@@ -10,11 +10,17 @@
 -- Term Algebra and related notions.
 module Term.Term.Raw (
     -- * Terms
-      Term
+      Term(..)
     , TermView (..)
     , viewTerm
+    , viewTerm'
     , TermView2 (..)
     , viewTerm2
+    , viewTerm2'
+    , termViewToTerm
+
+    -- * Diff Type
+    , DiffType (..)
 
     -- ** Standard function
     , traverseTerm
@@ -33,16 +39,16 @@ module Term.Term.Raw (
     ) where
 
 import           Data.List
-import           Data.Monoid
-import           Data.Foldable (Foldable, foldMap)
-import           Data.Traversable
+-- import           Data.Monoid
+-- import           Data.Foldable (Foldable, foldMap)
+-- import           Data.Traversable
 import           Data.Typeable
 import           Data.Generics
 import           Data.DeriveTH
 import           Data.Binary
 
 import           Control.DeepSeq
-import           Control.Basics
+-- import           Control.Basics
 
 import qualified Data.ByteString.Char8 as BC
 import           Extension.Data.ByteString ()
@@ -61,6 +67,12 @@ data Term a = LIT a                 -- ^ atomic terms (constants, variables, ..)
   deriving (Eq, Ord, Typeable, Data )
 
 ----------------------------------------------------------------------
+-- Diff Type - whether left/right interpretation of diff is desired,
+--             or no diff should occur
+----------------------------------------------------------------------
+data DiffType = DiffLeft | DiffRight | DiffNone | DiffBoth
+
+----------------------------------------------------------------------
 -- Views and smart constructors
 ----------------------------------------------------------------------
 
@@ -69,11 +81,26 @@ data TermView a = Lit a
                 | FApp FunSym [Term a]
   deriving (Show, Eq, Ord)
 
+viewTerm :: Term a -> TermView a
+viewTerm = viewTerm' DiffBoth -- should be DiffNone, but for test purposes do this!
+
 {-# INLINE viewTerm #-}
 -- | Return the 'TermView' of the given term.
-viewTerm :: Term a -> TermView a
-viewTerm (LIT l) = Lit l
-viewTerm (FAPP sym ts) = FApp sym ts
+viewTerm' :: DiffType -> Term a -> TermView a
+viewTerm' _  (LIT l) = Lit l
+viewTerm' dt (FAPP (NoEq o) [t1,t2]) =   case dt of
+                                     DiffLeft  | o == diffSym -> viewTerm' dt t1
+                                     DiffRight | o == diffSym -> viewTerm' dt t2
+                                     DiffBoth  | o == diffSym -> FApp (NoEq o) [t1,t2]
+                                     DiffNone  | o == diffSym -> error $ "viewTerm: illegal use of diff"
+                                     _                        -> FApp (NoEq o) [t1,t2]
+viewTerm' _  (FAPP sym ts) = FApp sym ts
+
+-- | Return the term of the given TermView.
+termViewToTerm :: TermView a -> Term a
+termViewToTerm (Lit l) = LIT l
+termViewToTerm (FApp sym ts) = FAPP sym ts
+
 
 -- | @fApp fsym as@ creates an application of @fsym@ to @as@. The function
 -- ensures that the resulting term is in AC-normal-form.
@@ -97,11 +124,11 @@ fAppAC acsym as  =
     (o_as0, non_o_as) = partition isOTerm as
     o_as              = [ a | FAPP _ ts <- o_as0, a <- ts ]
 
--- | Smart constructor for AC terms.
+-- | Smart constructor for C terms.
 fAppC :: Ord a => CSym -> [Term a] -> Term a
 fAppC nacsym as = FAPP (C nacsym) (sort as)
 
--- | Smart constructor for non-AC terms.
+-- | Smart constructor for non-AC/C terms.
 {-# INLINE fAppNoEq #-}
 fAppNoEq :: NoEqSym -> [Term a] -> Term a
 fAppNoEq freesym = FAPP (NoEq freesym)
@@ -128,17 +155,23 @@ data TermView2 a = FExp (Term a) (Term a)   | FInv (Term a) | FMult [Term a] | O
                  | FNatPlus [Term a]
                  | FUserAC String String [Term a]
                  | FPair (Term a) (Term a)
+                 | FDiff (Term a) (Term a)
                  | FAppNoEq NoEqSym [Term a]
                  | FAppC CSym [Term a]
                  | FList [Term a]
                  | Lit2 a
   deriving (Show, Eq, Ord)
 
+
 -- | Returns the 'TermView2' of the given term.
 viewTerm2 :: Show a => Term a -> TermView2 a
-viewTerm2 (LIT l) = Lit2 l
-viewTerm2 (FAPP List ts) = FList ts
-viewTerm2 t@(FAPP (AC o) ts)
+viewTerm2 = viewTerm2' DiffBoth -- should be DiffNone, but for test purposes do this!
+
+-- | Returns the 'TermView2' of the given term.
+viewTerm2' :: Show a => DiffType -> Term a -> TermView2 a
+viewTerm2' _  (LIT l) = Lit2 l
+viewTerm2' _  (FAPP List ts) = FList ts
+viewTerm2' _  t@(FAPP (AC o) ts)
   | length ts < 2 = error $ "viewTerm2: malformed term `"++show t++"'"
   | otherwise     = (acSymToConstr o) ts
   where
@@ -146,19 +179,24 @@ viewTerm2 t@(FAPP (AC o) ts)
     acSymToConstr Union   = FUnion
     acSymToConstr NatPlus = FNatPlus
     acSymToConstr (UserAC f s) = FUserAC f s
-viewTerm2 (FAPP (C EMap) [ t1 ,t2 ]) = FEMap t1 t2
-viewTerm2 t@(FAPP (C _)  _)          = error $ "viewTerm2: malformed term `"++show t++"'"
-viewTerm2 t@(FAPP (NoEq o) ts) = case ts of
+viewTerm2' _ (FAPP (C EMap) [ t1 ,t2 ]) = FEMap t1 t2
+viewTerm2' _ t@(FAPP (C _)  _)          = error $ "viewTerm2: malformed term `"++show t++"'"
+viewTerm2' dt t@(FAPP (NoEq o) ts) = case ts of
     [ t1, t2 ] | o == expSym    -> FExp   t1 t2  -- ensure here that FExp is always exp, never a user-defined symbol
     [ t1, t2 ] | o == pmultSym  -> FPMult t1 t2
     [ t1, t2 ] | o == pairSym   -> FPair  t1 t2
+    [ t1, t2 ] | o == diffSym   -> case dt of
+                                     DiffLeft  -> viewTerm2' dt t1
+                                     DiffRight -> viewTerm2' dt t2
+                                     DiffBoth  -> FDiff t1 t2
+                                     DiffNone  -> error $ "viewTerm2: illegal use of diff"
     [ t1 ]     | o == invSym    -> FInv   t1
     []         | o == oneSym    -> One
     _          | o `elem` ssyms -> error $ "viewTerm2: malformed term `"++show t++"'"
     _                           -> FAppNoEq o ts
   where
     -- special symbols
-    ssyms = [ expSym, pairSym, invSym, oneSym, pmultSym ]
+    ssyms = [ expSym, pairSym, diffSym, invSym, oneSym, pmultSym ]
 
 ----------------------------------------------------------------------
 -- Instances

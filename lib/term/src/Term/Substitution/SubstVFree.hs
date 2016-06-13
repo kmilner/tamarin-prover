@@ -68,9 +68,9 @@ import qualified Data.Map as M
 import qualified Data.Set as S
 import           Data.List
 import           Data.Binary
-import           Data.Monoid (mempty)
+-- import           Data.Monoid (mempty)
 
-import           Control.Applicative
+-- import           Control.Applicative
 import           Control.DeepSeq
 
 ----------------------------------------------------------------------
@@ -272,6 +272,9 @@ instance (Apply a, Apply b) => Apply (Either a b) where
     apply subst = either (Left . apply subst) (Right . apply subst)
 
 instance Apply a => Apply [a] where
+    apply subst = fmap (apply subst)
+
+instance Apply a => Apply (Map k a) where
     apply subst = fmap (apply subst)
 
 instance Apply a => Apply (Conj a) where

@@ -15,22 +15,23 @@ module Term.Rewriting.Norm (
   , maybeNotNfSubterms
 ) where
 
-import           Term.LTerm
-import           Term.Maude.Process
-import           Term.Maude.Signature
-import           Term.Substitution
-import           Term.SubtermRule
-import           Term.Unification
-
 import           Utils.Misc
 
-import           Control.Basics
+-- import           Control.Basics
 import           Control.Monad.Reader
 
 import           Data.List
 import qualified Data.Set             as S
 
 import           System.IO.Unsafe     (unsafePerformIO)
+
+
+import           Term.LTerm
+import           Term.Maude.Process
+import           Term.Maude.Signature
+import           Term.Substitution
+import           Term.SubtermRule
+import           Term.Unification
 
 ----------------------------------------------------------------------
 -- Normalization using Maude
@@ -65,6 +66,7 @@ nfViaHaskell t0 = reader $ \hnd -> check hnd
             FAppNoEq o ts | (NoEq o) `S.member` irreducible -> all go ts
             FList ts                                        -> all go ts
             FPair t1 t2                                     -> go t1 && go t2
+            FDiff t1 t2                                     -> go t1 && go t2
             One                                             -> True
             Lit2 _                                          -> True
             -- subterm rules

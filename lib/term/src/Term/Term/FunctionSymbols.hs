@@ -23,6 +23,7 @@ module Term.Term.FunctionSymbols (
     , NoEqFunSig
 
     -- ** concrete symbols strings
+    , diffSymString
     , expSymString
     , invSymString
     , pmultSymString
@@ -33,6 +34,7 @@ module Term.Term.FunctionSymbols (
     , natZeroSymString
 
     -- ** concrete symbols
+    , diffSym
     , expSym
     , pmultSym
     , oneSym
@@ -49,6 +51,7 @@ module Term.Term.FunctionSymbols (
     , msetFunSig
     , natFunSig
     , pairFunSig
+    , diffFunSig
     , dhReducibleFunSig
     , bpReducibleFunSig
     , implicitFunSig
@@ -113,7 +116,8 @@ type NoEqFunSig = Set NoEqSym
 -- Fixed function symbols
 ----------------------------------------------------------------------
 
-expSymString, invSymString :: ByteString
+diffSymString, expSymString, invSymString :: ByteString
+diffSymString = "diff"
 expSymString = "exp"
 invSymString = "inv"
 
@@ -130,9 +134,11 @@ natZeroSymString = "tzero"
 natOneSymString = "tone"
 
 
-pairSym, expSym, invSym, oneSym, fstSym, sndSym, pmultSym, natZeroSym, natOneSym :: NoEqSym
+pairSym, diffSym, expSym, invSym, oneSym, fstSym, sndSym, pmultSym, natZeroSym, natOneSym :: NoEqSym
 -- | Pairing.
 pairSym    = NoEqSym "pair" 2 Public Nothing False
+-- | Diff.
+diffSym  = NoEqSym diffSymString 2 Private Nothing False
 -- | Exponentiation.
 expSym     = NoEqSym expSymString 2 Public Nothing False
 -- | The inverse in the groups of exponents.
@@ -173,6 +179,10 @@ natFunSig = S.fromList [ NoEq natZeroSym, NoEq natOneSym, AC NatPlus ]
 -- | The signature for pairing.
 pairFunSig :: NoEqFunSig
 pairFunSig = S.fromList [ pairSym, fstSym, sndSym ]
+
+-- | The signature for diff terms.
+diffFunSig :: NoEqFunSig
+diffFunSig = S.fromList [ diffSym ]
 
 -- | Reducible function symbols for DH.
 dhReducibleFunSig :: FunSig

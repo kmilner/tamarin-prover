@@ -27,7 +27,7 @@ module Term.Maude.Process (
   , WithMaude
 ) where
 
-import Data.Traversable hiding ( mapM )
+-- import Data.Traversable hiding ( mapM )
 import qualified Data.Map as M
 
 import Term.Term
@@ -38,7 +38,7 @@ import Term.Maude.Types
 import Term.Maude.Parser
 import Term.Substitution
 
-import Control.Applicative
+-- import Control.Applicative
 import Control.Monad.Reader
 import Control.Monad.Fresh
 import Control.Concurrent
@@ -91,8 +91,8 @@ startMaude :: FilePath -> MaudeSig -> IO MaudeHandle
 startMaude maudePath maudeSig = do
     mv <- newMVar =<< startMaudeProcess maudePath maudeSig
     -- Add a finalizer to the MVar that stops maude.
-    addMVarFinalizer mv $ withMVar mv $ \mp -> do
-        terminateProcess (mProc mp) <* waitForProcess (mProc mp)
+    _  <- mkWeakMVar mv $ withMVar mv $ \mp -> do
+        terminateProcess (mProc mp) <* waitForProcess (mProc mp)      
     -- return the maude handle
     return (MaudeHandle maudePath maudeSig mv)
 

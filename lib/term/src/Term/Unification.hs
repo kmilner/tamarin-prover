@@ -37,7 +37,9 @@ module Term.Unification (
   , enableBP
   , enableNat
   , enableMSet
+  , enableDiff
   , minimalMaudeSig
+  , enableDiffMaudeSig
   , dhMaudeSig
   , bpMaudeSig
   , msetMaudeSig
@@ -60,9 +62,9 @@ module Term.Unification (
   , module Term.Rewriting.Definitions
 ) where
 
-import           Control.Applicative
+-- import           Control.Applicative
 import           Control.Monad.RWS
-import           Control.Monad.Error
+import           Control.Monad.Except
 import           Control.Monad.State
 import qualified Data.Map as M
 import           Data.Map (Map)
@@ -70,6 +72,7 @@ import           Data.Map (Map)
 import           System.IO.Unsafe (unsafePerformIO)
 
 import           Term.Term.FunctionSymbols
+
 import           Term.Rewriting.Definitions
 import           Term.Substitution
 import qualified Term.Maude.Process as UM
@@ -113,7 +116,6 @@ unifyLTerm sortOf eqs = flattenUnif <$> unifyLTermFactored sortOf eqs
 
 -- | @unifyLNTerm eqs@ returns a complete set of unifiers for @eqs@ modulo AC.
 unifyLNTerm :: [Equal LNTerm] -> WithMaude [SubstVFresh Name LVar]
--- unifyLNTerm eqs = reader $ \hnd -> (\res -> DT.trace (show ("unify", res, eqs)) res) $ unifyLTerm sortOfName eqs `runReader` hnd
 unifyLNTerm = unifyLTerm sortOfName
 
 -- | 'True' iff the terms are unifiable.
@@ -122,7 +124,8 @@ unifiableLNTerms t1 t2 = (not . null) <$> unifyLNTerm [Equal t1 t2]
 
 -- | Flatten a factored substitution to a list of substitutions.
 flattenUnif :: IsConst c => (LSubst c, [LSubstVFresh c]) -> [LSubstVFresh c]
-flattenUnif (subst, substs) =  (\res -> trace (show ("flattenUnif",subst, substs,res )) res) $ map (`composeVFresh` subst) substs
+flattenUnif (subst, substs) = 
+    (\res -> trace (show ("flattenUnif",subst, substs,res )) res) $ map (`composeVFresh` subst) substs
 
 -- Matching modulo AC
 ----------------------------------------------------------------------
@@ -147,7 +150,7 @@ solveMatchLTerm sortOf matchProblem =
       res
 
     matchTerms ms hnd =
-        trace' $ case runState (runErrorT match) M.empty of
+        trace' $ case runState (runExceptT match) M.empty of
           (Left NoMatcher, _)  -> []
           (Left ACProblem, _)  ->
               unsafePerformIO (UM.matchViaMaude hnd sortOf matchProblem)
@@ -222,8 +225,9 @@ unifyRaw l0 r0 = do
 
 data MatchFailure = NoMatcher | ACProblem
 
-instance Error MatchFailure where
-    strMsg _ = NoMatcher
+instance Monoid MatchFailure where
+  mempty = NoMatcher
+  mappend _ _ = NoMatcher
 
 -- | Ensure that the computed substitution @sigma@ satisfies
 -- @t ==_AC apply sigma p@ after the delayed equations are solved.
@@ -231,7 +235,7 @@ matchRaw :: IsConst c
          => (c -> LSort)
          -> LTerm c -- ^ Term @t@
          -> LTerm c -- ^ Pattern @p@.
-         -> ErrorT MatchFailure (State (Map LVar (VTerm c LVar))) ()
+         -> ExceptT MatchFailure (State (Map LVar (VTerm c LVar))) ()
 matchRaw sortOf t p = do
     mappings <- get
     guard (trace (show (mappings,t,p)) True)

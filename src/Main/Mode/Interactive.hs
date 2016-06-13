@@ -19,9 +19,10 @@ import           Data.Maybe
 import           Data.String                     (fromString)
 import           System.Console.CmdArgs.Explicit as CmdArgs
 import           System.Directory                (doesDirectoryExist, doesFileExist, getTemporaryDirectory)
+import           System.Environment              (lookupEnv)
 import           System.FilePath
 
-import           Network.Wai.Handler.Warp        (defaultSettings, settingsHost, settingsPort)
+import           Network.Wai.Handler.Warp        (defaultSettings, setHost, setPort)
 import qualified Network.Wai.Handler.Warp        as Warp
 import           Web.Dispatch
 import qualified Web.Settings
@@ -29,8 +30,6 @@ import qualified Web.Settings
 import           Main.Console
 import           Main.Environment
 import           Main.TheoryLoader
-
-import           Paths_tamarin_prover            (getDataDir)
 
 
 -- | Batch processing mode.
@@ -76,13 +75,18 @@ run thisMode as = case findArg "workDir" as of
         then do
           -- determine caching directory
           tempDir <- getTemporaryDirectory
-          let cacheDir = tempDir </> "tamarin-prover-cache"
+          winLoginName <- lookupEnv "USERNAME"
+	  unixLoginName <- lookupEnv "USER"
+	  let loginName = fromMaybe "" (winLoginName <|> unixLoginName)
+	      cacheDir = tempDir </> ("tamarin-prover-cache-" ++ loginName)
           -- process theories
-          _ <- ensureGraphVizDot as
+          case (fst $ graphPath as) of
+              "dot"  -> ensureGraphVizDot as
+              "json" -> ensureGraphCommand as
+              _      -> return True
           _ <- ensureMaude as
           putStrLn ""
           port <- readPort
-          dataDir <- getDataDir
           let webUrl = serverUrl port
           putStrLn $ intercalate "\n"
             [ "The server is starting up on port " ++ show port ++ "."
@@ -90,14 +94,25 @@ run thisMode as = case findArg "workDir" as of
             , ""
             , "Loading the security protocol theories '" ++ workDir </> "*.spthy"  ++ "' ..."
             ]
-          withWebUI
-            ("Finished loading theories ... server ready at \n\n    " ++ webUrl ++ "\n")
-            cacheDir
-            workDir (argExists "loadstate" as) (argExists "autosave" as)
-            (loadClosedThyWfReport as) (loadClosedThyString as)
-            (argExists "debug" as) dataDir (dotPath as) readImageFormat
-            (constructAutoProver as)
-            (runWarp port)
+          if (argExists "diff" as)
+            then do 
+              withWebUIDiff
+                ("Finished loading theories ... server ready at \n\n    " ++ webUrl ++ "\n")
+                cacheDir
+                workDir (argExists "loadstate" as) (argExists "autosave" as)
+                (loadClosedDiffThyWfReport as) (loadClosedDiffThyString as)
+                (argExists "debug" as) (dotPath as) readImageFormat
+                (constructAutoDiffProver as)
+                (runWarp port)
+            else do 
+              withWebUI
+                ("Finished loading theories ... server ready at \n\n    " ++ webUrl ++ "\n")
+                cacheDir
+                workDir (argExists "loadstate" as) (argExists "autosave" as)
+                (loadClosedThyWfReport as) (loadClosedThyString as)
+                (argExists "debug" as) (graphPath as) readImageFormat
+                (constructAutoProver as)
+                (runWarp port)
         else
           helpAndExit thisMode
             (Just $ "directory '" ++ workDir ++ "' does not exist.")
@@ -129,11 +144,10 @@ run thisMode as = case findArg "workDir" as of
                 | otherwise                        = interface
 
     runWarp port wapp =
-        handle (\e -> err (e::IOException))
-            (Warp.runSettings
-               (defaultSettings { settingsHost = fromString interface
-                                , settingsPort = port})
-               wapp)
+        handle (\e -> err (e::IOException)) $
+            Warp.runSettings
+               (setHost (fromString interface) $ setPort port defaultSettings)
+               wapp
 
     err e = error $ "Starting the webserver on "++interface++" failed: \n"
                     ++ show e

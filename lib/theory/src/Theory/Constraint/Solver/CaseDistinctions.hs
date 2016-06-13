@@ -38,6 +38,11 @@ import           Control.Monad.Reader
 import           Control.Monad.State                     (gets)
 import           Control.Parallel.Strategies
 
+import           System.IO.Error
+
+import           System.Environment
+import           System.IO.Unsafe
+
 import           Text.PrettyPrint.Highlight
 
 import           Extension.Data.Label
@@ -47,12 +52,13 @@ import           Theory.Constraint.Solver.Contradictions (contradictorySystem)
 import           Theory.Constraint.Solver.Goals
 import           Theory.Constraint.Solver.Reduction
 import           Theory.Constraint.Solver.Simplify
-import           Theory.Constraint.Solver.Types
+-- import           Theory.Constraint.Solver.Types
 import           Theory.Constraint.System
 import           Theory.Model
 
 import           Control.Monad.Bind
 
+import           Debug.Trace
 
 ------------------------------------------------------------------------------
 -- Precomputing case distinctions
@@ -78,7 +84,7 @@ initialCaseDistinction ctxt axioms goal =
     CaseDistinction goal cases
   where
     polish ((name, se), _) = ([name], se)
-    se0   = insertLemmas axioms $ emptySystem UntypedCaseDist
+    se0   = insertLemmas axioms $ emptySystem UntypedCaseDist $ get pcDiffContext ctxt
     cases = fmap polish $
         runReduction instantiate ctxt se0 (avoid (goal, se0))
     instantiate = do
@@ -103,7 +109,7 @@ refineCaseDistinction ctxt proofStep th =
 
     fs         = avoid th
     refinement = do
-        (names, se)   <- get cdCases th
+        (names, se)        <- get cdCases th
         ((x, names'), se') <- fst <$> runReduction proofStep ctxt se fs
         return (x, (combine names names', se'))
 
@@ -118,9 +124,11 @@ refineCaseDistinction ctxt proofStep th =
 --
 -- Returns the names of the steps applied.
 solveAllSafeGoals :: [CaseDistinction] -> Reduction [String]
-solveAllSafeGoals ths =
-    solve []
+solveAllSafeGoals ths' =
+    solve ths' []
   where
+    extensiveSplitting = unsafePerformIO $
+      (getEnv "TAMARIN_EXTENSIVE_SPLIT" >> return True) `catchIOError` \_ -> return False
     safeGoal _       (_,   (_, LoopBreaker)) = False
     safeGoal doSplit (goal, _              ) =
       case goal of
@@ -129,8 +137,8 @@ solveAllSafeGoals ths =
         PremiseG _ fa -> not (isKUFact fa)
         DisjG _       -> doSplit
         -- Uncomment to get more extensive case splitting
-        -- SplitG _   -> doSplit
-        SplitG _      -> False
+        SplitG _      -> doSplit --extensiveSplitting &&
+        -- SplitG _      -> False
 
     usefulGoal (_, (_, Useful)) = True
     usefulGoal _                = False
@@ -140,7 +148,8 @@ solveAllSafeGoals ths =
     isChainPrem1 (ChainG _ (_,PremIdx 1),_) = True
     isChainPrem1 _                          = False
 
-    solve caseNames = do
+    solve :: [CaseDistinction] -> [String] -> Reduction [String]
+    solve ths caseNames = do
         simplifySystem
         ctxt <- ask
         contradictoryIf =<< gets (contradictorySystem ctxt)
@@ -156,15 +165,18 @@ solveAllSafeGoals ths =
             safeGoals    = fst <$> filter (safeGoal splitAllowed) goals
             kdPremGoals  = fst <$> filter (\g -> isKDPrem g || isChainPrem1 g) goals
             usefulGoals  = fst <$> filter usefulGoal goals
+            nextStep :: Maybe (Reduction [String], Maybe CaseDistinction)
             nextStep     =
-                ((fmap return . solveGoal) <$> headMay kdPremGoals) <|>
-                ((fmap return . solveGoal) <$> headMay safeGoals) <|>
-                (asum $ map (solveWithCaseDistinction ctxt ths) usefulGoals)
+                ((\x -> (fmap return (solveGoal x), Nothing)) <$> headMay kdPremGoals) <|>
+                ((\x -> (fmap return (solveGoal x), Nothing)) <$> headMay safeGoals) <|>
+                (asum $ map (solveWithCaseDistinctionAndReturn ctxt ths) usefulGoals)
         case nextStep of
-          Nothing   -> return $ caseNames
-          Just step -> solve . (caseNames ++) =<< step
+          Nothing   -> return caseNames
+          Just (step, Nothing) -> (\x -> solve ths (caseNames ++ x)) =<< step
+          Just (step, Just usedCase) -> (\x -> solve (filterCases usedCase ths) (caseNames ++ x)) =<< step
 
-
+    filterCases :: CaseDistinction -> [CaseDistinction] -> [CaseDistinction]
+    filterCases usedCase cds = filter (\x -> usedCase /= x) cds
 
 ------------------------------------------------------------------------------
 -- Redundant Case Distinctions                                              --
@@ -258,27 +270,39 @@ matchToGoal ctxt th0 goalTerm =
         return ((), [])
 
 -- | Try to solve a premise goal or 'KU' action using the first precomputed
+-- case distinction with a matching premise. Also returns the used case distinction.
+solveWithCaseDistinctionAndReturn :: ProofContext
+                         -> [CaseDistinction]
+                         -> Goal
+                         -> Maybe (Reduction [String], Maybe CaseDistinction)
+solveWithCaseDistinctionAndReturn hnd ths goal = do
+    -- goal <- toBigStepGoal goal0
+    asum [ applyCaseDistinction hnd th goal | th <- ths ]
+
+-- | Try to solve a premise goal or 'KU' action using the first precomputed
 -- case distinction with a matching premise.
 solveWithCaseDistinction :: ProofContext
                          -> [CaseDistinction]
                          -> Goal
                          -> Maybe (Reduction [String])
-solveWithCaseDistinction hnd ths goal = do
-    -- goal <- toBigStepGoal goal0
-    asum [ applyCaseDistinction hnd th goal | th <- ths ]
+solveWithCaseDistinction hnd ths goal =
+    case (solveWithCaseDistinctionAndReturn hnd ths goal) of
+         Nothing     -> Nothing
+         Just (x, _) -> Just x
+
 
 -- | Apply a precomputed case distinction theorem to a required fact.
 applyCaseDistinction :: ProofContext
                      -> CaseDistinction    -- ^ Case distinction theorem.
                      -> Goal               -- ^ Required goal
-                     -> Maybe (Reduction [String])
+                     -> Maybe (Reduction [String], Maybe CaseDistinction)
 applyCaseDistinction ctxt th0 goal = case matchToGoal ctxt th0 goal of
-    Just th -> Just $ do
+    Just th -> Just ((do
         markGoalAsSolved "precomputed" goal
         (names, sysTh0) <- disjunctionOfList $ getDisj $ get cdCases th
         sysTh <- (`evalBindT` keepVarBindings) . someInst $ sysTh0
         conjoinSystem sysTh
-        return names
+        return names), Just th0)
     Nothing -> Nothing
   where
     keepVarBindings = M.fromList (map (\v -> (v, v)) (frees goal))
@@ -288,13 +312,16 @@ applyCaseDistinction ctxt th0 goal = case matchToGoal ctxt th0 goal of
 -- conclusion are used for the saturation.
 saturateCaseDistinctions
     :: ProofContext -> [CaseDistinction] -> [CaseDistinction]
-saturateCaseDistinctions ctxt =
-    go
+saturateCaseDistinctions ctxt thsInit =
+    (go thsInit 1)
   where
-    go ths =
-        if any or (changes `using` parList rdeepseq)
-          then go ths'
-          else ths'
+    go :: [CaseDistinction] -> Integer -> [CaseDistinction]
+    go ths n =
+        if (any or (changes `using` parList rdeepseq)) && (n <= 3)
+          then go ths' (n + 1)
+          else if (n > 3) 
+            then trace "saturateCaseDistinctions: Saturation aborted, more than 3 iterations." ths'
+            else ths'
       where
         (changes, ths') = unzip $ map (refineCaseDistinction ctxt solver) ths
         goodTh th  = length (getDisj (get cdCases th)) <= 1

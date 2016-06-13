@@ -21,19 +21,19 @@ import           System.Exit
 import           System.IO
 import           System.Process
 
-import           Paths_tamarin_prover
-
 import           Main.Console
+
 
 ------------------------------------------------------------------------------
 -- Retrieving the paths to required tools.
 ------------------------------------------------------------------------------
 
--- | Flags for handing over the path to the maude and 'dot' tool.
+-- | Flags for handing over the path to the maude and graph rendering tool (dot or json).
 toolFlags :: [Flag Arguments]
 toolFlags =
   [ flagOpt "dot" ["with-dot"] (updateArg "withDot") "FILE" "Path to GraphViz 'dot' tool"
-  , flagOpt "maude" ["with-maude"] (updateArg "withMaude") "FILE"  "Path to 'maude' rewriting tool"
+  , flagOpt "json" ["with-json"] (updateArg "withJson") "FILE" "Path to JSON rendering tool (not working with --diff)"
+  , flagOpt "maude" ["with-maude"] (updateArg "withMaude") "FILE" "Path to 'maude' rewriting tool"
   ]
 
 -- | Path to maude tool
@@ -43,6 +43,12 @@ maudePath = fromMaybe "maude" . findArg "withMaude"
 -- | Path to dot tool
 dotPath :: Arguments -> FilePath
 dotPath = fromMaybe "dot" . findArg "withDot"
+
+-- | Path to dot or json tool
+graphPath :: Arguments -> (String, FilePath)
+graphPath as = 
+  if (argExists "withJson" as) then ("json", (fromMaybe "json" . findArg "withJson") as)
+                               else ("dot", (fromMaybe "dot" . findArg "withDot") as)
 
 
 ------------------------------------------------------------------------------
@@ -68,11 +74,6 @@ getCpuModel =
   handler :: IOException -> IO String
   handler _ = return errMsg
 
--- | Get the path to the Html template file.
-getHtmlTemplate :: IO FilePath
-getHtmlTemplate = getDataFileName "HTML_TEMPLATE"
-
-
 -- | Build the command line corresponding to a program arguments tuple.
 commandLine :: String -> [String] -> String
 commandLine prog args = concat $ intersperse " " $ prog : args
@@ -87,8 +88,9 @@ testProcess
   -> FilePath       -- ^ Process to start
   -> [String]       -- ^ Arguments
   -> String         -- ^ Stdin
+  -> Bool           -- ^ Whether Maude is being tested - hard fail for exceptions on Maude.
   -> IO Bool        -- ^ True, if test was successful
-testProcess check defaultMsg testName prog args inp = do
+testProcess check defaultMsg testName prog args inp maudeTest = do
     putStr testName
     hFlush stdout
     handle handler $ do
@@ -115,13 +117,16 @@ testProcess check defaultMsg testName prog args inp = do
     handler _ = do putStrLn "caught exception while executing:"
                    putStrLn $ commandLine prog args
                    putStrLn $ "with input: " ++ inp
+                   if maudeTest then
+                     error "Maude is not installed. Ensure Maude is available and on the path."
+                     else putStrLn ""
                    return False
 
 -- | Ensure a suitable version of the Graphviz dot tool is installed.
 ensureGraphVizDot :: Arguments -> IO Bool
 ensureGraphVizDot as = do
     putStrLn $ "GraphViz tool: '" ++ dot ++ "'"
-    testProcess check errMsg " checking version: " dot ["-V"] ""
+    testProcess check errMsg " checking version: " dot ["-V"] "" False
   where
     dot = dotPath as
     check _ err
@@ -136,19 +141,33 @@ ensureGraphVizDot as = do
       , "         http://www.graphviz.org/"
       ]
 
+-- | Check whether a the graph rendering command supplied is pointing to an existing file
+ensureGraphCommand :: Arguments -> IO Bool
+ensureGraphCommand as = do
+    putStrLn $ "Graph rendering command: " ++ cmd
+    testProcess check errMsg "Checking availablity ..." "which" [cmd] "" False
+  where
+    cmd = snd $ graphPath as
+    check _ err
+      | err == ""  = Right $ " OK."
+      | otherwise  = Left  $ errMsg
+    errMsg = unlines
+      [ "Command not found" ]
+
 -- | Ensure a suitable version of Maude is installed.
 ensureMaude :: Arguments -> IO Bool
 ensureMaude as = do
     putStrLn $ "maude tool: '" ++ maude ++ "'"
-    t1 <- testProcess checkVersion errMsg' " checking version: " maude ["--version"] ""
-    t2 <- testProcess checkInstall errMsg' " checking installation: "   maude [] "quit\n"
+    t1 <- testProcess checkVersion errMsg' " checking version: " maude ["--version"] "" True
+    t2 <- testProcess checkInstall errMsg' " checking installation: "   maude [] "quit\n" True
     return (t1 && t2)
   where
     maude = maudePath as
     checkVersion out _
       | filter (not . isSpace) out == "2.6" = Right "2.6. OK."
+      | filter (not . isSpace) out == "2.7" = Right "2.7. OK."
       | otherwise                           = Left  $ errMsg $
-          " 'maude --version' returned wrong verison '" ++ out ++ "'"
+          " 'maude --version' returned wrong version '" ++ out ++ "'"
 
     checkInstall _ []  = Right "OK."
     checkInstall _ err = Left  $ errMsg err
@@ -159,7 +178,7 @@ ensureMaude as = do
           , ""
           , reason
           , " " ++ programName ++ " will likely not work."
-          , " Please download 'Core Maude 2.6' from:"
+          , " Please download 'Core Maude 2.7' (or 2.6) from:"
           , "    http://maude.cs.uiuc.edu/download/"
           , " Note that 'prelude.maude' must be in the same directory as the 'maude' executable."
           ]

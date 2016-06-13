@@ -21,10 +21,10 @@ import Term.Narrowing.Variants.Check (leqSubstVariant,variantsFrom)
 import Extension.Prelude
 
 import Data.Ord
-import Data.List
+import Data.List                     (partition,sortBy)
 import Data.Maybe
 import Control.Arrow
-import Control.Applicative
+-- import Control.Applicative
 import Control.Monad.Reader
 
 import Debug.Trace.Ignore

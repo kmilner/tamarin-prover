@@ -1,5 +1,7 @@
-{-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE BangPatterns     #-}
+{-# LANGUAGE ViewPatterns     #-}
+-- FIXME: Better solution for absTerm
+{-# LANGUAGE FlexibleContexts #-}
 -- |
 -- Copyright   : (c) 2012 Benedikt Schmidt & Simon Meier
 -- License     : GPL v3 (see LICENSE)
@@ -27,7 +29,7 @@ import           Control.Monad.Reader
 import           Data.Label
 import           Data.List
 import qualified Data.Set             as S
-import           Data.Traversable     (traverse)
+-- import           Data.Traversable     (traverse)
 
 import           Term.Substitution
 import           Theory.Model

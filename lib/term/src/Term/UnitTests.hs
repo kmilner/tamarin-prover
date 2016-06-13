@@ -25,7 +25,7 @@ import Data.Maybe
 import Prelude
 import Test.HUnit
 import Control.Monad.Reader
-import Data.Monoid
+-- import Data.Monoid
 
 
 testEqual :: (Eq a, Show a) => String -> a -> a -> Test

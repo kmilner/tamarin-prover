@@ -10,11 +10,12 @@
 -- Equational signatures for Maude.
 module Term.Maude.Signature (
   -- * Maude signatures
-    MaudeSig
+    MaudeSig 
   , enableDH
   , enableBP
   , enableMSet
   , enableNat
+  , enableDiff
   , stFunSyms
   , stRules
   , funSyms
@@ -36,6 +37,7 @@ module Term.Maude.Signature (
   , natMaudeSig
   , bpMaudeSig
   , minimalMaudeSig
+  , enableDiffMaudeSig
 
   -- * extend maude signatures
   , addFunSym
@@ -53,14 +55,14 @@ import Term.Builtin.Rules
 import Term.SubtermRule
 
 import Control.Monad.Fresh
-import Control.Applicative
+-- import Control.Applicative
 import Control.DeepSeq
 
 import Data.Maybe
 import Data.DeriveTH
 import Data.Binary
 import Data.Foldable (asum)
-import Data.Monoid
+-- import Data.Monoid
 import Data.Set (Set)
 import qualified Data.Set as S
 
@@ -78,6 +80,7 @@ data MaudeSig = MaudeSig
     , enableBP           :: Bool
     , enableMSet         :: Bool
     , enableNat          :: Bool
+    , enableDiff         :: Bool
     , stFunSyms          :: S.Set NoEqSym -- ^ function signature for subterm theory
     , stRules            :: S.Set StRule  -- ^ rewriting rules for subterm theory
 
@@ -92,7 +95,7 @@ data MaudeSig = MaudeSig
 
 -- | Smart constructor for maude signatures. Computes funSyms and irreducibleFunSyms.
 maudeSig :: MaudeSig -> MaudeSig
-maudeSig msig@(MaudeSig {enableDH,enableBP,enableMSet,enableNat,stFunSyms,stRules}) =
+maudeSig msig@(MaudeSig {enableDH,enableBP,enableMSet,enableDiff=_,enableNat,stFunSyms,stRules}) =
     msig {enableDH=enableDH||enableBP, funSyms=allfuns, irreducibleFunSyms=irreduciblefuns}
   where
     -- TODO: Take into accounts user-defined AC function symbols.
@@ -108,17 +111,18 @@ maudeSig msig@(MaudeSig {enableDH,enableBP,enableMSet,enableNat,stFunSyms,stRule
 
 -- | A monoid instance to combine maude signatures.
 instance Monoid MaudeSig where
-    (MaudeSig dh1 bp1 mset1 nat1 stFunSyms1 stRules1 _ _ uSorts1 uSyms1) `mappend`
-      (MaudeSig dh2 bp2 mset2 nat2 stFunSyms2 stRules2 _ _ uSorts2 uSyms2) =
+    (MaudeSig dh1 bp1 mset1 diff1 nat1 stFunSyms1 stRules1 _ _ uSorts1 uSyms1) `mappend`
+      (MaudeSig dh2 bp2 mset2 diff2 nat2 stFunSyms2 stRules2 _ _ uSorts2 uSyms2) =
           maudeSig (mempty {enableDH=dh1||dh2
                            ,enableBP=bp1||bp2
                            ,enableMSet=mset1||mset2
+                           ,enableDiff=diff1||diff2
                            ,enableNat=nat1||nat2
                            ,stFunSyms=S.union stFunSyms1 stFunSyms2
                            ,stRules=S.union stRules1 stRules2
                            ,userSorts=S.union uSorts1 uSorts2
                            ,userACSyms=S.union uSyms1 uSyms2})
-    mempty = MaudeSig False False False False S.empty S.empty S.empty S.empty S.empty S.empty
+    mempty = MaudeSig False False False False False S.empty S.empty S.empty S.empty S.empty S.empty
 
 -- | Non-AC function symbols.
 noEqFunSyms :: MaudeSig -> NoEqFunSig
@@ -188,6 +192,8 @@ msetMaudeSig = maudeSig $ mempty {enableMSet=True}
 natMaudeSig  = maudeSig $ mempty {enableNat=True}
 
 -- | Maude signatures for the default subterm symbols.
+--pairMaudeSig :: Bool -> MaudeSig
+--pairMaudeSig flag = maudeSig $ mempty {stFunSyms=pairFunSig,stRules=pairRules,enableDiff=flag}
 pairMaudeSig, symEncMaudeSig, asymEncMaudeSig, signatureMaudeSig, hashMaudeSig :: MaudeSig
 pairMaudeSig      = maudeSig $ mempty {stFunSyms=pairFunSig,stRules=pairRules}
 symEncMaudeSig    = maudeSig $ mempty {stFunSyms=symEncFunSig,stRules=symEncRules}
@@ -196,8 +202,14 @@ signatureMaudeSig = maudeSig $ mempty {stFunSyms=signatureFunSig,stRules=signatu
 hashMaudeSig      = maudeSig $ mempty {stFunSyms=hashFunSig}
 
 -- | The minimal maude signature.
-minimalMaudeSig :: MaudeSig
-minimalMaudeSig = pairMaudeSig
+minimalMaudeSig :: Bool -> MaudeSig
+minimalMaudeSig flag = maudeSig $ mempty {enableDiff=flag,stFunSyms=pairFunSig,stRules=pairRules}
+-- essentially pairMaudeSig, but with the enableDiff flag set according to "flag"
+-- -- MaudeSig False False False flag pairFunSig pairRules S.empty S.empty
+
+-- | Signature with enableDiff set to True
+enableDiffMaudeSig :: MaudeSig
+enableDiffMaudeSig = maudeSig $ mempty {enableDiff=True}
 
 ------------------------------------------------------------------------------
 -- Pretty Printing
