@@ -365,11 +365,11 @@ opExp = symbol_ "^"
 opMult :: Parser ()
 opMult = symbol_ "*"
 
--- | The addition operator @*@.
+-- | The addition operator @+@.
 opPlus :: Parser ()
 opPlus = symbol_ "+"
 
--- | The multiset union operator @+@.
+-- | The multiset union operator @++@.
 opUnion :: Parser ()
 opUnion = symbol_ "++"
 

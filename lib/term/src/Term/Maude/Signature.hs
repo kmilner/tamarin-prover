@@ -79,8 +79,8 @@ data MaudeSig = MaudeSig
     { enableDH           :: Bool
     , enableBP           :: Bool
     , enableMSet         :: Bool
-    , enableNat          :: Bool
     , enableDiff         :: Bool
+    , enableNat          :: Bool
     , stFunSyms          :: S.Set NoEqSym -- ^ function signature for subterm theory
     , stRules            :: S.Set StRule  -- ^ rewriting rules for subterm theory
 
