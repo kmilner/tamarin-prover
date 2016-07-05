@@ -93,6 +93,7 @@ openGoals sys = do
                     -- handled by 'insertAction'
                     || isPair m || isInverse m || isProduct m
                     || isUnion m || isNullaryPublicFunction m
+                    || isNatPlus m
         ActionG _ _                               -> not solved
         PremiseG _ _                              -> not solved
         -- Technically the 'False' disj would be a solvable goal. However, we

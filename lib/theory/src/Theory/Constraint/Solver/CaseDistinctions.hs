@@ -382,7 +382,7 @@ precomputeCaseDistinctions ctxt axioms =
       , if enableNat msig then
           [ fAppNoEq natZeroSym []
           , fAppNoEq natOneSym []
-          , fAppAC NatPlus [varTerm (LVar "t" LSortNat 1), varTerm (LVar "t" LSortNat 2)] ]
+          , fAppAC NatPlus [varTerm (LVar "n" LSortNat 1), varTerm (LVar "n" LSortNat 2)] ]
           else [] 
       -- User-defined functions (non-iterated)
       , [ fAppNoEq o $ nMsgVars k

@@ -34,6 +34,7 @@ module Term.Term (
     , isInverse
     , isProduct
     , isUnion
+    , isNatPlus
     , isEMap
     , isNullaryPublicFunction
     , isPrivateFunction
@@ -160,6 +161,11 @@ isEMap _                        = False
 isUnion :: Show a => Term a -> Bool
 isUnion (viewTerm2 -> FUnion _) = True
 isUnion _                       = False
+
+-- | 'True' iff the term is a well-formed plus.
+isNatPlus :: Show a => Term a -> Bool
+isNatPlus (viewTerm2 -> FNatPlus _) = True
+isNatPlus _                         = False
 
 -- | 'True' iff the term is a nullary, public function.
 isNullaryPublicFunction :: Term a -> Bool
