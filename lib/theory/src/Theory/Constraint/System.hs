@@ -30,7 +30,7 @@ module Theory.Constraint.System (
 
   , pcSignature
   , pcRules
-  , pcInjectiveFactInsts
+  , pcInjectiveFacts
   , pcCaseDists
   , pcCaseDistKind
   , pcUseInduction
@@ -215,7 +215,7 @@ import           Theory.Constraint.System.Constraints
 import           Theory.Model
 import           Theory.Text.Pretty
 import           Theory.Tools.EquationStore
-import           Theory.Tools.InjectiveFactInstance
+import           Theory.Tools.InjectiveFacts
 
 ----------------------------------------------------------------------
 -- ClassifiedRules
@@ -358,7 +358,7 @@ data InductionHint = UseInduction | AvoidInduction
 data ProofContext = ProofContext
        { _pcSignature          :: SignatureWithMaude
        , _pcRules              :: ClassifiedRules
-       , _pcInjectiveFactInsts :: S.Set InjectiveFactInstance
+       , _pcInjectiveFacts     :: InjectiveFacts
        , _pcCaseDistKind       :: CaseDistKind
        , _pcCaseDists          :: [CaseDistinction]
        , _pcUseInduction       :: InductionHint

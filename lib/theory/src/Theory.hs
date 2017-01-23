@@ -131,8 +131,8 @@ module Theory (
   , getDiffProofContext
   , getClassifiedRules
   , getDiffClassifiedRules
-  , getInjectiveFactInsts
-  , getDiffInjectiveFactInsts
+  , getInjectiveFacts
+  , getDiffInjectiveFacts
 
   , getCaseDistinction
   , getDiffCaseDistinction
@@ -171,6 +171,7 @@ module Theory (
   -- * Convenience exports
   , module Theory.Model
   , module Theory.Proof
+  , module Theory.Tools.InjectiveFacts
 --   , module Theory.Constraint.Solver.Types
 
   ) where
@@ -186,6 +187,7 @@ import           Data.List
 import           Data.Maybe
 import           Data.Monoid                         (Sum(..))
 import qualified Data.Set                            as S
+import qualified Data.Map                            as M
 -- import           Data.Traversable                    (Traversable, traverse)
 
 import           Control.Basics
@@ -202,7 +204,7 @@ import           Theory.Model
 import           Theory.Proof
 import           Theory.Text.Pretty
 import           Theory.Tools.AbstractInterpretation
-import           Theory.Tools.InjectiveFactInstance
+import           Theory.Tools.InjectiveFacts
 import           Theory.Tools.LoopBreakers
 import           Theory.Tools.RuleVariants
 -- import           Theory.Constraint.Solver.Types
@@ -261,7 +263,7 @@ data ClosedRuleCache = ClosedRuleCache
        { _crcRules            :: ClassifiedRules
        , _crcUntypedCaseDists :: [CaseDistinction]
        , _crcTypedCaseDists   :: [CaseDistinction]
-       , _crcInjectiveFactInsts  :: S.Set InjectiveFactInstance
+       , _crcInjectiveFacts   :: InjectiveFacts
        }
        deriving( Eq, Ord, Show )
 
@@ -319,17 +321,16 @@ closeRuleCache :: [LNGuarded]        -- ^ Axioms to use.
                -> ClosedRuleCache    -- ^ Cached rules and case distinctions.
 closeRuleCache axioms typAsms sig protoRules intrRules isdiff = -- trace ("closeRuleCache: " ++ show classifiedRules) $
     ClosedRuleCache
-        classifiedRules untypedCaseDists typedCaseDists injFactInstances
+        classifiedRules untypedCaseDists typedCaseDists injFacts
   where
     ctxt0 = ProofContext
-        sig classifiedRules injFactInstances UntypedCaseDist [] AvoidInduction
+        sig classifiedRules injFacts UntypedCaseDist [] AvoidInduction
         (error "closeRuleCache: trace quantifier should not matter here")
         (error "closeRuleCache: lemma name should not matter here") [] isdiff
         (all isSubtermRule {-$ trace (show destr ++ " - " ++ show (map isSubtermRule destr))-} destr) (any isConstantRule destr)
 
     -- inj fact instances
-    injFactInstances =
-        processInjectiveFacts $ L.get cprRuleE <$> protoRules
+    injFacts = findInjectiveFacts $ L.get cprRuleAC <$> protoRules
 
     -- precomputing the case distinctions: we make sure to only add safety
     -- axioms. Otherwise, it wouldn't be sound to use the precomputed case
@@ -1015,7 +1016,7 @@ getProofContext :: Lemma a -> ClosedTheory -> ProofContext
 getProofContext l thy = ProofContext
     ( L.get thySignature                       thy)
     ( L.get (crcRules . thyCache)              thy)
-    ( L.get (crcInjectiveFactInsts . thyCache) thy)
+    ( L.get (crcInjectiveFacts . thyCache) thy)
     kind
     ( L.get (cases . thyCache)                 thy)
     inductionHint
@@ -1039,7 +1040,7 @@ getProofContextDiff s l thy = case s of
   LHS -> ProofContext
             ( L.get diffThySignature                           thy)
             ( L.get (crcRules . diffThyCacheLeft)              thy)
-            ( L.get (crcInjectiveFactInsts . diffThyCacheLeft) thy)
+            ( L.get (crcInjectiveFacts . diffThyCacheLeft)     thy)
             kind
             ( L.get (cases . diffThyCacheLeft)                 thy)
             inductionHint
@@ -1052,7 +1053,7 @@ getProofContextDiff s l thy = case s of
   RHS -> ProofContext
             ( L.get diffThySignature                    thy)
             ( L.get (crcRules . diffThyCacheRight)           thy)
-            ( L.get (crcInjectiveFactInsts . diffThyCacheRight) thy)
+            ( L.get (crcInjectiveFacts . diffThyCacheRight) thy)
             kind
             ( L.get (cases . diffThyCacheRight)              thy)
             inductionHint
@@ -1083,7 +1084,7 @@ getDiffProofContext l thy = DiffProofContext (proofContext LHS) (proofContext RH
         LHS -> ProofContext
             ( L.get diffThySignature                    thy)
             ( L.get (crcRules . diffThyDiffCacheLeft)           thy)
-            ( L.get (crcInjectiveFactInsts . diffThyDiffCacheLeft) thy)
+            ( L.get (crcInjectiveFacts . diffThyDiffCacheLeft) thy)
             TypedCaseDist
             ( L.get (crcTypedCaseDists . diffThyDiffCacheLeft)              thy)
             AvoidInduction
@@ -1096,7 +1097,7 @@ getDiffProofContext l thy = DiffProofContext (proofContext LHS) (proofContext RH
         RHS -> ProofContext
             ( L.get diffThySignature                    thy)
             ( L.get (crcRules . diffThyDiffCacheRight)           thy)
-            ( L.get (crcInjectiveFactInsts . diffThyDiffCacheRight) thy)
+            ( L.get (crcInjectiveFacts . diffThyDiffCacheRight) thy)
             TypedCaseDist
             ( L.get (crcTypedCaseDists . diffThyDiffCacheRight)              thy)
             AvoidInduction
@@ -1108,16 +1109,16 @@ getDiffProofContext l thy = DiffProofContext (proofContext LHS) (proofContext RH
             (any isConstantRule $ filter isDestrRule $ intruderRules $ L.get (crcRules . diffThyCacheRight) thy)
 
 -- | The facts with injective instances in this theory
-getInjectiveFactInsts :: ClosedTheory -> S.Set InjectiveFactInstance
-getInjectiveFactInsts = L.get (crcInjectiveFactInsts . thyCache)
+getInjectiveFacts :: ClosedTheory -> InjectiveFacts
+getInjectiveFacts = L.get (crcInjectiveFacts . thyCache)
 
 -- | The facts with injective instances in this theory
-getDiffInjectiveFactInsts :: Side -> Bool -> ClosedDiffTheory -> S.Set InjectiveFactInstance
-getDiffInjectiveFactInsts s isdiff = case (s, isdiff) of
-           (LHS, False) -> L.get (crcInjectiveFactInsts . diffThyCacheLeft)
-           (RHS, False) -> L.get (crcInjectiveFactInsts . diffThyCacheRight)
-           (LHS, True)  -> L.get (crcInjectiveFactInsts . diffThyDiffCacheLeft)
-           (RHS, True)  -> L.get (crcInjectiveFactInsts . diffThyDiffCacheRight)
+getDiffInjectiveFacts :: Side -> Bool -> ClosedDiffTheory -> InjectiveFacts
+getDiffInjectiveFacts s isdiff = case (s, isdiff) of
+           (LHS, False) -> L.get (crcInjectiveFacts . diffThyCacheLeft)
+           (RHS, False) -> L.get (crcInjectiveFacts . diffThyCacheRight)
+           (LHS, True)  -> L.get (crcInjectiveFacts . diffThyDiffCacheLeft)
+           (RHS, True)  -> L.get (crcInjectiveFacts . diffThyDiffCacheRight)
 
 -- | The classified set of rules modulo AC in this theory.
 getClassifiedRules :: ClosedTheory -> ClassifiedRules
@@ -1822,14 +1823,14 @@ prettyOpenDiffTheory =
 prettyClosedTheory :: HighlightDocument d => ClosedTheory -> d
 prettyClosedTheory thy =
     prettyTheory prettySignatureWithMaude
-                 ppInjectiveFactInsts
+                 ppInjectiveFacts
                  -- (prettyIntrVariantsSection . intruderRules . L.get crcRules)
                  prettyClosedProtoRule
                  prettyIncrementalProof
                  thy
   where
-    ppInjectiveFactInsts crc =
-        case S.toList $ injectiveFactTags $ L.get crcInjectiveFactInsts crc of
+    ppInjectiveFacts crc =
+        case M.keys $ L.get crcInjectiveFacts crc of
             []   -> emptyDoc
             tags -> multiComment $ sep
                       [ text "looping facts with injective instances:"
@@ -1839,15 +1840,15 @@ prettyClosedTheory thy =
 prettyClosedDiffTheory :: HighlightDocument d => ClosedDiffTheory -> d
 prettyClosedDiffTheory thy =
     prettyDiffTheory prettySignatureWithMaude
-                 ppInjectiveFactInsts
+                 ppInjectiveFacts
                  -- (prettyIntrVariantsSection . intruderRules . L.get crcRules)
                  (\_ -> emptyDoc) --prettyClosedEitherRule
                  prettyIncrementalDiffProof
                  prettyIncrementalProof
                  thy
   where
-    ppInjectiveFactInsts crc =
-        case S.toList $ injectiveFactTags $ L.get crcInjectiveFactInsts crc of
+    ppInjectiveFacts crc =
+        case M.keys $ L.get crcInjectiveFacts crc of
             []   -> emptyDoc
             tags -> multiComment $ sep
                       [ text "looping facts with injective instances:"

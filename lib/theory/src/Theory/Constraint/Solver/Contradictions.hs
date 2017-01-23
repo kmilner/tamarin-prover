@@ -48,7 +48,7 @@ import           Extension.Prelude
 import           Theory.Constraint.System
 import           Theory.Model
 import           Theory.Tools.IntruderRules
-import           Theory.Tools.InjectiveFactInstance
+import           Theory.Tools.InjectiveFacts
 import           Theory.Text.Pretty
 
 import           Term.Rewriting.Norm            (maybeNotNfSubterms, nf')
@@ -182,7 +182,7 @@ nonInjectiveFactInstances ctxt se = do
         kTerm              = firstTerm kFaPrem
         conflictingFact fa = factTag fa == kTag && firstTerm fa == kTerm
 
-    guard (kTag `S.member` (injectiveFactTags $ L.get pcInjectiveFactInsts ctxt))
+    guard (kTag `M.member` L.get pcInjectiveFacts ctxt)
     j <- S.toList $ D.reachableSet [i] less
 
     let isCounterExample = (j /= i) && (j /= k) &&

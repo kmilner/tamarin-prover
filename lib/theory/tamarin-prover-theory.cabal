@@ -101,7 +101,7 @@ library
 
       Theory.Tools.AbstractInterpretation
       Theory.Tools.EquationStore
-      Theory.Tools.InjectiveFactInstance
+      Theory.Tools.InjectiveFacts
       Theory.Tools.IntruderRules
       Theory.Tools.LoopBreakers
       Theory.Tools.RuleVariants
