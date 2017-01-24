@@ -44,6 +44,7 @@ type InjectiveFacts = M.Map FactTag InjectiveFactInfo
 data InjectiveFactInfo = InjectiveFactInfo
     { _ifiConstructionRules  :: S.Set ProtoRuleAC
     , _ifiDestructionRules   :: S.Set ProtoRuleAC
+    , _ifiFreshTermIndex     :: Int
     }
     deriving( Eq, Ord, Show)
 
@@ -51,65 +52,70 @@ $(L.mkLabels [''InjectiveFactInfo])
 
 -- | Compute a simple under-approximation to the set of facts with injective
 -- instances. A fact-tag is has injective instances, if there is no state of
--- the protocol with more than one instance with the same term as a first
+-- the protocol with more than one instance with the same term as a ith
 -- argument of the fact-tag.
 --
 -- We compute the under-approximation by checking that
 -- (1) the fact-tag is linear,
--- (2) every introduction of such a fact-tag is protected by a Fr-fact of the
---     first term, and
+-- (2) every introduction of such a fact-tag is protected by a Fr-fact of some
+--     ith term, and
 -- (3) every rule has at most one copy of this fact-tag in the conlcusion and
---     the first term arguments agree.
+--     the ith term arguments agree.
 --
 -- We exclude facts that are not copied in a rule, as they are already handled
 -- properly by the naive backwards reasoning.
 findInjectiveFacts :: [ProtoRuleAC] -> InjectiveFacts
 findInjectiveFacts rules = M.fromList $ do
-    tag         <- candidates
-    guard $ not $ any (counterexample tag) rules
+    (tag, i)       <- candidates
+    guard $ not $ any (counterexample (tag, i)) rules
     return (tag, InjectiveFactInfo 
-                    { _ifiConstructionRules =  S.fromList $ constructions tag
-                    , _ifiDestructionRules  =  S.fromList $ destructions tag 
+                    { _ifiConstructionRules =  S.fromList $ constructions (tag, i)
+                    , _ifiDestructionRules  =  S.fromList $ destructions (tag, i)
+                    , _ifiFreshTermIndex    =  i
                     })
   where
     concTags r          = factTag <$> L.get rConcs r
     premTags r          = factTag <$> L.get rPrems r
-    firstTerm           = head . factTerms
+    ithTerm i fact      = factTerms fact !! i
     tagsInConcs tag ru  = filter ((tag ==) . factTag) (L.get rConcs ru)
 
     candidates = sortednub $ do
-        ru  <- rules
-        tag <- concTags ru
+        ru      <- rules
+        fact    <- L.get rConcs ru
+        let tag  = factTag fact
         guard $ (factTagMultiplicity tag == Linear) && (tag `elem` premTags ru)
-        return tag
+        i       <- [0..(factArity fact) - 1]
+        return (tag, i)
 
-    -- All rules where the fact is only in conclusions once, and the first term
+    -- All rules where the fact is only in conclusions once, and the ith term
     -- was generated fresh
-    constructions tag = filter
+    constructions (tag, i) = filter
         (\r -> (length (tagsInConcs tag r) == 1) && (all (freshConc r) (tagsInConcs tag r))) rules
       where
-        freshConc ru faConc  = freshFact (firstTerm faConc) `elem` (L.get rPrems ru)
+        freshConc ru faConc  = freshFact (ithTerm i faConc) `elem` (L.get rPrems ru)
 
     -- All rules where the fact is a premise but isn't in conclusions
-    destructions tag = filter
+    destructions (tag, i) = filter
         (\r -> (tag `elem` premTags r) && not (tag `elem` concTags r)) rules
 
     -- A rule is a counterexample to injectivity if the fact is in the conclusions
     -- multiple times, or if it is in the conclusion without a corresponding premise
-    -- or fresh term
-    counterexample tag r  = length (tagsInConcs tag r) > 1
-        || (not (elem r $ constructions tag)
+    -- or fresh term, or if the ith term is not a fresh term in every construction
+    counterexample (tag, i) r  = length (tagsInConcs tag r) > 1
+        || (not (elem r $ constructions (tag, i))
             && any unmatched (tagsInConcs tag r))
+        || length (constructions (tag, i))  == 0 -- this requires every injective fact to have at least one construction rule
       where
         unmatched faConc = not $ (`any` L.get rPrems r) $ \faPrem ->
-            factTag faPrem == tag && firstTerm faConc == firstTerm faPrem
+            factTag faPrem == tag && ithTerm i faConc == ithTerm i faPrem
 
 -- Pretty-Printing
 --------------------
 prettyInjFacts :: (HighlightDocument d) => InjectiveFacts -> d
 prettyInjFacts injs = vsep $ map ppInjFact $ M.toList injs
   where
-    ppInjFact (f,l) = (fsep [keyword (text $ showFactTagArity f)])
+    ppInjFact (f,l) = (fsep [keyword (text $ showFactTagArity f),
+                             text (" with fresh term at index " ++ show (L.get ifiFreshTermIndex l))])
                         $-$ (fsep [text "Constructed by:", vcat (ppRuleNames $ constructs l)])
                         $-$ (destr (ppRuleNames $  destructs l))
       
