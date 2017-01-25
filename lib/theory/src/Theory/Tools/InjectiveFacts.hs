@@ -59,8 +59,8 @@ $(L.mkLabels [''InjectiveFactInfo])
 -- (1) the fact-tag is linear,
 -- (2) every introduction of such a fact-tag is protected by a Fr-fact of some
 --     ith term, and
--- (3) every rule has at most one copy of this fact-tag in the conlcusion and
---     the ith term arguments agree.
+-- (3) every rule has at most one copy of this fact-tag and ith term in the
+--     conclusion and the ith term arguments agree.
 --
 -- We exclude facts that are not copied in a rule, as they are already handled
 -- properly by the naive backwards reasoning.
@@ -90,10 +90,13 @@ findInjectiveFacts rules = M.fromList $ do
     -- Returns the ith terms of facts with the matching tag
     ithFactTerms (tag, i) fs = map (ithTerm i) $ filter ((tag ==) . factTag) fs
 
+    -- Given a list of Ord a, determines whether there are any duplicate instances of a
+    hasDuplicates ts = (length ts) /= (length $ S.fromList ts)
+
     -- All rules where the fact is only in conclusions once, and the ith term
     -- was generated fresh
     constructions (tag, i) = filter
-        (\r -> (length (tagsInConcs tag r) == 1) && (all (freshConc r) (tagsInConcs tag r))) rules
+        (\r -> (length (tagsInConcs tag r) > 0) && (all (freshConc r) (tagsInConcs tag r))) rules
       where
         freshConc ru faConc  = freshFact (ithTerm i faConc) `elem` (L.get rPrems ru)
 
@@ -104,9 +107,10 @@ findInjectiveFacts rules = M.fromList $ do
         inConcs ru term = elem term $ ithFactTerms (tag, i) (L.get rConcs ru)
 
     -- A rule is a counterexample to injectivity if the fact is in the conclusions
-    -- multiple times, or if it is in the conclusion without a corresponding premise
-    -- or fresh term, or if the ith term is not a fresh term in every construction
-    counterexample (tag, i) r  = length (tagsInConcs tag r) > 1
+    -- multiple times with the same ith term, or if it is in the conclusion without
+    -- a corresponding premise or fresh term, or if the ith term is not a fresh term
+    -- in every construction
+    counterexample (tag, i) r  = hasDuplicates (ithFactTerms (tag, i) (L.get rConcs r))
         || (not (elem r $ constructions (tag, i))
             && any unmatched (tagsInConcs tag r))
         || length (constructions (tag, i))  == 0 -- this requires every injective fact to have at least one construction rule
