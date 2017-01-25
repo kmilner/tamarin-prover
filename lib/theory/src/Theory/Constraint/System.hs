@@ -105,6 +105,11 @@ module Theory.Constraint.System (
   , resolveNodePremFact
   , resolveNodeConcFact
 
+  -- ** Injective facts
+  , injTermSafe
+  , isInjFactCreation
+  , isInjFactRemoval
+
   -- ** Actions
   , allActions
   , allKUActions
@@ -998,7 +1003,46 @@ allOpenGoalsAreSimpleFacts ctxt sys = M.foldlWithKey goalIsSimpleFact True (L.ge
 -- | Returns true if the current system is a diff system
 isDiffSystem :: System -> Bool
 isDiffSystem = L.get sDiffSystem
-        
+
+-- Injective Facts
+----------
+injTermSafe :: ProofContext -> Fact t -> Maybe t
+injTermSafe ctxt fa = do
+    info <- M.lookup (factTag fa) (L.get pcInjectiveFacts ctxt)
+    return $ factTerms fa !! (L.get ifiFreshTermIndex) info
+
+-- Given an injective fact fa and a NodeId, returns true if that NodeId
+-- created fa. A node created an injective fact if
+--  1) It is a creation rule for that injective fact
+--  2) the injective term of fa is created fresh at that node
+isInjFactCreation :: ProofContext -> System -> LNFact -> NodeId -> Bool
+isInjFactCreation ctxt sys fa nid = fromMaybe False $ do
+    fainfo  <- M.lookup (factTag fa) (L.get pcInjectiveFacts ctxt)
+    guard   $ isProtocolRule ru && any (\r -> getRuleName r == getRuleName ru) (L.get ifiCreationRules fainfo)
+    faterm  <- injTermSafe ctxt fa
+    return  $ freshFact (faterm) `elem` (L.get rPrems ru)
+  where
+    ru = nodeRule nid sys
+
+-- Given an injective fact fa and a NodeId, returns true if that NodeId
+-- removed fa. A node removed an injective fact if
+--  1) It is a removal rule for that injective fact
+--  2) the injective term of the fact is the same as the injective
+--      term in a premise of that rule
+isInjFactRemoval :: ProofContext -> System -> LNFact -> NodeId -> Bool
+isInjFactRemoval ctxt sys fa nid = fromMaybe False $ do
+    fainfo  <- M.lookup (factTag fa) (L.get pcInjectiveFacts ctxt)
+    guard   $ isProtocolRule ru && any (\x -> getRuleName x == getRuleName ru) (L.get ifiRemovalRules fainfo)
+    faterm  <- injTermSafe ctxt fa
+    return  $ inPremises faterm && notInConcs faterm
+  where
+    ru = nodeRule nid sys
+
+    sameTag  facts    = filter (\x -> factTag x == factTag fa) facts
+    inPremises term   = any (Just term ==) $ (injTermSafe ctxt) <$> (sameTag $ L.get rPrems ru)
+    notInConcs term   = all (Just term /=) $ (injTermSafe ctxt) <$> (sameTag $ L.get rConcs ru)
+
+
 -- Actions
 ----------
 

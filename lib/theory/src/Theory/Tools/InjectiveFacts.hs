@@ -17,6 +17,9 @@
 module Theory.Tools.InjectiveFacts (
       InjectiveFacts
     , InjectiveFactInfo(..)
+    , ifiCreationRules
+    , ifiRemovalRules
+    , ifiFreshTermIndex
 
     -- ** Constructing all instances
     , findInjectiveFacts
@@ -26,15 +29,15 @@ module Theory.Tools.InjectiveFacts (
 ) where
 
 import           Control.DeepSeq
-import           Extension.Prelude   (sortednub)
+import           Extension.Prelude      (sortednub)
 import           Data.DeriveTH
 import           Data.Binary
 
 -- import           Control.Applicative
 import           Control.Monad.Fresh
-import qualified Extension.Data.Label          as L
-import qualified Data.Set            as S
-import qualified Data.Map            as M
+import qualified Extension.Data.Label   as L
+import qualified Data.Set               as S
+import qualified Data.Map               as M
 
 import           Theory.Model
 import           Theory.Text.Pretty
@@ -42,9 +45,9 @@ import           Theory.Text.Pretty
 type InjectiveFacts = M.Map FactTag InjectiveFactInfo
 
 data InjectiveFactInfo = InjectiveFactInfo
-    { _ifiConstructionRules  :: S.Set ProtoRuleAC
-    , _ifiDestructionRules   :: S.Set ProtoRuleAC
-    , _ifiFreshTermIndex     :: Int
+    { _ifiCreationRules  :: S.Set ProtoRuleAC
+    , _ifiRemovalRules   :: S.Set ProtoRuleAC
+    , _ifiFreshTermIndex :: Int
     }
     deriving( Eq, Ord, Show)
 
@@ -69,9 +72,9 @@ findInjectiveFacts rules = M.fromList $ do
     (tag, i)       <- candidates
     guard $ not $ any (counterexample (tag, i)) rules
     return (tag, InjectiveFactInfo 
-                    { _ifiConstructionRules =  S.fromList $ constructions (tag, i)
-                    , _ifiDestructionRules  =  S.fromList $ destructions (tag, i)
-                    , _ifiFreshTermIndex    =  i
+                    { _ifiCreationRules  =  S.fromList $ constructions (tag, i)
+                    , _ifiRemovalRules   =  S.fromList $ destructions (tag, i)
+                    , _ifiFreshTermIndex =  i
                     })
   where
     concTags r          = factTag <$> L.get rConcs r
@@ -125,16 +128,16 @@ prettyInjFacts injs = vsep $ map ppInjFact $ M.toList injs
   where
     ppInjFact (f,l) = (fsep [keyword (text $ showFactTagArity f),
                              text (" with fresh term at index " ++ show (L.get ifiFreshTermIndex l))])
-                        $-$ (fsep [text "Constructed by:", vcat (ppRuleNames $ constructs l)])
+                        $-$ (fsep [text "Created by:", vcat (ppRuleNames $ constructs l)])
                         $-$ (destr (ppRuleNames $  destructs l))
       
-    destr []        = text "(Not destructed)"
-    destr  s        = fsep [text "Destructed by:",  vcat s]
+    destr []        = text "(Not removed)"
+    destr  s        = fsep [text "Removed by:",  vcat s]
 
     ppRuleNames s   = map prettyRuleName $ S.toList s
 
-    constructs info = L.get ifiConstructionRules info
-    destructs info  = L.get ifiDestructionRules info
+    constructs info = L.get ifiCreationRules info
+    destructs info  = L.get ifiRemovalRules info
 
 -- derived instances
 --------------------
