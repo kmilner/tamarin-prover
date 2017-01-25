@@ -87,6 +87,9 @@ findInjectiveFacts rules = M.fromList $ do
         i       <- [0..(factArity fact) - 1]
         return (tag, i)
 
+    -- Returns the ith terms of facts with the matching tag
+    ithFactTerms (tag, i) fs = map (ithTerm i) $ filter ((tag ==) . factTag) fs
+
     -- All rules where the fact is only in conclusions once, and the ith term
     -- was generated fresh
     constructions (tag, i) = filter
@@ -94,9 +97,11 @@ findInjectiveFacts rules = M.fromList $ do
       where
         freshConc ru faConc  = freshFact (ithTerm i faConc) `elem` (L.get rPrems ru)
 
-    -- All rules where the fact is a premise but isn't in conclusions
+    -- All rules where the fact and its ith term argument is a premise but isn't in conclusions
     destructions (tag, i) = filter
-        (\r -> (tag `elem` premTags r) && not (tag `elem` concTags r)) rules
+        (\r -> any (not . inConcs r) (ithFactTerms (tag, i) (L.get rPrems r))) rules
+      where
+        inConcs ru term = elem term $ ithFactTerms (tag, i) (L.get rConcs ru)
 
     -- A rule is a counterexample to injectivity if the fact is in the conclusions
     -- multiple times, or if it is in the conclusion without a corresponding premise
