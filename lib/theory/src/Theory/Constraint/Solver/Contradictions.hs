@@ -22,6 +22,7 @@ module Theory.Constraint.Solver.Contradictions (
   , prettyContradiction
 
   ) where
+-- import           Debug.Trace
 
 import           Prelude                        hiding (id, (.))
 
@@ -176,6 +177,7 @@ substCreatesNonNormalTerms hnd sys fsubst =
 -- constraint 'j < k'.
 nonInjectiveFactInstances :: ProofContext -> System -> [(NodeId, NodeId, NodeId)]
 nonInjectiveFactInstances ctxt se = do
+--    guard $ injectiveLifetimeDebug ctxt se
     Edge c@(i, _) (k, _) <- S.toList $ L.get sEdges se
     let kFaPrem            = nodeConcFact c se
         kTag               = factTag kFaPrem
@@ -199,6 +201,15 @@ nonInjectiveFactInstances ctxt se = do
   where
     less      = rawLessRel se
     firstTerm = headMay . factTerms
+
+-- Prints lifetime checking of all nodes against all unsolved premises
+--injectiveLifetimeDebug :: ProofContext -> System -> Bool
+--injectiveLifetimeDebug ctxt se = all (True ==) $ do
+--    (_,fa)  <- unsolvedPremises se
+--    guard   $ factTag fa `M.member` L.get pcInjectiveFacts ctxt
+--    j       <- M.keys $ L.get sNodes se
+--    guard   $ trace (show (isInjFactCreation ctxt se fa j)) True
+--    return  $ trace (show (isInjFactRemoval ctxt se fa j)) True
 
 -- | The node-ids that must be instantiated to the trace, but are temporally
 -- after the last node.

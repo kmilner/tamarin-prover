@@ -1018,11 +1018,12 @@ injTermSafe ctxt fa = do
 isInjFactCreation :: ProofContext -> System -> LNFact -> NodeId -> Bool
 isInjFactCreation ctxt sys fa nid = fromMaybe False $ do
     fainfo  <- M.lookup (factTag fa) (L.get pcInjectiveFacts ctxt)
+    ru      <- nodeRuleSafe nid sys
+--    guard   $ trace ("Checking if " ++ show (getRuleName ru) ++ " @ " ++ (show nid) ++ " created " ++ show (factTag fa)) True
     guard   $ isProtocolRule ru && any (\r -> getRuleName r == getRuleName ru) (L.get ifiCreationRules fainfo)
     faterm  <- injTermSafe ctxt fa
+--    guard   $ trace ("     (On term " ++ show (faterm) ++ ") ") True
     return  $ freshFact (faterm) `elem` (L.get rPrems ru)
-  where
-    ru = nodeRule nid sys
 
 -- Given an injective fact fa and a NodeId, returns true if that NodeId
 -- removed fa. A node removed an injective fact if
@@ -1032,15 +1033,16 @@ isInjFactCreation ctxt sys fa nid = fromMaybe False $ do
 isInjFactRemoval :: ProofContext -> System -> LNFact -> NodeId -> Bool
 isInjFactRemoval ctxt sys fa nid = fromMaybe False $ do
     fainfo  <- M.lookup (factTag fa) (L.get pcInjectiveFacts ctxt)
+    ru      <- nodeRuleSafe nid sys
+--    guard   $ trace ("Checking if " ++ show (getRuleName ru) ++ " @ " ++ (show nid) ++ " removed " ++ show (factTag fa)) True
     guard   $ isProtocolRule ru && any (\x -> getRuleName x == getRuleName ru) (L.get ifiRemovalRules fainfo)
     faterm  <- injTermSafe ctxt fa
-    return  $ inPremises faterm && notInConcs faterm
+--    guard   $ trace ("     (On term " ++ show (faterm) ++ ") ") True
+    return  $ inPremises faterm ru && notInConcs faterm ru
   where
-    ru = nodeRule nid sys
-
     sameTag  facts    = filter (\x -> factTag x == factTag fa) facts
-    inPremises term   = any (Just term ==) $ (injTermSafe ctxt) <$> (sameTag $ L.get rPrems ru)
-    notInConcs term   = all (Just term /=) $ (injTermSafe ctxt) <$> (sameTag $ L.get rConcs ru)
+    inPremises term r = any (Just term ==) $ (injTermSafe ctxt) <$> (sameTag $ L.get rPrems r)
+    notInConcs term r = all (Just term /=) $ (injTermSafe ctxt) <$> (sameTag $ L.get rConcs r)
 
 
 -- Actions
