@@ -1020,7 +1020,7 @@ isInjFactCreation ctxt sys fa nid = fromMaybe False $ do
     fainfo  <- M.lookup (factTag fa) (L.get pcInjectiveFacts ctxt)
     ru      <- nodeRuleSafe nid sys
 --    guard   $ trace ("Checking if " ++ show (getRuleName ru) ++ " @ " ++ (show nid) ++ " created " ++ show (factTag fa)) True
-    guard   $ isProtocolRule ru && any (\r -> getRuleName r == getRuleName ru) (L.get ifiCreationRules fainfo)
+    guard   $ isProtocolRule ru && any (getRuleName ru ==) (getRuleName <$> L.get ifiCreationRules fainfo)
     faterm  <- injTermSafe ctxt fa
 --    guard   $ trace ("     (On term " ++ show (faterm) ++ ") ") True
     return  $ freshFact (faterm) `elem` (L.get rPrems ru)
@@ -1035,7 +1035,7 @@ isInjFactRemoval ctxt sys fa nid = fromMaybe False $ do
     fainfo  <- M.lookup (factTag fa) (L.get pcInjectiveFacts ctxt)
     ru      <- nodeRuleSafe nid sys
 --    guard   $ trace ("Checking if " ++ show (getRuleName ru) ++ " @ " ++ (show nid) ++ " removed " ++ show (factTag fa)) True
-    guard   $ isProtocolRule ru && any (\x -> getRuleName x == getRuleName ru) (L.get ifiRemovalRules fainfo)
+    guard   $ isProtocolRule ru && any (getRuleName ru ==) (getRuleName <$> L.get ifiRemovalRules fainfo)
     faterm  <- injTermSafe ctxt fa
 --    guard   $ trace ("     (On term " ++ show (faterm) ++ ") ") True
     return  $ inPremises faterm ru && notInConcs faterm ru

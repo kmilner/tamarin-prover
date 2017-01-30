@@ -45,8 +45,8 @@ import           Theory.Text.Pretty
 type InjectiveFacts = M.Map FactTag InjectiveFactInfo
 
 data InjectiveFactInfo = InjectiveFactInfo
-    { _ifiCreationRules  :: S.Set ProtoRuleAC
-    , _ifiRemovalRules   :: S.Set ProtoRuleAC
+    { _ifiCreationRules  :: [RuleAC]
+    , _ifiRemovalRules   :: [RuleAC]
     , _ifiFreshTermIndex :: Int
     }
     deriving( Eq, Ord, Show)
@@ -72,8 +72,8 @@ findInjectiveFacts rules = M.fromList $ do
     (tag, i)       <- candidates
     guard $ not $ any (counterexample (tag, i)) rules
     return (tag, InjectiveFactInfo 
-                    { _ifiCreationRules  =  S.fromList $ constructions (tag, i)
-                    , _ifiRemovalRules   =  S.fromList $ destructions (tag, i)
+                    { _ifiCreationRules  =  (fmap ProtoInfo) <$> constructions (tag, i)
+                    , _ifiRemovalRules   =  (fmap ProtoInfo) <$> destructions (tag, i)
                     , _ifiFreshTermIndex =  i
                     })
   where
@@ -134,7 +134,7 @@ prettyInjFacts injs = vsep $ map ppInjFact $ M.toList injs
     destr []        = text "(Not removed)"
     destr  s        = fsep [text "Removed by:",  vcat s]
 
-    ppRuleNames s   = map prettyRuleName $ S.toList s
+    ppRuleNames s   = map prettyRuleName s
 
     constructs info = L.get ifiCreationRules info
     destructs info  = L.get ifiRemovalRules info
