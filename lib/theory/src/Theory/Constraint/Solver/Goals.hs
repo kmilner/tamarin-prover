@@ -47,6 +47,7 @@ import           Theory.Constraint.Solver.Reduction
 -- import           Theory.Constraint.Solver.Types
 import           Theory.Constraint.System
 import           Theory.Tools.IntruderRules (mkDUnionRule, isDExpRule, isDPMultRule, isDEMapRule)
+import           Theory.Tools.InjectiveFacts
 import           Theory.Model
 
 ------------------------------------------------------------------------------
@@ -94,6 +95,7 @@ openGoals sys = do
                     || isUnion m || isNullaryPublicFunction m
         ActionG _ _                               -> not solved
         PremiseG _ _                              -> not solved
+        InjG _ _                                  -> not solved
         -- Technically the 'False' disj would be a solvable goal. However, we
         -- have a separate proof method for this, i.e., contradictions.
         DisjG (Disj [])                           -> False
@@ -206,6 +208,7 @@ solveGoal goal = do
       ActionG i fa  -> solveAction  (nonSilentRules rules) (i, fa)
       PremiseG p fa ->
            solvePremise (get crProtocol rules ++ get crConstruct rules) p fa
+      InjG p fa     -> solveInjCreation p fa
       ChainG c p    -> solveChain (get crDestruct  rules) (c, p)
       SplitG i      -> solveSplit i
       DisjG disj    -> solveDisjunction disj
@@ -258,6 +261,22 @@ solvePremise rules p faPrem
       (ru, c, faConc) <- insertFreshNodeConc rules
       insertEdges [(c, faConc, faPrem, p)]
       return $ showRuleCaseName ru
+
+solveInjCreation :: NodePrem       -- ^ Premise that requires injective fact.
+                 -> LNFact         -- ^ Injective fact.
+                 -> Reduction String -- ^ Case name to use.
+solveInjCreation p fa = do
+    pc       <- getProofContext
+    let mayInfo = M.lookup (factTag fa) $ get pcInjectiveFacts pc
+    case mayInfo of
+        Nothing -> error $ "solveInjCreation: non-injective goal"
+        Just injInfo -> do
+            (c, ru) <- insertFreshNode $ get ifiCreationRules injInfo
+            (_,ruConcFa) <- disjunctionOfList $ filter (\(_,x) -> factTag x == factTag fa) $ enumConcs ru
+
+            insertLess c (fst p)
+            void $ solveTermEqs SplitNow [Equal (injTerm pc fa) (injTerm pc ruConcFa)]
+            return $ showRuleCaseName ru
 
 -- | CR-rule *DG2_chain*: solve a chain constraint.
 solveChain :: [RuleAC]              -- ^ All destruction rules.

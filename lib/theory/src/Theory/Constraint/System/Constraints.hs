@@ -99,6 +99,8 @@ data Goal =
        -- A destruction chain.
      | PremiseG NodePrem LNFact
        -- ^ A premise that must have an incoming direct edge.
+     | InjG NodePrem LNFact
+       -- ^ An injective fact that must have a corresponding creation
      | SplitG SplitId
        -- ^ A case split over equalities.
      | DisjG (Disj LNGuarded)
@@ -119,6 +121,10 @@ isStandardActionGoal _              = False
 isPremiseGoal :: Goal -> Bool
 isPremiseGoal (PremiseG _ _) = True
 isPremiseGoal _              = False
+
+isInjGoal :: Goal -> Bool
+isInjGoal (InjG _ _) = True
+isInjGoal _          = False
 
 isChainGoal :: Goal -> Bool
 isChainGoal (ChainG _ _) = True
@@ -141,6 +147,7 @@ instance HasFrees Goal where
     foldFrees f goal = case goal of
         ActionG i fa  -> foldFrees f i <> foldFrees f fa
         PremiseG p fa -> foldFrees f p <> foldFrees f fa
+        InjG p fa     -> foldFrees f p <> foldFrees f fa
         ChainG c p    -> foldFrees f c <> foldFrees f p
         SplitG i      -> foldFrees f i
         DisjG x       -> foldFrees f x
@@ -153,6 +160,7 @@ instance HasFrees Goal where
     mapFrees f goal = case goal of
         ActionG i fa  -> ActionG  <$> mapFrees f i <*> mapFrees f fa
         PremiseG p fa -> PremiseG <$> mapFrees f p <*> mapFrees f fa
+        InjG p fa     -> InjG     <$> mapFrees f p <*> mapFrees f fa
         ChainG c p    -> ChainG   <$> mapFrees f c <*> mapFrees f p
         SplitG i      -> SplitG   <$> mapFrees f i
         DisjG x       -> DisjG    <$> mapFrees f x
@@ -161,6 +169,7 @@ instance Apply Goal where
     apply subst goal = case goal of
         ActionG i fa  -> ActionG  (apply subst i) (apply subst fa)
         PremiseG p fa -> PremiseG (apply subst p) (apply subst fa)
+        InjG p fa     -> InjG     (apply subst p) (apply subst fa)
         ChainG c p    -> ChainG   (apply subst c) (apply subst p)
         SplitG i      -> SplitG   (apply subst i)
         DisjG x       -> DisjG    (apply subst x)
@@ -200,6 +209,8 @@ prettyGoal (PremiseG (i, (PremIdx v)) fa) =
     -- Note that we can use "▷" for conclusions once we need them.
     prettyLNFact fa <-> text ("▶" ++ subscript (show v)) <-> prettyNodeId i
     -- prettyNodePrem p <> brackets (prettyLNFact fa)
+prettyGoal (InjG (i, (PremIdx v)) fa) =
+    text "Creation of " <-> prettyLNFact fa <-> text ("▶" ++ subscript (show v)) <-> prettyNodeId i
 prettyGoal (DisjG (Disj []))  = text "Disj" <-> operator_ "(⊥)"
 prettyGoal (DisjG (Disj gfs)) = fsep $
     punctuate (operator_ "  ∥") (map (nest 1 . parens . prettyGuarded) gfs)

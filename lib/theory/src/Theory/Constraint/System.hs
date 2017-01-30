@@ -106,6 +106,7 @@ module Theory.Constraint.System (
   , resolveNodeConcFact
 
   -- ** Injective facts
+  , injTerm
   , injTermSafe
   , isInjFactCreation
   , isInjFactRemoval
@@ -959,6 +960,7 @@ unsolvedTrivialGoals :: System -> [(Either NodePrem LVar, LNFact)]
 unsolvedTrivialGoals sys = foldl f [] $ M.toList (L.get sGoals sys)
   where
     f l (PremiseG premidx fa, status) = if ((isTrivialFact fa /= Nothing) && (not $ L.get gsSolved status)) then (Left premidx, fa):l else l 
+    f l (InjG premidx fa, status)     = l
     f l (ActionG var fa, status)      = if ((isTrivialFact fa /= Nothing) && (isKUFact fa) && (not $ L.get gsSolved status)) then (Right var, fa):l else l 
     f l (ChainG _ _, _)               = l 
     f l (SplitG _, _)                 = l 
@@ -997,6 +999,7 @@ allOpenGoalsAreSimpleFacts ctxt sys = M.foldlWithKey goalIsSimpleFact True (L.ge
     goalIsSimpleFact ret (PremiseG (nid, _) fact) (GoalStatus solved _ _) = ret && (solved || (isTrivialFact fact /= Nothing) && (not (isProtocolRule r) || (getOriginalRule ctxt LHS r == getOriginalRule ctxt RHS r)))
       where
         r = nodeRule nid sys
+    goalIsSimpleFact ret (InjG _ _)               (GoalStatus solved _ _) = ret && solved
     goalIsSimpleFact ret (SplitG _)               (GoalStatus solved _ _) = ret && solved
     goalIsSimpleFact ret (DisjG _)                (GoalStatus solved _ _) = ret && solved
 
@@ -1006,6 +1009,14 @@ isDiffSystem = L.get sDiffSystem
 
 -- Injective Facts
 ----------
+injTerm :: ProofContext -> Fact t -> t
+injTerm ctxt fa = fromMaybe errMsg $ do
+    info <- M.lookup (factTag fa) (L.get pcInjectiveFacts ctxt)
+    return $ factTerms fa !! (L.get ifiFreshTermIndex) info
+  where
+    errMsg = error $
+        "nodeRule: fact '" ++ showFactTag (factTag fa) ++ "' is not marked injective\n"
+
 injTermSafe :: ProofContext -> Fact t -> Maybe t
 injTermSafe ctxt fa = do
     info <- M.lookup (factTag fa) (L.get pcInjectiveFacts ctxt)

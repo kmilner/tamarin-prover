@@ -49,7 +49,6 @@ import           Extension.Prelude
 import           Theory.Constraint.System
 import           Theory.Model
 import           Theory.Tools.IntruderRules
-import           Theory.Tools.InjectiveFacts
 import           Theory.Text.Pretty
 
 import           Term.Rewriting.Norm            (maybeNotNfSubterms, nf')

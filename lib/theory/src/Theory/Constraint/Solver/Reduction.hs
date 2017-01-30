@@ -258,7 +258,11 @@ labelNodeId = \i rules parent -> do
               void (insertAction j fa)
 
           -- Store premise goal for later processing using CR-rule *DG2_2*
-          | otherwise -> insertGoal (PremiseG (i,v) fa) (v `elem` breakers)
+          | otherwise -> do
+              pc <- getProofContext
+              when (M.member (factTag fa) (get pcInjectiveFacts pc))
+                $ insertGoal (InjG (i,v) fa) (v `elem` breakers)
+              insertGoal (PremiseG (i,v) fa) (v `elem` breakers)
       where
         breakers = ruleInfo (get praciLoopBreakers) (const []) $ get rInfo ru
 
@@ -509,6 +513,7 @@ markGoalAsSolved how goal =
       PremiseG _ fa
         | isKDFact fa -> modM sGoals $ M.delete goal
         | otherwise   -> updateStatus
+      InjG _ _        -> updateStatus
       ChainG _ _      -> modM sGoals $ M.delete goal
       SplitG _        -> updateStatus
       DisjG disj      -> modM sFormulas       (S.delete $ GDisj disj) >>
