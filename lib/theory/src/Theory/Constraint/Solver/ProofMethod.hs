@@ -1051,6 +1051,7 @@ injRanking ctxt sys =
                                 || (isFirstProtoFact goal)
                                 || (isChainGoal goal)
                                 || (isFreshKnowsGoal goal)
+                                || (isInjGoal goal)
 
     isMedPriorityGoal goaltuple = (isStandardActionGoal $ fst goaltuple)
                                     || (isDisjGoal $ fst goaltuple)
@@ -1095,6 +1096,9 @@ injRanking ctxt sys =
     isFreshKnowsGoal goal = case msgPremise goal of
         Just (viewTerm -> Lit (Var lv)) | (lvarSort lv == LSortFresh) -> True
         _                                                             -> False
+
+    isInjGoal (InjG _ _) = True
+    isInjGoal _          = False
 
     isMsgOneCaseGoal goal = case msgPremise goal of
         Just (viewTerm -> FApp o _) | o `elem` oneCaseOnly -> True
