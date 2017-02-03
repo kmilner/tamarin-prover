@@ -271,7 +271,7 @@ solveInjCreation p fa = do
     case mayInfo of
         Nothing -> error $ "solveInjCreation: non-injective goal"
         Just injInfo -> do
-            (c, ru) <- insertFreshNode $ get ifiCreationRules injInfo
+            (c, ru) <- insertFreshNode (get ifiCreationRules injInfo) Nothing
             (_,ruConcFa) <- disjunctionOfList $ filter (\(_,x) -> factTag x == factTag fa) $ enumConcs ru
 
             insertLess c (fst p)
