@@ -82,14 +82,14 @@ specialIntruderRules diff =
     [ kuRule CoerceRule      [kdFact x_var]                 (x_var)
     , kuRule PubConstrRule   []                             (x_pub_var)
     , kuRule FreshConstrRule [Fact FreshFact [x_fresh_var]] (x_fresh_var)
-    , Rule ISendRule [kuFact x_var]  [Fact InFact [x_var]] [kLogFact x_var]
-    , Rule IRecvRule [Fact OutFact [x_var]] [Fact KDFact [x_var]] []
+    , Rule ISendRule [kuFact x_var]  [Fact InFact [x_var]] [kLogFact x_var] []
+    , Rule IRecvRule [Fact OutFact [x_var]] [Fact KDFact [x_var]] [] []
     ] ++
     if diff 
-       then [ Rule IEqualityRule [kuFact x_var, kdFact x_var]  [] [] ]
+       then [ Rule IEqualityRule [kuFact x_var, kdFact x_var]  [] [] [] ]
        else []
   where
-    kuRule name prems t = Rule name prems [kuFact t] [kuFact t]
+    kuRule name prems t = Rule name prems [kuFact t] [kuFact t] []
 
     x_var       = varTerm (LVar "x"  LSortMsg   0)
     x_pub_var   = varTerm (LVar "x"  LSortPub   0)
@@ -120,7 +120,7 @@ destructionRules bool (CtxtStRule lhs@(viewTerm -> FApp _ _) (StRhs (pos:[]) rhs
         irule = if {-trace (show lhs ++ " " ++ show pos ++ " " ++ show posname ++ " " ++ show rhs ++ " " ++ show (lhs `atPos` pos) ++ " " ++ show (frees rhs == []))-} (t' /= rhs && rhs `notElem` uprems')
                 then [ Rule (DestrRule name (-1) (rhs == lhs `atPos` pos) (frees rhs == []))
                             ((kdFact  t'):(map kuFact uprems'))
-                            [kdFact rhs] [] ]
+                            [kdFact rhs] [] [] ]
                 else []
     go _      (viewTerm -> FApp (NoEq (_,(_,Private))) _) _     _ _  = []
     go _      (viewTerm -> Lit _)                         (_:_) _ _  =
@@ -155,7 +155,7 @@ privateConstructorRules :: [CtxtStRule] -> [IntrRuleAC]
 privateConstructorRules rules = map createRule $ derivablePrivateConstants (privateConstructorEquations rules) []
   where
     -- creates a constructor rule for constant s
-    createRule s = Rule (ConstrRule (append (pack "_") s)) [] [concfact] [concfact]
+    createRule s = Rule (ConstrRule (append (pack "_") s)) [] [concfact] [concfact] []
       where m        = fAppNoEq (s,(0,Private)) []
             concfact = kuFact m
 
@@ -166,9 +166,9 @@ minimizeIntruderRules diff rules =
       $ if diff then rules else go [] rules
   where
     go checked [] = reverse checked
-    go checked (r@(Rule _ prems concs _):unchecked) = go checked' unchecked
+    go checked (r@(Rule _ prems concs _ _):unchecked) = go checked' unchecked
       where
-        checked' = if any (\(Rule _ prems' concs' _)
+        checked' = if any (\(Rule _ prems' concs' _ _)
                                -> concs' == concs && prems' `subsetOf` prems)
                           (checked++unchecked)
                    then checked
@@ -194,7 +194,7 @@ constructionRules :: NoEqFunSig -> [IntrRuleAC]
 constructionRules fSig =
     [ createRule s k | (s,(k,Public)) <- S.toList fSig ]
   where
-    createRule s k = Rule (ConstrRule (append (pack "_") s)) (map kuFact vars) [concfact] [concfact]
+    createRule s k = Rule (ConstrRule (append (pack "_") s)) (map kuFact vars) [concfact] [concfact] []
       where vars     = take k [ varTerm (LVar "x"  LSortMsg i) | i <- [0..] ]
             m        = fAppNoEq (s,(k,Public)) vars
             concfact = kuFact m
@@ -218,7 +218,7 @@ dhIntruderRules diff = reader $ \hnd -> minimizeIntruderRules diff $
     x_var_1 = varTerm (LVar "x" LSortMsg 1)
 
     expRule mkInfo kudFact mkAction =
-        Rule mkInfo [bfact, efact] [concfact] (mkAction concfact)
+        Rule mkInfo [bfact, efact] [concfact] (mkAction concfact) []
       where
         bfact = kudFact x_var_0
         efact = kuFact  x_var_1
@@ -226,7 +226,7 @@ dhIntruderRules diff = reader $ \hnd -> minimizeIntruderRules diff $
         concfact = kudFact conc
 
     invRule mkInfo kudFact mkAction =
-        Rule mkInfo [bfact] [concfact] (mkAction concfact)
+        Rule mkInfo [bfact] [concfact] (mkAction concfact) []
       where
         bfact    = kudFact x_var_0
         conc     = fAppInv x_var_0
@@ -257,9 +257,9 @@ variantsIntruder hnd minimizeVariants ru = do
 
 -- | @normRule irule@ computes the normal form of @irule@
 normRule' :: IntrRuleAC -> WithMaude IntrRuleAC
-normRule' (Rule i ps cs as) = reader $ \hnd ->
+normRule' (Rule i ps cs as is) = reader $ \hnd ->
     let normFactTerms = map (fmap (\t -> norm' t `runReader` hnd)) in
-    Rule i (normFactTerms ps) (normFactTerms cs) (normFactTerms as)
+    Rule i (normFactTerms ps) (normFactTerms cs) (normFactTerms as) (normFactTerms is)
 
 ------------------------------------------------------------------------------
 -- Multiset intruder rules
@@ -274,7 +274,7 @@ mkDUnionRule :: [LNTerm] -> LNTerm -> IntrRuleAC
 mkDUnionRule t_prems t_conc =
     Rule (DestrRule (append (pack "_") unionSymString) 0 True False)
          [kdFact $ fAppAC Union t_prems]
-         [kdFact t_conc] []
+         [kdFact t_conc] [] []
 
 ------------------------------------------------------------------------------
 -- Bilinear Pairing Intruder rules.
@@ -296,7 +296,7 @@ bpIntruderRules diff = reader $ \hnd -> minimizeIntruderRules diff $
     x_var_1 = varTerm (LVar "x" LSortMsg 1)
 
     pmultRule mkInfo kudFact mkAction =
-        Rule mkInfo [bfact, efact] [concfact] (mkAction concfact)
+        Rule mkInfo [bfact, efact] [concfact] (mkAction concfact) []
       where
         bfact = kudFact x_var_0
         efact = kuFact  x_var_1
@@ -304,7 +304,7 @@ bpIntruderRules diff = reader $ \hnd -> minimizeIntruderRules diff $
         concfact = kudFact conc
 
     emapRule mkInfo kudFact mkAction =
-        Rule mkInfo [bfact, efact] [concfact] (mkAction concfact)
+        Rule mkInfo [bfact, efact] [concfact] (mkAction concfact) []
       where
         bfact = kudFact x_var_0
         efact = kudFact  x_var_1
@@ -321,10 +321,10 @@ bpVariantsIntruder hnd ru = do
     -- fact that all other variants are of the form
     -- "pmult(..), pmult(..) -> em(..)"
     case ruvariant of
-      Rule i [Fact KDFact args@[viewTerm -> Lit (Var _)], yfact] concs actions ->
-        return $ Rule i [Fact KUFact args, yfact] concs actions
-      Rule i [yfact, Fact KDFact args@[viewTerm -> Lit (Var _)]] concs actions ->
-        return $ Rule i [yfact, Fact KUFact args] concs actions
+      Rule i [Fact KDFact args@[viewTerm -> Lit (Var _)], yfact] concs actions invars ->
+        return $ Rule i [Fact KUFact args, yfact] concs actions invars
+      Rule i [yfact, Fact KDFact args@[viewTerm -> Lit (Var _)]] concs actions invars ->
+        return $ Rule i [yfact, Fact KUFact args] concs actions invars
       _ -> return ruvariant
 
   where

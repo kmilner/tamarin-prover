@@ -265,7 +265,7 @@ unboundCheck info ru
         ( "unbound"
         , text info $-$ (nest 2 $ prettyVarList unboundVars) )
   where
-    boundVars   = S.fromList $ frees (get rPrems ru)
+    boundVars   = S.fromList $ frees (get rPrems ru, get rInvars ru)
     unboundVars = do
         v <- frees (get rConcs ru, get rActs ru, get rInfo ru)
         guard $ not (lvarSort v == LSortPub || v `S.member` boundVars)
@@ -755,11 +755,12 @@ multRestrictedReport thy = do
                 $-$ (if null unbounds then mempty
                      else nest 2 $ (text "Variables that occur only in rhs: ") <-> (prettyVarList unbounds))
   where
-    abstractRule ru@(Rule i lhs acts rhs) =
+    abstractRule ru@(Rule i lhs acts rhs invars) =
         (`evalFreshAvoiding` ru) .  (`evalBindT` noBindings) $ do
         Rule i <$> mapM (traverse abstractTerm) lhs
                <*> mapM (traverse replaceAbstracted) acts
                <*> mapM (traverse replaceAbstracted) rhs
+               <*> mapM (traverse replaceAbstracted) invars
 
     abstractTerm (viewTerm -> FApp o args) | o `S.member` irreducible =
         fApp o <$> mapM abstractTerm args
@@ -820,11 +821,12 @@ multRestrictedReportDiff thy = do
                 $-$ (if null unbounds then mempty
                      else nest 2 $ (text "Variables that occur only in rhs: ") <-> (prettyVarList unbounds))
   where
-    abstractRule ru@(Rule i lhs acts rhs) =
+    abstractRule ru@(Rule i lhs acts rhs invars) =
         (`evalFreshAvoiding` ru) .  (`evalBindT` noBindings) $ do
         Rule i <$> mapM (traverse abstractTerm) lhs
                <*> mapM (traverse replaceAbstracted) acts
                <*> mapM (traverse replaceAbstracted) rhs
+               <*> mapM (traverse replaceAbstracted) invars
 
     abstractTerm (viewTerm -> FApp o args) | o `S.member` irreducible =
         fApp o <$> mapM abstractTerm args

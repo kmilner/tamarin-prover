@@ -708,6 +708,14 @@ instance (HasFrees a, HasFrees b, HasFrees c) => HasFrees (a, b, c) where
     mapFrees     f (x0, y0, z0) =
         (\(x, (y, z)) -> (x, y, z)) <$> mapFrees f (x0, (y0, z0))
 
+instance (HasFrees a, HasFrees b, HasFrees c, HasFrees d) => HasFrees (a, b, c, d) where
+    foldFrees    f (w, x, y, z)    = foldFrees f (w, (x, y, z))
+    foldFreesOcc f p (w, x, y, z)  =
+        foldFreesOcc f ("0":p) w `mappend` foldFreesOcc f ("1":p) x 
+            `mappend` foldFreesOcc f ("2":p) y `mappend` foldFreesOcc f ("3":p) z
+    mapFrees     f (w0, x0, y0, z0) =
+        (\(w, (x, y, z)) -> (w, x, y, z)) <$> mapFrees f (w0, (x0, y0, z0))
+
 instance HasFrees a => HasFrees [a] where
     foldFrees    f      = foldMap  (foldFrees f)
     foldFreesOcc f c xs = mconcat $ (map (\(i,x) -> foldFreesOcc f (show i:c) x)) $ zip [(0::Int)..] xs

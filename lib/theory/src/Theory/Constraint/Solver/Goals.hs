@@ -247,7 +247,7 @@ solvePremise rules p faPrem
       let concLearn = kdFact mLearn
           premLearn = outFact mLearn
           -- !! Make sure that you construct the correct rule!
-          ruLearn = Rule (IntrInfo IRecvRule) [premLearn] [concLearn] []
+          ruLearn = Rule (IntrInfo IRecvRule) [premLearn] [concLearn] [] []
           cLearn = (iLearn, ConcIdx 0)
           pLearn = (iLearn, PremIdx 0)
       modM sNodes  (M.insert iLearn ruLearn)

@@ -58,7 +58,7 @@ tmpdir = "/tmp/tamarin/"
 --      to obtain DNF of equations.
 --   4. Simplify rule.
 variantsProtoRule :: MaudeHandle -> ProtoRuleE -> ProtoRuleAC
-variantsProtoRule hnd ru@(Rule ri prems0 concs0 acts0) =
+variantsProtoRule hnd ru@(Rule ri prems0 concs0 acts0 invars0) =
     -- rename rule to decrease variable indices
     (`Precise.evalFresh` Precise.nothingUsed) . renamePrecise  $ convertRule `evalFreshAvoiding` ru
   where
@@ -90,10 +90,11 @@ variantsProtoRule hnd ru@(Rule ri prems0 concs0 acts0) =
 
     abstrRule = (`runBindT` noBindings) $ do
         -- first import all vars into binding to obtain nicer names
-        mapM_ abstrTerm [ varTerm v | v <- frees (prems0, concs0, acts0) ]
-        (,,) <$> mapM abstrFact prems0
-             <*> mapM abstrFact concs0
-             <*> mapM abstrFact acts0
+        mapM_ abstrTerm [ varTerm v | v <- frees (prems0, concs0, acts0, invars0) ]
+        (,,,) <$> mapM abstrFact prems0
+              <*> mapM abstrFact concs0
+              <*> mapM abstrFact acts0
+              <*> mapM abstrFact invars0
 
     irreducible = irreducibleFunSyms (mhMaudeSig hnd)
     abstrFact = traverse abstrTerm
@@ -105,12 +106,13 @@ variantsProtoRule hnd ru@(Rule ri prems0 concs0 acts0) =
       where getHint (viewTerm -> Lit (Var v)) = lvarName v
             getHint _                         = "z"
 
-    makeRule (ps, cs, as) subst freshSubsts0 =
-        Rule (ProtoRuleACInfo ri (Disj freshSubsts) []) prems concs acts
-      where prems = apply subst ps
-            concs = apply subst cs
-            acts  = apply subst as
-            freshSubsts = map (restrictVFresh (frees (prems, concs, acts))) freshSubsts0
+    makeRule (ps, cs, as, is) subst freshSubsts0 =
+        Rule (ProtoRuleACInfo ri (Disj freshSubsts) []) prems concs acts invars
+      where prems  = apply subst ps
+            concs  = apply subst cs
+            acts   = apply subst as
+            invars = apply subst is
+            freshSubsts = map (restrictVFresh (frees (prems, concs, acts, invars))) freshSubsts0
 
     trueDisj = [ emptySubstVFresh ]
 
