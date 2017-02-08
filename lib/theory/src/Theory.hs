@@ -349,7 +349,7 @@ closeRuleCache restrictions typAsms sig protoRules intrRules isdiff = -- trace (
     
     -- classifying the rules
     rulesAC = (fmap IntrInfo                      <$> intrRulesAC) <|>
-              ((fmap ProtoInfo . L.get cprRuleAC) <$> protoRules)
+              ((fmap ProtoInfo . addInvariants . L.get cprRuleAC) <$> protoRules)
 
     anyOf ps = partition (\x -> any ($ x) ps)
 
@@ -363,6 +363,9 @@ closeRuleCache restrictions typAsms sig protoRules intrRules isdiff = -- trace (
       , _crProtocol   = proto
       }
 
+    addInvariants ru = (L.set rInvars $ invariantsOf ru) ru
+    invariantsOf ru = intersectBy factsInvariant (L.get rPrems ru) (L.get rConcs ru)
+    factsInvariant p c = p == c
 
 ------------------------------------------------------------------------------
 -- Restrictions (Trace filters)

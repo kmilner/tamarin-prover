@@ -20,6 +20,7 @@ module Theory.Model.Rule (
     Rule(..)
   , PremIdx(..)
   , ConcIdx(..)
+  , InvarIdx(..)
 
   -- ** Accessors
   , rInfo
@@ -904,7 +905,9 @@ prettyNamedRule prefix ppInfo ru =
                     then operator_ "-->"
                     else fsep [operator_ "--[", ppFacts' acts, operator_ "]->"]
                 , nest 1 $ ppFactsList rConcs
-                , nest 1 $ ppInvarsList rInvars]) $-$
+                , if null $ L.get rInvars ru
+                    then text ""
+                    else nest 1 $ ppInvarsList rInvars ]) $-$
     nest 2 (ppInfo $ L.get rInfo ru)
   where
     acts             = filter isNotDiffAnnotation (L.get rActs ru)

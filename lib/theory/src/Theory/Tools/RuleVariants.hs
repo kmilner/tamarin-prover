@@ -63,12 +63,12 @@ variantsProtoRule hnd ru@(Rule ri prems0 concs0 acts0 invars0) =
     (`Precise.evalFresh` Precise.nothingUsed) . renamePrecise  $ convertRule `evalFreshAvoiding` ru
   where
     convertRule = do
-        (abstrPsCsAs, bindings) <- abstrRule
+        (abstrPsCsAsIs, bindings) <- abstrRule
         let eqsAbstr         = map swap (M.toList bindings)
             abstractedTerms  = map snd eqsAbstr
             abstractionSubst = substFromList eqsAbstr
             variantSubsts    = computeVariantsCached (fAppList abstractedTerms) hnd
-            substs           = [ restrictVFresh (frees abstrPsCsAs) $
+            substs           = [ restrictVFresh (frees abstrPsCsAsIs) $
                                    removeRenamings $ ((`runReader` hnd) . normSubstVFresh')  $
                                    composeVFresh vsubst abstractionSubst
                                | vsubst <- variantSubsts ]
@@ -79,14 +79,14 @@ variantsProtoRule hnd ru@(Rule ri prems0 concs0 acts0 invars0) =
               -- x <- return (emptySubst, Just substs) --
               x <- simpDisjunction hnd (const (const False)) (Disj substs)
               case trace (show ("SIMP",abstractedTerms,
-                                "abstr", abstrPsCsAs,
+                                "abstr", abstrPsCsAsIs,
                                 "substs", substs,
                                 "simpSubsts:", x)) x of
                 -- the variants can be simplified to a single case
                 (commonSubst, Nothing) ->
-                  return $ makeRule abstrPsCsAs commonSubst trueDisj
+                  return $ makeRule abstrPsCsAsIs commonSubst trueDisj
                 (commonSubst, Just freshSubsts) ->
-                  return $ makeRule abstrPsCsAs commonSubst freshSubsts
+                  return $ makeRule abstrPsCsAsIs commonSubst freshSubsts
 
     abstrRule = (`runBindT` noBindings) $ do
         -- first import all vars into binding to obtain nicer names

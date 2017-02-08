@@ -17,6 +17,7 @@ module Theory.Constraint.System.Constraints (
   -- * Graph constraints
   , NodePrem
   , NodeConc
+  , NodeInvar
   , Edge(..)
   , Less
 
@@ -63,6 +64,10 @@ type NodePrem = (NodeId, PremIdx)
 
 -- | A conclusion of a node.
 type NodeConc = (NodeId, ConcIdx)
+
+-- | An invariant of a node.
+type NodeInvar = (NodeId, InvarIdx)
+
 
 -- | A labeled edge in a derivation graph.
 data Edge = Edge {
