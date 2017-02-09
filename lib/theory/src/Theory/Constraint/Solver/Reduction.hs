@@ -217,6 +217,7 @@ labelNodeId = \i rules parent -> do
     solveRuleConstraints mrconstrs
     modM sNodes (M.insert i ru)
     exploitPrems i ru
+    addInvariantGoals i ru
     return ru
   where
     -- | Import a rule with all its variables renamed to fresh variables.
@@ -228,6 +229,10 @@ labelNodeId = \i rules parent -> do
 
     mkFreshRuleAC m = Rule (ProtoInfo (ProtoRuleACInstInfo FreshRule []))
                            [] [freshFact m] [] []
+
+    addInvariantGoals i ru = mapM_ (addInvariantGoal i ru) $ enumInvars ru
+      where
+        addInvariantGoal i ru (v,fa) = insertGoal (InvariantG (i,v) fa) False
 
     exploitPrems i ru = mapM_ (exploitPrem i ru) (enumPrems ru)
 
@@ -509,6 +514,7 @@ markGoalAsSolved how goal =
       PremiseG _ fa
         | isKDFact fa -> modM sGoals $ M.delete goal
         | otherwise   -> updateStatus
+      InvariantG _ fa -> updateStatus
       ChainG _ _      -> modM sGoals $ M.delete goal
       SplitG _        -> updateStatus
       DisjG disj      -> modM sFormulas       (S.delete $ GDisj disj) >>

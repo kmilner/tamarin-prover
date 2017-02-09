@@ -1033,11 +1033,14 @@ unsolvedPremises sys =
 unsolvedTrivialGoals :: System -> [(Either NodePrem LVar, LNFact)]
 unsolvedTrivialGoals sys = foldl f [] $ M.toList (L.get sGoals sys)
   where
-    f l (PremiseG premidx fa, status) = if ((isTrivialFact fa /= Nothing) && (not $ L.get gsSolved status)) then (Left premidx, fa):l else l 
-    f l (ActionG var fa, status)      = if ((isTrivialFact fa /= Nothing) && (isKUFact fa) && (not $ L.get gsSolved status)) then (Right var, fa):l else l 
-    f l (ChainG _ _, _)               = l 
-    f l (SplitG _, _)                 = l 
-    f l (DisjG _, _)                  = l 
+    f l (PremiseG premidx fa, status)    = if ((isTrivialFact fa /= Nothing) && (not $ L.get gsSolved status))
+                                            then (Left premidx, fa):l else l
+    f l (InvariantG invaridx fa, status) = l
+    f l (ActionG var fa, status)         = if ((isTrivialFact fa /= Nothing) && (isKUFact fa) && (not $ L.get gsSolved status))
+                                            then (Right var, fa):l else l
+    f l (ChainG _ _, _)                  = l
+    f l (SplitG _, _)                    = l
+    f l (DisjG _, _)                     = l
 
 -- | Tests whether there are common Variables in the Facts
 noCommonVarsInGoals :: [(Either NodePrem LVar, LNFact)] -> Bool
@@ -1072,6 +1075,7 @@ allOpenGoalsAreSimpleFacts ctxt sys = M.foldlWithKey goalIsSimpleFact True (L.ge
     goalIsSimpleFact ret (PremiseG (nid, _) fact) (GoalStatus solved _ _) = ret && (solved || (isTrivialFact fact /= Nothing) && (not (isProtocolRule r) || (getOriginalRule ctxt LHS r == getOriginalRule ctxt RHS r)))
       where
         r = nodeRule nid sys
+    goalIsSimpleFact ret (InvariantG _ _)         (GoalStatus solved _ _) = ret && solved
     goalIsSimpleFact ret (SplitG _)               (GoalStatus solved _ _) = ret && solved
     goalIsSimpleFact ret (DisjG _)                (GoalStatus solved _ _) = ret && solved
 

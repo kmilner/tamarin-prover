@@ -105,6 +105,8 @@ data Goal =
        -- A destruction chain.
      | PremiseG NodePrem LNFact
        -- ^ A premise that must have an incoming direct edge.
+     | InvariantG NodeInvar LNFact
+       -- ^ An invariant fact that must have a source.
      | SplitG SplitId
        -- ^ A case split over equalities.
      | DisjG (Disj LNGuarded)
@@ -126,6 +128,10 @@ isPremiseGoal :: Goal -> Bool
 isPremiseGoal (PremiseG _ _) = True
 isPremiseGoal _              = False
 
+isInvariantGoal :: Goal -> Bool
+isInvariantGoal (InvariantG _ _) = True
+isInvariantGoal _                = False
+
 isChainGoal :: Goal -> Bool
 isChainGoal (ChainG _ _) = True
 isChainGoal _            = False
@@ -145,11 +151,12 @@ isDisjGoal _         = False
 
 instance HasFrees Goal where
     foldFrees f goal = case goal of
-        ActionG i fa  -> foldFrees f i <> foldFrees f fa
-        PremiseG p fa -> foldFrees f p <> foldFrees f fa
-        ChainG c p    -> foldFrees f c <> foldFrees f p
-        SplitG i      -> foldFrees f i
-        DisjG x       -> foldFrees f x
+        ActionG i fa    -> foldFrees f i <> foldFrees f fa
+        PremiseG p fa   -> foldFrees f p <> foldFrees f fa
+        InvariantG i fa -> foldFrees f i <> foldFrees f fa
+        ChainG c p      -> foldFrees f c <> foldFrees f p
+        SplitG i        -> foldFrees f i
+        DisjG x         -> foldFrees f x
 
     foldFreesOcc  f c goal = case goal of
         ActionG i fa -> foldFreesOcc f ("ActionG":c) (i, fa)
@@ -157,19 +164,21 @@ instance HasFrees Goal where
         _            -> mempty
 
     mapFrees f goal = case goal of
-        ActionG i fa  -> ActionG  <$> mapFrees f i <*> mapFrees f fa
-        PremiseG p fa -> PremiseG <$> mapFrees f p <*> mapFrees f fa
-        ChainG c p    -> ChainG   <$> mapFrees f c <*> mapFrees f p
-        SplitG i      -> SplitG   <$> mapFrees f i
-        DisjG x       -> DisjG    <$> mapFrees f x
+        ActionG i fa    -> ActionG    <$> mapFrees f i <*> mapFrees f fa
+        PremiseG p fa   -> PremiseG   <$> mapFrees f p <*> mapFrees f fa
+        InvariantG i fa -> InvariantG <$> mapFrees f i <*> mapFrees f fa
+        ChainG c p      -> ChainG     <$> mapFrees f c <*> mapFrees f p
+        SplitG i        -> SplitG     <$> mapFrees f i
+        DisjG x         -> DisjG      <$> mapFrees f x
 
 instance Apply Goal where
     apply subst goal = case goal of
-        ActionG i fa  -> ActionG  (apply subst i) (apply subst fa)
-        PremiseG p fa -> PremiseG (apply subst p) (apply subst fa)
-        ChainG c p    -> ChainG   (apply subst c) (apply subst p)
-        SplitG i      -> SplitG   (apply subst i)
-        DisjG x       -> DisjG    (apply subst x)
+        ActionG i fa    -> ActionG    (apply subst i) (apply subst fa)
+        PremiseG p fa   -> PremiseG   (apply subst p) (apply subst fa)
+        InvariantG i fa -> InvariantG (apply subst i) (apply subst fa)
+        ChainG c p      -> ChainG     (apply subst c) (apply subst p)
+        SplitG i        -> SplitG     (apply subst i)
+        DisjG x         -> DisjG      (apply subst x)
 
 
 ------------------------------------------------------------------------------
@@ -206,6 +215,9 @@ prettyGoal (PremiseG (i, (PremIdx v)) fa) =
     -- Note that we can use "▷" for conclusions once we need them.
     prettyLNFact fa <-> text ("▶" ++ subscript (show v)) <-> prettyNodeId i
     -- prettyNodePrem p <> brackets (prettyLNFact fa)
+prettyGoal (InvariantG (i, (InvarIdx v)) fa) =
+    -- Note that we can use "▷" for conclusions once we need them.
+    prettyLNFact fa <-> text ("source <" ++ subscript (show v)) <-> prettyNodeId i
 prettyGoal (DisjG (Disj []))  = text "Disj" <-> operator_ "(⊥)"
 prettyGoal (DisjG (Disj gfs)) = fsep $
     punctuate (operator_ "  ∥") (map (nest 1 . parens . prettyGuarded) gfs)

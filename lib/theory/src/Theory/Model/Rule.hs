@@ -213,7 +213,6 @@ rConc i = nthL (getConcIdx i) . rConcs
 rInvar :: InvarIdx -> (Rule i :-> LNFact)
 rInvar i = nthL (getInvarIdx i) . rInvars
 
-
 -- | Enumerate all premises of a rule.
 enumPrems :: Rule i -> [(PremIdx, LNFact)]
 enumPrems = zip [(PremIdx 0)..] . L.get rPrems
@@ -340,6 +339,14 @@ instance Apply PremIdx where
     apply _ = id
 
 instance HasFrees PremIdx where
+    foldFrees  _ = const mempty
+    foldFreesOcc  _ _ = const mempty
+    mapFrees   _ = pure
+
+instance Apply InvarIdx where
+    apply _ = id
+
+instance HasFrees InvarIdx where
     foldFrees  _ = const mempty
     foldFreesOcc  _ _ = const mempty
     mapFrees   _ = pure
