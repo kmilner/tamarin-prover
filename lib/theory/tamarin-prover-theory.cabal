@@ -98,5 +98,6 @@ library
       Theory.Tools.LoopBreakers
       Theory.Tools.RuleVariants
       Theory.Tools.Wellformedness
+      Theory.Tools.RuleInvariants
 
     other-modules:
