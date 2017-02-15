@@ -33,7 +33,7 @@ addRuleInvariants :: [ProtoRuleAC] -> [ProtoRuleAC]
 addRuleInvariants rules =
     constructInvariants $ (\ru -> set rInvars (directInvariants ru) ru) <$> rules
   where
-    directInvariants ru = nub $ intersect (get rPrems ru) (get rConcs ru)
+    directInvariants ru = (\f -> protoToInvFact f Nothing) <$> (nub $ intersect (get rPrems ru) (get rConcs ru))
 
 -- | Compute an under-approximation of possible invariant terms of existing
 -- facts in a rule. When there are multiple instances of the same fact tag,
@@ -41,11 +41,15 @@ addRuleInvariants rules =
 -- of the ith occurance in the premise with the ith occurance in the conclusion.
 constructInvariants :: [ProtoRuleAC] -> [ProtoRuleAC]
 constructInvariants rules =
---    map (addInvarsandConcs $ invariantFactTerms rules) rules
-    trace (show $ invariantFactTerms rules) rules
+    map (addInvarsandConcs $ invariantFactTerms rules) rules
   where
---    addInvarsandConcs :: M.Map FactTag [Int] -> ProtoRuleAC -> ProtoRuleAC
---    addInvarsandConcs invars ru =
+    -- Given a mapping of FactTags to invariant positions and a protocol rule,
+    -- find the occurrences of those tags in the premise and conclusions of the
+    -- rule and pair them with the appropriate invariant positions. For each
+    -- pair, create a new invariant fact with the conclusion and invariant
+    -- positions and put them all into the rule's invariants.
+    addInvarsandConcs :: M.Map FactTag [Int] -> ProtoRuleAC -> ProtoRuleAC
+    addInvarsandConcs invars ru = set rInvars ((\((p, c), is) -> protoToInvFact c (Just is)) <$> (concat ((\(tag, is) -> (zip (zip (prems tag ru) (concs tag ru)) (repeat is))) <$> (M.toList invars)))) ru
 
     invariantFactTerms :: [ProtoRuleAC] -> M.Map FactTag [Int]
     invariantFactTerms rules = M.fromList $ do
