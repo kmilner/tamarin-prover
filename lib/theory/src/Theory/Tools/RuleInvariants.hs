@@ -47,9 +47,11 @@ constructInvariants rules =
     -- find the occurrences of those tags in the premise and conclusions of the
     -- rule and pair them with the appropriate invariant positions. For each
     -- pair, create a new invariant fact with the conclusion and invariant
-    -- positions and put them all into the rule's invariants.
+    -- positions and put them all into the rule's invariants and conclusions.
     addInvarsandConcs :: M.Map FactTag [Int] -> ProtoRuleAC -> ProtoRuleAC
-    addInvarsandConcs invars ru = set rInvars ((\((p, c), is) -> protoToInvFact c (Just is)) <$> (concat ((\(tag, is) -> (zip (zip (prems tag ru) (concs tag ru)) (repeat is))) <$> (M.toList invars)))) ru
+    addInvarsandConcs invars ru =
+        let invfacts = ((\((p, c), is) -> protoToInvFact c (Just is)) <$> (concat ((\(tag, is) -> (zip (zip (prems tag ru) (concs tag ru)) (repeat is))) <$> (M.toList invars))))
+        in set rConcs ((get rConcs ru) ++ invfacts) $ set rInvars invfacts ru
 
     invariantFactTerms :: [ProtoRuleAC] -> M.Map FactTag [Int]
     invariantFactTerms rules = M.fromList $ do
