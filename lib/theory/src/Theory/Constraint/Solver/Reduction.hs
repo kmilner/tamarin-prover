@@ -217,22 +217,17 @@ labelNodeId = \i rules parent -> do
     solveRuleConstraints mrconstrs
     modM sNodes (M.insert i ru)
     exploitPrems i ru
-    addInvariantGoals i ru
     return ru
   where
     -- | Import a rule with all its variables renamed to fresh variables.
     importRule ru = someRuleACInst ru `evalBindT` noBindings
 
     mkISendRuleAC m = return $ Rule (IntrInfo (ISendRule))
-                                    [kuFact m] [inFact m] [kLogFact m] []
+                                    [kuFact m] [inFact m] [kLogFact m]
 
 
     mkFreshRuleAC m = Rule (ProtoInfo (ProtoRuleACInstInfo FreshRule []))
-                           [] [freshFact m] [] []
-
-    addInvariantGoals i ru = mapM_ (addInvariantGoal i ru) $ enumInvars ru
-      where
-        addInvariantGoal i ru (v,fa) = insertGoal (InvariantG (i,v) fa) False
+                           [] [freshFact m] []
 
     exploitPrems i ru = mapM_ (exploitPrem i ru) (enumPrems ru)
 
@@ -300,7 +295,7 @@ insertAction i fa = do
                           -- if the node is already present in the graph, do not insert it again. (This can be caused by substitutions applying and changing a goal.)
                           if not nodePresent
                              then do
-                               modM sNodes (M.insert i (Rule (IntrInfo (ConstrRule $ BC.pack "_pair")) ([(Fact KUFact [m1]),(Fact KUFact [m2])]) ([fa]) ([fa]) []))
+                               modM sNodes (M.insert i (Rule (IntrInfo (ConstrRule $ BC.pack "_pair")) ([(Fact KUFact [m1]),(Fact KUFact [m2])]) ([fa]) ([fa])))
                                insertGoal goal False
                                markGoalAsSolved "pair" goal
                                requiresKU m1 *> requiresKU m2 *> return Changed
@@ -319,7 +314,7 @@ insertAction i fa = do
                           -- if the node is already present in the graph, do not insert it again. (This can be caused by substitutions applying and changing a goal.)
                           if not nodePresent
                              then do
-                               modM sNodes (M.insert i (Rule (IntrInfo (ConstrRule $ BC.pack "_inv")) ([(Fact KUFact [m])]) ([fa]) ([fa]) []))
+                               modM sNodes (M.insert i (Rule (IntrInfo (ConstrRule $ BC.pack "_inv")) ([(Fact KUFact [m])]) ([fa]) ([fa])))
                                insertGoal goal False
                                markGoalAsSolved "inv" goal
                                requiresKU m *> return Changed
@@ -338,7 +333,7 @@ insertAction i fa = do
                           -- if the node is already present in the graph, do not insert it again. (This can be caused by substitutions applying and changing a goal.)
                           if not nodePresent
                              then do
-                               modM sNodes (M.insert i (Rule (IntrInfo (ConstrRule $ BC.pack "_mult")) (map (\x -> Fact KUFact [x]) ms) ([fa]) ([fa]) []))
+                               modM sNodes (M.insert i (Rule (IntrInfo (ConstrRule $ BC.pack "_mult")) (map (\x -> Fact KUFact [x]) ms) ([fa]) ([fa])))
                                insertGoal goal False
                                markGoalAsSolved "mult" goal
                                mapM_ requiresKU ms *> return Changed
@@ -358,7 +353,7 @@ insertAction i fa = do
                           -- if the node is already present in the graph, do not insert it again. (This can be caused by substitutions applying and changing a goal.)
                           if not nodePresent
                              then do
-                               modM sNodes (M.insert i (Rule (IntrInfo (ConstrRule $ BC.pack "_union")) (map (\x -> Fact KUFact [x]) ms) ([fa]) ([fa]) []))
+                               modM sNodes (M.insert i (Rule (IntrInfo (ConstrRule $ BC.pack "_union")) (map (\x -> Fact KUFact [x]) ms) ([fa]) ([fa])))
                                insertGoal goal False
                                markGoalAsSolved "union" goal
                                mapM_ requiresKU ms *> return Changed
@@ -514,7 +509,6 @@ markGoalAsSolved how goal =
       PremiseG _ fa
         | isKDFact fa -> modM sGoals $ M.delete goal
         | otherwise   -> updateStatus
-      InvariantG _ fa -> updateStatus
       ChainG _ _      -> modM sGoals $ M.delete goal
       SplitG _        -> updateStatus
       DisjG disj      -> modM sFormulas       (S.delete $ GDisj disj) >>

@@ -21,7 +21,7 @@ import           Data.Char                (isSpace)
 import           Data.Color
 import qualified Data.DAG.Simple          as D
 import qualified Data.Foldable            as F
-import           Data.List                (find,foldl',intersect)
+import           Data.List                (find,foldl',intersect,partition)
 import qualified Data.Map                 as M
 import           Data.Maybe
 import           Data.Monoid              (Any(..))
@@ -66,7 +66,6 @@ data DotState = DotState {
     _dsNodes   :: M.Map NodeId    D.NodeId
   , _dsPrems   :: M.Map NodePrem  D.NodeId
   , _dsConcs   :: M.Map NodeConc  D.NodeId
-  , _dsInvars  :: M.Map NodeInvar D.NodeId
   , _dsSingles :: M.Map (NodeConc, NodePrem) D.NodeId
   }
 
@@ -220,7 +219,7 @@ dotConc =
 -- premise and conclusion gets its own node.
 dotSystemLoose :: System -> D.Dot ()
 dotSystemLoose se =
-    (`evalStateT` DotState M.empty M.empty M.empty M.empty M.empty) $
+    (`evalStateT` DotState M.empty M.empty M.empty M.empty) $
     (`runReaderT` (se, nodeColorMap (M.elems $ get sNodes se))) $ do
         liftDot $ setDefaultAttributes
         -- draw single edges with matching facts.
@@ -332,7 +331,7 @@ dotNodeCompact boringStyle v = dotOnce dsNodes v $ do
               invars = [ ((v, i), nid) | (Just (SomeInvar i), nid) <- ids ]
               concs  = [ ((v, i), nid) | (Just (SomeConc i),  nid) <- ids ]
           modM dsPrems  $ M.union $ M.fromList prems
-          modM dsInvars $ M.union $ M.fromList invars
+          modM dsPrems  $ M.union $ M.fromList invars
           modM dsConcs  $ M.union $ M.fromList concs
           return $ fromJust $ lookup Nothing ids
   where
@@ -342,7 +341,7 @@ dotNodeCompact boringStyle v = dotOnce dsNodes v $ do
 
     mkNode  :: RuleACInst -> [(String, String)] -> Bool 
       -> ReaderT (System, NodeColorMap) (StateT DotState D.Dot)
-         [(Maybe (SomeIdx PremIdx InvarIdx ConcIdx), D.NodeId)]
+         [(Maybe (SomeIdx PremIdx PremIdx ConcIdx), D.NodeId)]
     mkNode ru attrs hasOutgoingEdge
       -- single node, share node-id for all premises and conclusions
       | boringStyle == CompactBoringNodes &&
@@ -361,10 +360,12 @@ dotNodeCompact boringStyle v = dotOnce dsNodes v $ do
         normalRuleRender = D.vcat $ map D.hcat $ map (map (uncurry D.portField)) $
                             filter (not . null) [ps, as, cs]
 
-        is = renderRow [ (Just (SomeInvar i), prettyLNFact v) | (i, v) <- enumInvars ru ]
-        ps = renderRow [ (Just (SomePrem i),  prettyLNFact p) | (i, p) <- enumPrems ru ]
+        is = renderRow [ (Just (SomeInvar i), prettyLNFact v) | (i, v) <- ruInvars ]
+        ps = renderRow [ (Just (SomePrem i),  prettyLNFact p) | (i, p) <- ruPrems  ]
         as = renderRow [ (Nothing, ruleLabel ) ]
         cs = renderRow [ (Just (SomeConc i), prettyLNFact c)  | (i, c) <- enumConcs ru ]
+
+        (ruInvars, ruPrems) = partition (\(_,fa) -> isInvariantFact fa) $ enumPrems ru
 
         ruleLabel =
             prettyNodeId v <-> colon <-> text (showRuleCaseName ru) <>
@@ -400,7 +401,7 @@ dotNodeCompact boringStyle v = dotOnce dsNodes v $ do
 -- to draw.
 dotSystemCompact :: BoringNodeStyle -> System -> D.Dot ()
 dotSystemCompact boringStyle se =
-    (`evalStateT` DotState M.empty M.empty M.empty M.empty M.empty) $
+    (`evalStateT` DotState M.empty M.empty M.empty M.empty) $
     (`runReaderT` (se, nodeColorMap (M.elems $ get sNodes se))) $ do
         liftDot $ setDefaultAttributes
         mapM_ (dotNodeCompact boringStyle) $ M.keys $ get sNodes       se

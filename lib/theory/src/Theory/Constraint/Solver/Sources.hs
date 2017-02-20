@@ -137,7 +137,6 @@ solveAllSafeGoals ths' =
                             else (trace "Stopping precomputation, too many chain goals." False)
         ActionG _ fa    -> not (isKUFact fa)
         PremiseG _ fa   -> not (isKUFact fa)
-        InvariantG _ fa -> True
         DisjG _         -> doSplit
         -- Uncomment to get more extensive case splitting
         SplitG _        -> doSplit --extensiveSplitting &&

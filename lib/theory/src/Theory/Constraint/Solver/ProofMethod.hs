@@ -1025,6 +1025,7 @@ injRanking ctxt allowLoopBreakers sys =
                                 || (isFirstProtoFact goal)
                                 || (isChainGoal goal)
                                 || (isFreshKnowsGoal goal)
+                                || (isInvariantGoal goal)
 
     isMedPriorityGoal goaltuple = (isStandardActionGoal $ fst goaltuple)
                                     || (isDisjGoal $ fst goaltuple)
@@ -1057,6 +1058,9 @@ injRanking ctxt allowLoopBreakers sys =
     isNonLastProtoFact (PremiseG _ (Fact (ProtoFact _ ('L':'_':_) _) _)) = False
     isNonLastProtoFact (ActionG  _ (Fact (ProtoFact _ ('L':'_':_) _) _)) = False
     isNonLastProtoFact _                                                 = True
+
+    isInvariantGoal (PremiseG _ (Fact InvFact{} _)) = True
+    isInvariantGoal _                               = False
 
     isLastName lv = isPrefixOf "L_" (lvarName lv)
     isFirstName lv = isPrefixOf "F_" (lvarName lv)

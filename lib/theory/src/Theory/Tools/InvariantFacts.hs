@@ -22,44 +22,56 @@ import           Debug.Trace
 import           Control.Monad.Fresh
 import           Data.Label
 import           Data.List
+import           Data.Maybe
 import qualified Data.Map            as M
-import           Safe                (headMay)
 
 import           Theory.Model
 
 
 
-addRuleInvariants :: [ProtoRuleAC] -> [ProtoRuleAC]
-addRuleInvariants rules =
-    constructInvariants $ (\ru -> set rInvars (directInvariants ru) ru) <$> rules
-  where
-    directInvariants ru = (\f -> protoToInvFact f Nothing) <$> (nub $ intersect (get rPrems ru) (get rConcs ru))
+--addRuleInvariants :: [ProtoRuleAC] -> [ProtoRuleAC]
+--addRuleInvariants rules =
+--    constructInvariants $ (\ru -> set rInvars (directInvariants ru) ru) <$> rules
+--  where
+--    directInvariants ru = (\f -> protoToInvFact f Nothing) <$> (nub $ intersect (get rPrems ru) (get rConcs ru))
 
 -- | Compute an under-approximation of possible invariant terms of existing
 -- facts in a rule. When there are multiple instances of the same fact tag,
 -- in the premises and conclusions, we assume we should compare the terms
 -- of the ith occurance in the premise with the ith occurance in the conclusion.
-constructInvariants :: [ProtoRuleAC] -> [ProtoRuleAC]
-constructInvariants rules =
-    map (addInvarsandConcs $ invariantFactTerms rules) rules
+addRuleInvariants :: [ProtoRuleAC] -> [ProtoRuleAC]
+addRuleInvariants rules =
+    map (addInvars invariantFactTerms) rules
   where
     -- Given a mapping of FactTags to invariant positions and a protocol rule,
     -- find the occurrences of those tags in the premise and conclusions of the
     -- rule and pair them with the appropriate invariant positions. For each
     -- pair, create a new invariant fact with the conclusion and invariant
     -- positions and put them all into the rule's invariants and conclusions.
-    addInvarsandConcs :: M.Map FactTag [Int] -> ProtoRuleAC -> ProtoRuleAC
-    addInvarsandConcs invars ru =
-        let invfacts = ((\((p, c), is) -> protoToInvFact c (Just is)) <$> (concat ((\(tag, is) -> (zip (zip (prems tag ru) (concs tag ru)) (repeat is))) <$> (M.toList invars))))
-        in set rConcs ((get rConcs ru) ++ invfacts) $ set rInvars invfacts ru
-
-    invariantFactTerms :: [ProtoRuleAC] -> M.Map FactTag [Int]
-    invariantFactTerms rules = M.fromList $ do
-        tag <- candidates
-        return (tag, sameTermIndices tag rules)
+    addInvars :: M.Map FactTag [Int] -> ProtoRuleAC -> ProtoRuleAC
+    addInvars invars ru =
+        set rConcs (get rConcs ru ++ newConcs)
+            $ set rPrems (get rPrems ru ++ newPrems) ru
       where
-        sameTermIndices :: FactTag -> [ProtoRuleAC] -> [Int]
-        sameTermIndices tag rules = foldr1 intersect $ do
+        newPrems = convertFact Persist <$> matched
+        newConcs = convertFact Persist <$> new
+
+        (matched, new) = partition
+            (\fa -> length (prems (factTag fa) ru) > concCount fa ru) $ invConcs ru
+        invConcs r = filter (\fa -> factTag fa `M.member` invars) $ get rConcs r
+        --This is a terrible hack, I'm sorry
+        concCount fa r = fromJust $ elemIndex fa $ concs (factTag fa) r
+
+        convertFact :: Lifetime -> LNFact -> LNFact
+        convertFact s fa = invariantFact s (factTagName $ factTag fa) $ 
+            (getFactTerms fa !!) <$> M.findWithDefault (error "Map missing invariant") (factTag fa) invars
+
+    invariantFactTerms = M.fromList $ do
+        tag <- candidates
+        return (tag, sameTermIndices tag)
+      where
+        sameTermIndices :: FactTag -> [Int]
+        sameTermIndices tag = foldr1 intersect $ do
             ru <- rules
             guard $ not $ null (prems tag ru) || null (concs tag ru)
             elemIndices True <$> zipWith (zipWith (==))
@@ -68,13 +80,11 @@ constructInvariants rules =
     prems tag ru = filter ((tag ==) . factTag) $ get rPrems ru
     concs tag ru = filter ((tag ==) . factTag) $ get rConcs ru
 
-    -- We only worry about constructing invariant out of fact tags that
-    -- actually occur in the premise and conclusion of some rule without
-    -- being being directly invariant
+    -- We only worry about constructing invariant out of protofact tags that
+    -- actually occur in the premise and conclusion of some rule
     candidates = sortednub $ do
         ru  <- rules
-        tag <- factTag <$> get rConcs ru
+        tag <- factTag <$> filter isProtoFact (get rConcs ru)
         guard $    (factTagMultiplicity tag == Linear)
-                && (tag `notElem` (factTag <$> get rInvars ru))
                 && (tag `elem` (factTag <$> get rPrems ru))
         return tag

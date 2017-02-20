@@ -94,7 +94,6 @@ openGoals sys = do
                     || isUnion m || isNullaryPublicFunction m
         ActionG _ _                               -> not solved
         PremiseG _ _                              -> not solved
-        InvariantG _ _                            -> not solved
         -- Technically the 'False' disj would be a solvable goal. However, we
         -- have a separate proof method for this, i.e., contradictions.
         DisjG (Disj [])                           -> False
@@ -207,7 +206,6 @@ solveGoal goal = do
       ActionG i fa    -> solveAction  (nonSilentRules rules) (i, fa)
       PremiseG p fa   ->
            solvePremise (get crProtocol rules ++ get crConstruct rules) p fa
-      InvariantG i fa -> solveInvariant (get crProtocol rules) i fa
       ChainG c p      -> solveChain (get crDestruct  rules) (c, p)
       SplitG i        -> solveSplit i
       DisjG disj      -> solveDisjunction disj
@@ -249,7 +247,7 @@ solvePremise rules p faPrem
       let concLearn = kdFact mLearn
           premLearn = outFact mLearn
           -- !! Make sure that you construct the correct rule!
-          ruLearn = Rule (IntrInfo IRecvRule) [premLearn] [concLearn] [] []
+          ruLearn = Rule (IntrInfo IRecvRule) [premLearn] [concLearn] []
           cLearn = (iLearn, ConcIdx 0)
           pLearn = (iLearn, PremIdx 0)
       modM sNodes  (M.insert iLearn ruLearn)
@@ -260,24 +258,6 @@ solvePremise rules p faPrem
       (ru, c, faConc) <- insertFreshNodeConc rules
       insertEdges [(c, faConc, faPrem, p)]
       return $ showRuleCaseName ru
-
-solveInvariant :: [RuleAC]         -- ^ All protocol rules
-               -> NodeInvar        -- ^ Invariant to solve
-               -> LNFact           -- ^ Fact that requires a source
-               -> Reduction String -- ^ Case name
-solveInvariant rules invar fa = do
-    (id, ru) <- insertFreshNode rules Nothing
-    sourceFa <- disjunctionOfList $ invariantConcs ru
-    insertLess id (fst invar)
-    void $ solveFactEqs SplitNow [Equal fa sourceFa]
-    return $ showRuleCaseName ru
-  where
-    -- TODO: It should be ok that this contains real terms, since they
-    -- should all still be fresh names at this point.
-    -- Also, this is not very efficient, but we may end up removing the
-    -- invariant concs entirely later so this would no longer exist.
-    invariantConcs ru = filter (\c -> notElem c $ get rInvars ru) $ get rConcs ru
-
 
 -- | CR-rule *DG2_chain*: solve a chain constraint.
 solveChain :: [RuleAC]              -- ^ All destruction rules.
