@@ -10,14 +10,14 @@
 -- conclusions for rules to allow solving for the source of
 -- those terms directly.
 
-module Theory.Tools.RuleInvariants (
+module Theory.Tools.InvariantFacts (
 
   -- * Computing and adding invariant term facts.
   addRuleInvariants
   ) where
 
 import           Extension.Prelude   (sortednub)
-import           Debug.Trace
+-- import           Debug.Trace
 -- import           Control.Applicative
 import           Control.Monad.Fresh
 import           Data.Label

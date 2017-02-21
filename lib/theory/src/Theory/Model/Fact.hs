@@ -382,7 +382,7 @@ factTagName tag = case tag of
     InFact            -> "In"
     OutFact           -> "Out"
     FreshFact         -> "Fr"
-    InvFact _ n _       -> ("Inv" ++ n)
+    InvFact _ n _       -> (n ++ " Invars")
     (ProtoFact _ n _) -> n
 
 -- | Show a fact tag as a 'String'. This is the 'factTagName' prefixed with
@@ -390,10 +390,11 @@ factTagName tag = case tag of
 showFactTag :: FactTag -> String
 showFactTag tag =
     (++ factTagName tag) $ case factTagMultiplicity tag of
-                             Linear     -> ""
+                             Linear                  -> ""
                              Persistent -> case tag of
-                                (InvFact {}) -> ""
-                                _ -> "!"
+                                (InvFact Remove _ _) -> "-"
+                                InvFact{}            -> ""
+                                _                    -> "!"
 
 -- | Show a fact tag together with its aritiy.
 showFactTagArity :: FactTag -> String

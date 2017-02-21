@@ -208,7 +208,7 @@ import           Theory.Tools.AbstractInterpretation
 import           Theory.Tools.InjectiveFactInstances
 import           Theory.Tools.LoopBreakers
 import           Theory.Tools.RuleVariants
-import           Theory.Tools.RuleInvariants
+import           Theory.Tools.InvariantFacts
 -- import           Theory.Constraint.Solver.Types
 
 import           Term.Positions
