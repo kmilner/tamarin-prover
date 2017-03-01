@@ -888,15 +888,18 @@ prettyNamedRule prefix ppInfo ru =
                 , if null acts
                     then operator_ "-->"
                     else fsep [operator_ "--[", ppFacts' acts, operator_ "]->"]
-                , nest 1 $ ppFactsList rConcs]) $-$
+                , nest 1 $ ppFactsList rConcs
+                , ppInvariants]) $-$
     nest 2 (ppInfo $ L.get rInfo ru)
   where
     acts             = filter isNotDiffAnnotation (L.get rActs ru)
     ppList pp        = fsep . punctuate comma . map pp
     ppFacts' list    = ppList prettyLNFact list
-    ppFacts proj     = ppList prettyLNFact $ L.get proj ru
+    ppFacts proj     = ppList prettyLNFact $ filter (not . isInvariantFact) (L.get proj ru)
     ppFactsList proj = fsep [operator_ "[", ppFacts proj, operator_ "]"]
     isNotDiffAnnotation fa = (fa /= Fact {factTag = ProtoFact Linear ("Diff" ++ getRuleNameDiff ru) 0, factTerms = []})
+    ppInvariants     = if null invariants then text "" else fsep [lineComment_ $ "Invariants: " ++ show invariants]
+    invariants       = filter isInvariantFact (L.get rPrems ru ++ L.get rConcs ru)
 
 prettyProtoRuleACInfo :: HighlightDocument d => ProtoRuleACInfo -> d
 prettyProtoRuleACInfo i =

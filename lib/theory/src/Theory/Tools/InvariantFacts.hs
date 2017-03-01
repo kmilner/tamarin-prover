@@ -17,7 +17,7 @@ module Theory.Tools.InvariantFacts (
   ) where
 
 import           Extension.Prelude   (sortednub)
--- import           Debug.Trace
+import           Debug.Trace
 -- import           Control.Applicative
 import           Control.Monad.Fresh
 import           Data.Label
@@ -26,14 +26,6 @@ import           Data.Maybe
 import qualified Data.Map            as M
 
 import           Theory.Model
-
-
-
---addRuleInvariants :: [ProtoRuleAC] -> [ProtoRuleAC]
---addRuleInvariants rules =
---    constructInvariants $ (\ru -> set rInvars (directInvariants ru) ru) <$> rules
---  where
---    directInvariants ru = (\f -> protoToInvFact f Nothing) <$> (nub $ intersect (get rPrems ru) (get rConcs ru))
 
 -- | Compute an under-approximation of possible invariant terms of existing
 -- facts in a rule. When there are multiple instances of the same fact tag,
@@ -49,28 +41,34 @@ addRuleInvariants rules =
     -- pair, create a new invariant fact with the conclusion and invariant
     -- positions and put them all into the rule's invariants and conclusions.
     addInvars :: M.Map FactTag [Int] -> ProtoRuleAC -> ProtoRuleAC
-    addInvars invars ru =
+    addInvars invarM ru =
         set rConcs (get rConcs ru ++ newConcs)
             $ set rPrems (get rPrems ru ++ newPrems) ru
       where
-        newPrems = convertFact Persist <$> matched
-        newConcs = convertFact Persist <$> new
+        newPrems = (convertFact Persist <$> persists) ++ (convertFact Remove <$> removed)
+        newConcs = convertFact Create <$> created
 
-        (matched, new) = partition
-            (\fa -> length (prems (factTag fa) ru) > concCount fa ru) $ invConcs ru
-        invConcs r = filter (\fa -> factTag fa `M.member` invars) $ get rConcs r
-        --This is a terrible hack, I'm sorry
-        concCount fa r = fromJust $ elemIndex fa $ concs (factTag fa) r
+        -- By only examining facts with invariants, and from the assumption that the i-th
+        -- occurance in the premises matches up to the i-th occurance in the conclusions,
+        -- we can pick out the removed/new/matched instances by counting alone
+        -- TODO: Partition this in a less gross way
+        (persists, created) = partition
+            (\fa -> length (prems (factTag fa) ru) > concCount fa) $ invarsOf $ get rConcs ru
+        removed             = filter
+            (\fa -> length (concs (factTag fa) ru) <= premCount fa) $ invarsOf $ get rPrems ru
 
-        convertFact :: Lifetime -> LNFact -> LNFact
-        convertFact s fa = invariantFact s (factTagName $ factTag fa) $ 
-            (getFactTerms fa !!) <$> M.findWithDefault (error "Map missing invariant") (factTag fa) invars
+        invarsOf     = filter (\fa -> factTag fa `M.member` invarM)
+        concCount fa = fromJust $ elemIndex fa $ concs (factTag fa) ru
+        premCount fa = fromJust $ elemIndex fa $ prems (factTag fa) ru
+
+        convertFact s fa = invariantFact s (factTagName $ factTag fa) $ (getFactTerms fa !!)
+            <$> M.findWithDefault (error $ "Invalid invariant lookup: " ++ show (factTag fa))
+                    (factTag fa) invarM
 
     invariantFactTerms = M.fromList $ do
         tag <- candidates
         return (tag, sameTermIndices tag)
       where
-        sameTermIndices :: FactTag -> [Int]
         sameTermIndices tag = foldr1 intersect $ do
             ru <- rules
             guard $ not $ null (prems tag ru) || null (concs tag ru)

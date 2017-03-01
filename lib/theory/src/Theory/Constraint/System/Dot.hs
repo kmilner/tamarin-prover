@@ -352,7 +352,7 @@ dotNodeCompact boringStyle v = dotOnce dsNodes v $ do
             return [ (key, nid) | (key, _) <- is ++ ps ++ as ++ cs ]
       -- full record syntax
       | otherwise =
-            fmap snd $ liftDot $ (`D.record` attrs) $ 
+            fmap snd $ liftDot $ (`D.record` attrs) $
                 if null is
                     then normalRuleRender
                     else D.hcat  [D.vcat $ map (uncurry D.portField) is, normalRuleRender]
@@ -360,7 +360,7 @@ dotNodeCompact boringStyle v = dotOnce dsNodes v $ do
         normalRuleRender = D.vcat $ map D.hcat $ map (map (uncurry D.portField)) $
                             filter (not . null) [ps, as, cs]
 
-        is = renderRow [ (Just (SomeInvar i), prettyLNFact v) | (i, v) <- ruInvars ]
+        is = renderRow [ (Just (SomeInvar i), prettyLNFact p) | (i, p) <- ruInvars ]
         ps = renderRow [ (Just (SomePrem i),  prettyLNFact p) | (i, p) <- ruPrems  ]
         as = renderRow [ (Nothing, ruleLabel ) ]
         cs = renderRow [ (Just (SomeConc i), prettyLNFact c)  | (i, c) <- enumConcs ru ]
@@ -420,6 +420,7 @@ dotSystemCompact boringStyle se =
                       [("style","bold"),("weight","10.0")] ++
                       (guard (check isPersistentFact) >> [("color","gray50")])
                   | check isKFact     = [("color","orangered2")]
+                  | check isInvariantFact = [("color", "blueviolet"), ("style", "dashed"), ("weight", "5.0")]
                   | otherwise         = [("color","gray30")]
         dotGenEdge attrs src tgt
 

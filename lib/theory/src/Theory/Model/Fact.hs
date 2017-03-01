@@ -104,7 +104,7 @@ import           Text.PrettyPrint.Class
 data Multiplicity = Persistent | Linear
                   deriving( Eq, Ord, Show, Typeable, Data, Generic, NFData, Binary )
 
-data Lifetime = Persist | Remove
+data Lifetime = Create | Persist | Remove
                   deriving( Ord, Show, Typeable, Data, Generic, NFData, Binary )
 
 instance Eq Lifetime where
@@ -262,6 +262,7 @@ isInvariantFact _                     = False
 factTagMultiplicity :: FactTag -> Multiplicity
 factTagMultiplicity tag = case tag of
     ProtoFact multi _ _ -> multi
+    InvFact Create _ _  -> Persistent
     InvFact Persist _ _ -> Persistent
     InvFact Remove _ _  -> Linear
     KUFact              -> Persistent
@@ -382,19 +383,20 @@ factTagName tag = case tag of
     InFact            -> "In"
     OutFact           -> "Out"
     FreshFact         -> "Fr"
-    InvFact _ n _       -> (n ++ " Invars")
+    InvFact _ n _     -> (n ++ "_terms")
     (ProtoFact _ n _) -> n
 
 -- | Show a fact tag as a 'String'. This is the 'factTagName' prefixed with
 -- the multiplicity.
 showFactTag :: FactTag -> String
 showFactTag tag =
-    (++ factTagName tag) $ case factTagMultiplicity tag of
-                             Linear                  -> ""
-                             Persistent -> case tag of
-                                (InvFact Remove _ _) -> "-"
-                                InvFact{}            -> ""
-                                _                    -> "!"
+    (++ factTagName tag) $ case tag of
+                            InvFact Remove _ _ -> "--"
+                            InvFact Create _ _ -> "++"
+                            InvFact{}          -> ""
+                            _ -> case factTagMultiplicity tag of
+                                    Linear     -> ""
+                                    Persistent -> "!"
 
 -- | Show a fact tag together with its aritiy.
 showFactTagArity :: FactTag -> String
