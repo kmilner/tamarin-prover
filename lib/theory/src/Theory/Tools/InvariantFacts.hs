@@ -67,6 +67,7 @@ addRuleInvariants rules =
 
     invariantFactTerms = M.fromList $ do
         tag <- candidates
+        guard $ not $ null $ sameTermIndices tag
         return (tag, sameTermIndices tag)
       where
         sameTermIndices tag = foldr1 intersect $ do
