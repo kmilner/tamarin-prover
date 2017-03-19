@@ -33,6 +33,7 @@ module Theory.Constraint.System (
   , pcSignature
   , pcRules
   , pcInjectiveFactInsts
+  , pcInvariantFactTerms
   , pcSources
   , pcSourceKind
   , pcUseInduction
@@ -362,6 +363,7 @@ data ProofContext = ProofContext
        { _pcSignature          :: SignatureWithMaude
        , _pcRules              :: ClassifiedRules
        , _pcInjectiveFactInsts :: S.Set FactTag
+       , _pcInvariantFactTerms :: M.Map FactTag [Int]
        , _pcSourceKind         :: SourceKind
        , _pcSources            :: [Source]
        , _pcUseInduction       :: InductionHint
@@ -383,7 +385,7 @@ data DiffProofContext = DiffProofContext
        , _dpcProtoRules           :: [ProtoRuleE]
        , _dpcConstrRules          :: [RuleAC]
        , _dpcDestrRules           :: [RuleAC]
-       , _dpcRestrictions               :: [(Side, [LNGuarded])]
+       , _dpcRestrictions         :: [(Side, [LNGuarded])]
        }
        deriving( Eq, Ord, Show )
 

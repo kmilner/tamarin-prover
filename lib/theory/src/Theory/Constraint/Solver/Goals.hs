@@ -94,6 +94,7 @@ openGoals sys = do
                     || isUnion m || isNullaryPublicFunction m
         ActionG _ _                               -> not solved
         PremiseG _ _                              -> not solved
+        OriginG _ _                               -> not solved
         -- Technically the 'False' disj would be a solvable goal. However, we
         -- have a separate proof method for this, i.e., contradictions.
         DisjG (Disj [])                           -> False
@@ -206,6 +207,7 @@ solveGoal goal = do
       ActionG i fa    -> solveAction  (nonSilentRules rules) (i, fa)
       PremiseG p fa   ->
            solvePremise (get crProtocol rules ++ get crConstruct rules) p fa
+      OriginG p fa   -> solveOrigin (get crProtocol rules) p fa
       ChainG c p      -> solveChain (get crDestruct  rules) (c, p)
       SplitG i        -> solveSplit i
       DisjG disj      -> solveDisjunction disj
@@ -258,6 +260,30 @@ solvePremise rules p faPrem
       (ru, c, faConc) <- insertFreshNodeConc rules
       insertEdges [(c, faConc, faPrem, p)]
       return $ showRuleCaseName ru
+
+-- | CR-rules TODO
+--
+solveOrigin   :: [RuleAC]       -- ^ All protocol rules
+              -> NodePrem       -- ^ Premise to solve.
+              -> LNFact         -- ^ Fact with terms to solve.
+              -> Reduction String -- ^ Case name to use.
+solveOrigin rules p faPrem = do
+    ctxt <- getProofContext
+    let mayInfo = M.lookup (factTag faPrem) $ get pcInvariantFactTerms ctxt
+    case mayInfo of
+        Nothing -> error $ "solveOrigin: No invariant terms in goal"
+        Just invTerms -> do
+            (c, ru) <- insertFreshNode sourceRules Nothing
+            (_,ruConcFa) <- disjunctionOfList $ enumOrigins ru
+
+            insertLess c (fst p)
+            void $ solveTermEqs SplitNow $ map 
+                (\idx -> Equal (getFactTerms faPrem !! idx) (getFactTerms ruConcFa !! idx)) invTerms
+            return $ showRuleCaseName ru
+  where
+    sourceRules    = filter (not . null . enumOrigins) rules
+    enumOrigins ru = drop (nPremsWTag ru) $ filter (\(_,x) -> factTag x == factTag faPrem) $ enumConcs ru
+    nPremsWTag ru  = length . filter (\fa -> factTag fa == factTag faPrem) $ get rPrems ru
 
 -- | CR-rule *DG2_chain*: solve a chain constraint.
 solveChain :: [RuleAC]              -- ^ All destruction rules.

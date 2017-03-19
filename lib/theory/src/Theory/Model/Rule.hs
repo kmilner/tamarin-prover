@@ -43,9 +43,11 @@ module Theory.Model.Rule (
   , pracName
   , pracVariants
   , pracLoopBreakers
+  , pracFactInvariants
   , ProtoRuleACInstInfo(..)
   , praciName
   , praciLoopBreakers
+  , praciFactInvariants
   , RuleACConstrs
 
   -- * Intruder Rule Information
@@ -178,11 +180,6 @@ newtype PremIdx = PremIdx { getPremIdx :: Int }
 newtype ConcIdx = ConcIdx { getConcIdx :: Int }
   deriving( Eq, Ord, Show, Enum, Data, Typeable, Binary, NFData )
 
--- | An index of an invariant. The first invariant has index '0'.
-newtype InvarIdx = InvarIdx { getInvarIdx :: Int }
-  deriving( Eq, Ord, Show, Enum, Data, Typeable, Binary, NFData )
-
-
 -- | @lookupPrem i ru@ returns the @i@-th premise of rule @ru@, if possible.
 lookupPrem :: PremIdx -> Rule i -> Maybe LNFact
 lookupPrem i = (`atMay` getPremIdx i) . L.get rPrems
@@ -284,9 +281,10 @@ instance Binary ProtoRuleName
 -- instantiations of the free variables of the rule. The source is interpreted
 -- modulo AC; i.e., its variants were also built.
 data ProtoRuleACInfo = ProtoRuleACInfo
-       { _pracName         :: ProtoRuleName
-       , _pracVariants     :: Disj (LNSubstVFresh)
-       , _pracLoopBreakers :: [PremIdx]
+       { _pracName           :: ProtoRuleName
+       , _pracVariants       :: Disj (LNSubstVFresh)
+       , _pracLoopBreakers   :: [PremIdx]
+       , _pracFactInvariants :: ([Maybe [Int]], [Maybe [Int]])
        }
        deriving( Eq, Ord, Show, Generic)
 instance NFData ProtoRuleACInfo
@@ -294,8 +292,9 @@ instance Binary ProtoRuleACInfo
 
 -- | Information for instances of protocol rules modulo AC.
 data ProtoRuleACInstInfo = ProtoRuleACInstInfo
-       { _praciName         :: ProtoRuleName
-       , _praciLoopBreakers :: [PremIdx]
+       { _praciName             :: ProtoRuleName
+       , _praciLoopBreakers     :: [PremIdx]
+       , _praciFactInvariants   :: ([Maybe [Int]], [Maybe [Int]])
        }
        deriving( Eq, Ord, Show, Generic)
 instance NFData ProtoRuleACInstInfo
@@ -324,14 +323,6 @@ instance HasFrees PremIdx where
     foldFreesOcc  _ _ = const mempty
     mapFrees   _ = pure
 
-instance Apply InvarIdx where
-    apply _ = id
-
-instance HasFrees InvarIdx where
-    foldFrees  _ = const mempty
-    foldFreesOcc  _ _ = const mempty
-    mapFrees   _ = pure
-
 instance Apply ConcIdx where
     apply _ = id
 
@@ -341,24 +332,27 @@ instance HasFrees ConcIdx where
     mapFrees   _ = pure
 
 instance HasFrees ProtoRuleACInfo where
-    foldFrees f (ProtoRuleACInfo na vari breakers) =
+    foldFrees f (ProtoRuleACInfo na vari breakers factinvs) =
         foldFrees f na `mappend` foldFrees f vari
                        `mappend` foldFrees f breakers
+                       `mappend` foldFrees f factinvs
     foldFreesOcc  _ _ = const mempty
-    mapFrees f (ProtoRuleACInfo na vari breakers) =
-        ProtoRuleACInfo na <$> mapFrees f vari <*> mapFrees f breakers
+    mapFrees f (ProtoRuleACInfo na vari breakers factinvs) =
+        ProtoRuleACInfo na <$> mapFrees f vari <*> mapFrees f breakers 
+            <*> mapFrees f factinvs
 
 instance Apply ProtoRuleACInstInfo where
     apply _ = id
 
 instance HasFrees ProtoRuleACInstInfo where
-    foldFrees f (ProtoRuleACInstInfo na breakers) =
-        foldFrees f na `mappend` foldFrees f breakers
+    foldFrees f (ProtoRuleACInstInfo na breakers factinvs) =
+        foldFrees f na `mappend` foldFrees f breakers 
+                       `mappend` foldFrees f factinvs
 
     foldFreesOcc  _ _ = const mempty
 
-    mapFrees f (ProtoRuleACInstInfo na breakers) =
-        ProtoRuleACInstInfo na <$> mapFrees f breakers
+    mapFrees f (ProtoRuleACInstInfo na breakers factinvs) =
+        ProtoRuleACInstInfo na <$> mapFrees f breakers <*> mapFrees f factinvs
 
 
 ------------------------------------------------------------------------------
@@ -691,7 +685,8 @@ someRuleACInst =
       , Just (L.get pracVariants i)
       )
       where
-        i' = ProtoRuleACInstInfo (L.get pracName i) (L.get pracLoopBreakers i)
+        i' = ProtoRuleACInstInfo (L.get pracName i) (L.get pracLoopBreakers i) 
+                (L.get pracFactInvariants i)
     extractInsts (Rule (IntrInfo i) ps cs as) =
       ( Rule (IntrInfo i) ps cs as, Nothing )
 
@@ -709,7 +704,8 @@ someRuleACInstAvoiding r s =
       , Just (L.get pracVariants i)
       )
       where
-        i' = ProtoRuleACInstInfo (L.get pracName i) (L.get pracLoopBreakers i)
+        i' = ProtoRuleACInstInfo (L.get pracName i) (L.get pracLoopBreakers i) 
+                (L.get pracFactInvariants i)
     extractInsts (Rule (IntrInfo i) ps cs as) =
       ( Rule (IntrInfo i) ps cs as, Nothing )
 
@@ -727,7 +723,8 @@ someRuleACInstFixing r subst =
       , Just (L.get pracVariants i)
       )
       where
-        i' = ProtoRuleACInstInfo (L.get pracName i) (L.get pracLoopBreakers i)
+        i' = ProtoRuleACInstInfo (L.get pracName i) (L.get pracLoopBreakers i) 
+                (L.get pracFactInvariants i)
     extractInsts (Rule (IntrInfo i) ps cs as) =
       ( apply subst (Rule (IntrInfo i) ps cs as), Nothing )
 
@@ -747,7 +744,8 @@ someRuleACInstAvoidingFixing r s subst =
       , Just (L.get pracVariants i)
       )
       where
-        i' = ProtoRuleACInstInfo (L.get pracName i) (L.get pracLoopBreakers i)
+        i' = ProtoRuleACInstInfo (L.get pracName i) (L.get pracLoopBreakers i) 
+                (L.get pracFactInvariants i)
     extractInsts (Rule (IntrInfo i) ps cs as) =
       ( apply subst (Rule (IntrInfo i) ps cs as), Nothing )
 
@@ -888,18 +886,15 @@ prettyNamedRule prefix ppInfo ru =
                 , if null acts
                     then operator_ "-->"
                     else fsep [operator_ "--[", ppFacts' acts, operator_ "]->"]
-                , nest 1 $ ppFactsList rConcs
-                , ppInvariants]) $-$
+                , nest 1 $ ppFactsList rConcs ]) $-$
     nest 2 (ppInfo $ L.get rInfo ru)
   where
     acts             = filter isNotDiffAnnotation (L.get rActs ru)
     ppList pp        = fsep . punctuate comma . map pp
     ppFacts' list    = ppList prettyLNFact list
-    ppFacts proj     = ppList prettyLNFact $ filter (not . isInvariantFact) (L.get proj ru)
+    ppFacts proj     = ppList prettyLNFact $ L.get proj ru
     ppFactsList proj = fsep [operator_ "[", ppFacts proj, operator_ "]"]
     isNotDiffAnnotation fa = (fa /= Fact {factTag = ProtoFact Linear ("Diff" ++ getRuleNameDiff ru) 0, factTerms = []})
-    ppInvariants     = if null invariants then text "" else fsep [lineComment_ $ "Invariants: " ++ show invariants]
-    invariants       = filter isInvariantFact (L.get rPrems ru ++ L.get rConcs ru)
 
 prettyProtoRuleACInfo :: HighlightDocument d => ProtoRuleACInfo -> d
 prettyProtoRuleACInfo i =

@@ -134,6 +134,7 @@ module Theory (
   , getClassifiedRules
   , getDiffClassifiedRules
   , getInjectiveFactInsts
+  , getInvariantFactTerms
   , getDiffInjectiveFactInsts
 
   , getSource
@@ -189,6 +190,7 @@ import           Data.List
 import           Data.Maybe
 import           Data.Monoid                         (Sum(..))
 import qualified Data.Set                            as S
+import qualified Data.Map                            as M
 -- import           Data.Traversable                    (Traversable, traverse)
 
 import           Control.Basics
@@ -266,6 +268,7 @@ data ClosedRuleCache = ClosedRuleCache
        , _crcRawSources          :: [Source]
        , _crcRefinedSources      :: [Source]
        , _crcInjectiveFactInsts  :: S.Set FactTag
+       , _crcInvariantFactTerms  :: M.Map FactTag [Int]
        }
        deriving( Eq, Ord, Show, Generic, NFData, Binary )
 
@@ -323,10 +326,10 @@ closeRuleCache :: [LNGuarded]        -- ^ Restrictions to use.
                -> ClosedRuleCache    -- ^ Cached rules and case distinctions.
 closeRuleCache restrictions typAsms sig protoRules intrRules isdiff = -- trace ("closeRuleCache: " ++ show classifiedRules) $
     ClosedRuleCache
-        classifiedRules rawSources refinedSources injFactInstances
+        classifiedRules rawSources refinedSources injFactInstances invariants
   where
     ctxt0 = ProofContext
-        sig classifiedRules injFactInstances RawSource [] AvoidInduction
+        sig classifiedRules injFactInstances invariants RawSource [] AvoidInduction
         (error "closeRuleCache: trace quantifier should not matter here")
         (error "closeRuleCache: lemma name should not matter here") [] isdiff
         (all isSubtermRule {-$ trace (show destr ++ " - " ++ show (map isSubtermRule destr))-} destr) (any isConstantRule destr)
@@ -334,6 +337,8 @@ closeRuleCache restrictions typAsms sig protoRules intrRules isdiff = -- trace (
     -- inj fact instances
     injFactInstances =
         simpleInjectiveFactInstances $ L.get cprRuleE <$> protoRules
+
+    invariants = invariantFactTerms $ L.get cprRuleE <$> protoRules
 
     -- precomputing the case distinctions: we make sure to only add safety
     -- restrictions. Otherwise, it wouldn't be sound to use the precomputed case
@@ -350,7 +355,7 @@ closeRuleCache restrictions typAsms sig protoRules intrRules isdiff = -- trace (
     
     -- classifying the rules
     rulesAC = (fmap IntrInfo                      <$> intrRulesAC) <|>
-              (fmap ProtoInfo <$> (addRuleInvariants $ L.get cprRuleAC <$> protoRules))
+              (fmap ProtoInfo <$> L.get cprRuleAC <$> protoRules)
 
     anyOf ps = partition (\x -> any ($ x) ps)
 
@@ -1023,6 +1028,7 @@ getProofContext l thy = ProofContext
     ( L.get thySignature                       thy)
     ( L.get (crcRules . thyCache)              thy)
     ( L.get (crcInjectiveFactInsts . thyCache) thy)
+    ( L.get (crcInvariantFactTerms . thyCache) thy)
     kind
     ( L.get (cases . thyCache)                 thy)
     inductionHint
@@ -1047,6 +1053,7 @@ getProofContextDiff s l thy = case s of
             ( L.get diffThySignature                           thy)
             ( L.get (crcRules . diffThyCacheLeft)              thy)
             ( L.get (crcInjectiveFactInsts . diffThyCacheLeft) thy)
+            ( L.get (crcInvariantFactTerms . diffThyCacheLeft) thy)
             kind
             ( L.get (cases . diffThyCacheLeft)                 thy)
             inductionHint
@@ -1060,6 +1067,7 @@ getProofContextDiff s l thy = case s of
             ( L.get diffThySignature                    thy)
             ( L.get (crcRules . diffThyCacheRight)           thy)
             ( L.get (crcInjectiveFactInsts . diffThyCacheRight) thy)
+            ( L.get (crcInvariantFactTerms . diffThyCacheRight) thy)
             kind
             ( L.get (cases . diffThyCacheRight)              thy)
             inductionHint
@@ -1091,6 +1099,7 @@ getDiffProofContext l thy = DiffProofContext (proofContext LHS) (proofContext RH
             ( L.get diffThySignature                    thy)
             ( L.get (crcRules . diffThyDiffCacheLeft)           thy)
             ( L.get (crcInjectiveFactInsts . diffThyDiffCacheLeft) thy)
+            ( L.get (crcInvariantFactTerms . diffThyDiffCacheLeft) thy)
             RefinedSource
             ( L.get (crcRefinedSources . diffThyDiffCacheLeft)              thy)
             AvoidInduction
@@ -1104,6 +1113,7 @@ getDiffProofContext l thy = DiffProofContext (proofContext LHS) (proofContext RH
             ( L.get diffThySignature                    thy)
             ( L.get (crcRules . diffThyDiffCacheRight)           thy)
             ( L.get (crcInjectiveFactInsts . diffThyDiffCacheRight) thy)
+            ( L.get (crcInvariantFactTerms . diffThyDiffCacheRight) thy)
             RefinedSource
             ( L.get (crcRefinedSources . diffThyDiffCacheRight)              thy)
             AvoidInduction
@@ -1117,6 +1127,10 @@ getDiffProofContext l thy = DiffProofContext (proofContext LHS) (proofContext RH
 -- | The facts with injective instances in this theory
 getInjectiveFactInsts :: ClosedTheory -> S.Set FactTag
 getInjectiveFactInsts = L.get (crcInjectiveFactInsts . thyCache)
+
+-- | The facts with injective instances in this theory
+getInvariantFactTerms :: ClosedTheory -> M.Map FactTag [Int]
+getInvariantFactTerms = L.get (crcInvariantFactTerms . thyCache)
 
 -- | The facts with injective instances in this theory
 getDiffInjectiveFactInsts :: Side -> Bool -> ClosedDiffTheory -> S.Set FactTag

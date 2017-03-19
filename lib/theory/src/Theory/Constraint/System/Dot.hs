@@ -21,7 +21,7 @@ import           Data.Char                (isSpace)
 import           Data.Color
 import qualified Data.DAG.Simple          as D
 import qualified Data.Foldable            as F
-import           Data.List                (find,foldl',intersect,partition)
+import           Data.List                (find,foldl',intersect)
 import qualified Data.Map                 as M
 import           Data.Maybe
 import           Data.Monoid              (Any(..))
@@ -63,9 +63,9 @@ type SeDot = ReaderT (System, NodeColorMap) (StateT DotState D.Dot)
 
 -- | State to avoid multiple drawing of the same entity.
 data DotState = DotState {
-    _dsNodes   :: M.Map NodeId    D.NodeId
-  , _dsPrems   :: M.Map NodePrem  D.NodeId
-  , _dsConcs   :: M.Map NodeConc  D.NodeId
+    _dsNodes   :: M.Map NodeId   D.NodeId
+  , _dsPrems   :: M.Map NodePrem D.NodeId
+  , _dsConcs   :: M.Map NodeConc D.NodeId
   , _dsSingles :: M.Map (NodeConc, NodePrem) D.NodeId
   }
 
@@ -131,8 +131,8 @@ dotNode v = dotOnce dsNodes v $ do
                            [ (v,i) | (i,_) <- enumPrems ru ]
               concIds <- mapM dotConc
                            [ (v,i) | (i,_) <- enumConcs ru ]
-              sequence_ [ dotIntraRuleEdge premId vId  | premId <- premIds ]
-              sequence_ [ dotIntraRuleEdge vId concId  | concId <- concIds ]
+              sequence_ [ dotIntraRuleEdge premId vId | premId <- premIds ]
+              sequence_ [ dotIntraRuleEdge vId concId | concId <- concIds ]
   where
     label ru = " : " ++ render nameAndActs
       where
@@ -305,8 +305,6 @@ nodeColorMap rules =
 data BoringNodeStyle = FullBoringNodes | CompactBoringNodes
     deriving( Eq, Ord, Show )
 
-data SomeIdx p i c = SomePrem p | SomeInvar i | SomeConc c
-    deriving( Eq, Ord, Show )
 
 -- | Dot a node in record based (compact) format.
 dotNodeCompact :: BoringNodeStyle -> NodeId -> SeDot D.NodeId
@@ -327,12 +325,10 @@ dotNodeCompact boringStyle v = dotOnce dsNodes v $ do
               nodeColor = maybe "white" (rgbToHex . lighter) color
               attrs     = [("fillcolor", nodeColor),("style","filled")]
           ids <- mkNode ru attrs hasOutgoingEdge
-          let prems  = [ ((v, i), nid) | (Just (SomePrem i),  nid) <- ids ]
-              invars = [ ((v, i), nid) | (Just (SomeInvar i), nid) <- ids ]
-              concs  = [ ((v, i), nid) | (Just (SomeConc i),  nid) <- ids ]
-          modM dsPrems  $ M.union $ M.fromList prems
-          modM dsPrems  $ M.union $ M.fromList invars
-          modM dsConcs  $ M.union $ M.fromList concs
+          let prems = [ ((v, i), nid) | (Just (Left i),  nid) <- ids ]
+              concs = [ ((v, i), nid) | (Just (Right i), nid) <- ids ]
+          modM dsPrems $ M.union $ M.fromList prems
+          modM dsConcs $ M.union $ M.fromList concs
           return $ fromJust $ lookup Nothing ids
   where
 
@@ -341,7 +337,7 @@ dotNodeCompact boringStyle v = dotOnce dsNodes v $ do
 
     mkNode  :: RuleACInst -> [(String, String)] -> Bool 
       -> ReaderT (System, NodeColorMap) (StateT DotState D.Dot)
-         [(Maybe (SomeIdx PremIdx PremIdx ConcIdx), D.NodeId)]
+         [(Maybe (Either PremIdx ConcIdx), D.NodeId)]
     mkNode ru attrs hasOutgoingEdge
       -- single node, share node-id for all premises and conclusions
       | boringStyle == CompactBoringNodes &&
@@ -349,23 +345,21 @@ dotNodeCompact boringStyle v = dotOnce dsNodes v $ do
             let lbl | hasOutgoingEdge = show v ++ " : " ++ showRuleCaseName ru
                     | otherwise       = concatMap snd as
             nid <- mkSimpleNode lbl []
-            return [ (key, nid) | (key, _) <- is ++ ps ++ as ++ cs ]
+            return [ (key, nid) | (key, _) <- ps ++ as ++ cs ]
       -- full record syntax
       | otherwise =
             fmap snd $ liftDot $ (`D.record` attrs) $
-                if null is
-                    then normalRuleRender
-                    else D.hcat  [D.vcat $ map (uncurry D.portField) is, normalRuleRender]
+            D.vcat $ map D.hcat $ map (map (uncurry D.portField)) $
+            filter (not . null) [ps, as, cs]
       where
-        normalRuleRender = D.vcat $ map D.hcat $ map (map (uncurry D.portField)) $
-                            filter (not . null) [ps, as, cs]
+        ps = renderRow [ (Just (Left i),  ppFactAndInvars p) | (i, p) <- enumPrems ru ]
+        as = renderRow [ (Nothing,        ruleLabel ) ]
+        cs = renderRow [ (Just (Right i), ppFactAndInvars c) | (i, c) <- enumConcs ru ]
 
-        is = renderRow [ (Just (SomeInvar i), prettyLNFact p) | (i, p) <- ruInvars ]
-        ps = renderRow [ (Just (SomePrem i),  prettyLNFact p) | (i, p) <- ruPrems  ]
-        as = renderRow [ (Nothing, ruleLabel ) ]
-        cs = renderRow [ (Just (SomeConc i), prettyLNFact c)  | (i, c) <- enumConcs ru ]
-
-        (ruInvars, ruPrems) = partition (\(_,fa) -> isInvariantFact fa) $ enumPrems ru
+        ppFactAndInvars fa =
+            prettyLNFact fa
+            {-((se,ctxt), colorMap) <- ask-}
+            {-prettyLNFactWithInvars (get pcInvariantFactTerms ctxt) fa-}
 
         ruleLabel =
             prettyNodeId v <-> colon <-> text (showRuleCaseName ru) <>
@@ -420,7 +414,6 @@ dotSystemCompact boringStyle se =
                       [("style","bold"),("weight","10.0")] ++
                       (guard (check isPersistentFact) >> [("color","gray50")])
                   | check isKFact     = [("color","orangered2")]
-                  | check isInvariantFact = [("color", "blueviolet"), ("style", "dashed"), ("weight", "5.0")]
                   | otherwise         = [("color","gray30")]
         dotGenEdge attrs src tgt
 

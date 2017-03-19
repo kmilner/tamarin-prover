@@ -226,7 +226,7 @@ labelNodeId = \i rules parent -> do
                                     [kuFact m] [inFact m] [kLogFact m]
 
 
-    mkFreshRuleAC m = Rule (ProtoInfo (ProtoRuleACInstInfo FreshRule []))
+    mkFreshRuleAC m = Rule (ProtoInfo (ProtoRuleACInstInfo FreshRule [] ([],[])))
                            [] [freshFact m] []
 
     exploitPrems i ru = mapM_ (exploitPrem i ru) (enumPrems ru)
@@ -258,7 +258,11 @@ labelNodeId = \i rules parent -> do
               void (insertAction j fa)
 
           -- Store premise goal for later processing using CR-rule *DG2_2*
-          | otherwise -> insertGoal (PremiseG (i,v) fa) (v `elem` breakers)
+          | otherwise -> do
+              insertGoal (PremiseG (i,v) fa) (v `elem` breakers)
+              ctxt <- getProofContext
+              if M.member (factTag fa) (get pcInvariantFactTerms ctxt) then
+                insertGoal (OriginG (i,v) fa) False else return ()
       where
         breakers = ruleInfo (get praciLoopBreakers) (const []) $ get rInfo ru
 
@@ -509,6 +513,7 @@ markGoalAsSolved how goal =
       PremiseG _ fa
         | isKDFact fa -> modM sGoals $ M.delete goal
         | otherwise   -> updateStatus
+      OriginG _ fa    -> updateStatus
       ChainG _ _      -> modM sGoals $ M.delete goal
       SplitG _        -> updateStatus
       DisjG disj      -> modM sFormulas       (S.delete $ GDisj disj) >>
