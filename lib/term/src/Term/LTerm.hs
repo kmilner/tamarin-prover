@@ -106,7 +106,7 @@ module Term.LTerm (
   , module Term.VTerm
 ) where
 
-import           Text.PrettyPrint.Class
+import           Text.PrettyPrint.Highlight
 
 -- import           Control.Applicative
 import           Control.DeepSeq
@@ -757,7 +757,6 @@ prettyNTerm = prettyTerm (text . show)
 -- | Pretty print an @LTerm@.
 prettyLNTerm :: Document d => LNTerm -> d
 prettyLNTerm = prettyNTerm
-
 
 -- | Pretty print a literal for case generation.
 showLitName :: Lit Name LVar -> String

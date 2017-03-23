@@ -43,11 +43,9 @@ module Theory.Model.Rule (
   , pracName
   , pracVariants
   , pracLoopBreakers
-  , pracFactInvariants
   , ProtoRuleACInstInfo(..)
   , praciName
   , praciLoopBreakers
-  , praciFactInvariants
   , RuleACConstrs
 
   -- * Intruder Rule Information
@@ -284,7 +282,6 @@ data ProtoRuleACInfo = ProtoRuleACInfo
        { _pracName           :: ProtoRuleName
        , _pracVariants       :: Disj (LNSubstVFresh)
        , _pracLoopBreakers   :: [PremIdx]
-       , _pracFactInvariants :: ([Maybe [Int]], [Maybe [Int]])
        }
        deriving( Eq, Ord, Show, Generic)
 instance NFData ProtoRuleACInfo
@@ -294,7 +291,6 @@ instance Binary ProtoRuleACInfo
 data ProtoRuleACInstInfo = ProtoRuleACInstInfo
        { _praciName             :: ProtoRuleName
        , _praciLoopBreakers     :: [PremIdx]
-       , _praciFactInvariants   :: ([Maybe [Int]], [Maybe [Int]])
        }
        deriving( Eq, Ord, Show, Generic)
 instance NFData ProtoRuleACInstInfo
@@ -332,27 +328,24 @@ instance HasFrees ConcIdx where
     mapFrees   _ = pure
 
 instance HasFrees ProtoRuleACInfo where
-    foldFrees f (ProtoRuleACInfo na vari breakers factinvs) =
+    foldFrees f (ProtoRuleACInfo na vari breakers) =
         foldFrees f na `mappend` foldFrees f vari
                        `mappend` foldFrees f breakers
-                       `mappend` foldFrees f factinvs
     foldFreesOcc  _ _ = const mempty
-    mapFrees f (ProtoRuleACInfo na vari breakers factinvs) =
+    mapFrees f (ProtoRuleACInfo na vari breakers) =
         ProtoRuleACInfo na <$> mapFrees f vari <*> mapFrees f breakers 
-            <*> mapFrees f factinvs
 
 instance Apply ProtoRuleACInstInfo where
     apply _ = id
 
 instance HasFrees ProtoRuleACInstInfo where
-    foldFrees f (ProtoRuleACInstInfo na breakers factinvs) =
+    foldFrees f (ProtoRuleACInstInfo na breakers) =
         foldFrees f na `mappend` foldFrees f breakers 
-                       `mappend` foldFrees f factinvs
 
     foldFreesOcc  _ _ = const mempty
 
-    mapFrees f (ProtoRuleACInstInfo na breakers factinvs) =
-        ProtoRuleACInstInfo na <$> mapFrees f breakers <*> mapFrees f factinvs
+    mapFrees f (ProtoRuleACInstInfo na breakers) =
+        ProtoRuleACInstInfo na <$> mapFrees f breakers
 
 
 ------------------------------------------------------------------------------
@@ -686,7 +679,6 @@ someRuleACInst =
       )
       where
         i' = ProtoRuleACInstInfo (L.get pracName i) (L.get pracLoopBreakers i) 
-                (L.get pracFactInvariants i)
     extractInsts (Rule (IntrInfo i) ps cs as) =
       ( Rule (IntrInfo i) ps cs as, Nothing )
 
@@ -705,7 +697,6 @@ someRuleACInstAvoiding r s =
       )
       where
         i' = ProtoRuleACInstInfo (L.get pracName i) (L.get pracLoopBreakers i) 
-                (L.get pracFactInvariants i)
     extractInsts (Rule (IntrInfo i) ps cs as) =
       ( Rule (IntrInfo i) ps cs as, Nothing )
 
@@ -724,7 +715,6 @@ someRuleACInstFixing r subst =
       )
       where
         i' = ProtoRuleACInstInfo (L.get pracName i) (L.get pracLoopBreakers i) 
-                (L.get pracFactInvariants i)
     extractInsts (Rule (IntrInfo i) ps cs as) =
       ( apply subst (Rule (IntrInfo i) ps cs as), Nothing )
 
@@ -745,7 +735,6 @@ someRuleACInstAvoidingFixing r s subst =
       )
       where
         i' = ProtoRuleACInstInfo (L.get pracName i) (L.get pracLoopBreakers i) 
-                (L.get pracFactInvariants i)
     extractInsts (Rule (IntrInfo i) ps cs as) =
       ( apply subst (Rule (IntrInfo i) ps cs as), Nothing )
 
@@ -753,13 +742,13 @@ someRuleACInstAvoidingFixing r s subst =
 -- | Add the diff label to a rule
 addDiffLabel :: Rule a -> String -> Rule a
 addDiffLabel (Rule info prems concs acts) name 
-    = Rule info prems concs (acts ++ [Fact {factTag = ProtoFact Linear name 0, factTerms = []}])
+    = Rule info prems concs (acts ++ [Fact {factTag = ProtoFact Linear name [], factTerms = []}])
 
 -- | Remove the diff label from a rule
 removeDiffLabel :: Rule a -> String -> Rule a
 removeDiffLabel (Rule info prems concs acts) name = Rule info prems concs (filter isNotDiffAnnotation acts)
   where
-    isNotDiffAnnotation fa = (fa /= Fact {factTag = ProtoFact Linear name 0, factTerms = []})
+    isNotDiffAnnotation fa = (fa /= Fact {factTag = ProtoFact Linear name [], factTerms = []})
 
 -- Unification
 --------------
@@ -894,7 +883,7 @@ prettyNamedRule prefix ppInfo ru =
     ppFacts' list    = ppList prettyLNFact list
     ppFacts proj     = ppList prettyLNFact $ L.get proj ru
     ppFactsList proj = fsep [operator_ "[", ppFacts proj, operator_ "]"]
-    isNotDiffAnnotation fa = (fa /= Fact {factTag = ProtoFact Linear ("Diff" ++ getRuleNameDiff ru) 0, factTerms = []})
+    isNotDiffAnnotation fa = (fa /= Fact {factTag = ProtoFact Linear ("Diff" ++ getRuleNameDiff ru) [], factTerms = []})
 
 prettyProtoRuleACInfo :: HighlightDocument d => ProtoRuleACInfo -> d
 prettyProtoRuleACInfo i =

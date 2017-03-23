@@ -207,7 +207,7 @@ solveGoal goal = do
       ActionG i fa    -> solveAction  (nonSilentRules rules) (i, fa)
       PremiseG p fa   ->
            solvePremise (get crProtocol rules ++ get crConstruct rules) p fa
-      OriginG p fa   -> solveOrigin (get crProtocol rules) p fa
+      OriginG p fa    -> solveOrigin (get crProtocol rules) p fa
       ChainG c p      -> solveChain (get crDestruct  rules) (c, p)
       SplitG i        -> solveSplit i
       DisjG disj      -> solveDisjunction disj
@@ -277,8 +277,7 @@ solveOrigin rules p faPrem = do
             (_,ruConcFa) <- disjunctionOfList $ enumOrigins ru
 
             insertLess c (fst p)
-            void $ solveTermEqs SplitNow $ map 
-                (\idx -> Equal (getFactTerms faPrem !! idx) (getFactTerms ruConcFa !! idx)) invTerms
+            void $ solveTermEqs SplitNow $ [(Equal pt ct) | (True,pt,ct) <- zip3 invTerms (getFactTerms faPrem) (getFactTerms ruConcFa)]
             return $ showRuleCaseName ru
   where
     sourceRules    = filter (not . null . enumOrigins) rules

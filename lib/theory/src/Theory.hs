@@ -268,7 +268,7 @@ data ClosedRuleCache = ClosedRuleCache
        , _crcRawSources          :: [Source]
        , _crcRefinedSources      :: [Source]
        , _crcInjectiveFactInsts  :: S.Set FactTag
-       , _crcInvariantFactTerms  :: M.Map FactTag [Int]
+       , _crcInvariantFactTerms  :: M.Map FactTag [Bool]
        }
        deriving( Eq, Ord, Show, Generic, NFData, Binary )
 
@@ -1129,7 +1129,7 @@ getInjectiveFactInsts :: ClosedTheory -> S.Set FactTag
 getInjectiveFactInsts = L.get (crcInjectiveFactInsts . thyCache)
 
 -- | The facts with injective instances in this theory
-getInvariantFactTerms :: ClosedTheory -> M.Map FactTag [Int]
+getInvariantFactTerms :: ClosedTheory -> M.Map FactTag [Bool]
 getInvariantFactTerms = L.get (crcInvariantFactTerms . thyCache)
 
 -- | The facts with injective instances in this theory
