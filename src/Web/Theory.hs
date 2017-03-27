@@ -797,7 +797,8 @@ rulesSnippet thy = vcat
     [ ppWithHeader "Fact Symbols with Injective Instances" $
         fsepList (text . showFactTagArity) injFacts
     , ppWithHeader "Invariant Terms in Facts" $
-        text invFTerms
+        vsep $ map (\(fa,is) -> (text $ showFactTagArity fa) <> 
+                text " terms: " <> text (show $ elemIndices True is)) invFTerms
     , ppWithHeader "Multiset Rewriting Rules" $
         vsep $ map prettyRuleAC msrRules
     , ppWithHeader "Restrictions of the Set of Traces" $
@@ -806,7 +807,7 @@ rulesSnippet thy = vcat
   where
     msrRules   = get crProtocol $ getClassifiedRules thy
     injFacts   = S.toList $ getInjectiveFactInsts thy
-    invFTerms  = show (M.toList $ getInvariantFactTerms thy)
+    invFTerms  = M.toList $ getInvariantFactTerms thy
     ppWithHeader header body =
         caseEmptyDoc
             emptyDoc

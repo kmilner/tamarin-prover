@@ -12,7 +12,7 @@
 
 module Theory.Tools.InvariantFacts (
   -- * Computing and adding invariant term facts.
-    addInvariantsToRules
+    addInvariantsToRule
   , invariantFactTerms
   ) where
 
@@ -20,25 +20,19 @@ import           Extension.Prelude   (sortednub)
 import           Control.Monad.Fresh
 import           Data.Label
 import           Data.List
---import           Data.Maybe
 import qualified Data.Map            as M
 
 import           Theory.Model
 
--- | Compute an under-approximation of possible invariant terms of existing
--- facts in a rule. When there are multiple instances of the same fact tag,
--- in the premises and conclusions, we assume we should compare the terms
--- of the ith occurance in the premise with the ith occurance in the conclusion.
-addInvariantsToRules :: M.Map FactTag [Bool] -> [ProtoRuleAC] -> [ProtoRuleAC]
-addInvariantsToRules invarM rules = map addInvarAnnotations rules
-  where
-    -- Given a mapping of FactTags to invariant positions and a protocol rule,
-    -- find the occurrences of those tags in the premise and conclusions of the
-    -- rule and pair them with the appropriate invariant positions. For each
-    -- pair, create a new invariant fact with the conclusion and invariant
-    -- positions and put them all into the rule's invariants and conclusions.
-    addInvarAnnotations :: ProtoRuleAC -> ProtoRuleAC
-    addInvarAnnotations (Rule i ps cs as) = (Rule i ps' cs' as)
+import Debug.Trace
+
+-- | Given a mapping of FactTags to invariant positions and a protocol rule,
+-- find the occurrences of those tags in the premise and conclusions of the
+-- rule and pair them with the appropriate invariant positions. For each
+-- pair, create a new invariant fact with the conclusion and invariant
+-- positions and put them all into the rule's invariants and conclusions.
+addInvariantsToRule :: M.Map FactTag [Bool] -> ProtoRuleAC -> ProtoRuleAC
+addInvariantsToRule invarM (Rule i ps cs as) = trace ("++++++++++++++++++" ++ show (Rule i ps' cs' as)) (Rule i ps' cs' as)
       where
         ps' = map setInvars ps
         cs' = map setInvars cs
@@ -46,6 +40,10 @@ addInvariantsToRules invarM rules = map addInvarAnnotations rules
             Fact (ProtoFact m s (M.findWithDefault i tag invarM)) ts
         setInvars fa = fa
 
+-- | Compute an under-approximation of possible invariant terms of existing
+-- facts in a rule. When there are multiple instances of the same fact tag,
+-- in the premises and conclusions, we assume we should compare the terms
+-- of the ith occurance in the premise with the ith occurance in the conclusion.
 invariantFactTerms :: [ProtoRuleE] -> M.Map FactTag [Bool]
 invariantFactTerms rules = M.fromList $ do
     tag <- candidates

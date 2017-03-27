@@ -1,5 +1,6 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeOperators   #-}
+{-# LANGUAGE FlexibleContexts#-}
 -- |
 -- Copyright   : (c) 2010, 2011 Simon Meier
 -- License     : GPL v3 (see LICENSE)
@@ -356,10 +357,15 @@ dotNodeCompact boringStyle v = dotOnce dsNodes v $ do
         as = renderRow [ (Nothing,        ruleLabel ) ]
         cs = renderRow [ (Just (Right i), ppFactAndInvars c) | (i, c) <- enumConcs ru ]
 
-        ppFactAndInvars fa =
-            prettyLNFact fa
-            {-((se,ctxt), colorMap) <- ask-}
-            {-prettyLNFactWithInvars (get pcInvariantFactTerms ctxt) fa-}
+        ppFactAndInvars (Fact tag@(ProtoFact _ _ invs) ts)
+            | factTagArity tag /= length ts = ppFact ("MALFORMED-" ++ show tag) $ zip invs ts
+            | otherwise                     = ppFact (showFactTag tag) $ zip invs ts
+          where
+            ppFact n = nestShort' (n ++ "(") ")" . fsep . punctuate comma . map ppTerm
+            ppTerm (b,t)
+                | b         = zeroWidthText "\SOFONT COLOR=`blue`\SI" <> prettyNTerm t <> zeroWidthText "\SO/FONT\SI"
+                | otherwise = prettyNTerm t
+        ppFactAndInvars fa = prettyLNFact fa
 
         ruleLabel =
             prettyNodeId v <-> colon <-> text (showRuleCaseName ru) <>
@@ -410,20 +416,23 @@ dotSystemCompact boringStyle se =
     dotEdge (Edge src tgt)  = do
         let check p = maybe False p (resolveNodePremFact tgt se) ||
                       maybe False p (resolveNodeConcFact src se)
-            attrs | check isProtoFact =
-                      [("style","bold"),("weight","10.0")] ++
-                      (guard (check isPersistentFact) >> [("color","gray50")])
-                  | check isKFact     = [("color","orangered2")]
-                  | otherwise         = [("color","gray30")]
-        dotGenEdge attrs src tgt
+            dotGen | check isProtoFact = dotGenEdge True
+                      ([("style","bold"),("weight","10.0")] ++
+                      (guard (check isPersistentFact) >> [("color","gray50")]))
+                   | check isKFact     = dotGenEdge False [("color","orangered2")]
+                   | otherwise         = dotGenEdge False [("color","gray30")]
+        dotGen src tgt
 
-    dotGenEdge style src tgt = do
+    dotGenEdge anchored style src tgt = do
         srcId <- dotConcC src
         tgtId <- dotPremC tgt
-        liftDot $ D.edge srcId tgtId style
+        liftDot $ if anchored then D.edge(addPos "s" srcId) (addPos "n" tgtId) style
+                              else D.edge srcId tgtId style
+
+    addPos p nid = D.NodeId (show nid ++ ":" ++ p)
 
     dotChain (src, tgt) =
-        dotGenEdge [("style","dashed"),("color","green")] src tgt
+        dotGenEdge False [("style","dashed"),("color","green")] src tgt
 
     dotLess (src, tgt) = do
         srcId <- dotNodeCompact boringStyle src

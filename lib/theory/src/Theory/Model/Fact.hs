@@ -388,12 +388,13 @@ prettyLNFact :: Document d => LNFact -> d
 prettyLNFact fa = prettyFact prettyNTerm fa
 
 -- | Pretty print an 'LNFact' with invariants
-prettyInvarLNFact :: HighlightDocument d => LNFact -> [Int] -> d
-prettyInvarLNFact (Fact tag ts) invs
-  | factTagArity tag /= length ts = ppFact ("MALFORMED-" ++ show tag) $ zip [1..] ts
-  | otherwise                     = ppFact (showFactTag tag) $ zip [1..] ts
+prettyInvarLNFact :: HighlightDocument d => LNFact -> d
+prettyInvarLNFact (Fact tag@(ProtoFact _ _ invs) ts)
+  | factTagArity tag /= length ts = ppFact ("MALFORMED-" ++ show tag) $ zip invs ts
+  | otherwise                     = ppFact (showFactTag tag) $ zip invs ts
   where
     ppFact n = nestShort' (n ++ "(") ")" . fsep . punctuate comma . map ppTerm
     ppTerm (id,t)
         | id `elem` invs = keyword $ prettyNTerm t
         | otherwise      = prettyNTerm t
+prettyInvarLNFact fa = prettyLNFact fa

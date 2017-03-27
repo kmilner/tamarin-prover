@@ -16,7 +16,7 @@ module Text.Dot
           Dot           -- abstract
           -- * Nodes
         , node
-        , NodeId        -- abstract
+        , NodeId(..)
         , userNodeId
         , userNode
           -- * Edges
@@ -51,7 +51,7 @@ module Text.Dot
         ) where
 
 import Data.Char           (isSpace)
-import Data.List           (intersperse)
+import Data.List           (intercalate)
 import Control.Monad       (liftM, ap)
 -- import Control.Applicative (Applicative(..))
 
@@ -99,7 +99,6 @@ node = rawNode . map fixLabel
   where
     fixLabel ("label",lbl) = ("label", fixMultiLineLabel lbl)
     fixLabel attr          = attr
-
 
 -- | 'userNodeId' allows a user to use their own (Int-based) node id's, without needing to remap them.
 userNodeId :: Int -> NodeId
@@ -178,10 +177,16 @@ showAttrs xs = "[" ++ showAttrs' xs ++ "]"
 
 showAttr :: (String, String) -> String
 showAttr (name, val) =
-      name ++ "=\"" ++ concatMap escape val ++ "\""
+      name ++ "=<" ++ concatMap escape val ++ ">"
     where
-      escape '\n' = "\\l"
-      escape '"'  = "\\\""
+      escape '\n' = "<br align=\"left\"/>\n"
+      escape '"'  = "&quot;"
+      escape '`'   = "\""
+      escape '<'   = "&lt;"
+      escape '>'   = "&gt;"
+      escape '\''  = "&#39;"
+      escape '\SO' = "<" --Hack to allow dot html tags, using SHIFTIN and SHIFTOUT
+      escape '\SI' = ">"
       escape c    = [c]
 
 -- | Ensure that multi-line labels use non-breaking spaces at the start and
@@ -244,32 +249,26 @@ vcat' = vcat . map field
 -- actual node id of the node with the record shape. Thus the returned
 -- association list is parametrized over this missing node id.
 renderRecord :: Record a -> Dot (String, NodeId -> [(a,NodeId)])
-renderRecord = render True
+renderRecord = render False
   where
-  render _ (Field Nothing l) = return (escape l, const [])
+  render _ (Field Nothing l) = return ("\SOtd border=`1`\SI"++l++"\SO/td\SI", const [])
   render _ (Field (Just p) l) =
     Dot $ \uq -> let pid = "n" ++ show uq
-                     lbl = "<"++pid++"> "++escape l
+                     lbl = "\SOtd border=`1` port=`"++pid++"`\SI "++l++"\SO/td\SI"
                  in  ([], succ uq, (lbl, \nId -> [(p,NodeId (show nId++":"++pid))]))
-  render horiz (HCat rs) = do
+  render inTable (HCat rs) = do
     (lbls, ids) <- liftM unzip $ mapM (render True) rs
-    let rawLbl = concat (intersperse "|" lbls)
-        lbl = if horiz then "{{"++rawLbl++"}}" else "{"++rawLbl++"}"
-    return (lbl, \nId -> concatMap (\i -> i nId) ids)
-  render horiz (VCat rs) = do
-    (lbls, ids) <- liftM unzip $ mapM (render False) rs
-    let rawLbl = concat (intersperse "|" lbls)
-        lbl = if horiz then "{"++rawLbl++"}" else "{{"++rawLbl++"}}"
-    return (lbl, \nId -> concatMap (\i -> i nId) ids)
-  -- escape chars used for record label construction
-  escape = concatMap esc
-  esc '|'  = "\\|"
-  esc '{'  = "\\{"
-  esc '}'  = "\\}"
-  esc '<'  = "\\<"
-  esc '>'  = "\\>"
-  esc c    = [c]
+    let lbl = concat lbls
+    return (tabular inTable lbl, \nId -> concatMap (\i -> i nId) ids)
+  render inTable (VCat rs) = do
+    (lbls, ids) <- liftM unzip $ mapM (render True) rs
+    let lbl = intercalate "\SO/tr\SI\SOtr\SI" lbls
+    return (tabular inTable lbl, \nId -> concatMap (\i -> i nId) ids)
 
+  tabular t l = if t then "\SOtd\SI"++out++"\SO/td\SI" else out
+    where
+      out = "\SOtable border=`0` cellspacing=`0`"++(if t then "" else  " cellpadding=`0`")
+                ++"\SI\SOtr\SI"++l++"\SO/tr\SI\SO/table\SI"
 
 -- | A generic version of record creation.
 genRecord :: String -> Record a -> [(String,String)] -> Dot (NodeId, [(a,NodeId)])
@@ -283,7 +282,7 @@ genRecord shape rec attrs = do
 -- idenfiers given in the record to their corresponding node-ids. This list is
 -- ordered according to a left-to-rigth traversal of the record description.
 record :: Record a -> [(String,String)] -> Dot (NodeId, [(a,NodeId)])
-record = genRecord "record"
+record = genRecord "plain"
 
 -- | A variant of "record" ignoring the port identifiers.
 record' :: Record a -> [(String,String)] -> Dot (NodeId, [NodeId])
