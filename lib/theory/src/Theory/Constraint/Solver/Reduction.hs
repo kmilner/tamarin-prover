@@ -261,8 +261,7 @@ labelNodeId = \i rules parent -> do
           | otherwise -> do
               insertGoal (PremiseG (i,v) fa) (v `elem` breakers)
               ctxt <- getProofContext
-              if M.member (factTag fa) (get pcInvariantFactTerms ctxt) then
-                insertGoal (OriginG (i,v) fa) False else return ()
+              when (True `elem` getInvariantTerms fa) $ insertGoal (OriginG (i,v) fa) False
       where
         breakers = ruleInfo (get praciLoopBreakers) (const []) $ get rInfo ru
 

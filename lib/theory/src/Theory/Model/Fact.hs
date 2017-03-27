@@ -38,6 +38,7 @@ module Theory.Model.Fact (
   , getRightFact
   , getFactVariables
   , getFactTerms
+  , getInvariantTerms
   , isTrivialFact
 
   , DirTag(..)
@@ -270,7 +271,11 @@ factMultiplicity = factTagMultiplicity . factTag
 
 -- | The terms of a 'Fact'.
 getFactTerms :: Fact t -> [t]
-getFactTerms (Fact _ ts) = ts 
+getFactTerms (Fact _ ts) = ts
+
+getInvariantTerms :: Fact t -> [Bool]
+getInvariantTerms (Fact (ProtoFact _ _ invs) ts) = invs
+getInvariantTerms fa = [False]
 
 ------------------------------------------------------------------------------
 -- NFact

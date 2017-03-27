@@ -268,17 +268,13 @@ solveOrigin   :: [RuleAC]       -- ^ All protocol rules
               -> LNFact         -- ^ Fact with terms to solve.
               -> Reduction String -- ^ Case name to use.
 solveOrigin rules p faPrem = do
-    ctxt <- getProofContext
-    let mayInfo = M.lookup (factTag faPrem) $ get pcInvariantFactTerms ctxt
-    case mayInfo of
-        Nothing -> error $ "solveOrigin: No invariant terms in goal"
-        Just invTerms -> do
-            (c, ru) <- insertFreshNode sourceRules Nothing
-            (_,ruConcFa) <- disjunctionOfList $ enumOrigins ru
+    let invTerms = getInvariantTerms faPrem
+    (c, ru) <- insertFreshNode sourceRules Nothing
+    (_,ruConcFa) <- disjunctionOfList $ enumOrigins ru
 
-            insertLess c (fst p)
-            void $ solveTermEqs SplitNow $ [(Equal pt ct) | (True,pt,ct) <- zip3 invTerms (getFactTerms faPrem) (getFactTerms ruConcFa)]
-            return $ showRuleCaseName ru
+    insertLess c (fst p)
+    void $ solveTermEqs SplitNow $ [(Equal pt ct) | (True,pt,ct) <- zip3 invTerms (getFactTerms faPrem) (getFactTerms ruConcFa)]
+    return $ showRuleCaseName ru
   where
     sourceRules    = filter (not . null . enumOrigins) rules
     enumOrigins ru = drop (nPremsWTag ru) $ filter (\(_,x) -> factTag x == factTag faPrem) $ enumConcs ru
