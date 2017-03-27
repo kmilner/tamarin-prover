@@ -24,15 +24,13 @@ import qualified Data.Map            as M
 
 import           Theory.Model
 
-import Debug.Trace
-
 -- | Given a mapping of FactTags to invariant positions and a protocol rule,
 -- find the occurrences of those tags in the premise and conclusions of the
 -- rule and pair them with the appropriate invariant positions. For each
 -- pair, create a new invariant fact with the conclusion and invariant
 -- positions and put them all into the rule's invariants and conclusions.
 addInvariantsToRule :: M.Map FactTag [Bool] -> ProtoRuleAC -> ProtoRuleAC
-addInvariantsToRule invarM (Rule i ps cs as) = trace ("++++++++++++++++++" ++ show (Rule i ps' cs' as)) (Rule i ps' cs' as)
+addInvariantsToRule invarM (Rule i ps cs as) = (Rule i ps' cs' as)
       where
         ps' = map setInvars ps
         cs' = map setInvars cs

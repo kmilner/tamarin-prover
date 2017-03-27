@@ -363,7 +363,7 @@ dotNodeCompact boringStyle v = dotOnce dsNodes v $ do
           where
             ppFact n = nestShort' (n ++ "(") ")" . fsep . punctuate comma . map ppTerm
             ppTerm (b,t)
-                | b         = zeroWidthText "\SOFONT COLOR=`blue`\SI" <> prettyNTerm t <> zeroWidthText "\SO/FONT\SI"
+                | b         = zeroWidthText "\SOFONT COLOR=`blue3`\SI" <> prettyNTerm t <> zeroWidthText "\SO/FONT\SI"
                 | otherwise = prettyNTerm t
         ppFactAndInvars fa = prettyLNFact fa
 
