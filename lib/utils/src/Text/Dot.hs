@@ -177,17 +177,17 @@ showAttrs xs = "[" ++ showAttrs' xs ++ "]"
 
 showAttr :: (String, String) -> String
 showAttr (name, val) =
-      name ++ "=<" ++ concatMap escape val ++ ">"
-    where
-      escape '\n' = "<br align=\"left\"/>\n"
-      escape '"'  = "&quot;"
-      escape '`'   = "\""
-      escape '<'   = "&lt;"
-      escape '>'   = "&gt;"
-      escape '\''  = "&#39;"
-      escape '\SO' = "<" --Hack to allow dot html tags, using SHIFTIN and SHIFTOUT
-      escape '\SI' = ">"
-      escape c    = [c]
+    name ++ "=<" ++ concatMap escape val ++ ">"
+  where
+    escape '\n' = "<br align=\"left\"/>\n"
+--      escape '"'  = "&quot;"
+--      escape '`'   = "\""
+--      escape '<'   = "&lt;"
+--      escape '>'   = "&gt;"
+--      escape '\''  = "&#39;"
+--      escape '\SO' = "<" --Hack to allow dot html tags, using SHIFTIN and SHIFTOUT
+--      escape '\SI' = ">"
+    escape c    = [c]
 
 -- | Ensure that multi-line labels use non-breaking spaces at the start and
 -- are terminated with a newline.
@@ -251,10 +251,10 @@ vcat' = vcat . map field
 renderRecord :: Record a -> Dot (String, NodeId -> [(a,NodeId)])
 renderRecord = render False
   where
-  render _ (Field Nothing l) = return ("\SOtd border=`1`\SI"++l++"\SO/td\SI", const [])
+  render _ (Field Nothing l) = return ("<td border=\"1\" balign=\"left\">"++l++"</td>", const [])
   render _ (Field (Just p) l) =
     Dot $ \uq -> let pid = "n" ++ show uq
-                     lbl = "\SOtd border=`1` port=`"++pid++"`\SI "++l++"\SO/td\SI"
+                     lbl = "<td border=\"1\" balign=\"left\" port=\""++pid++"\">"++l++"</td>"
                  in  ([], succ uq, (lbl, \nId -> [(p,NodeId (show nId++":"++pid))]))
   render inTable (HCat rs) = do
     (lbls, ids) <- liftM unzip $ mapM (render True) rs
@@ -262,13 +262,13 @@ renderRecord = render False
     return (tabular inTable lbl, \nId -> concatMap (\i -> i nId) ids)
   render inTable (VCat rs) = do
     (lbls, ids) <- liftM unzip $ mapM (render True) rs
-    let lbl = intercalate "\SO/tr\SI\SOtr\SI" lbls
+    let lbl = intercalate "</tr><tr>" lbls
     return (tabular inTable lbl, \nId -> concatMap (\i -> i nId) ids)
 
-  tabular t l = if t then "\SOtd\SI"++out++"\SO/td\SI" else out
+  tabular t l = if t then "<td>"++out++"</td>" else out
     where
-      out = "\SOtable border=`0` cellspacing=`0`"++(if t then "" else  " cellpadding=`0`")
-                ++"\SI\SOtr\SI"++l++"\SO/tr\SI\SO/table\SI"
+      out = "<table border=\"0\" cellspacing=\"0\" align=\"left\""++(if t then "" else  " cellpadding=\"0\"")
+                ++"><tr>"++l++"</tr></table>"
 
 -- | A generic version of record creation.
 genRecord :: String -> Record a -> [(String,String)] -> Dot (NodeId, [(a,NodeId)])

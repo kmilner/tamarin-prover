@@ -18,10 +18,12 @@ module Text.PrettyPrint.Highlight (
   , comment
   , keyword
   , operator
+  , specialTerm
 
   , comment_
   , keyword_
   , operator_
+  , specialTerm_
 
   , opParens
 
@@ -31,7 +33,7 @@ module Text.PrettyPrint.Highlight (
 import Text.PrettyPrint.Class
 
 -- | Currently we support only keywords, operators, and comments.
-data HighlightStyle = Keyword | Comment | Operator
+data HighlightStyle = Keyword | Comment | Operator | SpecialTerm
        deriving( Eq, Ord, Show )
 
 class Document d => HighlightDocument d where
@@ -46,15 +48,17 @@ instance HighlightDocument Doc where
 -- General highlighters
 ------------------------------------------------------------------------------
 
-comment, keyword, operator :: HighlightDocument d => d -> d
-comment  = highlight Comment
-keyword  = highlight Keyword
-operator = highlight Operator
+comment, keyword, operator, specialTerm :: HighlightDocument d => d -> d
+comment     = highlight Comment
+keyword     = highlight Keyword
+operator    = highlight Operator
+specialTerm = highlight SpecialTerm
 
-comment_, keyword_, operator_ :: HighlightDocument d => String -> d
-comment_  = comment  . text
-keyword_  = keyword  . text
-operator_ = operator . text
+comment_, keyword_, operator_, specialTerm_ :: HighlightDocument d => String -> d
+comment_     = comment  . text
+keyword_     = keyword  . text
+operator_    = operator . text
+specialTerm_ = specialTerm . text
 
 opParens :: HighlightDocument d => d -> d
 opParens d = operator_ "(" <> d <> operator_ ")"

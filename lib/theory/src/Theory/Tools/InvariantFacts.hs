@@ -34,8 +34,8 @@ addInvariantsToRule invarM (Rule i ps cs as) = (Rule i ps' cs' as)
       where
         ps' = map setInvars ps
         cs' = map setInvars cs
-        setInvars (Fact tag@(ProtoFact m s i) ts) = 
-            Fact (ProtoFact m s (M.findWithDefault i tag invarM)) ts
+        setInvars (Fact tag@(ProtoFact m s k) ts) =
+            Fact (ProtoFact m s (M.findWithDefault k tag invarM)) ts
         setInvars fa = fa
 
 -- | Compute an under-approximation of possible invariant terms of existing

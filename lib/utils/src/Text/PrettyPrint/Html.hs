@@ -21,8 +21,11 @@ module Text.PrettyPrint.Html (
   , HtmlDoc
   , htmlDoc
   , getHtmlDoc
+  , DotHtmlDoc
   , postprocessHtmlDoc
   , renderHtmlDoc
+  , renderDotHtmlDoc
+  , renderDotHtmlDocStyle
 
   -- * NoHtmlDoc: ignoring HTML markup
   , noHtmlDoc
@@ -81,7 +84,7 @@ withTagNonEmpty tag attrs inner =
 
 -- | Render an attribute.
 attribute :: (String, String) -> String
-attribute (key,value) = " " ++ key ++ "=\"" ++ escapeHtmlEntities value ++ "\""
+attribute (key,value) = " " ++ key ++ "=\"" ++ escapeHtmlString value ++ "\""
 
 
 ------------------------------------------------------------------------------
@@ -101,9 +104,9 @@ instance NFData d => NFData (HtmlDoc d) where
     rnf = rnf . getHtmlDoc
 
 instance Document d => Document (HtmlDoc d) where
-    char          = HtmlDoc . text . escapeHtmlEntities . return
-    text          = HtmlDoc . text . escapeHtmlEntities 
-    zeroWidthText = HtmlDoc . zeroWidthText . escapeHtmlEntities
+    char          = HtmlDoc . escapeHtmlEntities . return
+    text          = HtmlDoc . escapeHtmlEntities
+    zeroWidthText = HtmlDoc . zeroWidthText . escapeHtmlString
 
     HtmlDoc d1 <-> HtmlDoc d2 = HtmlDoc $ d1 <-> d2
     hcat = HtmlDoc . hcat . map getHtmlDoc
@@ -128,30 +131,62 @@ instance Document d => HtmlDocument (HtmlDoc d) where
     unescapedZeroWidthText = HtmlDoc . zeroWidthText
 
 instance Document d => HighlightDocument (HtmlDoc d) where
-    highlight hlStyle = 
-        withTag "span" [("class", hlClass hlStyle)]
+    highlight hlStyle
+        | hlStyle == SpecialTerm  = withTag "font" [("color", "#0000CD")]
+        | otherwise               = withTag "span" [("class", hlClass hlStyle)]
       where
         hlClass Comment  = "hl_comment"
         hlClass Keyword  = "hl_keyword"
         hlClass Operator = "hl_operator"
 
+-- | A 'Document' transformer that inherits from html documents but does not apply
+-- html tags that are not in the graphviz spec
+newtype DotHtmlDoc d = DotHtmlDoc (HtmlDoc d)
+    deriving( Monoid, NFData, Document, HtmlDocument )
+
+instance Document d => HighlightDocument (DotHtmlDoc d) where
+    highlight hlStyle (DotHtmlDoc doc)
+        | hlStyle == SpecialTerm  = DotHtmlDoc (withTag "font" [("color", "#0000CD")] doc)
+        | otherwise               = DotHtmlDoc doc
+
+-- | Escape HTML entities in a string
+-- Converts to a document to preserve sizing
+escapeHtmlEntities :: Document d
+                   => String     -- ^ String to escape
+                   -> d          -- ^ Resulting document
+escapeHtmlEntities []     = text ""
+escapeHtmlEntities (c:cs) = case c of
+    '<'  -> text "&" <> zeroWidthText "lt;"   <> escapeHtmlEntities cs
+    '>'  -> text "&" <> zeroWidthText "gt;"   <> escapeHtmlEntities cs
+    '&'  -> text "&" <> zeroWidthText "amp;"  <> escapeHtmlEntities cs
+    '"'  -> text "&" <> zeroWidthText "quot;" <> escapeHtmlEntities cs
+    '\'' -> text "&" <> zeroWidthText "#39;"  <> escapeHtmlEntities cs
+    x    -> char x <> escapeHtmlEntities cs
+
+
 -- | Escape HTML entities in a string
 --
 -- Copied from 'blaze-html'.
-escapeHtmlEntities :: String  -- ^ String to escape
-                   -> String  -- ^ Resulting string
-escapeHtmlEntities []     = []
-escapeHtmlEntities (c:cs) = case c of
-    '<'  -> "&lt;"   ++ escapeHtmlEntities cs
-    '>'  -> "&gt;"   ++ escapeHtmlEntities cs
-    '&'  -> "&amp;"  ++ escapeHtmlEntities cs
-    '"'  -> "&quot;" ++ escapeHtmlEntities cs
-    '\'' -> "&#39;"  ++ escapeHtmlEntities cs
-    x    -> x : escapeHtmlEntities cs
+escapeHtmlString :: String  -- ^ String to escape
+                 -> String  -- ^ Resulting string
+escapeHtmlString []     = []
+escapeHtmlString (c:cs) = case c of
+    '<'  -> "&lt;"   ++ escapeHtmlString cs
+    '>'  -> "&gt;"   ++ escapeHtmlString cs
+    '&'  -> "&amp;"  ++ escapeHtmlString cs
+    '"'  -> "&quot;" ++ escapeHtmlString cs
+    '\'' -> "&#39;"  ++ escapeHtmlString cs
+    x    -> x : escapeHtmlString cs
 
 -- | @renderHtmlDoc = 'postprocessHtmlDoc' . 'render' . 'getHtmlDoc'@ 
 renderHtmlDoc :: HtmlDoc Doc -> String
 renderHtmlDoc = postprocessHtmlDoc . render . getHtmlDoc
+
+renderDotHtmlDoc :: DotHtmlDoc Doc -> String
+renderDotHtmlDoc (DotHtmlDoc d) = postprocessDotHtmlDoc $ render $ getHtmlDoc d
+
+renderDotHtmlDocStyle :: Style -> DotHtmlDoc Doc -> String
+renderDotHtmlDocStyle s (DotHtmlDoc d) = postprocessDotHtmlDoc $ renderStyle s $ getHtmlDoc d
 
 -- | @postprocessHtmlDoc cs@ converts the line-breaks of @cs@ to @<br>@ tags and
 -- the prefixed spaces in every line of @cs@ by non-breaing HTML spaces @&nbsp;@.
@@ -161,6 +196,13 @@ postprocessHtmlDoc =
   where
     addBreak = (++"<br/>")
     indent   = uncurry (++) . (first $ concatMap (const "&nbsp;")) . span isSpace
+
+postprocessDotHtmlDoc :: String -> String
+postprocessDotHtmlDoc =
+    unlines . map (indent) . lines
+  where
+--    addBreak = (++"<br/>")
+    indent   = uncurry (++) . (first $ concatMap (const " ")) . span isSpace
 
 ------------------------------------------------------------------------------
 -- NoHtmlDoc: ignoring HTML markup

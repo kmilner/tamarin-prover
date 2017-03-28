@@ -73,7 +73,6 @@ module Theory.Model.Fact (
   , prettyFact
   , prettyNFact
   , prettyLNFact
-  , prettyInvarLNFact
   ) where
 
 -- import           Control.Basics
@@ -274,8 +273,8 @@ getFactTerms :: Fact t -> [t]
 getFactTerms (Fact _ ts) = ts
 
 getInvariantTerms :: Fact t -> [Bool]
-getInvariantTerms (Fact (ProtoFact _ _ invs) ts) = invs
-getInvariantTerms fa = [False]
+getInvariantTerms (Fact (ProtoFact _ _ invs) _) = invs
+getInvariantTerms _ = [False]
 
 ------------------------------------------------------------------------------
 -- NFact
@@ -389,17 +388,17 @@ prettyNFact :: Document d => LNFact -> d
 prettyNFact = prettyFact prettyNTerm
 
 -- | Pretty print a 'LNFact'.
-prettyLNFact :: Document d => LNFact -> d
-prettyLNFact fa = prettyFact prettyNTerm fa
+prettyLNFact :: HighlightDocument d => LNFact -> d
+--prettyLNFact fa = prettyFact prettyNTerm fa
 
 -- | Pretty print an 'LNFact' with invariants
-prettyInvarLNFact :: HighlightDocument d => LNFact -> d
-prettyInvarLNFact (Fact tag@(ProtoFact _ _ invs) ts)
+--htmlLNFact :: Document d => LNFact -> d
+prettyLNFact (Fact tag@(ProtoFact _ _ invs) ts)
   | factTagArity tag /= length ts = ppFact ("MALFORMED-" ++ show tag) $ zip invs ts
   | otherwise                     = ppFact (showFactTag tag) $ zip invs ts
   where
     ppFact n = nestShort' (n ++ "(") ")" . fsep . punctuate comma . map ppTerm
-    ppTerm (id,t)
-        | id `elem` invs = keyword $ prettyNTerm t
-        | otherwise      = prettyNTerm t
-prettyInvarLNFact fa = prettyLNFact fa
+    ppTerm (b,t)
+        | b          = specialTerm $ prettyNTerm t
+        | otherwise  = prettyNTerm t
+prettyLNFact fa = prettyFact prettyNTerm fa

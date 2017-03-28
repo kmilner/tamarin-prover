@@ -38,6 +38,7 @@ import           Control.Monad.State      (StateT, evalStateT)
 
 import qualified Text.Dot                 as D
 import           Text.PrettyPrint.Class
+import           Text.PrettyPrint.Html
 
 import           Theory.Constraint.System
 import           Theory.Model
@@ -135,7 +136,7 @@ dotNode v = dotOnce dsNodes v $ do
               sequence_ [ dotIntraRuleEdge premId vId | premId <- premIds ]
               sequence_ [ dotIntraRuleEdge vId concId | concId <- concIds ]
   where
-    label ru = " : " ++ render nameAndActs
+    label ru = " : " ++ renderDotHtmlDoc nameAndActs
       where
         nameAndActs =
             ruleInfo (prettyProtoRuleName . get praciName) prettyIntrRuleACInfo (get rInfo ru) <->
@@ -166,7 +167,7 @@ dotSingleEdge :: (NodeConc, NodePrem) -> SeDot D.NodeId
 dotSingleEdge edge@(_, to) = dotOnce dsSingles edge $ do
     se <- asks fst
     let fa    = nodePremFact to se
-        label = render $ prettyLNFact fa
+        label = renderDotHtmlDoc $ prettyLNFact fa
     liftDot $ D.node $ [("label", label),("shape", "hexagon")]
                        ++ factNodeStyle fa
 
@@ -187,7 +188,7 @@ dotPrem prem@(v, i) =
             (label, moreStyle) = fromMaybe (ppPrem, []) $ do
                 ru <- M.lookup v nodes
                 fa <- lookupPrem i ru
-                return ( render $ prettyLNFact fa
+                return ( renderDotHtmlDoc $ prettyLNFact fa
                        , factNodeStyle fa
                        )
         liftDot $ D.node $ [("label", label),("shape",shape)]
@@ -207,7 +208,7 @@ dotConc =
             let (label, moreStyle) = fromMaybe (show x, []) $ do
                     ru <- M.lookup (fst x) nodes
                     fa <- (`atMay` snd x) $ get ruleSel ru
-                    return ( render $ prettyLNFact fa
+                    return ( renderDotHtmlDoc $ prettyLNFact fa
                            , factNodeStyle fa
                            )
             liftDot $ D.node $ [("label", label),("shape",shape)]
@@ -320,7 +321,7 @@ dotNodeCompact boringStyle v = dotOnce dsNodes v $ do
                         <-> opAction <-> text (show v)
                   attrs | any (isKUFact . snd) as = [("color","gray")]
                         | otherwise               = [("color","darkblue")]
-              in mkSimpleNode (render lbl) attrs
+              in mkSimpleNode (renderDotHtmlDoc lbl) attrs
       Just ru -> do
           let color     = M.lookup (get rInfo ru) colorMap
               nodeColor = maybe "white" (rgbToHex . lighter) color
@@ -353,19 +354,12 @@ dotNodeCompact boringStyle v = dotOnce dsNodes v $ do
             D.vcat $ map D.hcat $ map (map (uncurry D.portField)) $
             filter (not . null) [ps, as, cs]
       where
-        ps = renderRow [ (Just (Left i),  ppFactAndInvars p) | (i, p) <- enumPrems ru ]
+        ps = renderRow [ (Just (Left i),  ppFact p) | (i, p) <- enumPrems ru ]
         as = renderRow [ (Nothing,        ruleLabel ) ]
-        cs = renderRow [ (Just (Right i), ppFactAndInvars c) | (i, c) <- enumConcs ru ]
+        cs = renderRow [ (Just (Right i), ppFact c) | (i, c) <- enumConcs ru ]
 
-        ppFactAndInvars (Fact tag@(ProtoFact _ _ invs) ts)
-            | factTagArity tag /= length ts = ppFact ("MALFORMED-" ++ show tag) $ zip invs ts
-            | otherwise                     = ppFact (showFactTag tag) $ zip invs ts
-          where
-            ppFact n = nestShort' (n ++ "(") ")" . fsep . punctuate comma . map ppTerm
-            ppTerm (b,t)
-                | b         = zeroWidthText "\SOFONT COLOR=`blue3`\SI" <> prettyNTerm t <> zeroWidthText "\SO/FONT\SI"
-                | otherwise = prettyNTerm t
-        ppFactAndInvars fa = prettyLNFact fa
+        ppFact :: HighlightDocument d => LNFact -> DotHtmlDoc d
+        ppFact = prettyLNFact
 
         ruleLabel =
             prettyNodeId v <-> colon <-> text (showRuleCaseName ru) <>
@@ -379,14 +373,14 @@ dotNodeCompact boringStyle v = dotOnce dsNodes v $ do
 
         renderBalanced :: Double           -- ^ Total available width
                        -> (Double -> Int)  -- ^ Convert available space to actual line-width.
-                       -> [Doc]            -- ^ Initial documents
+                       -> [DotHtmlDoc Doc] -- ^ Initial documents
                        -> [String]         -- ^ Rendered documents
         renderBalanced _          _    []   = []
         renderBalanced totalWidth conv docs =
             zipWith (\w d -> widthRender (conv (ratio * w)) d) usedWidths docs
           where
-            oneLineRender  = renderStyle (defaultStyle { mode = OneLineMode })
-            widthRender w  = scaleIndent . renderStyle (defaultStyle { lineLength = w })
+            oneLineRender  = renderDotHtmlDocStyle (defaultStyle { mode = OneLineMode })
+            widthRender w  = scaleIndent . renderDotHtmlDocStyle (defaultStyle { lineLength = w })
             usedWidths     = map (fromIntegral . length . oneLineRender) docs
             ratio          = totalWidth / sum usedWidths
             scaleIndent line = case span isSpace line of
@@ -410,7 +404,7 @@ dotSystemCompact boringStyle se =
         F.mapM_ dotChain                           $ unsolvedChains    se
         F.mapM_ dotLess                            $ get sLessAtoms    se
   where
-    missingNode shape label = liftDot $ D.node $ [("label", render label),("shape",shape)]
+    missingNode shape label = liftDot $ D.node $ [("label", renderDotHtmlDoc label),("shape",shape)]
     dotPremC prem = dotOnce dsPrems prem $ missingNode "invtrapezium" $ prettyNodePrem prem
     dotConcC conc = dotOnce dsConcs conc $ missingNode "trapezium" $ prettyNodeConc conc
     dotEdge (Edge src tgt)  = do
