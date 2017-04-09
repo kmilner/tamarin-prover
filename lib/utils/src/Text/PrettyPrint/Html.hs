@@ -138,6 +138,7 @@ instance Document d => HighlightDocument (HtmlDoc d) where
         hlClass Comment  = "hl_comment"
         hlClass Keyword  = "hl_keyword"
         hlClass Operator = "hl_operator"
+        hlClass _        = ""
 
 -- | A 'Document' transformer that inherits from html documents but does not apply
 -- html tags that are not in the graphviz spec
