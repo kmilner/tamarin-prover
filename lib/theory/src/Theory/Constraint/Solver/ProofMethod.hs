@@ -1059,9 +1059,6 @@ injRanking ctxt allowLoopBreakers sys =
     isNonLastProtoFact (ActionG  _ (Fact (ProtoFact _ ('L':'_':_) _) _)) = False
     isNonLastProtoFact _                                                 = True
 
-    isOriginGoal (OriginG _ _) = True
-    isOriginGoal _             = False
-
     isLastName lv = isPrefixOf "L_" (lvarName lv)
     isFirstName lv = isPrefixOf "F_" (lvarName lv)
     isImmediateName lv = isPrefixOf "I_" (lvarName lv)

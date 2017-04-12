@@ -260,7 +260,6 @@ labelNodeId = \i rules parent -> do
           -- Store premise goal for later processing using CR-rule *DG2_2*
           | otherwise -> do
               insertGoal (PremiseG (i,v) fa) (v `elem` breakers)
-              ctxt <- getProofContext
               when (True `elem` getInvariantTerms fa) $ insertGoal (OriginG (i,v) fa) False
       where
         breakers = ruleInfo (get praciLoopBreakers) (const []) $ get rInfo ru
@@ -512,7 +511,7 @@ markGoalAsSolved how goal =
       PremiseG _ fa
         | isKDFact fa -> modM sGoals $ M.delete goal
         | otherwise   -> updateStatus
-      OriginG _ fa    -> updateStatus
+      OriginG _ _     -> updateStatus
       ChainG _ _      -> modM sGoals $ M.delete goal
       SplitG _        -> updateStatus
       DisjG disj      -> modM sFormulas       (S.delete $ GDisj disj) >>

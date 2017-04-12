@@ -209,7 +209,7 @@ prettyGoal (PremiseG (i, (PremIdx v)) fa) =
     -- Note that we can use "▷" for conclusions once we need them.
     prettyLNFact fa <-> text ("▶" ++ subscript (show v)) <-> prettyNodeId i
     -- prettyNodePrem p <> brackets (prettyLNFact fa)
-prettyGoal (OriginG (i, (PremIdx v)) fa) =
+prettyGoal (OriginG (i, (PremIdx _)) fa) =
     -- Note that we can use "▷" for conclusions once we need them.
     text (showFactTagArity (factTag fa)) <-> text (" origin") <-> prettyNodeId i
 prettyGoal (DisjG (Disj []))  = text "Disj" <-> operator_ "(⊥)"
