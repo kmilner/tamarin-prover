@@ -336,7 +336,7 @@ closeRuleCache restrictions typAsms sig protoRules intrRules isdiff = -- trace (
 
     -- inj fact instances
     injFactInstances =
-        simpleInjectiveFactInstances $ L.get cprRuleE <$> protoRules
+        simpleInjectiveFactInstances $ addInvariantsToRule invariants <$> L.get cprRuleE <$> protoRules
 
     invariants = invariantFactTerms $ L.get cprRuleE <$> protoRules
 
@@ -368,10 +368,6 @@ closeRuleCache restrictions typAsms sig protoRules intrRules isdiff = -- trace (
       , _crDestruct   = destr
       , _crProtocol   = proto
       }
-
---    addInvariants ru = (L.set rInvars $ invariantsOf ru) ru
---    invariantsOf ru = intersectBy factsInvariant (L.get rPrems ru) (L.get rConcs ru)
---    factsInvariant p c = p == c
 
 ------------------------------------------------------------------------------
 -- Restrictions (Trace filters)

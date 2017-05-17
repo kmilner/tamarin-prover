@@ -29,7 +29,7 @@ import           Theory.Model
 -- rule and pair them with the appropriate invariant positions. For each
 -- pair, create a new invariant fact with the conclusion and invariant
 -- positions and put them all into the rule's invariants and conclusions.
-addInvariantsToRule :: M.Map FactTag [Bool] -> ProtoRuleAC -> ProtoRuleAC
+addInvariantsToRule :: M.Map FactTag [Bool] -> Rule a -> Rule a
 addInvariantsToRule invarM (Rule i ps cs as) = (Rule i ps' cs' as)
       where
         ps' = map setInvars ps
