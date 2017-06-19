@@ -45,7 +45,7 @@ addInvariantsToRule invarM (Rule i ps cs as) = (Rule i ps' cs' as)
 invariantFactTerms :: [ProtoRuleE] -> M.Map FactTag [Bool]
 invariantFactTerms rules = M.fromList $ do
     tag <- candidates
-    guard $ not $ null $ sameTermIndices tag
+    guard $ or $ sameTermIndices tag
     return (tag, sameTermIndices tag)
   where
     sameTermIndices tag = foldl1' (zipWith (&&)) $ do
