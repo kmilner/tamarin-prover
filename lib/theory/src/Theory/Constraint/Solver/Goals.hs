@@ -1,5 +1,6 @@
-{-# LANGUAGE TupleSections #-}
-{-# LANGUAGE ViewPatterns  #-}
+{-# LANGUAGE TupleSections    #-}
+{-# LANGUAGE ViewPatterns     #-}
+{-# LANGUAGE FlexibleContexts #-}
 -- |
 -- Copyright   : (c) 2010-2012 Benedikt Schmidt & Simon Meier
 -- License     : GPL v3 (see LICENSE)
@@ -154,7 +155,7 @@ openGoals sys = do
         -- We cannot deduce a message from a last node.
         guard (not $ isLast sys j)
         let derivedMsgs = concatMap toplevelTerms $
-                [ t | Fact OutFact [t] <- get rConcs ru] <|>
+                [ t | Fact OutFact _ [t] <- get rConcs ru] <|>
                 [ t | Just (DnK, t)    <- kFactView <$> get rConcs ru]
         -- m is deducible from j without an immediate contradiction
         -- if it is a derived message of 'ru' and the dependency does
@@ -217,10 +218,10 @@ solveGoal goal = do
 solveAction :: [RuleAC]          -- ^ All rules labelled with an action
             -> (NodeId, LNFact)  -- ^ The action we are looking for.
             -> Reduction String  -- ^ A sensible case name.
-solveAction rules (i, fa) = do
+solveAction rules (i, fa@(Fact _ ann _)) = do
     mayRu <- M.lookup i <$> getM sNodes
     showRuleCaseName <$> case mayRu of
-        Nothing -> do ru  <- labelNodeId i rules Nothing
+        Nothing -> do ru  <- labelNodeId i (annotatePrems <$> rules) Nothing
                       act <- disjunctionOfList $ get rActs ru
                       void (solveFactEqs SplitNow [Equal fa act])
                       return ru
@@ -229,6 +230,14 @@ solveAction rules (i, fa) = do
                           act <- disjunctionOfList $ get rActs ru
                           void (solveFactEqs SplitNow [Equal fa act])
                       return ru
+  where
+    -- If the fact in the action goal has annotations, then consider annotated
+    -- versions of intruder rules (this allows high or low priority intruder knowledge
+    -- goals to propagate to intruder knowledge of subterms)
+    annotatePrems ru@(Rule ri ps cs as) =
+        if not (S.null ann) && isIntruderRule ru then
+            Rule ri (annotateFact ann <$> ps) cs (annotateFact ann <$> as)
+            else ru
 
 -- | CR-rules *DG_{2,P}* and *DG_{2,d}*: solve a premise with a direct edge
 -- from a unifying conclusion or using a destruction chain.

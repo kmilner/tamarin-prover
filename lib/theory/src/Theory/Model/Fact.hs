@@ -18,6 +18,8 @@ module Theory.Model.Fact (
     Fact(..)
   , Multiplicity(..)
   , FactTag(..)
+  , SolvePriority(..)
+  , FactAnnotation(..)
 
   , matchFact
   , normFact
@@ -38,11 +40,16 @@ module Theory.Model.Fact (
   , getRightFact
   , getFactVariables
   , getFactTerms
+  , getFactAnnotations
   , isTrivialFact
+  , isSolveFirstFact
+  , isSolveLastFact
 
   , DirTag(..)
   , kuFact
+  , kuFactAnn
   , kdFact
+  , kdFactAnn
   , kFactView
   , dedFactView
 
@@ -54,9 +61,12 @@ module Theory.Model.Fact (
   , freshFact
   , outFact
   , inFact
+  , inFactAnn
   , kLogFact
   , dedLogFact
   , protoFact
+  , protoFactAnn
+  , annotateFact
 
   -- * NFact
   , NFact
@@ -86,6 +96,7 @@ import           Data.Data
 import           Data.Maybe             (isJust)
 import           Data.Monoid
 -- import           Data.Traversable       (Traversable(..))
+import           Data.List              (isPrefixOf)
 import qualified Data.Set               as S
 
 import           Term.Unification
@@ -113,29 +124,57 @@ data FactTag = ProtoFact Multiplicity String Int
                           -- a message using a construction rule.
     deriving( Eq, Ord, Show, Typeable, Data, Generic, NFData, Binary )
 
+
+-- | SolvePriority is a type of annotation which the heuristic uses when sorting goals
+data SolvePriority = SolveFirst | SolveLast
+    deriving( Show, Data, Typeable, Generic, NFData, Binary )
+
+-- | Annotations are properties thhat might be used elsewhere (e.g. in
+--   dot rendering, or for sorting by heuristics) but do not affect
+--   the semantics of the fact
+data FactAnnotation = Priority SolvePriority
+    deriving( Eq, Ord, Show, Typeable, Data, Generic, NFData, Binary )
+
 -- | Facts.
 data Fact t = Fact
-    { factTag   :: FactTag
-    , factTerms :: [t]
+    { factTag         :: FactTag
+    , factAnnotations :: S.Set FactAnnotation
+    , factTerms       :: [t]
     }
-    deriving( Eq, Ord, Show, Typeable, Data, Generic, NFData, Binary )
+    deriving( Show, Typeable, Data, Generic, NFData, Binary )
 
 
 -- Instances
 ------------
 
+-- Ignore annotations in equality and ord testing
+instance Eq t => Eq (Fact t) where
+    (==) (Fact tag _ ts) (Fact tag' _ ts') = (tag == tag') && (ts == ts')
+
+instance Ord t => Ord (Fact t) where
+    compare (Fact tag _ ts) (Fact tag' _ ts') = compare tag tag' <> compare ts ts'
+
+-- Custom equality instance for SolvePriority, so that we can enforce uniqueness
+-- constraints on the set of annotations (e.g. adding SolveLast will replace
+-- SolveFirst in the set)
+instance Eq SolvePriority where
+    (==) _ _ = True
+
+instance Ord SolvePriority where
+    compare _ _ = EQ
+
 instance Functor Fact where
-    fmap f (Fact tag ts) = Fact tag (fmap f ts)
+    fmap f (Fact tag an ts) = Fact tag an (fmap f ts)
 
 instance Foldable Fact where
-    foldMap f (Fact _ ts) = foldMap f ts
+    foldMap f (Fact _ _ ts) = foldMap f ts
 
 instance Traversable Fact where
-    sequenceA (Fact tag ts) = Fact tag <$> sequenceA ts
-    traverse f (Fact tag ts) = Fact tag <$> traverse f ts
+    sequenceA (Fact tag an ts) = Fact tag an <$> sequenceA ts
+    traverse f (Fact tag an ts) = Fact tag an <$> traverse f ts
 
 instance Sized t => Sized (Fact t) where
-  size (Fact _ args) = size args
+  size (Fact _ _ args) = size args
 
 instance HasFrees t => HasFrees (Fact t) where
     foldFrees  f = foldMap  (foldFrees f)
@@ -154,24 +193,29 @@ data DirTag = UpK | DnK
             deriving( Eq, Ord, Show )
 
 kdFact, kuFact :: t -> Fact t
-kdFact = Fact KDFact . return
-kuFact = Fact KUFact . return
+kdFact = Fact KDFact S.empty . return
+kuFact = Fact KUFact S.empty . return
+
+-- | Make annotated KU/KD facts
+kdFactAnn, kuFactAnn :: S.Set FactAnnotation -> t -> Fact t
+kdFactAnn ann = Fact KDFact ann . return
+kuFactAnn ann = Fact KUFact ann . return
 
 -- | View a message-deduction fact.
 kFactView :: LNFact -> Maybe (DirTag, LNTerm)
 kFactView fa = case fa of
-    Fact KUFact [m] -> Just (UpK, m)
-    Fact KUFact _   -> errMalformed "kFactView" fa
-    Fact KDFact [m] -> Just (DnK, m)
-    Fact KDFact _   -> errMalformed "kFactView" fa
-    _               -> Nothing
+    Fact KUFact _ [m] -> Just (UpK, m)
+    Fact KUFact _ _   -> errMalformed "kFactView" fa
+    Fact KDFact _ [m] -> Just (DnK, m)
+    Fact KDFact _ _   -> errMalformed "kFactView" fa
+    _                 -> Nothing
 
 -- | View a deduction logging fact.
 dedFactView :: LNFact -> Maybe LNTerm
 dedFactView fa = case fa of
-    Fact DedFact [m] -> Just m
-    Fact DedFact _   -> errMalformed "dedFactView" fa
-    _                -> Nothing
+    Fact DedFact _ [m] -> Just m
+    Fact DedFact _ _   -> errMalformed "dedFactView" fa
+    _                  -> Nothing
 
 -- | True if the fact is a message-deduction fact.
 isKFact :: LNFact -> Bool
@@ -179,13 +223,13 @@ isKFact = isJust . kFactView
 
 -- | True if the fact is a KU-fact.
 isKUFact :: LNFact -> Bool
-isKUFact (Fact KUFact _) = True
-isKUFact _               = False
+isKUFact (Fact KUFact _ _) = True
+isKUFact _                 = False
 
 -- | True if the fact is a KD-fact.
 isKDFact :: LNFact -> Bool
-isKDFact (Fact KDFact _) = True
-isKDFact _               = False
+isKDFact (Fact KDFact _ _) = True
+isKDFact _                 = False
 
 -- | Mark a fact as malformed.
 errMalformed :: String -> LNFact -> a
@@ -197,15 +241,19 @@ errMalformed caller fa =
 
 -- | A fact denoting a message sent by the protocol to the intruder.
 outFact :: t -> Fact t
-outFact = Fact OutFact . return
+outFact = Fact OutFact S.empty . return
 
 -- | A fresh fact denotes a fresh unguessable name.
 freshFact :: t -> Fact t
-freshFact = Fact FreshFact . return
+freshFact = Fact FreshFact S.empty . return
 
 -- | A fact denoting that the intruder sent a message to the protocol.
 inFact :: t -> Fact t
-inFact = Fact InFact . return
+inFact = Fact InFact S.empty . return
+
+-- | An annotated fact denoting that the intruder sent a message to the protocol.
+inFactAnn :: S.Set FactAnnotation -> t -> Fact t
+inFactAnn an = Fact InFact an . return
 
 -- | A fact logging that the intruder knows a message.
 kLogFact :: t -> Fact t
@@ -214,20 +262,27 @@ kLogFact = protoFact Linear "K" . return
 -- | A fact logging that the intruder deduced a message using a construction
 -- rule. We use this to formulate invariants over normal dependency graphs.
 dedLogFact :: t -> Fact t
-dedLogFact = Fact DedFact . return
+dedLogFact = Fact DedFact S.empty . return
 
 -- | A protocol fact denotes a fact generated by a protocol rule.
 protoFact :: Multiplicity -> String -> [t] -> Fact t
-protoFact multi name ts = Fact (ProtoFact multi name (length ts)) ts
+protoFact multi name ts = Fact (ProtoFact multi name (length ts)) S.empty ts
 
+-- | An annotated fact denoting a fact generated by a protocol rule.
+protoFactAnn :: Multiplicity -> String -> S.Set FactAnnotation -> [t] -> Fact t
+protoFactAnn multi name an ts = Fact (ProtoFact multi name (length ts)) an ts
+
+-- | Add annotations to an existing fact
+annotateFact :: S.Set FactAnnotation -> Fact t -> Fact t
+annotateFact ann' (Fact tag ann ts) = Fact tag (S.union ann' ann) ts
 
 -- Queries on facts
 -------------------
 
 -- | True iff the fact is a non-special protocol fact.
 isProtoFact :: Fact t -> Bool
-isProtoFact (Fact (ProtoFact _ _ _) _) = True
-isProtoFact _                          = False
+isProtoFact (Fact (ProtoFact _ _ _) _ _) = True
+isProtoFact _                            = False
 
 -- | True if the fact is a linear fact.
 isLinearFact :: Fact t -> Bool
@@ -258,7 +313,7 @@ factTagArity tag = case  tag of
 
 -- | The arity of a 'Fact'.
 factArity :: Fact t -> Int
-factArity (Fact tag ts)
+factArity (Fact tag _ ts)
   | length ts == k = k
   | otherwise      = error $ "factArity: tag of arity " ++ show k ++
                              " applied to " ++ show (length ts) ++ " terms"
@@ -271,7 +326,19 @@ factMultiplicity = factTagMultiplicity . factTag
 
 -- | The terms of a 'Fact'.
 getFactTerms :: Fact t -> [t]
-getFactTerms (Fact _ ts) = ts 
+getFactTerms (Fact _ _ ts) = ts
+
+-- | Get the set of fact annotations
+getFactAnnotations :: Fact t -> S.Set FactAnnotation
+getFactAnnotations (Fact _ ann _) = ann
+
+-- | Whether the fact has been marked as 'solve first' for the heuristic
+isSolveFirstFact :: Fact t -> Bool
+isSolveFirstFact (Fact tag ann _) = Priority SolveFirst `S.member` ann || (isPrefixOf "F_" $ factTagName tag)
+
+-- | Whether the fact has been marked as 'solve last' for the heuristic
+isSolveLastFact :: Fact t -> Bool
+isSolveLastFact (Fact tag ann _)  = Priority SolveLast `S.member` ann  || (isPrefixOf "L_" $ factTagName tag)
 
 ------------------------------------------------------------------------------
 -- NFact
@@ -305,7 +372,7 @@ unifiableLNFacts fa1 fa2 = (not . null) <$> unifyLNFactEqs [Equal fa1 fa2]
 
 -- | Normalize all terms in the fact
 normFact :: LNFact -> WithMaude LNFact
-normFact (Fact h ts) = reader $ \hnd -> (Fact h (map (\term -> runReader (norm' term) hnd) ts))
+normFact (Fact h an ts) = reader $ \hnd -> (Fact h an (map (\term -> runReader (norm' term) hnd) ts))
 
 -- | @matchLFact t p@ is a complete set of AC matchers for the term fact @t@
 -- and the pattern fact @p@.
@@ -319,22 +386,22 @@ matchFact t p =
     
 -- | Get "left" variant of a diff fact
 getLeftFact :: LNFact -> LNFact
-getLeftFact (Fact tag ts) =
-   (Fact tag (map getLeftTerm ts))
+getLeftFact (Fact tag an ts) =
+   (Fact tag an (map getLeftTerm ts))
 
 -- | Get "left" variant of a diff fact
 getRightFact :: LNFact -> LNFact
-getRightFact (Fact tag ts) =
-   (Fact tag (map getRightTerm ts))
+getRightFact (Fact tag an ts) =
+   (Fact tag an (map getRightTerm ts))
 
 -- | Get all variables inside a fact
 getFactVariables :: LNFact -> [LVar]
-getFactVariables (Fact _ ts) =
+getFactVariables (Fact _ _ ts) =
    map fst $ varOccurences ts
 
 -- | If all the fact terms are simple and different msg variables (i.e., not fresh or public), returns the list of all these variables. Otherwise returns Nothing. [This could be relaxed to work for all variables (including fresh and public) if Facts were typed, so that an argument would always have to be fresh or public or general.]
 isTrivialFact :: LNFact -> Maybe [LVar]
-isTrivialFact (Fact _ ts) = case ts of
+isTrivialFact (Fact _ _ ts) = case ts of
       []   -> Just []
       x:xs -> Prelude.foldl combine (getMsgVar x) (map getMsgVar xs)
     where
@@ -372,13 +439,21 @@ showFactTag tag =
 showFactTagArity :: FactTag -> String
 showFactTagArity tag = showFactTag tag ++ "/" ++ show (factTagArity tag)
 
+-- | Show fact annotation
+showFactAnnotation :: FactAnnotation -> String
+showFactAnnotation an = case an of
+    Priority SolveFirst     -> "+"
+    Priority SolveLast      -> "-"
+
 -- | Pretty print a fact.
 prettyFact :: Document d => (t -> d) -> Fact t -> d
-prettyFact ppTerm (Fact tag ts)
-  | factTagArity tag /= length ts = ppFact ("MALFORMED-" ++ show tag) ts
-  | otherwise                     = ppFact (showFactTag tag) ts
+prettyFact ppTerm (Fact tag an ts)
+  | factTagArity tag /= length ts = ppFact ("MALFORMED-" ++ show tag) ts <> ppAnn an
+  | otherwise                     = ppFact (showFactTag tag) ts <> ppAnn an
   where
-    ppFact n = nestShort' (n ++ "(") ")" . fsep . punctuate comma . map ppTerm
+    ppFact n t = nestShort' (n ++ "(") ")" . fsep . punctuate comma $ map ppTerm t
+    ppAnn ann = if S.null ann then text "" else
+        brackets . fsep . punctuate comma $ map (text . showFactAnnotation) $ S.toList ann
 
 -- | Pretty print a 'NFact'.
 prettyNFact :: Document d => LNFact -> d

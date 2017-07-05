@@ -685,11 +685,11 @@ getSubstitutionsFixingNewVars rule orig = Subst $ M.fromList $ concat $ map getS
     getSubst (fa, cidx, var) = map (\x -> (var, x)) (getMatchingTerm (fa, cidx, var))
     
     getMatchingTerm :: (LNFact, ConcIdx, LVar) -> [LNTerm]
-    getMatchingTerm ((Fact fi ts), cidx, var') = rec var' ts matchingTs 
+    getMatchingTerm ((Fact fi an ts), cidx, var') = rec var' ts matchingTs 
       where
         matchingTs = case matchingConc of
-                          Fact fi' ts' -> if fi == fi' then ts' else (error $ "getMatchingTerm: Matching conclusion with different fact: " ++ show (Fact fi ts) ++ " " ++ show cidx ++ " " ++ show var')
-        matchingConc = fromMaybe (error $ "getMatchingTerm: No matching conclusion: " ++ show (Fact fi ts) ++ " " ++ show cidx ++ " " ++ show var') (lookupConc cidx rule)
+                          Fact fi' _ ts' -> if fi == fi' then ts' else (error $ "getMatchingTerm: Matching conclusion with different fact: " ++ show (Fact fi an ts) ++ " " ++ show cidx ++ " " ++ show var')
+        matchingConc = fromMaybe (error $ "getMatchingTerm: No matching conclusion: " ++ show (Fact fi an ts) ++ " " ++ show cidx ++ " " ++ show var') (lookupConc cidx rule)
         
         rec :: LVar -> [LNTerm] -> [LNTerm] -> [LNTerm]
         rec _   []     []       = []
@@ -708,25 +708,25 @@ getSubstitutionsFixingNewVars rule orig = Subst $ M.fromList $ concat $ map getS
 multRuleInstance :: Int -> RuleAC
 multRuleInstance n = (Rule (IntrInfo (ConstrRule $ BC.pack "mult")) (map xifact [1..n]) [prod] [prod])
   where
-    prod = Fact KUFact [(FAPP (AC Mult) (map xi [1..n]))]
+    prod = kuFact (FAPP (AC Mult) (map xi [1..n]))
     
     xi :: Int -> LNTerm
     xi k = (LIT $ Var $ LVar "x" LSortMsg (toInteger k))
     
     xifact :: Int -> LNFact
-    xifact k = Fact KUFact [(xi k)]
+    xifact k = kuFact (xi k)
 
 -- | Returns a union rule instance of the given size.
 unionRuleInstance :: Int -> RuleAC
 unionRuleInstance n = (Rule (IntrInfo (ConstrRule $ BC.pack "union")) (map xifact [1..n]) [prod] [prod])
   where
-    prod = Fact KUFact [(FAPP (AC Union) (map xi [1..n]))]
+    prod = kuFact (FAPP (AC Union) (map xi [1..n]))
     
     xi :: Int -> LNTerm
     xi k = (LIT $ Var $ LVar "x" LSortMsg (toInteger k))
     
     xifact :: Int -> LNFact
-    xifact k = Fact KUFact [(xi k)]
+    xifact k = kuFact (xi k)
 
 type RuleACConstrs = Disj LNSubstVFresh
 
@@ -814,13 +814,13 @@ someRuleACInstAvoidingFixing r s subst =
       
 -- | Add the diff label to a rule
 addDiffLabel :: Rule a -> String -> Rule a
-addDiffLabel (Rule info prems concs acts) name = Rule info prems concs (acts ++ [Fact {factTag = ProtoFact Linear name 0, factTerms = []}])
+addDiffLabel (Rule info prems concs acts) name = Rule info prems concs (acts ++ [Fact {factTag = ProtoFact Linear name 0, factAnnotations = S.empty, factTerms = []}])
 
 -- | Remove the diff label from a rule
 removeDiffLabel :: Rule a -> String -> Rule a
 removeDiffLabel (Rule info prems concs acts) name = Rule info prems concs (filter isNotDiffAnnotation acts)
   where
-    isNotDiffAnnotation fa = (fa /= Fact {factTag = ProtoFact Linear name 0, factTerms = []})
+    isNotDiffAnnotation fa = (fa /= Fact {factTag = ProtoFact Linear name 0, factAnnotations = S.empty, factTerms = []})
 
 -- Unification
 --------------
@@ -973,7 +973,7 @@ prettyNamedRule prefix ppInfo ru =
     ppFacts' list    = ppList prettyLNFact list
     ppFacts proj     = ppList prettyLNFact $ L.get proj ru
     ppFactsList proj = fsep [operator_ "[", ppFacts proj, operator_ "]"]
-    isNotDiffAnnotation fa = (fa /= Fact {factTag = ProtoFact Linear ("Diff" ++ getRuleNameDiff ru) 0, factTerms = []})
+    isNotDiffAnnotation fa = (fa /= Fact {factTag = ProtoFact Linear ("Diff" ++ getRuleNameDiff ru) 0, factAnnotations = S.empty, factTerms = []})
     ppAttributes = case ruleAttributes ru of
         []    -> text ""
         attrs -> hcat $ [text "[", hsep $ map prettyRuleAttribute attrs, text "]"]
