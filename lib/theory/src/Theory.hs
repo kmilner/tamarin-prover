@@ -223,7 +223,7 @@ import           Term.Positions
 -- Datatypes for feature sets
 ------------------------------------------------------------------------------
 
-data Feature    = Invariant deriving (Eq, Ord, Show)
+data Feature    = Invariant | DiffEquiv deriving (Eq, Ord, Show)
 type FeatureSet = S.Set Feature
 
 ------------------------------------------------------------------------------
@@ -333,24 +333,23 @@ closeRuleCache :: [LNGuarded]        -- ^ Restrictions to use.
                -> SignatureWithMaude -- ^ Signature of theory.
                -> [ClosedProtoRule]  -- ^ Protocol rules with variants.
                -> OpenRuleCache      -- ^ Intruder rules modulo AC.
-               -> Bool               -- ^ Diff or not
                -> FeatureSet         -- ^ Features to disable
                -> ClosedRuleCache    -- ^ Cached rules and case distinctions.
-closeRuleCache restrictions typAsms sig protoRules intrRules isdiff fs = -- trace ("closeRuleCache: " ++ show classifiedRules) $
+closeRuleCache restrictions typAsms sig protoRules intrRules fs = -- trace ("closeRuleCache: " ++ show classifiedRules) $
     ClosedRuleCache
         classifiedRules rawSources refinedSources injFactInstances invariants
   where
     ctxt0 = ProofContext
         sig classifiedRules injFactInstances invariants RawSource [] AvoidInduction
         (error "closeRuleCache: trace quantifier should not matter here")
-        (error "closeRuleCache: lemma name should not matter here") [] isdiff
+        (error "closeRuleCache: lemma name should not matter here") [] (DiffEquiv `S.notMember` fs)
         (all isSubtermRule {-$ trace (show destr ++ " - " ++ show (map isSubtermRule destr))-} destr) (any isConstantRule destr)
 
     -- inj fact instances
     injFactInstances =
         simpleInjectiveFactInstances $ addInvariantsToRule invariants <$> L.get cprRuleE <$> protoRules
 
-    invariants = if not (Invariant `S.member` fs)
+    invariants = if Invariant `S.notMember` fs
         then invariantFactTerms $ L.get cprRuleE <$> protoRules
         else M.empty
 
@@ -1224,10 +1223,11 @@ closeDiffTheoryWithMaude :: SignatureWithMaude -> FeatureSet -> OpenDiffTheory -
 closeDiffTheoryWithMaude sig fs thy0 = do
     proveDiffTheory (const True) (const True) checkProof checkDiffProof (DiffTheory (L.get diffThyName thy0) sig cacheLeft cacheRight diffCacheLeft diffCacheRight items)
   where
-    diffCacheLeft  = closeRuleCache restrictionsLeft  typAsms sig leftClosedRules  (L.get diffThyDiffCacheLeft  thy0) True fs
-    diffCacheRight = closeRuleCache restrictionsRight typAsms sig rightClosedRules (L.get diffThyDiffCacheRight thy0) True fs
-    cacheLeft  = closeRuleCache restrictionsLeft  typAsms sig leftClosedRules  (L.get diffThyCacheLeft  thy0) False fs
-    cacheRight = closeRuleCache restrictionsRight typAsms sig rightClosedRules (L.get diffThyCacheRight thy0) False fs
+    woDiff = DiffEquiv `S.insert` fs
+    diffCacheLeft  = closeRuleCache restrictionsLeft  typAsms sig leftClosedRules  (L.get diffThyDiffCacheLeft  thy0) fs
+    diffCacheRight = closeRuleCache restrictionsRight typAsms sig rightClosedRules (L.get diffThyDiffCacheRight thy0) fs
+    cacheLeft  = closeRuleCache restrictionsLeft  typAsms sig leftClosedRules  (L.get diffThyCacheLeft  thy0) woDiff
+    cacheRight = closeRuleCache restrictionsRight typAsms sig rightClosedRules (L.get diffThyCacheRight thy0) woDiff
     checkProof = checkAndExtendProver (sorryProver Nothing)
     checkDiffProof = checkAndExtendDiffProver (sorryDiffProver Nothing)
     diffRules  = diffTheoryDiffRules thy0
@@ -1291,7 +1291,7 @@ closeTheoryWithMaude sig fs thy0 = do
       proveTheory (const True) checkProof
     $ Theory (L.get thyName thy0) sig cache items
   where
-    cache      = closeRuleCache restrictions typAsms sig rules (L.get thyCache thy0) False fs
+    cache      = closeRuleCache restrictions typAsms sig rules (L.get thyCache thy0) fs
     checkProof = checkAndExtendProver (sorryProver Nothing)
 
     -- Maude / Signature handle

@@ -123,12 +123,14 @@ quitOnWarning as = if (argExists "quit-on-warning" as) then ["quit-on-warning"] 
 
 -- | Extract features from a string
 parseFeature :: ArgVal -> Maybe Feature
-parseFeature "invariant" = Just Invariant
-parseFeature _           = Nothing -- should we throw an error/show a warning?
+parseFeature f
+    | f == "invariant" = Just Invariant
+    | otherwise        = Nothing
 
 -- | The features to disable.
 disabled :: Arguments -> FeatureSet
-disabled as = Set.fromList $ catMaybes $ parseFeature <$> map toLower <$> findArg "disable" as
+disabled as = Set.fromList $ catMaybes $ (parseFeature <$> map toLower <$> findArg "disable" as)
+    ++ if (argExists "diff" as) then [Nothing] else [Just DiffEquiv]
 
 -- | Load an open theory from a file.
 loadOpenDiffThy :: Arguments -> FilePath -> IO OpenDiffTheory
