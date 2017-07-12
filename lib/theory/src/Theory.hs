@@ -17,8 +17,12 @@
 --
 -- Theory datatype and transformations on it.
 module Theory (
+  -- * Feature datatypes
+    Feature(..)
+  , FeatureSet
+
   -- * Restrictions
-    Restriction(..)
+  , Restriction(..)
   , RestrictionAttribute(..)
   , rstrName
   , rstrFormula
@@ -216,6 +220,13 @@ import           Theory.Tools.InvariantFacts
 import           Term.Positions
 
 ------------------------------------------------------------------------------
+-- Datatypes for feature sets
+------------------------------------------------------------------------------
+
+data Feature    = Invariant deriving (Eq, Ord, Show)
+type FeatureSet = S.Set Feature
+
+------------------------------------------------------------------------------
 -- Specific proof types
 ------------------------------------------------------------------------------
 
@@ -323,8 +334,9 @@ closeRuleCache :: [LNGuarded]        -- ^ Restrictions to use.
                -> [ClosedProtoRule]  -- ^ Protocol rules with variants.
                -> OpenRuleCache      -- ^ Intruder rules modulo AC.
                -> Bool               -- ^ Diff or not
+               -> FeatureSet         -- ^ Features to disable
                -> ClosedRuleCache    -- ^ Cached rules and case distinctions.
-closeRuleCache restrictions typAsms sig protoRules intrRules isdiff = -- trace ("closeRuleCache: " ++ show classifiedRules) $
+closeRuleCache restrictions typAsms sig protoRules intrRules isdiff fs = -- trace ("closeRuleCache: " ++ show classifiedRules) $
     ClosedRuleCache
         classifiedRules rawSources refinedSources injFactInstances invariants
   where
@@ -338,7 +350,9 @@ closeRuleCache restrictions typAsms sig protoRules intrRules isdiff = -- trace (
     injFactInstances =
         simpleInjectiveFactInstances $ addInvariantsToRule invariants <$> L.get cprRuleE <$> protoRules
 
-    invariants = invariantFactTerms $ L.get cprRuleE <$> protoRules
+    invariants = if not (Invariant `S.member` fs)
+        then invariantFactTerms $ L.get cprRuleE <$> protoRules
+        else M.empty
 
     -- precomputing the case distinctions: we make sure to only add safety
     -- restrictions. Otherwise, it wouldn't be sound to use the precomputed case
@@ -1183,11 +1197,12 @@ closeEitherProtoRule hnd (s, ruE) = (s, closeProtoRule hnd ruE)
 -- correct signature. This is the right place to do that because in a closed
 -- theory the signature may not change any longer.
 closeTheory :: FilePath         -- ^ Path to the Maude executable.
+            -> FeatureSet       -- ^ Features to disable
             -> OpenTheory
             -> IO ClosedTheory
-closeTheory maudePath thy0 = do
+closeTheory maudePath fs thy0 = do
     sig <- toSignatureWithMaude maudePath $ L.get thySignature thy0
-    return $ closeTheoryWithMaude sig thy0
+    return $ closeTheoryWithMaude sig fs thy0
     
 -- | Close a theory by closing its associated rule set and checking the proof
 -- skeletons and caching AC variants as well as precomputed case distinctions.
@@ -1196,22 +1211,23 @@ closeTheory maudePath thy0 = do
 -- correct signature. This is the right place to do that because in a closed
 -- theory the signature may not change any longer.
 closeDiffTheory :: FilePath         -- ^ Path to the Maude executable.
+            -> FeatureSet           -- ^ Features to disable
             -> OpenDiffTheory
             -> IO ClosedDiffTheory
-closeDiffTheory maudePath thy0 = do
+closeDiffTheory maudePath fs thy0 = do
     sig <- toSignatureWithMaude maudePath $ L.get diffThySignature thy0
-    return $ closeDiffTheoryWithMaude sig thy0
+    return $ closeDiffTheoryWithMaude sig fs thy0
     
 -- | Close a diff theory given a maude signature. This signature must be valid for
 -- the given theory.
-closeDiffTheoryWithMaude :: SignatureWithMaude -> OpenDiffTheory -> ClosedDiffTheory
-closeDiffTheoryWithMaude sig thy0 = do
+closeDiffTheoryWithMaude :: SignatureWithMaude -> FeatureSet -> OpenDiffTheory -> ClosedDiffTheory
+closeDiffTheoryWithMaude sig fs thy0 = do
     proveDiffTheory (const True) (const True) checkProof checkDiffProof (DiffTheory (L.get diffThyName thy0) sig cacheLeft cacheRight diffCacheLeft diffCacheRight items)
   where
-    diffCacheLeft  = closeRuleCache restrictionsLeft  typAsms sig leftClosedRules  (L.get diffThyDiffCacheLeft  thy0) True
-    diffCacheRight = closeRuleCache restrictionsRight typAsms sig rightClosedRules (L.get diffThyDiffCacheRight thy0) True
-    cacheLeft  = closeRuleCache restrictionsLeft  typAsms sig leftClosedRules  (L.get diffThyCacheLeft  thy0) False
-    cacheRight = closeRuleCache restrictionsRight typAsms sig rightClosedRules (L.get diffThyCacheRight thy0) False
+    diffCacheLeft  = closeRuleCache restrictionsLeft  typAsms sig leftClosedRules  (L.get diffThyDiffCacheLeft  thy0) True fs
+    diffCacheRight = closeRuleCache restrictionsRight typAsms sig rightClosedRules (L.get diffThyDiffCacheRight thy0) True fs
+    cacheLeft  = closeRuleCache restrictionsLeft  typAsms sig leftClosedRules  (L.get diffThyCacheLeft  thy0) False fs
+    cacheRight = closeRuleCache restrictionsRight typAsms sig rightClosedRules (L.get diffThyCacheRight thy0) False fs
     checkProof = checkAndExtendProver (sorryProver Nothing)
     checkDiffProof = checkAndExtendDiffProver (sorryDiffProver Nothing)
     diffRules  = diffTheoryDiffRules thy0
@@ -1270,12 +1286,12 @@ closeDiffTheoryWithMaude sig thy0 = do
     
 -- | Close a theory given a maude signature. This signature must be valid for
 -- the given theory.
-closeTheoryWithMaude :: SignatureWithMaude -> OpenTheory -> ClosedTheory
-closeTheoryWithMaude sig thy0 = do
+closeTheoryWithMaude :: SignatureWithMaude -> FeatureSet -> OpenTheory -> ClosedTheory
+closeTheoryWithMaude sig fs thy0 = do
       proveTheory (const True) checkProof
     $ Theory (L.get thyName thy0) sig cache items
   where
-    cache      = closeRuleCache restrictions typAsms sig rules (L.get thyCache thy0) False
+    cache      = closeRuleCache restrictions typAsms sig rules (L.get thyCache thy0) False fs
     checkProof = checkAndExtendProver (sorryProver Nothing)
 
     -- Maude / Signature handle
@@ -1324,9 +1340,9 @@ closeTheoryWithMaude sig thy0 = do
 -----------------------------------------------
 
 -- | Apply partial evaluation.
-applyPartialEvaluation :: EvaluationStyle -> ClosedTheory -> ClosedTheory
-applyPartialEvaluation evalStyle thy0 =
-    closeTheoryWithMaude sig $
+applyPartialEvaluation :: EvaluationStyle -> FeatureSet -> ClosedTheory -> ClosedTheory
+applyPartialEvaluation evalStyle fs thy0 =
+    closeTheoryWithMaude sig fs $
     L.modify thyItems replaceProtoRules (openTheory thy0)
   where
     sig          = L.get thySignature thy0
@@ -1355,9 +1371,9 @@ applyPartialEvaluation evalStyle thy0 =
               ++ show (length ruEs) ++ ".\n\n")
 
 -- | Apply partial evaluation.
-applyPartialEvaluationDiff :: EvaluationStyle -> ClosedDiffTheory -> ClosedDiffTheory
-applyPartialEvaluationDiff evalStyle thy0 =
-    closeDiffTheoryWithMaude sig $
+applyPartialEvaluationDiff :: EvaluationStyle -> FeatureSet -> ClosedDiffTheory -> ClosedDiffTheory
+applyPartialEvaluationDiff evalStyle fs thy0 =
+    closeDiffTheoryWithMaude sig fs $
     L.modify diffThyItems replaceProtoRules (openDiffTheory thy0)
   where
     sig            = L.get diffThySignature thy0

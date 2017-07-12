@@ -47,8 +47,10 @@ import           Prelude                             hiding (id, (.))
 import           Data.Char                           (toLower)
 import           Data.Label
 import           Data.List                           (isPrefixOf)
+import qualified Data.Set as Set
 -- import           Data.Monoid
 import           Data.FileEmbed                      (embedFile)
+import           Data.Maybe                          (catMaybes)
 
 -- import           Control.Basics
 import           Control.Category
@@ -66,7 +68,6 @@ import           Theory.Tools.Wellformedness
 
 import           Main.Console
 import           Main.Environment
-
 
 ------------------------------------------------------------------------------
 -- Theory loading: shared between interactive and batch mode
@@ -101,6 +102,9 @@ theoryLoadFlags =
   , flagNone ["quit-on-warning"] (addEmptyArg "quit-on-warning")
       "Strict mode that quits on any warning that is emitted."
 
+  , flagReq ["disable"] (updateArg "disable") "INVARIANT"
+      "Disable specified logic when proving a theory."
+
 --  , flagOpt "" ["diff"] (updateArg "diff") "OFF|ON"
 --      "Turn on observational equivalence (default OFF)."
   ]
@@ -116,6 +120,15 @@ diff as = if (argExists "diff" as) then ["diff"] else []
 -- | quit-on-warning flag in the argument
 quitOnWarning :: Arguments -> [String]
 quitOnWarning as = if (argExists "quit-on-warning" as) then ["quit-on-warning"] else []
+
+-- | Extract features from a string
+parseFeature :: ArgVal -> Maybe Feature
+parseFeature "invariant" = Just Invariant
+parseFeature _           = Nothing -- should we throw an error/show a warning?
+
+-- | The features to disable.
+disabled :: Arguments -> FeatureSet
+disabled as = Set.fromList $ catMaybes $ parseFeature <$> map toLower <$> findArg "disable" as
 
 -- | Load an open theory from a file.
 loadOpenDiffThy :: Arguments -> FilePath -> IO OpenDiffTheory
@@ -201,14 +214,14 @@ closeThy as thy0 = do
   -- fine-grained.
   let thy2 = wfCheck thy1
   -- close and prove
-  cthy <- closeTheory (maudePath as) thy2
+  cthy <- closeTheory (maudePath as) (disabled as) thy2
   return $ proveTheory lemmaSelector prover $ partialEvaluation cthy
     where
       -- apply partial application
       ----------------------------
       partialEvaluation = case map toLower <$> findArg "partialEvaluation" as of
-        Just "verbose" -> applyPartialEvaluation Tracing
-        Just _         -> applyPartialEvaluation Summary
+        Just "verbose" -> applyPartialEvaluation Tracing (disabled as)
+        Just _         -> applyPartialEvaluation Summary (disabled as)
         _              -> id
 
       -- wellformedness check
@@ -238,14 +251,14 @@ closeDiffThy as thy0 = do
   -- fine-grained.
   let thy2 = wfCheckDiff thy0
   -- close and prove
-  cthy <- closeDiffTheory (maudePath as) (addDefaultDiffLemma (addProtoRuleLabels thy2))
+  cthy <- closeDiffTheory (maudePath as) (disabled as) (addDefaultDiffLemma (addProtoRuleLabels thy2))
   return $ proveDiffTheory lemmaSelector diffLemmaSelector prover diffprover $ partialEvaluation cthy
     where
       -- apply partial application
       ----------------------------
       partialEvaluation = case map toLower <$> findArg "partialEvaluation" as of
-        Just "verbose" -> applyPartialEvaluationDiff Tracing
-        Just _         -> applyPartialEvaluationDiff Summary
+        Just "verbose" -> applyPartialEvaluationDiff Tracing (disabled as)
+        Just _         -> applyPartialEvaluationDiff Summary (disabled as)
         _              -> id
 
       -- wellformedness check
