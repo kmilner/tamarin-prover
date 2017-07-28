@@ -1855,36 +1855,54 @@ prettyOpenDiffTheory =
 prettyClosedTheory :: HighlightDocument d => ClosedTheory -> d
 prettyClosedTheory thy =
     prettyTheory prettySignatureWithMaude
-                 ppInjectiveFactInsts
+                 ppSpecialFactInsts
                  -- (prettyIntrVariantsSection . intruderRules . L.get crcRules)
                  prettyClosedProtoRule
                  prettyIncrementalProof
                  thy
   where
-    ppInjectiveFactInsts crc =
-        case S.toList $ L.get crcInjectiveFactInsts crc of
-            []   -> emptyDoc
-            tags -> multiComment $ sep
-                      [ text "looping facts with injective instances:"
-                      , nest 2 $ fsepList (text . showFactTagArity) tags ]
+    ppSpecialFactInsts crc =
+        case (injFacts, invFacts) of
+            ([], [])           -> emptyDoc
+            (injTags, [])      -> multiComment $ sep (formatInjFacts injTags) -- this shouldn't be possible
+            ([], invTags)      -> multiComment $ sep (formatInvFacts invTags)
+            (injTags, invTags) -> multiComment $ sep (formatInjFacts injTags ++ formatInvFacts invTags)
+      where
+        injFacts = S.toList $ L.get crcInjectiveFactInsts crc
+        invFacts = M.keys $ L.get crcInvariantFactTerms crc
+        formatInjFacts tags =
+            [ text "looping facts with injective instances:"
+            , nest 2 $ fsepList (text . showFactTagArity) tags ]
+        formatInvFacts tags =
+            [ text "looping facts with invariant instances:"
+            , nest 2 $ fsepList (text . showFactTagArity) tags ]
 
 -- | Pretty print a closed theory.
 prettyClosedDiffTheory :: HighlightDocument d => ClosedDiffTheory -> d
 prettyClosedDiffTheory thy =
     prettyDiffTheory prettySignatureWithMaude
-                 ppInjectiveFactInsts
+                 ppSpecialFactInsts
                  -- (prettyIntrVariantsSection . intruderRules . L.get crcRules)
                  (\_ -> emptyDoc) --prettyClosedEitherRule
                  prettyIncrementalDiffProof
                  prettyIncrementalProof
                  thy
   where
-    ppInjectiveFactInsts crc =
-        case S.toList $ L.get crcInjectiveFactInsts crc of
-            []   -> emptyDoc
-            tags -> multiComment $ sep
-                      [ text "looping facts with injective instances:"
-                      , nest 2 $ fsepList (text . showFactTagArity) tags ]
+    ppSpecialFactInsts crc =
+        case (injFacts, invFacts) of
+            ([], [])           -> emptyDoc
+            (injTags, [])      -> multiComment $ sep (formatInjFacts injTags) -- this shouldn't be possible
+            ([], invTags)      -> multiComment $ sep (formatInvFacts invTags)
+            (injTags, invTags) -> multiComment $ sep (formatInjFacts injTags ++ formatInvFacts invTags)
+      where
+        injFacts = S.toList $ L.get crcInjectiveFactInsts crc
+        invFacts = M.keys $ L.get crcInvariantFactTerms crc
+        formatInjFacts tags =
+            [ text "looping facts with injective instances:"
+            , nest 2 $ fsepList (text . showFactTagArity) tags ]
+        formatInvFacts tags =
+            [ text "looping facts with invariant instances:"
+            , nest 2 $ fsepList (text . showFactTagArity) tags ]
 
 prettyClosedSummary :: Document d => ClosedTheory -> d
 prettyClosedSummary thy =
