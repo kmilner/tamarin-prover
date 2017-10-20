@@ -175,7 +175,7 @@ module Theory (
 
   ) where
 
--- import           Debug.Trace
+import           Debug.Trace
 
 import           Prelude                             hiding (id, (.))
 
@@ -342,7 +342,7 @@ closeRuleCache restrictions typAsms sig protoRules intrRules isdiff = -- trace (
     -- restrictions. Otherwise, it wouldn't be sound to use the precomputed case
     -- distinctions for properties proven using induction.
     safetyRestrictions = filter isSafetyFormula restrictions
-    rawSources         = precomputeSources ctxt0 safetyRestrictions
+    rawSources         = trace ("PRECOMPUTING SOURCES GIVEN INTRUDER RULES: " ++ show intrRules) $ precomputeSources ctxt0 safetyRestrictions
     refinedSources     = refineWithSourceAsms typAsms ctxt0 rawSources
 
     -- Maude handle

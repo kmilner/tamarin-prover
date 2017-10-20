@@ -115,7 +115,7 @@ simplifySystem = do
             else do
               (c1,c2,c3) <- enforceNodeUniqueness
               c4 <- enforceEdgeUniqueness
-              c5 <- solveUniqueActions
+--              c5 <- solveUniqueActions
               c6 <- reduceFormulas
               c7 <- evalFormulaAtoms
               c8 <- insertImpliedFormulas
@@ -126,7 +126,7 @@ simplifySystem = do
                     , ("unique K↓-facts (N5↓)",               c2)
                     , ("unique K↑-facts (N5↑)",               c3)
                     , ("unique (linear) edges (DG2 and DG3)", c4)
-                    , ("solve unambiguous actions (S_@)",     c5)
+--                    , ("solve unambiguous actions (S_@)",     c5)
                     , ("decompose trace formula",             c6)
                     , ("propagate atom valuation to formula", c7)
                     , ("saturate under ∀-clauses (S_∀)",      c8)

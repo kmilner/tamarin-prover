@@ -30,6 +30,7 @@ import           Safe
 import           Data.Foldable                           (asum)
 import qualified Data.Map                                as M
 import qualified Data.Set                                as S
+import           Data.List                               (group, sort)
 
 import           Control.Basics
 import           Control.Category
@@ -149,6 +150,14 @@ solveAllSafeGoals ths' =
     isChainPrem1 (ChainG _ (_,PremIdx 1),_) = True
     isChainPrem1 _                          = False
 
+    isUniqueAction ctxt (ActionG _ (Fact tag ts),_) = (tag, length ts) `elem` (uniqueActions ctxt)
+                                                      && null [ () | t <- ts, FUnion _ <- return (viewTerm2 t) ]
+    isUniqueAction _ _                              = False
+
+    uniqueActions ctxt = [ x | [x] <- group $ 
+        sort [ (tag, length ts) | ru <- nonSilentRules $ get pcRules ctxt, 
+                                  Fact tag ts <- filter isProtoFact $ get rActs ru ] ]
+
     solve :: [Source] -> [String] -> Maybe LNTerm -> Integer -> Reduction [String]
     solve ths caseNames lastChainTerm chainsLeft = do
         simplifySystem
@@ -174,15 +183,17 @@ solveAllSafeGoals ths' =
             remainingChains _                = chainsLeft
             kdPremGoals     = fst <$> filter (\g -> isKDPrem g || isChainPrem1 g) goals
             usefulGoals     = fst <$> filter usefulGoal goals
+            uniqueActionGoals = fst <$> filter (isUniqueAction ctxt) goals
             nextStep :: Maybe (Reduction [String], Maybe Source)
             nextStep     =
+                (asum $ map (solveWithSourceAndReturn ctxt ths) uniqueActionGoals) <|>
                 ((\x -> (fmap return (solveGoal x), Nothing)) <$> headMay (kdPremGoals)) <|>
                 ((\x -> (fmap return (solveGoal x), Nothing)) <$> headMay (safeGoals)) <|>
                 (asum $ map (solveWithSourceAndReturn ctxt ths) usefulGoals)
 
         -- Update the last chain conclusion term if next step is a 'safe' chain goal (kdPremGoals is empty)
-        lastChainTerm' <- case (kdPremGoals, safeGoals) of
-            ([], ((ChainG c _):_)) -> (\t -> return $ t <|> lastChainTerm) =<< kConcTerm c
+        lastChainTerm' <- case (uniqueActionGoals, kdPremGoals, safeGoals) of
+            ([], [], ((ChainG c _):_)) -> (\t -> return $ t <|> lastChainTerm) =<< kConcTerm c
             _                      -> return lastChainTerm
 
         case nextStep of
@@ -278,6 +289,7 @@ matchToGoal ctxt th0 goalTerm =
             (Lit  (Var v),_) | lvarSort v == LSortFresh -> sortOfLNTerm tPat == LSortFresh
             (FApp o _, FApp o' _)                       -> o == o'
             _                                           -> True
+    maybeMatcher (ActionG _ faTerm, ActionG _ faPat)    = (factTag faTerm == factTag faPat) && isProtoFact faTerm
     maybeMatcher _                                      = False
 
     th = (`evalFresh` avoid goalTerm) . rename $ th0
@@ -365,11 +377,12 @@ precomputeSources ctxt restrictions =
       . map (filter (`elem` '_' : ['a'..'z'] ++ ['A'..'Z'] ++ ['0'..'9']))
 
     rawSources =
-        (initialSource ctxt restrictions <$> (protoGoals ++ msgGoals))
+        (initialSource ctxt restrictions <$> (protoGoals ++ msgGoals ++ actGoals))
 
     -- construct source starting from facts from non-special rules
     protoGoals = someProtoGoal <$> absProtoFacts
     msgGoals   = someKUGoal <$> absMsgFacts
+    actGoals   = someActGoal <$> absActions
 
     getProtoFact (Fact KUFact _ _ ) = mzero
     getProtoFact (Fact KDFact _ _ ) = mzero
@@ -382,6 +395,10 @@ precomputeSources ctxt restrictions =
     someProtoGoal :: (FactTag, S.Set FactAnnotation, Int) -> Goal
     someProtoGoal (tag, ann, arity) =
         PremiseG (someNodeId, PremIdx 0) (Fact tag ann (nMsgVars arity))
+
+    someActGoal :: (FactTag, Int) -> Goal
+    someActGoal (tag, arity) =
+        ActionG someNodeId (Fact tag (nMsgVars arity))
 
     someKUGoal :: LNTerm -> Goal
     someKUGoal m = ActionG someNodeId (kuFact m)
@@ -405,6 +422,14 @@ precomputeSources ctxt restrictions =
         | o@(_,(k,priv)) <- S.toList . noEqFunSyms  $ msig
         , NoEq o `S.notMember` implicitFunSig, k > 0 || priv==Private]
       ]
+
+    absActions = sortednub $ do
+        -- Take only actions that occur in a single rule
+        let ruleActions   = [ (tag, ts) | ru <- nonSilentRules rules, Fact tag ts <- filter isProtoFact $ get rActs ru ]
+        (tag,ts) <- ruleActions --[ x | [x] <- group (sort ruleActions) ]
+        -- Exclude facts with no terms (incl. diff annotations) and facts containing multiset unions (which can have case splits)
+        guard $ (length ts) > 0 && null [ () | t <- ts, FUnion _ <- return (viewTerm2 t) ]
+        return $ trace ("###############absActions:  " ++ show tag) $ (tag,length ts)
 
     msig = mhMaudeSig . get pcMaudeHandle $ ctxt
 
