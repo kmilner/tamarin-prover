@@ -154,8 +154,8 @@ solveAllSafeGoals ths' =
                                                       && null [ () | t <- ts, FUnion _ <- return (viewTerm2 t) ]
     isUniqueAction _ _                              = False
 
-    uniqueActions ctxt = [ x | [x] <- group $ 
-        sort [ (tag, length ts) | ru <- nonSilentRules $ get pcRules ctxt, 
+    uniqueActions ctxt = [ x | [x] <- group $
+        sort [ (tag, length ts) | ru <- nonSilentRules $ get pcRules ctxt,
                                   Fact tag ts <- filter isProtoFact $ get rActs ru ] ]
 
     solve :: [Source] -> [String] -> Maybe LNTerm -> Integer -> Reduction [String]
@@ -424,12 +424,11 @@ precomputeSources ctxt restrictions =
       ]
 
     absActions = sortednub $ do
-        -- Take only actions that occur in a single rule
         let ruleActions   = [ (tag, ts) | ru <- nonSilentRules rules, Fact tag ts <- filter isProtoFact $ get rActs ru ]
         (tag,ts) <- ruleActions --[ x | [x] <- group (sort ruleActions) ]
         -- Exclude facts with no terms (incl. diff annotations) and facts containing multiset unions (which can have case splits)
-        guard $ (length ts) > 0 && null [ () | t <- ts, FUnion _ <- return (viewTerm2 t) ]
-        return $ trace ("###############absActions:  " ++ show tag) $ (tag,length ts)
+        guard $ (length ts) > 0 -- && null [ () | t <- ts, FUnion _ <- return (viewTerm2 t) ]
+        return (tag,length ts)
 
     msig = mhMaudeSig . get pcMaudeHandle $ ctxt
 
