@@ -735,15 +735,16 @@ data AutoProver = AutoProver
     { apDefaultHeuristic :: Heuristic
     , apBound            :: Maybe Int
     , apCut              :: SolutionExtractor
+    , apDepth     :: Integer
     }
     deriving ( Generic, NFData, Binary )
 
 runAutoProver :: AutoProver -> Prover
-runAutoProver (AutoProver defaultHeuristic bound cut) =
+runAutoProver (AutoProver defaultHeuristic bound cut sDepth) =
     mapProverProof cutSolved $ maybe id boundProver bound autoProver
   where
     cutSolved = case cut of
-      CutDFS     -> cutOnSolvedDFS
+      CutDFS     -> cutOnSolvedDFS sDepth
       CutBFS     -> cutOnSolvedBFS
       CutNothing -> id
 
@@ -763,11 +764,11 @@ runAutoProver (AutoProver defaultHeuristic bound cut) =
         boundProofDepth b <$> runProver p ctxt d se prf
 
 runAutoDiffProver :: AutoProver -> DiffProver
-runAutoDiffProver (AutoProver defaultHeuristic bound cut) =
+runAutoDiffProver (AutoProver defaultHeuristic bound cut sDepth) =
     mapDiffProverDiffProof cutSolved $ maybe id boundProver bound autoProver
   where
     cutSolved = case cut of
-      CutDFS     -> cutOnSolvedDFSDiff
+      CutDFS     -> cutOnSolvedDFSDiff sDepth
       CutBFS     -> cutOnSolvedBFSDiff
       CutNothing -> id
 
@@ -805,9 +806,9 @@ instance Monoid IterDeepRes where
 --
 -- FIXME: Note that this function may use a lot of space, as it holds onto the
 -- whole proof tree.
-cutOnSolvedDFS :: Proof (Maybe a) -> Proof (Maybe a)
-cutOnSolvedDFS prf0 =
-    go (4 :: Integer) $ insertPaths prf0
+cutOnSolvedDFS :: Integer -> Proof (Maybe a) -> Proof (Maybe a)
+cutOnSolvedDFS depth prf0 =
+    go depth $ insertPaths prf0
   where
     go dMax prf = case findSolved 0 prf of
         NoSolution      -> prf0
@@ -843,9 +844,9 @@ cutOnSolvedDFS prf0 =
 --
 -- FIXME: Note that this function may use a lot of space, as it holds onto the
 -- whole proof tree.
-cutOnSolvedDFSDiff :: DiffProof (Maybe a) -> DiffProof (Maybe a)
-cutOnSolvedDFSDiff prf0 =
-    go (4 :: Integer) $ insertPathsDiff prf0
+cutOnSolvedDFSDiff :: Integer -> DiffProof (Maybe a) -> DiffProof (Maybe a)
+cutOnSolvedDFSDiff depth prf0 =
+    go depth $ insertPathsDiff prf0
   where
     go dMax prf = case findSolved 0 prf of
         NoSolution      -> prf0

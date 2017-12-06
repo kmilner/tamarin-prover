@@ -50,6 +50,7 @@ import           Data.Char                           (toLower)
 import           Data.Label
 import           Data.List                           (isPrefixOf,intersperse)
 import           Data.Map                            (keys)
+import           Data.Maybe                          (fromMaybe)
 -- import           Data.Monoid
 import           Data.FileEmbed                      (embedFile)
 
@@ -98,6 +99,9 @@ theoryLoadFlags =
 
   , flagOpt "" ["defines","D"] (updateArg "defines") "STRING"
       "Define flags for pseudo-preprocessor."
+
+  , flagOpt "4" ["depth", "d"] (updateArg "depth") "INT"
+      "Define the starting depth for the DFS before iterative deepening"
 
   , flagNone ["diff"] (addEmptyArg "diff")
       "Turn on observational equivalence mode using diff terms."
@@ -328,11 +332,12 @@ constructAutoProver :: Arguments -> AutoProver
 constructAutoProver as =
     -- force error early
     (rnf rankings) `seq`
-    AutoProver (roundRobinHeuristic rankings) proofBound stopOnTrace
+    AutoProver (roundRobinHeuristic rankings) proofBound stopOnTrace depth
   where
     -- handles to relevant arguments
     --------------------------------
     proofBound      = read <$> findArg "bound" as
+    depth           = fromMaybe (4::Integer) $ read <$> findArg "depth" as
 
     oracleName = case findArg "oraclename" as of
       Nothing       -> "./oracle"
@@ -361,11 +366,12 @@ constructAutoDiffProver as =
     -- FIXME!
     -- force error early
     (rnf rankings) `seq`
-    AutoProver (roundRobinHeuristic rankings) proofBound stopOnTrace
+    AutoProver (roundRobinHeuristic rankings) proofBound stopOnTrace depth
   where
     -- handles to relevant arguments
     --------------------------------
     proofBound      = read <$> findArg "bound" as
+    depth           = fromMaybe (4::Integer) $ read <$> findArg "depth" as
 
     oracleName = case findArg "oraclename" as of
       Nothing       -> "./oracle"
