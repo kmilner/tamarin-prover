@@ -857,7 +857,7 @@ equalRuleUpToRenaming r1@(Rule rn1 pr1 co1 ac1) r2@(Rule rn2 pr2 co2 ac2) = read
        unifs eq hnd = unifyLNTerm eq `runReader` hnd
        eqs = foldl matchFacts (Just []) $ zip (pr1++co1++ac1) (pr2++co2++ac2)
        matchFacts Nothing  _                                    = Nothing
-       matchFacts (Just l) (Fact f1 t1, Fact f2 t2) | f1 == f2  = Just ((zipWith Equal t1 t2)++l) 
+       matchFacts (Just l) (Fact f1 _ t1, Fact f2 _ t2) | f1 == f2  = Just ((zipWith Equal t1 t2)++l)
                                                     | otherwise = Nothing
 
 ------------------------------------------------------------------------------
