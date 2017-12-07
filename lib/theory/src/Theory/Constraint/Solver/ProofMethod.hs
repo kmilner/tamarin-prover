@@ -1125,7 +1125,7 @@ injRanking ctxt allowLoopBreakers sys =
     -- | @sortDecisionTree xs ps@ returns a reordering of @xs@
     -- such that the sublist satisfying @ps!!0@ occurs first,
     -- then the sublist satisfying @ps!!1@, and so on.
-    sortDecisionTree :: [a -> Bool] -> [a] -> [a]
+    sortDecisionTree :: (Show a) => [a -> Bool] -> [a] -> [a]
     sortDecisionTree []     xs = xs
     sortDecisionTree (p:ps) xs = sat ++ sortDecisionTree ps nonsat
       where (sat, nonsat) = partition p xs

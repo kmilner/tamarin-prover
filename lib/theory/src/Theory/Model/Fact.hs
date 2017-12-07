@@ -18,7 +18,6 @@ module Theory.Model.Fact (
     Fact(..)
   , Multiplicity(..)
   , FactTag(..)
-  , SolvePriority(..)
   , FactAnnotation(..)
 
   , matchFact
@@ -125,14 +124,10 @@ data FactTag = ProtoFact Multiplicity String Int
     deriving( Eq, Ord, Show, Typeable, Data, Generic, NFData, Binary )
 
 
--- | SolvePriority is a type of annotation which the heuristic uses when sorting goals
-data SolvePriority = SolveFirst | SolveLast
-    deriving( Show, Data, Typeable, Generic, NFData, Binary )
-
 -- | Annotations are properties thhat might be used elsewhere (e.g. in
 --   dot rendering, or for sorting by heuristics) but do not affect
 --   the semantics of the fact
-data FactAnnotation = Priority SolvePriority
+data FactAnnotation = SolveFirst | SolveLast
     deriving( Eq, Ord, Show, Typeable, Data, Generic, NFData, Binary )
 
 -- | Facts.
@@ -153,15 +148,6 @@ instance Eq t => Eq (Fact t) where
 
 instance Ord t => Ord (Fact t) where
     compare (Fact tag _ ts) (Fact tag' _ ts') = compare tag tag' <> compare ts ts'
-
--- Custom equality instance for SolvePriority, so that we can enforce uniqueness
--- constraints on the set of annotations (e.g. adding SolveLast will replace
--- SolveFirst in the set)
-instance Eq SolvePriority where
-    (==) _ _ = True
-
-instance Ord SolvePriority where
-    compare _ _ = EQ
 
 instance Functor Fact where
     fmap f (Fact tag an ts) = Fact tag an (fmap f ts)
@@ -334,11 +320,11 @@ getFactAnnotations (Fact _ ann _) = ann
 
 -- | Whether the fact has been marked as 'solve first' for the heuristic
 isSolveFirstFact :: Fact t -> Bool
-isSolveFirstFact (Fact tag ann _) = Priority SolveFirst `S.member` ann || (isPrefixOf "F_" $ factTagName tag)
+isSolveFirstFact (Fact tag ann _) = SolveFirst `S.member` ann || (isPrefixOf "F_" $ factTagName tag)
 
 -- | Whether the fact has been marked as 'solve last' for the heuristic
 isSolveLastFact :: Fact t -> Bool
-isSolveLastFact (Fact tag ann _)  = Priority SolveLast `S.member` ann  || (isPrefixOf "L_" $ factTagName tag)
+isSolveLastFact (Fact tag ann _)  = SolveLast `S.member` ann  || (isPrefixOf "L_" $ factTagName tag)
 
 ------------------------------------------------------------------------------
 -- NFact
@@ -442,8 +428,8 @@ showFactTagArity tag = showFactTag tag ++ "/" ++ show (factTagArity tag)
 -- | Show fact annotation
 showFactAnnotation :: FactAnnotation -> String
 showFactAnnotation an = case an of
-    Priority SolveFirst     -> "+"
-    Priority SolveLast      -> "-"
+    SolveFirst     -> "+"
+    SolveLast      -> "-"
 
 -- | Pretty print a fact.
 prettyFact :: Document d => (t -> d) -> Fact t -> d

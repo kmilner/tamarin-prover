@@ -237,8 +237,8 @@ tupleterm plit = chainr1 (msetterm plit) ((\a b -> fAppPair (a,b)) <$ comma)
 -- | Parse a fact annotation
 factAnnotation :: Parser FactAnnotation
 factAnnotation = asum
-  [ opPlus  *> pure (Priority SolveFirst)
-  , opMinus *> pure (Priority SolveLast)
+  [ opPlus  *> pure SolveFirst
+  , opMinus *> pure SolveLast
   ]
 
 -- | Parse a fact.
