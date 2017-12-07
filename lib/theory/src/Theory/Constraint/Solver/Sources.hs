@@ -150,7 +150,7 @@ solveAllSafeGoals ths' =
     isChainPrem1 (ChainG _ (_,PremIdx 1),_) = True
     isChainPrem1 _                          = False
 
-    isUniqueAction ctxt (ActionG _ (Fact tag ts),_) =
+    isUniqueAction ctxt (ActionG _ (Fact tag _ ts),_) =
         (tag, length ts) `elem` (uniqueActions ctxt)
         && null [ () | t <- ts, FUnion _ <- return (viewTerm2 t) ]
         && (length ts) > 0
@@ -158,7 +158,7 @@ solveAllSafeGoals ths' =
 
     uniqueActions ctxt = [ x | [x] <- group $
         sort [ (tag, length ts) | ru <- nonSilentRules $ get pcRules ctxt,
-                                  Fact tag ts <- filter isProtoFact $ get rActs ru ] ]
+                                  Fact tag _ ts <- filter isProtoFact $ get rActs ru ] ]
 
     solve :: [Source] -> [String] -> Maybe LNTerm -> Integer -> Reduction [String]
     solve ths caseNames lastChainTerm chainsLeft = do
@@ -400,7 +400,7 @@ precomputeSources ctxt restrictions =
 
     someActGoal :: (FactTag, Int) -> Goal
     someActGoal (tag, arity) =
-        ActionG someNodeId (Fact tag (nMsgVars arity))
+        ActionG someNodeId (Fact tag S.empty (nMsgVars arity))
 
     someKUGoal :: LNTerm -> Goal
     someKUGoal m = ActionG someNodeId (kuFact m)
@@ -427,7 +427,7 @@ precomputeSources ctxt restrictions =
 
     absActions = sortednub $ do
         let ruleActions   = [ (tag, ts) | ru <- nonSilentRules rules,
-                                          Fact tag ts <- filter isProtoFact $ get rActs ru ]
+                                          Fact tag _ ts <- filter isProtoFact $ get rActs ru ]
         (tag,ts) <- [ x | [x] <- group (sort ruleActions) ]
         -- Exclude facts with no terms (incl. diff annotations) and facts containing multiset unions (which can have case splits)
         guard $ (length ts) > 0 && null [ () | t <- ts, FUnion _ <- return (viewTerm2 t) ]
