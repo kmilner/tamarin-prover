@@ -30,7 +30,6 @@ import           Safe
 import           Data.Foldable                           (asum)
 import qualified Data.Map                                as M
 import qualified Data.Set                                as S
-import           Data.List                               (group, sort)
 
 import           Control.Basics
 import           Control.Category
@@ -135,8 +134,8 @@ solveAllSafeGoals ths' =
         ChainG _ _    -> if (chainsLeft > 0) 
                             then True 
                             else (trace "Stopping precomputation, too many chain goals." False)
-        ActionG _ fa  -> not (isKUFact fa)
-        PremiseG _ fa -> not (isKUFact fa)
+        ActionG _ _  -> False -- We solve action goals through precomputed sources
+        PremiseG _ fa -> not (isKUFact fa) && not (isSolveLastFact fa)
         DisjG _       -> doSplit
         -- Uncomment to get more extensive case splitting
         SplitG _      -> doSplit --extensiveSplitting &&
@@ -150,15 +149,14 @@ solveAllSafeGoals ths' =
     isChainPrem1 (ChainG _ (_,PremIdx 1),_) = True
     isChainPrem1 _                          = False
 
-    isUniqueAction ctxt (ActionG _ (Fact tag _ ts),_) =
-        (tag, length ts) `elem` (uniqueActions ctxt)
+    isPrecompAction ctxt (ActionG _ (Fact tag _ ts),_) =
+        (tag, length ts) `elem` (precompActions ctxt)
         && null [ () | t <- ts, FUnion _ <- return (viewTerm2 t) ]
         && (length ts) > 0
-    isUniqueAction _ _                              = False
+    isPrecompAction _ _                              = False
 
-    uniqueActions ctxt = [ x | [x] <- group $
-        sort [ (tag, length ts) | ru <- nonSilentRules $ get pcRules ctxt,
-                                  Fact tag _ ts <- filter isProtoFact $ get rActs ru ] ]
+    precompActions ctxt = sortednub [ (tag, length ts) | ru <- nonSilentRules $ get pcRules ctxt,
+                                  Fact tag _ ts <- filter isProtoFact $ get rActs ru ]
 
     solve :: [Source] -> [String] -> Maybe LNTerm -> Integer -> Reduction [String]
     solve ths caseNames lastChainTerm chainsLeft = do
@@ -185,12 +183,12 @@ solveAllSafeGoals ths' =
             remainingChains _                = chainsLeft
             kdPremGoals     = fst <$> filter (\g -> isKDPrem g || isChainPrem1 g) goals
             usefulGoals     = fst <$> filter usefulGoal goals
-            uniqueActionGoals = fst <$> filter (isUniqueAction ctxt) goals
+            uniqueActionGoals = fst <$> filter (isPrecompAction ctxt) goals
             nextStep :: Maybe (Reduction [String], Maybe Source)
             nextStep     =
-                (asum $ map (solveWithSourceAndReturn ctxt ths) uniqueActionGoals) <|>
                 ((\x -> (fmap return (solveGoal x), Nothing)) <$> headMay (kdPremGoals)) <|>
                 ((\x -> (fmap return (solveGoal x), Nothing)) <$> headMay (safeGoals)) <|>
+                (asum $ map (solveWithSourceAndReturn ctxt ths) uniqueActionGoals) <|>
                 (asum $ map (solveWithSourceAndReturn ctxt ths) usefulGoals)
 
         -- Update the last chain conclusion term if next step is a 'safe' chain goal (kdPremGoals is empty)
@@ -200,8 +198,10 @@ solveAllSafeGoals ths' =
 
         case nextStep of
           Nothing   -> return caseNames
-          Just (step, Nothing) -> (\x -> solve ths (caseNames ++ x) lastChainTerm' (remainingChains safeGoals)) =<< step
-          Just (step, Just usedCase) -> (\x -> solve (filterCases usedCase ths) (caseNames ++ x) lastChainTerm' (remainingChains safeGoals)) =<< step
+          Just (step, Nothing) -> (\x -> solve ths (caseNames ++ x) lastChainTerm'
+                                                (remainingChains safeGoals)) =<< step
+          Just (step, Just usedCase) -> (\x -> solve (filterCases usedCase ths) (caseNames ++ x) lastChainTerm'
+                                                     (remainingChains safeGoals)) =<< step
 
     filterCases :: Source -> [Source] -> [Source]
     filterCases usedCase cds = filter (\x -> usedCase /= x) cds
@@ -428,10 +428,11 @@ precomputeSources ctxt restrictions =
     absActions = sortednub $ do
         let ruleActions   = [ (tag, ts) | ru <- nonSilentRules rules,
                                           Fact tag _ ts <- filter isProtoFact $ get rActs ru ]
-        (tag,ts) <- [ x | [x] <- group (sort ruleActions) ]
-        -- Exclude facts with no terms (incl. diff annotations) and facts containing multiset unions (which can have case splits)
+        (tag,ts) <- sortednub ruleActions
+        -- Exclude facts with no terms (incl. diff annotations),
+        -- and facts containing multiset unions (which can have case splits)
         guard $ (length ts) > 0 && null [ () | t <- ts, FUnion _ <- return (viewTerm2 t) ]
-        return $ trace (show tag) (tag,length ts)
+        return (tag,length ts)
 
     msig = mhMaudeSig . get pcMaudeHandle $ ctxt
 
