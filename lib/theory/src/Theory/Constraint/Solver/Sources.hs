@@ -136,7 +136,7 @@ solveAllSafeGoals ths' =
         ChainG _ _    -> if (chainsLeft > 0) 
                             then True 
                             else (trace "Stopping precomputation, too many chain goals." False)
-        ActionG _ fa  -> not (isKUFact fa)
+        ActionG _ fa  -> False --Actions are solved through precomputed sources
         PremiseG _ fa -> not (isKUFact fa)
         DisjG _       -> doSplit
         -- Uncomment to get more extensive case splitting
@@ -150,16 +150,6 @@ solveAllSafeGoals ths' =
     isKDPrem _                 = False
     isChainPrem1 (ChainG _ (_,PremIdx 1),_) = True
     isChainPrem1 _                          = False
-
-    isUniqueAction ctxt (ActionG _ (Fact tag ts),_) =
-        (tag, length ts) `elem` (uniqueActions ctxt)
-        && null [ () | t <- ts, FUnion _ <- return (viewTerm2 t) ]
-        && (length ts) > 0
-    isUniqueAction _ _                              = False
-
-    uniqueActions ctxt = [ x | [x] <- group $
-        sort [ (tag, length ts) | ru <- nonSilentRules $ get pcRules ctxt,
-                                  Fact tag ts <- filter isProtoFact $ get rActs ru ] ]
 
     solve :: [Source] -> [String] -> Maybe LNTerm -> Integer -> Reduction [String]
     solve ths caseNames lastChainTerm chainsLeft = do
@@ -186,23 +176,23 @@ solveAllSafeGoals ths' =
             remainingChains _                = chainsLeft
             kdPremGoals     = fst <$> filter (\g -> isKDPrem g || isChainPrem1 g) goals
             usefulGoals     = fst <$> filter usefulGoal goals
-            uniqueActionGoals = fst <$> filter (isUniqueAction ctxt) goals
             nextStep :: Maybe (Reduction [String], Maybe Source)
             nextStep     =
-                (asum $ map (solveWithSourceAndReturn ctxt ths) uniqueActionGoals) <|>
                 ((\x -> (fmap return (solveGoal x), Nothing)) <$> headMay (kdPremGoals)) <|>
                 ((\x -> (fmap return (solveGoal x), Nothing)) <$> headMay (safeGoals)) <|>
                 (asum $ map (solveWithSourceAndReturn ctxt ths) usefulGoals)
 
         -- Update the last chain conclusion term if next step is a 'safe' chain goal (kdPremGoals is empty)
-        lastChainTerm' <- case (uniqueActionGoals, kdPremGoals, safeGoals) of
-            ([], [], ((ChainG c _):_)) -> (\t -> return $ t <|> lastChainTerm) =<< kConcTerm c
+        lastChainTerm' <- case (kdPremGoals, safeGoals) of
+            ([], ((ChainG c _):_)) -> (\t -> return $ t <|> lastChainTerm) =<< kConcTerm c
             _                      -> return lastChainTerm
 
         case nextStep of
           Nothing   -> return caseNames
-          Just (step, Nothing) -> (\x -> solve ths (caseNames ++ x) lastChainTerm' (remainingChains safeGoals)) =<< step
-          Just (step, Just usedCase) -> (\x -> solve (filterCases usedCase ths) (caseNames ++ x) lastChainTerm' (remainingChains safeGoals)) =<< step
+          Just (step, Nothing) -> (\x -> solve ths (caseNames ++ x) 
+                                    lastChainTerm' (remainingChains safeGoals)) =<< step
+          Just (step, Just usedCase) -> (\x -> solve (filterCases usedCase ths) (caseNames ++ x)
+                                    lastChainTerm' (remainingChains safeGoals)) =<< step
 
     filterCases :: Source -> [Source] -> [Source]
     filterCases usedCase cds = filter (\x -> usedCase /= x) cds
@@ -361,10 +351,13 @@ saturateSources ctxt thsInit =
             then trace "saturateSources: Saturation aborted, more than 5 iterations." ths'
             else ths'
       where
-        (changes, ths') = unzip $ map (refineSource ctxt solver) ths
-        goodTh th  = length (getDisj (get cdCases th)) <= 1
-        solver     = do names <- solveAllSafeGoals (filter goodTh ths)
-                        return (not $ null names, names)
+        (changes, ths')     = unzip $ map (refineSource ctxt solver) ths
+        goodTh th           = length (getDisj (get cdCases th)) <= 1 || unsolvedActionG th
+        unsolvedActionG th  = case (get cdGoal th) of
+            (ActionG _ fa) -> n == 1 && not (isKUFact fa) --Solve all protofact actions once
+            _              -> False
+        solver              = do names <- solveAllSafeGoals (filter goodTh ths)
+                                 return (not $ null names, names)
 
 -- | Precompute a saturated set of case distinctions.
 precomputeSources
@@ -426,10 +419,8 @@ precomputeSources ctxt restrictions =
       ]
 
     absActions = sortednub $ do
-        let ruleActions   = [ (tag, ts) | ru <- nonSilentRules rules,
+        (tag,ts) <- sortednub [ (tag, ts) | ru <- nonSilentRules rules,
                                           Fact tag ts <- filter isProtoFact $ get rActs ru ]
-        (tag,ts) <- [ x | [x] <- group (sort ruleActions) ]
-        -- Exclude facts with no terms (incl. diff annotations) and facts containing multiset unions (which can have case splits)
         guard $ (length ts) > 0 && null [ () | t <- ts, FUnion _ <- return (viewTerm2 t) ]
         return $ trace (show tag) (tag,length ts)
 
