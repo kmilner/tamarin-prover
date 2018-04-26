@@ -343,21 +343,29 @@ saturateSources
 saturateSources ctxt thsInit =
     (go thsInit 1)
   where
+    satLimit = 5
+    solver :: [Source] -> Bool -> Reduction (Bool, [String])
+    solver ths solveActions = do
+        names <- solveAllSafeGoals (filter goodTh ths)
+        return (not $ null names, names)
+      where
+        goodTh th      = length (getDisj (get cdCases th)) <= 1 || (solveActions && actionGoals th)
+        actionGoals th = case (get cdGoal th) of
+            (ActionG _ fa) -> not (isKUFact fa)
+            _              -> False
+
     go :: [Source] -> Integer -> [Source]
     go ths n =
-        if (any or (changes `using` parList rdeepseq)) && (n <= 5)
+        if (any or (changes `using` parList rdeepseq)) && (n <= satLimit)
           then go ths' (n + 1)
-          else if (n > 5)
-            then trace "saturateSources: Saturation aborted, more than 5 iterations." ths'
-            else ths'
+          -- Solve non-KU action goals on the final iteration if not previously solved
+          else if (n > satLimit)
+              then trace ("saturateSources: Saturation aborted, more than "
+                     ++ show satLimit ++ " iterations.") finalThs
+              else finalThs
       where
-        (changes, ths')     = unzip $ map (refineSource ctxt solver) ths
-        goodTh th           = length (getDisj (get cdCases th)) <= 1 || unsolvedActionG th
-        unsolvedActionG th  = case (get cdGoal th) of
-            (ActionG _ fa) -> n == 1 && not (isKUFact fa) --Solve all protofact actions once
-            _              -> False
-        solver              = do names <- solveAllSafeGoals (filter goodTh ths)
-                                 return (not $ null names, names)
+        (changes, ths')     = unzip $ map (refineSource ctxt (solver ths False)) ths
+        (_, finalThs)       = unzip $ map (refineSource ctxt (solver ths True)) ths'
 
 -- | Precompute a saturated set of case distinctions.
 precomputeSources
