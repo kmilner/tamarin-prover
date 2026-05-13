@@ -1,0 +1,689 @@
+//! Skeleton port of `Theory.Constraint.Solver.Goals`.
+//!
+//! `openGoals` enumerates the list of goals from a `System` that
+//! still need to be solved, with `Usefulness` annotations driving
+//! the heuristic. The full Haskell version filters via
+//! `kFactView`, sort checks, AC predicates, and chain-conclusion
+//! analysis. The Rust port currently implements the cheap structural
+//! filter (skip already-solved goals, drop `DisjG (Disj [])`) and
+//! defers the message-knowledge filtering until those view helpers
+//! are available.
+
+use crate::constraint::constraints::Goal;
+use crate::constraint::solver::annotated_goals::{AnnotatedGoal, Usefulness};
+use crate::constraint::system::System;
+
+/// `openGoals`: enumerate annotated goals still to be solved.
+pub fn open_goals(sys: &System) -> Vec<AnnotatedGoal> {
+    let mut out = Vec::new();
+    for (seq, (goal, status)) in sys.goals.iter().enumerate() {
+        if status.solved { continue; }
+        if !is_open(goal) { continue; }
+        let u = goal_usefulness(goal, status.looping, sys);
+        out.push(AnnotatedGoal::new(goal.clone(), seq as u64, u));
+    }
+    out
+}
+
+/// Plain (non-annotated) open goals.
+pub fn plain_open_goals(sys: &System) -> Vec<Goal> {
+    open_goals(sys).into_iter().map(|a| a.goal).collect()
+}
+
+// =============================================================================
+// smartRanking — port of `Theory.Constraint.Solver.ProofMethod.smartRanking`
+// =============================================================================
+
+/// Decision-tree-aware goal ranking. Direct port of Haskell's
+/// `smartRanking ctxt False sys`:
+///
+/// ```text
+///   moveNatToEnd
+///     . sortOnUsefulness
+///     . sortDecisionTree notSolveLast
+///     . sortDecisionTree solveFirst
+///     . goalNrRanking
+/// ```
+///
+/// Some Haskell predicates depend on data we haven't ported yet:
+///
+///   - `isMsgOneCaseGoal` needs `pcSources` source-cache analysis.
+///   - `isSplitGoalSmall` / `isNoLargeSplitGoal` need split-size info
+///     from the eq-store.
+///   - `moveNatToEnd` needs `isNatSubterm` over subterms.
+///
+/// These are treated conservatively (predicate returns `false`) so the
+/// remaining decision-tree partitioning still matches Haskell on every
+/// other criterion.  When the stubs are filled in, behaviour aligns
+/// without further changes here.
+pub fn rank_goals(sys: &System) -> Vec<AnnotatedGoal> {
+    rank_goals_with(sys, None)
+}
+
+/// Variant that takes a proof context for source-cache predicates
+/// (`is_msg_one_case_goal`).  Without context, those predicates
+/// fall back to `false` — same behaviour as before the source-cache
+/// wiring landed.
+pub fn rank_goals_with(
+    sys: &System,
+    ctx: Option<&crate::constraint::solver::context::ProofContext>,
+) -> Vec<AnnotatedGoal> {
+    let mut goals = open_goals(sys);
+    // 1. goalNrRanking — already in seq order from `open_goals`.
+    // 2. sortDecisionTree solveFirst — multi-pass partitions.
+    // We use closures (rather than function pointers) so the
+    // predicates that depend on system state — split_size,
+    // source-cache one-case — can borrow `sys` / `ctx`.
+    type Pred<'a> = Box<dyn Fn(&AnnotatedGoal) -> bool + 'a>;
+    let one_case_syms: std::collections::BTreeSet<Vec<u8>> = match ctx {
+        Some(c) => collect_one_case_syms(c),
+        None => Default::default(),
+    };
+    let solve_first: Vec<Pred> = vec![
+        Box::new(is_chain_goal),
+        Box::new(is_disj_goal),
+        Box::new(is_solve_first_goal),
+        Box::new(is_non_loop_breaker_proto_fact_goal),
+        Box::new(is_standard_action_goal),
+        Box::new(is_not_auth_out),
+        Box::new(is_private_knows_goal),
+        Box::new(is_fresh_knows_goal),
+        Box::new(|a: &AnnotatedGoal| is_split_goal_small(a, sys)),
+        Box::new(|a: &AnnotatedGoal| is_msg_one_case_goal(a, &one_case_syms)),
+        Box::new(is_signature_goal),
+        // is_double_exp_goal — needs Exp/Mult view; stubbed.
+        Box::new(|a: &AnnotatedGoal| is_no_large_split_goal(a, sys)),
+    ];
+    goals = sort_decision_tree_dyn(&solve_first, goals);
+    // 3. sortDecisionTree notSolveLast — push solve-last goals to end.
+    let not_solve_last: Vec<fn(&AnnotatedGoal) -> bool> = vec![is_non_solve_last_goal];
+    goals = sort_decision_tree(&not_solve_last, goals);
+    // 4. sortOnUsefulness — stable sort by tag.
+    goals.sort_by_key(|a| tag_usefulness(a.usefulness));
+    // 5. moveNatToEnd — Nat subterm splits to back.
+    goals.sort_by_key(|a| is_nat_subterm_split(&a.goal));
+    goals
+}
+
+/// Stable partition for closure-based predicate list.
+fn sort_decision_tree_dyn(
+    ps: &[Box<dyn Fn(&AnnotatedGoal) -> bool + '_>],
+    xs: Vec<AnnotatedGoal>,
+) -> Vec<AnnotatedGoal> {
+    let mut result = Vec::with_capacity(xs.len());
+    let mut rest = xs;
+    for p in ps {
+        let (sat, nonsat): (Vec<_>, Vec<_>) = rest.into_iter().partition(|a| p(a));
+        result.extend(sat);
+        rest = nonsat;
+    }
+    result.extend(rest);
+    result
+}
+
+/// `isSplitGoalSmall`: a `Goal::Split(id)` is small if its
+/// `splitSize` ≤ 3 (Haskell's `smallSplitGoalSize = 3`).
+/// Mirrors `ProofMethod.hs:836`.
+fn is_split_goal_small(a: &AnnotatedGoal, sys: &System) -> bool {
+    use crate::constraint::constraints::Goal;
+    const SMALL_SPLIT_GOAL_SIZE: usize = 3;
+    match &a.goal {
+        Goal::Split(id) => sys.eq_store.split_size(*id)
+            .map(|n| n <= SMALL_SPLIT_GOAL_SIZE)
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// `isNoLargeSplitGoal`: every non-Split goal qualifies; a Split
+/// goal qualifies iff it's small.  Used as a final tier in the
+/// decision tree to push large eq-store splits last.
+fn is_no_large_split_goal(a: &AnnotatedGoal, sys: &System) -> bool {
+    use crate::constraint::constraints::Goal;
+    match &a.goal {
+        Goal::Split(_) => is_split_goal_small(a, sys),
+        _ => true,
+    }
+}
+
+/// `isMsgOneCaseGoal`: the goal's premise is `KU(FApp o _)` where
+/// the operator `o` has only one source case in `pcSources`.
+/// Mirrors `ProofMethod.hs:780`.
+///
+/// We approximate `pcSources` via `ctx.full_sources` — for each
+/// precomputed source whose goal is a KU goal with a `FApp(o, _)`
+/// term and whose case set has exactly one disjunct, record `o`
+/// in the one-case set.
+fn collect_one_case_syms(
+    ctx: &crate::constraint::solver::context::ProofContext,
+) -> std::collections::BTreeSet<Vec<u8>> {
+    use crate::constraint::constraints::Goal as G;
+    use crate::fact::FactTag;
+    use tamarin_term::function_symbols::FunSym;
+    use tamarin_term::term::Term;
+    let mut out = std::collections::BTreeSet::new();
+    for src in &ctx.full_sources {
+        if src.cases.len() != 1 { continue; }
+        // Only KU-headed source goals.
+        let term: &tamarin_term::lterm::LNTerm = match &src.goal {
+            G::Action(_, fa) | G::Premise(_, fa) if matches!(fa.tag, FactTag::Ku) =>
+                match fa.terms.first() { Some(t) => t, None => continue },
+            _ => continue,
+        };
+        if let Term::App(FunSym::NoEq(s), _) = term {
+            out.insert(s.name.clone());
+        }
+    }
+    out
+}
+
+fn is_msg_one_case_goal(
+    a: &AnnotatedGoal,
+    one_case_syms: &std::collections::BTreeSet<Vec<u8>>,
+) -> bool {
+    use crate::constraint::constraints::Goal;
+    use crate::fact::FactTag;
+    use tamarin_term::function_symbols::FunSym;
+    use tamarin_term::term::Term;
+    let fa = match &a.goal {
+        Goal::Action(_, fa) | Goal::Premise(_, fa) => fa,
+        _ => return false,
+    };
+    if !matches!(fa.tag, FactTag::Ku) { return false; }
+    let Some(t) = fa.terms.first() else { return false };
+    if let Term::App(FunSym::NoEq(s), _) = t {
+        return one_case_syms.contains(&s.name);
+    }
+    false
+}
+
+/// Stable partition: `sat ++ sortDecisionTree ps nonsat`. Haskell's
+/// `sortDecisionTree` walks the predicate list in order, peeling off
+/// the satisfying prefix at each pass.
+fn sort_decision_tree(
+    ps: &[fn(&AnnotatedGoal) -> bool],
+    xs: Vec<AnnotatedGoal>,
+) -> Vec<AnnotatedGoal> {
+    let mut result = Vec::with_capacity(xs.len());
+    let mut rest = xs;
+    for &p in ps {
+        let (sat, nonsat): (Vec<_>, Vec<_>) = rest.into_iter().partition(p);
+        result.extend(sat);
+        rest = nonsat;
+    }
+    result.extend(rest);
+    result
+}
+
+/// `tagUsefulness` — direct port of Haskell `ProofMethod.hs:1068`:
+///
+/// ```haskell
+/// tagUsefulness Useful                = 0 :: Int
+/// tagUsefulness ProbablyConstructible = 1
+/// tagUsefulness LoopBreaker           = 1
+/// tagUsefulness CurrentlyDeducible    = 2
+/// ```
+///
+/// Lower = explored first.  LoopBreaker is `1` (deprioritised), NOT
+/// `0` — the earlier version conflated LoopBreaker with Useful, so
+/// our search expanded looping premises eagerly instead of after
+/// every contradiction-discovering goal.  Fixing this aligns goal
+/// ordering with Haskell's automatic prover.
+fn tag_usefulness(u: Usefulness) -> u8 {
+    match u {
+        Usefulness::Useful => 0,
+        Usefulness::ProbablyConstructible | Usefulness::LoopBreaker => 1,
+        Usefulness::CurrentlyDeducible => 2,
+    }
+}
+
+// -- Predicate library (mirrors Haskell exactly where we can) ----------------
+
+fn is_chain_goal(a: &AnnotatedGoal) -> bool {
+    matches!(a.goal, Goal::Chain(_, _))
+}
+fn is_disj_goal(a: &AnnotatedGoal) -> bool {
+    matches!(a.goal, Goal::Disj(_))
+}
+fn is_solve_first_goal(a: &AnnotatedGoal) -> bool {
+    match &a.goal {
+        Goal::Action(_, fa) | Goal::Premise(_, fa) => is_solve_first_fact(fa),
+        _ => false,
+    }
+}
+/// `isNonLoopBreakerProtoFactGoal` — protocol-fact premise that's
+/// non-K, non-AuthOut, and not currently flagged LoopBreaker.
+fn is_non_loop_breaker_proto_fact_goal(a: &AnnotatedGoal) -> bool {
+    match &a.goal {
+        Goal::Premise(_, fa) => {
+            !fa.is_k_fact() && !is_auth_out_fact(fa)
+                && a.usefulness == Usefulness::Useful
+        }
+        _ => false,
+    }
+}
+fn is_standard_action_goal(a: &AnnotatedGoal) -> bool {
+    matches!(&a.goal, Goal::Action(_, fa) if !fa.is_ku())
+}
+fn is_not_auth_out(a: &AnnotatedGoal) -> bool {
+    match &a.goal {
+        Goal::Premise(_, fa) => !is_auth_out_fact(fa),
+        _ => false,
+    }
+}
+fn is_private_knows_goal(a: &AnnotatedGoal) -> bool {
+    msg_premise(&a.goal).map(contains_private).unwrap_or(false)
+}
+fn is_fresh_knows_goal(a: &AnnotatedGoal) -> bool {
+    use tamarin_term::lterm::LSort;
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    match msg_premise(&a.goal) {
+        Some(Term::Lit(Lit::Var(v))) if v.sort == LSort::Fresh => true,
+        _ => false,
+    }
+}
+fn is_signature_goal(a: &AnnotatedGoal) -> bool {
+    use tamarin_term::function_symbols::{FunSym, NoEqSym};
+    use tamarin_term::term::Term;
+    match msg_premise(&a.goal) {
+        Some(Term::App(FunSym::NoEq(NoEqSym { name, .. }), _))
+            if name.as_slice() == b"sign" => true,
+        _ => false,
+    }
+}
+/// `isNonSolveLastGoal` — PremiseG/ActionG NOT tagged SolveLast.
+fn is_non_solve_last_goal(a: &AnnotatedGoal) -> bool {
+    match &a.goal {
+        Goal::Premise(_, fa) | Goal::Action(_, fa) => !is_solve_last_fact(fa),
+        _ => true,
+    }
+}
+fn is_nat_subterm_split(_g: &Goal) -> bool {
+    // Stubbed: Nat-subterm view requires the full Subterm shape; for now
+    // never push to the end.  Safe — this only ever moves goals later.
+    false
+}
+
+// -- Fact-level helpers ------------------------------------------------------
+
+fn is_solve_first_fact(fa: &crate::fact::LNFact) -> bool {
+    use crate::fact::FactAnnotation;
+    if fa.annotations.contains(&FactAnnotation::SolveFirst) { return true; }
+    crate::fact::fact_tag_name(&fa.tag).starts_with("F_")
+}
+fn is_solve_last_fact(fa: &crate::fact::LNFact) -> bool {
+    use crate::fact::FactAnnotation;
+    if fa.annotations.contains(&FactAnnotation::SolveLast) { return true; }
+    crate::fact::fact_tag_name(&fa.tag).starts_with("L_")
+}
+fn is_auth_out_fact(fa: &crate::fact::LNFact) -> bool {
+    use crate::fact::FactTag;
+    matches!(&fa.tag, FactTag::Proto(_, name, _) if name == "AuthOut")
+}
+
+/// `msgPremise`: the message argument of a KU action goal, if any.
+/// Mirrors Haskell:
+///   msgPremise (ActionG _ fa) = do (UpK, m) <- kFactView fa; return m
+fn msg_premise(g: &Goal) -> Option<&tamarin_term::lterm::LNTerm> {
+    match g {
+        Goal::Action(_, fa) if fa.is_ku() => fa.terms.first(),
+        _ => None,
+    }
+}
+
+/// True if a goal is still "open": not vacuously False, not already
+/// trivially handled.  Mirrors Haskell's `openGoals` filter
+/// (`Theory.Constraint.Solver.Goals:66`):
+///
+///   ActionG i (KU m) →
+///       not ( solved
+///             || (isMsgVar m && i ∉ sNodes)  -- handled later
+///             || sort m == Pub || sort m == Nat
+///             || isPair m || isInverse m || isProduct m
+///             || isUnion m || isNullaryPublicFunction m )
+///   DisjG (Disj []) → False    -- empty disj handled by contradictions
+///   _              → not solved
+///
+/// KU goals on Pub/Nat literals, pair-shaped or constructor-shaped
+/// terms, or on a message variable for an unallocated node are
+/// treated as "auto-solved" — the solver doesn't need to enumerate
+/// rule candidates for them.  Without this filter, such goals stay
+/// open indefinitely, blocking `is_finished == Solved` and forcing
+/// the search to enumerate every Coerce/etc. candidate.
+fn is_open(g: &Goal) -> bool {
+    use crate::constraint::constraints::Disj;
+    use crate::fact::FactTag;
+    match g {
+        Goal::Disj(Disj(items)) if items.is_empty() => false,
+        Goal::Action(_, fa) if matches!(fa.tag, FactTag::Ku) => {
+            let Some(m) = fa.terms.first() else { return true };
+            if is_pub_or_nat_term(m) { return false; }
+            if has_top_pair_inv_prod(m) { return false; }
+            true
+        }
+        _ => true,
+    }
+}
+
+/// True if the term is a sort-Pub or sort-Nat literal (variable or
+/// constant).  These KU goals are auto-solved because the adversary
+/// can construct any Pub/Nat value trivially.
+fn is_pub_or_nat_term(t: &tamarin_term::lterm::LNTerm) -> bool {
+    use tamarin_term::lterm::{LSort, NameTag};
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    match t {
+        Term::Lit(Lit::Var(v)) => matches!(v.sort, LSort::Pub | LSort::Nat),
+        Term::Lit(Lit::Con(n)) => matches!(n.tag, NameTag::Pub | NameTag::Nat),
+        _ => false,
+    }
+}
+
+/// True if the term's top symbol is a pair, inverse, product, or
+/// AC union — those decompositions are handled inline by
+/// `insertAction` in Haskell, so KU goals on them are auto-solved.
+fn has_top_pair_inv_prod(t: &tamarin_term::lterm::LNTerm) -> bool {
+    use tamarin_term::function_symbols::{AcSym, FunSym, INV_SYM_STRING};
+    use tamarin_term::term::Term;
+    match t {
+        Term::App(FunSym::NoEq(s), args) => {
+            s.name == b"pair" && args.len() == 2
+                || s.name == INV_SYM_STRING && args.len() == 1
+        }
+        Term::App(FunSym::Ac(AcSym::Mult), _) => true,  // product
+        Term::App(FunSym::Ac(AcSym::Union), _) => true, // multiset union
+        _ => false,
+    }
+}
+
+/// Compute a goal's `Usefulness` annotation. Direct port of the
+/// `useful` case-block in Haskell's `openGoals`
+/// (`Theory.Constraint.Solver.Goals`):
+///
+///   useful = case goal of
+///     _ | gsLoopBreaker status     -> LoopBreaker
+///     ActionG i (UpK m) | hasKUGuards          -> Useful
+///                       | currentlyDeducible i m  -> CurrentlyDeducible
+///                       | probablyConstructible m -> ProbablyConstructible
+///     _                            -> Useful
+///
+/// `currentlyDeducible` and `extractible` need full edge / less-rel
+/// reachability + node-rule introspection, which we haven't ported
+/// yet. We approximate by treating any KU goal whose term has only
+/// public-or-nat-sort literals (no fresh names, no private function
+/// symbols) as `ProbablyConstructible` and otherwise `Useful`. This
+/// matches `probablyConstructible` exactly and is strictly more
+/// conservative than `currentlyDeducible` (so the decision-tree
+/// sort still partitions correctly).
+fn goal_usefulness(g: &Goal, looping: bool, sys: &System) -> Usefulness {
+    if looping { return Usefulness::LoopBreaker; }
+    if let Goal::Action(i, fa) = g {
+        if fa.is_ku() {
+            if let Some(m) = fa.terms.first() {
+                // Order matters — `currentlyDeducible` subsumes
+                // `probablyConstructible` for Pub/Nat-only terms but
+                // also catches the `extractible` case.
+                if currently_deducible(sys, i, m) {
+                    return Usefulness::CurrentlyDeducible;
+                }
+                if probably_constructible(m) {
+                    return Usefulness::ProbablyConstructible;
+                }
+            }
+        }
+    }
+    Usefulness::Useful
+}
+
+/// `currentlyDeducible i m` — direct port of Haskell's
+/// `Goals.hs:140`. True iff:
+///   * `m` consists only of Pub/Nat literals (no private function
+///     symbols), OR
+///   * `m` is `extractible i m` from some existing node's `Out` /
+///     `KD` conclusion via top-level pair / inverse decomposition,
+///     and that node is not reachable from `i` via `rawLessRel`.
+fn currently_deducible(
+    sys: &System,
+    i: &crate::constraint::constraints::NodeId,
+    m: &tamarin_term::lterm::LNTerm,
+) -> bool {
+    use tamarin_term::lterm::LSort;
+    if check_term_lits(m, |s| s == LSort::Pub || s == LSort::Nat)
+        && !contains_private(m)
+    {
+        return true;
+    }
+    extractible(sys, i, m)
+}
+
+/// `extractible i m` — direct port of Haskell's `Goals.hs:144`.
+/// True iff some node `j != lastAtom` produces `m` (or one of its
+/// top-level pair/inv subterms) at an `Out` / `KD` conclusion,
+/// and `j` is not reachable from `i` via `rawLessRel` (so adding
+/// the dependency wouldn't introduce a cycle).
+fn extractible(
+    sys: &System,
+    i: &crate::constraint::constraints::NodeId,
+    m: &tamarin_term::lterm::LNTerm,
+) -> bool {
+    use crate::fact::FactTag;
+    let i_reach = reachable_from(sys, i);
+    for (j, rule) in sys.nodes.iter() {
+        if Some(j) == sys.last_atom.as_ref() { continue; }
+        // We cannot deduce a message via a node we ourselves precede.
+        if i_reach.contains(j) { continue; }
+        // `Out(t)` and `KD(t)` conclusions.
+        for fa in rule.conclusions.iter() {
+            let derived = match &fa.tag {
+                FactTag::Out => fa.terms.first(),
+                FactTag::Kd => fa.terms.first(),
+                _ => None,
+            };
+            let Some(t) = derived else { continue };
+            for sub in toplevel_terms(t) {
+                if sub == *m { return true; }
+            }
+        }
+    }
+    false
+}
+
+/// `toplevelTerms t` — direct port of `Goals.hs:157`. Walks pair/inv
+/// at the top level only (other function applications are leaves).
+fn toplevel_terms(t: &tamarin_term::lterm::LNTerm) -> Vec<tamarin_term::lterm::LNTerm> {
+    use tamarin_term::function_symbols::{FunSym, NoEqSym};
+    use tamarin_term::term::Term;
+    let mut out = vec![t.clone()];
+    if let Term::App(FunSym::NoEq(NoEqSym { name, .. }), args) = t {
+        match name.as_slice() {
+            b"pair" if args.len() == 2 => {
+                out.extend(toplevel_terms(&args[0]));
+                out.extend(toplevel_terms(&args[1]));
+            }
+            b"inv" if args.len() == 1 => {
+                out.extend(toplevel_terms(&args[0]));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// `rawLessRel`-based forward reachability: every node id reachable
+/// from `i` via `sLessAtoms ++ edges` (transitive closure).
+fn reachable_from(
+    sys: &System,
+    i: &crate::constraint::constraints::NodeId,
+) -> std::collections::BTreeSet<crate::constraint::constraints::NodeId> {
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    let mut adj: BTreeMap<
+        crate::constraint::constraints::NodeId,
+        Vec<crate::constraint::constraints::NodeId>,
+    > = BTreeMap::new();
+    for l in &sys.less_atoms {
+        adj.entry(l.smaller.clone()).or_default().push(l.larger.clone());
+    }
+    for e in &sys.edges {
+        adj.entry(e.src.0.clone()).or_default().push(e.tgt.0.clone());
+    }
+    let mut seen: BTreeSet<crate::constraint::constraints::NodeId> = BTreeSet::new();
+    let mut q: VecDeque<crate::constraint::constraints::NodeId> = VecDeque::new();
+    q.push_back(i.clone());
+    while let Some(n) = q.pop_front() {
+        if !seen.insert(n.clone()) { continue; }
+        if let Some(succs) = adj.get(&n) {
+            for s in succs { q.push_back(s.clone()); }
+        }
+    }
+    seen
+}
+
+/// `checkTermLits p t` — true iff every leaf-literal sort in `t`
+/// satisfies `p`. Mirrors Haskell's `foldMap (All . p . sortOfLit)`.
+fn check_term_lits<F: Fn(tamarin_term::lterm::LSort) -> bool>(
+    t: &tamarin_term::lterm::LNTerm,
+    p: F,
+) -> bool {
+    fn walk<F: Fn(tamarin_term::lterm::LSort) -> bool>(
+        t: &tamarin_term::lterm::LNTerm, p: &F,
+    ) -> bool {
+        use tamarin_term::lterm::{LSort, NameTag};
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+        match t {
+            Term::Lit(Lit::Var(v)) => p(v.sort),
+            Term::Lit(Lit::Con(c)) => p(match c.tag {
+                NameTag::Pub => LSort::Pub,
+                NameTag::Fresh => LSort::Fresh,
+                NameTag::Node => LSort::Node,
+                NameTag::Nat => LSort::Nat,
+            }),
+            Term::App(_, args) => args.iter().all(|a| walk(a, p)),
+        }
+    }
+    walk(t, &p)
+}
+
+/// `probablyConstructible` (Haskell):
+///   no fresh-name literals AND no private function symbols.
+fn probably_constructible(t: &tamarin_term::lterm::LNTerm) -> bool {
+    use tamarin_term::lterm::LSort;
+    !lit_sort_contains(t, LSort::Fresh) && !contains_private(t)
+}
+
+/// True iff any literal in `t` has the given sort. The Haskell source
+/// folds `sortOfLit` over every leaf; we mirror that with a recursive
+/// walk over `Term` matching `LSort` against `Var.sort` for variables
+/// and `NameTag` for constants.
+fn lit_sort_contains(t: &tamarin_term::lterm::LNTerm, target: tamarin_term::lterm::LSort) -> bool {
+    use tamarin_term::lterm::{LSort, NameTag};
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    match t {
+        Term::Lit(Lit::Var(v)) => v.sort == target,
+        Term::Lit(Lit::Con(c)) => match (target, c.tag) {
+            (LSort::Pub,   NameTag::Pub)   => true,
+            (LSort::Fresh, NameTag::Fresh) => true,
+            (LSort::Node,  NameTag::Node)  => true,
+            (LSort::Nat,   NameTag::Nat)   => true,
+            _ => false,
+        },
+        Term::App(_, args) => args.iter().any(|a| lit_sort_contains(a, target)),
+    }
+}
+
+/// True iff any sub-term is a `Private` function-symbol application.
+fn contains_private(t: &tamarin_term::lterm::LNTerm) -> bool {
+    use tamarin_term::function_symbols::{Privacy, FunSym};
+    use tamarin_term::term::Term;
+    match t {
+        Term::Lit(_) => false,
+        Term::App(FunSym::NoEq(sym), args) => {
+            sym.privacy == Privacy::Private || args.iter().any(contains_private)
+        }
+        Term::App(_, args) => args.iter().any(contains_private),
+    }
+}
+
+/// `solveGoal` placeholder: the full implementation lives in the
+/// Reduction monad and applies the appropriate constraint-reduction
+/// rule for the goal type. For now this is a stub.
+#[allow(unused_variables)]
+pub fn solve_goal(g: &Goal, sys: &mut System) -> Option<()> {
+    None
+}
+
+/// Dispatch a goal to the appropriate `solve_*_goal` primitive on a
+/// `Reduction`. Mirrors the case dispatch at the top of Haskell's
+/// `solveGoal`. Returns the corresponding `GoalCases` outcome.
+pub fn dispatch_solve_goal(
+    red: &mut crate::constraint::solver::reduction::Reduction<'_>,
+    g: &Goal,
+) -> crate::constraint::solver::reduction::GoalCases {
+    match g {
+        Goal::Action(i, fa) => red.solve_action_goal(i, fa),
+        Goal::Premise(p, fa) => red.solve_premise_goal(p, fa),
+        Goal::Chain(c, p) => red.solve_chain_goal(c, p),
+        Goal::Split(id) => red.solve_split_goal(*id),
+        Goal::Disj(d) => red.solve_disj_goal(d),
+        Goal::Subterm(st) => red.solve_subterm_goal(st),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constraint::system::System;
+
+    #[test]
+    fn empty_system_has_no_open_goals() {
+        let sys = System::empty();
+        assert!(open_goals(&sys).is_empty());
+    }
+
+    #[test]
+    fn single_goal_returned() {
+        let mut sys = System::empty();
+        let v = tamarin_term::lterm::LVar::new(
+            "k", tamarin_term::lterm::LSort::Msg, 0);
+        let f = crate::fact::LNFact::new(crate::fact::FactTag::Out, vec![]);
+        sys.add_goal(Goal::Action(v, f));
+        let goals = open_goals(&sys);
+        assert_eq!(goals.len(), 1);
+        assert_eq!(goals[0].usefulness, Usefulness::Useful);
+    }
+
+    #[test]
+    fn solved_goal_filtered() {
+        let mut sys = System::empty();
+        let v = tamarin_term::lterm::LVar::new(
+            "k", tamarin_term::lterm::LSort::Msg, 0);
+        let f = crate::fact::LNFact::new(crate::fact::FactTag::Out, vec![]);
+        sys.add_goal(Goal::Action(v, f));
+        sys.goals[0].1.solved = true;
+        assert!(open_goals(&sys).is_empty());
+    }
+
+    #[test]
+    fn dispatch_solve_disj_goal_routes() {
+        use crate::constraint::solver::context::ProofContext;
+        use crate::constraint::solver::reduction::{GoalCases, Reduction};
+        use tamarin_term::maude_sig::pair_maude_sig;
+
+        let path = match std::env::var("MAUDE_PATH").ok().or_else(|| {
+            for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+                if std::path::Path::new(c).exists() { return Some(c.to_string()); }
+            }
+            None
+        }) { Some(p) => p, None => return };
+        let h = tamarin_term::maude_proc::MaudeHandle::start(&path, pair_maude_sig()).unwrap();
+        let ctx = ProofContext::new(h, Vec::new());
+        let mut r = Reduction::new(&ctx, System::empty());
+        // Empty disjunction → contradictory.
+        let d = crate::constraint::constraints::Disj::<crate::guarded::Guarded>::new(Vec::new());
+        let g = Goal::Disj(d);
+        let out = dispatch_solve_goal(&mut r, &g);
+        assert!(matches!(out, GoalCases::Contradictory));
+    }
+}

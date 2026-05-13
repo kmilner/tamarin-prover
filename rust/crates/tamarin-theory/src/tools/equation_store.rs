@@ -1,0 +1,881 @@
+//! Port of `Theory.Tools.EquationStore`.
+//!
+//! The equation store represents a (constrained) disjunction of
+//! substitutions. Semantically:
+//!
+//! ```text
+//! EqStore sigma_free
+//!         [ [sigma_i1, ..., sigma_ik_i] | i ∈ 1..l ]
+//! ```
+//!
+//! denotes
+//!
+//! ```text
+//!     /\_i (x_i = sigma_free(x_i))
+//!  /\ /\_i (sigma_i1 ∨ … ∨ sigma_ik_i)
+//! ```
+//!
+//! where each `sigma_ij` is a *fresh-range* substitution (its
+//! variables are existentially quantified).
+//!
+//! This Rust port currently exposes the data structure and
+//! Maude-free operations: empty, false-detection, adding a
+//! disjunction, performing a split, and listing splits. Operations
+//! that need AC unification — `addEqs`, `apply_eq_store`, `simp` —
+//! will land alongside the AC-unification port.
+
+use std::collections::BTreeSet;
+
+use tamarin_term::lterm::{LNTerm, LVar, Name};
+use tamarin_term::subst::Subst;
+use tamarin_term::subst_vfresh::SubstVFresh;
+
+/// Rename "witness" range variables in a Maude unifier to globally
+/// fresh indices. A witness is a range var that:
+///  1. doesn't appear as a domain variable (otherwise it's a target
+///     binding), and
+///  2. doesn't appear in the original input equations (otherwise it's
+///     a real system variable that Maude is reusing).
+///
+/// Maude introduces witnesses as `x_N` LVars when it needs auxiliary
+/// variables to express a unifier. Without renaming, two separate
+/// `add_eqs` calls can return witnesses with the same `x_N` name +
+/// idx, causing distinct vars in the system to collapse.
+fn freshen_witness_range(
+    raw: Vec<(LVar, LNTerm)>,
+    input_vars: &std::collections::BTreeSet<LVar>,
+    avoid_max: u64,
+) -> Vec<(LVar, LNTerm)> {
+    use tamarin_term::lterm::HasFrees;
+    use std::collections::{BTreeMap, BTreeSet};
+    let domain: BTreeSet<LVar> = raw.iter().map(|(v, _)| v.clone()).collect();
+    // Collect every range-only-and-not-input variable: that's a witness.
+    let mut witnesses: BTreeSet<LVar> = BTreeSet::new();
+    for (_, t) in &raw {
+        t.for_each_free(&mut |w| {
+            if !domain.contains(w) && !input_vars.contains(w) {
+                witnesses.insert(w.clone());
+            }
+        });
+    }
+    if witnesses.is_empty() { return raw; }
+    // Allocate fresh indices for each.
+    let mut renames: BTreeMap<LVar, LVar> = BTreeMap::new();
+    let mut next = avoid_max + 1;
+    for v in witnesses {
+        renames.insert(v.clone(), LVar { idx: next, ..v });
+        next += 1;
+    }
+    // Apply the rename across each (var, term).
+    raw.into_iter()
+        .map(|(v, t)| (v, t.map_free(&mut |w|
+            renames.get(&w).cloned().unwrap_or(w))))
+        .collect()
+}
+
+/// Index of a disjunction in the equation store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SplitId(pub i64);
+
+impl SplitId {
+    pub fn succ(self) -> Self { SplitId(self.0 + 1) }
+}
+
+/// Convenient alias for the substitution type the solver uses on the
+/// "free" (currently-fixed) part of the equation store.
+pub type LNSubst = Subst<Name, LVar>;
+
+/// Convenient alias for the fresh-range substitutions stored in
+/// disjunctions.
+pub type LNSubstVFresh = SubstVFresh<Name, LVar>;
+
+/// One entry in the disjunctive part of the store: a `SplitId`
+/// alongside the set of substitutions making up that disjunction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EqDisj {
+    pub split_id: SplitId,
+    pub substs: Vec<LNSubstVFresh>,
+}
+
+/// `EqStore`. Mirrors Haskell's `EqStore { _eqsSubst, _eqsConj,
+/// _eqsNextSplitId }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EquationStore {
+    /// "Free" substitution — currently-fixed bindings of the global
+    /// variables. Composes with everything else.
+    pub subst: LNSubst,
+    /// Conjunction of disjunctions.
+    pub conj: Vec<EqDisj>,
+    pub next_split: SplitId,
+}
+
+impl Default for EquationStore {
+    fn default() -> Self { Self::empty() }
+}
+
+impl EquationStore {
+    pub fn empty() -> Self {
+        EquationStore {
+            subst: LNSubst::empty(),
+            conj: Vec::new(),
+            next_split: SplitId(0),
+        }
+    }
+
+    /// `True` iff the store is contradictory (i.e. contains an empty
+    /// disjunction).
+    pub fn is_false(&self) -> bool {
+        self.conj.iter().any(|d| d.substs.is_empty())
+    }
+
+    /// The conjunction representing logical false (split id `-1` and
+    /// an empty disjunction).
+    pub fn false_conj() -> Vec<EqDisj> {
+        vec![EqDisj { split_id: SplitId(-1), substs: Vec::new() }]
+    }
+
+    /// Set the store to logical false. Returns the modified store.
+    pub fn set_false(mut self) -> Self {
+        self.conj = Self::false_conj();
+        self
+    }
+
+    /// Add a new disjunction to the front of the conjunction. Returns
+    /// the resulting store and the new split id.
+    pub fn add_disj(&mut self, substs: Vec<LNSubstVFresh>) -> SplitId {
+        let id = self.next_split;
+        self.conj.insert(0, EqDisj { split_id: id, substs });
+        self.next_split = id.succ();
+        id
+    }
+
+    /// Sorted list of split-ids by disjunction size (ascending).
+    /// Mirrors Haskell's `splits`.
+    pub fn splits(&self) -> Vec<SplitId> {
+        let mut indexed: Vec<(SplitId, usize)> = self.conj.iter()
+            .map(|d| (d.split_id, d.substs.len()))
+            .collect();
+        indexed.sort_by_key(|(_, sz)| *sz);
+        // Dedup keeping first occurrence (matching Haskell's `nub`).
+        let mut seen: BTreeSet<SplitId> = BTreeSet::new();
+        let mut out = Vec::with_capacity(indexed.len());
+        for (id, _) in indexed {
+            if seen.insert(id) { out.push(id); }
+        }
+        out
+    }
+
+    /// Number of cases for a given split id.
+    pub fn split_size(&self, id: SplitId) -> Option<usize> {
+        self.conj.iter().find(|d| d.split_id == id)
+            .map(|d| d.substs.len())
+    }
+
+    pub fn split_exists(&self, id: SplitId) -> bool {
+        self.split_size(id).is_some()
+    }
+
+    /// Perform a case-split on the given disjunction, returning one
+    /// fresh `EquationStore` per case.
+    ///
+    /// Returns `None` if no disjunction with `id` exists.
+    pub fn perform_split(&self, id: SplitId) -> Option<Vec<EquationStore>> {
+        let pos = self.conj.iter().position(|d| d.split_id == id)?;
+        let disj = &self.conj[pos];
+
+        // For each substitution in the chosen disjunction, build a new
+        // store that drops `id` and adds a fresh single-case
+        // disjunction containing just that subst.
+        let mut out = Vec::with_capacity(disj.substs.len());
+        for subst in &disj.substs {
+            let mut new_store = self.clone();
+            new_store.conj.remove(pos);
+            new_store.add_disj(vec![subst.clone()]);
+            out.push(new_store);
+        }
+        Some(out)
+    }
+
+    /// Compute a baseline for fresh-witness allocation: max var idx
+    /// across the eq-store's domain and range.
+    fn fresh_baseline(&self) -> u64 {
+        use tamarin_term::lterm::HasFrees;
+        let mut m = 0u64;
+        for (v, t) in self.subst.to_list().iter() {
+            if v.idx > m { m = v.idx; }
+            t.for_each_free(&mut |w| if w.idx > m { m = w.idx; });
+        }
+        for d in &self.conj {
+            for s in &d.substs {
+                for (v, t) in s.to_list() {
+                    if v.idx > m { m = v.idx; }
+                    t.for_each_free(&mut |w| if w.idx > m { m = w.idx; });
+                }
+            }
+        }
+        m
+    }
+
+    /// Apply a free substitution and a list of equations would go here once
+    /// AC unification is wired up. For now this is a stub.
+    #[allow(unused_variables)]
+    pub fn add_eqs_stub(&mut self, eqs: &[(LNTerm, LNTerm)]) -> Result<Option<SplitId>, &'static str> {
+        Err("addEqs requires Maude-backed AC unification — not yet implemented")
+    }
+
+    /// Maude-backed `addEqs` with a caller-supplied freshness baseline.
+    /// `extra_avoid` is the max idx seen anywhere in the surrounding
+    /// system (beyond just the eq-store).  Without this, Maude
+    /// witnesses get renamed using only the eq-store's max idx, which
+    /// can collide with vars in nodes/edges/goals/formulas — leading
+    /// to the variable conflation bug.
+    pub fn add_eqs_with_avoid(
+        &mut self,
+        maude: &tamarin_term::maude_proc::MaudeHandle,
+        eqs: &[tamarin_term::rewriting::Equal<LNTerm>],
+        extra_avoid: u64,
+    ) -> Result<Option<SplitId>, AddEqsError> {
+        self.add_eqs_inner(maude, eqs, extra_avoid)
+    }
+
+    /// Maude-backed `addEqs`. Calls the supplied Maude bridge to AC-unify
+    /// the given equations and incorporates the result into the store.
+    /// Returns the new split id if the unification produced a non-trivial
+    /// disjunction; `None` if the unifier was either single (already
+    /// composed into `subst`) or empty (store becomes false).
+    pub fn add_eqs(
+        &mut self,
+        maude: &tamarin_term::maude_proc::MaudeHandle,
+        eqs: &[tamarin_term::rewriting::Equal<LNTerm>],
+    ) -> Result<Option<SplitId>, AddEqsError> {
+        self.add_eqs_inner(maude, eqs, 0)
+    }
+
+    fn add_eqs_inner(
+        &mut self,
+        maude: &tamarin_term::maude_proc::MaudeHandle,
+        eqs: &[tamarin_term::rewriting::Equal<LNTerm>],
+        extra_avoid: u64,
+    ) -> Result<Option<SplitId>, AddEqsError> {
+        // Short-cut: empty input → no change.
+        if eqs.is_empty() { return Ok(None); }
+
+        // Apply the existing free substitution to the input first so the
+        // unifier sees the most-refined version of each side.
+        let applied: Vec<tamarin_term::rewriting::Equal<LNTerm>> = eqs
+            .iter()
+            .map(|e| tamarin_term::rewriting::Equal {
+                lhs: tamarin_term::subst::apply_vterm(&self.subst, e.lhs.clone()),
+                rhs: tamarin_term::subst::apply_vterm(&self.subst, e.rhs.clone()),
+            })
+            .collect();
+
+        let unifiers = maude.unify_at("eq_store::add_eqs", &applied)
+            .map_err(|e| AddEqsError::Maude(format!("{}", e)))?;
+
+        if unifiers.is_empty() {
+            if std::env::var("TAM_DBG_NOUNIFY").is_ok() {
+                eprintln!("[nounify] add_eqs found 0 unifiers for:");
+                for e in &applied {
+                    let l = format!("{:?}", e.lhs).chars().take(150).collect::<String>();
+                    let r = format!("{:?}", e.rhs).chars().take(150).collect::<String>();
+                    eprintln!("[nounify]   {} = {}", l, r);
+                }
+            }
+            // No unifiers → contradiction.
+            *self = self.clone().set_false();
+            return Ok(None);
+        }
+        if unifiers.len() == 1 {
+            // Single unifier composes directly into the free substitution.
+            // BUT first rename the witness range vars (vars Maude
+            // introduced as auxiliaries that aren't in the input nor
+            // in the unifier's domain) to globally fresh indices.
+            // Without this, two separate unifications can produce
+            // colliding witness names and spuriously equate unrelated
+            // vars.
+            let raw: Vec<(LVar, LNTerm)> = unifiers.into_iter().next().unwrap();
+            // Collect input vars (vars in the post-subst eqs).
+            use tamarin_term::lterm::HasFrees;
+            let mut input_vars: std::collections::BTreeSet<LVar> = std::collections::BTreeSet::new();
+            for e in &applied {
+                e.lhs.for_each_free(&mut |v| { input_vars.insert(v.clone()); });
+                e.rhs.for_each_free(&mut |v| { input_vars.insert(v.clone()); });
+            }
+            let raw = freshen_witness_range(
+                raw, &input_vars,
+                self.fresh_baseline().max(extra_avoid));
+            let mut subst = LNSubst::empty();
+            for (v, t) in raw {
+                subst = subst.compose(&LNSubst::from_list(vec![(v, t)]));
+            }
+            self.subst = subst.compose(&self.subst);
+            return Ok(None);
+        }
+
+        // Multiple unifiers → record as a fresh-range disjunction.
+        let mut substs: Vec<LNSubstVFresh> = Vec::with_capacity(unifiers.len());
+        for raw in unifiers {
+            substs.push(LNSubstVFresh::from_list(raw.into_iter()));
+        }
+        Ok(Some(self.add_disj(substs)))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum AddEqsError {
+    Maude(String),
+}
+
+impl std::fmt::Display for AddEqsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self { AddEqsError::Maude(s) => write!(f, "Maude error: {}", s) }
+    }
+}
+impl std::error::Error for AddEqsError {}
+
+// =============================================================================
+// Rule variants
+// =============================================================================
+
+impl EquationStore {
+    /// `addRuleVariants disj store` — extends the store's conjunction
+    /// with the given precomputed AC variants (a disjunction of
+    /// fresh-range substitutions). Mirrors Haskell's `addRuleVariants`.
+    /// Errors if the variants share variables with the free
+    /// substitution's domain (Haskell `error`'s here).
+    pub fn add_rule_variants(
+        &mut self,
+        variants: Vec<LNSubstVFresh>,
+    ) -> Result<SplitId, &'static str> {
+        // Domain-disjointness check: free-subst domain must not
+        // overlap with any variant's domain.
+        let free_dom: BTreeSet<LVar> = self.subst.dom().cloned().collect();
+        for v in &variants {
+            if v.dom().any(|x| free_dom.contains(x)) {
+                return Err(
+                    "addRuleVariants: nonempty intersection between domain \
+                     of variants and free substitution",
+                );
+            }
+        }
+        Ok(self.add_disj(variants))
+    }
+}
+
+// =============================================================================
+// Simplification (Maude-free pieces)
+// =============================================================================
+
+impl EquationStore {
+    /// Mirrors `simp` from Haskell: a fixed-point loop running each
+    /// simp1 pass until no further changes. Returns the new store.
+    ///
+    /// The Maude-using passes (`simp_abstract_*` and friends that need
+    /// fresh-variable generation) are not yet wired in. The currently-
+    /// implemented passes are:
+    ///
+    /// - `simp_empty_disj`
+    /// - `simp_remove_renamings`
+    /// - `simp_minimize` (with a caller-supplied contradiction predicate)
+    /// - `simp_abstract_name`
+    /// - `simp_identify`
+    pub fn simp<F: Fn(&LNSubst, &LNSubstVFresh) -> bool>(
+        mut self,
+        is_contr: F,
+    ) -> Self {
+        loop {
+            if self.is_false() { return self; }
+            let mut changed = false;
+            // Snapshot the free subst so the closure doesn't borrow `self`.
+            let subst_snapshot = self.subst.clone();
+            changed |= self.simp_minimize(|s| is_contr(&subst_snapshot, s));
+            changed |= self.simp_remove_renamings();
+            changed |= self.simp_empty_disj();
+            changed |= self.simp_abstract_name();
+            changed |= self.simp_identify();
+            if !changed { return self; }
+        }
+    }
+
+    /// `simpEmptyDisj`: if any disjunction is empty (and the store
+    /// isn't already the canonical false-conjunction), collapse the
+    /// whole store to `false`.
+    pub fn simp_empty_disj(&mut self) -> bool {
+        let already_false_canonical = self.conj.len() == 1
+            && self.conj[0].split_id == SplitId(-1)
+            && self.conj[0].substs.is_empty();
+        let has_empty_disj = self.conj.iter().any(|d| d.substs.is_empty());
+        if has_empty_disj && !already_false_canonical {
+            self.conj = Self::false_conj();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `simpRemoveRenamings`: drop variable-renaming entries from
+    /// every fresh-range substitution. Returns true if any subst was
+    /// modified.
+    pub fn simp_remove_renamings(&mut self) -> bool {
+        let mut changed = false;
+        for d in self.conj.iter_mut() {
+            for s in d.substs.iter_mut() {
+                let cleaned = s.remove_renamings();
+                if cleaned.dom().count() != s.dom().count() {
+                    *s = cleaned;
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// `simpMinimize`: dedupe substitutions within a disjunction; if a
+    /// disjunction contains the empty subst (i.e. a tautology), reduce
+    /// it to just that. Also drops substs flagged contradictory by
+    /// `is_contr`.
+    pub fn simp_minimize<F: Fn(&LNSubstVFresh) -> bool>(
+        &mut self,
+        is_contr: F,
+    ) -> bool {
+        let mut changed = false;
+        let empty = LNSubstVFresh::empty();
+        for d in self.conj.iter_mut() {
+            // Dedup in-place while preserving first occurrences.
+            let mut seen: Vec<LNSubstVFresh> = Vec::new();
+            for s in &d.substs {
+                if !seen.iter().any(|x| x == s) { seen.push(s.clone()); }
+            }
+            let original_len = d.substs.len();
+            // If any subst equals empty or contradicts, reduce to empty-only.
+            let reduce_to_empty = seen.iter().any(|s| s == &empty || is_contr(s));
+            if reduce_to_empty {
+                if seen.iter().any(|s| s == &empty) {
+                    seen = vec![empty.clone()];
+                } else {
+                    seen.retain(|s| !is_contr(s));
+                }
+            }
+            if seen.len() != original_len || seen != d.substs {
+                d.substs = seen;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// `simpAbstractName`: if every substitution in a disjunction maps
+    /// the same variable `v` to the same constant `c`, factor `{v →
+    /// c}` out into the free substitution and drop those mappings.
+    pub fn simp_abstract_name(&mut self) -> bool {
+        // Walk each disjunction and look for a common (v, const)
+        // mapping.
+        let mut common_mapping: Option<(LVar, LNTerm, usize)> = None;
+        for (idx, d) in self.conj.iter().enumerate() {
+            if d.substs.is_empty() { continue; }
+            let first = &d.substs[0];
+            // For each (v, t) in first where t is a constant, check
+            // every other subst maps v to the same t.
+            for (v, t) in first.to_list() {
+                if !is_constant_term(&t) { continue; }
+                let common = d.substs.iter().all(|s| {
+                    s.image_of(&v).map(|got| got == &t).unwrap_or(false)
+                });
+                if common {
+                    common_mapping = Some((v.clone(), t.clone(), idx));
+                    break;
+                }
+            }
+            if common_mapping.is_some() { break; }
+        }
+        let (v, t, idx) = match common_mapping {
+            Some(p) => p,
+            None => return false,
+        };
+        // Compose `{v → t}` into the free substitution and drop `v`
+        // from every subst in disjunction `idx`.
+        let factor = LNSubst::from_list(vec![(v.clone(), t)]);
+        self.subst = factor.compose(&self.subst);
+        let new_substs: Vec<LNSubstVFresh> = self.conj[idx].substs
+            .iter()
+            .map(|s| {
+                let kept: Vec<(LVar, LNTerm)> = s.to_list().into_iter()
+                    .filter(|(x, _)| x != &v)
+                    .collect();
+                LNSubstVFresh::from_list(kept)
+            })
+            .collect();
+        self.conj[idx].substs = new_substs;
+        true
+    }
+
+    /// `simpIdentify`: if every subst in a disjunction has two
+    /// different variables `x` and `y` (with `x < y` and same sort)
+    /// mapped to the same image, factor `{x → y}` and drop `x` from
+    /// every subst.
+    pub fn simp_identify(&mut self) -> bool {
+        let mut to_apply: Option<(LVar, LVar, usize)> = None;
+        for (idx, d) in self.conj.iter().enumerate() {
+            if d.substs.is_empty() { continue; }
+            let first = &d.substs[0];
+            // Find all (v, v') pairs in `first` with same image, v < v'.
+            let pairs: Vec<(LVar, LVar)> = {
+                let entries = first.to_list();
+                let mut out = Vec::new();
+                for (i, (v, t)) in entries.iter().enumerate() {
+                    for (v2, t2) in entries.iter().skip(i + 1) {
+                        if t == t2 && v < v2 { out.push((v.clone(), v2.clone())); }
+                    }
+                }
+                out
+            };
+            for (v, v2) in &pairs {
+                let agrees = d.substs.iter().skip(1).all(|s| {
+                    let i1 = s.image_of(v);
+                    let i2 = s.image_of(v2);
+                    i1.is_some() && i1 == i2
+                });
+                if agrees {
+                    to_apply = Some((v.clone(), v2.clone(), idx));
+                    break;
+                }
+            }
+            if to_apply.is_some() { break; }
+        }
+        let (v, v2, idx) = match to_apply {
+            Some(p) => p,
+            None => return false,
+        };
+        // Decide which to keep: the variable with the larger sort
+        // (Tamarin says "GT means keep first"; we use the same rule).
+        let (keep, remove) = match sort_compare(v.sort, v2.sort) {
+            Some(std::cmp::Ordering::Greater) => (v2.clone(), v.clone()),
+            Some(_) => (v.clone(), v2.clone()),
+            None => return false, // incomparable sorts; bail
+        };
+        let factor = LNSubst::from_list(vec![
+            (remove.clone(), tamarin_term::term::Term::Lit(
+                tamarin_term::vterm::Lit::Var(keep.clone()))),
+        ]);
+        self.subst = factor.compose(&self.subst);
+        // Remove `keep` from every subst in disjunction `idx`.
+        let new_substs: Vec<LNSubstVFresh> = self.conj[idx].substs
+            .iter()
+            .map(|s| {
+                let kept: Vec<(LVar, LNTerm)> = s.to_list().into_iter()
+                    .filter(|(x, _)| x != &keep)
+                    .collect();
+                LNSubstVFresh::from_list(kept)
+            })
+            .collect();
+        self.conj[idx].substs = new_substs;
+        true
+    }
+
+    /// `simpDisjunction`: simplify a single disjunction of fresh-range
+    /// substitutions, returning the resulting free-substitution part
+    /// and (if the disjunction didn't collapse to true) the remaining
+    /// substitutions. Mirrors Haskell's `simpDisjunction`.
+    pub fn simp_disjunction<F: Fn(&LNSubst, &LNSubstVFresh) -> bool>(
+        substs: Vec<LNSubstVFresh>,
+        is_contr: F,
+    ) -> (LNSubst, Option<Vec<LNSubstVFresh>>) {
+        let mut store = EquationStore::empty();
+        let _ = store.add_disj(substs);
+        let store = store.simp(is_contr);
+        let free = store.subst.clone();
+        match store.conj.as_slice() {
+            // Empty conjunction → simplification reduced to True.
+            [] => (free, None),
+            // Single disjunction left → return its substitutions.
+            [d] => (free, Some(d.substs.clone())),
+            // Otherwise, return the flattened set of remaining substs.
+            _ => (free, Some(store.conj.into_iter().flat_map(|d| d.substs).collect())),
+        }
+    }
+
+    /// Apply a free substitution to the entire store. Structural-only
+    /// version (no Maude renormalisation). Use this when the new
+    /// substitution can't introduce AC-unification opportunities.
+    pub fn apply_subst_structural(&mut self, asubst: &LNSubst) {
+        // Composition of the new substitution with the free.
+        self.subst = asubst.compose(&self.subst);
+        // Apply structurally to each subst's range terms.
+        for d in self.conj.iter_mut() {
+            for s in d.substs.iter_mut() {
+                let new_pairs: Vec<(LVar, LNTerm)> = s.to_list().into_iter()
+                    .map(|(v, t)| (v, tamarin_term::subst::apply_vterm(asubst, t)))
+                    .collect();
+                *s = LNSubstVFresh::from_list(new_pairs);
+            }
+        }
+    }
+
+    /// `applyEqStore`: apply a free substitution to the store, going
+    /// through Maude to renormalise each disjunction's substitutions
+    /// modulo AC. Mirrors the Haskell semantics.
+    ///
+    /// Errors if `asubst`'s domain and range overlap (Haskell errors
+    /// here too, since the resulting composition would be malformed).
+    pub fn apply_eq_store(
+        &mut self,
+        maude: &tamarin_term::maude_proc::MaudeHandle,
+        asubst: &LNSubst,
+    ) -> Result<(), AddEqsError> {
+        // Domain/range disjointness check.
+        let dom: BTreeSet<LVar> = asubst.dom().cloned().collect();
+        let range_vars: BTreeSet<LVar> = asubst.range()
+            .flat_map(|t| tamarin_term::vterm::vars_vterm(t))
+            .collect();
+        if dom.intersection(&range_vars).count() > 0 {
+            return Err(AddEqsError::Maude(
+                "applyEqStore: dom and vrange not disjoint".into()));
+        }
+
+        let new_subst = asubst.compose(&self.subst);
+        // Re-unify each subst against the new free subst by
+        // delegating to Maude. For each (v, t) in the existing
+        // fresh-range subst, normalise the substituted version.
+        for d in self.conj.iter_mut() {
+            let mut new_substs: Vec<LNSubstVFresh> = Vec::with_capacity(d.substs.len());
+            for s in &d.substs {
+                let mut new_pairs: Vec<(LVar, LNTerm)> = Vec::with_capacity(s.len());
+                for (v, t) in s.to_list() {
+                    // Apply the new free subst to the range term, then reduce
+                    // modulo the maude theory.
+                    let applied = tamarin_term::subst::apply_vterm(&new_subst, t);
+                    let normalised = match maude.reduce(&applied) {
+                        Ok(t) => t,
+                        Err(e) => return Err(AddEqsError::Maude(format!("{}", e))),
+                    };
+                    new_pairs.push((v, normalised));
+                }
+                new_substs.push(LNSubstVFresh::from_list(new_pairs));
+            }
+            d.substs = new_substs;
+        }
+        self.subst = new_subst;
+        Ok(())
+    }
+}
+
+/// True if `t` is a single constant literal (no variables, no apps).
+fn is_constant_term(t: &LNTerm) -> bool {
+    matches!(t, tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Con(_)))
+}
+
+/// Re-export sort comparison from the term layer for `simp_identify`.
+fn sort_compare(a: tamarin_term::lterm::LSort, b: tamarin_term::lterm::LSort)
+    -> Option<std::cmp::Ordering>
+{
+    tamarin_term::lterm::sort_compare(a, b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tamarin_term::lterm::LSort;
+    use tamarin_term::subst_vfresh::SubstVFresh;
+
+    fn fresh_subst() -> LNSubstVFresh {
+        let v = LVar::new("x", LSort::Msg, 0);
+        let t = tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Var(
+            LVar::new("y", LSort::Msg, 0)));
+        SubstVFresh::from_list(vec![(v, t)])
+    }
+
+    #[test]
+    fn empty_store_is_consistent() {
+        let s = EquationStore::empty();
+        assert!(!s.is_false());
+        assert!(s.splits().is_empty());
+    }
+
+    #[test]
+    fn empty_disj_makes_store_false() {
+        let mut s = EquationStore::empty();
+        let id = s.add_disj(vec![]);
+        assert_eq!(id, SplitId(0));
+        assert!(s.is_false());
+    }
+
+    #[test]
+    fn add_disj_assigns_fresh_ids() {
+        let mut s = EquationStore::empty();
+        let id1 = s.add_disj(vec![fresh_subst()]);
+        let id2 = s.add_disj(vec![fresh_subst(), fresh_subst()]);
+        assert_eq!(id1, SplitId(0));
+        assert_eq!(id2, SplitId(1));
+        assert!(!s.is_false());
+        assert_eq!(s.split_size(id1), Some(1));
+        assert_eq!(s.split_size(id2), Some(2));
+        assert!(s.split_exists(id2));
+    }
+
+    #[test]
+    fn splits_sorted_by_size() {
+        let mut s = EquationStore::empty();
+        let big = s.add_disj(vec![fresh_subst(), fresh_subst(), fresh_subst()]);
+        let small = s.add_disj(vec![fresh_subst()]);
+        let sorted = s.splits();
+        assert_eq!(sorted[0], small);
+        assert_eq!(sorted[1], big);
+    }
+
+    #[test]
+    fn perform_split_branches() {
+        let mut s = EquationStore::empty();
+        let id = s.add_disj(vec![fresh_subst(), fresh_subst()]);
+        let branches = s.perform_split(id).unwrap();
+        assert_eq!(branches.len(), 2);
+        // Each branch contains a single-case disjunction.
+        for b in &branches {
+            assert_eq!(b.conj.len(), 1);
+            assert_eq!(b.conj[0].substs.len(), 1);
+        }
+    }
+
+    #[test]
+    fn perform_split_unknown_id() {
+        let s = EquationStore::empty();
+        assert!(s.perform_split(SplitId(42)).is_none());
+    }
+
+    #[test]
+    fn set_false_marks_store_false() {
+        let s = EquationStore::empty().set_false();
+        assert!(s.is_false());
+    }
+
+    fn maude_path() -> Option<String> {
+        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
+        let candidates = [
+            "/home/linuxbrew/.linuxbrew/bin/maude",
+            "/usr/local/bin/maude",
+            "/usr/bin/maude",
+            "maude",
+        ];
+        for c in &candidates {
+            if std::path::Path::new(c).exists() { return Some((*c).to_string()); }
+        }
+        None
+    }
+
+    #[test]
+    fn rule_variants_added_as_disjunction() {
+        let mut store = EquationStore::empty();
+        let id = store.add_rule_variants(vec![fresh_subst(), fresh_subst()])
+            .expect("add_rule_variants");
+        assert_eq!(id, SplitId(0));
+        assert_eq!(store.split_size(id), Some(2));
+    }
+
+    #[test]
+    fn rule_variants_rejects_overlapping_domain() {
+        let mut store = EquationStore::empty();
+        // Pre-populate the free subst with `x`.
+        let v = LVar::new("x", LSort::Msg, 0);
+        let t = tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Var(
+            LVar::new("z", LSort::Msg, 0)));
+        store.subst = LNSubst::from_list(vec![(v, t)]);
+        // Variant subst also touches `x`.
+        let res = store.add_rule_variants(vec![fresh_subst()]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn simp_empty_disj_makes_store_false() {
+        let mut store = EquationStore::empty();
+        // Add an empty disjunction.
+        let _ = store.add_disj(vec![]);
+        let changed = store.simp_empty_disj();
+        assert!(changed);
+        assert!(store.is_false());
+    }
+
+    #[test]
+    fn simp_idempotent_on_consistent_store() {
+        let mut store = EquationStore::empty();
+        let _ = store.add_disj(vec![fresh_subst()]);
+        let store = store.simp(|_, _| false);
+        assert!(!store.is_false());
+        assert!(!store.conj.is_empty());
+    }
+
+    #[test]
+    fn simp_abstract_name_factors_common_constant() {
+        // Build a disjunction where every subst maps `x → 'foo'` (pub
+        // constant). simp_abstract_name should hoist that into the
+        // free substitution.
+        use tamarin_term::lterm::{Name, NameTag};
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+        let v = LVar::new("x", LSort::Msg, 0);
+        let foo: LNTerm = Term::Lit(Lit::Con(
+            Name::new(NameTag::Pub, "foo".to_string())));
+        let s1 = LNSubstVFresh::from_list(vec![(v.clone(), foo.clone())]);
+        let s2 = LNSubstVFresh::from_list(vec![(v.clone(), foo.clone())]);
+        let mut store = EquationStore::empty();
+        let _ = store.add_disj(vec![s1, s2]);
+        assert!(store.simp_abstract_name());
+        // Free subst should now contain x → foo.
+        let dom: Vec<&LVar> = store.subst.dom().collect();
+        assert_eq!(dom, vec![&v]);
+    }
+
+    #[test]
+    fn add_eqs_xor_produces_disjunction() {
+        let path = match maude_path() {
+            Some(p) => p,
+            None => { eprintln!("skipping: no maude"); return; }
+        };
+        let sig = tamarin_term::maude_sig::xor_maude_sig();
+        let h = tamarin_term::maude_proc::MaudeHandle::start(&path, sig).expect("start");
+        // x XOR a =? b XOR y has multiple AC unifiers.
+        use tamarin_term::function_symbols::AcSym;
+        use tamarin_term::term::{f_app_ac, Term};
+        use tamarin_term::vterm::Lit;
+        let v = |n: &str| LVar::new(n, LSort::Msg, 0);
+        let lhs: LNTerm = f_app_ac(AcSym::Xor, vec![
+            Term::Lit(Lit::Var(v("x"))), Term::Lit(Lit::Var(v("a"))),
+        ]);
+        let rhs: LNTerm = f_app_ac(AcSym::Xor, vec![
+            Term::Lit(Lit::Var(v("b"))), Term::Lit(Lit::Var(v("y"))),
+        ]);
+        let mut store = EquationStore::empty();
+        let split = store
+            .add_eqs(&h, &[tamarin_term::rewriting::Equal { lhs, rhs }])
+            .expect("add_eqs xor");
+        // AC unification has many unifiers, so we should get a fresh disjunction.
+        assert!(split.is_some(), "expected disjunction split");
+        assert!(!store.is_false());
+        assert!(!store.conj.is_empty());
+    }
+
+    #[test]
+    fn add_eqs_two_vars_via_maude() {
+        let path = match maude_path() {
+            Some(p) => p,
+            None => { eprintln!("skipping: no maude"); return; }
+        };
+        let sig = tamarin_term::maude_sig::pair_maude_sig();
+        let h = tamarin_term::maude_proc::MaudeHandle::start(&path, sig).expect("start");
+        // Unify x =? y — single mgu, no disjunction, just composes into subst.
+        let x = LVar::new("x", LSort::Msg, 0);
+        let y = LVar::new("y", LSort::Msg, 0);
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+        let tx: LNTerm = Term::Lit(Lit::Var(x));
+        let ty: LNTerm = Term::Lit(Lit::Var(y));
+        let mut store = EquationStore::empty();
+        let split = store
+            .add_eqs(&h, &[tamarin_term::rewriting::Equal { lhs: tx, rhs: ty }])
+            .expect("add_eqs");
+        // Single mgu → composed into subst, no new disjunction.
+        assert!(split.is_none());
+        assert!(!store.is_false());
+        // The free substitution must now bind one variable to the other.
+        assert!(!store.subst.is_empty(), "subst should be populated, got {:?}", store.subst);
+    }
+}

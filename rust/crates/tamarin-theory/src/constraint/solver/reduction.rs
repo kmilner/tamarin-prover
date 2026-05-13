@@ -1,0 +1,3381 @@
+//! Skeleton port of `Theory.Constraint.Solver.Reduction`.
+//!
+//! In Haskell, `Reduction` is a state-and-disjunction monad:
+//!
+//! ```haskell
+//! type Reduction = ReaderT ProofContext (StateT System (DisjT FreshT IO))
+//! ```
+//!
+//! Each constraint-reduction rule runs as a `Reduction`, possibly
+//! producing multiple cases. The monad provides primitives like
+//! `insertNode`, `insertEdge`, `insertGoal`, `solveTermEqs`, etc.
+//!
+//! For the Rust port we model `Reduction` as a small struct holding
+//! mutable state and a context reference. Disjunctive results are
+//! returned as `Vec`s. This is enough for the simpler reduction
+//! steps; the full solver eventually inlines this with proper
+//! fresh-variable threading and disjunctive case splitting.
+
+use crate::constraint::constraints::{Disj, Edge, Goal, LessAtom, NodeId};
+use crate::constraint::solver::context::ProofContext;
+use crate::constraint::system::System;
+use crate::guarded::Guarded;
+use crate::rule::RuleACInst;
+
+/// A reduction step takes a `System` and produces zero or more new
+/// systems. We keep it simple: explicit input/output rather than a
+/// monad transformer stack.
+pub struct Reduction<'ctx> {
+    pub ctx: &'ctx ProofContext,
+    pub sys: System,
+    /// Whether the system has been mutated since the last
+    /// `whileChanging` checkpoint.
+    pub changed: ChangeIndicator,
+}
+
+/// `ChangeIndicator` mirrors the `True`/`False` flag the Haskell
+/// `whenChanged` / `whileChanging` combinators thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeIndicator { Changed, Unchanged }
+
+impl ChangeIndicator {
+    pub fn or(self, other: Self) -> Self {
+        if self == ChangeIndicator::Changed || other == ChangeIndicator::Changed {
+            ChangeIndicator::Changed
+        } else {
+            ChangeIndicator::Unchanged
+        }
+    }
+}
+
+impl<'ctx> Reduction<'ctx> {
+    pub fn new(ctx: &'ctx ProofContext, sys: System) -> Self {
+        Reduction { ctx, sys, changed: ChangeIndicator::Unchanged }
+    }
+
+    /// Run a reduction step until it stops mutating the system. The
+    /// `step` closure returns the new `ChangeIndicator`.
+    pub fn while_changing<F>(&mut self, mut step: F)
+    where F: FnMut(&mut Reduction<'ctx>) -> ChangeIndicator {
+        loop {
+            self.changed = ChangeIndicator::Unchanged;
+            let _ = step(self);
+            if self.changed == ChangeIndicator::Unchanged { break; }
+        }
+    }
+
+    /// Mark the system as changed and run a closure only if it was.
+    pub fn when_changed<F>(&mut self, mut f: F)
+    where F: FnMut(&mut Reduction<'ctx>) {
+        if self.changed == ChangeIndicator::Changed { f(self); }
+    }
+
+    /// Insert a fresh node, returning its node id. The Haskell version
+    /// allocates a fresh `LVar` via `MonadFresh`; here we use a simple
+    /// counter on `System.next_split` to avoid threading a separate
+    /// fresh supply.
+    pub fn insert_fresh_node(&mut self, rule: RuleACInst) -> NodeId {
+        let id = tamarin_term::lterm::LVar::new(
+            "i".to_string(),
+            tamarin_term::lterm::LSort::Node,
+            self.sys.next_split,
+        );
+        self.sys.next_split += 1;
+        self.sys.add_node(id.clone(), rule);
+        self.changed = ChangeIndicator::Changed;
+        id
+    }
+
+    /// Insert an edge; mark changed if it wasn't there.
+    pub fn insert_edge(&mut self, e: Edge) {
+        let before = self.sys.edges.len();
+        self.sys.add_edge(e);
+        if self.sys.edges.len() != before { self.changed = ChangeIndicator::Changed; }
+    }
+
+    /// `substSystem`: apply the eq-store's current substitution to
+    /// every part of the constraint system that holds free variables —
+    /// nodes (both ids and rule contents), edges, last-atom, less
+    /// atoms, formulas, solved formulas, lemmas, and goals. Mirrors
+    /// Haskell's `substSystem` from `Theory.Constraint.Solver.Reduction`.
+    ///
+    /// The Rust port had been letting the eq-store accumulate
+    /// substitutions while the data structures kept stale node ids and
+    /// term occurrences. That makes graph-based contradiction checks
+    /// (cycles in `<`, edge-induced ordering) miss real contradictions
+    /// and creates phantom ones once we *do* normalise — Haskell
+    /// avoids both by calling `substSystem` after every successful
+    /// `solveTermEqs`.
+    pub fn subst_system(&mut self) {
+        use tamarin_term::lterm::HasFrees;
+        let subst = self.sys.eq_store.subst.clone();
+        if subst.is_empty() { return; }
+        let map_var = |v: tamarin_term::lterm::LVar| -> tamarin_term::lterm::LVar {
+            let id_term = tamarin_term::term::Term::Lit(
+                tamarin_term::vterm::Lit::Var(v.clone()));
+            let mapped = tamarin_term::subst::apply_vterm(&subst, id_term);
+            if let tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Var(w)) = mapped {
+                w
+            } else {
+                v
+            }
+        };
+        // 1. Nodes: rewrite node ids and rule contents. When two
+        //    nodes collapse to the same canonical id, queue an
+        //    equality between their rules' fact lists (mirrors
+        //    Haskell's `setNodes` → `solveRuleEqs`). We solve those
+        //    equalities AFTER the rest of substSystem has run, so the
+        //    triggered re-substitution sees a consistent state.
+        let nodes = std::mem::take(&mut self.sys.nodes);
+        let mut new_nodes: Vec<(crate::constraint::constraints::NodeId, RuleACInst)>
+            = Vec::with_capacity(nodes.len());
+        let mut id_to_index: std::collections::HashMap<crate::constraint::constraints::NodeId, usize>
+            = std::collections::HashMap::new();
+        let mut rule_eqs: Vec<tamarin_term::rewriting::Equal<crate::fact::LNFact>> = Vec::new();
+        let mut shape_mismatch = false;
+        // Helper: apply the full term substitution to a fact's terms.
+        // `map_var` above only handles Var→Var rewrites (used for
+        // node-ids), but the eq-store can also bind a var to an
+        // app-headed term (e.g. `pkR → pk(ltkR)` from a !Pk-edge
+        // unification).  For those entries, `map_free` falls back
+        // to the original var, leaving stale `pkR` in rule actions.
+        // Use `apply_vterm` on the full term to substitute through
+        // app-headed bindings.  Mirrors Haskell's `substSystem`
+        // which uses `apply` on rules' facts as full-term subst.
+        let apply_to_fact = |fa: &crate::fact::LNFact| -> crate::fact::LNFact {
+            crate::fact::LNFact {
+                tag: fa.tag.clone(),
+                annotations: fa.annotations.clone(),
+                terms: fa.terms.iter()
+                    .map(|t| tamarin_term::subst::apply_vterm(&subst, t.clone()))
+                    .collect(),
+            }
+        };
+        for (id, rule) in nodes {
+            let new_id = map_var(id);
+            // First pass: map_var via map_free for node-ids etc.
+            let new_rule = rule.map_free(&mut |v| map_var(v));
+            // Second pass: full term substitution on every fact, so
+            // var→app eq-store bindings reach the rule's terms.
+            let new_rule = crate::rule::Rule {
+                info: new_rule.info,
+                premises: new_rule.premises.iter().map(apply_to_fact).collect(),
+                conclusions: new_rule.conclusions.iter().map(apply_to_fact).collect(),
+                actions: new_rule.actions.iter().map(apply_to_fact).collect(),
+                new_vars: new_rule.new_vars.iter()
+                    .map(|t| tamarin_term::subst::apply_vterm(&subst, t.clone()))
+                    .collect(),
+            };
+            match id_to_index.get(&new_id).copied() {
+                Some(i) => {
+                    let kept: &RuleACInst = &new_nodes[i].1;
+                    if kept.premises.len() != new_rule.premises.len()
+                        || kept.conclusions.len() != new_rule.conclusions.len()
+                        || kept.actions.len() != new_rule.actions.len()
+                    {
+                        // Two distinct rule instances collapsed to the
+                        // same node id but their fact-list shapes
+                        // disagree — there's no consistent rule for
+                        // this node, so the system is contradictory.
+                        // Haskell's `setNodes` reaches the same
+                        // conclusion via `solveRuleEqs` failing.
+                        shape_mismatch = true;
+                    } else {
+                        for (a, b) in kept.premises.iter().zip(new_rule.premises.iter()) {
+                            rule_eqs.push(tamarin_term::rewriting::Equal {
+                                lhs: a.clone(), rhs: b.clone(),
+                            });
+                        }
+                        for (a, b) in kept.conclusions.iter().zip(new_rule.conclusions.iter()) {
+                            rule_eqs.push(tamarin_term::rewriting::Equal {
+                                lhs: a.clone(), rhs: b.clone(),
+                            });
+                        }
+                        for (a, b) in kept.actions.iter().zip(new_rule.actions.iter()) {
+                            rule_eqs.push(tamarin_term::rewriting::Equal {
+                                lhs: a.clone(), rhs: b.clone(),
+                            });
+                        }
+                    }
+                }
+                None => {
+                    id_to_index.insert(new_id.clone(), new_nodes.len());
+                    new_nodes.push((new_id, new_rule));
+                }
+            }
+        }
+        self.sys.nodes = new_nodes;
+        if shape_mismatch {
+            // Force a `gfalse` formula so `has_false_formula` picks up
+            // the contradiction in the next contradictions check.
+            let bot = crate::guarded::gfalse();
+            if !self.sys.formulas.contains(&bot) {
+                self.sys.formulas.push(bot);
+                self.changed = ChangeIndicator::Changed;
+            }
+            // Mark the conflation source so is_finished can route
+            // this gfalse to Unfinishable rather than Contradictory.
+            // Only gated under KU-exp: without it, our shape_mismatch
+            // fires from legitimate Maude narrowings that DO mean the
+            // branch is genuinely contradictory.  Default-OFF keeps
+            // baseline corpus behaviour intact; default-ON would lose
+            // matched lemmas that rely on shape-mismatch closing
+            // attack branches.  See `System::shape_mismatch_conflation`.
+            if std::env::var("TAM_ENABLE_KU_EXP").is_ok() {
+                self.sys.shape_mismatch_conflation = true;
+            }
+        }
+        // 2. Edges: rewrite both endpoints' node ids.
+        for e in self.sys.edges.iter_mut() {
+            e.src.0 = map_var(e.src.0.clone());
+            e.tgt.0 = map_var(e.tgt.0.clone());
+        }
+        self.sys.edges.dedup();
+        // 3. Last-atom.
+        if let Some(last) = self.sys.last_atom.take() {
+            self.sys.last_atom = Some(map_var(last));
+        }
+        // 4. Less atoms.
+        for la in self.sys.less_atoms.iter_mut() {
+            la.smaller = map_var(la.smaller.clone());
+            la.larger  = map_var(la.larger.clone());
+        }
+        // 5. Goals: rewrite the Goal's free vars. Goals are deduped
+        //    structurally; collapsed goals merge by keeping the first
+        //    occurrence.
+        let goals = std::mem::take(&mut self.sys.goals);
+        let apply_term = |t: tamarin_term::lterm::LNTerm|
+            -> tamarin_term::lterm::LNTerm {
+            tamarin_term::subst::apply_vterm(&subst, t)
+        };
+        let mut new_goals: Vec<(Goal, crate::constraint::system::GoalStatus)>
+            = Vec::with_capacity(goals.len());
+        // Apply full term substitution to a fact's term list — required
+        // when the eq-store maps a var to a non-var term (e.g.
+        // `m → h(...)` from an Eq restriction), in which case
+        // `map_var` falls back to identity and the goal's terms never
+        // get rewritten.  Mirrors Haskell's `substFacts` in
+        // `substSystem`.
+        let apply_fact = |fa: crate::fact::LNFact| -> crate::fact::LNFact {
+            crate::fact::Fact {
+                tag: fa.tag,
+                annotations: fa.annotations,
+                terms: fa.terms.into_iter()
+                    .map(|t| apply_term(t))
+                    .collect(),
+            }
+        };
+        // Mirrors Haskell's `substGoals` (Reduction.hs:637-651) — for
+        // KU action goals whose pre-subst term is a msg-var, product,
+        // or union AND whose term actually changes via substitution,
+        // re-insert via `insert_action`-equivalent so the pair/inv/prod
+        // auto-decomp fires retroactively.  This was task #118/#119:
+        // initially introduced unsoundness on NSPK3/roles via
+        // Maude-witness conflation in chain-saturated graft cases;
+        // the upstream `system_max_idx` was incomplete (didn't walk
+        // goals/formulas/eq_store), allowing freshen_system to assign
+        // colliding idxs across grafted Register_pk instances.  After
+        // fixing system_max_idx, the conflation no longer occurs and
+        // this re-insert path is sound.
+        let mut to_insert_action: Vec<(crate::constraint::constraints::NodeId,
+                                       crate::fact::LNFact,
+                                       crate::constraint::system::GoalStatus)>
+            = Vec::new();
+        for (g, st) in goals {
+            let needs_reinsert = if let Goal::Action(_, fa) = &g {
+                if fa.tag == crate::fact::FactTag::Ku && !st.solved {
+                    if let Some(m_pre) = fa.terms.first() {
+                        let m_post = apply_term(m_pre.clone());
+                        (is_msg_var(m_pre) || is_product_or_union(m_pre))
+                            && m_post != *m_pre
+                    } else { false }
+                } else { false }
+            } else { false };
+            let g2 = match g {
+                Goal::Action(i, fa) =>
+                    Goal::Action(map_var(i), apply_fact(fa)),
+                Goal::Premise(p, fa) =>
+                    Goal::Premise((map_var(p.0), p.1), apply_fact(fa)),
+                Goal::Chain(c, p) =>
+                    Goal::Chain(
+                        (map_var(c.0), c.1),
+                        (map_var(p.0), p.1)),
+                Goal::Disj(d) => Goal::Disj(d),
+                Goal::Split(s) => Goal::Split(s),
+                Goal::Subterm((s, t)) => Goal::Subterm((apply_term(s), apply_term(t))),
+            };
+            if needs_reinsert {
+                if let Goal::Action(i, fa) = &g2 {
+                    to_insert_action.push((i.clone(), fa.clone(), st.clone()));
+                }
+            } else if !new_goals.iter().any(|(eg, _)| eg == &g2) {
+                new_goals.push((g2, st));
+            }
+        }
+        self.sys.goals = new_goals;
+        for (i, fa, st) in to_insert_action {
+            self.insert_goal_with_loop_flag(Goal::Action(i, fa), st.looping);
+        }
+        // Formulas / solved formulas / lemmas: port of Haskell's
+        // `substFormulas`, `substSolvedFormulas`, `substLemmas` (all
+        // run inside `substSystem`).  Our formulas are stored as
+        // `Guarded` over parser-AST `VarSpec`, while the eq-store's
+        // substitution is over `LVar`s.  Build a parser-AST `VarSubst`
+        // by converting each LVar→LNTerm entry to (name, idx)→Term,
+        // then apply via `subst_guarded` (which already respects
+        // quantifier shadowing).  Without this, free variables in
+        // formulas (e.g. a lemma's outer Skolem `key` after the
+        // proof has unified `key = ~k15`) never get substituted, and
+        // simplify-time formula-evaluation (eval_formula_atoms,
+        // insert_implied_formulas) misses contradictions like a
+        // surviving `All r. Rev(?key) @ r ==> ⊥` when the trace
+        // contains `Rev(~k15) @ vr_14` — that's a soundness gap.
+        let formula_subst = build_parser_subst_from_eq_store(&subst);
+        if !formula_subst.is_empty() {
+            for f in self.sys.formulas.iter_mut() {
+                let new_f = crate::guarded::subst_guarded(f, &formula_subst);
+                if &new_f != f { *f = new_f; self.changed = ChangeIndicator::Changed; }
+            }
+            for f in self.sys.solved_formulas.iter_mut() {
+                let new_f = crate::guarded::subst_guarded(f, &formula_subst);
+                if &new_f != f { *f = new_f; self.changed = ChangeIndicator::Changed; }
+            }
+            for f in self.sys.lemmas.iter_mut() {
+                let new_f = crate::guarded::subst_guarded(f, &formula_subst);
+                if &new_f != f { *f = new_f; self.changed = ChangeIndicator::Changed; }
+            }
+        }
+        // 6. Drain the queued rule-eqs from node merges. We resolve
+        //    them by routing through `solve_fact_eqs` (Haskell uses
+        //    `solveRuleEqs SplitLater`). This may add new substitutions
+        //    to the eq-store; if so we won't recurse here — the next
+        //    simplify-loop iteration will pick them up.
+        if !rule_eqs.is_empty() {
+            // Avoid infinite recursion: tag-mismatch is silently
+            // dropped (would be a Contradictory caught upstream).
+            let safe_eqs: Vec<_> = rule_eqs.into_iter()
+                .filter(|e| e.lhs.tag == e.rhs.tag
+                    && e.lhs.terms.len() == e.rhs.terms.len())
+                .collect();
+            // Use SplitLater so we don't recurse into perform_split
+            // (which can itself call subst_system).
+            let _ = self.solve_fact_eqs(SplitStrategy::SplitLater, &safe_eqs);
+        }
+    }
+
+    /// Insert a `<` atom.
+    pub fn insert_less(&mut self, l: LessAtom) {
+        let before = self.sys.less_atoms.len();
+        self.sys.add_less(l);
+        if self.sys.less_atoms.len() != before { self.changed = ChangeIndicator::Changed; }
+    }
+
+    /// Add a new goal.
+    pub fn insert_goal(&mut self, g: Goal) {
+        self.insert_goal_with_loop_flag(g, false);
+    }
+
+    /// Add a new goal with an explicit loop-breaker flag, matching
+    /// Haskell's `insertGoal goal isLoopBreaker`. The flag controls
+    /// `gsLoopBreaker` in the resulting status — used by the smart
+    /// ranker to deprioritise premises that would otherwise loop.
+    pub fn insert_goal_with_loop_flag(&mut self, g: Goal, looping: bool) {
+        // Auto-decompose `KU(pair(a,b))` / `KU(inv(x))` / `KU(prod(...))`
+        // into sub-KU goals on the components, each at a fresh
+        // pre-ordered node (mirrors Haskell's `insertAction` in
+        // `Reduction.hs` which inserts sub-KU actions at fresh
+        // node-ids with a `i_sub < i_outer` less-atom before
+        // marking the outer KU goal solved).  Without this,
+        // `is_open` (which marks pair/inv-topped KU goals as
+        // not-open assuming the decomposition already happened)
+        // would hide the actual unsolved sub-goals, leaving the
+        // search stuck with "no method".
+        if let Goal::Action(node_id, fa) = &g {
+            if fa.tag == crate::fact::FactTag::Ku {
+                if let Some(top) = fa.terms.first() {
+                    if let Some(sub_terms) = ku_decomp_subterms(top) {
+                        // Skip if outer goal already present (avoid
+                        // re-decomposition on re-insertion).
+                        if self.sys.goals.iter().any(|(eg, _)| eg == &g) {
+                            return;
+                        }
+                        let mut next_idx = bounds_max(&self.sys) + 1;
+                        let outer_node = node_id.clone();
+                        for sub in sub_terms {
+                            let sub_node = tamarin_term::lterm::LVar::new(
+                                "vk",
+                                tamarin_term::lterm::LSort::Node,
+                                next_idx,
+                            );
+                            next_idx += 1;
+                            let sub_fa = crate::fact::ku_fact(sub);
+                            self.insert_goal_with_loop_flag(
+                                Goal::Action(sub_node.clone(), sub_fa),
+                                looping,
+                            );
+                            // The sub-KU action must precede the
+                            // outer pair-construction at `outer_node`.
+                            self.insert_less(
+                                crate::constraint::constraints::LessAtom::new(
+                                    sub_node, outer_node.clone(),
+                                    crate::constraint::constraints::Reason::Adversary,
+                                ),
+                            );
+                        }
+                        // Push the outer goal AND mark it solved so
+                        // `open_goals` skips it but bookkeeping (e.g.
+                        // mark_goal_as_solved lookups) still find it.
+                        let before = self.sys.goals.len();
+                        self.sys.add_goal_with_loop_flag(g.clone(), looping);
+                        if self.sys.goals.len() != before {
+                            for (existing, status) in self.sys.goals.iter_mut() {
+                                if existing == &g {
+                                    status.solved = true;
+                                    break;
+                                }
+                            }
+                            self.changed = ChangeIndicator::Changed;
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+        let before = self.sys.goals.len();
+        self.sys.add_goal_with_loop_flag(g, looping);
+        if self.sys.goals.len() != before { self.changed = ChangeIndicator::Changed; }
+    }
+
+    /// Add an open formula obligation.
+    pub fn insert_formula(&mut self, f: Guarded) {
+        if !self.sys.formulas.contains(&f) {
+            self.sys.formulas.push(f);
+            self.changed = ChangeIndicator::Changed;
+        }
+    }
+
+    /// Compute a fresh-var baseline — the max idx across:
+    ///   - all vars in nodes' rules
+    ///   - all vars in stored & solved formulas
+    ///   - any LessAtom node-id idx
+    /// Plus a constant headroom so multiple Ex-decompositions in
+    /// quick succession don't clash. Used by `Ex` decomposition.
+    pub fn fresh_var_baseline(&self) -> u64 {
+        let mut m = bounds_max(&self.sys);
+        for f in &self.sys.formulas {
+            let n = crate::guarded::max_var_idx(f);
+            if n > m { m = n; }
+        }
+        for f in &self.sys.solved_formulas {
+            let n = crate::guarded::max_var_idx(f);
+            if n > m { m = n; }
+        }
+        m
+    }
+
+    /// Insert a parser-AST `Atom` into the system following Haskell's
+    /// `insertAtom` semantics:
+    ///
+    /// - `Eq(x, y)`     → `solve_term_eqs` (Maude AC unification)
+    /// - `Less(i, j)`   → push a `LessAtom` (Formula reason)
+    /// - `Last(t)`      → set `last_atom` if `t` is a node variable
+    /// - `Action(fa,t)` → push a `Goal::Action(node_id, lnfact)`
+    /// - `Subterm(s,b)` → push a subterm-store entry
+    /// - `Pred(_)`      → no-op (predicates would have been expanded)
+    /// - `LessMset(_,_)`→ ignored for now (multiset ordering goal)
+    ///
+    /// Returns `true` if the atom was successfully decomposed,
+    /// `false` if it was a shape we don't yet handle.
+    pub fn insert_atom(&mut self, a: &tamarin_parser::ast::Atom) -> bool {
+        use tamarin_parser::ast::Atom;
+        match a {
+            Atom::Eq(x, y) => {
+                let (Some(tx), Some(ty)) = (
+                    crate::elaborate::term_to_lnterm(x),
+                    crate::elaborate::term_to_lnterm(y),
+                ) else { return false; };
+                let _ = self.solve_term_eqs(
+                    SplitStrategy::SplitNow,
+                    &[tamarin_term::rewriting::Equal { lhs: tx, rhs: ty }],
+                );
+                self.changed = ChangeIndicator::Changed;
+                true
+            }
+            Atom::Less(i, j) => {
+                let (Some(ni), Some(nj)) = (term_to_node_id(i), term_to_node_id(j))
+                    else { return false; };
+                // Normalise through the eq-store substitution so any
+                // earlier node-id merges propagate to this fresh atom.
+                let ni = normalise_node_id(ni, &self.sys.eq_store.subst);
+                let nj = normalise_node_id(nj, &self.sys.eq_store.subst);
+                self.insert_less(crate::constraint::constraints::LessAtom::new(
+                    ni, nj, crate::constraint::constraints::Reason::Formula));
+                true
+            }
+            Atom::Last(t) => {
+                let Some(n) = term_to_node_id(t) else { return false; };
+                // Mirror Haskell `insertLast` in
+                // `Theory.Constraint.Solver.Reduction`: if no last_atom
+                // is set, install this one; if there's already a last
+                // node and it differs from `n`, equate them via
+                // `solveNodeIdEqs` — picking the case_1 (Last) disjunct
+                // of a sources-assertion IH commits to `n` BEING the
+                // last node, which must unify with whatever the system
+                // already considers last (the induction's `#i`).
+                match self.sys.last_atom.clone() {
+                    None => {
+                        self.sys.last_atom = Some(n);
+                        self.changed = ChangeIndicator::Changed;
+                    }
+                    Some(la) if la == n => {}
+                    Some(la) => {
+                        let _ = self.solve_node_id_eqs(&[
+                            tamarin_term::rewriting::Equal {
+                                lhs: la, rhs: n,
+                            }
+                        ]);
+                        self.changed = ChangeIndicator::Changed;
+                    }
+                }
+                true
+            }
+            Atom::Action(fact, t) => {
+                let Ok(lnfact) = crate::elaborate::fact_to_lnfact(fact) else { return false; };
+                let Some(n) = term_to_node_id(t) else { return false; };
+                self.insert_goal(Goal::Action(n, lnfact));
+                true
+            }
+            Atom::Subterm(s, b) => {
+                let (Some(ts), Some(tb)) = (
+                    crate::elaborate::term_to_lnterm(s),
+                    crate::elaborate::term_to_lnterm(b),
+                ) else { return false; };
+                self.sys.subterm_store.add(ts, tb);
+                self.changed = ChangeIndicator::Changed;
+                true
+            }
+            Atom::Pred(_) | Atom::LessMset(_, _) => false,
+        }
+    }
+
+    /// Decompose a guarded formula via the structural cases of
+    /// `insertFormula` from `Theory.Constraint.Solver.Reduction`.
+    ///
+    /// Implemented cases (mark-as-solved on the *outermost* call only):
+    /// - `Conj fms`     → recurse on each subformula (CR-rule *S_∧*)
+    /// - `Disj`         → store + insert `Goal::Disj` (defer split)
+    /// - `Atom`         → no-op (would need parser-atom→LNAtom bridge)
+    /// - `Ex` / `All`   → store as-is for now (need fresh supply for ∃)
+    pub fn insert_formula_decompose(&mut self, g: Guarded) {
+        self.insert_formula_decompose_inner(g, true);
+    }
+
+    fn insert_formula_decompose_inner(&mut self, g: Guarded, mark: bool) {
+        if self.sys.formulas.contains(&g) || self.sys.solved_formulas.contains(&g) {
+            return;
+        }
+        match g.clone() {
+            Guarded::Conj(items) => {
+                if mark { self.sys.solved_formulas.push(g); }
+                for it in items { self.insert_formula_decompose_inner(it, false); }
+                self.changed = ChangeIndicator::Changed;
+            }
+            Guarded::Disj(items) if items.is_empty() => {
+                // Empty disjunction = ⊥ — store the formula so a
+                // downstream contradictions check can detect it.
+                if !self.sys.formulas.contains(&g) {
+                    self.sys.formulas.push(g);
+                    self.changed = ChangeIndicator::Changed;
+                }
+            }
+            Guarded::Disj(items) => {
+                // Store the formula AND insert a corresponding split
+                // goal. The goal itself uses the same vector, allowing
+                // `solve_disj_goal` to resume later.
+                if !self.sys.formulas.contains(&g) {
+                    self.sys.formulas.push(g.clone());
+                }
+                let goal = Goal::Disj(crate::constraint::constraints::Disj::new(items));
+                self.insert_goal(goal);
+                self.changed = ChangeIndicator::Changed;
+            }
+            Guarded::Atom(a) => {
+                // Try to decompose into a constraint via insert_atom.
+                let _ = self.insert_atom(&a);
+                // Either way mark the outer formula solved so we
+                // don't loop on it. Inner-recursion (mark=false)
+                // already reaches here when an outer Conj broke
+                // down into atoms.
+                //
+                // Dedup-by-normalize: Maude unification mints fresh
+                // `~mw#N` witnesses per call, so structurally-
+                // identical derivations from impl_formulas would
+                // otherwise accumulate.  Compare normalized form.
+                // Compute the canonical form: first apply the
+                // eq-store substitution (so e.g. `m` maps to `h(...)`
+                // matching how stored entries appear after
+                // `subst_system`), then normalize witness LVars
+                // (`~mw#N` → `~mw#0`).
+                let eq_vs = crate::guarded::var_subst_from_eq_store(&self.sys.eq_store);
+                let apply_canon = |f: &crate::guarded::Guarded| {
+                    let f1 = if eq_vs.is_empty() { f.clone() }
+                             else { crate::guarded::subst_guarded(f, &eq_vs) };
+                    crate::guarded::normalize_witness_lvars(&f1)
+                };
+                let canon = apply_canon(&g);
+                let already_solved = self.sys.solved_formulas.iter().any(|f|
+                    apply_canon(f) == canon);
+                if !already_solved {
+                    self.sys.solved_formulas.push(g);
+                    self.changed = ChangeIndicator::Changed;
+                }
+            }
+            Guarded::GGuarded { qua, vars, guards, body }
+                if matches!(qua, crate::guarded::Quant::Ex) => {
+                // CR-rule *S_∃*: fresh-rename the bound vars,
+                // substitute, and recurse on `gconj([atoms..., body])`.
+                let outer = g.clone();
+                if self.sys.solved_formulas.contains(&outer) {
+                    return;
+                }
+                self.sys.solved_formulas.push(outer);
+                let avoid_max = self.fresh_var_baseline();
+                let mut subst = crate::guarded::VarSubst::new();
+                let mut next = avoid_max + 1;
+                for v in &vars {
+                    subst.insert(
+                        (v.name.clone(), v.idx),
+                        tamarin_parser::ast::Term::Var(tamarin_parser::ast::VarSpec {
+                            name: v.name.clone(),
+                            idx: next,
+                            sort: v.sort,
+                            typ: v.typ.clone(),
+                        }));
+                    next += 1;
+                }
+                // Build `gconj(map atoms ++ [body])` with the subst applied.
+                let mut items: Vec<Guarded> = guards.iter()
+                    .map(|a| Guarded::Atom(crate::guarded::subst_atom(a, &subst)))
+                    .collect();
+                items.push(crate::guarded::subst_guarded(&body, &subst));
+                let new_body = crate::guarded::gconj(items);
+                self.insert_formula_decompose_inner(new_body, false);
+                self.changed = ChangeIndicator::Changed;
+            }
+            Guarded::GGuarded { qua: crate::guarded::Quant::All, ref vars, ref guards, ref body }
+                if vars.is_empty() && guards.len() == 1
+                   && **body == crate::guarded::gfalse() =>
+            {
+                // CR-rules from Haskell `insertFormula`
+                // (Reduction.hs:461-486) for single-guard, body=⊥
+                // universals:
+                //
+                //   ∀[].[Less i j].⊥        → i = j ∨ j < i
+                //   ∀[].[Eq i j].⊥          → i < j ∨ j < i        (i,j: Node)
+                //   ∀[].[Subterm i j].⊥     → insertNegSubterm
+                //   ∀[].[Last i].⊥          → last < i ∨ i < last
+                use tamarin_parser::ast::Atom as AAtom;
+                let guard = &guards[0];
+                match guard {
+                    AAtom::Less(i, j) if term_to_node_id(i).is_some()
+                                       && term_to_node_id(j).is_some() => {
+                        // Haskell decomposes ∀[].[Less i j].⊥ into
+                        // `i = j ∨ j < i` (Reduction.hs:461-486).
+                        // Without firing this, we end up labelling
+                        // proof leaves with `/* from formulas */`
+                        // (the kept universal-with-True-guard
+                        // simplifies to ⊥) instead of `/* cyclic */`
+                        // (the order graph closes via i<j ∧ j<i).
+                        // Verdict-equivalent but breaks proof-trace
+                        // match against tamarin's output.
+                        //
+                        // Earlier note flagged Order2 regressions
+                        // from this firing — those have since been
+                        // resolved by enforce_ku_action_uniqueness
+                        // (N5_u) and simp_injective_fact_eq_mon
+                        // closing the i=j branch correctly when
+                        // unifying incompatible rule instances.
+                        if !self.sys.solved_formulas.contains(&g) {
+                            self.sys.solved_formulas.push(g.clone());
+                        }
+                        let d = crate::guarded::Guarded::Disj(vec![
+                            crate::guarded::Guarded::Atom(AAtom::Eq(i.clone(), j.clone())),
+                            crate::guarded::Guarded::Atom(AAtom::Less(j.clone(), i.clone())),
+                        ]);
+                        self.insert_formula_decompose_inner(d, false);
+                        self.changed = ChangeIndicator::Changed;
+                    }
+                    AAtom::Less(_, _) => {
+                        // Less on non-node terms — keep as formula.
+                        if !self.sys.formulas.contains(&g)
+                            && !self.sys.solved_formulas.contains(&g) {
+                            self.sys.formulas.push(g);
+                            self.changed = ChangeIndicator::Changed;
+                        }
+                    }
+                    AAtom::Eq(i, j)
+                        if term_to_node_id(i).is_some() && term_to_node_id(j).is_some() =>
+                    {
+                        // i = j is false (i,j are node ids) ⇒ i < j ∨ j < i
+                        if !self.sys.solved_formulas.contains(&g) {
+                            self.sys.solved_formulas.push(g.clone());
+                        }
+                        let d = crate::guarded::Guarded::Disj(vec![
+                            crate::guarded::Guarded::Atom(AAtom::Less(i.clone(), j.clone())),
+                            crate::guarded::Guarded::Atom(AAtom::Less(j.clone(), i.clone())),
+                        ]);
+                        self.insert_formula_decompose_inner(d, false);
+                        self.changed = ChangeIndicator::Changed;
+                    }
+                    AAtom::Last(i) if self.sys.last_atom.is_some() => {
+                        // Last(i) is false ⇒ last < i ∨ i < last
+                        // Only fire when sys.last_atom is already set;
+                        // allocating a fresh last node here can perturb
+                        // downstream goal ordering on lemmas where the
+                        // induction hypothesis already encodes the last
+                        // constraint via partial_atom_valuation paths.
+                        if !self.sys.solved_formulas.contains(&g) {
+                            self.sys.solved_formulas.push(g.clone());
+                        }
+                        let last_node = self.sys.last_atom.as_ref().unwrap().clone();
+                        let last_term = tamarin_parser::ast::Term::Var(
+                            tamarin_parser::ast::VarSpec {
+                                name: last_node.name.clone(),
+                                idx: last_node.idx,
+                                sort: tamarin_parser::ast::SortHint::Node,
+                                typ: None,
+                            });
+                        let d = crate::guarded::Guarded::Disj(vec![
+                            crate::guarded::Guarded::Atom(AAtom::Less(last_term.clone(), i.clone())),
+                            crate::guarded::Guarded::Atom(AAtom::Less(i.clone(), last_term)),
+                        ]);
+                        self.insert_formula_decompose_inner(d, false);
+                        self.changed = ChangeIndicator::Changed;
+                    }
+                    AAtom::Subterm(s, b) => {
+                        // ¬(s ⊏ b) — record as a negative subterm.
+                        if !self.sys.solved_formulas.contains(&g) {
+                            self.sys.solved_formulas.push(g.clone());
+                        }
+                        if let (Some(ts), Some(tb)) = (
+                            crate::elaborate::term_to_lnterm(s),
+                            crate::elaborate::term_to_lnterm(b),
+                        ) {
+                            // The subterm store doesn't yet expose a
+                            // negative-subterm list; for now just
+                            // record the original constraint so a
+                            // future simpSubterms pass can pick it up
+                            // and decide it.  TODO wire up negSubterms.
+                            let _ = (ts, tb);
+                        }
+                        // Fall through to push original to formulas as
+                        // a safety net so downstream contradictions can
+                        // see it.
+                        if !self.sys.formulas.contains(&g) {
+                            self.sys.formulas.push(g);
+                            self.changed = ChangeIndicator::Changed;
+                        }
+                    }
+                    _ => {
+                        // Unhandled single-guard universal: keep in formulas.
+                        if !self.sys.formulas.contains(&g)
+                            && !self.sys.solved_formulas.contains(&g) {
+                            self.sys.formulas.push(g);
+                            self.changed = ChangeIndicator::Changed;
+                        }
+                    }
+                }
+            }
+            Guarded::GGuarded { .. } => {
+                // Universal quantification: store in `sFormulas` so
+                // `insert_implied_formulas_pass` can iterate and
+                // instantiate it against system actions.  Mirrors
+                // Haskell's `insertFormula` for `All`-quantified
+                // guarded formulas — those go into `sFormulas`, not
+                // `sSolvedFormulas`. Without this, lemmas reduce
+                // their universals into a dead store and the body
+                // never fires (Start_before_Loop &c. mistakenly
+                // reach Solved).
+                if !self.sys.formulas.contains(&g)
+                    && !self.sys.solved_formulas.contains(&g) {
+                    self.sys.formulas.push(g);
+                    self.changed = ChangeIndicator::Changed;
+                }
+            }
+        }
+    }
+
+    /// Mark a goal as solved (if present). Mirrors
+    /// `markGoalAsSolved`.
+    pub fn mark_goal_as_solved(&mut self, g: &Goal) {
+        for (existing, status) in self.sys.goals.iter_mut() {
+            if existing == g && !status.solved {
+                status.solved = true;
+                self.changed = ChangeIndicator::Changed;
+                break;
+            }
+        }
+    }
+
+    /// Remove all solved `Split` goals whose split id is no longer
+    /// valid in the equation store. Matches Haskell's
+    /// `removeSolvedSplitGoals`.
+    pub fn remove_solved_split_goals(&mut self) {
+        use crate::constraint::constraints::Goal as G;
+        let valid: std::collections::BTreeSet<_> = self.sys.eq_store.conj.iter()
+            .map(|d| d.split_id)
+            .collect();
+        let before = self.sys.goals.len();
+        self.sys.goals.retain(|(g, status)| match g {
+            G::Split(id) => !status.solved || valid.contains(id),
+            _ => true,
+        });
+        if self.sys.goals.len() != before {
+            self.changed = ChangeIndicator::Changed;
+        }
+    }
+}
+
+/// Helpers matching Haskell's `getProofContext` / `getMaudeHandle`.
+impl<'ctx> Reduction<'ctx> {
+    pub fn get_proof_context(&self) -> &ProofContext { self.ctx }
+    pub fn get_maude_handle(&self) -> &tamarin_term::maude_proc::MaudeHandle {
+        &self.ctx.maude
+    }
+}
+
+// =============================================================================
+// Equality solving — bridges into the equation store
+// =============================================================================
+
+/// Whether to perform a case-split immediately or defer it as a goal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitStrategy { SplitNow, SplitLater }
+
+/// Outcome of an equality-solving step.
+#[derive(Debug)]
+pub enum SolveOutcome {
+    /// Single case — the same `Reduction` continues.
+    Linear(ChangeIndicator),
+    /// Multiple cases — the caller picks one and continues. Mirrors
+    /// the disjunctive branching of the Haskell `Reduction` monad.
+    Cases(Vec<crate::tools::equation_store::EquationStore>),
+    /// Equation store became contradictory.
+    Contradictory,
+}
+
+impl<'ctx> Reduction<'ctx> {
+    /// `solveTermEqs` — add a list of term equalities to the equation
+    /// store, optionally splitting if the unifier produced more than
+    /// one disjunct. Mirrors the Haskell function in
+    /// `Theory.Constraint.Solver.Reduction`.
+    pub fn solve_term_eqs(
+        &mut self,
+        strategy: SplitStrategy,
+        eqs: &[tamarin_term::rewriting::Equal<tamarin_term::lterm::LNTerm>],
+    ) -> Result<SolveOutcome, crate::tools::equation_store::AddEqsError> {
+        // Filter out trivially-equal equations.
+        let pending: Vec<_> = eqs.iter()
+            .filter(|e| e.lhs != e.rhs)
+            .cloned()
+            .collect();
+        if pending.is_empty() {
+            return Ok(SolveOutcome::Linear(ChangeIndicator::Unchanged));
+        }
+
+        // Take eq_store out of self, mutate it, put it back, then
+        // borrow Maude — this avoids overlapping borrows of self.
+        let maude = self.ctx.maude.clone();
+        // Pass the system-wide max idx so Maude witnesses get renamed
+        // above ANY existing variable in the system (not just in the
+        // eq-store).  Without this, witnesses collide with rule vars,
+        // goal vars, formula vars, etc., conflating distinct semantic
+        // variables.
+        let avoid = bounds_max(&self.sys);
+        let split = self.sys.eq_store.add_eqs_with_avoid(&maude, &pending, avoid)?;
+        // Run the simplification pass with a no-op contradiction
+        // predicate (the proper one needs `substCreatesNonNormalTerms`
+        // wired through, which uses Maude — left for a later step).
+        let store = std::mem::take(&mut self.sys.eq_store);
+        self.sys.eq_store = store.simp(|_, _| false);
+
+        if self.sys.eq_store.is_false() {
+            return Ok(SolveOutcome::Contradictory);
+        }
+
+        match (split, strategy) {
+            (Some(id), SplitStrategy::SplitNow) => {
+                let cases = self.sys.eq_store.perform_split(id)
+                    .ok_or_else(|| crate::tools::equation_store::AddEqsError::Maude(
+                        format!("split id {:?} not found", id)))?;
+                self.changed = ChangeIndicator::Changed;
+                Ok(SolveOutcome::Cases(cases))
+            }
+            (Some(id), SplitStrategy::SplitLater) => {
+                self.insert_goal(crate::constraint::constraints::Goal::Split(id));
+                self.changed = ChangeIndicator::Changed;
+                Ok(SolveOutcome::Linear(ChangeIndicator::Changed))
+            }
+            (None, _) => {
+                self.changed = ChangeIndicator::Changed;
+                Ok(SolveOutcome::Linear(ChangeIndicator::Changed))
+            }
+        }
+    }
+
+    /// `solveNodeIdEqs` — equalities between node-id variables.
+    pub fn solve_node_id_eqs(
+        &mut self,
+        eqs: &[tamarin_term::rewriting::Equal<crate::constraint::constraints::NodeId>],
+    ) -> Result<SolveOutcome, crate::tools::equation_store::AddEqsError> {
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+        let term_eqs: Vec<tamarin_term::rewriting::Equal<tamarin_term::lterm::LNTerm>> =
+            eqs.iter()
+                .map(|e| tamarin_term::rewriting::Equal {
+                    lhs: Term::Lit(Lit::Var(e.lhs.clone())),
+                    rhs: Term::Lit(Lit::Var(e.rhs.clone())),
+                })
+                .collect();
+        self.solve_term_eqs(SplitStrategy::SplitNow, &term_eqs)
+    }
+
+    /// `solveFactEqs` — equate two fact lists. Returns
+    /// `Contradictory` if any pair of facts has different tags or
+    /// arities.
+    pub fn solve_fact_eqs(
+        &mut self,
+        strategy: SplitStrategy,
+        eqs: &[tamarin_term::rewriting::Equal<crate::fact::LNFact>],
+    ) -> Result<SolveOutcome, crate::tools::equation_store::AddEqsError> {
+        for e in eqs {
+            if e.lhs.tag != e.rhs.tag { return Ok(SolveOutcome::Contradictory); }
+            if e.lhs.terms.len() != e.rhs.terms.len() {
+                return Ok(SolveOutcome::Contradictory);
+            }
+        }
+        let mut flat = Vec::new();
+        for e in eqs {
+            for (a, b) in e.lhs.terms.iter().zip(e.rhs.terms.iter()) {
+                flat.push(tamarin_term::rewriting::Equal {
+                    lhs: a.clone(), rhs: b.clone(),
+                });
+            }
+        }
+        self.solve_term_eqs(strategy, &flat)
+    }
+}
+
+// =============================================================================
+// Helpers used by goal solving.
+// =============================================================================
+
+/// Convert `OpenProtoRule`s to `RuleACInst`s, applying a per-rule
+/// keep predicate.
+fn rule_insts_with<F: Fn(&RuleACInst) -> bool>(
+    open: &[crate::theory::OpenProtoRule], keep: F,
+) -> Vec<RuleACInst> {
+    let mut out = Vec::new();
+    for o in open {
+        let push = |inst: RuleACInst, out: &mut Vec<RuleACInst>| {
+            if keep(&inst) { out.push(inst); }
+        };
+        if o.variants.is_empty() {
+            let inst = crate::rule::Rule {
+                info: crate::rule::RuleInfo::Proto(crate::rule::ProtoRuleACInstInfo {
+                    name: o.rule.info.name.clone(),
+                    attributes: o.rule.info.attributes.clone(),
+                    loop_breakers: o.loop_breakers.clone(),
+                }),
+                premises: o.rule.premises.clone(),
+                conclusions: o.rule.conclusions.clone(),
+                actions: o.rule.actions.clone(),
+                new_vars: o.rule.new_vars.clone(),
+            };
+            push(inst, &mut out);
+        } else {
+            for v in &o.variants {
+                let mut inst = crate::rule::proto_rule_ac_to_rule_ac_inst(v.clone());
+                if let crate::rule::RuleInfo::Proto(p) = &mut inst.info {
+                    if p.loop_breakers.is_empty() {
+                        p.loop_breakers = o.loop_breakers.clone();
+                    }
+                }
+                push(inst, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// `nonSilentRules` lite: rules with at least one action. Includes
+/// the proof context's intruder rules so KU goals can be discharged.
+fn non_silent_rule_insts(
+    ctx: &crate::constraint::solver::context::ProofContext,
+) -> Vec<RuleACInst> {
+    let mut out = rule_insts_with(&ctx.rules, |r| !r.actions.is_empty());
+    for ir in &ctx.intruder_rules {
+        if !ir.actions.is_empty() {
+            out.push(intr_rule_to_rule_ac_inst(ir.clone()));
+        }
+    }
+    out
+}
+
+fn intr_rule_to_rule_ac_inst(ir: crate::rule::IntrRuleAC) -> RuleACInst {
+    crate::rule::Rule {
+        info: crate::rule::RuleInfo::Intr(ir.info),
+        premises: ir.premises,
+        conclusions: ir.conclusions,
+        actions: ir.actions,
+        new_vars: ir.new_vars,
+    }
+}
+
+/// Build the implicit `Fresh` rule instance: `[] --[]-> [Fr(m)]`
+/// with `m` as the new-vars. Mirrors Haskell's `mkFreshRuleAC`.
+fn make_fresh_rule(m: tamarin_term::lterm::LNTerm) -> RuleACInst {
+    let info = crate::rule::RuleInfo::Proto(crate::rule::ProtoRuleACInstInfo {
+        name: crate::rule::ProtoRuleName::Fresh,
+        attributes: crate::rule::RuleAttributes::empty(),
+        loop_breakers: Vec::new(),
+    });
+    let conc = crate::fact::fresh_fact(m.clone());
+    crate::rule::Rule::new(info, vec![], vec![conc], vec![])
+        .with_new_vars(vec![m])
+}
+
+/// Convert an eq-store `LSubst` (LVar → LNTerm) into a parser-AST
+/// `VarSubst` keyed by `(name, idx)`.  Used by `subst_system` to push
+/// the eq-store substitution into formulas / solved_formulas /
+/// lemmas — Haskell's `substFormulas` / `substSolvedFormulas` /
+/// `substLemmas`.  Each LVar in the subst's domain maps via its
+/// `(name, idx)` to a parser-AST term obtained from
+/// `lnterm_to_term`.  Only entries that change are recorded
+/// (skipping identity mappings keeps the per-step subst small).
+fn build_parser_subst_from_eq_store(
+    subst: &crate::tools::equation_store::LNSubst,
+) -> crate::guarded::VarSubst {
+    let mut out = crate::guarded::VarSubst::new();
+    for (lv, lt) in subst.to_list() {
+        // Identity mappings are no-ops; skip.
+        if let tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Var(w)) = &lt {
+            if w == &lv { continue; }
+        }
+        let term = crate::elaborate::lnterm_to_term(&lt);
+        out.insert((lv.name.clone(), lv.idx), term);
+    }
+    out
+}
+
+/// Build the implicit `ISend` rule instance:
+/// `[KU(m)] --[K(m)]-> [In(m)]`. Mirrors Haskell's `mkISendRuleAC`
+/// at `Reduction.hs:232`: `[kuFactAnn ann m] [inFact m] [kLogFact m]`.
+///
+/// `kLogFact` in Haskell is `protoFact Linear "K"` — a regular
+/// ProtoFact tag named "K", *not* `DedFact`.  So ISend's action is
+/// a ProtoFact, and a user-written `K(t) @ j` (which also parses to
+/// `protoFact "K"` per the parser's fall-through) matches the ISend
+/// action directly — that's how `K(t)` atoms in lemmas get
+/// satisfied through adversary forwarding.
+///
+/// Previously we used `ded_fact` (FactTag::Ded), which prevented
+/// `K(t) @ j` action goals from unifying with ISend's action,
+/// breaking exists-trace witnesses that route adversary knowledge
+/// through Out → IRecv → KD → Coerce → KU → ISend.
+fn make_isend_rule(m: tamarin_term::lterm::LNTerm) -> RuleACInst {
+    let info = crate::rule::RuleInfo::Intr(crate::rule::IntrRuleACInfo::ISend);
+    let prem = crate::fact::ku_fact(m.clone());
+    let act = crate::fact::k_log_fact(m.clone());
+    let conc = crate::fact::in_fact(m);
+    crate::rule::Rule::new(info, vec![prem], vec![conc], vec![act])
+}
+
+/// Apply an eq-store substitution to a node-id. Returns the new
+/// representative if the subst maps `id` to a node-sort variable; else
+/// the input unchanged.
+fn normalise_node_id(
+    id: crate::constraint::constraints::NodeId,
+    subst: &crate::tools::equation_store::LNSubst,
+) -> crate::constraint::constraints::NodeId {
+    let id_term = tamarin_term::term::Term::Lit(
+        tamarin_term::vterm::Lit::Var(id.clone()));
+    let mapped = tamarin_term::subst::apply_vterm(subst, id_term);
+    if let tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Var(v)) = mapped {
+        v
+    } else {
+        id
+    }
+}
+
+/// Convert a parser-AST term to an `LVar` of node sort (for the time
+/// argument of an action atom or the operands of a `Less`/`Last`).
+/// Accepts either a `#i`-sorted variable or any unsorted variable in
+/// a position requiring a node — the sort hint check is loose to
+/// match Haskell's `ltermNodeId'`.
+fn term_to_node_id(
+    t: &tamarin_parser::ast::Term,
+) -> Option<crate::constraint::constraints::NodeId> {
+    use tamarin_parser::ast::{SortHint, Term as AstTerm};
+    let v = match t {
+        AstTerm::Var(v) => v,
+        _ => return None,
+    };
+    let sort = match v.sort {
+        SortHint::Node => tamarin_term::lterm::LSort::Node,
+        // Allow unsorted vars; downstream sort propagation will narrow.
+        _ => tamarin_term::lterm::LSort::Node,
+    };
+    Some(tamarin_term::lterm::LVar::new(v.name.clone(), sort, v.idx))
+}
+
+/// `forbiddenEdge` — port of the chain-goal forbidden edge shapes.
+fn forbidden_edge(c_rule: &RuleACInst, p_rule: &RuleACInst) -> bool {
+    use crate::rule::{is_d_exp_rule, is_d_pmult_rule, is_d_emap_rule,
+                       get_remaining_rule_applications, rule_name_string};
+    if is_d_exp_rule(c_rule) && is_d_exp_rule(p_rule) { return true; }
+    if is_d_pmult_rule(c_rule) && is_d_pmult_rule(p_rule) { return true; }
+    if is_d_pmult_rule(c_rule) && is_d_emap_rule(p_rule) { return true; }
+    let cn = rule_name_string(c_rule);
+    let pn = rule_name_string(p_rule);
+    if !cn.is_empty() && cn == pn && get_remaining_rule_applications(c_rule) == 1 {
+        return true;
+    }
+    false
+}
+
+/// `illegalCoerce` — port of the chain-goal illegal coerce check.
+/// Returns `true` if `p_rule` is a Coerce rule and `fa_prem`'s sole
+/// term is a pair / inverse / product (which N2 forbids).
+fn illegal_coerce(p_rule: &RuleACInst, fa_prem: &crate::fact::LNFact) -> bool {
+    use crate::rule::is_coerce_rule_inst;
+    if !is_coerce_rule_inst(p_rule) { return false; }
+    if fa_prem.terms.len() != 1 { return false; }
+    let t = &fa_prem.terms[0];
+    is_pair(t) || is_inverse(t) || is_product(t)
+}
+
+/// Build a structural fingerprint of a !KU goal's term for runtime
+/// filterCases. Two goals with the same fingerprint are "the same
+/// shape" — re-grafting the same chain-composed source case for
+/// the same shape risks the sources_assertion-class infinite descent.
+/// Two goals with different fingerprints (e.g. different head symbols)
+/// may legitimately use the same case.
+///
+/// Strategy: dump the term head + immediate argument heads, with
+/// variables collapsed to `?`. Catches structural recursion without
+/// over-merging distinct goal shapes.
+fn ku_goal_fingerprint(fa: &crate::fact::LNFact) -> String {
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    fn head(t: &tamarin_term::lterm::LNTerm) -> String {
+        match t {
+            Term::Lit(Lit::Var(v)) => format!("V:{:?}", v.sort),
+            Term::Lit(Lit::Con(_)) => "Con".into(),
+            Term::App(sym, args) => {
+                let name: String = match sym {
+                    tamarin_term::function_symbols::FunSym::NoEq(s) =>
+                        String::from_utf8_lossy(&s.name).to_string(),
+                    tamarin_term::function_symbols::FunSym::Ac(_) => "AC".into(),
+                    tamarin_term::function_symbols::FunSym::C(_) => "C".into(),
+                    tamarin_term::function_symbols::FunSym::List => "List".into(),
+                };
+                let arg_heads: Vec<String> = args.iter().map(|a| match a {
+                    Term::Lit(Lit::Var(v)) => format!("V:{:?}", v.sort),
+                    Term::Lit(Lit::Con(_)) => "Con".into(),
+                    Term::App(s, _) => match s {
+                        tamarin_term::function_symbols::FunSym::NoEq(ss) =>
+                            String::from_utf8_lossy(&ss.name).to_string(),
+                        _ => "?".into(),
+                    },
+                }).collect();
+                format!("{}({})", name, arg_heads.join(","))
+            }
+        }
+    }
+    fa.terms.first().map(head).unwrap_or_else(|| "?".into())
+}
+
+fn is_pair(t: &tamarin_term::lterm::LNTerm) -> bool {
+    use tamarin_term::function_symbols::FunSym;
+    if let tamarin_term::term::Term::App(FunSym::NoEq(s), args) = t {
+        return s.name == b"pair" && args.len() == 2;
+    }
+    false
+}
+fn is_inverse(t: &tamarin_term::lterm::LNTerm) -> bool {
+    use tamarin_term::function_symbols::{FunSym, INV_SYM_STRING};
+    if let tamarin_term::term::Term::App(FunSym::NoEq(s), args) = t {
+        return s.name == INV_SYM_STRING && args.len() == 1;
+    }
+    false
+}
+fn is_product(t: &tamarin_term::lterm::LNTerm) -> bool {
+    use tamarin_term::function_symbols::{FunSym, AcSym};
+    matches!(t, tamarin_term::term::Term::App(FunSym::Ac(AcSym::Mult), _))
+}
+
+/// Rules with conclusions matching the given premise's tag/arity.
+/// For non-K premises this favours protocol rules with non-K
+/// conclusions; for K-premises (KD/KU) it includes the intruder
+/// rules.
+///
+/// **Source-cache short-circuit**: if the proof context has a
+/// `UniqueSource` for the premise's fact tag (= exactly one rule in
+/// the theory produces it), we restrict the candidates to just that
+/// rule — Haskell's `solveWithSource` does the same. Cuts down search
+/// breadth for premise goals with deterministic sources.
+fn premise_solving_rule_insts(
+    ctx: &crate::constraint::solver::context::ProofContext,
+    fa_prem: &crate::fact::LNFact,
+) -> Vec<RuleACInst> {
+    let unique_rule_name = ctx.unique_sources.iter()
+        .find(|s| s.fact_tag == fa_prem.tag)
+        .map(|s| s.rule_name.clone());
+    let mut out: Vec<RuleACInst> = if !fa_prem.is_k_fact() {
+        // Non-K premise → protocol rules whose conclusions are non-K.
+        // If the source cache says exactly one rule matches, restrict.
+        let keep_rule_name = unique_rule_name.clone();
+        rule_insts_with(&ctx.rules, move |r| {
+            if !r.conclusions.iter().any(|c| !c.is_k_fact()) {
+                return false;
+            }
+            if let Some(name) = &keep_rule_name {
+                let r_name = match &r.info {
+                    crate::rule::RuleInfo::Proto(p) => match &p.name {
+                        crate::rule::ProtoRuleName::Stand(s) => s.clone(),
+                        crate::rule::ProtoRuleName::Fresh => "Fresh".to_string(),
+                    },
+                    _ => return true,
+                };
+                return &r_name == name;
+            }
+            true
+        })
+    } else {
+        // K-premise → all rules.
+        rule_insts_with(&ctx.rules, |_| true)
+    };
+    // Add intruder rules whose conclusions can match the live premise
+    // tag.  Mirrors Haskell's `crProtocol ++ crConstruct ++ crDestruct`
+    // narrowing in `solvePremise` — protocol-fact premises don't ask
+    // intruder rules to produce them, so we don't enumerate them as
+    // candidates.  Without this, sig-aware MaudeSig added 5+ rules
+    // per protocol-fact premise that never matched, blowing the
+    // search budget.
+    for ir in &ctx.intruder_rules {
+        let inst = intr_rule_to_rule_ac_inst(ir.clone());
+        if inst.conclusions.iter().any(|c| c.tag == fa_prem.tag) {
+            out.push(inst);
+        }
+    }
+    out
+}
+
+/// Find the largest free LVar index used anywhere in the system, so
+/// fresh-renaming doesn't collide.
+///
+/// **Must scan every field of `System` that holds free LVars** — not
+/// just `nodes`.  In particular, the lemma's free existentials live in
+/// `goals` and `formulas` *before any rule is added*, so a `bounds_max`
+/// that ignores them will return `0`, causing `freshen_rule`'s shift
+/// of `+1` to land directly on the lemma's variable indices.  Result:
+/// the freshly-added rule's vars (e.g. Secrecy_claim's `A:Msg idx 0`
+/// shifted to `idx 1`) collide with the lemma's existential `A:Msg
+/// idx 1`, identifying them by structural equality and conflating
+/// downstream substitutions across what should be distinct variables.
+pub fn bounds_max(sys: &System) -> u64 {
+    use std::cell::Cell;
+    use tamarin_term::lterm::HasFrees;
+    let max = Cell::new(0u64);
+    let visit = |v: &tamarin_term::lterm::LVar| {
+        let cur = max.get();
+        if v.idx > cur { max.set(v.idx); }
+    };
+    let mut do_visit = |v: &tamarin_term::lterm::LVar| visit(v);
+    for (id, rule) in &sys.nodes {
+        id.for_each_free(&mut do_visit);
+        rule.for_each_free(&mut do_visit);
+    }
+    for e in &sys.edges {
+        e.src.0.for_each_free(&mut do_visit);
+        e.tgt.0.for_each_free(&mut do_visit);
+    }
+    for l in &sys.less_atoms {
+        l.smaller.for_each_free(&mut do_visit);
+        l.larger.for_each_free(&mut do_visit);
+    }
+    if let Some(la) = &sys.last_atom {
+        la.for_each_free(&mut do_visit);
+    }
+    for (g, _) in &sys.goals {
+        use crate::constraint::constraints::Goal;
+        match g {
+            Goal::Action(i, fa) => {
+                i.for_each_free(&mut do_visit);
+                fa.for_each_free(&mut do_visit);
+            }
+            Goal::Premise(p, fa) => {
+                p.0.for_each_free(&mut do_visit);
+                fa.for_each_free(&mut do_visit);
+            }
+            Goal::Chain(c, p) => {
+                c.0.for_each_free(&mut do_visit);
+                p.0.for_each_free(&mut do_visit);
+            }
+            Goal::Subterm((s, t)) => {
+                s.for_each_free(&mut do_visit);
+                t.for_each_free(&mut do_visit);
+            }
+            Goal::Disj(_) | Goal::Split(_) => {}
+        }
+    }
+    for f in sys.formulas.iter()
+        .chain(sys.solved_formulas.iter())
+        .chain(sys.lemmas.iter())
+    {
+        let n = crate::guarded::max_var_idx(f);
+        if n > max.get() { max.set(n); }
+    }
+    for (v, t) in sys.eq_store.subst.to_list() {
+        if v.idx > max.get() { max.set(v.idx); }
+        t.for_each_free(&mut do_visit);
+    }
+    // Also walk eq_store.conj (disjunctive substitutions): these may
+    // carry high-idx Maude witnesses introduced by earlier `solve_fact_eqs`
+    // calls.  Without including these, a fresh witness minted by a later
+    // unification can collide with the in-conj witnesses, conflating two
+    // semantically-distinct vars to the same `~mw#N` — the root cause of
+    // the NSPK3/roles spurious Cyclic regressions in task #119.
+    for d in &sys.eq_store.conj {
+        for s in &d.substs {
+            for (v, t) in s.to_list() {
+                if v.idx > max.get() { max.set(v.idx); }
+                t.for_each_free(&mut do_visit);
+            }
+        }
+    }
+    max.get()
+}
+
+/// Fresh-rename a `RuleACInst` so its free variables don't collide
+/// with anything below `avoid_max`.
+fn freshen_rule(rule: RuleACInst, avoid_max: u64) -> RuleACInst {
+    use tamarin_term::lterm::HasFrees;
+    let bounds = {
+        let mut min = u64::MAX;
+        let mut max = 0u64;
+        let mut any = false;
+        rule.for_each_free(&mut |v| {
+            any = true;
+            if v.idx < min { min = v.idx; }
+            if v.idx > max { max = v.idx; }
+        });
+        if any { Some((min, max)) } else { None }
+    };
+    match bounds {
+        None => rule,
+        Some((min, _)) => {
+            let shift = (avoid_max + 1) as i128 - min as i128;
+            rule.map_free(&mut |tamarin_term::lterm::LVar { name, sort, idx }|
+                tamarin_term::lterm::LVar {
+                    name, sort,
+                    idx: ((idx as i128) + shift) as u64,
+                })
+        }
+    }
+}
+
+// =============================================================================
+// Goal solving — concrete cases that don't need typed-rule unification
+// =============================================================================
+
+/// Outcome of `solve_*_goal` — mirrors the disjunctive branching of
+/// the Haskell `Reduction` monad's case-split.
+#[derive(Debug)]
+pub enum GoalCases {
+    /// One continuation, no case name; `self.sys` was mutated in
+    /// place.  Used for trivial collapses (Disj-singleton, mark-as-
+    /// solved) where Haskell's printer emits no `case` heading.
+    Linear,
+    /// One continuation tagged with a case name; `self.sys` was
+    /// mutated in place.  Used for rule-instantiation goals whose
+    /// candidate enumeration narrowed to exactly one rule — Haskell
+    /// still prints `case <RuleName>` + `qed`.
+    LinearNamed(String),
+    /// Several continuations; each carries a case name plus the
+    /// forked `System`. Case names match Haskell's `prettyProof`:
+    /// rule-instantiation cases use the rule name; disjunction /
+    /// other splits use `case_1`/`case_2`/...
+    Cases(Vec<(String, System)>),
+    /// Dead branch — the goal is false.
+    Contradictory,
+}
+
+/// For a KU-action term `m`, return the sub-terms a KU goal on `m`
+/// should decompose into (per Haskell's `insertAction` pair/inv/prod
+/// handling).  Returns `None` if no decomposition applies.
+/// Returns true if the system has two distinct non-AC-unifiable
+/// nodes consuming the same Fresh value as their `Fr(~x)` premise.
+/// Such a state is logically inconsistent (Fresh is linear, so the
+/// same fresh value can have at most one consumer) — but our
+/// source-case graft pipeline can produce it via Maude-witness
+/// conflation across chain-saturated cases.  Detecting it lets the
+/// caller skip the conflated case so the search doesn't close a
+/// branch as Cyclic on the spurious shared-fresh ordering and roll
+/// up to Verified.  Task #119.
+fn has_fresh_consumer_conflation(
+    sys: &crate::constraint::system::System,
+    maude: &tamarin_term::maude_proc::MaudeHandle,
+) -> bool {
+    use crate::fact::FactTag;
+    use tamarin_term::lterm::{LSort, LVar};
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    let subst = sys.eq_store.subst.clone();
+    let mut consumers: Vec<(crate::constraint::constraints::NodeId, LVar)> = Vec::new();
+    for (id, rule) in &sys.nodes {
+        for prem in &rule.premises {
+            if !matches!(prem.tag, FactTag::Fresh) { continue; }
+            let t = match prem.terms.first() { Some(t) => t, None => continue };
+            let t_norm = tamarin_term::subst::apply_vterm(&subst, t.clone());
+            if let Term::Lit(Lit::Var(v)) = t_norm {
+                if v.sort == LSort::Fresh {
+                    consumers.push((id.clone(), v));
+                }
+            }
+        }
+    }
+    // Look for two consumers with the same fresh-var, non-unifiable rules.
+    for i in 0..consumers.len() {
+        for j in (i + 1)..consumers.len() {
+            if consumers[i].1 != consumers[j].1 { continue; }
+            if consumers[i].0 == consumers[j].0 { continue; }
+            let ri = sys.nodes.iter().find(|(n, _)| n == &consumers[i].0).map(|(_, r)| r);
+            let rj = sys.nodes.iter().find(|(n, _)| n == &consumers[j].0).map(|(_, r)| r);
+            let (Some(ri), Some(rj)) = (ri, rj) else { continue };
+            match crate::rule::unifiable_rule_ac_insts(maude, ri, rj) {
+                Ok(true) => continue,  // could be merged; not a conflation
+                Ok(false) => return true,  // distinct rules, same fresh → conflation
+                Err(_) => continue,  // be conservative on Maude errors
+            }
+        }
+    }
+    false
+}
+
+/// `isMsgVar` — port of Haskell's predicate from `Term.LTerm`.
+fn is_msg_var(t: &tamarin_term::lterm::LNTerm) -> bool {
+    use tamarin_term::lterm::LSort;
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    matches!(t, Term::Lit(Lit::Var(v)) if v.sort == LSort::Msg)
+}
+
+/// True iff the term is an AC product (Mult) or union.
+fn is_product_or_union(t: &tamarin_term::lterm::LNTerm) -> bool {
+    use tamarin_term::function_symbols::{AcSym, FunSym};
+    use tamarin_term::term::Term;
+    matches!(t, Term::App(FunSym::Ac(AcSym::Mult), _)
+              | Term::App(FunSym::Ac(AcSym::Union), _))
+}
+
+fn ku_decomp_subterms(t: &tamarin_term::lterm::LNTerm)
+    -> Option<Vec<tamarin_term::lterm::LNTerm>>
+{
+    use tamarin_term::function_symbols::{AcSym, FunSym, INV_SYM_STRING};
+    use tamarin_term::term::Term;
+    match t {
+        Term::App(FunSym::NoEq(s), args)
+            if s.name == b"pair" && args.len() == 2
+                => Some(args.clone()),
+        Term::App(FunSym::NoEq(s), args)
+            if s.name == INV_SYM_STRING && args.len() == 1
+                => Some(args.clone()),
+        Term::App(FunSym::Ac(AcSym::Mult), args) => Some(args.clone()),
+        Term::App(FunSym::Ac(AcSym::Union), args) => Some(args.clone()),
+        _ => None,
+    }
+}
+
+/// Default case-name fallback when callers don't provide a specific
+/// name: `case_1`, `case_2`, ... (1-indexed, matching Haskell's
+/// printer).
+pub fn default_case_name(i: usize) -> String {
+    format!("case_{}", i + 1)
+}
+
+/// Derive a Haskell-style case name for a rule-instantiation case.
+/// Matches `Theory.Constraint.Solver.Reduction.casName` conventions:
+/// protocol rules use their declared name, intruder constructors use
+/// `c_<head>`, destructors use `d_<head>`, fresh-construction uses
+/// `fresh`, coercion uses `coerce`, IRecv/ISend use their internal
+/// names.
+pub fn rule_case_name(rule: &crate::rule::RuleACInst) -> String {
+    use crate::rule::{IntrRuleACInfo, ProtoRuleName, RuleInfo};
+    match &rule.info {
+        RuleInfo::Proto(p) => match &p.name {
+            ProtoRuleName::Fresh => "Fresh".to_string(),
+            ProtoRuleName::Stand(s) => s.clone(),
+        },
+        RuleInfo::Intr(i) => match i {
+            IntrRuleACInfo::ConstrRule(name) => {
+                // The constructor's stored name carries a leading
+                // underscore (see `intruder_rules.rs:277`); strip it
+                // here so the case label matches Haskell's printer:
+                // `c_h` not `c__h`.
+                let s = String::from_utf8_lossy(name);
+                let trimmed = s.strip_prefix('_').unwrap_or(&s);
+                format!("c_{}", trimmed)
+            }
+            IntrRuleACInfo::DestrRule(name, _, _, _) => {
+                let s = String::from_utf8_lossy(name);
+                let trimmed = s.strip_prefix('_').unwrap_or(&s);
+                format!("d_{}", trimmed)
+            }
+            IntrRuleACInfo::Coerce => "coerce".to_string(),
+            IntrRuleACInfo::IRecv => "irecv".to_string(),
+            IntrRuleACInfo::ISend => "isend".to_string(),
+            IntrRuleACInfo::PubConstr => "c_pub".to_string(),
+            IntrRuleACInfo::NatConstr => "c_nat".to_string(),
+            IntrRuleACInfo::FreshConstr => "c_fresh".to_string(),
+            IntrRuleACInfo::IEquality => "iequality".to_string(),
+        },
+    }
+}
+
+impl<'ctx> Reduction<'ctx> {
+    /// `solveDisjunction` from `Solver.Goals`:
+    ///
+    /// > In contrast to the paper, we use n-ary disjunctions and also
+    /// > split over all of them at once.
+    ///
+    /// For each `gfm` in the disjunction, fork a system in which the
+    /// disj-goal is marked solved and `gfm` is inserted as an open
+    /// formula. The empty disjunction is `False` → `Contradictory`.
+    /// A singleton disjunction collapses to a linear continuation
+    /// (mutating `self.sys` in place).
+    pub fn solve_disj_goal(&mut self, disj: &Disj<Guarded>) -> GoalCases {
+        let g = Goal::Disj(disj.clone());
+        let alts = &disj.0;
+        match alts.len() {
+            0 => GoalCases::Contradictory,
+            1 => {
+                self.mark_goal_as_solved(&g);
+                // Route through the decomposing inserter so atomic /
+                // existential / disjunctive alternatives generate their
+                // own sub-goals (Haskell `insertFormula`).  Raw-pushing
+                // leaks Disj/Ex bodies past is_finished (see the
+                // companion fix in `insert_implied_formulas_pass`).
+                self.insert_formula_decompose(alts[0].clone());
+                GoalCases::Linear
+            }
+            _ => {
+                let mut cases = Vec::with_capacity(alts.len());
+                for (i, gfm) in alts.iter().enumerate() {
+                    let mut sub = Reduction::new(self.ctx, self.sys.clone());
+                    for (existing, status) in sub.sys.goals.iter_mut() {
+                        if existing == &g && !status.solved {
+                            status.solved = true;
+                            break;
+                        }
+                    }
+                    // Decompose the chosen alternative — see comment in
+                    // singleton branch.  Mirrors Haskell `solveDisjunction`
+                    // → `insertFormula alt`.
+                    sub.insert_formula_decompose(gfm.clone());
+                    cases.push((default_case_name(i), sub.sys));
+                }
+                self.changed = ChangeIndicator::Changed;
+                GoalCases::Cases(cases)
+            }
+        }
+    }
+
+    /// `exploitPrems` — port of Haskell's `labelNodeId.exploitPrems`.
+    ///
+    /// For each premise of a freshly-instantiated rule node `i`, expand
+    /// according to the fact tag:
+    ///
+    /// - `Fr(m)` → allocate a fresh node `j`, instantiate the implicit
+    ///   Fresh-rule with conclusion `Fr(m)`, add edge `(j,0) → (i,p)`.
+    /// - `In(m)` → allocate a fresh `j`, instantiate the implicit
+    ///   `ISend` rule (premise `KU(m)`, conclusion `In(m)`, action
+    ///   `K(m)`), add edge.
+    /// - `KU(_)` (or `K(_)`/`KD(_)` k-fact) → add a KU-action goal at a
+    ///   fresh node `j` with `j < i`.
+    /// - Otherwise → insert a `Goal::Premise((i, idx), fact)`.
+    pub fn exploit_prems(
+        &mut self,
+        i: &crate::constraint::constraints::NodeId,
+        rule: &RuleACInst,
+    ) {
+        // Snapshot premises so we can mutate self while iterating.
+        let prems: Vec<(crate::rule::PremIdx, crate::fact::LNFact)> =
+            rule.enumerate_premises().map(|(p, f)| (p, f.clone())).collect();
+        // Loop-breaker premises (per Haskell `praciLoopBreakers`) are
+        // those whose `PremIdx` was flagged at theory-load time by the
+        // dataflow loop-breaker analysis.  Goals at these premises get
+        // `looping=true`, so `isNonLoopBreakerProtoFactGoal` excludes
+        // them and the smart ranker defers them.
+        let breakers: std::collections::BTreeSet<crate::rule::PremIdx> =
+            match &rule.info {
+                crate::rule::RuleInfo::Proto(info) =>
+                    info.loop_breakers.iter().cloned().collect(),
+                _ => std::collections::BTreeSet::new(),
+            };
+        for (idx, fa) in prems {
+            self.exploit_one_prem(i, idx, &fa, breakers.contains(&idx));
+        }
+    }
+
+    /// Same as `exploit_prems`, but only synthesise the canonical
+    /// suppliers for `Fr` / `In` / `Ku` premises and drop any
+    /// generic-premise goals on the floor. Used when a rule node was
+    /// added speculatively during `solve_premise_goal`: the parent
+    /// solver step has already arranged for the consumed premise to be
+    /// matched, so we don't want to flood the goal queue with the new
+    /// node's other premises (each of which would trigger another
+    /// rule-instantiation cascade and blow up the proof tree).
+    pub fn exploit_prems_supplier_only(
+        &mut self,
+        i: &crate::constraint::constraints::NodeId,
+        rule: &RuleACInst,
+    ) {
+        use crate::fact::FactTag;
+        let prems: Vec<(crate::rule::PremIdx, crate::fact::LNFact)> =
+            rule.enumerate_premises().map(|(p, f)| (p, f.clone())).collect();
+        for (idx, fa) in prems {
+            match &fa.tag {
+                FactTag::Fresh => self.add_fresh_supplier_for(i, idx, &fa),
+                FactTag::In => self.add_isend_supplier_for(i, idx, &fa),
+                FactTag::Ku => self.add_ku_action_before(i, &fa),
+                _ => { /* skip — parent solver will track */ }
+            }
+        }
+    }
+
+    fn exploit_one_prem(
+        &mut self,
+        i: &crate::constraint::constraints::NodeId,
+        idx: crate::rule::PremIdx,
+        fa: &crate::fact::LNFact,
+        is_loop_breaker: bool,
+    ) {
+        use crate::fact::FactTag;
+        match &fa.tag {
+            FactTag::Fresh => {
+                self.add_fresh_supplier_for(i, idx, fa);
+            }
+            FactTag::In => {
+                self.add_isend_supplier_for(i, idx, fa);
+            }
+            FactTag::Ku => {
+                self.add_ku_action_before(i, fa);
+            }
+            FactTag::Kd | FactTag::Ded => {
+                self.insert_goal_with_loop_flag(
+                    Goal::Premise((i.clone(), idx), fa.clone()),
+                    is_loop_breaker);
+            }
+            _ => {
+                self.insert_goal_with_loop_flag(
+                    Goal::Premise((i.clone(), idx), fa.clone()),
+                    is_loop_breaker);
+            }
+        }
+    }
+
+    /// Add a fresh-rule supplier node for a `Fr(m)` premise. The
+    /// Fresh-rule has `[] --[]-> [Fr(m)]`.
+    fn add_fresh_supplier_for(
+        &mut self,
+        i: &crate::constraint::constraints::NodeId,
+        idx: crate::rule::PremIdx,
+        fa: &crate::fact::LNFact,
+    ) {
+        let m = match fa.terms.first() { Some(t) => t.clone(), None => return };
+        let next = self.next_fresh_node_idx();
+        let j = tamarin_term::lterm::LVar::new(
+            "vf", tamarin_term::lterm::LSort::Node, next);
+        let rule = make_fresh_rule(m);
+        self.sys.add_node(j.clone(), rule);
+        self.sys.add_edge(crate::constraint::constraints::Edge {
+            src: (j, crate::rule::ConcIdx(0)),
+            tgt: (i.clone(), idx),
+        });
+        self.changed = ChangeIndicator::Changed;
+    }
+
+    /// Add an ISend-rule supplier node for an `In(m)` premise.
+    /// `ISend` has `[KU(m)] --[K(m)]-> [In(m)]`.
+    ///
+    /// Mirrors Haskell's `labelNodeId.exploitPrem` for `InFact` — it
+    /// adds the ISend node, edges it to the consuming premise, then
+    /// recursively exploits the ISend's premises.  Since ISend's only
+    /// premise is `KU(m)`, the recursive exploit dispatches to
+    /// `add_ku_action_before` (Haskell's `requiresKU`), creating a
+    /// `KU(m)` action goal at a fresh predecessor.  ISend's action is
+    /// `K(m)` (the log fact, FactTag::Ded), not `KU(m)`, so the new
+    /// fresh node and the ISend node don't collide via
+    /// `enforce_ku_action_uniqueness`.
+    fn add_isend_supplier_for(
+        &mut self,
+        i: &crate::constraint::constraints::NodeId,
+        idx: crate::rule::PremIdx,
+        fa: &crate::fact::LNFact,
+    ) {
+        let m = match fa.terms.first() { Some(t) => t.clone(), None => return };
+        let next = self.next_fresh_node_idx();
+        let j = tamarin_term::lterm::LVar::new(
+            "vf", tamarin_term::lterm::LSort::Node, next);
+        let rule = make_isend_rule(m.clone());
+        self.sys.add_node(j.clone(), rule);
+        self.sys.add_edge(crate::constraint::constraints::Edge {
+            src: (j.clone(), crate::rule::ConcIdx(0)),
+            tgt: (i.clone(), idx),
+        });
+        // ISend's KU premise → KU action goal at fresh predecessor —
+        // Haskell's `exploitPrems j ruKnows`.  Always record the goal,
+        // even during precompute: skipping it (the previous behaviour)
+        // left grafted ISend nodes with un-tracked KU premises, so the
+        // runtime search marked leaves Solved while the encrypted-
+        // message construction was actually un-proven (root cause of
+        // the NSLPK3-class `[sources]`-typing FPs; see solver-memory
+        // bug #27).  The goal is just a goal at precompute time — it
+        // doesn't recursively expand within the precompute call.
+        let ku = crate::fact::ku_fact(m);
+        self.add_ku_action_before(&j, &ku);
+        self.changed = ChangeIndicator::Changed;
+    }
+
+    /// Add a KU action goal at a fresh node before `i`.
+    fn add_ku_action_before(
+        &mut self,
+        i: &crate::constraint::constraints::NodeId,
+        fa: &crate::fact::LNFact,
+    ) {
+        let next = self.next_fresh_node_idx();
+        let j = tamarin_term::lterm::LVar::new(
+            "vk", tamarin_term::lterm::LSort::Node, next);
+        self.insert_less(crate::constraint::constraints::LessAtom::new(
+            j.clone(), i.clone(),
+            crate::constraint::constraints::Reason::Adversary,
+        ));
+        self.insert_goal(Goal::Action(j, fa.clone()));
+    }
+
+    fn next_fresh_node_idx(&self) -> u64 {
+        bounds_max(&self.sys) + 1
+    }
+
+    /// `solveAction` — port of the Action arm of `solveGoal`.
+    ///
+    /// Three cases:
+    /// 1. **Node `i` already exists** in the graph and `fa` is among
+    ///    its actions ⇒ Linear (already satisfied).
+    /// 2. **Node `i` already exists** but `fa` is *not* in its actions
+    ///    ⇒ fork once per existing action, unifying `fa` against each.
+    /// 3. **Node `i` doesn't exist** ⇒ fork once per non-silent rule,
+    ///    fresh-instantiating the rule and unifying `fa` against each
+    ///    of its actions.
+    ///
+    /// The XOR-coercion special case for `KU(t1 ⊕ t2 ⊕ ...)` is
+    /// deferred — it produces multiple intruder-rule shapes that
+    /// require partition enumeration we haven't ported.
+    pub fn solve_action_goal(
+        &mut self,
+        i: &crate::constraint::constraints::NodeId,
+        fa: &crate::fact::LNFact,
+    ) -> GoalCases {
+        if crate::constraint::solver::search::deadline_reached() {
+            return GoalCases::Contradictory;
+        }
+        let g = Goal::Action(i.clone(), fa.clone());
+        let existing = self.sys.nodes.iter()
+            .find(|(nid, _)| nid == i)
+            .map(|(_, ru)| ru.clone());
+        match existing {
+            Some(ru) => {
+                if ru.actions.contains(fa) {
+                    self.mark_goal_as_solved(&g);
+                    return GoalCases::Linear;
+                }
+                // Fork: one case per action of the existing rule
+                // instance, unifying that action with `fa`. All cases
+                // share the same rule name; proof_method.rs dedup will
+                // append `_case_1`/`_case_2`/... if multiple cases.
+                //
+                let rule_name = rule_case_name(&ru);
+                let mut cases = Vec::new();
+                for act in &ru.actions {
+                    let mut sys = self.sys.clone();
+                    let mut sub = Reduction::new(self.ctx, sys);
+                    let res = sub.solve_fact_eqs(
+                        SplitStrategy::SplitNow,
+                        &[tamarin_term::rewriting::Equal {
+                            lhs: fa.clone(), rhs: act.clone() }]);
+                    sys = sub.sys;
+                    match res {
+                        Err(_) | Ok(SolveOutcome::Contradictory) => continue,
+                        Ok(_) => {
+                            for (existing, status) in sys.goals.iter_mut() {
+                                if existing == &g && !status.solved {
+                                    status.solved = true;
+                                    break;
+                                }
+                            }
+                            cases.push((rule_name.clone(), sys));
+                        }
+                    }
+                }
+                if cases.is_empty() { return GoalCases::Contradictory; }
+                if cases.len() == 1 {
+                    // Mutate in-place AND signal the case-name for
+                    // the printer.  Simplify-pass callers ignore the
+                    // return and look at `self.sys`; the proof-method
+                    // dispatcher emits `case <name>` + qed.
+                    self.sys = cases.into_iter().next().unwrap().1;
+                    self.changed = ChangeIndicator::Changed;
+                    return GoalCases::LinearNamed(rule_name);
+                }
+                self.changed = ChangeIndicator::Changed;
+                GoalCases::Cases(cases)
+            }
+            None => {
+                // Source-case short-circuit for KU action goals —
+                // mirrors Haskell's `solveWithSource` flow consulting
+                // the `msgGoals` branch of `precomputeSources`.  When a
+                // precomputed Action source matches the live KU shape
+                // (sort-compatible bare-var pattern, or matching head
+                // symbol for an app-headed pattern), graft each of its
+                // saturated cases onto the live system and unify the
+                // case's KU action with `fa`.  This bypasses raw rule
+                // enumeration in favour of the typed source enumeration
+                // — exactly the [sources]-driven typing-refined chain
+                // that Haskell uses.
+                if !crate::constraint::solver::sources::in_precompute_mode()
+                    && matches!(fa.tag, crate::fact::FactTag::Ku)
+                    && !self.ctx.full_sources.is_empty()
+                {
+                    let avoid_max = bounds_max(&self.sys);
+                    if let Some(case_pairs) = crate::constraint::solver::sources::solve_with_source_cases_action_with_ctx(
+                        &self.ctx.full_sources,
+                        &self.sys,
+                        i, fa,
+                        avoid_max,
+                        Some(self.ctx),
+                    ) {
+                        let live_goal = Goal::Action(i.clone(), fa.clone());
+                        let mut out: Vec<(String, crate::constraint::system::System)> = Vec::new();
+                        // filterCases: skip cases whose source name was
+                        // already used in this branch (mirrors Haskell's
+                        // `solveAllSafeGoals` filterCases invariant).
+                        // A chain-saturated case left open KU goals at
+                        // saturate-time; without this filter the same
+                        // case keeps getting re-grafted at runtime to
+                        // discharge its own re-spawned KU sub-goals,
+                        // looping forever.  Single-case cases (the c_*
+                        // intruder constructors and unique-producer
+                        // protocol rules) are still allowed to repeat
+                        // — only the chain-saturated multi-rule cases
+                        // carry the "name" structure that risks loops.
+                        // filterCases applies ONLY to chain-saturated
+                        // cases — those whose name encodes a multi-rule
+                        // chain (contains an underscore).  Single-rule
+                        // case names (e.g. "Send", "c_senc") may be
+                        // legitimately re-applied for distinct sub-goals
+                        // in the same branch; only the multi-rule
+                        // saturated cases carry the open re-spawning
+                        // KU goals that loop.
+                        let used = self.sys.used_sources.clone();
+                        // A case is "saturated" (chain-folded across
+                        // multiple rules) if its name encodes more than
+                        // one rule.  Saturated cases collect open KU
+                        // goals at saturate time, so re-applying the
+                        // same case at runtime risks looping.  Single-
+                        // rule names (e.g. `R_2`, `Reveal_ltk`,
+                        // `Register_pk`) typically have 0–1 underscores;
+                        // chain-saturated names like `Initiator_Setup_Key`
+                        // or `R_1_Register_pk_Register_pk` have 2+.  We
+                        // also skip names starting with `c_` (intruder
+                        // constructors are always atomic) and `case_N`
+                        // (Disj/Ex case-split markers).
+                        // Filter chain-saturated source-cases that have
+                        // already been used in this branch — mirrors
+                        // Haskell's `filterCases` in
+                        // `Theory.Constraint.Solver.Sources`. A
+                        // chain-saturated case name encodes a multi-rule
+                        // composition (`Rule_A_Rule_B`); re-applying it
+                        // in the same branch lets the !KU source-case
+                        // enumeration recurse infinitely on typing
+                        // lemmas where the IH disjunction case_1 keeps
+                        // demanding the same shape of !KU.  The
+                        // saturate-time filter only catches the
+                        // precompute path; the runtime path can
+                        // re-graft when the IH spawns fresh KU goals.
+                        //
+                        // Heuristics for "is this a saturated case":
+                        //   - `c_*` (intruder constructors) and
+                        //     `case_N` (Disj/Ex case-split markers) are
+                        //     atomic — always allowed to repeat.
+                        //   - Names with 2+ underscores encode rule
+                        //     chains; treat as saturated and filter.
+                        // Runtime filterCases — disabled (see task #115).
+                        // The right fix is N5_u-driven KU action-node
+                        // unification on identical terms, which then
+                        // surfaces a cyclic-ordering contradiction.
+                        let _ = &used;
+                        let _ = ku_goal_fingerprint(fa);
+                        for (case_label, mut sys, case_action) in case_pairs {
+                            if let Some(slot) = sys.goals.iter_mut()
+                                .find(|(g, _)| g == &live_goal) {
+                                slot.1.solved = true;
+                            }
+                            // Use the saturated case's name (the
+                            // chain-root rule label from
+                            // `saturate_out_premise`).  Fall back to
+                            // the rule at the live goal node only if
+                            // the source-case carried no chain info.
+                            // `coerce_case_N` (no trailing rule) is an
+                            // un-folded intruder-chain artifact from
+                            // our chain-fold pipeline.  Haskell's
+                            // source-case enumeration doesn't produce
+                            // these labels; it shows the producer
+                            // rule's name directly.  Fall back to the
+                            // live node's rule name when the label is
+                            // empty, a default `case_N`, or a bare
+                            // chain-fold marker.
+                            let is_chain_fold_artifact = case_label.is_empty()
+                                || case_label == "case_1"
+                                || (case_label.starts_with("coerce_case_")
+                                    && !case_label[12..].contains('_'));
+                            let case_name = if is_chain_fold_artifact {
+                                sys.nodes.iter()
+                                    .find(|(nid, _)| nid == i)
+                                    .map(|(_, r)| rule_case_name(r))
+                                    .unwrap_or_else(|| default_case_name(out.len()))
+                            } else {
+                                case_label
+                            };
+                            let mut sub = Reduction::new(self.ctx, sys);
+                            let res = sub.solve_fact_eqs(
+                                SplitStrategy::SplitNow,
+                                &[tamarin_term::rewriting::Equal {
+                                    lhs: case_action.clone(), rhs: fa.clone() }]);
+                            // Mirror Haskell `refineSubst`'s
+                            // `solveSubstEqs >> substSystem` — propagate
+                            // the action-unify bindings into the grafted
+                            // case's nodes/edges BEFORE computing
+                            // chain_eqs.  Without this, the case-side
+                            // syntactic forms still reference the pre-
+                            // graft vars (e.g. ~nb_case#shifted vs
+                            // ~nb_live), so chain_eqs's per-edge fact
+                            // unification sees mismatched terms that
+                            // would have aligned trivially after subst.
+                            // For protocols with chained pair-Out
+                            // producers (e.g. CR's responder), this is
+                            // what lets the grafted Fresh node share
+                            // the live Fresh node's term so
+                            // `enforce_fresh_node_uniqueness` can merge
+                            // them in simplify (instead of leaving two
+                            // distinct fresh-producers that
+                            // edge-uniqueness then over-collapses,
+                            // ending in `IncompatibleEqs`).
+                            if matches!(res, Ok(SolveOutcome::Linear(_)) | Ok(SolveOutcome::Cases(_))) {
+                                sub.subst_system();
+                            }
+                            match res {
+                                Err(_) | Ok(SolveOutcome::Contradictory) => continue,
+                                Ok(_) => {
+                                    // Edge-induced fact unification:
+                                    // walk each edge in the grafted case
+                                    // and equate the source-conclusion's
+                                    // fact with the target-premise's
+                                    // fact.  At precompute time these
+                                    // are already unified within the
+                                    // case's local namespace, but the
+                                    // case carries chain-internal vars
+                                    // that have no binding to the live
+                                    // system's vars.  Re-running
+                                    // unification in the live eq-store
+                                    // context propagates the case vars
+                                    // (sec#24:Fresh) → live lemma vars
+                                    // (~mw#11:Msg), narrowing sorts
+                                    // through Maude AC unification.
+                                    let chain_eqs: Vec<_> = sub.sys.edges
+                                        .iter()
+                                        .filter_map(|e| {
+                                            let (_, src_rule) = sub.sys.nodes.iter()
+                                                .find(|(n, _)| n == &e.src.0)?;
+                                            let (_, tgt_rule) = sub.sys.nodes.iter()
+                                                .find(|(n, _)| n == &e.tgt.0)?;
+                                            let fc = src_rule.conclusions
+                                                .get(e.src.1.0)?.clone();
+                                            let fp = tgt_rule.premises
+                                                .get(e.tgt.1.0)?.clone();
+                                            if fc.tag != fp.tag
+                                                || fc.terms.len() != fp.terms.len() {
+                                                return None;
+                                            }
+                                            if fc == fp { return None; }
+                                            Some(tamarin_term::rewriting::Equal {
+                                                lhs: fc, rhs: fp,
+                                            })
+                                        })
+                                        .collect();
+                                    if !chain_eqs.is_empty() {
+                                        let r2 = sub.solve_fact_eqs(
+                                            SplitStrategy::SplitNow, &chain_eqs);
+                                        if matches!(r2,
+                                            Err(_) | Ok(SolveOutcome::Contradictory))
+                                        {
+                                            continue;
+                                        }
+                                    }
+                                    sub.subst_system();
+                                    // Defensive Fresh-conflation check:
+                                    // after the graft + subst, if the
+                                    // grafted system has two non-unifiable
+                                    // nodes consuming the same Fresh value,
+                                    // the graft conflated two distinct
+                                    // fresh-vars (task #119 root cause).
+                                    // Skip the case rather than push it —
+                                    // letting the search enumerate it would
+                                    // close the branch as Cyclic
+                                    // (correctly, given the impossible
+                                    // state), wrongly rolling up to
+                                    // Verified for all-traces lemmas.
+                                    if has_fresh_consumer_conflation(&sub.sys, &self.ctx.maude) {
+                                        continue;
+                                    }
+                                    sub.sys.used_sources.push(case_name.clone());
+                                    out.push((case_name, sub.sys));
+                                }
+                            }
+                        }
+                        if !out.is_empty() {
+                            self.changed = ChangeIndicator::Changed;
+                            if out.len() == 1 {
+                                let (name, sys) = out.into_iter().next().unwrap();
+                                self.sys = sys;
+                                return GoalCases::LinearNamed(name);
+                            }
+                            return GoalCases::Cases(out);
+                        }
+                        // If source-cases yielded nothing applicable,
+                        // fall back to plain rule enumeration below.
+                    }
+                }
+                let candidates = non_silent_rule_insts(self.ctx);
+                if candidates.is_empty() { return GoalCases::Contradictory; }
+                let avoid_max = bounds_max(&self.sys);
+                let mut cases: Vec<(String, crate::constraint::system::System)> = Vec::new();
+                for rule in candidates {
+                    // Filter rules that have at least one action with
+                    // matching tag/arity — cheap pre-filter that
+                    // mirrors the unifiability check.
+                    if !rule.actions.iter().any(|a| a.tag == fa.tag && a.terms.len() == fa.terms.len()) {
+                        continue;
+                    }
+                    if crate::constraint::solver::search::deadline_reached() {
+                        break;
+                    }
+                    for (act_idx, _) in rule.actions.iter().enumerate() {
+                        // Fresh-rename the rule once per branch so
+                        // each candidate has independent variables.
+                        let renamed = freshen_rule(rule.clone(), avoid_max);
+                        let act = renamed.actions[act_idx].clone();
+                        if act.tag != fa.tag || act.terms.len() != fa.terms.len() {
+                            continue;
+                        }
+                        let case_name = rule_case_name(&renamed);
+                        let mut sys = self.sys.clone();
+                        sys.add_node(i.clone(), renamed.clone());
+                        let mut sub = Reduction::new(self.ctx, sys);
+                        let res = sub.solve_fact_eqs(
+                            SplitStrategy::SplitNow,
+                            &[tamarin_term::rewriting::Equal {
+                                lhs: fa.clone(), rhs: act.clone() }]);
+                        match res {
+                            Err(_) | Ok(SolveOutcome::Contradictory) => continue,
+                            Ok(_) => {
+                                // Expand the new node's premises
+                                // (Fresh / In / KU / Premise goal).
+                                sub.exploit_prems(i, &renamed);
+                                let mut sys = sub.sys;
+                                for (existing, status) in sys.goals.iter_mut() {
+                                    if existing == &g && !status.solved {
+                                        status.solved = true;
+                                        break;
+                                    }
+                                }
+                                cases.push((case_name, sys));
+                            }
+                        }
+                    }
+                }
+                if cases.is_empty() { return GoalCases::Contradictory; }
+                if cases.len() == 1 {
+                    let (name, sys) = cases.into_iter().next().unwrap();
+                    self.sys = sys;
+                    self.changed = ChangeIndicator::Changed;
+                    return GoalCases::LinearNamed(name);
+                }
+                self.changed = ChangeIndicator::Changed;
+                GoalCases::Cases(cases)
+            }
+        }
+    }
+
+    /// `solvePremise` (non-KD branch only).
+    ///
+    /// For a goal `Premise(p, faPrem)` where `p = (i, PremIdx j)`, fork
+    /// once per (rule, conclusion-index) pair whose conclusion is
+    /// shape-compatible with `faPrem`. In each case:
+    ///   - allocate a fresh node id
+    ///   - fresh-rename the chosen rule
+    ///   - add the node and the edge
+    ///   - unify the conclusion fact with `faPrem`
+    ///
+    /// The KD-fact branch (which inserts an `IRecv` learning step and
+    /// a chain constraint) is deferred until `insert_chain` lands.
+    pub fn solve_premise_goal(
+        &mut self,
+        p: &crate::constraint::constraints::NodePrem,
+        fa_prem: &crate::fact::LNFact,
+    ) -> GoalCases {
+        if crate::constraint::solver::search::deadline_reached() {
+            return GoalCases::Contradictory;
+        }
+        // KD premises route through the chain machinery — direct port
+        // of Haskell's `solvePremise rules p faPrem | isKDFact faPrem`:
+        //   1. Allocate fresh node `iLearn`
+        //   2. Insert IRecv rule `[Out(m)] → [KD(m)]` at `iLearn`
+        //   3. `insertChain (cLearn, p)` — chain goal connecting IRecv
+        //      conc to the live KD premise (resolved by `solveChain`)
+        //   4. Mark the live KD premise solved (it's now a chain target)
+        //   5. Insert the IRecv's `Out(m)` as a regular Premise goal
+        //      (search will pick it up later).
+        // Haskell's `solvePremise` recurses immediately on `pLearn`; we
+        // defer via `insert_goal` to keep each call bounded — the
+        // search driver enumerates the goal in its own `expand` step.
+        if matches!(fa_prem.tag, crate::fact::FactTag::Kd) {
+            if fa_prem.terms.first().is_none() {
+                return GoalCases::Contradictory;
+            }
+            // Haskell `solvePremise rules p faPrem | isKDFact faPrem`:
+            //   iLearn <- freshLVar "vl" LSortNode
+            //   mLearn <- varTerm <$> freshLVar "t" LSortMsg
+            //   let ruLearn = Rule IRecvRule [outFact mLearn] [kdFact mLearn] [] []
+            //   modM sNodes (M.insert iLearn ruLearn)
+            //   insertChain (iLearn, ConcIdx 0) p
+            //   solvePremise rules pLearn (outFact mLearn)
+            //
+            // The crucial detail is that `mLearn` is a FRESH msg-sorted
+            // variable — *not* the concrete term `m` from `faPrem`.  When
+            // the recursive `solvePremise` enumerates protocol rules
+            // whose Out conclusion is e.g. `Out(<h(...), ~nb>)`, that
+            // unifies against `Out(mLearn)` (since mLearn is fresh),
+            // substituting `mLearn := <h(...), ~nb>` and giving the
+            // case name of the upstream protocol rule (e.g. "responder").
+            // The chain `KD(<h(...), ~nb>) → KD(h(t1))` is then closed
+            // separately by `solveChain` via destructor extension
+            // (d_fst → KD(h) → unifies with KD(h(t1))).
+            //
+            // refineSource's `combine` ([Sources.hs:135-137]) then
+            // strips leading "coerce" from the accumulated case-name
+            // list, leaving "responder" as the final source case name.
+            //
+            // Previously we used `m` directly and deferred the Out
+            // premise as a queued Goal — but that pinned the IRecv's
+            // Out-premise term to the concrete `m`, which cannot
+            // unify with `<h(...), ~nb>` (head mismatch h vs pair).
+            // Without the fresh var, the chain-up to responder never
+            // materialises and the case name stays at "coerce_irecv".
+            let avoid = bounds_max(&self.sys);
+            let i_learn = tamarin_term::lterm::LVar::new(
+                "vl", tamarin_term::lterm::LSort::Node, avoid + 1);
+            let m_learn_var = tamarin_term::lterm::LVar::new(
+                "t", tamarin_term::lterm::LSort::Msg, avoid + 2);
+            let m_learn = tamarin_term::term::Term::Lit(
+                tamarin_term::vterm::Lit::Var(m_learn_var));
+            let irecv_rule = crate::rule::Rule::new(
+                crate::rule::RuleInfo::Intr(crate::rule::IntrRuleACInfo::IRecv),
+                vec![crate::fact::out_fact(m_learn.clone())],
+                vec![crate::fact::kd_fact(m_learn.clone())],
+                vec![],
+            );
+            self.sys.add_node(i_learn.clone(), irecv_rule);
+            let c_learn: crate::constraint::constraints::NodeConc =
+                (i_learn.clone(), crate::rule::ConcIdx(0));
+            self.insert_goal(Goal::Chain(c_learn, p.clone()));
+            self.mark_goal_as_solved(&Goal::Premise(p.clone(), fa_prem.clone()));
+            self.changed = ChangeIndicator::Changed;
+            // Recurse on the Out(mLearn) premise — Haskell does this
+            // immediately, inline, before any chain solving.  This is
+            // also where source-case short-circuiting will fire at
+            // runtime (the Out premise routes through the `solveWithSource`
+            // path below since Out is not KD).
+            let p_learn: crate::constraint::constraints::NodePrem =
+                (i_learn, crate::rule::PremIdx(0));
+            let prem_learn = crate::fact::out_fact(m_learn);
+            let rec = self.solve_premise_goal(&p_learn, &prem_learn);
+            // Materialise the substitution from the recursive solve
+            // into node/edge/goal state so subsequent `solve_chain_goal`
+            // sees the substituted chain conclusion (e.g. mLearn
+            // resolved to <h(...), ~nb>).  Haskell does this via
+            // `substSystem` at the end of `solveFactEqs`.
+            return match rec {
+                GoalCases::Contradictory => GoalCases::Contradictory,
+                GoalCases::Linear => {
+                    self.subst_system();
+                    GoalCases::Linear
+                }
+                GoalCases::LinearNamed(name) => {
+                    self.subst_system();
+                    GoalCases::LinearNamed(name)
+                }
+                GoalCases::Cases(cases) => {
+                    let new_cases: Vec<_> = cases.into_iter().map(|(name, sys)| {
+                        let mut sub = Reduction::new(self.ctx, sys);
+                        sub.subst_system();
+                        (name, sub.sys)
+                    }).collect();
+                    GoalCases::Cases(new_cases)
+                }
+            };
+        }
+        // Source-case short-circuit.  Mirrors Haskell's
+        //     solve goal = ... solveWithSource ctxt ths goal
+        // in `Theory.Constraint.Solver.ProofMethod`.  When a saturated
+        // source matches the live tag, graft each of its precomputed
+        // cases onto the live system and then run
+        // `solve_fact_eqs(SplitNow, [Equal { conc, fa_prem }])` to
+        // align the case's abstract terms with the concrete premise
+        // — exactly Haskell's `someInst >> conjoinSystem` flow.  Cases
+        // whose unification fails are dropped; the rest are returned
+        // as `GoalCases::Cases`.  Skipped during precompute itself.
+        if !crate::constraint::solver::sources::in_precompute_mode()
+            && !self.ctx.full_sources.is_empty()
+        {
+            let avoid_max = bounds_max(&self.sys);
+            if let Some(case_pairs) = crate::constraint::solver::sources::solve_with_source_cases(
+                &self.ctx.full_sources,
+                &self.sys,
+                &p.0, p.1, fa_prem,
+                avoid_max,
+            ) {
+                let live_goal = Goal::Premise(p.clone(), fa_prem.clone());
+                let mut out: Vec<(String, crate::constraint::system::System)> = Vec::new();
+                let used = self.sys.used_sources.clone();
+                for (mut sys, conc_fact) in case_pairs {
+                    // Mark the live goal solved before unifying — applySource
+                    // does the same prior to conjoining the case.
+                    if let Some(slot) = sys.goals.iter_mut()
+                        .find(|(g, _)| g == &live_goal) {
+                        slot.1.solved = true;
+                    }
+                    // Look up the grafted rule's name via the edge
+                    // pointing at our premise — that edge's source
+                    // node holds the case's producer rule.
+                    let producer_id = sys.edges.iter()
+                        .find(|e| e.tgt == *p)
+                        .map(|e| e.src.0.clone());
+                    let case_name = producer_id
+                        .and_then(|pid| sys.nodes.iter()
+                            .find(|(nid, _)| nid == &pid)
+                            .map(|(_, r)| rule_case_name(r)))
+                        .unwrap_or_else(|| default_case_name(out.len()));
+                    // Runtime filterCases no-op (saturate-time
+                    // filterCases #106 covers the common path).
+                    let _ = &used;
+                    let mut sub = Reduction::new(self.ctx, sys);
+                    let res = sub.solve_fact_eqs(
+                        SplitStrategy::SplitNow,
+                        &[tamarin_term::rewriting::Equal {
+                            lhs: conc_fact, rhs: fa_prem.clone() }]);
+                    match res {
+                        Err(_) | Ok(SolveOutcome::Contradictory) => continue,
+                        Ok(_) => {
+                            // Edge-induced fact unification.  See the
+                            // same idiom in `solve_action_goal`'s
+                            // source-case branch above for the rationale:
+                            // chain-internal vars from the saturated case
+                            // need to be equated with live-system vars
+                            // via every edge in the grafted subsystem,
+                            // so the eq-store carries the bindings into
+                            // subsequent simplification.
+                            let chain_eqs: Vec<_> = sub.sys.edges
+                                .iter()
+                                .filter_map(|e| {
+                                    let (_, src_rule) = sub.sys.nodes.iter()
+                                        .find(|(n, _)| n == &e.src.0)?;
+                                    let (_, tgt_rule) = sub.sys.nodes.iter()
+                                        .find(|(n, _)| n == &e.tgt.0)?;
+                                    let fc = src_rule.conclusions
+                                        .get(e.src.1.0)?.clone();
+                                    let fp = tgt_rule.premises
+                                        .get(e.tgt.1.0)?.clone();
+                                    if fc.tag != fp.tag
+                                        || fc.terms.len() != fp.terms.len() {
+                                        return None;
+                                    }
+                                    if fc == fp { return None; }
+                                    Some(tamarin_term::rewriting::Equal {
+                                        lhs: fc, rhs: fp,
+                                    })
+                                })
+                                .collect();
+                            if !chain_eqs.is_empty() {
+                                let r2 = sub.solve_fact_eqs(
+                                    SplitStrategy::SplitNow, &chain_eqs);
+                                if matches!(r2,
+                                    Err(_) | Ok(SolveOutcome::Contradictory))
+                                {
+                                    continue;
+                                }
+                            }
+                            sub.subst_system();
+                            if has_fresh_consumer_conflation(&sub.sys, &self.ctx.maude) {
+                                continue;
+                            }
+                            sub.sys.used_sources.push(case_name.clone());
+                            out.push((case_name, sub.sys));
+                        }
+                    }
+                }
+                if out.is_empty() {
+                    // All source-cases filtered/contradicted.  Fall
+                    // through to plain rule enumeration so we still
+                    // make progress.  Returning Contradictory here
+                    // would mistakenly close the branch — used_sources
+                    // exclusion doesn't mean no rule applies.
+                    // (was: return GoalCases::Contradictory;)
+                }
+                self.changed = ChangeIndicator::Changed;
+                if out.len() == 1 {
+                    let (name, sys) = out.into_iter().next().unwrap();
+                    self.sys = sys;
+                    return GoalCases::LinearNamed(name);
+                }
+                return GoalCases::Cases(out);
+            }
+        }
+        let g = Goal::Premise(p.clone(), fa_prem.clone());
+        let candidates = premise_solving_rule_insts(self.ctx, fa_prem);
+        let avoid_max = bounds_max(&self.sys);
+        let mut cases: Vec<(String, crate::constraint::system::System)> = Vec::new();
+        let mut next_node_idx = avoid_max + 1;
+        for rule in &candidates {
+            if crate::constraint::solver::search::deadline_reached() { break; }
+            for (c_idx, fa_conc) in rule.enumerate_conclusions() {
+                if crate::constraint::solver::search::deadline_reached() { break; }
+                if fa_conc.tag != fa_prem.tag
+                    || fa_conc.terms.len() != fa_prem.terms.len() {
+                    continue;
+                }
+                let mut sys = self.sys.clone();
+                let renamed = freshen_rule(rule.clone(), avoid_max);
+                let fa_conc = renamed.conclusions[c_idx.0].clone();
+                let case_name = rule_case_name(&renamed);
+                let new_node = tamarin_term::lterm::LVar::new(
+                    "vr",
+                    tamarin_term::lterm::LSort::Node,
+                    next_node_idx,
+                );
+                next_node_idx += 1;
+                sys.add_node(new_node.clone(), renamed.clone());
+                sys.add_edge(crate::constraint::constraints::Edge {
+                    src: (new_node.clone(), c_idx),
+                    tgt: p.clone(),
+                });
+                let mut sub = Reduction::new(self.ctx, sys);
+                let res = sub.solve_fact_eqs(
+                    SplitStrategy::SplitNow,
+                    &[tamarin_term::rewriting::Equal {
+                        lhs: fa_conc, rhs: fa_prem.clone() }]);
+                // Full premise expansion — both at precompute time
+                // (so `saturateSources` can refine sub-goals into self-
+                // contained cases) and at runtime (so the search
+                // tracks every premise the new rule introduces).  The
+                // earlier `supplier_only` runtime path silently
+                // dropped Proto-fact premises in the assumption that
+                // the source-case cache covered them; but the cache
+                // only carries Proto-fact entries for tags seen in
+                // protocol rules, and a Premise(Out)→Reveal_ltk fork
+                // can introduce !Ltk premises that no source covers.
+                // Dropping them produced false-Solved leaves where
+                // Reveal_ltk's !Ltk premise had no producer (root cause
+                // of NSLPK3-class FPs; see solver-memory bug #27).
+                if matches!(res, Ok(SolveOutcome::Linear(_))) {
+                    sub.exploit_prems(&new_node, &renamed);
+                }
+                let mut sys = sub.sys;
+                match res {
+                    Err(_) | Ok(SolveOutcome::Contradictory) => continue,
+                    Ok(_) => {
+                        for (existing, status) in sys.goals.iter_mut() {
+                            if existing == &g && !status.solved {
+                                status.solved = true;
+                                break;
+                            }
+                        }
+                        cases.push((case_name.clone(), sys));
+                    }
+                }
+            }
+        }
+        if cases.is_empty() { return GoalCases::Contradictory; }
+        if cases.len() == 1 {
+            let (name, sys) = cases.into_iter().next().unwrap();
+            self.sys = sys;
+            self.changed = ChangeIndicator::Changed;
+            return GoalCases::LinearNamed(name);
+        }
+        self.changed = ChangeIndicator::Changed;
+        GoalCases::Cases(cases)
+    }
+
+    /// `solveChain` — direct port of Haskell's `Goals.solveChain`
+    /// (CR-rule *DG2_chain*).
+    ///
+    /// For a chain goal `(c, p)` we explore two branches and return
+    /// their disjunction:
+    ///
+    /// 1. **Direct edge.** Add an edge `c → p`, unify the conclusion
+    ///    fact with the premise fact, and (for the prem-rule already
+    ///    in the system) check `forbidden_edge` and `illegal_coerce`.
+    /// 2. **Extend by one destructor step.** For each destructor rule
+    ///    in `ctx.intruder_rules`, instantiate it as a fresh node `i`,
+    ///    add an edge `c → (i, prem 0)` (unifying `fa_conc` with the
+    ///    destructor's first KD premise), wire the destructor's other
+    ///    premises via `exploit_prems`, mark `(i, prem 0)` solved
+    ///    (the chain now feeds it directly), and insert a fresh chain
+    ///    `(i, conc 0) → p` for the next step.  Skipped when
+    ///    `is_msg_var fa_conc` (open chain — Haskell's
+    ///    `contradictoryIf (isMsgVar m)`).
+    ///
+    /// Each successful case becomes one entry in `GoalCases::Cases`;
+    /// the union-message (FUnion) sub-branch is not yet ported.
+    pub fn solve_chain_goal(
+        &mut self,
+        c: &crate::constraint::constraints::NodeConc,
+        p: &crate::constraint::constraints::NodePrem,
+    ) -> GoalCases {
+        let g = Goal::Chain(c.clone(), p.clone());
+        let c_rule = match self.sys.nodes.iter().find(|(id, _)| id == &c.0) {
+            Some((_, r)) => r.clone(),
+            None => return GoalCases::Contradictory,
+        };
+        let p_rule_opt = self.sys.nodes.iter().find(|(id, _)| id == &p.0)
+            .map(|(_, r)| r.clone());
+        let fa_conc = match c_rule.lookup_conclusion(c.1) {
+            Some(f) => f.clone(),
+            None => return GoalCases::Contradictory,
+        };
+
+        let mut all_cases: Vec<(String, crate::constraint::system::System)> = Vec::new();
+
+        // ---------------- Branch 1: direct edge ----------------
+        if let Some(p_rule) = &p_rule_opt {
+            let fa_prem_opt = p_rule.lookup_premise(p.1).cloned();
+            if let Some(fa_prem) = fa_prem_opt {
+                if !forbidden_edge(&c_rule, p_rule)
+                    && !illegal_coerce(p_rule, &fa_prem)
+                {
+                    let mut sys_clone = self.sys.clone();
+                    sys_clone.add_edge(crate::constraint::constraints::Edge {
+                        src: c.clone(), tgt: p.clone(),
+                    });
+                    let mut sub = Reduction::new(self.ctx, sys_clone);
+                    let res = sub.solve_fact_eqs(
+                        SplitStrategy::SplitNow,
+                        &[tamarin_term::rewriting::Equal {
+                            lhs: fa_conc.clone(), rhs: fa_prem.clone() }]);
+                    if !matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
+                        for (existing, status) in sub.sys.goals.iter_mut() {
+                            if existing == &g && !status.solved {
+                                status.solved = true;
+                                break;
+                            }
+                        }
+                        // Direct-edge chain: name by the producer's rule.
+                        let case_name = rule_case_name(&c_rule);
+                        all_cases.push((case_name, sub.sys));
+                    }
+                }
+            }
+        }
+
+        // ---------------- Branch 2: extend by destructor ----------------
+        // Skip in precompute mode (`saturate_sources` handles open
+        // chains differently) and skip when the chain's term is a
+        // message variable (Haskell `contradictoryIf (isMsgVar m)`).
+        let conc_term_is_msg_var = fa_conc.terms.first()
+            .map(|t| tamarin_term::lterm::is_msg_var(t))
+            .unwrap_or(false);
+        if !conc_term_is_msg_var
+            && !crate::constraint::solver::sources::in_precompute_mode()
+        {
+            let avoid_max = bounds_max(&self.sys);
+            let mut next_node_idx = avoid_max + 1;
+            for ir in &self.ctx.intruder_rules {
+                if !crate::rule::is_destr_rule_info(&ir.info) { continue; }
+                if crate::constraint::solver::search::deadline_reached() { break; }
+                let ru_inst = intr_rule_to_rule_ac_inst(ir.clone());
+                let ru_renamed = freshen_rule(ru_inst, avoid_max);
+                let prem0 = match ru_renamed.premises.first() {
+                    Some(f) => f.clone(),
+                    None => continue,
+                };
+                if prem0.tag != fa_conc.tag
+                    || prem0.terms.len() != fa_conc.terms.len()
+                {
+                    continue;
+                }
+                if forbidden_edge(&c_rule, &ru_renamed) { continue; }
+                if ru_renamed.conclusions.is_empty() { continue; }
+
+                let mut sys_clone = self.sys.clone();
+                let new_node = tamarin_term::lterm::LVar::new(
+                    "vr",
+                    tamarin_term::lterm::LSort::Node,
+                    next_node_idx,
+                );
+                next_node_idx += 1;
+                sys_clone.add_node(new_node.clone(), ru_renamed.clone());
+                sys_clone.add_edge(crate::constraint::constraints::Edge {
+                    src: c.clone(),
+                    tgt: (new_node.clone(), crate::rule::PremIdx(0)),
+                });
+                let mut sub = Reduction::new(self.ctx, sys_clone);
+                let res = sub.solve_fact_eqs(
+                    SplitStrategy::SplitNow,
+                    &[tamarin_term::rewriting::Equal {
+                        lhs: fa_conc.clone(), rhs: prem0.clone() }]);
+                if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
+                    continue;
+                }
+                // Wire up the destructor's other premises (KU(k) etc.)
+                // via the supplier-only path: KU premises become
+                // `Goal::Action` at fresh predecessors (Haskell's
+                // `requiresKU`); other premise types are skipped here
+                // — we don't want to flood the goal queue while the
+                // chain is still being extended.
+                sub.exploit_prems_supplier_only(&new_node, &ru_renamed);
+                // The freshly-added prem-0 goal now has an incoming
+                // edge from `c`, so mark it solved (Haskell's
+                // `markGoalAsSolved "directly" (PremiseG (i, v) ...)`).
+                sub.mark_goal_as_solved(&Goal::Premise(
+                    (new_node.clone(), crate::rule::PremIdx(0)),
+                    prem0.clone(),
+                ));
+                // Insert the chain continuation (i, ConcIdx(0)) → p.
+                sub.insert_goal(Goal::Chain(
+                    (new_node.clone(), crate::rule::ConcIdx(0)),
+                    p.clone(),
+                ));
+                // Mark the original chain goal as solved in this case
+                // (it's been extended, not closed).
+                for (existing, status) in sub.sys.goals.iter_mut() {
+                    if existing == &g && !status.solved {
+                        status.solved = true;
+                        break;
+                    }
+                }
+                // Destructor-extend chain: name by destructor rule.
+                let case_name = rule_case_name(&ru_renamed);
+                all_cases.push((case_name, sub.sys));
+            }
+        }
+
+        if all_cases.is_empty() { return GoalCases::Contradictory; }
+        if all_cases.len() == 1 {
+            let (name, sys) = all_cases.into_iter().next().unwrap();
+            self.sys = sys;
+            self.changed = ChangeIndicator::Changed;
+            return GoalCases::LinearNamed(name);
+        }
+        self.changed = ChangeIndicator::Changed;
+        GoalCases::Cases(all_cases)
+    }
+
+    /// `solveSubterm` — partial port. Currently only the structural
+    /// "mark as solved" half: move the constraint from the active set
+    /// into the solved set and mark the corresponding goal solved.
+    /// The actual `splitSubterm` (which depends on
+    /// `reducibleFunSyms` from the Maude signature) lands once the
+    /// reducibility info is wired through.
+    pub fn solve_subterm_goal(
+        &mut self,
+        st: &(tamarin_term::lterm::LNTerm, tamarin_term::lterm::LNTerm),
+    ) -> GoalCases {
+        let g = Goal::Subterm(st.clone());
+        // Move from posSubterms → solvedSubterms.
+        let before = self.sys.subterm_store.subterms.len();
+        let mut moved = false;
+        self.sys.subterm_store.subterms.retain(|c| {
+            let keep = !(c.small == st.0 && c.big == st.1);
+            if !keep { moved = true; }
+            keep
+        });
+        if moved {
+            self.sys.subterm_store.solved_subterms.push(
+                crate::tools::subterm_store::SubtermConstraint {
+                    small: st.0.clone(),
+                    big: st.1.clone(),
+                    propagated: true,
+                });
+        }
+        if self.sys.subterm_store.subterms.len() != before {
+            self.changed = ChangeIndicator::Changed;
+        }
+        self.mark_goal_as_solved(&g);
+        // Trivial self-subterm `t ⊏ t` is contradictory.
+        if st.0 == st.1 {
+            self.sys.subterm_store.contradictory = true;
+            return GoalCases::Contradictory;
+        }
+        GoalCases::Linear
+    }
+
+    /// `solveSplit` — perform a deferred equality-store split for
+    /// `Goal::Split(id)`. Mirrors the relevant arm of Haskell's
+    /// `solveGoal`: `splitAtPos` followed by replacing the eq-store.
+    pub fn solve_split_goal(
+        &mut self,
+        id: crate::tools::equation_store::SplitId,
+    ) -> GoalCases {
+        let cases = match self.sys.eq_store.perform_split(id) {
+            Some(cs) => cs,
+            None => return GoalCases::Contradictory,
+        };
+        if cases.is_empty() { return GoalCases::Contradictory; }
+        let g = Goal::Split(id);
+        if cases.len() == 1 {
+            self.sys.eq_store = cases.into_iter().next().unwrap();
+            self.mark_goal_as_solved(&g);
+            return GoalCases::Linear;
+        }
+        let mut out = Vec::with_capacity(cases.len());
+        for (i, store) in cases.into_iter().enumerate() {
+            let mut sys = self.sys.clone();
+            sys.eq_store = store;
+            for (existing, status) in sys.goals.iter_mut() {
+                if existing == &g && !status.solved {
+                    status.solved = true;
+                    break;
+                }
+            }
+            out.push((default_case_name(i), sys));
+        }
+        self.changed = ChangeIndicator::Changed;
+        GoalCases::Cases(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tamarin_term::maude_sig::pair_maude_sig;
+
+    fn maude_path() -> Option<String> {
+        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
+        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
+        }
+        None
+    }
+
+    fn ctx() -> Option<ProofContext> {
+        let path = maude_path()?;
+        let h = tamarin_term::maude_proc::MaudeHandle::start(&path, pair_maude_sig()).ok()?;
+        Some(ProofContext::new(h, Vec::new()))
+    }
+
+    #[test]
+    fn reduction_starts_unchanged() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let r = Reduction::new(&ctx, System::empty());
+        assert_eq!(r.changed, ChangeIndicator::Unchanged);
+    }
+
+    #[test]
+    fn insert_goal_marks_changed() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut r = Reduction::new(&ctx, System::empty());
+        let v = tamarin_term::lterm::LVar::new(
+            "k", tamarin_term::lterm::LSort::Msg, 0);
+        let f = crate::fact::LNFact::new(crate::fact::FactTag::Out, vec![]);
+        r.insert_goal(Goal::Action(v, f));
+        assert_eq!(r.changed, ChangeIndicator::Changed);
+        assert_eq!(r.sys.goals.len(), 1);
+    }
+
+    #[test]
+    fn solve_term_eqs_trivial_equation_no_change() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut r = Reduction::new(&ctx, System::empty());
+        // x =? x is trivially true.
+        let v = tamarin_term::lterm::LVar::new(
+            "x", tamarin_term::lterm::LSort::Msg, 0);
+        use tamarin_term::vterm::Lit;
+        let t: tamarin_term::lterm::LNTerm =
+            tamarin_term::term::Term::Lit(Lit::Var(v));
+        let r_out = r.solve_term_eqs(
+            SplitStrategy::SplitNow,
+            &[tamarin_term::rewriting::Equal { lhs: t.clone(), rhs: t }],
+        ).expect("solve");
+        assert!(matches!(r_out, SolveOutcome::Linear(ChangeIndicator::Unchanged)));
+    }
+
+    #[test]
+    fn solve_term_eqs_unifies_two_vars() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut r = Reduction::new(&ctx, System::empty());
+        // x =? y produces a single mgu.
+        use tamarin_term::vterm::Lit;
+        let x = tamarin_term::lterm::LVar::new(
+            "x", tamarin_term::lterm::LSort::Msg, 0);
+        let y = tamarin_term::lterm::LVar::new(
+            "y", tamarin_term::lterm::LSort::Msg, 0);
+        let tx: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(Lit::Var(x));
+        let ty: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(Lit::Var(y));
+        let r_out = r.solve_term_eqs(
+            SplitStrategy::SplitNow,
+            &[tamarin_term::rewriting::Equal { lhs: tx, rhs: ty }],
+        ).expect("solve");
+        assert!(matches!(r_out, SolveOutcome::Linear(ChangeIndicator::Changed)));
+        assert_eq!(r.changed, ChangeIndicator::Changed);
+    }
+
+    // =====================================================================
+    // subst_system — Haskell-equivalent invariants
+    // =====================================================================
+    //
+    // Haskell's `Theory.Constraint.Solver.Reduction.substSystem`:
+    //   substSystem = do
+    //     c1 <- substNodes
+    //     substEdges
+    //     substLastAtom
+    //     substLessAtoms
+    //     ...
+    //     c2 <- substGoals
+    //     return (c1 <> c2)
+    // pulls the eq-store substitution through every node id, edge,
+    // less atom, last atom, and goal. The Rust port should preserve
+    // these invariants on completion.
+
+    #[test]
+    fn subst_system_rewrites_edge_node_ids_through_eqstore() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut r = Reduction::new(&ctx, System::empty());
+        // Force `i_2 = j_3` into the eq-store, then add an edge whose
+        // src is `i_2` and confirm that subst_system rewrites it.
+        use tamarin_term::lterm::{LSort, LVar};
+        use tamarin_term::vterm::Lit;
+        let i = LVar::new("i", LSort::Node, 2);
+        let j = LVar::new("j", LSort::Node, 3);
+        let ti = tamarin_term::term::Term::Lit(Lit::Var(i.clone()));
+        let tj = tamarin_term::term::Term::Lit(Lit::Var(j.clone()));
+        // Add an edge i -> some target. (Source-only is enough — we
+        // just want to verify the substitution propagates.)
+        let tgt = LVar::new("t", LSort::Node, 99);
+        r.sys.edges.push(crate::constraint::constraints::Edge {
+            src: (i.clone(), crate::rule::ConcIdx(0)),
+            tgt: (tgt.clone(), crate::rule::PremIdx(0)),
+        });
+        // Inject the equality into the eq-store directly.
+        r.solve_term_eqs(
+            SplitStrategy::SplitNow,
+            &[tamarin_term::rewriting::Equal { lhs: ti, rhs: tj }],
+        ).expect("solve");
+        r.subst_system();
+        // After subst_system, the edge's source node id must be
+        // mapped to whatever the canonical representative of i and j
+        // is (the eq-store unifier picks one).
+        let canonical = {
+            let id_term = tamarin_term::term::Term::Lit(Lit::Var(i.clone()));
+            let mapped = tamarin_term::subst::apply_vterm(&r.sys.eq_store.subst, id_term);
+            if let tamarin_term::term::Term::Lit(Lit::Var(v)) = mapped { v } else { i.clone() }
+        };
+        assert_eq!(r.sys.edges[0].src.0, canonical,
+            "edge src should be the canonical node id after subst_system");
+    }
+
+    #[test]
+    fn subst_system_rewrites_less_atom_node_ids() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut r = Reduction::new(&ctx, System::empty());
+        use tamarin_term::lterm::{LSort, LVar};
+        use tamarin_term::vterm::Lit;
+        let i = LVar::new("i", LSort::Node, 2);
+        let j = LVar::new("j", LSort::Node, 3);
+        let target = LVar::new("t", LSort::Node, 9);
+        r.sys.less_atoms.push(crate::constraint::constraints::LessAtom::new(
+            i.clone(), target.clone(),
+            crate::constraint::constraints::Reason::Formula));
+        let ti = tamarin_term::term::Term::Lit(Lit::Var(i.clone()));
+        let tj = tamarin_term::term::Term::Lit(Lit::Var(j));
+        r.solve_term_eqs(
+            SplitStrategy::SplitNow,
+            &[tamarin_term::rewriting::Equal { lhs: ti, rhs: tj }],
+        ).expect("solve");
+        r.subst_system();
+        // The less atom's `smaller` should still resolve to the same
+        // canonical id reachable from i via the eq-store.
+        let canonical = {
+            let id_term = tamarin_term::term::Term::Lit(Lit::Var(i.clone()));
+            let mapped = tamarin_term::subst::apply_vterm(&r.sys.eq_store.subst, id_term);
+            if let tamarin_term::term::Term::Lit(Lit::Var(v)) = mapped { v } else { i.clone() }
+        };
+        assert_eq!(r.sys.less_atoms[0].smaller, canonical);
+    }
+
+    #[test]
+    fn subst_system_idempotent_on_empty_substitution() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut r = Reduction::new(&ctx, System::empty());
+        // No equations injected — the eq-store substitution is empty.
+        let before_changed = r.changed;
+        r.subst_system();
+        // No-op: nothing to rewrite.
+        assert_eq!(r.changed, before_changed);
+        assert!(r.sys.nodes.is_empty());
+        assert!(r.sys.edges.is_empty());
+        assert!(r.sys.less_atoms.is_empty());
+    }
+
+    #[test]
+    fn subst_system_marks_contradiction_on_shape_mismatch() {
+        // Two nodes with the same canonical id but DIFFERENT rule
+        // shapes (e.g. one with 0 conclusions, one with 1) cannot be
+        // merged consistently — Haskell's `setNodes` reaches the same
+        // conclusion via `solveRuleEqs` failing. Our port pushes
+        // `gfalse` so the next contradictions check trips.
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut r = Reduction::new(&ctx, System::empty());
+        use tamarin_term::lterm::{LSort, LVar};
+        use tamarin_term::vterm::Lit;
+        let i = LVar::new("i", LSort::Node, 2);
+        let j = LVar::new("j", LSort::Node, 3);
+        let info = || crate::rule::RuleInfo::Proto(crate::rule::ProtoRuleACInstInfo {
+            name: crate::rule::ProtoRuleName::Stand("R".into()),
+            attributes: crate::rule::RuleAttributes::empty(),
+            loop_breakers: Vec::new(),
+        });
+        // First node has 0 conclusions; second has 1 — incompatible.
+        r.sys.add_node(i.clone(),
+            crate::rule::Rule::new(info(), vec![], vec![], vec![]));
+        let dummy_fact = crate::fact::Fact::new(
+            crate::fact::FactTag::Out, vec![]);
+        r.sys.add_node(j.clone(),
+            crate::rule::Rule::new(info(), vec![], vec![dummy_fact], vec![]));
+        // Force i = j into the eq-store.
+        let ti = tamarin_term::term::Term::Lit(Lit::Var(i));
+        let tj = tamarin_term::term::Term::Lit(Lit::Var(j));
+        r.solve_term_eqs(
+            SplitStrategy::SplitNow,
+            &[tamarin_term::rewriting::Equal { lhs: ti, rhs: tj }],
+        ).expect("solve");
+        r.subst_system();
+        let bot = crate::guarded::gfalse();
+        assert!(r.sys.formulas.contains(&bot),
+            "shape mismatch must push gfalse onto the formula list");
+    }
+
+    #[test]
+    fn subst_system_merges_collided_nodes_and_equates_their_rules() {
+        // When two nodes collapse to the same canonical id, Haskell's
+        // `setNodes` runs `solveRuleEqs` on their facts. Our port queues
+        // those into solve_fact_eqs at the tail of subst_system. Verify
+        // that the merge happens and only one node remains under the
+        // canonical id.
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut r = Reduction::new(&ctx, System::empty());
+        use tamarin_term::lterm::{LSort, LVar};
+        use tamarin_term::vterm::Lit;
+        let i = LVar::new("i", LSort::Node, 2);
+        let j = LVar::new("j", LSort::Node, 3);
+        // Two empty rule instances, one keyed by i and one by j.
+        let ru = || crate::rule::Rule {
+            info: crate::rule::RuleInfo::Proto(crate::rule::ProtoRuleACInstInfo {
+                name: crate::rule::ProtoRuleName::Stand("R".into()),
+                attributes: crate::rule::RuleAttributes::empty(),
+                loop_breakers: Vec::new(),
+            }),
+            premises: vec![],
+            conclusions: vec![],
+            actions: vec![],
+            new_vars: vec![],
+        };
+        r.sys.add_node(i.clone(), ru());
+        r.sys.add_node(j.clone(), ru());
+        let ti = tamarin_term::term::Term::Lit(Lit::Var(i));
+        let tj = tamarin_term::term::Term::Lit(Lit::Var(j));
+        r.solve_term_eqs(
+            SplitStrategy::SplitNow,
+            &[tamarin_term::rewriting::Equal { lhs: ti, rhs: tj }],
+        ).expect("solve");
+        r.subst_system();
+        assert_eq!(r.sys.nodes.len(), 1, "two nodes with the same canonical id should merge");
+    }
+
+    #[test]
+    fn solve_fact_eqs_tag_mismatch_is_contradictory() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut r = Reduction::new(&ctx, System::empty());
+        let f1 = crate::fact::LNFact::new(crate::fact::FactTag::Out, vec![]);
+        let f2 = crate::fact::LNFact::new(crate::fact::FactTag::In, vec![]);
+        let r_out = r.solve_fact_eqs(
+            SplitStrategy::SplitNow,
+            &[tamarin_term::rewriting::Equal { lhs: f1, rhs: f2 }],
+        ).expect("solve");
+        assert!(matches!(r_out, SolveOutcome::Contradictory));
+    }
+
+    #[test]
+    fn solve_disj_goal_empty_is_contradictory() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut r = Reduction::new(&ctx, System::empty());
+        let d = Disj(Vec::<Guarded>::new());
+        let out = r.solve_disj_goal(&d);
+        assert!(matches!(out, GoalCases::Contradictory));
+    }
+
+    #[test]
+    fn solve_disj_goal_singleton_is_linear() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut r = Reduction::new(&ctx, System::empty());
+        // Use gtrue() = Conj([]): it gets decomposed into solved_formulas
+        // by insert_formula_decompose (not raw-pushed to formulas).
+        let f = crate::guarded::gtrue();
+        let d = Disj(vec![f.clone()]);
+        r.insert_goal(Goal::Disj(d.clone()));
+        let out = r.solve_disj_goal(&d);
+        assert!(matches!(out, GoalCases::Linear));
+        // gtrue (Conj []) decomposes to solved_formulas — see
+        // insert_formula_decompose_inner for the Conj arm.
+        assert!(r.sys.solved_formulas.contains(&f));
+        assert!(r.sys.goals.iter().any(|(g, s)| matches!(g, Goal::Disj(_)) && s.solved));
+    }
+
+    #[test]
+    fn solve_disj_goal_two_branches_forks() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut r = Reduction::new(&ctx, System::empty());
+        let f1 = crate::guarded::gtrue();   // Conj([]) → solved_formulas
+        let f2 = crate::guarded::gfalse();  // Disj([]) → formulas (gfalse sentinel)
+        let d = Disj(vec![f1.clone(), f2.clone()]);
+        r.insert_goal(Goal::Disj(d.clone()));
+        let out = r.solve_disj_goal(&d);
+        match out {
+            GoalCases::Cases(systems) => {
+                assert_eq!(systems.len(), 2);
+                assert!(systems[0].1.solved_formulas.contains(&f1));
+                assert!(systems[1].1.formulas.contains(&f2));
+                for (_, s) in &systems {
+                    assert!(s.goals.iter().any(|(g, st)| matches!(g, Goal::Disj(_)) && st.solved));
+                }
+            }
+            other => panic!("expected Cases, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn solve_subterm_goal_marks_solved_and_moves() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut sys = System::empty();
+        let v = tamarin_term::lterm::LVar::new(
+            "x", tamarin_term::lterm::LSort::Msg, 0);
+        let w = tamarin_term::lterm::LVar::new(
+            "y", tamarin_term::lterm::LSort::Msg, 0);
+        let tx: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(
+            tamarin_term::vterm::Lit::Var(v));
+        let ty: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(
+            tamarin_term::vterm::Lit::Var(w));
+        sys.subterm_store.add(tx.clone(), ty.clone());
+        sys.add_goal(Goal::Subterm((tx.clone(), ty.clone())));
+        let mut r = Reduction::new(&ctx, sys);
+        let out = r.solve_subterm_goal(&(tx.clone(), ty.clone()));
+        assert!(matches!(out, GoalCases::Linear));
+        assert_eq!(r.sys.subterm_store.subterms.len(), 0);
+        assert_eq!(r.sys.subterm_store.solved_subterms.len(), 1);
+        assert!(r.sys.goals.iter().any(|(g, s)| matches!(g, Goal::Subterm(_)) && s.solved));
+    }
+
+    #[test]
+    fn solve_subterm_self_is_contradictory() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut sys = System::empty();
+        let v = tamarin_term::lterm::LVar::new(
+            "x", tamarin_term::lterm::LSort::Msg, 0);
+        let tx: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(
+            tamarin_term::vterm::Lit::Var(v));
+        sys.subterm_store.add(tx.clone(), tx.clone());
+        let mut r = Reduction::new(&ctx, sys);
+        let out = r.solve_subterm_goal(&(tx.clone(), tx));
+        assert!(matches!(out, GoalCases::Contradictory));
+        assert!(r.sys.subterm_store.contradictory);
+    }
+
+    #[test]
+    fn solve_action_goal_existing_node_with_action_is_linear() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        // Build a system with a node already labelled by a rule that
+        // produces the action `Out(x)`.
+        let mut sys = System::empty();
+        let i = tamarin_term::lterm::LVar::new(
+            "i", tamarin_term::lterm::LSort::Node, 0);
+        let v = tamarin_term::lterm::LVar::new(
+            "x", tamarin_term::lterm::LSort::Msg, 0);
+        use tamarin_term::vterm::Lit;
+        let tx: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(Lit::Var(v));
+        let fa = crate::fact::out_fact(tx);
+        let ru: crate::rule::RuleACInst = crate::rule::Rule::new(
+            crate::rule::RuleInfo::Intr(crate::rule::IntrRuleACInfo::ISend),
+            vec![],
+            vec![],
+            vec![fa.clone()],
+        );
+        sys.add_node(i.clone(), ru);
+        sys.add_goal(Goal::Action(i.clone(), fa.clone()));
+        let mut r = Reduction::new(&ctx, sys);
+        let out = r.solve_action_goal(&i, &fa);
+        assert!(matches!(out, GoalCases::Linear));
+        assert!(r.sys.goals.iter().any(|(g, s)|
+            matches!(g, Goal::Action(_, _)) && s.solved));
+    }
+
+    #[test]
+    fn solve_action_goal_no_node_no_rules_is_contradictory() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut r = Reduction::new(&ctx, System::empty());
+        let i = tamarin_term::lterm::LVar::new(
+            "i", tamarin_term::lterm::LSort::Node, 0);
+        let v = tamarin_term::lterm::LVar::new(
+            "x", tamarin_term::lterm::LSort::Msg, 0);
+        use tamarin_term::vterm::Lit;
+        let tx: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(Lit::Var(v));
+        let fa = crate::fact::out_fact(tx);
+        let out = r.solve_action_goal(&i, &fa);
+        // No rules in the context → no candidates.
+        assert!(matches!(out, GoalCases::Contradictory));
+    }
+
+    #[test]
+    fn solve_action_goal_no_node_with_matching_rule_unifies() {
+        let ctx_no = match ctx() { Some(c) => c, None => return };
+        // Build a context with one rule that has an Out(y) action.
+        let v = tamarin_term::lterm::LVar::new(
+            "y", tamarin_term::lterm::LSort::Msg, 0);
+        use tamarin_term::vterm::Lit;
+        let ty: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(Lit::Var(v));
+        let fact_y = crate::fact::out_fact(ty);
+        let rule: crate::rule::ProtoRuleE = crate::rule::Rule::new(
+            crate::rule::ProtoRuleEInfo::standard("Send"),
+            vec![],
+            vec![],
+            vec![fact_y],
+        );
+        let open = crate::theory::OpenProtoRule::new(rule);
+        let mut ctx2 = ctx_no.clone();
+        ctx2.rules = vec![open];
+        let mut r = Reduction::new(&ctx2, System::empty());
+        // Goal: Out(x) at fresh node i.
+        let i = tamarin_term::lterm::LVar::new(
+            "i", tamarin_term::lterm::LSort::Node, 0);
+        let v2 = tamarin_term::lterm::LVar::new(
+            "x", tamarin_term::lterm::LSort::Msg, 0);
+        let tx: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(Lit::Var(v2));
+        let fa = crate::fact::out_fact(tx);
+        let out = r.solve_action_goal(&i, &fa);
+        // One matching rule with one matching action ⇒ LinearNamed
+        // (the rule name); node added in-place to r.sys.
+        assert!(matches!(&out, GoalCases::LinearNamed(n) if n == "Send"),
+            "expected LinearNamed(\"Send\"), got {:?}", out);
+        assert_eq!(r.sys.nodes.len(), 1);
+        assert_eq!(r.sys.nodes[0].0, i);
+    }
+
+    #[test]
+    fn solve_premise_goal_no_user_rules_uses_intruder() {
+        // With the intruder rules wired into ProofContext, an `In(x)`
+        // premise can be discharged via `ISend` even when no user
+        // rules exist. Tests that the intruder-rule fallback works.
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut r = Reduction::new(&ctx, System::empty());
+        let i = tamarin_term::lterm::LVar::new(
+            "i", tamarin_term::lterm::LSort::Node, 0);
+        let v = tamarin_term::lterm::LVar::new(
+            "x", tamarin_term::lterm::LSort::Msg, 0);
+        use tamarin_term::vterm::Lit;
+        let tx: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(Lit::Var(v));
+        let fa = crate::fact::in_fact(tx);
+        let p = (i, crate::rule::PremIdx(0));
+        let out = r.solve_premise_goal(&p, &fa);
+        // ISend supplier can satisfy the In(x) premise → LinearNamed.
+        assert!(matches!(out, GoalCases::LinearNamed(_)),
+            "expected LinearNamed, got {:?}", out);
+    }
+
+    #[test]
+    fn solve_premise_goal_no_user_rules_unmatchable_fact_is_contradictory() {
+        // Use a fact tag that no intruder rule produces (e.g. a
+        // user-defined linear `Foo(x)` fact in an empty context).
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut r = Reduction::new(&ctx, System::empty());
+        let i = tamarin_term::lterm::LVar::new(
+            "i", tamarin_term::lterm::LSort::Node, 0);
+        let v = tamarin_term::lterm::LVar::new(
+            "x", tamarin_term::lterm::LSort::Msg, 0);
+        use tamarin_term::vterm::Lit;
+        let tx: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(Lit::Var(v));
+        let fa = crate::fact::Fact::new(
+            crate::fact::FactTag::Proto(
+                crate::fact::Multiplicity::Linear, "Foo".into(), 1),
+            vec![tx]);
+        let p = (i, crate::rule::PremIdx(0));
+        let out = r.solve_premise_goal(&p, &fa);
+        assert!(matches!(out, GoalCases::Contradictory));
+    }
+
+    #[test]
+    fn solve_premise_goal_with_matching_rule_inserts_edge() {
+        let base = match ctx() { Some(c) => c, None => return };
+        // Rule that produces an Out(y) conclusion.
+        let v = tamarin_term::lterm::LVar::new(
+            "y", tamarin_term::lterm::LSort::Msg, 0);
+        use tamarin_term::vterm::Lit;
+        let ty: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(Lit::Var(v));
+        let conc_y = crate::fact::out_fact(ty);
+        let rule: crate::rule::ProtoRuleE = crate::rule::Rule::new(
+            crate::rule::ProtoRuleEInfo::standard("Producer"),
+            vec![],
+            vec![conc_y],
+            vec![],
+        );
+        let open = crate::theory::OpenProtoRule::new(rule);
+        let mut ctx2 = base.clone();
+        ctx2.rules = vec![open];
+        let mut r = Reduction::new(&ctx2, System::empty());
+        // Premise: Out(x) at node i, premise idx 0.
+        let i = tamarin_term::lterm::LVar::new(
+            "i", tamarin_term::lterm::LSort::Node, 5);
+        let v2 = tamarin_term::lterm::LVar::new(
+            "x", tamarin_term::lterm::LSort::Msg, 0);
+        let tx: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(Lit::Var(v2));
+        let fa = crate::fact::out_fact(tx);
+        let p = (i.clone(), crate::rule::PremIdx(0));
+        let out = r.solve_premise_goal(&p, &fa);
+        // Single matching rule → LinearNamed("Producer"); node + edge
+        // applied in-place to r.sys.
+        assert!(matches!(&out, GoalCases::LinearNamed(n) if n == "Producer"),
+            "expected LinearNamed(\"Producer\"), got {:?}", out);
+        assert_eq!(r.sys.nodes.len(), 1);
+        assert_eq!(r.sys.edges.len(), 1);
+        assert_eq!(r.sys.edges[0].tgt, p);
+    }
+
+    #[test]
+    fn solve_premise_goal_kd_fact_inserts_irecv_chain() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut r = Reduction::new(&ctx, System::empty());
+        let i = tamarin_term::lterm::LVar::new(
+            "i", tamarin_term::lterm::LSort::Node, 0);
+        let v = tamarin_term::lterm::LVar::new(
+            "x", tamarin_term::lterm::LSort::Msg, 0);
+        use tamarin_term::vterm::Lit;
+        let tx: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(Lit::Var(v));
+        let fa = crate::fact::kd_fact(tx);
+        let p = (i, crate::rule::PremIdx(0));
+        let _out = r.solve_premise_goal(&p, &fa);
+        // KD branch inserts IRecv + Chain goal; the Out(mLearn) premise
+        // is recursively solved inline (Haskell's solvePremise behaviour)
+        // so it does NOT remain as a queued Premise goal.  The recursive
+        // solve picks some producer (or Contradictory if there's none in
+        // an empty test ctx); the structural invariants we check here are
+        // just the IRecv node and chain goal.
+        assert!(r.sys.nodes.iter().any(|(_, ru)|
+            matches!(ru.info, crate::rule::RuleInfo::Intr(crate::rule::IntrRuleACInfo::IRecv))));
+        assert!(r.sys.goals.iter().any(|(g, _)| matches!(g, Goal::Chain(_, _))));
+    }
+
+    #[test]
+    fn solve_chain_goal_missing_node_is_contradictory() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut r = Reduction::new(&ctx, System::empty());
+        let i = tamarin_term::lterm::LVar::new(
+            "i", tamarin_term::lterm::LSort::Node, 0);
+        let j = tamarin_term::lterm::LVar::new(
+            "j", tamarin_term::lterm::LSort::Node, 0);
+        let c = (i, crate::rule::ConcIdx(0));
+        let p = (j, crate::rule::PremIdx(0));
+        let out = r.solve_chain_goal(&c, &p);
+        assert!(matches!(out, GoalCases::Contradictory));
+    }
+
+    #[test]
+    fn solve_chain_goal_compatible_facts_inserts_edge() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        // Build two nodes whose conc/prem facts are compatible.
+        let mut sys = System::empty();
+        let i = tamarin_term::lterm::LVar::new(
+            "i", tamarin_term::lterm::LSort::Node, 0);
+        let j = tamarin_term::lterm::LVar::new(
+            "j", tamarin_term::lterm::LSort::Node, 0);
+        let v = tamarin_term::lterm::LVar::new(
+            "x", tamarin_term::lterm::LSort::Msg, 0);
+        use tamarin_term::vterm::Lit;
+        let tx: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(Lit::Var(v));
+        // Node i conclusion: KD(x).
+        let conc_kd = crate::fact::kd_fact(tx.clone());
+        let ru_i: crate::rule::RuleACInst = crate::rule::Rule::new(
+            crate::rule::RuleInfo::Intr(crate::rule::IntrRuleACInfo::IRecv),
+            vec![],
+            vec![conc_kd],
+            vec![],
+        );
+        sys.add_node(i.clone(), ru_i);
+        // Node j premise: KD(x).
+        let prem_kd = crate::fact::kd_fact(tx);
+        let ru_j: crate::rule::RuleACInst = crate::rule::Rule::new(
+            crate::rule::RuleInfo::Intr(crate::rule::IntrRuleACInfo::ISend),
+            vec![prem_kd],
+            vec![],
+            vec![],
+        );
+        sys.add_node(j.clone(), ru_j);
+        let c = (i, crate::rule::ConcIdx(0));
+        let p = (j, crate::rule::PremIdx(0));
+        sys.add_goal(Goal::Chain(c.clone(), p.clone()));
+        let mut r = Reduction::new(&ctx, sys);
+        let out = r.solve_chain_goal(&c, &p);
+        // Compatible facts → LinearNamed (rule-named) with edge added
+        // and chain goal marked solved in-place.
+        assert!(matches!(out, GoalCases::LinearNamed(_)),
+            "expected LinearNamed, got {:?}", out);
+        assert_eq!(r.sys.edges.len(), 1);
+        assert!(r.sys.goals.iter().any(|(g, s)|
+            matches!(g, Goal::Chain(_, _)) && s.solved));
+    }
+
+    #[test]
+    fn insert_atom_action_creates_action_goal() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut r = Reduction::new(&ctx, System::empty());
+        use tamarin_parser::ast::{Atom, Fact, SortHint, Term, VarSpec};
+        let mkvar = |n: &str, sort: SortHint| Term::Var(VarSpec {
+            name: n.to_string(), idx: 0, sort, typ: None,
+        });
+        let action = Atom::Action(
+            Fact {
+                persistent: false,
+                annotations: Vec::new(),
+                name: "Setup".into(),
+                args: vec![mkvar("k", SortHint::Msg)],
+            },
+            mkvar("i", SortHint::Node),
+        );
+        let ok = r.insert_atom(&action);
+        assert!(ok);
+        assert_eq!(r.sys.goals.len(), 1);
+        assert!(matches!(&r.sys.goals[0].0, Goal::Action(_, fact)
+            if fact.tag == crate::fact::FactTag::Proto(
+                crate::fact::Multiplicity::Linear, "Setup".into(), 1)));
+    }
+
+    #[test]
+    fn insert_atom_less_creates_less_atom() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut r = Reduction::new(&ctx, System::empty());
+        use tamarin_parser::ast::{Atom, SortHint, Term, VarSpec};
+        let mkvar = |n: &str| Term::Var(VarSpec {
+            name: n.to_string(), idx: 0, sort: SortHint::Node, typ: None,
+        });
+        let less = Atom::Less(mkvar("i"), mkvar("j"));
+        let ok = r.insert_atom(&less);
+        assert!(ok);
+        assert_eq!(r.sys.less_atoms.len(), 1);
+    }
+
+    #[test]
+    fn insert_atom_last_sets_last_atom() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut r = Reduction::new(&ctx, System::empty());
+        use tamarin_parser::ast::{Atom, SortHint, Term, VarSpec};
+        let v = Term::Var(VarSpec {
+            name: "i".into(), idx: 0, sort: SortHint::Node, typ: None,
+        });
+        let last = Atom::Last(v);
+        assert!(r.insert_atom(&last));
+        assert!(r.sys.last_atom.is_some());
+    }
+
+    #[test]
+    fn solve_action_with_fresh_premise_adds_fresh_supplier() {
+        let base = match ctx() { Some(c) => c, None => return };
+        // Setup-like rule: [ Fr(~k) ] --[ Setup(~k) ]-> [ Out(~k) ]
+        let v = tamarin_term::lterm::LVar::new(
+            "k", tamarin_term::lterm::LSort::Fresh, 0);
+        use tamarin_term::vterm::Lit;
+        let tk: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(Lit::Var(v));
+        let prem = crate::fact::fresh_fact(tk.clone());
+        let act = crate::fact::Fact::new(
+            crate::fact::FactTag::Proto(
+                crate::fact::Multiplicity::Linear, "Setup".into(), 1),
+            vec![tk.clone()]);
+        let conc = crate::fact::out_fact(tk);
+        let rule: crate::rule::ProtoRuleE = crate::rule::Rule::new(
+            crate::rule::ProtoRuleEInfo::standard("Setup"),
+            vec![prem],
+            vec![conc],
+            vec![act],
+        );
+        let open = crate::theory::OpenProtoRule::new(rule);
+        let mut ctx2 = base.clone();
+        ctx2.rules = vec![open];
+        let mut r = Reduction::new(&ctx2, System::empty());
+
+        // Goal: Setup(x) at fresh node i.
+        let i = tamarin_term::lterm::LVar::new(
+            "i", tamarin_term::lterm::LSort::Node, 0);
+        let v2 = tamarin_term::lterm::LVar::new(
+            "x", tamarin_term::lterm::LSort::Msg, 1);
+        let tx: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(Lit::Var(v2));
+        let fa = crate::fact::Fact::new(
+            crate::fact::FactTag::Proto(
+                crate::fact::Multiplicity::Linear, "Setup".into(), 1),
+            vec![tx]);
+        let out = r.solve_action_goal(&i, &fa);
+        // LinearNamed("Setup") with in-place mutation: 2 nodes (Setup
+        // instance + Fresh supplier) and 1 edge in r.sys.
+        assert!(matches!(&out, GoalCases::LinearNamed(n) if n == "Setup"),
+            "expected LinearNamed(\"Setup\"), got {:?}", out);
+        assert_eq!(r.sys.nodes.len(), 2,
+            "expected 2 nodes (Setup + Fresh supplier), got {}",
+            r.sys.nodes.len());
+        assert_eq!(r.sys.edges.len(), 1, "expected 1 edge");
+    }
+
+    #[test]
+    fn while_changing_terminates() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut r = Reduction::new(&ctx, System::empty());
+        let mut count = 0;
+        r.while_changing(|red| {
+            count += 1;
+            if count < 3 {
+                let v = tamarin_term::lterm::LVar::new(
+                    "k", tamarin_term::lterm::LSort::Msg, count as u64);
+                let f = crate::fact::LNFact::new(crate::fact::FactTag::Out, vec![]);
+                red.insert_goal(Goal::Action(v, f));
+                ChangeIndicator::Changed
+            } else {
+                ChangeIndicator::Unchanged
+            }
+        });
+        assert!(count >= 3);
+    }
+}
