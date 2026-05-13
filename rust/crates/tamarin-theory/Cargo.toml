@@ -1,0 +1,16 @@
+[package]
+name = "tamarin-theory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Theory representation for the Tamarin prover (Rust port)."
+
+[dependencies]
+tamarin-utils = { workspace = true }
+tamarin-term = { workspace = true }
+tamarin-parser = { workspace = true }
+
+[dev-dependencies]
+walkdir = "2"

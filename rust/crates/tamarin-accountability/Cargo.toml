@@ -1,0 +1,13 @@
+[package]
+name = "tamarin-accountability"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Accountability extension for the Tamarin prover (Rust port)."
+
+[dependencies]
+tamarin-utils = { workspace = true }
+tamarin-term = { workspace = true }
+tamarin-theory = { workspace = true }
