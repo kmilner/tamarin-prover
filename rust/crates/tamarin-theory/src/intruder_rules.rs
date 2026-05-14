@@ -88,7 +88,7 @@ pub fn destruction_rules(
     diff: bool,
     rule: &tamarin_term::subterm_rule::CtxtStRule,
 ) -> Vec<IntrRuleAC> {
-    use tamarin_term::lterm::{LSort, frees};
+    use tamarin_term::lterm::frees;
     use tamarin_term::positions::Position;
     use tamarin_term::function_symbols::{FunSym, NoEqSym, Privacy};
     use tamarin_term::term::Term;

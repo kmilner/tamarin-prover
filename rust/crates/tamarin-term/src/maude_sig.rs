@@ -242,6 +242,7 @@ pub fn signature_maude_sig() -> MaudeSig {
 pub fn reveal_signature_maude_sig() -> MaudeSig {
     MaudeSig {
         st_fun_syms: reveal_signature_fun_sig(),
+        st_rules: crate::builtin::reveal_signature_rules(),
         ..MaudeSig::default()
     }.refresh()
 }
@@ -262,7 +263,11 @@ pub fn asym_enc_dest_maude_sig() -> MaudeSig {
 }
 
 pub fn signature_dest_maude_sig() -> MaudeSig {
-    MaudeSig { st_fun_syms: signature_fun_dest_sig(), ..MaudeSig::default() }.refresh()
+    MaudeSig {
+        st_fun_syms: signature_fun_dest_sig(),
+        st_rules: crate::builtin::signature_dest_rules(),
+        ..MaudeSig::default()
+    }.refresh()
 }
 
 pub fn minimal_maude_sig(diff: bool) -> MaudeSig {

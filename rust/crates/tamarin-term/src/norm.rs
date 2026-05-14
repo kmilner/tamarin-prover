@@ -77,7 +77,7 @@ pub fn nf_structural(msig: &MaudeSig, t: &LNTerm) -> Option<bool> {
 /// Recognise top-level shapes that are immediately reducible by the
 /// built-in rewrite rules. Returns `true` if the term IS reducible.
 fn obvious_reduction(t: &LNTerm) -> Option<bool> {
-    use crate::function_symbols::{INV_SYM_STRING, ONE_SYM_STRING};
+    use crate::function_symbols::INV_SYM_STRING;
     if let Term::App(FunSym::NoEq(s), args) = t {
         // inv(inv(_)) — reducible.
         if s.name == INV_SYM_STRING {

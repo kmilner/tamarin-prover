@@ -21,6 +21,7 @@
 //! `R`"), with no internal panics.
 
 use std::collections::BTreeSet;
+use std::cell::RefCell;
 
 use tamarin_parser::ast as p;
 use tamarin_term::function_symbols::{
@@ -28,6 +29,37 @@ use tamarin_term::function_symbols::{
 };
 use tamarin_term::lterm::LVar;
 use tamarin_term::lterm::LSort;
+
+thread_local! {
+    /// User-declared arity-1 function names for the theory currently
+    /// being elaborated.  Set by `elaborate()` from the theory's
+    /// `functions:` declarations, read by `term_to_lnterm`'s arity-1
+    /// auto-tuple branch.  In Tamarin's surface syntax, `f(a, b, c)`
+    /// for a function declared `f/1` is sugar for `f(<a, b, c>)`; our
+    /// hard-coded list previously only covered built-in arity-1 names
+    /// (h, fst, snd, inv, pk).  Without this, `PRF(pms, nc, ns)` for
+    /// `functions: PRF/1` would reach Maude as a 3-arg call, which
+    /// Maude silently rejects, and our `reduce` loop spins forever.
+    static USER_UNARY_FUNS: RefCell<BTreeSet<String>>
+        = RefCell::new(BTreeSet::new());
+
+    /// Names of nullary (0-arity) function symbols available in the
+    /// theory currently being elaborated.  Set by `elaborate()` from
+    /// both user `functions: f/0` declarations and the builtins that
+    /// introduce 0-arity constants (`signing`/`dest-signing`/
+    /// `revealing-signing` add `true`; `xor` adds `zero`; etc.).
+    /// Read by `term_to_lnterm`'s `Var` branch so a bare `true` (which
+    /// the lexer-level surface parser renders as `Var("true",Untagged)`
+    /// for lack of a signature lookup) is converted into a 0-arity
+    /// `f_app_no_eq` constant instead of a free variable.  Without
+    /// this, `Eq(verify(...), true)` in a rule's actions becomes an
+    /// `Eq` over `verify(...)` and a Msg-sort variable, which the
+    /// `Eq_check_succeed` restriction trivially satisfies via the
+    /// eq-store — undermining the signing builtin's semantics and
+    /// causing TLS_Handshake-class lemmas to be wrong-falsified.
+    static USER_NULLARY_FUNS: RefCell<BTreeSet<String>>
+        = RefCell::new(BTreeSet::new());
+}
 use tamarin_term::term::{f_app_no_eq, Term};
 use tamarin_term::lterm::{Name, NameTag};
 use tamarin_term::vterm::Lit;
@@ -113,7 +145,115 @@ pub fn elaborate(parser_thy: &p::Theory) -> Result<Theory, ElabError> {
             message: format!("predicate expansion failed: {}", e.message),
         });
     }
+    // Collect user-declared arity-1 function names so `term_to_lnterm`'s
+    // auto-tuple branch fires for them as well as the built-in unary
+    // names (h, fst, snd, ...).  Scoped via a guard so concurrent
+    // elaborations on the same thread can't see stale state if one
+    // panics — see `UserUnaryFunsGuard`.
+    let unary_funs: BTreeSet<String> = thy_clone.items.iter().flat_map(|it| {
+        if let p::TheoryItem::Functions(decls) = it {
+            decls.iter().filter(|d| d.arg_types.len() == 1)
+                .map(|d| d.name.clone()).collect::<Vec<_>>()
+        } else { Vec::new() }
+    }).collect();
+    let _guard = UserUnaryFunsGuard::set(unary_funs);
+    // Collect 0-arity function names introduced by user `functions:` and
+    // by any enabled builtin (mirroring Haskell's parser-state-driven
+    // `nullaryApp` lookup).
+    let mut nullary_funs: BTreeSet<String> = thy_clone.items.iter().flat_map(|it| {
+        if let p::TheoryItem::Functions(decls) = it {
+            decls.iter().filter(|d| d.arg_types.is_empty())
+                .map(|d| d.name.clone()).collect::<Vec<_>>()
+        } else { Vec::new() }
+    }).collect();
+    for it in &thy_clone.items {
+        if let p::TheoryItem::Builtins(names) = it {
+            for n in names {
+                for c in builtin_nullary_constants(n) {
+                    nullary_funs.insert(c.to_string());
+                }
+            }
+        }
+    }
+    let _nullary_guard = UserNullaryFunsGuard::set(nullary_funs);
     elaborate_already_expanded(&thy_clone)
+}
+
+/// Returns the 0-arity function symbol names introduced by a given
+/// `builtins:` declaration.  Mirrors `note_builtin` in the parser and
+/// the Haskell `enableBuiltin` paths.  Used to populate the
+/// `USER_NULLARY_FUNS` thread-local so `term_to_lnterm` can convert
+/// bare identifiers like `true` into 0-arity applications instead of
+/// free Msg-sort variables.
+fn builtin_nullary_constants(name: &str) -> &'static [&'static str] {
+    match name {
+        "diffie-hellman" | "bilinear-pairing" => &["1", "DH_neutral"],
+        "xor" => &["zero"],
+        "signing" | "dest-signing" | "revealing-signing" => &["true"],
+        _ => &[],
+    }
+}
+
+/// RAII guard that swaps in a fresh `USER_UNARY_FUNS` set for the
+/// duration of an `elaborate()` call and restores the previous value
+/// on drop.  Ensures nested or sequential elaborations don't bleed
+/// each other's arity-1 function sets.
+struct UserUnaryFunsGuard {
+    previous: BTreeSet<String>,
+}
+
+impl UserUnaryFunsGuard {
+    fn set(new: BTreeSet<String>) -> Self {
+        let previous = USER_UNARY_FUNS.with(|c| {
+            let mut b = c.borrow_mut();
+            let prev = std::mem::replace(&mut *b, new);
+            prev
+        });
+        UserUnaryFunsGuard { previous }
+    }
+}
+
+impl Drop for UserUnaryFunsGuard {
+    fn drop(&mut self) {
+        USER_UNARY_FUNS.with(|c| {
+            *c.borrow_mut() = std::mem::take(&mut self.previous);
+        });
+    }
+}
+
+/// True if `name` is registered as a user-declared arity-1 function for
+/// the current elaboration.  Read from the `USER_UNARY_FUNS` thread-local.
+fn is_user_unary_fun(name: &str) -> bool {
+    USER_UNARY_FUNS.with(|c| c.borrow().contains(name))
+}
+
+/// Same as `UserUnaryFunsGuard` but for the `USER_NULLARY_FUNS` set.
+struct UserNullaryFunsGuard {
+    previous: BTreeSet<String>,
+}
+
+impl UserNullaryFunsGuard {
+    fn set(new: BTreeSet<String>) -> Self {
+        let previous = USER_NULLARY_FUNS.with(|c| {
+            let mut b = c.borrow_mut();
+            std::mem::replace(&mut *b, new)
+        });
+        UserNullaryFunsGuard { previous }
+    }
+}
+
+impl Drop for UserNullaryFunsGuard {
+    fn drop(&mut self) {
+        USER_NULLARY_FUNS.with(|c| {
+            *c.borrow_mut() = std::mem::take(&mut self.previous);
+        });
+    }
+}
+
+/// True if `name` is registered as a 0-arity function for the current
+/// elaboration.  See `USER_NULLARY_FUNS` for the populating logic.
+fn is_user_nullary_fun(name: &str) -> bool {
+    USER_NULLARY_FUNS.with(|c| c.borrow().contains(name))
 }
 
 fn elaborate_already_expanded(parser_thy: &p::Theory) -> Result<Theory, ElabError> {
@@ -608,6 +748,22 @@ pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
 
     match t {
         p::Term::Var(v) => {
+            // A bare identifier in surface syntax may denote a 0-arity
+            // function symbol (e.g. `true` when `builtins: signing` is
+            // enabled).  Haskell's `term` parser disambiguates this
+            // via `nullaryApp` against the maudeSig in parser state;
+            // our parser doesn't, so the lexer leaves it as
+            // `Var{name, sort: Untagged}`.  We recover the constant
+            // here.  Only fires for `Untagged` sort + idx 0 — a user
+            // can still bind a Msg-sort var named `true` if they
+            // explicitly annotate it (e.g. `true:msg`), and the parser
+            // would emit `Untagged` only for the bare form anyway.
+            if matches!(v.sort, p::SortHint::Untagged) && v.idx == 0
+                && is_user_nullary_fun(&v.name) {
+                let sym = NoEqSym::new(v.name.as_bytes().to_vec(), 0,
+                    Privacy::Public, Constructability::Constructor);
+                return Some(f_app_no_eq(sym, vec![]));
+            }
             let lv = LVar::new(v.name.clone(), sort_of(&v.sort), v.idx);
             Some(Term::Lit(Lit::Var(lv)))
         }
@@ -647,7 +803,8 @@ pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
             // Currently only `h` (from `builtins: hashing`) is
             // unary; other multi-arg builtins (senc/aenc/sign/...)
             // are genuinely multi-arg.
-            let unary_builtin = matches!(name.as_str(), "h" | "fst" | "snd" | "inv" | "pk");
+            let unary_builtin = matches!(name.as_str(), "h" | "fst" | "snd" | "inv" | "pk")
+                || is_user_unary_fun(name.as_str());
             let new_args: Option<Vec<_>> = args.iter().map(term_to_lnterm).collect();
             let mut new_args = new_args?;
             if unary_builtin && new_args.len() > 1 {

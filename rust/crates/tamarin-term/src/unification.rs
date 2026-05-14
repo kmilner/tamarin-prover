@@ -10,6 +10,7 @@
 //! Matching follows the same split.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::function_symbols::FunSym;
 use crate::lterm::{sort_compare, sort_of_lterm, LSort, LTerm, LVar, Name};
@@ -17,6 +18,33 @@ use crate::rewriting::{Equal, Match};
 use crate::subst::{apply_vterm, Subst};
 use crate::term::Term;
 use crate::vterm::Lit;
+
+/// Source of fresh witness indices for the local non-AC unifier.
+///
+/// Wraps either a private local counter (legacy "per-call" behaviour,
+/// kept for callers that don't have a shared counter) or a shared
+/// `AtomicU64` (the Haskell-faithful `MonadFresh` path, used by
+/// `MaudeHandle::unify_with_avoid`).  Allocating from a shared counter
+/// guarantees indices are globally unique across all calls in a proof
+/// session — the fix for the TESLA::authentic_reachable
+/// `~mw:Pub:17` / `~mw:Msg:17` cross-call collision.
+enum FreshSrc<'a> {
+    Local(u64),
+    Shared(&'a AtomicU64),
+}
+
+impl<'a> FreshSrc<'a> {
+    fn next(&mut self) -> u64 {
+        match self {
+            FreshSrc::Local(c) => {
+                let v = 1_000_000_000 + *c;
+                *c += 1;
+                v
+            }
+            FreshSrc::Shared(a) => a.fetch_add(1, Ordering::SeqCst),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum UnifyError {
@@ -44,9 +72,9 @@ where
     F: Fn(&C) -> LSort,
 {
     let mut acc: BTreeMap<LVar, LTerm<C>> = BTreeMap::new();
-    let mut witness_counter: u64 = 0;
+    let mut src = FreshSrc::Local(0);
     for Equal { lhs, rhs } in eqs {
-        unify_raw(sort_of_const, &mut acc, lhs, rhs, &mut witness_counter)?;
+        unify_raw(sort_of_const, &mut acc, lhs, rhs, &mut src)?;
     }
     Ok(Subst::from_map(acc))
 }
@@ -56,6 +84,23 @@ pub fn unify_lnterm_no_ac(
     eqs: Vec<Equal<crate::lterm::LNTerm>>,
 ) -> Result<Subst<Name, LVar>, UnifyError> {
     unify_lterm_no_ac(&|n: &Name| crate::lterm::sort_of_name(n), eqs)
+}
+
+/// Variant that draws witness idxs from a shared atomic counter
+/// (Haskell `MonadFresh`).  Use this when calling from inside a Maude
+/// bridge so witnesses get globally-unique idxs across all unify
+/// calls — preventing the cross-call collision class.
+pub fn unify_lnterm_no_ac_with_counter(
+    eqs: Vec<Equal<crate::lterm::LNTerm>>,
+    counter: &AtomicU64,
+) -> Result<Subst<Name, LVar>, UnifyError> {
+    let sort_of_const = |n: &Name| crate::lterm::sort_of_name(n);
+    let mut acc: BTreeMap<LVar, LTerm<Name>> = BTreeMap::new();
+    let mut src = FreshSrc::Shared(counter);
+    for Equal { lhs, rhs } in eqs {
+        unify_raw(&sort_of_const, &mut acc, lhs, rhs, &mut src)?;
+    }
+    Ok(Subst::from_map(acc))
 }
 
 /// `unifiableLNTermsNoAC`: shorthand for "is there a unifier?".
@@ -71,7 +116,7 @@ fn unify_raw<C, F>(
     acc: &mut BTreeMap<LVar, LTerm<C>>,
     lhs: LTerm<C>,
     rhs: LTerm<C>,
-    witness_counter: &mut u64,
+    src: &mut FreshSrc<'_>,
 ) -> Result<(), UnifyError>
 where
     C: Ord + Clone,
@@ -101,9 +146,8 @@ where
             let w = LVar {
                 name: "~mw".to_string(),
                 sort: narrower_sort,
-                idx: 1_000_000_000 + *witness_counter,
+                idx: src.next(),
             };
-            *witness_counter += 1;
             let wt: LTerm<C> = Term::Lit(Lit::Var(w));
             eliminate(sort_of_const, acc, vl.clone(), wt.clone())?;
             eliminate(sort_of_const, acc, vr.clone(), wt)
@@ -117,13 +161,13 @@ where
             if lf == rf && la.len() == ra.len() =>
         {
             for (a, b) in la.clone().into_iter().zip(ra.clone()) {
-                unify_raw(sort_of_const, acc, a, b, witness_counter)?;
+                unify_raw(sort_of_const, acc, a, b, src)?;
             }
             Ok(())
         }
         (Term::App(FunSym::List, la), Term::App(FunSym::List, ra)) if la.len() == ra.len() => {
             for (a, b) in la.clone().into_iter().zip(ra.clone()) {
-                unify_raw(sort_of_const, acc, a, b, witness_counter)?;
+                unify_raw(sort_of_const, acc, a, b, src)?;
             }
             Ok(())
         }

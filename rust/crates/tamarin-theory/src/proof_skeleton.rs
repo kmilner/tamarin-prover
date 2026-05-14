@@ -49,14 +49,11 @@ pub fn render(root: &ProofNode) -> String {
 
 fn render_node(node: &ProofNode, indent: usize, out: &mut String) {
     let pad = "  ".repeat(indent);
-    // Emit the method keyword.
-    let kw = method_keyword(&node.method);
-    if !kw.is_empty() {
-        out.push_str(&pad);
-        out.push_str(kw);
-        out.push('\n');
-    }
-    // Terminal-method handling: Sorry/Finished have no children.
+    // Terminal-method handling: Sorry/Finished and SolveGoal/Simplify
+    // /Induction with no children are leaves.  Haskell's prettyProof
+    // emits `by <method>` as a single line for leaves whose method is
+    // not Finished (Proof.hs:1064-1066), so we mirror that here — emit
+    // *just* the leaf line, skipping the separate method-keyword line.
     if node.children.is_empty() {
         match &node.method {
             ProofMethod::Finished(MethodResult::Contradictory(c)) => {
@@ -89,6 +86,10 @@ fn render_node(node: &ProofNode, indent: usize, out: &mut String) {
             | ProofMethod::Invalidated => {
                 // Non-terminal method with no children — must have
                 // closed contradictorily without producing cases.
+                // Haskell renders this as `by solve(...)` / `by simplify`
+                // / `by induction`; our `extract_from_haskell` normalises
+                // those to `by contradiction /* closed */` so the diff
+                // treats both leaf-closure forms as equivalent.
                 out.push_str(&pad);
                 out.push_str(match node.status {
                     NodeStatus::Contradictory => "by contradiction /* closed */\n",
@@ -100,6 +101,13 @@ fn render_node(node: &ProofNode, indent: usize, out: &mut String) {
             }
         }
         return;
+    }
+    // Non-leaf: emit the method keyword line, then children.
+    let kw = method_keyword(&node.method);
+    if !kw.is_empty() {
+        out.push_str(&pad);
+        out.push_str(kw);
+        out.push('\n');
     }
     // Special case: a single child with empty key is a "Linear"
     // continuation (no branching). Haskell prints these inline, with

@@ -51,6 +51,15 @@ pub struct ProofContext {
     /// cases let the search graft a precomputed subsystem rather than
     /// re-deriving it (and recursing through copy-rules ad infinitum).
     pub full_sources: Vec<crate::constraint::solver::sources::Source>,
+    /// Set when the current proof is for an exists-trace lemma.
+    /// Used by `is_finished` to decide whether the Fresh-conflation
+    /// case-drop should convert Contradictory→Unfinishable: for
+    /// exists-trace lemmas the dropped case might have been the
+    /// witness path (sound only via Unfinishable); for all-traces
+    /// lemmas the drop is harmless (no witness to lose).  Defaults
+    /// to false; set by `prove_lemma` based on the lemma's
+    /// trace-quantifier attribute.
+    pub is_exists_trace: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,17 +128,33 @@ impl ProofContext {
             }
             rec(t, &reducible_syms)
         };
-        // Only rules with destructors in their CONCLUSIONS benefit
-        // from rule-variant plumbing — they're the ones where
-        // chain-fold needs to enumerate destructor-narrowed
-        // alternatives (e.g. `Out(snd(sdec(...)))`). Rules with
-        // destructors only in premises don't benefit since premise-
-        // side narrowing is the solver's job (via intruder rules).
-        // Limiting the scope avoids exploding search work on rules
-        // where variants are redundant.
+        // Rules with destructors anywhere — conclusions, premises,
+        // ACTIONS, or new_vars — benefit from rule-variant plumbing.
+        // Haskell's `variantsProtoRule` abstracts every reducible-
+        // headed subterm in `prems ++ concs ++ acts ++ nvs` into a
+        // fresh `z` var and computes the disjunction of
+        // substitutions Maude returns from its variant narrowing
+        // (RuleVariants.hs:93-99).
+        //
+        // The conclusions-only filter we had here used to be enough
+        // because chain-fold was the only path that needed
+        // destructor-narrowed alternatives.  But rules like
+        // `--[ Equality(verify(sig, ...), true) ]->` (issue193,
+        // TLS_Handshake) have reducible terms in their ACTIONS:
+        // without variant expansion, the equality restriction
+        // `All x y. Equality(x,y) ⇒ x=y` instantiates to
+        // `Eq(verify(sig:Msg, ...), true)` which Maude
+        // `unify in MSG` (AC-only, no [variant] eqs) reports as
+        // unifiable-free → `eq_store.is_false` → false contradiction.
+        // With variants, the action is abstracted to
+        // `Equality(z, true)` and the variant subst {z → true,
+        // sig → revealSign(...)} provides the closing witness case.
         let rule_has_reducible = |r: &crate::rule::ProtoRuleE| -> bool {
             r.conclusions.iter()
+                .chain(r.premises.iter())
+                .chain(r.actions.iter())
                 .any(|f| f.terms.iter().any(|t| term_has_reducible(t)))
+                || r.new_vars.iter().any(|t| term_has_reducible(t))
         };
         // Rule-variant plumbing: enabled by default to match Haskell's
         // `variantsProtoRule` behaviour. Broadens search for protocols
@@ -190,6 +215,7 @@ impl ProofContext {
             is_diff: false,
             injective_fact_insts,
             full_sources: Vec::new(),
+            is_exists_trace: false,
         };
         // Precompute unique sources from the protocol rules.
         let params = crate::constraint::solver::sources::IntegerParameters::default();
@@ -202,13 +228,27 @@ impl ProofContext {
         // the cases via `saturate_sources` so recursive Loop-style
         // chains fold into a finite enumeration of self-contained
         // sub-systems.
+        // Install rule variants BEFORE precompute. Haskell's precompute
+        // uses the full variant-expanded rule set so cases with chain
+        // edges across reducible-headed conclusions (like
+        // `Receiver0b → Receiver0b_check` where `verify(...) = true`)
+        // already have the variant subst applied. Enable by default;
+        // TAM_NO_PRECOMPUTE_VARIANTS=1 forces the legacy
+        // (variants-after-precompute) behaviour for diagnostics.
+        let precompute_with_variants = std::env::var("TAM_NO_PRECOMPUTE_VARIANTS").is_err();
+        if precompute_with_variants {
+            for (idx, vs) in &computed_variants {
+                if let Some(o) = ctx.rules.get_mut(*idx) {
+                    o.variants = vs.clone();
+                }
+            }
+        }
         let raw_sources = crate::constraint::solver::sources::precompute_full_sources(&ctx);
-        // Install rule variants after precompute: chain-fold below will
-        // see the destructor-narrowed alternatives but typing
-        // precomputation above already saw only raw rules.
-        for (idx, vs) in computed_variants {
-            if let Some(o) = ctx.rules.get_mut(idx) {
-                o.variants = vs;
+        if !precompute_with_variants {
+            for (idx, vs) in computed_variants {
+                if let Some(o) = ctx.rules.get_mut(idx) {
+                    o.variants = vs;
+                }
             }
         }
         // Chain-fold saturator: lightweight order-sorted aligner
