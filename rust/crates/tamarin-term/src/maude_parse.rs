@@ -39,11 +39,6 @@ impl<'a> Cursor<'a> {
     fn rest(&self) -> &[u8] { &self.src[self.pos..] }
     fn is_eof(&self) -> bool { self.pos >= self.src.len() }
     fn peek(&self) -> Option<u8> { self.src.get(self.pos).copied() }
-    fn bump(&mut self) -> Option<u8> {
-        let c = self.peek()?;
-        self.pos += 1;
-        Some(c)
-    }
     fn eat(&mut self, b: u8) -> bool {
         if self.peek() == Some(b) { self.pos += 1; true } else { false }
     }

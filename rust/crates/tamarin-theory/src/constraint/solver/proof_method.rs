@@ -56,64 +56,13 @@ pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
     if is_initial_system(sys) { return None; }
     let cs = contradictions(ctx, sys);
     if let Some(c) = cs.into_iter().next() {
-        // Convert spurious Cyclic / FormulasFalse arising from
-        // Fresh-consumer conflation to Unfinishable.  Fresh values
-        // are linear (can be consumed by exactly one node), so two
-        // distinct non-AC-unifiable nodes sharing the same Fresh
-        // value is impossible — the branch IS contradictory.  BUT:
-        // when this state arises via our graft pipeline (instead of
-        // via legitimate search), other valid branches (the actual
-        // attack trace) may be missed, and rolling up to all-
-        // Contradictory wrongly yields Verified for an all-traces
-        // lemma OR wrongly Falsified for an exists-trace lemma.
-        // Returning Unfinishable preserves soundness — the parent
-        // rolls up as Sorry-equivalent.
-        //
-        // FormulasFalse on a Fresh-conflated system typically comes
-        // from `subst_system`'s shape-mismatch fast-path pushing
-        // gfalse (Reduction.hs:213): two rule instances collapse to
-        // one node id but their fact lists disagree.  Same Maude-
-        // witness conflation root cause as Cyclic + Fresh-consumer.
-        use crate::constraint::solver::contradictions::Contradiction;
-        // Cyclic / FormulasFalse arising from Fresh-consumer
-        // conflation: Unfinishable, not Contradictory.
-        let is_conflation_grade = matches!(c,
-            Contradiction::Cyclic | Contradiction::FormulasFalse);
-        if is_conflation_grade && has_fresh_consumer_conflation_at(ctx, sys) {
-            return Some(Result::Unfinishable);
-        }
-        // Duplicate-protocol-instance pattern: when the system has
-        // multiple instances of the same Standalone proto rule (e.g.
-        // two `responder` nodes), and a contradiction surfaces in the
-        // eq-store, the root cause is almost always our
-        // graft-pipeline's missing `conjoinSystem`/`setNodes`
-        // collision semantics (Haskell merges these instances
-        // cleanly via `solveRuleEqs`; our pipeline collapses them
-        // through `enforce_edge_uniqueness` → eq-store
-        // over-constraint → `IncompatibleEqs`/`Cyclic`).  Converting
-        // such contradictions to `Unfinishable` keeps the verdict
-        // sound (Sorry/Unfinishable is incomparable, never
-        // wrong-Falsified) — at the cost of leaving lemmas that
-        // depend on the duplicate-instance graft pattern as Sorry
-        // rather than Verified.  Without the conversion,
-        // `CR.spthy::executable` wrong-falsifies (ours=falsified,
-        // tamarin=verified) under DFS chain-closure.
-        //
-        // See `project_rust_ku_fresh_responder_gap.md`.
-        let is_eq_contradiction = matches!(c,
-            Contradiction::IncompatibleEqs);
-        if is_eq_contradiction && has_duplicate_proto_instances(sys) {
-            return Some(Result::Unfinishable);
-        }
-        // FormulasFalse from `subst_system` shape-mismatch: Maude-
-        // witness conflation collapsing distinct rule instances onto
-        // the same node id.  Tagged by `subst_system` directly so we
-        // don't need to recover the pattern from sys structure.
-        if matches!(c, Contradiction::FormulasFalse)
-            && sys.shape_mismatch_conflation
-        {
-            return Some(Result::Unfinishable);
-        }
+        // Mirror Haskell `contradictorySystem`: any contradiction
+        // closes the branch.  Previous Cyclic/FormulasFalse→Unfinishable
+        // routing for conflation patterns has been removed — it was
+        // not Haskell-faithful.  See `project_rust_search_completeness_gaps.md`
+        // for the underlying search-completeness bugs that those
+        // workarounds were masking.
+        let _ = ctx;
         return Some(Result::Contradictory(Some(c)));
     }
     if std::env::var("TAM_DBG_IMPL").is_ok() {
@@ -130,81 +79,26 @@ pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
                 sys.formulas.len(), has_bot, sys.nodes.len());
         }
     }
-    // A system with all goals already marked solved is also "no
-    // remaining open goals" — Haskell's `openGoals` filter does the
-    // same thing. Formulas remain in `sFormulas` as sentinels (e.g.
-    // a Disj whose case-split goal has been chosen still lives on),
-    // so we don't require an empty `formulas` list — only that no
-    // formula is `gfalse` (which would be a contradiction).
-    let no_open_goals = sys.goals.iter().all(|(_, st)| st.solved);
-    let bot = crate::guarded::gfalse();
-    let no_false_formula = !sys.formulas.contains(&bot);
-    let sub_finished = finished_subterms(sys);
-    if no_open_goals && no_false_formula && sub_finished { Some(Result::Solved) }
-    else if no_open_goals && no_false_formula && !sub_finished { Some(Result::Unfinishable) }
+    // Mirror Haskell `isFinished`:
+    //   | null ogs && stFinished     = Just Solved
+    //   | null ogs && not stFinished = Just Unfinishable
+    //   | otherwise                  = Nothing
+    // where `ogs = openGoals sys` — the FILTERED list (with the
+    // auto-solve KU heuristic applied), not just the unsolved-status
+    // count.  Our `open_goals` does the same filtering, so we should
+    // check IT for emptiness rather than the status flags.
+    // Direct port of Haskell `isFinished` (ProofMethod.hs:505):
+    //   | null ogs && stFinished     = Just Solved
+    //   | null ogs && not stFinished = Just Unfinishable
+    //   | otherwise                  = Nothing
+    // (gfalse is caught as a FormulasFalse contradiction above, so we
+    // don't need an explicit `no_false_formula` guard here.)
+    use crate::constraint::solver::goals::open_goals;
+    let no_open_goals = open_goals(sys).is_empty();
+    let sub_finished = finished_subterms(ctx, sys);
+    if no_open_goals && sub_finished { Some(Result::Solved) }
+    else if no_open_goals && !sub_finished { Some(Result::Unfinishable) }
     else { None }
-}
-
-/// Returns true if `sys` has two or more nodes whose rules are
-/// instances of the same Standalone protocol rule.  This pattern
-/// arises when a source-case graft creates a duplicate protocol-rule
-/// instance — Haskell merges these via `conjoinSystem`'s setNodes
-/// collision semantics; our pipeline does not, so the merge cascade
-/// through `enforce_fresh_node_uniqueness` + `enforce_edge_uniqueness`
-/// can over-constrain the eq-store.
-fn has_duplicate_proto_instances(sys: &System) -> bool {
-    use std::collections::BTreeSet;
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    for (_, rule) in &sys.nodes {
-        if let crate::rule::RuleInfo::Proto(p) = &rule.info {
-            if let crate::rule::ProtoRuleName::Stand(s) = &p.name {
-                if !seen.insert(s.clone()) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-/// Returns true if `sys` has two distinct non-AC-unifiable nodes that
-/// both consume the same Fresh value as their `Fr(~x)` premise.  See
-/// `reduction::has_fresh_consumer_conflation`; this is the proof-method
-/// layer's wrapper that uses the proof context to access Maude.
-fn has_fresh_consumer_conflation_at(ctx: &ProofContext, sys: &System) -> bool {
-    use crate::fact::FactTag;
-    use tamarin_term::lterm::{LSort, LVar};
-    use tamarin_term::term::Term;
-    use tamarin_term::vterm::Lit;
-    let subst = sys.eq_store.subst.clone();
-    let mut consumers: Vec<(crate::constraint::constraints::NodeId, LVar)> = Vec::new();
-    for (id, rule) in &sys.nodes {
-        for prem in &rule.premises {
-            if !matches!(prem.tag, FactTag::Fresh) { continue; }
-            let t = match prem.terms.first() { Some(t) => t, None => continue };
-            let t_norm = tamarin_term::subst::apply_vterm(&subst, t.clone());
-            if let Term::Lit(Lit::Var(v)) = t_norm {
-                if v.sort == LSort::Fresh {
-                    consumers.push((id.clone(), v));
-                }
-            }
-        }
-    }
-    for i in 0..consumers.len() {
-        for j in (i + 1)..consumers.len() {
-            if consumers[i].1 != consumers[j].1 { continue; }
-            if consumers[i].0 == consumers[j].0 { continue; }
-            let ri = sys.nodes.iter().find(|(n, _)| n == &consumers[i].0).map(|(_, r)| r);
-            let rj = sys.nodes.iter().find(|(n, _)| n == &consumers[j].0).map(|(_, r)| r);
-            let (Some(ri), Some(rj)) = (ri, rj) else { continue };
-            match crate::rule::unifiable_rule_ac_insts(&ctx.maude, ri, rj) {
-                Ok(true) => continue,
-                Ok(false) => return true,
-                Err(_) => continue,
-            }
-        }
-    }
-    false
 }
 
 /// Approximation of Haskell's `isInitialSystem`:
@@ -214,21 +108,51 @@ fn has_fresh_consumer_conflation_at(ctx: &ProofContext, sys: &System) -> bool {
 /// carries more state than Haskell's at this stage. The crucial
 /// property is the `not bot in formulas` clause — a system whose
 /// open formulas contain ⊥ is *contradictory*, not initial.
+/// Direct port of Haskell `isInitialSystem`:
+///   isInitialSystem sys = null (get sSolvedFormulas sys) && not (member bot (get sFormulas sys))
+/// (`System.hs:828`).  Just two conditions: no solved formulas yet,
+/// and no gfalse in the formula set.  We were checking many more
+/// (empty nodes/edges/less/goals) which made us mark systems as
+/// non-initial too early — that caused `is_finished` to short-circuit
+/// to Solved/Unfinishable when Haskell would still return `None` and
+/// continue searching.
 fn is_initial_system(sys: &System) -> bool {
     let bot = crate::guarded::gfalse();
-    sys.nodes.is_empty()
-        && sys.edges.is_empty()
-        && sys.less_atoms.is_empty()
-        && sys.solved_formulas.is_empty()
-        && sys.goals.is_empty()
-        && !sys.formulas.contains(&bot)
+    sys.solved_formulas.is_empty() && !sys.formulas.contains(&bot)
 }
 
-/// True if every subterm constraint has been resolved (or no subterm
-/// constraints exist). Mirrors Haskell's `finishedSubterms` modulo
-/// the propagation step we haven't ported.
-fn finished_subterms(sys: &System) -> bool {
-    sys.subterm_store.subterms.iter().all(|s| s.propagated)
+/// Direct port of Haskell `finishedSubterms`
+/// (`Theory.Tools.SubtermStore:130`):
+///   hasReducibleOperatorsOnTop reducible sst =
+///     all (topIsNotReducible . snd) allSubterms
+///     where allSubterms = posSubterms ∪ negSubterms ∪ solvedSubterms
+///           topIsNotReducible (FApp f _) = f ∉ reducible
+///           topIsNotReducible _          = True
+///
+/// True iff every subterm's RHS has a top-level function symbol that
+/// is NOT in the reducible set.  If any subterm's RHS has a reducible
+/// top symbol, the proof cannot finish (further rewriting could
+/// reduce it).
+fn finished_subterms(ctx: &ProofContext, sys: &System) -> bool {
+    use tamarin_term::function_symbols::FunSym;
+    use tamarin_term::term::Term;
+    let msig = ctx.maude.maude_sig();
+    let top_is_not_reducible = |t: &tamarin_term::lterm::LNTerm| -> bool {
+        match t {
+            Term::App(f, _) => !msig.reducible_fun_syms.iter().any(|r| match (r, f) {
+                (FunSym::NoEq(rs), FunSym::NoEq(fs)) => rs.name == fs.name,
+                (FunSym::Ac(ra), FunSym::Ac(fa)) =>
+                    std::mem::discriminant(ra) == std::mem::discriminant(fa),
+                (FunSym::C(rc), FunSym::C(fc)) =>
+                    std::mem::discriminant(rc) == std::mem::discriminant(fc),
+                _ => false,
+            }),
+            // Variables and constants are never reducible at the top.
+            _ => true,
+        }
+    };
+    sys.subterm_store.subterms.iter().all(|s| top_is_not_reducible(&s.big))
+        && sys.subterm_store.solved_subterms.iter().all(|s| top_is_not_reducible(&s.big))
 }
 
 /// Execute a proof method against `sys`, returning the resulting
@@ -260,24 +184,92 @@ pub fn exec_proof_method(
             Some(out)
         }
         ProofMethod::SolveGoal(g) => {
+            let dbg_solve = std::env::var("TAM_DBG_SOLVE").is_ok();
+            let t_dispatch = std::time::Instant::now();
             let mut r = Reduction::new(ctx, sys.clone());
             let outcome = crate::constraint::solver::goals::dispatch_solve_goal(&mut r, g);
+            if dbg_solve {
+                let name: String = format!("{:?}", g).chars().take(60).collect();
+                let kind = match &outcome {
+                    crate::constraint::solver::reduction::GoalCases::Linear => "Linear".to_string(),
+                    crate::constraint::solver::reduction::GoalCases::LinearNamed(_) => "LinearNamed".to_string(),
+                    crate::constraint::solver::reduction::GoalCases::Cases(cs) => format!("Cases({})", cs.len()),
+                    crate::constraint::solver::reduction::GoalCases::Contradictory => "Contradictory".to_string(),
+                };
+                eprintln!("[solve] dispatch {} → {} in {:?}", name, kind, t_dispatch.elapsed());
+            }
             // Run simplify after every goal-solving step — mirrors
-            // Haskell's `m <* simplifySystem` pattern in `process`.
+            // Haskell's `m <* simplifySystem` pattern in `process`
+            // (ProofMethod.hs:299-308).  Filter out cases that simplify
+            // to a contradictory system — Haskell's Disj-monad does the
+            // same via `mzero` on `contradictoryIf`, so contradictory
+            // cases never make it into the children map.  This keeps
+            // our proof tree the same shape as Haskell's: when every
+            // case fires a contradiction, the SolveGoal node has 0
+            // children (rendered as a leaf "by solve(...)" in Haskell
+            // / "by contradiction /* closed */" in our normalised diff).
             let simplify = |sys: System| -> System {
+                if dbg_solve {
+                    eprintln!("[solve] simplify start (nodes={} goals={})",
+                        sys.nodes.len(), sys.goals.len());
+                }
+                let t0 = std::time::Instant::now();
                 let mut r = Reduction::new(ctx, sys);
                 simplify_system(&mut r);
+                if dbg_solve {
+                    eprintln!("[solve] simplify done {:?} (nodes={} goals={})",
+                        t0.elapsed(), r.sys.nodes.len(), r.sys.goals.len());
+                }
                 r.sys
+            };
+            // Filter cases the same way Haskell's `runReduction` does:
+            // when a CR-rule called `contradictoryIf` during simplify
+            // (e.g. solveFactEqs / solveRuleEqs / solveSubstEqs hitting
+            // an incompatible unification, or Maude returning the empty
+            // unifier set on a sort/tag mismatch), the Disj entry for
+            // that case becomes `mzero` and disappears.  In our port
+            // these failures surface as `Contradiction::IncompatibleEqs`
+            // (eq_store.is_false / sort-conflation / edge-tag mismatch).
+            // We mirror Haskell by pruning only those cases.
+            //
+            // Cases with *other* contradictions (FormulasFalse, Cyclic,
+            // NodeAfterLast, …) survive `runReduction` in Haskell and
+            // are picked up by the next iteration's contradictions
+            // check as explicit `Finished(Contradictory(_))` leaves.
+            // Do *not* filter those here, or the proof tree loses
+            // siblings whose contradiction reason Haskell renders.
+            // Filter cases where the eq_store has been marked false.
+            // This is the most-direct Haskell-faithful proxy for `mzero`
+            // from `contradictoryIf` during simplify (the eq-store flips
+            // to false when solveSubstEqs/solveTermEqs/solveFactEqs hit
+            // an incompatible unification, or when Maude returns the
+            // empty unifier set).  Other `Contradiction`-list signals
+            // (sort-conflation, edge-fact-tag mismatch, Cyclic, …) are
+            // post-simplify detections in our port — Haskell either
+            // catches them earlier (before the case is even built) or
+            // leaves them as explicit `Finished(Contradictory(_))`
+            // leaves.  Mirror the latter shape by *not* filtering them.
+            let dbg_filter = std::env::var("TAM_DBG_FILTER").is_ok();
+            let keep = |sys: &System, name: &str| -> bool {
+                let r = !sys.eq_store.is_false();
+                if dbg_filter {
+                    let cs = crate::constraint::solver::contradictions::contradictions(ctx, sys);
+                    eprintln!("[filter] goal={:?} case={:?} eqf={} contradictions={:?} keep={}",
+                        g, name, sys.eq_store.is_false(), cs, r);
+                }
+                r
             };
             match outcome {
                 GoalCases::Linear => {
+                    let s = simplify(r.sys);
                     let mut out = BTreeMap::new();
-                    out.insert("".to_string(), simplify(r.sys));
+                    if keep(&s, "") { out.insert("".to_string(), s); }
                     Some(out)
                 }
                 GoalCases::LinearNamed(name) => {
+                    let s = simplify(r.sys);
                     let mut out = BTreeMap::new();
-                    out.insert(name, simplify(r.sys));
+                    if keep(&s, &name) { out.insert(name, s); }
                     Some(out)
                 }
                 GoalCases::Cases(cases) => {
@@ -302,7 +294,8 @@ pub fn exec_proof_method(
                         } else {
                             name
                         };
-                        out.insert(key, simplify(sys));
+                        let s = simplify(sys);
+                        if keep(&s, &key) { out.insert(key, s); }
                     }
                     Some(out)
                 }
@@ -430,13 +423,13 @@ mod tests {
     fn solved_when_no_goals_and_subterms_done() {
         let ctx = match ctx() { Some(c) => c, None => return };
         let mut s = System::empty();
-        // Force the system out of its initial state by adding a node
-        // (so is_initial_system returns false).
+        // Force the system out of its initial state by recording a
+        // solved formula (Haskell `isInitialSystem` checks
+        // `solved_formulas.is_empty() && no_gfalse`; setting one to
+        // gtrue makes the system non-initial).
+        s.solved_formulas.push(crate::guarded::gtrue());
+        // Add a placeholder node too so the structure is non-trivial.
         let nid = tamarin_term::lterm::LVar::new("i", tamarin_term::lterm::LSort::Node, 0);
-        // Use the Fresh built-in rule shape — but for the test all we
-        // need is that nodes/edges/less is non-empty.
-        // We push an empty-rule-instance directly via the type's
-        // constructor.
         use crate::rule::{
             IntrRuleACInfo, ProtoRuleACInstInfo, ProtoRuleName, RuleAttributes,
             RuleInfo, RuleACInst, Rule,

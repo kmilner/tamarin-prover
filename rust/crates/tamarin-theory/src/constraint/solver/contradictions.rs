@@ -84,6 +84,8 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
     if sys.subterm_store.is_false() { out.push(Contradiction::SubtermCyclic); }
     if has_subterm_cycle_contra(_ctxt, sys) { out.push(Contradiction::SubtermCyclic); }
     if has_non_normal_terms(_ctxt, sys) { out.push(Contradiction::NonNormalTerms); }
+    if has_incompatible_edge_facts(sys) { out.push(Contradiction::IncompatibleEqs); }
+    if has_fresh_fact_sort_violation(sys) { out.push(Contradiction::IncompatibleEqs); }
     if sys.eq_store.is_false() { out.push(Contradiction::IncompatibleEqs); }
     // FormulasFalse: detect a `gfalse` (empty disjunction) at the top
     // level. Our `Guarded` represents False as `Disj([])`.
@@ -606,6 +608,68 @@ fn has_sort_conflated_lvars(sys: &System) -> bool {
 fn has_false_formula(sys: &System) -> bool {
     use crate::guarded::Guarded;
     sys.formulas.iter().any(|f| matches!(f, Guarded::Disj(v) if v.is_empty()))
+}
+
+/// `Fr(t)` requires `t` to be a Fresh-sorted variable. Maude's
+/// sort-aware unifier rejects bindings like `seed = f(k)` where
+/// `f` is a constructor (returning Msg sort). When our source-case
+/// grafting bypasses that check — e.g. on Minimal_HashChain where
+/// the Gen_Start direct-to-Gen_Stop precomputed case is grafted
+/// onto a runtime `!Final(f(k))` premise, conflating Gen_Start's
+/// `seed` with `f(k)` — the resulting `Fr(f(k))` is unsatisfiable.
+/// Mirrors the sort-check Haskell's unifier performs implicitly.
+fn has_fresh_fact_sort_violation(sys: &System) -> bool {
+    use tamarin_term::lterm::LSort;
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    use crate::fact::FactTag;
+    let subst = &sys.eq_store.subst;
+    for (_, rule) in &sys.nodes {
+        // Check premises (where Fr lives) and conclusions/actions
+        // for completeness — any Fresh-tagged fact with a non-Fresh
+        // term is a sort violation.
+        for fact in rule.premises.iter()
+            .chain(rule.conclusions.iter())
+            .chain(rule.actions.iter())
+        {
+            if !matches!(fact.tag, FactTag::Fresh) { continue; }
+            let t = match fact.terms.first() { Some(t) => t, None => continue };
+            let t_norm = tamarin_term::subst::apply_vterm(subst, t.clone());
+            match t_norm {
+                Term::Lit(Lit::Var(v)) if v.sort == LSort::Fresh => {}
+                Term::Lit(Lit::Var(v)) if v.sort == LSort::Msg => {
+                    // Msg can narrow to Fresh later — don't flag.
+                    let _ = v;
+                }
+                _ => return true,
+            }
+        }
+    }
+    false
+}
+
+/// Soundness invariant: every edge in a well-formed system must
+/// connect a conclusion and premise with identical fact tags (and
+/// arity).  Tamarin's `solveChainGoal` / `solvePremise` only ever
+/// add edges after `solveFactEqs` succeeds, which requires the
+/// fact tags to match.  In our port, an edge with mismatched tags
+/// can arise when node-id substitution collapses a case node onto
+/// an unrelated live node — the edge survives the rename but
+/// connects incompatible facts.  Such a system has no model.
+fn has_incompatible_edge_facts(sys: &System) -> bool {
+    for e in &sys.edges {
+        let src_rule = sys.nodes.iter().find(|(id, _)| id == &e.src.0);
+        let tgt_rule = sys.nodes.iter().find(|(id, _)| id == &e.tgt.0);
+        let (Some((_, sr)), Some((_, tr))) = (src_rule, tgt_rule) else {
+            continue;
+        };
+        let fc = match sr.conclusions.get(e.src.1.0) { Some(f) => f, None => continue };
+        let fp = match tr.premises.get(e.tgt.1.0) { Some(f) => f, None => continue };
+        if fc.tag != fp.tag || fc.terms.len() != fp.terms.len() {
+            return true;
+        }
+    }
+    false
 }
 
 /// True if the strict `<` partial order has a cycle.

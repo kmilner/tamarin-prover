@@ -548,7 +548,7 @@ end"#;
 ///  - take longer than 10s on tamarin's side
 #[test]
 fn corpus_verdict_match_coverage_probe() {
-    use std::time::Duration;
+    use rayon::prelude::*;
     use tamarin_theory::constraint::solver::search::NodeStatus;
     use tamarin_theory::prove::prove_lemma;
 
@@ -562,6 +562,11 @@ fn corpus_verdict_match_coverage_probe() {
     let mp = match maude_path() { Some(p) => p, None => return };
     if !tamarin_available() { return; }
 
+    // Per-process global — set ONCE before parallel work so threads
+    // don't race on env writes.  Step budget (200) is the deterministic
+    // gate; 10s deadline is the wall-clock backstop.
+    std::env::set_var("TAM_PROVE_DEADLINE_MS", "10000");
+
     let corpus_root = std::path::PathBuf::from("/home/parallels/tamarin-prover/examples");
     let target_dirs = [
         "loops", "csf23-subterms", "experiments", "regression",
@@ -569,135 +574,202 @@ fn corpus_verdict_match_coverage_probe() {
         "post17", "cav13", "jcs18", "csf18-alethea",
     ];
 
-    let mut compared = 0usize;
-    let mut matched = 0usize;
-    let mut diffs: Vec<String> = Vec::new();
-
+    // Phase 1: collect candidate spthy paths (sequential — just I/O).
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
     for dir in &target_dirs {
         let dir_path = corpus_root.join(dir);
         if !dir_path.exists() { continue; }
-        let entries: Vec<_> = walkdir::WalkDir::new(&dir_path)
-            .max_depth(2)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("spthy"))
-            .map(|e| e.path().to_path_buf())
-            .collect();
-
-        for path in entries {
-            let src = match std::fs::read_to_string(&path) { Ok(s) => s, Err(_) => continue };
-            // Skip files with cryptographic functions our skeleton doesn't model.
-            if src.contains("functions:") && !src.contains("functions: fst") { continue; }
-            // Skip diff-mode files.
-            if src.contains("diff(") { continue; }
-            // Skip macros / predicates / accountability — out of scope.
-            if src.contains("macros:") || src.contains("predicates:") { continue; }
-            // Skip SAPIC process files (need translation to MSR rules).
-            // Rule-level `let ... in` blocks are desugared during elaboration
-            // (see `apply_let_block`) and are therefore left in scope.
-            if src.contains("process:") { continue; }
-            // Skip files using DH / multiset / xor / bilinear-pairing
-            // — equational theories we don't fully model.
-            if src.contains("builtins:") &&
-               (src.contains("diffie-hellman") || src.contains("multiset") ||
-                src.contains("xor") || src.contains("bilinear-pairing"))
-            { continue; }
-
-            let theory = match tamarin_parser::parse_theory(&src, &[]) { Ok(t) => t, Err(_) => continue };
-            // Run tamarin once for the file with a timeout.
-            let tam_out = match Command::new("timeout")
-                .arg("10s")
-                .arg("tamarin-prover")
-                .arg("--prove")
-                .arg(&path)
-                .output() {
-                    Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
-                    Err(_) => continue,
-                };
-            let summary = match extract_summary(&tam_out) {
-                Some(s) => s, None => continue,
-            };
-
-            for it in &theory.items {
-                let lemma = match it {
-                    tamarin_parser::ast::TheoryItem::Lemma(l) => l, _ => continue,
-                };
-                // Find tamarin's verdict line for this lemma.
-                let verdict_line = match summary.lines()
-                    .find(|l| l.contains(&format!("{} (", lemma.name)))
-                {
-                    Some(l) => l, None => continue,
-                };
-                let tamarin_verdict = if verdict_line.contains("verified") {
-                    "verified"
-                } else if verdict_line.contains("falsified") {
-                    "falsified"
-                } else { continue };
-
-                // Use the file's own elaborated Maude signature.
-                // Pair-only Maude can't unify against `senc/aenc/sign/h`
-                // terms (those symbols aren't declared in the Maude
-                // module), so any lemma whose witness construction
-                // routes through encrypted-message reconstruction is
-                // unreachable.  Sig-aware Maude knows the protocol's
-                // function signature and unifies correctly.  Falls
-                // back to pair-only on elaboration failure.
-                let elab_sig = match tamarin_theory::elaborate::elaborate(&theory) {
-                    Ok(e) => Some(e.signature.maude_sig.clone()),
-                    Err(_) => None,
-                };
-                let h = match tamarin_term::maude_proc::MaudeHandle::start(
-                    &mp,
-                    elab_sig.unwrap_or_else(tamarin_term::maude_sig::pair_maude_sig),
-                ) { Ok(h) => h, Err(_) => continue };
-                // Per-lemma budget: under sig-aware Maude, the search
-                // takes more steps because impl_formulas correctly
-                // fires sources_assertion on protocols with [sources]
-                // attributes, generating extra case-splits.  Bump
-                // deadline to 2000ms / budget 200 to give the harder
-                // lemmas room to finish.
-                std::env::set_var("TAM_PROVE_DEADLINE_MS", "2000");
-                let root = match prove_lemma(&theory, &lemma.name, h, 200) {
-                    Ok(r) => r, Err(_) => continue,
-                };
-
-                use tamarin_parser::ast::TraceQuantifier;
-                let our_verdict = match (&lemma.trace_quantifier, &root.status) {
-                    // exists-trace + Solved → trace found = verified
-                    (TraceQuantifier::ExistsTrace, NodeStatus::Solved) => "verified",
-                    // exists-trace + Contradictory → no trace = falsified
-                    (TraceQuantifier::ExistsTrace, NodeStatus::Contradictory) => "falsified",
-                    // all-traces + Contradictory → counterexample dead-end = verified
-                    (TraceQuantifier::AllTraces, NodeStatus::Contradictory) => "verified",
-                    // all-traces + Solved → counterexample = falsified
-                    (TraceQuantifier::AllTraces, NodeStatus::Solved) => "falsified",
-                    (_, s) => {
-                        if std::env::var("TAM_DBG_INCOMPARABLE").is_ok() {
-                            eprintln!("INCOMPARABLE: {}::{} → {:?} (tamarin={})",
-                                path.file_name().unwrap().to_string_lossy(),
-                                lemma.name, s, tamarin_verdict);
-                        }
-                        continue;
-                    }
-                };
-
-                compared += 1;
-                if our_verdict == tamarin_verdict {
-                    matched += 1;
-                } else {
-                    diffs.push(format!(
-                        "{}::{} — ours={}, tamarin={}",
-                        path.file_name().unwrap().to_string_lossy(),
-                        lemma.name, our_verdict, tamarin_verdict));
-                }
+        for e in walkdir::WalkDir::new(&dir_path).max_depth(2).into_iter().filter_map(|e| e.ok()) {
+            if e.path().extension().and_then(|s| s.to_str()) == Some("spthy") {
+                paths.push(e.path().to_path_buf());
             }
         }
     }
 
-    let _ = Duration::from_secs(0); // Silence unused import.
+    // Phase 2: per-file work (parse + tamarin invocation) in parallel.
+    // Each successful file yields (path, theory, tamarin_summary,
+    // elab_sig) — `elab_sig` is shared across all lemmas in the file
+    // so we elaborate once per file.
+    struct FileWork {
+        path: std::path::PathBuf,
+        theory: tamarin_parser::ast::Theory,
+        summary: String,
+        elab_sig: tamarin_term::maude_sig::MaudeSig,
+    }
+    let files: Vec<FileWork> = paths.par_iter().filter_map(|path| {
+        let src = std::fs::read_to_string(path).ok()?;
+        // Skip files with USER-defined equational theories — we pass
+        // `functions:` decls through to sig-aware Maude (free symbols
+        // work fine), but user-supplied `equations:` clauses would
+        // need our AC-narrowing machinery which we don't fully model.
+        // Builtin equations (from `builtins: signing` etc.) are fine.
+        //
+        // Match both `equations:` and `equations [attrs]:` (Tamarin
+        // permits attribute brackets like `equations [convergent]:`)
+        // so we don't slip a file with custom AC theory past the
+        // filter — that previously bypassed us and produced a
+        // wrong-VERIFIED soundness regression on
+        // `denning_sacco_symmetric_cbc` whose `dec(enc(M,k),k) = M`
+        // equation we don't model.
+        if src.contains("\nequations:") || src.contains("\nequations [") { return None; }
+        if src.contains("diff(") { return None; }
+        if src.contains("macros:") || src.contains("predicates:") { return None; }
+        if src.contains("process:") { return None; }
+        if src.contains("builtins:") &&
+           (src.contains("diffie-hellman") || src.contains("multiset") ||
+            src.contains("xor") || src.contains("bilinear-pairing"))
+        { return None; }
+
+        let theory = tamarin_parser::parse_theory(&src, &[]).ok()?;
+        // Run tamarin once per file with a timeout.
+        let tam_out = Command::new("timeout")
+            .arg("10s")
+            .arg("tamarin-prover")
+            .arg("--prove")
+            .arg(path)
+            .output()
+            .ok()?;
+        let tam_text = String::from_utf8_lossy(&tam_out.stdout).into_owned();
+        let summary = extract_summary(&tam_text)?;
+        let elab_sig = match tamarin_theory::elaborate::elaborate(&theory) {
+            Ok(e) => e.signature.maude_sig.clone(),
+            Err(_) => tamarin_term::maude_sig::pair_maude_sig(),
+        };
+        Some(FileWork { path: path.clone(), theory, summary: summary.to_string(), elab_sig })
+    }).collect();
+
+    // Phase 3: flatten to per-lemma work items.
+    struct LemmaWork<'a> {
+        path: &'a std::path::PathBuf,
+        theory: &'a tamarin_parser::ast::Theory,
+        elab_sig: &'a tamarin_term::maude_sig::MaudeSig,
+        lemma_name: String,
+        trace_quantifier: tamarin_parser::ast::TraceQuantifier,
+        tamarin_verdict: &'static str,
+    }
+    let lemmas: Vec<LemmaWork> = files.iter().flat_map(|f| {
+        f.theory.items.iter().filter_map(move |it| {
+            let lemma = match it {
+                tamarin_parser::ast::TheoryItem::Lemma(l) => l, _ => return None,
+            };
+            let verdict_line = f.summary.lines()
+                .find(|l| l.contains(&format!("{} (", lemma.name)))?;
+            let tamarin_verdict = if verdict_line.contains("verified") {
+                "verified"
+            } else if verdict_line.contains("falsified") {
+                "falsified"
+            } else { return None };
+            Some(LemmaWork {
+                path: &f.path,
+                theory: &f.theory,
+                elab_sig: &f.elab_sig,
+                lemma_name: lemma.name.clone(),
+                trace_quantifier: lemma.trace_quantifier.clone(),
+                tamarin_verdict,
+            })
+        })
+    }).collect();
+
+    // Phase 4: run prove_lemma per lemma in parallel.  Each lemma gets
+    // its own MaudeHandle (independent subprocess); rayon manages
+    // thread-pool sizing via num_cpus.
+    use tamarin_parser::ast::TraceQuantifier;
+    #[derive(Clone)]
+    enum LemmaOutcome {
+        Match,
+        Diff(String),
+        Incomparable,
+    }
+    let dbg_incomp = std::env::var("TAM_DBG_INCOMPARABLE").is_ok();
+    let outcomes: Vec<LemmaOutcome> = lemmas.par_iter().map(|w| {
+        let h = match tamarin_term::maude_proc::MaudeHandle::start(&mp, w.elab_sig.clone()) {
+            Ok(h) => h, Err(_) => return LemmaOutcome::Incomparable,
+        };
+        // Watchdog: the wall-clock deadline at search::expand fires
+        // BETWEEN expand calls, but a single blocking Maude IPC read
+        // sits in stdin/stdout forever if Maude itself hangs.  Spawn
+        // a watchdog thread that kills the subprocess after a hard
+        // cap; the blocked read then returns EOF and prove_lemma
+        // unwinds with an error → Incomparable.  Without this, even
+        // one hung lemma blocks the whole `par_iter().collect()`.
+        let watchdog_handle = h.clone();
+        let watchdog_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchdog_done_clone = watchdog_done.clone();
+        let watchdog_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchdog_fired_clone = watchdog_fired.clone();
+        let watchdog = std::thread::spawn(move || {
+            // 20s per-lemma cap — twice the 10s deadline so genuine
+            // long-but-terminating lemmas finish, but real hangs are
+            // bounded.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while std::time::Instant::now() < deadline {
+                if watchdog_done_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            watchdog_fired_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+            watchdog_handle.kill_subprocess();
+        });
+        let t0 = std::time::Instant::now();
+        let root_result = prove_lemma(w.theory, &w.lemma_name, h, 200);
+        let elapsed = t0.elapsed();
+        watchdog_done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = watchdog.join();
+        let fname = w.path.file_name().unwrap().to_string_lossy().into_owned();
+        if watchdog_fired.load(std::sync::atomic::Ordering::Relaxed) {
+            // Watchdog killed Maude — log to surface the offender.
+            eprintln!("WATCHDOG: {}::{} killed after {:?}",
+                fname, w.lemma_name, elapsed);
+        } else if elapsed.as_secs() >= 5 {
+            // Slow but completed.  Worth surfacing so we can
+            // investigate Maude or solver perf for these cases.
+            eprintln!("SLOW: {}::{} took {:?}", fname, w.lemma_name, elapsed);
+        }
+        let root = match root_result {
+            Ok(r) => r, Err(_) => return LemmaOutcome::Incomparable,
+        };
+        let our_verdict = match (&w.trace_quantifier, &root.status) {
+            (TraceQuantifier::ExistsTrace, NodeStatus::Solved) => "verified",
+            (TraceQuantifier::ExistsTrace, NodeStatus::Contradictory) => "falsified",
+            (TraceQuantifier::AllTraces, NodeStatus::Contradictory) => "verified",
+            (TraceQuantifier::AllTraces, NodeStatus::Solved) => "falsified",
+            (_, s) => {
+                if dbg_incomp {
+                    eprintln!("INCOMPARABLE: {}::{} → {:?} (tamarin={})",
+                        w.path.file_name().unwrap().to_string_lossy(),
+                        w.lemma_name, s, w.tamarin_verdict);
+                }
+                return LemmaOutcome::Incomparable;
+            }
+        };
+        if our_verdict == w.tamarin_verdict {
+            LemmaOutcome::Match
+        } else {
+            LemmaOutcome::Diff(format!(
+                "{}::{} — ours={}, tamarin={}",
+                w.path.file_name().unwrap().to_string_lossy(),
+                w.lemma_name, our_verdict, w.tamarin_verdict))
+        }
+    }).collect();
+
+    // Aggregate.
+    let mut compared = 0usize;
+    let mut matched = 0usize;
+    let mut diffs: Vec<String> = Vec::new();
+    for o in &outcomes {
+        match o {
+            LemmaOutcome::Match => { compared += 1; matched += 1; }
+            LemmaOutcome::Diff(d) => { compared += 1; diffs.push(d.clone()); }
+            LemmaOutcome::Incomparable => {}
+        }
+    }
+
     eprintln!("corpus verdict-match: {}/{} matched", matched, compared);
     if !diffs.is_empty() {
         eprintln!("mismatches:");
+        // Sort for deterministic output order under parallel scheduling.
+        diffs.sort();
         for d in &diffs { eprintln!("  {}", d); }
     }
     // We don't *require* a match rate — this is a diagnostic.
@@ -1256,6 +1328,10 @@ fn proof_search_end_to_end_tiny_theory() {
         });
     let rule: tamarin_theory::rule::RuleACInst =
         Rule::new(info, Vec::new(), Vec::new(), Vec::new());
+    // Mark non-initial via a solved formula (Haskell's
+    // `isInitialSystem` uses solved_formulas emptiness, not the
+    // node/edge count).
+    sys.solved_formulas.push(tamarin_theory::guarded::gtrue());
     sys.add_node(
         tamarin_term::lterm::LVar::new(
             "i", tamarin_term::lterm::LSort::Node, 0),

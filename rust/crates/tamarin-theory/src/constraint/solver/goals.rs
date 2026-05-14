@@ -18,7 +18,7 @@ pub fn open_goals(sys: &System) -> Vec<AnnotatedGoal> {
     let mut out = Vec::new();
     for (seq, (goal, status)) in sys.goals.iter().enumerate() {
         if status.solved { continue; }
-        if !is_open(goal) { continue; }
+        if !is_open_in_sys(goal, sys) { continue; }
         let u = goal_usefulness(goal, status.looping, sys);
         out.push(AnnotatedGoal::new(goal.clone(), seq as u64, u));
     }
@@ -345,24 +345,50 @@ fn msg_premise(g: &Goal) -> Option<&tamarin_term::lterm::LNTerm> {
 ///   DisjG (Disj []) → False    -- empty disj handled by contradictions
 ///   _              → not solved
 ///
-/// KU goals on Pub/Nat literals, pair-shaped or constructor-shaped
-/// terms, or on a message variable for an unallocated node are
-/// treated as "auto-solved" — the solver doesn't need to enumerate
-/// rule candidates for them.  Without this filter, such goals stay
-/// open indefinitely, blocking `is_finished == Solved` and forcing
-/// the search to enumerate every Coerce/etc. candidate.
-fn is_open(g: &Goal) -> bool {
+/// Sys-aware variant: also auto-solves `KU(msg_var) @ #i` when no
+/// node with id `i` exists yet.  Mirrors Haskell's `openGoals`
+/// `ActionG i (kFactView -> Just (UpK, m))` branch:
+///   not $ solved
+///      || (isMsgVar m && Nothing == M.lookup i (get sNodes sys))
+///      || ... (the sort-Pub/Nat / pair/inv/prod/union checks above)
+fn is_open_in_sys(g: &Goal, sys: &System) -> bool {
     use crate::constraint::constraints::Disj;
     use crate::fact::FactTag;
     match g {
         Goal::Disj(Disj(items)) if items.is_empty() => false,
-        Goal::Action(_, fa) if matches!(fa.tag, FactTag::Ku) => {
+        Goal::Action(i, fa) if matches!(fa.tag, FactTag::Ku) => {
             let Some(m) = fa.terms.first() else { return true };
             if is_pub_or_nat_term(m) { return false; }
             if has_top_pair_inv_prod(m) { return false; }
+            if is_nullary_public_function(m) { return false; }
+            // Haskell: `isMsgVar m && no node at i` → auto-solved.
+            if is_msg_var(m) && !sys.nodes.iter().any(|(n, _)| n == i) {
+                return false;
+            }
             true
         }
         _ => true,
+    }
+}
+
+/// `isMsgVar`: the term is a Msg-sorted free variable.
+fn is_msg_var(t: &tamarin_term::lterm::LNTerm) -> bool {
+    use tamarin_term::lterm::LSort;
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    matches!(t, Term::Lit(Lit::Var(v)) if v.sort == LSort::Msg)
+}
+
+/// `isNullaryPublicFunction`: 0-arity public function symbols.
+/// Haskell's auto-solve case.
+fn is_nullary_public_function(t: &tamarin_term::lterm::LNTerm) -> bool {
+    use tamarin_term::function_symbols::FunSym;
+    use tamarin_term::term::Term;
+    match t {
+        Term::App(FunSym::NoEq(s), args)
+            if args.is_empty()
+                && matches!(s.privacy, tamarin_term::function_symbols::Privacy::Public) => true,
+        _ => false,
     }
 }
 

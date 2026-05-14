@@ -50,9 +50,12 @@ pub fn prove_lemma(
     maude: tamarin_term::maude_proc::MaudeHandle,
     max_steps: usize,
 ) -> Result<ProofNode, ProveError> {
+    let trace = std::env::var("TAM_DBG_PHASE").is_ok();
+    if trace { eprintln!("[phase] elaborate start"); }
     // Elaborate to get the typed theory, then pull rules + restrictions.
     let theory = elaborate(parser_theory)
         .map_err(|e| ProveError::Elaboration(e.message))?;
+    if trace { eprintln!("[phase] elaborate done"); }
 
     // Find the lemma (parser-AST formula stays accessible via Theory's items).
     // Our typed theory's lemma carries a parser-AST formula too — look it up.
@@ -136,9 +139,19 @@ pub fn prove_lemma(
         &g,
     );
 
+    if trace { eprintln!("[phase] formula_to_system done; ProofContext::new start"); }
     // Bridge the elaborated theory's rules into the proof context.
     let rules: Vec<OpenProtoRule> = theory.rules().cloned().collect();
     let mut ctx = ProofContext::new(maude, rules);
+    if trace { eprintln!("[phase] ProofContext::new done"); }
+    // Propagate the lemma's trace quantifier so `is_finished` can
+    // decide whether the Fresh-conflation case-drop should convert
+    // Contradictory→Unfinishable (sound only on exists-trace where
+    // the dropped case might have been the witness).
+    ctx.is_exists_trace = matches!(
+        lemma.trace_quantifier,
+        crate::theory::TraceQuantifier::ExistsTrace,
+    );
 
     // `refineWithSourceAsms`: prune precomputed source cases by
     // assumptions from `[sources]`-tagged lemmas.  Mirrors Haskell's
@@ -164,12 +177,15 @@ pub fn prove_lemma(
         }
     }
     if !typing_assumptions.is_empty() {
+        if trace { eprintln!("[phase] refine_with_source_asms start"); }
         ctx.full_sources = crate::constraint::solver::sources::refine_with_source_asms(
             std::mem::take(&mut ctx.full_sources),
             &typing_assumptions,
             &ctx,
         );
+        if trace { eprintln!("[phase] refine_with_source_asms done"); }
     }
+    if trace { eprintln!("[phase] run_proof_search start"); }
     // Honour the `[use_induction]` and `[sources]` attributes by
     // forcing the first proof method to be Induction. Haskell's
     // `ClosedTheory.hs` flips `pcUseInduction = UseInduction` for

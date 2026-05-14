@@ -41,10 +41,19 @@ use tamarin_term::subst_vfresh::SubstVFresh;
 /// variables to express a unifier. Without renaming, two separate
 /// `add_eqs` calls can return witnesses with the same `x_N` name +
 /// idx, causing distinct vars in the system to collapse.
+///
+/// **Haskell-faithful counter**: indices come from the MaudeHandle's
+/// global `fresh_counter` (mirrors `MonadFresh`), NOT from
+/// `avoid_max + 1`.  Using the local avoid_max means two calls with
+/// the same surrounding system both rename to idxs `avoid_max + 1`,
+/// `+ 2`, ... causing inter-call collisions (TESLA::authentic_reachable
+/// root cause).  The global counter guarantees every freshened witness
+/// gets a globally unique idx.
 fn freshen_witness_range(
     raw: Vec<(LVar, LNTerm)>,
     input_vars: &std::collections::BTreeSet<LVar>,
     avoid_max: u64,
+    maude: &tamarin_term::maude_proc::MaudeHandle,
 ) -> Vec<(LVar, LNTerm)> {
     use tamarin_term::lterm::HasFrees;
     use std::collections::{BTreeMap, BTreeSet};
@@ -59,12 +68,13 @@ fn freshen_witness_range(
         });
     }
     if witnesses.is_empty() { return raw; }
-    // Allocate fresh indices for each.
+    // Push the global counter above `avoid_max` first, then draw
+    // unique indices from it for each witness.
+    maude.ensure_above(avoid_max);
     let mut renames: BTreeMap<LVar, LVar> = BTreeMap::new();
-    let mut next = avoid_max + 1;
     for v in witnesses {
+        let next = maude.fresh_idx();
         renames.insert(v.clone(), LVar { idx: next, ..v });
-        next += 1;
     }
     // Apply the rename across each (var, term).
     raw.into_iter()
@@ -270,7 +280,12 @@ impl EquationStore {
             })
             .collect();
 
-        let unifiers = maude.unify_at("eq_store::add_eqs", &applied)
+        // Pass `extra_avoid` (the caller's system-wide max var idx)
+        // to the unifier so Maude-introduced witness vars get indices
+        // above any system var, preventing `~mw:Pub:N` / `~mw:Msg:N`
+        // collisions that break our (name, sort, idx) LVar identity.
+        let avoid = self.fresh_baseline().max(extra_avoid);
+        let unifiers = maude.unify_at_with_avoid("eq_store::add_eqs", &applied, avoid)
             .map_err(|e| AddEqsError::Maude(format!("{}", e)))?;
 
         if unifiers.is_empty() {
@@ -304,7 +319,8 @@ impl EquationStore {
             }
             let raw = freshen_witness_range(
                 raw, &input_vars,
-                self.fresh_baseline().max(extra_avoid));
+                self.fresh_baseline().max(extra_avoid),
+                maude);
             let mut subst = LNSubst::empty();
             for (v, t) in raw {
                 subst = subst.compose(&LNSubst::from_list(vec![(v, t)]));

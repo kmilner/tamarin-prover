@@ -14,7 +14,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
-use crate::lterm::{LNTerm, LSort, LVar};
+use crate::lterm::{LNTerm, LVar};
 use crate::maude_proc::{MaudeError, MaudeHandle};
 use crate::rewriting::Equal;
 use crate::subst_vfresh::LNSubstVFresh;

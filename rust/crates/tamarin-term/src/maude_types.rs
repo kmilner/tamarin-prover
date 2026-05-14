@@ -144,6 +144,16 @@ pub fn mterm_to_lnterm(
             if let Some(orig) = ctx.inverse.get(ml).cloned() {
                 return Term::Lit(orig);
             }
+            // Sort-tolerant fallback: Maude can return a var with the
+            // same idx but a widened sort (e.g. our `~k1:Fresh:6` may
+            // come back as `~k1:Msg:6`). Recover the canonical original
+            // LVar so subst lookups downstream don't see two distinct
+            // (name, sort, idx) instances for the same logical variable.
+            if let MaudeLit::MaudeVar(idx, sort) = ml {
+                if let Some(orig) = lookup_canonical_var_lit(ctx, *sort, *idx) {
+                    return Term::Lit(orig);
+                }
+            }
             // Otherwise it must be a Maude-introduced fresh variable.
             match ml {
                 MaudeLit::FreshVar(_, sort) | MaudeLit::MaudeVar(_, sort) => {
@@ -185,9 +195,50 @@ pub fn substitute_lookup_var(
     sort: LSort,
     idx: u64,
 ) -> Option<LVar> {
-    ctx.inverse.get(&MaudeLit::MaudeVar(idx, sort)).and_then(|l| {
-        if let Lit::Var(lv) = l { Some(lv.clone()) } else { None }
-    })
+    // Strict lookup first.
+    if let Some(lv) = ctx.inverse.get(&MaudeLit::MaudeVar(idx, sort))
+        .and_then(|l| if let Lit::Var(lv) = l { Some(lv.clone()) } else { None })
+    {
+        return Some(lv);
+    }
+    // Sort-tolerant fallback: Maude sometimes widens a variable's sort
+    // when constructing response terms (e.g. our `~k1:Fresh:6` may be
+    // referenced as `~k1:Msg:6` in the returned substitution). Look up
+    // by (idx, ANY sort) so we recover the original LVar identity.
+    // Without this, `mterm_to_lnterm` creates a fresh LVar with Maude's
+    // reported (widened) sort, producing a (name, sort, idx) collision
+    // with the original — breaking subst lookups downstream. This is
+    // the root cause of TESLA's Sender0a chain artifact.
+    for sort_candidate in &[LSort::Pub, LSort::Fresh, LSort::Nat, LSort::Msg, LSort::Node] {
+        if *sort_candidate == sort { continue; }
+        if let Some(lv) = ctx.inverse.get(&MaudeLit::MaudeVar(idx, *sort_candidate))
+            .and_then(|l| if let Lit::Var(lv) = l { Some(lv.clone()) } else { None })
+        {
+            return Some(lv);
+        }
+    }
+    None
+}
+
+/// Like `substitute_lookup_var` but for term-reconstruction: returns
+/// the matched literal (not just the LVar) so that callers in
+/// `mterm_to_lnterm` can reuse the canonical original LVar instead of
+/// fabricating a sort-mismatched fresh one.
+pub fn lookup_canonical_var_lit(
+    ctx: &ConvCtx,
+    sort: LSort,
+    idx: u64,
+) -> Option<Lit<Name, LVar>> {
+    if let Some(l) = ctx.inverse.get(&MaudeLit::MaudeVar(idx, sort)).cloned() {
+        return Some(l);
+    }
+    for sort_candidate in &[LSort::Pub, LSort::Fresh, LSort::Nat, LSort::Msg, LSort::Node] {
+        if *sort_candidate == sort { continue; }
+        if let Some(l) = ctx.inverse.get(&MaudeLit::MaudeVar(idx, *sort_candidate)).cloned() {
+            return Some(l);
+        }
+    }
+    None
 }
 
 #[cfg(test)]

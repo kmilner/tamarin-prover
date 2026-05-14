@@ -82,6 +82,13 @@ pub struct System {
     /// legitimate gfalse-in-formulas (e.g. from a body that genuinely
     /// simplifies to ⊥) still produces Contradictory.
     pub shape_mismatch_conflation: bool,
+    /// Set when `solve_action_goal` (under TAM_APPLY_SOURCE) had to
+    /// drop one or more source-cases via the Fresh-consumer conflation
+    /// guard.  The dropped case may have been the actual witness path,
+    /// so we can't trust an overall Contradictory rollup.  `is_finished`
+    /// routes Contradictory→Unfinishable when this flag is set,
+    /// preserving soundness on the new applySource path.
+    pub lost_conflation_case_apply_source: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Ord, PartialOrd, Hash)]
@@ -136,6 +143,13 @@ impl System {
     }
 
     /// Add a `<` atom if not already present (equality ignores reason).
+    /// Add a less-atom. Self-loops (a < a) are degenerate — they
+    /// produce immediate contradictions via the cyclic check.  In
+    /// most cases such a self-loop arises from subst_system collapsing
+    /// two distinct nodes to the same id AFTER a less-atom between
+    /// them was already recorded; the resulting `a < a` is a true
+    /// contradiction.  We still add it (so contradictions catches
+    /// it) but log under TAM_DBG_SELF_LOOP for diagnosis.
     pub fn add_less(&mut self, l: LessAtom) {
         if !self.less_atoms.iter().any(|x| x == &l) { self.less_atoms.push(l); }
     }

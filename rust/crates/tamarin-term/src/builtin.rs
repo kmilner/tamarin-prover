@@ -319,6 +319,44 @@ pub fn signature_rules() -> BTreeSet<crate::subterm_rule::CtxtStRule> {
     s
 }
 
+/// `revealSignatureRules`: `revealVerify(revealSign(x,y), x, pk(y)) = true`
+/// plus `getMessage(revealSign(x,y)) = x`.  Mirrors
+/// `Term.Builtin.Rules.revealSignatureRules` (Rules.hs:110-111).
+pub fn reveal_signature_rules() -> BTreeSet<crate::subterm_rule::CtxtStRule> {
+    use crate::subterm_rule::{CtxtStRule, StRhs};
+    let x1 = msg_var("x", 1);
+    let x2 = msg_var("x", 2);
+    let true_term: LNTerm = true_const::<crate::vterm::Lit<crate::lterm::Name, LVar>>();
+    let mut s = BTreeSet::new();
+    let reveal_sign_term = f_app_no_eq(reveal_sign_sym(), vec![x1.clone(), x2.clone()]);
+    s.insert(CtxtStRule::new(
+        f_app_no_eq(reveal_verify_sym(),
+            vec![reveal_sign_term.clone(), x1.clone(), pk(x2)]),
+        StRhs { positions: vec![vec![0, 0]], term: true_term },
+    ));
+    s.insert(CtxtStRule::new(
+        f_app_no_eq(extract_message_sym(), vec![reveal_sign_term]),
+        StRhs { positions: vec![vec![0, 0]], term: x1 },
+    ));
+    s
+}
+
+/// `signatureDestRules`: `verifyDest(sign(x, y), x, pk(y)) = true`.
+/// Mirrors `Term.Builtin.Rules.signatureDestRules` (Rules.hs:118).
+pub fn signature_dest_rules() -> BTreeSet<crate::subterm_rule::CtxtStRule> {
+    use crate::subterm_rule::{CtxtStRule, StRhs};
+    let x1 = msg_var("x", 1);
+    let x2 = msg_var("x", 2);
+    let true_term: LNTerm = true_const::<crate::vterm::Lit<crate::lterm::Name, LVar>>();
+    let mut s = BTreeSet::new();
+    s.insert(CtxtStRule::new(
+        f_app_no_eq(verify_dest_sym(),
+            vec![sign(x1.clone(), x2.clone()), x1, pk(x2)]),
+        StRhs { positions: vec![vec![0, 0]], term: true_term },
+    ));
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

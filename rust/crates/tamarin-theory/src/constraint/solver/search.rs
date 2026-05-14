@@ -108,6 +108,11 @@ fn expand(
     budget: &mut usize,
     deadline: &std::time::Instant,
 ) {
+    let dbg_expand = std::env::var("TAM_DBG_EXPAND").is_ok();
+    if dbg_expand {
+        eprintln!("[expand] enter budget={} sys.nodes={} goals={}",
+            *budget, node.sys.nodes.len(), node.sys.goals.len());
+    }
     // Already terminal.
     if let Some(r) = is_finished(ctx, &node.sys) {
         node.method = ProofMethod::Finished(r.clone());
@@ -146,10 +151,24 @@ fn expand(
     //
     // Then `execMethods` filters to those that succeed.
     let candidates = candidate_methods(&node.sys, ctx);
+    if dbg_expand {
+        let names: Vec<String> = candidates.iter().map(|m| format!("{:?}", m).chars().take(40).collect()).collect();
+        eprintln!("[expand] candidates: {:?}", names);
+    }
     let (method, cases) = {
         let mut pick: Option<(ProofMethod, BTreeMap<String, System>)> = None;
         for m in candidates {
-            match exec_proof_method(ctx, &m, &node.sys) {
+            if dbg_expand {
+                let name: String = format!("{:?}", m).chars().take(40).collect();
+                eprintln!("[expand] try method {}", name);
+            }
+            let t0 = std::time::Instant::now();
+            let r = exec_proof_method(ctx, &m, &node.sys);
+            if dbg_expand {
+                eprintln!("[expand] method took {:?}, result_kind={}", t0.elapsed(),
+                    if r.is_some() { "Some" } else { "None" });
+            }
+            match r {
                 Some(cs) => { pick = Some((m, cs)); break; }
                 None => continue,
             }
@@ -163,6 +182,9 @@ fn expand(
             }
         }
     };
+    if dbg_expand {
+        eprintln!("[expand] picked {} cases", cases.len());
+    }
     node.method = method;
     if cases.is_empty() {
         // Empty case-map after exec means contradictory closure.
@@ -356,6 +378,10 @@ mod tests {
             });
         let rule: RuleACInst = Rule::new(info, Vec::new(), Vec::new(), Vec::new());
         let mut sys = System::empty();
+        // Mark non-initial via a solved formula (Haskell's
+        // `isInitialSystem` uses solved_formulas emptiness, not the
+        // node/edge count).
+        sys.solved_formulas.push(crate::guarded::gtrue());
         sys.add_node(tamarin_term::lterm::LVar::new(
             "i", tamarin_term::lterm::LSort::Node, 0), rule);
         let root = run_proof_search(&ctx, sys, 10);

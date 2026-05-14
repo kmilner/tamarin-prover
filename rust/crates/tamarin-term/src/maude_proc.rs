@@ -10,6 +10,7 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::lterm::LNTerm;
@@ -46,6 +47,26 @@ impl std::error::Error for MaudeError {}
 impl From<std::io::Error> for MaudeError { fn from(e: std::io::Error) -> Self { MaudeError::Io(e) } }
 impl From<maude_parse::ParseError> for MaudeError { fn from(e: maude_parse::ParseError) -> Self { MaudeError::Parse(e) } }
 
+/// True if `t` contains any function symbol whose head matches one in
+/// `reducible`.  Used as a fast-path predicate for `reduce`: if the
+/// term contains no reducible symbols at all, `reduce` is the
+/// identity, and we can skip the Maude IPC round-trip.
+fn term_has_reducible_sym(
+    t: &LNTerm,
+    reducible: &crate::function_symbols::FunSig,
+) -> bool {
+    use crate::term::Term;
+    fn rec(t: &LNTerm, reducible: &crate::function_symbols::FunSig) -> bool {
+        match t {
+            Term::Lit(_) => false,
+            Term::App(f, args) => {
+                reducible.contains(f) || args.iter().any(|a| rec(a, reducible))
+            }
+        }
+    }
+    rec(t, reducible)
+}
+
 /// Statistics on Maude operations performed via this handle.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MaudeStats {
@@ -79,7 +100,6 @@ pub fn dump_callsite_profile() -> Vec<(String, u64)> {
 }
 
 struct MaudeProcessInner {
-    _child: Child,
     stdin: ChildStdin,
     stdout: ChildStdout,
     stats: MaudeStats,
@@ -92,6 +112,14 @@ struct MaudeProcessInner {
     /// time) so we don't memoize substitutions, only the existence
     /// answer.
     unifiable_cache: std::collections::HashMap<Vec<(LNTerm, LNTerm)>, bool>,
+    /// Memo for `reduce(...)` queries.  Maude `reduce` is a pure
+    /// function of the input term modulo the (fixed-per-handle) theory
+    /// signature, so successful reductions can be cached across calls.
+    /// `has_non_normal_terms` (contradictions.rs) calls `reduce` on
+    /// every candidate subterm of every node, and `is_finished` runs
+    /// every search step — so the same subterm gets reduced repeatedly
+    /// during a single proof.  Caching cuts those repeat round-trips.
+    reduce_cache: std::collections::HashMap<LNTerm, LNTerm>,
 }
 
 impl MaudeProcessInner {
@@ -119,8 +147,56 @@ impl MaudeProcessInner {
     }
 
     fn execute(&mut self, cmd: &[u8]) -> Result<Vec<u8>, MaudeError> {
+        let trace = std::env::var("TAM_DBG_MAUDE_IO").is_ok();
+        if trace {
+            let preview: String = cmd.iter()
+                .take(200).map(|&b| b as char).collect();
+            eprintln!("[maude>] {}", preview.replace('\n', "\\n"));
+        }
         self.write_line(cmd)?;
-        self.read_until_prompt()
+        let result = self.read_until_prompt();
+        if trace {
+            match &result {
+                Ok(reply) => {
+                    let preview: String = reply.iter()
+                        .take(200).map(|&b| b as char).collect();
+                    eprintln!("[maude<] {} bytes: {}", reply.len(), preview.replace('\n', "\\n"));
+                }
+                Err(e) => eprintln!("[maude<] ERR: {:?}", e),
+            }
+        }
+        result
+    }
+}
+
+/// Reaper for the Maude `Child` handle.  Lives in its own `Arc<Mutex<...>>`
+/// separate from the I/O mutex so that a watchdog can kill the
+/// subprocess WITHOUT contending with a reader thread that's blocked
+/// inside `read_until_prompt` while holding the I/O lock.
+struct MaudeChildReaper {
+    child: Option<Child>,
+}
+
+impl MaudeChildReaper {
+    fn kill_and_wait(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            match c.try_wait() {
+                Ok(Some(_)) => {}
+                _ => {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+            }
+        }
+    }
+}
+
+impl Drop for MaudeChildReaper {
+    fn drop(&mut self) {
+        // Reap the Maude subprocess on handle drop.  `Child::drop`
+        // alone DETACHES the process (the rust stdlib's std::process
+        // does not kill on drop), leaking zombies.
+        self.kill_and_wait();
     }
 }
 
@@ -131,9 +207,37 @@ fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// Handle to a running Maude subprocess. Cloneable; uses an `Arc<Mutex<...>>`
 /// internally so calls from multiple owners are serialised.
+/// The `Child` reaper sits in its OWN mutex so a watchdog can
+/// `kill_subprocess()` even while a reader thread is blocked on Maude
+/// IPC inside `inner` — without this split, the watchdog deadlocks
+/// trying to acquire the same mutex the blocked reader holds.
 #[derive(Clone)]
 pub struct MaudeHandle {
     inner: Arc<Mutex<MaudeProcessInner>>,
+    child: Arc<Mutex<MaudeChildReaper>>,
+    /// Monotonically-increasing counter for fresh-variable allocation.
+    ///
+    /// Mirrors Haskell's `MonadFresh` (`FreshT m` in lib/utils): a SINGLE
+    /// global counter shared across the entire proof session so that
+    /// every `freshLVar` call gets a unique idx.  Without this, two
+    /// independent Maude calls can both compute `avoid_max + 1` as the
+    /// next witness idx and produce colliding `(name, idx)` LVars at
+    /// different sorts (e.g. `~mw:Pub:17` from one call and
+    /// `~mw:Msg:17` from another).  Those collisions break our
+    /// `(name, sort, idx)` LVar identity, leading to sort-conflated
+    /// saved source cases (see project_rust_tesla_sender0a_diagnosis).
+    ///
+    /// Used by:
+    /// - `msubst_to_lnsubst_with_avoid` for Maude witness allocation.
+    /// - `freshen_witness_range` (eq_store) for post-unification renames.
+    /// - `freshen_rule` / `freshen_system` (reduction) for rule shift.
+    ///
+    /// Every consumer first calls `ensure_above(local_avoid_max)` to
+    /// guarantee the counter is at least as high as the current system
+    /// bounds, then calls `fresh_idx()` to allocate.  The counter NEVER
+    /// goes backward, so once a witness/rule idx is allocated it can
+    /// never be reused.
+    fresh_counter: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for MaudeHandle {
@@ -158,14 +262,15 @@ impl MaudeHandle {
             .map_err(|e| MaudeError::Spawn(format!("{}: {}", maude_path, e)))?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
+        let reaper = MaudeChildReaper { child: Some(child) };
         let mut inner = MaudeProcessInner {
-            _child: child,
             stdin,
             stdout,
             stats: MaudeStats::default(),
             sig: sig.clone(),
             path: PathBuf::from(maude_path),
             unifiable_cache: std::collections::HashMap::new(),
+            reduce_cache: std::collections::HashMap::new(),
         };
         // Banner / initial prompt.
         let _ = inner.read_until_prompt()?;
@@ -180,7 +285,50 @@ impl MaudeHandle {
         // Load the theory.
         let theory = pp_theory(&sig);
         let _ = inner.execute(theory.as_bytes())?;
-        Ok(MaudeHandle { inner: Arc::new(Mutex::new(inner)) })
+        Ok(MaudeHandle {
+            inner: Arc::new(Mutex::new(inner)),
+            child: Arc::new(Mutex::new(reaper)),
+            fresh_counter: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    /// Return the next unique idx and increment the counter.
+    /// Mirrors Haskell's `freshIdent` / `freshLVar` — every call returns
+    /// a globally-unique integer across the entire proof session.
+    pub fn fresh_idx(&self) -> u64 {
+        self.fresh_counter.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Atomically reserve `n` consecutive idxs from the global counter,
+    /// returning the FIRST one.  Used by `freshen_rule` /
+    /// `freshen_system` to shift a rule's or case's vars into a globally
+    /// unique range without per-call collisions.  Haskell's MonadFresh
+    /// equivalent: `freshIdents n` (replicates `freshIdent` n times).
+    pub fn reserve_idxs(&self, n: u64) -> u64 {
+        if n == 0 { return self.fresh_counter.load(Ordering::SeqCst); }
+        self.fresh_counter.fetch_add(n, Ordering::SeqCst)
+    }
+
+    /// Bump the counter so the next allocation is strictly greater than `n`.
+    /// No-op if the counter is already > `n`.  Callers use this before
+    /// `fresh_idx()` to guarantee new allocations don't collide with
+    /// any system var below `n`.  The counter never goes backward.
+    pub fn ensure_above(&self, n: u64) {
+        let target = n.saturating_add(1);
+        let mut cur = self.fresh_counter.load(Ordering::SeqCst);
+        while cur < target {
+            match self.fresh_counter.compare_exchange(
+                cur, target, Ordering::SeqCst, Ordering::SeqCst,
+            ) {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Current counter value (for diagnostics / probe output).
+    pub fn fresh_counter_peek(&self) -> u64 {
+        self.fresh_counter.load(Ordering::SeqCst)
     }
 
     pub fn maude_sig(&self) -> MaudeSig {
@@ -191,12 +339,53 @@ impl MaudeHandle {
         self.inner.lock().unwrap().path.clone()
     }
 
+    /// Kill the underlying Maude subprocess.  Use as a watchdog when a
+    /// prove_lemma call is blocked inside a synchronous Maude IPC read
+    /// (no internal deadline can catch that — the read just sits there
+    /// waiting for stdout bytes).  After kill, any pending read returns
+    /// EOF, the worker thread unwinds with an error, and the handle's
+    /// `Drop` reaps the zombie.  Idempotent — try_wait first so we
+    /// don't error on an already-exited child.
+    ///
+    /// Locks ONLY `self.child` (the dedicated reaper mutex), NOT
+    /// `self.inner`, so it can fire while a reader thread holds the
+    /// I/O mutex inside `read_until_prompt`.  Without this split the
+    /// watchdog deadlocks with the very thread it's trying to unblock.
+    pub fn kill_subprocess(&self) {
+        if let Ok(mut reaper) = self.child.lock() {
+            reaper.kill_and_wait();
+        }
+    }
+
     pub fn stats(&self) -> MaudeStats {
         self.inner.lock().unwrap().stats
     }
 
-    /// Reduce a term to normal form modulo the theory.
+    /// Reduce a term to normal form modulo the theory.  Memoized via
+    /// `reduce_cache`: `reduce` is a pure function of the input modulo
+    /// the fixed-per-handle Maude signature, and `has_non_normal_terms`
+    /// (called on every search step) calls it repeatedly for the same
+    /// subterms.
     pub fn reduce(&self, t: &LNTerm) -> Result<LNTerm, MaudeError> {
+        {
+            let inner = self.inner.lock().unwrap();
+            if let Some(cached) = inner.reduce_cache.get(t) {
+                return Ok(cached.clone());
+            }
+            // Fast path: if the term contains NO reducible function
+            // symbols anywhere (and the signature has no AC theories
+            // that could rewrite via narrowing), `reduce` is the
+            // identity.  Avoids the ~0.7ms Maude IPC round-trip on the
+            // overwhelming majority of fact-term normalisations we
+            // perform during subst_system.
+            if !inner.sig.enable_dh && !inner.sig.enable_bp
+                && !inner.sig.enable_mset && !inner.sig.enable_nat
+                && !inner.sig.enable_xor
+                && !term_has_reducible_sym(t, &inner.sig.reducible_fun_syms)
+            {
+                return Ok(t.clone());
+            }
+        }
         let mut inner = self.inner.lock().unwrap();
         let mut ctx = ConvCtx::new();
         let mt = lterm_to_mterm_global(t, &mut ctx);
@@ -209,7 +398,10 @@ impl MaudeHandle {
         drop(inner);
         let mt_back = maude_parse::parse_reduce_reply(&sig, &reply)?;
         let mut next = 0;
-        Ok(mterm_to_lnterm(&mt_back, &mut ctx, "z", &mut next))
+        let result = mterm_to_lnterm(&mt_back, &mut ctx, "z", &mut next);
+        let mut inner = self.inner.lock().unwrap();
+        inner.reduce_cache.insert(t.clone(), result.clone());
+        Ok(result)
     }
 
     /// Unify a list of equations modulo the theory. Returns one substitution
@@ -264,7 +456,32 @@ impl MaudeHandle {
         self.unify(eqs)
     }
 
+    /// `unify_at` with explicit `avoid_max` — Maude-introduced witness
+    /// vars get indices above `avoid_max + 1`. Critical to prevent
+    /// witness/system var collisions: a system-wide `~mw:Pub:N` would
+    /// conflict with a Maude witness `~mw:Msg:N` if the counter starts
+    /// from 0 (or just the call's input).
+    pub fn unify_at_with_avoid(
+        &self,
+        label: &'static str,
+        eqs: &[Equal<LNTerm>],
+        avoid_max: u64,
+    ) -> Result<Vec<Vec<(crate::lterm::LVar, LNTerm)>>, MaudeError>
+    {
+        _tally_callsite(label);
+        self.unify_with_avoid(eqs, avoid_max)
+    }
+
     pub fn unify(&self, eqs: &[Equal<LNTerm>]) -> Result<Vec<Vec<(crate::lterm::LVar, LNTerm)>>, MaudeError>
+    {
+        self.unify_with_avoid(eqs, 0)
+    }
+
+    pub fn unify_with_avoid(
+        &self,
+        eqs: &[Equal<LNTerm>],
+        avoid_max: u64,
+    ) -> Result<Vec<Vec<(crate::lterm::LVar, LNTerm)>>, MaudeError>
     {
         if eqs.is_empty() {
             return Ok(vec![Vec::new()]);
@@ -284,8 +501,28 @@ impl MaudeHandle {
         // the same shape.  Skips the ~2.5 ms subprocess round-trip
         // on every fact-eq unification.
         if self.is_ac_free() {
+            // Push the global counter above `avoid_max` so the local
+            // unifier's `~mw` witnesses (allocated by
+            // `unify_lnterm_no_ac` via the supplied counter) live in a
+            // globally-unique range.  Haskell-faithful MonadFresh:
+            // one counter shared across every freshen.
+            self.ensure_above(avoid_max);
+            // Also account for input vars to avoid colliding with
+            // them (they may themselves be old witness vars).
+            use crate::lterm::HasFrees;
+            for eq in eqs {
+                eq.lhs.for_each_free(&mut |v| {
+                    if v.name == "~mw" { self.ensure_above(v.idx); }
+                });
+                eq.rhs.for_each_free(&mut |v| {
+                    if v.name == "~mw" { self.ensure_above(v.idx); }
+                });
+            }
             let eqs_owned: Vec<Equal<LNTerm>> = eqs.iter().cloned().collect();
-            return Ok(match crate::unification::unify_lnterm_no_ac(eqs_owned) {
+            let result = crate::unification::unify_lnterm_no_ac_with_counter(
+                eqs_owned, &self.fresh_counter,
+            );
+            return Ok(match result {
                 Ok(subst) => {
                     let bindings: Vec<(crate::lterm::LVar, LNTerm)> = subst.to_list()
                         .into_iter().map(|(v, t)| (v, t)).collect();
@@ -297,6 +534,64 @@ impl MaudeHandle {
         let mut inner = self.inner.lock().unwrap();
         let mut ctx = ConvCtx::new();
         let mut cmd = b"unify in MSG : ".to_vec();
+        for (i, eq) in eqs.iter().enumerate() {
+            if i > 0 { cmd.extend_from_slice(b" /\\ "); }
+            let lm = lterm_to_mterm_global(&eq.lhs, &mut ctx);
+            let rm = lterm_to_mterm_global(&eq.rhs, &mut ctx);
+            cmd.extend(pp_mterm(&lm));
+            cmd.extend_from_slice(b" =? ");
+            cmd.extend(pp_mterm(&rm));
+        }
+        cmd.extend_from_slice(b" .\n");
+        let reply = inner.execute(&cmd)?;
+        inner.stats.unify_count += 1;
+        let sig = inner.sig.clone();
+        drop(inner);
+        let msubsts = maude_parse::parse_unify_reply(&sig, &reply)?;
+        // Also avoid colliding with vars in the input eqs (their `~mw`
+        // indices set a floor for the witness counter).
+        let mut input_max = avoid_max;
+        for eq in eqs {
+            use crate::lterm::HasFrees;
+            eq.lhs.for_each_free(&mut |v| {
+                if v.idx > input_max { input_max = v.idx; }
+            });
+            eq.rhs.for_each_free(&mut |v| {
+                if v.idx > input_max { input_max = v.idx; }
+            });
+        }
+        let mut out = Vec::with_capacity(msubsts.len());
+        for ms in &msubsts {
+            // Use the global counter (Haskell-faithful MonadFresh).
+            out.push(msubst_to_lnsubst_with_maude(ms, &mut ctx, input_max, Some(self))?);
+        }
+        Ok(out)
+    }
+
+    /// Variant unification — uses Maude's `variant unify in M : t1 =? t2 .`
+    /// which unifies modulo the `[variant]` equations from the builtin
+    /// theory (e.g. `verify(sign(m,sk), m, pk(sk)) = true`). Standard
+    /// `unify` doesn't apply these eqs; variant unify does narrowing.
+    ///
+    /// Used as a fallback for chain-edge unification when the standard
+    /// `unify_eqs` returns no unifier — typically for cases involving
+    /// `verify(...) = true` chain artifacts from rules like Receiver0b
+    /// (TESLA) which have `verify(signature, ...)` in conclusions whose
+    /// chain target consumes `true`. Without variant unification, the
+    /// chain edge is rejected as sort-incompatible and the case is
+    /// dropped → search loses witness paths.
+    pub fn variant_unify_eqs(&self, eqs: &[Equal<LNTerm>])
+        -> Result<Vec<Vec<(crate::lterm::LVar, LNTerm)>>, MaudeError>
+    {
+        if eqs.is_empty() {
+            return Ok(vec![Vec::new()]);
+        }
+        if eqs.iter().all(|eq| eq.lhs == eq.rhs) {
+            return Ok(vec![Vec::new()]);
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let mut ctx = ConvCtx::new();
+        let mut cmd = b"variant unify in MSG : ".to_vec();
         for (i, eq) in eqs.iter().enumerate() {
             if i > 0 { cmd.extend_from_slice(b" /\\ "); }
             let lm = lterm_to_mterm_global(&eq.lhs, &mut ctx);
@@ -531,38 +826,6 @@ impl MaudeHandle {
     }
 }
 
-/// Whether `eqs` contains any var-var pair where the two sides have
-/// *different* sub-sorts.  When this happens, Maude's order-sorted
-/// unifier introduces a fresh witness at the narrower sort and binds
-/// both inputs to it; our local Robinson-style unifier instead picks
-/// one of the originals as the survivor.  Both are valid most-general
-/// unifiers but downstream code (eq-store + subst-system +
-/// freshen_witness_range) is calibrated against Maude's witness-heavy
-/// shape, so we fall back to Maude whenever sort narrowing is in play.
-fn needs_sort_narrowing(eqs: &[Equal<LNTerm>]) -> bool {
-    use crate::lterm::LSort;
-    use crate::term::Term;
-    use crate::vterm::Lit;
-    fn collect_var_pairs(t1: &LNTerm, t2: &LNTerm, out: &mut Vec<(LSort, LSort)>) {
-        match (t1, t2) {
-            (Term::Lit(Lit::Var(v1)), Term::Lit(Lit::Var(v2))) => {
-                out.push((v1.sort, v2.sort));
-            }
-            (Term::App(f1, a1), Term::App(f2, a2)) if f1 == f2 && a1.len() == a2.len() => {
-                for (x, y) in a1.iter().zip(a2.iter()) {
-                    collect_var_pairs(x, y, out);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut pairs: Vec<(LSort, LSort)> = Vec::new();
-    for eq in eqs {
-        collect_var_pairs(&eq.lhs, &eq.rhs, &mut pairs);
-    }
-    pairs.iter().any(|(a, b)| a != b)
-}
-
 /// One-letter sort tag for synthesizing skolem constant names.
 fn sort_tag(s: crate::lterm::LSort) -> &'static str {
     use crate::lterm::LSort;
@@ -616,25 +879,67 @@ fn msubst_to_lnsubst(
     ms: &MSubst,
     ctx: &mut ConvCtx,
 ) -> Result<Vec<(crate::lterm::LVar, LNTerm)>, MaudeError> {
+    msubst_to_lnsubst_with_avoid(ms, ctx, 0)
+}
+
+fn msubst_to_lnsubst_with_avoid(
+    ms: &MSubst,
+    ctx: &mut ConvCtx,
+    avoid_max: u64,
+) -> Result<Vec<(crate::lterm::LVar, LNTerm)>, MaudeError> {
+    msubst_to_lnsubst_with_maude(ms, ctx, avoid_max, None)
+}
+
+/// Maude-handle-aware variant: draws witness indices from the
+/// MaudeHandle's global counter when supplied.  Mirrors Haskell's
+/// `MonadFresh` — every freshen across the entire proof session uses
+/// the same counter, so witness indices are globally unique.  Without
+/// this, two independent Maude calls both start at `avoid_max + 1`
+/// and produce colliding `(name, idx)` LVars at different sorts (the
+/// TESLA Sender0a root cause).
+fn msubst_to_lnsubst_with_maude(
+    ms: &MSubst,
+    ctx: &mut ConvCtx,
+    avoid_max: u64,
+    maude: Option<&MaudeHandle>,
+) -> Result<Vec<(crate::lterm::LVar, LNTerm)>, MaudeError> {
     let mut out = Vec::with_capacity(ms.len());
-    let mut next: u64 = 0;
-    // Even within a single Maude call we must avoid colliding with any
-    // pre-existing `~mw`-named input (rare, but possible if a
-    // sub-substitution from a prior call was re-fed in).
-    for lit in ctx.bindings().values() {
-        if let crate::vterm::Lit::Var(lv) = lit {
-            if lv.name == "~mw" && lv.idx >= next {
-                next = lv.idx + 1;
+    // Initialise `next`.  With a global counter, push it above
+    // `avoid_max` and any input `~mw` var, then snapshot — every
+    // subsequent allocation increments BOTH the local `next` and the
+    // global counter (via the wrapper closure below).
+    let mut next: u64 = if let Some(h) = maude {
+        h.ensure_above(avoid_max);
+        for lit in ctx.bindings().values() {
+            if let crate::vterm::Lit::Var(lv) = lit {
+                if lv.name == "~mw" {
+                    h.ensure_above(lv.idx);
+                }
             }
         }
-    }
+        h.fresh_counter_peek()
+    } else {
+        let mut n = avoid_max.saturating_add(1);
+        for lit in ctx.bindings().values() {
+            if let crate::vterm::Lit::Var(lv) = lit {
+                if lv.name == "~mw" && lv.idx >= n {
+                    n = lv.idx + 1;
+                }
+            }
+        }
+        n
+    };
     for ((sort, idx), mt) in ms {
-        // Look up the original LVar that we mapped to MaudeVar(*idx, *sort).
         let lv = crate::maude_types::substitute_lookup_var(ctx, *sort, *idx)
             .ok_or_else(|| MaudeError::Other(format!(
                 "no binding for Maude variable x{}:{:?}", idx, sort)))?;
         let t = mterm_to_lnterm(mt, ctx, "~mw", &mut next);
         out.push((lv, t));
+    }
+    // Bump the global counter so any subsequent allocator (in this or
+    // a parallel call on the same handle) starts above our allocations.
+    if let Some(h) = maude {
+        if next > 0 { h.ensure_above(next - 1); }
     }
     Ok(out)
 }

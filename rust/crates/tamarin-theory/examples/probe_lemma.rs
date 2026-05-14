@@ -34,8 +34,151 @@ fn main() {
         elab_sig.unwrap_or_else(tamarin_term::maude_sig::pair_maude_sig),
     ).unwrap();
 
+    let stats_handle = h.clone();
     let t = Instant::now();
     let root = prove_lemma(&theory, lemma_name, h, budget).expect("prove");
     println!("lemma={} budget={} deadline={}ms elapsed={}ms status={:?}",
         lemma_name, budget, deadline_ms, t.elapsed().as_millis(), root.status);
+    let stats = stats_handle.stats();
+    println!("maude_stats: unify={} match={} norm={} var={}",
+        stats.unify_count, stats.match_count, stats.norm_count, stats.var_count);
+    if std::env::var("TAM_DUMP_PROOF").is_ok() {
+        println!("---");
+        println!("{}", tamarin_theory::proof_skeleton::render(&root));
+    }
+    if std::env::var("TAM_DUMP_PATH").is_ok() {
+        // Path follows the named children, defaulting to first.
+        let path_str = std::env::var("TAM_DUMP_PATH").unwrap_or_default();
+        let path: Vec<&str> = if path_str == "1" { Vec::new() } else { path_str.split(',').collect() };
+        let dump_at_depth: Option<usize> = std::env::var("TAM_DUMP_AT").ok()
+            .and_then(|s| s.parse().ok());
+        fn dump_path(
+            node: &tamarin_theory::constraint::solver::search::ProofNode,
+            depth: usize,
+            remaining_path: &[&str],
+            dump_at_depth: Option<usize>,
+        ) {
+            let pad = "  ".repeat(depth);
+            println!("{}--- depth {} status={:?} method={:?} ---", pad, depth, node.status, node.method);
+            println!("{}nodes={} edges={} goals={} subst.len={} is_false={} children={}",
+                pad, node.sys.nodes.len(), node.sys.edges.len(), node.sys.goals.len(),
+                node.sys.eq_store.subst.to_list().len(),
+                node.sys.eq_store.is_false(),
+                node.children.len());
+            for (name, c) in &node.children {
+                println!("{}  child: {:?} status={:?}", pad, name, c.status);
+            }
+            if node.sys.eq_store.is_false() {
+                println!("{}>>> is_false detected at this node", pad);
+            }
+            if dump_at_depth == Some(depth) {
+                println!("{}=== FULL DUMP at depth {} ===", pad, depth);
+                println!("{}-- nodes --", pad);
+                for (id, ru) in &node.sys.nodes {
+                    println!("{}  {:?} → {}", pad, id,
+                        tamarin_theory::constraint::solver::reduction::rule_case_name(ru));
+                    for (i, p) in ru.premises.iter().enumerate() {
+                        println!("{}    prem[{}]: {:?} {:?}", pad, i, p.tag, p.terms);
+                    }
+                    for (i, a) in ru.actions.iter().enumerate() {
+                        println!("{}    act[{}]:  {:?} {:?}", pad, i, a.tag, a.terms);
+                    }
+                    for (i, c) in ru.conclusions.iter().enumerate() {
+                        println!("{}    conc[{}]: {:?} {:?}", pad, i, c.tag, c.terms);
+                    }
+                }
+                println!("{}-- edges --", pad);
+                for e in &node.sys.edges {
+                    println!("{}  {:?} → {:?}", pad, e.src, e.tgt);
+                }
+                println!("{}-- goals --", pad);
+                for (g, st) in &node.sys.goals {
+                    println!("{}  solved={} loop={} {:?}", pad, st.solved, st.looping, g);
+                }
+                println!("{}-- subst --", pad);
+                for (v, t) in node.sys.eq_store.subst.to_list().iter() {
+                    println!("{}  {:?} → {:?}", pad, v, t);
+                }
+                println!("{}-- conj --", pad);
+                for d in &node.sys.eq_store.conj {
+                    println!("{}  disj id={:?} substs.len={}", pad, d.split_id, d.substs.len());
+                }
+                println!("{}-- formulas ({}) --", pad, node.sys.formulas.len());
+                for f in &node.sys.formulas {
+                    println!("{}  {:?}", pad,
+                        format!("{:?}", f).chars().take(300).collect::<String>());
+                }
+                println!("{}-- solved_formulas ({}) --", pad,
+                    node.sys.solved_formulas.len());
+                for f in &node.sys.solved_formulas {
+                    println!("{}  {:?}", pad,
+                        format!("{:?}", f).chars().take(300).collect::<String>());
+                }
+            }
+            // Pick next child by name from remaining_path, or first.
+            let next_child = if let Some((wanted, rest)) = remaining_path.split_first() {
+                let found = node.children.iter().find(|(name, _)| name.as_str() == *wanted);
+                if let Some((_, c)) = found {
+                    Some((c, rest))
+                } else {
+                    println!("{}!! could not find child {:?} — stopping", pad, wanted);
+                    None
+                }
+            } else if let Some((_, c)) = node.children.iter().next() {
+                Some((c, &[][..]))
+            } else {
+                None
+            };
+            if let Some((c, rest)) = next_child {
+                dump_path(c, depth + 1, rest, dump_at_depth);
+            }
+        }
+        println!("--- PATH DUMP ---");
+        dump_path(&root, 0, &path, dump_at_depth);
+    }
+    if std::env::var("TAM_DUMP_LEAF").is_ok() {
+        // Walk to first Solved leaf and dump its system state.
+        fn find_solved(node: &tamarin_theory::constraint::solver::search::ProofNode)
+            -> Option<&tamarin_theory::constraint::solver::search::ProofNode>
+        {
+            if matches!(node.status, NodeStatus::Solved) && node.children.is_empty() {
+                return Some(node);
+            }
+            for (_, c) in &node.children {
+                if let Some(r) = find_solved(c) { return Some(r); }
+            }
+            None
+        }
+        if let Some(leaf) = find_solved(&root) {
+            println!("--- SOLVED LEAF ---");
+            println!("nodes ({}):", leaf.sys.nodes.len());
+            for (id, ru) in &leaf.sys.nodes {
+                println!("  {:?} -> {:?}", id, tamarin_theory::constraint::solver::reduction::rule_case_name(ru));
+                for (i, p) in ru.premises.iter().enumerate() {
+                    println!("    prem[{}]: {:?}({:?})", i, p.tag, p.terms);
+                }
+                for (i, a) in ru.actions.iter().enumerate() {
+                    println!("    act[{}]:  {:?}({:?})", i, a.tag, a.terms);
+                }
+                for (i, c) in ru.conclusions.iter().enumerate() {
+                    println!("    conc[{}]: {:?}({:?})", i, c.tag, c.terms);
+                }
+            }
+            println!("edges ({}):", leaf.sys.edges.len());
+            for e in &leaf.sys.edges {
+                println!("  {:?} -> {:?}", e.src, e.tgt);
+            }
+            println!("goals ({}):", leaf.sys.goals.len());
+            for (g, st) in &leaf.sys.goals {
+                println!("  solved={} {:?}", st.solved, g);
+            }
+            println!("less_atoms ({}):", leaf.sys.less_atoms.len());
+            for l in &leaf.sys.less_atoms {
+                println!("  {:?}", l);
+            }
+            println!("eq_store: {:?}", leaf.sys.eq_store.subst);
+        } else {
+            println!("(no Solved leaf found)");
+        }
+    }
 }
