@@ -4135,9 +4135,21 @@ fn graft_case_into_action(
     Some(out)
 }
 
-/// `removeRedundantCases` placeholder. The full version filters cases
-/// that are subsumed by earlier ones modulo AC; the structural skeleton
-/// here is a no-op.
+/// Direct port of Haskell `removeRedundantCases` (Sources.hs:236-260)
+/// for the **non-BP/MSet branch** — Haskell short-circuits:
+///
+/// ```haskell
+/// removeRedundantCases ctxt stableVars getSys cases0 =
+///     if enableBP msig || enableMSet msig then cases else cases0
+/// ```
+///
+/// Without bilinear-pairing or multiset signatures, no AC-redundant
+/// cases can arise from `runReduction`, so the function is the identity.
+/// Our refineSource already dedups by canonical-system string and our
+/// `SolveGoal` arm dedups by case-name suffix, which together cover
+/// the BP/MSet branch's intent for the corpus we exercise.  No live
+/// callers today; left as a hook for when BP/MSet protocols enter the
+/// corpus and Haskell-equivalent system-normed dedup becomes needed.
 pub fn remove_redundant_cases<T: Clone>(cases: Vec<T>) -> Vec<T> { cases }
 
 #[cfg(test)]
