@@ -60,7 +60,10 @@ import qualified Control.Monad.Trans.State                 as St
 import           Debug.Trace
 import           Safe
 import           System.IO.Unsafe
+import           System.IO                                 (hPutStrLn, stderr)
 import           System.Process
+import qualified System.Environment
+import qualified Data.IORef
 
 import           Theory.Constraint.Solver.Sources
 import           Theory.Constraint.Solver.Contradictions
@@ -76,7 +79,118 @@ import qualified Extension.Data.Label as L
 import Control.Monad.Disj (disjunctionOfList)
 import Data.Bool (bool)
 
+hsTraceSolve :: Bool
+hsTraceSolve = unsafePerformIO $
+  maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_TRACE"
+{-# NOINLINE hsTraceSolve #-}
 
+-- | Cross-solver state tracer.  Set `TAM_TRACE_STATE=1` and run
+-- `tamarin-prover --prove`; lines go to stderr in the canonical
+-- format used by our Rust port's `state_trace` module:
+--
+--   TRACE@<step> <op> goal=<goal_summary> sys=<fingerprint>
+--
+-- Diffing the two traces side-by-side localizes where Rust and
+-- Haskell diverge.
+hsTraceState :: Bool
+hsTraceState = unsafePerformIO $
+  maybe False (\v -> v == "1" || not (null v)) <$>
+    System.Environment.lookupEnv "TAM_TRACE_STATE"
+{-# NOINLINE hsTraceState #-}
+
+-- Step counter — mirrors Rust's `STEP: AtomicU64`.  Each
+-- `hsEmit` / `hsEmitCase` call atomically bumps it.
+hsTraceStep :: Data.IORef.IORef Int
+hsTraceStep = unsafePerformIO $ Data.IORef.newIORef 0
+{-# NOINLINE hsTraceStep #-}
+
+-- Compact one-line system fingerprint — matches Rust's
+-- `state_trace::fingerprint` format byte-for-byte.
+hsFingerprint :: System -> String
+hsFingerprint sys =
+  let n   = M.size (L.get sNodes sys)
+      e   = S.size (L.get sEdges sys)
+      gO  = length [ () | (_, status) <- M.toList (L.get sGoals sys)
+                        , not (L.get gsSolved status) ]
+      f   = S.size (L.get sFormulas sys)
+      sf  = S.size (L.get sSolvedFormulas sys)
+      eqs = length (substToList (L.get sSubst sys))
+      la  = case L.get sLastAtom sys of
+              Just _ -> "Y"; Nothing -> "N"
+  in "n=" ++ show n ++ " e=" ++ show e ++ " gO=" ++ show gO ++
+     " f=" ++ show f ++ " sf=" ++ show sf ++
+     " eqs=" ++ show eqs ++ " la=" ++ la
+
+-- Compact goal summary — matches Rust's
+-- `state_trace::goal_summary` format.
+hsGoalSummary :: Maybe Goal -> String
+hsGoalSummary Nothing = "-"
+hsGoalSummary (Just g) = case g of
+  ActionG _ fa  -> hsFactSummary "" fa
+  PremiseG _ fa -> hsFactSummary "Pre/" fa
+  ChainG _ _    -> "Chain"
+  DisjG _       -> "Disj"
+  SplitG _      -> "Split"
+  SubtermG _    -> "Subterm"
+
+hsFactSummary :: String -> LNFact -> String
+hsFactSummary pfx (Fact tag _ ts) =
+  let label = case tag of
+        KUFact          -> "KU"
+        KDFact          -> "KD"
+        ProtoFact _ n _ -> n
+        FreshFact       -> "Fr"
+        InFact          -> "In"
+        OutFact         -> "Out"
+        DedFact         -> "Ded"
+        TermFact        -> "Term"
+  in pfx ++ label ++ "(" ++ intercalate "," (map hsTermSummary ts) ++ ")"
+
+hsTermSummary :: LNTerm -> String
+hsTermSummary t = case viewTerm t of
+  Lit (Var v) ->
+    let sortCh = case lvarSort v of
+          LSortMsg   -> 'M'
+          LSortPub   -> 'P'
+          LSortFresh -> 'F'
+          LSortNat   -> 'N'
+          LSortNode  -> 'I'
+    in lvarName v ++ ":" ++ [sortCh]
+  Lit (Con c) -> "'" ++ show c ++ "'"
+  FApp (NoEq (n,(_,_,_))) args
+    | n == BC.pack "pair" ->
+        "<" ++ intercalate "," (map hsTermSummary (flattenPairs t)) ++ ">"
+    | otherwise ->
+        BC.unpack n ++ "(" ++ intercalate "," (map hsTermSummary args) ++ ")"
+  FApp List args ->
+    "[" ++ intercalate "," (map hsTermSummary args) ++ "]"
+  FApp _ _ -> "AC?"
+  where
+    flattenPairs ::LNTerm -> [LNTerm]
+    flattenPairs (viewTerm -> FApp (NoEq (n,_)) [l,r]) | n == BC.pack "pair" =
+        flattenPairs l ++ flattenPairs r
+    flattenPairs x = [x]
+
+-- Emit one trace event.  Uses `unsafePerformIO . hPutStrLn stderr`
+-- to mirror Rust's `eprintln!`.  `seq` keeps the order strict.
+hsEmit :: String -> Maybe Goal -> System -> a -> a
+hsEmit op mg sys k =
+  if not hsTraceState then k else
+    unsafePerformIO (do
+      s <- Data.IORef.atomicModifyIORef' hsTraceStep (\n -> (n + 1, n))
+      hPutStrLn stderr ("TRACE@" ++ show s ++ " " ++ op
+        ++ " goal=" ++ hsGoalSummary mg
+        ++ " sys=" ++ hsFingerprint sys)) `seq` k
+
+hsEmitCase :: String -> String -> Maybe Goal -> System -> a -> a
+hsEmitCase op caseName mg sys k =
+  if not hsTraceState then k else
+    unsafePerformIO (do
+      s <- Data.IORef.atomicModifyIORef' hsTraceStep (\n -> (n + 1, n))
+      hPutStrLn stderr ("TRACE@" ++ show s ++ " " ++ op
+        ++ " case=" ++ caseName
+        ++ " goal=" ++ hsGoalSummary mg
+        ++ " sys=" ++ hsFingerprint sys)) `seq` k
 
 ------------------------------------------------------------------------------
 -- Utilities
@@ -283,6 +397,7 @@ checkAndExecProofMethod ctxt method sys = do
 execProofMethod :: ProofContext
                 -> ProofMethod -> System -> Maybe (M.Map CaseName System)
 execProofMethod ctxt method sys =
+    hsEmit "expand" Nothing sys $
     case method of
       Sorry _               -> return M.empty
       Finished _            -> return M.empty
@@ -296,7 +411,25 @@ execProofMethod ctxt method sys =
           -- cannot be equal to the original one so there's nothing to check.
           _ -> return cases
       Induction             -> process . induction <$> getInductionCases sys
-      SolveGoal goal        -> return $ process $ solve goal
+      SolveGoal goal        ->
+        let cases = process (solve goal)
+            -- emit one trace line per case, mirroring Rust's
+            -- `proof_method::keep` instrumentation.  Cases that
+            -- survived simplifySystem are emitted as `case_keep`;
+            -- ones that got dropped (mzero) are not in the map and
+            -- therefore not emitted on the Haskell side either,
+            -- which matches Rust's actual filter behaviour.
+            tracedCases =
+              if hsTraceState then
+                M.foldrWithKey
+                  (\name s acc -> hsEmitCase "case_keep" name (Just goal) s acc)
+                  cases
+                  cases
+              else cases
+        in (if hsTraceSolve
+              then trace ("[SOLVE] goal=" ++ take 200 (show goal) ++
+                          "\n        cases=" ++ show (M.keys cases))
+              else id) (return tracedCases)
       Invalidated           -> Nothing
   where
     process :: Reduction CaseName -> M.Map CaseName System
