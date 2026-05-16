@@ -98,7 +98,6 @@ pub fn simplify_system(red: &mut Reduction) {
         c = c.or(enforce_fresh_ordering_pass(r));
         c = c.or(propagate_subterm_obvious(r));
         c = c.or(simp_injective_fact_eq_mon_pass(r));
-        c = c.or(remove_solved_split_goals_pass(r));
         c = c.or(dedupe_formulas_pass(r));
         c = c.or(drop_trivially_true_formulas_pass(r));
         c = c.or(normalise_less_atoms_pass(r));
@@ -110,6 +109,13 @@ pub fn simplify_system(red: &mut Reduction) {
     // sharing the same term.  Haskell runs this only in non-diff
     // mode, after the main loop, before `removeSolvedSplitGoals`.
     exploit_unique_msg_order(red);
+    // Haskell `simplifySystem` non-diff branch (Simplify.hs:73-78)
+    // runs `removeSolvedSplitGoals` AFTER `exploitUniqueMsgOrder`
+    // and once at the end of the pipeline — NOT inside the
+    // while_changing loop.  We had it in the loop body; that's
+    // non-Haskell-faithful and can cause non-idempotent oscillation
+    // with downstream passes that add goals.
+    remove_solved_split_goals_pass(red);
     // Post-loop: `addNonInjectiveFactInstances` (Simplify.hs:730-735).
     // Haskell runs this AFTER `exploitUniqueMsgOrder` and
     // `removeSolvedSplitGoals` in the non-diff branch of
