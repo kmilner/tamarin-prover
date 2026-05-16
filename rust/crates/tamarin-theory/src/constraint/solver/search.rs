@@ -311,12 +311,22 @@ fn candidate_methods(
 ) -> Vec<ProofMethod> {
     use crate::constraint::solver::context::UseInduction;
     let mut out: Vec<ProofMethod> = Vec::new();
-    // Build the goal list first.
-    let goal = pick_open_goal(sys, ctx);
-    // Construct: [Simplify, goal] (or [Simplify] if no goal).
+    // Haskell-faithful: build the FULL ranked goal list, not just the
+    // first one (ProofMethod.hs:520-540).  Haskell's `proofMethods`
+    // includes ALL open goals as SolveGoal candidates; `execMethods`
+    // then filters via `mapMaybe execMethod` and picks the first that
+    // succeeds.  If the highest-ranked goal's SolveGoal returns None
+    // (e.g. its dispatch_solve_goal hit Contradictory and was filtered),
+    // we fall through to the next-ranked goal.
+    //
+    // Previously we only added the FIRST ranked goal, causing search
+    // to Sorry whenever the top goal was un-solvable — even if a
+    // lower-ranked goal could have made progress.
+    let goals = crate::constraint::solver::goals::rank_goals_with(sys, Some(ctx));
+    // Construct: [Simplify, goal_1, goal_2, ..., goal_N].
     out.push(ProofMethod::Simplify);
-    if let Some(g) = goal {
-        out.push(ProofMethod::SolveGoal(g));
+    for g in goals.into_iter() {
+        out.push(ProofMethod::SolveGoal(g.goal));
     }
     // Insert Induction at the appropriate position in initial state.
     let initial = can_apply_induction(sys);
