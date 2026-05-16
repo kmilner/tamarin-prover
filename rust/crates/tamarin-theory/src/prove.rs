@@ -150,32 +150,37 @@ pub fn prove_lemma(
     sys.insert_lemmas(reuse_lemmas);
     // [sources] lemmas: Haskell only uses them for precompute via
     // `refineWithSourceAsms` — they do NOT appear in sLemmas at proof
-    // time.  But our refine isn't fully Haskell-faithful (the typing-
-    // violating Responder cases survive saturate's speculative-
-    // IncompatibleEqs restore), so without runtime [sources] our
-    // typing-class lemmas (NSLPK3::injective_agree class) hit verdict
-    // Sorry where Haskell verifies.  Default ON until refine catches
-    // up.  Cost: ~12 non-typing all-traces lemmas show an extra
-    // `case_1`/`case_2` Disj-split that Haskell skips because the
-    // typing implication never gets a chance to fire at proof time.
-    // Disable via TAM_NO_SOURCES_IN_LEMMAS=1 to get Haskell-exact
-    // simplification at the cost of verdict regressions on typing-
-    // class lemmas.
-    // TODO Haskell parity (task #157): Haskell's `gatherReusableLemmas`
-    // (Prover.hs:331) puts ONLY `[reuse]` in sLemmas — never
-    // `[sources]`.  [sources] bodies are consulted by
-    // `refineWithSourceAsms` at precompute time.  Our weaker refine
-    // currently requires runtime [sources] firing to prune typing-
-    // violating cases; without it, both attack and typing-class
-    // lemmas regress (NSPK3::nonce_secrecy: Solved→Sorry, NSLPK3
-    // typing-class: Contradictory→Sorry).  Until refine is
-    // strengthened (Path A / Path B), keep them in sLemmas as a
-    // workaround.  `TAM_NO_SOURCES_IN_LEMMAS=1` enables the
-    // Haskell-faithful behaviour for testing the refine strengthening
-    // work.
-    if std::env::var("TAM_NO_SOURCES_IN_LEMMAS").is_err() {
+    // time (Haskell's `gatherReusableLemmas` Prover.hs:331 filters to
+    // `[reuse]` only).  Default OFF after task #167: with the
+    // goal-rank fix removing isFreshKnowsGoal from solveFirst (matching
+    // Haskell's smartRanking ProofMethod.hs:953 commented-out bin),
+    // runtime [sources] firing is no longer required for typing-class
+    // lemma verification.  ZERO mismatches in both modes; default OFF
+    // matches Haskell exactly.
+    //
+    // `TAM_LEGACY_SOURCES_IN_LEMMAS=1` opts back in to the legacy
+    // workaround for diagnostic comparison (e.g. to recover lemmas
+    // that go Sorry-Incomparable under tight deadlines).
+    let _ = source_lemmas;
+    if std::env::var("TAM_LEGACY_SOURCES_IN_LEMMAS").is_ok() {
         // insertLemma unwraps Conj-tops; mirror that here so
         // sources_lemma_universals matches what ends up in sys.lemmas.
+        // Re-collect since we took source_lemmas out above.
+        let mut legacy_source_lemmas: Vec<Guarded> = Vec::new();
+        if matches!(lemma.trace_quantifier, crate::theory::TraceQuantifier::AllTraces) {
+            for prior in theory.lemmas() {
+                if prior.name == lemma_name { continue; }
+                if !prior.attributes.iter().any(|a| matches!(a, crate::theory::LemmaAttr::Sources)) {
+                    continue;
+                }
+                if !matches!(prior.trace_quantifier, crate::theory::TraceQuantifier::AllTraces) {
+                    continue;
+                }
+                if let Ok(rg) = formula_to_guarded(&prior.formula) {
+                    legacy_source_lemmas.push(rg);
+                }
+            }
+        }
         fn flatten_conj(g: &crate::guarded::Guarded,
                         out: &mut Vec<crate::guarded::Guarded>) {
             match g {
@@ -185,12 +190,10 @@ pub fn prove_lemma(
                 other => out.push(other.clone()),
             }
         }
-        for s in &source_lemmas {
+        for s in &legacy_source_lemmas {
             flatten_conj(s, &mut sys.sources_lemma_universals);
         }
-        sys.insert_lemmas(source_lemmas);
-    } else {
-        let _ = source_lemmas;
+        sys.insert_lemmas(legacy_source_lemmas);
     }
 
     if trace { eprintln!("[phase] formula_to_system done; ProofContext::new start"); }
