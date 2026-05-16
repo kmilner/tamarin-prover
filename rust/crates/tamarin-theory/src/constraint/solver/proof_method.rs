@@ -192,6 +192,18 @@ pub fn exec_proof_method(
             let mut r = Reduction::new(ctx, sys.clone());
             r.changed = ChangeIndicator::Unchanged;
             simplify_system(&mut r);
+            // Iterate to fixpoint to match the case-creation lambda's
+            // 8-step iteration.  Without this, search's first
+            // Simplify-pass attempt on a case-creation result may
+            // still change state (e.g. a new implied formula fires
+            // post-rename), producing a redundant `simplify` step
+            // in the proof tree where Haskell's renderer shows none.
+            for _ in 0..32 {
+                let before = r.sys.clone();
+                r.changed = ChangeIndicator::Unchanged;
+                simplify_system(&mut r);
+                if r.sys == before { break; }
+            }
             // Match Haskell's guard: if `Simplify` produced an
             // identical system, it failed — return None so the
             // search picks something else (or marks Sorry).
@@ -288,6 +300,20 @@ pub fn exec_proof_method(
                 if !r.sys.eq_store.is_false() {
                     r.sys.eq_store.subst =
                         tamarin_term::subst::Subst::from_list(Vec::new());
+                }
+                // After rename_precise + clear-subst, simplify_system
+                // may discover NEW progress (e.g. insert_implied_formulas
+                // fires on a freshly-renamed universal whose match no
+                // longer relies on a now-cleared eq-store binding).
+                // Re-run to convergence so the post-cleanup state is
+                // truly idempotent — otherwise search's first
+                // Simplify-pass attempt makes the same progress and
+                // renders a redundant `simplify` step.
+                for _ in 0..8 {
+                    let before = r.sys.clone();
+                    r.changed = ChangeIndicator::Unchanged;
+                    simplify_system(&mut r);
+                    if r.sys == before { break; }
                 }
                 r.sys
             };
