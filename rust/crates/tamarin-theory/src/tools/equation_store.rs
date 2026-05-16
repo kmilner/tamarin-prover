@@ -336,7 +336,19 @@ impl EquationStore {
             for (v, t) in raw {
                 subst = subst.compose(&LNSubst::from_list(vec![(v, t)]));
             }
-            self.subst = subst.compose(&self.subst);
+            // Haskell-faithful: call applyEqStore so existing disj substs
+            // get re-unified against the new free subst.  Without it,
+            // SplitG variants whose domain intersects with `subst.dom`
+            // silently get their constraints dropped on later pick
+            // (e.g. `{z → verify(s,m,pkA)}` vs `{z → true}` collapse).
+            // Mirrors Reduction.hs:225 / EquationStore.hs:228.
+            if self.conj.is_empty() {
+                // Fast path: nothing to re-unify, just compose.
+                self.subst = subst.compose(&self.subst);
+            } else {
+                // Slow path: re-unify each disj subst.
+                self.apply_eq_store(maude, &subst)?;
+            }
             return Ok(None);
         }
 
@@ -712,7 +724,22 @@ impl EquationStore {
 
     /// `applyEqStore`: apply a free substitution to the store, going
     /// through Maude to renormalise each disjunction's substitutions
-    /// modulo AC. Mirrors the Haskell semantics.
+    /// modulo AC. Mirrors the Haskell semantics
+    /// (EquationStore.hs:252-271).
+    ///
+    /// CRITICAL semantics: for each disjunction subst `s = {(lv_i, t_i)}`,
+    /// build equations `[Equal (apply newsubst (Var lv_i)) t_i]` and
+    /// AC-unify them via Maude.  Each unifier becomes a new variant
+    /// (a single old variant may explode into several).  Variants
+    /// whose unification fails are dropped (the disjunction shrinks).
+    ///
+    /// This is what propagates rule-variant constraints when the
+    /// free subst is updated by a later `addEqs`. e.g. for
+    /// `B_1_verify`'s variant `{z → verify(s,m,pkA)}` against a
+    /// later `{z → true}`, this re-unifies as `verify(s,m,pkA) = true`
+    /// → Maude narrows to `{s → sign(x1,x2), m → x1, pkA → pk(x2)}`.
+    /// Without it, picking the variant later silently DROPS the
+    /// verify constraint (composition `(picked ∘ {z→true})(z) = true`).
     ///
     /// Errors if `asubst`'s domain and range overlap (Haskell errors
     /// here too, since the resulting composition would be malformed).
@@ -732,27 +759,72 @@ impl EquationStore {
         }
 
         let new_subst = asubst.compose(&self.subst);
-        // Re-unify each subst against the new free subst by
-        // delegating to Maude. For each (v, t) in the existing
-        // fresh-range subst, normalise the substituted version.
-        for d in self.conj.iter_mut() {
-            let mut new_substs: Vec<LNSubstVFresh> = Vec::with_capacity(d.substs.len());
+
+        // Re-unify each disj subst against the new free subst via Maude
+        // (Haskell's `applyBound`).  For each `s = {(lv, t)}`, build
+        // equations `[Equal (apply newsubst (Var lv)) t]` and let Maude
+        // AC-unify the list; multiple unifiers split into multiple
+        // variants.
+        use tamarin_term::rewriting::Equal;
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+        let fresh_base = self.fresh_baseline();
+        let mut new_conj: Vec<EqDisj> = Vec::with_capacity(self.conj.len());
+        for d in self.conj.iter() {
+            let mut new_substs: Vec<LNSubstVFresh> = Vec::new();
             for s in &d.substs {
-                let mut new_pairs: Vec<(LVar, LNTerm)> = Vec::with_capacity(s.len());
-                for (v, t) in s.to_list() {
-                    // Apply the new free subst to the range term, then reduce
-                    // modulo the maude theory.
-                    let applied = tamarin_term::subst::apply_vterm(&new_subst, t);
-                    let normalised = match maude.reduce(&applied) {
-                        Ok(t) => t,
-                        Err(e) => return Err(AddEqsError::Maude(format!("{}", e))),
-                    };
-                    new_pairs.push((v, normalised));
+                let bindings: Vec<(LVar, LNTerm)> = s.to_list();
+                if bindings.is_empty() {
+                    // Empty subst (identity) — preserves.
+                    new_substs.push(s.clone());
+                    continue;
                 }
-                new_substs.push(LNSubstVFresh::from_list(new_pairs));
+                // Build equations.  LHS = `apply new_subst (Var lv)`,
+                // RHS = `t` (already in fresh-vrange of the original `s`).
+                let eqs: Vec<Equal<LNTerm>> = bindings.iter()
+                    .map(|(lv, t)| {
+                        let lv_t = Term::Lit(Lit::Var(lv.clone()));
+                        Equal {
+                            lhs: tamarin_term::subst::apply_vterm(&new_subst, lv_t),
+                            rhs: t.clone(),
+                        }
+                    })
+                    .collect();
+                // Unify with Maude — multi-unifier returns a Disj.
+                let mut max_idx = fresh_base;
+                {
+                    use tamarin_term::lterm::HasFrees;
+                    for e in &eqs {
+                        e.lhs.for_each_free(&mut |v| if v.idx > max_idx { max_idx = v.idx; });
+                        e.rhs.for_each_free(&mut |v| if v.idx > max_idx { max_idx = v.idx; });
+                    }
+                }
+                let unifiers = match maude.unify_at_with_avoid(
+                    "apply_eq_store::re_unify", &eqs, max_idx) {
+                    Ok(u) => u,
+                    Err(e) => return Err(AddEqsError::Maude(format!("{}", e))),
+                };
+                if unifiers.is_empty() {
+                    // No unifier → variant dropped.
+                    continue;
+                }
+                // For each unifier, build the new vfresh subst.  Restrict
+                // its domain to `varsRange(new_subst) ∪ dom(s)` so we
+                // don't leak Maude witnesses.
+                let restrict_set: BTreeSet<LVar> = new_subst.range()
+                    .flat_map(|t| tamarin_term::vterm::vars_vterm(t))
+                    .chain(bindings.iter().map(|(v, _)| v.clone()))
+                    .collect();
+                for raw in unifiers {
+                    let pairs: Vec<(LVar, LNTerm)> = raw.into_iter()
+                        .filter(|(v, _)| restrict_set.contains(v))
+                        .collect();
+                    new_substs.push(LNSubstVFresh::from_list(pairs));
+                }
             }
-            d.substs = new_substs;
+            new_conj.push(EqDisj { split_id: d.split_id, substs: new_substs });
         }
+        self.conj = new_conj;
         self.subst = new_subst;
         Ok(())
     }

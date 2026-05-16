@@ -201,14 +201,20 @@ fn has_non_normal_terms(ctx: &ProofContext, sys: &System) -> bool {
 
 /// `maybeNotNfSubterms` — collect subterms that might not be in
 /// normal form.  Constants in NF; irreducible-headed apps recurse
-/// into args; anything else (reducible heads) is returned as a
-/// candidate.
+/// into args; anything else (variables OR reducible-headed apps)
+/// is returned as a candidate.
 ///
-/// Optimization vs Haskell: we also exclude `Lit(Var _)` — a free
-/// variable trivially equals its own reduction, so calling Maude
-/// on it is pure overhead.  Haskell's `maybeNotNfSubterms` returns
-/// vars too but Haskell's downstream `nf'` caches Maude per query;
-/// our bridge doesn't, so we filter earlier.
+/// Variables MUST be included — for `subst_creates_non_normal_terms`,
+/// a variable `z` becomes a reducible term after the variant subst
+/// (e.g. `{z → verify(s,m,pkA)}`).  Without including vars we miss
+/// the SplitG variant filter and the picked variant pulls the
+/// reducible term into the system unfiltered.
+/// Mirrors Haskell `maybeNotNfSubterms` exactly (Norm.hs:162-168):
+/// the `_` arm catches both `Lit (Var _)` and reducible `FApp`.
+///
+/// For `has_non_normal_terms` the variable case is harmless:
+/// `reduce(z) == z` since variables are already NF, and the
+/// Maude bridge caches the result.
 fn maybe_not_nf_subterms(
     irreducible: &tamarin_term::function_symbols::FunSig,
     t: &tamarin_term::lterm::LNTerm,
@@ -217,7 +223,7 @@ fn maybe_not_nf_subterms(
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
     match t {
-        Term::Lit(Lit::Con(_)) | Term::Lit(Lit::Var(_)) => {}
+        Term::Lit(Lit::Con(_)) => {}
         Term::App(sym, args) if irreducible.contains(sym) => {
             for a in args {
                 maybe_not_nf_subterms(irreducible, a, out);

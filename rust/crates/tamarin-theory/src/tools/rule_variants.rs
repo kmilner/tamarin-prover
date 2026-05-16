@@ -303,12 +303,35 @@ pub fn abstract_rule_and_variants(
     }
 
     // For each variant subst, compose with abstraction bindings.
-    // The variant subst σ has domain ⊆ vars(original_terms).
-    // We want a final subst ρ with domain = z_i, range = σ(original_terms).
-    // So ρ(z_i) = σ(original_t).
+    // Haskell-faithful: `composeVFresh vsubst abstractionSubst` followed
+    // by `restrictVFresh (frees abstrPsCsAs)`.  Without including
+    // sigma's bindings for the original rule's vars (not just z_i),
+    // the variant subst's m/s/pkA → ... constraints get LOST.
+    //
+    // `(vsubst ∘ abstractionSubst)(v)` is:
+    //   - if v ∈ dom(abstractionSubst) = {z_i}: vsubst(abstractionSubst(v)) = vsubst(original_t)
+    //   - else: vsubst(v)
+    //
+    // Then `restrictVFresh (frees abstrPsCsAs)` keeps only domain
+    // entries whose variable is in the abstracted rule's frees.
+    use tamarin_term::lterm::HasFrees;
+    let mut abstr_frees: std::collections::BTreeSet<LVar> = std::collections::BTreeSet::new();
+    for f in &abstracted_rule.premises {
+        for t in &f.terms { t.for_each_free(&mut |v| { abstr_frees.insert(v.clone()); }); }
+    }
+    for f in &abstracted_rule.actions {
+        for t in &f.terms { t.for_each_free(&mut |v| { abstr_frees.insert(v.clone()); }); }
+    }
+    for f in &abstracted_rule.conclusions {
+        for t in &f.terms { t.for_each_free(&mut |v| { abstr_frees.insert(v.clone()); }); }
+    }
+    for t in &abstracted_rule.new_vars {
+        t.for_each_free(&mut |v| { abstr_frees.insert(v.clone()); });
+    }
     let composed_substs: Vec<LNSubstVFresh> = raw_substs.into_iter().map(|pairs| {
         let sigma: LNSubst = Subst::from_list(pairs.into_iter().collect::<Vec<_>>());
-        let composed_pairs: Vec<(LVar, LNTerm)> = abstraction_pairs.iter()
+        // 1) Bindings for z_i: σ(abstractionSubst(z_i)) = σ(original_t).
+        let mut composed_pairs: Vec<(LVar, LNTerm)> = abstraction_pairs.iter()
             .map(|(z, t)| {
                 let new_t = apply_vterm(&sigma, t.clone());
                 // Normalise so destructor heads reduce to their narrowed forms.
@@ -316,6 +339,16 @@ pub fn abstract_rule_and_variants(
                 (z.clone(), normalised)
             })
             .collect();
+        // 2) Bindings for v ∉ dom(abstractionSubst) (original rule's vars):
+        //    σ(v) — restricted to abstr_frees.
+        let z_domain: std::collections::BTreeSet<LVar> = abstraction_pairs.iter()
+            .map(|(z, _)| z.clone()).collect();
+        for (v, t) in sigma.to_list().iter() {
+            if z_domain.contains(v) { continue; } // already handled
+            if !abstr_frees.contains(v) { continue; } // outside abstr rule frees
+            let normalised = maude.reduce(t).unwrap_or_else(|_| t.clone());
+            composed_pairs.push((v.clone(), normalised));
+        }
         LNSubstVFresh::from_list(composed_pairs)
     })
     .filter(|s| {
