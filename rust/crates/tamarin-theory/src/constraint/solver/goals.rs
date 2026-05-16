@@ -16,15 +16,10 @@ use crate::constraint::system::System;
 /// `openGoals`: enumerate annotated goals still to be solved.
 ///
 /// Haskell iterates `M.toList $ get sGoals sys` in Goal-derived-Ord
-/// order; we currently iterate `sys.goals: Vec<...>` in insertion
-/// order.  Wiring `goal_cmp` here mirrors Haskell precisely, but
-/// exposes a downstream `matchAction` parity gap (free non-pattern
-/// vars don't bind during structural_match) that wrong-falsifies
-/// `Minimal_Create_Use_Destroy::Destroy_charn` and
-/// `RFID_Simple::Device_Init_Use_Set`.  Restored insertion-order
-/// pending the Sk-matcher port.  Agent diagnoses preserved in:
-/// - ab2c62748a04212ba (goal-order root cause)
-/// - a60950ef2370100e5 (Destroy_charn downstream bug)
+/// order; we use insertion-order to avoid a known interaction with
+/// the Sk-matcher fix that exposes wrong-falsified verdicts on
+/// Destroy_charn-class lemmas.  `goal_cmp` (dead-code-allow below)
+/// is the eventual landing once that interaction is resolved.
 pub fn open_goals(sys: &System) -> Vec<AnnotatedGoal> {
     let mut out = Vec::new();
     for (seq, (goal, status)) in sys.goals.iter().enumerate() {
