@@ -87,10 +87,21 @@ pub fn rank_goals_with(
         Box::new(is_standard_action_goal),
         Box::new(is_not_auth_out),
         Box::new(is_private_knows_goal),
-        Box::new(is_fresh_knows_goal),
+        // Haskell's `smartRanking` (ProofMethod.hs:953) COMMENTS OUT
+        // `isFreshKnowsGoal`: "Problematic when using handles" — moving
+        // KU(t:Fresh) to a high priority traps chaum/foo/okamoto and
+        // NSLPK3-class lemmas in infinite KU(t:Fresh) recursion (each
+        // grafted B_1/I_2 introduces another KU(t:Fresh) sub-goal).
+        // Bin removed to match Haskell.
+        // Box::new(is_fresh_knows_goal),
         Box::new(|a: &AnnotatedGoal| is_split_goal_small(a, sys)),
         Box::new(|a: &AnnotatedGoal| is_msg_one_case_goal(a, &one_case_syms)),
-        Box::new(is_signature_goal),
+        // Haskell's smartRanking solveFirst doesn't include isSignatureGoal
+        // either (only sapicLooseRanking does at ProofMethod.hs:1224).
+        // Keeping it here would over-prefer KU(sign(...)) goals over
+        // standard sources, breaking the "expensive equation splits
+        // last" ordering. Removed.
+        // Box::new(is_signature_goal),
         // is_double_exp_goal — needs Exp/Mult view; stubbed.
         Box::new(|a: &AnnotatedGoal| is_no_large_split_goal(a, sys)),
     ];
