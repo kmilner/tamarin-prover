@@ -54,7 +54,9 @@ import           Theory.Text.Pretty
 
 import           Term.Rewriting.Norm            (maybeNotNfSubterms, nf')
 
--- import           Debug.Trace
+import           Debug.Trace
+import qualified System.IO.Unsafe
+import qualified System.Environment
 
 ------------------------------------------------------------------------------
 -- Contradictions
@@ -89,7 +91,25 @@ contradictorySystem ctxt = not . null . contradictions ctxt
 -- because they have no unifier. This is part of unification. Note also that
 -- *S_{¬,\@}* is handled as part of *S_∀*.
 contradictions :: ProofContext -> System -> [Contradiction]
-contradictions ctxt sys = F.asum
+contradictions ctxt sys =
+  let res = contradictionsRaw ctxt sys
+  in if hsTraceContra
+       then case res of
+              [] -> res
+              (c:_) -> trace ("[CONTRA] kind=" ++ show c ++
+                              " |sNodes|=" ++ show (M.size (L.get sNodes sys)) ++
+                              " |sFormulas|=" ++ show (S.size (L.get sFormulas sys)) ++
+                              " gfalse_in_F=" ++ show (S.member gfalse (L.get sFormulas sys)) ++
+                              " eqStoreFalse=" ++ show (eqsIsFalse (L.get sEqStore sys))) res
+       else res
+
+hsTraceContra :: Bool
+hsTraceContra = System.IO.Unsafe.unsafePerformIO $
+  maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_TRACE"
+{-# NOINLINE hsTraceContra #-}
+
+contradictionsRaw :: ProofContext -> System -> [Contradiction]
+contradictionsRaw ctxt sys = F.asum
     -- CR-rule **
     [ guard (D.cyclic $ rawLessRel sys)             $> Cyclic
     -- CR-rule *S_Subterm-Chain-Fail*

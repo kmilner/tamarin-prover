@@ -23,6 +23,8 @@ module Theory.Constraint.Solver.Simplify (
   ) where
 
 import           Debug.Trace
+import qualified System.IO.Unsafe                   as Unsafe
+import qualified System.Environment                 as SysEnv
 
 import           Prelude                            hiding (id, (.))
 
@@ -50,6 +52,11 @@ import           Theory.Constraint.System
 import           Theory.Model
 import           Theory.Text.Pretty
 import           Theory.Tools.InjectiveFactInstances
+
+hsTraceFire :: Bool
+hsTraceFire = Unsafe.unsafePerformIO $
+  maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE"
+{-# NOINLINE hsTraceFire #-}
 
 -- | Apply CR-rules that don't result in case splitting until the constraint
 -- system does not change anymore.
@@ -414,7 +421,13 @@ insertImpliedFormulas = do
         implied <- impliedFormulas hnd sys clause
         if ( implied `S.notMember` get sFormulas sys &&
              implied `S.notMember` get sSolvedFormulas sys )
-          then return (insertFormula implied)
+          then (if hsTraceFire then trace ("[IMPL-FIRE]" ++
+                      "\n  clause:  " ++ show clause ++
+                      "\n  implied: " ++ show implied ++
+                      "\n  nodes:   " ++ show (M.size (get sNodes sys)) ++
+                      "\n  actions: " ++ show (allActions sys) ++
+                      "\n  ----") else id)
+                      (return (insertFormula implied))
           else []
 
 -- | CR-rule *S_fresh-order*:
