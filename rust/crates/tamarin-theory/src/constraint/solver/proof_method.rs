@@ -390,12 +390,45 @@ pub fn exec_proof_method(
                     // which matches Haskell's `disjunctionOfList`
                     // iteration order (rule order in `joinAllRules`).
                     use std::collections::HashMap;
-                    let kept: Vec<(String, System)> = cases.into_iter()
+                    let kept_raw: Vec<(String, System)> = cases.into_iter()
                         .filter_map(|(name, sys)| {
                             let s = simplify(sys);
                             if keep(&s, &name) { Some((name, s)) } else { None }
                         })
                         .collect();
+                    // Dedup cases that share BOTH a name and canonical
+                    // system (post-simplify + rename_precise).  Haskell's
+                    // `someRuleACInst` encodes rule variants as a SplitG
+                    // disjunction on the eq-store, so `solveAction`
+                    // returns ONE case per rule with variants threaded
+                    // through SplitG; our legacy expansion enumerates
+                    // each variant as a separate `RuleACInst`.  When
+                    // multiple variants converge to the same post-
+                    // simplify canonical system, drop the duplicates —
+                    // that's the structural-match win for NSPK3/NSLPK3/
+                    // roles `case R_1` (vs our prior `case R_1_case_1`).
+                    let kept: Vec<(String, System)> = {
+                        // Dedup by (case_name, exact-system) — catches
+                        // cases where two distinct rule unifications
+                        // produce structurally-identical post-simplify
+                        // systems.  Today this hits no NSPK3/roles-class
+                        // variants (they DO produce different systems
+                        // because variant equational instantiations
+                        // change rule terms); the proper Haskell-parity
+                        // dedup is the SplitG-variants path (task #154,
+                        // currently has 3-4 soundness regressions under
+                        // TAM_SPLITG_VARIANTS=1).  This local dedup is a
+                        // safety guard for actually-isomorphic cases.
+                        let mut seen_systems: Vec<(String, System)> = Vec::new();
+                        for (name, s) in kept_raw {
+                            let dup = seen_systems.iter().any(|(prev_name, prev_sys)|
+                                prev_name == &name && prev_sys == &s);
+                            if !dup {
+                                seen_systems.push((name, s));
+                            }
+                        }
+                        seen_systems
+                    };
                     let mut counts: HashMap<String, usize> = HashMap::new();
                     for (name, _) in &kept {
                         *counts.entry(name.clone()).or_default() += 1;
