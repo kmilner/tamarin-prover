@@ -29,7 +29,32 @@ pub type OpenRestriction = ProtoRestriction<tamarin_parser::ast::Formula>;
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpenProtoRule {
     pub rule: ProtoRuleE,
+    /// Pre-applied variant rules (legacy path) — each entry is a
+    /// fully-narrowed `ProtoRuleAC` with its variant subst applied.
+    /// `rule_insts_with` historically expanded these into separate
+    /// `RuleACInst`s, producing N variant cases per rule at the
+    /// action/premise-goal level.  Now superseded by `variant_substs`
+    /// for the SplitG-based path; kept temporarily for backward
+    /// compat until callers fully migrate.
     pub variants: Vec<ProtoRuleAC>,
+    /// Variant substitutions as a disjunction (`RuleACConstrs` in
+    /// Haskell — `Disj LNSubstVFresh`).  The canonical rule (`rule`)
+    /// represents the un-narrowed E-rule; when this disjunction is
+    /// non-empty, `solve_rule_constraints` adds it as a SplitG goal
+    /// in the eq-store so the variant choice is enumerated lazily
+    /// per Haskell's `solveRuleConstraints` (Reduction.hs:766-774).
+    /// Mirrors `RuleACConstrs = Disj LNSubstVFresh` (Rule.hs:926).
+    pub variant_substs: Vec<tamarin_term::subst_vfresh::LNSubstVFresh>,
+    /// The abstracted form of `rule` for the SplitG path (Haskell
+    /// `variantsProtoRule` returns this in the `ProtoRuleAC`'s
+    /// prems/concs/acts/nvs).  Every reducible-headed sub-term in
+    /// the rule's terms is replaced by a fresh `LVar`; the
+    /// `variant_substs` disjunction is keyed by those fresh vars,
+    /// so applying any picked variant subst yields a fully-narrowed
+    /// rule.  `None` when no reducible-headed sub-terms exist
+    /// (canonical rule equals raw rule).  Only populated when SplitG
+    /// path is enabled — caller checks `TAM_SPLITG_VARIANTS`.
+    pub abstracted_rule: Option<ProtoRuleE>,
     /// Premise indices marked as loop breakers by the dataflow
     /// analysis (`useAutoLoopBreakersAC`).  In Haskell these live on
     /// `praciLoopBreakers` of `ProtoRuleACInfo`; we attach them to
@@ -42,7 +67,13 @@ pub struct OpenProtoRule {
 
 impl OpenProtoRule {
     pub fn new(rule: ProtoRuleE) -> Self {
-        OpenProtoRule { rule, variants: Vec::new(), loop_breakers: Vec::new() }
+        OpenProtoRule {
+            rule,
+            variants: Vec::new(),
+            variant_substs: Vec::new(),
+            abstracted_rule: None,
+            loop_breakers: Vec::new(),
+        }
     }
 
     pub fn name(&self) -> &str {

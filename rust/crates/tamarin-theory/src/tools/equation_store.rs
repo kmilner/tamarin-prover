@@ -146,6 +146,17 @@ impl EquationStore {
 
     /// Set the store to logical false. Returns the modified store.
     pub fn set_false(mut self) -> Self {
+        if std::env::var("TAM_TRACE_SET_FALSE").is_ok() && !self.is_false() {
+            let bt = std::backtrace::Backtrace::force_capture();
+            let bt_s = format!("{bt}");
+            let caller = bt_s.lines()
+                .filter(|l| l.contains("tamarin_theory") || l.contains("tamarin-theory") || l.contains("tamarin_term"))
+                .filter(|l| !l.contains("set_false"))
+                .nth(0)
+                .unwrap_or("(no frame)")
+                .trim();
+            eprintln!("[set_false] caller={}", caller);
+        }
         self.conj = Self::false_conj();
         self
     }
@@ -586,6 +597,77 @@ impl EquationStore {
             })
             .collect();
         self.conj[idx].substs = new_substs;
+        true
+    }
+
+    /// Variant of `simp` that also runs `simp_singleton` — converts
+    /// singleton disjunctions (one substitution as the only disjunct)
+    /// into free-substitution composition via `freshToFree`.  Mirrors
+    /// Haskell's `simpSingleton` (EquationStore.hs:391-397) wired into
+    /// `simp1` via `foreachDisj`.
+    ///
+    /// Requires a fresh-idx allocator (typically wrapping
+    /// `MaudeHandle::reserve_idxs`) because `freshToFree` renames range
+    /// vars to distinct LVar idxs.
+    pub fn simp_with_fresh<F, G>(
+        mut self,
+        is_contr: F,
+        mut alloc: G,
+    ) -> Self
+    where
+        F: Fn(&LNSubst, &LNSubstVFresh) -> bool,
+        G: FnMut(u64) -> u64,
+    {
+        loop {
+            if self.is_false() { return self; }
+            let mut changed = false;
+            let subst_snapshot = self.subst.clone();
+            changed |= self.simp_minimize(|s| is_contr(&subst_snapshot, s));
+            changed |= self.simp_remove_renamings();
+            changed |= self.simp_empty_disj();
+            changed |= self.simp_singleton(&mut alloc);
+            changed |= self.simp_abstract_name();
+            changed |= self.simp_identify();
+            if !changed { return self; }
+        }
+    }
+
+    /// `simpSingleton`: if a disjunction has exactly one substitution,
+    /// fold that subst into the free substitution (via `freshToFree`)
+    /// and drop the disjunction.  This is what propagates picked
+    /// variant subst bindings into the eq-store's free subst, which
+    /// then gets pushed into rule terms by `substSystem` /
+    /// `substNodes` / `normDG`.
+    ///
+    /// Haskell reference:
+    /// ```haskell
+    /// simpSingleton [subst0] = do
+    ///         subst <- freshToFree subst0
+    ///         return (Just (Just subst, []))
+    /// simpSingleton _        = return Nothing
+    /// ```
+    /// Plus `foreachDisj`'s wiring that calls `applyEqStore hnd subst`
+    /// on the resulting `Just subst`.  We compose into `self.subst`
+    /// directly — this is sound when the new subst's domain is
+    /// disjoint from `self.subst`'s range.
+    pub fn simp_singleton<F: FnMut(u64) -> u64>(
+        &mut self,
+        alloc: &mut F,
+    ) -> bool {
+        // Find the first singleton disjunction (1 subst).
+        let pos = self.conj.iter().position(|d| d.substs.len() == 1);
+        let Some(pos) = pos else { return false; };
+        let subst_vf = self.conj[pos].substs[0].clone();
+        // Drop the singleton disjunction.
+        self.conj.remove(pos);
+        if subst_vf.is_empty() {
+            // Identity disjunction: nothing to compose; just dropped.
+            return true;
+        }
+        // Convert VFresh → free via freshToFree, then compose.
+        let new_subst = subst_vf.fresh_to_free(|n| alloc(n));
+        // Compose: new_subst ∘ self.subst.
+        self.subst = new_subst.compose(&self.subst);
         true
     }
 

@@ -102,6 +102,12 @@ pub fn rank_goals_with(
     goals.sort_by_key(|a| tag_usefulness(a.usefulness));
     // 5. moveNatToEnd — Nat subterm splits to back.
     goals.sort_by_key(|a| is_nat_subterm_split(&a.goal));
+    if std::env::var("TAM_RANK_DBG").is_ok() {
+        for (i, a) in goals.iter().take(6).enumerate() {
+            let g_str = format!("{:?}", a.goal).chars().take(160).collect::<String>();
+            eprintln!("[rank] #{}: {} useful={:?}", i, g_str, a.usefulness);
+        }
+    }
     goals
 }
 

@@ -107,6 +107,67 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
             .collect();
         SubstVFresh { map }
     }
+
+    /// `freshToFreeAvoidingFast`: convert this VFresh substitution to a
+    /// free `Subst` by renaming each range variable to a fresh LVar
+    /// using indices obtained from `alloc_idxs` (a MonadFresh substitute
+    /// — typically wrapping `MaudeHandle::reserve_idxs`).  Mirrors
+    /// `Term.Substitution.freshToFreeAvoidingFast` (Substitution.hs:77-92).
+    ///
+    /// The reduction layer composes the result into the eq-store's
+    /// free substitution so the picked variant's bindings propagate
+    /// to rule terms during the next `substSystem` pass.
+    pub fn fresh_to_free<F: FnMut(u64) -> u64>(
+        &self,
+        mut alloc_idxs: F,
+    ) -> crate::subst::Subst<C, LVar> {
+        use crate::subst::Subst;
+        // Step 1: collect all distinct range vars, in deterministic
+        // order. Each gets a fresh idx.
+        let mut range_vars: Vec<LVar> = Vec::new();
+        for (_v, t) in self.to_list() {
+            for w in crate::vterm::vars_vterm(&t) {
+                if !range_vars.iter().any(|r| r == &w) {
+                    range_vars.push(w);
+                }
+            }
+        }
+        // Step 2: allocate fresh indices and build a rename map.
+        let need = range_vars.len() as u64;
+        let base = alloc_idxs(need);
+        let mut rename: BTreeMap<LVar, LVar> = BTreeMap::new();
+        for (k, old) in range_vars.into_iter().enumerate() {
+            let new = LVar { name: old.name.clone(),
+                             sort: old.sort,
+                             idx: base + (k as u64) };
+            rename.insert(old, new);
+        }
+        // Step 3: rewrite each (v, t) by renaming v's range vars.
+        let mut pairs: Vec<(LVar, VTerm<C, LVar>)> = Vec::new();
+        for (v, t) in self.to_list() {
+            let renamed = rename_lvars_in_vterm(&t, &rename);
+            pairs.push((v, renamed));
+        }
+        Subst::from_list(pairs)
+    }
+}
+
+/// Walk a VTerm, applying a LVar→LVar rename.
+fn rename_lvars_in_vterm<C: Clone>(
+    t: &VTerm<C, LVar>,
+    rename: &BTreeMap<LVar, LVar>,
+) -> VTerm<C, LVar> {
+    match t {
+        Term::Lit(Lit::Var(v)) => {
+            let new = rename.get(v).cloned().unwrap_or_else(|| v.clone());
+            Term::Lit(Lit::Var(new))
+        }
+        Term::Lit(other) => Term::Lit(other.clone()),
+        Term::App(f, args) => Term::App(
+            f.clone(),
+            args.iter().map(|a| rename_lvars_in_vterm(a, rename)).collect(),
+        ),
+    }
 }
 
 #[cfg(test)]

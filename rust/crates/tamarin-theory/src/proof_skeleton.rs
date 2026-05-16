@@ -158,7 +158,7 @@ fn render_node(node: &ProofNode, indent: usize, out: &mut String) {
         render_node(children_to_render[0].1, indent, out);
         return;
     }
-    let _ = strip_dedup_suffix; // ensure helper is reachable
+    let _ = strip_dedup_suffix; // helper kept for the trace-found path
     // Render children. BTreeMap iterates in key order, which is the
     // stable canonical order we want for the diff.
     //

@@ -35,6 +35,7 @@ pub mod guarded;
 pub mod predicate_expand;
 pub mod proof_skeleton;
 pub mod prove;
+pub mod state_trace;
 pub mod sapic;
 pub mod signature;
 pub mod theory;

@@ -138,6 +138,250 @@ fn make_proto_rule_ac(
 /// can't unify with a destructor-free goal and just bloat the search
 /// case tree. The fully-narrowed forms are the ones chain-fold
 /// actually needs.
+/// Like `expand_rule_variants`, but returns the raw variant substitutions
+/// (the `Disj LNSubstVFresh` of `RuleACConstrs` in Haskell) — the
+/// substitutions that should be installed as a SplitG goal via
+/// `solve_rule_constraints`. Filters out pure-renaming variants
+/// (matches `expand_rule_variants`' useful filter).
+pub fn variant_substs_for_rule(
+    maude: &MaudeHandle,
+    rule: &ProtoRuleE,
+) -> Result<Vec<LNSubstVFresh>, VariantsError> {
+    let ac = match variants_proto_rule(maude, rule)? {
+        Some(ac) => ac,
+        None => return Ok(Vec::new()),
+    };
+    let useful: Vec<LNSubstVFresh> = ac.info.variants.into_iter()
+        .filter(|s| s.range().any(|t| matches!(t, Term::App(_, _))))
+        .collect();
+    Ok(useful)
+}
+
+/// Port of Haskell `abstrRule` (RuleVariants.hs:93-109): walks every
+/// fact-term in `rule` and replaces each reducible-headed sub-term
+/// with a fresh `LVar`.  Returns the abstracted rule plus the
+/// variant disjunction whose substs talk about the abstracted rule's
+/// fresh vars (after composing Maude's variant substs over the
+/// abstraction bindings).
+///
+/// The variant disjunction returned by Maude on the abstracted form
+/// is composed with the abstraction substitution to produce the
+/// final SplitG disjunction whose substs talk about the abstracted
+/// rule's fresh vars (the z_i).
+///
+/// Returns `Ok(None)` when no reducible-headed sub-terms exist, in
+/// which case `rule` is already canonical and needs no variants.
+pub fn abstract_rule_and_variants(
+    maude: &MaudeHandle,
+    rule: &ProtoRuleE,
+) -> Result<Option<(ProtoRuleE, Vec<LNSubstVFresh>)>, VariantsError> {
+    use tamarin_term::function_symbols::FunSym;
+    let irreducible = maude.maude_sig().irreducible_fun_syms.clone();
+    // Memoization: term → fresh LVar.  Order-preserving so the same
+    // rule always abstracts identically.
+    let mut bindings: Vec<(LNTerm, LVar)> = Vec::new();
+    // Avoid clashes with the rule's existing free vars.
+    let avoid_max: u64 = {
+        use tamarin_term::lterm::HasFrees;
+        let m = std::cell::Cell::new(0u64);
+        let visit = |v: &LVar| {
+            if v.idx > m.get() { m.set(v.idx); }
+        };
+        for f in &rule.premises { f.terms.iter().for_each(|t| t.for_each_free(&mut |v| visit(v))); }
+        for f in &rule.actions { f.terms.iter().for_each(|t| t.for_each_free(&mut |v| visit(v))); }
+        for f in &rule.conclusions { f.terms.iter().for_each(|t| t.for_each_free(&mut |v| visit(v))); }
+        for t in &rule.new_vars { t.for_each_free(&mut |v| visit(v)); }
+        m.get()
+    };
+    maude.ensure_above(avoid_max);
+
+    fn sort_of_term(t: &LNTerm) -> tamarin_term::lterm::LSort {
+        use tamarin_term::vterm::Lit;
+        match t {
+            Term::Lit(Lit::Var(v)) => v.sort,
+            Term::Lit(Lit::Con(_)) => tamarin_term::lterm::LSort::Pub,
+            Term::App(_, _) => tamarin_term::lterm::LSort::Msg,
+        }
+    }
+
+    fn name_hint(t: &LNTerm) -> String {
+        use tamarin_term::vterm::Lit;
+        match t {
+            Term::Lit(Lit::Var(v)) => v.name.clone(),
+            _ => "z".to_string(),
+        }
+    }
+
+    fn abstr_term(
+        t: &LNTerm,
+        irreducible: &std::collections::BTreeSet<FunSym>,
+        bindings: &mut Vec<(LNTerm, LVar)>,
+        maude: &MaudeHandle,
+    ) -> LNTerm {
+        match t {
+            Term::App(f, args) if irreducible.contains(f) => {
+                // Irreducible head: recurse into args.
+                Term::App(
+                    f.clone(),
+                    args.iter().map(|a| abstr_term(a, irreducible, bindings, maude)).collect(),
+                )
+            }
+            Term::App(_, _) => {
+                // Reducible head: abstract into fresh LVar.
+                if let Some((_, v)) = bindings.iter().find(|(k, _)| k == t) {
+                    return Term::Lit(tamarin_term::vterm::Lit::Var(v.clone()));
+                }
+                let new_idx = maude.reserve_idxs(1);
+                let v = LVar {
+                    name: name_hint(t),
+                    sort: sort_of_term(t),
+                    idx: new_idx,
+                };
+                bindings.push((t.clone(), v.clone()));
+                Term::Lit(tamarin_term::vterm::Lit::Var(v))
+            }
+            // Lit (vars / consts) — keep as-is.
+            Term::Lit(_) => t.clone(),
+        }
+    }
+
+    fn abstr_fact(
+        f: &Fact<LNTerm>,
+        irreducible: &std::collections::BTreeSet<FunSym>,
+        bindings: &mut Vec<(LNTerm, LVar)>,
+        maude: &MaudeHandle,
+    ) -> Fact<LNTerm> {
+        Fact {
+            tag: f.tag.clone(),
+            annotations: f.annotations.clone(),
+            terms: f.terms.iter()
+                .map(|t| abstr_term(t, irreducible, bindings, maude))
+                .collect(),
+        }
+    }
+
+    let prems: Vec<Fact<LNTerm>> = rule.premises.iter()
+        .map(|f| abstr_fact(f, &irreducible, &mut bindings, maude)).collect();
+    let concs: Vec<Fact<LNTerm>> = rule.conclusions.iter()
+        .map(|f| abstr_fact(f, &irreducible, &mut bindings, maude)).collect();
+    let acts: Vec<Fact<LNTerm>> = rule.actions.iter()
+        .map(|f| abstr_fact(f, &irreducible, &mut bindings, maude)).collect();
+    let nvs: Vec<LNTerm> = rule.new_vars.iter()
+        .map(|t| abstr_term(t, &irreducible, &mut bindings, maude)).collect();
+
+    if bindings.is_empty() {
+        // No reducible heads → no abstraction → no useful variants.
+        return Ok(None);
+    }
+
+    // Build the abstracted rule.
+    let abstracted_rule = crate::rule::Rule::new(
+        rule.info.clone(),
+        prems,
+        concs,
+        acts,
+    ).with_new_vars(nvs);
+
+    // abstraction_pairs: {z_i → original_term_i}
+    let abstraction_pairs: Vec<(LVar, LNTerm)> = bindings.iter()
+        .map(|(t, v)| (v.clone(), t.clone()))
+        .collect();
+
+    // Pack the original (pre-abstraction) terms and ask Maude for variants.
+    // The variants have domain ⊆ vars(original_terms) ⊆ original rule's
+    // free vars.  We then COMPOSE with abstraction_pairs to get a
+    // substitution whose domain is z_i — exactly what the SplitG
+    // expects to apply on the abstracted rule's terms.
+    let abstracted_terms: Vec<LNTerm> = bindings.iter().map(|(t, _)| t.clone()).collect();
+    let packed = Term::App(FunSym::List, abstracted_terms);
+    let raw_substs = match maude.variants(&packed) {
+        Ok(v) => v,
+        Err(e) => return Err(e.into()),
+    };
+    if raw_substs.is_empty() {
+        return Ok(None);
+    }
+
+    // For each variant subst, compose with abstraction bindings.
+    // The variant subst σ has domain ⊆ vars(original_terms).
+    // We want a final subst ρ with domain = z_i, range = σ(original_terms).
+    // So ρ(z_i) = σ(original_t).
+    let composed_substs: Vec<LNSubstVFresh> = raw_substs.into_iter().map(|pairs| {
+        let sigma: LNSubst = Subst::from_list(pairs.into_iter().collect::<Vec<_>>());
+        let composed_pairs: Vec<(LVar, LNTerm)> = abstraction_pairs.iter()
+            .map(|(z, t)| {
+                let new_t = apply_vterm(&sigma, t.clone());
+                // Normalise so destructor heads reduce to their narrowed forms.
+                let normalised = maude.reduce(&new_t).unwrap_or(new_t);
+                (z.clone(), normalised)
+            })
+            .collect();
+        LNSubstVFresh::from_list(composed_pairs)
+    })
+    .filter(|s| {
+        // Drop pure-renaming variants and identity.
+        !s.is_renaming()
+    })
+    .collect();
+
+    if composed_substs.is_empty() {
+        return Ok(None);
+    }
+
+    // Haskell `simpDisjunction hnd (const (const False)) (Disj substs)`
+    // splits into (commonSubst, freshSubsts).  commonSubst is the free
+    // substitution part that's common to all variants — applied to the
+    // abstracted rule.  freshSubsts is the residual SplitG disjunction.
+    //
+    // Without this split, action terms like `Verify(m)` get abstracted
+    // to `Verify(z)` AND every variant binds `z := m` — so the SplitG
+    // is just identity but the rule still carries `Verify(z)`, which
+    // matches against ANY Verify(_) action goal causing wrong cases.
+    //
+    // After splitting, `commonSubst` carries `{z := m}` and the rule's
+    // action becomes `Verify(m)` again; the SplitG only carries the
+    // RESIDUAL disjuncts that differ between variants.
+    let (common_subst, residual) = crate::tools::equation_store::EquationStore::simp_disjunction(
+        composed_substs, |_, _| false);
+
+    // Apply common_subst to the abstracted rule's terms.
+    let abstracted_rule = if common_subst.is_empty() {
+        abstracted_rule
+    } else {
+        let map_facts = |fs: Vec<Fact<LNTerm>>| -> Vec<Fact<LNTerm>> {
+            fs.into_iter().map(|f| f.map(|t| apply_vterm(&common_subst, t))).collect()
+        };
+        let prems = map_facts(abstracted_rule.premises);
+        let concs = map_facts(abstracted_rule.conclusions);
+        let acts = map_facts(abstracted_rule.actions);
+        let nvs: Vec<LNTerm> = abstracted_rule.new_vars.into_iter()
+            .map(|t| apply_vterm(&common_subst, t))
+            .collect();
+        crate::rule::Rule::new(rule.info.clone(), prems, concs, acts).with_new_vars(nvs)
+    };
+
+    // Filter out trivial-true disjuncts and degenerate cases.
+    let final_substs: Vec<LNSubstVFresh> = match residual {
+        Some(rs) => rs.into_iter()
+            .filter(|s| !s.is_renaming())
+            .filter(|s| s.range().any(|t| matches!(t, Term::App(_, _))) ||
+                        !s.is_empty())
+            .collect(),
+        None => Vec::new(),
+    };
+
+    // Even if there are no useful residual substs, the common_subst
+    // application changed the rule — we still need to return the
+    // abstracted rule shape so the canonical-rule path picks it up.
+    // But if common_subst was empty AND no residual, there's nothing
+    // to gain from abstraction.
+    if common_subst.is_empty() && final_substs.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some((abstracted_rule, final_substs)))
+}
+
 pub fn expand_rule_variants(
     maude: &MaudeHandle,
     rule: &ProtoRuleE,

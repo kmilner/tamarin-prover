@@ -74,11 +74,22 @@ pub fn prove_lemma(
         }
     }
 
-    // Add `[reuse]` lemmas declared BEFORE this one as additional
-    // known-true universals — mirrors Haskell's lemma-reuse machinery
-    // where each lemma's proof can cite earlier `reuse`-flagged lemmas.
-    // Existing-trace lemmas can't be reused (their negation isn't a
-    // sound universal), only all-traces ones.
+    // `[reuse]` lemmas declared BEFORE this one are gathered separately
+    // and pushed into `sLemmas` (not `sFormulas`) after building the
+    // system. Mirrors Haskell's `mkSystem` (Prover.hs:317-329):
+    //
+    //   addLemmas
+    //   . formulaToSystem restrictions ...
+    //   where addLemmas sys = insertLemmas (gatherReusableLemmas ...) sys
+    //
+    // The distinction is load-bearing for induction: `formulaToSystem`
+    // conjoins non-safety restrictions into `sFormulas` so they're
+    // included in `toInductionHypothesis(gf)` — yielding a `Disj` over
+    // each conjunct's IH. Reuse lemmas, in contrast, must NOT be
+    // conjoined: their IH would weaken the inductive hypothesis to a
+    // disjunction across all reuse lemmas, blocking simplify from
+    // resolving the IH against current trace actions.
+    let mut reuse_lemmas: Vec<Guarded> = Vec::new();
     for prior in theory.lemmas() {
         if prior.name == lemma_name { break; }
         if !prior.attributes.iter().any(|a| matches!(a, crate::theory::LemmaAttr::Reuse)) {
@@ -88,28 +99,23 @@ pub fn prove_lemma(
             continue;
         }
         if let Ok(rg) = formula_to_guarded(&prior.formula) {
-            restrictions.push(rg);
+            reuse_lemmas.push(rg);
         }
     }
 
-    // Add `[sources]` lemmas as runtime restrictions ONLY for
-    // all-traces lemmas being proved.
+    // `[sources]`-tagged lemmas: in Haskell they only drive
+    // `refineWithSourceAsms` precompute and are NOT in `sFormulas`
+    // at runtime.  Our refine is weaker, so we route them into
+    // `sLemmas` (Haskell's same-named bucket — drives
+    // `insertImpliedFormulas` over `sFormulas ++ sLemmas` but does
+    // NOT enter `toIH` or appear as goals).  This keeps the
+    // typing-implication available at runtime without surfacing
+    // its body-Disj as `case_1`/`case_2` steps.
     //
-    // Haskell uses `SourceLemma`-tagged lemmas to refine precomputed
-    // source-cases via `refineWithSourceAsms`.  Our refine doesn't
-    // prune as thoroughly as Haskell (typing-class Responder source
-    // cases survive saturate's speculative-IncompatibleEqs restore),
-    // so on all-traces lemmas the typing-violating cases re-enter at
-    // runtime and recurse.  Re-installing sources_assertion as a
-    // runtime restriction for all-traces lemmas makes the typing
-    // implication fire on grafted In_Responder actions during search,
-    // closing the recursion via the same cyclic/N5_u path that
-    // sources_assertion's own proof uses.
-    //
-    // For exists-trace lemmas, sources_assertion as a restriction
-    // creates cycles on cases that need to be reachable (e.g.
-    // Public_part_public), so we deliberately exclude them.  This
-    // matches Haskell's behaviour modulo precompute strictness.
+    // Only for all-traces lemmas.  On exists-trace, the typing
+    // implication can prune required witness cases (e.g.
+    // Public_part_public).
+    let mut source_lemmas: Vec<Guarded> = Vec::new();
     if matches!(lemma.trace_quantifier, crate::theory::TraceQuantifier::AllTraces) {
         for prior in theory.lemmas() {
             if prior.name == lemma_name { continue; }
@@ -120,7 +126,7 @@ pub fn prove_lemma(
                 continue;
             }
             if let Ok(rg) = formula_to_guarded(&prior.formula) {
-                restrictions.push(rg);
+                source_lemmas.push(rg);
             }
         }
     }
@@ -131,13 +137,61 @@ pub fn prove_lemma(
         crate::theory::TraceQuantifier::AllTraces => p::TraceQuantifier::AllTraces,
         crate::theory::TraceQuantifier::ExistsTrace => p::TraceQuantifier::ExistsTrace,
     };
-    let sys = formula_to_system(
+    let mut sys = formula_to_system(
         restrictions,
         SourceKind::RawSources,
         tq,
         false,
         &g,
     );
+    // Haskell's `addLemmas`: push reuse lemmas into `sLemmas`. They
+    // become drivers for `insertImpliedFormulas` (which iterates
+    // `sFormulas ++ sLemmas`) but are excluded from `ginduct`.
+    sys.insert_lemmas(reuse_lemmas);
+    // [sources] lemmas: Haskell only uses them for precompute via
+    // `refineWithSourceAsms` — they do NOT appear in sLemmas at proof
+    // time.  But our refine isn't fully Haskell-faithful (the typing-
+    // violating Responder cases survive saturate's speculative-
+    // IncompatibleEqs restore), so without runtime [sources] our
+    // typing-class lemmas (NSLPK3::injective_agree class) hit verdict
+    // Sorry where Haskell verifies.  Default ON until refine catches
+    // up.  Cost: ~12 non-typing all-traces lemmas show an extra
+    // `case_1`/`case_2` Disj-split that Haskell skips because the
+    // typing implication never gets a chance to fire at proof time.
+    // Disable via TAM_NO_SOURCES_IN_LEMMAS=1 to get Haskell-exact
+    // simplification at the cost of verdict regressions on typing-
+    // class lemmas.
+    // TODO Haskell parity (task #157): Haskell's `gatherReusableLemmas`
+    // (Prover.hs:331) puts ONLY `[reuse]` in sLemmas — never
+    // `[sources]`.  [sources] bodies are consulted by
+    // `refineWithSourceAsms` at precompute time.  Our weaker refine
+    // currently requires runtime [sources] firing to prune typing-
+    // violating cases; without it, both attack and typing-class
+    // lemmas regress (NSPK3::nonce_secrecy: Solved→Sorry, NSLPK3
+    // typing-class: Contradictory→Sorry).  Until refine is
+    // strengthened (Path A / Path B), keep them in sLemmas as a
+    // workaround.  `TAM_NO_SOURCES_IN_LEMMAS=1` enables the
+    // Haskell-faithful behaviour for testing the refine strengthening
+    // work.
+    if std::env::var("TAM_NO_SOURCES_IN_LEMMAS").is_err() {
+        // insertLemma unwraps Conj-tops; mirror that here so
+        // sources_lemma_universals matches what ends up in sys.lemmas.
+        fn flatten_conj(g: &crate::guarded::Guarded,
+                        out: &mut Vec<crate::guarded::Guarded>) {
+            match g {
+                crate::guarded::Guarded::Conj(items) => {
+                    for it in items { flatten_conj(it, out); }
+                }
+                other => out.push(other.clone()),
+            }
+        }
+        for s in &source_lemmas {
+            flatten_conj(s, &mut sys.sources_lemma_universals);
+        }
+        sys.insert_lemmas(source_lemmas);
+    } else {
+        let _ = source_lemmas;
+    }
 
     if trace { eprintln!("[phase] formula_to_system done; ProofContext::new start"); }
     // Bridge the elaborated theory's rules into the proof context.

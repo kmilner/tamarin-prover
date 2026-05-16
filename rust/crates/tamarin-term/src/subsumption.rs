@@ -113,6 +113,7 @@ fn rename_term(t: &LNTerm, rename: &BTreeMap<LVar, LVar>) -> LNTerm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lterm::LSort;
     use crate::vterm::Lit;
 
     #[test]
