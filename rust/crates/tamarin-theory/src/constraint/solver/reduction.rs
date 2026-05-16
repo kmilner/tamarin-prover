@@ -70,6 +70,68 @@ impl<'ctx> Reduction<'ctx> {
         if self.changed == ChangeIndicator::Changed { f(self); }
     }
 
+    /// Mark the system contradictory via the eq-store *and* via gfalse
+    /// in formulas.  Mirrors Haskell's `contradictoryIf True` /
+    /// `mzero`-via-`contradictoryIf` semantics: in Haskell, hitting
+    /// `contradictoryIf` in any CR-rule pass calls `mzero`, which
+    /// removes the case from the surrounding `runReduction` Disj.
+    /// Our port doesn't have monad-level mzero, so we have two markers:
+    ///
+    ///   - `gfalse` in `sys.formulas` — picked up by post-simplify
+    ///     `contradictions(ctx, sys)` as `FormulasFalse`, drives
+    ///     `is_finished` to return `Contradictory`.
+    ///   - `eq_store.is_false` — the simplify-time filter in
+    ///     `exec_proof_method`'s SolveGoal arm uses this as the Haskell-
+    ///     faithful proxy for mzero, dropping the case from the resulting
+    ///     case map so the proof tree mirrors Haskell's shape.
+    ///
+    /// Use this helper at every CR-rule failure point that corresponds
+    /// to a `contradictoryIf` in Haskell (`solveFactEqs` tag/arity
+    /// mismatch, `solveRuleEqs` rInfo mismatch, `solveSubstEqs`
+    /// failure, `noContradictoryEqStore` firing, etc.).  Idempotent:
+    /// only flags `Changed` if at least one marker actually toggled.
+    pub fn mark_contradictory(&mut self) {
+        let bot = crate::guarded::gfalse();
+        let added_bot = if !self.sys.formulas.contains(&bot) {
+            self.sys.formulas.push(bot);
+            true
+        } else {
+            false
+        };
+        let flipped_eq = if !self.sys.eq_store.is_false() {
+            let s = std::mem::take(&mut self.sys.eq_store);
+            self.sys.eq_store = s.set_false();
+            true
+        } else {
+            false
+        };
+        if added_bot || flipped_eq {
+            self.changed = ChangeIndicator::Changed;
+            if std::env::var("TAM_TRACE_CONTRADICTION").is_ok() {
+                let open = self.sys.goals.iter().filter(|(_, st)| !st.solved).count();
+                let bt = std::backtrace::Backtrace::force_capture();
+                let bt_s = format!("{bt}");
+                // Extract first non-mark_contradictory frame for compact view.
+                let caller = bt_s.lines()
+                    .filter(|l| l.contains("tamarin_theory") || l.contains("tamarin-theory"))
+                    .filter(|l| !l.contains("mark_contradictory"))
+                    .nth(0)
+                    .unwrap_or("(no frame)")
+                    .trim();
+                eprintln!(
+                    "[contra] nodes={} edges={} open={} forms={} bot={} eq={} caller={}",
+                    self.sys.nodes.len(),
+                    self.sys.edges.len(),
+                    open,
+                    self.sys.formulas.len(),
+                    added_bot,
+                    flipped_eq,
+                    caller,
+                );
+            }
+        }
+    }
+
     /// Insert a fresh node, returning its node id. The Haskell version
     /// allocates a fresh `LVar` via `MonadFresh`; here we use a simple
     /// counter on `System.next_split` to avoid threading a separate
@@ -107,6 +169,29 @@ impl<'ctx> Reduction<'ctx> {
     /// avoids both by calling `substSystem` after every successful
     /// `solveTermEqs`.
     pub fn subst_system(&mut self) {
+        // Haskell-faithful port of `substSystem`: substNodeIds is
+        // `whileChanging`, so we loop until the eq_store stops growing
+        // (substituting nodes can introduce new rule_eqs via setNodes
+        // which add to eq_store, which then needs to be reapplied to
+        // nodes).  Without this loop, intermediate states show stale
+        // node ids that downstream `enforce_edge_uniqueness_pass`
+        // mistakes for legitimate prem_idx_clash → spurious
+        // Contradictory on legitimate witness paths
+        // (TLS_Handshake::session_key_setup_possible root cause).
+        let mut iter = 0u32;
+        let cap = 32u32;
+        loop {
+            let before_subst_len = self.sys.eq_store.subst.to_list().len();
+            self.subst_system_once();
+            let after_subst_len = self.sys.eq_store.subst.to_list().len();
+            if after_subst_len == before_subst_len { break; }
+            iter += 1;
+            if iter >= cap { break; }
+        }
+    }
+
+    /// One pass of substSystem.  See [`subst_system`] for the loop wrapper.
+    fn subst_system_once(&mut self) {
         use tamarin_term::lterm::HasFrees;
         let subst = self.sys.eq_store.subst.clone();
         if subst.is_empty() { return; }
@@ -272,7 +357,14 @@ impl<'ctx> Reduction<'ctx> {
             e.src.0 = map_var(e.src.0.clone());
             e.tgt.0 = map_var(e.tgt.0.clone());
         }
-        self.sys.edges.dedup();
+        // Full (non-adjacent) dedup: see comment in
+        // simplify::apply_node_eqs.  Vec::dedup() only removes
+        // adjacent duplicates; after var-rename the duplicates may
+        // be scattered, so we must sort first.
+        let mut tmp: Vec<_> = std::mem::take(&mut self.sys.edges);
+        tmp.sort();
+        tmp.dedup();
+        self.sys.edges = tmp;
         // 3. Last-atom.
         if let Some(last) = self.sys.last_atom.take() {
             self.sys.last_atom = Some(map_var(last));
@@ -417,11 +509,14 @@ impl<'ctx> Reduction<'ctx> {
                 }
             }
             if tag_mismatch {
-                let bot = crate::guarded::gfalse();
-                if !self.sys.formulas.contains(&bot) {
-                    self.sys.formulas.push(bot);
-                    self.changed = ChangeIndicator::Changed;
-                }
+                // Mirrors Haskell `setNodes` → `solveRuleEqs` →
+                // `solveFactEqs` (Reduction.hs:745) where a fact-tag
+                // mismatch fires `contradictoryIf True` → mzero.  We
+                // funnel through `mark_contradictory` so BOTH the
+                // gfalse-in-formulas marker AND `eq_store.is_false`
+                // get set (SolveGoal-arm mzero proxy + post-simplify
+                // FormulasFalse).
+                self.mark_contradictory();
             }
             // Use SplitLater so we don't recurse into perform_split
             // (which can itself call subst_system).  Track the
@@ -431,13 +526,44 @@ impl<'ctx> Reduction<'ctx> {
             // !Key(~k) = !Key(some_other_term)).
             let res = self.solve_fact_eqs(SplitStrategy::SplitLater, &safe_eqs);
             if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
-                let bot = crate::guarded::gfalse();
-                if !self.sys.formulas.contains(&bot) {
-                    self.sys.formulas.push(bot);
-                    self.changed = ChangeIndicator::Changed;
-                }
+                // Mirrors Haskell `solveFactEqs` -> `solveTermEqs`
+                // ending in `noContradictoryEqStore` (Reduction.hs:704)
+                // which fires mzero on `eqsIsFalse`.  Set both
+                // markers via the helper.
+                self.mark_contradictory();
             }
         }
+    }
+
+    /// Install a rule's variant disjunction as a SplitG goal — mirrors
+    /// Haskell's `solveRuleConstraints` (Reduction.hs:766-774):
+    /// ```haskell
+    /// solveRuleConstraints (Just eqConstr) = do
+    ///     (eqs, splitId) <- addRuleVariants eqConstr <$> getM sEqStore
+    ///     insertGoal (SplitG splitId) False
+    ///     setM sEqStore =<< simp hnd ...
+    /// solveRuleConstraints Nothing = return ()
+    /// ```
+    ///
+    /// Adds `substs` as a new disjunction to the eq-store, allocates a
+    /// fresh `SplitId`, and inserts a `Goal::Split(id)` so the search
+    /// (or simplify) layer enumerates the variant choice lazily.
+    /// Returns without effect when `substs` is `None` or empty.
+    pub fn solve_rule_constraints(
+        &mut self,
+        substs: Option<Vec<tamarin_term::subst_vfresh::LNSubstVFresh>>,
+    ) {
+        let substs = match substs {
+            Some(v) if !v.is_empty() => v,
+            _ => return,
+        };
+        // Haskell `addRuleVariants` errors if domain of variants
+        // intersects with eq-store free subst — that case isn't
+        // supported there either. We don't enforce it; the worst case
+        // is a redundant SplitG entry that simplify will discharge.
+        let id = self.sys.eq_store.add_disj(substs);
+        self.insert_goal(Goal::Split(id));
+        self.changed = ChangeIndicator::Changed;
     }
 
     /// Insert a `<` atom.
@@ -497,7 +623,7 @@ impl<'ctx> Reduction<'ctx> {
                             let next_idx = std::cmp::max(
                                 bounds_max(&self.sys),
                                 outer_node.idx,
-                            ) + 1;
+                            ).saturating_add(1);
                             let sub_node = tamarin_term::lterm::LVar::new(
                                 "vk",
                                 tamarin_term::lterm::LSort::Node,
@@ -611,18 +737,18 @@ impl<'ctx> Reduction<'ctx> {
                 // Haskell `insertAtom (EqE x y) = void (solveTermEqs
                 // SplitNow [Equal x y])`.  The monadic `void` ignores
                 // the ChangeIndicator but the monad propagates
-                // Contradictory via mzero/MonadPlus.  In our pass form,
-                // surface failure as gfalse so the next contradictions
-                // check picks it up (FormulasFalse).
+                // Contradictory via mzero/MonadPlus (the inner
+                // `noContradictoryEqStore` at Reduction.hs:704 fires
+                // mzero on `eqsIsFalse`).  In our pass form, route
+                // both markers via `mark_contradictory` so the
+                // SolveGoal-arm mzero proxy AND post-simplify
+                // contradictions check both fire.
                 let res = self.solve_term_eqs(
                     SplitStrategy::SplitNow,
                     &[tamarin_term::rewriting::Equal { lhs: tx, rhs: ty }],
                 );
                 if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
-                    let bot = crate::guarded::gfalse();
-                    if !self.sys.formulas.contains(&bot) {
-                        self.sys.formulas.push(bot);
-                    }
+                    self.mark_contradictory();
                 }
                 self.changed = ChangeIndicator::Changed;
                 true
@@ -657,19 +783,17 @@ impl<'ctx> Reduction<'ctx> {
                     Some(la) => {
                         // Haskell `insertLast n = ... whenJust last
                         // $ \i -> solveNodeIdEqs [Equal i n]` — failure
-                        // propagates via monadic bind.  In our pass
-                        // form, surface failure as gfalse so the next
-                        // contradictions check picks it up.
+                        // propagates via monadic bind through
+                        // `noContradictoryEqStore` (Reduction.hs:704).
+                        // Route both gfalse + eq_store.is_false via the
+                        // helper to keep the mzero proxy in sync.
                         let res = self.solve_node_id_eqs(&[
                             tamarin_term::rewriting::Equal {
                                 lhs: la, rhs: n,
                             }
                         ]);
                         if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
-                            let bot = crate::guarded::gfalse();
-                            if !self.sys.formulas.contains(&bot) {
-                                self.sys.formulas.push(bot);
-                            }
+                            self.mark_contradictory();
                         }
                         self.changed = ChangeIndicator::Changed;
                     }
@@ -778,7 +902,7 @@ impl<'ctx> Reduction<'ctx> {
                 self.sys.solved_formulas.push(outer);
                 let avoid_max = self.fresh_var_baseline();
                 let mut subst = crate::guarded::VarSubst::new();
-                let mut next = avoid_max + 1;
+                let mut next = avoid_max.saturating_add(1);
                 for v in &vars {
                     subst.insert(
                         (v.name.clone(), v.idx),
@@ -788,7 +912,7 @@ impl<'ctx> Reduction<'ctx> {
                             sort: v.sort,
                             typ: v.typ.clone(),
                         }));
-                    next += 1;
+                    next = next.saturating_add(1);
                 }
                 // Build `gconj(map atoms ++ [body])` with the subst applied.
                 let mut items: Vec<Guarded> = guards.iter()
@@ -864,17 +988,38 @@ impl<'ctx> Reduction<'ctx> {
                         self.insert_formula_decompose_inner(d, false);
                         self.changed = ChangeIndicator::Changed;
                     }
-                    AAtom::Last(i) if self.sys.last_atom.is_some() => {
-                        // Last(i) is false ⇒ last < i ∨ i < last
-                        // Only fire when sys.last_atom is already set;
-                        // allocating a fresh last node here can perturb
-                        // downstream goal ordering on lemmas where the
-                        // induction hypothesis already encodes the last
-                        // constraint via partial_atom_valuation paths.
+                    AAtom::Last(i) => {
+                        // Haskell `insertFormula` for `∀[].[Last i].⊥`
+                        // (Reduction.hs:478-486):
+                        //   markAsSolved
+                        //   lst <- getM sLastAtom
+                        //   j <- case lst of
+                        //          Nothing -> do j <- freshLVar "last" LSortNode
+                        //                        insertLast j; return j
+                        //          Just j  -> return j
+                        //   insert (gdisj [Less last_term i, Less i last_term])
+                        //
+                        // We previously only fired this when last_atom was
+                        // already set, to avoid perturbing proof ordering.
+                        // But Haskell ALWAYS allocates fresh if None, and
+                        // our earlier guard made `last_atom` get set later
+                        // (during simplify) instead — emitting an extra
+                        // visible `simplify` step where Haskell shows none.
                         if !self.sys.solved_formulas.contains(&g) {
                             self.sys.solved_formulas.push(g.clone());
                         }
-                        let last_node = self.sys.last_atom.as_ref().unwrap().clone();
+                        let last_node = match &self.sys.last_atom {
+                            Some(j) => j.clone(),
+                            None => {
+                                let baseline = self.fresh_var_baseline();
+                                let j = tamarin_term::lterm::LVar::new(
+                                    "last",
+                                    tamarin_term::lterm::LSort::Node,
+                                    baseline.saturating_add(1));
+                                self.sys.last_atom = Some(j.clone());
+                                j
+                            }
+                        };
                         let last_term = tamarin_parser::ast::Term::Var(
                             tamarin_parser::ast::VarSpec {
                                 name: last_node.name.clone(),
@@ -1061,11 +1206,25 @@ impl<'ctx> Reduction<'ctx> {
         // variables.
         let avoid = bounds_max(&self.sys);
         let split = self.sys.eq_store.add_eqs_with_avoid(&maude, &pending, avoid)?;
-        // Run the simplification pass with a no-op contradiction
-        // predicate (the proper one needs `substCreatesNonNormalTerms`
-        // wired through, which uses Maude — left for a later step).
+        // Run simp with substCreatesNonNormalTerms as the is_contr
+        // predicate.  Without it, SplitG variants that would
+        // introduce non-normal terms (e.g. verify=sign(...)) aren't
+        // filtered; Haskell uses this exact check.  Gated to non-
+        // empty reducible signatures — pair-only theories never
+        // produce non-normal subterms structurally so the check is
+        // pure overhead.  See contradictions.rs::subst_creates_non_normal_terms.
+        let sys_snapshot = self.sys.clone();
+        let maude_for_check = maude.clone();
+        let has_reducible = !maude.maude_sig().reducible_fun_syms.is_empty()
+            && std::env::var("TAM_DISABLE_SUBST_NF").is_err();
         let store = std::mem::take(&mut self.sys.eq_store);
-        self.sys.eq_store = store.simp(|_, _| false);
+        self.sys.eq_store = if has_reducible {
+            store.simp(|fs, vfs| crate::constraint::solver::contradictions::subst_creates_non_normal_terms(
+                &maude_for_check, &sys_snapshot, fs, vfs,
+            ))
+        } else {
+            store.simp(|_, _| false)
+        };
 
         if self.sys.eq_store.is_false() {
             return Ok(SolveOutcome::Contradictory);
@@ -1111,14 +1270,34 @@ impl<'ctx> Reduction<'ctx> {
     /// `solveFactEqs` — equate two fact lists. Returns
     /// `Contradictory` if any pair of facts has different tags or
     /// arities.
+    ///
+    /// Mirrors Haskell `solveFactEqs` (Reduction.hs:743-746):
+    /// ```haskell
+    /// solveFactEqs split eqs = do
+    ///     contradictoryIf (not $ all evalEqual $ map (fmap factTag) eqs)
+    ///     solveListEqs (solveTermEqs split) $ ...
+    /// ```
+    /// The `contradictoryIf` fires mzero on tag/arity mismatch.  We
+    /// emulate mzero by flipping `eq_store.is_false` AND returning
+    /// `Contradictory` — the proof_method.rs SolveGoal arm uses
+    /// `eq_store.is_false` as the mzero proxy when filtering cases,
+    /// so without the flip a tag-mismatch case would slip through.
     pub fn solve_fact_eqs(
         &mut self,
         strategy: SplitStrategy,
         eqs: &[tamarin_term::rewriting::Equal<crate::fact::LNFact>],
     ) -> Result<SolveOutcome, crate::tools::equation_store::AddEqsError> {
         for e in eqs {
-            if e.lhs.tag != e.rhs.tag { return Ok(SolveOutcome::Contradictory); }
-            if e.lhs.terms.len() != e.rhs.terms.len() {
+            if e.lhs.tag != e.rhs.tag || e.lhs.terms.len() != e.rhs.terms.len() {
+                // Set eq_store.is_false so the SolveGoal-arm mzero
+                // proxy filter (proof_method.rs:326) sees the
+                // contradiction even if the caller `let _ = ...`s
+                // our result.  Mirrors Haskell's `contradictoryIf`
+                // (Reduction.hs:745) firing mzero on tag mismatch.
+                if !self.sys.eq_store.is_false() {
+                    let s = std::mem::take(&mut self.sys.eq_store);
+                    self.sys.eq_store = s.set_false();
+                }
                 return Ok(SolveOutcome::Contradictory);
             }
         }
@@ -1136,6 +1315,17 @@ impl<'ctx> Reduction<'ctx> {
     /// `solveRuleEqs` — equate two rule instances.  Mirrors
     /// `Reduction.hs:749-754`: checks rInfo equality, then runs
     /// `solveFactEqs` on conclusions, premises, actions.
+    ///
+    /// Mirrors Haskell `solveRuleEqs` (Reduction.hs:749-754):
+    /// ```haskell
+    /// solveRuleEqs split eqs = do
+    ///     contradictoryIf (not $ all evalEqual $ map (fmap (get rInfo)) eqs)
+    ///     solveListEqs (solveFactEqs split) ...
+    /// ```
+    /// `contradictoryIf` fires mzero on rInfo mismatch.  Set
+    /// `eq_store.is_false` here so the SolveGoal-arm mzero proxy
+    /// catches the contradiction, mirroring the helper for
+    /// `solve_fact_eqs`.
     pub fn solve_rule_eqs(
         &mut self,
         strategy: SplitStrategy,
@@ -1144,6 +1334,10 @@ impl<'ctx> Reduction<'ctx> {
         // Rule infos must match (rule names, intruder-info, etc.).
         for e in eqs {
             if e.lhs.info != e.rhs.info {
+                if !self.sys.eq_store.is_false() {
+                    let s = std::mem::take(&mut self.sys.eq_store);
+                    self.sys.eq_store = s.set_false();
+                }
                 return Ok(SolveOutcome::Contradictory);
             }
         }
@@ -1232,6 +1426,8 @@ impl<'ctx> Reduction<'ctx> {
     pub fn conjoin_system(&mut self, sys: &System)
         -> Result<SolveOutcome, crate::tools::equation_store::AddEqsError>
     {
+        crate::state_trace::emit("conjoin_in", None, &self.sys);
+        crate::state_trace::emit("conjoin_with", None, sys);
         // 1-3. joinSets: solved_formulas, lemmas, edges.  Use sets so
         // duplicates are collapsed (HasFrees-based dedup not needed —
         // syntactic equality is sufficient for these sets).
@@ -1353,29 +1549,63 @@ impl<'ctx> Reduction<'ctx> {
 // Helpers used by goal solving.
 // =============================================================================
 
+/// Build the canonical `RuleACInst` for an `OpenProtoRule`.
+///
+/// In SplitG-variants mode (`TAM_SPLITG_VARIANTS=1`), uses the
+/// abstracted form (Haskell `variantsProtoRule`'s output with
+/// reducible-headed sub-terms abstracted to fresh `z_i` vars) so the
+/// equality-restriction firing during simplify doesn't contradict on
+/// the un-narrowed form.  Otherwise falls back to the raw rule.
+/// Mirrors Haskell's `someRuleACInst` (Rule.hs:933) extracting the
+/// `RuleACInst` half from a `RuleAC`.
+fn canonical_rule_inst(o: &crate::theory::OpenProtoRule) -> RuleACInst {
+    canonical_rule_inst_with(o, /* prefer_abstracted = */ true)
+}
+
+fn canonical_rule_inst_with(
+    o: &crate::theory::OpenProtoRule,
+    prefer_abstracted: bool,
+) -> RuleACInst {
+    let src: &crate::rule::ProtoRuleE = if prefer_abstracted {
+        o.abstracted_rule.as_ref().unwrap_or(&o.rule)
+    } else {
+        &o.rule
+    };
+    crate::rule::Rule {
+        info: crate::rule::RuleInfo::Proto(crate::rule::ProtoRuleACInstInfo {
+            name: src.info.name.clone(),
+            attributes: src.info.attributes.clone(),
+            loop_breakers: o.loop_breakers.clone(),
+        }),
+        premises: src.premises.clone(),
+        conclusions: src.conclusions.clone(),
+        actions: src.actions.clone(),
+        new_vars: src.new_vars.clone(),
+    }
+}
+
 /// Convert `OpenProtoRule`s to `RuleACInst`s, applying a per-rule
-/// keep predicate.
+/// keep predicate. Legacy expansion of variants into separate rule
+/// instances — `rule_insts_with_constrs` is the SplitG-faithful
+/// alternative.
+///
+/// When `TAM_SPLITG_VARIANTS=1`, returns the abstracted form so
+/// premise-goal / chain-fold paths see the same rule shape as the
+/// SplitG action-goal path.  Otherwise returns the raw (legacy)
+/// shape — possibly expanded over pre-applied variants.
 fn rule_insts_with<F: Fn(&RuleACInst) -> bool>(
     open: &[crate::theory::OpenProtoRule], keep: F,
 ) -> Vec<RuleACInst> {
+    let splitg_path = std::env::var("TAM_SPLITG_VARIANTS").is_ok();
     let mut out = Vec::new();
     for o in open {
         let push = |inst: RuleACInst, out: &mut Vec<RuleACInst>| {
             if keep(&inst) { out.push(inst); }
         };
         if o.variants.is_empty() {
-            let inst = crate::rule::Rule {
-                info: crate::rule::RuleInfo::Proto(crate::rule::ProtoRuleACInstInfo {
-                    name: o.rule.info.name.clone(),
-                    attributes: o.rule.info.attributes.clone(),
-                    loop_breakers: o.loop_breakers.clone(),
-                }),
-                premises: o.rule.premises.clone(),
-                conclusions: o.rule.conclusions.clone(),
-                actions: o.rule.actions.clone(),
-                new_vars: o.rule.new_vars.clone(),
-            };
-            push(inst, &mut out);
+            // SplitG: prefer the abstracted rule so all goal-types
+            // share the same shape.  Legacy: raw rule.
+            push(canonical_rule_inst_with(o, splitg_path), &mut out);
         } else {
             for v in &o.variants {
                 let mut inst = crate::rule::proto_rule_ac_to_rule_ac_inst(v.clone());
@@ -1391,6 +1621,32 @@ fn rule_insts_with<F: Fn(&RuleACInst) -> bool>(
     out
 }
 
+/// `someRuleACInst`-style rule enumeration (Rule.hs:933): one canonical
+/// `RuleACInst` per `OpenProtoRule`, paired with its variant disjunction
+/// (`Maybe RuleACConstrs`). Callers should add the disjunction to the
+/// eq-store as a SplitG via `solve_rule_constraints` after labeling the
+/// node. Intruder rules are added with `None` constraints (they have no
+/// variants).
+///
+/// `TAM_SPLITG_VARIANTS=1` opts in to this path; otherwise legacy
+/// pre-applied-variant expansion is used.
+fn rule_insts_with_constrs<F: Fn(&RuleACInst) -> bool>(
+    open: &[crate::theory::OpenProtoRule], keep: F,
+) -> Vec<(RuleACInst, Option<Vec<tamarin_term::subst_vfresh::LNSubstVFresh>>)> {
+    let mut out = Vec::new();
+    for o in open {
+        let inst = canonical_rule_inst(o);
+        if !keep(&inst) { continue; }
+        let constrs = if o.variant_substs.is_empty() {
+            None
+        } else {
+            Some(o.variant_substs.clone())
+        };
+        out.push((inst, constrs));
+    }
+    out
+}
+
 /// `nonSilentRules` lite: rules with at least one action. Includes
 /// the proof context's intruder rules so KU goals can be discharged.
 fn non_silent_rule_insts(
@@ -1400,6 +1656,21 @@ fn non_silent_rule_insts(
     for ir in &ctx.intruder_rules {
         if !ir.actions.is_empty() {
             out.push(intr_rule_to_rule_ac_inst(ir.clone()));
+        }
+    }
+    out
+}
+
+/// SplitG-faithful variant of `non_silent_rule_insts`: returns the
+/// canonical rule per `OpenProtoRule` plus its variant disjunction.
+/// Intruder rules carry `None` (no variants).
+fn non_silent_rule_insts_with_constrs(
+    ctx: &crate::constraint::solver::context::ProofContext,
+) -> Vec<(RuleACInst, Option<Vec<tamarin_term::subst_vfresh::LNSubstVFresh>>)> {
+    let mut out = rule_insts_with_constrs(&ctx.rules, |r| !r.actions.is_empty());
+    for ir in &ctx.intruder_rules {
+        if !ir.actions.is_empty() {
+            out.push((intr_rule_to_rule_ac_inst(ir.clone()), None));
         }
     }
     out
@@ -1499,17 +1770,27 @@ fn normalise_node_id(
 fn term_to_node_id(
     t: &tamarin_parser::ast::Term,
 ) -> Option<crate::constraint::constraints::NodeId> {
-    use tamarin_parser::ast::{SortHint, Term as AstTerm};
+    use tamarin_parser::ast::{SortHint, SuffixSort, Term as AstTerm};
     let v = match t {
         AstTerm::Var(v) => v,
         _ => return None,
     };
-    let sort = match v.sort {
-        SortHint::Node => tamarin_term::lterm::LSort::Node,
-        // Allow unsorted vars; downstream sort propagation will narrow.
-        _ => tamarin_term::lterm::LSort::Node,
-    };
-    Some(tamarin_term::lterm::LVar::new(v.name.clone(), sort, v.idx))
+    // Mirror Haskell `bltermNodeId` (Reduction.hs ~480): returns `Just`
+    // only when the term is a Var with sort `LSortNode`. Returning
+    // `Some` for non-Node sorts causes the Eq/Less→Disj CR-rules to
+    // fire on msg-var `¬(a=b)` formulas — which Haskell leaves as
+    // formulas, producing the SOLVED vs solve divergence on
+    // MinValueEq/WrongEquality.
+    match v.sort {
+        SortHint::Node | SortHint::Suffix(SuffixSort::Node) => {
+            Some(tamarin_term::lterm::LVar::new(
+                v.name.clone(),
+                tamarin_term::lterm::LSort::Node,
+                v.idx,
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// `forbiddenEdge` — port of the chain-goal forbidden edge shapes.
@@ -1655,6 +1936,48 @@ fn premise_solving_rule_insts(
     out
 }
 
+/// SplitG-aware variant: returns the canonical (possibly abstracted)
+/// rule per `OpenProtoRule` plus its variant disjunction.  Intruder
+/// rules carry `None` (no variants).  Same filtering as
+/// `premise_solving_rule_insts`.
+fn premise_solving_rule_insts_with_constrs(
+    ctx: &crate::constraint::solver::context::ProofContext,
+    fa_prem: &crate::fact::LNFact,
+) -> Vec<(RuleACInst, Option<Vec<tamarin_term::subst_vfresh::LNSubstVFresh>>)> {
+    let unique_rule_name = ctx.unique_sources.iter()
+        .find(|s| s.fact_tag == fa_prem.tag)
+        .map(|s| s.rule_name.clone());
+    let mut out: Vec<(RuleACInst, Option<Vec<tamarin_term::subst_vfresh::LNSubstVFresh>>)>
+        = if !fa_prem.is_k_fact() {
+        let keep_rule_name = unique_rule_name.clone();
+        rule_insts_with_constrs(&ctx.rules, move |r| {
+            if !r.conclusions.iter().any(|c| !c.is_k_fact()) {
+                return false;
+            }
+            if let Some(name) = &keep_rule_name {
+                let r_name = match &r.info {
+                    crate::rule::RuleInfo::Proto(p) => match &p.name {
+                        crate::rule::ProtoRuleName::Stand(s) => s.clone(),
+                        crate::rule::ProtoRuleName::Fresh => "Fresh".to_string(),
+                    },
+                    _ => return true,
+                };
+                return &r_name == name;
+            }
+            true
+        })
+    } else {
+        rule_insts_with_constrs(&ctx.rules, |_| true)
+    };
+    for ir in &ctx.intruder_rules {
+        let inst = intr_rule_to_rule_ac_inst(ir.clone());
+        if inst.conclusions.iter().any(|c| c.tag == fa_prem.tag) {
+            out.push((inst, None));
+        }
+    }
+    out
+}
+
 /// Find the largest free LVar index used anywhere in the system, so
 /// fresh-renaming doesn't collide.
 ///
@@ -1753,6 +2076,75 @@ pub fn bounds_max(sys: &System) -> u64 {
 /// breaks TESLA::authentic_reachable.  Drawing from the global
 /// counter guarantees every freshen produces a globally-unique idx
 /// range.
+/// Freshen a `(RuleACInst, Option<Vec<LNSubstVFresh>>)` pair, applying
+/// the same idx-shift to both the rule's free vars and the substs'
+/// domains+ranges. Mirrors Haskell's `someRuleACInst`'s use of
+/// `fmap extractInsts . rename` (Rule.hs:933-945): the `rename` runs
+/// over the whole rule+constrs pair via `MonadFresh`, so the
+/// disjunction's vars stay aligned with the renamed rule.
+fn freshen_rule_with_constrs(
+    rule: RuleACInst,
+    constrs: Option<Vec<tamarin_term::subst_vfresh::LNSubstVFresh>>,
+    avoid_max: u64,
+    maude: &tamarin_term::maude_proc::MaudeHandle,
+) -> (RuleACInst, Option<Vec<tamarin_term::subst_vfresh::LNSubstVFresh>>) {
+    use tamarin_term::lterm::{HasFrees, LVar};
+    // Combined bounds across rule + constrs.
+    let mut min = u64::MAX;
+    let mut max = 0u64;
+    let mut any = false;
+    let mut acc = |v: &LVar| {
+        any = true;
+        if v.idx < min { min = v.idx; }
+        if v.idx > max { max = v.idx; }
+    };
+    rule.for_each_free(&mut acc);
+    if let Some(cs) = &constrs {
+        for s in cs {
+            for (k, v) in s.to_list() {
+                acc(&k);
+                for_each_free_lvar_lnterm(&v, &mut acc);
+            }
+        }
+    }
+    if !any { return (rule, constrs); }
+    maude.ensure_above(avoid_max);
+    let span = max.saturating_sub(min).saturating_add(1);
+    let base = maude.reserve_idxs(span);
+    let shift = (base as i128) - (min as i128);
+    let shift_idx = |idx: u64| -> u64 { ((idx as i128) + shift) as u64 };
+    let new_rule = rule.map_free(&mut |LVar { name, sort, idx }| LVar {
+        name, sort, idx: shift_idx(idx),
+    });
+    let new_constrs = constrs.map(|cs| {
+        cs.into_iter().map(|s| {
+            let pairs: Vec<_> = s.to_list().into_iter().map(|(k, v)| {
+                let new_k = LVar {
+                    name: k.name.clone(),
+                    sort: k.sort,
+                    idx: shift_idx(k.idx),
+                };
+                let new_v = v.map_free(&mut |LVar { name, sort, idx }| LVar {
+                    name, sort, idx: shift_idx(idx),
+                });
+                (new_k, new_v)
+            }).collect();
+            tamarin_term::subst_vfresh::LNSubstVFresh::from_list(pairs)
+        }).collect()
+    });
+    (new_rule, new_constrs)
+}
+
+/// Helper: walk every free LVar in an LNTerm (analog of for_each_free
+/// for terms, since LNTerm = VTerm<Name, LVar>).
+fn for_each_free_lvar_lnterm<F: FnMut(&tamarin_term::lterm::LVar)>(
+    t: &tamarin_term::lterm::LNTerm,
+    f: &mut F,
+) {
+    use tamarin_term::lterm::HasFrees;
+    t.for_each_free(f);
+}
+
 fn freshen_rule(rule: RuleACInst, avoid_max: u64, maude: &tamarin_term::maude_proc::MaudeHandle) -> RuleACInst {
     use tamarin_term::lterm::HasFrees;
     let bounds = {
@@ -2088,6 +2480,32 @@ impl<'ctx> Reduction<'ctx> {
 
     /// Add a fresh-rule supplier node for a `Fr(m)` premise. The
     /// Fresh-rule has `[] --[]-> [Fr(m)]`.
+    ///
+    /// Haskell-faithful port of `exploitPrem` for FreshFact
+    /// (`Reduction.hs:250-258`):
+    ///
+    /// ```haskell
+    /// Fact FreshFact _ [m] -> do
+    ///     j <- freshLVar "vf" LSortNode
+    ///     modM sNodes (M.insert j (mkFreshRuleAC m))
+    ///     unless (isFreshVar m) $ do
+    ///         -- 'm' must be of sort fresh ==> enforce via unification
+    ///         n <- varTerm <$> freshLVar "n" LSortFresh
+    ///         void (solveTermEqs SplitNow [Equal m n])
+    ///     modM sEdges (S.insert $ Edge (j, ConcIdx 0) (i,v))
+    /// ```
+    ///
+    /// The `unless (isFreshVar m)` branch narrows m's sort to Fresh
+    /// via a unification equation `m = ~n` (where ~n is freshly
+    /// allocated Fresh-sorted).  Without this, when a user writes
+    /// `Fr(x)` (where x is the default Msg sort), the supplier
+    /// rule's conclusion would carry x:Msg through the whole proof
+    /// — leaving `KU(x:Msg)` goals that get auto-solved (filtered
+    /// out by `is_open_in_sys`) because they look like an
+    /// unconstrained Msg variable, when in fact x is the fresh
+    /// value Step1 generated.  CSF12::Artificial's
+    /// Keys_must_be_revealed lemma wrong-falsifies exactly because
+    /// of this.
     fn add_fresh_supplier_for(
         &mut self,
         i: &crate::constraint::constraints::NodeId,
@@ -2098,12 +2516,47 @@ impl<'ctx> Reduction<'ctx> {
         let next = self.next_fresh_node_idx();
         let j = tamarin_term::lterm::LVar::new(
             "vf", tamarin_term::lterm::LSort::Node, next);
-        let rule = make_fresh_rule(m);
+        let rule = make_fresh_rule(m.clone());
         self.sys.add_node(j.clone(), rule);
         self.sys.add_edge(crate::constraint::constraints::Edge {
             src: (j, crate::rule::ConcIdx(0)),
             tgt: (i.clone(), idx),
         });
+        // Haskell `unless (isFreshVar m)`: narrow m:Msg → ~n:Fresh
+        // via solveTermEqs.  Only fires when m is not already Fresh-
+        // sorted (free var or Fresh literal).
+        let is_fresh_var_or_lit = {
+            use tamarin_term::lterm::{LSort, NameTag};
+            use tamarin_term::term::Term;
+            use tamarin_term::vterm::Lit;
+            match &m {
+                Term::Lit(Lit::Var(v)) => v.sort == LSort::Fresh,
+                Term::Lit(Lit::Con(n)) => matches!(n.tag, NameTag::Fresh),
+                _ => false,
+            }
+        };
+        if !is_fresh_var_or_lit {
+            let next_n = bounds_max(&self.sys).saturating_add(1);
+            let n_var = tamarin_term::lterm::LVar::new(
+                "n", tamarin_term::lterm::LSort::Fresh, next_n);
+            let n_term = tamarin_term::term::Term::Lit(
+                tamarin_term::vterm::Lit::Var(n_var));
+            let eq = tamarin_term::rewriting::Equal { lhs: m, rhs: n_term };
+            // Haskell `void (solveTermEqs SplitNow [Equal m n])` —
+            // `void` ignores ChangeIndicator but the monadic bind
+            // propagates Contradictory via mzero on
+            // `noContradictoryEqStore`.  Previously this was
+            // `let _ = ...` which silently swallowed failures, breaking
+            // the mzero proxy for shapes like `Fr(pub_var)` where the
+            // narrowing `pub_var = ~n:Fresh` is sort-incompatible.
+            let res = self.solve_term_eqs(SplitStrategy::SplitNow, &[eq]);
+            if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
+                self.mark_contradictory();
+            }
+            // Propagate the narrowing into the system structure so
+            // downstream passes see the Fresh-sorted version.
+            self.subst_system();
+        }
         self.changed = ChangeIndicator::Changed;
     }
 
@@ -2166,7 +2619,15 @@ impl<'ctx> Reduction<'ctx> {
     }
 
     fn next_fresh_node_idx(&self) -> u64 {
-        bounds_max(&self.sys) + 1
+        // Mirror Haskell's `freshLVar`: push the global counter past the
+        // current system's max idx, then take the next idx.  Using
+        // `bounds_max + 1` directly overflows when a Maude witness LVar
+        // (idx near u64::MAX from order-sorted unification output) leaks
+        // into the system without being re-freshed.  `freshen_rule` and
+        // `freshen_witness_range` already use this pattern.
+        let bm = bounds_max(&self.sys);
+        self.ctx.maude.ensure_above(bm);
+        self.ctx.maude.fresh_idx()
     }
 
     /// `solveAction` — port of the Action arm of `solveGoal`.
@@ -2324,7 +2785,8 @@ impl<'ctx> Reduction<'ctx> {
                         // surfaces a cyclic-ordering contradiction.
                         let _ = &used;
                         let _ = ku_goal_fingerprint(fa);
-                        for (case_label, mut sys, case_action) in case_pairs {
+                        for (case_label, mut sys, case_action) in case_pairs.into_iter() {
+                            let case_idx: usize = 0; let _ = case_idx;
                             if let Some(slot) = sys.goals.iter_mut()
                                 .find(|(g, _)| g == &live_goal) {
                                 slot.1.solved = true;
@@ -2468,11 +2930,29 @@ impl<'ctx> Reduction<'ctx> {
                         // fall back to plain rule enumeration below.
                     }
                 }
-                let candidates = non_silent_rule_insts(self.ctx);
+                // Two enumeration paths:
+                //   * legacy: rule_insts_with expands `variants` into N
+                //     separate pre-applied rules, each becomes its own
+                //     case.
+                //   * SplitG (TAM_SPLITG_VARIANTS=1): canonical rule per
+                //     `OpenProtoRule` + variant substs installed as
+                //     a SplitG goal via `solve_rule_constraints`
+                //     (Reduction.hs:766-774). One case per rule at the
+                //     action level; variant choice deferred.
+                let splitg_path = std::env::var("TAM_SPLITG_VARIANTS").is_ok();
+                let candidates: Vec<(RuleACInst,
+                        Option<Vec<tamarin_term::subst_vfresh::LNSubstVFresh>>)>
+                    = if splitg_path {
+                        non_silent_rule_insts_with_constrs(self.ctx)
+                    } else {
+                        non_silent_rule_insts(self.ctx).into_iter()
+                            .map(|r| (r, None))
+                            .collect()
+                    };
                 if candidates.is_empty() { return GoalCases::Contradictory; }
                 let avoid_max = bounds_max(&self.sys);
                 let mut cases: Vec<(String, crate::constraint::system::System)> = Vec::new();
-                for rule in candidates {
+                for (rule, constrs) in candidates {
                     // Filter rules that have at least one action with
                     // matching tag/arity — cheap pre-filter that
                     // mirrors the unifiability check.
@@ -2482,7 +2962,13 @@ impl<'ctx> Reduction<'ctx> {
                     for (act_idx, _) in rule.actions.iter().enumerate() {
                         // Fresh-rename the rule once per branch so
                         // each candidate has independent variables.
-                        let renamed = freshen_rule(rule.clone(), avoid_max, &self.ctx.maude);
+                        // When the SplitG path is on, freshen both the
+                        // rule and any accompanying variant substs
+                        // consistently — Haskell `someRuleACInst` runs
+                        // `rename` over the whole (rule, constrs) pair
+                        // via `fmap extractInsts . rename`.
+                        let (renamed, renamed_constrs) = freshen_rule_with_constrs(
+                            rule.clone(), constrs.clone(), avoid_max, &self.ctx.maude);
                         let act = renamed.actions[act_idx].clone();
                         if act.tag != fa.tag || act.terms.len() != fa.terms.len() {
                             continue;
@@ -2498,6 +2984,9 @@ impl<'ctx> Reduction<'ctx> {
                         match res {
                             Err(_) | Ok(SolveOutcome::Contradictory) => continue,
                             Ok(_) => {
+                                // Install variant constraints as SplitG
+                                // (Haskell `solveRuleConstraints`).
+                                sub.solve_rule_constraints(renamed_constrs);
                                 // Expand the new node's premises
                                 // (Fresh / In / KU / Premise goal).
                                 sub.exploit_prems(i, &renamed);
@@ -2590,9 +3079,9 @@ impl<'ctx> Reduction<'ctx> {
             // materialises and the case name stays at "coerce_irecv".
             let avoid = bounds_max(&self.sys);
             let i_learn = tamarin_term::lterm::LVar::new(
-                "vl", tamarin_term::lterm::LSort::Node, avoid + 1);
+                "vl", tamarin_term::lterm::LSort::Node, avoid.saturating_add(1));
             let m_learn_var = tamarin_term::lterm::LVar::new(
-                "t", tamarin_term::lterm::LSort::Msg, avoid + 2);
+                "t", tamarin_term::lterm::LSort::Msg, avoid.saturating_add(2));
             let m_learn = tamarin_term::term::Term::Lit(
                 tamarin_term::vterm::Lit::Var(m_learn_var));
             let irecv_rule = crate::rule::Rule::new(
@@ -2766,18 +3255,35 @@ impl<'ctx> Reduction<'ctx> {
             }
         }
         let g = Goal::Premise(p.clone(), fa_prem.clone());
-        let candidates = premise_solving_rule_insts(self.ctx, fa_prem);
+        // SplitG path: use canonical (abstracted) rule + variant
+        // disjunction installed as SplitG after labeling.  Legacy
+        // path: use raw (or pre-applied-variant-expanded) rule.
+        let splitg_path = std::env::var("TAM_SPLITG_VARIANTS").is_ok();
+        let candidates: Vec<(RuleACInst,
+                Option<Vec<tamarin_term::subst_vfresh::LNSubstVFresh>>)>
+            = if splitg_path {
+                premise_solving_rule_insts_with_constrs(self.ctx, fa_prem)
+            } else {
+                premise_solving_rule_insts(self.ctx, fa_prem).into_iter()
+                    .map(|r| (r, None))
+                    .collect()
+            };
         let avoid_max = bounds_max(&self.sys);
         let mut cases: Vec<(String, crate::constraint::system::System)> = Vec::new();
-        let mut next_node_idx = avoid_max + 1;
-        for rule in &candidates {
+        let mut next_node_idx = avoid_max.saturating_add(1);
+        for (rule, constrs) in &candidates {
             for (c_idx, fa_conc) in rule.enumerate_conclusions() {
                 if fa_conc.tag != fa_prem.tag
                     || fa_conc.terms.len() != fa_prem.terms.len() {
                     continue;
                 }
                 let mut sys = self.sys.clone();
-                let renamed = freshen_rule(rule.clone(), avoid_max, &self.ctx.maude);
+                // Freshen the rule and its variant constraints together
+                // so the SplitG disjunction's domain stays aligned with
+                // the rule's free vars (Haskell `someRuleACInst` runs
+                // `rename` over the whole pair).
+                let (renamed, renamed_constrs) = freshen_rule_with_constrs(
+                    rule.clone(), constrs.clone(), avoid_max, &self.ctx.maude);
                 let fa_conc = renamed.conclusions[c_idx.0].clone();
                 let case_name = rule_case_name(&renamed);
                 let new_node = tamarin_term::lterm::LVar::new(
@@ -2785,7 +3291,7 @@ impl<'ctx> Reduction<'ctx> {
                     tamarin_term::lterm::LSort::Node,
                     next_node_idx,
                 );
-                next_node_idx += 1;
+                next_node_idx = next_node_idx.saturating_add(1);
                 sys.add_node(new_node.clone(), renamed.clone());
                 sys.add_edge(crate::constraint::constraints::Edge {
                     src: (new_node.clone(), c_idx),
@@ -2810,6 +3316,10 @@ impl<'ctx> Reduction<'ctx> {
                 // Reveal_ltk's !Ltk premise had no producer (root cause
                 // of NSLPK3-class FPs; see solver-memory bug #27).
                 if matches!(res, Ok(SolveOutcome::Linear(_))) {
+                    // Install variant constraints as SplitG (Haskell
+                    // `solveRuleConstraints`).  No-op when constrs is
+                    // None (intruder rules, or SplitG path disabled).
+                    sub.solve_rule_constraints(renamed_constrs.clone());
                     sub.exploit_prems(&new_node, &renamed);
                 }
                 let mut sys = sub.sys;
@@ -2920,7 +3430,7 @@ impl<'ctx> Reduction<'ctx> {
             && !crate::constraint::solver::sources::in_precompute_mode()
         {
             let avoid_max = bounds_max(&self.sys);
-            let mut next_node_idx = avoid_max + 1;
+            let mut next_node_idx = avoid_max.saturating_add(1);
             for ir in &self.ctx.intruder_rules {
                 if !crate::rule::is_destr_rule_info(&ir.info) { continue; }
                 let ru_inst = intr_rule_to_rule_ac_inst(ir.clone());
@@ -2943,7 +3453,7 @@ impl<'ctx> Reduction<'ctx> {
                     tamarin_term::lterm::LSort::Node,
                     next_node_idx,
                 );
-                next_node_idx += 1;
+                next_node_idx = next_node_idx.saturating_add(1);
                 sys_clone.add_node(new_node.clone(), ru_renamed.clone());
                 sys_clone.add_edge(crate::constraint::constraints::Edge {
                     src: c.clone(),
@@ -3072,7 +3582,9 @@ impl<'ctx> Reduction<'ctx> {
 
     /// `solveSplit` — perform a deferred equality-store split for
     /// `Goal::Split(id)`. Mirrors the relevant arm of Haskell's
-    /// `solveGoal`: `splitAtPos` followed by replacing the eq-store.
+    /// `solveGoal`: `splitAtPos` followed by replacing the eq-store
+    /// and running `simp` so the singleton disjunction folds into the
+    /// free substitution via `simpSingleton` + `applyEqStore`.
     pub fn solve_split_goal(
         &mut self,
         id: crate::tools::equation_store::SplitId,
@@ -3083,22 +3595,64 @@ impl<'ctx> Reduction<'ctx> {
         };
         if cases.is_empty() { return GoalCases::Contradictory; }
         let g = Goal::Split(id);
+        // After picking a case, run `simp_with_fresh` so the resulting
+        // singleton disjunction (the picked variant subst) folds into
+        // eq_store.subst via `simp_singleton` — matching Haskell's
+        // `solveSplit`'s `simp hnd substCheck store` call (Goals.hs:381).
+        // Without this the picked subst stays in the conjunction and
+        // never propagates to rule terms.
+        //
+        // The is_contr predicate is Haskell's `substCreatesNonNormalTerms hnd`:
+        // it drops variants where applying the variant subst to a
+        // maybe-non-NF subterm in the system produces a non-NF term.
+        // Critical for SplitG variant filtering (e.g. drop verify=sign(...)
+        // variants against a live Eq(verify, true) restriction).
+        let maude = self.ctx.maude.clone();
+        let sys_snapshot = self.sys.clone();
+        let has_reducible = !maude.maude_sig().reducible_fun_syms.is_empty()
+            && std::env::var("TAM_DISABLE_SUBST_NF").is_err();
+        let simplify_picked = |store: crate::tools::equation_store::EquationStore|
+            -> crate::tools::equation_store::EquationStore
+        {
+            if has_reducible {
+                let maude_ref = maude.clone();
+                let sys_ref = &sys_snapshot;
+                store.simp_with_fresh(
+                    |fs, vfs| crate::constraint::solver::contradictions::subst_creates_non_normal_terms(
+                        &maude_ref, sys_ref, fs, vfs,
+                    ),
+                    |n| maude.reserve_idxs(n),
+                )
+            } else {
+                store.simp_with_fresh(
+                    |_, _| false,
+                    |n| maude.reserve_idxs(n),
+                )
+            }
+        };
         if cases.len() == 1 {
-            self.sys.eq_store = cases.into_iter().next().unwrap();
+            self.sys.eq_store = simplify_picked(
+                cases.into_iter().next().unwrap());
             self.mark_goal_as_solved(&g);
+            // Push the resulting free subst back into the system.
+            self.subst_system();
             return GoalCases::Linear;
         }
         let mut out = Vec::with_capacity(cases.len());
         for (i, store) in cases.into_iter().enumerate() {
             let mut sys = self.sys.clone();
-            sys.eq_store = store;
+            sys.eq_store = simplify_picked(store);
             for (existing, status) in sys.goals.iter_mut() {
                 if existing == &g && !status.solved {
                     status.solved = true;
                     break;
                 }
             }
-            out.push((default_case_name(i), sys));
+            // Propagate variant subst into nodes/edges/goals for each
+            // case before saving.
+            let mut sub = Reduction::new(self.ctx, sys);
+            sub.subst_system();
+            out.push((default_case_name(i), sub.sys));
         }
         self.changed = ChangeIndicator::Changed;
         GoalCases::Cases(out)

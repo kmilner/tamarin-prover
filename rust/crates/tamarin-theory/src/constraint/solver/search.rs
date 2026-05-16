@@ -113,6 +113,7 @@ fn expand(
         eprintln!("[expand] enter budget={} sys.nodes={} goals={}",
             *budget, node.sys.nodes.len(), node.sys.goals.len());
     }
+    crate::state_trace::emit("expand", None, &node.sys);
     // Already terminal.
     if let Some(r) = is_finished(ctx, &node.sys) {
         node.method = ProofMethod::Finished(r.clone());

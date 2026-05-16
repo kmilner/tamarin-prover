@@ -19,41 +19,14 @@
 
 use crate::constraint::solver::reduction::{ChangeIndicator, Reduction};
 
-/// Mark the system contradictory via the eq-store *and* via gfalse in
-/// formulas.  Mirrors Haskell's `contradictoryIf True` semantics: in
-/// Haskell, hitting `contradictoryIf` in any CR-rule pass calls `mzero`,
-/// which removes the case from the surrounding `runReduction` Disj.
-/// Our port doesn't have monad-level mzero, so we have two markers:
-///
-///   - `gfalse` in `sys.formulas` — picked up by post-simplify
-///     `contradictions(ctx, sys)` as `FormulasFalse`, drives
-///     `is_finished` to return `Contradictory`.
-///   - `eq_store.is_false` — the simplify-time filter in
-///     `exec_proof_method`'s SolveGoal arm uses this as the Haskell-
-///     faithful proxy for mzero, dropping the case from the resulting
-///     case map so the proof tree mirrors Haskell's shape.
-///
-/// Use this helper at every CR-rule failure point that corresponds to a
-/// `contradictoryIf` in Haskell (`solveFactEqs` tag/arity mismatch,
-/// `solveRuleEqs` rInfo mismatch, `solveSubstEqs` failure, etc.).
+/// Thin wrapper around `Reduction::mark_contradictory` for backwards
+/// compatibility with the existing simplify-pass callsites.  See the
+/// method docstring for the contract — both `sys.formulas` (gfalse)
+/// and `eq_store.is_false` get set so the post-simplify
+/// `contradictions(ctx, sys)` and the SolveGoal-arm mzero proxy both
+/// fire.
 fn mark_contradictory(red: &mut Reduction) {
-    let bot = crate::guarded::gfalse();
-    let added_bot = if !red.sys.formulas.contains(&bot) {
-        red.sys.formulas.push(bot);
-        true
-    } else {
-        false
-    };
-    let flipped_eq = if !red.sys.eq_store.is_false() {
-        let s = std::mem::take(&mut red.sys.eq_store);
-        red.sys.eq_store = s.set_false();
-        true
-    } else {
-        false
-    };
-    if added_bot || flipped_eq {
-        red.changed = ChangeIndicator::Changed;
-    }
+    red.mark_contradictory();
 }
 
 /// `simplifySystem` — run all non-case-splitting CR-rules to a fixpoint.
@@ -101,14 +74,24 @@ pub fn simplify_system(red: &mut Reduction) {
         // — they don't have direct Haskell counterparts but are
         // necessary for our slightly-different data structures.
         let mut c = ChangeIndicator::Unchanged;
-        c = c.or(enforce_fresh_node_uniqueness_pass(r));
-        c = c.or(enforce_ku_action_uniqueness_pass(r));
-        c = c.or(enforce_kd_fact_uniqueness_pass(r));
-        c = c.or(enforce_edge_uniqueness_pass(r));
+        if std::env::var("TAM_OFF_FRESH_UNIQ").is_err() {
+            c = c.or(enforce_fresh_node_uniqueness_pass(r));
+        }
+        if std::env::var("TAM_OFF_KU_UNIQ").is_err() {
+            c = c.or(enforce_ku_action_uniqueness_pass(r));
+        }
+        if std::env::var("TAM_OFF_KD_UNIQ").is_err() {
+            c = c.or(enforce_kd_fact_uniqueness_pass(r));
+        }
+        if std::env::var("TAM_OFF_EDGE_UNIQ").is_err() {
+            c = c.or(enforce_edge_uniqueness_pass(r));
+        }
         c = c.or(solve_unique_actions_pass(r));
         c = c.or(reduce_formulas_pass(r));
         c = c.or(eval_formula_atoms_pass(r));
-        c = c.or(insert_implied_formulas_pass(r));
+        if std::env::var("TAM_OFF_IMPL").is_err() {
+            c = c.or(insert_implied_formulas_pass(r));
+        }
         c = c.or(enforce_fresh_ordering_pass(r));
         c = c.or(propagate_subterm_obvious(r));
         c = c.or(simp_injective_fact_eq_mon_pass(r));
@@ -124,6 +107,103 @@ pub fn simplify_system(red: &mut Reduction) {
     // sharing the same term.  Haskell runs this only in non-diff
     // mode, after the main loop, before `removeSolvedSplitGoals`.
     exploit_unique_msg_order(red);
+    // Post-loop: `addNonInjectiveFactInstances` (Simplify.hs:730-735).
+    // Haskell runs this AFTER `exploitUniqueMsgOrder` and
+    // `removeSolvedSplitGoals` in the non-diff branch of
+    // `simplifySystem`.  For every (j, k) pair where (j ≠ i, k) and
+    // both j and i (or k and j) have conflicting injective fact
+    // instances under appropriate reachability, add an InjectiveFacts
+    // LessAtom.  Without this step, our `simplify_system` is one CR-
+    // rule shy of Haskell's: a follow-up `Simplify` call on the same
+    // system would then add these atoms, accounting for the
+    // `case_check → simplify → by contradiction` pattern instead of
+    // `case_check → by contradiction` we see in lemmas like
+    // Loop_Start, Use_charn, Start_before_Loop.
+    add_non_injective_fact_instances(red);
+}
+
+/// Direct port of Haskell `addNonInjectiveFactInstances`
+/// (Simplify.hs:730-735): collects (smaller, larger) pairs from
+/// `nonInjectiveFactInstances` (Simplify.hs:686) and inserts each as
+/// `LessAtom(smaller, larger, InjectiveFacts)`.
+fn add_non_injective_fact_instances(red: &mut Reduction) {
+    use crate::constraint::constraints::{LessAtom, Reason};
+    let pairs = non_injective_fact_instances_pairs(red);
+    for (a, b) in pairs {
+        red.insert_less(LessAtom::new(a, b, Reason::InjectiveFacts));
+    }
+}
+
+/// Direct port of Haskell `Simplify.nonInjectiveFactInstances`
+/// (Simplify.hs:686-728) — returns the (j, i) or (k, j) less-relation
+/// pairs that should be added when injective facts are duplicated
+/// across the system.  Distinct from
+/// `Contradictions.nonInjectiveFactInstances` (used in our
+/// `contradictions::contradictions` to detect the *contradiction*
+/// case): the simplify variant infers a less-relation Haskell can
+/// use to make progress without contradicting yet.
+fn non_injective_fact_instances_pairs(
+    red: &Reduction,
+) -> Vec<(crate::constraint::constraints::NodeId,
+        crate::constraint::constraints::NodeId)> {
+    use crate::constraint::constraints::NodeId;
+    use std::collections::BTreeSet;
+    let sys = &red.sys;
+    let ctxt = red.ctx;
+    let mut out: Vec<(NodeId, NodeId)> = Vec::new();
+    // Injective fact tags from the proof context.
+    let inj_tags: BTreeSet<&crate::fact::FactTag> =
+        ctxt.injective_fact_insts.iter().map(|(t, _)| t).collect();
+    if inj_tags.is_empty() { return out; }
+
+    let lookup_node = |id: &NodeId| -> Option<&crate::rule::RuleACInst> {
+        sys.nodes.iter().find(|(n, _)| n == id).map(|(_, r)| r)
+    };
+    let non_unifiable_nodes = |i: &NodeId, j: &NodeId| -> bool {
+        let (Some(ri), Some(rj)) = (lookup_node(i), lookup_node(j))
+            else { return false };
+        match crate::rule::unifiable_rule_ac_insts(&ctxt.maude, ri, rj) {
+            Ok(true) => false,
+            Ok(false) => true,
+            Err(_) => false,
+        }
+    };
+    for e in &sys.edges {
+        let (i, conc_idx) = (e.src.0.clone(), e.src.1.clone());
+        let k = e.tgt.0.clone();
+        let i_rule = match lookup_node(&i) { Some(r) => r, None => continue };
+        let k_fa_prem = match i_rule.conclusions.get(conc_idx.0) {
+            Some(f) => f, None => continue,
+        };
+        if !inj_tags.contains(&k_fa_prem.tag) { continue; }
+        let k_term = match k_fa_prem.terms.first() {
+            Some(t) => t, None => continue,
+        };
+        let conflicting = |fa: &crate::fact::LNFact| -> bool {
+            fa.tag == k_fa_prem.tag && fa.terms.first() == Some(k_term)
+        };
+        for (j, j_rule) in &sys.nodes {
+            if j == &i || j == &k { continue; }
+            // Haskell's `guard (k ∈ reachableSet [j] less)` runs
+            // *before* the case dispatch — so we require it up-front.
+            if !sys.always_before(j, &k) { continue; }
+            let has_conflict = j_rule.premises.iter().any(conflicting)
+                || j_rule.conclusions.iter().any(conflicting);
+            if !has_conflict { continue; }
+            // checkRuleJK: j<k and nonUnifiable(j, i) — return (j, i)
+            if non_unifiable_nodes(j, &i) {
+                out.push((j.clone(), i.clone()));
+                continue;
+            }
+            // checkRuleIJ: i<j and nonUnifiable(k, j) — return (k, j)
+            // Haskell's IJ branch uses `D.reachableSet [i] less`; we
+            // mirror that with `i < j`.
+            if sys.always_before(&i, j) && non_unifiable_nodes(&k, j) {
+                out.push((k.clone(), j.clone()));
+            }
+        }
+    }
+    out
 }
 
 /// CR-rule *N6* — `exploitUniqueMsgOrder` (`Simplify.hs:163`).
@@ -196,34 +276,59 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
             partial_atom_valuation(&red.sys, &maude, a);
         let simp = simplify_guarded_with(&fm, &val);
         if simp == fm { continue; }
-        // Remove the original formula and insert the simplified one
-        // (skipping no-op trues to avoid re-decomposition cycles).
-        red.sys.formulas.retain(|f| f != &fm);
-        if simp != gtrue() {
-            if simp == gfalse() {
-                if !red.sys.formulas.contains(&simp) {
-                    red.sys.formulas.push(simp);
+        // Haskell `evalFormulaAtoms` (Simplify.hs:321-337):
+        //   case fm of
+        //     GDisj disj -> markGoalAsSolved "simplified" (DisjG disj)
+        //     _          -> return ()
+        //   modM sFormulas       $ S.delete fm
+        //   modM sSolvedFormulas $ S.insert fm
+        //   insertFormula fm'
+        //
+        // Critical: when the simplified formula was a `GDisj`, the
+        // corresponding `Goal::Disj` (registered when this formula was
+        // first decomposed via `insert_formula_decompose`) MUST be
+        // marked solved. Otherwise the goal stays open and the goal
+        // ranker picks it (typically a Disj-goal ranks BEFORE Premise
+        // by `solveFirst`), producing extra `case_N` steps where
+        // Haskell jumps straight to the Premise.
+        if let Guarded::Disj(items) = &fm {
+            let disj_goal = crate::constraint::constraints::Goal::Disj(
+                crate::constraint::constraints::Disj::new(items.clone()));
+            for (g, st) in red.sys.goals.iter_mut() {
+                if g == &disj_goal && !st.solved {
+                    st.solved = true;
+                    break;
                 }
-            } else if !red.sys.formulas.contains(&simp) {
-                // Move solved formula to the solved set so we don't
-                // re-simplify it forever.
-                red.sys.formulas.push(simp.clone());
             }
-            // Track the original as solved to mirror Haskell's
-            // `modM sSolvedFormulas $ S.insert fm`.
-            if !red.sys.solved_formulas.contains(&fm) {
-                red.sys.solved_formulas.push(fm);
-            }
-        } else {
-            // Simplified to gtrue — original is fully discharged.
-            if !red.sys.solved_formulas.contains(&fm) {
-                red.sys.solved_formulas.push(fm);
+        }
+        // Remove the original formula and route the simplified one
+        // through `insert_formula_decompose` — mirrors Haskell's
+        // `evalFormulaAtoms` (Simplify.hs:334-336):
+        //   modM sFormulas       $ S.delete fm
+        //   modM sSolvedFormulas $ S.insert fm
+        //   insertFormula fm'
+        //
+        // Critical: previously we pushed `simp` to `formulas` directly,
+        // bypassing `insertFormula`'s atom decomposition. When `simp`
+        // simplified to a bare `Atom(Last(k))`, the `last_atom` side
+        // effect of `insertAtom` was missed — leading to a vacuous
+        // Simplify step downstream where Haskell goes straight to
+        // Solve (injectivity_check class).
+        red.sys.formulas.retain(|f| f != &fm);
+        if !red.sys.solved_formulas.contains(&fm) {
+            red.sys.solved_formulas.push(fm);
+        }
+        if simp != gtrue() && simp != gfalse() {
+            // Route through decomposition to fire `insert_atom`
+            // side effects (Last → set sys.last_atom, etc).
+            red.insert_formula_decompose(simp);
+        } else if simp == gfalse() {
+            // Preserve the gfalse signal so contradictions catch it.
+            if !red.sys.formulas.contains(&simp) {
+                red.sys.formulas.push(simp);
             }
         }
         changed = ChangeIndicator::Changed;
-        // Also simplify any GDisj that disappeared into a known
-        // truth value: mirror Haskell's `markGoalAsSolved`.
-        let _ = (Guarded::Atom as fn(_) -> _,);
     }
     changed
 }
@@ -442,12 +547,35 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     use crate::guarded::{Guarded, Quant};
     use tamarin_parser::ast::Atom as AAtom;
 
+    // Mirror Haskell `impliedFormulas` (System.hs:1111-1121): `openGuarded gf`
+    // returns `Just (All, vs, antecedent, succedent)` for ANY `GGuarded All`
+    // formula — including those with empty `vs`.  Such empty-var universals
+    // can arise as residuals (e.g. `gall [] otherAtoms succedent` from a
+    // previous `impliedFormulas` round, or from a multi-guard formula whose
+    // bound vars have all been substituted away).  Previously we filtered
+    // `!vars.is_empty()` which excluded them entirely — a deviation from
+    // Haskell that left implications unfired.
+    // Task #157 provenance V1: at runtime (NOT in_precompute_mode),
+    // optionally skip universals from `[sources]`-tagged lemma bodies.
+    // Haskell only adds `[reuse]` to sLemmas (gatherReusableLemmas in
+    // Prover.hs:331), so its runtime `insertImpliedFormulas` never
+    // fires `[sources]`.  Refine fires them at precompute (drives
+    // typing-violation drops).  Default OFF because NSPK3 attack and
+    // typing-class lemmas rely on the runtime firing as a workaround
+    // for our weaker refine; skip enabled → search times out on those.
+    // Opt-in via TAM_PROVENANCE_SKIP_SOURCES=1 for Haskell-faithful
+    // runtime behaviour (requires stronger refine to compensate).
+    let skip_sources = std::env::var("TAM_PROVENANCE_SKIP_SOURCES").is_ok()
+        && !crate::constraint::solver::sources::in_precompute_mode()
+        && !red.sys.sources_lemma_universals.is_empty();
     let universals: Vec<(Guarded, Vec<tamarin_parser::ast::VarSpec>,
                          Vec<AAtom>, Guarded)> = red.sys.formulas.iter()
         .chain(red.sys.lemmas.iter())
         .filter_map(|f| match f {
-            Guarded::GGuarded { qua: Quant::All, vars, guards, body }
-                if !vars.is_empty() => {
+            Guarded::GGuarded { qua: Quant::All, vars, guards, body } => {
+                if skip_sources && red.sys.sources_lemma_universals.contains(f) {
+                    return None;
+                }
                 Some((f.clone(), vars.clone(), guards.clone(), (**body).clone()))
             }
             _ => None,
@@ -521,11 +649,25 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
         // Mirrors Haskell's `impliedFormulas`'s `prepare` partition
         // (`System.hs:1124-1126`): Action and Eq atoms drive matching,
         // everything else is carried as a non-Action precondition.
-        let driving_guards: Vec<&AAtom> = guards.iter()
-            .filter(|a| matches!(a,
-                AAtom::Action(_, _) | AAtom::Eq(_, _)))
+        //
+        // Haskell sorts driving guards via `sortGAtoms`
+        // (Guarded.hs:193-194): a stable partition placing Actions
+        // first, then Eqs.  `candidateSubsts` recurses through them
+        // in that order, so Action atoms bind universal vars BEFORE
+        // any Eq atom's `frees` check chooses pattern vs subject side.
+        // Without this ordering, an `Eq` whose pattern-vars are bound
+        // only AFTER a later Action would fail eagerly (both sides
+        // have unbound pattern vars → bail).  Preserve relative order
+        // within each group via a stable partition.
+        let action_guards: Vec<&AAtom> = guards.iter()
+            .filter(|a| matches!(a, AAtom::Action(_, _)))
             .collect();
-        if driving_guards.is_empty() { continue; }
+        let eq_guards: Vec<&AAtom> = guards.iter()
+            .filter(|a| matches!(a, AAtom::Eq(_, _)))
+            .collect();
+        let mut driving_guards: Vec<&AAtom> = Vec::new();
+        driving_guards.extend(action_guards);
+        driving_guards.extend(eq_guards);
         let other_guards: Vec<&AAtom> = guards.iter()
             .filter(|a| !matches!(a,
                 AAtom::Action(_, _) | AAtom::Eq(_, _)))
@@ -536,6 +678,14 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
         // guards (Less/Last/Subterm/Pred) become preconditions in the
         // implied formula's body wrapper — Haskell's
         //   succedent' = gall [] otherAtoms succedent.
+        //
+        // When `driving_guards` is empty, Haskell still emits one
+        // implied formula under the empty substitution — i.e.
+        // `unskolemizeLNGuarded $ applySkGuarded emptySubst succedent'`
+        // = `gall [] otherAtoms succedent`.  Previously we skipped this
+        // case; fall through to `try_match_all_guards` which (with
+        // empty guards) terminates immediately at `guard_idx == 0`
+        // and emits the implied body with `acc = emptySubst`.
         try_match_all_guards(
             &maude, vars, &driving_guards, &sys_actions, body,
             &red.sys.formulas, &red.sys.solved_formulas,
@@ -604,47 +754,35 @@ fn try_match_all_guards(
             // i.e. the implied formula is
             //   "(non-Action guards under σ) ⇒ σ(body)".
             //
-            // We mirror that here.  Three cases per non-Action guard:
-            //   - `Some(true)` → guard satisfied, drop it (it can be
-            //     omitted from the conditional).
-            //   - `Some(false)` → guard refutes this assignment; the
-            //     entire conditional becomes vacuously True so we
-            //     skip emitting any formula.
-            //   - `None` → guard's truth value is unknown; carry it
-            //     into the conditional so the body only fires once
-            //     the guard is later resolved.  Failing to carry it
-            //     would unsoundly assert the body without checking
-            //     the precondition.
-            let mut surviving_guards: Vec<crate::guarded::Guarded> = Vec::new();
-            for g in other_guards {
-                let g_subst = subst_atom(g, acc);
-                let v = partial_atom_valuation(sys, sys_maude, &g_subst);
-                match v {
-                    Some(true) => continue,
-                    Some(false) => return,
-                    None => surviving_guards.push(crate::guarded::Guarded::Atom(g_subst)),
-                }
-            }
+            // Haskell-faithful behaviour: carry ALL `other_guards`
+            // through the substitution and into the wrapping `gall`
+            // unconditionally — `impliedFormulas` does not do any
+            // partial-atom valuation here.  Atom valuation (dropping
+            // `Some(true)` guards, collapsing on `Some(false)`) is
+            // handled in a SEPARATE simplifier pass — `evalFormulaAtoms`
+            // — which mirrors Haskell's pass ordering exactly.
+            //
+            // Previous version filtered out `Some(true)` guards and
+            // aborted on `Some(false)`.  That is structurally different
+            // from Haskell: e.g. an emitted `gall [] [false_atom] body`
+            // here lets `evalFormulaAtoms` short-circuit to `gtrue` in
+            // its own pass, exposing trivially-true implications to
+            // the dedup logic in a Haskell-consistent way.
+            let _ = sys_maude; // unused — kept signature compatible
+            let surviving_atoms: Vec<tamarin_parser::ast::Atom> = other_guards.iter()
+                .map(|g| subst_atom(g, acc))
+                .collect();
             let body_subst = subst_guarded(body, acc);
-            // Build `surviving_guards ⇒ body` as a (closed) conditional
-            // formula.  A `Conj` of guards plus the body, wrapped as
-            // `Conj` simplifies to body when guards are empty.
-            let implied = if surviving_guards.is_empty() {
-                body_subst
-            } else {
-                // (g1 ∧ g2 ∧ ...) ⇒ body  =  ¬(g1 ∧ g2 ∧ ...) ∨ body
-                // Equivalently in guarded form: a `GGuarded(All, [], guards, body)`.
-                crate::guarded::Guarded::GGuarded {
-                    qua: crate::guarded::Quant::All,
-                    vars: Vec::new(),
-                    guards: surviving_guards.iter().filter_map(|g| {
-                        if let crate::guarded::Guarded::Atom(a) = g {
-                            Some(a.clone())
-                        } else { None }
-                    }).collect(),
-                    body: Box::new(body_subst),
-                }
-            };
+            // Mirror Haskell's `gall [] otherAtoms succedent` smart-
+            // constructor (Guarded.hs:447-451):
+            //   gall _ []   gf              = gf
+            //   gall _ _    gf | gf == gtrue = gtrue
+            //   gall ss atos gf             = GGuarded All ss atos gf
+            let implied = crate::guarded::gall(
+                Vec::new(),
+                surviving_atoms,
+                body_subst,
+            );
             // Maude unification mints fresh `~mw#N` witnesses on every
             // call, so structurally-identical derivations from the
             // same (restriction, action-node) pair would otherwise
@@ -1135,25 +1273,33 @@ fn normalise_less_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
 /// node ids via `solve_node_id_eqs`.
 fn enforce_fresh_node_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     use crate::rule::{ProtoRuleName, RuleInfo};
-    let subst = red.sys.eq_store.subst.clone();
-    // Collect (normalized conclusion term, node_id) for each Fresh-rule node.
-    let mut buckets: std::collections::BTreeMap<
-        tamarin_term::lterm::LNTerm,
-        Vec<crate::constraint::constraints::NodeId>,
-    > = std::collections::BTreeMap::new();
+    // Haskell-faithful (`Simplify.hs:220-230`): group by the raw
+    // `RuleACInst` — two Fresh-rule instances merge only if their
+    // full rule representations are syntactically identical.
+    // Previous implementation bucketed by `apply_vterm(eq_store, m)`
+    // which was strictly more aggressive than Haskell's
+    // `groupSortOn fst` on `ru :: RuleACInst`.  The post-subst key
+    // grouped Fresh-rules whose conclusions had been eq-store-equated
+    // even if their raw representations differed; Haskell waits for
+    // `substSystem` to propagate the eq-store INTO the rules first,
+    // so syntactic equality only catches genuinely-identical
+    // instances.  RuleACInst doesn't derive Ord/Hash, so we group
+    // with a linear scan (Fresh-rule count is small in practice).
+    let mut buckets: Vec<(crate::rule::RuleACInst,
+        Vec<crate::constraint::constraints::NodeId>)> = Vec::new();
     for (id, rule) in &red.sys.nodes {
         let is_fresh = matches!(&rule.info,
             RuleInfo::Proto(p) if p.name == ProtoRuleName::Fresh);
         if !is_fresh { continue; }
-        let Some(conc) = rule.conclusions.first() else { continue };
-        let Some(m) = conc.terms.first() else { continue };
-        // Apply the current free subst before bucketing so two Fresh
-        // nodes whose ~k vars have been unified end up in the same bucket.
-        let normalised = tamarin_term::subst::apply_vterm(&subst, m.clone());
-        buckets.entry(normalised).or_default().push(id.clone());
+        if let Some(slot) = buckets.iter_mut().find(|(r, _)| r == rule) {
+            slot.1.push(id.clone());
+        } else {
+            buckets.push((rule.clone(), vec![id.clone()]));
+        }
     }
     let mut changed = ChangeIndicator::Unchanged;
-    for (_m, ids) in buckets {
+    let mut hit_contra = false;
+    for (_rule, ids) in buckets {
         if ids.len() < 2 { continue; }
         let keep = ids[0].clone();
         let eqs: Vec<_> = ids.into_iter().skip(1)
@@ -1161,15 +1307,39 @@ fn enforce_fresh_node_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
                 lhs: keep.clone(), rhs: i,
             })
             .collect();
-        if let Ok(crate::constraint::solver::reduction::SolveOutcome::Linear(c)) =
-            red.solve_node_id_eqs(&eqs)
-        {
-            changed = changed.or(c);
+        // Haskell `enforceNodeUniqueness` freshRuleInsts branch
+        // (Simplify.hs:185) calls `solveNodeIdEqs` via the `merge`
+        // helper.  The monadic bind through `solveTermEqs` ends in
+        // `noContradictoryEqStore` (Reduction.hs:704) which fires
+        // mzero on `eqsIsFalse`.  Previously this site used
+        // `if let Ok(SolveOutcome::Linear(...))` which silently
+        // swallowed `Ok(Contradictory)` and `Err(_)`, so a Fresh-rule
+        // node id eqs that produced an mzero in Haskell stayed silent
+        // here — funnel both through `mark_contradictory` so the
+        // mzero proxy stays in sync.  `Cases(_)` is treated as success
+        // (matches the pattern in `enforce_ku_action_uniqueness_pass`).
+        let res = red.solve_node_id_eqs(&eqs);
+        match res {
+            Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)
+            | Err(_) => {
+                hit_contra = true;
+            }
+            Ok(_) => {
+                changed = changed.or(ChangeIndicator::Changed);
+            }
         }
         // Apply the unification through the system: replace ids in
         // nodes / edges / less / goals with the kept id.
+        // (Restored: this is non-Haskell-faithful — Haskell uses
+        // `solver = const $ return Unchanged` — but our impl needs it
+        // to keep `subst_system`'s loop from re-firing edges before
+        // they're propagated.  Test: TLS regression risk if removed.)
         apply_node_eqs(red, &eqs);
         changed = changed.or(ChangeIndicator::Changed);
+    }
+    if hit_contra {
+        mark_contradictory(red);
+        changed = ChangeIndicator::Changed;
     }
     changed
 }
@@ -1396,53 +1566,80 @@ fn has_funion_head(t: &tamarin_term::lterm::LNTerm) -> bool {
 fn enforce_kd_fact_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     use crate::constraint::constraints::NodeId;
     use crate::fact::FactTag;
+    use crate::rule::RuleACInst;
     use tamarin_term::lterm::LNTerm;
 
-    // Collect (node, term) for every KD-conc.  Skip duplicates
-    // within the same node (same node has at most one KD-conc by
-    // construction, but iterate defensively).
-    let mut kd_concs: Vec<(NodeId, LNTerm)> = Vec::new();
+    // Haskell-faithful (`Simplify.hs:183-187`): `enforceNodeUniqueness`
+    // kdConcs branch uses `(merge (solveRuleEqs SplitNow) kdConcs)`.
+    // The merger emits BOTH `solveRuleEqs` (full rule-instance
+    // equality) AND `solveNodeIdEqs`.  We previously only emitted
+    // `solve_node_id_eqs` — that was missing the rule-level
+    // unification of the merged KD-conc rules.
+    //
+    // Collect (node, rule, term) for every KD-conc.
+    let mut kd_concs: Vec<(NodeId, RuleACInst, LNTerm)> = Vec::new();
     for (id, rule) in &red.sys.nodes {
         for fa in &rule.conclusions {
             if matches!(fa.tag, FactTag::Kd) {
                 if let Some(m) = fa.terms.first() {
-                    kd_concs.push((id.clone(), m.clone()));
+                    kd_concs.push((id.clone(), rule.clone(), m.clone()));
                 }
             }
         }
     }
     if kd_concs.len() < 2 { return ChangeIndicator::Unchanged; }
     use std::collections::BTreeMap;
-    let mut by_term: BTreeMap<LNTerm, Vec<NodeId>> = BTreeMap::new();
-    for (i, m) in kd_concs {
-        by_term.entry(m).or_default().push(i);
+    let mut by_term: BTreeMap<LNTerm, Vec<(NodeId, RuleACInst)>> = BTreeMap::new();
+    for (i, r, m) in kd_concs {
+        by_term.entry(m).or_default().push((i, r));
     }
     let mut node_eqs: Vec<tamarin_term::rewriting::Equal<NodeId>> = Vec::new();
+    let mut rule_eqs: Vec<tamarin_term::rewriting::Equal<RuleACInst>> = Vec::new();
     for (_m, group) in by_term {
         if group.len() < 2 { continue; }
-        let keep = &group[0];
-        for rid in group.iter().skip(1) {
-            if rid != keep {
+        let (keep_id, keep_rule) = &group[0];
+        for (rid, rrule) in group.iter().skip(1) {
+            if rid != keep_id {
                 node_eqs.push(tamarin_term::rewriting::Equal {
-                    lhs: keep.clone(), rhs: rid.clone(),
+                    lhs: keep_id.clone(), rhs: rid.clone(),
+                });
+            }
+            if keep_rule != rrule {
+                rule_eqs.push(tamarin_term::rewriting::Equal {
+                    lhs: keep_rule.clone(), rhs: rrule.clone(),
                 });
             }
         }
     }
     node_eqs.retain(|e| e.lhs != e.rhs);
-    if node_eqs.is_empty() { return ChangeIndicator::Unchanged; }
-    // `if let Ok(_)` previously swallowed Ok(Contradictory) — surface
-    // it as gfalse so the next contradictions check picks it up.
-    // Haskell's `enforceKdFactUniqueness` propagates via monadic bind.
-    let res = red.solve_node_id_eqs(&node_eqs);
-    match res {
-        Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)
-        | Err(_) => {
-            mark_contradictory(red);
-            ChangeIndicator::Changed
-        }
-        Ok(_) => ChangeIndicator::Changed,
+    if node_eqs.is_empty() && rule_eqs.is_empty() {
+        return ChangeIndicator::Unchanged;
     }
+    let mut hit_contra = false;
+    if !rule_eqs.is_empty() {
+        // Haskell uses `solveRuleEqs SplitNow` for the kdConcs merger.
+        let res = red.solve_rule_eqs(
+            crate::constraint::solver::reduction::SplitStrategy::SplitNow,
+            &rule_eqs,
+        );
+        match res {
+            Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)
+            | Err(_) => hit_contra = true,
+            Ok(_) => {}
+        }
+    }
+    if !node_eqs.is_empty() {
+        let res = red.solve_node_id_eqs(&node_eqs);
+        match res {
+            Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)
+            | Err(_) => hit_contra = true,
+            Ok(_) => {}
+        }
+    }
+    if hit_contra {
+        mark_contradictory(red);
+    }
+    ChangeIndicator::Changed
 }
 
 /// CR-rule *S_fresh-order / freshOrdering*: enforce that the unique
@@ -1618,10 +1815,6 @@ fn apply_node_eqs(
     }
     red.sys.nodes = new_nodes;
     if shape_mismatch {
-        // Mark contradictory: mirrors Haskell `setNodes` →
-        // `solveRuleEqs` failure (Reduction.hs:751).  Two distinct
-        // rule instances at the same node id (different rInfos or
-        // mismatched fact-list lengths) is `contradictoryIf` → mzero.
         mark_contradictory(red);
     }
     if !rule_eqs.is_empty() {
@@ -1662,7 +1855,18 @@ fn apply_node_eqs(
         e.src.0 = rn(&e.src.0);
         e.tgt.0 = rn(&e.tgt.0);
     }
-    red.sys.edges.dedup();
+    // Full (non-adjacent) dedup: after renaming, edges that were
+    // distinct can collapse to identical pairs but won't be adjacent
+    // in the vector.  Vec::dedup() only removes *consecutive*
+    // duplicates, so without a sort+dedup the spurious copies survive
+    // and `enforce_edge_uniqueness_pass` then fires false-positive
+    // prem_idx_clash on them (e.g. TLS_Handshake: a single Fresh
+    // conclusion appears 3× feeding the same C_1.Fr premise after
+    // cumulative source-case grafts).
+    let mut tmp: Vec<_> = std::mem::take(&mut red.sys.edges);
+    tmp.sort();
+    tmp.dedup();
+    red.sys.edges = tmp;
     // Less atoms.
     for l in red.sys.less_atoms.iter_mut() {
         l.smaller = rn(&l.smaller);

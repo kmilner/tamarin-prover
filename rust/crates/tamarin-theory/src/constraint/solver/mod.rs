@@ -20,6 +20,7 @@ pub mod contradictions;
 pub mod goals;
 pub mod proof_method;
 pub mod reduction;
+pub mod rename_precise;
 pub mod search;
 pub mod simplify;
 pub mod sources;

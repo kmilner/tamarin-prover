@@ -129,28 +129,46 @@ where
     match (&l, &r) {
         (Term::Lit(Lit::Var(vl)), Term::Lit(Lit::Var(vr))) if vl == vr => Ok(()),
         (Term::Lit(Lit::Var(vl)), Term::Lit(Lit::Var(vr))) => {
-            // Maude emits a fresh witness at the narrower sub-sort for
-            // EVERY var-var pair (verified empirically — even
-            // `x:Msg idx 0 =? y:Msg idx 1` becomes
-            // `{x → ~mw:Msg w, y → ~mw:Msg w}`, not `y → x`).  The
-            // witness-heavy shape is what downstream eq-store /
-            // freshen_witness_range / subst-system expect.  When sorts
-            // are disjoint (Pub vs Fresh, etc.) no unifier exists.
+            // Var-var unification: orient to the narrower-sort
+            // variable (no `~mw` witness needed).
+            //
+            // For same-sort pairs (`Ordering::Equal`), pick by idx
+            // (lower → higher).  For cross-sort with strict order
+            // (Pub < Msg, Fresh < Msg, etc.), bind the broader-sorted
+            // var to the narrower-sorted one — this is sound because
+            // the unifier must lie in the intersection sort, which IS
+            // the narrower one.  No witness needed.
+            //
+            // The original witness-heavy form
+            // `{vl → ~mw, vr → ~mw}` was an over-mimicry of Maude
+            // that polluted downstream state — `less_atoms` carried
+            // witness LVars, `Fresh`-rule conclusions became
+            // `Fr(~mw:Fresh:N)`, and `enforce_fresh_node_uniqueness_pass`
+            // then bucketed by witness term and merged Fresh nodes
+            // that should have stayed distinct (the TLS_Handshake
+            // prem_idx_clash root cause).
             use std::cmp::Ordering;
-            let narrower_sort = match sort_compare(vl.sort, vr.sort) {
-                Some(Ordering::Equal) => vl.sort,
-                Some(Ordering::Greater) => vr.sort,
-                Some(Ordering::Less) => vl.sort,
-                None => return Err(UnifyError::NoUnifier),
-            };
-            let w = LVar {
-                name: "~mw".to_string(),
-                sort: narrower_sort,
-                idx: src.next(),
-            };
-            let wt: LTerm<C> = Term::Lit(Lit::Var(w));
-            eliminate(sort_of_const, acc, vl.clone(), wt.clone())?;
-            eliminate(sort_of_const, acc, vr.clone(), wt)
+            match sort_compare(vl.sort, vr.sort) {
+                Some(Ordering::Equal) => {
+                    let (from, to) = if vl.idx <= vr.idx {
+                        (vl.clone(), Term::Lit(Lit::Var(vr.clone())))
+                    } else {
+                        (vr.clone(), Term::Lit(Lit::Var(vl.clone())))
+                    };
+                    eliminate(sort_of_const, acc, from, to)
+                }
+                Some(Ordering::Greater) => {
+                    // vl > vr (vl is broader) → bind vl to vr.
+                    eliminate(sort_of_const, acc,
+                        vl.clone(), Term::Lit(Lit::Var(vr.clone())))
+                }
+                Some(Ordering::Less) => {
+                    // vl < vr (vr is broader) → bind vr to vl.
+                    eliminate(sort_of_const, acc,
+                        vr.clone(), Term::Lit(Lit::Var(vl.clone())))
+                }
+                None => Err(UnifyError::NoUnifier),
+            }
         }
         (Term::Lit(Lit::Var(vl)), _) => eliminate(sort_of_const, acc, vl.clone(), r.clone()),
         (_, Term::Lit(Lit::Var(vr))) => eliminate(sort_of_const, acc, vr.clone(), l.clone()),

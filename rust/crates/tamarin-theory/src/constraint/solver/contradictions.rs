@@ -63,13 +63,47 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
     }
     // Mirror Haskell's `rawLessRel = sLessAtoms ++ rawEdgeRel` —
     // every graph edge induces a strict ordering src < tgt, and the
-    // cyclic check has to fold both relations together. After
-    // `simplify_system` runs `subst_system`, all node ids are
-    // canonical, so we don't need to re-normalise here.
-    let mut all_less: Vec<LessAtom> = sys.less_atoms.clone();
+    // cyclic check has to fold both relations together.
+    //
+    // **Apply eq_store subst before cycle detection**.  Haskell's
+    // `cyclic` is called via `runReduction` which invariantly threads
+    // the eq-store's substitution through every node-id lookup; their
+    // `nodeConcNode` / `nodePremNode` resolve through `eqsSubst`
+    // implicitly.  Our `subst_system` propagates eq-store bindings to
+    // sys.edges / sys.less_atoms, but it isn't always called between
+    // every reduction step (e.g. between `solve_fact_eqs` and the next
+    // `contradictions(...)` call from `is_finished`).  When the
+    // eq-store binds `vr.X → ~mw.Y` but the system's edges still
+    // reference `vr.X`, the cyclic graph carries DOUBLE node identity
+    // for the same logical node — two distinct entries that should
+    // collapse, sometimes producing a spurious back-edge.
+    //
+    // Apply the eq-store's substitution to less.smaller / less.larger
+    // before walking, so the cyclic graph reflects the canonical
+    // node identity. Pure node-id lookups (LVar variable terms) — no
+    // term traversal needed.
+    use tamarin_term::lterm::LVar;
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    let subst = &sys.eq_store.subst;
+    let resolve = |v: &LVar| -> LVar {
+        let t = tamarin_term::subst::apply_vterm(
+            subst,
+            Term::Lit(Lit::Var(v.clone())),
+        );
+        if let Term::Lit(Lit::Var(w)) = t { w } else { v.clone() }
+    };
+    let mut all_less: Vec<LessAtom> = sys.less_atoms.iter().map(|l| LessAtom {
+        smaller: resolve(&l.smaller),
+        larger: resolve(&l.larger),
+        reason: l.reason,
+    }).collect();
     for e in &sys.edges {
-        all_less.push(LessAtom::from_edge(
-            crate::constraint::constraints::Reason::Adversary, e));
+        all_less.push(LessAtom {
+            smaller: resolve(&e.src.0),
+            larger: resolve(&e.tgt.0),
+            reason: crate::constraint::constraints::Reason::Adversary,
+        });
     }
     if cyclic(&all_less) { out.push(Contradiction::Cyclic); }
     // Sort-conflated LVars defence-in-depth: two LVars sharing
@@ -767,6 +801,92 @@ fn node_after_last(sys: &System) -> Vec<Contradiction> {
         .filter(|n| in_trace.contains(n))
         .map(|after| Contradiction::NodeAfterLast(last.clone(), after))
         .collect()
+}
+
+/// `maybeNonNormalTerms`: walk all node facts + new_vars in `sys`,
+/// returning every subterm that could be non-normal under some
+/// substitution.  Used by `subst_creates_non_normal_terms` below.
+/// Mirrors Haskell's `Contradictions.maybeNonNormalTerms`
+/// (Contradictions.hs:170-175).
+pub fn maybe_non_normal_terms(
+    sys: &System,
+    irreducible: &tamarin_term::function_symbols::FunSig,
+) -> Vec<tamarin_term::lterm::LNTerm> {
+    let mut candidates: std::collections::BTreeSet<tamarin_term::lterm::LNTerm>
+        = std::collections::BTreeSet::new();
+    for (_, rule) in &sys.nodes {
+        for f in rule.premises.iter().chain(&rule.conclusions).chain(&rule.actions) {
+            for t in &f.terms {
+                maybe_not_nf_subterms(irreducible, t, &mut candidates);
+            }
+        }
+        for t in &rule.new_vars {
+            maybe_not_nf_subterms(irreducible, t, &mut candidates);
+        }
+    }
+    candidates.into_iter().collect()
+}
+
+/// `substCreatesNonNormalTerms`: returns `true` if applying
+/// `vfresh_subst` to the system's `maybe-non-normal` terms (already
+/// substituted by `fsubst`) creates a non-normal-form term.  Used by
+/// `simp_minimize` to filter SplitG variants that would violate the
+/// nf-respecting trace semantics.  Mirrors Haskell's
+/// `Contradictions.substCreatesNonNormalTerms` (Contradictions.hs:177-184):
+///
+/// ```haskell
+/// substCreatesNonNormalTerms hnd sys fsubst =
+///     \subst -> any (not . nfApply subst) terms
+///   where terms = apply fsubst $ maybeNonNormalTerms hnd sys
+///         nfApply subst0 t = t == t' || nf' t' `runReader` hnd
+///           where tvars = freesList t
+///                 subst = restrictVFresh tvars subst0
+///                 t'    = apply (freshToFreeAvoidingFast subst tvars) t
+/// ```
+pub fn subst_creates_non_normal_terms(
+    maude: &tamarin_term::maude_proc::MaudeHandle,
+    sys: &System,
+    fsubst: &crate::tools::equation_store::LNSubst,
+    vfresh_subst: &crate::tools::equation_store::LNSubstVFresh,
+) -> bool {
+    use tamarin_term::subst::apply_vterm;
+    use tamarin_term::vterm::vars_vterm;
+    let sig = maude.maude_sig();
+    let irreducible = &sig.irreducible_fun_syms;
+    // Apply fsubst once upfront.
+    let terms: Vec<tamarin_term::lterm::LNTerm> = maybe_non_normal_terms(sys, irreducible)
+        .into_iter()
+        .map(|t| apply_vterm(fsubst, t))
+        .collect();
+    for t in &terms {
+        let tvars: Vec<tamarin_term::lterm::LVar> = vars_vterm(t);
+        if tvars.is_empty() { continue; }
+        let restricted = vfresh_subst.restrict(&tvars);
+        if restricted.dom().count() == 0 { continue; }
+        // Build a free subst from the restricted VFresh, allocating
+        // fresh idxs above the rest of the system.
+        let free_subst = restricted.fresh_to_free(|n| maude.reserve_idxs(n));
+        let t_prime = apply_vterm(&free_subst, t.clone());
+        // Fast path: if subst doesn't change the term, it's still NF.
+        if &t_prime == t { continue; }
+        // Slow path: call Maude.  If t_prime is in NF, this subst
+        // does NOT create non-normal terms (for this term).
+        match maude.reduce(&t_prime) {
+            Ok(t_red) => {
+                if t_red == t_prime { continue; }
+                // Reduced form differs from t_prime → not NF → CREATES.
+                return true;
+            }
+            Err(_) => {
+                // Be conservative: if Maude errored we don't know,
+                // assume the subst is OK (matches Haskell's behaviour
+                // where a runReader exception would propagate, but in
+                // practice Maude doesn't error on well-formed terms).
+                continue;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]

@@ -80,7 +80,12 @@ pub fn gconj(items: Vec<Guarded>) -> Guarded {
             x => out.push(x),
         }
     }
-    if out.len() == 1 { out.into_iter().next().unwrap() } else { Guarded::Conj(out) }
+    // Mirror Haskell `gconj`'s `nub gfs` (Guarded.hs:418).
+    let mut deduped: Vec<Guarded> = Vec::with_capacity(out.len());
+    for x in out {
+        if !deduped.contains(&x) { deduped.push(x); }
+    }
+    if deduped.len() == 1 { deduped.into_iter().next().unwrap() } else { Guarded::Conj(deduped) }
 }
 
 /// Walk a guarded formula and replace atoms whose truth value the
@@ -172,9 +177,16 @@ pub fn gdisj(items: Vec<Guarded>) -> Guarded {
             x => out.push(x),
         }
     }
-    if out.is_empty() { gfalse() }
-    else if out.len() == 1 { out.into_iter().next().unwrap() }
-    else { Guarded::Disj(out) }
+    // Mirror Haskell `gdisj`'s `nub gfs` (Guarded.hs:432).  Removes
+    // syntactic-equal duplicates while preserving order. Order-preserving
+    // dedup, like `Data.List.nub`.
+    let mut deduped: Vec<Guarded> = Vec::with_capacity(out.len());
+    for x in out {
+        if !deduped.contains(&x) { deduped.push(x); }
+    }
+    if deduped.is_empty() { gfalse() }
+    else if deduped.len() == 1 { deduped.into_iter().next().unwrap() }
+    else { Guarded::Disj(deduped) }
 }
 
 /// Smart `GGuarded(Ex, ...)` — direct port of Haskell's `gex`:

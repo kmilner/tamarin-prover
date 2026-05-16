@@ -89,6 +89,28 @@ pub struct System {
     /// routes Contradictory→Unfinishable when this flag is set,
     /// preserving soundness on the new applySource path.
     pub lost_conflation_case_apply_source: bool,
+    /// Set when a search branch consumed a source-case from a
+    /// precomputed `Source` whose case enumeration was truncated by
+    /// `TAM_MAX_CLOSURES_PER_SOURCE` (i.e. `Source.incomplete=true`).
+    /// `is_finished` must route Solved→Sorry in this case — the
+    /// dropped cases could contain attack witnesses we never enumerated.
+    /// Without this, the cap is unsound (denning_sacco::sessionsmatch
+    /// wrong-VERIFIED at cap=256).
+    pub used_incomplete_source: bool,
+    /// Provenance tracking (task #157): universals in `lemmas` that
+    /// came from `[sources]`-tagged lemma bodies.  Haskell never adds
+    /// these to `sLemmas` (only `[reuse]` lemmas go there via
+    /// `gatherReusableLemmas`), so its runtime `insertImpliedFormulas`
+    /// never fires them — they're only consulted via
+    /// `refineWithSourceAsms` at precompute.  We add them to `lemmas`
+    /// as a workaround for our weaker refine; tagging them here lets
+    /// `insertImpliedFormulas` skip them at runtime (when
+    /// `!in_precompute_mode`) while still firing them during refine's
+    /// Step 1 simplify (where it's needed to drop typing-violating
+    /// cases).  Matching Haskell's runtime behaviour eliminates the
+    /// spurious `case case_1`/`case case_2` Disj-decomposition steps
+    /// that appear in our proof trees for ~10 corpus lemmas.
+    pub sources_lemma_universals: Vec<Guarded>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Ord, PartialOrd, Hash)]

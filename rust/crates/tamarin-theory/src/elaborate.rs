@@ -311,20 +311,22 @@ fn elaborate_items(
                 }
             }
             p::TheoryItem::Equations { eqs, convergent } => {
-                // We'd like to convert to CtxtStRule, but that requires
-                // free-variable terms LNTerm. Convert each side via
-                // term_to_lnterm. On any conversion failure, attach a
-                // best-effort rewrite rule and continue.
+                // Port of Haskell `addEquationsM` (Theory.hs).
+                // Convert each LHS=RHS pair to a CtxtStRule via
+                // `rrule_to_ctxt_st_rule` and install it on the MaudeSig
+                // so Maude sees the rewrite rule in its `fmod MSG ...`
+                // module.  Convergent flag is stored as informational.
                 out.signature.maude_sig.eq_convergent = *convergent;
+                let mut s = out.signature.maude_sig.clone();
                 for eq in eqs {
-                    if let (Some(_l), Some(_r)) =
-                        (term_to_lnterm(&eq.lhs), term_to_lnterm(&eq.rhs)) {
-                        // Subterm rule construction needs Position info
-                        // — we skip CtxtStRule wiring for now and just
-                        // don't add the equation. Users wanting full
-                        // rewriting still get the function symbols.
+                    let (Some(l), Some(r)) =
+                        (term_to_lnterm(&eq.lhs), term_to_lnterm(&eq.rhs)) else { continue };
+                    let rrule = tamarin_term::rewriting::RRule::new(l, r);
+                    if let Some(ctxt) = tamarin_term::subterm_rule::rrule_to_ctxt_st_rule(&rrule) {
+                        s = s.add_ctxt_st_rule(ctxt);
                     }
                 }
+                out.signature.maude_sig = s.refresh();
             }
             p::TheoryItem::Macros(macros) => {
                 let mut ms = Vec::new();

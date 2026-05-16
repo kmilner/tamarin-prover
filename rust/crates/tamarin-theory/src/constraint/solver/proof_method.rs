@@ -63,6 +63,16 @@ pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
         // for the underlying search-completeness bugs that those
         // workarounds were masking.
         let _ = ctx;
+        // Soundness: a branch that consumed a precomputed source whose
+        // case enumeration was truncated (`used_incomplete_source=true`)
+        // can have its Contradictory poisoned by the dropped cases — a
+        // missing destructor-chain alternative may have been the
+        // actual witness path.  Convert to Unfinishable so the rollup
+        // emits Sorry rather than wrong-VERIFIED (for all-traces
+        // lemmas: Contradictory rolls up to Verified).
+        if sys.used_incomplete_source {
+            return Some(Result::Unfinishable);
+        }
         return Some(Result::Contradictory(Some(c)));
     }
     if std::env::var("TAM_DBG_IMPL").is_ok() {
@@ -96,7 +106,15 @@ pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
     use crate::constraint::solver::goals::open_goals;
     let no_open_goals = open_goals(sys).is_empty();
     let sub_finished = finished_subterms(ctx, sys);
-    if no_open_goals && sub_finished { Some(Result::Solved) }
+    if no_open_goals && sub_finished {
+        // A branch that consumed a source-case from an `incomplete`
+        // precomputed Source (i.e. one truncated by the closure cap)
+        // can't claim Solved — the dropped cases could have contained
+        // a counterexample.  Convert to Unfinishable so search reports
+        // Sorry instead of wrong-VERIFIED.
+        if sys.used_incomplete_source { Some(Result::Unfinishable) }
+        else { Some(Result::Solved) }
+    }
     else if no_open_goals && !sub_finished { Some(Result::Unfinishable) }
     else { None }
 }
@@ -216,9 +234,63 @@ pub fn exec_proof_method(
                 let t0 = std::time::Instant::now();
                 let mut r = Reduction::new(ctx, sys);
                 simplify_system(&mut r);
+                // Repeat until structurally stable: simplify_system's
+                // own while_changing only loops over the inner CR-rules
+                // — the post-loop steps (exploitUniqueMsgOrder,
+                // addNonInjectiveFactInstances) add state (LessAtom)
+                // that can enable CR-rule fire on the *next* outer
+                // pass.  Haskell exhibits the same non-idempotency but
+                // gets away with it because the search-Simplify call
+                // happens to discover the contradiction directly.  Loop
+                // up to 8 times — empirically converges in 1-2.
+                for _ in 0..8 {
+                    let before = r.sys.clone();
+                    r.changed = ChangeIndicator::Unchanged;
+                    simplify_system(&mut r);
+                    if r.sys == before { break; }
+                }
                 if dbg_solve {
                     eprintln!("[solve] simplify done {:?} (nodes={} goals={})",
                         t0.elapsed(), r.sys.nodes.len(), r.sys.goals.len());
+                }
+                // Haskell-faithful `cleanup` (`ProofMethod.hs:443-444`):
+                //   cleanup s = L.set sSubst emptySubst (renamePrecise s)
+                //
+                // After `simplifySystem` runs, the eq-store's substitution
+                // has been propagated through every part of the system by
+                // `substSystem`. Holding on to those bindings post-simplify
+                // means future eq-store additions (e.g. from a downstream
+                // applySource graft) re-chain stale precompute-time
+                // bindings into the live state — that's the orphan-witness
+                // class of bugs we hit on TLS_Handshake.  Haskell clears
+                // it; we should too.
+                //
+                // Haskell `cleanup` (ProofMethod.hs:443-444):
+                //   cleanup s = L.set sSubst emptySubst
+                //                       (Precise.evalFresh (renamePrecise s)
+                //                                          Precise.nothingUsed)
+                //
+                // `renamePrecise` walks every free LVar in deterministic
+                // order and rebinds each unique var to a freshly-numbered
+                // LVar keyed by name. Two systems differing only by
+                // variable numbering then compare equal — which is what
+                // `M.fromListWith` needs in `process` (ProofMethod.hs:440)
+                // to dedup variant-divergent cases.
+                //
+                // Variant-heavy rules (e.g. TWO's `Equality(revealVerify
+                // (...))` action) generate multiple unifiers that
+                // produce structurally-equivalent systems differing only
+                // by Maude-witness LVar indices.  Without renamePrecise,
+                // we keep them as separate cases (`TWO_case_1`,
+                // `TWO_case_2`, …) where Haskell shows a single `TWO`.
+                // `TAM_DISABLE_RENAME_PRECISE=1` opts out (diagnostic only).
+                if std::env::var("TAM_DISABLE_RENAME_PRECISE").is_err() {
+                    crate::constraint::solver::rename_precise::rename_precise_system(
+                        &mut r.sys);
+                }
+                if !r.sys.eq_store.is_false() {
+                    r.sys.eq_store.subst =
+                        tamarin_term::subst::Subst::from_list(Vec::new());
                 }
                 r.sys
             };
@@ -257,6 +329,8 @@ pub fn exec_proof_method(
                     eprintln!("[filter] goal={:?} case={:?} eqf={} contradictions={:?} keep={}",
                         g, name, sys.eq_store.is_false(), cs, r);
                 }
+                let op = if r { "case_keep" } else { "case_drop" };
+                crate::state_trace::emit_case(op, name, Some(&g), sys);
                 r
             };
             match outcome {
@@ -279,13 +353,28 @@ pub fn exec_proof_method(
                     // `groupSortOn casName` printing convention
                     // (e.g. `R_1_case_1`, `R_1_case_2` for two
                     // distinct unifications against rule `R_1`).
+                    //
+                    // The dedup must run on the *kept* cases only.  If
+                    // we count before `keep` and one of two `Create`
+                    // cases gets dropped (e.g. eq_store false after
+                    // simplify), we end up with a lone `Create_case_1`
+                    // where Haskell shows a bare `Create` — a pure
+                    // naming divergence with no proof-shape difference.
+                    // So: simplify + keep first, then dedup the
+                    // survivors.
                     use std::collections::HashMap;
+                    let kept: Vec<(String, System)> = cases.into_iter()
+                        .filter_map(|(name, sys)| {
+                            let s = simplify(sys);
+                            if keep(&s, &name) { Some((name, s)) } else { None }
+                        })
+                        .collect();
                     let mut counts: HashMap<String, usize> = HashMap::new();
-                    for (name, _) in &cases {
+                    for (name, _) in &kept {
                         *counts.entry(name.clone()).or_default() += 1;
                     }
                     let mut seen: HashMap<String, usize> = HashMap::new();
-                    for (name, sys) in cases.into_iter() {
+                    for (name, s) in kept.into_iter() {
                         let total = counts[&name];
                         let key = if total > 1 {
                             let n = seen.entry(name.clone()).or_default();
@@ -294,8 +383,7 @@ pub fn exec_proof_method(
                         } else {
                             name
                         };
-                        let s = simplify(sys);
-                        if keep(&s, &key) { out.insert(key, s); }
+                        out.insert(key, s);
                     }
                     Some(out)
                 }

@@ -563,7 +563,7 @@ fn corpus_verdict_match_coverage_probe() {
     if !tamarin_available() { return; }
 
     // Per-process global — set ONCE before parallel work so threads
-    // don't race on env writes.  Step budget (200) is the deterministic
+    // don't race on env writes.  Step budget (2000) is the deterministic
     // gate; 10s deadline is the wall-clock backstop.
     std::env::set_var("TAM_PROVE_DEADLINE_MS", "10000");
 
@@ -572,6 +572,12 @@ fn corpus_verdict_match_coverage_probe() {
         "loops", "csf23-subterms", "experiments", "regression",
         "ccs15", "classic", "features", "related_work",
         "post17", "cav13", "jcs18", "csf18-alethea",
+        // Added — small dirs with mostly-supported protocols.  csf17
+        // is 4 files all unexcluded; csf12 has a few simple ones.
+        "csf17", "csf12",
+        // testParser is parser-level fixtures; define.spthy is a tiny
+        // #ifdef preprocessor exercise.
+        "testParser",
     ];
 
     // Phase 1: collect candidate spthy paths (sequential — just I/O).
@@ -581,7 +587,12 @@ fn corpus_verdict_match_coverage_probe() {
         if !dir_path.exists() { continue; }
         for e in walkdir::WalkDir::new(&dir_path).max_depth(2).into_iter().filter_map(|e| e.ok()) {
             if e.path().extension().and_then(|s| s.to_str()) == Some("spthy") {
-                paths.push(e.path().to_path_buf());
+                // testParser/include uses #include which pulls in
+                // user-defined equations from sibling files; the
+                // builtin-filter on the entry file can't see them.
+                let p = e.path();
+                if p.to_string_lossy().contains("/testParser/include/") { continue; }
+                paths.push(p.to_path_buf());
             }
         }
     }
@@ -598,20 +609,14 @@ fn corpus_verdict_match_coverage_probe() {
     }
     let files: Vec<FileWork> = paths.par_iter().filter_map(|path| {
         let src = std::fs::read_to_string(path).ok()?;
-        // Skip files with USER-defined equational theories — we pass
-        // `functions:` decls through to sig-aware Maude (free symbols
-        // work fine), but user-supplied `equations:` clauses would
-        // need our AC-narrowing machinery which we don't fully model.
-        // Builtin equations (from `builtins: signing` etc.) are fine.
-        //
-        // Match both `equations:` and `equations [attrs]:` (Tamarin
-        // permits attribute brackets like `equations [convergent]:`)
-        // so we don't slip a file with custom AC theory past the
-        // filter — that previously bypassed us and produced a
-        // wrong-VERIFIED soundness regression on
-        // `denning_sacco_symmetric_cbc` whose `dec(enc(M,k),k) = M`
-        // equation we don't model.
-        if src.contains("\nequations:") || src.contains("\nequations [") { return None; }
+        // User-defined `equations:` declarations are wired through
+        // elaborate.rs → MaudeSig.st_rules → Maude module text.  The
+        // lastChainTerm filter + threaded closure cap (default 256)
+        // keep precompute under 200ms even with many destructors.
+        // Sources truncated by the cap are tagged `incomplete=true`;
+        // `is_finished` converts Solved→Unfinishable for any branch
+        // that consumed an incomplete source — preserving soundness
+        // (no wrong-VERIFIED).
         if src.contains("diff(") { return None; }
         if src.contains("macros:") || src.contains("predicates:") { return None; }
         if src.contains("process:") { return None; }
@@ -712,7 +717,23 @@ fn corpus_verdict_match_coverage_probe() {
             watchdog_handle.kill_subprocess();
         });
         let t0 = std::time::Instant::now();
-        let root_result = prove_lemma(w.theory, &w.lemma_name, h, 200);
+        // Budget 2000: the deadline (10s) is the real gate; budget
+        // gives slack so search isn't budget-bounded into a Sorry on
+        // healthy lemmas that just need a few more proof-method steps.
+        // Bumped from 200 after corpus probe showed several
+        // "INCOMPARABLE: Sorry" lemmas (NSLPK3::injective_agree,
+        // T&D::Responder_secrecy, TPM::exclusive_secrets) terminate
+        // correctly within 1-3 seconds at this budget.
+        // catch_unwind: pre-existing overflow panics at multiple
+        // bounds_max+1 sites in reduction.rs (task #151) surface on
+        // some corpus lemmas; without catch_unwind the whole rayon
+        // par_iter dies on the first panicking lemma.
+        let h_inner = h.clone();
+        let theory_ref = w.theory;
+        let lemma_name_inner = w.lemma_name.clone();
+        let root_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            prove_lemma(theory_ref, &lemma_name_inner, h_inner, 2000)
+        }));
         let elapsed = t0.elapsed();
         watchdog_done.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = watchdog.join();
@@ -727,7 +748,8 @@ fn corpus_verdict_match_coverage_probe() {
             eprintln!("SLOW: {}::{} took {:?}", fname, w.lemma_name, elapsed);
         }
         let root = match root_result {
-            Ok(r) => r, Err(_) => return LemmaOutcome::Incomparable,
+            Ok(Ok(r)) => r,
+            _ => return LemmaOutcome::Incomparable,
         };
         let our_verdict = match (&w.trace_quantifier, &root.status) {
             (TraceQuantifier::ExistsTrace, NodeStatus::Solved) => "verified",
@@ -773,6 +795,245 @@ fn corpus_verdict_match_coverage_probe() {
         for d in &diffs { eprintln!("  {}", d); }
     }
     // We don't *require* a match rate — this is a diagnostic.
+}
+
+/// **Corpus proof-skeleton match probe**: walks the same corpus dirs as
+/// `corpus_verdict_match_coverage_probe`, invokes `tamarin-prover --prove
+/// --output=<tmp>` once per file (so we get the rendered proof tree from
+/// Haskell), then for every verdict-matching lemma diffs our `render`ed
+/// `ProofNode` against tamarin's skeleton via `first_divergence`.
+///
+/// Reports `corpus structural-match: X/Y` where Y is the number of lemmas
+/// whose verdicts already agree (so structural divergence is reported
+/// *given* the verdict matches; mismatched-verdict lemmas are not
+/// included in either numerator or denominator).
+#[test]
+#[ignore = "diagnostic probe — task #150; run with --ignored"]
+fn corpus_proof_skeleton_match_probe() {
+    use rayon::prelude::*;
+    use tamarin_theory::constraint::solver::search::NodeStatus;
+    use tamarin_theory::prove::prove_lemma;
+    use tamarin_theory::proof_skeleton::{extract_from_haskell, first_divergence, render};
+
+    fn maude_path() -> Option<String> {
+        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
+        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
+        }
+        None
+    }
+    let mp = match maude_path() { Some(p) => p, None => return };
+    if !tamarin_available() { return; }
+
+    std::env::set_var("TAM_PROVE_DEADLINE_MS", "10000");
+
+    let corpus_root = std::path::PathBuf::from("/home/parallels/tamarin-prover/examples");
+    let target_dirs = [
+        "loops", "csf23-subterms", "experiments", "regression",
+        "ccs15", "classic", "features", "related_work",
+        "post17", "cav13", "jcs18", "csf18-alethea",
+        "csf17", "csf12",
+        "testParser",
+    ];
+
+    // Phase 1: collect candidate spthy paths.
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    for dir in &target_dirs {
+        let dir_path = corpus_root.join(dir);
+        if !dir_path.exists() { continue; }
+        for e in walkdir::WalkDir::new(&dir_path).max_depth(2).into_iter().filter_map(|e| e.ok()) {
+            if e.path().extension().and_then(|s| s.to_str()) == Some("spthy") {
+                let p = e.path();
+                if p.to_string_lossy().contains("/testParser/include/") { continue; }
+                paths.push(p.to_path_buf());
+            }
+        }
+    }
+
+    // Phase 2: per-file work. Same filtering as verdict probe, plus each
+    // file gets a unique `--output=` tmp path so rayon jobs don't race.
+    struct FileWork {
+        path: std::path::PathBuf,
+        theory: tamarin_parser::ast::Theory,
+        summary: String,
+        proof_text: String,
+        elab_sig: tamarin_term::maude_sig::MaudeSig,
+    }
+    let pid = std::process::id();
+    let files: Vec<FileWork> = paths.par_iter().enumerate().filter_map(|(idx, path)| {
+        let src = std::fs::read_to_string(path).ok()?;
+        if src.contains("diff(") { return None; }
+        if src.contains("macros:") || src.contains("predicates:") { return None; }
+        if src.contains("process:") { return None; }
+        if src.contains("builtins:") &&
+           (src.contains("diffie-hellman") || src.contains("multiset") ||
+            src.contains("xor") || src.contains("bilinear-pairing"))
+        { return None; }
+
+        let theory = tamarin_parser::parse_theory(&src, &[]).ok()?;
+        let out_path = format!("/tmp/proof_skel_corpus_{}_{}.spthy", pid, idx);
+        let tam_out = Command::new("timeout")
+            .arg("10s")
+            .arg("tamarin-prover")
+            .arg("--prove")
+            .arg(format!("--output={}", out_path))
+            .arg(path)
+            .output()
+            .ok()?;
+        let tam_text = String::from_utf8_lossy(&tam_out.stdout).into_owned();
+        let summary = extract_summary(&tam_text)?.to_string();
+        // The output file holds the rendered proof tree.  If tamarin
+        // timed out before writing it, skip the file.
+        let proof_text = std::fs::read_to_string(&out_path).ok()?;
+        let _ = std::fs::remove_file(&out_path);
+        let elab_sig = match tamarin_theory::elaborate::elaborate(&theory) {
+            Ok(e) => e.signature.maude_sig.clone(),
+            Err(_) => tamarin_term::maude_sig::pair_maude_sig(),
+        };
+        Some(FileWork { path: path.clone(), theory, summary, proof_text, elab_sig })
+    }).collect();
+
+    // Phase 3: flatten to per-lemma work.
+    struct LemmaWork<'a> {
+        path: &'a std::path::PathBuf,
+        theory: &'a tamarin_parser::ast::Theory,
+        elab_sig: &'a tamarin_term::maude_sig::MaudeSig,
+        proof_text: &'a str,
+        lemma_name: String,
+        trace_quantifier: tamarin_parser::ast::TraceQuantifier,
+        tamarin_verdict: &'static str,
+    }
+    let lemmas: Vec<LemmaWork> = files.iter().flat_map(|f| {
+        f.theory.items.iter().filter_map(move |it| {
+            let lemma = match it {
+                tamarin_parser::ast::TheoryItem::Lemma(l) => l, _ => return None,
+            };
+            let verdict_line = f.summary.lines()
+                .find(|l| l.contains(&format!("{} (", lemma.name)))?;
+            let tamarin_verdict = if verdict_line.contains("verified") {
+                "verified"
+            } else if verdict_line.contains("falsified") {
+                "falsified"
+            } else { return None };
+            Some(LemmaWork {
+                path: &f.path,
+                theory: &f.theory,
+                elab_sig: &f.elab_sig,
+                proof_text: &f.proof_text,
+                lemma_name: lemma.name.clone(),
+                trace_quantifier: lemma.trace_quantifier.clone(),
+                tamarin_verdict,
+            })
+        })
+    }).collect();
+
+    // Phase 4: per-lemma prove + diff in parallel.
+    use tamarin_parser::ast::TraceQuantifier;
+    #[derive(Clone)]
+    enum Outcome {
+        StructMatch,
+        StructDiff { file_lemma: String, line: usize, ours: String, theirs: String },
+        VerdictDiff(String),
+        Incomparable,
+        NoHaskellSkeleton(String),
+    }
+    let outcomes: Vec<Outcome> = lemmas.par_iter().map(|w| {
+        let h = match tamarin_term::maude_proc::MaudeHandle::start(&mp, w.elab_sig.clone()) {
+            Ok(h) => h, Err(_) => return Outcome::Incomparable,
+        };
+        let watchdog_handle = h.clone();
+        let watchdog_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchdog_done_clone = watchdog_done.clone();
+        let watchdog = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while std::time::Instant::now() < deadline {
+                if watchdog_done_clone.load(std::sync::atomic::Ordering::Relaxed) { return; }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            watchdog_handle.kill_subprocess();
+        });
+        // Catch panics — pre-existing overflow bugs in
+        // reduction.rs::bounds_max+1 sites surface on some corpus
+        // lemmas (tracked separately).  Without catch_unwind, one
+        // panicking lemma kills the whole rayon par_iter and the
+        // probe yields no number.
+        let h_for_prove = h.clone();
+        let theory_ref = w.theory;
+        let lemma_name = w.lemma_name.clone();
+        let root_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            prove_lemma(theory_ref, &lemma_name, h_for_prove, 2000)
+        }));
+        watchdog_done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = watchdog.join();
+        let root = match root_result {
+            Ok(Ok(r)) => r,
+            _ => return Outcome::Incomparable,
+        };
+        let our_verdict = match (&w.trace_quantifier, &root.status) {
+            (TraceQuantifier::ExistsTrace, NodeStatus::Solved) => "verified",
+            (TraceQuantifier::ExistsTrace, NodeStatus::Contradictory) => "falsified",
+            (TraceQuantifier::AllTraces, NodeStatus::Contradictory) => "verified",
+            (TraceQuantifier::AllTraces, NodeStatus::Solved) => "falsified",
+            _ => return Outcome::Incomparable,
+        };
+        let fname = w.path.file_name().unwrap().to_string_lossy().into_owned();
+        let file_lemma = format!("{}::{}", fname, w.lemma_name);
+        if our_verdict != w.tamarin_verdict {
+            return Outcome::VerdictDiff(file_lemma);
+        }
+        // Verdicts match — diff skeletons.
+        let theirs = match extract_from_haskell(w.proof_text, &w.lemma_name) {
+            Some(s) => s,
+            None => return Outcome::NoHaskellSkeleton(file_lemma),
+        };
+        let ours = render(&root);
+        match first_divergence(&ours, &theirs) {
+            None => Outcome::StructMatch,
+            Some((line, ol, tl)) => Outcome::StructDiff {
+                file_lemma, line, ours: ol, theirs: tl,
+            },
+        }
+    }).collect();
+
+    let mut struct_match = 0usize;
+    let mut struct_diff: Vec<String> = Vec::new();
+    let mut verdict_diff: Vec<String> = Vec::new();
+    let mut no_skel: Vec<String> = Vec::new();
+    let mut incomparable = 0usize;
+    for o in &outcomes {
+        match o {
+            Outcome::StructMatch => struct_match += 1,
+            Outcome::StructDiff { file_lemma, line, ours, theirs } => {
+                struct_diff.push(format!(
+                    "{} — diverge line {}: ours={:?} theirs={:?}",
+                    file_lemma, line, ours, theirs));
+            }
+            Outcome::VerdictDiff(s) => verdict_diff.push(s.clone()),
+            Outcome::NoHaskellSkeleton(s) => no_skel.push(s.clone()),
+            Outcome::Incomparable => incomparable += 1,
+        }
+    }
+    let verdict_matched = struct_match + struct_diff.len() + no_skel.len();
+    eprintln!("corpus structural-match: {}/{} (of verdict-matched lemmas; \
+              {} struct-divergent, {} verdict-divergent, {} no-haskell-skel, {} incomparable)",
+              struct_match, verdict_matched,
+              struct_diff.len(), verdict_diff.len(), no_skel.len(), incomparable);
+
+    if !verdict_diff.is_empty() {
+        eprintln!("verdict divergences:");
+        verdict_diff.sort();
+        for d in &verdict_diff { eprintln!("  {}", d); }
+    }
+    if !struct_diff.is_empty() {
+        eprintln!("structural divergences:");
+        struct_diff.sort();
+        for d in &struct_diff { eprintln!("  {}", d); }
+    }
+    if !no_skel.is_empty() {
+        eprintln!("no-haskell-skeleton (verdict still matched):");
+        no_skel.sort();
+        for d in &no_skel { eprintln!("  {}", d); }
+    }
 }
 
 /// Probe: TPM Exclusive_Secrets::left_reachable contradiction breakdown.
