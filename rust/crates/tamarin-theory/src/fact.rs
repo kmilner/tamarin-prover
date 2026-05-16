@@ -155,6 +155,27 @@ impl<T> Fact<T> {
     }
     pub fn is_ku(&self) -> bool { self.tag == FactTag::Ku }
     pub fn is_kd(&self) -> bool { self.tag == FactTag::Kd }
+    /// Mirrors Haskell `Theory.Model.Fact.isNoSourcesFact`
+    /// (Fact.hs:405-406): returns true iff this fact has the
+    /// `NoSources` annotation (set via `[no_sources]` on a fact).
+    /// Used by `safeGoal` to exclude premise solving during
+    /// saturate-time `solveAllSafeGoals`.
+    pub fn is_no_sources(&self) -> bool {
+        self.annotations.contains(&FactAnnotation::NoSources)
+    }
+}
+
+/// Mirrors Haskell `Theory.Model.Fact.isKDXorFact` (Fact.hs:241-243):
+/// returns true iff this is a KD-tagged fact whose single term is
+/// `xor`-headed.  Used by `safeGoal` and `isKDPrem` to exclude
+/// Xor-KD goals from saturate-time solving — Xor-KD goals are
+/// re-inserted directly by `insertAction` (Sources.hs:158-159).
+pub fn is_kd_xor_fact(fa: &LNFact) -> bool {
+    use tamarin_term::function_symbols::{FunSym, AcSym};
+    use tamarin_term::term::Term;
+    if fa.tag != FactTag::Kd || fa.terms.len() != 1 { return false; }
+    matches!(&fa.terms[0],
+        Term::App(FunSym::Ac(AcSym::Xor), _))
 }
 
 // =============================================================================

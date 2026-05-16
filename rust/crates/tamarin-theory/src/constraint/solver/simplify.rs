@@ -74,14 +74,17 @@ pub fn simplify_system(red: &mut Reduction) {
         // — they don't have direct Haskell counterparts but are
         // necessary for our slightly-different data structures.
         let mut c = ChangeIndicator::Unchanged;
+        // Haskell-faithful order (Simplify.hs:131): enforceNodeUniqueness
+        // returns (c1, c2, c3) = (fresh-DG4, KD-N5↓, KU-N5↑).
+        // Previously we ran KU before KD — order divergence.
         if std::env::var("TAM_OFF_FRESH_UNIQ").is_err() {
             c = c.or(enforce_fresh_node_uniqueness_pass(r));
         }
-        if std::env::var("TAM_OFF_KU_UNIQ").is_err() {
-            c = c.or(enforce_ku_action_uniqueness_pass(r));
-        }
         if std::env::var("TAM_OFF_KD_UNIQ").is_err() {
             c = c.or(enforce_kd_fact_uniqueness_pass(r));
+        }
+        if std::env::var("TAM_OFF_KU_UNIQ").is_err() {
+            c = c.or(enforce_ku_action_uniqueness_pass(r));
         }
         if std::env::var("TAM_OFF_EDGE_UNIQ").is_err() {
             c = c.or(enforce_edge_uniqueness_pass(r));

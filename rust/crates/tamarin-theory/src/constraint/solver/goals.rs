@@ -384,6 +384,20 @@ fn is_open_in_sys(g: &Goal, sys: &System) -> bool {
             }
             true
         }
+        // Haskell parity (Goals.hs:105):
+        //   SplitG idx -> splitExists (get sEqStore sys) idx
+        // A Split goal is only open if its split-id still exists
+        // in the eq-store.  Without this, stale split-ids appear
+        // as open goals after a split has been performed elsewhere.
+        Goal::Split(id) => sys.eq_store.split_exists(*id),
+        // Haskell parity (Goals.hs:106):
+        //   SubtermG st -> st `elem` posSubterms . sSubtermStore $ sys
+        // A Subterm goal is only open if its (small, big) pair is
+        // still in the positive-subterm list (not yet solved).
+        Goal::Subterm((small, big)) => {
+            sys.subterm_store.subterms.iter()
+                .any(|c| &c.small == small && &c.big == big)
+        }
         _ => true,
     }
 }

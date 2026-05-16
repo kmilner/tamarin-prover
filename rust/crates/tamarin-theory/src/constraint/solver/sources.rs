@@ -2317,8 +2317,16 @@ fn solve_all_safe_goals_tracked(
         let split_allowed = !any_chain_goal && any_unsolved_chain;
 
         // Classify goals into kd_prem (priority) and safe.
+        // Haskell parity (Sources.hs:169-170, 159):
+        //   isKDPrem (PremiseG _ fa,_) = isKDFact fa && not (isKDXorFact fa)
+        //   PremiseG _ fa -> not (isKUFact fa) && not (isKDXorFact fa)
+        //                     && not (isNoSourcesFact fa)
+        // Previously we excluded ALL KD premises (Ku | Kd) — too
+        // restrictive; Haskell solves non-Xor non-NoSources KD
+        // premises as safe goals.
         let is_kd_prem = |g: &Goal| -> bool {
-            matches!(g, Goal::Premise(_, fa) if fa.tag == FactTag::Kd)
+            matches!(g, Goal::Premise(_, fa)
+                if fa.tag == FactTag::Kd && !crate::fact::is_kd_xor_fact(fa))
         };
         let is_chain_prem1 = |g: &Goal| -> bool {
             matches!(g, Goal::Chain(_, (_, pi)) if pi.0 == 1)
@@ -2327,7 +2335,11 @@ fn solve_all_safe_goals_tracked(
             match g {
                 Goal::Chain(_, _) => chains_left > 0,
                 Goal::Action(_, fa) => !matches!(fa.tag, FactTag::Ku),
-                Goal::Premise(_, fa) => !matches!(fa.tag, FactTag::Ku | FactTag::Kd),
+                Goal::Premise(_, fa) => {
+                    !matches!(fa.tag, FactTag::Ku)
+                        && !crate::fact::is_kd_xor_fact(fa)
+                        && !fa.is_no_sources()
+                }
                 Goal::Disj(_) | Goal::Split(_) | Goal::Subterm(_) => split_allowed,
             }
         };
@@ -2637,8 +2649,11 @@ fn run_solve_all_safe_goals_disj(
         let any_chain_goal = goals.iter()
             .any(|(g, _)| matches!(g, Goal::Chain(_, _)));
         let split_allowed = !any_chain_goal && any_unsolved_chain;
+        // Haskell parity (Sources.hs:169-170, 159) — same fix as
+        // solve_all_safe_goals_tracked above.
         let is_kd_prem = |g: &Goal| -> bool {
-            matches!(g, Goal::Premise(_, fa) if fa.tag == FactTag::Kd)
+            matches!(g, Goal::Premise(_, fa)
+                if fa.tag == FactTag::Kd && !crate::fact::is_kd_xor_fact(fa))
         };
         let is_chain_prem1 = |g: &Goal| -> bool {
             matches!(g, Goal::Chain(_, (_, pi)) if pi.0 == 1)
@@ -2647,7 +2662,11 @@ fn run_solve_all_safe_goals_disj(
             match g {
                 Goal::Chain(_, _) => chains_left > 0,
                 Goal::Action(_, fa) => !matches!(fa.tag, FactTag::Ku),
-                Goal::Premise(_, fa) => !matches!(fa.tag, FactTag::Ku | FactTag::Kd),
+                Goal::Premise(_, fa) => {
+                    !matches!(fa.tag, FactTag::Ku)
+                        && !crate::fact::is_kd_xor_fact(fa)
+                        && !fa.is_no_sources()
+                }
                 Goal::Disj(_) | Goal::Split(_) | Goal::Subterm(_) => split_allowed,
             }
         };
