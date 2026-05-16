@@ -88,12 +88,11 @@ impl ProofContext {
                 &proto_rules);
         // Compute loop-breakers and annotate the protocol rules in
         // place — direct port of Haskell's `useAutoLoopBreakersAC`
-        // (`Theory.Tools.LoopBreakers`).  We approximate the dataflow
-        // relation using fact-tag matching (no Maude AC unification);
-        // a rule R_from feeds R_to.premIdx if some conclusion of
-        // R_from has the same tag as the premise.  Loop-breaker
-        // analysis runs on `(rule_name, prem_idx)` pairs.
-        annotate_loop_breakers(&mut rules);
+        // (`Theory.Tools.LoopBreakers`).  Edge `R_from → R_to.prem`
+        // exists iff some conclusion of `R_from` is Maude AC-unifiable
+        // with `R_to.prem`.  Loop-breaker analysis runs on
+        // `(rule_name, prem_idx)` pairs.
+        annotate_loop_breakers(&mut rules, &maude);
         // Compute rule variants — direct port of Haskell's
         // `variantsProtoRule` over every protocol rule.  For rules
         // containing reducible (destructor) sub-terms, Maude produces
@@ -344,7 +343,10 @@ impl ProofContext {
 /// 3. `dfs_loop_breakers` returns the set of `(rule_name, prem_idx)`
 ///    targets to mark — the premises whose goals should be tagged
 ///    loop-breaker.
-fn annotate_loop_breakers(rules: &mut [OpenProtoRule]) {
+fn annotate_loop_breakers(
+    rules: &mut [OpenProtoRule],
+    maude: &tamarin_term::maude_proc::MaudeHandle,
+) {
     use crate::rule::PremIdx;
     use crate::rule::ProtoRuleName;
 
@@ -377,9 +379,17 @@ fn annotate_loop_breakers(rules: &mut [OpenProtoRule]) {
                 continue;
             }
             for (i_from, ru_from) in rules.iter().enumerate() {
+                // Haskell `LoopBreakers.hs:53` calls
+                // `unifiableLNFacts concFaFresh premFa` (Maude AC-
+                // unifiability).  Calling Maude N×M times during
+                // precompute OOMs on large protocols (NSPK3, Minimal_*).
+                // Stick with fast-path tag equality for now; deeper
+                // Maude-AC dedup is a follow-up that would need a
+                // unification cache keyed by `(tag, normalized-shape)`.
                 let conc_match = ru_from.rule.conclusions.iter()
                     .any(|c| c.tag == prem_fa.tag);
                 if !conc_match { continue; }
+                let _ = maude;
                 for (from_prem_idx, _) in ru_from.rule.enumerate_premises() {
                     relation.push((
                         (keys[i_to].clone(), to_prem_idx),
