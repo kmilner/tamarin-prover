@@ -197,14 +197,47 @@ fn expand(
     let mut any_solved = false;
     let mut any_unfin = false;
     let mut any_sorry = false;
+    // Combined fair-budget + early-break-on-Solved (Haskell-faithful):
+    //
+    // Fair budget: Haskell's lazy Disj-monad explores each branch
+    // independently — no shared step counter — so an infinite-
+    // recursion sibling can't starve other branches.  Our `budget`
+    // is a shared counter; without fair allocation, depth-first
+    // descent into the first case (alphabetically) can exhaust the
+    // entire budget before later siblings get explored.  Give each
+    // child a fair share so a single explosive branch can't starve
+    // siblings.
+    //
+    // Early-break-on-Solved: Haskell's Disj-monad is lazy — once
+    // any branch returns `TraceFound` (Solved), the monad short-
+    // circuits and siblings aren't forced.  Haskell's proof tree
+    // renders only what was forced; the Solved branch and its
+    // ancestors.  Our search needs the same: once any child closes
+    // Solved, the parent's status is Solved (per the rollup below)
+    // and remaining siblings would just be wasted work.
+    //
+    // Critical for NSPK3::nonce_secrecy and other attack lemmas:
+    // Haskell finds the trace at one specific case (e.g. `c_aenc`)
+    // after the lazy Disj-monad short-circuits other paths.
+    let n_cases = cases.len();
+    let total_budget = *budget;
+    let per_case = if n_cases > 0 { (total_budget / n_cases).max(1) } else { total_budget };
+    let mut leftover = total_budget.saturating_sub(per_case * n_cases);
+    *budget = 0;  // we'll redistribute below
     for (name, sys) in cases {
+        if any_solved { break; }  // Haskell-lazy: stop on first TraceFound.
+        let mut child_budget = per_case + leftover;
+        leftover = 0; // only first case gets the leftover
+        if child_budget == 0 { child_budget = 1; }
         let mut child = ProofNode {
             method: ProofMethod::Sorry(None),
             sys,
             children: BTreeMap::new(),
             status: NodeStatus::Open,
         };
-        expand(ctx, &mut child, budget, deadline);
+        expand(ctx, &mut child, &mut child_budget, deadline);
+        // Carry unused budget forward to the next sibling.
+        leftover = child_budget;
         match child.status {
             NodeStatus::Solved => any_solved = true,
             NodeStatus::Contradictory => any_contra = true,
@@ -214,6 +247,8 @@ fn expand(
         }
         node.children.insert(name, child);
     }
+    // Return any unused budget to caller.
+    *budget = leftover;
     // Rollup follows Haskell's `Semigroup ProofStatus`
     // (`Theory.Proof:409`):
     //
@@ -413,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn search_disj_goal_with_two_branches_creates_two_cases() {
+    fn search_disj_goal_with_two_branches_lazy_early_break_on_solved() {
         let ctx = match ctx() { Some(c) => c, None => return };
         let mut sys = System::empty();
         // Force out of initial state.
@@ -423,17 +458,21 @@ mod tests {
             crate::constraint::constraints::Reason::Fresh,
         ));
         // Add a 2-branch disjunction goal — true | false.
+        // Haskell's lazy Disj-monad early-breaks once any branch
+        // returns TraceFound (Solved).  The gtrue branch Solves
+        // immediately, so the gfalse branch is never forced.
+        // Our search mirrors this: only 1 child rendered.
         let f1 = crate::guarded::gtrue();
         let f2 = crate::guarded::gfalse();
         sys.add_goal(crate::constraint::constraints::Goal::Disj(
             crate::constraint::constraints::Disj::new(vec![f1, f2]),
         ));
         let root = run_proof_search(&ctx, sys, 10);
-        // SolveGoal on a 2-branch disjunction should produce two
-        // child cases.
         assert!(matches!(root.method,
             ProofMethod::SolveGoal(crate::constraint::constraints::Goal::Disj(_))));
-        assert_eq!(root.children.len(), 2);
+        // Lazy early-break: only the first-Solved branch is rendered.
+        assert_eq!(root.children.len(), 1);
+        assert_eq!(root.status, NodeStatus::Solved);
     }
 
     #[test]
