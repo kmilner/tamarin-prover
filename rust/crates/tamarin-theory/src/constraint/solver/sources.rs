@@ -1818,9 +1818,6 @@ pub fn refine_with_source_asms(
     assumptions: &[crate::guarded::Guarded],
     ctx: &crate::constraint::solver::context::ProofContext,
 ) -> Vec<Source> {
-    use crate::constraint::solver::contradictions::contradictions;
-    use crate::constraint::solver::reduction::Reduction;
-    use crate::constraint::solver::simplify::simplify_system;
     if assumptions.is_empty() { return sources; }
 
     // Step 1: match Haskell's `updateSystem` (Sources.hs:466-468):
