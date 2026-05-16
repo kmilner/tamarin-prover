@@ -517,6 +517,51 @@ fn partial_atom_valuation(
             let _ = Term::Var as fn(_) -> _;
             None
         }
+        // Direct port of Haskell `partialAtomValuation` Subterm arm
+        // (Simplify.hs:399):
+        //   Subterm small big -> isTrueFalse reducible (Just sst) (small, big)
+        //
+        // We restrict to the subset of `isTrueFalse`-cases that work over
+        // ground-ish parser terms — the full Maude-backed AC recursion and
+        // nat-cycle logic are handled at `propagate_subterm_obvious` time;
+        // here we just need the cheap structural checks plus posSubterms /
+        // negSubterms membership so a lemma-formula atom can collapse to
+        // True/False before being inserted as a goal.
+        Atom::Subterm(small, big) => {
+            use crate::tools::subterm_store::elem_not_below_reducible;
+            use tamarin_term::lterm::{is_fresh_var, is_pub_var};
+            use tamarin_term::term::Term as LTerm;
+            use tamarin_term::vterm::Lit as LLit;
+            let small_lt = crate::elaborate::term_to_lnterm(small)?;
+            let big_lt = crate::elaborate::term_to_lnterm(big)?;
+            // small ⊏ small  -> False  (trivially-false)
+            if small_lt == big_lt { return Some(false); }
+            // small ⊏ Con _  -> False  (Haskell: SubtermStore.hs:347)
+            if let LTerm::Lit(LLit::Con(_)) = &big_lt { return Some(false); }
+            // small ⊏ Var (pub|fresh) -> False  (CR-rule S_invalid)
+            if is_pub_var(&big_lt) || is_fresh_var(&big_lt) { return Some(false); }
+            // small `redElem` big -> True  (small appears in big not below
+            // any reducible function symbol).
+            let reducible = &sys.subterm_store.contradictory; // placeholder
+            let _ = reducible;
+            // We don't carry MaudeSig here; pull reducible from the
+            // existing positive/negative-subterm membership only.
+            let pos = sys.subterm_store.subterms.iter()
+                .chain(sys.subterm_store.solved_subterms.iter())
+                .any(|c| c.small == small_lt && c.big == big_lt);
+            if pos { return Some(true); }
+            // negSubterms not yet ported into SubtermStore; Haskell's
+            // `isInside / isNegatedInside` check there is skipped.
+            //
+            // Reducible-syntactic check (redElem): port of Haskell's
+            // `small `redElem` big` line in `isTrueFalse`
+            // (SubtermStore.hs:342).
+            let reducible_syms = maude.maude_sig().reducible_fun_syms.clone();
+            if elem_not_below_reducible(&reducible_syms, &small_lt, &big_lt) {
+                return Some(true);
+            }
+            None
+        }
         _ => None,
     }
 }
