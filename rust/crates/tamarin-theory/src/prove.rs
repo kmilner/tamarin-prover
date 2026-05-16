@@ -103,34 +103,6 @@ pub fn prove_lemma(
         }
     }
 
-    // `[sources]`-tagged lemmas: in Haskell they only drive
-    // `refineWithSourceAsms` precompute and are NOT in `sFormulas`
-    // at runtime.  Our refine is weaker, so we route them into
-    // `sLemmas` (Haskell's same-named bucket — drives
-    // `insertImpliedFormulas` over `sFormulas ++ sLemmas` but does
-    // NOT enter `toIH` or appear as goals).  This keeps the
-    // typing-implication available at runtime without surfacing
-    // its body-Disj as `case_1`/`case_2` steps.
-    //
-    // Only for all-traces lemmas.  On exists-trace, the typing
-    // implication can prune required witness cases (e.g.
-    // Public_part_public).
-    let mut source_lemmas: Vec<Guarded> = Vec::new();
-    if matches!(lemma.trace_quantifier, crate::theory::TraceQuantifier::AllTraces) {
-        for prior in theory.lemmas() {
-            if prior.name == lemma_name { continue; }
-            if !prior.attributes.iter().any(|a| matches!(a, crate::theory::LemmaAttr::Sources)) {
-                continue;
-            }
-            if !matches!(prior.trace_quantifier, crate::theory::TraceQuantifier::AllTraces) {
-                continue;
-            }
-            if let Ok(rg) = formula_to_guarded(&prior.formula) {
-                source_lemmas.push(rg);
-            }
-        }
-    }
-
     // Bridge our typed `theory::TraceQuantifier` back to the parser's
     // `ast::TraceQuantifier` (which `formula_to_system` consumes).
     let tq = match lemma.trace_quantifier {
@@ -147,54 +119,15 @@ pub fn prove_lemma(
     // Haskell's `addLemmas`: push reuse lemmas into `sLemmas`. They
     // become drivers for `insertImpliedFormulas` (which iterates
     // `sFormulas ++ sLemmas`) but are excluded from `ginduct`.
-    sys.insert_lemmas(reuse_lemmas);
-    // [sources] lemmas: Haskell only uses them for precompute via
-    // `refineWithSourceAsms` — they do NOT appear in sLemmas at proof
-    // time (Haskell's `gatherReusableLemmas` Prover.hs:331 filters to
-    // `[reuse]` only).  Default OFF after task #167: with the
-    // goal-rank fix removing isFreshKnowsGoal from solveFirst (matching
-    // Haskell's smartRanking ProofMethod.hs:953 commented-out bin),
-    // runtime [sources] firing is no longer required for typing-class
-    // lemma verification.  ZERO mismatches in both modes; default OFF
-    // matches Haskell exactly.
     //
-    // `TAM_LEGACY_SOURCES_IN_LEMMAS=1` opts back in to the legacy
-    // workaround for diagnostic comparison (e.g. to recover lemmas
-    // that go Sorry-Incomparable under tight deadlines).
-    let _ = source_lemmas;
-    if std::env::var("TAM_LEGACY_SOURCES_IN_LEMMAS").is_ok() {
-        // insertLemma unwraps Conj-tops; mirror that here so
-        // sources_lemma_universals matches what ends up in sys.lemmas.
-        // Re-collect since we took source_lemmas out above.
-        let mut legacy_source_lemmas: Vec<Guarded> = Vec::new();
-        if matches!(lemma.trace_quantifier, crate::theory::TraceQuantifier::AllTraces) {
-            for prior in theory.lemmas() {
-                if prior.name == lemma_name { continue; }
-                if !prior.attributes.iter().any(|a| matches!(a, crate::theory::LemmaAttr::Sources)) {
-                    continue;
-                }
-                if !matches!(prior.trace_quantifier, crate::theory::TraceQuantifier::AllTraces) {
-                    continue;
-                }
-                if let Ok(rg) = formula_to_guarded(&prior.formula) {
-                    legacy_source_lemmas.push(rg);
-                }
-            }
-        }
-        fn flatten_conj(g: &crate::guarded::Guarded,
-                        out: &mut Vec<crate::guarded::Guarded>) {
-            match g {
-                crate::guarded::Guarded::Conj(items) => {
-                    for it in items { flatten_conj(it, out); }
-                }
-                other => out.push(other.clone()),
-            }
-        }
-        for s in &legacy_source_lemmas {
-            flatten_conj(s, &mut sys.sources_lemma_universals);
-        }
-        sys.insert_lemmas(legacy_source_lemmas);
-    }
+    // Note: `[sources]`-tagged lemmas are NOT added to sLemmas.
+    // Haskell's `gatherReusableLemmas` (Prover.hs:331) filters to
+    // `[reuse]` only; `[sources]` lemmas are consumed solely by
+    // `refineWithSourceAsms` at precompute time (called below at
+    // line ~210 via ctx.full_sources).  Coverage on typing-class
+    // lemmas (NSLPK3, chaum, foo, okamoto) depends on the
+    // architecture matching Haskell exactly — no workaround.
+    sys.insert_lemmas(reuse_lemmas);
 
     if trace { eprintln!("[phase] formula_to_system done; ProofContext::new start"); }
     // Bridge the elaborated theory's rules into the proof context.
