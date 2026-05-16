@@ -215,18 +215,33 @@ pub fn precompute_full_sources(
         // from chaining at runtime when applySource adds a new
         // abstract-var binding.
         let stable_vars = stable_vars_for_goal(&goal);
-        let normalize = |sys: System| -> System {
+        // Haskell `initialSource` runs `runReduction (instantiate)` whose
+        // `Disj` monad mzeros out any case whose embedded `contradictoryIf`
+        // fires inside `solveGoal` / `simplifySystem`.  Mirror that by
+        // running `simplify_system` then dropping cases that turn
+        // contradictory.  Without this, destructor-chain branches whose
+        // `Secret(I,R,x:Msg)` (or similar) is incompatible with a pre-
+        // existing fresh-binding survive precompute and produce stray
+        // `_case_2` siblings at runtime (Bug 2 from agent ab16c432c4c2).
+        let normalize_and_keep = |sys: System| -> Option<System> {
             let mut r = Reduction::new(ctx, sys);
             r.subst_system();
+            crate::constraint::solver::simplify::simplify_system(&mut r);
+            if r.sys.eq_store.is_false() { return None; }
+            if !crate::constraint::solver::contradictions::contradictions(ctx, &r.sys)
+                .is_empty()
+            { return None; }
             let mut s = r.sys;
             restrict_eq_store_to_stable_vars(&mut s, &stable_vars);
-            s
+            Some(s)
         };
-        let cases = match outcome {
-            GoalCases::Linear => vec![("only".into(), normalize(red.sys))],
-            GoalCases::LinearNamed(name) => vec![(name, normalize(red.sys))],
+        let cases: Vec<(String, System)> = match outcome {
+            GoalCases::Linear => normalize_and_keep(red.sys)
+                .map(|s| vec![("only".into(), s)]).unwrap_or_default(),
+            GoalCases::LinearNamed(name) => normalize_and_keep(red.sys)
+                .map(|s| vec![(name, s)]).unwrap_or_default(),
             GoalCases::Cases(systems) => systems.into_iter()
-                .map(|(name, s)| (name, normalize(s)))
+                .filter_map(|(name, s)| normalize_and_keep(s).map(|s| (name, s)))
                 .collect(),
             GoalCases::Contradictory => Vec::new(),
         };
@@ -288,18 +303,33 @@ pub fn precompute_full_sources(
         let outcome = red.solve_action_goal(&goal_node, &ku_fact);
         // Haskell `refineSource` restrict (Sources.hs:118-124).
         let stable_vars = stable_vars_for_goal(&goal);
-        let normalize = |sys: System| -> System {
+        // Haskell `initialSource` runs `runReduction (instantiate)` whose
+        // `Disj` monad mzeros out any case whose embedded `contradictoryIf`
+        // fires inside `solveGoal` / `simplifySystem`.  Mirror that by
+        // running `simplify_system` then dropping cases that turn
+        // contradictory.  Without this, destructor-chain branches whose
+        // `Secret(I,R,x:Msg)` (or similar) is incompatible with a pre-
+        // existing fresh-binding survive precompute and produce stray
+        // `_case_2` siblings at runtime (Bug 2 from agent ab16c432c4c2).
+        let normalize_and_keep = |sys: System| -> Option<System> {
             let mut r = Reduction::new(ctx, sys);
             r.subst_system();
+            crate::constraint::solver::simplify::simplify_system(&mut r);
+            if r.sys.eq_store.is_false() { return None; }
+            if !crate::constraint::solver::contradictions::contradictions(ctx, &r.sys)
+                .is_empty()
+            { return None; }
             let mut s = r.sys;
             restrict_eq_store_to_stable_vars(&mut s, &stable_vars);
-            s
+            Some(s)
         };
-        let cases = match outcome {
-            GoalCases::Linear => vec![("only".into(), normalize(red.sys))],
-            GoalCases::LinearNamed(name) => vec![(name, normalize(red.sys))],
+        let cases: Vec<(String, System)> = match outcome {
+            GoalCases::Linear => normalize_and_keep(red.sys)
+                .map(|s| vec![("only".into(), s)]).unwrap_or_default(),
+            GoalCases::LinearNamed(name) => normalize_and_keep(red.sys)
+                .map(|s| vec![(name, s)]).unwrap_or_default(),
             GoalCases::Cases(systems) => systems.into_iter()
-                .map(|(name, s)| (name, normalize(s)))
+                .filter_map(|(name, s)| normalize_and_keep(s).map(|s| (name, s)))
                 .collect(),
             GoalCases::Contradictory => Vec::new(),
         };

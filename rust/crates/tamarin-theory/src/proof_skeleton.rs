@@ -135,14 +135,14 @@ fn render_node(node: &ProofNode, indent: usize, out: &mut String) {
             match node.children.iter()
                 .find(|(_, c)| c.status == NodeStatus::Solved) {
                 Some((name, child)) => {
-                    // The `proof_method::exec_proof_method` dedup
-                    // appends `_case_N` when multiple cases share a
-                    // rule name.  After elision keeps only this one
-                    // child, the suffix is misleading: Haskell prints
-                    // a bare rule name when only one sibling survives.
-                    // Strip the suffix to match.
-                    let stripped = strip_dedup_suffix(name);
-                    vec![(stripped, child)]
+                    // Haskell's `extractSolved` (`Theory/Proof.hs:921-923`)
+                    // keeps the survivor's label verbatim — including any
+                    // `_case_N` dedup suffix appended by `uniqueListBy`
+                    // (ProofMethod.hs:441) when the goal originally had
+                    // multiple cases sharing a rule name.  We had been
+                    // stripping the suffix on the assumption Haskell did
+                    // the same; it does not.  Pass the name through.
+                    vec![(name.clone(), child)]
                 }
                 None => node.children.iter()
                     .map(|(n, c)| (n.clone(), c))
@@ -158,7 +158,6 @@ fn render_node(node: &ProofNode, indent: usize, out: &mut String) {
         render_node(children_to_render[0].1, indent, out);
         return;
     }
-    let _ = strip_dedup_suffix; // helper kept for the trace-found path
     // Render children. BTreeMap iterates in key order, which is the
     // stable canonical order we want for the diff.
     //
@@ -184,25 +183,6 @@ fn render_node(node: &ProofNode, indent: usize, out: &mut String) {
     }
     out.push_str(&pad_method);
     out.push_str("qed\n");
-}
-
-/// Strip a `_case_N` dedup suffix from a case name.  The suffix is
-/// added by `proof_method::exec_proof_method` when multiple cases
-/// share the same rule name (matching Haskell's `R_1_case_1` printer
-/// convention); after elision keeps only one such case, the suffix
-/// is misleading and Haskell prints the bare rule name.
-fn strip_dedup_suffix(name: &str) -> String {
-    // Walk backwards: an "_case_<digits>" suffix is just `_case_` +
-    // ASCII digits to end-of-string.
-    let bytes = name.as_bytes();
-    let mut i = bytes.len();
-    while i > 0 && bytes[i - 1].is_ascii_digit() { i -= 1; }
-    let digit_end = bytes.len();
-    let digit_start = i;
-    if digit_end > digit_start && i >= 6 && &bytes[i - 6..i] == b"_case_" {
-        return name[..i - 6].to_string();
-    }
-    name.to_string()
 }
 
 fn method_keyword(m: &ProofMethod) -> &'static str {
