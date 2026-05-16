@@ -1344,15 +1344,28 @@ fn saturate_out_premise(
         set_precompute_mode(false);
         let outcome = sub.solve_chain_goal(&c, &p);
         set_precompute_mode(true);
-        // Lightweight contradiction filter: drop branches whose
-        // eq-store flipped to false or formulas contain gfalse. This
-        // catches the cheap contradictions without paying for the full
-        // CR-rule simplify loop, which dominates precompute cost on
-        // protocols with deep chain-fold trees.
+        // Contradiction filter: drop branches whose post-solve state
+        // is contradictory.  Haskell's `solveAllSafeGoals` calls
+        // `contradictoryIf =<< gets contradictorySystem` between safe
+        // goals (Sources.hs:178); Disj-monad branches that contradict
+        // are mzero'd before the next safe-goal step.
+        //
+        // Without this, our DFS keeps every chain-extension combo
+        // including the ones that immediately contradict.  chaum
+        // B_1 had 85 closures where only ~1 is actually viable in
+        // Haskell because the other 84 contradict at the next step.
+        //
+        // Uses `contradictions()` directly (no full simplify pass) —
+        // that's the same check Haskell calls.  Full simplify is
+        // unnecessary here because we're inside close_chains_dfs's
+        // step-by-step iteration; the outer saturate runs simplify.
         let is_dead = |sys: &System| -> bool {
-            sys.eq_store.is_false()
-                || sys.formulas.iter().any(|f|
-                    matches!(f, crate::guarded::Guarded::Disj(v) if v.is_empty()))
+            use crate::constraint::solver::contradictions::contradictions;
+            if sys.eq_store.is_false() { return true; }
+            if sys.formulas.iter().any(|f|
+                matches!(f, crate::guarded::Guarded::Disj(v) if v.is_empty()))
+            { return true; }
+            !contradictions(ctx, sys).is_empty()
         };
         match outcome {
             GoalCases::Contradictory => Vec::new(),
