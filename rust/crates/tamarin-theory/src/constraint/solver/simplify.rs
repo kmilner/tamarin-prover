@@ -1180,7 +1180,12 @@ fn structural_match(
         }
         (Term::Lit(Lit::Var(pv)), Term::Lit(Lit::Var(sv))) => {
             // Non-pattern LVar — must match identically (subject is
-            // treated as a constant).
+            // treated as a constant).  Attempts to bind free non-pattern
+            // vars caused cascading new-implication generation (stack
+            // overflow on larger protocols); the parity-correct fix
+            // needs the universal's free vars to be Sk-constants
+            // (skolemised) before matching, not Maude-vars.  See
+            // agent a60950ef2370100e5 + the Destroy_charn deferred bug.
             pv == sv
         }
         (Term::Lit(Lit::Con(pn)), Term::Lit(Lit::Con(sn))) => pn == sn,
