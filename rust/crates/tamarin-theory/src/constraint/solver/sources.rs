@@ -2238,35 +2238,6 @@ fn saturate_sources_with_simp_opt(
     current
 }
 
-/// Port of Haskell's `solveAllSafeGoals` (`Sources.hs:144-225`).
-///
-/// Iteratively simplifies the system, then picks one "safe" goal to
-/// solve, repeating until no safe goal remains.  A goal is safe if:
-///   - `Chain(_, _)` and chains_left > 0
-///   - `Action(_, fa)` with `fa` NOT a KU fact
-///   - `Premise(_, fa)` with `fa` NOT a KU/KD-Xor/NoSources fact
-///   - `Disj` / `Split` / `Subterm` — only when split is allowed
-///     (no open chain goals AND there ARE unsolved-chain constraints
-///     in the system, per Haskell's `splitAllowed` flag)
-///
-/// KD-premise goals (and chain-prem-1 goals) take priority — they're
-/// solved first, ahead of other safe goals.  When a goal-solve produces
-/// multiple cases, we take the first case (best-effort saturation —
-/// the case-fork would otherwise blow up the source-case count).
-///
-/// This is what propagates [sources]-typing assumptions transitively:
-/// solving an open KD/Chain/Action goal grafts a producer rule,
-/// adding facts and equations that interact with the typing-universal
-/// formulas added by `refineWithSourceAsms` to detect contradictions.
-fn solve_all_safe_goals(
-    red: &mut crate::constraint::solver::reduction::Reduction,
-    ths: &[Source],
-    used: &mut std::collections::BTreeSet<String>,
-    chains_limit: i64,
-) {
-    let _ = solve_all_safe_goals_tracked(red, ths, used, chains_limit);
-}
-
 /// `SolveSaturateOutcome` distinguishes cases where saturate picked a
 /// Disj-goal (meaning any post-saturate contradiction might be from
 /// exploring one branch of a Disj where Haskell would have explored
