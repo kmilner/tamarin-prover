@@ -58,3 +58,9 @@ tags
 **/benchmark
 **/input
 
+# Claude Code session state + agent worktrees (local-only)
+.claude/
+
+# Rust probe scripts (experimental diagnostics, kept locally)
+rust/crates/tamarin-theory/examples/probe_*.rs
+
