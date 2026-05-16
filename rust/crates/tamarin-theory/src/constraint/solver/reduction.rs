@@ -466,16 +466,35 @@ impl<'ctx> Reduction<'ctx> {
         // contains `Rev(~k15) @ vr_14` — that's a soundness gap.
         let formula_subst = build_parser_subst_from_eq_store(&subst);
         if !formula_subst.is_empty() {
+            // Iterate per-formula until subst_guarded reaches a fixpoint
+            // — eq-store entries can form chains (e.g. `x:1 → x:13`,
+            // `x:13 → ~n:28`); a single application only reduces by one
+            // step.  Haskell's `substSystem` operates on a transitively-
+            // closed substitution by construction; our `compose` is
+            // closed at insert time but later `restrict_*` / cleanup
+            // passes can prune intermediate entries leaving a
+            // partially-applied formula-subst.  Bounded loop (16 steps)
+            // to defend against degenerate cycles.  Diagnosed by
+            // agent-a60950ef2370100e5 on Destroy_charn wrong-falsified.
+            let apply_to_fixpoint = |f: &Guarded| -> Guarded {
+                let mut cur = f.clone();
+                for _ in 0..16 {
+                    let nxt = crate::guarded::subst_guarded(&cur, &formula_subst);
+                    if nxt == cur { break; }
+                    cur = nxt;
+                }
+                cur
+            };
             for f in self.sys.formulas.iter_mut() {
-                let new_f = crate::guarded::subst_guarded(f, &formula_subst);
+                let new_f = apply_to_fixpoint(f);
                 if &new_f != f { *f = new_f; self.changed = ChangeIndicator::Changed; }
             }
             for f in self.sys.solved_formulas.iter_mut() {
-                let new_f = crate::guarded::subst_guarded(f, &formula_subst);
+                let new_f = apply_to_fixpoint(f);
                 if &new_f != f { *f = new_f; self.changed = ChangeIndicator::Changed; }
             }
             for f in self.sys.lemmas.iter_mut() {
-                let new_f = crate::guarded::subst_guarded(f, &formula_subst);
+                let new_f = apply_to_fixpoint(f);
                 if &new_f != f { *f = new_f; self.changed = ChangeIndicator::Changed; }
             }
         }
