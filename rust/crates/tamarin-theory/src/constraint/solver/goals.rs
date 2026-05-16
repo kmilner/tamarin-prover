@@ -16,10 +16,14 @@ use crate::constraint::system::System;
 /// `openGoals`: enumerate annotated goals still to be solved.
 ///
 /// Haskell iterates `M.toList $ get sGoals sys` in Goal-derived-Ord
-/// order; we use insertion-order to avoid a known interaction with
-/// the Sk-matcher fix that exposes wrong-falsified verdicts on
-/// Destroy_charn-class lemmas.  `goal_cmp` (dead-code-allow below)
-/// is the eventual landing once that interaction is resolved.
+/// order; we use insertion-order.  With the Sk-matcher port now in
+/// (commits 28567ab1 applySkAction + this commit's permissive
+/// structural_match), Goal-Ord wiring is the natural next parity step
+/// — but its interaction with the 10s corpus-probe deadline causes
+/// runtime-perf regressions (Destroy_charn, Device_Init_Use_Set) that
+/// verify with a 30s deadline.  Wire `goal_cmp` here when the corpus
+/// probe deadline can accommodate the deeper search Goal-Ord induces
+/// on those lemmas; `goal_cmp` is dead-code-allow below until then.
 pub fn open_goals(sys: &System) -> Vec<AnnotatedGoal> {
     let mut out = Vec::new();
     for (seq, (goal, status)) in sys.goals.iter().enumerate() {
