@@ -202,8 +202,13 @@ fn is_msg_one_case_goal(
     use crate::fact::FactTag;
     use tamarin_term::function_symbols::FunSym;
     use tamarin_term::term::Term;
+    // Haskell `isMsgOneCaseGoal` (ProofMethod.hs:1248-1250) routes
+    // through `msgPremise`, which is defined ONLY for `ActionG` (the
+    // KU-action arm).  Premise-side KU goals (rare — Goal::Premise with
+    // a KU fact) are excluded.  Mirror exactly to avoid spurious
+    // over-prioritisation of KU premises.
     let fa = match &a.goal {
-        Goal::Action(_, fa) | Goal::Premise(_, fa) => fa,
+        Goal::Action(_, fa) => fa,
         _ => return false,
     };
     if !matches!(fa.tag, FactTag::Ku) { return false; }
@@ -477,6 +482,16 @@ fn goal_usefulness(g: &Goal, looping: bool, sys: &System) -> Usefulness {
     if looping { return Usefulness::LoopBreaker; }
     if let Goal::Action(i, fa) = g {
         if fa.is_ku() {
+            // Haskell `hasKUGuards` (Goals.hs:118-122): if ANY system
+            // formula has a `KUFact`-tagged action atom in its guards
+            // (`KU(?) @ ?` quantifier-binding), every KU goal is
+            // **Useful** regardless of `currentlyDeducible` /
+            // `probablyConstructible` — those tests are SHORT-CIRCUITED.
+            // Typing-class IHs (`All m j. KU(m,j) ⇒ ...`) always have
+            // such guards; the order matters for proof-search bias.
+            if has_ku_guards(sys) {
+                return Usefulness::Useful;
+            }
             if let Some(m) = fa.terms.first() {
                 // Order matters — `currentlyDeducible` subsumes
                 // `probablyConstructible` for Pub/Nat-only terms but
@@ -491,6 +506,44 @@ fn goal_usefulness(g: &Goal, looping: bool, sys: &System) -> Usefulness {
         }
     }
     Usefulness::Useful
+}
+
+/// Port of Haskell `hasKUGuards` (`Goals.hs:118-122`):
+///
+/// ```haskell
+/// hasKUGuards = any (any ((KUFact ==) . factTag) . guardFactTags) (S.toList $ get sFormulas sys)
+/// ```
+///
+/// True iff any guarded formula in `sys.formulas` has a `KU`-tagged
+/// fact atom in its guard list.  Conservative: walks every formula
+/// recursively, surfacing fact tags from inside `GGuarded`/`GAtom`/
+/// `Conj`/`Disj` structures.
+fn has_ku_guards(sys: &System) -> bool {
+    use crate::fact::FactTag;
+    use crate::guarded::Guarded;
+    use tamarin_parser::ast::Atom;
+    fn walk_guards(g: &Guarded) -> bool {
+        match g {
+            Guarded::GGuarded { guards, body, .. } => {
+                for atom in guards {
+                    if let Atom::Action(fa, _) = atom {
+                        // Parser-fact: tag is KU iff name == "KU" (and
+                        // arity 1, but the simple name match is enough
+                        // for the heuristic; the goal-rank step is a
+                        // soft hint, not a soundness gate).
+                        if fa.name == "KU" { return true; }
+                    }
+                }
+                walk_guards(body)
+            }
+            Guarded::Conj(items) | Guarded::Disj(items) => items.iter().any(walk_guards),
+            Guarded::Atom(Atom::Action(fa, _)) => fa.name == "KU",
+            Guarded::Atom(_) => false,
+        }
+    }
+    let _ = FactTag::Ku;
+    sys.formulas.iter().any(walk_guards)
+        || sys.lemmas.iter().any(walk_guards)
 }
 
 /// `currentlyDeducible i m` — direct port of Haskell's
