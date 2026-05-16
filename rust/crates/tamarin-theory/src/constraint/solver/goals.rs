@@ -15,17 +15,24 @@ use crate::constraint::system::System;
 
 /// `openGoals`: enumerate annotated goals still to be solved.
 ///
-/// **Note**: Haskell iterates `M.toList $ get sGoals sys` in
-/// Goal-key sorted order; we iterate `sys.goals: Vec<...>` in
-/// insertion order.  An attempt to switch to a `format!("{:?}", goal)`
-/// proxy sort caused soundness regressions on
-/// `Minimal_Create_Use_Destroy::Destroy_charn` and
-/// `RFID_Simple::Device_Init_Use_Set` — Debug format isn't byte-exact
-/// to Haskell's derived `Ord`, and the divergence cascades into
-/// wrong-falsified verdicts.  A faithful Goal-Ord port would need
-/// careful matching of Haskell's structural ordering on `LNFact` /
-/// `LVar` / `Guarded`; tracked but deferred (see proof-skel agent
-/// ab2c62748a04212ba's diagnosis on Minimal_Loop_Example::Stop_unique).
+/// **Note**: Haskell iterates `M.toList $ get sGoals sys` in Goal-Ord
+/// order; we iterate `sys.goals: Vec<...>` in insertion order.  Agent
+/// ab2c62748a04212ba diagnosed this as the root cause of several
+/// proof-skeleton divergences (e.g. Stop_unique premature `cyclic`).
+///
+/// Two attempts at Haskell-faithful sort have both regressed verdict
+/// on `Minimal_Create_Use_Destroy::Destroy_charn` and
+/// `RFID_Simple::Device_Init_Use_Set` from `matched` to `wrong-
+/// falsified` (under both `format!("{:?}", goal)` sort and a manual
+/// structural `goal_cmp` matching Haskell's derived `Ord Goal`).  The
+/// pattern: switching to Haskell's goal-pick order exposes a
+/// downstream bug that produces a spurious "counterexample" for an
+/// all-traces lemma Haskell verifies.  Both regressions are NET-
+/// negative against Haskell parity — Haskell verifies, we say
+/// falsified.  A faithful fix needs both Goal-Ord *and* a fix for
+/// whatever pipeline divergence the new order surfaces.  Reverted
+/// pending that investigation.  See `goal_cmp` below for the manual
+/// structural compare we tried.
 pub fn open_goals(sys: &System) -> Vec<AnnotatedGoal> {
     let mut out = Vec::new();
     for (seq, (goal, status)) in sys.goals.iter().enumerate() {
@@ -35,6 +42,47 @@ pub fn open_goals(sys: &System) -> Vec<AnnotatedGoal> {
         out.push(AnnotatedGoal::new(goal.clone(), seq as u64, u));
     }
     out
+}
+
+/// **NOT WIRED IN** — see `open_goals` note.  Manual structural compare
+/// on `Goal`, mirroring Haskell's derived `Ord Goal`.  Variant tags
+/// follow Haskell declaration order: Action < Chain < Premise < Disj
+/// < Subterm < Split.  Kept available for follow-up investigation
+/// once the downstream verdict regressions can be isolated.
+#[allow(dead_code)]
+fn goal_cmp(a: &Goal, b: &Goal) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let tag = |g: &Goal| -> u8 {
+        match g {
+            Goal::Action(_, _) => 0,
+            Goal::Chain(_, _) => 1,
+            Goal::Premise(_, _) => 2,
+            Goal::Disj(_) => 3,
+            Goal::Subterm(_) => 4,
+            Goal::Split(_) => 5,
+        }
+    };
+    let ta = tag(a);
+    let tb = tag(b);
+    if ta != tb { return ta.cmp(&tb); }
+    match (a, b) {
+        (Goal::Action(la, fa), Goal::Action(lb, fb)) =>
+            la.cmp(lb).then_with(|| fa.cmp(fb)),
+        (Goal::Chain(ca, pa), Goal::Chain(cb, pb)) =>
+            (&ca.0, ca.1.0).cmp(&(&cb.0, cb.1.0))
+                .then_with(|| (&pa.0, pa.1.0).cmp(&(&pb.0, pb.1.0))),
+        (Goal::Premise(pa, fa), Goal::Premise(pb, fb)) =>
+            (&pa.0, pa.1.0).cmp(&(&pb.0, pb.1.0))
+                .then_with(|| fa.cmp(fb)),
+        (Goal::Disj(da), Goal::Disj(db)) => {
+            da.0.len().cmp(&db.0.len()).then_with(||
+                format!("{:?}", da).cmp(&format!("{:?}", db)))
+        }
+        (Goal::Subterm((sa, ta_)), Goal::Subterm((sb, tb_))) =>
+            sa.cmp(sb).then_with(|| ta_.cmp(tb_)),
+        (Goal::Split(sa), Goal::Split(sb)) => sa.cmp(sb),
+        _ => Ordering::Equal,
+    }
 }
 
 /// Plain (non-annotated) open goals.
