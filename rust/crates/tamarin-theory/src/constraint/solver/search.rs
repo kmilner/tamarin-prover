@@ -157,7 +157,7 @@ fn expand(
         eprintln!("[expand] candidates: {:?}", names);
     }
     let (method, cases) = {
-        let mut pick: Option<(ProofMethod, BTreeMap<String, System>)> = None;
+        let mut pick: Option<(ProofMethod, Vec<(String, System)>)> = None;
         for m in candidates {
             if dbg_expand {
                 let name: String = format!("{:?}", m).chars().take(40).collect();

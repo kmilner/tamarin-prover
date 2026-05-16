@@ -174,20 +174,28 @@ fn finished_subterms(ctx: &ProofContext, sys: &System) -> bool {
 }
 
 /// Execute a proof method against `sys`, returning the resulting
-/// case map. `Sorry` / `Finished` produce empty cases; `Simplify`
-/// runs `simplify_system` and returns one case; `SolveGoal(g)`
-/// dispatches via `solve_*_goal` and converts `GoalCases` to a case
-/// map. `Induction` is left as a stub.
+/// case list IN INSERTION ORDER. `Sorry` / `Finished` produce empty
+/// cases; `Simplify` runs `simplify_system` and returns one case;
+/// `SolveGoal(g)` dispatches via `solve_*_goal` and converts
+/// `GoalCases` to a case list. `Induction` is left as a stub.
+///
+/// **Order matters**: Haskell's `disjunctionOfList` and the
+/// downstream `runReduction` preserve the order of rules /
+/// destructors as iterated in `joinAllRules` / saturate output.
+/// Returning `Vec` (not `BTreeMap`) preserves that order so the
+/// search explores cases in Haskell's same order, allowing the
+/// `case c_aenc`-style trace-found paths to be reached without
+/// being starved by alphabetically-earlier siblings.
 pub fn exec_proof_method(
     ctx: &ProofContext,
     method: &ProofMethod,
     sys: &System,
-) -> Option<BTreeMap<CaseName, System>> {
+) -> Option<Vec<(CaseName, System)>> {
     use crate::constraint::solver::reduction::{ChangeIndicator, GoalCases, Reduction};
     use crate::constraint::solver::simplify::simplify_system;
 
     match method {
-        ProofMethod::Sorry(_) | ProofMethod::Finished(_) => Some(BTreeMap::new()),
+        ProofMethod::Sorry(_) | ProofMethod::Finished(_) => Some(Vec::new()),
         ProofMethod::Invalidated => None,
         ProofMethod::Simplify => {
             let mut r = Reduction::new(ctx, sys.clone());
@@ -197,9 +205,7 @@ pub fn exec_proof_method(
             // identical system, it failed — return None so the
             // search picks something else (or marks Sorry).
             if r.sys == *sys { return None; }
-            let mut out = BTreeMap::new();
-            out.insert("".to_string(), r.sys);
-            Some(out)
+            Some(vec![("".to_string(), r.sys)])
         }
         ProofMethod::SolveGoal(g) => {
             let dbg_solve = std::env::var("TAM_DBG_SOLVE").is_ok();
@@ -336,18 +342,17 @@ pub fn exec_proof_method(
             match outcome {
                 GoalCases::Linear => {
                     let s = simplify(r.sys);
-                    let mut out = BTreeMap::new();
-                    if keep(&s, "") { out.insert("".to_string(), s); }
+                    let mut out = Vec::new();
+                    if keep(&s, "") { out.push(("".to_string(), s)); }
                     Some(out)
                 }
                 GoalCases::LinearNamed(name) => {
                     let s = simplify(r.sys);
-                    let mut out = BTreeMap::new();
-                    if keep(&s, &name) { out.insert(name, s); }
+                    let mut out = Vec::new();
+                    if keep(&s, &name) { out.push((name, s)); }
                     Some(out)
                 }
                 GoalCases::Cases(cases) => {
-                    let mut out = BTreeMap::new();
                     // De-duplicate identical case names by appending
                     // `_case_1`/`_case_2`/... — mirrors Haskell's
                     // `groupSortOn casName` printing convention
@@ -362,6 +367,11 @@ pub fn exec_proof_method(
                     // naming divergence with no proof-shape difference.
                     // So: simplify + keep first, then dedup the
                     // survivors.
+                    //
+                    // **Order preservation**: Vec<(name, sys)> output
+                    // preserves the order from `dispatch_solve_goal`,
+                    // which matches Haskell's `disjunctionOfList`
+                    // iteration order (rule order in `joinAllRules`).
                     use std::collections::HashMap;
                     let kept: Vec<(String, System)> = cases.into_iter()
                         .filter_map(|(name, sys)| {
@@ -374,6 +384,7 @@ pub fn exec_proof_method(
                         *counts.entry(name.clone()).or_default() += 1;
                     }
                     let mut seen: HashMap<String, usize> = HashMap::new();
+                    let mut out = Vec::new();
                     for (name, s) in kept.into_iter() {
                         let total = counts[&name];
                         let key = if total > 1 {
@@ -383,11 +394,11 @@ pub fn exec_proof_method(
                         } else {
                             name
                         };
-                        out.insert(key, s);
+                        out.push((key, s));
                     }
                     Some(out)
                 }
-                GoalCases::Contradictory => Some(BTreeMap::new()),
+                GoalCases::Contradictory => Some(Vec::new()),
             }
         }
         ProofMethod::Induction => {
@@ -427,10 +438,10 @@ pub fn exec_proof_method(
             sr.insert_formula_decompose(step);
             simplify_system(&mut sr);
 
-            let mut out = BTreeMap::new();
-            out.insert("empty_trace".to_string(), br.sys);
-            out.insert("non_empty_trace".to_string(), sr.sys);
-            Some(out)
+            Some(vec![
+                ("empty_trace".to_string(), br.sys),
+                ("non_empty_trace".to_string(), sr.sys),
+            ])
         }
     }
 }
@@ -448,7 +459,7 @@ pub fn check_and_exec_proof_method(
     ctx: &ProofContext,
     method: &ProofMethod,
     sys: &System,
-) -> Option<BTreeMap<CaseName, System>> {
+) -> Option<Vec<(CaseName, System)>> {
     match method {
         ProofMethod::Finished(r) => {
             let actual = is_finished(ctx, sys)?;
@@ -587,8 +598,8 @@ mod tests {
         let r = exec_proof_method(&ctx, &ProofMethod::Induction, &s).expect("induction");
         // Two case names: empty_trace and non_empty_trace.
         assert_eq!(r.len(), 2);
-        assert!(r.contains_key("empty_trace"));
-        assert!(r.contains_key("non_empty_trace"));
+        assert!(r.iter().any(|(n, _)| n == "empty_trace"));
+        assert!(r.iter().any(|(n, _)| n == "non_empty_trace"));
     }
 
     #[test]

@@ -1319,7 +1319,8 @@ fn ex_decomposition_produces_action_goal_via_induction() {
     // case decomposes the Ex via reduce_formulas → insert_atom.
     let cases = exec_proof_method(&ctx, &ProofMethod::Induction, &sys)
         .expect("induction");
-    let non_empty = cases.get("non_empty_trace").expect("non_empty");
+    let non_empty = &cases.iter().find(|(n, _)| n == "non_empty_trace")
+        .expect("non_empty").1;
     assert!(non_empty.goals.iter().any(|(g, _)|
         matches!(g, tamarin_theory::constraint::constraints::Goal::Action(_, fact)
             if fact.tag == tamarin_theory::fact::FactTag::Proto(
