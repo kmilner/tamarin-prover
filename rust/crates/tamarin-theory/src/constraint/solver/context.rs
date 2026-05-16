@@ -367,6 +367,15 @@ fn annotate_loop_breakers(rules: &mut [OpenProtoRule]) {
             if !matches!(prem_fa.tag, crate::fact::FactTag::Proto(_, _, _)) {
                 continue;
             }
+            // Haskell `LoopBreakers.hs:48`:
+            //   `guard $ not (isNoSourcesFact premFa0)`
+            // Premises tagged `[no_precomp]` are dropped from the
+            // dataflow relation entirely.  Without this, no_precomp
+            // premises get spurious loop-breaker marks, deprioritising
+            // goals that Haskell intends to be solved eagerly.
+            if prem_fa.is_no_sources() {
+                continue;
+            }
             for (i_from, ru_from) in rules.iter().enumerate() {
                 let conc_match = ru_from.rule.conclusions.iter()
                     .any(|c| c.tag == prem_fa.tag);
