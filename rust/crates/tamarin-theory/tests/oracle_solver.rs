@@ -552,6 +552,13 @@ fn corpus_verdict_match_coverage_probe() {
     use tamarin_theory::constraint::solver::search::NodeStatus;
     use tamarin_theory::prove::prove_lemma;
 
+    // Configure rayon thread-pool with a larger stack — Goal-Ord + Sk
+    // matcher path is recursively deeper on some protocols than rayon's
+    // default 2 MiB worker stack tolerates.  16 MiB is plenty.
+    let _ = rayon::ThreadPoolBuilder::new()
+        .stack_size(16 * 1024 * 1024)
+        .build_global();
+
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
         for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
@@ -814,6 +821,13 @@ fn corpus_proof_skeleton_match_probe() {
     use tamarin_theory::constraint::solver::search::NodeStatus;
     use tamarin_theory::prove::prove_lemma;
     use tamarin_theory::proof_skeleton::{extract_from_haskell, first_divergence, render};
+
+    // Same stack-bump as the verdict probe — Goal-Ord + Sk-matcher path
+    // can recurse deeper than rayon's default 2 MiB worker stack on
+    // typing-class lemmas.
+    let _ = rayon::ThreadPoolBuilder::new()
+        .stack_size(16 * 1024 * 1024)
+        .build_global();
 
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }

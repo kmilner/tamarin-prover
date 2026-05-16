@@ -1180,12 +1180,16 @@ fn structural_match(
         }
         (Term::Lit(Lit::Var(pv)), Term::Lit(Lit::Var(sv))) => {
             // Non-pattern LVar — must match identically (subject is
-            // treated as a constant).  Attempts to bind free non-pattern
-            // vars caused cascading new-implication generation (stack
-            // overflow on larger protocols); the parity-correct fix
-            // needs the universal's free vars to be Sk-constants
-            // (skolemised) before matching, not Maude-vars.  See
-            // agent a60950ef2370100e5 + the Destroy_charn deferred bug.
+            // treated as a constant).  Haskell-faithful `matchAction`
+            // would bind free non-pattern Vars too (applySkAction subst
+            // before matching, then bind remaining Maude LVars).  Our
+            // attempt at that fix (commit history under task #182)
+            // verified Destroy_charn correctly in isolation BUT
+            // regressed `corpus structural-match` from 47/85 to
+            // 37/84 — the extra implications generated change downstream
+            // proof shapes.  Reverted; the Sk-matcher port needs to be
+            // paired with `applySkAction` upfront to control which Vars
+            // are SK-constants vs free at match time.
             pv == sv
         }
         (Term::Lit(Lit::Con(pn)), Term::Lit(Lit::Con(sn))) => pn == sn,
@@ -1280,6 +1284,8 @@ fn match_atom_via_maude(
     // Translate the LVar → LNTerm matches back to parser-AST.
     for (lv, lt) in m {
         // Only record bindings for vars in the universal's `vars` list.
+        // (See structural_match's non-pattern-var clause for the
+        // deferred Sk-matcher port.)
         if !vars.iter().any(|v| v.name == lv.name && v.idx == lv.idx) {
             continue;
         }
