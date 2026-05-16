@@ -915,11 +915,20 @@ fn try_match_all_guards(
         }
         match guards[guard_idx] {
             AAtom::Action(g_fact, g_time) => {
+                // Haskell `applySkAction subst (a, fa)` (System.hs:1134):
+                // apply the accumulated `subst` to the guard's pattern
+                // BEFORE matching, so multi-guard universals where one
+                // guard binds a variable used by a later guard propagate
+                // the binding correctly.  For single-guard universals
+                // this is a no-op (acc is empty).
+                use crate::guarded::{subst_fact, subst_term};
+                let g_fact_subst = subst_fact(g_fact, acc);
+                let g_time_subst = subst_term(g_time, acc);
                 for (i, fa_sys) in sys_actions {
-                    if &g_fact.name != &fact_name(&fa_sys.tag) { continue; }
-                    if g_fact.args.len() != fa_sys.terms.len() { continue; }
+                    if &g_fact_subst.name != &fact_name(&fa_sys.tag) { continue; }
+                    if g_fact_subst.args.len() != fa_sys.terms.len() { continue; }
                     let Some(subst_here) = match_atom_via_maude(
-                        maude, vars, g_fact, g_time, i, &fa_sys.terms) else { continue };
+                        maude, vars, &g_fact_subst, &g_time_subst, i, &fa_sys.terms) else { continue };
                     let Some(combined) = combine_substs(acc, &subst_here) else { continue };
                     rec(maude, vars, guards, guard_idx + 1, sys_actions,
                         &combined, body, existing_formulas, existing_solved,
