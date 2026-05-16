@@ -14,6 +14,18 @@ use crate::constraint::solver::annotated_goals::{AnnotatedGoal, Usefulness};
 use crate::constraint::system::System;
 
 /// `openGoals`: enumerate annotated goals still to be solved.
+///
+/// **Note**: Haskell iterates `M.toList $ get sGoals sys` in
+/// Goal-key sorted order; we iterate `sys.goals: Vec<...>` in
+/// insertion order.  An attempt to switch to a `format!("{:?}", goal)`
+/// proxy sort caused soundness regressions on
+/// `Minimal_Create_Use_Destroy::Destroy_charn` and
+/// `RFID_Simple::Device_Init_Use_Set` — Debug format isn't byte-exact
+/// to Haskell's derived `Ord`, and the divergence cascades into
+/// wrong-falsified verdicts.  A faithful Goal-Ord port would need
+/// careful matching of Haskell's structural ordering on `LNFact` /
+/// `LVar` / `Guarded`; tracked but deferred (see proof-skel agent
+/// ab2c62748a04212ba's diagnosis on Minimal_Loop_Example::Stop_unique).
 pub fn open_goals(sys: &System) -> Vec<AnnotatedGoal> {
     let mut out = Vec::new();
     for (seq, (goal, status)) in sys.goals.iter().enumerate() {
