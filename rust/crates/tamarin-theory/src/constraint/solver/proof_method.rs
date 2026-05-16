@@ -63,16 +63,10 @@ pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
         // for the underlying search-completeness bugs that those
         // workarounds were masking.
         let _ = ctx;
-        // Soundness: a branch that consumed a precomputed source whose
-        // case enumeration was truncated (`used_incomplete_source=true`)
-        // can have its Contradictory poisoned by the dropped cases — a
-        // missing destructor-chain alternative may have been the
-        // actual witness path.  Convert to Unfinishable so the rollup
-        // emits Sorry rather than wrong-VERIFIED (for all-traces
-        // lemmas: Contradictory rolls up to Verified).
-        if sys.used_incomplete_source {
-            return Some(Result::Unfinishable);
-        }
+        // Haskell's `isFinished` (ProofMethod.hs:505) does not gate
+        // Contradictory on incomplete-source consumption.  Source's
+        // `incomplete` flag only affects diagnostic warnings, not
+        // search verdict.  Removed the Unfinishable downgrade to match.
         return Some(Result::Contradictory(Some(c)));
     }
     if std::env::var("TAM_DBG_IMPL").is_ok() {
@@ -107,13 +101,10 @@ pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
     let no_open_goals = open_goals(sys).is_empty();
     let sub_finished = finished_subterms(ctx, sys);
     if no_open_goals && sub_finished {
-        // A branch that consumed a source-case from an `incomplete`
-        // precomputed Source (i.e. one truncated by the closure cap)
-        // can't claim Solved — the dropped cases could have contained
-        // a counterexample.  Convert to Unfinishable so search reports
-        // Sorry instead of wrong-VERIFIED.
-        if sys.used_incomplete_source { Some(Result::Unfinishable) }
-        else { Some(Result::Solved) }
+        // Haskell's `isFinished` (ProofMethod.hs:505) doesn't gate
+        // Solved on `incomplete` source consumption — `Source.incomplete`
+        // is diagnostic-only there.  Match that.
+        Some(Result::Solved)
     }
     else if no_open_goals && !sub_finished { Some(Result::Unfinishable) }
     else { None }
