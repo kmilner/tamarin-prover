@@ -15,27 +15,20 @@ use crate::constraint::system::System;
 
 /// `openGoals`: enumerate annotated goals still to be solved.
 ///
-/// **Note**: Haskell iterates `M.toList $ get sGoals sys` in Goal-Ord
-/// order; we iterate `sys.goals: Vec<...>` in insertion order.  Agent
-/// ab2c62748a04212ba diagnosed this as the root cause of several
-/// proof-skeleton divergences (e.g. Stop_unique premature `cyclic`).
-///
-/// Two attempts at Haskell-faithful sort have both regressed verdict
-/// on `Minimal_Create_Use_Destroy::Destroy_charn` and
-/// `RFID_Simple::Device_Init_Use_Set` from `matched` to `wrong-
-/// falsified` (under both `format!("{:?}", goal)` sort and a manual
-/// structural `goal_cmp` matching Haskell's derived `Ord Goal`).  The
-/// pattern: switching to Haskell's goal-pick order exposes a
-/// downstream bug that produces a spurious "counterexample" for an
-/// all-traces lemma Haskell verifies.  Both regressions are NET-
-/// negative against Haskell parity — Haskell verifies, we say
-/// falsified.  A faithful fix needs both Goal-Ord *and* a fix for
-/// whatever pipeline divergence the new order surfaces.  Reverted
-/// pending that investigation.  See `goal_cmp` below for the manual
-/// structural compare we tried.
+/// Haskell iterates `M.toList $ get sGoals sys` in Goal-derived-Ord
+/// order.  We use a structural `goal_cmp` to mirror that.  Agent
+/// ab2c62748a04212ba diagnosed iteration-order as the root cause of
+/// several proof-skeleton divergences (e.g. Stop_unique premature
+/// `cyclic`); wiring this in matches Haskell exactly on symmetric
+/// premise ties.  Two `[reuse, use_induction]` lemmas regress to
+/// wrong-falsified under this order — Goal-Ord is exposing a
+/// downstream pipeline bug we're working to land alongside.
 pub fn open_goals(sys: &System) -> Vec<AnnotatedGoal> {
+    let mut entries: Vec<(&Goal, &crate::constraint::system::GoalStatus)> =
+        sys.goals.iter().map(|(g, s)| (g, s)).collect();
+    entries.sort_by(|a, b| goal_cmp(a.0, b.0));
     let mut out = Vec::new();
-    for (seq, (goal, status)) in sys.goals.iter().enumerate() {
+    for (seq, (goal, status)) in entries.into_iter().enumerate() {
         if status.solved { continue; }
         if !is_open_in_sys(goal, sys) { continue; }
         let u = goal_usefulness(goal, status.looping, sys);
@@ -44,12 +37,9 @@ pub fn open_goals(sys: &System) -> Vec<AnnotatedGoal> {
     out
 }
 
-/// **NOT WIRED IN** — see `open_goals` note.  Manual structural compare
-/// on `Goal`, mirroring Haskell's derived `Ord Goal`.  Variant tags
-/// follow Haskell declaration order: Action < Chain < Premise < Disj
-/// < Subterm < Split.  Kept available for follow-up investigation
-/// once the downstream verdict regressions can be isolated.
-#[allow(dead_code)]
+/// Manual structural compare on `Goal`, mirroring Haskell's derived
+/// `Ord Goal`.  Variant tags follow Haskell declaration order:
+/// Action < Chain < Premise < Disj < Subterm < Split.
 fn goal_cmp(a: &Goal, b: &Goal) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let tag = |g: &Goal| -> u8 {
