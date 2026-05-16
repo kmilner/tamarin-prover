@@ -1361,12 +1361,44 @@ fn saturate_out_premise(
                 close_chains_dfs(ctx, sub.sys, budget - 1, this_term.as_ref(), cases_remaining)
             }
             GoalCases::Cases(cases) => {
+                // Allocate budget fairly across alternatives so a single
+                // explosive branch (e.g. _0_fst leading to many sub-chains)
+                // doesn't starve later destructor alternatives (_0_snd).
+                // Without this, the DFS exhausts cases_remaining on the
+                // first destructor's subtree, dropping snd-paths entirely
+                // — which was the root cause of denning_sacco_symmetric_cbc::
+                // sessionsmatch being wrong-VERIFIED (missing Server source
+                // case for inner-enc extraction via _0_dec → _0_snd).
+                //
+                // Mirrors Haskell's Disj-monad branching: each destructor
+                // alternative gets its own slice of the closure budget,
+                // matching the saturate_out_premise top-level allocation.
+                let live_cases: Vec<_> = cases.into_iter()
+                    .filter(|(_, c_sys)| !is_dead(c_sys))
+                    .collect();
+                let n = live_cases.len();
+                if n == 0 { return Vec::new(); }
+                let total_budget = *cases_remaining;
+                let per_alt = (total_budget / n).max(1);
+                let mut leftover = total_budget.saturating_sub(per_alt * n);
                 let mut out = Vec::new();
-                for (_, c_sys) in cases {
+                for (_, c_sys) in live_cases {
                     if *cases_remaining == 0 { break; }
-                    if is_dead(&c_sys) { continue; }
-                    out.extend(close_chains_dfs(
-                        ctx, c_sys, budget - 1, this_term.as_ref(), cases_remaining));
+                    // Give this alternative its share plus accumulated
+                    // leftover from earlier alternatives that finished
+                    // under budget.  Always at least 1 so no alternative
+                    // is silently dropped.
+                    let mut alt_budget = (per_alt + leftover).min(*cases_remaining);
+                    if alt_budget == 0 { alt_budget = (*cases_remaining).min(1); }
+                    let pre = alt_budget;
+                    let alt_results = close_chains_dfs(
+                        ctx, c_sys, budget - 1, this_term.as_ref(), &mut alt_budget);
+                    let used = pre.saturating_sub(alt_budget);
+                    // Deduct used budget from the shared counter.
+                    *cases_remaining = cases_remaining.saturating_sub(used);
+                    // Carry leftover forward to later alternatives.
+                    leftover = (per_alt + leftover).saturating_sub(used);
+                    out.extend(alt_results);
                 }
                 out
             }
