@@ -1175,31 +1175,25 @@ fn structural_match(
         }
     }
     match (pat, subj) {
-        (Term::Lit(Lit::Var(pv)), _)
-            if pattern_vars.contains(&(pv.name.clone(), pv.idx)) =>
-        {
-            // Pattern var binding.  Check sort compatibility.
+        (Term::Lit(Lit::Var(pv)), _) => {
+            // Per Haskell `matchAction` (System.hs:1134) operating after
+            // `applySkAction subst (a, fa)`: the accumulated subst has
+            // already substituted the universal-bound vars that have
+            // bindings; remaining LVars (whether universal-bound but
+            // unbound, or free system vars) are bindable Maude vars.
+            // Pattern_vars is no longer needed as a guard — applySkAction
+            // (commit 28567ab1) handles the SK-constant logic upfront.
             let subj_sort = term_lsort(subj);
             if !sort_compatible(pv.sort, subj_sort) { return false; }
             if let Some(existing) = subst.get(pv) {
                 return existing == subj;
             }
+            if matches!(subj, Term::Lit(Lit::Var(sv)) if sv == pv) {
+                return true;
+            }
             subst.insert(pv.clone(), subj.clone());
+            let _ = pattern_vars;
             true
-        }
-        (Term::Lit(Lit::Var(pv)), Term::Lit(Lit::Var(sv))) => {
-            // Non-pattern LVar — must match identically (subject is
-            // treated as a constant).  Haskell-faithful `matchAction`
-            // would bind free non-pattern Vars too (applySkAction subst
-            // before matching, then bind remaining Maude LVars).  Our
-            // attempt at that fix (commit history under task #182)
-            // verified Destroy_charn correctly in isolation BUT
-            // regressed `corpus structural-match` from 47/85 to
-            // 37/84 — the extra implications generated change downstream
-            // proof shapes.  Reverted; the Sk-matcher port needs to be
-            // paired with `applySkAction` upfront to control which Vars
-            // are SK-constants vs free at match time.
-            pv == sv
         }
         (Term::Lit(Lit::Con(pn)), Term::Lit(Lit::Con(sn))) => pn == sn,
         (Term::App(p_sym, p_args), Term::App(s_sym, s_args)) => {
@@ -1291,13 +1285,12 @@ fn match_atom_via_maude(
     let _ = maude;
 
     // Translate the LVar → LNTerm matches back to parser-AST.
+    // Record bindings for BOTH universal-bound vars AND free system
+    // vars (Haskell `matchAction` binds all unbound Maude LVars after
+    // `applySkAction`).  Caller (try_match_all_guards rec) uses these
+    // for both: applying to body (universal-bound) AND threading
+    // through subsequent guards (free vars from prior matches).
     for (lv, lt) in m {
-        // Only record bindings for vars in the universal's `vars` list.
-        // (See structural_match's non-pattern-var clause for the
-        // deferred Sk-matcher port.)
-        if !vars.iter().any(|v| v.name == lv.name && v.idx == lv.idx) {
-            continue;
-        }
         let term = crate::elaborate::lnterm_to_term(&lt);
         subst.insert((lv.name, lv.idx), term);
     }

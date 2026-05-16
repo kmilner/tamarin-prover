@@ -556,7 +556,7 @@ fn corpus_verdict_match_coverage_probe() {
     // matcher path is recursively deeper on some protocols than rayon's
     // default 2 MiB worker stack tolerates.  16 MiB is plenty.
     let _ = rayon::ThreadPoolBuilder::new()
-        .stack_size(16 * 1024 * 1024)
+        .stack_size(64 * 1024 * 1024)
         .build_global();
 
     fn maude_path() -> Option<String> {
@@ -826,7 +826,7 @@ fn corpus_proof_skeleton_match_probe() {
     // can recurse deeper than rayon's default 2 MiB worker stack on
     // typing-class lemmas.
     let _ = rayon::ThreadPoolBuilder::new()
-        .stack_size(16 * 1024 * 1024)
+        .stack_size(64 * 1024 * 1024)
         .build_global();
 
     fn maude_path() -> Option<String> {
