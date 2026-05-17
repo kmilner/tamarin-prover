@@ -99,14 +99,26 @@ fn parse_segs(segs: &[String]) -> Option<TheoryPath> {
         "delete" => rest.first().map(|n| TheoryPath::Delete(n.clone())),
         "proof" => {
             let lemma = rest.first()?.clone();
-            let sub = rest.get(1..).unwrap_or(&[]).to_vec();
+            // Drop a single trailing empty segment — Haskell's URL
+            // shape uses `proof/<lemma>/_` to mean the lemma root, and
+            // `_` round-trips through `unprefix_underscore` as `""`.
+            // Without this filter `sub = [""]` (one empty segment), so
+            // proof-tree navigation looks for a child named `""` and
+            // fails.
+            let mut sub: Vec<String> = rest.get(1..).unwrap_or(&[]).to_vec();
+            if sub.last().map(|s| s.is_empty()).unwrap_or(false) {
+                sub.pop();
+            }
             Some(TheoryPath::Proof { lemma, sub })
         }
         "method" => {
             let lemma = rest.first()?.clone();
             let idx_s = rest.get(1)?;
             let idx: usize = idx_s.parse().ok()?;
-            let sub = rest.get(2..).unwrap_or(&[]).to_vec();
+            let mut sub: Vec<String> = rest.get(2..).unwrap_or(&[]).to_vec();
+            if sub.last().map(|s| s.is_empty()).unwrap_or(false) {
+                sub.pop();
+            }
             Some(TheoryPath::Method { lemma, idx, sub })
         }
         "cases" => {

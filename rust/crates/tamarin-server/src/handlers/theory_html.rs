@@ -141,7 +141,12 @@ fn proof_state(entry: &TheoryEntry) -> String {
         idx = idx));
     out.push_str("<br>\n");
 
-    // Lemmas — each with the nested proof tree below.
+    // Lemmas — each with the nested proof tree below.  Mirrors
+    // Haskell's `lemmaIndex` (`src/Web/Theory.hs:296-318`): the lemma
+    // NAME is plain text (no link); the clickable step is `by sorry`
+    // pointing at `/main/proof/<lemma>/_`.  Haskell's `TheoryLemma`
+    // path renders the literal "this is a mistake" — so we must not
+    // link there.
     let lemmas: Vec<_> = typed.lemmas().collect();
     for l in lemmas {
         let tq = match l.trace_quantifier {
@@ -152,23 +157,41 @@ fn proof_state(entry: &TheoryEntry) -> String {
         let formula = pretty_formula(&l.formula);
         out.push_str(&format!(
             "<div class=\"lemma-row\">\n\
-             <a class=\"internal-link lemma\" href=\"/thy/trace/{idx}/main/lemma/{n}\">lemma {n}</a>:{attrs}<br>\n\
+             <span class=\"hl_keyword\">lemma</span> {n}:{attrs}<br>\n\
              &nbsp;&nbsp;{tq} \"{f}\"<br>\n\
-             &nbsp; <a class=\"ajax-action proof-step autoprove\" href=\"/thy/trace/{idx}/autoprove/idfs/0/false/proof/{n}\">[autoprove]</a>\n",
+             &nbsp; <a class=\"ajax-action proof-step autoprove\" href=\"/thy/trace/{idx}/autoprove/idfs/0/false/proof/{n_url}\">[autoprove]</a>\n",
             idx = idx,
             n = html_escape(&l.name),
+            n_url = url_path_escape_local(&l.name),
             tq = tq,
             attrs = html_escape(&attrs),
             f = html_escape(&formula),
         ));
-        // Nested proof tree (if a live proof state exists).
+        // Nested proof tree (if a live proof state exists).  If there's
+        // no live tree yet, fall back to the Haskell-style
+        // `by <sorry-step>` line so the user can click into the lemma's
+        // initial proof view.  This matches Haskell's
+        // `proofIndex` output for a freshly loaded lemma whose root is
+        // `Sorry "not yet proven"`.
+        let mut rendered_tree = false;
         if let Some(ps) = &entry.proof_state {
             if let Some(root) = ps.get_root(&l.name) {
                 out.push_str("<div class=\"proof-index\" style=\"margin-left:1em;font-family:monospace\">\n");
                 let path: Vec<String> = Vec::new();
                 render_index_node(&mut out, idx, &l.name, &path, &root);
                 out.push_str("</div>\n");
+                rendered_tree = true;
             }
+        }
+        if !rendered_tree {
+            out.push_str(&format!(
+                "&nbsp;<span class=\"hl_keyword\">by</span> \
+                 <a class=\"internal-link proof-step sorry-step\" \
+                 href=\"/thy/trace/{idx}/main/proof/{n_url}/_\">\
+                 <span class=\"hl_keyword\">sorry</span></a><br>\n",
+                idx = idx,
+                n_url = url_path_escape_local(&l.name),
+            ));
         }
         out.push_str("</div>\n");
     }
