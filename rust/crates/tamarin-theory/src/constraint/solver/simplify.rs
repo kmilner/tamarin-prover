@@ -1175,14 +1175,13 @@ fn structural_match(
         }
     }
     match (pat, subj) {
-        (Term::Lit(Lit::Var(pv)), _) => {
-            // Per Haskell `matchAction` (System.hs:1134) operating after
-            // `applySkAction subst (a, fa)`: the accumulated subst has
-            // already substituted the universal-bound vars that have
-            // bindings; remaining LVars (whether universal-bound but
-            // unbound, or free system vars) are bindable Maude vars.
-            // Pattern_vars is no longer needed as a guard — applySkAction
-            // (commit 28567ab1) handles the SK-constant logic upfront.
+        // Pattern-bound var: bindable Maude var.
+        // Mirrors Haskell `matchAction` after `skolemizeGuarded` has
+        // converted free system vars into `SkConst` constants (see
+        // System.hs:1122 + Guarded.hs:741-805).
+        (Term::Lit(Lit::Var(pv)), _)
+            if pattern_vars.contains(&(pv.name.clone(), pv.idx)) =>
+        {
             let subj_sort = term_lsort(subj);
             if !sort_compatible(pv.sort, subj_sort) { return false; }
             if let Some(existing) = subst.get(pv) {
@@ -1192,9 +1191,13 @@ fn structural_match(
                 return true;
             }
             subst.insert(pv.clone(), subj.clone());
-            let _ = pattern_vars;
             true
         }
+        // Non-pattern LVar = SkConst-equivalent: matches only the
+        // same literal LVar on the subject side.  Haskell's
+        // `skolemizeAtom` turns free LVars into `Con (SkConst v)` so
+        // they only unify with identical `SkConst`s.
+        (Term::Lit(Lit::Var(pv)), Term::Lit(Lit::Var(sv))) => pv == sv,
         (Term::Lit(Lit::Con(pn)), Term::Lit(Lit::Con(sn))) => pn == sn,
         (Term::App(p_sym, p_args), Term::App(s_sym, s_args)) => {
             if p_sym != s_sym { return false; }
@@ -1285,12 +1288,16 @@ fn match_atom_via_maude(
     let _ = maude;
 
     // Translate the LVar → LNTerm matches back to parser-AST.
-    // Record bindings for BOTH universal-bound vars AND free system
-    // vars (Haskell `matchAction` binds all unbound Maude LVars after
-    // `applySkAction`).  Caller (try_match_all_guards rec) uses these
-    // for both: applying to body (universal-bound) AND threading
-    // through subsequent guards (free vars from prior matches).
+    // Record bindings for universal-bound vars only — free system
+    // vars on the pattern side are SkConst-equivalent (per Haskell's
+    // `skolemizeGuarded` upstream of `matchAction`) and cannot be
+    // bound during matching.  Threading free-var bindings into `acc`
+    // (the old behaviour) causes spurious propagation when later
+    // guards re-encounter those names.
     for (lv, lt) in m {
+        if !pattern_vars.contains(&(lv.name.clone(), lv.idx)) {
+            continue;
+        }
         let term = crate::elaborate::lnterm_to_term(&lt);
         subst.insert((lv.name, lv.idx), term);
     }
