@@ -219,6 +219,15 @@ fn expand(
     // Critical for NSPK3::nonce_secrecy and other attack lemmas:
     // Haskell finds the trace at one specific case (e.g. `c_aenc`)
     // after the lazy Disj-monad short-circuits other paths.
+    // Haskell-faithful case iteration order.  `execProofMethod`
+    // (ProofMethod.hs:435-441) builds a `Data.Map` keyed by case name
+    // via `M.fromListWith`, so entries are alphabetically ordered.
+    // `proveSystemDFS` / `cutOnSolvedDFS` then walk those children in
+    // map order (Proof.hs:855-877 — `foldMap`, `M.map`).  Our `Vec`
+    // preserves the case-creation order (source-file rule order), so
+    // sort by name to match Haskell.
+    let mut cases = cases;
+    cases.sort_by(|a, b| a.0.cmp(&b.0));
     let n_cases = cases.len();
     let total_budget = *budget;
     let per_case = if n_cases > 0 { (total_budget / n_cases).max(1) } else { total_budget };
