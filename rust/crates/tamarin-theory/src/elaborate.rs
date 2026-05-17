@@ -59,6 +59,16 @@ thread_local! {
     /// causing TLS_Handshake-class lemmas to be wrong-falsified.
     static USER_NULLARY_FUNS: RefCell<BTreeSet<String>>
         = RefCell::new(BTreeSet::new());
+
+    /// Names of user-declared function symbols marked `private`.
+    /// Populated from `FunctionDecl.private` across all arities.  Read
+    /// by `term_to_lnterm` when synthesizing `NoEqSym` for user-defined
+    /// function applications so `Privacy::Private` propagates through
+    /// to Maude.  Without this, `KU(f)` for a private nullary `f` is
+    /// filtered by `is_nullary_public_function` (because we say
+    /// Public), causing `is_finished` to incorrectly report Solved.
+    static USER_PRIVATE_FUNS: RefCell<BTreeSet<String>>
+        = RefCell::new(BTreeSet::new());
 }
 use tamarin_term::term::{f_app_no_eq, Term};
 use tamarin_term::lterm::{Name, NameTag};
@@ -176,6 +186,16 @@ pub fn elaborate(parser_thy: &p::Theory) -> Result<Theory, ElabError> {
         }
     }
     let _nullary_guard = UserNullaryFunsGuard::set(nullary_funs);
+    // Collect names of user-declared private function symbols (any
+    // arity).  Used by term_to_lnterm to thread Privacy::Private through
+    // synthesized NoEqSyms — without this, `KU(f)` for private nullary
+    // `f` is incorrectly filtered as a known public function.
+    let private_funs: BTreeSet<String> = thy_clone.items.iter().flat_map(|it| {
+        if let p::TheoryItem::Functions(decls) = it {
+            decls.iter().filter(|d| d.private).map(|d| d.name.clone()).collect::<Vec<_>>()
+        } else { Vec::new() }
+    }).collect();
+    let _private_guard = UserPrivateFunsGuard::set(private_funs);
     elaborate_already_expanded(&thy_clone)
 }
 
@@ -254,6 +274,85 @@ impl Drop for UserNullaryFunsGuard {
 /// elaboration.  See `USER_NULLARY_FUNS` for the populating logic.
 fn is_user_nullary_fun(name: &str) -> bool {
     USER_NULLARY_FUNS.with(|c| c.borrow().contains(name))
+}
+
+/// RAII guard for the USER_PRIVATE_FUNS thread-local.
+struct UserPrivateFunsGuard {
+    previous: BTreeSet<String>,
+}
+
+impl UserPrivateFunsGuard {
+    fn set(new: BTreeSet<String>) -> Self {
+        let previous = USER_PRIVATE_FUNS.with(|c| {
+            let mut b = c.borrow_mut();
+            std::mem::replace(&mut *b, new)
+        });
+        UserPrivateFunsGuard { previous }
+    }
+}
+
+impl Drop for UserPrivateFunsGuard {
+    fn drop(&mut self) {
+        USER_PRIVATE_FUNS.with(|c| {
+            *c.borrow_mut() = std::mem::take(&mut self.previous);
+        });
+    }
+}
+
+/// Returns `Privacy::Private` if `name` is a user-declared private
+/// function symbol; otherwise `Privacy::Public`.  Mirrors Haskell's
+/// `signature` lookup against the per-theory funSig.
+fn user_fun_privacy(name: &str) -> Privacy {
+    USER_PRIVATE_FUNS.with(|c| {
+        if c.borrow().contains(name) { Privacy::Private } else { Privacy::Public }
+    })
+}
+
+/// Bundles RAII guards for all the user-declared function thread-locals,
+/// scoped to the lifetime of an outer call (typically `prove_lemma`).
+pub struct UserFunsForTheoryGuard {
+    _unary: UserUnaryFunsGuard,
+    _nullary: UserNullaryFunsGuard,
+    _private: UserPrivateFunsGuard,
+}
+
+/// Re-collects the user-declared unary / nullary / private function
+/// names from `parser_theory` and pushes them into the thread-locals
+/// read by `term_to_lnterm`.  Returns an RAII guard whose drop
+/// restores the previous values.  Use from `prove_lemma` so search-
+/// time term conversions see the right per-theory signature info.
+pub fn set_user_funs_for_theory(parser_theory: &p::Theory) -> UserFunsForTheoryGuard {
+    let unary_funs: BTreeSet<String> = parser_theory.items.iter().flat_map(|it| {
+        if let p::TheoryItem::Functions(decls) = it {
+            decls.iter().filter(|d| d.arg_types.len() == 1)
+                .map(|d| d.name.clone()).collect::<Vec<_>>()
+        } else { Vec::new() }
+    }).collect();
+    let mut nullary_funs: BTreeSet<String> = parser_theory.items.iter().flat_map(|it| {
+        if let p::TheoryItem::Functions(decls) = it {
+            decls.iter().filter(|d| d.arg_types.is_empty())
+                .map(|d| d.name.clone()).collect::<Vec<_>>()
+        } else { Vec::new() }
+    }).collect();
+    for it in &parser_theory.items {
+        if let p::TheoryItem::Builtins(names) = it {
+            for n in names {
+                for c in builtin_nullary_constants(n) {
+                    nullary_funs.insert(c.to_string());
+                }
+            }
+        }
+    }
+    let private_funs: BTreeSet<String> = parser_theory.items.iter().flat_map(|it| {
+        if let p::TheoryItem::Functions(decls) = it {
+            decls.iter().filter(|d| d.private).map(|d| d.name.clone()).collect::<Vec<_>>()
+        } else { Vec::new() }
+    }).collect();
+    UserFunsForTheoryGuard {
+        _unary: UserUnaryFunsGuard::set(unary_funs),
+        _nullary: UserNullaryFunsGuard::set(nullary_funs),
+        _private: UserPrivateFunsGuard::set(private_funs),
+    }
 }
 
 fn elaborate_already_expanded(parser_thy: &p::Theory) -> Result<Theory, ElabError> {
@@ -763,7 +862,7 @@ pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
             if matches!(v.sort, p::SortHint::Untagged) && v.idx == 0
                 && is_user_nullary_fun(&v.name) {
                 let sym = NoEqSym::new(v.name.as_bytes().to_vec(), 0,
-                    Privacy::Public, Constructability::Constructor);
+                    user_fun_privacy(&v.name), Constructability::Constructor);
                 return Some(f_app_no_eq(sym, vec![]));
             }
             let lv = LVar::new(v.name.clone(), sort_of(&v.sort), v.idx);
@@ -823,7 +922,7 @@ pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
                 new_args = vec![acc];
             }
             let sym = NoEqSym::new(name.as_bytes().to_vec(), new_args.len(),
-                Privacy::Public, Constructability::Constructor);
+                user_fun_privacy(name), Constructability::Constructor);
             Some(f_app_no_eq(sym, new_args))
         }
         p::Term::Pair(items) => {
