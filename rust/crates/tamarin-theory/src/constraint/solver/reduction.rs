@@ -1570,13 +1570,11 @@ impl<'ctx> Reduction<'ctx> {
 
 /// Build the canonical `RuleACInst` for an `OpenProtoRule`.
 ///
-/// In SplitG-variants mode (`TAM_SPLITG_VARIANTS=1`), uses the
-/// abstracted form (Haskell `variantsProtoRule`'s output with
+/// Uses the abstracted form (Haskell `variantsProtoRule`'s output with
 /// reducible-headed sub-terms abstracted to fresh `z_i` vars) so the
 /// equality-restriction firing during simplify doesn't contradict on
-/// the un-narrowed form.  Otherwise falls back to the raw rule.
-/// Mirrors Haskell's `someRuleACInst` (Rule.hs:933) extracting the
-/// `RuleACInst` half from a `RuleAC`.
+/// the un-narrowed form.  Mirrors Haskell's `someRuleACInst`
+/// (Rule.hs:933) extracting the `RuleACInst` half from a `RuleAC`.
 fn canonical_rule_inst(o: &crate::theory::OpenProtoRule) -> RuleACInst {
     canonical_rule_inst_with(o, /* prefer_abstracted = */ true)
 }
@@ -1604,28 +1602,25 @@ fn canonical_rule_inst_with(
 }
 
 /// Convert `OpenProtoRule`s to `RuleACInst`s, applying a per-rule
-/// keep predicate. Legacy expansion of variants into separate rule
-/// instances — `rule_insts_with_constrs` is the SplitG-faithful
-/// alternative.
-///
-/// When `TAM_SPLITG_VARIANTS=1`, returns the abstracted form so
-/// premise-goal / chain-fold paths see the same rule shape as the
-/// SplitG action-goal path.  Otherwise returns the raw (legacy)
-/// shape — possibly expanded over pre-applied variants.
+/// keep predicate.  Returns the abstracted form so premise-goal /
+/// chain-fold paths see the same rule shape as the SplitG action-goal
+/// path.  Mirrors Haskell's `someRuleACInst` semantics for code paths
+/// that don't carry the variant disjunction (chain-fold, etc.).
 fn rule_insts_with<F: Fn(&RuleACInst) -> bool>(
     open: &[crate::theory::OpenProtoRule], keep: F,
 ) -> Vec<RuleACInst> {
-    let splitg_path = std::env::var("TAM_SPLITG_VARIANTS").is_ok();
     let mut out = Vec::new();
     for o in open {
         let push = |inst: RuleACInst, out: &mut Vec<RuleACInst>| {
             if keep(&inst) { out.push(inst); }
         };
         if o.variants.is_empty() {
-            // SplitG: prefer the abstracted rule so all goal-types
-            // share the same shape.  Legacy: raw rule.
-            push(canonical_rule_inst_with(o, splitg_path), &mut out);
+            push(canonical_rule_inst_with(o, /* prefer_abstracted= */ true), &mut out);
         } else {
+            // Legacy pre-applied variants — kept for the rare case
+            // where `o.variants` is populated externally; under the
+            // standard load path `variants` stays empty and the
+            // abstracted form + SplitG carries the variant data.
             for v in &o.variants {
                 let mut inst = crate::rule::proto_rule_ac_to_rule_ac_inst(v.clone());
                 if let crate::rule::RuleInfo::Proto(p) = &mut inst.info {
@@ -1647,8 +1642,7 @@ fn rule_insts_with<F: Fn(&RuleACInst) -> bool>(
 /// node. Intruder rules are added with `None` constraints (they have no
 /// variants).
 ///
-/// `TAM_SPLITG_VARIANTS=1` opts in to this path; otherwise legacy
-/// pre-applied-variant expansion is used.
+/// This is the Haskell-faithful path — there is no legacy fallback.
 fn rule_insts_with_constrs<F: Fn(&RuleACInst) -> bool>(
     open: &[crate::theory::OpenProtoRule], keep: F,
 ) -> Vec<(RuleACInst, Option<Vec<tamarin_term::subst_vfresh::LNSubstVFresh>>)> {
@@ -2949,25 +2943,14 @@ impl<'ctx> Reduction<'ctx> {
                         // fall back to plain rule enumeration below.
                     }
                 }
-                // Two enumeration paths:
-                //   * legacy: rule_insts_with expands `variants` into N
-                //     separate pre-applied rules, each becomes its own
-                //     case.
-                //   * SplitG (TAM_SPLITG_VARIANTS=1): canonical rule per
-                //     `OpenProtoRule` + variant substs installed as
-                //     a SplitG goal via `solve_rule_constraints`
-                //     (Reduction.hs:766-774). One case per rule at the
-                //     action level; variant choice deferred.
-                let splitg_path = std::env::var("TAM_SPLITG_VARIANTS").is_ok();
+                // Haskell `someRuleACInst` (Rule.hs:933): canonical rule
+                // per `OpenProtoRule` + variant substs installed as a
+                // SplitG goal via `solve_rule_constraints`
+                // (Reduction.hs:766-774). One case per rule at the
+                // action level; variant choice deferred to SplitG.
                 let candidates: Vec<(RuleACInst,
                         Option<Vec<tamarin_term::subst_vfresh::LNSubstVFresh>>)>
-                    = if splitg_path {
-                        non_silent_rule_insts_with_constrs(self.ctx)
-                    } else {
-                        non_silent_rule_insts(self.ctx).into_iter()
-                            .map(|r| (r, None))
-                            .collect()
-                    };
+                    = non_silent_rule_insts_with_constrs(self.ctx);
                 if candidates.is_empty() { return GoalCases::Contradictory; }
                 let avoid_max = bounds_max(&self.sys);
                 let mut cases: Vec<(String, crate::constraint::system::System)> = Vec::new();
@@ -3274,19 +3257,12 @@ impl<'ctx> Reduction<'ctx> {
             }
         }
         let g = Goal::Premise(p.clone(), fa_prem.clone());
-        // SplitG path: use canonical (abstracted) rule + variant
-        // disjunction installed as SplitG after labeling.  Legacy
-        // path: use raw (or pre-applied-variant-expanded) rule.
-        let splitg_path = std::env::var("TAM_SPLITG_VARIANTS").is_ok();
+        // Canonical (abstracted) rule + variant disjunction installed
+        // as SplitG after labeling — Haskell-faithful `someRuleACInst`
+        // path (Rule.hs:933).
         let candidates: Vec<(RuleACInst,
                 Option<Vec<tamarin_term::subst_vfresh::LNSubstVFresh>>)>
-            = if splitg_path {
-                premise_solving_rule_insts_with_constrs(self.ctx, fa_prem)
-            } else {
-                premise_solving_rule_insts(self.ctx, fa_prem).into_iter()
-                    .map(|r| (r, None))
-                    .collect()
-            };
+            = premise_solving_rule_insts_with_constrs(self.ctx, fa_prem);
         let avoid_max = bounds_max(&self.sys);
         let mut cases: Vec<(String, crate::constraint::system::System)> = Vec::new();
         let mut next_node_idx = avoid_max.saturating_add(1);

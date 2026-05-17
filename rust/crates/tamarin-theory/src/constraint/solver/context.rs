@@ -183,7 +183,9 @@ impl ProofContext {
         let mut computed_abstracted_rules:
             Vec<(usize, crate::rule::ProtoRuleE, Vec<tamarin_term::subst_vfresh::LNSubstVFresh>)>
             = Vec::new();
-        let splitg_path = std::env::var("TAM_SPLITG_VARIANTS").is_ok();
+        // SplitG variants is the Haskell-faithful path
+        // (`someRuleACInst` + `solveRuleConstraints` from Rule.hs:933 /
+        // Reduction.hs:766-774).  Always on — there is no legacy fallback.
         if !var_disabled {
             for (idx, o) in rules.iter().enumerate() {
                 if !o.variants.is_empty() { continue; }
@@ -220,21 +222,19 @@ impl ProofContext {
                         computed_variant_substs.push((idx, substs));
                     }
                 }
-                // SplitG path: compute the abstracted-rule + variant
-                // disjunction (Haskell-faithful `variantsProtoRule`
-                // with `abstrRule`).  Reducible-headed sub-terms in
-                // the rule's facts are replaced by fresh `z_i` vars,
-                // and the variant disjunction is keyed by those.
-                // Without this, the canonical rule's destructor
-                // restrictions fire on un-narrowed forms and
-                // contradict before the SplitG can resolve.
-                if splitg_path {
-                    if let Ok(Some((abstr, av_substs))) =
-                        crate::tools::rule_variants::abstract_rule_and_variants(
-                            &maude, &o.rule)
-                    {
-                        computed_abstracted_rules.push((idx, abstr, av_substs));
-                    }
+                // Compute the abstracted-rule + variant disjunction
+                // (Haskell-faithful `variantsProtoRule` with `abstrRule`).
+                // Reducible-headed sub-terms in the rule's facts are
+                // replaced by fresh `z_i` vars, and the variant
+                // disjunction is keyed by those.  Without this, the
+                // canonical rule's destructor restrictions fire on
+                // un-narrowed forms and contradict before the SplitG
+                // can resolve.
+                if let Ok(Some((abstr, av_substs))) =
+                    crate::tools::rule_variants::abstract_rule_and_variants(
+                        &maude, &o.rule)
+                {
+                    computed_abstracted_rules.push((idx, abstr, av_substs));
                 }
             }
         }
@@ -286,17 +286,15 @@ impl ProofContext {
                 o.variant_substs = substs.clone();
             }
         }
-        // Install abstracted rules + their variant disjunctions for the
-        // SplitG path.  Overrides `variant_substs` with the abstraction-
-        // composed disjunction (whose domain is the abstracted rule's
-        // fresh z_i vars) — `canonical_rule_inst` checks
-        // `abstracted_rule` first when present.
-        if splitg_path {
-            for (idx, abstr, av_substs) in &computed_abstracted_rules {
-                if let Some(o) = ctx.rules.get_mut(*idx) {
-                    o.abstracted_rule = Some(abstr.clone());
-                    o.variant_substs = av_substs.clone();
-                }
+        // Install abstracted rules + their variant disjunctions.
+        // Overrides `variant_substs` with the abstraction-composed
+        // disjunction (whose domain is the abstracted rule's fresh
+        // z_i vars) — `canonical_rule_inst` checks `abstracted_rule`
+        // first when present.
+        for (idx, abstr, av_substs) in &computed_abstracted_rules {
+            if let Some(o) = ctx.rules.get_mut(*idx) {
+                o.abstracted_rule = Some(abstr.clone());
+                o.variant_substs = av_substs.clone();
             }
         }
         let raw_sources = crate::constraint::solver::sources::precompute_full_sources(&ctx);
