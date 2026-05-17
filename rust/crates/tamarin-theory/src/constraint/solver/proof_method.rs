@@ -411,14 +411,9 @@ pub fn exec_proof_method(
                         // Dedup by (case_name, exact-system) — catches
                         // cases where two distinct rule unifications
                         // produce structurally-identical post-simplify
-                        // systems.  Today this hits no NSPK3/roles-class
-                        // variants (they DO produce different systems
-                        // because variant equational instantiations
-                        // change rule terms); the proper Haskell-parity
-                        // dedup is the SplitG-variants path (task #154,
-                        // currently has 3-4 soundness regressions under
-                        // TAM_SPLITG_VARIANTS=1).  This local dedup is a
-                        // safety guard for actually-isomorphic cases.
+                        // systems.  Safety guard for actually-isomorphic
+                        // cases; the proper Haskell-parity dedup is the
+                        // SplitG-variants path (now always on).
                         let mut seen_systems: Vec<(String, System)> = Vec::new();
                         for (name, s) in kept_raw {
                             let dup = seen_systems.iter().any(|(prev_name, prev_sys)|
