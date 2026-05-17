@@ -119,14 +119,36 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
     /// to rule terms during the next `substSystem` pass.
     pub fn fresh_to_free<F: FnMut(u64) -> u64>(
         &self,
+        alloc_idxs: F,
+    ) -> crate::subst::Subst<C, LVar> {
+        // Default: no preserve set — every range var is treated as a
+        // witness and gets renamed.  Suitable when the caller knows
+        // there are no live system vars in the range.
+        self.fresh_to_free_avoiding(alloc_idxs, &std::collections::BTreeSet::new())
+    }
+
+    /// `freshToFreeAvoidingFast`: convert VFresh → free subst, but
+    /// PRESERVE any range var that's in `preserve` — those are live
+    /// system vars (not fresh witnesses) and renaming them would
+    /// break sharing with the rest of the system.
+    ///
+    /// Mirrors Haskell `freshToFreeAvoidingFast s t` which renames
+    /// range vars via `rename ... \`evalFreshAvoiding\` t` — Haskell's
+    /// `evalFreshAvoiding` avoids vars in `t`, so the renamer simply
+    /// skips them.  Our equivalent: pass `varsRange(eq_store.subst)`
+    /// (or similar) as `preserve`.
+    pub fn fresh_to_free_avoiding<F: FnMut(u64) -> u64>(
+        &self,
         mut alloc_idxs: F,
+        preserve: &std::collections::BTreeSet<LVar>,
     ) -> crate::subst::Subst<C, LVar> {
         use crate::subst::Subst;
-        // Step 1: collect all distinct range vars, in deterministic
-        // order. Each gets a fresh idx.
+        // Step 1: collect distinct range vars that are NOT in `preserve`.
+        // Those that are in `preserve` retain their identity (no rename).
         let mut range_vars: Vec<LVar> = Vec::new();
         for (_v, t) in self.to_list() {
             for w in crate::vterm::vars_vterm(&t) {
+                if preserve.contains(&w) { continue; }
                 if !range_vars.iter().any(|r| r == &w) {
                     range_vars.push(w);
                 }
@@ -134,15 +156,17 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
         }
         // Step 2: allocate fresh indices and build a rename map.
         let need = range_vars.len() as u64;
-        let base = alloc_idxs(need);
         let mut rename: BTreeMap<LVar, LVar> = BTreeMap::new();
-        for (k, old) in range_vars.into_iter().enumerate() {
-            let new = LVar { name: old.name.clone(),
-                             sort: old.sort,
-                             idx: base + (k as u64) };
-            rename.insert(old, new);
+        if need > 0 {
+            let base = alloc_idxs(need);
+            for (k, old) in range_vars.into_iter().enumerate() {
+                let new = LVar { name: old.name.clone(),
+                                 sort: old.sort,
+                                 idx: base + (k as u64) };
+                rename.insert(old, new);
+            }
         }
-        // Step 3: rewrite each (v, t) by renaming v's range vars.
+        // Step 3: rewrite each (v, t) by renaming non-preserved vars.
         let mut pairs: Vec<(LVar, VTerm<C, LVar>)> = Vec::new();
         for (v, t) in self.to_list() {
             let renamed = rename_lvars_in_vterm(&t, &rename);

@@ -622,9 +622,28 @@ impl EquationStore {
     /// `MaudeHandle::reserve_idxs`) because `freshToFree` renames range
     /// vars to distinct LVar idxs.
     pub fn simp_with_fresh<F, G>(
+        self,
+        is_contr: F,
+        alloc: G,
+    ) -> Self
+    where
+        F: Fn(&LNSubst, &LNSubstVFresh) -> bool,
+        G: FnMut(u64) -> u64,
+    {
+        self.simp_with_fresh_avoiding(is_contr, alloc, &BTreeSet::new())
+    }
+
+    /// `simp_with_fresh` variant that takes an extra `external_preserve`
+    /// set — live system free vars that must NOT be treated as fresh
+    /// witnesses when `simp_singleton` folds a singleton disjunction
+    /// into the free subst.  Pattern_matching::Responder_secrecy was
+    /// wrong-falsified by `fresh_to_free` renaming `k:Fresh#0` (a
+    /// Setup_Key conclusion var) inside the variant's range.
+    pub fn simp_with_fresh_avoiding<F, G>(
         mut self,
         is_contr: F,
         mut alloc: G,
+        external_preserve: &BTreeSet<LVar>,
     ) -> Self
     where
         F: Fn(&LNSubst, &LNSubstVFresh) -> bool,
@@ -637,7 +656,7 @@ impl EquationStore {
             changed |= self.simp_minimize(|s| is_contr(&subst_snapshot, s));
             changed |= self.simp_remove_renamings();
             changed |= self.simp_empty_disj();
-            changed |= self.simp_singleton(&mut alloc);
+            changed |= self.simp_singleton_avoiding(&mut alloc, external_preserve);
             changed |= self.simp_abstract_name();
             changed |= self.simp_identify();
             if !changed { return self; }
@@ -666,6 +685,17 @@ impl EquationStore {
         &mut self,
         alloc: &mut F,
     ) -> bool {
+        self.simp_singleton_avoiding(alloc, &BTreeSet::new())
+    }
+
+    /// `simp_singleton` variant that accepts an `external_preserve`
+    /// set — typically the system's free vars — to PROTECT from
+    /// renaming in `fresh_to_free`.  See `simp_with_fresh_avoiding`.
+    pub fn simp_singleton_avoiding<F: FnMut(u64) -> u64>(
+        &mut self,
+        alloc: &mut F,
+        external_preserve: &BTreeSet<LVar>,
+    ) -> bool {
         // Find the first singleton disjunction (1 subst).
         let pos = self.conj.iter().position(|d| d.substs.len() == 1);
         let Some(pos) = pos else { return false; };
@@ -676,8 +706,28 @@ impl EquationStore {
             // Identity disjunction: nothing to compose; just dropped.
             return true;
         }
-        // Convert VFresh → free via freshToFree, then compose.
-        let new_subst = subst_vf.fresh_to_free(|n| alloc(n));
+        // Build preserve set:
+        //   1. external_preserve (system's free vars — node terms, etc.)
+        //   2. self.subst.range() (vars referenced by current free subst)
+        //   3. self.subst.dom() (current free subst's keys)
+        //   4. every other disjunct's dom/range (cross-disjunct sharing)
+        let mut preserve: BTreeSet<LVar> = external_preserve.clone();
+        preserve.extend(self.subst.range()
+            .flat_map(|t| tamarin_term::vterm::vars_vterm(t)));
+        preserve.extend(self.subst.dom().cloned());
+        for d in &self.conj {
+            for s in &d.substs {
+                for v in s.dom() {
+                    preserve.insert(v.clone());
+                }
+                for t in s.range() {
+                    for w in tamarin_term::vterm::vars_vterm(t) {
+                        preserve.insert(w);
+                    }
+                }
+            }
+        }
+        let new_subst = subst_vf.fresh_to_free_avoiding(|n| alloc(n), &preserve);
         // Compose: new_subst ∘ self.subst.
         self.subst = new_subst.compose(&self.subst);
         true
