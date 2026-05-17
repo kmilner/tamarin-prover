@@ -402,9 +402,56 @@ fn msg_premise(g: &Goal) -> Option<&tamarin_term::lterm::LNTerm> {
     }
 }
 
+/// Saturate-time openGoals view.  Haskell uses a single `openGoals`
+/// function for both `isFinished` and `solveAllSafeGoals`, so this is
+/// just an alias for `is_open_in_sys`.  Kept as a separate name so
+/// callers in saturate code make the intent explicit; if we ever need
+/// to diverge again, the seam is here.
+pub fn is_open_for_saturate(g: &Goal, sys: &System) -> bool {
+    is_open_in_sys(g, sys)
+}
+
+/// `chain_kd_conc_term`: the KD-fact term at the chain's source-
+/// conclusion, or None if the source-conclusion isn't a KD fact.
+fn chain_kd_conc_term(
+    sys: &System,
+    c: &crate::constraint::constraints::NodeConc,
+) -> Option<tamarin_term::lterm::LNTerm> {
+    use crate::fact::FactTag;
+    let (id, idx) = (&c.0, &c.1);
+    let rule = sys.nodes.iter().find(|(n, _)| n == id).map(|(_, r)| r)?;
+    let fact = rule.conclusions.get(idx.0)?;
+    if fact.tag != FactTag::Kd { return None; }
+    fact.terms.first().cloned()
+}
+
+/// Haskell `chainToEquality` (Goals.hs:171-182).  Open the msg-var
+/// ChainG only when its premise targets an intruder equality rule
+/// AND there's an earlier KU action for the same msg var.
+///
+/// Conservative default: we don't build IEquality rules generally
+/// (`Theory.Tools.IntruderRules`), so the equality check is
+/// effectively False — matching the typical case where the chain is
+/// NOT routed through an equality rule.
+fn chain_to_equality(
+    _t_start: &tamarin_term::lterm::LNTerm,
+    _c: &crate::constraint::constraints::NodeConc,
+    p: &crate::constraint::constraints::NodePrem,
+    sys: &System,
+) -> bool {
+    // Look up the premise's rule. If it's NOT an IEquality rule,
+    // chainToEquality returns False (chain is auto-handled).
+    let p_rule = sys.nodes.iter().find(|(n, _)| n == &p.0).map(|(_, r)| r);
+    let Some(p_rule) = p_rule else { return false; };
+    matches!(&p_rule.info,
+        crate::rule::RuleInfo::Proto(info)
+        if matches!(&info.name,
+            crate::rule::ProtoRuleName::Stand(n) if n.as_str() == "IEquality"))
+}
+
 /// True if a goal is still "open": not vacuously False, not already
-/// trivially handled.  Mirrors Haskell's `openGoals` filter
-/// (`Theory.Constraint.Solver.Goals:66`):
+/// trivially handled.  **Direct port of Haskell's `openGoals` filter**
+/// (`Theory.Constraint.Solver.Goals:66-101`):
 ///
 ///   ActionG i (KU m) →
 ///       not ( solved
@@ -413,14 +460,20 @@ fn msg_premise(g: &Goal) -> Option<&tamarin_term::lterm::LNTerm> {
 ///             || isPair m || isInverse m || isProduct m
 ///             || isUnion m || isNullaryPublicFunction m )
 ///   DisjG (Disj []) → False    -- empty disj handled by contradictions
-///   _              → not solved
+///   ChainG c p →
+///     case kFactView (nodeConcFact c sys) of
+///       Just (DnK, FUnion args) | allMsgVarsKnownEarlier → False
+///       Just (DnK, m) | isMsgVar m → chainToEquality m c p
+///                     | otherwise  → True
+///       _ → True
+///   _ → not solved
 ///
-/// Sys-aware variant: also auto-solves `KU(msg_var) @ #i` when no
-/// node with id `i` exists yet.  Mirrors Haskell's `openGoals`
-/// `ActionG i (kFactView -> Just (UpK, m))` branch:
-///   not $ solved
-///      || (isMsgVar m && Nothing == M.lookup i (get sNodes sys))
-///      || ... (the sort-Pub/Nat / pair/inv/prod/union checks above)
+/// **Soundness note**: filtered-out msg-var KD ChainG goals stand for
+/// "intruder learns some message via some derivation".  When the
+/// caller is `isFinished`, an empty `openGoals` set together with
+/// stale msg-var KD chains is still a valid Solved verdict — Haskell
+/// trusts that the intruder is omnipotent for any unspecified
+/// message, so the chain is vacuously satisfied.
 fn is_open_in_sys(g: &Goal, sys: &System) -> bool {
     use crate::constraint::constraints::Disj;
     use crate::fact::FactTag;
@@ -434,6 +487,21 @@ fn is_open_in_sys(g: &Goal, sys: &System) -> bool {
             // Haskell: `isMsgVar m && no node at i` → auto-solved.
             if is_msg_var(m) && !sys.nodes.iter().any(|(n, _)| n == i) {
                 return false;
+            }
+            true
+        }
+        // Haskell parity (Goals.hs:92-100):
+        //   ChainG c p →
+        //     case kFactView (nodeConcFact c sys) of
+        //       Just (DnK, FUnion ...) → ... allMsgVarsKnownEarlier ...
+        //       Just (DnK, m) | isMsgVar m → chainToEquality m c p
+        //                     | otherwise  → True
+        //       _ → True
+        Goal::Chain(c, p) => {
+            if let Some(m) = chain_kd_conc_term(sys, c) {
+                if is_msg_var(&m) {
+                    return chain_to_equality(&m, c, p, sys);
+                }
             }
             true
         }

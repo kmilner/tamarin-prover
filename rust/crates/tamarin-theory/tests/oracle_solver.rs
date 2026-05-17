@@ -546,7 +546,13 @@ end"#;
 ///  - declare functions/equations our skeleton can't unify
 ///  - use macros, predicates, or accountability constructs
 ///  - take longer than 10s on tamarin's side
+///
+/// **Deprecated** as a primary metric — verdict-only matching masks
+/// reasoning bugs (right answer, wrong proof structure).  Use
+/// `corpus_proof_skeleton_match_probe` instead for the
+/// structural-match metric that the project actually optimizes.
 #[test]
+#[ignore = "verdict-only metric is deprecated; use corpus_proof_skeleton_match_probe"]
 fn corpus_verdict_match_coverage_probe() {
     use rayon::prelude::*;
     use tamarin_theory::constraint::solver::search::NodeStatus;
@@ -810,12 +816,15 @@ fn corpus_verdict_match_coverage_probe() {
 /// Haskell), then for every verdict-matching lemma diffs our `render`ed
 /// `ProofNode` against tamarin's skeleton via `first_divergence`.
 ///
-/// Reports `corpus structural-match: X/Y` where Y is the number of lemmas
-/// whose verdicts already agree (so structural divergence is reported
-/// *given* the verdict matches; mismatched-verdict lemmas are not
-/// included in either numerator or denominator).
+/// Reports `corpus structural-match: X/Y` where Y is the total number
+/// of lemmas where Haskell's proof skeleton is available — verdict
+/// divergences DO count against structural match (verdict-only matching
+/// masks reasoning bugs).
+///
+/// This is the **primary metric** for the port's progress, per
+/// project directive: count only whether the proof matches the
+/// Haskell skeleton directly.
 #[test]
-#[ignore = "diagnostic probe — task #150; run with --ignored"]
 fn corpus_proof_skeleton_match_probe() {
     use rayon::prelude::*;
     use tamarin_theory::constraint::solver::search::NodeStatus;
@@ -992,26 +1001,31 @@ fn corpus_proof_skeleton_match_probe() {
         };
         let fname = w.path.file_name().unwrap().to_string_lossy().into_owned();
         let file_lemma = format!("{}::{}", fname, w.lemma_name);
-        if our_verdict != w.tamarin_verdict {
-            return Outcome::VerdictDiff(file_lemma);
-        }
-        // Verdicts match — diff skeletons.
+        // **Structural match is the only metric** (per project directive).
+        // Always diff proof skeletons, regardless of verdict — a verdict
+        // match on a structurally-divergent proof means we're getting the
+        // right answer for the wrong reasons, which is misleading.
         let theirs = match extract_from_haskell(w.proof_text, &w.lemma_name) {
             Some(s) => s,
             None => return Outcome::NoHaskellSkeleton(file_lemma),
         };
         let ours = render(&root);
+        let verdict_note = if our_verdict != w.tamarin_verdict {
+            format!(" [verdict: ours={} theirs={}]", our_verdict, w.tamarin_verdict)
+        } else {
+            String::new()
+        };
         match first_divergence(&ours, &theirs) {
             None => Outcome::StructMatch,
             Some((line, ol, tl)) => Outcome::StructDiff {
-                file_lemma, line, ours: ol, theirs: tl,
+                file_lemma: format!("{}{}", file_lemma, verdict_note),
+                line, ours: ol, theirs: tl,
             },
         }
     }).collect();
 
     let mut struct_match = 0usize;
     let mut struct_diff: Vec<String> = Vec::new();
-    let mut verdict_diff: Vec<String> = Vec::new();
     let mut no_skel: Vec<String> = Vec::new();
     let mut incomparable = 0usize;
     for o in &outcomes {
@@ -1022,29 +1036,28 @@ fn corpus_proof_skeleton_match_probe() {
                     "{} — diverge line {}: ours={:?} theirs={:?}",
                     file_lemma, line, ours, theirs));
             }
-            Outcome::VerdictDiff(s) => verdict_diff.push(s.clone()),
+            // Outcome::VerdictDiff is no longer produced (we always diff
+            // structurally now), but the variant is kept on the enum for
+            // backward source-compat with other probes — count any stray
+            // ones as struct-diff for the total denominator.
+            Outcome::VerdictDiff(s) => struct_diff.push(s.clone()),
             Outcome::NoHaskellSkeleton(s) => no_skel.push(s.clone()),
             Outcome::Incomparable => incomparable += 1,
         }
     }
-    let verdict_matched = struct_match + struct_diff.len() + no_skel.len();
-    eprintln!("corpus structural-match: {}/{} (of verdict-matched lemmas; \
-              {} struct-divergent, {} verdict-divergent, {} no-haskell-skel, {} incomparable)",
-              struct_match, verdict_matched,
-              struct_diff.len(), verdict_diff.len(), no_skel.len(), incomparable);
+    let comparable = struct_match + struct_diff.len() + no_skel.len();
+    eprintln!("corpus structural-match: {}/{} ({} struct-divergent, \
+              {} no-haskell-skel, {} incomparable)",
+              struct_match, comparable,
+              struct_diff.len(), no_skel.len(), incomparable);
 
-    if !verdict_diff.is_empty() {
-        eprintln!("verdict divergences:");
-        verdict_diff.sort();
-        for d in &verdict_diff { eprintln!("  {}", d); }
-    }
     if !struct_diff.is_empty() {
         eprintln!("structural divergences:");
         struct_diff.sort();
         for d in &struct_diff { eprintln!("  {}", d); }
     }
     if !no_skel.is_empty() {
-        eprintln!("no-haskell-skeleton (verdict still matched):");
+        eprintln!("no-haskell-skeleton:");
         no_skel.sort();
         for d in &no_skel { eprintln!("  {}", d); }
     }

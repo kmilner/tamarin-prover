@@ -1265,17 +1265,26 @@ fn saturate_out_premise(
                 .map(|(_, r)| rule_case_name(r)))
             .unwrap_or_else(|| "case_1".into())
     };
-    // Drop cases that leave open `Chain` goals — the KD branch of
-    // `solve_premise_goal` introduces a Chain that should be closed
-    // by `solve_chain_goal`, but if we hand the runtime a case with
-    // an unresolved Chain it sometimes contradicts spuriously
-    // (likely the Chain endpoint's unification interacts with
-    // the rest of the system in ways we don't model at precompute).
-    // Keeping only Chain-free cases is conservative but avoids the
-    // verdict regressions we hit when grafting partial chains.
-    let chain_free = |s: &System| -> bool {
-        !s.goals.iter().any(|(g, st)|
-            !st.solved && matches!(g, Goal::Chain(_, _)))
+    // Drop cases that leave open non-msg-var KD `Chain` goals.
+    //
+    // Haskell-faithful: msg-var KD chains are excluded from
+    // `openGoals` (Goals.hs:92-100 — `chainToEquality` returns
+    // False for non-IEquality premises), so saturate doesn't try
+    // to close them.  Cases with open msg-var KD chains are
+    // acceptable — they mirror Haskell's `saturateSources`
+    // leaving these chains open in the saved source case.  Cases
+    // with other unresolved chain goals (non-msg-var KD, or
+    // non-KD) are dropped.
+    let chain_acceptable = |s: &System| -> bool {
+        !s.goals.iter().any(|(g, st)| {
+            if st.solved { return false; }
+            if let Goal::Chain(c, _) = g {
+                if let Some(m) = chain_kd_conc_term_local(s, c) {
+                    if is_msg_var_local(&m) { return false; }
+                }
+                true
+            } else { false }
+        })
     };
     if std::env::var("TAM_DBG_SAT").is_ok() {
         eprintln!("[sat] outer={} fa.tag={:?} fa.terms[0]={:?}",
@@ -1353,6 +1362,17 @@ fn saturate_out_premise(
         // Check FIRST whether there's any chain left to close,
         // filtering out chains whose conclusion term equals
         // `last_term` (Haskell-faithful loop-break).
+        //
+        // Haskell-faithful: msg-var KD chains are auto-handled
+        // (Goals.hs:92-100 `chainToEquality` returns False for
+        // non-IEquality premises). Haskell's `solveAllSafeGoals`
+        // doesn't try to close them — they stay open in the saved
+        // source case.  Mirroring this aligns saturate's output
+        // with Haskell's, even though it exposes pre-existing
+        // soundness bugs in NSPK3 et al. that were being masked by
+        // our over-eager closure.  Those bugs are tracked separately
+        // (see project memory) — the right fix is to find what
+        // Haskell does instead that catches the same scenarios.
         let chain = s.goals.iter().find_map(|(g, st)| {
             if st.solved || st.looping { return None; }
             if let Goal::Chain(c, p) = g {
@@ -1360,6 +1380,10 @@ fn saturate_out_premise(
                     if let Some(this_t) = chain_conc_term(&s, c) {
                         if eq_modulo_freshness(t, &this_t) { return None; }
                     }
+                }
+                // Haskell-faithful: msg-var KD chains are auto-handled.
+                if let Some(m) = chain_kd_conc_term_local(&s, c) {
+                    if is_msg_var_local(&m) { return None; }
                 }
                 Some((c.clone(), p.clone()))
             } else { None }
@@ -1456,6 +1480,24 @@ fn saturate_out_premise(
         let fact = rule.conclusions.get(idx.0)?;
         fact.terms.first().cloned()
     }
+    // Same as chain_conc_term but only returns Some when the conclusion
+    // is KD-tagged.  Used by the msg-var KD chain filter.
+    fn chain_kd_conc_term_local(sys: &System, c: &crate::constraint::constraints::NodeConc)
+        -> Option<tamarin_term::lterm::LNTerm>
+    {
+        use crate::fact::FactTag;
+        let (id, idx) = (&c.0, &c.1);
+        let rule = sys.nodes.iter().find(|(n, _)| n == id).map(|(_, r)| r)?;
+        let fact = rule.conclusions.get(idx.0)?;
+        if fact.tag != FactTag::Kd { return None; }
+        fact.terms.first().cloned()
+    }
+    fn is_msg_var_local(t: &tamarin_term::lterm::LNTerm) -> bool {
+        use tamarin_term::lterm::LSort;
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+        matches!(t, Term::Lit(Lit::Var(v)) if v.sort == LSort::Msg)
+    }
     // Structural equality modulo fresh variable renaming and AC.  For
     // the chain-loop-break heuristic we use a strict variant: just
     // structural equality after dropping LVar idx.  Mirrors Haskell's
@@ -1535,7 +1577,7 @@ fn saturate_out_premise(
         // 1-based suffixes).
         let mut this_sub: Vec<System> = Vec::new();
         for s in close_results.into_iter() {
-            if !chain_free(&s) { continue; }
+            if !chain_acceptable(&s) { continue; }
             if closed_cases.len() + this_sub.len() >= max_closures {
                 *incomplete_out = true;
                 break;
@@ -2333,14 +2375,22 @@ fn solve_all_safe_goals_tracked(
         if !contradictions(&red.ctx, &red.sys).is_empty() {
             return outcome;
         }
-        // Snapshot open goals (skip solved + loop-breakers).
+        // Snapshot open goals using Haskell's `openGoals` view (via
+        // `is_open_for_saturate` — same function as `is_open_in_sys`,
+        // since Haskell uses a single openGoals).  This drops msg-var
+        // KD `ChainG` and KU(msg_var, no-node) auto-solve cases, so
+        // `splitAllowed` correctly flips True when only auto-handled
+        // chains remain — letting DisjG/SplitG/SubtermG count as
+        // "safe" goals for saturate's case-split step.
         let goals: Vec<(Goal, bool /* looping */)> = red.sys.goals.iter()
             .filter(|(_, st)| !st.solved && !st.looping)
+            .filter(|(g, _)| crate::constraint::solver::goals::is_open_for_saturate(g, &red.sys))
             .map(|(g, st)| (g.clone(), st.looping))
             .collect();
-        // Check if there are unsolved chain constraints (used for
-        // splitAllowed flag — Disj/Split/Subterm goals only count
-        // as "safe" when chains exist to keep the search bounded).
+        // UNFILTERED chains view — mirrors Haskell's `unsolvedChains`
+        // (NOT `openGoals`).  Together with the filtered `goals`,
+        // `splitAllowed` flips True when there are chains present but
+        // they're all auto-handled msg-var KD ones.
         let any_unsolved_chain = red.sys.goals.iter().any(|(g, st)|
             !st.solved && matches!(g, Goal::Chain(_, _)));
         let any_chain_goal = goals.iter().any(|(g, _)| matches!(g, Goal::Chain(_, _)));
@@ -2670,10 +2720,16 @@ fn run_solve_all_safe_goals_disj(
         }
 
         // Pick a goal — mirrors `solve_all_safe_goals_tracked` exactly.
+        // Saturate-time filter (Haskell `openGoals`) drops msg-var KD
+        // ChainG so `split_allowed` correctly flips True when only
+        // auto-handled chains remain.  See `is_open_for_saturate` in
+        // goals.rs for the rationale.
         let goals: Vec<(Goal, bool)> = red.sys.goals.iter()
             .filter(|(_, st)| !st.solved && !st.looping)
+            .filter(|(g, _)| crate::constraint::solver::goals::is_open_for_saturate(g, &red.sys))
             .map(|(g, st)| (g.clone(), st.looping))
             .collect();
+        // Unfiltered chains view — Haskell's `unsolvedChains`.
         let any_unsolved_chain = red.sys.goals.iter().any(|(g, st)|
             !st.solved && matches!(g, Goal::Chain(_, _)));
         let any_chain_goal = goals.iter()
