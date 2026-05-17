@@ -27,6 +27,8 @@ pub mod fact;
 pub mod formula;
 pub mod intruder_rules;
 pub mod predicate;
+pub mod pretty_formula;
+pub mod pretty_system;
 pub mod restriction;
 pub mod rule;
 pub mod constraint;
