@@ -52,6 +52,13 @@ pub fn prove_lemma(
 ) -> Result<ProofNode, ProveError> {
     let trace = std::env::var("TAM_DBG_PHASE").is_ok();
     if trace { eprintln!("[phase] elaborate start"); }
+    // Re-set the thread-locals that track user-declared function symbols
+    // for the *duration of this prove call*.  `elaborate()` sets them
+    // for its own scope via RAII guards that drop on return — so
+    // `term_to_lnterm` calls during search would otherwise see an
+    // empty set.  Mirror Haskell's funSig staying available through
+    // the whole prover lifetime.
+    let _user_funs_guard = crate::elaborate::set_user_funs_for_theory(parser_theory);
     // Elaborate to get the typed theory, then pull rules + restrictions.
     let theory = elaborate(parser_theory)
         .map_err(|e| ProveError::Elaboration(e.message))?;
