@@ -34,6 +34,7 @@ pub mod maude_proc;
 pub mod maude_sig;
 pub mod maude_types;
 pub mod norm;
+pub mod pretty;
 pub mod subsumption;
 pub mod positions;
 pub mod rewriting;

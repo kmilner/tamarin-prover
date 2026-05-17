@@ -305,7 +305,7 @@ fn expand(
 /// in the list before goals so that when the system is reducible
 /// the simplifier runs first, decomposing pending formulas into
 /// goals.  Induction is only added in the initial state.
-fn candidate_methods(
+pub fn candidate_methods(
     sys: &System,
     ctx: &ProofContext,
 ) -> Vec<ProofMethod> {
