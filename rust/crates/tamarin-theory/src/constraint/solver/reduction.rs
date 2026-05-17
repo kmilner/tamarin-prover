@@ -3606,22 +3606,68 @@ impl<'ctx> Reduction<'ctx> {
         let sys_snapshot = self.sys.clone();
         let has_reducible = !maude.maude_sig().reducible_fun_syms.is_empty()
             && std::env::var("TAM_DISABLE_SUBST_NF").is_err();
+        // Collect the system's free vars — these are LIVE system vars
+        // (node ids, rule premise/conclusion/action vars, edges, less
+        // atoms, goals, formulas).  Pass to `simp_with_fresh_avoiding`
+        // so the singleton fold's `fresh_to_free` doesn't rename them.
+        // Pattern_matching::Responder_secrecy bug:  Setup_Key's `k:F#0`
+        // got baked into the variant subst's range via `apply_eq_store`,
+        // then `fresh_to_free` renamed it, desyncing the rule's two
+        // premises.
+        let system_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar> = {
+            use tamarin_term::lterm::HasFrees;
+            let mut s = std::collections::BTreeSet::new();
+            let mut visit = |v: &tamarin_term::lterm::LVar| { s.insert(v.clone()); };
+            for (id, rule) in &self.sys.nodes {
+                id.for_each_free(&mut visit);
+                rule.for_each_free(&mut visit);
+            }
+            for e in &self.sys.edges {
+                e.src.0.for_each_free(&mut visit);
+                e.tgt.0.for_each_free(&mut visit);
+            }
+            for l in &self.sys.less_atoms {
+                l.smaller.for_each_free(&mut visit);
+                l.larger.for_each_free(&mut visit);
+            }
+            if let Some(la) = &self.sys.last_atom { la.for_each_free(&mut visit); }
+            for (g, _) in &self.sys.goals {
+                match g {
+                    crate::constraint::constraints::Goal::Action(n, fa) => {
+                        n.for_each_free(&mut visit);
+                        fa.for_each_free(&mut visit);
+                    }
+                    crate::constraint::constraints::Goal::Premise(p, fa) => {
+                        p.0.for_each_free(&mut visit);
+                        fa.for_each_free(&mut visit);
+                    }
+                    crate::constraint::constraints::Goal::Chain(c, p) => {
+                        c.0.for_each_free(&mut visit);
+                        p.0.for_each_free(&mut visit);
+                    }
+                    _ => {}
+                }
+            }
+            s
+        };
         let simplify_picked = |store: crate::tools::equation_store::EquationStore|
             -> crate::tools::equation_store::EquationStore
         {
             if has_reducible {
                 let maude_ref = maude.clone();
                 let sys_ref = &sys_snapshot;
-                store.simp_with_fresh(
+                store.simp_with_fresh_avoiding(
                     |fs, vfs| crate::constraint::solver::contradictions::subst_creates_non_normal_terms(
                         &maude_ref, sys_ref, fs, vfs,
                     ),
                     |n| maude.reserve_idxs(n),
+                    &system_vars,
                 )
             } else {
-                store.simp_with_fresh(
+                store.simp_with_fresh_avoiding(
                     |_, _| false,
                     |n| maude.reserve_idxs(n),
+                    &system_vars,
                 )
             }
         };
