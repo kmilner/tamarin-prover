@@ -62,12 +62,21 @@ pub async fn interactive_overview(
     State(state): State<Arc<AppState>>,
     Path((idx, raw_path)): Path<(usize, String)>,
 ) -> Response {
-    let Some(entry) = state.store.get(idx) else {
+    if state.store.get(idx).is_none() {
         // Haskell's `notFound` returns 404 HTML; our overview is HTML
         // too so we match exactly.
         return missing_idx_html(idx);
-    };
+    }
     let path = parse_path(&raw_path);
+    // Eagerly build the live proof state when navigating to a
+    // proof/lemma path so the right pane can render the initial
+    // constraint system + applicable proof methods (Haskell does this
+    // implicitly via `subProofSnippet` since its `IncrementalProof` is
+    // always populated at theory close time).
+    materialise_proof_state_if_needed(&state, idx, &path);
+    let Some(entry) = state.store.get(idx) else {
+        return missing_idx_html(idx);
+    };
     html_response(theory_html::overview_page(&entry, &path))
 }
 
@@ -78,13 +87,35 @@ pub async fn theory_path_main(
     State(state): State<Arc<AppState>>,
     Path((idx, raw_path)): Path<(usize, String)>,
 ) -> Response {
+    if state.store.get(idx).is_none() {
+        return missing_idx_html(idx);
+    }
+    let path = parse_path(&raw_path);
+    materialise_proof_state_if_needed(&state, idx, &path);
     let Some(entry) = state.store.get(idx) else {
         return missing_idx_html(idx);
     };
-    let path = parse_path(&raw_path);
     let title = title_for(&entry, &path);
     let body = theory_html::path_html(&entry, &path);
     json_resp::html(title, body).into_response()
+}
+
+/// Build the per-theory `ProofState` when the path is a Proof / Method
+/// / Lemma so the renderer can show the initial constraint system +
+/// applicable proof methods. Best-effort: silent failure leaves
+/// `entry.proof_state = None` (renderer falls back to the static
+/// "sorry /* initial */" line).
+fn materialise_proof_state_if_needed(
+    state: &AppState,
+    idx: usize,
+    path: &path_parse::TheoryPath,
+) {
+    let needs = matches!(path,
+        path_parse::TheoryPath::Proof { .. }
+        | path_parse::TheoryPath::Method { .. }
+        | path_parse::TheoryPath::Lemma(_));
+    if !needs { return; }
+    let _ = state.store.ensure_proof_state(idx, &state.cfg.maude_path);
 }
 
 fn title_for(entry: &crate::state::TheoryEntry, path: &path_parse::TheoryPath) -> String {
