@@ -275,7 +275,13 @@ pub fn precompute_full_sources(
     let msig = ctx.maude.maude_sig();
     for sym in &msig.irreducible_fun_syms {
         if let tamarin_term::function_symbols::FunSym::NoEq(noeq) = sym {
-            if noeq.arity == 0 { continue; }
+            // Private nullary symbols still need a source case (the
+            // intruder learns them only via protocol rules that
+            // output them).  Public nullary symbols are auto-solved
+            // by `is_nullary_public_function`, but including them
+            // here is harmless: their source case enumeration will
+            // typically be empty (no protocol rule outputs them in
+            // a useful way) and `cases.is_empty()` skips the entry.
             if noeq.constructability
                 != tamarin_term::function_symbols::Constructability::Constructor
             { continue; }
@@ -4126,9 +4132,123 @@ fn apply_source_case_action(
             "applySource_drop", Some(&live_goal_for_trace), &r.sys);
         return None;
     }
+
+    // ---------------------------------------------------------------
+    // F — Close trivial chains via direct-edge unification.
+    //
+    // Haskell's precompute `solveAllSafeGoals` closes chains during
+    // source-case saturation, so the case_sys merged here already has
+    // chain edges (in `sEdges`) and their term equations (in
+    // `sSubst`).  Our `close_chains_dfs` defers msg-var KD chains
+    // (per the openGoals filter), so they remain as `Goal::Chain` in
+    // the precomputed case.  After `refineSubst` substitutes the
+    // abstract source pattern var with a concrete (e.g. Fresh-sorted)
+    // live term, those chains become closeable via direct edge.  Run
+    // that closure here so callers don't have to take an explicit
+    // `case irecv` step (which Haskell never does).
+    //
+    // Conservative: only try Branch 1 (direct edge) — never extend
+    // via destructor.  If Branch 1 fails or splits, leave the chain
+    // as-is.
+    close_trivial_chains_in_graft(&mut r);
+
     crate::state_trace::emit(
         "applySource_out", Some(&live_goal_for_trace), &r.sys);
     Some((r.sys, live_action))
+}
+
+/// True when `t` is a Msg-sorted free variable.  Used by
+/// `close_trivial_chains_in_graft` to match Haskell's
+/// `chainToEquality` filter on msg-var KD chains.
+fn is_msg_var_for_chain_filter(t: &tamarin_term::lterm::LNTerm) -> bool {
+    use tamarin_term::lterm::LSort;
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    matches!(t, Term::Lit(Lit::Var(v)) if v.sort == LSort::Msg)
+}
+
+/// Walk open `Goal::Chain` goals in `r.sys` and close each via the
+/// direct-edge branch of `solve_chain_goal` when the endpoints' fact
+/// tags + arity match (no destructor extension).  Mirrors the
+/// post-saturate state Haskell's precompute produces for source cases.
+/// Stops on the first chain where direct-edge unification fails or
+/// is contradictory — the chain stays as a `Goal::Chain` and gets
+/// handled at search time, exactly as before.
+fn close_trivial_chains_in_graft(
+    r: &mut crate::constraint::solver::reduction::Reduction,
+) {
+    use crate::constraint::constraints::Goal;
+    use crate::constraint::solver::reduction::{SolveOutcome, SplitStrategy};
+
+    loop {
+        // Find one open Chain goal whose endpoints are tag+arity
+        // compatible AND not a forbidden edge.  Snapshot the goal so
+        // we can release the borrow on `r.sys` before mutating.
+        let candidate: Option<(
+            crate::constraint::constraints::NodeConc,
+            crate::constraint::constraints::NodePrem,
+            crate::fact::LNFact,
+            crate::fact::LNFact,
+        )> = r.sys.goals.iter().find_map(|(g, st)| {
+            if st.solved || st.looping { return None; }
+            let Goal::Chain(c, p) = g else { return None };
+            let c_rule = r.sys.nodes.iter().find(|(id, _)| id == &c.0).map(|(_, ru)| ru)?;
+            let p_rule = r.sys.nodes.iter().find(|(id, _)| id == &p.0).map(|(_, ru)| ru)?;
+            let fa_conc = c_rule.conclusions.get(c.1.0)?.clone();
+            let fa_prem = p_rule.premises.get(p.1.0)?.clone();
+            if fa_conc.tag != fa_prem.tag
+                || fa_conc.terms.len() != fa_prem.terms.len()
+            {
+                return None;
+            }
+            // Haskell-faithful: msg-var KD chains are auto-handled via
+            // `chainToEquality` (Goals.hs:92-100) — they're filtered
+            // OUT of `openGoals` and `solveAllSafeGoals` doesn't close
+            // them.  Mirroring that here prevents over-eager closure
+            // that breaks SplitG resolution downstream (NSPK3/NSLPK3
+            // R_1 + I_2 case regressions).
+            if fa_conc.tag == crate::fact::FactTag::Kd {
+                if let Some(t) = fa_conc.terms.first() {
+                    if is_msg_var_for_chain_filter(t) {
+                        return None;
+                    }
+                }
+            }
+            Some((c.clone(), p.clone(), fa_conc, fa_prem))
+        });
+        let Some((c, p, fa_conc, fa_prem)) = candidate else { break };
+
+        // Snapshot system; if direct-edge unification contradicts,
+        // restore and stop trying.
+        let snapshot = r.sys.clone();
+        r.sys.add_edge(crate::constraint::constraints::Edge {
+            src: c.clone(), tgt: p.clone(),
+        });
+        let res = r.solve_fact_eqs(
+            SplitStrategy::SplitNow,
+            &[tamarin_term::rewriting::Equal { lhs: fa_conc, rhs: fa_prem }],
+        );
+        match res {
+            Err(_) | Ok(SolveOutcome::Contradictory) => {
+                // Direct-edge closure not possible.  Restore and bail
+                // — the chain stays open for the search layer to
+                // handle (Branch 2 destructor or Disj-case).
+                r.sys = snapshot;
+                break;
+            }
+            Ok(_) => {
+                // Mark the chain solved.
+                let chain_goal = Goal::Chain(c, p);
+                if let Some(slot) = r.sys.goals.iter_mut()
+                    .find(|(g, _)| g == &chain_goal)
+                {
+                    slot.1.solved = true;
+                }
+                // Continue — additional chains may now be closeable
+                // after the eq-store propagation.
+            }
+        }
+    }
 }
 
 /// Graft a precomputed Action-source case into `live_sys`, mapping
