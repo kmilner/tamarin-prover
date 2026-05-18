@@ -94,11 +94,7 @@ pub fn run(args: &Args) -> Result<i32, RunError> {
 
     match args.subcommand {
         Subcommand::Batch => run_batch(args),
-        Subcommand::Interactive => Err(RunError(
-            "the `interactive` subcommand is not yet ported. \
-             Use the Haskell tamarin-prover binary for the web UI."
-                .to_string(),
-        )),
+        Subcommand::Interactive => run_interactive(args),
         Subcommand::Variants => Err(RunError(
             "the `variants` subcommand is not yet ported.".to_string(),
         )),
@@ -106,6 +102,120 @@ pub fn run(args: &Args) -> Result<i32, RunError> {
             "the `test` self-test subcommand is not yet ported.".to_string(),
         )),
     }
+}
+
+/// Default port matches Haskell `Web.Settings.defaultPort` (3001).
+const DEFAULT_INTERACTIVE_PORT: u16 = 3001;
+
+/// Run the interactive web UI. Mirrors `Main.Mode.Interactive.run`:
+/// builds a [`tamarin_server::ServerConfig`] from the CLI flags, eagerly
+/// loads any positional `.spthy` files into the theory store, and serves
+/// HTTP until SIGINT/SIGTERM. Returns 0 on graceful shutdown.
+fn run_interactive(args: &Args) -> Result<i32, RunError> {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::path::PathBuf;
+
+    // Haskell defaults: 3001 on 127.0.0.1.
+    let port = args.port.unwrap_or(DEFAULT_INTERACTIVE_PORT);
+
+    // `--interface` accepts a literal IP address. Haskell's `*4` / `*` /
+    // `*6` magic strings bind to all interfaces; mirror those.
+    let iface_str = args
+        .interface
+        .clone()
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let ip: IpAddr = match iface_str.as_str() {
+        "*" | "*4" => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        "*6" => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        other => other.parse::<IpAddr>().map_err(|e| {
+            RunError(format!(
+                "could not parse --interface={:?} as an IP address: {}\n\
+                 Use --interface=\"*4\" to bind to all IPv4 interfaces.",
+                other, e,
+            ))
+        })?,
+    };
+    let bind_addr = SocketAddr::new(ip, port);
+
+    // Resolve data dir. Without an explicit flag, look for `data/`
+    // alongside the working directory or its ancestors — the same
+    // search the server already exposes via `resolve_data_dir`.
+    let data_dir = tamarin_server::handlers::static_files::resolve_data_dir(
+        args.data_dir.clone().map(PathBuf::from),
+    );
+    // Try to discover a sibling frontend/dist for the bundled UI assets.
+    let frontend_dist = guess_frontend_dist(&data_dir);
+
+    let maude_path = args.maude_path.clone().unwrap_or_else(default_maude_path);
+
+    let mut cfg = tamarin_server::ServerConfig::new(bind_addr, data_dir, maude_path);
+    cfg.frontend_dist = frontend_dist;
+    if let Some(b) = args.bound {
+        cfg.max_steps = b as usize;
+    }
+
+    // Positional args are theory files (Haskell uses a working
+    // directory, but we accept either: a single dir arg, or one-or-more
+    // .spthy paths).
+    let theory_paths: Vec<PathBuf> = collect_theory_paths(&args.in_files)?;
+
+    if !args.quiet {
+        eprintln!(
+            "The server is starting up on port {}.\nBrowse to http://{} once the server is ready.",
+            port, bind_addr,
+        );
+    }
+
+    // Spin up a tokio runtime and run the server. We use a multi-thread
+    // runtime so background `spawn_blocking` proof tasks don't park the
+    // single executor thread.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| RunError(format!("failed to build tokio runtime: {}", e)))?;
+    runtime
+        .block_on(tamarin_server::serve(cfg, theory_paths))
+        .map_err(|e| RunError(format!("server error: {}", e)))?;
+    Ok(0)
+}
+
+/// Expand the positional input list into a list of `.spthy` files.
+/// Haskell's interactive mode takes a single working directory; we
+/// accept either a directory (whose `.spthy` files we glob) or any
+/// number of `.spthy` files (the path Tamarin batch mode uses).
+fn collect_theory_paths(in_files: &[String]) -> Result<Vec<std::path::PathBuf>, RunError> {
+    use std::path::PathBuf;
+    let mut out: Vec<PathBuf> = Vec::new();
+    for f in in_files {
+        let p = PathBuf::from(f);
+        if p.is_dir() {
+            let entries = std::fs::read_dir(&p).map_err(|e| {
+                RunError(format!("could not read directory {}: {}", p.display(), e))
+            })?;
+            for e in entries.flatten() {
+                let ep = e.path();
+                if ep.extension().and_then(|s| s.to_str()) == Some("spthy") {
+                    out.push(ep);
+                }
+            }
+        } else {
+            out.push(p);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Best-effort: locate the bundled `frontend/dist/` sibling of `data/`.
+/// Returns None if not found — the server tolerates this and just
+/// won't serve the frontend assets.
+fn guess_frontend_dist(data_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let parent = data_dir.parent()?;
+    let candidate = parent.join("frontend").join("dist");
+    if candidate.is_dir() {
+        return Some(candidate);
+    }
+    None
 }
 
 fn run_batch(args: &Args) -> Result<i32, RunError> {
@@ -437,10 +547,36 @@ mod tests {
     }
 
     #[test]
-    fn interactive_subcmd_errors_cleanly() {
-        let a = parse(&["interactive"]);
+    fn interactive_subcmd_is_routed() {
+        // We can't actually invoke `run` on the interactive subcommand
+        // in a unit test (it would bind a TCP socket and block), so we
+        // just check that the parser routes to it and accepts the
+        // expected interactive flags.
+        let a = parse(&[
+            "interactive",
+            "--port=3001",
+            "--interface=127.0.0.1",
+            "--image-format=PNG",
+            "--debug",
+            "--no-logging",
+            "--data-dir=/tmp/data",
+        ]);
+        assert_eq!(a.subcommand, crate::cli::Subcommand::Interactive);
+        assert_eq!(a.port, Some(3001));
+        assert_eq!(a.interface.as_deref(), Some("127.0.0.1"));
+        assert!(matches!(a.image_format, Some(crate::cli::ImageFormat::Png)));
+        assert!(a.debug);
+        assert!(a.no_logging);
+        assert_eq!(a.data_dir.as_deref(), Some("/tmp/data"));
+    }
+
+    #[test]
+    fn interactive_invalid_interface_errors() {
+        // Asking to bind to garbage should produce a clear error
+        // without ever opening a socket.
+        let a = parse(&["interactive", "--interface=not-an-ip"]);
         let r = run(&a);
-        assert!(matches!(r, Err(_)));
+        assert!(matches!(r, Err(_)), "expected interface parse error");
     }
 
     #[test]
