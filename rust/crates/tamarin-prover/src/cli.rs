@@ -45,9 +45,17 @@
 //! Subcommands recognised but unimplemented in the Rust port (clear
 //! error message issued):
 //!
-//!   interactive   the web-UI prover
 //!   variants      compute intruder-rule variants
 //!   test          self-test
+//!
+//! `interactive` subcommand flags (mirrors `Main/Mode/Interactive.hs`):
+//!
+//!   --port=N, -p N             port to listen on (default 3001)
+//!   --interface=ADDR, -i ADDR  interface to listen on (default 127.0.0.1)
+//!   --image-format=PNG|SVG     image format used for graphs (default SVG)
+//!   --debug                    show server debugging output
+//!   --no-logging               suppress web server logs
+//!   --data-dir=DIR             override path to the bundled `data/` directory
 //!
 //! The Haskell CLI uses `cmdargs`'s `flagOpt` for both bare `--foo` and
 //! `--foo=VALUE` forms; we mirror that — a `--prove` with no value
@@ -97,12 +105,29 @@ impl PartialEval {
 pub enum Subcommand {
     /// The default batch mode (prove + emit theory).
     Batch,
-    /// `interactive` — web UI (not supported in port).
+    /// `interactive` — web UI.
     Interactive,
     /// `variants` — intruder-rule variants (not supported in port).
     Variants,
     /// `test` — self-test (not supported in port).
     Test,
+}
+
+/// Image format used for graph rendering in interactive mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageFormat {
+    Png,
+    Svg,
+}
+
+impl ImageFormat {
+    fn parse(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "png" => Ok(ImageFormat::Png),
+            "svg" => Ok(ImageFormat::Svg),
+            other => Err(format!("image-format must be PNG|SVG (got {:?})", other)),
+        }
+    }
 }
 
 /// Parsed command-line options.
@@ -158,6 +183,14 @@ pub struct Args {
     pub dot_path: Option<String>,
     pub json_path: Option<String>,
 
+    // Interactive-mode flags (mirror src/Main/Mode/Interactive.hs).
+    pub port: Option<u16>,
+    pub interface: Option<String>,
+    pub image_format: Option<ImageFormat>,
+    pub debug: bool,
+    pub no_logging: bool,
+    pub data_dir: Option<String>,
+
     // Meta.
     pub show_help: bool,
     pub show_version: bool,
@@ -200,6 +233,12 @@ impl Default for Args {
             maude_path: None,
             dot_path: None,
             json_path: None,
+            port: None,
+            interface: None,
+            image_format: None,
+            debug: false,
+            no_logging: false,
+            data_dir: None,
             show_help: false,
             show_version: false,
         }
@@ -376,6 +415,25 @@ pub fn parse_args(raw: &[String]) -> Result<Args, CliError> {
                     let v = take_val(&mut i, raw, val_inline, "with-json")?;
                     args.json_path = Some(v);
                 }
+                // Interactive-mode flags.
+                "port" => {
+                    let v = take_val(&mut i, raw, val_inline, "port")?;
+                    args.port = Some(parse_int(&v, "port")?);
+                }
+                "interface" => {
+                    let v = take_val(&mut i, raw, val_inline, "interface")?;
+                    args.interface = Some(v);
+                }
+                "image-format" => {
+                    let v = take_val(&mut i, raw, val_inline, "image-format")?;
+                    args.image_format = Some(ImageFormat::parse(&v).map_err(CliError::Msg)?);
+                }
+                "debug" => args.debug = true,
+                "no-logging" => args.no_logging = true,
+                "data-dir" => {
+                    let v = take_val(&mut i, raw, val_inline, "data-dir")?;
+                    args.data_dir = Some(v);
+                }
                 other => {
                     return Err(CliError::Msg(format!("unknown flag: --{}", other)));
                 }
@@ -430,6 +488,14 @@ pub fn parse_args(raw: &[String]) -> Result<Args, CliError> {
                 'm' => {
                     let v = take_short_val(&mut i, raw, inline, "output-module")?;
                     args.output_module = Some(v);
+                }
+                'p' => {
+                    let v = take_short_val(&mut i, raw, inline, "port")?;
+                    args.port = Some(parse_int(&v, "port")?);
+                }
+                'i' => {
+                    let v = take_short_val(&mut i, raw, inline, "interface")?;
+                    args.interface = Some(v);
                 }
                 other => {
                     return Err(CliError::Msg(format!("unknown short flag: -{}", other)));
@@ -530,6 +596,8 @@ fn short_for(long: &str) -> char {
         "output" => 'o',
         "Output" => 'O',
         "output-module" => 'm',
+        "port" => 'p',
+        "interface" => 'i',
         _ => '?',
     }
 }
@@ -592,9 +660,17 @@ pub fn help_text() -> String {
     s.push_str("  Security protocol analysis and verification (Rust port).\n");
     s.push_str("\n");
     s.push_str("Commands:\n");
-    s.push_str("  interactive  Start the web UI prover (NOT YET PORTED).\n");
+    s.push_str("  interactive  Start a web-server to construct proofs interactively.\n");
     s.push_str("  variants     Compute intruder-rule variants (NOT YET PORTED).\n");
     s.push_str("  test         Self-test (NOT YET PORTED).\n");
+    s.push_str("\n");
+    s.push_str("Interactive-mode flags (used with the `interactive` subcommand):\n");
+    s.push_str("  -p --port=PORT                        Port to listen on (default 3001).\n");
+    s.push_str("  -i --interface=INTERFACE              Interface to listen on (default 127.0.0.1).\n");
+    s.push_str("     --image-format=PNG|SVG             Image format for graphs (default SVG).\n");
+    s.push_str("     --debug                            Show server debugging output.\n");
+    s.push_str("     --no-logging                       Suppress web server logs.\n");
+    s.push_str("     --data-dir=DIR                     Override path to the bundled `data/` dir.\n");
     s.push_str("\n");
     s.push_str("Lemma selection / proof options:\n");
     s.push_str("     --prove[=LEMMAPREFIX*|LEMMANAME]   Prove the named lemma(s). Repeatable.\n");
