@@ -98,27 +98,37 @@ fn parse_segs(segs: &[String]) -> Option<TheoryPath> {
         "add" => rest.first().map(|n| TheoryPath::Add(n.clone())),
         "delete" => rest.first().map(|n| TheoryPath::Delete(n.clone())),
         "proof" => {
+            // Mirror Haskell `parseProof` (`src/Web/Types.hs:443`):
+            //   parseProof (y:ys) = Just (TheoryProof y ys)
+            // i.e. the sub-path is taken AS-IS (after `unprefixUnderscore`
+            // each segment).  We do NOT pop trailing empty segments:
+            // `proof/<lemma>` is the lemma root (sub = []), while
+            // `proof/<lemma>/_` is the sub-path with a single empty
+            // case name (sub = [""]) — these are distinct paths in
+            // the proof tree (Simplify produces a child with case
+            // name "" so this distinction matters at every step).
             let lemma = rest.first()?.clone();
-            // Drop a single trailing empty segment — Haskell's URL
-            // shape uses `proof/<lemma>/_` to mean the lemma root, and
-            // `_` round-trips through `unprefix_underscore` as `""`.
-            // Without this filter `sub = [""]` (one empty segment), so
-            // proof-tree navigation looks for a child named `""` and
-            // fails.
-            let mut sub: Vec<String> = rest.get(1..).unwrap_or(&[]).to_vec();
-            if sub.last().map(|s| s.is_empty()).unwrap_or(false) {
-                sub.pop();
-            }
+            let sub: Vec<String> = rest.get(1..).unwrap_or(&[]).to_vec();
             Some(TheoryPath::Proof { lemma, sub })
         }
         "method" => {
+            // Mirror Haskell `parseMethod` (`src/Web/Types.hs:446`):
+            //   parseMethod (y:z:zs) = safeRead z >>= Just . TheoryMethod y zs
+            // i.e. the sub-path is taken AS-IS (after `unprefixUnderscore`
+            // each segment) — including a single empty trailing
+            // segment, which encodes the inner proof case named "".
+            //
+            // We intentionally do NOT pop trailing empty segments here
+            // (unlike `proof` below): the method URL is constructed
+            // from the proof-tree path, and each `/_` denotes a real
+            // path segment.  Popping would conflate the lemma-root
+            // application with applying-at-inner-empty-case (which
+            // simplify produces a lot of), routing the click to the
+            // wrong node.
             let lemma = rest.first()?.clone();
             let idx_s = rest.get(1)?;
             let idx: usize = idx_s.parse().ok()?;
-            let mut sub: Vec<String> = rest.get(2..).unwrap_or(&[]).to_vec();
-            if sub.last().map(|s| s.is_empty()).unwrap_or(false) {
-                sub.pop();
-            }
+            let sub: Vec<String> = rest.get(2..).unwrap_or(&[]).to_vec();
             Some(TheoryPath::Method { lemma, idx, sub })
         }
         "cases" => {
@@ -160,5 +170,29 @@ mod tests {
         let p = TheoryPath::Proof { lemma: "X".into(), sub: vec![] };
         let segs = p.render();
         assert_eq!(segs, vec!["proof", "X"]);
+    }
+    // Haskell `parseProof (y:ys) = Just (TheoryProof y ys)`: no trailing
+    // strip — `proof/<lemma>` is the root (sub=[]), `proof/<lemma>/_`
+    // is the inner sub-path with single empty case (sub=[""]).
+    #[test] fn proof_root_vs_inner_empty_case() {
+        let root = parse("proof/Alice").unwrap();
+        assert!(matches!(&root, TheoryPath::Proof { lemma, sub } if lemma == "Alice" && sub.is_empty()),
+            "got {:?}", root);
+        let inner = parse("proof/Alice/_").unwrap();
+        assert!(matches!(&inner, TheoryPath::Proof { lemma, sub } if lemma == "Alice" && sub == &[""]),
+            "got {:?}", inner);
+    }
+    // Method path: `method/<lemma>/<N>` applies method N at lemma root
+    // (sub=[]); `method/<lemma>/<N>/_` applies at the inner empty-case
+    // sub-path (sub=[""]).  Without this distinction the click on a
+    // post-simplify sub-case's method list would resolve to the
+    // wrong proof node.
+    #[test] fn method_root_vs_inner_empty_case() {
+        let root = parse("method/Alice/1").unwrap();
+        assert!(matches!(&root, TheoryPath::Method { lemma, idx, sub }
+            if lemma == "Alice" && *idx == 1 && sub.is_empty()), "got {:?}", root);
+        let inner = parse("method/Alice/1/_").unwrap();
+        assert!(matches!(&inner, TheoryPath::Method { lemma, idx, sub }
+            if lemma == "Alice" && *idx == 1 && sub == &[""]), "got {:?}", inner);
     }
 }

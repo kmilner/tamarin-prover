@@ -145,6 +145,33 @@ impl TheoryStore {
         Some(new_idx)
     }
 
+    /// Like [`clone_at_new_idx`] but, when the source idx has a
+    /// materialised `proof_state`, also fork it into the clone — share
+    /// the `ProofContext` (Maude handle + precomputed sources) but
+    /// deep-copy the per-lemma trees so subsequent mutations on the
+    /// clone don't leak back into the source.  Used by the method-apply
+    /// route so the post-step proof tree contains the SAME tree shape
+    /// as the source idx (i.e. retains all children produced by prior
+    /// applied steps), rather than rebuilding a bare initial-state
+    /// tree.  This mirrors Haskell's `modifyTheory` semantics, where
+    /// `putTheory` puts the *modified* `ClosedTheory` (with its full
+    /// `IncrementalProof`) at the new idx — not a fresh one.
+    pub fn clone_at_new_idx_forking_proof_state(&self, src_idx: usize) -> Option<usize> {
+        let mut inner = self.inner.lock();
+        let mut clone = inner.by_idx.get(&src_idx).cloned()?;
+        let new_idx = inner.by_idx.keys().last().copied().unwrap_or(0) + 1;
+        clone.idx = new_idx;
+        clone.primary = false;
+        clone.loaded_at = Local::now();
+        // Fork the proof state if present — preserves the source tree's
+        // shape under a new Arc.  If the source never materialised a
+        // proof state, the clone starts from scratch (`None`).
+        clone.proof_state = clone.proof_state.as_ref().map(|ps| Arc::new(ps.fork()));
+        inner.by_idx.insert(new_idx, clone);
+        inner.next_idx = new_idx + 1;
+        Some(new_idx)
+    }
+
     /// Replace the entry at `idx` in place, keeping the idx the same.
     /// Mirrors Haskell `replaceTheory` (`src/Web/Handler.hs` — used by
     /// `reload` and `editProof`).  Returns the same `idx` on success

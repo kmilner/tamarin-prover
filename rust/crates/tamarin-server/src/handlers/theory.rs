@@ -83,6 +83,12 @@ pub async fn interactive_overview(
 /// `GET /thy/trace/<idx>/main/*path` — AJAX-only JsonHtml content
 /// (no framing).  Missing idx returns 404 HTML to match Haskell's
 /// `withTheory` / `notFound` (see `src/Web/Handler.hs:660-666`).
+///
+/// Special-cases the `TheoryMethod` path (Haskell `getTheoryPathMR` →
+/// `applyMethodAtPath`): we look up the ranked applicable methods at
+/// the indicated proof node, apply the requested one, allocate a fresh
+/// theory idx for the post-step state, and return a `{redirect}` JSON
+/// envelope pointing at `/thy/trace/<newIdx>/overview/proof/...`.
 pub async fn theory_path_main(
     State(state): State<Arc<AppState>>,
     Path((idx, raw_path)): Path<(usize, String)>,
@@ -91,6 +97,11 @@ pub async fn theory_path_main(
         return missing_idx_html(idx);
     }
     let path = parse_path(&raw_path);
+    // Method paths mutate the proof tree; dispatch separately.
+    if let path_parse::TheoryPath::Method { lemma, idx: method_nr, sub } = &path {
+        return apply_method_and_redirect(
+            &state, idx, lemma, *method_nr, sub).into_response();
+    }
     materialise_proof_state_if_needed(&state, idx, &path);
     let Some(entry) = state.store.get(idx) else {
         return missing_idx_html(idx);
@@ -98,6 +109,99 @@ pub async fn theory_path_main(
     let title = title_for(&entry, &path);
     let body = theory_html::path_html(&entry, &path);
     json_resp::html(title, body).into_response()
+}
+
+/// Apply ranked method `method_nr` (1-based) at proof path `sub` in
+/// lemma `lemma`'s tree.  Allocates a fresh idx for the post-step
+/// state and returns a JsonRedirect pointing at the resulting
+/// `overview/proof/<lemma>/<sub>` URL.  Mirrors Haskell's
+/// `applyMethodAtPath` + `modifyTheory` flow in
+/// `src/Web/Handler.hs:1013-1015` and `src/Web/Theory.hs:80-94`.
+fn apply_method_and_redirect(
+    state: &AppState,
+    idx: usize,
+    lemma: &str,
+    method_nr: usize,
+    sub: &[String],
+) -> axum::Json<Value> {
+    // Ensure the proof state at the *source* idx is built (so we can
+    // navigate to the sub-path and rank candidate methods there).
+    let src_ps = match state.store.ensure_proof_state(idx, &state.cfg.maude_path) {
+        Ok(p) => p,
+        Err(e) => return json_resp::alert(format!("proof state init failed: {}", e)),
+    };
+    // Look up the system at the requested path.
+    let sys_at_path = match src_ps.get_system_at(lemma, sub) {
+        Some(s) => s,
+        None => return json_resp::alert(format!(
+            "no system at path {:?} in lemma {}", sub, lemma)),
+    };
+    // Pick the N-th ranked method (1-based).  Filter to only those
+    // methods whose `exec_proof_method` succeeds — matches Haskell's
+    // `rankProofMethods` → `execMethods` (`ProofMethod.hs:653-668`)
+    // semantics, and matches the user-visible numbering produced by
+    // `write_applicable_methods` (which applies the same filter).
+    // Without filtering here the numbering would drift on Sorry/no-op
+    // candidates that the UI omits.
+    let method = {
+        let ctx_guard = src_ps.ctx.lock();
+        let methods: Vec<_> =
+            tamarin_theory::constraint::solver::search::candidate_methods(
+                &sys_at_path, &ctx_guard)
+                .into_iter()
+                .filter(|m| tamarin_theory::constraint::solver::proof_method::
+                    exec_proof_method(&ctx_guard, m, &sys_at_path).is_some())
+                .collect();
+        if method_nr == 0 || method_nr > methods.len() {
+            return json_resp::alert(
+                "Sorry, but the prover failed on the selected method!");
+        }
+        methods.into_iter().nth(method_nr - 1).unwrap()
+    };
+    // Allocate a fresh theory idx so the post-step state doesn't
+    // overwrite the source (matches Haskell's `modifyTheory` →
+    // `putTheory` allocating a new idx).  We FORK the source's proof
+    // state so the post-step state retains the SAME tree shape as the
+    // source (preserving any prior applied steps' children), then
+    // apply the step in the fork.  Mirrors Haskell where `putTheory`
+    // installs the modified `ClosedTheory` value (which contains its
+    // full `IncrementalProof`) at the new idx.
+    let new_idx = match state.store.clone_at_new_idx_forking_proof_state(idx) {
+        Some(n) => n,
+        None => return json_resp::alert(format!("theory index {} not found", idx)),
+    };
+    let new_ps = match state.store.ensure_proof_state(new_idx, &state.cfg.maude_path) {
+        Ok(p) => p,
+        Err(e) => return json_resp::alert(format!(
+            "proof state init failed on fresh idx: {}", e)),
+    };
+    if let Err(e) = new_ps.apply_at_path(lemma, sub, method) {
+        return json_resp::alert(format!("proof step failed: {}", e));
+    }
+    // Build the redirect URL matching Haskell's `renderTheoryPath`
+    // for `TheoryProof lemma sub` (`src/Web/Types.hs:372`):
+    //   "proof" : lemma : (map prefixWithUnderscore sub)
+    // i.e. lemma root (sub=[]) becomes `proof/<lemma>` (no trailing
+    // segments); each sub segment is `prefixWithUnderscore`d.
+    let mut url = format!(
+        "/thy/trace/{}/overview/proof/{}",
+        new_idx, url_path_escape(lemma));
+    for seg in sub {
+        url.push('/');
+        let escaped = if seg.is_empty() { "_".to_string() }
+            else if seg.starts_with('_') { format!("_{}", seg) }
+            else { seg.clone() };
+        url.push_str(&url_path_escape(&escaped));
+    }
+    json_resp::redirect(url)
+}
+
+/// Local copy of `proof_tree::url_path_escape` (the latter is private).
+fn url_path_escape(s: &str) -> String {
+    s.chars().map(|c| match c {
+        c if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' => c.to_string(),
+        c => format!("%{:02X}", c as u32),
+    }).collect()
 }
 
 /// Build the per-theory `ProofState` when the path is a Proof / Method
@@ -291,17 +395,18 @@ pub async fn autoprove(
                 let _ = ps.replace_root(&lemma_name, root);
             }
             // Render mirrors Haskell `renderTheoryPath` for
-            // `TheoryProof lemma []` → `proof/<lemma>/_` (the trailing
-            // `_` is `prefixWithUnderscore ""` for an empty proof-path
-            // tail).  After autoprove, Haskell's `nextSmartThyPath`
-            // typically walks INTO the freshly grown proof tree (the
-            // captured fixture has `ONE/ONE` from the protocol's
-            // first rule case).  Since our Rust solver returns a
-            // status rather than the proof tree, we land on the
-            // proof root.  Both shapes are accepted by the frontend
-            // dispatcher (`server.handleJson` just navigates).
+            // `TheoryProof lemma []` → `proof/<lemma>` (the empty
+            // tail produces no extra path segment — see Haskell's
+            // `renderTheoryPath` definition in `src/Web/Types.hs:372`).
+            // After autoprove, Haskell's `nextSmartThyPath` typically
+            // walks INTO the freshly grown proof tree (the captured
+            // fixture has `ONE/ONE` from the protocol's first rule
+            // case).  Since our Rust solver returns a status rather
+            // than the proof tree, we land on the proof root.  Both
+            // shapes are accepted by the frontend dispatcher
+            // (`server.handleJson` just navigates).
             let redir = format!(
-                "/thy/trace/{idx}/overview/proof/{lname}/_",
+                "/thy/trace/{idx}/overview/proof/{lname}",
                 idx = new_idx,
                 lname = lemma_name);
             json_resp::redirect(redir).into_response()
@@ -371,8 +476,10 @@ pub async fn autoprove_all(
 
     let new_idx = state.store.clone_at_new_idx(idx).unwrap_or(idx);
     let target = match last_lemma {
+        // Match Haskell `renderTheoryPath (TheoryProof lname [])` →
+        // `proof/<lname>` (no trailing `_`).
         Some(n) => format!(
-            "/thy/trace/{idx}/overview/proof/{lname}/_",
+            "/thy/trace/{idx}/overview/proof/{lname}",
             idx = new_idx,
             lname = n),
         None => format!("/thy/trace/{}/overview/help", new_idx),
