@@ -195,7 +195,16 @@ pub fn precompute_full_sources(
         let goal = Goal::Premise(
             (goal_node.clone(), PremIdx(0)), abstract_fact.clone());
 
-        let sys = System::empty();
+        // Haskell-faithful: inject the theory's restrictions into each
+        // case-system before saturate.  Mirrors `initialSource ctxt
+        // restrictions goal` (Sources.hs:102):
+        //   se0 = insertLemmas restrictions $ emptySystem RawSource ...
+        // Restrictions then fire on rule actions during saturate, so
+        // e.g. `True_is_true` on Responder's `IsTrue(z)` action forces
+        // z=true and drops cases whose variant subst doesn't satisfy
+        // that constraint.
+        let mut sys = System::empty();
+        sys.insert_lemmas(ctx.restrictions.clone());
         let mut red = Reduction::new(ctx, sys);
         red.insert_goal(goal.clone());
         let outcome = red.solve_premise_goal(
@@ -303,7 +312,9 @@ pub fn precompute_full_sources(
     for pat in ku_patterns {
         let ku_fact = crate::fact::ku_fact(pat.clone());
         let goal = Goal::Action(goal_node.clone(), ku_fact.clone());
-        let sys = System::empty();
+        // Haskell-faithful: inject restrictions (see protoGoals branch).
+        let mut sys = System::empty();
+        sys.insert_lemmas(ctx.restrictions.clone());
         let mut red = Reduction::new(ctx, sys);
         red.insert_goal(goal.clone());
         let outcome = red.solve_action_goal(&goal_node, &ku_fact);

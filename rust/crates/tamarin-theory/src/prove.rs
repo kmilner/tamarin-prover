@@ -117,7 +117,7 @@ pub fn prove_lemma(
         crate::theory::TraceQuantifier::ExistsTrace => p::TraceQuantifier::ExistsTrace,
     };
     let mut sys = formula_to_system(
-        restrictions,
+        restrictions.clone(),
         SourceKind::RawSources,
         tq,
         false,
@@ -139,7 +139,7 @@ pub fn prove_lemma(
     if trace { eprintln!("[phase] formula_to_system done; ProofContext::new start"); }
     // Bridge the elaborated theory's rules into the proof context.
     let rules: Vec<OpenProtoRule> = theory.rules().cloned().collect();
-    let mut ctx = ProofContext::new(maude, rules);
+    let mut ctx = ProofContext::new_with_restrictions(maude, rules, restrictions.clone());
     if trace { eprintln!("[phase] ProofContext::new done"); }
     // Propagate the lemma's trace quantifier so `is_finished` can
     // decide whether the Fresh-conflation case-drop should convert

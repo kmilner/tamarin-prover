@@ -60,13 +60,37 @@ pub struct ProofContext {
     /// to false; set by `prove_lemma` based on the lemma's
     /// trace-quantifier attribute.
     pub is_exists_trace: bool,
+    /// Theory-level restrictions (safety formulas), in guarded form.
+    /// Mirrors Haskell's `pcRestrictions` — passed to `initialSource`
+    /// so each precomputed source-case starts from a system with the
+    /// restrictions installed as `sLemmas`.  Without this, restrictions
+    /// like `True_is_true` never fire during precompute saturation,
+    /// leaving spurious cases (e.g. Responder for `KU(senc)` in
+    /// Pattern_matching::Responder_secrecy) that Haskell would have
+    /// dropped via the restriction's implied-formula propagation.
+    pub restrictions: Vec<crate::guarded::Guarded>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UseInduction { UseInduction, AvoidInduction }
 
 impl ProofContext {
-    pub fn new(maude: MaudeHandle, mut rules: Vec<OpenProtoRule>) -> Self {
+    pub fn new(maude: MaudeHandle, rules: Vec<OpenProtoRule>) -> Self {
+        Self::new_with_restrictions(maude, rules, Vec::new())
+    }
+
+    /// Variant that accepts the theory-level restrictions.  Mirrors
+    /// Haskell's `precomputeSources parameters ctxt restrictions`
+    /// which threads restrictions into each `initialSource`'s system
+    /// via `insertLemmas`.  Restrictions then fire on rule actions
+    /// during saturate, dropping cases that violate them — e.g.
+    /// `True_is_true` on Responder's `IsTrue(z)` action drops the
+    /// Responder case for `KU(senc(...))` in Pattern_matching.
+    pub fn new_with_restrictions(
+        maude: MaudeHandle,
+        mut rules: Vec<OpenProtoRule>,
+        restrictions: Vec<crate::guarded::Guarded>,
+    ) -> Self {
         // Inherit the maude signature from the handle so we can
         // synthesise per-symbol construction rules.
         let sig = maude.maude_sig();
@@ -248,6 +272,7 @@ impl ProofContext {
             injective_fact_insts,
             full_sources: Vec::new(),
             is_exists_trace: false,
+            restrictions,
         };
         // Precompute unique sources from the protocol rules.
         let params = crate::constraint::solver::sources::IntegerParameters::default();
