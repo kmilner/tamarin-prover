@@ -395,6 +395,104 @@ pub fn saturate_sources_maude(
     saturate_sources_inner(sources, limit, Some(ctx))
 }
 
+/// Helper: `true` iff `sys` has an unsolved `Chain(c, p)` whose
+/// start term has a fixed non-Msg sort (Fresh/Pub/Nat) and whose
+/// end term is App-headed.  Such a chain can never close: no
+/// destructor rule maps a Fresh/Pub/Nat-sorted value to a function
+/// application of a different head, and direct unification
+/// (Fresh ⊆ Msg vs senc-shape) fails.
+///
+/// Mirrors the **shape-level** impossibility that Haskell catches
+/// via its lazy `Disj`-monad backtracking inside `refineSource` —
+/// Haskell's `solveAllSafeGoals` extends the chain via destructors
+/// and `mzero`s when no extension is viable.  Our saturate keeps
+/// the chain open, so we need an explicit drop here.
+fn case_has_impossible_open_chain(
+    sys: &crate::constraint::system::System,
+) -> bool {
+    use crate::constraint::constraints::Goal;
+    use crate::fact::FactTag;
+    use tamarin_term::lterm::{LSort, NameTag};
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+
+    for (g, st) in &sys.goals {
+        if st.solved { continue; }
+        let Goal::Chain(c, p) = g else { continue; };
+        let c_rule = sys.nodes.iter().find(|(id, _)| id == &c.0).map(|(_, r)| r);
+        let p_rule = sys.nodes.iter().find(|(id, _)| id == &p.0).map(|(_, r)| r);
+        let (Some(c_rule), Some(p_rule)) = (c_rule, p_rule) else { continue };
+        let Some(conc_fact) = c_rule.conclusions.get(c.1.0) else { continue };
+        let Some(prem_fact) = p_rule.premises.get(p.1.0) else { continue };
+        if !matches!(conc_fact.tag, FactTag::Kd) { continue; }
+        if !matches!(prem_fact.tag, FactTag::Kd) { continue; }
+        let Some(t_start) = conc_fact.terms.first() else { continue };
+        let Some(t_end) = prem_fact.terms.first() else { continue };
+
+        // Determine t_start's "fixed sort" — Fresh/Pub/Nat (Var) or
+        // Fresh constant (Lit::Con).  Msg vars don't have a fixed
+        // sort.  App-headed terms are excluded (they can extend
+        // via destructors of matching head).
+        let t_start_fixed_sort: Option<LSort> = match t_start {
+            Term::Lit(Lit::Var(v)) if !matches!(v.sort, LSort::Msg) => Some(v.sort),
+            Term::Lit(Lit::Con(n)) => Some(match n.tag {
+                NameTag::Pub => LSort::Pub,
+                NameTag::Fresh => LSort::Fresh,
+                NameTag::Nat => LSort::Nat,
+                NameTag::Node => LSort::Node,
+            }),
+            _ => None,
+        };
+        let Some(_start_sort) = t_start_fixed_sort else { continue };
+
+        // t_end must be App-headed with a different "shape" — i.e.
+        // a non-trivial function application that can't accept a
+        // Fresh/Pub/Nat-sorted value as its own root.  We use the
+        // simplest check: t_end is an App.
+        let t_end_is_app = matches!(t_end, Term::App(_, _));
+        if !t_end_is_app { continue; }
+
+        // The chain shape is incompatible.  No destructor maps
+        // Fresh/Pub/Nat to an App-headed term of arbitrary shape
+        // (destructors are head-specific: d_fst extracts pair
+        // components, d_sdec extracts senc plaintexts, etc., all
+        // requiring the input to already be App-headed of the
+        // matching constructor).
+        return true;
+    }
+    false
+}
+
+/// **Drop contradictory cases** — Haskell-faithful final filter.
+///
+/// After `saturateSources`, walk each source's cases and drop any
+/// whose system has a `contradictions()` non-empty.  Haskell's
+/// `refineSource` (Sources.hs:118-133) runs each case through the
+/// `Reduction` monad whose `Disj` short-circuits via `mzero` on
+/// `contradictoryIf` (Sources.hs:178 in `solveAllSafeGoals`).  A
+/// case whose system is contradictory after saturation never
+/// appears in `cdCases`.
+///
+/// Our saturate keeps cases by name but doesn't check the final
+/// system for contradictions — so impossible chains (e.g. an
+/// `Out(k:Fresh) → Kd(senc(...))` chain where no destructor maps
+/// Fresh → senc) survive into runtime as bogus cases.  This pass
+/// closes the gap.
+pub fn drop_contradictory_cases(
+    sources: Vec<Source>,
+    ctx: &crate::constraint::solver::context::ProofContext,
+) -> Vec<Source> {
+    use crate::constraint::solver::contradictions::contradictions;
+    sources.into_iter().map(|src| {
+        let cases: Vec<_> = src.cases.into_iter()
+            .filter(|(_, sys)| contradictions(ctx, sys).is_empty()
+                            && !sys.eq_store.is_false()
+                            && !case_has_impossible_open_chain(sys))
+            .collect();
+        Source { goal: src.goal, cases, incomplete: src.incomplete }
+    }).collect()
+}
+
 /// **Source-case-level loop-breaker** (experimental, currently
 /// disabled at the call site in `context.rs`) — drop precomputed
 /// cases whose nodes contain an `In(_)` premise whose term-shape
