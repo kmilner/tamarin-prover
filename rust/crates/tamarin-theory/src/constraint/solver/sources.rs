@@ -543,76 +543,42 @@ fn case_has_surviving_variant(
     ctx: &crate::constraint::solver::context::ProofContext,
     sys: &crate::constraint::system::System,
 ) -> bool {
-    use crate::constraint::solver::contradictions::contradictions;
-    use crate::constraint::solver::reduction::{Reduction, GoalCases};
-    use crate::constraint::constraints::Goal;
-
+    // Haskell-faithful (Sources.hs:118-133):
+    //   refinement = do (names, se) <- get cdCases th
+    //                   ((x, names'), se') <- fst <$>
+    //                       runReduction proofStep ctxt se fs
+    //                   return (...)
+    // `runReduction proofStep ctxt se fs` returns `[(result, final_sys)]`
+    // — the list of all Disj-monad branches that survived `proofStep`.
+    // If the list is empty, the input case (this `sys`) contributes
+    // NOTHING to `newCases` ⇒ the case is dropped.
+    //
+    // `proofStep` is `solveAllSafeGoals (filter goodTh ths) limit`.
+    // Our `run_solve_all_safe_goals_disj` is exactly this — a
+    // worklist-based Disj-monad explorer that drops branches on
+    // mzero (contradiction).  Return value is the list of survivors.
+    //
+    // So the Haskell-faithful drop test is simply: run the multi-
+    // branch saturate; keep the case iff the result is non-empty.
     let dbg = std::env::var("TAM_DBG_VARIANT").is_ok();
-
-    // Run simplify + safe-goals saturate with restrictions.  The
-    // saturate closes chains, applies splitS, and fires restriction-
-    // implied formulas.  This is the Haskell-faithful path:
-    // `simplifySystem` + `solveAllSafeGoals` in `refineSource`.
     let mut base_sys = sys.clone();
     base_sys.insert_lemmas(ctx.restrictions.clone());
-    let mut r = Reduction::new(ctx, base_sys);
     set_precompute_mode(true);
-    let mut used: std::collections::BTreeSet<String> = Default::default();
-    let _ = solve_all_safe_goals_tracked(
-        &mut r, &[], &mut used, /* chains_limit */ 10);
+    let branch_cap: usize = std::env::var("TAM_DROP_BRANCH_CAP")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+    let outer_cap: i64 = std::env::var("TAM_DROP_OUTER_CAP")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(40);
+    let branches = run_solve_all_safe_goals_disj(
+        ctx, base_sys, &[],
+        /* chains_limit */ 10,
+        /* outer_cap */ outer_cap,
+        /* branch_cap */ branch_cap,
+        String::new());
     set_precompute_mode(false);
-    if !contradictions(ctx, &r.sys).is_empty()
-        || r.sys.eq_store.is_false()
-        || case_has_impossible_open_chain(&r.sys)
-    {
-        if dbg { eprintln!("[variant] saturate→contradiction"); }
-        return false;
+    if dbg {
+        eprintln!("[variant] disj-monad surviving branches={}", branches.len());
     }
-
-    // If there's STILL an unsolved Split goal after saturate (maybe
-    // because saturate's single-pick couldn't process it without
-    // committing to ONE branch), enumerate all variant branches
-    // explicitly and check viability of each.
-    set_precompute_mode(true);
-    let split_id = r.sys.goals.iter().find_map(|(g, st)| {
-        if st.solved { return None; }
-        if let Goal::Split(id) = g { Some(*id) } else { None }
-    });
-    if let Some(id) = split_id {
-        let outcome = r.solve_split_goal(id);
-        let outcome_kind = match &outcome {
-            GoalCases::Contradictory => "Contradictory".to_string(),
-            GoalCases::Linear => "Linear".to_string(),
-            GoalCases::LinearNamed(_) => "LinearNamed".to_string(),
-            GoalCases::Cases(cs) => format!("Cases({})", cs.len()),
-        };
-        if dbg {
-            eprintln!("[variant] split_id={:?} outcome={}", id, outcome_kind);
-        }
-        let cases = match outcome {
-            GoalCases::Contradictory => {
-                set_precompute_mode(false);
-                return false;
-            }
-            GoalCases::Linear | GoalCases::LinearNamed(_) => {
-                set_precompute_mode(false);
-                return case_has_surviving_variant(ctx, &r.sys);
-            }
-            GoalCases::Cases(cs) => cs,
-        };
-        set_precompute_mode(false);
-        let mut survivors = 0;
-        for (vname, branch_sys) in &cases {
-            let viable = case_has_surviving_variant(ctx, branch_sys);
-            if dbg {
-                eprintln!("[variant]   branch={} viable={}", vname, viable);
-            }
-            if viable { survivors += 1; }
-        }
-        return survivors > 0;
-    }
-    set_precompute_mode(false);
-    true
+    !branches.is_empty()
 }
 
 /// **Source-case-level loop-breaker** (experimental, currently
