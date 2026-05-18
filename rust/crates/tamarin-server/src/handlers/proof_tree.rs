@@ -211,6 +211,24 @@ impl ProofState {
         Ok(())
     }
 
+    /// Fork this proof state: share the same `ProofContext` (so we
+    /// don't re-precompute sources / re-boot Maude) but deep-copy the
+    /// per-lemma proof trees so mutations on one idx don't leak to the
+    /// other.  Mirrors Haskell `modifyTheory`'s value-typed
+    /// `IncrementalProof` semantics: each version-fork sees the source
+    /// tree at the moment of fork, then evolves independently.
+    pub fn fork(&self) -> Self {
+        let src = self.by_lemma.lock();
+        let mut clone: BTreeMap<String, LemmaProofState> = BTreeMap::new();
+        for (k, v) in src.iter() {
+            clone.insert(k.clone(), LemmaProofState { root: v.root.clone() });
+        }
+        ProofState {
+            ctx: self.ctx.clone(),
+            by_lemma: Arc::new(Mutex::new(clone)),
+        }
+    }
+
     /// Read the root ProofNode for a lemma.
     pub fn get_root(&self, lemma: &str) -> Option<ProofNode> {
         self.by_lemma.lock().get(lemma).map(|lp| lp.root.clone())
@@ -391,63 +409,55 @@ fn write_applicable_methods(
     sys: &System,
     ctx: &ProofContext,
 ) {
-    let methods = candidate_methods(sys, ctx);
+    // Match Haskell `rankProofMethods` (`ProofMethod.hs:653-668`):
+    // candidates come from `proofMethods`, then `execMethods` filters
+    // via `mapMaybe execMethod` to those that successfully apply.  In
+    // Rust, `candidate_methods` is the un-filtered list (used by the
+    // search loop which tries each in order); for the UI we must
+    // filter, so the user-visible numbering matches the actual click
+    // semantics (otherwise the user can click an inapplicable method
+    // and get an alert).  Filtering is exactly Haskell's
+    // `execProofMethod` call — same cost the search loop pays.
+    let methods: Vec<ProofMethod> = candidate_methods(sys, ctx)
+        .into_iter()
+        .filter(|m| exec_proof_method(ctx, m, sys).is_some())
+        .collect();
     if methods.is_empty() {
         out.push_str("<h3>Constraint System is Solved or Unfinishable</h3>\n");
         return;
     }
     out.push_str("<h3>Applicable Proof Methods:</h3>\n");
     out.push_str("<div class=\"preformatted methods\"><pre>");
+    // Mirror Haskell `Web.Theory.subProofSnippet` (`Web/Theory.hs:593-596`):
+    // each ranked method N (1-based) emits
+    //   <a class="internal-link proof-method"
+    //      href="/thy/trace/<idx>/main/method/<lemma>/<N>/<sub>">label</a>
+    // The frontend's `mainDisplay.applyProofMethod` keyboard shortcuts
+    // (1..9) target `div.methods a.internal-link`, and the click handler
+    // for `internal-link` posts the URL via `server.handleJson` —
+    // landing on our `/main/method/...` route which dispatches to
+    // `apply_method_and_redirect` and returns a `{redirect}`.
     for (i, m) in methods.iter().enumerate() {
         let nr = i + 1;
-        let method_url = method_to_url(m, sys);
-        if let Some(url_frag) = method_url {
-            out.push_str(&format!(
-                "{nr}. <a class=\"ajax-action proof-step proof-method\" href=\"/thy/trace/{idx}/proof-step/{lemma}{path}/{frag}\">{label}</a>\n",
-                nr = nr,
-                idx = idx,
-                lemma = url_path_escape(lemma),
-                path = url_path,
-                frag = url_frag,
-                label = html_escape(&method_label(m)),
-            ));
-        } else {
-            out.push_str(&format!(
-                "{nr}. {label}\n",
-                nr = nr,
-                label = html_escape(&method_label(m)),
-            ));
-        }
+        out.push_str(&format!(
+            "{nr}. <a class=\"internal-link proof-method\" href=\"/thy/trace/{idx}/main/method/{lemma}/{nr}{path}\">{label}</a>\n",
+            nr = nr,
+            idx = idx,
+            lemma = url_path_escape(lemma),
+            path = url_path,
+            label = html_escape(&method_label(m)),
+        ));
     }
     out.push_str("</pre></div>\n");
     // Autoprove links — match Haskell's `a.` / `b.` / `s.` style.
     out.push_str(&format!(
-        "<p>a. <a class=\"ajax-action autoprove\" href=\"/thy/trace/{idx}/autoprove/idfs/0/false/proof/{lemma}{path}\">autoprove</a> &nbsp; \
-         b. <a class=\"ajax-action bounded-autoprove\" href=\"/thy/trace/{idx}/autoprove/idfs/5/false/proof/{lemma}{path}\">autoprove</a> with proof-depth bound 5 &nbsp; \
-         s. <a class=\"ajax-action autoprove-all\" href=\"/thy/trace/{idx}/autoprove-all/idfs/0/proof/{lemma}{path}\">autoprove</a> for all lemmas\n</p>\n",
+        "<p>a. <a class=\"internal-link autoprove\" href=\"/thy/trace/{idx}/autoprove/idfs/0/false/proof/{lemma}{path}\">autoprove</a> &nbsp; \
+         b. <a class=\"internal-link bounded-autoprove\" href=\"/thy/trace/{idx}/autoprove/idfs/5/false/proof/{lemma}{path}\">autoprove</a> with proof-depth bound 5 &nbsp; \
+         s. <a class=\"internal-link autoprove-all\" href=\"/thy/trace/{idx}/autoprove-all/idfs/0/proof/{lemma}{path}\">autoprove</a> for all lemmas\n</p>\n",
         idx = idx,
         lemma = url_path_escape(lemma),
         path = url_path,
     ));
-}
-
-fn method_to_url(m: &ProofMethod, sys: &System) -> Option<String> {
-    match m {
-        ProofMethod::Simplify => Some("simplify".to_string()),
-        ProofMethod::Induction => Some("induction".to_string()),
-        ProofMethod::Sorry(_) => Some("sorry".to_string()),
-        ProofMethod::SolveGoal(g) => {
-            // Find this goal's 1-based unsolved index.
-            let mut nr = 0;
-            for (cand, st) in &sys.goals {
-                if st.solved { continue; }
-                nr += 1;
-                if cand == g { return Some(format!("solve/{}", nr)); }
-            }
-            None
-        }
-        ProofMethod::Finished(_) | ProofMethod::Invalidated => None,
-    }
 }
 
 fn render_node(

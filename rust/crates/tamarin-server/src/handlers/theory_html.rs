@@ -184,10 +184,15 @@ fn proof_state(entry: &TheoryEntry) -> String {
             }
         }
         if !rendered_tree {
+            // Static fallback "by sorry" link — points at the LEMMA
+            // ROOT proof path (sub = []), matching Haskell's URL
+            // emission `proof/<lemma>` (no trailing `_`).  See
+            // `path_parse.rs` for the parser's `proof/<lemma>` →
+            // `sub = []` semantics.
             out.push_str(&format!(
                 "&nbsp;<span class=\"hl_keyword\">by</span> \
                  <a class=\"internal-link proof-step sorry-step\" \
-                 href=\"/thy/trace/{idx}/main/proof/{n_url}/_\">\
+                 href=\"/thy/trace/{idx}/main/proof/{n_url}\">\
                  <span class=\"hl_keyword\">sorry</span></a><br>\n",
                 idx = idx,
                 n_url = url_path_escape_local(&l.name),
@@ -218,8 +223,14 @@ fn render_index_node(
         tamarin_theory::constraint::solver::search::NodeStatus::Unfinishable => "hl_medium",
     };
     let label = crate::handlers::proof_tree::method_label(&node.method);
+    // Class includes `internal-link` so the frontend JS picks it up
+    // (events.installRelativeClickHandler targets
+    // `div#proof a.internal-link.proof-step`); see
+    // `data/js/tamarin-prover-ui.js:428-433`.  Without that class, the
+    // sorry-step link is a plain anchor — clicking does nothing
+    // because the AJAX handler isn't installed on it.
     out.push_str(&format!(
-        "<a class=\"proof-step {cls}\" href=\"/thy/trace/{idx}/main/proof/{lemma}{path}\">{label}</a><br>\n",
+        "<a class=\"internal-link proof-step {cls}\" href=\"/thy/trace/{idx}/main/proof/{lemma}{path}\">{label}</a><br>\n",
         cls = cls,
         idx = idx,
         lemma = url_path_escape_local(lemma),
