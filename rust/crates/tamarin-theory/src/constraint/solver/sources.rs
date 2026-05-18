@@ -232,8 +232,9 @@ pub fn precompute_full_sources(
         // `Secret(I,R,x:Msg)` (or similar) is incompatible with a pre-
         // existing fresh-binding survive precompute and produce stray
         // `_case_2` siblings at runtime (Bug 2 from agent ab16c432c4c2).
-        let normalize_and_keep = |sys: System| -> Option<System> {
+        let normalize_and_keep = |sys: System, _case_name: &str| -> Option<System> {
             let mut r = Reduction::new(ctx, sys);
+            r.sys.insert_lemmas(ctx.restrictions.clone());
             r.subst_system();
             crate::constraint::solver::simplify::simplify_system(&mut r);
             if r.sys.eq_store.is_false() { return None; }
@@ -245,12 +246,18 @@ pub fn precompute_full_sources(
             Some(s)
         };
         let cases: Vec<(String, System)> = match outcome {
-            GoalCases::Linear => normalize_and_keep(red.sys)
+            GoalCases::Linear => normalize_and_keep(red.sys, "only")
                 .map(|s| vec![("only".into(), s)]).unwrap_or_default(),
-            GoalCases::LinearNamed(name) => normalize_and_keep(red.sys)
-                .map(|s| vec![(name, s)]).unwrap_or_default(),
+            GoalCases::LinearNamed(name) => {
+                let name_cloned = name.clone();
+                normalize_and_keep(red.sys, &name_cloned)
+                    .map(|s| vec![(name, s)]).unwrap_or_default()
+            }
             GoalCases::Cases(systems) => systems.into_iter()
-                .filter_map(|(name, s)| normalize_and_keep(s).map(|s| (name, s)))
+                .filter_map(|(name, s)| {
+                    let n = name.clone();
+                    normalize_and_keep(s, &n).map(|s| (name, s))
+                })
                 .collect(),
             GoalCases::Contradictory => Vec::new(),
         };
@@ -328,8 +335,10 @@ pub fn precompute_full_sources(
         // `Secret(I,R,x:Msg)` (or similar) is incompatible with a pre-
         // existing fresh-binding survive precompute and produce stray
         // `_case_2` siblings at runtime (Bug 2 from agent ab16c432c4c2).
-        let normalize_and_keep = |sys: System| -> Option<System> {
+        let normalize_and_keep = |sys: System, _case_name: &str| -> Option<System> {
             let mut r = Reduction::new(ctx, sys);
+            // Re-inject restrictions (see proto branch above).
+            r.sys.insert_lemmas(ctx.restrictions.clone());
             r.subst_system();
             crate::constraint::solver::simplify::simplify_system(&mut r);
             if r.sys.eq_store.is_false() { return None; }
@@ -341,12 +350,18 @@ pub fn precompute_full_sources(
             Some(s)
         };
         let cases: Vec<(String, System)> = match outcome {
-            GoalCases::Linear => normalize_and_keep(red.sys)
+            GoalCases::Linear => normalize_and_keep(red.sys, "only")
                 .map(|s| vec![("only".into(), s)]).unwrap_or_default(),
-            GoalCases::LinearNamed(name) => normalize_and_keep(red.sys)
-                .map(|s| vec![(name, s)]).unwrap_or_default(),
+            GoalCases::LinearNamed(name) => {
+                let n2 = name.clone();
+                normalize_and_keep(red.sys, &n2)
+                    .map(|s| vec![(name, s)]).unwrap_or_default()
+            }
             GoalCases::Cases(systems) => systems.into_iter()
-                .filter_map(|(name, s)| normalize_and_keep(s).map(|s| (name, s)))
+                .filter_map(|(name, s)| {
+                    let n2 = name.clone();
+                    normalize_and_keep(s, &n2).map(|s| (name, s))
+                })
                 .collect(),
             GoalCases::Contradictory => Vec::new(),
         };
@@ -494,11 +509,53 @@ pub fn drop_contradictory_cases(
     ctx: &crate::constraint::solver::context::ProofContext,
 ) -> Vec<Source> {
     use crate::constraint::solver::contradictions::contradictions;
+    use crate::constraint::solver::reduction::Reduction;
+    let dbg = std::env::var("TAM_DBG_DROP").is_ok();
     sources.into_iter().map(|src| {
+        let goal_str = format!("{:?}", src.goal).chars().take(60).collect::<String>();
         let cases: Vec<_> = src.cases.into_iter()
-            .filter(|(_, sys)| contradictions(ctx, sys).is_empty()
-                            && !sys.eq_store.is_false()
-                            && !case_has_impossible_open_chain(sys))
+            .filter(|(name, sys)| {
+                // Haskell-faithful drop: mirror saturate's solve loop
+                // (Sources.hs:174-215) on each case-system.  Restrictions
+                // are in `sLemmas`; `simplifySystem` fires
+                // `insertImpliedFormulas` (e.g. `True_is_true` on
+                // Responder's `IsTrue(z)` → `EqE z true` → eq-store).
+                // Then `solveAllSafeGoals` picks Split (variant
+                // disjunction) goals because `splitAllowed` flips True
+                // when no msg-var KD chain remains in `openGoals`.
+                // Each variant branch unifies the variant's substitution
+                // with the eq-store; variants whose variant subst
+                // conflicts with the restriction-driven equations
+                // (e.g. variant 1's `z = and(encSucc, isPair)` vs
+                // `z = true`) mzero out.  Cases with zero surviving
+                // variants drop.
+                let mut sys = sys.clone();
+                sys.insert_lemmas(ctx.restrictions.clone());
+                let mut r = Reduction::new(ctx, sys);
+                let actions_before: Vec<_> = r.sys.nodes.iter()
+                    .flat_map(|(nid, rule)| rule.actions.iter()
+                        .map(move |a| (nid.clone(), a.clone())))
+                    .collect();
+                set_precompute_mode(true);
+                // Run an outer simplify-then-saturate pass.  Bounded
+                // outer iteration cap to avoid runaway: saturate's own
+                // internal loop already has a budget.
+                let mut used: std::collections::BTreeSet<String> = Default::default();
+                let _ = solve_all_safe_goals_tracked(
+                    &mut r, &[], &mut used, /* chains_limit */ 10);
+                set_precompute_mode(false);
+                let contras = contradictions(ctx, &r.sys);
+                let eq_false = r.sys.eq_store.is_false();
+                let impossible = case_has_impossible_open_chain(&r.sys);
+                let keep = contras.is_empty() && !eq_false && !impossible;
+                if dbg {
+                    eprintln!("[drop] goal={} case={} nodes={} actions={} contras={} \
+                              eq_false={} impossible={} keep={}",
+                        goal_str, name, r.sys.nodes.len(), actions_before.len(),
+                        contras.len(), eq_false, impossible, keep);
+                }
+                keep
+            })
             .collect();
         Source { goal: src.goal, cases, incomplete: src.incomplete }
     }).collect()
