@@ -510,55 +510,109 @@ pub fn drop_contradictory_cases(
 ) -> Vec<Source> {
     use crate::constraint::solver::contradictions::contradictions;
     use crate::constraint::solver::reduction::Reduction;
+    use crate::constraint::constraints::Goal;
     let dbg = std::env::var("TAM_DBG_DROP").is_ok();
     sources.into_iter().map(|src| {
-        let goal_str = format!("{:?}", src.goal).chars().take(60).collect::<String>();
+        let goal_str = format!("{:?}", src.goal).chars().take(80).collect::<String>();
         let cases: Vec<_> = src.cases.into_iter()
             .filter(|(name, sys)| {
-                // Haskell-faithful drop: mirror saturate's solve loop
-                // (Sources.hs:174-215) on each case-system.  Restrictions
-                // are in `sLemmas`; `simplifySystem` fires
-                // `insertImpliedFormulas` (e.g. `True_is_true` on
-                // Responder's `IsTrue(z)` → `EqE z true` → eq-store).
-                // Then `solveAllSafeGoals` picks Split (variant
-                // disjunction) goals because `splitAllowed` flips True
-                // when no msg-var KD chain remains in `openGoals`.
-                // Each variant branch unifies the variant's substitution
-                // with the eq-store; variants whose variant subst
-                // conflicts with the restriction-driven equations
-                // (e.g. variant 1's `z = and(encSucc, isPair)` vs
-                // `z = true`) mzero out.  Cases with zero surviving
-                // variants drop.
-                let mut sys = sys.clone();
-                sys.insert_lemmas(ctx.restrictions.clone());
-                let mut r = Reduction::new(ctx, sys);
-                let actions_before: Vec<_> = r.sys.nodes.iter()
-                    .flat_map(|(nid, rule)| rule.actions.iter()
-                        .map(move |a| (nid.clone(), a.clone())))
-                    .collect();
-                set_precompute_mode(true);
-                // Run an outer simplify-then-saturate pass.  Bounded
-                // outer iteration cap to avoid runaway: saturate's own
-                // internal loop already has a budget.
-                let mut used: std::collections::BTreeSet<String> = Default::default();
-                let _ = solve_all_safe_goals_tracked(
-                    &mut r, &[], &mut used, /* chains_limit */ 10);
-                set_precompute_mode(false);
-                let contras = contradictions(ctx, &r.sys);
-                let eq_false = r.sys.eq_store.is_false();
-                let impossible = case_has_impossible_open_chain(&r.sys);
-                let keep = contras.is_empty() && !eq_false && !impossible;
+                let keep = case_has_surviving_variant(ctx, sys);
                 if dbg {
-                    eprintln!("[drop] goal={} case={} nodes={} actions={} contras={} \
-                              eq_false={} impossible={} keep={}",
-                        goal_str, name, r.sys.nodes.len(), actions_before.len(),
-                        contras.len(), eq_false, impossible, keep);
+                    eprintln!("[drop] goal={} case={} keep={}", goal_str, name, keep);
                 }
                 keep
             })
             .collect();
         Source { goal: src.goal, cases, incomplete: src.incomplete }
     }).collect()
+}
+
+/// Haskell-faithful contradictory-case filter via Disj-monad
+/// variant enumeration.  Mirrors `refineSource`'s
+/// `runReduction proofStep ctxt se fs` (Sources.hs:131): each open
+/// Split goal in the case fans out into branches; each branch runs
+/// simplify; branches with contradictions mzero out.  If ALL branches
+/// of a Split mzero, the entire case is contradictory and dropped.
+///
+/// Without this, single-pick saturate commits to the first variant
+/// and misses contradictions Haskell catches via full Disj-monad
+/// exploration (e.g. `True_is_true` forces z=true, but Responder's
+/// variant subst maps z to and(encSucc, isPair) — incompatible with
+/// every variant after Maude AC reduction).
+fn case_has_surviving_variant(
+    ctx: &crate::constraint::solver::context::ProofContext,
+    sys: &crate::constraint::system::System,
+) -> bool {
+    use crate::constraint::solver::contradictions::contradictions;
+    use crate::constraint::solver::reduction::{Reduction, GoalCases};
+    use crate::constraint::constraints::Goal;
+
+    let dbg = std::env::var("TAM_DBG_VARIANT").is_ok();
+
+    // Run simplify + safe-goals saturate with restrictions.  The
+    // saturate closes chains, applies splitS, and fires restriction-
+    // implied formulas.  This is the Haskell-faithful path:
+    // `simplifySystem` + `solveAllSafeGoals` in `refineSource`.
+    let mut base_sys = sys.clone();
+    base_sys.insert_lemmas(ctx.restrictions.clone());
+    let mut r = Reduction::new(ctx, base_sys);
+    set_precompute_mode(true);
+    let mut used: std::collections::BTreeSet<String> = Default::default();
+    let _ = solve_all_safe_goals_tracked(
+        &mut r, &[], &mut used, /* chains_limit */ 10);
+    set_precompute_mode(false);
+    if !contradictions(ctx, &r.sys).is_empty()
+        || r.sys.eq_store.is_false()
+        || case_has_impossible_open_chain(&r.sys)
+    {
+        if dbg { eprintln!("[variant] saturate→contradiction"); }
+        return false;
+    }
+
+    // If there's STILL an unsolved Split goal after saturate (maybe
+    // because saturate's single-pick couldn't process it without
+    // committing to ONE branch), enumerate all variant branches
+    // explicitly and check viability of each.
+    set_precompute_mode(true);
+    let split_id = r.sys.goals.iter().find_map(|(g, st)| {
+        if st.solved { return None; }
+        if let Goal::Split(id) = g { Some(*id) } else { None }
+    });
+    if let Some(id) = split_id {
+        let outcome = r.solve_split_goal(id);
+        let outcome_kind = match &outcome {
+            GoalCases::Contradictory => "Contradictory".to_string(),
+            GoalCases::Linear => "Linear".to_string(),
+            GoalCases::LinearNamed(_) => "LinearNamed".to_string(),
+            GoalCases::Cases(cs) => format!("Cases({})", cs.len()),
+        };
+        if dbg {
+            eprintln!("[variant] split_id={:?} outcome={}", id, outcome_kind);
+        }
+        let cases = match outcome {
+            GoalCases::Contradictory => {
+                set_precompute_mode(false);
+                return false;
+            }
+            GoalCases::Linear | GoalCases::LinearNamed(_) => {
+                set_precompute_mode(false);
+                return case_has_surviving_variant(ctx, &r.sys);
+            }
+            GoalCases::Cases(cs) => cs,
+        };
+        set_precompute_mode(false);
+        let mut survivors = 0;
+        for (vname, branch_sys) in &cases {
+            let viable = case_has_surviving_variant(ctx, branch_sys);
+            if dbg {
+                eprintln!("[variant]   branch={} viable={}", vname, viable);
+            }
+            if viable { survivors += 1; }
+        }
+        return survivors > 0;
+    }
+    set_precompute_mode(false);
+    true
 }
 
 /// **Source-case-level loop-breaker** (experimental, currently
@@ -2715,6 +2769,28 @@ fn solve_all_safe_goals_tracked(
         let pick = goals.iter()
             .find(|(g, _)| is_kd_prem(g) || is_chain_prem1(g))
             .or_else(|| goals.iter().find(|(g, _)| is_safe(g)));
+
+        if std::env::var("TAM_DBG_SAS_FLOW").is_ok() {
+            let goal_kinds: Vec<String> = goals.iter().map(|(g, _)| match g {
+                Goal::Chain(_, _) => "Chain".to_string(),
+                Goal::Disj(_) => "Disj".to_string(),
+                Goal::Split(_) => "Split".to_string(),
+                Goal::Subterm(_) => "Subterm".to_string(),
+                Goal::Action(_, fa) => format!("Action({:?})", fa.tag),
+                Goal::Premise(_, fa) => format!("Premise({:?})", fa.tag),
+            }).collect();
+            let pick_kind = pick.map(|(g, _)| match g {
+                Goal::Chain(_, _) => "Chain",
+                Goal::Disj(_) => "Disj",
+                Goal::Split(_) => "Split",
+                Goal::Subterm(_) => "Subterm",
+                Goal::Action(_, _) => "Action",
+                Goal::Premise(_, _) => "Premise",
+            }).unwrap_or("None");
+            eprintln!("[SAS-flow] split_allowed={} goals=[{}] pick={} eq_entries={}",
+                split_allowed, goal_kinds.join(","), pick_kind,
+                red.sys.eq_store.subst.to_list().len());
+        }
 
         if let Some((goal, _)) = pick {
             let goal = goal.clone();
