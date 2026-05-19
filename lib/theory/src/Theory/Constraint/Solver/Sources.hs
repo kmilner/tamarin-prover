@@ -60,6 +60,7 @@ import           Theory.Constraint.Solver.Goals
 import           Theory.Constraint.Solver.AnnotatedGoals
 import           Theory.Constraint.Solver.Reduction
 import           Theory.Constraint.Solver.Simplify
+import qualified Theory.Constraint.Solver.Trace          as T
 import           Theory.Constraint.System
 import           Theory.Model
 
@@ -362,19 +363,19 @@ saturateSources parameters ctxt thsInit  =
       | any or (changes `using` parList rdeepseq) && (n <= get paramSaturationLimit parameters) =
           if get showSaturationSteps parameters then
             trace ("[Saturating Sources] Step " ++ show n ++ " (Max " ++ show (get paramSaturationLimit parameters) ++ ")")
-             $ go ths' (n + 1)
-          else 
-             go ths' (n + 1)
+             $ traceSourcesStep n ths' $ go ths' (n + 1)
+          else
+             traceSourcesStep n ths' $ go ths' (n + 1)
       | n > get paramSaturationLimit parameters =
           if get showSaturationSteps parameters then
             trace ("[Saturating Sources] Saturation aborted, more than " ++ show (get paramSaturationLimit parameters) ++
-                 " iterations. (Limit can be change with -s=)") ths'
+                 " iterations. (Limit can be change with -s=)") (traceSourcesFinal ths')
           else
-            ths'
+            traceSourcesFinal ths'
       | otherwise =
           if get showSaturationSteps parameters then
-            trace "[Saturating Sources] Done" ths'
-          else ths'
+            trace "[Saturating Sources] Done" (traceSourcesFinal ths')
+          else traceSourcesFinal ths'
       where
           (changes, ths') = unzip $ map (refineSource ctxt solver) ths
           goodTh th = length (getDisj (get cdCases th)) <= 1
@@ -382,6 +383,31 @@ saturateSources parameters ctxt thsInit  =
             = do names <- solveAllSafeGoals
                             (filter goodTh ths) (get paramOpenChainsLimit parameters)
                  return (not $ null names, names)
+
+    -- Per-iteration trace: dump per-source case-name list when
+    -- TAM_HS_TRACE_SOURCES=1.  Used to diagnose Rust-port source-case
+    -- overenumeration (denning_sacco Initiator2_case_N et al.).
+    traceSourcesStep :: Integer -> [Source] -> a -> a
+    traceSourcesStep n ths_post k
+        | T.flagSources = trace (dumpSources ("SAT-STEP " ++ show n) ths_post) k
+        | otherwise     = k
+    traceSourcesFinal :: [Source] -> [Source]
+    traceSourcesFinal ths_final
+        | T.flagSources = trace (dumpSources "SAT-FINAL" ths_final) ths_final
+        | otherwise     = ths_final
+
+    dumpSources :: String -> [Source] -> String
+    dumpSources label ths_dump =
+        unlines $ ("[" ++ label ++ "] sources=" ++ show (length ths_dump))
+                : zipWith oneSource [(0::Int)..] ths_dump
+      where
+        oneSource idx th =
+            let g  = get cdGoal th
+                cs = getDisj (get cdCases th)
+                names = map (concat . fst) cs
+            in "  [" ++ label ++ " " ++ show idx ++ "] goal="
+                  ++ show g ++ " cases=" ++ show (length cs)
+                  ++ " names=" ++ show names
 
 -- | Precompute a saturated set of case distinctions.
 precomputeSources
