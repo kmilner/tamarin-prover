@@ -25,6 +25,12 @@
 --                          source-case overenumeration (e.g. denning_sacco
 --                          Initiator2_case_N cluster).
 --
+--   TAM_HS_TRACE_CHAINS — every `solveChain` invocation: chain conc,
+--                         destructor rule attempted, branch outcome
+--                         (direct-edge close vs destructor extend).
+--                         Used to pin down chain-extension branching
+--                         factor for #164.
+--
 -- Usage in code:
 --
 --   import qualified Theory.Constraint.Solver.Trace as T
@@ -42,6 +48,7 @@ module Theory.Constraint.Solver.Trace (
   , flagSimplify
   , flagCases
   , flagSources
+  , flagChains
   ) where
 
 import           Control.Monad.Disj            (MonadDisj, contradictoryIf)
@@ -76,6 +83,11 @@ flagSources :: Bool
 flagSources = unsafePerformIO $
     maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_SOURCES"
 {-# NOINLINE flagSources #-}
+
+flagChains :: Bool
+flagChains = unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_CHAINS"
+{-# NOINLINE flagChains #-}
 
 
 -- | Drop-in replacement for `contradictoryIf` with a site label.  When

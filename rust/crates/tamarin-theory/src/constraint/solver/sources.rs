@@ -1940,26 +1940,66 @@ fn saturate_out_premise(
         use tamarin_term::vterm::Lit;
         matches!(t, Term::Lit(Lit::Var(v)) if v.sort == LSort::Msg)
     }
-    // Structural equality modulo fresh variable renaming and AC.  For
-    // the chain-loop-break heuristic we use a strict variant: just
-    // structural equality after dropping LVar idx.  Mirrors Haskell's
-    // `eqModuloFreshnessNoAC` closely enough for our use (which is to
-    // prevent solving the same destructor chain twice in a row).
+    // Structural equality modulo fresh variable renaming and AC.
+    // Mirrors Haskell's `eqModuloFreshnessNoAC` (LTerm.hs:632):
+    //   normIndices = mapFrees (Arbitrary $ \x -> importBinding (LVar lvarSort x) x "")
+    // Two terms are equal modulo freshness iff they're structurally
+    // identical after renaming every free var to a fresh canonical
+    // name preserving ONLY sort (name and idx are reset).
+    //
+    // The earlier port compared `va.name == vb.name && va.sort == vb.sort`
+    // which is too strict — `enc(x:Msg, ~k:Fresh)` vs `enc(y:Msg, ~m:Fresh)`
+    // would NOT be equal-mod-freshness in Rust but ARE in Haskell.  This
+    // under-detected chain loops in close_chains_dfs, letting Rust extend
+    // chains where Haskell would loop-break.  Root cause of task #164
+    // denning_sacco Initiator2_case_N over-enumeration: Rust enumerates
+    // chain extensions that Haskell drops via `lastChainTerm` filter.
     fn eq_modulo_freshness(
         a: &tamarin_term::lterm::LNTerm,
         b: &tamarin_term::lterm::LNTerm,
     ) -> bool {
-        use tamarin_term::term::Term;
-        use tamarin_term::vterm::Lit;
-        match (a, b) {
-            (Term::Lit(Lit::Var(va)), Term::Lit(Lit::Var(vb))) =>
-                va.name == vb.name && va.sort == vb.sort,
-            (Term::Lit(Lit::Con(ca)), Term::Lit(Lit::Con(cb))) => ca == cb,
-            (Term::App(oa, xs), Term::App(ob, ys)) =>
-                oa == ob && xs.len() == ys.len()
-                    && xs.iter().zip(ys).all(|(x, y)| eq_modulo_freshness(x, y)),
-            _ => false,
+        use tamarin_term::lterm::LVar;
+        use std::collections::HashMap;
+        // Walk both terms in lockstep, assigning each var pair a
+        // canonical idx.  Two vars at corresponding positions must
+        // (a) have the same sort and (b) map to the same canonical idx.
+        fn go(
+            a: &tamarin_term::lterm::LNTerm,
+            b: &tamarin_term::lterm::LNTerm,
+            ma: &mut HashMap<LVar, u64>,
+            mb: &mut HashMap<LVar, u64>,
+            next: &mut u64,
+        ) -> bool {
+            use tamarin_term::term::Term;
+            use tamarin_term::vterm::Lit;
+            match (a, b) {
+                (Term::Lit(Lit::Var(va)), Term::Lit(Lit::Var(vb))) => {
+                    if va.sort != vb.sort { return false; }
+                    let ka = ma.get(va).cloned();
+                    let kb = mb.get(vb).cloned();
+                    match (ka, kb) {
+                        (Some(x), Some(y)) => x == y,
+                        (None, None) => {
+                            let k = *next;
+                            *next += 1;
+                            ma.insert(va.clone(), k);
+                            mb.insert(vb.clone(), k);
+                            true
+                        }
+                        _ => false,
+                    }
+                }
+                (Term::Lit(Lit::Con(ca)), Term::Lit(Lit::Con(cb))) => ca == cb,
+                (Term::App(oa, xs), Term::App(ob, ys)) =>
+                    oa == ob && xs.len() == ys.len()
+                        && xs.iter().zip(ys).all(|(x, y)| go(x, y, ma, mb, next)),
+                _ => false,
+            }
         }
+        let mut ma = HashMap::new();
+        let mut mb = HashMap::new();
+        let mut next = 0;
+        go(a, b, &mut ma, &mut mb, &mut next)
     }
     // Cap on closures per source — bounds the explosion when user
     // equations introduce many destructors. Default 256; tunable via

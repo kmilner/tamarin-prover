@@ -22,7 +22,7 @@ module Theory.Constraint.Solver.Goals (
   , plainOpenGoals
   ) where
 
--- import           Debug.Trace
+import           Debug.Trace                             (trace)
 
 import           Prelude                                 hiding (id, (.))
 
@@ -44,6 +44,7 @@ import           Theory.Constraint.Solver.AnnotatedGoals
 import           Theory.Constraint.Solver.Contradictions (substCreatesNonNormalTerms)
 import           Theory.Constraint.Solver.Reduction
 import           Theory.Constraint.System
+import qualified Theory.Constraint.Solver.Trace          as T
 import           Theory.Tools.IntruderRules (mkDUnionRule, isDExpRule, isDPMultRule, isDEMapRule)
 import           Theory.Model
 import           Term.Builtin.Convenience
@@ -295,6 +296,13 @@ solveChain :: [RuleAC]              -- ^ All destruction rules.
            -> Reduction String      -- ^ Case name to use.
 solveChain rules (c, p) = do
     faConc  <- gets $ nodeConcFact c
+    -- TAM_HS_TRACE_CHAINS: log the chain conc + n destruction rules tried.
+    let chainTrace label =
+          if T.flagChains
+            then trace ("[CHAIN] " ++ label ++ " faConc=" ++ show faConc
+                       ++ " nRules=" ++ show (length rules))
+            else id
+    chainTrace "ENTER" (return ())
     do -- solve it by a direct edge
         cRule <- gets $ nodeRule (nodeConcNode c)
         pRule <- gets $ nodeRule (nodePremNode p)
@@ -307,7 +315,8 @@ solveChain rules (c, p) = do
             caseName (viewTerm -> FApp o _)    = showFunSymName o
             caseName (viewTerm -> Lit l)       = showLitName l
         contradictoryIf (illegalCoerce pRule mPrem)
-        return (caseName mPrem)
+        let cn = caseName mPrem
+        chainTrace ("DIRECT " ++ cn) (return cn)
      `disjunction`
      -- extend it with one step
      case kFactView faConc of
@@ -324,7 +333,8 @@ solveChain rules (c, p) = do
                 -- marked as solved?
                 let v = PremIdx 0
                 faPrem <- gets $ nodePremFact (i,v)
-                extendAndMark i ru v faPrem faConc
+                chainTrace ("UNION " ++ showRuleCaseName ru)
+                  (extendAndMark i ru v faPrem faConc)
          Just (DnK, m) ->
              do -- If the chain does not start at a union message,
                 -- the usual *DG2_chain* extension is perfomed.
@@ -337,7 +347,8 @@ solveChain rules (c, p) = do
                 -- This requires a modified chain constraint def:
                 -- path via first destruction premise of rule ...
                 (v, faPrem) <- disjunctionOfList $ take 1 $ enumPrems ru
-                extendAndMark i ru v faPrem faConc
+                chainTrace ("EXTEND " ++ showRuleCaseName ru ++ " prem=" ++ show v)
+                  (extendAndMark i ru v faPrem faConc)
          _ -> error "solveChain: not a down fact"
   where
     extendAndMark :: NodeId -> RuleACInst -> PremIdx -> LNFact -> LNFact
