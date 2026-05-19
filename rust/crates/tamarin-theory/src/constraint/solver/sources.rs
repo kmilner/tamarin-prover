@@ -1272,8 +1272,15 @@ fn saturate_sources_inner_with_options(
                         Some(tamarin_term::rewriting::Equal { lhs: conc, rhs: prem })
                     }).collect();
                     if !edge_eqs.is_empty() {
+                        // Was `SplitLater`; bumped to `SplitNow` to match
+                        // Haskell `insertEdges` → `solveFactEqs SplitNow`
+                        // (System.hs near insertEdges).  Defers => SplitG
+                        // means downstream saturate iters see open Splits
+                        // rather than propagated subst — exactly the gap
+                        // that forced the defensive `chain_eqs` pass in
+                        // apply_source_case_premise (task #249).
                         let _ = r.solve_fact_eqs(
-                            crate::constraint::solver::reduction::SplitStrategy::SplitLater,
+                            crate::constraint::solver::reduction::SplitStrategy::SplitNow,
                             &edge_eqs);
                     }
                     r.subst_system();
