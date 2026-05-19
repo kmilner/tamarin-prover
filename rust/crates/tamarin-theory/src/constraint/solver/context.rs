@@ -69,6 +69,16 @@ pub struct ProofContext {
     /// Pattern_matching::Responder_secrecy) that Haskell would have
     /// dropped via the restriction's implied-formula propagation.
     pub restrictions: Vec<crate::guarded::Guarded>,
+    /// `pcTrueSubterm` — True iff every destructor rule has its
+    /// RHS as a proper subterm of its LHS (`all isSubtermRule $
+    /// filter isDestrRule $ intruder_rules`).  Mirrors Haskell's
+    /// `_pcTrueSubterm` (System.hs:763) and gates the
+    /// `has_impossible_chain` analysis: when True, only the chain-end
+    /// root symbol is checked against the chain-start's possible
+    /// decomposition root syms (a STRICTER test that fires more often);
+    /// when False, all possible subterm syms of the chain-end are
+    /// checked for intersection (a more LENIENT test).
+    pub pc_true_subterm: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +277,15 @@ impl ProofContext {
                 }
             }
         }
+        // `pcTrueSubterm` — `all isSubtermRule $ filter isDestrRule $
+        // intruder_rules`.  Mirrors `ClosedTheory.getProofContext`
+        // (`lib/theory/src/ClosedTheory.hs:112`).  When the destructor
+        // set contains only subterm-rules (sdec / fst / snd / etc., as
+        // opposed to constant-RHS rules like `isPair → true`), the
+        // strict variant of `hasImpossibleChain` applies.
+        let pc_true_subterm = intruder_rules.iter()
+            .filter(|r| crate::rule::is_destr_rule_info(&r.info))
+            .all(|r| crate::rule::is_subterm_rule_info(&r.info));
         let mut ctx = ProofContext {
             maude,
             rules,
@@ -278,6 +297,7 @@ impl ProofContext {
             full_sources: Vec::new(),
             is_exists_trace: false,
             restrictions,
+            pc_true_subterm,
         };
         // Precompute unique sources from the protocol rules.
         let params = crate::constraint::solver::sources::IntegerParameters::default();
