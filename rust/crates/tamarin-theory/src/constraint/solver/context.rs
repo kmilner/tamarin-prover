@@ -94,14 +94,19 @@ impl ProofContext {
         // Inherit the maude signature from the handle so we can
         // synthesise per-symbol construction rules.
         let sig = maude.maude_sig();
-        let mut intruder_rules = crate::intruder_rules::special_intruder_rules(false);
-        // Subterm-rule expansion: combines `constructionRules` and
-        // `destructionRules` over the signature's `stRules`.  Mirrors
-        // Haskell's `subtermIntruderRules diff maudeSig`.  Without
-        // this, `[builtins: symmetric-encryption]` etc. theories never
-        // emit decryption destructors and the intruder can't analyse
-        // received ciphertexts.
-        intruder_rules.extend(crate::intruder_rules::subterm_intruder_rules(false, &sig));
+        // Order: subterm rules FIRST, then special rules.  Mirrors
+        // Haskell's `addMessageDeductionRuleVariants` (TheoryLoader.hs:784-789):
+        //     rules = subtermIntruderRules False msig
+        //          ++ specialIntruderRules False
+        //          ++ ...
+        // The ORDER MATTERS for solveAction's `disjunctionOfList rules` —
+        // a `KU(aenc(t1,t2))` goal is matched against c_aenc BEFORE
+        // coerce, producing cdCases = [c_aenc, coerce] instead of
+        // [coerce, c_aenc].  This downstream determines which case
+        // applies first in the proof renderer (e.g. NSPK3 injective_agree
+        // picks `case c_aenc` like Haskell does).
+        let mut intruder_rules = crate::intruder_rules::subterm_intruder_rules(false, &sig);
+        intruder_rules.extend(crate::intruder_rules::special_intruder_rules(false));
         // Detect injective fact instances ahead of time — mirrors
         // Haskell's `pcInjectiveFactInsts` precomputation.
         let proto_rules: Vec<crate::rule::ProtoRuleE> = rules.iter()

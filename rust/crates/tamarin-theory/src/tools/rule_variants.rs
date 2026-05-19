@@ -141,8 +141,22 @@ fn make_proto_rule_ac(
 /// Like `expand_rule_variants`, but returns the raw variant substitutions
 /// (the `Disj LNSubstVFresh` of `RuleACConstrs` in Haskell) — the
 /// substitutions that should be installed as a SplitG goal via
-/// `solve_rule_constraints`. Filters out pure-renaming variants
-/// (matches `expand_rule_variants`' useful filter).
+/// `solve_rule_constraints`.
+///
+/// Haskell-faithful: keeps ALL variants Maude returns (including the
+/// identity).  The identity variant corresponds to "destructor doesn't
+/// reduce" — e.g. `adec(c, k)` stays as is when `c ≠ aenc(_, pk(k))`.
+/// Filtering it out drops the no-narrowing case from the SplitG, so
+/// downstream search misses the alternative where the term is irreducible.
+///
+/// Earlier versions of this function filtered out pure-renaming variants
+/// ("matches `expand_rule_variants`' useful filter").  That was wrong:
+/// `expand_rule_variants` produces the pre-applied variant *rules* (used
+/// by the legacy `o.variants` path), where the identity rule duplicates
+/// `o.rule` and is rightly skipped.  But the raw variant *substitutions*
+/// (`Disj LNSubstVFresh` of Haskell's `RuleACConstrs`) need the identity
+/// kept — it's what tells `solveRuleConstraints` to install a SplitG with
+/// both narrowing and no-narrowing branches.
 pub fn variant_substs_for_rule(
     maude: &MaudeHandle,
     rule: &ProtoRuleE,
@@ -151,10 +165,7 @@ pub fn variant_substs_for_rule(
         Some(ac) => ac,
         None => return Ok(Vec::new()),
     };
-    let useful: Vec<LNSubstVFresh> = ac.info.variants.into_iter()
-        .filter(|s| s.range().any(|t| matches!(t, Term::App(_, _))))
-        .collect();
-    Ok(useful)
+    Ok(ac.info.variants)
 }
 
 /// Port of Haskell `abstrRule` (RuleVariants.hs:93-109): walks every

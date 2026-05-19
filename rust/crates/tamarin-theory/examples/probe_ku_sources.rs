@@ -5,6 +5,7 @@ use tamarin_theory::fact::FactTag;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let path = &args[1];
+    let want_case = args.get(2).cloned();
     let src = std::fs::read_to_string(path).unwrap();
     let theory = tamarin_parser::parse_theory(&src, &[]).unwrap();
     let elab = tamarin_theory::elaborate::elaborate(&theory).unwrap();
@@ -19,8 +20,36 @@ fn main() {
         if let Goal::Action(_, fa) = &src.goal {
             if matches!(fa.tag, FactTag::Ku) {
                 println!("KU source: pattern = {:?}", fa.terms.first());
-                for (name, _) in &src.cases {
-                    println!("  case: {}", name);
+                for (name, sys) in &src.cases {
+                    let unsolved_prem_goals: usize = sys.goals.iter()
+                        .filter(|(g, st)| !st.solved && matches!(g,
+                            tamarin_theory::constraint::constraints::Goal::Premise(_, _)))
+                        .count();
+                    let chains: usize = sys.goals.iter()
+                        .filter(|(g, st)| !st.solved && matches!(g,
+                            tamarin_theory::constraint::constraints::Goal::Chain(_, _)))
+                        .count();
+                    println!("  case: {} nodes={} edges={} open_prems={} chains={} eqs={}",
+                        name, sys.nodes.len(), sys.edges.len(),
+                        unsolved_prem_goals, chains,
+                        sys.eq_store.subst.to_list().len());
+                    if want_case.as_deref() == Some(name) {
+                        println!("    -- subst entries --");
+                        for (v, t) in sys.eq_store.subst.to_list().iter() {
+                            println!("      {:?} → {:?}", v, t);
+                        }
+                        println!("    -- nodes --");
+                        for (id, rule) in &sys.nodes {
+                            let name = tamarin_theory::constraint::solver::reduction::rule_case_name(rule);
+                            println!("      {:?} = {}", id, name);
+                        }
+                        println!("    -- goals --");
+                        for (g, st) in &sys.goals {
+                            println!("      [{}] {:?}",
+                                if st.solved { "S" } else { "-" },
+                                g);
+                        }
+                    }
                 }
             }
         }

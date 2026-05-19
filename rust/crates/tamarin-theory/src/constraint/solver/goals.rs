@@ -135,21 +135,16 @@ pub fn rank_goals_with(
         Box::new(is_standard_action_goal),
         Box::new(is_not_auth_out),
         Box::new(is_private_knows_goal),
-        // Haskell's `smartRanking` (ProofMethod.hs:953) COMMENTS OUT
-        // `isFreshKnowsGoal`: "Problematic when using handles" — moving
-        // KU(t:Fresh) to a high priority traps chaum/foo/okamoto and
-        // NSLPK3-class lemmas in infinite KU(t:Fresh) recursion (each
-        // grafted B_1/I_2 introduces another KU(t:Fresh) sub-goal).
-        // Bin removed to match Haskell.
-        // Box::new(is_fresh_knows_goal),
+        // Haskell `smartRanking` solveFirst (ProofMethod.hs:1219-1232)
+        // includes `isFreshKnowsGoal` AND `isSignatureGoal` — both are
+        // active in the smart ranking. Previous comment incorrectly cited
+        // `sapicRanking` (line 953) where they're commented out. TPM
+        // lemmas (Alice_Init / PCR_Unbind ranking) rely on isFreshKnowsGoal
+        // to prefer KU(~s0) over KU(sign(...)).
+        Box::new(is_fresh_knows_goal),
         Box::new(|a: &AnnotatedGoal| is_split_goal_small(a, sys)),
         Box::new(|a: &AnnotatedGoal| is_msg_one_case_goal(a, &one_case_syms)),
-        // Haskell's smartRanking solveFirst doesn't include isSignatureGoal
-        // either (only sapicLooseRanking does at ProofMethod.hs:1224).
-        // Keeping it here would over-prefer KU(sign(...)) goals over
-        // standard sources, breaking the "expensive equation splits
-        // last" ordering. Removed.
-        // Box::new(is_signature_goal),
+        Box::new(is_signature_goal),
         // is_double_exp_goal — needs Exp/Mult view; stubbed.
         Box::new(|a: &AnnotatedGoal| is_no_large_split_goal(a, sys)),
     ];
@@ -429,13 +424,12 @@ fn chain_kd_conc_term(
 /// ChainG only when its premise targets an intruder equality rule
 /// AND there's an earlier KU action for the same msg var.
 ///
-/// Conservative default: we don't build IEquality rules generally
-/// (`Theory.Tools.IntruderRules`), so the equality check is
-/// effectively False — matching the typical case where the chain is
-/// NOT routed through an equality rule.
+/// IEquality is an INTRUDER rule (IntrRuleACInfo::IEquality), not a
+/// proto rule.  The earlier port checked `Proto(Stand("IEquality"))`
+/// which is always false — silently failing chainToEquality.
 fn chain_to_equality(
-    _t_start: &tamarin_term::lterm::LNTerm,
-    _c: &crate::constraint::constraints::NodeConc,
+    t_start: &tamarin_term::lterm::LNTerm,
+    c: &crate::constraint::constraints::NodeConc,
     p: &crate::constraint::constraints::NodePrem,
     sys: &System,
 ) -> bool {
@@ -443,10 +437,20 @@ fn chain_to_equality(
     // chainToEquality returns False (chain is auto-handled).
     let p_rule = sys.nodes.iter().find(|(n, _)| n == &p.0).map(|(_, r)| r);
     let Some(p_rule) = p_rule else { return false; };
-    matches!(&p_rule.info,
-        crate::rule::RuleInfo::Proto(info)
-        if matches!(&info.name,
-            crate::rule::ProtoRuleName::Stand(n) if n.as_str() == "IEquality"))
+    let is_equality = matches!(&p_rule.info,
+        crate::rule::RuleInfo::Intr(crate::rule::IntrRuleACInfo::IEquality));
+    if !is_equality { return false; }
+    // ku_before: there's a KU action for t_start at some node that
+    // is reachable-before c.0 in the less-relation.
+    let ku_before = sys.nodes.iter().any(|(id, rule)| {
+        if id == &c.0 { return false; }
+        rule.actions.iter().any(|fa| {
+            matches!(fa.tag, crate::fact::FactTag::Ku)
+                && fa.terms.first() == Some(t_start)
+                && sys.always_before(id, &c.0)
+        })
+    });
+    ku_before
 }
 
 /// True if a goal is still "open": not vacuously False, not already

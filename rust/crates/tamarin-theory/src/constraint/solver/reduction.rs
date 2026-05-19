@@ -580,6 +580,15 @@ impl<'ctx> Reduction<'ctx> {
         // intersects with eq-store free subst — that case isn't
         // supported there either. We don't enforce it; the worst case
         // is a redundant SplitG entry that simplify will discharge.
+        if std::env::var("TAM_DBG_VS_DUMP").is_ok() {
+            eprintln!("[vs-dump] solve_rule_constraints: {} substs", substs.len());
+            for (i, s) in substs.iter().enumerate() {
+                let pairs: Vec<String> = s.to_list().iter()
+                    .map(|(k, v)| format!("{:?}→{:?}", k, v).chars().take(120).collect::<String>())
+                    .collect();
+                eprintln!("[vs-dump]   [{}]: {}", i, pairs.join(" ; "));
+            }
+        }
         let id = self.sys.eq_store.add_disj(substs);
         self.insert_goal(Goal::Split(id));
         self.changed = ChangeIndicator::Changed;
@@ -1236,13 +1245,67 @@ impl<'ctx> Reduction<'ctx> {
         let maude_for_check = maude.clone();
         let has_reducible = !maude.maude_sig().reducible_fun_syms.is_empty()
             && std::env::var("TAM_DISABLE_SUBST_NF").is_err();
+        // Collect live system vars so `simp_singleton`'s `fresh_to_free`
+        // doesn't rename them.  Mirrors `solve_split_goal`'s approach.
+        let system_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar> = {
+            use tamarin_term::lterm::HasFrees;
+            let mut s = std::collections::BTreeSet::new();
+            let mut visit = |v: &tamarin_term::lterm::LVar| { s.insert(v.clone()); };
+            for (id, rule) in &self.sys.nodes {
+                id.for_each_free(&mut visit);
+                rule.for_each_free(&mut visit);
+            }
+            for e in &self.sys.edges {
+                e.src.0.for_each_free(&mut visit);
+                e.tgt.0.for_each_free(&mut visit);
+            }
+            for l in &self.sys.less_atoms {
+                l.smaller.for_each_free(&mut visit);
+                l.larger.for_each_free(&mut visit);
+            }
+            if let Some(la) = &self.sys.last_atom { la.for_each_free(&mut visit); }
+            for (g, _) in &self.sys.goals {
+                match g {
+                    crate::constraint::constraints::Goal::Action(n, fa) => {
+                        n.for_each_free(&mut visit);
+                        fa.for_each_free(&mut visit);
+                    }
+                    crate::constraint::constraints::Goal::Premise(p, fa) => {
+                        p.0.for_each_free(&mut visit);
+                        fa.for_each_free(&mut visit);
+                    }
+                    crate::constraint::constraints::Goal::Chain(c, p) => {
+                        c.0.for_each_free(&mut visit);
+                        p.0.for_each_free(&mut visit);
+                    }
+                    _ => {}
+                }
+            }
+            s
+        };
         let store = std::mem::take(&mut self.sys.eq_store);
+        // Use `simp_with_fresh_avoiding` so singleton SplitG disjunctions
+        // get folded into `subst` via `simp_singleton`.  Haskell's `simp`
+        // (EquationStore.hs:361) calls `simpSingleton` as part of the
+        // main loop, so by the time the search sees the goal list, a
+        // singleton variant subst is already in `subst`.  Without this,
+        // we leave a stale SplitG goal in `sys.goals` and the search
+        // emits an extra `solve` step for it (e.g. issue193::debug).
+        let maude_alloc = maude.clone();
         self.sys.eq_store = if has_reducible {
-            store.simp(|fs, vfs| crate::constraint::solver::contradictions::subst_creates_non_normal_terms(
-                &maude_for_check, &sys_snapshot, fs, vfs,
-            ))
+            store.simp_with_fresh_avoiding(
+                |fs, vfs| crate::constraint::solver::contradictions::subst_creates_non_normal_terms(
+                    &maude_for_check, &sys_snapshot, fs, vfs,
+                ),
+                |n| maude_alloc.reserve_idxs(n),
+                &system_vars,
+            )
         } else {
-            store.simp(|_, _| false)
+            store.simp_with_fresh_avoiding(
+                |_, _| false,
+                |n| maude_alloc.reserve_idxs(n),
+                &system_vars,
+            )
         };
 
         if self.sys.eq_store.is_false() {
@@ -3693,7 +3756,13 @@ impl<'ctx> Reduction<'ctx> {
             // case before saving.
             let mut sub = Reduction::new(self.ctx, sys);
             sub.subst_system();
-            out.push((default_case_name(i), sub.sys));
+            // Haskell `solveSplit` (Goals.hs:386): returns `"split"` for
+            // EVERY alternative.  Disambiguation to `split_case_1`,
+            // `split_case_2`, ... happens in `distinguish`
+            // (ProofMethod.hs:468) when multiple sibling cases share the
+            // same name.  Mirror by emitting plain `"split"` here.
+            let _ = i;
+            out.push(("split".to_string(), sub.sys));
         }
         self.changed = ChangeIndicator::Changed;
         GoalCases::Cases(out)
