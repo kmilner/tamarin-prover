@@ -2505,6 +2505,57 @@ fn apply_lvar_subst(
             (g2, st)
         })
         .collect();
+    // Also rewrite the eq_store: both the free subst (keys + RHS
+    // terms) and the conjunctive disj substs.  Without this, the
+    // saturate's sort-narrowing rewrites system nodes from
+    // `kZero:Msg:2` to `kZero:Fresh:2` while the eq_store keeps
+    // stale bindings like `t:Msg:1 → kZero:Msg:2` — orphan because
+    // `kZero:Msg:2` is no longer referenced anywhere.  Runtime
+    // applySource can't chase `t → seed:Fresh` through this
+    // disconnected chain, so matchSubst doesn't reach the case's
+    // saturated terms.  Minimal_HashChain (3 lemmas) wrong-falsified
+    // root cause.
+    let lookup_term = |v: &tamarin_term::lterm::LVar| -> tamarin_term::lterm::LNTerm {
+        subst.get(v).cloned().unwrap_or_else(|| Term::Lit(Lit::Var(v.clone())))
+    };
+    out.eq_store.subst = {
+        let pairs: Vec<_> = out.eq_store.subst.to_list().into_iter()
+            .map(|(v, t)| {
+                let new_v = if let Some(replacement) = subst.get(&v) {
+                    if let Term::Lit(Lit::Var(nv)) = replacement {
+                        nv.clone()
+                    } else { v }
+                } else { v };
+                let new_t = t.map_free(&mut |w| {
+                    if let Term::Lit(Lit::Var(nw)) = lookup_term(&w) {
+                        nw
+                    } else { w }
+                });
+                (new_v, new_t)
+            })
+            .collect();
+        tamarin_term::subst::Subst::from_list(pairs)
+    };
+    for disj in out.eq_store.conj.iter_mut() {
+        for s in disj.substs.iter_mut() {
+            let pairs: Vec<_> = s.to_list().into_iter()
+                .map(|(v, t)| {
+                    let new_v = if let Some(replacement) = subst.get(&v) {
+                        if let Term::Lit(Lit::Var(nv)) = replacement {
+                            nv.clone()
+                        } else { v }
+                    } else { v };
+                    let new_t = t.clone().map_free(&mut |w| {
+                        if let Term::Lit(Lit::Var(nw)) = lookup_term(&w) {
+                            nw
+                        } else { w }
+                    });
+                    (new_v, new_t)
+                })
+                .collect();
+            *s = tamarin_term::subst_vfresh::SubstVFresh::from_list(pairs);
+        }
+    }
     out
 }
 
@@ -4758,8 +4809,32 @@ fn restrict_eq_store_to_stable_vars(
     sys: &mut System,
     stable_vars: &std::collections::BTreeSet<tamarin_term::lterm::LVar>,
 ) {
+    // Normalise the substitution by chasing chains: each binding's RHS
+    // is repeatedly substituted via the full subst until fixed point.
+    // Without this, restricting drops intermediate-var bindings (e.g.
+    // `kZero_2 → seed:Fresh:2`) while keeping the stable-var pointer
+    // (e.g. `t_1 → kZero_2`), leaving the stable-var binding pointing
+    // at a phantom var that no longer appears in the system.  Haskell's
+    // `solveSubstEqs`/`addEqs` composes incrementally so the subst is
+    // always idempotent before `restrict`; we materialise the same
+    // shape here.
+    let full = sys.eq_store.subst.clone();
+    let normalised: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)>
+        = full.to_list().into_iter()
+            .map(|(v, t)| {
+                let mut cur = t;
+                let mut iter = 0u32;
+                loop {
+                    let next = tamarin_term::subst::apply_vterm(&full, cur.clone());
+                    if next == cur || iter >= 16 { break; }
+                    cur = next;
+                    iter += 1;
+                }
+                (v, cur)
+            })
+            .collect();
     let kept: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)>
-        = sys.eq_store.subst.to_list().into_iter()
+        = normalised.into_iter()
             .filter(|(v, _)| stable_vars.contains(v))
             .collect();
     sys.eq_store.subst = tamarin_term::subst::Subst::from_list(kept);
