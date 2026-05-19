@@ -2344,7 +2344,21 @@ fn saturate_ku_action_via_sources(
         for (g, st) in sub.sys.goals.iter_mut() {
             if g == &live_goal { st.solved = true; break; }
         }
-        let name = format!("{}_{}", outer_name, case_label);
+        // Haskell `refineSource.combine` (Sources.hs:135-137):
+        //   combine (n:_) _ = [n]
+        // — keep the FIRST non-coerce name, DISCARD the new step's
+        // name.  So `combine ["B_1_case_1"] ["c_blind"]` = ["B_1_case_1"].
+        //
+        // Previously we used `format!("{}_{}", outer_name, case_label)`
+        // which appends the source's case_label (e.g. `c_blind`).  The
+        // renderer's `saturated_chain_root` then strips the `_case_<N>_`
+        // middle of `B_1_case_1_c_blind`, leaving `c_blind` — but the
+        // case is actually a chain-folded variant of KU(sign) via B_1.
+        //
+        // Haskell renders this case as `B_1` (it never had the
+        // `c_blind` suffix in the first place).  Use `combine_case_names`
+        // to match.
+        let name = combine_case_names(outer_name, &case_label);
         out.push((name, sub.sys));
     }
     set_precompute_mode(false);
