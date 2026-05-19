@@ -48,6 +48,7 @@ import           Extension.Prelude
 
 import           Theory.Constraint.Solver.Goals
 import           Theory.Constraint.Solver.Reduction
+import qualified Theory.Constraint.Solver.Trace     as T
 import           Theory.Constraint.System
 import           Theory.Model
 import           Theory.Text.Pretty
@@ -62,9 +63,11 @@ hsTraceFire = Unsafe.unsafePerformIO $
 -- system does not change anymore.
 simplifySystem :: Reduction ()
 simplifySystem = do
+    when T.flagSimplify (Debug.Trace.traceM "[SIMP] enter")
     isdiff <- getM sDiffSystem
     -- Start simplification, indicating that some change happened
     go (0 :: Int) [Changed]
+    when T.flagSimplify (Debug.Trace.traceM "[SIMP] after go-loop")
     if isdiff
        then do
         -- Remove equation split goals that do not exist anymore
@@ -72,10 +75,14 @@ simplifySystem = do
        else do
         -- Add all ordering constraint implied by CR-rule *N6*.
         exploitUniqueMsgOrder
+        when T.flagSimplify (Debug.Trace.traceM "[SIMP] after exploitUniqueMsgOrder")
         -- Remove equation split goals that do not exist anymore
         removeSolvedSplitGoals
+        when T.flagSimplify (Debug.Trace.traceM "[SIMP] after removeSolvedSplitGoals")
         -- Add ordering constraint from injective facts
         addNonInjectiveFactInstances
+        when T.flagSimplify (Debug.Trace.traceM "[SIMP] after addNonInjectiveFactInstances")
+    when T.flagSimplify (Debug.Trace.traceM "[SIMP] exit OK")
   where
     go n changes0
       -- We stop as soon as all simplification steps have been run without
@@ -86,21 +93,21 @@ simplifySystem = do
           se0 <- gets id
           -- Perform one initial substitution. We do not have to consider its
           -- changes as 'substSystem' is idempotent.
-          void substSystem
+          void (T.tracePassPair "substSystem" substSystem)
           -- Perform one simplification pass.
           isdiff <- getM sDiffSystem
           -- In the diff case, we cannot enfore N4-N6.
           if isdiff
             then do
-              (c1,c3) <- enforceFreshAndKuNodeUniqueness
-              c4 <- enforceEdgeUniqueness
-              c5 <- solveUniqueActions
-              c6 <- reduceFormulas
-              c7 <- evalFormulaAtoms
-              c8 <- insertImpliedFormulas
-              c9 <- freshOrdering
-              c10 <- simpSubterms
-              c11 <- simpInjectiveFactEqMon
+              (c1,c3) <- T.tracePassPair "enforceFreshAndKuNodeUniqueness" enforceFreshAndKuNodeUniqueness
+              c4 <- T.tracePassPair "enforceEdgeUniqueness" enforceEdgeUniqueness
+              c5 <- T.tracePassPair "solveUniqueActions" solveUniqueActions
+              c6 <- T.tracePassPair "reduceFormulas" reduceFormulas
+              c7 <- T.tracePassPair "evalFormulaAtoms" evalFormulaAtoms
+              c8 <- T.tracePassPair "insertImpliedFormulas" insertImpliedFormulas
+              c9 <- T.tracePassPair "freshOrdering" freshOrdering
+              c10 <- T.tracePassPair "simpSubterms" simpSubterms
+              c11 <- T.tracePassPair "simpInjectiveFactEqMon" simpInjectiveFactEqMon
 
               -- Report on looping behaviour if necessary
               let changes = filter ((Changed ==) . snd) $
@@ -128,15 +135,15 @@ simplifySystem = do
 
               traceIfLooping $ go (n + 1) (map snd changes)
             else do
-              (c1,c2,c3) <- enforceNodeUniqueness
-              c4 <- enforceEdgeUniqueness
-              c5 <- solveUniqueActions
-              c6 <- reduceFormulas
-              c7 <- evalFormulaAtoms
-              c8 <- insertImpliedFormulas
-              c9 <- freshOrdering
-              c10 <- simpSubterms
-              c11 <- simpInjectiveFactEqMon
+              (c1,c2,c3) <- T.tracePassPair "enforceNodeUniqueness" enforceNodeUniqueness
+              c4 <- T.tracePassPair "enforceEdgeUniqueness" enforceEdgeUniqueness
+              c5 <- T.tracePassPair "solveUniqueActions" solveUniqueActions
+              c6 <- T.tracePassPair "reduceFormulas" reduceFormulas
+              c7 <- T.tracePassPair "evalFormulaAtoms" evalFormulaAtoms
+              c8 <- T.tracePassPair "insertImpliedFormulas" insertImpliedFormulas
+              c9 <- T.tracePassPair "freshOrdering" freshOrdering
+              c10 <- T.tracePassPair "simpSubterms" simpSubterms
+              c11 <- T.tracePassPair "simpInjectiveFactEqMon" simpInjectiveFactEqMon
 
               -- Report on looping behaviour if necessary
               let changes = filter ((Changed ==) . snd) $
@@ -269,7 +276,8 @@ enforceEdgeUniqueness = do
       | null eqs  = return Unchanged
       | otherwise = do
             -- all indices of merged premises and conclusions must be equal
-            contradictoryIf (not $ and [snd l == snd r | Equal l r <- eqs])
+            T.contradictoryIfT "enforceEdgeUniqueness:premConcIdxMismatch"
+                (not $ and [snd l == snd r | Equal l r <- eqs])
             -- nodes must be equal
             solveNodeIdEqs $ map (fmap fst) eqs
       where

@@ -21,6 +21,20 @@ import Control.Monad
 import Control.Monad.Disj.Class
 import Control.Monad.Reader
 import Control.Monad.Logic (LogicT, observeAllT)
+import ListT
+import qualified Debug.Trace               as Tr
+import qualified System.Environment        as SysEnv
+import           System.IO.Unsafe          (unsafePerformIO)
+
+-- | Read TAM_HS_TRACE_MZERO at module load (NOINLINE-cached).
+-- When set to "1", every `contradictoryBecause _` call on `DisjT` is
+-- traced via `Debug.Trace`, including the optional reason (if any).
+-- This catches mzero paths invisible to `contradictoryIfT` (e.g. direct
+-- `contradiction "reason"` calls, or `mzero` lifted from inner monads).
+flagMzero :: Bool
+flagMzero = unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_MZERO"
+{-# NOINLINE flagMzero #-}
 
 
 ------------------------------------------------------------------------------
@@ -54,7 +68,10 @@ instance MonadFail m => MonadFail (DisjT m) where
     fail = error
 
 instance Monad m => MonadDisj (DisjT m) where
-    contradictoryBecause _ = DisjT mzero
+    contradictoryBecause r
+      | flagMzero = Tr.trace ("[MZERO-FIRE] " ++ maybe "<no-reason>" id r)
+                             (DisjT mzero)
+      | otherwise = DisjT mzero
     disjunction m1 m2      = DisjT $ unDisjT m1 `mplus` unDisjT m2
 
 

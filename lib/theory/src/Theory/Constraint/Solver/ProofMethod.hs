@@ -71,6 +71,7 @@ import           Theory.Constraint.Solver.Goals
 import           Theory.Constraint.Solver.AnnotatedGoals
 import           Theory.Constraint.Solver.Reduction
 import           Theory.Constraint.Solver.Simplify
+import qualified Theory.Constraint.Solver.Trace          as T
 --import           Theory.Constraint.Solver.Heuristics
 import           Theory.Constraint.System
 import           Theory.Model
@@ -412,7 +413,7 @@ execProofMethod ctxt method sys =
           _ -> return cases
       Induction             -> process . induction <$> getInductionCases sys
       SolveGoal goal        ->
-        let cases = process (solve goal)
+        let cases = processLabeled (take 80 $ show goal) (solve goal)
             -- emit one trace line per case, mirroring Rust's
             -- `proof_method::keep` instrumentation.  Cases that
             -- survived simplifySystem are emitted as `case_keep`;
@@ -433,12 +434,21 @@ execProofMethod ctxt method sys =
       Invalidated           -> Nothing
   where
     process :: Reduction CaseName -> M.Map CaseName System
-    process m =
+    process m = processLabeled "?" m
+
+    processLabeled :: String -> Reduction CaseName -> M.Map CaseName System
+    processLabeled goalLabel m =
       let cases =   removeRedundantCases ctxt [] snd
                   . map (fmap cleanup . fst)
                   . getDisj $ runReduction (m <* simplifySystem) ctxt sys (avoid sys)
+          tracedCases =
+            if T.flagCases
+            then trace ("[PROCESS goal=" ++ goalLabel ++ "] "
+                        ++ show (length cases) ++ " surviving cases: "
+                        ++ show (map fst cases)) cases
+            else cases
       in  M.fromListWith (error "case names not unique")
-            $ uniqueListBy (comparing fst) id distinguish cases
+            $ uniqueListBy (comparing fst) id distinguish tracedCases
 
     cleanup :: System -> System
     cleanup s = L.set sSubst emptySubst (Precise.evalFresh (renamePrecise s) Precise.nothingUsed)
