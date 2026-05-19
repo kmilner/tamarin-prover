@@ -4013,6 +4013,10 @@ pub fn solve_with_source_cases_action_with_ctx(
     }
     let m_live = &fa_live.terms[0];
     let _ = LSort::Msg; // silence unused-import warning at low cost
+    if std::env::var("TAM_DBG_SRC_CASE").is_ok() {
+        let live_str = format!("{:?}", fa_live).chars().take(120).collect::<String>();
+        eprintln!("[src_case] solve_with_source_cases CALLED for live={}", live_str);
+    }
 
     // Find a source whose abstract pattern matches `m_live`.
     let src = sources.iter().find(|s| match &s.goal {
@@ -4044,6 +4048,18 @@ pub fn solve_with_source_cases_action_with_ctx(
         let goal_str = format!("{:?}", fa_live).chars().take(200).collect::<String>();
         let case_names: Vec<&String> = src.cases.iter().map(|(n, _)| n).collect();
         eprintln!("[RS_APPLY_SRC_PRE] live_goal={} cases={:?}", goal_str, case_names);
+    }
+    if std::env::var("TAM_DBG_SRC_CASE").is_ok() {
+        let goal_str = format!("{:?}", fa_live).chars().take(120).collect::<String>();
+        eprintln!("[src_case] LIVE goal={}", goal_str);
+        for (n, c) in &src.cases {
+            eprintln!("[src_case] name={} nodes={} edges={} goals={} last_atom={:?}",
+                n, c.nodes.len(), c.edges.len(), c.goals.len(), c.last_atom);
+            for (id, ru) in &c.nodes {
+                let nm = crate::constraint::solver::reduction::rule_case_name(ru);
+                eprintln!("[src_case]   node {:?} → {}", id, nm);
+            }
+        }
     }
 
     let mut out: Vec<(String, System, crate::fact::LNFact)> = Vec::new();
@@ -4524,6 +4540,28 @@ fn freshen_system_keep_with_shift(
             .collect();
         tamarin_term::subst::Subst::from_list(pairs)
     };
+    // Eq-store conj (SplitG disjunctions): shift both var keys and
+    // term values in each variant subst.  Without this, the variant
+    // SplitG's substs still reference pre-freshen var idxs while the
+    // surrounding nodes/edges/goals carry post-freshen idxs — so when
+    // a variant is picked via `solve_split_goal` and folded into the
+    // free subst via `simp_singleton`, `subst_system` finds no
+    // matching keys to substitute, leaving the rule nodes with bare
+    // msg-vars (e.g. `pk1`) instead of the narrowed `pk(x)` form.
+    // This causes the StatVerif `resolved1_contract_reachable`
+    // premature-SOLVED bug.
+    for disj in out.eq_store.conj.iter_mut() {
+        for s in disj.substs.iter_mut() {
+            let pairs: Vec<_> = s.to_list().into_iter()
+                .map(|(v, t)| {
+                    let new_v = shift_lvar(&v);
+                    let new_t = t.clone().map_free(&mut |w| shift_lvar(&w));
+                    (new_v, new_t)
+                })
+                .collect();
+            *s = tamarin_term::subst_vfresh::SubstVFresh::from_list(pairs);
+        }
+    }
     out
 }
 

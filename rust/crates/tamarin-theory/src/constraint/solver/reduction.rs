@@ -809,6 +809,10 @@ impl<'ctx> Reduction<'ctx> {
                     }
                     Some(la) if la == n => {}
                     Some(la) => {
+                        if std::env::var("TAM_DBG_INSERT_LAST").is_ok() {
+                            eprintln!("[insert_last] insert_atom: existing={:?} new={:?} → eq",
+                                la, n);
+                        }
                         // Haskell `insertLast n = ... whenJust last
                         // $ \i -> solveNodeIdEqs [Equal i n]` — failure
                         // propagates via monadic bind through
@@ -1339,6 +1343,11 @@ impl<'ctx> Reduction<'ctx> {
     ) -> Result<SolveOutcome, crate::tools::equation_store::AddEqsError> {
         use tamarin_term::term::Term;
         use tamarin_term::vterm::Lit;
+        if std::env::var("TAM_DBG_NODE_EQS").is_ok() {
+            for e in eqs {
+                eprintln!("[node_eqs] {:?} = {:?}", e.lhs, e.rhs);
+            }
+        }
         let term_eqs: Vec<tamarin_term::rewriting::Equal<tamarin_term::lterm::LNTerm>> =
             eqs.iter()
                 .map(|e| tamarin_term::rewriting::Equal {
@@ -1535,6 +1544,10 @@ impl<'ctx> Reduction<'ctx> {
                 Some(live_last) => {
                     let lhs = case_last.clone();
                     let rhs = live_last.clone();
+                    if std::env::var("TAM_DBG_INSERT_LAST").is_ok() {
+                        eprintln!("[insert_last] conjoin: case_last={:?} live_last={:?} → eq",
+                            lhs, rhs);
+                    }
                     let r = self.solve_node_id_eqs(
                         &[tamarin_term::rewriting::Equal { lhs, rhs }]);
                     if matches!(r, Err(_) | Ok(SolveOutcome::Contradictory)) {
@@ -2729,6 +2742,16 @@ impl<'ctx> Reduction<'ctx> {
         let existing = self.sys.nodes.iter()
             .find(|(nid, _)| nid == i)
             .map(|(_, ru)| ru.clone());
+        if std::env::var("TAM_DBG_SAG").is_ok() {
+            eprintln!("[sag] ENTRY i={:?} fa.tag={:?} existing={:?}",
+                i, fa.tag,
+                existing.as_ref().map(|r| rule_case_name(r)));
+        }
+        if std::env::var("TAM_DBG_SRC_CASE").is_ok() {
+            eprintln!("[src_case] solve_action_goal ENTRY: i={:?} fa.tag={:?} existing={:?}",
+                i, fa.tag,
+                existing.as_ref().map(|r| crate::constraint::solver::reduction::rule_case_name(r)));
+        }
         match existing {
             Some(ru) => {
                 if ru.actions.contains(fa) {
@@ -2788,6 +2811,11 @@ impl<'ctx> Reduction<'ctx> {
                 // enumeration in favour of the typed source enumeration
                 // — exactly the [sources]-driven typing-refined chain
                 // that Haskell uses.
+                if std::env::var("TAM_DBG_SRC_CASE").is_ok() {
+                    eprintln!("[src_case] solve_action_goal None-branch: precompute={} tag={:?} full_sources.len={}",
+                        crate::constraint::solver::sources::in_precompute_mode(),
+                        fa.tag, self.ctx.full_sources.len());
+                }
                 if !crate::constraint::solver::sources::in_precompute_mode()
                     && matches!(fa.tag, crate::fact::FactTag::Ku)
                     && !self.ctx.full_sources.is_empty()
