@@ -126,7 +126,7 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
     if has_false_formula(sys) { out.push(Contradiction::FormulasFalse); }
     if has_forbidden_chain(sys) { out.push(Contradiction::ForbiddenChain); }
     if has_forbidden_kd(sys) { out.push(Contradiction::ForbiddenKD); }
-    if has_impossible_chain(sys) { out.push(Contradiction::ImpossibleChain); }
+    if has_impossible_chain(_ctxt, sys) { out.push(Contradiction::ImpossibleChain); }
     // Maude-dependent: NonNormalTerms / ForbiddenExp / ForbiddenBP —
     // left for the Maude-driven fill.
     out.extend(node_after_last(sys));
@@ -259,7 +259,7 @@ fn has_subterm_cycle_contra(ctx: &ProofContext, sys: &System) -> bool {
 /// Skips DH/BP-specific cases (FExp/FPMult/FEMap) for now —
 /// corpus filters DH/BP-using protocols.  When DH support lands,
 /// these branches need adding.
-fn has_impossible_chain(sys: &System) -> bool {
+fn has_impossible_chain(ctx: &ProofContext, sys: &System) -> bool {
     use crate::constraint::constraints::Goal;
     use crate::fact::FactTag;
 
@@ -282,8 +282,28 @@ fn has_impossible_chain(sys: &System) -> bool {
         let t_start = match conc_fact.terms.first() { Some(t) => t, None => continue };
         let t_end = match prem_fact.terms.first() { Some(t) => t, None => continue };
         let Some(poss) = possible_root_syms(t_start) else { continue };
-        let Some(req) = possible_end_syms(t_end) else { continue };
-        if poss.iter().all(|s| !req.contains(s)) {
+        // Haskell:
+        //   if pcTrueSubterm
+        //      then do req_end <- rootSym t_end
+        //              return $ not (req_end `elem` poss)
+        //      else do req_end <- possibleEndSyms t_end
+        //              return $ null (req_end `intersect` poss)
+        // True branch: STRICT — fire if the chain-end's root sym is
+        // not among the possible decomposition syms.
+        // False branch: LENIENT — fire only if NO subterm sym of the
+        // chain-end matches any possible decomposition sym.
+        let fires = if ctx.pc_true_subterm {
+            match root_sym(t_end) {
+                Some(req) => !poss.iter().any(|s| s == &req),
+                None => false,
+            }
+        } else {
+            match possible_end_syms(t_end) {
+                Some(req) => poss.iter().all(|s| !req.contains(s)),
+                None => false,
+            }
+        };
+        if fires {
             return true;
         }
     }

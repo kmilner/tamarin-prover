@@ -335,6 +335,17 @@ pub fn proto_rule_ac_to_rule_ac_inst(r: ProtoRuleAC) -> RuleACInst {
 pub fn is_destr_rule_info(info: &IntrRuleACInfo) -> bool {
     matches!(info, IntrRuleACInfo::DestrRule(_, _, _, _))
 }
+/// `isSubtermRule`: True iff the rule is a destruction rule whose
+/// RHS is a true subterm of the LHS, or the IEquality rule.
+/// Mirrors Haskell's `Theory.Model.Rule.isSubtermRule`
+/// (`lib/theory/src/Theory/Model/Rule.hs:728`).
+pub fn is_subterm_rule_info(info: &IntrRuleACInfo) -> bool {
+    match info {
+        IntrRuleACInfo::DestrRule(_, _, subterm, _) => *subterm,
+        IntrRuleACInfo::IEquality => true,
+        _ => false,
+    }
+}
 pub fn is_constr_rule_info(info: &IntrRuleACInfo) -> bool {
     matches!(info, IntrRuleACInfo::ConstrRule(_))
 }
@@ -401,6 +412,15 @@ pub fn is_destr_rule<I>(rule: &Rule<RuleInfo<I, IntrRuleACInfo>>) -> bool {
     matches!(&rule.info,
         RuleInfo::Intr(IntrRuleACInfo::DestrRule(_, _, _, _))
         | RuleInfo::Intr(IntrRuleACInfo::IEquality))
+}
+
+/// `isSubtermRule` for a `Rule` shape — RHS is a true subterm of LHS,
+/// or IEquality. Mirrors Haskell's `Theory.Model.Rule.isSubtermRule`.
+pub fn is_subterm_rule<I>(rule: &Rule<RuleInfo<I, IntrRuleACInfo>>) -> bool {
+    match &rule.info {
+        RuleInfo::Intr(info) => is_subterm_rule_info(info),
+        _ => false,
+    }
 }
 
 /// `getRemainingRuleApplications`: returns the chain budget for
