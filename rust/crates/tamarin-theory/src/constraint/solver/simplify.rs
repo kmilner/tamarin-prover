@@ -1590,7 +1590,20 @@ fn solve_unique_actions_pass(red: &mut Reduction) -> ChangeIndicator {
 
     // Snapshot the unsolved Action goals up-front; calling
     // solve_action_goal mutates the goal list.
-    let candidates: Vec<(crate::constraint::constraints::NodeId, LNFact)> =
+    //
+    // Haskell-faithful: `unsolvedActionAtoms` returns `M.toList sGoals`
+    // which iterates the Map in `Goal`-Ord order — ActionG sorted by
+    // (NodeId, LNFact).  Our `sys.goals` is a Vec preserving insertion
+    // order; sort the candidates by (NodeId, LNFact) to match Haskell.
+    //
+    // Critical for goal-ranking: solveUniqueActions creates Premise
+    // goals as a side-effect of solving each Action.  The order in
+    // which those Premises are created determines their goalNr, which
+    // determines execProofMethod's pick.  Stop_unique (Minimal_Loop)
+    // hits a spurious Cyclic if Action(j) is solved before Action(i)
+    // because the InjectiveFacts + reuse-lemma constraints cycle on
+    // a one-Loop state.
+    let mut candidates: Vec<(crate::constraint::constraints::NodeId, LNFact)> =
         red.sys.goals.iter()
             .filter_map(|(g, st)| match g {
                 Goal::Action(i, fa) if !st.solved && is_unique(fa) =>
@@ -1598,6 +1611,7 @@ fn solve_unique_actions_pass(red: &mut Reduction) -> ChangeIndicator {
                 _ => None,
             })
             .collect();
+    candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     if candidates.is_empty() { return ChangeIndicator::Unchanged; }
     let mut changed = ChangeIndicator::Unchanged;
     for (i, fa) in candidates {
