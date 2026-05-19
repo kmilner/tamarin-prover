@@ -140,10 +140,6 @@ pub fn destruction_rules(
     let mut posname = String::new();
     let pos_iter: Vec<i64> = pos.clone();
     for (step_idx, &i) in pos_iter.iter().enumerate() {
-        // If we've reached the RHS position via an FApp, but we still
-        // have more steps and `frees(rhs)` is non-empty, Haskell's
-        // first guard kicks in and we stop — corresponds to the
-        // `(_:[])` arm with `frees rhs /= []` skip.
         match &t {
             Term::App(FunSym::NoEq(sym), args) => {
                 if sym.privacy == Privacy::Private {
@@ -151,16 +147,20 @@ pub fn destruction_rules(
                 }
                 let public = sym.privacy == Privacy::Public;
                 if !public { return out; }
-                // Haskell's special case: at the *last* step into an
-                // FApp, with non-constant RHS, skip — the term is
-                // already in premises.
-                if pos_iter.len() == step_idx + 1 && !frees(rhs).is_empty()
-                    && i as usize == 0
-                {
-                    // proceed normally — Haskell's go has the skip only
-                    // when the position is `(_:[])` AND the lhs at
-                    // that point is an FApp; but we're stepping into
-                    // the FApp anyway. Don't skip yet.
+                // Haskell `destructionRules` pattern #2 (IntruderRules.hs:135):
+                //     go _ (viewTerm -> FApp _ _) (_:[]) _ _ | (frees rhs /= []) = []
+                // At the LAST position step, if the current term is an
+                // FApp AND rhs has free vars, return [] — neither emit
+                // nor recurse.  Current `t` is necessarily FApp here
+                // (we're inside the Term::App arm).  Without this,
+                // Rust emits extra rules at deep positions like
+                // d_0_0_0_prefix_enc_pair or d_1_0_prefix_enc — see
+                // denning_sacco_symmetric_cbc which has rule
+                // `prefix(enc(<X,Y>,k)) = enc(X,k)` (positions [0,0,0]
+                // and [0,1]); at the LAST step into pair(X,Y) and
+                // enc(X,Y), Haskell skips.
+                if pos_iter.len() == step_idx + 1 && !frees(rhs).is_empty() {
+                    return out;
                 }
                 // Build uprems' = uprems ++ siblings.
                 let mut new_uprems = uprems.clone();
