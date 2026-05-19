@@ -4110,6 +4110,10 @@ fn graft_case_into(
             }
             crate::constraint::constraints::Goal::Action(n, fa) =>
                 crate::constraint::constraints::Goal::Action(rename_node(n), fa.clone()),
+            // Haskell `conjoinSystem` filters `isSplitGoal` out
+            // (Reduction.hs:676); we re-emit them below with fresh
+            // IDs once their disjs are added via `add_disj`.
+            crate::constraint::constraints::Goal::Split(_) => continue,
             other => other.clone(),
         };
         // Add the goal, preserving solved/looping flags from the case.
@@ -4119,6 +4123,28 @@ fn graft_case_into(
         if !out.goals.iter().any(|(existing, _)| existing == &renamed_goal) {
             out.goals.push((renamed_goal, st.clone()));
         }
+    }
+    // Haskell `conjoinSystem` (Reduction.hs:679-684): merge eq_store.
+    //   let (eqs',splitIds) = mapAccumL addDisj eqs
+    //         (map snd . getConj $ get sConjDisjEqs sys)
+    //   setM sEqStore eqs'
+    //   mapM_ (`insertGoal` False) $ SplitG <$> splitIds
+    //   void (solveSubstEqs SplitNow $ get sSubst sys)
+    //
+    // Without this, source cases that carry a variant SplitG (e.g.
+    // Receiver0b's `signature -> sign(...)` / `z -> true` disjunction
+    // in TESLA) lose the disjunction at graft time — the false
+    // `c_MAC + c_f` path stays open and the abstracted-rule's
+    // `signature` is never narrowed at runtime.  The case's free
+    // subst must reach the live eq_store so `subst_system`
+    // propagates its bindings into the grafted rule terms.
+    for disj in &case_sys.eq_store.conj {
+        let new_id = out.eq_store.add_disj(disj.substs.clone());
+        out.add_goal(crate::constraint::constraints::Goal::Split(new_id));
+    }
+    if !case_sys.eq_store.subst.is_empty() {
+        let merged = case_sys.eq_store.subst.compose(&out.eq_store.subst);
+        out.eq_store.subst = merged;
     }
     let live_goal = crate::constraint::constraints::Goal::Premise(
         (live_node.clone(), live_prem_idx), fa_prem.clone());
