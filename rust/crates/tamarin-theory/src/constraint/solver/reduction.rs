@@ -3444,6 +3444,18 @@ impl<'ctx> Reduction<'ctx> {
             None => return GoalCases::Contradictory,
         };
 
+        // TAM_RS_TRACE_CHAINS: mirror Haskell `solveChain` enter trace
+        // (Goals.hs:300-305).  Format kept identical so a diff between
+        // [HS-CHAIN] and [RS-CHAIN] surfaces directly.
+        let trace_chains = std::env::var("TAM_RS_TRACE_CHAINS").is_ok();
+        if trace_chains {
+            let n_destr = self.ctx.intruder_rules.iter()
+                .filter(|ir| crate::rule::is_destr_rule_info(&ir.info))
+                .count();
+            eprintln!("[RS-CHAIN] ENTER faConc={:?} nRules={}",
+                fa_conc, n_destr);
+        }
+
         let mut all_cases: Vec<(String, crate::constraint::system::System)> = Vec::new();
 
         // ---------------- Branch 1: direct edge ----------------
@@ -3471,6 +3483,9 @@ impl<'ctx> Reduction<'ctx> {
                         }
                         // Direct-edge chain: name by the producer's rule.
                         let case_name = rule_case_name(&c_rule);
+                        if trace_chains {
+                            eprintln!("[RS-CHAIN] DIRECT {}", case_name);
+                        }
                         all_cases.push((case_name, sub.sys));
                     }
                 }
@@ -3584,6 +3599,9 @@ impl<'ctx> Reduction<'ctx> {
                 }
                 // Destructor-extend chain: name by destructor rule.
                 let case_name = rule_case_name(&ru_renamed);
+                if trace_chains {
+                    eprintln!("[RS-CHAIN] EXTEND {} prem=PremIdx(0)", case_name);
+                }
                 all_cases.push((case_name, sub.sys));
             }
         }
