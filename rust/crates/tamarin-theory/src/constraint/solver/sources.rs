@@ -5455,39 +5455,6 @@ fn apply_source_case_premise(
     // F — close trivial chains.
     close_trivial_chains_in_graft(&mut r);
 
-    // G — defensive edge-fact coherence pass.  Rust saturate doesn't
-    // always emit fully-edge-consistent case_sys (task #249); conjoin's
-    // substSystem doesn't always propagate every fact-eq through edges
-    // (task #250).  This pass re-unifies producer-conc / consumer-prem
-    // facts along every edge.  Required for soundness on
-    // Minimal_HashChain, FreshOrderingTest, foo/okamoto eligibility.
-    let mut tag_mismatch = false;
-    let chain_eqs: Vec<_> = r.sys.edges.iter()
-        .filter_map(|e| {
-            let (_, src_rule) = r.sys.nodes.iter()
-                .find(|(n, _)| n == &e.src.0)?;
-            let (_, tgt_rule) = r.sys.nodes.iter()
-                .find(|(n, _)| n == &e.tgt.0)?;
-            let fc = src_rule.conclusions.get(e.src.1.0)?.clone();
-            let fp = tgt_rule.premises.get(e.tgt.1.0)?.clone();
-            if fc.tag != fp.tag || fc.terms.len() != fp.terms.len() {
-                tag_mismatch = true;
-                return None;
-            }
-            if fc == fp { return None; }
-            Some(tamarin_term::rewriting::Equal { lhs: fc, rhs: fp })
-        })
-        .collect();
-    if tag_mismatch { dbg("chain-eqs-tag-mismatch"); return None; }
-    if !chain_eqs.is_empty() {
-        let r2 = r.solve_fact_eqs(SplitStrategy::SplitNow, &chain_eqs);
-        if matches!(r2, Err(_) | Ok(SolveOutcome::Contradictory)) {
-            dbg("chain-eqs-contradictory");
-            return None;
-        }
-        r.subst_system();
-    }
-
     if src.incomplete { r.sys.used_incomplete_source = true; }
     crate::state_trace::emit(
         "applySource_prem_out", Some(&live_goal_for_trace), &r.sys);
