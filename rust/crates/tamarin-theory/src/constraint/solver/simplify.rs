@@ -246,14 +246,28 @@ fn exploit_unique_msg_order(red: &mut Reduction) {
         }
     }
     if kd_conc.is_empty() { return; }
-    // Collect KU-action (term, node) pairs (rule actions only;
-    // open Action goals are handled by other paths).
+    // Collect KU-action (term, node) pairs.  Haskell `allActions`
+    // (System.hs:1575) combines `unsolvedActionAtoms` with `rule.acts`
+    // — so we MUST include open Action goals here, not just rule
+    // actions.  Without this, KU goals added by existential atom
+    // decomposition (e.g. `∃ #j. KU(t) @ j`) don't participate in
+    // N6's NormalForm ordering, leaving a Cyclic detection gap.
     let mut ku_act: BTreeMap<LNTerm, NodeId> = BTreeMap::new();
     for (id, rule) in &red.sys.nodes {
         for fa in &rule.actions {
             if matches!(fa.tag, FactTag::Ku) {
                 if let Some(m) = fa.terms.first() {
                     ku_act.entry(m.clone()).or_insert_with(|| id.clone());
+                }
+            }
+        }
+    }
+    for (goal, st) in &red.sys.goals {
+        if st.solved { continue; }
+        if let crate::constraint::constraints::Goal::Action(i, fa) = goal {
+            if matches!(fa.tag, FactTag::Ku) {
+                if let Some(m) = fa.terms.first() {
+                    ku_act.entry(m.clone()).or_insert_with(|| i.clone());
                 }
             }
         }

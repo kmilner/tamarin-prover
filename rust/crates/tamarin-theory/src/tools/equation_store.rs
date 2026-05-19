@@ -207,11 +207,22 @@ impl EquationStore {
         // For each substitution in the chosen disjunction, build a new
         // store that drops `id` and adds a fresh single-case
         // disjunction containing just that subst.
-        let mut out = Vec::with_capacity(disj.substs.len());
-        for subst in &disj.substs {
+        //
+        // Mirrors Haskell `performSplit` (EquationStore.hs:213):
+        //   mkNewEqStore before after <$> S.toList disj
+        //
+        // `S.toList` returns substs in their natural `Ord` order — the
+        // BTreeMap<LVar, VTerm> derived ordering. We sort our `Vec`
+        // here to match, so `split_case_1` is Haskell's "first" subst
+        // (typically the meaningful destructor-variant binding) rather
+        // than the original insertion order.
+        let mut sorted_substs: Vec<LNSubstVFresh> = disj.substs.clone();
+        sorted_substs.sort();
+        let mut out = Vec::with_capacity(sorted_substs.len());
+        for subst in sorted_substs {
             let mut new_store = self.clone();
             new_store.conj.remove(pos);
-            new_store.add_disj(vec![subst.clone()]);
+            new_store.add_disj(vec![subst]);
             out.push(new_store);
         }
         Some(out)
@@ -487,7 +498,15 @@ impl EquationStore {
                 if !seen.iter().any(|x| x == s) { seen.push(s.clone()); }
             }
             let original_len = d.substs.len();
-            // If any subst equals empty or contradicts, reduce to empty-only.
+            // Haskell-faithful `simpMinimize` (EquationStore.hs:524):
+            // if any subst is empty (vacuously true) OR contradictory,
+            // reduce the disj.  If empty present → singleton empty
+            // (next pass simpSingleton folds it into the free subst).
+            // Otherwise filter out contradictory substs.
+            //
+            // The variant-SplitG-preservation case is handled upstream
+            // in `apply_eq_store` via `renameAvoiding`, which prevents
+            // the narrowing variant from collapsing to an empty subst.
             let reduce_to_empty = seen.iter().any(|s| s == &empty || is_contr(s));
             if reduce_to_empty {
                 if seen.iter().any(|s| s == &empty) {
@@ -812,13 +831,28 @@ impl EquationStore {
 
         // Re-unify each disj subst against the new free subst via Maude
         // (Haskell's `applyBound`).  For each `s = {(lv, t)}`, build
-        // equations `[Equal (apply newsubst (Var lv)) t]` and let Maude
-        // AC-unify the list; multiple unifiers split into multiple
-        // variants.
+        // equations `[Equal (apply newsubst (Var lv)) renamed_t]` and
+        // let Maude AC-unify the list; multiple unifiers split into
+        // multiple variants.
+        //
+        // The RHS terms are FRESH-RENAMED (Haskell `renameAvoiding`,
+        // EquationStore.hs:268, LTerm.hs:663) to a uniform-shifted set
+        // of var idxs starting at `succ avoid_max`, where `avoid_max`
+        // is the max idx across `domVFresh s ∪ varsRange newsubst`.
+        // The shift `freshStart - rhs_min` may be negative (when RHS
+        // vars were originally above avoid_max).  Without this rename,
+        // a fresh witness in the variant subst could coincide by idx
+        // with a var in newsubst, causing the unifier to incorrectly
+        // identify them and collapse the variant to empty.  See
+        // [[project_rust_variant_substs_identity_filter]] / KAS2_eCK
+        // case_2 short-circuit.
         use tamarin_term::rewriting::Equal;
         use tamarin_term::term::Term;
         use tamarin_term::vterm::Lit;
         let fresh_base = self.fresh_baseline();
+        let new_subst_range_vars: BTreeSet<LVar> = new_subst.range()
+            .flat_map(|t| tamarin_term::vterm::vars_vterm(t))
+            .collect();
         let mut new_conj: Vec<EqDisj> = Vec::with_capacity(self.conj.len());
         for d in self.conj.iter() {
             let mut new_substs: Vec<LNSubstVFresh> = Vec::new();
@@ -829,14 +863,59 @@ impl EquationStore {
                     new_substs.push(s.clone());
                     continue;
                 }
+                // Compute avoid_max = max idx across (domVFresh s ∪
+                // varsRange newsubst).
+                let avoid_max: u64 = {
+                    let mut m: u64 = 0;
+                    for (k, _) in &bindings { if k.idx > m { m = k.idx; } }
+                    for v in &new_subst_range_vars {
+                        if v.idx > m { m = v.idx; }
+                    }
+                    m
+                };
+                // Find min idx across all RHS terms' vars.
+                let rhs_min: Option<u64> = {
+                    use tamarin_term::lterm::HasFrees;
+                    let mut min: Option<u64> = None;
+                    for (_, t) in &bindings {
+                        t.for_each_free(&mut |v| {
+                            min = Some(min.map_or(v.idx, |m| m.min(v.idx)));
+                        });
+                    }
+                    min
+                };
+                // Apply uniform shift to all RHS terms.  Haskell-faithful:
+                // shift = freshStart - rhs_min, where freshStart = avoid_max + 1.
+                // Shift may be negative (rhs already above avoid); use i128.
+                let renamed_rhs: Vec<LNTerm> = if let Some(min) = rhs_min {
+                    let fresh_start: i128 = avoid_max as i128 + 1;
+                    let shift: i128 = fresh_start - (min as i128);
+                    if shift != 0 {
+                        use tamarin_term::lterm::HasFrees;
+                        bindings.iter().map(|(_, t)| {
+                            t.clone().map_free(&mut |v| {
+                                let new_idx: i128 = (v.idx as i128) + shift;
+                                let new_idx_u64 = if new_idx < 0 { 0 }
+                                    else if new_idx > u64::MAX as i128 { u64::MAX }
+                                    else { new_idx as u64 };
+                                LVar { name: v.name, sort: v.sort, idx: new_idx_u64 }
+                            })
+                        }).collect()
+                    } else {
+                        bindings.iter().map(|(_, t)| t.clone()).collect()
+                    }
+                } else {
+                    bindings.iter().map(|(_, t)| t.clone()).collect()
+                };
                 // Build equations.  LHS = `apply new_subst (Var lv)`,
-                // RHS = `t` (already in fresh-vrange of the original `s`).
+                // RHS = renamed `t`.
                 let eqs: Vec<Equal<LNTerm>> = bindings.iter()
-                    .map(|(lv, t)| {
+                    .zip(renamed_rhs.into_iter())
+                    .map(|((lv, _), t)| {
                         let lv_t = Term::Lit(Lit::Var(lv.clone()));
                         Equal {
                             lhs: tamarin_term::subst::apply_vterm(&new_subst, lv_t),
-                            rhs: t.clone(),
+                            rhs: t,
                         }
                     })
                     .collect();

@@ -11,7 +11,13 @@ use crate::lterm::{LVar, Name};
 use crate::vterm::{Lit, VTerm};
 use crate::term::{f_app_list, Term};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `PartialOrd` / `Ord` derived to mirror Haskell's `deriving (Ord, ..)` on
+// `SubstVFresh c v` (LTerm.hs).  Haskell's `S.toList` in `performSplit`
+// returns substitutions in sorted order; we need the same canonical
+// ordering so split-case enumeration matches Haskell (e.g. KAS2_eCK
+// Resp_1 variant `c1 = aenc(x, pk(~lkR))` comes before the trivial
+// one, giving `split_case_1` = the meaningful variant).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SubstVFresh<C, V> {
     map: BTreeMap<V, VTerm<C, V>>,
 }

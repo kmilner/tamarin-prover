@@ -67,6 +67,17 @@ thread_local! {
     /// otherwise sit unchecked).
     static DEADLINE: std::cell::Cell<Option<std::time::Instant>> =
         std::cell::Cell::new(None);
+
+    /// ID-DFS depth limit for the current iteration.  `usize::MAX` =
+    /// no limit (default; matches pre-ID-DFS behaviour).  Set per
+    /// iteration in `run_proof_search`'s ID-DFS loop.
+    static MAX_DEPTH: std::cell::Cell<usize> = std::cell::Cell::new(usize::MAX);
+
+    /// Set to true by `expand` whenever a node hits `MAX_DEPTH`.  The
+    /// top-level loop reads this between iterations to decide whether
+    /// to retry with doubled depth.  Mirrors Haskell's `MaybeNoSolution`
+    /// sentinel in `cutOnSolvedDFS` (Proof.hs:855-877).
+    static DEPTH_LIMIT_HIT: std::cell::Cell<bool> = std::cell::Cell::new(false);
 }
 
 /// True iff the current search is past its wall-clock deadline.
@@ -83,21 +94,72 @@ fn clear_deadline()                     { DEADLINE.with(|d| d.set(None));     }
 /// Returns the root proof node. The final status is the OR of children
 /// (Solved if all children solved, Contradictory if any contradictory,
 /// etc.) — matching Haskell's notion of "complete" proofs.
+///
+/// **Iterative-deepening DFS** — port of Haskell's `cutOnSolvedDFS`
+/// (Proof.hs:855-877).  Starts at `max_depth=4` and doubles up to
+/// 2048.  At each iteration:
+///   1. Run `expand` with the current `MAX_DEPTH`.
+///   2. If status is Solved → return immediately (matches Haskell's
+///      `Solution path` short-circuit via `<>`).
+///   3. If `DEPTH_LIMIT_HIT` was set and depth < cap → double and retry.
+///   4. Else (no Solved found, no depth limit hit) → return.
+///
+/// This makes shorter Solved paths win over longer Solved paths even
+/// when the longer path is alphabetically earlier — critical for
+/// NSPK3/roles `injective_agree` where Haskell renders `case c_aenc`
+/// (shorter) over `case I_2` (alphabetically earlier but deeper).
+///
+/// `TAM_DISABLE_ID_DFS=1` falls back to single-pass with no depth limit
+/// (pre-ID-DFS behaviour) — useful for diagnosing regressions.
 pub fn run_proof_search(
     ctx: &ProofContext,
     initial: System,
     max_steps: usize,
 ) -> ProofNode {
-    let mut budget = max_steps;
     let deadline = proof_deadline();
     set_deadline(deadline);
+    let id_dfs_disabled = std::env::var("TAM_DISABLE_ID_DFS").is_ok();
+    let cap: usize = 2048;
+    let mut current_max_depth: usize = if id_dfs_disabled { usize::MAX } else { 4 };
     let mut root = ProofNode {
         method: ProofMethod::Sorry(Some("initial".into())),
-        sys: initial,
+        sys: initial.clone(),
         children: BTreeMap::new(),
         status: NodeStatus::Open,
     };
-    expand(ctx, &mut root, &mut budget, &deadline);
+    loop {
+        MAX_DEPTH.with(|m| m.set(current_max_depth));
+        DEPTH_LIMIT_HIT.with(|f| f.set(false));
+        let mut budget = max_steps;
+        root = ProofNode {
+            method: ProofMethod::Sorry(Some("initial".into())),
+            sys: initial.clone(),
+            children: BTreeMap::new(),
+            status: NodeStatus::Open,
+        };
+        expand(ctx, &mut root, &mut budget, &deadline, 0);
+        if id_dfs_disabled {
+            break;
+        }
+        if matches!(root.status, NodeStatus::Solved | NodeStatus::Contradictory) {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        let hit_depth = DEPTH_LIMIT_HIT.with(|f| f.get());
+        if !hit_depth {
+            // No branch hit the depth limit — going deeper won't help.
+            break;
+        }
+        if current_max_depth >= cap {
+            // Depth cap reached; accept whatever we have.
+            break;
+        }
+        current_max_depth = current_max_depth.saturating_mul(2).min(cap);
+    }
+    MAX_DEPTH.with(|m| m.set(usize::MAX));
+    DEPTH_LIMIT_HIT.with(|f| f.set(false));
     clear_deadline();
     root
 }
@@ -107,13 +169,43 @@ fn expand(
     node: &mut ProofNode,
     budget: &mut usize,
     deadline: &std::time::Instant,
+    depth: usize,
 ) {
     let dbg_expand = std::env::var("TAM_DBG_EXPAND").is_ok();
     if dbg_expand {
-        eprintln!("[expand] enter budget={} sys.nodes={} goals={}",
-            *budget, node.sys.nodes.len(), node.sys.goals.len());
+        eprintln!("[expand] enter depth={} budget={} sys.nodes={} goals={}",
+            depth, *budget, node.sys.nodes.len(), node.sys.goals.len());
     }
     crate::state_trace::emit("expand", None, &node.sys);
+    // ID-DFS depth limit (Haskell `cutOnSolvedDFS` Proof.hs:855-877).
+    //
+    // Haskell's `findSolved` checks `d >= dMax` BEFORE checking the
+    // node's method type:
+    //
+    //   findSolved d node
+    //     | d >= dMax = MaybeNoSolution
+    //     | otherwise = case node of
+    //         LNode (ProofStep (Finished Solved) ...) _  -> Solution path
+    //         ...
+    //
+    // So a Solved leaf at depth d == dMax becomes MaybeNoSolution, NOT
+    // Solution.  This is critical for correct alphabetical-first selection
+    // during iterative deepening: if a shorter Solved (case_2 at d=8)
+    // exists alongside a longer one (case_1 at d=15), Haskell needs to
+    // iterate dMax up to >= 16 before EITHER returns Solution, at which
+    // point alphabetical-first (case_1) wins.  Checking is_finished
+    // before the depth limit would make our case_2 close at max_depth=8
+    // and short-circuit before case_1 is reachable at deeper iterations.
+    //
+    // See [[project_rust_id_dfs]] for the original ID-DFS port and
+    // KAS2_eCK::eCK_key_secrecy for the case that motivated this fix.
+    let max_depth = MAX_DEPTH.with(|m| m.get());
+    if depth >= max_depth {
+        DEPTH_LIMIT_HIT.with(|f| f.set(true));
+        node.method = ProofMethod::Sorry(Some("depth limit".into()));
+        node.status = NodeStatus::Sorry;
+        return;
+    }
     // Already terminal.
     if let Some(r) = is_finished(ctx, &node.sys) {
         node.method = ProofMethod::Finished(r.clone());
@@ -197,56 +289,45 @@ fn expand(
     let mut any_solved = false;
     let mut any_unfin = false;
     let mut any_sorry = false;
-    // Combined fair-budget + early-break-on-Solved (Haskell-faithful):
+    // Early-break-on-Solved (Haskell `foldMap` semantics):
     //
-    // Fair budget: Haskell's lazy Disj-monad explores each branch
-    // independently — no shared step counter — so an infinite-
-    // recursion sibling can't starve other branches.  Our `budget`
-    // is a shared counter; without fair allocation, depth-first
-    // descent into the first case (alphabetically) can exhaust the
-    // entire budget before later siblings get explored.  Give each
-    // child a fair share so a single explosive branch can't starve
-    // siblings.
-    //
-    // Early-break-on-Solved: Haskell's Disj-monad is lazy — once
-    // any branch returns `TraceFound` (Solved), the monad short-
-    // circuits and siblings aren't forced.  Haskell's proof tree
-    // renders only what was forced; the Solved branch and its
-    // ancestors.  Our search needs the same: once any child closes
-    // Solved, the parent's status is Solved (per the rollup below)
-    // and remaining siblings would just be wasted work.
+    // Haskell's Disj-monad is lazy — once any branch returns
+    // `TraceFound` (Solved), the monad short-circuits and siblings
+    // aren't forced.  Haskell's proof tree renders only what was
+    // forced: the Solved branch and its ancestors.  Our search does
+    // the same — once any child closes Solved, parent's status is
+    // Solved (per rollup) and remaining siblings are wasted work.
     //
     // Critical for NSPK3::nonce_secrecy and other attack lemmas:
     // Haskell finds the trace at one specific case (e.g. `c_aenc`)
     // after the lazy Disj-monad short-circuits other paths.
-    // Haskell-faithful case iteration order.  `execProofMethod`
-    // (ProofMethod.hs:435-441) builds a `Data.Map` keyed by case name
-    // via `M.fromListWith`, so entries are alphabetically ordered.
-    // `proveSystemDFS` / `cutOnSolvedDFS` then walk those children in
-    // map order (Proof.hs:855-877 — `foldMap`, `M.map`).  Our `Vec`
-    // preserves the case-creation order (source-file rule order), so
-    // sort by name to match Haskell.
+    //
+    // Case iteration order: `execProofMethod` (ProofMethod.hs:435-441)
+    // builds a `Data.Map` keyed by case name via `M.fromListWith`, so
+    // entries are alphabetically ordered.  `proveSystemDFS` /
+    // `cutOnSolvedDFS` then walk in map order (Proof.hs:855-877 —
+    // `foldMap`, `M.map`).  Our `Vec` preserves creation order
+    // (source-file rule order), so sort by name to match Haskell.
     let mut cases = cases;
     cases.sort_by(|a, b| a.0.cmp(&b.0));
-    let n_cases = cases.len();
-    let total_budget = *budget;
-    let per_case = if n_cases > 0 { (total_budget / n_cases).max(1) } else { total_budget };
-    let mut leftover = total_budget.saturating_sub(per_case * n_cases);
-    *budget = 0;  // we'll redistribute below
+    // Haskell-faithful: no per-branch budget split.  Haskell's lazy
+    // Disj-monad explores each branch using as many steps as needed —
+    // there is no step-count cap on individual branches.  The ID-DFS
+    // depth limit (above) prevents infinite recursion; deadline catches
+    // runaway Maude calls.  Earlier fair-budget split divided `budget`
+    // by `n_cases`, which caused deeply-branching paths to exhaust
+    // their per-branch share before reaching a Solved leaf, even when
+    // total budget was generous.  Each child sees the same shared
+    // `budget` counter, decremented as it explores.
     for (name, sys) in cases {
         if any_solved { break; }  // Haskell-lazy: stop on first TraceFound.
-        let mut child_budget = per_case + leftover;
-        leftover = 0; // only first case gets the leftover
-        if child_budget == 0 { child_budget = 1; }
         let mut child = ProofNode {
             method: ProofMethod::Sorry(None),
             sys,
             children: BTreeMap::new(),
             status: NodeStatus::Open,
         };
-        expand(ctx, &mut child, &mut child_budget, deadline);
-        // Carry unused budget forward to the next sibling.
-        leftover = child_budget;
+        expand(ctx, &mut child, budget, deadline, depth + 1);
         match child.status {
             NodeStatus::Solved => any_solved = true,
             NodeStatus::Contradictory => any_contra = true,
@@ -256,8 +337,6 @@ fn expand(
         }
         node.children.insert(name, child);
     }
-    // Return any unused budget to caller.
-    *budget = leftover;
     // Rollup follows Haskell's `Semigroup ProofStatus`
     // (`Theory.Proof:409`):
     //

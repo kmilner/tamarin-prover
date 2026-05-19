@@ -118,15 +118,30 @@ pub fn simple_injective_fact_instances(
             &p.tag == tag && p.terms.first() == Some(t))
     }
 
-    // Candidate tags = every Linear protocol-fact tag that appears as a
-    // conclusion in at least one rule.
+    // Candidate tags = Linear protocol-fact tags that appear as BOTH a
+    // conclusion AND a premise in the SAME rule.  Mirrors Haskell's
+    // `simpleInjectiveFactInstances` (InjectiveFactInstances.hs:121-132):
+    //   guard $ (factTagMultiplicity tag == Linear)
+    //        && (tag `elem` (factTag <$> rPrems ru))
+    //
+    // Previously over-permissive: we included any tag that appeared as a
+    // conclusion in any rule.  That added spurious InjectiveFacts
+    // less-atoms (via `nonInjectiveFactInstances`) for protocols whose
+    // linear facts get *created* in one rule and *consumed* in another
+    // (no round-trip).  E.g. Artificial.spthy: Step1 creates St(x, k),
+    // Step2 consumes it — neither rule has both → St not injective in
+    // Haskell, but was injective in our port, creating a spurious cycle
+    // in Fin_unique's case_2.
     use std::collections::BTreeSet;
     let mut candidates: BTreeSet<FactTag> = BTreeSet::new();
     for r in rules {
+        let prem_tags: BTreeSet<FactTag> = r.premises.iter()
+            .map(|p| p.tag.clone()).collect();
         for c in &r.conclusions {
             if !matches!(c.tag, FactTag::Proto(_, _, _)) { continue; }
             if fact_tag_multiplicity(&c.tag) != Multiplicity::Linear { continue; }
             if fact_tag_arity(&c.tag) == 0 { continue; }
+            if !prem_tags.contains(&c.tag) { continue; }
             candidates.insert(c.tag.clone());
         }
     }
