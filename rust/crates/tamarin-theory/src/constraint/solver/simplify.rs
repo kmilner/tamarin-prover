@@ -2291,11 +2291,25 @@ fn drop_trivially_true_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
 
 /// Deduplicate the formula list. Haskell uses `Set` storage so this
 /// is implicit; we use `Vec` so a manual pass is needed.
+///
+/// Dedupe compares on a sort-hint-normalised canonical form: two
+/// formulas that differ ONLY by `SortHint::Msg` vs `SortHint::Untagged`
+/// (or other equivalent forms — see `normalize_sort_hints`) elaborate
+/// to the same `LSort` and represent the same semantic formula.
+/// Without normalisation, the Maude→AST round trip in
+/// `insert_implied_formulas_pass` produces variants that compare
+/// unequal, accumulating duplicate IH-Disjs.
 fn dedupe_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
+    use crate::guarded::{Guarded, normalize_sort_hints};
     let before = red.sys.formulas.len();
-    let mut seen: Vec<crate::guarded::Guarded> = Vec::new();
+    let mut seen: Vec<Guarded> = Vec::new();
+    let mut seen_canon: Vec<Guarded> = Vec::new();
     for f in red.sys.formulas.drain(..) {
-        if !seen.contains(&f) { seen.push(f); }
+        let canon = normalize_sort_hints(&f);
+        if !seen_canon.contains(&canon) {
+            seen_canon.push(canon);
+            seen.push(f);
+        }
     }
     red.sys.formulas = seen;
     if red.sys.formulas.len() != before {

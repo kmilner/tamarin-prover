@@ -598,6 +598,100 @@ pub fn normalize_witness_lvars(g: &Guarded) -> Guarded {
     subst_guarded(g, &subst)
 }
 
+/// Normalize equivalent sort hints so two `Guarded` formulas that
+/// differ ONLY by sort hint compare equal under `==`.
+///
+/// All of `SortHint::Msg`, `SortHint::Suffix(SuffixSort::Msg)`, and
+/// `SortHint::Untagged` map to `LSort::Msg` in elaboration (see
+/// `elaborate::sort_of`).  Implied-formula matching uses Maude →
+/// LNTerm → parser-AST round trips, where `lnterm_to_term` always
+/// produces the canonical `SortHint::Msg`/`Pub`/`Fresh`/`Node`/`Nat`
+/// form regardless of the original hint.  Formulas created by other
+/// paths (lemma re-instantiation, ginduct on the IH) may retain
+/// `Untagged` or suffix-style hints.  Without normalisation, two
+/// semantically-identical formulas compare unequal and the dedupe in
+/// `insert_formula_decompose` / `insert_implied_formulas_pass` lets
+/// duplicates accumulate.
+///
+/// Concretely: `RFID_Simple::Device_Init_Use_Set` was generating
+/// duplicate IH-Disjs at depth 2 — one with `sk:Msg` and one with
+/// `sk:Untagged`.
+pub fn normalize_sort_hints(g: &Guarded) -> Guarded {
+    fn norm_sort(s: p::SortHint) -> p::SortHint {
+        match s {
+            p::SortHint::Pub | p::SortHint::Suffix(p::SuffixSort::Pub) =>
+                p::SortHint::Pub,
+            p::SortHint::Fresh | p::SortHint::Suffix(p::SuffixSort::Fresh) =>
+                p::SortHint::Fresh,
+            p::SortHint::Node | p::SortHint::Suffix(p::SuffixSort::Node) =>
+                p::SortHint::Node,
+            p::SortHint::Nat | p::SortHint::Suffix(p::SuffixSort::Nat) =>
+                p::SortHint::Nat,
+            p::SortHint::Msg | p::SortHint::Suffix(p::SuffixSort::Msg)
+            | p::SortHint::Untagged => p::SortHint::Msg,
+        }
+    }
+    fn norm_var(v: &p::VarSpec) -> p::VarSpec {
+        p::VarSpec {
+            name: v.name.clone(),
+            idx: v.idx,
+            sort: norm_sort(v.sort),
+            typ: v.typ.clone(),
+        }
+    }
+    fn norm_term(t: &p::Term) -> p::Term {
+        use p::Term;
+        match t {
+            Term::Var(v) => Term::Var(norm_var(v)),
+            Term::App(n, args) => Term::App(
+                n.clone(), args.iter().map(norm_term).collect()),
+            Term::Pair(args) => Term::Pair(args.iter().map(norm_term).collect()),
+            Term::AlgApp(n, a, b) => Term::AlgApp(
+                n.clone(), Box::new(norm_term(a)), Box::new(norm_term(b))),
+            Term::Diff(a, b) => Term::Diff(
+                Box::new(norm_term(a)), Box::new(norm_term(b))),
+            Term::BinOp(op, a, b) => Term::BinOp(
+                *op, Box::new(norm_term(a)), Box::new(norm_term(b))),
+            Term::PatMatch(inner) => Term::PatMatch(Box::new(norm_term(inner))),
+            _ => t.clone(),
+        }
+    }
+    fn norm_fact(f: &p::Fact) -> p::Fact {
+        p::Fact {
+            persistent: f.persistent,
+            name: f.name.clone(),
+            args: f.args.iter().map(norm_term).collect(),
+            annotations: f.annotations.clone(),
+        }
+    }
+    fn norm_atom(a: &p::Atom) -> p::Atom {
+        use p::Atom;
+        match a {
+            Atom::Action(f, t) => Atom::Action(norm_fact(f), norm_term(t)),
+            Atom::Eq(x, y) => Atom::Eq(norm_term(x), norm_term(y)),
+            Atom::Less(x, y) => Atom::Less(norm_term(x), norm_term(y)),
+            Atom::LessMset(x, y) => Atom::LessMset(norm_term(x), norm_term(y)),
+            Atom::Subterm(x, y) => Atom::Subterm(norm_term(x), norm_term(y)),
+            Atom::Last(t) => Atom::Last(norm_term(t)),
+            Atom::Pred(f) => Atom::Pred(norm_fact(f)),
+        }
+    }
+    fn rec(g: &Guarded) -> Guarded {
+        match g {
+            Guarded::Atom(a) => Guarded::Atom(norm_atom(a)),
+            Guarded::Disj(items) => Guarded::Disj(items.iter().map(rec).collect()),
+            Guarded::Conj(items) => Guarded::Conj(items.iter().map(rec).collect()),
+            Guarded::GGuarded { qua, vars, guards, body } => Guarded::GGuarded {
+                qua: qua.clone(),
+                vars: vars.iter().map(norm_var).collect(),
+                guards: guards.iter().map(norm_atom).collect(),
+                body: Box::new(rec(body)),
+            },
+        }
+    }
+    rec(g)
+}
+
 fn collect_witness_vars(g: &Guarded, out: &mut VarSubst) {
     match g {
         Guarded::Atom(a) => collect_witness_vars_atom(a, out),
