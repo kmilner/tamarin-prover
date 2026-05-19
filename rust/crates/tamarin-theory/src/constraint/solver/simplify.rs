@@ -666,7 +666,14 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     // pending KU action goals at ghost nodes.  Result: typing-class
     // [sources] lemmas reached bogus SOLVED leaves where the open
     // KU(m) claim should have triggered an IH contradiction.
-    let mut sys_actions: Vec<(crate::constraint::constraints::NodeId, crate::fact::LNFact)>
+    // Haskell-faithful: `allActions = unsolvedActionAtoms sys ++ ...`
+    // both halves iterate Data.Map (M.toList = sorted by key).  Sort
+    // each half to match — unsolved Action goals in Goal-Ord
+    // ((NodeId, LNFact)) and node actions in NodeId order.  Affects
+    // the order in which implied formulas (e.g. Less atoms from
+    // [reuse] lemmas) are inserted, which can change downstream
+    // simplify-loop iteration and contradiction detection.
+    let mut unsolved_actions: Vec<(crate::constraint::constraints::NodeId, crate::fact::LNFact)>
         = red.sys.goals.iter()
             .filter(|(_, st)| !st.solved)
             .filter_map(|(g, _)| match g {
@@ -674,11 +681,17 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
                 _ => None,
             })
             .collect();
+    unsolved_actions.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let mut node_actions: Vec<(crate::constraint::constraints::NodeId, crate::fact::LNFact)>
+        = Vec::new();
     for (id, rule) in &red.sys.nodes {
         for a in &rule.actions {
-            sys_actions.push((id.clone(), a.clone()));
+            node_actions.push((id.clone(), a.clone()));
         }
     }
+    node_actions.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut sys_actions = unsolved_actions;
+    sys_actions.extend(node_actions);
     if sys_actions.is_empty() { return ChangeIndicator::Unchanged; }
 
     let maude = red.ctx.maude.clone();
