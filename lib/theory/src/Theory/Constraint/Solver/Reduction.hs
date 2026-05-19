@@ -102,6 +102,7 @@ import           Extension.Prelude
 import           Logic.Connectives
 
 import           Theory.Constraint.Solver.Contradictions
+import qualified Theory.Constraint.Solver.Trace          as T
 import           Theory.Constraint.System
 import           Theory.Model
 
@@ -710,7 +711,7 @@ data SplitStrategy = SplitNow | SplitLater
 -- | @noContradictoryEqStore@ succeeds iff the equation store is not
 -- contradictory.
 noContradictoryEqStore :: Reduction ()
-noContradictoryEqStore = (contradictoryIf . eqsIsFalse) =<< getM sEqStore
+noContradictoryEqStore = (T.contradictoryIfT "noContradictoryEqStore:eqsIsFalse" . eqsIsFalse) =<< getM sEqStore
 
 -- | Add a list of term equalities to the equation store. And
 --  split resulting disjunction of equations according
@@ -751,13 +752,15 @@ solveNodeIdEqs = solveTermEqs SplitNow . map (fmap varTerm)
 -- | Add a list of fact equalities to the equation store, if possible.
 solveFactEqs :: SplitStrategy -> [Equal LNFact] -> Reduction ChangeIndicator
 solveFactEqs split eqs = do
-    contradictoryIf (not $ all evalEqual $ map (fmap factTag) eqs)
+    T.contradictoryIfT "solveFactEqs:tagMismatch"
+        (not $ all evalEqual $ map (fmap factTag) eqs)
     solveListEqs (solveTermEqs split) $ map (fmap factTerms) eqs
 
 -- | Add a list of rule equalities to the equation store, if possible.
 solveRuleEqs :: SplitStrategy -> [Equal RuleACInst] -> Reduction ChangeIndicator
 solveRuleEqs split eqs = do
-    contradictoryIf (not $ all evalEqual $ map (fmap (get rInfo)) eqs)
+    T.contradictoryIfT "solveRuleEqs:ruleInfoMismatch"
+        (not $ all evalEqual $ map (fmap (get rInfo)) eqs)
     solveListEqs (solveFactEqs split) $
         map (fmap (get rConcs)) eqs ++ map (fmap (get rPrems)) eqs
         ++ map (fmap (get rActs)) eqs
@@ -766,7 +769,8 @@ solveRuleEqs split eqs = do
 -- using the given solver for solving the entailed per-element equalities.
 solveListEqs :: ([Equal a] -> Reduction b) -> [(Equal [a])] -> Reduction b
 solveListEqs solver eqs = do
-    contradictoryIf (not $ all evalEqual $ map (fmap length) eqs)
+    T.contradictoryIfT "solveListEqs:lengthMismatch"
+        (not $ all evalEqual $ map (fmap length) eqs)
     solver $ concatMap flatten eqs
   where
     flatten (Equal l r) = zipWith Equal l r

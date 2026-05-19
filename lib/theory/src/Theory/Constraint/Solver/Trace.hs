@@ -1,0 +1,128 @@
+{-# LANGUAGE FlexibleContexts #-}
+-- |
+-- Reusable Haskell-side tracing infrastructure for solver investigations
+-- against the Rust port.
+--
+-- All trace points are env-var-gated, so they have zero overhead when
+-- flags are unset.  Flags:
+--
+--   TAM_HS_TRACE_CONTRA  — every `contradictoryIfT` call: site label,
+--                          whether it fired, plus a one-line system summary
+--                          when it does fire.  This is the workhorse for
+--                          locating "which simplify-time contradiction
+--                          Haskell catches that the Rust port misses".
+--
+--   TAM_HS_TRACE_SIMPLIFY — entry/exit of each simplify pass (which CR-rule)
+--                           and the size of the system before/after.
+--
+--   TAM_HS_TRACE_CASES — every case kept/dropped by `process` in
+--                        execProofMethod: case name, whether it survived
+--                        runReduction (i.e. wasn't mzero'd), final case
+--                        count after `distinguish`.
+--
+-- Usage in code:
+--
+--   import qualified Theory.Constraint.Solver.Trace as T
+--   T.contradictoryIfT "enforceEdgeUniqueness:premIdxMismatch" cond
+--
+-- The label should be specific enough to identify the call site in the
+-- log output.
+module Theory.Constraint.Solver.Trace (
+    contradictoryIfT
+  , tracePass
+  , tracePassPair
+  , traceCase
+  , dumpSystemSummary
+  , flagContra
+  , flagSimplify
+  , flagCases
+  ) where
+
+import           Control.Monad.Disj            (MonadDisj, contradictoryIf)
+import qualified Data.Map                      as M
+import qualified Data.Set                      as S
+import           Debug.Trace                   (trace, traceM)
+import qualified Extension.Data.Label          as L
+import           System.IO.Unsafe              (unsafePerformIO)
+import qualified System.Environment            as SysEnv
+
+import           Theory.Constraint.System
+
+
+-- | Read an env var at module load time (cached via NOINLINE so the
+-- unsafePerformIO fires exactly once per program run).
+flagContra :: Bool
+flagContra = unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_CONTRA"
+{-# NOINLINE flagContra #-}
+
+flagSimplify :: Bool
+flagSimplify = unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_SIMPLIFY"
+{-# NOINLINE flagSimplify #-}
+
+flagCases :: Bool
+flagCases = unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_CASES"
+{-# NOINLINE flagCases #-}
+
+
+-- | Drop-in replacement for `contradictoryIf` with a site label.  When
+-- `TAM_HS_TRACE_CONTRA=1` and the condition fires (i.e. the case is
+-- about to be mzero'd), prints `[CONTRA-FIRE] <label>` so we can see
+-- exactly which simplify-time contradiction caught the case.
+--
+-- When the condition is False (no contradiction), nothing is printed
+-- (would be too noisy — every solveFactEqs would log).
+contradictoryIfT :: MonadDisj m => String -> Bool -> m ()
+contradictoryIfT label cond
+    | cond && flagContra = traceM ("[CONTRA-FIRE] " ++ label) >> contradictoryIf cond
+    | otherwise          = contradictoryIf cond
+{-# INLINE contradictoryIfT #-}
+
+
+-- | Trace entry to a simplify pass, returning the result unchanged.
+-- The `before` System is used to compute a one-line summary; the result
+-- is the System after the pass.
+tracePass :: String -> a -> a
+tracePass label x
+    | flagSimplify = trace ("[PASS] " ++ label) x
+    | otherwise    = x
+{-# INLINE tracePass #-}
+
+
+-- | Wrap a monadic action with `[SUBPASS] enter/exit <label>` traces gated
+-- on `TAM_HS_TRACE_SIMPLIFY=1`.  Use this around each subpass inside
+-- `simplifySystem`'s go-loop: if the action mzero's mid-pass, the `exit`
+-- trace does NOT fire, so a per-pass enter/exit count mismatch identifies
+-- exactly which CR-rule killed the case.
+tracePassPair :: Monad m => String -> m a -> m a
+tracePassPair label m
+    | flagSimplify = do
+        () <- trace ("[SUBPASS] enter " ++ label) (return ())
+        r <- m
+        () <- trace ("[SUBPASS] exit  " ++ label) (return ())
+        return r
+    | otherwise = m
+{-# INLINE tracePassPair #-}
+
+
+-- | Trace a case-survival decision in `process` (execProofMethod).
+-- Called with the case name and whether it survived `runReduction`.
+traceCase :: String -> Bool -> a -> a
+traceCase name kept x
+    | flagCases = trace ("[CASE] " ++ name ++ " kept=" ++ show kept) x
+    | otherwise = x
+{-# INLINE traceCase #-}
+
+
+-- | One-line summary of a System for trace output.  Captures sizes so
+-- we can correlate the system state with the contradiction firing
+-- without flooding the log.
+dumpSystemSummary :: System -> String
+dumpSystemSummary sys =
+    "nodes=" ++ show (M.size (L.get sNodes sys)) ++
+    " edges=" ++ show (S.size (L.get sEdges sys)) ++
+    " less=" ++ show (S.size (L.get sLessAtoms sys)) ++
+    " goals=" ++ show (M.size (L.get sGoals sys)) ++
+    " formulas=" ++ show (S.size (L.get sFormulas sys))
