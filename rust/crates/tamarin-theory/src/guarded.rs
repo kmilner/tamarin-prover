@@ -831,29 +831,128 @@ pub fn subst_atom(a: &p::Atom, s: &VarSubst) -> p::Atom {
 /// guards, body, and every nested term/atom — but does NOT descend
 /// into a nested `GGuarded` whose `vars` shadow names in `s` (those
 /// references aren't free).
+///
+/// Capture-avoiding: if a binder's bound var would be captured by a
+/// free var in the substitution's range, the bound var is alpha-
+/// renamed to a fresh idx first.  Without this, an LVar substitution
+/// like `j:Node:2 → i:Node:0` applied to a formula
+/// `∀ i:0. body[i, j:2]` would conflate the free `j:2` (now `i:0`)
+/// with the bound `i:0` — the chaum_unforgeability wrong-falsified
+/// root cause.
 pub fn subst_guarded(g: &Guarded, s: &VarSubst) -> Guarded {
+    // Hot path: empty subst → no-op clone.
+    if s.is_empty() { return g.clone(); }
+    // Precompute the subst's range free vars once.  Captures can
+    // only occur for names that appear free in the subst's range
+    // values.
+    let mut range_free: std::collections::HashSet<(String, u64)>
+        = std::collections::HashSet::new();
+    for (_, t) in s.iter() {
+        collect_term_vars(t, &mut range_free);
+    }
+    subst_guarded_inner(g, s, &range_free)
+}
+
+fn subst_guarded_inner(
+    g: &Guarded,
+    s: &VarSubst,
+    range_free: &std::collections::HashSet<(String, u64)>,
+) -> Guarded {
     match g {
         Guarded::Atom(a) => Guarded::Atom(subst_atom(a, s)),
         Guarded::Disj(items) =>
-            Guarded::Disj(items.iter().map(|i| subst_guarded(i, s)).collect()),
+            Guarded::Disj(items.iter().map(|i| subst_guarded_inner(i, s, range_free)).collect()),
         Guarded::Conj(items) =>
-            Guarded::Conj(items.iter().map(|i| subst_guarded(i, s)).collect()),
+            Guarded::Conj(items.iter().map(|i| subst_guarded_inner(i, s, range_free)).collect()),
         Guarded::GGuarded { qua, vars, guards, body } => {
             // Drop substitutions for any var shadowed by this binder.
             let shadowed: std::collections::HashSet<(String, u64)> = vars.iter()
                 .map(|v| (v.name.clone(), v.idx))
                 .collect();
-            let s2: VarSubst = s.iter()
+            let s_filtered: VarSubst = s.iter()
                 .filter(|((n, i), _)| !shadowed.contains(&(n.clone(), *i)))
                 .map(|((n, i), v)| ((n.clone(), *i), v.clone()))
                 .collect();
+            // Capture check: bound vars that are free in subst's range.
+            let captures: Vec<(String, u64)> = vars.iter()
+                .map(|v| (v.name.clone(), v.idx))
+                .filter(|k| range_free.contains(k))
+                .collect();
+            if captures.is_empty() {
+                // Recompute range_free from s_filtered (smaller); but for
+                // perf, just reuse the parent's range_free conservatively.
+                return Guarded::GGuarded {
+                    qua: qua.clone(),
+                    vars: vars.clone(),
+                    guards: guards.iter().map(|a| subst_atom(a, &s_filtered)).collect(),
+                    body: Box::new(subst_guarded_inner(body, &s_filtered, range_free)),
+                };
+            }
+            // Allocate fresh idxs.  Use max(range_free.idx) + 1 as floor.
+            let mut next_idx: u64 = range_free.iter().map(|(_, i)| *i).max()
+                .unwrap_or(0).saturating_add(1);
+            // Also bump above any explicit idx in the binder vars.
+            for v in vars { if v.idx >= next_idx { next_idx = v.idx + 1; } }
+            let mut rename: VarSubst = VarSubst::new();
+            let mut new_vars: Vec<p::VarSpec> = Vec::with_capacity(vars.len());
+            for v in vars {
+                if captures.contains(&(v.name.clone(), v.idx)) {
+                    let new_v = p::VarSpec {
+                        name: v.name.clone(),
+                        idx: next_idx,
+                        sort: v.sort,
+                        typ: v.typ.clone(),
+                    };
+                    rename.insert(
+                        (v.name.clone(), v.idx),
+                        p::Term::Var(new_v.clone()));
+                    new_vars.push(new_v);
+                    next_idx = next_idx.saturating_add(1);
+                } else {
+                    new_vars.push(v.clone());
+                }
+            }
+            // Build a combined substitution: rename ∪ s_filtered.
+            // The rename keys are the OLD bound vars, mapping to new
+            // bound vars.  s_filtered's keys are the free vars from
+            // the eq-store.  Since the bound vars and free vars are
+            // disjoint (bound vars are now renamed to new idxs in
+            // the body's references), we can combine them.
+            let mut combined: VarSubst = s_filtered.clone();
+            for (k, v) in &rename {
+                combined.insert(k.clone(), v.clone());
+            }
+            // Recompute range_free for the combined subst — captures
+            // could compound if rename targets are already in range_free.
+            let mut combined_range_free: std::collections::HashSet<(String, u64)>
+                = range_free.clone();
+            for (_, t) in rename.iter() {
+                collect_term_vars(t, &mut combined_range_free);
+            }
             Guarded::GGuarded {
                 qua: qua.clone(),
-                vars: vars.clone(),
-                guards: guards.iter().map(|a| subst_atom(a, &s2)).collect(),
-                body: Box::new(subst_guarded(body, &s2)),
+                vars: new_vars,
+                guards: guards.iter().map(|a| subst_atom(a, &combined)).collect(),
+                body: Box::new(subst_guarded_inner(body, &combined, &combined_range_free)),
             }
         }
+    }
+}
+
+/// Collect (name, idx) of every variable that appears in a parser-AST term.
+fn collect_term_vars(t: &p::Term, out: &mut std::collections::HashSet<(String, u64)>) {
+    use p::Term;
+    match t {
+        Term::Var(v) => { out.insert((v.name.clone(), v.idx)); }
+        Term::App(_, args) | Term::Pair(args) => {
+            for a in args { collect_term_vars(a, out); }
+        }
+        Term::AlgApp(_, a, b) | Term::Diff(a, b) | Term::BinOp(_, a, b) => {
+            collect_term_vars(a, out); collect_term_vars(b, out);
+        }
+        Term::PatMatch(t) => collect_term_vars(t, out),
+        Term::PubLit(_) | Term::FreshLit(_) | Term::NatLit(_)
+        | Term::Number(_) | Term::NumberOne | Term::NatOne | Term::DhNeutral => {}
     }
 }
 
