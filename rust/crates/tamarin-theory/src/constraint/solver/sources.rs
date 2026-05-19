@@ -1276,6 +1276,127 @@ fn saturate_sources_inner_with_options(
             next.push(Source { goal: src.goal.clone(), cases: new_cases, incomplete: src_incomplete });
             next_used.push(new_used);
         }
+        // Haskell-faithful per-iter contradictory-case pruning.
+        // Mirrors `solveAllSafeGoals` (Sources.hs:144-219) running
+        // inside `refineSource` for each iter of `saturateSources`
+        // (Sources.hs:356-385).  Each iter, Haskell's Disj monad
+        // mzeros out cases whose `solveAllSafeGoals` produces no
+        // surviving branches — driving sources like `KU(t:Fresh)`
+        // toward `goodTh` (≤1 case) so they become applicable to
+        // sub-goals in OTHER cases via `solveWithSourceAndReturn`
+        // (Sources.hs:206 `asum $ map ...`).
+        //
+        // Without this pass, Rust's saturate accumulates chain-fold
+        // variants in KU(t:Fresh) (coerce-rooted) that aren't pruned
+        // until `drop_contradictory_cases` runs POST-saturate.  The
+        // multi-case state blocks `goodTh` throughout saturate, so
+        // the proto-grafted case-systems (e.g. chaum's `S_1` case
+        // with open `KU(~x:Fresh)`) never get their KU sub-goals
+        // auto-solved, and the runtime smartRanking ends up picking
+        // `case c_fresh` instead of `case B_1` / `S_2` / etc.
+        //
+        // Cluster B fix.
+        if let Some(ctx) = fold_ctx {
+            // good_ths = iter-start sources with ≤1 case.  Same set
+            // Haskell passes to `solveAllSafeGoals` per iter
+            // (Sources.hs:383-384 `filter goodTh ths`).
+            let good_ths: Vec<Source> = current.iter()
+                .filter(|s| s.cases.len() <= 1)
+                .cloned()
+                .collect();
+            for (src_idx, src) in next.iter_mut().enumerate() {
+                let cases_snapshot = src.cases.clone();
+                let used_snapshot: Vec<BTreeSet<String>> = next_used
+                    .get(src_idx).cloned().unwrap_or_default();
+                let mut kept_cases: Vec<(String, System)> = Vec::new();
+                let mut kept_used: Vec<BTreeSet<String>> = Vec::new();
+                for (case_idx, (name, sys)) in cases_snapshot.iter().enumerate() {
+                    if case_has_surviving_variant_with_ths(ctx, sys, &good_ths) {
+                        kept_cases.push((name.clone(), sys.clone()));
+                        kept_used.push(used_snapshot.get(case_idx)
+                            .cloned().unwrap_or_default());
+                    } else {
+                        // A case was dropped this iter — flag `changed`
+                        // so the saturate loop continues another iter.
+                        changed = true;
+                    }
+                }
+                src.cases = kept_cases;
+                if let Some(slot) = next_used.get_mut(src_idx) {
+                    *slot = kept_used;
+                }
+            }
+            // After pruning, run an auto-apply pass: for each case in
+            // `next` with an open KU action goal, find a NOW-goodTh
+            // source (in `next`, post-prune) that matches and graft
+            // its case.  Mirrors Haskell's `solveAllSafeGoals`'s
+            // `solveWithSourceAndReturn` arm (Sources.hs:206) firing
+            // on `usefulGoals` (KU actions) when goodTh sources are
+            // available.
+            //
+            // Without this, sources like `KU(t:Fresh)` that BECOME
+            // goodTh after per-iter pruning aren't actually applied
+            // to KU sub-goals in proto-grafted cases — runtime
+            // smartRanking then sees open KU(~x:Fresh) sub-goals and
+            // picks `case c_fresh` instead of the protocol rule.
+            //
+            // Consults `next` (post-prune state) so newly-goodTh
+            // sources are visible.  Source labels are recomputed
+            // since `next.cases` may have changed.
+            let next_labels: Vec<Option<String>> = next.iter()
+                .map(source_label).collect();
+            for src_idx in 0..next.len() {
+                let cases_snapshot = next[src_idx].cases.clone();
+                let used_snapshot: Vec<BTreeSet<String>> = next_used
+                    .get(src_idx).cloned().unwrap_or_default();
+                let mut new_inner_cases: Vec<(String, System)> = Vec::new();
+                let mut new_inner_used: Vec<BTreeSet<String>> = Vec::new();
+                for (case_idx, (name, sys)) in cases_snapshot.iter().enumerate() {
+                    let case_used = used_snapshot.get(case_idx)
+                        .cloned().unwrap_or_default();
+                    if first_open_proto_premise(sys).is_none() {
+                        if let Some((goal_node, fa_ku)) =
+                            first_open_ku_action_goal(sys)
+                        {
+                            let filtered: Vec<Source> = next.iter()
+                                .zip(next_labels.iter())
+                                .filter(|(s, _)| s.cases.len() <= 1)
+                                .filter(|(_, lbl)| match lbl {
+                                    Some(l) if l.starts_with("KU:") =>
+                                        !case_used.contains(l),
+                                    _ => true,
+                                })
+                                .map(|(s, _)| s.clone())
+                                .collect();
+                            let picked_label =
+                                pick_matching_ku_source_label(
+                                    &filtered, &fa_ku);
+                            if let (Some(picked), Some(grafted)) = (
+                                picked_label,
+                                saturate_ku_action_via_sources(
+                                    ctx, &filtered, sys,
+                                    &goal_node, &fa_ku, name),
+                            ) {
+                                for (sub_name, sub_sys) in grafted {
+                                    let mut sub_used = case_used.clone();
+                                    sub_used.insert(picked.clone());
+                                    new_inner_cases.push((sub_name, sub_sys));
+                                    new_inner_used.push(sub_used);
+                                }
+                                changed = true;
+                                continue;
+                            }
+                        }
+                    }
+                    new_inner_cases.push((name.clone(), sys.clone()));
+                    new_inner_used.push(case_used);
+                }
+                next[src_idx].cases = new_inner_cases;
+                if let Some(slot) = next_used.get_mut(src_idx) {
+                    *slot = new_inner_used;
+                }
+            }
+        }
         current = next;
         current_used = next_used;
         if !changed { break; }
@@ -2198,6 +2319,8 @@ fn saturate_ku_action_via_sources(
         sources, sys, goal_node, fa_ku, avoid_max)?;
     let mut out: Vec<(String, System)> = Vec::new();
     set_precompute_mode(true);
+    let live_goal = crate::constraint::constraints::Goal::Action(
+        goal_node.clone(), fa_ku.clone());
     for (case_label, grafted, case_action) in case_pairs {
         let mut sub = Reduction::new(ctx, grafted);
         // Unify the case's KU action with the live KU action.
@@ -2212,6 +2335,15 @@ fn saturate_ku_action_via_sources(
         sub.subst_system();
         // Skip cases that hit immediate contradiction after subst.
         if !contradictions(ctx, &sub.sys).is_empty() { continue; }
+        // Mark the live KU goal as solved.  Mirrors Haskell's
+        // `_applySource` (Sources.hs:346) which calls
+        // `markGoalAsSolved "precomputed" goal` before conjoinSystem.
+        // Without this, the KU sub-goal stays open in the
+        // saturated case-system and runtime's smartRanking picks
+        // it instead of the protocol-rule-driven sub-goal.
+        for (g, st) in sub.sys.goals.iter_mut() {
+            if g == &live_goal { st.solved = true; break; }
+        }
         let name = format!("{}_{}", outer_name, case_label);
         out.push((name, sub.sys));
     }
