@@ -3745,6 +3745,47 @@ fn run_solve_all_safe_goals_disj(
 /// step over each returned tuple — that's why we hand back the
 /// conclusion fact rather than running unification here (we don't have
 /// a `&mut Reduction` at this layer).
+/// Haskell-faithful `applySource` driver for Premise goals.  Walks
+/// the source's cases, invoking `apply_source_case_premise` per case
+/// (which mirrors `matchToGoal` + `_applySource` from Sources.hs).
+///
+/// Returns `(case_name, fully_conjoined_system)` per case that
+/// successfully matched + conjoined.  The system is already aligned
+/// against the live goal via `conjoinSystem`'s `solveSubstEqs +
+/// substSystem` plus a defensive `chain_eqs` pass — no additional
+/// fact-eq work needed by the caller.
+pub fn solve_with_source_cases_ctx(
+    ctx: &crate::constraint::solver::context::ProofContext,
+    sources: &[Source],
+    sys: &System,
+    goal_node: &crate::constraint::constraints::NodeId,
+    goal_prem_idx: crate::rule::PremIdx,
+    fa_prem: &crate::fact::LNFact,
+) -> Option<Vec<(String, System)>> {
+    use crate::constraint::constraints::Goal;
+
+    let src = sources.iter().find(|s| match &s.goal {
+        Goal::Premise(_, fa) => fa.tag == fa_prem.tag,
+        _ => false,
+    })?;
+
+    let mut out: Vec<(String, System)> = Vec::new();
+    for (name, case_sys) in &src.cases {
+        // Normalize precompute case-name by stripping `_case_<N>_` and
+        // intruder-rule prefixes (coerce_, irecv_, c_<sym>_) so that
+        // runtime emits the canonical Haskell name (e.g. `Recv1`).
+        let case_label = saturated_chain_root(name);
+        if let Some(final_sys) = apply_source_case_premise(
+            ctx, sys, src, case_sys,
+            goal_node, goal_prem_idx, fa_prem,
+        ) {
+            out.push((case_label, final_sys));
+        }
+    }
+    if out.is_empty() { return None; }
+    Some(out)
+}
+
 pub fn solve_with_source_cases(
     sources: &[Source],
     sys: &System,
@@ -5202,6 +5243,248 @@ fn apply_source_case_action(
     crate::state_trace::emit(
         "applySource_out", Some(&live_goal_for_trace), &r.sys);
     Some((r.sys, live_action))
+}
+
+/// Haskell-faithful `applySource` for Premise goals.  Mirrors
+/// `apply_source_case_action` step-for-step, with the Premise-specific
+/// edge rewire from `matchToGoal` (Sources.hs:283).
+///
+/// Includes a defensive edge-fact `chain_eqs` pass after `conjoinSystem`
+/// (step G) to re-unify edge facts.  Rust saturate doesn't always emit
+/// fully-edge-consistent `case_sys` (task #249); until that lands, this
+/// pass compensates.
+fn apply_source_case_premise(
+    ctx: &crate::constraint::solver::context::ProofContext,
+    live_sys: &System,
+    src: &Source,
+    case_sys: &System,
+    live_node: &crate::constraint::constraints::NodeId,
+    live_prem_idx: crate::rule::PremIdx,
+    fa_live: &crate::fact::LNFact,
+) -> Option<System> {
+    use crate::constraint::solver::reduction::{
+        Reduction, SolveOutcome, SplitStrategy, bounds_max,
+    };
+    use tamarin_term::lterm::HasFrees;
+
+    let dbg_apply = std::env::var("TAM_DBG_APPLY_SOURCE").is_ok();
+    let case_label = src.cases.iter()
+        .find_map(|(n, sys)|
+            if std::ptr::eq(sys as *const _, case_sys as *const _) {
+                Some(n.clone())
+            } else { None })
+        .unwrap_or_default();
+    let dbg = |reason: &str| {
+        if dbg_apply {
+            eprintln!("[applySource_prem] DROP case={} reason={} live_node={:?} fa_live.tag={:?}",
+                case_label, reason, live_node, fa_live.tag);
+        }
+    };
+
+    let (abstract_node_orig, abstract_prem_idx_orig, abstract_prem_fact_orig) =
+        match &src.goal {
+            crate::constraint::constraints::Goal::Premise((n, p), fa) =>
+                (n.clone(), *p, fa.clone()),
+            _ => { dbg("src-goal-not-Premise"); return None; },
+        };
+    if fa_live.tag != abstract_prem_fact_orig.tag
+        || fa_live.terms.len() != abstract_prem_fact_orig.terms.len()
+    {
+        dbg("tag/arity-mismatch");
+        return None;
+    }
+
+    let live_goal_for_trace = crate::constraint::constraints::Goal::Premise(
+        (live_node.clone(), live_prem_idx), fa_live.clone());
+    crate::state_trace::emit("applySource_prem_in", Some(&live_goal_for_trace), live_sys);
+
+    // A.1 — rename th0 in matchToGoal.
+    let mut goal_max: u64 = 0;
+    {
+        let mut visit = |v: &tamarin_term::lterm::LVar| {
+            if v.idx > goal_max { goal_max = v.idx; }
+        };
+        live_node.for_each_free(&mut visit);
+        fa_live.for_each_free(&mut visit);
+    }
+    let rename_shift = goal_max.saturating_add(1);
+    let shift_lvar = |v: &tamarin_term::lterm::LVar| {
+        let mut v2 = v.clone();
+        v2.idx = v2.idx.saturating_add(rename_shift);
+        v2
+    };
+    let renamed_abstract_node = shift_lvar(&abstract_node_orig);
+    let renamed_abstract_fact = abstract_prem_fact_orig
+        .map_free(&mut |v| shift_lvar(&v));
+    let empty_keep: std::collections::BTreeSet<tamarin_term::lterm::LVar>
+        = std::collections::BTreeSet::new();
+    let renamed_case = freshen_system_keep_with_shift(
+        case_sys, rename_shift, &empty_keep);
+
+    // A.2 — match (faTerm matchFact faPat) <> (iTerm matchLVar iPat).
+    let mut pairs: Vec<(tamarin_term::lterm::LNTerm, tamarin_term::lterm::LNTerm)>
+        = Vec::with_capacity(fa_live.terms.len() + 1);
+    for (lt, pt) in fa_live.terms.iter().zip(renamed_abstract_fact.terms.iter()) {
+        pairs.push((lt.clone(), pt.clone()));
+    }
+    pairs.push((
+        tamarin_term::term::Term::Lit(
+            tamarin_term::vterm::Lit::Var(live_node.clone())),
+        tamarin_term::term::Term::Lit(
+            tamarin_term::vterm::Lit::Var(renamed_abstract_node.clone())),
+    ));
+    let match_pairs: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)> = {
+        let problem = tamarin_term::rewriting::Match::DelayedMatches(pairs.clone());
+        match tamarin_term::unification::solve_match_lterm_no_ac::<
+            tamarin_term::lterm::Name, _>(
+            &tamarin_term::lterm::sort_of_name, problem,
+        ) {
+            Some(s) => s.to_list(),
+            None => {
+                let match_eqs: Vec<_> = pairs.into_iter()
+                    .map(|(t, p)| tamarin_term::rewriting::Equal { lhs: t, rhs: p })
+                    .collect();
+                let substs_res = ctx.maude.match_eqs(&match_eqs);
+                let mut substs = match substs_res {
+                    Ok(s) => s,
+                    Err(_) => { dbg("maude-match-err"); return None; },
+                };
+                if substs.is_empty() { dbg("match-empty"); return None; }
+                substs.swap_remove(0)
+            }
+        }
+    };
+
+    // A.2.5 (Premise-specific) — substNodePrem pPat (iPat, premIdxTerm).
+    // Rewrite edges in the case whose tgt is the renamed pattern
+    // premise so they point at the LIVE premise idx.  Same for any
+    // Premise goal at that position.
+    let mut renamed_case = renamed_case;
+    let pat_prem: (tamarin_term::lterm::LVar, crate::rule::PremIdx) =
+        (renamed_abstract_node.clone(), abstract_prem_idx_orig);
+    let new_prem: (tamarin_term::lterm::LVar, crate::rule::PremIdx) =
+        (renamed_abstract_node.clone(), live_prem_idx);
+    for e in renamed_case.edges.iter_mut() {
+        if e.tgt == pat_prem {
+            e.tgt = new_prem.clone();
+        }
+    }
+    for (g, _) in renamed_case.goals.iter_mut() {
+        if let crate::constraint::constraints::Goal::Premise(p, _) = g {
+            if *p == pat_prem {
+                *p = new_prem.clone();
+            }
+        }
+    }
+
+    // A.3 — refineSubst: solveSubstEqs SplitNow subst >> substSystem.
+    let mut refined = Reduction::new(ctx, renamed_case);
+    let term_eqs: Vec<_> = match_pairs.into_iter()
+        .map(|(v, t)| tamarin_term::rewriting::Equal {
+            lhs: tamarin_term::term::Term::Lit(
+                tamarin_term::vterm::Lit::Var(v)),
+            rhs: t,
+        })
+        .collect();
+    if !term_eqs.is_empty() {
+        let r = refined.solve_term_eqs(SplitStrategy::SplitNow, &term_eqs);
+        if matches!(r, Err(_) | Ok(SolveOutcome::Contradictory)) {
+            dbg("refineSubst-contradictory");
+            return None;
+        }
+    }
+    refined.subst_system();
+    if refined.sys.eq_store.is_false() {
+        dbg("post-subst-eq-store-false");
+        return None;
+    }
+    let runtime_stable: std::collections::BTreeSet<tamarin_term::lterm::LVar> = {
+        let mut s = std::collections::BTreeSet::new();
+        s.insert(live_node.clone());
+        fa_live.for_each_free(&mut |v: &tamarin_term::lterm::LVar| {
+            s.insert(v.clone());
+        });
+        s
+    };
+    restrict_eq_store_to_stable_vars(&mut refined.sys, &runtime_stable);
+    crate::state_trace::emit(
+        "applySource_prem_refined", Some(&live_goal_for_trace), &refined.sys);
+    let refined_case = refined.sys;
+
+    // D — someInst keepVarBindings.
+    let mut keep_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar>
+        = std::collections::BTreeSet::new();
+    keep_vars.insert(live_node.clone());
+    fa_live.for_each_free(&mut |v: &tamarin_term::lterm::LVar| {
+        keep_vars.insert(v.clone());
+    });
+    let post_refine_max = bounds_max(&refined_case);
+    ctx.maude.ensure_above(post_refine_max);
+    let shift_base = ctx.maude.reserve_idxs(post_refine_max.saturating_add(1));
+    let freshened_case = freshen_system_keep_with_shift(
+        &refined_case, shift_base, &keep_vars);
+
+    // B+E — markGoalAsSolved + conjoinSystem.
+    let mut r = Reduction::new(ctx, live_sys.clone());
+    let live_goal = crate::constraint::constraints::Goal::Premise(
+        (live_node.clone(), live_prem_idx), fa_live.clone());
+    if let Some(slot) = r.sys.goals.iter_mut().find(|(g, _)| g == &live_goal) {
+        slot.1.solved = true;
+    }
+    crate::state_trace::emit(
+        "applySource_prem_pre_conjoin", Some(&live_goal_for_trace), &freshened_case);
+    let res = r.conjoin_system(&freshened_case);
+    if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
+        dbg(match res {
+            Err(_) => "conjoin-err",
+            Ok(SolveOutcome::Contradictory) => "conjoin-contradictory",
+            _ => "conjoin-other",
+        });
+        crate::state_trace::emit(
+            "applySource_prem_drop", Some(&live_goal_for_trace), &r.sys);
+        return None;
+    }
+
+    // F — close trivial chains.
+    close_trivial_chains_in_graft(&mut r);
+
+    // G — defensive edge-fact coherence pass.  Rust saturate doesn't
+    // always emit fully-edge-consistent case_sys (task #249); conjoin's
+    // substSystem doesn't always propagate every fact-eq through edges
+    // (task #250).  This pass re-unifies producer-conc / consumer-prem
+    // facts along every edge.  Required for soundness on
+    // Minimal_HashChain, FreshOrderingTest, foo/okamoto eligibility.
+    let mut tag_mismatch = false;
+    let chain_eqs: Vec<_> = r.sys.edges.iter()
+        .filter_map(|e| {
+            let (_, src_rule) = r.sys.nodes.iter()
+                .find(|(n, _)| n == &e.src.0)?;
+            let (_, tgt_rule) = r.sys.nodes.iter()
+                .find(|(n, _)| n == &e.tgt.0)?;
+            let fc = src_rule.conclusions.get(e.src.1.0)?.clone();
+            let fp = tgt_rule.premises.get(e.tgt.1.0)?.clone();
+            if fc.tag != fp.tag || fc.terms.len() != fp.terms.len() {
+                tag_mismatch = true;
+                return None;
+            }
+            if fc == fp { return None; }
+            Some(tamarin_term::rewriting::Equal { lhs: fc, rhs: fp })
+        })
+        .collect();
+    if tag_mismatch { dbg("chain-eqs-tag-mismatch"); return None; }
+    if !chain_eqs.is_empty() {
+        let r2 = r.solve_fact_eqs(SplitStrategy::SplitNow, &chain_eqs);
+        if matches!(r2, Err(_) | Ok(SolveOutcome::Contradictory)) {
+            dbg("chain-eqs-contradictory");
+            return None;
+        }
+        r.subst_system();
+    }
+
+    if src.incomplete { r.sys.used_incomplete_source = true; }
+    crate::state_trace::emit(
+        "applySource_prem_out", Some(&live_goal_for_trace), &r.sys);
+    Some(r.sys)
 }
 
 /// True when `t` is a Msg-sorted free variable.  Used by

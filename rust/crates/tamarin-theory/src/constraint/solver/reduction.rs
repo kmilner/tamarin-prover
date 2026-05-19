@@ -3223,128 +3223,44 @@ impl<'ctx> Reduction<'ctx> {
                 }
             };
         }
-        // Source-case short-circuit.  Mirrors Haskell's
-        //     solve goal = ... solveWithSource ctxt ths goal
-        // in `Theory.Constraint.Solver.ProofMethod`.  When a saturated
-        // source matches the live tag, graft each of its precomputed
-        // cases onto the live system and then run
-        // `solve_fact_eqs(SplitNow, [Equal { conc, fa_prem }])` to
-        // align the case's abstract terms with the concrete premise
-        // — exactly Haskell's `someInst >> conjoinSystem` flow.  Cases
-        // whose unification fails are dropped; the rest are returned
-        // as `GoalCases::Cases`.  Skipped during precompute itself.
+        // Source-case short-circuit.  Mirrors Haskell's `solveWithSource`
+        // → `applySource` (Sources.hs:326-351): match the live goal
+        // against the source's abstract `cdGoal`, refine the case via
+        // `refineSubst`, someInst with keepVarBindings, then
+        // `conjoinSystem`.  Implemented in
+        // `apply_source_case_premise` (sources.rs).
+        //
+        // The returned systems are already fact-aligned + edge-coherent
+        // (with a defensive `chain_eqs` pass — see task #249).
+        // Skipped during precompute itself.
         if !crate::constraint::solver::sources::in_precompute_mode()
             && !self.ctx.full_sources.is_empty()
         {
-            let avoid_max = bounds_max(&self.sys);
-            if let Some(case_pairs) = crate::constraint::solver::sources::solve_with_source_cases(
+            if let Some(case_pairs) = crate::constraint::solver::sources::solve_with_source_cases_ctx(
+                self.ctx,
                 &self.ctx.full_sources,
                 &self.sys,
                 &p.0, p.1, fa_prem,
-                avoid_max,
             ) {
-                let live_goal = Goal::Premise(p.clone(), fa_prem.clone());
                 let mut out: Vec<(String, crate::constraint::system::System)> = Vec::new();
-                let used = self.sys.used_sources.clone();
-                for (mut sys, conc_fact) in case_pairs {
-                    // Mark the live goal solved before unifying — applySource
-                    // does the same prior to conjoining the case.
-                    if let Some(slot) = sys.goals.iter_mut()
-                        .find(|(g, _)| g == &live_goal) {
-                        slot.1.solved = true;
+                for (case_name, mut sys) in case_pairs {
+                    if has_fresh_consumer_conflation(&sys, &self.ctx.maude) {
+                        continue;
                     }
-                    // Look up the grafted rule's name via the edge
-                    // pointing at our premise — that edge's source
-                    // node holds the case's producer rule.
-                    let producer_id = sys.edges.iter()
-                        .find(|e| e.tgt == *p)
-                        .map(|e| e.src.0.clone());
-                    let case_name = producer_id
-                        .and_then(|pid| sys.nodes.iter()
-                            .find(|(nid, _)| nid == &pid)
-                            .map(|(_, r)| rule_case_name(r)))
-                        .unwrap_or_else(|| default_case_name(out.len()));
-                    // Runtime filterCases no-op (saturate-time
-                    // filterCases #106 covers the common path).
-                    let _ = &used;
-                    let mut sub = Reduction::new(self.ctx, sys);
-                    let res = sub.solve_fact_eqs(
-                        SplitStrategy::SplitNow,
-                        &[tamarin_term::rewriting::Equal {
-                            lhs: conc_fact, rhs: fa_prem.clone() }]);
-                    match res {
-                        Err(_) | Ok(SolveOutcome::Contradictory) => continue,
-                        Ok(_) => {
-                            // Edge-induced fact unification.  See the
-                            // same idiom in `solve_action_goal`'s
-                            // source-case branch above for the rationale:
-                            // chain-internal vars from the saturated case
-                            // need to be equated with live-system vars
-                            // via every edge in the grafted subsystem,
-                            // so the eq-store carries the bindings into
-                            // subsequent simplification.
-                            // See identical idiom in `solve_action_goal`
-                            // above: edges with mismatched fact tags
-                            // indicate the case carries an invariant
-                            // violation — treat as Contradictory rather
-                            // than silently dropping the mismatch.
-                            let mut tag_mismatch_edge = false;
-                            let chain_eqs: Vec<_> = sub.sys.edges
-                                .iter()
-                                .filter_map(|e| {
-                                    let (_, src_rule) = sub.sys.nodes.iter()
-                                        .find(|(n, _)| n == &e.src.0)?;
-                                    let (_, tgt_rule) = sub.sys.nodes.iter()
-                                        .find(|(n, _)| n == &e.tgt.0)?;
-                                    let fc = src_rule.conclusions
-                                        .get(e.src.1.0)?.clone();
-                                    let fp = tgt_rule.premises
-                                        .get(e.tgt.1.0)?.clone();
-                                    if fc.tag != fp.tag
-                                        || fc.terms.len() != fp.terms.len() {
-                                        tag_mismatch_edge = true;
-                                        return None;
-                                    }
-                                    if fc == fp { return None; }
-                                    Some(tamarin_term::rewriting::Equal {
-                                        lhs: fc, rhs: fp,
-                                    })
-                                })
-                                .collect();
-                            if tag_mismatch_edge { continue; }
-                            if !chain_eqs.is_empty() {
-                                let r2 = sub.solve_fact_eqs(
-                                    SplitStrategy::SplitNow, &chain_eqs);
-                                if matches!(r2,
-                                    Err(_) | Ok(SolveOutcome::Contradictory))
-                                {
-                                    continue;
-                                }
-                            }
-                            sub.subst_system();
-                            if has_fresh_consumer_conflation(&sub.sys, &self.ctx.maude) {
-                                continue;
-                            }
-                            sub.sys.used_sources.push(case_name.clone());
-                            out.push((case_name, sub.sys));
-                        }
+                    sys.used_sources.push(case_name.clone());
+                    out.push((case_name, sys));
+                }
+                if !out.is_empty() {
+                    self.changed = ChangeIndicator::Changed;
+                    if out.len() == 1 {
+                        let (name, sys) = out.into_iter().next().unwrap();
+                        self.sys = sys;
+                        return GoalCases::LinearNamed(name);
                     }
+                    return GoalCases::Cases(out);
                 }
-                if out.is_empty() {
-                    // All source-cases filtered/contradicted.  Fall
-                    // through to plain rule enumeration so we still
-                    // make progress.  Returning Contradictory here
-                    // would mistakenly close the branch — used_sources
-                    // exclusion doesn't mean no rule applies.
-                    // (was: return GoalCases::Contradictory;)
-                }
-                self.changed = ChangeIndicator::Changed;
-                if out.len() == 1 {
-                    let (name, sys) = out.into_iter().next().unwrap();
-                    self.sys = sys;
-                    return GoalCases::LinearNamed(name);
-                }
-                return GoalCases::Cases(out);
+                // Fall through to plain rule enumeration if every case
+                // dropped — keeps the search making progress.
             }
         }
         let g = Goal::Premise(p.clone(), fa_prem.clone());
