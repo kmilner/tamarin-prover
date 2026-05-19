@@ -91,6 +91,14 @@ fn main() {
                 for e in &node.sys.edges {
                     println!("{}  {:?} → {:?}", pad, e.src, e.tgt);
                 }
+                println!("{}-- less_atoms ({}) --", pad, node.sys.less_atoms.len());
+                for l in &node.sys.less_atoms {
+                    println!("{}  {:?} < {:?} ({:?})",
+                        pad, l.smaller, l.larger, l.reason);
+                }
+                if let Some(la) = &node.sys.last_atom {
+                    println!("{}-- last_atom: {:?} --", pad, la);
+                }
                 println!("{}-- goals --", pad);
                 for (g, st) in &node.sys.goals {
                     println!("{}  solved={} loop={} {:?}", pad, st.solved, st.looping, g);
@@ -116,6 +124,9 @@ fn main() {
                 }
             }
             // Pick next child by name from remaining_path, or first.
+            // Solved-priority mode (TAM_DUMP_SOLVED=1) picks the first
+            // Solved child instead, matching the renderer's traversal.
+            let solved_priority = std::env::var("TAM_DUMP_SOLVED").is_ok();
             let next_child = if let Some((wanted, rest)) = remaining_path.split_first() {
                 let found = node.children.iter().find(|(name, _)| name.as_str() == *wanted);
                 if let Some((_, c)) = found {
@@ -124,6 +135,11 @@ fn main() {
                     println!("{}!! could not find child {:?} — stopping", pad, wanted);
                     None
                 }
+            } else if solved_priority {
+                node.children.iter()
+                    .find(|(_, c)| matches!(c.status, tamarin_theory::constraint::solver::search::NodeStatus::Solved))
+                    .or_else(|| node.children.iter().next())
+                    .map(|(_, c)| (c, &[][..]))
             } else if let Some((_, c)) = node.children.iter().next() {
                 Some((c, &[][..]))
             } else {
