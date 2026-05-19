@@ -833,10 +833,34 @@ fn saturate_sources_inner_with_options(
                         if let Some(grafted) = saturate_out_premise(
                             ctx, sys, &p, &fa, name, &mut sat_incomplete)
                         {
+                            // Saturate-time variant fanout: when the
+                            // chain-folded case has a small unsolved
+                            // variant SplitG, fan it out into per-arm
+                            // sub-cases.  Mirrors Haskell
+                            // `someRuleACInst` + `solveDisjunction`
+                            // resolving `RuleACConstrs` BEFORE the
+                            // saturated case is stored, so destructor
+                            // chains see the variant-narrowed Fresh-
+                            // typed t_start (essential for
+                            // `hasImpossibleChain`'s pcTrueSubterm
+                            // dispatch — Contradictions.hs:258).
                             for (sub_name, sub_sys) in grafted {
-                                new_cases.push((sub_name, sub_sys));
-                                new_used.push(case_used.clone());
-                                changed = true;
+                                let arms = saturate_fanout_variant_splits(
+                                    ctx, sub_sys.clone(), &sub_name);
+                                match arms {
+                                    Some(arm_list) => {
+                                        for (arm_name, arm_sys) in arm_list {
+                                            new_cases.push((arm_name, arm_sys));
+                                            new_used.push(case_used.clone());
+                                            changed = true;
+                                        }
+                                    }
+                                    None => {
+                                        new_cases.push((sub_name, sub_sys));
+                                        new_used.push(case_used.clone());
+                                        changed = true;
+                                    }
+                                }
                             }
                             if sat_incomplete { src_incomplete = true; }
                             continue;
@@ -4244,7 +4268,34 @@ pub fn solve_with_source_cases_action_with_ctx(
                     if fanout {
                         let expanded = fanout_variant_splits(
                             ctx, grafted_sys, &live_action, &case_label);
-                        for (sub_name, sub_sys, sub_action) in expanded {
+                        for (sub_name, mut sub_sys, sub_action) in expanded {
+                            // Haskell `solveAllSafeGoals` (saturate-time)
+                            // applies 1-case `c_<sym>` constructor
+                            // sources to open KU goals whose head
+                            // matches.  These pass `goodTh` (Sources.hs:381)
+                            // — saturate's source-pick (`asum`
+                            // Sources.hs:206) eagerly applies them at
+                            // PRECOMPUTE time.  Multi-case sources (KU
+                            // sign with c_sign + Abort1 + Resolve*) FAIL
+                            // goodTh and stay open for runtime selection.
+                            //
+                            // Our precomputed source cases don't always
+                            // reflect saturate's auto-resolution because
+                            // the variant SplitG is collapsed before the
+                            // KU-expansion pass sees the variant-
+                            // substituted head term (e.g. Abort1's
+                            // `pcsig1 = pcs(sign(...),...)`).  Replicate
+                            // the effect at runtime: walk open KU goals
+                            // and auto-apply single-case `c_<sym>`
+                            // sources whose abstract head matches.
+                            //
+                            // Skip via TAM_DISABLE_KU_AUTORESOLVE=1.
+                            if std::env::var("TAM_DISABLE_KU_AUTORESOLVE").is_err() {
+                                if let Some(ctx_ref) = ctx_opt {
+                                    auto_resolve_single_case_ku(
+                                        ctx_ref, &mut sub_sys);
+                                }
+                            }
                             out.push((sub_name, sub_sys, sub_action));
                         }
                     } else {
@@ -4348,6 +4399,109 @@ fn fanout_variant_splits(
         }
     }
     out
+}
+
+/// Apply 1-case `c_<sym>` constructor sources to any open KU goal in
+/// `sys` whose head term matches the source's abstract head.  Iterates
+/// to fixpoint (up to a small cap to bound runtime).  Mutates `sys`
+/// in place, marking the resolved KU goal as solved and grafting the
+/// source case's nodes/edges/sub-goals.
+///
+/// Mirrors the effect of Haskell `solveAllSafeGoals`'s saturate-time
+/// source-pick on `filter goodTh ths` (Sources.hs:206, 380-385).
+/// Haskell pre-resolves these constructor decompositions during
+/// `saturateSources` so their renderings collapse via `refineSource.
+/// combine` (Sources.hs:135-137 keeps the FIRST non-coerce name).
+/// Our precomputed cases don't always do this — the variant SplitG
+/// collapses before KU-expansion sees the substituted head — so we
+/// apply the auto-resolution here at runtime instead.
+fn auto_resolve_single_case_ku(
+    ctx: &crate::constraint::solver::context::ProofContext,
+    sys: &mut System,
+) {
+    use crate::constraint::constraints::Goal;
+    use crate::constraint::solver::reduction::Reduction;
+    use crate::fact::FactTag;
+    use tamarin_term::term::Term;
+    use tamarin_term::function_symbols::FunSym;
+
+    // Build (source-index → head sym name) map for 1-case `c_<sym>`
+    // sources whose abstract goal is `KU(<sym>(t.1, t.2, …))` (an
+    // App-headed pattern).  These are the only sources we will
+    // auto-apply: 1 case (passes goodTh), head is a NoEqSym App.
+    let candidates: Vec<(usize, Vec<u8>)> = ctx.full_sources.iter().enumerate()
+        .filter_map(|(idx, s)| {
+            if s.cases.len() != 1 { return None; }
+            match &s.goal {
+                Goal::Action(_, fa)
+                    if fa.tag == FactTag::Ku && fa.terms.len() == 1 =>
+                {
+                    match &fa.terms[0] {
+                        Term::App(FunSym::NoEq(noeq), _) => {
+                            Some((idx, noeq.name.clone()))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    if candidates.is_empty() { return; }
+
+    // Iterate to fixpoint (cap at 16 to avoid runaway).
+    for _iter in 0..16 {
+        // Find an open KU action goal whose term head matches a
+        // candidate source's head.
+        let pick: Option<(crate::constraint::constraints::NodeId,
+                          crate::fact::LNFact,
+                          usize)> = sys.goals.iter().find_map(|(g, st)| {
+            if st.solved || st.looping { return None; }
+            let (node, fa) = match g {
+                Goal::Action(n, fa) if matches!(fa.tag, FactTag::Ku)
+                    && fa.terms.len() == 1 => (n.clone(), fa.clone()),
+                _ => return None,
+            };
+            // Live term must have a NoEqSym App head matching a
+            // candidate source.
+            let live_name: &[u8] = match &fa.terms[0] {
+                Term::App(FunSym::NoEq(noeq), _) => &noeq.name,
+                _ => return None,
+            };
+            // Skip pair/inv (handled by insertAction).
+            if live_name == b"pair" { return None; }
+            use tamarin_term::function_symbols::INV_SYM_STRING;
+            if live_name == INV_SYM_STRING { return None; }
+            // Find matching candidate source.
+            candidates.iter()
+                .find(|(_, sym)| sym.as_slice() == live_name)
+                .map(|(idx, _)| (node, fa, *idx))
+        });
+        let Some((live_node, live_fa, src_idx)) = pick else { break; };
+        let src = &ctx.full_sources[src_idx];
+        let avoid_max = system_max_idx(sys);
+        // Apply the source's single case via `apply_source_case_action`
+        // (the Haskell-faithful `applySource` path).
+        let Some((_, case_sys)) = src.cases.first() else { break; };
+        let Some((mut grafted, _)) = apply_source_case_action(
+            ctx, sys, src, case_sys, &live_node, &live_fa
+        ) else { break; };
+        // Sanity: mark the live KU goal solved if not already.
+        let live_goal = Goal::Action(live_node.clone(), live_fa.clone());
+        for (g, st) in grafted.goals.iter_mut() {
+            if g == &live_goal { st.solved = true; break; }
+        }
+        let _ = avoid_max;  // avoid unused-var warning
+        // Run a quick simplify on the grafted system.
+        let mut r = Reduction::new(ctx, grafted);
+        crate::constraint::solver::simplify::simplify_system(&mut r);
+        // If the simplify produced a contradictory state, stop —
+        // caller will detect and drop.
+        let contradicted = !crate::constraint::solver::contradictions::
+            contradictions(ctx, &r.sys).is_empty();
+        if contradicted { break; }
+        *sys = r.sys;
+    }
 }
 
 /// Extract the chain-root case name from a saturated source-case
@@ -5256,6 +5410,91 @@ fn graft_case_into_action(
 /// callers today; left as a hook for when BP/MSet protocols enter the
 /// corpus and Haskell-equivalent system-normed dedup becomes needed.
 pub fn remove_redundant_cases<T: Clone>(cases: Vec<T>) -> Vec<T> { cases }
+
+/// Saturate-time variant of `fanout_variant_splits`: fan out the first
+/// small (size ≤ SMALL) variant SplitG goal in a saturated source-case
+/// into per-arm sub-cases.  Mirrors Haskell `someRuleACInst` whose
+/// returned `RuleACConstrs` get resolved by `solveDisjunction` BEFORE
+/// the saturated case is stored — so Haskell's saturate-output cases
+/// have the variant-narrowed form (e.g.
+/// `In(aenc(<'1', <$A, ~k>>, pk(~ltkS)))` where `~k:Fresh`), no
+/// surviving SplitG, and downstream chains see Fresh-typed t_start at
+/// destructor outputs (essential for `hasImpossibleChain`'s
+/// `pcTrueSubterm` rootSym dispatch — see `Contradictions.hs:258`).
+///
+/// Without this, Rust's saturate stores the canonical (Msg-typed)
+/// form with an unresolved variant SplitG.  The destructor chain's
+/// t_start is `x_0:Msg` instead of `~k:Fresh`, so `possibleRootSyms`
+/// returns `Nothing` (rootSym of Lit Msg returns Nothing) and
+/// impossible-chain never fires — JCS12::typing_assertion shows
+/// `solve` where Haskell shows `by contradiction /* impossible chain */`.
+///
+/// Gates:
+///   - Only fires when the case has an open Chain goal — variant
+///     narrowing matters when a destructor chain follows the protocol
+///     rule.  Chain-free cases (NSLPK3 R_1) don't benefit; fanout would
+///     just add redundant arms that destabilise goal-ranking.
+///   - Variant SplitG must be ≤ SMALL (=6).  Larger SplitGs stay as
+///     runtime goals (smartRanking only ranks small SplitGs).
+///   - Canonical-system dedup collapses redundant arms.
+///
+/// Returns `None` when the case has no eligible small variant SplitG
+/// (caller keeps the original case unchanged).  Returns `Some(cases)`
+/// with one entry per surviving variant arm (empty Vec = all arms
+/// contradicted, caller drops the case).
+fn saturate_fanout_variant_splits(
+    ctx: &crate::constraint::solver::context::ProofContext,
+    sys: crate::constraint::system::System,
+    case_label: &str,
+) -> Option<Vec<(String, crate::constraint::system::System)>> {
+    use crate::constraint::solver::reduction::{Reduction, GoalCases};
+    use crate::constraint::constraints::Goal;
+    const SMALL: usize = 6;
+    // Gate: open chain required (see fn doc).
+    let has_open_chain = sys.goals.iter().any(|(g, st)| {
+        if st.solved || st.looping { return false; }
+        matches!(g, Goal::Chain(_, _))
+    });
+    if !has_open_chain { return None; }
+    let small_split: Option<crate::tools::equation_store::SplitId> =
+        sys.goals.iter().find_map(|(g, st)| {
+            if st.solved || st.looping { return None; }
+            let Goal::Split(id) = g else { return None };
+            let sz = sys.eq_store.split_size(*id)?;
+            if sz > 1 && sz <= SMALL { Some(*id) } else { None }
+        });
+    let split_id = small_split?;
+    set_precompute_mode(true);
+    let mut red = Reduction::new(ctx, sys);
+    let outcome = red.solve_split_goal(split_id);
+    let raw_cases: Vec<crate::constraint::system::System> = match outcome {
+        GoalCases::Cases(cases) if !cases.is_empty() => {
+            cases.into_iter().map(|(_, sub_sys)| sub_sys).collect()
+        }
+        GoalCases::Linear | GoalCases::LinearNamed(_) => {
+            vec![red.sys]
+        }
+        GoalCases::Contradictory | GoalCases::Cases(_) => {
+            set_precompute_mode(false);
+            return Some(Vec::new());
+        }
+    };
+    set_precompute_mode(false);
+    // Dedup variant fanout by canonical-system structural form, same
+    // approach as `fanout_variant_splits` (runtime apply).  Two arms
+    // may differ only in eq_store witness names that don't affect
+    // downstream proof.
+    let mut seen_keys: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    let mut out: Vec<(String, crate::constraint::system::System)> = Vec::new();
+    for sub_sys in raw_cases {
+        let key = canonicalise_system(&sub_sys);
+        if seen_keys.insert(key) {
+            out.push((case_label.to_string(), sub_sys));
+        }
+    }
+    Some(out)
+}
 
 #[cfg(test)]
 mod tests {
