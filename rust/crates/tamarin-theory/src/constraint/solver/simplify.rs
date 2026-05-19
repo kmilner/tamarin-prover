@@ -177,7 +177,21 @@ fn non_injective_fact_instances_pairs(
             Err(_) => false,
         }
     };
-    for e in &sys.edges {
+    // Haskell-faithful: iterate edges and nodes in Ord order
+    // (`S.toList sEdges`, `M.keys sNodes`).  Our Vec preserves
+    // insertion order; sort to match so the order of generated Less
+    // atoms (and therefore downstream simplify-loop behaviour) is
+    // deterministic and aligned with Haskell.
+    let mut edges_sorted: Vec<&crate::constraint::constraints::Edge>
+        = sys.edges.iter().collect();
+    edges_sorted.sort_by(|a, b|
+        (&a.src.0, a.src.1.0, &a.tgt.0, a.tgt.1.0)
+            .cmp(&(&b.src.0, b.src.1.0, &b.tgt.0, b.tgt.1.0))
+    );
+    let mut nodes_sorted: Vec<&(crate::constraint::constraints::NodeId, crate::rule::RuleACInst)>
+        = sys.nodes.iter().collect();
+    nodes_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    for e in &edges_sorted {
         let (i, conc_idx) = (e.src.0.clone(), e.src.1.clone());
         let k = e.tgt.0.clone();
         let i_rule = match lookup_node(&i) { Some(r) => r, None => continue };
@@ -191,7 +205,7 @@ fn non_injective_fact_instances_pairs(
         let conflicting = |fa: &crate::fact::LNFact| -> bool {
             fa.tag == k_fa_prem.tag && fa.terms.first() == Some(k_term)
         };
-        for (j, j_rule) in &sys.nodes {
+        for (j, j_rule) in &nodes_sorted {
             if j == &i || j == &k { continue; }
             // Haskell's `guard (k ∈ reachableSet [j] less)` runs
             // *before* the case dispatch — so we require it up-front.
