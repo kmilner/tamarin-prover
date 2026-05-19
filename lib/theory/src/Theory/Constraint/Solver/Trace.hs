@@ -20,6 +20,11 @@
 --                        runReduction (i.e. wasn't mzero'd), final case
 --                        count after `distinguish`.
 --
+--   TAM_HS_TRACE_SOURCES — case-name list per source after each
+--                          saturateSources iteration.  Used to diagnose
+--                          source-case overenumeration (e.g. denning_sacco
+--                          Initiator2_case_N cluster).
+--
 -- Usage in code:
 --
 --   import qualified Theory.Constraint.Solver.Trace as T
@@ -36,6 +41,7 @@ module Theory.Constraint.Solver.Trace (
   , flagContra
   , flagSimplify
   , flagCases
+  , flagSources
   ) where
 
 import           Control.Monad.Disj            (MonadDisj, contradictoryIf)
@@ -65,6 +71,11 @@ flagCases :: Bool
 flagCases = unsafePerformIO $
     maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_CASES"
 {-# NOINLINE flagCases #-}
+
+flagSources :: Bool
+flagSources = unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_SOURCES"
+{-# NOINLINE flagSources #-}
 
 
 -- | Drop-in replacement for `contradictoryIf` with a site label.  When
