@@ -1897,13 +1897,41 @@ fn make_fresh_rule(m: tamarin_term::lterm::LNTerm) -> RuleACInst {
 fn build_parser_subst_from_eq_store(
     subst: &crate::tools::equation_store::LNSubst,
 ) -> crate::guarded::VarSubst {
+    // Chain-chase to a canonical representative.  If the eq-store has both
+    // `a → b` and `b → c`, the formula should rewrite `a` to `c` (not `b`).
+    // Mirrors Haskell's `applyVTerm` behaviour where applying a composed
+    // subst transitively follows var→var bindings to the canonical end.
+    //
+    // Concrete trigger: Minimal_HashChain::Loop_Start.  Check0's rule
+    // produces `Loop(loopId, kOrig, kOrig)` — repeated arg.  Unifying
+    // with lemma's `Loop(lid, k, kOrig)` binds both `k_lemma` and
+    // `kOrig_lemma` to the rule's `kOrig`.  Subsequent compose may
+    // funnel one through the other (e.g. `k_lemma → kOrig_rule →
+    // kOrig_lemma`); without chain-chase in the parser_subst the
+    // lemma's universal `Start(lid, kOrig)` doesn't get its `kOrig`
+    // rewritten to match the rule action's canonical form, so
+    // `structural_match` fails and `impliedFormulas` misses the
+    // discharge, leaving FormulasFalse unfired — wrong-Solved.
+    let lookup_chain = |start: &tamarin_term::lterm::LVar| -> tamarin_term::lterm::LNTerm {
+        let mut cur = tamarin_term::term::Term::Lit(
+            tamarin_term::vterm::Lit::Var(start.clone()));
+        // Bound chain length to avoid pathological cycles (shouldn't
+        // happen post-compose, but defensive).
+        for _ in 0..32 {
+            let next = tamarin_term::subst::apply_vterm(subst, cur.clone());
+            if next == cur { return cur; }
+            cur = next;
+        }
+        cur
+    };
     let mut out = crate::guarded::VarSubst::new();
-    for (lv, lt) in subst.to_list() {
+    for (lv, _) in subst.to_list() {
+        let final_term = lookup_chain(&lv);
         // Identity mappings are no-ops; skip.
-        if let tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Var(w)) = &lt {
+        if let tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Var(w)) = &final_term {
             if w == &lv { continue; }
         }
-        let term = crate::elaborate::lnterm_to_term(&lt);
+        let term = crate::elaborate::lnterm_to_term(&final_term);
         out.insert((lv.name.clone(), lv.idx), term);
     }
     out
