@@ -432,11 +432,13 @@ impl<'ctx> Reduction<'ctx> {
             // bodies re-narrowed when runtime unification populates
             // the eq_store — mirrors Haskell's `substSystem`
             // (System.hs) applying the substitution to ALL goal
-            // bodies including Disjs.  Diagnosed via Haskell
-            // impl-trace on NSLPK3_untagged::session_key_setup_possible
-            // inner Disj where `KU(ni:Msg@1)` should be narrowed to
-            // `KU(~ni:Fresh@0)` once the outer-Disj case_2 + R_1
-            // unification fires.
+            // bodies including Disjs.  Without this, a Disj goal
+            // added to `sys.goals` at saturate-time retains the
+            // saturate-time vars even after runtime narrowing
+            // populates `eq_store`; downstream `is_open_in_sys` then
+            // auto-solves the stale Msg-var KU arm.  Net +3 lemmas
+            // in corpus (NSLPK3_untagged::session_key_setup_possible
+            // + Destroy_charn + Loop_charn).
             let g2 = match g {
                 Goal::Action(i, fa) =>
                     Goal::Action(map_var(i), apply_fact(fa)),
@@ -3182,30 +3184,6 @@ impl<'ctx> Reduction<'ctx> {
                             SplitStrategy::SplitNow,
                             &[tamarin_term::rewriting::Equal {
                                 lhs: fa.clone(), rhs: act.clone() }]);
-                        // Mirror Haskell `solveFactEqs` → `substSystem`
-                        // flow (Reduction.hs:732, runs after every
-                        // successful unification): propagate the
-                        // action-unify bindings into the system —
-                        // nodes, edges, goals, AND formulas — so
-                        // saturate-time impl-fire bodies referencing
-                        // the action goal's vars (e.g. `ni:Msg@1` in
-                        // a [sources] universal body) get re-narrowed
-                        // by the Maude unification result (e.g. to
-                        // `~ni:Fresh@0` once R_1 grafts).  Without
-                        // this, `is_open_in_sys`'s `is_msg_var && i ∉
-                        // sNodes` filter auto-solves the stale Msg-var
-                        // body — diagnosed via Haskell impl-trace on
-                        // NSLPK3_untagged::session_key_setup_possible
-                        // where the inner Disj's `KU(~ni)` (Haskell)
-                        // appears as `KU(ni:Msg@1)` (Rust) because
-                        // Rust never applied subst_system after the
-                        // outer-Disj-case_2 unification.
-                        // Source-case path (line 3027/3091 above)
-                        // already does this; rule-enumeration path
-                        // was the gap.
-                        if matches!(res, Ok(SolveOutcome::Linear(_)) | Ok(SolveOutcome::Cases(_))) {
-                            sub.subst_system();
-                        }
                         match res {
                             Err(_) | Ok(SolveOutcome::Contradictory) => continue,
                             Ok(_) => {
