@@ -425,6 +425,18 @@ impl<'ctx> Reduction<'ctx> {
                     } else { false }
                 } else { false }
             } else { false };
+            // Disj goal rewriting: Disjs carry a `Guarded` body whose
+            // free variables are `VarSpec` (parser-AST), same form
+            // used in `formulas`/`lemmas`.  Route through
+            // `subst_guarded` so saturate-time Disj goals get their
+            // bodies re-narrowed when runtime unification populates
+            // the eq_store — mirrors Haskell's `substSystem`
+            // (System.hs) applying the substitution to ALL goal
+            // bodies including Disjs.  Diagnosed via Haskell
+            // impl-trace on NSLPK3_untagged::session_key_setup_possible
+            // inner Disj where `KU(ni:Msg@1)` should be narrowed to
+            // `KU(~ni:Fresh@0)` once the outer-Disj case_2 + R_1
+            // unification fires.
             let g2 = match g {
                 Goal::Action(i, fa) =>
                     Goal::Action(map_var(i), apply_fact(fa)),
@@ -434,7 +446,25 @@ impl<'ctx> Reduction<'ctx> {
                     Goal::Chain(
                         (map_var(c.0), c.1),
                         (map_var(p.0), p.1)),
-                Goal::Disj(d) => Goal::Disj(d),
+                Goal::Disj(d) => {
+                    let parser_subst = build_parser_subst_from_eq_store(&subst);
+                    if parser_subst.is_empty() {
+                        Goal::Disj(d)
+                    } else {
+                        let new_alts: Vec<_> = d.0.into_iter()
+                            .map(|alt| {
+                                let mut cur = alt;
+                                for _ in 0..16 {
+                                    let nxt = crate::guarded::subst_guarded(&cur, &parser_subst);
+                                    if nxt == cur { break; }
+                                    cur = nxt;
+                                }
+                                cur
+                            })
+                            .collect();
+                        Goal::Disj(crate::constraint::constraints::Disj(new_alts))
+                    }
+                },
                 Goal::Split(s) => Goal::Split(s),
                 Goal::Subterm((s, t)) => Goal::Subterm((apply_term(s), apply_term(t))),
             };
@@ -3152,6 +3182,30 @@ impl<'ctx> Reduction<'ctx> {
                             SplitStrategy::SplitNow,
                             &[tamarin_term::rewriting::Equal {
                                 lhs: fa.clone(), rhs: act.clone() }]);
+                        // Mirror Haskell `solveFactEqs` → `substSystem`
+                        // flow (Reduction.hs:732, runs after every
+                        // successful unification): propagate the
+                        // action-unify bindings into the system —
+                        // nodes, edges, goals, AND formulas — so
+                        // saturate-time impl-fire bodies referencing
+                        // the action goal's vars (e.g. `ni:Msg@1` in
+                        // a [sources] universal body) get re-narrowed
+                        // by the Maude unification result (e.g. to
+                        // `~ni:Fresh@0` once R_1 grafts).  Without
+                        // this, `is_open_in_sys`'s `is_msg_var && i ∉
+                        // sNodes` filter auto-solves the stale Msg-var
+                        // body — diagnosed via Haskell impl-trace on
+                        // NSLPK3_untagged::session_key_setup_possible
+                        // where the inner Disj's `KU(~ni)` (Haskell)
+                        // appears as `KU(ni:Msg@1)` (Rust) because
+                        // Rust never applied subst_system after the
+                        // outer-Disj-case_2 unification.
+                        // Source-case path (line 3027/3091 above)
+                        // already does this; rule-enumeration path
+                        // was the gap.
+                        if matches!(res, Ok(SolveOutcome::Linear(_)) | Ok(SolveOutcome::Cases(_))) {
+                            sub.subst_system();
+                        }
                         match res {
                             Err(_) | Ok(SolveOutcome::Contradictory) => continue,
                             Ok(_) => {
