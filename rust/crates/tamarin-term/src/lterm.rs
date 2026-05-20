@@ -128,11 +128,50 @@ pub fn sort_of_name(n: &Name) -> LSort {
 
 /// Logical variable. Two `LVar`s are equal only if all three of name, sort,
 /// and index match.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// **Ord semantics**: idx FIRST, then sort, then name — mirrors Haskell's
+/// `instance Ord LVar` in `lib/term/src/Term/LTerm.hs:521-523`:
+///
+/// ```haskell
+/// instance Ord LVar where
+///     compare (LVar x1 x2 x3) (LVar y1 y2 y3) =
+///         compare x3 y3 <> compare x2 y2 <> compare x1 y1
+/// ```
+///
+/// where `x1=name, x2=sort, x3=idx` (comment: *"An ord instance that prefers
+/// the 'lvarIdx' over the 'lvarName'."*).  This matters because Haskell's
+/// `unifyRaw` (Unification.hs:241) orients same-sort var-var bindings such
+/// that the larger-Ord (=larger-idx) becomes the KEY:
+///
+/// ```haskell
+/// (sl, sr) | sl == sr -> if vl < vr then elim vr l else elim vl r
+/// ```
+///
+/// Combined with `refineSource`'s post-saturate
+/// `restrict stableVars sSubst` (Sources.hs:118-124), this ensures stable
+/// pattern vars (small idx like t.1, t.2) are NEVER keys, so all
+/// stable-keyed bindings drop and pattern vars stay unbound for runtime
+/// `applySource` to bind cleanly.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LVar {
     pub name: String,
     pub sort: LSort,
     pub idx: u64,
+}
+
+impl Ord for LVar {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Haskell-faithful: idx <> sort <> name (idx FIRST).
+        self.idx.cmp(&other.idx)
+            .then_with(|| self.sort.cmp(&other.sort))
+            .then_with(|| self.name.cmp(&other.name))
+    }
+}
+
+impl PartialOrd for LVar {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl LVar {
@@ -613,5 +652,97 @@ mod tests {
         assert!(contains_private(&t));
         let t: LNTerm = f_app_no_eq(pair_sym(), vec![pub_term("a"), pub_term("b")]);
         assert!(!contains_private(&t));
+    }
+
+    // =========================================================================
+    // Haskell-faithfulness invariants for enum declaration order.
+    //
+    // For every Haskell `data X = A | B | C deriving (Ord, ...)`, the
+    // induced `Ord` is the declaration order.  If our Rust enum reorders
+    // variants, BTreeMap/BTreeSet iteration over X-keyed maps silently
+    // sorts differently — and proof state inspection by downstream code
+    // (goal-ranking, case dedup, source-case ordering) diverges.
+    //
+    // **Pin every Ord-bearing enum's declaration order to its Haskell
+    // counterpart by checked file:line below.**
+    // =========================================================================
+
+    /// LTerm.hs:161-166:
+    ///     data LSort = LSortPub | LSortFresh | LSortMsg | LSortNode | LSortNat
+    ///                deriving( Eq, Ord, ... )
+    #[test]
+    fn lsort_ord_matches_haskell_declaration() {
+        // Pub < Fresh < Msg < Node < Nat
+        assert!(LSort::Pub   < LSort::Fresh);
+        assert!(LSort::Fresh < LSort::Msg);
+        assert!(LSort::Msg   < LSort::Node);
+        assert!(LSort::Node  < LSort::Nat);
+        // Transitive.
+        assert!(LSort::Pub < LSort::Nat);
+    }
+
+    /// LTerm.hs:215: `data NameTag = FreshName | PubName | NodeName | NatName`
+    #[test]
+    fn name_tag_ord_matches_haskell_declaration() {
+        // Fresh < Pub < Node < Nat
+        assert!(NameTag::Fresh < NameTag::Pub);
+        assert!(NameTag::Pub   < NameTag::Node);
+        assert!(NameTag::Node  < NameTag::Nat);
+    }
+
+    /// Haskell `sortCompare` (LTerm.hs:177-187) is a PARTIAL ORDER, NOT
+    /// the same as `Ord LSort`.  Specifically:
+    ///   - Msg is greater than every other comparable sort
+    ///   - Node is incomparable to ALL other sorts (returns Nothing)
+    ///   - Pub, Fresh, Nat are pairwise incomparable
+    ///
+    /// **Do not confuse with `Ord LSort`.** `Ord LSort` is the derived
+    /// total order from declaration order, used as BTreeMap/Set key.
+    /// `sortCompare` is the order-sorted lattice used during unification
+    /// for sort narrowing.  Mixing them up breaks unify_raw cross-sort
+    /// handling.
+    #[test]
+    fn sort_compare_is_partial_not_total() {
+        // Comparable: Msg dominates.
+        assert_eq!(sort_compare(LSort::Msg, LSort::Pub),   Some(Ordering::Greater));
+        assert_eq!(sort_compare(LSort::Msg, LSort::Fresh), Some(Ordering::Greater));
+        assert_eq!(sort_compare(LSort::Msg, LSort::Nat),   Some(Ordering::Greater));
+        // Pub, Fresh, Nat are pairwise incomparable.
+        assert_eq!(sort_compare(LSort::Pub,   LSort::Fresh), None);
+        assert_eq!(sort_compare(LSort::Pub,   LSort::Nat),   None);
+        assert_eq!(sort_compare(LSort::Fresh, LSort::Nat),   None);
+        // Node is incomparable to all.
+        assert_eq!(sort_compare(LSort::Node, LSort::Msg),   None);
+        assert_eq!(sort_compare(LSort::Node, LSort::Pub),   None);
+        assert_eq!(sort_compare(LSort::Node, LSort::Fresh), None);
+        assert_eq!(sort_compare(LSort::Node, LSort::Nat),   None);
+        // BUT `Ord LSort` total order differs!  Pub < Fresh < Msg < Node
+        // in Ord, even though Pub vs Fresh is incomparable in sortCompare.
+        assert!(LSort::Pub < LSort::Fresh,
+                "Ord LSort is total — Pub < Fresh by declaration order. \
+                 (sort_compare returns None for this pair; the two \
+                 contracts are deliberately different.)");
+    }
+
+    /// LTerm.hs:51-58: sort prefixes for variable rendering.  These show
+    /// up in the proof skeleton as `~k` / `$A` / `#i` / `%n` and a parse
+    /// regression in the renderer would break corpus diffing.
+    #[test]
+    fn sort_prefixes_match_haskell() {
+        assert_eq!(sort_prefix(LSort::Fresh), "~");
+        assert_eq!(sort_prefix(LSort::Pub),   "$");
+        assert_eq!(sort_prefix(LSort::Node),  "#");
+        assert_eq!(sort_prefix(LSort::Nat),   "%");
+        assert_eq!(sort_prefix(LSort::Msg),   "");
+    }
+
+    /// LTerm.hs sort suffix strings used in maude bridge interchange.
+    #[test]
+    fn sort_suffixes_match_haskell() {
+        assert_eq!(sort_suffix(LSort::Msg),   "msg");
+        assert_eq!(sort_suffix(LSort::Fresh), "fresh");
+        assert_eq!(sort_suffix(LSort::Pub),   "pub");
+        assert_eq!(sort_suffix(LSort::Node),  "node");
+        assert_eq!(sort_suffix(LSort::Nat),   "nat");
     }
 }

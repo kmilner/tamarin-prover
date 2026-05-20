@@ -4843,32 +4843,28 @@ fn restrict_eq_store_to_stable_vars(
     sys: &mut System,
     stable_vars: &std::collections::BTreeSet<tamarin_term::lterm::LVar>,
 ) {
-    // Normalise the substitution by chasing chains: each binding's RHS
-    // is repeatedly substituted via the full subst until fixed point.
-    // Without this, restricting drops intermediate-var bindings (e.g.
-    // `kZero_2 → seed:Fresh:2`) while keeping the stable-var pointer
-    // (e.g. `t_1 → kZero_2`), leaving the stable-var binding pointing
-    // at a phantom var that no longer appears in the system.  Haskell's
-    // `solveSubstEqs`/`addEqs` composes incrementally so the subst is
-    // always idempotent before `restrict`; we materialise the same
-    // shape here.
-    let full = sys.eq_store.subst.clone();
-    let normalised: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)>
-        = full.to_list().into_iter()
-            .map(|(v, t)| {
-                let mut cur = t;
-                let mut iter = 0u32;
-                loop {
-                    let next = tamarin_term::subst::apply_vterm(&full, cur.clone());
-                    if next == cur || iter >= 16 { break; }
-                    cur = next;
-                    iter += 1;
-                }
-                (v, cur)
-            })
-            .collect();
+    // Haskell's `restrict` in `Theory.Tools.EquationStore`
+    // (EquationStore.hs:289 via Term.Substitution.Subst.restrict) is a
+    // simple key-filter: `Subst (M.filterWithKey (\k _ -> k `elem` vars) m)`.
+    // It does NOT chase chains.  Keys not in `vars` are dropped, and
+    // values that referenced those dropped keys become dangling — which
+    // is fine because Haskell's substitution lookup falls back to
+    // identity for unbound vars.
+    //
+    // Earlier this function chained-chased values to a fixed point
+    // before filtering, which collapsed e.g. `t:1 → e_A_1 → blind(...)`
+    // into `t:1 → blind(...)` directly.  The chain-chased binding
+    // survived restrict (because t:1 is stable), and at runtime
+    // `apply_source_case_action`'s `refineSubst` then tried to unify
+    // `t:1 = commit(z, r)` against the now-direct binding
+    // `t:1 → blind(...)`, which fails (commit vs blind).  Haskell
+    // doesn't do this chain-chase, so its `t:1 → e_A_1` survives with
+    // `e_A_1` unbound (since e_A_1 isn't in stable_vars); the
+    // runtime match then binds `e_A_1 = commit(z, r)` cleanly, and any
+    // downstream `[sources]`-axiom violation is caught via
+    // `FormulasFalse` rather than `refineSubst-contradictory`.
     let kept: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)>
-        = normalised.into_iter()
+        = sys.eq_store.subst.to_list().into_iter()
             .filter(|(v, _)| stable_vars.contains(v))
             .collect();
     sys.eq_store.subst = tamarin_term::subst::Subst::from_list(kept);
@@ -6144,5 +6140,198 @@ mod tests {
             .collect();
         assert!(names.contains(&"MakeA"));
         assert!(names.contains(&"MakeB"));
+    }
+
+    // =========================================================================
+    // Haskell-faithfulness invariants for `restrict_eq_store_to_stable_vars`.
+    //
+    // This is the function that exhibited the chain-chase bug for ~6
+    // wasted iterations.  These tests pin its contract: pure key-filter,
+    // matching Haskell's `Subst.restrict = M.filterWithKey`.
+    // =========================================================================
+
+    /// `restrict_eq_store_to_stable_vars` is a pure key-filter — drops
+    /// every binding whose KEY is not in stable_vars.  No chain-chase.
+    ///
+    /// Mirrors `Theory.Tools.EquationStore.restrict`
+    /// (via `Term.Substitution.Subst.restrict`, SubstVFree.hs:160-161):
+    /// ```haskell
+    /// restrict vs (Subst smap) = Subst (M.filterWithKey (\v _ -> v `elem` vs) smap)
+    /// ```
+    #[test]
+    fn restrict_eq_store_keeps_only_stable_keyed_bindings() {
+        use tamarin_term::lterm::{LSort, LVar};
+        use tamarin_term::subst::Subst;
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+        use std::collections::BTreeSet;
+
+        let t1 = LVar::new("t", LSort::Msg, 1);     // stable
+        let t2 = LVar::new("t", LSort::Msg, 2);     // stable
+        let m19 = LVar::new("m", LSort::Msg, 19);   // not stable
+        let sk28 = LVar::new("sk", LSort::Msg, 28); // not stable
+
+        let pub_a = LVar::new("a", LSort::Pub, 0);
+        let pub_b = LVar::new("b", LSort::Pub, 0);
+        let mut sys = System::empty();
+        sys.eq_store.subst = Subst::from_list(vec![
+            (t1.clone(),  Term::Lit(Lit::Var(pub_a))),
+            (m19.clone(), Term::Lit(Lit::Var(pub_b))),
+            (sk28.clone(), Term::Lit(Lit::Var(t2.clone()))),
+        ]);
+
+        let stable: BTreeSet<LVar> = [t1.clone(), t2.clone()].into_iter().collect();
+        restrict_eq_store_to_stable_vars(&mut sys, &stable);
+
+        // t1 binding kept; m19 + sk28 bindings dropped.
+        assert!(sys.eq_store.subst.image_of(&t1).is_some(),
+                "stable-keyed binding (t.1) is kept");
+        assert!(sys.eq_store.subst.image_of(&m19).is_none(),
+                "non-stable-keyed binding (m.19) is dropped");
+        assert!(sys.eq_store.subst.image_of(&sk28).is_none(),
+                "non-stable-keyed binding (sk.28) is dropped, EVEN THOUGH \
+                 its VALUE mentions stable t.2 — restrict is key-only.");
+    }
+
+    /// `restrict_eq_store_to_stable_vars` does NOT chain-chase.
+    ///
+    /// This pins the bug we shipped for ~6 iterations.  If someone
+    /// re-introduces chain-chase here, foo_eligibility-class divergences
+    /// silently appear in the corpus.
+    #[test]
+    fn restrict_eq_store_does_not_chain_chase() {
+        use tamarin_term::lterm::{LSort, LVar};
+        use tamarin_term::subst::Subst;
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+        use std::collections::BTreeSet;
+
+        // Set up exactly the foo_eligibility shape: a chain
+        // t.1 → e.10 → blind_arg.  Stable = {t.1}.  Haskell-faithful:
+        // t.1 → e.10 stays (e.10 unbound after filter).  Rust must NOT
+        // collapse to t.1 → blind_arg directly.
+        let t1 = LVar::new("t", LSort::Msg, 1);
+        let e10 = LVar::new("e", LSort::Msg, 10);
+        let blind_arg = LVar::new("m", LSort::Msg, 28);
+
+        let mut sys = System::empty();
+        sys.eq_store.subst = Subst::from_list(vec![
+            (t1.clone(),  Term::Lit(Lit::Var(e10.clone()))),
+            (e10.clone(), Term::Lit(Lit::Var(blind_arg.clone()))),
+        ]);
+
+        let stable: BTreeSet<LVar> = [t1.clone()].into_iter().collect();
+        restrict_eq_store_to_stable_vars(&mut sys, &stable);
+
+        // t.1's binding must be exactly e.10 (the var), NOT chain-chased
+        // to blind_arg.
+        assert_eq!(sys.eq_store.subst.image_of(&t1),
+                   Some(&Term::Lit(Lit::Var(e10))),
+                   "restrict must NOT chain-chase t.1 → e.10 → blind_arg \
+                    into t.1 → blind_arg.  This was the foo_eligibility \
+                    root cause — see project_rust_foo_eligibility_saturate_overspec.md");
+    }
+
+    /// `restrict_eq_store_to_stable_vars` produces empty subst when no
+    /// key is stable.  This is the foo_eligibility shape under
+    /// Haskell-faithful unification orientation: keys are rule-internal
+    /// vars (large idx), stableVars are lemma vars (small idx).
+    #[test]
+    fn restrict_eq_store_empties_subst_when_no_keys_are_stable() {
+        use tamarin_term::lterm::{LSort, LVar};
+        use tamarin_term::subst::Subst;
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+        use std::collections::BTreeSet;
+
+        let m19 = LVar::new("m", LSort::Msg, 19);
+        let sk28 = LVar::new("sk", LSort::Msg, 28);
+        let pub_a = LVar::new("a", LSort::Pub, 0);
+        let pub_b = LVar::new("b", LSort::Pub, 0);
+        let mut sys = System::empty();
+        sys.eq_store.subst = Subst::from_list(vec![
+            (m19, Term::Lit(Lit::Var(pub_a))),
+            (sk28, Term::Lit(Lit::Var(pub_b))),
+        ]);
+
+        let stable: BTreeSet<LVar> = [
+            LVar::new("t", LSort::Msg, 1),
+            LVar::new("t", LSort::Msg, 2),
+        ].into_iter().collect();
+        restrict_eq_store_to_stable_vars(&mut sys, &stable);
+
+        assert!(sys.eq_store.subst.is_empty(),
+                "When no key is in stable set (Haskell shape: keys are \
+                 rule-internal large-idx vars, stable are lemma small-idx \
+                 vars), restrict produces empty subst.  This is what \
+                 enables foo_eligibility's clean runtime applySource bind.");
+    }
+
+    // =========================================================================
+    // Haskell-faithfulness invariants for `saturated_chain_root` —
+    // the function whose `_case_N` mishandling caused 14+ corpus
+    // divergences (Cluster B, task #209).
+    //
+    // Mirrors Haskell `refineSource.combine` (Sources.hs:135-137):
+    // strip the "coerce" prefix, descend through chain prefixes, and
+    // produce a stable per-chain root name.  Per-closure `_case_N`
+    // suffixes are saturate-time artifacts that must not survive into
+    // the rendered case name.
+    // =========================================================================
+
+    /// Trailing `_case_<N>` (saturate's per-closure suffix) must be
+    /// stripped.  Bug regressed 14 lemmas in cluster B until task #209.
+    ///
+    /// Mirrors Haskell `combine` (Sources.hs:135-137): the per-closure
+    /// suffix is a Rust saturate-time artifact; Haskell doesn't add it.
+    /// Runtime `distinguish` (ProofMethod.hs:468) adds sibling-disambig
+    /// suffixes only when needed.
+    #[test]
+    fn saturated_chain_root_strips_trailing_case_n() {
+        assert_eq!(saturated_chain_root("Alice_case_1"), "Alice");
+        assert_eq!(saturated_chain_root("Alice_case_42"), "Alice");
+        assert_eq!(saturated_chain_root("Resp_2_case_3"), "Resp_2",
+                   "only the FINAL _case_<N> is stripped, not internal _<digit>");
+    }
+
+    /// Middle `_case_<N>_` (legacy form: saturate used to produce
+    /// `Rule_case_3_chain`) gets stripped from the LEFT.  This is the
+    /// step-1 stripping logic that predates the trailing fix.
+    #[test]
+    fn saturated_chain_root_strips_middle_case_n_underscore() {
+        // `Foo_case_3_bar` → strip `Foo_case_3_` → `bar`.
+        assert_eq!(saturated_chain_root("Foo_case_3_bar"), "bar");
+        // No `_case_N_` middle → keep as-is (modulo prefix stripping).
+        assert_eq!(saturated_chain_root("Foo_bar"), "Foo_bar");
+    }
+
+    /// Intruder-rule prefixes (`coerce_`, `irecv_`, `ipub_`, `isend_`,
+    /// `c_<sym>_`) get peeled iteratively.  Mirrors Haskell's `combine`
+    /// behavior of blending out coerce/intruder noise.
+    #[test]
+    fn saturated_chain_root_strips_intruder_prefixes() {
+        assert_eq!(saturated_chain_root("coerce_Alice"), "Alice");
+        assert_eq!(saturated_chain_root("isend_Alice"), "Alice");
+        assert_eq!(saturated_chain_root("irecv_Bob"), "Bob");
+        assert_eq!(saturated_chain_root("ipub_Carol"), "Carol");
+        // `c_<sym>_<rest>` strips both the `c_` and the `<sym>_`.
+        assert_eq!(saturated_chain_root("c_pair_Alice"), "Alice");
+    }
+
+    /// Combination: intruder prefix + trailing `_case_N` both stripped.
+    /// This is the actual shape that hit production: an inner rule that
+    /// went through coerce got `coerce_Alice_case_1`, which must reduce
+    /// to `Alice`.
+    #[test]
+    fn saturated_chain_root_handles_prefix_and_trailing_suffix() {
+        assert_eq!(saturated_chain_root("coerce_Alice_case_1"), "Alice");
+        assert_eq!(saturated_chain_root("isend_Resp_2_case_3"), "Resp_2");
+    }
+
+    /// Empty / no-match input is returned unchanged.
+    #[test]
+    fn saturated_chain_root_passes_through_unrecognized_name() {
+        assert_eq!(saturated_chain_root("Alice"), "Alice");
+        assert_eq!(saturated_chain_root("XYZ"), "XYZ");
     }
 }

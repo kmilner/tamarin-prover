@@ -4544,4 +4544,41 @@ mod tests {
         });
         assert!(count >= 3);
     }
+
+    // =========================================================================
+    // Haskell-faithfulness invariants for case-naming.
+    //
+    // Mirrors Haskell's `casName` (Reduction.hs) which uses 1-INDEXED
+    // `case_<n>` for generic case labels.  Off-by-one here makes
+    // `distinguish` (ProofMethod.hs:468) disambiguate against the
+    // wrong sibling suffix and the proof skeleton drifts.
+    // =========================================================================
+
+    /// `default_case_name(i)` produces `case_<i+1>` — 1-INDEXED.
+    ///
+    /// Mirrors Haskell's `casName` convention; off-by-one here regressed
+    /// the `case split` cluster (task #207).  Disjunction-driven case
+    /// labels (`case_1`, `case_2`, ...) must match the Haskell printer
+    /// exactly or proof-skeleton diffs report spurious mismatches.
+    #[test]
+    fn default_case_name_is_one_indexed() {
+        assert_eq!(default_case_name(0), "case_1");
+        assert_eq!(default_case_name(1), "case_2");
+        assert_eq!(default_case_name(9), "case_10");
+        assert_eq!(default_case_name(99), "case_100",
+                   "three-digit suffix renders without padding");
+    }
+
+    /// `default_case_name(i) != default_case_name(j)` for i != j —
+    /// pairwise distinct.  This guards against accidentally returning
+    /// "case_1" for every i (e.g. a hardcoded constant slipped in).
+    #[test]
+    fn default_case_name_is_injective() {
+        let n = 25usize;
+        let names: Vec<String> = (0..n).map(default_case_name).collect();
+        let unique: std::collections::BTreeSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), n,
+            "default_case_name must produce {} distinct names; got {}",
+            n, unique.len());
+    }
 }

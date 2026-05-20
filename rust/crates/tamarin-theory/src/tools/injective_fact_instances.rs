@@ -280,4 +280,136 @@ mod tests {
         );
         assert!(simple_injective_fact_instances(&[weird]).is_empty());
     }
+
+    // =========================================================================
+    // Haskell-faithfulness invariants — pinning the candidate filter
+    // (#206: `Artificial::Fin_unique` regression).
+    //
+    // Mirrors Haskell `simpleInjectiveFactInstances`
+    // (InjectiveFactInstances.hs:121-132):
+    //
+    //   guard $ (factTagMultiplicity tag == Linear)
+    //        && (tag `elem` (factTag <$> rPrems ru))
+    //
+    // The `tag elem prems` check is PER-RULE, not across all rules.
+    // We previously had a broader filter (any rule that produces the
+    // tag) which counted facts as injective when one rule created them
+    // and another consumed them — but no SINGLE rule had both prems
+    // AND concs.  This added spurious less-atoms and broke Fin_unique's
+    // case_2.
+    // =========================================================================
+
+    /// Fact created in Rule1 and consumed in Rule2 (no single rule has
+    /// it in both prems and concs) — must NOT be injective.
+    ///
+    /// This is the Artificial.spthy::Fin_unique shape:
+    ///   Step1: Fr(x) → St(x, k)
+    ///   Step2: St(x, k) → []
+    /// No round-trip → St is NOT injective in Haskell.
+    /// Without per-rule filter, we'd mark it injective and add a
+    /// spurious less-atom in case_2.
+    #[test]
+    fn cross_rule_create_consume_is_not_injective() {
+        use crate::fact::{Fact, FactTag, Multiplicity, fresh_fact};
+        use crate::rule::{Rule, ProtoRuleEInfo};
+        use tamarin_term::builtin::msg_var;
+
+        let st_tag = FactTag::Proto(Multiplicity::Linear, "St".to_string(), 2);
+        let st_fact = Fact::new(st_tag.clone(),
+            vec![msg_var("x", 0), msg_var("k", 0)]);
+        // Step1 creates St but doesn't consume it.
+        let step1: ProtoRuleE = Rule::new(
+            ProtoRuleEInfo::standard("Step1"),
+            vec![fresh_fact(msg_var("x", 0))],
+            vec![st_fact.clone()],
+            vec![],
+        );
+        // Step2 consumes St but doesn't produce it.
+        let step2: ProtoRuleE = Rule::new(
+            ProtoRuleEInfo::standard("Step2"),
+            vec![st_fact.clone()],
+            vec![],
+            vec![],
+        );
+
+        let inj = simple_injective_fact_instances(&[step1, step2]);
+        assert!(inj.is_empty(),
+            "St is created in Step1, consumed in Step2, but NO single rule \
+             has St in both prems and concs → must NOT be marked injective. \
+             Haskell `simpleInjectiveFactInstances` checks the per-rule \
+             `tag elem rPrems ru` condition.  Otherwise spurious less-atoms \
+             break Artificial::Fin_unique case_2.  (Memory: \
+             project_rust_injective_fact_candidate_filter.md)");
+    }
+
+    /// Persistent facts (multiplicity = Persistent) are never marked
+    /// injective.  Mirrors Haskell's
+    /// `guard (factTagMultiplicity tag == Linear)`.
+    #[test]
+    fn persistent_facts_are_not_injective() {
+        use crate::fact::{Fact, FactTag, Multiplicity};
+        use crate::rule::{Rule, ProtoRuleEInfo};
+        use tamarin_term::builtin::msg_var;
+
+        let p_tag = FactTag::Proto(Multiplicity::Persistent, "P".to_string(), 1);
+        let p_fact = Fact::new(p_tag.clone(), vec![msg_var("x", 0)]);
+        // Even with both prems + concs (which would normally pass the
+        // candidate filter), Persistent disqualifies.
+        let r: ProtoRuleE = Rule::new(
+            ProtoRuleEInfo::standard("R"),
+            vec![p_fact.clone()],
+            vec![p_fact.clone()],
+            vec![],
+        );
+        let inj = simple_injective_fact_instances(&[r]);
+        assert!(inj.is_empty(),
+            "Persistent facts are never injective (Haskell: \
+             `factTagMultiplicity tag == Linear` guard)");
+    }
+
+    /// Arity-0 facts (no args) cannot have monotonic behaviour and
+    /// must be excluded.  Per Haskell `behaviourLen = max 0 (arity-1)`
+    /// is 0; combined with the candidate filter check, arity-0 facts
+    /// get filtered.  Our impl has an explicit `if arity == 0 continue`.
+    #[test]
+    fn arity_zero_facts_are_not_injective() {
+        use crate::fact::{Fact, FactTag, Multiplicity};
+        use crate::rule::{Rule, ProtoRuleEInfo};
+
+        let z_tag = FactTag::Proto(Multiplicity::Linear, "Z".to_string(), 0);
+        let z_fact = Fact::new(z_tag.clone(), vec![]);
+        let r: ProtoRuleE = Rule::new(
+            ProtoRuleEInfo::standard("R"),
+            vec![z_fact.clone()],
+            vec![z_fact.clone()],
+            vec![],
+        );
+        let inj = simple_injective_fact_instances(&[r]);
+        assert!(inj.is_empty(),
+            "Arity-0 facts have no behaviour to track → never injective");
+    }
+
+    /// Built-in facts (Out, Ku, Kd, Fresh, etc.) are never injective.
+    /// Only Proto-tagged facts get the analysis.
+    #[test]
+    fn builtin_facts_are_not_injective() {
+        use crate::fact::{Fact, FactTag, fresh_fact};
+        use crate::rule::{Rule, ProtoRuleEInfo};
+        use tamarin_term::builtin::msg_var;
+
+        // Two Out facts — never injective regardless of pattern.
+        let out_fact = Fact::new(FactTag::Out, vec![msg_var("x", 0)]);
+        let r: ProtoRuleE = Rule::new(
+            ProtoRuleEInfo::standard("R"),
+            vec![fresh_fact(msg_var("x", 0)), out_fact.clone()],
+            vec![out_fact.clone()],
+            vec![],
+        );
+        let inj = simple_injective_fact_instances(&[r]);
+        // Out should NOT appear (only Proto tags are candidates).
+        assert!(inj.iter().all(|(t, _)| matches!(t, FactTag::Proto(_, _, _))),
+            "Only Proto facts are injective candidates");
+        assert!(!inj.iter().any(|(t, _)| matches!(t, FactTag::Out)),
+            "Out is never injective");
+    }
 }

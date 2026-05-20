@@ -302,12 +302,53 @@ impl EquationStore {
             })
             .collect();
 
+        // Haskell-faithful factored unification (Unification.hs:107-120):
+        // first run the local non-AC unifier; only AC residuals go to
+        // Maude.  When `unifyLTermFactored` returns `Just (m, [])`, the
+        // result is the local subst directly — NO Maude call.  This is
+        // critical for foo_eligibility-style cases: the local unifier
+        // orients same-sort var-var with larger-idx-as-key
+        // (Unification.hs:241), so stable pattern vars (small idx like
+        // t.1, t.2) stay on the value side and are dropped by
+        // `restrict stableVars` (Sources.hs:118).
+        let local_result = tamarin_term::unification::unify_lnterm_factored(applied.clone());
+        let local_result = match local_result {
+            Some(r) => r,
+            None => {
+                // Local non-AC failed → no unifier.
+                *self = self.clone().set_false();
+                return Ok(None);
+            }
+        };
+        let (local_subst, ac_residuals) = local_result;
+
+        // Fast path: no AC residuals.  Use local subst directly — this
+        // mirrors Haskell's `solve _ (Just (m, [])) = (substFromMap m,
+        // [emptySubstVFresh])` followed by `flattenUnif` which produces
+        // a single SubstVFresh equal to the local subst.
+        if ac_residuals.is_empty() {
+            if local_subst.is_empty() {
+                return Ok(None);
+            }
+            if self.conj.is_empty() {
+                self.subst = local_subst.compose(&self.subst);
+            } else {
+                self.apply_eq_store(maude, &local_subst)?;
+            }
+            return Ok(None);
+        }
+
+        // Mixed case: AC residuals exist.  Send them to Maude after
+        // applying local subst.  Each Maude unifier is composed with
+        // the local subst at the end (mirrors `flattenUnif` =
+        // `map (\`composeVFresh\` subst) substs`).
+        //
         // Pass `extra_avoid` (the caller's system-wide max var idx)
         // to the unifier so Maude-introduced witness vars get indices
         // above any system var, preventing `~mw:Pub:N` / `~mw:Msg:N`
         // collisions that break our (name, sort, idx) LVar identity.
         let avoid = self.fresh_baseline().max(extra_avoid);
-        let unifiers = maude.unify_at_with_avoid("eq_store::add_eqs", &applied, avoid)
+        let unifiers = maude.unify_at_with_avoid("eq_store::add_eqs", &ac_residuals, avoid)
             .map_err(|e| AddEqsError::Maude(format!("{}", e)))?;
 
         if unifiers.is_empty() {
@@ -332,10 +373,10 @@ impl EquationStore {
             // colliding witness names and spuriously equate unrelated
             // vars.
             let raw: Vec<(LVar, LNTerm)> = unifiers.into_iter().next().unwrap();
-            // Collect input vars (vars in the post-subst eqs).
+            // Collect input vars from the AC residuals (Maude's input).
             use tamarin_term::lterm::HasFrees;
             let mut input_vars: std::collections::BTreeSet<LVar> = std::collections::BTreeSet::new();
-            for e in &applied {
+            for e in &ac_residuals {
                 e.lhs.for_each_free(&mut |v| { input_vars.insert(v.clone()); });
                 e.rhs.for_each_free(&mut |v| { input_vars.insert(v.clone()); });
             }
@@ -343,10 +384,14 @@ impl EquationStore {
                 raw, &input_vars,
                 self.fresh_baseline().max(extra_avoid),
                 maude);
-            let mut subst = LNSubst::empty();
+            let mut maude_subst = LNSubst::empty();
             for (v, t) in raw {
-                subst = subst.compose(&LNSubst::from_list(vec![(v, t)]));
+                maude_subst = maude_subst.compose(&LNSubst::from_list(vec![(v, t)]));
             }
+            // Haskell-faithful: compose local_subst with Maude's result
+            // (Unification.hs:147 `flattenUnif` =
+            // `map (\`composeVFresh\` subst) substs`).
+            let subst = maude_subst.compose(&local_subst);
             // Haskell-faithful: call applyEqStore so existing disj substs
             // get re-unified against the new free subst.  Without it,
             // SplitG variants whose domain intersects with `subst.dom`
@@ -364,6 +409,17 @@ impl EquationStore {
         }
 
         // Multiple unifiers → record as a fresh-range disjunction.
+        // Haskell composes each Maude unifier with the local subst
+        // before storing as a disjunction (flattenUnif semantics).
+        // The local subst becomes part of the free subst; the Maude
+        // unifiers represent the disjunction over AC choices.
+        if !local_subst.is_empty() {
+            if self.conj.is_empty() {
+                self.subst = local_subst.compose(&self.subst);
+            } else {
+                self.apply_eq_store(maude, &local_subst)?;
+            }
+        }
         let mut substs: Vec<LNSubstVFresh> = Vec::with_capacity(unifiers.len());
         for raw in unifiers {
             substs.push(LNSubstVFresh::from_list(raw.into_iter()));
@@ -1201,5 +1257,166 @@ mod tests {
         assert!(!store.is_false());
         // The free substitution must now bind one variable to the other.
         assert!(!store.subst.is_empty(), "subst should be populated, got {:?}", store.subst);
+    }
+
+    // =========================================================================
+    // Haskell-faithfulness invariants for `add_eqs`.
+    //
+    // These tests pin orientation choices in the eq-store that we missed
+    // for weeks.  See `unification::haskell_invariants` for the rationale.
+    // =========================================================================
+
+    /// `add_eqs` for AC-free, same-sort var-var input must orient the
+    /// resulting subst with LARGER-idx as KEY (Haskell `unifyRaw`
+    /// convention, Unification.hs:241).
+    ///
+    /// This is the most important orientation invariant for downstream
+    /// `restrict stableVars`: stable pattern vars (small idx) must stay
+    /// on the VALUE side so they get filtered out (they're never keys
+    /// in Haskell's subst).
+    ///
+    /// **If this test fails, foo_eligibility-class divergences will
+    /// silently appear in the corpus.**
+    #[test]
+    fn add_eqs_ac_free_var_var_uses_haskell_orientation() {
+        let path = match maude_path() {
+            Some(p) => p,
+            None => { eprintln!("skipping: no maude"); return; }
+        };
+        let sig = tamarin_term::maude_sig::pair_maude_sig();
+        let h = tamarin_term::maude_proc::MaudeHandle::start(&path, sig).expect("start");
+
+        // Mimic the foo_eligibility shape: stable pattern var t.1 unified
+        // with rule-internal var e.10.  Both Msg, same sort.  Haskell
+        // convention: e.10 (larger idx) is the key.
+        let t1 = LVar::new("t", LSort::Msg, 1);
+        let e10 = LVar::new("e", LSort::Msg, 10);
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+        let lt1: LNTerm = Term::Lit(Lit::Var(t1.clone()));
+        let le10: LNTerm = Term::Lit(Lit::Var(e10.clone()));
+
+        let mut store = EquationStore::empty();
+        let split = store
+            .add_eqs(&h, &[tamarin_term::rewriting::Equal { lhs: lt1, rhs: le10 }])
+            .expect("add_eqs");
+        assert!(split.is_none(), "var-var unification produces a single mgu");
+        assert!(!store.is_false());
+
+        // Haskell-faithful: e.10 (larger idx) is the KEY.
+        assert!(store.subst.image_of(&e10).is_some(),
+                "add_eqs MUST orient same-sort var-var with larger-idx (e.10) \
+                 as KEY.  If this fails, foo_eligibility::eligibility and \
+                 friends will silently diverge from Haskell.  See \
+                 project_rust_lvar_ord_idx_first_landed.md.");
+        assert!(store.subst.image_of(&t1).is_none(),
+                "smaller-idx (t.1, the stable pattern var) must NOT be a key");
+    }
+
+    /// `add_eqs` for an unbinding (`x = y` where neither is in the
+    /// existing subst) must NOT introduce a Maude witness ~mw.
+    ///
+    /// We use the local non-AC fast path for AC-free signatures, which
+    /// just orients the bind directly.  If we accidentally regress to
+    /// the witness-heavy Maude shape (`{x → ~mw, y → ~mw}`), the
+    /// downstream `enforce_fresh_node_uniqueness_pass` will bucket
+    /// nodes by witness and merge Fresh nodes that should stay
+    /// distinct (the TLS_Handshake prem_idx_clash class).
+    #[test]
+    fn add_eqs_ac_free_var_var_does_not_introduce_witness() {
+        let path = match maude_path() {
+            Some(p) => p,
+            None => { eprintln!("skipping: no maude"); return; }
+        };
+        let sig = tamarin_term::maude_sig::pair_maude_sig();
+        let h = tamarin_term::maude_proc::MaudeHandle::start(&path, sig).expect("start");
+        let x = LVar::new("x", LSort::Msg, 0);
+        let y = LVar::new("y", LSort::Msg, 0);
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+        let tx: LNTerm = Term::Lit(Lit::Var(x.clone()));
+        let ty: LNTerm = Term::Lit(Lit::Var(y.clone()));
+        let mut store = EquationStore::empty();
+        let _ = store
+            .add_eqs(&h, &[tamarin_term::rewriting::Equal { lhs: tx, rhs: ty }])
+            .expect("add_eqs");
+
+        // Inspect every var in the subst's domain and range.  None
+        // should be a `~mw`-named witness.
+        use tamarin_term::lterm::HasFrees;
+        let mut witness_found = false;
+        for (key, term) in store.subst.to_list() {
+            if key.name == "~mw" { witness_found = true; }
+            term.for_each_free(&mut |v| {
+                if v.name == "~mw" { witness_found = true; }
+            });
+        }
+        assert!(!witness_found,
+                "AC-free var-var unification must NOT introduce ~mw \
+                 witnesses.  Witness introduction here regressed \
+                 TLS_Handshake::prem_idx_clash historically.");
+    }
+
+    /// `add_eqs` is idempotent for an already-implied equation.
+    ///
+    /// If the eq-store already has `x → 1`, calling `add_eqs([x = 1])`
+    /// must NOT introduce new bindings or witnesses or contradictions.
+    /// This is a regression guard for the eq-store's snapshot/apply
+    /// chain in `add_eqs_inner` (we apply `self.subst` to inputs first).
+    #[test]
+    fn add_eqs_idempotent_for_already_implied_eq() {
+        let path = match maude_path() {
+            Some(p) => p,
+            None => { eprintln!("skipping: no maude"); return; }
+        };
+        let sig = tamarin_term::maude_sig::pair_maude_sig();
+        let h = tamarin_term::maude_proc::MaudeHandle::start(&path, sig).expect("start");
+        let x = LVar::new("x", LSort::Msg, 0);
+        let y = LVar::new("y", LSort::Msg, 5);
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+        let tx: LNTerm = Term::Lit(Lit::Var(x.clone()));
+        let ty: LNTerm = Term::Lit(Lit::Var(y.clone()));
+        let mut store = EquationStore::empty();
+        let _ = store
+            .add_eqs(&h, &[tamarin_term::rewriting::Equal {
+                lhs: tx.clone(), rhs: ty.clone() }])
+            .expect("first add_eqs");
+        let dom_before: Vec<LVar> = store.subst.dom().cloned().collect();
+
+        // Repeat — should be a no-op.
+        let _ = store
+            .add_eqs(&h, &[tamarin_term::rewriting::Equal {
+                lhs: tx, rhs: ty }])
+            .expect("second add_eqs");
+        let dom_after: Vec<LVar> = store.subst.dom().cloned().collect();
+        assert_eq!(dom_before, dom_after,
+                   "Repeated add_eqs of an already-implied equation must \
+                    not change the subst domain.");
+        assert!(!store.is_false(),
+                "Repeating an equation must not produce a contradiction.");
+    }
+
+    /// `add_eqs` with an unsatisfiable input marks the store false.
+    ///
+    /// Constructor mismatch (pair vs pk) is unsatisfiable in non-AC.
+    /// Our `add_eqs_inner` should set the store to false, not panic or
+    /// silently succeed.
+    #[test]
+    fn add_eqs_unsatisfiable_sets_store_false() {
+        let path = match maude_path() {
+            Some(p) => p,
+            None => { eprintln!("skipping: no maude"); return; }
+        };
+        let sig = tamarin_term::maude_sig::pair_maude_sig();
+        let h = tamarin_term::maude_proc::MaudeHandle::start(&path, sig).expect("start");
+        use tamarin_term::builtin::{msg_var, pair, pk};
+        let lhs: LNTerm = pair(msg_var("a", 1), msg_var("b", 2));
+        let rhs: LNTerm = pk(msg_var("c", 3));
+        let mut store = EquationStore::empty();
+        let _ = store.add_eqs(&h,
+            &[tamarin_term::rewriting::Equal { lhs, rhs }]);
+        assert!(store.is_false(),
+                "constructor mismatch must set store to false");
     }
 }

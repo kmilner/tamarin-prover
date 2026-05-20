@@ -1690,4 +1690,223 @@ mod tests {
         let val = |_atom: &p::Atom| Some(true);
         assert_eq!(simplify_guarded_with(&g, &val), g);
     }
+
+    // =========================================================================
+    // Haskell-faithfulness invariants for guarded-formula smart ctors.
+    //
+    // `gconj` / `gdisj` mirror Haskell's smart constructors in
+    // `Theory.Constraint.System.Guarded` (Guarded.hs:418, :432).  They
+    // SHORT-CIRCUIT on `gtrue`/`gfalse` and dedupe via `nub`.
+    // =========================================================================
+
+    /// `gtrue` is represented as `Conj []` and `gfalse` as `Disj []`.
+    /// This is a Haskell convention (Guarded.hs:139-145).  Many
+    /// short-circuit checks rely on it (e.g. `x == gfalse()` in
+    /// `gconj`).  If we accidentally encode them differently, every
+    /// short-circuit silently breaks.
+    #[test]
+    fn gtrue_is_empty_conj_and_gfalse_is_empty_disj() {
+        assert_eq!(gtrue(), Guarded::Conj(vec![]));
+        assert_eq!(gfalse(), Guarded::Disj(vec![]));
+        assert_ne!(gtrue(), gfalse(), "gtrue and gfalse must be distinguishable");
+    }
+
+    /// `gconj([gtrue, gtrue, ...])` reduces to `gtrue`.  Empty/trivial
+    /// conjunction is True.  Mirrors Haskell `gconj`'s elimination of
+    /// `gtrue` items.
+    #[test]
+    fn gconj_of_only_gtrue_items_is_gtrue() {
+        // Guarded.hs:418: `gconj` should collapse all-true conjunctions.
+        // Rust impl flattens `Conj` items (gtrue is Conj([])), so all
+        // gtrue items dissolve into empty.  Result: `Conj([])` = gtrue.
+        let g = gconj(vec![gtrue(), gtrue(), gtrue()]);
+        assert_eq!(g, gtrue(),
+                   "gconj of only-True items must collapse to gtrue");
+    }
+
+    /// `gconj([..., gfalse, ...])` SHORT-CIRCUITS to `gfalse` regardless
+    /// of other items.  This is the "any-false makes conjunction false"
+    /// short-circuit at Guarded.hs:418.
+    #[test]
+    fn gconj_short_circuits_on_gfalse() {
+        // Build a non-trivial atom by parsing a small formula.
+        let atom_g = g("Last(#i)").unwrap();
+        // Any gfalse in the items short-circuits to gfalse.
+        let g = gconj(vec![gtrue(), gfalse(), atom_g.clone()]);
+        assert_eq!(g, gfalse(),
+                   "gconj must short-circuit when any item is gfalse");
+        let g2 = gconj(vec![atom_g, gfalse()]);
+        assert_eq!(g2, gfalse());
+    }
+
+    /// `gdisj([gfalse, gfalse, ...])` reduces to `gfalse`. Empty
+    /// disjunction is False.
+    #[test]
+    fn gdisj_of_only_gfalse_items_is_gfalse() {
+        let g = gdisj(vec![gfalse(), gfalse()]);
+        assert_eq!(g, gfalse(),
+                   "gdisj of only-False items must collapse to gfalse");
+    }
+
+    /// `gdisj([..., gtrue, ...])` short-circuits to `gtrue`.
+    #[test]
+    fn gdisj_short_circuits_on_gtrue() {
+        let g = gdisj(vec![gfalse(), gtrue(), gfalse()]);
+        assert_eq!(g, gtrue(),
+                   "gdisj must short-circuit on first gtrue encountered");
+    }
+
+    /// `gconj` deduplicates syntactically-equal items.  Mirrors
+    /// Haskell's `nub gfs` (Guarded.hs:418).  Dedup is ORDER-PRESERVING
+    /// (Haskell `Data.List.nub` keeps first occurrence).
+    #[test]
+    fn gconj_dedupes_syntactic_duplicates() {
+        let a = g("Last(#i)").unwrap();
+        let b = g("Last(#j)").unwrap();
+        let out = gconj(vec![a.clone(), b.clone(), a.clone()]);
+        // Expected: Conj([a, b]) — second occurrence of `a` dropped.
+        match out {
+            Guarded::Conj(items) => {
+                assert_eq!(items.len(), 2,
+                    "gconj must dedupe identical items via nub");
+                assert_eq!(items[0], a);
+                assert_eq!(items[1], b);
+            }
+            _ => panic!("expected Conj"),
+        }
+    }
+
+    /// `gdisj` deduplicates syntactically-equal items.  Same as above,
+    /// for disjunction.  Bug from #194 (clusters): without this dedup,
+    /// `verify_checksign_test`-class SplitG variants doubled up.
+    #[test]
+    fn gdisj_dedupes_syntactic_duplicates() {
+        let a = g("Last(#i)").unwrap();
+        let b = g("Last(#j)").unwrap();
+        let out = gdisj(vec![a.clone(), b.clone(), a.clone(), b.clone()]);
+        match out {
+            Guarded::Disj(items) => {
+                assert_eq!(items.len(), 2,
+                    "gdisj must dedupe identical items via nub");
+                assert_eq!(items[0], a);
+                assert_eq!(items[1], b);
+            }
+            _ => panic!("expected Disj"),
+        }
+    }
+
+    /// `gconj` with a single non-trivial item collapses to that item
+    /// (no Conj wrapper).  Mirrors Haskell's `case gfs' of [g] -> g`
+    /// pattern.
+    #[test]
+    fn gconj_singleton_unwraps() {
+        let a = g("Last(#i)").unwrap();
+        let out = gconj(vec![a.clone()]);
+        assert_eq!(out, a, "singleton gconj must unwrap to the lone item");
+    }
+
+    /// `gconj` flattens nested `Conj` one level.  Mirrors Haskell's
+    /// `concatMap` flatten.
+    #[test]
+    fn gconj_flattens_nested_conj_one_level() {
+        let a = g("Last(#i)").unwrap();
+        let b = g("Last(#j)").unwrap();
+        let c = g("Last(#k)").unwrap();
+        let inner = Guarded::Conj(vec![a.clone(), b.clone()]);
+        let out = gconj(vec![inner, c.clone()]);
+        match out {
+            Guarded::Conj(items) => {
+                assert_eq!(items.len(), 3,
+                    "nested Conj should be flattened: 2 inner + 1 outer = 3");
+                assert_eq!(items, vec![a, b, c]);
+            }
+            _ => panic!("expected Conj"),
+        }
+    }
+
+    // =========================================================================
+    // Haskell-faithfulness invariants for `gnot` and quantifier swap.
+    //
+    // Mirrors Haskell `gnot` (Guarded.hs):
+    //     gnot (GGuarded All ss as gf) = gex  ss as (gnot gf)
+    //     gnot (GGuarded Ex  ss as gf) = gall ss as (gnot gf)
+    //
+    // The All↔Ex swap under negation is critical.  Past bugs:
+    //   #48 (gnot_atom for Action/Last/Pred) — proto-fact actions need
+    //     a specific Haskell-faithful negation shape.
+    //   #170 (TESLA::authentic nondeterminism) had a downstream impact.
+    // =========================================================================
+
+    /// `gnot ∘ gnot = id` (involution) for ground formulas.
+    /// This is the most fundamental algebraic property of negation.
+    /// If gnot doesn't round-trip, every double-negation in IH
+    /// reasoning silently degrades.
+    #[test]
+    fn gnot_double_negation_is_identity() {
+        assert_eq!(gnot(&gnot(&gtrue())), gtrue());
+        assert_eq!(gnot(&gnot(&gfalse())), gfalse());
+        // Atom case.
+        let a = g("Last(#i)").unwrap();
+        assert_eq!(gnot(&gnot(&a)), a,
+                   "gnot is involutive on atomic formulas — \
+                    needed for `to_induction_hypothesis` round-trip.");
+    }
+
+    /// `gnot (All ... body) = Ex ... gnot(body)`.  Haskell:
+    /// `gnot (GGuarded All ss as gf) = gex ss as (gnot gf)`.
+    ///
+    /// **The quantifier flips on negation.**  If we forget to flip,
+    /// `to_induction_hypothesis` produces the wrong dual and the IH
+    /// becomes vacuous or false.
+    #[test]
+    fn gnot_flips_universal_to_existential() {
+        // ∀ x #i. P(x)@#i ⇒ Q(x)@#i — guarded universal.
+        // Negation flips to: ∃ x #i. P(x)@#i ∧ ¬Q(x)@#i.
+        let f = g("All x #i. P(x)@#i ==> Q(x)@#i").unwrap();
+        let n = gnot(&f);
+        // The resulting quantifier MUST be Ex.
+        match n {
+            Guarded::GGuarded { qua: Quant::Ex, .. } => {}
+            other => panic!(
+                "expected Ex quantifier after negating All; got {:?}", other),
+        }
+    }
+
+    /// `gnot (Ex ... body) = All ... gnot(body)`.  Symmetric to above.
+    ///
+    /// Together these ensure that `gnot ∘ gnot` round-trips through
+    /// the quantifier — Ex → All → Ex.  Without the flip on either
+    /// side, the double-negation property breaks.
+    #[test]
+    fn gnot_flips_existential_to_universal() {
+        let f = g("Ex x #i. P(x)@#i").unwrap();
+        // Sanity: starts as Ex.
+        match &f {
+            Guarded::GGuarded { qua: Quant::Ex, .. } => {}
+            other => panic!("test setup: expected Ex; got {:?}", other),
+        }
+        let n = gnot(&f);
+        // After negation, outer quantifier must be All (or the formula
+        // simplified — but for this non-trivial body it remains All).
+        match n {
+            Guarded::GGuarded { qua: Quant::All, .. } => {}
+            other => panic!(
+                "expected All quantifier after negating Ex; got {:?}", other),
+        }
+    }
+
+    /// De Morgan: `gnot (gconj [a, b]) = gdisj [gnot a, gnot b]`.
+    /// Already exercised in `gnot_conj_becomes_disj` — pin the dual.
+    #[test]
+    fn gnot_distributes_over_disj() {
+        // ¬(a ∨ b) = ¬a ∧ ¬b
+        let a = g("Last(#i)").unwrap();
+        let b = g("Last(#j)").unwrap();
+        let or = Guarded::Disj(vec![a.clone(), b.clone()]);
+        let neg = gnot(&or);
+        // Should be Conj([¬a, ¬b]) — both negated.
+        let expected = gconj(vec![gnot(&a), gnot(&b)]);
+        assert_eq!(neg, expected,
+            "De Morgan: ¬(a ∨ b) = ¬a ∧ ¬b — required for IH derivation");
+    }
 }
