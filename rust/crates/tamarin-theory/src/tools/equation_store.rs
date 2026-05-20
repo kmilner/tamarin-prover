@@ -719,6 +719,17 @@ impl EquationStore {
         let pos = self.conj.iter().position(|d| d.substs.len() == 1);
         let Some(pos) = pos else { return false; };
         let subst_vf = self.conj[pos].substs[0].clone();
+        if std::env::var("TAM_DBG_APPLY_EQ").is_ok() {
+            let pairs: Vec<String> = subst_vf.to_list().iter().take(8)
+                .map(|(k, v)| format!("{}_{} → {}", k.name, k.idx,
+                    format!("{:?}", v).chars().take(40).collect::<String>()))
+                .collect();
+            eprintln!("[simp_singleton] folding: {:?}", pairs);
+            let pre_pairs: Vec<String> = external_preserve.iter().take(5)
+                .map(|v| format!("{}_{}", v.name, v.idx))
+                .collect();
+            eprintln!("[simp_singleton] preserve subset: {:?} (total {})", pre_pairs, external_preserve.len());
+        }
         // Drop the singleton disjunction.
         self.conj.remove(pos);
         if subst_vf.is_empty() {

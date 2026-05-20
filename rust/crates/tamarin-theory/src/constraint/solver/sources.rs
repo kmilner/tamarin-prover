@@ -4224,6 +4224,40 @@ fn graft_case_into(
     if let Some(slot) = out.goals.iter_mut().find(|(g, _)| g == &live_goal) {
         slot.1.solved = true;
     }
+    // Copy the case's variant SplitG disjunctions into the live system.
+    // Without this, when saturate grafts a case (e.g. Receiver0b's case
+    // with its 2-variant SplitG `signature → ~mw` vs `signature → sign(...)`)
+    // into a chain, the SplitG is silently dropped — the resulting case
+    // has the rule's facts un-narrowed (signature stays free) AND no
+    // SplitG goal to later resolve.  At runtime when this case is
+    // applied, the search sees an untyped signature variable and
+    // reaches a spurious Solved leaf.  Mirrors Haskell's `conjoinSystem`
+    // (Reduction.hs:707-708) which copies the case's `sEqStore.eqsConj`
+    // disjunctions, then inserts a SplitG goal for each new disj id.
+    //
+    // We have to rename nodes referenced inside the variant substs
+    // (the subst's range may contain LVars; if any reference the
+    // abstract node it must be renamed to live_node).  Haskell's
+    // domain/range of the variant subst is bound vars of the abstracted
+    // rule, which don't include the abstract goal node, so this rename
+    // is usually a no-op — but doing it consistently keeps the graft
+    // semantics uniform.
+    use tamarin_term::lterm::HasFrees;
+    for d in &case_sys.eq_store.conj {
+        let renamed_substs: Vec<_> = d.substs.iter().map(|s| {
+            let pairs: Vec<_> = s.to_list().into_iter().map(|(v, t)| {
+                let new_v = if &v == abstract_node { live_node.clone() } else { v };
+                let new_t = t.map_free(&mut |w| {
+                    if &w == abstract_node { live_node.clone() } else { w }
+                });
+                (new_v, new_t)
+            }).collect();
+            tamarin_term::subst_vfresh::SubstVFresh::from_list(pairs)
+        }).collect();
+        let new_id = out.eq_store.add_disj(renamed_substs);
+        // Add the goal at the same position as the new disj.
+        out.add_goal(crate::constraint::constraints::Goal::Split(new_id));
+    }
     Some(out)
 }
 
@@ -5529,6 +5563,52 @@ fn apply_source_case_premise(
 
     // F — close trivial chains.
     close_trivial_chains_in_graft(&mut r);
+
+    // G — re-filter conjoined variant SplitGs against the now-extended
+    // free subst.  Mirrors Haskell's `applyEqStore` semantics: when new
+    // bindings enter eq_store.subst (here, via the conjoin's case_subst_eqs),
+    // existing SplitG variants whose bindings conflict are dropped.
+    //
+    // Concrete TESLA::authentic example: Receiver0b's variant [0] has
+    // `z → verify(...)` and variant [1] has `z → true`.  When the case is
+    // grafted via apply_source_case_premise → conjoin_system, z gets
+    // unified with `true` (from Receiver0b_check's literal `true` slot)
+    // via the case's edges.  At that moment, applyEqStore should drop
+    // variant [0] because `verify(...) ≠ true`.  Without this G step,
+    // both variants survive, the search forks at the SplitG, picks
+    // variant [0]'s untyped-signature path, and reaches a spurious Solved.
+    if !r.sys.eq_store.conj.is_empty() && !r.sys.eq_store.subst.is_empty() {
+        let empty_subst = tamarin_term::subst::Subst::empty();
+        let _ = r.sys.eq_store.apply_eq_store(&ctx.maude, &empty_subst);
+        let needs_fold = r.sys.eq_store.conj.iter().any(|d| d.substs.len() == 1);
+        if needs_fold {
+            use tamarin_term::lterm::HasFrees;
+            let mut sys_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar>
+                = std::collections::BTreeSet::new();
+            let mut visit = |v: &tamarin_term::lterm::LVar| { sys_vars.insert(v.clone()); };
+            for (id, rule) in &r.sys.nodes {
+                id.for_each_free(&mut visit);
+                rule.for_each_free(&mut visit);
+            }
+            for e in &r.sys.edges {
+                e.src.0.for_each_free(&mut visit);
+                e.tgt.0.for_each_free(&mut visit);
+            }
+            for l in &r.sys.less_atoms {
+                l.smaller.for_each_free(&mut visit);
+                l.larger.for_each_free(&mut visit);
+            }
+            if let Some(la) = &r.sys.last_atom { la.for_each_free(&mut visit); }
+            let maude = ctx.maude.clone();
+            let store = std::mem::take(&mut r.sys.eq_store);
+            r.sys.eq_store = store.simp_with_fresh_avoiding(
+                |_, _| false,
+                |n| maude.reserve_idxs(n),
+                &sys_vars,
+            );
+            r.subst_system();
+        }
+    }
 
     if src.incomplete { r.sys.used_incomplete_source = true; }
     crate::state_trace::emit(
