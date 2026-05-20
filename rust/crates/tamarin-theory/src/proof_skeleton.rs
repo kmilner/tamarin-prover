@@ -200,21 +200,23 @@ fn contradiction_label(
     c: &Option<crate::constraint::solver::contradictions::Contradiction>,
 ) -> String {
     use crate::constraint::solver::contradictions::Contradiction as K;
+    // Strings mirror Haskell `prettyContradiction` (Contradictions.hs:457+);
+    // see the case there for each variant.
     match c {
         None => "closed".to_string(),
         Some(K::Cyclic) => "cyclic".to_string(),
         Some(K::ForbiddenChain) => "forbidden chain".to_string(),
-        Some(K::ForbiddenKD) => "forbidden KD".to_string(),
+        Some(K::ForbiddenKD) => "forbidden KD-fact".to_string(),
         Some(K::ImpossibleChain) => "impossible chain".to_string(),
         Some(K::NodeAfterLast(..)) => "node after last".to_string(),
-        Some(K::NonInjectiveFactInstance(..)) => "non-injective".to_string(),
-        Some(K::SubtermCyclic) => "subterm cycle".to_string(),
+        Some(K::NonInjectiveFactInstance(..)) => "non-injective facts".to_string(),
+        Some(K::SubtermCyclic) => "contradictory subterm store".to_string(),
         Some(K::NonNormalTerms) => "non-normal terms".to_string(),
         Some(K::FormulasFalse) => "from formulas".to_string(),
-        Some(K::IncompatibleEqs) => "incompatible equations".to_string(),
-        Some(K::SuperfluousLearn(..)) => "superfluous learn".to_string(),
-        Some(K::ForbiddenExp) => "forbidden exp".to_string(),
-        Some(K::ForbiddenBP) => "forbidden BP".to_string(),
+        Some(K::IncompatibleEqs) => "incompatible equalities".to_string(),
+        Some(K::SuperfluousLearn(..)) => "derived before and after".to_string(),
+        Some(K::ForbiddenExp) => "non-normal exponentiation rule instance".to_string(),
+        Some(K::ForbiddenBP) => "non-normal bilinear pairing rule instance".to_string(),
     }
 }
 
