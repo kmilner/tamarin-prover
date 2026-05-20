@@ -45,9 +45,17 @@ fn main() {
                         }
                         println!("    -- goals --");
                         for (g, st) in &sys.goals {
-                            println!("      [{}] {:?}",
+                            let extra = match g {
+                                tamarin_theory::constraint::constraints::Goal::Split(id) => {
+                                    sys.eq_store.split_size(*id)
+                                        .map(|sz| format!(" SIZE={}", sz))
+                                        .unwrap_or_default()
+                                }
+                                _ => String::new(),
+                            };
+                            println!("      [{}] {:?}{}",
                                 if st.solved { "S" } else { "-" },
-                                g);
+                                g, extra);
                         }
                     }
                 }
