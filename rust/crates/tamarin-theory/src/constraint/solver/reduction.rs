@@ -590,7 +590,73 @@ impl<'ctx> Reduction<'ctx> {
             }
         }
         let id = self.sys.eq_store.add_disj(substs);
-        self.insert_goal(Goal::Split(id));
+        // Re-filter the newly-added variants against the existing free
+        // subst.  Without this, variant bindings that conflict with the
+        // already-established free subst stay in the disjunction.
+        //
+        // Concrete TESLA::authentic example: solve_premise_goal calls
+        // solve_fact_eqs FIRST (unifying rule conc with live premise,
+        // forcing z=true into eq_store.subst), THEN solve_rule_constraints
+        // adds the variant SplitG.  Variant [0] has z → verify(...) which
+        // conflicts with z=true.  Haskell's `applyEqStore`
+        // (EquationStore.hs:252-271) re-unifies each variant against the
+        // new free subst via Maude and drops variants whose Maude call
+        // returns no unifier.  Without this re-filter, both variants
+        // survive, the wrong one (variant [0], untyped signature) gets
+        // picked first by solve_split_goal, and the In premise's
+        // `signature → sign(...)` narrowing is lost.
+        //
+        // Passing an EMPTY asubst makes apply_eq_store re-unify variants
+        // against the existing free subst (new_subst = empty ∘ self.subst
+        // = self.subst).  Variants whose Maude call returns no unifier
+        // are dropped.  If only one variant remains, fold it via
+        // simp_with_fresh_avoiding so its bindings propagate to rule
+        // terms via the subsequent exploit_prems.
+        let mut folded = false;
+        if !self.sys.eq_store.subst.is_empty() {
+            let empty_subst = tamarin_term::subst::Subst::empty();
+            let _ = self.sys.eq_store.apply_eq_store(&self.ctx.maude, &empty_subst);
+            let needs_fold = self.sys.eq_store.conj.iter()
+                .any(|d| d.split_id == id && d.substs.len() == 1);
+            if needs_fold {
+                use tamarin_term::lterm::HasFrees;
+                let mut sys_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar>
+                    = std::collections::BTreeSet::new();
+                let mut visit = |v: &tamarin_term::lterm::LVar| { sys_vars.insert(v.clone()); };
+                for (id, rule) in &self.sys.nodes {
+                    id.for_each_free(&mut visit);
+                    rule.for_each_free(&mut visit);
+                }
+                for e in &self.sys.edges {
+                    e.src.0.for_each_free(&mut visit);
+                    e.tgt.0.for_each_free(&mut visit);
+                }
+                for l in &self.sys.less_atoms {
+                    l.smaller.for_each_free(&mut visit);
+                    l.larger.for_each_free(&mut visit);
+                }
+                if let Some(la) = &self.sys.last_atom { la.for_each_free(&mut visit); }
+                let maude = self.ctx.maude.clone();
+                let store = std::mem::take(&mut self.sys.eq_store);
+                self.sys.eq_store = store.simp_with_fresh_avoiding(
+                    |_, _| false,
+                    |n| maude.reserve_idxs(n),
+                    &sys_vars,
+                );
+                // Check if our disj was actually folded (might still be
+                // there if simp couldn't fold for some reason).
+                folded = !self.sys.eq_store.conj.iter().any(|d| d.split_id == id);
+                if folded {
+                    self.subst_system();
+                }
+            }
+        }
+        // Only insert the Goal::Split if the disj wasn't already folded.
+        // If we folded it, the SplitG goal would be orphaned (perform_split
+        // would return None → Contradictory).
+        if !folded {
+            self.insert_goal(Goal::Split(id));
+        }
         self.changed = ChangeIndicator::Changed;
     }
 
@@ -2492,8 +2558,16 @@ impl<'ctx> Reduction<'ctx> {
         rule: &RuleACInst,
     ) {
         // Snapshot premises so we can mutate self while iterating.
+        // Apply the current eq_store.subst to each premise so any
+        // variant subst that was folded into the free subst (e.g. by
+        // solve_rule_constraints' applyEqStore filter) propagates into
+        // the new Goal::Premise entries.  Mirrors Haskell which sees
+        // the substituted premises at goal-insertion time.
+        let subst = &self.sys.eq_store.subst;
         let prems: Vec<(crate::rule::PremIdx, crate::fact::LNFact)> =
-            rule.enumerate_premises().map(|(p, f)| (p, f.clone())).collect();
+            rule.enumerate_premises()
+                .map(|(p, f)| (p, f.clone().map(|t| tamarin_term::subst::apply_vterm(subst, t))))
+                .collect();
         // Loop-breaker premises (per Haskell `praciLoopBreakers`) are
         // those whose `PremIdx` was flagged at theory-load time by the
         // dataflow loop-breaker analysis.  Goals at these premises get
