@@ -898,6 +898,15 @@ impl EquationStore {
                 // Apply uniform shift to all RHS terms.  Haskell-faithful:
                 // shift = freshStart - rhs_min, where freshStart = avoid_max + 1.
                 // Shift may be negative (rhs already above avoid); use i128.
+                //
+                // BUT: vars that are in `new_subst_range_vars` (system vars
+                // baked into the variant via prior AES + Maude inlining,
+                // e.g. Setup_Key's `k:F#342` in `z_0 → snd(sdec(~mw, k:F#342))`)
+                // MUST NOT be shifted.  Shifting them creates an orphan
+                // `k:F#343` distinct from the actual system var `k:F#342`,
+                // desyncing the variant from the system.  T&D::type_assertion
+                // bug: each AES call shifted k:F#N → k:F#N+1, drifting the
+                // variant's k away from Setup_Key's k.
                 let renamed_rhs: Vec<LNTerm> = if let Some(min) = rhs_min {
                     let fresh_start: i128 = avoid_max as i128 + 1;
                     let shift: i128 = fresh_start - (min as i128);
@@ -905,6 +914,11 @@ impl EquationStore {
                         use tamarin_term::lterm::HasFrees;
                         bindings.iter().map(|(_, t)| {
                             t.clone().map_free(&mut |v| {
+                                // Preserve system vars (vars in newsubst's
+                                // range) — they're not witnesses.
+                                if new_subst_range_vars.contains(&v) {
+                                    return v;
+                                }
                                 let new_idx: i128 = (v.idx as i128) + shift;
                                 let new_idx_u64 = if new_idx < 0 { 0 }
                                     else if new_idx > u64::MAX as i128 { u64::MAX }
