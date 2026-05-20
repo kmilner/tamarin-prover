@@ -1066,8 +1066,21 @@ fn saturate_sources_inner_with_options(
                                         // Haskell's order-sorted unifier
                                         // does (it picks the named var
                                         // when one side is anonymous).
-                                        let use_cv_name =
-                                            lv.name == "~mw" && cv.name != "~mw";
+                                        //
+                                        // ALSO: if lv's sort is BROADER
+                                        // than the narrower result `s`,
+                                        // pick cv's identity (which is at
+                                        // the narrower sort already) —
+                                        // synthesizing `{name: lv.name,
+                                        // sort: s, idx: lv.idx}` would
+                                        // create a sort-conflated LVar
+                                        // (e.g. `t:Fresh:1` colliding with
+                                        // stable `t:Msg:1`).  Haskell-
+                                        // faithful: narrowing produces a
+                                        // binding `lv → cv` (Msg→Fresh)
+                                        // without synthesizing new LVars.
+                                        let use_cv_name = (lv.name == "~mw" && cv.name != "~mw")
+                                            || lv.sort != s;
                                         let canonical = if use_cv_name {
                                             tamarin_term::lterm::LVar {
                                                 name: cv.name.clone(),
@@ -1102,7 +1115,39 @@ fn saturate_sources_inner_with_options(
                             // the runtime two semantically-distinct LVars
                             // for what should be the same variable.
                             let renamed = apply_lvar_subst(&renamed, &term_subst);
-                            let live_sys = apply_lvar_subst(sys, &term_subst);
+                            let mut live_sys = apply_lvar_subst(sys, &term_subst);
+                            // Compose cross-sort term_subst entries into
+                            // live_sys.eq_store.subst.  apply_lvar_subst
+                            // only rewrites identity for same-sort renames
+                            // (guarded since session 5 to avoid sort-
+                            // conflated LVars).  Cross-sort entries like
+                            // `t#1:Msg → n:Fresh:8` represent narrowing
+                            // constraints that must enter eq_store as
+                            // bindings — otherwise the constraint is lost
+                            // and runtime applySource can't detect the
+                            // contradiction.  Haskell-faithful: matching
+                            // subst is composed into eq_store via
+                            // `applyEqStore` (EquationStore.hs).
+                            {
+                                let mut cross_sort_pairs: Vec<(tamarin_term::lterm::LVar,
+                                    tamarin_term::lterm::LNTerm)> = Vec::new();
+                                for (k, v) in &term_subst {
+                                    if let tamarin_term::term::Term::Lit(
+                                        tamarin_term::vterm::Lit::Var(nv)) = v
+                                    {
+                                        if nv.sort == k.sort {
+                                            // Same-sort: handled by apply_lvar_subst alpha-rename.
+                                            continue;
+                                        }
+                                    }
+                                    // Cross-sort or var→app: add as binding.
+                                    cross_sort_pairs.push((k.clone(), v.clone()));
+                                }
+                                if !cross_sort_pairs.is_empty() {
+                                    let added = tamarin_term::subst::Subst::from_list(cross_sort_pairs);
+                                    live_sys.eq_store.subst = added.compose(&live_sys.eq_store.subst);
+                                }
+                            }
                             // Compute the case_conc post-subst for the
                             // Maude alignment step below.
                             let case_conc_aligned = {
@@ -4258,6 +4303,30 @@ fn graft_case_into(
         // Add the goal at the same position as the new disj.
         out.add_goal(crate::constraint::constraints::Goal::Split(new_id));
     }
+    // Merge the case's free subst (eq_store.subst) into the live system's
+    // free subst.  Mirrors Haskell's `conjoinSystem` (Reduction.hs:671) which
+    // composes the case's eqStore subst into the live's via `applyEqStore`.
+    // Without this, when a case carrying a Haskell-faithful `t#1 → kZero`
+    // binding is grafted at saturate, the binding is silently dropped — and
+    // subsequent saturate iterations lose the constraint that the goal var
+    // is equated with the rule's internal var.  This was the missing piece
+    // making Minimal_HashChain::Loop_and_success wrong-falsified post-LVar.
+    //
+    // Rename abstract_node → live_node in keys + values, mirroring the
+    // rename done above for disj substs and edges.
+    if !case_sys.eq_store.subst.is_empty() {
+        for (v, t) in case_sys.eq_store.subst.to_list() {
+            let new_v = if &v == abstract_node { live_node.clone() } else { v };
+            let new_t = t.map_free(&mut |w| {
+                if &w == abstract_node { live_node.clone() } else { w }
+            });
+            // Compose: new_v → new_t goes into out.eq_store.subst.  Use
+            // simple insertion since the live system's subst typically has
+            // disjoint domain at this point in saturate.
+            let added = tamarin_term::subst::Subst::from_list(vec![(new_v, new_t)]);
+            out.eq_store.subst = added.compose(&out.eq_store.subst);
+        }
+    }
     Some(out)
 }
 
@@ -4839,10 +4908,87 @@ fn sort_ge(a: tamarin_term::lterm::LSort, b: tamarin_term::lterm::LSort) -> bool
 /// after every `refineSource` call (saturateSources iterations
 /// + matchToGoal's refineSubst).  Both places need the restrict
 /// for runtime applySource to see a clean precomputed case.
+/// Flip same-sort var-var bindings `x → y` where `y` is in `stable_vars`
+/// but `x` is not.  Result `y → x` is Haskell-equivalent (both encode
+/// `x = y`) but survives the subsequent key-filter restrict.
+///
+/// Why this is needed: Haskell-faithful LVar Ord (idx-first) +
+/// `unify_lterm_factored` (larger-idx-as-key) orient bindings so the
+/// rule-internal var (large idx, NOT stable) becomes the key.  Restrict
+/// then drops the binding even though it carries load-bearing constraint
+/// info (e.g. `t#1 = kZero` ↔ same goal var = rule's conclusion arg).
+/// Without the binding, runtime `apply_source_case_premise`'s refineSubst
+/// (sources.rs:5503) trivially succeeds where Haskell would contradict
+/// via downstream substSystem propagation in the case_sys.
+fn flip_to_stable_keys(
+    sys: &mut System,
+    stable_vars: &std::collections::BTreeSet<tamarin_term::lterm::LVar>,
+) {
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    let trace = std::env::var("TAM_DBG_FLIP").is_ok();
+    let mut kept: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)> = Vec::new();
+    let mut flipped: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)> = Vec::new();
+    for (k, v) in sys.eq_store.subst.to_list() {
+        let Term::Lit(Lit::Var(target_var)) = &v else {
+            kept.push((k, v));
+            continue;
+        };
+        // Already correct orientation (key is stable).
+        if stable_vars.contains(&k) {
+            kept.push((k, v));
+            continue;
+        }
+        // Flip if value is stable AND sort-compatible (same sort, or
+        // value's sort is broader so flipping doesn't widen).
+        if stable_vars.contains(target_var) {
+            // Allow flip when key's sort can be substituted by value's sort
+            // (i.e. value sort >= key sort in the lattice).  Same sort is OK.
+            // Cross-sort flip would invert direction which could widen the
+            // sort of the stable var — skip those.
+            if target_var.sort == k.sort {
+                if trace {
+                    eprintln!("[flip] {}#{}({:?})→{}#{}({:?})  TO  {}#{}({:?})→{}#{}({:?})",
+                        k.name, k.idx, k.sort, target_var.name, target_var.idx, target_var.sort,
+                        target_var.name, target_var.idx, target_var.sort,
+                        k.name, k.idx, k.sort);
+                }
+                flipped.push((target_var.clone(), Term::Lit(Lit::Var(k))));
+                continue;
+            }
+        }
+        kept.push((k, v));
+    }
+    // Add flipped entries, but only if target isn't already a key
+    // (preserves domain disjointness).
+    let mut existing_keys: std::collections::BTreeSet<tamarin_term::lterm::LVar> =
+        kept.iter().map(|(k, _)| k.clone()).collect();
+    for (k, v) in flipped {
+        if !existing_keys.contains(&k) {
+            existing_keys.insert(k.clone());
+            kept.push((k, v));
+        }
+    }
+    sys.eq_store.subst = tamarin_term::subst::Subst::from_list(kept);
+}
+
 fn restrict_eq_store_to_stable_vars(
     sys: &mut System,
     stable_vars: &std::collections::BTreeSet<tamarin_term::lterm::LVar>,
 ) {
+    // Flip non-stable→stable var-var bindings so the stable var becomes
+    // the key, preserving the binding under the subsequent key-filter.
+    // See doc-comment on `flip_to_stable_keys`.
+    flip_to_stable_keys(sys, stable_vars);
+    // Build a (name, idx) set from stable_vars: under cross-sort unification,
+    // a stable var like `t#1:Msg` can be narrowed to `t#1:Fresh` and
+    // re-appear in the eq_store as a different LVar (Rust's PartialEq
+    // requires sort to match).  Haskell's `restrict` filters by full
+    // LVar identity, but in Haskell the narrowing always produces a
+    // binding `t#1:Msg → seed:Fresh` (Msg as key), so the issue doesn't
+    // arise.  In Rust post-LVar, sort narrowing via apply_lvar_subst
+    // can rebind the eq_store key to `t#1:Fresh`.  Keep both forms by
+    // matching on (name, idx).
     // Haskell's `restrict` in `Theory.Tools.EquationStore`
     // (EquationStore.hs:289 via Term.Substitution.Subst.restrict) is a
     // simple key-filter: `Subst (M.filterWithKey (\k _ -> k `elem` vars) m)`.
@@ -4863,9 +5009,14 @@ fn restrict_eq_store_to_stable_vars(
     // runtime match then binds `e_A_1 = commit(z, r)` cleanly, and any
     // downstream `[sources]`-axiom violation is caught via
     // `FormulasFalse` rather than `refineSubst-contradictory`.
+    let stable_name_idx: std::collections::BTreeSet<(String, u64)> =
+        stable_vars.iter().map(|v| (v.name.clone(), v.idx)).collect();
     let kept: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)>
         = sys.eq_store.subst.to_list().into_iter()
-            .filter(|(v, _)| stable_vars.contains(v))
+            .filter(|(v, _)| {
+                stable_vars.contains(v)
+                    || stable_name_idx.contains(&(v.name.clone(), v.idx))
+            })
             .collect();
     sys.eq_store.subst = tamarin_term::subst::Subst::from_list(kept);
 }

@@ -57,29 +57,76 @@ fn freshen_witness_range(
 ) -> Vec<(LVar, LNTerm)> {
     use tamarin_term::lterm::HasFrees;
     use std::collections::{BTreeMap, BTreeSet};
+    let trace = std::env::var("TAM_DBG_FRESHEN_WITNESS").is_ok();
     let domain: BTreeSet<LVar> = raw.iter().map(|(v, _)| v.clone()).collect();
-    // Collect every range-only-and-not-input variable: that's a witness.
+    // Also track input_vars by (name, idx) for cross-sort collision check.
+    let input_by_name_idx: BTreeSet<(String, u64)> =
+        input_vars.iter().map(|v| (v.name.clone(), v.idx)).collect();
+    // Collect every range-only var that isn't a domain key OR an input.
+    // ALSO catch Maude-introduced witnesses that coincidentally share
+    // (name, idx) with an input var but differ in sort — these are
+    // distinct LVars under full PartialEq, but their name+idx collision
+    // can later cause downstream confusion (e.g. restrict_eq_store_to_stable_vars
+    // dropping a `t#1:Fresh` binding because the stable var is `t#1:Msg`).
+    // Mark them as witnesses too so they get globally-fresh idxs.
     let mut witnesses: BTreeSet<LVar> = BTreeSet::new();
     for (_, t) in &raw {
         t.for_each_free(&mut |w| {
-            if !domain.contains(w) && !input_vars.contains(w) {
-                witnesses.insert(w.clone());
+            if domain.contains(w) { return; }
+            if input_vars.contains(w) { return; }
+            // Sort-blind input collision: rename to be safe.
+            if input_by_name_idx.contains(&(w.name.clone(), w.idx)) {
+                if trace {
+                    eprintln!("[freshen_witness] sort-blind collision: {}#{}({:?}) — flagging as witness",
+                        w.name, w.idx, w.sort);
+                }
             }
+            witnesses.insert(w.clone());
         });
     }
-    if witnesses.is_empty() { return raw; }
+    // Also check domain keys: a Maude unifier may produce a key like
+    // `t#1:Fresh` that coincidentally collides with input `t#1:Msg`.
+    // These keys aren't witnesses per se (they ARE the subst's domain),
+    // but their (name, idx) collision with input vars makes downstream
+    // restrict treat them as separate from the input — losing the
+    // intended sort-narrowing constraint.  Rename to disambiguate.
+    let mut key_renames: BTreeMap<LVar, LVar> = BTreeMap::new();
+    for (k, _) in &raw {
+        if input_vars.contains(k) { continue; }
+        if input_by_name_idx.contains(&(k.name.clone(), k.idx)) {
+            // Coincidental (name, idx) collision with an input var of
+            // DIFFERENT sort.  Rename to avoid confusion.
+            if trace {
+                eprintln!("[freshen_witness] key collision: {}#{}({:?}) — renaming",
+                    k.name, k.idx, k.sort);
+            }
+            key_renames.insert(k.clone(), k.clone());  // placeholder; filled below
+        }
+    }
+    if witnesses.is_empty() && key_renames.is_empty() { return raw; }
     // Push the global counter above `avoid_max` first, then draw
-    // unique indices from it for each witness.
+    // unique indices from it for each witness/key.
     maude.ensure_above(avoid_max);
     let mut renames: BTreeMap<LVar, LVar> = BTreeMap::new();
     for v in witnesses {
         let next = maude.fresh_idx();
         renames.insert(v.clone(), LVar { idx: next, ..v });
     }
-    // Apply the rename across each (var, term).
+    for (k, _) in key_renames.iter() {
+        let next = maude.fresh_idx();
+        renames.insert(k.clone(), LVar { idx: next, ..k.clone() });
+    }
+    if trace && !renames.is_empty() {
+        eprintln!("[freshen_witness] {} renames (witnesses + key collisions)",
+            renames.len());
+    }
+    // Apply the rename across each (var, term).  Keys get renamed too.
     raw.into_iter()
-        .map(|(v, t)| (v, t.map_free(&mut |w|
-            renames.get(&w).cloned().unwrap_or(w))))
+        .map(|(v, t)| {
+            let new_v = renames.get(&v).cloned().unwrap_or(v);
+            let new_t = t.map_free(&mut |w| renames.get(&w).cloned().unwrap_or(w));
+            (new_v, new_t)
+        })
         .collect()
 }
 
