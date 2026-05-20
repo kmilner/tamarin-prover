@@ -255,4 +255,89 @@ mod tests {
         assert!(ku_fact(msg_var("x", 0)).is_klog());
         assert!(!fresh_fact(msg_var("x", 0)).is_klog());
     }
+
+    // =========================================================================
+    // Haskell-faithfulness invariants.
+    //
+    // Fact.hs:128:  `data Multiplicity = Persistent | Linear`
+    // Fact.hs:132:  `data FactTag = ProtoFact ... | FreshFact | OutFact |
+    //                              InFact | KUFact | KDFact | DedFact |
+    //                              TermFact`
+    //
+    // FactTag Ord matters because BTreeSet<LNFact> is used in injective-fact
+    // analysis and rule-conclusion sets.  If the tag order drifts, the
+    // "Proto facts come first" iteration property breaks, which downstream
+    // injective-fact code assumes.
+    // =========================================================================
+
+    /// Multiplicity: `Persistent < Linear` from Fact.hs:128.
+    #[test]
+    fn multiplicity_ord_matches_haskell_declaration() {
+        assert!(Multiplicity::Persistent < Multiplicity::Linear,
+                "Persistent must sort before Linear (Fact.hs:128)");
+    }
+
+    /// `FactTag` Ord — `Proto < Fresh < Out < In < Ku < Kd < Ded < Term`.
+    ///
+    /// Critical: Proto facts MUST sort before all built-in tags so that
+    /// BTreeSet<LNFact> iteration puts protocol facts first.  Multiple
+    /// downstream code paths (simpInjectiveFactEqMon, partial_atom_valuation
+    /// nonUnifiableNodes) iterate fact sets and depend on Proto-first order
+    /// for deterministic case ranking.
+    #[test]
+    fn fact_tag_ord_proto_sorts_before_builtins() {
+        let proto = FactTag::Proto(Multiplicity::Linear, "Foo".into(), 0);
+        let fresh = FactTag::Fresh;
+        assert!(proto < fresh,
+                "Proto must sort before Fresh (Haskell decl order Fact.hs:132)");
+        assert!(fresh < FactTag::Out);
+        assert!(FactTag::Out  < FactTag::In);
+        assert!(FactTag::In   < FactTag::Ku);
+        assert!(FactTag::Ku   < FactTag::Kd);
+        assert!(FactTag::Kd   < FactTag::Ded);
+        assert!(FactTag::Ded  < FactTag::Term);
+    }
+
+    /// `Proto` facts compare by `(multiplicity, name, arity)` triple.
+    /// Specifically: Linear and Persistent same-named facts compare via
+    /// Multiplicity first, then name, then arity.  If we drift, lemmas
+    /// using both `!P(x)` (persistent) and `P(x)` (linear) versions get
+    /// inconsistently bucketed.
+    #[test]
+    fn proto_fact_tag_compare_by_multiplicity_then_name_then_arity() {
+        let lp = FactTag::Proto(Multiplicity::Linear,     "P".into(), 1);
+        let pp = FactTag::Proto(Multiplicity::Persistent, "P".into(), 1);
+        // Persistent < Linear (per Haskell Multiplicity Ord).
+        assert!(pp < lp);
+
+        // Same multiplicity, different name → name breaks tie.
+        let la = FactTag::Proto(Multiplicity::Linear, "A".into(), 1);
+        assert!(la < lp);
+
+        // Same multiplicity+name, different arity → arity breaks tie.
+        let lp2 = FactTag::Proto(Multiplicity::Linear, "P".into(), 2);
+        assert!(lp < lp2);
+    }
+
+    /// `ku` and `kd` predicates are mutually exclusive.
+    /// Used in `enforce_kd_fact_uniqueness` to skip KU facts.
+    #[test]
+    fn ku_and_kd_are_mutually_exclusive() {
+        let ku = ku_fact(msg_var("x", 0));
+        let kd = kd_fact(msg_var("x", 0));
+        assert!(ku.is_ku() && !ku.is_kd());
+        assert!(kd.is_kd() && !kd.is_ku());
+    }
+
+    /// `is_klog` is true for K-facts (KU or KD) and false for Proto/Fresh
+    /// /In/Out/Ded/Term.  Mirrors Haskell `isKLogFact`.
+    #[test]
+    fn is_klog_only_for_ku_or_kd() {
+        let x = msg_var("x", 0);
+        assert!(ku_fact(x.clone()).is_klog());
+        assert!(kd_fact(x.clone()).is_klog());
+        assert!(!fresh_fact(x.clone()).is_klog());
+        let proto = proto_fact(Multiplicity::Linear, "P", vec![x]);
+        assert!(!proto.is_klog());
+    }
 }

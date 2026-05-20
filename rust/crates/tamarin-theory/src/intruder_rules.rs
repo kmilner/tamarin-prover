@@ -448,4 +448,125 @@ mod tests {
             assert_eq!(r.actions.len(), 1);
         }
     }
+
+    // =========================================================================
+    // Haskell-faithfulness invariants for `destruction_rules`.
+    //
+    // Mirrors IntruderRules.hs:129-157.  Two patterns are easy to break
+    // and were broken historically:
+    //
+    //   1. Pattern #1 line 135: at the LAST position step, if the
+    //      current term is an FApp AND rhs has free vars, return [].
+    //      (The "skip-last" — task #164 resolved this.)
+    //
+    //   2. Private-symbol stop (line 149): descending through a Private
+    //      constructor terminates the loop early.
+    // =========================================================================
+
+    /// `destructionRules` for the sym-enc rule `sdec(senc(x, y), y) = x`
+    /// must emit EXACTLY ONE destructor, not two.
+    ///
+    /// The rule has rhs position [0, 0] — two steps.  Without the
+    /// skip-last guard, Rust emits a second (degenerate) destructor at
+    /// the inner step, producing `KD(x) + KU(...) → KD(x)` — a
+    /// self-loop that explodes the chain search on denning_sacco.
+    /// See project_rust_destruction_rules_skip_last.md.
+    #[test]
+    fn destruction_rules_sym_enc_emits_exactly_one_destructor() {
+        let sig = tamarin_term::maude_sig::sym_enc_maude_sig();
+        let rules: Vec<IntrRuleAC> = sig.st_rules.iter()
+            .flat_map(|r| destruction_rules(false, r))
+            .collect();
+        assert_eq!(rules.len(), 1,
+            "sym-enc rule `sdec(senc(x, y), y) = x` must yield EXACTLY ONE \
+             destructor — the skip-last pattern (IntruderRules.hs:135) \
+             elides the inner step.  Got {} rules.  If this regresses, \
+             denning_sacco-class chain explosion will silently reappear \
+             (see project_rust_destruction_rules_skip_last.md).",
+            rules.len());
+        let r = &rules[0];
+        // Premise[0] = KD(senc(x, y)); follow-on premises = KU(y).
+        assert_eq!(r.premises[0].tag, crate::fact::FactTag::Kd);
+        // Inner step was elided, so no `KD(x) KU(x) → KD(x)` self-loop.
+        for p in &r.premises[1..] {
+            assert_eq!(p.tag, crate::fact::FactTag::Ku);
+        }
+    }
+
+    /// `destructionRules` for the asym-enc rule
+    /// `adec(aenc(x, pk(y)), y) = x` likewise emits EXACTLY ONE
+    /// destructor (position [0, 0], rhs free var x).
+    #[test]
+    fn destruction_rules_asym_enc_emits_exactly_one_destructor() {
+        let sig = tamarin_term::maude_sig::asym_enc_maude_sig();
+        let rules: Vec<IntrRuleAC> = sig.st_rules.iter()
+            .flat_map(|r| destruction_rules(false, r))
+            .collect();
+        assert_eq!(rules.len(), 1,
+            "asym-enc rule must yield EXACTLY ONE destructor; got {} rules. \
+             Skip-last pattern was probably regressed.", rules.len());
+    }
+
+    /// `destructionRules` for pair `fst(<x,y>) = x` and `snd(<x,y>) = y`
+    /// each yield EXACTLY ONE destructor.  Pair is a one-step rule
+    /// (position [0]), but skip-last doesn't apply to the FIRST step
+    /// because step_idx == 0 and pos_iter.len() == 1 → step_idx+1 == len,
+    /// and `t` is `pair(x,y)` (FApp) and rhs is a var (free) — so
+    /// skip-last DOES fire.  This means the destructor must be emitted
+    /// at the WRAPPING-step (the outer match arm where we step from
+    /// the destructor's lhs into pair), NOT at the inner step.
+    ///
+    /// (This is subtle and worth pinning explicitly.)
+    #[test]
+    fn destruction_rules_pair_emits_exactly_two_destructors() {
+        let sig = tamarin_term::maude_sig::pair_maude_sig();
+        let rules: Vec<IntrRuleAC> = sig.st_rules.iter()
+            .flat_map(|r| destruction_rules(false, r))
+            .collect();
+        assert_eq!(rules.len(), 2,
+            "pair signature must yield exactly fst + snd destructors \
+             (2 total); got {} rules.  Pair rules are `fst(<x,y>) = x` \
+             and `snd(<x,y>) = y` at position [0] each.", rules.len());
+    }
+
+    /// `destructionRules` short-circuits when the rhs is a closed term
+    /// (no free vars) AND `diff=false` AND rhs has no Private symbol.
+    /// This is the outer guard at IntruderRules.hs:130 — the function
+    /// returns [] before even starting the position walk.
+    ///
+    /// Pin this by constructing a CtxtStRule whose rhs is a public
+    /// constant (no free vars).
+    #[test]
+    fn destruction_rules_returns_empty_for_closed_rhs_in_non_diff_mode() {
+        use tamarin_term::lterm::{LSort, LVar, Name, NameId, NameTag, LNTerm};
+        use tamarin_term::subterm_rule::{CtxtStRule, StRhs};
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+        use tamarin_term::builtin::{pair, senc};
+
+        // Build: lhs = senc(x, pair($a, $b)), rhs = $a (pub const, no frees).
+        // Position [1, 0] — into senc's arg 1 (the pair), then into pair's
+        // arg 0 ($a).
+        let x = LVar::new("x", LSort::Msg, 1);
+        let pub_a = Name { tag: NameTag::Pub, id: NameId::new("a") };
+        let pub_b = Name { tag: NameTag::Pub, id: NameId::new("b") };
+        let pa: LNTerm = Term::Lit(Lit::Con(pub_a.clone()));
+        let pb: LNTerm = Term::Lit(Lit::Con(pub_b));
+        let lhs = senc(Term::Lit(Lit::Var(x)), pair(pa.clone(), pb));
+        let rhs_st = StRhs { positions: vec![vec![1, 0]], term: pa };
+        let rule = CtxtStRule::new(lhs, rhs_st);
+
+        // diff=false, rhs has no free vars, rhs has no private symbol →
+        // outer guard returns [].
+        let out = destruction_rules(false, &rule);
+        assert!(out.is_empty(),
+            "diff=false + closed rhs (no frees, no private) must short-\
+             circuit to empty.  Mirrors IntruderRules.hs:130 outer guard. \
+             Got {} rules.", out.len());
+
+        // BUT in diff mode, the guard is bypassed and we DO descend.
+        let out_diff = destruction_rules(true, &rule);
+        assert!(!out_diff.is_empty(),
+            "diff=true must bypass the closed-rhs guard and emit destructors");
+    }
 }

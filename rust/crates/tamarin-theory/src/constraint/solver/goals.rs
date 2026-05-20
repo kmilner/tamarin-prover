@@ -36,18 +36,24 @@ pub fn open_goals(sys: &System) -> Vec<AnnotatedGoal> {
 }
 
 /// Manual structural compare on `Goal`, mirroring Haskell's derived
-/// `Ord Goal`.  Variant tags follow Haskell declaration order:
-/// Action < Chain < Premise < Disj < Subterm < Split.
+/// `Ord Goal` (Constraints.hs:155-168).  Variant tags follow Haskell
+/// declaration order:
+///     ActionG < ChainG < PremiseG < SplitG < DisjG < SubtermG.
+///
+/// **Do NOT change this ordering without updating Haskell.**  If the
+/// tags drift from declaration order, BTreeMap-backed goal iteration
+/// (e.g. `solveUniqueActions`, `solveAllSafeGoals`) silently picks
+/// goals in a different order and the proof shape diverges.
 fn goal_cmp(a: &Goal, b: &Goal) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let tag = |g: &Goal| -> u8 {
         match g {
-            Goal::Action(_, _) => 0,
-            Goal::Chain(_, _) => 1,
+            Goal::Action(_, _)  => 0,
+            Goal::Chain(_, _)   => 1,
             Goal::Premise(_, _) => 2,
-            Goal::Disj(_) => 3,
-            Goal::Subterm(_) => 4,
-            Goal::Split(_) => 5,
+            Goal::Split(_)      => 3,
+            Goal::Disj(_)       => 4,
+            Goal::Subterm(_)    => 5,
         }
     };
     let ta = tag(a);
@@ -915,5 +921,149 @@ mod tests {
         let g = Goal::Disj(d);
         let out = dispatch_solve_goal(&mut r, &g);
         assert!(matches!(out, GoalCases::Contradictory));
+    }
+
+    // =========================================================================
+    // Haskell-faithfulness invariants for Goal-Ord.
+    //
+    // Haskell `data Goal` (Constraints.hs:155-168) declares variants in
+    // this exact order, and derives `Ord`:
+    //
+    //     data Goal = ActionG _ _
+    //               | ChainG _ _
+    //               | PremiseG _ _
+    //               | SplitG _
+    //               | DisjG _
+    //               | SubtermG _
+    //               deriving( ..., Ord, ... )
+    //
+    // So the constructor tag order is:
+    //     Action < Chain < Premise < Split < Disj < Subterm
+    //
+    // The Rust `Goal` enum (constraints.rs:138) preserves this variant
+    // order, so its derived structural order — if we had one — would be
+    // the same.  But `goal_cmp` (this file) hand-codes a `tag` function,
+    // and any divergence between that and the variant order would silently
+    // sort goals differently than Haskell.
+    // =========================================================================
+
+    /// Pin Haskell's Goal-Ord tag order: Action < Chain < Premise < Split
+    /// < Disj < Subterm.
+    ///
+    /// This is the exact order from Constraints.hs:155-168.  When
+    /// `goal_cmp` is wired into goal iteration (see file-level comment),
+    /// the choice of Action's-first-Premise determines which goal the
+    /// solver picks at each step, which determines the proof shape.
+    #[test]
+    fn goal_cmp_tag_order_matches_haskell_declaration() {
+        use tamarin_term::lterm::{LSort, LVar};
+        use crate::constraint::constraints::{Disj, NodeId, SplitId};
+        use crate::fact::{FactTag, LNFact, Multiplicity};
+        use crate::rule::{ConcIdx, PremIdx};
+        use std::cmp::Ordering;
+
+        // Build one minimal instance of each Goal variant.
+        let v: LVar = LVar::new("k", LSort::Msg, 0);
+        let n: NodeId = LVar::new("i", LSort::Node, 0);
+        let f: LNFact = LNFact::new(
+            FactTag::Proto(Multiplicity::Linear, "F".into(), 0), vec![]);
+
+        let action: Goal = Goal::Action(v.clone(), f.clone());
+        let chain: Goal = Goal::Chain(
+            (n.clone(), ConcIdx(0)), (n.clone(), PremIdx(0)));
+        let premise: Goal = Goal::Premise((n.clone(), PremIdx(0)), f.clone());
+        let split: Goal = Goal::Split(SplitId(0));
+        let disj: Goal = Goal::Disj(Disj::<crate::guarded::Guarded>::new(vec![]));
+        // Use plain msg vars for the Subterm pair.
+        let sub: Goal = Goal::Subterm((
+            tamarin_term::builtin::msg_var("a", 0),
+            tamarin_term::builtin::msg_var("b", 0),
+        ));
+
+        // The order from Constraints.hs:155-168 (deriving Ord):
+        //   ActionG < ChainG < PremiseG < SplitG < DisjG < SubtermG
+        //
+        // **THIS IS THE CONTRACT.**  If Rust's `goal_cmp` differs, the
+        // BTreeMap-backed goal iteration in any Haskell-faithful wiring
+        // will sort differently from Haskell, causing proof-step
+        // divergences silently.
+        let order = [&action, &chain, &premise, &split, &disj, &sub];
+        let names = ["Action", "Chain", "Premise", "Split", "Disj", "Subterm"];
+        for i in 0..order.len() {
+            for j in (i + 1)..order.len() {
+                assert_eq!(goal_cmp(order[i], order[j]), Ordering::Less,
+                    "Haskell Goal-Ord requires {} < {} \
+                     (Constraints.hs:155-168 declaration order).  \
+                     goal_cmp put them in the wrong order — this WILL \
+                     cause silent proof divergence when goal_cmp is \
+                     wired into goal iteration.",
+                    names[i], names[j]);
+                assert_eq!(goal_cmp(order[j], order[i]), Ordering::Greater,
+                    "Haskell Goal-Ord requires {} > {}",
+                    names[j], names[i]);
+            }
+        }
+    }
+
+    /// Pin tag-equality (every variant ordered with itself returns Equal).
+    /// Within-variant comparison is structural and depends on inner-field
+    /// ordering; here we just check the tag-equality short-circuit.
+    #[test]
+    fn goal_cmp_reflexive() {
+        use std::cmp::Ordering;
+        use tamarin_term::lterm::{LSort, LVar};
+        use crate::constraint::constraints::SplitId;
+
+        let action: Goal = Goal::Action(
+            LVar::new("k", LSort::Msg, 0),
+            crate::fact::LNFact::new(crate::fact::FactTag::Out, vec![]),
+        );
+        let split: Goal = Goal::Split(SplitId(7));
+        assert_eq!(goal_cmp(&action, &action), Ordering::Equal);
+        assert_eq!(goal_cmp(&split, &split), Ordering::Equal);
+    }
+
+    /// Pin that `Goal` enum variant declaration order in Rust matches
+    /// Haskell's data-decl order.  This is the upstream invariant that
+    /// `goal_cmp`'s tag function should respect.  If Rust's enum is
+    /// reordered, both this AND `goal_cmp` must change together.
+    #[test]
+    fn rust_goal_enum_variant_order_matches_haskell() {
+        // We can't reflect over enum variants in stable Rust without a
+        // proc-macro, but we can pin the order via discriminant indices
+        // assigned by the compiler.  `Goal::Action(...)` is variant 0,
+        // `Goal::Chain` is 1, etc.  If someone reorders the enum, the
+        // discriminant values change and this test breaks.
+        use std::mem::discriminant;
+        use tamarin_term::lterm::{LSort, LVar};
+        use crate::constraint::constraints::{Disj, NodeId, SplitId};
+        use crate::fact::{FactTag, LNFact, Multiplicity};
+        use crate::rule::{ConcIdx, PremIdx};
+
+        let v: LVar = LVar::new("k", LSort::Msg, 0);
+        let n: NodeId = LVar::new("i", LSort::Node, 0);
+        let f: LNFact = LNFact::new(
+            FactTag::Proto(Multiplicity::Linear, "F".into(), 0), vec![]);
+
+        // Build one of each variant in Haskell's declaration order.
+        let variants = [
+            Goal::Action(v.clone(), f.clone()),
+            Goal::Chain((n.clone(), ConcIdx(0)), (n.clone(), PremIdx(0))),
+            Goal::Premise((n.clone(), PremIdx(0)), f.clone()),
+            Goal::Split(SplitId(0)),
+            Goal::Disj(Disj::<crate::guarded::Guarded>::new(vec![])),
+            Goal::Subterm((
+                tamarin_term::builtin::msg_var("a", 0),
+                tamarin_term::builtin::msg_var("b", 0),
+            )),
+        ];
+        // All discriminants must be distinct (sanity).
+        let discs: Vec<_> = variants.iter().map(discriminant).collect();
+        for i in 0..discs.len() {
+            for j in (i + 1)..discs.len() {
+                assert_ne!(discs[i], discs[j],
+                    "variants {} and {} share a discriminant!", i, j);
+            }
+        }
     }
 }

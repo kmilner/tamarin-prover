@@ -126,4 +126,35 @@ mod tests {
         let f: LNFormula = lftrue().implies(lffalse());
         assert!(matches!(f, ProtoFormula::Conn(Connective::Imp, _, _)));
     }
+
+    // =========================================================================
+    // Haskell-faithfulness invariants for Connective and Quantifier order.
+    //
+    // Formula.hs:104-108: `data Connective = And | Or | Imp | Iff`
+    //                     `data Quantifier = All | Ex`
+    //
+    // These orders matter for any BTreeMap<Connective,_> iteration or
+    // structural comparison.  More importantly, Atom variant order
+    // affects partial_atom_valuation iteration in simplifyGuarded.
+    // =========================================================================
+
+    /// `Connective` Ord — `And < Or < Imp < Iff` from Formula.hs:104.
+    #[test]
+    fn connective_ord_matches_haskell_declaration() {
+        assert!(Connective::And < Connective::Or);
+        assert!(Connective::Or  < Connective::Imp);
+        assert!(Connective::Imp < Connective::Iff);
+    }
+
+    /// `Quantifier` Ord — `All < Ex` from Formula.hs:108.
+    ///
+    /// This is the order that downstream `partial_atom_valuation`
+    /// and `simplify_guarded` use to decompose quantified formulas.
+    /// If Ex sorted before All, the simplifier would visit existentials
+    /// first and miss universal-driven contradictions.
+    #[test]
+    fn quantifier_ord_matches_haskell_declaration() {
+        assert!(Quantifier::All < Quantifier::Ex,
+                "All MUST sort before Ex (Formula.hs:108)");
+    }
 }

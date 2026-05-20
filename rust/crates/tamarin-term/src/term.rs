@@ -300,4 +300,100 @@ mod tests {
             _ => panic!(),
         }
     }
+
+    // =========================================================================
+    // Haskell-faithfulness invariants for AC/C/NoEq term constructors.
+    // =========================================================================
+
+    /// AC terms with the same multiset are *equal* mod-AC: `+(a, b)` and
+    /// `+(b, a)` get sorted to the same canonical form, so structural
+    /// equality holds.  Haskell-faithful: AC canonicalization happens at
+    /// construction time (`fAppAC` in Term/Term/Raw.hs).
+    #[test]
+    fn ac_terms_are_equal_modulo_argument_order() {
+        let t1 = f_app_ac(AcSym::Mult, vec![nat(7), nat(2), nat(5)]);
+        let t2 = f_app_ac(AcSym::Mult, vec![nat(5), nat(7), nat(2)]);
+        let t3 = f_app_ac(AcSym::Mult, vec![nat(2), nat(5), nat(7)]);
+        assert_eq!(t1, t2,
+            "AC terms with same multiset of args must compare equal — \
+             smart constructor canonicalizes order");
+        assert_eq!(t1, t3);
+    }
+
+    /// AC vs C distinction: C terms ARE sorted but NOT flattened.  NoEq
+    /// terms preserve argument order.
+    #[test]
+    fn ac_flattens_but_c_does_not() {
+        // AC: mult(mult(1,2), 3) → mult(1,2,3) — flat.
+        let nested_ac = f_app_ac(AcSym::Mult, vec![
+            f_app_ac(AcSym::Mult, vec![nat(1), nat(2)]),
+            nat(3),
+        ]);
+        match &nested_ac {
+            Term::App(FunSym::Ac(AcSym::Mult), ts) => {
+                assert_eq!(ts.len(), 3, "AC must flatten nested same-sym");
+            }
+            _ => panic!(),
+        }
+        // C is non-associative; nested EMap doesn't flatten.
+        let nested_c = f_app_c(CSym::EMap, vec![
+            f_app_c(CSym::EMap, vec![nat(1), nat(2)]),
+            nat(3),
+        ]);
+        match &nested_c {
+            Term::App(FunSym::C(CSym::EMap), ts) => {
+                assert_eq!(ts.len(), 2, "C must NOT flatten — non-associative");
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// `f_app_ac` panics on empty argument list — matching Haskell's
+    /// `fAppAC` which is undefined on []. Empty AC terms are nonsensical
+    /// (there's no identity element at the term layer).
+    #[test]
+    #[should_panic(expected = "empty argument list")]
+    fn ac_panics_on_empty_args() {
+        let _: Term<u64> = f_app_ac(AcSym::Mult, vec![]);
+    }
+
+    /// Lit::Con < Lit::Var: constants sort before variables.
+    /// VTerm.hs:56: `data Lit c v = Con c | Var v`.
+    ///
+    /// This matters for `f_app_ac`/`f_app_c` argument sorting: if a
+    /// term mixes constants and variables, constants always sort first.
+    /// Downstream code in atom_valuation expects constants in fixed
+    /// positions when matching.
+    #[test]
+    fn lit_con_sorts_before_lit_var() {
+        use crate::lterm::{LNTerm, LVar, LSort, Name, NameTag, NameId};
+        use crate::vterm::Lit;
+
+        // Variant tags: Con=0, Var=1 in Haskell decl order.
+        let pub_a = Name { tag: NameTag::Pub, id: NameId::new("a") };
+        let v_x = LVar::new("x", LSort::Msg, 0);
+        let con: LNTerm = Term::Lit(Lit::Con(pub_a));
+        let var: LNTerm = Term::Lit(Lit::Var(v_x));
+        assert!(con < var,
+                "Lit::Con must sort before Lit::Var (Haskell decl order). \
+                 AC term canonicalization relies on this — `+(x, 'a')` \
+                 canonicalizes to `+('a', x)`.");
+    }
+
+    /// `BVar::Bound < BVar::Free` from LTerm.hs:451-453 declaration order.
+    /// `data BVar v = Bound Integer | Free v`
+    ///
+    /// This drives the BTreeMap key order for guarded-formula
+    /// binders/bound-var lookup — when we de Bruijn-index a formula's
+    /// quantified variables, the bound positions sort before any free
+    /// occurrences.
+    #[test]
+    fn bvar_bound_sorts_before_bvar_free() {
+        use crate::lterm::{BVar, LVar, LSort};
+        let bound: BVar<LVar> = BVar::Bound(5);
+        let free: BVar<LVar> = BVar::Free(LVar::new("x", LSort::Msg, 0));
+        assert!(bound < free,
+                "BVar::Bound must sort before BVar::Free \
+                 (Haskell LTerm.hs:451 declaration order)");
+    }
 }
