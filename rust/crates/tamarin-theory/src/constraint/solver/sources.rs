@@ -5830,22 +5830,22 @@ pub fn remove_redundant_cases<T: Clone>(cases: Vec<T>) -> Vec<T> { cases }
 /// the saturated case is stored — so Haskell's saturate-output cases
 /// have the variant-narrowed form (e.g.
 /// `In(aenc(<'1', <$A, ~k>>, pk(~ltkS)))` where `~k:Fresh`), no
-/// surviving SplitG, and downstream chains see Fresh-typed t_start at
-/// destructor outputs (essential for `hasImpossibleChain`'s
-/// `pcTrueSubterm` rootSym dispatch — see `Contradictions.hs:258`).
+/// surviving SplitG, and downstream choices see the variant-narrowed
+/// terms.
 ///
-/// Without this, Rust's saturate stores the canonical (Msg-typed)
-/// form with an unresolved variant SplitG.  The destructor chain's
-/// t_start is `x_0:Msg` instead of `~k:Fresh`, so `possibleRootSyms`
-/// returns `Nothing` (rootSym of Lit Msg returns Nothing) and
-/// impossible-chain never fires — JCS12::typing_assertion shows
-/// `solve` where Haskell shows `by contradiction /* impossible chain */`.
+/// Variant narrowing matters for any case with downstream goal-ranking
+/// choices:
+///   - open Chain → destructor chains see Fresh-typed t_start at
+///     destructor outputs (essential for `hasImpossibleChain`'s
+///     `pcTrueSubterm` rootSym dispatch — Contradictions.hs:258).
+///     Without this, t_start is `x_0:Msg` and `possibleRootSyms`
+///     returns `Nothing`; JCS12::typing_assertion shows `solve`
+///     where Haskell shows `by contradiction /* impossible chain */`.
+///   - open KU action → variant subst changes the picked constructor
+///     source at runtime (StatVerif Resolve1: pcsig2 narrowed to
+///     pcs(...) flips c_pcs → c_sign).
 ///
-/// Gates:
-///   - Only fires when the case has an open Chain goal — variant
-///     narrowing matters when a destructor chain follows the protocol
-///     rule.  Chain-free cases (NSLPK3 R_1) don't benefit; fanout would
-///     just add redundant arms that destabilise goal-ranking.
+/// Constraints:
 ///   - Variant SplitG must be ≤ SMALL (=6).  Larger SplitGs stay as
 ///     runtime goals (smartRanking only ranks small SplitGs).
 ///   - Canonical-system dedup collapses redundant arms.
@@ -5862,12 +5862,13 @@ fn saturate_fanout_variant_splits(
     use crate::constraint::solver::reduction::{Reduction, GoalCases};
     use crate::constraint::constraints::Goal;
     const SMALL: usize = 6;
-    // Gate: open chain required (see fn doc).
-    let has_open_chain = sys.goals.iter().any(|(g, st)| {
-        if st.solved || st.looping { return false; }
-        matches!(g, Goal::Chain(_, _))
-    });
-    if !has_open_chain { return None; }
+    // No saturate-time gate: Haskell's `someRuleACInst` always fans out
+    // variants via `solveDisjunction` over `RuleACConstrs`. Variant
+    // narrowing matters for any case with downstream goal-ranking choices —
+    //   - open Chain → `pcTrueSubterm` rootSym dispatch (JCS12);
+    //   - open KU action → constructor-source selection (StatVerif:
+    //     pcsig2 narrowed to pcs(...) changes c_pcs → c_sign at runtime).
+    // Canonical-system dedup collapses redundant arms.
     let small_split: Option<crate::tools::equation_store::SplitId> =
         sys.goals.iter().find_map(|(g, st)| {
             if st.solved || st.looping { return None; }
