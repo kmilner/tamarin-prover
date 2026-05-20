@@ -303,9 +303,12 @@ fn intr_rule_name(info: &IntrRuleACInfo) -> String {
         IntrRuleACInfo::Coerce => "coerce".to_string(),
         IntrRuleACInfo::IRecv => "irecv".to_string(),
         IntrRuleACInfo::ISend => "isend".to_string(),
-        IntrRuleACInfo::PubConstr => "c_pub".to_string(),
-        IntrRuleACInfo::NatConstr => "c_nat".to_string(),
-        IntrRuleACInfo::FreshConstr => "c_fresh".to_string(),
+        // Built-in constructor rules render without the `c_` prefix —
+        // Haskell `prettyIntrRuleACInfo` (Rule.hs:1229) emits "pub",
+        // "nat", "fresh"; the `c` prefix is for named user constructors.
+        IntrRuleACInfo::PubConstr => "pub".to_string(),
+        IntrRuleACInfo::NatConstr => "nat".to_string(),
+        IntrRuleACInfo::FreshConstr => "fresh".to_string(),
         IntrRuleACInfo::IEquality => "iequality".to_string(),
     }
 }
