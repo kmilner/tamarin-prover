@@ -59,66 +59,37 @@ fn freshen_witness_range(
     use std::collections::{BTreeMap, BTreeSet};
     let trace = std::env::var("TAM_DBG_FRESHEN_WITNESS").is_ok();
     let domain: BTreeSet<LVar> = raw.iter().map(|(v, _)| v.clone()).collect();
-    // Also track input_vars by (name, idx) for cross-sort collision check.
-    let input_by_name_idx: BTreeSet<(String, u64)> =
-        input_vars.iter().map(|v| (v.name.clone(), v.idx)).collect();
     // Collect every range-only var that isn't a domain key OR an input.
-    // ALSO catch Maude-introduced witnesses that coincidentally share
-    // (name, idx) with an input var but differ in sort — these are
-    // distinct LVars under full PartialEq, but their name+idx collision
-    // can later cause downstream confusion (e.g. restrict_eq_store_to_stable_vars
-    // dropping a `t#1:Fresh` binding because the stable var is `t#1:Msg`).
-    // Mark them as witnesses too so they get globally-fresh idxs.
+    // Mirrors Haskell-faithful witness detection: any var introduced by
+    // the Maude unifier that doesn't trace back to the input/output
+    // variable sets is a fresh witness that needs globally-unique idx.
+    //
+    // Earlier versions ALSO renamed domain keys whose (name, idx)
+    // coincidentally collided with input vars across different sorts,
+    // as a workaround for the now-removed sort-blind restrict matching
+    // (see commit 1e16e77f).  With full LVar equality everywhere
+    // downstream, those cross-sort collisions are no longer harmful —
+    // `t#1:Msg` and `t#1:Fresh` are correctly distinct LVars and the
+    // rename was unnecessary.  Removed for Haskell parity.
     let mut witnesses: BTreeSet<LVar> = BTreeSet::new();
     for (_, t) in &raw {
         t.for_each_free(&mut |w| {
             if domain.contains(w) { return; }
             if input_vars.contains(w) { return; }
-            // Sort-blind input collision: rename to be safe.
-            if input_by_name_idx.contains(&(w.name.clone(), w.idx)) {
-                if trace {
-                    eprintln!("[freshen_witness] sort-blind collision: {}#{}({:?}) — flagging as witness",
-                        w.name, w.idx, w.sort);
-                }
-            }
             witnesses.insert(w.clone());
         });
     }
-    // Also check domain keys: a Maude unifier may produce a key like
-    // `t#1:Fresh` that coincidentally collides with input `t#1:Msg`.
-    // These keys aren't witnesses per se (they ARE the subst's domain),
-    // but their (name, idx) collision with input vars makes downstream
-    // restrict treat them as separate from the input — losing the
-    // intended sort-narrowing constraint.  Rename to disambiguate.
-    let mut key_renames: BTreeMap<LVar, LVar> = BTreeMap::new();
-    for (k, _) in &raw {
-        if input_vars.contains(k) { continue; }
-        if input_by_name_idx.contains(&(k.name.clone(), k.idx)) {
-            // Coincidental (name, idx) collision with an input var of
-            // DIFFERENT sort.  Rename to avoid confusion.
-            if trace {
-                eprintln!("[freshen_witness] key collision: {}#{}({:?}) — renaming",
-                    k.name, k.idx, k.sort);
-            }
-            key_renames.insert(k.clone(), k.clone());  // placeholder; filled below
-        }
-    }
-    if witnesses.is_empty() && key_renames.is_empty() { return raw; }
+    if witnesses.is_empty() { return raw; }
     // Push the global counter above `avoid_max` first, then draw
-    // unique indices from it for each witness/key.
+    // unique indices from it for each witness.
     maude.ensure_above(avoid_max);
     let mut renames: BTreeMap<LVar, LVar> = BTreeMap::new();
     for v in witnesses {
         let next = maude.fresh_idx();
         renames.insert(v.clone(), LVar { idx: next, ..v });
     }
-    for (k, _) in key_renames.iter() {
-        let next = maude.fresh_idx();
-        renames.insert(k.clone(), LVar { idx: next, ..k.clone() });
-    }
     if trace && !renames.is_empty() {
-        eprintln!("[freshen_witness] {} renames (witnesses + key collisions)",
-            renames.len());
+        eprintln!("[freshen_witness] {} witness renames", renames.len());
     }
     // Apply the rename across each (var, term).  Keys get renamed too.
     raw.into_iter()
