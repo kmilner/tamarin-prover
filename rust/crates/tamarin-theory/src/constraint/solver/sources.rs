@@ -2170,11 +2170,10 @@ fn saturate_out_premise(
         // 1-based suffixes).
         //
         // Haskell-faithful: NO canonical-form dedup here.  Haskell's
-        // `saturateSources` has only ONE dedup site: `removeRedundantCases`
-        // at `refineSource` (Sources.hs:123), and that's gated on BP/MSet
-        // (line 240).  Closures that look structurally identical
-        // post-restrict must be preserved so the runtime renderer's
-        // `distinguish` can give them `_case_N` suffixes.
+        // `Disj` (Logic.Connectives) is `newtype Disj a = Disj { getDisj :: [a] }`,
+        // a plain LIST — Eq-equal branches are preserved.  Multiple
+        // entries with the same `(names, system)` would coexist.  So
+        // dedupping here would diverge from Haskell.
         let mut this_sub: Vec<System> = Vec::new();
         let dbg_drop = std::env::var("TAM_DBG_DROP_CASE").is_ok();
         let mut idx = 0;
