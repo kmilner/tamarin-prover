@@ -44,7 +44,7 @@ pub fn open_goals(sys: &System) -> Vec<AnnotatedGoal> {
 /// tags drift from declaration order, BTreeMap-backed goal iteration
 /// (e.g. `solveUniqueActions`, `solveAllSafeGoals`) silently picks
 /// goals in a different order and the proof shape diverges.
-fn goal_cmp(a: &Goal, b: &Goal) -> std::cmp::Ordering {
+pub(crate) fn goal_cmp(a: &Goal, b: &Goal) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let tag = |g: &Goal| -> u8 {
         match g {

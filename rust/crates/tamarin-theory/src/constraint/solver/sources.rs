@@ -3170,11 +3170,19 @@ fn solve_all_safe_goals_tracked(
         // `splitAllowed` correctly flips True when only auto-handled
         // chains remain — letting DisjG/SplitG/SubtermG count as
         // "safe" goals for saturate's case-split step.
-        let goals: Vec<(Goal, bool /* looping */)> = red.sys.goals.iter()
+        //
+        // Haskell-faithful Goal-Ord (Goals.hs:69 `M.toList sGoals`):
+        // sort by `goal_cmp` to match Haskell's BTreeMap iteration
+        // order (ActionG < ChainG < PremiseG < SplitG < DisjG <
+        // SubtermG).  Without this, our insertion-order iteration
+        // picks a different goal than Haskell at the first
+        // `headMay safeGoals` step, causing proof-shape divergence.
+        let mut goals: Vec<(Goal, bool /* looping */)> = red.sys.goals.iter()
             .filter(|(_, st)| !st.solved && !st.looping)
             .filter(|(g, _)| crate::constraint::solver::goals::is_open_for_saturate(g, &red.sys))
             .map(|(g, st)| (g.clone(), st.looping))
             .collect();
+        goals.sort_by(|a, b| crate::constraint::solver::goals::goal_cmp(&a.0, &b.0));
         // UNFILTERED chains view — mirrors Haskell's `unsolvedChains`
         // (NOT `openGoals`).  Together with the filtered `goals`,
         // `splitAllowed` flips True when there are chains present but
@@ -3566,11 +3574,14 @@ fn run_solve_all_safe_goals_disj(
         // ChainG so `split_allowed` correctly flips True when only
         // auto-handled chains remain.  See `is_open_for_saturate` in
         // goals.rs for the rationale.
-        let goals: Vec<(Goal, bool)> = red.sys.goals.iter()
+        //
+        // Haskell-faithful Goal-Ord (Goals.hs:69 `M.toList sGoals`).
+        let mut goals: Vec<(Goal, bool)> = red.sys.goals.iter()
             .filter(|(_, st)| !st.solved && !st.looping)
             .filter(|(g, _)| crate::constraint::solver::goals::is_open_for_saturate(g, &red.sys))
             .map(|(g, st)| (g.clone(), st.looping))
             .collect();
+        goals.sort_by(|a, b| crate::constraint::solver::goals::goal_cmp(&a.0, &b.0));
         // Unfiltered chains view — Haskell's `unsolvedChains`.
         let any_unsolved_chain = red.sys.goals.iter().any(|(g, st)|
             !st.solved && matches!(g, Goal::Chain(_, _)));
