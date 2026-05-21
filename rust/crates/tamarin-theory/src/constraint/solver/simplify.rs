@@ -637,17 +637,20 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     // bound vars have all been substituted away).  Previously we filtered
     // `!vars.is_empty()` which excluded them entirely — a deviation from
     // Haskell that left implications unfired.
-    // Task #157 provenance V1: at runtime (NOT in_precompute_mode),
-    // optionally skip universals from `[sources]`-tagged lemma bodies.
-    // Haskell only adds `[reuse]` to sLemmas (gatherReusableLemmas in
-    // Prover.hs:331), so its runtime `insertImpliedFormulas` never
-    // fires `[sources]`.  Refine fires them at precompute (drives
-    // typing-violation drops).  Default OFF because NSPK3 attack and
-    // typing-class lemmas rely on the runtime firing as a workaround
-    // for our weaker refine; skip enabled → search times out on those.
-    // Opt-in via TAM_PROVENANCE_SKIP_SOURCES=1 for Haskell-faithful
-    // runtime behaviour (requires stronger refine to compensate).
-    let skip_sources = std::env::var("TAM_PROVENANCE_SKIP_SOURCES").is_ok()
+    // Haskell-faithful: at runtime (NOT in_precompute_mode), SKIP
+    // universals from `[sources]`-tagged lemma bodies.  Haskell only
+    // adds `[reuse]` to sLemmas (gatherReusableLemmas in Prover.hs:331),
+    // so its runtime `insertImpliedFormulas` never fires `[sources]`.
+    // Refine fires them at precompute (drives typing-violation drops).
+    //
+    // Was previously default-OFF (workaround for our weaker refine);
+    // any NSPK3 / typing-class lemma that timed out without it was
+    // masking a refine-strength bug that needs to be fixed at refine,
+    // not papered over by runtime [sources] firings.
+    //
+    // TAM_PROVENANCE_SKIP_SOURCES_OFF=1 reverts to the old workaround
+    // for diagnostic comparison.
+    let skip_sources = !std::env::var("TAM_PROVENANCE_SKIP_SOURCES_OFF").is_ok()
         && !crate::constraint::solver::sources::in_precompute_mode()
         && !red.sys.sources_lemma_universals.is_empty();
     let universals: Vec<(Guarded, Vec<tamarin_parser::ast::VarSpec>,
