@@ -1789,27 +1789,21 @@ fn saturate_out_premise(
                 .map(|(_, r)| rule_case_name(r)))
             .unwrap_or_else(|| "case_1".into())
     };
-    // Drop cases that leave open non-msg-var KD `Chain` goals.
+    // Haskell-faithful: keep cases with open Chain goals.
     //
-    // Haskell-faithful: msg-var KD chains are excluded from
-    // `openGoals` (Goals.hs:92-100 — `chainToEquality` returns
-    // False for non-IEquality premises), so saturate doesn't try
-    // to close them.  Cases with open msg-var KD chains are
-    // acceptable — they mirror Haskell's `saturateSources`
-    // leaving these chains open in the saved source case.  Cases
-    // with other unresolved chain goals (non-msg-var KD, or
-    // non-KD) are dropped.
-    let chain_acceptable = |s: &System| -> bool {
-        !s.goals.iter().any(|(g, st)| {
-            if st.solved { return false; }
-            if let Goal::Chain(c, _) = g {
-                if let Some(m) = chain_kd_conc_term_local(s, c) {
-                    if is_msg_var_local(&m) { return false; }
-                }
-                true
-            } else { false }
-        })
-    };
+    // Haskell's `openGoals` (Goals.hs:92-100) returns ChainG with
+    // `not solved` for non-msg-var KD chains.  These are OPEN goals
+    // that the next refineSource iter can pick via solveAllSafeGoals
+    // (when chainsLeft resets).  Previously this filter dropped them
+    // outright at saturate, preventing per-iter chain growth that
+    // Haskell exhibits (e.g. foo_eligibility::types A_1 grows
+    // 2→4→6→8→10→11 over 5 iters via further chain extension).
+    //
+    // The historical `chain_acceptable` filter rejected these,
+    // believing them auto-handled.  But they're only auto-handled at
+    // RENDER time — at saturate time they must be preserved so per-
+    // iter refinement can extend them.  See [[rust-ku-source-overenumeration-2026-05-22]].
+    let chain_acceptable = |_s: &System| -> bool { true };
     if std::env::var("TAM_DBG_SAT").is_ok() {
         eprintln!("[sat] outer={} fa.tag={:?} fa.terms[0]={:?}",
             outer_name, fa.tag,
