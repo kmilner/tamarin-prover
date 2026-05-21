@@ -503,14 +503,25 @@ fn is_open_in_sys(g: &Goal, sys: &System) -> bool {
         // Haskell parity (Goals.hs:92-100):
         //   ChainG c p →
         //     case kFactView (nodeConcFact c sys) of
-        //       Just (DnK, FUnion ...) → ... allMsgVarsKnownEarlier ...
+        //       Just (DnK, FUnion args) → not solved && not (allMsgVarsKnownEarlier c args)
         //       Just (DnK, m) | isMsgVar m → chainToEquality m c p
         //                     | otherwise  → True
         //       _ → True
-        Goal::Chain(c, p) => {
+        Goal::Chain(c, _p) => {
             if let Some(m) = chain_kd_conc_term(sys, c) {
+                // FUnion arm: KD chain over a multiset union — auto-closed
+                // when all union args are msg-vars known via earlier KU action
+                // (Haskell Goals.hs:95-97 + 163-167).  Without this Rust
+                // treats these as open and explores extension paths Haskell
+                // skips.
+                if let Some(args) = union_args(&m) {
+                    if all_msg_vars_known_earlier(c, &args, sys) {
+                        return false;
+                    }
+                    return true;
+                }
                 if is_msg_var(&m) {
-                    return chain_to_equality(&m, c, p, sys);
+                    return chain_to_equality(&m, c, _p, sys);
                 }
             }
             true
@@ -539,6 +550,41 @@ fn is_msg_var(t: &tamarin_term::lterm::LNTerm) -> bool {
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
     matches!(t, Term::Lit(Lit::Var(v)) if v.sort == LSort::Msg)
+}
+
+/// Extract args if the term is a multiset-union (`FUnion`) — Haskell's
+/// `viewTerm2 → FUnion args`.  Returns None for any other term shape.
+fn union_args(t: &tamarin_term::lterm::LNTerm) -> Option<Vec<tamarin_term::lterm::LNTerm>> {
+    use tamarin_term::function_symbols::{FunSym, UNION_SYM_STRING};
+    use tamarin_term::term::Term;
+    match t {
+        Term::App(FunSym::NoEq(s), args) if s.name == UNION_SYM_STRING =>
+            Some(args.clone()),
+        _ => None,
+    }
+}
+
+/// `allMsgVarsKnownEarlier` (Haskell Goals.hs:163-167): all `args` are
+/// msg-vars AND each appears as the term of a KU action at some node
+/// always-before `c.0` (the chain's source node).  When this holds for
+/// an FUnion ChainG conclusion, the chain is auto-handled (Goals.hs:95-97).
+fn all_msg_vars_known_earlier(
+    c: &crate::constraint::constraints::NodeConc,
+    args: &[tamarin_term::lterm::LNTerm],
+    sys: &System,
+) -> bool {
+    if !args.iter().all(is_msg_var) { return false; }
+    let i = &c.0;
+    args.iter().all(|arg| {
+        sys.nodes.iter().any(|(j, rule)| {
+            j != i
+                && sys.always_before(j, i)
+                && rule.actions.iter().any(|fa| {
+                    matches!(fa.tag, crate::fact::FactTag::Ku)
+                        && fa.terms.first() == Some(arg)
+                })
+        })
+    })
 }
 
 /// `isNullaryPublicFunction`: 0-arity public function symbols.
