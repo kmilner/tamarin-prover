@@ -793,14 +793,6 @@ impl<'ctx> Reduction<'ctx> {
         if self.sys.goals.len() != before { self.changed = ChangeIndicator::Changed; }
     }
 
-    /// Add an open formula obligation.
-    pub fn insert_formula(&mut self, f: Guarded) {
-        if !self.sys.formulas.contains(&f) {
-            self.sys.formulas.push(f);
-            self.changed = ChangeIndicator::Changed;
-        }
-    }
-
     /// Compute a fresh-var baseline — the max idx across:
     ///   - all vars in nodes' rules
     ///   - all vars in stored & solved formulas
@@ -957,18 +949,18 @@ impl<'ctx> Reduction<'ctx> {
     /// - `Disj`         → store + insert `Goal::Disj` (defer split)
     /// - `Atom`         → no-op (would need parser-atom→LNAtom bridge)
     /// - `Ex` / `All`   → store as-is for now (need fresh supply for ∃)
-    pub fn insert_formula_decompose(&mut self, g: Guarded) {
-        self.insert_formula_decompose_inner(g, true);
+    pub fn insert_formula(&mut self, g: Guarded) {
+        self.insert_formula_inner(g, true);
     }
 
-    fn insert_formula_decompose_inner(&mut self, g: Guarded, mark: bool) {
+    fn insert_formula_inner(&mut self, g: Guarded, mark: bool) {
         if self.sys.formulas.contains(&g) || self.sys.solved_formulas.contains(&g) {
             return;
         }
         match g.clone() {
             Guarded::Conj(items) => {
                 if mark { self.sys.solved_formulas.push(g); }
-                for it in items { self.insert_formula_decompose_inner(it, false); }
+                for it in items { self.insert_formula_inner(it, false); }
                 self.changed = ChangeIndicator::Changed;
             }
             Guarded::Disj(items) if items.is_empty() => {
@@ -1050,7 +1042,7 @@ impl<'ctx> Reduction<'ctx> {
                     .collect();
                 items.push(crate::guarded::subst_guarded(&body, &subst));
                 let new_body = crate::guarded::gconj(items);
-                self.insert_formula_decompose_inner(new_body, false);
+                self.insert_formula_inner(new_body, false);
                 self.changed = ChangeIndicator::Changed;
             }
             Guarded::GGuarded { qua: crate::guarded::Quant::All, ref vars, ref guards, ref body }
@@ -1093,7 +1085,7 @@ impl<'ctx> Reduction<'ctx> {
                             crate::guarded::Guarded::Atom(AAtom::Eq(i.clone(), j.clone())),
                             crate::guarded::Guarded::Atom(AAtom::Less(j.clone(), i.clone())),
                         ]);
-                        self.insert_formula_decompose_inner(d, false);
+                        self.insert_formula_inner(d, false);
                         self.changed = ChangeIndicator::Changed;
                     }
                     AAtom::Less(_, _) => {
@@ -1115,7 +1107,7 @@ impl<'ctx> Reduction<'ctx> {
                             crate::guarded::Guarded::Atom(AAtom::Less(i.clone(), j.clone())),
                             crate::guarded::Guarded::Atom(AAtom::Less(j.clone(), i.clone())),
                         ]);
-                        self.insert_formula_decompose_inner(d, false);
+                        self.insert_formula_inner(d, false);
                         self.changed = ChangeIndicator::Changed;
                     }
                     AAtom::Last(i) => {
@@ -1161,7 +1153,7 @@ impl<'ctx> Reduction<'ctx> {
                             crate::guarded::Guarded::Atom(AAtom::Less(last_term.clone(), i.clone())),
                             crate::guarded::Guarded::Atom(AAtom::Less(i.clone(), last_term)),
                         ]);
-                        self.insert_formula_decompose_inner(d, false);
+                        self.insert_formula_inner(d, false);
                         self.changed = ChangeIndicator::Changed;
                     }
                     AAtom::Subterm(s, b) => {
@@ -1685,7 +1677,19 @@ impl<'ctx> Reduction<'ctx> {
                 }
             }
         }
-        // 7. insertFormula.
+        // 7. insertFormula.  Haskell-faithful: `insertFormula` in
+        // `conjoinSystem` (Reduction.hs:673) DECOMPOSES guarded formulas
+        // via the full CR-rule dispatch (Reduction.hs:425-490) — GAto →
+        // insertAtom, GConj → recurse on conjuncts, GDisj → insertGoal
+        // DisjG, GGuarded Ex → freshen + substBound, GGuarded All []
+        // [Less|Subterm|EqE|Last] gf | gf==gfalse → markAsSolved +
+        // negative-atom decomposition.  Without this dispatch, a
+        // grafted case's `GGuarded All [] [Less i j] gfalse` formula
+        // (the canonical encoding of `¬(i<j)`) stays raw in
+        // `sys.formulas` instead of becoming the disjunction
+        // `EqE i j ∨ Less j i`, so downstream FormulasFalse /
+        // cyclic-LessAtom checks miss the contradiction even though
+        // the algebra is already incompatible.
         for f in &sys.formulas {
             self.insert_formula(f.clone());
         }
@@ -2578,7 +2582,7 @@ impl<'ctx> Reduction<'ctx> {
                 // own sub-goals (Haskell `insertFormula`).  Raw-pushing
                 // leaks Disj/Ex bodies past is_finished (see the
                 // companion fix in `insert_implied_formulas_pass`).
-                self.insert_formula_decompose(alts[0].clone());
+                self.insert_formula(alts[0].clone());
                 GoalCases::Linear
             }
             _ => {
@@ -2594,7 +2598,7 @@ impl<'ctx> Reduction<'ctx> {
                     // Decompose the chosen alternative — see comment in
                     // singleton branch.  Mirrors Haskell `solveDisjunction`
                     // → `insertFormula alt`.
-                    sub.insert_formula_decompose(gfm.clone());
+                    sub.insert_formula(gfm.clone());
                     cases.push((default_case_name(i), sub.sys));
                 }
                 self.changed = ChangeIndicator::Changed;
@@ -4143,14 +4147,14 @@ mod tests {
         let ctx = match ctx() { Some(c) => c, None => return };
         let mut r = Reduction::new(&ctx, System::empty());
         // Use gtrue() = Conj([]): it gets decomposed into solved_formulas
-        // by insert_formula_decompose (not raw-pushed to formulas).
+        // by insert_formula (not raw-pushed to formulas).
         let f = crate::guarded::gtrue();
         let d = Disj(vec![f.clone()]);
         r.insert_goal(Goal::Disj(d.clone()));
         let out = r.solve_disj_goal(&d);
         assert!(matches!(out, GoalCases::Linear));
         // gtrue (Conj []) decomposes to solved_formulas — see
-        // insert_formula_decompose_inner for the Conj arm.
+        // insert_formula_inner for the Conj arm.
         assert!(r.sys.solved_formulas.contains(&f));
         assert!(r.sys.goals.iter().any(|(g, s)| matches!(g, Goal::Disj(_)) && s.solved));
     }

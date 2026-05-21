@@ -533,7 +533,7 @@ mod tests {
             crate::constraint::constraints::Reason::Fresh,
         ));
         // An empty disjunction comes hand-in-hand with `gfalse` in the
-        // formula set (insert_formula_decompose pushes both).  That's
+        // formula set (insert_formula pushes both).  That's
         // also how Haskell signals contradictoryness — `openGoals`
         // filters `DisjG (Disj [])` and `FormulasFalse` fires from
         // `contradictions`.  We mirror exactly that here.

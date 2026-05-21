@@ -610,7 +610,7 @@ pub fn normalize_witness_lvars(g: &Guarded) -> Guarded {
 /// paths (lemma re-instantiation, ginduct on the IH) may retain
 /// `Untagged` or suffix-style hints.  Without normalisation, two
 /// semantically-identical formulas compare unequal and the dedupe in
-/// `insert_formula_decompose` / `insert_implied_formulas_pass` lets
+/// `insert_formula` / `insert_implied_formulas_pass` lets
 /// duplicates accumulate.
 ///
 /// Concretely: `RFID_Simple::Device_Init_Use_Set` was generating

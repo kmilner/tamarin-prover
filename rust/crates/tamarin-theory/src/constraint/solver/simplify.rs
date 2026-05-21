@@ -323,7 +323,7 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
         //
         // Critical: when the simplified formula was a `GDisj`, the
         // corresponding `Goal::Disj` (registered when this formula was
-        // first decomposed via `insert_formula_decompose`) MUST be
+        // first decomposed via `insert_formula`) MUST be
         // marked solved. Otherwise the goal stays open and the goal
         // ranker picks it (typically a Disj-goal ranks BEFORE Premise
         // by `solveFirst`), producing extra `case_N` steps where
@@ -339,7 +339,7 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
             }
         }
         // Remove the original formula and route the simplified one
-        // through `insert_formula_decompose` — mirrors Haskell's
+        // through `insert_formula` — mirrors Haskell's
         // `evalFormulaAtoms` (Simplify.hs:334-336):
         //   modM sFormulas       $ S.delete fm
         //   modM sSolvedFormulas $ S.insert fm
@@ -358,7 +358,7 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
         if simp != gtrue() && simp != gfalse() {
             // Route through decomposition to fire `insert_atom`
             // side effects (Last → set sys.last_atom, etc).
-            red.insert_formula_decompose(simp);
+            red.insert_formula(simp);
         } else if simp == gfalse() {
             // Preserve the gfalse signal so contradictions catch it.
             if !red.sys.formulas.contains(&simp) {
@@ -789,7 +789,7 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
         );
     }
     if new_formulas.is_empty() { return ChangeIndicator::Unchanged; }
-    // Route each implied-formula body through `insert_formula_decompose`
+    // Route each implied-formula body through `insert_formula`
     // so Disj / Ex / Conj bodies generate the matching `Goal::Disj`,
     // existential decomposition, and atomic goal entries.  Raw-pushing
     // to `sys.formulas` (which we did before) silently leaks Disj bodies
@@ -799,7 +799,7 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     // disjunction is undecomposed.  Mirrors Haskell `insertFormula`'s
     // case dispatch (`Reduction.hs:insertFormula`).
     for f in new_formulas {
-        red.insert_formula_decompose(f);
+        red.insert_formula(f);
     }
     red.changed = ChangeIndicator::Changed;
     ChangeIndicator::Changed
@@ -900,7 +900,7 @@ fn try_match_all_guards(
             //       to be brought to the same canonical form.
             //   (b) rename witness LVars `~mw#N → ~mw#0`, since each
             //       Maude unification mints a fresh witness idx.
-            // Mirrors `insert_formula_decompose_inner`'s Atom-branch
+            // Mirrors `insert_formula_inner`'s Atom-branch
             // dedup (`reduction.rs:715-720`).  Without applying (a),
             // RFID_Simple loops forever in `insert_implied_formulas`
             // because new implications never recognize that the same
@@ -2234,7 +2234,7 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
 
 /// `reduceFormulas` — decompose every reducible formula in the open
 /// set. Mirrors the Haskell pass. The decomposition itself happens in
-/// `Reduction::insert_formula_decompose`.
+/// `Reduction::insert_formula`.
 fn reduce_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     use crate::guarded::reducible_formula;
     // Pull out reducible formulas in one pass; otherwise we'd have
@@ -2247,7 +2247,7 @@ fn reduce_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     // Remove them, then re-insert via the decomposition logic.
     red.sys.formulas.retain(|f| !reducible_formula(f));
     for f in to_decompose {
-        red.insert_formula_decompose(f);
+        red.insert_formula(f);
     }
     red.changed = ChangeIndicator::Changed;
     ChangeIndicator::Changed

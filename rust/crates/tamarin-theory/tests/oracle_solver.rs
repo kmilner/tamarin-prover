@@ -1508,7 +1508,7 @@ fn proof_search_disj_lemma_descends_into_disj_goal() {
 
 /// End-to-end with explicit decomposition: wrap a Disj in a Conj so
 /// reduce_formulas picks up the Conj, recurses into the Disj, and
-/// produces a Goal::Disj. This confirms `insert_formula_decompose`
+/// produces a Goal::Disj. This confirms `insert_formula`
 /// fires when invoked through the reducible-formula path.
 #[test]
 fn simplify_conj_wrapping_disj_produces_goal() {
