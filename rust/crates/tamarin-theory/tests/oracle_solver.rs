@@ -1363,6 +1363,103 @@ fn probe_chaum_unforgeability() {
     }
 }
 
+/// Probe: TLS::session_key_setup_possible — render Rust's proof to
+/// diagnose why `case S_2_case_1` appears where Haskell has `case S_2`.
+#[test]
+#[ignore = "diagnostic probe — TLS S_2_case_N; run with --ignored"]
+fn probe_tls_setup_possible() {
+    fn maude_path() -> Option<String> {
+        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
+        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
+        }
+        None
+    }
+    let mp = match maude_path() { Some(p) => p, None => return };
+    let path = "/home/parallels/tamarin-prover/examples/classic/TLS_Handshake.spthy";
+    let src = std::fs::read_to_string(path).unwrap();
+    let theory = tamarin_parser::parse_theory(&src, &[]).unwrap();
+    let elab = tamarin_theory::elaborate::elaborate(&theory).unwrap();
+    // Dump precomputed sources first
+    {
+        let h_probe = tamarin_term::maude_proc::MaudeHandle::start(
+            &mp, elab.signature.maude_sig.clone()).unwrap();
+        let rules: Vec<_> = (&elab).rules().cloned().collect();
+        let ctx = tamarin_theory::constraint::solver::context::ProofContext::new(h_probe, rules);
+        use tamarin_theory::constraint::constraints::Goal;
+        eprintln!("== Precomputed full_sources ({} entries) ==", ctx.full_sources.len());
+        for src_obj in &ctx.full_sources {
+            if let Goal::Action(_, fa) = &src_obj.goal {
+                if matches!(fa.tag, tamarin_theory::fact::FactTag::Ku) {
+                    let term_dbg = format!("{:?}", fa.terms.first())
+                        .chars().take(120).collect::<String>();
+                    eprintln!("Ku source ({} cases): {}",
+                        src_obj.cases.len(), term_dbg);
+                    for (name, _) in &src_obj.cases {
+                        eprintln!("  case: {}", name);
+                    }
+                }
+            }
+        }
+    }
+    let h = tamarin_term::maude_proc::MaudeHandle::start(
+        &mp, elab.signature.maude_sig.clone()).unwrap();
+    std::env::set_var("TAM_PROVE_DEADLINE_MS", "30000");
+    let root = tamarin_theory::prove::prove_lemma(
+        &theory, "session_key_setup_possible", h, 2000).unwrap();
+    eprintln!("== Rust's proof for TLS::session_key_setup_possible ==");
+    eprintln!("{}", tamarin_theory::proof_skeleton::render(&root));
+    // Find the first node whose case-name ends in `_case_N` and print its
+    // children + open goals before the split.
+    use tamarin_theory::constraint::solver::search::ProofNode;
+    fn find_case_n<'a>(
+        n: &'a ProofNode, path: Vec<String>,
+    ) -> Option<(&'a ProofNode, Vec<String>)> {
+        // If any child's case-name contains "_case_", this node is the
+        // source of the split.
+        for (name, _) in &n.children {
+            if name.contains("_case_") { return Some((n, path)); }
+        }
+        for (name, c) in &n.children {
+            let mut p = path.clone();
+            p.push(name.clone());
+            if let Some(r) = find_case_n(c, p) { return Some(r); }
+        }
+        None
+    }
+    if let Some((node, path)) = find_case_n(&root, Vec::new()) {
+        eprintln!("\n== First _case_N split node ==");
+        eprintln!("Path to it: {:?}", path);
+        eprintln!("Method: {:?}", format!("{:?}", node.method).chars().take(200).collect::<String>());
+        eprintln!("Children ({}):", node.children.len());
+        for (name, _c) in &node.children {
+            eprintln!("  - {}", name);
+        }
+        eprintln!("\n== System state at this node ==");
+        eprintln!("  nodes ({}):", node.sys.nodes.len());
+        for (id, ru) in node.sys.nodes.iter().take(20) {
+            let ru_dbg = format!("{:?}", ru.info).chars().take(80).collect::<String>();
+            eprintln!("    #{}:{:?} → {}", id.name, id.idx, ru_dbg);
+        }
+        eprintln!("  open goals ({}):",
+            node.sys.goals.iter().filter(|(_, st)| !st.solved).count());
+        for (g, st) in node.sys.goals.iter() {
+            if !st.solved {
+                let gd = format!("{:?}", g).chars().take(100).collect::<String>();
+                eprintln!("    {}", gd);
+            }
+        }
+        eprintln!("  eq_store.conj ({}):", node.sys.eq_store.conj.len());
+        for (i, d) in node.sys.eq_store.conj.iter().enumerate() {
+            eprintln!("    disj[{}] ({} substs):", i, d.substs.len());
+            for (j, s) in d.substs.iter().enumerate().take(5) {
+                let ts = format!("{:?}", s).chars().take(200).collect::<String>();
+                eprintln!("      [{}] {}", j, ts);
+            }
+        }
+    }
+}
+
 /// **First end-to-end verdict-match** against `tamarin-prover`:
 /// drive `tiny_setup.spthy` through `prove_lemma` and confirm we
 /// reach `Solved` — same verdict tamarin produces (`verified`).
