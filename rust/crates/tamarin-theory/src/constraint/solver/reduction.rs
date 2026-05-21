@@ -1784,6 +1784,12 @@ fn canonical_rule_inst_with(
 /// chain-fold paths see the same rule shape as the SplitG action-goal
 /// path.  Mirrors Haskell's `someRuleACInst` semantics for code paths
 /// that don't carry the variant disjunction (chain-fold, etc.).
+///
+/// Currently unused — all live callers use the `*_with_constrs`
+/// variants below.  Kept for the rare diagnostic where
+/// `TAM_NO_PRECOMPUTE_VARIANTS=1` populates the legacy `variants`
+/// field; that path needs this expansion.
+#[allow(dead_code)]
 fn rule_insts_with<F: Fn(&RuleACInst) -> bool>(
     open: &[crate::theory::OpenProtoRule], keep: F,
 ) -> Vec<RuleACInst> {
@@ -1840,6 +1846,11 @@ fn rule_insts_with_constrs<F: Fn(&RuleACInst) -> bool>(
 
 /// `nonSilentRules` lite: rules with at least one action. Includes
 /// the proof context's intruder rules so KU goals can be discharged.
+///
+/// Unused — superseded by `non_silent_rule_insts_with_constrs` which
+/// carries the SplitG variant disjunction. Kept for parity with the
+/// (likewise unused) `rule_insts_with` legacy path.
+#[allow(dead_code)]
 fn non_silent_rule_insts(
     ctx: &crate::constraint::solver::context::ProofContext,
 ) -> Vec<RuleACInst> {
@@ -2108,6 +2119,10 @@ fn is_product(t: &tamarin_term::lterm::LNTerm) -> bool {
 /// the theory produces it), we restrict the candidates to just that
 /// rule — Haskell's `solveWithSource` does the same. Cuts down search
 /// breadth for premise goals with deterministic sources.
+///
+/// Unused — superseded by `premise_solving_rule_insts_with_constrs`
+/// which carries the SplitG variant disjunction.
+#[allow(dead_code)]
 fn premise_solving_rule_insts(
     ctx: &crate::constraint::solver::context::ProofContext,
     fa_prem: &crate::fact::LNFact,

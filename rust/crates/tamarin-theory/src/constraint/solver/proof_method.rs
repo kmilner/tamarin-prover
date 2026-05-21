@@ -17,8 +17,6 @@
 //! (returns `None` / empty map). The shape is in place so the rest
 //! can grow incrementally.
 
-use std::collections::BTreeMap;
-
 use crate::constraint::constraints::Goal;
 use crate::constraint::solver::context::ProofContext;
 use crate::constraint::solver::contradictions::{contradictions, Contradiction};
