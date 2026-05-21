@@ -527,12 +527,15 @@ pub fn drop_contradictory_cases(
     sources: Vec<Source>,
     ctx: &crate::constraint::solver::context::ProofContext,
 ) -> Vec<Source> {
-    // TAM_DISABLE_DROP_CONTRADICTORY=1 — bypass this Rust-specific pass
-    // to compare against Haskell's behaviour, which has no equivalent
-    // post-saturate drop step.  Haskell relies on saturate-time
-    // `contradictoryIf` inside `solveAllSafeGoals` plus runtime
-    // contradiction detection during proof search.
-    if std::env::var("TAM_DISABLE_DROP_CONTRADICTORY").is_ok() {
+    // Haskell-faithful: NO post-saturate drop pass.  Haskell relies on:
+    //   1. `contradictoryIf` checks inside `solveAllSafeGoals`
+    //      (saturate-time, Sources.hs:155-156).
+    //   2. Runtime contradiction detection during proof search.
+    //
+    // This Rust-specific pass was added as a workaround for our saturate
+    // over-enumerating cases.  Removing it matches Haskell architecture.
+    // Set TAM_ENABLE_DROP_CONTRADICTORY=1 to re-enable for measurement.
+    if !std::env::var("TAM_ENABLE_DROP_CONTRADICTORY").is_ok() {
         return sources;
     }
     let dbg = std::env::var("TAM_DBG_DROP").is_ok();
@@ -2281,41 +2284,19 @@ fn saturate_out_premise(
         // based on the kept count (Haskell convention: a single
         // surviving closure has no `_case_N` suffix; multiple get
         // 1-based suffixes).
+        //
+        // Haskell-faithful: NO canonical-form dedup here.  Haskell's
+        // `saturateSources` has only ONE dedup site: `removeRedundantCases`
+        // at `refineSource` (Sources.hs:123), and that's gated on BP/MSet
+        // (line 240).  Closures that look structurally identical
+        // post-restrict must be preserved so the runtime renderer's
+        // `distinguish` can give them `_case_N` suffixes.
         let mut this_sub: Vec<System> = Vec::new();
-        // Dedup chain-extension paths by canonical structural form.
-        // close_chains_dfs enumerates ALL viable destructor-chain
-        // combinations; many produce structurally-equivalent final
-        // source-cases (same nodes/edges, just walked through different
-        // destructor intermediates).  Haskell's saturate-time apply
-        // selects via runtime matching, naturally collapsing
-        // structurally-equivalent paths to one rendered case.
-        // Without dedup, our runtime apply produces hundreds of
-        // `_case_N` survivors for what Haskell renders as one case
-        // (e.g. denning_sacco Initiator2_case_1..164).
-        // Haskell-faithful `removeRedundantCases` gate (Sources.hs:240):
-        // BP/MSet only.  Outside those theories, sibling cases with same
-        // canonical form (post `restrict stableVars`) must be PRESERVED
-        // so the runtime renderer's `distinguish` can rename them
-        // `RULE_case_1`/`RULE_case_2`.  Collapsing them here causes the
-        // FOO/TLS/NSLPK3 case_N cluster — Haskell renders 5 sibling
-        // cases under C_1 (A_1, V_1_case_1, V_1_case_2, V_2, c_sign),
-        // Rust drops A_1 because two A_1-rooted closures canonicalise
-        // equal after restrict.
-        let sub_canon_dedup = {
-            let s = ctx.maude.maude_sig();
-            s.enable_bp || s.enable_mset
-        };
-        let mut sub_canon_seen: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
         for s in close_results.into_iter() {
             if !chain_acceptable(&s) { continue; }
             if closed_cases.len() + this_sub.len() >= max_closures {
                 *incomplete_out = true;
                 break;
-            }
-            if sub_canon_dedup {
-                let canon = canonicalise_system(&s);
-                if !sub_canon_seen.insert(canon) { continue; }
             }
             this_sub.push(s);
         }
@@ -4705,30 +4686,13 @@ fn fanout_variant_splits(
             return Vec::new();
         }
     };
-    // Dedup variant fanout by canonical-system structural form.
-    // Haskell's saturate-time fanout produces source cases that look
-    // distinct in eq_store but identical in structural (nodes/edges/
-    // premises/conclusions/actions) shape.  Without dedup, our runtime
-    // apply emits N variant-cases that each render an identical proof
-    // subtree under `_case_N` suffixes — Haskell shows ONE case.
-    //
-    // Use canonicalise_system which renames vars deterministically and
-    // ignores eq_store; this catches "same shape, different name hints"
-    // variants that produce equivalent downstream proofs.
-    //
-    // Haskell-faithful `removeRedundantCases` gate (Sources.hs:240):
-    // BP/MSet only.  See site at refineSource (line ~3107).
-    let dedup_enabled = {
-        let s = ctx.maude.maude_sig();
-        s.enable_bp || s.enable_mset
-    };
-    let mut seen_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // Haskell-faithful: NO dedup at runtime variant fanout.  Haskell's
+    // `someRuleACInst` / `solveDisjunction` produces variant arms as a
+    // Disj branch tree; rendering's `distinguish` later renames
+    // siblings.  Rust's per-fanout canonical dedup is an artificial
+    // workaround and is removed here to match Haskell.
     let mut out: Vec<(String, crate::constraint::system::System, crate::fact::LNFact)> = Vec::new();
     for sub_sys in raw_cases {
-        if dedup_enabled {
-            let key = canonicalise_system(&sub_sys);
-            if !seen_keys.insert(key) { continue; }
-        }
         out.push((case_label.to_string(), sub_sys, live_action.clone()));
     }
     out
@@ -6261,21 +6225,12 @@ fn saturate_fanout_variant_splits(
     //
     // Haskell-faithful `removeRedundantCases` gate (Sources.hs:240):
     // BP/MSet only.  See site at refineSource.
-    let dedup_enabled = {
-        let s = ctx.maude.maude_sig();
-        s.enable_bp || s.enable_mset
-    };
-    let mut seen_keys: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
+    // Haskell-faithful: NO dedup at saturate-time variant fanout.
+    // Haskell's `someRuleACInst` + `solveDisjunction` simply emits one
+    // case per variant subst.
     let mut out: Vec<(String, crate::constraint::system::System)> = Vec::new();
     for sub_sys in raw_cases {
-        if dedup_enabled {
-            let key = canonicalise_system(&sub_sys);
-            if !seen_keys.insert(key) { continue; }
-        }
-        {
-            out.push((case_label.to_string(), sub_sys));
-        }
+        out.push((case_label.to_string(), sub_sys));
     }
     Some(out)
 }
