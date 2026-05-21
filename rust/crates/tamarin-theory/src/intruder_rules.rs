@@ -231,7 +231,18 @@ fn at_pos(t: &tamarin_term::lterm::LNTerm, pos: &[i64]) -> tamarin_term::lterm::
 }
 
 /// `subtermIntruderRules` — direct port:
-/// `concatMap (destructionRules diff) (S.toList stRules) ++ constructionRules`.
+/// `minimizeIntruderRules diff $ concatMap (destructionRules diff) (S.toList stRules) ++ constructionRules`.
+///
+/// IntruderRules.hs:210-213.  The `minimizeIntruderRules` pass strips
+/// subsumed/duplicate destructor rules — without it, a single equation
+/// containing multiple variable positions of the same rhs (e.g. chaum's
+/// `unblind(sign(blind(m,r),k), r) = sign(m,k)` where m at [0,0,0] and
+/// k at [0,1] both walk through position [0]) emits the same `_0_unblind`
+/// destructor twice.  Those duplicates then cause `solve_chain_goal` to
+/// fan out 2 identical destructor branches (idx-renamed but otherwise
+/// equal), inflating source-case counts at saturate time
+/// (chaum::unforgeability KU(sign) goes from Haskell's 1 case to Rust's
+/// 4 cases).
 pub fn subterm_intruder_rules(
     diff: bool,
     sig: &tamarin_term::maude_sig::MaudeSig,
@@ -241,7 +252,121 @@ pub fn subterm_intruder_rules(
         out.extend(destruction_rules(diff, r));
     }
     out.extend(construction_rules(sig));
-    out
+    minimize_intruder_rules(diff, out)
+}
+
+/// Port of `minimizeIntruderRules` (IntruderRules.hs:186-206).
+///
+/// Two-stage filter:
+/// 1. **Subsumption** (skipped in `diff` mode): for each rule with
+///    `(prems, concs)`, drop it if any OTHER rule has the same `concs`
+///    and a premise set that is a subset of this rule's premises.
+///    Mirrors Haskell's `go` accumulator iteration; preserves the order
+///    of the first-kept duplicate.
+/// 2. **Double-premise filter** (always applied): drop rules whose KD
+///    first-premise is a msg-var `t` and whose premises also include
+///    `KU(t)` of the same term (with all terms private-free).
+fn minimize_intruder_rules(
+    diff: bool,
+    rules: Vec<IntrRuleAC>,
+) -> Vec<IntrRuleAC> {
+    let after_subsumption = if diff {
+        rules
+    } else {
+        // Haskell `go checked unchecked`: process `unchecked` left-to-right,
+        // dropping any rule subsumed by a peer in `checked ++ unchecked`.
+        // We mirror exactly: walk by index, and when checking rule i, the
+        // peers are { all kept rules so far } ∪ { all rules with index > i }.
+        let n = rules.len();
+        let mut kept: Vec<usize> = Vec::with_capacity(n);
+        for i in 0..n {
+            let r_i = &rules[i];
+            let subsumed = (0..n).any(|j| {
+                if j == i { return false; }
+                // Peer eligibility: either already-kept earlier (j < i and j in kept)
+                // or still in `unchecked` (j > i).  Haskell's `checked++unchecked`
+                // semantics.
+                if j < i && !kept.contains(&j) { return false; }
+                let r_j = &rules[j];
+                r_j.conclusions == r_i.conclusions
+                    && is_subset_of(&r_j.premises, &r_i.premises)
+            });
+            if !subsumed { kept.push(i); }
+        }
+        kept.into_iter().map(|i| rules[i].clone()).collect()
+    };
+    after_subsumption.into_iter().filter(|r| !is_double_premise_rule(r)).collect()
+}
+
+/// Multiset-subset check: every premise of `a` (counted with multiplicity)
+/// occurs in `b`.  Haskell's `subsetOf` on lists.
+fn is_subset_of(a: &[crate::fact::LNFact], b: &[crate::fact::LNFact]) -> bool {
+    let mut b_remaining: Vec<bool> = vec![true; b.len()];
+    for fa in a {
+        let mut found = false;
+        for (j, fb) in b.iter().enumerate() {
+            if b_remaining[j] && fa == fb {
+                b_remaining[j] = false;
+                found = true;
+                break;
+            }
+        }
+        if !found { return false; }
+    }
+    true
+}
+
+/// `isDoublePremiseRule` (IntruderRules.hs:201-206).
+///
+/// Drops destructor rules whose first premise is `KD(t)` where `t` is a
+/// msg-var, conclusions are ground, no private function symbols appear
+/// in premise/conclusion terms, and `KU(t)` also appears among the
+/// premises.  These rules are redundant — the intruder can always supply
+/// the term directly via the KU premise, so the KD-derivation pathway
+/// is never useful.
+fn is_double_premise_rule(r: &IntrRuleAC) -> bool {
+    use crate::fact::FactTag;
+    use tamarin_term::lterm::is_msg_var;
+    let (kd_fact_term, rest_prems): (&tamarin_term::lterm::LNTerm, &[crate::fact::LNFact]) =
+        match r.premises.split_first() {
+            Some((first, rest)) => {
+                if first.tag != FactTag::Kd { return false; }
+                let t = match first.terms.first() {
+                    Some(t) => t,
+                    None => return false,
+                };
+                (t, rest)
+            }
+            None => return false,
+        };
+    // Conclusions must be ground.
+    let frees_concs = r.conclusions.iter()
+        .flat_map(|f| f.terms.iter())
+        .any(|t| !tamarin_term::lterm::frees(t).is_empty());
+    if frees_concs { return false; }
+    // Reject if any term (KD-premise or any prems-term) contains a private symbol.
+    fn contains_private(t: &tamarin_term::lterm::LNTerm) -> bool {
+        use tamarin_term::function_symbols::{FunSym, NoEqSym, Privacy};
+        use tamarin_term::term::Term;
+        match t {
+            Term::Lit(_) => false,
+            Term::App(FunSym::NoEq(NoEqSym { privacy, .. }), args) => {
+                *privacy == Privacy::Private || args.iter().any(contains_private)
+            }
+            Term::App(_, args) => args.iter().any(contains_private),
+        }
+    }
+    if contains_private(kd_fact_term) { return false; }
+    for f in r.premises.iter() {
+        for t in f.terms.iter() {
+            if contains_private(t) { return false; }
+        }
+    }
+    // KD-premise term must be a msg-var.
+    if !is_msg_var(kd_fact_term) { return false; }
+    // KU(kd_fact_term) must appear among the remaining premises.
+    let ku_t = crate::fact::ku_fact(kd_fact_term.clone());
+    rest_prems.iter().any(|f| f == &ku_t)
 }
 
 /// `constructionRules`: for every public constructor `f/n` in the
