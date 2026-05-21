@@ -5991,91 +5991,41 @@ fn graft_case_into_action(
 /// corpus and Haskell-equivalent system-normed dedup becomes needed.
 pub fn remove_redundant_cases<T: Clone>(cases: Vec<T>) -> Vec<T> { cases }
 
-/// Saturate-time variant of `fanout_variant_splits`: fan out the first
-/// small (size ≤ SMALL) variant SplitG goal in a saturated source-case
-/// into per-arm sub-cases.  Mirrors Haskell `someRuleACInst` whose
-/// returned `RuleACConstrs` get resolved by `solveDisjunction` BEFORE
-/// the saturated case is stored — so Haskell's saturate-output cases
-/// have the variant-narrowed form (e.g.
-/// `In(aenc(<'1', <$A, ~k>>, pk(~ltkS)))` where `~k:Fresh`), no
-/// surviving SplitG, and downstream choices see the variant-narrowed
-/// terms.
+/// Saturate-time variant SplitG handler — Haskell-faithful no-op.
 ///
-/// Variant narrowing matters for any case with downstream goal-ranking
-/// choices:
-///   - open Chain → destructor chains see Fresh-typed t_start at
-///     destructor outputs (essential for `hasImpossibleChain`'s
-///     `pcTrueSubterm` rootSym dispatch — Contradictions.hs:258).
-///     Without this, t_start is `x_0:Msg` and `possibleRootSyms`
-///     returns `Nothing`; JCS12::typing_assertion shows `solve`
-///     where Haskell shows `by contradiction /* impossible chain */`.
-///   - open KU action → variant subst changes the picked constructor
-///     source at runtime (StatVerif Resolve1: pcsig2 narrowed to
-///     pcs(...) flips c_pcs → c_sign).
+/// Haskell's `someRuleACInst` adds `RuleACConstrs` (the Disj of variant
+/// substs) to the eq_store as a `SplitG` via `solveRuleConstraints`
+/// (Reduction.hs:770-777) and leaves it OPEN.  In `solveAllSafeGoals.solve`,
+/// `safeGoal` returns `SplitG _ -> doSplit` where
+/// `doSplit = noChainGoals && not (null chains)` (Sources.hs:152-164) —
+/// SplitG is only "safe" when there are no open Chain goals AND there
+/// ARE pending chains in the system.  For all the source cases we
+/// precompute (chain-fold paths back to protocol Out conclusions),
+/// the chain goals are open during saturate, so SplitG is NOT safe.
+/// Haskell therefore leaves the variant SplitG as an open goal in the
+/// saturated source case, deferring resolution to runtime.
 ///
-/// Constraints:
-///   - Variant SplitG must be ≤ SMALL (=6).  Larger SplitGs stay as
-///     runtime goals (smartRanking only ranks small SplitGs).
-///   - Canonical-system dedup collapses redundant arms.
+/// A previous Rust-port commit (a64042c4) removed a `has_open_chain`
+/// gate here to fan out variants at saturate time, claiming the
+/// StatVerif c_pcs→c_sign cluster needed variant narrowing in the
+/// stored case.  That was an unprincipled trade-off: it created
+/// `Resolve1_case_N`/`S_2_case_N`/`B_1_case_N` sibling cases that Haskell
+/// never produces (Haskell renders the variant resolution as a separate
+/// `case split` step deeper in the proof tree, not as siblings at the
+/// outer source level).  The Haskell-faithful behavior is to leave the
+/// SplitG alone; any downstream variant-narrowing effect must come from
+/// runtime SplitG resolution, not from baking it into the saturated case.
 ///
-/// Returns `None` when the case has no eligible small variant SplitG
-/// (caller keeps the original case unchanged).  Returns `Some(cases)`
-/// with one entry per surviving variant arm (empty Vec = all arms
-/// contradicted, caller drops the case).
+/// This function is now a no-op (returns `None`) so the saturate loop
+/// keeps the case with its open SplitG intact.  The runtime
+/// `fanout_variant_splits` (`solve_with_source_cases_action_with_ctx`)
+/// continues to handle SplitG fanout at apply time.
 fn saturate_fanout_variant_splits(
-    ctx: &crate::constraint::solver::context::ProofContext,
-    sys: crate::constraint::system::System,
-    case_label: &str,
+    _ctx: &crate::constraint::solver::context::ProofContext,
+    _sys: crate::constraint::system::System,
+    _case_label: &str,
 ) -> Option<Vec<(String, crate::constraint::system::System)>> {
-    use crate::constraint::solver::reduction::{Reduction, GoalCases};
-    use crate::constraint::constraints::Goal;
-    const SMALL: usize = 6;
-    // No saturate-time gate: Haskell's `someRuleACInst` always fans out
-    // variants via `solveDisjunction` over `RuleACConstrs`. Variant
-    // narrowing matters for any case with downstream goal-ranking choices —
-    //   - open Chain → `pcTrueSubterm` rootSym dispatch (JCS12);
-    //   - open KU action → constructor-source selection (StatVerif:
-    //     pcsig2 narrowed to pcs(...) changes c_pcs → c_sign at runtime).
-    // Canonical-system dedup collapses redundant arms.
-    let small_split: Option<crate::tools::equation_store::SplitId> =
-        sys.goals.iter().find_map(|(g, st)| {
-            if st.solved || st.looping { return None; }
-            let Goal::Split(id) = g else { return None };
-            let sz = sys.eq_store.split_size(*id)?;
-            if sz > 1 && sz <= SMALL { Some(*id) } else { None }
-        });
-    let split_id = small_split?;
-    set_precompute_mode(true);
-    let mut red = Reduction::new(ctx, sys);
-    let outcome = red.solve_split_goal(split_id);
-    let raw_cases: Vec<crate::constraint::system::System> = match outcome {
-        GoalCases::Cases(cases) if !cases.is_empty() => {
-            cases.into_iter().map(|(_, sub_sys)| sub_sys).collect()
-        }
-        GoalCases::Linear | GoalCases::LinearNamed(_) => {
-            vec![red.sys]
-        }
-        GoalCases::Contradictory | GoalCases::Cases(_) => {
-            set_precompute_mode(false);
-            return Some(Vec::new());
-        }
-    };
-    set_precompute_mode(false);
-    // Dedup variant fanout by canonical-system structural form, same
-    // approach as `fanout_variant_splits` (runtime apply).  Two arms
-    // may differ only in eq_store witness names that don't affect
-    // downstream proof.
-    //
-    // Haskell-faithful `removeRedundantCases` gate (Sources.hs:240):
-    // BP/MSet only.  See site at refineSource.
-    // Haskell-faithful: NO dedup at saturate-time variant fanout.
-    // Haskell's `someRuleACInst` + `solveDisjunction` simply emits one
-    // case per variant subst.
-    let mut out: Vec<(String, crate::constraint::system::System)> = Vec::new();
-    for sub_sys in raw_cases {
-        out.push((case_label.to_string(), sub_sys));
-    }
-    Some(out)
+    None
 }
 
 #[cfg(test)]
