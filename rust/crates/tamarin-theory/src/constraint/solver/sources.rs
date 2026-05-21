@@ -5148,6 +5148,26 @@ fn freshen_system_keep_with_shift(
             v2
         }
     };
+    // Haskell-faithful `mapFrees` on parser-AST `VarSpec` (used by
+    // Guarded formulas): mirror `shift_lvar` semantics — skip keep,
+    // shift idx otherwise.  Project keep to `(name, idx)` since
+    // VarSpec sort and LVar sort are distinct types and in-practice
+    // names disambiguate node vs message vars.
+    let keep_name_idx: std::collections::BTreeSet<(String, u64)> = keep.iter()
+        .map(|v| (v.name.clone(), v.idx))
+        .collect();
+    let shift_vs = |v: &tamarin_parser::ast::VarSpec| {
+        if keep_name_idx.contains(&(v.name.clone(), v.idx)) {
+            v.clone()
+        } else {
+            tamarin_parser::ast::VarSpec {
+                name: v.name.clone(),
+                idx: v.idx.saturating_add(shift_amount),
+                sort: v.sort,
+                typ: v.typ.clone(),
+            }
+        }
+    };
     let mut out = sys.clone();
     out.nodes = out.nodes.into_iter()
         .map(|(id, ru)| (shift_lvar(&id), ru.map_free(&mut |v| shift_lvar(&v))))
@@ -5180,13 +5200,51 @@ fn freshen_system_keep_with_shift(
                     crate::constraint::constraints::Goal::Chain(
                         (shift_lvar(&c.0), c.1),
                         (shift_lvar(&p.0), p.1)),
-                other => other,
+                // Haskell-faithful: Disj carries guarded formulas;
+                // Subterm carries an (LNTerm, LNTerm) pair.  Their
+                // free vars must shift too.  Split(SplitId) is an
+                // opaque index — no vars to rename.
+                crate::constraint::constraints::Goal::Disj(d) => {
+                    let mapped: Vec<_> = d.0.into_iter()
+                        .map(|alt| crate::guarded::map_lvars_in_guarded(&alt, &shift_vs))
+                        .collect();
+                    crate::constraint::constraints::Goal::Disj(
+                        crate::constraint::constraints::Disj(mapped))
+                }
+                crate::constraint::constraints::Goal::Subterm((small, big)) =>
+                    crate::constraint::constraints::Goal::Subterm((
+                        small.map_free(&mut |v| shift_lvar(&v)),
+                        big.map_free(&mut |v| shift_lvar(&v)))),
+                other @ crate::constraint::constraints::Goal::Split(_) => other,
             };
             (g2, st)
         })
         .collect();
     if let Some(la) = out.last_atom.take() {
         out.last_atom = Some(shift_lvar(&la));
+    }
+    // Haskell-faithful: shift free LVars in `formulas`, `solved_formulas`,
+    // and `lemmas`.  Haskell's `mapFrees` on System (System.hs:1863-1876)
+    // traverses ALL 13 fields — without this, post-freshen formulas/
+    // lemmas reference pre-freshen var idxs and collide with live
+    // post-shift node/edge idxs.
+    out.formulas = out.formulas.into_iter()
+        .map(|g| crate::guarded::map_lvars_in_guarded(&g, &shift_vs))
+        .collect();
+    out.solved_formulas = out.solved_formulas.into_iter()
+        .map(|g| crate::guarded::map_lvars_in_guarded(&g, &shift_vs))
+        .collect();
+    out.lemmas = out.lemmas.into_iter()
+        .map(|g| crate::guarded::map_lvars_in_guarded(&g, &shift_vs))
+        .collect();
+    // Shift LNTerm vars inside subterm_store constraints.
+    for c in &mut out.subterm_store.subterms {
+        c.small = c.small.clone().map_free(&mut |v| shift_lvar(&v));
+        c.big = c.big.clone().map_free(&mut |v| shift_lvar(&v));
+    }
+    for c in &mut out.subterm_store.solved_subterms {
+        c.small = c.small.clone().map_free(&mut |v| shift_lvar(&v));
+        c.big = c.big.clone().map_free(&mut |v| shift_lvar(&v));
     }
     // Eq-store subst: shift both var keys and term values.
     out.eq_store.subst = {

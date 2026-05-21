@@ -1164,6 +1164,117 @@ pub fn ginduct(g: &Guarded) -> Result<(Guarded, Guarded), String> {
     Ok((base_case, step_case))
 }
 
+/// Apply a `VarSpec → VarSpec` transformation to every FREE variable
+/// reference in a `Guarded` formula.  Variables bound by an enclosing
+/// `GGuarded` are NOT passed to `f` — they stay verbatim.  Used by
+/// `freshen_system_keep_with_shift` (sources.rs) to shift free-var
+/// idxs in stored formulas / solved_formulas / lemmas alongside the
+/// rest of the system, mirroring Haskell's uniform `mapFrees`
+/// (System.hs:1863-1876) which traverses ALL 13 system fields.
+pub fn map_lvars_in_guarded<F>(g: &Guarded, mut f: F) -> Guarded
+where F: FnMut(&p::VarSpec) -> p::VarSpec,
+{
+    fn map_term<F>(
+        t: &p::Term,
+        f: &mut F,
+        bound: &std::collections::HashSet<(String, u64)>,
+    ) -> p::Term
+    where F: FnMut(&p::VarSpec) -> p::VarSpec,
+    {
+        match t {
+            p::Term::Var(v) => {
+                if bound.contains(&(v.name.clone(), v.idx)) {
+                    p::Term::Var(v.clone())
+                } else {
+                    p::Term::Var(f(v))
+                }
+            }
+            p::Term::App(name, args) =>
+                p::Term::App(name.clone(),
+                    args.iter().map(|a| map_term(a, f, bound)).collect()),
+            p::Term::AlgApp(name, a, b) =>
+                p::Term::AlgApp(name.clone(),
+                    Box::new(map_term(a, f, bound)),
+                    Box::new(map_term(b, f, bound))),
+            p::Term::Pair(args) =>
+                p::Term::Pair(args.iter().map(|a| map_term(a, f, bound)).collect()),
+            p::Term::Diff(a, b) =>
+                p::Term::Diff(
+                    Box::new(map_term(a, f, bound)),
+                    Box::new(map_term(b, f, bound))),
+            p::Term::BinOp(op, a, b) =>
+                p::Term::BinOp(*op,
+                    Box::new(map_term(a, f, bound)),
+                    Box::new(map_term(b, f, bound))),
+            p::Term::PatMatch(inner) =>
+                p::Term::PatMatch(Box::new(map_term(inner, f, bound))),
+            other => other.clone(),
+        }
+    }
+    fn map_fact<F>(
+        fa: &p::Fact,
+        f: &mut F,
+        bound: &std::collections::HashSet<(String, u64)>,
+    ) -> p::Fact
+    where F: FnMut(&p::VarSpec) -> p::VarSpec,
+    {
+        p::Fact {
+            persistent: fa.persistent,
+            name: fa.name.clone(),
+            args: fa.args.iter().map(|a| map_term(a, f, bound)).collect(),
+            annotations: fa.annotations.clone(),
+        }
+    }
+    fn map_atom<F>(
+        a: &p::Atom,
+        f: &mut F,
+        bound: &std::collections::HashSet<(String, u64)>,
+    ) -> p::Atom
+    where F: FnMut(&p::VarSpec) -> p::VarSpec,
+    {
+        match a {
+            p::Atom::Eq(t1, t2) =>
+                p::Atom::Eq(map_term(t1, f, bound), map_term(t2, f, bound)),
+            p::Atom::Less(t1, t2) =>
+                p::Atom::Less(map_term(t1, f, bound), map_term(t2, f, bound)),
+            p::Atom::LessMset(t1, t2) =>
+                p::Atom::LessMset(map_term(t1, f, bound), map_term(t2, f, bound)),
+            p::Atom::Subterm(t1, t2) =>
+                p::Atom::Subterm(map_term(t1, f, bound), map_term(t2, f, bound)),
+            p::Atom::Action(fa, t) =>
+                p::Atom::Action(map_fact(fa, f, bound), map_term(t, f, bound)),
+            p::Atom::Last(t) => p::Atom::Last(map_term(t, f, bound)),
+            p::Atom::Pred(fa) => p::Atom::Pred(map_fact(fa, f, bound)),
+        }
+    }
+    fn rec<F>(
+        g: &Guarded,
+        f: &mut F,
+        bound: &std::collections::HashSet<(String, u64)>,
+    ) -> Guarded
+    where F: FnMut(&p::VarSpec) -> p::VarSpec,
+    {
+        match g {
+            Guarded::Atom(a) => Guarded::Atom(map_atom(a, f, bound)),
+            Guarded::Disj(items) =>
+                Guarded::Disj(items.iter().map(|i| rec(i, f, bound)).collect()),
+            Guarded::Conj(items) =>
+                Guarded::Conj(items.iter().map(|i| rec(i, f, bound)).collect()),
+            Guarded::GGuarded { qua, vars, guards, body } => {
+                let mut new_bound = bound.clone();
+                for v in vars { new_bound.insert((v.name.clone(), v.idx)); }
+                Guarded::GGuarded {
+                    qua: qua.clone(),
+                    vars: vars.clone(),
+                    guards: guards.iter().map(|a| map_atom(a, f, &new_bound)).collect(),
+                    body: Box::new(rec(body, f, &new_bound)),
+                }
+            }
+        }
+    }
+    rec(g, &mut f, &std::collections::HashSet::new())
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
