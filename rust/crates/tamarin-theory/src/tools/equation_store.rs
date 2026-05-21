@@ -264,7 +264,24 @@ impl EquationStore {
         // (typically the meaningful destructor-variant binding) rather
         // than the original insertion order.
         let mut sorted_substs: Vec<LNSubstVFresh> = disj.substs.clone();
+        if std::env::var("TAM_DBG_PERFORM_SPLIT").is_ok() {
+            eprintln!("[perform_split] split_id={:?}, {} substs (pre-sort):", id, sorted_substs.len());
+            for (i, s) in sorted_substs.iter().enumerate() {
+                eprintln!("[perform_split]   raw[{}]: {:?}", i, s.to_list());
+            }
+            // Show full eq_store.subst too — system substitution at this point
+            eprintln!("[perform_split] eq_store.subst entries:");
+            for (k, v) in self.subst.to_list() {
+                eprintln!("[perform_split]   {:?} → {:?}", k, v);
+            }
+        }
         sorted_substs.sort();
+        if std::env::var("TAM_DBG_PERFORM_SPLIT").is_ok() {
+            eprintln!("[perform_split] sorted result:");
+            for (i, s) in sorted_substs.iter().enumerate() {
+                eprintln!("[perform_split]   case_{}: {:?}", i + 1, s.to_list());
+            }
+        }
         let mut out = Vec::with_capacity(sorted_substs.len());
         for subst in sorted_substs {
             let mut new_store = self.clone();
@@ -470,6 +487,16 @@ impl EquationStore {
         let mut substs: Vec<LNSubstVFresh> = Vec::with_capacity(unifiers.len());
         for raw in unifiers {
             substs.push(LNSubstVFresh::from_list(raw.into_iter()));
+        }
+        if std::env::var("TAM_DBG_ADDEQS_VARIANTS").is_ok() {
+            eprintln!("[addEqs_variants] inserted {} variants for eqs:", substs.len());
+            for (i, e) in applied.iter().enumerate() {
+                eprintln!("[addEqs_variants]   eq[{}]: {:?} = {:?}", i, e.lhs, e.rhs);
+            }
+            eprintln!("[addEqs_variants] local_subst: {:?}", local_subst.to_list());
+            for (i, s) in substs.iter().enumerate() {
+                eprintln!("[addEqs_variants]   variant[{}]: {:?}", i, s.to_list());
+            }
         }
         Ok(Some(self.add_disj(substs)))
     }
@@ -1077,6 +1104,18 @@ impl EquationStore {
                         .filter(|(v, _)| restrict_set.contains(v))
                         .collect();
                     new_substs.push(LNSubstVFresh::from_list(pairs));
+                }
+            }
+            if std::env::var("TAM_DBG_AES_VARIANTS").is_ok() {
+                eprintln!("[aes_variants] disj split_id={:?} before→after: {} → {} substs",
+                    d.split_id, d.substs.len(), new_substs.len());
+                eprintln!("[aes_variants]   BEFORE (input variants):");
+                for (i, s) in d.substs.iter().enumerate() {
+                    eprintln!("[aes_variants]     in[{}]: {:?}", i, s.to_list());
+                }
+                eprintln!("[aes_variants]   AFTER (post-Maude variants):");
+                for (i, s) in new_substs.iter().enumerate() {
+                    eprintln!("[aes_variants]     out[{}]: {:?}", i, s.to_list());
                 }
             }
             new_conj.push(EqDisj { split_id: d.split_id, substs: new_substs });

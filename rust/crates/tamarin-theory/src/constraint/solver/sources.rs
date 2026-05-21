@@ -2284,6 +2284,19 @@ fn saturate_out_premise(
         // Without dedup, our runtime apply produces hundreds of
         // `_case_N` survivors for what Haskell renders as one case
         // (e.g. denning_sacco Initiator2_case_1..164).
+        // Haskell-faithful `removeRedundantCases` gate (Sources.hs:240):
+        // BP/MSet only.  Outside those theories, sibling cases with same
+        // canonical form (post `restrict stableVars`) must be PRESERVED
+        // so the runtime renderer's `distinguish` can rename them
+        // `RULE_case_1`/`RULE_case_2`.  Collapsing them here causes the
+        // FOO/TLS/NSLPK3 case_N cluster — Haskell renders 5 sibling
+        // cases under C_1 (A_1, V_1_case_1, V_1_case_2, V_2, c_sign),
+        // Rust drops A_1 because two A_1-rooted closures canonicalise
+        // equal after restrict.
+        let sub_canon_dedup = {
+            let s = ctx.maude.maude_sig();
+            s.enable_bp || s.enable_mset
+        };
         let mut sub_canon_seen: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
         for s in close_results.into_iter() {
@@ -2292,8 +2305,10 @@ fn saturate_out_premise(
                 *incomplete_out = true;
                 break;
             }
-            let canon = canonicalise_system(&s);
-            if !sub_canon_seen.insert(canon) { continue; }
+            if sub_canon_dedup {
+                let canon = canonicalise_system(&s);
+                if !sub_canon_seen.insert(canon) { continue; }
+            }
             this_sub.push(s);
         }
         let multi = this_sub.len() > 1;
@@ -3075,9 +3090,21 @@ fn saturate_sources_with_simp_opt(
                 goal_free_vars(&src.goal, &mut |v| {
                     stable_vars.insert(v.clone());
                 });
-                // Dedup branches using the FULL canonical form (nodes,
-                // edges, less_atoms, last_atom, formulas, solved,
-                // lemmas, used_sources, eq_store subst, goals).
+                // Haskell-faithful `removeRedundantCases` (Sources.hs:240):
+                //   if enableBP msig || enableMSet msig then cases else cases0
+                // Outside BP/MSet theories, redundant-case dedup is a no-op —
+                // sibling cases with the same parent rule (e.g. multiple
+                // `A_1` cases under KU(sign(...)) for foo_eligibility) MUST
+                // be preserved so the renderer's `distinguish` can rename
+                // them `A_1_case_1`/`A_1_case_2`.
+                //
+                // The dedup-on-by-default behaviour collapsed those siblings
+                // under canonical-form equality, leaving Haskell-rendered
+                // siblings (A_1) missing from the Rust proof skeleton —
+                // root cause of the 8-lemma case_N cluster (foo/okamoto/
+                // NSLPK3/NSLPK3_untagged/TLS).
+                let msig = ctx.maude.maude_sig();
+                let dedup_enabled = msig.enable_bp || msig.enable_mset;
                 let mut seen: std::collections::BTreeSet<String> =
                     std::collections::BTreeSet::new();
                 for (mut branch_sys, branch_name) in branches {
@@ -3092,10 +3119,11 @@ fn saturate_sources_with_simp_opt(
                         .collect();
                     branch_sys.eq_store.subst =
                         tamarin_term::subst::Subst::from_list(restricted_pairs);
-                    let key = canonicalise_system_full(&branch_sys);
-                    if seen.insert(key) {
-                        new_cases.push((branch_name, branch_sys));
+                    if dedup_enabled {
+                        let key = canonicalise_system_full(&branch_sys);
+                        if !seen.insert(key) { continue; }
                     }
+                    new_cases.push((branch_name, branch_sys));
                 }
             }
             // Determine if the case count changed for this source.
@@ -4679,13 +4707,21 @@ fn fanout_variant_splits(
     // Use canonicalise_system which renames vars deterministically and
     // ignores eq_store; this catches "same shape, different name hints"
     // variants that produce equivalent downstream proofs.
+    //
+    // Haskell-faithful `removeRedundantCases` gate (Sources.hs:240):
+    // BP/MSet only.  See site at refineSource (line ~3107).
+    let dedup_enabled = {
+        let s = ctx.maude.maude_sig();
+        s.enable_bp || s.enable_mset
+    };
     let mut seen_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut out: Vec<(String, crate::constraint::system::System, crate::fact::LNFact)> = Vec::new();
     for sub_sys in raw_cases {
-        let key = canonicalise_system(&sub_sys);
-        if seen_keys.insert(key) {
-            out.push((case_label.to_string(), sub_sys, live_action.clone()));
+        if dedup_enabled {
+            let key = canonicalise_system(&sub_sys);
+            if !seen_keys.insert(key) { continue; }
         }
+        out.push((case_label.to_string(), sub_sys, live_action.clone()));
     }
     out
 }
@@ -6214,12 +6250,22 @@ fn saturate_fanout_variant_splits(
     // approach as `fanout_variant_splits` (runtime apply).  Two arms
     // may differ only in eq_store witness names that don't affect
     // downstream proof.
+    //
+    // Haskell-faithful `removeRedundantCases` gate (Sources.hs:240):
+    // BP/MSet only.  See site at refineSource.
+    let dedup_enabled = {
+        let s = ctx.maude.maude_sig();
+        s.enable_bp || s.enable_mset
+    };
     let mut seen_keys: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
     let mut out: Vec<(String, crate::constraint::system::System)> = Vec::new();
     for sub_sys in raw_cases {
-        let key = canonicalise_system(&sub_sys);
-        if seen_keys.insert(key) {
+        if dedup_enabled {
+            let key = canonicalise_system(&sub_sys);
+            if !seen_keys.insert(key) { continue; }
+        }
+        {
             out.push((case_label.to_string(), sub_sys));
         }
     }
