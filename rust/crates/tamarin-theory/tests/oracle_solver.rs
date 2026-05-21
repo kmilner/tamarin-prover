@@ -1268,6 +1268,96 @@ fn probe_nspk3_cyclic_leaf() {
     }
 }
 
+/// Probe: chaum_unforgeability — KU(sign) source-case count + rendered
+/// proof skeleton, for diagnosing the B_1_case_N divergence.  Haskell
+/// SAT-FINAL shows KU(sign) cases=1 ["c_sign"] at raw saturate.  Rust
+/// previously showed 4 cases (c_sign + B_1_case_1/2/3) before the
+/// `minimize_intruder_rules` port (commit landing this probe).  Cases
+/// 2/3 differed only in fresh-var idx allocation because chaum's two
+/// `unblind` equations generated TWO identical `_0_unblind` destructor
+/// rules — `solve_chain_goal` then fanned out two destructor branches
+/// from the same rule, leaving idx-renamed duplicates.
+#[test]
+#[ignore = "diagnostic probe — chaum B_1 over-enum; run with --ignored"]
+fn probe_chaum_unforgeability() {
+    use tamarin_theory::constraint::solver::context::ProofContext;
+    use tamarin_theory::constraint::constraints::Goal;
+    fn maude_path() -> Option<String> {
+        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
+        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
+        }
+        None
+    }
+    let mp = match maude_path() { Some(p) => p, None => return };
+    let path = "/home/parallels/tamarin-prover/examples/post17/chaum_unforgeability.spthy";
+    let src = std::fs::read_to_string(path).unwrap();
+    let theory = tamarin_parser::parse_theory(&src, &[]).unwrap();
+    let elab = tamarin_theory::elaborate::elaborate(&theory).unwrap();
+    let h_probe = tamarin_term::maude_proc::MaudeHandle::start(&mp, elab.signature.maude_sig.clone()).unwrap();
+    let rules: Vec<_> = (&elab).rules().cloned().collect();
+    let ctx = ProofContext::new(h_probe, rules);
+    // Dump destructor intruder rules (used by close_chains_dfs's
+    // destructor-extension branch).
+    eprintln!("== Destructor intruder rules ==");
+    for ir in &ctx.intruder_rules {
+        if tamarin_theory::rule::is_destr_rule_info(&ir.info) {
+            let prems = ir.premises.iter()
+                .map(|f| format!("{:?}", f).chars().take(80).collect::<String>())
+                .collect::<Vec<_>>();
+            let concs = ir.conclusions.iter()
+                .map(|f| format!("{:?}", f).chars().take(80).collect::<String>())
+                .collect::<Vec<_>>();
+            eprintln!("  {:?} prems={:?} concs={:?}", ir.info, prems, concs);
+        }
+    }
+    eprintln!("== Precomputed full_sources ({} entries) ==", ctx.full_sources.len());
+    for src_obj in &ctx.full_sources {
+        if let Goal::Action(_, fa) = &src_obj.goal {
+            if matches!(fa.tag, tamarin_theory::fact::FactTag::Ku) {
+                let term_dbg = format!("{:?}", fa.terms.first()).chars().take(160).collect::<String>();
+                eprintln!("Ku source ({} cases): {}", src_obj.cases.len(), term_dbg);
+                for (name, case_sys) in &src_obj.cases {
+                    eprintln!("  case: {}", name);
+                    // Dump key state for diffing
+                    eprintln!("    nodes ({}):", case_sys.nodes.len());
+                    for (id, ru) in &case_sys.nodes {
+                        let ru_dbg = format!("{:?}", ru).chars().take(140).collect::<String>();
+                        eprintln!("      #{:?} → {}", id, ru_dbg);
+                    }
+                    eprintln!("    edges ({}):", case_sys.edges.len());
+                    for e in &case_sys.edges {
+                        eprintln!("      {:?}", e);
+                    }
+                    eprintln!("    eq_store.subst ({}):",
+                        case_sys.eq_store.subst.to_list().len());
+                    for (v, t) in case_sys.eq_store.subst.to_list().iter() {
+                        let ts = format!("{:?}", t).chars().take(80).collect::<String>();
+                        eprintln!("      {:?} → {}", v, ts);
+                    }
+                    eprintln!("    eq_store.conj ({}):",
+                        case_sys.eq_store.conj.len());
+                    for (i, d) in case_sys.eq_store.conj.iter().enumerate() {
+                        eprintln!("      disj[{}].substs ({}):", i, d.substs.len());
+                        for (j, s) in d.substs.iter().enumerate() {
+                            let ts = format!("{:?}", s).chars().take(140).collect::<String>();
+                            eprintln!("        [{}] {}", j, ts);
+                        }
+                    }
+                    eprintln!("    open goals ({}):",
+                        case_sys.goals.iter().filter(|(_, st)| !st.solved).count());
+                    for (g, st) in case_sys.goals.iter() {
+                        if !st.solved {
+                            let gd = format!("{:?}", g).chars().take(100).collect::<String>();
+                            eprintln!("      {}", gd);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// **First end-to-end verdict-match** against `tamarin-prover`:
 /// drive `tiny_setup.spthy` through `prove_lemma` and confirm we
 /// reach `Solved` — same verdict tamarin produces (`verified`).
