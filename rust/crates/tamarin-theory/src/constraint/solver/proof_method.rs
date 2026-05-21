@@ -474,13 +474,13 @@ pub fn exec_proof_method(
             let mut base_sys = sys.clone();
             base_sys.formulas.remove(0);
             let mut br = Reduction::new(ctx, base_sys);
-            br.insert_formula_decompose(base);
+            br.insert_formula(base);
             simplify_system(&mut br);
 
             let mut step_sys = sys.clone();
             step_sys.formulas.remove(0);
             let mut sr = Reduction::new(ctx, step_sys);
-            sr.insert_formula_decompose(step);
+            sr.insert_formula(step);
             simplify_system(&mut sr);
 
             Some(vec![
