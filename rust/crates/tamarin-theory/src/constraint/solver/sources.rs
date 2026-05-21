@@ -1917,20 +1917,29 @@ fn saturate_out_premise(
         let outcome = sub.solve_chain_goal(&c, &p);
         set_precompute_mode(true);
         // Contradiction filter: drop branches whose post-solve state
-        // is contradictory.  Haskell's `solveAllSafeGoals` calls
-        // `contradictoryIf =<< gets contradictorySystem` between safe
-        // goals (Sources.hs:178); Disj-monad branches that contradict
-        // are mzero'd before the next safe-goal step.
+        // is contradictory.  Haskell's `solveAllSafeGoals.solve`
+        // (Sources.hs:175-216) calls `simplifySystem` at the TOP of
+        // every recursive step (line 177), then
+        // `contradictoryIf =<< gets contradictorySystem` (line 179) —
+        // Disj-monad branches that contradict are mzero'd before the
+        // next safe-goal step.  simplifySystem runs the full CR-rule
+        // fixpoint, which collapses or contradicts redundant
+        // destructor-extension branches that the raw contradiction
+        // check misses (e.g. branches that unify `unblind(blind(~x,r),
+        // r')` with `r ≠ r'`).
         //
-        // Without this, our DFS keeps every chain-extension combo
-        // including the ones that immediately contradict.  chaum
-        // B_1 had 85 closures where only ~1 is actually viable in
-        // Haskell because the other 84 contradict at the next step.
+        // Without simplify, our DFS keeps every chain-extension combo
+        // that doesn't immediately contradict, including ones that
+        // would die at the next simplify pass.  chaum::unforgeability
+        // B_1 had 4 closures Haskell collapses to 1 because the
+        // redundant ones die in simplify; we previously kept all 4 as
+        // `B_1_case_1..B_1_case_4`.
         //
-        // Uses `contradictions()` directly (no full simplify pass) —
-        // that's the same check Haskell calls.  Full simplify is
-        // unnecessary here because we're inside close_chains_dfs's
-        // step-by-step iteration; the outer saturate runs simplify.
+        // Mirrors Haskell exactly by running simplify_system on the
+        // post-solve state before the contradiction check.  The
+        // `pre_simp` snapshot is what gets returned if simplify
+        // doesn't dirty things — keeps the rest of close_chains_dfs's
+        // contract unchanged.
         let is_dead = |sys: &System| -> bool {
             use crate::constraint::solver::contradictions::contradictions;
             if sys.eq_store.is_false() { return true; }
@@ -1939,11 +1948,21 @@ fn saturate_out_premise(
             { return true; }
             !contradictions(ctx, sys).is_empty()
         };
+        // Run simplify_system on the post-step state, then re-check
+        // is_dead.  This mirrors Haskell's `simplifySystem` +
+        // `contradictoryIf` pair at every step of solveAllSafeGoals.
+        let simplify_and_check = |sys: System| -> Option<System> {
+            let mut r = Reduction::new(ctx, sys);
+            crate::constraint::solver::simplify::simplify_system(&mut r);
+            if is_dead(&r.sys) { None } else { Some(r.sys) }
+        };
         match outcome {
             GoalCases::Contradictory => Vec::new(),
             GoalCases::Linear | GoalCases::LinearNamed(_) => {
-                if is_dead(&sub.sys) { return Vec::new(); }
-                close_chains_dfs(ctx, sub.sys, budget - 1, this_term.as_ref(), cases_remaining)
+                let Some(simplified) = simplify_and_check(sub.sys) else {
+                    return Vec::new();
+                };
+                close_chains_dfs(ctx, simplified, budget - 1, this_term.as_ref(), cases_remaining)
             }
             GoalCases::Cases(cases) => {
                 // Allocate budget fairly across alternatives so a single
@@ -1958,8 +1977,13 @@ fn saturate_out_premise(
                 // Mirrors Haskell's Disj-monad branching: each destructor
                 // alternative gets its own slice of the closure budget,
                 // matching the saturate_out_premise top-level allocation.
+                // Run simplify on each case before keeping it; matches
+                // Haskell's per-branch simplifySystem at the top of
+                // each solveAllSafeGoals.solve recursion (Sources.hs:177).
                 let live_cases: Vec<_> = cases.into_iter()
-                    .filter(|(_, c_sys)| !is_dead(c_sys))
+                    .filter_map(|(name, c_sys)| {
+                        simplify_and_check(c_sys).map(|sys| (name, sys))
+                    })
                     .collect();
                 let n = live_cases.len();
                 if n == 0 { return Vec::new(); }
