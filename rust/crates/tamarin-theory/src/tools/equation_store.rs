@@ -1100,7 +1100,99 @@ impl EquationStore {
                     .chain(bindings.iter().map(|(v, _)| v.clone()))
                     .collect();
                 for raw in unifiers {
-                    let pairs: Vec<(LVar, LNTerm)> = raw.into_iter()
+                    // EXTRACT-SYSTEM-VARS-TO-DOMAIN: the AC-free local
+                    // unifier path (maude_proc.rs:503-532) doesn't
+                    // introduce narrowing witnesses for cross-sort
+                    // var-var unification.  E.g. for `Var(~k:Fresh) =
+                    // Var(~mw:Msg)`, the local unifier returns
+                    // `~mw:Msg → Var(~k:Fresh)` (Unification.hs:241
+                    // orientation).  After restrict drops `~mw`, the
+                    // `~k` narrowing info is lost AND `~k` (a system
+                    // var in new_subst's range) ends up referenced
+                    // ONLY in OTHER subst entries' values — never as
+                    // a domain key.
+                    //
+                    // Haskell's full Maude `unify` introduces a fresh
+                    // narrowing witness `~w:Fresh` and produces both
+                    // `~k:Fresh → ~w:Fresh` and `~mw:Msg → ~w:Fresh`.
+                    // After Haskell's restrict (keys in
+                    // `varsRange new_subst ∪ domVFresh s`), `~k → ~w`
+                    // survives — placing the system var `~k` as a
+                    // domain key with a fresh-witness value.
+                    //
+                    // To mirror Haskell's post-Maude shape, after the
+                    // local unifier returns its raw subst, we do a
+                    // post-processing pass:
+                    //   1. Identify system vars S referenced in any
+                    //      RANGE value of the subst that are NOT in
+                    //      the domain of the subst.
+                    //   2. For each such S, allocate a fresh witness
+                    //      W of S's sort, replace S→W in all range
+                    //      values, and ADD `S → Var(W)` to the domain.
+                    //
+                    // System vars S are detected as members of
+                    // `new_subst_range_vars` (the vars in new_subst's
+                    // range — these are by-construction the system
+                    // vars introduced by prior unifications into the
+                    // free subst).  Variant subst's range should refer
+                    // only to fresh witnesses (Haskell's
+                    // SubstVFresh invariant); any system-var reference
+                    // there is a Rust-side artifact that needs to be
+                    // lifted to the domain.
+                    use tamarin_term::lterm::HasFrees;
+                    use tamarin_term::term::Term;
+                    use tamarin_term::vterm::Lit;
+                    // Compute current subst's domain (after restrict).
+                    let current_dom: BTreeSet<LVar> = raw.iter()
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    // Find system vars in any range value that aren't
+                    // in the current domain.  These are the ones to
+                    // lift.
+                    let mut to_lift: Vec<LVar> = Vec::new();
+                    let mut seen: BTreeSet<LVar> = BTreeSet::new();
+                    for (_, t) in &raw {
+                        t.for_each_free(&mut |v: &LVar| {
+                            if new_subst_range_vars.contains(v)
+                                && !current_dom.contains(v)
+                                && seen.insert(v.clone())
+                            {
+                                to_lift.push(v.clone());
+                            }
+                        });
+                    }
+                    // For each S in to_lift, allocate a fresh witness W
+                    // of S's sort.  Use the maude handle's global
+                    // counter so witness idxs don't collide.
+                    let mut witnesses: Vec<(LVar, LVar)> = Vec::new();
+                    if !to_lift.is_empty() {
+                        let base = maude.reserve_idxs(to_lift.len() as u64);
+                        for (i, s) in to_lift.iter().enumerate() {
+                            let w = LVar {
+                                name: s.name.clone(),
+                                sort: s.sort,
+                                idx: base + i as u64,
+                            };
+                            witnesses.push((s.clone(), w));
+                        }
+                    }
+                    let witness_map: std::collections::BTreeMap<LVar, LVar>
+                        = witnesses.iter().cloned().collect();
+                    let rename_term = |t: LNTerm| -> LNTerm {
+                        t.map_free(&mut |v: LVar| {
+                            witness_map.get(&v).cloned().unwrap_or(v)
+                        })
+                    };
+                    // Build lifted subst: rename range values, add
+                    // S → Var(W) entries to domain.
+                    let mut lifted: Vec<(LVar, LNTerm)> = Vec::new();
+                    for (k, t) in raw {
+                        lifted.push((k, rename_term(t)));
+                    }
+                    for (s, w) in witnesses {
+                        lifted.push((s, Term::Lit(Lit::Var(w))));
+                    }
+                    let pairs: Vec<(LVar, LNTerm)> = lifted.into_iter()
                         .filter(|(v, _)| restrict_set.contains(v))
                         .collect();
                     new_substs.push(LNSubstVFresh::from_list(pairs));
