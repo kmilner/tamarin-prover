@@ -373,20 +373,17 @@ impl ProofContext {
         // project_rust_proof_diff.md / project_rust_chain_fold.md.
         ctx.full_sources = crate::constraint::solver::sources::saturate_sources_with_chain_fold(
             raw_sources, params.saturation_limit as usize, &ctx);
-        // Haskell-faithful final filter: drop cases whose system is
-        // contradictory after saturation.  Mirrors Haskell's
-        // `refineSource` (Sources.hs:118-133) which propagates
-        // `mzero` through the `Disj` monad whenever the embedded
-        // `contradictoryIf` fires inside `solveAllSafeGoals`.  Our
-        // saturate doesn't carry this check, so impossible chains
-        // (e.g. `Out(k:Fresh) → Kd(senc(...))` with no Fresh→senc
-        // destructor path) survive as bogus precomputed cases.
-        // Without this, runtime search picks these cases first
-        // (alphabetically) and either falsely finds an attack via
-        // their dangling premises or loops on cross-source chains.
-        let prev_full = std::mem::take(&mut ctx.full_sources);
-        ctx.full_sources = crate::constraint::solver::sources::drop_contradictory_cases(
-            prev_full, &ctx);
+        // No post-saturate drop pass — Haskell doesn't have one.
+        // Haskell relies on saturate-time `contradictoryIf` inside
+        // `solveAllSafeGoals` (Sources.hs:118-133) + runtime
+        // contradiction detection during proof search.  Set
+        // `TAM_ENABLE_DROP_CONTRADICTORY=1` to re-enable the Rust
+        // workaround for measurement.
+        if std::env::var("TAM_ENABLE_DROP_CONTRADICTORY").is_ok() {
+            let prev_full = std::mem::take(&mut ctx.full_sources);
+            ctx.full_sources = crate::constraint::solver::sources::drop_contradictory_cases(
+                prev_full, &ctx);
+        }
         ctx
     }
 }
