@@ -1824,6 +1824,16 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
     // whose conclusion is `Fr(~x)`, isn't picked up as a "mentioning"
     // node — only the data-flow successors are).
     //
+    // KNOWN GAP (task #275): Haskell additionally `floodFill`s over the
+    // subterm graph (`posSubterms` + `elemNotBelowReducible` edges,
+    // Simplify.hs:464-467) so transitively-contained subterms (via
+    // `⊏`-chains) are picked up as "containing ~x" too.  Rust only does
+    // direct `for_each_free` matching.  No current 116-corpus lemma
+    // exposes this — Order2 passes via compensating fixes, and the
+    // protocols that use `⊏`-restrictions (csf23-subterms variants,
+    // csf18-alethea) aren't in the active corpus.  Implement when a
+    // wrong-VERDICT surfaces on a `⊏`-using lemma.
+    //
     // The `nonUnifiableNodes i j` side condition is essential for
     // soundness: two distinct nodes that both consume `Fr(~x)` might
     // be the *same* instance, in which case adding `i < j` AND `j < i`
