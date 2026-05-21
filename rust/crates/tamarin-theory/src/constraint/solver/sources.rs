@@ -527,6 +527,14 @@ pub fn drop_contradictory_cases(
     sources: Vec<Source>,
     ctx: &crate::constraint::solver::context::ProofContext,
 ) -> Vec<Source> {
+    // TAM_DISABLE_DROP_CONTRADICTORY=1 — bypass this Rust-specific pass
+    // to compare against Haskell's behaviour, which has no equivalent
+    // post-saturate drop step.  Haskell relies on saturate-time
+    // `contradictoryIf` inside `solveAllSafeGoals` plus runtime
+    // contradiction detection during proof search.
+    if std::env::var("TAM_DISABLE_DROP_CONTRADICTORY").is_ok() {
+        return sources;
+    }
     let dbg = std::env::var("TAM_DBG_DROP").is_ok();
     // Iterate to fixpoint mirroring Haskell's `saturateSources` loop
     // (Sources.hs:357-385).  Each iteration, cases whose `proofStep`
