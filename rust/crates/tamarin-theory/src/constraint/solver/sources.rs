@@ -2153,11 +2153,27 @@ fn saturate_out_premise(
         // post-restrict must be preserved so the runtime renderer's
         // `distinguish` can give them `_case_N` suffixes.
         let mut this_sub: Vec<System> = Vec::new();
+        let dbg_drop = std::env::var("TAM_DBG_DROP_CASE").is_ok();
+        let mut idx = 0;
         for s in close_results.into_iter() {
-            if !chain_acceptable(&s) { continue; }
+            idx += 1;
+            if !chain_acceptable(&s) {
+                if dbg_drop {
+                    eprintln!("[drop_case] sub_name={:?} idx={} REJECTED by chain_acceptable",
+                        sub_name, idx);
+                }
+                continue;
+            }
             if closed_cases.len() + this_sub.len() >= max_closures {
+                if dbg_drop {
+                    eprintln!("[drop_case] sub_name={:?} idx={} REJECTED by max_closures budget",
+                        sub_name, idx);
+                }
                 *incomplete_out = true;
                 break;
+            }
+            if dbg_drop {
+                eprintln!("[drop_case] sub_name={:?} idx={} KEPT", sub_name, idx);
             }
             this_sub.push(s);
         }
