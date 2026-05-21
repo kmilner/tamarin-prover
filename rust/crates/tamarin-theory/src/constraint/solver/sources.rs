@@ -452,6 +452,11 @@ pub fn saturate_sources_maude(
 /// Haskell's `solveAllSafeGoals` extends the chain via destructors
 /// and `mzero`s when no extension is viable.  Our saturate keeps
 /// the chain open, so we need an explicit drop here.
+///
+/// Currently unused — `drop_contradictory_cases` (its only caller)
+/// is gated off by default (TAM_ENABLE_DROP_CONTRADICTORY) as a
+/// non-Haskell-faithful workaround.  Kept for diagnostic re-enable.
+#[allow(dead_code)]
 fn case_has_impossible_open_chain(
     sys: &crate::constraint::system::System,
 ) -> bool {
@@ -624,6 +629,12 @@ fn case_has_surviving_variant_with_ths(
 /// exploration (e.g. `True_is_true` forces z=true, but Responder's
 /// variant subst maps z to and(encSucc, isPair) — incompatible with
 /// every variant after Maude AC reduction).
+///
+/// Currently unused — sole caller `case_has_surviving_variant_with_ths`
+/// is invoked from `drop_contradictory_cases` (gated off by default,
+/// TAM_ENABLE_DROP_CONTRADICTORY) and the gated `TAM_ENABLE_PRE_REFINE_PRUNE`
+/// per-iter pruning.  Kept for diagnostic re-enable.
+#[allow(dead_code)]
 fn case_has_surviving_variant(
     ctx: &crate::constraint::solver::context::ProofContext,
     sys: &crate::constraint::system::System,
@@ -4557,7 +4568,7 @@ fn fanout_variant_splits(
     live_action: &crate::fact::LNFact,
     case_label: &str,
 ) -> Vec<(String, crate::constraint::system::System, crate::fact::LNFact)> {
-    use crate::constraint::solver::reduction::{Reduction, SolveOutcome, GoalCases};
+    use crate::constraint::solver::reduction::{Reduction, GoalCases};
     use crate::constraint::constraints::Goal;
     const SMALL: usize = 3;
     // Find first small SplitG goal.

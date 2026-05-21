@@ -121,12 +121,7 @@ pub fn run_proof_search(
     let id_dfs_disabled = std::env::var("TAM_DISABLE_ID_DFS").is_ok();
     let cap: usize = 2048;
     let mut current_max_depth: usize = if id_dfs_disabled { usize::MAX } else { 4 };
-    let mut root = ProofNode {
-        method: ProofMethod::Sorry(Some("initial".into())),
-        sys: initial.clone(),
-        children: BTreeMap::new(),
-        status: NodeStatus::Open,
-    };
+    let mut root;
     loop {
         MAX_DEPTH.with(|m| m.set(current_max_depth));
         DEPTH_LIMIT_HIT.with(|f| f.set(false));
@@ -454,6 +449,11 @@ fn pick_method(
 /// and returns the first ranked open goal.  Threads the proof
 /// context through so source-cache predicates
 /// (`is_msg_one_case_goal`) can access `ctx.full_sources`.
+///
+/// Currently unused — live callers go through `candidate_methods` →
+/// `execProofMethod` which embeds the same ranking.  Kept as a
+/// reusable helper for diagnostic code that wants just the goal.
+#[allow(dead_code)]
 fn pick_open_goal(
     sys: &System,
     ctx: &ProofContext,

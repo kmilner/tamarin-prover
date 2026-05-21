@@ -28,11 +28,17 @@ use crate::vterm::Lit;
 /// guarantees indices are globally unique across all calls in a proof
 /// session — the fix for the TESLA::authentic_reachable
 /// `~mw:Pub:17` / `~mw:Msg:17` cross-call collision.
+// Carrier kept around because callers thread it through `unify_raw`
+// for future use (e.g. minting witnesses when sort narrowing is
+// extended past the current named-var-orientation logic).  The
+// fields/method are reserved for that path.
+#[allow(dead_code)]
 enum FreshSrc<'a> {
     Local(u64),
     Shared(&'a AtomicU64),
 }
 
+#[allow(dead_code)]
 impl<'a> FreshSrc<'a> {
     fn next(&mut self) -> u64 {
         match self {
