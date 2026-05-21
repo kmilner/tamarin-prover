@@ -458,18 +458,16 @@ pub fn exec_proof_method(
                 Ok(p) => p,
                 Err(_) => return None,
             };
-            // Build each case, then immediately simplify — mirrors
-            // Haskell's `process . induction` which threads
-            // `simplifySystem` through the resulting reduction.
-            // Mirror Haskell's exec for Induction: REMOVE formulas[0]
-            // (the original lemma formula) and route the new base /
-            // step through `insertFormula`'s structural decomposition.
-            // `Conj([])` (= gtrue) is marked solved by insertFormula's
-            // GConj arm, which lands it in `solved_formulas` and makes
-            // `isInitialSystem` return false on the empty-trace child.
-            // Without this routing, our direct `formulas[0] = base;`
-            // replacement leaves both formulas and solved_formulas
-            // empty, so the child looks like a fresh initial system
+            // Mirror Haskell's `setM sFormulas (singleton caseFormula)`
+            // followed by `process`'s `simplifySystem`.  We perform the
+            // `insertFormula` routing eagerly here — Haskell's
+            // `reduceFormulas` (Simplify.hs:317) would decompose the
+            // raw formula on its next fixpoint pass anyway, so the
+            // end state is identical and we save one simp iteration.
+            // The decomposition is essential because `Conj([])` (gtrue)
+            // is solved-marked by insertFormula's GConj arm, landing in
+            // `solved_formulas` so `isInitialSystem` returns false on
+            // the empty-trace child — without it the child looks fresh
             // and search refuses to mark it Solved.
             let mut base_sys = sys.clone();
             base_sys.formulas.remove(0);

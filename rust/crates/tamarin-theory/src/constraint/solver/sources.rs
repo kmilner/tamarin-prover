@@ -2245,10 +2245,14 @@ pub(crate) fn source_label(src: &Source) -> Option<String> {
 /// Compute the source label that would identify a KU-action source
 /// matching the given live `fa` (a KU fact with a single term).
 /// Mirrors `source_label`'s KU arm — used at the runtime filterCases
-/// step where we have the live fa (not the source).  Two KU sources
-/// are identified as "the same source" when their labels are equal,
-/// approximating Haskell's full-`Source` equality (Sources.hs:218-219
-/// `filterCases usedCase cds = filter (\x -> usedCase /= x) cds`).
+/// step where we have the live fa (not the source).  Equivalent to
+/// Haskell's full-`Source` equality (Sources.hs:218-219
+/// `filterCases usedCase cds = filter (\x -> usedCase /= x) cds`)
+/// under the precompute invariant: `precompute_full_sources` emits
+/// at most one Source per distinct KU root symbol (mirroring
+/// Haskell's `sortednub absMsgFacts`), and `refineSource` preserves
+/// `cdGoal` through saturation — so label-equality identifies the
+/// same Source that Haskell's structural `Eq` would.
 pub(crate) fn ku_source_label_for_fa(
     fa: &crate::fact::LNFact,
 ) -> Option<String> {
