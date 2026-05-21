@@ -1267,26 +1267,19 @@ fn saturate_sources_inner_with_options(
             next.push(Source { goal: src.goal.clone(), cases: new_cases, incomplete: src_incomplete });
             next_used.push(new_used);
         }
-        // Haskell-faithful per-iter contradictory-case pruning.
-        // Mirrors `solveAllSafeGoals` (Sources.hs:144-219) running
-        // inside `refineSource` for each iter of `saturateSources`
-        // (Sources.hs:356-385).  Each iter, Haskell's Disj monad
-        // mzeros out cases whose `solveAllSafeGoals` produces no
-        // surviving branches — driving sources like `KU(t:Fresh)`
-        // toward `goodTh` (≤1 case) so they become applicable to
-        // sub-goals in OTHER cases via `solveWithSourceAndReturn`
-        // (Sources.hs:206 `asum $ map ...`).
+        // Haskell-faithful: refineSource's Disj-monad fold already
+        // mzeros out contradictory cases via `run_solve_all_safe_goals_disj`
+        // at the per-case level (line ~2937).  This per-iter PRE-refineSource
+        // pruning was a Rust-specific duplicate workaround — Haskell does
+        // not have a separate per-iter `case_has_surviving_variant` pass.
         //
-        // Without this pass, Rust's saturate accumulates chain-fold
-        // variants in KU(t:Fresh) (coerce-rooted) that aren't pruned
-        // until `drop_contradictory_cases` runs POST-saturate.  The
-        // multi-case state blocks `goodTh` throughout saturate, so
-        // the proto-grafted case-systems (e.g. chaum's `S_1` case
-        // with open `KU(~x:Fresh)`) never get their KU sub-goals
-        // auto-solved, and the runtime smartRanking ends up picking
-        // `case c_fresh` instead of `case B_1` / `S_2` / etc.
-        //
-        // Cluster B fix.
+        // Gated via TAM_ENABLE_PRE_REFINE_PRUNE=1 for diagnostic re-enable.
+        // Per user directive ("if Haskell has one X we should too"), the
+        // workaround is OFF by default.  If this regresses
+        // chaum_unforgeability / foo_eligibility's "Cluster B" patterns
+        // (KU(t:Fresh) accumulates coerce variants), the right fix is in
+        // refineSource itself, not duplicating its filter earlier.
+        if std::env::var("TAM_ENABLE_PRE_REFINE_PRUNE").is_ok() {
         if let Some(ctx) = fold_ctx {
             // good_ths = iter-start sources with ≤1 case.  Same set
             // Haskell passes to `solveAllSafeGoals` per iter
@@ -1388,6 +1381,7 @@ fn saturate_sources_inner_with_options(
                 }
             }
         }
+        }  // close TAM_ENABLE_PRE_REFINE_PRUNE gate
         current = next;
         current_used = next_used;
         if !changed { break; }
@@ -3495,7 +3489,12 @@ fn run_solve_all_safe_goals_disj(
 
         let mut red = Reduction::new(ctx, sys);
         simplify_system(&mut red);
-        if !contradictions(red.ctx, &red.sys).is_empty() {
+        let contras = contradictions(red.ctx, &red.sys);
+        if !contras.is_empty() {
+            if std::env::var("TAM_DBG_BRANCH_DROP").is_ok() {
+                eprintln!("[branch_drop] name={:?} dropped by contras: {:?}",
+                    name, contras.iter().map(|c| format!("{:?}", c).chars().take(40).collect::<String>()).collect::<Vec<_>>());
+            }
             // Haskell mzero — drop branch (don't push to finished).
             continue;
         }
