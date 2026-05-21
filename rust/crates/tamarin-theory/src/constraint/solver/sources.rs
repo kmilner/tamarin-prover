@@ -5756,6 +5756,50 @@ fn apply_source_case_premise(
         return None;
     }
 
+    // E.5 — edge fact-equality propagation.  Mirror Haskell's runtime
+    // `insertEdges` (Reduction.hs:280) which calls `solveFactEqs SplitNow`
+    // on every new edge so producer-conclusion ⇆ consumer-premise terms
+    // unify before downstream `insertImpliedFormulas` runs.
+    //
+    // `conjoin_system` copies edges (Reduction.hs's `joinSets sEdges`) but
+    // doesn't run solveFactEqs on them.  In Haskell the runtime path goes
+    // `solvePremise → insertEdges → solveFactEqs` BEFORE conjoin reaches
+    // the eq-pass; here we install the source case's edges via conjoin
+    // directly, so we must re-fire fact-equality on them.
+    //
+    // Without this: Minimal_HashChain::Success_charn case Gen_Stop_case_1
+    // installs an `!Final(kZero)` ←→ `!Final(kOrig)` edge but never unifies
+    // kZero ⇆ kOrig, so the IH guard `ChainKey(kOrig)` can't match the
+    // Gen_Stop node's `ChainKey(kZero)` action and gfalse never enters
+    // sFormulas → Rust does an extra solve step where Haskell sees
+    // `by contradiction /* from formulas */`.  Same pattern as the
+    // saturate-time edge fact-equality fix at sources.rs:1221-1244.
+    let edge_eqs: Vec<_> = r.sys.edges.iter().filter_map(|e| {
+        let conc = r.sys.nodes.iter()
+            .find(|(n, _)| n == &e.src.0)?
+            .1.conclusions.get(e.src.1.0).cloned()?;
+        let prem = r.sys.nodes.iter()
+            .find(|(n, _)| n == &e.tgt.0)?
+            .1.premises.get(e.tgt.1.0).cloned()?;
+        if conc.tag != prem.tag || conc.terms.len() != prem.terms.len() {
+            return None;
+        }
+        if conc == prem { return None; }
+        Some(tamarin_term::rewriting::Equal { lhs: conc, rhs: prem })
+    }).collect();
+    if !edge_eqs.is_empty() {
+        let res = r.solve_fact_eqs(
+            crate::constraint::solver::reduction::SplitStrategy::SplitNow,
+            &edge_eqs);
+        if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
+            crate::state_trace::emit(
+                "applySource_prem_drop_edge_eqs",
+                Some(&live_goal_for_trace), &r.sys);
+            return None;
+        }
+        r.subst_system();
+    }
+
     // F — close trivial chains.
     close_trivial_chains_in_graft(&mut r);
 
