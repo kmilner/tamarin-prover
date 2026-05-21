@@ -2365,31 +2365,47 @@ fn first_open_ku_action_goal(
 pub(crate) fn source_label(src: &Source) -> Option<String> {
     use crate::constraint::constraints::Goal;
     use crate::fact::FactTag;
+    match &src.goal {
+        Goal::Action(_, fa) if fa.tag == FactTag::Ku && fa.terms.len() == 1 =>
+            ku_source_label_for_fa(fa),
+        Goal::Premise(_, fa) => Some(format!("PR:{:?}", fa.tag)),
+        _ => None,
+    }
+}
+
+/// Compute the source label that would identify a KU-action source
+/// matching the given live `fa` (a KU fact with a single term).
+/// Mirrors `source_label`'s KU arm — used at the runtime filterCases
+/// step where we have the live fa (not the source).  Two KU sources
+/// are identified as "the same source" when their labels are equal,
+/// approximating Haskell's full-`Source` equality (Sources.hs:218-219
+/// `filterCases usedCase cds = filter (\x -> usedCase /= x) cds`).
+pub(crate) fn ku_source_label_for_fa(
+    fa: &crate::fact::LNFact,
+) -> Option<String> {
+    use crate::fact::FactTag;
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
     use tamarin_term::lterm::LSort;
-    match &src.goal {
-        Goal::Action(_, fa) if fa.tag == FactTag::Ku && fa.terms.len() == 1 => {
-            match &fa.terms[0] {
-                Term::Lit(Lit::Var(v)) => Some(match v.sort {
-                    LSort::Fresh => "KU:fresh".to_string(),
-                    LSort::Pub => "KU:pub".to_string(),
-                    LSort::Nat => "KU:nat".to_string(),
-                    LSort::Node => "KU:node".to_string(),
-                    LSort::Msg => "KU:msg".to_string(),
-                }),
-                Term::App(tamarin_term::function_symbols::FunSym::NoEq(s), _) =>
-                    Some(format!("KU:{}", String::from_utf8_lossy(&s.name))),
-                Term::App(tamarin_term::function_symbols::FunSym::Ac(_), _) =>
-                    Some("KU:ac".to_string()),
-                Term::App(tamarin_term::function_symbols::FunSym::C(_), _) =>
-                    Some("KU:c".to_string()),
-                Term::App(tamarin_term::function_symbols::FunSym::List, _) =>
-                    Some("KU:list".to_string()),
-                _ => None,
-            }
-        }
-        Goal::Premise(_, fa) => Some(format!("PR:{:?}", fa.tag)),
+    if fa.tag != FactTag::Ku || fa.terms.len() != 1 {
+        return None;
+    }
+    match &fa.terms[0] {
+        Term::Lit(Lit::Var(v)) => Some(match v.sort {
+            LSort::Fresh => "KU:fresh".to_string(),
+            LSort::Pub => "KU:pub".to_string(),
+            LSort::Nat => "KU:nat".to_string(),
+            LSort::Node => "KU:node".to_string(),
+            LSort::Msg => "KU:msg".to_string(),
+        }),
+        Term::App(tamarin_term::function_symbols::FunSym::NoEq(s), _) =>
+            Some(format!("KU:{}", String::from_utf8_lossy(&s.name))),
+        Term::App(tamarin_term::function_symbols::FunSym::Ac(_), _) =>
+            Some("KU:ac".to_string()),
+        Term::App(tamarin_term::function_symbols::FunSym::C(_), _) =>
+            Some("KU:c".to_string()),
+        Term::App(tamarin_term::function_symbols::FunSym::List, _) =>
+            Some("KU:list".to_string()),
         _ => None,
     }
 }
@@ -3296,18 +3312,31 @@ fn solve_all_safe_goals_tracked(
         //     Haskell's Disj-monad `mzero` propagation when no branch
         //     survives).
         if ths.is_empty() { return outcome; }
+        // Haskell-faithful `filterCases`: skip useful_kus whose source
+        // label is already in `used` (whole source consumed).  Mirrors
+        // Sources.hs:218-219 — picking case X from Source1 removes
+        // Source1 entirely from the candidate list, not just the X
+        // case-name.  When ALL useful_kus map to consumed sources,
+        // return outcome (saturate complete for this iteration).
         let useful_ku = goals.iter().find_map(|(g, _)| match g {
-            Goal::Action(i, fa) if matches!(fa.tag, FactTag::Ku) =>
-                Some((i.clone(), fa.clone())),
+            Goal::Action(i, fa) if matches!(fa.tag, FactTag::Ku) => {
+                if let Some(label) = ku_source_label_for_fa(fa) {
+                    if used.contains(&label) { return None; }
+                }
+                Some((i.clone(), fa.clone()))
+            }
             _ => None,
         });
         let Some((i, fa)) = useful_ku else { return outcome };
         let avoid_max = system_max_idx(&red.sys);
         let Some(case_pairs) = solve_with_source_cases_action(
             ths, &red.sys, &i, &fa, avoid_max) else { return outcome };
-        let unused: Vec<_> = case_pairs.into_iter()
-            .filter(|(n, _, _)| !used.contains(n))
-            .collect();
+        // `used` now tracks SOURCE LABELS (not case names) — once we
+        // pick a case from Source S, S as a whole becomes unavailable.
+        // No per-case-name filter needed here: case_pairs all come
+        // from a single source whose label is NOT in used (verified
+        // above).
+        let unused: Vec<_> = case_pairs;
         let unused_count = unused.len();
         if unused_count == 0 { return outcome; }
         if unused_count > 1 {
@@ -3373,7 +3402,15 @@ fn solve_all_safe_goals_tracked(
                 }
             }
             red.subst_system();
-            used.insert(case_name.to_string());
+            // Haskell-faithful `filterCases`: track SOURCE LABEL (not
+            // case name).  When the source label is unavailable
+            // (shouldn't happen for KU goals reaching this point),
+            // fall back to case_name to retain a guard.
+            if let Some(label) = ku_source_label_for_fa(fa) {
+                used.insert(label);
+            } else {
+                used.insert(case_name.to_string());
+            }
             Ok(())
         };
 
@@ -3682,11 +3719,19 @@ fn run_solve_all_safe_goals_disj(
         // with d_1_check_getmsg) to survive our drop pass, where
         // Haskell drops them via Cyclic+ForbiddenChain after
         // source-picking on a *later* KU goal (e.g. KU(pcs(...))).
+        // Haskell-faithful `filterCases` (Sources.hs:218-219):
+        // skip useful_kus whose source LABEL is already in `used` —
+        // picking a case from Source S consumes S entirely, not just
+        // the picked case-name.  See `ku_source_label_for_fa`.
         let useful_kus: Vec<(crate::constraint::constraints::NodeId,
                               crate::fact::LNFact)> =
             goals.iter().filter_map(|(g, _)| match g {
-                Goal::Action(i, fa) if matches!(fa.tag, FactTag::Ku) =>
-                    Some((i.clone(), fa.clone())),
+                Goal::Action(i, fa) if matches!(fa.tag, FactTag::Ku) => {
+                    if let Some(label) = ku_source_label_for_fa(fa) {
+                        if used.contains(&label) { return None; }
+                    }
+                    Some((i.clone(), fa.clone()))
+                }
                 _ => None,
             }).collect();
         if useful_kus.is_empty() {
@@ -3733,12 +3778,14 @@ fn run_solve_all_safe_goals_disj(
             eprintln!("[disj-refine] name={} i={:?} -- {} cases: {:?}",
                 name, i, case_pairs.len(), names);
         }
-        let unused: Vec<_> = case_pairs.into_iter()
-            .filter(|(n, _, _)| !used.contains(n))
-            .collect();
+        // Source-label-based filter (Haskell-faithful): the picked
+        // useful_ku's source label was verified NOT in `used` above,
+        // so all case_pairs from this single source are available.
+        // No per-case-name filter needed.
+        let unused: Vec<_> = case_pairs;
         if unused.is_empty() {
-            // No remaining candidates — Haskell's asum returns
-            // [] here; the case keeps its current state.
+            // No candidates returned by solve_with_source_cases_action
+            // — surface as survivor (Haskell's asum returns [] here).
             if trace {
                 eprintln!("[disj-refine] name={} -- ALL USED", name);
             }
@@ -3765,7 +3812,12 @@ fn run_solve_all_safe_goals_disj(
                 // so the system is fully merged.  No follow-up
                 // solve_fact_eqs needed — push directly.
                 let mut new_used = used.clone();
-                new_used.insert(case_name.clone());
+                // Haskell-faithful: track SOURCE LABEL.
+                if let Some(label) = ku_source_label_for_fa(&fa) {
+                    new_used.insert(label);
+                } else {
+                    new_used.insert(case_name.clone());
+                }
                 let combined = combine_case_names(&name, &case_name);
                 if trace {
                     eprintln!("[disj-refine] commit ctx-aware case={} -> {}",
@@ -3830,7 +3882,12 @@ fn run_solve_all_safe_goals_disj(
 
             // This candidate is viable — push as a new alive branch.
             let mut new_used = used.clone();
-            new_used.insert(case_name.clone());
+            // Haskell-faithful: track SOURCE LABEL.
+            if let Some(label) = ku_source_label_for_fa(&fa) {
+                new_used.insert(label);
+            } else {
+                new_used.insert(case_name.clone());
+            }
             let combined = combine_case_names(&name, &case_name);
             if trace {
                 eprintln!("[disj-refine] commit legacy case={} -> {}",
