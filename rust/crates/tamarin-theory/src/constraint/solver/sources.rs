@@ -207,6 +207,22 @@ pub fn precompute_full_sources(
         sys.insert_lemmas(ctx.restrictions.clone());
         let mut red = Reduction::new(ctx, sys);
         red.insert_goal(goal.clone());
+        // Haskell-faithful: mark the goal as solved BEFORE invoking the
+        // solver.  Mirrors `solveGoal` (Goals.hs:201-213):
+        //   solveGoal goal = do
+        //       -- mark before solving, as representation might change
+        //       -- due to unification
+        //       markGoalAsSolved "directly" goal
+        //       ...
+        // Without this, `solve_fact_eqs` running inside `solve_premise_goal`
+        // can rewrite the goal's fact terms (e.g. Check0's repeated-arg
+        // `Loop(loopId, kOrig, kOrig)` unification rewrites the abstract
+        // `Loop(t1, t2, t3)` to `Loop(t1, t2, t2)`), after which a post-
+        // solve mark using the original goal misses the (now substituted)
+        // entry in the map.  The unmarked goal then triggers spurious
+        // re-graft in `saturate_sources_inner_with_options`, adding a
+        // duplicate producing-rule instance (task #222).
+        red.mark_goal_as_solved(&goal);
         let outcome = red.solve_premise_goal(
             &(goal_node.clone(), PremIdx(0)),
             &abstract_fact);
@@ -324,6 +340,9 @@ pub fn precompute_full_sources(
         sys.insert_lemmas(ctx.restrictions.clone());
         let mut red = Reduction::new(ctx, sys);
         red.insert_goal(goal.clone());
+        // Haskell-faithful mark-before-solve (Goals.hs:201-213).  See
+        // proto-goals branch above for full justification.
+        red.mark_goal_as_solved(&goal);
         let outcome = red.solve_action_goal(&goal_node, &ku_fact);
         // Haskell `refineSource` restrict (Sources.hs:118-124).
         let stable_vars = stable_vars_for_goal(&goal);
@@ -4959,15 +4978,40 @@ fn flip_to_stable_keys(
         }
         kept.push((k, v));
     }
-    // Add flipped entries, but only if target isn't already a key
-    // (preserves domain disjointness).
+    // Add flipped entries, but only if both:
+    // (a) target isn't already a key (preserves domain disjointness), AND
+    // (b) target isn't a VALUE of any kept binding (flipping would
+    //     introduce a chain `kept_key → target → kept_value`, breaking
+    //     idempotency — see `restrict_eq_store_does_not_chain_chase`
+    //     test for the Haskell invariant).
+    //
+    // Haskell does NOT flip at all — `restrict` is a pure key-filter.
+    // Our flip exists to preserve rule-internal-to-canonical bindings
+    // that would otherwise be lost.  Skipping flips that would create
+    // chains keeps the idempotency invariant Haskell relies on for
+    // `applyVTerm` correctness.
+    //
+    // Concrete trigger for the chain-introducing case (task #222
+    // Loop_Start): saturate-time `{loopId:6 → t:1, kOrig:6 → t:2,
+    // t:3 → t:2}`.  Naively flipping `kOrig:6 → t:2` to `t:2 → kOrig:6`
+    // would create the chain `t:3 → t:2 → kOrig:6`, breaking the
+    // idempotency Haskell's `applyVTerm` relies on (it does ONE
+    // lookup, not chain-chase).  The downstream runtime then fails to
+    // propagate the Check0 repeated-arg equivalence to the lemma's
+    // `k = kOrig` constraint.
     let mut existing_keys: std::collections::BTreeSet<tamarin_term::lterm::LVar> =
         kept.iter().map(|(k, _)| k.clone()).collect();
+    let value_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar> = kept.iter()
+        .filter_map(|(_, v)| match v {
+            Term::Lit(Lit::Var(w)) => Some(w.clone()),
+            _ => None,
+        })
+        .collect();
     for (k, v) in flipped {
-        if !existing_keys.contains(&k) {
-            existing_keys.insert(k.clone());
-            kept.push((k, v));
-        }
+        if existing_keys.contains(&k) { continue; }
+        if value_vars.contains(&k) { continue; }   // flipping creates a chain
+        existing_keys.insert(k.clone());
+        kept.push((k, v));
     }
     sys.eq_store.subst = tamarin_term::subst::Subst::from_list(kept);
 }

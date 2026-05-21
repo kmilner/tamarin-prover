@@ -857,6 +857,29 @@ pub fn dispatch_solve_goal(
     red: &mut crate::constraint::solver::reduction::Reduction<'_>,
     g: &Goal,
 ) -> crate::constraint::solver::reduction::GoalCases {
+    // Haskell-faithful: mark the goal as solved BEFORE delegating to
+    // the specific solver.  Mirrors `solveGoal` (Goals.hs:201-213):
+    //   solveGoal goal = do
+    //       -- mark before solving, as representation might change due
+    //       -- to unification
+    //       markGoalAsSolved "directly" goal
+    //       ...
+    //       case goal of
+    //         ActionG i fa  -> solveAction ...
+    //         PremiseG p fa -> solvePremise ...
+    //         ...
+    //
+    // The comment in Haskell ("representation might change due to
+    // unification") refers exactly to the case where `solveFactEqs` or
+    // `substSystem` running INSIDE the solver rewrites the goal's terms
+    // (e.g. Check0's `Loop(loopId, kOrig, kOrig)` repeated-arg unification
+    // rewrites `Loop(t1, t2, t3)` → `Loop(t1, t2, t2)`).  An attempted
+    // post-solve mark with the ORIGINAL goal then misses the (now
+    // substituted) goal in the map and leaves it open.  Concrete
+    // trigger: Minimal_HashChain Loop_Start source-case Check0 left
+    // its abstract Loop goal open, which then triggered another graft
+    // iteration adding a duplicate Check0 node (task #222).
+    red.mark_goal_as_solved(g);
     match g {
         Goal::Action(i, fa) => red.solve_action_goal(i, fa),
         Goal::Premise(p, fa) => red.solve_premise_goal(p, fa),
