@@ -1269,14 +1269,10 @@ fn probe_nspk3_cyclic_leaf() {
 }
 
 /// Probe: chaum_unforgeability — KU(sign) source-case count + rendered
-/// proof skeleton, for diagnosing the B_1_case_N divergence.  Haskell
-/// SAT-FINAL shows KU(sign) cases=1 ["c_sign"] at raw saturate.  Rust
-/// previously showed 4 cases (c_sign + B_1_case_1/2/3) before the
-/// `minimize_intruder_rules` port (commit landing this probe).  Cases
-/// 2/3 differed only in fresh-var idx allocation because chaum's two
-/// `unblind` equations generated TWO identical `_0_unblind` destructor
-/// rules — `solve_chain_goal` then fanned out two destructor branches
-/// from the same rule, leaving idx-renamed duplicates.
+/// proof skeleton, for diagnosing the B_1_case_N divergence (mostly
+/// fixed via `minimize_intruder_rules` port + variant-fanout revert).
+/// Now diagnoses the remaining `case fresh vs case B_1` divergence at
+/// chaum::exec line 7 + chaum::unforgeability line 22.
 #[test]
 #[ignore = "diagnostic probe — chaum B_1 over-enum; run with --ignored"]
 fn probe_chaum_unforgeability() {
@@ -1294,6 +1290,15 @@ fn probe_chaum_unforgeability() {
     let src = std::fs::read_to_string(path).unwrap();
     let theory = tamarin_parser::parse_theory(&src, &[]).unwrap();
     let elab = tamarin_theory::elaborate::elaborate(&theory).unwrap();
+    // Also render Rust's proof for chaum::exec
+    {
+        let h_proof = tamarin_term::maude_proc::MaudeHandle::start(
+            &mp, elab.signature.maude_sig.clone()).unwrap();
+        std::env::set_var("TAM_PROVE_DEADLINE_MS", "30000");
+        let root = tamarin_theory::prove::prove_lemma(&theory, "exec", h_proof, 500).unwrap();
+        eprintln!("== Rendered proof for exec ==");
+        eprintln!("{}", tamarin_theory::proof_skeleton::render(&root));
+    }
     let h_probe = tamarin_term::maude_proc::MaudeHandle::start(&mp, elab.signature.maude_sig.clone()).unwrap();
     let rules: Vec<_> = (&elab).rules().cloned().collect();
     let ctx = ProofContext::new(h_probe, rules);

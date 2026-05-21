@@ -4467,54 +4467,26 @@ pub fn solve_with_source_cases_action_with_ctx(
                     ctx, sys, src, case_sys, goal_node, fa_live);
                 if let Some((mut grafted_sys, live_action)) = result {
                     if src.incomplete { grafted_sys.used_incomplete_source = true; }
-                    // Eagerly fan out small variant SplitG goals into
-                    // separate Disj cases.  Mirrors Haskell's saturate
-                    // which (via solveAllSafeGoals's Disj-monad
-                    // branching on small SplitG) produces one case per
-                    // variant arm at PRECOMPUTE time — leaving no
-                    // SplitG in the runtime state.  Our precompute
-                    // single-branches, so the variant SplitG survives
-                    // until runtime; without this fan-out, runtime
-                    // goal-ranking picks `case split` (S2 cluster).
+                    // Haskell-faithful: do NOT fan out variant SplitG
+                    // at source-apply time.  The previous comment
+                    // claimed Haskell's saturate produces one case per
+                    // variant arm at PRECOMPUTE time — that was wrong.
+                    // Haskell's `solveAllSafeGoals.solve` only treats
+                    // SplitG as a safe goal when
+                    // `doSplit = noChainGoals && not (null chains)`
+                    // (Sources.hs:152-164).  For source cases with open
+                    // chains (which is most of them), SplitG stays open
+                    // through saturate AND is left in the case state.
+                    // At runtime, the SplitG appears in the live system
+                    // and `solveGoal SplitG` produces `case split` /
+                    // `case case_1` / `case case_2` via smartRanking's
+                    // `isSplitGoalSmall` pick — matching Haskell.
                     //
-                    // Skip when TAM_DISABLE_VARIANT_FANOUT=1 (diagnostic).
-                    let fanout = std::env::var("TAM_DISABLE_VARIANT_FANOUT").is_err();
-                    if fanout {
-                        let expanded = fanout_variant_splits(
-                            ctx, grafted_sys, &live_action, &case_label);
-                        for (sub_name, mut sub_sys, sub_action) in expanded {
-                            // Haskell `solveAllSafeGoals` (saturate-time)
-                            // applies 1-case `c_<sym>` constructor
-                            // sources to open KU goals whose head
-                            // matches.  These pass `goodTh` (Sources.hs:381)
-                            // — saturate's source-pick (`asum`
-                            // Sources.hs:206) eagerly applies them at
-                            // PRECOMPUTE time.  Multi-case sources (KU
-                            // sign with c_sign + Abort1 + Resolve*) FAIL
-                            // goodTh and stay open for runtime selection.
-                            //
-                            // Our precomputed source cases don't always
-                            // reflect saturate's auto-resolution because
-                            // the variant SplitG is collapsed before the
-                            // KU-expansion pass sees the variant-
-                            // substituted head term (e.g. Abort1's
-                            // `pcsig1 = pcs(sign(...),...)`).  Replicate
-                            // the effect at runtime: walk open KU goals
-                            // and auto-apply single-case `c_<sym>`
-                            // sources whose abstract head matches.
-                            //
-                            // Skip via TAM_DISABLE_KU_AUTORESOLVE=1.
-                            if std::env::var("TAM_DISABLE_KU_AUTORESOLVE").is_err() {
-                                if let Some(ctx_ref) = ctx_opt {
-                                    auto_resolve_single_case_ku(
-                                        ctx_ref, &mut sub_sys);
-                                }
-                            }
-                            out.push((sub_name, sub_sys, sub_action));
-                        }
-                    } else {
-                        out.push((case_label, grafted_sys, live_action));
-                    }
+                    // The previous fan-out produced `Rule_case_N`
+                    // siblings that Haskell never has (StatVerif
+                    // Resolve1_case_1/2, TLS S_2_case_1/2, etc.).
+                    out.push((case_label, grafted_sys, live_action));
+                    let _ = ctx_opt;
                 }
                 let _ = name;
                 continue;
@@ -4545,22 +4517,13 @@ pub fn solve_with_source_cases_action_with_ctx(
     Some(out)
 }
 
-/// Eagerly fan out small variant SplitG goals from a grafted source
-/// case into separate Disj cases (one per surviving variant arm).
-/// Mirrors Haskell's saturate's solveAllSafeGoals Disj-monad branching
-/// on small SplitGs — Haskell's precomputed source cases contain NO
-/// SplitG (each variant arm became its own case during saturate).
-/// Our precompute single-branches, so the variant SplitG persists; we
-/// fan it out at apply-source-case time instead.
-///
-/// Limited to "small" SplitG (size ≤ 3) — same threshold as
-/// `is_split_goal_small`.  Large SplitGs stay as goals (matching
-/// Haskell's smartRanking, which only ranks small SplitGs in
-/// solveFirst).
-///
-/// Returns Vec<(case_name, sys, action)> — one entry per surviving
-/// variant arm.  Empty Vec when no fan-out applies (returns the
-/// original triple).
+/// Dead — kept for diagnostic re-enable.  The Haskell-faithful behavior
+/// is to leave variant SplitG open through source-apply (Haskell's
+/// `applySource` + `conjoinSystem` merge the case state as-is).  This
+/// function used to eagerly fan out small SplitGs at apply time; the
+/// effect was unprincipled `Rule_case_N` sibling generation that
+/// Haskell never produces.  See commit message for details.
+#[allow(dead_code)]
 fn fanout_variant_splits(
     ctx: &crate::constraint::solver::context::ProofContext,
     sys: crate::constraint::system::System,
@@ -4606,20 +4569,11 @@ fn fanout_variant_splits(
     out
 }
 
-/// Apply 1-case `c_<sym>` constructor sources to any open KU goal in
-/// `sys` whose head term matches the source's abstract head.  Iterates
-/// to fixpoint (up to a small cap to bound runtime).  Mutates `sys`
-/// in place, marking the resolved KU goal as solved and grafting the
-/// source case's nodes/edges/sub-goals.
-///
-/// Mirrors the effect of Haskell `solveAllSafeGoals`'s saturate-time
-/// source-pick on `filter goodTh ths` (Sources.hs:206, 380-385).
-/// Haskell pre-resolves these constructor decompositions during
-/// `saturateSources` so their renderings collapse via `refineSource.
-/// combine` (Sources.hs:135-137 keeps the FIRST non-coerce name).
-/// Our precomputed cases don't always do this — the variant SplitG
-/// collapses before KU-expansion sees the substituted head — so we
-/// apply the auto-resolution here at runtime instead.
+/// Dead — kept for diagnostic re-enable.  Was companion to
+/// `fanout_variant_splits` (auto-applying 1-case constructor sources
+/// after fan-out); both unprincipled.  Haskell-faithful behavior
+/// leaves the SplitG and KU goals open for runtime goal-ranking.
+#[allow(dead_code)]
 fn auto_resolve_single_case_ku(
     ctx: &crate::constraint::solver::context::ProofContext,
     sys: &mut System,
