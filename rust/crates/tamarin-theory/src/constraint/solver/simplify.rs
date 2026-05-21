@@ -1830,10 +1830,63 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
     // would create a spurious cycle.  Skipping unifiable pairs lets
     // node-uniqueness merge them via the eq-store first.
     let nodes_snapshot: Vec<_> = red.sys.nodes.clone();
+    let edges_snapshot: Vec<_> = red.sys.edges.clone();
     let maude = red.ctx.maude.clone();
     let mut changed = ChangeIndicator::Unchanged;
+
+    // Build the route() function as a closure (Simplify.hs:486-496).
+    // `route nid` follows linear-fact edges from a node's single
+    // linear conclusion, returning the chain of node ids until either
+    // the node has multiple conclusions, the single conclusion is
+    // non-linear, or there's no outgoing edge from that conclusion.
+    let lookup_rule = |nid: &crate::constraint::constraints::NodeId|
+        -> Option<crate::rule::RuleACInst>
+    {
+        nodes_snapshot.iter().find(|(id, _)| id == nid)
+            .map(|(_, r)| r.clone())
+    };
+    // edge_map: NodeConc → NodeId (only first edge per conc is needed
+    // since the source case has at most one outgoing edge per conc).
+    let edge_map: std::collections::BTreeMap<
+        crate::constraint::constraints::NodeConc,
+        crate::constraint::constraints::NodeId> = edges_snapshot.iter()
+        .map(|e| (e.src.clone(), e.tgt.0.clone()))
+        .collect();
+    fn plain_route(
+        nid: &crate::constraint::constraints::NodeId,
+        lookup_rule: &dyn Fn(&crate::constraint::constraints::NodeId)
+            -> Option<crate::rule::RuleACInst>,
+        edge_map: &std::collections::BTreeMap<
+            crate::constraint::constraints::NodeConc,
+            crate::constraint::constraints::NodeId>,
+        depth: usize,
+    ) -> Vec<crate::constraint::constraints::NodeId> {
+        // Defensive depth bound — proto chains rarely exceed 16 in
+        // practice; this stops on cyclic edges (shouldn't happen
+        // in a well-formed system, but defensive).
+        if depth > 32 { return vec![nid.clone()]; }
+        let Some(rule) = lookup_rule(nid) else { return vec![nid.clone()]; };
+        if rule.conclusions.len() != 1 { return vec![nid.clone()]; }
+        let conc_fact = &rule.conclusions[0];
+        if !conc_fact.is_linear() { return vec![nid.clone()]; }
+        let conc_idx = crate::rule::ConcIdx(0);
+        let conc_key = (nid.clone(), conc_idx);
+        match edge_map.get(&conc_key) {
+            Some(next) => {
+                let mut out = vec![nid.clone()];
+                out.extend(plain_route(next, lookup_rule, edge_map, depth + 1));
+                out
+            }
+            None => vec![nid.clone()],
+        }
+    }
+
+    // Collect newLesses first so we can iterate to compute enhanced.
+    // Each entry: (sup_id, other_id) where sup_id < other_id was added.
+    let mut new_lesses: Vec<(
+        crate::constraint::constraints::NodeId,
+        crate::constraint::constraints::NodeId)> = Vec::new();
     for (sup_id, fresh_var) in &suppliers {
-        // Find the supplier's rule once.
         let sup_rule = match nodes_snapshot.iter().find(|(id, _)| id == sup_id) {
             Some((_, r)) => r, None => continue,
         };
@@ -1850,11 +1903,10 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
                 if found { break; }
             }
             if !found { continue; }
-            // nonUnifiableNodes side condition.
             match crate::rule::unifiable_rule_ac_insts(&maude, sup_rule, other_rule) {
-                Ok(true) => continue,   // unifiable → skip (could be same instance)
-                Ok(false) => {}         // distinct rules → safe to order
-                Err(_) => continue,     // be conservative on Maude errors
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(_) => continue,
             }
             let new_la = LessAtom::new(
                 sup_id.clone(), other_id.clone(), Reason::Fresh);
@@ -1862,8 +1914,63 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
                 red.sys.less_atoms.push(new_la);
                 changed = ChangeIndicator::Changed;
             }
+            new_lesses.push((sup_id.clone(), other_id.clone()));
         }
     }
+
+    // Step 3 — `enhancedLesses` (Simplify.hs:468).
+    //
+    // ```haskell
+    // enhancedLesses = [ LessAtom (last rs) j Fresh
+    //     | (LessAtom i j _) <- newLesses
+    //     , (frI, _) <- freshVars, i == frI
+    //     , rs <- [route frI], length rs > 1
+    //     , all (nonUnifiableNodes j) (tail rs)]
+    // ```
+    //
+    // For each `newLess (i, j)` where `i` is a fresh-consumer node:
+    //   - Compute `route(i)` — chain via single-linear-conclusion edges.
+    //   - If chain length > 1 AND every node in `tail route` is
+    //     non-unifiable with `j`:
+    //   - Add `LessAtom (last route) j Fresh`.
+    //
+    // Concrete trigger: `FreshOrderingTest.spthy::Order2` (csf23-subterms).
+    // The lemma `All s #i #j. Start2(s)@i ∧ Step(s)@j ⇒ i<j` is solvable
+    // via the enhanced rule but NOT via basic `newLesses`.  Without
+    // this step, Rust falsifies a verified lemma — confirmed against
+    // Haskell `interactive`'s dot output (LessAtom `#i < #j Fresh`
+    // comes from `enhancedLesses`).
+    let supplier_ids: std::collections::BTreeSet<_> = suppliers.iter()
+        .map(|(id, _)| id.clone()).collect();
+    for (i, j) in &new_lesses {
+        if !supplier_ids.contains(i) { continue; }   // i must be a frI
+        let rs = plain_route(i, &lookup_rule, &edge_map, 0);
+        if rs.len() <= 1 { continue; }
+        // `tail rs` — all nodes after the first.
+        let tail = &rs[1..];
+        // Side condition: all nodes in `tail rs` must be non-unifiable
+        // with `j`.  `nonUnifiableNodes n j = ¬ unifiableRuleACInsts
+        // rule(n) rule(j)`.
+        let j_rule = match nodes_snapshot.iter().find(|(id, _)| id == j) {
+            Some((_, r)) => r, None => continue,
+        };
+        let all_non_unifiable = tail.iter().all(|t_id| {
+            let t_rule = match nodes_snapshot.iter().find(|(id, _)| id == t_id) {
+                Some((_, r)) => r, None => return true,
+            };
+            !matches!(
+                crate::rule::unifiable_rule_ac_insts(&maude, t_rule, j_rule),
+                Ok(true))
+        });
+        if !all_non_unifiable { continue; }
+        let last = match rs.last() { Some(l) => l.clone(), None => continue };
+        let enhanced = LessAtom::new(last, j.clone(), Reason::Fresh);
+        if !red.sys.less_atoms.iter().any(|x| x == &enhanced) {
+            red.sys.less_atoms.push(enhanced);
+            changed = ChangeIndicator::Changed;
+        }
+    }
+
     changed
 }
 
