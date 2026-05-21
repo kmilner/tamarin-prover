@@ -4901,140 +4901,31 @@ fn sort_ge(a: tamarin_term::lterm::LSort, b: tamarin_term::lterm::LSort) -> bool
 /// after every `refineSource` call (saturateSources iterations
 /// + matchToGoal's refineSubst).  Both places need the restrict
 /// for runtime applySource to see a clean precomputed case.
-/// Flip same-sort var-var bindings `x → y` where `y` is in `stable_vars`
-/// but `x` is not.  Result `y → x` is Haskell-equivalent (both encode
-/// `x = y`) but survives the subsequent key-filter restrict.
-///
-/// Why this is needed: Haskell-faithful LVar Ord (idx-first) +
-/// `unify_lterm_factored` (larger-idx-as-key) orient bindings so the
-/// rule-internal var (large idx, NOT stable) becomes the key.  Restrict
-/// then drops the binding even though it carries load-bearing constraint
-/// info (e.g. `t#1 = kZero` ↔ same goal var = rule's conclusion arg).
-/// Without the binding, runtime `apply_source_case_premise`'s refineSubst
-/// (sources.rs:5503) trivially succeeds where Haskell would contradict
-/// via downstream substSystem propagation in the case_sys.
-fn flip_to_stable_keys(
-    sys: &mut System,
-    stable_vars: &std::collections::BTreeSet<tamarin_term::lterm::LVar>,
-) {
-    use tamarin_term::term::Term;
-    use tamarin_term::vterm::Lit;
-    let trace = std::env::var("TAM_DBG_FLIP").is_ok();
-    let mut kept: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)> = Vec::new();
-    let mut flipped: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)> = Vec::new();
-    for (k, v) in sys.eq_store.subst.to_list() {
-        let Term::Lit(Lit::Var(target_var)) = &v else {
-            kept.push((k, v));
-            continue;
-        };
-        // Already correct orientation (key is stable).
-        if stable_vars.contains(&k) {
-            kept.push((k, v));
-            continue;
-        }
-        // Flip if value is stable AND sort-compatible (same sort, or
-        // value's sort is broader so flipping doesn't widen).
-        if stable_vars.contains(target_var) {
-            // Allow flip when key's sort can be substituted by value's sort
-            // (i.e. value sort >= key sort in the lattice).  Same sort is OK.
-            // Cross-sort flip would invert direction which could widen the
-            // sort of the stable var — skip those.
-            if target_var.sort == k.sort {
-                if trace {
-                    eprintln!("[flip] {}#{}({:?})→{}#{}({:?})  TO  {}#{}({:?})→{}#{}({:?})",
-                        k.name, k.idx, k.sort, target_var.name, target_var.idx, target_var.sort,
-                        target_var.name, target_var.idx, target_var.sort,
-                        k.name, k.idx, k.sort);
-                }
-                flipped.push((target_var.clone(), Term::Lit(Lit::Var(k))));
-                continue;
-            }
-        }
-        kept.push((k, v));
-    }
-    // Add flipped entries, but only if both:
-    // (a) target isn't already a key (preserves domain disjointness), AND
-    // (b) target isn't a VALUE of any kept binding (flipping would
-    //     introduce a chain `kept_key → target → kept_value`, breaking
-    //     idempotency — see `restrict_eq_store_does_not_chain_chase`
-    //     test for the Haskell invariant).
-    //
-    // Haskell does NOT flip at all — `restrict` is a pure key-filter.
-    // Our flip exists to preserve rule-internal-to-canonical bindings
-    // that would otherwise be lost.  Skipping flips that would create
-    // chains keeps the idempotency invariant Haskell relies on for
-    // `applyVTerm` correctness.
-    //
-    // Concrete trigger for the chain-introducing case (task #222
-    // Loop_Start): saturate-time `{loopId:6 → t:1, kOrig:6 → t:2,
-    // t:3 → t:2}`.  Naively flipping `kOrig:6 → t:2` to `t:2 → kOrig:6`
-    // would create the chain `t:3 → t:2 → kOrig:6`, breaking the
-    // idempotency Haskell's `applyVTerm` relies on (it does ONE
-    // lookup, not chain-chase).  The downstream runtime then fails to
-    // propagate the Check0 repeated-arg equivalence to the lemma's
-    // `k = kOrig` constraint.
-    let mut existing_keys: std::collections::BTreeSet<tamarin_term::lterm::LVar> =
-        kept.iter().map(|(k, _)| k.clone()).collect();
-    let value_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar> = kept.iter()
-        .filter_map(|(_, v)| match v {
-            Term::Lit(Lit::Var(w)) => Some(w.clone()),
-            _ => None,
-        })
-        .collect();
-    for (k, v) in flipped {
-        if existing_keys.contains(&k) { continue; }
-        if value_vars.contains(&k) { continue; }   // flipping creates a chain
-        existing_keys.insert(k.clone());
-        kept.push((k, v));
-    }
-    sys.eq_store.subst = tamarin_term::subst::Subst::from_list(kept);
-}
-
 fn restrict_eq_store_to_stable_vars(
     sys: &mut System,
     stable_vars: &std::collections::BTreeSet<tamarin_term::lterm::LVar>,
 ) {
-    // Flip non-stable→stable var-var bindings so the stable var becomes
-    // the key, preserving the binding under the subsequent key-filter.
-    // See doc-comment on `flip_to_stable_keys`.
-    flip_to_stable_keys(sys, stable_vars);
-    // Build a (name, idx) set from stable_vars: under cross-sort unification,
-    // a stable var like `t#1:Msg` can be narrowed to `t#1:Fresh` and
-    // re-appear in the eq_store as a different LVar (Rust's PartialEq
-    // requires sort to match).  Haskell's `restrict` filters by full
-    // LVar identity, but in Haskell the narrowing always produces a
-    // binding `t#1:Msg → seed:Fresh` (Msg as key), so the issue doesn't
-    // arise.  In Rust post-LVar, sort narrowing via apply_lvar_subst
-    // can rebind the eq_store key to `t#1:Fresh`.  Keep both forms by
-    // matching on (name, idx).
     // Haskell's `restrict` in `Theory.Tools.EquationStore`
     // (EquationStore.hs:289 via Term.Substitution.Subst.restrict) is a
-    // simple key-filter: `Subst (M.filterWithKey (\k _ -> k `elem` vars) m)`.
-    // It does NOT chase chains.  Keys not in `vars` are dropped, and
-    // values that referenced those dropped keys become dangling — which
-    // is fine because Haskell's substitution lookup falls back to
-    // identity for unbound vars.
+    // simple key-filter using FULL LVar equality:
+    //   `Subst (M.filterWithKey (\k _ -> k `elem` vars) m)`
+    // - No chain-chase.
+    // - No flipping of non-stable→stable bindings.
+    // - No sort-blind (name, idx) matching.
+    // Keys not in `vars` are dropped; values that referenced dropped
+    // keys become dangling — fine because Haskell's substitution lookup
+    // falls back to identity for unbound vars.
     //
-    // Earlier this function chained-chased values to a fixed point
-    // before filtering, which collapsed e.g. `t:1 → e_A_1 → blind(...)`
-    // into `t:1 → blind(...)` directly.  The chain-chased binding
-    // survived restrict (because t:1 is stable), and at runtime
-    // `apply_source_case_action`'s `refineSubst` then tried to unify
-    // `t:1 = commit(z, r)` against the now-direct binding
-    // `t:1 → blind(...)`, which fails (commit vs blind).  Haskell
-    // doesn't do this chain-chase, so its `t:1 → e_A_1` survives with
-    // `e_A_1` unbound (since e_A_1 isn't in stable_vars); the
-    // runtime match then binds `e_A_1 = commit(z, r)` cleanly, and any
-    // downstream `[sources]`-axiom violation is caught via
-    // `FormulasFalse` rather than `refineSubst-contradictory`.
-    let stable_name_idx: std::collections::BTreeSet<(String, u64)> =
-        stable_vars.iter().map(|v| (v.name.clone(), v.idx)).collect();
+    // The prior Rust-specific workarounds (flip_to_stable_keys + sort-
+    // blind (name, idx) matching) were attempting to preserve bindings
+    // that the May 20 LVar-Ord change put on the wrong side of the
+    // key-filter.  Per "Haskell logic is the source of truth", those
+    // workarounds are removed — any divergence they were masking is a
+    // bug elsewhere (in unification orientation or narrowing) and must
+    // be fixed at that level instead.
     let kept: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)>
         = sys.eq_store.subst.to_list().into_iter()
-            .filter(|(v, _)| {
-                stable_vars.contains(v)
-                    || stable_name_idx.contains(&(v.name.clone(), v.idx))
-            })
+            .filter(|(v, _)| stable_vars.contains(v))
             .collect();
     sys.eq_store.subst = tamarin_term::subst::Subst::from_list(kept);
 }
