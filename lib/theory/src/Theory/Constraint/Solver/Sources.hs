@@ -211,7 +211,22 @@ solveAllSafeGoals ths' openChainsLimit =
             _                      -> return lastChainTerm
 
         case nextStep of
-          Nothing   -> return caseNames
+          Nothing   -> do
+              -- TAM_HS_TRACE_SOURCES_LEAF: dump per-leaf state for
+              -- diagnosing Rust-port saturate-case over-enumeration.
+              -- At a leaf (no safe goal remains) we're emitting one
+              -- case; dump caseNames + open-chain count + nodes/goals.
+              when T.flagSourcesLeaf $ do
+                  sys <- gets id
+                  let chCount = length [ () | (ChainG _ _, _) <- M.toList $ get sGoals sys ]
+                      goalCount = M.size $ get sGoals sys
+                      nodeCount = M.size $ get sNodes sys
+                  trace ("[LEAF] cn=" ++ show caseNames
+                       ++ " chains=" ++ show chCount
+                       ++ " nodes=" ++ show nodeCount
+                       ++ " goals=" ++ show goalCount
+                       ++ " chainsLeft=" ++ show chainsLeft) (return ())
+              return caseNames
           Just (step, Nothing) -> (\x -> solve ths (caseNames ++ x) lastChainTerm' (remainingChains safeGoals)) =<< step
           Just (step, Just usedCase) -> (\x -> solve (filterCases usedCase ths) (caseNames ++ x) lastChainTerm' (remainingChains safeGoals)) =<< step
 

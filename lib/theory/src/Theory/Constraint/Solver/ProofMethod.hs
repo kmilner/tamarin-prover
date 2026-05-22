@@ -456,11 +456,17 @@ execProofMethod ctxt method sys =
     -- solve the given goal
     -- PRE: Goal must be valid in this system.
     solve :: Goal -> Reduction CaseName
-    solve goal =
+    solve goal = do
+      -- TAM_HS_TRACE_STATE: emit a canonical [STATE] line BEFORE each
+      -- goal dispatch, paired with Rust's `TAM_RS_TRACE_STATE` (see
+      -- `proof_method.rs::SolveGoal`).  Lets the two stderr logs be
+      -- diff'd to find the first HS-vs-Rust system-state divergence.
+      sys <- St.get
+      T.traceStateM sys
       let ths = L.get pcSources ctxt
-      in maybe  (solveGoal goal)
-                (intercalate "_" <$>)
-                (solveWithSource ctxt ths goal)
+      maybe  (solveGoal goal)
+             (intercalate "_" <$>)
+             (solveWithSource ctxt ths goal)
 
     -- Induction is only possible if the system contains only
     -- a single, last-free, closed formula.

@@ -913,7 +913,15 @@ fn try_match_all_guards(
             let apply_canon = |f: &crate::guarded::Guarded| {
                 let f1 = if eq_vs.is_empty() { f.clone() }
                          else { crate::guarded::subst_guarded(f, &eq_vs) };
-                crate::guarded::normalize_witness_lvars(&f1)
+                let f2 = crate::guarded::normalize_witness_lvars(&f1);
+                // Bound-var alpha-canonicalization. Required because
+                // `freshen_system` shifts GGuarded bound-var idxs along
+                // with free vars (sources.rs:4158-4170), so the same
+                // source-assertion Disj from impliedFormulas comes back
+                // with different `j:K` allocations across iterations.
+                // HS uses DeBruijn-bound vars so this never matters
+                // there; Rust needs explicit alpha-normalisation.
+                crate::guarded::normalize_bound_lvars(&f2)
             };
             let canon = apply_canon(&implied);
             // Fast-path: structurally-equal candidates (no apply_canon
@@ -2571,10 +2579,24 @@ mod tests {
         // The Conj should have been removed from the open formula set.
         assert!(!r.sys.formulas.iter().any(|f|
             matches!(f, crate::guarded::Guarded::Conj(items) if items.len() == 2)));
-        // The two atoms need to live somewhere — either still pending
-        // (formulas) or marked solved.
-        assert!(r.sys.formulas.contains(&a1) || r.sys.solved_formulas.contains(&a1));
-        assert!(r.sys.formulas.contains(&a2) || r.sys.solved_formulas.contains(&a2));
+        // Haskell-faithful: GConj decomposition recurses on its
+        // members with mark=False, so GAto-Action members are
+        // inserted as `Goal::Action` (via `insertAtom -> insertAction`)
+        // rather than being tracked as formulas/solved_formulas.
+        // Mirrors HS `insert' mark fm = ... GConj fms -> mapM_ (insert
+        // False) (getConj fms)` (Reduction.hs:449-451) where the inner
+        // GAto path's `markAsSolved` is gated on `when mark`.
+        let _ = (&a1, &a2);
+        let has_action_goal = |name: &str| {
+            r.sys.goals.iter().any(|(g, _)| match g {
+                crate::constraint::constraints::Goal::Action(_, fa) =>
+                    matches!(&fa.tag,
+                        crate::fact::FactTag::Proto(_, n, _) if n == name),
+                _ => false,
+            })
+        };
+        assert!(has_action_goal("P"));
+        assert!(has_action_goal("Q"));
     }
 
     #[test]

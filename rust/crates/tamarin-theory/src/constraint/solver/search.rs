@@ -98,11 +98,24 @@ fn clear_deadline()                     { DEADLINE.with(|d| d.set(None));     }
 /// **Iterative-deepening DFS** — port of Haskell's `cutOnSolvedDFS`
 /// (Proof.hs:855-877).  Starts at `max_depth=4` and doubles up to
 /// 2048.  At each iteration:
-///   1. Run `expand` with the current `MAX_DEPTH`.
+///   1. Expand the tree at the current `MAX_DEPTH`.  On the first
+///      iteration this builds the tree from scratch; on subsequent
+///      iterations only `depth limit` Sorry leaves are re-expanded
+///      (mirroring Haskell's lazy-thunk memoization in
+///      `cutOnSolvedDFS`).
 ///   2. If status is Solved → return immediately (matches Haskell's
 ///      `Solution path` short-circuit via `<>`).
 ///   3. If `DEPTH_LIMIT_HIT` was set and depth < cap → double and retry.
 ///   4. Else (no Solved found, no depth limit hit) → return.
+///
+/// **Memoization** (task #287): Haskell's iter-deep gets free
+/// memoization because the proof tree is built lazily — each `prove sys'`
+/// thunk fires once when forced, and re-forcing a thunk returns the
+/// cached value.  Rust has no laziness, so without memoization each
+/// iter-deep iteration rebuilds the entire tree from scratch — visiting
+/// 2.3x more nodes than Haskell on NSLPK3.  We mirror Haskell by keeping
+/// the tree across iterations and only re-expanding `Sorry: depth limit`
+/// leaves (the analog of unforced thunks).
 ///
 /// This makes shorter Solved paths win over longer Solved paths even
 /// when the longer path is alphabetically earlier — critical for
@@ -121,18 +134,26 @@ pub fn run_proof_search(
     let id_dfs_disabled = std::env::var("TAM_DISABLE_ID_DFS").is_ok();
     let cap: usize = 2048;
     let mut current_max_depth: usize = if id_dfs_disabled { usize::MAX } else { 4 };
-    let mut root;
+    let mut root = ProofNode {
+        method: ProofMethod::Sorry(Some("initial".into())),
+        sys: initial.clone(),
+        children: BTreeMap::new(),
+        status: NodeStatus::Open,
+    };
+    let mut first_iter = true;
     loop {
         MAX_DEPTH.with(|m| m.set(current_max_depth));
         DEPTH_LIMIT_HIT.with(|f| f.set(false));
         let mut budget = max_steps;
-        root = ProofNode {
-            method: ProofMethod::Sorry(Some("initial".into())),
-            sys: initial.clone(),
-            children: BTreeMap::new(),
-            status: NodeStatus::Open,
-        };
-        expand(ctx, &mut root, &mut budget, &deadline, 0);
+        if first_iter {
+            expand(ctx, &mut root, &mut budget, &deadline, 0);
+            first_iter = false;
+        } else {
+            // Re-expand only `Sorry: depth limit` leaves (Haskell-faithful
+            // memoization — the cached tree IS the proof tree, only the
+            // unforced "depth limit" thunks need (re-)expansion).
+            re_expand_depth_limited(ctx, &mut root, &mut budget, &deadline, 0);
+        }
         if id_dfs_disabled {
             break;
         }
@@ -157,6 +178,103 @@ pub fn run_proof_search(
     DEPTH_LIMIT_HIT.with(|f| f.set(false));
     clear_deadline();
     root
+}
+
+/// Re-expand only the `Sorry: depth limit` leaves in the existing
+/// proof tree, preserving previously-computed subtrees.
+///
+/// This is the Rust analog of Haskell's lazy-thunk memoization: when
+/// `cutOnSolvedDFS` doubles `dMax` and re-walks the proof tree, only
+/// the unforced thunks (those past the previous depth limit) actually
+/// execute their `prove sys'` body.  Already-forced thunks return
+/// cached values.
+///
+/// Behaviour:
+/// - Solved/Contradictory/Unfinishable nodes: already resolved, skip.
+/// - Sorry with `"depth limit"` reason: re-expand from scratch at this
+///   depth using the (now larger) `MAX_DEPTH`.
+/// - Sorry with other reasons (budget, deadline, no method): preserve.
+/// - Other nodes: recurse into children, then re-roll up the status.
+///
+/// Early-break-on-Solved: matches `expand`'s short-circuit semantics —
+/// once any sibling is Solved during re-expansion, stop traversing
+/// the remaining siblings (Haskell's `foldMap`-with-Solution semigroup).
+fn re_expand_depth_limited(
+    ctx: &ProofContext,
+    node: &mut ProofNode,
+    budget: &mut usize,
+    deadline: &std::time::Instant,
+    depth: usize,
+) {
+    // Was this node previously stalled at the depth limit?
+    let was_depth_limited = matches!(
+        &node.method,
+        ProofMethod::Sorry(Some(msg)) if msg == "depth limit"
+    ) && matches!(node.status, NodeStatus::Sorry);
+    if was_depth_limited {
+        // Re-expand from scratch at this depth.  The deeper `MAX_DEPTH`
+        // now lets the recursion go further before stalling again.
+        node.method = ProofMethod::Sorry(None);
+        node.children = BTreeMap::new();
+        node.status = NodeStatus::Open;
+        expand(ctx, node, budget, deadline, depth);
+        return;
+    }
+    // Already resolved — return cached subtree.
+    if matches!(
+        node.status,
+        NodeStatus::Solved | NodeStatus::Contradictory | NodeStatus::Unfinishable
+    ) {
+        return;
+    }
+    // Sorry with non-depth-limit reason and no descendants: preserve.
+    // (Budget exhausted, deadline, or no-method Sorrys are terminal.)
+    if matches!(node.status, NodeStatus::Sorry) && node.children.is_empty() {
+        return;
+    }
+    // Recurse into children.  Any depth-limited descendant gets
+    // re-expanded in place.  Match `expand`'s early-break-on-Solved.
+    let names: Vec<String> = node.children.keys().cloned().collect();
+    let mut found_solved = false;
+    for name in names {
+        if found_solved { break; }
+        if *budget == 0 { break; }
+        if std::time::Instant::now() >= *deadline { break; }
+        if let Some(child) = node.children.get_mut(&name) {
+            re_expand_depth_limited(ctx, child, budget, deadline, depth + 1);
+            if matches!(child.status, NodeStatus::Solved) {
+                found_solved = true;
+            }
+        }
+    }
+    // Re-roll up the parent's status from current children — mirrors
+    // expand's rollup at lines 356-370.
+    let mut any_solved = false;
+    let mut any_contra = false;
+    let mut any_unfin = false;
+    let mut any_sorry = false;
+    for child in node.children.values() {
+        match child.status {
+            NodeStatus::Solved => any_solved = true,
+            NodeStatus::Contradictory => any_contra = true,
+            NodeStatus::Unfinishable => any_unfin = true,
+            NodeStatus::Sorry => any_sorry = true,
+            NodeStatus::Open => {}
+        }
+    }
+    if !node.children.is_empty() {
+        node.status = if any_solved {
+            NodeStatus::Solved
+        } else if any_sorry {
+            NodeStatus::Sorry
+        } else if any_unfin {
+            NodeStatus::Unfinishable
+        } else if any_contra {
+            NodeStatus::Contradictory
+        } else {
+            NodeStatus::Sorry
+        };
+    }
 }
 
 fn expand(

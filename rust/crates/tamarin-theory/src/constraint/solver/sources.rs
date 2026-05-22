@@ -2200,6 +2200,7 @@ fn saturate_out_premise(
         // dedupping here would diverge from Haskell.
         let mut this_sub: Vec<System> = Vec::new();
         let dbg_drop = std::env::var("TAM_DBG_DROP_CASE").is_ok();
+        let dbg_branch = std::env::var("TAM_DBG_BRANCH").is_ok();
         let mut idx = 0;
         for s in close_results.into_iter() {
             idx += 1;
@@ -2220,6 +2221,39 @@ fn saturate_out_premise(
             }
             if dbg_drop {
                 eprintln!("[drop_case] sub_name={:?} idx={} KEPT", sub_name, idx);
+            }
+            if dbg_branch {
+                eprintln!("\n[branch] outer={} sub_name={:?} idx={}",
+                    outer_name, sub_name, idx);
+                eprintln!("  nodes ({}):", s.nodes.len());
+                for (nid, rule) in &s.nodes {
+                    let rname = format!("{:?}", rule.info)
+                        .chars().take(80).collect::<String>();
+                    eprintln!("    {:?} → {}", nid, rname);
+                }
+                eprintln!("  edges ({}):", s.edges.len());
+                for e in s.edges.iter().take(20) {
+                    eprintln!("    {:?} → {:?}", e.src, e.tgt);
+                }
+                let subst_pairs = s.eq_store.subst.to_list();
+                eprintln!("  eq_store.subst ({}):", subst_pairs.len());
+                for (k, v) in subst_pairs.iter().take(20) {
+                    let vs = format!("{:?}", v).chars().take(80).collect::<String>();
+                    eprintln!("    {:?} → {}", k, vs);
+                }
+                eprintln!("  eq_store.conj ({} disjs):", s.eq_store.conj.len());
+                for (i, d) in s.eq_store.conj.iter().enumerate().take(5) {
+                    eprintln!("    [{}] {} substs", i, d.substs.len());
+                }
+                let n_open_goals = s.goals.iter()
+                    .filter(|(_, st)| !st.solved && !st.looping).count();
+                eprintln!("  open goals ({}):", n_open_goals);
+                for (g, st) in s.goals.iter()
+                    .filter(|(_, st)| !st.solved && !st.looping).take(8)
+                {
+                    let gs = format!("{:?}", g).chars().take(120).collect::<String>();
+                    eprintln!("    {} (looping={})", gs, st.looping);
+                }
             }
             this_sub.push(s);
         }

@@ -211,17 +211,42 @@ pub fn exec_proof_method(
         ProofMethod::SolveGoal(g) => {
             let dbg_solve = std::env::var("TAM_DBG_SOLVE").is_ok();
             let t_dispatch = std::time::Instant::now();
+            // State snapshot BEFORE dispatch — paired with HS's
+            // `[STATE]` line in `Theory.Constraint.Solver.ProofMethod.solve`.
+            // Emits the canonical open-goal / node set so we can see what
+            // ranking decision was available at this proof step.  Reusable
+            // for any future HS-vs-Rust step-by-step lockstep diff: set
+            // `TAM_RS_TRACE_STATE=1` + `TAM_HS_TRACE_STATE=1` on both
+            // sides, run the same theory, diff the outputs.
+            crate::constraint::solver::trace::trace_state(sys);
             let mut r = Reduction::new(ctx, sys.clone());
             let outcome = crate::constraint::solver::goals::dispatch_solve_goal(&mut r, g);
             if dbg_solve {
-                let name: String = format!("{:?}", g).chars().take(60).collect();
+                let truncate_at: usize = std::env::var("TAM_DBG_SOLVE_TRUNC")
+                    .ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+                let name: String = format!("{:?}", g).chars().take(truncate_at).collect();
                 let kind = match &outcome {
                     crate::constraint::solver::reduction::GoalCases::Linear => "Linear".to_string(),
-                    crate::constraint::solver::reduction::GoalCases::LinearNamed(_) => "LinearNamed".to_string(),
-                    crate::constraint::solver::reduction::GoalCases::Cases(cs) => format!("Cases({})", cs.len()),
+                    crate::constraint::solver::reduction::GoalCases::LinearNamed(n) => format!("LinearNamed({})", n),
+                    crate::constraint::solver::reduction::GoalCases::Cases(cs) => {
+                        let names: Vec<&str> = cs.iter().map(|(n, _)| n.as_str()).collect();
+                        format!("Cases({})=[{}]", cs.len(), names.join(","))
+                    },
                     crate::constraint::solver::reduction::GoalCases::Contradictory => "Contradictory".to_string(),
                 };
                 eprintln!("[solve] dispatch {} → {} in {:?}", name, kind, t_dispatch.elapsed());
+                if std::env::var("TAM_DBG_SOLVE_NODES").is_ok() {
+                    // Dump sys.nodes (rule names per node) so we can
+                    // see which rules are grafted when the goal is
+                    // dispatched.
+                    let mut node_list: Vec<String> = sys.nodes.iter()
+                        .map(|(id, rule)| format!("{}#{}={}",
+                            id.name, id.idx,
+                            crate::constraint::solver::reduction::rule_case_name(rule)))
+                        .collect();
+                    node_list.sort();
+                    eprintln!("[solve] nodes: [{}]", node_list.join(", "));
+                }
             }
             // Run simplify after every goal-solving step — mirrors
             // Haskell's `m <* simplifySystem` pattern in `process`

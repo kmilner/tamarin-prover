@@ -65,9 +65,13 @@ module Theory.Constraint.Solver.Trace (
   , flagSources
   , flagChains
   , flagExec
+  , flagSourcesLeaf
+  , flagState
+  , traceStateM
   ) where
 
 import           Control.Monad.Disj            (MonadDisj, contradictoryIf)
+import           Data.List                     (intercalate, sort)
 import qualified Data.Map                      as M
 import qualified Data.Set                      as S
 import           Debug.Trace                   (trace, traceM)
@@ -76,6 +80,13 @@ import           System.IO.Unsafe              (unsafePerformIO)
 import qualified System.Environment            as SysEnv
 
 import           Theory.Constraint.System
+import           Theory.Constraint.System.Constraints
+                                                (Goal(..))
+import           Theory.Constraint.System.Guarded
+                                                (LNGuarded, Guarded(..))
+import           Logic.Connectives             (getDisj)
+import           Theory.Model
+                  (LNFact, Fact(..), FactTag(..), showRuleCaseName)
 
 
 -- | Read an env var at module load time (cached via NOINLINE so the
@@ -109,6 +120,41 @@ flagExec :: Bool
 flagExec = unsafePerformIO $
     maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_EXEC"
 {-# NOINLINE flagExec #-}
+
+-- TAM_HS_TRACE_SOURCES_LEAF: dump per-leaf state in solveAllSafeGoals.
+-- Each time `solve` returns `caseNames` (no safe goal remains),
+-- one line is printed: `[LEAF] cn=... chains=... nodes=... goals=...`.
+-- Used to count actual leaves in HS's Disj-monad tree for comparison
+-- with Rust's `close_chains_dfs` closure count.
+flagSourcesLeaf :: Bool
+flagSourcesLeaf = unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_SOURCES_LEAF"
+{-# NOINLINE flagSourcesLeaf #-}
+
+-- TAM_HS_TRACE_STATE: dump a canonical system-state line before each
+-- `solveGoal` dispatch in ProofMethod.solve.  Format-matched against
+-- Rust's `TAM_RS_TRACE_STATE` output (see
+-- `rust/crates/tamarin-theory/src/constraint/solver/trace.rs`) so the
+-- two logs can be diffed side-by-side to find the FIRST system-state
+-- divergence between the implementations.
+--
+-- Line shape:
+--   [STATE] nodes=[<RuleName×N, ...>] goals=[<Kind(head), ...>] formulas=N solved_formulas=M
+--
+-- - `nodes`: sorted, count-compressed rule-case-name list.  Var idxs
+--   suppressed so two structurally-identical systems compare equal
+--   across HS/Rust idx allocation drift.
+-- - `goals`: sorted list of UNSOLVED goal kinds + canonical fact heads.
+--   Use the same `factCanonical` style as `goalKind` (Goals.hs:218-234).
+-- - `formulas`/`solved_formulas`: counts only.  Full bodies elided to
+--   keep the line readable; depth dumps available via TAM_HS_TRACE_SIMP.
+--
+-- Reusable for any future state-divergence investigation: enable the
+-- env vars on both sides, run the same theory, diff the outputs.
+flagState :: Bool
+flagState = unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_STATE"
+{-# NOINLINE flagState #-}
 
 
 -- | Drop-in replacement for `contradictoryIf` with a site label.  When
@@ -198,3 +244,84 @@ dumpSystemSummary sys =
     " less=" ++ show (S.size (L.get sLessAtoms sys)) ++
     " goals=" ++ show (M.size (L.get sGoals sys)) ++
     " formulas=" ++ show (S.size (L.get sFormulas sys))
+
+-- | Emit a `[STATE]` line summarising the system state.  Format-matched
+-- against Rust's `TAM_RS_TRACE_STATE` output (see
+-- `rust/crates/tamarin-theory/src/constraint/solver/trace.rs::trace_state`)
+-- so the two logs can be diffed side-by-side to find the FIRST
+-- system-state divergence between the implementations.
+--
+-- Reusable: enable `TAM_HS_TRACE_STATE=1` (HS) + `TAM_RS_TRACE_STATE=1`
+-- (Rust) on the same theory, then `diff` the stderr outputs.
+--
+-- Line format:
+--
+--   [STATE] nodes=[<RuleName×N, ...>] goals=[<Kind(head), ...>] formulas=N solved_formulas=M
+--
+-- - `nodes`: sorted, count-compressed list of rule-case-names.  Var idxs
+--   are suppressed so two structurally-identical systems compare equal
+--   across HS/Rust idx allocation drift.
+-- - `goals`: sorted list of UNSOLVED goal kinds + canonical fact heads,
+--   following `goalKind`'s `factCanonical` shape (Goals.hs:218-234).
+-- - `formulas`/`solved_formulas`: counts only.  Full bodies elided to
+--   keep the line readable; depth dumps available via other flags.
+traceStateM :: Applicative m => System -> m ()
+traceStateM sys
+    | flagState = traceM ("[STATE] nodes=" ++ canonicalNodes sys
+                       ++ " goals=" ++ canonicalOpenGoals sys
+                       ++ " formulas=" ++ show (S.size (L.get sFormulas sys))
+                       ++ " solved_formulas=" ++ show (S.size (L.get sSolvedFormulas sys)))
+    | otherwise = pure ()
+{-# NOINLINE traceStateM #-}
+
+canonicalNodes :: System -> String
+canonicalNodes sys =
+    compressDups $ sort $ map (showRuleCaseName . snd) $ M.toList $ L.get sNodes sys
+
+canonicalOpenGoals :: System -> String
+canonicalOpenGoals sys =
+    let pairs = M.toList (L.get sGoals sys)
+        unsolved = [ g | (g, gs) <- pairs, not (L.get gsSolved gs) ]
+        digests  = sort (map goalCanonical unsolved)
+    in "[" ++ intercalate "," digests ++ "]"
+
+goalCanonical :: Goal -> String
+goalCanonical g = case g of
+    ActionG _ fa  -> "Action(" ++ factCanonical fa ++ ")"
+    PremiseG _ fa -> "Premise(" ++ factCanonical fa ++ ")"
+    ChainG _ _    -> "Chain"
+    SplitG _      -> "Split"
+    DisjG d       -> "Disj[" ++ intercalate "|" (map guardedHead (getDisj d)) ++ "]"
+    SubtermG _    -> "Subterm"
+
+-- | Canonical short rendering of a fact's tag + arity.  Suppresses
+-- term content entirely; the goal-set count and tag distribution are
+-- sufficient for the lockstep-state diff.  If a finer-grained head
+-- comparison becomes necessary, extend with `viewTerm` matching
+-- (mirror `goalKind` in Goals.hs:218-234).
+factCanonical :: LNFact -> String
+factCanonical (Fact tag _ ts) =
+    showFactTag tag ++ "/" ++ show (length ts)
+  where
+    showFactTag KUFact            = "KU"
+    showFactTag KDFact            = "KD"
+    showFactTag FreshFact         = "Fr"
+    showFactTag OutFact           = "Out"
+    showFactTag InFact            = "In"
+    showFactTag (ProtoFact _ n _) = n
+
+guardedHead :: LNGuarded -> String
+guardedHead g = case g of
+    GAto _              -> "Atom"
+    GConj _             -> "Conj"
+    GDisj _             -> "Disj"
+    GGuarded q vs _ _   -> show q ++ show (length vs) ++ "v"
+
+compressDups :: [String] -> String
+compressDups xs = "[" ++ intercalate "," (go xs) ++ "]"
+  where
+    go []     = []
+    go (y:ys) =
+        let (eqs, rest) = span (== y) ys
+            n           = 1 + length eqs
+        in (if n > 1 then y ++ "\215" ++ show n else y) : go rest
