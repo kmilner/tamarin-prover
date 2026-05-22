@@ -2800,7 +2800,23 @@ impl<'ctx> Reduction<'ctx> {
             let n_var = tamarin_term::lterm::LVar::new(
                 "n", tamarin_term::lterm::LSort::Fresh, next_n);
             let n_term = tamarin_term::term::Term::Lit(
-                tamarin_term::vterm::Lit::Var(n_var));
+                tamarin_term::vterm::Lit::Var(n_var.clone()));
+            if std::env::var("TAM_RS_TRACE_FR_NARROW").is_ok() {
+                eprintln!("[RS-FR-NARROW] Fr({}_{}:{:?}) narrowed to ~n.{}",
+                    match &m {
+                        tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Var(v)) => &v.name,
+                        _ => "?",
+                    },
+                    match &m {
+                        tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Var(v)) => v.idx,
+                        _ => 0,
+                    },
+                    match &m {
+                        tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Var(v)) => v.sort,
+                        _ => tamarin_term::lterm::LSort::Msg,
+                    },
+                    next_n);
+            }
             let eq = tamarin_term::rewriting::Equal { lhs: m, rhs: n_term };
             // Haskell `void (solveTermEqs SplitNow [Equal m n])` —
             // `void` ignores ChangeIndicator but the monadic bind
