@@ -440,7 +440,13 @@ fn expand(
             children: BTreeMap::new(),
             status: NodeStatus::Open,
         };
+        // Track proof-tree path for branch-aware lockstep tracing.
+        // Skip empty-name cases (Simplify produces a single "" case
+        // with no proof-tree label — they're transparent in HS too).
+        let push_path = !name.is_empty();
+        if push_path { crate::constraint::solver::trace::case_path_push(&name); }
         expand(ctx, &mut child, budget, deadline, depth + 1);
+        if push_path { crate::constraint::solver::trace::case_path_pop(); }
         match child.status {
             NodeStatus::Solved => any_solved = true,
             NodeStatus::Contradictory => any_contra = true,
