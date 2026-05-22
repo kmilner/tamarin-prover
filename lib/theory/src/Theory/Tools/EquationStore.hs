@@ -8,6 +8,7 @@
 {-# LANGUAGE ViewPatterns               #-}
 {-# LANGUAGE TypeSynonymInstances       #-}
 {-# LANGUAGE FlexibleInstances          #-}
+{-# LANGUAGE FlexibleContexts           #-}
 {-# LANGUAGE MultiParamTypeClasses      #-}
 -- |
 -- Copyright   : (c) 2010-2012 Benedikt Schmidt, Simon Meier
@@ -65,6 +66,16 @@ import           Extension.Prelude
 import           Utils.Misc
 
 import           Debug.Trace.Ignore
+
+-- TAM_HS_TRACE_SIMP: reusable env-var-gated tracing for the eq-store
+-- simplification pipeline.  Imports the REAL Debug.Trace + System.IO.Unsafe
+-- (so we can read the env var without threading IO through the monad
+-- transformer stack) and exposes `traceSimp`.  Use sparingly — calls
+-- to `traceSimp` short-circuit to id when the env var is unset, so they
+-- have negligible runtime cost.
+import qualified Debug.Trace
+import qualified System.Environment
+import qualified System.IO.Unsafe
 
 import           Control.Basics
 import           Control.DeepSeq
@@ -354,11 +365,72 @@ simpDisjunction hnd isContr disj0 = do
 -- Simplification
 ----------------------------------------------------------------------
 
+------------------------------------------------------------------------------
+-- TAM_HS_TRACE_SIMP — reusable env-var-gated tracing for `simp`.
+--
+-- Set `TAM_HS_TRACE_SIMP=1` to dump:
+--   * the eq-store conj (with full sort info) on entry of every `simp` call,
+--   * which passes inside `simp1` fired and the post-pass conj after each one,
+--   * the final conj on `simp` exit.
+--
+-- Designed to stay zero-cost when the env var is unset — `tamHsTraceSimpOn`
+-- is evaluated via `unsafePerformIO . lookupEnv` at every callsite but GHC's
+-- per-process IORef cache and constant-folded comparisons keep the overhead
+-- minimal in practice.
+------------------------------------------------------------------------------
+
+tamHsTraceSimpOn :: Bool
+tamHsTraceSimpOn = System.IO.Unsafe.unsafePerformIO $
+    maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_TRACE_SIMP"
+{-# NOINLINE tamHsTraceSimpOn #-}
+
+-- | `traceSimp tag x` returns `x`; when `TAM_HS_TRACE_SIMP=1`, also emits
+-- `[HS-SIMP] <tag>` to stderr.  Use the `Show`-able payload variant
+-- (`traceSimpShow`) when you want to include the value being inspected.
+traceSimp :: String -> a -> a
+traceSimp tag x =
+    if tamHsTraceSimpOn
+        then Debug.Trace.trace ("[HS-SIMP] " ++ tag) x
+        else x
+
+traceSimpShow :: Show s => String -> s -> a -> a
+traceSimpShow tag payload x =
+    if tamHsTraceSimpOn
+        then Debug.Trace.trace ("[HS-SIMP] " ++ tag ++ " " ++ show payload) x
+        else x
+
+-- | Render an EqStore's conj compactly for diagnostic output: per-disj id
+-- followed by its substs with explicit sort annotations on every range var.
+renderEqStoreConj :: EqStore -> String
+renderEqStoreConj eqStore =
+    "conj=" ++ show (length (getConj (L.get eqsConj eqStore))) ++
+    " " ++ concatMap renderDisj (getConj (L.get eqsConj eqStore))
+  where
+    renderDisj (idx, substs) =
+        "[" ++ show (unSplitId idx) ++ ":" ++
+        show (length (S.toList substs)) ++ " " ++
+        intercalate " | " (map renderSubst (S.toList substs)) ++ "] "
+    renderSubst s =
+        "{" ++ intercalate ", " (map renderMapping (substToListVFresh s)) ++ "}"
+    renderMapping (v, t) =
+        show v ++ ":" ++ show (lvarSort v) ++ "→" ++
+        show t ++ rangeSorts t
+    rangeSorts t =
+        let rangeVars = [ lv | lv <- frees t ]
+        in if null rangeVars
+            then ""
+            else " {sorts: " ++
+                 intercalate "," (map (\lv -> show lv ++ ":" ++ show (lvarSort lv)) rangeVars) ++
+                 "}"
+    intercalate sep = foldr (\a acc -> if null acc then a else a ++ sep ++ acc) ""
+
 -- | @simp eqStore@ simplifies the equation store.
 simp :: MonadFresh m => MaudeHandle -> (LNSubst -> LNSubstVFresh -> Bool) -> EqStore -> m EqStore
 simp hnd isContr eqStore =
-    execStateT (whileTrue (simp1 hnd isContr))
-               (trace (show ("eqStore", eqStore)) eqStore)
+    traceSimp ("ENTER " ++ renderEqStoreConj eqStore) $ do
+        out <- execStateT (whileTrue (simp1 hnd isContr))
+                          (trace (show ("eqStore", eqStore)) eqStore)
+        return $! traceSimp ("EXIT  " ++ renderEqStoreConj out) out
 
 
 -- | @simp1@ tries to execute one simplification step
@@ -371,15 +443,29 @@ simp1 hnd isContr = do
         then return False
         else do
           b1 <- simpMinimize (isContr (L.get eqsSubst eqs))
+          dumpPostPass "simpMinimize" b1
           b2 <- simpRemoveRenamings
+          dumpPostPass "simpRemoveRenamings" b2
           b3 <- simpEmptyDisj
+          dumpPostPass "simpEmptyDisj" b3
           b4 <- foreachDisj hnd simpSingleton
+          dumpPostPass "simpSingleton" b4
           b5 <- foreachDisj hnd simpAbstractSortedVar
+          dumpPostPass "simpAbstractSortedVar" b5
           b6 <- foreachDisj hnd simpIdentify
+          dumpPostPass "simpIdentify" b6
           b7 <- foreachDisj hnd simpAbstractFun
+          dumpPostPass "simpAbstractFun" b7
           b8 <- foreachDisj hnd simpAbstractName
+          dumpPostPass "simpAbstractName" b8
           (trace (show ("simp:", [b1, b2, b3, b4, b5, b6, b7, b8]))) $
               return $ (or [b1, b2, b3, b4, b5, b6, b7, b8])
+  where
+    dumpPostPass passName fired =
+        when (fired && tamHsTraceSimpOn) $ do
+            postEqs <- MS.get
+            Debug.Trace.traceM ("[HS-SIMP] after " ++ passName ++
+                                " " ++ renderEqStoreConj postEqs)
 
 
 -- | Remove variable renamings in fresh substitutions.
