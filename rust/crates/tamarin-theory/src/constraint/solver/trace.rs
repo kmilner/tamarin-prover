@@ -76,6 +76,84 @@ pub fn trace_state(sys: &crate::constraint::system::System) {
         canonical_open_goals(sys),
         sys.formulas.len(),
         sys.solved_formulas.len());
+    if state_full_flag() {
+        // Additional [STATE_FULL] emission for fine-grained lockstep
+        // diff: dumps the FULL action terms with var idxs suppressed
+        // (canonical form for clean HS-Rust diff).
+        eprintln!("[STATE_FULL] node_actions={}", canonical_node_actions(sys));
+        eprintln!("[STATE_FULL] open_actions={}", canonical_open_actions(sys));
+    }
+}
+
+fn state_full_flag() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("TAM_RS_TRACE_STATE_FULL").is_ok())
+}
+
+/// Canonicalize an LNTerm by suppressing LVar idxs.  Keeps name+sort,
+/// strips the numeric idx.  Same shape on HS / Rust => diff-able.
+fn canonical_lnterm(t: &tamarin_term::lterm::LNTerm) -> String {
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    use tamarin_term::function_symbols::FunSym;
+    match t {
+        Term::Lit(Lit::Var(v)) => {
+            format!("{}{}:{:?}", sort_prefix(v.sort), v.name, v.sort)
+        }
+        Term::Lit(Lit::Con(n)) => {
+            let nm = &n.id.0;
+            match n.tag {
+                tamarin_term::lterm::NameTag::Pub => format!("'{}'", nm),
+                tamarin_term::lterm::NameTag::Fresh => format!("~'{}'", nm),
+                tamarin_term::lterm::NameTag::Nat => format!("%{}", nm),
+                tamarin_term::lterm::NameTag::Node => format!("#'{}'", nm),
+            }
+        }
+        Term::App(sym, args) => {
+            let head = match sym {
+                FunSym::NoEq(s) => String::from_utf8_lossy(&s.name).to_string(),
+                FunSym::C(_) => "C".to_string(),
+                FunSym::Ac(_) => "AC".to_string(),
+                FunSym::List => "List".to_string(),
+            };
+            let args_s: Vec<String> = args.iter().map(canonical_lnterm).collect();
+            format!("{}({})", head, args_s.join(","))
+        }
+    }
+}
+
+fn canonical_fact(fa: &crate::fact::LNFact) -> String {
+    let terms: Vec<String> = fa.terms.iter().map(canonical_lnterm).collect();
+    format!("{}({})", fact_tag_short(&fa.tag), terms.join(","))
+}
+
+fn canonical_node_actions(sys: &crate::constraint::system::System) -> String {
+    // Dump all action atoms from sys.nodes — same iteration order as
+    // Haskell's `allActions sys` (M.toList sNodes <- rActs).  Idxs
+    // suppressed for clean diff.
+    let mut acts: Vec<String> = Vec::new();
+    for (_, rule) in &sys.nodes {
+        for a in &rule.actions {
+            acts.push(canonical_fact(a));
+        }
+    }
+    acts.sort();
+    let compressed = compress_dups(&acts);
+    compressed
+}
+
+fn canonical_open_actions(sys: &crate::constraint::system::System) -> String {
+    use crate::constraint::constraints::Goal;
+    let mut acts: Vec<String> = Vec::new();
+    for (g, st) in &sys.goals {
+        if st.solved { continue; }
+        if let Goal::Action(_, fa) = g {
+            acts.push(canonical_fact(fa));
+        }
+    }
+    acts.sort();
+    let compressed = compress_dups(&acts);
+    compressed
 }
 
 /// Emit a [PICK] line indicating which goal was selected for this dispatch.
