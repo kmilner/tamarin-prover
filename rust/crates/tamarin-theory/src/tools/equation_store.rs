@@ -732,6 +732,103 @@ impl EquationStore {
         true
     }
 
+    /// `simpAbstractSortedVar`: if every substitution `si` in a
+    /// disjunction maps a variable `v` to variables `xi` of the SAME
+    /// sort `s` that is STRICTLY narrower than `lvarSort v`, then they
+    /// all contain the common factor `{v → y}` for a fresh variable
+    /// `y` of sort `s`, and we can replace `{v → xi}` by `{y → xi}` in
+    /// all `si`.
+    ///
+    /// Haskell reference (EquationStore.hs:471-492):
+    /// ```haskell
+    /// simpAbstractSortedVar (subst:others) = case commonSortedVar of
+    ///     (v, s, lvs):_ -> do
+    ///         fv <- freshLVar (lvarName v) s
+    ///         return $ Just (Just $ substFromList [(v, varTerm fv)]
+    ///                       , [S.fromList (zipWith (replaceMapping v fv) lvs (subst:others))])
+    ///   where
+    ///     commonSortedVar = do
+    ///         (v, (viewTerm -> Lit (Var lx))) <- substToListVFresh subst
+    ///         guard (sortCompare (lvarSort v) (lvarSort lx) == Just GT)
+    ///         let images = map (\s -> imageOfVFresh s v) others
+    ///             goodImages = [ ly | Just (viewTerm -> Lit (Var ly)) <- images
+    ///                                , lvarSort lx == lvarSort ly]
+    ///         guard (length images == length goodImages)
+    ///         return (v, lvarSort lx, (lx:goodImages))
+    /// ```
+    ///
+    /// This is the pass that narrows protocol rule body Msg-vars to
+    /// Fresh witnesses when the variant constraints all map them to
+    /// Fresh vars — load-bearing for `hasImpossibleChain` to fire on
+    /// destructor extensions through TLS-style `senc(<...>, h)` payloads
+    /// (otherwise the chain conc keeps Msg-var `sid` and the check
+    /// can't determine root symbols).
+    pub fn simp_abstract_sorted_var<F: FnMut(u64) -> u64>(
+        &mut self,
+        alloc: &mut F,
+    ) -> bool {
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+        use tamarin_term::lterm::LVar;
+        let mut to_apply: Option<(LVar, tamarin_term::lterm::LSort, Vec<LVar>, usize)> = None;
+        for (idx, d) in self.conj.iter().enumerate() {
+            if d.substs.is_empty() { continue; }
+            let first = &d.substs[0];
+            for (v, t) in first.to_list() {
+                let lx = match &t {
+                    Term::Lit(Lit::Var(lx)) => lx.clone(),
+                    _ => continue,
+                };
+                if !matches!(
+                    sort_compare(v.sort, lx.sort),
+                    Some(std::cmp::Ordering::Greater)
+                ) {
+                    continue;
+                }
+                let mut lvs: Vec<LVar> = vec![lx.clone()];
+                let mut all_match = true;
+                for other in d.substs.iter().skip(1) {
+                    match other.image_of(&v) {
+                        Some(Term::Lit(Lit::Var(ly))) if ly.sort == lx.sort => {
+                            lvs.push(ly.clone());
+                        }
+                        _ => { all_match = false; break; }
+                    }
+                }
+                if all_match {
+                    to_apply = Some((v.clone(), lx.sort, lvs, idx));
+                    break;
+                }
+            }
+            if to_apply.is_some() { break; }
+        }
+        let (v, s, lvs, idx) = match to_apply {
+            Some(p) => p,
+            None => return false,
+        };
+        // Allocate a fresh witness fv with the narrower sort `s`.
+        let new_idx = alloc(1);
+        let fv = LVar { name: v.name.clone(), sort: s, idx: new_idx };
+        // Compose {v → Var(fv)} into the free substitution.
+        let factor = LNSubst::from_list(vec![
+            (v.clone(), Term::Lit(Lit::Var(fv.clone()))),
+        ]);
+        self.subst = factor.compose(&self.subst);
+        // For each (subst, lv) pair, remove (v, _) and add (fv, Var(lv)).
+        let new_substs: Vec<LNSubstVFresh> = self.conj[idx].substs.iter()
+            .zip(lvs.iter())
+            .map(|(s, lv)| {
+                let mut kept: Vec<(LVar, LNTerm)> = s.to_list().into_iter()
+                    .filter(|(x, _)| x != &v)
+                    .collect();
+                kept.push((fv.clone(), Term::Lit(Lit::Var(lv.clone()))));
+                LNSubstVFresh::from_list(kept)
+            })
+            .collect();
+        self.conj[idx].substs = new_substs;
+        true
+    }
+
     /// Variant of `simp` that also runs `simp_singleton` — converts
     /// singleton disjunctions (one substitution as the only disjunct)
     /// into free-substitution composition via `freshToFree`.  Mirrors
@@ -777,6 +874,7 @@ impl EquationStore {
             changed |= self.simp_remove_renamings();
             changed |= self.simp_empty_disj();
             changed |= self.simp_singleton_avoiding(&mut alloc, external_preserve);
+            changed |= self.simp_abstract_sorted_var(&mut alloc);
             changed |= self.simp_abstract_name();
             changed |= self.simp_identify();
             if !changed { return self; }

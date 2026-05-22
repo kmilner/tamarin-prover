@@ -644,43 +644,57 @@ impl<'ctx> Reduction<'ctx> {
         // are dropped.  If only one variant remains, fold it via
         // simp_with_fresh_avoiding so its bindings propagate to rule
         // terms via the subsequent exploit_prems.
-        let mut folded = false;
+        let mut folded;
         if !self.sys.eq_store.subst.is_empty() {
             let empty_subst = tamarin_term::subst::Subst::empty();
             let _ = self.sys.eq_store.apply_eq_store(&self.ctx.maude, &empty_subst);
-            let needs_fold = self.sys.eq_store.conj.iter()
-                .any(|d| d.split_id == id && d.substs.len() == 1);
-            if needs_fold {
-                use tamarin_term::lterm::HasFrees;
-                let mut sys_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar>
-                    = std::collections::BTreeSet::new();
-                let mut visit = |v: &tamarin_term::lterm::LVar| { sys_vars.insert(v.clone()); };
-                for (id, rule) in &self.sys.nodes {
-                    id.for_each_free(&mut visit);
-                    rule.for_each_free(&mut visit);
-                }
-                for e in &self.sys.edges {
-                    e.src.0.for_each_free(&mut visit);
-                    e.tgt.0.for_each_free(&mut visit);
-                }
-                for l in &self.sys.less_atoms {
-                    l.smaller.for_each_free(&mut visit);
-                    l.larger.for_each_free(&mut visit);
-                }
-                if let Some(la) = &self.sys.last_atom { la.for_each_free(&mut visit); }
-                let maude = self.ctx.maude.clone();
-                let store = std::mem::take(&mut self.sys.eq_store);
-                self.sys.eq_store = store.simp_with_fresh_avoiding(
-                    |_, _| false,
-                    |n| maude.reserve_idxs(n),
-                    &sys_vars,
-                );
-                // Check if our disj was actually folded (might still be
-                // there if simp couldn't fold for some reason).
-                folded = !self.sys.eq_store.conj.iter().any(|d| d.split_id == id);
-                if folded {
-                    self.subst_system();
-                }
+        }
+        // Haskell-faithful: ALWAYS run simp after add_disj.  Mirrors
+        // `setM sEqStore =<< simp hnd (const (const False)) eqs` at the
+        // tail of `solveRuleConstraints` (Reduction.hs).  Even when the
+        // variant disj stays multi-valued, simp's `simpAbstractSortedVar`
+        // pass extracts the common factor `{v → ~witness:NarrowerSort}`
+        // into the free subst — narrowing rule body Msg-vars whose every
+        // variant image is a Fresh-sorted var.
+        //
+        // NOTE 2026-05-22 sess 10: simp_abstract_sorted_var is now wired
+        // but currently a no-op for protocol variants because Rust's
+        // Maude bridge returns variant range vars as `~mw:Msg` (not
+        // `~mw:Fresh`).  The `sortCompare(v.sort, lx.sort)` strict-GT
+        // check fails when both are Msg.  Resolving the upstream Maude-
+        // bridge sort divergence (Fresh-narrowing of `~mw` returned
+        // from Maude) will let this pass narrow rule body Msg-vars to
+        // Fresh witnesses, fixing the TLS Rule_case_N cluster
+        // (impossible_chain skip on Msg-var chain conc).
+        {
+            use tamarin_term::lterm::HasFrees;
+            let mut sys_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar>
+                = std::collections::BTreeSet::new();
+            let mut visit = |v: &tamarin_term::lterm::LVar| { sys_vars.insert(v.clone()); };
+            for (id, rule) in &self.sys.nodes {
+                id.for_each_free(&mut visit);
+                rule.for_each_free(&mut visit);
+            }
+            for e in &self.sys.edges {
+                e.src.0.for_each_free(&mut visit);
+                e.tgt.0.for_each_free(&mut visit);
+            }
+            for l in &self.sys.less_atoms {
+                l.smaller.for_each_free(&mut visit);
+                l.larger.for_each_free(&mut visit);
+            }
+            if let Some(la) = &self.sys.last_atom { la.for_each_free(&mut visit); }
+            let maude = self.ctx.maude.clone();
+            let store = std::mem::take(&mut self.sys.eq_store);
+            self.sys.eq_store = store.simp_with_fresh_avoiding(
+                |_, _| false,
+                |n| maude.reserve_idxs(n),
+                &sys_vars,
+            );
+            // Check if our disj was folded (singleton case).
+            folded = !self.sys.eq_store.conj.iter().any(|d| d.split_id == id);
+            if folded {
+                self.subst_system();
             }
         }
         // Only insert the Goal::Split if the disj wasn't already folded.
