@@ -87,7 +87,7 @@ import           Theory.Constraint.System.Guarded
                                                 (LNGuarded, Guarded(..))
 import           Logic.Connectives             (getDisj)
 import           Theory.Model
-                  (LNFact, Fact(..), FactTag(..), showRuleCaseName)
+                  (LNFact, Fact(..), FactTag(..), showRuleCaseName, rActs)
 
 
 -- | Read an env var at module load time (cached via NOINLINE so the
@@ -156,6 +156,15 @@ flagState :: Bool
 flagState = unsafePerformIO $
     maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_STATE"
 {-# NOINLINE flagState #-}
+
+-- TAM_HS_TRACE_STATE_FULL: like TAM_HS_TRACE_STATE but additionally emits
+-- a [STATE_FULL] line with FULL action terms (var idxs suppressed) so
+-- HS-vs-Rust diffs can see exactly which actions each side has at the
+-- divergent state.  Mirrors Rust's TAM_RS_TRACE_STATE_FULL.
+flagStateFull :: Bool
+flagStateFull = unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_STATE_FULL"
+{-# NOINLINE flagStateFull #-}
 
 
 -- | Drop-in replacement for `contradictoryIf` with a site label.  When
@@ -266,12 +275,18 @@ dumpSystemSummary sys =
 --   following `goalKind`'s `factCanonical` shape (Goals.hs:218-234).
 -- - `formulas`/`solved_formulas`: counts only.  Full bodies elided to
 --   keep the line readable; depth dumps available via other flags.
-traceStateM :: Applicative m => System -> m ()
+traceStateM :: Monad m => System -> m ()
 traceStateM sys
-    | flagState = traceM ("[STATE] nodes=" ++ canonicalNodes sys
-                       ++ " goals=" ++ canonicalOpenGoals sys
-                       ++ " formulas=" ++ show (S.size (L.get sFormulas sys))
-                       ++ " solved_formulas=" ++ show (S.size (L.get sSolvedFormulas sys)))
+    | flagState = do
+        traceM ("[STATE] nodes=" ++ canonicalNodes sys
+              ++ " goals=" ++ canonicalOpenGoals sys
+              ++ " formulas=" ++ show (S.size (L.get sFormulas sys))
+              ++ " solved_formulas=" ++ show (S.size (L.get sSolvedFormulas sys)))
+        if flagStateFull
+            then do
+                traceM ("[STATE_FULL] node_actions=" ++ canonicalNodeActions sys)
+                traceM ("[STATE_FULL] open_actions=" ++ canonicalOpenActions sys)
+            else pure ()
     | otherwise = pure ()
 {-# NOINLINE traceStateM #-}
 
@@ -336,3 +351,38 @@ compressDups xs = "[" ++ intercalate "," (go xs) ++ "]"
         let (eqs, rest) = span (== y) ys
             n           = 1 + length eqs
         in (if n > 1 then y ++ "\215" ++ show n else y) : go rest
+
+-- | Canonicalize a fact for STATE_FULL output.  Uses HS's `show`
+-- on the fact (which renders terms with idxs) and then strips
+-- numeric var idx suffixes via a simple regex-style cleanup —
+-- enough to make HS / Rust output diff-able after both passes.
+--
+-- Concretely, after this: `~ni.5:fresh` becomes `~ni:fresh`,
+-- `t.3:msg` becomes `t:msg`, etc.  Compound terms remain in their
+-- normal HS rendering, just without the `.N` var-idx annotations.
+canonicalFactStr :: LNFact -> String
+canonicalFactStr fa = stripVarIdxs (show fa)
+  where
+    -- Strip a `.N` immediately after an identifier (var idx suffix).
+    -- Walks the string char-by-char keeping a state machine.
+    stripVarIdxs []                = []
+    stripVarIdxs ('.' : cs)
+        | (digits, rest) <- span (`elem` "0123456789") cs
+        , not (null digits)
+        = stripVarIdxs rest
+    stripVarIdxs (c : cs)           = c : stripVarIdxs cs
+
+canonicalNodeActions :: System -> String
+canonicalNodeActions sys =
+    let acts = [ canonicalFactStr fa
+               | (_, ru) <- M.toList (L.get sNodes sys)
+               , fa <- L.get rActs ru ]
+    in compressDups (sort acts)
+
+canonicalOpenActions :: System -> String
+canonicalOpenActions sys =
+    let pairs = M.toList (L.get sGoals sys)
+        actions = [ canonicalFactStr fa
+                  | (ActionG _ fa, gs) <- pairs
+                  , not (L.get gsSolved gs) ]
+    in compressDups (sort actions)
