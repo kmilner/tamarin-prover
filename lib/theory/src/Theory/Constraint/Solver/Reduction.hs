@@ -237,11 +237,14 @@ labelNodeId = \i rules parent -> do
     mkFreshRuleAC m = Rule (ProtoInfo (ProtoRuleACInstInfo FreshRule mempty []))
                            [] [freshFact m] [] [m]
 
-    exploitPrems i ru = mapM_ (exploitPrem i ru) (enumPrems ru)
+    exploitPrems i ru = do
+        T.traceExecM ("exploitPrems rule=" ++ getRuleName ru)
+        mapM_ (exploitPrem i ru) (enumPrems ru)
 
     exploitPrem i ru (v, fa) = case fa of
         -- CR-rule *DG2_2* specialized for *In* facts.
         Fact InFact ann [m] -> do
+            T.traceExecM "exploitPrem InFact"
             j <- freshLVar "vf" LSortNode
             ruKnows <- mkISendRuleAC ann m
             modM sNodes (M.insert j ruKnows)
@@ -250,11 +253,13 @@ labelNodeId = \i rules parent -> do
 
         -- CR-rule *DG2_2* specialized for *Fr* facts.
         Fact FreshFact _ [m] -> do
+            T.traceExecM ("exploitPrem FreshFact isFresh=" ++ show (isFreshVar m))
             j <- freshLVar "vf" LSortNode
             modM sNodes (M.insert j (mkFreshRuleAC m))
             unless (isFreshVar m) $ do
                 -- 'm' must be of sort fresh ==> enforce via unification
                 n <- varTerm <$> freshLVar "n" LSortFresh
+                T.traceExecM "FrNarrow"
                 void (solveTermEqs SplitNow [Equal m n])
             modM sEdges (S.insert $ Edge (j, ConcIdx 0) (i,v))
 
@@ -278,6 +283,7 @@ insertChain c p = insertGoal (ChainG c p) False
 -- i.e., the fact equalities are enforced.
 insertEdges :: [(NodeConc, LNFact, LNFact, NodePrem)] -> Reduction ()
 insertEdges edges = do
+    T.traceExecM ("insertEdges n=" ++ show (length edges))
     void (solveFactEqs SplitNow [ Equal fa1 fa2 | (_, fa1, fa2, _) <- edges ])
     modM sEdges (\es -> foldr S.insert es [ Edge c p | (c,_,_,p) <- edges])
 
@@ -724,6 +730,7 @@ solveTermEqs splitStrat eqs0 =
     case filter (not . evalEqual) eqs0 of
       []  -> do return Unchanged
       eqs1 -> do
+        T.traceExecM ("solveTermEqs n=" ++ show (length eqs1))
         hnd <- getMaudeHandle
         se  <- gets id
         (eqs2, maySplitId) <- addEqs hnd eqs1 =<< getM sEqStore

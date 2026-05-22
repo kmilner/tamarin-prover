@@ -35,6 +35,7 @@ fn mark_contradictory(red: &mut Reduction) {
 /// goal-ranking we can hit pathological cases where two passes keep
 /// undoing each other's work. Real proofs converge well within this.
 pub fn simplify_system(red: &mut Reduction) {
+    crate::constraint::solver::trace::trace_exec("simplifySystem");
     // Most simplify runs converge in <10 iterations.  The cap was 256
     // as a safety net for known non-idempotent passes (since fixed);
     // 64 is plenty for any real proof and significantly cheaper when
