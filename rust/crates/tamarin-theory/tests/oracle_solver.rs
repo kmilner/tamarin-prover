@@ -1460,6 +1460,96 @@ fn probe_tls_setup_possible() {
     }
 }
 
+/// Probe: NSLPK3_untagged::nonce_secrecy — render Rust's proof and
+/// dump precomputed sources for the KU sources implicated in the
+/// line-7 `case_1` vs `I_2` divergence.
+#[test]
+#[ignore = "diagnostic probe — NSLPK3 line-7 case_1; run with --ignored"]
+fn probe_nslpk3_nonce_secrecy() {
+    fn maude_path() -> Option<String> {
+        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
+        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
+        }
+        None
+    }
+    let mp = match maude_path() { Some(p) => p, None => return };
+    let path = "/home/parallels/tamarin-prover/examples/classic/NSLPK3_untagged.spthy";
+    let src = std::fs::read_to_string(path).unwrap();
+    let theory = tamarin_parser::parse_theory(&src, &[]).unwrap();
+    let elab = tamarin_theory::elaborate::elaborate(&theory).unwrap();
+    {
+        let h_probe = tamarin_term::maude_proc::MaudeHandle::start(
+            &mp, elab.signature.maude_sig.clone()).unwrap();
+        let rules: Vec<_> = (&elab).rules().cloned().collect();
+        let ctx = tamarin_theory::constraint::solver::context::ProofContext::new(h_probe, rules);
+        use tamarin_theory::constraint::constraints::Goal;
+        eprintln!("== Precomputed full_sources ({} entries) ==", ctx.full_sources.len());
+        for src_obj in &ctx.full_sources {
+            if let Goal::Action(_, fa) = &src_obj.goal {
+                if matches!(fa.tag, tamarin_theory::fact::FactTag::Ku) {
+                    let term_dbg = format!("{:?}", fa.terms.first())
+                        .chars().take(140).collect::<String>();
+                    eprintln!("Ku source ({} cases): {}",
+                        src_obj.cases.len(), term_dbg);
+                    for (name, _) in &src_obj.cases {
+                        eprintln!("  case: {}", name);
+                    }
+                }
+            }
+        }
+    }
+    let h = tamarin_term::maude_proc::MaudeHandle::start(
+        &mp, elab.signature.maude_sig.clone()).unwrap();
+    std::env::set_var("TAM_PROVE_DEADLINE_MS", "60000");
+    let root = tamarin_theory::prove::prove_lemma(
+        &theory, "nonce_secrecy", h, 5000).unwrap();
+    let rs_skel = tamarin_theory::proof_skeleton::render(&root);
+    eprintln!("== Rust's proof for NSLPK3_untagged::nonce_secrecy ==");
+    eprintln!("{}", rs_skel);
+    // Also fetch HS's skeleton via tamarin-prover output, dump side-by-side
+    // around the first divergence to make targeted fixes possible.
+    let tam_out = std::process::Command::new("timeout")
+        .arg("30s")
+        .arg("tamarin-prover")
+        .arg("--prove")
+        .arg("--output=/tmp/nslpk3_hs_full.spthy")
+        .arg(path)
+        .output().ok();
+    if tam_out.is_some() {
+        if let Ok(hs_text) = std::fs::read_to_string("/tmp/nslpk3_hs_full.spthy") {
+            if let Some(hs_skel) = tamarin_theory::proof_skeleton::extract_from_haskell(
+                &hs_text, "nonce_secrecy")
+            {
+                eprintln!("== HS skeleton for NSLPK3_untagged::nonce_secrecy ==");
+                eprintln!("{}", hs_skel);
+                if let Some((line_no, ours_line, theirs_line)) =
+                    tamarin_theory::proof_skeleton::first_divergence(&rs_skel, &hs_skel)
+                {
+                    eprintln!("\n== FIRST DIVERGENCE ==");
+                    eprintln!("line {}: ours={:?} theirs={:?}", line_no, ours_line, theirs_line);
+                    // Surrounding context.
+                    let ours_lines: Vec<&str> = rs_skel.lines().collect();
+                    let theirs_lines: Vec<&str> = hs_skel.lines().collect();
+                    let lo = line_no.saturating_sub(5);
+                    let hi_ours = (line_no + 3).min(ours_lines.len());
+                    let hi_theirs = (line_no + 3).min(theirs_lines.len());
+                    eprintln!("\n-- Rust (lines {}..{}) --", lo + 1, hi_ours);
+                    for (i, l) in ours_lines[lo..hi_ours].iter().enumerate() {
+                        let mark = if lo + i + 1 == line_no { ">>" } else { "  " };
+                        eprintln!("{} {:4}: {}", mark, lo + i + 1, l);
+                    }
+                    eprintln!("\n-- HS (lines {}..{}) --", lo + 1, hi_theirs);
+                    for (i, l) in theirs_lines[lo..hi_theirs].iter().enumerate() {
+                        let mark = if lo + i + 1 == line_no { ">>" } else { "  " };
+                        eprintln!("{} {:4}: {}", mark, lo + i + 1, l);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// **First end-to-end verdict-match** against `tamarin-prover`:
 /// drive `tiny_setup.spthy` through `prove_lemma` and confirm we
 /// reach `Solved` — same verdict tamarin produces (`verified`).

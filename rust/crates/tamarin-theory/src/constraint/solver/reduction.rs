@@ -999,32 +999,43 @@ impl<'ctx> Reduction<'ctx> {
             Guarded::Atom(a) => {
                 // Try to decompose into a constraint via insert_atom.
                 let _ = self.insert_atom(&a);
-                // Either way mark the outer formula solved so we
-                // don't loop on it. Inner-recursion (mark=false)
-                // already reaches here when an outer Conj broke
-                // down into atoms.
+                // Haskell-faithful: only mark the OUTER formula as
+                // solved (mark=True at top-level `insert_formula`).
+                // Inner recursion (mark=False, from Conj/Ex body) does
+                // NOT add the atom to solved_formulas — mirrors HS
+                // `GAto ato -> markAsSolved; insertAtom ...` where
+                // `markAsSolved = when mark $ modM sSolvedFormulas`
+                // (Reduction.hs:445).
                 //
-                // Dedup-by-normalize: Maude unification mints fresh
-                // `~mw#N` witnesses per call, so structurally-
-                // identical derivations from impl_formulas would
-                // otherwise accumulate.  Compare normalized form.
-                // Compute the canonical form: first apply the
-                // eq-store substitution (so e.g. `m` maps to `h(...)`
-                // matching how stored entries appear after
-                // `subst_system`), then normalize witness LVars
-                // (`~mw#N` → `~mw#0`).
-                let eq_vs = crate::guarded::var_subst_from_eq_store(&self.sys.eq_store);
-                let apply_canon = |f: &crate::guarded::Guarded| {
-                    let f1 = if eq_vs.is_empty() { f.clone() }
-                             else { crate::guarded::subst_guarded(f, &eq_vs) };
-                    crate::guarded::normalize_witness_lvars(&f1)
-                };
-                let canon = apply_canon(&g);
-                let already_solved = self.sys.solved_formulas.iter().any(|f|
-                    apply_canon(f) == canon);
-                if !already_solved {
-                    self.sys.solved_formulas.push(g);
-                    self.changed = ChangeIndicator::Changed;
+                // Why bother: tracks lockstep with HS for the
+                // `[STATE] solved_formulas=N` count and avoids
+                // accumulating per-Conj-child duplicates that don't
+                // semantically need tracking — Conj bodies aren't
+                // "re-inserted" anywhere; only top-level impl_formulas
+                // outputs reach the Atom branch with mark=True.
+                //
+                // Dedup-by-normalize still applies at mark=True: Maude
+                // unification mints fresh `~mw#N` witnesses per call,
+                // so structurally-identical derivations from
+                // impl_formulas would otherwise accumulate.  Compare
+                // normalized form (apply eq-store, then normalize
+                // witness LVars `~mw#N → ~mw#0`, then alpha-canon
+                // GGuarded bound vars).
+                if mark {
+                    let eq_vs = crate::guarded::var_subst_from_eq_store(&self.sys.eq_store);
+                    let apply_canon = |f: &crate::guarded::Guarded| {
+                        let f1 = if eq_vs.is_empty() { f.clone() }
+                                 else { crate::guarded::subst_guarded(f, &eq_vs) };
+                        let f2 = crate::guarded::normalize_witness_lvars(&f1);
+                        crate::guarded::normalize_bound_lvars(&f2)
+                    };
+                    let canon = apply_canon(&g);
+                    let already_solved = self.sys.solved_formulas.iter().any(|f|
+                        apply_canon(f) == canon);
+                    if !already_solved {
+                        self.sys.solved_formulas.push(g);
+                        self.changed = ChangeIndicator::Changed;
+                    }
                 }
             }
             Guarded::GGuarded { qua, vars, guards, body }
@@ -1402,40 +1413,98 @@ impl<'ctx> Reduction<'ctx> {
         // we leave a stale SplitG goal in `sys.goals` and the search
         // emits an extra `solve` step for it (e.g. issue193::debug).
         let maude_alloc = maude.clone();
-        self.sys.eq_store = if has_reducible {
-            store.simp_with_fresh_avoiding(
-                |fs, vfs| crate::constraint::solver::contradictions::subst_creates_non_normal_terms(
-                    &maude_for_check, &sys_snapshot, fs, vfs,
-                ),
-                |n| maude_alloc.reserve_idxs(n),
-                &system_vars,
-            )
-        } else {
-            store.simp_with_fresh_avoiding(
-                |_, _| false,
-                |n| maude_alloc.reserve_idxs(n),
-                &system_vars,
-            )
+        // Closure-style helper: simp one EquationStore with the same
+        // non-normal-terms predicate + system_vars.  Reused for both
+        // the no-split branch and the per-arm SplitNow loop below.
+        let do_simp = |s: crate::tools::equation_store::EquationStore|
+                -> crate::tools::equation_store::EquationStore {
+            if has_reducible {
+                s.simp_with_fresh_avoiding(
+                    |fs, vfs| crate::constraint::solver::contradictions::subst_creates_non_normal_terms(
+                        &maude_for_check, &sys_snapshot, fs, vfs,
+                    ),
+                    |n| maude_alloc.reserve_idxs(n),
+                    &system_vars,
+                )
+            } else {
+                s.simp_with_fresh_avoiding(
+                    |_, _| false,
+                    |n| maude_alloc.reserve_idxs(n),
+                    &system_vars,
+                )
+            }
         };
-
-        if self.sys.eq_store.is_false() {
-            return Ok(SolveOutcome::Contradictory);
-        }
 
         match (split, strategy) {
             (Some(id), SplitStrategy::SplitNow) => {
-                let cases = self.sys.eq_store.perform_split(id)
+                // HS-faithful: perform_split FIRST, then simp + is_false
+                // check PER ARM.  Mirrors Haskell `solveTermEqs`
+                // (Reduction.hs:730-738):
+                //   setM sEqStore =<< simp ... =<<
+                //       case (maySplitId, splitStrat) of
+                //         (Just splitId, SplitNow) -> disjunctionOfList
+                //                $ performSplit eqs2 splitId
+                //         ...
+                //   noContradictoryEqStore
+                // The `disjunctionOfList performSplit` returns each arm
+                // in the Disj monad; `simp` and `noContradictoryEqStore`
+                // then run per arm.  Arm-specific subst can trigger
+                // contradictions that the un-split pre-simp store
+                // doesn't show (the subst composition into existing
+                // disjs may produce empty disjs in some arms but not
+                // others).  Without per-arm simp, those arms slip
+                // through to downstream consumers as live cases.
+                //
+                // Previously Rust did: simp ONCE on pre-split store →
+                // is_false check ONCE → perform_split → all arms
+                // returned.  That diverges from HS and is suspected of
+                // contributing to source-case over-enumeration on
+                // TLS_Handshake::session_key_setup_possible KU(senc).
+                let arms = store.perform_split(id)
                     .ok_or_else(|| crate::tools::equation_store::AddEqsError::Maude(
                         format!("split id {:?} not found", id)))?;
+                let mut live_arms: Vec<crate::tools::equation_store::EquationStore> = Vec::new();
+                for arm in arms {
+                    let simped = do_simp(arm);
+                    if simped.is_false() { continue; }
+                    live_arms.push(simped);
+                }
+                if live_arms.is_empty() {
+                    // All arms contradicted under per-arm simp.
+                    // Install a false store so downstream is_false
+                    // checks see it (mirrors HS noContradictoryEqStore
+                    // firing mzero on every arm).
+                    self.sys.eq_store = crate::tools::equation_store::EquationStore::default()
+                        .set_false();
+                    return Ok(SolveOutcome::Contradictory);
+                }
                 self.changed = ChangeIndicator::Changed;
-                Ok(SolveOutcome::Cases(cases))
+                if live_arms.len() == 1 {
+                    // Single arm survived: install as the current
+                    // eq_store and return Linear (no caller-side fork
+                    // needed).
+                    self.sys.eq_store = live_arms.into_iter().next().unwrap();
+                    Ok(SolveOutcome::Linear(ChangeIndicator::Changed))
+                } else {
+                    Ok(SolveOutcome::Cases(live_arms))
+                }
             }
             (Some(id), SplitStrategy::SplitLater) => {
+                // No split fanout — simp once on the combined store.
+                self.sys.eq_store = do_simp(store);
+                if self.sys.eq_store.is_false() {
+                    return Ok(SolveOutcome::Contradictory);
+                }
                 self.insert_goal(crate::constraint::constraints::Goal::Split(id));
                 self.changed = ChangeIndicator::Changed;
                 Ok(SolveOutcome::Linear(ChangeIndicator::Changed))
             }
             (None, _) => {
+                // No split — simp once.
+                self.sys.eq_store = do_simp(store);
+                if self.sys.eq_store.is_false() {
+                    return Ok(SolveOutcome::Contradictory);
+                }
                 self.changed = ChangeIndicator::Changed;
                 Ok(SolveOutcome::Linear(ChangeIndicator::Changed))
             }
@@ -3113,17 +3182,29 @@ impl<'ctx> Reduction<'ctx> {
                 GoalCases::Cases(cases)
             }
             None => {
-                // Source-case short-circuit for KU action goals —
-                // mirrors Haskell's `solveWithSource` flow consulting
-                // the `msgGoals` branch of `precomputeSources`.  When a
-                // precomputed Action source matches the live KU shape
-                // (sort-compatible bare-var pattern, or matching head
-                // symbol for an app-headed pattern), graft each of its
-                // saturated cases onto the live system and unify the
-                // case's KU action with `fa`.  This bypasses raw rule
-                // enumeration in favour of the typed source enumeration
-                // — exactly the [sources]-driven typing-refined chain
-                // that Haskell uses.
+                // Source-case dispatch for KU action goals — mirrors
+                // Haskell's `solveWithSource` (ProofMethod.hs:461-463)
+                // which is called from `solve` BEFORE falling back to
+                // plain `solveGoal`.  HS picks a source whose pattern
+                // matches the goal, then `applySource` does
+                // `markGoalAsSolved >> disjunctionOfList cases >>
+                // someInst >> conjoinSystem` — i.e. grafts the case's
+                // entire sub-system (nodes/edges/goals) into the live
+                // system.
+                //
+                // Empirical verification (May 22 sess 14): removing
+                // this path entirely (pure labelNodeId rule enumeration)
+                // regresses corpus 97/117 → 42/94 with 23 timeouts.
+                // Source-cases are the equivalent of HS's
+                // `solveWithSource`; both code paths need them.
+                //
+                // Remaining divergence (NSLPK3 line 105): Rust's
+                // source-case for KU(aenc(...)) `case I_2` includes
+                // R_1 in its grafted chain.  Need to verify whether HS's
+                // I_2 source case for the same goal also includes R_1.
+                // If yes, this is identical HS behavior and the
+                // divergence is elsewhere.  If no, our precompute
+                // grafts extra chain.
                 if std::env::var("TAM_DBG_SRC_CASE").is_ok() {
                     eprintln!("[src_case] solve_action_goal None-branch: precompute={} tag={:?} full_sources.len={}",
                         crate::constraint::solver::sources::in_precompute_mode(),

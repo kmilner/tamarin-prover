@@ -598,6 +598,139 @@ pub fn normalize_witness_lvars(g: &Guarded) -> Guarded {
     subst_guarded(g, &subst)
 }
 
+/// Alpha-canonicalize `GGuarded` bound-variable idxs.
+///
+/// Background: Haskell's `Guarded` uses DeBruijn-bound vars (`BVar
+/// Bound`), so two alpha-equivalent formulas — say `Ex j:5. KU(s)@j:5`
+/// and `Ex j:6. KU(s)@j:6` produced by impliedFormulas across separate
+/// firings — are structurally identical (the bound index doesn't show
+/// up in the term tree). HS's `S.member` dedup works trivially.
+///
+/// Rust represents bound vars as `VarSpec` (free vars masquerading as
+/// bound) so `freshen_system` (sources.rs:4042+) which shifts ALL
+/// VarSpec idxs also shifts bound-var idxs. After freshening, the
+/// stored universal's body has bound `j:K` for some non-zero K. When
+/// impl_formulas re-fires across iterations, each firing produces a
+/// `Disj([Ex j:Ki, ...])` with a different bound idx Ki, none of which
+/// matches the previously-stored `j:Kj` under structural equality.
+///
+/// This breaks dedup — the same source-assertion Disj gets inserted
+/// many times as alpha-equivalent copies, each producing its own
+/// `Goal::Disj` and an extra `solve / case_1` step in the proof tree.
+/// Trigger: NSLPK3_untagged::nonce_secrecy line 7.
+///
+/// Fix: a scope-aware traversal that allocates canonical idxs (from a
+/// fresh per-call counter) to each `GGuarded`'s bound vars and rewrites
+/// references inside guards + body accordingly. Two alpha-equivalent
+/// formulas produce IDENTICAL canonical output because the walk is
+/// deterministic and the counter starts at the same value.
+///
+/// Free vars are preserved (the canonical counter starts well above
+/// any real free-var idx so shifts can't collide). Names are not
+/// touched — only the same-universal-different-allocation case
+/// matters in practice; truly different bound-var names should NOT
+/// merge under this normalization.
+pub fn normalize_bound_lvars(g: &Guarded) -> Guarded {
+    // Per-call counter; high baseline so any system free-var idx
+    // (typically <1M after freshen) remains untouched on lookup.
+    let mut next_idx: u64 = 1_000_000_000;
+    let mut scope: Vec<std::collections::HashMap<(String, u64), p::VarSpec>> = Vec::new();
+    rec_g(g, &mut scope, &mut next_idx)
+}
+
+fn rec_g(
+    g: &Guarded,
+    scope: &mut Vec<std::collections::HashMap<(String, u64), p::VarSpec>>,
+    next_idx: &mut u64,
+) -> Guarded {
+    match g {
+        Guarded::Atom(a) => Guarded::Atom(rec_a(a, scope)),
+        Guarded::Disj(items) =>
+            Guarded::Disj(items.iter().map(|i| rec_g(i, scope, next_idx)).collect()),
+        Guarded::Conj(items) =>
+            Guarded::Conj(items.iter().map(|i| rec_g(i, scope, next_idx)).collect()),
+        Guarded::GGuarded { qua, vars, guards, body } => {
+            let mut layer: std::collections::HashMap<(String, u64), p::VarSpec> =
+                std::collections::HashMap::new();
+            let mut new_vars = Vec::with_capacity(vars.len());
+            for v in vars {
+                let canon = p::VarSpec {
+                    name: v.name.clone(),
+                    idx: *next_idx,
+                    sort: v.sort,
+                    typ: v.typ.clone(),
+                };
+                *next_idx = next_idx.saturating_add(1);
+                layer.insert((v.name.clone(), v.idx), canon.clone());
+                new_vars.push(canon);
+            }
+            scope.push(layer);
+            let new_guards: Vec<p::Atom> = guards.iter().map(|a| rec_a(a, scope)).collect();
+            let new_body = rec_g(body, scope, next_idx);
+            scope.pop();
+            Guarded::GGuarded {
+                qua: qua.clone(),
+                vars: new_vars,
+                guards: new_guards,
+                body: Box::new(new_body),
+            }
+        }
+    }
+}
+
+fn rec_a(
+    a: &p::Atom,
+    scope: &[std::collections::HashMap<(String, u64), p::VarSpec>],
+) -> p::Atom {
+    use p::Atom;
+    match a {
+        Atom::Eq(s, t) => Atom::Eq(rec_t(s, scope), rec_t(t, scope)),
+        Atom::Less(s, t) => Atom::Less(rec_t(s, scope), rec_t(t, scope)),
+        Atom::LessMset(s, t) => Atom::LessMset(rec_t(s, scope), rec_t(t, scope)),
+        Atom::Subterm(s, t) => Atom::Subterm(rec_t(s, scope), rec_t(t, scope)),
+        Atom::Action(f, t) => {
+            let mut f2 = f.clone();
+            f2.args = f.args.iter().map(|a| rec_t(a, scope)).collect();
+            Atom::Action(f2, rec_t(t, scope))
+        }
+        Atom::Last(t) => Atom::Last(rec_t(t, scope)),
+        Atom::Pred(f) => {
+            let mut f2 = f.clone();
+            f2.args = f.args.iter().map(|a| rec_t(a, scope)).collect();
+            Atom::Pred(f2)
+        }
+    }
+}
+
+fn rec_t(
+    t: &p::Term,
+    scope: &[std::collections::HashMap<(String, u64), p::VarSpec>],
+) -> p::Term {
+    use p::Term;
+    match t {
+        Term::Var(v) => {
+            // Innermost-first lookup; only bound vars in scope get rewritten.
+            for layer in scope.iter().rev() {
+                if let Some(canon) = layer.get(&(v.name.clone(), v.idx)) {
+                    return Term::Var(canon.clone());
+                }
+            }
+            Term::Var(v.clone())
+        }
+        Term::App(name, args) => Term::App(
+            name.clone(), args.iter().map(|a| rec_t(a, scope)).collect()),
+        Term::Pair(items) => Term::Pair(items.iter().map(|i| rec_t(i, scope)).collect()),
+        Term::AlgApp(name, a, b) => Term::AlgApp(
+            name.clone(), Box::new(rec_t(a, scope)), Box::new(rec_t(b, scope))),
+        Term::Diff(a, b) => Term::Diff(
+            Box::new(rec_t(a, scope)), Box::new(rec_t(b, scope))),
+        Term::BinOp(op, a, b) => Term::BinOp(
+            *op, Box::new(rec_t(a, scope)), Box::new(rec_t(b, scope))),
+        Term::PatMatch(t) => Term::PatMatch(Box::new(rec_t(t, scope))),
+        other => other.clone(),
+    }
+}
+
 /// Normalize equivalent sort hints so two `Guarded` formulas that
 /// differ ONLY by sort hint compare equal under `==`.
 ///
