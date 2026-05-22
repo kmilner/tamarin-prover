@@ -436,8 +436,15 @@ pub fn get_remaining_rule_applications<I>(
 
 /// Get the rule name for `RuleACInst` / `RuleAC` shapes — used to
 /// detect "same-name" rules in `forbiddenEdge`.
-pub fn rule_name_string<I>(
-    rule: &Rule<RuleInfo<crate::rule::ProtoRuleACInstInfo, I>>,
+///
+/// Mirrors Haskell `getRuleName` (Theory/Model/Rule.hs:767-781).  Intr
+/// rules — especially `DestrRule` — MUST return their proper names here;
+/// otherwise the `forbiddenEdge` same-rule loop-breaker
+/// (Goals.hs:367-371) never fires for destructors, letting `solveChain`
+/// recurse indefinitely through `d_0_sdec → d_0_sdec → ...` chains that
+/// Haskell prunes after one application (per `paciRemainingApplications`).
+pub fn rule_name_string(
+    rule: &RuleACInst,
 ) -> String
 {
     match &rule.info {
@@ -445,8 +452,32 @@ pub fn rule_name_string<I>(
             ProtoRuleName::Stand(s) => s.clone(),
             ProtoRuleName::Fresh => "Fresh".to_string(),
         },
-        // Intr variant of generic rule — formatter would need IntrInfo display.
-        RuleInfo::Intr(_) => String::new(),
+        RuleInfo::Intr(i) => match i {
+            IntrRuleACInfo::ConstrRule(name) =>
+                format!("Constr{}", prefix_if_reserved(&format!("c{}",
+                    String::from_utf8_lossy(name)))),
+            IntrRuleACInfo::DestrRule(name, _, _, _) =>
+                format!("Destr{}", prefix_if_reserved(&format!("d{}",
+                    String::from_utf8_lossy(name)))),
+            IntrRuleACInfo::Coerce => "Coerce".to_string(),
+            IntrRuleACInfo::IRecv => "Recv".to_string(),
+            IntrRuleACInfo::ISend => "Send".to_string(),
+            IntrRuleACInfo::PubConstr => "PubConstr".to_string(),
+            IntrRuleACInfo::NatConstr => "NatConstr".to_string(),
+            IntrRuleACInfo::FreshConstr => "FreshConstr".to_string(),
+            IntrRuleACInfo::IEquality => "Equality".to_string(),
+        },
+    }
+}
+
+/// Mirror Haskell `prefixIfReserved` (Theory/Model/Rule.hs around line 760):
+/// prefixes the name with `_` if it collides with a reserved rule name.
+fn prefix_if_reserved(s: &str) -> String {
+    let reserved = reserved_rule_names();
+    if reserved.contains(s) {
+        format!("_{}", s)
+    } else {
+        s.to_string()
     }
 }
 
