@@ -929,13 +929,21 @@ pub fn dispatch_solve_goal(
     // TAM_RS_TRACE_EXEC mirror of Haskell `solveGoal` `T.traceExecM`
     // (Goals.hs:206).  Same canonical-data form as the Haskell side so
     // the two outputs diff cleanly.
+    //
+    // Fact rendering mirrors Haskell `show FactTag`:
+    //   - `Ku`   → "KUFact"
+    //   - `Kd`   → "KDFact"
+    //   - `Fresh`→ "FreshFact"
+    //   - `Out`  → "OutFact"
+    //   - `In`   → "InFact"
+    //   - `Proto(mult, name, _)` → "ProtoFact <Mult> \"<name>\" <arity>"
     {
         use crate::constraint::solver::trace::{trace_exec, sort_prefix};
         let label = match g {
-            Goal::Action(_, fa)  => format!("solveGoal kind=Action fact={:?}({})",
-                fa.tag, fact_term_head(fa, sort_prefix)),
-            Goal::Premise(_, fa) => format!("solveGoal kind=Premise fact={:?}({})",
-                fa.tag, fact_term_head(fa, sort_prefix)),
+            Goal::Action(_, fa)  => format!("solveGoal kind=Action fact={}({})",
+                fact_tag_haskell(fa), fact_term_head(fa, sort_prefix)),
+            Goal::Premise(_, fa) => format!("solveGoal kind=Premise fact={}({})",
+                fact_tag_haskell(fa), fact_term_head(fa, sort_prefix)),
             Goal::Chain(_, _)    => "solveGoal kind=Chain".to_string(),
             Goal::Split(_)       => "solveGoal kind=Split".to_string(),
             Goal::Disj(_)        => "solveGoal kind=Disj".to_string(),
@@ -953,6 +961,29 @@ pub fn dispatch_solve_goal(
     }
 }
 
+// Haskell `Show FactTag` mirror (Fact.hs).  Used only by the trace; not
+// visible elsewhere.  Keep aligned with Haskell so the EXEC diff doesn't
+// show spurious format-only differences.
+fn fact_tag_haskell(fa: &crate::fact::LNFact) -> String {
+    use crate::fact::{FactTag, Multiplicity};
+    match &fa.tag {
+        FactTag::Ku    => "KUFact".to_string(),
+        FactTag::Kd    => "KDFact".to_string(),
+        FactTag::Fresh => "FreshFact".to_string(),
+        FactTag::Out   => "OutFact".to_string(),
+        FactTag::In    => "InFact".to_string(),
+        FactTag::Ded   => "DedFact".to_string(),
+        FactTag::Term  => "TermFact".to_string(),
+        FactTag::Proto(mult, name, arity) => {
+            let m = match mult {
+                Multiplicity::Linear     => "Linear",
+                Multiplicity::Persistent => "Persistent",
+            };
+            format!("ProtoFact {} \"{}\" {}", m, name, arity)
+        }
+    }
+}
+
 // Canonical head-symbol rendering for the EXEC trace.  Mirrors Haskell's
 // `termHeadStr` in Goals.hs (Var → `sortPrefix ++ name`, Const → `<const>`,
 // App → `showFunSymName`).  Used only by the trace; not visible elsewhere.
@@ -962,12 +993,18 @@ fn fact_term_head(
 ) -> String {
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
+    use tamarin_term::function_symbols::FunSym;
     match fa.terms.first() {
         None => String::new(),
         Some(Term::Lit(Lit::Var(v))) =>
             format!("{}{}", sort_prefix(v.sort), v.name),
         Some(Term::Lit(Lit::Con(_))) => "<const>".to_string(),
-        Some(Term::App(sym, _)) => format!("{:?}", sym).chars().take(40).collect(),
+        Some(Term::App(sym, _)) => match sym {
+            FunSym::NoEq(noeq) => String::from_utf8_lossy(&noeq.name).into_owned(),
+            FunSym::Ac(op) => format!("{:?}", op),
+            FunSym::C(op) => format!("{:?}", op),
+            FunSym::List => "List".to_string(),
+        },
     }
 }
 
