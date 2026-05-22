@@ -223,6 +223,16 @@ pub fn precompute_full_sources(
         // re-graft in `saturate_sources_inner_with_options`, adding a
         // duplicate producing-rule instance (task #222).
         red.mark_goal_as_solved(&goal);
+        // Mirror Haskell `solveGoal` traceExecM (Goals.hs:206): saturate's
+        // direct call to solve_premise_goal here bypasses the dispatch
+        // wrapper, so emit the trace explicitly to match HS solveAllSafeGoals.
+        {
+            use crate::constraint::solver::trace::trace_exec;
+            let fa = &abstract_fact;
+            trace_exec(&format!("solveGoal kind=Premise fact={}({})",
+                crate::constraint::solver::goals::fact_tag_haskell_pub(fa),
+                crate::constraint::solver::goals::fact_term_head_pub(fa)));
+        }
         let outcome = red.solve_premise_goal(
             &(goal_node.clone(), PremIdx(0)),
             &abstract_fact);
@@ -343,6 +353,14 @@ pub fn precompute_full_sources(
         // Haskell-faithful mark-before-solve (Goals.hs:201-213).  See
         // proto-goals branch above for full justification.
         red.mark_goal_as_solved(&goal);
+        // Mirror Haskell `solveGoal` traceExecM (Goals.hs:206) for the
+        // saturate direct-call path that bypasses dispatch_solve_goal.
+        {
+            use crate::constraint::solver::trace::trace_exec;
+            trace_exec(&format!("solveGoal kind=Action fact={}({})",
+                crate::constraint::solver::goals::fact_tag_haskell_pub(&ku_fact),
+                crate::constraint::solver::goals::fact_term_head_pub(&ku_fact)));
+        }
         let outcome = red.solve_action_goal(&goal_node, &ku_fact);
         // Haskell `refineSource` restrict (Sources.hs:118-124).
         let stable_vars = stable_vars_for_goal(&goal);
