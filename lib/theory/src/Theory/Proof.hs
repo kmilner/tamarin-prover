@@ -1027,7 +1027,16 @@ proveSystemDFS heuristic tactics ctxt =
     -- (TAM_HS_TRACE_STATE=1) uses this to align HS/Rust traces by the
     -- exact proof-tree position.
     prove path !depth sys =
-        let !_ = unsafePerformIO (T.setCasePath path) in
+        let !_ = unsafePerformIO (T.setCasePath path)
+            -- Force unconditional state emission so the trace covers
+            -- every prove call regardless of which proof method
+            -- (Simplify / SolveGoal / Finished) is dispatched.  Without
+            -- this, [STATE] only fires inside `solve` (the SolveGoal
+            -- dispatcher), leaving entire subtrees invisible — for the
+            -- NSLPK3 line-105 investigation, only ~25% of paths were
+            -- traced.
+            !_ = unsafePerformIO (T.traceProveEntry path sys)
+        in
         case rankProofMethods (useHeuristic heuristic depth) tactics ctxt sys of
           [] | finishedSubterms ctxt sys  -> node (Finished Solved) M.empty
           []                              -> node (Finished Unfinishable) M.empty
