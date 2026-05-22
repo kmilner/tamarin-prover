@@ -71,6 +71,8 @@ module Theory.Constraint.Solver.Trace (
   , tracePickM
   , setCasePath
   , getCasePath
+  , traceFormM
+  , guardedRepr
   ) where
 
 import           Control.Monad.Disj            (MonadDisj, contradictoryIf)
@@ -88,7 +90,7 @@ import           Theory.Constraint.System.Constraints
                                                 (Goal(..))
 import           Theory.Constraint.System.Guarded
                                                 (LNGuarded, Guarded(..))
-import           Logic.Connectives             (getDisj)
+import           Logic.Connectives             (getDisj, getConj)
 import           Theory.Model
                   (LNFact, Fact(..), FactTag(..), showRuleCaseName, rActs)
 
@@ -325,6 +327,31 @@ tracePickM g
     | flagState = traceM ("[PICK] " ++ goalCanonical g)
     | otherwise = pure ()
 {-# NOINLINE tracePickM #-}
+
+-- | TAM_HS_TRACE_FORM=1: emit `[FORMULA_ADD] path=... kind=... <repr>`
+-- whenever a guarded formula is inserted into sFormulas / DisjG goal.
+-- Pairs with Rust's `TAM_RS_TRACE_FORM` to find insertion divergences.
+flagForm :: Bool
+flagForm = unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_FORM"
+{-# NOINLINE flagForm #-}
+
+traceFormM :: Monad m => String -> LNGuarded -> m ()
+traceFormM kind fm
+    | flagForm = do
+        let path = unsafePerformIO getCasePath
+        traceM ("[FORMULA_ADD] path=" ++ casePathString path
+              ++ " kind=" ++ kind ++ " " ++ guardedRepr fm)
+    | otherwise = pure ()
+{-# NOINLINE traceFormM #-}
+
+-- | Canonicalized Guarded formula renderer matching Rust's `guarded_repr`.
+guardedRepr :: LNGuarded -> String
+guardedRepr fm = case fm of
+    GAto _ -> "Atom"
+    GConj items -> "Conj[" ++ intercalate "," (map guardedRepr (getConj items)) ++ "]"
+    GDisj items -> "Disj[" ++ intercalate "|" (map guardedRepr (getDisj items)) ++ "]"
+    GGuarded q ss _ _ -> show q ++ show (length ss) ++ "v"
 
 canonicalNodes :: System -> String
 canonicalNodes sys =

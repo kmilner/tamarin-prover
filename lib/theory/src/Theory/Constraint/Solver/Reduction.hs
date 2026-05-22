@@ -452,6 +452,7 @@ insertFormula = do
 
           -- Store for later applications of CR-rule *S_∨*
           GDisj disj -> do
+              T.traceFormM "Disj" fm
               modM sFormulas (S.insert fm)
               insertGoal (DisjG disj) False
 
