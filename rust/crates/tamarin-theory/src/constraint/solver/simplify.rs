@@ -989,6 +989,28 @@ fn try_match_all_guards(
                 crate::guarded::normalize_bound_lvars(&f2)
             };
             let canon = apply_canon(&implied);
+            // TAM_RS_TRACE_FORM=1 also emits an `Impl-candidate` event
+            // for every successful match BEFORE dedup — so the count
+            // diffs against HS's [IMPL-FIRE] count reveal whether Rust's
+            // matcher finds the same number of candidates HS finds.
+            crate::constraint::solver::trace::trace_form(
+                "Impl-candidate",
+                &crate::constraint::solver::trace::guarded_repr(&implied));
+            // TAM_RS_DISABLE_IMPL_DEDUP=1 — diagnostic gate that
+            // replaces `apply_canon`-based dedup with bare structural
+            // `==`.  HS uses bare `Eq Guarded` and works because its
+            // Maude unification is deterministic per call (matchAction
+            // / evalFresh allocate the same witness idxs each call on
+            // the same input).  Rust's Maude unification draws witness
+            // idxs from a GLOBAL atomic `fresh_counter` (maude_proc.rs)
+            // — every call mints fresh idxs, so structurally-equal
+            // re-fires would never dedup via bare `==`.  The
+            // canonicalisation is therefore *necessary* to avoid an
+            // infinite-fire loop on RFID_Simple etc., but appears to
+            // *over-dedup* — at NSLPK3 line-105's parent path Rust
+            // finds 66 candidates → 2 unique post-canon while HS keeps
+            // 4 (per [FORMULA_ADD] counts).  See task #291.
+            let disable_dedup = std::env::var("TAM_RS_DISABLE_IMPL_DEDUP").is_ok();
             // Fast-path: structurally-equal candidates (no apply_canon
             // call needed).  Most existing_formulas are NOT
             // canon-equal to the freshly-built implied, so we want to
@@ -997,12 +1019,21 @@ fn try_match_all_guards(
             // unconditionally clones + walks.  If implied == f
             // syntactically (typical post-fixpoint case), skip
             // canonicalization entirely.
-            let in_formulas = existing_formulas.iter().any(|f|
-                f == &implied || apply_canon(f) == canon);
-            let in_solved = existing_solved.iter().any(|f|
-                f == &implied || apply_canon(f) == canon);
-            let in_out = out.iter().any(|f|
-                f == &implied || apply_canon(f) == canon);
+            let in_formulas = if disable_dedup {
+                existing_formulas.iter().any(|f| f == &implied)
+            } else {
+                existing_formulas.iter().any(|f| f == &implied || apply_canon(f) == canon)
+            };
+            let in_solved = if disable_dedup {
+                existing_solved.iter().any(|f| f == &implied)
+            } else {
+                existing_solved.iter().any(|f| f == &implied || apply_canon(f) == canon)
+            };
+            let in_out = if disable_dedup {
+                out.iter().any(|f| f == &implied)
+            } else {
+                out.iter().any(|f| f == &implied || apply_canon(f) == canon)
+            };
             let already = in_formulas || in_solved || in_out;
             if std::env::var("TAM_DBG_IMPL2").is_ok() && !already {
                 eprintln!("[impl2] NEW canon: {:?}", format!("{:?}", canon).chars().take(140).collect::<String>());

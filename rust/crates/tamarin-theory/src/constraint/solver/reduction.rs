@@ -1020,7 +1020,11 @@ impl<'ctx> Reduction<'ctx> {
                 // Store the formula AND insert a corresponding split
                 // goal. The goal itself uses the same vector, allowing
                 // `solve_disj_goal` to resume later.
-                if !self.sys.formulas.contains(&g) {
+                let already_in = self.sys.formulas.contains(&g);
+                crate::constraint::solver::trace::trace_form(
+                    if already_in { "Disj-dedup" } else { "Disj" },
+                    &crate::constraint::solver::trace::guarded_repr(&g));
+                if !already_in {
                     self.sys.formulas.push(g.clone());
                 }
                 let goal = Goal::Disj(crate::constraint::constraints::Disj::new(items));

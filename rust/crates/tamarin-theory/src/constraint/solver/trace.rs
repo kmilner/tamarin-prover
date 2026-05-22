@@ -45,6 +45,39 @@ pub fn case_path_string() -> String {
     })
 }
 
+/// TAM_RS_TRACE_FORM=1 emits `[FORMULA_ADD] path=... kind=... <repr>` lines
+/// for each formula insertion into sys.formulas / sys.goals.  Pairs with
+/// HS's `TAM_HS_TRACE_FORM` for finding insertion divergences.
+pub fn form_flag() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("TAM_RS_TRACE_FORM").is_ok())
+}
+
+pub fn trace_form(kind: &str, repr: &str) {
+    if form_flag() {
+        eprintln!("[FORMULA_ADD] path={} kind={} {}", case_path_string(), kind, repr);
+    }
+}
+
+/// Canonicalized representation of a Guarded formula for [FORMULA_ADD]
+/// tracing — same `<Quant><N>v` head encoding as `guarded_head` and
+/// matching the HS `guardedHead` Trace helper, recursive into Disj.
+pub fn guarded_repr(g: &crate::guarded::Guarded) -> String {
+    use crate::guarded::Guarded;
+    match g {
+        Guarded::Atom(a) => format!("Atom({})", atom_head(a)),
+        Guarded::Conj(items) => {
+            let s: Vec<String> = items.iter().map(guarded_repr).collect();
+            format!("Conj[{}]", s.join(","))
+        }
+        Guarded::Disj(items) => {
+            let s: Vec<String> = items.iter().map(guarded_repr).collect();
+            format!("Disj[{}]", s.join("|"))
+        }
+        Guarded::GGuarded { qua, vars, .. } => format!("{:?}{}v", qua, vars.len()),
+    }
+}
+
 fn flag() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| std::env::var("TAM_RS_TRACE_EXEC").is_ok())
