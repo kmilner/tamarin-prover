@@ -60,12 +60,14 @@ pub fn trace_form(kind: &str, repr: &str) {
 }
 
 /// Canonicalized representation of a Guarded formula for [FORMULA_ADD]
-/// tracing — same `<Quant><N>v` head encoding as `guarded_head` and
-/// matching the HS `guardedHead` Trace helper, recursive into Disj.
+/// tracing — recursive structural dump with full bound-term content
+/// (var idxs suppressed via name-only LVar rendering) so HS/Rust diffs
+/// can distinguish formulas with the same head shape but different
+/// instantiation of free vars (e.g., `KU(ni:42)` vs `KU(ni:44)`).
 pub fn guarded_repr(g: &crate::guarded::Guarded) -> String {
     use crate::guarded::Guarded;
     match g {
-        Guarded::Atom(a) => format!("Atom({})", atom_head(a)),
+        Guarded::Atom(a) => format!("Atom({})", atom_repr(a)),
         Guarded::Conj(items) => {
             let s: Vec<String> = items.iter().map(guarded_repr).collect();
             format!("Conj[{}]", s.join(","))
@@ -74,7 +76,54 @@ pub fn guarded_repr(g: &crate::guarded::Guarded) -> String {
             let s: Vec<String> = items.iter().map(guarded_repr).collect();
             format!("Disj[{}]", s.join("|"))
         }
-        Guarded::GGuarded { qua, vars, .. } => format!("{:?}{}v", qua, vars.len()),
+        Guarded::GGuarded { qua, vars, guards, body } => {
+            let g_strs: Vec<String> = guards.iter().map(atom_repr).collect();
+            format!("{:?}{}v[{}]({})", qua, vars.len(), g_strs.join(","), guarded_repr(body))
+        }
+    }
+}
+
+fn atom_repr(a: &tamarin_parser::ast::Atom) -> String {
+    use tamarin_parser::ast::Atom;
+    match a {
+        Atom::Eq(s, t) => format!("Eq({},{})", term_repr(s), term_repr(t)),
+        Atom::Less(s, t) => format!("Less({},{})", term_repr(s), term_repr(t)),
+        Atom::LessMset(s, t) => format!("LMset({},{})", term_repr(s), term_repr(t)),
+        Atom::Subterm(s, t) => format!("Subterm({},{})", term_repr(s), term_repr(t)),
+        Atom::Last(s) => format!("Last({})", term_repr(s)),
+        Atom::Action(f, t) => format!("{}({})@{}",
+            f.name, f.args.iter().map(term_repr).collect::<Vec<_>>().join(","),
+            term_repr(t)),
+        Atom::Pred(f) => format!("Pred({})", f.name),
+    }
+}
+
+fn term_repr(t: &tamarin_parser::ast::Term) -> String {
+    use tamarin_parser::ast::Term;
+    match t {
+        Term::Var(v) => format!("{}{}#{}", match v.sort {
+            tamarin_parser::ast::SortHint::Fresh => "~",
+            tamarin_parser::ast::SortHint::Pub   => "$",
+            tamarin_parser::ast::SortHint::Node  => "#",
+            tamarin_parser::ast::SortHint::Nat   => "%",
+            tamarin_parser::ast::SortHint::Msg   => "",
+            _ => "?",
+        }, v.name, v.idx),  // idx KEPT so we can spot real differences
+        Term::App(name, args) => format!("{}({})", name,
+            args.iter().map(term_repr).collect::<Vec<_>>().join(",")),
+        Term::Pair(args) =>
+            format!("<{}>", args.iter().map(term_repr).collect::<Vec<_>>().join(",")),
+        Term::AlgApp(name, a, b) => format!("{}({},{})", name, term_repr(a), term_repr(b)),
+        Term::Diff(a, b) => format!("diff({},{})", term_repr(a), term_repr(b)),
+        Term::BinOp(op, a, b) => format!("{:?}({},{})", op, term_repr(a), term_repr(b)),
+        Term::PubLit(s) => format!("'{}'", s),
+        Term::FreshLit(s) => format!("~'{}'", s),
+        Term::NatLit(s) => format!("%'{}'", s),
+        Term::Number(n) => format!("{}", n),
+        Term::NumberOne => "1".to_string(),
+        Term::NatOne => "%1".to_string(),
+        Term::DhNeutral => "1g".to_string(),
+        Term::PatMatch(t) => format!("=({})", term_repr(t)),
     }
 }
 
