@@ -961,6 +961,15 @@ pub fn dispatch_solve_goal(
     }
 }
 
+// Public wrappers so sites outside this module (e.g. sources.rs's
+// direct solve_*_goal calls that bypass dispatch_solve_goal) can emit
+// the same EXEC-trace format.
+pub fn fact_tag_haskell_pub(fa: &crate::fact::LNFact) -> String { fact_tag_haskell(fa) }
+pub fn fact_term_head_pub(fa: &crate::fact::LNFact) -> String {
+    use crate::constraint::solver::trace::sort_prefix;
+    fact_term_head(fa, sort_prefix)
+}
+
 // Haskell `Show FactTag` mirror (Fact.hs).  Used only by the trace; not
 // visible elsewhere.  Keep aligned with Haskell so the EXEC diff doesn't
 // show spurious format-only differences.

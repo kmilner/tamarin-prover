@@ -2940,6 +2940,14 @@ impl<'ctx> Reduction<'ctx> {
         let j = tamarin_term::lterm::LVar::new(
             "vf", tamarin_term::lterm::LSort::Node, next);
         let rule = make_isend_rule(m.clone());
+        // Mirrors Haskell `exploitPrems j ruKnows` (Reduction.hs:252) —
+        // after creating the ISend supplier node, HS recursively exploits
+        // the supplier rule's premises (which dispatches to add_ku_action
+        // for the KU(m) premise).  Rust does the equivalent inline via
+        // add_ku_action_before below, so emit the matching trace here.
+        crate::constraint::solver::trace::trace_exec(
+            &format!("exploitPrems rule={}",
+                crate::constraint::solver::reduction::rule_case_name(&rule)));
         self.sys.add_node(j.clone(), rule);
         self.sys.add_edge(crate::constraint::constraints::Edge {
             src: (j.clone(), crate::rule::ConcIdx(0)),
