@@ -3811,17 +3811,36 @@ impl<'ctx> Reduction<'ctx> {
                 if !crate::rule::is_destr_rule_info(&ir.info) { continue; }
                 let ru_inst = intr_rule_to_rule_ac_inst(ir.clone());
                 let ru_renamed = freshen_rule(ru_inst, avoid_max, &self.ctx.maude);
+                // Mirror HS `insertFreshNode rules (Just cRule)` (Goals.hs:369)
+                // which calls labelNodeId → exploitPrems for every destructor
+                // rule, BEFORE the forbiddenEdge / prem-tag mismatch checks
+                // mzero the branch.  Trace per-rule + per-premise to align
+                // counts; Rust skips the actual instantiation work for
+                // mismatched rules.
+                crate::constraint::solver::trace::trace_exec(
+                    &format!("exploitPrems rule={}",
+                        crate::constraint::solver::reduction::rule_case_name(&ru_renamed)));
                 let prem0 = match ru_renamed.premises.first() {
                     Some(f) => f.clone(),
-                    None => continue,
+                    None => {
+                        emit_dead_rule_premise_traces(&ru_renamed);
+                        continue;
+                    }
                 };
                 if prem0.tag != fa_conc.tag
                     || prem0.terms.len() != fa_conc.terms.len()
                 {
+                    emit_dead_rule_premise_traces(&ru_renamed);
                     continue;
                 }
-                if forbidden_edge(&c_rule, &ru_renamed) { continue; }
-                if ru_renamed.conclusions.is_empty() { continue; }
+                if forbidden_edge(&c_rule, &ru_renamed) {
+                    emit_dead_rule_premise_traces(&ru_renamed);
+                    continue;
+                }
+                if ru_renamed.conclusions.is_empty() {
+                    emit_dead_rule_premise_traces(&ru_renamed);
+                    continue;
+                }
 
                 let mut sys_clone = self.sys.clone();
                 let new_node = tamarin_term::lterm::LVar::new(
