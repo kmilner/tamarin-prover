@@ -2762,13 +2762,20 @@ impl<'ctx> Reduction<'ctx> {
         i: &crate::constraint::constraints::NodeId,
         rule: &RuleACInst,
     ) {
+        crate::constraint::solver::trace::trace_exec(
+            &format!("exploitPrems rule={}",
+                crate::constraint::solver::reduction::rule_case_name(rule)));
         use crate::fact::FactTag;
         let prems: Vec<(crate::rule::PremIdx, crate::fact::LNFact)> =
             rule.enumerate_premises().map(|(p, f)| (p, f.clone())).collect();
         for (idx, fa) in prems {
             match &fa.tag {
                 FactTag::Fresh => self.add_fresh_supplier_for(i, idx, &fa),
-                FactTag::In => self.add_isend_supplier_for(i, idx, &fa),
+                FactTag::In => {
+                    crate::constraint::solver::trace::trace_exec(
+                        "exploitPrem InFact");
+                    self.add_isend_supplier_for(i, idx, &fa);
+                }
                 FactTag::Ku => self.add_ku_action_before(i, &fa),
                 _ => { /* skip — parent solver will track */ }
             }
@@ -2788,6 +2795,8 @@ impl<'ctx> Reduction<'ctx> {
                 self.add_fresh_supplier_for(i, idx, fa);
             }
             FactTag::In => {
+                crate::constraint::solver::trace::trace_exec(
+                    "exploitPrem InFact");
                 self.add_isend_supplier_for(i, idx, fa);
             }
             FactTag::Ku => {
