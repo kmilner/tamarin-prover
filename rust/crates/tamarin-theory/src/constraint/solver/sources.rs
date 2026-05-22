@@ -1943,6 +1943,12 @@ fn saturate_out_premise(
         let this_term = chain_conc_term(&s, &c);
         let mut sub = Reduction::new(ctx, s);
         set_precompute_mode(false);
+        // Mirror HS solveAllSafeGoals.solve: HS dispatches every chain
+        // goal through solveGoal which emits `solveGoal kind=Chain`.
+        // Rust's close_chains_dfs invokes solve_chain_goal directly
+        // without going through dispatch_solve_goal, so the trace
+        // wasn't firing for the saturate-time chain closing.
+        crate::constraint::solver::trace::trace_exec("solveGoal kind=Chain");
         let outcome = sub.solve_chain_goal(&c, &p);
         set_precompute_mode(true);
         // Contradiction filter: drop branches whose post-solve state
