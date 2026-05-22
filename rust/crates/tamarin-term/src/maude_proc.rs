@@ -288,7 +288,14 @@ impl MaudeHandle {
         Ok(MaudeHandle {
             inner: Arc::new(Mutex::new(inner)),
             child: Arc::new(Mutex::new(reaper)),
-            fresh_counter: Arc::new(AtomicU64::new(0)),
+            // EXPERIMENTAL: init counter to safe-zone (agent's option 2) to test
+            // whether idx-0 collisions with lemma bound vars are causing
+            // NSLPK3 line-105 divergence.  NOT HS-faithful — proper fix is
+            // PreciseFresh per-name counter or DeBruijn binders.  Just here
+            // for diagnosis: if NSLPK3 changes, we know the bug class.
+            fresh_counter: Arc::new(AtomicU64::new(
+                std::env::var("TAM_FRESH_SAFE_ZONE").ok()
+                    .and_then(|s| s.parse().ok()).unwrap_or(0))),
         })
     }
 
