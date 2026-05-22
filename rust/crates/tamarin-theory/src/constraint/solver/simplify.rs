@@ -721,7 +721,7 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
             universals.len(), sys_actions.len());
         for (i, (_orig, vars, guards, _)) in universals.iter().enumerate() {
             eprintln!("  universal[{}] vars={:?}", i,
-                vars.iter().map(|v| &v.name).collect::<Vec<_>>());
+                vars.iter().map(|v| (v.name.clone(), v.idx)).collect::<Vec<_>>());
             for g in guards {
                 eprintln!("    guard: {:?}", g);
             }

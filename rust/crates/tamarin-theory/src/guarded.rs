@@ -1006,23 +1006,43 @@ fn subst_guarded_inner(
                 .filter(|((n, i), _)| !shadowed.contains(&(n.clone(), *i)))
                 .map(|((n, i), v)| ((n.clone(), *i), v.clone()))
                 .collect();
-            // Capture check: bound vars that are free in subst's range.
+            // Capture check: bound vars that are free in the FILTERED
+            // subst's range.  Earlier we used the parent's `range_free`
+            // (computed from the FULL subst), which over-triggered the
+            // capture-avoidance: shadowed entries dropped here no
+            // longer apply, so their range values shouldn't influence
+            // capture detection.  Mirrors HS `applySkGuarded` semantics
+            // — DeBruijn-bound vars there are unaffected by free-var
+            // substitution, so no capture occurs.  Without this fix,
+            // a lemma's bound vars (`nr:0`, `ni:0`, `i:0`) get spuriously
+            // renamed to fresh idxs whenever ANY full-subst entry maps
+            // a (filtered-out) bound key to a value naming the same
+            // bound var — producing extra IMPL-FIRE matches that HS
+            // never emits (task #287, NSLPK3 line-105 cluster).
+            let filtered_range_free: std::collections::HashSet<(String, u64)> = {
+                let mut r = std::collections::HashSet::new();
+                for ((_, _), t) in s_filtered.iter() {
+                    collect_term_vars(t, &mut r);
+                }
+                r
+            };
             let captures: Vec<(String, u64)> = vars.iter()
                 .map(|v| (v.name.clone(), v.idx))
-                .filter(|k| range_free.contains(k))
+                .filter(|k| filtered_range_free.contains(k))
                 .collect();
             if captures.is_empty() {
-                // Recompute range_free from s_filtered (smaller); but for
-                // perf, just reuse the parent's range_free conservatively.
+                // Pass the filtered range_free down to the body — the
+                // parent's `range_free` would over-conservatively still
+                // include the dropped (shadowed) entries.
                 return Guarded::GGuarded {
                     qua: qua.clone(),
                     vars: vars.clone(),
                     guards: guards.iter().map(|a| subst_atom(a, &s_filtered)).collect(),
-                    body: Box::new(subst_guarded_inner(body, &s_filtered, range_free)),
+                    body: Box::new(subst_guarded_inner(body, &s_filtered, &filtered_range_free)),
                 };
             }
-            // Allocate fresh idxs.  Use max(range_free.idx) + 1 as floor.
-            let mut next_idx: u64 = range_free.iter().map(|(_, i)| *i).max()
+            // Allocate fresh idxs.  Use max(filtered_range_free.idx) + 1 as floor.
+            let mut next_idx: u64 = filtered_range_free.iter().map(|(_, i)| *i).max()
                 .unwrap_or(0).saturating_add(1);
             // Also bump above any explicit idx in the binder vars.
             for v in vars { if v.idx >= next_idx { next_idx = v.idx + 1; } }
@@ -1058,7 +1078,7 @@ fn subst_guarded_inner(
             // Recompute range_free for the combined subst — captures
             // could compound if rename targets are already in range_free.
             let mut combined_range_free: std::collections::HashSet<(String, u64)>
-                = range_free.clone();
+                = filtered_range_free.clone();
             for (_, t) in rename.iter() {
                 collect_term_vars(t, &mut combined_range_free);
             }
