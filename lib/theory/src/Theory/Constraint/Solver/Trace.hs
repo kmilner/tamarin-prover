@@ -31,10 +31,23 @@
 --                         Used to pin down chain-extension branching
 --                         factor for #164.
 --
+--   TAM_HS_TRACE_EXEC — synchronized exec-trace at major solver entry
+--                       points (solveGoal, solveChain, exploitPrems,
+--                       simplifySystem, insertEdges, solveTermEqs,
+--                       applyEqStore, someRuleACInst, FrNarrow).
+--                       Designed to diff against TAM_RS_TRACE_EXEC for
+--                       identifying the FIRST execution-trace divergence
+--                       between Rust and Haskell.  Output format:
+--                       `[EXEC] <function> <canonical-data>` — one line
+--                       per call, no sequence numbers (so the diff isn't
+--                       dominated by counter drift), data is normalized
+--                       to suppress fresh-var index variation.
+--
 -- Usage in code:
 --
 --   import qualified Theory.Constraint.Solver.Trace as T
 --   T.contradictoryIfT "enforceEdgeUniqueness:premIdxMismatch" cond
+--   T.traceExec ("solveChain ENTER")
 --
 -- The label should be specific enough to identify the call site in the
 -- log output.
@@ -43,12 +56,15 @@ module Theory.Constraint.Solver.Trace (
   , tracePass
   , tracePassPair
   , traceCase
+  , traceExec
+  , traceExecM
   , dumpSystemSummary
   , flagContra
   , flagSimplify
   , flagCases
   , flagSources
   , flagChains
+  , flagExec
   ) where
 
 import           Control.Monad.Disj            (MonadDisj, contradictoryIf)
@@ -88,6 +104,11 @@ flagChains :: Bool
 flagChains = unsafePerformIO $
     maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_CHAINS"
 {-# NOINLINE flagChains #-}
+
+flagExec :: Bool
+flagExec = unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_EXEC"
+{-# NOINLINE flagExec #-}
 
 
 -- | Drop-in replacement for `contradictoryIf` with a site label.  When
@@ -137,6 +158,31 @@ traceCase name kept x
     | flagCases = trace ("[CASE] " ++ name ++ " kept=" ++ show kept) x
     | otherwise = x
 {-# INLINE traceCase #-}
+
+
+-- | `traceExec label x` returns x; when `TAM_HS_TRACE_EXEC=1`, also
+-- emits `[EXEC] <label>` to stderr.  Use at major function entries
+-- so the trace can be diffed against the Rust port's equivalent
+-- `TAM_RS_TRACE_EXEC` output to find the first execution-trace
+-- divergence.
+--
+-- Format `[EXEC] <function-name> <canonical-data>` — keep `label` in
+-- the same form on both sides for the diff to be meaningful.  Avoid
+-- including fresh indices, node ids, or other counters that differ
+-- between implementations.
+traceExec :: String -> a -> a
+traceExec label x
+    | flagExec  = trace ("[EXEC] " ++ label) x
+    | otherwise = x
+{-# INLINE traceExec #-}
+
+
+-- | Monadic version of `traceExec` — emits the trace as a side effect.
+traceExecM :: Monad m => String -> m ()
+traceExecM label
+    | flagExec  = (trace ("[EXEC] " ++ label) (return ()) :: Monad m => m ())
+    | otherwise = return ()
+{-# INLINE traceExecM #-}
 
 
 -- | One-line summary of a System for trace output.  Captures sizes so

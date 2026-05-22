@@ -1331,6 +1331,8 @@ impl<'ctx> Reduction<'ctx> {
         if pending.is_empty() {
             return Ok(SolveOutcome::Linear(ChangeIndicator::Unchanged));
         }
+        crate::constraint::solver::trace::trace_exec(
+            &format!("solveTermEqs n={}", pending.len()));
 
         // Take eq_store out of self, mutate it, put it back, then
         // borrow Maude — this avoids overlapping borrows of self.
@@ -2654,6 +2656,9 @@ impl<'ctx> Reduction<'ctx> {
         i: &crate::constraint::constraints::NodeId,
         rule: &RuleACInst,
     ) {
+        crate::constraint::solver::trace::trace_exec(
+            &format!("exploitPrems rule={}",
+                crate::constraint::solver::reduction::rule_case_name(rule)));
         // Snapshot premises so we can mutate self while iterating.
         // Apply the current eq_store.subst to each premise so any
         // variant subst that was folded into the free subst (e.g. by
@@ -2795,12 +2800,16 @@ impl<'ctx> Reduction<'ctx> {
                 _ => false,
             }
         };
+        crate::constraint::solver::trace::trace_exec(
+            &format!("exploitPrem FreshFact isFresh={}",
+                if is_fresh_var_or_lit { "True" } else { "False" }));
         if !is_fresh_var_or_lit {
             let next_n = bounds_max(&self.sys).saturating_add(1);
             let n_var = tamarin_term::lterm::LVar::new(
                 "n", tamarin_term::lterm::LSort::Fresh, next_n);
             let n_term = tamarin_term::term::Term::Lit(
                 tamarin_term::vterm::Lit::Var(n_var.clone()));
+            crate::constraint::solver::trace::trace_exec("FrNarrow");
             if std::env::var("TAM_RS_TRACE_FR_NARROW").is_ok() {
                 eprintln!("[RS-FR-NARROW] Fr({}_{}:{:?}) narrowed to ~n.{}",
                     match &m {
@@ -3586,6 +3595,7 @@ impl<'ctx> Reduction<'ctx> {
             eprintln!("[RS-CHAIN] ENTER faConc={:?} nRules={}",
                 fa_conc, n_destr);
         }
+        crate::constraint::solver::trace::trace_exec("solveChain ENTER");
 
         let mut all_cases: Vec<(String, crate::constraint::system::System)> = Vec::new();
 

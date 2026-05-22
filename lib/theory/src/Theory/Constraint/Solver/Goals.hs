@@ -203,6 +203,7 @@ solveGoal goal = do
     -- mark before solving, as representation might change due to unification
     markGoalAsSolved "directly" goal
     rules <- askM pcRules
+    T.traceExecM ("solveGoal " ++ goalKind goal)
     case goal of
       ActionG i fa  -> solveAction (nonSilentRules rules) (i, fa)
       PremiseG p fa ->
@@ -211,6 +212,26 @@ solveGoal goal = do
       SplitG i      -> solveSplit i
       DisjG disj    -> solveDisjunction disj
       SubtermG st   -> solveSubterm st
+  where
+    -- Canonical kind name for exec-trace diffing.  Keep aligned with the
+    -- Rust port's `solve_goal` kinds: Action/Premise/Chain/Split/Disj/Subterm.
+    goalKind (ActionG _ fa)  = "kind=Action fact=" ++ factCanonical fa
+    goalKind (PremiseG _ fa) = "kind=Premise fact=" ++ factCanonical fa
+    goalKind (ChainG _ _)    = "kind=Chain"
+    goalKind (SplitG _)      = "kind=Split"
+    goalKind (DisjG _)       = "kind=Disj"
+    goalKind (SubtermG _)    = "kind=Subterm"
+
+    -- Fact -> canonical short representation (tag only; suppress fresh
+    -- indices to keep the trace diff-friendly).  Add term head for
+    -- KU/KD facts since those drive proof structure.
+    factCanonical (Fact tag _ ts) =
+        show tag ++ "(" ++ termHeadStr ts ++ ")"
+    termHeadStr []      = ""
+    termHeadStr (t : _) = case viewTerm t of
+        Lit (Var v)  -> sortPrefix (lvarSort v) ++ lvarName v
+        Lit (Con _)  -> "<const>"
+        FApp o _     -> showFunSymName o
 
 -- The following functions are internal to 'solveGoal'. Use them with great
 -- care.
@@ -296,6 +317,7 @@ solveChain :: [RuleAC]              -- ^ All destruction rules.
            -> Reduction String      -- ^ Case name to use.
 solveChain rules (c, p) = do
     faConc  <- gets $ nodeConcFact c
+    T.traceExecM "solveChain ENTER"
     -- TAM_HS_TRACE_CHAINS: log the chain conc + n destruction rules tried.
     let chainTrace label =
           if T.flagChains
@@ -316,6 +338,7 @@ solveChain rules (c, p) = do
             caseName (viewTerm -> Lit l)       = showLitName l
         contradictoryIf (illegalCoerce pRule mPrem)
         let cn = caseName mPrem
+        T.traceExecM ("solveChain DIRECT " ++ cn)
         chainTrace ("DIRECT " ++ cn) (return cn)
      `disjunction`
      -- extend it with one step
@@ -333,6 +356,7 @@ solveChain rules (c, p) = do
                 -- marked as solved?
                 let v = PremIdx 0
                 faPrem <- gets $ nodePremFact (i,v)
+                T.traceExecM ("solveChain UNION " ++ showRuleCaseName ru)
                 chainTrace ("UNION " ++ showRuleCaseName ru)
                   (extendAndMark i ru v faPrem faConc)
          Just (DnK, m) ->
@@ -343,6 +367,7 @@ solveChain rules (c, p) = do
                 contradictoryIf (isMsgVar m)
                 cRule <- gets $ nodeRule (nodeConcNode c)
                 (i, ru) <- insertFreshNode rules (Just cRule)
+                T.traceExecM ("solveChain EXTEND " ++ showRuleCaseName ru)
                 contradictoryIf (forbiddenEdge cRule ru)
                 -- This requires a modified chain constraint def:
                 -- path via first destruction premise of rule ...

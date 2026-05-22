@@ -926,6 +926,23 @@ pub fn dispatch_solve_goal(
     // its abstract Loop goal open, which then triggered another graft
     // iteration adding a duplicate Check0 node (task #222).
     red.mark_goal_as_solved(g);
+    // TAM_RS_TRACE_EXEC mirror of Haskell `solveGoal` `T.traceExecM`
+    // (Goals.hs:206).  Same canonical-data form as the Haskell side so
+    // the two outputs diff cleanly.
+    {
+        use crate::constraint::solver::trace::{trace_exec, sort_prefix};
+        let label = match g {
+            Goal::Action(_, fa)  => format!("solveGoal kind=Action fact={:?}({})",
+                fa.tag, fact_term_head(fa, sort_prefix)),
+            Goal::Premise(_, fa) => format!("solveGoal kind=Premise fact={:?}({})",
+                fa.tag, fact_term_head(fa, sort_prefix)),
+            Goal::Chain(_, _)    => "solveGoal kind=Chain".to_string(),
+            Goal::Split(_)       => "solveGoal kind=Split".to_string(),
+            Goal::Disj(_)        => "solveGoal kind=Disj".to_string(),
+            Goal::Subterm(_)     => "solveGoal kind=Subterm".to_string(),
+        };
+        trace_exec(&label);
+    }
     match g {
         Goal::Action(i, fa) => red.solve_action_goal(i, fa),
         Goal::Premise(p, fa) => red.solve_premise_goal(p, fa),
@@ -933,6 +950,24 @@ pub fn dispatch_solve_goal(
         Goal::Split(id) => red.solve_split_goal(*id),
         Goal::Disj(d) => red.solve_disj_goal(d),
         Goal::Subterm(st) => red.solve_subterm_goal(st),
+    }
+}
+
+// Canonical head-symbol rendering for the EXEC trace.  Mirrors Haskell's
+// `termHeadStr` in Goals.hs (Var → `sortPrefix ++ name`, Const → `<const>`,
+// App → `showFunSymName`).  Used only by the trace; not visible elsewhere.
+fn fact_term_head(
+    fa: &crate::fact::LNFact,
+    sort_prefix: fn(tamarin_term::lterm::LSort) -> &'static str,
+) -> String {
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    match fa.terms.first() {
+        None => String::new(),
+        Some(Term::Lit(Lit::Var(v))) =>
+            format!("{}{}", sort_prefix(v.sort), v.name),
+        Some(Term::Lit(Lit::Con(_))) => "<const>".to_string(),
+        Some(Term::App(sym, _)) => format!("{:?}", sym).chars().take(40).collect(),
     }
 }
 

@@ -63,6 +63,7 @@ hsTraceFire = Unsafe.unsafePerformIO $
 -- system does not change anymore.
 simplifySystem :: Reduction ()
 simplifySystem = do
+    T.traceExecM "simplifySystem"
     when T.flagSimplify (Debug.Trace.traceM "[SIMP] enter")
     isdiff <- getM sDiffSystem
     -- Start simplification, indicating that some change happened
