@@ -346,12 +346,18 @@ traceFormM kind fm
 {-# NOINLINE traceFormM #-}
 
 -- | Canonicalized Guarded formula renderer matching Rust's `guarded_repr`.
+-- Includes the full `show`-rendered atoms / quantifier bodies so two
+-- alpha-distinct or instantiation-distinct firings can be compared
+-- structurally across HS and Rust.
 guardedRepr :: LNGuarded -> String
 guardedRepr fm = case fm of
-    GAto _ -> "Atom"
+    GAto a -> "Atom(" ++ show a ++ ")"
     GConj items -> "Conj[" ++ intercalate "," (map guardedRepr (getConj items)) ++ "]"
     GDisj items -> "Disj[" ++ intercalate "|" (map guardedRepr (getDisj items)) ++ "]"
-    GGuarded q ss _ _ -> show q ++ show (length ss) ++ "v"
+    GGuarded q ss gs body ->
+        show q ++ show (length ss) ++ "v["
+            ++ intercalate "," (map show gs) ++ "]("
+            ++ guardedRepr body ++ ")"
 
 canonicalNodes :: System -> String
 canonicalNodes sys =

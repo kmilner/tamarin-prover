@@ -974,19 +974,34 @@ fn try_match_all_guards(
             // RFID_Simple loops forever in `insert_implied_formulas`
             // because new implications never recognize that the same
             // body (post-subst) already exists.
-            let eq_vs = crate::guarded::var_subst_from_eq_store(&sys.eq_store);
+            // HS-faithful dedup: HS uses bare `Eq Guarded` (structural)
+            // for the `S.member sFormulas` / `S.member sSolvedFormulas`
+            // checks in `insertFormula`.  Two HS firings whose only
+            // difference is bound-var indices ARE structurally identical
+            // because HS uses DeBruijn `BVar Bound`.  Two HS firings with
+            // different FREE-var bindings (from different action-subject
+            // matches) ARE structurally distinct, so HS keeps both.
+            //
+            // Rust represents bound vars as `VarSpec` (free vars-shape),
+            // so `freshen_system` shifts bound-var idxs across iterations.
+            // `normalize_bound_lvars` simulates HS's DeBruijn invariant.
+            //
+            // `normalize_witness_lvars` collapses Maude-minted `~mw#N`
+            // witnesses — necessary because Rust's Maude `unify_at` mints
+            // fresh witnesses per call, breaking structural Eq.  HS's
+            // matchAction is pure matching (no witnesses).
+            //
+            // Previously this also applied `eq_store.subst` to both sides
+            // before comparing.  That step OVER-COLLAPSED legit-distinct
+            // firings: at NSLPK3 line-105's parent path, eq_store contains
+            // bindings (e.g. ni→s) that unify two structurally-distinct
+            // firings to the same canonical form, hiding both from each
+            // other's dedup check.  HS does NOT do this — its bare
+            // structural Eq keeps them apart, and 4 distinct Disjs survive.
+            // Reverted to witness+bound normalisation only.
             let apply_canon = |f: &crate::guarded::Guarded| {
-                let f1 = if eq_vs.is_empty() { f.clone() }
-                         else { crate::guarded::subst_guarded(f, &eq_vs) };
-                let f2 = crate::guarded::normalize_witness_lvars(&f1);
-                // Bound-var alpha-canonicalization. Required because
-                // `freshen_system` shifts GGuarded bound-var idxs along
-                // with free vars (sources.rs:4158-4170), so the same
-                // source-assertion Disj from impliedFormulas comes back
-                // with different `j:K` allocations across iterations.
-                // HS uses DeBruijn-bound vars so this never matters
-                // there; Rust needs explicit alpha-normalisation.
-                crate::guarded::normalize_bound_lvars(&f2)
+                let f1 = crate::guarded::normalize_witness_lvars(f);
+                crate::guarded::normalize_bound_lvars(&f1)
             };
             let canon = apply_canon(&implied);
             // TAM_RS_TRACE_FORM=1 also emits an `Impl-candidate` event
