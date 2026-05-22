@@ -68,6 +68,7 @@ module Theory.Constraint.Solver.Trace (
   , flagSourcesLeaf
   , flagState
   , traceStateM
+  , tracePickM
   ) where
 
 import           Control.Monad.Disj            (MonadDisj, contradictoryIf)
@@ -273,6 +274,16 @@ traceStateM sys
                        ++ " solved_formulas=" ++ show (S.size (L.get sSolvedFormulas sys)))
     | otherwise = pure ()
 {-# NOINLINE traceStateM #-}
+
+-- | Emit a [PICK] line showing which goal was picked at this dispatch.
+-- Paired with Rust's `TAM_RS_TRACE_STATE=1` emission for goal-ranking
+-- divergence diagnosis.  Use AFTER `traceStateM sys` so the [PICK]
+-- attaches to the [STATE] line just emitted.
+tracePickM :: Applicative m => Goal -> m ()
+tracePickM g
+    | flagState = traceM ("[PICK] " ++ goalCanonical g)
+    | otherwise = pure ()
+{-# NOINLINE tracePickM #-}
 
 canonicalNodes :: System -> String
 canonicalNodes sys =
