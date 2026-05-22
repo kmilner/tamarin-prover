@@ -219,6 +219,7 @@ pub fn exec_proof_method(
             // `TAM_RS_TRACE_STATE=1` + `TAM_HS_TRACE_STATE=1` on both
             // sides, run the same theory, diff the outputs.
             crate::constraint::solver::trace::trace_state(sys);
+            crate::constraint::solver::trace::trace_pick(g);
             let mut r = Reduction::new(ctx, sys.clone());
             let outcome = crate::constraint::solver::goals::dispatch_solve_goal(&mut r, g);
             if dbg_solve {

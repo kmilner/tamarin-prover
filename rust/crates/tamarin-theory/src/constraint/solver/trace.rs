@@ -78,6 +78,24 @@ pub fn trace_state(sys: &crate::constraint::system::System) {
         sys.solved_formulas.len());
 }
 
+/// Emit a [PICK] line indicating which goal was selected for this dispatch.
+/// Paired with HS's `tracePickM` so we can compare goal-ranking decisions.
+pub fn trace_pick(g: &crate::constraint::constraints::Goal) {
+    use crate::constraint::constraints::Goal;
+    if !state_flag() { return; }
+    let s = match g {
+        Goal::Action(_, fa)  => format!("Action({}/{})",
+            fact_tag_short(&fa.tag), fa.terms.len()),
+        Goal::Premise(_, fa) => format!("Premise({}/{})",
+            fact_tag_short(&fa.tag), fa.terms.len()),
+        Goal::Chain(_, _)    => "Chain".to_string(),
+        Goal::Split(_)       => "Split".to_string(),
+        Goal::Disj(d)        => format!("Disj[{}]", disj_heads(d)),
+        Goal::Subterm(_)     => "Subterm".to_string(),
+    };
+    eprintln!("[PICK] {}", s);
+}
+
 fn canonical_nodes(sys: &crate::constraint::system::System) -> String {
     use crate::constraint::solver::reduction::rule_case_name;
     let mut names: Vec<String> = sys.nodes.iter()

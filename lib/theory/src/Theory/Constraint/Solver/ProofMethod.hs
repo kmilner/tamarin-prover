@@ -463,6 +463,7 @@ execProofMethod ctxt method sys =
       -- diff'd to find the first HS-vs-Rust system-state divergence.
       sys <- St.get
       T.traceStateM sys
+      T.tracePickM goal
       let ths = L.get pcSources ctxt
       maybe  (solveGoal goal)
              (intercalate "_" <$>)
