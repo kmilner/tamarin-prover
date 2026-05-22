@@ -1134,6 +1134,7 @@ fn saturate_sources_inner_with_options(
                             if let Some(grafted) = graft_case_into(
                                 &live_sys, &renamed, &abstract_renamed,
                                 &p.0, p.1, &fa_aligned,
+                                fold_ctx.map(|c| &c.maude),
                             ) {
                                 // Maude alignment: if we have a Maude
                                 // handle, run a proper AC-unification of
@@ -4012,6 +4013,7 @@ pub fn solve_with_source_cases(
         let mut grafted = match graft_case_into(
             sys, &renamed, &abstract_renamed, goal_node,
             goal_prem_idx, fa_prem,
+            None,
         ) {
             Some(g) => g, None => continue,
         };
@@ -4269,6 +4271,7 @@ fn graft_case_into(
     live_node: &crate::constraint::constraints::NodeId,
     live_prem_idx: crate::rule::PremIdx,
     fa_prem: &crate::fact::LNFact,
+    maude: Option<&tamarin_term::maude_proc::MaudeHandle>,
 ) -> Option<System> {
     let mut out = live_sys.clone();
     let rename_node = |n: &crate::constraint::constraints::NodeId| {
@@ -4395,6 +4398,63 @@ fn graft_case_into(
             // disjoint domain at this point in saturate.
             let added = tamarin_term::subst::Subst::from_list(vec![(new_v, new_t)]);
             out.eq_store.subst = added.compose(&out.eq_store.subst);
+        }
+    }
+    // HS-faithful filter (mirrors conjoinSystem in Reduction.hs:691):
+    // HS composes case's sSubst via `solveSubstEqs SplitNow` → `addEqs`
+    // → `applyEqStore`, where applyEqStore re-unifies each variant in
+    // eqsConj against the new free subst via Maude (EquationStore.hs:
+    // 263-282).  Variants whose Maude unification returns no unifier
+    // (e.g. TESLA Receiver0b variant [0] `z → verify(...)` conflicting
+    // with live subst's `z → true`) are DROPPED.
+    //
+    // Our prior conj-copy (lines 4361-4374) + subst-compose
+    // (lines 4387-4399) is the *structural* part of conjoinSystem; this
+    // apply_eq_store(empty) call is the *semantic* filter HS gets for
+    // free via solveTermEqs.  Without it, a variant disj copied into a
+    // live system that ALREADY has a binding key in the variant's domain
+    // (e.g. `t#38 → true` set earlier when conj was empty so add_eqs
+    // took the fast path) silently keeps the conflicting variant.
+    //
+    // Passing empty as the new subst makes apply_eq_store compute
+    // newsubst = empty ∘ out.eq_store.subst = out.eq_store.subst — so
+    // every variant gets re-unified against the EXISTING free subst.
+    // No-op when maude isn't available (legacy callers without ctx).
+    if let Some(maude) = maude {
+        if !out.eq_store.conj.is_empty() && !out.eq_store.subst.is_empty() {
+            let empty_subst = tamarin_term::subst::Subst::empty();
+            let _ = out.eq_store.apply_eq_store(maude, &empty_subst);
+            // Run simp so any variant disj that collapsed to a singleton
+            // (or empty) gets folded into eqsSubst / contradicts out.
+            // Mirrors HS's `simp hnd (substCreatesNonNormalTerms hnd se)`
+            // invocation at the tail of solveTermEqs (Reduction.hs:730).
+            use tamarin_term::lterm::HasFrees;
+            let mut sys_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar>
+                = std::collections::BTreeSet::new();
+            let mut visit = |v: &tamarin_term::lterm::LVar| { sys_vars.insert(v.clone()); };
+            for (id, rule) in &out.nodes {
+                id.for_each_free(&mut visit);
+                rule.for_each_free(&mut visit);
+            }
+            for e in &out.edges {
+                e.src.0.for_each_free(&mut visit);
+                e.tgt.0.for_each_free(&mut visit);
+            }
+            for l in &out.less_atoms {
+                l.smaller.for_each_free(&mut visit);
+                l.larger.for_each_free(&mut visit);
+            }
+            if let Some(la) = &out.last_atom { la.for_each_free(&mut visit); }
+            let maude_for_simp = maude.clone();
+            let store = std::mem::take(&mut out.eq_store);
+            out.eq_store = store.simp_with_fresh_avoiding(
+                |_, _| false,
+                |n| maude_for_simp.reserve_idxs(n),
+                &sys_vars,
+            );
+            if out.eq_store.is_false() {
+                return None;
+            }
         }
     }
     Some(out)
