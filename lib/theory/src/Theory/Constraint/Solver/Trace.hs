@@ -178,11 +178,14 @@ traceExec label x
 
 
 -- | Monadic version of `traceExec` — emits the trace as a side effect.
-traceExecM :: Monad m => String -> m ()
+-- Uses Debug.Trace.traceM directly.  Note: the previous
+-- unsafePerformIO+hPutStrLn variant produced interleaved characters
+-- because hPutStrLn isn't atomic under lazy evaluation order.
+traceExecM :: Applicative m => String -> m ()
 traceExecM label
-    | flagExec  = (trace ("[EXEC] " ++ label) (return ()) :: Monad m => m ())
-    | otherwise = return ()
-{-# INLINE traceExecM #-}
+    | flagExec  = traceM ("[EXEC] " ++ label)
+    | otherwise = pure ()
+{-# NOINLINE traceExecM #-}
 
 
 -- | One-line summary of a System for trace output.  Captures sizes so
