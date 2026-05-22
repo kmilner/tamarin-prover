@@ -154,25 +154,55 @@ impl System {
     pub fn add_node(&mut self, id: NodeId, rule: RuleACInst) {
         // DIAGNOSTIC: panic if an instance rule with user-named idx-0 vars
         // gets added.  Gated by env var so it doesn't affect production.
+        // Honors TAM_DBG_PANIC_IDX0_RUNTIME_ONLY=1 to skip during precompute.
         if std::env::var("TAM_DBG_PANIC_IDX0").is_ok() {
-            use tamarin_term::lterm::HasFrees;
-            let mut found_idx0: Option<tamarin_term::lterm::LVar> = None;
-            rule.for_each_free(&mut |v| {
-                if v.idx == 0 && matches!(v.name.as_str(),
-                    "ni" | "nr" | "m1" | "m2" | "s" | "R" | "ltkA" | "ltkI")
-                    && found_idx0.is_none() {
-                    found_idx0 = Some(v.clone());
+            let in_precompute = crate::constraint::solver::sources::in_precompute_mode();
+            let skip_during_precompute = std::env::var("TAM_DBG_PANIC_IDX0_RUNTIME_ONLY").is_ok();
+            let active = !(skip_during_precompute && in_precompute);
+            if active {
+                use tamarin_term::lterm::HasFrees;
+                let mut found_idx0: Option<tamarin_term::lterm::LVar> = None;
+                rule.for_each_free(&mut |v| {
+                    if v.idx == 0 && matches!(v.name.as_str(),
+                        "ni" | "nr" | "m1" | "m2" | "s" | "R" | "ltkA" | "ltkI")
+                        && found_idx0.is_none() {
+                        found_idx0 = Some(v.clone());
+                    }
+                });
+                if let Some(v) = found_idx0 {
+                    panic!("[TAM_DBG_PANIC_IDX0] add_node: rule has idx-0 var {:?} (id={:?}, precompute={})",
+                        v, id, in_precompute);
                 }
-            });
-            if let Some(v) = found_idx0 {
-                panic!("[TAM_DBG_PANIC_IDX0] add_node: rule has idx-0 var {:?} (id={:?})", v, id);
             }
         }
         // DIAGNOSTIC: trace every node addition with its id+rule_name.
         // Captures both pre-saturation (precompute) and runtime grafts.
         if std::env::var("TAM_DBG_TRACE_ADD_NODE").is_ok() {
             let rule_name = crate::constraint::solver::reduction::rule_case_name(&rule);
-            eprintln!("[ADD_NODE] id={:?}:{} rule={}", id.name, id.idx, rule_name);
+            // Also dump prem[1] term if id is j:N (R_1/I_1 candidates).
+            if id.name == "j" {
+                let prem1 = rule.premises.get(1)
+                    .and_then(|p| p.terms.first())
+                    .map(|t| format!("{:?}", t).chars().take(120).collect::<String>())
+                    .unwrap_or_default();
+                let prem0 = rule.premises.get(0)
+                    .and_then(|p| p.terms.first())
+                    .map(|t| format!("{:?}", t).chars().take(80).collect::<String>())
+                    .unwrap_or_default();
+                eprintln!("[ADD_NODE_J] id={}:{} rule={} prem[0]={} prem[1]={}",
+                    id.name, id.idx, rule_name, prem0, prem1);
+            } else {
+                eprintln!("[ADD_NODE] id={:?}:{} rule={}", id.name, id.idx, rule_name);
+            }
+        }
+        // DIAGNOSTIC: TAM_DBG_PANIC_ANY_IDX0_NODE — panic on ANY node added
+        // with id idx 0 (excluding the very first node, which is legitimate).
+        // Used to find the source of the idx-0 leak.  Set
+        // TAM_DBG_PANIC_ANY_IDX0_NODE=1 to enable.
+        if std::env::var("TAM_DBG_PANIC_ANY_IDX0_NODE").is_ok() && id.idx == 0 {
+            let rule_name = crate::constraint::solver::reduction::rule_case_name(&rule);
+            panic!("[TAM_DBG_PANIC_ANY_IDX0_NODE] add_node at idx 0: id={:?} rule={}",
+                id, rule_name);
         }
         if let Some(slot) = self.nodes.iter_mut().find(|(k, _)| k == &id) {
             slot.1 = rule;
