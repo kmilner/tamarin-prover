@@ -1550,6 +1550,67 @@ fn probe_nslpk3_nonce_secrecy() {
     }
 }
 
+/// Probe: CR.spthy::executable wrong-VERDICT (ours=falsified theirs=verified).
+/// Exists-trace lemma where HS finds a witness via `case responder` for
+/// KU(h(...)) but Rust takes `case c_h` path and fails.
+#[test]
+#[ignore = "diagnostic probe — CR executable wrong-VERDICT; run with --ignored"]
+fn probe_cr_executable() {
+    fn maude_path() -> Option<String> {
+        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
+        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+            if std::path::Path::new(c).exists() { return Some(c.to_string()); }
+        }
+        None
+    }
+    let mp = match maude_path() { Some(p) => p, None => return };
+    let path = "/home/parallels/tamarin-prover/examples/features/xor/CR.spthy";
+    let src = std::fs::read_to_string(path).unwrap();
+    let theory = tamarin_parser::parse_theory(&src, &[]).unwrap();
+    let elab = tamarin_theory::elaborate::elaborate(&theory).unwrap();
+    let h = tamarin_term::maude_proc::MaudeHandle::start(
+        &mp, elab.signature.maude_sig.clone()).unwrap();
+    std::env::set_var("TAM_PROVE_DEADLINE_MS", "30000");
+    let root = tamarin_theory::prove::prove_lemma(
+        &theory, "executable", h, 5000).unwrap();
+    let skel = tamarin_theory::proof_skeleton::render(&root);
+    eprintln!("== Rust's proof for CR::executable ==");
+    eprintln!("Status: {:?}", root.status);
+    eprintln!("{}", skel);
+
+    // Walk the proof tree to find the Cyclic leaf and dump its system.
+    fn walk(node: &tamarin_theory::constraint::solver::search::ProofNode, depth: usize) {
+        use tamarin_theory::constraint::solver::proof_method::{
+            ProofMethod, Result as MethodResult,
+        };
+        use tamarin_theory::constraint::solver::contradictions::Contradiction;
+        if node.children.is_empty() {
+            if let ProofMethod::Finished(MethodResult::Contradictory(c)) = &node.method {
+                if matches!(c, Some(Contradiction::Cyclic)) {
+                    eprintln!("\n== CYCLIC LEAF at depth {} ==", depth);
+                    eprintln!("nodes ({}):", node.sys.nodes.len());
+                    for (id, rule) in &node.sys.nodes {
+                        eprintln!("  {:?} → {}", id,
+                            tamarin_theory::constraint::solver::reduction::rule_case_name(rule));
+                    }
+                    eprintln!("edges ({}):", node.sys.edges.len());
+                    for e in &node.sys.edges {
+                        eprintln!("  {:?} → {:?}", e.src, e.tgt);
+                    }
+                    eprintln!("less_atoms ({}):", node.sys.less_atoms.len());
+                    for la in &node.sys.less_atoms {
+                        eprintln!("  {:?} < {:?} ({:?})", la.smaller, la.larger, la.reason);
+                    }
+                }
+            }
+        }
+        for (_, child) in &node.children {
+            walk(child, depth + 1);
+        }
+    }
+    walk(&root, 0);
+}
+
 /// **First end-to-end verdict-match** against `tamarin-prover`:
 /// drive `tiny_setup.spthy` through `prove_lemma` and confirm we
 /// reach `Solved` — same verdict tamarin produces (`verified`).
