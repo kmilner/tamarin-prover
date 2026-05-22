@@ -69,12 +69,15 @@ module Theory.Constraint.Solver.Trace (
   , flagState
   , traceStateM
   , tracePickM
+  , setCasePath
+  , getCasePath
   ) where
 
 import           Control.Monad.Disj            (MonadDisj, contradictoryIf)
 import           Data.List                     (intercalate, sort)
 import qualified Data.Map                      as M
 import qualified Data.Set                      as S
+import qualified Data.IORef                    as IORef
 import           Debug.Trace                   (trace, traceM)
 import qualified Extension.Data.Label          as L
 import           System.IO.Unsafe              (unsafePerformIO)
@@ -165,6 +168,27 @@ flagStateFull :: Bool
 flagStateFull = unsafePerformIO $
     maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_STATE_FULL"
 {-# NOINLINE flagStateFull #-}
+
+-- | Global mutable proof-tree case-name path.  Driver code
+-- (`proveSystemDFS`) sets this before each `prove` call so the trace
+-- knows which proof-tree position is being evaluated.  Because the
+-- proof tree is built lazily, we MUST set this immediately before
+-- forcing the system at each level — see Theory.Proof.proveSystemDFS
+-- for the wiring.
+casePathRef :: IORef.IORef [String]
+casePathRef = unsafePerformIO (IORef.newIORef [])
+{-# NOINLINE casePathRef #-}
+
+setCasePath :: [String] -> IO ()
+setCasePath p = IORef.writeIORef casePathRef p
+
+getCasePath :: IO [String]
+getCasePath = IORef.readIORef casePathRef
+
+casePathString :: [String] -> String
+casePathString xs =
+    let nonEmpty = filter (not . null) xs
+    in if null nonEmpty then "/" else "/" ++ intercalate "/" nonEmpty
 
 
 -- | Drop-in replacement for `contradictoryIf` with a site label.  When
@@ -278,7 +302,9 @@ dumpSystemSummary sys =
 traceStateM :: Monad m => System -> m ()
 traceStateM sys
     | flagState = do
-        traceM ("[STATE] nodes=" ++ canonicalNodes sys
+        let path = unsafePerformIO getCasePath
+        traceM ("[STATE] path=" ++ casePathString path
+              ++ " nodes=" ++ canonicalNodes sys
               ++ " goals=" ++ canonicalOpenGoals sys
               ++ " formulas=" ++ show (S.size (L.get sFormulas sys))
               ++ " solved_formulas=" ++ show (S.size (L.get sSolvedFormulas sys)))

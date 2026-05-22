@@ -113,6 +113,8 @@ import           Data.Maybe
 -- import           Data.Monoid
 
 import           Debug.Trace
+import           System.IO.Unsafe              (unsafePerformIO)
+import qualified Theory.Constraint.Solver.Trace as T
 
 import           Control.Basics
 import           Control.DeepSeq
@@ -1016,16 +1018,24 @@ cutAfterFirstSorryDiff = snd . go False
 -- infinite depth, if the proof strategy loops.
 proveSystemDFS :: Heuristic ProofContext -> [Tactic ProofContext] -> ProofContext -> Int -> System -> Proof (Maybe System)
 proveSystemDFS heuristic tactics ctxt =
-    prove
+    prove []
   where
-    prove !depth sys =
+    -- The path argument tracks the proof-tree case-name sequence from
+    -- the root.  Set into Trace.casePathRef before invoking
+    -- rankProofMethods so traceStateM emits the correct path for the
+    -- current proof position.  Branch-aware lockstep tracing
+    -- (TAM_HS_TRACE_STATE=1) uses this to align HS/Rust traces by the
+    -- exact proof-tree position.
+    prove path !depth sys =
+        let !_ = unsafePerformIO (T.setCasePath path) in
         case rankProofMethods (useHeuristic heuristic depth) tactics ctxt sys of
           [] | finishedSubterms ctxt sys  -> node (Finished Solved) M.empty
           []                              -> node (Finished Unfinishable) M.empty
           (method, (cases, _expl)):_      -> node method cases
       where
         node method cases =
-          LNode (ProofStep method (Just sys)) (M.map (prove (succ depth)) cases)
+          LNode (ProofStep method (Just sys))
+            (M.mapWithKey (\caseName s -> prove (path ++ [caseName]) (succ depth) s) cases)
 
 -- | @proveSystemDFS rules se@ explores all solutions of the initial
 -- constraint system using a depth-first-search strategy to resolve the

@@ -17,6 +17,33 @@
 //!   `factCanonical` choices in the trace sites.
 
 use std::sync::OnceLock;
+use std::cell::RefCell;
+
+thread_local! {
+    /// Stack of case-names from proof tree root to current node.
+    /// Pushed/popped by `case_path_push` / `case_path_pop` in
+    /// `search.rs::expand` and HS analog `solve`.  Emitted by
+    /// `trace_state` so each [STATE] line can be matched by the
+    /// EXACT proof path that produced it — solves the HS Disj-monad
+    /// branch-interleaving problem where the same goal-shape appears
+    /// at many proof positions.
+    static CASE_PATH: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+pub fn case_path_push(name: &str) {
+    CASE_PATH.with(|p| p.borrow_mut().push(name.to_string()));
+}
+
+pub fn case_path_pop() {
+    CASE_PATH.with(|p| { p.borrow_mut().pop(); });
+}
+
+pub fn case_path_string() -> String {
+    CASE_PATH.with(|p| {
+        let v = p.borrow();
+        if v.is_empty() { "/".to_string() } else { format!("/{}", v.join("/")) }
+    })
+}
 
 fn flag() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
@@ -71,7 +98,8 @@ fn state_flag() -> bool {
 /// had when each ranking decision was made.
 pub fn trace_state(sys: &crate::constraint::system::System) {
     if !state_flag() { return; }
-    eprintln!("[STATE] nodes={} goals={} formulas={} solved_formulas={}",
+    eprintln!("[STATE] path={} nodes={} goals={} formulas={} solved_formulas={}",
+        case_path_string(),
         canonical_nodes(sys),
         canonical_open_goals(sys),
         sys.formulas.len(),
