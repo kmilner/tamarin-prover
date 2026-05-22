@@ -2553,6 +2553,69 @@ pub fn default_case_name(i: usize) -> String {
 /// `c_<head>`, destructors use `d_<head>`, fresh-construction uses
 /// `fresh`, coercion uses `coerce`, IRecv/ISend use their internal
 /// names.
+/// Haskell-faithful direct-close case name for a chain.  Mirrors
+/// Haskell `caseName mPrem` (Goals.hs:337-338) where `mPrem` is the
+/// chain conc's KD term:
+///   * `Lit (Var v)`  → `Var_<sortSuffix>_<idx-or-name>` (see Haskell
+///     `showLitName`, LTerm.hs:864).
+///   * `Lit (Con c)`  → `Const_<sortSuffix>_<n>` (Haskell `showLitName`
+///     LTerm.hs:862-863).  Currently we don't emit constants on the
+///     direct path; the variant covers it defensively.
+///   * `FApp o _`     → function symbol name (e.g. `senc`).  Mirrors
+///     Haskell `showFunSymName` (Term.hs:261).
+///
+/// Returns `None` when the fact isn't a KD-tagged fact (the chain
+/// must be a destruction chain to be naming-relevant); callers should
+/// fall back to `rule_case_name(c_rule)` in that case.
+pub fn chain_direct_case_name(fa_conc: &crate::fact::LNFact) -> Option<String> {
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    use crate::fact::FactTag;
+    if !matches!(fa_conc.tag, FactTag::Kd) { return None; }
+    let m = fa_conc.terms.first()?;
+    Some(match m {
+        Term::Lit(Lit::Var(v)) => {
+            // Haskell `showLitName (Var (LVar v s i))`:
+            //   body | null v   = show i
+            //        | i == 0   = v
+            //        | otherwise = show i ++ "_" ++ v
+            let body = if v.name.is_empty() {
+                v.idx.to_string()
+            } else if v.idx == 0 {
+                v.name.clone()
+            } else {
+                format!("{}_{}", v.idx, v.name)
+            };
+            format!("Var_{}_{}", sort_suffix(v.sort), body)
+        }
+        Term::Lit(Lit::Con(_)) => {
+            // We don't expect direct close on a constant for KD facts,
+            // but emit a Haskell-shaped placeholder for forward compat.
+            "Const".to_string()
+        }
+        Term::App(sym, _) => {
+            use tamarin_term::function_symbols::FunSym;
+            match sym {
+                FunSym::NoEq(noeq) => String::from_utf8_lossy(&noeq.name).into_owned(),
+                FunSym::Ac(op) => format!("{:?}", op),
+                FunSym::C(op) => format!("{:?}", op),
+                FunSym::List => "List".to_string(),
+            }
+        }
+    })
+}
+
+fn sort_suffix(s: tamarin_term::lterm::LSort) -> &'static str {
+    use tamarin_term::lterm::LSort;
+    match s {
+        LSort::Msg => "msg",
+        LSort::Fresh => "fresh",
+        LSort::Pub => "pub",
+        LSort::Node => "node",
+        LSort::Nat => "nat",
+    }
+}
+
 pub fn rule_case_name(rule: &crate::rule::RuleACInst) -> String {
     use crate::rule::{IntrRuleACInfo, ProtoRuleName, RuleInfo};
     match &rule.info {
@@ -3622,8 +3685,15 @@ impl<'ctx> Reduction<'ctx> {
                                 break;
                             }
                         }
-                        // Direct-edge chain: name by the producer's rule.
-                        let case_name = rule_case_name(&c_rule);
+                        // Direct-edge chain: name by the chain conc's KD
+                        // term head, mirroring Haskell `caseName mPrem`
+                        // (Goals.hs:337-338) — `showFunSymName` for App,
+                        // `showLitName` for Lit.  Previously Rust used the
+                        // producer rule's name (`rule_case_name`), which
+                        // diverges from Haskell's proof-skeleton naming
+                        // (`senc`/`Var_fresh_7_ltkA` etc.).
+                        let case_name = chain_direct_case_name(&fa_conc)
+                            .unwrap_or_else(|| rule_case_name(&c_rule));
                         if trace_chains {
                             eprintln!("[RS-CHAIN] DIRECT {}", case_name);
                         }
