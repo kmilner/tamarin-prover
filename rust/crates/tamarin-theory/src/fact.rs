@@ -131,9 +131,28 @@ pub fn fact_tag_arity(t: &FactTag) -> usize {
 }
 
 pub fn fact_tag_multiplicity(t: &FactTag) -> Multiplicity {
+    // Mirror Haskell's `factTagMultiplicity` (Fact.hs:340-344):
+    //
+    //   factTagMultiplicity tag = case tag of
+    //       ProtoFact multi _ _ -> multi
+    //       KUFact              -> Persistent
+    //       KDFact              -> Persistent
+    //       _                   -> Linear
+    //
+    // KU/KD encode adversary knowledge — they're inherently reusable.
+    // Treating them as Linear caused `plain_route` in
+    // `enforce_fresh_ordering_pass` to walk THROUGH coerce/destructor
+    // nodes (which output KU/KD) extending the data-flow chain past
+    // its proper end.  That made `enhancedLesses` end at coerce
+    // node-ids on both sides of a fresh-supplier pair, producing the
+    // cyclic `vk:0 < vk:2` + `vk:2 < vk:0` Less-relation on
+    // CR.spthy::executable (wrong-VERDICT, task #129 regression).
+    // HS's route stops at the KU/KD conclusion, ending the chain at
+    // the destructor's predecessor (irecv) — distinct chain ends, no
+    // cycle.
     match t {
         FactTag::Proto(m, _, _) => *m,
-        // Built-in tags are Linear by default.
+        FactTag::Ku | FactTag::Kd => Multiplicity::Persistent,
         _ => Multiplicity::Linear,
     }
 }

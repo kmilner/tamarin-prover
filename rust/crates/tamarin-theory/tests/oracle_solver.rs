@@ -1590,8 +1590,13 @@ fn probe_cr_executable() {
                     eprintln!("\n== CYCLIC LEAF at depth {} ==", depth);
                     eprintln!("nodes ({}):", node.sys.nodes.len());
                     for (id, rule) in &node.sys.nodes {
-                        eprintln!("  {:?} → {}", id,
-                            tamarin_theory::constraint::solver::reduction::rule_case_name(rule));
+                        let name = tamarin_theory::constraint::solver::reduction::rule_case_name(rule);
+                        let ku_acts: Vec<_> = rule.actions.iter()
+                            .filter(|a| matches!(a.tag, tamarin_theory::fact::FactTag::Ku))
+                            .map(|a| format!("{:?}", a.terms.first())
+                                .chars().take(80).collect::<String>())
+                            .collect();
+                        eprintln!("  {:?} → {} KU={:?}", id, name, ku_acts);
                     }
                     eprintln!("edges ({}):", node.sys.edges.len());
                     for e in &node.sys.edges {
@@ -1600,6 +1605,11 @@ fn probe_cr_executable() {
                     eprintln!("less_atoms ({}):", node.sys.less_atoms.len());
                     for la in &node.sys.less_atoms {
                         eprintln!("  {:?} < {:?} ({:?})", la.smaller, la.larger, la.reason);
+                    }
+                    eprintln!("eq_store.subst ({}):", node.sys.eq_store.subst.to_list().len());
+                    for (k, v) in node.sys.eq_store.subst.to_list() {
+                        let vs = format!("{:?}", v).chars().take(120).collect::<String>();
+                        eprintln!("  {:?} → {}", k, vs);
                     }
                 }
             }
