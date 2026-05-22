@@ -968,6 +968,19 @@ impl<'ctx> Reduction<'ctx> {
     }
 
     fn insert_formula_inner(&mut self, g: Guarded, mark: bool) {
+        if std::env::var("TAM_DBG_INSERT_FORM").is_ok() {
+            let head = match &g {
+                Guarded::Atom(_) => "Atom",
+                Guarded::Conj(_) => "Conj",
+                Guarded::Disj(_) => "Disj",
+                Guarded::GGuarded { qua: crate::guarded::Quant::Ex, .. } => "Ex",
+                Guarded::GGuarded { qua: crate::guarded::Quant::All, .. } => "All",
+            };
+            let dup_f = self.sys.formulas.contains(&g);
+            let dup_s = self.sys.solved_formulas.contains(&g);
+            eprintln!("[INSERT_FORM] mark={} head={} dup_f={} dup_s={}",
+                mark, head, dup_f, dup_s);
+        }
         if self.sys.formulas.contains(&g) || self.sys.solved_formulas.contains(&g) {
             return;
         }
@@ -1043,6 +1056,11 @@ impl<'ctx> Reduction<'ctx> {
                 // CR-rule *S_∃*: fresh-rename the bound vars,
                 // substitute, and recurse on `gconj([atoms..., body])`.
                 let outer = g.clone();
+                if std::env::var("TAM_DBG_EX_DECOMP").is_ok() {
+                    eprintln!("[EX-DECOMP] ENTER mark={} vars={:?}",
+                        mark,
+                        vars.iter().map(|v| (v.name.clone(), v.idx)).collect::<Vec<_>>());
+                }
                 if self.sys.solved_formulas.contains(&outer) {
                     if std::env::var("TAM_DBG_EX_DECOMP").is_ok() {
                         eprintln!("[EX-DECOMP] SKIP (already solved) vars={:?}",

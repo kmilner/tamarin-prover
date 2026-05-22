@@ -168,6 +168,12 @@ impl System {
                 panic!("[TAM_DBG_PANIC_IDX0] add_node: rule has idx-0 var {:?} (id={:?})", v, id);
             }
         }
+        // DIAGNOSTIC: trace every node addition with its id+rule_name.
+        // Captures both pre-saturation (precompute) and runtime grafts.
+        if std::env::var("TAM_DBG_TRACE_ADD_NODE").is_ok() {
+            let rule_name = crate::constraint::solver::reduction::rule_case_name(&rule);
+            eprintln!("[ADD_NODE] id={:?}:{} rule={}", id.name, id.idx, rule_name);
+        }
         if let Some(slot) = self.nodes.iter_mut().find(|(k, _)| k == &id) {
             slot.1 = rule;
         } else {
@@ -286,6 +292,10 @@ pub fn formula_to_system(
         TraceQuantifier::ExistsTrace => fm.clone(),
         TraceQuantifier::AllTraces => gnot(fm),
     };
+    if std::env::var("TAM_DBG_FORMULA_TO_SYS").is_ok() {
+        eprintln!("[formula_to_system] tq={:?} fm = {:?}", trace_quantifier, fm);
+        eprintln!("[formula_to_system] tq={:?} gf1 = {:?}", trace_quantifier, gf1);
+    }
     // Conjoin non-safety restrictions.
     let mut conj_items = vec![gf1];
     conj_items.extend(other_restrictions);

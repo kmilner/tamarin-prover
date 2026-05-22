@@ -36,6 +36,23 @@ fn mark_contradictory(red: &mut Reduction) {
 /// undoing each other's work. Real proofs converge well within this.
 pub fn simplify_system(red: &mut Reduction) {
     crate::constraint::solver::trace::trace_exec("simplifySystem");
+    if std::env::var("TAM_DBG_SIMP_ENTER").is_ok() {
+        eprintln!("[SIMP_ENTER] formulas.len()={} solved.len()={} goals={} nodes={}",
+            red.sys.formulas.len(), red.sys.solved_formulas.len(),
+            red.sys.goals.len(), red.sys.nodes.len());
+        for (i, f) in red.sys.formulas.iter().enumerate() {
+            let head = match f {
+                crate::guarded::Guarded::Atom(_) => "Atom",
+                crate::guarded::Guarded::Conj(_) => "Conj",
+                crate::guarded::Guarded::Disj(_) => "Disj",
+                crate::guarded::Guarded::GGuarded { qua: crate::guarded::Quant::Ex, vars, .. } =>
+                    Box::leak(format!("Ex({:?})", vars.iter().map(|v| (v.name.clone(), v.idx)).collect::<Vec<_>>()).into_boxed_str()),
+                crate::guarded::Guarded::GGuarded { qua: crate::guarded::Quant::All, vars, .. } =>
+                    Box::leak(format!("All({:?})", vars.iter().map(|v| (v.name.clone(), v.idx)).collect::<Vec<_>>()).into_boxed_str()),
+            };
+            eprintln!("  [SIMP_ENTER] formula[{}] head={}", i, head);
+        }
+    }
     // Most simplify runs converge in <10 iterations.  The cap was 256
     // as a safety net for known non-idempotent passes (since fixed);
     // 64 is plenty for any real proof and significantly cheaper when
@@ -2372,6 +2389,23 @@ fn reduce_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
         .filter(|f| reducible_formula(f))
         .cloned()
         .collect();
+    if std::env::var("TAM_DBG_REDUCE_FORM").is_ok() {
+        let total = red.sys.formulas.len();
+        eprintln!("[REDUCE_FORM] total_formulas={} to_decompose={}", total, to_decompose.len());
+        for (i, f) in red.sys.formulas.iter().enumerate() {
+            let head = match f {
+                crate::guarded::Guarded::Atom(_) => "Atom",
+                crate::guarded::Guarded::Conj(_) => "Conj",
+                crate::guarded::Guarded::Disj(_) => "Disj",
+                crate::guarded::Guarded::GGuarded { qua: crate::guarded::Quant::Ex, vars, .. } =>
+                    Box::leak(format!("Ex({:?})", vars.iter().map(|v| (v.name.clone(), v.idx)).collect::<Vec<_>>()).into_boxed_str()),
+                crate::guarded::Guarded::GGuarded { qua: crate::guarded::Quant::All, vars, .. } =>
+                    Box::leak(format!("All({:?})", vars.iter().map(|v| (v.name.clone(), v.idx)).collect::<Vec<_>>()).into_boxed_str()),
+            };
+            let red_flag = reducible_formula(f);
+            eprintln!("  formula[{}] head={} reducible={}", i, head, red_flag);
+        }
+    }
     if to_decompose.is_empty() { return ChangeIndicator::Unchanged; }
     // Remove them, then re-insert via the decomposition logic.
     red.sys.formulas.retain(|f| !reducible_formula(f));
