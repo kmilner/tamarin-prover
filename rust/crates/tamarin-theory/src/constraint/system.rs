@@ -152,6 +152,22 @@ impl System {
     /// Insert a new node into the sequent. Replaces an existing entry
     /// for the same id.
     pub fn add_node(&mut self, id: NodeId, rule: RuleACInst) {
+        // DIAGNOSTIC: panic if an instance rule with user-named idx-0 vars
+        // gets added.  Gated by env var so it doesn't affect production.
+        if std::env::var("TAM_DBG_PANIC_IDX0").is_ok() {
+            use tamarin_term::lterm::HasFrees;
+            let mut found_idx0: Option<tamarin_term::lterm::LVar> = None;
+            rule.for_each_free(&mut |v| {
+                if v.idx == 0 && matches!(v.name.as_str(),
+                    "ni" | "nr" | "m1" | "m2" | "s" | "R" | "ltkA" | "ltkI")
+                    && found_idx0.is_none() {
+                    found_idx0 = Some(v.clone());
+                }
+            });
+            if let Some(v) = found_idx0 {
+                panic!("[TAM_DBG_PANIC_IDX0] add_node: rule has idx-0 var {:?} (id={:?})", v, id);
+            }
+        }
         if let Some(slot) = self.nodes.iter_mut().find(|(k, _)| k == &id) {
             slot.1 = rule;
         } else {

@@ -1044,12 +1044,21 @@ impl<'ctx> Reduction<'ctx> {
                 // substitute, and recurse on `gconj([atoms..., body])`.
                 let outer = g.clone();
                 if self.sys.solved_formulas.contains(&outer) {
+                    if std::env::var("TAM_DBG_EX_DECOMP").is_ok() {
+                        eprintln!("[EX-DECOMP] SKIP (already solved) vars={:?}",
+                            vars.iter().map(|v| (v.name.clone(), v.idx)).collect::<Vec<_>>());
+                    }
                     return;
                 }
                 self.sys.solved_formulas.push(outer);
                 let avoid_max = self.fresh_var_baseline();
                 let mut subst = crate::guarded::VarSubst::new();
                 let mut next = avoid_max.saturating_add(1);
+                if std::env::var("TAM_DBG_EX_DECOMP").is_ok() {
+                    eprintln!("[EX-DECOMP] FIRE avoid_max={} vars={:?}",
+                        avoid_max,
+                        vars.iter().map(|v| (v.name.clone(), v.idx)).collect::<Vec<_>>());
+                }
                 for v in &vars {
                     subst.insert(
                         (v.name.clone(), v.idx),
