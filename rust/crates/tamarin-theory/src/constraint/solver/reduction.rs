@@ -2616,6 +2616,43 @@ fn sort_suffix(s: tamarin_term::lterm::LSort) -> &'static str {
     }
 }
 
+/// Emit the per-premise exploitPrem traces that HS would emit for a
+/// rule whose Disj-monad branch will mzero (action/conclusion mismatch
+/// against the goal fact).  HS `labelNodeId` runs `exploitPrems i ru`
+/// BEFORE the action-mismatch check, so each premise of every dead
+/// rule still emits a `exploitPrem InFact` or `exploitPrem FreshFact
+/// isFresh=...` trace.  We synthesise the matching traces here so the
+/// exec-trace counts align between HS and Rust without Rust actually
+/// instantiating the dead rule.
+fn emit_dead_rule_premise_traces(rule: &crate::rule::RuleACInst) {
+    use crate::fact::FactTag;
+    use tamarin_term::lterm::LSort;
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    for fa in &rule.premises {
+        match &fa.tag {
+            FactTag::Fresh => {
+                // Check if the Fresh arg is already a Fresh-sorted
+                // var to determine the isFresh flag, matching HS.
+                let is_fresh = match fa.terms.first() {
+                    Some(Term::Lit(Lit::Var(v))) => v.sort == LSort::Fresh,
+                    Some(Term::Lit(Lit::Con(c))) =>
+                        matches!(c.tag, tamarin_term::lterm::NameTag::Fresh),
+                    _ => false,
+                };
+                crate::constraint::solver::trace::trace_exec(
+                    &format!("exploitPrem FreshFact isFresh={}",
+                        if is_fresh { "True" } else { "False" }));
+            }
+            FactTag::In => {
+                crate::constraint::solver::trace::trace_exec(
+                    "exploitPrem InFact");
+            }
+            _ => { /* HS doesn't trace other premise types */ }
+        }
+    }
+}
+
 pub fn rule_case_name(rule: &crate::rule::RuleACInst) -> String {
     use crate::rule::{IntrRuleACInfo, ProtoRuleName, RuleInfo};
     match &rule.info {
@@ -3336,6 +3373,12 @@ impl<'ctx> Reduction<'ctx> {
                     // matching tag/arity — cheap pre-filter that
                     // mirrors the unifiability check.
                     if !rule.actions.iter().any(|a| a.tag == fa.tag && a.terms.len() == fa.terms.len()) {
+                        // HS-faithful trace: in HS the dead-rule branch
+                        // STILL runs exploitPrem for each premise
+                        // before the action-mismatch mzero fires.
+                        // Emit matching exploitPrem traces here so the
+                        // diff isn't dominated by these dead branches.
+                        emit_dead_rule_premise_traces(&rule);
                         continue;
                     }
                     // Suppress the trace that exploit_prems would emit
@@ -3571,6 +3614,15 @@ impl<'ctx> Reduction<'ctx> {
             crate::constraint::solver::trace::trace_exec(
                 &format!("exploitPrems rule={}",
                     crate::constraint::solver::reduction::rule_case_name(rule)));
+            // If no conclusion matches, the inner loop emits 0 traces
+            // for this dead rule's premises.  HS emits one per Fr/In
+            // premise.  Synthesize matching traces for parity.
+            let any_conc_match = rule.enumerate_conclusions().any(|(_, fc)|
+                fc.tag == fa_prem.tag && fc.terms.len() == fa_prem.terms.len());
+            if !any_conc_match {
+                emit_dead_rule_premise_traces(rule);
+                continue;
+            }
             for (c_idx, fa_conc) in rule.enumerate_conclusions() {
                 if fa_conc.tag != fa_prem.tag
                     || fa_conc.terms.len() != fa_prem.terms.len() {
