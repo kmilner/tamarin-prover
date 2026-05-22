@@ -1639,9 +1639,9 @@ impl<'ctx> Reduction<'ctx> {
             }
         }
         for e in &sys.edges {
-            if !self.sys.edges.contains(e) {
-                self.sys.edges.push(e.clone());
-            }
+            // Route through System::add_edge so the EXEC trace fires
+            // (mirrors HS's `insertEdges` trace on the conjoin path).
+            self.sys.add_edge(e.clone());
         }
         // 4. insertLast: unify if both set.
         if let Some(case_last) = &sys.last_atom {
