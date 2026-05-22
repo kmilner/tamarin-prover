@@ -161,7 +161,10 @@ impl System {
 
     /// Add an edge if not already present.
     pub fn add_edge(&mut self, e: Edge) {
-        if !self.edges.contains(&e) { self.edges.push(e); }
+        if !self.edges.contains(&e) {
+            crate::constraint::solver::trace::trace_exec("insertEdges n=1");
+            self.edges.push(e);
+        }
     }
 
     /// Add a `<` atom if not already present (equality ignores reason).
