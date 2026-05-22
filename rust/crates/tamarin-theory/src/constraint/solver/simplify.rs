@@ -671,6 +671,33 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     let skip_sources = !std::env::var("TAM_PROVENANCE_SKIP_SOURCES_OFF").is_ok()
         && !crate::constraint::solver::sources::in_precompute_mode()
         && !red.sys.sources_lemma_universals.is_empty();
+    // Mirror Haskell's `openGuarded` (Guarded.hs:openGuarded): allocate
+    // FRESH LVar idxs for each bound var BEFORE matching, then
+    // substitute the antecedent + body.  Without this freshening, the
+    // lemma's bound vars stay at their parser-AST idxs (typically 0),
+    // and can spuriously match SYSTEM LVars that coincidentally share
+    // the same (name, idx) — producing the NSLPK3 line-105 / 19x
+    // IMPL-FIRE over-fire by treating system `ni:Fresh:0` as a binding
+    // target for the lemma's bound `ni:0`.
+    //
+    // HS: openGuarded freshens via `mapM (\(n,s) -> freshLVar n s)`,
+    // returning unique fresh LVars per match — system vars CANNOT
+    // collide with them because the MonadFresh counter strictly
+    // advances past every previously-seen idx.
+    //
+    // Rust: take baseline as max system var idx + 1; allocate
+    // sequential idxs per bound var.  Then `subst_atom`/`subst_guarded`
+    // applies the rename throughout antecedent + body.
+    let mut rename_baseline = red.fresh_var_baseline().saturating_add(1);
+    // Bump past max idx of all universals' bound vars (in case the
+    // collected universals' raw idxs exceed baseline).
+    for f in red.sys.formulas.iter().chain(red.sys.lemmas.iter()) {
+        if let Guarded::GGuarded { qua: Quant::All, vars, .. } = f {
+            for v in vars {
+                if v.idx >= rename_baseline { rename_baseline = v.idx + 1; }
+            }
+        }
+    }
     let universals: Vec<(Guarded, Vec<tamarin_parser::ast::VarSpec>,
                          Vec<AAtom>, Guarded)> = red.sys.formulas.iter()
         .chain(red.sys.lemmas.iter())
@@ -679,7 +706,28 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
                 if skip_sources && red.sys.sources_lemma_universals.contains(f) {
                     return None;
                 }
-                Some((f.clone(), vars.clone(), guards.clone(), (**body).clone()))
+                // openGuarded-equivalent: rename bound vars to fresh idxs.
+                use crate::guarded::{VarSubst, subst_atom, subst_guarded};
+                let mut subst = VarSubst::new();
+                let mut new_vars: Vec<tamarin_parser::ast::VarSpec> = Vec::with_capacity(vars.len());
+                let mut next = rename_baseline;
+                for v in vars {
+                    let new_v = tamarin_parser::ast::VarSpec {
+                        name: v.name.clone(),
+                        idx: next,
+                        sort: v.sort,
+                        typ: v.typ.clone(),
+                    };
+                    subst.insert((v.name.clone(), v.idx),
+                        tamarin_parser::ast::Term::Var(new_v.clone()));
+                    new_vars.push(new_v);
+                    next = next.saturating_add(1);
+                }
+                rename_baseline = next;
+                let new_guards: Vec<AAtom> = guards.iter()
+                    .map(|a| subst_atom(a, &subst)).collect();
+                let new_body = subst_guarded(body, &subst);
+                Some((f.clone(), new_vars, new_guards, new_body))
             }
             _ => None,
         })

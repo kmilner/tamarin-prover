@@ -723,6 +723,24 @@ impl<'ctx> Reduction<'ctx> {
     /// `gsLoopBreaker` in the resulting status — used by the smart
     /// ranker to deprioritise premises that would otherwise loop.
     pub fn insert_goal_with_loop_flag(&mut self, g: Goal, looping: bool) {
+        if std::env::var("TAM_DBG_PANIC_GOAL_IDX0").is_ok() {
+            use tamarin_term::lterm::HasFrees;
+            let mut found_idx0: Option<tamarin_term::lterm::LVar> = None;
+            match &g {
+                Goal::Action(_, fa) => fa.for_each_free(&mut |v| {
+                    if v.idx == 0 && matches!(v.name.as_str(),
+                        "ni" | "nr" | "m1" | "m2" | "s" | "R" | "ltkA" | "ltkI")
+                        && found_idx0.is_none() {
+                        found_idx0 = Some(v.clone());
+                    }
+                }),
+                _ => {}
+            }
+            if let Some(v) = found_idx0 {
+                panic!("[TAM_DBG_PANIC_GOAL_IDX0] insert_goal: Goal::Action with idx-0 var {:?} (goal={:?})",
+                    v, g);
+            }
+        }
         // Auto-decompose `KU(pair(a,b))` / `KU(inv(x))` / `KU(prod(...))`
         // into sub-KU goals on the components, each at a fresh
         // pre-ordered node (mirrors Haskell's `insertAction` in
@@ -3069,6 +3087,20 @@ impl<'ctx> Reduction<'ctx> {
         fa: &crate::fact::LNFact,
     ) {
         let m = match fa.terms.first() { Some(t) => t.clone(), None => return };
+        if std::env::var("TAM_DBG_ISEND_M").is_ok() {
+            use tamarin_term::lterm::HasFrees;
+            let mut has_idx0 = false;
+            m.for_each_free(&mut |v| {
+                if v.idx == 0 && matches!(v.name.as_str(),
+                    "ni" | "nr" | "m1" | "m2" | "s" | "R" | "ltkA" | "ltkI")
+                { has_idx0 = true; }
+            });
+            if has_idx0 {
+                eprintln!("[ISEND_M_IDX0] parent_node={:?}:{} prem_idx={:?} m={:?}",
+                    i.name, i.idx, idx,
+                    format!("{:?}", m).chars().take(200).collect::<String>());
+            }
+        }
         let next = self.next_fresh_node_idx();
         let j = tamarin_term::lterm::LVar::new(
             "vf", tamarin_term::lterm::LSort::Node, next);
