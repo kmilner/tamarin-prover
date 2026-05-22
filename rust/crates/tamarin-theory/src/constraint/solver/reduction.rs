@@ -3362,28 +3362,26 @@ impl<'ctx> Reduction<'ctx> {
                     // Mirror Haskell's `labelNodeId` (Goals.hs:262) which
                     // exploits every candidate rule via Disj-monad,
                     // including ones whose actions can't unify with `fa`
-                    // (those branches mzero in `solveFactEqs`).  Trace
-                    // once per rule to match HS's per-Disj-branch
-                    // exploitPrems trace; Rust still skips actually
-                    // instantiating non-matching rules for efficiency.
-                    crate::constraint::solver::trace::trace_exec(
-                        &format!("exploitPrems rule={}",
-                            crate::constraint::solver::reduction::rule_case_name(&rule)));
+                    // (those branches mzero in `solveFactEqs`).
                     // Filter rules that have at least one action with
                     // matching tag/arity — cheap pre-filter that
                     // mirrors the unifiability check.
                     if !rule.actions.iter().any(|a| a.tag == fa.tag && a.terms.len() == fa.terms.len()) {
-                        // HS-faithful trace: in HS the dead-rule branch
-                        // STILL runs exploitPrem for each premise
-                        // before the action-mismatch mzero fires.
-                        // Emit matching exploitPrem traces here so the
-                        // diff isn't dominated by these dead branches.
+                        // For non-matching rules: synthesise the
+                        // exploitPrems + per-Fresh/In premise traces
+                        // HS emits in the dead Disj branch before
+                        // mzero, so trace counts align.  Rust still
+                        // skips the actual instantiation work.
+                        crate::constraint::solver::trace::trace_exec(
+                            &format!("exploitPrems rule={}",
+                                crate::constraint::solver::reduction::rule_case_name(&rule)));
                         emit_dead_rule_premise_traces(&rule);
                         continue;
                     }
-                    // Suppress the trace that exploit_prems would emit
-                    // again from inside the inner loop — we already
-                    // traced once per rule above to match HS semantics.
+                    // Matching rules: rely on the trace emitted from
+                    // inside exploit_prems (no duplicate here).  HS
+                    // emits exactly one exploitPrems per rule (matching
+                    // or not), so we follow the same pattern.
                     for (act_idx, _) in rule.actions.iter().enumerate() {
                         // Fresh-rename the rule once per branch so
                         // each candidate has independent variables.
@@ -3608,21 +3606,23 @@ impl<'ctx> Reduction<'ctx> {
         for (rule, constrs) in &candidates {
             // Mirror HS `labelNodeId` in solvePremise: HS exploits every
             // candidate rule via Disj-monad, including conclusion
-            // tag-mismatched ones (mzero in solveFactEqs).  Trace once
-            // per rule so trace counts align; Rust still skips
-            // non-matching rules for efficiency.
-            crate::constraint::solver::trace::trace_exec(
-                &format!("exploitPrems rule={}",
-                    crate::constraint::solver::reduction::rule_case_name(rule)));
+            // tag-mismatched ones (mzero in solveFactEqs).
             // If no conclusion matches, the inner loop emits 0 traces
-            // for this dead rule's premises.  HS emits one per Fr/In
-            // premise.  Synthesize matching traces for parity.
+            // for this dead rule's premises.  HS emits one exploitPrems
+            // plus one per Fr/In premise — synthesise both here.
             let any_conc_match = rule.enumerate_conclusions().any(|(_, fc)|
                 fc.tag == fa_prem.tag && fc.terms.len() == fa_prem.terms.len());
             if !any_conc_match {
+                crate::constraint::solver::trace::trace_exec(
+                    &format!("exploitPrems rule={}",
+                        crate::constraint::solver::reduction::rule_case_name(rule)));
                 emit_dead_rule_premise_traces(rule);
                 continue;
             }
+            // Matching rule: exploit_prems will be called inside the
+            // inner loop and emit its own exploitPrems trace.  HS
+            // emits exactly one per rule (matching or not), so no
+            // duplicate here.
             for (c_idx, fa_conc) in rule.enumerate_conclusions() {
                 if fa_conc.tag != fa_prem.tag
                     || fa_conc.terms.len() != fa_prem.terms.len() {
@@ -3814,33 +3814,38 @@ impl<'ctx> Reduction<'ctx> {
                 // Mirror HS `insertFreshNode rules (Just cRule)` (Goals.hs:369)
                 // which calls labelNodeId → exploitPrems for every destructor
                 // rule, BEFORE the forbiddenEdge / prem-tag mismatch checks
-                // mzero the branch.  Trace per-rule + per-premise to align
-                // counts; Rust skips the actual instantiation work for
-                // mismatched rules.
-                crate::constraint::solver::trace::trace_exec(
-                    &format!("exploitPrems rule={}",
-                        crate::constraint::solver::reduction::rule_case_name(&ru_renamed)));
+                // mzero the branch.  For dead-branch destructors, synthesize
+                // the matching exploitPrems + per-premise traces so trace
+                // counts align; HS emits exactly one exploitPrems per rule.
+                let trace_dead = |ru: &crate::rule::RuleACInst| {
+                    crate::constraint::solver::trace::trace_exec(
+                        &format!("exploitPrems rule={}",
+                            crate::constraint::solver::reduction::rule_case_name(ru)));
+                    emit_dead_rule_premise_traces(ru);
+                };
                 let prem0 = match ru_renamed.premises.first() {
                     Some(f) => f.clone(),
                     None => {
-                        emit_dead_rule_premise_traces(&ru_renamed);
+                        trace_dead(&ru_renamed);
                         continue;
                     }
                 };
                 if prem0.tag != fa_conc.tag
                     || prem0.terms.len() != fa_conc.terms.len()
                 {
-                    emit_dead_rule_premise_traces(&ru_renamed);
+                    trace_dead(&ru_renamed);
                     continue;
                 }
                 if forbidden_edge(&c_rule, &ru_renamed) {
-                    emit_dead_rule_premise_traces(&ru_renamed);
+                    trace_dead(&ru_renamed);
                     continue;
                 }
                 if ru_renamed.conclusions.is_empty() {
-                    emit_dead_rule_premise_traces(&ru_renamed);
+                    trace_dead(&ru_renamed);
                     continue;
                 }
+                // Matching destructor: exploit_prems_supplier_only inside
+                // will emit its own exploitPrems trace below.
 
                 let mut sys_clone = self.sys.clone();
                 let new_node = tamarin_term::lterm::LVar::new(
