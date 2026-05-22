@@ -474,8 +474,37 @@ impl<'ctx> Reduction<'ctx> {
                 if let Goal::Action(i, fa) = &g2 {
                     to_insert_action.push((i.clone(), fa.clone(), st.clone()));
                 }
-            } else if !new_goals.iter().any(|(eg, _)| eg == &g2) {
-                new_goals.push((g2, st));
+            } else {
+                // HS-faithful merge: mirror `M.insertWith combineGoalStatus`
+                // (Reduction.hs:527, 656).  When subst rewrites two
+                // pre-subst goals to the same post-subst form, merge
+                // their statuses:
+                //   solved = solved_old || solved_new
+                //   looping = looping_old || looping_new
+                // (gsNr = min — we don't track it explicitly).
+                //
+                // Previously: kept the first occurrence and dropped the
+                // rest, which lost `solved=True` if it appeared later.
+                // For Disj goals specifically, this caused NSLPK3
+                // line-105 divergence: the 4 typing-lemma Disj firings
+                // post-subst collapse to 2 canonical Disjs in HS via
+                // `combineGoalStatus`, merging with prior solved
+                // entries; Rust kept 4 distinct entries instead.
+                //
+                // Comparison key: `canonical_goal_for_dedup` (mirrors
+                // HS's Map-key equality on Goal, which is structural Eq
+                // — but Rust's `VarSpec`-bound Disjs need
+                // `normalize_bound_lvars` to match HS's DeBruijn
+                // semantics, see system.rs::canonical_goal_for_dedup).
+                let canon_g2 = crate::constraint::system::canonical_goal_for_dedup(&g2);
+                if let Some(slot) = new_goals.iter_mut().find(|(eg, _)|
+                    crate::constraint::system::canonical_goal_for_dedup(eg) == canon_g2)
+                {
+                    slot.1.solved = slot.1.solved || st.solved;
+                    slot.1.looping = slot.1.looping || st.looping;
+                } else {
+                    new_goals.push((g2, st));
+                }
             }
         }
         self.sys.goals = new_goals;
