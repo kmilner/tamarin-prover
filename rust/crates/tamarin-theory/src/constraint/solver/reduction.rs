@@ -3322,12 +3322,25 @@ impl<'ctx> Reduction<'ctx> {
                 let avoid_max = bounds_max(&self.sys);
                 let mut cases: Vec<(String, crate::constraint::system::System)> = Vec::new();
                 for (rule, constrs) in candidates {
+                    // Mirror Haskell's `labelNodeId` (Goals.hs:262) which
+                    // exploits every candidate rule via Disj-monad,
+                    // including ones whose actions can't unify with `fa`
+                    // (those branches mzero in `solveFactEqs`).  Trace
+                    // once per rule to match HS's per-Disj-branch
+                    // exploitPrems trace; Rust still skips actually
+                    // instantiating non-matching rules for efficiency.
+                    crate::constraint::solver::trace::trace_exec(
+                        &format!("exploitPrems rule={}",
+                            crate::constraint::solver::reduction::rule_case_name(&rule)));
                     // Filter rules that have at least one action with
                     // matching tag/arity — cheap pre-filter that
                     // mirrors the unifiability check.
                     if !rule.actions.iter().any(|a| a.tag == fa.tag && a.terms.len() == fa.terms.len()) {
                         continue;
                     }
+                    // Suppress the trace that exploit_prems would emit
+                    // again from inside the inner loop — we already
+                    // traced once per rule above to match HS semantics.
                     for (act_idx, _) in rule.actions.iter().enumerate() {
                         // Fresh-rename the rule once per branch so
                         // each candidate has independent variables.
@@ -3550,6 +3563,14 @@ impl<'ctx> Reduction<'ctx> {
         let mut cases: Vec<(String, crate::constraint::system::System)> = Vec::new();
         let mut next_node_idx = avoid_max.saturating_add(1);
         for (rule, constrs) in &candidates {
+            // Mirror HS `labelNodeId` in solvePremise: HS exploits every
+            // candidate rule via Disj-monad, including conclusion
+            // tag-mismatched ones (mzero in solveFactEqs).  Trace once
+            // per rule so trace counts align; Rust still skips
+            // non-matching rules for efficiency.
+            crate::constraint::solver::trace::trace_exec(
+                &format!("exploitPrems rule={}",
+                    crate::constraint::solver::reduction::rule_case_name(rule)));
             for (c_idx, fa_conc) in rule.enumerate_conclusions() {
                 if fa_conc.tag != fa_prem.tag
                     || fa_conc.terms.len() != fa_prem.terms.len() {
