@@ -2844,6 +2844,13 @@ impl<'ctx> Reduction<'ctx> {
                             break;
                         }
                     }
+                    // Disj-formula bookkeeping (delete from sys.formulas,
+                    // insert into sys.solved_formulas) is already done by
+                    // `dispatch_solve_goal`'s `mark_goal_as_solved(g)` call
+                    // BEFORE delegating to us, mirroring Haskell's
+                    // `solveGoal goal = markGoalAsSolved "directly" goal ...`
+                    // (Goals.hs:201-213).  Each sub-clone inherits the
+                    // post-move state.  No additional bookkeeping needed.
                     // Decompose the chosen alternative — see comment in
                     // singleton branch.  Mirrors Haskell `solveDisjunction`
                     // → `insertFormula alt`.
