@@ -73,6 +73,7 @@ module Theory.Constraint.Solver.Trace (
   , getCasePath
   , traceFormM
   , guardedRepr
+  , traceProveEntry
   ) where
 
 import           Control.Monad.Disj            (MonadDisj, contradictoryIf)
@@ -80,7 +81,7 @@ import           Data.List                     (intercalate, sort)
 import qualified Data.Map                      as M
 import qualified Data.Set                      as S
 import qualified Data.IORef                    as IORef
-import           Debug.Trace                   (trace, traceM)
+import           Debug.Trace                   (trace, traceM, traceIO)
 import qualified Extension.Data.Label          as L
 import           System.IO.Unsafe              (unsafePerformIO)
 import qualified System.Environment            as SysEnv
@@ -344,6 +345,22 @@ traceFormM kind fm
               ++ " kind=" ++ kind ++ " " ++ guardedRepr fm)
     | otherwise = pure ()
 {-# NOINLINE traceFormM #-}
+
+-- | Unconditional state-emission at proveSystemDFS::prove entry.
+-- Mirrors the [STATE] format from `traceStateM` but doesn't go through
+-- the ProofMethod.solve path — so EVERY proof-tree position gets
+-- traced, not just SolveGoal dispatches.  Required for branch-aware
+-- lockstep with Rust which also traces every `expand` call.
+traceProveEntry :: [String] -> System -> IO ()
+traceProveEntry path sys
+    | flagState =
+        traceIO ("[STATE] path=" ++ casePathString path
+              ++ " nodes=" ++ canonicalNodes sys
+              ++ " goals=" ++ canonicalOpenGoals sys
+              ++ " formulas=" ++ show (S.size (L.get sFormulas sys))
+              ++ " solved_formulas=" ++ show (S.size (L.get sSolvedFormulas sys)))
+    | otherwise = pure ()
+{-# NOINLINE traceProveEntry #-}
 
 -- | Canonicalized Guarded formula renderer matching Rust's `guarded_repr`.
 -- Includes the full `show`-rendered atoms / quantifier bodies so two

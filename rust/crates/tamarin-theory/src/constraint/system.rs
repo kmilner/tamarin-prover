@@ -113,6 +113,26 @@ pub struct System {
     pub sources_lemma_universals: Vec<Guarded>,
 }
 
+/// Canonicalize a Goal for dedup-comparison in `add_goal_with_loop_flag`.
+/// For Disj goals, applies `normalize_bound_lvars` to the alternatives
+/// so alpha-equivalent Disjs (re-fired across simplify iterations with
+/// different freshen-shifted bound idxs) compare equal — mirroring HS's
+/// DeBruijn-bound structural equality on the Map key.
+///
+/// Identity for non-Disj goals (their var idxs are semantically
+/// significant — same NodeId means same node etc.).
+pub fn canonical_goal_for_dedup(g: &Goal) -> Goal {
+    match g {
+        Goal::Disj(d) => {
+            let canon_alts: Vec<crate::guarded::Guarded> = d.0.iter()
+                .map(crate::guarded::normalize_bound_lvars)
+                .collect();
+            Goal::Disj(crate::constraint::constraints::Disj::new(canon_alts))
+        }
+        _ => g.clone(),
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Ord, PartialOrd, Hash)]
 pub struct GoalStatus {
     /// How many times the solver has applied a tactic to this goal.
@@ -137,10 +157,37 @@ impl System {
     /// `insertGoal` mirror with loop-breaker flag — direct port of
     /// Haskell's `insertGoal goal isLoopBreaker`. Marks the goal's
     /// `looping` field so the smart ranker can deprioritise it.
+    ///
+    /// Haskell uses `M.insertWith combineGoalStatus`:
+    ///   combineGoalStatus (GoalStatus s1 a1 l1) (GoalStatus s2 a2 l2) =
+    ///     GoalStatus (s1 || s2) (min a1 a2) (l1 || l2)
+    /// — so re-inserting a goal that was previously marked `solved` keeps
+    /// it solved.
+    ///
+    /// For Disj goals specifically, HS uses DeBruijn-bound vars so
+    /// alpha-equivalent Disjs are STRUCTURALLY IDENTICAL — the Map
+    /// key match triggers `combineGoalStatus` and the prior `solved=True`
+    /// is preserved.  Rust represents bound vars as `VarSpec` with
+    /// freshen-shifted idxs, so alpha-equivalent re-firings would
+    /// otherwise produce DISTINCT goal keys → new goals with
+    /// `solved=False` accumulate.
+    ///
+    /// Concrete trigger: NSLPK3 line-105.  The 4 typing-lemma Disjs
+    /// at parent path are re-fired across many proof-tree positions.
+    /// HS recognises them as the same goal each time (DeBruijn match)
+    /// and keeps the prior solved=True.  Rust loses track and ends up
+    /// with 1 spurious open Disj at `/.../I_2`, which smartRanking
+    /// then picks → line-105 `case case_1` (Disj) where HS picks
+    /// `case I_1` (next Action).
+    ///
+    /// Fix: for Disj goals, compare against existing goals via
+    /// alpha-canonicalised form (`normalize_bound_lvars`).  Mirrors
+    /// HS's DeBruijn-based structural equality.
     pub fn add_goal_with_loop_flag(&mut self, g: Goal, looping: bool) {
-        if let Some(slot) = self.goals.iter_mut().find(|(existing, _)| existing == &g) {
-            // Existing goal — keep its prior `looping` state if already
-            // set true (matches Haskell's monoidal status update).
+        let canon_g = canonical_goal_for_dedup(&g);
+        if let Some(slot) = self.goals.iter_mut().find(|(existing, _)|
+            canonical_goal_for_dedup(existing) == canon_g)
+        {
             slot.1.looping = slot.1.looping || looping;
             return;
         }
