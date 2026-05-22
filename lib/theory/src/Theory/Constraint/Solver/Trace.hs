@@ -353,14 +353,44 @@ traceFormM kind fm
 -- lockstep with Rust which also traces every `expand` call.
 traceProveEntry :: [String] -> System -> IO ()
 traceProveEntry path sys
-    | flagState =
+    | flagState = do
         traceIO ("[STATE] path=" ++ casePathString path
               ++ " nodes=" ++ canonicalNodes sys
               ++ " goals=" ++ canonicalOpenGoals sys
               ++ " formulas=" ++ show (S.size (L.get sFormulas sys))
               ++ " solved_formulas=" ++ show (S.size (L.get sSolvedFormulas sys)))
+        if flagGoalsAll
+            then traceIO ("[STATE_GOALS_ALL] path=" ++ casePathString path
+                  ++ " goals=" ++ allGoalsCanonical sys)
+            else pure ()
     | otherwise = pure ()
 {-# NOINLINE traceProveEntry #-}
+
+-- | TAM_HS_TRACE_GOALS_ALL=1 dumps ALL goals (incl. solved + DisjG) with
+-- solved status — for diagnosing where Disj goals end up after HS's
+-- combineGoalStatus merges or markGoalAsSolved removes them.
+flagGoalsAll :: Bool
+flagGoalsAll = unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_GOALS_ALL"
+{-# NOINLINE flagGoalsAll #-}
+
+allGoalsCanonical :: System -> String
+allGoalsCanonical sys =
+    let pairs = M.toList (L.get sGoals sys)
+        rendered = [ goalDetailed g ++ "[solved=" ++ show (L.get gsSolved gs) ++ "]"
+                   | (g, gs) <- pairs ]
+    in "[" ++ intercalate "," rendered ++ "]"
+
+-- | Detailed goal renderer (full content) — for full-fidelity sGoals
+-- dump when investigating HS's Disj-key merging behaviour.
+goalDetailed :: Goal -> String
+goalDetailed g = case g of
+    ActionG  _ fa -> "Action(" ++ factCanonical fa ++ ")"
+    PremiseG _ fa -> "Premise(" ++ factCanonical fa ++ ")"
+    ChainG _ _    -> "Chain"
+    SplitG _      -> "Split"
+    DisjG d       -> "DisjG{" ++ show d ++ "}"
+    SubtermG _    -> "Subterm"
 
 -- | Canonicalized Guarded formula renderer matching Rust's `guarded_repr`.
 -- Includes the full `show`-rendered atoms / quantifier bodies so two
