@@ -3627,6 +3627,8 @@ impl<'ctx> Reduction<'ctx> {
                         if trace_chains {
                             eprintln!("[RS-CHAIN] DIRECT {}", case_name);
                         }
+                        crate::constraint::solver::trace::trace_exec(
+                            &format!("solveChain DIRECT {}", case_name));
                         all_cases.push((case_name, sub.sys));
                     }
                 }
@@ -3743,6 +3745,8 @@ impl<'ctx> Reduction<'ctx> {
                 if trace_chains {
                     eprintln!("[RS-CHAIN] EXTEND {} prem=PremIdx(0)", case_name);
                 }
+                crate::constraint::solver::trace::trace_exec(
+                    &format!("solveChain EXTEND {}", case_name));
                 all_cases.push((case_name, sub.sys));
             }
         }
