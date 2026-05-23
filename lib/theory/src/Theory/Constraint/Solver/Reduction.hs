@@ -284,7 +284,7 @@ insertChain c p = insertGoal (ChainG c p) False
 insertEdges :: [(NodeConc, LNFact, LNFact, NodePrem)] -> Reduction ()
 insertEdges edges = do
     T.traceExecM ("insertEdges n=" ++ show (length edges))
-    void (solveFactEqs SplitNow [ Equal fa1 fa2 | (_, fa1, fa2, _) <- edges ])
+    void (solveFactEqsLabeled "insertEdges" SplitNow [ Equal fa1 fa2 | (_, fa1, fa2, _) <- edges ])
     modM sEdges (\es -> foldr S.insert es [ Edge c p | (c,_,_,p) <- edges])
 
 -- | Insert an 'Action' atom. Ensures that (almost all) trivial *KU* actions
@@ -747,7 +747,13 @@ noContradictoryEqStore = do
 -- Note that updating the remaining parts of the constraint system with the
 -- substitution has to be performed using a separate call to 'substSystem'.
 solveTermEqs :: SplitStrategy -> [Equal LNTerm] -> Reduction ChangeIndicator
-solveTermEqs splitStrat eqs0 =
+solveTermEqs splitStrat eqs0 = solveTermEqsLabeled "solveTermEqs" splitStrat eqs0
+
+-- | Like solveTermEqs but tags downstream noContradictoryEqStore traces
+-- with a call-site label so we can attribute contradictions to specific
+-- upstream callers (solveSubstEqs, solveNodeIdEqs, solveFactEqs, etc.).
+solveTermEqsLabeled :: String -> SplitStrategy -> [Equal LNTerm] -> Reduction ChangeIndicator
+solveTermEqsLabeled siteLabel splitStrat eqs0 =
     case filter (not . evalEqual) eqs0 of
       []  -> do return Unchanged
       eqs1 -> do
@@ -765,33 +771,36 @@ solveTermEqs splitStrat eqs0 =
                       insertGoal (SplitG splitId) False
                       return eqs2
                   _                        -> return eqs2
-        noContradictoryEqStore
+        noContradictoryEqStoreLabeled siteLabel
         return Changed
 
 -- | Add a list of equalities in substitution form to the equation store
 solveSubstEqs :: SplitStrategy -> LNSubst -> Reduction ChangeIndicator
 solveSubstEqs split subst =
-    solveTermEqs split [Equal (varTerm v) t | (v, t) <- substToList subst]
+    solveTermEqsLabeled "solveSubstEqs" split [Equal (varTerm v) t | (v, t) <- substToList subst]
 
 -- | Add a list of node equalities to the equation store.
 solveNodeIdEqs :: [Equal NodeId] -> Reduction ChangeIndicator
-solveNodeIdEqs = solveTermEqs SplitNow . map (fmap varTerm)
+solveNodeIdEqs = solveTermEqsLabeled "solveNodeIdEqs" SplitNow . map (fmap varTerm)
 
 -- | Add a list of fact equalities to the equation store, if possible.
 solveFactEqs :: SplitStrategy -> [Equal LNFact] -> Reduction ChangeIndicator
-solveFactEqs split eqs = do
-    T.contradictoryIfT "solveFactEqs:tagMismatch"
-        (not $ all evalEqual $ map (fmap factTag) eqs)
-    solveListEqs (solveTermEqs split) $ map (fmap factTerms) eqs
+solveFactEqs split eqs = solveFactEqsLabeled "solveFactEqs.default" split eqs
 
 -- | Add a list of rule equalities to the equation store, if possible.
 solveRuleEqs :: SplitStrategy -> [Equal RuleACInst] -> Reduction ChangeIndicator
 solveRuleEqs split eqs = do
     T.contradictoryIfT "solveRuleEqs:ruleInfoMismatch"
         (not $ all evalEqual $ map (fmap (get rInfo)) eqs)
-    solveListEqs (solveFactEqs split) $
+    solveListEqs (solveFactEqsLabeled "solveRuleEqs" split) $
         map (fmap (get rConcs)) eqs ++ map (fmap (get rPrems)) eqs
         ++ map (fmap (get rActs)) eqs
+
+solveFactEqsLabeled :: String -> SplitStrategy -> [Equal LNFact] -> Reduction ChangeIndicator
+solveFactEqsLabeled siteLabel split eqs = do
+    T.contradictoryIfT "solveFactEqs:tagMismatch"
+        (not $ all evalEqual $ map (fmap factTag) eqs)
+    solveListEqs (solveTermEqsLabeled siteLabel split) $ map (fmap factTerms) eqs
 
 -- | Solve a number of equalities between lists interpreted as free terms
 -- using the given solver for solving the entailed per-element equalities.
@@ -811,5 +820,21 @@ solveRuleConstraints (Just eqConstr) = do
     insertGoal (SplitG splitId) False
     -- do not use expensive substCreatesNonNormalTerms here
     setM sEqStore =<< simp hnd (const (const False)) eqs
-    noContradictoryEqStore
+    noContradictoryEqStoreLabeled "solveRuleConstraints"
 solveRuleConstraints Nothing = return ()
+
+-- | Like noContradictoryEqStore but tags the [CONTRA-DUMP] trace with
+-- the calling site label so we can attribute contradictions to specific
+-- HS code paths.
+noContradictoryEqStoreLabeled :: String -> Reduction ()
+noContradictoryEqStoreLabeled siteLabel = do
+    isfalse <- eqsIsFalse <$> getM sEqStore
+    when (isfalse && T.flagContra) $ do
+        sys <- gets id
+        Debug.Trace.traceM $ "[CONTRA-DUMP] label=noContradictoryEqStore:eqsIsFalse"
+          ++ " site=" ++ siteLabel
+          ++ " nodes=" ++ show (M.size (get sNodes sys))
+          ++ " edges=" ++ show (S.size (get sEdges sys))
+          ++ " formulas=" ++ show (S.size (get sFormulas sys))
+          ++ " goals=" ++ show (M.size (get sGoals sys))
+    T.contradictoryIfT ("noContradictoryEqStore:eqsIsFalse:" ++ siteLabel) isfalse

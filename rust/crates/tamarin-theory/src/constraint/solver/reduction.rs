@@ -165,6 +165,17 @@ impl<'ctx> Reduction<'ctx> {
     }
 
     /// Insert an edge; mark changed if it wasn't there.
+    ///
+    /// NOTE: This method is currently DEAD CODE — no caller in the
+    /// solver routes through it.  All edge insertions go through
+    /// `self.sys.add_edge(...)` directly.  Keeping the method as the
+    /// natural home for an HS-faithful `insertEdges` port (Reduction.hs:
+    /// 285-288), which would do `solveFactEqs SplitNow` on the edge's
+    /// facts BEFORE inserting.  Sess 19/20 instrumentation showed HS
+    /// catches 1123 contradictions in `insertEdges`; matching this in
+    /// Rust requires updating the actual call sites (chain extension,
+    /// source-case grafting, etc.) which use raw `sys.add_edge` and
+    /// often run their own `solve_fact_eqs` separately afterwards.
     pub fn insert_edge(&mut self, e: Edge) {
         let before = self.sys.edges.len();
         self.sys.add_edge(e);
