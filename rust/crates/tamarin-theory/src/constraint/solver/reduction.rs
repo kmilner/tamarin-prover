@@ -4232,15 +4232,27 @@ impl<'ctx> Reduction<'ctx> {
                 if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
                     continue;
                 }
-                // Step 3: propagate the unification into nodes/edges/
-                // goals so that the recursive `solve_chain_goal` sees
-                // the actual bound term at the destructor's conclusion
-                // rather than its fresh var.  Also propagates the
-                // subst into the KU goals added by step 1's exploit
-                // path so they reference bound vars.  Mirrors HS's
-                // implicit eq-store-driven substitution at goal lookup
-                // time.
-                sub.subst_system();
+                // Step 3 (HS-faithful): leave sub.sys raw post-insertEdges.
+                // HS's simplifySystem (`Simplify.hs:97`) calls substSystem
+                // exactly ONCE at the start of each simplify iteration,
+                // NOT after every solveTermEqs inside a CR-rule.  So
+                // when the chain continuation goal Chain((new_node,
+                // ConcIdx 0), p) is later dispatched by solveGoal, HS
+                // reads sNodes which still holds ru's raw (pre-subst)
+                // conclusion fact — e.g. KD(~mw:Fresh) or KD(x:Msg) —
+                // and HS's `contradictoryIf (isMsgVar m)` (Goals.hs:367)
+                // fires mzero on the latter.
+                //
+                // Previously Rust called `sub.subst_system()` here to
+                // propagate the chain_extend unification into nodes.
+                // This pre-resolved the destructor's conc-var so
+                // `is_msg_var` returned False every time, doubling
+                // chain_extend insertEdges entries vs HS on TLS.
+                //
+                // Sub.sys.eq_store still holds the binding; downstream
+                // consumers that need the resolved term call
+                // `lazy_views::node_conc_fact_subst` or run their own
+                // substSystem (e.g. the next simplifySystem iteration).
                 // The freshly-added prem-0 goal now has an incoming
                 // edge from `c`, so mark it solved (Haskell's
                 // `markGoalAsSolved "directly" (PremiseG (i, v) ...)`).
