@@ -222,6 +222,47 @@ impl<'ctx> Reduction<'ctx> {
         res
     }
 
+    /// `insertLast` — HS-faithful port of Reduction.hs:409-414:
+    /// ```haskell
+    /// insertLast i = do
+    ///     lst <- getM sLastAtom
+    ///     case lst of
+    ///       Nothing -> setM sLastAtom (Just i) >> return Unchanged
+    ///       Just j  -> solveNodeIdEqs [Equal i j]
+    /// ```
+    /// When no last atom is set, install this one.  When one is
+    /// already set, equate the new node id to the existing last via
+    /// `solveNodeIdEqs` — failure routes through `mark_contradictory`
+    /// to keep the mzero-proxy in sync with HS `noContradictoryEqStore`.
+    pub fn insert_last(&mut self, i: crate::constraint::constraints::NodeId)
+        -> Result<SolveOutcome, crate::tools::equation_store::AddEqsError>
+    {
+        match self.sys.last_atom.clone() {
+            None => {
+                self.sys.last_atom = Some(i);
+                self.changed = ChangeIndicator::Changed;
+                Ok(SolveOutcome::Linear(ChangeIndicator::Unchanged))
+            }
+            Some(j) if j == i => {
+                Ok(SolveOutcome::Linear(ChangeIndicator::Unchanged))
+            }
+            Some(j) => {
+                if std::env::var("TAM_DBG_INSERT_LAST").is_ok() {
+                    eprintln!("[insert_last] existing={:?} new={:?} → eq", j, i);
+                }
+                let res = self.solve_node_id_eqs(&[
+                    tamarin_term::rewriting::Equal { lhs: i, rhs: j }
+                ]);
+                if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
+                    self.mark_contradictory();
+                } else {
+                    self.changed = ChangeIndicator::Changed;
+                }
+                res
+            }
+        }
+    }
+
     /// `substSystem`: apply the eq-store's current substitution to
     /// every part of the constraint system that holds free variables —
     /// nodes (both ids and rule contents), edges, last-atom, less
@@ -1034,42 +1075,8 @@ impl<'ctx> Reduction<'ctx> {
             }
             Atom::Last(t) => {
                 let Some(n) = term_to_node_id(t) else { return false; };
-                // Mirror Haskell `insertLast` in
-                // `Theory.Constraint.Solver.Reduction`: if no last_atom
-                // is set, install this one; if there's already a last
-                // node and it differs from `n`, equate them via
-                // `solveNodeIdEqs` — picking the case_1 (Last) disjunct
-                // of a sources-assertion IH commits to `n` BEING the
-                // last node, which must unify with whatever the system
-                // already considers last (the induction's `#i`).
-                match self.sys.last_atom.clone() {
-                    None => {
-                        self.sys.last_atom = Some(n);
-                        self.changed = ChangeIndicator::Changed;
-                    }
-                    Some(la) if la == n => {}
-                    Some(la) => {
-                        if std::env::var("TAM_DBG_INSERT_LAST").is_ok() {
-                            eprintln!("[insert_last] insert_atom: existing={:?} new={:?} → eq",
-                                la, n);
-                        }
-                        // Haskell `insertLast n = ... whenJust last
-                        // $ \i -> solveNodeIdEqs [Equal i n]` — failure
-                        // propagates via monadic bind through
-                        // `noContradictoryEqStore` (Reduction.hs:704).
-                        // Route both gfalse + eq_store.is_false via the
-                        // helper to keep the mzero proxy in sync.
-                        let res = self.solve_node_id_eqs(&[
-                            tamarin_term::rewriting::Equal {
-                                lhs: la, rhs: n,
-                            }
-                        ]);
-                        if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
-                            self.mark_contradictory();
-                        }
-                        self.changed = ChangeIndicator::Changed;
-                    }
-                }
+                // HS-faithful insertLast (Reduction.hs:409-414).
+                let _ = self.insert_last(n);
                 true
             }
             Atom::Action(fact, t) => {
@@ -1879,23 +1886,12 @@ impl<'ctx> Reduction<'ctx> {
             // (mirrors HS's `insertEdges` trace on the conjoin path).
             self.sys.add_edge(e.clone());
         }
-        // 4. insertLast: unify if both set.
+        // 4. insertLast: HS-faithful (Reduction.hs:409-414 + conjoinSystem
+        // Reduction.hs:676 `F.mapM_ insertLast $ get sLastAtom sys`).
         if let Some(case_last) = &sys.last_atom {
-            match &self.sys.last_atom {
-                None => self.sys.last_atom = Some(case_last.clone()),
-                Some(live_last) => {
-                    let lhs = case_last.clone();
-                    let rhs = live_last.clone();
-                    if std::env::var("TAM_DBG_INSERT_LAST").is_ok() {
-                        eprintln!("[insert_last] conjoin: case_last={:?} live_last={:?} → eq",
-                            lhs, rhs);
-                    }
-                    let r = self.solve_node_id_eqs(
-                        &[tamarin_term::rewriting::Equal { lhs, rhs }]);
-                    if matches!(r, Err(_) | Ok(SolveOutcome::Contradictory)) {
-                        return r;
-                    }
-                }
+            let r = self.insert_last(case_last.clone());
+            if matches!(r, Err(_) | Ok(SolveOutcome::Contradictory)) {
+                return r;
             }
         }
         // 5. insertLess.
@@ -1958,20 +1954,10 @@ impl<'ctx> Reduction<'ctx> {
             let id = self.sys.eq_store.add_disj(disj.substs.clone());
             new_split_ids.push(id);
         }
-        // 10. conjoinSubtermStores — best-effort: union of subterm + solved-subterm sets.
-        for st in &sys.subterm_store.subterms {
-            if !self.sys.subterm_store.subterms.contains(st) {
-                self.sys.subterm_store.subterms.push(st.clone());
-            }
-        }
-        for st in &sys.subterm_store.solved_subterms {
-            if !self.sys.subterm_store.solved_subterms.contains(st) {
-                self.sys.subterm_store.solved_subterms.push(st.clone());
-            }
-        }
-        if sys.subterm_store.contradictory {
-            self.sys.subterm_store.contradictory = true;
-        }
+        // 10. conjoinSubtermStores — HS-faithful (SubtermStore.hs:108).
+        // Mirrors HS `modM sSubtermStore (conjoinSubtermStores (get sSubtermStore sys))`
+        // at Reduction.hs:698.
+        self.sys.subterm_store.conjoin(&sys.subterm_store);
         // 11. insertGoal(SplitG) for each new split-id.
         for id in new_split_ids {
             self.insert_goal(crate::constraint::constraints::Goal::Split(id));
