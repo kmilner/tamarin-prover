@@ -193,11 +193,39 @@ pub fn trace_state(sys: &crate::constraint::system::System) {
         eprintln!("[STATE_FULL] node_actions={}", canonical_node_actions(sys));
         eprintln!("[STATE_FULL] open_actions={}", canonical_open_actions(sys));
     }
+    if state_eqs_flag() {
+        // `TAM_RS_TRACE_STATE_EQS=1`: dump canonical eq_store contents
+        // for HS vs Rust binding-divergence diagnosis.  Idxs suppressed
+        // so the diff catches semantic divergences (different name
+        // unifications) rather than idx-allocation drift.
+        eprintln!("[STATE_EQS] path={} subst={} conj={}",
+            case_path_string(),
+            canonical_eq_store_subst(sys),
+            sys.eq_store.conj.len());
+    }
 }
 
 fn state_full_flag() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| std::env::var("TAM_RS_TRACE_STATE_FULL").is_ok())
+}
+
+fn state_eqs_flag() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("TAM_RS_TRACE_STATE_EQS").is_ok())
+}
+
+/// Canonical dump of `sys.eq_store.subst`: sorted list of canonical
+/// `var → term` bindings, var idxs suppressed.  Mirrors HS's
+/// `canonicalEqStoreSubst` (Trace.hs) so the lines diff line-by-line.
+fn canonical_eq_store_subst(sys: &crate::constraint::system::System) -> String {
+    let mut entries: Vec<String> = sys.eq_store.subst.to_list().into_iter().map(|(k, v)| {
+        let k_str = format!("{}{}:{:?}", sort_prefix(k.sort), k.name, k.sort);
+        let v_str = canonical_lnterm(&v);
+        format!("{}→{}", k_str, v_str)
+    }).collect();
+    entries.sort();
+    format!("[{}]", entries.join(", "))
 }
 
 /// Canonicalize an LNTerm by suppressing LVar idxs.  Keeps name+sort,

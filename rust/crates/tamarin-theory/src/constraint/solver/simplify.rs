@@ -1577,6 +1577,18 @@ fn enforce_fresh_node_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     let mut hit_contra = false;
     for (_rule, ids) in buckets {
         if ids.len() < 2 { continue; }
+        // TAM_RS_TRACE_DG4=1: dump the merge event + current eq_store
+        // contents.  Used to find the upstream binding that caused two
+        // distinct Fresh suppliers' rules to compare equal here.
+        if std::env::var("TAM_RS_TRACE_DG4").is_ok() {
+            let bindings: Vec<String> = red.sys.eq_store.subst.to_list().into_iter()
+                .map(|(k, v)| format!("{}.{}/{:?}→{:?}", k.name, k.idx, k.sort, v))
+                .collect();
+            eprintln!("[DG4_MERGE] ids={:?} rule_conc={:?} eq_store={:?}",
+                ids,
+                _rule.conclusions.first().map(|f| format!("{:?}({:?})", f.tag, f.terms)),
+                bindings);
+        }
         let keep = ids[0].clone();
         let eqs: Vec<_> = ids.into_iter().skip(1)
             .map(|i| tamarin_term::rewriting::Equal {

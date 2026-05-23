@@ -3166,10 +3166,18 @@ impl<'ctx> Reduction<'ctx> {
             "vf", tamarin_term::lterm::LSort::Node, next);
         let rule = make_fresh_rule(m.clone());
         self.sys.add_node(j.clone(), rule);
-        // HS-faithful `insertEdges` (Reduction.hs:284): unify edge
-        // facts before adding.  Mirrors HS `exploitPrem FreshFact`
-        // which does `insertEdges [((j, ConcIdx 0), freshFact m, fa, ...)]`.
-        let _ = self.insert_edge_labeled("fresh_supplier", crate::constraint::constraints::Edge {
+        // HS-faithful (Reduction.hs:265): `exploitPrem FreshFact` does
+        // a raw `modM sEdges (S.insert $ Edge (j, ConcIdx 0) (i,v))` —
+        // NO `insertEdges` (so NO solveFactEqs).  Routing through
+        // `insert_edge_labeled` here was non-HS-faithful: it unified
+        // the supplier's conc fact with the consumer's prem fact,
+        // adding bindings to the eq_store that HS doesn't have.  On
+        // NSPK3 the extra bindings transitively chained `~ltkA = ~nr`,
+        // causing `enforce_fresh_node_uniqueness` (DG4) to merge two
+        // distinct Fresh suppliers, which then fired a false-positive
+        // `enforce_edge_uniqueness:prem_idx_clash` and dropped the
+        // Lowe-attack cases as FormulasFalse.
+        self.sys.edges.push(crate::constraint::constraints::Edge {
             src: (j, crate::rule::ConcIdx(0)),
             tgt: (i.clone(), idx),
         });
@@ -3224,9 +3232,10 @@ impl<'ctx> Reduction<'ctx> {
             if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
                 self.mark_contradictory();
             }
-            // Propagate the narrowing into the system structure so
-            // downstream passes see the Fresh-sorted version.
-            self.subst_system();
+            // HS-faithful (Reduction.hs:255-258): `exploitPrem FreshFact`
+            // ends with `unless (isFreshVar m) $ void (solveTermEqs ...)`.
+            // No `substSystem` call.  The eq-store update propagates at
+            // the next simplifySystem's iter-start substSystem (Simplify.hs:97).
         }
         self.changed = ChangeIndicator::Changed;
     }

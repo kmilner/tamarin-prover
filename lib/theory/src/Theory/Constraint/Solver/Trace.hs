@@ -86,6 +86,7 @@ import qualified Extension.Data.Label          as L
 import           System.IO.Unsafe              (unsafePerformIO)
 import qualified System.Environment            as SysEnv
 
+import           Term.Substitution             (substToList)
 import           Theory.Constraint.System
 import           Theory.Constraint.System.Constraints
                                                 (Goal(..))
@@ -171,6 +172,17 @@ flagStateFull :: Bool
 flagStateFull = unsafePerformIO $
     maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_STATE_FULL"
 {-# NOINLINE flagStateFull #-}
+
+-- TAM_HS_TRACE_STATE_EQS: emit a [STATE_EQS] line containing the
+-- canonical eq_store substitution at each [STATE] checkpoint.
+-- Mirrors Rust's TAM_RS_TRACE_STATE_EQS.  Used to find the first
+-- divergent eq-store binding between the implementations.  Idxs
+-- suppressed so the diff catches semantic divergences rather than
+-- idx-allocation drift.
+flagStateEqs :: Bool
+flagStateEqs = unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_STATE_EQS"
+{-# NOINLINE flagStateEqs #-}
 
 -- | Global mutable proof-tree case-name path.  Driver code
 -- (`proveSystemDFS`) sets this before each `prove` call so the trace
@@ -315,6 +327,11 @@ traceStateM sys
             then do
                 traceM ("[STATE_FULL] node_actions=" ++ canonicalNodeActions sys)
                 traceM ("[STATE_FULL] open_actions=" ++ canonicalOpenActions sys)
+            else pure ()
+        if flagStateEqs
+            then traceM ("[STATE_EQS] path=" ++ casePathString path
+                  ++ " subst=" ++ canonicalEqStoreSubst sys
+                  ++ " conj=" ++ show (length (L.get sConjDisjEqs sys)))
             else pure ()
     | otherwise = pure ()
 {-# NOINLINE traceStateM #-}
@@ -492,3 +509,23 @@ canonicalOpenActions sys =
                   | (ActionG _ fa, gs) <- pairs
                   , not (L.get gsSolved gs) ]
     in compressDups (sort actions)
+
+-- | Canonical dump of `sys ^. sSubst`: sorted list of `var → term`
+-- bindings with var idxs suppressed.  Mirrors Rust's
+-- `canonical_eq_store_subst` so the lines diff line-by-line.  Used to
+-- find the first divergent eq-store binding between HS and Rust at the
+-- same proof-tree path.
+canonicalEqStoreSubst :: System -> String
+canonicalEqStoreSubst sys =
+    let pairs = substToList (L.get sSubst sys)
+        entries = sort [ stripVarIdxs (show v ++ "→" ++ show t)
+                       | (v, t) <- pairs ]
+    in "[" ++ intercalate ", " entries ++ "]"
+  where
+    -- Reuse the var-idx-stripping logic.
+    stripVarIdxs []                = []
+    stripVarIdxs ('.' : cs)
+        | (digits, rest) <- span (`elem` "0123456789") cs
+        , not (null digits)
+        = stripVarIdxs rest
+    stripVarIdxs (c : cs)           = c : stripVarIdxs cs

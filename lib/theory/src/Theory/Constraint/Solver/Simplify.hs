@@ -232,10 +232,26 @@ enforceFreshAndKuNodeUniqueness =
       <*> (merge (solveFactEqs SplitNow)    kuActions)
   where
     -- *DG4*
-    freshRuleInsts se = do
-        (i, ru) <- M.toList $ get sNodes se
-        guard (isFreshRule ru)
-        return (ru, ((), i))  -- no need to merge equal rules
+    freshRuleInsts se =
+        -- TAM_HS_TRACE_DG4=1 mirror of Rust's TAM_RS_TRACE_DG4:
+        -- emit one [HS_DG4_MERGE] line per group of identical Fresh
+        -- rule instances about to be merged.
+        let insts = do
+              (i, ru) <- M.toList $ get sNodes se
+              guard (isFreshRule ru)
+              return (ru, ((), i))
+            traceDg4 = Unsafe.unsafePerformIO $ do
+              flag <- maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_DG4"
+              when flag $ do
+                let groups = groupSortOn fst insts
+                mapM_ (\g -> when (length g > 1) $ do
+                    let ru = fst (head g)
+                        ids = [i | (_, ((), i)) <- g]
+                    Debug.Trace.traceIO ("[HS_DG4_MERGE] ids=" ++ show ids
+                                  ++ " rule_conc=" ++ show (get rConcs ru))
+                  ) groups
+              return ()
+        in traceDg4 `seq` insts
 
     -- *N5_u*
     kuActions se = (\(i, fa, m) -> (m, (fa, i))) <$> allKUActions se
