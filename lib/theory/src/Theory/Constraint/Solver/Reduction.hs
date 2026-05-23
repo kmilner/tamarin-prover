@@ -729,7 +729,16 @@ data SplitStrategy = SplitNow | SplitLater
 -- | @noContradictoryEqStore@ succeeds iff the equation store is not
 -- contradictory.
 noContradictoryEqStore :: Reduction ()
-noContradictoryEqStore = (T.contradictoryIfT "noContradictoryEqStore:eqsIsFalse" . eqsIsFalse) =<< getM sEqStore
+noContradictoryEqStore = do
+    isfalse <- eqsIsFalse <$> getM sEqStore
+    when (isfalse && T.flagContra) $ do
+        sys <- gets id
+        Debug.Trace.traceM $ "[CONTRA-DUMP] label=noContradictoryEqStore:eqsIsFalse"
+          ++ " nodes=" ++ show (M.size (get sNodes sys))
+          ++ " edges=" ++ show (S.size (get sEdges sys))
+          ++ " formulas=" ++ show (S.size (get sFormulas sys))
+          ++ " goals=" ++ show (M.size (get sGoals sys))
+    T.contradictoryIfT "noContradictoryEqStore:eqsIsFalse" isfalse
 
 -- | Add a list of term equalities to the equation store. And
 --  split resulting disjunction of equations according

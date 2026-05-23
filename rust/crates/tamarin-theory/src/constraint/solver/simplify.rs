@@ -2358,6 +2358,9 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         }
     }
     if conc_idx_clash {
+        if std::env::var("TAM_DBG_EDGE_UNIQ").is_ok() {
+            eprintln!("[edge_uniq] CONTRA conc_idx_clash");
+        }
         mark_contradictory(red);
         return ChangeIndicator::Changed;
     }
@@ -2379,6 +2382,9 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         }
     }
     if prem_idx_clash {
+        if std::env::var("TAM_DBG_EDGE_UNIQ").is_ok() {
+            eprintln!("[edge_uniq] CONTRA prem_idx_clash");
+        }
         mark_contradictory(red);
         return ChangeIndicator::Changed;
     }
@@ -2386,6 +2392,9 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     if node_eqs.is_empty() { return ChangeIndicator::Unchanged; }
     let res = red.solve_node_id_eqs(&node_eqs);
     if matches!(res, Err(_) | Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)) {
+        if std::env::var("TAM_DBG_EDGE_UNIQ").is_ok() {
+            eprintln!("[edge_uniq] CONTRA solve_node_id_eqs n_eqs={}", node_eqs.len());
+        }
         mark_contradictory(red);
         return ChangeIndicator::Changed;
     }
