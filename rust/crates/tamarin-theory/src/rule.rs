@@ -434,6 +434,29 @@ pub fn get_remaining_rule_applications<I>(
     }
 }
 
+/// `setRemainingRuleApplications`: writes a new budget into a
+/// destruction rule's `paciRemainingApplications` field.  Non-destr
+/// rules are returned unchanged.  Mirrors Haskell
+/// `setRemainingRuleApplications` (Theory/Model/Rule.hs:807-811).
+///
+/// Used by `solve_chain_goal` EXTEND to decrement the destructor's
+/// remaining budget when chaining into another instance of the same
+/// destructor — the loop-breaker that bounds chain extensions of
+/// the same rule.
+pub fn set_remaining_rule_applications<I>(
+    rule: Rule<RuleInfo<I, IntrRuleACInfo>>,
+    n: i64,
+) -> Rule<RuleInfo<I, IntrRuleACInfo>>
+{
+    let Rule { info, premises, conclusions, actions, new_vars } = rule;
+    let info = match info {
+        RuleInfo::Intr(IntrRuleACInfo::DestrRule(name, _, subterm, constant)) =>
+            RuleInfo::Intr(IntrRuleACInfo::DestrRule(name, n, subterm, constant)),
+        other => other,
+    };
+    Rule { info, premises, conclusions, actions, new_vars }
+}
+
 /// Get the rule name for `RuleACInst` / `RuleAC` shapes — used to
 /// detect "same-name" rules in `forbiddenEdge`.
 ///

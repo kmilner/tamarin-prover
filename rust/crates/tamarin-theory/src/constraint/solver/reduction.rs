@@ -4098,6 +4098,35 @@ impl<'ctx> Reduction<'ctx> {
                 if !crate::rule::is_destr_rule_info(&ir.info) { continue; }
                 let ru_inst = intr_rule_to_rule_ac_inst(ir.clone());
                 let ru_renamed = freshen_rule(ru_inst, avoid_max, &self.ctx.maude);
+                // HS-faithful `labelNodeId` (Reduction.hs:219-225) — when
+                // the chain conc's rule (parent) shares a name with this
+                // destructor and still has > 1 remaining applications,
+                // decrement the destructor's budget by 1.  This is the
+                // chain-extension loop-breaker: the budget reaches 1 after
+                // N consecutive same-name extensions, at which point
+                // `forbiddenEdge` (Goals.hs:399-400) mzero's the branch.
+                //
+                // Previously Rust didn't decrement, so the destructor's
+                // budget stayed at its initial value forever — the
+                // `forbiddenEdge` same-rule loop-breaker never fired,
+                // and each solveChain enumerated all 4 destructors
+                // (matching Haskell's BFS) but never pruned the
+                // same-rule chains, doubling chain_extend insertEdges
+                // entries compared to HS on TLS_Handshake.
+                let ru_renamed = {
+                    let cn = crate::rule::rule_name_string(&c_rule);
+                    let pn = crate::rule::rule_name_string(&ru_renamed);
+                    if !cn.is_empty() && cn == pn {
+                        let parent_budget = crate::rule::get_remaining_rule_applications(&c_rule);
+                        if parent_budget > 1 {
+                            crate::rule::set_remaining_rule_applications(ru_renamed, parent_budget - 1)
+                        } else {
+                            ru_renamed
+                        }
+                    } else {
+                        ru_renamed
+                    }
+                };
                 // Mirror HS `insertFreshNode rules (Just cRule)` (Goals.hs:369)
                 // which calls labelNodeId → exploitPrems for every destructor
                 // rule, BEFORE the forbiddenEdge / prem-tag mismatch checks
@@ -4142,12 +4171,36 @@ impl<'ctx> Reduction<'ctx> {
                 );
                 next_node_idx = next_node_idx.saturating_add(1);
                 sys_clone.add_node(new_node.clone(), ru_renamed.clone());
-                // HS-faithful `insertEdges` (Goals.hs:382 extendAndMark):
-                // route through `insert_edge` so unification fires
-                // BEFORE the edge enters sEdges.  Mirrors HS's
-                // `solveFactEqs SplitNow` + `modM sEdges` order in
-                // `insertEdges` (Reduction.hs:284-288).
                 let mut sub = Reduction::new(self.ctx, sys_clone);
+                // HS-faithful effect order (Goals.hs solveChain EXTEND
+                // + Reduction.hs labelNodeId/extendAndMark):
+                //   1. labelNodeId → exploitPrems        (Reduction.hs:219-228)
+                //   2. contradictoryIf forbiddenEdge      (Goals.hs:371 — pre-filtered above)
+                //   3. extendAndMark → insertEdges chain_extend  (Goals.hs:382)
+                //
+                // Previously Rust did chain_extend insertEdges FIRST,
+                // then subst_system, then exploit_prems_supplier_only.
+                // That over-fired insert_edge for branches where
+                // exploitPrems would have mzero'd in HS (e.g. an InFact
+                // supplier's insertEdges fails fact unification).  The
+                // case was still pushed to all_cases, even though
+                // downstream simplify would drop it.  This new order
+                // mirrors HS's effect sequence so the case is dropped
+                // BEFORE chain_extend insertEdges fires, matching
+                // CONTRA-DUMP attribution exactly.
+                //
+                // Step 1: exploit suppliers + KU action goals (HS
+                // `exploitPrems i ru` in labelNodeId).  Suppliers route
+                // through `insert_edge_labeled` (fresh_supplier /
+                // isend_supplier) so any fact-unification failure
+                // sets sub.sys.eq_store.is_false() via mark_contradictory.
+                sub.exploit_prems_supplier_only(&new_node, &ru_renamed);
+                if sub.sys.eq_store.is_false() {
+                    continue;
+                }
+                // Step 2: HS-faithful `insertEdges` chain_extend
+                // (Goals.hs:382 extendAndMark) — solveFactEqs on
+                // (faConc, faPrem) BEFORE adding to sEdges.
                 let res = sub.insert_edge_labeled("chain_extend", crate::constraint::constraints::Edge {
                     src: c.clone(),
                     tgt: (new_node.clone(), crate::rule::PremIdx(0)),
@@ -4155,43 +4208,15 @@ impl<'ctx> Reduction<'ctx> {
                 if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
                     continue;
                 }
-                // Propagate the unification into nodes/conclusions so
-                // that the recursive `solve_chain_goal` sees the actual
-                // bound term at the destructor's conclusion rather than
-                // its fresh var.  Without this, `fa_conc` for the next
-                // chain step is `KD(x:Msg)` (the destructor's raw conc
-                // var), which is_msg_var → true, skipping Branch 2's
-                // second destructor extension.  Mirrors Haskell's
-                // `solveFactEqs >> substSystem`.
+                // Step 3: propagate the unification into nodes/edges/
+                // goals so that the recursive `solve_chain_goal` sees
+                // the actual bound term at the destructor's conclusion
+                // rather than its fresh var.  Also propagates the
+                // subst into the KU goals added by step 1's exploit
+                // path so they reference bound vars.  Mirrors HS's
+                // implicit eq-store-driven substitution at goal lookup
+                // time.
                 sub.subst_system();
-                // Wire up the destructor's other premises (KU(k) etc.)
-                // via the supplier-only path: KU premises become
-                // `Goal::Action` at fresh predecessors (Haskell's
-                // `requiresKU`); other premise types are skipped here
-                // — we don't want to flood the goal queue while the
-                // chain is still being extended.
-                //
-                // CRITICAL: read the SUBSTITUTED rule from
-                // `sub.sys.nodes` rather than passing `ru_renamed`
-                // (which is the pre-subst local variable).  After
-                // `subst_system`, the rule stored at `new_node` has
-                // its premises rewritten to use the bound vars from
-                // the eq-store (e.g. `~mw#1000000052:Fresh` instead
-                // of the raw destructor var `k`).  Passing the stale
-                // `ru_renamed` creates KU goals with unbound
-                // destructor vars that never get matched to the
-                // substituted prem[1] term — leaving the d_*sdec
-                // node's KU premise structurally dangling.  Found via
-                // Minimal_Crypto_API::NewKey_invariant: the d_0_sdec
-                // node had prem[1] = Ku(~mw#1000000052:Fresh) but the
-                // only unsolved KU goal was Ku(~mw#48:Msg), so the
-                // KU(~mw#1000000052) premise had no producer or open
-                // goal, and the system reached a bogus SOLVED leaf.
-                let ru_subst = sub.sys.nodes.iter()
-                    .find(|(id, _)| id == &new_node)
-                    .map(|(_, r)| r.clone())
-                    .unwrap_or_else(|| ru_renamed.clone());
-                sub.exploit_prems_supplier_only(&new_node, &ru_subst);
                 // The freshly-added prem-0 goal now has an incoming
                 // edge from `c`, so mark it solved (Haskell's
                 // `markGoalAsSolved "directly" (PremiseG (i, v) ...)`).
