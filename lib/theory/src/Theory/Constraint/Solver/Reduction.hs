@@ -578,6 +578,7 @@ removeSolvedSplitGoals = do
 -- the sequent.
 substSystem :: Reduction ChangeIndicator
 substSystem = do
+<<<<<<< HEAD
     -- The equation-store substitution is applied to the whole system after
     -- every solving step and is idempotent, so it is frequently empty (e.g.
     -- right after a proof step renamed and reset it). Applying an empty
@@ -587,17 +588,17 @@ substSystem = do
     if nullSubst subst
       then return Unchanged
       else do
-        c1 <- substNodes
-        substEdges
-        substLastAtom
-        substLessAtoms
-        substSubtermStore
-        substFormulas
-        substSolvedFormulas
-        substLemmas
-        c2 <- substGoals
-        substNextGoalNr
-        return (c1 <> c2)
+   	c1 <- T.tracePassPair "substSystem.substNodes" substNodes
+    	T.tracePassPair "substSystem.substEdges" substEdges
+    	T.tracePassPair "substSystem.substLastAtom" substLastAtom
+    	T.tracePassPair "substSystem.substLessAtoms" substLessAtoms
+    	T.tracePassPair "substSystem.substSubtermStore" substSubtermStore
+    	T.tracePassPair "substSystem.substFormulas" substFormulas
+    	T.tracePassPair "substSystem.substSolvedFormulas" substSolvedFormulas
+    	T.tracePassPair "substSystem.substLemmas" substLemmas
+    	c2 <- T.tracePassPair "substSystem.substGoals" substGoals
+    	T.tracePassPair "substSystem.substNextGoalNr" substNextGoalNr
+    	return (c1 <> c2)
 
 -- no invariants to maintain here
 substEdges, substLessAtoms, substSubtermStore, substLastAtom, substFormulas,
@@ -630,12 +631,22 @@ substNodes =
 -- Return @True@ iff new equalities have been added to the equation store.
 setNodes :: [(NodeId, RuleACInst)] -> Reduction ChangeIndicator
 setNodes nodes0 = do
+    when T.flagSimplify $ Debug.Trace.traceM $
+        "[SET_NODES] enter nodes0_len=" ++ show (length nodes0)
+        ++ " groups=" ++ show (length groups)
+        ++ " ruleEqs_len=" ++ show (length ruleEqs)
     sNodes =: M.fromList nodes
-    if null ruleEqs then                                    return Unchanged
-                    else solveRuleEqs SplitLater ruleEqs >> return Changed
+    if null ruleEqs then do
+                         when T.flagSimplify $ Debug.Trace.traceM "[SET_NODES] exit no_eqs"
+                         return Unchanged
+                    else do
+                         r <- solveRuleEqs SplitLater ruleEqs >> return Changed
+                         when T.flagSimplify $ Debug.Trace.traceM "[SET_NODES] exit after_solveRuleEqs"
+                         return r
   where
     -- merge nodes with equal node id
-    (ruleEqs, nodes) = first concat $ unzip $ map merge $ groupSortOn fst nodes0
+    groups            = groupSortOn fst nodes0
+    (ruleEqs, nodes)  = first concat $ unzip $ map merge groups
 
     merge []            = unreachable "setNodes"
     merge (keep:remove) = (map (Equal (snd keep) . snd) remove, keep)

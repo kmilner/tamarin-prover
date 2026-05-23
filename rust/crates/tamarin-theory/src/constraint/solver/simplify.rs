@@ -29,6 +29,34 @@ fn mark_contradictory(red: &mut Reduction) {
     red.mark_contradictory();
 }
 
+/// `TAM_RS_TRACE_SIMPLIFY=1` — per-subpass enter/exit traces matching
+/// HS's `tracePassPair` format.  Lets us count contradiction-firing per
+/// pass via `delta = enter - exit` (an exit MISSING means the pass
+/// mzero'd via contradictoryIfT in HS, or marked contradictory in Rust).
+fn trace_subpass<F: FnOnce(&mut Reduction) -> ChangeIndicator>(
+    label: &'static str, red: &mut Reduction, f: F,
+) -> ChangeIndicator {
+    let on = std::env::var("TAM_RS_TRACE_SIMPLIFY").is_ok();
+    if on { eprintln!("[SUBPASS] enter {}", label); }
+    let was_dead_before = is_dead_for_trace(red);
+    let r = f(red);
+    let dead_after = is_dead_for_trace(red);
+    // Mirror HS's `tracePassPair` semantics: exit is only emitted if the
+    // monadic action ran to completion WITHOUT mzero'ing.  In Rust,
+    // mark_contradictory is the closest analog — if the pass marked
+    // contradictory (and wasn't already), it "mzero'd" mid-pass.
+    if on && !(dead_after && !was_dead_before) {
+        eprintln!("[SUBPASS] exit  {}", label);
+    }
+    r
+}
+
+fn is_dead_for_trace(red: &Reduction) -> bool {
+    red.sys.eq_store.is_false()
+        || red.sys.formulas.iter().any(|f|
+            matches!(f, crate::guarded::Guarded::Disj(v) if v.is_empty()))
+}
+
 /// `simplifySystem` — run all non-case-splitting CR-rules to a fixpoint.
 ///
 /// The loop is bounded to 256 iterations as a safety net — without
@@ -73,7 +101,7 @@ pub fn simplify_system(red: &mut Reduction) {
         // Mirror Haskell: at the start of every simplify iteration,
         // consume the eq-store substitution into nodes/edges/less/goals
         // so the per-pass reasoning sees canonical node ids.
-        r.subst_system();
+        trace_subpass("substSystem", r, |r| { r.subst_system(); ChangeIndicator::Unchanged });
         // Pass order ported from Haskell `Simplify.hs:124-132`
         // (non-diff branch):
         //   enforceNodeUniqueness    -- {fresh, ku, kd}-node uniqueness (DG4, N5↑, N5↓)
@@ -96,29 +124,29 @@ pub fn simplify_system(red: &mut Reduction) {
         // returns (c1, c2, c3) = (fresh-DG4, KD-N5↓, KU-N5↑).
         // Previously we ran KU before KD — order divergence.
         if std::env::var("TAM_OFF_FRESH_UNIQ").is_err() {
-            c = c.or(enforce_fresh_node_uniqueness_pass(r));
+            c = c.or(trace_subpass("enforceFreshNodeUniqueness", r, enforce_fresh_node_uniqueness_pass));
         }
         if std::env::var("TAM_OFF_KD_UNIQ").is_err() {
-            c = c.or(enforce_kd_fact_uniqueness_pass(r));
+            c = c.or(trace_subpass("enforceKdFactUniqueness", r, enforce_kd_fact_uniqueness_pass));
         }
         if std::env::var("TAM_OFF_KU_UNIQ").is_err() {
-            c = c.or(enforce_ku_action_uniqueness_pass(r));
+            c = c.or(trace_subpass("enforceKuActionUniqueness", r, enforce_ku_action_uniqueness_pass));
         }
         if std::env::var("TAM_OFF_EDGE_UNIQ").is_err() {
-            c = c.or(enforce_edge_uniqueness_pass(r));
+            c = c.or(trace_subpass("enforceEdgeUniqueness", r, enforce_edge_uniqueness_pass));
         }
-        c = c.or(solve_unique_actions_pass(r));
-        c = c.or(reduce_formulas_pass(r));
-        c = c.or(eval_formula_atoms_pass(r));
+        c = c.or(trace_subpass("solveUniqueActions", r, solve_unique_actions_pass));
+        c = c.or(trace_subpass("reduceFormulas", r, reduce_formulas_pass));
+        c = c.or(trace_subpass("evalFormulaAtoms", r, eval_formula_atoms_pass));
         if std::env::var("TAM_OFF_IMPL").is_err() {
-            c = c.or(insert_implied_formulas_pass(r));
+            c = c.or(trace_subpass("insertImpliedFormulas", r, insert_implied_formulas_pass));
         }
-        c = c.or(enforce_fresh_ordering_pass(r));
-        c = c.or(propagate_subterm_obvious(r));
-        c = c.or(simp_injective_fact_eq_mon_pass(r));
-        c = c.or(dedupe_formulas_pass(r));
-        c = c.or(drop_trivially_true_formulas_pass(r));
-        c = c.or(normalise_less_atoms_pass(r));
+        c = c.or(trace_subpass("enforceFreshOrdering", r, enforce_fresh_ordering_pass));
+        c = c.or(trace_subpass("propagateSubtermObvious", r, propagate_subterm_obvious));
+        c = c.or(trace_subpass("simpInjectiveFactEqMon", r, simp_injective_fact_eq_mon_pass));
+        c = c.or(trace_subpass("dedupeFormulas", r, dedupe_formulas_pass));
+        c = c.or(trace_subpass("dropTriviallyTrueFormulas", r, drop_trivially_true_formulas_pass));
+        c = c.or(trace_subpass("normaliseLessAtoms", r, normalise_less_atoms_pass));
         c
     });
     // Post-loop: CR-rule N6 (`exploitUniqueMsgOrder`) — once the
