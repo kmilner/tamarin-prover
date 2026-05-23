@@ -120,6 +120,10 @@ impl<'ctx> Reduction<'ctx> {
                     .filter(|l| !l.contains("mark_contradictory"))
                     .filter(|l| !l.contains("trace_subpass"))
                     .filter(|l| !l.contains("apply_node_eqs"))
+                    .filter(|l| !l.contains("while_changing"))
+                    .filter(|l| !l.contains("simp_with_fresh"))
+                    .filter(|l| !l.contains("::Reduction::insert_edge"))
+                    .filter(|l| !l.contains("::Reduction::insert_edge_labeled"))
                     .nth(0)
                     .unwrap_or("(no frame)")
                     .trim();
@@ -183,6 +187,18 @@ impl<'ctx> Reduction<'ctx> {
     pub fn insert_edge(&mut self, e: Edge)
         -> Result<SolveOutcome, crate::tools::equation_store::AddEqsError>
     {
+        self.insert_edge_labeled("unlabeled", e)
+    }
+
+    pub fn insert_edge_labeled(&mut self, site: &str, e: Edge)
+        -> Result<SolveOutcome, crate::tools::equation_store::AddEqsError>
+    {
+        if std::env::var("TAM_RS_TRACE_INSERT_EDGE").is_ok() {
+            let mode = if crate::constraint::solver::sources::in_precompute_mode() {
+                "saturate" } else { "runtime" };
+            eprintln!("[INSERT_EDGE] enter site={} mode={} src={:?} tgt={:?} eqIsFalse={}",
+                site, mode, e.src, e.tgt, self.sys.eq_store.is_false());
+        }
         // Look up the conclusion fact (source) and premise fact (target).
         let fa_conc = self.sys.nodes.iter()
             .find(|(n, _)| n == &e.src.0)
@@ -212,6 +228,11 @@ impl<'ctx> Reduction<'ctx> {
         // Mirrors `noContradictoryEqStore` (Reduction.hs:721+):
         // mzero-equivalent if eq_store becomes false.
         if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
+            if std::env::var("TAM_RS_TRACE_INSERT_EDGE_FIRE").is_ok() {
+                let mode = if crate::constraint::solver::sources::in_precompute_mode() {
+                    "saturate" } else { "runtime" };
+                eprintln!("[INSERT_EDGE_FIRE] site={} mode={}", site, mode);
+            }
             self.mark_contradictory();
             return res;
         }
@@ -3124,7 +3145,7 @@ impl<'ctx> Reduction<'ctx> {
         // HS-faithful `insertEdges` (Reduction.hs:284): unify edge
         // facts before adding.  Mirrors HS `exploitPrem FreshFact`
         // which does `insertEdges [((j, ConcIdx 0), freshFact m, fa, ...)]`.
-        let _ = self.insert_edge(crate::constraint::constraints::Edge {
+        let _ = self.insert_edge_labeled("fresh_supplier", crate::constraint::constraints::Edge {
             src: (j, crate::rule::ConcIdx(0)),
             tgt: (i.clone(), idx),
         });
@@ -3235,7 +3256,7 @@ impl<'ctx> Reduction<'ctx> {
         // HS-faithful `insertEdges` (Reduction.hs:284): unify edge
         // facts before adding.  Mirrors HS `exploitPrem InFact` which
         // does `insertEdges [((j, ConcIdx 0), kuFactAnn ann m, fa, ...)]`.
-        let _ = self.insert_edge(crate::constraint::constraints::Edge {
+        let _ = self.insert_edge_labeled("isend_supplier", crate::constraint::constraints::Edge {
             src: (j.clone(), crate::rule::ConcIdx(0)),
             tgt: (i.clone(), idx),
         });
@@ -3986,6 +4007,11 @@ impl<'ctx> Reduction<'ctx> {
         c: &crate::constraint::constraints::NodeConc,
         p: &crate::constraint::constraints::NodePrem,
     ) -> GoalCases {
+        if std::env::var("TAM_RS_TRACE_SOLVE_CHAIN").is_ok() {
+            let mode = if crate::constraint::solver::sources::in_precompute_mode() {
+                "saturate" } else { "runtime" };
+            eprintln!("[SOLVE_CHAIN] enter mode={} c={:?} p={:?}", mode, c, p);
+        }
         let g = Goal::Chain(c.clone(), p.clone());
         let c_rule = match self.sys.nodes.iter().find(|(id, _)| id == &c.0) {
             Some((_, r)) => r.clone(),
@@ -4026,7 +4052,7 @@ impl<'ctx> Reduction<'ctx> {
                     // `solveFactEqs SplitNow` + `modM sEdges` order.
                     let sys_clone = self.sys.clone();
                     let mut sub = Reduction::new(self.ctx, sys_clone);
-                    let res = sub.insert_edge(crate::constraint::constraints::Edge {
+                    let res = sub.insert_edge_labeled("chain_direct", crate::constraint::constraints::Edge {
                         src: c.clone(), tgt: p.clone(),
                     });
                     if !matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
@@ -4122,7 +4148,7 @@ impl<'ctx> Reduction<'ctx> {
                 // `solveFactEqs SplitNow` + `modM sEdges` order in
                 // `insertEdges` (Reduction.hs:284-288).
                 let mut sub = Reduction::new(self.ctx, sys_clone);
-                let res = sub.insert_edge(crate::constraint::constraints::Edge {
+                let res = sub.insert_edge_labeled("chain_extend", crate::constraint::constraints::Edge {
                     src: c.clone(),
                     tgt: (new_node.clone(), crate::rule::PremIdx(0)),
                 });

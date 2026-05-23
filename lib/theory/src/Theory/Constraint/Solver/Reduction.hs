@@ -39,6 +39,7 @@ module Theory.Constraint.Solver.Reduction (
   , insertGoal
   , insertAtom
   , insertEdges
+  , insertEdgesLabeled
   , insertChain
   , insertAction
   , insertLess
@@ -282,9 +283,19 @@ insertChain c p = insertGoal (ChainG c p) False
 -- | Insert an edge constraint. CR-rule *DG1_2* is enforced automatically,
 -- i.e., the fact equalities are enforced.
 insertEdges :: [(NodeConc, LNFact, LNFact, NodePrem)] -> Reduction ()
-insertEdges edges = do
+insertEdges = insertEdgesLabeled "default"
+
+-- | Insert an edge constraint with a call-site label so [CONTRA-DUMP] traces
+-- can be attributed to specific call sites (solvePremise / solveChain DIRECT /
+-- solveChain EXTEND).
+insertEdgesLabeled :: String -> [(NodeConc, LNFact, LNFact, NodePrem)] -> Reduction ()
+insertEdgesLabeled siteLabel edges = do
     T.traceExecM ("insertEdges n=" ++ show (length edges))
-    void (solveFactEqsLabeled "insertEdges" SplitNow [ Equal fa1 fa2 | (_, fa1, fa2, _) <- edges ])
+    when T.flagContra $ Debug.Trace.traceM
+      ("[INSERT_EDGES] enter site=" ++ siteLabel
+       ++ " n=" ++ show (length edges)
+       ++ " edges=" ++ show [(c,p) | (c,_,_,p) <- edges])
+    void (solveFactEqsLabeled ("insertEdges:" ++ siteLabel) SplitNow [ Equal fa1 fa2 | (_, fa1, fa2, _) <- edges ])
     modM sEdges (\es -> foldr S.insert es [ Edge c p | (c,_,_,p) <- edges])
 
 -- | Insert an 'Action' atom. Ensures that (almost all) trivial *KU* actions
