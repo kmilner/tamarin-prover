@@ -164,22 +164,62 @@ impl<'ctx> Reduction<'ctx> {
         id
     }
 
-    /// Insert an edge; mark changed if it wasn't there.
+    /// Insert an edge — HS-faithful port of `insertEdges` (Reduction.hs:284-288):
+    /// ```haskell
+    /// insertEdges edges = do
+    ///     void (solveFactEqs SplitNow [Equal fa1 fa2 | (_, fa1, fa2, _) <- edges])
+    ///     modM sEdges (\es -> foldr S.insert es ...)
+    /// ```
+    /// Order matters: HS calls `solveFactEqs SplitNow` BEFORE adding to
+    /// sEdges. If the unification fails (eq_store becomes false), HS
+    /// mzero's the branch via `noContradictoryEqStore` — the edge is
+    /// never added to the contradicted state. We mirror this: unify
+    /// first via `solve_fact_eqs`, fail-fast via `mark_contradictory`
+    /// + early return, then add to `sys.edges` only on success.
     ///
-    /// NOTE: This method is currently DEAD CODE — no caller in the
-    /// solver routes through it.  All edge insertions go through
-    /// `self.sys.add_edge(...)` directly.  Keeping the method as the
-    /// natural home for an HS-faithful `insertEdges` port (Reduction.hs:
-    /// 285-288), which would do `solveFactEqs SplitNow` on the edge's
-    /// facts BEFORE inserting.  Sess 19/20 instrumentation showed HS
-    /// catches 1123 contradictions in `insertEdges`; matching this in
-    /// Rust requires updating the actual call sites (chain extension,
-    /// source-case grafting, etc.) which use raw `sys.add_edge` and
-    /// often run their own `solve_fact_eqs` separately afterwards.
-    pub fn insert_edge(&mut self, e: Edge) {
+    /// Returns `Ok(Contradictory)` when the fact unification fails so
+    /// callers can skip the case cleanly (matches HS Disj-monad mzero
+    /// semantics on the caller side).
+    pub fn insert_edge(&mut self, e: Edge)
+        -> Result<SolveOutcome, crate::tools::equation_store::AddEqsError>
+    {
+        // Look up the conclusion fact (source) and premise fact (target).
+        let fa_conc = self.sys.nodes.iter()
+            .find(|(n, _)| n == &e.src.0)
+            .and_then(|(_, r)| r.conclusions.get(e.src.1.0).cloned());
+        let fa_prem = self.sys.nodes.iter()
+            .find(|(n, _)| n == &e.tgt.0)
+            .and_then(|(_, r)| r.premises.get(e.tgt.1.0).cloned());
+        // HS step 1: solveFactEqs SplitNow on the edge's facts.
+        // Mirrors Reduction.hs:287.  If the facts are already
+        // structurally equal, skip (Maude would just succeed trivially).
+        let res = if let (Some(fa_c), Some(fa_p)) = (&fa_conc, &fa_prem) {
+            if fa_c != fa_p {
+                self.solve_fact_eqs(
+                    SplitStrategy::SplitNow,
+                    &[tamarin_term::rewriting::Equal {
+                        lhs: fa_c.clone(), rhs: fa_p.clone() }],
+                )
+            } else {
+                Ok(SolveOutcome::Linear(ChangeIndicator::Unchanged))
+            }
+        } else {
+            // No facts found (rule lookup failed) — fall through to
+            // raw insert.  Shouldn't happen in practice unless the
+            // caller passes an edge for a node that's not in the system.
+            Ok(SolveOutcome::Linear(ChangeIndicator::Unchanged))
+        };
+        // Mirrors `noContradictoryEqStore` (Reduction.hs:721+):
+        // mzero-equivalent if eq_store becomes false.
+        if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
+            self.mark_contradictory();
+            return res;
+        }
+        // HS step 2: add to sEdges (Reduction.hs:288).
         let before = self.sys.edges.len();
         self.sys.add_edge(e);
         if self.sys.edges.len() != before { self.changed = ChangeIndicator::Changed; }
+        res
     }
 
     /// `substSystem`: apply the eq-store's current substitution to
@@ -3095,7 +3135,10 @@ impl<'ctx> Reduction<'ctx> {
             "vf", tamarin_term::lterm::LSort::Node, next);
         let rule = make_fresh_rule(m.clone());
         self.sys.add_node(j.clone(), rule);
-        self.sys.add_edge(crate::constraint::constraints::Edge {
+        // HS-faithful `insertEdges` (Reduction.hs:284): unify edge
+        // facts before adding.  Mirrors HS `exploitPrem FreshFact`
+        // which does `insertEdges [((j, ConcIdx 0), freshFact m, fa, ...)]`.
+        let _ = self.insert_edge(crate::constraint::constraints::Edge {
             src: (j, crate::rule::ConcIdx(0)),
             tgt: (i.clone(), idx),
         });
@@ -3203,7 +3246,10 @@ impl<'ctx> Reduction<'ctx> {
             &format!("exploitPrems rule={}",
                 crate::constraint::solver::reduction::rule_case_name(&rule)));
         self.sys.add_node(j.clone(), rule);
-        self.sys.add_edge(crate::constraint::constraints::Edge {
+        // HS-faithful `insertEdges` (Reduction.hs:284): unify edge
+        // facts before adding.  Mirrors HS `exploitPrem InFact` which
+        // does `insertEdges [((j, ConcIdx 0), kuFactAnn ann m, fa, ...)]`.
+        let _ = self.insert_edge(crate::constraint::constraints::Edge {
             src: (j.clone(), crate::rule::ConcIdx(0)),
             tgt: (i.clone(), idx),
         });
@@ -3988,15 +4034,15 @@ impl<'ctx> Reduction<'ctx> {
                 if !forbidden_edge(&c_rule, p_rule)
                     && !illegal_coerce(p_rule, &fa_prem)
                 {
-                    let mut sys_clone = self.sys.clone();
-                    sys_clone.add_edge(crate::constraint::constraints::Edge {
+                    // HS-faithful `insertEdges` (Reduction.hs:284-288):
+                    // route through `insert_edge` so unification fires
+                    // BEFORE the edge enters sEdges.  Mirrors HS's
+                    // `solveFactEqs SplitNow` + `modM sEdges` order.
+                    let sys_clone = self.sys.clone();
+                    let mut sub = Reduction::new(self.ctx, sys_clone);
+                    let res = sub.insert_edge(crate::constraint::constraints::Edge {
                         src: c.clone(), tgt: p.clone(),
                     });
-                    let mut sub = Reduction::new(self.ctx, sys_clone);
-                    let res = sub.solve_fact_eqs(
-                        SplitStrategy::SplitNow,
-                        &[tamarin_term::rewriting::Equal {
-                            lhs: fa_conc.clone(), rhs: fa_prem.clone() }]);
                     if !matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
                         for (existing, status) in sub.sys.goals.iter_mut() {
                             if existing == &g && !status.solved {
@@ -4084,15 +4130,16 @@ impl<'ctx> Reduction<'ctx> {
                 );
                 next_node_idx = next_node_idx.saturating_add(1);
                 sys_clone.add_node(new_node.clone(), ru_renamed.clone());
-                sys_clone.add_edge(crate::constraint::constraints::Edge {
+                // HS-faithful `insertEdges` (Goals.hs:382 extendAndMark):
+                // route through `insert_edge` so unification fires
+                // BEFORE the edge enters sEdges.  Mirrors HS's
+                // `solveFactEqs SplitNow` + `modM sEdges` order in
+                // `insertEdges` (Reduction.hs:284-288).
+                let mut sub = Reduction::new(self.ctx, sys_clone);
+                let res = sub.insert_edge(crate::constraint::constraints::Edge {
                     src: c.clone(),
                     tgt: (new_node.clone(), crate::rule::PremIdx(0)),
                 });
-                let mut sub = Reduction::new(self.ctx, sys_clone);
-                let res = sub.solve_fact_eqs(
-                    SplitStrategy::SplitNow,
-                    &[tamarin_term::rewriting::Equal {
-                        lhs: fa_conc.clone(), rhs: prem0.clone() }]);
                 if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
                     continue;
                 }
