@@ -2069,10 +2069,12 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
                 Ok(false) => {}
                 Err(_) => continue,
             }
-            let new_la = LessAtom::new(
-                sup_id.clone(), other_id.clone(), Reason::Fresh);
-            if !red.sys.less_atoms.iter().any(|x| x == &new_la) {
-                red.sys.less_atoms.push(new_la);
+            // HS-faithful insertLess (Reduction.hs:397 `modM sLessAtoms . S.insert`).
+            // Routes through `red.insert_less` which already does set-add dedup.
+            let before = red.sys.less_atoms.len();
+            red.insert_less(LessAtom::new(
+                sup_id.clone(), other_id.clone(), Reason::Fresh));
+            if red.sys.less_atoms.len() != before {
                 changed = ChangeIndicator::Changed;
             }
             new_lesses.push((sup_id.clone(), other_id.clone()));
@@ -2125,9 +2127,10 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
         });
         if !all_non_unifiable { continue; }
         let last = match rs.last() { Some(l) => l.clone(), None => continue };
-        let enhanced = LessAtom::new(last, j.clone(), Reason::Fresh);
-        if !red.sys.less_atoms.iter().any(|x| x == &enhanced) {
-            red.sys.less_atoms.push(enhanced);
+        // HS-faithful insertLess (Reduction.hs:397).
+        let before = red.sys.less_atoms.len();
+        red.insert_less(LessAtom::new(last, j.clone(), Reason::Fresh));
+        if red.sys.less_atoms.len() != before {
             changed = ChangeIndicator::Changed;
         }
     }
