@@ -112,9 +112,14 @@ impl<'ctx> Reduction<'ctx> {
                 let bt = std::backtrace::Backtrace::force_capture();
                 let bt_s = format!("{bt}");
                 // Extract first non-mark_contradictory frame for compact view.
+                // Walk a few frames up to find a non-helper caller — skip
+                // mark_contradictory, trace_subpass, and apply_node_eqs
+                // wrappers to surface the real CR-rule that fired.
                 let caller = bt_s.lines()
                     .filter(|l| l.contains("tamarin_theory") || l.contains("tamarin-theory"))
                     .filter(|l| !l.contains("mark_contradictory"))
+                    .filter(|l| !l.contains("trace_subpass"))
+                    .filter(|l| !l.contains("apply_node_eqs"))
                     .nth(0)
                     .unwrap_or("(no frame)")
                     .trim();
@@ -255,6 +260,10 @@ impl<'ctx> Reduction<'ctx> {
                     .collect(),
             }
         };
+        let dbg_set_nodes = std::env::var("TAM_DBG_SET_NODES").is_ok();
+        let nodes_in = nodes.len();
+        let mut collisions = 0usize;
+        let mut shape_mm = 0usize;
         for (id, rule) in nodes {
             let new_id = map_var(id);
             // First pass: map_var via map_free for node-ids etc.
@@ -275,6 +284,7 @@ impl<'ctx> Reduction<'ctx> {
             };
             match id_to_index.get(&new_id).copied() {
                 Some(i) => {
+                    collisions += 1;
                     let kept: &RuleACInst = &new_nodes[i].1;
                     // Haskell `solveRuleEqs` (Reduction.hs:749-754)
                     // checks `rInfo` equality FIRST: two distinct rule
@@ -283,6 +293,7 @@ impl<'ctx> Reduction<'ctx> {
                     // contradictory as different shapes.
                     if kept.info != new_rule.info {
                         shape_mismatch = true;
+                        shape_mm += 1;
                     } else if kept.premises.len() != new_rule.premises.len()
                         || kept.conclusions.len() != new_rule.conclusions.len()
                         || kept.actions.len() != new_rule.actions.len()
@@ -317,6 +328,10 @@ impl<'ctx> Reduction<'ctx> {
                     new_nodes.push((new_id, new_rule));
                 }
             }
+        }
+        if dbg_set_nodes && (nodes_in > 0) {
+            eprintln!("[SET_NODES_RS] nodes_in={} collisions={} shape_mismatches={} rule_eqs_queued={}",
+                nodes_in, collisions, shape_mm, rule_eqs.len());
         }
         self.sys.nodes = new_nodes;
         if shape_mismatch {
@@ -565,6 +580,10 @@ impl<'ctx> Reduction<'ctx> {
         //    to the eq-store; if so we won't recurse here — the next
         //    simplify-loop iteration will pick them up.
         if !rule_eqs.is_empty() {
+            if std::env::var("TAM_DBG_SUBST_RULE_EQS").is_ok() {
+                eprintln!("[subst_rule_eqs] queueing {} rule_eqs from setNodes-style collision",
+                    rule_eqs.len());
+            }
             // Tag/arity mismatches mean two distinct rule instances
             // collapsed to the same node id but their facts disagree
             // — the system has no model (Haskell `setNodes` →
@@ -605,6 +624,14 @@ impl<'ctx> Reduction<'ctx> {
             // fails on same-tag facts with incompatible terms, e.g.
             // !Key(~k) = !Key(some_other_term)).
             let res = self.solve_fact_eqs(SplitStrategy::SplitLater, &safe_eqs);
+            if std::env::var("TAM_DBG_SUBST_RULE_EQS").is_ok() {
+                eprintln!("[subst_rule_eqs] solve_fact_eqs returned: {:?}",
+                    res.as_ref().map(|o| match o {
+                        SolveOutcome::Linear(_) => "Linear",
+                        SolveOutcome::Cases(_) => "Cases",
+                        SolveOutcome::Contradictory => "Contradictory",
+                    }).map_err(|e| format!("Err({:?})", e)));
+            }
             if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
                 // Mirrors Haskell `solveFactEqs` -> `solveTermEqs`
                 // ending in `noContradictoryEqStore` (Reduction.hs:704)

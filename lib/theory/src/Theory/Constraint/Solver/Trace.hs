@@ -226,12 +226,12 @@ tracePass label x
 tracePassPair :: Monad m => String -> m a -> m a
 tracePassPair label m
     | flagSimplify = do
-        () <- trace ("[SUBPASS] enter " ++ label) (return ())
+        traceM ("[SUBPASS] enter " ++ label)
         r <- m
-        () <- trace ("[SUBPASS] exit  " ++ label) (return ())
+        traceM ("[SUBPASS] exit  " ++ label)
         return r
     | otherwise = m
-{-# INLINE tracePassPair #-}
+{-# NOINLINE tracePassPair #-}
 
 
 -- | Trace a case-survival decision in `process` (execProofMethod).
