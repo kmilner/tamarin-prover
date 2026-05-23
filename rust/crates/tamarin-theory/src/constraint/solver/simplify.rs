@@ -29,6 +29,16 @@ fn mark_contradictory(red: &mut Reduction) {
     red.mark_contradictory();
 }
 
+/// Labeled variant — emits a `[SIMP_CONTRA]` trace under
+/// `TAM_RS_TRACE_SIMP_CONTRA=1` so per-pass contradiction firings can be
+/// attributed against HS's `[CONTRA-FIRE]` histogram.
+fn mark_contradictory_labeled(red: &mut Reduction, pass: &'static str) {
+    if std::env::var("TAM_RS_TRACE_SIMP_CONTRA").is_ok() {
+        eprintln!("[SIMP_CONTRA] pass={}", pass);
+    }
+    red.mark_contradictory();
+}
+
 /// `TAM_RS_TRACE_SIMPLIFY=1` — per-subpass enter/exit traces matching
 /// HS's `tracePassPair` format.  Lets us count contradiction-firing per
 /// pass via `delta = enter - exit` (an exit MISSING means the pass
@@ -1604,7 +1614,7 @@ fn enforce_fresh_node_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         changed = changed.or(ChangeIndicator::Changed);
     }
     if hit_contra {
-        mark_contradictory(red);
+        mark_contradictory_labeled(red, "enforce_fresh_node_uniqueness");
         changed = ChangeIndicator::Changed;
     }
     changed
@@ -1714,7 +1724,7 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         }
     }
     if hit_contra {
-        mark_contradictory(red);
+        mark_contradictory_labeled(red, "enforce_ku_action_uniqueness");
         changed = ChangeIndicator::Changed;
     }
     changed
@@ -1808,7 +1818,7 @@ fn solve_unique_actions_pass(red: &mut Reduction) -> ChangeIndicator {
         if matches!(outcome,
             crate::constraint::solver::reduction::GoalCases::Contradictory)
         {
-            mark_contradictory(red);
+            mark_contradictory_labeled(red, "solve_unique_actions");
         }
         changed = ChangeIndicator::Changed;
     }
@@ -1917,7 +1927,7 @@ fn enforce_kd_fact_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         }
     }
     if hit_contra {
-        mark_contradictory(red);
+        mark_contradictory_labeled(red, "enforce_kd_fact_uniqueness");
     }
     ChangeIndicator::Changed
 }
@@ -2215,7 +2225,7 @@ fn apply_node_eqs(
     }
     red.sys.nodes = new_nodes;
     if shape_mismatch {
-        mark_contradictory(red);
+        mark_contradictory_labeled(red, "apply_node_eqs:shape_mismatch");
     }
     if !rule_eqs.is_empty() {
         // Tag/arity mismatch in same-shape node collisions: facts at
@@ -2240,14 +2250,14 @@ fn apply_node_eqs(
             }
         }
         if tag_mismatch {
-            mark_contradictory(red);
+            mark_contradictory_labeled(red, "apply_node_eqs:tag_mismatch");
         }
         let res = red.solve_fact_eqs(
             crate::constraint::solver::reduction::SplitStrategy::SplitLater,
             &safe_eqs,
         );
         if matches!(res, Err(_) | Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)) {
-            mark_contradictory(red);
+            mark_contradictory_labeled(red, "apply_node_eqs:fact_eqs_contradictory");
         }
     }
     // Edges.
@@ -2364,7 +2374,7 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         if std::env::var("TAM_DBG_EDGE_UNIQ").is_ok() {
             eprintln!("[edge_uniq] CONTRA conc_idx_clash");
         }
-        mark_contradictory(red);
+        mark_contradictory_labeled(red, "enforce_edge_uniqueness:conc_idx_clash");
         return ChangeIndicator::Changed;
     }
     // Pass 2 (Haskell's second `mergeNodes eTgt eSrc` filtered to
@@ -2388,7 +2398,7 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         if std::env::var("TAM_DBG_EDGE_UNIQ").is_ok() {
             eprintln!("[edge_uniq] CONTRA prem_idx_clash");
         }
-        mark_contradictory(red);
+        mark_contradictory_labeled(red, "enforce_edge_uniqueness:prem_idx_clash");
         return ChangeIndicator::Changed;
     }
     node_eqs.retain(|e| e.lhs != e.rhs);
@@ -2398,7 +2408,7 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         if std::env::var("TAM_DBG_EDGE_UNIQ").is_ok() {
             eprintln!("[edge_uniq] CONTRA solve_node_id_eqs n_eqs={}", node_eqs.len());
         }
-        mark_contradictory(red);
+        mark_contradictory_labeled(red, "enforce_edge_uniqueness:node_id_eqs_contradictory");
         return ChangeIndicator::Changed;
     }
     apply_node_eqs(red, &node_eqs);
@@ -2506,7 +2516,7 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
         }
     }
     if hit_contra {
-        mark_contradictory(red);
+        mark_contradictory_labeled(red, "simp_injective_fact_eq_mon");
     }
     red.changed = ChangeIndicator::Changed;
     ChangeIndicator::Changed

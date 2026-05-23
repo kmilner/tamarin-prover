@@ -23,6 +23,7 @@ module Theory.Constraint.Solver.Goals (
   ) where
 
 import           Debug.Trace                             (trace)
+import qualified Debug.Trace
 
 import           Prelude                                 hiding (id, (.))
 
@@ -308,7 +309,7 @@ solvePremise rules p faPrem
 
   | otherwise = do
       (ru, c, faConc) <- insertFreshNodeConc rules
-      insertEdges [(c, faConc, faPrem, p)]
+      insertEdgesLabeled "solvePremise" [(c, faConc, faPrem, p)]
       return $ showRuleCaseName ru
 
 -- | CR-rule *DG2_chain*: solve a chain constraint.
@@ -317,6 +318,8 @@ solveChain :: [RuleAC]              -- ^ All destruction rules.
            -> Reduction String      -- ^ Case name to use.
 solveChain rules (c, p) = do
     faConc  <- gets $ nodeConcFact c
+    when T.flagContra $ Debug.Trace.traceM
+      ("[SOLVE_CHAIN] enter c=" ++ show c ++ " p=" ++ show p)
     T.traceExecM "solveChain ENTER"
     -- TAM_HS_TRACE_CHAINS: log the chain conc + n destruction rules tried.
     let chainTrace label =
@@ -330,7 +333,7 @@ solveChain rules (c, p) = do
         pRule <- gets $ nodeRule (nodePremNode p)
         faPrem <- gets $ nodePremFact p
         contradictoryIf (forbiddenEdge cRule pRule)
-        insertEdges [(c, faConc, faPrem, p)]
+        insertEdgesLabeled "chain_direct" [(c, faConc, faPrem, p)]
         let mPrem = case kFactView faConc of
                       Just (DnK, m') -> m'
                       _              -> error "solveChain: impossible"
@@ -379,7 +382,7 @@ solveChain rules (c, p) = do
     extendAndMark :: NodeId -> RuleACInst -> PremIdx -> LNFact -> LNFact
       -> Reduction String
     extendAndMark i ru v faPrem faConc = do
-        insertEdges [(c, faConc, faPrem, (i, v))]
+        insertEdgesLabeled "chain_extend" [(c, faConc, faPrem, (i, v))]
         markGoalAsSolved "directly" (PremiseG (i, v) faPrem)
         insertChain (i, ConcIdx 0) p
         return (showRuleCaseName ru)
