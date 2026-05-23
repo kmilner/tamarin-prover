@@ -1549,6 +1549,13 @@ fn normalise_less_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
 /// node ids via `solve_node_id_eqs`.
 fn enforce_fresh_node_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     use crate::rule::{ProtoRuleName, RuleInfo};
+    if std::env::var("TAM_RS_TRACE_DG4_ENTER").is_ok() {
+        let n_fresh = red.sys.nodes.iter().filter(|(_, r)|
+            matches!(&r.info, RuleInfo::Proto(p) if p.name == ProtoRuleName::Fresh))
+            .count();
+        let path = crate::constraint::solver::trace::case_path_string();
+        eprintln!("[DG4_ENTER] path={} fresh_count={}", path, n_fresh);
+    }
     // Haskell-faithful (`Simplify.hs:220-230`): group by the raw
     // `RuleACInst` — two Fresh-rule instances merge only if their
     // full rule representations are syntactically identical.
