@@ -331,8 +331,10 @@ enforceEdgeUniqueness = do
             -- all indices of merged premises and conclusions must be equal
             let clash = not $ and [snd l == snd r | Equal l r <- eqs]
             when (clash && Unsafe.unsafePerformIO (
-                    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_EDGE_UNIQ")) $
-                Debug.Trace.traceM ("[HS_EDGE_UNIQ_CLASH] eqs=" ++ show eqs)
+                    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_EDGE_UNIQ")) $ do
+                let path = Unsafe.unsafePerformIO T.getCasePath
+                Debug.Trace.traceM ("[HS_EDGE_UNIQ_CLASH] path=" ++ T.casePathString path
+                                  ++ " eqs=" ++ show eqs)
             T.contradictoryIfT "enforceEdgeUniqueness:premConcIdxMismatch" clash
             -- nodes must be equal
             solveNodeIdEqs $ map (fmap fst) eqs

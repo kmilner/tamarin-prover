@@ -71,6 +71,7 @@ module Theory.Constraint.Solver.Trace (
   , tracePickM
   , setCasePath
   , getCasePath
+  , casePathString
   , traceFormM
   , guardedRepr
   , traceProveEntry
