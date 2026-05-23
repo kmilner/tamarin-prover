@@ -18,6 +18,7 @@ pub mod annotated_goals;
 pub mod context;
 pub mod contradictions;
 pub mod goals;
+pub mod lazy_views;
 pub mod proof_method;
 pub mod reduction;
 pub mod rename_precise;
