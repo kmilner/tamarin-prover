@@ -2386,6 +2386,10 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         let keep = &prems[0];
         for other in prems.iter().skip(1) {
             if keep.1 != other.1 {
+                if std::env::var("TAM_DBG_EDGE_UNIQ").is_ok() {
+                    eprintln!("[edge_uniq] PREM_IDX_CLASH src={:?} keep=({:?},{:?}) other=({:?},{:?})",
+                        src, keep.0, keep.1, other.0, other.1);
+                }
                 prem_idx_clash = true;
                 continue;
             }
