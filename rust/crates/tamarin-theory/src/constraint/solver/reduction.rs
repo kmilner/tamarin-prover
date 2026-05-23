@@ -3833,42 +3833,20 @@ impl<'ctx> Reduction<'ctx> {
             let p_learn: crate::constraint::constraints::NodePrem =
                 (i_learn, crate::rule::PremIdx(0));
             let prem_learn = crate::fact::out_fact(m_learn);
-            let rec = self.solve_premise_goal(&p_learn, &prem_learn);
             // HS-faithful (Goals.hs:295-307): solvePremise KD path ends
             // with `solvePremise rules pLearn premLearn` — NO substSystem
             // after the recursive solve.  HS leaves the eq-store update
             // unpropagated; the next simplify iteration's substSystem
             // (`Simplify.hs:97`) handles it.
             //
-            // Diagnostic split — TAM_RS_KD_SUBST_CASES / _LINEAR control
-            // which arm restores the eager subst.  Used to bisect what
-            // non-HS-faithful code path masks the NSPK3 Lowe-attack
-            // regression.
-            let keep_cases = std::env::var("TAM_RS_KD_SUBST_CASES").is_ok();
-            let keep_linear = std::env::var("TAM_RS_KD_SUBST_LINEAR").is_ok();
-            return match rec {
-                GoalCases::Contradictory => GoalCases::Contradictory,
-                GoalCases::Linear => {
-                    if keep_linear { self.subst_system(); }
-                    GoalCases::Linear
-                }
-                GoalCases::LinearNamed(name) => {
-                    if keep_linear { self.subst_system(); }
-                    GoalCases::LinearNamed(name)
-                }
-                GoalCases::Cases(cases) => {
-                    if keep_cases {
-                        let new_cases: Vec<_> = cases.into_iter().map(|(name, sys)| {
-                            let mut sub = Reduction::new(self.ctx, sys);
-                            sub.subst_system();
-                            (name, sub.sys)
-                        }).collect();
-                        GoalCases::Cases(new_cases)
-                    } else {
-                        GoalCases::Cases(cases)
-                    }
-                }
-            };
+            // Previously Rust called subst_system here after the
+            // recursive solve_premise_goal.  That was BOTH non-HS-faithful
+            // AND masked a separate bug: the rule-enumeration loop's
+            // raw `sys.add_edge` (now routed through `insert_edge_labeled`)
+            // plus the lack of `sub.subst_system` after `exploit_prems`
+            // left case clones with eq_store bindings but stale node
+            // facts.  Both fixed now — see lines ~3960-3985 below.
+            return self.solve_premise_goal(&p_learn, &prem_learn);
         }
         // Source-case short-circuit.  Mirrors Haskell's `solveWithSource`
         // → `applySource` (Sources.hs:326-351): match the live goal
@@ -3961,15 +3939,29 @@ impl<'ctx> Reduction<'ctx> {
                 );
                 next_node_idx = next_node_idx.saturating_add(1);
                 sys.add_node(new_node.clone(), renamed.clone());
-                sys.add_edge(crate::constraint::constraints::Edge {
-                    src: (new_node.clone(), c_idx),
-                    tgt: p.clone(),
-                });
                 let mut sub = Reduction::new(self.ctx, sys);
-                let res = sub.solve_fact_eqs(
-                    SplitStrategy::SplitNow,
-                    &[tamarin_term::rewriting::Equal {
-                        lhs: fa_conc, rhs: fa_prem.clone() }]);
+                // HS-faithful (Goals.hs:309-312 + Reduction.hs:285-291):
+                //   insertEdgesLabeled "solvePremise" [(c, faConc, faPrem, p)]
+                // which performs `solveFactEqs SplitNow` FIRST then
+                // `modM sEdges` — atomic.  Previously Rust did
+                // `sys.add_edge(...)` raw FIRST then `sub.solve_fact_eqs(...)`
+                // separately — opposite order from HS.  This left the
+                // edge in sEdges referencing raw conc/prem facts (no
+                // unification applied yet), so downstream eq_store +
+                // sys.nodes/edges/etc were out of sync until something
+                // ran subst_system.
+                //
+                // The previous outer KD-path `subst_system` after the
+                // recursive call was masking this bug — it propagated
+                // the late eq_store binding into sys.nodes.  Removing
+                // that subst (HS-faithful) caused TLS+NSPK3 wrong-
+                // VERIFIED.  The root cause is THIS raw add_edge.
+                let res = sub.insert_edge_labeled(
+                    "premise_goal_rule_enum",
+                    crate::constraint::constraints::Edge {
+                        src: (new_node.clone(), c_idx),
+                        tgt: p.clone(),
+                    });
                 // Full premise expansion — both at precompute time
                 // (so `saturateSources` can refine sub-goals into self-
                 // contained cases) and at runtime (so the search
