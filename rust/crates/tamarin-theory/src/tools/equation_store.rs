@@ -365,6 +365,7 @@ impl EquationStore {
             if local_subst.is_empty() {
                 return Ok(None);
             }
+            log_fresh_bindings("local", &local_subst);
             if self.conj.is_empty() {
                 self.subst = local_subst.compose(&self.subst);
             } else {
@@ -372,6 +373,8 @@ impl EquationStore {
             }
             return Ok(None);
         }
+
+        // Maude path: log the AC unifier output (if single) — handled below.
 
         // Mixed case: AC residuals exist.  Send them to Maude after
         // applying local subst.  Each Maude unifier is composed with
@@ -427,6 +430,7 @@ impl EquationStore {
             // (Unification.hs:147 `flattenUnif` =
             // `map (\`composeVFresh\` subst) substs`).
             let subst = maude_subst.compose(&local_subst);
+            log_fresh_bindings("maude_single", &subst);
             // Haskell-faithful: call applyEqStore so existing disj substs
             // get re-unified against the new free subst.  Without it,
             // SplitG variants whose domain intersects with `subst.dom`
@@ -1290,6 +1294,32 @@ impl EquationStore {
 /// True if `t` is a single constant literal (no variables, no apps).
 fn is_constant_term(t: &LNTerm) -> bool {
     matches!(t, tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Con(_)))
+}
+
+/// `TAM_RS_TRACE_FRESH_BIND=1`: log every binding being composed into
+/// the eq-store whose key or value is Fresh-sorted.  Used to find the
+/// upstream binding that equates two distinct protocol rules' fresh
+/// variables (which then causes `enforce_fresh_node_uniqueness` to
+/// merge their suppliers and `enforce_edge_uniqueness` to fire
+/// prem_idx_clash false-positives).
+fn log_fresh_bindings(site: &str, subst: &LNSubst) {
+    if std::env::var("TAM_RS_TRACE_FRESH_BIND").is_err() { return; }
+    use tamarin_term::lterm::LSort;
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    for (v, t) in subst.to_list() {
+        // Find any Fresh-sort var on either side.
+        let lhs_fresh = v.sort == LSort::Fresh;
+        let mut rhs_has_fresh = false;
+        if let Term::Lit(Lit::Var(rv)) = &t {
+            if rv.sort == LSort::Fresh { rhs_has_fresh = true; }
+        }
+        if lhs_fresh || rhs_has_fresh {
+            let t_str: String = format!("{:?}", t).chars().take(120).collect();
+            eprintln!("[FRESH_BIND] site={} {}.{}/{:?} → {}",
+                site, v.name, v.idx, v.sort, t_str);
+        }
+    }
 }
 
 /// Re-export sort comparison from the term layer for `simp_identify`.
