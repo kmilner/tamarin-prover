@@ -53,6 +53,7 @@ import           Theory.Constraint.System
 import           Theory.Model
 import           Theory.Text.Pretty
 import           Theory.Tools.InjectiveFactInstances
+import qualified Term.Substitution
 
 hsTraceFire :: Bool
 hsTraceFire = Unsafe.unsafePerformIO $
@@ -195,10 +196,35 @@ enforceNodeUniqueness =
       <*> (merge (solveFactEqs SplitNow)    kuActions)
   where
     -- *DG4*
-    freshRuleInsts se = do
-        (i, ru) <- M.toList $ get sNodes se
-        guard (isFreshRule ru)
-        return (ru, ((), i))  -- no need to merge equal rules
+    freshRuleInsts se =
+        -- TAM_HS_TRACE_DG4_ENTER=1 / TAM_HS_TRACE_DG4=1: mirror of
+        -- Rust's traces.  Emit per-call Fresh-rule-instance count and
+        -- per-merge-group MERGE events, used to diagnose why HS has
+        -- 0 merges on NSPK3 while Rust has 87.
+        let insts = do
+              (i, ru) <- M.toList $ get sNodes se
+              guard (isFreshRule ru)
+              return (ru, ((), i))
+            traceDg4 = Unsafe.unsafePerformIO $ do
+              flagEnter <- maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_DG4_ENTER"
+              when flagEnter $ do
+                let subst = get sSubst se
+                    bindings = Term.Substitution.substToList subst
+                Debug.Trace.traceIO ("[HS_DG4_ENTER] fresh_count=" ++ show (length insts)
+                                  ++ " subst_len=" ++ show (length bindings)
+                                  ++ " subst=" ++ show bindings
+                                  ++ " concs=" ++ show [get rConcs ru | (ru, _) <- insts])
+              flag <- maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_DG4"
+              when flag $ do
+                let groups = groupSortOn fst insts
+                mapM_ (\g -> when (length g > 1) $ do
+                    let ru = fst (head g)
+                        ids = [i | (_, ((), i)) <- g]
+                    Debug.Trace.traceIO ("[HS_DG4_MERGE] ids=" ++ show ids
+                                  ++ " rule_conc=" ++ show (get rConcs ru))
+                  ) groups
+              return ()
+        in traceDg4 `seq` insts
 
     -- *N5_d*
     kdConcs sys = (\(i, ru, m) -> (m, (ru, i))) <$> allKDConcs sys
@@ -236,6 +262,10 @@ enforceFreshAndKuNodeUniqueness =
         -- TAM_HS_TRACE_DG4=1 mirror of Rust's TAM_RS_TRACE_DG4:
         -- emit one [HS_DG4_MERGE] line per group of identical Fresh
         -- rule instances about to be merged.
+        -- TAM_HS_TRACE_DG4_ENTER=1 mirror of Rust's TAM_RS_TRACE_DG4_ENTER:
+        -- emit the Fresh-rule-instance count at each call (whether or
+        -- not any group has duplicates).  Used to diagnose why HS has
+        -- 0 merges on NSPK3 while Rust has 87.
         let insts = do
               (i, ru) <- M.toList $ get sNodes se
               guard (isFreshRule ru)
@@ -250,6 +280,9 @@ enforceFreshAndKuNodeUniqueness =
                     Debug.Trace.traceIO ("[HS_DG4_MERGE] ids=" ++ show ids
                                   ++ " rule_conc=" ++ show (get rConcs ru))
                   ) groups
+              flagEnter <- maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_DG4_ENTER"
+              when flagEnter $
+                Debug.Trace.traceIO ("[HS_DG4_ENTER] fresh_count=" ++ show (length insts))
               return ()
         in traceDg4 `seq` insts
 
@@ -278,6 +311,9 @@ enforceEdgeUniqueness :: Reduction ChangeIndicator
 enforceEdgeUniqueness = do
     se <- gets id
     let edges = S.toList (get sEdges se)
+    when (Unsafe.unsafePerformIO $
+            maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_EDGE_UNIQ") $
+        Debug.Trace.traceM ("[HS_EDGE_UNIQ_ENTER] edges=" ++ show (length edges))
     (<>) <$> mergeNodes eSrc eTgt edges
          <*> mergeNodes eTgt eSrc (filter (proveLinearConc se . eSrc) edges)
   where
@@ -293,8 +329,11 @@ enforceEdgeUniqueness = do
       | null eqs  = return Unchanged
       | otherwise = do
             -- all indices of merged premises and conclusions must be equal
-            T.contradictoryIfT "enforceEdgeUniqueness:premConcIdxMismatch"
-                (not $ and [snd l == snd r | Equal l r <- eqs])
+            let clash = not $ and [snd l == snd r | Equal l r <- eqs]
+            when (clash && Unsafe.unsafePerformIO (
+                    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_EDGE_UNIQ")) $
+                Debug.Trace.traceM ("[HS_EDGE_UNIQ_CLASH] eqs=" ++ show eqs)
+            T.contradictoryIfT "enforceEdgeUniqueness:premConcIdxMismatch" clash
             -- nodes must be equal
             solveNodeIdEqs $ map (fmap fst) eqs
       where

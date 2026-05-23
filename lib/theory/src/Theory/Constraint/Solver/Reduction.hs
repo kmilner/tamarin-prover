@@ -77,6 +77,8 @@ module Theory.Constraint.Solver.Reduction (
   ) where
 
 import           Debug.Trace
+import qualified System.IO.Unsafe                        as Unsafe
+import qualified System.Environment                      as SysEnv
 import           Prelude                                 hiding (id, (.))
 
 import qualified Data.Foldable                           as F
@@ -256,6 +258,12 @@ labelNodeId = \i rules parent -> do
         Fact FreshFact _ [m] -> do
             T.traceExecM ("exploitPrem FreshFact isFresh=" ++ show (isFreshVar m))
             j <- freshLVar "vf" LSortNode
+            -- TAM_HS_TRACE_VF_CREATE=1 mirror of Rust's TAM_RS_TRACE_VF_CREATE:
+            -- log each vf-supplier creation so HS-vs-Rust counts can be
+            -- compared to find the over-creation site.
+            when (Unsafe.unsafePerformIO $
+                    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_VF_CREATE") $
+                Debug.Trace.traceM ("[HS_VF_CREATE] site=exploitPrem_FreshFact j=" ++ show j)
             modM sNodes (M.insert j (mkFreshRuleAC m))
             unless (isFreshVar m) $ do
                 -- 'm' must be of sort fresh ==> enforce via unification

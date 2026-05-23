@@ -3185,6 +3185,10 @@ impl<'ctx> Reduction<'ctx> {
         let j = tamarin_term::lterm::LVar::new(
             "vf", tamarin_term::lterm::LSort::Node, next);
         let rule = make_fresh_rule(m.clone());
+        if std::env::var("TAM_RS_TRACE_VF_CREATE").is_ok() {
+            let path = crate::constraint::solver::trace::case_path_string();
+            eprintln!("[VF_CREATE] path={} site=add_fresh_supplier_for vf.{}", path, next);
+        }
         self.sys.add_node(j.clone(), rule);
         // HS-faithful (Reduction.hs:265): `exploitPrem FreshFact` does
         // a raw `modM sEdges (S.insert $ Edge (j, ConcIdx 0) (i,v))` —
