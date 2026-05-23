@@ -2457,6 +2457,18 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         if std::env::var("TAM_DBG_EDGE_UNIQ").is_ok() {
             eprintln!("[edge_uniq] CONTRA prem_idx_clash");
         }
+        if std::env::var("TAM_RS_TRACE_CLASH_PATH").is_ok() {
+            let path = crate::constraint::solver::trace::case_path_string();
+            // Dump the smallest signature that can be diffed against HS:
+            // sorted edges as (src, conc_idx) → (tgt, prem_idx).
+            let mut edges: Vec<String> = red.sys.edges.iter()
+                .map(|e| format!("({}.{},{})→({}.{},{})",
+                    e.src.0.name, e.src.0.idx, e.src.1.0,
+                    e.tgt.0.name, e.tgt.0.idx, e.tgt.1.0))
+                .collect();
+            edges.sort();
+            eprintln!("[CLASH_PATH] path={} edges={:?}", path, edges);
+        }
         mark_contradictory_labeled(red, "enforce_edge_uniqueness:prem_idx_clash");
         return ChangeIndicator::Changed;
     }
