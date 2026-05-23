@@ -1913,6 +1913,26 @@ impl<'ctx> Reduction<'ctx> {
     {
         crate::state_trace::emit("conjoin_in", None, &self.sys);
         crate::state_trace::emit("conjoin_with", None, sys);
+        if std::env::var("TAM_RS_TRACE_CONJOIN").is_ok() {
+            let path = crate::constraint::solver::trace::case_path_string();
+            let live_fresh: Vec<String> = self.sys.nodes.iter()
+                .filter(|(_, r)| matches!(&r.info,
+                    crate::rule::RuleInfo::Proto(p) if p.name == crate::rule::ProtoRuleName::Fresh))
+                .map(|(id, r)| format!("{}.{}={:?}", id.name, id.idx,
+                    r.conclusions.first().map(|f| format!("{:?}", f.terms))))
+                .collect();
+            let case_fresh: Vec<String> = sys.nodes.iter()
+                .filter(|(_, r)| matches!(&r.info,
+                    crate::rule::RuleInfo::Proto(p) if p.name == crate::rule::ProtoRuleName::Fresh))
+                .map(|(id, r)| format!("{}.{}={:?}", id.name, id.idx,
+                    r.conclusions.first().map(|f| format!("{:?}", f.terms))))
+                .collect();
+            let case_subst: Vec<String> = sys.eq_store.subst.to_list().into_iter()
+                .map(|(v, t)| format!("{}.{}/{:?}→{:?}", v.name, v.idx, v.sort, t))
+                .collect();
+            eprintln!("[CONJOIN] path={} live_fresh={:?} case_fresh={:?} case_subst={:?}",
+                path, live_fresh, case_fresh, case_subst);
+        }
         // 1-3. joinSets: solved_formulas, lemmas, edges.  Use sets so
         // duplicates are collapsed (HasFrees-based dedup not needed —
         // syntactic equality is sufficient for these sets).
