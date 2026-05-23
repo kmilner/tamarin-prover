@@ -134,6 +134,17 @@ impl<'ctx> Reduction<'ctx> {
                     caller,
                 );
             }
+            // HS-equivalent compact dump matching [CONTRA-DUMP] format
+            // for one-to-one comparison with HS noContradictoryEqStore.
+            if std::env::var("TAM_RS_TRACE_CONTRA_DUMP").is_ok() {
+                eprintln!(
+                    "[CONTRA-DUMP] label=mark_contradictory nodes={} edges={} formulas={} goals={}",
+                    self.sys.nodes.len(),
+                    self.sys.edges.len(),
+                    self.sys.formulas.len(),
+                    self.sys.goals.len(),
+                );
+            }
         }
     }
 
