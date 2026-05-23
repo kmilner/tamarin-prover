@@ -3839,6 +3839,14 @@ impl<'ctx> Reduction<'ctx> {
             // sees the substituted chain conclusion (e.g. mLearn
             // resolved to <h(...), ~nb>).  Haskell does this via
             // `substSystem` at the end of `solveFactEqs`.
+            //
+            // (Phase 2b note: attempted to remove this for HS-faithful
+            // lazy state — caused TLS_Handshake regression
+            // 3 verdicts → 2 and 3.6x chain_extend explosion.  The
+            // recursive solve produces a system where mLearn was
+            // bound but no eq-store propagation happened, causing
+            // downstream solveChain to retry chain extension on the
+            // stale state.  Restored — needs careful per-pass audit.)
             return match rec {
                 GoalCases::Contradictory => GoalCases::Contradictory,
                 GoalCases::Linear => {
