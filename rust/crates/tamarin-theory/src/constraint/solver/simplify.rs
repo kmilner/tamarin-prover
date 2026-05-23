@@ -1584,7 +1584,9 @@ fn enforce_fresh_node_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
             let bindings: Vec<String> = red.sys.eq_store.subst.to_list().into_iter()
                 .map(|(k, v)| format!("{}.{}/{:?}→{:?}", k.name, k.idx, k.sort, v))
                 .collect();
-            eprintln!("[DG4_MERGE] ids={:?} rule_conc={:?} eq_store={:?}",
+            let path = crate::constraint::solver::trace::case_path_string();
+            eprintln!("[DG4_MERGE] path={} ids={:?} rule_conc={:?} eq_store={:?}",
+                path,
                 ids,
                 _rule.conclusions.first().map(|f| format!("{:?}({:?})", f.tag, f.terms)),
                 bindings);
