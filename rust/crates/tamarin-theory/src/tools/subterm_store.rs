@@ -37,6 +37,33 @@ impl SubtermStore {
     }
 
     pub fn is_false(&self) -> bool { self.contradictory }
+
+    /// `conjoinSubtermStores` — HS-faithful port of
+    /// `Theory.Tools.SubtermStore.conjoinSubtermStores` (SubtermStore.hs:108):
+    /// ```haskell
+    /// conjoinSubtermStores (SubtermStore a1 b1 c1 d1 e1) (SubtermStore a2 b2 c2 d2 e2)
+    ///   = SubtermStore (a1 `S.union` a2) (b1 `S.union` b2)
+    ///                  (c1 `S.union` c2) (d1 || d2) (e1 `S.union` e2)
+    /// ```
+    /// Rust's SubtermStore is currently a 3-field subset of HS's 5-field
+    /// shape: `subterms` (HS posSubterms), `solved_subterms`
+    /// (HS solvedSubterms), and `contradictory` (HS boolean field).
+    /// The missing HS fields are `negSubterms` and `natSubterms` —
+    /// not yet ported; tracked separately.  This method unifies the
+    /// 3 fields we DO have using HS's set-union + OR semantics.
+    pub fn conjoin(&mut self, other: &SubtermStore) {
+        for st in &other.subterms {
+            if !self.subterms.contains(st) {
+                self.subterms.push(st.clone());
+            }
+        }
+        for st in &other.solved_subterms {
+            if !self.solved_subterms.contains(st) {
+                self.solved_subterms.push(st.clone());
+            }
+        }
+        self.contradictory = self.contradictory || other.contradictory;
+    }
 }
 
 /// `elemNotBelowReducible reducible inner outer` — port of Haskell's
