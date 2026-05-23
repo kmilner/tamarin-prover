@@ -3840,13 +3840,30 @@ impl<'ctx> Reduction<'ctx> {
             // resolved to <h(...), ~nb>).  Haskell does this via
             // `substSystem` at the end of `solveFactEqs`.
             //
-            // (Phase 2b note: attempted to remove this for HS-faithful
-            // lazy state — caused TLS_Handshake regression
-            // 3 verdicts → 2 and 3.6x chain_extend explosion.  The
-            // recursive solve produces a system where mLearn was
-            // bound but no eq-store propagation happened, causing
-            // downstream solveChain to retry chain extension on the
-            // stale state.  Restored — needs careful per-pass audit.)
+            // (Phase 2b note: HS solvePremise KD path syntactically
+            // has no substSystem after the recursive call.  But
+            // removing this here CAUSES SOUNDNESS REGRESSIONS:
+            //  - TLS_Handshake::session_key_secrecy V → Sorry
+            //  - NSPK3::nonce_secrecy F → V (wrong-VERIFIED, masks
+            //    the Lowe attack)
+            //  - NSPK3::injective_agree F → V (wrong-VERIFIED)
+            // The wrong-VERIFIED on NSPK3 is a soundness bug — Rust
+            // proves a known-broken protocol secure.
+            //
+            // Diagnosis: this isn't a simple syntactic match.  Rust's
+            // eager subst architecture means the surrounding solver
+            // path (Maude unification, chain dispatch, simplify
+            // propagation) ALL depend on coordinated post-subst state.
+            // Removing one eager subst without migrating ALL
+            // downstream consumers leaves the system in an
+            // INCONSISTENT state where subsequent reads see stale
+            // node facts while eq_store has the binding, causing the
+            // search to miss attack paths.
+            //
+            // The HS-faithful migration needs the full lazy_views
+            // wiring (Phase 2c-2e in the plan) before this removal
+            // can be safe.  Site annotated; do not remove until
+            // every downstream consumer reads via lazy_views.
             return match rec {
                 GoalCases::Contradictory => GoalCases::Contradictory,
                 GoalCases::Linear => {
