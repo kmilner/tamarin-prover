@@ -3834,53 +3834,39 @@ impl<'ctx> Reduction<'ctx> {
                 (i_learn, crate::rule::PremIdx(0));
             let prem_learn = crate::fact::out_fact(m_learn);
             let rec = self.solve_premise_goal(&p_learn, &prem_learn);
-            // Materialise the substitution from the recursive solve
-            // into node/edge/goal state so subsequent `solve_chain_goal`
-            // sees the substituted chain conclusion (e.g. mLearn
-            // resolved to <h(...), ~nb>).  Haskell does this via
-            // `substSystem` at the end of `solveFactEqs`.
+            // HS-faithful (Goals.hs:295-307): solvePremise KD path ends
+            // with `solvePremise rules pLearn premLearn` — NO substSystem
+            // after the recursive solve.  HS leaves the eq-store update
+            // unpropagated; the next simplify iteration's substSystem
+            // (`Simplify.hs:97`) handles it.
             //
-            // (Phase 2b note: HS solvePremise KD path syntactically
-            // has no substSystem after the recursive call.  But
-            // removing this here CAUSES SOUNDNESS REGRESSIONS:
-            //  - TLS_Handshake::session_key_secrecy V → Sorry
-            //  - NSPK3::nonce_secrecy F → V (wrong-VERIFIED, masks
-            //    the Lowe attack)
-            //  - NSPK3::injective_agree F → V (wrong-VERIFIED)
-            // The wrong-VERIFIED on NSPK3 is a soundness bug — Rust
-            // proves a known-broken protocol secure.
-            //
-            // Diagnosis: this isn't a simple syntactic match.  Rust's
-            // eager subst architecture means the surrounding solver
-            // path (Maude unification, chain dispatch, simplify
-            // propagation) ALL depend on coordinated post-subst state.
-            // Removing one eager subst without migrating ALL
-            // downstream consumers leaves the system in an
-            // INCONSISTENT state where subsequent reads see stale
-            // node facts while eq_store has the binding, causing the
-            // search to miss attack paths.
-            //
-            // The HS-faithful migration needs the full lazy_views
-            // wiring (Phase 2c-2e in the plan) before this removal
-            // can be safe.  Site annotated; do not remove until
-            // every downstream consumer reads via lazy_views.
+            // Diagnostic split — TAM_RS_KD_SUBST_CASES / _LINEAR control
+            // which arm restores the eager subst.  Used to bisect what
+            // non-HS-faithful code path masks the NSPK3 Lowe-attack
+            // regression.
+            let keep_cases = std::env::var("TAM_RS_KD_SUBST_CASES").is_ok();
+            let keep_linear = std::env::var("TAM_RS_KD_SUBST_LINEAR").is_ok();
             return match rec {
                 GoalCases::Contradictory => GoalCases::Contradictory,
                 GoalCases::Linear => {
-                    self.subst_system();
+                    if keep_linear { self.subst_system(); }
                     GoalCases::Linear
                 }
                 GoalCases::LinearNamed(name) => {
-                    self.subst_system();
+                    if keep_linear { self.subst_system(); }
                     GoalCases::LinearNamed(name)
                 }
                 GoalCases::Cases(cases) => {
-                    let new_cases: Vec<_> = cases.into_iter().map(|(name, sys)| {
-                        let mut sub = Reduction::new(self.ctx, sys);
-                        sub.subst_system();
-                        (name, sub.sys)
-                    }).collect();
-                    GoalCases::Cases(new_cases)
+                    if keep_cases {
+                        let new_cases: Vec<_> = cases.into_iter().map(|(name, sys)| {
+                            let mut sub = Reduction::new(self.ctx, sys);
+                            sub.subst_system();
+                            (name, sub.sys)
+                        }).collect();
+                        GoalCases::Cases(new_cases)
+                    } else {
+                        GoalCases::Cases(cases)
+                    }
                 }
             };
         }
