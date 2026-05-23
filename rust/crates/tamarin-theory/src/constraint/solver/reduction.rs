@@ -388,23 +388,47 @@ impl<'ctx> Reduction<'ctx> {
         let nodes_in = nodes.len();
         let mut collisions = 0usize;
         let mut shape_mm = 0usize;
+        // HS-faithful experiment (TAM_RS_NO_NODE_FACT_SUBST=1): skip
+        // eager substitution of rule premise/conclusion/action facts.
+        // HS's `setM sNodes` writes the raw rule to sNodes; downstream
+        // reads via `gets $ nodeConcFact c` retrieve the raw fact
+        // because HS state-monad reads don't auto-apply the eq-store
+        // subst.  This means HS pre-substitution-time checks like
+        // `contradictoryIf (isMsgVar m)` see the original `~mw:Msg`
+        // fresh var (which IS a msg-var, so mzero fires).  Rust's
+        // eager subst rewrites `~mw:Msg` to its bound term (often
+        // concrete) BEFORE `isMsgVar` runs — so the check never fires.
+        //
+        // This experiment leaves rule facts RAW in sys.nodes while
+        // still rewriting node ids (so collapsing-node lookups work).
+        // Downstream consumers that NEED substituted facts must apply
+        // subst lazily on read; this is the multi-week audit we're
+        // tracking.
+        let no_node_fact_subst = std::env::var("TAM_RS_NO_NODE_FACT_SUBST").is_ok();
         for (id, rule) in nodes {
             let new_id = map_var(id);
             // First pass: map_var via map_free for node-ids etc.
+            // Always do node-id rewrites (otherwise edges/goals can't
+            // find their nodes by canonical id).
             let new_rule = rule.map_free(&mut |v| map_var(v));
             // Second pass: full term substitution on every fact, so
             // var→app eq-store bindings reach the rule's terms.
-            let new_rule = crate::rule::Rule {
-                info: new_rule.info,
-                premises: new_rule.premises.iter().map(apply_to_fact).collect(),
-                conclusions: new_rule.conclusions.iter().map(apply_to_fact).collect(),
-                actions: new_rule.actions.iter().map(apply_to_fact).collect(),
-                new_vars: new_rule.new_vars.iter()
-                    .map(|t| {
-                        let substed = tamarin_term::subst::apply_vterm(&subst, t.clone());
-                        normalize_term(substed)
-                    })
-                    .collect(),
+            // Skipped when TAM_RS_NO_NODE_FACT_SUBST=1.
+            let new_rule = if no_node_fact_subst {
+                new_rule
+            } else {
+                crate::rule::Rule {
+                    info: new_rule.info,
+                    premises: new_rule.premises.iter().map(apply_to_fact).collect(),
+                    conclusions: new_rule.conclusions.iter().map(apply_to_fact).collect(),
+                    actions: new_rule.actions.iter().map(apply_to_fact).collect(),
+                    new_vars: new_rule.new_vars.iter()
+                        .map(|t| {
+                            let substed = tamarin_term::subst::apply_vterm(&subst, t.clone());
+                            normalize_term(substed)
+                        })
+                        .collect(),
+                }
             };
             match id_to_index.get(&new_id).copied() {
                 Some(i) => {
