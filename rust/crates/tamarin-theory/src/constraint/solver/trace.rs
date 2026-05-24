@@ -302,6 +302,20 @@ pub fn trace_state(sys: &crate::constraint::system::System) {
                     canonical_fact_with_idx(fa));
             }
         }
+        // Dump less_atoms and last_atom — these drive HS's `Cyclic`
+        // contradiction detection (cycles in the Less/Edge graph).
+        // Critical for diagnosing Gen_Stop/Gen_Start cyclic-firing
+        // divergences in Helper_Loop_and_success.
+        for la in &sys.less_atoms {
+            eprintln!("[STATE_LESS] path={} {}.{} < {}.{}",
+                case_path_string(),
+                la.smaller.name, la.smaller.idx,
+                la.larger.name, la.larger.idx);
+        }
+        if let Some(la) = &sys.last_atom {
+            eprintln!("[STATE_LAST] path={} last={}.{}",
+                case_path_string(), la.name, la.idx);
+        }
     }
 }
 
