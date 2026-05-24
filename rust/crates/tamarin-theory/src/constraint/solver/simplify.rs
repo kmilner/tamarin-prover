@@ -2570,8 +2570,48 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
     let mut node_eqs: Vec<tamarin_term::rewriting::Equal<crate::constraint::constraints::NodeId>>
         = Vec::new();
     let mut new_inequalities: Vec<crate::guarded::Guarded> = Vec::new();
+    let mut new_lesses: Vec<(crate::constraint::constraints::NodeId,
+                             crate::constraint::constraints::NodeId)> = Vec::new();
+    let reducible = red.ctx.maude.maude_sig().reducible_fun_syms.clone();
+    // Mirror of HS `isTrueFalse reducible Nothing (small, big)`
+    // (SubtermStore.hs:334-355) — the cheap structural classification
+    // used by `triviallySmaller` / `triviallyNotSmaller` inside
+    // simpInjectiveFactEqMon (Simplify.hs:634-635). The subterm-store-
+    // backed cases are skipped (matches HS using `Just sst` here only
+    // when sst is empty/atom — for the injective-fact pass HS calls
+    // `isTrueFalse reducible (Just sst) (s,t)` but the sst membership
+    // checks fire only when the pair is already in posSubterms/
+    // negSubterms which the simplify loop builds itself via the
+    // formulas below, never via this short-circuit path).
+    let is_true_false = |s: &tamarin_term::lterm::LNTerm,
+                         t: &tamarin_term::lterm::LNTerm| -> Option<bool> {
+        use crate::tools::subterm_store::elem_not_below_reducible;
+        use tamarin_term::lterm::{is_fresh_var, is_pub_var};
+        use tamarin_term::term::Term as LTerm;
+        use tamarin_term::vterm::Lit as LLit;
+        if s == t { return Some(false); }
+        if elem_not_below_reducible(&reducible, t, s) { return Some(false); }
+        if elem_not_below_reducible(&reducible, s, t) { return Some(true); }
+        if let LTerm::Lit(LLit::Con(_)) = t { return Some(false); }
+        if is_pub_var(t) || is_fresh_var(t) { return Some(false); }
+        None
+    };
+    let trivially_smaller = |s: &tamarin_term::lterm::LNTerm,
+                             t: &tamarin_term::lterm::LNTerm| {
+        is_true_false(s, t) == Some(true)
+    };
+    let trivially_not_smaller = |s: &tamarin_term::lterm::LNTerm,
+                                 t: &tamarin_term::lterm::LNTerm| {
+        is_true_false(s, t) == Some(false)
+    };
+    // HS-faithful: iterate ALL (i, j) pairs with i != j (not just
+    // unordered `a < b`).  Cases (3) and (5) are NOT symmetric — they
+    // emit `(i, j)` or `(j, i)` LessAtoms whose direction depends on
+    // which side has the "smaller" term.  Mirrors HS `paired` list
+    // comprehension (Simplify.hs:728-734).
     for a in 0..by_inj.len() {
-        for b in (a + 1)..by_inj.len() {
+        for b in 0..by_inj.len() {
+            if a == b { continue; }
             let (i, fa_i, behaviours_i) = &by_inj[a];
             let (j, fa_j, _) = &by_inj[b];
             if fa_i.tag != fa_j.tag { continue; }
@@ -2584,39 +2624,38 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                 let pos = k + 1;
                 let s = match fa_i.terms.get(pos) { Some(t) => t, None => continue };
                 let t = match fa_j.terms.get(pos) { Some(t) => t, None => continue };
-                match bh {
+                // HS `simpSingle` (Simplify.hs:646) handles
+                // Decreasing/StrictlyDecreasing by swapping i↔j and
+                // recursing into Increasing/StrictlyIncreasing.  We
+                // mirror that swap here so case (3) / (5) emit
+                // less-atoms with the correct direction.
+                let (eff_bh, ii, jj) = match bh {
+                    MonotonicBehaviour::Decreasing =>
+                        (MonotonicBehaviour::Increasing, j, i),
+                    MonotonicBehaviour::StrictlyDecreasing =>
+                        (MonotonicBehaviour::StrictlyIncreasing, j, i),
+                    other => (other.clone(), i, j),
+                };
+                match eff_bh {
                     MonotonicBehaviour::Constant if s != t => {
                         term_eqs.push(tamarin_term::rewriting::Equal {
                             lhs: s.clone(), rhs: t.clone(),
                         });
                     }
-                    MonotonicBehaviour::StrictlyIncreasing
-                    | MonotonicBehaviour::StrictlyDecreasing if s == t => {
-                        if i != j {
+                    MonotonicBehaviour::StrictlyIncreasing if s == t => {
+                        if ii != jj {
                             node_eqs.push(tamarin_term::rewriting::Equal {
-                                lhs: i.clone(), rhs: j.clone(),
+                                lhs: ii.clone(), rhs: jj.clone(),
                             });
                         }
                     }
                     // HS-faithful case (4) (Simplify.hs:655): for a
-                    // StrictlyIncreasing/StrictlyDecreasing position
-                    // where the two nodes are order-comparable
-                    // (`alwaysBefore i j` or `alwaysBefore j i`), the
-                    // value at that position must differ — emit
-                    // `gnotAtom (EqE s t)` = `∀[] [s = t] ⊥` = `s ≠ t`.
-                    // Skip when we already know `s ≠ t`.
-                    //
-                    // Without this, lemmas whose proof needs to know
-                    // that two ordered Loop/Gen instances have distinct
-                    // StrictlyIncreasing arguments (e.g.
-                    // Helper_Loop_and_success at the case_3 split)
-                    // miss the disequality formulas HS generates, so
-                    // downstream impl-fire can't derive the gfalse
-                    // needed to close the case immediately.
-                    MonotonicBehaviour::StrictlyIncreasing
-                    | MonotonicBehaviour::StrictlyDecreasing if s != t => {
-                        let comparable = red.sys.always_before(i, j)
-                                      || red.sys.always_before(j, i);
+                    // StrictlyIncreasing position where the two nodes
+                    // are order-comparable, the value at that position
+                    // must differ — emit `s ≠ t`.
+                    MonotonicBehaviour::StrictlyIncreasing if s != t => {
+                        let comparable = red.sys.always_before(ii, jj)
+                                      || red.sys.always_before(jj, ii);
                         let already_ineq = inequalities.contains(&(s.clone(), t.clone()))
                                         || inequalities.contains(&(t.clone(), s.clone()));
                         if comparable && !already_ineq {
@@ -2629,13 +2668,41 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                             );
                             new_inequalities.push(neg);
                         }
+                        // HS-faithful case (3) (Simplify.hs:657):
+                        //   triviallySmaller s t && !alwaysBefore i j → emit i<j.
+                        // HS-faithful case (5) (Simplify.hs:658):
+                        //   triviallyNotSmaller s t && !alwaysBefore j i && ineq s t → emit j<i.
+                        if trivially_smaller(s, t) && !red.sys.always_before(ii, jj) {
+                            new_lesses.push((ii.clone(), jj.clone()));
+                        }
+                        if trivially_not_smaller(s, t)
+                            && !red.sys.always_before(jj, ii)
+                            && (inequalities.contains(&(s.clone(), t.clone()))
+                                || inequalities.contains(&(t.clone(), s.clone()))) {
+                            new_lesses.push((jj.clone(), ii.clone()));
+                        }
+                    }
+                    // HS-faithful Increasing (Simplify.hs:659):
+                    //   delegates to StrictlyIncreasing for less-atoms
+                    //   only (no new formulas at this position).
+                    MonotonicBehaviour::Increasing if s != t => {
+                        if trivially_smaller(s, t) && !red.sys.always_before(ii, jj) {
+                            new_lesses.push((ii.clone(), jj.clone()));
+                        }
+                        if trivially_not_smaller(s, t)
+                            && !red.sys.always_before(jj, ii)
+                            && (inequalities.contains(&(s.clone(), t.clone()))
+                                || inequalities.contains(&(t.clone(), s.clone()))) {
+                            new_lesses.push((jj.clone(), ii.clone()));
+                        }
                     }
                     _ => {}
                 }
             }
         }
     }
-    if term_eqs.is_empty() && node_eqs.is_empty() && new_inequalities.is_empty() {
+    if term_eqs.is_empty() && node_eqs.is_empty()
+        && new_inequalities.is_empty() && new_lesses.is_empty() {
         return ChangeIndicator::Unchanged;
     }
     // Haskell `simpInjectiveFactEqMon` runs the term/node-id
@@ -2665,6 +2732,13 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
     // HS `mapM_ insertFormula newFormulas` (Simplify.hs:667).
     for neg in new_inequalities {
         red.insert_formula(neg);
+    }
+    // Insert case (3)/(5) less-atoms with `InjectiveFacts` reason,
+    // mirroring HS `mapM_ (\(x, y) -> insertLess (LessAtom x y
+    // InjectiveFacts)) newLesses` (Simplify.hs:668-669).
+    for (sm, lg) in new_lesses {
+        red.insert_less(crate::constraint::constraints::LessAtom::new(
+            sm, lg, crate::constraint::constraints::Reason::InjectiveFacts));
     }
     if hit_contra {
         mark_contradictory_labeled(red, "simp_injective_fact_eq_mon");
