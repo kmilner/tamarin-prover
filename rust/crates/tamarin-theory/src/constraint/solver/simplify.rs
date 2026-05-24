@@ -416,10 +416,20 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
             // side effects (Last → set sys.last_atom, etc).
             red.insert_formula(simp);
         } else if simp == gfalse() {
-            // Preserve the gfalse signal so contradictions catch it.
-            if !red.sys.formulas.contains(&simp) {
-                red.sys.formulas.push(simp);
-            }
+            // HS-faithful: `evalFormulaAtoms` (Simplify.hs:334-336)
+            // ends with `insertFormula fm'` — route the gfalse through
+            // `insert_formula` so the [FORMULA_ADD] trace fires for
+            // lockstep diff against HS, and so any other side-effects
+            // of insertFormula (markAsSolved, etc.) execute too.
+            //
+            // Previously we pushed `simp` to `formulas` directly,
+            // bypassing `insertFormula`'s GDisj branch.  Behaviour-
+            // identical at end-state (gfalse lands in sys.formulas
+            // either way), but the bypass hid 83 lines of NSPK3
+            // `types` proof-tree divergence (Rust never producing
+            // the GDisj trace events that HS emits per simplify
+            // iteration) and 90 lines on Tutorial `Client_auth`.
+            red.insert_formula(simp);
         }
         changed = ChangeIndicator::Changed;
     }
