@@ -330,8 +330,10 @@ pub fn extract_from_haskell(spthy_text: &str, lemma_name: &str) -> Option<String
                 while let Some(Scope::Uncommitted) = stack.last() {
                     stack.pop();
                 }
-            } else if nt.starts_with("by ") || nt == "SOLVED" {
+            } else if nt.starts_with("by ") || nt == "SOLVED" || nt.starts_with("SOLVED ") {
                 // Leaf: resolve any Uncommitted ancestors above us.
+                // (`"SOLVED "` covers `"SOLVED // trace found"` after the
+                // normalise step preserves the trailing comment.)
                 while let Some(Scope::Uncommitted) = stack.last() {
                     stack.pop();
                 }
