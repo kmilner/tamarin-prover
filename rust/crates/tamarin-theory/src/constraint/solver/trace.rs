@@ -556,7 +556,9 @@ fn disj_heads(d: &crate::constraint::constraints::Disj<crate::guarded::Guarded>)
 fn guarded_head(g: &crate::guarded::Guarded) -> String {
     use crate::guarded::Guarded;
     match g {
-        Guarded::Atom(a) => format!("Atom({})", atom_head(a)),
+        // HS Trace.hs::guardedHead returns just the literal `"Atom"` —
+        // no atom contents.  Keep Rust aligned for byte-equivalent diff.
+        Guarded::Atom(_) => "Atom".to_string(),
         Guarded::Conj(_) => "Conj".to_string(),
         Guarded::Disj(_) => "Disj".to_string(),
         // Format matches HS Trace.hs::guardedHead: `<Quant><N>v` (e.g. `Ex1v`).
