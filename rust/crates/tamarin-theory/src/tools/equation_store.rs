@@ -185,7 +185,31 @@ impl EquationStore {
     /// TAM_DBG_ADD_DISJ=1 logs each add_disj call's substs at runtime.
     pub fn add_disj(&mut self, substs: Vec<LNSubstVFresh>) -> SplitId {
         let id = self.next_split;
+        if std::env::var("TAM_DBG_ADD_DISJ_FULL").is_ok() {
+            // Full backtrace + pre-state for every call.
+            let bt = std::backtrace::Backtrace::force_capture();
+            let bt_s = format!("{}", bt);
+            let frames: Vec<&str> = bt_s.lines()
+                .filter(|l| l.contains("tamarin_theory") || l.contains("add_disj"))
+                .take(8).collect();
+            let self_id = self as *const _ as usize;
+            eprintln!("[add_disj-full-bt] eq_store@{:x} {}", self_id, frames.join(" | "));
+            eprintln!("[add_disj-full-pre] eq_store@{:x} eqsSubst: {:?}",
+                self_id, self.subst.to_list());
+            eprintln!("[add_disj-full-pre] eq_store@{:x} {} existing disjs, next_split={:?}",
+                self_id, self.conj.len(), self.next_split);
+        }
         if std::env::var("TAM_DBG_ADD_DISJ").is_ok() {
+            // TAM_DBG_ADD_DISJ=stack also prints a short backtrace of the
+            // caller chain, filtered to tamarin-theory frames.
+            if std::env::var("TAM_DBG_ADD_DISJ").map(|s| s == "stack").unwrap_or(false) {
+                let bt = std::backtrace::Backtrace::force_capture();
+                let bt_s = format!("{}", bt);
+                let frames: Vec<&str> = bt_s.lines()
+                    .filter(|l| l.contains("tamarin_theory") || l.contains("equation_store"))
+                    .take(10).collect();
+                eprintln!("[add_disj-bt] {}", frames.join(" | "));
+            }
             eprintln!("[add_disj] split_id={:?} {} substs", id, substs.len());
             for (i, s) in substs.iter().enumerate() {
                 let pairs: Vec<String> = s.to_list().iter()
