@@ -456,6 +456,20 @@ pub fn trace_pick(g: &crate::constraint::constraints::Goal) {
         Goal::Disj(d)        => format!("Disj[{}]", disj_heads(d)),
         Goal::Subterm(_)     => "Subterm".to_string(),
     };
+    // For Disj goals, also dump the full alternatives (with var idxs
+    // preserved) so HS↔Rust comparison can catch dispatch-order
+    // divergences — e.g. Helper_Loop_and_success at case_3 has 2
+    // Disj goals with identical PICK heads (`Disj[Atom(Eq)|Atom(Less)
+    // |Ex1v]`) but DIFFERENT alternatives (one has ChainKey(k#1) in
+    // its Ex body, the other has ChainKey(f(k#1))).  HS picks the
+    // f-wrapped one first; Rust picks the bare-k#1 one — causing the
+    // case_3 over-split.
+    if let Goal::Disj(d) = g {
+        if std::env::var("TAM_RS_TRACE_PICK_DISJ").is_ok() {
+            let alts: Vec<String> = d.0.iter().map(guarded_repr).collect();
+            eprintln!("[PICK_DISJ] Disj[{}]", alts.join(" || "));
+        }
+    }
     eprintln!("[PICK] {}", s);
 }
 
