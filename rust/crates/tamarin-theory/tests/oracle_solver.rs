@@ -1092,8 +1092,8 @@ fn probe_tpm_left_reachable() {
         if let Goal::Action(_, fa) = &src_obj.goal {
             if matches!(fa.tag, tamarin_theory::fact::FactTag::Ku) {
                 let term_dbg = format!("{:?}", fa.terms.first()).chars().take(120).collect::<String>();
-                eprintln!("Ku source ({} cases): {}", src_obj.cases.len(), term_dbg);
-                for (name, _) in &src_obj.cases {
+                eprintln!("Ku source ({} cases): {}", src_obj.cases_or_empty().len(), term_dbg);
+                for (name, _) in src_obj.cases_or_empty() {
                     eprintln!("  case: {}", name);
                 }
             }
@@ -1163,8 +1163,8 @@ fn probe_nspk3_fresh_sources() {
         if let Goal::Action(_, fa) = &src.goal {
             if matches!(fa.tag, tamarin_theory::fact::FactTag::Ku) {
                 let term_dbg = format!("{:?}", fa.terms.first()).chars().take(80).collect::<String>();
-                eprintln!("=== source: Goal::Action _ Ku({}) — {} cases", term_dbg, src.cases.len());
-                for (name, _) in &src.cases {
+                eprintln!("=== source: Goal::Action _ Ku({}) — {} cases", term_dbg, src.cases_or_empty().len());
+                for (name, _) in src.cases_or_empty() {
                     eprintln!("  case: {}", name);
                 }
             }
@@ -1321,8 +1321,8 @@ fn probe_chaum_unforgeability() {
         if let Goal::Action(_, fa) = &src_obj.goal {
             if matches!(fa.tag, tamarin_theory::fact::FactTag::Ku) {
                 let term_dbg = format!("{:?}", fa.terms.first()).chars().take(160).collect::<String>();
-                eprintln!("Ku source ({} cases): {}", src_obj.cases.len(), term_dbg);
-                for (name, case_sys) in &src_obj.cases {
+                eprintln!("Ku source ({} cases): {}", src_obj.cases_or_empty().len(), term_dbg);
+                for (name, case_sys) in src_obj.cases_or_empty() {
                     eprintln!("  case: {}", name);
                     // Dump key state for diffing
                     eprintln!("    nodes ({}):", case_sys.nodes.len());
@@ -1394,8 +1394,8 @@ fn probe_tls_setup_possible() {
                     let term_dbg = format!("{:?}", fa.terms.first())
                         .chars().take(120).collect::<String>();
                     eprintln!("Ku source ({} cases): {}",
-                        src_obj.cases.len(), term_dbg);
-                    for (name, _) in &src_obj.cases {
+                        src_obj.cases_or_empty().len(), term_dbg);
+                    for (name, _) in src_obj.cases_or_empty() {
                         eprintln!("  case: {}", name);
                     }
                 }
@@ -1491,8 +1491,8 @@ fn probe_nslpk3_nonce_secrecy() {
                     let term_dbg = format!("{:?}", fa.terms.first())
                         .chars().take(140).collect::<String>();
                     eprintln!("Ku source ({} cases): {}",
-                        src_obj.cases.len(), term_dbg);
-                    for (name, _) in &src_obj.cases {
+                        src_obj.cases_or_empty().len(), term_dbg);
+                    for (name, _) in src_obj.cases_or_empty() {
                         eprintln!("  case: {}", name);
                     }
                 }

@@ -199,6 +199,11 @@ impl<'ctx> Reduction<'ctx> {
             eprintln!("[INSERT_EDGE] enter site={} mode={} src={:?} tgt={:?} eqIsFalse={}",
                 site, mode, e.src, e.tgt, self.sys.eq_store.is_false());
         }
+        // HS-faithful: `insertEdgesLabeled` (Reduction.hs:301) emits
+        // `traceExecM ("insertEdges n=" ++ show (length edges))` BEFORE
+        // running `solveFactEqs` on the edges.  We're per-edge here
+        // (n=1), so emit once.
+        crate::constraint::solver::trace::trace_exec("insertEdges n=1");
         // Look up the conclusion fact (source) and premise fact (target).
         let fa_conc = self.sys.nodes.iter()
             .find(|(n, _)| n == &e.src.0)
@@ -237,6 +242,44 @@ impl<'ctx> Reduction<'ctx> {
             return res;
         }
         // HS step 2: add to sEdges (Reduction.hs:288).
+        let before = self.sys.edges.len();
+        self.sys.add_edge(e);
+        if self.sys.edges.len() != before { self.changed = ChangeIndicator::Changed; }
+        res
+    }
+
+    /// Variant of `insert_edge_labeled` that takes explicit conc/prem
+    /// facts rather than looking them up via `sys.nodes`.  Mirrors
+    /// HS's `insertEdgesLabeled "solvePremise" [(c, faConc, faPrem, p)]`
+    /// — the live premise's fact comes from solvePremise's `faPrem`
+    /// argument, not from a node lookup (the abstract goal's NodeId
+    /// has no corresponding rule in sys.nodes).
+    pub fn insert_edge_labeled_with_facts(
+        &mut self, site: &str,
+        e: crate::constraint::constraints::Edge,
+        fa_conc: &crate::fact::LNFact,
+        fa_prem: &crate::fact::LNFact,
+    ) -> Result<SolveOutcome, crate::tools::equation_store::AddEqsError> {
+        if std::env::var("TAM_RS_TRACE_INSERT_EDGE").is_ok() {
+            let mode = if crate::constraint::solver::sources::in_precompute_mode() {
+                "saturate" } else { "runtime" };
+            eprintln!("[INSERT_EDGE] enter site={} mode={} src={:?} tgt={:?} eqIsFalse={}",
+                site, mode, e.src, e.tgt, self.sys.eq_store.is_false());
+        }
+        crate::constraint::solver::trace::trace_exec("insertEdges n=1");
+        let res = if fa_conc != fa_prem {
+            self.solve_fact_eqs(
+                SplitStrategy::SplitNow,
+                &[tamarin_term::rewriting::Equal {
+                    lhs: fa_conc.clone(), rhs: fa_prem.clone() }],
+            )
+        } else {
+            Ok(SolveOutcome::Linear(ChangeIndicator::Unchanged))
+        };
+        if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
+            self.mark_contradictory();
+            return res;
+        }
         let before = self.sys.edges.len();
         self.sys.add_edge(e);
         if self.sys.edges.len() != before { self.changed = ChangeIndicator::Changed; }
@@ -804,13 +847,20 @@ impl<'ctx> Reduction<'ctx> {
     /// fresh `SplitId`, and inserts a `Goal::Split(id)` so the search
     /// (or simplify) layer enumerates the variant choice lazily.
     /// Returns without effect when `substs` is `None` or empty.
+    /// Add a SplitG for variant constraints and check if the
+    /// resulting eq_store is contradictory.  Returns `true` if the
+    /// eq_store is false (caller should mzero — drop the branch).
+    /// Mirrors HS `solveRuleConstraints` + `noContradictoryEqStoreLabeled
+    /// "solveRuleConstraints"` (Reduction.hs ~770).  HS's mzero here
+    /// kills rule branches whose variants conflict with the live
+    /// eq_store — so `exploitPrems`/`solveGoal` never fires for them.
     pub fn solve_rule_constraints(
         &mut self,
         substs: Option<Vec<tamarin_term::subst_vfresh::LNSubstVFresh>>,
-    ) {
+    ) -> bool {
         let substs = match substs {
             Some(v) if !v.is_empty() => v,
-            _ => return,
+            _ => return false,
         };
         // Haskell `addRuleVariants` errors if domain of variants
         // intersects with eq-store free subst — that case isn't
@@ -908,6 +958,18 @@ impl<'ctx> Reduction<'ctx> {
             self.insert_goal(Goal::Split(id));
         }
         self.changed = ChangeIndicator::Changed;
+        // HS-faithful: `noContradictoryEqStoreLabeled "solveRuleConstraints"`
+        // (Reduction.hs ~770) fires mzero if the eq_store ended up
+        // contradictory after adding variants + simp.  Return that
+        // signal so the caller can drop the rule branch BEFORE
+        // exploit_prems fires — matching HS's behavior where
+        // `exploitPrems rule=X` trace never emits for rules whose
+        // variants conflict with the live state.
+        let contra = self.sys.eq_store.is_false();
+        if std::env::var("TAM_DBG_VARIANT_CONTRA").is_ok() && contra {
+            eprintln!("[variant_contra] solve_rule_constraints contradiction fired");
+        }
+        contra
     }
 
     /// Insert a `<` atom.
@@ -1160,6 +1222,7 @@ impl<'ctx> Reduction<'ctx> {
             let head = match &g {
                 Guarded::Atom(_) => "Atom",
                 Guarded::Conj(_) => "Conj",
+                Guarded::Disj(items) if items.is_empty() => "Disj-EMPTY",
                 Guarded::Disj(_) => "Disj",
                 Guarded::GGuarded { qua: crate::guarded::Quant::Ex, .. } => "Ex",
                 Guarded::GGuarded { qua: crate::guarded::Quant::All, .. } => "All",
@@ -1181,10 +1244,27 @@ impl<'ctx> Reduction<'ctx> {
             Guarded::Disj(items) if items.is_empty() => {
                 // Empty disjunction = ⊥ — store the formula so a
                 // downstream contradictions check can detect it.
-                if !self.sys.formulas.contains(&g) {
-                    self.sys.formulas.push(g);
+                //
+                // HS-faithful: `insertFormula` (Reduction.hs:473-482) for
+                // GDisj does NOT branch on emptiness — it always traces
+                // `Disj`, inserts into sFormulas, AND inserts the DisjG
+                // goal.  When the disj is empty, the DisjG goal becomes
+                // `solveDisjunction (Disj [])` = mzero (Goals.hs:432-436)
+                // — a structurally-explicit contradiction that the goal
+                // ranker can pick.  Mirror by emitting the trace event,
+                // adding to formulas, AND inserting the empty DisjG goal
+                // alongside.  Both contradictions-check and goal-ranker
+                // can then close the case (HS picks whichever fires first).
+                let already_in = self.sys.formulas.contains(&g);
+                crate::constraint::solver::trace::trace_form(
+                    if already_in { "Disj-dedup" } else { "Disj" },
+                    &crate::constraint::solver::trace::guarded_repr(&g));
+                if !already_in {
+                    self.sys.formulas.push(g.clone());
                     self.changed = ChangeIndicator::Changed;
                 }
+                let goal = Goal::Disj(crate::constraint::constraints::Disj::new(items));
+                self.insert_goal(goal);
             }
             Guarded::Disj(items) => {
                 // Store the formula AND insert a corresponding split
@@ -2169,15 +2249,59 @@ fn non_silent_rule_insts(
 /// SplitG-faithful variant of `non_silent_rule_insts`: returns the
 /// canonical rule per `OpenProtoRule` plus its variant disjunction.
 /// Intruder rules carry `None` (no variants).
+///
+/// HS-faithful ordering: `joinAllRules (ClassifiedRules a b c) = a ++ b ++ c`
+/// where (a, b, c) = (crProtocol, crDestruct, crConstruct).
+/// `crProtocol` is `rulesAC` filtered to rules that are NEITHER
+/// `isConstrRule` NOR `isDestrRule` — and `rulesAC = intruder ++ proto`,
+/// so within `crProtocol` the non-constr-non-destr intruder rules
+/// (ISend, IRecv) come BEFORE the protocol rules.  See `Rule.hs:163-176`.
+///
+/// HS's `isConstrRule` matches `ConstrRule _ | FreshConstrRule |
+/// PubConstrRule | NatConstrRule | CoerceRule` (Model/Rule.hs:684-691);
+/// `isDestrRule` matches `DestrRule _ _ _ _ | IEqualityRule`
+/// (Model/Rule.hs:671-675).  We use HS-local predicates here so the
+/// existing `is_constr_rule_info` / `is_destr_rule_info` callers
+/// (dot.rs, context.rs's pc_true_subterm, chain handling) keep their
+/// current — narrower — behaviour pending a separate audit.
 fn non_silent_rule_insts_with_constrs(
     ctx: &crate::constraint::solver::context::ProofContext,
 ) -> Vec<(RuleACInst, Option<Vec<tamarin_term::subst_vfresh::LNSubstVFresh>>)> {
-    let mut out = rule_insts_with_constrs(&ctx.rules, |r| !r.actions.is_empty());
+    use crate::rule::IntrRuleACInfo;
+    let is_constr_hs = |info: &IntrRuleACInfo| matches!(info,
+        IntrRuleACInfo::ConstrRule(_)
+        | IntrRuleACInfo::FreshConstr
+        | IntrRuleACInfo::PubConstr
+        | IntrRuleACInfo::NatConstr
+        | IntrRuleACInfo::Coerce);
+    let is_destr_hs = |info: &IntrRuleACInfo| matches!(info,
+        IntrRuleACInfo::DestrRule(_, _, _, _)
+        | IntrRuleACInfo::IEquality);
+
+    // crProtocol arm: intruder-non-cd ++ protocol (rulesAC order).
+    let mut cr_protocol: Vec<(RuleACInst, Option<_>)> = Vec::new();
     for ir in &ctx.intruder_rules {
-        if !ir.actions.is_empty() {
-            out.push((intr_rule_to_rule_ac_inst(ir.clone()), None));
+        if ir.actions.is_empty() { continue; }
+        if is_constr_hs(&ir.info) || is_destr_hs(&ir.info) { continue; }
+        cr_protocol.push((intr_rule_to_rule_ac_inst(ir.clone()), None));
+    }
+    cr_protocol.extend(rule_insts_with_constrs(&ctx.rules, |r| !r.actions.is_empty()));
+
+    // crDestruct + crConstruct: walk intruder_rules once, partition.
+    let mut cr_destruct: Vec<(RuleACInst, Option<_>)> = Vec::new();
+    let mut cr_construct: Vec<(RuleACInst, Option<_>)> = Vec::new();
+    for ir in &ctx.intruder_rules {
+        if ir.actions.is_empty() { continue; }
+        if is_destr_hs(&ir.info) {
+            cr_destruct.push((intr_rule_to_rule_ac_inst(ir.clone()), None));
+        } else if is_constr_hs(&ir.info) {
+            cr_construct.push((intr_rule_to_rule_ac_inst(ir.clone()), None));
         }
     }
+
+    let mut out = cr_protocol;
+    out.extend(cr_destruct);
+    out.extend(cr_construct);
     out
 }
 
@@ -2481,35 +2605,48 @@ fn premise_solving_rule_insts_with_constrs(
     ctx: &crate::constraint::solver::context::ProofContext,
     fa_prem: &crate::fact::LNFact,
 ) -> Vec<(RuleACInst, Option<Vec<tamarin_term::subst_vfresh::LNSubstVFresh>>)> {
-    let unique_rule_name = ctx.unique_sources.iter()
-        .find(|s| s.fact_tag == fa_prem.tag)
-        .map(|s| s.rule_name.clone());
+    // HS-faithful: `solvePremise (crProtocol ++ crConstruct)` iterates
+    // crProtocol intruder rules (ISend, IRecv, IEquality) regardless of
+    // conclusion-tag — the `labelNodeId` trace `exploitPrems rule=Send`/
+    // `Recv` fires before the conclusion unification mzero's.
+    //
+    // HS-faithful: HS iterates ALL `crProtocol ++ crConstruct` rules
+    // per `solveGoal kind=Premise ...` (Goals.hs:211).  With single-
+    // threaded HS (`+RTS -N1`) the lazy ListT enumeration is
+    // deterministic and forces all branches.  Mirror that ordering
+    // and inclusion set here:
+    //   crProtocol  = non-destr, non-constr intruder rules (ISend,
+    //                  IRecv, IEquality) ++ protocol rules
+    //   crConstruct = constructor intruder rules (Coerce, PubConstr,
+    //                  FreshConstr, NatConstr, ConstrRule(*))
+    // Note: crDestruct (destructor rules) is NOT iterated for Premise
+    // goals — those are reserved for `solveChain` (Goals.hs:212).
     let mut out: Vec<(RuleACInst, Option<Vec<tamarin_term::subst_vfresh::LNSubstVFresh>>)>
-        = if !fa_prem.is_k_fact() {
-        let keep_rule_name = unique_rule_name.clone();
-        rule_insts_with_constrs(&ctx.rules, move |r| {
-            if !r.conclusions.iter().any(|c| !c.is_k_fact()) {
-                return false;
-            }
-            if let Some(name) = &keep_rule_name {
-                let r_name = match &r.info {
-                    crate::rule::RuleInfo::Proto(p) => match &p.name {
-                        crate::rule::ProtoRuleName::Stand(s) => s.clone(),
-                        crate::rule::ProtoRuleName::Fresh => "Fresh".to_string(),
-                    },
-                    _ => return true,
-                };
-                return &r_name == name;
-            }
-            true
-        })
-    } else {
-        rule_insts_with_constrs(&ctx.rules, |_| true)
-    };
+        = Vec::new();
+    // crProtocol intruder rules first.
     for ir in &ctx.intruder_rules {
-        let inst = intr_rule_to_rule_ac_inst(ir.clone());
-        if inst.conclusions.iter().any(|c| c.tag == fa_prem.tag) {
-            out.push((inst, None));
+        let is_crprotocol_intr = !crate::rule::is_destr_rule_info(&ir.info)
+            && !crate::rule::is_constr_rule_info(&ir.info)
+            && !crate::rule::is_pub_constr_rule_info(&ir.info)
+            && !crate::rule::is_nat_constr_rule_info(&ir.info)
+            && !crate::rule::is_fresh_constr_rule_info(&ir.info)
+            && !crate::rule::is_coerce_rule_info(&ir.info);
+        if is_crprotocol_intr {
+            out.push((intr_rule_to_rule_ac_inst(ir.clone()), None));
+        }
+    }
+    // Then all protocol rules.
+    out.extend(rule_insts_with_constrs(&ctx.rules, |_| true));
+    // Then crConstruct intruder rules (Coerce, PubConstr, FreshConstr,
+    // NatConstr, ConstrRule).
+    for ir in &ctx.intruder_rules {
+        let is_constr = crate::rule::is_constr_rule_info(&ir.info)
+            || crate::rule::is_pub_constr_rule_info(&ir.info)
+            || crate::rule::is_nat_constr_rule_info(&ir.info)
+            || crate::rule::is_fresh_constr_rule_info(&ir.info)
+            || crate::rule::is_coerce_rule_info(&ir.info);
+        if is_constr {
+            out.push((intr_rule_to_rule_ac_inst(ir.clone()), None));
         }
     }
     out
@@ -2934,6 +3071,22 @@ fn emit_dead_rule_premise_traces(rule: &crate::rule::RuleACInst) {
             FactTag::In => {
                 crate::constraint::solver::trace::trace_exec(
                     "exploitPrem InFact");
+                // HS-faithful (Reduction.hs:248-255): `exploitPrem
+                // InFact` does `ruKnows <- mkISendRuleAC ann m;
+                // modM sNodes (M.insert j ruKnows); modM sEdges
+                // (S.insert ...); exploitPrems j ruKnows`.  The
+                // recursive `exploitPrems` fires `traceExecM
+                // ("exploitPrems rule=" ++ getRuleName ru)` =
+                // `exploitPrems rule=Send` for the ISend supplier
+                // — even when the OUTER rule's action mismatches
+                // the goal (HS's Disj-monad branch still runs the
+                // body before `solveFactEqs` mzero's the branch).
+                // The dead-rule path must mirror that trace.  ISend's
+                // only premise is KU(x), which goes via `insertAction`
+                // and emits no exploitPrem-* trace, so no further
+                // recursion needed.
+                crate::constraint::solver::trace::trace_exec(
+                    "exploitPrems rule=Send");
             }
             _ => { /* HS doesn't trace other premise types */ }
         }
@@ -2974,6 +3127,72 @@ pub fn rule_case_name(rule: &crate::rule::RuleACInst) -> String {
             IntrRuleACInfo::FreshConstr => "fresh".to_string(),
             IntrRuleACInfo::IEquality => "iequality".to_string(),
         },
+    }
+}
+
+/// HS-faithful port of `Theory.Model.Rule.getRuleName`
+/// (lib/theory/src/Theory/Model/Rule.hs:767-781).  Distinct from
+/// `rule_case_name` (which mirrors HS `showRuleCaseName` ≡
+/// `prettyIntrRuleACInfo` — lowercase "isend", "c_fst", ...).
+/// HS uses `getRuleName` ONLY at the `[EXEC] exploitPrems rule=X`
+/// trace site (Reduction.hs:244) and a few other internal log
+/// points; everywhere else (proof tree case names, dot rendering,
+/// HTML output) HS uses `showRuleCaseName`.  We mirror that split.
+///
+/// Naming:
+///   ConstrRule x   → "Constr" ++ prefixIfReserved('c' : x)
+///   DestrRule  x _ _ _ → "Destr" ++ prefixIfReserved('d' : x)
+///   CoerceRule     → "Coerce"
+///   IRecvRule      → "Recv"
+///   ISendRule      → "Send"
+///   PubConstrRule  → "PubConstr"
+///   NatConstrRule  → "NatConstr"
+///   FreshConstrRule→ "FreshConstr"
+///   IEqualityRule  → "Equality"
+///   FreshRule      → "FreshRule"
+///   StandRule s    → s   (no prefixIfReserved — that's the pretty path)
+///
+/// The `x` for Constr/Destr is stored with HS's leading underscore
+/// (see `intruder_rules.rs:402`), so `ConstrRule(b"_fst")` yields
+/// `c` + `_fst` = `c_fst` and `prefixIfReserved` leaves it as-is.
+pub fn rule_trace_name(rule: &crate::rule::RuleACInst) -> String {
+    use crate::rule::{IntrRuleACInfo, ProtoRuleName, RuleInfo};
+    match &rule.info {
+        RuleInfo::Proto(p) => match &p.name {
+            ProtoRuleName::Fresh => "FreshRule".to_string(),
+            ProtoRuleName::Stand(s) => s.clone(),
+        },
+        RuleInfo::Intr(i) => match i {
+            IntrRuleACInfo::ConstrRule(name) => {
+                let s = String::from_utf8_lossy(name);
+                format!("Constr{}", prefix_if_reserved(&format!("c{}", s)))
+            }
+            IntrRuleACInfo::DestrRule(name, _, _, _) => {
+                let s = String::from_utf8_lossy(name);
+                format!("Destr{}", prefix_if_reserved(&format!("d{}", s)))
+            }
+            IntrRuleACInfo::Coerce      => "Coerce".to_string(),
+            IntrRuleACInfo::IRecv       => "Recv".to_string(),
+            IntrRuleACInfo::ISend       => "Send".to_string(),
+            IntrRuleACInfo::PubConstr   => "PubConstr".to_string(),
+            IntrRuleACInfo::NatConstr   => "NatConstr".to_string(),
+            IntrRuleACInfo::FreshConstr => "FreshConstr".to_string(),
+            IntrRuleACInfo::IEquality   => "Equality".to_string(),
+        },
+    }
+}
+
+/// HS-faithful port of `prefixIfReserved` (Model/Rule.hs:1154-1158):
+/// prefixes `n` with `_` if `n` is in `reservedRuleNames` or already
+/// starts with `_`.
+fn prefix_if_reserved(n: &str) -> String {
+    const RESERVED: &[&str] = &[
+        "Fresh", "irecv", "isend", "coerce", "fresh", "pub", "iequality",
+    ];
+    if RESERVED.contains(&n) || n.starts_with('_') {
+        format!("_{}", n)
+    } else {
+        n.to_string()
     }
 }
 
@@ -3052,7 +3271,7 @@ impl<'ctx> Reduction<'ctx> {
     ) {
         crate::constraint::solver::trace::trace_exec(
             &format!("exploitPrems rule={}",
-                crate::constraint::solver::reduction::rule_case_name(rule)));
+                crate::constraint::solver::reduction::rule_trace_name(rule)));
         // Snapshot premises so we can mutate self while iterating.
         // Apply the current eq_store.subst to each premise so any
         // variant subst that was folded into the free subst (e.g. by
@@ -3095,7 +3314,7 @@ impl<'ctx> Reduction<'ctx> {
     ) {
         crate::constraint::solver::trace::trace_exec(
             &format!("exploitPrems rule={}",
-                crate::constraint::solver::reduction::rule_case_name(rule)));
+                crate::constraint::solver::reduction::rule_trace_name(rule)));
         use crate::fact::FactTag;
         let prems: Vec<(crate::rule::PremIdx, crate::fact::LNFact)> =
             rule.enumerate_premises().map(|(p, f)| (p, f.clone())).collect();
@@ -3308,12 +3527,18 @@ impl<'ctx> Reduction<'ctx> {
         // add_ku_action_before below, so emit the matching trace here.
         crate::constraint::solver::trace::trace_exec(
             &format!("exploitPrems rule={}",
-                crate::constraint::solver::reduction::rule_case_name(&rule)));
+                crate::constraint::solver::reduction::rule_trace_name(&rule)));
         self.sys.add_node(j.clone(), rule);
-        // HS-faithful `insertEdges` (Reduction.hs:284): unify edge
-        // facts before adding.  Mirrors HS `exploitPrem InFact` which
-        // does `insertEdges [((j, ConcIdx 0), kuFactAnn ann m, fa, ...)]`.
-        let _ = self.insert_edge_labeled("isend_supplier", crate::constraint::constraints::Edge {
+        // HS-faithful (Reduction.hs:254): `exploitPrem InFact` does a
+        // RAW `modM sEdges (S.insert $ Edge (j, ConcIdx 0) (i, v))` —
+        // NO `insertEdges` call, NO `solveFactEqs` unification, NO
+        // `[EXEC] insertEdges n=1` trace.  Earlier comment said this
+        // was an `insertEdges` site but the corresponding HS line is
+        // a raw set insert; the previous `insert_edge_labeled` call
+        // both emitted a spurious trace and ran an unwanted edge-fact
+        // unification (eq-store binding the ISend conc fact to the
+        // consumer's prem fact).
+        self.sys.add_edge(crate::constraint::constraints::Edge {
             src: (j.clone(), crate::rule::ConcIdx(0)),
             tgt: (i.clone(), idx),
         });
@@ -3468,7 +3693,11 @@ impl<'ctx> Reduction<'ctx> {
                         crate::constraint::solver::sources::in_precompute_mode(),
                         fa.tag, self.ctx.full_sources.len());
                 }
-                if !crate::constraint::solver::sources::in_precompute_mode()
+                // HS-faithful (Sources.hs:202-206): KU action goals are
+                // "useful" — `solveAllSafeGoals` dispatches them via
+                // `solveWithSourceAndReturn` at BOTH saturate and
+                // runtime.  Skipped only during HS's `initialSource`.
+                if !crate::constraint::solver::sources::in_initial_source_cases()
                     && matches!(fa.tag, crate::fact::FactTag::Ku)
                     && !self.ctx.full_sources.is_empty()
                 {
@@ -3713,7 +3942,7 @@ impl<'ctx> Reduction<'ctx> {
                         // skips the actual instantiation work.
                         crate::constraint::solver::trace::trace_exec(
                             &format!("exploitPrems rule={}",
-                                crate::constraint::solver::reduction::rule_case_name(&rule)));
+                                crate::constraint::solver::reduction::rule_trace_name(&rule)));
                         emit_dead_rule_premise_traces(&rule);
                         continue;
                     }
@@ -3739,6 +3968,29 @@ impl<'ctx> Reduction<'ctx> {
                         let mut sys = self.sys.clone();
                         sys.add_node(i.clone(), renamed.clone());
                         let mut sub = Reduction::new(self.ctx, sys);
+                        // HS-faithful order (Goals.hs:262-265): `labelNodeId
+                        // i rules Nothing` returns the chosen `ru` AFTER
+                        // running `exploitPrems i ru`; only AFTERWARDS
+                        // does `solveAction` call
+                        //   `act <- disjunctionOfList (rActs ru)`
+                        //   `void (solveFactEqs SplitNow [Equal fa act])`.
+                        //
+                        // So `exploit_prems` must fire BEFORE
+                        // `solve_fact_eqs` — otherwise the `[EXEC]
+                        // solveTermEqs n=1` line emitted by
+                        // `solveFactEqs`'s underlying `solveTermEqsLabeled`
+                        // (Reduction.hs:769) lands before the matching
+                        // rule's `exploitPrems rule=X`/`exploitPrem
+                        // InFact`/etc. trace, instead of after.
+                        // HS-faithful: solveRuleConstraints fires BEFORE
+                        // exploitPrems (Reduction.hs labelNodeId).  If
+                        // it mzeros (eq_store contradictory), the
+                        // entire branch dies — exploitPrems trace
+                        // never fires.
+                        if sub.solve_rule_constraints(renamed_constrs) {
+                            continue;
+                        }
+                        sub.exploit_prems(i, &renamed);
                         let res = sub.solve_fact_eqs(
                             SplitStrategy::SplitNow,
                             &[tamarin_term::rewriting::Equal {
@@ -3746,12 +3998,6 @@ impl<'ctx> Reduction<'ctx> {
                         match res {
                             Err(_) | Ok(SolveOutcome::Contradictory) => continue,
                             Ok(_) => {
-                                // Install variant constraints as SplitG
-                                // (Haskell `solveRuleConstraints`).
-                                sub.solve_rule_constraints(renamed_constrs);
-                                // Expand the new node's premises
-                                // (Fresh / In / KU / Premise goal).
-                                sub.exploit_prems(i, &renamed);
                                 let mut sys = sub.sys;
                                 for (existing, status) in sys.goals.iter_mut() {
                                     if existing == &g && !status.solved {
@@ -3890,7 +4136,14 @@ impl<'ctx> Reduction<'ctx> {
         //
         // The returned systems are already fact-aligned + edge-coherent
         // (with a defensive `chain_eqs` pass — see task #249).
-        // Skipped during precompute itself.
+        //
+        // HS-faithful (Sources.hs:202-206): `solveAllSafeGoals` only
+        // calls `solveWithSourceAndReturn` on "useful" goals (KU
+        // actions).  Premise goals are "safe goals" — dispatched via
+        // `solveGoal` directly (rule enumeration), NOT through
+        // `solveWithSource`.  So Rust's saturate-time Premise dispatch
+        // should be skipped; runtime dispatch (via ProofMethod.solve)
+        // still fires.  Gate on `!in_precompute_mode()`.
         if !crate::constraint::solver::sources::in_precompute_mode()
             && !self.ctx.full_sources.is_empty()
         {
@@ -3943,78 +4196,78 @@ impl<'ctx> Reduction<'ctx> {
             if !any_conc_match {
                 crate::constraint::solver::trace::trace_exec(
                     &format!("exploitPrems rule={}",
-                        crate::constraint::solver::reduction::rule_case_name(rule)));
+                        crate::constraint::solver::reduction::rule_trace_name(rule)));
                 emit_dead_rule_premise_traces(rule);
+                // HS-faithful: insertEdgesLabeled "solvePremise" emits
+                // `insertEdges n=1` BEFORE `solveFactEqs` mzero's the
+                // branch.  For each conclusion enumerated, HS emits one
+                // such trace (Goals.hs:309-312 + Reduction.hs:300-302).
+                for _ in rule.enumerate_conclusions() {
+                    crate::constraint::solver::trace::trace_exec(
+                        "insertEdges n=1");
+                }
                 continue;
             }
-            // Matching rule: exploit_prems will be called inside the
-            // inner loop and emit its own exploitPrems trace.  HS
-            // emits exactly one per rule (matching or not), so no
-            // duplicate here.
-            for (c_idx, fa_conc) in rule.enumerate_conclusions() {
-                if fa_conc.tag != fa_prem.tag
-                    || fa_conc.terms.len() != fa_prem.terms.len() {
+            // HS-faithful labelNodeId order (Reduction.hs:222-230):
+            //   1. solveRuleConstraints (= solve_rule_constraints)
+            //   2. modM sNodes (insert rule node)
+            //   3. exploitPrems i ru (emits trace, adds vf/vk nodes)
+            // THEN insertFreshNodeConc's enumConcs Disj enumerates each
+            // conclusion — each conclusion gets its own sub-branch with
+            // its own insert_edge_labeled (Reduction.hs:300) emitting
+            // `insertEdges n=1`.  Tag-mismatched conclusions mzero in
+            // solveFactEqs but still emit their insertEdges trace.
+            let (renamed, renamed_constrs) = freshen_rule_with_constrs(
+                rule.clone(), constrs.clone(), avoid_max, &self.ctx.maude);
+            let case_name = rule_case_name(&renamed);
+            let new_node = tamarin_term::lterm::LVar::new(
+                "vr",
+                tamarin_term::lterm::LSort::Node,
+                next_node_idx,
+            );
+            next_node_idx = next_node_idx.saturating_add(1);
+            // Run labelNodeId on a working sys clone — its side effects
+            // (rule node, vf/vk supplier nodes/edges, eq_store SplitG
+            // disjunctions, exploit_prems traces) are SHARED across all
+            // conclusion sub-branches in HS's Disj structure.
+            //
+            // HS-faithful (Reduction.hs labelNodeId): solveRuleConstraints
+            // fires BEFORE exploitPrems.  If solveRuleConstraints mzeros
+            // (noContradictoryEqStoreLabeled), exploitPrems never fires
+            // — the rule branch dies silently.  Skip the entire rule
+            // here when solve_rule_constraints reports contradiction
+            // so `exploitPrems rule=X` / `insertEdges` traces don't
+            // fire either.
+            let mut label_sys = self.sys.clone();
+            label_sys.add_node(new_node.clone(), renamed.clone());
+            let mut label_sub = Reduction::new(self.ctx, label_sys);
+            if label_sub.solve_rule_constraints(renamed_constrs.clone()) {
+                continue;
+            }
+            label_sub.exploit_prems(&new_node, &renamed);
+            let label_sys = label_sub.sys;
+            // enumConcs Disj sub-branches — emit insertEdges per conc.
+            for (c_idx, fa_conc) in renamed.enumerate_conclusions() {
+                let conc_matches = fa_conc.tag == fa_prem.tag
+                    && fa_conc.terms.len() == fa_prem.terms.len();
+                if !conc_matches {
+                    // Dead-conclusion sub-branch: HS still runs
+                    // insertEdgesLabeled which emits the trace BEFORE
+                    // solveFactEqs mzero's the branch.
+                    crate::constraint::solver::trace::trace_exec(
+                        "insertEdges n=1");
                     continue;
                 }
-                let mut sys = self.sys.clone();
-                // Freshen the rule and its variant constraints together
-                // so the SplitG disjunction's domain stays aligned with
-                // the rule's free vars (Haskell `someRuleACInst` runs
-                // `rename` over the whole pair).
-                let (renamed, renamed_constrs) = freshen_rule_with_constrs(
-                    rule.clone(), constrs.clone(), avoid_max, &self.ctx.maude);
-                let fa_conc = renamed.conclusions[c_idx.0].clone();
-                let case_name = rule_case_name(&renamed);
-                let new_node = tamarin_term::lterm::LVar::new(
-                    "vr",
-                    tamarin_term::lterm::LSort::Node,
-                    next_node_idx,
-                );
-                next_node_idx = next_node_idx.saturating_add(1);
-                sys.add_node(new_node.clone(), renamed.clone());
-                let mut sub = Reduction::new(self.ctx, sys);
-                // HS-faithful (Goals.hs:309-312 + Reduction.hs:285-291):
-                //   insertEdgesLabeled "solvePremise" [(c, faConc, faPrem, p)]
-                // which performs `solveFactEqs SplitNow` FIRST then
-                // `modM sEdges` — atomic.  Previously Rust did
-                // `sys.add_edge(...)` raw FIRST then `sub.solve_fact_eqs(...)`
-                // separately — opposite order from HS.  This left the
-                // edge in sEdges referencing raw conc/prem facts (no
-                // unification applied yet), so downstream eq_store +
-                // sys.nodes/edges/etc were out of sync until something
-                // ran subst_system.
-                //
-                // The previous outer KD-path `subst_system` after the
-                // recursive call was masking this bug — it propagated
-                // the late eq_store binding into sys.nodes.  Removing
-                // that subst (HS-faithful) caused TLS+NSPK3 wrong-
-                // VERIFIED.  The root cause is THIS raw add_edge.
-                let res = sub.insert_edge_labeled(
+                let mut sub = Reduction::new(self.ctx, label_sys.clone());
+                let res = sub.insert_edge_labeled_with_facts(
                     "premise_goal_rule_enum",
                     crate::constraint::constraints::Edge {
                         src: (new_node.clone(), c_idx),
                         tgt: p.clone(),
-                    });
-                // Full premise expansion — both at precompute time
-                // (so `saturateSources` can refine sub-goals into self-
-                // contained cases) and at runtime (so the search
-                // tracks every premise the new rule introduces).  The
-                // earlier `supplier_only` runtime path silently
-                // dropped Proto-fact premises in the assumption that
-                // the source-case cache covered them; but the cache
-                // only carries Proto-fact entries for tags seen in
-                // protocol rules, and a Premise(Out)→Reveal_ltk fork
-                // can introduce !Ltk premises that no source covers.
-                // Dropping them produced false-Solved leaves where
-                // Reveal_ltk's !Ltk premise had no producer (root cause
-                // of NSLPK3-class FPs; see solver-memory bug #27).
-                if matches!(res, Ok(SolveOutcome::Linear(_))) {
-                    // Install variant constraints as SplitG (Haskell
-                    // `solveRuleConstraints`).  No-op when constrs is
-                    // None (intruder rules, or SplitG path disabled).
-                    sub.solve_rule_constraints(renamed_constrs.clone());
-                    sub.exploit_prems(&new_node, &renamed);
-                }
+                    },
+                    &fa_conc,
+                    fa_prem,
+                );
                 let mut sys = sub.sys;
                 match res {
                     Err(_) | Ok(SolveOutcome::Contradictory) => continue,
@@ -4143,15 +4396,23 @@ impl<'ctx> Reduction<'ctx> {
         }
 
         // ---------------- Branch 2: extend by destructor ----------------
-        // Skip in precompute mode (`saturate_sources` handles open
-        // chains differently) and skip when the chain's term is a
-        // message variable (Haskell `contradictoryIf (isMsgVar m)`).
+        // Skip ONLY when the chain's term is a message variable
+        // (Haskell `contradictoryIf (isMsgVar m)`, Goals.hs:370).
+        //
+        // We previously also skipped during precompute (`saturate_sources`
+        // handles chains via a separate chain-fold path), but with the
+        // HS-faithful `saturate_sources_with_simp` driven via
+        // `solve_all_safe_goals_tracked`, the chain-extend branch needs
+        // to fire here so saturate explores destructor alternatives
+        // like `R_1d_0_adecd_0_sndd_0_fstRegister_pkRegister_pk`.
+        // Without these alternatives, HS produces 6 cases for KU(aenc)
+        // but Rust produces 4 — and the trace work-count gap stays
+        // 10-30× off.  HS Goals.hs:316-380 runs both branches via
+        // `disjunction` unconditionally.
         let conc_term_is_msg_var = fa_conc.terms.first()
             .map(|t| tamarin_term::lterm::is_msg_var(t))
             .unwrap_or(false);
-        if !conc_term_is_msg_var
-            && !crate::constraint::solver::sources::in_precompute_mode()
-        {
+        if !conc_term_is_msg_var {
             let avoid_max = bounds_max(&self.sys);
             let mut next_node_idx = avoid_max.saturating_add(1);
             for ir in &self.ctx.intruder_rules {
@@ -4196,7 +4457,7 @@ impl<'ctx> Reduction<'ctx> {
                 let trace_dead = |ru: &crate::rule::RuleACInst| {
                     crate::constraint::solver::trace::trace_exec(
                         &format!("exploitPrems rule={}",
-                            crate::constraint::solver::reduction::rule_case_name(ru)));
+                            crate::constraint::solver::reduction::rule_trace_name(ru)));
                     emit_dead_rule_premise_traces(ru);
                 };
                 let prem0 = match ru_renamed.premises.first() {

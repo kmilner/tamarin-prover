@@ -258,10 +258,17 @@ impl System {
         }
     }
 
-    /// Add an edge if not already present.
+    /// Add an edge if not already present.  Low-level raw insert
+    /// equivalent of HS `modM sEdges (S.insert e)`.  Does NOT emit
+    /// `[EXEC] insertEdges n=K` — that trace is bound to HS's
+    /// `insertEdgesLabeled` (Reduction.hs:299-307), which is the only
+    /// path that traces.  Callers that mirror `insertEdgesLabeled`
+    /// must use `Reduction::insert_edge_labeled` (which emits the
+    /// trace + runs `solveFactEqs`); callers that mirror HS's raw
+    /// `modM sEdges` (e.g. `exploitPrem InFact` /
+    /// `exploitPrem FreshFact`) should use this directly.
     pub fn add_edge(&mut self, e: Edge) {
         if !self.edges.contains(&e) {
-            crate::constraint::solver::trace::trace_exec("insertEdges n=1");
             self.edges.push(e);
         }
     }

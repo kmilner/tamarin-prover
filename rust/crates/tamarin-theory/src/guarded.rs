@@ -1253,7 +1253,13 @@ pub fn to_induction_hypothesis(g: &Guarded) -> Result<Guarded, String> {
             // We use named vars, so no de-Bruijn shifting is needed: the
             // body2 refers to the same `vars` by name, and we just emit
             // `Last(Var(v))` for each node-sorted v in `vars`.
-            let last_atos: Vec<Guarded> = vars.iter()
+            // Haskell `reverse ss` (Guarded.hs:613) — node-sorted binders
+            // emitted in REVERSE quantifier order.  For `∀ k #i #j`, ss
+            // reversed = [#j, #i, k] → lastAtos = [Last(#j), Last(#i)].
+            // Without `.rev()`, our disj order is [#i, #j] (matches HS
+            // case_2 first), inverting `case_1`/`case_2` labels for the
+            // `last`-disjunction split and breaking proof-tree shape diff.
+            let last_atos: Vec<Guarded> = vars.iter().rev()
                 .filter(|v| matches!(
                     v.sort,
                     p::SortHint::Node | p::SortHint::Suffix(p::SuffixSort::Node)

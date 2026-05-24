@@ -359,6 +359,15 @@ traceStateM sys
                 mapM_ (\e -> traceM ("[STATE_EDGE] path=" ++ casePathString path
                                   ++ " " ++ show e))
                       (S.toList (L.get sEdges sys))
+                -- Less atoms and last_atom — drive Cyclic contradiction
+                -- detection.  Mirrors Rust's [STATE_LESS] / [STATE_LAST].
+                mapM_ (\l -> traceM ("[STATE_LESS] path=" ++ casePathString path
+                                  ++ " " ++ show l))
+                      (S.toList (L.get sLessAtoms sys))
+                case L.get sLastAtom sys of
+                    Just la -> traceM ("[STATE_LAST] path=" ++ casePathString path
+                                    ++ " last=" ++ show la)
+                    Nothing -> pure ()
             else pure ()
     | otherwise = pure ()
 {-# NOINLINE traceStateM #-}
