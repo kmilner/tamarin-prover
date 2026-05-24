@@ -2533,10 +2533,38 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
     }
     if by_inj.len() < 2 { return ChangeIndicator::Unchanged; }
 
+    // Pre-collect the existing `gnotAtom (EqE s t)` inequalities from
+    // formulas + solved_formulas so case (4) below can skip when we
+    // already know s ≠ t.  Mirrors HS `inequalities` set
+    // (Simplify.hs:637-643).
+    let inequalities: std::collections::BTreeSet<(tamarin_term::lterm::LNTerm,
+                                                  tamarin_term::lterm::LNTerm)> = {
+        let mut set = std::collections::BTreeSet::new();
+        let all_fms = red.sys.formulas.iter().chain(red.sys.solved_formulas.iter());
+        for fm in all_fms {
+            if let crate::guarded::Guarded::GGuarded { qua, vars, guards, body } = fm {
+                if !matches!(qua, crate::guarded::Quant::All) { continue; }
+                if !vars.is_empty() { continue; }
+                if guards.len() != 1 { continue; }
+                if **body != crate::guarded::gfalse() { continue; }
+                if let tamarin_parser::ast::Atom::Eq(s, t) = &guards[0] {
+                    if let (Some(sl), Some(tl)) = (
+                        crate::elaborate::term_to_lnterm(s),
+                        crate::elaborate::term_to_lnterm(t),
+                    ) {
+                        set.insert((sl.clone(), tl.clone()));
+                        set.insert((tl, sl));
+                    }
+                }
+            }
+        }
+        set
+    };
     let mut term_eqs: Vec<tamarin_term::rewriting::Equal<tamarin_term::lterm::LNTerm>>
         = Vec::new();
     let mut node_eqs: Vec<tamarin_term::rewriting::Equal<crate::constraint::constraints::NodeId>>
         = Vec::new();
+    let mut new_inequalities: Vec<crate::guarded::Guarded> = Vec::new();
     for a in 0..by_inj.len() {
         for b in (a + 1)..by_inj.len() {
             let (i, fa_i, behaviours_i) = &by_inj[a];
@@ -2565,12 +2593,44 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                             });
                         }
                     }
+                    // HS-faithful case (4) (Simplify.hs:655): for a
+                    // StrictlyIncreasing/StrictlyDecreasing position
+                    // where the two nodes are order-comparable
+                    // (`alwaysBefore i j` or `alwaysBefore j i`), the
+                    // value at that position must differ — emit
+                    // `gnotAtom (EqE s t)` = `∀[] [s = t] ⊥` = `s ≠ t`.
+                    // Skip when we already know `s ≠ t`.
+                    //
+                    // Without this, lemmas whose proof needs to know
+                    // that two ordered Loop/Gen instances have distinct
+                    // StrictlyIncreasing arguments (e.g.
+                    // Helper_Loop_and_success at the case_3 split)
+                    // miss the disequality formulas HS generates, so
+                    // downstream impl-fire can't derive the gfalse
+                    // needed to close the case immediately.
+                    MonotonicBehaviour::StrictlyIncreasing
+                    | MonotonicBehaviour::StrictlyDecreasing if s != t => {
+                        let comparable = red.sys.always_before(i, j)
+                                      || red.sys.always_before(j, i);
+                        let already_ineq = inequalities.contains(&(s.clone(), t.clone()))
+                                        || inequalities.contains(&(t.clone(), s.clone()));
+                        if comparable && !already_ineq {
+                            let s_ast = crate::elaborate::lnterm_to_term(s);
+                            let t_ast = crate::elaborate::lnterm_to_term(t);
+                            let neg = crate::guarded::gall(
+                                Vec::new(),
+                                vec![tamarin_parser::ast::Atom::Eq(s_ast, t_ast)],
+                                crate::guarded::gfalse(),
+                            );
+                            new_inequalities.push(neg);
+                        }
+                    }
                     _ => {}
                 }
             }
         }
     }
-    if term_eqs.is_empty() && node_eqs.is_empty() {
+    if term_eqs.is_empty() && node_eqs.is_empty() && new_inequalities.is_empty() {
         return ChangeIndicator::Unchanged;
     }
     // Haskell `simpInjectiveFactEqMon` runs the term/node-id
@@ -2595,6 +2655,11 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
         } else {
             apply_node_eqs(red, &node_eqs);
         }
+    }
+    // Insert the StrictlyIncreasing case-(4) `s ≠ t` formulas, mirroring
+    // HS `mapM_ insertFormula newFormulas` (Simplify.hs:667).
+    for neg in new_inequalities {
+        red.insert_formula(neg);
     }
     if hit_contra {
         mark_contradictory_labeled(red, "simp_injective_fact_eq_mon");
