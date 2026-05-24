@@ -275,15 +275,67 @@ addEqs hnd eqs0 eqStore =
 
 -- | Apply a substitution to an equation store and bring resulting equations into
 --   normal form again by using unification.
+--
+-- TAM_HS_DBG_APPLY_EQ_STORE=1 dumps every call's asubst, eqsSubst, IN
+-- disjs, per-variant applyBound input/output, and OUT disjs.  Pair with
+-- Rust's TAM_RS_DBG_APPLY_EQ_STORE for HS↔Rust diffing of variant flow
+-- (see [[project-apply-eq-store-divergence]]).
+--
+-- TAM_HS_DBG_APPLY_EQ_STORE_FILTER=substantive limits dump to calls with
+-- non-empty conj (skips trivial composition-only calls).
 applyEqStore :: MaudeHandle -> LNSubst -> EqStore -> EqStore
 applyEqStore hnd asubst eqStore
     | dom asubst `intersect` varsRange asubst /= [] || trace (show ("applyEqStore", asubst, eqStore)) False
     = error $ "applyEqStore: dom and vrange not disjoint for `"++show asubst++"'"
     | otherwise
-    = modify eqsConj (fmap (second (S.fromList . concatMap applyBound  . S.toList))) $
+    = dbgWrap $ modify eqsConj (fmap (second (S.fromList . concatMap applyBoundDbg . S.toList))) $
           set eqsSubst newsubst eqStore
   where
     newsubst = asubst `compose` L.get eqsSubst eqStore
+    dbgEnabled = System.IO.Unsafe.unsafePerformIO $
+                 fmap (== Just "1") $ System.Environment.lookupEnv "TAM_HS_DBG_APPLY_EQ_STORE"
+    dbgFilterSubstantive = System.IO.Unsafe.unsafePerformIO $
+                 fmap (== Just "substantive") $ System.Environment.lookupEnv "TAM_HS_DBG_APPLY_EQ_STORE_FILTER"
+    -- Tick every call (even empty conj) so call counts can be compared
+    -- against Rust's TAM_RS_DBG_APPLY_EQ_STORE.  Substantive calls
+    -- (non-empty conj) also dump per-variant detail.
+    dbgWrap r = if dbgEnabled
+      then System.IO.Unsafe.unsafePerformIO $ do
+        let inDisjs = filter (not . S.null . snd) (getConj $ L.get eqsConj eqStore)
+        let substantive = not (null inDisjs)
+        -- Always emit a tick line for call counting.
+        if substantive || not dbgFilterSubstantive
+          then putStrLn $ "[hs-aes-tick] conj=" ++ show (length (getConj $ L.get eqsConj eqStore))
+                       ++ " substantive=" ++ show substantive
+          else return ()
+        if substantive
+          then do
+            putStrLn $ "[hs-aes] === call ==="
+            putStrLn $ "[hs-aes] asubst = " ++ show (substToList asubst)
+            putStrLn $ "[hs-aes] eqsSubst = " ++ show (substToList (L.get eqsSubst eqStore))
+            mapM_ (\(i, (sid, ss)) -> do
+              putStrLn $ "[hs-aes] IN  disj[" ++ show i ++ "] sid=" ++ show sid
+                                              ++ " (" ++ show (S.size ss) ++ " substs)"
+              mapM_ (\(j, s) -> putStrLn $ "  in[" ++ show j ++ "]: " ++ show (substToListVFresh s))
+                    (zip [0::Int ..] (S.toList ss)))
+              (zip [0::Int ..] inDisjs)
+            mapM_ (\(i, (sid, ss)) -> do
+              putStrLn $ "[hs-aes] OUT disj[" ++ show i ++ "] sid=" ++ show sid
+                                              ++ " (" ++ show (S.size ss) ++ " substs)"
+              mapM_ (\(j, s) -> putStrLn $ "  out[" ++ show j ++ "]: " ++ show (substToListVFresh s))
+                    (zip [0::Int ..] (S.toList ss)))
+              (zip [0::Int ..] (filter (not . S.null . snd) (getConj $ L.get eqsConj r)))
+            return r
+          else return r
+      else r
+    applyBoundDbg s =
+      let res = applyBound s in
+      if dbgEnabled then System.IO.Unsafe.unsafePerformIO $ do
+        putStrLn $ "[hs-aes-applyBound] IN  : " ++ show (substToListVFresh s)
+        mapM_ (\(j, o) -> putStrLn $ "  OUT[" ++ show j ++ "]: " ++ show (substToListVFresh o))
+              (zip [0::Int ..] res)
+        return res
+      else res
     applyBound s = map (restrictVFresh (varsRange newsubst ++ domVFresh s)) $
         (`runReader` hnd) $ unifyLNTerm
           [ Equal (apply newsubst (varTerm lv)) t

@@ -182,6 +182,13 @@ pub fn prove_lemma(
     // proof-then-saturate-on-demand ordering.
     ctx.typing_assumptions = typing_assumptions;
     if trace { eprintln!("[phase] run_proof_search start"); }
+    // Permanent phase marker so TAM_RS_DBG_* counts can be filtered
+    // to the lemma-proof phase only.  Pair with HS's
+    // `[Saturating Sources] Done` marker for HS↔Rust diffing of just
+    // the lemma proof (excludes precompute/saturation).  Always-on
+    // because the marker line is cheap and useful for any trace
+    // analysis.
+    eprintln!("[rs-phase] lemma-proof START");
     // Honour the `[use_induction]` and `[sources]` attributes by
     // forcing the first proof method to be Induction. Haskell's
     // `ClosedTheory.hs` flips `pcUseInduction = UseInduction` for
