@@ -55,6 +55,11 @@ import qualified Data.ByteString.Char8 as BC
 import System.Process
 import System.IO
 
+import qualified System.Environment
+import qualified System.IO.Unsafe
+
+import Control.Monad (when)
+
 import Utils.Misc
 -- import Extension.Data.Monoid
 
@@ -159,6 +164,9 @@ callMaude hnd updateStatistics cmd = do
     -- on another call to Maude anymore. Otherwise, we could end up in a
     -- deadlock.
     evaluate (rnf cmd)
+    when dbgMaudeIO $ do
+        let preview = BC.take 2000 cmd
+        BC.hPutStrLn stderr (BC.concat ["[hs-maude>] ", preview])
     -- If there was an exception, then we might be out of sync with the current
     -- persistent Maude process: restart the process.
     (`onException` restartMaude hnd) $ modifyMVar (mhProc hnd) $ \mp -> do
@@ -168,7 +176,19 @@ callMaude hnd updateStatistics cmd = do
         hFlush  inp
         mp' <- evaluate (updateStatistics mp)
         res <- getToDelim out
+        when dbgMaudeIO $
+            BC.hPutStrLn stderr (BC.concat ["[hs-maude<] ",
+                BC.pack (show (BC.length res)), " bytes: ",
+                BC.take 2000 res])
         return (mp', res)
+
+-- | TAM_HS_DBG_MAUDE_IO: mirror of Rust's TAM_DBG_MAUDE_IO.  Logs every
+-- Maude command sent + reply received so HS↔Rust Maude protocol
+-- diffs can be pinpointed.
+dbgMaudeIO :: Bool
+dbgMaudeIO = System.IO.Unsafe.unsafePerformIO $
+    maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_DBG_MAUDE_IO"
+{-# NOINLINE dbgMaudeIO #-}
 
 -- | Compute a result via Maude.
 computeViaMaude ::
