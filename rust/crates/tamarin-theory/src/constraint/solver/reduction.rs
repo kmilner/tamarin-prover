@@ -584,9 +584,22 @@ impl<'ctx> Reduction<'ctx> {
         //    structurally; collapsed goals merge by keeping the first
         //    occurrence.
         let goals = std::mem::take(&mut self.sys.goals);
+        // Mirror node-fact handling above (lines 414-428): apply the
+        // eq-store substitution, then Maude-normalize the result.
+        // Without the normalize step a goal's term can stay non-normal
+        // after subst — e.g. `sec → fst(pair(~sec, ~pub))` rewrites
+        // the open KU goal to `KU(fst(pair(~sec, ~pub)))` instead of
+        // `KU(~sec)`, which then takes a totally different (and wrong)
+        // source-pick path.  HS's `substFacts` (Reduction.hs) reaches
+        // the same canonical form because Tamarin's term representation
+        // is normalised on construction; we do it explicitly via Maude.
+        // Surfaced via Responder_secrecy byte-level trace:
+        // /Setup_Key/split_case_2/Initiator had goal `KU(fst(pair(...)))`
+        // in Rust where HS had `KU(~sec)`.
         let apply_term = |t: tamarin_term::lterm::LNTerm|
             -> tamarin_term::lterm::LNTerm {
-            tamarin_term::subst::apply_vterm(&subst, t)
+            let substed = tamarin_term::subst::apply_vterm(&subst, t);
+            self.ctx.maude.reduce(&substed).unwrap_or(substed)
         };
         let mut new_goals: Vec<(Goal, crate::constraint::system::GoalStatus)>
             = Vec::with_capacity(goals.len());
