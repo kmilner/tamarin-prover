@@ -549,6 +549,20 @@ pub fn precompute_full_sources(
                 args));
         }
     }
+    // TAM_DBG_SRC_PRECOMP=1: dump every ku_pattern + every fun_sym
+    // considered, so we can verify that precompute generated sources
+    // for the expected function symbols.
+    if std::env::var("TAM_DBG_SRC_PRECOMP").is_ok() {
+        eprintln!("[src_precomp] msig.fun_syms ({} entries):", msig.fun_syms.len());
+        for sym in &msig.fun_syms {
+            eprintln!("  fun_sym: {:?}", sym);
+        }
+        eprintln!("[src_precomp] generated {} ku_patterns:", ku_patterns.len());
+        for (i, pat) in ku_patterns.iter().enumerate() {
+            let s = format!("{:?}", pat).chars().take(160).collect::<String>();
+            eprintln!("  ku[{}]: {}", i, s);
+        }
+    }
     for pat in ku_patterns {
         let ku_fact = crate::fact::ku_fact(pat.clone());
         let goal = Goal::Action(goal_node.clone(), ku_fact.clone());
@@ -4749,6 +4763,7 @@ pub fn solve_with_source_cases_action(
 /// rule-eqs. When `None`, falls back to the legacy graft (preserves
 /// older behaviour for callers that don't have a context — e.g.
 /// saturate-time helpers).
+#[track_caller]
 pub fn solve_with_source_cases_action_with_ctx(
     sources: &[Source],
     sys: &System,
@@ -4774,23 +4789,61 @@ pub fn solve_with_source_cases_action_with_ctx(
         eprintln!("[src_case] solve_with_source_cases CALLED for live={}", live_str);
     }
 
+    // TAM_DBG_SRC_MATCH=1: dump each source pattern + match decision
+    // for HS↔Rust diffing of source-case selection.
+    let dbg_match = std::env::var("TAM_DBG_SRC_MATCH").is_ok();
+    if dbg_match {
+        let live_str = format!("{:?}", m_live).chars().take(160).collect::<String>();
+        let caller = std::panic::Location::caller();
+        eprintln!("[src_match] looking for source matching live={} from {}:{}",
+                  live_str, caller.file(), caller.line());
+        for (i, s) in sources.iter().enumerate() {
+            if let Goal::Action(_, gfa) = &s.goal {
+                let pat_str = format!("{:?}", gfa).chars().take(160).collect::<String>();
+                eprintln!("  src[{}] tag={:?}.{} pat={}",
+                    i, gfa.tag, gfa.terms.len(), pat_str);
+            } else {
+                eprintln!("  src[{}] non-Action goal: {:?}", i, s.goal);
+            }
+        }
+    }
     // Find a source whose abstract pattern matches `m_live`.
     let src = sources.iter().find(|s| match &s.goal {
         Goal::Action(_, gfa) => {
             if gfa.tag != FactTag::Ku || gfa.terms.len() != 1 {
+                if dbg_match {
+                    eprintln!("  → reject (tag/arity): tag={:?} arity={}",
+                              gfa.tag, gfa.terms.len());
+                }
                 return false;
             }
             let pat = &gfa.terms[0];
-            match (pat, m_live) {
+            let result = match (pat, m_live) {
                 (Term::Lit(Lit::Var(pv)), _) => {
                     let live_sort = sort_of_lnterm(m_live);
-                    sort_ge(pv.sort, live_sort)
+                    let ok = sort_ge(pv.sort, live_sort);
+                    if dbg_match {
+                        eprintln!("  → var-pat: pat_sort={:?} live_sort={:?} sort_ge={}",
+                                  pv.sort, live_sort, ok);
+                    }
+                    ok
                 }
                 (Term::App(pf, pargs), Term::App(lf, largs)) => {
-                    pf == lf && pargs.len() == largs.len()
+                    let ok = pf == lf && pargs.len() == largs.len();
+                    if dbg_match {
+                        eprintln!("  → app-app: pf==lf={} args_match={}",
+                                  pf == lf, pargs.len() == largs.len());
+                    }
+                    ok
                 }
-                _ => false,
-            }
+                _ => {
+                    if dbg_match {
+                        eprintln!("  → reject: pat is Lit/App mismatch with live");
+                    }
+                    false
+                }
+            };
+            result
         }
         _ => false,
     })?;

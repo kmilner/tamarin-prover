@@ -3753,9 +3753,17 @@ impl<'ctx> Reduction<'ctx> {
                 // "useful" — `solveAllSafeGoals` dispatches them via
                 // `solveWithSourceAndReturn` at BOTH saturate and
                 // runtime.  Skipped only during HS's `initialSource`.
-                if !crate::constraint::solver::sources::in_initial_source_cases()
+                let src_dispatch_ok = !crate::constraint::solver::sources::in_initial_source_cases()
                     && matches!(fa.tag, crate::fact::FactTag::Ku)
-                    && !self.ctx.full_sources.is_empty()
+                    && !self.ctx.full_sources.is_empty();
+                if std::env::var("TAM_DBG_SAG_SOURCE_GATE").is_ok() {
+                    eprintln!("[sag-gate] tag={:?} src_dispatch_ok={} in_initial_source_cases={} ku={} full_sources_empty={}",
+                        fa.tag, src_dispatch_ok,
+                        crate::constraint::solver::sources::in_initial_source_cases(),
+                        matches!(fa.tag, crate::fact::FactTag::Ku),
+                        self.ctx.full_sources.is_empty());
+                }
+                if src_dispatch_ok
                 {
                     let avoid_max = bounds_max(&self.sys);
                     if let Some(case_pairs) = crate::constraint::solver::sources::solve_with_source_cases_action_with_ctx(
