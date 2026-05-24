@@ -173,24 +173,14 @@ pub fn prove_lemma(
             typing_assumptions.push(rg);
         }
     }
-    // HS-faithful lazy refinement: store typing assumptions on the
-    // ctx; `ensure_saturated` applies `refine_with_source_asms` AFTER
-    // its own saturate, both deferred to first source-case access.
-    // This keeps `prove_lemma`'s setup silent (no saturate traces
-    // emitted upfront) so the lemma proof's first `[EXEC]
-    // simplifySystem` appears at the trace's head — matching HS's
-    // proof-then-saturate-on-demand ordering.
+    // HS-faithful saturation: store typing assumptions, then eagerly
+    // run `ensure_saturated` (which applies `refine_with_source_asms`
+    // with the assumptions just set).  This matches HS's
+    // `refineWithSourceAsms` call site emitting `[Saturating Sources]
+    // Done` at theory-close time — Rust does it per-lemma because the
+    // ctx is per-lemma.
     ctx.typing_assumptions = typing_assumptions;
-    // TAM_RS_EAGER_SATURATE=1: force saturation NOW (after assumptions
-    // are set, matching HS's `[Saturating Sources] Done` timing at the
-    // refineWithSourceAsms call site).  Lazy still fires on first
-    // Source::cases() call if env not set.  Wiring this here rather
-    // than at ctx setup ensures `refine_with_source_asms` actually
-    // runs — at ctx setup `typing_assumptions` is empty so refine is
-    // skipped, leaving the "Responder" recursive cases un-pruned.
-    if std::env::var("TAM_RS_EAGER_SATURATE").is_ok() {
-        ctx.ensure_saturated();
-    }
+    ctx.ensure_saturated();
     if trace { eprintln!("[phase] run_proof_search start"); }
     // Permanent phase marker so TAM_RS_DBG_* counts can be filtered
     // to the lemma-proof phase only.  Pair with HS's

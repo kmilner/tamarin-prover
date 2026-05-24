@@ -589,19 +589,13 @@ impl ProofContext {
         // they only fire when a lemma proof forces a source's cases
         // via pattern-matching on its `cdCases` (HS-faithful).
         ctx.full_sources = raw_sources;
-        // HS-faithfulness note: HS emits `[Saturating Sources] Done`
-        // at theory-close time, but only AFTER refineWithSourceAsms
-        // has been applied with the lemma-specific typing_assumptions.
-        // Rust defers saturation via lazy ensure_saturated (triggered
-        // on first `Source::cases(ctx)` call from inside the lemma
-        // proof, AFTER `prove_lemma` assigns ctx.typing_assumptions).
-        //
-        // Eager saturate at THIS point (ctx setup) would skip
-        // refine_with_source_asms entirely because typing_assumptions
-        // is empty — leaving cases un-refined and the lemma proof
-        // exploring "Responder" cases that HS's refined sources prune
-        // (Responder_secrecy: 53 → 4080 lines).  TAM_RS_EAGER_SATURATE
-        // is now wired in prove.rs AFTER typing_assumptions is set.
+        // No saturation here — `ctx.full_sources` holds unsaturated
+        // raw sources.  `prove_lemma` calls `ctx.ensure_saturated()`
+        // AFTER assigning `ctx.typing_assumptions` so that
+        // `refine_with_source_asms` runs with the lemma's [sources]
+        // assumptions in hand.  Matches HS's `refineWithSourceAsms`
+        // timing where `[Saturating Sources] Done` fires after
+        // assumptions are applied.
         // No post-saturate drop pass — Haskell doesn't have one.
         // Haskell relies on saturate-time `contradictoryIf` inside
         // `solveAllSafeGoals` (Sources.hs:118-133) + runtime

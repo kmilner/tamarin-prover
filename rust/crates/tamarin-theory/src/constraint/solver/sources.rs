@@ -174,11 +174,12 @@ impl Source {
         Source::eager(goal, Vec::new(), false)
     }
 
-    /// Materialise + return the cases.  HS-faithful: the first call
-    /// triggers `ProofContext::ensure_saturated` (which runs
-    /// `precompute_full_sources` + `saturate_sources_with_chain_fold`
-    /// once per ctx), then reads the cached value.  Subsequent calls
-    /// return the cached value directly.
+    /// Materialise + return the cases.  `prove_lemma` runs
+    /// `ProofContext::ensure_saturated` eagerly before any lemma proof
+    /// starts, so the cached value is normally already populated.
+    /// The defensive `ensure_saturated()` call below is idempotent
+    /// (state machine returns immediately when Done) and handles
+    /// odd code paths that bypass `prove_lemma` (tests, probes).
     ///
     /// Returns by-value (`Vec<…>`) rather than `&Vec<…>` because the
     /// cell is a `Mutex` and we can't hold the lock for the caller's
