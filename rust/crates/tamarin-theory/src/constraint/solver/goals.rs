@@ -35,6 +35,84 @@ pub fn open_goals(sys: &System) -> Vec<AnnotatedGoal> {
     out
 }
 
+/// Render a `Disj<Guarded>` in a form whose lexicographic compare
+/// matches HS's derived `Ord (Disj LNGuarded)` (which bottoms out at
+/// `Ord LVar = idx <> sort <> name` per May-20).  Default `Debug` puts
+/// `name` first so string compare disagrees with LVar Ord at the
+/// first var that differs.  See `goal_cmp` Disj arm for use.
+fn guarded_canon_idx_first(d: &crate::constraint::constraints::Disj<crate::guarded::Guarded>) -> String {
+    fn render_guarded(g: &crate::guarded::Guarded, out: &mut String) {
+        use crate::guarded::Guarded;
+        match g {
+            Guarded::Atom(a) => { out.push_str("A:"); render_atom(a, out); }
+            Guarded::Conj(items) => {
+                out.push('&');
+                for it in items { render_guarded(it, out); out.push('|'); }
+            }
+            Guarded::Disj(items) => {
+                out.push('|');
+                for it in items { render_guarded(it, out); out.push('|'); }
+            }
+            Guarded::GGuarded { qua, vars, guards, body } => {
+                out.push_str(&format!("{:?}{}", qua, vars.len()));
+                for g in guards { render_atom(g, out); }
+                render_guarded(body, out);
+            }
+        }
+    }
+    fn render_atom(a: &tamarin_parser::ast::Atom, out: &mut String) {
+        use tamarin_parser::ast::Atom;
+        match a {
+            Atom::Eq(s, t) => { out.push_str("E"); render_term(s, out); render_term(t, out); }
+            Atom::Less(s, t) => { out.push_str("L"); render_term(s, out); render_term(t, out); }
+            Atom::LessMset(s, t) => { out.push_str("M"); render_term(s, out); render_term(t, out); }
+            Atom::Subterm(s, t) => { out.push_str("S"); render_term(s, out); render_term(t, out); }
+            Atom::Last(s) => { out.push_str("La"); render_term(s, out); }
+            Atom::Action(f, t) => {
+                out.push_str(&format!("Ac{}/{}", f.name, f.args.len()));
+                for arg in &f.args { render_term(arg, out); }
+                render_term(t, out);
+            }
+            Atom::Pred(f) => { out.push_str(&format!("P{}", f.name)); }
+        }
+    }
+    fn render_term(t: &tamarin_parser::ast::Term, out: &mut String) {
+        use tamarin_parser::ast::Term;
+        match t {
+            // idx FIRST, then sort, then name — mirrors LVar Ord.
+            Term::Var(v) => out.push_str(&format!("v{}-{:?}-{}", v.idx, v.sort, v.name)),
+            Term::App(name, args) => {
+                out.push_str(&format!("a{}/{}", name, args.len()));
+                for arg in args { render_term(arg, out); }
+            }
+            Term::Pair(items) => {
+                out.push_str(&format!("p/{}", items.len()));
+                for it in items { render_term(it, out); }
+            }
+            Term::AlgApp(name, a, b) => {
+                out.push_str(&format!("g{}", name));
+                render_term(a, out); render_term(b, out);
+            }
+            Term::Diff(a, b) => { out.push('d'); render_term(a, out); render_term(b, out); }
+            Term::BinOp(op, a, b) => { out.push_str(&format!("b{:?}", op)); render_term(a, out); render_term(b, out); }
+            Term::PubLit(s) => out.push_str(&format!("PL{}", s)),
+            Term::FreshLit(s) => out.push_str(&format!("FL{}", s)),
+            Term::NatLit(s) => out.push_str(&format!("NL{}", s)),
+            Term::Number(n) => out.push_str(&format!("N{}", n)),
+            Term::NumberOne => out.push_str("N1"),
+            Term::NatOne => out.push_str("Na1"),
+            Term::DhNeutral => out.push_str("Dh"),
+            Term::PatMatch(t) => { out.push('m'); render_term(t, out); }
+        }
+    }
+    let mut out = String::new();
+    for g in &d.0 {
+        render_guarded(g, &mut out);
+        out.push('#');
+    }
+    out
+}
+
 /// Manual structural compare on `Goal`, mirroring Haskell's derived
 /// `Ord Goal` (Constraints.hs:155-168).  Variant tags follow Haskell
 /// declaration order:
@@ -69,8 +147,16 @@ pub(crate) fn goal_cmp(a: &Goal, b: &Goal) -> std::cmp::Ordering {
             (&pa.0, pa.1.0).cmp(&(&pb.0, pb.1.0))
                 .then_with(|| fa.cmp(fb)),
         (Goal::Disj(da), Goal::Disj(db)) => {
+            // HS-faithful: derived `Ord (Disj LNGuarded)` is structural
+            // and bottoms out at `Ord LVar`, which (per the May-20 LVar
+            // Ord change) is `idx <> sort <> name` — IDX-FIRST.
+            // Plain `Debug` would compare on `name` first because the
+            // `Debug` impl renders `VarSpec { name: ..., idx: ... }`
+            // with `name` lexicographically before `idx`.
+            // Build a render that puts idx first so string compare
+            // matches LVar Ord.
             da.0.len().cmp(&db.0.len()).then_with(||
-                format!("{:?}", da).cmp(&format!("{:?}", db)))
+                guarded_canon_idx_first(da).cmp(&guarded_canon_idx_first(db)))
         }
         (Goal::Subterm((sa, ta_)), Goal::Subterm((sb, tb_))) =>
             sa.cmp(sb).then_with(|| ta_.cmp(tb_)),
@@ -129,10 +215,32 @@ pub fn rank_goals_with(
     // predicates that depend on system state — split_size,
     // source-cache one-case — can borrow `sys` / `ctx`.
     type Pred<'a> = Box<dyn Fn(&AnnotatedGoal) -> bool + 'a>;
-    let one_case_syms: std::collections::BTreeSet<Vec<u8>> = match ctx {
-        Some(c) => collect_one_case_syms(c),
-        None => Default::default(),
-    };
+    // HS-faithful lazy: `smartRanking`'s `oneCaseOnly = catMaybes . map
+    // getMsgOneCase . L.get pcSources $ ctxt` is a thunk that only
+    // forces when an `isMsgOneCaseGoal` predicate fires.  That predicate
+    // returns False instantly for non-KU goals (`msgPremise` returns
+    // Nothing).  So if NO goal in the current list is a KU action goal,
+    // the thunk is never forced — and HS's `cdCases` thunks for
+    // FApp-headed KU sources stay unforced too, deferring saturate
+    // traces until the first KU goal appears.
+    //
+    // Replicate by only computing `one_case_syms` when at least one
+    // goal in `goals` is a KU action goal.  Otherwise pass an empty
+    // set — `is_msg_one_case_goal` returns False unconditionally.
+    let any_ku_action_goal = goals.iter().any(|a| {
+        use crate::constraint::constraints::Goal;
+        use crate::fact::FactTag;
+        matches!(&a.goal, Goal::Action(_, fa) if matches!(fa.tag, FactTag::Ku))
+    });
+    let one_case_syms: std::collections::BTreeSet<Vec<u8>> =
+        if any_ku_action_goal {
+            match ctx {
+                Some(c) => collect_one_case_syms(c),
+                None => Default::default(),
+            }
+        } else {
+            Default::default()
+        };
     let solve_first: Vec<Pred> = vec![
         Box::new(is_chain_goal),
         Box::new(is_disj_goal),
@@ -162,6 +270,34 @@ pub fn rank_goals_with(
     goals.sort_by_key(|a| tag_usefulness(a.usefulness));
     // 5. moveNatToEnd — Nat subterm splits to back.
     goals.sort_by_key(|a| is_nat_subterm_split(&a.goal));
+    // 6. HS-faithful Set-ordering tie-break for Disj goals: HS's
+    // `openGoals` (Goals.hs:68) iterates `M.toList $ get sGoals sys`,
+    // a Map keyed by Goal — so the FIRST Disj returned (after the
+    // smartRanking predicates pick Disj as the goal-class) is the
+    // structurally-smallest Disj per `Ord Goal`.  Rust's `sys.goals`
+    // is a Vec preserving insertion order, so without this tie-break
+    // we pick the "first-inserted" Disj where HS picks the
+    // "structurally-smallest" Disj.  Implementation: extract Disj
+    // entries, sort them by `goal_cmp`, then put them back at their
+    // original positions (Action/Premise/Chain entries are untouched).
+    // This preserves the smartRanking order across goal classes while
+    // breaking ties within Disjs by structural Ord.
+    {
+        let mut disj_positions: Vec<usize> = goals.iter().enumerate()
+            .filter(|(_, a)| matches!(a.goal, Goal::Disj(_)))
+            .map(|(i, _)| i)
+            .collect();
+        if disj_positions.len() >= 2 {
+            // Stable sort the Disj indices by goal_cmp of their content.
+            let mut disj_entries: Vec<AnnotatedGoal> = disj_positions.iter()
+                .map(|&i| goals[i].clone()).collect();
+            disj_entries.sort_by(|a, b| goal_cmp(&a.goal, &b.goal));
+            // Write back in-place.
+            for (slot, entry) in disj_positions.drain(..).zip(disj_entries) {
+                goals[slot] = entry;
+            }
+        }
+    }
     if std::env::var("TAM_RANK_DBG").is_ok() {
         for (i, a) in goals.iter().take(6).enumerate() {
             let g_str = format!("{:?}", a.goal).chars().take(160).collect::<String>();
@@ -229,16 +365,32 @@ fn collect_one_case_syms(
     use tamarin_term::term::Term;
     let mut out = std::collections::BTreeSet::new();
     for src in &ctx.full_sources {
-        if src.cases.len() != 1 { continue; }
+        // HS-faithful order — `smartRanking.getMsgOneCase`
+        // (ProofMethod.hs:1207-1210) pattern-matches on `cdGoal` BEFORE
+        // touching `cdCases`:
+        //
+        //   getMsgOneCase cd = case msgPremise (L.get cdGoal cd) of
+        //     Just (viewTerm -> FApp o _)
+        //       | length (getDisj (L.get cdCases cd)) == 1 -> Just o
+        //     _                                            -> Nothing
+        //
+        // So Var-headed sources (e.g. `KU(t:Fresh)`) never force
+        // `cdCases`.  Previously we checked `src.cases.len() != 1`
+        // first, which forced the lazy thunk on every source and
+        // emitted spurious precompute `[EXEC] solveGoal ...` lines
+        // for sources HS would never compute.
+        //
         // Only KU-headed source goals.
         let term: &tamarin_term::lterm::LNTerm = match &src.goal {
             G::Action(_, fa) | G::Premise(_, fa) if matches!(fa.tag, FactTag::Ku) =>
                 match fa.terms.first() { Some(t) => t, None => continue },
             _ => continue,
         };
-        if let Term::App(FunSym::NoEq(s), _) = term {
-            out.insert(s.name.clone());
-        }
+        let Term::App(FunSym::NoEq(s), _) = term else { continue };
+        // Now we know the goal is `KU(FApp o _)` — HS-faithful: force
+        // cases at this point to check the disjunct count.
+        if src.cases(ctx).len() != 1 { continue; }
+        out.insert(s.name.clone());
     }
     out
 }
@@ -926,6 +1078,46 @@ pub fn dispatch_solve_goal(
     // its abstract Loop goal open, which then triggered another graft
     // iteration adding a duplicate Check0 node (task #222).
     red.mark_goal_as_solved(g);
+    // HS-faithful `solve goal = maybe (solveGoal goal) ...
+    // (solveWithSource ctxt ths goal)` (ProofMethod.hs:467-470).
+    // HS tries source-case dispatch FIRST; only if it returns
+    // `Nothing` does it fall back to `solveGoal` (which emits the
+    // `traceExecM ("solveGoal " ++ goalKind goal)` line).  Mirror
+    // here for `Premise` goals: try `solve_with_source_cases_ctx`,
+    // and if it returns `Some(cases)`, return them directly without
+    // emitting the `solveGoal kind=Premise fact=...` trace.
+    //
+    // Limited to `Premise` goals for now (HS uses `solveWithSource`
+    // for both Action-KU and Premise; we leave Action to its
+    // existing inner source-case path pending further audit).
+    if let Goal::Premise(p, fa) = g {
+        // HS-faithful (Sources.hs:202-206): `solveAllSafeGoals` only
+        // calls `solveWithSourceAndReturn` on "useful" goals (KU
+        // actions), routing safe goals (Premise) through `solveGoal`
+        // directly.  At runtime (`ProofMethod.solve` line 467-470),
+        // dispatch fires for any goal.  Gate Premise dispatch on
+        // `!in_precompute_mode()` so saturate skips it.
+        if !crate::constraint::solver::sources::in_precompute_mode()
+            && !red.ctx.full_sources.is_empty()
+        {
+            if let Some(case_pairs) = crate::constraint::solver::sources::solve_with_source_cases_ctx(
+                red.ctx,
+                &red.ctx.full_sources,
+                &red.sys,
+                &p.0, p.1, fa,
+            ) {
+                use crate::constraint::solver::reduction::GoalCases;
+                if !case_pairs.is_empty() {
+                    if case_pairs.len() == 1 {
+                        let (name, sys) = case_pairs.into_iter().next().unwrap();
+                        red.sys = sys;
+                        return GoalCases::LinearNamed(name);
+                    }
+                    return GoalCases::Cases(case_pairs);
+                }
+            }
+        }
+    }
     // TAM_RS_TRACE_EXEC mirror of Haskell `solveGoal` `T.traceExecM`
     // (Goals.hs:206).  Same canonical-data form as the Haskell side so
     // the two outputs diff cleanly.
