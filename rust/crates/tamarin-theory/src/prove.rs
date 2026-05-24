@@ -181,6 +181,16 @@ pub fn prove_lemma(
     // simplifySystem` appears at the trace's head — matching HS's
     // proof-then-saturate-on-demand ordering.
     ctx.typing_assumptions = typing_assumptions;
+    // TAM_RS_EAGER_SATURATE=1: force saturation NOW (after assumptions
+    // are set, matching HS's `[Saturating Sources] Done` timing at the
+    // refineWithSourceAsms call site).  Lazy still fires on first
+    // Source::cases() call if env not set.  Wiring this here rather
+    // than at ctx setup ensures `refine_with_source_asms` actually
+    // runs — at ctx setup `typing_assumptions` is empty so refine is
+    // skipped, leaving the "Responder" recursive cases un-pruned.
+    if std::env::var("TAM_RS_EAGER_SATURATE").is_ok() {
+        ctx.ensure_saturated();
+    }
     if trace { eprintln!("[phase] run_proof_search start"); }
     // Permanent phase marker so TAM_RS_DBG_* counts can be filtered
     // to the lemma-proof phase only.  Pair with HS's
