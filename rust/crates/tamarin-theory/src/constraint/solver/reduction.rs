@@ -28,6 +28,14 @@ use crate::rule::RuleACInst;
 pub struct Reduction<'ctx> {
     pub ctx: &'ctx ProofContext,
     pub sys: System,
+    /// Per-Reduction MaudeHandle: shares Maude's process state with
+    /// `ctx.maude` but carries its own `fresh_counter` initialised from
+    /// `bounds_max(&sys) + 1` at Reduction creation.  Mirrors Haskell's
+    /// `runReduction m ctx sys (avoid sys)` — each runReduction call gets
+    /// its own FreshState that advances within the call but doesn't leak
+    /// across Reductions.  Use `self.maude` for any fresh-idx allocation
+    /// inside Reduction methods (so witness allocation patterns match HS).
+    pub maude: tamarin_term::maude_proc::MaudeHandle,
     /// Whether the system has been mutated since the last
     /// `whileChanging` checkpoint.
     pub changed: ChangeIndicator,
@@ -50,7 +58,18 @@ impl ChangeIndicator {
 
 impl<'ctx> Reduction<'ctx> {
     pub fn new(ctx: &'ctx ProofContext, sys: System) -> Self {
-        Reduction { ctx, sys, changed: ChangeIndicator::Unchanged }
+        // HS-faithful per-Reduction Fresh counter: init from
+        // `bounds_max(sys) + 1`.  Matches `runReduction m ctx sys (avoid sys)`
+        // in HS where `avoid t = maybe 0 (succ . snd) . boundsVarIdx`.
+        let avoid_max = bounds_max(&sys);
+        let maude = ctx.maude.with_fresh_counter_from(avoid_max);
+        // Ensure the GLOBAL ctx.maude is at least as advanced as our
+        // local high-water start.  Any non-Reduction allocator
+        // (`sources.rs`, etc.) that subsequently uses `ctx.maude` will
+        // then start above our base, preventing cross-allocator
+        // collisions on names like `~mw` that both routes mint.
+        ctx.maude.ensure_above(avoid_max);
+        Reduction { ctx, sys, maude, changed: ChangeIndicator::Unchanged }
     }
 
     /// Run a reduction step until it stops mutating the system. The
@@ -411,7 +430,7 @@ impl<'ctx> Reduction<'ctx> {
         // `reduce` would close it.  We normalise here so the matched
         // action terms are in canonical form before
         // `insert_implied_formulas_pass` fires the body.
-        let maude = self.ctx.maude.clone();
+        let maude = self.maude.clone();
         let normalize_term = |t: tamarin_term::lterm::LNTerm| -> tamarin_term::lterm::LNTerm {
             maude.reduce(&t).unwrap_or(t)
         };
@@ -599,7 +618,7 @@ impl<'ctx> Reduction<'ctx> {
         let apply_term = |t: tamarin_term::lterm::LNTerm|
             -> tamarin_term::lterm::LNTerm {
             let substed = tamarin_term::subst::apply_vterm(&subst, t);
-            self.ctx.maude.reduce(&substed).unwrap_or(substed)
+            self.maude.reduce(&substed).unwrap_or(substed)
         };
         let mut new_goals: Vec<(Goal, crate::constraint::system::GoalStatus)>
             = Vec::with_capacity(goals.len());
@@ -914,7 +933,7 @@ impl<'ctx> Reduction<'ctx> {
         let mut folded;
         if !self.sys.eq_store.subst.is_empty() {
             let empty_subst = tamarin_term::subst::Subst::empty();
-            let _ = self.sys.eq_store.apply_eq_store(&self.ctx.maude, &empty_subst);
+            let _ = self.sys.eq_store.apply_eq_store(&self.maude, &empty_subst);
         }
         // Haskell-faithful: ALWAYS run simp after add_disj.  Mirrors
         // `setM sEqStore =<< simp hnd (const (const False)) eqs` at the
@@ -951,7 +970,7 @@ impl<'ctx> Reduction<'ctx> {
                 l.larger.for_each_free(&mut visit);
             }
             if let Some(la) = &self.sys.last_atom { la.for_each_free(&mut visit); }
-            let maude = self.ctx.maude.clone();
+            let maude = self.maude.clone();
             let store = std::mem::take(&mut self.sys.eq_store);
             self.sys.eq_store = store.simp_with_fresh_avoiding(
                 |_, _| false,
@@ -1160,7 +1179,7 @@ impl<'ctx> Reduction<'ctx> {
                 // insertion.  This matches Haskell's behaviour exactly
                 // for the EqE case — which is the only path where
                 // user-rewrite-rule normalisation gates the proof.
-                let maude = self.ctx.maude.clone();
+                let maude = self.maude.clone();
                 let tx = maude.reduce(&tx).unwrap_or(tx);
                 let ty = maude.reduce(&ty).unwrap_or(ty);
                 // Haskell `insertAtom (EqE x y) = void (solveTermEqs
@@ -1612,7 +1631,7 @@ impl<'ctx> Reduction<'ctx> {
 impl<'ctx> Reduction<'ctx> {
     pub fn get_proof_context(&self) -> &ProofContext { self.ctx }
     pub fn get_maude_handle(&self) -> &tamarin_term::maude_proc::MaudeHandle {
-        &self.ctx.maude
+        &self.maude
     }
 }
 
@@ -1659,7 +1678,7 @@ impl<'ctx> Reduction<'ctx> {
 
         // Take eq_store out of self, mutate it, put it back, then
         // borrow Maude — this avoids overlapping borrows of self.
-        let maude = self.ctx.maude.clone();
+        let maude = self.maude.clone();
         // Pass the system-wide max idx so Maude witnesses get renamed
         // above ANY existing variable in the system (not just in the
         // eq-store).  Without this, witnesses collide with rule vars,
@@ -3593,8 +3612,8 @@ impl<'ctx> Reduction<'ctx> {
         // into the system without being re-freshed.  `freshen_rule` and
         // `freshen_witness_range` already use this pattern.
         let bm = bounds_max(&self.sys);
-        self.ctx.maude.ensure_above(bm);
-        self.ctx.maude.fresh_idx()
+        self.maude.ensure_above(bm);
+        self.maude.fresh_idx()
     }
 
     /// `solveAction` — port of the Action arm of `solveGoal`.
@@ -3972,7 +3991,7 @@ impl<'ctx> Reduction<'ctx> {
                         // `rename` over the whole (rule, constrs) pair
                         // via `fmap extractInsts . rename`.
                         let (renamed, renamed_constrs) = freshen_rule_with_constrs(
-                            rule.clone(), constrs.clone(), avoid_max, &self.ctx.maude);
+                            rule.clone(), constrs.clone(), avoid_max, &self.maude);
                         let act = renamed.actions[act_idx].clone();
                         if act.tag != fa.tag || act.terms.len() != fa.terms.len() {
                             continue;
@@ -4168,7 +4187,7 @@ impl<'ctx> Reduction<'ctx> {
             ) {
                 let mut out: Vec<(String, crate::constraint::system::System)> = Vec::new();
                 for (case_name, mut sys) in case_pairs {
-                    if has_fresh_consumer_conflation(&sys, &self.ctx.maude) {
+                    if has_fresh_consumer_conflation(&sys, &self.maude) {
                         continue;
                     }
                     sys.used_sources.push(case_name.clone());
@@ -4231,7 +4250,7 @@ impl<'ctx> Reduction<'ctx> {
             // `insertEdges n=1`.  Tag-mismatched conclusions mzero in
             // solveFactEqs but still emit their insertEdges trace.
             let (renamed, renamed_constrs) = freshen_rule_with_constrs(
-                rule.clone(), constrs.clone(), avoid_max, &self.ctx.maude);
+                rule.clone(), constrs.clone(), avoid_max, &self.maude);
             let case_name = rule_case_name(&renamed);
             let new_node = tamarin_term::lterm::LVar::new(
                 "vr",
@@ -4431,7 +4450,7 @@ impl<'ctx> Reduction<'ctx> {
             for ir in &self.ctx.intruder_rules {
                 if !crate::rule::is_destr_rule_info(&ir.info) { continue; }
                 let ru_inst = intr_rule_to_rule_ac_inst(ir.clone());
-                let ru_renamed = freshen_rule(ru_inst, avoid_max, &self.ctx.maude);
+                let ru_renamed = freshen_rule(ru_inst, avoid_max, &self.maude);
                 // HS-faithful `labelNodeId` (Reduction.hs:219-225) — when
                 // the chain conc's rule (parent) shares a name with this
                 // destructor and still has > 1 remaining applications,
@@ -4671,7 +4690,7 @@ impl<'ctx> Reduction<'ctx> {
         // maybe-non-NF subterm in the system produces a non-NF term.
         // Critical for SplitG variant filtering (e.g. drop verify=sign(...)
         // variants against a live Eq(verify, true) restriction).
-        let maude = self.ctx.maude.clone();
+        let maude = self.maude.clone();
         let sys_snapshot = self.sys.clone();
         let has_reducible = !maude.maude_sig().reducible_fun_syms.is_empty()
             && std::env::var("TAM_DISABLE_SUBST_NF").is_err();

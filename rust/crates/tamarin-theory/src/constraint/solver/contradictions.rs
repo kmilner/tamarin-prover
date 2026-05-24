@@ -1054,9 +1054,9 @@ mod tests {
         };
 
         // Build a system with two nodes, each containing an action
-        // using "~mw" at idx 58 but with conflicting sorts: Pub vs Fresh.
-        let pub_var = LVar::new("~mw", LSort::Pub, 58);
-        let fresh_var = LVar::new("~mw", LSort::Fresh, 58);
+        // using "x" at idx 58 but with conflicting sorts: Pub vs Fresh.
+        let pub_var = LVar::new("x", LSort::Pub, 58);
+        let fresh_var = LVar::new("x", LSort::Fresh, 58);
         let tag = FactTag::Proto(Multiplicity::Linear, "X".to_string(), 1);
         let pub_term = tamarin_term::term::Term::Lit(
             tamarin_term::vterm::Lit::Var(pub_var.clone()));
@@ -1091,8 +1091,8 @@ mod tests {
             Rule, ProtoRuleACInstInfo, ProtoRuleName, RuleAttributes,
             RuleInfo, IntrRuleACInfo, RuleACInst,
         };
-        let pub_var = LVar::new("~mw", LSort::Pub, 58);
-        let msg_var = LVar::new("~mw", LSort::Msg, 58);
+        let pub_var = LVar::new("x", LSort::Pub, 58);
+        let msg_var = LVar::new("x", LSort::Msg, 58);
         let tag = FactTag::Proto(Multiplicity::Linear, "X".to_string(), 1);
         let mk = |name: &str, t| -> RuleACInst {
             Rule::new(

@@ -587,7 +587,7 @@ pub fn subst_renaming(name: String, old_idx: u64, new_idx: u64,
 /// bypass `Vec::contains`, causing solved_formulas to grow without
 /// bound and the simplify loop to never converge.
 ///
-/// We touch ONLY witness vars (name == "~mw") — every other LVar
+/// We touch ONLY witness vars (name == "x") — every other LVar
 /// (real protocol vars, distinct named fresh values) keeps its
 /// identity, so the dedup doesn't over-merge legitimately-distinct
 /// implications.
@@ -861,7 +861,7 @@ fn collect_witness_vars_term(t: &p::Term, out: &mut VarSubst) {
     use p::Term;
     match t {
         Term::Var(v) => {
-            if v.name == "~mw" {
+            if v.name == "x" {
                 let canonical = p::VarSpec {
                     name: v.name.clone(),
                     idx: 0,                  // canonical idx

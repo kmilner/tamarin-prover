@@ -1174,7 +1174,7 @@ fn saturate_sources_inner_with_options(
                                         // faithful: narrowing produces a
                                         // binding `lv → cv` (Msg→Fresh)
                                         // without synthesizing new LVars.
-                                        let use_cv_name = (lv.name == "~mw" && cv.name != "~mw")
+                                        let use_cv_name = (lv.name == "x" && cv.name != "x")
                                             || lv.sort != s;
                                         let canonical = if use_cv_name {
                                             tamarin_term::lterm::LVar {
