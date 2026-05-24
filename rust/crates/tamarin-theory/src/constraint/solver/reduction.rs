@@ -427,12 +427,24 @@ impl<'ctx> Reduction<'ctx> {
         // unification, so downstream restrictions like
         // `Eq_check_succeed` (`All x y. Eq(x,y) ⇒ x=y`) would
         // erroneously contradict `verify(...) = true` even though
-        // `reduce` would close it.  We normalise here so the matched
-        // action terms are in canonical form before
-        // `insert_implied_formulas_pass` fires the body.
+        // `reduce` would close it.  HS-faithful: HS's substSystem
+        // (Reduction.hs:634) does NOT normalise — `normDG` (System.hs:
+        // 1283) runs only inside `impliedOrInitial`.  Normalising here
+        // eagerly reduces e.g. `checksign(sign(m,k), pk(k))` to `m`,
+        // which loses the head shape needed by source-case matching
+        // (test4 lost c_checksign as a candidate).  Worse, the eager
+        // normalise blocked HS's `hasNonNormalTerms` contradiction from
+        // ever firing on a non-normal term shape (Responder_secrecy's
+        // split_case_3/Initiator non-normal contradiction was lost).
+        //
+        // TAM_RS_EAGER_NORMALIZE_SUBST=1 reverts to the prior eager
+        // normalise for diagnostic comparison.
         let maude = self.maude.clone();
+        let eager_normalize = std::env::var("TAM_RS_EAGER_NORMALIZE_SUBST").is_ok();
         let normalize_term = |t: tamarin_term::lterm::LNTerm| -> tamarin_term::lterm::LNTerm {
-            maude.reduce(&t).unwrap_or(t)
+            if eager_normalize {
+                maude.reduce(&t).unwrap_or(t)
+            } else { t }
         };
         let apply_to_fact = |fa: &crate::fact::LNFact| -> crate::fact::LNFact {
             crate::fact::LNFact {
@@ -618,7 +630,9 @@ impl<'ctx> Reduction<'ctx> {
         let apply_term = |t: tamarin_term::lterm::LNTerm|
             -> tamarin_term::lterm::LNTerm {
             let substed = tamarin_term::subst::apply_vterm(&subst, t);
-            self.maude.reduce(&substed).unwrap_or(substed)
+            if eager_normalize {
+                self.maude.reduce(&substed).unwrap_or(substed)
+            } else { substed }
         };
         let mut new_goals: Vec<(Goal, crate::constraint::system::GoalStatus)>
             = Vec::with_capacity(goals.len());
