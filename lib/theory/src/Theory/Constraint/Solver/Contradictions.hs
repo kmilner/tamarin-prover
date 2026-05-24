@@ -93,10 +93,28 @@ contradictorySystem ctxt = not . null . contradictions ctxt
 contradictions :: ProofContext -> System -> [Contradiction]
 contradictions ctxt sys =
   let res = contradictionsRaw ctxt sys
-  in if hsTraceContra
+      -- TAM_HS_TRACE_CYCLIC=1: when the FIRST check (Cyclic) fires, dump
+      -- the FULL rawLessRel (less atoms + edges + unsolved chains) so we
+      -- can compare HS's reachability graph against Rust's identical
+      -- diagnostic.  Used for /Gen_Stop/Gen_Start divergence diagnosis.
+      cyclicDump c
+        | hsTraceCyclic && c == Cyclic =
+            let lessAts   = S.toList (L.get sLessAtoms sys)
+                edges     = S.toList (L.get sEdges sys)
+                chains    = unsolvedChains sys
+                rawRel    = rawLessRel sys
+                nodeList  = M.toList (L.get sNodes sys)
+            in trace ("[CYCLIC_DUMP] nodes=" ++ show nodeList ++
+                      " less_atoms=" ++ show lessAts ++
+                      " edges=" ++ show edges ++
+                      " unsolved_chains=" ++ show chains ++
+                      " rawLessRel=" ++ show rawRel) ()
+        | otherwise = ()
+  in if hsTraceContra || hsTraceCyclic
        then case res of
               [] -> res
-              (c:_) -> trace ("[CONTRA] kind=" ++ show c ++
+              (c:_) -> cyclicDump c `seq`
+                       trace ("[CONTRA] kind=" ++ show c ++
                               " |sNodes|=" ++ show (M.size (L.get sNodes sys)) ++
                               " |sFormulas|=" ++ show (S.size (L.get sFormulas sys)) ++
                               " gfalse_in_F=" ++ show (S.member gfalse (L.get sFormulas sys)) ++
@@ -107,6 +125,11 @@ hsTraceContra :: Bool
 hsTraceContra = System.IO.Unsafe.unsafePerformIO $
   maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_TRACE"
 {-# NOINLINE hsTraceContra #-}
+
+hsTraceCyclic :: Bool
+hsTraceCyclic = System.IO.Unsafe.unsafePerformIO $
+  maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_TRACE_CYCLIC"
+{-# NOINLINE hsTraceCyclic #-}
 
 contradictionsRaw :: ProofContext -> System -> [Contradiction]
 contradictionsRaw ctxt sys = F.asum

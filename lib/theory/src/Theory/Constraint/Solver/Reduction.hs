@@ -414,7 +414,24 @@ insertAction i fa@(Fact _ ann _) = do
 
 -- | Insert a 'Less' atom. @insertLess i j@ means that *i < j* is added.
 insertLess :: LessAtom -> Reduction ()
-insertLess = modM sLessAtoms . S.insert
+insertLess la = do
+  hsTraceInsertLess la
+  modM sLessAtoms (S.insert la)
+
+-- TAM_HS_TRACE_INSERT_LESS=1: trace every insertLess call.  Reusable
+-- diagnostic for locating where specific LessAtoms (eg. InjectiveFacts)
+-- originate during simplify — paired with Rust's identical hook for
+-- root-causing less-atom divergences.
+hsTraceInsertLess :: LessAtom -> Reduction ()
+hsTraceInsertLess la
+    | hsTraceInsertLessOn =
+        trace ("[INSERT_LESS] " ++ show la) (return ())
+    | otherwise = return ()
+
+hsTraceInsertLessOn :: Bool
+hsTraceInsertLessOn = Unsafe.unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_INSERT_LESS"
+{-# NOINLINE hsTraceInsertLessOn #-}
 
 -- | Insert a 'Subterm' atom. *x ⊏ y* is added to the SubtermStore
 insertSubterm :: LNTerm -> LNTerm -> Reduction ()
@@ -472,6 +489,12 @@ insertFormula = do
           -- Store for later applications of CR-rule *S_∨*
           GDisj disj -> do
               T.traceFormM "Disj" fm
+              when (null (getDisj disj)) $ do
+                  let dbg = Unsafe.unsafePerformIO $
+                        maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_GFALSE"
+                  when dbg $ Debug.Trace.traceM $
+                    "[HS_GFALSE] path=" ++ T.casePathString (Unsafe.unsafePerformIO T.getCasePath)
+                    ++ " gfalse inserted"
               modM sFormulas (S.insert fm)
               insertGoal (DisjG disj) False
 
