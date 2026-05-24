@@ -98,6 +98,7 @@ pub fn combine_behaviour(x: MonotonicBehaviour, y: MonotonicBehaviour) -> Monoto
 /// per pair-leaf.
 pub fn simple_injective_fact_instances(
     rules: &[ProtoRuleE],
+    reducible: &tamarin_term::function_symbols::FunSig,
 ) -> Vec<(FactTag, Vec<MonotonicBehaviour>)> {
     use crate::fact::{LNFact, fact_tag_arity, fact_tag_multiplicity, Multiplicity};
     use MonotonicBehaviour::*;
@@ -163,10 +164,26 @@ pub fn simple_injective_fact_instances(
                     None => continue 'tags,  // not statically injective
                 };
                 // Compare position-by-position (positions ≥ 1).
+                // Mirrors HS `getBehaviour` (InjectiveFactInstances.hs:213-219):
+                //   getBehaviour (t1, t2) | t1 == t2 = Constant
+                //   getBehaviour (t1, t2) | elemNotBelowReducible reducible t1 t2 = StrictlyIncreasing
+                //   getBehaviour (t1, t2) | elemNotBelowReducible reducible t2 t1 = StrictlyDecreasing
+                //   getBehaviour _ = Unstable
+                // (constraints-based case omitted — not used by current callers.)
                 for k in 1..arity {
                     let p_term = match prem.terms.get(k) { Some(x) => x, None => continue 'tags };
                     let c_term = match conc.terms.get(k) { Some(x) => x, None => continue 'tags };
-                    let bh = if p_term == c_term { Constant } else { Unstable };
+                    let bh = if p_term == c_term {
+                        Constant
+                    } else if crate::tools::subterm_store::elem_not_below_reducible(
+                        reducible, p_term, c_term) {
+                        StrictlyIncreasing
+                    } else if crate::tools::subterm_store::elem_not_below_reducible(
+                        reducible, c_term, p_term) {
+                        StrictlyDecreasing
+                    } else {
+                        Unstable
+                    };
                     let i = k - 1;
                     combined[i] = combine_behaviour(combined[i], bh);
                 }
@@ -192,7 +209,7 @@ mod tests {
     #[test]
     fn empty_rules_no_injective_facts() {
         let r: Vec<ProtoRuleE> = Vec::new();
-        assert!(simple_injective_fact_instances(&r).is_empty());
+        assert!(simple_injective_fact_instances(&r, &Default::default()).is_empty());
     }
 
     /// Loop-style rules: `Start: Fr(x) → A(x); Loop: A(x) → A(x); Stop: A(x) → []`.
@@ -225,7 +242,7 @@ mod tests {
             vec![],
         );
         let rules = vec![start, loop_r, stop];
-        let inj = simple_injective_fact_instances(&rules);
+        let inj = simple_injective_fact_instances(&rules, &Default::default());
         assert_eq!(inj.len(), 1);
         assert_eq!(inj[0].0, a_tag);
     }
@@ -254,7 +271,7 @@ mod tests {
             vec![],
         );
         let rules = vec![init, copy];
-        let inj = simple_injective_fact_instances(&rules);
+        let inj = simple_injective_fact_instances(&rules, &Default::default());
         assert_eq!(inj.len(), 1);
         assert_eq!(inj[0].0, s_tag);
         assert_eq!(inj[0].1.len(), 1);
@@ -278,7 +295,7 @@ mod tests {
             vec![b_fact.clone()],
             vec![],
         );
-        assert!(simple_injective_fact_instances(&[weird]).is_empty());
+        assert!(simple_injective_fact_instances(&[weird], &Default::default()).is_empty());
     }
 
     // =========================================================================
@@ -332,7 +349,7 @@ mod tests {
             vec![],
         );
 
-        let inj = simple_injective_fact_instances(&[step1, step2]);
+        let inj = simple_injective_fact_instances(&[step1, step2], &Default::default());
         assert!(inj.is_empty(),
             "St is created in Step1, consumed in Step2, but NO single rule \
              has St in both prems and concs → must NOT be marked injective. \
@@ -361,7 +378,7 @@ mod tests {
             vec![p_fact.clone()],
             vec![],
         );
-        let inj = simple_injective_fact_instances(&[r]);
+        let inj = simple_injective_fact_instances(&[r], &Default::default());
         assert!(inj.is_empty(),
             "Persistent facts are never injective (Haskell: \
              `factTagMultiplicity tag == Linear` guard)");
@@ -384,7 +401,7 @@ mod tests {
             vec![z_fact.clone()],
             vec![],
         );
-        let inj = simple_injective_fact_instances(&[r]);
+        let inj = simple_injective_fact_instances(&[r], &Default::default());
         assert!(inj.is_empty(),
             "Arity-0 facts have no behaviour to track → never injective");
     }
@@ -405,7 +422,7 @@ mod tests {
             vec![out_fact.clone()],
             vec![],
         );
-        let inj = simple_injective_fact_instances(&[r]);
+        let inj = simple_injective_fact_instances(&[r], &Default::default());
         // Out should NOT appear (only Proto tags are candidates).
         assert!(inj.iter().all(|(t, _)| matches!(t, FactTag::Proto(_, _, _))),
             "Only Proto facts are injective candidates");

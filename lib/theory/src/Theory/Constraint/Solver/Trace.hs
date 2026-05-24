@@ -334,8 +334,29 @@ traceStateM sys
                   ++ " subst=" ++ canonicalEqStoreSubst sys
                   ++ " conj=" ++ show (length (L.get sConjDisjEqs sys)))
             else pure ()
+        if flagStateForms
+            then do
+                let formulas = S.toList (L.get sFormulas sys)
+                    solved   = S.toList (L.get sSolvedFormulas sys)
+                mapM_ (\(i, f) -> traceM ("[STATE_FORM] path=" ++ casePathString path
+                                       ++ " formulas[" ++ show i ++ "]=" ++ show f))
+                      (zip [(0::Int)..] formulas)
+                mapM_ (\(i, f) -> traceM ("[STATE_FORM] path=" ++ casePathString path
+                                       ++ " solved[" ++ show i ++ "]=" ++ show f))
+                      (zip [(0::Int)..] solved)
+            else pure ()
     | otherwise = pure ()
 {-# NOINLINE traceStateM #-}
+
+-- TAM_HS_TRACE_STATE_FORMS: emit `[STATE_FORM]` lines dumping the
+-- FULL guarded-formula content of sFormulas / sSolvedFormulas at each
+-- [STATE] checkpoint.  Mirrors Rust's TAM_RS_TRACE_STATE_FORMS for
+-- pin-pointing which specific formula(s) are missing on one side when
+-- the counts diverge.
+flagStateForms :: Bool
+flagStateForms = unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_STATE_FORMS"
+{-# NOINLINE flagStateForms #-}
 
 -- | Emit a [PICK] line showing which goal was picked at this dispatch.
 -- Paired with Rust's `TAM_RS_TRACE_STATE=1` emission for goal-ranking
