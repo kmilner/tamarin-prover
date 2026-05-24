@@ -976,6 +976,7 @@ impl<'ctx> Reduction<'ctx> {
                 |_, _| false,
                 |n| maude.reserve_idxs(n),
                 &sys_vars,
+                Some(&maude),
             );
             // Check if our disj was folded (singleton case).
             folded = !self.sys.eq_store.conj.iter().any(|d| d.split_id == id);
@@ -1770,12 +1771,14 @@ impl<'ctx> Reduction<'ctx> {
                     ),
                     |n| maude_alloc.reserve_idxs(n),
                     &system_vars,
+                    Some(&maude_alloc),
                 )
             } else {
                 s.simp_with_fresh_avoiding(
                     |_, _| false,
                     |n| maude_alloc.reserve_idxs(n),
                     &system_vars,
+                    Some(&maude_alloc),
                 )
             }
         };
@@ -4764,12 +4767,14 @@ impl<'ctx> Reduction<'ctx> {
                     ),
                     |n| maude.reserve_idxs(n),
                     &system_vars,
+                    Some(&maude),
                 )
             } else {
                 store.simp_with_fresh_avoiding(
                     |_, _| false,
                     |n| maude.reserve_idxs(n),
                     &system_vars,
+                    Some(&maude),
                 )
             }
         };

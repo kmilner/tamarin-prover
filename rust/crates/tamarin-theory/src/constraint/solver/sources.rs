@@ -4704,6 +4704,7 @@ fn graft_case_into(
                 |_, _| false,
                 |n| maude_for_simp.reserve_idxs(n),
                 &sys_vars,
+                Some(&maude_for_simp),
             );
             if out.eq_store.is_false() {
                 return None;
@@ -6132,6 +6133,7 @@ fn apply_source_case_premise(
                 |_, _| false,
                 |n| maude.reserve_idxs(n),
                 &sys_vars,
+                Some(&maude),
             );
             r.subst_system();
         }
