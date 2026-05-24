@@ -655,6 +655,17 @@ impl EquationStore {
     /// the same variable `v` to the same constant `c`, factor `{v →
     /// c}` out into the free substitution and drop those mappings.
     pub fn simp_abstract_name(&mut self) -> bool {
+        self.simp_abstract_name_with_maude(None)
+    }
+
+    /// HS-faithful variant of `simp_abstract_name` that takes a Maude
+    /// handle and calls `apply_eq_store` on the factored subst to
+    /// re-unify remaining disjs (mirrors HS's `foreachDisj` at
+    /// EquationStore.hs:696).
+    pub fn simp_abstract_name_with_maude(
+        &mut self,
+        maude: Option<&tamarin_term::maude_proc::MaudeHandle>,
+    ) -> bool {
         // Walk each disjunction and look for a common (v, const)
         // mapping.
         let mut common_mapping: Option<(LVar, LNTerm, usize)> = None;
@@ -682,7 +693,16 @@ impl EquationStore {
         // Compose `{v → t}` into the free substitution and drop `v`
         // from every subst in disjunction `idx`.
         let factor = LNSubst::from_list(vec![(v.clone(), t)]);
-        self.subst = factor.compose(&self.subst);
+        // HS-faithful: foreachDisj at EquationStore.hs:696 calls
+        // `MS.modify (applyEqStore hnd msubst)` after the simp pass,
+        // composing factor AND re-unifying remaining disjs.
+        if let Some(m) = maude {
+            if self.apply_eq_store(m, &factor).is_err() {
+                self.subst = factor.compose(&self.subst);
+            }
+        } else {
+            self.subst = factor.compose(&self.subst);
+        }
         let new_substs: Vec<LNSubstVFresh> = self.conj[idx].substs
             .iter()
             .map(|s| {
@@ -794,6 +814,18 @@ impl EquationStore {
         &mut self,
         alloc: &mut F,
     ) -> bool {
+        self.simp_abstract_sorted_var_with_maude(alloc, None)
+    }
+
+    /// HS-faithful variant of `simp_abstract_sorted_var` that takes a
+    /// Maude handle and calls `apply_eq_store` on the factored subst
+    /// to re-unify remaining disjs (mirrors HS's `foreachDisj` at
+    /// EquationStore.hs:696).
+    pub fn simp_abstract_sorted_var_with_maude<F: FnMut(u64) -> u64>(
+        &mut self,
+        alloc: &mut F,
+        maude: Option<&tamarin_term::maude_proc::MaudeHandle>,
+    ) -> bool {
         use tamarin_term::term::Term;
         use tamarin_term::vterm::Lit;
         use tamarin_term::lterm::LVar;
@@ -840,7 +872,16 @@ impl EquationStore {
         let factor = LNSubst::from_list(vec![
             (v.clone(), Term::Lit(Lit::Var(fv.clone()))),
         ]);
-        self.subst = factor.compose(&self.subst);
+        // HS-faithful: foreachDisj at EquationStore.hs:696 calls
+        // `MS.modify (applyEqStore hnd msubst)` after the simp pass,
+        // composing factor AND re-unifying remaining disjs.
+        if let Some(m) = maude {
+            if self.apply_eq_store(m, &factor).is_err() {
+                self.subst = factor.compose(&self.subst);
+            }
+        } else {
+            self.subst = factor.compose(&self.subst);
+        }
         // For each (subst, lv) pair, remove (v, _) and add (fv, Var(lv)).
         let new_substs: Vec<LNSubstVFresh> = self.conj[idx].substs.iter()
             .zip(lvs.iter())
@@ -874,7 +915,7 @@ impl EquationStore {
         F: Fn(&LNSubst, &LNSubstVFresh) -> bool,
         G: FnMut(u64) -> u64,
     {
-        self.simp_with_fresh_avoiding(is_contr, alloc, &BTreeSet::new())
+        self.simp_with_fresh_avoiding(is_contr, alloc, &BTreeSet::new(), None)
     }
 
     /// `simp_with_fresh` variant that takes an extra `external_preserve`
@@ -888,6 +929,7 @@ impl EquationStore {
         is_contr: F,
         mut alloc: G,
         external_preserve: &BTreeSet<LVar>,
+        maude: Option<&tamarin_term::maude_proc::MaudeHandle>,
     ) -> Self
     where
         F: Fn(&LNSubst, &LNSubstVFresh) -> bool,
@@ -900,9 +942,9 @@ impl EquationStore {
             changed |= self.simp_minimize(|s| is_contr(&subst_snapshot, s));
             changed |= self.simp_remove_renamings();
             changed |= self.simp_empty_disj();
-            changed |= self.simp_singleton_avoiding(&mut alloc, external_preserve);
-            changed |= self.simp_abstract_sorted_var(&mut alloc);
-            changed |= self.simp_abstract_name();
+            changed |= self.simp_singleton_avoiding(&mut alloc, external_preserve, maude);
+            changed |= self.simp_abstract_sorted_var_with_maude(&mut alloc, maude);
+            changed |= self.simp_abstract_name_with_maude(maude);
             changed |= self.simp_identify();
             if !changed { return self; }
         }
@@ -930,16 +972,26 @@ impl EquationStore {
         &mut self,
         alloc: &mut F,
     ) -> bool {
-        self.simp_singleton_avoiding(alloc, &BTreeSet::new())
+        self.simp_singleton_avoiding(alloc, &BTreeSet::new(), None)
     }
 
     /// `simp_singleton` variant that accepts an `external_preserve`
     /// set — typically the system's free vars — to PROTECT from
     /// renaming in `fresh_to_free`.  See `simp_with_fresh_avoiding`.
+    ///
+    /// If `maude` is `Some`, after composing the folded factor into the
+    /// free subst, also re-unifies any REMAINING disj substs against
+    /// the new free subst via `apply_eq_store`.  HS-faithful:
+    /// `foreachDisj` (EquationStore.hs:696) does
+    /// `MS.modify (applyEqStore hnd msubst)` after replacing the
+    /// disj.  Without this, remaining variants stay un-refined and
+    /// `perform_split` enumerates stale shapes.  Pass `None` for the
+    /// test-only path that doesn't have a Maude handle.
     pub fn simp_singleton_avoiding<F: FnMut(u64) -> u64>(
         &mut self,
         alloc: &mut F,
         external_preserve: &BTreeSet<LVar>,
+        maude: Option<&tamarin_term::maude_proc::MaudeHandle>,
     ) -> bool {
         // Find the first singleton disjunction (1 subst).
         let pos = self.conj.iter().position(|d| d.substs.len() == 1);
@@ -984,8 +1036,28 @@ impl EquationStore {
             }
         }
         let new_subst = subst_vf.fresh_to_free_avoiding(|n| alloc(n), &preserve);
-        // Compose: new_subst ∘ self.subst.
-        self.subst = new_subst.compose(&self.subst);
+        // HS-faithful: foreachDisj at EquationStore.hs:696 calls
+        // `MS.modify (applyEqStore hnd msubst)` after replacing the
+        // singleton disj.  applyEqStore composes msubst into eqsSubst
+        // AND re-unifies remaining disj substs against the new
+        // eqsSubst — so SplitG variants whose values reference the
+        // newly-bound vars get refined.  Direct compose (the previous
+        // code path) was a divergence that left remaining variants
+        // stale, surfacing as perform_split picking different cases
+        // than HS.  See [[project-apply-eq-store-divergence]].
+        if let Some(m) = maude {
+            // apply_eq_store does: compose new_subst into self.subst +
+            // re-unify all remaining conj disjs.  On Err (e.g. dom/range
+            // overlap), fall back to direct compose to preserve old
+            // behaviour for malformed factors.
+            if self.apply_eq_store(m, &new_subst).is_err() {
+                self.subst = new_subst.compose(&self.subst);
+            }
+        } else {
+            // No Maude handle (test-only path) — fall back to direct
+            // compose without re-unifying remaining disjs.
+            self.subst = new_subst.compose(&self.subst);
+        }
         true
     }
 
