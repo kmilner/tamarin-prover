@@ -222,8 +222,18 @@ performSplit :: EqStore -> SplitId -> Maybe [EqStore]
 performSplit eqStore idx =
     case break ((idx ==) . fst) (getConj $ L.get eqsConj eqStore) of
         (_, [])                   -> Nothing
-        (before, (_, disj):after) -> Just $
-            mkNewEqStore before after <$> orderedSubsts disj
+        (before, (_, disj):after) ->
+            let substs   = orderedSubsts disj
+                tracedSubsts
+                    | dbgPerformSplit =
+                        Debug.Trace.trace
+                            ("[hs-perform_split] split_id=" ++ show idx
+                             ++ ", " ++ show (length substs) ++ " substs (ordered):\n"
+                             ++ concatMap (\(i, s) -> "  case_" ++ show i ++ ": "
+                                                      ++ show (substToListVFresh s) ++ "\n")
+                                          (zip [(1::Int)..] substs)) substs
+                    | otherwise = substs
+            in Just $ mkNewEqStore before after <$> tracedSubsts
   where
     -- The disjunction is stored as a @Set LNSubstVFresh@, so @S.toList@ would
     -- enumerate the cases in the derived 'Ord' order of the substitutions. That
@@ -241,6 +251,14 @@ performSplit eqStore idx =
     mkNewEqStore before after subst =
         fst $ addDisj (set eqsConj (Conj (before ++ after)) eqStore)
                       (S.singleton subst)
+
+-- | TAM_HS_DBG_PERFORM_SPLIT: log perform_split's S.toList output (the
+-- post-sort order in which case_1, case_2, ... are produced).  Mirrors
+-- Rust's TAM_DBG_PERFORM_SPLIT for diffing variant-allocation order.
+dbgPerformSplit :: Bool
+dbgPerformSplit = System.IO.Unsafe.unsafePerformIO $
+    maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_DBG_PERFORM_SPLIT"
+{-# NOINLINE dbgPerformSplit #-}
 
 -- | Add a list of term equalities to the equation store. Returns the split
 -- identifier of the disjunction in resulting equation store.
