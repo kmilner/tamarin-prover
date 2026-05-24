@@ -338,6 +338,20 @@ impl MaudeHandle {
         self.fresh_counter.load(Ordering::SeqCst)
     }
 
+    /// Force-set the counter to `n` (overwriting the current value
+    /// even if `n` is BELOW current).  Used by `apply_eq_store` to
+    /// reset the counter between per-variant Maude calls so each
+    /// variant's witness allocation starts from the same baseline —
+    /// HS-faithful `evalFreshAvoiding` semantics where each
+    /// per-variant `applyBound` call has its own fresh state.
+    ///
+    /// IMPORTANT: callers MUST advance the counter back to the high
+    /// water mark after the per-variant loop or subsequent
+    /// allocations could collide with the per-variant outputs.
+    pub fn reset_counter_to(&self, n: u64) {
+        self.fresh_counter.store(n, Ordering::SeqCst);
+    }
+
     /// Clone this handle but with a FRESH fresh_counter initialised to
     /// `avoid_max + 1`.  Mirrors Haskell's `runReduction _ _ _ (avoid sys)`
     /// — every Reduction starts with a counter that's local to that
