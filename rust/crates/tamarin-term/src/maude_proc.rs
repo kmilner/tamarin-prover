@@ -860,8 +860,20 @@ impl MaudeHandle {
         drop(inner);
         let msubsts = maude_parse::parse_variants_reply(&sig, &reply)?;
         let mut out = Vec::with_capacity(msubsts.len());
+        // HS-faithful: each variant's back-conversion uses a fresh ctx
+        // clone.  Mirrors HS `msubstToLSubstVFresh` (Maude/Types.hs:130)
+        // where each call to `runBackConversion (...) bindings` runs
+        // `evalBindT back bindings` with the same INITIAL bindings —
+        // augmentations to the binding map are per-call.
+        //
+        // Without this, the shared `ctx.inverse` causes
+        // `MaudeLit::FreshVar(N, sort)` to collide between variants —
+        // variant 1's `#1:Msg` and variant 2's `%1:Msg` both parse to
+        // `FreshVar(1, Msg)` (parser at maude_parse.rs:243 collapses
+        // # and %) and the second lookup returns the first's LVar.
         for ms in &msubsts {
-            out.push(msubst_to_lnsubst(ms, &mut ctx)?);
+            let mut variant_ctx = ctx.clone();
+            out.push(msubst_to_lnsubst(ms, &mut variant_ctx)?);
         }
         Ok(out)
     }
