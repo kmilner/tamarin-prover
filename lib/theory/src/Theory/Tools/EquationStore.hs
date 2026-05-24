@@ -229,6 +229,8 @@ performSplit eqStore idx =
                         Debug.Trace.trace
                             ("[hs-perform_split] split_id=" ++ show idx
                              ++ ", " ++ show (length substs) ++ " substs (ordered):\n"
+                             ++ "  eqsSubst: " ++ show (substToList $ L.get eqsSubst eqStore) ++ "\n"
+                             ++ "  all conj sids: " ++ show (map fst (getConj $ L.get eqsConj eqStore)) ++ "\n"
                              ++ concatMap (\(i, s) -> "  case_" ++ show i ++ ": "
                                                       ++ show (substToListVFresh s) ++ "\n")
                                           (zip [(1::Int)..] substs)) substs
