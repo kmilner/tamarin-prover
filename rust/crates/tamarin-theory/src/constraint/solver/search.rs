@@ -284,7 +284,17 @@ fn re_expand_depth_limited(
         if *budget == 0 { break; }
         if std::time::Instant::now() >= *deadline { break; }
         if let Some(child) = node.children.get_mut(&name) {
+            // Track proof-tree path so state-trace / lockstep
+            // emissions reflect the correct deep path during
+            // iterative-deepening re-expansion.  Without this push,
+            // state-traces from re-expanded subtrees report just
+            // the deepest pushed case (e.g. `/c_sdec`) instead of
+            // the full lemma-proof path (`/Setup_Key/.../c_sdec`).
+            // Mirrors expand_cases at search.rs:489-492.
+            let push_path = !name.is_empty();
+            if push_path { crate::constraint::solver::trace::case_path_push(&name); }
             re_expand_depth_limited(ctx, child, budget, deadline, depth + 1);
+            if push_path { crate::constraint::solver::trace::case_path_pop(); }
             if matches!(child.status, NodeStatus::Solved) {
                 found_solved = true;
             }
@@ -333,6 +343,12 @@ fn expand(
             depth, *budget, node.sys.nodes.len(), node.sys.goals.len());
     }
     crate::state_trace::emit("expand", None, &node.sys);
+    // HS-faithful unconditional [STATE] emission at every prove entry
+    // — mirrors `Theory.Proof.proveSystemDFS` calling `traceProveEntry`
+    // before each prove call.  Without this, Rust's TAM_RS_TRACE_STATE
+    // only fires from SolveGoal dispatch (proof_method.rs), missing
+    // Simplify / Induction / Finished steps that HS records.
+    crate::constraint::solver::trace::trace_state(&node.sys);
     // ID-DFS depth limit (Haskell `cutOnSolvedDFS` Proof.hs:855-877).
     //
     // Haskell's `findSolved` checks `d >= dMax` BEFORE checking the
