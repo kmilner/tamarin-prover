@@ -590,27 +590,18 @@ impl ProofContext {
         // via pattern-matching on its `cdCases` (HS-faithful).
         ctx.full_sources = raw_sources;
         // HS-faithfulness note: HS emits `[Saturating Sources] Done`
-        // at theory-close time, suggesting it eagerly drives
-        // `saturateSources` here.  Rust currently defers via lazy
-        // ensure_saturated (triggered on first `Source::cases(ctx)`
-        // call).  Attempted to match HS by calling
-        // `ctx.ensure_saturated()` here (commit reverted) — produced
-        // unacceptable regressions:
-        //   - Responder_secrecy explodes from 53 → 4070 lines (HS=47)
-        //     because eager saturate produces too many cases that all
-        //     get explored.
-        //   - ~16 lemmas become incomparable (timeouts at 10s).
-        //   - 4 new R_1_case_1/I_2_case_1 divergences.
-        //   - Non-determinism across RAYON_NUM_THREADS.
-        // Conclusion: Rust's `ensure_saturated` implementation isn't
-        // ready to match HS's saturate semantics yet — it's
-        // over-generating cases.  Lazy stays for now; the per-source
-        // `cases_cell` already supports the same end-state, just
-        // computed on demand.  Setting TAM_RS_EAGER_SATURATE=1
-        // force-enables for diagnostic comparison.
-        if std::env::var("TAM_RS_EAGER_SATURATE").is_ok() {
-            ctx.ensure_saturated();
-        }
+        // at theory-close time, but only AFTER refineWithSourceAsms
+        // has been applied with the lemma-specific typing_assumptions.
+        // Rust defers saturation via lazy ensure_saturated (triggered
+        // on first `Source::cases(ctx)` call from inside the lemma
+        // proof, AFTER `prove_lemma` assigns ctx.typing_assumptions).
+        //
+        // Eager saturate at THIS point (ctx setup) would skip
+        // refine_with_source_asms entirely because typing_assumptions
+        // is empty — leaving cases un-refined and the lemma proof
+        // exploring "Responder" cases that HS's refined sources prune
+        // (Responder_secrecy: 53 → 4080 lines).  TAM_RS_EAGER_SATURATE
+        // is now wired in prove.rs AFTER typing_assumptions is set.
         // No post-saturate drop pass — Haskell doesn't have one.
         // Haskell relies on saturate-time `contradictoryIf` inside
         // `solveAllSafeGoals` (Sources.hs:118-133) + runtime
