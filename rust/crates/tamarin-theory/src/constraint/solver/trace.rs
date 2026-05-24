@@ -132,14 +132,64 @@ fn flag() -> bool {
     *FLAG.get_or_init(|| std::env::var("TAM_RS_TRACE_EXEC").is_ok())
 }
 
+/// Static-string `traceExecM` labels that HS emits exactly once per
+/// program run due to GHC CSE on the literal `String` argument to
+/// `traceM`.  The full set, identified by grepping HS for
+/// `T.traceExecM "..."` (literal-only):
+///
+///   - `simplifySystem`            (Simplify.hs:67)
+///   - `solveChain ENTER`          (Goals.hs:323)
+///   - `FrNarrow`                  (Reduction.hs:271)
+///   - `exploitPrem InFact`        (Reduction.hs:250)
+///
+/// All other `traceExecM` callsites use a concatenated string
+/// (`++ show n`, `++ getRuleName ru`, etc.) which has a distinct
+/// expression per call and emits per-invocation in HS.
+///
+/// Rust's `trace_exec` would otherwise emit per call for these too —
+/// diverging from HS even though the underlying work matches.  Dedup
+/// here on first emission per program run, matching HS line-for-line.
+fn is_cse_deduplicated_label(label: &str) -> bool {
+    matches!(label,
+        "simplifySystem"
+        | "solveChain ENTER"
+        | "FrNarrow"
+        | "exploitPrem InFact"
+    )
+}
+
+/// Has this CSE-deduplicated label already been emitted in this
+/// program run?  Returns `true` if already seen (skip emission),
+/// `false` and records it if first time.
+fn check_and_mark_emitted(label: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static EMITTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let set = EMITTED.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut g = set.lock().unwrap();
+    if g.contains(label) {
+        true
+    } else {
+        g.insert(label.to_string());
+        false
+    }
+}
+
 /// Emit a `[EXEC] <label>` line to stderr when `TAM_RS_TRACE_EXEC=1`.
 /// No-op otherwise.  Keep `label` in the same canonical form as the
 /// Haskell `T.traceExecM` callsite so the outputs diff cleanly.
+///
+/// For labels HS deduplicates via GHC CSE (see
+/// [`is_cse_deduplicated_label`]), emit only on first occurrence per
+/// program run — matching HS's effective once-per-program emission
+/// for those literal-string `traceExecM` callsites.
 #[inline]
 pub fn trace_exec(label: &str) {
-    if flag() {
-        eprintln!("[EXEC] {}", label);
+    if !flag() { return; }
+    if is_cse_deduplicated_label(label) && check_and_mark_emitted(label) {
+        return;
     }
+    eprintln!("[EXEC] {}", label);
 }
 
 /// Convenience: format a `LSort`-tagged short variable identifier
@@ -203,6 +253,103 @@ pub fn trace_state(sys: &crate::constraint::system::System) {
             canonical_eq_store_subst(sys),
             sys.eq_store.conj.len());
     }
+    if state_forms_flag() {
+        // `TAM_RS_TRACE_STATE_FORMS=1`: dump full formula content at
+        // each [STATE] checkpoint.  Used when state counts diverge from
+        // HS (e.g., HS has more formulas than Rust at the same path):
+        // shows which specific formulas Rust is missing relative to HS.
+        for (i, f) in sys.formulas.iter().enumerate() {
+            eprintln!("[STATE_FORM] path={} formulas[{}]={}",
+                case_path_string(), i, guarded_repr(f));
+        }
+        for (i, f) in sys.solved_formulas.iter().enumerate() {
+            eprintln!("[STATE_FORM] path={} solved[{}]={}",
+                case_path_string(), i, guarded_repr(f));
+        }
+    }
+    if state_nodes_flag() {
+        // `TAM_RS_TRACE_STATE_NODES=1`: dump each node with its full
+        // rule case-name + ALL actions (with var idxs preserved) so
+        // HS↔Rust diff can detect missing chain levels (e.g.
+        // Helper_Loop_and_success: HS has Loop(~n, f(f(k.1)), kOrig)
+        // at parent path; Rust only has Loop(~n, k, kOrig) / Loop(~n,
+        // f(k), kOrig) — missing the third chain level).
+        for (id, rule) in &sys.nodes {
+            let rc = crate::constraint::solver::reduction::rule_case_name(rule);
+            let acts: Vec<String> = rule.actions.iter()
+                .map(canonical_fact_with_idx).collect();
+            eprintln!("[STATE_NODE] path={} {}.{}={} actions=[{}]",
+                case_path_string(), id.name, id.idx, rc, acts.join(", "));
+        }
+        for e in &sys.edges {
+            eprintln!("[STATE_EDGE] path={} {}.{}/{} -> {}.{}/{}",
+                case_path_string(),
+                e.src.0.name, e.src.0.idx, e.src.1.0,
+                e.tgt.0.name, e.tgt.0.idx, e.tgt.1.0);
+        }
+        // Also dump open Action goals with their idx-preserved fact
+        // content (the canonical [STATE] line above suppresses idxs).
+        // These are Ex-decomposed action atoms that haven't been folded
+        // into nodes yet — they participate in `impl_formulas` matching
+        // and are critical for diagnosing IH-Forall-fires-but-misses-
+        // gfalse divergences at case-3 (Helper_Loop_and_success).
+        use crate::constraint::constraints::Goal;
+        for (g, st) in &sys.goals {
+            if st.solved { continue; }
+            if let Goal::Action(node, fa) = g {
+                eprintln!("[STATE_GOAL] path={} Action@{}.{}={}",
+                    case_path_string(), node.name, node.idx,
+                    canonical_fact_with_idx(fa));
+            }
+        }
+    }
+}
+
+fn state_nodes_flag() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("TAM_RS_TRACE_STATE_NODES").is_ok())
+}
+
+/// Like `canonical_fact` but KEEPS the LVar idx so diffs reveal node
+/// chain depth (which would otherwise canonicalise to the same shape).
+fn canonical_fact_with_idx(fa: &crate::fact::LNFact) -> String {
+    let terms: Vec<String> = fa.terms.iter().map(canonical_lnterm_with_idx).collect();
+    format!("{}({})", fact_tag_short(&fa.tag), terms.join(","))
+}
+
+fn canonical_lnterm_with_idx(t: &tamarin_term::lterm::LNTerm) -> String {
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    use tamarin_term::function_symbols::FunSym;
+    match t {
+        Term::Lit(Lit::Var(v)) => {
+            format!("{}{}#{}", sort_prefix(v.sort), v.name, v.idx)
+        }
+        Term::Lit(Lit::Con(n)) => {
+            let nm = &n.id.0;
+            match n.tag {
+                tamarin_term::lterm::NameTag::Pub => format!("'{}'", nm),
+                tamarin_term::lterm::NameTag::Fresh => format!("~'{}'", nm),
+                tamarin_term::lterm::NameTag::Nat => format!("%{}", nm),
+                tamarin_term::lterm::NameTag::Node => format!("#'{}'", nm),
+            }
+        }
+        Term::App(sym, args) => {
+            let head = match sym {
+                FunSym::NoEq(s) => String::from_utf8_lossy(&s.name).to_string(),
+                FunSym::C(_) => "C".to_string(),
+                FunSym::Ac(_) => "AC".to_string(),
+                FunSym::List => "List".to_string(),
+            };
+            let args_s: Vec<String> = args.iter().map(canonical_lnterm_with_idx).collect();
+            format!("{}({})", head, args_s.join(","))
+        }
+    }
+}
+
+fn state_forms_flag() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("TAM_RS_TRACE_STATE_FORMS").is_ok())
 }
 
 fn state_full_flag() -> bool {

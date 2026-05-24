@@ -345,6 +345,21 @@ traceStateM sys
                                        ++ " solved[" ++ show i ++ "]=" ++ show f))
                       (zip [(0::Int)..] solved)
             else pure ()
+        if flagStateNodes
+            then do
+                -- Dump each node with full rule name + actions + var idxs
+                -- preserved.  Used for chain-depth diff: Rust↔HS may
+                -- merge differently, producing different action levels
+                -- (e.g. Loop(~n, f(k.1), kOrig) vs Loop(~n, f(f(k.1)),
+                -- kOrig)) — Helper_Loop_and_success root cause.
+                mapM_ (\(i, ru) -> traceM ("[STATE_NODE] path=" ++ casePathString path
+                                        ++ " " ++ show i ++ "=" ++ showRuleCaseName ru
+                                        ++ " actions=" ++ show (L.get rActs ru)))
+                      (M.toList (L.get sNodes sys))
+                mapM_ (\e -> traceM ("[STATE_EDGE] path=" ++ casePathString path
+                                  ++ " " ++ show e))
+                      (S.toList (L.get sEdges sys))
+            else pure ()
     | otherwise = pure ()
 {-# NOINLINE traceStateM #-}
 
@@ -357,6 +372,16 @@ flagStateForms :: Bool
 flagStateForms = unsafePerformIO $
     maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_STATE_FORMS"
 {-# NOINLINE flagStateForms #-}
+
+-- TAM_HS_TRACE_STATE_NODES: emit `[STATE_NODE]` + `[STATE_EDGE]` lines
+-- dumping each node (rule name, actions with var idxs preserved) and
+-- each edge.  Mirrors Rust's TAM_RS_TRACE_STATE_NODES for pin-pointing
+-- chain-depth divergences (e.g. Helper_Loop_and_success: HS has Loop
+-- chain ~n → k.1 → f(k.1) → f(f(k.1)); Rust merges to 2 levels only).
+flagStateNodes :: Bool
+flagStateNodes = unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_STATE_NODES"
+{-# NOINLINE flagStateNodes #-}
 
 -- | Emit a [PICK] line showing which goal was picked at this dispatch.
 -- Paired with Rust's `TAM_RS_TRACE_STATE=1` emission for goal-ranking
