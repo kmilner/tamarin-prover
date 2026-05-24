@@ -1114,10 +1114,15 @@ fn try_match_all_guards(
             if std::env::var("TAM_DBG_IMPL").is_ok() {
                 let is_bot = matches!(&implied,
                     crate::guarded::Guarded::Disj(v) if v.is_empty());
-                if is_bot || !already {
-                    eprintln!("[impl] implied (bot={}) already={} (formulas={} solved={} out={}): {:?}",
+                if is_bot || !already || std::env::var("TAM_DBG_IMPL_ALL").is_ok() {
+                    eprintln!("[impl] path={} implied (bot={}) already={} (formulas={} solved={} out={}): {}",
+                        crate::constraint::solver::trace::case_path_string(),
                         is_bot, already, in_formulas, in_solved, in_out,
-                        format!("{:?}", implied).chars().take(80).collect::<String>());
+                        if std::env::var("TAM_DBG_IMPL_ALL").is_ok() {
+                            crate::constraint::solver::trace::guarded_repr(&implied)
+                        } else {
+                            format!("{:?}", implied).chars().take(80).collect::<String>()
+                        });
                 }
             }
             if !already {
