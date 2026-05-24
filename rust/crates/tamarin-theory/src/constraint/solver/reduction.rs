@@ -1670,6 +1670,20 @@ impl<'ctx> Reduction<'ctx> {
             .filter(|e| e.lhs != e.rhs)
             .cloned()
             .collect();
+        // TAM_RS_DBG_SOLVE_TERM_EQS=1 dumps every solve_term_eqs call's
+        // split strategy, equation count, and the equations.  Pair with
+        // HS's TAM_HS_DBG_SOLVE_TERM_EQS for HS↔Rust diffing of the
+        // goal-by-goal solver flow (see [[project-apply-eq-store-divergence]]).
+        if std::env::var("TAM_RS_DBG_SOLVE_TERM_EQS").is_ok() {
+            if pending.is_empty() {
+                eprintln!("[rs-ste-tick] zero-eqs (filtered {} trivial)", eqs.len());
+            } else {
+                eprintln!("[rs-ste] === call split={:?} n={}", strategy, pending.len());
+                for (i, eq) in pending.iter().enumerate() {
+                    eprintln!("  eq[{}]: {:?} = {:?}", i, eq.lhs, eq.rhs);
+                }
+            }
+        }
         if pending.is_empty() {
             return Ok(SolveOutcome::Linear(ChangeIndicator::Unchanged));
         }

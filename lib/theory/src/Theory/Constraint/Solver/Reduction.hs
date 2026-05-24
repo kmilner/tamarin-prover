@@ -119,6 +119,19 @@ import           Theory.Model
 type Reduction = StateT System (FreshT (DisjT (Reader ProofContext)))
 
 
+-- Permanent debug instrumentation flags
+----------------------------------------
+
+-- | TAM_HS_DBG_SOLVE_TERM_EQS=1 dumps every solveTermEqs call's site
+-- label, split strategy, equation count, and the equations.  Pair with
+-- Rust's TAM_RS_DBG_SOLVE_TERM_EQS for HS↔Rust diffing of the goal-by-
+-- goal solver flow.  Cached via unsafePerformIO to stay zero-cost when
+-- the env var is unset.
+dbgSolveTermEqsOn :: Bool
+dbgSolveTermEqsOn = Unsafe.unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_DBG_SOLVE_TERM_EQS"
+{-# NOINLINE dbgSolveTermEqsOn #-}
+
 -- Executing reductions
 -----------------------
 
@@ -797,9 +810,31 @@ solveTermEqs splitStrat eqs0 = solveTermEqsLabeled "solveTermEqs" splitStrat eqs
 solveTermEqsLabeled :: String -> SplitStrategy -> [Equal LNTerm] -> Reduction ChangeIndicator
 solveTermEqsLabeled siteLabel splitStrat eqs0 =
     case filter (not . evalEqual) eqs0 of
-      []  -> do return Unchanged
+      []  -> do
+          -- TAM_HS_DBG_SOLVE_TERM_EQS=1: tick zero-eq calls too so call
+          -- counts can be compared against Rust's TAM_RS_DBG_SOLVE_TERM_EQS.
+          if dbgSolveTermEqsOn
+              then Debug.Trace.traceM ("[hs-ste-tick] zero-eqs site=" ++ siteLabel)
+              else return ()
+          return Unchanged
       eqs1 -> do
         T.traceExecM ("solveTermEqs n=" ++ show (length eqs1))
+        -- TAM_HS_DBG_SOLVE_TERM_EQS=1: dump every solveTermEqs call's
+        -- site label, split strategy, and the equations being solved.
+        -- Pair with Rust's TAM_RS_DBG_SOLVE_TERM_EQS for HS↔Rust
+        -- diffing of the solver flow (see
+        -- [[project-apply-eq-store-divergence]]).
+        if dbgSolveTermEqsOn
+            then do
+              let splitTag = case splitStrat of
+                    SplitNow -> "SplitNow"
+                    SplitLater -> "SplitLater"
+              Debug.Trace.traceM ("[hs-ste] === call site=" ++ siteLabel ++
+                            " split=" ++ splitTag ++ " n=" ++ show (length eqs1))
+              mapM_ (\(i, Equal l r) ->
+                Debug.Trace.traceM ("  eq[" ++ show (i :: Int) ++ "]: " ++ show l ++ " = " ++ show r))
+                (zip [0..] eqs1)
+            else return ()
         hnd <- getMaudeHandle
         se  <- gets id
         (eqs2, maySplitId) <- addEqs hnd eqs1 =<< getM sEqStore

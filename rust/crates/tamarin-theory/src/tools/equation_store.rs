@@ -367,6 +367,15 @@ impl EquationStore {
             }
             log_fresh_bindings("local", &local_subst);
             if self.conj.is_empty() {
+                // HS would call applyEqStore with empty conj here.
+                // Tick to match HS's call count when comparing.
+                if std::env::var("TAM_RS_DBG_APPLY_EQ_STORE").is_ok() {
+                    let filter = std::env::var("TAM_RS_DBG_APPLY_EQ_STORE_FILTER")
+                        .map(|s| s == "substantive").unwrap_or(false);
+                    if !filter {
+                        eprintln!("[rs-aes-tick] conj=0 substantive=false (short-circuit:add_eqs-no-ac)");
+                    }
+                }
                 self.subst = local_subst.compose(&self.subst);
             } else {
                 self.apply_eq_store(maude, &local_subst)?;
@@ -438,6 +447,13 @@ impl EquationStore {
             // (e.g. `{z → verify(s,m,pkA)}` vs `{z → true}` collapse).
             // Mirrors Reduction.hs:225 / EquationStore.hs:228.
             if self.conj.is_empty() {
+                if std::env::var("TAM_RS_DBG_APPLY_EQ_STORE").is_ok() {
+                    let filter = std::env::var("TAM_RS_DBG_APPLY_EQ_STORE_FILTER")
+                        .map(|s| s == "substantive").unwrap_or(false);
+                    if !filter {
+                        eprintln!("[rs-aes-tick] conj=0 substantive=false (short-circuit:add_eqs-single-maude)");
+                    }
+                }
                 // Fast path: nothing to re-unify, just compose.
                 self.subst = subst.compose(&self.subst);
             } else {
@@ -454,6 +470,13 @@ impl EquationStore {
         // unifiers represent the disjunction over AC choices.
         if !local_subst.is_empty() {
             if self.conj.is_empty() {
+                if std::env::var("TAM_RS_DBG_APPLY_EQ_STORE").is_ok() {
+                    let filter = std::env::var("TAM_RS_DBG_APPLY_EQ_STORE_FILTER")
+                        .map(|s| s == "substantive").unwrap_or(false);
+                    if !filter {
+                        eprintln!("[rs-aes-tick] conj=0 substantive=false (short-circuit:add_eqs-multi-maude)");
+                    }
+                }
                 self.subst = local_subst.compose(&self.subst);
             } else {
                 self.apply_eq_store(maude, &local_subst)?;
@@ -1043,6 +1066,36 @@ impl EquationStore {
 
         let new_subst = asubst.compose(&self.subst);
 
+        // TAM_RS_DBG_APPLY_EQ_STORE=1: dump every call's asubst, IN/OUT
+        // disjs, per-variant applyBound input/output.  Pair with HS's
+        // TAM_HS_DBG_APPLY_EQ_STORE for HS↔Rust diffing of variant flow.
+        // Every call ticks (including precompute) so call counts can be
+        // compared apples-to-apples against HS.
+        // TAM_RS_DBG_APPLY_EQ_STORE_FILTER=substantive limits dump to
+        // calls with non-empty conj (matches HS's substantive filter).
+        let rs_dbg = std::env::var("TAM_RS_DBG_APPLY_EQ_STORE").is_ok();
+        let rs_dbg_filter_substantive = std::env::var("TAM_RS_DBG_APPLY_EQ_STORE_FILTER")
+            .map(|s| s == "substantive").unwrap_or(false);
+        let rs_substantive = self.conj.iter().any(|d| !d.substs.is_empty());
+        if rs_dbg && (rs_substantive || !rs_dbg_filter_substantive) {
+            eprintln!("[rs-aes-tick] conj={} substantive={}",
+                self.conj.len(), rs_substantive);
+        }
+        let dbg_call = rs_dbg && rs_substantive;
+        if dbg_call {
+            eprintln!("[rs-aes] === call ===");
+            eprintln!("[rs-aes] asubst = {:?}", asubst.to_list());
+            eprintln!("[rs-aes] eqsSubst = {:?}", self.subst.to_list());
+            for (i, d) in self.conj.iter().enumerate() {
+                if d.substs.is_empty() { continue; }
+                eprintln!("[rs-aes] IN  disj[{}] sid={:?} ({} substs)",
+                          i, d.split_id, d.substs.len());
+                for (j, s) in d.substs.iter().enumerate() {
+                    eprintln!("  in[{}]: {:?}", j, s.to_list());
+                }
+            }
+        }
+
         // Re-unify each disj subst against the new free subst via Maude
         // (Haskell's `applyBound`).  For each `s = {(lv, t)}`, build
         // equations `[Equal (apply newsubst (Var lv)) renamed_t]` and
@@ -1071,10 +1124,15 @@ impl EquationStore {
         for d in self.conj.iter() {
             let mut new_substs: Vec<LNSubstVFresh> = Vec::new();
             for s in &d.substs {
+                let dbg_in = if dbg_call { Some(s.to_list()) } else { None };
                 let bindings: Vec<(LVar, LNTerm)> = s.to_list();
                 if bindings.is_empty() {
                     // Empty subst (identity) — preserves.
                     new_substs.push(s.clone());
+                    if dbg_in.is_some() {
+                        eprintln!("[rs-aes-applyBound] IN  : (empty)");
+                        eprintln!("  OUT[0] (empty preserved)");
+                    }
                     continue;
                 }
                 // Compute avoid_max = max idx across (domVFresh s ∪
@@ -1156,11 +1214,17 @@ impl EquationStore {
                         e.rhs.for_each_free(&mut |v| if v.idx > max_idx { max_idx = v.idx; });
                     }
                 }
+                if let Some(input) = &dbg_in {
+                    eprintln!("[rs-aes-applyBound] IN  : {:?}", input);
+                }
                 let unifiers = match maude.unify_at_with_avoid(
                     "apply_eq_store::re_unify", &eqs, max_idx) {
                     Ok(u) => u,
                     Err(e) => return Err(AddEqsError::Maude(format!("{}", e))),
                 };
+                if dbg_in.is_some() {
+                    eprintln!("  {} unifiers from Maude", unifiers.len());
+                }
                 if unifiers.is_empty() {
                     // No unifier → variant dropped.
                     continue;
@@ -1268,7 +1332,11 @@ impl EquationStore {
                     let pairs: Vec<(LVar, LNTerm)> = lifted.into_iter()
                         .filter(|(v, _)| restrict_set.contains(v))
                         .collect();
-                    new_substs.push(LNSubstVFresh::from_list(pairs));
+                    let out_subst = LNSubstVFresh::from_list(pairs);
+                    if dbg_in.is_some() {
+                        eprintln!("  OUT: {:?}", out_subst.to_list());
+                    }
+                    new_substs.push(out_subst);
                 }
             }
             // HS-faithful (`applyEqStore`, EquationStore.hs:268): wrap
@@ -1302,6 +1370,13 @@ impl EquationStore {
                 eprintln!("[aes_variants]   AFTER (post-Maude variants, sorted+deduped):");
                 for (i, s) in new_substs.iter().enumerate() {
                     eprintln!("[aes_variants]     out[{}]: {:?}", i, s.to_list());
+                }
+            }
+            if dbg_call {
+                eprintln!("[rs-aes] OUT disj[?] sid={:?} ({} substs)",
+                          d.split_id, new_substs.len());
+                for (j, s) in new_substs.iter().enumerate() {
+                    eprintln!("  out[{}]: {:?}", j, s.to_list());
                 }
             }
             new_conj.push(EqDisj { split_id: d.split_id, substs: new_substs });
