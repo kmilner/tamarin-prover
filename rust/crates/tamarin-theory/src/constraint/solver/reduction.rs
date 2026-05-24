@@ -1661,6 +1661,7 @@ impl<'ctx> Reduction<'ctx> {
     /// store, optionally splitting if the unifier produced more than
     /// one disjunct. Mirrors the Haskell function in
     /// `Theory.Constraint.Solver.Reduction`.
+    #[track_caller]
     pub fn solve_term_eqs(
         &mut self,
         strategy: SplitStrategy,
@@ -1672,14 +1673,19 @@ impl<'ctx> Reduction<'ctx> {
             .cloned()
             .collect();
         // TAM_RS_DBG_SOLVE_TERM_EQS=1 dumps every solve_term_eqs call's
-        // split strategy, equation count, and the equations.  Pair with
-        // HS's TAM_HS_DBG_SOLVE_TERM_EQS for HS↔Rust diffing of the
+        // caller location (via #[track_caller]), split strategy,
+        // equation count, and the equations.  Pair with HS's
+        // TAM_HS_DBG_SOLVE_TERM_EQS for HS↔Rust diffing of the
         // goal-by-goal solver flow (see [[project-apply-eq-store-divergence]]).
         if std::env::var("TAM_RS_DBG_SOLVE_TERM_EQS").is_ok() {
+            let loc = std::panic::Location::caller();
+            let site = format!("{}:{}", loc.file(), loc.line());
             if pending.is_empty() {
-                eprintln!("[rs-ste-tick] zero-eqs (filtered {} trivial)", eqs.len());
+                eprintln!("[rs-ste-tick] zero-eqs site={} (filtered {} trivial)",
+                          site, eqs.len());
             } else {
-                eprintln!("[rs-ste] === call split={:?} n={}", strategy, pending.len());
+                eprintln!("[rs-ste] === call site={} split={:?} n={}",
+                          site, strategy, pending.len());
                 for (i, eq) in pending.iter().enumerate() {
                     eprintln!("  eq[{}]: {:?} = {:?}", i, eq.lhs, eq.rhs);
                 }
@@ -1896,6 +1902,7 @@ impl<'ctx> Reduction<'ctx> {
     /// `Contradictory` — the proof_method.rs SolveGoal arm uses
     /// `eq_store.is_false` as the mzero proxy when filtering cases,
     /// so without the flip a tag-mismatch case would slip through.
+    #[track_caller]
     pub fn solve_fact_eqs(
         &mut self,
         strategy: SplitStrategy,
