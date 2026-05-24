@@ -177,7 +177,50 @@ pub fn run_proof_search(
     MAX_DEPTH.with(|m| m.set(usize::MAX));
     DEPTH_LIMIT_HIT.with(|f| f.set(false));
     clear_deadline();
+    // HS-faithful: `cutOnSolvedDFS` (Proof.hs:855-877) calls
+    // `extractSolved path prf0` once a Solved leaf is found, pruning
+    // the proof tree to JUST the solved-witness path.  All
+    // Contradictory siblings are removed.  Without this, Rust's
+    // proof_steps count includes failed branches HS prunes — e.g.
+    // NSPK3 session_key_setup_possible reports 30 steps vs HS 5.
+    if matches!(root.status, NodeStatus::Solved) {
+        extract_solved_path(&mut root);
+    }
     root
+}
+
+/// HS-faithful `extractSolved` (Proof.hs:922-927): walks the proof
+/// tree, finds the first Solved-leaf path from root, and prunes all
+/// non-path siblings.  Mutates `root` in place.
+fn extract_solved_path(root: &mut ProofNode) {
+    let mut path: Vec<String> = Vec::new();
+    if find_solved_path(root, &mut path) {
+        prune_to_path(root, &path);
+    }
+}
+
+fn find_solved_path(node: &ProofNode, path: &mut Vec<String>) -> bool {
+    if matches!(node.status, NodeStatus::Solved) && node.children.is_empty() {
+        return true;
+    }
+    for (label, child) in &node.children {
+        path.push(label.clone());
+        if find_solved_path(child, path) {
+            return true;
+        }
+        path.pop();
+    }
+    false
+}
+
+fn prune_to_path(node: &mut ProofNode, path: &[String]) {
+    if path.is_empty() { return; }
+    let label = &path[0];
+    if let Some(mut child) = node.children.remove(label) {
+        prune_to_path(&mut child, &path[1..]);
+        node.children = BTreeMap::new();
+        node.children.insert(label.clone(), child);
+    }
 }
 
 /// Re-expand only the `Sorry: depth limit` leaves in the existing
@@ -358,7 +401,7 @@ fn expand(
     // Then `execMethods` filters to those that succeed.
     let candidates = candidate_methods(&node.sys, ctx);
     if dbg_expand {
-        let names: Vec<String> = candidates.iter().map(|m| format!("{:?}", m).chars().take(40).collect()).collect();
+        let names: Vec<String> = candidates.iter().map(|m| format!("{:?}", m).chars().take(180).collect()).collect();
         eprintln!("[expand] candidates: {:?}", names);
     }
     let (method, cases) = {

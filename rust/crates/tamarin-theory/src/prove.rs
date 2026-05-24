@@ -173,15 +173,14 @@ pub fn prove_lemma(
             typing_assumptions.push(rg);
         }
     }
-    if !typing_assumptions.is_empty() {
-        if trace { eprintln!("[phase] refine_with_source_asms start"); }
-        ctx.full_sources = crate::constraint::solver::sources::refine_with_source_asms(
-            std::mem::take(&mut ctx.full_sources),
-            &typing_assumptions,
-            &ctx,
-        );
-        if trace { eprintln!("[phase] refine_with_source_asms done"); }
-    }
+    // HS-faithful lazy refinement: store typing assumptions on the
+    // ctx; `ensure_saturated` applies `refine_with_source_asms` AFTER
+    // its own saturate, both deferred to first source-case access.
+    // This keeps `prove_lemma`'s setup silent (no saturate traces
+    // emitted upfront) so the lemma proof's first `[EXEC]
+    // simplifySystem` appears at the trace's head — matching HS's
+    // proof-then-saturate-on-demand ordering.
+    ctx.typing_assumptions = typing_assumptions;
     if trace { eprintln!("[phase] run_proof_search start"); }
     // Honour the `[use_induction]` and `[sources]` attributes by
     // forcing the first proof method to be Induction. Haskell's

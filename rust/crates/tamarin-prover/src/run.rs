@@ -70,6 +70,12 @@ pub struct LemmaResult {
     pub name: String,
     pub verdict: LemmaVerdict,
     pub elapsed_ms: u128,
+    /// Proof-tree node count — matches HS's "(N steps)" in
+    /// `--prove` output (Theory.Proof.proofStepCount).
+    pub proof_steps: usize,
+    /// `true` for `exists-trace` lemmas, `false` for `all-traces`.
+    /// Drives the trace-quantifier label in the summary.
+    pub exists_trace: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -295,6 +301,11 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                         LemmaVerdict::Filtered
                     },
                     elapsed_ms: 0,
+                    proof_steps: 0,
+                    exists_trace: matches!(
+                        l.trace_quantifier,
+                        tamarin_theory::theory::TraceQuantifier::ExistsTrace,
+                    ),
                 });
             }
         } else {
@@ -318,11 +329,17 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
 
             for l in elaborated.lemmas() {
                 let lemma_name = l.name.clone();
+                let exists_trace = matches!(
+                    l.trace_quantifier,
+                    tamarin_theory::theory::TraceQuantifier::ExistsTrace,
+                );
                 if !lemma_matches(lemma_filter, &lemma_name) {
                     results.push(LemmaResult {
                         name: lemma_name,
                         verdict: LemmaVerdict::Filtered,
                         elapsed_ms: 0,
+                        proof_steps: 0,
+                        exists_trace,
                     });
                     continue;
                 }
@@ -331,38 +348,44 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 }
                 let lt = Instant::now();
                 let outcome = prove_lemma(&parsed, &lemma_name, maude.clone(), budget);
-                let verdict = match outcome {
-                    Ok(root) => match root.status {
-                        NodeStatus::Solved => {
-                            if matches!(
-                                l.trace_quantifier,
-                                tamarin_theory::theory::TraceQuantifier::ExistsTrace,
-                            ) {
-                                LemmaVerdict::Verified
-                            } else {
-                                LemmaVerdict::Falsified
+                let (verdict, proof_steps) = match outcome {
+                    Ok(root) => {
+                        let steps = count_proof_steps(&root);
+                        let v = match root.status {
+                            NodeStatus::Solved => {
+                                if matches!(
+                                    l.trace_quantifier,
+                                    tamarin_theory::theory::TraceQuantifier::ExistsTrace,
+                                ) {
+                                    LemmaVerdict::Verified
+                                } else {
+                                    LemmaVerdict::Falsified
+                                }
                             }
-                        }
-                        NodeStatus::Contradictory => {
-                            if matches!(
-                                l.trace_quantifier,
-                                tamarin_theory::theory::TraceQuantifier::ExistsTrace,
-                            ) {
-                                LemmaVerdict::Falsified
-                            } else {
-                                LemmaVerdict::Verified
+                            NodeStatus::Contradictory => {
+                                if matches!(
+                                    l.trace_quantifier,
+                                    tamarin_theory::theory::TraceQuantifier::ExistsTrace,
+                                ) {
+                                    LemmaVerdict::Falsified
+                                } else {
+                                    LemmaVerdict::Verified
+                                }
                             }
-                        }
-                        NodeStatus::Sorry
-                        | NodeStatus::Unfinishable
-                        | NodeStatus::Open => LemmaVerdict::Analyzed,
-                    },
-                    Err(e) => LemmaVerdict::Error(format!("{}", e)),
+                            NodeStatus::Sorry
+                            | NodeStatus::Unfinishable
+                            | NodeStatus::Open => LemmaVerdict::Analyzed,
+                        };
+                        (v, steps)
+                    }
+                    Err(e) => (LemmaVerdict::Error(format!("{}", e)), 0),
                 };
                 results.push(LemmaResult {
                     name: lemma_name,
                     verdict,
                     elapsed_ms: lt.elapsed().as_millis(),
+                    proof_steps,
+                    exists_trace,
                 });
             }
 
@@ -450,6 +473,15 @@ pub fn out_path_for(args: &Args, in_file: &str) -> Option<String> {
     None
 }
 
+/// Count proof-tree nodes in HS's `proofStepCount` style — the number
+/// of `LNode` constructors in the proof tree.  Each `step` in the
+/// proof's textual form (a `simplify` / `solve(...) case X` /
+/// `qed` / `SOLVED` annotation) corresponds to one ProofNode.
+/// Mirrors `Theory.Proof.proofStepCount`.
+fn count_proof_steps(node: &tamarin_theory::constraint::solver::search::ProofNode) -> usize {
+    1 + node.children.values().map(count_proof_steps).sum::<usize>()
+}
+
 fn format_summary(in_file: &str, results: &[LemmaResult]) -> String {
     let mut s = String::new();
     s.push_str("/*\n");
@@ -464,11 +496,16 @@ fn format_summary(in_file: &str, results: &[LemmaResult]) -> String {
                 LemmaVerdict::Error(msg) => format!(" — {}", msg),
                 _ => String::new(),
             };
+            // HS-faithful format: "(<quantifier>): <verdict> - found
+            // trace (<N> steps)" or "(<quantifier>, <N> steps): <verdict>"
+            // depending on context.  We use HS's
+            // `--prove` summary form: "(<quantifier>, <N> steps):
+            // <verdict>" where N is the proof-tree node count.
             s.push_str(&format!(
                 "  {} ({}, {} steps): {}{}\n",
                 r.name,
-                tag_for(&r.verdict),
-                r.elapsed_ms,
+                tag_for(&r.verdict, r.exists_trace),
+                r.proof_steps,
                 r.verdict.label(),
                 suffix
             ));
@@ -478,11 +515,13 @@ fn format_summary(in_file: &str, results: &[LemmaResult]) -> String {
     s
 }
 
-fn tag_for(v: &LemmaVerdict) -> &'static str {
+fn tag_for(v: &LemmaVerdict, exists_trace: bool) -> &'static str {
     match v {
-        LemmaVerdict::Verified => "all-traces",
-        LemmaVerdict::Falsified => "all-traces",
-        LemmaVerdict::Analyzed => "all-traces",
+        LemmaVerdict::Verified
+        | LemmaVerdict::Falsified
+        | LemmaVerdict::Analyzed => {
+            if exists_trace { "exists-trace" } else { "all-traces" }
+        }
         LemmaVerdict::Skipped => "skipped",
         LemmaVerdict::Filtered => "filtered",
         LemmaVerdict::Error(_) => "error",

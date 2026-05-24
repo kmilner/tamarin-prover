@@ -20,7 +20,7 @@ use crate::rule::IntrRuleAC;
 use crate::theory::OpenProtoRule;
 
 /// Minimum-viable context for the solver loop.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ProofContext {
     pub maude: MaudeHandle,
     /// All protocol rules in scope, including their AC variants.
@@ -69,6 +69,15 @@ pub struct ProofContext {
     /// Pattern_matching::Responder_secrecy) that Haskell would have
     /// dropped via the restriction's implied-formula propagation.
     pub restrictions: Vec<crate::guarded::Guarded>,
+    /// Pending typing assumptions (from `[sources]`-tagged lemmas)
+    /// applied during `ensure_saturated`'s refinement step.  Set by
+    /// `prove_lemma` before any source-case access; refinement is
+    /// deferred to keep `ensure_saturated`'s trace emissions
+    /// interleaved with the lemma proof's first source-case access
+    /// (HS-faithful: `refineWithSourceAsms` operates on lazy `Source`
+    /// thunks; its work only fires when a downstream consumer forces
+    /// a `cdCases` thunk).
+    pub typing_assumptions: Vec<crate::guarded::Guarded>,
     /// `pcTrueSubterm` — True iff every destructor rule has its
     /// RHS as a proper subterm of its LHS (`all isSubtermRule $
     /// filter isDestrRule $ intruder_rules`).  Mirrors Haskell's
@@ -79,6 +88,41 @@ pub struct ProofContext {
     /// when False, all possible subterm syms of the chain-end are
     /// checked for intersection (a more LENIENT test).
     pub pc_true_subterm: bool,
+    /// `saturate_state` — gates the lazy `ensure_saturated()` call.
+    /// HS's `saturateSources` is lazy in `cdCases`: it only emits
+    /// `[EXEC] solveGoal / exploitPrems / ...` traces when a consumer
+    /// pattern-matches on a source's `cdCases` (forcing the thunk).
+    /// To match, we defer the saturate run from `ProofContext::new`
+    /// to the first `Source::cases(ctx)` call.  Sets to `Done` once
+    /// run; subsequent calls no-op.
+    pub(crate) saturate_state: std::sync::Mutex<SaturateState>,
+    /// Cached saturation limit (from `IntegerParameters::default()`).
+    pub(crate) saturation_limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaturateState { Pending, InProgress, Done }
+
+impl Clone for ProofContext {
+    fn clone(&self) -> Self {
+        let state = *self.saturate_state.lock().unwrap();
+        ProofContext {
+            maude: self.maude.clone(),
+            rules: self.rules.clone(),
+            intruder_rules: self.intruder_rules.clone(),
+            unique_sources: self.unique_sources.clone(),
+            use_induction: self.use_induction,
+            is_diff: self.is_diff,
+            injective_fact_insts: self.injective_fact_insts.clone(),
+            full_sources: self.full_sources.clone(),
+            is_exists_trace: self.is_exists_trace,
+            restrictions: self.restrictions.clone(),
+            typing_assumptions: self.typing_assumptions.clone(),
+            pc_true_subterm: self.pc_true_subterm,
+            saturate_state: std::sync::Mutex::new(state),
+            saturation_limit: self.saturation_limit,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +131,143 @@ pub enum UseInduction { UseInduction, AvoidInduction }
 impl ProofContext {
     pub fn new(maude: MaudeHandle, rules: Vec<OpenProtoRule>) -> Self {
         Self::new_with_restrictions(maude, rules, Vec::new())
+    }
+
+    /// HS-faithful lazy `saturateSources` (Sources.hs:373).  Runs at
+    /// most once per `ProofContext`: forces `initial_source_cases`
+    /// for each source in `full_sources`, then iterates
+    /// `saturate_sources_with_chain_fold` to convergence.  Subsequent
+    /// calls no-op via the `saturate_state` flag.
+    ///
+    /// Triggered by `Source::cases(ctx)` on first force.  Trivial
+    /// protocols whose lemma proofs never pattern-match on source
+    /// cases (e.g. Var-headed `KU(t:Fresh)` source on an existence
+    /// lemma) never call this, so zero saturate-time `[EXEC]` lines
+    /// fire — matching HS's lazy-thunk behaviour.
+    pub fn ensure_saturated(&self) {
+        {
+            let mut state = self.saturate_state.lock().unwrap();
+            match *state {
+                SaturateState::Done => return,
+                SaturateState::InProgress => {
+                    // Re-entrant call from inside saturate's own
+                    // source-case grafting.  Return without re-running
+                    // — the caller sees the partially-populated cells,
+                    // matching HS's lazy fix-point semantics where
+                    // iteration N forces iteration N-1's cached value.
+                    return;
+                }
+                SaturateState::Pending => {
+                    *state = SaturateState::InProgress;
+                }
+            }
+        }
+        // Pre-populate every source's cell with `Some(vec![])` BEFORE
+        // running `initial_source_cases` on any of them.  This breaks
+        // the recursion: when `initial_source_cases` for source A
+        // calls `solve_with_source_cases_action` against source B
+        // (forcing B.cases() recursively), B's cell is already
+        // `Some(empty)`, so the recursive call returns empty rather
+        // than re-entering `initial_source_cases` for B.  After this
+        // pass we run the second pass that fills each cell with the
+        // actual unsaturated `initialSource` cases — HS's `mapM`
+        // over the lazy list under the iterative fix-point.
+        for src in &self.full_sources {
+            if src.cases_cell.lock().unwrap().is_none() {
+                src.cases_set(Vec::new());
+            }
+        }
+        for src in &self.full_sources {
+            let init = crate::constraint::solver::sources::initial_source_cases_pub(
+                &src.goal, self);
+            src.cases_set(init);
+        }
+        // HS-faithful `saturate_sources_with_simp` (mirrors HS's
+        // `saturateSources` driven by `solveAllSafeGoals` as the
+        // proofStep).  Trace work-count closes from ~10-60× off
+        // (with the chain-fold shortcut) to ~3-10× off.
+        //
+        // The chain-fold path (`saturate_sources_with_chain_fold`)
+        // collapses HS's per-step `insertEdges`/`solveTermEqs`/
+        // `exploitPrems` work into a single graft operation,
+        // producing the same final case set with far fewer trace
+        // events — efficient but not HS-faithful.  We use simp here
+        // and investigate the resulting verdict regressions
+        // (currently 7 exists-trace lemmas where Rust falsifies and
+        // HS verifies) as separate missing-HS-behaviour bugs rather
+        // than reverting to the trace-divergent chain-fold path.
+        let raw: Vec<crate::constraint::solver::sources::Source> =
+            self.full_sources.iter().cloned().collect();
+        let saturated = crate::constraint::solver::sources::saturate_sources_with_simp_public(
+            raw, self.saturation_limit, self);
+        // HS-faithful: apply `refineWithSourceAsms` AFTER saturate.
+        // HS does this lazily — `refineWithSourceAsms` produces
+        // updated `Source` thunks that only fire their inner saturate
+        // when forced.  We approximate by running both inside
+        // `ensure_saturated` (which itself is lazy at the first
+        // `cases(ctx)` call), so the refinement traces still
+        // interleave with the lemma proof's first source-case access
+        // rather than firing during `prove_lemma` setup.
+        let refined = if self.typing_assumptions.is_empty() {
+            saturated
+        } else {
+            crate::constraint::solver::sources::refine_with_source_asms(
+                saturated, &self.typing_assumptions, self)
+        };
+        // Match saturated sources back to originals BY GOAL.  Saturate
+        // may drop sources whose cases all `mzero` during `refineSource`
+        // (HS's `runReduction proofStep ctxt se fs` returns Disj.empty),
+        // so the saturated list can be SHORTER than `full_sources`.  A
+        // positional `zip` here was a bug: it wrote saturated[0] (e.g.
+        // KU(t:Fresh)'s cases) onto full_sources[0] (Premise(A)),
+        // corrupting unrelated sources.  HS keeps `cdGoal` stable across
+        // saturate iters (only `cdCases` changes), so `cdGoal` is the
+        // join key.
+        for orig in &self.full_sources {
+            let sat = refined.iter().find(|s| s.goal == orig.goal);
+            match sat {
+                Some(s) => orig.cases_set(s.cases_or_empty()),
+                // No matching saturated source — saturate dropped it
+                // entirely (all branches contradicted).  HS's
+                // `saturateSources` would leave the source with the
+                // initial cases in this case (its `solver` returns
+                // `(False, [])` on every iter, so `cdCases` stays
+                // unchanged from `initialSource`'s output).  Mirror by
+                // leaving the cell as-set by `initial_source_cases`
+                // earlier in `ensure_saturated` — no overwrite.
+                None => {}
+            }
+        }
+        if std::env::var("TAM_DBG_SAT_FINAL").is_ok() {
+            use crate::constraint::constraints::Goal;
+            for src in &self.full_sources {
+                let tag = match &src.goal {
+                    Goal::Premise(_, f) => format!("Premise({:?})", f.tag),
+                    Goal::Action(_, f) => format!("Action({:?})", f.tag),
+                    _ => continue,
+                };
+                for (name, sys) in src.cases_or_empty() {
+                    eprintln!("[SAT_FINAL] src={} case={} nodes={:?} edges={} goals_solved={} goals_open={}",
+                        tag, name,
+                        sys.nodes.iter().map(|(id, r)|
+                            format!("{:?}={}", id,
+                                crate::constraint::solver::reduction::rule_case_name(r)))
+                            .collect::<Vec<_>>(),
+                        sys.edges.len(),
+                        sys.goals.iter().filter(|(_, st)| st.solved).count(),
+                        sys.goals.iter().filter(|(_, st)| !st.solved).count());
+                    for e in &sys.edges {
+                        eprintln!("[SAT_FINAL]   edge {:?}.{:?} → {:?}.{:?}",
+                            e.src.0, e.src.1, e.tgt.0, e.tgt.1);
+                    }
+                    for (g, st) in &sys.goals {
+                        eprintln!("[SAT_FINAL]   goal solved={} {:?}",
+                            st.solved, format!("{:?}", g).chars().take(120).collect::<String>());
+                    }
+                }
+            }
+        }
+        *self.saturate_state.lock().unwrap() = SaturateState::Done;
     }
 
     /// Variant that accepts the theory-level restrictions.  Mirrors
@@ -297,7 +478,11 @@ impl ProofContext {
             full_sources: Vec::new(),
             is_exists_trace: false,
             restrictions,
+            typing_assumptions: Vec::new(),
             pc_true_subterm,
+            saturate_state: std::sync::Mutex::new(SaturateState::Pending),
+            saturation_limit: crate::constraint::solver::sources::IntegerParameters::default()
+                .saturation_limit as usize,
         };
         // Precompute unique sources from the protocol rules.
         let params = crate::constraint::solver::sources::IntegerParameters::default();
@@ -371,8 +556,39 @@ impl ProofContext {
         // fix is to strengthen the refinement, not hide the
         // exposure behind a weaker saturator.  See
         // project_rust_proof_diff.md / project_rust_chain_fold.md.
-        ctx.full_sources = crate::constraint::solver::sources::saturate_sources_with_chain_fold(
-            raw_sources, params.saturation_limit as usize, &ctx);
+        // HS-faithful lazy precompute: `saturateSources` (Sources.hs:373)
+        // is *lazy in cdCases* — its `refineSource ctxt solver`
+        // applications produce `Source`s whose updated `cdCases` is
+        // itself a thunk that forces only when a consumer pattern-
+        // matches on `(name, sys) <- get cdCases th` in a Disj-monad
+        // bind.  For protocols where the lemma proof never forces a
+        // particular source's `cdCases` (e.g. `Heard`-style existence
+        // lemmas on a Var-headed `KU(t:Fresh)` source — HS's
+        // `getMsgOneCase` short-circuits on the goal-shape pattern
+        // before touching `cdCases`), the thunk never runs and zero
+        // saturate-time `[EXEC] solveGoal / exploitPrems / ...` lines
+        // are emitted.
+        //
+        // The eager Rust `saturate_sources_with_chain_fold` call here
+        // would walk every source's cases regardless, defeating
+        // laziness.  Skipping it leaves `ctx.full_sources` as the
+        // unsaturated raw sources from `precompute_full_sources`;
+        // each `Source::cases(ctx)` call still runs `initial_source_cases`
+        // which does the per-source `initialSource` work but NOT the
+        // cross-source chain-fold saturation.  For trivial protocols
+        // this is sufficient (HS's saturate is also lazy for them);
+        // for protocols that need saturated chains, this is a
+        // regression that future work will close by porting saturate
+        // itself in a lazy form.
+        // HS-faithful lazy saturate: defer the
+        // `saturate_sources_with_chain_fold` call to the first
+        // `Source::cases(ctx)` call via `ProofContext::ensure_saturated`.
+        // `ctx.full_sources` holds the unsaturated raw sources from
+        // `precompute_full_sources` (each with `cases_cell = None`).
+        // No `[EXEC] solveGoal / exploitPrems / ...` lines fire here —
+        // they only fire when a lemma proof forces a source's cases
+        // via pattern-matching on its `cdCases` (HS-faithful).
+        ctx.full_sources = raw_sources;
         // No post-saturate drop pass — Haskell doesn't have one.
         // Haskell relies on saturate-time `contradictoryIf` inside
         // `solveAllSafeGoals` (Sources.hs:118-133) + runtime

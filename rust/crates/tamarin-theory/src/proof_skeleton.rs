@@ -63,8 +63,10 @@ fn render_node(node: &ProofNode, indent: usize, out: &mut String) {
                 out.push_str(" */\n");
             }
             ProofMethod::Finished(MethodResult::Solved) => {
+                // Mirror HS `prettyProofMethod` (ProofMethod.hs:1327):
+                //   `keyword_ "SOLVED" <-> lineComment_ "trace found"`.
                 out.push_str(&pad);
-                out.push_str("SOLVED\n");
+                out.push_str("SOLVED // trace found\n");
             }
             ProofMethod::Finished(MethodResult::Unfinishable) => {
                 out.push_str(&pad);
@@ -93,7 +95,7 @@ fn render_node(node: &ProofNode, indent: usize, out: &mut String) {
                 out.push_str(&pad);
                 out.push_str(match node.status {
                     NodeStatus::Contradictory => "by contradiction /* closed */\n",
-                    NodeStatus::Solved => "SOLVED\n",
+                    NodeStatus::Solved => "SOLVED // trace found\n",
                     NodeStatus::Sorry => "by sorry\n",
                     NodeStatus::Unfinishable => "by sorry /* unfinishable */\n",
                     NodeStatus::Open => "by sorry /* open */\n",
