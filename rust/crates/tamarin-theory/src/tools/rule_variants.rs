@@ -187,13 +187,13 @@ pub fn abstract_rule_and_variants(
     rule: &ProtoRuleE,
 ) -> Result<Option<(ProtoRuleE, Vec<LNSubstVFresh>)>, VariantsError> {
     use tamarin_term::function_symbols::FunSym;
+    use tamarin_term::lterm::HasFrees;
     let irreducible = maude.maude_sig().irreducible_fun_syms.clone();
-    // Memoization: term → fresh LVar.  Order-preserving so the same
-    // rule always abstracts identically.
-    let mut bindings: Vec<(LNTerm, LVar)> = Vec::new();
-    // Avoid clashes with the rule's existing free vars.
+
+    // Avoid clashes with the rule's existing free vars.  HS:
+    // `convertRule \`evalFreshTAvoiding\` ru` — Fresh counter starts at
+    // (max idx of rule's free vars) + 1.
     let avoid_max: u64 = {
-        use tamarin_term::lterm::HasFrees;
         let m = std::cell::Cell::new(0u64);
         let visit = |v: &LVar| {
             if v.idx > m.get() { m.set(v.idx); }
@@ -223,37 +223,40 @@ pub fn abstract_rule_and_variants(
         }
     }
 
+    // Memoization: original term → fresh LVar.  HS: `BindT` state
+    // (RuleVariants.hs:93) ensures each unique LNTerm gets ONE binding,
+    // reused on subsequent encounters.
+    let mut bindings: Vec<(LNTerm, LVar)> = Vec::new();
+
+    // HS-faithful `abstrTerm` (RuleVariants.hs:103-109).
     fn abstr_term(
         t: &LNTerm,
         irreducible: &std::collections::BTreeSet<FunSym>,
         bindings: &mut Vec<(LNTerm, LVar)>,
         maude: &MaudeHandle,
     ) -> LNTerm {
-        match t {
-            Term::App(f, args) if irreducible.contains(f) => {
-                // Irreducible head: recurse into args.
-                Term::App(
+        // Irreducible head: recurse into args.
+        if let Term::App(f, args) = t {
+            if irreducible.contains(f) {
+                return Term::App(
                     f.clone(),
                     args.iter().map(|a| abstr_term(a, irreducible, bindings, maude)).collect(),
-                )
+                );
             }
-            Term::App(_, _) => {
-                // Reducible head: abstract into fresh LVar.
-                if let Some((_, v)) = bindings.iter().find(|(k, _)| k == t) {
-                    return Term::Lit(tamarin_term::vterm::Lit::Var(v.clone()));
-                }
-                let new_idx = maude.reserve_idxs(1);
-                let v = LVar {
-                    name: name_hint(t),
-                    sort: sort_of_term(t),
-                    idx: new_idx,
-                };
-                bindings.push((t.clone(), v.clone()));
-                Term::Lit(tamarin_term::vterm::Lit::Var(v))
-            }
-            // Lit (vars / consts) — keep as-is.
-            Term::Lit(_) => t.clone(),
         }
+        // Catch-all: import binding (handles leaf vars AND reducible-head
+        // App).  HS: `abstrTerm t = do at <- varTerm <$> importBinding ...`.
+        if let Some((_, v)) = bindings.iter().find(|(k, _)| k == t) {
+            return Term::Lit(tamarin_term::vterm::Lit::Var(v.clone()));
+        }
+        let new_idx = maude.reserve_idxs(1);
+        let v = LVar {
+            name: name_hint(t),
+            sort: sort_of_term(t),
+            idx: new_idx,
+        };
+        bindings.push((t.clone(), v.clone()));
+        Term::Lit(tamarin_term::vterm::Lit::Var(v))
     }
 
     fn abstr_fact(
@@ -271,6 +274,38 @@ pub fn abstract_rule_and_variants(
         }
     }
 
+    // HS-faithful: import ALL leaf vars FIRST (RuleVariants.hs:95
+    // `mapM_ abstrTerm [varTerm v | v <- frees (prems0, concs0, acts0, nvs0)]`).
+    // This populates the bindings map so leaf vars get RENAMED to fresh
+    // idxs with name preserved (via getHint = lvarName for Var).  Without
+    // this, abstractionSubst lacks leaf-var entries and downstream
+    // composeVFresh leaves the original rule's free vars unrenamed, which
+    // makes Maude's variant-witness allocation collide across variants.
+    //
+    // `TAM_RS_DISABLE_LEAF_RENAME=1` opts out for diagnosis.
+    let leaf_rename = std::env::var("TAM_RS_DISABLE_LEAF_RENAME").is_err();
+    if leaf_rename {
+        let mut leaf_vars: Vec<LVar> = Vec::new();
+        let mut seen: std::collections::BTreeSet<LVar> = std::collections::BTreeSet::new();
+        // HS uses `frees` over a Map — deduplicated.  Order is the Map's
+        // traversal order (alphabetical by name/sort/idx via Ord).
+        let mut visit = |v: &LVar| {
+            if seen.insert(v.clone()) {
+                leaf_vars.push(v.clone());
+            }
+        };
+        for f in &rule.premises { f.terms.iter().for_each(|t| t.for_each_free(&mut visit)); }
+        for f in &rule.actions { f.terms.iter().for_each(|t| t.for_each_free(&mut visit)); }
+        for f in &rule.conclusions { f.terms.iter().for_each(|t| t.for_each_free(&mut visit)); }
+        for t in &rule.new_vars { t.for_each_free(&mut visit); }
+        for v in leaf_vars {
+            let leaf_term: LNTerm = Term::Lit(tamarin_term::vterm::Lit::Var(v));
+            // The result is discarded; the side effect on `bindings` is
+            // what matters.
+            let _ = abstr_term(&leaf_term, &irreducible, &mut bindings, maude);
+        }
+    }
+
     let prems: Vec<Fact<LNTerm>> = rule.premises.iter()
         .map(|f| abstr_fact(f, &irreducible, &mut bindings, maude)).collect();
     let concs: Vec<Fact<LNTerm>> = rule.conclusions.iter()
@@ -280,8 +315,12 @@ pub fn abstract_rule_and_variants(
     let nvs: Vec<LNTerm> = rule.new_vars.iter()
         .map(|t| abstr_term(t, &irreducible, &mut bindings, maude)).collect();
 
-    if bindings.is_empty() {
-        // No reducible heads → no abstraction → no useful variants.
+    // Count reducible-head abstractions: if zero, no useful variants.
+    // (With leaf-rename, `bindings` always non-empty when rule has vars.)
+    let has_reducible_abstraction = bindings.iter().any(|(t, _)| {
+        matches!(t, Term::App(f, _) if !irreducible.contains(f))
+    });
+    if !has_reducible_abstraction {
         return Ok(None);
     }
 
@@ -293,16 +332,18 @@ pub fn abstract_rule_and_variants(
         acts,
     ).with_new_vars(nvs);
 
-    // abstraction_pairs: {z_i → original_term_i}
+    // abstractionSubst (HS RuleVariants.hs:70-71):
+    //   `eqsAbstr = map swap (M.toList bindings)` — list of (lvar, orig_term).
+    //   `abstractionSubst = substFromList eqsAbstr` — FREE Subst.
+    //
+    // With leaf-rename, this includes BOTH leaf entries `(lv_renamed,
+    // Var v_orig)` AND reducible entries `(z_i, complex_term)`.
     let abstraction_pairs: Vec<(LVar, LNTerm)> = bindings.iter()
         .map(|(t, v)| (v.clone(), t.clone()))
         .collect();
+    let abstraction_subst: LNSubst = Subst::from_list(abstraction_pairs.clone());
 
-    // Pack the original (pre-abstraction) terms and ask Maude for variants.
-    // The variants have domain ⊆ vars(original_terms) ⊆ original rule's
-    // free vars.  We then COMPOSE with abstraction_pairs to get a
-    // substitution whose domain is z_i — exactly what the SplitG
-    // expects to apply on the abstracted rule's terms.
+    // `abstractedTerms = map snd eqsAbstr` — the ORIGINAL terms.
     let abstracted_terms: Vec<LNTerm> = bindings.iter().map(|(t, _)| t.clone()).collect();
     let packed = Term::App(FunSym::List, abstracted_terms);
     let raw_substs = match maude.variants(&packed) {
@@ -313,59 +354,85 @@ pub fn abstract_rule_and_variants(
         return Ok(None);
     }
 
-    // For each variant subst, compose with abstraction bindings.
-    // Haskell-faithful: `composeVFresh vsubst abstractionSubst` followed
-    // by `restrictVFresh (frees abstrPsCsAs)`.  Without including
-    // sigma's bindings for the original rule's vars (not just z_i),
-    // the variant subst's m/s/pkA → ... constraints get LOST.
+    // HS pipeline per variant (RuleVariants.hs:73-77):
+    //   restrictVFresh (frees abstrPsCsAs) $
+    //     removeRenamings $ normSubstVFresh' $
+    //     composeVFresh vsubst abstractionSubst
     //
-    // `(vsubst ∘ abstractionSubst)(v)` is:
-    //   - if v ∈ dom(abstractionSubst) = {z_i}: vsubst(abstractionSubst(v)) = vsubst(original_t)
-    //   - else: vsubst(v)
-    //
-    // Then `restrictVFresh (frees abstrPsCsAs)` keeps only domain
-    // entries whose variable is in the abstracted rule's frees.
-    use tamarin_term::lterm::HasFrees;
-    let mut abstr_frees: std::collections::BTreeSet<LVar> = std::collections::BTreeSet::new();
-    for f in &abstracted_rule.premises {
-        for t in &f.terms { t.for_each_free(&mut |v| { abstr_frees.insert(v.clone()); }); }
-    }
-    for f in &abstracted_rule.actions {
-        for t in &f.terms { t.for_each_free(&mut |v| { abstr_frees.insert(v.clone()); }); }
-    }
-    for f in &abstracted_rule.conclusions {
-        for t in &f.terms { t.for_each_free(&mut |v| { abstr_frees.insert(v.clone()); }); }
-    }
-    for t in &abstracted_rule.new_vars {
-        t.for_each_free(&mut |v| { abstr_frees.insert(v.clone()); });
+    // We use the new `compose_vfresh` helper (mirrors HS's full pipeline:
+    // extendWithRenaming + freshToFreeAvoidingFast + compose + freeToFreshRaw).
+    // Without this, two variants whose Maude-back-conversion shapes
+    // happen to collide end up with structurally-identical range vars
+    // and collapse at perform_split (split_case ordering bug).
+    let abstr_frees: Vec<LVar> = {
+        let mut s: std::collections::BTreeSet<LVar> = std::collections::BTreeSet::new();
+        for f in &abstracted_rule.premises {
+            for t in &f.terms { t.for_each_free(&mut |v| { s.insert(v.clone()); }); }
+        }
+        for f in &abstracted_rule.actions {
+            for t in &f.terms { t.for_each_free(&mut |v| { s.insert(v.clone()); }); }
+        }
+        for f in &abstracted_rule.conclusions {
+            for t in &f.terms { t.for_each_free(&mut |v| { s.insert(v.clone()); }); }
+        }
+        for t in &abstracted_rule.new_vars {
+            t.for_each_free(&mut |v| { s.insert(v.clone()); });
+        }
+        s.into_iter().collect()
+    };
+
+    // `TAM_RS_DISABLE_HS_COMPOSE_PIPELINE=1` reverts to the old manual
+    // composition path for diagnosis.
+    let use_hs_compose = std::env::var("TAM_RS_DISABLE_HS_COMPOSE_PIPELINE").is_err();
+
+    if std::env::var("TAM_DBG_HS_COMPOSE").is_ok() {
+        eprintln!("[hs-compose] rule={:?} leaf_rename={} use_hs_compose={} #variants={}",
+                  rule.info.name, leaf_rename, use_hs_compose, raw_substs.len());
     }
     let composed_substs: Vec<LNSubstVFresh> = raw_substs.into_iter().map(|pairs| {
-        let sigma: LNSubst = Subst::from_list(pairs.into_iter().collect::<Vec<_>>());
-        // 1) Bindings for z_i: σ(abstractionSubst(z_i)) = σ(original_t).
-        let mut composed_pairs: Vec<(LVar, LNTerm)> = abstraction_pairs.iter()
-            .map(|(z, t)| {
-                let new_t = apply_vterm(&sigma, t.clone());
-                // Normalise so destructor heads reduce to their narrowed forms.
-                let normalised = maude.reduce(&new_t).unwrap_or(new_t);
-                (z.clone(), normalised)
-            })
-            .collect();
-        // 2) Bindings for v ∉ dom(abstractionSubst) (original rule's vars):
-        //    σ(v) — restricted to abstr_frees.
-        let z_domain: std::collections::BTreeSet<LVar> = abstraction_pairs.iter()
-            .map(|(z, _)| z.clone()).collect();
-        for (v, t) in sigma.to_list().iter() {
-            if z_domain.contains(v) { continue; } // already handled
-            if !abstr_frees.contains(v) { continue; } // outside abstr rule frees
-            let normalised = maude.reduce(t).unwrap_or_else(|_| t.clone());
-            composed_pairs.push((v.clone(), normalised));
+        if use_hs_compose {
+            // HS-faithful path.
+            let vsubst = LNSubstVFresh::from_list(pairs);
+            // composeVFresh vsubst abstractionSubst
+            let composed = tamarin_term::subst_vfresh::compose_vfresh(
+                &vsubst, &abstraction_subst);
+            // normSubstVFresh' — normalise each range term via Maude.
+            let normalised_pairs: Vec<(LVar, LNTerm)> = composed.to_list()
+                .into_iter()
+                .map(|(k, t)| {
+                    let n = maude.reduce(&t).unwrap_or(t);
+                    (k, n)
+                })
+                .collect();
+            let normalised = LNSubstVFresh::from_list(normalised_pairs);
+            // removeRenamings
+            let cleaned = normalised.remove_renamings();
+            // restrictVFresh (frees abstrPsCsAs)
+            cleaned.restrict(&abstr_frees)
+        } else {
+            // Old (pre-pipeline) manual composition path.
+            let sigma: LNSubst = Subst::from_list(pairs.into_iter().collect::<Vec<_>>());
+            let mut composed_pairs: Vec<(LVar, LNTerm)> = abstraction_pairs.iter()
+                .map(|(z, t)| {
+                    let new_t = apply_vterm(&sigma, t.clone());
+                    let normalised = maude.reduce(&new_t).unwrap_or(new_t);
+                    (z.clone(), normalised)
+                })
+                .collect();
+            let z_domain: std::collections::BTreeSet<LVar> = abstraction_pairs.iter()
+                .map(|(z, _)| z.clone()).collect();
+            let abstr_frees_set: std::collections::BTreeSet<LVar> =
+                abstr_frees.iter().cloned().collect();
+            for (v, t) in sigma.to_list().iter() {
+                if z_domain.contains(v) { continue; }
+                if !abstr_frees_set.contains(v) { continue; }
+                let normalised = maude.reduce(t).unwrap_or_else(|_| t.clone());
+                composed_pairs.push((v.clone(), normalised));
+            }
+            LNSubstVFresh::from_list(composed_pairs)
         }
-        LNSubstVFresh::from_list(composed_pairs)
     })
-    .filter(|s| {
-        // Drop pure-renaming variants and identity.
-        !s.is_renaming()
-    })
+    .filter(|s| !s.is_renaming())
     .collect();
 
     if composed_substs.is_empty() {
