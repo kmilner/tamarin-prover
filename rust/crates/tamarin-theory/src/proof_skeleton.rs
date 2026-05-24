@@ -402,7 +402,17 @@ fn normalize_haskell_line(raw: &str) -> Option<String> {
         return Some(format!("{}by sorry", pad));
     }
     if t == "SOLVED" || t.starts_with("SOLVED") || t == "by SOLVED" {
-        return Some(format!("{}SOLVED", pad));
+        // HS pretty-prints `keyword_ "SOLVED" <-> lineComment_ "trace found"`
+        // (ProofMethod.hs:1327), so the raw line is `SOLVED // trace found`.
+        // Our `render` emits the same suffix; preserve it here so the diff
+        // matches verbatim instead of treating the cosmetic comment as a
+        // divergence.
+        let rest = t.strip_prefix("by ").unwrap_or(t)  // "by SOLVED" → "SOLVED"
+                    .strip_prefix("SOLVED").unwrap_or("").trim();
+        if rest.is_empty() {
+            return Some(format!("{}SOLVED", pad));
+        }
+        return Some(format!("{}SOLVED {}", pad, rest));
     }
     // `by solve(...)` and `by induction` — leaf closures that tamarin's
     // printer emits when the case closes after exactly one more proof
