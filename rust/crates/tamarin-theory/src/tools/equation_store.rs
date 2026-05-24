@@ -1230,6 +1230,28 @@ impl EquationStore {
             .flat_map(|t| tamarin_term::vterm::vars_vterm(t))
             .collect();
         let mut new_conj: Vec<EqDisj> = Vec::with_capacity(self.conj.len());
+        // HS-faithful per-variant fresh-state isolation.  In HS, each
+        // `applyBound` call runs `evalFreshAvoiding` independently
+        // (Substitution/SubstVFresh.hs:74-81), so each variant's
+        // witness allocation starts from the same avoid baseline.
+        // The variants' witnesses can OVERLAP in idx because each
+        // ends up in its own SubstVFresh.
+        //
+        // In Rust, Maude's global counter advances monotonically across
+        // calls, so the LAST variant gets the LARGEST witness idxs.
+        // This causes the SubstVFresh Ord at perform_split to order
+        // variants by witness allocation order (first variant always
+        // wins), not by HS-equivalent allocation.
+        //
+        // Snapshot the global counter at loop entry, reset before each
+        // per-variant call.  After the loop, advance the counter to the
+        // high water mark so subsequent (non-per-variant) Maude calls
+        // don't reuse these idxs.  Mirrors HS's per-call evalFreshAvoiding.
+        //
+        // `TAM_RS_DISABLE_PER_VARIANT_COUNTER_RESET=1` opts out for diagnosis.
+        let per_variant_reset = std::env::var("TAM_RS_DISABLE_PER_VARIANT_COUNTER_RESET").is_err();
+        let initial_counter = maude.fresh_counter_peek();
+        let mut high_water_mark = initial_counter;
         for d in self.conj.iter() {
             let mut new_substs: Vec<LNSubstVFresh> = Vec::new();
             for s in &d.substs {
@@ -1243,6 +1265,12 @@ impl EquationStore {
                         eprintln!("  OUT[0] (empty preserved)");
                     }
                     continue;
+                }
+                // HS-faithful: reset counter before each per-variant
+                // call so each variant's witness allocation starts fresh.
+                if per_variant_reset {
+                    high_water_mark = high_water_mark.max(maude.fresh_counter_peek());
+                    maude.reset_counter_to(initial_counter);
                 }
                 // Compute avoid_max = max idx across (domVFresh s ∪
                 // varsRange newsubst).
@@ -1489,6 +1517,15 @@ impl EquationStore {
                 }
             }
             new_conj.push(EqDisj { split_id: d.split_id, substs: new_substs });
+        }
+        // After the per-variant loop, advance Maude's counter to the
+        // high water mark (the max reached across all variant calls).
+        // Without this, subsequent Maude calls might reuse witness idxs
+        // already consumed by the per-variant outputs, causing
+        // (name, sort, idx) collisions in the eq-store.
+        if per_variant_reset {
+            high_water_mark = high_water_mark.max(maude.fresh_counter_peek());
+            maude.ensure_above(high_water_mark.saturating_sub(1));
         }
         self.conj = new_conj;
         self.subst = new_subst;
