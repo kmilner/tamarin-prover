@@ -127,7 +127,7 @@ pub fn term_summary(t: &tamarin_term::lterm::LNTerm) -> String {
             // Include idx for witness vars so we can debug
             // sort-conflation issues — comparing identical-looking
             // names with different idxs.
-            if v.name == "~mw" {
+            if v.name == "x" {
                 format!("{}:{}:{}", v.name, sort_ch, v.idx)
             } else {
                 format!("{}:{}", v.name, sort_ch)

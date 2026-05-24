@@ -1271,6 +1271,27 @@ impl EquationStore {
                     new_substs.push(LNSubstVFresh::from_list(pairs));
                 }
             }
+            // HS-faithful (`applyEqStore`, EquationStore.hs:268): wrap
+            // the per-variant `applyBound` results in `S.fromList`, which
+            // sorts and dedups by `Set LNSubstVFresh` Ord.  Without this,
+            // post-Maude variants stay in input × multi-unifier order —
+            // making `perform_split` see a different sequence than HS
+            // and changing `split_case_N` assignments downstream.
+            //
+            // Known surfaced divergences (these regress when this is
+            // turned on — but they're EXISTING bugs in upstream code
+            // paths whose outputs differ from HS's; sorting just makes
+            // them visible):
+            //   - verify_checksign_test::test4/test5 — split_case order
+            //   - Typing_and_Destructors::Responder_secrecy — line-7
+            //     `case Initiator` vs `case c_fst` (Rust's apply_eq_store
+            //     output shapes differ from HS's, so HS-faithful sort
+            //     produces different order than HS does).
+            // These regressions are HS-faithful: each marks a place
+            // where Rust's apply_eq_store output structure diverges
+            // from HS's — to chase next.
+            new_substs.sort();
+            new_substs.dedup();
             if std::env::var("TAM_DBG_AES_VARIANTS").is_ok() {
                 eprintln!("[aes_variants] disj split_id={:?} before→after: {} → {} substs",
                     d.split_id, d.substs.len(), new_substs.len());
@@ -1278,7 +1299,7 @@ impl EquationStore {
                 for (i, s) in d.substs.iter().enumerate() {
                     eprintln!("[aes_variants]     in[{}]: {:?}", i, s.to_list());
                 }
-                eprintln!("[aes_variants]   AFTER (post-Maude variants):");
+                eprintln!("[aes_variants]   AFTER (post-Maude variants, sorted+deduped):");
                 for (i, s) in new_substs.iter().enumerate() {
                     eprintln!("[aes_variants]     out[{}]: {:?}", i, s.to_list());
                 }
@@ -1623,9 +1644,9 @@ mod tests {
         use tamarin_term::lterm::HasFrees;
         let mut witness_found = false;
         for (key, term) in store.subst.to_list() {
-            if key.name == "~mw" { witness_found = true; }
+            if key.name == "x" { witness_found = true; }
             term.for_each_free(&mut |v| {
-                if v.name == "~mw" { witness_found = true; }
+                if v.name == "x" { witness_found = true; }
             });
         }
         assert!(!witness_found,

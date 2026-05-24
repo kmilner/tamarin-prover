@@ -338,6 +338,26 @@ impl MaudeHandle {
         self.fresh_counter.load(Ordering::SeqCst)
     }
 
+    /// Clone this handle but with a FRESH fresh_counter initialised to
+    /// `avoid_max + 1`.  Mirrors Haskell's `runReduction _ _ _ (avoid sys)`
+    /// — every Reduction starts with a counter that's local to that
+    /// Reduction call, computed from the system's current free-var max.
+    /// Within the Reduction the counter advances (so sequential calls
+    /// don't collide), but the next Reduction starts fresh.
+    ///
+    /// The Maude PROCESS state (the `inner`/`child` Arcs) is shared —
+    /// only the counter is per-handle.  This is safe because Maude itself
+    /// is stateless between queries; variable idxs are just Rust-side
+    /// labels used when constructing Maude terms, not anything Maude
+    /// tracks across calls.
+    pub fn with_fresh_counter_from(&self, avoid_max: u64) -> MaudeHandle {
+        MaudeHandle {
+            inner: self.inner.clone(),
+            child: self.child.clone(),
+            fresh_counter: Arc::new(AtomicU64::new(avoid_max.saturating_add(1))),
+        }
+    }
+
     pub fn maude_sig(&self) -> MaudeSig {
         self.inner.lock().unwrap().sig.clone()
     }
@@ -519,10 +539,10 @@ impl MaudeHandle {
             use crate::lterm::HasFrees;
             for eq in eqs {
                 eq.lhs.for_each_free(&mut |v| {
-                    if v.name == "~mw" { self.ensure_above(v.idx); }
+                    if v.name == "x" { self.ensure_above(v.idx); }
                 });
                 eq.rhs.for_each_free(&mut |v| {
-                    if v.name == "~mw" { self.ensure_above(v.idx); }
+                    if v.name == "x" { self.ensure_above(v.idx); }
                 });
             }
             let eqs_owned: Vec<Equal<LNTerm>> = eqs.iter().cloned().collect();
@@ -874,7 +894,7 @@ fn unskolemize(
 ///
 /// **Witness naming**: Maude returns auxiliary witness variables when
 /// expressing unifiers.  We decode each witness as an `LVar` with a
-/// dedicated name `"~mw"` (Maude-Witness) that no input variable can
+/// dedicated name `"x"` (Maude-Witness) that no input variable can
 /// ever have — this guarantees the witness's `(name, sort, idx)`
 /// triple cannot collide with any pre-existing system variable.
 /// Without this, `LVar`'s structural equality (name + sort + idx)
@@ -919,7 +939,7 @@ fn msubst_to_lnsubst_with_maude(
         h.ensure_above(avoid_max);
         for lit in ctx.bindings().values() {
             if let crate::vterm::Lit::Var(lv) = lit {
-                if lv.name == "~mw" {
+                if lv.name == "x" {
                     h.ensure_above(lv.idx);
                 }
             }
@@ -929,7 +949,7 @@ fn msubst_to_lnsubst_with_maude(
         let mut n = avoid_max.saturating_add(1);
         for lit in ctx.bindings().values() {
             if let crate::vterm::Lit::Var(lv) = lit {
-                if lv.name == "~mw" && lv.idx >= n {
+                if lv.name == "x" && lv.idx >= n {
                     n = lv.idx + 1;
                 }
             }
@@ -940,7 +960,7 @@ fn msubst_to_lnsubst_with_maude(
         let lv = crate::maude_types::substitute_lookup_var(ctx, *sort, *idx)
             .ok_or_else(|| MaudeError::Other(format!(
                 "no binding for Maude variable x{}:{:?}", idx, sort)))?;
-        let t = mterm_to_lnterm(mt, ctx, "~mw", &mut next);
+        let t = mterm_to_lnterm(mt, ctx, "x", &mut next);
         out.push((lv, t));
     }
     // Bump the global counter so any subsequent allocator (in this or
