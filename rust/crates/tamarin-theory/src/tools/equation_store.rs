@@ -181,8 +181,21 @@ impl EquationStore {
 
     /// Add a new disjunction to the front of the conjunction. Returns
     /// the resulting store and the new split id.
+    ///
+    /// TAM_DBG_ADD_DISJ=1 logs each add_disj call's substs at runtime.
     pub fn add_disj(&mut self, substs: Vec<LNSubstVFresh>) -> SplitId {
         let id = self.next_split;
+        if std::env::var("TAM_DBG_ADD_DISJ").is_ok() {
+            eprintln!("[add_disj] split_id={:?} {} substs", id, substs.len());
+            for (i, s) in substs.iter().enumerate() {
+                let pairs: Vec<String> = s.to_list().iter()
+                    .map(|(k, v)| format!("{}:{:?}:{}→{:?}",
+                        k.name, k.sort, k.idx,
+                        format!("{:?}", v).chars().take(80).collect::<String>()))
+                    .collect();
+                eprintln!("[add_disj]   [{}]: {}", i, pairs.join(" ; "));
+            }
+        }
         self.conj.insert(0, EqDisj { split_id: id, substs });
         self.next_split = id.succ();
         id
