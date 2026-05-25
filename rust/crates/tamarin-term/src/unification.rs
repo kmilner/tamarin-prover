@@ -135,33 +135,28 @@ where
     match (&l, &r) {
         (Term::Lit(Lit::Var(vl)), Term::Lit(Lit::Var(vr))) if vl == vr => Ok(()),
         (Term::Lit(Lit::Var(vl)), Term::Lit(Lit::Var(vr))) => {
-            // Var-var unification: orient to the narrower-sort
-            // variable (no `~mw` witness needed).
+            // Haskell-faithful var-var orientation (Unification.hs:240-246):
+            //   same-sort   → if vl < vr then elim vr l else elim vl r
+            //   vl ⊇ vr     → elim vl r   (broader becomes KEY)
+            //   otherwise   → elim vr l   (broader becomes KEY)
             //
-            // For same-sort pairs (`Ordering::Equal`), pick by idx
-            // (lower → higher).  For cross-sort with strict order
-            // (Pub < Msg, Fresh < Msg, etc.), bind the broader-sorted
-            // var to the narrower-sorted one — this is sound because
-            // the unifier must lie in the intersection sort, which IS
-            // the narrower one.  No witness needed.
-            //
-            // The original witness-heavy form
-            // `{vl → ~mw, vr → ~mw}` was an over-mimicry of Maude
-            // that polluted downstream state — `less_atoms` carried
-            // witness LVars, `Fresh`-rule conclusions became
-            // `Fr(~mw:Fresh:N)`, and `enforce_fresh_node_uniqueness_pass`
-            // then bucketed by witness term and merged Fresh nodes
-            // that should have stayed distinct (the TLS_Handshake
-            // prem_idx_clash root cause).
+            // For same-sort, LARGER-idx becomes KEY; smaller-idx
+            // becomes value.  This is the orientation that makes
+            // `restrict stableVars` (Sources.hs:118) and `applySource`
+            // (Sources.hs:178) work — stable pattern vars (small idx)
+            // stay on the value side and get dropped by the key-filter.
             use std::cmp::Ordering;
             match sort_compare(vl.sort, vr.sort) {
                 Some(Ordering::Equal) => {
-                    let (from, to) = if vl.idx <= vr.idx {
-                        (vl.clone(), Term::Lit(Lit::Var(vr.clone())))
-                    } else {
+                    // Haskell `unifyRaw` (Unification.hs:241):
+                    //   `if vl < vr then elim vr l else elim vl r`
+                    // Larger-idx becomes KEY, smaller-idx becomes value.
+                    let (key, val) = if vl < vr {
                         (vr.clone(), Term::Lit(Lit::Var(vl.clone())))
+                    } else {
+                        (vl.clone(), Term::Lit(Lit::Var(vr.clone())))
                     };
-                    eliminate(sort_of_const, acc, from, to)
+                    eliminate(sort_of_const, acc, key, val)
                 }
                 Some(Ordering::Greater) => {
                     // vl > vr (vl is broader) → bind vl to vr.
@@ -873,12 +868,10 @@ mod haskell_invariants {
     }
 
     // -------------------------------------------------------------------
-    // 8. The factored unify and the older `unify_lnterm_no_ac` SHARE
-    //    the orientation invariant for var-vs-non-var (both bind the
-    //    var to the term).  They DIFFER on same-sort var-var direction.
-    //
-    //    This test pins the difference so anyone "unifying" the two
-    //    paths in the future has to actively notice the divergence.
+    // 8. The factored unify and the older `unify_lnterm_no_ac` agree on
+    //    orientation for var-vs-non-var (both bind the var to the term)
+    //    AND on same-sort var-var (Haskell-faithful: larger-idx is key,
+    //    Unification.hs:241).  These tests pin both invariants.
     // -------------------------------------------------------------------
 
     #[test]
@@ -893,11 +886,10 @@ mod haskell_invariants {
     }
 
     #[test]
-    fn old_and_factored_unify_disagree_on_same_sort_var_var_orientation() {
-        // Document the known orientation difference between the two
-        // paths.  This is INTENTIONAL — the factored path is
-        // Haskell-faithful; the old path is Maude-compatible.
-        // Both are unifiers; their canonical forms differ.
+    fn old_and_factored_unify_agree_on_same_sort_var_var_orientation() {
+        // Both paths follow Haskell `unifyRaw` (Unification.hs:241):
+        //   `if vl < vr then elim vr l else elim vl r`
+        // i.e. LARGER-idx becomes KEY, smaller-idx becomes value.
         let small = msg_var("t", 1);   // small idx, "stable"
         let large = msg_var("e", 10);  // large idx
 
@@ -907,20 +899,16 @@ mod haskell_invariants {
         let small_v = as_var(&small).clone();
         let large_v = as_var(&large).clone();
 
-        // Old: smaller-idx is key (Maude/legacy convention).
-        assert!(old.image_of(&small_v).is_some(),
-                "OLD `unify_raw`: smaller-idx (t.1) is the key");
-        assert!(old.image_of(&large_v).is_none());
-
-        // New (factored): larger-idx is key (Haskell `unifyRaw` convention).
+        // Haskell-faithful: larger-idx is key in BOTH paths.
+        assert!(old.image_of(&large_v).is_some(),
+                "`unify_raw`: larger-idx (e.10) is the key");
+        assert!(old.image_of(&small_v).is_none());
         assert!(new_.image_of(&large_v).is_some(),
-                "NEW `unify_raw_factored`: larger-idx (e.10) is the key");
+                "`unify_raw_factored`: larger-idx (e.10) is the key");
         assert!(new_.image_of(&small_v).is_none());
 
-        assert_ne!(old, new_,
-                   "The two unifiers MUST differ here.  If they agree, \
-                    one of them has been changed without updating the \
-                    other — please check the orientation contract \
-                    (LTerm.hs:521, Unification.hs:241).");
+        assert_eq!(old, new_,
+                   "Both unifiers must produce identical substs \
+                    (Haskell-faithful: Unification.hs:241).");
     }
 }
