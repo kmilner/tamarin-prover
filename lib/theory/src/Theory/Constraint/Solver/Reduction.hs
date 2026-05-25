@@ -824,7 +824,12 @@ solveTermEqsLabeled siteLabel splitStrat eqs0 =
           return Unchanged
       eqs1 -> do
         T.traceExecM ("solveTermEqs n=" ++ show (length eqs1))
-        when hsTraceSBindHere $ Debug.Trace.traceM ("[HS_STE_CALL] site=" ++ siteLabel ++ " eqs=" ++ show eqs1)
+        when hsTraceSBindHere $ do
+          let splitTag = case splitStrat of
+                SplitNow -> "SplitNow"
+                SplitLater -> "SplitLater"
+          Debug.Trace.traceM ("[HS_STE_CALL] site=" ++ siteLabel ++
+                              " split=" ++ splitTag ++ " eqs=" ++ show eqs1)
         -- TAM_HS_DBG_SOLVE_TERM_EQS=1: dump every solveTermEqs call's
         -- site label, split strategy, and the equations being solved.
         -- Pair with Rust's TAM_RS_DBG_SOLVE_TERM_EQS for HS↔Rust

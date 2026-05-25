@@ -479,6 +479,27 @@ impl<'ctx> Reduction<'ctx> {
         // subst lazily on read; this is the multi-week audit we're
         // tracking.
         let no_node_fact_subst = std::env::var("TAM_RS_NO_NODE_FACT_SUBST").is_ok();
+        // Haskell-faithful `substNodes` order (Reduction.hs:670-672):
+        //   substNodes = substNodeIds <*
+        //                ((modM sNodes . M.map . apply) =<< getM sSubst)
+        //
+        // `substNodeIds` runs FIRST: applies the eq-store subst to
+        // NODE IDs only (NOT to rule contents) and calls `setNodes`,
+        // which detects id collisions and emits `solveRuleEqs` on
+        // the UN-SUBSTITUTED rules.  This is critical for the
+        // Client_auth chain: case's Register_pk has `~ltkS` post-
+        // refine, live's existing Register_pk has `~ltk`; setNodes
+        // sees them at the same id after node-id rename, emits
+        // rule_eqs `pk(~ltk) = pk(~ltkS)`, which then unifies them.
+        //
+        // After substNodeIds, HS applies subst to rule contents via
+        // `M.map . apply`.
+        //
+        // Rust previously applied node-id rename AND fact substitution
+        // in the SAME loop, so rule_eqs at collision time saw
+        // already-substituted (and thus identical-looking) rules.
+        // Splitting into two passes mirrors HS exactly.
+        let mut id_renamed_nodes: Vec<(crate::constraint::constraints::NodeId, RuleACInst)> = Vec::new();
         for (id, rule) in nodes {
             let id_orig = id.clone();
             let new_id = map_var(id);
@@ -488,64 +509,36 @@ impl<'ctx> Reduction<'ctx> {
                 eprintln!("[subst_node_rename] path={} {}.{} → {}.{}  rule={}",
                     path, id_orig.name, id_orig.idx, new_id.name, new_id.idx, rule_name);
             }
-            // First pass: map_var via map_free for node-ids etc.
-            // Always do node-id rewrites (otherwise edges/goals can't
-            // find their nodes by canonical id).
-            let new_rule = rule.map_free(&mut |v| map_var(v));
-            // Second pass: full term substitution on every fact, so
-            // var→app eq-store bindings reach the rule's terms.
-            // Skipped when TAM_RS_NO_NODE_FACT_SUBST=1.
-            let new_rule = if no_node_fact_subst {
-                new_rule
-            } else {
-                crate::rule::Rule {
-                    info: new_rule.info,
-                    premises: new_rule.premises.iter().map(apply_to_fact).collect(),
-                    conclusions: new_rule.conclusions.iter().map(apply_to_fact).collect(),
-                    actions: new_rule.actions.iter().map(apply_to_fact).collect(),
-                    new_vars: new_rule.new_vars.iter()
-                        .map(|t| {
-                            let substed = tamarin_term::subst::apply_vterm(&subst, t.clone());
-                            normalize_term(substed)
-                        })
-                        .collect(),
-                }
-            };
+            // Pass 1: node-id rename only (HS `substNodeIds` `apply subst`
+            // on the id, not the rule body).  Keep the rule UN-substituted.
+            id_renamed_nodes.push((new_id, rule));
+        }
+        // Pass 1b: dedupe by new_id, detecting collisions on RAW rules.
+        for (new_id, rule) in id_renamed_nodes {
             match id_to_index.get(&new_id).copied() {
                 Some(i) => {
                     collisions += 1;
                     let kept: &RuleACInst = &new_nodes[i].1;
-                    // Haskell `solveRuleEqs` (Reduction.hs:749-754)
-                    // checks `rInfo` equality FIRST: two distinct rule
-                    // instances cannot live at the same node id.  Same
-                    // shape but different rule names/infos is just as
-                    // contradictory as different shapes.
-                    if kept.info != new_rule.info {
+                    if kept.info != rule.info {
                         shape_mismatch = true;
                         shape_mm += 1;
-                    } else if kept.premises.len() != new_rule.premises.len()
-                        || kept.conclusions.len() != new_rule.conclusions.len()
-                        || kept.actions.len() != new_rule.actions.len()
+                    } else if kept.premises.len() != rule.premises.len()
+                        || kept.conclusions.len() != rule.conclusions.len()
+                        || kept.actions.len() != rule.actions.len()
                     {
-                        // Two distinct rule instances collapsed to the
-                        // same node id but their fact-list shapes
-                        // disagree — there's no consistent rule for
-                        // this node, so the system is contradictory.
-                        // Haskell's `setNodes` reaches the same
-                        // conclusion via `solveRuleEqs` failing.
                         shape_mismatch = true;
                     } else {
-                        for (a, b) in kept.premises.iter().zip(new_rule.premises.iter()) {
+                        for (a, b) in kept.premises.iter().zip(rule.premises.iter()) {
                             rule_eqs.push(tamarin_term::rewriting::Equal {
                                 lhs: a.clone(), rhs: b.clone(),
                             });
                         }
-                        for (a, b) in kept.conclusions.iter().zip(new_rule.conclusions.iter()) {
+                        for (a, b) in kept.conclusions.iter().zip(rule.conclusions.iter()) {
                             rule_eqs.push(tamarin_term::rewriting::Equal {
                                 lhs: a.clone(), rhs: b.clone(),
                             });
                         }
-                        for (a, b) in kept.actions.iter().zip(new_rule.actions.iter()) {
+                        for (a, b) in kept.actions.iter().zip(rule.actions.iter()) {
                             rule_eqs.push(tamarin_term::rewriting::Equal {
                                 lhs: a.clone(), rhs: b.clone(),
                             });
@@ -554,8 +547,27 @@ impl<'ctx> Reduction<'ctx> {
                 }
                 None => {
                     id_to_index.insert(new_id.clone(), new_nodes.len());
-                    new_nodes.push((new_id, new_rule));
+                    new_nodes.push((new_id, rule));
                 }
+            }
+        }
+        // Pass 2: NOW apply the full term substitution to the surviving
+        // rules' fact terms (mirrors HS's `M.map . apply` AFTER
+        // substNodeIds).  Skipped when TAM_RS_NO_NODE_FACT_SUBST=1.
+        if !no_node_fact_subst {
+            for (_, rule) in new_nodes.iter_mut() {
+                *rule = crate::rule::Rule {
+                    info: rule.info.clone(),
+                    premises: rule.premises.iter().map(&apply_to_fact).collect(),
+                    conclusions: rule.conclusions.iter().map(&apply_to_fact).collect(),
+                    actions: rule.actions.iter().map(&apply_to_fact).collect(),
+                    new_vars: rule.new_vars.iter()
+                        .map(|t| {
+                            let substed = tamarin_term::subst::apply_vterm(&subst, t.clone());
+                            normalize_term(substed)
+                        })
+                        .collect(),
+                };
             }
         }
         if dbg_set_nodes && (nodes_in > 0) {

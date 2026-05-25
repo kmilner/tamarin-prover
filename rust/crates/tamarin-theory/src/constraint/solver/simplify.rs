@@ -1958,7 +1958,27 @@ fn enforce_kd_fact_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     }
     node_eqs.retain(|e| e.lhs != e.rhs);
     if node_eqs.is_empty() && rule_eqs.is_empty() {
+        if std::env::var("TAM_DBG_KD_UNIQ").is_ok() {
+            // Even when there's nothing to merge, log so we can see whether
+            // the by_term grouping found candidates.
+            let path = crate::constraint::solver::trace::case_path_string();
+            eprintln!("[kd_uniq] path={} ENTER (no-merge): kd_concs n=0", path);
+        }
         return ChangeIndicator::Unchanged;
+    }
+    if std::env::var("TAM_DBG_KD_UNIQ").is_ok() {
+        let path = crate::constraint::solver::trace::case_path_string();
+        eprintln!("[kd_uniq] path={} node_eqs.n={} rule_eqs.n={}",
+            path, node_eqs.len(), rule_eqs.len());
+        for (i, e) in rule_eqs.iter().enumerate() {
+            eprintln!("[kd_uniq]   rule_eq[{}]: keep={:?} other={:?}", i,
+                crate::constraint::solver::reduction::rule_case_name(&e.lhs),
+                crate::constraint::solver::reduction::rule_case_name(&e.rhs));
+            eprintln!("[kd_uniq]     keep.concs: {:?}",
+                e.lhs.conclusions.iter().map(|f| format!("{:?}", f).chars().take(120).collect::<String>()).collect::<Vec<_>>());
+            eprintln!("[kd_uniq]     other.concs: {:?}",
+                e.rhs.conclusions.iter().map(|f| format!("{:?}", f).chars().take(120).collect::<String>()).collect::<Vec<_>>());
+        }
     }
     let mut hit_contra = false;
     if !rule_eqs.is_empty() {
