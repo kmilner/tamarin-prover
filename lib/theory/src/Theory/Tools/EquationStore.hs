@@ -356,17 +356,31 @@ applyEqStore hnd asubst eqStore
               (zip [0::Int ..] res)
         return res
       else res
-    applyBound s = map (restrictVFresh (varsRange newsubst ++ domVFresh s)) $
-        (`runReader` hnd) $ unifyLNTerm
-          [ Equal (apply newsubst (varTerm lv)) t
-          | let slist = substToListVFresh s,
-            -- variables in the range are fresh, so we have to rename
-            -- them away from all other variables in unification problem
-            -- NOTE: these variables never enter the global context
-            let ran = renameAvoiding (map snd slist)
-                                     (domVFresh s ++ varsRange newsubst),
-            (lv,t) <- zip (map fst slist) ran
-          ]
+    -- TAM_HS_DBG_AES_DETAIL=1: dump per-variant slist, avoid set,
+    -- renamed RHS, and unifier outputs.  Pair with Rust's
+    -- TAM_RS_DBG_AES_DETAIL for HS↔Rust witness-allocation diffing.
+    detailDbg = System.IO.Unsafe.unsafePerformIO $
+                fmap (== Just "1") $ System.Environment.lookupEnv "TAM_HS_DBG_AES_DETAIL"
+    applyBound s =
+        let slist = substToListVFresh s
+            avoidSet = domVFresh s ++ varsRange newsubst
+            ran = renameAvoiding (map snd slist) avoidSet
+            eqs = [ Equal (apply newsubst (varTerm lv)) t
+                  | (lv, t) <- zip (map fst slist) ran ]
+            unifiers = (`runReader` hnd) $ unifyLNTerm eqs
+            restricted = map (restrictVFresh (varsRange newsubst ++ domVFresh s)) unifiers
+        in if detailDbg
+           then System.IO.Unsafe.unsafePerformIO $ do
+                  putStrLn $ "[hs-aes-detail] slist=" ++ show slist
+                  putStrLn $ "[hs-aes-detail]   avoidSet=" ++ show avoidSet
+                  putStrLn $ "[hs-aes-detail]   ran (renamed values)=" ++ show ran
+                  putStrLn $ "[hs-aes-detail]   eqs=" ++ show [(l, r) | Equal l r <- eqs]
+                  putStrLn $ "[hs-aes-detail]   #unifiers=" ++ show (length unifiers)
+                  mapM_ (\(j, u) -> putStrLn $ "[hs-aes-detail]   unifier[" ++ show j ++
+                                    "]=" ++ show (substToListVFresh u))
+                        (zip [0::Int ..] unifiers)
+                  return restricted
+           else restricted
 
 {- NOTES for @applyEqStore tau@ to a fresh substitution sigma:
 [ FIXME: extend explanation to multiple unifiers ]

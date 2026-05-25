@@ -392,7 +392,33 @@ pub fn abstract_rule_and_variants(
     let composed_substs: Vec<LNSubstVFresh> = raw_substs.into_iter().map(|pairs| {
         if use_hs_compose {
             // HS-faithful path.
-            let vsubst = LNSubstVFresh::from_list(pairs);
+            // HS's `msubstToLSubstVFresh` (Maude/Types.hs:130) returns
+            // `removeRenamings $ substFromListVFresh slist` — i.e. raw
+            // Maude variants have their pure-rename entries (e.g.
+            // identity-variant `{s → s_w, pkA → pkA_w}` where each
+            // witness doesn't appear elsewhere) removed FIRST.
+            //
+            // Without this, Rust's identity variant keeps `{s.0 → s.1,
+            // pkA.0 → pkA.2, A.0 → A.3}` (DIFFERENT witness idxs from
+            // Maude's sequential allocation), then composeVFresh's
+            // uniform shift preserves the gap → witnesses end at
+            // DIFFERENT idxs.
+            //
+            // HS's identity variant becomes EMPTY here, so composeVFresh
+            // operates on empty s1_0 and adds renamings for the
+            // abstraction subst's range vars (the rule's leaves, all at
+            // idx 0 from parser) — uniform shift collapses them ALL to
+            // the SAME fresh idx.  THAT's how HS gets `{pkA.5, s.5}`
+            // (both at idx 5) for the CHECKSIGN identity variant.
+            //
+            // `TAM_RS_DISABLE_VARIANT_REMOVE_RENAMINGS=1` opts out.
+            let raw_vsubst = LNSubstVFresh::from_list(pairs);
+            let use_remove_renamings = std::env::var("TAM_RS_DISABLE_VARIANT_REMOVE_RENAMINGS").is_err();
+            let vsubst = if use_remove_renamings {
+                raw_vsubst.remove_renamings()
+            } else {
+                raw_vsubst
+            };
             // composeVFresh vsubst abstractionSubst
             let composed = tamarin_term::subst_vfresh::compose_vfresh(
                 &vsubst, &abstraction_subst);
@@ -405,7 +431,7 @@ pub fn abstract_rule_and_variants(
                 })
                 .collect();
             let normalised = LNSubstVFresh::from_list(normalised_pairs);
-            // removeRenamings
+            // removeRenamings (post-compose, HS RuleVariants.hs:74)
             let cleaned = normalised.remove_renamings();
             // restrictVFresh (frees abstrPsCsAs)
             cleaned.restrict(&abstr_frees)
@@ -490,7 +516,129 @@ pub fn abstract_rule_and_variants(
         return Ok(None);
     }
 
+    // HS-faithful `renamePrecise` wrap (RuleVariants.hs:64):
+    //   `(`Precise.evalFresh` Precise.nothingUsed) . renamePrecise $ ...`
+    //
+    // Re-numbers all rule + variant subst LVars using PreciseFresh
+    // (per-name counter starting from 0).  Without this, the rule's
+    // vars keep the unique idxs assigned by abstrRule (via Maude's
+    // global counter), which causes downstream `freshen_rule`'s
+    // uniform shift to keep them at DIFFERENT idxs — but HS's
+    // renamePrecise collapses ALL rule vars to PER-NAME idxs
+    // (typically 0 since each name is unique in the rule).
+    //
+    // This makes BTreeMap key ordering in apply_eq_store match HS's
+    // — all rule keys at idx 0 → sorted by name first → CHECKSIGN
+    // variant sort order matches HS for test4/test5.
+    //
+    // `TAM_RS_DISABLE_VARIANT_RENAME_PRECISE=1` opts out for diagnosis.
+    let use_rename_precise = std::env::var("TAM_RS_DISABLE_VARIANT_RENAME_PRECISE").is_err();
+    let (abstracted_rule, final_substs) = if use_rename_precise {
+        rename_precise_rule_with_variants(abstracted_rule, final_substs)
+    } else {
+        (abstracted_rule, final_substs)
+    };
+
     Ok(Some((abstracted_rule, final_substs)))
+}
+
+/// Apply HS-style `renamePrecise` to a rule + its variant disjunction
+/// substs.  Mirrors HS `Precise.evalFresh (renamePrecise x) Precise.nothingUsed`
+/// where x = `(ProtoRuleE, [LNSubstVFresh])`.
+///
+/// `renamePrecise` walks the structure in deterministic order and
+/// re-binds each unique LVar to a freshly-allocated LVar keyed by name.
+/// PreciseFresh's per-name counter ensures different names get
+/// independent idxs (typically 0 for first allocation per name).
+fn rename_precise_rule_with_variants(
+    rule: ProtoRuleE,
+    substs: Vec<LNSubstVFresh>,
+) -> (ProtoRuleE, Vec<LNSubstVFresh>) {
+    use tamarin_term::lterm::HasFrees;
+    use tamarin_utils::fresh::PreciseFreshState;
+    use std::collections::HashMap;
+
+    let mut state = PreciseFreshState::nothing_used();
+    let mut map: HashMap<LVar, LVar> = HashMap::new();
+    let mut import = |v: &LVar, st: &mut PreciseFreshState, m: &mut HashMap<LVar, LVar>| {
+        if m.contains_key(v) { return; }
+        let idx = st.fresh_ident(&v.name);
+        let new_v = LVar { name: v.name.clone(), sort: v.sort, idx };
+        m.insert(v.clone(), new_v);
+    };
+
+    // Phase 1: walk every free LVar in deterministic order to populate
+    // the binding map.  Order matches HS's `mapFrees` traversal of
+    // ProtoRule (premises, conclusions, actions, new_vars) followed by
+    // each constraint disj's substs (dom + range).
+    for f in &rule.premises {
+        for t in &f.terms { t.for_each_free(&mut |v| import(v, &mut state, &mut map)); }
+    }
+    for f in &rule.conclusions {
+        for t in &f.terms { t.for_each_free(&mut |v| import(v, &mut state, &mut map)); }
+    }
+    for f in &rule.actions {
+        for t in &f.terms { t.for_each_free(&mut |v| import(v, &mut state, &mut map)); }
+    }
+    for t in &rule.new_vars {
+        t.for_each_free(&mut |v| import(v, &mut state, &mut map));
+    }
+    for s in &substs {
+        for (k, t) in s.to_list() {
+            import(&k, &mut state, &mut map);
+            t.for_each_free(&mut |v| import(v, &mut state, &mut map));
+        }
+    }
+
+    if map.is_empty() {
+        return (rule, substs);
+    }
+
+    // Phase 2: apply the renaming map.
+    let map_var = |v: &LVar| -> LVar {
+        map.get(v).cloned().unwrap_or_else(|| v.clone())
+    };
+    let map_term = |t: LNTerm| -> LNTerm {
+        t.map_free(&mut |v| map_var(&v))
+    };
+
+    let new_premises: Vec<Fact<LNTerm>> = rule.premises.into_iter().map(|f| {
+        Fact {
+            tag: f.tag,
+            annotations: f.annotations,
+            terms: f.terms.into_iter().map(map_term).collect(),
+        }
+    }).collect();
+    let new_conclusions: Vec<Fact<LNTerm>> = rule.conclusions.into_iter().map(|f| {
+        Fact {
+            tag: f.tag,
+            annotations: f.annotations,
+            terms: f.terms.into_iter().map(map_term).collect(),
+        }
+    }).collect();
+    let new_actions: Vec<Fact<LNTerm>> = rule.actions.into_iter().map(|f| {
+        Fact {
+            tag: f.tag,
+            annotations: f.annotations,
+            terms: f.terms.into_iter().map(map_term).collect(),
+        }
+    }).collect();
+    let new_nvs: Vec<LNTerm> = rule.new_vars.into_iter().map(map_term).collect();
+    let new_rule = crate::rule::Rule::new(
+        rule.info,
+        new_premises,
+        new_conclusions,
+        new_actions,
+    ).with_new_vars(new_nvs);
+
+    let new_substs: Vec<LNSubstVFresh> = substs.into_iter().map(|s| {
+        let pairs: Vec<(LVar, LNTerm)> = s.to_list().into_iter().map(|(k, t)| {
+            (map_var(&k), map_term(t))
+        }).collect();
+        LNSubstVFresh::from_list(pairs)
+    }).collect();
+
+    (new_rule, new_substs)
 }
 
 pub fn expand_rule_variants(
