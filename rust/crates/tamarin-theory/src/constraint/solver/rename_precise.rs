@@ -67,14 +67,15 @@ pub fn rename_precise_system(sys: &mut System) {
         state.import(&k);
         t.for_each_free(&mut |v| { state.import(v); });
     }
-    // eq_store.conj: each EqDisj holds SubstVFresh entries (range vars are
-    // considered fresh per Haskell, but still appear in the System and must
-    // be renamed alongside everything else).
+    // eq_store.conj: HS-faithful `HasFrees (SubstVFresh n LVar)` only
+    // walks DOMAIN (keys), NOT values (SubstVFresh.hs:196-202).  This
+    // preserves the witness idxs in values — crucial for
+    // sort-discriminating across variants at perform_split.
     for d in &sys.eq_store.conj {
         for s in &d.substs {
-            for (k, t) in s.to_list() {
+            for (k, _t) in s.to_list() {
                 state.import(&k);
-                t.for_each_free(&mut |v| { state.import(v); });
+                // Note: value vars NOT imported (HS-faithful).
             }
         }
     }
@@ -210,10 +211,29 @@ pub fn rename_precise_system(sys: &mut System) {
         .collect();
     sys.eq_store.subst = Subst::from_list(pairs);
 
+    // HS-faithful: `HasFrees (SubstVFresh n LVar)` only maps DOMAIN
+    // (keys), NOT values.  From Term.Substitution.SubstVFresh.hs:196-202:
+    //
+    //   instance HasFrees (SubstVFresh n LVar) where
+    //       foldFrees f = foldFrees f . M.keys . svMap
+    //       foldFreesOcc _ _ = const mempty
+    //       mapFrees f =
+    //           (substFromListVFresh <$>) . traverse mapDomain
+    //                                     . substToListVFresh
+    //         where mapDomain (v, t) = (,t) <$> mapFrees f v
+    //
+    // So renamePrecise renames variant subst KEYS but PRESERVES the
+    // witness idxs in VALUES.  This preserves the AES-output witness
+    // idxs at perform_split time — which is what gives HS the
+    // sort-discriminating idx differences across variants (e.g.,
+    // ~k.11 vs ~k.14 for test4's CHECKSIGN vs SIGN).
+    //
+    // Rust previously renamed values too, collapsing all to small
+    // PreciseFresh idxs (1, 2) and reversing the sort order vs HS.
     for d in sys.eq_store.conj.iter_mut() {
         for s in d.substs.iter_mut() {
             let pairs: Vec<(LVar, LNTerm)> = s.to_list().into_iter()
-                .map(|(k, v)| (map_var(k), apply_term(v)))
+                .map(|(k, v)| (map_var(k), v))  // keep VALUE unchanged
                 .collect();
             *s = tamarin_term::subst_vfresh::SubstVFresh::from_list(pairs);
         }

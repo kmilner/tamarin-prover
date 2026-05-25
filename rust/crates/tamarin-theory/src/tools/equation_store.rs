@@ -1354,11 +1354,31 @@ impl EquationStore {
                 if let Some(input) = &dbg_in {
                     eprintln!("[rs-aes-applyBound] IN  : {:?}", input);
                 }
+                // TAM_RS_DBG_AES_DETAIL=1: dump per-variant rhs_min, shift,
+                // avoid_max, max_idx, counter before/after Maude.  Used to
+                // diagnose witness idx divergence vs HS (split_case ordering).
+                let detail_dbg = std::env::var("TAM_RS_DBG_AES_DETAIL").is_ok();
+                if detail_dbg {
+                    eprintln!("[rs-aes-detail] avoid_max={} rhs_min={:?} max_idx={} counter_before={}",
+                        avoid_max, rhs_min, max_idx, maude.fresh_counter_peek());
+                    eprintln!("[rs-aes-detail]   eqs: {:?}", eqs.iter().map(|e|
+                        format!("{:?} =? {:?}", e.lhs, e.rhs)).collect::<Vec<_>>());
+                }
+                let counter_before_maude = maude.fresh_counter_peek();
                 let unifiers = match maude.unify_at_with_avoid(
                     "apply_eq_store::re_unify", &eqs, max_idx) {
                     Ok(u) => u,
                     Err(e) => return Err(AddEqsError::Maude(format!("{}", e))),
                 };
+                if detail_dbg {
+                    eprintln!("[rs-aes-detail] counter_after={} delta={} #unifiers={}",
+                        maude.fresh_counter_peek(),
+                        maude.fresh_counter_peek().saturating_sub(counter_before_maude),
+                        unifiers.len());
+                    for (i, u) in unifiers.iter().enumerate() {
+                        eprintln!("[rs-aes-detail]   unifier[{}]: {:?}", i, u);
+                    }
+                }
                 if dbg_in.is_some() {
                     eprintln!("  {} unifiers from Maude", unifiers.len());
                 }
