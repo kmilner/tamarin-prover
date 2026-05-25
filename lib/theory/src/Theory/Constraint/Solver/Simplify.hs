@@ -318,6 +318,11 @@ enforceEdgeUniqueness = do
     when (Unsafe.unsafePerformIO $
             maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_EDGE_UNIQ") $
         Debug.Trace.traceM ("[HS_EDGE_UNIQ_ENTER] edges=" ++ show (length edges))
+    when (Unsafe.unsafePerformIO $
+            maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_EDGES") $ do
+        let path = Unsafe.unsafePerformIO T.getCasePath
+        Debug.Trace.traceM ("[HS_EDGES_ENTER] path=" ++ T.casePathString path
+                          ++ " edges=" ++ show edges)
     (<>) <$> mergeNodes "EEU.eSrc-eTgt" eSrc eTgt edges
          <*> mergeNodes "EEU.eTgt-eSrc(linear)" eTgt eSrc (filter (proveLinearConc se . eSrc) edges)
   where
