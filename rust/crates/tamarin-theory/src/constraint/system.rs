@@ -222,6 +222,22 @@ impl System {
                 }
             }
         }
+        // DIAGNOSTIC: dump Serv_1 rule contents at the moment of add_node.
+        if std::env::var("TAM_DBG_ADD_NODE_SERV1").is_ok() {
+            let nm = crate::constraint::solver::reduction::rule_case_name(&rule);
+            if nm == "Serv_1" {
+                eprintln!("[add_node_serv1] adding Serv_1 at {}.{}", id.name, id.idx);
+                for (i, p) in rule.premises.iter().enumerate() {
+                    eprintln!("[add_node_serv1]   prem[{}]: {:?}", i,
+                        format!("{:?}", p).chars().take(400).collect::<String>());
+                }
+                for (i, c) in rule.conclusions.iter().enumerate() {
+                    eprintln!("[add_node_serv1]   conc[{}]: {:?}", i,
+                        format!("{:?}", c).chars().take(400).collect::<String>());
+                }
+                // Walk the stack via env vars if we want to know where this is called from.
+            }
+        }
         // DIAGNOSTIC: trace every node addition with its id+rule_name.
         // Captures both pre-saturation (precompute) and runtime grafts.
         if std::env::var("TAM_DBG_TRACE_ADD_NODE").is_ok() {

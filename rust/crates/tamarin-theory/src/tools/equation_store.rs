@@ -1076,7 +1076,32 @@ impl EquationStore {
                 }
             }
         }
+        if std::env::var("TAM_DBG_FOLD_VARIANT").is_ok() {
+            let pairs: Vec<String> = subst_vf.to_list().iter()
+                .filter(|(k, _)| k.name.contains("ltkS") || k.name.contains("request"))
+                .map(|(k, v)| format!("{}.{} → {}", k.name, k.idx,
+                    format!("{:?}", v).chars().take(100).collect::<String>()))
+                .collect();
+            if !pairs.is_empty() {
+                eprintln!("[fold_variant] BEFORE fresh_to_free: {:?}", pairs);
+                let pre_ltks: Vec<String> = external_preserve.iter()
+                    .filter(|v| v.name.contains("ltkS") || v.name.contains("request"))
+                    .map(|v| format!("{}.{}", v.name, v.idx))
+                    .collect();
+                eprintln!("[fold_variant]   preserve(ltkS/request): {:?}", pre_ltks);
+            }
+        }
         let new_subst = subst_vf.fresh_to_free_avoiding(|n| alloc(n), &preserve);
+        if std::env::var("TAM_DBG_FOLD_VARIANT").is_ok() {
+            let pairs: Vec<String> = new_subst.to_list().iter()
+                .filter(|(k, _)| k.name.contains("ltkS") || k.name.contains("request"))
+                .map(|(k, v)| format!("{}.{} → {}", k.name, k.idx,
+                    format!("{:?}", v).chars().take(100).collect::<String>()))
+                .collect();
+            if !pairs.is_empty() {
+                eprintln!("[fold_variant]  AFTER fresh_to_free: {:?}", pairs);
+            }
+        }
         // HS-faithful: foreachDisj at EquationStore.hs:696 calls
         // `MS.modify (applyEqStore hnd msubst)` after replacing the
         // singleton disj.  applyEqStore composes msubst into eqsSubst
@@ -1357,6 +1382,13 @@ impl EquationStore {
                 }
                 if let Some(input) = &dbg_in {
                     eprintln!("[rs-aes-applyBound] IN  : {:?}", input);
+                }
+                if std::env::var("TAM_DBG_AES_VARIANT").is_ok() {
+                    let pairs: Vec<String> = bindings.iter()
+                        .map(|(k, v)| format!("{}.{} → {}", k.name, k.idx,
+                            format!("{:?}", v).chars().take(80).collect::<String>()))
+                        .collect();
+                    eprintln!("[aes_variant] applyBound bindings: {:?}", pairs);
                 }
                 // TAM_RS_DBG_AES_DETAIL=1: dump per-variant rhs_min, shift,
                 // avoid_max, max_idx, counter before/after Maude.  Used to
