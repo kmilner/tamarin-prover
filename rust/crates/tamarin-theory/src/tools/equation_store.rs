@@ -185,6 +185,46 @@ impl EquationStore {
     /// TAM_DBG_ADD_DISJ=1 logs each add_disj call's substs at runtime.
     pub fn add_disj(&mut self, substs: Vec<LNSubstVFresh>) -> SplitId {
         let id = self.next_split;
+        // TAM_DBG_BAD_DISJ=1: print backtrace when a disj subst has two
+        // distinct keys mapping to the same VTerm value (the canonical
+        // KAS-divergence pattern: ~ltkA.0 and ~ltkA.1 both → ~ltkA.X).
+        if std::env::var("TAM_DBG_BAD_DISJ").is_ok() {
+            for s in &substs {
+                let entries: Vec<(LVar, LNTerm)> = s.to_list();
+                let mut seen: std::collections::BTreeMap<String, (LVar, LVar)>
+                    = std::collections::BTreeMap::new();
+                let mut found_bad = false;
+                for (k, v) in &entries {
+                    if let tamarin_term::term::Term::Lit(
+                        tamarin_term::vterm::Lit::Var(vv)) = v {
+                        let v_str = format!("{}.{}", vv.name, vv.idx);
+                        if let Some((prev_k, _)) = seen.get(&v_str) {
+                            if prev_k.name == k.name && prev_k != k {
+                                eprintln!("[BAD_DISJ] FOUND collision: {}.{} and {}.{} both → {}",
+                                    prev_k.name, prev_k.idx, k.name, k.idx, v_str);
+                                found_bad = true;
+                                break;
+                            }
+                        }
+                        seen.insert(v_str, (k.clone(), vv.clone()));
+                    }
+                }
+                if found_bad {
+                    eprintln!("[BAD_DISJ] full subst:");
+                    for (k, v) in &entries {
+                        eprintln!("[BAD_DISJ]   {}.{}/{:?} → {:?}",
+                            k.name, k.idx, k.sort,
+                            format!("{:?}", v).chars().take(80).collect::<String>());
+                    }
+                    let bt = std::backtrace::Backtrace::force_capture();
+                    let bt_s = format!("{}", bt);
+                    let frames: Vec<&str> = bt_s.lines()
+                        .filter(|l| l.contains("tamarin_") || l.contains(".rs:"))
+                        .take(30).collect();
+                    eprintln!("[BAD_DISJ] backtrace:\n{}", frames.join("\n"));
+                }
+            }
+        }
         if std::env::var("TAM_DBG_ADD_DISJ_FULL").is_ok() {
             // Full backtrace + pre-state for every call.
             let bt = std::backtrace::Backtrace::force_capture();
@@ -603,16 +643,20 @@ impl EquationStore {
         mut self,
         is_contr: F,
     ) -> Self {
+        // HS-faithful pass order (EquationStore.hs:518-541 simp1).  This
+        // variant lacks a fresh-idx allocator + Maude handle, so it skips
+        // the passes that need them: simpSingleton, simpAbstractSortedVar,
+        // simpAbstractFun.  Callers that need the full simp pipeline
+        // should use `simp_with_fresh_avoiding`.
         loop {
             if self.is_false() { return self; }
             let mut changed = false;
-            // Snapshot the free subst so the closure doesn't borrow `self`.
             let subst_snapshot = self.subst.clone();
             changed |= self.simp_minimize(|s| is_contr(&subst_snapshot, s));
             changed |= self.simp_remove_renamings();
             changed |= self.simp_empty_disj();
-            changed |= self.simp_abstract_name();
             changed |= self.simp_identify();
+            changed |= self.simp_abstract_name();
             if !changed { return self; }
         }
     }
@@ -938,6 +982,168 @@ impl EquationStore {
         true
     }
 
+    /// `simpAbstractFun`: if every substitution in a disjunction maps
+    /// the same variable `v` to terms with the SAME outermost function
+    /// symbol `o`, factor `{v → o(x1,...,xk)}` (with fresh xi vars) into
+    /// the free substitution and replace `v`'s mapping in each subst
+    /// with mappings `{x1 → arg[0], x2 → arg[1], ...}`.
+    ///
+    /// For AC operators (multiset, exp, etc.) only the FIRST TWO
+    /// arguments are factored (since AC args are unordered, only the
+    /// "left/right split" is meaningful): factor `{v → o(x1, x2)}` with
+    /// `x2 → o(rest)` if the original had >2 args.
+    ///
+    /// Mirrors HS `simpAbstractFun` (EquationStore.hs:584-624).
+    pub fn simp_abstract_fun<F: FnMut(u64) -> u64>(
+        &mut self,
+        alloc: &mut F,
+    ) -> bool {
+        self.simp_abstract_fun_with_maude(alloc, None)
+    }
+
+    /// HS-faithful variant of `simp_abstract_fun` that takes a Maude
+    /// handle and calls `apply_eq_store` on the factored subst to
+    /// re-unify remaining disjs (mirrors HS's `foreachDisj` at
+    /// EquationStore.hs:696).
+    pub fn simp_abstract_fun_with_maude<F: FnMut(u64) -> u64>(
+        &mut self,
+        alloc: &mut F,
+        maude: Option<&tamarin_term::maude_proc::MaudeHandle>,
+    ) -> bool {
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+        use tamarin_term::function_symbols::FunSym;
+        use tamarin_term::lterm::{LVar, LSort};
+
+        // Find (disj_idx, v, op, argss) where v has the same outermost
+        // function symbol across every subst in the disjunction.
+        // argss[i] = args of subst[i]'s mapping for v.
+        let mut to_apply: Option<(usize, LVar, FunSym, Vec<Vec<LNTerm>>)> = None;
+        'outer: for (idx, d) in self.conj.iter().enumerate() {
+            if d.substs.is_empty() { continue; }
+            let first = &d.substs[0];
+            for (v, t) in first.to_list() {
+                let (op, args0) = match &t {
+                    Term::App(o, a) => (o.clone(), a.clone()),
+                    _ => continue,
+                };
+                let mut argss: Vec<Vec<LNTerm>> = vec![args0];
+                let mut ok = true;
+                for other in d.substs.iter().skip(1) {
+                    match other.image_of(&v) {
+                        Some(Term::App(o2, a2)) if o2 == &op => {
+                            argss.push(a2.clone());
+                        }
+                        _ => { ok = false; break; }
+                    }
+                }
+                if ok {
+                    to_apply = Some((idx, v.clone(), op, argss));
+                    break 'outer;
+                }
+            }
+        }
+        let (idx, v, op, argss) = match to_apply {
+            Some(p) => p,
+            None => return false,
+        };
+
+        // For non-AC operators, all argss MUST have the same length
+        // (since outer symbol is identical). For AC, can have varying
+        // arities.
+        let first_arity = argss[0].len();
+        let same_arity = argss.iter().all(|a| a.len() == first_arity);
+
+        if !op.is_ac() || same_arity {
+            // Abstract ALL arguments.  Allocate `first_arity` fresh
+            // Msg-sort vars.
+            let mut fvars: Vec<LVar> = Vec::with_capacity(first_arity);
+            for _ in 0..first_arity {
+                let idx_alloc = alloc(1);
+                fvars.push(LVar { name: "x".into(), sort: LSort::Msg, idx: idx_alloc });
+            }
+            // Build factor `{v → op(x1, ..., xk)}`.
+            let factor = LNSubst::from_list(vec![(
+                v.clone(),
+                Term::App(op.clone(),
+                    fvars.iter()
+                        .map(|fv| Term::Lit(Lit::Var(fv.clone())))
+                        .collect()),
+            )]);
+            // Apply factor (via apply_eq_store if maude available).
+            if let Some(m) = maude {
+                if self.apply_eq_store(m, &factor).is_err() {
+                    self.subst = factor.compose(&self.subst);
+                }
+            } else {
+                self.subst = factor.compose(&self.subst);
+            }
+            // For each subst, drop v's entry and add (fvars[j], args[j]).
+            let new_substs: Vec<LNSubstVFresh> = self.conj[idx].substs.iter()
+                .zip(argss.iter())
+                .map(|(s, args)| {
+                    let mut kept: Vec<(LVar, LNTerm)> = s.to_list().into_iter()
+                        .filter(|(x, _)| x != &v)
+                        .collect();
+                    for (fv, a) in fvars.iter().zip(args.iter()) {
+                        kept.push((fv.clone(), a.clone()));
+                    }
+                    LNSubstVFresh::from_list(kept)
+                })
+                .collect();
+            self.conj[idx].substs = new_substs;
+            true
+        } else {
+            // AC operator with varying arity: factor first two args.
+            let fv1_idx = alloc(1);
+            let fv2_idx = alloc(1);
+            let fv1 = LVar { name: "x".into(), sort: LSort::Msg, idx: fv1_idx };
+            let fv2 = LVar { name: "x".into(), sort: LSort::Msg, idx: fv2_idx };
+            // Factor: `{v → op(fv1, fv2)}`
+            let factor = LNSubst::from_list(vec![(
+                v.clone(),
+                Term::App(op.clone(), vec![
+                    Term::Lit(Lit::Var(fv1.clone())),
+                    Term::Lit(Lit::Var(fv2.clone())),
+                ]),
+            )]);
+            if let Some(m) = maude {
+                if self.apply_eq_store(m, &factor).is_err() {
+                    self.subst = factor.compose(&self.subst);
+                }
+            } else {
+                self.subst = factor.compose(&self.subst);
+            }
+            // For each subst with args = [a1, a2, ...]:
+            //   if length 2: add (fv1, a1), (fv2, a2)
+            //   else (>2):   add (fv1, a1), (fv2, op(a2, a3, ...))
+            let new_substs: Vec<LNSubstVFresh> = self.conj[idx].substs.iter()
+                .zip(argss.iter())
+                .map(|(s, args)| {
+                    let mut kept: Vec<(LVar, LNTerm)> = s.to_list().into_iter()
+                        .filter(|(x, _)| x != &v)
+                        .collect();
+                    if args.len() < 2 {
+                        // Shouldn't happen for AC (arity >= 2 by HS comment).
+                        // Bail out by keeping the subst unchanged.
+                        return s.clone();
+                    }
+                    let a1 = args[0].clone();
+                    let a_rest = if args.len() == 2 {
+                        args[1].clone()
+                    } else {
+                        Term::App(op.clone(), args[1..].to_vec())
+                    };
+                    kept.push((fv1.clone(), a1));
+                    kept.push((fv2.clone(), a_rest));
+                    LNSubstVFresh::from_list(kept)
+                })
+                .collect();
+            self.conj[idx].substs = new_substs;
+            true
+        }
+    }
+
     /// Variant of `simp` that also runs `simp_singleton` — converts
     /// singleton disjunctions (one substitution as the only disjunct)
     /// into free-substitution composition via `freshToFree`.  Mirrors
@@ -976,6 +1182,22 @@ impl EquationStore {
         F: Fn(&LNSubst, &LNSubstVFresh) -> bool,
         G: FnMut(u64) -> u64,
     {
+        // HS-faithful pass order (EquationStore.hs:518-541 simp1):
+        //   1. simpMinimize
+        //   2. simpRemoveRenamings
+        //   3. simpEmptyDisj
+        //   4. simpSingleton          (via foreachDisj)
+        //   5. simpAbstractSortedVar  (via foreachDisj)
+        //   6. simpIdentify           (via foreachDisj)
+        //   7. simpAbstractFun        (via foreachDisj)
+        //   8. simpAbstractName       (via foreachDisj)
+        //
+        // Earlier Rust ordering had simpAbstractName before simpIdentify
+        // and was missing simpAbstractFun entirely.  HS-faithful order
+        // matters: simpAbstractSortedVar can introduce new mappings that
+        // simpIdentify then collapses; simpAbstractFun fires before
+        // simpAbstractName so common Fun-headed images get factored
+        // before common name constants.
         loop {
             if self.is_false() { return self; }
             let mut changed = false;
@@ -985,8 +1207,9 @@ impl EquationStore {
             changed |= self.simp_empty_disj();
             changed |= self.simp_singleton_avoiding(&mut alloc, external_preserve, maude);
             changed |= self.simp_abstract_sorted_var_with_maude(&mut alloc, maude);
-            changed |= self.simp_abstract_name_with_maude(maude);
             changed |= self.simp_identify();
+            changed |= self.simp_abstract_fun_with_maude(&mut alloc, maude);
+            changed |= self.simp_abstract_name_with_maude(maude);
             if !changed { return self; }
         }
     }
@@ -1430,6 +1653,15 @@ impl EquationStore {
                     .chain(bindings.iter().map(|(v, _)| v.clone()))
                     .collect();
                 for raw in unifiers {
+                    // TAM_DBG_RAW_UNIFIER=1: dump Maude's raw output.
+                    if std::env::var("TAM_DBG_RAW_UNIFIER").is_ok() {
+                        eprintln!("[rs-raw-unifier] sid={:?} raw entries:", d.split_id);
+                        for (k, t) in &raw {
+                            eprintln!("[rs-raw-unifier]   {}.{}/{:?} → {:?}",
+                                k.name, k.idx, k.sort,
+                                format!("{:?}", t).chars().take(80).collect::<String>());
+                        }
+                    }
                     // EXTRACT-SYSTEM-VARS-TO-DOMAIN: the AC-free local
                     // unifier path (maude_proc.rs:503-532) doesn't
                     // introduce narrowing witnesses for cross-sort
@@ -1584,6 +1816,42 @@ impl EquationStore {
                           d.split_id, new_substs.len());
                 for (j, s) in new_substs.iter().enumerate() {
                     eprintln!("  out[{}]: {:?}", j, s.to_list());
+                }
+            }
+            // TAM_DBG_BAD_DISJ=1: detect collision in new_substs.
+            if std::env::var("TAM_DBG_BAD_DISJ").is_ok() {
+                for s in &new_substs {
+                    let entries: Vec<(LVar, LNTerm)> = s.to_list();
+                    let mut seen: std::collections::BTreeMap<String, LVar>
+                        = std::collections::BTreeMap::new();
+                    for (k, v) in &entries {
+                        if let tamarin_term::term::Term::Lit(
+                            tamarin_term::vterm::Lit::Var(vv)) = v {
+                            let v_str = format!("{}.{}", vv.name, vv.idx);
+                            if let Some(prev_k) = seen.get(&v_str) {
+                                if prev_k.name == k.name && prev_k != k {
+                                    eprintln!("[BAD_DISJ_AES] sid={:?} collision: {}.{} + {}.{} → {}",
+                                        d.split_id, prev_k.name, prev_k.idx, k.name, k.idx, v_str);
+                                    eprintln!("[BAD_DISJ_AES] subst:");
+                                    for (k2, v2) in &entries {
+                                        eprintln!("[BAD_DISJ_AES]   {}.{}/{:?} → {:?}",
+                                            k2.name, k2.idx, k2.sort,
+                                            format!("{:?}", v2).chars().take(80).collect::<String>());
+                                    }
+                                    eprintln!("[BAD_DISJ_AES] asubst={:?}", asubst.to_list());
+                                    eprintln!("[BAD_DISJ_AES] input subst (pre-aes) for this variant:");
+                                    let bt = std::backtrace::Backtrace::force_capture();
+                                    let bt_s = format!("{}", bt);
+                                    let frames: Vec<&str> = bt_s.lines()
+                                        .filter(|l| l.contains("tamarin_") || l.contains(".rs:"))
+                                        .take(20).collect();
+                                    eprintln!("[BAD_DISJ_AES] backtrace:\n{}", frames.join("\n"));
+                                    break;
+                                }
+                            }
+                            seen.insert(v_str, k.clone());
+                        }
+                    }
                 }
             }
             new_conj.push(EqDisj { split_id: d.split_id, substs: new_substs });

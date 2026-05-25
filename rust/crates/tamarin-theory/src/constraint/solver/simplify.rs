@@ -1227,85 +1227,32 @@ fn try_match_all_guards(
                 let s_has_pat = atom_has_unbound_pattern_var(&s_subst, vars);
                 let t_has_pat = atom_has_unbound_pattern_var(&t_subst, vars);
                 let (pat_term, subj_term) = match (s_has_pat, t_has_pat) {
-                    // Both ground (no pattern vars).  Mirrors Haskell's
-                    // `splitEqs` flow: convert both sides to LNTerm and
-                    // ask Maude AC unifier whether they're unifiable.
-                    // Three cases:
-                    //   - 0 unifiers       → Eq is False, assignment dies
-                    //   - 1 unifier  empty → syntactic equality, recurse
-                    //   - 1 unifier nontrivial → recurse and embed the
-                    //     unifier as an extra Eq atom in `other_guards`
-                    //     so the implied formula's decomposition pushes
-                    //     the binding through `insert_atom` →
-                    //     `solve_term_eqs`, where the eq-store records
-                    //     it (this is how the binding actually reaches
-                    //     `subst_system` downstream).
-                    //   - >1 unifiers → one rec() per unifier, each
-                    //     embedding that unifier's bindings.  This is
-                    //     the `split_case_*` generation Haskell uses.
+                    // Both ground (no pattern vars).  HS-faithful: mirrors
+                    // `matchTerm term pat` in `impliedFormulas`
+                    // (System.hs:1136-1145).  HS skolemizes universals
+                    // before matching, so system vars become SkConst —
+                    // `null $ frees s` is true and matchTerm runs on
+                    // structurally-fixed terms, returning the EMPTY subst
+                    // on syntactic equality and failing otherwise.
+                    //
+                    // Previous implementation called `sys_maude.unify_at`
+                    // here, which under the HS-faithful flattenUnif fix
+                    // (maude_proc.rs::unify_with_avoid's AC-free fast
+                    // path) returns narrowing-witness pairs
+                    // `K → ~Vw, V → ~Vw`.  Those witness pairs were
+                    // encoded as extra Eq atoms appended to other_guards,
+                    // which then became guards in the next
+                    // `insert_implied_formulas_pass` round — accumulating
+                    // 2 witness atoms per round, causing unbounded
+                    // recursion + heap growth on Minimal_HashChain
+                    // lemmas.  See [[project-corpus-probe-oom]].
                     (false, false) => {
                         if s_subst == t_subst {
                             rec(maude, vars, guards, guard_idx + 1, sys_actions,
                                 acc, body, existing_formulas, existing_solved,
                                 other_guards, sys, sys_maude, out);
-                            return;
                         }
-                        let (Some(s_lnt), Some(t_lnt)) = (
-                            crate::elaborate::term_to_lnterm(&s_subst),
-                            crate::elaborate::term_to_lnterm(&t_subst),
-                        ) else { return };
-                        match sys_maude.unify_at(
-                            "impl_formulas::splitEqs",
-                            &[tamarin_term::rewriting::Equal {
-                                lhs: s_lnt, rhs: t_lnt,
-                            }],
-                        ) {
-                            Err(_) => return,
-                            Ok(unifiers) if unifiers.is_empty() => return,
-                            Ok(unifiers) => {
-                                // For each unifier, recurse with the
-                                // unifier-bindings encoded as extra Eq
-                                // atoms appended to `other_guards`.  The
-                                // implied formula carries these to the
-                                // system as preconditions; their
-                                // decomposition routes through
-                                // `insert_atom` → `solve_term_eqs` and
-                                // the eq-store splits if any.
-                                let lsort_to_hint = |s: tamarin_term::lterm::LSort| {
-                                    use tamarin_term::lterm::LSort;
-                                    match s {
-                                        LSort::Msg => tamarin_parser::ast::SortHint::Msg,
-                                        LSort::Pub => tamarin_parser::ast::SortHint::Pub,
-                                        LSort::Fresh => tamarin_parser::ast::SortHint::Fresh,
-                                        LSort::Node => tamarin_parser::ast::SortHint::Node,
-                                        LSort::Nat => tamarin_parser::ast::SortHint::Nat,
-                                    }
-                                };
-                                for unifier in unifiers {
-                                    let mut extra: Vec<tamarin_parser::ast::Atom> = Vec::new();
-                                    for (lv, lt) in &unifier {
-                                        let lhs = tamarin_parser::ast::Term::Var(
-                                            tamarin_parser::ast::VarSpec {
-                                                name: lv.name.clone(),
-                                                idx: lv.idx,
-                                                sort: lsort_to_hint(lv.sort),
-                                                typ: None,
-                                            });
-                                        let rhs = crate::elaborate::lnterm_to_term(lt);
-                                        extra.push(tamarin_parser::ast::Atom::Eq(lhs, rhs));
-                                    }
-                                    let mut og2: Vec<&tamarin_parser::ast::Atom> =
-                                        other_guards.to_vec();
-                                    let extra_refs: Vec<&tamarin_parser::ast::Atom> =
-                                        extra.iter().collect();
-                                    og2.extend(extra_refs);
-                                    rec(maude, vars, guards, guard_idx + 1, sys_actions,
-                                        acc, body, existing_formulas, existing_solved,
-                                        &og2, sys, sys_maude, out);
-                                }
-                                return;
-                            }
-                        }
+                        return;
                     }
                     // s has pattern vars → s is the pattern.
                     (true, false) => (s_subst, t_subst),

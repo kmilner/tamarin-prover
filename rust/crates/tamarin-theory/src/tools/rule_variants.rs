@@ -417,7 +417,7 @@ pub fn abstract_rule_and_variants(
             let vsubst = if use_remove_renamings {
                 raw_vsubst.remove_renamings()
             } else {
-                raw_vsubst
+                raw_vsubst.clone()
             };
             // composeVFresh vsubst abstractionSubst
             let composed = tamarin_term::subst_vfresh::compose_vfresh(

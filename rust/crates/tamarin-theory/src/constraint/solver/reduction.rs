@@ -938,7 +938,8 @@ impl<'ctx> Reduction<'ctx> {
         // supported there either. We don't enforce it; the worst case
         // is a redundant SplitG entry that simplify will discharge.
         if std::env::var("TAM_DBG_VS_DUMP").is_ok() {
-            eprintln!("[vs-dump] solve_rule_constraints: {} substs", substs.len());
+            let path = crate::constraint::solver::trace::case_path_string();
+            eprintln!("[vs-dump] path={} solve_rule_constraints: {} substs", path, substs.len());
             for (i, s) in substs.iter().enumerate() {
                 let pairs: Vec<String> = s.to_list().iter()
                     .map(|(k, v)| {
@@ -1167,18 +1168,27 @@ impl<'ctx> Reduction<'ctx> {
                                 ),
                             );
                         }
-                        // Push the outer goal AND mark it solved so
-                        // `open_goals` skips it but bookkeeping (e.g.
-                        // mark_goal_as_solved lookups) still find it.
+                        // HS-faithful: push the outer pair/inv/prod KU
+                        // goal UNSOLVED.  `is_open_in_sys` filters out
+                        // `has_top_pair_inv_prod` KUs (matching HS's
+                        // `openGoals` Goals.hs:85 `isPair m || isInverse m
+                        // || isProduct m → effectively-solved` rule), so
+                        // the unsolved flag doesn't cause spurious work.
+                        //
+                        // Leaving them UNSOLVED is critical for the
+                        // `enforce_ku_action_uniqueness` simplify pass:
+                        // it filters by `gsSolved` and so previously
+                        // missed pair-KU dedup, leaving Rust with
+                        // duplicate `KU(pair(c2, MAC))` at distinct
+                        // node-ids while HS dedups them via the eq_store
+                        // node-id mapping that `substGoals` then
+                        // collapses via `M.insertWith combineGoalStatus`.
+                        // Concrete divergence: KAS_key_secrecy bounds_max
+                        // off-by-one (Rust 19 vs HS 18 at the divergent
+                        // c_MAC/c_KDF path).
                         let before = self.sys.goals.len();
                         self.sys.add_goal_with_loop_flag(g.clone(), looping);
                         if self.sys.goals.len() != before {
-                            for (existing, status) in self.sys.goals.iter_mut() {
-                                if existing == &g {
-                                    status.solved = true;
-                                    break;
-                                }
-                            }
                             self.changed = ChangeIndicator::Changed;
                         }
                         return;
@@ -2267,6 +2277,17 @@ impl<'ctx> Reduction<'ctx> {
         // 9. addDisj for each case conjDisjEq entry.  Track new split-ids.
         let mut new_split_ids: Vec<crate::tools::equation_store::SplitId> = Vec::new();
         for disj in &sys.eq_store.conj {
+            // TAM_DBG_CONJOIN_DISJ=1: dump each disj being added.
+            if std::env::var("TAM_DBG_CONJOIN_DISJ").is_ok() {
+                for (j, s) in disj.substs.iter().enumerate() {
+                    let pairs: Vec<String> = s.to_list().iter()
+                        .map(|(k, v)| format!("{}.{}/{:?}→{:?}", k.name, k.idx, k.sort,
+                            format!("{:?}", v).chars().take(60).collect::<String>()))
+                        .collect();
+                    eprintln!("[conjoin_disj] sid={:?} subst[{}] entries=[{}]",
+                        disj.split_id, j, pairs.join(", "));
+                }
+            }
             let id = self.sys.eq_store.add_disj(disj.substs.clone());
             new_split_ids.push(id);
         }
@@ -4175,6 +4196,10 @@ impl<'ctx> Reduction<'ctx> {
                         // it mzeros (eq_store contradictory), the
                         // entire branch dies — exploitPrems trace
                         // never fires.
+                        if std::env::var("TAM_DBG_VS_DUMP").is_ok() {
+                            eprintln!("[vs-dump]   rule_case={} for goal={:?}",
+                                rule_case_name(&renamed), fa.terms.first().map(|t| format!("{:?}", t).chars().take(80).collect::<String>()));
+                        }
                         if sub.solve_rule_constraints(renamed_constrs) {
                             continue;
                         }

@@ -69,6 +69,7 @@ import           Control.Monad.Bind
 import           Debug.Trace
 import qualified GHC.Generics as G
 import qualified Data.Binary  as B
+import qualified System.IO.Unsafe                        as Unsafe
 
 
 -- | Parameters
@@ -361,7 +362,24 @@ applySource ctxt th0 goal = (\th -> (_applySource th, Just th0)) <$> matchToGoal
     _applySource th = do
       markGoalAsSolved "precomputed" goal
       (names, sysTh0) <- disjunctionOfList $ getDisj $ get cdCases th
+      -- TAM_HS_TRACE_APPLY_SRC=1: dump pre- and post-conjoin state for
+      -- each source-case application.  Used for KAS_key_secrecy investigation
+      -- against Rust's TAM_RS_TRACE_APPLY_SRC.  Filter output by grep for
+      -- specific path + case.
+      when T.flagApplySrc $ do
+        let cp = Unsafe.unsafePerformIO T.getCasePath
+        freshBefore <- freshIdents 0
+        traceM $ "[APPLY_SRC] path=" ++ T.casePathString cp
+              ++ " goal=" ++ show goal
+              ++ " case=" ++ show names
+        traceM $ "[APPLY_SRC]   keep=" ++ show (M.toList keepVarBindings)
+        traceM $ "[APPLY_SRC]   freshBefore=" ++ show freshBefore
+        traceM $ "[APPLY_SRC]   preFrees=" ++ show (freesList sysTh0)
       sysTh <- evalBindT (someInst sysTh0) keepVarBindings
+      when T.flagApplySrc $ do
+        freshAfter <- freshIdents 0
+        traceM $ "[APPLY_SRC]   freshAfter=" ++ show freshAfter
+        traceM $ "[APPLY_SRC]   postFrees=" ++ show (freesList sysTh)
       conjoinSystem sysTh
       return names
 
