@@ -64,6 +64,7 @@ module Theory.Constraint.Solver.Reduction (
 
   , solveNodeIdEqs
   , solveTermEqs
+  , solveTermEqsLabeled
   , solveFactEqs
   , solveRuleEqs
   , solveSubstEqs
@@ -87,6 +88,7 @@ import qualified Data.Map.Strict                         as M'
 import qualified Data.Set                                as S
 import qualified Data.ByteString.Char8                   as BC
 import           Data.List                               (mapAccumL)
+import qualified Data.List
 import           Safe
 
 import           Control.Basics
@@ -136,6 +138,11 @@ hsTraceSBindHere :: Bool
 hsTraceSBindHere = Unsafe.unsafePerformIO $
     maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_S_BIND"
 {-# NOINLINE hsTraceSBindHere #-}
+
+hsTraceSubstNodeIdsOn :: Bool
+hsTraceSubstNodeIdsOn = Unsafe.unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_SUBST_NODE_IDS"
+{-# NOINLINE hsTraceSubstNodeIdsOn #-}
 
 -- Executing reductions
 -----------------------
@@ -718,7 +725,23 @@ substNodeIds :: Reduction ChangeIndicator
 substNodeIds =
     whileChanging $ do
         subst <- getM sSubst
-        nodes <- gets (map (first (apply subst)) . M.toList . get sNodes)
+        nodesRaw <- gets (M.toList . get sNodes)
+        let nodes = map (first (apply subst)) nodesRaw
+        when hsTraceSubstNodeIdsOn $ do
+            let renames = [(i, i') | ((i, _), (i', _)) <- zip nodesRaw nodes, i /= i']
+                idsBefore = map fst nodesRaw
+                idsAfter  = map fst nodes
+                collisions = filter (\g -> length g > 1) $
+                                Data.List.groupBy (\a b -> fst a == fst b) $
+                                Data.List.sortOn fst nodes
+            Debug.Trace.traceM ("[HS_SUBST_NODE_IDS] ids_before=" ++ show idsBefore
+                              ++ " ids_after=" ++ show idsAfter
+                              ++ " renames=" ++ show renames
+                              ++ " collision_groups=" ++ show (length collisions))
+            when (not (null collisions)) $ do
+              Debug.Trace.traceM ("[HS_SUBST_NODE_IDS] subst=" ++ show subst)
+              mapM_ (\g -> Debug.Trace.traceM ("[HS_SUBST_NODE_IDS] collision_at=" ++ show (fst (head g))
+                                            ++ " count=" ++ show (length g))) collisions
         setNodes nodes
 
 -- | Substitute all goals. Keep the ones with the lower nr.

@@ -2275,6 +2275,29 @@ fn apply_node_eqs(
         match id_to_index.get(&new_id).copied() {
             Some(i) => {
                 let kept = &new_nodes[i].1;
+                if std::env::var("TAM_DBG_APPLY_NODE_EQS_FULL").is_ok() {
+                    let path = crate::constraint::solver::trace::case_path_string();
+                    let kept_rule_nm = crate::constraint::solver::reduction::rule_case_name(kept);
+                    let other_rule_nm = crate::constraint::solver::reduction::rule_case_name(&rule);
+                    eprintln!("[apply_node_eqs-FULL] path={} COLLISION_AT new_id={}.{} keep_rule={} other_rule={}",
+                        path, new_id.name, new_id.idx,
+                        kept_rule_nm, other_rule_nm);
+                    eprintln!("[apply_node_eqs-FULL]   kept.premises={:?}",
+                        kept.premises.iter().map(|f| format!("{:?}", f).chars().take(120).collect::<String>()).collect::<Vec<_>>());
+                    eprintln!("[apply_node_eqs-FULL]   other.premises={:?}",
+                        rule.premises.iter().map(|f| format!("{:?}", f).chars().take(120).collect::<String>()).collect::<Vec<_>>());
+                    eprintln!("[apply_node_eqs-FULL]   kept.conclusions={:?}",
+                        kept.conclusions.iter().map(|f| format!("{:?}", f).chars().take(120).collect::<String>()).collect::<Vec<_>>());
+                    eprintln!("[apply_node_eqs-FULL]   other.conclusions={:?}",
+                        rule.conclusions.iter().map(|f| format!("{:?}", f).chars().take(120).collect::<String>()).collect::<Vec<_>>());
+                    let bindings_count = red.sys.eq_store.subst.to_list().len();
+                    let nontrivial_bindings: Vec<String> = red.sys.eq_store.subst.to_list().iter()
+                        .filter(|(v, _)| v.name.contains("ltk") || v.name.contains("S") || v.name.starts_with("ltkS"))
+                        .map(|(v, t)| format!("{}.{} → {}", v.name, v.idx, format!("{:?}", t).chars().take(60).collect::<String>()))
+                        .collect();
+                    eprintln!("[apply_node_eqs-FULL]   eq_store.bindings_count={} ltk_related={:?}",
+                        bindings_count, nontrivial_bindings);
+                }
                 // Haskell `solveRuleEqs` (Reduction.hs:751) checks
                 // `rInfo` equality before fact-eqs.  Two distinct rule
                 // instances at the same node id (same shape but
@@ -2472,6 +2495,20 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
             if keep.1 != other.1 {
                 conc_idx_clash = true;
                 continue;
+            }
+            if std::env::var("TAM_DBG_EEU_ESRC_ETGT").is_ok() {
+                let path = crate::constraint::solver::trace::case_path_string();
+                let keep_rule = red.sys.nodes.iter()
+                    .find(|(id, _)| id == &keep.0)
+                    .map(|(_, r)| crate::constraint::solver::reduction::rule_case_name(r))
+                    .unwrap_or_else(|| "?".to_string());
+                let other_rule = red.sys.nodes.iter()
+                    .find(|(id, _)| id == &other.0)
+                    .map(|(_, r)| crate::constraint::solver::reduction::rule_case_name(r))
+                    .unwrap_or_else(|| "?".to_string());
+                eprintln!("[EEU_eSrc-eTgt] path={} push_eq lhs={}.{}({}) rhs={}.{}({})",
+                    path, keep.0.name, keep.0.idx, keep_rule,
+                    other.0.name, other.0.idx, other_rule);
             }
             node_eqs.push(tamarin_term::rewriting::Equal {
                 lhs: keep.0.clone(), rhs: other.0.clone(),
