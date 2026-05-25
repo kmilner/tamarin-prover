@@ -1701,13 +1701,32 @@ fn enforce_fresh_node_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
                 changed = changed.or(ChangeIndicator::Changed);
             }
         }
-        // Apply the unification through the system: replace ids in
-        // nodes / edges / less / goals with the kept id.
-        // (Restored: this is non-Haskell-faithful — Haskell uses
-        // `solver = const $ return Unchanged` — but our impl needs it
-        // to keep `subst_system`'s loop from re-firing edges before
-        // they're propagated.  Test: TLS regression risk if removed.)
-        apply_node_eqs(red, &eqs);
+        // HS-faithful: HS's `enforceNodeUniqueness` freshRuleInsts
+        // branch (Simplify.hs:194-196) uses `solver = const $ return
+        // Unchanged` — calls solveNodeIdEqs ONLY, never merges inline.
+        // The merge happens on the NEXT iteration's substSystem →
+        // substNodes → substNodeIds → setNodes, which detects the
+        // collision and emits ruleEqs on UN-substituted rules.
+        //
+        // Rust's previous behavior called `apply_node_eqs(red, &eqs)`
+        // here, which renamed node ids inline AND propagated to other
+        // collisions (Client_1, Register_pk).  But because subst_system
+        // ran first in the iteration (applying eq_store fact-subst to
+        // rules), apply_node_eqs's rule_eqs were already trivial — no
+        // cross-name var unification — leading to the Client_auth
+        // verdict regression at /Client_1/Serv_1/Client_1.
+        //
+        // Removing the inline apply_node_eqs defers the rename +
+        // collision-detection to subst_system_once's Pass1/Pass2 split
+        // (commit 0c89639a), which detects collisions on UN-subst
+        // rules.  Matches HS's `substNodes = substNodeIds <* (M.map
+        // . apply)` ordering.
+        //
+        // TAM_RS_KEEP_INLINE_APPLY_NODE_EQS=1 opts in to old behavior
+        // for diagnostic comparison.
+        if std::env::var("TAM_RS_KEEP_INLINE_APPLY_NODE_EQS").is_ok() {
+            apply_node_eqs(red, &eqs);
+        }
         changed = changed.or(ChangeIndicator::Changed);
     }
     if hit_contra {
@@ -2538,6 +2557,27 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         crate::constraint::constraints::NodeConc,
         Vec<crate::constraint::constraints::NodePrem>,
     > = std::collections::BTreeMap::new();
+    if std::env::var("TAM_DBG_EDGES_ENTER").is_ok() {
+        let path = crate::constraint::solver::trace::case_path_string();
+        eprintln!("[edges_enter] path={} edges_n={}", path, red.sys.edges.len());
+        let mut sorted_edges: Vec<String> = red.sys.edges.iter().map(|e| {
+            let src_rule = red.sys.nodes.iter()
+                .find(|(id, _)| id == &e.src.0)
+                .map(|(_, r)| crate::constraint::solver::reduction::rule_case_name(r))
+                .unwrap_or_else(|| "?".to_string());
+            let tgt_rule = red.sys.nodes.iter()
+                .find(|(id, _)| id == &e.tgt.0)
+                .map(|(_, r)| crate::constraint::solver::reduction::rule_case_name(r))
+                .unwrap_or_else(|| "?".to_string());
+            format!("({}.{}/{},c{}) -> ({}.{}/{},p{})",
+                e.src.0.name, e.src.0.idx, src_rule, e.src.1.0,
+                e.tgt.0.name, e.tgt.0.idx, tgt_rule, e.tgt.1.0)
+        }).collect();
+        sorted_edges.sort();
+        for s in &sorted_edges {
+            eprintln!("[edges_enter]   {}", s);
+        }
+    }
     for e in &red.sys.edges {
         by_tgt.entry(e.tgt.clone()).or_default().push(e.src.clone());
         by_src.entry(e.src.clone()).or_default().push(e.tgt.clone());
@@ -2696,7 +2736,36 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         mark_contradictory_labeled(red, "enforce_edge_uniqueness:node_id_eqs_contradictory");
         return ChangeIndicator::Changed;
     }
-    apply_node_eqs(red, &node_eqs);
+    // HS-faithful: HS's `enforceEdgeUniqueness` only calls
+    // `solveTermEqs SplitNow` (via `solveNodeIdEqs`) — it adds node-id
+    // bindings to the eq-store but does NOT immediately rename node
+    // ids or merge nodes.  The actual rename + setNodes collision
+    // detection happens at the NEXT `substSystem` call (which runs at
+    // the start of every simplify iteration via the outer
+    // `whileChanging` go-loop).  setNodes (called from substNodeIds)
+    // emits its ruleEqs from UN-substituted rules, propagating
+    // cross-name var unifications (e.g. `pk(~ltk) = pk(~ltkS)`).
+    //
+    // Rust's previous behavior called `apply_node_eqs(red, &node_eqs)`
+    // here, which would rename node ids inline AND collect rule_eqs
+    // from collision rules.  But by the time apply_node_eqs runs, the
+    // eq-store substitution has already been applied to the rules
+    // (via the just-completed `solve_node_id_eqs`'s side effects on
+    // `subst_system`).  The colliding rules are then identical → trivial
+    // rule_eqs → no cross-name var unification → /Client_1/Serv_1's
+    // depth-3 case Client_1 misses the contradiction in Client_auth.
+    //
+    // Removing the inline `apply_node_eqs` defers the rename to the
+    // next iteration's `subst_system` (which uses the Pass1/Pass2
+    // split from commit 0c89639a — collisions detected on pre-subst
+    // rules, fact-subst applied AFTER).  This matches HS's
+    // `substNodes = substNodeIds <* (M.map . apply)` ordering exactly.
+    //
+    // TAM_RS_KEEP_INLINE_APPLY_NODE_EQS=1 opts in to the old behavior
+    // for diagnostic comparison.
+    if std::env::var("TAM_RS_KEEP_INLINE_APPLY_NODE_EQS").is_ok() {
+        apply_node_eqs(red, &node_eqs);
+    }
     red.changed = ChangeIndicator::Changed;
     ChangeIndicator::Changed
 }

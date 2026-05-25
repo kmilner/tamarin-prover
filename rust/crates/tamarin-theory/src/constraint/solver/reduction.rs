@@ -837,8 +837,14 @@ impl<'ctx> Reduction<'ctx> {
         //    simplify-loop iteration will pick them up.
         if !rule_eqs.is_empty() {
             if std::env::var("TAM_DBG_SUBST_RULE_EQS").is_ok() {
-                eprintln!("[subst_rule_eqs] queueing {} rule_eqs from setNodes-style collision",
-                    rule_eqs.len());
+                let path = crate::constraint::solver::trace::case_path_string();
+                eprintln!("[subst_rule_eqs] path={} queueing {} rule_eqs from setNodes-style collision",
+                    path, rule_eqs.len());
+                for (i, e) in rule_eqs.iter().enumerate() {
+                    eprintln!("[subst_rule_eqs]   eq[{}]: lhs={:?} rhs={:?}", i,
+                        format!("{:?}", e.lhs).chars().take(180).collect::<String>(),
+                        format!("{:?}", e.rhs).chars().take(180).collect::<String>());
+                }
             }
             // Tag/arity mismatches mean two distinct rule instances
             // collapsed to the same node id but their facts disagree
