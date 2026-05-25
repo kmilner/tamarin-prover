@@ -2032,27 +2032,43 @@ fn saturate_out_premise(
     let outcome = red.solve_premise_goal(p, fa);
     set_precompute_mode(false);
     if std::env::var("TAM_DBG_SAT_OUT_PREM").is_ok() {
-        eprintln!("[sat_out_prem] AFTER solve_premise_goal: outer={} fa.tag={:?}",
-            outer_name, fa.tag);
-        for (id, ru) in &red.sys.nodes {
-            let nm = crate::constraint::solver::reduction::rule_case_name(ru);
-            if nm == "Serv_1" || nm == "Register_pk" {
-                eprintln!("[sat_out_prem]   node {}.{} → {}", id.name, id.idx, nm);
-                for (i, p) in ru.premises.iter().enumerate() {
-                    eprintln!("[sat_out_prem]     prem[{}]: {:?}", i,
-                        format!("{:?}", p).chars().take(400).collect::<String>());
-                }
-                for (i, c) in ru.conclusions.iter().enumerate() {
-                    eprintln!("[sat_out_prem]     conc[{}]: {:?}", i,
-                        format!("{:?}", c).chars().take(400).collect::<String>());
+        let any_serv = red.sys.nodes.iter().any(|(_, r)|
+            crate::constraint::solver::reduction::rule_case_name(r) == "Serv_1");
+        if any_serv {
+            eprintln!("[sat_out_prem] AFTER solve_premise_goal: outer={} fa.tag={:?}",
+                outer_name, fa.tag);
+            for (id, ru) in &red.sys.nodes {
+                let nm = crate::constraint::solver::reduction::rule_case_name(ru);
+                if nm == "Serv_1" || nm == "Register_pk" {
+                    eprintln!("[sat_out_prem]   node {}.{} → {}", id.name, id.idx, nm);
+                    for (i, p) in ru.premises.iter().enumerate() {
+                        eprintln!("[sat_out_prem]     prem[{}]: {:?}", i,
+                            format!("{:?}", p).chars().take(400).collect::<String>());
+                    }
+                    for (i, c) in ru.conclusions.iter().enumerate() {
+                        eprintln!("[sat_out_prem]     conc[{}]: {:?}", i,
+                            format!("{:?}", c).chars().take(400).collect::<String>());
+                    }
                 }
             }
-        }
-        eprintln!("[sat_out_prem]   eq_store ({} entries):",
-            red.sys.eq_store.subst.to_list().len());
-        for (v, t) in red.sys.eq_store.subst.to_list().iter().take(10) {
-            eprintln!("[sat_out_prem]     {}.{}/{:?} → {:?}", v.name, v.idx, v.sort,
-                format!("{:?}", t).chars().take(120).collect::<String>());
+            eprintln!("[sat_out_prem]   eq_store ({} entries):",
+                red.sys.eq_store.subst.to_list().len());
+            for (v, t) in red.sys.eq_store.subst.to_list().iter().take(15) {
+                eprintln!("[sat_out_prem]     {}.{} → {:?}", v.name, v.idx,
+                    format!("{:?}", t).chars().take(120).collect::<String>());
+            }
+            eprintln!("[sat_out_prem]   eq_store.conj ({} disjs):", red.sys.eq_store.conj.len());
+            for d in &red.sys.eq_store.conj {
+                eprintln!("[sat_out_prem]     disj sz={} sid={:?}", d.substs.len(), d.split_id);
+                for (i, s) in d.substs.iter().enumerate() {
+                    let pairs: Vec<String> = s.to_list().iter()
+                        .filter(|(k, _)| k.name.contains("ltkS") || k.name.contains("request"))
+                        .map(|(k, v)| format!("{}.{} → {}", k.name, k.idx,
+                            format!("{:?}", v).chars().take(80).collect::<String>()))
+                        .collect();
+                    eprintln!("[sat_out_prem]       subst[{}]: {:?}", i, pairs);
+                }
+            }
         }
     }
     let producer_name = |s: &System| -> String {
