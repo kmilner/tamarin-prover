@@ -5812,15 +5812,15 @@ fn apply_source_case_action(
                 eprintln!("[apply_refine]   node {:?} → {}", id, nm);
                 for (i, p) in ru.premises.iter().enumerate() {
                     eprintln!("[apply_refine]     prem[{}]: {:?}", i,
-                        format!("{:?}", p).chars().take(150).collect::<String>());
+                        format!("{:?}", p).chars().take(280).collect::<String>());
                 }
                 for (i, c) in ru.conclusions.iter().enumerate() {
                     eprintln!("[apply_refine]     conc[{}]: {:?}", i,
-                        format!("{:?}", c).chars().take(150).collect::<String>());
+                        format!("{:?}", c).chars().take(280).collect::<String>());
                 }
                 for (i, a) in ru.actions.iter().enumerate() {
                     eprintln!("[apply_refine]     act[{}]: {:?}", i,
-                        format!("{:?}", a).chars().take(150).collect::<String>());
+                        format!("{:?}", a).chars().take(280).collect::<String>());
                 }
             }
         }
@@ -5915,6 +5915,52 @@ fn apply_source_case_action(
     }
 
     // ---------------------------------------------------------------
+    // E.5 — edge fact-equality propagation.  Mirror the equivalent
+    // step in `apply_source_case_premise`.  After conjoin, walk every
+    // edge in the joined system and ensure its conclusion fact and
+    // premise fact are unified.  Without this, a Serv_1 source-case
+    // grafted alongside an existing Register_pk produces a second
+    // Register_pk whose `$A` is at a different LVar than the
+    // lemma-chain Register_pk's `$A`.  The two `!Ltk`/`!Pk` chains
+    // never coalesce, and the lemma's universal
+    // `∀a. AnswerRequest($S, ~k) @ a ⇒ ⊥` matcher fails when
+    // Serv_1's action references `$S.Pub.0` while the lemma's
+    // universal references `$S.Pub.1`.
+    let edge_eqs: Vec<_> = r.sys.edges.iter().filter_map(|e| {
+        let conc = r.sys.nodes.iter()
+            .find(|(n, _)| n == &e.src.0)?
+            .1.conclusions.get(e.src.1.0).cloned()?;
+        let prem = r.sys.nodes.iter()
+            .find(|(n, _)| n == &e.tgt.0)?
+            .1.premises.get(e.tgt.1.0).cloned()?;
+        if conc.tag != prem.tag || conc.terms.len() != prem.terms.len() {
+            return None;
+        }
+        if conc == prem { return None; }
+        Some(tamarin_term::rewriting::Equal { lhs: conc, rhs: prem })
+    }).collect();
+    if std::env::var("TAM_DBG_APPLY_E5").is_ok() {
+        let path = crate::constraint::solver::trace::case_path_string();
+        eprintln!("[apply_source_case_action E.5] path={} edge_eqs.len={}", path, edge_eqs.len());
+        for (i, e) in edge_eqs.iter().enumerate() {
+            eprintln!("  eq[{}]: {:?} = {:?}", i,
+                format!("{:?}", e.lhs).chars().take(160).collect::<String>(),
+                format!("{:?}", e.rhs).chars().take(160).collect::<String>());
+        }
+    }
+    if !edge_eqs.is_empty() {
+        let res = r.solve_fact_eqs(
+            crate::constraint::solver::reduction::SplitStrategy::SplitNow,
+            &edge_eqs);
+        if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
+            crate::state_trace::emit(
+                "applySource_drop_edge_eqs", Some(&live_goal_for_trace), &r.sys);
+            return None;
+        }
+        r.subst_system();
+    }
+
+    // ---------------------------------------------------------------
     // F — Close trivial chains via direct-edge unification.
     //
     // Haskell's precompute `solveAllSafeGoals` closes chains during
@@ -5932,6 +5978,43 @@ fn apply_source_case_action(
     // via destructor.  If Branch 1 fails or splits, leave the chain
     // as-is.
     close_trivial_chains_in_graft(&mut r);
+
+    // ---------------------------------------------------------------
+    // G — re-filter conjoined variant SplitGs.  Mirror the equivalent
+    // step in `apply_source_case_premise`.
+    if !r.sys.eq_store.conj.is_empty() && !r.sys.eq_store.subst.is_empty() {
+        let empty_subst = tamarin_term::subst::Subst::empty();
+        let _ = r.sys.eq_store.apply_eq_store(&ctx.maude, &empty_subst);
+        let needs_fold = r.sys.eq_store.conj.iter().any(|d| d.substs.len() == 1);
+        if needs_fold {
+            use tamarin_term::lterm::HasFrees;
+            let mut sys_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar>
+                = std::collections::BTreeSet::new();
+            let mut visit = |v: &tamarin_term::lterm::LVar| { sys_vars.insert(v.clone()); };
+            for (id, rule) in &r.sys.nodes {
+                id.for_each_free(&mut visit);
+                rule.for_each_free(&mut visit);
+            }
+            for e in &r.sys.edges {
+                e.src.0.for_each_free(&mut visit);
+                e.tgt.0.for_each_free(&mut visit);
+            }
+            for l in &r.sys.less_atoms {
+                l.smaller.for_each_free(&mut visit);
+                l.larger.for_each_free(&mut visit);
+            }
+            if let Some(la) = &r.sys.last_atom { la.for_each_free(&mut visit); }
+            let maude = ctx.maude.clone();
+            let store = std::mem::take(&mut r.sys.eq_store);
+            r.sys.eq_store = store.simp_with_fresh_avoiding(
+                |_, _| false,
+                |n| maude.reserve_idxs(n),
+                &sys_vars,
+                Some(&maude),
+            );
+            r.subst_system();
+        }
+    }
 
     crate::state_trace::emit(
         "applySource_out", Some(&live_goal_for_trace), &r.sys);
