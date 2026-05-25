@@ -1044,6 +1044,31 @@ impl<'ctx> Reduction<'ctx> {
         if std::env::var("TAM_DBG_VARIANT_CONTRA").is_ok() && contra {
             eprintln!("[variant_contra] solve_rule_constraints contradiction fired");
         }
+        if std::env::var("TAM_DBG_VS_POST").is_ok() {
+            for (id, ru) in &self.sys.nodes {
+                let nm = crate::constraint::solver::reduction::rule_case_name(ru);
+                if nm == "Serv_1" {
+                    eprintln!("[vs_post] AFTER solve_rule_constraints: id={}.{} folded={}",
+                        id.name, id.idx, folded);
+                    for (i, p) in ru.premises.iter().enumerate() {
+                        eprintln!("[vs_post]   prem[{}]: {:?}", i,
+                            format!("{:?}", p).chars().take(400).collect::<String>());
+                    }
+                    for (i, c) in ru.conclusions.iter().enumerate() {
+                        eprintln!("[vs_post]   conc[{}]: {:?}", i,
+                            format!("{:?}", c).chars().take(400).collect::<String>());
+                    }
+                    eprintln!("[vs_post]   eq_store.subst ({} entries):",
+                        self.sys.eq_store.subst.to_list().len());
+                    for (v, t) in self.sys.eq_store.subst.to_list().iter().take(15) {
+                        eprintln!("[vs_post]     {}.{}/{:?} → {:?}", v.name, v.idx, v.sort,
+                            format!("{:?}", t).chars().take(120).collect::<String>());
+                    }
+                    eprintln!("[vs_post]   eq_store.conj ({} disjs):",
+                        self.sys.eq_store.conj.len());
+                }
+            }
+        }
         contra
     }
 
@@ -4439,6 +4464,26 @@ impl<'ctx> Reduction<'ctx> {
                             if existing == &g && !status.solved {
                                 status.solved = true;
                                 break;
+                            }
+                        }
+                        if std::env::var("TAM_DBG_PREM_CASE_OUT").is_ok() {
+                            for (id, ru) in &sys.nodes {
+                                let nm = crate::constraint::solver::reduction::rule_case_name(ru);
+                                if nm == "Serv_1" {
+                                    eprintln!("[prem_case_out] case={} id={}.{}",
+                                        case_name, id.name, id.idx);
+                                    for (i, p) in ru.premises.iter().enumerate() {
+                                        eprintln!("[prem_case_out]   prem[{}]: {:?}", i,
+                                            format!("{:?}", p).chars().take(400).collect::<String>());
+                                    }
+                                    eprintln!("[prem_case_out]   eq_store ({} entries):",
+                                        sys.eq_store.subst.to_list().len());
+                                    for (v, t) in sys.eq_store.subst.to_list().iter() {
+                                        eprintln!("[prem_case_out]     {}.{} → {}",
+                                            v.name, v.idx,
+                                            format!("{:?}", t).chars().take(120).collect::<String>());
+                                    }
+                                }
                             }
                         }
                         cases.push((case_name.clone(), sys));
