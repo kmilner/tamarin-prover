@@ -5682,7 +5682,21 @@ fn apply_source_case_action(
             if std::ptr::eq(sys as *const _, case_sys as *const _) {
                 Some(n.clone())
             } else { None })
-        .unwrap_or_default();
+        .unwrap_or_else(|| {
+            // Fallback: try matching by content (rule names + counts).
+            let case_signature: Vec<String> = case_sys.nodes.iter()
+                .map(|(_, r)| crate::constraint::solver::reduction::rule_case_name(r))
+                .collect();
+            src.cases_or_empty().iter()
+                .find_map(|(n, sys)| {
+                    let s: Vec<String> = sys.nodes.iter()
+                        .map(|(_, r)| crate::constraint::solver::reduction::rule_case_name(r))
+                        .collect();
+                    if s == case_signature { Some(n.clone()) } else { None }
+                })
+                .unwrap_or_else(|| format!("?({})",
+                    case_signature.join(",").chars().take(50).collect::<String>()))
+        });
     let dbg = |reason: &str| {
         if dbg_apply {
             eprintln!("[applySource] DROP case={} reason={} live_node={:?} fa_live.tag={:?}",
@@ -6063,7 +6077,21 @@ fn apply_source_case_premise(
             if std::ptr::eq(sys as *const _, case_sys as *const _) {
                 Some(n.clone())
             } else { None })
-        .unwrap_or_default();
+        .unwrap_or_else(|| {
+            // Fallback: try matching by content (rule names + counts).
+            let case_signature: Vec<String> = case_sys.nodes.iter()
+                .map(|(_, r)| crate::constraint::solver::reduction::rule_case_name(r))
+                .collect();
+            src.cases_or_empty().iter()
+                .find_map(|(n, sys)| {
+                    let s: Vec<String> = sys.nodes.iter()
+                        .map(|(_, r)| crate::constraint::solver::reduction::rule_case_name(r))
+                        .collect();
+                    if s == case_signature { Some(n.clone()) } else { None }
+                })
+                .unwrap_or_else(|| format!("?({})",
+                    case_signature.join(",").chars().take(50).collect::<String>()))
+        });
     let dbg = |reason: &str| {
         if dbg_apply {
             eprintln!("[applySource_prem] DROP case={} reason={} live_node={:?} fa_live.tag={:?}",
