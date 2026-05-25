@@ -2080,8 +2080,33 @@ impl<'ctx> Reduction<'ctx> {
             let case_subst: Vec<String> = sys.eq_store.subst.to_list().into_iter()
                 .map(|(v, t)| format!("{}.{}/{:?}→{:?}", v.name, v.idx, v.sort, t))
                 .collect();
-            eprintln!("[CONJOIN] path={} live_fresh={:?} case_fresh={:?} case_subst={:?}",
-                path, live_fresh, case_fresh, case_subst);
+            let live_subst: Vec<String> = self.sys.eq_store.subst.to_list().into_iter()
+                .map(|(v, t)| format!("{}.{}/{:?}→{:?}", v.name, v.idx, v.sort,
+                    format!("{:?}", t).chars().take(70).collect::<String>()))
+                .collect();
+            eprintln!("[CONJOIN] path={} live_fresh={:?} case_fresh={:?} case_subst={:?} live_subst={:?}",
+                path, live_fresh, case_fresh, case_subst, live_subst);
+            // Also dump Serv_1/Register_pk-like nodes from BOTH live and case.
+            for (id, r) in &self.sys.nodes {
+                let nm = crate::constraint::solver::reduction::rule_case_name(r);
+                if nm == "Serv_1" || nm == "Register_pk" {
+                    eprintln!("[CONJOIN]   live {:?} → {}: prems={:?} concs={:?} acts={:?}",
+                        id, nm,
+                        r.premises.iter().map(|f| format!("{:?}", f.terms).chars().take(70).collect::<String>()).collect::<Vec<_>>(),
+                        r.conclusions.iter().map(|f| format!("{:?}", f.terms).chars().take(70).collect::<String>()).collect::<Vec<_>>(),
+                        r.actions.iter().map(|f| format!("{:?}", f.terms).chars().take(70).collect::<String>()).collect::<Vec<_>>());
+                }
+            }
+            for (id, r) in &sys.nodes {
+                let nm = crate::constraint::solver::reduction::rule_case_name(r);
+                if nm == "Serv_1" || nm == "Register_pk" {
+                    eprintln!("[CONJOIN]   case {:?} → {}: prems={:?} concs={:?} acts={:?}",
+                        id, nm,
+                        r.premises.iter().map(|f| format!("{:?}", f.terms).chars().take(70).collect::<String>()).collect::<Vec<_>>(),
+                        r.conclusions.iter().map(|f| format!("{:?}", f.terms).chars().take(70).collect::<String>()).collect::<Vec<_>>(),
+                        r.actions.iter().map(|f| format!("{:?}", f.terms).chars().take(70).collect::<String>()).collect::<Vec<_>>());
+                }
+            }
         }
         // 1-3. joinSets: solved_formulas, lemmas, edges.  Use sets so
         // duplicates are collapsed (HasFrees-based dedup not needed —
