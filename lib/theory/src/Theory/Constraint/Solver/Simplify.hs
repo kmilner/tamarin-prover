@@ -492,6 +492,7 @@ insertImpliedFormulas = do
                       "\n  clause-frees: " ++ show (frees clause) ++
                       "\n  implied: " ++ show implied ++
                       "\n  nodes:   " ++ show (M.size (get sNodes sys)) ++
+                      "\n  nodes_dump:" ++ concatMap (\(n,r) -> "\n    " ++ show n ++ " = " ++ show (getRuleName r) ++ "  prems=" ++ show (get rPrems r) ++ "  concs=" ++ show (get rConcs r)) (M.toList (get sNodes sys)) ++
                       "\n  actions: " ++ show (allActions sys) ++
                       "\n  action-frees: " ++ show (frees (allActions sys)) ++
                       "\n  ----") else id)
