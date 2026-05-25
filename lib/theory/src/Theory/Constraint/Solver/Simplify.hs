@@ -191,9 +191,9 @@ exploitUniqueMsgOrder = do
 enforceNodeUniqueness :: Reduction (ChangeIndicator, ChangeIndicator, ChangeIndicator)
 enforceNodeUniqueness =
     (,,)
-      <$> (merge (const $ return Unchanged) freshRuleInsts)
-      <*> (merge (solveRuleEqs SplitNow)    kdConcs)
-      <*> (merge (solveFactEqs SplitNow)    kuActions)
+      <$> (merge "ENU.freshRuleInsts" (const $ return Unchanged) freshRuleInsts)
+      <*> (merge "ENU.kdConcs" (solveRuleEqs SplitNow)    kdConcs)
+      <*> (merge "ENU.kuActions" (solveFactEqs SplitNow)    kuActions)
   where
     -- *DG4*
     freshRuleInsts se =
@@ -233,19 +233,21 @@ enforceNodeUniqueness =
     kuActions se = (\(i, fa, m) -> (m, (fa, i))) <$> allKUActions se
 
     merge :: Ord b
-          => ([Equal a] -> Reduction ChangeIndicator)
+          => String
+          -> ([Equal a] -> Reduction ChangeIndicator)
              -- ^ Equation solver for 'Equal a'
           -> (System -> [(b,(a,NodeId))])
              -- ^ Candidate selector
           -> Reduction ChangeIndicator                  --
-    merge solver candidates = do
+    merge siteLbl solver candidates = do
         changes <- gets (map mergers . groupSortOn fst . candidates)
         mconcat <$> sequence changes
       where
         mergers []                          = unreachable "enforceUniqueness"
         mergers ((_,(xKeep, iKeep)):remove) =
             mappend <$> solver         (map (Equal xKeep . fst . snd) remove)
-                    <*> solveNodeIdEqs (map (Equal iKeep . snd . snd) remove)
+                    <*> solveTermEqsLabeled siteLbl SplitNow
+                          (map (fmap varTerm . Equal iKeep . snd . snd) remove)
 
 -- | CR-rule *DG4*: enforcing uniqueness of *Fresh* rule
 -- instances.
@@ -254,8 +256,8 @@ enforceNodeUniqueness =
 enforceFreshAndKuNodeUniqueness :: Reduction (ChangeIndicator, ChangeIndicator)
 enforceFreshAndKuNodeUniqueness =
     (,)
-      <$> (merge (const $ return Unchanged) freshRuleInsts)
-      <*> (merge (solveFactEqs SplitNow)    kuActions)
+      <$> (merge "EFKU.freshRuleInsts" (const $ return Unchanged) freshRuleInsts)
+      <*> (merge "EFKU.kuActions" (solveFactEqs SplitNow)    kuActions)
   where
     -- *DG4*
     freshRuleInsts se =
@@ -290,19 +292,21 @@ enforceFreshAndKuNodeUniqueness =
     kuActions se = (\(i, fa, m) -> (m, (fa, i))) <$> allKUActions se
 
     merge :: Ord b
-          => ([Equal a] -> Reduction ChangeIndicator)
+          => String
+          -> ([Equal a] -> Reduction ChangeIndicator)
              -- ^ Equation solver for 'Equal a'
           -> (System -> [(b,(a,NodeId))])
              -- ^ Candidate selector
           -> Reduction ChangeIndicator                  --
-    merge solver candidates = do
+    merge siteLbl solver candidates = do
         changes <- gets (map mergers . groupSortOn fst . candidates)
         mconcat <$> sequence changes
       where
         mergers []                          = unreachable "enforceFreshAndKuUniqueness"
         mergers ((_,(xKeep, iKeep)):remove) =
             mappend <$> solver         (map (Equal xKeep . fst . snd) remove)
-                    <*> solveNodeIdEqs (map (Equal iKeep . snd . snd) remove)
+                    <*> solveTermEqsLabeled siteLbl SplitNow
+                          (map (fmap varTerm . Equal iKeep . snd . snd) remove)
 
 
 -- | CR-rules *DG2_1* and *DG3*: merge multiple incoming edges to all facts
@@ -314,8 +318,8 @@ enforceEdgeUniqueness = do
     when (Unsafe.unsafePerformIO $
             maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_EDGE_UNIQ") $
         Debug.Trace.traceM ("[HS_EDGE_UNIQ_ENTER] edges=" ++ show (length edges))
-    (<>) <$> mergeNodes eSrc eTgt edges
-         <*> mergeNodes eTgt eSrc (filter (proveLinearConc se . eSrc) edges)
+    (<>) <$> mergeNodes "EEU.eSrc-eTgt" eSrc eTgt edges
+         <*> mergeNodes "EEU.eTgt-eSrc(linear)" eTgt eSrc (filter (proveLinearConc se . eSrc) edges)
   where
     -- | @proveLinearConc se (v,i)@ tries to prove that the @i@-th
     -- conclusion of node @v@ is a linear fact.
@@ -325,7 +329,7 @@ enforceEdgeUniqueness = do
 
     -- merge the nodes on the 'mergeEnd' for edges that are equal on the
     -- 'compareEnd'
-    mergeNodes mergeEnd compareEnd edges
+    mergeNodes siteLbl mergeEnd compareEnd edges
       | null eqs  = return Unchanged
       | otherwise = do
             -- all indices of merged premises and conclusions must be equal
@@ -337,7 +341,8 @@ enforceEdgeUniqueness = do
                                   ++ " eqs=" ++ show eqs)
             T.contradictoryIfT "enforceEdgeUniqueness:premConcIdxMismatch" clash
             -- nodes must be equal
-            solveNodeIdEqs $ map (fmap fst) eqs
+            solveTermEqsLabeled siteLbl SplitNow
+                (map (fmap varTerm . fmap fst) eqs)
       where
         eqs = concatMap (merge mergeEnd) $ groupSortOn compareEnd edges
 
