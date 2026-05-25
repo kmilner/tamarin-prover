@@ -2099,10 +2099,22 @@ impl<'ctx> Reduction<'ctx> {
                 eprintln!("[CONJOIN]     {}.{} = {}", id.name, id.idx,
                     crate::constraint::solver::reduction::rule_case_name(r));
             }
+            eprintln!("[CONJOIN]   live_edges:");
+            for e in &self.sys.edges {
+                eprintln!("[CONJOIN]     {}.{}.c{} → {}.{}.p{}",
+                    e.src.0.name, e.src.0.idx, e.src.1.0,
+                    e.tgt.0.name, e.tgt.0.idx, e.tgt.1.0);
+            }
             eprintln!("[CONJOIN]   case_all_nodes:");
             for (id, r) in &sys.nodes {
                 eprintln!("[CONJOIN]     {}.{} = {}", id.name, id.idx,
                     crate::constraint::solver::reduction::rule_case_name(r));
+            }
+            eprintln!("[CONJOIN]   case_edges:");
+            for e in &sys.edges {
+                eprintln!("[CONJOIN]     {}.{}.c{} → {}.{}.p{}",
+                    e.src.0.name, e.src.0.idx, e.src.1.0,
+                    e.tgt.0.name, e.tgt.0.idx, e.tgt.1.0);
             }
             // Also dump Serv_1/Register_pk-like nodes from BOTH live and case.
             for (id, r) in &self.sys.nodes {
