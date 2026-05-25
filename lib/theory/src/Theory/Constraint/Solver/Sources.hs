@@ -420,9 +420,23 @@ saturateSources parameters ctxt thsInit  =
             let g  = get cdGoal th
                 cs = getDisj (get cdCases th)
                 names = map (concat . fst) cs
+                -- Per-case dump of node-rule names + their RuleACInst
+                -- prems/concs/acts so we can diff against Rust's
+                -- TAM_DBG_SRC_CASE output.
+                caseDetail (caseName, sysTh0) =
+                    "\n    case=" ++ show caseName
+                    ++ " nodes=" ++ show (M.size (get sNodes sysTh0))
+                    ++ " edges=" ++ show (S.size (get sEdges sysTh0))
+                    ++ "\n      nodes_dump:" ++ concatMap nodeLine (M.toList (get sNodes sysTh0))
+                nodeLine (nid, ru) =
+                    "\n        " ++ show (nid :: NodeId)
+                    ++ " | prems=" ++ show (get rPrems ru)
+                    ++ " | concs=" ++ show (get rConcs ru)
+                    ++ " | acts=" ++ show (get rActs ru)
             in "  [" ++ label ++ " " ++ show idx ++ "] goal="
                   ++ show g ++ " cases=" ++ show (length cs)
                   ++ " names=" ++ show names
+                  ++ concatMap caseDetail cs
 
 -- | Precompute a saturated set of case distinctions.
 precomputeSources
