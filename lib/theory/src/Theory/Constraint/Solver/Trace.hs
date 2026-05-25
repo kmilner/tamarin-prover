@@ -66,6 +66,7 @@ module Theory.Constraint.Solver.Trace (
   , flagChains
   , flagExec
   , flagSourcesLeaf
+  , flagApplySrc
   , flagState
   , traceStateM
   , tracePickM
@@ -87,7 +88,7 @@ import qualified Extension.Data.Label          as L
 import           System.IO.Unsafe              (unsafePerformIO)
 import qualified System.Environment            as SysEnv
 
-import           Term.Substitution             (substToList)
+import           Term.Substitution             (substToList, substToListVFresh)
 import           Theory.Constraint.System
 import           Theory.Constraint.System.Constraints
                                                 (Goal(..))
@@ -184,6 +185,21 @@ flagStateEqs :: Bool
 flagStateEqs = unsafePerformIO $
     maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_STATE_EQS"
 {-# NOINLINE flagStateEqs #-}
+
+-- TAM_HS_TRACE_APPLY_SRC: dump per-application of a precomputed source
+-- case in `_applySource`.  For each `(goal, case)` pair, emit:
+--   [APPLY_SRC] path=<casePath> goal=<goal> case=<names>
+--   [APPLY_SRC]   keep=<keepVarBindings>
+--   [APPLY_SRC]   freshBefore=<global counter>
+--   [APPLY_SRC]   preFrees=<frees of sysTh0 in traversal order>
+--   [APPLY_SRC]   freshAfter=<global counter>
+--   [APPLY_SRC]   postFrees=<frees of sysTh in traversal order>
+-- Used to bisect the KAS_key_secrecy divergence (idx-allocation order
+-- between HS's someInst+importBinding and Rust's freshen_system_keep).
+flagApplySrc :: Bool
+flagApplySrc = unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_APPLY_SRC"
+{-# NOINLINE flagApplySrc #-}
 
 -- | Global mutable proof-tree case-name path.  Driver code
 -- (`proveSystemDFS`) sets this before each `prove` call so the trace
@@ -330,9 +346,24 @@ traceStateM sys
                 traceM ("[STATE_FULL] open_actions=" ++ canonicalOpenActions sys)
             else pure ()
         if flagStateEqs
-            then traceM ("[STATE_EQS] path=" ++ casePathString path
+            then do
+                traceM ("[STATE_EQS] path=" ++ casePathString path
                   ++ " subst=" ++ canonicalEqStoreSubst sys
                   ++ " conj=" ++ show (length (L.get sConjDisjEqs sys)))
+                -- Per-disjunct subst dump (mirrors Rust's
+                -- `[STATE_EQS]   disj[di].subst[si]=SplitId(N) [...]`).
+                -- Each subst is dumped as a list of `name.idx/sort→term`
+                -- pairs WITH idxs preserved so HS↔Rust can cross-diff
+                -- the exact `~ltkA.0 → ~lkR.X` collapse entries.
+                let dumpDisj di (sid, sset) =
+                        mapM_ (\(si, s) ->
+                            traceM ("[STATE_EQS]   disj[" ++ show di
+                                ++ "].subst[" ++ show si
+                                ++ "]=SplitId(" ++ show sid ++ ") "
+                                ++ show (substToListVFresh s)))
+                            (zip [(0::Int)..] (S.toList sset))
+                mapM_ (\(di, x) -> dumpDisj di x)
+                      (zip [(0::Int)..] (getConj (L.get sConjDisjEqs sys)))
             else pure ()
         if flagStateForms
             then do

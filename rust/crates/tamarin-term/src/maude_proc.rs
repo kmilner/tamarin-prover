@@ -541,6 +541,35 @@ impl MaudeHandle {
         // `{x → ~mw:Pub w, y → ~mw:Pub w}` and our unifier emits
         // the same shape.  Skips the ~2.5 ms subprocess round-trip
         // on every fact-eq unification.
+        // HS-faithful fast path for AC-free signatures.  Mirrors HS's
+        // `unifyLTermFactored` (Unification.hs:107-120):
+        //
+        // ```haskell
+        // unifyLTermFactored sortOf eqs = reader $ \h ->
+        //     solve h $ execRWST unif sortOf M.empty
+        //   where
+        //     unif = sequence [ unifyRaw t p | Equal t p <- eqs ]
+        //     solve _ (Just (m, [])) = (substFromMap m, [emptySubstVFresh])
+        // ```
+        // Then `flattenUnif`:
+        // ```haskell
+        // flattenUnif (subst, substs) = map (`composeVFresh` subst) substs
+        // ```
+        // For the fast path: `flattenUnif (m, [emptyVFresh])
+        //                  = [emptyVFresh `composeVFresh` m]`
+        //
+        // `composeVFresh` extends the empty VFresh with renamings for
+        // `varsRange m`, so range vars get RENAMED to fresh witnesses.
+        // This is the CRITICAL step: HS's output for `K → Var(V)`
+        // becomes TWO entries `[K → Var(~Vw), V → Var(~Vw)]`
+        // (narrowing-witness pattern), matching what Maude's full
+        // unify produces.
+        //
+        // Without this step, downstream `apply_eq_store`'s lifting
+        // gets confused: V appears only in range (not domain), and
+        // its lifted witness collides with K's renamed target,
+        // creating the SubstVFresh same-target collision that
+        // cascades into $R=$I (KAS_key_secrecy).
         if self.is_ac_free() {
             // Push the global counter above `avoid_max` so the local
             // unifier's `~mw` witnesses (allocated by
@@ -565,9 +594,25 @@ impl MaudeHandle {
             );
             return Ok(match result {
                 Ok(subst) => {
-                    let bindings: Vec<(crate::lterm::LVar, LNTerm)> = subst.to_list()
-                        .into_iter().map(|(v, t)| (v, t)).collect();
-                    vec![bindings]
+                    // HS-faithful flattenUnif (Unification.hs:147):
+                    //   map (`composeVFresh` subst) [emptyVFresh]
+                    // = [emptyVFresh.composeVFresh(subst)]
+                    //
+                    // This freshens range vars to witnesses, producing
+                    // narrowing-witness shape `K → ~Vw, V → ~Vw`.
+                    //
+                    // `TAM_RS_DISABLE_FLATTEN_UNIF=1` opts out to the
+                    // raw bindings shape for diagnosis.
+                    if std::env::var("TAM_RS_DISABLE_FLATTEN_UNIF").is_ok() {
+                        let bindings: Vec<(crate::lterm::LVar, LNTerm)> = subst.to_list()
+                            .into_iter().map(|(v, t)| (v, t)).collect();
+                        vec![bindings]
+                    } else {
+                        let empty_vfresh = crate::subst_vfresh::LSubstVFresh::<crate::lterm::Name>::empty();
+                        let folded = crate::subst_vfresh::compose_vfresh(
+                            &empty_vfresh, &subst);
+                        vec![folded.to_list()]
+                    }
                 }
                 Err(_) => Vec::new(),
             });

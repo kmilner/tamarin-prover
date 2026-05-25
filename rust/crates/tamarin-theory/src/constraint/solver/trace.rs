@@ -252,6 +252,18 @@ pub fn trace_state(sys: &crate::constraint::system::System) {
             case_path_string(),
             canonical_eq_store_subst(sys),
             sys.eq_store.conj.len());
+        // Dump each disjunct's substs for diff against HS — WITH IDXS
+        for (di, d) in sys.eq_store.conj.iter().enumerate() {
+            for (si, s) in d.substs.iter().enumerate() {
+                let entries: Vec<String> = s.to_list().into_iter().map(|(k, v)| {
+                    let k_str = format!("{}{}.{}", sort_prefix(k.sort), k.name, k.idx);
+                    let v_str = format!("{:?}", v).chars().take(120).collect::<String>();
+                    format!("{}→{}", k_str, v_str)
+                }).collect();
+                eprintln!("[STATE_EQS]   disj[{}].subst[{}]={:?} [{}]",
+                    di, si, d.split_id, entries.join(", "));
+            }
+        }
     }
     if state_forms_flag() {
         // `TAM_RS_TRACE_STATE_FORMS=1`: dump full formula content at
