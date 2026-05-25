@@ -941,7 +941,10 @@ impl<'ctx> Reduction<'ctx> {
             eprintln!("[vs-dump] solve_rule_constraints: {} substs", substs.len());
             for (i, s) in substs.iter().enumerate() {
                 let pairs: Vec<String> = s.to_list().iter()
-                    .map(|(k, v)| format!("{:?}→{:?}", k, v).chars().take(120).collect::<String>())
+                    .map(|(k, v)| {
+                        let trunc = if std::env::var("TAM_DBG_VS_DUMP_FULL").is_ok() { 500 } else { 120 };
+                        format!("{:?}→{:?}", k, v).chars().take(trunc).collect::<String>()
+                    })
                     .collect();
                 eprintln!("[vs-dump]   [{}]: {}", i, pairs.join(" ; "));
             }
