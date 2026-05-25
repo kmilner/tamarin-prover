@@ -4868,7 +4868,24 @@ pub fn solve_with_source_cases_action_with_ctx(
                 n, c.nodes.len(), c.edges.len(), c.goals.len(), c.last_atom);
             for (id, ru) in &c.nodes {
                 let nm = crate::constraint::solver::reduction::rule_case_name(ru);
-                eprintln!("[src_case]   node {:?} → {}", id, nm);
+                let fact_dump = |fs: &[crate::fact::LNFact]| -> Vec<String> {
+                    fs.iter().map(|a| format!("{}({:?})", crate::fact::fact_tag_name(&a.tag),
+                        a.terms.iter().map(|t| format!("{:?}", t).chars().take(80).collect::<String>())
+                            .collect::<Vec<_>>())).collect::<Vec<_>>()
+                };
+                eprintln!("[src_case]   node {:?} → {} | prems={:?} concs={:?} acts={:?}", id, nm,
+                    fact_dump(&ru.premises), fact_dump(&ru.conclusions), fact_dump(&ru.actions));
+            }
+            for e in &c.edges {
+                eprintln!("[src_case]   edge {:?}.c{} → {:?}.p{}",
+                    e.src.0, e.src.1.0, e.tgt.0, e.tgt.1.0);
+            }
+            for (g, _) in &c.goals {
+                eprintln!("[src_case]   goal {:?}", g);
+            }
+            for (v, t) in c.eq_store.subst.to_list().iter() {
+                eprintln!("[src_case]   eq {}.{}/{:?} → {:?}", v.name, v.idx, v.sort,
+                    format!("{:?}", t).chars().take(80).collect::<String>());
             }
         }
     }
