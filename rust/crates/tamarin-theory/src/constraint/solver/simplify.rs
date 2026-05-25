@@ -830,8 +830,27 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     let mut new_formulas: Vec<Guarded> = Vec::new();
     let dbg = std::env::var("TAM_DBG_IMPL").is_ok();
     if dbg {
-        eprintln!("[impl] {} universals, {} sys_actions",
-            universals.len(), sys_actions.len());
+        eprintln!("[impl] {} universals, {} sys_actions, {} formulas, {} lemmas",
+            universals.len(), sys_actions.len(),
+            red.sys.formulas.len(), red.sys.lemmas.len());
+        if std::env::var("TAM_DBG_IMPL_FORMULAS").is_ok() {
+            eprintln!("  formulas:");
+            for (i, f) in red.sys.formulas.iter().enumerate() {
+                let s = format!("{:?}", f);
+                eprintln!("    [{}]: {}", i, s.chars().take(200).collect::<String>());
+            }
+            eprintln!("  lemmas:");
+            for (i, f) in red.sys.lemmas.iter().enumerate() {
+                let s = format!("{:?}", f);
+                eprintln!("    [{}]: {}", i, s.chars().take(200).collect::<String>());
+            }
+            eprintln!("  solved_formulas ({}):", red.sys.solved_formulas.len());
+            for (i, f) in red.sys.solved_formulas.iter().take(20).enumerate() {
+                let s = format!("{:?}", f);
+                eprintln!("    [{}]: {}", i, s.chars().take(200).collect::<String>());
+            }
+        }
+        // Keep TAM_DBG_IMPL_FORMULAS as a documented diagnostic env var.
         for (i, (_orig, vars, guards, _)) in universals.iter().enumerate() {
             eprintln!("  universal[{}] vars={:?}", i,
                 vars.iter().map(|v| (v.name.clone(), v.idx)).collect::<Vec<_>>());
@@ -2772,7 +2791,9 @@ fn reduce_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
                     Box::leak(format!("All({:?})", vars.iter().map(|v| (v.name.clone(), v.idx)).collect::<Vec<_>>()).into_boxed_str()),
             };
             let red_flag = reducible_formula(f);
-            eprintln!("  formula[{}] head={} reducible={}", i, head, red_flag);
+            let s = format!("{:?}", f);
+            eprintln!("  formula[{}] head={} reducible={} body={}",
+                i, head, red_flag, s.chars().take(180).collect::<String>());
         }
     }
     if to_decompose.is_empty() { return ChangeIndicator::Unchanged; }

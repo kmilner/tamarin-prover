@@ -189,6 +189,21 @@ pub fn prove_lemma(
     // because the marker line is cheap and useful for any trace
     // analysis.
     eprintln!("[rs-phase] lemma-proof START");
+    if std::env::var("TAM_DBG_LEMMA_INIT").is_ok() {
+        eprintln!("[lemma-init] sys.formulas count = {}", sys.formulas.len());
+        for (i, f) in sys.formulas.iter().enumerate() {
+            let s = format!("{:?}", f);
+            eprintln!("[lemma-init]   formula[{}]: {}", i,
+                s.chars().take(250).collect::<String>());
+        }
+        eprintln!("[lemma-init] sys.lemmas count = {}", sys.lemmas.len());
+        for (i, f) in sys.lemmas.iter().enumerate() {
+            let s = format!("{:?}", f);
+            eprintln!("[lemma-init]   lemma[{}]: {}", i,
+                s.chars().take(250).collect::<String>());
+        }
+    }
+    // Keep TAM_DBG_LEMMA_INIT as a documented diagnostic env var.
     // Honour the `[use_induction]` and `[sources]` attributes by
     // forcing the first proof method to be Induction. Haskell's
     // `ClosedTheory.hs` flips `pcUseInduction = UseInduction` for
