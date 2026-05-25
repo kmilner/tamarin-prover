@@ -5746,6 +5746,23 @@ fn apply_source_case_action(
         .map_free(&mut |v| shift_lvar(&v));
     let empty_keep: std::collections::BTreeSet<tamarin_term::lterm::LVar>
         = std::collections::BTreeSet::new();
+    if std::env::var("TAM_DBG_CASE_PRE_FRESHEN").is_ok() {
+        eprintln!("[case_pre_freshen] case={}: case_sys.nodes:", case_label);
+        for (id, ru) in &case_sys.nodes {
+            let nm = crate::constraint::solver::reduction::rule_case_name(ru);
+            if nm == "Serv_1" || nm == "Register_pk" || nm == "Client_1" {
+                eprintln!("[case_pre_freshen]   node {:?} → {}", id, nm);
+                for (i, p) in ru.premises.iter().enumerate() {
+                    eprintln!("[case_pre_freshen]     prem[{}]: {:?}", i,
+                        format!("{:?}", p).chars().take(1000).collect::<String>());
+                }
+                for (i, c) in ru.conclusions.iter().enumerate() {
+                    eprintln!("[case_pre_freshen]     conc[{}]: {:?}", i,
+                        format!("{:?}", c).chars().take(1000).collect::<String>());
+                }
+            }
+        }
+    }
     let renamed_case = freshen_system_keep_with_shift(
         case_sys, rename_shift, &empty_keep);
 
@@ -5838,17 +5855,18 @@ fn apply_source_case_action(
             let nm = crate::constraint::solver::reduction::rule_case_name(ru);
             if nm == "Serv_1" || nm == "Register_pk" {
                 eprintln!("[apply_refine]   node {:?} → {}", id, nm);
+                let trunc = if std::env::var("TAM_DBG_APPLY_REFINE_FULL").is_ok() { 1000 } else { 280 };
                 for (i, p) in ru.premises.iter().enumerate() {
                     eprintln!("[apply_refine]     prem[{}]: {:?}", i,
-                        format!("{:?}", p).chars().take(280).collect::<String>());
+                        format!("{:?}", p).chars().take(trunc).collect::<String>());
                 }
                 for (i, c) in ru.conclusions.iter().enumerate() {
                     eprintln!("[apply_refine]     conc[{}]: {:?}", i,
-                        format!("{:?}", c).chars().take(280).collect::<String>());
+                        format!("{:?}", c).chars().take(trunc).collect::<String>());
                 }
                 for (i, a) in ru.actions.iter().enumerate() {
                     eprintln!("[apply_refine]     act[{}]: {:?}", i,
-                        format!("{:?}", a).chars().take(280).collect::<String>());
+                        format!("{:?}", a).chars().take(trunc).collect::<String>());
                 }
             }
         }
