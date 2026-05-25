@@ -2307,10 +2307,27 @@ fn apply_node_eqs(
         if tag_mismatch {
             mark_contradictory_labeled(red, "apply_node_eqs:tag_mismatch");
         }
+        if std::env::var("TAM_DBG_EDGE_UNIQ2").is_ok() {
+            let path = crate::constraint::solver::trace::case_path_string();
+            eprintln!("[apply_node_eqs] path={} safe_eqs.len={}", path, safe_eqs.len());
+            for (i, e) in safe_eqs.iter().enumerate().take(8) {
+                eprintln!("[apply_node_eqs]   eq[{}]: lhs={:?} rhs={:?}", i,
+                    format!("{:?}", e.lhs).chars().take(220).collect::<String>(),
+                    format!("{:?}", e.rhs).chars().take(220).collect::<String>());
+            }
+        }
         let res = red.solve_fact_eqs(
             crate::constraint::solver::reduction::SplitStrategy::SplitLater,
             &safe_eqs,
         );
+        if std::env::var("TAM_DBG_EDGE_UNIQ2").is_ok() {
+            eprintln!("[apply_node_eqs] solve_fact_eqs result: {:?}", res);
+            eprintln!("[apply_node_eqs] eq_store after: ({} entries)", red.sys.eq_store.subst.to_list().len());
+            for (v, t) in red.sys.eq_store.subst.to_list().iter().take(10) {
+                eprintln!("[apply_node_eqs]   {}#{}({:?}) → {}", v.name, v.idx, v.sort,
+                    format!("{:?}", t).chars().take(80).collect::<String>());
+            }
+        }
         if matches!(res, Err(_) | Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)) {
             mark_contradictory_labeled(red, "apply_node_eqs:fact_eqs_contradictory");
         }
@@ -2432,12 +2449,44 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         mark_contradictory_labeled(red, "enforce_edge_uniqueness:conc_idx_clash");
         return ChangeIndicator::Changed;
     }
+    if std::env::var("TAM_DBG_EDGE_UNIQ2").is_ok() {
+        let path = crate::constraint::solver::trace::case_path_string();
+        eprintln!("[edge_uniq2] path={} by_src.len={} by_tgt-merges={}",
+            path, by_src.len(), node_eqs.len());
+        for (src, prems) in &by_src {
+            if prems.len() < 2 { continue; }
+            let is_persistent = persistent_concs.contains(&(src.0.clone(), src.1.0));
+            eprintln!("[edge_uniq2]   src=({}.{}, conc{}) persistent={} consumers={}",
+                src.0.name, src.0.idx, src.1.0, is_persistent, prems.len());
+            for p in prems {
+                eprintln!("[edge_uniq2]     → ({}.{}, prem{})", p.0.name, p.0.idx, p.1.0);
+            }
+        }
+    }
     // Pass 2 (Haskell's second `mergeNodes eTgt eSrc` filtered to
     // linear conclusions): a single linear conclusion can feed only
     // one premise.  Skip persistent conclusions.
     for (src, prems) in by_src {
         if prems.len() < 2 { continue; }
         if persistent_concs.contains(&(src.0.clone(), src.1.0)) { continue; }
+        if std::env::var("TAM_DBG_EDGE_UNIQ2").is_ok() {
+            let path = crate::constraint::solver::trace::case_path_string();
+            let keep_rule = red.sys.nodes.iter()
+                .find(|(id, _)| id == &prems[0].0)
+                .map(|(_, r)| crate::constraint::solver::reduction::rule_case_name(r))
+                .unwrap_or_else(|| "?".to_string());
+            eprintln!("[edge_uniq2-PASS2] path={} src=({}.{},c{}) keep={}.{}({}) prems_n={}",
+                path, src.0.name, src.0.idx, src.1.0,
+                prems[0].0.name, prems[0].0.idx, keep_rule, prems.len());
+            for p in &prems[1..] {
+                let other_rule = red.sys.nodes.iter()
+                    .find(|(id, _)| id == &p.0)
+                    .map(|(_, r)| crate::constraint::solver::reduction::rule_case_name(r))
+                    .unwrap_or_else(|| "?".to_string());
+                eprintln!("[edge_uniq2-PASS2]   merge_other={}.{}({}) prem_idx={}",
+                    p.0.name, p.0.idx, other_rule, p.1.0);
+            }
+        }
         let keep = &prems[0];
         for other in prems.iter().skip(1) {
             if keep.1 != other.1 {

@@ -465,9 +465,14 @@ execProofMethod ctxt method sys =
       T.traceStateM sys
       T.tracePickM goal
       let ths = L.get pcSources ctxt
-      maybe  (solveGoal goal)
-             (intercalate "_" <$>)
-             (solveWithSource ctxt ths goal)
+      let ws = solveWithSource ctxt ths goal
+      let mark = case ws of
+                   Just _  -> "[SOLVE-DISPATCH] via=solveWithSource goal=" ++ show goal
+                   Nothing -> "[SOLVE-DISPATCH] via=solveGoal goal=" ++ show goal
+      (if hsTraceSolve then trace mark else id) $
+       maybe  (solveGoal goal)
+              (intercalate "_" <$>)
+              ws
 
     -- Induction is only possible if the system contains only
     -- a single, last-free, closed formula.
