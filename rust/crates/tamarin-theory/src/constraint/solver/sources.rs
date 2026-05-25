@@ -5804,6 +5804,27 @@ fn apply_source_case_action(
         dbg("post-subst-eq-store-false");
         return None;
     }
+    if std::env::var("TAM_DBG_APPLY_REFINE").is_ok() {
+        eprintln!("[apply_refine] case={} POST-subst:", case_label);
+        for (id, ru) in &refined.sys.nodes {
+            let nm = crate::constraint::solver::reduction::rule_case_name(ru);
+            if nm == "Serv_1" || nm == "Register_pk" {
+                eprintln!("[apply_refine]   node {:?} → {}", id, nm);
+                for (i, p) in ru.premises.iter().enumerate() {
+                    eprintln!("[apply_refine]     prem[{}]: {:?}", i,
+                        format!("{:?}", p).chars().take(150).collect::<String>());
+                }
+                for (i, c) in ru.conclusions.iter().enumerate() {
+                    eprintln!("[apply_refine]     conc[{}]: {:?}", i,
+                        format!("{:?}", c).chars().take(150).collect::<String>());
+                }
+                for (i, a) in ru.actions.iter().enumerate() {
+                    eprintln!("[apply_refine]     act[{}]: {:?}", i,
+                        format!("{:?}", a).chars().take(150).collect::<String>());
+                }
+            }
+        }
+    }
     // Mirror Haskell `refineSource ctxt (refineSubst subst) (set cdGoal goalTerm th)`
     // (Sources.hs:285,290): after refineSubst, restrict the case's
     // eq-store to `frees (cdGoal th) = frees goalTerm` — the LIVE
