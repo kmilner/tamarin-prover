@@ -99,6 +99,71 @@ pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
     let no_open_goals = open_goals(sys).is_empty();
     let sub_finished = finished_subterms(ctx, sys);
     if no_open_goals && sub_finished {
+        if std::env::var("TAM_DBG_SOLVED_DUMP").is_ok() {
+            let path = crate::constraint::solver::trace::case_path_string();
+            eprintln!("[SOLVED_DUMP] path={} nodes={} actions=?, formulas={}, solved_formulas={}, lemmas={}, edges={}, eq_store_n={}",
+                path, sys.nodes.len(),
+                sys.formulas.len(), sys.solved_formulas.len(),
+                sys.lemmas.len(), sys.edges.len(),
+                sys.eq_store.subst.to_list().len());
+            eprintln!("[SOLVED_DUMP]   nodes:");
+            for (id, r) in &sys.nodes {
+                let acts: Vec<String> = r.actions.iter()
+                    .map(|a| format!("{:?}({:?})", a.tag,
+                        a.terms.iter().map(|t| format!("{:?}", t).chars().take(80).collect::<String>())
+                            .collect::<Vec<_>>()))
+                    .collect();
+                eprintln!("[SOLVED_DUMP]     {}.{} {} acts={:?}",
+                    id.name, id.idx,
+                    crate::constraint::solver::reduction::rule_case_name(r),
+                    acts);
+            }
+            eprintln!("[SOLVED_DUMP]   formulas (open):");
+            for (i, f) in sys.formulas.iter().enumerate() {
+                eprintln!("[SOLVED_DUMP]     [{}] {}", i, format!("{:?}", f).chars().take(300).collect::<String>());
+            }
+            eprintln!("[SOLVED_DUMP]   solved_formulas:");
+            for (i, f) in sys.solved_formulas.iter().enumerate() {
+                eprintln!("[SOLVED_DUMP]     [{}] {}", i, format!("{:?}", f).chars().take(300).collect::<String>());
+            }
+            eprintln!("[SOLVED_DUMP]   lemmas:");
+            for (i, f) in sys.lemmas.iter().enumerate() {
+                eprintln!("[SOLVED_DUMP]     [{}] {}", i, format!("{:?}", f).chars().take(300).collect::<String>());
+            }
+            eprintln!("[SOLVED_DUMP]   eq_store bindings:");
+            for (v, t) in sys.eq_store.subst.to_list().iter() {
+                eprintln!("[SOLVED_DUMP]     {}.{}({:?}) → {}",
+                    v.name, v.idx, v.sort,
+                    format!("{:?}", t).chars().take(150).collect::<String>());
+            }
+            eprintln!("[SOLVED_DUMP]   edges:");
+            for e in &sys.edges {
+                let src_rule = sys.nodes.iter()
+                    .find(|(id, _)| id == &e.src.0)
+                    .map(|(_, r)| crate::constraint::solver::reduction::rule_case_name(r))
+                    .unwrap_or_else(|| "?".to_string());
+                let tgt_rule = sys.nodes.iter()
+                    .find(|(id, _)| id == &e.tgt.0)
+                    .map(|(_, r)| crate::constraint::solver::reduction::rule_case_name(r))
+                    .unwrap_or_else(|| "?".to_string());
+                eprintln!("[SOLVED_DUMP]     ({}.{}/{},conc{}) → ({}.{}/{},prem{})",
+                    e.src.0.name, e.src.0.idx, src_rule, e.src.1.0,
+                    e.tgt.0.name, e.tgt.0.idx, tgt_rule, e.tgt.1.0);
+            }
+            eprintln!("[SOLVED_DUMP]   node-premises by node:");
+            for (id, r) in &sys.nodes {
+                let prems: Vec<String> = r.premises.iter()
+                    .map(|f| format!("{:?}", f.tag))
+                    .collect();
+                let concs: Vec<String> = r.conclusions.iter()
+                    .map(|f| format!("{:?}", f.tag))
+                    .collect();
+                eprintln!("[SOLVED_DUMP]     {}.{} ({}) prems={:?} concs={:?}",
+                    id.name, id.idx,
+                    crate::constraint::solver::reduction::rule_case_name(r),
+                    prems, concs);
+            }
+        }
         // Haskell's `isFinished` (ProofMethod.hs:505) doesn't gate
         // Solved on `incomplete` source consumption — `Source.incomplete`
         // is diagnostic-only there.  Match that.
