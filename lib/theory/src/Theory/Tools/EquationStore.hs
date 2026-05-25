@@ -267,10 +267,12 @@ dbgPerformSplit = System.IO.Unsafe.unsafePerformIO $
 addEqs :: MonadFresh m
        => MaudeHandle -> [Equal LNTerm] -> EqStore -> m (EqStore, Maybe SplitId)
 addEqs hnd eqs0 eqStore =
+    (if hsTraceSBind then trace ("[HS_addEqs] eqs0=" ++ show eqs0) else id) $
     case unifyLNTermFactored eqs `runReader` hnd of
         (_, []) ->
             return (set eqsConj falseEqConstrConj eqStore, Nothing)
         (subst, [substFresh]) | substFresh == emptySubstVFresh ->
+            (if hsTraceSBind then trace ("[HS_addEqs_subst] subst=" ++ show (substToList subst)) else id) $
             return (applyEqStore hnd subst eqStore, Nothing)
         (subst, substs) -> do
             let (eqStore', sid) = addDisj (applyEqStore hnd subst eqStore)
@@ -292,6 +294,12 @@ addEqs hnd eqs0 eqStore =
       fromMaybe (error "addEqsSplit: impossible, splitAtPos failed")
                 (splitAtPos (applyEqStore hnd sfree (addDisj eqSt (S.fromList disj))) 0)
 -}
+
+-- TAM_HS_TRACE_S_BIND flag.
+hsTraceSBind :: Bool
+hsTraceSBind = System.IO.Unsafe.unsafePerformIO $
+    maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_TRACE_S_BIND"
+{-# NOINLINE hsTraceSBind #-}
 
 -- | Apply a substitution to an equation store and bring resulting equations into
 --   normal form again by using unification.

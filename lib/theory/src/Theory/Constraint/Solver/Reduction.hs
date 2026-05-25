@@ -132,6 +132,11 @@ dbgSolveTermEqsOn = Unsafe.unsafePerformIO $
     maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_DBG_SOLVE_TERM_EQS"
 {-# NOINLINE dbgSolveTermEqsOn #-}
 
+hsTraceSBindHere :: Bool
+hsTraceSBindHere = Unsafe.unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_S_BIND"
+{-# NOINLINE hsTraceSBindHere #-}
+
 -- Executing reductions
 -----------------------
 
@@ -819,6 +824,7 @@ solveTermEqsLabeled siteLabel splitStrat eqs0 =
           return Unchanged
       eqs1 -> do
         T.traceExecM ("solveTermEqs n=" ++ show (length eqs1))
+        when hsTraceSBindHere $ Debug.Trace.traceM ("[HS_STE_CALL] site=" ++ siteLabel ++ " eqs=" ++ show eqs1)
         -- TAM_HS_DBG_SOLVE_TERM_EQS=1: dump every solveTermEqs call's
         -- site label, split strategy, and the equations being solved.
         -- Pair with Rust's TAM_RS_DBG_SOLVE_TERM_EQS for HS↔Rust

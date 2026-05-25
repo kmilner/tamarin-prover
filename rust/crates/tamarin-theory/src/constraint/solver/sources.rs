@@ -5785,6 +5785,13 @@ fn apply_source_case_action(
     // then run them through the renamed case's Reduction.
     // ---------------------------------------------------------------
     let mut refined = Reduction::new(ctx, renamed_case);
+    if std::env::var("TAM_DBG_APPLY_REFINE").is_ok() {
+        eprintln!("[apply_refine] case={} PRE-solve_term_eqs eq_store entries:", case_label);
+        for (v, t) in refined.sys.eq_store.subst.to_list().iter().take(10) {
+            eprintln!("[apply_refine]   {}.{}/{:?} → {:?}", v.name, v.idx, v.sort,
+                format!("{:?}", t).chars().take(100).collect::<String>());
+        }
+    }
     let term_eqs: Vec<_> = match_pairs.into_iter()
         .map(|(v, t)| tamarin_term::rewriting::Equal {
             lhs: tamarin_term::term::Term::Lit(
@@ -5797,6 +5804,13 @@ fn apply_source_case_action(
         if matches!(r, Err(_) | Ok(SolveOutcome::Contradictory)) {
             dbg("refineSubst-contradictory");
             return None;
+        }
+    }
+    if std::env::var("TAM_DBG_APPLY_REFINE").is_ok() {
+        eprintln!("[apply_refine] case={} POST-solve_term_eqs eq_store entries:", case_label);
+        for (v, t) in refined.sys.eq_store.subst.to_list().iter().take(15) {
+            eprintln!("[apply_refine]   {}.{}/{:?} → {:?}", v.name, v.idx, v.sort,
+                format!("{:?}", t).chars().take(100).collect::<String>());
         }
     }
     refined.subst_system();
