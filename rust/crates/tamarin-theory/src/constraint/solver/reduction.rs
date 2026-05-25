@@ -480,7 +480,14 @@ impl<'ctx> Reduction<'ctx> {
         // tracking.
         let no_node_fact_subst = std::env::var("TAM_RS_NO_NODE_FACT_SUBST").is_ok();
         for (id, rule) in nodes {
+            let id_orig = id.clone();
             let new_id = map_var(id);
+            if std::env::var("TAM_DBG_SUBST_NODE_RENAME").is_ok() && new_id != id_orig {
+                let path = crate::constraint::solver::trace::case_path_string();
+                let rule_name = rule_case_name(&rule);
+                eprintln!("[subst_node_rename] path={} {}.{} → {}.{}  rule={}",
+                    path, id_orig.name, id_orig.idx, new_id.name, new_id.idx, rule_name);
+            }
             // First pass: map_var via map_free for node-ids etc.
             // Always do node-id rewrites (otherwise edges/goals can't
             // find their nodes by canonical id).
@@ -2086,6 +2093,17 @@ impl<'ctx> Reduction<'ctx> {
                 .collect();
             eprintln!("[CONJOIN] path={} live_fresh={:?} case_fresh={:?} case_subst={:?} live_subst={:?}",
                 path, live_fresh, case_fresh, case_subst, live_subst);
+            // ALL live nodes summary
+            eprintln!("[CONJOIN]   live_all_nodes:");
+            for (id, r) in &self.sys.nodes {
+                eprintln!("[CONJOIN]     {}.{} = {}", id.name, id.idx,
+                    crate::constraint::solver::reduction::rule_case_name(r));
+            }
+            eprintln!("[CONJOIN]   case_all_nodes:");
+            for (id, r) in &sys.nodes {
+                eprintln!("[CONJOIN]     {}.{} = {}", id.name, id.idx,
+                    crate::constraint::solver::reduction::rule_case_name(r));
+            }
             // Also dump Serv_1/Register_pk-like nodes from BOTH live and case.
             for (id, r) in &self.sys.nodes {
                 let nm = crate::constraint::solver::reduction::rule_case_name(r);

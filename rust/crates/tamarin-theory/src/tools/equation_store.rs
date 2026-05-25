@@ -403,6 +403,8 @@ impl EquationStore {
                 return Ok(None);
             }
             log_fresh_bindings("local", &local_subst);
+            log_s_pub_bindings("local", &local_subst);
+            log_vr_node_bindings("local", &local_subst);
             if self.conj.is_empty() {
                 // HS would call applyEqStore with empty conj here.
                 // Tick to match HS's call count when comparing.
@@ -477,6 +479,8 @@ impl EquationStore {
             // `map (\`composeVFresh\` subst) substs`).
             let subst = maude_subst.compose(&local_subst);
             log_fresh_bindings("maude_single", &subst);
+            log_s_pub_bindings("maude_single", &subst);
+            log_vr_node_bindings("maude_single", &subst);
             // Haskell-faithful: call applyEqStore so existing disj substs
             // get re-unified against the new free subst.  Without it,
             // SplitG variants whose domain intersects with `subst.dom`
@@ -1580,6 +1584,56 @@ fn log_fresh_bindings(site: &str, subst: &LNSubst) {
             let t_str: String = format!("{:?}", t).chars().take(120).collect();
             eprintln!("[FRESH_BIND] site={} {}.{}/{:?} → {}",
                 site, v.name, v.idx, v.sort, t_str);
+        }
+    }
+}
+
+/// TAM_RS_TRACE_S_BIND: log every binding where lhs OR rhs mentions an
+/// LVar with name="S" and sort=Pub.  Used to pinpoint the moment a
+/// freshly-grafted Serv_1's $S diverges from the lemma's $S.
+pub(crate) fn log_s_pub_bindings(site: &str, subst: &LNSubst) {
+    if std::env::var("TAM_RS_TRACE_S_BIND").is_err() { return; }
+    use tamarin_term::lterm::{HasFrees, LSort};
+    for (v, t) in subst.to_list() {
+        let v_is_s = v.name == "S" && v.sort == LSort::Pub;
+        let mut t_has_s = false;
+        t.for_each_free(&mut |w: &tamarin_term::lterm::LVar| {
+            if w.name == "S" && w.sort == LSort::Pub { t_has_s = true; }
+        });
+        if v_is_s || t_has_s {
+            let path = crate::constraint::solver::trace::case_path_string();
+            let bt = std::backtrace::Backtrace::force_capture();
+            let bt_str = format!("{}", bt);
+            // Trim the backtrace to the most relevant 4 frames
+            // (caller's call stack into the eq_store).
+            let bt_short: String = bt_str.lines()
+                .filter(|l| l.contains("tamarin_") && !l.contains(".cargo"))
+                .take(6).collect::<Vec<_>>().join(" | ");
+            let t_str: String = format!("{:?}", t).chars().take(120).collect();
+            eprintln!("[S_BIND] path={} site={} {}.{}/{:?} → {}  | bt={}",
+                path, site, v.name, v.idx, v.sort, t_str, bt_short);
+        }
+    }
+}
+
+/// TAM_RS_TRACE_VR_BIND: log every binding where lhs is a Node LVar with
+/// name "vr" (rule-instance node ids).  Used to pinpoint when grafted
+/// Serv_1 node ids get renamed to low-idx values that collide with
+/// pre-existing instances.
+pub(crate) fn log_vr_node_bindings(site: &str, subst: &LNSubst) {
+    if std::env::var("TAM_RS_TRACE_VR_BIND").is_err() { return; }
+    use tamarin_term::lterm::LSort;
+    for (v, t) in subst.to_list() {
+        if v.name == "vr" && v.sort == LSort::Node {
+            let path = crate::constraint::solver::trace::case_path_string();
+            let bt = std::backtrace::Backtrace::force_capture();
+            let bt_str = format!("{}", bt);
+            let bt_short: String = bt_str.lines()
+                .filter(|l| l.contains("tamarin_") && !l.contains(".cargo"))
+                .take(6).collect::<Vec<_>>().join(" | ");
+            let t_str: String = format!("{:?}", t).chars().take(60).collect();
+            eprintln!("[VR_BIND] path={} site={} vr.{} → {}  | bt={}",
+                path, site, v.idx, t_str, bt_short);
         }
     }
 }

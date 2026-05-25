@@ -2210,6 +2210,22 @@ fn apply_node_eqs(
     red: &mut Reduction,
     eqs: &[tamarin_term::rewriting::Equal<crate::constraint::constraints::NodeId>],
 ) {
+    if std::env::var("TAM_DBG_APPLY_NODE_EQS").is_ok() {
+        let path = crate::constraint::solver::trace::case_path_string();
+        for e in eqs {
+            let kept_rule = red.sys.nodes.iter()
+                .find(|(id, _)| id == &e.lhs)
+                .map(|(_, r)| crate::constraint::solver::reduction::rule_case_name(r))
+                .unwrap_or_else(|| "?".to_string());
+            let other_rule = red.sys.nodes.iter()
+                .find(|(id, _)| id == &e.rhs)
+                .map(|(_, r)| crate::constraint::solver::reduction::rule_case_name(r))
+                .unwrap_or_else(|| "?".to_string());
+            eprintln!("[apply_node_eqs] path={} rename {}.{} ({}) → {}.{} ({})",
+                path, e.rhs.name, e.rhs.idx, other_rule,
+                e.lhs.name, e.lhs.idx, kept_rule);
+        }
+    }
     let renames: std::collections::HashMap<
         crate::constraint::constraints::NodeId,
         crate::constraint::constraints::NodeId,
