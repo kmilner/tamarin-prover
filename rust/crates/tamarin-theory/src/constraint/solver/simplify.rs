@@ -99,6 +99,48 @@ pub fn simplify_system(red: &mut Reduction) {
         .and_then(|s| s.parse().ok()).unwrap_or(64);
     let mut iter = 0u32;
     let dbg_simp = std::env::var("TAM_DBG_SIMP").is_ok();
+    if std::env::var("TAM_DBG_SIMP_ENTER").is_ok() {
+        let path = crate::constraint::solver::trace::case_path_string();
+        eprintln!("[simp_enter] path={} nodes={} formulas={} eq_store={}",
+            path, red.sys.nodes.len(), red.sys.formulas.len(),
+            red.sys.eq_store.subst.to_list().len());
+        if std::env::var("TAM_DBG_SIMP_ENTER_NODES").is_ok() {
+            // Compact var dump: show "name.idx" only for LVar literals.
+            fn term_compact(t: &tamarin_term::lterm::LNTerm) -> String {
+                use tamarin_term::term::Term;
+                use tamarin_term::vterm::Lit;
+                match t {
+                    Term::Lit(Lit::Var(v)) => format!("{}.{}", v.name, v.idx),
+                    Term::Lit(Lit::Con(c)) => format!("'{}'", format!("{:?}", c).chars().take(20).collect::<String>()),
+                    Term::App(f, args) => format!("{}({})",
+                        match f {
+                            tamarin_term::function_symbols::FunSym::NoEq(n) =>
+                                std::str::from_utf8(&n.name).unwrap_or("?").to_string(),
+                            _ => format!("{:?}", f).chars().take(10).collect::<String>(),
+                        },
+                        args.iter().map(term_compact).collect::<Vec<_>>().join(",")),
+                }
+            }
+            let fact_compact = |f: &crate::fact::LNFact| -> String {
+                format!("{:?}({})", f.tag,
+                    f.terms.iter().map(term_compact).collect::<Vec<_>>().join(","))
+            };
+            for (id, r) in &red.sys.nodes {
+                let prems: Vec<String> = r.premises.iter().map(&fact_compact).collect();
+                let acts: Vec<String> = r.actions.iter().map(&fact_compact).collect();
+                let concs: Vec<String> = r.conclusions.iter().map(&fact_compact).collect();
+                eprintln!("[simp_enter]   {}.{}({}) prems={:?} concs={:?} acts={:?}",
+                    id.name, id.idx,
+                    crate::constraint::solver::reduction::rule_case_name(r),
+                    prems, concs, acts);
+            }
+            for (v, t) in red.sys.eq_store.subst.to_list().iter() {
+                eprintln!("[simp_enter]   eqstore {}.{} → {}",
+                    v.name, v.idx,
+                    format!("{:?}", t).chars().take(80).collect::<String>());
+            }
+        }
+    }
     red.while_changing(|r| {
         iter += 1;
         if iter > cap {
@@ -2282,6 +2324,22 @@ fn apply_node_eqs(
                     eprintln!("[apply_node_eqs-FULL] path={} COLLISION_AT new_id={}.{} keep_rule={} other_rule={}",
                         path, new_id.name, new_id.idx,
                         kept_rule_nm, other_rule_nm);
+                    // Dump ALL other nodes' $S vars at this collision moment
+                    if std::env::var("TAM_DBG_S_DUMP").is_ok() {
+                        eprintln!("[apply_node_eqs-FULL]   --- SYSTEM NODES WITH $S ---");
+                        for (other_id, other_r) in new_nodes.iter() {
+                            let s_in_acts: Vec<String> = other_r.actions.iter()
+                                .filter_map(|a| a.terms.first().map(|t| format!("{:?}", t).chars().take(60).collect::<String>()))
+                                .collect();
+                            let s_in_prems: Vec<String> = other_r.premises.iter()
+                                .filter_map(|f| f.terms.first().map(|t| format!("{:?}", t).chars().take(60).collect::<String>()))
+                                .collect();
+                            eprintln!("[apply_node_eqs-FULL]     {}.{} ({}) acts_first={:?} prems_first={:?}",
+                                other_id.name, other_id.idx,
+                                crate::constraint::solver::reduction::rule_case_name(other_r),
+                                s_in_acts, s_in_prems);
+                        }
+                    }
                     eprintln!("[apply_node_eqs-FULL]   kept.premises={:?}",
                         kept.premises.iter().map(|f| format!("{:?}", f).chars().take(120).collect::<String>()).collect::<Vec<_>>());
                     eprintln!("[apply_node_eqs-FULL]   other.premises={:?}",
