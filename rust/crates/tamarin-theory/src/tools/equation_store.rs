@@ -1476,6 +1476,18 @@ impl EquationStore {
                     let current_dom: BTreeSet<LVar> = raw.iter()
                         .map(|(k, _)| k.clone())
                         .collect();
+                    // Also collect this variant's ORIGINAL bindings.keys
+                    // — these are the variant's system vars from its
+                    // domain.  When restrict drops a (witness, system_var)
+                    // entry due to LARGER-idx orient, the system_var ends
+                    // up orphaned in OTHER entries' range values.  Without
+                    // lifting it, the next aes call's uniform RHS shift
+                    // treats it as a witness and renames it, breaking the
+                    // binding to the rule's premise (Client_auth Ltk vs In
+                    // ltkS desync).
+                    let orig_dom: BTreeSet<LVar> = bindings.iter()
+                        .map(|(k, _)| k.clone())
+                        .collect();
                     // Find system vars in any range value that aren't
                     // in the current domain.  These are the ones to
                     // lift.
@@ -1483,7 +1495,9 @@ impl EquationStore {
                     let mut seen: BTreeSet<LVar> = BTreeSet::new();
                     for (_, t) in &raw {
                         t.for_each_free(&mut |v: &LVar| {
-                            if new_subst_range_vars.contains(v)
+                            let is_system = new_subst_range_vars.contains(v)
+                                || orig_dom.contains(v);
+                            if is_system
                                 && !current_dom.contains(v)
                                 && seen.insert(v.clone())
                             {
