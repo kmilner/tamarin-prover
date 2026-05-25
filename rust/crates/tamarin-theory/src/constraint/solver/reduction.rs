@@ -2246,6 +2246,15 @@ impl<'ctx> Reduction<'ctx> {
         }
         // 13. substSystem.
         self.subst_system();
+        if std::env::var("TAM_DBG_CONJOIN_POST").is_ok() {
+            let path = crate::constraint::solver::trace::case_path_string();
+            eprintln!("[conjoin_post] path={} eq_store after step 13 ({} entries):",
+                path, self.sys.eq_store.subst.to_list().len());
+            for (v, t) in self.sys.eq_store.subst.to_list().iter().take(20) {
+                eprintln!("[conjoin_post]   {}.{}/{:?} → {:?}", v.name, v.idx, v.sort,
+                    format!("{:?}", t).chars().take(80).collect::<String>());
+            }
+        }
         Ok(SolveOutcome::Linear(ChangeIndicator::Changed))
     }
 }
