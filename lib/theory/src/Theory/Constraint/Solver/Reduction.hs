@@ -871,7 +871,7 @@ solveTermEqsLabeled siteLabel splitStrat eqs0 =
             else return ()
         hnd <- getMaudeHandle
         se  <- gets id
-        (eqs2, maySplitId) <- addEqs hnd eqs1 =<< getM sEqStore
+        (eqs2, maySplitId) <- addEqsLabeled siteLabel hnd eqs1 =<< getM sEqStore
         setM sEqStore
             =<< simp hnd (substCreatesNonNormalTerms hnd se)
             =<< case (maySplitId, splitStrat) of
