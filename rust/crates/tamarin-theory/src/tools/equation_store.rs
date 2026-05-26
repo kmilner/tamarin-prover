@@ -1410,11 +1410,13 @@ impl EquationStore {
     ///
     /// Errors if `asubst`'s domain and range overlap (Haskell errors
     /// here too, since the resulting composition would be malformed).
+    #[track_caller]
     pub fn apply_eq_store(
         &mut self,
         maude: &tamarin_term::maude_proc::MaudeHandle,
         asubst: &LNSubst,
     ) -> Result<(), AddEqsError> {
+        let __aes_caller = std::panic::Location::caller();
         // Domain/range disjointness check.
         let dom: BTreeSet<LVar> = asubst.dom().cloned().collect();
         let range_vars: BTreeSet<LVar> = asubst.range()
@@ -1438,13 +1440,14 @@ impl EquationStore {
         let rs_dbg_filter_substantive = std::env::var("TAM_RS_DBG_APPLY_EQ_STORE_FILTER")
             .map(|s| s == "substantive").unwrap_or(false);
         let rs_substantive = self.conj.iter().any(|d| !d.substs.is_empty());
+        let aes_site = format!("{}:{}", __aes_caller.file(), __aes_caller.line());
         if rs_dbg && (rs_substantive || !rs_dbg_filter_substantive) {
-            eprintln!("[rs-aes-tick] conj={} substantive={}",
-                self.conj.len(), rs_substantive);
+            eprintln!("[rs-aes-tick] site={} conj={} substantive={}",
+                aes_site, self.conj.len(), rs_substantive);
         }
         let dbg_call = rs_dbg && rs_substantive;
         if dbg_call {
-            eprintln!("[rs-aes] === call ===");
+            eprintln!("[rs-aes] === call site={} ===", aes_site);
             eprintln!("[rs-aes] asubst = {:?}", asubst.to_list());
             eprintln!("[rs-aes] eqsSubst = {:?}", self.subst.to_list());
             for (i, d) in self.conj.iter().enumerate() {
