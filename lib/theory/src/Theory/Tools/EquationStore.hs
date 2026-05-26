@@ -315,9 +315,9 @@ addEqs hnd eqs0 eqStore =
             return (set eqsConj falseEqConstrConj eqStore, Nothing)
         (subst, [substFresh]) | substFresh == emptySubstVFresh ->
             (if hsTraceSBind then trace ("[HS_addEqs_subst] subst=" ++ show (substToList subst)) else id) $
-            return (applyEqStore hnd subst eqStore, Nothing)
+            return (applyEqStoreAt "addEqs.single-unifier" hnd subst eqStore, Nothing)
         (subst, substs) -> do
-            let (eqStore', sid) = addDisj (applyEqStore hnd subst eqStore)
+            let (eqStore', sid) = addDisj (applyEqStoreAt "addEqs.multi-unifier" hnd subst eqStore)
                                           (S.fromList substs)
             return (eqStore', Just sid)
             {-
@@ -354,7 +354,14 @@ hsTraceSBind = System.IO.Unsafe.unsafePerformIO $
 -- TAM_HS_DBG_APPLY_EQ_STORE_FILTER=substantive limits dump to calls with
 -- non-empty conj (skips trivial composition-only calls).
 applyEqStore :: MaudeHandle -> LNSubst -> EqStore -> EqStore
-applyEqStore hnd asubst eqStore
+applyEqStore = applyEqStoreAt "applyEqStore.unlabeled"
+
+-- | Like `applyEqStore` but takes an explicit label that's threaded
+-- through `[hs-aes]` traces.  Lazy-eval-safe — the label is fixed at
+-- the call site rather than read from an IORef whose value can shift
+-- between addEqs and the eventual force of the returned EqStore.
+applyEqStoreAt :: String -> MaudeHandle -> LNSubst -> EqStore -> EqStore
+applyEqStoreAt callSite hnd asubst eqStore
     | dom asubst `intersect` varsRange asubst /= [] || trace (show ("applyEqStore", asubst, eqStore)) False
     = error $ "applyEqStore: dom and vrange not disjoint for `"++show asubst++"'"
     | otherwise
@@ -373,9 +380,12 @@ applyEqStore hnd asubst eqStore
       then System.IO.Unsafe.unsafePerformIO $ do
         let inDisjs = filter (not . S.null . snd) (getConj $ L.get eqsConj eqStore)
         let substantive = not (null inDisjs)
-        -- Read the site label set by `addEqsLabeled` so each [hs-aes]
-        -- tick can be attributed back to a specific Reduction operation.
-        siteLabel <- Data.IORef.readIORef currentAddEqsLabel
+        -- Compose addEqs-callsite IORef label with this applyEqStore's
+        -- own callSite label.  The addEqs label is the outer Reduction
+        -- operation that originated the eq_store mutation; the callSite
+        -- is the specific applyEqStore branch within addEqs / simp.
+        addEqsLabel <- Data.IORef.readIORef currentAddEqsLabel
+        let siteLabel = callSite ++ "@" ++ addEqsLabel
         -- Always emit a tick line for call counting.
         if substantive || not dbgFilterSubstantive
           then putStrLn $ "[hs-aes-tick] site=" ++ siteLabel
@@ -588,15 +598,15 @@ simp1 hnd isContr = do
           dumpPostPass "simpRemoveRenamings" b2
           b3 <- simpEmptyDisj
           dumpPostPass "simpEmptyDisj" b3
-          b4 <- foreachDisj hnd simpSingleton
+          b4 <- foreachDisjAt "simpSingleton" hnd simpSingleton
           dumpPostPass "simpSingleton" b4
-          b5 <- foreachDisj hnd simpAbstractSortedVar
+          b5 <- foreachDisjAt "simpAbstractSortedVar" hnd simpAbstractSortedVar
           dumpPostPass "simpAbstractSortedVar" b5
-          b6 <- foreachDisj hnd simpIdentify
+          b6 <- foreachDisjAt "simpIdentify" hnd simpIdentify
           dumpPostPass "simpIdentify" b6
-          b7 <- foreachDisj hnd simpAbstractFun
+          b7 <- foreachDisjAt "simpAbstractFun" hnd simpAbstractFun
           dumpPostPass "simpAbstractFun" b7
-          b8 <- foreachDisj hnd simpAbstractName
+          b8 <- foreachDisjAt "simpAbstractName" hnd simpAbstractName
           dumpPostPass "simpAbstractName" b8
           (trace (show ("simp:", [b1, b2, b3, b4, b5, b6, b7, b8]))) $
               return $ (or [b1, b2, b3, b4, b5, b6, b7, b8])
@@ -785,7 +795,17 @@ foreachDisj :: forall m. MonadFresh m
             => MaudeHandle
             -> ([LNSubstVFresh] -> m (Maybe (Maybe LNSubst, [S.Set LNSubstVFresh])))
             -> StateT EqStore m Bool
-foreachDisj hnd f =
+foreachDisj hnd f = foreachDisjAt "foreachDisj.unlabeled" hnd f
+
+-- | Like `foreachDisj` but takes an explicit label identifying the
+-- simp pass (`simpAbstractFun`, `simpAbstractSortedVar`, etc.) so the
+-- applyEqStore trace shows which pass produced the factored asubst.
+foreachDisjAt :: forall m. MonadFresh m
+              => String
+              -> MaudeHandle
+              -> ([LNSubstVFresh] -> m (Maybe (Maybe LNSubst, [S.Set LNSubstVFresh])))
+              -> StateT EqStore m Bool
+foreachDisjAt passName hnd f =
     go [] =<< gets (getConj . L.get eqsConj)
   where
     go :: [(SplitId, S.Set LNSubstVFresh)] -> [(SplitId, S.Set LNSubstVFresh)] -> StateT EqStore m Bool
@@ -796,7 +816,7 @@ foreachDisj hnd f =
           Nothing              -> go ((idx,d):lefts) rights
           Just (msubst, disjs) -> do
               eqsConj =: Conj (reverse lefts ++ ((,) idx <$> disjs) ++ rights)
-              maybe (return ()) (\s -> MS.modify (applyEqStore hnd s)) msubst
+              maybe (return ()) (\s -> MS.modify (applyEqStoreAt ("foreachDisj:" ++ passName) hnd s)) msubst
               return True
 
 ------------------------------------------------------------------------------
