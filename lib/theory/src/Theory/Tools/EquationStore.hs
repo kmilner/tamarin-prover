@@ -35,6 +35,7 @@ module Theory.Tools.EquationStore (
 
   -- ** Adding equalities
   , addEqs
+  , addEqsLabeled
   , addRuleVariants
   , addDisj
 
@@ -76,6 +77,7 @@ import           Debug.Trace.Ignore
 import qualified Debug.Trace
 import qualified System.Environment
 import qualified System.IO.Unsafe
+import qualified Data.IORef
 
 import           Control.Basics
 import           Control.DeepSeq
@@ -262,6 +264,37 @@ dbgPerformSplit = System.IO.Unsafe.unsafePerformIO $
     maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_DBG_PERFORM_SPLIT"
 {-# NOINLINE dbgPerformSplit #-}
 
+-- | Global IORef holding the label of the current `addEqs` callsite.
+-- Read by `applyEqStore`'s [hs-aes] trace so the asubst can be
+-- attributed back to a specific Reduction operation
+-- (solveTermEqs/solveSubstEqs/solveNodeIdEqs/solveFactEqs/etc.).
+-- Mutated by `addEqsLabeled` before calling `addEqs`.
+--
+-- This is pure-Haskell-via-unsafePerformIO because applyEqStore lives
+-- in pure code (not IO/Reduction monad).  Diagnostic only — no effect
+-- when TAM_HS_DBG_APPLY_EQ_STORE is unset.
+currentAddEqsLabel :: Data.IORef.IORef String
+currentAddEqsLabel = System.IO.Unsafe.unsafePerformIO $
+    Data.IORef.newIORef "addEqs.unlabeled"
+{-# NOINLINE currentAddEqsLabel #-}
+
+-- | Like `addEqs` but tags the downstream applyEqStore trace lines
+-- with a `site=<label>` field via `currentAddEqsLabel`.  Lets
+-- TAM_HS_DBG_APPLY_EQ_STORE=1 output show which Reduction operation
+-- (solveTermEqs, solveSubstEqs, ...) triggered each addEqs call.
+addEqsLabeled :: MonadFresh m
+              => String -> MaudeHandle -> [Equal LNTerm] -> EqStore
+              -> m (EqStore, Maybe SplitId)
+addEqsLabeled label hnd eqs0 eqStore = do
+    -- Stash the label; applyEqStore's trace reads it on its next call.
+    let _ = System.IO.Unsafe.unsafePerformIO $
+              Data.IORef.writeIORef currentAddEqsLabel label
+    -- Force evaluation of the side-effect by sequencing in IO via
+    -- unsafePerformIO — the seq prevents the let-binding from being
+    -- floated away.  Diagnostic only; no effect when dbg flag is off.
+    seq (System.IO.Unsafe.unsafePerformIO $
+            Data.IORef.writeIORef currentAddEqsLabel label) $ addEqs hnd eqs0 eqStore
+
 -- | Add a list of term equalities to the equation store. Returns the split
 -- identifier of the disjunction in resulting equation store.
 addEqs :: MonadFresh m
@@ -331,14 +364,18 @@ applyEqStore hnd asubst eqStore
       then System.IO.Unsafe.unsafePerformIO $ do
         let inDisjs = filter (not . S.null . snd) (getConj $ L.get eqsConj eqStore)
         let substantive = not (null inDisjs)
+        -- Read the site label set by `addEqsLabeled` so each [hs-aes]
+        -- tick can be attributed back to a specific Reduction operation.
+        siteLabel <- Data.IORef.readIORef currentAddEqsLabel
         -- Always emit a tick line for call counting.
         if substantive || not dbgFilterSubstantive
-          then putStrLn $ "[hs-aes-tick] conj=" ++ show (length (getConj $ L.get eqsConj eqStore))
+          then putStrLn $ "[hs-aes-tick] site=" ++ siteLabel
+                       ++ " conj=" ++ show (length (getConj $ L.get eqsConj eqStore))
                        ++ " substantive=" ++ show substantive
           else return ()
         if substantive
           then do
-            putStrLn $ "[hs-aes] === call ==="
+            putStrLn $ "[hs-aes] === call site=" ++ siteLabel ++ " ==="
             putStrLn $ "[hs-aes] asubst = " ++ show (substToList asubst)
             putStrLn $ "[hs-aes] eqsSubst = " ++ show (substToList (L.get eqsSubst eqStore))
             mapM_ (\(i, (sid, ss)) -> do
