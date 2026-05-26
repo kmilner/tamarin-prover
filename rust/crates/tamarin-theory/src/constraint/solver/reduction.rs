@@ -1369,6 +1369,10 @@ impl<'ctx> Reduction<'ctx> {
                 crate::constraint::solver::trace::trace_form(
                     if already_in { "Disj-dedup" } else { "Disj" },
                     &crate::constraint::solver::trace::guarded_repr(&g));
+                if std::env::var("TAM_RS_TRACE_GFALSE").map(|v| v == "1").unwrap_or(false) {
+                    eprintln!("[RS_GFALSE] path={} gfalse inserted",
+                        crate::constraint::solver::trace::case_path_string());
+                }
                 if !already_in {
                     self.sys.formulas.push(g.clone());
                     self.changed = ChangeIndicator::Changed;
