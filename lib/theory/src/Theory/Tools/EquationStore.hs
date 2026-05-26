@@ -268,7 +268,8 @@ dbgPerformSplit = System.IO.Unsafe.unsafePerformIO $
 -- Read by `applyEqStore`'s [hs-aes] trace so the asubst can be
 -- attributed back to a specific Reduction operation
 -- (solveTermEqs/solveSubstEqs/solveNodeIdEqs/solveFactEqs/etc.).
--- Mutated by `addEqsLabeled` before calling `addEqs`.
+-- Mutated by `addEqsLabeled` (via `setCurrentAddEqsLabel`) before
+-- calling `addEqs`.
 --
 -- This is pure-Haskell-via-unsafePerformIO because applyEqStore lives
 -- in pure code (not IO/Reduction monad).  Diagnostic only — no effect
@@ -278,6 +279,16 @@ currentAddEqsLabel = System.IO.Unsafe.unsafePerformIO $
     Data.IORef.newIORef "addEqs.unlabeled"
 {-# NOINLINE currentAddEqsLabel #-}
 
+-- | Set the current `addEqs` callsite label.  Wrapped in `Bool`-returning
+-- `unsafePerformIO` + `NOINLINE` so it's forced exactly once per call
+-- (Bool is strict).  Returns True; caller threads through the result
+-- via `seq` or a guard pattern to ensure the IORef write executes.
+setCurrentAddEqsLabel :: String -> Bool
+setCurrentAddEqsLabel label = System.IO.Unsafe.unsafePerformIO $ do
+    Data.IORef.writeIORef currentAddEqsLabel label
+    return True
+{-# NOINLINE setCurrentAddEqsLabel #-}
+
 -- | Like `addEqs` but tags the downstream applyEqStore trace lines
 -- with a `site=<label>` field via `currentAddEqsLabel`.  Lets
 -- TAM_HS_DBG_APPLY_EQ_STORE=1 output show which Reduction operation
@@ -285,15 +296,13 @@ currentAddEqsLabel = System.IO.Unsafe.unsafePerformIO $
 addEqsLabeled :: MonadFresh m
               => String -> MaudeHandle -> [Equal LNTerm] -> EqStore
               -> m (EqStore, Maybe SplitId)
-addEqsLabeled label hnd eqs0 eqStore = do
-    -- Stash the label; applyEqStore's trace reads it on its next call.
-    let _ = System.IO.Unsafe.unsafePerformIO $
-              Data.IORef.writeIORef currentAddEqsLabel label
-    -- Force evaluation of the side-effect by sequencing in IO via
-    -- unsafePerformIO — the seq prevents the let-binding from being
-    -- floated away.  Diagnostic only; no effect when dbg flag is off.
-    seq (System.IO.Unsafe.unsafePerformIO $
-            Data.IORef.writeIORef currentAddEqsLabel label) $ addEqs hnd eqs0 eqStore
+addEqsLabeled label hnd eqs0 eqStore =
+    -- Force the IORef write via the Bool-returning `setCurrentAddEqsLabel`.
+    -- The `if` evaluates the strict Bool argument, executing the
+    -- unsafePerformIO side effect, before delegating to `addEqs`.
+    if setCurrentAddEqsLabel label
+        then addEqs hnd eqs0 eqStore
+        else error "unreachable"
 
 -- | Add a list of term equalities to the equation store. Returns the split
 -- identifier of the disjunction in resulting equation store.
