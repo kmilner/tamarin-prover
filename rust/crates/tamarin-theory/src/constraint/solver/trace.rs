@@ -28,6 +28,76 @@ thread_local! {
     /// branch-interleaving problem where the same goal-shape appears
     /// at many proof positions.
     static CASE_PATH: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+
+    /// Current operation label, set by callers of apply_eq_store/add_eqs.
+    /// Mirrors HS's `currentAddEqsLabel` IORef.  Used by [rs-aes]
+    /// trace to attribute each apply_eq_store call to the originating
+    /// Reduction operation (solveTermEqs, solveFactEqs, chain_extend,
+    /// ENU.kuActions, etc.) so HS↔RS apply_eq_store call counts can
+    /// be diffed per-label rather than per-line-number.
+    static CURRENT_OP_LABEL: RefCell<String> =
+        RefCell::new(String::from("unlabeled"));
+}
+
+/// Set the current operation label.  Callers wrap their apply_eq_store
+/// / add_eqs call sites with `set_op_label` to associate the call with
+/// a semantic name.  Use `OpLabelGuard::new(...)` for scope-based
+/// management so the label restores on drop.
+pub fn set_op_label(label: &str) -> String {
+    CURRENT_OP_LABEL.with(|l| {
+        let prev = l.borrow().clone();
+        *l.borrow_mut() = label.to_string();
+        prev
+    })
+}
+
+/// Get the current operation label.  Used by apply_eq_store's [rs-aes]
+/// trace to print the site label.
+pub fn current_op_label() -> String {
+    CURRENT_OP_LABEL.with(|l| l.borrow().clone())
+}
+
+/// RAII guard for op label: sets label on creation, restores previous
+/// on drop.  Use as `let _g = OpLabelGuard::new("solveTermEqs");` at
+/// the start of a scope.
+///
+/// **Default semantics**: if an outer label is already set (anything
+/// other than "unlabeled"), the outer label is PRESERVED — this lets
+/// chain-extend/ENU.kuActions/etc. flow through solve_term_eqs without
+/// being overwritten, matching HS's `addEqsLabeled` semantics where
+/// the OUTERMOST caller's label sticks.  Use `OpLabelGuard::force`
+/// for cases where you want to override even an outer label
+/// (e.g. simp passes adding their own prefix).
+pub struct OpLabelGuard {
+    prev: String,
+}
+
+impl OpLabelGuard {
+    pub fn new(label: &str) -> Self {
+        let outer = current_op_label();
+        if outer == "unlabeled" {
+            let prev = set_op_label(label);
+            Self { prev }
+        } else {
+            // Outer label sticks; we don't change anything but still
+            // return a guard so the call-site doesn't need to special-case.
+            Self { prev: outer }
+        }
+    }
+
+    /// Force override the label (used by simp passes that prepend to
+    /// the outer label, e.g. `simpAbstractFun@<outer>`).
+    pub fn force(label: &str) -> Self {
+        let prev = set_op_label(label);
+        Self { prev }
+    }
+}
+
+impl Drop for OpLabelGuard {
+    fn drop(&mut self) {
+        let prev = std::mem::take(&mut self.prev);
+        CURRENT_OP_LABEL.with(|l| { *l.borrow_mut() = prev; });
+    }
 }
 
 pub fn case_path_push(name: &str) {
@@ -83,47 +153,48 @@ pub fn guarded_repr(g: &crate::guarded::Guarded) -> String {
     }
 }
 
-fn atom_repr(a: &tamarin_parser::ast::Atom) -> String {
-    use tamarin_parser::ast::Atom;
+fn atom_repr(a: &crate::guarded::GAtom) -> String {
+    use crate::guarded::GAtom;
     match a {
-        Atom::Eq(s, t) => format!("Eq({},{})", term_repr(s), term_repr(t)),
-        Atom::Less(s, t) => format!("Less({},{})", term_repr(s), term_repr(t)),
-        Atom::LessMset(s, t) => format!("LMset({},{})", term_repr(s), term_repr(t)),
-        Atom::Subterm(s, t) => format!("Subterm({},{})", term_repr(s), term_repr(t)),
-        Atom::Last(s) => format!("Last({})", term_repr(s)),
-        Atom::Action(f, t) => format!("{}({})@{}",
+        GAtom::Eq(s, t) => format!("Eq({},{})", term_repr(s), term_repr(t)),
+        GAtom::Less(s, t) => format!("Less({},{})", term_repr(s), term_repr(t)),
+        GAtom::LessMset(s, t) => format!("LMset({},{})", term_repr(s), term_repr(t)),
+        GAtom::Subterm(s, t) => format!("Subterm({},{})", term_repr(s), term_repr(t)),
+        GAtom::Last(s) => format!("Last({})", term_repr(s)),
+        GAtom::Action(f, t) => format!("{}({})@{}",
             f.name, f.args.iter().map(term_repr).collect::<Vec<_>>().join(","),
             term_repr(t)),
-        Atom::Pred(f) => format!("Pred({})", f.name),
+        GAtom::Pred(f) => format!("Pred({})", f.name),
     }
 }
 
-fn term_repr(t: &tamarin_parser::ast::Term) -> String {
-    use tamarin_parser::ast::Term;
+fn term_repr(t: &crate::guarded::GTerm) -> String {
+    use crate::guarded::{GTerm, BVar};
     match t {
-        Term::Var(v) => format!("{}{}#{}", match v.sort {
+        GTerm::Var(BVar::Free(v)) => format!("{}{}#{}", match v.sort {
             tamarin_parser::ast::SortHint::Fresh => "~",
             tamarin_parser::ast::SortHint::Pub   => "$",
             tamarin_parser::ast::SortHint::Node  => "#",
             tamarin_parser::ast::SortHint::Nat   => "%",
             tamarin_parser::ast::SortHint::Msg   => "",
             _ => "?",
-        }, v.name, v.idx),  // idx KEPT so we can spot real differences
-        Term::App(name, args) => format!("{}({})", name,
+        }, v.name, v.idx),
+        GTerm::Var(BVar::Bound(n)) => format!("B{}", n),
+        GTerm::App(name, args) => format!("{}({})", name,
             args.iter().map(term_repr).collect::<Vec<_>>().join(",")),
-        Term::Pair(args) =>
+        GTerm::Pair(args) =>
             format!("<{}>", args.iter().map(term_repr).collect::<Vec<_>>().join(",")),
-        Term::AlgApp(name, a, b) => format!("{}({},{})", name, term_repr(a), term_repr(b)),
-        Term::Diff(a, b) => format!("diff({},{})", term_repr(a), term_repr(b)),
-        Term::BinOp(op, a, b) => format!("{:?}({},{})", op, term_repr(a), term_repr(b)),
-        Term::PubLit(s) => format!("'{}'", s),
-        Term::FreshLit(s) => format!("~'{}'", s),
-        Term::NatLit(s) => format!("%'{}'", s),
-        Term::Number(n) => format!("{}", n),
-        Term::NumberOne => "1".to_string(),
-        Term::NatOne => "%1".to_string(),
-        Term::DhNeutral => "1g".to_string(),
-        Term::PatMatch(t) => format!("=({})", term_repr(t)),
+        GTerm::AlgApp(name, a, b) => format!("{}({},{})", name, term_repr(a), term_repr(b)),
+        GTerm::Diff(a, b) => format!("diff({},{})", term_repr(a), term_repr(b)),
+        GTerm::BinOp(op, a, b) => format!("{:?}({},{})", op, term_repr(a), term_repr(b)),
+        GTerm::PubLit(s) => format!("'{}'", s),
+        GTerm::FreshLit(s) => format!("~'{}'", s),
+        GTerm::NatLit(s) => format!("%'{}'", s),
+        GTerm::Number(n) => format!("{}", n),
+        GTerm::NumberOne => "1".to_string(),
+        GTerm::NatOne => "%1".to_string(),
+        GTerm::DhNeutral => "1g".to_string(),
+        GTerm::PatMatch(t) => format!("=({})", term_repr(t)),
     }
 }
 
@@ -496,6 +567,22 @@ pub fn trace_pick(g: &crate::constraint::constraints::Goal) {
             eprintln!("[PICK_DISJ] Disj[{}]", alts.join(" || "));
         }
     }
+    // TAM_RS_TRACE_PICK_TERM=1 also emits the full picked-fact term repr
+    // for Action/Premise goals.  Used to compare HS↔Rust goal-ranking
+    // when [PICK] heads agree but the picked goal-term differs.
+    if std::env::var("TAM_RS_TRACE_PICK_TERM").is_ok() {
+        use tamarin_term::pretty::pretty_lnterm;
+        let term_repr = match g {
+            Goal::Action(_, fa) | Goal::Premise(_, fa) => {
+                let ts: Vec<String> = fa.terms.iter().map(|t| pretty_lnterm(t)).collect();
+                format!("{}({})", fact_tag_short(&fa.tag), ts.join(", "))
+            }
+            _ => String::new(),
+        };
+        if !term_repr.is_empty() {
+            eprintln!("[PICK_TERM] {}", term_repr);
+        }
+    }
     eprintln!("[PICK] {}", s);
 }
 
@@ -540,26 +627,6 @@ fn fact_tag_short(t: &crate::fact::FactTag) -> String {
     }
 }
 
-fn fact_term_head(fa: &crate::fact::LNFact) -> String {
-    use tamarin_term::term::Term;
-    use tamarin_term::vterm::Lit;
-    if let Some(t) = fa.terms.first() {
-        match t {
-            Term::Lit(Lit::Var(v)) => format!("{}var", sort_prefix(v.sort)),
-            Term::Lit(Lit::Con(_)) => "<const>".to_string(),
-            // Use Debug; suffices for a stable rendering across runs as long
-            // as the function symbol's Debug output is name-only.  We don't
-            // need the full term tree — just the head — so truncate.
-            Term::App(sym, _) => {
-                let s = format!("{:?}", sym);
-                s.chars().take(40).collect::<String>()
-            }
-        }
-    } else {
-        String::new()
-    }
-}
-
 fn disj_heads(d: &crate::constraint::constraints::Disj<crate::guarded::Guarded>) -> String {
     let heads: Vec<String> = d.0.iter().map(guarded_head).collect();
     heads.join("|")
@@ -577,19 +644,6 @@ fn guarded_head(g: &crate::guarded::Guarded) -> String {
         // Suppresses bound-var names so HS/Rust line up.
         Guarded::GGuarded { qua, vars, .. } => format!("{:?}{}v",
             qua, vars.len()),
-    }
-}
-
-fn atom_head(a: &tamarin_parser::ast::Atom) -> String {
-    use tamarin_parser::ast::Atom;
-    match a {
-        Atom::Eq(_, _) => "Eq".to_string(),
-        Atom::Less(_, _) => "Less".to_string(),
-        Atom::LessMset(_, _) => "LessMset".to_string(),
-        Atom::Subterm(_, _) => "Subterm".to_string(),
-        Atom::Last(_) => "Last".to_string(),
-        Atom::Action(f, _) => format!("Action({})", f.name),
-        Atom::Pred(f) => format!("Pred({})", f.name),
     }
 }
 

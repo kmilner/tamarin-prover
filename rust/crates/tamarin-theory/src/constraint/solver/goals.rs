@@ -60,49 +60,50 @@ fn guarded_canon_idx_first(d: &crate::constraint::constraints::Disj<crate::guard
             }
         }
     }
-    fn render_atom(a: &tamarin_parser::ast::Atom, out: &mut String) {
-        use tamarin_parser::ast::Atom;
+    fn render_atom(a: &crate::guarded::GAtom, out: &mut String) {
+        use crate::guarded::GAtom;
         match a {
-            Atom::Eq(s, t) => { out.push_str("E"); render_term(s, out); render_term(t, out); }
-            Atom::Less(s, t) => { out.push_str("L"); render_term(s, out); render_term(t, out); }
-            Atom::LessMset(s, t) => { out.push_str("M"); render_term(s, out); render_term(t, out); }
-            Atom::Subterm(s, t) => { out.push_str("S"); render_term(s, out); render_term(t, out); }
-            Atom::Last(s) => { out.push_str("La"); render_term(s, out); }
-            Atom::Action(f, t) => {
+            GAtom::Eq(s, t) => { out.push_str("E"); render_term(s, out); render_term(t, out); }
+            GAtom::Less(s, t) => { out.push_str("L"); render_term(s, out); render_term(t, out); }
+            GAtom::LessMset(s, t) => { out.push_str("M"); render_term(s, out); render_term(t, out); }
+            GAtom::Subterm(s, t) => { out.push_str("S"); render_term(s, out); render_term(t, out); }
+            GAtom::Last(s) => { out.push_str("La"); render_term(s, out); }
+            GAtom::Action(f, t) => {
                 out.push_str(&format!("Ac{}/{}", f.name, f.args.len()));
                 for arg in &f.args { render_term(arg, out); }
                 render_term(t, out);
             }
-            Atom::Pred(f) => { out.push_str(&format!("P{}", f.name)); }
+            GAtom::Pred(f) => { out.push_str(&format!("P{}", f.name)); }
         }
     }
-    fn render_term(t: &tamarin_parser::ast::Term, out: &mut String) {
-        use tamarin_parser::ast::Term;
+    fn render_term(t: &crate::guarded::GTerm, out: &mut String) {
+        use crate::guarded::{GTerm, BVar};
         match t {
             // idx FIRST, then sort, then name — mirrors LVar Ord.
-            Term::Var(v) => out.push_str(&format!("v{}-{:?}-{}", v.idx, v.sort, v.name)),
-            Term::App(name, args) => {
+            GTerm::Var(BVar::Free(v)) => out.push_str(&format!("v{}-{:?}-{}", v.idx, v.sort, v.name)),
+            GTerm::Var(BVar::Bound(n)) => out.push_str(&format!("B{}", n)),
+            GTerm::App(name, args) => {
                 out.push_str(&format!("a{}/{}", name, args.len()));
                 for arg in args { render_term(arg, out); }
             }
-            Term::Pair(items) => {
+            GTerm::Pair(items) => {
                 out.push_str(&format!("p/{}", items.len()));
                 for it in items { render_term(it, out); }
             }
-            Term::AlgApp(name, a, b) => {
+            GTerm::AlgApp(name, a, b) => {
                 out.push_str(&format!("g{}", name));
                 render_term(a, out); render_term(b, out);
             }
-            Term::Diff(a, b) => { out.push('d'); render_term(a, out); render_term(b, out); }
-            Term::BinOp(op, a, b) => { out.push_str(&format!("b{:?}", op)); render_term(a, out); render_term(b, out); }
-            Term::PubLit(s) => out.push_str(&format!("PL{}", s)),
-            Term::FreshLit(s) => out.push_str(&format!("FL{}", s)),
-            Term::NatLit(s) => out.push_str(&format!("NL{}", s)),
-            Term::Number(n) => out.push_str(&format!("N{}", n)),
-            Term::NumberOne => out.push_str("N1"),
-            Term::NatOne => out.push_str("Na1"),
-            Term::DhNeutral => out.push_str("Dh"),
-            Term::PatMatch(t) => { out.push('m'); render_term(t, out); }
+            GTerm::Diff(a, b) => { out.push('d'); render_term(a, out); render_term(b, out); }
+            GTerm::BinOp(op, a, b) => { out.push_str(&format!("b{:?}", op)); render_term(a, out); render_term(b, out); }
+            GTerm::PubLit(s) => out.push_str(&format!("PL{}", s)),
+            GTerm::FreshLit(s) => out.push_str(&format!("FL{}", s)),
+            GTerm::NatLit(s) => out.push_str(&format!("NL{}", s)),
+            GTerm::Number(n) => out.push_str(&format!("N{}", n)),
+            GTerm::NumberOne => out.push_str("N1"),
+            GTerm::NatOne => out.push_str("Na1"),
+            GTerm::DhNeutral => out.push_str("Dh"),
+            GTerm::PatMatch(t) => { out.push('m'); render_term(t, out); }
         }
     }
     let mut out = String::new();
@@ -270,34 +271,22 @@ pub fn rank_goals_with(
     goals.sort_by_key(|a| tag_usefulness(a.usefulness));
     // 5. moveNatToEnd — Nat subterm splits to back.
     goals.sort_by_key(|a| is_nat_subterm_split(&a.goal));
-    // 6. HS-faithful Set-ordering tie-break for Disj goals: HS's
-    // `openGoals` (Goals.hs:68) iterates `M.toList $ get sGoals sys`,
-    // a Map keyed by Goal — so the FIRST Disj returned (after the
-    // smartRanking predicates pick Disj as the goal-class) is the
-    // structurally-smallest Disj per `Ord Goal`.  Rust's `sys.goals`
-    // is a Vec preserving insertion order, so without this tie-break
-    // we pick the "first-inserted" Disj where HS picks the
-    // "structurally-smallest" Disj.  Implementation: extract Disj
-    // entries, sort them by `goal_cmp`, then put them back at their
-    // original positions (Action/Premise/Chain entries are untouched).
-    // This preserves the smartRanking order across goal classes while
-    // breaking ties within Disjs by structural Ord.
-    {
-        let mut disj_positions: Vec<usize> = goals.iter().enumerate()
-            .filter(|(_, a)| matches!(a.goal, Goal::Disj(_)))
-            .map(|(i, _)| i)
-            .collect();
-        if disj_positions.len() >= 2 {
-            // Stable sort the Disj indices by goal_cmp of their content.
-            let mut disj_entries: Vec<AnnotatedGoal> = disj_positions.iter()
-                .map(|&i| goals[i].clone()).collect();
-            disj_entries.sort_by(|a, b| goal_cmp(&a.goal, &b.goal));
-            // Write back in-place.
-            for (slot, entry) in disj_positions.drain(..).zip(disj_entries) {
-                goals[slot] = entry;
-            }
-        }
-    }
+    // 6. NO structural tie-break for Disj goals.  HS's `smartRanking`
+    // ends with `goalNrRanking = sortOn (fst . snd)` (ProofMethod.hs:
+    // 748-749) — sorting by goal NR (insertion-order counter), NOT by
+    // Goal Ord.  The `sortDecisionTree` partitions that follow are
+    // stable, so within each class the relative order from
+    // goalNrRanking is preserved.  Rust's `open_goals` yields goals in
+    // sys.goals insertion order = nr order, and the subsequent
+    // partitions here are stable too, so no extra sort is required.
+    //
+    // Previously this block re-sorted Disj goals by `goal_cmp`, on the
+    // mistaken belief that HS's `M.toList sGoals` order survived to the
+    // pick (it doesn't — `goalNrRanking` clobbers it).  Removed
+    // 2026-05-26 to restore HS-faithfulness for Device_Init_Use_Set
+    // (case-content swap caused by Rust picking the structurally-
+    // smaller induction Disj before HS's lemma-negation Disj).
+    // See [[project-rust-port-lockstep]].
     if std::env::var("TAM_RANK_DBG").is_ok() {
         for (i, a) in goals.iter().take(6).enumerate() {
             let g_str = format!("{:?}", a.goal).chars().take(160).collect::<String>();
@@ -364,6 +353,10 @@ fn collect_one_case_syms(
     use tamarin_term::function_symbols::FunSym;
     use tamarin_term::term::Term;
     let mut out = std::collections::BTreeSet::new();
+    let dbg_sources = std::env::var("TAM_DBG_SOURCES").is_ok();
+    if dbg_sources {
+        eprintln!("[RS full_sources] count={}", ctx.full_sources.len());
+    }
     for src in &ctx.full_sources {
         // HS-faithful order — `smartRanking.getMsgOneCase`
         // (ProofMethod.hs:1207-1210) pattern-matches on `cdGoal` BEFORE
@@ -386,10 +379,23 @@ fn collect_one_case_syms(
                 match fa.terms.first() { Some(t) => t, None => continue },
             _ => continue,
         };
-        let Term::App(FunSym::NoEq(s), _) = term else { continue };
+        let Term::App(FunSym::NoEq(s), _) = term else {
+            if dbg_sources {
+                eprintln!("[RS src non-app]");
+            }
+            continue
+        };
         // Now we know the goal is `KU(FApp o _)` — HS-faithful: force
         // cases at this point to check the disjunct count.
-        if src.cases(ctx).len() != 1 { continue; }
+        let cases = src.cases(ctx);
+        if dbg_sources {
+            let nm = String::from_utf8_lossy(&s.name);
+            let arity = if let Term::App(_, args) = term { args.len() } else { 0 };
+            let names: Vec<String> = cases.iter().map(|(n, _)| n.clone()).collect();
+            eprintln!("[RS src] {} arity={} cases={} names={:?}",
+                nm, arity, cases.len(), names);
+        }
+        if cases.len() != 1 { continue; }
         out.insert(s.name.clone());
     }
     out
@@ -844,24 +850,19 @@ fn goal_usefulness(g: &Goal, looping: bool, sys: &System) -> Usefulness {
 /// `Conj`/`Disj` structures.
 fn has_ku_guards(sys: &System) -> bool {
     use crate::fact::FactTag;
-    use crate::guarded::Guarded;
-    use tamarin_parser::ast::Atom;
+    use crate::guarded::{Guarded, GAtom};
     fn walk_guards(g: &Guarded) -> bool {
         match g {
             Guarded::GGuarded { guards, body, .. } => {
                 for atom in guards {
-                    if let Atom::Action(fa, _) = atom {
-                        // Parser-fact: tag is KU iff name == "KU" (and
-                        // arity 1, but the simple name match is enough
-                        // for the heuristic; the goal-rank step is a
-                        // soft hint, not a soundness gate).
+                    if let GAtom::Action(fa, _) = atom {
                         if fa.name == "KU" { return true; }
                     }
                 }
                 walk_guards(body)
             }
             Guarded::Conj(items) | Guarded::Disj(items) => items.iter().any(walk_guards),
-            Guarded::Atom(Atom::Action(fa, _)) => fa.name == "KU",
+            Guarded::Atom(GAtom::Action(fa, _)) => fa.name == "KU",
             Guarded::Atom(_) => false,
         }
     }

@@ -260,6 +260,25 @@ impl EquationStore {
                 eprintln!("[add_disj]   [{}]: {}", i, pairs.join(" ; "));
             }
         }
+        // H16.6 (Path A): HS-faithful Set ordering of variant substs.
+        // HS's `addDisj` (EquationStore.hs:209) does `addDisj eqStore
+        // (S.fromList substs)` — substs go into a Set, sorted by Ord
+        // LNSubstVFresh.  Without sorting here, RS's `Vec`-based disj
+        // preserves insertion order from `maude.variants()`, putting
+        // the identity-rename variant first.  HS's Set-based disj puts
+        // STRUCTURED variants first (where convertpcs is reduced to
+        // sign via Maude equations).  Downstream `simp_identify`
+        // iterates the FIRST subst's entries — HS finds same-image
+        // pairs in the structured variant, RS sees only the identity
+        // variant's unreduced entries and finds none.  See
+        // [[project-h16-5-simp-identify-precondition]] for the trace.
+        //
+        // Opt-out via `TAM_RS_DISABLE_DISJ_SORT=1` for diagnosis.
+        let mut substs = substs;
+        if std::env::var("TAM_RS_DISABLE_DISJ_SORT").is_err() {
+            substs.sort();
+            substs.dedup();
+        }
         self.conj.insert(0, EqDisj { split_id: id, substs });
         self.next_split = id.succ();
         id
@@ -661,6 +680,19 @@ impl EquationStore {
         }
     }
 
+    /// HS-faithful Set ordering: sort each disj's substs by Ord and
+    /// dedupe (mirrors `S.fromList` invariant in HS's `Disj`).  Called
+    /// after every simp pass that mutates substs so the FIRST subst
+    /// (used by simp_identify/simp_abstract_fun probing) matches HS's
+    /// Set-first variant.  See [[project-h16-6-disj-sort-path-a]].
+    pub fn sort_disj_substs(&mut self) {
+        if std::env::var("TAM_RS_DISABLE_DISJ_SORT").is_ok() { return; }
+        for d in self.conj.iter_mut() {
+            d.substs.sort();
+            d.substs.dedup();
+        }
+    }
+
     /// `simpEmptyDisj`: if any disjunction is empty (and the store
     /// isn't already the canonical false-conjunction), collapse the
     /// whole store to `false`.
@@ -805,7 +837,67 @@ impl EquationStore {
     /// different variables `x` and `y` (with `x < y` and same sort)
     /// mapped to the same image, factor `{x → y}` and drop `x` from
     /// every subst.
+    ///
+    /// HS-faithful: also runs `applyEqStore` on the factor (per HS's
+    /// `foreachDisj` wrapper in EquationStore.hs) so variants get
+    /// re-unified against the new free subst. Without this, variants
+    /// that would conflict with the new free subst stay around. See
+    /// [[project-h16-4-rs-apply-eq-store-caller-labels]] for the
+    /// resolved1 case where RS missed 91 simpIdentify apply_eq_store
+    /// calls that HS fires.
     pub fn simp_identify(&mut self) -> bool {
+        self.simp_identify_with_maude(None)
+    }
+
+    /// Maude-using variant of `simp_identify` (HS-faithful).
+    pub fn simp_identify_with_maude(
+        &mut self,
+        maude: Option<&tamarin_term::maude_proc::MaudeHandle>,
+    ) -> bool {
+        // TAM_RS_DBG_SIMP_IDENTIFY=1: dump same-image probe results
+        // per disj — used by H16.5 to confirm that RS variants never
+        // contain same-image pairs (whereas HS's do after equation
+        // reduction).  See [[project-h16-5-simp-identify-precondition]].
+        let dbg = std::env::var("TAM_RS_DBG_SIMP_IDENTIFY").is_ok();
+        if dbg && self.conj.iter().any(|d| d.substs.len() >= 2) {
+            for (idx, d) in self.conj.iter().enumerate() {
+                if d.substs.len() < 2 { continue; }
+                let first = &d.substs[0];
+                let entries = first.to_list();
+                let mut pairs_found = 0u32;
+                for (i, (v, t)) in entries.iter().enumerate() {
+                    for (v2, t2) in entries.iter().skip(i + 1) {
+                        if t == t2 && v < v2 {
+                            pairs_found += 1;
+                            let all_agree = d.substs.iter().skip(1).all(|s| {
+                                let i1 = s.image_of(v);
+                                let i2 = s.image_of(v2);
+                                i1.is_some() && i1 == i2
+                            });
+                            if all_agree {
+                                eprintln!("[simp_id_probe] disj[{}] FIRE: ({}.{}, {}.{}) -> {:?}",
+                                    idx, v.name, v.idx, v2.name, v2.idx,
+                                    format!("{:?}", t).chars().take(120).collect::<String>());
+                            }
+                        }
+                    }
+                }
+                if pairs_found == 0 {
+                    eprintln!("[simp_id_probe] disj[{}] NO_PAIRS: no same-image pairs in first subst ({} entries, {} substs)",
+                        idx, entries.len(), d.substs.len());
+                    if entries.len() >= 8 && std::env::var("TAM_RS_DBG_SIMP_IDENTIFY_FULL").is_ok() {
+                        for (sidx, s) in d.substs.iter().enumerate() {
+                            eprintln!("[simp_id_probe]   subst[{}]:", sidx);
+                            for (k, v) in s.to_list() {
+                                eprintln!("[simp_id_probe]     {}.{} -> {:?}",
+                                    k.name, k.idx,
+                                    format!("{:?}", v).chars().take(200).collect::<String>());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let mut to_apply: Option<(LVar, LVar, usize)> = None;
         for (idx, d) in self.conj.iter().enumerate() {
             if d.substs.is_empty() { continue; }
@@ -849,7 +941,19 @@ impl EquationStore {
             (remove.clone(), tamarin_term::term::Term::Lit(
                 tamarin_term::vterm::Lit::Var(keep.clone()))),
         ]);
-        self.subst = factor.compose(&self.subst);
+        // HS-faithful: apply factor via apply_eq_store (re-unifies
+        // variants against new free subst).  Falls back to compose if
+        // no Maude handle.
+        let _id_guard = crate::constraint::solver::trace::OpLabelGuard::force(
+            &format!("simpIdentify@{}",
+                crate::constraint::solver::trace::current_op_label()));
+        if let Some(m) = maude {
+            if self.apply_eq_store(m, &factor).is_err() {
+                self.subst = factor.compose(&self.subst);
+            }
+        } else {
+            self.subst = factor.compose(&self.subst);
+        }
         // Remove `keep` from every subst in disjunction `idx`.
         let new_substs: Vec<LNSubstVFresh> = self.conj[idx].substs
             .iter()
@@ -1005,6 +1109,11 @@ impl EquationStore {
     /// handle and calls `apply_eq_store` on the factored subst to
     /// re-unify remaining disjs (mirrors HS's `foreachDisj` at
     /// EquationStore.hs:696).
+    ///
+    /// H17.7 (2026-05-28): opt-out via `TAM_RS_DISABLE_SIMP_ABSTRACT_FUN=1`
+    /// for diagnostic comparison.  Lifting common operators may introduce
+    /// fresh witnesses that don't compose with later chain bindings, breaking
+    /// the HS-faithful cycle detection at iter-2 c_pcs source-pick.
     pub fn simp_abstract_fun_with_maude<F: FnMut(u64) -> u64>(
         &mut self,
         alloc: &mut F,
@@ -1014,6 +1123,15 @@ impl EquationStore {
         use tamarin_term::vterm::Lit;
         use tamarin_term::function_symbols::FunSym;
         use tamarin_term::lterm::{LVar, LSort};
+
+        // H17.7 opt-out (default ON, opt-out via TAM_RS_DISABLE_SIMP_ABSTRACT_FUN=1):
+        // skip simp_abstract_fun entirely.  Tests whether lifting common
+        // operators is what prevents the HS-faithful cycle detection at
+        // iter-2 c_pcs source-pick (vk's stored term needs rule-internal
+        // var names that compose with chain bindings, not fresh witnesses).
+        if std::env::var("TAM_RS_DISABLE_SIMP_ABSTRACT_FUN").is_ok() {
+            return false;
+        }
 
         // Find (disj_idx, v, op, argss) where v has the same outermost
         // function symbol across every subst in the disjunction.
@@ -1071,6 +1189,15 @@ impl EquationStore {
                         .collect()),
             )]);
             // Apply factor (via apply_eq_store if maude available).
+            // H16.4: tag the apply_eq_store with simp_abstract_fun
+            // label so HS↔RS per-label call counts match HS's
+            // `foreachDisj:simpAbstractFun@<outer>` site naming.
+            // `force` because we want to PREPEND a simp pass marker
+            // even though an outer label exists (so the trace shows
+            // both passes).
+            let _abs_fun_guard = crate::constraint::solver::trace::OpLabelGuard::force(
+                &format!("simpAbstractFun@{}",
+                    crate::constraint::solver::trace::current_op_label()));
             if let Some(m) = maude {
                 if self.apply_eq_store(m, &factor).is_err() {
                     self.subst = factor.compose(&self.subst);
@@ -1182,6 +1309,13 @@ impl EquationStore {
         F: Fn(&LNSubst, &LNSubstVFresh) -> bool,
         G: FnMut(u64) -> u64,
     {
+        let dbg_simp_disj = std::env::var("TAM_RS_DBG_SIMP_DISJ").is_ok();
+        if dbg_simp_disj {
+            let sizes: Vec<usize> = self.conj.iter().map(|d| d.substs.len()).collect();
+            if sizes.iter().any(|n| *n >= 2) {
+                eprintln!("[SIMP_DISJ_IN] sizes={:?}", sizes);
+            }
+        }
         // HS-faithful pass order (EquationStore.hs:518-541 simp1):
         //   1. simpMinimize
         //   2. simpRemoveRenamings
@@ -1198,19 +1332,51 @@ impl EquationStore {
         // simpIdentify then collapses; simpAbstractFun fires before
         // simpAbstractName so common Fun-headed images get factored
         // before common name constants.
+        // H16.6: ensure substs are sorted on entry (mirrors HS's Set
+        // invariant after addRuleVariants → S.fromList).
+        self.sort_disj_substs();
         loop {
             if self.is_false() { return self; }
             let mut changed = false;
             let subst_snapshot = self.subst.clone();
-            changed |= self.simp_minimize(|s| is_contr(&subst_snapshot, s));
-            changed |= self.simp_remove_renamings();
+            if self.simp_minimize(|s| is_contr(&subst_snapshot, s)) {
+                changed = true;
+                self.sort_disj_substs();
+            }
+            if self.simp_remove_renamings() {
+                changed = true;
+                self.sort_disj_substs();
+            }
             changed |= self.simp_empty_disj();
-            changed |= self.simp_singleton_avoiding(&mut alloc, external_preserve, maude);
-            changed |= self.simp_abstract_sorted_var_with_maude(&mut alloc, maude);
-            changed |= self.simp_identify();
-            changed |= self.simp_abstract_fun_with_maude(&mut alloc, maude);
-            changed |= self.simp_abstract_name_with_maude(maude);
-            if !changed { return self; }
+            if self.simp_singleton_avoiding(&mut alloc, external_preserve, maude) {
+                changed = true;
+                self.sort_disj_substs();
+            }
+            if self.simp_abstract_sorted_var_with_maude(&mut alloc, maude) {
+                changed = true;
+                self.sort_disj_substs();
+            }
+            if self.simp_identify_with_maude(maude) {
+                changed = true;
+                self.sort_disj_substs();
+            }
+            if self.simp_abstract_fun_with_maude(&mut alloc, maude) {
+                changed = true;
+                self.sort_disj_substs();
+            }
+            if self.simp_abstract_name_with_maude(maude) {
+                changed = true;
+                self.sort_disj_substs();
+            }
+            if !changed {
+                if dbg_simp_disj {
+                    let sizes: Vec<usize> = self.conj.iter().map(|d| d.substs.len()).collect();
+                    if sizes.iter().any(|n| *n >= 2) {
+                        eprintln!("[SIMP_DISJ_OUT] sizes={:?}", sizes);
+                    }
+                }
+                return self;
+            }
         }
     }
 
@@ -1440,7 +1606,14 @@ impl EquationStore {
         let rs_dbg_filter_substantive = std::env::var("TAM_RS_DBG_APPLY_EQ_STORE_FILTER")
             .map(|s| s == "substantive").unwrap_or(false);
         let rs_substantive = self.conj.iter().any(|d| !d.substs.is_empty());
-        let aes_site = format!("{}:{}", __aes_caller.file(), __aes_caller.line());
+        let op_label = crate::constraint::solver::trace::current_op_label();
+        // Build a HS-comparable site label: `<rust_site>@<op_label>`.
+        // HS emits e.g. `addEqs.single-unifier@solveTermEqs` — the part
+        // before `@` is the apply_eq_store internal call site, after `@`
+        // is the originating Reduction operation.  Match RS's convention
+        // so per-label diffs work.
+        let aes_site = format!("{}:{}@{}",
+            __aes_caller.file(), __aes_caller.line(), op_label);
         if rs_dbg && (rs_substantive || !rs_dbg_filter_substantive) {
             eprintln!("[rs-aes-tick] site={} conj={} substantive={}",
                 aes_site, self.conj.len(), rs_substantive);
@@ -1770,6 +1943,25 @@ impl EquationStore {
                     }
                     for (s, w) in witnesses {
                         lifted.push((s, Term::Lit(Lit::Var(w))));
+                    }
+                    // H16.7 (Path C): HS-faithful Maude normalisation
+                    // of variant range terms.  HS's `normSubstVFresh'`
+                    // (Term/Rewriting/Norm.hs:158) reduces every range
+                    // term via the equational theory after each variant
+                    // is built.  This reduces `convertpcs(zsk, pcs(sign(...)))`
+                    // to `sign(...)` etc.  Without this, RS's variants
+                    // keep unreduced equation heads even when their args
+                    // are structurally complete, breaking `simp_identify`
+                    // which needs same-image pairs to fire.  See
+                    // [[project-h16-5-simp-identify-precondition]].
+                    //
+                    // Opt-out via `TAM_RS_DISABLE_AES_NORM=1`.
+                    if std::env::var("TAM_RS_DISABLE_AES_NORM").is_err() {
+                        for (_, v) in lifted.iter_mut() {
+                            if let Ok(reduced) = maude.reduce(v) {
+                                *v = reduced;
+                            }
+                        }
                     }
                     let pairs: Vec<(LVar, LNTerm)> = lifted.into_iter()
                         .filter(|(v, _)| restrict_set.contains(v))

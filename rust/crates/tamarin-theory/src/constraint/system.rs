@@ -303,10 +303,18 @@ impl System {
 
     /// `alwaysBefore i j`: True iff `i < j` in every model of the system.
     /// Mirrors Haskell's `Theory.Constraint.System.alwaysBefore`. Computed
-    /// as transitive reachability over `rawLessRel = sLessAtoms ++ edges`.
+    /// as transitive reachability over
+    ///   `rawLessRel = sLessAtoms ++ rawEdgeRel`
+    /// where
+    ///   `rawEdgeRel = sEdges ++ unsolvedChains` (`System.hs:1613-1616`).
+    /// **Unsolved chain goals contribute (c.0, p.0) to the less-relation
+    /// too** — HS treats an open chain as an implicit edge for purposes
+    /// of cycle detection and ordering inference. Without this, RS's
+    /// `cyclic` and `has_forbidden_chain` miss contradictions HS catches
+    /// (root cause of the StatVerif KU(pcs) over-saturation).
     pub fn always_before(&self, i: &NodeId, j: &NodeId) -> bool {
         if i == j { return false; }
-        // Build adjacency from less atoms + edges.
+        // Build adjacency from less atoms + edges + unsolved chains.
         let mut adj: std::collections::BTreeMap<NodeId, Vec<NodeId>>
             = std::collections::BTreeMap::new();
         for l in &self.less_atoms {
@@ -314,6 +322,14 @@ impl System {
         }
         for e in &self.edges {
             adj.entry(e.src.0.clone()).or_default().push(e.tgt.0.clone());
+        }
+        // HS-faithful `unsolvedChains` contribution to rawEdgeRel
+        // (`System.hs:1613-1616`).
+        for (g, st) in &self.goals {
+            if st.solved { continue; }
+            if let crate::constraint::constraints::Goal::Chain(c, p) = g {
+                adj.entry(c.0.clone()).or_default().push(p.0.clone());
+            }
         }
         // BFS from i until j.
         let mut frontier: std::collections::VecDeque<NodeId>
@@ -442,8 +458,8 @@ mod tests {
         let mkvar = |n: &str| Term::Var(VarSpec {
             name: n.to_string(), idx: 0, sort: SortHint::Node, typ: None,
         });
-        let l1 = crate::guarded::Guarded::Atom(Atom::Last(mkvar("i")));
-        let l2 = crate::guarded::Guarded::Atom(Atom::Last(mkvar("j")));
+        let l1 = crate::guarded::Guarded::Atom(crate::guarded::atom_to_gatom_free(&Atom::Last(mkvar("i"))));
+        let l2 = crate::guarded::Guarded::Atom(crate::guarded::atom_to_gatom_free(&Atom::Last(mkvar("j"))));
         s.insert_lemma(crate::guarded::Guarded::Conj(vec![l1.clone(), l2.clone()]));
         assert_eq!(s.lemmas.len(), 2);
         assert!(s.lemmas.contains(&l1));

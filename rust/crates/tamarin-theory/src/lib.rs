@@ -34,6 +34,7 @@ pub mod rule;
 pub mod constraint;
 pub mod elaborate;
 pub mod guarded;
+pub mod guarded_types;
 pub mod predicate_expand;
 pub mod proof_skeleton;
 pub mod prove;

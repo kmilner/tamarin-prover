@@ -19,16 +19,6 @@
 
 use crate::constraint::solver::reduction::{ChangeIndicator, Reduction};
 
-/// Thin wrapper around `Reduction::mark_contradictory` for backwards
-/// compatibility with the existing simplify-pass callsites.  See the
-/// method docstring for the contract — both `sys.formulas` (gfalse)
-/// and `eq_store.is_false` get set so the post-simplify
-/// `contradictions(ctx, sys)` and the SolveGoal-arm mzero proxy both
-/// fire.
-fn mark_contradictory(red: &mut Reduction) {
-    red.mark_contradictory();
-}
-
 /// Labeled variant — emits a `[SIMP_CONTRA]` trace under
 /// `TAM_RS_TRACE_SIMP_CONTRA=1` so per-pass contradiction firings can be
 /// attributed against HS's `[CONTRA-FIRE]` histogram.
@@ -84,9 +74,9 @@ pub fn simplify_system(red: &mut Reduction) {
                 crate::guarded::Guarded::Conj(_) => "Conj",
                 crate::guarded::Guarded::Disj(_) => "Disj",
                 crate::guarded::Guarded::GGuarded { qua: crate::guarded::Quant::Ex, vars, .. } =>
-                    Box::leak(format!("Ex({:?})", vars.iter().map(|v| (v.name.clone(), v.idx)).collect::<Vec<_>>()).into_boxed_str()),
+                    Box::leak(format!("Ex({:?})", vars.iter().map(|b| (b.name.clone(), b.sort)).collect::<Vec<_>>()).into_boxed_str()),
                 crate::guarded::Guarded::GGuarded { qua: crate::guarded::Quant::All, vars, .. } =>
-                    Box::leak(format!("All({:?})", vars.iter().map(|v| (v.name.clone(), v.idx)).collect::<Vec<_>>()).into_boxed_str()),
+                    Box::leak(format!("All({:?})", vars.iter().map(|b| (b.name.clone(), b.sort)).collect::<Vec<_>>()).into_boxed_str()),
             };
             eprintln!("  [SIMP_ENTER] formula[{}] head={}", i, head);
         }
@@ -403,7 +393,11 @@ fn exploit_unique_msg_order(red: &mut Reduction) {
 /// out of disjunctions or short-circuiting conjunctions.
 fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
     use crate::guarded::{simplify_guarded_with, gfalse, gtrue, Guarded};
-    let formulas = red.sys.formulas.clone();
+    // HS-faithful: `evalFormulaAtoms` iterates `S.toList sFormulas` —
+    // Simplify.hs:402-404 — ascending Guarded Ord.  Rust's Vec is in
+    // insertion order; sort first to match HS's iteration.
+    let mut formulas = red.sys.formulas.clone();
+    formulas.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
     let mut changed = ChangeIndicator::Unchanged;
     for fm in formulas {
         let maude = red.ctx.maude.clone();
@@ -779,45 +773,45 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     // sequential idxs per bound var.  Then `subst_atom`/`subst_guarded`
     // applies the rename throughout antecedent + body.
     let mut rename_baseline = red.fresh_var_baseline().saturating_add(1);
-    // Bump past max idx of all universals' bound vars (in case the
-    // collected universals' raw idxs exceed baseline).
-    for f in red.sys.formulas.iter().chain(red.sys.lemmas.iter()) {
-        if let Guarded::GGuarded { qua: Quant::All, vars, .. } = f {
-            for v in vars {
-                if v.idx >= rename_baseline { rename_baseline = v.idx + 1; }
-            }
-        }
-    }
+    // HS-faithful: iterate formulas + lemmas in `S.toList` order
+    // (Guarded Ord ascending) — Simplify.hs:494-496:
+    //   clause <- (S.toList $ get sFormulas sys) ++
+    //             (S.toList $ get sLemmas sys)
+    let mut sorted_universals_src: Vec<&Guarded> = red.sys.formulas.iter().collect();
+    sorted_universals_src.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
+    let mut sorted_lemmas_src: Vec<&Guarded> = red.sys.lemmas.iter().collect();
+    sorted_lemmas_src.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
     let universals: Vec<(Guarded, Vec<tamarin_parser::ast::VarSpec>,
-                         Vec<AAtom>, Guarded)> = red.sys.formulas.iter()
-        .chain(red.sys.lemmas.iter())
+                         Vec<AAtom>, Guarded)> = sorted_universals_src.iter()
+        .chain(sorted_lemmas_src.iter())
+        .copied()
         .filter_map(|f| match f {
             Guarded::GGuarded { qua: Quant::All, vars, guards, body } => {
                 if skip_sources && red.sys.sources_lemma_universals.contains(f) {
                     return None;
                 }
-                // openGuarded-equivalent: rename bound vars to fresh idxs.
-                use crate::guarded::{VarSubst, subst_atom, subst_guarded};
-                let mut subst = VarSubst::new();
-                let mut new_vars: Vec<tamarin_parser::ast::VarSpec> = Vec::with_capacity(vars.len());
-                let mut next = rename_baseline;
-                for v in vars {
-                    let new_v = tamarin_parser::ast::VarSpec {
-                        name: v.name.clone(),
-                        idx: next,
-                        sort: v.sort,
-                        typ: v.typ.clone(),
-                    };
-                    subst.insert((v.name.clone(), v.idx),
-                        tamarin_parser::ast::Term::Var(new_v.clone()));
-                    new_vars.push(new_v);
-                    next = next.saturating_add(1);
+                // openGuarded: fresh-allocate LVars in HS lexical order,
+                // build the `zip [0..] (reverse xs)` substitution, walk
+                // guards + body replacing Bound → Free.
+                let mut xs: Vec<tamarin_parser::ast::VarSpec> = Vec::with_capacity(vars.len());
+                for b in vars {
+                    xs.push(tamarin_parser::ast::VarSpec {
+                        name: b.name.clone(),
+                        idx: rename_baseline,
+                        sort: b.sort,
+                        typ: None,
+                    });
+                    rename_baseline = rename_baseline.saturating_add(1);
                 }
-                rename_baseline = next;
+                let open_s = crate::guarded::open_subst(&xs);
                 let new_guards: Vec<AAtom> = guards.iter()
-                    .map(|a| subst_atom(a, &subst)).collect();
-                let new_body = subst_guarded(body, &subst);
-                Some((f.clone(), new_vars, new_guards, new_body))
+                    .map(|a| {
+                        let opened = crate::guarded::subst_bound_atom_at_depth(a, &open_s, 0);
+                        crate::guarded::gatom_to_atom(&opened)
+                    })
+                    .collect();
+                let new_body = crate::guarded::subst_bound_guarded(body, &open_s);
+                Some((f.clone(), xs, new_guards, new_body))
             }
             _ => None,
         })
@@ -1051,9 +1045,12 @@ fn try_match_all_guards(
             //   gall _ []   gf              = gf
             //   gall _ _    gf | gf == gtrue = gtrue
             //   gall ss atos gf             = GGuarded All ss atos gf
+            let surviving_gatoms: Vec<crate::guarded::GAtom> = surviving_atoms.iter()
+                .map(crate::guarded::atom_to_gatom_free)
+                .collect();
             let implied = crate::guarded::gall(
                 Vec::new(),
-                surviving_atoms,
+                surviving_gatoms,
                 body_subst,
             );
             // Maude unification mints fresh `~mw#N` witnesses on every
@@ -1247,7 +1244,30 @@ fn try_match_all_guards(
                     // recursion + heap growth on Minimal_HashChain
                     // lemmas.  See [[project-corpus-probe-oom]].
                     (false, false) => {
-                        if s_subst == t_subst {
+                        // HS-faithful: compare at the LNTerm level, not on
+                        // raw parser AST.  Two parser-AST shapes can denote
+                        // the same LNTerm (e.g. `App("sdec", [a,b])` from a
+                        // free-var substitution vs `AlgApp("sdec", a, b)`
+                        // from a universal's body — both elaborate to
+                        // `Term::App(NoEq(sdec), [a, b])`).  HS's matchTerm
+                        // works on canonical LNTerms, so structurally-equal
+                        // LNTerms succeed even when their parser shells
+                        // differ.  Without this, type_assertion's u3 EqE
+                        // fails at /non_empty_trace/case_1/Setup_Key (case_3
+                        // snd-sdec form): both sides become `snd(sdec(m,k))`
+                        // semantically, but LHS uses `App` and RHS uses
+                        // `AlgApp` — equality fails and gfalse never fires.
+                        let lhs_eq = crate::elaborate::term_to_lnterm(&s_subst);
+                        let rhs_eq = crate::elaborate::term_to_lnterm(&t_subst);
+                        if let (Some(a), Some(b)) = (lhs_eq, rhs_eq) {
+                            if a == b {
+                                rec(maude, vars, guards, guard_idx + 1, sys_actions,
+                                    acc, body, existing_formulas, existing_solved,
+                                    other_guards, sys, sys_maude, out);
+                            }
+                        } else if s_subst == t_subst {
+                            // Fallback for terms term_to_lnterm can't elaborate
+                            // (e.g. PatMatch); preserve previous behaviour.
                             rec(maude, vars, guards, guard_idx + 1, sys_actions,
                                 acc, body, existing_formulas, existing_solved,
                                 other_guards, sys, sys_maude, out);
@@ -1700,6 +1720,20 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     use crate::fact::{FactTag, LNFact};
     use tamarin_term::lterm::LNTerm;
 
+    // H14.3 diagnostic: dump i_0's KU action at the moment of the merge.
+    if std::env::var("TAM_RS_DBG_KU_I0_ACT").is_ok() {
+        for (id, rule) in &red.sys.nodes {
+            if id.name == "i" && id.idx == 0 {
+                for fa in &rule.actions {
+                    if matches!(fa.tag, FactTag::Ku) {
+                        let t = format!("{:?}", fa.terms.first()).chars().take(200).collect::<String>();
+                        eprintln!("[KU_I0_ACT] i_0 act: {}", t);
+                    }
+                }
+            }
+        }
+    }
+
     // Collect (node, fact, term) for every KU action — both the
     // rule-instance actions and the UNSOLVED open goals.  Mirrors
     // Haskell's `allKUActions`: `unsolvedActionAtoms sys ++ <rule actions>`.
@@ -1710,12 +1744,32 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     // emitted `node_eqs vk.X = vk.Y` which then induced self-loops
     // in less_atoms (vk.X < outer < vk.Y → vk.X < outer < vk.X via
     // post-merge subst).  Haskell's filter avoids this.
+    // H17.8 (2026-05-28): Apply eq_store subst to the action term before
+    // grouping (mirrors HS's `allKUActions` which extracts m from the
+    // node's action fact AFTER substSystem propagated bindings).  Without
+    // this, RS's stored action terms may have bare vars (x.19 from
+    // requiresKU on pair-components) that haven't been rewritten by
+    // substSystem when the substitution is in eq_store but not yet applied.
+    // Opt-out via TAM_RS_DISABLE_H17_8=1.
+    let h17_8_enabled = std::env::var("TAM_RS_DISABLE_H17_8").is_err();
+    let subst = if h17_8_enabled {
+        Some(&red.sys.eq_store.subst)
+    } else {
+        None
+    };
+    let apply_subst = |t: &LNTerm| -> LNTerm {
+        if let Some(s) = subst {
+            tamarin_term::subst::apply_vterm(s, t.clone())
+        } else {
+            t.clone()
+        }
+    };
     let mut acts: Vec<(NodeId, LNFact, LNTerm)> = Vec::new();
     for (id, rule) in &red.sys.nodes {
         for fa in &rule.actions {
             if matches!(fa.tag, FactTag::Ku) {
                 if let Some(m) = fa.terms.first() {
-                    acts.push((id.clone(), fa.clone(), m.clone()));
+                    acts.push((id.clone(), fa.clone(), apply_subst(m)));
                 }
             }
         }
@@ -1725,12 +1779,37 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         if let Goal::Action(i, fa) = g {
             if matches!(fa.tag, FactTag::Ku) {
                 if let Some(m) = fa.terms.first() {
-                    acts.push((i.clone(), fa.clone(), m.clone()));
+                    acts.push((i.clone(), fa.clone(), apply_subst(m)));
                 }
             }
         }
     }
     if acts.len() < 2 { return ChangeIndicator::Unchanged; }
+    // H14.3 diagnostic: dump ALL acts at this invocation if env var set.
+    if std::env::var("TAM_RS_DBG_KU_ACTS").is_ok() {
+        eprintln!("[KU_ACTS_CALL] acts:");
+        for (id, _fa, m) in &acts {
+            let term_s = format!("{:?}", m).chars().take(300).collect::<String>();
+            eprintln!("[KU_ACTS_CALL]   {}_{} → {}", id.name, id.idx, term_s);
+        }
+    }
+    // H18 diagnostic: dump eq_store at the merge moment so we can see
+    // what bindings exist (or are missing) compared to HS's
+    // HS_MERGE_EQSTORE_PRE dump.  Triggered only when there's at least
+    // one i_0 node with a KU action AND the dump env var is set.
+    if std::env::var("TAM_RS_DBG_KU_EQSTORE").is_ok() {
+        let has_i0_ku = red.sys.nodes.iter().any(|(id, rule)| {
+            id.name == "i" && id.idx == 0
+                && rule.actions.iter().any(|fa| matches!(fa.tag, FactTag::Ku))
+        });
+        if has_i0_ku {
+            eprintln!("[KU_EQSTORE] subst:");
+            for (k, v) in red.sys.eq_store.subst.to_list().iter() {
+                let t = format!("{:?}", v).chars().take(200).collect::<String>();
+                eprintln!("[KU_EQSTORE]   {}.{}/{:?} → {}", k.name, k.idx, k.sort, t);
+            }
+        }
+    }
     // Group by term. (LNTerm is Ord/Eq from term::Term.)
     use std::collections::BTreeMap;
     let mut by_term: BTreeMap<LNTerm, Vec<(NodeId, LNFact)>> = BTreeMap::new();
@@ -1739,8 +1818,15 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     }
     let mut node_eqs: Vec<tamarin_term::rewriting::Equal<NodeId>> = Vec::new();
     let mut fact_eqs: Vec<tamarin_term::rewriting::Equal<LNFact>> = Vec::new();
+    let dbg_ku_groups = std::env::var("TAM_RS_DBG_KU_GROUPS").is_ok();
     for (_m, group) in by_term {
         if group.len() < 2 { continue; }
+        if dbg_ku_groups {
+            let ids: Vec<String> = group.iter()
+                .map(|(id, _)| format!("{}_{}", id.name, id.idx)).collect();
+            let term_str = format!("{:?}", _m).chars().take(300).collect::<String>();
+            eprintln!("[KU_GROUP] ids=[{}] term={}", ids.join(","), term_str);
+        }
         let (keep_id, keep_fa) = &group[0];
         for (rid, rfa) in group.iter().skip(1) {
             if rid != keep_id {
@@ -1790,6 +1876,225 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         mark_contradictory_labeled(red, "enforce_ku_action_uniqueness");
         changed = ChangeIndicator::Changed;
     }
+
+    // H14.4 HS-faithful synthesis (2026-05-28):
+    //
+    // HS's `enforceUniqueKuFact` produces less_atoms `(action_node, prem_node,
+    // Adversary)` indirectly via this chain:
+    //   1. action_node has KU(t) action.
+    //   2. prem_node has KU(t) as a RULE PREMISE.
+    //   3. exploitPrem on the KU prem calls `requiresKU(t)` which creates a
+    //      new vk node with KU(t) action.
+    //   4. enforceUniqueKuFact merges the new vk with action_node (same KU
+    //      term) — Maude orients new_vk → action_node (smaller idx wins).
+    //   5. substLessAtoms applies the subst: `LessAtom new_vk prem_node`
+    //      becomes `LessAtom action_node prem_node`.
+    //
+    // RS doesn't reproduce this chain because RS's source-pick application
+    // specializes term variables eagerly, so the prem_node's prem term
+    // diverges from action_node's action term (see [[project-h14-3-generic-
+    // vs-specific-terms]]).
+    //
+    // Direct synthesis: detect (action_node, prem_node) pairs where
+    // action_node's KU(t1) action term UNIFIES with prem_node's KU(t2) rule
+    // premise term, then add the less_atom directly.  We use UNIFICATION
+    // (not exact equality) because HS's chain effectively applies the
+    // unifier via the merge — terms become equal post-merge.  In RS,
+    // since we don't merge, we accept the unifier exists and add the
+    // less_atom.  Soundness: if Maude can unify the terms, there's a
+    // valid sub-supply relationship and the less_atom is semantically
+    // correct.
+    //
+    // OPT-IN via `TAM_RS_ENABLE_KU_PREM_LESS=1` (default disabled).  Reverted
+    // 2026-05-28 because regresses aborted_contract_reachable (0→24) — the
+    // synthesis approximates HS's merge effect but isn't precise.  Kept as
+    // a documented experiment for future deep fix in apply_source_case_action.
+    //
+    // H17.3 TIGHTER CRITERION (opt-in via TAM_RS_ENABLE_KU_PREM_LESS_TIGHT=1):
+    // Only synthesize the less_atom when prem_node's KU term contains a
+    // sub-term EXACTLY equal to action_node's KU term (post-subst).  This
+    // tightens H14.4's `unifiable_shape` to "subterm equality", avoiding
+    // false-positive synthesis on aborted/other lemmas where the
+    // unifiable_shape match happens but no HS merge fires (different vars).
+    // Verified: 0 fires for resolved1 (terms have different vars).  Kept
+    // opt-in until verification on broader corpus.  See
+    // [[project-h17-3-synthesis-tighter]].
+    if std::env::var("TAM_RS_ENABLE_KU_PREM_LESS_TIGHT").is_ok() {
+        use crate::constraint::constraints::{LessAtom, Reason};
+        let mut action_kus: Vec<(crate::constraint::constraints::NodeId, LNTerm)>
+            = Vec::new();
+        for (id, rule) in &red.sys.nodes {
+            for fa in &rule.actions {
+                if matches!(fa.tag, FactTag::Ku) {
+                    if let Some(m) = fa.terms.first() {
+                        action_kus.push((id.clone(), m.clone()));
+                    }
+                }
+            }
+        }
+        let mut prem_kus: Vec<(crate::constraint::constraints::NodeId, LNTerm)>
+            = Vec::new();
+        for (id, rule) in &red.sys.nodes {
+            for fa in &rule.premises {
+                if matches!(fa.tag, FactTag::Ku) {
+                    if let Some(m) = fa.terms.first() {
+                        prem_kus.push((id.clone(), m.clone()));
+                    }
+                }
+            }
+        }
+        // H17.3 tighter: require prem_term to CONTAIN action_term as a
+        // SUB-TERM (post-subst). This corresponds to HS's `requiresKU(sub)`
+        // firing on a structured prem term, where the sub equals an
+        // existing action term — exact equality of the sub-component.
+        fn contains_subterm(haystack: &LNTerm, needle: &LNTerm) -> bool {
+            use tamarin_term::term::Term;
+            if haystack == needle { return true; }
+            match haystack {
+                Term::App(_, args) => args.iter().any(|a| contains_subterm(a, needle)),
+                _ => false,
+            }
+        }
+        if !action_kus.is_empty() && !prem_kus.is_empty() {
+            let existing: std::collections::BTreeSet<(crate::constraint::constraints::NodeId,
+                crate::constraint::constraints::NodeId)> =
+                red.sys.less_atoms.iter()
+                    .map(|la| (la.smaller.clone(), la.larger.clone()))
+                    .collect();
+            let dbg_synth = std::env::var("TAM_RS_DBG_KU_PREM_SYNTH").is_ok();
+            for (action_node, action_term) in &action_kus {
+                if !(action_node.name == "i" && action_node.idx == 0) { continue; }
+                // Action term must be an App (e.g., sign(t.1, t.2)).
+                if !matches!(action_term, tamarin_term::term::Term::App(_, _)) { continue; }
+                for (prem_node, prem_term) in &prem_kus {
+                    if action_node == prem_node { continue; }
+                    // Tighter: prem_term must contain action_term as a sub-term.
+                    if !contains_subterm(prem_term, action_term) { continue; }
+                    // Skip if already exists.
+                    if existing.contains(&(action_node.clone(), prem_node.clone())) {
+                        continue;
+                    }
+                    if dbg_synth {
+                        let a_str = format!("{:?}", action_term)
+                            .chars().take(80).collect::<String>();
+                        let p_str = format!("{:?}", prem_term)
+                            .chars().take(80).collect::<String>();
+                        eprintln!("[KU_PREM_SYNTH_TIGHT] LessAtom {}_{} {}_{} (action={}, prem_contains={})",
+                            action_node.name, action_node.idx,
+                            prem_node.name, prem_node.idx, a_str, p_str);
+                    }
+                    red.insert_less(LessAtom::new(
+                        action_node.clone(),
+                        prem_node.clone(),
+                        Reason::Adversary,
+                    ));
+                    changed = ChangeIndicator::Changed;
+                }
+            }
+        }
+    }
+    if std::env::var("TAM_RS_ENABLE_KU_PREM_LESS").is_ok() {
+        use crate::constraint::constraints::{LessAtom, Reason};
+        // Collect (node, KU action term).
+        let mut action_kus: Vec<(crate::constraint::constraints::NodeId, LNTerm)>
+            = Vec::new();
+        for (id, rule) in &red.sys.nodes {
+            for fa in &rule.actions {
+                if matches!(fa.tag, FactTag::Ku) {
+                    if let Some(m) = fa.terms.first() {
+                        action_kus.push((id.clone(), m.clone()));
+                    }
+                }
+            }
+        }
+        // Collect (node, KU premise term).
+        let mut prem_kus: Vec<(crate::constraint::constraints::NodeId, LNTerm)>
+            = Vec::new();
+        for (id, rule) in &red.sys.nodes {
+            for fa in &rule.premises {
+                if matches!(fa.tag, FactTag::Ku) {
+                    if let Some(m) = fa.terms.first() {
+                        prem_kus.push((id.clone(), m.clone()));
+                    }
+                }
+            }
+        }
+        if !action_kus.is_empty() && !prem_kus.is_empty() {
+            let existing: std::collections::BTreeSet<(crate::constraint::constraints::NodeId,
+                crate::constraint::constraints::NodeId)> =
+                red.sys.less_atoms.iter()
+                    .map(|la| (la.smaller.clone(), la.larger.clone()))
+                    .collect();
+            let dbg_synth = std::env::var("TAM_RS_DBG_KU_PREM_SYNTH").is_ok();
+            // Unification check: same top-level function symbol and same
+            // arity recursively (a structural match that admits any
+            // variable assignment).  This is a sound under-approximation
+            // of "unifiable" — actual Maude unification may admit more
+            // pairs (e.g., via equational theory), but missing some
+            // matches only means MISSING less_atoms (not extra ones).
+            // HS-faithful structural match: both terms must have the SAME
+            // top-level function symbol AND args must structurally match
+            // (allowing vars inside, but the head must be non-variable).
+            //
+            // We REQUIRE non-variable at the top level because HS's chain
+            // only fires when the new vk's KU action is a HEADED term
+            // (e.g., sign(...)) that matches the supplier's HEADED term.
+            // A bare variable wouldn't trigger HS's merge in the same way.
+            fn unifiable_shape(a: &LNTerm, b: &LNTerm) -> bool {
+                use tamarin_term::term::Term;
+                match (a, b) {
+                    // Top-level must be App (function symbol) — bare vars
+                    // or constants don't drive the merge chain HS uses.
+                    (Term::App(s1, args1), Term::App(s2, args2)) => {
+                        if s1 != s2 { return false; }
+                        if args1.len() != args2.len() { return false; }
+                        // Args can be vars or matching shape.
+                        args1.iter().zip(args2.iter())
+                            .all(|(x, y)| match (x, y) {
+                                (Term::Lit(_), Term::Lit(_)) => true, // var/const OK
+                                (Term::App(_, _), Term::App(_, _)) => unifiable_shape(x, y),
+                                (Term::Lit(_), _) | (_, Term::Lit(_)) => true,
+                                _ => false,
+                            })
+                    }
+                    _ => false,
+                }
+            }
+            for (action_node, action_term) in &action_kus {
+                // NARROW: only fire when action_node is the source goal's
+                // i_0 (LVar name="i", idx=0).  This matches HS's chain
+                // where the outer source goal's #i is the merge target.
+                // For non-i_0 action nodes, the standard same-term merge
+                // in enforce_ku_action_uniqueness above handles it.
+                if !(action_node.name == "i" && action_node.idx == 0) { continue; }
+                for (prem_node, prem_term) in &prem_kus {
+                    if action_node == prem_node { continue; }
+                    if !unifiable_shape(action_term, prem_term) { continue; }
+                    // Skip if already exists.
+                    if existing.contains(&(action_node.clone(), prem_node.clone())) {
+                        continue;
+                    }
+                    // Synthesize the less_atom.
+                    if dbg_synth {
+                        let a_str = format!("{:?}", action_term)
+                            .chars().take(80).collect::<String>();
+                        let p_str = format!("{:?}", prem_term)
+                            .chars().take(80).collect::<String>();
+                        eprintln!("[KU_PREM_SYNTH] LessAtom {}_{} {}_{} (action={}, prem={})",
+                            action_node.name, action_node.idx,
+                            prem_node.name, prem_node.idx, a_str, p_str);
+                    }
+                    red.insert_less(LessAtom::new(
+                        action_node.clone(),
+                        prem_node.clone(),
+                        Reason::Adversary,
+                    ));
+                    changed = ChangeIndicator::Changed;
+                }
+            }
+        }
+    }
+
     changed
 }
 
@@ -2767,10 +3072,12 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                 if !vars.is_empty() { continue; }
                 if guards.len() != 1 { continue; }
                 if **body != crate::guarded::gfalse() { continue; }
-                if let tamarin_parser::ast::Atom::Eq(s, t) = &guards[0] {
+                if let crate::guarded::GAtom::Eq(s_g, t_g) = &guards[0] {
+                    let s = crate::guarded::gterm_to_term(s_g);
+                    let t = crate::guarded::gterm_to_term(t_g);
                     if let (Some(sl), Some(tl)) = (
-                        crate::elaborate::term_to_lnterm(s),
-                        crate::elaborate::term_to_lnterm(t),
+                        crate::elaborate::term_to_lnterm(&s),
+                        crate::elaborate::term_to_lnterm(&t),
                     ) {
                         set.insert((sl.clone(), tl.clone()));
                         set.insert((tl, sl));
@@ -2878,7 +3185,8 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                             let t_ast = crate::elaborate::lnterm_to_term(t);
                             let neg = crate::guarded::gall(
                                 Vec::new(),
-                                vec![tamarin_parser::ast::Atom::Eq(s_ast, t_ast)],
+                                vec![crate::guarded::atom_to_gatom_free(
+                                    &tamarin_parser::ast::Atom::Eq(s_ast, t_ast))],
                                 crate::guarded::gfalse(),
                             );
                             new_inequalities.push(neg);
@@ -2969,10 +3277,16 @@ fn reduce_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     use crate::guarded::reducible_formula;
     // Pull out reducible formulas in one pass; otherwise we'd have
     // overlapping borrows (read+modify on `sys.formulas`).
-    let to_decompose: Vec<_> = red.sys.formulas.iter()
+    //
+    // HS-faithful: `reduceFormulas` iterates `S.toList formulas` —
+    // Simplify.hs:388-389 — ascending Guarded Ord.  Sort to match HS's
+    // iteration order; otherwise the decomposition + re-insertion
+    // sequence picks up different goal-nrs than HS.
+    let mut to_decompose: Vec<_> = red.sys.formulas.iter()
         .filter(|f| reducible_formula(f))
         .cloned()
         .collect();
+    to_decompose.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
     if std::env::var("TAM_DBG_REDUCE_FORM").is_ok() {
         let total = red.sys.formulas.len();
         eprintln!("[REDUCE_FORM] total_formulas={} to_decompose={}", total, to_decompose.len());
@@ -2982,9 +3296,9 @@ fn reduce_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
                 crate::guarded::Guarded::Conj(_) => "Conj",
                 crate::guarded::Guarded::Disj(_) => "Disj",
                 crate::guarded::Guarded::GGuarded { qua: crate::guarded::Quant::Ex, vars, .. } =>
-                    Box::leak(format!("Ex({:?})", vars.iter().map(|v| (v.name.clone(), v.idx)).collect::<Vec<_>>()).into_boxed_str()),
+                    Box::leak(format!("Ex({:?})", vars.iter().map(|b| (b.name.clone(), b.sort)).collect::<Vec<_>>()).into_boxed_str()),
                 crate::guarded::Guarded::GGuarded { qua: crate::guarded::Quant::All, vars, .. } =>
-                    Box::leak(format!("All({:?})", vars.iter().map(|v| (v.name.clone(), v.idx)).collect::<Vec<_>>()).into_boxed_str()),
+                    Box::leak(format!("All({:?})", vars.iter().map(|b| (b.name.clone(), b.sort)).collect::<Vec<_>>()).into_boxed_str()),
             };
             let red_flag = reducible_formula(f);
             let s = format!("{:?}", f);
@@ -3175,7 +3489,7 @@ mod tests {
             name: n.to_string(), idx, sort: SortHint::Node, typ: None,
         });
         let _ = mkvar; // keep import alive
-        let a1 = crate::guarded::Guarded::Atom(Atom::Action(
+        let a1 = crate::guarded::Guarded::Atom(crate::guarded::atom_to_gatom_free(&Atom::Action(
             tamarin_parser::ast::Fact {
                 persistent: false,
                 name: "P".to_string(),
@@ -3183,8 +3497,8 @@ mod tests {
                 annotations: Vec::new(),
             },
             mkvar_idx("i", 0),
-        ));
-        let a2 = crate::guarded::Guarded::Atom(Atom::Action(
+        )));
+        let a2 = crate::guarded::Guarded::Atom(crate::guarded::atom_to_gatom_free(&Atom::Action(
             tamarin_parser::ast::Fact {
                 persistent: false,
                 name: "Q".to_string(),
@@ -3192,7 +3506,7 @@ mod tests {
                 annotations: Vec::new(),
             },
             mkvar_idx("j", 0),
-        ));
+        )));
         sys.formulas.push(crate::guarded::Guarded::Conj(vec![a1.clone(), a2.clone()]));
         let mut r = Reduction::new(&ctx, sys);
         simplify_system(&mut r);
@@ -3229,8 +3543,8 @@ mod tests {
         let mkvar = |n: &str| Term::Var(VarSpec {
             name: n.to_string(), idx: 0, sort: SortHint::Node, typ: None,
         });
-        let a1 = crate::guarded::Guarded::Atom(Atom::Last(mkvar("i")));
-        let a2 = crate::guarded::Guarded::Atom(Atom::Last(mkvar("j")));
+        let a1 = crate::guarded::Guarded::Atom(crate::guarded::atom_to_gatom_free(&Atom::Last(mkvar("i"))));
+        let a2 = crate::guarded::Guarded::Atom(crate::guarded::atom_to_gatom_free(&Atom::Last(mkvar("j"))));
         // Wrap a Disj inside a Conj so the outer formula is reducible
         // (Conj is) — reduce_formulas will trip on it and decompose
         // the Disj inside.

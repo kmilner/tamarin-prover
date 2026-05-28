@@ -17,6 +17,17 @@ use std::collections::BTreeSet;
 
 use tamarin_parser::ast as p;
 
+pub use crate::guarded_types::{
+    BVar, GAtom, GBinding, GFact, GTerm,
+    atom_to_gatom_free, fact_to_gfact_free, term_to_gterm_free,
+    gatom_to_atom, gfact_to_fact, gterm_to_term,
+    subst_free_atom_at_depth, subst_free_fact_at_depth, subst_free_term_at_depth,
+    subst_bound_atom_at_depth, subst_bound_fact_at_depth, subst_bound_term_at_depth,
+    close_subst, open_subst, lvar_to_binding,
+    collect_free_term, collect_free_atom,
+    map_free_term, map_free_fact, map_free_atom,
+};
+
 // =============================================================================
 // Guarded data type
 // =============================================================================
@@ -24,10 +35,271 @@ use tamarin_parser::ast as p;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Quant { All, Ex }
 
+// ===========================================================================
+// HS-faithful Ord for Guarded
+// ===========================================================================
+//
+// HS's `Theory.Constraint.System.Guarded.Guarded` derives Ord structurally
+// (Guarded.hs:121-129):
+//
+//     data Guarded s c v = GAto  (Atom ...)
+//                        | GDisj (Disj (Guarded ...))
+//                        | GConj (Conj (Guarded ...))
+//                        | GGuarded Quantifier [s] [Atom ...] (Guarded ...)
+//
+// Constructor order: GAto < GDisj < GConj < GGuarded.
+// Within each, lexicographic on contents.
+//
+// HS's `Set LNGuarded` iterates via `S.toList` which yields elements in
+// ascending Ord.  Rust's `sys.formulas: Vec<Guarded>` iterates in
+// insertion order, so the impl-pass / reduce-formulas / eval-formula-atoms
+// passes see clauses in a DIFFERENT order than HS does — which propagates
+// to which clause's matches fire first → goal-nrs of newly-inserted
+// Disj formulas → goal pick at downstream proof steps.
+//
+// This module provides `cmp_guarded` (and helpers `cmp_atom` /
+// `cmp_term`) that mirror HS's derived Ord chain.  See
+// [[reference-vec-vs-set-walks]] for the sites that need this.
+
+/// HS-faithful structural comparison for Guarded.  Mirrors HS's derived
+/// `Ord (Guarded s c v)` on `Theory.Constraint.System.Guarded.Guarded`.
+pub fn cmp_guarded(a: &Guarded, b: &Guarded) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let ta = guarded_tag(a);
+    let tb = guarded_tag(b);
+    if ta != tb { return ta.cmp(&tb); }
+    match (a, b) {
+        (Guarded::Atom(x), Guarded::Atom(y)) => cmp_atom(x, y),
+        (Guarded::Disj(xs), Guarded::Disj(ys)) => cmp_slice(xs, ys, cmp_guarded),
+        (Guarded::Conj(xs), Guarded::Conj(ys)) => cmp_slice(xs, ys, cmp_guarded),
+        (
+            Guarded::GGuarded { qua: q1, vars: v1, guards: g1, body: b1 },
+            Guarded::GGuarded { qua: q2, vars: v2, guards: g2, body: b2 },
+        ) => {
+            cmp_quant(q1, q2)
+                // HS-faithful: in `LNGuarded = Guarded (String,LSort) Name
+                // LVar` (Guarded.hs:279,389), the `s` parameter — used
+                // for GGuarded's binding list — is the TUPLE
+                // `(String, LSort)`, NOT `LVar`.  So bindings sort by
+                // (name, sort) only — there is no idx field on a binding.
+                // Rust's `VarSpec` carries `idx` but for binding-list
+                // comparison we must ignore it (cmp_binding); free-var
+                // comparison inside terms still uses cmp_varspec which
+                // mirrors HS's `Ord LVar = (idx, sort, name)`.
+                .then_with(|| cmp_slice(v1, v2, cmp_binding))
+                .then_with(|| cmp_slice(g1, g2, cmp_atom))
+                .then_with(|| cmp_guarded(b1, b2))
+        }
+        _ => Ordering::Equal,
+    }
+}
+
+fn guarded_tag(g: &Guarded) -> u8 {
+    match g {
+        Guarded::Atom(_) => 0,
+        Guarded::Disj(_) => 1,
+        Guarded::Conj(_) => 2,
+        Guarded::GGuarded { .. } => 3,
+    }
+}
+
+fn cmp_quant(a: &Quant, b: &Quant) -> std::cmp::Ordering {
+    let ta = if matches!(a, Quant::All) { 0u8 } else { 1 };
+    let tb = if matches!(b, Quant::All) { 0u8 } else { 1 };
+    ta.cmp(&tb)
+}
+
+/// HS list Ord: element-by-element, shorter < longer.
+fn cmp_slice<T, F>(a: &[T], b: &[T], mut f: F) -> std::cmp::Ordering
+where F: FnMut(&T, &T) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let mut i = 0;
+    loop {
+        match (a.get(i), b.get(i)) {
+            (Some(x), Some(y)) => {
+                let c = f(x, y);
+                if c != Ordering::Equal { return c; }
+                i += 1;
+            }
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (None, None) => return Ordering::Equal,
+        }
+    }
+}
+
+/// HS-faithful Ord for `ProtoAtom`: Action < EqE < Subterm < Less < Last
+/// < Syntactic (Theory/Model/Atom.hs:78-84).  Rust's `GAtom` declares
+/// variants in a different order; we re-map to HS's order via
+/// `atom_tag`.  `LessMset` has no HS equivalent — put at end.
+pub fn cmp_atom(a: &GAtom, b: &GAtom) -> std::cmp::Ordering {
+    let ta = atom_tag(a);
+    let tb = atom_tag(b);
+    if ta != tb { return ta.cmp(&tb); }
+    match (a, b) {
+        (GAtom::Action(f1, t1), GAtom::Action(f2, t2)) =>
+            cmp_fact(f1, f2).then_with(|| cmp_term(t1, t2)),
+        (GAtom::Eq(a1, b1), GAtom::Eq(a2, b2)) =>
+            cmp_term(a1, a2).then_with(|| cmp_term(b1, b2)),
+        (GAtom::Subterm(a1, b1), GAtom::Subterm(a2, b2)) =>
+            cmp_term(a1, a2).then_with(|| cmp_term(b1, b2)),
+        (GAtom::Less(a1, b1), GAtom::Less(a2, b2)) =>
+            cmp_term(a1, a2).then_with(|| cmp_term(b1, b2)),
+        (GAtom::Last(t1), GAtom::Last(t2)) => cmp_term(t1, t2),
+        (GAtom::Pred(f1), GAtom::Pred(f2)) => cmp_fact(f1, f2),
+        (GAtom::LessMset(a1, b1), GAtom::LessMset(a2, b2)) =>
+            cmp_term(a1, a2).then_with(|| cmp_term(b1, b2)),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+fn atom_tag(a: &GAtom) -> u8 {
+    match a {
+        GAtom::Action(_, _) => 0,
+        GAtom::Eq(_, _) => 1,
+        GAtom::Subterm(_, _) => 2,
+        GAtom::Less(_, _) => 3,
+        GAtom::Last(_) => 4,
+        GAtom::Pred(_) => 5,
+        GAtom::LessMset(_, _) => 6, // Rust-only, no HS equivalent
+    }
+}
+
+/// HS Term Ord: `Lit < FApp` (Term.hs).  Walks `GTerm`.  Bound vars sort
+/// before Free vars (HS `BVar = Bound Int | Free v` declaration order).
+pub fn cmp_term(a: &GTerm, b: &GTerm) -> std::cmp::Ordering {
+    use GTerm::*;
+    let (ca, sa) = term_class(a);
+    let (cb, sb) = term_class(b);
+    if ca != cb { return ca.cmp(&cb); }
+    if sa != sb { return sa.cmp(&sb); }
+    match (a, b) {
+        // Lit class:
+        (Var(v1), Var(v2)) => cmp_bvar(v1, v2),
+        (PubLit(s1), PubLit(s2)) => s1.cmp(s2),
+        (FreshLit(s1), FreshLit(s2)) => s1.cmp(s2),
+        (NatLit(s1), NatLit(s2)) => s1.cmp(s2),
+        (Number(n1), Number(n2)) => n1.cmp(n2),
+        (NumberOne, NumberOne) | (NatOne, NatOne) | (DhNeutral, DhNeutral)
+            => std::cmp::Ordering::Equal,
+        // FApp class:
+        (App(n1, args1), App(n2, args2)) =>
+            n1.cmp(n2).then_with(|| cmp_slice(args1, args2, cmp_term)),
+        (AlgApp(n1, l1, r1), AlgApp(n2, l2, r2)) =>
+            n1.cmp(n2).then_with(|| cmp_term(l1, l2)).then_with(|| cmp_term(r1, r2)),
+        (Pair(a1), Pair(a2)) => cmp_slice(a1, a2, cmp_term),
+        (Diff(l1, r1), Diff(l2, r2)) =>
+            cmp_term(l1, l2).then_with(|| cmp_term(r1, r2)),
+        (BinOp(o1, l1, r1), BinOp(o2, l2, r2)) =>
+            binop_tag(o1).cmp(&binop_tag(o2))
+                .then_with(|| cmp_term(l1, l2))
+                .then_with(|| cmp_term(r1, r2)),
+        (PatMatch(a1), PatMatch(a2)) => cmp_term(a1, a2),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+/// HS `Ord BVar`: derived; `Bound < Free`.  Within each constructor,
+/// compare the contents — `Int` for Bound, LVar Ord (idx, sort, name) for Free.
+pub fn cmp_bvar(a: &BVar, b: &BVar) -> std::cmp::Ordering {
+    match (a, b) {
+        (BVar::Bound(_), BVar::Free(_)) => std::cmp::Ordering::Less,
+        (BVar::Free(_), BVar::Bound(_)) => std::cmp::Ordering::Greater,
+        (BVar::Bound(n1), BVar::Bound(n2)) => n1.cmp(n2),
+        (BVar::Free(v1), BVar::Free(v2)) => cmp_varspec(v1, v2),
+    }
+}
+
+/// Returns `(class, sub_tag)` where class=0 for Lit-like, 1 for FApp-like.
+fn term_class(t: &GTerm) -> (u8, u8) {
+    use GTerm::*;
+    match t {
+        Var(_) => (0, 0),
+        PubLit(_) => (0, 1),
+        FreshLit(_) => (0, 2),
+        NatLit(_) => (0, 3),
+        Number(_) => (0, 4),
+        NumberOne => (0, 5),
+        NatOne => (0, 6),
+        DhNeutral => (0, 7),
+        App(_, _) => (1, 0),
+        AlgApp(_, _, _) => (1, 1),
+        Pair(_) => (1, 2),
+        Diff(_, _) => (1, 3),
+        BinOp(_, _, _) => (1, 4),
+        PatMatch(_) => (1, 5),
+    }
+}
+
+fn binop_tag(o: &p::BinOp) -> u8 {
+    use p::BinOp::*;
+    match o {
+        Exp => 0, Mult => 1, Union => 2, Xor => 3, NatPlus => 4,
+    }
+}
+
+/// HS-faithful Ord for free `LVar`: `(idx, sort, name)` lexicographic
+/// (Term/LTerm.hs:521-523).  Rust's `p::VarSpec` has the same fields
+/// in a different declaration order — we compare in HS's order.
+/// Used for VarSpecs that appear as FREE vars inside terms.
+pub fn cmp_varspec(a: &p::VarSpec, b: &p::VarSpec) -> std::cmp::Ordering {
+    a.idx.cmp(&b.idx)
+        .then_with(|| cmp_sort_hint(&a.sort, &b.sort))
+        .then_with(|| a.name.cmp(&b.name))
+}
+
+/// HS-faithful Ord for GGuarded *binding* entries.  In LNGuarded, the
+/// binding type is `(String, LSort)` — Guarded.hs:279,389.  So bindings
+/// sort by `(name, sort)` lex.  After the DeBruijn migration our
+/// `GBinding` already carries only those two fields.
+pub fn cmp_binding(a: &GBinding, b: &GBinding) -> std::cmp::Ordering {
+    a.name.cmp(&b.name)
+        .then_with(|| cmp_sort_hint(&a.sort, &b.sort))
+}
+
+/// HS LSort declaration order (Term/LTerm.hs:161-166):
+///   LSortPub < LSortFresh < LSortMsg < LSortNode < LSortNat.
+fn cmp_sort_hint(a: &p::SortHint, b: &p::SortHint) -> std::cmp::Ordering {
+    sort_hint_tag(a).cmp(&sort_hint_tag(b))
+}
+
+fn sort_hint_tag(s: &p::SortHint) -> u8 {
+    use p::SortHint::*;
+    use p::SuffixSort;
+    match s {
+        Pub => 0,
+        Fresh => 1,
+        Msg => 2,
+        Node => 3,
+        Nat => 4,
+        Suffix(SuffixSort::Pub) => 0,
+        Suffix(SuffixSort::Fresh) => 1,
+        Suffix(SuffixSort::Msg) => 2,
+        Suffix(SuffixSort::Node) => 3,
+        Suffix(SuffixSort::Nat) => 4,
+        Untagged => 99, // no HS equivalent (sorted last)
+    }
+}
+
+/// HS Fact Ord (Theory/Model/Fact.hs): `(factTag, factAnnotations,
+/// factTerms)` tuple Ord.  Works on `GFact` (HS `Fact (VTerm c (BVar v))`).
+pub fn cmp_fact(a: &GFact, b: &GFact) -> std::cmp::Ordering {
+    a.persistent.cmp(&b.persistent)
+        .then_with(|| a.name.cmp(&b.name))
+        .then_with(|| cmp_slice(&a.args, &b.args, cmp_term))
+}
+
+/// HS-faithful Guarded type. Mirrors `Theory.Constraint.System.Guarded.Guarded`.
+///
+/// Atoms use `GAtom` (which is `Atom (VTerm c (BVar v))` in HS), so a
+/// variable leaf inside an atom is either `Bound(n)` (DeBruijn index into
+/// the enclosing binder list) or `Free(LVar)`. Bindings carry only name +
+/// sort — DeBruijn position determines identity.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Guarded {
-    /// One atomic predicate.
-    Atom(p::Atom),
+    /// One atomic predicate (may contain Bound vars only when nested under
+    /// a sufficient number of `GGuarded` binders).
+    Atom(GAtom),
     /// Disjunction of guarded sub-formulas.
     Disj(Vec<Guarded>),
     /// Conjunction of guarded sub-formulas.
@@ -37,8 +309,8 @@ pub enum Guarded {
     /// quantified `xs` must be bound by them.
     GGuarded {
         qua: Quant,
-        vars: Vec<p::VarSpec>,
-        guards: Vec<p::Atom>,
+        vars: Vec<GBinding>,
+        guards: Vec<GAtom>,
         body: Box<Guarded>,
     },
 }
@@ -52,7 +324,6 @@ pub fn gtf(b: bool) -> Guarded { if b { gtrue() } else { gfalse() } }
 /// solver's `insertFormula` decomposition rules. Mirrors
 /// `Theory.Constraint.Solver.Reduction.reducibleFormula`.
 pub fn reducible_formula(fm: &Guarded) -> bool {
-    use p::Atom;
     match fm {
         Guarded::Atom(_) => true,
         Guarded::Conj(_) => true,
@@ -62,7 +333,7 @@ pub fn reducible_formula(fm: &Guarded) -> bool {
             let body_is_false = matches!(&**body, Guarded::Disj(v) if v.is_empty());
             body_is_false && matches!(
                 &guards[0],
-                Atom::Less(_, _) | Atom::Subterm(_, _) | Atom::Last(_),
+                GAtom::Less(_, _) | GAtom::Subterm(_, _) | GAtom::Last(_),
             )
         }
         _ => false,
@@ -106,8 +377,15 @@ pub fn simplify_guarded_with(
     fm: &Guarded,
     valuation: &dyn Fn(&p::Atom) -> Option<bool>,
 ) -> Guarded {
+    // HS `simplifyGuardedOrReturn` calls `valuation =<< unbindAtom ato`,
+    // which is Nothing whenever any Bound var is present in the atom.
+    // We mirror by attempting GAtom→p::Atom conversion; on Bound, the
+    // round-trip panics, so we use a safe variant.
+    let eval = |a: &GAtom| -> Option<bool> {
+        try_gatom_to_atom(a).and_then(|pa| valuation(&pa))
+    };
     match fm {
-        Guarded::Atom(a) => match valuation(a) {
+        Guarded::Atom(a) => match eval(a) {
             Some(true) => gtrue(),
             Some(false) => gfalse(),
             None => fm.clone(),
@@ -125,15 +403,15 @@ pub fn simplify_guarded_with(
             gconj(simplified)
         }
         Guarded::GGuarded { qua: Quant::All, vars, guards, body } if vars.is_empty() => {
-            let evaluated: Vec<(p::Atom, Option<bool>)> = guards.iter()
-                .map(|a| (a.clone(), valuation(a)))
+            let evaluated: Vec<(GAtom, Option<bool>)> = guards.iter()
+                .map(|a| (a.clone(), eval(a)))
                 .collect();
             // Any False guard → universal vacuously holds.
             if evaluated.iter().any(|(_, v)| v == &Some(false)) {
                 return gtrue();
             }
             // Keep only the Unknown guards — True guards are vacuous.
-            let kept: Vec<p::Atom> = evaluated.into_iter()
+            let kept: Vec<GAtom> = evaluated.into_iter()
                 .filter(|(_, v)| v.is_none())
                 .map(|(a, _)| a)
                 .collect();
@@ -152,6 +430,64 @@ pub fn simplify_guarded_with(
         // simplification past the binder.
         Guarded::GGuarded { .. } => fm.clone(),
     }
+}
+
+/// Convert `GAtom` to `p::Atom` if no Bound vars are present, else None.
+/// HS `unbindAtom`.
+pub fn try_gatom_to_atom(a: &GAtom) -> Option<p::Atom> {
+    Some(match a {
+        GAtom::Eq(s, t) => p::Atom::Eq(try_gterm_to_term(s)?, try_gterm_to_term(t)?),
+        GAtom::Less(s, t) => p::Atom::Less(try_gterm_to_term(s)?, try_gterm_to_term(t)?),
+        GAtom::LessMset(s, t) => p::Atom::LessMset(try_gterm_to_term(s)?, try_gterm_to_term(t)?),
+        GAtom::Subterm(s, t) => p::Atom::Subterm(try_gterm_to_term(s)?, try_gterm_to_term(t)?),
+        GAtom::Action(f, t) => p::Atom::Action(try_gfact_to_fact(f)?, try_gterm_to_term(t)?),
+        GAtom::Last(t) => p::Atom::Last(try_gterm_to_term(t)?),
+        GAtom::Pred(f) => p::Atom::Pred(try_gfact_to_fact(f)?),
+    })
+}
+
+/// Convert `GTerm` to `p::Term` if no Bound vars are present, else None.
+pub fn try_gterm_to_term(t: &GTerm) -> Option<p::Term> {
+    Some(match t {
+        GTerm::Var(BVar::Free(v)) => p::Term::Var(v.clone()),
+        GTerm::Var(BVar::Bound(_)) => return None,
+        GTerm::PubLit(s) => p::Term::PubLit(s.clone()),
+        GTerm::FreshLit(s) => p::Term::FreshLit(s.clone()),
+        GTerm::NatLit(s) => p::Term::NatLit(s.clone()),
+        GTerm::Number(n) => p::Term::Number(*n),
+        GTerm::NumberOne => p::Term::NumberOne,
+        GTerm::NatOne => p::Term::NatOne,
+        GTerm::DhNeutral => p::Term::DhNeutral,
+        GTerm::App(n, args) => {
+            let mut acc = Vec::with_capacity(args.len());
+            for a in args { acc.push(try_gterm_to_term(a)?); }
+            p::Term::App(n.clone(), acc)
+        }
+        GTerm::AlgApp(n, a, b) =>
+            p::Term::AlgApp(n.clone(), Box::new(try_gterm_to_term(a)?), Box::new(try_gterm_to_term(b)?)),
+        GTerm::Pair(items) => {
+            let mut acc = Vec::with_capacity(items.len());
+            for it in items { acc.push(try_gterm_to_term(it)?); }
+            p::Term::Pair(acc)
+        }
+        GTerm::Diff(a, b) =>
+            p::Term::Diff(Box::new(try_gterm_to_term(a)?), Box::new(try_gterm_to_term(b)?)),
+        GTerm::BinOp(op, a, b) =>
+            p::Term::BinOp(*op, Box::new(try_gterm_to_term(a)?), Box::new(try_gterm_to_term(b)?)),
+        GTerm::PatMatch(t) => p::Term::PatMatch(Box::new(try_gterm_to_term(t)?)),
+    })
+}
+
+/// Convert `GFact` to `p::Fact` if no Bound vars are present, else None.
+pub fn try_gfact_to_fact(f: &GFact) -> Option<p::Fact> {
+    let mut args = Vec::with_capacity(f.args.len());
+    for a in &f.args { args.push(try_gterm_to_term(a)?); }
+    Some(p::Fact {
+        persistent: f.persistent,
+        name: f.name.clone(),
+        args,
+        annotations: f.annotations.clone(),
+    })
 }
 
 /// Smart `Disj` — flatten one level, short-circuit on `gtrue`, drop
@@ -195,7 +531,7 @@ pub fn gdisj(items: Vec<Guarded>) -> Guarded {
 ///   gex _   _   gf | gf == gfalse = gfalse
 ///   gex ss  as  gf                = GGuarded Ex ss as gf
 /// ```
-pub fn gex(vars: Vec<p::VarSpec>, guards: Vec<p::Atom>, body: Guarded) -> Guarded {
+pub fn gex(vars: Vec<GBinding>, guards: Vec<GAtom>, body: Guarded) -> Guarded {
     if vars.is_empty() {
         let mut items: Vec<Guarded> = guards.into_iter()
             .map(Guarded::Atom).collect();
@@ -212,7 +548,7 @@ pub fn gex(vars: Vec<p::VarSpec>, guards: Vec<p::Atom>, body: Guarded) -> Guarde
 ///   gall _   _    gf | gf == gtrue = gtrue
 ///   gall ss  atos gf              = GGuarded All ss atos gf
 /// ```
-pub fn gall(vars: Vec<p::VarSpec>, guards: Vec<p::Atom>, body: Guarded) -> Guarded {
+pub fn gall(vars: Vec<GBinding>, guards: Vec<GAtom>, body: Guarded) -> Guarded {
     if guards.is_empty() { return body; }
     if body == gtrue() { return gtrue(); }
     Guarded::GGuarded { qua: Quant::All, vars, guards, body: Box::new(body) }
@@ -263,51 +599,37 @@ pub fn is_safety_formula(g: &Guarded) -> bool {
 }
 
 /// Compute the set of free (un-quantified) variables in a guarded formula.
+///
+/// With DeBruijn bindings, Bound vars don't appear in this set — they have
+/// no name (their "name" is positional).  We collect VarSpec names from
+/// every `BVar::Free` leaf.
 pub fn free_vars(g: &Guarded) -> BTreeSet<String> {
-    fn vs_atom(a: &p::Atom, out: &mut BTreeSet<String>) {
-        let mut tv = Vec::new();
-        match a {
-            p::Atom::Eq(x, y) | p::Atom::Less(x, y)
-            | p::Atom::LessMset(x, y) | p::Atom::Subterm(x, y) => {
-                term_var_names(x, &mut tv); term_var_names(y, &mut tv);
-            }
-            p::Atom::Action(fact, t) => {
-                for arg in &fact.args { term_var_names(arg, &mut tv); }
-                term_var_names(t, &mut tv);
-            }
-            p::Atom::Last(t) => term_var_names(t, &mut tv),
-            p::Atom::Pred(fact) => {
-                for arg in &fact.args { term_var_names(arg, &mut tv); }
-            }
-        }
-        for n in tv { out.insert(n); }
-    }
-    fn rec(g: &Guarded, out: &mut BTreeSet<String>, bound: &BTreeSet<String>) {
+    fn rec(g: &Guarded, out: &mut BTreeSet<String>) {
         match g {
             Guarded::Atom(a) => {
-                let mut here = BTreeSet::new();
-                vs_atom(a, &mut here);
-                for n in here { if !bound.contains(&n) { out.insert(n); } }
+                let mut free = Vec::new();
+                collect_free_atom(a, &mut free);
+                for v in free { out.insert(v.name); }
             }
             Guarded::Disj(items) | Guarded::Conj(items) =>
-                for it in items { rec(it, out, bound); },
-            Guarded::GGuarded { vars, guards, body, .. } => {
-                let mut new_bound = bound.clone();
-                for v in vars { new_bound.insert(v.name.clone()); }
+                for it in items { rec(it, out); },
+            Guarded::GGuarded { guards, body, .. } => {
                 for a in guards {
-                    let mut here = BTreeSet::new();
-                    vs_atom(a, &mut here);
-                    for n in here { if !new_bound.contains(&n) { out.insert(n); } }
+                    let mut free = Vec::new();
+                    collect_free_atom(a, &mut free);
+                    for v in free { out.insert(v.name); }
                 }
-                rec(body, out, &new_bound);
+                rec(body, out);
             }
         }
     }
     let mut out = BTreeSet::new();
-    rec(g, &mut out, &BTreeSet::new());
+    rec(g, &mut out);
     out
 }
 
+/// Collect variable names from a parser-AST term.  Used by
+/// `remaining_unguarded` for the pre-DeBruijn unguarded-variable check.
 fn term_var_names(t: &p::Term, out: &mut Vec<String>) {
     match t {
         p::Term::Var(v) => out.push(v.name.clone()),
@@ -321,6 +643,68 @@ fn term_var_names(t: &p::Term, out: &mut Vec<String>) {
 }
 
 // =============================================================================
+// Walking Guarded with DeBruijn-aware substitution
+// =============================================================================
+
+/// Mirror HS `substFree :: [(LVar, Integer)] -> LGuarded c -> LGuarded c`.
+///
+/// Walks the Guarded tracking scope depth (number of binders crossed).
+/// At each atom, replaces each `Free(v)` matching some `(v, db)` in `s`
+/// with `Bound(db + depth)`.
+pub fn subst_free_guarded(g: &Guarded, s: &[(p::VarSpec, u32)]) -> Guarded {
+    fn rec(g: &Guarded, s: &[(p::VarSpec, u32)], depth: u32) -> Guarded {
+        match g {
+            Guarded::Atom(a) => Guarded::Atom(subst_free_atom_at_depth(a, s, depth)),
+            Guarded::Disj(items) =>
+                Guarded::Disj(items.iter().map(|i| rec(i, s, depth)).collect()),
+            Guarded::Conj(items) =>
+                Guarded::Conj(items.iter().map(|i| rec(i, s, depth)).collect()),
+            Guarded::GGuarded { qua, vars, guards, body } => {
+                let new_depth = depth + vars.len() as u32;
+                Guarded::GGuarded {
+                    qua: qua.clone(),
+                    vars: vars.clone(),
+                    guards: guards.iter()
+                        .map(|a| subst_free_atom_at_depth(a, s, new_depth))
+                        .collect(),
+                    body: Box::new(rec(body, s, new_depth)),
+                }
+            }
+        }
+    }
+    rec(g, s, 0)
+}
+
+/// Mirror HS `substBound :: [(Integer, LVar)] -> LGuarded c -> LGuarded c`.
+///
+/// Walks the Guarded tracking scope depth.  At each atom, replaces each
+/// `Bound(n)` matching some `(i, v)` in `s` (where `n = i + depth`) with
+/// `Free(v)`.
+pub fn subst_bound_guarded(g: &Guarded, s: &[(u32, p::VarSpec)]) -> Guarded {
+    fn rec(g: &Guarded, s: &[(u32, p::VarSpec)], depth: u32) -> Guarded {
+        match g {
+            Guarded::Atom(a) => Guarded::Atom(subst_bound_atom_at_depth(a, s, depth)),
+            Guarded::Disj(items) =>
+                Guarded::Disj(items.iter().map(|i| rec(i, s, depth)).collect()),
+            Guarded::Conj(items) =>
+                Guarded::Conj(items.iter().map(|i| rec(i, s, depth)).collect()),
+            Guarded::GGuarded { qua, vars, guards, body } => {
+                let new_depth = depth + vars.len() as u32;
+                Guarded::GGuarded {
+                    qua: qua.clone(),
+                    vars: vars.clone(),
+                    guards: guards.iter()
+                        .map(|a| subst_bound_atom_at_depth(a, s, new_depth))
+                        .collect(),
+                    body: Box::new(rec(body, s, new_depth)),
+                }
+            }
+        }
+    }
+    rec(g, s, 0)
+}
+
+// =============================================================================
 // Polarity-aware conversion
 // =============================================================================
 
@@ -329,7 +713,8 @@ fn convert(polarity: bool, f: &p::Formula) -> Result<Guarded, GuardError> {
         p::Formula::True => Ok(gtf(polarity != true)),
         p::Formula::False => Ok(gtf(polarity != false)),
         p::Formula::Atom(a) => {
-            if polarity { Ok(gnot_atom(a)) } else { Ok(Guarded::Atom(a.clone())) }
+            let ga = atom_to_gatom_free(a);
+            if polarity { Ok(gnot_atom(&ga)) } else { Ok(Guarded::Atom(ga)) }
         }
         p::Formula::Not(g) => convert(!polarity, g),
         p::Formula::And(a, b) => {
@@ -427,12 +812,7 @@ fn convert_ex(
         converted.push(convert(polarity, f)?);
     }
     let body_guarded = if polarity { gdisj(converted) } else { gconj(converted) };
-    Ok(Guarded::GGuarded {
-        qua: out_qua,
-        vars: xs.to_vec(),
-        guards: atoms,
-        body: Box::new(body_guarded),
-    })
+    Ok(close_guarded(out_qua, xs.to_vec(), atoms, body_guarded))
 }
 
 /// Body-is-implication case (universal-shaped). The antecedent is
@@ -457,14 +837,48 @@ fn convert_all(
         }
         sub.push(convert(polarity, succ)?);
         let body_guarded = if polarity { gconj(sub) } else { gdisj(sub) };
-        Ok(Guarded::GGuarded {
-            qua: out_qua,
-            vars: xs.to_vec(),
-            guards: atoms,
-            body: Box::new(body_guarded),
-        })
+        Ok(close_guarded(out_qua, xs.to_vec(), atoms, body_guarded))
     } else {
         Err(err("universal quantifier without toplevel implication"))
+    }
+}
+
+/// Mirror HS `closeGuarded :: Quantifier -> [LVar] -> [Atom] -> LGuarded -> LGuarded`.
+///
+/// Takes named LVars `xs`, parser-AST atoms `atoms`, and an already-built
+/// body `gf`.  Closes the binder:
+///   - Lifts each atom from `p::Atom` to `GAtom` (initially all Free).
+///   - Substitutes every Free LVar matching `xs[i]` with `Bound(k-1-i)` in
+///     the atoms (depth 0) and the body (depth-tracked through nested
+///     binders).
+///   - Strips the binder list down to `(name, sort)` pairs (`GBinding`).
+///
+/// HS:
+/// ```text
+///   closeGuarded qua vs as gf = ((case qua of Ex -> gex; All -> gall) vs' as' gf'
+///     where  as'   = map (substFreeAtom s . fmap (fmapTerm (fmap Free))) as
+///            gf'   = substFree s gf
+///            s     = zip (reverse vs) [0..]
+///            vs'   = map (lvarName &&& lvarSort) vs
+/// ```
+pub fn close_guarded(
+    qua: Quant,
+    xs: Vec<p::VarSpec>,
+    atoms: Vec<p::Atom>,
+    body: Guarded,
+) -> Guarded {
+    let close_s = close_subst(&xs);
+    let new_guards: Vec<GAtom> = atoms.iter()
+        .map(|a| {
+            let ga = atom_to_gatom_free(a);
+            subst_free_atom_at_depth(&ga, &close_s, 0)
+        })
+        .collect();
+    let new_body = subst_free_guarded(&body, &close_s);
+    let vs: Vec<GBinding> = xs.iter().map(lvar_to_binding).collect();
+    match qua {
+        Quant::Ex => gex(vs, new_guards, new_body),
+        Quant::All => gall(vs, new_guards, new_body),
     }
 }
 
@@ -550,7 +964,7 @@ fn unguarded_error(vars: &[p::VarSpec]) -> GuardError {
 /// Less is undefined between Msg/Fresh/Pub terms; the Ex form is
 /// semantically False rather than ¬Action.  See `Guarded.hs:408-410`
 /// vs `Guarded.hs:614-616`.)
-fn gnot_atom(a: &p::Atom) -> Guarded {
+fn gnot_atom(a: &GAtom) -> Guarded {
     Guarded::GGuarded {
         qua: Quant::All,
         vars: Vec::new(),
@@ -598,137 +1012,16 @@ pub fn normalize_witness_lvars(g: &Guarded) -> Guarded {
     subst_guarded(g, &subst)
 }
 
-/// Alpha-canonicalize `GGuarded` bound-variable idxs.
+/// `normalize_bound_lvars` from the pre-DeBruijn implementation has been
+/// REMOVED.  With HS-faithful DeBruijn bindings, alpha-equivalent formulas
+/// compare equal under structural `Eq` automatically — Bound vars carry no
+/// idx, so `Ex j:5. KU(s)@j:5` and `Ex j:6. KU(s)@j:6` both yield
+/// `GGuarded { vars: [(j, Node)], body: ... Bound(0) ... }`.
 ///
-/// Background: Haskell's `Guarded` uses DeBruijn-bound vars (`BVar
-/// Bound`), so two alpha-equivalent formulas — say `Ex j:5. KU(s)@j:5`
-/// and `Ex j:6. KU(s)@j:6` produced by impliedFormulas across separate
-/// firings — are structurally identical (the bound index doesn't show
-/// up in the term tree). HS's `S.member` dedup works trivially.
-///
-/// Rust represents bound vars as `VarSpec` (free vars masquerading as
-/// bound) so `freshen_system` (sources.rs:4042+) which shifts ALL
-/// VarSpec idxs also shifts bound-var idxs. After freshening, the
-/// stored universal's body has bound `j:K` for some non-zero K. When
-/// impl_formulas re-fires across iterations, each firing produces a
-/// `Disj([Ex j:Ki, ...])` with a different bound idx Ki, none of which
-/// matches the previously-stored `j:Kj` under structural equality.
-///
-/// This breaks dedup — the same source-assertion Disj gets inserted
-/// many times as alpha-equivalent copies, each producing its own
-/// `Goal::Disj` and an extra `solve / case_1` step in the proof tree.
-/// Trigger: NSLPK3_untagged::nonce_secrecy line 7.
-///
-/// Fix: a scope-aware traversal that allocates canonical idxs (from a
-/// fresh per-call counter) to each `GGuarded`'s bound vars and rewrites
-/// references inside guards + body accordingly. Two alpha-equivalent
-/// formulas produce IDENTICAL canonical output because the walk is
-/// deterministic and the counter starts at the same value.
-///
-/// Free vars are preserved (the canonical counter starts well above
-/// any real free-var idx so shifts can't collide). Names are not
-/// touched — only the same-universal-different-allocation case
-/// matters in practice; truly different bound-var names should NOT
-/// merge under this normalization.
+/// Kept as a no-op stub for any straggling caller; will be deleted once
+/// every site is migrated.
 pub fn normalize_bound_lvars(g: &Guarded) -> Guarded {
-    // Per-call counter; high baseline so any system free-var idx
-    // (typically <1M after freshen) remains untouched on lookup.
-    let mut next_idx: u64 = 1_000_000_000;
-    let mut scope: Vec<std::collections::HashMap<(String, u64), p::VarSpec>> = Vec::new();
-    rec_g(g, &mut scope, &mut next_idx)
-}
-
-fn rec_g(
-    g: &Guarded,
-    scope: &mut Vec<std::collections::HashMap<(String, u64), p::VarSpec>>,
-    next_idx: &mut u64,
-) -> Guarded {
-    match g {
-        Guarded::Atom(a) => Guarded::Atom(rec_a(a, scope)),
-        Guarded::Disj(items) =>
-            Guarded::Disj(items.iter().map(|i| rec_g(i, scope, next_idx)).collect()),
-        Guarded::Conj(items) =>
-            Guarded::Conj(items.iter().map(|i| rec_g(i, scope, next_idx)).collect()),
-        Guarded::GGuarded { qua, vars, guards, body } => {
-            let mut layer: std::collections::HashMap<(String, u64), p::VarSpec> =
-                std::collections::HashMap::new();
-            let mut new_vars = Vec::with_capacity(vars.len());
-            for v in vars {
-                let canon = p::VarSpec {
-                    name: v.name.clone(),
-                    idx: *next_idx,
-                    sort: v.sort,
-                    typ: v.typ.clone(),
-                };
-                *next_idx = next_idx.saturating_add(1);
-                layer.insert((v.name.clone(), v.idx), canon.clone());
-                new_vars.push(canon);
-            }
-            scope.push(layer);
-            let new_guards: Vec<p::Atom> = guards.iter().map(|a| rec_a(a, scope)).collect();
-            let new_body = rec_g(body, scope, next_idx);
-            scope.pop();
-            Guarded::GGuarded {
-                qua: qua.clone(),
-                vars: new_vars,
-                guards: new_guards,
-                body: Box::new(new_body),
-            }
-        }
-    }
-}
-
-fn rec_a(
-    a: &p::Atom,
-    scope: &[std::collections::HashMap<(String, u64), p::VarSpec>],
-) -> p::Atom {
-    use p::Atom;
-    match a {
-        Atom::Eq(s, t) => Atom::Eq(rec_t(s, scope), rec_t(t, scope)),
-        Atom::Less(s, t) => Atom::Less(rec_t(s, scope), rec_t(t, scope)),
-        Atom::LessMset(s, t) => Atom::LessMset(rec_t(s, scope), rec_t(t, scope)),
-        Atom::Subterm(s, t) => Atom::Subterm(rec_t(s, scope), rec_t(t, scope)),
-        Atom::Action(f, t) => {
-            let mut f2 = f.clone();
-            f2.args = f.args.iter().map(|a| rec_t(a, scope)).collect();
-            Atom::Action(f2, rec_t(t, scope))
-        }
-        Atom::Last(t) => Atom::Last(rec_t(t, scope)),
-        Atom::Pred(f) => {
-            let mut f2 = f.clone();
-            f2.args = f.args.iter().map(|a| rec_t(a, scope)).collect();
-            Atom::Pred(f2)
-        }
-    }
-}
-
-fn rec_t(
-    t: &p::Term,
-    scope: &[std::collections::HashMap<(String, u64), p::VarSpec>],
-) -> p::Term {
-    use p::Term;
-    match t {
-        Term::Var(v) => {
-            // Innermost-first lookup; only bound vars in scope get rewritten.
-            for layer in scope.iter().rev() {
-                if let Some(canon) = layer.get(&(v.name.clone(), v.idx)) {
-                    return Term::Var(canon.clone());
-                }
-            }
-            Term::Var(v.clone())
-        }
-        Term::App(name, args) => Term::App(
-            name.clone(), args.iter().map(|a| rec_t(a, scope)).collect()),
-        Term::Pair(items) => Term::Pair(items.iter().map(|i| rec_t(i, scope)).collect()),
-        Term::AlgApp(name, a, b) => Term::AlgApp(
-            name.clone(), Box::new(rec_t(a, scope)), Box::new(rec_t(b, scope))),
-        Term::Diff(a, b) => Term::Diff(
-            Box::new(rec_t(a, scope)), Box::new(rec_t(b, scope))),
-        Term::BinOp(op, a, b) => Term::BinOp(
-            *op, Box::new(rec_t(a, scope)), Box::new(rec_t(b, scope))),
-        Term::PatMatch(t) => Term::PatMatch(Box::new(rec_t(t, scope))),
-        other => other.clone(),
-    }
+    g.clone()
 }
 
 /// Normalize equivalent sort hints so two `Guarded` formulas that
@@ -764,49 +1057,53 @@ pub fn normalize_sort_hints(g: &Guarded) -> Guarded {
             | p::SortHint::Untagged => p::SortHint::Msg,
         }
     }
-    fn norm_var(v: &p::VarSpec) -> p::VarSpec {
-        p::VarSpec {
-            name: v.name.clone(),
-            idx: v.idx,
-            sort: norm_sort(v.sort),
-            typ: v.typ.clone(),
+    fn norm_binding(b: &GBinding) -> GBinding {
+        GBinding { name: b.name.clone(), sort: norm_sort(b.sort) }
+    }
+    fn norm_bvar(b: &BVar) -> BVar {
+        match b {
+            BVar::Bound(n) => BVar::Bound(*n),
+            BVar::Free(v) => BVar::Free(p::VarSpec {
+                name: v.name.clone(),
+                idx: v.idx,
+                sort: norm_sort(v.sort),
+                typ: v.typ.clone(),
+            }),
         }
     }
-    fn norm_term(t: &p::Term) -> p::Term {
-        use p::Term;
+    fn norm_term(t: &GTerm) -> GTerm {
         match t {
-            Term::Var(v) => Term::Var(norm_var(v)),
-            Term::App(n, args) => Term::App(
+            GTerm::Var(b) => GTerm::Var(norm_bvar(b)),
+            GTerm::App(n, args) => GTerm::App(
                 n.clone(), args.iter().map(norm_term).collect()),
-            Term::Pair(args) => Term::Pair(args.iter().map(norm_term).collect()),
-            Term::AlgApp(n, a, b) => Term::AlgApp(
+            GTerm::Pair(args) => GTerm::Pair(args.iter().map(norm_term).collect()),
+            GTerm::AlgApp(n, a, b) => GTerm::AlgApp(
                 n.clone(), Box::new(norm_term(a)), Box::new(norm_term(b))),
-            Term::Diff(a, b) => Term::Diff(
+            GTerm::Diff(a, b) => GTerm::Diff(
                 Box::new(norm_term(a)), Box::new(norm_term(b))),
-            Term::BinOp(op, a, b) => Term::BinOp(
+            GTerm::BinOp(op, a, b) => GTerm::BinOp(
                 *op, Box::new(norm_term(a)), Box::new(norm_term(b))),
-            Term::PatMatch(inner) => Term::PatMatch(Box::new(norm_term(inner))),
+            GTerm::PatMatch(inner) => GTerm::PatMatch(Box::new(norm_term(inner))),
             _ => t.clone(),
         }
     }
-    fn norm_fact(f: &p::Fact) -> p::Fact {
-        p::Fact {
+    fn norm_fact(f: &GFact) -> GFact {
+        GFact {
             persistent: f.persistent,
             name: f.name.clone(),
             args: f.args.iter().map(norm_term).collect(),
             annotations: f.annotations.clone(),
         }
     }
-    fn norm_atom(a: &p::Atom) -> p::Atom {
-        use p::Atom;
+    fn norm_atom(a: &GAtom) -> GAtom {
         match a {
-            Atom::Action(f, t) => Atom::Action(norm_fact(f), norm_term(t)),
-            Atom::Eq(x, y) => Atom::Eq(norm_term(x), norm_term(y)),
-            Atom::Less(x, y) => Atom::Less(norm_term(x), norm_term(y)),
-            Atom::LessMset(x, y) => Atom::LessMset(norm_term(x), norm_term(y)),
-            Atom::Subterm(x, y) => Atom::Subterm(norm_term(x), norm_term(y)),
-            Atom::Last(t) => Atom::Last(norm_term(t)),
-            Atom::Pred(f) => Atom::Pred(norm_fact(f)),
+            GAtom::Action(f, t) => GAtom::Action(norm_fact(f), norm_term(t)),
+            GAtom::Eq(x, y) => GAtom::Eq(norm_term(x), norm_term(y)),
+            GAtom::Less(x, y) => GAtom::Less(norm_term(x), norm_term(y)),
+            GAtom::LessMset(x, y) => GAtom::LessMset(norm_term(x), norm_term(y)),
+            GAtom::Subterm(x, y) => GAtom::Subterm(norm_term(x), norm_term(y)),
+            GAtom::Last(t) => GAtom::Last(norm_term(t)),
+            GAtom::Pred(f) => GAtom::Pred(norm_fact(f)),
         }
     }
     fn rec(g: &Guarded) -> Guarded {
@@ -816,7 +1113,7 @@ pub fn normalize_sort_hints(g: &Guarded) -> Guarded {
             Guarded::Conj(items) => Guarded::Conj(items.iter().map(rec).collect()),
             Guarded::GGuarded { qua, vars, guards, body } => Guarded::GGuarded {
                 qua: qua.clone(),
-                vars: vars.iter().map(norm_var).collect(),
+                vars: vars.iter().map(norm_binding).collect(),
                 guards: guards.iter().map(norm_atom).collect(),
                 body: Box::new(rec(body)),
             },
@@ -838,29 +1135,27 @@ fn collect_witness_vars(g: &Guarded, out: &mut VarSubst) {
     }
 }
 
-fn collect_witness_vars_atom(a: &p::Atom, out: &mut VarSubst) {
-    use p::Atom;
+fn collect_witness_vars_atom(a: &GAtom, out: &mut VarSubst) {
     match a {
-        Atom::Eq(x, y) | Atom::Less(x, y) | Atom::LessMset(x, y)
-        | Atom::Subterm(x, y) => {
+        GAtom::Eq(x, y) | GAtom::Less(x, y) | GAtom::LessMset(x, y)
+        | GAtom::Subterm(x, y) => {
             collect_witness_vars_term(x, out);
             collect_witness_vars_term(y, out);
         }
-        Atom::Action(f, t) => {
+        GAtom::Action(f, t) => {
             for arg in &f.args { collect_witness_vars_term(arg, out); }
             collect_witness_vars_term(t, out);
         }
-        Atom::Last(t) => collect_witness_vars_term(t, out),
-        Atom::Pred(f) => {
+        GAtom::Last(t) => collect_witness_vars_term(t, out),
+        GAtom::Pred(f) => {
             for arg in &f.args { collect_witness_vars_term(arg, out); }
         }
     }
 }
 
-fn collect_witness_vars_term(t: &p::Term, out: &mut VarSubst) {
-    use p::Term;
+fn collect_witness_vars_term(t: &GTerm, out: &mut VarSubst) {
     match t {
-        Term::Var(v) => {
+        GTerm::Var(BVar::Free(v)) => {
             if v.name == "x" {
                 let canonical = p::VarSpec {
                     name: v.name.clone(),
@@ -868,20 +1163,21 @@ fn collect_witness_vars_term(t: &p::Term, out: &mut VarSubst) {
                     sort: v.sort,
                     typ: v.typ.clone(),
                 };
-                out.insert((v.name.clone(), v.idx), Term::Var(canonical));
+                out.insert((v.name.clone(), v.idx), p::Term::Var(canonical));
             }
         }
-        Term::App(_, args) | Term::Pair(args) => {
+        GTerm::Var(BVar::Bound(_)) => {}  // bound vars have no LVar idx
+        GTerm::App(_, args) | GTerm::Pair(args) => {
             for a in args { collect_witness_vars_term(a, out); }
         }
-        Term::AlgApp(_, a, b) | Term::Diff(a, b) | Term::BinOp(_, a, b) => {
+        GTerm::AlgApp(_, a, b) | GTerm::Diff(a, b) | GTerm::BinOp(_, a, b) => {
             collect_witness_vars_term(a, out);
             collect_witness_vars_term(b, out);
         }
-        Term::PatMatch(t) => collect_witness_vars_term(t, out),
-        Term::PubLit(_) | Term::FreshLit(_) | Term::NatLit(_)
-        | Term::Number(_) | Term::NumberOne | Term::NatOne
-        | Term::DhNeutral => {}
+        GTerm::PatMatch(t) => collect_witness_vars_term(t, out),
+        GTerm::PubLit(_) | GTerm::FreshLit(_) | GTerm::NatLit(_)
+        | GTerm::Number(_) | GTerm::NumberOne | GTerm::NatOne
+        | GTerm::DhNeutral => {}
     }
 }
 
@@ -961,190 +1257,128 @@ pub fn subst_atom(a: &p::Atom, s: &VarSubst) -> p::Atom {
 }
 
 /// Apply a `VarSubst` to a guarded formula. Substitutes through
-/// guards, body, and every nested term/atom — but does NOT descend
-/// into a nested `GGuarded` whose `vars` shadow names in `s` (those
-/// references aren't free).
+/// guards, body, and every nested term/atom — but only Free LVar
+/// leaves (Bound vars are positional and cannot collide).
 ///
-/// Capture-avoiding: if a binder's bound var would be captured by a
-/// free var in the substitution's range, the bound var is alpha-
-/// renamed to a fresh idx first.  Without this, an LVar substitution
-/// like `j:Node:2 → i:Node:0` applied to a formula
-/// `∀ i:0. body[i, j:2]` would conflate the free `j:2` (now `i:0`)
-/// with the bound `i:0` — the chaum_unforgeability wrong-falsified
-/// root cause.
+/// With HS-faithful DeBruijn bindings, the elaborate capture-avoidance
+/// dance of the pre-migration code is unnecessary: Bound vars carry no
+/// LVar idx, so a free-var substitution cannot accidentally capture them.
+/// Mirrors HS `applySkGuarded subst = mapGuardedAtoms (const $ apply subst)`.
 pub fn subst_guarded(g: &Guarded, s: &VarSubst) -> Guarded {
-    // Hot path: empty subst → no-op clone.
     if s.is_empty() { return g.clone(); }
-    // Precompute the subst's range free vars once.  Captures can
-    // only occur for names that appear free in the subst's range
-    // values.
-    let mut range_free: std::collections::HashSet<(String, u64)>
-        = std::collections::HashSet::new();
-    for (_, t) in s.iter() {
-        collect_term_vars(t, &mut range_free);
-    }
-    subst_guarded_inner(g, s, &range_free)
+    subst_guarded_inner(g, s)
 }
 
-fn subst_guarded_inner(
-    g: &Guarded,
-    s: &VarSubst,
-    range_free: &std::collections::HashSet<(String, u64)>,
-) -> Guarded {
+fn subst_guarded_inner(g: &Guarded, s: &VarSubst) -> Guarded {
     match g {
-        Guarded::Atom(a) => Guarded::Atom(subst_atom(a, s)),
+        Guarded::Atom(a) => Guarded::Atom(subst_gatom(a, s)),
         Guarded::Disj(items) =>
-            Guarded::Disj(items.iter().map(|i| subst_guarded_inner(i, s, range_free)).collect()),
+            Guarded::Disj(items.iter().map(|i| subst_guarded_inner(i, s)).collect()),
         Guarded::Conj(items) =>
-            Guarded::Conj(items.iter().map(|i| subst_guarded_inner(i, s, range_free)).collect()),
-        Guarded::GGuarded { qua, vars, guards, body } => {
-            // Drop substitutions for any var shadowed by this binder.
-            let shadowed: std::collections::HashSet<(String, u64)> = vars.iter()
-                .map(|v| (v.name.clone(), v.idx))
-                .collect();
-            let s_filtered: VarSubst = s.iter()
-                .filter(|((n, i), _)| !shadowed.contains(&(n.clone(), *i)))
-                .map(|((n, i), v)| ((n.clone(), *i), v.clone()))
-                .collect();
-            // Capture check: bound vars that are free in the FILTERED
-            // subst's range.  Earlier we used the parent's `range_free`
-            // (computed from the FULL subst), which over-triggered the
-            // capture-avoidance: shadowed entries dropped here no
-            // longer apply, so their range values shouldn't influence
-            // capture detection.  Mirrors HS `applySkGuarded` semantics
-            // — DeBruijn-bound vars there are unaffected by free-var
-            // substitution, so no capture occurs.  Without this fix,
-            // a lemma's bound vars (`nr:0`, `ni:0`, `i:0`) get spuriously
-            // renamed to fresh idxs whenever ANY full-subst entry maps
-            // a (filtered-out) bound key to a value naming the same
-            // bound var — producing extra IMPL-FIRE matches that HS
-            // never emits (task #287, NSLPK3 line-105 cluster).
-            let filtered_range_free: std::collections::HashSet<(String, u64)> = {
-                let mut r = std::collections::HashSet::new();
-                for ((_, _), t) in s_filtered.iter() {
-                    collect_term_vars(t, &mut r);
-                }
-                r
-            };
-            let captures: Vec<(String, u64)> = vars.iter()
-                .map(|v| (v.name.clone(), v.idx))
-                .filter(|k| filtered_range_free.contains(k))
-                .collect();
-            if captures.is_empty() {
-                // Pass the filtered range_free down to the body — the
-                // parent's `range_free` would over-conservatively still
-                // include the dropped (shadowed) entries.
-                return Guarded::GGuarded {
-                    qua: qua.clone(),
-                    vars: vars.clone(),
-                    guards: guards.iter().map(|a| subst_atom(a, &s_filtered)).collect(),
-                    body: Box::new(subst_guarded_inner(body, &s_filtered, &filtered_range_free)),
-                };
-            }
-            // Allocate fresh idxs.  Use max(filtered_range_free.idx) + 1 as floor.
-            let mut next_idx: u64 = filtered_range_free.iter().map(|(_, i)| *i).max()
-                .unwrap_or(0).saturating_add(1);
-            // Also bump above any explicit idx in the binder vars.
-            for v in vars { if v.idx >= next_idx { next_idx = v.idx + 1; } }
-            let mut rename: VarSubst = VarSubst::new();
-            let mut new_vars: Vec<p::VarSpec> = Vec::with_capacity(vars.len());
-            for v in vars {
-                if captures.contains(&(v.name.clone(), v.idx)) {
-                    let new_v = p::VarSpec {
-                        name: v.name.clone(),
-                        idx: next_idx,
-                        sort: v.sort,
-                        typ: v.typ.clone(),
-                    };
-                    rename.insert(
-                        (v.name.clone(), v.idx),
-                        p::Term::Var(new_v.clone()));
-                    new_vars.push(new_v);
-                    next_idx = next_idx.saturating_add(1);
-                } else {
-                    new_vars.push(v.clone());
-                }
-            }
-            // Build a combined substitution: rename ∪ s_filtered.
-            // The rename keys are the OLD bound vars, mapping to new
-            // bound vars.  s_filtered's keys are the free vars from
-            // the eq-store.  Since the bound vars and free vars are
-            // disjoint (bound vars are now renamed to new idxs in
-            // the body's references), we can combine them.
-            let mut combined: VarSubst = s_filtered.clone();
-            for (k, v) in &rename {
-                combined.insert(k.clone(), v.clone());
-            }
-            // Recompute range_free for the combined subst — captures
-            // could compound if rename targets are already in range_free.
-            let mut combined_range_free: std::collections::HashSet<(String, u64)>
-                = filtered_range_free.clone();
-            for (_, t) in rename.iter() {
-                collect_term_vars(t, &mut combined_range_free);
-            }
-            Guarded::GGuarded {
-                qua: qua.clone(),
-                vars: new_vars,
-                guards: guards.iter().map(|a| subst_atom(a, &combined)).collect(),
-                body: Box::new(subst_guarded_inner(body, &combined, &combined_range_free)),
-            }
+            Guarded::Conj(items.iter().map(|i| subst_guarded_inner(i, s)).collect()),
+        Guarded::GGuarded { qua, vars, guards, body } => Guarded::GGuarded {
+            qua: qua.clone(),
+            vars: vars.clone(),
+            guards: guards.iter().map(|a| subst_gatom(a, s)).collect(),
+            body: Box::new(subst_guarded_inner(body, s)),
         }
     }
 }
 
-/// Collect (name, idx) of every variable that appears in a parser-AST term.
-fn collect_term_vars(t: &p::Term, out: &mut std::collections::HashSet<(String, u64)>) {
-    use p::Term;
+/// Substitute Free LVar leaves in a `GAtom`.  Replacement targets are
+/// parser-AST terms (`p::Term`), which we lift to `GTerm` with all-Free
+/// leaves — those Free LVars are at the system's top-level scope and
+/// cannot collide with any binder.
+pub fn subst_gatom(a: &GAtom, s: &VarSubst) -> GAtom {
+    match a {
+        GAtom::Eq(x, y) => GAtom::Eq(subst_gterm(x, s), subst_gterm(y, s)),
+        GAtom::Less(x, y) => GAtom::Less(subst_gterm(x, s), subst_gterm(y, s)),
+        GAtom::LessMset(x, y) => GAtom::LessMset(subst_gterm(x, s), subst_gterm(y, s)),
+        GAtom::Subterm(x, y) => GAtom::Subterm(subst_gterm(x, s), subst_gterm(y, s)),
+        GAtom::Action(f, t) => GAtom::Action(subst_gfact(f, s), subst_gterm(t, s)),
+        GAtom::Last(t) => GAtom::Last(subst_gterm(t, s)),
+        GAtom::Pred(f) => GAtom::Pred(subst_gfact(f, s)),
+    }
+}
+
+/// Substitute Free LVar leaves in a `GFact`.
+pub fn subst_gfact(f: &GFact, s: &VarSubst) -> GFact {
+    GFact {
+        persistent: f.persistent,
+        name: f.name.clone(),
+        args: f.args.iter().map(|a| subst_gterm(a, s)).collect(),
+        annotations: f.annotations.clone(),
+    }
+}
+
+/// Substitute Free LVar leaves in a `GTerm`.
+pub fn subst_gterm(t: &GTerm, s: &VarSubst) -> GTerm {
     match t {
-        Term::Var(v) => { out.insert((v.name.clone(), v.idx)); }
-        Term::App(_, args) | Term::Pair(args) => {
-            for a in args { collect_term_vars(a, out); }
+        GTerm::Var(BVar::Free(v)) => {
+            let key = (v.name.clone(), v.idx);
+            if let Some(target) = s.get(&key) {
+                term_to_gterm_free(target)
+            } else {
+                GTerm::Var(BVar::Free(v.clone()))
+            }
         }
-        Term::AlgApp(_, a, b) | Term::Diff(a, b) | Term::BinOp(_, a, b) => {
-            collect_term_vars(a, out); collect_term_vars(b, out);
-        }
-        Term::PatMatch(t) => collect_term_vars(t, out),
-        Term::PubLit(_) | Term::FreshLit(_) | Term::NatLit(_)
-        | Term::Number(_) | Term::NumberOne | Term::NatOne | Term::DhNeutral => {}
+        GTerm::Var(b) => GTerm::Var(b.clone()),
+        GTerm::PubLit(s_) => GTerm::PubLit(s_.clone()),
+        GTerm::FreshLit(s_) => GTerm::FreshLit(s_.clone()),
+        GTerm::NatLit(s_) => GTerm::NatLit(s_.clone()),
+        GTerm::Number(n) => GTerm::Number(*n),
+        GTerm::NumberOne => GTerm::NumberOne,
+        GTerm::NatOne => GTerm::NatOne,
+        GTerm::DhNeutral => GTerm::DhNeutral,
+        GTerm::App(n, args) =>
+            GTerm::App(n.clone(), args.iter().map(|a| subst_gterm(a, s)).collect()),
+        GTerm::AlgApp(n, a, b) => GTerm::AlgApp(
+            n.clone(), Box::new(subst_gterm(a, s)), Box::new(subst_gterm(b, s))),
+        GTerm::Pair(items) =>
+            GTerm::Pair(items.iter().map(|i| subst_gterm(i, s)).collect()),
+        GTerm::Diff(a, b) => GTerm::Diff(
+            Box::new(subst_gterm(a, s)), Box::new(subst_gterm(b, s))),
+        GTerm::BinOp(op, a, b) => GTerm::BinOp(
+            *op, Box::new(subst_gterm(a, s)), Box::new(subst_gterm(b, s))),
+        GTerm::PatMatch(t) => GTerm::PatMatch(Box::new(subst_gterm(t, s))),
     }
 }
 
 /// Find the maximum variable idx used in a guarded formula. Used
 /// to allocate fresh indices without collisions.
 pub fn max_var_idx(g: &Guarded) -> u64 {
-    fn rec_term(t: &p::Term, m: &mut u64) {
-        use p::Term;
+    fn rec_term(t: &GTerm, m: &mut u64) {
         match t {
-            Term::Var(v) => { if v.idx > *m { *m = v.idx; } }
-            Term::App(_, args) | Term::Pair(args) => {
+            GTerm::Var(BVar::Free(v)) => { if v.idx > *m { *m = v.idx; } }
+            GTerm::Var(BVar::Bound(_)) => {}
+            GTerm::App(_, args) | GTerm::Pair(args) => {
                 for a in args { rec_term(a, m); }
             }
-            Term::AlgApp(_, a, b) | Term::Diff(a, b) | Term::BinOp(_, a, b) => {
+            GTerm::AlgApp(_, a, b) | GTerm::Diff(a, b) | GTerm::BinOp(_, a, b) => {
                 rec_term(a, m); rec_term(b, m);
             }
-            Term::PatMatch(t) => rec_term(t, m),
+            GTerm::PatMatch(t) => rec_term(t, m),
             _ => {}
         }
     }
-    fn rec_atom(a: &p::Atom, m: &mut u64) {
-        use p::Atom;
+    fn rec_atom(a: &GAtom, m: &mut u64) {
         match a {
-            Atom::Eq(x, y) | Atom::Less(x, y) | Atom::LessMset(x, y)
-            | Atom::Subterm(x, y) => { rec_term(x, m); rec_term(y, m); }
-            Atom::Action(f, t) => {
+            GAtom::Eq(x, y) | GAtom::Less(x, y) | GAtom::LessMset(x, y)
+            | GAtom::Subterm(x, y) => { rec_term(x, m); rec_term(y, m); }
+            GAtom::Action(f, t) => {
                 for arg in &f.args { rec_term(arg, m); }
                 rec_term(t, m);
             }
-            Atom::Last(t) => rec_term(t, m),
-            Atom::Pred(f) => for a in &f.args { rec_term(a, m); },
+            GAtom::Last(t) => rec_term(t, m),
+            GAtom::Pred(f) => for a in &f.args { rec_term(a, m); },
         }
     }
     fn rec(g: &Guarded, m: &mut u64) {
         match g {
             Guarded::Atom(a) => rec_atom(a, m),
             Guarded::Disj(xs) | Guarded::Conj(xs) => for x in xs { rec(x, m); },
-            Guarded::GGuarded { vars, guards, body, .. } => {
-                for v in vars { if v.idx > *m { *m = v.idx; } }
+            Guarded::GGuarded { guards, body, .. } => {
+                // Bindings carry no idx in the DeBruijn representation.
                 for a in guards { rec_atom(a, m); }
                 rec(body, m);
             }
@@ -1217,11 +1451,11 @@ pub fn satisfied_by_empty_trace(g: &Guarded) -> Result<bool, String> {
 /// `containsAction` from Haskell's `ginduct`.
 pub fn contains_action(g: &Guarded) -> bool {
     match g {
-        Guarded::Atom(a) => matches!(a, p::Atom::Action(_, _)),
+        Guarded::Atom(a) => matches!(a, GAtom::Action(_, _)),
         Guarded::Disj(xs) | Guarded::Conj(xs) => xs.iter().any(contains_action),
         Guarded::GGuarded { guards, body, .. } => {
             !guards.is_empty()
-                || guards.iter().any(|a| matches!(a, p::Atom::Action(_, _)))
+                || guards.iter().any(|a| matches!(a, GAtom::Action(_, _)))
                 || contains_action(body)
         }
     }
@@ -1233,8 +1467,8 @@ fn is_closed(g: &Guarded) -> bool {
 }
 
 /// Test whether an atom is a `Last(_)` predicate.
-fn is_last_atom(a: &p::Atom) -> bool {
-    matches!(a, p::Atom::Last(_))
+fn is_last_atom(a: &GAtom) -> bool {
+    matches!(a, GAtom::Last(_))
 }
 
 /// `toInductionHypothesis`: rewrite a doubly guarded formula into its
@@ -1259,12 +1493,18 @@ pub fn to_induction_hypothesis(g: &Guarded) -> Result<Guarded, String> {
             // Without `.rev()`, our disj order is [#i, #j] (matches HS
             // case_2 first), inverting `case_1`/`case_2` labels for the
             // `last`-disjunction split and breaking proof-tree shape diff.
-            let last_atos: Vec<Guarded> = vars.iter().rev()
-                .filter(|v| matches!(
+            // HS `lastAtos = do (j, (_, LSortNode)) <- zip [0..] (reverse ss);
+            //                   return $ Last (varTerm (Bound j))`.
+            // Iterate vars inner-to-outer (rev), filter to node-sorted,
+            // assign DeBruijn `j = 0, 1, ...` in that order.
+            let last_atos: Vec<Guarded> = vars.iter().rev().enumerate()
+                .filter(|(_, v)| matches!(
                     v.sort,
                     p::SortHint::Node | p::SortHint::Suffix(p::SuffixSort::Node)
                 ))
-                .map(|v| Guarded::Atom(p::Atom::Last(p::Term::Var(v.clone()))))
+                .map(|(j, _)| {
+                    Guarded::Atom(GAtom::Last(GTerm::Var(BVar::Bound(j as u32))))
+                })
                 .collect();
             match qua {
                 Quant::All => {
@@ -1282,11 +1522,11 @@ pub fn to_induction_hypothesis(g: &Guarded) -> Result<Guarded, String> {
                 }
             }
         }
-        Guarded::Atom(p::Atom::Less(i, j)) => Ok(Guarded::Disj(vec![
-            Guarded::Atom(p::Atom::Eq(i.clone(), j.clone())),
-            Guarded::Atom(p::Atom::Less(j.clone(), i.clone())),
+        Guarded::Atom(GAtom::Less(i, j)) => Ok(Guarded::Disj(vec![
+            Guarded::Atom(GAtom::Eq(i.clone(), j.clone())),
+            Guarded::Atom(GAtom::Less(j.clone(), i.clone())),
         ])),
-        Guarded::Atom(p::Atom::Last(_)) => Err("formula not last-free".to_string()),
+        Guarded::Atom(GAtom::Last(_)) => Err("formula not last-free".to_string()),
         Guarded::Atom(a) => Ok(gnot_atom(a)),
         Guarded::Disj(xs) => {
             let xs2 = xs.iter()
@@ -1333,105 +1573,25 @@ pub fn ginduct(g: &Guarded) -> Result<(Guarded, Guarded), String> {
 pub fn map_lvars_in_guarded<F>(g: &Guarded, mut f: F) -> Guarded
 where F: FnMut(&p::VarSpec) -> p::VarSpec,
 {
-    fn map_term<F>(
-        t: &p::Term,
-        f: &mut F,
-        bound: &std::collections::HashSet<(String, u64)>,
-    ) -> p::Term
-    where F: FnMut(&p::VarSpec) -> p::VarSpec,
-    {
-        match t {
-            p::Term::Var(v) => {
-                if bound.contains(&(v.name.clone(), v.idx)) {
-                    p::Term::Var(v.clone())
-                } else {
-                    p::Term::Var(f(v))
-                }
-            }
-            p::Term::App(name, args) =>
-                p::Term::App(name.clone(),
-                    args.iter().map(|a| map_term(a, f, bound)).collect()),
-            p::Term::AlgApp(name, a, b) =>
-                p::Term::AlgApp(name.clone(),
-                    Box::new(map_term(a, f, bound)),
-                    Box::new(map_term(b, f, bound))),
-            p::Term::Pair(args) =>
-                p::Term::Pair(args.iter().map(|a| map_term(a, f, bound)).collect()),
-            p::Term::Diff(a, b) =>
-                p::Term::Diff(
-                    Box::new(map_term(a, f, bound)),
-                    Box::new(map_term(b, f, bound))),
-            p::Term::BinOp(op, a, b) =>
-                p::Term::BinOp(*op,
-                    Box::new(map_term(a, f, bound)),
-                    Box::new(map_term(b, f, bound))),
-            p::Term::PatMatch(inner) =>
-                p::Term::PatMatch(Box::new(map_term(inner, f, bound))),
-            other => other.clone(),
-        }
-    }
-    fn map_fact<F>(
-        fa: &p::Fact,
-        f: &mut F,
-        bound: &std::collections::HashSet<(String, u64)>,
-    ) -> p::Fact
-    where F: FnMut(&p::VarSpec) -> p::VarSpec,
-    {
-        p::Fact {
-            persistent: fa.persistent,
-            name: fa.name.clone(),
-            args: fa.args.iter().map(|a| map_term(a, f, bound)).collect(),
-            annotations: fa.annotations.clone(),
-        }
-    }
-    fn map_atom<F>(
-        a: &p::Atom,
-        f: &mut F,
-        bound: &std::collections::HashSet<(String, u64)>,
-    ) -> p::Atom
-    where F: FnMut(&p::VarSpec) -> p::VarSpec,
-    {
-        match a {
-            p::Atom::Eq(t1, t2) =>
-                p::Atom::Eq(map_term(t1, f, bound), map_term(t2, f, bound)),
-            p::Atom::Less(t1, t2) =>
-                p::Atom::Less(map_term(t1, f, bound), map_term(t2, f, bound)),
-            p::Atom::LessMset(t1, t2) =>
-                p::Atom::LessMset(map_term(t1, f, bound), map_term(t2, f, bound)),
-            p::Atom::Subterm(t1, t2) =>
-                p::Atom::Subterm(map_term(t1, f, bound), map_term(t2, f, bound)),
-            p::Atom::Action(fa, t) =>
-                p::Atom::Action(map_fact(fa, f, bound), map_term(t, f, bound)),
-            p::Atom::Last(t) => p::Atom::Last(map_term(t, f, bound)),
-            p::Atom::Pred(fa) => p::Atom::Pred(map_fact(fa, f, bound)),
-        }
-    }
-    fn rec<F>(
-        g: &Guarded,
-        f: &mut F,
-        bound: &std::collections::HashSet<(String, u64)>,
-    ) -> Guarded
-    where F: FnMut(&p::VarSpec) -> p::VarSpec,
-    {
+    // With DeBruijn bindings, only `BVar::Free` leaves carry an LVar
+    // identity — `Bound` is positional and skipped automatically.
+    // No bound-set tracking needed.
+    fn rec<G: FnMut(&p::VarSpec) -> p::VarSpec>(g: &Guarded, f: &mut G) -> Guarded {
         match g {
-            Guarded::Atom(a) => Guarded::Atom(map_atom(a, f, bound)),
+            Guarded::Atom(a) => Guarded::Atom(map_free_atom(a, f)),
             Guarded::Disj(items) =>
-                Guarded::Disj(items.iter().map(|i| rec(i, f, bound)).collect()),
+                Guarded::Disj(items.iter().map(|i| rec(i, f)).collect()),
             Guarded::Conj(items) =>
-                Guarded::Conj(items.iter().map(|i| rec(i, f, bound)).collect()),
-            Guarded::GGuarded { qua, vars, guards, body } => {
-                let mut new_bound = bound.clone();
-                for v in vars { new_bound.insert((v.name.clone(), v.idx)); }
-                Guarded::GGuarded {
-                    qua: qua.clone(),
-                    vars: vars.clone(),
-                    guards: guards.iter().map(|a| map_atom(a, f, &new_bound)).collect(),
-                    body: Box::new(rec(body, f, &new_bound)),
-                }
+                Guarded::Conj(items.iter().map(|i| rec(i, f)).collect()),
+            Guarded::GGuarded { qua, vars, guards, body } => Guarded::GGuarded {
+                qua: qua.clone(),
+                vars: vars.clone(),
+                guards: guards.iter().map(|a| map_free_atom(a, f)).collect(),
+                body: Box::new(rec(body, f)),
             }
         }
     }
-    rec(g, &mut f, &std::collections::HashSet::new())
+    rec(g, &mut f)
 }
 
 // =============================================================================
@@ -1665,10 +1825,25 @@ mod tests {
         assert_eq!(result, expected);
     }
 
+    /// Regression test for the binder-sort-mismatch bug found during the
+    /// DeBruijn migration: the parser produces `Ex #i. P @ i` with the
+    /// binder as `Node` and the body's `i` as `Untagged`.  `close_subst`
+    /// must match by `(name, idx)` only — full `VarSpec` equality would
+    /// leave the body's `i` Free, breaking `is_closed` / `ginduct`.
+    #[test]
+    fn injectivity_check_ginduct_succeeds() {
+        let f = parse_formula_str("not (Ex id #i #j #k. Initiated(id) @ i & Removed(id) @ j & Copied(id) @ k & #i < #j & #j < #k)").expect("parse");
+        let g = formula_to_guarded(&f).expect("guarded");
+        let g_neg = gnot(&g);
+        assert!(free_vars(&g_neg).is_empty(), "gnot should be closed");
+        assert!(ginduct(&g_neg).is_ok(), "ginduct should succeed");
+    }
+
     #[test]
     fn varsubst_shadowing_blocks_inner_binder() {
-        // `Ex k. Action(k)` — substituting `k` from outside should
-        // NOT rewrite the inner `k` because it's freshly bound.
+        // `Ex k. Action(k) @ i` — substituting `k` from outside should
+        // NOT rewrite the inner `k` because it's positionally bound
+        // (DeBruijn `Bound(0)` in the body, not Free LVar `k:0`).
         let mut s = VarSubst::new();
         s.insert(("k".into(), 0), pubconst("OUTER"));
         let inner_k = p::VarSpec { name: "k".into(), idx: 0, sort: p::SortHint::Msg, typ: None };
@@ -1678,23 +1853,30 @@ mod tests {
             name: "Action".into(),
             args: vec![t],
         };
-        let inner_atom = Guarded::Atom(p::Atom::Action(
-            mkfact(var("k", 0)),
-            var("i", 0),
-        ));
-        let g = Guarded::GGuarded {
-            qua: Quant::Ex,
-            vars: vec![inner_k.clone()],
-            guards: Vec::new(),
-            body: Box::new(inner_atom.clone()),
-        };
+        // Build via close_guarded so that `k` becomes Bound(0) in the body.
+        let g = close_guarded(
+            Quant::Ex,
+            vec![inner_k.clone()],
+            Vec::new(),
+            Guarded::Atom(atom_to_gatom_free(&p::Atom::Action(
+                mkfact(var("k", 0)),
+                var("i", 0),
+            ))),
+        );
         let result = subst_guarded(&g, &s);
-        // Body should be unchanged because `k` is shadowed by the
-        // existential binder.
+        // Body should be unchanged: subst on Free `(k, 0)` doesn't
+        // touch the Bound `k` reference.
         match result {
-            Guarded::GGuarded { body, .. } => {
-                assert_eq!(*body, inner_atom);
-            }
+            Guarded::GGuarded { body, .. } => match &*body {
+                Guarded::Atom(GAtom::Action(fa, _)) => {
+                    // Walk the body atom and verify the `k` slot is still Bound(0).
+                    match &fa.args[0] {
+                        GTerm::Var(BVar::Bound(0)) => {}
+                        other => panic!("expected Bound(0), got {:?}", other),
+                    }
+                }
+                other => panic!("expected Atom(Action), got {:?}", other),
+            },
             other => panic!("expected GGuarded, got {:?}", other),
         }
     }
@@ -1749,20 +1931,21 @@ mod tests {
             Guarded::GGuarded { qua, vars, body, .. } => {
                 assert_eq!(*qua, Quant::Ex);
                 assert_eq!(vars.len(), 1);
-                // Walk the body looking for an atom equal to Last(Var(#i)).
-                let target = p::Atom::Last(p::Term::Var(vars[0].clone()));
-                fn walks_to_last(g: &Guarded, t: &p::Atom) -> bool {
+                // Walk the body looking for a Last atom at the innermost
+                // binder.  In DeBruijn form, that's `Last(Bound(0))`.
+                fn walks_to_last_bound0(g: &Guarded) -> bool {
                     match g {
-                        Guarded::Atom(a) => a == t,
+                        Guarded::Atom(GAtom::Last(GTerm::Var(BVar::Bound(0)))) => true,
+                        Guarded::Atom(_) => false,
                         Guarded::Disj(xs) | Guarded::Conj(xs) =>
-                            xs.iter().any(|x| walks_to_last(x, t)),
+                            xs.iter().any(walks_to_last_bound0),
                         Guarded::GGuarded { guards, body, .. } =>
-                            guards.iter().any(|a| a == t)
-                                || walks_to_last(body, t),
+                            guards.iter().any(|a| matches!(a, GAtom::Last(GTerm::Var(BVar::Bound(0)))))
+                                || walks_to_last_bound0(body),
                     }
                 }
-                assert!(walks_to_last(body, &target),
-                    "IH body should mention Last(v) for the node binder; got {:?}", body);
+                assert!(walks_to_last_bound0(body),
+                    "IH body should mention Last(Bound 0) for the node binder; got {:?}", body);
             }
             other => panic!("expected GGuarded(Ex, ...), got {:?}", other),
         }
@@ -1785,12 +1968,12 @@ mod tests {
         // Walk: should find no `Last(_)` atom anywhere, since `k` is Msg-sorted.
         fn has_any_last(g: &Guarded) -> bool {
             match g {
-                Guarded::Atom(p::Atom::Last(_)) => true,
+                Guarded::Atom(GAtom::Last(_)) => true,
                 Guarded::Atom(_) => false,
                 Guarded::Disj(xs) | Guarded::Conj(xs) =>
                     xs.iter().any(has_any_last),
                 Guarded::GGuarded { guards, body, .. } =>
-                    guards.iter().any(|a| matches!(a, p::Atom::Last(_)))
+                    guards.iter().any(|a| matches!(a, GAtom::Last(_)))
                         || has_any_last(body),
             }
         }
@@ -1816,7 +1999,7 @@ mod tests {
         let mkv = |n: &str| p::Term::Var(p::VarSpec {
             name: n.into(), idx: 0, sort: p::SortHint::Msg, typ: None,
         });
-        Guarded::Atom(p::Atom::Eq(mkv(a), mkv(b)))
+        Guarded::Atom(atom_to_gatom_free(&p::Atom::Eq(mkv(a), mkv(b))))
     }
 
     #[test]
@@ -1883,7 +2066,7 @@ mod tests {
         let body = mk_atom_eq("p", "q");
         let g = Guarded::GGuarded {
             qua: Quant::All, vars: Vec::new(),
-            guards: vec![a.clone(), b],
+            guards: vec![atom_to_gatom_free(&a), atom_to_gatom_free(&b)],
             body: Box::new(body),
         };
         let val = move |atom: &p::Atom| {
@@ -1902,7 +2085,7 @@ mod tests {
         let body = mk_atom_eq("p", "q");
         let g = Guarded::GGuarded {
             qua: Quant::All, vars: Vec::new(),
-            guards: vec![a.clone(), b.clone()],
+            guards: vec![atom_to_gatom_free(&a), atom_to_gatom_free(&b)],
             body: Box::new(body.clone()),
         };
         let a_clone = a.clone();
@@ -1916,7 +2099,7 @@ mod tests {
         match simp {
             Guarded::GGuarded { vars, guards, .. } => {
                 assert!(vars.is_empty());
-                assert_eq!(guards, vec![b]);
+                assert_eq!(guards, vec![atom_to_gatom_free(&b)]);
             }
             other => panic!("expected GGuarded with one guard, got {:?}", other),
         }
@@ -1931,7 +2114,7 @@ mod tests {
         let body = mk_atom_eq("p", "q");
         let g = Guarded::GGuarded {
             qua: Quant::All, vars: Vec::new(),
-            guards: vec![a],
+            guards: vec![atom_to_gatom_free(&a)],
             body: Box::new(body.clone()),
         };
         let val = |_atom: &p::Atom| Some(true);
@@ -1949,12 +2132,12 @@ mod tests {
         });
         let a = p::Atom::Eq(mkv("a"), mkv("b"));
         let body = mk_atom_eq("p", "q");
-        let bound_var = p::VarSpec {
-            name: "x".into(), idx: 0, sort: p::SortHint::Msg, typ: None,
+        let bound_var = GBinding {
+            name: "x".into(), sort: p::SortHint::Msg,
         };
         let g = Guarded::GGuarded {
             qua: Quant::All, vars: vec![bound_var],
-            guards: vec![a],
+            guards: vec![atom_to_gatom_free(&a)],
             body: Box::new(body),
         };
         let val = |_atom: &p::Atom| Some(true);

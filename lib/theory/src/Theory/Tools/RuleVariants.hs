@@ -41,8 +41,22 @@ import qualified Data.Set                         as S
 -- import qualified Data.ByteString.Lazy as BS
 
 import           Debug.Trace.Ignore
+import qualified Debug.Trace as TR
+import qualified System.IO.Unsafe as Unsafe
+import qualified System.Environment as SysEnv
 import Data.Maybe (isJust)
 import Term.Positions (findPos)
+
+-- TAM_HS_DBG_VARIANTS=1 dumps composed_substs BEFORE simpDisjunction
+-- and after, for each rule's variant generation.  Used to diff against
+-- RS's expand_rule_variants to find the dedup divergence.  Established
+-- (2026-05-28) that HS's Resolve1 variant disj has 6 substs IDENTICAL
+-- to RS's — the H17.10 "HS reduces 6→2" claim was wrong (that trace
+-- was from runtime saturate, not variant generation).
+tamHsDbgVariants :: Bool
+tamHsDbgVariants = Unsafe.unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_DBG_VARIANTS"
+{-# NOINLINE tamHsDbgVariants #-}
 
 
 tmpdir :: FilePath
@@ -79,7 +93,31 @@ variantsProtoRule hnd ru@(Rule (ProtoRuleEInfo na attr _) prems0 concs0 acts0 nv
         case substs of
           [] -> mzero
           _  -> do
+              -- TAM_HS_DBG_VARIANTS: dump composed substs BEFORE simp.
+              () <- if tamHsDbgVariants
+                    then do
+                        TR.traceM ("[HS_VAR_BEFORE_SIMP] rule=" ++ show na
+                            ++ " n_composed=" ++ show (length substs))
+                        mapM_ (\(i, s) -> TR.traceM
+                            ("[HS_VAR_BEFORE_SIMP]   subst[" ++ show i ++ "]: "
+                                ++ show s)) (zip [0::Int ..] substs)
+                        return ()
+                    else return ()
               x <- simpDisjunction hnd (const (const False)) (Disj substs)
+              -- TAM_HS_DBG_VARIANTS: dump after simp.
+              () <- if tamHsDbgVariants
+                    then case x of
+                        (cs, mss) -> do
+                            TR.traceM ("[HS_VAR_AFTER_SIMP] rule=" ++ show na
+                                ++ " common_subst=" ++ show cs
+                                ++ " n_residual=" ++ show (maybe 0 length mss))
+                            case mss of
+                                Just rs ->
+                                    mapM_ (\(i, s) -> TR.traceM
+                                        ("[HS_VAR_AFTER_SIMP]   subst[" ++ show i ++ "]: "
+                                            ++ show s)) (zip [0::Int ..] rs)
+                                Nothing -> return ()
+                    else return ()
               case trace (show ("SIMP",abstractedTerms,
                                 "abstr", abstrPsCsAs,
                                 "substs", substs,

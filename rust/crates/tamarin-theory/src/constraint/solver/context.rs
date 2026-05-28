@@ -467,6 +467,18 @@ impl ProofContext {
         let pc_true_subterm = intruder_rules.iter()
             .filter(|r| crate::rule::is_destr_rule_info(&r.info))
             .all(|r| crate::rule::is_subterm_rule_info(&r.info));
+        if std::env::var("TAM_RS_DBG_PC_TRUE_SUBTERM").is_ok() {
+            eprintln!("[pc_true_subterm] = {}", pc_true_subterm);
+            for r in &intruder_rules {
+                if crate::rule::is_destr_rule_info(&r.info) {
+                    eprintln!("  destr: {:?} subterm={}",
+                        crate::rule::rule_name_string(&crate::rule::Rule::new(
+                            crate::rule::RuleInfo::Intr(r.info.clone()),
+                            vec![], vec![], vec![])),
+                        crate::rule::is_subterm_rule_info(&r.info));
+                }
+            }
+        }
         let mut ctx = ProofContext {
             maude,
             rules,

@@ -68,6 +68,7 @@ module Theory.Constraint.Solver.Trace (
   , flagSourcesLeaf
   , flagApplySrc
   , flagState
+  , flagDbgInitSrc
   , traceStateM
   , tracePickM
   , setCasePath
@@ -88,7 +89,9 @@ import qualified Extension.Data.Label          as L
 import           System.IO.Unsafe              (unsafePerformIO)
 import qualified System.Environment            as SysEnv
 
+import           Term.LTerm                    (prettyLNTerm)
 import           Term.Substitution             (substToList, substToListVFresh)
+import           Text.PrettyPrint.Class        (render)
 import           Theory.Constraint.System
 import           Theory.Constraint.System.Constraints
                                                 (Goal(..))
@@ -427,11 +430,48 @@ flagStateNodes = unsafePerformIO $
 -- Paired with Rust's `TAM_RS_TRACE_STATE=1` emission for goal-ranking
 -- divergence diagnosis.  Use AFTER `traceStateM sys` so the [PICK]
 -- attaches to the [STATE] line just emitted.
-tracePickM :: Applicative m => Goal -> m ()
+tracePickM :: Monad m => Goal -> m ()
 tracePickM g
-    | flagState = traceM ("[PICK] " ++ goalCanonical g)
+    | flagState = do
+        if flagPickTerm
+            then traceM ("[PICK_TERM] " ++ goalTermDump g)
+            else pure ()
+        traceM ("[PICK] " ++ goalCanonical g)
     | otherwise = pure ()
 {-# NOINLINE tracePickM #-}
+
+-- | TAM_HS_TRACE_PICK_TERM=1: also emit a [PICK_TERM] line with the
+-- full fact term repr of an Action/Premise pick.  Pairs with Rust's
+-- `TAM_RS_TRACE_PICK_TERM=1`.
+flagPickTerm :: Bool
+flagPickTerm = unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_PICK_TERM"
+{-# NOINLINE flagPickTerm #-}
+
+-- | TAM_HS_DBG_INIT_SRC=1: dump per-source case count + names produced
+-- by initialSource (before any saturate refinement).  Pairs with Rust's
+-- `TAM_DBG_INIT_SRC=1`.
+flagDbgInitSrc :: Bool
+flagDbgInitSrc = unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_DBG_INIT_SRC"
+{-# NOINLINE flagDbgInitSrc #-}
+
+goalTermDump :: Goal -> String
+goalTermDump g = case g of
+    ActionG  _ fa -> factTermDump fa
+    PremiseG _ fa -> factTermDump fa
+    _             -> ""
+
+factTermDump :: LNFact -> String
+factTermDump (Fact tag _ ts) =
+    showFactTag tag ++ "(" ++ intercalate ", " (map (render . prettyLNTerm) ts) ++ ")"
+  where
+    showFactTag KUFact            = "KU"
+    showFactTag KDFact            = "KD"
+    showFactTag FreshFact         = "Fr"
+    showFactTag OutFact           = "Out"
+    showFactTag InFact            = "In"
+    showFactTag (ProtoFact _ n _) = n
 
 -- | TAM_HS_TRACE_FORM=1: emit `[FORMULA_ADD] path=... kind=... <repr>`
 -- whenever a guarded formula is inserted into sFormulas / DisjG goal.

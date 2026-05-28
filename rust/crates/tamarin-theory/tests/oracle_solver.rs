@@ -1745,7 +1745,7 @@ fn atom_decomposition_creates_action_goal_in_simplify() {
         mkvar("i", SortHint::Node),
     );
     let g = tamarin_theory::guarded::Guarded::Conj(vec![
-        tamarin_theory::guarded::Guarded::Atom(action_atom),
+        tamarin_theory::guarded::Guarded::Atom(tamarin_theory::guarded::atom_to_gatom_free(&action_atom)),
     ]);
     let mut sys = System::empty();
     sys.formulas.push(g);
@@ -1887,8 +1887,8 @@ fn simplify_conj_wrapping_disj_produces_goal() {
     let mkvar = |n: &str| Term::Var(VarSpec {
         name: n.to_string(), idx: 0, sort: SortHint::Node, typ: None,
     });
-    let a1 = tamarin_theory::guarded::Guarded::Atom(Atom::Last(mkvar("i")));
-    let a2 = tamarin_theory::guarded::Guarded::Atom(Atom::Last(mkvar("j")));
+    let a1 = tamarin_theory::guarded::Guarded::Atom(tamarin_theory::guarded::atom_to_gatom_free(&Atom::Last(mkvar("i"))));
+    let a2 = tamarin_theory::guarded::Guarded::Atom(tamarin_theory::guarded::atom_to_gatom_free(&Atom::Last(mkvar("j"))));
     let disj = tamarin_theory::guarded::Guarded::Disj(vec![a1, a2]);
     let mut sys = System::empty();
     sys.formulas.push(tamarin_theory::guarded::Guarded::Conj(vec![disj]));

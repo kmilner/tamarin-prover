@@ -139,6 +139,11 @@ pub fn destruction_rules(
     let mut name_acc: Vec<u8> = Vec::new();
     let mut posname = String::new();
     let pos_iter: Vec<i64> = pos.clone();
+    if std::env::var("TAM_RS_DBG_DESTR_POS").is_ok() {
+        use tamarin_term::pretty::pretty_lnterm;
+        eprintln!("[destr_pos] lhs={} rhs={} pos={:?}",
+            pretty_lnterm(lhs), pretty_lnterm(rhs), pos);
+    }
     for (step_idx, &i) in pos_iter.iter().enumerate() {
         match &t {
             Term::App(FunSym::NoEq(sym), args) => {

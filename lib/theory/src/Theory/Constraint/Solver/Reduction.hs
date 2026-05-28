@@ -250,6 +250,13 @@ labelNodeId = \i rules parent -> do
                 Just pa | (getRuleName pa == getRuleName ru1) && (getRemainingRuleApplications pa > 1)
                     -> setRemainingRuleApplications ru1 ((getRemainingRuleApplications pa) - 1)
                 _   -> ru1
+    when (Unsafe.unsafePerformIO $
+            maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_DBG_SOLVE_RULE_CONSTRAINTS") $ do
+        let nSubsts = case mrconstrs of
+                Just (Disj substs) -> length substs
+                Nothing             -> 0
+        Debug.Trace.traceM ("[HS_LABEL_NODE_ID] rule=" ++ getRuleName ru
+            ++ " n_variant_substs=" ++ show nSubsts)
     solveRuleConstraints mrconstrs
     modM sNodes (M.insert i ru)
     exploitPrems i ru
@@ -340,6 +347,13 @@ insertEdgesLabeled siteLabel edges = do
 -- that no rule is applicable.
 insertAction :: NodeId -> LNFact -> Reduction ChangeIndicator
 insertAction i fa@(Fact _ ann _) = do
+    when (Unsafe.unsafePerformIO $
+            maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_DBG_KU_INSERT") $ do
+        case kFactView fa of
+            Just (UpK, m) ->
+                Debug.Trace.traceM ("[HS_KU_INSERT] i=" ++ show i
+                    ++ " term=" ++ show m)
+            _ -> return ()
     present <- (goal `M.member`) <$> getM sGoals
     isdiff <- getM sDiffSystem
     nodePresent <- (i `M.member`) <$> getM sNodes
@@ -875,9 +889,17 @@ solveTermEqsLabeled siteLabel splitStrat eqs0 =
         setM sEqStore
             =<< simp hnd (substCreatesNonNormalTerms hnd se)
             =<< case (maySplitId, splitStrat) of
-                  (Just splitId, SplitNow) -> disjunctionOfList
-                                                $ fromJustNote "solveTermEqs"
-                                                $ performSplit eqs2 splitId
+                  (Just splitId, SplitNow) ->
+                      let arms = fromJustNote "solveTermEqs" $ performSplit eqs2 splitId
+                          armN = length arms
+                      in do
+                          when (armN > 1 && Unsafe.unsafePerformIO
+                                    (maybe False (== "1") <$>
+                                     SysEnv.lookupEnv "TAM_HS_DBG_STE_MULTI")) $
+                              Debug.Trace.traceM ("[HS_STE_MULTI] arms=" ++ show armN
+                                  ++ " site=" ++ siteLabel
+                                  ++ " n_eqs=" ++ show (length eqs1))
+                          disjunctionOfList arms
                   (Just splitId, SplitLater) -> do
                       insertGoal (SplitG splitId) False
                       return eqs2
@@ -927,6 +949,10 @@ solveListEqs solver eqs = do
 solveRuleConstraints :: Maybe RuleACConstrs -> Reduction ()
 solveRuleConstraints (Just eqConstr) = do
     hnd <- getMaudeHandle
+    when (Unsafe.unsafePerformIO $
+            maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_DBG_SOLVE_RULE_CONSTRAINTS") $ do
+        let Disj substs = eqConstr
+        Debug.Trace.traceM ("[HS_SOLVE_RULE_CONSTRAINTS] n_substs=" ++ show (length substs))
     (eqs, splitId) <- addRuleVariants eqConstr <$> getM sEqStore
     insertGoal (SplitG splitId) False
     -- do not use expensive substCreatesNonNormalTerms here

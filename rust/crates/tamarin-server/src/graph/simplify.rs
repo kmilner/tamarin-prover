@@ -142,21 +142,21 @@ fn guarded_mentions_node(v: &NodeId, g: &tamarin_theory::guarded::Guarded) -> bo
     }
 }
 
-fn atom_mentions_node(v: &NodeId, at: &tamarin_parser::ast::Atom) -> bool {
-    use tamarin_parser::ast::Atom;
+fn atom_mentions_node(v: &NodeId, at: &tamarin_theory::guarded_types::GAtom) -> bool {
+    use tamarin_theory::guarded_types::{GAtom, GTerm, BVar};
     let v_name = &v.name;
-    let mentions_term = |t: &tamarin_parser::ast::Term| -> bool {
-        if let tamarin_parser::ast::Term::Var(spec) = t {
+    let mentions_term = |t: &GTerm| -> bool {
+        if let GTerm::Var(BVar::Free(spec)) = t {
             return &spec.name == v_name;
         }
         false
     };
     match at {
-        Atom::Action(_, t) => mentions_term(t),
-        Atom::Last(t) => mentions_term(t),
-        Atom::Eq(a, b) | Atom::Less(a, b) | Atom::LessMset(a, b)
-        | Atom::Subterm(a, b) => mentions_term(a) || mentions_term(b),
-        Atom::Pred(_) => false,
+        GAtom::Action(_, t) => mentions_term(t),
+        GAtom::Last(t) => mentions_term(t),
+        GAtom::Eq(a, b) | GAtom::Less(a, b) | GAtom::LessMset(a, b)
+        | GAtom::Subterm(a, b) => mentions_term(a) || mentions_term(b),
+        GAtom::Pred(_) => false,
     }
 }
 

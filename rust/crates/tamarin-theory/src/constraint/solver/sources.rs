@@ -108,7 +108,17 @@ pub struct Source {
     /// `cases_take` mutate the cell after initial materialisation,
     /// which `ProofContext::ensure_saturated`'s post-saturate writeback
     /// requires.
-    pub(crate) cases_cell: std::sync::Mutex<Option<Vec<(String, System)>>>,
+    /// Internally stores case names as `Vec<String>` — HS's
+    /// `caseNames :: [String]` (Sources.hs:147-148).  The list
+    /// representation is critical for `combine`'s truncation rule
+    /// `combine (n:_) _ = [n]` (Sources.hs:139): without per-element
+    /// boundaries, multi-step accumulated names can't be truncated
+    /// to a single element across refineSource iters.  External
+    /// callers using `cases_or_empty()` / `cases_get()` / etc. see
+    /// the joined `String` (intercalated with "_") for backward
+    /// compat; saturate-internal code uses the `_list` variants
+    /// that preserve list structure.
+    pub(crate) cases_cell: std::sync::Mutex<Option<Vec<(Vec<String>, System)>>>,
     /// `true` iff case enumeration was truncated by the per-source cap
     /// (`TAM_MAX_CLOSURES_PER_SOURCE`).  Search must not return
     /// `Verified` for any proof tree that consumed an incomplete
@@ -161,9 +171,26 @@ impl Source {
     /// internals that produce already-materialised case sets, and by
     /// `Source::new` for back-compat with old `Source { goal, cases:
     /// Vec::new(), .. }`-style construction.
+    ///
+    /// Takes `Vec<(String, System)>` for backward compat: each `String`
+    /// becomes a single-element `Vec<String>` in the internal list
+    /// representation.  Use [`Source::eager_list`] to pass an actual
+    /// `Vec<(Vec<String>, System)>`.
     pub fn eager(goal: crate::constraint::constraints::Goal,
                  cases: Vec<(String, System)>,
                  incomplete: bool) -> Self {
+        let list: Vec<(Vec<String>, System)> = cases.into_iter()
+            .map(|(n, s)| (string_to_name_list(&n), s))
+            .collect();
+        Source { goal, cases_cell: std::sync::Mutex::new(Some(list)), incomplete }
+    }
+
+    /// Build a Source with case-name LISTS already computed.  Used by
+    /// saturate-internal code that preserves HS's `[String]` list
+    /// structure across refineSource iters.
+    pub fn eager_list(goal: crate::constraint::constraints::Goal,
+                      cases: Vec<(Vec<String>, System)>,
+                      incomplete: bool) -> Self {
         Source { goal, cases_cell: std::sync::Mutex::new(Some(cases)), incomplete }
     }
 
@@ -187,36 +214,53 @@ impl Source {
     pub fn cases(&self, ctx: &crate::constraint::solver::context::ProofContext)
         -> Vec<(String, System)>
     {
+        cases_list_to_string_list(self.cases_list(ctx))
+    }
+
+    /// HS-faithful: returns cases with name-LISTS preserved.  Use this
+    /// when the per-element list structure matters for `combine`
+    /// (`combine_case_names_list`) at refineSource boundaries.
+    pub fn cases_list(&self, ctx: &crate::constraint::solver::context::ProofContext)
+        -> Vec<(Vec<String>, System)>
+    {
         ctx.ensure_saturated();
         let g = self.cases_cell.lock().unwrap();
         match &*g {
             Some(v) => v.clone(),
             None => {
                 drop(g);
-                // ensure_saturated should have set every source.  If
-                // we reach here, the source wasn't part of the saturated
-                // set (e.g. constructed post-saturate by a saturate
-                // internal): fall back to initial_source_cases.
                 let init = initial_source_cases(&self.goal, ctx);
-                *self.cases_cell.lock().unwrap() = Some(init.clone());
-                init
+                let init_list: Vec<(Vec<String>, System)> = init.into_iter()
+                    .map(|(n, s)| (string_to_name_list(&n), s))
+                    .collect();
+                *self.cases_cell.lock().unwrap() = Some(init_list.clone());
+                init_list
             }
         }
     }
 
     /// Return the cases iff already forced; do NOT trigger
     /// computation.  Use in consumers (e.g. `collect_one_case_syms`)
-    /// that can short-circuit on the goal shape — HS's
-    /// `getMsgOneCase` pattern-matches on `cdGoal` before touching
-    /// `cdCases`, so we need a non-forcing accessor to match.
+    /// that can short-circuit on the goal shape.
     pub fn cases_get(&self) -> Option<Vec<(String, System)>> {
+        self.cases_cell.lock().unwrap().clone()
+            .map(cases_list_to_string_list)
+    }
+
+    /// Same as `cases_get` but returns the HS-faithful list form.
+    pub fn cases_get_list(&self) -> Option<Vec<(Vec<String>, System)>> {
         self.cases_cell.lock().unwrap().clone()
     }
 
     /// Read-only clone that returns `vec![]` when the cell hasn't
-    /// been forced yet.  Same no-force semantics as [`Source::cases_get`]
-    /// but returns `Vec` directly (most callers want this).
+    /// been forced yet.  External-facing form (joined-String).
     pub fn cases_or_empty(&self) -> Vec<(String, System)> {
+        cases_list_to_string_list(self.cases_or_empty_list())
+    }
+
+    /// HS-faithful: same as `cases_or_empty` but preserves the
+    /// per-element list structure.
+    pub fn cases_or_empty_list(&self) -> Vec<(Vec<String>, System)> {
         self.cases_cell.lock().unwrap().clone().unwrap_or_default()
     }
 
@@ -228,8 +272,13 @@ impl Source {
 
     /// Drain the materialised cases out of the cell, leaving it as
     /// `None`.  Used by saturate internals that re-build the cases
-    /// list per iteration.
+    /// list per iteration.  External-facing form (joined-String).
     pub fn cases_take(&self) -> Vec<(String, System)> {
+        cases_list_to_string_list(self.cases_take_list())
+    }
+
+    /// HS-faithful: same as `cases_take` but preserves list structure.
+    pub fn cases_take_list(&self) -> Vec<(Vec<String>, System)> {
         self.cases_cell.lock().unwrap().take().unwrap_or_default()
     }
 
@@ -237,9 +286,30 @@ impl Source {
     /// install a refined case set, AND by `ensure_saturated`'s post-
     /// saturate writeback.  Takes `&self` (not `&mut`) so it works
     /// through immutable `ctx.full_sources` borrows.
+    /// External-facing form: each `String` name is wrapped as a
+    /// single-element list.
     pub fn cases_set(&self, cases: Vec<(String, System)>) {
+        let list: Vec<(Vec<String>, System)> = cases.into_iter()
+            .map(|(n, s)| (string_to_name_list(&n), s))
+            .collect();
+        *self.cases_cell.lock().unwrap() = Some(list);
+    }
+
+    /// HS-faithful: same as `cases_set` but takes the list form
+    /// directly, preserving per-element boundaries.
+    pub fn cases_set_list(&self, cases: Vec<(Vec<String>, System)>) {
         *self.cases_cell.lock().unwrap() = Some(cases);
     }
+}
+
+/// Convert `(Vec<String>, System)` case-list to the external
+/// `(String, System)` form via HS's `intercalate "_"` join.
+fn cases_list_to_string_list(
+    list: Vec<(Vec<String>, System)>,
+) -> Vec<(String, System)> {
+    list.into_iter()
+        .map(|(n, s)| (case_name_list_to_string(&n), s))
+        .collect()
 }
 
 /// HS-faithful port of `initialSource ctxt restrictions goal`
@@ -355,7 +425,7 @@ fn initial_source_cases_impl(
         restrict_eq_store_to_stable_vars(&mut s, &stable_vars);
         Some(s)
     };
-    match outcome {
+    let result: Vec<(String, System)> = match outcome {
         GoalCases::Linear => normalize_and_keep(red.sys, "only")
             .map(|s| vec![("only".into(), s)]).unwrap_or_default(),
         GoalCases::LinearNamed(name) => {
@@ -370,7 +440,21 @@ fn initial_source_cases_impl(
             })
             .collect(),
         GoalCases::Contradictory => Vec::new(),
+    };
+    if std::env::var("TAM_DBG_INIT_SRC").is_ok() {
+        use tamarin_term::pretty::pretty_lnterm;
+        let goal_str = match goal {
+            Goal::Action(_, fa) | Goal::Premise(_, fa) => {
+                let ts: Vec<String> = fa.terms.iter().map(|t| pretty_lnterm(t)).collect();
+                format!("{:?}({})", fa.tag, ts.join(", "))
+            }
+            _ => format!("{:?}", goal),
+        };
+        let names: Vec<&str> = result.iter().map(|(n, _)| n.as_str()).collect();
+        eprintln!("[init_src] {} → {} cases: {:?}",
+            goal_str, result.len(), names);
     }
+    result
 }
 
 /// `precomputeSources` (lite). For each non-K conclusion fact across
@@ -749,7 +833,7 @@ pub fn drop_contradictory_cases(
                 iter, current.len(), good_ths.len());
         }
         let before_total: usize = current.iter().map(|s| s.cases_or_empty().len()).sum();
-        let next: Vec<Source> = current.into_iter().map(|mut src| {
+        let next: Vec<Source> = current.into_iter().map(|src| {
             let goal_str = format!("{:?}", src.goal).chars().take(80).collect::<String>();
             let cases: Vec<_> = src.cases_take().into_iter()
                 .filter(|(name, sys)| {
@@ -792,7 +876,7 @@ fn case_has_surviving_variant_with_ths(
         /* chains_limit */ 10,
         /* outer_cap */ outer_cap,
         /* branch_cap */ branch_cap,
-        String::new());
+        Vec::new());
     set_precompute_mode(false);
     if dbg {
         eprintln!("[variant_with_ths] disj-monad surviving branches={} ths.len={}",
@@ -863,7 +947,7 @@ fn case_has_surviving_variant(
         /* chains_limit */ 10,
         /* outer_cap */ outer_cap,
         /* branch_cap */ branch_cap,
-        String::new());
+        Vec::new());
     set_precompute_mode(false);
     if dbg {
         eprintln!("[variant] disj-monad surviving branches={} good_ths.len={}",
@@ -2518,8 +2602,27 @@ fn saturate_out_premise(
             }
             this_sub.push(s);
         }
-        let multi = this_sub.len() > 1;
-        for (k, s) in this_sub.into_iter().enumerate() {
+        // H23 (2026-05-28): HS-faithful — HS's saturate produces ONE
+        // case per producer rule (with variants threaded through
+        // SplitG).  When `close_chains_dfs` returns multiple sub-
+        // cases that map to the SAME producer name, HS would have a
+        // single case (variants → SplitG).  Dedup by exact-system
+        // equality first (catches witness-only differences).
+        // Opt-out: TAM_RS_DISABLE_H23=1.
+        let h23_enabled = std::env::var("TAM_RS_DISABLE_H23").is_err();
+        let this_sub_deduped: Vec<System> = if h23_enabled {
+            let mut out: Vec<System> = Vec::new();
+            for s in this_sub {
+                if !out.iter().any(|prev| prev == &s) {
+                    out.push(s);
+                }
+            }
+            out
+        } else {
+            this_sub
+        };
+        let multi = this_sub_deduped.len() > 1;
+        for (k, s) in this_sub_deduped.into_iter().enumerate() {
             let base_name = if !sub_name.is_empty() {
                 format!("{}_{}", outer_name, sub_name)
             } else {
@@ -2980,7 +3083,7 @@ pub fn refine_with_source_asms(
     // is non-Haskell-faithful — it misses cases where the typing
     // violation only surfaces after exhaustive Disj exploration.
     let mut intermediate: Vec<Source> = Vec::new();
-    for mut src in sources {
+    for src in sources {
         let mut new_cases: Vec<(String, System)> = Vec::new();
         for (name, sys) in src.cases_take() {
             let mut refined = sys.clone();
@@ -3016,7 +3119,7 @@ pub fn refine_with_source_asms(
     // formulas after saturation, and drop disjunction goals derived
     // from the assumptions.
     let mut out: Vec<Source> = Vec::new();
-    for mut src in saturated {
+    for src in saturated {
         let mut new_cases: Vec<(String, System)> = Vec::new();
         for (name, mut sys) in src.cases_take().into_iter() {
             sys.formulas.clear();
@@ -3168,15 +3271,17 @@ fn saturate_sources_with_simp_opt(
             }
         }
     }
+    // HS-faithful: ONE pass per saturate iter via `refineSource solver`
+    // where `solver = solveAllSafeGoals` (`Sources.hs:391-418`).  Earlier
+    // Rust ran `saturate_sources_maude` (chain-fold) as a pre-step before
+    // `run_solve_all_safe_goals_disj_with_progress` — that was a
+    // Rust-proprietary "lightweight aligner" that materialised branched
+    // cases (e.g. Resolve1/Resolve2 for KU(pcs) in StatVerif) HS would
+    // only explore lazily inside the Disj monad.  Removed: the
+    // run_solve_all_safe_goals_disj_with_progress port is the single
+    // saturation mechanism, matching HS architecturally.
     for _iter_n in 0..limit {
-        // Use the Maude-backed saturate here.  Inside
-        // refine_with_source_asms the source-case formulas already
-        // carry the [sources] assumption universals, so the Maude
-        // alignment + simp loop has visibility into the typing
-        // constraints and can prune cases that violate them.  The
-        // top-level context init uses the lightweight aligner because
-        // it doesn't have the assumptions to drive pruning.
-        let saturated = saturate_sources_maude(current.clone(), 1, ctx);
+        let saturated = current.clone();
         // Haskell-faithful `goodTh` filter (Sources.hs:380-381):
         //
         //   goodTh th = length (getDisj (get cdCases th)) <= 1
@@ -3203,6 +3308,23 @@ fn saturate_sources_with_simp_opt(
         } else {
             saturated.clone()
         };
+        if std::env::var("TAM_DBG_TS_SNAP").is_ok() {
+            eprintln!("[ts_snap] iter={} saturated.len={} snapshot.len={}",
+                _iter_n, saturated.len(), ths_snapshot.len());
+            for (i, s) in saturated.iter().enumerate() {
+                eprintln!("  saturated[{}] cases={} goal_head={}",
+                    i, s.cases_or_empty().len(),
+                    {
+                        match &s.goal {
+                            crate::constraint::constraints::Goal::Action(_, gfa) =>
+                                gfa.terms.first().map(|t| format!("{:?}", t).chars().take(50).collect::<String>()).unwrap_or_default(),
+                            crate::constraint::constraints::Goal::Premise(_, gfa) =>
+                                format!("Premise({:?})", gfa.tag),
+                            _ => "Other".to_string(),
+                        }
+                    });
+            }
+        }
         // Inside refine_with_source_asms, drive each case forward by
         // SOLVING its safe goals (chain/KD-premise/non-KU action) —
         // not just simplifying.  Mirrors Haskell's `solveAllSafeGoals`-
@@ -3249,11 +3371,11 @@ fn saturate_sources_with_simp_opt(
         // remain findable via runtime case enumeration.  Toggle off
         // via `TAM_LEGACY_SINGLE_PICK=1` for diagnostic comparisons.
         let single_pick = std::env::var("TAM_LEGACY_SINGLE_PICK").is_ok();
-        for (i, mut src) in saturated.into_iter().enumerate() {
-            let prev_case_count = current.get(i).map(|s| s.cases_or_empty().len()).unwrap_or(0);
-            let mut new_cases: Vec<(String, System)> = Vec::new();
-            for (name, sys) in src.cases_take() {
-                let case_name_for_dbg = name.clone();
+        for (i, src) in saturated.into_iter().enumerate() {
+            let prev_case_count = current.get(i).map(|s| s.cases_or_empty_list().len()).unwrap_or(0);
+            let mut new_cases: Vec<(Vec<String>, System)> = Vec::new();
+            for (name_list, sys) in src.cases_take_list() {
+                let case_name_for_dbg = case_name_list_to_string(&name_list);
                 if single_pick {
                     // Pre-#160 single-pick fallback.
                     let sys_orig = sys.clone();
@@ -3277,21 +3399,43 @@ fn saturate_sources_with_simp_opt(
                             && !pre_has_contras
                             && saturate_branched;
                         if preserve {
-                            new_cases.push((name, sys_orig));
+                            new_cases.push((name_list, sys_orig));
                             changed = true;
                             continue;
                         }
                         changed = true;
                         continue;
                     }
-                    new_cases.push((name, red.sys));
+                    new_cases.push((name_list, red.sys));
                     continue;
                 }
                 // === Multi-branch path (default — Haskell-faithful) ===
                 set_precompute_mode(true);
-                let branches = run_solve_all_safe_goals_disj(
+                // HS uses no iter cap on solveAllSafeGoals.  Rust's
+                // worklist needs a safety bound, but 40 is too low for
+                // deep chain-destruction cases (PRF inside senc inside
+                // pair inside C_2's Out): cases get pushed-as-is at
+                // outer_cap, then re-refined next saturate-outer iter,
+                // and the per-iter contradiction check kills them
+                // before they finish.  500 is enough to let HS's
+                // typical TLS-style chains run to fixpoint within one
+                // saturate-outer iter.  Tunable via
+                // TAM_DISJ_OUTER_CAP.
+                let outer_cap: i64 = std::env::var("TAM_DISJ_OUTER_CAP")
+                    .ok().and_then(|s| s.parse().ok()).unwrap_or(500);
+                let (branches, branch_took_step) = run_solve_all_safe_goals_disj_with_progress(
                     ctx, sys, &ths_snapshot, /*chains_limit*/ 10,
-                    /*outer_cap*/ 40, branch_cap, name);
+                    outer_cap, branch_cap, name_list);
+                if branch_took_step {
+                    // HS-faithful `not (null names)` change signal —
+                    // solveAllSafeGoals took at least one step (safe-goal
+                    // solve or source-pick) on this case.  Drives outer
+                    // saturate re-iteration even when case count doesn't
+                    // grow, so multi-iter convergence patterns like
+                    // chaum's KU(~x:Fresh)→1-case work.  See
+                    // [[project-chaum-case-fresh-divergence]].
+                    changed = true;
+                }
                 set_precompute_mode(false);
                 if dbg {
                     eprintln!("  case {:?}: refineSource produced {} branches",
@@ -3328,7 +3472,7 @@ fn saturate_sources_with_simp_opt(
                 let dedup_enabled = msig.enable_bp || msig.enable_mset;
                 let mut seen: std::collections::BTreeSet<String> =
                     std::collections::BTreeSet::new();
-                for (mut branch_sys, branch_name) in branches {
+                for (mut branch_sys, branch_name_list) in branches {
                     if aggressive_drop && !contradictions(ctx, &branch_sys).is_empty() {
                         changed = true;
                         continue;
@@ -3344,7 +3488,7 @@ fn saturate_sources_with_simp_opt(
                         let key = canonicalise_system_full(&branch_sys);
                         if !seen.insert(key) { continue; }
                     }
-                    new_cases.push((branch_name, branch_sys));
+                    new_cases.push((branch_name_list, branch_sys));
                 }
             }
             // Determine if the case count changed for this source.
@@ -3355,23 +3499,108 @@ fn saturate_sources_with_simp_opt(
                 let mut name_counts: std::collections::BTreeMap<String, usize>
                     = std::collections::BTreeMap::new();
                 for (n, _) in &new_cases {
-                    *name_counts.entry(n.clone()).or_insert(0) += 1;
+                    *name_counts.entry(case_name_list_to_string(n)).or_insert(0) += 1;
                 }
                 for (n, c) in &name_counts {
                     eprintln!("[refine]   {}: {}", n, c);
                 }
+                // Per-case node/edge counts for diagnostic.
+                for (n, sys) in &new_cases {
+                    eprintln!("[refine]   case {:?}: {} nodes, {} edges, {} goals",
+                        n, sys.nodes.len(), sys.edges.len(), sys.goals.len());
+                    if std::env::var("TAM_DBG_REFINE_VERBOSE").is_ok() {
+                        let nm = case_name_list_to_string(n);
+                        if nm.starts_with("Resolve1") || nm.starts_with("Resolve2") {
+                            eprintln!("[refine]     nodes:");
+                            for (id, rule) in &sys.nodes {
+                                let rname = match &rule.info {
+                                    crate::rule::RuleInfo::Proto(p) =>
+                                        format!("Proto({:?})", p.name),
+                                    crate::rule::RuleInfo::Intr(i) =>
+                                        format!("Intr({:?})", i),
+                                };
+                                eprintln!("[refine]       {}_{}: {}", id.name, id.idx, rname);
+                            }
+                            eprintln!("[refine]     edges:");
+                            for e in &sys.edges {
+                                eprintln!("[refine]       {}_{} ConcIdx({}) -> {}_{} PremIdx({})",
+                                    e.src.0.name, e.src.0.idx, e.src.1.0,
+                                    e.tgt.0.name, e.tgt.0.idx, e.tgt.1.0);
+                            }
+                            eprintln!("[refine]     unsolved goals:");
+                            for (g, st) in &sys.goals {
+                                if !st.solved {
+                                    let gs = format!("{:?}", g).chars().take(500).collect::<String>();
+                                    eprintln!("[refine]       {}", gs);
+                                }
+                            }
+                            eprintln!("[refine]     i_0 node detail:");
+                            for (id, rule) in &sys.nodes {
+                                if id.name == "i" {
+                                    eprintln!("[refine]       i_{} acts: {:?}", id.idx,
+                                        rule.actions);
+                                }
+                            }
+                            eprintln!("[refine]     eq_store conj:");
+                            for (i, d) in sys.eq_store.conj.iter().enumerate() {
+                                eprintln!("[refine]       disj[{}] split_id={:?} substs={}",
+                                    i, d.split_id, d.substs.len());
+                            }
+                            eprintln!("[refine]     eq_store subst (LVar → term):");
+                            for (v, t) in sys.eq_store.subst.to_list() {
+                                let ts = format!("{:?}", t).chars().take(100).collect::<String>();
+                                eprintln!("[refine]       {}_{}:{:?} → {}",
+                                    v.name, v.idx, v.sort, ts);
+                            }
+                            eprintln!("[refine]     less_atoms:");
+                            for la in &sys.less_atoms {
+                                eprintln!("[refine]       {}_{} < {}_{} ({:?})",
+                                    la.smaller.name, la.smaller.idx,
+                                    la.larger.name, la.larger.idx,
+                                    la.reason);
+                            }
+                        }
+                    }
+                }
             }
             if !new_cases.is_empty() {
-                next.push(Source::eager(src.goal, new_cases, src.incomplete));
+                next.push(Source::eager_list(src.goal, new_cases, src.incomplete));
             } else {
                 changed = true;
             }
-            if new_case_count != prev_case_count {
+            if new_case_count > prev_case_count {
                 changed = true;
             }
+            // HS-faithful fixpoint: if case_count went DOWN or stayed,
+            // this source is at fixpoint (HS's `change = not (null
+            // names)` would be False here — solveAllSafeGoals reached
+            // a state where no more steps progress).  Don't trigger
+            // another iter because of a count drop — that was the
+            // saturate over-iteration that killed PRF's C_2/S_2 chain
+            // cases at iter 3 in TLS_Handshake.  See [project_prf_source_cache_undercount].
         }
         current = next;
         if !changed { break; }
+    }
+    // HS-faithful final-truncate pass: applies `combine` one more
+    // time per case with empty `new_names`, which (per Sources.hs:139
+    // `combine (n:_) _ = [n]`) truncates any multi-element name list
+    // to its first non-coerce element.  HS's saturate normally
+    // achieves this via iter-2's `combine names names'` on iter-1's
+    // multi-element output, but Rust's change-detection skips iter-2
+    // when only safe-goal steps fired (avoiding PRF over-refinement —
+    // see [[project-prf-source-cache-undercount]]).  Applying the
+    // truncate as a name-only pass matches HS's final case-name
+    // display without re-running solveAllSafeGoals.
+    for src in current.iter_mut() {
+        if let Some(cases) = src.cases_cell.lock().unwrap().as_mut() {
+            for (name_list, _) in cases.iter_mut() {
+                if name_list.len() > 1 {
+                    let truncated = combine_case_names_list(name_list, &[]);
+                    *name_list = truncated;
+                }
+            }
+        }
     }
     current
 }
@@ -3428,7 +3657,16 @@ fn solve_all_safe_goals_tracked(
         .ok().and_then(|s| s.parse().ok()).unwrap_or(200);
     for _iter in 0..outer_cap {
         simplify_system(red);
-        if !contradictions(&red.ctx, &red.sys).is_empty() {
+        let cs = contradictions(&red.ctx, &red.sys);
+        if std::env::var("TAM_RS_DBG_SAT_CONTRA").is_ok() {
+            let cp = crate::constraint::solver::trace::case_path_string();
+            eprintln!("[RS-SAT-CONTRA] path={} iter={} contras={:?} goals={} chains={} nodes={}",
+                cp, _iter, cs,
+                red.sys.goals.iter().filter(|(_, s)| !s.solved).count(),
+                red.sys.goals.iter().filter(|(g, s)| !s.solved && matches!(g, crate::constraint::constraints::Goal::Chain(_, _))).count(),
+                red.sys.nodes.len());
+        }
+        if !cs.is_empty() {
             return outcome;
         }
         // Snapshot open goals using Haskell's `openGoals` view (via
@@ -3475,6 +3713,10 @@ fn solve_all_safe_goals_tracked(
         let is_chain_prem1 = |g: &Goal| -> bool {
             matches!(g, Goal::Chain(_, (_, pi)) if pi.0 == 1)
         };
+        // HS-faithful: skip Split during precompute saturate (mirrors
+        // HS's empirical behavior — see notes on the other is_safe in
+        // run_solve_all_safe_goals_disj_with_progress).
+        let in_precompute = crate::constraint::solver::sources::in_precompute_mode();
         let is_safe = |g: &Goal| -> bool {
             match g {
                 Goal::Chain(_, _) => chains_left > 0,
@@ -3484,7 +3726,8 @@ fn solve_all_safe_goals_tracked(
                         && !crate::fact::is_kd_xor_fact(fa)
                         && !fa.is_no_sources()
                 }
-                Goal::Disj(_) | Goal::Split(_) | Goal::Subterm(_) => split_allowed,
+                Goal::Disj(_) | Goal::Subterm(_) => split_allowed,
+                Goal::Split(_) => split_allowed && !in_precompute,
             }
         };
         // Priority order: KD-premise / chain-prem1 first, then safe.
@@ -3789,8 +4032,12 @@ pub fn run_solve_all_safe_goals_disj_for_probe(
     branch_cap: usize,
     initial_name: String,
 ) -> Vec<(System, String)> {
+    let init = string_to_name_list(&initial_name);
     run_solve_all_safe_goals_disj(ctx, initial_sys, &[],
-        chains_limit, outer_cap, branch_cap, initial_name)
+        chains_limit, outer_cap, branch_cap, init)
+        .into_iter()
+        .map(|(sys, n)| (sys, case_name_list_to_string(&n)))
+        .collect()
 }
 
 /// Like `run_solve_all_safe_goals_disj_for_probe` but takes a `ths`
@@ -3805,8 +4052,12 @@ pub fn run_solve_all_safe_goals_disj_for_probe_with_ths(
     branch_cap: usize,
     initial_name: String,
 ) -> Vec<(System, String)> {
+    let init = string_to_name_list(&initial_name);
     run_solve_all_safe_goals_disj(ctx, initial_sys, ths,
-        chains_limit, outer_cap, branch_cap, initial_name)
+        chains_limit, outer_cap, branch_cap, init)
+        .into_iter()
+        .map(|(sys, n)| (sys, case_name_list_to_string(&n)))
+        .collect()
 }
 
 fn run_solve_all_safe_goals_disj(
@@ -3816,8 +4067,30 @@ fn run_solve_all_safe_goals_disj(
     chains_limit: i64,
     outer_cap: i64,
     branch_cap: usize,
-    initial_name: String,
-) -> Vec<(System, String)> {
+    initial_name: Vec<String>,
+) -> Vec<(System, Vec<String>)> {
+    run_solve_all_safe_goals_disj_with_progress(
+        ctx, initial_sys, ths, chains_limit, outer_cap, branch_cap, initial_name).0
+}
+
+/// Variant that also returns a flag indicating whether ANY branch took
+/// at least one solve step (safe-goal solve or source-pick).  This is
+/// HS-faithful `not (null names)` from `solveAllSafeGoals`'s `caseNames`
+/// accumulator — the signal that drives `saturateSources`'s outer-iter
+/// "changes" detection.  Without this signal Rust's saturate exits too
+/// early on cases like chaum's St_S_1 where a single source-pick on a
+/// later iter is needed to converge KU(~x:Fresh-Var) source-cache to
+/// 1 case (HS-faithful) rather than 2.
+/// See [[project-chaum-case-fresh-divergence]].
+fn run_solve_all_safe_goals_disj_with_progress(
+    ctx: &crate::constraint::solver::context::ProofContext,
+    initial_sys: System,
+    ths: &[Source],
+    chains_limit: i64,
+    outer_cap: i64,
+    branch_cap: usize,
+    initial_name: Vec<String>,
+) -> (Vec<(System, Vec<String>)>, bool) {
     use crate::constraint::constraints::Goal;
     use crate::constraint::solver::contradictions::contradictions;
     use crate::constraint::solver::goals::dispatch_solve_goal;
@@ -3826,12 +4099,10 @@ fn run_solve_all_safe_goals_disj(
     use crate::constraint::solver::simplify::simplify_system;
     use crate::fact::FactTag;
 
-    // HS-faithful: track `initial_name` (the existing case-name from
-    // refineSource's `(names, se) <- get cdCases th`) separately from
-    // `step_names` (the accumulator HS calls `caseNames` in
-    // solveAllSafeGoals).  At finish we apply HS's `combine` to merge
-    // them — this is the only spot where the coerce-prefix handling
-    // applies.  Mirrors:
+    // HS-faithful: track step names as a Vec<String> — HS's
+    // `caseNames` (Sources.hs:147-148) is `[String]`.  At finish we
+    // apply HS's `combine` (Sources.hs:135-139) to merge with the
+    // existing case-name list from `initial_name`:
     //
     //   refineSource ctxt proofStep th =
     //     refinement = do
@@ -3839,17 +4110,29 @@ fn run_solve_all_safe_goals_disj(
     //       ((x, names'), se') <- fst <$> runReduction proofStep ctxt se fs
     //       return (x, (combine names names', se'))
     //
-    // where `names'` is solveAllSafeGoals's accumulated `caseNames`.
-    type Entry = (System, String /* step_names accumulator */,
+    // The `Vec<String>` representation lets `combine` truncate to the
+    // first non-coerce element exactly as HS does — preserving the
+    // list boundary `(n:_)` pattern instead of losing it via
+    // concatenation.  Without this, `combine` can't tell where one
+    // step name ends and the next begins, so Rust accumulated
+    // multi-step names ("Step1sencSetup_Key") that HS truncated to
+    // single element ("Step1") at the refineSource boundary.
+    type Entry = (System, Vec<String> /* step_names accumulator */,
                   std::collections::BTreeSet<String>, i64, i64);
     let mut worklist: Vec<Entry> = vec![
-        (initial_sys, String::new() /* fresh accumulator for steps */,
+        (initial_sys, Vec::new() /* fresh accumulator for steps */,
          std::collections::BTreeSet::new(),
          chains_limit, outer_cap)
     ];
-    // `finished` holds (System, accumulated_step_names).  Combine
-    // with `initial_name` after the loop terminates.
-    let mut finished: Vec<(System, String)> = Vec::new();
+    // `finished` holds (System, accumulated_step_names_list).
+    // `combine` runs with `initial_name` after the loop terminates.
+    let mut finished: Vec<(System, Vec<String>)> = Vec::new();
+    // HS-faithful `not (null names)` progress flag: True iff any
+    // branch dispatched a solve-step (safe-goal or source-pick) that
+    // produced a named step (so `caseNames ++ x` would have been
+    // non-empty in HS's `solveAllSafeGoals`).  This drives the outer
+    // saturate's "changes" detection.
+    let mut any_step_taken: bool = false;
     // Safety: hard limit on total worklist processing iterations to
     // avoid runaway exploration if branching is pathological.
     let mut total_steps: usize = 0;
@@ -3872,6 +4155,50 @@ fn run_solve_all_safe_goals_disj(
         let mut red = Reduction::new(ctx, sys);
         simplify_system(&mut red);
         let contras = contradictions(red.ctx, &red.sys);
+        // TAM_RS_DBG_BRANCH_STATE=1 dumps state for ALL branches (not just dropped).
+        // Use it to find why a chain-based sub-case isn't dropping when HS would.
+        if std::env::var("TAM_RS_DBG_BRANCH_STATE").is_ok()
+            && name.iter().any(|s| s.contains("Resolve2") || s.contains("Resolve1"))
+        {
+            let chains: Vec<_> = red.sys.goals.iter().filter_map(|(g, st)|
+                if !st.solved {
+                    if let Goal::Chain(c, p) = g {
+                        let cf = red.sys.nodes.iter().find(|(id, _)| id == &c.0)
+                            .and_then(|(_, r)| r.conclusions.get(c.1.0));
+                        let pf = red.sys.nodes.iter().find(|(id, _)| id == &p.0)
+                            .and_then(|(_, r)| r.premises.get(p.1.0));
+                        Some(format!("Chain({:?}.{:?} → {:?}.{:?}): {:?} → {:?}",
+                            c.0.name, c.0.idx, p.0.name, p.0.idx, cf, pf))
+                    } else { None }
+                } else { None }).collect();
+            let ku_acts: Vec<_> = red.sys.goals.iter().filter_map(|(g, st)|
+                if !st.solved {
+                    if let Goal::Action(id, fa) = g {
+                        if matches!(fa.tag, FactTag::Ku) {
+                            Some(format!("KU@{:?}.{:?}: {:?}", id.name, id.idx, fa.terms.first()))
+                        } else { None }
+                    } else { None }
+                } else { None }).collect();
+            let subst: Vec<_> = red.sys.eq_store.subst.to_list().iter()
+                .map(|(v, t)| format!("{:?}_{} → {:?}",
+                    v.name, v.idx, format!("{:?}", t).chars().take(100).collect::<String>()))
+                .collect();
+            let conj: Vec<_> = red.sys.eq_store.conj.iter().enumerate()
+                .map(|(i, d)| {
+                    let s_list: Vec<String> = d.substs.iter().enumerate()
+                        .map(|(j, s)| {
+                            let l: Vec<String> = s.to_list().iter()
+                                .map(|(v, t)| format!("{}.{}:{:?} → {}",
+                                    v.name, v.idx, v.sort,
+                                    format!("{:?}", t).chars().take(300).collect::<String>()))
+                                .collect();
+                            format!("subst[{}]: {:#?}", j, l)
+                        }).collect();
+                    format!("disj[{}] sid={:?}: {:#?}", i, d.split_id, s_list)
+                }).collect();
+            eprintln!("[RS-SAT-STATE] name={:?} contras={:?}\n  subst={:#?}\n  conj={:#?}\n  chains={:#?}\n  ku_acts={:#?}",
+                name, contras, subst, conj, chains, ku_acts);
+        }
         if !contras.is_empty() {
             if std::env::var("TAM_DBG_BRANCH_DROP").is_ok() {
                 eprintln!("[branch_drop] name={:?} dropped by contras: {:?}",
@@ -3909,6 +4236,23 @@ fn run_solve_all_safe_goals_disj(
         let is_chain_prem1 = |g: &Goal| -> bool {
             matches!(g, Goal::Chain(_, (_, pi)) if pi.0 == 1)
         };
+        // HS-faithful: HS's `safeGoal` predicate (Sources.hs:175-188)
+        // marks Split/Disj/Subterm safe when `splitAllowed`.
+        //
+        // Previously RS gated `Split` with `!in_precompute` (don't fork
+        // during saturate).  This was WRONG vs HS — HS's `safeGoal`
+        // returns True for SplitG when `splitAllowed` regardless of
+        // precompute/runtime.  H17.4 fix (2026-05-28): allow Split
+        // during saturate when splitAllowed.  This lets the variant
+        // disj fork during saturate, propagating per-variant bindings
+        // to vk terms.  The cycle detection in
+        // `enforce_ku_action_uniqueness` then fires on the specific
+        // variant where vk's term matches i_0 (HS-faithful Branch B
+        // drop via Cyclic at cn=[c_pcs]).  See
+        // [[project-h17-resolve1-narrowing-mechanism]].
+        // Opt-out via TAM_RS_DISABLE_H17_4=1 for diagnostic comparison.
+        let h17_4_disabled = std::env::var("TAM_RS_DISABLE_H17_4").is_ok();
+        let in_precompute = crate::constraint::solver::sources::in_precompute_mode();
         let is_safe = |g: &Goal| -> bool {
             match g {
                 Goal::Chain(_, _) => chains_left > 0,
@@ -3918,7 +4262,16 @@ fn run_solve_all_safe_goals_disj(
                         && !crate::fact::is_kd_xor_fact(fa)
                         && !fa.is_no_sources()
                 }
-                Goal::Disj(_) | Goal::Split(_) | Goal::Subterm(_) => split_allowed,
+                Goal::Disj(_) | Goal::Subterm(_) => split_allowed,
+                // H17.4 HS-faithful: allow Split during saturate when
+                // splitAllowed (matches HS's `safeGoal SplitG = doSplit`).
+                // In practice split_allowed is rarely true during saturate
+                // (chain goals stay open), so this is a no-op for most cases
+                // — but it's the HS-faithful behavior.  Verified that aggressive
+                // force-split (TAM_RS_FORCE_SPLIT_SATURATE=1) makes things WORSE
+                // (8 Resolve1 cases instead of 2) because it forks every
+                // variant into a separate case rather than narrowing them.
+                Goal::Split(_) => split_allowed && (!in_precompute || !h17_4_disabled),
             }
         };
         let pick = goals.iter()
@@ -3949,12 +4302,18 @@ fn run_solve_all_safe_goals_disj(
                     // coerce-skipping `combine`.  `combine` runs at
                     // `refineSource` level once per saturate-outer
                     // iter (between calls to solveAllSafeGoals), not
-                    // per step within solveAllSafeGoals.  Earlier
-                    // Rust used `combine_case_names` here, which
-                    // truncated the chain to a single segment and
-                    // collapsed `I_1aencRegister_pk` to just `I_1`.
-                    let appended = append_step_name(&name, &sub_name);
-                    worklist.push((red.sys, appended, used,
+                    // per step within solveAllSafeGoals.
+                    // NOTE: `any_step_taken` is NOT set here — safe-goal
+                    // steps are normal HS behaviour and stable across
+                    // iters; flagging them re-iterates over-refining
+                    // C_2/S_2 chain cases on TLS_Handshake (kills PRF
+                    // C_2/S_2 cases at iter 3).  Only source-pick steps
+                    // mark progress for outer re-iter.  See
+                    // [[project-chaum-case-fresh-divergence]] for full
+                    // rationale.
+                    let mut new_name = name.clone();
+                    append_step_name_list(&mut new_name, &sub_name);
+                    worklist.push((red.sys, new_name, used,
                         new_chains_left, iters_left - 1));
                 }
                 GoalCases::Cases(cases) => {
@@ -3980,17 +4339,22 @@ fn run_solve_all_safe_goals_disj(
                     // types and similar source-saturated lemmas.
                     let toplevel_only = std::env::var("TAM_DISJ_REFINE_TOPLEVEL").is_ok();
                     let mut cases_iter = cases.into_iter();
+                    // NOTE: `any_step_taken` NOT set — see LinearNamed
+                    // comment above.  Safe-goal cases are normal HS
+                    // behavior and stable across iters.
                     if toplevel_only {
                         if let Some((sub_name, case_sys)) = cases_iter.next() {
-                            let appended = append_step_name(&name, &sub_name);
-                            worklist.push((case_sys, appended, used.clone(),
+                            let mut new_name = name.clone();
+                            append_step_name_list(&mut new_name, &sub_name);
+                            worklist.push((case_sys, new_name, used.clone(),
                                 new_chains_left, iters_left - 1));
                         }
                     } else {
                         let case_vec: Vec<_> = cases_iter.collect();
                         for (sub_name, case_sys) in case_vec.into_iter().rev() {
-                            let appended = append_step_name(&name, &sub_name);
-                            worklist.push((case_sys, appended, used.clone(),
+                            let mut new_name = name.clone();
+                            append_step_name_list(&mut new_name, &sub_name);
+                            worklist.push((case_sys, new_name, used.clone(),
                                 new_chains_left, iters_left - 1));
                         }
                     }
@@ -4045,6 +4409,35 @@ fn run_solve_all_safe_goals_disj(
                                 Vec<(String,
                                      crate::constraint::system::System,
                                      crate::fact::LNFact)>)> = None;
+        // TAM_DBG_USEFUL_KUS=1: dumps useful_kus + ths content + source-pick results
+        // per branch.  Used to diagnose source-availability divergences vs HS.
+        // See [[project-h17-2-resolve1-narrowing-mechanism]].
+        let dbg_useful = std::env::var("TAM_DBG_USEFUL_KUS").is_ok();
+        if dbg_useful {
+            eprintln!("[useful_kus] name={:?} n={} used={:?} ths_count={}",
+                name, useful_kus.len(), used, ths.len());
+            for (idx, src) in ths.iter().enumerate() {
+                let kind = match &src.goal {
+                    Goal::Action(_, gfa) => format!("Action({:?})", gfa.tag),
+                    Goal::Premise(_, gfa) => format!("Premise({:?})", gfa.tag),
+                    Goal::Chain(_, _) => "Chain".to_string(),
+                    Goal::Disj(_) => "Disj".to_string(),
+                    Goal::Subterm(_) => "Subterm".to_string(),
+                    Goal::Split(_) => "Split".to_string(),
+                };
+                let pat = match &src.goal {
+                    Goal::Action(_, gfa) | Goal::Premise(_, gfa) => {
+                        gfa.terms.first().map(|t| format!("{:?}",t).chars().take(60).collect::<String>()).unwrap_or_default()
+                    }
+                    _ => String::new(),
+                };
+                eprintln!("  ths[{}] kind={} pat={}", idx, kind, pat);
+            }
+            for (i, fa) in &useful_kus {
+                let head = fa.terms.first().map(|t| format!("{:?}",t).chars().take(80).collect::<String>()).unwrap_or_default();
+                eprintln!("  candidate i={:?} fa_head={}", i, head);
+            }
+        }
         for (i_cand, fa_cand) in useful_kus {
             let case_pairs_opt = if use_ctx_aware {
                 solve_with_source_cases_action_with_ctx(
@@ -4053,6 +4446,12 @@ fn run_solve_all_safe_goals_disj(
                 solve_with_source_cases_action(
                     ths, &red.sys, &i_cand, &fa_cand, avoid_max)
             };
+            if dbg_useful {
+                let n = case_pairs_opt.as_ref().map(|cp| cp.len()).unwrap_or(usize::MAX);
+                let head = fa_cand.terms.first().map(|t| format!("{:?}",t).chars().take(80).collect::<String>()).unwrap_or_default();
+                eprintln!("  tried fa_head={} result={}", head,
+                    if n == usize::MAX { "None".to_string() } else { format!("Some({})", n) });
+            }
             if let Some(case_pairs) = case_pairs_opt {
                 if !case_pairs.is_empty() {
                     picked = Some((i_cand, fa_cand, case_pairs));
@@ -4065,14 +4464,14 @@ fn run_solve_all_safe_goals_disj(
             // `nextStep = Nothing` → `return caseNames` (current
             // state survives).
             if trace {
-                eprintln!("[disj-refine] name={} -- no goal had matching source", name);
+                eprintln!("[disj-refine] name={:?} -- no goal had matching source", name);
             }
             finished.push((red.sys, name));
             continue;
         };
         if trace {
             let names: Vec<&str> = case_pairs.iter().map(|(n, _, _)| n.as_str()).collect();
-            eprintln!("[disj-refine] name={} i={:?} -- {} cases: {:?}",
+            eprintln!("[disj-refine] name={:?} i={:?} -- {} cases: {:?}",
                 name, i, case_pairs.len(), names);
         }
         // Source-label-based filter (Haskell-faithful): the picked
@@ -4084,7 +4483,7 @@ fn run_solve_all_safe_goals_disj(
             // No candidates returned by solve_with_source_cases_action
             // — surface as survivor (Haskell's asum returns [] here).
             if trace {
-                eprintln!("[disj-refine] name={} -- ALL USED", name);
+                eprintln!("[disj-refine] name={:?} -- ALL USED", name);
             }
             finished.push((red.sys, name));
             continue;
@@ -4115,12 +4514,18 @@ fn run_solve_all_safe_goals_disj(
                 } else {
                     new_used.insert(case_name.clone());
                 }
-                let combined = combine_case_names(&name, &case_name);
+                // HS-faithful: source-pick step APPENDS its name to
+                // `caseNames` (Sources.hs:232 `(caseNames ++ x)`).
+                // `combine` runs ONLY at refineSource level (between
+                // saturate iters), not per-step inside solveAllSafeGoals.
+                let mut new_name = name.clone();
+                append_step_name_list(&mut new_name, &case_name);
                 if trace {
-                    eprintln!("[disj-refine] commit ctx-aware case={} -> {}",
-                        case_name, combined);
+                    eprintln!("[disj-refine] commit ctx-aware case={} -> {:?}",
+                        case_name, new_name);
                 }
-                worklist.push((sys_cand, combined, new_used,
+                any_step_taken = true;
+                worklist.push((sys_cand, new_name, new_used,
                     chains_left, iters_left - 1));
                 any_branched = true;
                 continue;
@@ -4185,12 +4590,15 @@ fn run_solve_all_safe_goals_disj(
             } else {
                 new_used.insert(case_name.clone());
             }
-            let combined = combine_case_names(&name, &case_name);
+            // HS-faithful append (see ctx-aware path above for rationale).
+            let mut new_name = name.clone();
+            append_step_name_list(&mut new_name, &case_name);
             if trace {
-                eprintln!("[disj-refine] commit legacy case={} -> {}",
-                    case_name, combined);
+                eprintln!("[disj-refine] commit legacy case={} -> {:?}",
+                    case_name, new_name);
             }
-            worklist.push((sub.sys, combined, new_used,
+            any_step_taken = true;
+            worklist.push((sub.sys, new_name, new_used,
                 chains_left, iters_left - 1));
             any_branched = true;
             if no_source_pick_fork { break; }
@@ -4209,14 +4617,25 @@ fn run_solve_all_safe_goals_disj(
     // strips leading "coerce" entries from `initial_name`; if anything
     // non-coerce remains it's the only segment we keep (the rest of
     // the chain is discarded), otherwise the accumulated step_names
-    // take over.  This is the HS Sources.hs:135-137 behaviour that
-    // distinguishes us from per-step appending.
-    finished.into_iter()
-        .map(|(sys, step_names)| {
-            let combined = combine_case_names(&initial_name, &step_names);
+    // take over.  Mirrors Sources.hs:135-139 exactly.
+    let branches: Vec<(System, Vec<String>)> = finished.into_iter()
+        .map(|(sys, step_names_list)| {
+            let combined = combine_case_names_list(&initial_name, &step_names_list);
             (sys, combined)
         })
-        .collect()
+        .collect();
+    (branches, any_step_taken)
+}
+
+/// Convert a stored case-name `String` to a step-name list.  Used
+/// when crossing the legacy `String`-based API into the HS-faithful
+/// `Vec<String>` representation.  Empty string → empty Vec;
+/// otherwise treat the whole String as a single list element.
+/// (Multi-element strings from saturate's internal list-aware path
+/// reach this function only via the `cases_set`/`cases_take` legacy
+/// wrappers, which join with `_` first.)
+fn string_to_name_list(name: &str) -> Vec<String> {
+    if name.is_empty() { Vec::new() } else { vec![name.to_string()] }
 }
 
 /// `solveWithSource` lite — match a precomputed source against a live
@@ -4498,74 +4917,12 @@ fn freshen_system(
         v2.idx = v2.idx.saturating_add(shift);
         v2
     };
-    fn shift_guarded(
-        g: &crate::guarded::Guarded,
-        shift: &dyn Fn(&tamarin_parser::ast::VarSpec) -> tamarin_parser::ast::VarSpec,
-    ) -> crate::guarded::Guarded {
-        use crate::guarded::Guarded;
-        match g {
-            Guarded::Atom(a) => Guarded::Atom(shift_atom(a, shift)),
-            Guarded::Conj(xs) => Guarded::Conj(xs.iter().map(|x| shift_guarded(x, shift)).collect()),
-            Guarded::Disj(xs) => Guarded::Disj(xs.iter().map(|x| shift_guarded(x, shift)).collect()),
-            Guarded::GGuarded { qua, vars, guards, body } => {
-                // Bound vars get shifted too (they're locally scoped but
-                // we keep the global shift to maintain the invariant that
-                // ALL idxs in this case have been shifted).
-                let vars2: Vec<_> = vars.iter().map(shift).collect();
-                let guards2: Vec<_> = guards.iter().map(|a| shift_atom(a, shift)).collect();
-                Guarded::GGuarded {
-                    qua: qua.clone(),
-                    vars: vars2,
-                    guards: guards2,
-                    body: Box::new(shift_guarded(body, shift)),
-                }
-            }
-        }
-    }
-    fn shift_atom(
-        a: &tamarin_parser::ast::Atom,
-        shift: &dyn Fn(&tamarin_parser::ast::VarSpec) -> tamarin_parser::ast::VarSpec,
-    ) -> tamarin_parser::ast::Atom {
-        use tamarin_parser::ast::Atom;
-        match a {
-            Atom::Eq(s, t) => Atom::Eq(shift_term(s, shift), shift_term(t, shift)),
-            Atom::Less(s, t) => Atom::Less(shift_term(s, shift), shift_term(t, shift)),
-            Atom::LessMset(s, t) => Atom::LessMset(shift_term(s, shift), shift_term(t, shift)),
-            Atom::Subterm(s, t) => Atom::Subterm(shift_term(s, shift), shift_term(t, shift)),
-            Atom::Action(fact, t) => {
-                let mut f2 = fact.clone();
-                f2.args = f2.args.into_iter().map(|tm| shift_term(&tm, shift)).collect();
-                Atom::Action(f2, shift_term(t, shift))
-            }
-            Atom::Last(t) => Atom::Last(shift_term(t, shift)),
-            Atom::Pred(fact) => {
-                let mut f2 = fact.clone();
-                f2.args = f2.args.into_iter().map(|tm| shift_term(&tm, shift)).collect();
-                Atom::Pred(f2)
-            }
-        }
-    }
-    fn shift_term(
-        t: &tamarin_parser::ast::Term,
-        shift: &dyn Fn(&tamarin_parser::ast::VarSpec) -> tamarin_parser::ast::VarSpec,
-    ) -> tamarin_parser::ast::Term {
-        use tamarin_parser::ast::Term;
-        match t {
-            Term::Var(v) => Term::Var(shift(v)),
-            Term::App(n, args) => Term::App(n.clone(),
-                args.iter().map(|a| shift_term(a, shift)).collect()),
-            Term::AlgApp(n, a, b) => Term::AlgApp(n.clone(),
-                Box::new(shift_term(a, shift)), Box::new(shift_term(b, shift))),
-            Term::Pair(args) => Term::Pair(args.iter().map(|a| shift_term(a, shift)).collect()),
-            Term::Diff(a, b) => Term::Diff(
-                Box::new(shift_term(a, shift)), Box::new(shift_term(b, shift))),
-            Term::BinOp(op, a, b) => Term::BinOp(*op,
-                Box::new(shift_term(a, shift)), Box::new(shift_term(b, shift))),
-            Term::PatMatch(inner) => Term::PatMatch(Box::new(shift_term(inner, shift))),
-            other => other.clone(),
-        }
-    }
-    let shift_g = |g: &crate::guarded::Guarded| shift_guarded(g, &shift_parser_var);
+    // With DeBruijn bindings, only `BVar::Free` leaves carry idxs that
+    // need shifting; `Bound` and `GBinding` are positional and unaffected.
+    // `map_lvars_in_guarded` walks every Free leaf in the GAtoms.
+    let shift_g = |g: &crate::guarded::Guarded| {
+        crate::guarded::map_lvars_in_guarded(g, shift_parser_var)
+    };
     out.formulas = out.formulas.iter().map(shift_g).collect();
     out.solved_formulas = out.solved_formulas.iter().map(shift_g).collect();
     out.lemmas = out.lemmas.iter().map(shift_g).collect();
@@ -4919,6 +5276,22 @@ pub fn solve_with_source_cases_action_with_ctx(
                     }
                     ok
                 }
+                // H17.9 (2026-05-28): App pattern + Var live — HS's
+                // `maybeMatcher` (Sources.hs:391-396) falls into the
+                // `_ -> True` catch-all for this case, allowing the
+                // source-pick on bare-var live terms.  The unification
+                // then binds the live var to the pattern's structure
+                // (e.g. `x.3 → sign(t.1, t.2)`).  This is the missing
+                // mechanism for the iter-2 c_pcs cycle in resolved1
+                // (see H17.5+memory).  Opt-out via TAM_RS_DISABLE_H17_9=1.
+                (Term::App(pf, pargs), Term::Lit(Lit::Var(_))) => {
+                    let h17_9_enabled = std::env::var("TAM_RS_DISABLE_H17_9").is_err();
+                    if dbg_match {
+                        eprintln!("  → app-pat-var-live: h17_9_enabled={}", h17_9_enabled);
+                    }
+                    let _ = (pf, pargs);
+                    h17_9_enabled
+                }
                 _ => {
                     if dbg_match {
                         eprintln!("  → reject: pat is Lit/App mismatch with live");
@@ -5233,69 +5606,67 @@ fn auto_resolve_single_case_ku(
 /// Result is the underscore-joined effective list — the FIRST
 /// non-coerce segment from `name`, falling back to `sub_name` if
 /// `name` is empty or entirely "coerce" segments.
-/// HS-faithful `caseNames ++ x` (Sources.hs:230) for the
-/// solveAllSafeGoals inner loop.  Each step's name is APPENDED to
-/// the existing case-name chain.  Multi-segment names like
-/// `I_1aencRegister_pk` come from this — the saturate sub-step
-/// path is preserved through all iterations.  `combine` (which
-/// truncates) runs only at `refineSource` granularity, between
-/// outer saturate iterations.
-///
-/// Empty `name` → just `sub_name`.  Empty `sub_name` → just `name`.
-/// Otherwise concatenate with no separator (matches HS where
-/// caseNames is `[String]` and `concat` joins them on display).
-fn append_step_name(name: &str, sub_name: &str) -> String {
-    if name.is_empty() { return sub_name.to_string(); }
-    if sub_name.is_empty() { return name.to_string(); }
-    let mut out = String::with_capacity(name.len() + sub_name.len());
-    out.push_str(name);
-    out.push_str(sub_name);
-    out
+/// HS-faithful `caseNames ++ x` (Sources.hs:230) — append the step
+/// name as a NEW list element.  HS's `caseNames` is `[String]`; we
+/// model it as `Vec<String>` here.  `combine_case_names_list` runs
+/// at refineSource boundaries to truncate (HS combine).
+fn append_step_name_list(names: &mut Vec<String>, sub_name: &str) {
+    if !sub_name.is_empty() {
+        names.push(sub_name.to_string());
+    }
 }
 
+/// Render a step-name list as a single user-facing case-name string,
+/// matching HS's `intercalate "_" names'` (ProofMethod.hs:474).
+pub(crate) fn case_name_list_to_string(names: &[String]) -> String {
+    names.join("_")
+}
+
+/// HS-faithful `combine` (Sources.hs:135-139):
+///
+/// ```haskell
+/// combine []            ns' = ns'
+/// combine ("coerce":ns) ns' = combine ns ns'
+/// combine (n       :_)  _   = [n]
+/// ```
+///
+/// Strips leading `"coerce"` elements from `existing`, then:
+/// - if everything stripped → return `new_names` (HS uses `ns'`)
+/// - else return ONLY the first non-coerce element as a singleton,
+///   dropping the rest of `existing` AND `new_names` entirely.
+///
+/// This is the refineSource-boundary collapse that keeps HS's case
+/// names short across saturate iters.  Mirrors Sources.hs exactly —
+/// no underscore-prefix legacy: each `Vec<String>` element is a
+/// single step name from `solveGoal`'s return.
+fn combine_case_names_list(existing: &[String], new_names: &[String]) -> Vec<String> {
+    let mut i = 0;
+    while i < existing.len() && existing[i] == "coerce" {
+        i += 1;
+    }
+    if i >= existing.len() {
+        // All stripped (or empty existing) — use new names.
+        new_names.to_vec()
+    } else {
+        // First non-coerce; discard rest of existing AND new_names.
+        vec![existing[i].clone()]
+    }
+}
+
+/// Legacy single-string combine — kept for backward-compat callers
+/// (chain-fold path in `saturate_sources_inner`) that work with
+/// underscore-style intruder prefixes inside a single `String`.
+/// Strips leading `coerce_`, `irecv_`, `ipub_`, `isend_`, and
+/// `c_<sym>_` and returns the first non-stripable remainder.
 fn combine_case_names(name: &str, sub_name: &str) -> String {
-    // Haskell `combine`:
-    //   combine []            ns' = ns'
-    //   combine ("coerce":ns) ns' = combine ns ns'
-    //   combine (n       :_)  _   = [n]
-    //
-    // Treats names as a LIST of (single) case-names accumulated from
-    // each refinement step. Strips leading "coerce" entries, then keeps
-    // the FIRST non-coerce name and DISCARDS the rest (including the
-    // new step's name).
-    //
-    // Our representation accumulates the name list as a single
-    // underscore-joined string. To recover the list boundary correctly
-    // for rule names like `I_1`, we treat known intruder prefixes as
-    // their own list entries: `coerce`, `irecv`, `ipub`, `isend`, and
-    // `c_<sym>` (constructors). Anything else, including `I_1` /
-    // `Reveal_ltk`, is the actual rule name and stops the strip.
     let mut tail = name;
     loop {
-        if let Some(rest) = tail.strip_prefix("coerce_") {
-            tail = rest; continue;
-        }
-        if tail == "coerce" {
-            // All-coerce name → fall through to sub_name.
-            return sub_name.to_string();
-        }
-        if let Some(rest) = tail.strip_prefix("irecv_") {
-            tail = rest; continue;
-        }
-        if tail == "irecv" {
-            return sub_name.to_string();
-        }
-        if let Some(rest) = tail.strip_prefix("ipub_") {
-            tail = rest; continue;
-        }
-        if let Some(rest) = tail.strip_prefix("isend_") {
-            tail = rest; continue;
-        }
-        // `c_<sym>_<rest>` — strip leading constructor.  We require the
-        // sym segment (after `c_`) to be a single underscore-bounded
-        // ident — `c_aenc`, `c_h`, `c_pk`, etc.  A bare `c_fresh` /
-        // `c_pub` (no trailing `_<rest>`) is the actual case name and
-        // stops the strip.
+        if let Some(rest) = tail.strip_prefix("coerce_") { tail = rest; continue; }
+        if tail == "coerce" { return sub_name.to_string(); }
+        if let Some(rest) = tail.strip_prefix("irecv_") { tail = rest; continue; }
+        if tail == "irecv" { return sub_name.to_string(); }
+        if let Some(rest) = tail.strip_prefix("ipub_") { tail = rest; continue; }
+        if let Some(rest) = tail.strip_prefix("isend_") { tail = rest; continue; }
         if let Some(rest_after_c) = tail.strip_prefix("c_") {
             if let Some(pos) = rest_after_c.find('_') {
                 tail = &rest_after_c[pos + 1..];
@@ -5699,10 +6070,10 @@ fn freshen_system_some_inst(
     for v in keep {
         bindings.insert(v.clone(), v.clone());
     }
-    let mut import_var = |v: &tamarin_term::lterm::LVar,
-                          bindings: &mut BTreeMap<
-                            tamarin_term::lterm::LVar,
-                            tamarin_term::lterm::LVar>| {
+    let import_var = |v: &tamarin_term::lterm::LVar,
+                      bindings: &mut BTreeMap<
+                        tamarin_term::lterm::LVar,
+                        tamarin_term::lterm::LVar>| {
         if bindings.contains_key(v) { return; }
         let new_idx = maude.reserve_idxs(1);
         let new_v = tamarin_term::lterm::LVar {
@@ -6158,11 +6529,12 @@ fn apply_source_case_action(
     }
     // TAM_DBG_CASE_DISJ=1: dump case_sys's eq_store.conj BEFORE freshen.
     if std::env::var("TAM_DBG_CASE_DISJ").is_ok() {
+        let trunc = if std::env::var("TAM_DBG_CASE_DISJ_FULL").is_ok() { 9999 } else { 60 };
         for (i, d) in case_sys.eq_store.conj.iter().enumerate() {
             for (j, s) in d.substs.iter().enumerate() {
                 let pairs: Vec<String> = s.to_list().iter()
                     .map(|(k, v)| format!("{}.{}/{:?}→{:?}", k.name, k.idx, k.sort,
-                        format!("{:?}", v).chars().take(60).collect::<String>()))
+                        format!("{:?}", v).chars().take(trunc).collect::<String>()))
                     .collect();
                 eprintln!("[case_disj-pre] case={} disj[{}].subst[{}]={:?} entries=[{}]",
                     case_label, i, j, d.split_id, pairs.join(", "));
@@ -6173,11 +6545,12 @@ fn apply_source_case_action(
         case_sys, rename_shift, &empty_keep);
     // TAM_DBG_CASE_DISJ=1: dump renamed_case's eq_store.conj AFTER freshen.
     if std::env::var("TAM_DBG_CASE_DISJ").is_ok() {
+        let trunc = if std::env::var("TAM_DBG_CASE_DISJ_FULL").is_ok() { 9999 } else { 60 };
         for (i, d) in renamed_case.eq_store.conj.iter().enumerate() {
             for (j, s) in d.substs.iter().enumerate() {
                 let pairs: Vec<String> = s.to_list().iter()
                     .map(|(k, v)| format!("{}.{}/{:?}→{:?}", k.name, k.idx, k.sort,
-                        format!("{:?}", v).chars().take(60).collect::<String>()))
+                        format!("{:?}", v).chars().take(trunc).collect::<String>()))
                     .collect();
                 eprintln!("[case_disj-post] case={} disj[{}].subst[{}]={:?} entries=[{}]",
                     case_label, i, j, d.split_id, pairs.join(", "));
@@ -6242,14 +6615,45 @@ fn apply_source_case_action(
                 format!("{:?}", t).chars().take(100).collect::<String>());
         }
     }
+    // H15.1 (2026-05-28): flip orientation when live term is a Var so
+    // pattern vars are PRESERVED (HS-faithful behavior).  Gate via
+    // `TAM_RS_DISABLE_H15=1` for rollback.
+    let flip_h15 = std::env::var("TAM_RS_DISABLE_H15").is_err();
     let term_eqs: Vec<_> = match_pairs.into_iter()
-        .map(|(v, t)| tamarin_term::rewriting::Equal {
-            lhs: tamarin_term::term::Term::Lit(
-                tamarin_term::vterm::Lit::Var(v)),
-            rhs: t,
+        .map(|(v, t)| {
+            let pattern_var_term = tamarin_term::term::Term::Lit(
+                tamarin_term::vterm::Lit::Var(v));
+            if flip_h15 {
+                if let tamarin_term::term::Term::Lit(
+                    tamarin_term::vterm::Lit::Var(_)) = &t {
+                    // Flip: live_var → pattern_var.
+                    return tamarin_term::rewriting::Equal {
+                        lhs: t,
+                        rhs: pattern_var_term,
+                    };
+                }
+            }
+            tamarin_term::rewriting::Equal {
+                lhs: pattern_var_term,
+                rhs: t,
+            }
         })
         .collect();
-    if !term_eqs.is_empty() {
+    // H17.6 (2026-05-28): Save term_eqs for application AFTER conjoin
+    // (HS-faithful "bare-var preservation" — see H17.5 memory).  When
+    // TAM_RS_ENABLE_H17_6=1, skip the pre-graft refineSubst.  The
+    // term_eqs are applied to the merged system AFTER conjoin so that
+    // pattern vars stay in the case body until the live system can
+    // see them, allowing eq_store bindings (from chain closures etc.)
+    // to propagate to vk's KU actions via substSystem.  This unblocks
+    // the iter-2 c_pcs cycle detection for resolved1.
+    let h17_6 = std::env::var("TAM_RS_ENABLE_H17_6").is_ok();
+    let deferred_term_eqs: Vec<_> = if h17_6 {
+        term_eqs.clone()
+    } else {
+        Vec::new()
+    };
+    if !term_eqs.is_empty() && !h17_6 {
         let r = refined.solve_term_eqs(SplitStrategy::SplitNow, &term_eqs);
         if matches!(r, Err(_) | Ok(SolveOutcome::Contradictory)) {
             dbg("refineSubst-contradictory");
@@ -6263,7 +6667,52 @@ fn apply_source_case_action(
                 format!("{:?}", t).chars().take(100).collect::<String>());
         }
     }
+    // H15.3 (2026-05-28): selectively defer pattern_var → App(...) substs
+    // so enforce_ku_action_uniqueness can find structural matches on
+    // generic pattern vars BEFORE they're specialized.  HS-faithful in
+    // spirit: HS's lazy evaluation preserves pattern vars; we simulate
+    // by removing/restoring the specializing substs around subst_system.
+    // Gate via TAM_RS_DISABLE_H15_3=1 for rollback.
+    //
+    // (H15.2 was a coarse "skip subst_system entirely" — too broken.
+    //  See [[project-h15-2-defer-subst]] for that experiment.)
+    let h15_3_enabled = std::env::var("TAM_RS_ENABLE_H15_3").is_ok();
+    // Pattern vars: the RENAMED abstract goal's frees (which is what the
+    // match was actually performed against).  These are the vars that the
+    // matchToGoal subst would bind.
+    let pattern_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar> = if h15_3_enabled {
+        use tamarin_term::lterm::HasFrees;
+        let mut s = std::collections::BTreeSet::new();
+        s.insert(renamed_abstract_node.clone());
+        renamed_abstract_action.for_each_free(
+            &mut |v: &tamarin_term::lterm::LVar| { s.insert(v.clone()); });
+        s
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let deferred: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)> = if h15_3_enabled {
+        refined.sys.eq_store.subst.to_list().into_iter()
+            .filter(|(v, t)| pattern_vars.contains(v)
+                && matches!(t, tamarin_term::term::Term::App(_, _)))
+            .collect()
+    } else { Vec::new() };
+    if !deferred.is_empty() {
+        let keep_entries: Vec<_> = refined.sys.eq_store.subst.to_list().into_iter()
+            .filter(|(v, t)| !(pattern_vars.contains(v)
+                && matches!(t, tamarin_term::term::Term::App(_, _))))
+            .collect();
+        refined.sys.eq_store.subst = tamarin_term::subst::Subst::from_list(keep_entries);
+        if std::env::var("TAM_RS_DBG_H15_3").is_ok() {
+            eprintln!("[h15_3] deferred {} pattern→App substs in case={} (apply_action)",
+                deferred.len(), case_label);
+        }
+    }
     refined.subst_system();
+    if !deferred.is_empty() {
+        let mut current = refined.sys.eq_store.subst.to_list();
+        current.extend(deferred);
+        refined.sys.eq_store.subst = tamarin_term::subst::Subst::from_list(current);
+    }
     if refined.sys.eq_store.is_false() {
         dbg("post-subst-eq-store-false");
         return None;
@@ -6376,9 +6825,9 @@ fn apply_source_case_action(
         let collect_frees = |sys: &System| -> Vec<tamarin_term::lterm::LVar> {
             let mut out: Vec<tamarin_term::lterm::LVar> = Vec::new();
             let mut seen = std::collections::BTreeSet::new();
-            let mut push = |v: &tamarin_term::lterm::LVar,
-                            out: &mut Vec<tamarin_term::lterm::LVar>,
-                            seen: &mut std::collections::BTreeSet<tamarin_term::lterm::LVar>| {
+            let push = |v: &tamarin_term::lterm::LVar,
+                        out: &mut Vec<tamarin_term::lterm::LVar>,
+                        seen: &mut std::collections::BTreeSet<tamarin_term::lterm::LVar>| {
                 if seen.insert(v.clone()) { out.push(v.clone()); }
             };
             for (id, ru) in &sys.nodes {
@@ -6463,6 +6912,24 @@ fn apply_source_case_action(
         return None;
     }
 
+    // H17.6 (2026-05-28): Defer match-bindings to AFTER conjoin instead
+    // of applying them on the refined case body before grafting.  Goal
+    // was to preserve pattern vars in case body through conjoin so eq_store
+    // bindings (from later chain closures) could reach vk's KU actions
+    // and enable HS-faithful Cyclic detection.  EMPIRICAL RESULT:
+    // behaviorally equivalent (resolved1 still 26, no regressions, no
+    // improvement).  The deferred bindings have the same effect as
+    // eager bindings — the substitution propagates through the merged
+    // system identically.  Kept opt-in (TAM_RS_ENABLE_H17_6=1) for
+    // diagnostic comparison; default OFF.
+    if !deferred_term_eqs.is_empty() {
+        let res = r.solve_term_eqs(SplitStrategy::SplitNow, &deferred_term_eqs);
+        if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
+            dbg("h17_6-deferred-term-eqs-contradictory");
+            return None;
+        }
+    }
+
     // ---------------------------------------------------------------
     // E.5 — edge fact-equality propagation.  Mirror the equivalent
     // step in `apply_source_case_premise`.  After conjoin, walk every
@@ -6533,6 +7000,7 @@ fn apply_source_case_action(
     // step in `apply_source_case_premise`.
     if !r.sys.eq_store.conj.is_empty() && !r.sys.eq_store.subst.is_empty() {
         let empty_subst = tamarin_term::subst::Subst::empty();
+        let _op_guard = crate::constraint::solver::trace::OpLabelGuard::new("applySource:conjoin_refilter");
         let _ = r.sys.eq_store.apply_eq_store(&ctx.maude, &empty_subst);
         let needs_fold = r.sys.eq_store.conj.iter().any(|d| d.substs.len() == 1);
         if needs_fold {
@@ -6717,11 +7185,25 @@ fn apply_source_case_premise(
 
     // A.3 — refineSubst: solveSubstEqs SplitNow subst >> substSystem.
     let mut refined = Reduction::new(ctx, renamed_case);
+    // H15.1 (2026-05-28): same flip as in apply_source_case_action.
+    let flip_h15 = std::env::var("TAM_RS_DISABLE_H15").is_err();
     let term_eqs: Vec<_> = match_pairs.into_iter()
-        .map(|(v, t)| tamarin_term::rewriting::Equal {
-            lhs: tamarin_term::term::Term::Lit(
-                tamarin_term::vterm::Lit::Var(v)),
-            rhs: t,
+        .map(|(v, t)| {
+            let pattern_var_term = tamarin_term::term::Term::Lit(
+                tamarin_term::vterm::Lit::Var(v));
+            if flip_h15 {
+                if let tamarin_term::term::Term::Lit(
+                    tamarin_term::vterm::Lit::Var(_)) = &t {
+                    return tamarin_term::rewriting::Equal {
+                        lhs: t,
+                        rhs: pattern_var_term,
+                    };
+                }
+            }
+            tamarin_term::rewriting::Equal {
+                lhs: pattern_var_term,
+                rhs: t,
+            }
         })
         .collect();
     if !term_eqs.is_empty() {
@@ -6731,7 +7213,52 @@ fn apply_source_case_premise(
             return None;
         }
     }
+    // H15.3 (2026-05-28): selectively defer pattern_var → App(...) substs
+    // so enforce_ku_action_uniqueness can find structural matches on
+    // generic pattern vars BEFORE they're specialized.  HS-faithful in
+    // spirit: HS's lazy evaluation preserves pattern vars; we simulate
+    // by removing/restoring the specializing substs around subst_system.
+    // Gate via TAM_RS_DISABLE_H15_3=1 for rollback.
+    //
+    // (H15.2 was a coarse "skip subst_system entirely" — too broken.
+    //  See [[project-h15-2-defer-subst]] for that experiment.)
+    let h15_3_enabled = std::env::var("TAM_RS_ENABLE_H15_3").is_ok();
+    // Pattern vars: the RENAMED abstract goal's frees (which is what the
+    // match was actually performed against).  These are the vars that the
+    // matchToGoal subst would bind.
+    let pattern_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar> = if h15_3_enabled {
+        use tamarin_term::lterm::HasFrees;
+        let mut s = std::collections::BTreeSet::new();
+        s.insert(renamed_abstract_node.clone());
+        renamed_abstract_fact.for_each_free(
+            &mut |v: &tamarin_term::lterm::LVar| { s.insert(v.clone()); });
+        s
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let deferred: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)> = if h15_3_enabled {
+        refined.sys.eq_store.subst.to_list().into_iter()
+            .filter(|(v, t)| pattern_vars.contains(v)
+                && matches!(t, tamarin_term::term::Term::App(_, _)))
+            .collect()
+    } else { Vec::new() };
+    if !deferred.is_empty() {
+        let keep_entries: Vec<_> = refined.sys.eq_store.subst.to_list().into_iter()
+            .filter(|(v, t)| !(pattern_vars.contains(v)
+                && matches!(t, tamarin_term::term::Term::App(_, _))))
+            .collect();
+        refined.sys.eq_store.subst = tamarin_term::subst::Subst::from_list(keep_entries);
+        if std::env::var("TAM_RS_DBG_H15_3").is_ok() {
+            eprintln!("[h15_3] deferred {} pattern→App substs in case={} (apply_premise)",
+                deferred.len(), case_label);
+        }
+    }
     refined.subst_system();
+    if !deferred.is_empty() {
+        let mut current = refined.sys.eq_store.subst.to_list();
+        current.extend(deferred);
+        refined.sys.eq_store.subst = tamarin_term::subst::Subst::from_list(current);
+    }
     if refined.sys.eq_store.is_false() {
         dbg("post-subst-eq-store-false");
         return None;
@@ -6864,6 +7391,7 @@ fn apply_source_case_premise(
     // variant [0]'s untyped-signature path, and reaches a spurious Solved.
     if !r.sys.eq_store.conj.is_empty() && !r.sys.eq_store.subst.is_empty() {
         let empty_subst = tamarin_term::subst::Subst::empty();
+        let _op_guard = crate::constraint::solver::trace::OpLabelGuard::new("applySource:conjoin_refilter");
         let _ = r.sys.eq_store.apply_eq_store(&ctx.maude, &empty_subst);
         let needs_fold = r.sys.eq_store.conj.iter().any(|d| d.substs.len() == 1);
         if needs_fold {

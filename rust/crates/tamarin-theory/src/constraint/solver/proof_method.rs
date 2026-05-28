@@ -742,15 +742,17 @@ mod tests {
             mkvar("i", SortHint::Node),
         );
         let body = crate::guarded::Guarded::Conj(Vec::new());
-        let fm = crate::guarded::Guarded::GGuarded {
-            qua: crate::guarded::Quant::Ex,
-            vars: vec![
+        // Build with close_guarded so the binder's `k` and `i` are
+        // properly substituted to `Bound` in the guard atom.
+        let fm = crate::guarded::close_guarded(
+            crate::guarded::Quant::Ex,
+            vec![
                 VarSpec { name: "k".into(), idx: 0, sort: SortHint::Msg, typ: None },
                 VarSpec { name: "i".into(), idx: 0, sort: SortHint::Node, typ: None },
             ],
-            guards: vec![action_atom],
-            body: Box::new(body),
-        };
+            vec![action_atom],
+            body,
+        );
         let mut s = System::empty();
         s.formulas.push(fm);
         let r = exec_proof_method(&ctx, &ProofMethod::Induction, &s).expect("induction");
