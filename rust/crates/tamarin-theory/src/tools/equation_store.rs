@@ -1348,7 +1348,16 @@ impl EquationStore {
                 self.sort_disj_substs();
             }
             changed |= self.simp_empty_disj();
-            if self.simp_singleton_avoiding(&mut alloc, external_preserve, maude) {
+            // H29 (2026-05-29): during saturation (precompute), do NOT
+            // fold singleton variant disjs into the free subst. HS keeps
+            // the variant disj LAZY in cdCases (RuleACConstrs) during
+            // saturate; the binding stays in the Disj, so subst_system
+            // never bakes it into rule conclusion terms. Opt-out:
+            // TAM_RS_DISABLE_H29=1.
+            let h29_skip_fold = std::env::var("TAM_RS_DISABLE_H29").is_err()
+                && crate::constraint::solver::sources::in_precompute_mode();
+            if !h29_skip_fold
+                && self.simp_singleton_avoiding(&mut alloc, external_preserve, maude) {
                 changed = true;
                 self.sort_disj_substs();
             }
