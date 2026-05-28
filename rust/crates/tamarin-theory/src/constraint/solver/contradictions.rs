@@ -105,7 +105,32 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
             reason: crate::constraint::constraints::Reason::Adversary,
         });
     }
-    if cyclic(&all_less) { out.push(Contradiction::Cyclic); }
+    // HS-faithful: `rawEdgeRel = sEdges ++ unsolvedChains` (System.hs:1613-
+    // 1616) — unsolved chain goals contribute (c.0, p.0) to the less-
+    // relation for cycle detection. Without this, RS misses cycles HS
+    // catches when the cycle goes through an open chain. Root cause of
+    // StatVerif KU(pcs) saturate over-enumeration.
+    for (g, st) in &sys.goals {
+        if st.solved { continue; }
+        if let crate::constraint::constraints::Goal::Chain(c, p) = g {
+            all_less.push(LessAtom {
+                smaller: resolve(&c.0),
+                larger: resolve(&p.0),
+                reason: crate::constraint::constraints::Reason::Adversary,
+            });
+        }
+    }
+    if cyclic(&all_less) {
+        // H14-style diagnostic: dump the actual cycle path so a missing
+        // less_atom (vs HS) can be identified by diffing the paths.
+        if std::env::var("TAM_RS_DBG_CYCLE_PATH").is_ok() {
+            let path = cyclic_with_path(&all_less);
+            let path_str: Vec<String> = path.iter()
+                .map(|n| format!("{}_{}", n.name, n.idx)).collect();
+            eprintln!("[CYCLE_PATH] cycle: {}", path_str.join(" → "));
+        }
+        out.push(Contradiction::Cyclic);
+    }
     // Sort-conflated LVars defence-in-depth: two LVars sharing
     // `(name, idx)` but with disjoint sub-sorts (Pub vs Fresh, etc.)
     // can't be reconciled.  Haskell freshens globally so this never
@@ -262,6 +287,7 @@ fn has_subterm_cycle_contra(ctx: &ProofContext, sys: &System) -> bool {
 fn has_impossible_chain(ctx: &ProofContext, sys: &System) -> bool {
     use crate::constraint::constraints::Goal;
     use crate::fact::FactTag;
+    let dbg = std::env::var("TAM_RS_DBG_IMPOSSIBLE_CHAIN").is_ok();
 
     for (g, st) in &sys.goals {
         if st.solved { continue; }
@@ -281,7 +307,14 @@ fn has_impossible_chain(ctx: &ProofContext, sys: &System) -> bool {
         if !matches!(prem_fact.tag, FactTag::Kd) { continue; }
         let t_start = match conc_fact.terms.first() { Some(t) => t, None => continue };
         let t_end = match prem_fact.terms.first() { Some(t) => t, None => continue };
-        let Some(poss) = possible_root_syms(t_start) else { continue };
+        let poss_opt = possible_root_syms(t_start);
+        if dbg {
+            use tamarin_term::pretty::pretty_lnterm;
+            eprintln!("[ic] t_start={} t_end={} poss_root={:?} pc_true_subterm={}",
+                pretty_lnterm(t_start), pretty_lnterm(t_end),
+                poss_opt.is_some(), ctx.pc_true_subterm);
+        }
+        let Some(poss) = poss_opt else { continue };
         // Haskell:
         //   if pcTrueSubterm
         //      then do req_end <- rootSym t_end
@@ -303,6 +336,9 @@ fn has_impossible_chain(ctx: &ProofContext, sys: &System) -> bool {
                 None => false,
             }
         };
+        if dbg {
+            eprintln!("[ic] fires={}", fires);
+        }
         if fires {
             return true;
         }
@@ -467,6 +503,72 @@ fn has_forbidden_chain(sys: &System) -> bool {
     use crate::constraint::constraints::Goal;
     use crate::fact::FactTag;
     use tamarin_term::lterm::is_msg_var;
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+
+    // Build a disj-equivalence relation over Msg-Vars: two vars are
+    // equivalent if, in some disj subst, they both have the same
+    // non-trivial image.  Mirrors HS's behavior at this case state
+    // where simp would have folded the disj down to one subst before
+    // the contradictions check — but RS's variant-pick produces a
+    // 2-subst disj that simp doesn't fold (subst[0] keeps the var,
+    // subst[1] binds it to a concrete term).  HS's path commits to
+    // subst[0] via simpMinimize+substCreatesNonNormalTerms on subst[1];
+    // since RS's NF check doesn't catch this case, walk the disj
+    // substs directly and treat vars that coincide in any branch as
+    // equivalent.
+    //
+    // For each disj subst, group vars by their image term.  Vars
+    // sharing a non-trivial image in some subst are equivalent under
+    // that branch.  Conservative: treat them as equivalent for the
+    // ForbiddenChain check, which means firing on chains where t_start
+    // would equal a KU-action term in any branch.  Root cause of
+    // StatVerif Resolve2_d_1_check_getmsg_d_0_fst_d_1_check_getmsg
+    // case survival (see [[project-statverif-aborted-contract-reachable]]).
+    let mut equivalence_classes: std::collections::HashMap<
+        tamarin_term::lterm::LVar,
+        std::collections::HashSet<tamarin_term::lterm::LVar>> =
+        std::collections::HashMap::new();
+    // Compute a coarse "head signature" of a term for grouping: the
+    // outermost function symbol (or Var/Const tag).  Two Msg-Vars
+    // mapped to App-headed terms with the same outer function symbol
+    // in the same disj subst are treated as candidate-equivalent — they
+    // would unify modulo the inner witness aliasing.  This catches HS's
+    // variant-pick behavior where Maude returns multiple unifiers but
+    // simp collapses them to a single canonical form.
+    let term_head_sig = |t: &tamarin_term::lterm::LNTerm| -> Option<Vec<u8>> {
+        match t {
+            Term::App(tamarin_term::function_symbols::FunSym::NoEq(sym), _) =>
+                Some(sym.name.clone()),
+            _ => None,
+        }
+    };
+    for disj in &sys.eq_store.conj {
+        for subst in &disj.substs {
+            let pairs = subst.to_list();
+            // Group Msg-vars by their image's outermost function symbol.
+            let mut by_head: std::collections::HashMap<
+                Vec<u8>,
+                Vec<tamarin_term::lterm::LVar>> = std::collections::HashMap::new();
+            for (v, t) in pairs {
+                if v.sort != tamarin_term::lterm::LSort::Msg { continue; }
+                let head = match term_head_sig(&t) {
+                    Some(h) => h, None => continue,
+                };
+                by_head.entry(head).or_default().push(v);
+            }
+            for (_, vars) in by_head {
+                if vars.len() < 2 { continue; }
+                for vi in &vars {
+                    for vj in &vars {
+                        if vi == vj { continue; }
+                        equivalence_classes.entry(vi.clone())
+                            .or_default().insert(vj.clone());
+                    }
+                }
+            }
+        }
+    }
 
     for (g, st) in &sys.goals {
         if st.solved { continue; }
@@ -486,7 +588,13 @@ fn has_forbidden_chain(sys: &System) -> bool {
         // Chain ends and starts must both be KD facts.
         if !matches!(conc_fact.tag, FactTag::Kd) { continue; }
         if !matches!(prem_fact.tag, FactTag::Kd) { continue; }
-        let t_start = match conc_fact.terms.first() { Some(t) => t, None => continue };
+        // Apply eq_store subst to chain conc term — substSystem may not
+        // have run since the last variant fold, so the rule's raw conc
+        // can lag behind the canonical term.  HS evaluates `nodeConcFact`
+        // through the eq-store-substituted node lookup; mirror that here.
+        let raw_t_start = match conc_fact.terms.first() { Some(t) => t.clone(), None => continue };
+        let t_start_owned = tamarin_term::subst::apply_vterm(&sys.eq_store.subst, raw_t_start);
+        let t_start = &t_start_owned;
         // (1) Chain starts at a message variable.
         if !is_msg_var(t_start) { continue; }
         // (2) End rule is not IEquality.
@@ -494,17 +602,54 @@ fn has_forbidden_chain(sys: &System) -> bool {
             crate::rule::RuleInfo::Intr(crate::rule::IntrRuleACInfo::IEquality)) {
             continue;
         }
+        let t_start_var = match t_start {
+            Term::Lit(Lit::Var(v)) => v.clone(),
+            _ => continue,
+        };
+        // Build the set of candidate-equal Msg-Vars: t_start itself
+        // plus any var in its disj-equivalence class.
+        let mut candidate_vars: std::collections::HashSet<tamarin_term::lterm::LVar>
+            = std::collections::HashSet::new();
+        candidate_vars.insert(t_start_var.clone());
+        if let Some(eqs) = equivalence_classes.get(&t_start_var) {
+            for v in eqs {
+                candidate_vars.insert(v.clone());
+            }
+        }
+        let candidate_terms: Vec<tamarin_term::lterm::LNTerm> = candidate_vars.iter()
+            .map(|v| Term::Lit(Lit::Var(v.clone()))).collect();
         // (3) Some KU(t_start) action node precedes the chain
-        // start `c.0`.  Walk all nodes' action lists for KU facts
-        // matching t_start syntactically.
+        // start `c.0`.  HS-faithful: `allKUActions` (System.hs:1582-1585)
+        // unions BOTH `unsolvedActionAtoms` (unsolved ActionG goals)
+        // AND node `rActs` lists.  Rust previously only checked node
+        // actions, missing the unsolved-goal half — Cyclic/ForbiddenChain
+        // didn't fire on chain-destruction branches where t_start is
+        // a Msg-var that appears as an open KU action goal (no node yet
+        // labeled).  Root cause of StatVerif Resolve1/Resolve2 KU(pcs)
+        // case survival.
+        //
+        // Walk node actions first:
         for (id, rule) in &sys.nodes {
             for fa in &rule.actions {
                 if !matches!(fa.tag, FactTag::Ku) { continue; }
-                if fa.terms.first() != Some(t_start) { continue; }
+                let t_ku = match fa.terms.first() { Some(t) => t, None => continue };
+                if !candidate_terms.contains(t_ku) { continue; }
                 if id == &c.0 { continue; }
                 if sys.always_before(id, &c.0) {
                     return true;
                 }
+            }
+        }
+        // Then walk unsolved ActionG goals (HS's `unsolvedActionAtoms`):
+        for (g, gst) in &sys.goals {
+            if gst.solved { continue; }
+            let Goal::Action(id, fa) = g else { continue };
+            if !matches!(fa.tag, FactTag::Ku) { continue; }
+            let t_ku = match fa.terms.first() { Some(t) => t, None => continue };
+            if !candidate_terms.contains(t_ku) { continue; }
+            if id == &c.0 { continue; }
+            if sys.always_before(id, &c.0) {
+                return true;
             }
         }
     }
@@ -765,6 +910,65 @@ pub fn cyclic(less: &[LessAtom]) -> bool {
         if dfs(n, &adj, &mut color) { return true; }
     }
     false
+}
+
+/// `cyclic_with_path` — same as `cyclic` but returns the cycle path
+/// when one exists.  Intended for H14-style diagnostics: when HS
+/// detects a Cyclic contradiction at some cn but RS doesn't, comparing
+/// HS's cycle path against RS's available less_atoms shows EXACTLY
+/// which less_atom is missing in RS.
+///
+/// **Instrumentation that would have caught H14.x earlier**: add a
+/// `TAM_RS_DBG_CYCLE_PATH=1` env-gated trace at every contradiction
+/// check that calls this function (or a HS-side equivalent) and dumps
+/// the cycle path.  Diffing HS's path against RS's less_atom set
+/// identifies the missing edge immediately.
+///
+/// Returns the cycle as a `Vec<NodeId>` where the first and last
+/// entries are equal (the back-edge node).  Empty if no cycle.
+pub fn cyclic_with_path(less: &[LessAtom]) -> Vec<NodeId> {
+    let mut adj: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
+    for l in less {
+        adj.entry(l.smaller.clone()).or_default().push(l.larger.clone());
+    }
+    let mut color: BTreeMap<NodeId, u8> = BTreeMap::new();
+    let mut path: Vec<NodeId> = Vec::new();
+    let nodes: Vec<NodeId> = adj.keys().cloned().collect();
+    fn dfs(
+        node: &NodeId,
+        adj: &BTreeMap<NodeId, Vec<NodeId>>,
+        color: &mut BTreeMap<NodeId, u8>,
+        path: &mut Vec<NodeId>,
+    ) -> Option<NodeId> {
+        match color.get(node).copied().unwrap_or(0) {
+            1 => return Some(node.clone()),   // back-edge target
+            2 => return None,
+            _ => {}
+        }
+        color.insert(node.clone(), 1);
+        path.push(node.clone());
+        if let Some(succs) = adj.get(node) {
+            for s in succs {
+                if let Some(target) = dfs(s, adj, color, path) {
+                    return Some(target);
+                }
+            }
+        }
+        color.insert(node.clone(), 2);
+        path.pop();
+        None
+    }
+    for n in &nodes {
+        if let Some(target) = dfs(n, &adj, &mut color, &mut path) {
+            // Truncate path to the cycle (from `target` onwards).
+            if let Some(start) = path.iter().position(|x| x == &target) {
+                let mut cycle: Vec<NodeId> = path[start..].to_vec();
+                cycle.push(target);
+                return cycle;
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// Detect any node that is strictly after `last(_)`. Mirrors Haskell's

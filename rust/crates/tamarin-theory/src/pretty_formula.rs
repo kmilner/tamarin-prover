@@ -314,22 +314,43 @@ fn binop_symbol(op: p::BinOp) -> &'static str {
 // =============================================================================
 
 fn pp_guarded(g: &Guarded, out: &mut String) {
-    pp_guarded_inner(g, false, out);
+    pp_guarded_inner(g, false, &[], out);
+}
+
+/// Look up the binder for `Bound(n)` given a scope stack (outer-to-inner
+/// order).  HS convention: `Bound 0` = innermost binder's last entry.
+/// We map by walking the stack inner→outer and indexing each binder's
+/// var list from the end.
+fn lookup_bound<'a>(n: u32, scope: &'a [Vec<crate::guarded::GBinding>]) -> Option<&'a crate::guarded::GBinding> {
+    let mut m = n as usize;
+    for vars in scope.iter().rev() {
+        if m < vars.len() {
+            return Some(&vars[vars.len() - 1 - m]);
+        }
+        m -= vars.len();
+    }
+    None
 }
 
 /// `paren_atomic` controls whether non-atomic shapes (Disj/Conj with
 /// multiple children, GGuarded) get wrapped in parens.  Mirrors
 /// Haskell's `opParens` use inside `pp` (Guarded.hs:840-841).
-fn pp_guarded_inner(g: &Guarded, paren_atomic: bool, out: &mut String) {
+fn pp_guarded_inner(
+    g: &Guarded,
+    paren_atomic: bool,
+    scope: &[Vec<crate::guarded::GBinding>],
+    out: &mut String,
+) {
+    use crate::guarded::GBinding;
     match g {
-        Guarded::Atom(a) => pp_atom(a, out),
+        Guarded::Atom(a) => pp_gatom(a, scope, out),
         Guarded::Disj(xs) if xs.is_empty() => out.push('\u{22A5}'), // ⊥
         Guarded::Conj(xs) if xs.is_empty() => out.push('\u{22A4}'), // ⊤
         Guarded::Disj(xs) => {
             if paren_atomic { out.push('('); }
             for (i, x) in xs.iter().enumerate() {
                 if i > 0 { out.push_str(" \u{2228} "); } // ∨
-                pp_guarded_inner(x, true, out);
+                pp_guarded_inner(x, true, scope, out);
             }
             if paren_atomic { out.push(')'); }
         }
@@ -338,11 +359,13 @@ fn pp_guarded_inner(g: &Guarded, paren_atomic: bool, out: &mut String) {
             if needs { out.push('('); }
             for (i, x) in xs.iter().enumerate() {
                 if i > 0 { out.push_str(" \u{2227} "); } // ∧
-                pp_guarded_inner(x, true, out);
+                pp_guarded_inner(x, true, scope, out);
             }
             if needs { out.push(')'); }
         }
         Guarded::GGuarded { qua, vars, guards, body } => {
+            let mut new_scope: Vec<Vec<GBinding>> = scope.to_vec();
+            new_scope.push(vars.clone());
             // Special case: `∀[] [Atom].⊥` renders as `¬Atom`.
             // Mirrors Guarded.hs:856-857.
             if matches!(qua, Quant::All)
@@ -351,12 +374,12 @@ fn pp_guarded_inner(g: &Guarded, paren_atomic: bool, out: &mut String) {
             {
                 out.push('\u{00AC}'); // ¬
                 if guards.len() == 1 {
-                    pp_atom(&guards[0], out);
+                    pp_gatom(&guards[0], &new_scope, out);
                 } else {
                     out.push('(');
                     for (i, gd) in guards.iter().enumerate() {
                         if i > 0 { out.push_str(" \u{2227} "); }
-                        pp_atom(gd, out);
+                        pp_gatom(gd, &new_scope, out);
                     }
                     out.push(')');
                 }
@@ -369,12 +392,12 @@ fn pp_guarded_inner(g: &Guarded, paren_atomic: bool, out: &mut String) {
                 Quant::Ex => '\u{2203}',  // ∃
             });
             out.push(' ');
-            pp_var_list(vars, out);
+            pp_binding_list(vars, out);
             out.push_str(". ");
             // Antecedent (guards).
             if guards.is_empty() {
                 // Just the body.
-                pp_guarded_inner(body, false, out);
+                pp_guarded_inner(body, false, &new_scope, out);
             } else {
                 let connective = match qua {
                     Quant::All => " \u{21D2} ", // ⇒
@@ -385,7 +408,7 @@ fn pp_guarded_inner(g: &Guarded, paren_atomic: bool, out: &mut String) {
                 if matches!(qua, Quant::Ex) && body_is_true(body) {
                     for (i, gd) in guards.iter().enumerate() {
                         if i > 0 { out.push_str(" \u{2227} "); }
-                        pp_atom(gd, out);
+                        pp_gatom(gd, &new_scope, out);
                     }
                 } else {
                     // (guards) connective body
@@ -394,16 +417,141 @@ fn pp_guarded_inner(g: &Guarded, paren_atomic: bool, out: &mut String) {
                     }
                     for (i, gd) in guards.iter().enumerate() {
                         if i > 0 { out.push_str(" \u{2227} "); }
-                        pp_atom(gd, out);
+                        pp_gatom(gd, &new_scope, out);
                     }
                     if guards.len() > 1 {
                         out.push(')');
                     }
                     out.push_str(connective);
-                    pp_guarded_inner(body, true, out);
+                    pp_guarded_inner(body, true, &new_scope, out);
                 }
             }
             if paren_atomic { out.push(')'); }
+        }
+    }
+}
+
+/// Pretty-print a binder list `[(name, sort)]`.
+fn pp_binding_list(bs: &[crate::guarded::GBinding], out: &mut String) {
+    for (i, b) in bs.iter().enumerate() {
+        if i > 0 { out.push(' '); }
+        out.push_str(sort_prefix_from_hint(b.sort));
+        out.push_str(&b.name);
+    }
+}
+
+fn pp_gatom(a: &crate::guarded::GAtom, scope: &[Vec<crate::guarded::GBinding>], out: &mut String) {
+    use crate::guarded::GAtom;
+    match a {
+        GAtom::Eq(l, r) => {
+            pp_gterm(l, TermPrec::Top, scope, out);
+            out.push_str(" = ");
+            pp_gterm(r, TermPrec::Top, scope, out);
+        }
+        GAtom::Less(l, r) => {
+            pp_gterm(l, TermPrec::Top, scope, out);
+            out.push_str(" < ");
+            pp_gterm(r, TermPrec::Top, scope, out);
+        }
+        GAtom::LessMset(l, r) => {
+            pp_gterm(l, TermPrec::Top, scope, out);
+            out.push_str(" (<) ");
+            pp_gterm(r, TermPrec::Top, scope, out);
+        }
+        GAtom::Subterm(l, r) => {
+            pp_gterm(l, TermPrec::Top, scope, out);
+            out.push_str(" \u{228F} "); // ⊏
+            pp_gterm(r, TermPrec::Top, scope, out);
+        }
+        GAtom::Action(fa, t) => {
+            pp_gfact(fa, scope, out);
+            out.push_str(" @ ");
+            pp_gterm(t, TermPrec::Top, scope, out);
+        }
+        GAtom::Last(t) => {
+            out.push_str("last(");
+            pp_gterm(t, TermPrec::Top, scope, out);
+            out.push(')');
+        }
+        GAtom::Pred(fa) => pp_gfact(fa, scope, out),
+    }
+}
+
+fn pp_gfact(fa: &crate::guarded::GFact, scope: &[Vec<crate::guarded::GBinding>], out: &mut String) {
+    if fa.persistent { out.push('!'); }
+    out.push_str(&fa.name);
+    out.push('(');
+    for (i, t) in fa.args.iter().enumerate() {
+        if i > 0 { out.push_str(", "); }
+        pp_gterm(t, TermPrec::Top, scope, out);
+    }
+    out.push(')');
+}
+
+fn pp_gterm(t: &crate::guarded::GTerm, prec: TermPrec, scope: &[Vec<crate::guarded::GBinding>], out: &mut String) {
+    use crate::guarded::{GTerm, BVar};
+    match t {
+        GTerm::Var(BVar::Free(v)) => pp_var(v, out),
+        GTerm::Var(BVar::Bound(n)) => {
+            if let Some(b) = lookup_bound(*n, scope) {
+                out.push_str(sort_prefix_from_hint(b.sort));
+                out.push_str(&b.name);
+            } else {
+                // Free DeBruijn (shouldn't appear in a well-formed Guarded);
+                // emit as `?n` for debug visibility.
+                out.push('?');
+                out.push_str(&n.to_string());
+            }
+        }
+        GTerm::PubLit(s) => { out.push('\''); out.push_str(s); out.push('\''); }
+        GTerm::FreshLit(s) => { out.push_str("~'"); out.push_str(s); out.push('\''); }
+        GTerm::NatLit(s) => { out.push_str("%'"); out.push_str(s); out.push('\''); }
+        GTerm::Number(n) => { out.push_str(&n.to_string()); }
+        GTerm::NumberOne => out.push('1'),
+        GTerm::NatOne => out.push_str("%1"),
+        GTerm::DhNeutral => out.push('1'),
+        GTerm::App(name, args) => {
+            out.push_str(name);
+            out.push('(');
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 { out.push_str(", "); }
+                pp_gterm(a, TermPrec::Top, scope, out);
+            }
+            out.push(')');
+        }
+        GTerm::AlgApp(name, a, b) => {
+            out.push_str(name);
+            out.push('{');
+            pp_gterm(a, TermPrec::Top, scope, out);
+            out.push('}');
+            pp_gterm(b, TermPrec::Top, scope, out);
+        }
+        GTerm::Pair(items) => {
+            out.push('<');
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 { out.push_str(", "); }
+                pp_gterm(it, TermPrec::Top, scope, out);
+            }
+            out.push('>');
+        }
+        GTerm::Diff(l, r) => {
+            out.push_str("diff(");
+            pp_gterm(l, TermPrec::Top, scope, out);
+            out.push_str(", ");
+            pp_gterm(r, TermPrec::Top, scope, out);
+            out.push(')');
+        }
+        GTerm::BinOp(op, l, r) => {
+            let needs = prec == TermPrec::InOp;
+            if needs { out.push('('); }
+            pp_gterm(l, TermPrec::InOp, scope, out);
+            out.push_str(binop_symbol(*op));
+            pp_gterm(r, TermPrec::InOp, scope, out);
+            if needs { out.push(')'); }
+        }
+        GTerm::PatMatch(inner) => {
+            out.push('=');
+            pp_gterm(inner, TermPrec::Top, scope, out);
         }
     }
 }
@@ -481,10 +629,10 @@ mod tests {
         let g = Guarded::GGuarded {
             qua: Quant::All,
             vars: vec![],
-            guards: vec![p::Atom::Less(
+            guards: vec![crate::guarded::atom_to_gatom_free(&p::Atom::Less(
                 p::Term::Var(v("i", p::SortHint::Node)),
                 p::Term::Var(v("j", p::SortHint::Node)),
-            )],
+            ))],
             body: Box::new(Guarded::Disj(vec![])),
         };
         let s = pretty_guarded(&g);

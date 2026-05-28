@@ -56,6 +56,7 @@ import System.Process
 import System.IO
 
 import qualified System.Environment
+import           Data.Maybe (isJust, fromMaybe)
 import qualified System.IO.Unsafe
 
 import Control.Monad (when)
@@ -164,8 +165,11 @@ callMaude hnd updateStatistics cmd = do
     -- on another call to Maude anymore. Otherwise, we could end up in a
     -- deadlock.
     evaluate (rnf cmd)
-    when dbgMaudeIO $ do
-        let preview = BC.take 2000 cmd
+    let cmd_keep = case dbgMaudeIOFilter of
+                     "" -> True
+                     f  -> BC.isInfixOf (BC.pack f) cmd
+    when (dbgMaudeIO && cmd_keep) $ do
+        let preview = if dbgMaudeIOFull then cmd else BC.take 2000 cmd
         BC.hPutStrLn stderr (BC.concat ["[hs-maude>] ", preview])
     -- If there was an exception, then we might be out of sync with the current
     -- persistent Maude process: restart the process.
@@ -176,19 +180,33 @@ callMaude hnd updateStatistics cmd = do
         hFlush  inp
         mp' <- evaluate (updateStatistics mp)
         res <- getToDelim out
-        when dbgMaudeIO $
+        when (dbgMaudeIO && cmd_keep) $ do
+            let preview = if dbgMaudeIOFull then res else BC.take 2000 res
             BC.hPutStrLn stderr (BC.concat ["[hs-maude<] ",
-                BC.pack (show (BC.length res)), " bytes: ",
-                BC.take 2000 res])
+                BC.pack (show (BC.length res)), " bytes: ", preview])
         return (mp', res)
 
 -- | TAM_HS_DBG_MAUDE_IO: mirror of Rust's TAM_DBG_MAUDE_IO.  Logs every
 -- Maude command sent + reply received so HS↔Rust Maude protocol
 -- diffs can be pinpointed.
+--   `TAM_HS_DBG_MAUDE_IO=1`    — truncated trace (2000 chars).
+--   `TAM_HS_DBG_MAUDE_IO=full` — full command + response.
+--   `TAM_HS_DBG_MAUDE_IO_FILTER=unify` — only dump commands matching
+--     this substring (e.g. "unify", "variant unify", "reduce").
 dbgMaudeIO :: Bool
 dbgMaudeIO = System.IO.Unsafe.unsafePerformIO $
-    maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_DBG_MAUDE_IO"
+    isJust <$> System.Environment.lookupEnv "TAM_HS_DBG_MAUDE_IO"
 {-# NOINLINE dbgMaudeIO #-}
+
+dbgMaudeIOFull :: Bool
+dbgMaudeIOFull = System.IO.Unsafe.unsafePerformIO $
+    maybe False (== "full") <$> System.Environment.lookupEnv "TAM_HS_DBG_MAUDE_IO"
+{-# NOINLINE dbgMaudeIOFull #-}
+
+dbgMaudeIOFilter :: String
+dbgMaudeIOFilter = System.IO.Unsafe.unsafePerformIO $
+    fromMaybe "" <$> System.Environment.lookupEnv "TAM_HS_DBG_MAUDE_IO_FILTER"
+{-# NOINLINE dbgMaudeIOFilter #-}
 
 -- | Compute a result via Maude.
 computeViaMaude ::

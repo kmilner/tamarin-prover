@@ -389,6 +389,67 @@ pub fn abstract_rule_and_variants(
         eprintln!("[hs-compose] rule={:?} leaf_rename={} use_hs_compose={} #variants={}",
                   rule.info.name, leaf_rename, use_hs_compose, raw_substs.len());
     }
+    // HS-faithful: filter variants via `isFreshRedundant` (RuleVariants.hs:128-134)
+    // BEFORE composition. A variant is redundant if it forces a freshly
+    // introduced term (from a Fresh-fact premise) to also appear in a
+    // non-Fresh premise after substitution.  These variants represent
+    // physically impossible bindings — they require a Fresh nonce to
+    // appear simultaneously in two unrelated message positions.
+    //
+    // Without this filter, RS keeps redundant variants that HS drops,
+    // causing the variant disj to retain heterogeneous outer ops across
+    // substs (identity variant with `convertpcs(...)` vs reducing variant
+    // with `sign(...)`). simp_abstract_fun can't lift heterogeneous ops,
+    // so same-image pairs never emerge, simp_identify never fires, no
+    // multi-key equivalence classes form, enforce_ku_action_uniqueness
+    // never merges. This is the root cause of resolved1's 26-line diff.
+    let h20_enabled = std::env::var("TAM_RS_DISABLE_H20").is_err();
+    let raw_substs: Vec<_> = if h20_enabled {
+        let freshly_introduced: Vec<LNTerm> = rule.premises.iter()
+            .filter(|f| matches!(f.tag, crate::fact::FactTag::Fresh))
+            .filter_map(|f| f.terms.first().cloned())
+            .collect();
+        let premise_terms_for_filter: Vec<LNTerm> = rule.premises.iter()
+            .filter(|f| !matches!(f.tag, crate::fact::FactTag::Fresh))
+            .flat_map(|f| f.terms.iter().cloned())
+            .collect();
+        if freshly_introduced.is_empty() || premise_terms_for_filter.is_empty() {
+            raw_substs
+        } else {
+            let mut frees = std::collections::BTreeSet::new();
+            for t in &premise_terms_for_filter {
+                t.for_each_free(&mut |v| { frees.insert(v.clone()); });
+            }
+            raw_substs.into_iter().filter(|pairs| {
+                let s_fresh = LNSubstVFresh::from_list(pairs.clone());
+                let mut counter = maude.fresh_idx();
+                let subst = s_fresh.fresh_to_free_avoiding(
+                    |n| { let b = counter; counter += n; b },
+                    &frees,
+                );
+                let premises: Vec<LNTerm> = premise_terms_for_filter.iter()
+                    .map(|t| {
+                        let applied = apply_vterm(&subst, t.clone());
+                        maude.reduce(&applied).unwrap_or(applied)
+                    })
+                    .collect();
+                let fresh_terms: Vec<LNTerm> = freshly_introduced.iter()
+                    .map(|t| apply_vterm(&subst, t.clone()))
+                    .collect();
+                for ft in &fresh_terms {
+                    for p in &premises {
+                        if contains_subterm(ft, p) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            }).collect()
+        }
+    } else {
+        raw_substs
+    };
+
     let composed_substs: Vec<LNSubstVFresh> = raw_substs.into_iter().map(|pairs| {
         if use_hs_compose {
             // HS-faithful path.
@@ -560,7 +621,7 @@ fn rename_precise_rule_with_variants(
 
     let mut state = PreciseFreshState::nothing_used();
     let mut map: HashMap<LVar, LVar> = HashMap::new();
-    let mut import = |v: &LVar, st: &mut PreciseFreshState, m: &mut HashMap<LVar, LVar>| {
+    let import = |v: &LVar, st: &mut PreciseFreshState, m: &mut HashMap<LVar, LVar>| {
         if m.contains_key(v) { return; }
         let idx = st.fresh_ident(&v.name);
         let new_v = LVar { name: v.name.clone(), sort: v.sort, idx };
@@ -812,4 +873,16 @@ mod tests {
         assert!(!ac.info.variants.is_empty(),
             "expected at least one variant, got none");
     }
+}
+
+/// `findPos`-style subterm check: returns true if `needle` appears
+/// anywhere within `haystack` (including as the whole term).  Mirrors
+/// HS's `isJust . findPos` used in `isFreshRedundant`.
+fn contains_subterm(needle: &LNTerm, haystack: &LNTerm) -> bool {
+    use tamarin_term::term::Term;
+    if needle == haystack { return true; }
+    if let Term::App(_, args) = haystack {
+        for a in args { if contains_subterm(needle, a) { return true; } }
+    }
+    false
 }

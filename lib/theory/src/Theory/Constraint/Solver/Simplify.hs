@@ -240,8 +240,27 @@ enforceNodeUniqueness =
              -- ^ Candidate selector
           -> Reduction ChangeIndicator                  --
     merge siteLbl solver candidates = do
-        changes <- gets (map mergers . groupSortOn fst . candidates)
-        mconcat <$> sequence changes
+        cands <- gets candidates
+        let groups = groupSortOn fst cands
+        when (Unsafe.unsafePerformIO $
+                maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_DBG_MERGE_EQSTORE") $ do
+            Debug.Trace.traceM ("[HS_MERGE_ENTRY] site=" ++ siteLbl
+                ++ " n_cands=" ++ show (length cands)
+                ++ " n_groups=" ++ show (length groups)
+                ++ " max_group_size=" ++ show (maximum (1 : map length groups)))
+            when (any (\g -> length g > 1) groups) $ do
+                eqs <- getM sEqStore
+                Debug.Trace.traceM ("[HS_MERGE_EQSTORE_PRE] site=" ++ siteLbl ++ " eqs=" ++ show eqs)
+                forM_ groups $ \g -> when (length g > 1) $
+                    Debug.Trace.traceM ("[HS_MERGE_GROUP] site=" ++ siteLbl
+                        ++ " size=" ++ show (length g))
+        changes <- mconcat <$> sequence (map mergers groups)
+        when (Unsafe.unsafePerformIO $
+                maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_DBG_MERGE_EQSTORE") $ do
+            when (any (\g -> length g > 1) groups) $ do
+                eqs <- getM sEqStore
+                Debug.Trace.traceM ("[HS_MERGE_EQSTORE_POST] site=" ++ siteLbl ++ " eqs=" ++ show eqs)
+        return changes
       where
         mergers []                          = unreachable "enforceUniqueness"
         mergers ((_,(xKeep, iKeep)):remove) =
@@ -299,8 +318,30 @@ enforceFreshAndKuNodeUniqueness =
              -- ^ Candidate selector
           -> Reduction ChangeIndicator                  --
     merge siteLbl solver candidates = do
-        changes <- gets (map mergers . groupSortOn fst . candidates)
-        mconcat <$> sequence changes
+        cands <- gets candidates
+        let groups = groupSortOn fst cands
+        -- TAM_HS_DBG_MERGE_EQSTORE=1 dumps the eq_store BEFORE and
+        -- AFTER any non-trivial merge group fires.  Used to find
+        -- the multi-key equivalence bindings driving the merge.
+        when (Unsafe.unsafePerformIO $
+                maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_DBG_MERGE_EQSTORE") $ do
+            Debug.Trace.traceM ("[HS_MERGE_ENTRY] site=" ++ siteLbl
+                ++ " n_cands=" ++ show (length cands)
+                ++ " n_groups=" ++ show (length groups)
+                ++ " max_group_size=" ++ show (maximum (1 : map length groups)))
+            when (any (\g -> length g > 1) groups) $ do
+                eqs <- getM sEqStore
+                Debug.Trace.traceM ("[HS_MERGE_EQSTORE_PRE] site=" ++ siteLbl ++ " eqs=" ++ show eqs)
+                forM_ groups $ \g -> when (length g > 1) $
+                    Debug.Trace.traceM ("[HS_MERGE_GROUP] site=" ++ siteLbl
+                        ++ " size=" ++ show (length g))
+        changes <- mconcat <$> sequence (map mergers groups)
+        when (Unsafe.unsafePerformIO $
+                maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_DBG_MERGE_EQSTORE") $ do
+            when (any (\g -> length g > 1) groups) $ do
+                eqs <- getM sEqStore
+                Debug.Trace.traceM ("[HS_MERGE_EQSTORE_POST] site=" ++ siteLbl ++ " eqs=" ++ show eqs)
+        return changes
       where
         mergers []                          = unreachable "enforceFreshAndKuUniqueness"
         mergers ((_,(xKeep, iKeep)):remove) =

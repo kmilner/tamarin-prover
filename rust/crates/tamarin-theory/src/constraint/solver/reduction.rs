@@ -383,7 +383,6 @@ impl<'ctx> Reduction<'ctx> {
 
     /// One pass of substSystem.  See [`subst_system`] for the loop wrapper.
     fn subst_system_once(&mut self) {
-        use tamarin_term::lterm::HasFrees;
         let subst = self.sys.eq_store.subst.clone();
         if subst.is_empty() { return; }
         let map_var = |v: tamarin_term::lterm::LVar| -> tamarin_term::lterm::LVar {
@@ -933,6 +932,9 @@ impl<'ctx> Reduction<'ctx> {
             Some(v) if !v.is_empty() => v,
             _ => return false,
         };
+        if std::env::var("TAM_RS_DBG_SOLVE_RULE_CONSTRAINTS").is_ok() {
+            eprintln!("[RS_SOLVE_RULE_CONSTRAINTS] n_substs={}", substs.len());
+        }
         // Haskell `addRuleVariants` errors if domain of variants
         // intersects with eq-store free subst — that case isn't
         // supported there either. We don't enforce it; the worst case
@@ -973,11 +975,18 @@ impl<'ctx> Reduction<'ctx> {
         // are dropped.  If only one variant remains, fold it via
         // simp_with_fresh_avoiding so its bindings propagate to rule
         // terms via the subsequent exploit_prems.
-        let mut folded;
-        if !self.sys.eq_store.subst.is_empty() {
-            let empty_subst = tamarin_term::subst::Subst::empty();
-            let _ = self.sys.eq_store.apply_eq_store(&self.maude, &empty_subst);
-        }
+        let folded;
+        // HS-faithful (Reduction.hs ~770): `solveRuleConstraints` flow is
+        //   (eqs, splitId) <- addRuleVariants eqConstr <$> getM sEqStore
+        //   insertGoal (SplitG splitId) False
+        //   setM sEqStore =<< simp hnd (const (const False)) eqs
+        // — NO apply_eq_store re-filter between addRuleVariants and simp.
+        // Previously RS called apply_eq_store(maude, empty_subst) here to
+        // drop variants conflicting with the existing free subst (added
+        // for TESLA::authentic — see [[project-h16-1-variant-orient-hs-faithful]]).
+        // That's HS-unfaithful: HS lets simp's own passes (simp_singleton +
+        // friends) handle the propagation.  Removed 2026-05-28 to restore
+        // HS faithfulness; regressions allowed per project policy.
         // Haskell-faithful: ALWAYS run simp after add_disj.  Mirrors
         // `setM sEqStore =<< simp hnd (const (const False)) eqs` at the
         // tail of `solveRuleConstraints` (Reduction.hs).  Even when the
@@ -1128,23 +1137,15 @@ impl<'ctx> Reduction<'ctx> {
                             return;
                         }
                         let outer_node = node_id.clone();
+                        // HS-faithful order (Reduction.hs:364-366):
+                        //   insertGoal goal False                     -- outer FIRST
+                        //   requiresKU m1 *> requiresKU m2 ...        -- sub-goals after
+                        let before = self.sys.goals.len();
+                        self.sys.add_goal_with_loop_flag(g.clone(), looping);
+                        if self.sys.goals.len() != before {
+                            self.changed = ChangeIndicator::Changed;
+                        }
                         for sub in sub_terms {
-                            // Allocate fresh sub-node idx as MAX of
-                            // `bounds_max + 1` and `outer_node.idx + 1`.
-                            // The outer_node may have been allocated
-                            // OUTSIDE this call (caller passed it),
-                            // in which case it might not yet appear
-                            // in sys.nodes/goals — `bounds_max` would
-                            // return a value < outer_node.idx, and
-                            // naive `bounds_max + 1` could COLLIDE
-                            // with the outer.  That would produce a
-                            // `sub_node < outer_node` LessAtom where
-                            // sub_node == outer_node — a self-loop
-                            // mistakenly flagged as Cyclic.
-                            //
-                            // Mirrors Haskell `freshLVar "vk"` which
-                            // uses MonadFresh's globally-unique
-                            // counter, never colliding.
                             let next_idx = std::cmp::max(
                                 bounds_max(&self.sys),
                                 outer_node.idx,
@@ -1159,37 +1160,12 @@ impl<'ctx> Reduction<'ctx> {
                                 Goal::Action(sub_node.clone(), sub_fa),
                                 looping,
                             );
-                            // The sub-KU action must precede the
-                            // outer pair-construction at `outer_node`.
                             self.insert_less(
                                 crate::constraint::constraints::LessAtom::new(
                                     sub_node, outer_node.clone(),
                                     crate::constraint::constraints::Reason::Adversary,
                                 ),
                             );
-                        }
-                        // HS-faithful: push the outer pair/inv/prod KU
-                        // goal UNSOLVED.  `is_open_in_sys` filters out
-                        // `has_top_pair_inv_prod` KUs (matching HS's
-                        // `openGoals` Goals.hs:85 `isPair m || isInverse m
-                        // || isProduct m → effectively-solved` rule), so
-                        // the unsolved flag doesn't cause spurious work.
-                        //
-                        // Leaving them UNSOLVED is critical for the
-                        // `enforce_ku_action_uniqueness` simplify pass:
-                        // it filters by `gsSolved` and so previously
-                        // missed pair-KU dedup, leaving Rust with
-                        // duplicate `KU(pair(c2, MAC))` at distinct
-                        // node-ids while HS dedups them via the eq_store
-                        // node-id mapping that `substGoals` then
-                        // collapses via `M.insertWith combineGoalStatus`.
-                        // Concrete divergence: KAS_key_secrecy bounds_max
-                        // off-by-one (Rust 19 vs HS 18 at the divergent
-                        // c_MAC/c_KDF path).
-                        let before = self.sys.goals.len();
-                        self.sys.add_goal_with_loop_flag(g.clone(), looping);
-                        if self.sys.goals.len() != before {
-                            self.changed = ChangeIndicator::Changed;
                         }
                         return;
                     }
@@ -1395,8 +1371,11 @@ impl<'ctx> Reduction<'ctx> {
                 self.insert_goal(goal);
                 self.changed = ChangeIndicator::Changed;
             }
-            Guarded::Atom(a) => {
+            Guarded::Atom(ref ga) => {
                 // Try to decompose into a constraint via insert_atom.
+                // Top-level Guarded::Atom has no Bound vars; round-trip
+                // to parser AST for the legacy `insert_atom` interface.
+                let a = crate::guarded::gatom_to_atom(ga);
                 let _ = self.insert_atom(&a);
                 // Haskell-faithful: only mark the OUTER formula as
                 // solved (mark=True at top-level `insert_formula`).
@@ -1439,46 +1418,47 @@ impl<'ctx> Reduction<'ctx> {
             }
             Guarded::GGuarded { qua, vars, guards, body }
                 if matches!(qua, crate::guarded::Quant::Ex) => {
-                // CR-rule *S_∃*: fresh-rename the bound vars,
-                // substitute, and recurse on `gconj([atoms..., body])`.
+                // CR-rule *S_∃*: openGuarded — allocate fresh LVars for
+                // the bound vars, substitute Bound → Free in guards/body,
+                // and recurse on `gconj([atoms..., body])`.
                 let outer = g.clone();
                 if std::env::var("TAM_DBG_EX_DECOMP").is_ok() {
                     eprintln!("[EX-DECOMP] ENTER mark={} vars={:?}",
                         mark,
-                        vars.iter().map(|v| (v.name.clone(), v.idx)).collect::<Vec<_>>());
+                        vars.iter().map(|b| (b.name.clone(), b.sort)).collect::<Vec<_>>());
                 }
                 if self.sys.solved_formulas.contains(&outer) {
                     if std::env::var("TAM_DBG_EX_DECOMP").is_ok() {
                         eprintln!("[EX-DECOMP] SKIP (already solved) vars={:?}",
-                            vars.iter().map(|v| (v.name.clone(), v.idx)).collect::<Vec<_>>());
+                            vars.iter().map(|b| (b.name.clone(), b.sort)).collect::<Vec<_>>());
                     }
                     return;
                 }
                 self.sys.solved_formulas.push(outer);
                 let avoid_max = self.fresh_var_baseline();
-                let mut subst = crate::guarded::VarSubst::new();
-                let mut next = avoid_max.saturating_add(1);
-                if std::env::var("TAM_DBG_EX_DECOMP").is_ok() {
-                    eprintln!("[EX-DECOMP] FIRE avoid_max={} vars={:?}",
-                        avoid_max,
-                        vars.iter().map(|v| (v.name.clone(), v.idx)).collect::<Vec<_>>());
-                }
-                for v in &vars {
-                    subst.insert(
-                        (v.name.clone(), v.idx),
-                        tamarin_parser::ast::Term::Var(tamarin_parser::ast::VarSpec {
-                            name: v.name.clone(),
-                            idx: next,
-                            sort: v.sort,
-                            typ: v.typ.clone(),
-                        }));
-                    next = next.saturating_add(1);
-                }
-                // Build `gconj(map atoms ++ [body])` with the subst applied.
-                let mut items: Vec<Guarded> = guards.iter()
-                    .map(|a| Guarded::Atom(crate::guarded::subst_atom(a, &subst)))
+                self.maude.ensure_above(avoid_max);
+                let base = self.maude.reserve_idxs(vars.len() as u64);
+                // Fresh LVars (HS `freshLVar`-style), one per binding in
+                // the original lexical order.
+                let xs: Vec<tamarin_parser::ast::VarSpec> = vars.iter().enumerate()
+                    .map(|(i, b)| tamarin_parser::ast::VarSpec {
+                        name: b.name.clone(),
+                        idx: base + i as u64,
+                        sort: b.sort,
+                        typ: None,
+                    })
                     .collect();
-                items.push(crate::guarded::subst_guarded(&body, &subst));
+                if std::env::var("TAM_DBG_EX_DECOMP").is_ok() {
+                    eprintln!("[EX-DECOMP] FIRE avoid_max={} base={} xs={:?}",
+                        avoid_max, base,
+                        xs.iter().map(|v| (v.name.clone(), v.idx)).collect::<Vec<_>>());
+                }
+                // HS `subst xs = zip [0..] (reverse xs)`: Bound 0 → xs[k-1].
+                let open_s = crate::guarded::open_subst(&xs);
+                let mut items: Vec<Guarded> = guards.iter()
+                    .map(|a| Guarded::Atom(crate::guarded::subst_bound_atom_at_depth(a, &open_s, 0)))
+                    .collect();
+                items.push(crate::guarded::subst_bound_guarded(&body, &open_s));
                 let new_body = crate::guarded::gconj(items);
                 self.insert_formula_inner(new_body, false);
                 self.changed = ChangeIndicator::Changed;
@@ -1495,9 +1475,13 @@ impl<'ctx> Reduction<'ctx> {
                 //   ∀[].[Eq i j].⊥          → i < j ∨ j < i        (i,j: Node)
                 //   ∀[].[Subterm i j].⊥     → insertNegSubterm
                 //   ∀[].[Last i].⊥          → last < i ∨ i < last
+                //
+                // Empty-binder universals: guards have no Bound vars so
+                // we can safely round-trip to parser AST for the legacy
+                // matching code below.
                 use tamarin_parser::ast::Atom as AAtom;
-                let guard = &guards[0];
-                match guard {
+                let guard_pa = crate::guarded::gatom_to_atom(&guards[0]);
+                match &guard_pa {
                     AAtom::Less(i, j) if term_to_node_id(i).is_some()
                                        && term_to_node_id(j).is_some() => {
                         // Haskell decomposes ∀[].[Less i j].⊥ into
@@ -1520,8 +1504,8 @@ impl<'ctx> Reduction<'ctx> {
                             self.sys.solved_formulas.push(g.clone());
                         }
                         let d = crate::guarded::Guarded::Disj(vec![
-                            crate::guarded::Guarded::Atom(AAtom::Eq(i.clone(), j.clone())),
-                            crate::guarded::Guarded::Atom(AAtom::Less(j.clone(), i.clone())),
+                            crate::guarded::Guarded::Atom(crate::guarded::atom_to_gatom_free(&AAtom::Eq(i.clone(), j.clone()))),
+                            crate::guarded::Guarded::Atom(crate::guarded::atom_to_gatom_free(&AAtom::Less(j.clone(), i.clone()))),
                         ]);
                         self.insert_formula_inner(d, false);
                         self.changed = ChangeIndicator::Changed;
@@ -1542,8 +1526,8 @@ impl<'ctx> Reduction<'ctx> {
                             self.sys.solved_formulas.push(g.clone());
                         }
                         let d = crate::guarded::Guarded::Disj(vec![
-                            crate::guarded::Guarded::Atom(AAtom::Less(i.clone(), j.clone())),
-                            crate::guarded::Guarded::Atom(AAtom::Less(j.clone(), i.clone())),
+                            crate::guarded::Guarded::Atom(crate::guarded::atom_to_gatom_free(&AAtom::Less(i.clone(), j.clone()))),
+                            crate::guarded::Guarded::Atom(crate::guarded::atom_to_gatom_free(&AAtom::Less(j.clone(), i.clone()))),
                         ]);
                         self.insert_formula_inner(d, false);
                         self.changed = ChangeIndicator::Changed;
@@ -1588,8 +1572,8 @@ impl<'ctx> Reduction<'ctx> {
                                 typ: None,
                             });
                         let d = crate::guarded::Guarded::Disj(vec![
-                            crate::guarded::Guarded::Atom(AAtom::Less(last_term.clone(), i.clone())),
-                            crate::guarded::Guarded::Atom(AAtom::Less(i.clone(), last_term)),
+                            crate::guarded::Guarded::Atom(crate::guarded::atom_to_gatom_free(&AAtom::Less(last_term.clone(), i.clone()))),
+                            crate::guarded::Guarded::Atom(crate::guarded::atom_to_gatom_free(&AAtom::Less(i.clone(), last_term))),
                         ]);
                         self.insert_formula_inner(d, false);
                         self.changed = ChangeIndicator::Changed;
@@ -1787,6 +1771,10 @@ impl<'ctx> Reduction<'ctx> {
         // goal vars, formula vars, etc., conflating distinct semantic
         // variables.
         let avoid = bounds_max(&self.sys);
+        // H16.4: set op label so apply_eq_store's [rs-aes-tick] trace
+        // attributes calls to solveTermEqs (matches HS's
+        // `addEqsLabeled "solveTermEqs"` site naming).
+        let _op_guard = crate::constraint::solver::trace::OpLabelGuard::new("solveTermEqs");
         let split = self.sys.eq_store.add_eqs_with_avoid(&maude, &pending, avoid)?;
         // Run simp with substCreatesNonNormalTerms as the is_contr
         // predicate.  Without it, SplitG variants that would
@@ -1921,6 +1909,11 @@ impl<'ctx> Reduction<'ctx> {
                     self.sys.eq_store = live_arms.into_iter().next().unwrap();
                     Ok(SolveOutcome::Linear(ChangeIndicator::Changed))
                 } else {
+                    if std::env::var("TAM_RS_DBG_STE_MULTI").is_ok() {
+                        let loc = std::panic::Location::caller();
+                        eprintln!("[STE_MULTI] arms={} site={}:{} pending_eqs={}",
+                            live_arms.len(), loc.file(), loc.line(), pending.len());
+                    }
                     Ok(SolveOutcome::Cases(live_arms))
                 }
             }
@@ -2808,7 +2801,7 @@ fn premise_solving_rule_insts(
 /// `premise_solving_rule_insts`.
 fn premise_solving_rule_insts_with_constrs(
     ctx: &crate::constraint::solver::context::ProofContext,
-    fa_prem: &crate::fact::LNFact,
+    _fa_prem: &crate::fact::LNFact,
 ) -> Vec<(RuleACInst, Option<Vec<tamarin_term::subst_vfresh::LNSubstVFresh>>)> {
     // HS-faithful: `solvePremise (crProtocol ++ crConstruct)` iterates
     // crProtocol intruder rules (ISend, IRecv, IEquality) regardless of
@@ -3022,6 +3015,35 @@ fn for_each_free_lvar_lnterm<F: FnMut(&tamarin_term::lterm::LVar)>(
 ) {
     use tamarin_term::lterm::HasFrees;
     t.for_each_free(f);
+}
+
+/// Apply a variant substitution (LNSubstVFresh) directly to a rule's
+/// facts.  Mirrors Haskell's `apply sub (Rule ri ps cs as nvs)` inside
+/// `someInst` (Rule.hs:933) — the variant subst is folded into rule
+/// terms BEFORE the rule is grafted into the system.
+///
+/// Used by the eager-variant path in `solve_premise_goal` as an
+/// HS-functional-equivalent for StatVerif chain-narrowing.  HS's lazy
+/// SplitG variants get folded later via `applyEqStore`+`simp_singleton`
+/// when chain-extension's Maude unification kills incompatible variants;
+/// this helper short-circuits by applying the variant subst eagerly.
+fn apply_variant_to_rule(
+    rule: &RuleACInst,
+    variant: &tamarin_term::subst_vfresh::LNSubstVFresh,
+) -> RuleACInst {
+    let pairs = variant.to_list();
+    let subst = tamarin_term::subst::Subst::from_list(pairs);
+    let map_fact = |f: crate::fact::LNFact| -> crate::fact::LNFact {
+        f.map(|t| tamarin_term::subst::apply_vterm(&subst, t))
+    };
+    let new_prems: Vec<_> = rule.premises.iter().cloned().map(map_fact).collect();
+    let new_acts: Vec<_> = rule.actions.iter().cloned().map(map_fact).collect();
+    let new_concs: Vec<_> = rule.conclusions.iter().cloned().map(map_fact).collect();
+    let new_nvs: Vec<_> = rule.new_vars.iter()
+        .map(|t| tamarin_term::subst::apply_vterm(&subst, t.clone()))
+        .collect();
+    crate::rule::Rule::new(rule.info.clone(), new_prems, new_concs, new_acts)
+        .with_new_vars(new_nvs)
 }
 
 fn freshen_rule(rule: RuleACInst, avoid_max: u64, maude: &tamarin_term::maude_proc::MaudeHandle) -> RuleACInst {
@@ -3477,17 +3499,25 @@ impl<'ctx> Reduction<'ctx> {
         crate::constraint::solver::trace::trace_exec(
             &format!("exploitPrems rule={}",
                 crate::constraint::solver::reduction::rule_trace_name(rule)));
-        // Snapshot premises so we can mutate self while iterating.
-        // Apply the current eq_store.subst to each premise so any
-        // variant subst that was folded into the free subst (e.g. by
-        // solve_rule_constraints' applyEqStore filter) propagates into
-        // the new Goal::Premise entries.  Mirrors Haskell which sees
-        // the substituted premises at goal-insertion time.
-        let subst = &self.sys.eq_store.subst;
-        let prems: Vec<(crate::rule::PremIdx, crate::fact::LNFact)> =
+        // HS-faithful (Reduction.hs:277-315): `exploitPrem i ru (v, fa)`
+        // uses `fa` from `enumPrems ru` directly — no substitution
+        // applied at this point.  The substitution is applied later
+        // via `substSystem` (or implicit lookup).  This preserves
+        // fresh rule vars in vk stored action terms, enabling the
+        // binding-based merge mechanism in
+        // `enforce_ku_action_uniqueness` to operate on the same
+        // structure as HS.
+        //
+        // Opt-out: TAM_RS_DISABLE_H18=1 restores the prior eager subst.
+        let h18_disabled = std::env::var("TAM_RS_DISABLE_H18").is_ok();
+        let prems: Vec<(crate::rule::PremIdx, crate::fact::LNFact)> = if h18_disabled {
+            let subst = &self.sys.eq_store.subst;
             rule.enumerate_premises()
                 .map(|(p, f)| (p, f.clone().map(|t| tamarin_term::subst::apply_vterm(subst, t))))
-                .collect();
+                .collect()
+        } else {
+            rule.enumerate_premises().map(|(p, f)| (p, f.clone())).collect()
+        };
         // Loop-breaker premises (per Haskell `praciLoopBreakers`) are
         // those whose `PremIdx` was flagged at theory-load time by the
         // dataflow loop-breaker analysis.  Goals at these premises get
@@ -3808,6 +3838,15 @@ impl<'ctx> Reduction<'ctx> {
         i: &crate::constraint::constraints::NodeId,
         fa: &crate::fact::LNFact,
     ) -> GoalCases {
+        // H16.4: tag apply_eq_store calls during KU action solving
+        // with `ENU.kuActions` for KU facts, matching HS's site
+        // naming (ENU = enforceUniqueKuFact).
+        let label = if matches!(fa.tag, crate::fact::FactTag::Ku) {
+            "ENU.kuActions"
+        } else {
+            "solveActionGoal"
+        };
+        let _op_guard = crate::constraint::solver::trace::OpLabelGuard::new(label);
         let g = Goal::Action(i.clone(), fa.clone());
         let existing = self.sys.nodes.iter()
             .find(|(nid, _)| nid == i)
@@ -4257,6 +4296,11 @@ impl<'ctx> Reduction<'ctx> {
         p: &crate::constraint::constraints::NodePrem,
         fa_prem: &crate::fact::LNFact,
     ) -> GoalCases {
+        // H16.4: tag apply_eq_store calls during premise-goal solving
+        // with `insertEdges:solvePremise` label, matching HS's site
+        // naming.
+        let _op_guard = crate::constraint::solver::trace::OpLabelGuard::new(
+            "insertEdges:solvePremise");
         // KD premises route through the chain machinery — direct port
         // of Haskell's `solvePremise rules p faPrem | isKDFact faPrem`:
         //   1. Allocate fresh node `iLearn`
@@ -4443,23 +4487,19 @@ impl<'ctx> Reduction<'ctx> {
                 next_node_idx,
             );
             next_node_idx = next_node_idx.saturating_add(1);
-            // Run labelNodeId on a working sys clone — its side effects
-            // (rule node, vf/vk supplier nodes/edges, eq_store SplitG
-            // disjunctions, exploit_prems traces) are SHARED across all
-            // conclusion sub-branches in HS's Disj structure.
-            //
-            // HS-faithful (Reduction.hs labelNodeId): solveRuleConstraints
-            // fires BEFORE exploitPrems.  If solveRuleConstraints mzeros
-            // (noContradictoryEqStoreLabeled), exploitPrems never fires
-            // — the rule branch dies silently.  Skip the entire rule
-            // here when solve_rule_constraints reports contradiction
-            // so `exploitPrems rule=X` / `insertEdges` traces don't
-            // fire either.
+            // HS-faithful labelNodeId (`Reduction.hs:246-256`).
             let mut label_sys = self.sys.clone();
             label_sys.add_node(new_node.clone(), renamed.clone());
             let mut label_sub = Reduction::new(self.ctx, label_sys);
-            if label_sub.solve_rule_constraints(renamed_constrs.clone()) {
-                continue;
+            if std::env::var("TAM_RS_DBG_SOLVE_RULE_CONSTRAINTS").is_ok() {
+                let n = renamed_constrs.as_ref().map(|c| c.len()).unwrap_or(0);
+                eprintln!("[RS_LABEL_NODE_ID] rule={} n_variant_substs={}",
+                    rule_case_name(&renamed), n);
+            }
+            if let Some(constrs) = &renamed_constrs {
+                if !constrs.is_empty() {
+                    label_sub.solve_rule_constraints(Some(constrs.clone()));
+                }
             }
             label_sub.exploit_prems(&new_node, &renamed);
             let label_sys = label_sub.sys;
@@ -4557,6 +4597,11 @@ impl<'ctx> Reduction<'ctx> {
         c: &crate::constraint::constraints::NodeConc,
         p: &crate::constraint::constraints::NodePrem,
     ) -> GoalCases {
+        // H16.4: set op label so any apply_eq_store calls during chain
+        // processing get attributed correctly (mirrors HS's
+        // `insertEdges:chain_extend` / `insertEdges:chain_direct` labels).
+        let _op_guard = crate::constraint::solver::trace::OpLabelGuard::new(
+            "insertEdges:solveChain");
         if std::env::var("TAM_RS_TRACE_SOLVE_CHAIN").is_ok() {
             let mode = if crate::constraint::solver::sources::in_precompute_mode() {
                 "saturate" } else { "runtime" };
@@ -4697,9 +4742,14 @@ impl<'ctx> Reduction<'ctx> {
                             crate::constraint::solver::reduction::rule_trace_name(ru)));
                     emit_dead_rule_premise_traces(ru);
                 };
+                let dbg_filter = std::env::var("TAM_RS_DBG_CHAIN_EXT_FILTER").is_ok();
                 let prem0 = match ru_renamed.premises.first() {
                     Some(f) => f.clone(),
                     None => {
+                        if dbg_filter {
+                            eprintln!("[CHAIN_EXT_FILTER] SKIP rule={} reason=no_premises",
+                                rule_case_name(&ru_renamed));
+                        }
                         trace_dead(&ru_renamed);
                         continue;
                     }
@@ -4707,16 +4757,35 @@ impl<'ctx> Reduction<'ctx> {
                 if prem0.tag != fa_conc.tag
                     || prem0.terms.len() != fa_conc.terms.len()
                 {
+                    if dbg_filter {
+                        eprintln!("[CHAIN_EXT_FILTER] SKIP rule={} reason=tag/arity_mismatch prem0={:?}/{} faConc={:?}/{}",
+                            rule_case_name(&ru_renamed),
+                            prem0.tag, prem0.terms.len(),
+                            fa_conc.tag, fa_conc.terms.len());
+                    }
                     trace_dead(&ru_renamed);
                     continue;
                 }
                 if forbidden_edge(&c_rule, &ru_renamed) {
+                    if dbg_filter {
+                        eprintln!("[CHAIN_EXT_FILTER] SKIP rule={} reason=forbidden_edge c_rule={}",
+                            rule_case_name(&ru_renamed),
+                            rule_case_name(&c_rule));
+                    }
                     trace_dead(&ru_renamed);
                     continue;
                 }
                 if ru_renamed.conclusions.is_empty() {
+                    if dbg_filter {
+                        eprintln!("[CHAIN_EXT_FILTER] SKIP rule={} reason=no_conclusions",
+                            rule_case_name(&ru_renamed));
+                    }
                     trace_dead(&ru_renamed);
                     continue;
+                }
+                if dbg_filter {
+                    eprintln!("[CHAIN_EXT_FILTER] KEEP rule={} faConc={:?}",
+                        rule_case_name(&ru_renamed), fa_conc);
                 }
                 // Matching destructor: exploit_prems_supplier_only inside
                 // will emit its own exploitPrems trace below.
@@ -4754,6 +4823,10 @@ impl<'ctx> Reduction<'ctx> {
                 // sets sub.sys.eq_store.is_false() via mark_contradictory.
                 sub.exploit_prems_supplier_only(&new_node, &ru_renamed);
                 if sub.sys.eq_store.is_false() {
+                    if dbg_filter {
+                        eprintln!("[CHAIN_EXT_FILTER] DROP_AFTER_EXPLOIT rule={}",
+                            rule_case_name(&ru_renamed));
+                    }
                     continue;
                 }
                 // Step 2: HS-faithful `insertEdges` chain_extend
@@ -4763,7 +4836,17 @@ impl<'ctx> Reduction<'ctx> {
                     src: c.clone(),
                     tgt: (new_node.clone(), crate::rule::PremIdx(0)),
                 });
+                if std::env::var("TAM_RS_DBG_CHAIN_EXTEND_MULTI").is_ok() {
+                    if let Ok(SolveOutcome::Cases(ref arms)) = res {
+                        eprintln!("[CHAIN_EXTEND_MULTI] rule={} arms={} faConc={:?}",
+                            rule_case_name(&ru_renamed), arms.len(), fa_conc);
+                    }
+                }
                 if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
+                    if dbg_filter {
+                        eprintln!("[CHAIN_EXT_FILTER] DROP_AFTER_INSERT_EDGE rule={}",
+                            rule_case_name(&ru_renamed));
+                    }
                     continue;
                 }
                 // Step 3 (HS-faithful): leave sub.sys raw post-insertEdges.
@@ -4877,6 +4960,10 @@ impl<'ctx> Reduction<'ctx> {
         &mut self,
         id: crate::tools::equation_store::SplitId,
     ) -> GoalCases {
+        if std::env::var("TAM_RS_DBG_SOLVE_SPLIT_PRECOMPUTE").is_ok() {
+            let in_pre = crate::constraint::solver::sources::in_precompute_mode();
+            eprintln!("[SOLVE_SPLIT_CALL] in_precompute={} split_id={:?}", in_pre, id);
+        }
         let cases = match self.sys.eq_store.perform_split(id) {
             Some(cs) => cs,
             None => return GoalCases::Contradictory,

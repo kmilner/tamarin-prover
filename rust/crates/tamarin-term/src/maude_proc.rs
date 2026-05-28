@@ -147,20 +147,34 @@ impl MaudeProcessInner {
     }
 
     fn execute(&mut self, cmd: &[u8]) -> Result<Vec<u8>, MaudeError> {
-        let trace = std::env::var("TAM_DBG_MAUDE_IO").is_ok();
-        if trace {
-            let preview: String = cmd.iter()
-                .take(200).map(|&b| b as char).collect();
-            eprintln!("[maude>] {}", preview.replace('\n', "\\n"));
+        // `TAM_DBG_MAUDE_IO=1` — truncated trace (200 chars).
+        // `TAM_DBG_MAUDE_IO=full` — full command + response, for HS↔RS
+        //   side-by-side Maude command comparison.
+        // `TAM_DBG_MAUDE_IO_FILTER=unify` — only dump unify/variant unify
+        //   calls (suppresses set/show/reduce noise).  Matches HS's
+        //   `TAM_HS_DBG_MAUDE_IO` semantics.
+        let trace_mode = std::env::var("TAM_DBG_MAUDE_IO").unwrap_or_default();
+        let trace_enabled = !trace_mode.is_empty();
+        let trace_full = trace_mode == "full";
+        let filter = std::env::var("TAM_DBG_MAUDE_IO_FILTER").unwrap_or_default();
+        let cmd_str_full: String = cmd.iter().map(|&b| b as char).collect();
+        let cmd_keep = if filter.is_empty() { true }
+            else { cmd_str_full.contains(filter.as_str()) };
+        if trace_enabled && cmd_keep {
+            let cmd_str = if trace_full { cmd_str_full.clone() }
+                else { cmd_str_full.chars().take(200).collect() };
+            eprintln!("[maude>] {}", cmd_str.replace('\n', "\\n"));
         }
         self.write_line(cmd)?;
         let result = self.read_until_prompt();
-        if trace {
+        if trace_enabled && cmd_keep {
             match &result {
                 Ok(reply) => {
-                    let preview: String = reply.iter()
-                        .take(200).map(|&b| b as char).collect();
-                    eprintln!("[maude<] {} bytes: {}", reply.len(), preview.replace('\n', "\\n"));
+                    let reply_str_full: String = reply.iter().map(|&b| b as char).collect();
+                    let reply_str = if trace_full { reply_str_full }
+                        else { reply.iter().take(200).map(|&b| b as char).collect() };
+                    eprintln!("[maude<] {} bytes: {}",
+                        reply.len(), reply_str.replace('\n', "\\n"));
                 }
                 Err(e) => eprintln!("[maude<] ERR: {:?}", e),
             }
@@ -480,14 +494,55 @@ impl MaudeHandle {
         Ok(answer)
     }
 
-    /// True when the signature carries no AC-flavoured operators —
-    /// i.e. no DH, XOR, multiset, nat or bilinear-pairing.  In that
-    /// regime free (Robinson) unification is complete; we can answer
-    /// every Maude unifiability query locally.
+    /// True when the signature carries no AC-flavoured operators AND
+    /// no user-defined [variant] equations.  In that regime free
+    /// (Robinson) unification is complete; we can answer every Maude
+    /// unifiability query locally.
+    ///
+    /// User [variant] equations (e.g. `check_getmsg(pk(x), sign(x,m)) = m`,
+    /// `convertpcs(...) = sign(...)`, `checkpcs(...) = true`) require
+    /// Maude's narrowing — the local unifier fails for different App
+    /// heads where Maude's `unify in MSG` would find narrowing variants.
+    /// See `project_statverif_aborted_pcs_divergence.md`.
+    ///
+    /// TAM_RS_LEGACY_FAST_PATH=1 reverts to the prior AC-only check
+    /// for performance comparison.
+    /// True when the local Robinson unifier is complete for this
+    /// signature.  Requires: no AC operators (DH/XOR/multiset/nat/BP)
+    /// AND no user-defined `[variant]` equations.  When user equations
+    /// are present (e.g. `check_getmsg(pk(x), sign(x,m)) = m`,
+    /// `convertpcs(...) = sign(...)`, `checkpcs(...) = true`), Maude's
+    /// `unify in MSG` narrows via the `[variant]`-attributed equations
+    /// — the local fast path is incomplete because it can't narrow
+    /// different-App-head equations.  See StatVerif_GM_Contract_Signing
+    /// where `true =? checkpcs(...)` requires narrowing to keep
+    /// variants alive past Eq_checks_succeed propagation.
+    ///
+    /// `TAM_RS_LEGACY_FAST_PATH=1` reverts to the prior AC-only check
+    /// for performance comparison.
+    /// True when the local Robinson unifier is complete for this
+    /// signature.  Requires: no AC operators (DH/XOR/multiset/nat/BP)
+    /// AND no user-defined `[variant]` equations.  When user equations
+    /// are present (e.g. `check_getmsg(pk(x), sign(x,m)) = m`,
+    /// `convertpcs(...) = sign(...)`, `checkpcs(...) = true`), Maude's
+    /// `unify in MSG` narrows via the `[variant]`-attributed equations
+    /// (see ppTheory in HS's Term.Maude.Parser:248-249, mirrored by
+    /// Rust's maude_print.rs:327) — the local fast path is incomplete
+    /// because Robinson unification can't narrow different-App-head
+    /// equations like `true =? checkpcs(...)`.
+    ///
+    /// StatVerif_GM_Contract_Signing: keeping the variant disj alive
+    /// past `Eq_checks_succeed`'s `z.10 → true` propagation requires
+    /// Maude to narrow `true =? checkpcs(...)` via the `[variant]`
+    /// checkpcs equation, binding pcsig1 → pcs(sign(_, ct), _, _).
+    /// Without narrowing, that variant drops and the chain extension
+    /// produces a surviving Resolve2 case where xm doesn't bind to ct,
+    /// missing the N6 contradiction.
     fn is_ac_free(&self) -> bool {
         let sig = self.inner.lock().unwrap().sig.clone();
         !sig.enable_dh && !sig.enable_xor && !sig.enable_mset
             && !sig.enable_nat && !sig.enable_bp
+            && sig.st_rules.is_empty()
     }
 
     pub fn unify_at(&self, label: &'static str, eqs: &[Equal<LNTerm>])
@@ -570,15 +625,30 @@ impl MaudeHandle {
         // its lifted witness collides with K's renamed target,
         // creating the SubstVFresh same-target collision that
         // cascades into $R=$I (KAS_key_secrecy).
-        if self.is_ac_free() {
-            // Push the global counter above `avoid_max` so the local
-            // unifier's `~mw` witnesses (allocated by
-            // `unify_lnterm_no_ac` via the supplied counter) live in a
-            // globally-unique range.  Haskell-faithful MonadFresh:
-            // one counter shared across every freshen.
+        // H16.9 (HS-faithful): ALWAYS try the local non-AC unifier first.
+        // HS's `unifyLTermFactored` (Unification.hs:107-119) does this:
+        //   1. Run `unifyRaw` locally (no Maude).
+        //   2. If success with no AC residuals → return result.
+        //   3. If success with AC residuals → call Maude on residuals only.
+        //   4. If failure → return empty (no Maude call).
+        // Previously RS gated the fast path on `is_ac_free()` (signature
+        // has no [variant] equations).  But that meant for signatures
+        // WITH [variant] equations (e.g. StatVerif's convertpcs/checkpcs),
+        // RS sent EVERY unification to Maude, which then NARROWS via
+        // [variant] equations — keeping variants HS would drop.
+        //
+        // Verified via TAM_DBG_MAUDE_IO=full on resolved1:
+        //   HS: 0 unify calls, 198 reduce, 18 get variants.
+        //   RS: 864 unify calls (incl 81 with `true =? checkpcs(...)`),
+        //       998 reduce, 9 get variants.
+        // The extra 864 unify calls let Maude narrow [variant] equations
+        // RS shouldn't have asked about.  See
+        // [[project-h16-9-maude-trace-and-fix]].
+        //
+        // Opt-out via `TAM_RS_DISABLE_NO_AC_FAST_PATH=1` for diagnosis.
+        let try_fast_path = std::env::var("TAM_RS_DISABLE_NO_AC_FAST_PATH").is_err();
+        if try_fast_path {
             self.ensure_above(avoid_max);
-            // Also account for input vars to avoid colliding with
-            // them (they may themselves be old witness vars).
             use crate::lterm::HasFrees;
             for eq in eqs {
                 eq.lhs.for_each_free(&mut |v| {
@@ -592,18 +662,10 @@ impl MaudeHandle {
             let result = crate::unification::unify_lnterm_no_ac_with_counter(
                 eqs_owned, &self.fresh_counter,
             );
-            return Ok(match result {
+            match result {
                 Ok(subst) => {
-                    // HS-faithful flattenUnif (Unification.hs:147):
-                    //   map (`composeVFresh` subst) [emptyVFresh]
-                    // = [emptyVFresh.composeVFresh(subst)]
-                    //
-                    // This freshens range vars to witnesses, producing
-                    // narrowing-witness shape `K → ~Vw, V → ~Vw`.
-                    //
-                    // `TAM_RS_DISABLE_FLATTEN_UNIF=1` opts out to the
-                    // raw bindings shape for diagnosis.
-                    if std::env::var("TAM_RS_DISABLE_FLATTEN_UNIF").is_ok() {
+                    // HS-faithful flattenUnif: success, return [vfresh ∘ subst].
+                    return Ok(if std::env::var("TAM_RS_DISABLE_FLATTEN_UNIF").is_ok() {
                         let bindings: Vec<(crate::lterm::LVar, LNTerm)> = subst.to_list()
                             .into_iter().map(|(v, t)| (v, t)).collect();
                         vec![bindings]
@@ -612,10 +674,17 @@ impl MaudeHandle {
                         let folded = crate::subst_vfresh::compose_vfresh(
                             &empty_vfresh, &subst);
                         vec![folded.to_list()]
-                    }
+                    });
                 }
-                Err(_) => Vec::new(),
-            });
+                Err(crate::unification::UnifyError::NoUnifier) => {
+                    // HS-faithful: unifyRaw failed.  Don't call Maude
+                    // (avoid spurious [variant] narrowing).  Return empty.
+                    return Ok(Vec::new());
+                }
+                Err(crate::unification::UnifyError::NeedsAC) => {
+                    // Fall through to Maude call below.
+                }
+            }
         }
         let mut inner = self.inner.lock().unwrap();
         let mut ctx = ConvCtx::new();

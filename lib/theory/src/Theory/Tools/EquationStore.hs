@@ -578,8 +578,18 @@ renderEqStoreConj eqStore =
 simp :: MonadFresh m => MaudeHandle -> (LNSubst -> LNSubstVFresh -> Bool) -> EqStore -> m EqStore
 simp hnd isContr eqStore =
     traceSimp ("ENTER " ++ renderEqStoreConj eqStore) $ do
+        let inSizes = [ S.size conj | (_, conj) <- getConj $ L.get eqsConj eqStore ]
+        when (System.IO.Unsafe.unsafePerformIO (
+                  maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_DBG_SIMP_DISJ")
+              && any (>= 2) inSizes) $
+            Debug.Trace.traceM ("[HS_SIMP_DISJ_IN] sizes=" ++ show inSizes)
         out <- execStateT (whileTrue (simp1 hnd isContr))
                           (trace (show ("eqStore", eqStore)) eqStore)
+        let outSizes = [ S.size conj | (_, conj) <- getConj $ L.get eqsConj out ]
+        when (System.IO.Unsafe.unsafePerformIO (
+                  maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_DBG_SIMP_DISJ")
+              && (any (>= 2) inSizes || any (>= 2) outSizes)) $
+            Debug.Trace.traceM ("[HS_SIMP_DISJ_OUT] sizes=" ++ show outSizes)
         return $! traceSimp ("EXIT  " ++ renderEqStoreConj out) out
 
 

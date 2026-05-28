@@ -38,12 +38,38 @@ pub fn rename_precise_system(sys: &mut System) {
     // Phase 1 — walk every free LVar in deterministic traversal order so the
     // import-binding map is populated independent of how we apply later.
     //
-    // Order matches `subst_system_once` (Reduction::subst_system_once):
-    //   nodes → edges → last_atom → less_atoms → goals →
-    //   formulas → solved_formulas → lemmas → eq_store → subterm_store
+    // HS-faithful order — matches `instance HasFrees System` field walk
+    // (System.hs:383-397 declaration order, traversed by foldFrees):
+    //   sNodes → sEdges → sLessAtoms → sLastAtom → sSubtermStore →
+    //   sEqStore → sFormulas → sSolvedFormulas → sLemmas → sGoals
+    //
+    // This MUST match HS's renamePrecise to keep per-name idx assignment
+    // in lockstep.  Previously Rust visited goals BEFORE formulas, which
+    // for Helper_Loop_and_success caused formula[0]'s free `k2` to end
+    // up at idx 4 (because 4 other "k2" LVars in goals' Disjs were
+    // imported first) — making it a DIFFERENT LVar from the action term
+    // `k2` (which got idx 0 elsewhere), so the impl pass's match against
+    // `∀ t. ChainKey(k2) @ t ⇒ ⊥` failed and no gfalse was emitted at
+    // case_3 entry — forcing Rust to solve an inner disj before reaching
+    // contradiction.
     // ----------------------------------------------------------------------
 
-    for (id, rule) in &sys.nodes {
+    // HS-faithful: HS's `instance HasFrees (Map k v)` uses
+    // `M.foldrWithKey` which walks the map keyed by `Ord k` ascending
+    // (Term/LTerm.hs:829-836).  Rust's `sys.nodes` is a `Vec<(NodeId,
+    // RuleACInst)>` in insertion order — that order is NOT the same as
+    // NodeId-ascending.  Without this sort, the walk visits a newly-grafted
+    // source-case Gen_Step (high pre-rename idx but inserted last) AFTER
+    // pre-existing Check nodes — yet then `state.import` allocates per-name
+    // counters in *visit* order, so the newly-grafted Gen_Step gets the
+    // FIRST fresh "vr" slot if walked first / LAST if walked last.  For
+    // Helper_Loop_and_success this controls whether vr.0 ends up Check
+    // (HS pattern) or Gen_Step (Rust pre-fix pattern), which in turn flips
+    // impliedFormulas' sysActions iteration order and the Disj goal-nrs.
+    let mut nodes_sorted: Vec<&(crate::constraint::constraints::NodeId, crate::rule::RuleACInst)>
+        = sys.nodes.iter().collect();
+    nodes_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    for (id, rule) in nodes_sorted {
         state.import(id);
         rule.for_each_free(&mut |v| { state.import(v); });
     }
@@ -51,17 +77,19 @@ pub fn rename_precise_system(sys: &mut System) {
         state.import(&e.src.0);
         state.import(&e.tgt.0);
     }
-    if let Some(la) = &sys.last_atom { state.import(la); }
     for la in &sys.less_atoms {
         state.import(&la.smaller);
         state.import(&la.larger);
     }
-    for (g, _) in &sys.goals {
-        goal_for_each_free(g, &mut |v| { state.import(v); });
+    if let Some(la) = &sys.last_atom { state.import(la); }
+    for c in &sys.subterm_store.subterms {
+        c.small.for_each_free(&mut |v| { state.import(v); });
+        c.big.for_each_free(&mut |v| { state.import(v); });
     }
-    for f in &sys.formulas { guarded_for_each_free(f, &mut |v| { state.import(v); }); }
-    for f in &sys.solved_formulas { guarded_for_each_free(f, &mut |v| { state.import(v); }); }
-    for f in &sys.lemmas { guarded_for_each_free(f, &mut |v| { state.import(v); }); }
+    for c in &sys.subterm_store.solved_subterms {
+        c.small.for_each_free(&mut |v| { state.import(v); });
+        c.big.for_each_free(&mut |v| { state.import(v); });
+    }
     // eq_store.subst: visit keys (dom) and values (range).
     for (k, t) in sys.eq_store.subst.to_list() {
         state.import(&k);
@@ -79,13 +107,11 @@ pub fn rename_precise_system(sys: &mut System) {
             }
         }
     }
-    for c in &sys.subterm_store.subterms {
-        c.small.for_each_free(&mut |v| { state.import(v); });
-        c.big.for_each_free(&mut |v| { state.import(v); });
-    }
-    for c in &sys.subterm_store.solved_subterms {
-        c.small.for_each_free(&mut |v| { state.import(v); });
-        c.big.for_each_free(&mut |v| { state.import(v); });
+    for f in &sys.formulas { guarded_for_each_free(f, &mut |v| { state.import(v); }); }
+    for f in &sys.solved_formulas { guarded_for_each_free(f, &mut |v| { state.import(v); }); }
+    for f in &sys.lemmas { guarded_for_each_free(f, &mut |v| { state.import(v); }); }
+    for (g, _) in &sys.goals {
+        goal_for_each_free(g, &mut |v| { state.import(v); });
     }
 
     // ----------------------------------------------------------------------
@@ -311,10 +337,9 @@ fn goal_for_each_free(g: &Goal, f: &mut dyn FnMut(&LVar)) {
     }
 }
 
-/// Walk every free `LVar` of a `Guarded` formula. Parser-AST terms inside
-/// the formula carry `VarSpec`s — we visit each `Var` as the corresponding
-/// `LVar`. Bound variables in `GGuarded` are skipped so we don't rename
-/// quantifier-bound names (the formula's outer `vars` list).
+/// Walk every free `LVar` of a `Guarded` formula. With DeBruijn bindings,
+/// `BVar::Bound` leaves carry no LVar identity and are auto-skipped; only
+/// `BVar::Free` leaves get visited.
 fn guarded_for_each_free(g: &crate::guarded::Guarded, f: &mut dyn FnMut(&LVar)) {
     use crate::guarded::Guarded;
     match g {
@@ -322,54 +347,48 @@ fn guarded_for_each_free(g: &crate::guarded::Guarded, f: &mut dyn FnMut(&LVar)) 
         Guarded::Disj(xs) | Guarded::Conj(xs) => {
             for x in xs { guarded_for_each_free(x, f); }
         }
-        Guarded::GGuarded { vars, guards, body, .. } => {
-            // Bound names in `vars` shadow free occurrences inside guards/body.
-            let bound: std::collections::HashSet<(String, u64)> = vars.iter()
-                .map(|v| (v.name.clone(), v.idx))
-                .collect();
-            let mut g2 = |v: &LVar| {
-                if !bound.contains(&(v.name.clone(), v.idx)) { f(v); }
-            };
-            for a in guards { atom_for_each_free(a, &mut g2); }
-            guarded_for_each_free(body, &mut g2);
+        Guarded::GGuarded { guards, body, .. } => {
+            for a in guards { atom_for_each_free(a, f); }
+            guarded_for_each_free(body, f);
         }
     }
 }
 
-fn atom_for_each_free(a: &tamarin_parser::ast::Atom, f: &mut dyn FnMut(&LVar)) {
-    use tamarin_parser::ast::Atom;
+fn atom_for_each_free(a: &crate::guarded::GAtom, f: &mut dyn FnMut(&LVar)) {
+    use crate::guarded::GAtom;
     match a {
-        Atom::Eq(x, y) | Atom::Less(x, y)
-        | Atom::LessMset(x, y) | Atom::Subterm(x, y) => {
+        GAtom::Eq(x, y) | GAtom::Less(x, y)
+        | GAtom::LessMset(x, y) | GAtom::Subterm(x, y) => {
             term_for_each_free(x, f);
             term_for_each_free(y, f);
         }
-        Atom::Action(fa, t) => {
+        GAtom::Action(fa, t) => {
             for arg in &fa.args { term_for_each_free(arg, f); }
             term_for_each_free(t, f);
         }
-        Atom::Last(t) => term_for_each_free(t, f),
-        Atom::Pred(fa) => { for arg in &fa.args { term_for_each_free(arg, f); } }
+        GAtom::Last(t) => term_for_each_free(t, f),
+        GAtom::Pred(fa) => { for arg in &fa.args { term_for_each_free(arg, f); } }
     }
 }
 
-fn term_for_each_free(t: &tamarin_parser::ast::Term, f: &mut dyn FnMut(&LVar)) {
-    use tamarin_parser::ast::Term;
+fn term_for_each_free(t: &crate::guarded::GTerm, f: &mut dyn FnMut(&LVar)) {
+    use crate::guarded::{GTerm, BVar};
     match t {
-        Term::Var(v) => {
+        GTerm::Var(BVar::Free(v)) => {
             let sort = parser_sort_to_lsort(v.sort);
             f(&LVar { name: v.name.clone(), sort, idx: v.idx });
         }
-        Term::PubLit(_) | Term::FreshLit(_) | Term::NatLit(_)
-        | Term::Number(_) | Term::NumberOne | Term::NatOne | Term::DhNeutral => {}
-        Term::App(_, args) | Term::Pair(args) => {
+        GTerm::Var(BVar::Bound(_)) => {}
+        GTerm::PubLit(_) | GTerm::FreshLit(_) | GTerm::NatLit(_)
+        | GTerm::Number(_) | GTerm::NumberOne | GTerm::NatOne | GTerm::DhNeutral => {}
+        GTerm::App(_, args) | GTerm::Pair(args) => {
             for a in args { term_for_each_free(a, f); }
         }
-        Term::AlgApp(_, a, b) | Term::Diff(a, b) | Term::BinOp(_, a, b) => {
+        GTerm::AlgApp(_, a, b) | GTerm::Diff(a, b) | GTerm::BinOp(_, a, b) => {
             term_for_each_free(a, f);
             term_for_each_free(b, f);
         }
-        Term::PatMatch(t) => term_for_each_free(t, f),
+        GTerm::PatMatch(t) => term_for_each_free(t, f),
     }
 }
 

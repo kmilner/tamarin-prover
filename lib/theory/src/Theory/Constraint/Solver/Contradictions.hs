@@ -266,25 +266,38 @@ nodesAfterLast sys = case L.get sLastAtom sys of
 -- chain-start by extending the chain or replacing
 -- it with an edge.
 hasImpossibleChain :: ProofContext -> System -> Bool
-hasImpossibleChain ctxt sys = {-trace (show (L.get pcTrueSubterm ctxt)) $-}
+hasImpossibleChain ctxt sys =
+    let dbg = System.IO.Unsafe.unsafePerformIO $
+                maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_DBG_IMPOSSIBLE_CHAIN"
+    in (if dbg then
+          Debug.Trace.trace ("[IC] pcTrueSubterm=" ++ show (L.get pcTrueSubterm ctxt)
+                          ++ " chains=" ++ show [(c, p, nodeConcFact c sys, nodePremFact p sys)
+                                                | ChainG c p <- M.keys $ L.get sGoals sys])
+          else id) $
     any impossibleChain [ (c,p) | ChainG c p <- M.keys $ L.get sGoals sys ]
   where
+    dbgIC = System.IO.Unsafe.unsafePerformIO $
+              maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_DBG_IMPOSSIBLE_CHAIN"
     impossibleChain (c,p) = fromMaybe False $ do
         (DnK, t_start) <- kFactView $ nodeConcFact c sys
         (DnK, t_end)   <- kFactView $ nodePremFact p sys
         -- the possible root symbols after applying deconstruction
         -- rules to the chain-start if they can be determined
-        poss_end_syms  <- possibleRootSyms t_start
-        -- the chain is impossible if both the required root-symbol
-        -- and the possible root-symbols for the chain-end can be
-        -- determined and the required symbol is not possible.
+        let poss_end_syms_m = possibleRootSyms t_start
+            req_end_sym_subterm_m = rootSym t_end
+            req_end_sym_gen_m = possibleEndSyms t_end
+        let dbgMsg = "[IC-chain] t_start=" ++ show t_start
+                  ++ " t_end=" ++ show t_end
+                  ++ " poss_root=" ++ show poss_end_syms_m
+                  ++ " req_subterm=" ++ show req_end_sym_subterm_m
+                  ++ " req_gen=" ++ show req_end_sym_gen_m
+        let trace' x = if dbgIC then Debug.Trace.trace dbgMsg x else x
+        poss_end_syms <- trace' poss_end_syms_m
         if (L.get pcTrueSubterm ctxt)
            then do
-              -- the root symbol of the chain-end if it can be determined
               req_end_sym_subterm <- rootSym t_end
               return $ not  (req_end_sym_subterm `elem` poss_end_syms)
            else do
-              -- the root symbols of the chain-end if they can be determined
               req_end_sym_gen     <- possibleEndSyms t_end
               return $ null (req_end_sym_gen `intersect` poss_end_syms)
 

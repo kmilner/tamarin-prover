@@ -1207,7 +1207,27 @@ smartRanking :: ProofContext
 smartRanking ctxt allowPremiseGLoopBreakers sys =
     moveNatToEnd . sortOnUsefulness . unmark . sortDecisionTree notSolveLast . sortDecisionTree solveFirst . goalNrRanking
   where
-    oneCaseOnly = catMaybes . map getMsgOneCase . L.get pcSources $ ctxt
+    oneCaseOnlyRaw = catMaybes . map getMsgOneCase . L.get pcSources $ ctxt
+    -- TAM_HS_DBG_ONE_CASE=1: dump the oneCaseOnly symbol set on every
+    -- smartRanking call.  Used for HS↔Rust source-cache divergence
+    -- diagnosis (TLS_Handshake::injective_agree c_h vs c_PRF).
+    oneCaseOnly = case unsafePerformIO (System.Environment.lookupEnv "TAM_HS_DBG_ONE_CASE") of
+      Just "1" -> trace ("[HS one_case_syms] " ++ show oneCaseOnlyRaw) oneCaseOnlyRaw
+      _        -> oneCaseOnlyRaw
+      `seq` case unsafePerformIO (System.Environment.lookupEnv "TAM_HS_DBG_SOURCES") of
+        Just "1" -> trace
+          (unlines $ ("[HS full_sources] count=" ++ show (length $ L.get pcSources ctxt))
+                   : map (\cd -> case msgPremise (L.get cdGoal cd) of
+                            Just (viewTerm -> FApp (NoEq (name, (arity, _, _))) _) ->
+                              "[HS src] " ++ BC.unpack name ++ " arity=" ++ show arity
+                                ++ " cases=" ++ show (length (getDisj (L.get cdCases cd)))
+                            Just (viewTerm -> FApp other _) ->
+                              "[HS src other] " ++ show other
+                                ++ " cases=" ++ show (length (getDisj (L.get cdCases cd)))
+                            _ -> "[HS src non-app]")
+                       (L.get pcSources ctxt))
+          oneCaseOnlyRaw
+        _ -> oneCaseOnlyRaw
 
     getMsgOneCase cd = case msgPremise (L.get cdGoal cd) of
       Just (viewTerm -> FApp o _)

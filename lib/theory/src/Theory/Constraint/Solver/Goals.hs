@@ -38,6 +38,11 @@ import           Control.Basics
 import           Control.Category
 import           Control.Monad.Disj
 import           Control.Monad.State                     (gets)
+import           Control.Monad                           (when)
+
+import qualified Debug.Trace
+import qualified System.Environment                      as SysEnv
+import qualified System.IO.Unsafe                        as Unsafe
 
 import           Extension.Data.Label                    as L
 
@@ -242,6 +247,12 @@ solveAction :: [RuleAC]          -- ^ All rules labelled with an action
             -> (NodeId, LNFact)  -- ^ The action we are looking for.
             -> Reduction String  -- ^ A sensible case name.
 solveAction rules (i, fa@(Fact _ ann _)) = do
+    when (Unsafe.unsafePerformIO $
+            maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_DBG_SOLVE_ACTION") $
+        Debug.Trace.traceM ("[HS_SOLVE_ACTION] fa=" ++ show fa
+            ++ " nRules=" ++ show (length rules)
+            ++ "\n    rules=" ++ show (map (\r ->
+                (showRuleCaseName r, get rConcs r, get rPrems r)) rules))
     mayRu <- M.lookup i <$> getM sNodes
     showRuleCaseName <$> case mayRu of
         Nothing -> case fa of
@@ -261,8 +272,16 @@ solveAction rules (i, fa@(Fact _ ann _)) = do
                             mapM_ requiresKU [a, b] *> return ru
             _                                        -> do
                    ru  <- labelNodeId i (annotatePrems <$> rules) Nothing
+                   when (Unsafe.unsafePerformIO $
+                           maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_DBG_SOLVE_ACTION") $
+                       Debug.Trace.traceM ("[HS_SOLVE_ACTION] after labelNodeId, rule="
+                           ++ showRuleCaseName ru ++ " for fa=" ++ show fa)
                    act <- disjunctionOfList $ get rActs ru
                    void (solveFactEqs SplitNow [Equal fa act])
+                   when (Unsafe.unsafePerformIO $
+                           maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_DBG_SOLVE_ACTION") $
+                       Debug.Trace.traceM ("[HS_SOLVE_ACTION] SURVIVED: "
+                           ++ showRuleCaseName ru ++ " for fa=" ++ show fa)
                    return ru
 
         Just ru -> do unless (fa `elem` get rActs ru) $ do

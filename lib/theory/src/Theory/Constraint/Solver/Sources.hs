@@ -47,7 +47,7 @@ import           Control.Parallel.Strategies
 
 -- uncomment for use of "EXTENSIVE_SPLIT" only
 -- import           System.IO.Error
--- import           System.Environment
+import qualified System.Environment
 -- import           System.IO.Unsafe
 
 -- import           Text.PrettyPrint.Highlight
@@ -56,6 +56,7 @@ import           Extension.Data.Label
 import           Extension.Prelude
 
 import           Theory.Constraint.Solver.Contradictions (contradictorySystem)
+import qualified Theory.Constraint.Solver.Contradictions
 import           Theory.Constraint.Solver.Goals
 import           Theory.Constraint.Solver.AnnotatedGoals
 import           Theory.Constraint.Solver.Reduction
@@ -102,7 +103,13 @@ initialSource
     -> Goal
     -> Source
 initialSource ctxt restrictions goal =
-    Source goal cases
+    if T.flagDbgInitSrc
+      then let xs = getDisj cases in
+           trace ("[HS_INIT_SRC] goal=" ++ goalCanonStr goal
+                ++ " → " ++ show (length xs) ++ " cases: "
+                ++ show (map fst xs))
+           (Source goal cases)
+      else Source goal cases
   where
     polish ((name, se), _) = ([name], se)
     se0   = insertLemmas restrictions $ emptySystem RawSource $ get pcDiffContext ctxt
@@ -110,6 +117,10 @@ initialSource ctxt restrictions goal =
     instantiate = do
         insertGoal goal False
         solveGoal goal
+    goalCanonStr g = case g of
+        ActionG _ fa  -> "ActionG " ++ show fa
+        PremiseG _ fa -> "PremiseG " ++ show fa
+        _ -> show g
 
 -- | Refine a source by applying the additional proof step.
 refineSource
@@ -121,9 +132,20 @@ refineSource ctxt proofStep th =
     ( map fst $ getDisj refinement
     , set cdCases newCases th )
   where
-    newCases =   Disj . removeRedundantCases ctxt stableVars snd
-               . map (second (modify sSubst (restrict stableVars)))
-               . getDisj $ snd <$> refinement
+    newCases =
+        let preDedup = getDisj $ snd <$> refinement
+            mapped   = map (second (modify sSubst (restrict stableVars))) preDedup
+            postDedup = removeRedundantCases ctxt stableVars snd mapped
+            nc = Disj postDedup
+        in if T.flagDbgInitSrc
+             then trace ("[HS_REFINE] goal=" ++ show (get cdGoal th)
+                       ++ " " ++ show (length (getDisj (get cdCases th)))
+                       ++ " cases (input) → "
+                       ++ show (length preDedup) ++ " pre-dedup → "
+                       ++ show (length postDedup) ++ " post-dedup"
+                       ++ "\n  pre-dedup names="
+                       ++ show (map fst preDedup)) nc
+             else nc
 
     stableVars = frees (get cdGoal th)
 
@@ -131,7 +153,29 @@ refineSource ctxt proofStep th =
     refinement = do
         (names, se)        <- get cdCases th
         ((x, names'), se') <- fst <$> runReduction proofStep ctxt se fs
-        return (x, (combine names names', se'))
+        let combined = combine names names'
+        when dbgRefineBoundary $
+            Debug.Trace.traceM ("[HS_REFINE_BOUNDARY] goal=" ++ goalCanonStrInline (get cdGoal th)
+                ++ " input_names=" ++ show names
+                ++ " step_names=" ++ show names'
+                ++ " → combined=" ++ show combined
+                ++ " nodes=" ++ show (M.size (get sNodes se'))
+                ++ " edges=" ++ show (S.size (get sEdges se'))
+                ++ " goals=" ++ show (M.size (get sGoals se')))
+        return (x, (combined, se'))
+
+    -- TAM_HS_DBG_REFINE_BOUNDARY=1: trace each (input_names, step_names → combined, state size)
+    -- at runReduction proofStep boundary in refineSource.  Used to compare
+    -- HS↔RS saturate iteration behavior; revealed HS drops deeper-chain
+    -- cases between iter 1 and 2 via contradictions inside runReduction.
+    dbgRefineBoundary :: Bool
+    dbgRefineBoundary = Unsafe.unsafePerformIO $
+        maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_DBG_REFINE_BOUNDARY"
+
+    goalCanonStrInline g = case g of
+        ActionG _ fa  -> "ActionG " ++ show fa
+        PremiseG _ fa -> "PremiseG " ++ show fa
+        _ -> show g
 
     -- Combine names such that the coerce rule is blended out.
     combine []            ns' = ns'
@@ -177,9 +221,40 @@ solveAllSafeGoals ths' openChainsLimit =
     solve ths caseNames lastChainTerm chainsLeft = do
         simplifySystem
         ctxt <- ask
-        contradictoryIf =<< (gets (contradictorySystem ctxt))
+        isContra <- gets (contradictorySystem ctxt)
+        when (T.flagDbgInitSrc && isContra) $ do
+            cs <- gets (Theory.Constraint.Solver.Contradictions.contradictions ctxt)
+            sys <- gets id
+            let chains' = [ (c, p, nodeConcFact c sys, nodePremFact p sys)
+                          | (ChainG c p, st) <- M.toList (get sGoals sys)
+                          , not (get gsSolved st) ]
+            let lessRel = S.toList (get sLessAtoms sys)
+            let edges' = S.toList (get sEdges sys)
+            let nodeKuActs = [ (nid, [m | fa <- get rActs ru, Just (UpK, m) <- pure (kFactView fa)])
+                             | (nid, ru) <- M.toList (get sNodes sys) ]
+            Debug.Trace.traceM ("[HS_SAS_CONTRA] cn=" ++ show caseNames
+                ++ " contras=" ++ show cs
+                ++ " chains=" ++ show chains'
+                ++ "\n  less_atoms=" ++ show lessRel
+                ++ "\n  edges=" ++ show edges'
+                ++ "\n  node_ku_acts=" ++ show nodeKuActs)
+        contradictoryIf isContra
         goals  <- gets openGoals
         chains <- gets unsolvedChains
+        when T.flagDbgInitSrc $
+            Debug.Trace.traceM ("[HS_SAS_ITER] cn=" ++ show caseNames
+                ++ " goals=" ++ show (length goals)
+                ++ " chains=" ++ show (length chains)
+                ++ " chainsLeft=" ++ show chainsLeft
+                ++ " goalKinds=" ++ show
+                    [ case g of
+                        ActionG _ fa  -> "Act-" ++ show (factTag fa)
+                        PremiseG _ fa -> "Prem-" ++ show (factTag fa)
+                        ChainG _ _    -> "Chain"
+                        DisjG _       -> "Disj"
+                        SplitG _      -> "Split"
+                        SubtermG _    -> "Subterm"
+                    | (g, _) <- goals ])
         -- Filter out chain goals where the term in the conclusion is identical to one we just solved,
         -- as this indicates our chain can loop
         filteredGoals <- filterM  (\(g,_) -> case g of
@@ -446,6 +521,7 @@ saturateSources parameters ctxt thsInit  =
                     ++ " nodes=" ++ show (M.size (get sNodes sysTh0))
                     ++ " edges=" ++ show (S.size (get sEdges sysTh0))
                     ++ "\n      nodes_dump:" ++ concatMap nodeLine (M.toList (get sNodes sysTh0))
+                    ++ "\n      less_atoms=" ++ show (S.toList (get sLessAtoms sysTh0))
                 nodeLine (nid, ru) =
                     "\n        " ++ show (nid :: NodeId)
                     ++ " | prems=" ++ show (get rPrems ru)
