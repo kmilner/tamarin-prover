@@ -349,8 +349,17 @@ where
         }
     }
     let extended = s1_0.extend_with_renaming(&vs_in_range_s2);
-    // Avoid set for freshToFreeAvoidingFast: vars in (s2, s1_0).
-    // HS: `evalFreshAvoiding (s2, s1_0)` — frees of the tuple.
+    // Avoid set for freshToFreeAvoidingFast: `evalFreshAvoiding (s2, s1_0)`
+    // (Substitution.hs:47) = `frees (s2, s1_0)` = `frees s2 <> frees s1_0`.
+    //
+    // `frees s2` (s2 :: free LNSubst) walks BOTH domain and range.
+    // `frees s1_0` (s1_0 :: LNSubstVFresh) uses `foldFrees (SubstVFresh n
+    // LVar) = foldFrees f . M.keys` (SubstVFresh.hs:196) — i.e. ONLY the
+    // DOMAIN KEYS, NOT the range (witnesses).  Including s1_0's range here
+    // (as the old code did) over-counted the avoid set, so the re-based
+    // witnesses came out inflated (Responder_secrecy: the Setup_Key `~k`
+    // variant witnesses at ~k.30/42 vs HS's ~k.11/12/15, rotating the
+    // 3-way split via `Ord LNSubstVFresh`).
     let mut avoid_set: std::collections::BTreeSet<LVar> = std::collections::BTreeSet::new();
     // s2's domain
     for v in s2.dom() { avoid_set.insert(v.clone()); }
@@ -358,10 +367,8 @@ where
     for t in s2.range() {
         for v in crate::vterm::vars_vterm(t) { avoid_set.insert(v); }
     }
-    // s1_0's domain
+    // s1_0's domain keys ONLY (HS-faithful: frees of a SubstVFresh = keys).
     for v in s1_0.dom() { avoid_set.insert(v.clone()); }
-    // s1_0's range vars
-    for v in s1_0.vars_range() { avoid_set.insert(v); }
     let avoid: Vec<LVar> = avoid_set.into_iter().collect();
     let s1 = extended.fresh_to_free_uniform_shift(&avoid);
     let composed = s1.compose(s2);
