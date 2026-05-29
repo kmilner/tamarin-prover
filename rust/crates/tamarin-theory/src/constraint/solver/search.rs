@@ -10,7 +10,10 @@
 //! simplify" heuristic — enough to drive small examples end-to-end
 //! and exercise the solver wiring.
 //!
-//! The search is bounded by `max_steps` to keep tests deterministic.
+//! The search is bounded by the ID-DFS depth (`MAX_DEPTH`, capped at
+//! 2048) plus a per-lemma wall-clock deadline — mirroring HS's
+//! `cutOnSolvedDFS` (`dMax` + `--prove-timeout`), which has no
+//! step/node budget.
 
 use std::collections::BTreeMap;
 
@@ -88,8 +91,14 @@ pub fn deadline_reached() -> bool {
 fn set_deadline(t: std::time::Instant) { DEADLINE.with(|d| d.set(Some(t))); }
 fn clear_deadline()                     { DEADLINE.with(|d| d.set(None));     }
 
-/// Run a small-step search to depth `max_steps`. Heuristic: try
-/// `Simplify` once, then pick the first open goal each round.
+/// Run an iterative-deepening search.  Heuristic: try `Simplify`
+/// once, then pick the first ranked open goal each round.
+///
+/// `max_steps` is accepted for API compatibility but is NOT used as a
+/// terminal cutoff: HS's `cutOnSolvedDFS` bounds the search purely by
+/// the ID-DFS depth `dMax` (`MAX_DEPTH`, capped 2048) and the per-lemma
+/// wall-clock timeout (`deadline`).  See the `budget = usize::MAX`
+/// note in the loop body.
 ///
 /// Returns the root proof node. The final status is the OR of children
 /// (Solved if all children solved, Contradictory if any contradictory,
@@ -144,7 +153,22 @@ pub fn run_proof_search(
     loop {
         MAX_DEPTH.with(|m| m.set(current_max_depth));
         DEPTH_LIMIT_HIT.with(|f| f.set(false));
-        let mut budget = max_steps;
+        // HS-faithful: `cutOnSolvedDFS` (Proof.hs:856-863) bounds the
+        // search by the ID-DFS depth `dMax` (our `MAX_DEPTH`) and the
+        // per-lemma wall-clock timeout ONLY — it has NO step/node budget.
+        // The caller's `max_steps` was a non-faithful crutch that cut off
+        // exploration of *wide* (but correct) trees prematurely: e.g.
+        // csf17 keylessssl-modified::exists_detect_no_C_compromise, whose
+        // witness is reachable but sits beneath a broad fan-out of
+        // contradiction branches.  Once the loop-breaker count was made
+        // HS-faithful (wider, correct source cases), a too-small step
+        // budget turned a Solved exists-trace into Sorry.  HS never hits
+        // this because it has no budget — so neither do we.  `MAX_DEPTH`
+        // (capped at 2048) guarantees termination; `deadline` catches
+        // wall-clock runaway.  `max_steps` is retained in the signature
+        // for callers but no longer used as a terminal cutoff.
+        let _ = max_steps;
+        let mut budget = usize::MAX;
         if first_iter {
             expand(ctx, &mut root, &mut budget, &deadline, 0);
             first_iter = false;
