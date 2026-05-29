@@ -280,19 +280,27 @@ pub fn exec_proof_method(
             crate::constraint::solver::trace::trace_exec("simplifySystem");
             let mut r = Reduction::new(ctx, sys.clone());
             r.changed = ChangeIndicator::Unchanged;
+            // HS-faithful: `processLabeled` (ProofMethod.hs:443) runs
+            // `runReduction (m <* simplifySystem) ctxt sys (avoid sys)`
+            // — `simplifySystem` runs EXACTLY ONCE.  Its internal
+            // `go`-loop (Simplify.hs:89-208 / `while_changing`) is the
+            // ONLY fixpoint mechanism; there is no outer repeat in HS.
+            //
+            // A previous outer 32-iteration fixpoint loop here was NOT
+            // Haskell-faithful: it re-ran the whole pipeline (including
+            // the post-loop `addNonInjectiveFactInstances` /
+            // `exploitUniqueMsgOrder`), feeding each iteration's newly
+            // inserted injective-fact / N6 ordering atoms back as the
+            // next iteration's input.  `nonInjectiveFactInstances`
+            // would then derive *transitive* orderings (e.g. from an
+            // added `j < vr.0`, derive `j < vr.1`, `j < vr.2`) that HS
+            // never produces because HS computes all pairs ONCE against
+            // the fixed input system.  On count_unique those spurious
+            // orderings closed a `j → vr.k → j` cycle, so RS detected a
+            // `Cyclic` contradiction (via `isFinished`/`contradictions`)
+            // at the `*_case_2` children one proof-step EARLIER than HS,
+            // dropping the `simplify` node HS emits there (5 nodes).
             simplify_system(&mut r);
-            // Iterate to fixpoint to match the case-creation lambda's
-            // 8-step iteration.  Without this, search's first
-            // Simplify-pass attempt on a case-creation result may
-            // still change state (e.g. a new implied formula fires
-            // post-rename), producing a redundant `simplify` step
-            // in the proof tree where Haskell's renderer shows none.
-            for _ in 0..32 {
-                let before = r.sys.clone();
-                r.changed = ChangeIndicator::Unchanged;
-                simplify_system(&mut r);
-                if r.sys == before { break; }
-            }
             // HS-faithful `cleanup` (ProofMethod.hs:453-454): EVERY proof
             // method's cases pass through `map (fmap cleanup . fst)`
             // (ProofMethod.hs:442), and `Simplify` goes through `process`
@@ -386,22 +394,24 @@ pub fn exec_proof_method(
                 }
                 let t0 = std::time::Instant::now();
                 let mut r = Reduction::new(ctx, sys);
+                // HS-faithful: `processLabeled` (ProofMethod.hs:443) runs
+                // `runReduction (m <* simplifySystem) ctxt sys (avoid sys)`
+                // — `simplifySystem` runs EXACTLY ONCE per case.  Its
+                // internal `go`-loop is the only fixpoint mechanism.
+                //
+                // A previous outer 8-iteration loop here re-ran the whole
+                // pipeline (including post-loop `addNonInjectiveFactInstances`
+                // / `exploitUniqueMsgOrder`), feeding each iteration's newly
+                // inserted injective-fact ordering atoms back as the next
+                // iteration's input.  `nonInjectiveFactInstances` then
+                // derives *transitive* orderings (e.g. from a fed-back
+                // `j < vr.k`, derive `j < vr.m`) that HS NEVER produces
+                // (HS computes all pairs once against a fixed input).  On
+                // count_unique those spurious orderings closed a
+                // `j → vr.m → j` cycle, so RS hit a `Cyclic` contradiction
+                // at the `*_case_2` children one proof-step EARLIER than
+                // HS — dropping the 5 `simplify` nodes HS emits there.
                 simplify_system(&mut r);
-                // Repeat until structurally stable: simplify_system's
-                // own while_changing only loops over the inner CR-rules
-                // — the post-loop steps (exploitUniqueMsgOrder,
-                // addNonInjectiveFactInstances) add state (LessAtom)
-                // that can enable CR-rule fire on the *next* outer
-                // pass.  Haskell exhibits the same non-idempotency but
-                // gets away with it because the search-Simplify call
-                // happens to discover the contradiction directly.  Loop
-                // up to 8 times — empirically converges in 1-2.
-                for _ in 0..8 {
-                    let before = r.sys.clone();
-                    r.changed = ChangeIndicator::Unchanged;
-                    simplify_system(&mut r);
-                    if r.sys == before { break; }
-                }
                 if dbg_solve {
                     eprintln!("[solve] simplify done {:?} (nodes={} goals={})",
                         t0.elapsed(), r.sys.nodes.len(), r.sys.goals.len());
@@ -445,20 +455,12 @@ pub fn exec_proof_method(
                     r.sys.eq_store.subst =
                         tamarin_term::subst::Subst::from_list(Vec::new());
                 }
-                // After rename_precise + clear-subst, simplify_system
-                // may discover NEW progress (e.g. insert_implied_formulas
-                // fires on a freshly-renamed universal whose match no
-                // longer relies on a now-cleared eq-store binding).
-                // Re-run to convergence so the post-cleanup state is
-                // truly idempotent — otherwise search's first
-                // Simplify-pass attempt makes the same progress and
-                // renders a redundant `simplify` step.
-                for _ in 0..8 {
-                    let before = r.sys.clone();
-                    r.changed = ChangeIndicator::Unchanged;
-                    simplify_system(&mut r);
-                    if r.sys == before { break; }
-                }
+                // HS-faithful: `cleanup` (ProofMethod.hs:443-444) runs
+                // `renamePrecise` ONCE on the post-`simplifySystem`
+                // system and clears the subst — it does NOT re-run
+                // `simplifySystem` afterward.  A previous outer 8-iter
+                // re-simplify loop here was the same non-faithful
+                // injective-ordering feedback as above; removed.
                 r.sys
             };
             // Filter cases the same way Haskell's `runReduction` does:
