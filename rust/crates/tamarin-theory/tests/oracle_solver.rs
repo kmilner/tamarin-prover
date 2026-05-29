@@ -956,7 +956,6 @@ fn corpus_proof_skeleton_match_probe() {
     enum Outcome {
         StructMatch,
         StructDiff { file_lemma: String, line: usize, ours: String, theirs: String },
-        VerdictDiff(String),
         Incomparable,
         NoHaskellSkeleton(String),
     }
@@ -1036,11 +1035,8 @@ fn corpus_proof_skeleton_match_probe() {
                     "{} — diverge line {}: ours={:?} theirs={:?}",
                     file_lemma, line, ours, theirs));
             }
-            // Outcome::VerdictDiff is no longer produced (we always diff
-            // structurally now), but the variant is kept on the enum for
-            // backward source-compat with other probes — count any stray
-            // ones as struct-diff for the total denominator.
-            Outcome::VerdictDiff(s) => struct_diff.push(s.clone()),
+            // (Outcome::VerdictDiff removed: it was never produced — we
+            // always diff structurally now.)
             Outcome::NoHaskellSkeleton(s) => no_skel.push(s.clone()),
             Outcome::Incomparable => incomparable += 1,
         }
@@ -1250,19 +1246,7 @@ fn probe_nspk3_cyclic_leaf() {
             let ts = format!("{:?}", t).chars().take(80).collect::<String>();
             eprintln!("  {}#{}:{:?} → {}", v.name, v.idx, v.sort, ts);
         }
-        return; // skip the rest of the original dump
-        eprintln!("edges ({}):", leaf.sys.edges.len());
-        for e in &leaf.sys.edges {
-            eprintln!("  ({}#{},{:?}) → ({}#{},{:?})",
-                e.src.0.name, e.src.0.idx, e.src.1,
-                e.tgt.0.name, e.tgt.0.idx, e.tgt.1);
-        }
-        eprintln!("less_atoms ({}):", leaf.sys.less_atoms.len());
-        for l in &leaf.sys.less_atoms {
-            eprintln!("  {}#{} < {}#{}  ({:?})",
-                l.smaller.name, l.smaller.idx, l.larger.name, l.larger.idx, l.reason);
-        }
-        eprintln!("last_atom: {:?}", leaf.sys.last_atom);
+        // (Remaining edges/less_atoms/last_atom dump intentionally elided.)
     } else {
         eprintln!("no cyclic leaf found");
     }
