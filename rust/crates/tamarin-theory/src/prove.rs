@@ -150,6 +150,23 @@ pub fn prove_lemma(
         crate::theory::TraceQuantifier::ExistsTrace,
     );
 
+    // Resolve the goal-ranking heuristic, mirroring HS's
+    // `getProofContext.specifiedHeuristic` (ClosedTheory.hs:123-131):
+    //   per-lemma `[heuristic=..]` > theory-level `heuristic:` > None.
+    // `None` falls back to `SmartRanking False` in `rank_goals_with`
+    // (= HS's `defaultHeuristic False`).  We currently only parse the
+    // first ranking identifier (the comparable corpus uses single-char
+    // heuristics; HS schedules a list round-robin by depth).
+    use crate::constraint::solver::goals::GoalRanking;
+    let lemma_heuristic: Option<&str> = lemma.attributes.iter().find_map(|a| match a {
+        crate::theory::LemmaAttr::Heuristic(s) => Some(s.as_str()),
+        _ => None,
+    });
+    ctx.heuristic = match lemma_heuristic {
+        Some(h) => Some(GoalRanking::from_str(h)),
+        None => theory.heuristic.first().map(|h| GoalRanking::from_str(h)),
+    };
+
     // `refineWithSourceAsms`: prune precomputed source cases by
     // assumptions from `[sources]`-tagged lemmas.  Mirrors Haskell's
     // `refineWithSourceAsms` — typing-style protocols rely on these

@@ -88,6 +88,14 @@ pub struct ProofContext {
     /// when False, all possible subterm syms of the chain-end are
     /// checked for intersection (a more LENIENT test).
     pub pc_true_subterm: bool,
+    /// The goal ranking selected by the theory's / lemma's `heuristic:`
+    /// directive.  Mirrors HS's `_pcHeuristic :: Maybe (Heuristic
+    /// ProofContext)` (System.hs) consulted by `selectHeuristic`
+    /// (Proof.hs:707).  `None` ⇒ HS's `defaultHeuristic False`
+    /// (`SmartRanking False`).  Resolved per-lemma in `prove_lemma`
+    /// (per-lemma `[heuristic=..]` overrides the theory-level directive,
+    /// matching `apDefaultHeuristic <|> pcHeuristic`).
+    pub heuristic: Option<crate::constraint::solver::goals::GoalRanking>,
     /// `saturate_state` — gates the lazy `ensure_saturated()` call.
     /// HS's `saturateSources` is lazy in `cdCases`: it only emits
     /// `[EXEC] solveGoal / exploitPrems / ...` traces when a consumer
@@ -119,6 +127,7 @@ impl Clone for ProofContext {
             restrictions: self.restrictions.clone(),
             typing_assumptions: self.typing_assumptions.clone(),
             pc_true_subterm: self.pc_true_subterm,
+            heuristic: self.heuristic,
             saturate_state: std::sync::Mutex::new(state),
             saturation_limit: self.saturation_limit,
         }
@@ -492,6 +501,7 @@ impl ProofContext {
             restrictions,
             typing_assumptions: Vec::new(),
             pc_true_subterm,
+            heuristic: None,
             saturate_state: std::sync::Mutex::new(SaturateState::Pending),
             saturation_limit: crate::constraint::solver::sources::IntegerParameters::default()
                 .saturation_limit as usize,

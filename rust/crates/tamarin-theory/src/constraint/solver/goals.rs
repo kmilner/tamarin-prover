@@ -13,6 +13,57 @@ use crate::constraint::constraints::Goal;
 use crate::constraint::solver::annotated_goals::{AnnotatedGoal, Usefulness};
 use crate::constraint::system::System;
 
+/// The goal ranking selected by a theory / lemma `heuristic:` directive.
+///
+/// Port of the relevant `Theory.Constraint.System.GoalRanking` variants
+/// (`System.hs:506-520`).  We currently implement the two non-oracle,
+/// non-tactic rankings that the comparable corpus exercises:
+///
+///   * `SmartRanking Bool`  (heuristic `s`/`S`, the default)
+///   * `InjRanking  Bool`   (heuristic `i`/`I`)
+///
+/// All other ranking identifiers (oracle `o`/`O`, sapic `p`/`P`,
+/// `c`/`C`, tactic `{..}`) parse to `Smart(false)` for now — the files
+/// that use them are filtered out of the comparable corpus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalRanking {
+    /// `SmartRanking useLoopBreakers` (ProofMethod.hs:1203).
+    Smart(bool),
+    /// `InjRanking useLoopBreakers` (ProofMethod.hs:1096).
+    Inj(bool),
+}
+
+impl GoalRanking {
+    /// Parse a single heuristic character into a `GoalRanking`,
+    /// mirroring HS's `goalRankingIdentifiers` (System.hs:585-598) /
+    /// `stringToGoalRanking`.  Unhandled identifiers fall back to the
+    /// default `Smart(false)` so behaviour for filtered-out files is
+    /// unchanged.
+    pub fn from_char(c: char) -> GoalRanking {
+        match c {
+            's' => GoalRanking::Smart(false),
+            'S' => GoalRanking::Smart(true),
+            'i' => GoalRanking::Inj(false),
+            'I' => GoalRanking::Inj(true),
+            _ => GoalRanking::Smart(false),
+        }
+    }
+
+    /// Parse the first ranking identifier out of a heuristic string
+    /// (e.g. `"I"`, `"s"`).  HS's `Heuristic` is a *list* of rankings
+    /// scheduled round-robin by proof depth (`useHeuristic`,
+    /// ProofMethod.hs:736); for the single-character heuristics in the
+    /// comparable corpus the list has one element, so taking the first
+    /// identifier is exact.  A leading `{` (tactic ranking) or quote is
+    /// treated as the default.
+    pub fn from_str(s: &str) -> GoalRanking {
+        match s.trim().chars().next() {
+            Some(c) if c.is_ascii_alphabetic() => GoalRanking::from_char(c),
+            _ => GoalRanking::Smart(false),
+        }
+    }
+}
+
 /// `openGoals`: enumerate annotated goals still to be solved.
 ///
 /// Haskell iterates `M.toList $ get sGoals sys` in Goal-derived-Ord
@@ -209,6 +260,38 @@ pub fn rank_goals_with(
     sys: &System,
     ctx: Option<&crate::constraint::solver::context::ProofContext>,
 ) -> Vec<AnnotatedGoal> {
+    // Dispatch on the theory/lemma `heuristic:` directive, mirroring
+    // HS's `rankGoals` (ProofMethod.hs:636) which pattern-matches the
+    // `GoalRanking`.  When no context (or no heuristic) is supplied we
+    // default to `SmartRanking False` — exactly HS's
+    // `defaultHeuristic False = Heuristic [SmartRanking False]`
+    // (System.hs:527).
+    let ranking = ctx
+        .and_then(|c| c.heuristic)
+        .unwrap_or(GoalRanking::Smart(false));
+    match ranking {
+        GoalRanking::Inj(use_loop_breakers) => {
+            inj_ranking(sys, ctx, use_loop_breakers)
+        }
+        GoalRanking::Smart(use_loop_breakers) => {
+            smart_ranking(sys, ctx, use_loop_breakers)
+        }
+    }
+}
+
+/// Port of HS `smartRanking ctxt allowPremiseGLoopBreakers sys`
+/// (ProofMethod.hs:1203):
+///
+/// ```text
+///   moveNatToEnd . sortOnUsefulness . unmark
+///     . sortDecisionTree notSolveLast . sortDecisionTree solveFirst
+///     . goalNrRanking
+/// ```
+fn smart_ranking(
+    sys: &System,
+    ctx: Option<&crate::constraint::solver::context::ProofContext>,
+    allow_premise_g_loop_breakers: bool,
+) -> Vec<AnnotatedGoal> {
     let mut goals = open_goals(sys);
     // 1. goalNrRanking — already in seq order from `open_goals`.
     // 2. sortDecisionTree solveFirst — multi-pass partitions.
@@ -267,6 +350,18 @@ pub fn rank_goals_with(
     // 3. sortDecisionTree notSolveLast — push solve-last goals to end.
     let not_solve_last: Vec<fn(&AnnotatedGoal) -> bool> = vec![is_non_solve_last_goal];
     goals = sort_decision_tree(&not_solve_last, goals);
+    // 3b. unmark — HS `smartRanking`'s `unmark | allowPremiseGLoopBreakers
+    //     = map unmarkPremiseG` (ProofMethod.hs:1248).  Resets each
+    //     PremiseG goal's usefulness to Useful so loop-breaker premises
+    //     are not deprioritised.  Only active when allowLoopBreakers
+    //     (heuristic `S`).  `unmarkPremiseG` (ProofMethod.hs:296-299).
+    if allow_premise_g_loop_breakers {
+        for a in goals.iter_mut() {
+            if matches!(a.goal, Goal::Premise(_, _)) {
+                a.usefulness = Usefulness::Useful;
+            }
+        }
+    }
     // 4. sortOnUsefulness — stable sort by tag.
     goals.sort_by_key(|a| tag_usefulness(a.usefulness));
     // 5. moveNatToEnd — Nat subterm splits to back.
@@ -291,6 +386,95 @@ pub fn rank_goals_with(
         for (i, a) in goals.iter().take(6).enumerate() {
             let g_str = format!("{:?}", a.goal).chars().take(160).collect::<String>();
             eprintln!("[rank] #{}: {} useful={:?}", i, g_str, a.usefulness);
+        }
+    }
+    goals
+}
+
+/// Port of HS `injRanking ctxt allowLoopBreakers sys`
+/// (ProofMethod.hs:1096):
+///
+/// ```text
+///   sortOnUsefulness . unmark
+///     . sortDecisionTree [notSolveLast] . sortDecisionTree solveFirst
+///     . goalNrRanking
+/// ```
+///
+/// where
+/// ```text
+///   solveFirst = [ isImmediateGoal, isHighPriorityGoal
+///                , isMedPriorityGoal, isLowPriorityGoal ]
+///   notSolveLast g = isNoLargeSplitGoal g && isNonSolveLastGoal g
+///                    && isNotKnowsLastNameGoal g
+/// ```
+///
+/// The crucial difference vs `smartRanking`: standard action goals and
+/// Disj goals share the SAME priority class (`isMedPriorityGoal`,
+/// ProofMethod.hs:1144-1149), so within that class they keep goal-nr
+/// order rather than Disj always winning.  This is why the csf17
+/// `heuristic: I` lemmas solve their protocol-action goal before the
+/// `¬(j<i)` disjunction.
+fn inj_ranking(
+    sys: &System,
+    ctx: Option<&crate::constraint::solver::context::ProofContext>,
+    allow_loop_breakers: bool,
+) -> Vec<AnnotatedGoal> {
+    let mut goals = open_goals(sys);
+    type Pred<'a> = Box<dyn Fn(&AnnotatedGoal) -> bool + 'a>;
+    // Lazy one-case-syms exactly as in smart_ranking: only force the
+    // source-cache thunk when a KU action goal is present.
+    let any_ku_action_goal = goals.iter().any(|a| {
+        use crate::fact::FactTag;
+        matches!(&a.goal, Goal::Action(_, fa) if matches!(fa.tag, FactTag::Ku))
+    });
+    let one_case_syms: std::collections::BTreeSet<Vec<u8>> =
+        if any_ku_action_goal {
+            match ctx {
+                Some(c) => collect_one_case_syms(c),
+                None => Default::default(),
+            }
+        } else {
+            Default::default()
+        };
+    // solveFirst — four priority classes.  Within each class the
+    // relative order from goalNrRanking (insertion / nr order) is
+    // preserved by the stable partition.
+    //
+    //   isImmediateGoal     (ProofMethod.hs:1158-1161)
+    //   isHighPriorityGoal  (ProofMethod.hs:1139-1142)
+    //   isMedPriorityGoal   (ProofMethod.hs:1144-1149)
+    //   isLowPriorityGoal   (ProofMethod.hs:1151-1153)
+    let solve_first: Vec<Pred> = vec![
+        Box::new(is_immediate_goal),
+        Box::new(is_high_priority_goal),
+        Box::new(move |a: &AnnotatedGoal| is_med_priority_goal(a, sys, &one_case_syms)),
+        Box::new(is_low_priority_goal),
+    ];
+    goals = sort_decision_tree_dyn(&solve_first, goals);
+    // notSolveLast — SINGLE combined predicate (note the `&&`), unlike
+    // smartRanking's list.  sortDecisionTree [notSolveLast].
+    let not_solve_last: Vec<Pred> = vec![Box::new(|a: &AnnotatedGoal| {
+        is_no_large_split_goal(a, sys)
+            && is_non_solve_last_goal(a)
+            && is_not_knows_last_name_goal(a)
+    })];
+    goals = sort_decision_tree_dyn(&not_solve_last, goals);
+    // unmark — `unmark | allowLoopBreakers = map unmarkPremiseG`
+    // (ProofMethod.hs:1117).  Reset PremiseG usefulness to Useful.
+    if allow_loop_breakers {
+        for a in goals.iter_mut() {
+            if matches!(a.goal, Goal::Premise(_, _)) {
+                a.usefulness = Usefulness::Useful;
+            }
+        }
+    }
+    // sortOnUsefulness — stable sort by usefulness tag.  (injRanking has
+    // NO moveNatToEnd step — that's smartRanking-only.)
+    goals.sort_by_key(|a| tag_usefulness(a.usefulness));
+    if std::env::var("TAM_RANK_DBG").is_ok() {
+        for (i, a) in goals.iter().take(6).enumerate() {
+            let g_str = format!("{:?}", a.goal).chars().take(160).collect::<String>();
+            eprintln!("[inj-rank] #{}: {} useful={:?}", i, g_str, a.usefulness);
         }
     }
     goals
@@ -521,6 +705,101 @@ fn is_signature_goal(a: &AnnotatedGoal) -> bool {
         _ => false,
     }
 }
+// -- injRanking priority-class predicates (ProofMethod.hs:1126-1198) ----------
+
+/// `isImmediateGoal` (ProofMethod.hs:1158-1161): a PremiseG/ActionG
+/// whose fact name has the `I_` prefix, OR a KU goal of a fresh name
+/// var whose name has the `I_` prefix (`isKnowsImmediateNameGoal`).
+fn is_immediate_goal(a: &AnnotatedGoal) -> bool {
+    match &a.goal {
+        Goal::Premise(_, fa) | Goal::Action(_, fa)
+            if crate::fact::fact_tag_name(&fa.tag).starts_with("I_") => true,
+        _ => is_knows_immediate_name_goal(a),
+    }
+}
+
+/// `isHighPriorityGoal` (ProofMethod.hs:1139-1142):
+///   isKnowsFirstNameGoal || isSolveFirstGoal || isChainGoal
+///   || isFreshKnowsGoal
+fn is_high_priority_goal(a: &AnnotatedGoal) -> bool {
+    is_knows_first_name_goal(a)
+        || is_solve_first_goal(a)
+        || is_chain_goal(a)
+        || is_fresh_knows_goal(a)
+}
+
+/// `isMedPriorityGoal` (ProofMethod.hs:1144-1149):
+///   isStandardActionGoal || isDisjGoal || isPrivateKnowsGoal
+///   || isSplitGoalSmall || isMsgOneCaseGoal
+///   || isNonLoopBreakerProtoFactGoal
+fn is_med_priority_goal(
+    a: &AnnotatedGoal,
+    sys: &System,
+    one_case_syms: &std::collections::BTreeSet<Vec<u8>>,
+) -> bool {
+    is_standard_action_goal(a)
+        || is_disj_goal(a)
+        || is_private_knows_goal(a)
+        || is_split_goal_small(a, sys)
+        || is_msg_one_case_goal(a, one_case_syms)
+        || is_non_loop_breaker_proto_fact_goal(a)
+}
+
+/// `isLowPriorityGoal` (ProofMethod.hs:1151-1153):
+///   isDoubleExpGoal || isSignatureGoal || isProtoFactGoal
+/// (`isDoubleExpGoal` is stubbed false — needs the Exp/Mult view, same
+/// as smartRanking.)
+fn is_low_priority_goal(a: &AnnotatedGoal) -> bool {
+    is_signature_goal(a) || is_proto_fact_goal(a)
+}
+
+/// `isProtoFactGoal` (ProofMethod.hs:1155-1156): a non-K PremiseG.
+fn is_proto_fact_goal(a: &AnnotatedGoal) -> bool {
+    match &a.goal {
+        Goal::Premise(_, fa) => !fa.is_k_fact(),
+        _ => false,
+    }
+}
+
+/// `isKnowsFirstNameGoal` (ProofMethod.hs:267-269): KU goal of a fresh
+/// name var whose name has the `F_` prefix.
+fn is_knows_first_name_goal(a: &AnnotatedGoal) -> bool {
+    use tamarin_term::lterm::LSort;
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    match msg_premise(&a.goal) {
+        Some(Term::Lit(Lit::Var(v))) =>
+            v.sort == LSort::Fresh && v.name.starts_with("F_"),
+        _ => false,
+    }
+}
+
+/// `isKnowsImmediateNameGoal` (ProofMethod.hs:1177-1179): KU goal of a
+/// fresh name var whose name has the `I_` prefix.
+fn is_knows_immediate_name_goal(a: &AnnotatedGoal) -> bool {
+    use tamarin_term::lterm::LSort;
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    match msg_premise(&a.goal) {
+        Some(Term::Lit(Lit::Var(v))) =>
+            v.sort == LSort::Fresh && v.name.starts_with("I_"),
+        _ => false,
+    }
+}
+
+/// `isNotKnowsLastNameGoal` (ProofMethod.hs:1173-1175): True unless the
+/// goal is a KU goal of a fresh name var with an `L_` prefix.
+fn is_not_knows_last_name_goal(a: &AnnotatedGoal) -> bool {
+    use tamarin_term::lterm::LSort;
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    match msg_premise(&a.goal) {
+        Some(Term::Lit(Lit::Var(v)))
+            if v.sort == LSort::Fresh && v.name.starts_with("L_") => false,
+        _ => true,
+    }
+}
+
 /// `isNonSolveLastGoal` — PremiseG/ActionG NOT tagged SolveLast.
 fn is_non_solve_last_goal(a: &AnnotatedGoal) -> bool {
     match &a.goal {
