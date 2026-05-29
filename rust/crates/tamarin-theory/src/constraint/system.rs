@@ -62,6 +62,12 @@ pub struct System {
     pub subterm_store: SubtermStore,
     /// Open goals paired with their current status.
     pub goals: Vec<(Goal, GoalStatus)>,
+    /// Monotonic goal-number counter (`_sNextGoalNr`,
+    /// System.hs:394).  Advanced on every goal insertion (even when
+    /// the goal already exists — HS's `insertGoalStatus`
+    /// Reduction.hs:606-609 always `succ`s it).  Each new goal records
+    /// the current value as its `GoalStatus.nr`.
+    pub next_goal_nr: u64,
     /// Next available `SplitId`.
     pub next_split: u64,
     /// Source-case names already grafted into this branch.  Mirrors
@@ -141,6 +147,15 @@ pub struct GoalStatus {
     pub looping: bool,
     /// Whether the goal is already solved (kept for replay).
     pub solved: bool,
+    /// Goal creation order (`_gsNr` in HS `GoalStatus`,
+    /// System.hs:373).  Assigned from `System.next_goal_nr` at first
+    /// insertion; on re-insertion of an existing goal HS keeps the
+    /// `min` (so the original, smaller nr wins — see
+    /// `combineGoalStatus`).  `goalNrRanking` (ProofMethod.hs:748-749
+    /// `sortOn (fst . snd)`) orders goals by this number, NOT by Vec
+    /// position.  This is the canonical tie-break within a heuristic
+    /// priority class.
+    pub nr: u64,
 }
 
 impl System {
@@ -149,8 +164,14 @@ impl System {
     /// Add an open goal, no-op if already present (compared by `Goal`
     /// equality).
     pub fn add_goal(&mut self, g: Goal) {
+        // HS `insertGoalStatus` (Reduction.hs:606-609): advance the
+        // counter on EVERY call, even when the goal already exists.
+        let age = self.next_goal_nr;
+        self.next_goal_nr = self.next_goal_nr.wrapping_add(1);
         if !self.goals.iter().any(|(existing, _)| existing == &g) {
-            self.goals.push((g, GoalStatus::default()));
+            let mut st = GoalStatus::default();
+            st.nr = age;
+            self.goals.push((g, st));
         }
     }
 
@@ -184,15 +205,24 @@ impl System {
     /// alpha-canonicalised form (`normalize_bound_lvars`).  Mirrors
     /// HS's DeBruijn-based structural equality.
     pub fn add_goal_with_loop_flag(&mut self, g: Goal, looping: bool) {
+        // HS `insertGoalStatus` (Reduction.hs:606-609) reads
+        // `sNextGoalNr` then `succ`s it on EVERY call, including when
+        // the goal key already exists (where `insertWith
+        // combineGoalStatus` keeps the existing — smaller — nr).
+        let age = self.next_goal_nr;
+        self.next_goal_nr = self.next_goal_nr.wrapping_add(1);
         let canon_g = canonical_goal_for_dedup(&g);
         if let Some(slot) = self.goals.iter_mut().find(|(existing, _)|
             canonical_goal_for_dedup(existing) == canon_g)
         {
             slot.1.looping = slot.1.looping || looping;
+            // combineGoalStatus keeps `min` of the two nrs; the
+            // existing one is always smaller, so leave it unchanged.
             return;
         }
         let mut st = GoalStatus::default();
         st.looping = looping;
+        st.nr = age;
         self.goals.push((g, st));
     }
 

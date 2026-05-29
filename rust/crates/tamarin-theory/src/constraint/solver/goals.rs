@@ -77,12 +77,24 @@ impl GoalRanking {
 /// on those lemmas; `goal_cmp` is dead-code-allow below until then.
 pub fn open_goals(sys: &System) -> Vec<AnnotatedGoal> {
     let mut out = Vec::new();
-    for (seq, (goal, status)) in sys.goals.iter().enumerate() {
+    for (goal, status) in sys.goals.iter() {
         if status.solved { continue; }
         if !is_open_in_sys(goal, sys) { continue; }
         let u = goal_usefulness(goal, status.looping, sys);
-        out.push(AnnotatedGoal::new(goal.clone(), seq as u64, u));
+        // Use the persistent goal-number (`_gsNr`), NOT the Vec
+        // position.  Haskell's `openGoals` returns `(goal, (gsNr,
+        // useful))` (Goals.hs:125) and the rankings begin with
+        // `goalNrRanking = sortOn (fst . snd)` (ProofMethod.hs:748),
+        // i.e. ordering by creation number.  We carry `status.nr`
+        // here and sort below so the heuristic priority classes break
+        // ties by creation order exactly as HS does.
+        out.push(AnnotatedGoal::new(goal.clone(), status.nr, u));
     }
+    // goalNrRanking — stable sort by creation number.  The Vec is not
+    // guaranteed to be in nr order (subst_goals / conjoin rebuild it),
+    // so sort explicitly.  Stable so equal-nr goals (shouldn't happen,
+    // but defensive) keep Vec order.
+    out.sort_by_key(|a| a.seq);
     out
 }
 
