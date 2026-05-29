@@ -3040,35 +3040,6 @@ fn for_each_free_lvar_lnterm<F: FnMut(&tamarin_term::lterm::LVar)>(
     t.for_each_free(f);
 }
 
-/// Apply a variant substitution (LNSubstVFresh) directly to a rule's
-/// facts.  Mirrors Haskell's `apply sub (Rule ri ps cs as nvs)` inside
-/// `someInst` (Rule.hs:933) — the variant subst is folded into rule
-/// terms BEFORE the rule is grafted into the system.
-///
-/// Used by the eager-variant path in `solve_premise_goal` as an
-/// HS-functional-equivalent for StatVerif chain-narrowing.  HS's lazy
-/// SplitG variants get folded later via `applyEqStore`+`simp_singleton`
-/// when chain-extension's Maude unification kills incompatible variants;
-/// this helper short-circuits by applying the variant subst eagerly.
-fn apply_variant_to_rule(
-    rule: &RuleACInst,
-    variant: &tamarin_term::subst_vfresh::LNSubstVFresh,
-) -> RuleACInst {
-    let pairs = variant.to_list();
-    let subst = tamarin_term::subst::Subst::from_list(pairs);
-    let map_fact = |f: crate::fact::LNFact| -> crate::fact::LNFact {
-        f.map(|t| tamarin_term::subst::apply_vterm(&subst, t))
-    };
-    let new_prems: Vec<_> = rule.premises.iter().cloned().map(map_fact).collect();
-    let new_acts: Vec<_> = rule.actions.iter().cloned().map(map_fact).collect();
-    let new_concs: Vec<_> = rule.conclusions.iter().cloned().map(map_fact).collect();
-    let new_nvs: Vec<_> = rule.new_vars.iter()
-        .map(|t| tamarin_term::subst::apply_vterm(&subst, t.clone()))
-        .collect();
-    crate::rule::Rule::new(rule.info.clone(), new_prems, new_concs, new_acts)
-        .with_new_vars(new_nvs)
-}
-
 fn freshen_rule(rule: RuleACInst, avoid_max: u64, maude: &tamarin_term::maude_proc::MaudeHandle) -> RuleACInst {
     use tamarin_term::lterm::HasFrees;
     let bounds = {

@@ -7004,52 +7004,10 @@ fn apply_source_case_action(
     // as-is.
     close_trivial_chains_in_graft(&mut r);
 
-    // ---------------------------------------------------------------
-    // G — RS-only `apply_eq_store(empty_subst)` variant SplitG re-filter.
-    // Mirror the equivalent (now-removed-by-default) step in
-    // `apply_source_case_premise`.  HS has NO standalone empty-subst
-    // `applyEqStore`; the variant-drop happens via the edge-driven
-    // `solveFactEqs` (E.5).  Re-keying the variants a second time here
-    // collapses distinct witnesses onto the same idx and rotates split
-    // ordering (test4/test5).  Removed by default; legacy escape hatch
-    // via `TAM_RS_ENABLE_CONJOIN_REFILTER=1`.  See the premise-path G
-    // comment for the full rationale.
-    if std::env::var("TAM_RS_ENABLE_CONJOIN_REFILTER").is_ok()
-        && !r.sys.eq_store.conj.is_empty() && !r.sys.eq_store.subst.is_empty()
-    {
-        let empty_subst = tamarin_term::subst::Subst::empty();
-        let _op_guard = crate::constraint::solver::trace::OpLabelGuard::new("applySource:conjoin_refilter");
-        let _ = r.sys.eq_store.apply_eq_store(&ctx.maude, &empty_subst);
-        let needs_fold = r.sys.eq_store.conj.iter().any(|d| d.substs.len() == 1);
-        if needs_fold {
-            use tamarin_term::lterm::HasFrees;
-            let mut sys_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar>
-                = std::collections::BTreeSet::new();
-            let mut visit = |v: &tamarin_term::lterm::LVar| { sys_vars.insert(v.clone()); };
-            for (id, rule) in &r.sys.nodes {
-                id.for_each_free(&mut visit);
-                rule.for_each_free(&mut visit);
-            }
-            for e in &r.sys.edges {
-                e.src.0.for_each_free(&mut visit);
-                e.tgt.0.for_each_free(&mut visit);
-            }
-            for l in &r.sys.less_atoms {
-                l.smaller.for_each_free(&mut visit);
-                l.larger.for_each_free(&mut visit);
-            }
-            if let Some(la) = &r.sys.last_atom { la.for_each_free(&mut visit); }
-            let maude = ctx.maude.clone();
-            let store = std::mem::take(&mut r.sys.eq_store);
-            r.sys.eq_store = store.simp_with_fresh_avoiding(
-                |_, _| false,
-                |n| maude.reserve_idxs(n),
-                &sys_vars,
-                Some(&maude),
-            );
-            r.subst_system();
-        }
-    }
+    // (No RS-only empty-subst `apply_eq_store` variant re-filter here: HS has
+    // none; the conflicting-variant drop is edge-driven via `solveFactEqs`
+    // (E.5), which RS mirrors. A second re-key here collapsed distinct
+    // witnesses and rotated split ordering — verify_checksign_test::test4/5.)
 
     crate::state_trace::emit(
         "applySource_out", Some(&live_goal_for_trace), &r.sys);
@@ -7420,48 +7378,10 @@ fn apply_source_case_premise(
     // LNSubstVFresh` to the next key and rotates the 2-way split (RS picks
     // split_case_2 where HS picks split_case_1).
     //
-    // Removed by default (HS-faithful — HS never makes this call).  The
-    // edge-driven variant-drop (E.5) is retained, so TESLA-class variant
-    // pruning is unaffected (verified: corpus structural-match 116→118/118
-    // with identical incomparable set; TESLA honestly_executable unchanged
-    // at 8 diff lines both ways).  Legacy escape hatch via
-    // `TAM_RS_ENABLE_CONJOIN_REFILTER=1` for diagnosis.
-    if std::env::var("TAM_RS_ENABLE_CONJOIN_REFILTER").is_ok()
-        && !r.sys.eq_store.conj.is_empty() && !r.sys.eq_store.subst.is_empty()
-    {
-        let empty_subst = tamarin_term::subst::Subst::empty();
-        let _op_guard = crate::constraint::solver::trace::OpLabelGuard::new("applySource:conjoin_refilter");
-        let _ = r.sys.eq_store.apply_eq_store(&ctx.maude, &empty_subst);
-        let needs_fold = r.sys.eq_store.conj.iter().any(|d| d.substs.len() == 1);
-        if needs_fold {
-            use tamarin_term::lterm::HasFrees;
-            let mut sys_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar>
-                = std::collections::BTreeSet::new();
-            let mut visit = |v: &tamarin_term::lterm::LVar| { sys_vars.insert(v.clone()); };
-            for (id, rule) in &r.sys.nodes {
-                id.for_each_free(&mut visit);
-                rule.for_each_free(&mut visit);
-            }
-            for e in &r.sys.edges {
-                e.src.0.for_each_free(&mut visit);
-                e.tgt.0.for_each_free(&mut visit);
-            }
-            for l in &r.sys.less_atoms {
-                l.smaller.for_each_free(&mut visit);
-                l.larger.for_each_free(&mut visit);
-            }
-            if let Some(la) = &r.sys.last_atom { la.for_each_free(&mut visit); }
-            let maude = ctx.maude.clone();
-            let store = std::mem::take(&mut r.sys.eq_store);
-            r.sys.eq_store = store.simp_with_fresh_avoiding(
-                |_, _| false,
-                |n| maude.reserve_idxs(n),
-                &sys_vars,
-                Some(&maude),
-            );
-            r.subst_system();
-        }
-    }
+    // (No RS-only empty-subst `apply_eq_store` variant re-filter here: HS has
+    // none; the conflicting-variant drop is edge-driven via `solveFactEqs`
+    // (E.5), which RS mirrors. A second re-key here collapsed distinct
+    // witnesses and rotated split ordering — verify_checksign_test::test4/5.)
 
     if src.incomplete { r.sys.used_incomplete_source = true; }
     crate::state_trace::emit(

@@ -2053,8 +2053,10 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
                             .all(|(x, y)| match (x, y) {
                                 (Term::Lit(_), Term::Lit(_)) => true, // var/const OK
                                 (Term::App(_, _), Term::App(_, _)) => unifiable_shape(x, y),
+                                // `Term` has only `Lit`/`App`, so these two
+                                // arms cover the remaining `(Lit, App)` and
+                                // `(App, Lit)` mixes exhaustively.
                                 (Term::Lit(_), _) | (_, Term::Lit(_)) => true,
-                                _ => false,
                             })
                     }
                     _ => false,
