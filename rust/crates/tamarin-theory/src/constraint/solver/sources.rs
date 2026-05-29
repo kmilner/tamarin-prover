@@ -6006,24 +6006,24 @@ fn freshen_system_keep_with_shift(
             .collect();
         tamarin_term::subst::Subst::from_list(pairs)
     };
-    // Eq-store conj (SplitG disjunctions): shift both var keys and
-    // term values in each variant subst.  Without this, the variant
-    // SplitG's substs still reference pre-freshen var idxs while the
-    // surrounding nodes/edges/goals carry post-freshen idxs — so when
-    // a variant is picked via `solve_split_goal` and folded into the
-    // free subst via `simp_singleton`, `subst_system` finds no
-    // matching keys to substitute, leaving the rule nodes with bare
-    // msg-vars (e.g. `pk1`) instead of the narrowed `pk(x)` form.
-    // This causes the StatVerif `resolved1_contract_reachable`
-    // premature-SOLVED bug.
+    // Eq-store conj (SplitG disjunctions).  HS-faithful `mapFrees
+    // (SubstVFresh n LVar)` (SubstVFresh.hs:200-202): `rename`/`mapFrees`
+    // rewrite ONLY the DOMAIN keys; the range (existentially-bound
+    // witnesses) is left UNTOUCHED.  Shifting the range here (as the old
+    // code did) re-based the variant-disj witnesses on every matchToGoal
+    // rename, contributing to the cumulative inflation that rotates
+    // Responder_secrecy's 3-way split.  Match `freshen_system_some_inst`
+    // and `rename_precise.rs:98-109`: shift keys only.
+    //
+    // NOTE: a uniform shift of the domain keys keeps the variant SplitG's
+    // keys consistent with the surrounding (also-shifted) nodes/edges/goals
+    // so `subst_system` still finds matching keys after a variant is
+    // picked (the resolved1_contract_reachable concern); the witnesses in
+    // the range are local and need no shift.
     for disj in out.eq_store.conj.iter_mut() {
         for s in disj.substs.iter_mut() {
             let pairs: Vec<_> = s.to_list().into_iter()
-                .map(|(v, t)| {
-                    let new_v = shift_lvar(&v);
-                    let new_t = t.clone().map_free(&mut |w| shift_lvar(&w));
-                    (new_v, new_t)
-                })
+                .map(|(v, t)| (shift_lvar(&v), t))
                 .collect();
             *s = tamarin_term::subst_vfresh::SubstVFresh::from_list(pairs);
         }
@@ -6144,11 +6144,20 @@ fn freshen_system_some_inst(
         import_var(&k, &mut bindings);
         t.for_each_free(&mut |v| import_var(v, &mut bindings));
     }
+    // HS-faithful `mapFrees (SubstVFresh n LVar)` (SubstVFresh.hs:196-202):
+    // `foldFrees f = foldFrees f . M.keys` and `mapDomain (v,t) = (,t) <$>
+    // mapFrees f v` — so `someInst`/`rename` over a variant disj touch ONLY
+    // the DOMAIN keys; the range (witnesses) is left UNTOUCHED.  Walking the
+    // range here (as the old code did) re-freshened the variant-disj
+    // witnesses on every someInst, inflating them across saturate/conjoin
+    // iterations (e.g. Responder_secrecy: ~k.6 → ~k.31) and rotating the
+    // 3-way split via `Ord LNSubstVFresh`.  Match `rename_precise.rs:98-109`
+    // and import keys only.
     for d in sys.eq_store.conj.iter() {
         for s in d.substs.iter() {
-            for (k, t) in s.to_list() {
+            for (k, _t) in s.to_list() {
                 import_var(&k, &mut bindings);
-                t.for_each_free(&mut |v| import_var(v, &mut bindings));
+                // Range vars NOT imported (HS-faithful).
             }
         }
     }
@@ -6306,12 +6315,12 @@ fn freshen_system_some_inst(
             .collect();
         tamarin_term::subst::Subst::from_list(pairs)
     };
+    // HS-faithful `mapFrees (SubstVFresh)` (SubstVFresh.hs:200-202):
+    // rewrite ONLY the domain keys; leave the range (witnesses) UNTOUCHED.
     for disj in out.eq_store.conj.iter_mut() {
         for s in disj.substs.iter_mut() {
             let pairs: Vec<_> = s.to_list().into_iter()
-                .map(|(v, t)| {
-                    (lookup(&v), t.clone().map_free(&mut |w| lookup(&w)))
-                })
+                .map(|(v, t)| (lookup(&v), t))
                 .collect();
             *s = tamarin_term::subst_vfresh::SubstVFresh::from_list(pairs);
         }
@@ -6996,9 +7005,18 @@ fn apply_source_case_action(
     close_trivial_chains_in_graft(&mut r);
 
     // ---------------------------------------------------------------
-    // G — re-filter conjoined variant SplitGs.  Mirror the equivalent
-    // step in `apply_source_case_premise`.
-    if !r.sys.eq_store.conj.is_empty() && !r.sys.eq_store.subst.is_empty() {
+    // G — RS-only `apply_eq_store(empty_subst)` variant SplitG re-filter.
+    // Mirror the equivalent (now-removed-by-default) step in
+    // `apply_source_case_premise`.  HS has NO standalone empty-subst
+    // `applyEqStore`; the variant-drop happens via the edge-driven
+    // `solveFactEqs` (E.5).  Re-keying the variants a second time here
+    // collapses distinct witnesses onto the same idx and rotates split
+    // ordering (test4/test5).  Removed by default; legacy escape hatch
+    // via `TAM_RS_ENABLE_CONJOIN_REFILTER=1`.  See the premise-path G
+    // comment for the full rationale.
+    if std::env::var("TAM_RS_ENABLE_CONJOIN_REFILTER").is_ok()
+        && !r.sys.eq_store.conj.is_empty() && !r.sys.eq_store.subst.is_empty()
+    {
         let empty_subst = tamarin_term::subst::Subst::empty();
         let _op_guard = crate::constraint::solver::trace::OpLabelGuard::new("applySource:conjoin_refilter");
         let _ = r.sys.eq_store.apply_eq_store(&ctx.maude, &empty_subst);
@@ -7307,7 +7325,6 @@ fn apply_source_case_premise(
     } else {
         freshen_system_some_inst(&refined_case, &keep_vars, &ctx.maude)
     };
-
     // B+E — markGoalAsSolved + conjoinSystem.
     let mut r = Reduction::new(ctx, live_sys.clone());
     let live_goal = crate::constraint::constraints::Goal::Premise(
@@ -7376,20 +7393,42 @@ fn apply_source_case_premise(
     // F — close trivial chains.
     close_trivial_chains_in_graft(&mut r);
 
-    // G — re-filter conjoined variant SplitGs against the now-extended
-    // free subst.  Mirrors Haskell's `applyEqStore` semantics: when new
-    // bindings enter eq_store.subst (here, via the conjoin's case_subst_eqs),
-    // existing SplitG variants whose bindings conflict are dropped.
+    // G — RS-only `apply_eq_store(empty_subst)` variant SplitG re-filter.
     //
-    // Concrete TESLA::authentic example: Receiver0b's variant [0] has
-    // `z → verify(...)` and variant [1] has `z → true`.  When the case is
-    // grafted via apply_source_case_premise → conjoin_system, z gets
-    // unified with `true` (from Receiver0b_check's literal `true` slot)
-    // via the case's edges.  At that moment, applyEqStore should drop
-    // variant [0] because `verify(...) ≠ true`.  Without this G step,
-    // both variants survive, the search forks at the SplitG, picks
-    // variant [0]'s untyped-signature path, and reaches a spurious Solved.
-    if !r.sys.eq_store.conj.is_empty() && !r.sys.eq_store.subst.is_empty() {
+    // HS HAS NO STANDALONE EMPTY-SUBST `applyEqStore` REFILTER.  HS's
+    // `applyEqStore` (EquationStore.hs:348) is only ever called with a
+    // REAL `asubst` (from `solveSubstEqs`/`solveFactEqs`/`addEqs`); the
+    // variant-drop for conflicting variants happens organically when the
+    // conflicting binding enters via the normal solve path.  In particular
+    // HS's `insertEdges` (Reduction.hs:338) runs `solveFactEqs SplitNow`
+    // on every new edge's producer-conclusion ⇆ consumer-premise pair, and
+    // THAT applyEqStore (with the real edge binding) drops a variant whose
+    // range conflicts (e.g. TESLA Receiver0b variant `z → verify(...)`
+    // vs the edge's `z → true`).  Step E.5 above already mirrors this
+    // edge-driven `solve_fact_eqs`, so the variant-drop is HS-faithful
+    // WITHOUT this extra call.
+    //
+    // This standalone empty-subst re-key was an RS-only artifact: with an
+    // empty `asubst`, `newsubst = eqsSubst` and `applyBound` RE-KEYS the
+    // surviving variants' witnesses a SECOND time (after solveTermEqs
+    // already keyed them once).  Because each per-variant `applyBound`
+    // resets the fresh counter to the same base (HS-faithful per-call
+    // `evalFreshAvoiding`), the second re-key collapses two distinct
+    // witnesses onto the SAME idx (e.g. verify_checksign_test::test4/test5:
+    // sign→~k.15 and checksign→~k.15 COLLIDE, where HS keeps sign→~k.14,
+    // checksign→~k.11 distinct).  The collision falls through `Ord
+    // LNSubstVFresh` to the next key and rotates the 2-way split (RS picks
+    // split_case_2 where HS picks split_case_1).
+    //
+    // Removed by default (HS-faithful — HS never makes this call).  The
+    // edge-driven variant-drop (E.5) is retained, so TESLA-class variant
+    // pruning is unaffected (verified: corpus structural-match 116→118/118
+    // with identical incomparable set; TESLA honestly_executable unchanged
+    // at 8 diff lines both ways).  Legacy escape hatch via
+    // `TAM_RS_ENABLE_CONJOIN_REFILTER=1` for diagnosis.
+    if std::env::var("TAM_RS_ENABLE_CONJOIN_REFILTER").is_ok()
+        && !r.sys.eq_store.conj.is_empty() && !r.sys.eq_store.subst.is_empty()
+    {
         let empty_subst = tamarin_term::subst::Subst::empty();
         let _op_guard = crate::constraint::solver::trace::OpLabelGuard::new("applySource:conjoin_refilter");
         let _ = r.sys.eq_store.apply_eq_store(&ctx.maude, &empty_subst);

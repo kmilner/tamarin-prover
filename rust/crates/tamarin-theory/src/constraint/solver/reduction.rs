@@ -2886,6 +2886,24 @@ pub fn bounds_max(sys: &System) -> u64 {
     if let Some(la) = &sys.last_atom {
         la.for_each_free(&mut do_visit);
     }
+    // HS-faithful: `HasFrees System` folds field `e` = `_sSubtermStore`
+    // (System.hs:1834-1847), and `HasFrees SubtermStore` (SubtermStore.hs:
+    // 546-548) folds `negSt <> st <> solvedSt`.  RS's SubtermStore is a
+    // 3-field subset (subterms = HS's `st`, solved_subterms = HS's
+    // `solvedSt`), so walk both here.  Without this, `avoid sys` (the
+    // per-step Maude-counter reset seed, proof_method.rs:265 ≈ HS
+    // `runReduction … (avoid sys)`) under-counts when a lemma has live
+    // subterm constraints (e.g. `Ex x. x << t`), so RS could mint a
+    // witness colliding with a subterm-store var that HS's `avoid`
+    // reserves above.
+    for c in &sys.subterm_store.subterms {
+        c.small.for_each_free(&mut do_visit);
+        c.big.for_each_free(&mut do_visit);
+    }
+    for c in &sys.subterm_store.solved_subterms {
+        c.small.for_each_free(&mut do_visit);
+        c.big.for_each_free(&mut do_visit);
+    }
     for (g, _) in &sys.goals {
         use crate::constraint::constraints::Goal;
         match g {
@@ -2919,17 +2937,22 @@ pub fn bounds_max(sys: &System) -> u64 {
         if v.idx > max.get() { max.set(v.idx); }
         t.for_each_free(&mut do_visit);
     }
-    // Also walk eq_store.conj (disjunctive substitutions): these may
-    // carry high-idx Maude witnesses introduced by earlier `solve_fact_eqs`
-    // calls.  Without including these, a fresh witness minted by a later
-    // unification can collide with the in-conj witnesses, conflating two
-    // semantically-distinct vars to the same `~mw#N` — the root cause of
-    // the NSPK3/roles spurious Cyclic regressions in task #119.
+    // Walk eq_store.conj (disjunctive substitutions).  HS-faithful:
+    // `avoid sys = freshAvoiding (frees sys)`, and `frees` over the variant
+    // disj uses `foldFrees (SubstVFresh n LVar) = foldFrees f . M.keys`
+    // (SubstVFresh.hs:196) — i.e. ONLY the DOMAIN keys, NOT the range
+    // (witnesses).  Walking the range here over-counted `avoid sys`, so the
+    // per-step Maude-counter reset (proof_method.rs:265 ≈ HS
+    // `runReduction … (avoid sys)`) seeded too high, inflating witnesses
+    // minted by `someInst`/`applyBound` (e.g. Responder_secrecy: the
+    // Setup_Key `~k` nonce came out at ~k.31 vs HS ~k.3, rotating the
+    // 3-way split via `Ord LNSubstVFresh`).  Match `rename_precise.rs:
+    // 98-109` and count keys only.
     for d in &sys.eq_store.conj {
         for s in &d.substs {
-            for (v, t) in s.to_list() {
+            for (v, _t) in s.to_list() {
                 if v.idx > max.get() { max.set(v.idx); }
-                t.for_each_free(&mut do_visit);
+                // Range vars NOT counted (HS-faithful: foldFrees over keys).
             }
         }
     }

@@ -293,10 +293,39 @@ pub fn exec_proof_method(
                 simplify_system(&mut r);
                 if r.sys == before { break; }
             }
-            // Match Haskell's guard: if `Simplify` produced an
-            // identical system, it failed — return None so the
-            // search picks something else (or marks Sorry).
-            if r.sys == *sys { return None; }
+            // HS-faithful `cleanup` (ProofMethod.hs:453-454): EVERY proof
+            // method's cases pass through `map (fmap cleanup . fst)`
+            // (ProofMethod.hs:442), and `Simplify` goes through `process`
+            // (ProofMethod.hs:405-406) — so its output is ALSO cleaned.
+            // `cleanup s = L.set sSubst emptySubst (Precise.evalFresh
+            //   (renamePrecise s) Precise.nothingUsed)` resets ALL var
+            // indices per-name from 0 and clears the free subst.  The
+            // documented invariant (ProofMethod.hs:396-397): "the returned
+            // systems have their free substitution fully applied and all
+            // variable indices reset."  Without this on the Simplify path,
+            // RS's per-step counter reset (proof_method.rs:265 ≈ HS
+            // `runReduction … (avoid sys)`) seeds from an inflated
+            // `bounds_max` (e.g. Responder_secrecy: nodes i.3/j.4/vf.9 +
+            // terms msg.7/z.7 where HS canonicalises everything to idx 0),
+            // so the downstream Setup_Key `~k` nonce is minted at ~k.14
+            // instead of HS's ~k.3 — rotating the 3-way split.
+            let cleanup = |s: &System| -> System {
+                let mut s2 = s.clone();
+                if std::env::var("TAM_DISABLE_RENAME_PRECISE").is_err() {
+                    crate::constraint::solver::rename_precise::rename_precise_system(
+                        &mut s2);
+                }
+                s2.eq_store.subst =
+                    tamarin_term::subst::Subst::from_list(Vec::new());
+                s2
+            };
+            r.sys = cleanup(&r.sys);
+            // Match Haskell's guard (ProofMethod.hs:410): if `Simplify`
+            // produced a system equal to `cleanup sys`, it failed — return
+            // None so search picks something else (or marks Sorry).  HS
+            // compares the CLEANED simplified system against the CLEANED
+            // original, NOT the raw input.
+            if r.sys == cleanup(sys) { return None; }
             Some(vec![("".to_string(), r.sys)])
         }
         ProofMethod::SolveGoal(g) => {
