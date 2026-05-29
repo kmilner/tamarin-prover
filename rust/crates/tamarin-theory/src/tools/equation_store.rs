@@ -810,16 +810,10 @@ impl EquationStore {
         // Compose `{v → t}` into the free substitution and drop `v`
         // from every subst in disjunction `idx`.
         let factor = LNSubst::from_list(vec![(v.clone(), t)]);
-        // HS-faithful: foreachDisj at EquationStore.hs:696 calls
-        // `MS.modify (applyEqStore hnd msubst)` after the simp pass,
-        // composing factor AND re-unifying remaining disjs.
-        if let Some(m) = maude {
-            if self.apply_eq_store(m, &factor).is_err() {
-                self.subst = factor.compose(&self.subst);
-            }
-        } else {
-            self.subst = factor.compose(&self.subst);
-        }
+        // HS-faithful order (`foreachDisjAt`, EquationStore.hs:812-814):
+        // REPLACE the disj FIRST, THEN applyEqStore.  (For simpAbstractName
+        // the factor's range is a constant, so order is behaviourally
+        // neutral, but we keep the HS order for consistency.)
         let new_substs: Vec<LNSubstVFresh> = self.conj[idx].substs
             .iter()
             .map(|s| {
@@ -830,6 +824,13 @@ impl EquationStore {
             })
             .collect();
         self.conj[idx].substs = new_substs;
+        if let Some(m) = maude {
+            if self.apply_eq_store(m, &factor).is_err() {
+                self.subst = factor.compose(&self.subst);
+            }
+        } else {
+            self.subst = factor.compose(&self.subst);
+        }
         true
     }
 
@@ -947,13 +948,10 @@ impl EquationStore {
         let _id_guard = crate::constraint::solver::trace::OpLabelGuard::force(
             &format!("simpIdentify@{}",
                 crate::constraint::solver::trace::current_op_label()));
-        if let Some(m) = maude {
-            if self.apply_eq_store(m, &factor).is_err() {
-                self.subst = factor.compose(&self.subst);
-            }
-        } else {
-            self.subst = factor.compose(&self.subst);
-        }
+        // HS-faithful order (`foreachDisjAt`): REPLACE the disj (remove
+        // `keep` from every subst) FIRST, THEN apply_eq_store the factor.
+        // Same rationale as simpAbstractFun (avoids splitting shared range
+        // witnesses by re-unifying the un-updated disj).
         // Remove `keep` from every subst in disjunction `idx`.
         let new_substs: Vec<LNSubstVFresh> = self.conj[idx].substs
             .iter()
@@ -965,6 +963,13 @@ impl EquationStore {
             })
             .collect();
         self.conj[idx].substs = new_substs;
+        if let Some(m) = maude {
+            if self.apply_eq_store(m, &factor).is_err() {
+                self.subst = factor.compose(&self.subst);
+            }
+        } else {
+            self.subst = factor.compose(&self.subst);
+        }
         true
     }
 
@@ -1061,16 +1066,12 @@ impl EquationStore {
         let factor = LNSubst::from_list(vec![
             (v.clone(), Term::Lit(Lit::Var(fv.clone()))),
         ]);
-        // HS-faithful: foreachDisj at EquationStore.hs:696 calls
-        // `MS.modify (applyEqStore hnd msubst)` after the simp pass,
-        // composing factor AND re-unifying remaining disjs.
-        if let Some(m) = maude {
-            if self.apply_eq_store(m, &factor).is_err() {
-                self.subst = factor.compose(&self.subst);
-            }
-        } else {
-            self.subst = factor.compose(&self.subst);
-        }
+        // HS-faithful: foreachDisjAt (EquationStore.hs:812-814) REPLACES
+        // the disj with the abstracted substs FIRST, THEN calls
+        // `applyEqStore hnd msubst`.  Apply the abstraction to the disj
+        // before re-unifying (matching the simpAbstractFun fix — see
+        // rationale there: re-unifying the un-abstracted disj can split
+        // shared range witnesses).
         // For each (subst, lv) pair, remove (v, _) and add (fv, Var(lv)).
         let new_substs: Vec<LNSubstVFresh> = self.conj[idx].substs.iter()
             .zip(lvs.iter())
@@ -1083,6 +1084,13 @@ impl EquationStore {
             })
             .collect();
         self.conj[idx].substs = new_substs;
+        if let Some(m) = maude {
+            if self.apply_eq_store(m, &factor).is_err() {
+                self.subst = factor.compose(&self.subst);
+            }
+        } else {
+            self.subst = factor.compose(&self.subst);
+        }
         true
     }
 
@@ -1198,14 +1206,20 @@ impl EquationStore {
             let _abs_fun_guard = crate::constraint::solver::trace::OpLabelGuard::force(
                 &format!("simpAbstractFun@{}",
                     crate::constraint::solver::trace::current_op_label()));
-            if let Some(m) = maude {
-                if self.apply_eq_store(m, &factor).is_err() {
-                    self.subst = factor.compose(&self.subst);
-                }
-            } else {
-                self.subst = factor.compose(&self.subst);
-            }
-            // For each subst, drop v's entry and add (fvars[j], args[j]).
+            // HS-faithful order (`foreachDisjAt`, EquationStore.hs:812-814):
+            // REPLACE the disjunction with the abstracted substs FIRST,
+            // THEN run `applyEqStore` with the factored free subst.  RS
+            // previously ran apply_eq_store BEFORE replacing the disj, so
+            // apply_eq_store re-unified the OLD (un-abstracted) disj substs
+            // (still carrying `v → op(a, b)`) against the new free subst
+            // `{v → op(x1, x2)}`.  That re-unification re-allocated witnesses
+            // for OTHER range terms that shared `a, b` (e.g. a sibling
+            // `pcsig2 → pcs(op(a, b), ...)` entry), splitting the shared
+            // `a, b` into distinct fresh vars — the resolved1 linkage break
+            // (Out's `sign(a,b)` vs In's `pcs(sign(a',b'),...)`).  Applying
+            // the abstraction to the disj first makes `a, b` cleanly bound
+            // via `{x1 → a, x2 → b}`, and the subsequent apply_eq_store
+            // re-unifies the ALREADY-abstracted disj, preserving the share.
             let new_substs: Vec<LNSubstVFresh> = self.conj[idx].substs.iter()
                 .zip(argss.iter())
                 .map(|(s, args)| {
@@ -1219,6 +1233,13 @@ impl EquationStore {
                 })
                 .collect();
             self.conj[idx].substs = new_substs;
+            if let Some(m) = maude {
+                if self.apply_eq_store(m, &factor).is_err() {
+                    self.subst = factor.compose(&self.subst);
+                }
+            } else {
+                self.subst = factor.compose(&self.subst);
+            }
             true
         } else {
             // AC operator with varying arity: factor first two args.
@@ -1234,13 +1255,9 @@ impl EquationStore {
                     Term::Lit(Lit::Var(fv2.clone())),
                 ]),
             )]);
-            if let Some(m) = maude {
-                if self.apply_eq_store(m, &factor).is_err() {
-                    self.subst = factor.compose(&self.subst);
-                }
-            } else {
-                self.subst = factor.compose(&self.subst);
-            }
+            // HS-faithful order (`foreachDisjAt`): replace the disj FIRST,
+            // then apply_eq_store the factor.  See the non-AC branch above
+            // for the rationale (resolved1 linkage break).
             // For each subst with args = [a1, a2, ...]:
             //   if length 2: add (fv1, a1), (fv2, a2)
             //   else (>2):   add (fv1, a1), (fv2, op(a2, a3, ...))
@@ -1267,6 +1284,13 @@ impl EquationStore {
                 })
                 .collect();
             self.conj[idx].substs = new_substs;
+            if let Some(m) = maude {
+                if self.apply_eq_store(m, &factor).is_err() {
+                    self.subst = factor.compose(&self.subst);
+                }
+            } else {
+                self.subst = factor.compose(&self.subst);
+            }
             true
         }
     }
@@ -2197,6 +2221,18 @@ mod tests {
         SubstVFresh::from_list(vec![(v, t)])
     }
 
+    // A distinct subst per `idx`.  `add_disj`/`add_rule_variants` dedup
+    // identical substs (HS-faithful `S.fromList`, EquationStore.hs:209),
+    // so building a multi-element disjunction from repeated `fresh_subst()`
+    // collapses to a single element.  Tests that need a genuine N-element
+    // disjunction use distinct substs via this helper.
+    fn fresh_subst_n(idx: u64) -> LNSubstVFresh {
+        let v = LVar::new("x", LSort::Msg, idx);
+        let t = tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Var(
+            LVar::new("y", LSort::Msg, idx)));
+        SubstVFresh::from_list(vec![(v, t)])
+    }
+
     #[test]
     fn empty_store_is_consistent() {
         let s = EquationStore::empty();
@@ -2216,7 +2252,7 @@ mod tests {
     fn add_disj_assigns_fresh_ids() {
         let mut s = EquationStore::empty();
         let id1 = s.add_disj(vec![fresh_subst()]);
-        let id2 = s.add_disj(vec![fresh_subst(), fresh_subst()]);
+        let id2 = s.add_disj(vec![fresh_subst_n(0), fresh_subst_n(1)]);
         assert_eq!(id1, SplitId(0));
         assert_eq!(id2, SplitId(1));
         assert!(!s.is_false());
@@ -2238,7 +2274,7 @@ mod tests {
     #[test]
     fn perform_split_branches() {
         let mut s = EquationStore::empty();
-        let id = s.add_disj(vec![fresh_subst(), fresh_subst()]);
+        let id = s.add_disj(vec![fresh_subst_n(0), fresh_subst_n(1)]);
         let branches = s.perform_split(id).unwrap();
         assert_eq!(branches.len(), 2);
         // Each branch contains a single-case disjunction.
@@ -2277,7 +2313,7 @@ mod tests {
     #[test]
     fn rule_variants_added_as_disjunction() {
         let mut store = EquationStore::empty();
-        let id = store.add_rule_variants(vec![fresh_subst(), fresh_subst()])
+        let id = store.add_rule_variants(vec![fresh_subst_n(0), fresh_subst_n(1)])
             .expect("add_rule_variants");
         assert_eq!(id, SplitId(0));
         assert_eq!(store.split_size(id), Some(2));
@@ -2473,14 +2509,19 @@ mod tests {
             .add_eqs(&h, &[tamarin_term::rewriting::Equal { lhs: tx, rhs: ty }])
             .expect("add_eqs");
 
-        // Inspect every var in the subst's domain and range.  None
-        // should be a `~mw`-named witness.
+        // Unifying two free Msg vars must yield a simple orientation
+        // between x and y (HS-faithful var-var orient gives `{y → x}`),
+        // NOT a fresh `~mw`-style witness.  So flag any subst var that is
+        // neither x nor y — that would be a freshly-introduced witness.
+        // (Witness introduction here regressed TLS_Handshake::prem_idx_clash
+        // historically.)  x legitimately appears in the range of `{y → x}`,
+        // so the old `== "x"` check was stale after the var-var orient flip.
         use tamarin_term::lterm::HasFrees;
         let mut witness_found = false;
         for (key, term) in store.subst.to_list() {
-            if key.name == "x" { witness_found = true; }
+            if key.name != "x" && key.name != "y" { witness_found = true; }
             term.for_each_free(&mut |v| {
-                if v.name == "x" { witness_found = true; }
+                if v.name != "x" && v.name != "y" { witness_found = true; }
             });
         }
         assert!(!witness_found,
