@@ -12,77 +12,94 @@
 //! unifiability — that piece is wired in by callers once the typed
 //! rule layer is in place.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-/// Compute a set of edges to remove from a relation so that the
-/// remaining graph is acyclic. The strategy mirrors Haskell's
-/// `dfsLoopBreakers`: walk the relation in DFS order; whenever a
-/// back-edge is encountered, mark its target node as a "loop
-/// breaker" and remove all edges with that target.
+/// Compute a minimal set of loop-breakers using a greedy DFS strategy.
 ///
-/// The function returns the loop-breaker nodes — *target* sides of
-/// removed edges — sorted in deterministic order for reproducibility.
+/// **Faithful port of Haskell's `Data.DAG.Simple.dfsLoopBreakers`**
+/// (`lib/utils/src/Data/DAG/Simple.hs:111-128`):
+///
+/// ```haskell
+/// dfsLoopBreakers rel =
+///     D.toList $ snd $ execRWS (mapM_ (visit . fst) rel) () S.empty
+///   where
+///     visit x = do
+///         visited <- gets (S.member x)
+///         unless visited $ findLoopBreakers S.empty x
+///     findLoopBreakers parents0 x = do
+///         modify (S.insert x)
+///         let parents = S.insert x parents0
+///             ys      = x `image` rel
+///         if any (`S.member` parents) ys
+///           then tell (return x)
+///           else forM_ ys $ \y -> do
+///                    visited <- gets (S.member y)
+///                    unless visited $ findLoopBreakers parents y
+/// ```
+///
+/// Key semantics replicated exactly:
+/// - Iterate the relation in **list order** (`mapM_ (visit . fst) rel`),
+///   using each tuple's first component as a DFS root.  The relation
+///   ordering therefore matters; callers must build it in HS's order.
+/// - A single **monotonic `visited` set** shared across all DFS roots
+///   (`execRWS ... S.empty`): once a node is visited it is never
+///   re-explored, even from a later root.  (RS's prior implementation
+///   re-ran the whole DFS after each pick — not faithful.)
+/// - On the **first** successor that is already a parent (back-edge),
+///   emit the **current node `x`** (the back-edge SOURCE) as a loop
+///   breaker and STOP descending.  (RS's prior implementation emitted
+///   the back-edge TARGET / gray ancestor — not faithful.)
+/// - Emission order = DFS discovery order (`tell`/`DList` append);
+///   we mirror it with a `Vec` so the returned list matches HS's
+///   `D.toList`.
+///
+/// `image x rel = [ y' | (x', y') <- rel, x == x' ]` preserves the
+/// relation's list order for successor iteration, so we recompute it
+/// per node from the slice (matching HS — no pre-sorted adjacency map).
 pub fn dfs_loop_breakers<N: Clone + Ord>(
     relation: &[(N, N)],
 ) -> Vec<N> {
-    // Build adjacency map.
-    let mut adj: BTreeMap<N, Vec<N>> = BTreeMap::new();
-    for (src, dst) in relation {
-        adj.entry(src.clone()).or_default().push(dst.clone());
-    }
-    let mut breakers: BTreeSet<N> = BTreeSet::new();
+    let mut visited: BTreeSet<N> = BTreeSet::new();
+    let mut breakers: Vec<N> = Vec::new();
 
-    // Stable DFS visiting all sources.
-    loop {
-        let cur_relation: Vec<(N, N)> = relation.iter()
-            .filter(|(_, d)| !breakers.contains(d))
-            .cloned()
-            .collect();
-        let mut adj_now: BTreeMap<N, Vec<N>> = BTreeMap::new();
-        for (src, dst) in &cur_relation {
-            adj_now.entry(src.clone()).or_default().push(dst.clone());
-        }
-        // Detect any cycle in the current adjacency. If found, pick
-        // the lexicographically smallest node in that cycle as a
-        // breaker and continue.
-        if let Some(cycle_node) = find_cycle_node(&adj_now) {
-            breakers.insert(cycle_node);
+    // `image x rel` — successors of `x` in relation list order.
+    fn image<'a, N: Clone + Ord>(x: &N, rel: &'a [(N, N)]) -> Vec<N> {
+        rel.iter()
+            .filter(|(a, _)| a == x)
+            .map(|(_, b)| b.clone())
+            .collect()
+    }
+
+    // PRE: x0 is not yet visited.
+    fn find_loop_breakers<N: Clone + Ord>(
+        parents0: &BTreeSet<N>,
+        x: &N,
+        rel: &[(N, N)],
+        visited: &mut BTreeSet<N>,
+        breakers: &mut Vec<N>,
+    ) {
+        visited.insert(x.clone());
+        let mut parents = parents0.clone();
+        parents.insert(x.clone());
+        let ys = image(x, rel);
+        if ys.iter().any(|y| parents.contains(y)) {
+            // Back-edge to a parent: emit `x` and stop descending.
+            breakers.push(x.clone());
         } else {
-            break;
-        }
-    }
-    breakers.into_iter().collect()
-}
-
-/// DFS that returns one node belonging to a cycle, if any.
-fn find_cycle_node<N: Clone + Ord>(adj: &BTreeMap<N, Vec<N>>) -> Option<N> {
-    // 0=white, 1=gray, 2=black
-    let mut color: BTreeMap<N, u8> = BTreeMap::new();
-    let nodes: Vec<N> = adj.keys().cloned().collect();
-    fn dfs<N: Clone + Ord>(
-        n: &N,
-        adj: &BTreeMap<N, Vec<N>>,
-        color: &mut BTreeMap<N, u8>,
-    ) -> Option<N> {
-        color.insert(n.clone(), 1);
-        if let Some(succs) = adj.get(n) {
-            for s in succs {
-                match color.get(s).copied().unwrap_or(0) {
-                    1 => return Some(s.clone()),  // back-edge → cycle
-                    0 => if let Some(c) = dfs(s, adj, color) { return Some(c); },
-                    _ => {}
+            for y in &ys {
+                if !visited.contains(y) {
+                    find_loop_breakers(&parents, y, rel, visited, breakers);
                 }
             }
         }
-        color.insert(n.clone(), 2);
-        None
     }
-    for n in &nodes {
-        if color.get(n).copied().unwrap_or(0) == 0 {
-            if let Some(c) = dfs(n, adj, &mut color) { return Some(c); }
+
+    for (x, _) in relation {
+        if !visited.contains(x) {
+            find_loop_breakers(&BTreeSet::new(), x, relation, &mut visited, &mut breakers);
         }
     }
-    None
+    breakers
 }
 
 #[cfg(test)]

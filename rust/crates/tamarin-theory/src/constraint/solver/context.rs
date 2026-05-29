@@ -664,46 +664,70 @@ fn annotate_loop_breakers(
     // Indexed view.
     let keys: Vec<String> = rules.iter().map(rule_key).collect();
 
-    // Build the prem-solving relation as ((to_key, to_prem), (from_key, from_prem)).
+    // Build the prem-solving relation, mirroring HS's `premSolvingRelAC`
+    // (`LoopBreakers.hs:35-58`) EXACTLY, including iteration nesting —
+    // `dfsLoopBreakers` walks the relation in list order, so the order
+    // determines which node becomes each DFS root and therefore which
+    // breakers are picked.
+    //
+    // HS structure:
+    //   dataflowRelAC: ruFrom <- rules; ruTo <- rules;
+    //                  (premIdx,premFa0) <- ePrems ruTo; [unifiable];
+    //                  return (ruFrom, (ruTo, premIdx))
+    //   premSolvingRelAC: (toRu=ruFrom, from=(ruTo,premIdx)) <- dataflowRelAC;
+    //                     (toPrem,_) <- ePrems toRu;
+    //                     return (from, (toRu, toPrem))
+    //                   = ((ruTo,premIdx), (ruFrom,toPrem))
+    //
+    // So the nesting is: ruFrom (outer) → ruTo → premIdx(of ruTo) →
+    // toPrem(of ruFrom, innermost).  Each emitted element's FIRST
+    // component is (ruTo, premIdx); the relation appears grouped by
+    // ruFrom because that's the outermost loop.
     let mut relation: Vec<((String, PremIdx), (String, PremIdx))> = Vec::new();
-    for (i_to, ru_to) in rules.iter().enumerate() {
-        for (to_prem_idx, prem_fa) in ru_to.rule.enumerate_premises() {
-            // Skip K-facts and built-ins — they're handled by intruder
-            // rules and never participate in protocol-rule loops.
-            if !matches!(prem_fa.tag, crate::fact::FactTag::Proto(_, _, _)) {
-                continue;
-            }
-            // Haskell `LoopBreakers.hs:48`:
-            //   `guard $ not (isNoSourcesFact premFa0)`
-            // Premises tagged `[no_precomp]` are dropped from the
-            // dataflow relation entirely.  Without this, no_precomp
-            // premises get spurious loop-breaker marks, deprioritising
-            // goals that Haskell intends to be solved eagerly.
-            if prem_fa.is_no_sources() {
-                continue;
-            }
-            for (i_from, ru_from) in rules.iter().enumerate() {
-                // Haskell `LoopBreakers.hs:53` calls
-                // `unifiableLNFacts concFaFresh premFa` (Maude AC-
-                // unifiability).  Calling Maude N×M times during
-                // precompute OOMs on large protocols (NSPK3, Minimal_*).
-                // Stick with fast-path tag equality for now; deeper
-                // Maude-AC dedup is a follow-up that would need a
-                // unification cache keyed by `(tag, normalized-shape)`.
-                let conc_match = ru_from.rule.conclusions.iter()
-                    .any(|c| c.tag == prem_fa.tag);
-                if !conc_match { continue; }
-                let _ = maude;
+    for (i_from, ru_from) in rules.iter().enumerate() {
+        for (i_to, ru_to) in rules.iter().enumerate() {
+            for (to_prem_idx, prem_fa) in ru_to.rule.enumerate_premises() {
+                // Skip K-facts and built-ins — they're handled by intruder
+                // rules and never participate in protocol-rule loops.
+                if !matches!(prem_fa.tag, crate::fact::FactTag::Proto(_, _, _)) {
+                    continue;
+                }
+                // Haskell `LoopBreakers.hs:48`:
+                //   `guard $ not (isNoSourcesFact premFa0)`
+                if prem_fa.is_no_sources() {
+                    continue;
+                }
+                // Haskell `LoopBreakers.hs:49-53`: edge exists iff some
+                // conclusion of `ruFrom` is AC-UNIFIABLE with this premise
+                // (not merely same-tag).  Tag-only matching over-approximates
+                // and adds spurious self-edges (e.g. `I_m0`'s `St_I(<'m2'>)`
+                // conclusion vs its own `St_I('m0')` premise share a tag but
+                // do NOT unify), which fabricate extra cycles and over-mark
+                // loop breakers.  Use real Maude unifiability, mirroring HS.
+                //
+                // HS renames the conclusion to avoid the premise's free
+                // vars (`concFaFresh = rename concFa \`evalFresh\` avoid
+                // premFa`, LoopBreakers.hs:52) so the unifier treats them
+                // as distinct rule instances rather than capturing shared
+                // names.  Replicate that here.
+                let conc_unifies = ru_from.rule.conclusions.iter().any(|c| {
+                    if c.tag != prem_fa.tag { return false; }
+                    let mut fresh = tamarin_term::lterm::avoid(prem_fa);
+                    let conc_fresh = tamarin_term::lterm::rename(c.clone(), &mut fresh);
+                    crate::rule::unifiable_ln_facts(maude, &conc_fresh, prem_fa)
+                        .unwrap_or(false)
+                });
+                if !conc_unifies { continue; }
                 for (from_prem_idx, _) in ru_from.rule.enumerate_premises() {
                     relation.push((
                         (keys[i_to].clone(), to_prem_idx),
                         (keys[i_from].clone(), from_prem_idx),
                     ));
                 }
-                let _ = i_from;
+                let _ = i_to;
             }
-            let _ = i_to;
         }
+        let _ = i_from;
     }
     // Run DFS loop-breaker selection.
     let breakers: Vec<(String, PremIdx)> =
