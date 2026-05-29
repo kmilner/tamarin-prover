@@ -1348,13 +1348,34 @@ impl EquationStore {
                 self.sort_disj_substs();
             }
             changed |= self.simp_empty_disj();
-            // H29 (2026-05-29): during saturation (precompute), do NOT
-            // fold singleton variant disjs into the free subst. HS keeps
-            // the variant disj LAZY in cdCases (RuleACConstrs) during
-            // saturate; the binding stays in the Disj, so subst_system
-            // never bakes it into rule conclusion terms. Opt-out:
-            // TAM_RS_DISABLE_H29=1.
-            let h29_skip_fold = std::env::var("TAM_RS_DISABLE_H29").is_err()
+            // increment 2 (2026-05-29): ALWAYS fold singleton variant
+            // disjs into the free subst — this is exactly what HS does.
+            // HS's `simp1` runs `foreachDisjAt "simpSingleton"`
+            // unconditionally on every disj (EquationStore.hs:596), with
+            // NO precompute guard; `simpSingleton [subst0]` folds a
+            // singleton disj via `freshToFree` into the free subst
+            // (EquationStore.hs:640-642).  Increment 1's H29 had skipped
+            // this fold during precompute on the premise that HS keeps
+            // the variant disj "lazy in cdCases".  That premise was
+            // wrong: `cdCases`'s laziness is Haskell *thunk* evaluation
+            // laziness (the case set isn't computed until forced), NOT an
+            // unfolded variant disjunction in the eq-store.  Once a source
+            // case IS computed, HS's `solveRuleConstraints` →
+            // `simp hnd ... eqs` folds the singleton variant, baking it
+            // into the rule body via `substSystem`.  Skipping the fold
+            // desynchronised a rule's premise from its conclusion (e.g.
+            // Tutorial Serv_1: conc `Out(h(t.1))` kept the abstract source
+            // pattern var while prem `In(aenc(<'1', x.26>, pk(x.67)))` used
+            // disconnected variant witnesses), so the search reached a
+            // spurious counterexample instead of HS's contradiction —
+            // verdict-flipping Client_auth, Client_auth_injective and
+            // TESLA_Scheme1::authentic from verified to falsified.
+            // Folding (this faithful behaviour) leaves resolved1's
+            // *multi-arm* variant disjs untouched (simpSingleton only
+            // fires on singletons), so it neither helps nor harms resolved1
+            // while reverting the 3 flips.  The experimental skip remains
+            // reachable for diagnosis via the opt-IN `TAM_RS_ENABLE_H29=1`.
+            let h29_skip_fold = std::env::var("TAM_RS_ENABLE_H29").is_ok()
                 && crate::constraint::solver::sources::in_precompute_mode();
             if !h29_skip_fold
                 && self.simp_singleton_avoiding(&mut alloc, external_preserve, maude) {
