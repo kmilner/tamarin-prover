@@ -1399,14 +1399,23 @@ pub fn dispatch_solve_goal(
                 &p.0, p.1, fa,
             ) {
                 use crate::constraint::solver::reduction::GoalCases;
+                if case_pairs.len() == 1 {
+                    let (name, sys) = case_pairs.into_iter().next().unwrap();
+                    red.sys = sys;
+                    return GoalCases::LinearNamed(name);
+                }
                 if !case_pairs.is_empty() {
-                    if case_pairs.len() == 1 {
-                        let (name, sys) = case_pairs.into_iter().next().unwrap();
-                        red.sys = sys;
-                        return GoalCases::LinearNamed(name);
-                    }
                     return GoalCases::Cases(case_pairs);
                 }
+                // HS-faithful: `solveWithSource` returned `Just` (the
+                // abstract `matchToGoal` matched) but every case was
+                // contradictory at conjoin → zero surviving cases.  HS
+                // renders this `by` (no children, Proof.hs:1084); the
+                // node is contradictory.  Return `Contradictory` instead
+                // of falling through to runtime `solve_premise_goal`,
+                // which would re-introduce a shallow producer case HS
+                // never explores.
+                return GoalCases::Contradictory;
             }
         }
     }

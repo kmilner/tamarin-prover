@@ -4712,6 +4712,44 @@ pub fn solve_with_source_cases_ctx(
     // empty cells and silently fall through to direct rule enumeration,
     // emitting an extra `[EXEC] solveGoal kind=Premise ...` trace
     // line that HS skips because its `solveWithSource` succeeded.
+    // HS `matchToGoal` (Sources.hs:366-377) decides Just/Nothing for the
+    // WHOLE source based ONLY on `maybeMatcher` (tag match, already
+    // guaranteed by the `find` above) AND `doMatch (faTerm matchFact
+    // faPat <> iTerm matchLVar iPat)` against the source's ABSTRACT goal
+    // (`cdGoal th`, all-fresh-var terms from `precomputeSources`).  It is
+    // independent of whether the individual `cdCases` survive conjoin:
+    // per-case contradictions are dropped later in `_applySource`
+    // (`disjunctionOfList ... >>= conjoinSystem`) WITHOUT causing
+    // fall-through to runtime `solveGoal`.  Concretely, if every case is
+    // contradictory, `solveWithSource` still returns `Just (empty
+    // reduction)` → the proof node renders `by` with ZERO children
+    // (Proof.hs:1084), NOT a runtime bare-rule graft.
+    //
+    // The abstract premise pattern is all-fresh-vars, so `matchFact`
+    // always succeeds for a same-tag/same-arity live fact — mirror that
+    // here with an explicit probe so we return `Some` (possibly empty)
+    // whenever HS's `matchToGoal` would return `Just`, instead of
+    // falling back to runtime `solve_premise_goal` and re-introducing a
+    // shallow producer case that HS never explores (the keylessssl
+    // `injectivity` `St_C ▶₀ #j` extra-`solve case C_2` divergence:
+    // every St_C source-case is `refineSubst`-contradictory at runtime,
+    // but HS emits `by`).
+    let abstract_match_ok = match &src.goal {
+        Goal::Premise(_, fa_pat) => {
+            // The precomputed source goal (`cdGoal`) is built by
+            // `precomputeSources` with all-fresh-variable terms, so HS's
+            // `faTerm matchFact faPat` always succeeds for a same-tag,
+            // same-arity live fact.  Require the pattern to be all-var to
+            // mirror that exactly (so a hypothetical non-var pattern still
+            // falls through to runtime if it genuinely can't match).
+            fa_pat.tag == fa_prem.tag
+                && fa_pat.terms.len() == fa_prem.terms.len()
+                && fa_pat.terms.iter().all(|t| matches!(
+                    t, tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Var(_))))
+        }
+        _ => false,
+    };
+
     let mut out: Vec<(String, System)> = Vec::new();
     for (name, case_sys) in src.cases(ctx) {
         // Normalize precompute case-name by stripping `_case_<N>_` and
@@ -4725,7 +4763,11 @@ pub fn solve_with_source_cases_ctx(
             out.push((case_label, final_sys));
         }
     }
-    if out.is_empty() { return None; }
+    // HS-faithful: an empty `out` (all cases contradictory) still counts
+    // as a successful `solveWithSource` when the abstract `matchToGoal`
+    // would have matched — return `Some(empty)` so the dispatcher emits
+    // `by` (no children) rather than falling through to runtime.
+    if out.is_empty() && !abstract_match_ok { return None; }
     Some(out)
 }
 
