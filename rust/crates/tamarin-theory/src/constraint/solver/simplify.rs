@@ -398,13 +398,45 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
     // insertion order; sort first to match HS's iteration.
     let mut formulas = red.sys.formulas.clone();
     formulas.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
-    let mut changed = ChangeIndicator::Unchanged;
-    for fm in formulas {
+    // HS-faithful: `evalFormulaAtoms` builds a CHANGE LIST via
+    // `applyChangeList`'s list comprehension (Simplify.hs:444-454) where
+    // every `fm'` is computed from the SINGLE `valuation` captured at
+    // pass entry (`valuation <- gets (partialAtomValuation ctxt)`,
+    // Simplify.hs:442) — i.e. against the FROZEN pre-pass system.  Only
+    // after all `fm'` are determined does `applyChangeList = sequence_`
+    // run the per-formula `insertFormula fm'` mutations, in `S.toList`
+    // order (Reduction.hs:191-193).
+    //
+    // Previously this loop recomputed `partial_atom_valuation(&red.sys,…)`
+    // on EACH iteration against the LIVE, already-mutated `red.sys`, and
+    // removed/re-inserted formulas mid-loop.  That made a later formula's
+    // simplification (and hence which DisjG goals are NEW vs already
+    // present) depend on earlier iterations' edits — splitting what HS
+    // does in ONE pass across several simplify-loop passes and SWAPPING
+    // the `_gsNr` insertion order of co-created disjunction goals (e.g.
+    // the `(∃Session('C',…,S(cw)))∨(∃Compromise)` vs
+    // `(∃Session('C',…,c1))∨(∃Compromise)` pair at
+    // `unmatching_implies_detect_with_W_uncompromised`'s divergence node:
+    // HS assigns S(cw)=209/c1=210, the live-mutation loop assigned
+    // c1=209/S(cw)=210).  We replicate HS's frozen `valuation` WITHOUT
+    // cloning the system: the first loop only READS `red.sys` (computing
+    // every `simp` against the current, not-yet-mutated state) and
+    // collects the change list; all mutations run afterwards.  Since
+    // nothing mutates during the compute phase, every `simp` sees the
+    // same pre-pass system — identical to HS's captured `valuation`.
+    let mut change_list: Vec<(Guarded, Guarded)> = Vec::new();
+    {
         let maude = red.ctx.maude.clone();
         let val = |a: &tamarin_parser::ast::Atom|
             partial_atom_valuation(&red.sys, &maude, a);
-        let simp = simplify_guarded_with(&fm, &val);
-        if simp == fm { continue; }
+        for fm in formulas.into_iter() {
+            let simp = simplify_guarded_with(&fm, &val);
+            if simp == fm { continue; }
+            change_list.push((fm, simp));
+        }
+    }
+    let mut changed = ChangeIndicator::Unchanged;
+    for (fm, simp) in change_list {
         // Haskell `evalFormulaAtoms` (Simplify.hs:321-337):
         //   case fm of
         //     GDisj disj -> markGoalAsSolved "simplified" (DisjG disj)
