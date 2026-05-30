@@ -555,9 +555,26 @@ fn partial_atom_valuation(
         Atom::Less(i, j) => {
             let ni = parser_node_id(i)?;
             let nj = parser_node_id(j)?;
+            // HS-faithful guard ORDER (Simplify.hs:519-525):
+            //   | i == j || j `before` i  -> Just False
+            //   | i `before` j            -> Just True
+            // The `j before i -> Just False` guard is checked BEFORE the
+            // `i before j -> Just True` guard.  When the less-relation
+            // already contains a cycle (`i before j` AND `j before i` both
+            // hold — e.g. after an ordering edge closes a loop), HS yields
+            // `Just False` because the `j before i` arm matches first.  RS
+            // previously checked `always_before(i,j) -> Some(true)` first,
+            // yielding `Some(true)` in the cyclic case — the OPPOSITE result.
+            // That single mis-ordering collapsed a `[¬Less | EqE(~ni,~ni)]`
+            // reuse-lemma disjunction (matching_detects_later_misuse): RS
+            // dropped the `¬Less` disjunct (because `Less` read True), leaving
+            // a bare `EqE(~ni,~ni)` that `insertAtom` then unified — merging
+            // two distinct Fresh `~ni` producers (DG4) → node-id-eq FALSE →
+            // the case was dropped, where HS instead keeps the 2-way DisjG
+            // split and closes only `I_1_case_1` via a Cyclic contradiction.
             if ni == nj { return Some(false); }
-            if sys.always_before(&ni, &nj) { return Some(true); }
             if sys.always_before(&nj, &ni) { return Some(false); }
+            if sys.always_before(&ni, &nj) { return Some(true); }
             // Haskell:
             //   isLast sys i && isInTrace sys j  -> Just False
             //   isLast sys j && isInTrace sys i &&
