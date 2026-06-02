@@ -104,20 +104,49 @@ worker() {
     # shellcheck disable=SC2064
     trap "rm -rf '$tmp'" RETURN
 
-    # --- HS canon: cache (#2) first, else per-lemma fallback (#1 isolation).
+    # --- HS canon: cache (#2) first, else per-lemma fallback.
+    # Cache stores 3 outcomes:
+    #   <key>.canon   - non-empty proof tree (typical match/diff path)
+    #   <key>.empty   - HS produced no skeleton (parsed-only / unprovable;
+    #                   classify as SKIP_NO_HS without re-running HS)
+    #   <key>.timeout - HS hit the wall-clock timeout last time
+    #                   (classify as SKIP_TIMEOUT without re-running HS;
+    #                   delete the marker manually to retry, e.g. after
+    #                   raising TIMEOUT)
+    # Previously only the non-empty case was cached, so SKIP_NO_HS (~32 of
+    # 292 corpus lemmas) and SKIP_TIMEOUT (~20 of 292) re-ran HS every
+    # sweep — and the timeouts happen to be the heaviest jcs18 lemmas
+    # using GB of RAM each.  Caching the negative outcomes cuts warm-sweep
+    # CPU dramatically.
     local hs_canon="$tmp/hs.canon" hs_rc=0
-    local key=""
-    if [ -z "$NO_HS_CACHE" ]; then key="$HS_CANON_CACHE/$(hs_cache_key "$f" "$lemma")"; fi
-    if [ -n "$key" ] && [ -f "$key" ]; then
+    local key="" key_empty="" key_timeout=""
+    if [ -z "$NO_HS_CACHE" ]; then
+        key="$HS_CANON_CACHE/$(hs_cache_key "$f" "$lemma")"
+        key_empty="${key%.canon}.empty"
+        key_timeout="${key%.canon}.timeout"
+    fi
+    if [ -n "$key" ] && [ -f "$key_timeout" ]; then
+        # Cached timeout — short-circuit to SKIP_TIMEOUT below.
+        hs_rc=124
+        : > "$tmp/hs.canon"
+    elif [ -n "$key" ] && [ -f "$key_empty" ]; then
+        # Cached empty canon — classify as SKIP_NO_HS below.
+        : > "$tmp/hs.canon"
+        hs_canon="$tmp/hs.canon"
+    elif [ -n "$key" ] && [ -f "$key" ]; then
         hs_canon="$key"
     else
-        # Fallback: prove just this lemma (the original per-lemma path).
         timeout "$TIMEOUT" "$HS_PATH" +RTS -N1 -RTS --prove="$lemma" "$f" 2>/dev/null > "$tmp/hs.out"
         hs_rc=$?
         slice_canon "$lemma" "$tmp/hs.out" "$tmp/hs.canon"
-        # Populate the cache for next time (only non-empty).
-        if [ -n "$key" ] && [ "$hs_rc" -ne 124 ] && [ "$(grep -c . "$tmp/hs.canon")" -gt 0 ]; then
-            cp -f "$tmp/hs.canon" "$key" 2>/dev/null || true
+        if [ -n "$key" ]; then
+            if [ "$hs_rc" -eq 124 ]; then
+                : > "$key_timeout" 2>/dev/null || true
+            elif [ "$(grep -c . "$tmp/hs.canon")" -gt 0 ]; then
+                cp -f "$tmp/hs.canon" "$key" 2>/dev/null || true
+            else
+                : > "$key_empty" 2>/dev/null || true
+            fi
         fi
     fi
 
