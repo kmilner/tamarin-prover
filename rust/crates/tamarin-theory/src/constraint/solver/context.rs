@@ -252,7 +252,15 @@ impl ProofContext {
             for src in &self.full_sources {
                 let tag = match &src.goal {
                     Goal::Premise(_, f) => format!("Premise({:?})", f.tag),
-                    Goal::Action(_, f) => format!("Action({:?})", f.tag),
+                    Goal::Action(_, f) => {
+                        let head = f.terms.first().map(|t| match t {
+                            tamarin_term::term::Term::App(n, args) =>
+                                format!("App({:?},{})", n, args.len()),
+                            tamarin_term::term::Term::Lit(_) => "Lit".to_string(),
+                            _ => "other".to_string(),
+                        }).unwrap_or_else(|| "no_terms".to_string());
+                        format!("Action({:?},{})", f.tag, head)
+                    }
                     _ => continue,
                 };
                 for (name, sys) in src.cases_or_empty() {
@@ -503,8 +511,10 @@ impl ProofContext {
             pc_true_subterm,
             heuristic: None,
             saturate_state: std::sync::Mutex::new(SaturateState::Pending),
-            saturation_limit: crate::constraint::solver::sources::IntegerParameters::default()
-                .saturation_limit as usize,
+            saturation_limit: std::env::var("TAM_SATURATION_LIMIT").ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or_else(|| crate::constraint::solver::sources::IntegerParameters::default()
+                    .saturation_limit as usize),
         };
         // Precompute unique sources from the protocol rules.
         let params = crate::constraint::solver::sources::IntegerParameters::default();

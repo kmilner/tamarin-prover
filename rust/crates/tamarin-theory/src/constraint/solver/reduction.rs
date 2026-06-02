@@ -4463,6 +4463,18 @@ impl<'ctx> Reduction<'ctx> {
         let candidates: Vec<(RuleACInst,
                 Option<Vec<tamarin_term::subst_vfresh::LNSubstVFresh>>)>
             = premise_solving_rule_insts_with_constrs(self.ctx, fa_prem);
+        if std::env::var("TAM_RS_DBG_PREM_CANDS").as_deref() == Ok("1") {
+            let path = crate::constraint::solver::trace::case_path_string();
+            eprintln!("[PREM_CANDS] path=[{}] prem_fact={:?} n_cands={}",
+                path, fa_prem, candidates.len());
+            let mut matchers: Vec<String> = Vec::new();
+            for (rule, _) in &candidates {
+                let any_match = rule.enumerate_conclusions().any(|(_, fc)|
+                    fc.tag == fa_prem.tag && fc.terms.len() == fa_prem.terms.len());
+                if any_match { matchers.push(rule_case_name(rule)); }
+            }
+            eprintln!("  tag-matchers: {:?}", matchers);
+        }
         let avoid_max = bounds_max(&self.sys);
         let mut cases: Vec<(String, crate::constraint::system::System)> = Vec::new();
         let mut next_node_idx = avoid_max.saturating_add(1);

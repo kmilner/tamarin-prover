@@ -4750,17 +4750,26 @@ pub fn solve_with_source_cases_ctx(
         _ => false,
     };
 
+    let dbg = std::env::var("TAM_RS_DBG_RUNTIME_CASES").as_deref() == Ok("1");
     let mut out: Vec<(String, System)> = Vec::new();
+    let mut all_attempted: Vec<(String, bool)> = Vec::new();
     for (name, case_sys) in src.cases(ctx) {
-        // Normalize precompute case-name by stripping `_case_<N>_` and
-        // intruder-rule prefixes (coerce_, irecv_, c_<sym>_) so that
-        // runtime emits the canonical Haskell name (e.g. `Recv1`).
         let case_label = saturated_chain_root(&name);
-        if let Some(final_sys) = apply_source_case_premise(
+        let applied = apply_source_case_premise(
             ctx, sys, src, &case_sys,
             goal_node, goal_prem_idx, fa_prem,
-        ) {
+        );
+        let kept = applied.is_some();
+        if dbg { all_attempted.push((case_label.clone(), kept)); }
+        if let Some(final_sys) = applied {
             out.push((case_label, final_sys));
+        }
+    }
+    if dbg {
+        eprintln!("[RUNTIME_CASES] prem_tag={:?} n_total={} n_kept={}",
+            fa_prem.tag, all_attempted.len(), out.len());
+        for (n, k) in &all_attempted {
+            eprintln!("  case: {} kept={}", n, k);
         }
     }
     // HS-faithful: an empty `out` (all cases contradictory) still counts
@@ -5400,9 +5409,14 @@ pub fn solve_with_source_cases_action_with_ctx(
     } else {
         src.cases_or_empty()
     };
+    let dbg_rt = std::env::var("TAM_RS_DBG_RUNTIME_CASES").as_deref() == Ok("1");
+    let total_n = cases_iter.len();
     let mut out: Vec<(String, System, crate::fact::LNFact)> = Vec::new();
+    let mut kept_names: Vec<String> = Vec::new();
+    let mut all_names: Vec<String> = Vec::new();
     for (name, case_sys) in cases_iter {
         let case_label = saturated_chain_root(&name);
+        if dbg_rt { all_names.push(case_label.clone()); }
         // Haskell-faithful `applySource` path when a ProofContext is
         // available.  Matches the live goal against the source's
         // ABSTRACT `cdGoal` (`src.goal`) — NOT a case-specific action.
@@ -5421,6 +5435,7 @@ pub fn solve_with_source_cases_action_with_ctx(
                     ctx, sys, src, &case_sys, goal_node, fa_live);
                 if let Some((mut grafted_sys, live_action)) = result {
                     if src.incomplete { grafted_sys.used_incomplete_source = true; }
+                    if dbg_rt { kept_names.push(case_label.clone()); }
                     // Haskell-faithful: do NOT fan out variant SplitG
                     // at source-apply time.  The previous comment
                     // claimed Haskell's saturate produces one case per
@@ -5465,7 +5480,17 @@ pub fn solve_with_source_cases_action_with_ctx(
             sys, &renamed, &abstract_renamed, goal_node, fa_live,
         ) else { continue };
         if src.incomplete { grafted.used_incomplete_source = true; }
+        if dbg_rt { kept_names.push(case_label.clone()); }
         out.push((case_label, grafted, action_fact));
+    }
+    if dbg_rt {
+        let head = match &fa_live.terms[0] {
+            tamarin_term::term::Term::App(n, args) => format!("App({:?},{})", n, args.len()),
+            tamarin_term::term::Term::Lit(_) => "Lit".to_string(),
+            _ => "other".to_string(),
+        };
+        eprintln!("[RUNTIME_CASES_ACT] head={} total={} kept={} all={:?} kept_names={:?}",
+            head, total_n, out.len(), all_names, kept_names);
     }
     if out.is_empty() { return None; }
     Some(out)

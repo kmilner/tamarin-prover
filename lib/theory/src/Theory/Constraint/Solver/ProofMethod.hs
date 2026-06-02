@@ -1224,7 +1224,9 @@ smartRanking ctxt allowPremiseGLoopBreakers sys =
                             Just (viewTerm -> FApp other _) ->
                               "[HS src other] " ++ show other
                                 ++ " cases=" ++ show (length (getDisj (L.get cdCases cd)))
-                            _ -> "[HS src non-app]")
+                            _ -> "[HS src non-app] cases="
+                                ++ show (length (getDisj (L.get cdCases cd)))
+                                ++ " names=" ++ show [n | (n, _) <- getDisj (L.get cdCases cd)])
                        (L.get pcSources ctxt))
           oneCaseOnlyRaw
         _ -> oneCaseOnlyRaw
