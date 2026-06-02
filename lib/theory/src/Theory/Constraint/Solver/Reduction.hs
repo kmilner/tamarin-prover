@@ -534,6 +534,11 @@ insertFormula = do
                   when dbg $ Debug.Trace.traceM $
                     "[HS_GFALSE] path=" ++ T.casePathString (Unsafe.unsafePerformIO T.getCasePath)
                     ++ " gfalse inserted"
+              let dbgD = Unsafe.unsafePerformIO $
+                    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_DBG_DISJ_INSERT"
+              when dbgD $ Debug.Trace.traceM $
+                  "[HS_DISJ_INSERT] n_alts=" ++ show (length $ getDisj disj) ++
+                  " alts=" ++ show (getDisj disj)
               modM sFormulas (S.insert fm)
               insertGoal (DisjG disj) False
 

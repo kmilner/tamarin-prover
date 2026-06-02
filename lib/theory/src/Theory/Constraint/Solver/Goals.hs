@@ -450,6 +450,11 @@ solveSplit x = do
 -- of them at once.
 solveDisjunction :: Disj LNGuarded -> Reduction String
 solveDisjunction disj = do
+    let dbg = Unsafe.unsafePerformIO $
+              maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_DBG_DISJ_SPLIT"
+    when dbg $ Debug.Trace.traceM $
+        "[HS_DISJ_SPLIT] n_alts=" ++ show (length $ getDisj disj) ++
+        " alts=" ++ show (getDisj disj)
     (i, gfm) <- disjunctionOfList $ zip [(1::Int)..] $ getDisj disj
     insertFormula gfm
     return $ "case_" ++ show i

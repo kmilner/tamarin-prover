@@ -548,8 +548,25 @@ fn partial_atom_valuation(
             _ => false,
         }
     };
+    // HS-faithful `isInTrace` (System.hs:1641-1645):
+    //   isInTrace sys i =
+    //        i `M.member` sNodes
+    //     || isLast sys i
+    //     || any ((i ==) . fst) (unsolvedActionAtoms sys)
+    // The `unsolvedActionAtoms` clause is critical: free node-id variables
+    // that appear only as the timepoint of an unsolved Action goal (e.g.
+    // a freshly-opened existential `Expired(k)@e`) ARE guaranteed to be
+    // instantiated to a trace index. Without this clause, RS would return
+    // `None` for `Less(last, e)` where HS returns `Just False`, leaving
+    // `Less(last, e) ∨ Less(e, last)` un-simplifiable in evalFormulaAtoms
+    // and forcing a runtime DisjG split that HS skips.  Concretely:
+    // TESLA::knows_only_expired_chain_keys had 2 such extra case_1/case_2
+    // splits; TPM_DKRS::PCR_Write_charn the same pattern.
     let is_in_trace = |n: &crate::constraint::constraints::NodeId| -> bool {
-        sys.nodes.iter().any(|(id, _)| id == n)
+        if sys.nodes.iter().any(|(id, _)| id == n) { return true; }
+        if sys.last_atom.as_ref() == Some(n) { return true; }
+        sys.goals.iter().any(|(g, st)| !st.solved && matches!(g,
+            crate::constraint::constraints::Goal::Action(i, _) if i == n))
     };
     match atom {
         Atom::Less(i, j) => {

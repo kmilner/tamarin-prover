@@ -3443,6 +3443,21 @@ impl<'ctx> Reduction<'ctx> {
     pub fn solve_disj_goal(&mut self, disj: &Disj<Guarded>) -> GoalCases {
         let g = Goal::Disj(disj.clone());
         let alts = &disj.0;
+        if std::env::var("TAM_RS_DBG_DISJ_SPLIT").as_deref() == Ok("1") {
+            eprintln!("[DISJ_SPLIT] n_alts={}", alts.len());
+            for (i, a) in alts.iter().enumerate() {
+                eprintln!("  alt {}: {:?}", i + 1, a);
+            }
+            eprintln!("[DISJ_SPLIT] last_atom={:?}, n_nodes={}, n_less_atoms={}",
+                self.sys.last_atom, self.sys.nodes.len(), self.sys.less_atoms.len());
+            for la in &self.sys.less_atoms {
+                eprintln!("  less: {:?} < {:?}", la.smaller, la.larger);
+            }
+            eprintln!("[DISJ_SPLIT] node ids:");
+            for (id, _) in &self.sys.nodes {
+                eprintln!("  node: {:?}", id);
+            }
+        }
         match alts.len() {
             0 => GoalCases::Contradictory,
             1 => {
