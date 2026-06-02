@@ -99,6 +99,28 @@ pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
     let no_open_goals = open_goals(sys).is_empty();
     let sub_finished = finished_subterms(ctx, sys);
     if no_open_goals && sub_finished {
+        if std::env::var("TAM_RS_DBG_SOLVED_GOALS").as_deref() == Ok("1") {
+            use crate::constraint::constraints::Goal;
+            eprintln!("[SOLVED_GOALS] all open_goals empty. Showing all goal statuses:");
+            for (g, st) in &sys.goals {
+                let kind = match g {
+                    Goal::Action(_, fa) => format!("Action({:?})", fa.tag),
+                    Goal::Premise(_, fa) => format!("Premise({:?})", fa.tag),
+                    Goal::Chain(_, _) => "Chain".to_string(),
+                    Goal::Split(_) => "Split".to_string(),
+                    Goal::Disj(_) => "Disj".to_string(),
+                    Goal::Subterm(_) => "Subterm".to_string(),
+                };
+                let term_dump = match g {
+                    Goal::Action(i, fa) | Goal::Premise((i, _), fa) =>
+                        format!("@{}.{} {}", i.name, i.idx,
+                            fa.terms.iter().map(|t| format!("{:?}", t).chars().take(60).collect::<String>())
+                                .collect::<Vec<_>>().join(",")),
+                    _ => String::new(),
+                };
+                eprintln!("[SOLVED_GOALS]   solved={} {} {}", st.solved, kind, term_dump);
+            }
+        }
         if std::env::var("TAM_DBG_SOLVED_DUMP").is_ok() {
             let path = crate::constraint::solver::trace::case_path_string();
             eprintln!("[SOLVED_DUMP] path={} nodes={} actions=?, formulas={}, solved_formulas={}, lemmas={}, edges={}, eq_store_n={}",
