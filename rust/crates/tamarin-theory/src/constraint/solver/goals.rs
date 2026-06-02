@@ -272,6 +272,30 @@ pub fn rank_goals_with(
     sys: &System,
     ctx: Option<&crate::constraint::solver::context::ProofContext>,
 ) -> Vec<AnnotatedGoal> {
+    let _result = rank_goals_with_inner(sys, ctx);
+    if std::env::var("TAM_RS_DBG_RANK").as_deref() == Ok("1") {
+        let in_pre = crate::constraint::solver::sources::in_precompute_mode();
+        let top3: Vec<String> = _result.iter().take(3).map(|a| {
+            use crate::constraint::constraints::Goal;
+            match &a.goal {
+                Goal::Chain(_, _) => "Chain".to_string(),
+                Goal::Disj(_) => "Disj".to_string(),
+                Goal::Premise(_, fa) => format!("Premise({:?})", fa.tag),
+                Goal::Action(_, fa) => format!("Action({:?})", fa.tag),
+                Goal::Split(_) => "Split".to_string(),
+                Goal::Subterm(_) => "Subterm".to_string(),
+            }
+        }).collect();
+        eprintln!("[RS_RANK] precompute={} n={} top3={:?}",
+            in_pre, _result.len(), top3);
+    }
+    _result
+}
+
+fn rank_goals_with_inner(
+    sys: &System,
+    ctx: Option<&crate::constraint::solver::context::ProofContext>,
+) -> Vec<AnnotatedGoal> {
     // Dispatch on the theory/lemma `heuristic:` directive, mirroring
     // HS's `rankGoals` (ProofMethod.hs:636) which pattern-matches the
     // `GoalRanking`.  When no context (or no heuristic) is supplied we
