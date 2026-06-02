@@ -70,7 +70,7 @@ fn render_node(node: &ProofNode, indent: usize, out: &mut String) {
             }
             ProofMethod::Finished(MethodResult::Unfinishable) => {
                 out.push_str(&pad);
-                out.push_str("by sorry /* unfinishable */\n");
+                out.push_str("by UNFINISHABLE // reducible operator in subterm\n");
             }
             ProofMethod::Sorry(reason) => {
                 out.push_str(&pad);
@@ -97,7 +97,7 @@ fn render_node(node: &ProofNode, indent: usize, out: &mut String) {
                     NodeStatus::Contradictory => "by contradiction /* closed */\n",
                     NodeStatus::Solved => "SOLVED // trace found\n",
                     NodeStatus::Sorry => "by sorry\n",
-                    NodeStatus::Unfinishable => "by sorry /* unfinishable */\n",
+                    NodeStatus::Unfinishable => "by UNFINISHABLE // reducible operator in subterm\n",
                     NodeStatus::Open => "by sorry /* open */\n",
                 });
             }
