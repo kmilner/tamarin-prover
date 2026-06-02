@@ -1830,22 +1830,32 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
             t.clone()
         }
     };
+    // HS-faithful order: `allActions = unsolvedActionAtoms sys <|>
+    // <rule actions>` (System.hs:1575-1579).  Goals come FIRST so
+    // that `groupSortOn fst` keeps a goal's NodeId as `iKeep` and
+    // emits `solveTermEqs [iKeep = rule_node_id]` — meaning the
+    // rule node is renamed onto the goal's id, NOT vice versa.
+    // The previous order (nodes first) made the goal id collapse
+    // onto a fresh `vk.X`, which then dedup-merged with a grafted
+    // goal whose solved=true status carried over.  See
+    // Simplify.hs:279 + 311 (`kuActions se = (\(i,fa,m) -> (m,(fa,i)))
+    // <$> allKUActions se`).
     let mut acts: Vec<(NodeId, LNFact, LNTerm)> = Vec::new();
-    for (id, rule) in &red.sys.nodes {
-        for fa in &rule.actions {
-            if matches!(fa.tag, FactTag::Ku) {
-                if let Some(m) = fa.terms.first() {
-                    acts.push((id.clone(), fa.clone(), apply_subst(m)));
-                }
-            }
-        }
-    }
     for (g, st) in &red.sys.goals {
         if st.solved { continue; }
         if let Goal::Action(i, fa) = g {
             if matches!(fa.tag, FactTag::Ku) {
                 if let Some(m) = fa.terms.first() {
                     acts.push((i.clone(), fa.clone(), apply_subst(m)));
+                }
+            }
+        }
+    }
+    for (id, rule) in &red.sys.nodes {
+        for fa in &rule.actions {
+            if matches!(fa.tag, FactTag::Ku) {
+                if let Some(m) = fa.terms.first() {
+                    acts.push((id.clone(), fa.clone(), apply_subst(m)));
                 }
             }
         }
