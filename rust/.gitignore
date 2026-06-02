@@ -1,2 +1,6 @@
 /target
 Cargo.lock
+
+# corpus_full_trace_diff.sh local caches and per-run result snapshots
+scripts/.hs_canon_cache/
+scripts/.corpus_full_truedl_*.txt
