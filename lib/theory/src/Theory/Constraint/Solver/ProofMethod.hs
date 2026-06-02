@@ -1204,9 +1204,23 @@ smartRanking :: ProofContext
              -> Bool   -- True if PremiseG loop-breakers should not be delayed
              -> System
              -> [AnnotatedGoal] -> [AnnotatedGoal]
-smartRanking ctxt allowPremiseGLoopBreakers sys =
-    moveNatToEnd . sortOnUsefulness . unmark . sortDecisionTree notSolveLast . sortDecisionTree solveFirst . goalNrRanking
+smartRanking ctxt allowPremiseGLoopBreakers sys ags0 =
+    let result = (moveNatToEnd . sortOnUsefulness . unmark . sortDecisionTree notSolveLast . sortDecisionTree solveFirst . goalNrRanking) ags0
+        dbg = unsafePerformIO $
+              maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_DBG_SMART_RANK"
+    in if dbg
+       then trace ("[HS_SMART_RANK] in=" ++ show (length ags0) ++
+                   " head=" ++ show (take 5 (map (goalKindStr . fst) result)))
+            result
+       else result
   where
+    goalKindStr (ChainG _ _)    = "Chain"
+    goalKindStr (DisjG _)       = "Disj"
+    goalKindStr (PremiseG _ fa) = "Premise(" ++ show (factTag fa) ++ ")"
+    goalKindStr (ActionG _ fa)  = "Action(" ++ show (factTag fa) ++ ")"
+    goalKindStr (SplitG _)      = "Split"
+    goalKindStr (SubtermG _)    = "Subterm"
+
     oneCaseOnlyRaw = catMaybes . map getMsgOneCase . L.get pcSources $ ctxt
     -- TAM_HS_DBG_ONE_CASE=1: dump the oneCaseOnly symbol set on every
     -- smartRanking call.  Used for HS↔Rust source-cache divergence
