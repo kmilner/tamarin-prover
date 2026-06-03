@@ -5516,8 +5516,16 @@ mod tests {
         assert!(r.sys.subterm_store.contradictory);
     }
 
+    /// Post-`90af50b7` (Root D fix): when the goal's existing node
+    /// already has the matching action, `solve_action_goal` emits
+    /// `GoalCases::LinearNamed(rule_case_name)` instead of bare
+    /// `Linear` — mirrors HS `solveAction`'s `Just ru -> ... return ru`
+    /// arm (Goals.hs:287-290) whose surrounding `showRuleCaseName <$>`
+    /// (Goals.hs:257) unconditionally emits the rule's case name.
+    /// The test was originally written for the pre-`90af50b7` bare-Linear
+    /// behaviour; we update the assertion to recognise `LinearNamed`.
     #[test]
-    fn solve_action_goal_existing_node_with_action_is_linear() {
+    fn solve_action_goal_existing_node_with_action_is_linear_named() {
         let ctx = match ctx() { Some(c) => c, None => return };
         // Build a system with a node already labelled by a rule that
         // produces the action `Out(x)`.
@@ -5539,7 +5547,14 @@ mod tests {
         sys.add_goal(Goal::Action(i.clone(), fa.clone()));
         let mut r = Reduction::new(&ctx, sys);
         let out = r.solve_action_goal(&i, &fa);
-        assert!(matches!(out, GoalCases::Linear));
+        // Post-Root-D: `LinearNamed(rule_case_name)`. The case name must
+        // be present (showRuleCaseName ru) for the proof tree to render
+        // `case <name>` correctly.  Accept any non-empty name string.
+        match &out {
+            GoalCases::LinearNamed(name) => assert!(
+                !name.is_empty(), "rule case name must be non-empty"),
+            other => panic!("expected GoalCases::LinearNamed, got {:?}", other),
+        }
         assert!(r.sys.goals.iter().any(|(g, s)|
             matches!(g, Goal::Action(_, _)) && s.solved));
     }
