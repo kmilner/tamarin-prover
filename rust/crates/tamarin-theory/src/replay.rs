@@ -49,7 +49,7 @@
 
 use std::collections::BTreeMap;
 
-use tamarin_parser::ast::{GoalSpec, ParsedMethod, ParsedProofTree};
+use tamarin_parser::ast::{DisjAlt, GoalSpec, ParsedMethod, ParsedProofTree};
 
 use crate::constraint::constraints::Goal;
 use crate::constraint::solver::context::ProofContext;
@@ -545,7 +545,84 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
             }
             None
         }
+        GoalSpec::Disj { alts } => {
+            // HS-faithful: HS parses the `solve(...)` text into a
+            // `DisjG (Disj [GuardedFormula])` value via
+            // `disjSplitGoal` (Theory/Text/Parser/Proof.hs:61), then
+            // dispatches `SolveGoal goal` against `sys.goals` (HS
+            // ProofMethod.hs:374: `guard (goal \`M.member\` sGoals)`).
+            //
+            // Our skeleton parser only captures each alt's structural
+            // SIGNATURE (top-level shape — see `DisjAlt`).  We pick
+            // the unique open `Goal::Disj(d)` whose `d.0` list has the
+            // same length AND the same per-alt signature as the
+            // skeleton's `alts`.  Empirically at every replay point in
+            // the lemma corpus, at most one open Disj matches that
+            // signature (the skeleton-text and runtime-Goal come from
+            // the same lemma formula).  See HS Proof.hs:61.
+            let mut matches: Vec<&Goal> = sys.goals
+                .iter()
+                .filter(|(_, st)| !st.solved)
+                .filter_map(|(g, _)| match g {
+                    Goal::Disj(d) if disj_alts_match(alts, &d.0) => Some(g),
+                    _ => None,
+                })
+                .collect();
+            if matches.len() == 1 {
+                return Some(matches.remove(0).clone());
+            }
+            // Ambiguous → pick the first in source order (creation
+            // order in `sGoals`).  This mirrors the Action/Premise
+            // ambiguity-resolution policy above.
+            if !matches.is_empty() {
+                return Some(matches[0].clone());
+            }
+            None
+        }
         GoalSpec::Raw(_) => None,
+    }
+}
+
+/// Compare the skeleton's per-alt signature against an open
+/// `Goal::Disj`'s alts (`Vec<Guarded>`).  Returns true iff the lists
+/// have the same length and each per-alt shape matches.
+///
+/// HS reference: each `Guarded` in the open Disj is what HS would
+/// have produced from the same skeleton text via `guardedFormula`
+/// (Theory/Text/Parser/Formula.hs).  HS matches by structural EQ of
+/// the whole `Guarded` value; we relax to the shape signature so we
+/// don't have to rebuild LVar identities from skeleton text (whose
+/// var indices are different from the runtime System's).
+fn disj_alts_match(skel: &[DisjAlt], runtime: &[crate::guarded::Guarded]) -> bool {
+    if skel.len() != runtime.len() { return false; }
+    skel.iter().zip(runtime.iter()).all(|(s, r)| disj_alt_shape_matches(s, r))
+}
+
+fn disj_alt_shape_matches(skel: &DisjAlt, g: &crate::guarded::Guarded) -> bool {
+    use crate::guarded::{Guarded, Quant};
+    match (skel, g) {
+        (DisjAlt::All { n_vars }, Guarded::GGuarded { qua: Quant::All, vars, .. }) => {
+            *n_vars == vars.len()
+        }
+        (DisjAlt::Ex { n_vars }, Guarded::GGuarded { qua: Quant::Ex, vars, .. }) => {
+            *n_vars == vars.len()
+        }
+        // `NonQuant` matches anything that isn't a top-level
+        // `GGuarded` — atoms, conjunctions, disjunctions, and the
+        // `∀[].A ⇒ ⊥` negation idiom (which HS pretty-prints as `¬A`
+        // but stores as a quantified Guarded).  For the negation
+        // idiom: the skeleton's text starts with `¬` (not `∀`), so
+        // the parser classified it `NonQuant`; we accept it matching
+        // a `GGuarded { qua: All, vars: [] }` here.  See
+        // Guarded.hs:856-857 for the negation rendering.
+        (DisjAlt::NonQuant, Guarded::GGuarded { qua: Quant::All, vars, body, .. })
+            if vars.is_empty() => {
+            matches!(&**body, Guarded::Disj(v) if v.is_empty())
+        }
+        (DisjAlt::NonQuant, Guarded::Atom(_))
+        | (DisjAlt::NonQuant, Guarded::Conj(_))
+        | (DisjAlt::NonQuant, Guarded::Disj(_)) => true,
+        _ => false,
     }
 }
 
