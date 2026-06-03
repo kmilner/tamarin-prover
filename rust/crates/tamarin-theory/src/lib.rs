@@ -26,6 +26,7 @@ pub mod atom;
 pub mod fact;
 pub mod formula;
 pub mod intruder_rules;
+pub mod intruder_variants;
 pub mod predicate;
 pub mod pretty_formula;
 pub mod pretty_system;
