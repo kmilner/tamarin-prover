@@ -3884,16 +3884,42 @@ impl<'ctx> Reduction<'ctx> {
         }
         match existing {
             Some(ru) => {
+                // HS-faithful (Goals.hs:287-290):
+                //
+                //   Just ru -> do
+                //     unless (fa `elem` get rActs ru) $ do
+                //         act <- disjunctionOfList $ get rActs ru
+                //         void (solveFactEqs SplitNow [Equal fa act])
+                //     return ru
+                //
+                // HS RETURNS THE RULE every time (the `return ru` is at
+                // the bottom, after the `unless`), so the surrounding
+                // `solveAction` always emits `showRuleCaseName ru` as
+                // its step name.  HS uses `unless` (= `when . not`)
+                // purely to SKIP the action-fork unification when
+                // `fa` is already among `rActs ru` — the case-name
+                // emission is unconditional.
+                //
+                // Previously RS short-circuited to `GoalCases::Linear`
+                // here, which the proof-method printer renders as a
+                // bare `solve` with NO `case <rule>` child.  HS renders
+                // the same situation as `case <rule_name>` followed by
+                // SOLVED (or the next step).  Manifested on Yubikey's
+                // Login_reachable as RS skipping two `case c_S` steps
+                // for vk.0 = c_S(KU(S(myzero))) and vk.2 = c_S(KU(S(S(myzero))))
+                // — both nodes existed with the exact KU action present,
+                // so RS hit this short-circuit; HS emits `case c_S`
+                // both times.
+                let rule_name = rule_case_name(&ru);
                 if ru.actions.contains(fa) {
                     self.mark_goal_as_solved(&g);
-                    return GoalCases::Linear;
+                    return GoalCases::LinearNamed(rule_name);
                 }
                 // Fork: one case per action of the existing rule
                 // instance, unifying that action with `fa`. All cases
                 // share the same rule name; proof_method.rs dedup will
                 // append `_case_1`/`_case_2`/... if multiple cases.
                 //
-                let rule_name = rule_case_name(&ru);
                 let mut cases = Vec::new();
                 for act in &ru.actions {
                     let mut sys = self.sys.clone();

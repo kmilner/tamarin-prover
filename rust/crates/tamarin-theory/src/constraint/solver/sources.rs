@@ -6971,8 +6971,35 @@ fn apply_source_case_action(
     let mut r = Reduction::new(ctx, live_sys.clone());
     let live_goal = crate::constraint::constraints::Goal::Action(
         live_node.clone(), fa_live.clone());
+    // HS-faithful (Sources.hs:196-216): `solveAllSafeGoals.safeGoal`
+    // returns `not (isKUFact fa)` for ActionG (Sources.hs:202), so
+    // HS's saturate-time precompute NEVER picks a KU action goal
+    // and therefore never calls `applySource` on one (Sources.hs:438
+    // `markGoalAsSolved "precomputed" goal`).  Any precompute-time
+    // resolution of a KU goal in HS happens only through chain
+    // closure / N5_u merging / N6 ordering — none of which mark
+    // the KU ActionG goal as solved in the case sub-system.
+    //
+    // RS reaches this site during saturate via the chain-fold path
+    // (`saturate_out_premise` → ... → `solve_with_source_cases_action_with_ctx`
+    // → `apply_source_case_action`).  Marking the live_goal as
+    // solved during saturate produces case sub-systems with
+    // pre-solved KU(...) ActionG goals; `conjoin_system`'s
+    // `combineGoalStatus` (Reduction.hs:680 `solved1 || solved2`)
+    // then stamps solved=true on the live system's KU goals — the
+    // runtime `case c_S` (or equivalent constructor) proof step HS
+    // emits never fires because the goal is no longer "open".
+    // Concrete manifestation: Yubikey's Login_reachable skipped
+    // two `case c_S` steps (`... → BuyANewYubikey → c_S → c_S → SOLVED`
+    // in HS, `... → BuyANewYubikey → SOLVED` in RS).
+    //
+    // Gate the mark on `!in_precompute_mode()` so saturate-time
+    // grafts emit a sub-system whose ActionG goals match HS's
+    // safe-goal-only saturation outputs.
     if let Some(slot) = r.sys.goals.iter_mut().find(|(g, _)| g == &live_goal) {
-        slot.1.solved = true;
+        if !in_precompute_mode() {
+            slot.1.solved = true;
+        }
     }
     crate::state_trace::emit(
         "applySource_pre_conjoin", Some(&live_goal_for_trace), &freshened_case);
@@ -7609,7 +7636,16 @@ fn graft_case_into_action(
     let live_goal = crate::constraint::constraints::Goal::Action(
         live_node.clone(), fa_live.clone());
     if let Some(slot) = out.goals.iter_mut().find(|(g, _)| g == &live_goal) {
-        slot.1.solved = true;
+        // HS-faithful: see the matching gate in `apply_source_case_action`.
+        // `solveAllSafeGoals.safeGoal` (Sources.hs:202) excludes KU
+        // ActionG goals from saturate-time dispatch, so applying a
+        // source-case for a KU goal during saturate must not mark
+        // the live goal as solved — otherwise the case sub-system
+        // carries pre-solved KU(...) ActionG goals into the live
+        // system via `conjoin_system`'s `combineGoalStatus`.
+        if !in_precompute_mode() {
+            slot.1.solved = true;
+        }
     }
     // Merge the case's eq-store substitutions into the live system.
     //
