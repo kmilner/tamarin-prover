@@ -54,6 +54,43 @@ pub fn parse_theory_or_diff(input: &str, flags: &[&str]) -> Result<Theory, Parse
     parse_theory(input, flags)
 }
 
+/// Parse a stream of intruder-rule declarations of the form
+///     `rule (modulo AC) <name>[<limit>]: [..] --[..]-> [..]`
+/// (with no surrounding `theory ... begin ... end` wrapper).
+///
+/// Direct port of HS `parseIntruderRules` (Theory/Text/Parser/Rule.hs:200-204):
+/// ```haskell
+/// parseIntruderRules
+///     :: MaudeSig -> String -> B.ByteString -> Either ParseError [IntrRuleAC]
+/// parseIntruderRules msig ctxtDesc =
+///     parseString [] ctxtDesc (setState (mkStateSig msig) >> many intrRule)
+///   . T.unpack . TE.decodeUtf8
+/// ```
+/// HS threads a `MaudeSig` through parser state so the term parser knows
+/// which function symbols are builtin.  In this port the parser always
+/// recognises every builtin operator at the syntax level — semantic
+/// gating happens at elaboration — so the `MaudeSig` argument is
+/// captured only for diagnostic context.
+///
+/// The bodies are parsed using the existing `parse_rule_ac` path.
+/// The caller is responsible for translating the parser-AST rules into
+/// `IntrRuleAC` (incl. the `c_`/`d_` name dispatch HS `intrInfo` does
+/// at Rule.hs:161-169).
+pub fn parse_intruder_rules(input: &str) -> Result<Vec<Rule>, ParseError> {
+    let mut p = Parser::new(input, &[], false);
+    let mut rules = Vec::new();
+    loop {
+        p.skip_ws();
+        if p.lx.is_eof() { break; }
+        // HS `intrRule` uses `try (symbol "rule" *> moduloAC *> intrInfo <* colon)`
+        // (Rule.hs:157) — i.e. requires the `rule (modulo AC) name:` head.
+        // `parse_rule_ac` enforces the same shape.
+        let r = p.parse_rule_ac()?;
+        rules.push(r);
+    }
+    Ok(rules)
+}
+
 // =============================================================================
 // Parser state
 // =============================================================================
