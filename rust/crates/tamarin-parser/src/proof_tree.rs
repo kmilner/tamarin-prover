@@ -273,9 +273,12 @@ impl<'a> TreeParser<'a> {
 /// ```
 ///
 /// We structurally recognise Action (`Fact(...) @ #t`), Premise
-/// (`Fact(...) ▶<n> #t`), and Disj (`gf1 ∥ gf2 ∥ ...` — HS
-/// `disjSplitGoal`, Proof.hs:61).  Chain / Subterm / Split go to
-/// `GoalSpec::Raw` and the walker falls back.
+/// (`Fact(...) ▶<n> #t`), Disj (`gf1 ∥ gf2 ∥ ...` — HS
+/// `disjSplitGoal`, Proof.hs:61), Chain (`(#i,n) ~~> (#j,m)` — HS
+/// `chainGoal`, Proof.hs:59), Subterm (`<a> ⊏ <b>` — HS `stSplitGoal`,
+/// Proof.hs:63-66), and Split (`splitEqs(N)` — HS `eqSplitGoal`,
+/// Proof.hs:70-72).  Anything else lands in `GoalSpec::Raw` and the
+/// walker falls back to the auto-prover.
 pub fn parse_goal_spec(raw: &str) -> GoalSpec {
     let trimmed = raw.trim();
     let mut p = GoalParser { lx: Lexer::new(trimmed) };
@@ -283,6 +286,15 @@ pub fn parse_goal_spec(raw: &str) -> GoalSpec {
         return spec;
     }
     if let Some(spec) = try_disj_split(trimmed) {
+        return spec;
+    }
+    if let Some(spec) = try_chain_split(trimmed) {
+        return spec;
+    }
+    if let Some(spec) = try_eq_split(trimmed) {
+        return spec;
+    }
+    if let Some(spec) = try_subterm_split(trimmed) {
         return spec;
     }
     GoalSpec::Raw(trimmed.to_string())
@@ -397,6 +409,134 @@ fn count_quant_vars(after_qua: &str) -> usize {
         }
     }
     n
+}
+
+/// Try to parse a chain-split goal-text: `(#i, N) ~~> (#j, M)`.
+///
+/// HS reference: `chainGoal = ChainG <$> (try (nodeConc <* opChain))
+/// <*> nodePrem` (Theory/Text/Parser/Proof.hs:59) where
+/// `nodeConc/nodePrem = parens ((,) <$> nodevar <*> (comma *> natural))`
+/// (Proof.hs:33-36).  The operator `~~>` is the HS pretty rendering
+/// (Constraints.hs:269-270).
+///
+/// We extract the time-var ROOT name (stripping any trailing `.N`
+/// freshen-suffix that HS's pretty-printer can emit) and the natural
+/// idx for each side.  The matcher disambiguates by these.
+fn try_chain_split(text: &str) -> Option<GoalSpec> {
+    // Find the top-level `~~>` separator.  HS prints exactly `~~>`
+    // (operator_ "~~>" inside fsep) so a plain substring search suffices
+    // — we only need to ensure we're at depth 0 of `()/[]/{}` to skip
+    // any `~~>` that hypothetically appeared inside a tuple (none do in
+    // practice but we are defensive).
+    let arrow_pos = find_top_level_substr(text, "~~>")?;
+    let lhs = text[..arrow_pos].trim();
+    let rhs = text[arrow_pos + 3..].trim();
+    let (src_var, conc_idx) = parse_node_idx_pair(lhs)?;
+    let (tgt_var, prem_idx) = parse_node_idx_pair(rhs)?;
+    Some(GoalSpec::Chain { src_var, conc_idx, tgt_var, prem_idx })
+}
+
+/// Try to parse a subterm-split goal-text: `<small> ⊏ <big>` (U+228F).
+///
+/// HS reference: `stSplitGoal` (Theory/Text/Parser/Proof.hs:63-66)
+/// parses `try (termp <* opSubterm) >>= ...`, where `opSubterm` is the
+/// `⊏` operator (renderer at Constraints.hs:281-282).
+///
+/// We split on the FIRST top-level `⊏` and trim both sides.  The text
+/// is kept raw — the matcher canonicalises against the runtime
+/// `Goal::Subterm((l, r))` pretty-print at match time.
+fn try_subterm_split(text: &str) -> Option<GoalSpec> {
+    const SUBTERM_OP: char = '\u{228F}';
+    let pos = find_top_level_char(text, SUBTERM_OP)?;
+    let small_raw = text[..pos].trim().to_string();
+    let big_raw = text[pos + SUBTERM_OP.len_utf8()..].trim().to_string();
+    if small_raw.is_empty() || big_raw.is_empty() {
+        return None;
+    }
+    Some(GoalSpec::Subterm { small_raw, big_raw })
+}
+
+/// Try to parse an equation-split goal-text: `splitEqs(N)`.
+///
+/// HS reference: `eqSplitGoal = try $ do { symbol_ "splitEqs"; parens
+/// $ (SplitG . SplitId . fromIntegral) <$> natural }`
+/// (Theory/Text/Parser/Proof.hs:70-72).  Pretty-printer:
+/// `text "splitEqs" <> parens (text $ show (unSplitId x))`
+/// (Constraints.hs:279-280).
+fn try_eq_split(text: &str) -> Option<GoalSpec> {
+    let s = text.trim_start();
+    let rest = s.strip_prefix("splitEqs")?.trim_start();
+    let rest = rest.strip_prefix('(')?.trim_start();
+    // Read decimal digits.
+    let mut end = 0usize;
+    let bs = rest.as_bytes();
+    while end < bs.len() && bs[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == 0 { return None; }
+    let n: i64 = rest[..end].parse().ok()?;
+    let tail = rest[end..].trim_start();
+    if !tail.starts_with(')') { return None; }
+    Some(GoalSpec::Split { split_id: n })
+}
+
+/// Locate the byte-offset of the first occurrence of `needle` at
+/// top-level depth (depth 0 of `()/[]/{}`).  Returns `None` if absent.
+fn find_top_level_substr(s: &str, needle: &str) -> Option<usize> {
+    let bs = s.as_bytes();
+    let nb = needle.as_bytes();
+    if nb.is_empty() || bs.len() < nb.len() { return None; }
+    let mut depth: i32 = 0;
+    let mut i = 0;
+    while i + nb.len() <= bs.len() {
+        let c = bs[i];
+        if c == b'(' || c == b'[' || c == b'{' { depth += 1; }
+        else if c == b')' || c == b']' || c == b'}' { depth -= 1; }
+        else if depth == 0 && &bs[i..i + nb.len()] == nb {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Same as [`find_top_level_substr`] but for a single (possibly
+/// multi-byte) `char`.
+fn find_top_level_char(s: &str, needle: char) -> Option<usize> {
+    let mut depth: i32 = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ if c == needle && depth == 0 => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parse a `(#name[.idx], N)` (or `(name[.idx], N)`) pair as used by
+/// HS `nodeConc / nodePrem` (Proof.hs:33-36).  Returns the time-var
+/// ROOT name (stripping any `.idx` freshen suffix) plus the natural N.
+fn parse_node_idx_pair(s: &str) -> Option<(String, u32)> {
+    let trimmed = s.trim();
+    let inside = trimmed.strip_prefix('(')?.strip_suffix(')')?.trim();
+    // Split into name-side / number-side on the first top-level `,`.
+    let comma = inside.find(',')?;
+    let name_part = inside[..comma].trim();
+    let num_part = inside[comma + 1..].trim();
+    // Strip optional `#` prefix; capture identifier-like characters up
+    // to (but not including) any `.` (freshen suffix) or whitespace.
+    let name_no_hash = name_part.strip_prefix('#').unwrap_or(name_part).trim();
+    let mut end = name_no_hash.len();
+    for (i, c) in name_no_hash.char_indices() {
+        if c == '.' || c.is_whitespace() { end = i; break; }
+        if !is_ident_char(c) { return None; }
+    }
+    let var_name = name_no_hash[..end].to_string();
+    if var_name.is_empty() { return None; }
+    let idx: u32 = num_part.parse().ok()?;
+    Some((var_name, idx))
 }
 
 struct GoalParser<'a> {
@@ -663,13 +803,90 @@ mod tests {
 
     #[test]
     fn raw_goalspec_fallback() {
-        // Subterm goals (`a ⊏ b`) — not handled yet, should fall back
-        // to GoalSpec::Raw.  Use a single non-disjunctive token.
-        let src = "solve( a \u{228F} b ) by sorry";
+        // Unknown gibberish goal-text — should fall back to
+        // GoalSpec::Raw.  All recognised forms (Action, Premise, Disj,
+        // Chain, Subterm, Split) need specific structural markers.
+        let src = "solve( garbage_no_marker ) by sorry";
         let t = parse_proof_tree(src).expect("parse");
         match &t.method {
             ParsedMethod::SolveGoal(GoalSpec::Raw(_)) => {}
             other => panic!("expected Raw goal-spec, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn solve_chain_goal() {
+        // HS `chainGoal` (Proof.hs:59) pretty-print:
+        // `(#i, 0) ~~> (#j, 2)`  (NodeConc ~~> NodePrem).
+        let src = "solve( (#i, 0) ~~> (#j, 2) ) by sorry";
+        let t = parse_proof_tree(src).expect("parse");
+        match &t.method {
+            ParsedMethod::SolveGoal(GoalSpec::Chain { src_var, conc_idx, tgt_var, prem_idx }) => {
+                assert_eq!(src_var, "i");
+                assert_eq!(*conc_idx, 0);
+                assert_eq!(tgt_var, "j");
+                assert_eq!(*prem_idx, 2);
+            }
+            other => panic!("expected Chain goal-spec, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn solve_chain_goal_with_freshen_suffix() {
+        // HS sometimes emits a freshen suffix like `#i.2` on the
+        // pretty-printed nodevar; the parser must strip it.
+        let src = "solve( (#i.5, 1) ~~> (#j.7, 0) ) by sorry";
+        let t = parse_proof_tree(src).expect("parse");
+        match &t.method {
+            ParsedMethod::SolveGoal(GoalSpec::Chain { src_var, conc_idx, tgt_var, prem_idx }) => {
+                // Freshen suffix stripped from the var ROOT.
+                assert_eq!(src_var, "i");
+                assert_eq!(*conc_idx, 1);
+                assert_eq!(tgt_var, "j");
+                assert_eq!(*prem_idx, 0);
+            }
+            other => panic!("expected Chain goal-spec, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn solve_subterm_goal() {
+        // HS `stSplitGoal` (Proof.hs:63-66) pretty-print:
+        // `<term> ⊏ <term>` (U+228F).
+        let src = "solve( foo(a, b) \u{228F} bar(c) ) by sorry";
+        let t = parse_proof_tree(src).expect("parse");
+        match &t.method {
+            ParsedMethod::SolveGoal(GoalSpec::Subterm { small_raw, big_raw }) => {
+                assert_eq!(small_raw, "foo(a, b)");
+                assert_eq!(big_raw, "bar(c)");
+            }
+            other => panic!("expected Subterm goal-spec, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn solve_split_goal() {
+        // HS `eqSplitGoal` (Proof.hs:70-72) pretty-print: `splitEqs(N)`.
+        let src = "solve( splitEqs(42) ) by sorry";
+        let t = parse_proof_tree(src).expect("parse");
+        match &t.method {
+            ParsedMethod::SolveGoal(GoalSpec::Split { split_id }) => {
+                assert_eq!(*split_id, 42);
+            }
+            other => panic!("expected Split goal-spec, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn solve_split_goal_zero() {
+        // Boundary: split id 0 (the first id minted by EquationStore).
+        let src = "solve( splitEqs(0) ) by sorry";
+        let t = parse_proof_tree(src).expect("parse");
+        match &t.method {
+            ParsedMethod::SolveGoal(GoalSpec::Split { split_id }) => {
+                assert_eq!(*split_id, 0);
+            }
+            other => panic!("expected Split goal-spec, got {:?}", other),
         }
     }
 

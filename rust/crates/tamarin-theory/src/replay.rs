@@ -479,14 +479,26 @@ fn resolve_method(parsed: &ParsedMethod, sys: &System) -> Option<ProofMethod> {
 /// auto-prover.
 fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
     match spec {
-        GoalSpec::Action { fact, .. } => {
+        GoalSpec::Action { fact, time_var } => {
             // Open Action goals whose fact name matches.  Skip KU
             // (auto-handled) for non-KU goal specs — the skeleton's
             // `solve(...)` always names protocol facts, never `KU(...)`.
+            //
+            // HS-faithful: HS's parsed `ActionG i fa` carries the
+            // timepoint LVar `i` and matches by structural equality
+            // (HS ProofMethod.hs:374 `goal `M.member` sGoals`).  RS's
+            // skeleton-text parser captures only the time-var ROOT
+            // name (e.g. `i` from `#i.3`) — LVar idxs in the skeleton
+            // and runtime differ because HS pretty-prints idxs after a
+            // freshen but our skeleton-parse drops them.  When a lemma
+            // has multiple same-fact-shape goals at different
+            // timepoints, the root-name disambiguates; when only one
+            // matches the (name, arity, persistent) tuple regardless,
+            // we keep the legacy single-match policy.
             let want_name = &fact.name;
             let want_arity = fact.args.len();
             let want_persistent = fact.persistent;
-            let mut matches: Vec<&Goal> = sys
+            let shape_matches: Vec<&Goal> = sys
                 .goals
                 .iter()
                 .filter(|(_, st)| !st.solved)
@@ -503,24 +515,53 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
                     _ => None,
                 })
                 .collect();
-            if matches.len() == 1 {
-                return Some(matches.remove(0).clone());
+            if shape_matches.len() == 1 {
+                return Some(shape_matches[0].clone());
             }
-            // Ambiguous → pick the first in source order to mirror HS's
-            // goalNrRanking-style ordering.  HS would have unique
-            // by-index; if our matches are ambiguous, the skeleton's
-            // original goal must be one of them and creation order is
-            // the closest proxy.
-            if !matches.is_empty() {
-                return Some(matches[0].clone());
+            if shape_matches.is_empty() {
+                return None;
             }
-            None
+            // Multiple shape-matches — disambiguate by time-var root
+            // name (after stripping the `#` prefix already done by
+            // `try_action_or_premise`).  HS resolves this via the
+            // exact LVar identity in `ActionG i fa`.
+            let by_time: Vec<&Goal> = shape_matches.iter().copied()
+                .filter(|g| match g {
+                    Goal::Action(i, _) => &i.name == time_var,
+                    _ => false,
+                })
+                .collect();
+            if by_time.len() == 1 {
+                return Some(by_time[0].clone());
+            }
+            if !by_time.is_empty() {
+                // Multiple shape+time matches — pick the one with the
+                // smallest LVar idx (the "root" instance HS's freshen
+                // would have picked first).
+                let mut pick: Option<&Goal> = None;
+                let mut best_idx: u64 = u64::MAX;
+                for g in &by_time {
+                    if let Goal::Action(i, _) = g {
+                        if i.idx <= best_idx { best_idx = i.idx; pick = Some(*g); }
+                    }
+                }
+                if let Some(g) = pick { return Some(g.clone()); }
+            }
+            // Fallback: time-var didn't disambiguate (e.g. skeleton
+            // shows `#t` but runtime has `#t1`/`#t2` — HS-side names
+            // sometimes lose freshen-suffix annotation).  Pick first
+            // shape-match in source order — same policy as before.
+            Some(shape_matches[0].clone())
         }
-        GoalSpec::Premise { fact, prem_idx, .. } => {
+        GoalSpec::Premise { fact, prem_idx, time_var } => {
+            // HS `PremiseG (i, v) fa` carries the node-LVar `i` and
+            // PremIdx `v`.  Disambiguate by name + arity + prem_idx
+            // first, then by time-var root if the (name, arity, idx)
+            // tuple matches multiple goals — same logic as Action.
             let want_name = &fact.name;
             let want_arity = fact.args.len();
             let want_persistent = fact.persistent;
-            let mut matches: Vec<&Goal> = sys
+            let shape_matches: Vec<&Goal> = sys
                 .goals
                 .iter()
                 .filter(|(_, st)| !st.solved)
@@ -537,13 +578,33 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
                     _ => None,
                 })
                 .collect();
-            if matches.len() == 1 {
-                return Some(matches.remove(0).clone());
+            if shape_matches.len() == 1 {
+                return Some(shape_matches[0].clone());
             }
-            if !matches.is_empty() {
-                return Some(matches[0].clone());
+            if shape_matches.is_empty() {
+                return None;
             }
-            None
+            // Multi-match: disambiguate by node-var name.
+            let by_time: Vec<&Goal> = shape_matches.iter().copied()
+                .filter(|g| match g {
+                    Goal::Premise((node, _), _) => &node.name == time_var,
+                    _ => false,
+                })
+                .collect();
+            if by_time.len() == 1 {
+                return Some(by_time[0].clone());
+            }
+            if !by_time.is_empty() {
+                let mut pick: Option<&Goal> = None;
+                let mut best_idx: u64 = u64::MAX;
+                for g in &by_time {
+                    if let Goal::Premise((node, _), _) = g {
+                        if node.idx <= best_idx { best_idx = node.idx; pick = Some(*g); }
+                    }
+                }
+                if let Some(g) = pick { return Some(g.clone()); }
+            }
+            Some(shape_matches[0].clone())
         }
         GoalSpec::Disj { alts } => {
             // HS-faithful: HS parses the `solve(...)` text into a
@@ -579,8 +640,130 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
             }
             None
         }
+        GoalSpec::Chain { src_var, conc_idx, tgt_var, prem_idx } => {
+            // HS dispatch: `solve( (#i, n) ~~> (#j, m) )` parses to
+            // `ChainG (i, ConcIdx n) (j, PremIdx m)` (Proof.hs:59) and
+            // matches by structural equality against an open
+            // `Goal::Chain(...)` in `sys.goals` (HS ProofMethod.hs:374:
+            // `goal `M.member` sGoals`).  HS's open chain-goal carries
+            // concrete LVar identities — same skeleton-vs-runtime LVar
+            // suffix-idx mismatch as Action/Premise.  We match by var
+            // ROOT name + conc/prem idx, ignoring suffix idxs.
+            let want_src = src_var;
+            let want_tgt = tgt_var;
+            let want_c = *conc_idx as usize;
+            let want_p = *prem_idx as usize;
+            let mut matches: Vec<&Goal> = sys.goals
+                .iter()
+                .filter(|(_, st)| !st.solved)
+                .filter_map(|(g, _)| match g {
+                    Goal::Chain((src, c), (tgt, p)) => {
+                        if &src.name == want_src
+                            && &tgt.name == want_tgt
+                            && c.0 == want_c
+                            && p.0 == want_p
+                        {
+                            Some(g)
+                        } else { None }
+                    }
+                    _ => None,
+                })
+                .collect();
+            if matches.len() == 1 {
+                return Some(matches.remove(0).clone());
+            }
+            if !matches.is_empty() {
+                return Some(matches[0].clone());
+            }
+            None
+        }
+        GoalSpec::Subterm { small_raw, big_raw } => {
+            // HS `stSplitGoal` (Proof.hs:63-66) parses to
+            // `SubtermG (small, big)` over LNTerm and dispatches via
+            // structural Map lookup in `sys.goals` (HS ProofMethod.hs:374).
+            // We compare by canonical pretty-printed text — see HS
+            // `prettyGoal (SubtermG (l,r))` at Constraints.hs:281-282
+            // which prints `prettyLNTerm l ⊏ prettyLNTerm r`.  Pretty
+            // representations are stable across the skeleton-vs-runtime
+            // boundary for ground terms; for terms containing free
+            // LVars the skeleton-text and runtime indices may diverge,
+            // so as a fallback we also accept a unique-arity match
+            // (when only ONE open Subterm exists).
+            use tamarin_term::pretty::pretty_lnterm;
+            let want_small = canonicalise_term_text(small_raw);
+            let want_big = canonicalise_term_text(big_raw);
+            let mut matches: Vec<&Goal> = sys.goals
+                .iter()
+                .filter(|(_, st)| !st.solved)
+                .filter_map(|(g, _)| match g {
+                    Goal::Subterm((l, r)) => {
+                        let l_s = canonicalise_term_text(&pretty_lnterm(l));
+                        let r_s = canonicalise_term_text(&pretty_lnterm(r));
+                        if l_s == want_small && r_s == want_big {
+                            Some(g)
+                        } else { None }
+                    }
+                    _ => None,
+                })
+                .collect();
+            if matches.len() == 1 {
+                return Some(matches.remove(0).clone());
+            }
+            if !matches.is_empty() {
+                return Some(matches[0].clone());
+            }
+            // Fallback: if exactly one open Subterm goal exists, use
+            // it (the skeleton text uniquely identifies it by being
+            // the only Subterm in `sys.goals`).
+            let only_subterm: Vec<&Goal> = sys.goals.iter()
+                .filter(|(_, st)| !st.solved)
+                .filter_map(|(g, _)| if matches!(g, Goal::Subterm(_)) { Some(g) } else { None })
+                .collect();
+            if only_subterm.len() == 1 {
+                return Some(only_subterm[0].clone());
+            }
+            None
+        }
+        GoalSpec::Split { split_id } => {
+            // HS `eqSplitGoal` (Proof.hs:70-72) parses to
+            // `SplitG (SplitId N)` and dispatches via structural Map
+            // lookup in `sys.goals`.  Split ids are stable (minted by
+            // `EquationStore::add_disj`), so an exact id-match is
+            // correct here — no variable-renaming concerns.
+            let want = crate::constraint::constraints::SplitId(*split_id);
+            for (g, st) in &sys.goals {
+                if st.solved { continue; }
+                if let Goal::Split(id) = g {
+                    if *id == want {
+                        return Some(g.clone());
+                    }
+                }
+            }
+            None
+        }
         GoalSpec::Raw(_) => None,
     }
+}
+
+/// Normalise spaces in a pretty-printed term/text fragment so that
+/// equality between skeleton-text and runtime-pretty doesn't fail on
+/// whitespace differences (HS's `fsep`/`PrettyPrint` and our
+/// `pretty_lnterm` produce slightly different spacing around commas
+/// and operators).  Collapses any run of ASCII whitespace into a single
+/// space and trims.
+fn canonicalise_term_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_ws = true; // suppress leading whitespace
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !last_ws { out.push(' '); last_ws = true; }
+        } else {
+            out.push(c);
+            last_ws = false;
+        }
+    }
+    if out.ends_with(' ') { out.pop(); }
+    out
 }
 
 /// Compare the skeleton's per-alt signature against an open
@@ -733,5 +916,252 @@ mod tests {
             time_var: "t".into(),
         };
         assert!(match_goal(&spec, &sys).is_none());
+    }
+
+    /// Variable-renaming-aware Action match: two same-fact-name Action
+    /// goals at different timepoints — the matcher must disambiguate by
+    /// the skeleton's time-var ROOT name, NOT just pick the first
+    /// shape-match in source order.
+    ///
+    /// HS reference: `ActionG i fa` carries the exact timepoint LVar
+    /// `i`; HS dispatches via M.member on the structural goal
+    /// (ProofMethod.hs:374), so picking the wrong goal here is the
+    /// same divergence pattern that motivated the Disj matcher fix
+    /// (commit b49ef0a2).
+    #[test]
+    fn match_action_disambiguates_by_time_var_root() {
+        use crate::fact::{Fact, FactTag, Multiplicity};
+        let i1 = LVar::new("t1", LSort::Node, 5);
+        let i2 = LVar::new("t2", LSort::Node, 7);
+        let tag = FactTag::Proto(Multiplicity::Linear, "Step".into(), 1);
+        // Two goals with the same fact tag/arity but different
+        // timepoints.
+        let g1 = Goal::Action(i1.clone(),
+            Fact::new(tag.clone(), vec![tamarin_term::term::Term::Lit(
+                tamarin_term::vterm::Lit::Var(LVar::new("x", LSort::Msg, 0)))]));
+        let g2 = Goal::Action(i2.clone(),
+            Fact::new(tag, vec![tamarin_term::term::Term::Lit(
+                tamarin_term::vterm::Lit::Var(LVar::new("y", LSort::Msg, 0)))]));
+        let mut sys = System::empty();
+        sys.goals.push((g1.clone(), Default::default()));
+        sys.goals.push((g2.clone(), Default::default()));
+        // Skeleton spec asking for time-var t2 specifically.
+        let spec = GoalSpec::Action {
+            fact: PFact {
+                persistent: false,
+                name: "Step".into(),
+                args: vec![tamarin_parser::ast::Term::Var(tamarin_parser::ast::VarSpec {
+                    name: "y".into(), idx: 0,
+                    sort: tamarin_parser::ast::SortHint::Untagged, typ: None,
+                })],
+                annotations: Vec::new(),
+            },
+            time_var: "t2".into(),
+        };
+        let matched = match_goal(&spec, &sys).expect("should match");
+        match matched {
+            Goal::Action(i, _) => assert_eq!(i.name, "t2",
+                "matcher must pick the goal whose timepoint LVar.name == time_var"),
+            other => panic!("expected Action, got {:?}", other),
+        }
+        // And with time_var = t1 we get the other goal.
+        let spec2 = GoalSpec::Action {
+            fact: PFact {
+                persistent: false,
+                name: "Step".into(),
+                args: vec![tamarin_parser::ast::Term::Var(tamarin_parser::ast::VarSpec {
+                    name: "x".into(), idx: 0,
+                    sort: tamarin_parser::ast::SortHint::Untagged, typ: None,
+                })],
+                annotations: Vec::new(),
+            },
+            time_var: "t1".into(),
+        };
+        let matched2 = match_goal(&spec2, &sys).expect("should match");
+        match matched2 {
+            Goal::Action(i, _) => assert_eq!(i.name, "t1"),
+            other => panic!("expected Action, got {:?}", other),
+        }
+    }
+
+    /// Variable-renaming-aware Premise match: two same-(name, arity,
+    /// prem_idx) Premise goals at different node timepoints.
+    #[test]
+    fn match_premise_disambiguates_by_time_var_root() {
+        use crate::fact::{Fact, FactTag, Multiplicity};
+        use crate::rule::PremIdx;
+        let n1 = LVar::new("u", LSort::Node, 0);
+        let n2 = LVar::new("v", LSort::Node, 0);
+        let tag = FactTag::Proto(Multiplicity::Linear, "Inp".into(), 0);
+        let g1 = Goal::Premise((n1, PremIdx(0)), Fact::new(tag.clone(), Vec::new()));
+        let g2 = Goal::Premise((n2, PremIdx(0)), Fact::new(tag, Vec::new()));
+        let mut sys = System::empty();
+        sys.goals.push((g1, Default::default()));
+        sys.goals.push((g2, Default::default()));
+        let spec = GoalSpec::Premise {
+            fact: PFact {
+                persistent: false, name: "Inp".into(),
+                args: Vec::new(), annotations: Vec::new(),
+            },
+            prem_idx: 0,
+            time_var: "v".into(),
+        };
+        let matched = match_goal(&spec, &sys).expect("should match");
+        match matched {
+            Goal::Premise((node, _), _) => assert_eq!(node.name, "v"),
+            other => panic!("expected Premise, got {:?}", other),
+        }
+    }
+
+    /// Chain matcher — synthetic system with two Chain goals at
+    /// different (src,tgt) pairs; the matcher picks by var+idx.
+    #[test]
+    fn match_chain_goal_by_var_and_idx() {
+        use crate::fact::{Fact, FactTag, Multiplicity};
+        use crate::rule::{ConcIdx, PremIdx};
+        let _ = (Fact::<u32>::new, FactTag::Ku, Multiplicity::Linear); // keep imports alive
+        let i = LVar::new("i", LSort::Node, 3);
+        let j = LVar::new("j", LSort::Node, 5);
+        let k = LVar::new("k", LSort::Node, 7);
+        let g_ij = Goal::Chain((i.clone(), ConcIdx(0)), (j.clone(), PremIdx(2)));
+        let g_jk = Goal::Chain((j.clone(), ConcIdx(1)), (k.clone(), PremIdx(0)));
+        let mut sys = System::empty();
+        sys.goals.push((g_ij.clone(), Default::default()));
+        sys.goals.push((g_jk.clone(), Default::default()));
+        // Ask for (#j, 1) ~~> (#k, 0).
+        let spec = GoalSpec::Chain {
+            src_var: "j".into(), conc_idx: 1,
+            tgt_var: "k".into(), prem_idx: 0,
+        };
+        let matched = match_goal(&spec, &sys).expect("should match");
+        assert_eq!(matched, g_jk);
+        // And the other side.
+        let spec2 = GoalSpec::Chain {
+            src_var: "i".into(), conc_idx: 0,
+            tgt_var: "j".into(), prem_idx: 2,
+        };
+        assert_eq!(match_goal(&spec2, &sys).expect("should match"), g_ij);
+        // Wrong idx — no match.
+        let bad = GoalSpec::Chain {
+            src_var: "i".into(), conc_idx: 9,
+            tgt_var: "j".into(), prem_idx: 2,
+        };
+        assert!(match_goal(&bad, &sys).is_none());
+    }
+
+    /// Subterm matcher — open Subterm goals are matched by canonical
+    /// pretty-printed-text equality on both sides.
+    #[test]
+    fn match_subterm_goal_by_pretty_text() {
+        use tamarin_term::lterm::{LSort, LVar};
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+        // small = x:msg, big = y:msg (two distinct vars).
+        let small = Term::Lit(Lit::Var(LVar::new("x", LSort::Msg, 0)));
+        let big = Term::Lit(Lit::Var(LVar::new("y", LSort::Msg, 0)));
+        let goal = Goal::Subterm((small.clone(), big.clone()));
+        let mut sys = System::empty();
+        sys.goals.push((goal.clone(), Default::default()));
+        // Skeleton-parsed small_raw / big_raw must canonicalise to the
+        // same text as `pretty_lnterm(small)` / `pretty_lnterm(big)`.
+        use tamarin_term::pretty::pretty_lnterm;
+        let small_s = pretty_lnterm(&small);
+        let big_s = pretty_lnterm(&big);
+        let spec = GoalSpec::Subterm {
+            small_raw: small_s,
+            big_raw: big_s,
+        };
+        let matched = match_goal(&spec, &sys).expect("should match");
+        assert_eq!(matched, goal);
+    }
+
+    /// Subterm matcher fallback — when skeleton text differs from
+    /// runtime pretty (e.g. LVar idx renumbering) but only ONE open
+    /// Subterm goal exists, the unique-match fallback picks it.
+    #[test]
+    fn match_subterm_unique_fallback() {
+        use tamarin_term::lterm::{LSort, LVar};
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+        let small = Term::Lit(Lit::Var(LVar::new("x", LSort::Msg, 99)));
+        let big = Term::Lit(Lit::Var(LVar::new("y", LSort::Msg, 99)));
+        let goal = Goal::Subterm((small, big));
+        let mut sys = System::empty();
+        sys.goals.push((goal.clone(), Default::default()));
+        // Skeleton small/big text deliberately uses a name the runtime
+        // doesn't have — text mismatch but unique-Subterm fallback
+        // still picks the goal.
+        let spec = GoalSpec::Subterm {
+            small_raw: "skel_small".into(),
+            big_raw: "skel_big".into(),
+        };
+        let matched = match_goal(&spec, &sys).expect("unique-fallback should match");
+        assert_eq!(matched, goal);
+    }
+
+    /// Split matcher — exact id match on `Goal::Split(SplitId(n))`.
+    #[test]
+    fn match_split_goal_by_id() {
+        use crate::constraint::constraints::SplitId;
+        let goal_a = Goal::Split(SplitId(7));
+        let goal_b = Goal::Split(SplitId(3));
+        let mut sys = System::empty();
+        sys.goals.push((goal_a.clone(), Default::default()));
+        sys.goals.push((goal_b.clone(), Default::default()));
+        let spec = GoalSpec::Split { split_id: 3 };
+        let matched = match_goal(&spec, &sys).expect("should match");
+        assert_eq!(matched, goal_b);
+        let spec2 = GoalSpec::Split { split_id: 7 };
+        assert_eq!(match_goal(&spec2, &sys).expect("should match"), goal_a);
+        // No id 99 in the system → None.
+        let none = GoalSpec::Split { split_id: 99 };
+        assert!(match_goal(&none, &sys).is_none());
+    }
+
+    /// Disj matcher — two open Disj goals of different alt counts; the
+    /// matcher picks by alt-count + per-alt shape signature.
+    ///
+    /// HS reference: HS `disjSplitGoal` (Proof.hs:61) parses to
+    /// `DisjG (Disj [Guarded])` and matches the runtime Goal::Disj by
+    /// structural equality (ProofMethod.hs:374).  The RS shape
+    /// signature must uniquely pick the disjunction whose alt-count
+    /// matches the skeleton.
+    #[test]
+    fn match_disj_goal_by_alt_count() {
+        use crate::guarded::{Guarded, GAtom, BVar};
+        use crate::constraint::constraints::Disj;
+        let mk_vs = |n: &str| tamarin_parser::ast::VarSpec {
+            name: n.into(), idx: 0,
+            sort: tamarin_parser::ast::SortHint::Node, typ: None,
+        };
+        // Two non-quant alts.
+        let two = Goal::Disj(Disj::new(vec![
+            Guarded::Atom(GAtom::Last(crate::guarded::GTerm::Var(
+                BVar::Free(mk_vs("a"))))),
+            Guarded::Atom(GAtom::Last(crate::guarded::GTerm::Var(
+                BVar::Free(mk_vs("b"))))),
+        ]));
+        // Three non-quant alts.
+        let three = Goal::Disj(Disj::new(vec![
+            Guarded::Atom(GAtom::Last(crate::guarded::GTerm::Var(
+                BVar::Free(mk_vs("c"))))),
+            Guarded::Atom(GAtom::Last(crate::guarded::GTerm::Var(
+                BVar::Free(mk_vs("d"))))),
+            Guarded::Atom(GAtom::Last(crate::guarded::GTerm::Var(
+                BVar::Free(mk_vs("e"))))),
+        ]));
+        let mut sys = System::empty();
+        sys.goals.push((two.clone(), Default::default()));
+        sys.goals.push((three.clone(), Default::default()));
+        // Spec with 3 NonQuant alts must pick the 3-alt goal.
+        let spec3 = GoalSpec::Disj {
+            alts: vec![DisjAlt::NonQuant, DisjAlt::NonQuant, DisjAlt::NonQuant],
+        };
+        assert_eq!(match_goal(&spec3, &sys).expect("should match"), three);
+        // Spec with 2 NonQuant alts must pick the 2-alt goal.
+        let spec2 = GoalSpec::Disj {
+            alts: vec![DisjAlt::NonQuant, DisjAlt::NonQuant],
+        };
+        assert_eq!(match_goal(&spec2, &sys).expect("should match"), two);
     }
 }

@@ -3661,6 +3661,60 @@ mod tests {
             matches!(g, crate::constraint::constraints::Goal::Disj(_))));
     }
 
+    /// HS `partialAtomValuation` for `Last i` returns Just False ONLY
+    /// when `any (isInTrace sys) (nodesAfter i)` — the existence of a
+    /// less-relation edge `n < m` is NOT itself sufficient; `m` must
+    /// satisfy `isInTrace` (in sNodes / isLast / unsolved Action atom).
+    /// Direct port of HS Simplify.hs:518-524.
+    ///
+    /// Pre-fix RS unconditionally returned Some(false) whenever any
+    /// less-atom had `smaller == n` (or any edge had `src == n`),
+    /// regardless of whether the successor was in trace.  HS in that
+    /// case returns Nothing.  Commit 65c17ebb removed both RS-only
+    /// checks and reinstated the HS-faithful `is_in_trace` filter.
+    ///
+    /// This test pins the post-fix behaviour: the less-atom alone must
+    /// NOT collapse `Last(n)` to Some(false).
+    #[test]
+    fn partial_atom_valuation_last_returns_none_when_successor_not_in_trace() {
+        let path = match maude_path() { Some(p) => p, None => return };
+        let h = tamarin_term::maude_proc::MaudeHandle::start(&path, pair_maude_sig()).unwrap();
+        use tamarin_parser::ast::{Atom, SortHint, Term, VarSpec};
+        let mkvar = |n: &str, idx: u64| Term::Var(VarSpec {
+            name: n.to_string(), idx, sort: SortHint::Node, typ: None,
+        });
+        let mkvar_l = |n: &str, idx: u64| tamarin_term::lterm::LVar::new(
+            n, tamarin_term::lterm::LSort::Node, idx);
+        // Build a System with:
+        //   - NO nodes (so neither n nor m is in sNodes)
+        //   - NO last_atom (so the isLast check fails for n)
+        //   - NO unsolved Action goals for n or m (so the
+        //     unsolvedActionAtoms clause of isInTrace also fails)
+        //   - ONE less_atom `n < m` (the only edge into / out of n).
+        //
+        // Under these conditions HS returns Nothing for `Last n`:
+        //   isLast sys n             = False (no last_atom)
+        //   any isInTrace (nodesAfter n) = isInTrace m = False
+        //   case sLastAtom of Nothing -> Nothing
+        // The pre-fix RS code's blanket "less_atom with smaller=n →
+        // Some(false)" would have returned Some(false) here, diverging
+        // from HS.
+        let mut sys = System::empty();
+        let n = mkvar_l("n", 0);
+        let m = mkvar_l("m", 0);
+        sys.less_atoms.push(crate::constraint::constraints::LessAtom::new(
+            n.clone(), m,
+            crate::constraint::constraints::Reason::Formula,
+        ));
+        let result = partial_atom_valuation(&sys, &h, &Atom::Last(mkvar("n", 0)));
+        assert_eq!(result, None,
+            "HS-faithful: `Last n` with `n < m` but m not in trace must \
+             yield None (not Some(false)).  Pre-fix RS returned \
+             Some(false) here — see commit 65c17ebb.  Mirrors HS \
+             Simplify.hs:518-524 `any (isInTrace sys) (nodesAfter i)` \
+             guard.");
+    }
+
     #[test]
     fn simplify_marks_subterm_self_contradiction() {
         let path = match maude_path() { Some(p) => p, None => return };

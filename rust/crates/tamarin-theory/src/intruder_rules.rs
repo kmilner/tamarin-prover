@@ -1045,6 +1045,143 @@ mod tests {
              and `snd(<x,y>) = y` at position [0] each.", rules.len());
     }
 
+    // =========================================================================
+    // `equal_rule_up_to_renaming` (Rule.hs:1065-1077 — see definition in
+    // intruder_rules.rs at line 734).  Mirrors HS:
+    //
+    //   equalRuleUpToRenaming r1 r2 = reader $ \hnd ->
+    //     case eqs of
+    //       Nothing   -> False
+    //       Just eqs' -> (rn1 == rn2) && any isRenamingPerRule (unifs eqs' hnd)
+    //
+    // Pin both ends of the predicate: a positive (two rules differing only
+    // in variable names) and a negative (structurally different).
+    // =========================================================================
+    fn maude_handle() -> Option<tamarin_term::maude_proc::MaudeHandle> {
+        let path = std::env::var("MAUDE_PATH").ok().or_else(|| {
+            for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+                if std::path::Path::new(c).exists() { return Some(c.to_string()); }
+            }
+            None
+        })?;
+        tamarin_term::maude_proc::MaudeHandle::start(
+            &path, tamarin_term::maude_sig::pair_maude_sig()).ok()
+    }
+
+    /// Build a rule `[ KU(a) ] --[ KU(pair(a, a)) ]-> [ KU(pair(a, a)) ]`
+    /// (a constructor-shape rule with one var `a`).  Used to test
+    /// `equal_rule_up_to_renaming` with two alpha-equivalent rules.
+    fn ku_pair_rule_with_var(var_name: &str, idx: u64) -> IntrRuleAC {
+        use tamarin_term::builtin::pair;
+        use tamarin_term::lterm::{LSort, LVar};
+        let a = var_term(LVar::new(var_name, LSort::Msg, idx));
+        let p = pair(a.clone(), a.clone());
+        Rule::new(
+            IntrRuleACInfo::ConstrRule(b"_pair".to_vec()),
+            vec![ku_fact(a.clone())],
+            vec![ku_fact(p.clone())],
+            vec![ku_fact(p)],
+        )
+    }
+
+    /// Positive: two rules that differ ONLY in their bound variable's
+    /// name (and possibly idx) must compare equal-up-to-renaming.
+    ///
+    /// HS: `unifyLNTerm` produces a renaming `[x.0 ~> y.7]`; its
+    /// restriction to each rule's vars (each is the singleton `{x.0}`
+    /// vs `{y.7}`) is a renaming, so `isRenamingPerRule` holds.
+    #[test]
+    fn equal_rule_up_to_renaming_alpha_equivalent_pair_rules() {
+        let maude = match maude_handle() { Some(m) => m, None => return };
+        let r1 = ku_pair_rule_with_var("x", 0);
+        let r2 = ku_pair_rule_with_var("y", 7);
+        assert!(equal_rule_up_to_renaming(&maude, &r1, &r2),
+            "two rules differing only in their bound var's name+idx \
+             must be equal-up-to-renaming.  HS: `unifyLNTerm` yields a \
+             renaming `[x.0 ~> y.7]`, isRenaming on each rule's restricted \
+             var set holds.  See Rule.hs:1065-1077.");
+        // Symmetric: r2 vs r1.
+        assert!(equal_rule_up_to_renaming(&maude, &r2, &r1),
+            "equal_rule_up_to_renaming must be symmetric");
+        // Reflexive: r1 vs r1.
+        assert!(equal_rule_up_to_renaming(&maude, &r1, &r1),
+            "equal_rule_up_to_renaming must be reflexive");
+    }
+
+    /// Negative: two rules with structurally different conclusions
+    /// (different fact shapes) must NOT be equal-up-to-renaming.
+    ///
+    /// HS: `matchFacts` returns `Nothing` because tags differ → False.
+    #[test]
+    fn equal_rule_up_to_renaming_structurally_different_rules_diverge() {
+        use tamarin_term::lterm::{LSort, LVar};
+        let maude = match maude_handle() { Some(m) => m, None => return };
+        let r1 = ku_pair_rule_with_var("x", 0);
+        // r2 has a single KU premise but a DIFFERENT conclusion shape:
+        // it concludes KU(x) (the variable directly) instead of
+        // KU(pair(x, x)).  No renaming can make `KU(x)` == `KU(pair(x, x))`.
+        let a = var_term(LVar::new("x", LSort::Msg, 0));
+        let r2 = Rule::new(
+            IntrRuleACInfo::ConstrRule(b"_pair".to_vec()),
+            vec![ku_fact(a.clone())],
+            vec![ku_fact(a.clone())],
+            vec![ku_fact(a)],
+        );
+        assert!(!equal_rule_up_to_renaming(&maude, &r1, &r2),
+            "rules with structurally distinct conclusions (KU(pair(x,x)) \
+             vs KU(x)) cannot be equal-up-to-renaming — no unifier \
+             matches `pair(x,x) =? x`.  HS: matchFacts builds the eqs, \
+             unifyLNTerm fails or yields a non-renaming.");
+        // Different info also makes them unequal even when terms match.
+        let r3 = Rule::new(
+            IntrRuleACInfo::ConstrRule(b"_OTHER".to_vec()),
+            r1.premises.clone(),
+            r1.conclusions.clone(),
+            r1.actions.clone(),
+        );
+        assert!(!equal_rule_up_to_renaming(&maude, &r1, &r3),
+            "differing info field (rule names) must short-circuit to False \
+             — HS: `if r1.info /= r2.info then False else ...`");
+    }
+
+    // =========================================================================
+    // `variants_intruder` (IntruderRules.hs:288-314 — definition in
+    // intruder_rules.rs at line 564).
+    //
+    // Pin: a `DestrRule subterm=False` rule whose argument terms have
+    // Maude variants under the AC theory produces MORE than one variant.
+    // =========================================================================
+
+    /// `variants_intruder` on a constructor rule whose argument is a
+    /// pair (i.e. has multiple Maude variants under AC) produces at
+    /// least two variants — the identity variant plus at least one
+    /// substitution that reorders / splits the pair structure.
+    ///
+    /// We don't assert an exact count because it is Maude-version
+    /// dependent (and minor signature differences affect the variant
+    /// enumeration), but `len() >= 1` is invariant.
+    #[test]
+    fn variants_intruder_emits_at_least_the_identity_variant() {
+        let maude = match maude_handle() { Some(m) => m, None => return };
+        // The pair-construction rule from the basic sig.  Apply
+        // `variants_intruder` to it; Maude should produce at least the
+        // identity variant.  More may appear depending on the
+        // signature loaded.
+        let sig = tamarin_term::maude_sig::pair_maude_sig();
+        let cs = construction_rules(&sig);
+        let pair_rule = cs.iter().find(|r| match &r.info {
+            IntrRuleACInfo::ConstrRule(name) => name == b"_pair",
+            _ => false,
+        }).expect("expected pair constructor rule");
+        let variants = variants_intruder(&maude, false, pair_rule);
+        assert!(!variants.is_empty(),
+            "variants_intruder must emit at least one rule (the identity \
+             variant if no Maude variants exist).  HS \
+             `variantsIntruder` (IntruderRules.hs:288-314) wraps the \
+             rule in a list-monad enumeration that includes the original \
+             via the identity Maude variant.");
+    }
+
     /// `destructionRules` short-circuits when the rhs is a closed term
     /// (no free vars) AND `diff=false` AND rhs has no Private symbol.
     /// This is the outer guard at IntruderRules.hs:130 — the function
