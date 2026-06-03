@@ -314,6 +314,56 @@ impl ProofContext {
         // applies first in the proof renderer (e.g. NSPK3 injective_agree
         // picks `case c_aenc` like Haskell does).
         let mut intruder_rules = crate::intruder_rules::subterm_intruder_rules(false, &sig);
+        // HS-faithful: run `closeIntrRule` over EACH intr rule BEFORE
+        // `special_intruder_rules` are appended.  Mirrors Haskell
+        // `Rule.closeRuleCache` (lib/theory/src/Rule.hs:160):
+        //     intrRulesAC = concat $ map (closeIntrRule hnd) intrRules
+        //
+        // `closeIntrRule` does two things:
+        //   (a) For `DestrRule subterm=True` it computes the per-rule
+        //       `paciRemainingApplications` budget (number of consecutive
+        //       chain applications) — previously every RS destructor had
+        //       budget `-1`.
+        //   (b) For `DestrRule subterm=False` (convergent-equation
+        //       destructors like `d_0_comb` in issue216) it invokes
+        //       `variantsIntruder` to enumerate Maude variants and add
+        //       them to the pool.  Without this, the chain pool for
+        //       issue216 has `nRules=6` instead of HS's `nRules=9`, and
+        //       all 4 issue216 lemmas fail to close.
+        //
+        // Per HS, `closeIntrRule` runs AFTER `minimizeIntruderRules`
+        // (already done inside `subterm_intruder_rules`) and BEFORE the
+        // `special_intruder_rules` append (since HS appends specials
+        // separately in `addMessageDeductionRuleVariants`).
+        let dbg_close = std::env::var("TAM_RS_DBG_CLOSE_INTR").is_ok();
+        if dbg_close {
+            eprintln!("[close_intr] BEFORE: {} intr rules", intruder_rules.len());
+            for r in &intruder_rules {
+                if let crate::rule::IntrRuleACInfo::DestrRule(n, b, st, c) = &r.info {
+                    eprintln!("  destr: {} budget={} subterm={} const={}",
+                        String::from_utf8_lossy(n), b, st, c);
+                }
+            }
+        }
+        intruder_rules = intruder_rules.into_iter()
+            .flat_map(|ir| crate::intruder_rules::close_intr_rule(&maude, &ir))
+            .collect();
+        if dbg_close {
+            eprintln!("[close_intr] AFTER: {} intr rules", intruder_rules.len());
+            for r in &intruder_rules {
+                if let crate::rule::IntrRuleACInfo::DestrRule(n, b, st, c) = &r.info {
+                    use tamarin_term::pretty::pretty_lnterm;
+                    let prems_s: Vec<String> = r.premises.iter().flat_map(|f|
+                        f.terms.iter().map(|t| pretty_lnterm(t))
+                    ).collect();
+                    let concs_s: Vec<String> = r.conclusions.iter().flat_map(|f|
+                        f.terms.iter().map(|t| pretty_lnterm(t))
+                    ).collect();
+                    eprintln!("  destr: {} b={} st={} const={}\n    prems={:?}\n    concs={:?}",
+                        String::from_utf8_lossy(n), b, st, c, prems_s, concs_s);
+                }
+            }
+        }
         intruder_rules.extend(crate::intruder_rules::special_intruder_rules(false));
         // Detect injective fact instances ahead of time — mirrors
         // Haskell's `pcInjectiveFactInsts` precomputation.

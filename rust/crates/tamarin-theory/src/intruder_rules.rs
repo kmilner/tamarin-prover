@@ -3,10 +3,10 @@
 //! always-included "special" intruder rules. The DH/BP/XOR/multiset
 //! variant computations need narrowing + Maude and are deferred.
 
-use tamarin_term::lterm::{LSort, LVar};
+use tamarin_term::lterm::{LNTerm, LSort, LVar};
 use tamarin_term::vterm::var_term;
 
-use crate::fact::{fresh_fact, in_fact, k_log_fact, kd_fact, ku_fact, out_fact, LNFact};
+use crate::fact::{fresh_fact, in_fact, k_log_fact, kd_fact, ku_fact, out_fact, FactTag, LNFact};
 use crate::rule::{IntrRuleAC, IntrRuleACInfo, Rule};
 
 /// `specialIntruderRules diff` returns the intruder rules that are
@@ -412,6 +412,392 @@ pub fn construction_rules(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<IntrRu
         out.push(Rule::new(info, prems, vec![conc], vec![act]));
     }
     out
+}
+
+// =============================================================================
+// `closeIntrRule` + `variantsIntruder` — port of `Theory.Tools.IntruderRules`
+// and `Rule.closeIntrRule`.
+//
+// Together these post-process the destructor rules in two ways:
+//
+//   1. For `DestrRule subterm=True` (the "syntactic-subterm" destructors
+//      like `sdec`, `fst`, `snd`) — compute the per-rule
+//      `paciRemainingApplications` budget (number of consecutive
+//      applications allowed before the loop-breaker fires). Rule.hs:104-114.
+//
+//   2. For `DestrRule subterm=False` (the convergent-equation
+//      destructors `d_0_comb`, `d_1_comb`, `d_0_transform` in issue216 —
+//      whose RHS is NOT a subterm of the LHS, e.g.
+//      `comb(transform(x, y), y) = x`, where `x` and `y` both appear
+//      in the RHS even though the RHS `x` is a sub-position of the LHS)
+//      — invoke Maude's `get variants` to enumerate ALL variant rules
+//      that the destructor can take.  Each Maude variant substitution is
+//      applied to the rule, normalised, and added to the pool.  Without
+//      this expansion, chains over `d_0_comb` etc. enumerate only the
+//      identity-variant — Haskell expects ~3 extra variant rules
+//      bringing the chain pool from `nRules=6` to `nRules=9` on issue216,
+//      and the 4 issue216 lemmas all need at least one of these variants
+//      to close.
+//
+// HS pipeline ORDER:
+//   intrRulesAC = concatMap (closeIntrRule hnd) intrRules
+//                       -- ^ AFTER `minimizeIntruderRules` (run inside
+//                       --   `subtermIntruderRules`)
+// Mirrors Rule.hs:160.
+// =============================================================================
+
+/// `isPrivateFunction` (Term.hs:203-205): top-level function symbol is Private.
+fn is_private_function(t: &LNTerm) -> bool {
+    use tamarin_term::function_symbols::{FunSym, NoEqSym, Privacy};
+    use tamarin_term::term::Term;
+    matches!(t, Term::App(FunSym::NoEq(NoEqSym { privacy: Privacy::Private, .. }), _))
+}
+
+/// `closeIntrRule` — port of `Rule.closeIntrRule` (lib/theory/src/Rule.hs:103-116).
+///
+/// HS shape:
+/// ```haskell
+/// closeIntrRule hnd (Rule (DestrRule name (-1) subterm constant)
+///                         prems@((Fact KDFact _ [t]):_)
+///                         concs@[Fact KDFact _ [rhs]] acts nvs) =
+///   if subterm then [ru] else variantsIntruder hnd id False ru
+///     where ru = ...budget-computed...
+/// closeIntrRule hnd ir@(Rule (DestrRule _ _ False _) _ _ _ _) =
+///     variantsIntruder hnd id False ir
+/// closeIntrRule _ ir = [ir]
+/// ```
+///
+/// Note the THREE-way pattern split on Haskell:
+///   1. `DestrRule name (-1) subterm constant` + KD-single-fact shape  → compute budget,
+///      then either single-rule (subterm) or variantsIntruder (non-subterm).
+///   2. ANY `DestrRule _ _ False _` (subterm=False) that didn't match clause 1  → variantsIntruder.
+///   3. Default — pass through unchanged.
+///
+/// Clause 2 catches DestrRules whose shape doesn't match clause 1's narrow
+/// pattern (e.g. budget already set, multiple-concs, etc.) AND have
+/// subterm=False — these still need variant expansion.
+pub fn close_intr_rule(
+    maude: &tamarin_term::maude_proc::MaudeHandle,
+    ir: &IntrRuleAC,
+) -> Vec<IntrRuleAC> {
+    use tamarin_term::positions::positions;
+
+    // Clause 1: budget = -1 AND single-KD-conclusion AND first-prem is KD.
+    if let IntrRuleACInfo::DestrRule(name, -1, subterm, constant) = &ir.info {
+        let kd_prem_t: Option<&LNTerm> = ir.premises.first()
+            .filter(|f| f.tag == FactTag::Kd && f.terms.len() == 1)
+            .map(|f| &f.terms[0]);
+        let single_kd_conc_rhs: Option<&LNTerm> =
+            if ir.conclusions.len() == 1
+                && ir.conclusions[0].tag == FactTag::Kd
+                && ir.conclusions[0].terms.len() == 1 {
+                Some(&ir.conclusions[0].terms[0])
+            } else { None };
+        if let (Some(t), Some(rhs)) = (kd_prem_t, single_kd_conc_rhs) {
+            // Compute budget: `if runMaude (unifiableLNTerms rhs t)
+            //   then (length (positions t)) - (if (isPrivateFunction t) then 1 else 2)
+            //   else 0`.
+            use tamarin_term::rewriting::Equal;
+            let unifiable = maude.unifiable(&[Equal { lhs: rhs.clone(), rhs: t.clone() }])
+                .unwrap_or(false);
+            let budget: i64 = if unifiable {
+                let np = positions(t).len() as i64;
+                let sub = if is_private_function(t) { 1 } else { 2 };
+                np - sub
+            } else {
+                0
+            };
+            let mut ru = ir.clone();
+            ru.info = IntrRuleACInfo::DestrRule(name.clone(), budget, *subterm, *constant);
+            return if *subterm {
+                vec![ru]
+            } else {
+                variants_intruder(maude, false, &ru)
+            };
+        }
+    }
+
+    // Clause 2: any DestrRule with subterm=False that didn't match clause 1.
+    if matches!(&ir.info, IntrRuleACInfo::DestrRule(_, _, false, _)) {
+        return variants_intruder(maude, false, ir);
+    }
+
+    // Clause 3: pass through.
+    vec![ir.clone()]
+}
+
+/// `variantsIntruder` — port of
+/// `Theory.Tools.IntruderRules.variantsIntruder` (IntruderRules.hs:288-314).
+///
+/// HS shape (with `minimizeVariants = id`):
+/// ```haskell
+/// variantsIntruder hnd id applyFilters ru = go [] $ reverse $ do
+///     let ruleTerms = concatMap factTerms (rPrems ru ++ rConcs ru ++ rActs ru)
+///     fsigma <- computeVariants (fAppList ruleTerms) `runReader` hnd
+///     let sigma     = freshToFree fsigma `evalFreshAvoiding` ruleTerms
+///         ruvariant = normRule' (apply sigma ru) `runReader` hnd
+///     guard (... filter conditions ...)
+///     case concatMap factTerms (rConcs ruvariant) of
+///       [viewTerm -> FApp (AC Mult) _] -> fail "Rules with product conclusion redundant"
+///       _ -> return ruvariant
+///   where
+///     go checked [] = checked
+///     go checked (r:unchecked) =
+///       let checked' = if any (\r' -> equalRuleUpToRenaming r r' ...) (checked++unchecked)
+///                      then checked else r:checked
+///       in go checked' unchecked
+/// ```
+///
+/// The list-monad `do` enumerates Maude variants of the packed rule-terms
+/// list `fAppList ruleTerms`.  For each variant substitution:
+///   * convert VFresh → free `Subst`, renaming range vars away from `ruleTerms`
+///   * apply to the rule
+///   * normalise every rule-term via Maude
+///   * if `applyFilters`: drop rules with ground conclusions, identity
+///     variants (ruvariant == ru), and rules whose conclusions are subsumed
+///     by their premises
+///   * drop rules whose single conclusion is an AC-Mult product
+///
+/// Then `go [] $ reverse $ ...` walks the LIST FROM THE BACK and dedups via
+/// `equalRuleUpToRenaming`: if any other rule in `checked++unchecked` is
+/// equal-up-to-renaming, this rule is dropped.
+pub fn variants_intruder(
+    maude: &tamarin_term::maude_proc::MaudeHandle,
+    apply_filters: bool,
+    ru: &IntrRuleAC,
+) -> Vec<IntrRuleAC> {
+    use tamarin_term::function_symbols::{AcSym, FunSym};
+    use tamarin_term::lterm::frees;
+    use tamarin_term::subst::{apply_vterm, Subst};
+    use tamarin_term::subst_vfresh::LNSubstVFresh;
+    use tamarin_term::term::{f_app_list, Term};
+
+    // `ruleTerms = concatMap factTerms (prems ++ concs ++ acts)`.
+    // Note: HS does NOT include `nvs` here (only prems/concs/acts), even
+    // though the rest of the pipeline includes nvs.
+    let mut rule_terms: Vec<LNTerm> = Vec::new();
+    for f in ru.premises.iter()
+        .chain(ru.conclusions.iter())
+        .chain(ru.actions.iter())
+    {
+        for t in &f.terms { rule_terms.push(t.clone()); }
+    }
+    let packed = f_app_list(rule_terms.clone());
+
+    let raw_substs = match maude.variants(&packed) {
+        Ok(v) => v,
+        Err(_) => return vec![ru.clone()],
+    };
+
+    // Avoid set for `freshToFreeAvoiding ruleTerms` — every free var in
+    // the rule's fact terms.
+    let avoid_set: std::collections::BTreeSet<LVar> = {
+        let mut s: std::collections::BTreeSet<LVar> = std::collections::BTreeSet::new();
+        for t in &rule_terms {
+            for v in frees(t) { s.insert(v); }
+        }
+        s
+    };
+
+    // Build one candidate variant rule per Maude variant substitution.
+    let mut produced: Vec<IntrRuleAC> = Vec::new();
+    for pairs in raw_substs {
+        // `restrictVFresh (frees packed) fsigma` — keep only entries whose
+        // KEY is a free var of the packed term.  HS `computeVariants`
+        // (Compute.hs:148-150) does this implicitly.  Maude only binds the
+        // vars we passed in, but be defensive.
+        let s_fresh = LNSubstVFresh::from_list(pairs)
+            .restrict(&avoid_set.iter().cloned().collect::<Vec<_>>());
+
+        // `freshToFreeAvoiding ruleTerms` — convert VFresh → free Subst,
+        // allocating fresh idxs that avoid every var in `ruleTerms`.
+        let sigma: Subst<tamarin_term::lterm::Name, LVar> = {
+            let mut counter = avoid_set.iter().map(|v| v.idx).max()
+                .map(|m| m + 1).unwrap_or(0);
+            s_fresh.fresh_to_free_avoiding(
+                |n| { let b = counter; counter += n; b },
+                &avoid_set,
+            )
+        };
+
+        // Build the variant rule by applying sigma + normalising every term.
+        let norm_t = |t: LNTerm| -> LNTerm {
+            let applied = apply_vterm(&sigma, t);
+            maude.reduce(&applied).unwrap_or_else(|_| {
+                // Fallback to un-normalised on Maude failure.
+                Term::Lit(tamarin_term::vterm::Lit::Var(LVar::new("err", LSort::Msg, 0)))
+            })
+        };
+        let map_facts = |fs: &[LNFact]| -> Vec<LNFact> {
+            fs.iter().map(|f| LNFact {
+                tag: f.tag.clone(),
+                annotations: f.annotations.clone(),
+                terms: f.terms.iter().map(|t| {
+                    let applied = apply_vterm(&sigma, t.clone());
+                    maude.reduce(&applied).unwrap_or(applied)
+                }).collect(),
+            }).collect()
+        };
+        let new_prems = map_facts(&ru.premises);
+        let new_concs = map_facts(&ru.conclusions);
+        let new_acts = map_facts(&ru.actions);
+        let new_nvs: Vec<LNTerm> = ru.new_vars.iter().cloned().map(norm_t).collect();
+        let ruvariant: IntrRuleAC = Rule {
+            info: ru.info.clone(),
+            premises: new_prems,
+            conclusions: new_concs,
+            actions: new_acts,
+            new_vars: new_nvs,
+        };
+
+        // Filter conditions (HS IntruderRules.hs:295-301):
+        //   guard (not applyFilters || frees (rConcs ruvariant) /= []
+        //          && (not applyFilters || ruvariant /= ru)
+        //          && (rConcs ruvariant) \\ (rPrems ruvariant) /= [])
+        //
+        // Note the `\\` is the LAST condition and is NOT gated by
+        // `applyFilters` in HS: it's ALWAYS applied.  But the first two
+        // are gated.  The expression is `a && b && c` — short-circuits to
+        // false if any is false.  When applyFilters=False, a and b are
+        // True (trivially) so only c applies.
+        if apply_filters {
+            // Conclusions must have free vars.
+            let concs_have_frees = ruvariant.conclusions.iter()
+                .flat_map(|f| f.terms.iter())
+                .any(|t| !frees(t).is_empty());
+            if !concs_have_frees { continue; }
+            // Not the identity variant.
+            if &ruvariant == ru { continue; }
+        }
+        // Always-applied: concs \\ prems != [].
+        let concs_minus_prems_nonempty = ruvariant.conclusions.iter()
+            .any(|c| !ruvariant.premises.contains(c));
+        if !concs_minus_prems_nonempty { continue; }
+
+        // Drop rules with single product-conclusion (HS lines 303-305).
+        let conc_terms: Vec<&LNTerm> = ruvariant.conclusions.iter()
+            .flat_map(|f| f.terms.iter())
+            .collect();
+        if conc_terms.len() == 1 {
+            if matches!(conc_terms[0], Term::App(FunSym::Ac(AcSym::Mult), _)) {
+                continue;
+            }
+        }
+
+        produced.push(ruvariant);
+    }
+
+    // `go [] $ reverse $ ...` — HS walks the reversed-produced list and
+    // prepends each kept rule via `r:checked`.  So `checked` accumulates
+    // in REVERSE order of traversal, which (since the traversal walks
+    // the already-reversed `produced`) ends up in `produced`'s ORIGINAL
+    // order.  We mirror that with `Vec::insert(0, r)`.
+    produced.reverse();
+    let mut checked: Vec<IntrRuleAC> = Vec::new();
+    let mut unchecked: Vec<IntrRuleAC> = produced;
+    while let Some(r) = unchecked.first().cloned() {
+        unchecked.remove(0);
+        // peers = checked ++ unchecked
+        let mut dup = false;
+        for peer in checked.iter().chain(unchecked.iter()) {
+            if equal_rule_up_to_renaming(maude, &r, peer) {
+                dup = true;
+                break;
+            }
+        }
+        if !dup {
+            // HS `checked' = r:checked` — prepend.
+            checked.insert(0, r);
+        }
+    }
+    checked
+}
+
+/// `equalRuleUpToRenaming` — port of
+/// `Theory.Model.Rule.equalRuleUpToRenaming` (Rule.hs:1065-1077).
+///
+/// Two rules are equal up to variable renaming iff:
+///   - Same `info`.
+///   - Zipped (premises ++ concs ++ acts) have matching fact tags AND
+///     element-wise term-equalities admit a unifier that is a renaming
+///     when restricted to either rule's variable occurrences (sorted).
+///   - `new_vars` are also zipped into equalities (in HS, `nvs1` zipped
+///     with `nvs2` start the equation list).
+///
+/// HS:
+/// ```haskell
+/// equalRuleUpToRenaming r1 r2 = reader $ \hnd ->
+///   case eqs of
+///     Nothing   -> False
+///     Just eqs' -> (rn1 == rn2) && any isRenamingPerRule (unifs eqs' hnd)
+/// ```
+pub fn equal_rule_up_to_renaming(
+    maude: &tamarin_term::maude_proc::MaudeHandle,
+    r1: &IntrRuleAC,
+    r2: &IntrRuleAC,
+) -> bool {
+    use tamarin_term::lterm::HasFrees;
+    use tamarin_term::rewriting::Equal;
+    use tamarin_term::subst_vfresh::LNSubstVFresh;
+
+    if r1.info != r2.info { return false; }
+    // `matchFacts`: zip the fact lists; if any pair has mismatched tags
+    // OR arities, the whole equation set is unconstructible — return False.
+    if r1.premises.len() != r2.premises.len() { return false; }
+    if r1.conclusions.len() != r2.conclusions.len() { return false; }
+    if r1.actions.len() != r2.actions.len() { return false; }
+    if r1.new_vars.len() != r2.new_vars.len() { return false; }
+
+    // HS's `eqs` is initialised with `zipWith Equal nvs1 nvs2`, then
+    // each fact pair extends it by `zipWith Equal t1 t2` when tags match.
+    let mut term_eqs: Vec<Equal<LNTerm>> = Vec::new();
+    for (a, b) in r1.new_vars.iter().zip(r2.new_vars.iter()) {
+        term_eqs.push(Equal { lhs: a.clone(), rhs: b.clone() });
+    }
+    let pair_iter = r1.premises.iter().chain(r1.conclusions.iter()).chain(r1.actions.iter())
+        .zip(r2.premises.iter().chain(r2.conclusions.iter()).chain(r2.actions.iter()));
+    for (f1, f2) in pair_iter {
+        if f1.tag != f2.tag { return false; }
+        if f1.terms.len() != f2.terms.len() { return false; }
+        for (a, b) in f1.terms.iter().zip(f2.terms.iter()) {
+            term_eqs.push(Equal { lhs: a.clone(), rhs: b.clone() });
+        }
+    }
+
+    // Collect each rule's vars (occurrences-set).
+    let vars_r1: Vec<LVar> = {
+        let mut s: std::collections::BTreeSet<LVar> = std::collections::BTreeSet::new();
+        r1.for_each_free(&mut |v| { s.insert(v.clone()); });
+        s.into_iter().collect()
+    };
+    let vars_r2: Vec<LVar> = {
+        let mut s: std::collections::BTreeSet<LVar> = std::collections::BTreeSet::new();
+        r2.for_each_free(&mut |v| { s.insert(v.clone()); });
+        s.into_iter().collect()
+    };
+
+    // Trivial case: no constraints → identity unifier is trivially a
+    // renaming (empty), so result is True.
+    if term_eqs.is_empty() {
+        return true;
+    }
+
+    let unifs = match maude.unify_at("equal_rule_up_to_renaming", &term_eqs) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    // For each unifier `subst`: check `isRenaming (restrictVFresh vars_r1 subst)
+    //                       && isRenaming (restrictVFresh vars_r2 subst)`.
+    // The unifier comes back as `Vec<(LVar, LNTerm)>` — treat as VFresh.
+    for u_pairs in &unifs {
+        let s_fresh = LNSubstVFresh::from_list(u_pairs.clone());
+        let r1_rest = s_fresh.restrict(&vars_r1);
+        let r2_rest = s_fresh.restrict(&vars_r2);
+        if r1_rest.is_renaming() && r2_rest.is_renaming() {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
