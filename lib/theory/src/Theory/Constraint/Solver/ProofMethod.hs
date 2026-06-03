@@ -463,7 +463,30 @@ execProofMethod ctxt method sys =
       -- diff'd to find the first HS-vs-Rust system-state divergence.
       sys <- St.get
       T.traceStateM sys
-      T.tracePickM goal
+      -- TAM_HS_DBG_PICK_NR=1: also dump the picked goal's gsNr so the
+      -- HS↔Rust pick can be aligned against gsNr-ordered ranks.
+      let pickNrFlag = unsafePerformIO $
+            maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_DBG_PICK_NR"
+      let pickNr = case M.lookup goal (L.get sGoals sys) of
+                     Just st -> show (L.get gsNr st)
+                     Nothing -> "?"
+      let allOpen =
+            intercalate " ; "
+              [ "#" ++ show (L.get gsNr st) ++ ":" ++ T.goalCanonical g
+                ++ "/lb=" ++ show (L.get gsLoopBreaker st)
+              | (g, st) <- M.toList (L.get sGoals sys)
+              , not (L.get gsSolved st) ]
+      let disjsDetail =
+            intercalate " || "
+              [ "#" ++ show (L.get gsNr st) ++ ":" ++ take 200 (show g)
+              | (g, st) <- M.toList (L.get sGoals sys)
+              , not (L.get gsSolved st)
+              , case g of { DisjG _ -> True; _ -> False } ]
+      (if pickNrFlag
+         then trace ("[HS_PICK_NR] #" ++ pickNr ++ ":" ++ T.goalCanonical goal ++
+                    "\n[HS_OPEN_NRS] " ++ allOpen ++
+                    "\n[HS_DISJS] " ++ disjsDetail)
+         else id) (T.tracePickM goal)
       let ths = L.get pcSources ctxt
       let ws = solveWithSource ctxt ths goal
       let mark = case ws of
@@ -1205,7 +1228,16 @@ smartRanking :: ProofContext
              -> System
              -> [AnnotatedGoal] -> [AnnotatedGoal]
 smartRanking ctxt allowPremiseGLoopBreakers sys ags0 =
-    let result = (moveNatToEnd . sortOnUsefulness . unmark . sortDecisionTree notSolveLast . sortDecisionTree solveFirst . goalNrRanking) ags0
+    let result0 = (moveNatToEnd . sortOnUsefulness . unmark . sortDecisionTree notSolveLast . sortDecisionTree solveFirst . goalNrRanking) ags0
+        always = unsafePerformIO $
+              maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_DBG_SMART_RANK_ALWAYS"
+        result = if always
+                   then unsafePerformIO $ do
+                          Debug.Trace.traceIO ("[HS_SMART_RANK_RAW] in=" ++ show (length ags0) ++
+                               " out_nrs=" ++ show (map (fst . snd) result0) ++
+                               " in_nrs=" ++ show (map (fst . snd) ags0))
+                          return result0
+                   else result0
         dbg = unsafePerformIO $
               maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_DBG_SMART_RANK"
         -- TAM_HS_DBG_SMART_RANK=1: also dump the FULL sGoals (including
