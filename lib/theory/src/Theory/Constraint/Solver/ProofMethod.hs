@@ -398,7 +398,21 @@ checkAndExecProofMethod ctxt method sys = do
 execProofMethod :: ProofContext
                 -> ProofMethod -> System -> Maybe (M.Map CaseName System)
 execProofMethod ctxt method sys =
-    hsEmit "expand" Nothing sys $
+    let dbgEpm = unsafePerformIO $
+          maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_DBG_EPM"
+        methStr = case method of
+                    SolveGoal g -> "SolveGoal:" ++ take 80 (show g)
+                    Simplify    -> "Simplify"
+                    Induction   -> "Induction"
+                    Sorry _     -> "Sorry"
+                    Finished _  -> "Finished"
+                    Invalidated -> "Invalidated"
+        forceEpm = if dbgEpm
+                     then unsafePerformIO $ do
+                            Debug.Trace.traceIO ("[HS_EPM] " ++ methStr)
+                            return ()
+                     else ()
+    in forceEpm `seq` hsEmit "expand" Nothing sys $
     case method of
       Sorry _               -> return M.empty
       Finished _            -> return M.empty
@@ -656,17 +670,37 @@ plainRanking = (`Ranking` Nothing)
 -- | Use a 'GoalRanking' to sort a list of 'AnnotatedGoal's stemming from the
 -- given constraint 'System'.
 rankGoals :: ProofContext -> GoalRanking ProofContext -> [Tactic ProofContext] -> System -> [AnnotatedGoal] -> Ranking [AnnotatedGoal]
-rankGoals ctxt ranking tacticsList sys = case ranking of
-    GoalNrRanking       -> plainRanking . goalNrRanking
-    OracleRanking quitOnEmpty oracleName -> oracleRanking (const goalNrRanking) oracleName quitOnEmpty ctxt sys
-    OracleSmartRanking quitOnEmpty oracleName -> oracleRanking (smartRanking ctxt False) oracleName quitOnEmpty ctxt sys
-    UsefulGoalNrRanking -> plainRanking. sortOn (\(_, (nr, useless)) -> (useless, nr))
-    SapicRanking -> plainRanking . sapicRanking ctxt sys
-    SapicPKCS11Ranking -> plainRanking . sapicPKCS11Ranking ctxt sys
-    SmartRanking useLoopBreakers -> plainRanking . smartRanking ctxt useLoopBreakers sys
-    SmartDiffRanking -> plainRanking . smartDiffRanking ctxt sys
-    InjRanking useLoopBreakers -> plainRanking . injRanking ctxt useLoopBreakers sys
-    InternalTacticRanking quitOnEmpty tactic -> internalTacticRanking (chosenTactic tacticsList tactic) quitOnEmpty ctxt sys
+rankGoals ctxt ranking tacticsList sys ags =
+  let rankingTag = case ranking of
+        GoalNrRanking{} -> "GoalNr"
+        OracleRanking{} -> "Oracle"
+        OracleSmartRanking{} -> "OracleSmart"
+        UsefulGoalNrRanking{} -> "UsefulGoalNr"
+        SapicRanking{} -> "Sapic"
+        SapicPKCS11Ranking{} -> "SapicPKCS11"
+        SmartRanking{} -> "Smart"
+        SmartDiffRanking{} -> "SmartDiff"
+        InjRanking{} -> "Inj"
+        InternalTacticRanking{} -> "InternalTactic"
+      dbg = unsafePerformIO $
+              maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_DBG_RANK_PATH"
+      forceTrace = if dbg
+             then unsafePerformIO $ do
+                    Debug.Trace.traceIO ("[HS_RANK_PATH] ranking=" ++ rankingTag ++
+                                " inNrs=" ++ show (map (fst . snd) ags))
+                    return ()
+             else ()
+  in forceTrace `seq` (case ranking of
+        GoalNrRanking       -> plainRanking (goalNrRanking ags)
+        OracleRanking quitOnEmpty oracleName -> oracleRanking (const goalNrRanking) oracleName quitOnEmpty ctxt sys ags
+        OracleSmartRanking quitOnEmpty oracleName -> oracleRanking (smartRanking ctxt False) oracleName quitOnEmpty ctxt sys ags
+        UsefulGoalNrRanking -> plainRanking (sortOn (\(_, (nr, useless)) -> (useless, nr)) ags)
+        SapicRanking -> plainRanking (sapicRanking ctxt sys ags)
+        SapicPKCS11Ranking -> plainRanking (sapicPKCS11Ranking ctxt sys ags)
+        SmartRanking useLoopBreakers -> plainRanking (smartRanking ctxt useLoopBreakers sys ags)
+        SmartDiffRanking -> plainRanking (smartDiffRanking ctxt sys ags)
+        InjRanking useLoopBreakers -> plainRanking (injRanking ctxt useLoopBreakers sys ags)
+        InternalTacticRanking quitOnEmpty tactic -> internalTacticRanking (chosenTactic tacticsList tactic) quitOnEmpty ctxt sys ags)
 
     where 
       chosenTactic :: [Tactic ProofContext] -> Tactic ProofContext-> Tactic ProofContext
@@ -698,14 +732,23 @@ isFinished ctxt sys
 rankProofMethods :: GoalRanking ProofContext -> [Tactic ProofContext] -> ProofContext -> System
                  -> [(ProofMethod, (M.Map CaseName System, String))]
 rankProofMethods ranking tactics ctxt sys =
-  let Ranking (map solveGoalMethod -> goals) instr = rankGoals ctxt ranking tactics sys (openGoals sys)
+  let dbgRpm = unsafePerformIO $
+              maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_DBG_RPM"
+      forceRpm = if dbgRpm
+                   then unsafePerformIO $ do
+                          Debug.Trace.traceIO ("[HS_RPM] open_nrs=" ++
+                            show [ L.get gsNr st | (_,st) <- M.toList (L.get sGoals sys), not (L.get gsSolved st)] ++
+                            " init=" ++ show (isInitialSystem sys))
+                          return ()
+                   else ()
+      Ranking (map solveGoalMethod -> goals) instr = rankGoals ctxt ranking tactics sys (openGoals sys)
       insertInduction (simplify NE.:| gs) = case L.get pcUseInduction ctxt of
         AvoidInduction -> simplify : (Induction, "") : gs
         UseInduction   -> (Induction, "") : simplify : gs
       proofMethods = bool NE.toList insertInduction (isInitialSystem sys) ((Simplify, "") NE.:| goals)
       stoppingMethod =    (Finished <$> isFinished ctxt sys)
                       <|> (Sorry (Just "Oracle ranked no proof methods") <$ instr)
-  in execMethods $ maybe proofMethods ((:[]) . (,"")) stoppingMethod
+  in forceRpm `seq` (execMethods $ maybe proofMethods ((:[]) . (,"")) stoppingMethod)
   where
     execMethods = mapMaybe execMethod
     execMethod (m, expl) = do
