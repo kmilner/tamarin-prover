@@ -889,7 +889,7 @@ fn corpus_proof_skeleton_match_probe() {
         if src.contains("macros:") || src.contains("predicates:") { return None; }
         if src.contains("process:") { return None; }
         if src.contains("builtins:") &&
-           (src.contains("diffie-hellman") || src.contains("multiset") ||
+           (src.contains("multiset") ||
             src.contains("xor") || src.contains("bilinear-pairing"))
         { return None; }
 
