@@ -800,6 +800,231 @@ pub fn equal_rule_up_to_renaming(
     false
 }
 
+// =============================================================================
+// `normRule'` — port of `Theory.Tools.IntruderRules.normRule'`
+// (IntruderRules.hs:316-321).
+//
+// HS shape:
+// ```haskell
+// normRule' :: IntrRuleAC -> WithMaude IntrRuleAC
+// normRule' (Rule i ps cs as nvs) = reader $ \hnd ->
+//     let normFactTerms = map (fmap (\t -> norm' t `runReader` hnd)) in
+//     let normTerms     = map (\t -> norm' t `runReader` hnd) in
+//     Rule i (normFactTerms ps) (normFactTerms cs) (normFactTerms as) (normTerms nvs)
+// ```
+//
+// Walks every fact-term + every new-var term through Maude-backed
+// `norm'`.  We use the lenient `tamarin_term::norm::norm` (returns
+// Result; on Maude error we fall back to the original term, matching
+// the lenient style of the rest of the port — Maude failures during
+// variant expansion are recoverable, and propagating them up would
+// abort theory load).
+// =============================================================================
+/// `normRule'` — normalise every term in an intruder rule via Maude.
+///
+/// Mirrors HS `normRule'` (IntruderRules.hs:316-321).
+pub fn norm_rule(
+    maude: &tamarin_term::maude_proc::MaudeHandle,
+    ru: &IntrRuleAC,
+) -> IntrRuleAC {
+    let norm_t = |t: &LNTerm| -> LNTerm {
+        tamarin_term::norm::norm(maude, t).unwrap_or_else(|_| t.clone())
+    };
+    let norm_fact = |f: &LNFact| -> LNFact {
+        LNFact {
+            tag: f.tag.clone(),
+            annotations: f.annotations.clone(),
+            terms: f.terms.iter().map(&norm_t).collect(),
+        }
+    };
+    Rule {
+        info: ru.info.clone(),
+        premises: ru.premises.iter().map(&norm_fact).collect(),
+        conclusions: ru.conclusions.iter().map(&norm_fact).collect(),
+        actions: ru.actions.iter().map(&norm_fact).collect(),
+        new_vars: ru.new_vars.iter().map(&norm_t).collect(),
+    }
+}
+
+// =============================================================================
+// `dhIntruderRules` — port of
+// `Theory.Tools.IntruderRules.dhIntruderRules`
+// (IntruderRules.hs:230-283).
+//
+// HS shape:
+// ```haskell
+// dhIntruderRules :: Bool -> WithMaude [IntrRuleAC]
+// dhIntruderRules diff = reader $ \hnd -> minimizeIntruderRules diff $
+//     [ expRule  (ConstrRule (append (pack "_") expSymString))  kuFact return
+//     , invRule  (ConstrRule (append (pack "_") invSymString))  kuFact return
+//     , dhNeutralRule (ConstrRule (append (pack "_") dhNeutralSymString)) kuFact return
+//     , oneRule  (ConstrRule (append (pack "_") oneSymString))  kuFact return
+//     , multRule (ConstrRule (append (pack "_") multSymString)) kuFact return
+//     ] ++
+//     concatMap (variantsIntruder hnd id True)
+//       [ expRule (DestrRule (append (pack "_") expSymString) 0 True False) kdFact (const [])
+//       , invRule (DestrRule (append (pack "_") invSymString) 0 True False) kdFact (const [])
+//       ]
+//   where
+//     x_var_0 = varTerm (LVar "x" LSortMsg 0)
+//     x_var_1 = varTerm (LVar "x" LSortMsg 1)
+//     expRule mkInfo kudFact mkAction =
+//         Rule mkInfo [bfact, efact] [concfact] (mkAction concfact) []
+//       where bfact=kudFact x_var_0; efact=kuFact x_var_1
+//             conc=fAppExp(x_var_0,x_var_1); concfact=kudFact conc
+//     ... (multRule, invRule, oneRule, dhNeutralRule similarly)
+// ```
+//
+// Note the asymmetry of `mkAction` between constructors and
+// destructors:
+//   * constructors pass `return :: a -> [a]` (singleton list) — i.e.
+//     `[concfact]` as the actions list.
+//   * destructors pass `const [] :: a -> [a]` — i.e. empty actions.
+//
+// We mirror this by passing the `mk_action` argument as an `Fn(&LNFact)
+// -> Vec<LNFact>` closure.
+// =============================================================================
+/// `dhIntruderRules` — compute the intruder rules for the Diffie-Hellman
+/// theory.  Direct mirror of HS `dhIntruderRules` (IntruderRules.hs:230-283).
+///
+/// Returns 5 constructor rules (`_exp`, `_inv`, `_DH_neutral`, `_one`,
+/// `_mult`) plus the variants-expansion of 2 destructor rules
+/// (`_exp`, `_inv`).  The constructors for `one` / `mult` /
+/// `DH_neutral` are only really applied in `diff` mode — in trace mode
+/// all such constraints are solved directly — but the constructors
+/// always appear in the message theory (mirrors HS comment at
+/// IntruderRules.hs:235-237).
+pub fn dh_intruder_rules(
+    diff: bool,
+    maude: &tamarin_term::maude_proc::MaudeHandle,
+) -> Vec<IntrRuleAC> {
+    use tamarin_term::builtin::{dh_neutral, exp, inv, mult, one_const};
+    use tamarin_term::function_symbols::{
+        DH_NEUTRAL_SYM_STRING, EXP_SYM_STRING, INV_SYM_STRING, MULT_SYM_STRING,
+        ONE_SYM_STRING,
+    };
+
+    // `x_var_0 = varTerm (LVar "x" LSortMsg 0)` etc.
+    // IntruderRules.hs:247-248.
+    let x_var_0 = var_term(LVar::new("x", LSort::Msg, 0));
+    let x_var_1 = var_term(LVar::new("x", LSort::Msg, 1));
+
+    // HS `expRule mkInfo kudFact mkAction`
+    //   = Rule mkInfo [kudFact x_var_0, kuFact x_var_1] [kudFact (fAppExp ...)] (mkAction ...) []
+    // IntruderRules.hs:250-256.
+    let exp_rule = |info: IntrRuleACInfo,
+                    kud_fact: fn(LNTerm) -> LNFact,
+                    mk_action: &dyn Fn(LNFact) -> Vec<LNFact>|
+     -> IntrRuleAC {
+        let bfact = kud_fact(x_var_0.clone());
+        let efact = ku_fact(x_var_1.clone());
+        let conc = exp(x_var_0.clone(), x_var_1.clone());
+        let concfact = kud_fact(conc);
+        let acts = mk_action(concfact.clone());
+        Rule::new(info, vec![bfact, efact], vec![concfact], acts)
+    };
+
+    // HS `multRule` — IntruderRules.hs:258-264.
+    let mult_rule = |info: IntrRuleACInfo,
+                     kud_fact: fn(LNTerm) -> LNFact,
+                     mk_action: &dyn Fn(LNFact) -> Vec<LNFact>|
+     -> IntrRuleAC {
+        let bfact = kud_fact(x_var_0.clone());
+        let efact = ku_fact(x_var_1.clone());
+        let conc = mult(x_var_0.clone(), x_var_1.clone());
+        let concfact = kud_fact(conc);
+        let acts = mk_action(concfact.clone());
+        Rule::new(info, vec![bfact, efact], vec![concfact], acts)
+    };
+
+    // HS `invRule` — IntruderRules.hs:266-271.
+    let inv_rule = |info: IntrRuleACInfo,
+                    kud_fact: fn(LNTerm) -> LNFact,
+                    mk_action: &dyn Fn(LNFact) -> Vec<LNFact>|
+     -> IntrRuleAC {
+        let bfact = kud_fact(x_var_0.clone());
+        let conc = inv(x_var_0.clone());
+        let concfact = kud_fact(conc);
+        let acts = mk_action(concfact.clone());
+        Rule::new(info, vec![bfact], vec![concfact], acts)
+    };
+
+    // HS `oneRule` — IntruderRules.hs:273-277.
+    let one_rule = |info: IntrRuleACInfo,
+                    kud_fact: fn(LNTerm) -> LNFact,
+                    mk_action: &dyn Fn(LNFact) -> Vec<LNFact>|
+     -> IntrRuleAC {
+        let conc = one_const::<tamarin_term::vterm::Lit<tamarin_term::lterm::Name, LVar>>();
+        let concfact = kud_fact(conc);
+        let acts = mk_action(concfact.clone());
+        Rule::new(info, vec![], vec![concfact], acts)
+    };
+
+    // HS `dhNeutralRule` — IntruderRules.hs:279-283.
+    let dh_neutral_rule = |info: IntrRuleACInfo,
+                           kud_fact: fn(LNTerm) -> LNFact,
+                           mk_action: &dyn Fn(LNFact) -> Vec<LNFact>|
+     -> IntrRuleAC {
+        let conc = dh_neutral::<tamarin_term::vterm::Lit<tamarin_term::lterm::Name, LVar>>();
+        let concfact = kud_fact(conc);
+        let acts = mk_action(concfact.clone());
+        Rule::new(info, vec![], vec![concfact], acts)
+    };
+
+    // `mkInfo` helpers — `ConstrRule (append (pack "_") xSymString)` etc.
+    let constr_info = |sym: &[u8]| -> IntrRuleACInfo {
+        let mut name = b"_".to_vec();
+        name.extend_from_slice(sym);
+        IntrRuleACInfo::ConstrRule(name)
+    };
+    // Destructor info: `DestrRule (append (pack "_") expSymString) 0 True False`
+    // (IntruderRules.hs:243-244).  Note budget=0 (NOT -1), subterm=True,
+    // constant=False.  `closeIntrRule` is what assigns budget=-1 sentinel
+    // in our pipeline for subtermIntruderRules' destructors; here HS
+    // assigns budget=0 directly because these are convergent-eq destructors
+    // for which the budget is irrelevant (variantsIntruder will expand them).
+    let destr_info = |sym: &[u8]| -> IntrRuleACInfo {
+        let mut name = b"_".to_vec();
+        name.extend_from_slice(sym);
+        IntrRuleACInfo::DestrRule(name, 0, true, false)
+    };
+
+    // `return :: a -> [a]` — singleton-list action constructor (HS).
+    let mk_singleton: &dyn Fn(LNFact) -> Vec<LNFact> = &|f| vec![f];
+    // `const [] :: a -> [a]` — empty action constructor (HS destructors).
+    let mk_empty: &dyn Fn(LNFact) -> Vec<LNFact> = &|_| Vec::new();
+
+    let constrs: Vec<IntrRuleAC> = vec![
+        // expRule  (ConstrRule "_exp")        kuFact return
+        exp_rule(constr_info(EXP_SYM_STRING), ku_fact, mk_singleton),
+        // invRule  (ConstrRule "_inv")        kuFact return
+        inv_rule(constr_info(INV_SYM_STRING), ku_fact, mk_singleton),
+        // dhNeutralRule (ConstrRule "_DH_neutral") kuFact return
+        dh_neutral_rule(constr_info(DH_NEUTRAL_SYM_STRING), ku_fact, mk_singleton),
+        // oneRule  (ConstrRule "_one")        kuFact return
+        one_rule(constr_info(ONE_SYM_STRING), ku_fact, mk_singleton),
+        // multRule (ConstrRule "_mult")       kuFact return
+        mult_rule(constr_info(MULT_SYM_STRING), ku_fact, mk_singleton),
+    ];
+
+    // Destructor variants: `concatMap (variantsIntruder hnd id True) [exp-destr, inv-destr]`.
+    // IntruderRules.hs:241-245.  Note `applyFilters=True` here (NOT False
+    // like in closeIntrRule's invocation) — this is the BUILD-time
+    // narrowing call, which expects the identity variant and ground-conc
+    // variants to be DROPPED.
+    let exp_destr = exp_rule(destr_info(EXP_SYM_STRING), kd_fact, mk_empty);
+    let inv_destr = inv_rule(destr_info(INV_SYM_STRING), kd_fact, mk_empty);
+
+    let mut destr_variants: Vec<IntrRuleAC> = Vec::new();
+    destr_variants.extend(variants_intruder(maude, true, &exp_destr));
+    destr_variants.extend(variants_intruder(maude, true, &inv_destr));
+
+    // `minimizeIntruderRules diff $ constrs ++ destr_variants`.
+    let mut all = constrs;
+    all.extend(destr_variants);
+    minimize_intruder_rules(diff, all)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1221,5 +1446,281 @@ mod tests {
         let out_diff = destruction_rules(true, &rule);
         assert!(!out_diff.is_empty(),
             "diff=true must bypass the closed-rhs guard and emit destructors");
+    }
+
+    // =========================================================================
+    // `dh_intruder_rules` (IntruderRules.hs:230-283 — definition above).
+    //
+    // The expected output for `dh_intruder_rules(false)` is exactly the
+    // contents of `data/intruder_variants_dh.spthy`, which the HS
+    // production pipeline embeds and parses (TheoryLoader.hs:746-759).
+    // That file has:
+    //   * 5 ConstrRules: `_exp` `_inv` `_DH_neutral` `_one` `_mult`
+    //   * 45 `d_exp` (DestrRule "_exp")  destructor variants
+    //   * 1  `d_inv` (DestrRule "_inv")  destructor variant
+    //   = 51 rules total.
+    //
+    // We measured this directly:
+    //   $ grep -c "^rule" data/intruder_variants_dh.spthy
+    //   51
+    //   $ grep -c "^rule (modulo AC) c_" data/intruder_variants_dh.spthy → 5
+    //   $ grep -c "^rule (modulo AC) d_exp" data/intruder_variants_dh.spthy → 45
+    //   $ grep -c "^rule (modulo AC) d_inv" data/intruder_variants_dh.spthy → 1
+    //
+    // The variants enumeration depends on Maude's narrowing
+    // implementation; the exact count is Maude-version-sensitive.  We
+    // assert structural invariants (constructor count, name shapes,
+    // KU/KD wiring) and let a slightly-looser bound check the variants
+    // count, deferring exact byte parity to the corpus probe.
+    // =========================================================================
+
+    fn dh_maude_handle() -> Option<tamarin_term::maude_proc::MaudeHandle> {
+        let path = std::env::var("MAUDE_PATH").ok().or_else(|| {
+            for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+                if std::path::Path::new(c).exists() { return Some(c.to_string()); }
+            }
+            None
+        })?;
+        tamarin_term::maude_proc::MaudeHandle::start(
+            &path, tamarin_term::maude_sig::dh_maude_sig()).ok()
+    }
+
+    /// Helper: extract the bytestring name of a ConstrRule or DestrRule.
+    fn rule_name(info: &IntrRuleACInfo) -> Option<&[u8]> {
+        match info {
+            IntrRuleACInfo::ConstrRule(n) => Some(n.as_slice()),
+            IntrRuleACInfo::DestrRule(n, _, _, _) => Some(n.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// `dh_intruder_rules(false)` returns the 5 hard-coded constructor
+    /// rules (`_exp`, `_inv`, `_DH_neutral`, `_one`, `_mult`) plus a
+    /// non-empty list of destructor variants.  The 5 ConstrRules are
+    /// the immediately-known core; the variant count depends on Maude's
+    /// narrowing enumeration but is at minimum 1 (the identity variant
+    /// of `_exp` or `_inv` survives `applyFilters=True` filters when
+    /// the variant has non-ground conclusions).
+    ///
+    /// HS reference: IntruderRules.hs:230-245.  The cached output at
+    /// `data/intruder_variants_dh.spthy` shows the expected shape (5
+    /// constr + 45 d_exp + 1 d_inv = 51 rules total).
+    #[test]
+    fn dh_intruder_rules_emits_five_constructors_and_some_destructors() {
+        let maude = match dh_maude_handle() { Some(m) => m, None => return };
+        let rules = dh_intruder_rules(false, &maude);
+
+        // 5 ConstrRules with the known names.
+        let names: Vec<&[u8]> = rules.iter()
+            .filter_map(|r| match &r.info {
+                IntrRuleACInfo::ConstrRule(n) => Some(n.as_slice()),
+                _ => None,
+            }).collect();
+        assert_eq!(names.len(), 5,
+            "expected exactly 5 ConstrRules (_exp/_inv/_DH_neutral/_one/_mult); \
+             got: {:?}",
+            names.iter().map(|n| String::from_utf8_lossy(n).to_string()).collect::<Vec<_>>()
+        );
+        // All constructor names start with `_` (HS pack "_" prefix).
+        for n in &names {
+            assert!(n.starts_with(b"_"),
+                "constructor rule name must start with `_` (HS appends pack \"_\" — \
+                 IntruderRules.hs:233-240); got {}",
+                String::from_utf8_lossy(n));
+        }
+        // Specific names present.
+        let name_strings: Vec<&[u8]> = names.iter().copied().collect();
+        for expected in &[&b"_exp"[..], b"_inv", b"_DH_neutral", b"_one", b"_mult"] {
+            assert!(name_strings.contains(expected),
+                "missing constructor rule named {}; got names {:?}",
+                String::from_utf8_lossy(expected),
+                name_strings.iter().map(|n| String::from_utf8_lossy(n).to_string())
+                    .collect::<Vec<_>>());
+        }
+
+        // Destructor rules also present (variants of _exp and _inv).
+        let destrs: Vec<&IntrRuleAC> = rules.iter()
+            .filter(|r| matches!(r.info, IntrRuleACInfo::DestrRule(..)))
+            .collect();
+        assert!(!destrs.is_empty(),
+            "expected at least one DestrRule variant (HS \
+             `variantsIntruder (exp-destr|inv-destr)` produces several); \
+             got 0 destructors out of {} total rules", rules.len());
+        for d in &destrs {
+            let n = rule_name(&d.info).expect("DestrRule has name");
+            assert!(n.starts_with(b"_"),
+                "destructor rule name must start with `_`; got {}",
+                String::from_utf8_lossy(n));
+        }
+    }
+
+    /// The 5 ConstrRules MUST have the HS-specified shape:
+    /// - `_exp` premises: `[KU(x.0), KU(x.1)]`, conc: `KU(exp(x.0, x.1))`
+    /// - `_inv` premises: `[KU(x.0)]`, conc: `KU(inv(x.0))`
+    /// - `_DH_neutral` premises: `[]`, conc: `KU(DH_neutral)`
+    /// - `_one` premises: `[]`, conc: `KU(one)`
+    /// - `_mult` premises: `[KU(x.0), KU(x.1)]`, conc: `KU(x.0 * x.1)`
+    ///
+    /// HS: see expRule/invRule/multRule/oneRule/dhNeutralRule helpers at
+    /// IntruderRules.hs:250-283 — each is `Rule mkInfo prems [concfact]
+    /// (mkAction concfact) []` where `concfact = kudFact conc`.
+    #[test]
+    fn dh_intruder_rules_constructors_have_expected_shape() {
+        let maude = match dh_maude_handle() { Some(m) => m, None => return };
+        let rules = dh_intruder_rules(false, &maude);
+        let find = |name: &[u8]| -> &IntrRuleAC {
+            rules.iter().find(|r| match &r.info {
+                IntrRuleACInfo::ConstrRule(n) => n.as_slice() == name,
+                _ => false,
+            }).unwrap_or_else(|| panic!("no constructor rule named {}",
+                String::from_utf8_lossy(name)))
+        };
+
+        // All constructor rules emit a single action equal to the conclusion
+        // (HS: `mkAction = return`, so `acts = [concfact]`).
+        for name in &[&b"_exp"[..], b"_inv", b"_DH_neutral", b"_one", b"_mult"] {
+            let r = find(name);
+            assert_eq!(r.conclusions.len(), 1, "{}: must have 1 conclusion",
+                String::from_utf8_lossy(name));
+            assert_eq!(r.actions.len(), 1, "{}: HS `return concfact` ⇒ 1 action",
+                String::from_utf8_lossy(name));
+            assert_eq!(r.actions[0], r.conclusions[0],
+                "{}: action must equal conclusion (HS `mkAction concfact` ⇒ \
+                 `[concfact]`)", String::from_utf8_lossy(name));
+            // No `new_vars`.
+            assert!(r.new_vars.is_empty(),
+                "{}: constructors have empty new_vars (HS Rule mkInfo prems concs acts [])",
+                String::from_utf8_lossy(name));
+            // Every fact tag is KU (HS `kudFact = kuFact`).
+            for f in r.premises.iter().chain(&r.conclusions).chain(&r.actions) {
+                assert_eq!(f.tag, FactTag::Ku,
+                    "{}: all facts must be KU (HS `kudFact = kuFact`)",
+                    String::from_utf8_lossy(name));
+            }
+        }
+
+        // Premise counts match HS shape.
+        assert_eq!(find(b"_exp").premises.len(), 2, "_exp: 2 KU premises (HS expRule)");
+        assert_eq!(find(b"_inv").premises.len(), 1, "_inv: 1 KU premise (HS invRule)");
+        assert_eq!(find(b"_DH_neutral").premises.len(), 0, "_DH_neutral: 0 premises");
+        assert_eq!(find(b"_one").premises.len(), 0, "_one: 0 premises");
+        assert_eq!(find(b"_mult").premises.len(), 2, "_mult: 2 KU premises");
+    }
+
+    /// `dh_intruder_rules(true)` (diff mode) skips the subsumption phase
+    /// of `minimizeIntruderRules` — see IntruderRules.hs:188-190:
+    /// ```haskell
+    /// minimizeIntruderRules diff rules =
+    ///     filter (not . isDoublePremiseRule)
+    ///        $ if diff then rules else go [] rules
+    /// ```
+    ///
+    /// Concretely: diff=true should produce AT LEAST as many rules as
+    /// diff=false (the diff filter is weaker — only the double-premise
+    /// filter still applies).
+    #[test]
+    fn dh_intruder_rules_diff_mode_is_at_least_as_large() {
+        let maude = match dh_maude_handle() { Some(m) => m, None => return };
+        let rules_no_diff = dh_intruder_rules(false, &maude);
+        let rules_diff = dh_intruder_rules(true, &maude);
+        assert!(rules_diff.len() >= rules_no_diff.len(),
+            "diff=true skips the subsumption filter (HS IntruderRules.hs:188-190) \
+             — must produce >= rules.  Got diff={}, no-diff={}",
+            rules_diff.len(), rules_no_diff.len());
+        // The 5 constructor rules must still be present in diff mode.
+        let constr_names: Vec<&[u8]> = rules_diff.iter()
+            .filter_map(|r| match &r.info {
+                IntrRuleACInfo::ConstrRule(n) => Some(n.as_slice()),
+                _ => None,
+            }).collect();
+        for expected in &[&b"_exp"[..], b"_inv", b"_DH_neutral", b"_one", b"_mult"] {
+            assert!(constr_names.contains(expected),
+                "diff-mode dh_intruder_rules missing constructor named {}",
+                String::from_utf8_lossy(expected));
+        }
+    }
+
+    /// Destructor rules in `dh_intruder_rules` are KD-rules: their
+    /// first premise (the term-being-deconstructed) has KD tag, the
+    /// conclusion is KD, and actions are empty (HS `mkAction = const []`
+    /// for destructors).
+    #[test]
+    fn dh_intruder_rules_destructors_have_kd_shape() {
+        let maude = match dh_maude_handle() { Some(m) => m, None => return };
+        let rules = dh_intruder_rules(false, &maude);
+        let destrs: Vec<&IntrRuleAC> = rules.iter()
+            .filter(|r| matches!(r.info, IntrRuleACInfo::DestrRule(..)))
+            .collect();
+        assert!(!destrs.is_empty(), "expected at least one destructor variant");
+        for d in &destrs {
+            assert!(!d.premises.is_empty(),
+                "destructor must have premises; got rule with 0 prems");
+            assert_eq!(d.premises[0].tag, FactTag::Kd,
+                "destructor's first premise must be KD (HS `kudFact = kdFact`)");
+            assert_eq!(d.conclusions.len(), 1,
+                "destructor must have exactly 1 KD conclusion");
+            assert_eq!(d.conclusions[0].tag, FactTag::Kd,
+                "destructor conclusion must be KD");
+            assert!(d.actions.is_empty(),
+                "destructor actions must be empty (HS `mkAction = const []`)");
+            assert!(d.new_vars.is_empty(),
+                "destructor new_vars must be empty");
+        }
+    }
+
+    /// Every rule produced by `dh_intruder_rules` has a name starting
+    /// with `_` — the HS `append (pack "_") ...SymString` prefix.  This
+    /// is how HS distinguishes intruder rules from user-defined rules
+    /// with the same name (e.g. user-defined `exp` vs intruder `_exp`).
+    /// Mirrors IntruderRules.hs:233-244, 182, etc.
+    #[test]
+    fn dh_intruder_rules_all_names_have_underscore_prefix() {
+        let maude = match dh_maude_handle() { Some(m) => m, None => return };
+        let rules = dh_intruder_rules(false, &maude);
+        for r in &rules {
+            let n = rule_name(&r.info).expect("DH intruder rule must have a name");
+            assert!(n.starts_with(b"_"),
+                "DH intruder rule name must start with `_` (HS `append (pack \"_\") \
+                 ...SymString`); got {}.  This prefix is how HS distinguishes \
+                 the intruder `_exp` from a user-defined `exp` function.",
+                String::from_utf8_lossy(n));
+        }
+    }
+
+    /// `norm_rule` is the identity on a DH constructor rule whose
+    /// terms are already in normal form (KU(x.0), KU(x.1), KU(exp(x.0, x.1))).
+    /// Mirrors HS `normRule'` (IntruderRules.hs:317-321) — for already-normal
+    /// terms, `norm'` returns the input.
+    #[test]
+    fn norm_rule_identity_on_already_normal_rule() {
+        let maude = match dh_maude_handle() { Some(m) => m, None => return };
+        let rules = dh_intruder_rules(false, &maude);
+        let exp_constr = rules.iter().find(|r| match &r.info {
+            IntrRuleACInfo::ConstrRule(n) => n.as_slice() == b"_exp",
+            _ => false,
+        }).expect("_exp constructor rule must be present");
+        let normalised = norm_rule(&maude, exp_constr);
+        assert_eq!(&normalised, exp_constr,
+            "norm_rule must be the identity on a rule whose terms are \
+             already in normal form (`x.0`, `x.1`, `exp(x.0, x.1)` — no \
+             reducible top-level shapes).  HS: `normRule' = mapTerms norm'`, \
+             and `norm' (x.0) = x.0`.");
+    }
+
+    /// `dh_intruder_rules` rule list is well-formed: every rule has at
+    /// least one conclusion, every fact's terms is non-empty, etc.
+    #[test]
+    fn dh_intruder_rules_well_formed() {
+        let maude = match dh_maude_handle() { Some(m) => m, None => return };
+        let rules = dh_intruder_rules(false, &maude);
+        assert!(!rules.is_empty(), "dh_intruder_rules must produce > 0 rules");
+        for r in &rules {
+            assert!(!r.conclusions.is_empty(),
+                "every dh intruder rule must have at least one conclusion");
+            for f in r.premises.iter().chain(&r.conclusions).chain(&r.actions) {
+                assert!(!f.terms.is_empty(),
+                    "every fact in a dh intruder rule must have non-empty terms");
+            }
+        }
     }
 }
