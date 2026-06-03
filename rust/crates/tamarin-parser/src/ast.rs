@@ -304,6 +304,51 @@ pub enum GoalSpec {
     /// `Goal::Disj` typically lives in `sys.goals`, so the shape
     /// signature is a sufficient discriminator.
     Disj { alts: Vec<DisjAlt> },
+    /// `(#i, n) ~~> (#j, m)` — chain-split goal.  Mirrors HS
+    /// `chainGoal = ChainG <$> (try (nodeConc <* opChain)) <*> nodePrem`
+    /// (Theory/Text/Parser/Proof.hs:59).  `nodeConc`/`nodePrem` parse
+    /// `(<nodevar>, <natural>)` and the operator is `~~>` (HS
+    /// `prettyGoal (ChainG c p)` Constraints.hs:269-270).
+    ///
+    /// We capture the time-var names (e.g. `i`, `j` from `#i`/`#j`)
+    /// and the conclusion / premise indices.  The replay matcher
+    /// disambiguates by these idxs and the time-var ROOT name; LVar
+    /// suffix-idxs are intentionally ignored (skeleton-text indices
+    /// differ from runtime LVar indices — same pattern as Action /
+    /// Premise).
+    Chain {
+        src_var: String,
+        conc_idx: u32,
+        tgt_var: String,
+        prem_idx: u32,
+    },
+    /// `<small> ⊏ <big>` — subterm-split goal.  Mirrors HS
+    /// `stSplitGoal` (Theory/Text/Parser/Proof.hs:63-66):
+    /// ```haskell
+    /// stSplitGoal = do
+    ///   a <- try (termp <* opSubterm)
+    ///   b <- termp
+    ///   return $ SubtermG (a, b)
+    /// ```
+    /// and the pretty-printer at Constraints.hs:281-282 emits
+    /// `<term> ⊏ <term>` (U+228F).
+    ///
+    /// We keep both sides as raw text trimmed of outer whitespace; the
+    /// matcher compares against open `Goal::Subterm((l, r))` by canonical
+    /// pretty-printed text equality.
+    Subterm { small_raw: String, big_raw: String },
+    /// `splitEqs(N)` — equation-split goal.  Mirrors HS `eqSplitGoal`
+    /// (Theory/Text/Parser/Proof.hs:70-72):
+    /// ```haskell
+    /// eqSplitGoal = try $ do
+    ///   symbol_ "splitEqs"
+    ///   parens $ (SplitG . SplitId . fromIntegral) <$> natural
+    /// ```
+    /// and the pretty-printer at Constraints.hs:279-280 emits
+    /// `splitEqs(<i64>)`.  The matcher looks up `Goal::Split(SplitId(N))`
+    /// by exact id — split ids are stable identifiers minted by the
+    /// equation store, not subject to LVar-style renaming.
+    Split { split_id: i64 },
     /// Anything we didn't structurally recognise.  Kept as raw text so
     /// the walker can choose to either (a) fall back to auto-prover or
     /// (b) be extended later to handle it.

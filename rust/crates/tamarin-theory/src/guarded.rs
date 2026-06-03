@@ -2302,6 +2302,66 @@ mod tests {
         }
     }
 
+    /// `gdisj` recursively flattens ARBITRARILY deeply nested `Disj`s.
+    /// Pinpoints commit 105d3f71's behaviour: the HS `gdisj` helper
+    /// `flatten (GDisj disj) = concatMap flatten $ getDisj disj`
+    /// (Guarded.hs:423-435) unwraps every level, not just one.  A prior
+    /// RS version unwrapped only ONE level — a 5-way `∨` parsed as a
+    /// binary-Or chain (`Disj(Disj(Disj(Disj(a, b), c), d), e)`) would
+    /// land as a 2-alt Disj goal instead of HS's 5-alt one.
+    #[test]
+    fn gdisj_deeply_nested_disj_flattens_to_5_alts() {
+        let a = g("Last(#a)").unwrap();
+        let b = g("Last(#b)").unwrap();
+        let c = g("Last(#c)").unwrap();
+        let d = g("Last(#d)").unwrap();
+        let e = g("Last(#e)").unwrap();
+        // Build the left-leaning binary-Or chain
+        // `Disj(Disj(Disj(Disj(a, b), c), d), e)`.
+        let lvl1 = Guarded::Disj(vec![a.clone(), b.clone()]);
+        let lvl2 = Guarded::Disj(vec![lvl1, c.clone()]);
+        let lvl3 = Guarded::Disj(vec![lvl2, d.clone()]);
+        let lvl4 = Guarded::Disj(vec![lvl3, e.clone()]);
+        let out = gdisj(vec![lvl4]);
+        match out {
+            Guarded::Disj(items) => {
+                assert_eq!(items.len(), 5,
+                    "4-level-nested binary-Or chain must flatten to 5 \
+                     alts (HS `flatten` recurses) — got {} alts",
+                    items.len());
+                assert_eq!(items, vec![a, b, c, d, e],
+                    "flatten preserves leaf order (HS uses concatMap)");
+            }
+            other => panic!("expected Disj of 5 items, got {:?}", other),
+        }
+    }
+
+    /// Symmetric: `gconj` recursively flattens deeply nested `Conj`s.
+    /// Mirrors HS Guarded.hs:413-421 `flatten (GConj conj) = concatMap
+    /// flatten $ getConj conj`.
+    #[test]
+    fn gconj_deeply_nested_conj_flattens() {
+        let a = g("Last(#a)").unwrap();
+        let b = g("Last(#b)").unwrap();
+        let c = g("Last(#c)").unwrap();
+        let d = g("Last(#d)").unwrap();
+        let e = g("Last(#e)").unwrap();
+        let lvl1 = Guarded::Conj(vec![a.clone(), b.clone()]);
+        let lvl2 = Guarded::Conj(vec![lvl1, c.clone()]);
+        let lvl3 = Guarded::Conj(vec![lvl2, d.clone()]);
+        let lvl4 = Guarded::Conj(vec![lvl3, e.clone()]);
+        let out = gconj(vec![lvl4]);
+        match out {
+            Guarded::Conj(items) => {
+                assert_eq!(items.len(), 5,
+                    "4-level-nested binary-And chain must flatten to 5 \
+                     conj items — got {}", items.len());
+                assert_eq!(items, vec![a, b, c, d, e]);
+            }
+            other => panic!("expected Conj of 5 items, got {:?}", other),
+        }
+    }
+
     // =========================================================================
     // Haskell-faithfulness invariants for `gnot` and quantifier swap.
     //

@@ -5911,4 +5911,65 @@ mod tests {
             "default_case_name must produce {} distinct names; got {}",
             n, unique.len());
     }
+
+    /// Build a `∀[].[Less #i #j].⊥` GGuarded value — the negated-
+    /// `Less`-of-node-ids idiom HS calls `markAsSolved`+decompose on
+    /// (Reduction.hs:461-486).
+    fn neg_less_node_universal(i_name: &str, j_name: &str) -> Guarded {
+        use crate::guarded::{GAtom, atom_to_gatom_free, Quant};
+        use tamarin_parser::ast::{Atom, SortHint, Term, VarSpec};
+        let mkvar = |n: &str| Term::Var(VarSpec {
+            name: n.to_string(), idx: 0, sort: SortHint::Node, typ: None,
+        });
+        let guard: GAtom = atom_to_gatom_free(&Atom::Less(mkvar(i_name), mkvar(j_name)));
+        Guarded::GGuarded {
+            qua: Quant::All,
+            vars: Vec::new(),
+            guards: vec![guard],
+            body: Box::new(crate::guarded::gfalse()),
+        }
+    }
+
+    /// HS-faithful `markAsSolved = when mark $ modM sSolvedFormulas
+    /// $ S.insert fm` (Reduction.hs:585).  Children of a Conj/Ex body
+    /// recurse via `insert' False`, so a negated-atom universal that
+    /// arrives transitively MUST NOT push into `solved_formulas`.
+    ///
+    /// Commit 42bb9515 gated the four `solved_formulas.push` sites
+    /// (Less-node-id, Eq-node-id, Last, Subterm CR-rules) on `mark`.
+    /// This test exercises the Less-node-id arm:
+    ///   - `insert_formula_inner(_, mark=false)` must leave
+    ///     `solved_formulas` untouched.
+    ///   - `insert_formula_inner(_, mark=true)` (the top-level
+    ///     `insert_formula` entrypoint) must push the formula.
+    /// Both calls produce the same decomposition (`#i = #j ∨ #j < #i`).
+    #[test]
+    fn insert_formula_negated_less_mark_false_does_not_push_solved() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut r = Reduction::new(&ctx, System::empty());
+        let g = neg_less_node_universal("i", "j");
+        assert!(r.sys.solved_formulas.is_empty(),
+            "precondition: solved_formulas starts empty");
+        // mark=false (the Conj/Ex-body-recursion case).
+        r.insert_formula_inner(g.clone(), false);
+        assert!(!r.sys.solved_formulas.contains(&g),
+            "mark=false MUST NOT push the negated-Less universal into \
+             solved_formulas — HS `markAsSolved` is `when mark $ ...` \
+             (Reduction.hs:585).  Pre-fix RS pushed unconditionally, \
+             bumping HS's sSolvedFormulas-count-3 to RS's count-4 on \
+             Yubikey slightly_weaker_invariant.");
+    }
+
+    #[test]
+    fn insert_formula_negated_less_mark_true_pushes_solved() {
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut r = Reduction::new(&ctx, System::empty());
+        let g = neg_less_node_universal("i", "j");
+        // mark=true (the top-level entrypoint).
+        r.insert_formula_inner(g.clone(), true);
+        assert!(r.sys.solved_formulas.contains(&g),
+            "mark=true (top-level `insert_formula`) MUST push the \
+             negated-Less universal into solved_formulas — \
+             HS `markAsSolved` fires (Reduction.hs:585).");
+    }
 }
