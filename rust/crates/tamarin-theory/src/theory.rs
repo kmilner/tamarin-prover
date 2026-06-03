@@ -202,13 +202,20 @@ pub struct LNMacro {
 
 /// Stored proof: either an unproven skeleton (raw text) or a
 /// completed proof tree. We keep this opaque in the typed AST.
+///
+/// `tree` is the structured parse of `raw`, produced by
+/// [`tamarin_parser::parse_proof_tree`].  Used by
+/// `prove::replace_sorry_prove` (the HS `replaceSorryProver` analogue,
+/// HS: Theory/Proof.hs:644-652) to walk the skeleton at proof-replay
+/// time and invoke the auto-prover only at `by sorry` leaves.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProofSkeleton {
     pub raw: String,
+    pub tree: Option<tamarin_parser::ast::ParsedProofTree>,
 }
 
 impl ProofSkeleton {
-    pub fn unproven() -> Self { ProofSkeleton { raw: String::new() } }
+    pub fn unproven() -> Self { ProofSkeleton { raw: String::new(), tree: None } }
 }
 
 /// `TheoryItem` — one top-level construct in a (non-diff) theory.

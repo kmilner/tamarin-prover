@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 use crate::ast::*;
 use crate::lexer::{is_ident_char, Lexer, Pos};
+use crate::proof_tree::parse_proof_tree;
 
 // =============================================================================
 // Errors
@@ -1179,7 +1180,19 @@ impl<'a> Parser<'a> {
         };
         if !starts { self.restore(save); return Ok(None); }
         let raw = self.read_until_next_top_level();
-        Ok(Some(ProofSkeleton { raw }))
+        // Structured parse of `raw`.  Mirrors HS's `startProofSkeleton`
+        // (Theory/Text/Parser/Proof.hs:90-95) which calls `proofSkeleton`
+        // (Proof.hs:98-115) — a recursive descent over
+        // `simplify | solve(...) | induction | by <method> | SOLVED`
+        // with `case <name> ... next ... qed` blocks.  We parse over
+        // the captured raw text rather than the original lexer so the
+        // top-level boundary detection (`read_until_next_top_level`)
+        // controls termination.
+        //
+        // If the structured parse fails we still keep the raw text,
+        // and `replace_sorry_prove` will fall back to the auto-prover.
+        let tree = parse_proof_tree(&raw).ok();
+        Ok(Some(ProofSkeleton { raw, tree }))
     }
 
     /// Peek a possibly-hyphenated identifier without consuming.

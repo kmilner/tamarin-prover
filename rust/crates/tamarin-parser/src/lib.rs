@@ -12,7 +12,9 @@
 pub mod ast;
 pub mod lexer;
 pub mod parser;
+pub mod proof_tree;
 pub mod wf;
 
 pub use ast::*;
 pub use parser::{parse_theory, parse_theory_or_diff, ParseError};
+pub use proof_tree::parse_proof_tree;
