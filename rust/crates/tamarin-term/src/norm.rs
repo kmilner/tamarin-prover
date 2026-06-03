@@ -151,6 +151,276 @@ fn is_zero_constant(t: &LNTerm) -> bool {
     } else { false }
 }
 
+/// `nfViaHaskell` — pure structural normal-form check.  Mirrors HS
+/// `Term/Rewriting/Norm.hs:54-127` (`nfViaHaskell`).  Returns `true`
+/// iff `t` is in normal form according to the structural rules of the
+/// signature, **independent of any AC canonicalisation that Maude
+/// might apply**.  This is critical: a term like `mult(tid, x)` and
+/// `mult(x, tid)` are *both* in normal form by HS's structural check
+/// — neither contains `one`, `DH_neutral`, nested products, or invalid
+/// patterns — even though Maude's `reduce` would canonicalise them to
+/// the same AC form.  Using `maude.reduce(t) == t` as the NF predicate
+/// (the previous Rust behaviour) wrongly flagged AC-reordered terms as
+/// "creates non-normal", over-filtering `simpMinimize` arms in
+/// `substCreatesNonNormalTerms` and causing wrong-verified outcomes on
+/// DH protocols (JKL_TS2_2004{,_KI_wPFS} key-secrecy lemmas).
+///
+/// HS-faithful pattern set (`nfViaHaskell` lines 60-99):
+///   - irreducible top: walk subterms
+///   - reducible exponent / inverse / mult / xor / pmult / emap
+///     patterns: return `false`
+///   - subterm-rule LHS matches: return `false`
+///   - else: walk subterms
+pub fn nf_via_haskell(maude: &MaudeHandle, t: &LNTerm) -> bool {
+    let msig = maude.maude_sig();
+    let irreducible: BTreeSet<&FunSym> = msig.irreducible_fun_syms.iter().collect();
+    go_nf(t, &msig, &irreducible)
+}
+
+fn go_nf(t: &LNTerm, msig: &MaudeSig, irreducible: &BTreeSet<&FunSym>) -> bool {
+    use crate::function_symbols::{
+        AcSym, DH_NEUTRAL_SYM_STRING, EXP_SYM_STRING, INV_SYM_STRING, ONE_SYM_STRING,
+        ZERO_SYM_STRING,
+    };
+    match t {
+        Term::Lit(_) => true,
+        Term::App(sym, args) => {
+            // 1. Irreducible NoEq top: walk subterms.
+            // HS-faithful: HS's `nfViaHaskell` (Norm.hs:62) checks
+            // `FAppNoEq o ts | (NoEq o) \`S.member\` irreducible` — the
+            // irreducible-set check is gated by `FAppNoEq` (i.e. NoEq
+            // function symbols only).  AC symbols like Mult are kept in
+            // `irreducible_fun_syms` for OTHER consumers (Sources.hs:177
+            // `maybeNonNormalTerms` uses `S.member` on the FUN set to
+            // decide which subterms to NOT include), but Norm.hs's NF
+            // check uses pattern matching on `FAppNoEq` which only
+            // matches NoEq symbols.  Without this gate, RS treated
+            // `Mult(tid, ekI, ekR, inv(tid))` as NF (skipped section 5's
+            // invalidMult check entirely), under-filtering
+            // simpMinimize and admitting AC variants HS rejects.
+            // FList also counts as irreducible (HS: `FList ts -> all go ts`).
+            if matches!(sym, FunSym::NoEq(_)) && irreducible.contains(sym) {
+                return args.iter().all(|a| go_nf(a, msig, irreducible));
+            }
+            if matches!(sym, FunSym::List) {
+                return args.iter().all(|a| go_nf(a, msig, irreducible));
+            }
+            // 2. Nullary constants in NF (One, DHNeutral, Zero, NatOne).
+            if let FunSym::NoEq(s) = sym {
+                if args.is_empty()
+                    && (s.name == ONE_SYM_STRING
+                        || s.name == DH_NEUTRAL_SYM_STRING
+                        || s.name == ZERO_SYM_STRING
+                        || s.name == crate::function_symbols::NAT_ONE_SYM_STRING)
+                {
+                    return true;
+                }
+            }
+            // 3. Subterm-rule LHS match → reducible.  HS uses
+            //    `solveMatchLNTerm (t `matchWith` lhs)` (Norm.hs:104-110).
+            //    All builtin subterm rules (pair / senc / sdec / aenc /
+            //    adec / sign / verify / ...) have AC-free LHS, so the
+            //    no-AC matcher is sufficient.  See subterm_rule.rs and
+            //    builtin.rs.
+            for rule in &msig.st_rules {
+                if rule_applies(t, &rule.lhs, &rule.rhs.term) {
+                    return false;
+                }
+            }
+            // 4. Reducible exponent / inverse / mult / xor patterns.
+            if let FunSym::NoEq(s) = sym {
+                if s.name == EXP_SYM_STRING && args.len() == 2 {
+                    // (a ^ b) ^ c → reducible
+                    if let Term::App(FunSym::NoEq(s2), _) = &args[0] {
+                        if s2.name == EXP_SYM_STRING { return false; }
+                    }
+                    // a ^ 1 → reducible
+                    if is_nullary(&args[1], ONE_SYM_STRING) { return false; }
+                    // DH_neutral ^ b → reducible
+                    if is_nullary(&args[0], DH_NEUTRAL_SYM_STRING) { return false; }
+                    // else walk subterms
+                    return go_nf(&args[0], msig, irreducible)
+                        && go_nf(&args[1], msig, irreducible);
+                }
+                if s.name == INV_SYM_STRING && args.len() == 1 {
+                    // inv(inv(_)) → reducible
+                    if let Term::App(FunSym::NoEq(s2), _) = &args[0] {
+                        if s2.name == INV_SYM_STRING { return false; }
+                    }
+                    // inv(mult(...)) where any factor is inverse → reducible
+                    if let Term::App(FunSym::Ac(AcSym::Mult), inner_args) = &args[0] {
+                        if inner_args.iter().any(|f| is_inverse(f)) { return false; }
+                    }
+                    // inv(one) → reducible
+                    if is_nullary(&args[0], ONE_SYM_STRING) { return false; }
+                    return go_nf(&args[0], msig, irreducible);
+                }
+                if s.name == crate::function_symbols::PMULT_SYM_STRING && args.len() == 2 {
+                    // pmult(_, pmult(_,_)) → reducible
+                    if let Term::App(FunSym::NoEq(s2), _) = &args[1] {
+                        if s2.name == crate::function_symbols::PMULT_SYM_STRING { return false; }
+                    }
+                    // pmult(one, _) → reducible
+                    if is_nullary(&args[0], ONE_SYM_STRING) { return false; }
+                    return go_nf(&args[0], msig, irreducible)
+                        && go_nf(&args[1], msig, irreducible);
+                }
+            }
+            // 5. AC-headed reducible patterns.
+            if let FunSym::Ac(ac) = sym {
+                match ac {
+                    AcSym::Mult => {
+                        // contains one / DH_neutral, nested mult, or invalidMult → reducible
+                        if args.iter().any(|a| is_nullary(a, ONE_SYM_STRING)) { return false; }
+                        if args.iter().any(|a| is_nullary(a, DH_NEUTRAL_SYM_STRING)) { return false; }
+                        if args.iter().any(|a| is_product(a)) { return false; }
+                        if invalid_mult(args) { return false; }
+                        return args.iter().all(|a| go_nf(a, msig, irreducible));
+                    }
+                    AcSym::Xor => {
+                        if args.iter().any(|a| is_nullary(a, ZERO_SYM_STRING)) { return false; }
+                        if args.iter().any(|a| is_xor(a)) { return false; }
+                        if invalid_xor(args) { return false; }
+                        return args.iter().all(|a| go_nf(a, msig, irreducible));
+                    }
+                    AcSym::Union | AcSym::NatPlus => {
+                        return args.iter().all(|a| go_nf(a, msig, irreducible));
+                    }
+                }
+            }
+            // 6. C-headed (FEMap) reducible patterns.
+            if let FunSym::C(_) = sym {
+                // em(_, pmult(_,_)) or em(pmult(_,_), _) → reducible
+                if args.len() == 2 {
+                    if let Term::App(FunSym::NoEq(s2), _) = &args[0] {
+                        if s2.name == crate::function_symbols::PMULT_SYM_STRING { return false; }
+                    }
+                    if let Term::App(FunSym::NoEq(s2), _) = &args[1] {
+                        if s2.name == crate::function_symbols::PMULT_SYM_STRING { return false; }
+                    }
+                }
+                return args.iter().all(|a| go_nf(a, msig, irreducible));
+            }
+            // 7. Default fallthrough: walk subterms (HS:
+            //    `FAppNoEq _ ts -> all go ts`, `FAppC _ ts -> all go ts`).
+            args.iter().all(|a| go_nf(a, msig, irreducible))
+        }
+    }
+}
+
+fn is_nullary(t: &LNTerm, name: &[u8]) -> bool {
+    if let Term::App(FunSym::NoEq(s), args) = t {
+        s.name == name && args.is_empty()
+    } else { false }
+}
+
+fn is_inverse(t: &LNTerm) -> bool {
+    use crate::function_symbols::INV_SYM_STRING;
+    if let Term::App(FunSym::NoEq(s), _) = t { s.name == INV_SYM_STRING } else { false }
+}
+
+fn is_product(t: &LNTerm) -> bool {
+    matches!(t, Term::App(FunSym::Ac(AcSym::Mult), _))
+}
+
+fn is_xor(t: &LNTerm) -> bool {
+    matches!(t, Term::App(FunSym::Ac(AcSym::Xor), _))
+}
+
+/// `invalidMult` — HS `Norm.hs:112-118`.  Detects mult patterns that
+/// are not in NF due to inverse cancellation.
+fn invalid_mult(ts: &[LNTerm]) -> bool {
+    use crate::function_symbols::AcSym;
+    // Partition into (inverses, non-inverses).
+    let (inverses, factors): (Vec<&LNTerm>, Vec<&LNTerm>) =
+        ts.iter().partition(|t| is_inverse(t));
+    match inverses.len() {
+        0 => false,
+        1 => {
+            // Single inverse: peel its inner.
+            let inv_arg = match inverses[0] {
+                Term::App(_, a) if !a.is_empty() => &a[0],
+                _ => return false,
+            };
+            // Case: inv(mult(ifactors)) — check ifactors vs factors overlap
+            if let Term::App(FunSym::Ac(AcSym::Mult), ifactors) = inv_arg {
+                let ifactors_refs: Vec<&LNTerm> = ifactors.iter().collect();
+                // (ifactors \\ factors /= ifactors) ||
+                // (factors  \\ ifactors /= factors)
+                // i.e. the multiset-difference removes something on either side.
+                return multiset_diff_changes(&ifactors_refs, &factors)
+                    || multiset_diff_changes(&factors, &ifactors_refs);
+            }
+            // Case: inv(t) — invalid if t `elem` factors.
+            factors.iter().any(|f| **f == *inv_arg)
+        }
+        _ => true, // 2+ inverses → invalid
+    }
+}
+
+/// Returns true iff multiset-difference `xs \\ ys` differs from `xs`,
+/// i.e. at least one element of `xs` is also in `ys`.  Mirrors Haskell
+/// `(\\)` (Data.List) on the underlying multisets.
+fn multiset_diff_changes(xs: &[&LNTerm], ys: &[&LNTerm]) -> bool {
+    let mut consumed: Vec<bool> = vec![false; ys.len()];
+    let mut removed_any = false;
+    for x in xs {
+        for (i, y) in ys.iter().enumerate() {
+            if !consumed[i] && **x == **y {
+                consumed[i] = true;
+                removed_any = true;
+                break;
+            }
+        }
+    }
+    removed_any
+}
+
+/// `invalidXor` — HS `Norm.hs:120-123`.  True iff `ts` contains
+/// duplicates.
+fn invalid_xor(ts: &[LNTerm]) -> bool {
+    // O(n^2) is fine here — typical xor arities are tiny.
+    for i in 0..ts.len() {
+        for j in (i + 1)..ts.len() {
+            if ts[i] == ts[j] { return true; }
+        }
+    }
+    false
+}
+
+/// `struleApplicable` — HS `Norm.hs:104-110`.  Returns true iff the
+/// rule's LHS matches `t` AND the rule actually rewrites `t` to
+/// something different (when the RHS is a constant).
+fn rule_applies(t: &LNTerm, lhs: &LNTerm, rhs: &LNTerm) -> bool {
+    use crate::rewriting::Match;
+    let problem = Match::match_with(t.clone(), lhs.clone());
+    let matched = crate::unification::solve_match_lterm_no_ac(
+        &|n| crate::lterm::sort_of_name(n),
+        problem,
+    );
+    let _ = matched.is_some(); // placeholder
+    // HS: StRhs [] s -> not (t == s) ; StRhs _ _ -> True
+    // The `StRhs [] s` case (RHS is a closed constant — no LHS-positions)
+    // can be detected by checking `frees(rhs).is_empty() && positions_in_lhs == 0`,
+    // but the StRhs struct in RS stores `positions` separately.  For the
+    // builtin rules used in tamarin, RHS is always either a variable that
+    // appears in LHS (e.g. `fst(pair(x,y)) → x`) or a constant.  When it
+    // appears in LHS, rule_applies returning True iff matched.is_some()
+    // is safe (the rewrite always changes `t` because the LHS structure
+    // is decomposed).  When RHS is a constant, returning True iff
+    // matched.is_some() && t != rhs preserves HS's behaviour.
+    match matched {
+        None => false,
+        Some(_) => {
+            if crate::lterm::frees(rhs).is_empty() {
+                t != rhs
+            } else {
+                true
+            }
+        }
+    }
+}
+
 /// Subterms that *might* not be in normal form. Used by
 /// wellformedness / contradiction checks to limit the number of
 /// Maude callouts.
@@ -213,6 +483,33 @@ mod tests {
         let v = LVar::new("x", LSort::Msg, 0);
         let t: LNTerm = Term::Lit(Lit::Var(v));
         assert_eq!(nf_structural(&sig, &t), Some(true));
+    }
+
+    #[test]
+    fn nf_via_haskell_detects_inverse_cancellation() {
+        let path = match maude_path() { Some(p) => p, None => return };
+        let mut sig = crate::maude_sig::pair_maude_sig();
+        sig.enable_dh = true;
+        sig = sig.refresh();
+        let h = MaudeHandle::start(&path, sig.clone()).unwrap();
+        let tid = LVar::new("tid", LSort::Fresh, 0);
+        let ekI = LVar::new("ekI", LSort::Fresh, 0);
+        let ekR = LVar::new("ekR", LSort::Fresh, 0);
+        let tid_term: LNTerm = Term::Lit(Lit::Var(tid.clone()));
+        let ekI_term: LNTerm = Term::Lit(Lit::Var(ekI));
+        let ekR_term: LNTerm = Term::Lit(Lit::Var(ekR));
+        let inv_tid: LNTerm = Term::App(
+            FunSym::NoEq(crate::function_symbols::inv_sym()),
+            vec![tid_term.clone()],
+        );
+        let mult: LNTerm = Term::App(
+            FunSym::Ac(AcSym::Mult),
+            vec![tid_term, ekI_term, ekR_term, inv_tid],
+        );
+        // Test: mult(tid, ekI, ekR, inv(tid)) should NOT be in NF
+        // (invalid_mult fires because tid appears as a factor and inside inv).
+        assert!(!nf_via_haskell(&h, &mult),
+            "mult(tid, ekI, ekR, inv(tid)) should be non-NF");
     }
 
     #[test]
