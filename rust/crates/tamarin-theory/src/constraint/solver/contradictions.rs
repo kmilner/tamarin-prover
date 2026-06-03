@@ -1099,21 +1099,25 @@ pub fn subst_creates_non_normal_terms(
         let t_prime = apply_vterm(&free_subst, t.clone());
         // Fast path: if subst doesn't change the term, it's still NF.
         if &t_prime == t { continue; }
-        // Slow path: call Maude.  If t_prime is in NF, this subst
-        // does NOT create non-normal terms (for this term).
-        match maude.reduce(&t_prime) {
-            Ok(t_red) => {
-                if t_red == t_prime { continue; }
-                // Reduced form differs from t_prime → not NF → CREATES.
-                return true;
+        // Slow path: structural NF check (HS-faithful).  Mirrors HS
+        // `nfApply subst0 t = t == t' || nf' t' \`runReader\` hnd`
+        // where `nf' = nfViaHaskell` (Norm.hs:130-131).  This is a
+        // PURE structural check, NOT `maude.reduce(t) == t`.  The
+        // distinction matters because Maude canonicalises AC operator
+        // arguments (multiset / mult / xor / nat-plus), so
+        // `mult(tid, x)` and `mult(x, tid)` are different `Eq`
+        // representations but both in NF.  The previous Rust check
+        // `match maude.reduce(&t_prime) { Ok(t_red) if t_red == t_prime
+        // => continue, _ => return true }` reported `creates non-normal`
+        // for AC-reordered arms, over-filtering `simpMinimize` and
+        // dropping legitimate `solve_term_eqs` cases in DH protocols
+        // (JKL_TS2_2004{,_KI_wPFS} key-secrecy lemmas).
+        let is_nf = tamarin_term::norm::nf_via_haskell(maude, &t_prime);
+        if !is_nf {
+            if std::env::var("TAM_RS_DBG_SUBST_NF").is_ok() {
+                eprintln!("[rs-subst-nf] CREATES t={:?} t_prime={:?}", t, t_prime);
             }
-            Err(_) => {
-                // Be conservative: if Maude errored we don't know,
-                // assume the subst is OK (matches Haskell's behaviour
-                // where a runReader exception would propagate, but in
-                // practice Maude doesn't error on well-formed terms).
-                continue;
-            }
+            return true;
         }
     }
     false
