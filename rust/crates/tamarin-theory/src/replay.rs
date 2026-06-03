@@ -114,22 +114,18 @@ fn replay_node(
                 status: NodeStatus::Contradictory,
             };
         }
-        // HS `oneStepProver (Finished (Contradictory Nothing))` would
-        // fail here, leaving the original Sorry.  We surface that as
-        // a `Sorry("contradiction expected but none found")` Sorry —
-        // letting the user notice the divergence.
-        return ProofNode {
-            method: ProofMethod::Sorry(Some(
-                "contradiction expected but none found".into(),
-            )),
-            sys,
-            children: BTreeMap::new(),
-            status: NodeStatus::Sorry,
-        };
+        // Runtime doesn't immediately agree with the skeleton's
+        // `by contradiction` claim.  Fall back to the auto-prover (as
+        // documented above in (a)/(b)/(c)) — it will either find a
+        // valid proof or emit Sorry honestly.
+        return run_proof_search(ctx, sys, max_steps);
     }
 
-    // `SOLVED` leaf (HS Proof.hs:102-103) → emit Finished(Solved) if
-    // the system actually has no open goals; else mismatch + Sorry.
+    // `SOLVED` leaf (HS Proof.hs:102-103).  If runtime is_finished
+    // agrees, emit Finished(Solved); else fall back to the auto-prover
+    // (whose run_proof_search may simplify/contract further until it
+    // reaches Solved naturally).  Skeleton's SOLVED is HS's claim;
+    // RS verifies via its own solver.
     if matches!(node.method, ParsedMethod::SolvedLeaf) && node.cases.is_empty() {
         if let Some(MethodResult::Solved) = is_finished(ctx, &sys) {
             return ProofNode {
@@ -139,21 +135,11 @@ fn replay_node(
                 status: NodeStatus::Solved,
             };
         }
-        // HS doesn't ship `SOLVED` annotations on unproven skeletons —
-        // they appear only after a proof completes.  If the runtime
-        // disagrees, the lemma has diverged elsewhere; report Sorry.
-        return ProofNode {
-            method: ProofMethod::Sorry(Some(
-                "SOLVED leaf but runtime not solved".into(),
-            )),
-            sys,
-            children: BTreeMap::new(),
-            status: NodeStatus::Sorry,
-        };
+        return run_proof_search(ctx, sys, max_steps);
     }
 
     // `UNFINISHABLE` leaf — emit Finished(Unfinishable) if runtime
-    // agrees, else Sorry.
+    // agrees, else fall back to auto-prover.
     if matches!(node.method, ParsedMethod::Unfinishable) && node.cases.is_empty() {
         if let Some(MethodResult::Unfinishable) = is_finished(ctx, &sys) {
             return ProofNode {
@@ -163,14 +149,7 @@ fn replay_node(
                 status: NodeStatus::Unfinishable,
             };
         }
-        return ProofNode {
-            method: ProofMethod::Sorry(Some(
-                "UNFINISHABLE leaf but runtime disagrees".into(),
-            )),
-            sys,
-            children: BTreeMap::new(),
-            status: NodeStatus::Sorry,
-        };
+        return run_proof_search(ctx, sys, max_steps);
     }
 
     // ---- Non-leaf nodes: pick a method, exec it, recurse. ----
