@@ -365,6 +365,27 @@ impl ProofContext {
             }
         }
         intruder_rules.extend(crate::intruder_rules::special_intruder_rules(false));
+        // DH intruder variants — port of HS `dhIntruderRules`
+        // (Theory/Tools/IntruderRules.hs:230-283).  In HS, the
+        // production path (TheoryLoader.hs:780,784-789) appends a
+        // PRE-COMPUTED parse of `data/intruder_variants_dh.spthy`
+        // (`mkDhIntruderVariants` → `parseIntruderRules` of the embedded
+        // file).  The Rust port skips the cached-file dance and
+        // re-runs the canonical generator `dh_intruder_rules` here —
+        // exactly what HS's `Main.Mode.Intruder.run` does to PRODUCE
+        // that file in the first place (Main/Mode/Intruder.hs:48).
+        //
+        // Ordering: HS `addMessageDeductionRuleVariants` puts the DH
+        // variants AFTER subterm + special + nat + mset + xor rules
+        // (TheoryLoader.hs:785-791).  Mirror that here.
+        //
+        // CRITICAL: gate on `enable_dh` exactly like HS does
+        // (TheoryLoader.hs:780).
+        if sig.enable_dh {
+            intruder_rules.extend(
+                crate::intruder_rules::dh_intruder_rules(false, &maude)
+            );
+        }
         // Detect injective fact instances ahead of time — mirrors
         // Haskell's `pcInjectiveFactInsts` precomputation.
         let proto_rules: Vec<crate::rule::ProtoRuleE> = rules.iter()
