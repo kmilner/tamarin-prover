@@ -38,6 +38,29 @@ pub fn nf_via_maude(maude: &MaudeHandle, t: &LNTerm) -> Result<bool, MaudeError>
     Ok(&n == t)
 }
 
+/// `normSubstVFresh'` — normalise every range term of a `LNSubstVFresh`
+/// via Maude.
+///
+/// HS canonical (`lib/term/src/Term/Rewriting/Norm.hs:158-159`):
+/// ```haskell
+/// normSubstVFresh' :: LNSubstVFresh -> WithMaude LNSubstVFresh
+/// normSubstVFresh' s = reader $ \hnd ->
+///     mapRangeVFresh (\t -> norm' t `runReader` hnd) s
+/// ```
+///
+/// Behaviour: walk the substitution, replacing each range term with
+/// `norm hnd t` (falling back to the original term on Maude error —
+/// matches the lenient call sites already in the port).
+pub fn norm_subst_vfresh(
+    maude: &MaudeHandle,
+    s: &crate::subst_vfresh::LNSubstVFresh,
+) -> crate::subst_vfresh::LNSubstVFresh {
+    s.map_range(|t| match norm(maude, &t) {
+        Ok(n) => n,
+        Err(_) => t,
+    })
+}
+
 /// Cheap structural NF check. Returns `Some(false)` for terms that
 /// are clearly reducible (e.g. `inv(inv(_))`, `(t1 ^ t2) ^ t3`,
 /// `1 ^ _`, `t * 1`, ...). Returns `Some(true)` if the term is
