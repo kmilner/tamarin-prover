@@ -38,6 +38,7 @@ pub mod guarded_types;
 pub mod predicate_expand;
 pub mod proof_skeleton;
 pub mod prove;
+pub mod replay;
 pub mod state_trace;
 pub mod sapic;
 pub mod signature;

@@ -232,6 +232,25 @@ pub fn prove_lemma(
         ctx.use_induction = crate::constraint::solver::context::UseInduction::UseInduction;
     }
 
+    // HS-faithful `replaceSorryProver` (Proof.hs:644-652):
+    // when the lemma carries a parsed skeleton, walk that skeleton and
+    // invoke the auto-prover only at `by sorry` leaves.  Otherwise (no
+    // skeleton or parser couldn't structure it) fall through to the
+    // pre-existing auto-prover-from-scratch behavior.  Gated by
+    // `TAM_RS_DISABLE_SKELETON_REPLAY` for emergency rollback.
+    let replay_disabled = std::env::var("TAM_RS_DISABLE_SKELETON_REPLAY").is_ok();
+    if !replay_disabled {
+        if let Some(tree) = lemma.proof.tree.clone() {
+            if std::env::var("TAM_DBG_REPLAY").is_ok() {
+                eprintln!("[replay] firing skeleton replay for `{}` (raw {} bytes)",
+                    lemma_name, lemma.proof.raw.len());
+            }
+            return Ok(crate::replay::replace_sorry_prove(&ctx, sys, &tree, max_steps));
+        } else if std::env::var("TAM_DBG_REPLAY").is_ok() {
+            eprintln!("[replay] NO tree on `{}` (raw {} bytes) — falling through to auto-prover",
+                lemma_name, lemma.proof.raw.len());
+        }
+    }
     Ok(run_proof_search(&ctx, sys, max_steps))
 }
 

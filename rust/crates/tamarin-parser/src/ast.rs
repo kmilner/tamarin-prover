@@ -177,9 +177,117 @@ pub enum LemmaAttr {
     Hint(String),
 }
 
+/// Structured skeleton parse — mirrors HS's
+/// `LTree (ProofStep ProofMethod (Maybe System))` produced by
+/// `Theory.Text.Parser.Proof.startProofSkeleton`
+/// (lib/theory/src/Theory/Text/Parser/Proof.hs:90-115).
+///
+/// The skeleton is the *static* tree as written in the `.spthy` source,
+/// before any prover is run; `by sorry` leaves are the placeholders
+/// `replaceSorryProver` (HS: Theory/Proof.hs:644-652) replaces with
+/// auto-prover output at proof-replay time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProofSkeleton {
+    /// Raw source text of the proof skeleton (kept for diagnostics and
+    /// back-compatibility with downstream emitters that haven't been
+    /// migrated yet).
     pub raw: String,
+    /// Structured parse of `raw`.  `None` only if `try_proof_skeleton`
+    /// failed to interpret the token stream (we always set this for
+    /// well-formed proofs).
+    pub tree: Option<ParsedProofTree>,
+}
+
+/// One node of the parsed proof skeleton.
+///
+/// Mirrors HS's `LNode (ProofStep ProofMethod ()) (Map CaseName ProofSkeleton)`
+/// from lib/theory/src/Theory/Text/Parser/Proof.hs:98-115:
+///
+/// ```haskell
+/// proofSkeleton =
+///     solvedProof <|> finalProof <|> interProof
+///   where
+///     solvedProof = symbol "SOLVED" *> pure (LNode (ProofStep (Finished Solved) ()) M.empty)
+///     finalProof = do
+///         method <- symbol "by" *> proofMethod
+///         return (LNode (ProofStep method ()) M.empty)
+///     interProof = do
+///         method <- proofMethod
+///         cases  <- (sepBy oneCase (symbol "next") <* symbol "qed") <|>
+///                   ((return . (,) "") <$> proofSkeleton          )
+///         return (LNode (ProofStep method ()) (M.fromList cases))
+///     oneCase = (,) <$> (symbol "case" *> identifier) <*> proofSkeleton
+/// ```
+///
+/// `cases` retains the source ordering (HS uses `M.fromList` which is
+/// alphabetical, but at replay time the order doesn't matter — we look
+/// each case up by name).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedProofTree {
+    pub method: ParsedMethod,
+    pub cases: Vec<(String, ParsedProofTree)>,
+}
+
+/// Parsed proof method.  Mirrors HS's `ProofMethod` enum (matched by
+/// `Theory.Text.Parser.Proof.proofMethod`, Proof.hs:76-85).  Plus
+/// `Solved` for the `SOLVED` keyword leaf and `Other` for any token
+/// pattern we don't yet recognise.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParsedMethod {
+    /// `by sorry` or `sorry` (HS: `Sorry Nothing`).  This is the
+    /// placeholder `replaceSorryProver` replaces.
+    Sorry,
+    /// `by contradiction` (HS: `Finished (Contradictory Nothing)`).
+    Contradiction,
+    /// `simplify` (HS: `Simplify`).
+    Simplify,
+    /// `induction` (HS: `Induction`).
+    Induction,
+    /// `solve( <goal-text> )` (HS: `SolveGoal <parsed-goal>`).  We
+    /// capture the raw text plus a best-effort parsed `GoalSpec`.
+    SolveGoal(GoalSpec),
+    /// `SOLVED` (HS: `Finished Solved`).
+    SolvedLeaf,
+    /// `UNFINISHABLE` (HS: `Finished Unfinishable`).
+    Unfinishable,
+    /// `INVALIDATED` (HS: `Invalidated`).
+    Invalidated,
+    /// Any other proof-method token we don't yet handle structurally.
+    /// At replay time these fall back to the auto-prover.
+    Other(String),
+}
+
+/// Best-effort parse of the formula inside `solve( ... )`.
+///
+/// The text inside `solve(...)` is one of HS's `goal` parses
+/// (Theory/Text/Parser/Proof.hs:38-72):
+///
+///   - `Fact( ... ) @ #var`        →  ActionG
+///   - `Fact( ... ) ▶<n> #var`     →  PremiseG (subscript-digit shows
+///                                              the premise index)
+///   - chain / disj / subterm / splitEqs  →  Chain/Disj/Subterm/Split
+///
+/// We only build the cheap-to-recognise variants for the two target
+/// lemmas (Action, Premise); everything else lands in `Raw` and the
+/// replay walker falls back to the auto-prover.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GoalSpec {
+    /// `Fact( args... ) @ #ivar` — action goal.
+    Action {
+        fact: Fact,
+        time_var: String,
+    },
+    /// `Fact( args... ) ▶<idx> #ivar` — premise goal.  The premise
+    /// index is the digit after `▶` (UTF-8 ▶₀..▶₉).
+    Premise {
+        fact: Fact,
+        prem_idx: usize,
+        time_var: String,
+    },
+    /// Anything we didn't structurally recognise.  Kept as raw text so
+    /// the walker can choose to either (a) fall back to auto-prover or
+    /// (b) be extended later to handle it.
+    Raw(String),
 }
 
 // =============================================================================
