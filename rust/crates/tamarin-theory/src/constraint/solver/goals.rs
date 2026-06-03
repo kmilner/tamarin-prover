@@ -288,7 +288,7 @@ pub fn rank_goals_with(
             let ku = msg_premise(&a.goal)
                 .map(|t| format!("/KU={:?}", t))
                 .unwrap_or_default();
-            format!("{}{}/use={:?}", kind, ku, a.usefulness)
+            format!("#{}:{}{}/use={:?}", a.seq, kind, ku, a.usefulness)
         }).collect();
         let path = crate::constraint::solver::trace::case_path_string();
         eprintln!("[RS_RANK] precompute={} path={} n={} top={:?}",

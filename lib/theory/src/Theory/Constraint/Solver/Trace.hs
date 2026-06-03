@@ -71,6 +71,7 @@ module Theory.Constraint.Solver.Trace (
   , flagDbgInitSrc
   , traceStateM
   , tracePickM
+  , goalCanonical
   , setCasePath
   , getCasePath
   , casePathString
