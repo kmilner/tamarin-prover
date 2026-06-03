@@ -687,29 +687,55 @@ fn partial_atom_valuation(
         }
         Atom::Last(t) => {
             let n = parser_node_id(t)?;
-            // Haskell:
-            //   isLast sys i                       -> Just True
-            //   any (isInTrace sys) (nodesAfter i) -> Just False
-            //   case sLastAtom of Just j
-            //     | nonUnifiableNodes i j -> Just False
-            //     _                       -> Nothing
+            // Haskell-faithful (Simplify.hs:518-524):
+            //   Last i
+            //     | isLast sys i                       -> Just True
+            //     | any (isInTrace sys) (nodesAfter i) -> Just False
+            //     | otherwise -> case sLastAtom of
+            //         Just j | nonUnifiableNodes i j   -> Just False
+            //         _                                -> Nothing
+            //
+            // `nodesAfter i = filter (i /=) $ reachableSet [i] lessRel`
+            // where `lessRel = sLessAtoms ++ rawEdgeRel`.
+            // `isInTrace` is the 3-clause check (sNodes / isLast /
+            // unsolvedActionAtoms) — see `is_in_trace` above.
+            //
+            // The PRIOR RS version added two non-HS-faithful checks:
+            // "any less_atom with smaller=n → Some(false)" and "any edge
+            // with src=n → Some(false)".  These returned `Some(false)`
+            // even when the successor was just a free variable not in
+            // trace — HS in that case returns `Nothing`.  Concrete
+            // manifestation: YubiSecure slightly_weaker_invariant's IH
+            // 5-way disjunction (`last(#t2) ∨ last(#t1) ∨ ...`) had its
+            // two `last(_)` alts eliminated to `gfalse` here (the bound
+            // variables happened to have less-atoms / edges to other
+            // bound variables not in trace), collapsing the 5-way Disj
+            // to a 3-way one — wrong goal shape vs HS's 5-way.
             if let Some(la) = &sys.last_atom {
                 if la == &n { return Some(true); }
             }
-            // Any node strictly after n that is itself in the trace
-            // means n cannot be last.  We approximate
-            // `nodesAfter` with `always_before` over each node id,
-            // which already reaches transitively via less + edges.
-            for (id, _) in &sys.nodes {
-                if id != &n && sys.always_before(&n, id) { return Some(false); }
+            // Build lessRel = less_atoms ∪ edges-as-less.
+            let less_rel: Vec<(crate::constraint::constraints::NodeId,
+                               crate::constraint::constraints::NodeId)> =
+                sys.less_atoms.iter()
+                    .map(|l| (l.smaller.clone(), l.larger.clone()))
+                    .chain(sys.edges.iter()
+                        .map(|e| (e.src.0.clone(), e.tgt.0.clone())))
+                    .collect();
+            // nodesAfter n = transitive closure from n via less_rel.
+            let mut frontier: Vec<crate::constraint::constraints::NodeId> = vec![n.clone()];
+            let mut seen: std::collections::BTreeSet<_> = [n.clone()].into_iter().collect();
+            while let Some(cur) = frontier.pop() {
+                for (a, b) in &less_rel {
+                    if a == &cur && !seen.contains(b) {
+                        seen.insert(b.clone());
+                        frontier.push(b.clone());
+                    }
+                }
             }
-            // Direct successor (less or edge) — even if not yet a rule
-            // node — also rules out n being last.
-            for l in &sys.less_atoms {
-                if l.smaller == n { return Some(false); }
-            }
-            for e in &sys.edges {
-                if e.src.0 == n { return Some(false); }
+            // Check `any (isInTrace) (nodesAfter n)` (excluding n itself).
+            for j in seen.iter() {
+                if j != &n && is_in_trace(j) { return Some(false); }
             }
             // Final fallback: if there's a recorded last_atom and it's
             // non-unifiable with n, then n cannot be last.
