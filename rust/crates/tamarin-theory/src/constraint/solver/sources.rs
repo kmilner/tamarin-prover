@@ -5499,7 +5499,14 @@ pub fn solve_with_source_cases_action_with_ctx(
             if !use_legacy {
                 let result = apply_source_case_action(
                     ctx, sys, src, &case_sys, goal_node, fa_live);
-                if let Some((mut grafted_sys, live_action)) = result {
+                // refineSubst (`solve_term_eqs SplitNow`) can fan out
+                // into multiple AC-unification arms — HS replicates the
+                // Reduction continuation per arm via `disjunctionOfList
+                // performSplit` (Reduction.hs:776).  Each returned
+                // entry is one arm.  Same `case_label` for all arms;
+                // proof_method.rs::ProofMethod::SolveGoal handles
+                // `_case_N` disambiguation (HS ProofMethod.hs:485-490).
+                for (mut grafted_sys, live_action) in result {
                     if src.incomplete { grafted_sys.used_incomplete_source = true; }
                     if dbg_rt { kept_names.push(case_label.clone()); }
                     // Haskell-faithful: do NOT fan out variant SplitG
@@ -5520,10 +5527,10 @@ pub fn solve_with_source_cases_action_with_ctx(
                     // The previous fan-out produced `Rule_case_N`
                     // siblings that Haskell never has (StatVerif
                     // Resolve1_case_1/2, TLS S_2_case_1/2, etc.).
-                    out.push((case_label, grafted_sys, live_action));
-                    let _ = ctx_opt;
+                    out.push((case_label.clone(), grafted_sys, live_action));
                 }
                 let _ = name;
+                let _ = ctx_opt;
                 continue;
             }
         }
@@ -5688,9 +5695,15 @@ fn auto_resolve_single_case_ku(
         // (the Haskell-faithful `applySource` path).
         let _cases_first = src.cases_or_empty();
         let Some((_, case_sys)) = _cases_first.first() else { break; };
-        let Some((mut grafted, _)) = apply_source_case_action(
-            ctx, sys, src, case_sys, &live_node, &live_fa
-        ) else { break; };
+        // refineSubst can fan out into multiple AC arms (HS
+        // Reduction.hs:773-781).  Take the first arm — this helper is
+        // for the "single case" optimization and Cases() multi-arms
+        // already indicate the simple shortcut path is wrong.  In the
+        // 1-arm case (the common one) this is identical to legacy.
+        let mut arms = apply_source_case_action(
+            ctx, sys, src, case_sys, &live_node, &live_fa);
+        if arms.is_empty() { break; }
+        let (mut grafted, _) = arms.swap_remove(0);
         // Sanity: mark the live KU goal solved if not already.
         let live_goal = Goal::Action(live_node.clone(), live_fa.clone());
         for (g, st) in grafted.goals.iter_mut() {
@@ -6565,6 +6578,30 @@ fn vspec_to_lvar(v: &tamarin_parser::ast::VarSpec) -> Option<tamarin_term::lterm
 ///     insertLess + insertGoalStatus + insertFormula + setNodes +
 ///     addDisj + conjoinSubtermStores + solveSubstEqs +
 ///     substSystem).
+///
+/// ## Return shape
+///
+/// `Vec` because `refineSubst` (`solve_term_eqs SplitNow` here) can fan
+/// out into multiple AC-unification arms — each arm is a distinct
+/// disjunctive sub-case in HS's `refineSource` (Sources.hs:114-138)
+/// because `solveTermEqs SplitNow` calls `disjunctionOfList performSplit`
+/// (Reduction.hs:773-781).  Empty Vec means the case dropped (match-fail,
+/// refineSubst-contradictory, conjoin-fail, etc.).
+///
+/// Multi-arm fan-out semantics: HS's `_applySource` runs in the
+/// `Reduction` monad whose `DisjT` layer replicates the WHOLE remaining
+/// continuation per disjunct.  Concretely, when `solveSubstEqs SplitNow`
+/// inside `refineSubst` produces N AC arms, each arm carries its own
+/// `eq_store` (one of the `performSplit` results) into the subsequent
+/// `substSystem` / `markGoalAsSolved` / `conjoinSystem` steps.  We
+/// mirror that here by re-running the post-`solve_term_eqs` body once
+/// per arm with that arm's eq_store installed.
+///
+/// Case-name disambiguation: callers push `(case_label, sys, fact)` per
+/// returned entry.  When the same `case_label` shows up twice in the
+/// upstream `Vec<(String, System, LNFact)>`, the proof-method dispatcher
+/// (`proof_method.rs`:595-611) appends `_case_N` per HS's
+/// `uniqueListBy ... distinguish` (ProofMethod.hs:485-490).
 fn apply_source_case_action(
     ctx: &crate::constraint::solver::context::ProofContext,
     live_sys: &System,
@@ -6572,7 +6609,7 @@ fn apply_source_case_action(
     case_sys: &System,
     live_node: &crate::constraint::constraints::NodeId,
     fa_live: &crate::fact::LNFact,
-) -> Option<(System, crate::fact::LNFact)> {
+) -> Vec<(System, crate::fact::LNFact)> {
     use crate::constraint::solver::reduction::{
         Reduction, SolveOutcome, SplitStrategy, bounds_max,
     };
@@ -6613,13 +6650,13 @@ fn apply_source_case_action(
     // Pull the abstract `cdGoal` (NodeId + LNFact) out of `src`.
     let (abstract_node_orig, abstract_action_orig) = match &src.goal {
         crate::constraint::constraints::Goal::Action(n, fa) => (n.clone(), fa.clone()),
-        _ => { dbg("src-goal-not-Action"); return None; },
+        _ => { dbg("src-goal-not-Action"); return Vec::new(); },
     };
     if fa_live.tag != abstract_action_orig.tag
         || fa_live.terms.len() != abstract_action_orig.terms.len()
     {
         dbg("tag/arity-mismatch");
-        return None;
+        return Vec::new();
     }
 
     let live_goal_for_trace = crate::constraint::constraints::Goal::Action(
@@ -6735,9 +6772,9 @@ fn apply_source_case_action(
                 let substs_res = ctx.maude.match_eqs(&match_eqs);
                 let mut substs = match substs_res {
                     Ok(s) => s,
-                    Err(_) => { dbg("maude-match-err"); return None; },
+                    Err(_) => { dbg("maude-match-err"); return Vec::new(); },
                 };
-                if substs.is_empty() { dbg("match-empty"); return None; }
+                if substs.is_empty() { dbg("match-empty"); return Vec::new(); }
                 substs.swap_remove(0)
             }
         }
@@ -6795,13 +6832,87 @@ fn apply_source_case_action(
     } else {
         Vec::new()
     };
-    if !term_eqs.is_empty() && !h17_6 {
-        let r = refined.solve_term_eqs(SplitStrategy::SplitNow, &term_eqs);
-        if matches!(r, Err(_) | Ok(SolveOutcome::Contradictory)) {
-            dbg("refineSubst-contradictory");
-            return None;
-        }
-    }
+    // -----------------------------------------------------------------
+    // refineSubst fan-out (HS Reduction.hs:773-781).
+    //
+    // HS's `solveTermEqs SplitNow` calls
+    //     disjunctionOfList $ performSplit eqs2 splitId
+    // when the AC unifier produces multiple disjunctive results.  In the
+    // Reduction monad's `DisjT` layer this replicates the WHOLE remaining
+    // continuation per arm — so each arm carries its own `sEqStore` into
+    // the subsequent `substSystem` / `markGoalAsSolved` / `conjoinSystem`
+    // steps that make up `_applySource` (HS Sources.hs:360-366).
+    //
+    // RS's `solve_term_eqs` returns `SolveOutcome::Cases(arms)` when N>1
+    // AC arms survive per-arm simp; it does NOT install any arm into
+    // `self.sys.eq_store` in that case.  Previously we treated `Cases` as
+    // success and proceeded with `refined.sys` whose eq_store was still
+    // the pre-call value — silently dropping every arm's Fresh-Fresh
+    // bindings.  This caused the DH wrong-verdict cluster (KEA_plus +
+    // 7 siblings): a `~tid → ~ekI`-style binding from one AC arm never
+    // entered the live system, so HS's `Sessk_reveal_case_1` carried a
+    // witness merge that contradicted, while RS's stale-eq-store version
+    // didn't, leaving the lemma's existential reachable.
+    //
+    // Fix: when `Cases(arms)` returns, fan out — re-run the
+    // post-`solve_term_eqs` continuation once per arm with that arm's
+    // eq_store installed.  Each arm produces a distinct output entry; the
+    // upstream caller pushes `(case_label, sys, fact)` per entry and the
+    // proof-method dispatcher (`proof_method.rs`:595-611) handles
+    // `_case_N` disambiguation when two entries share `case_label`,
+    // matching HS's `uniqueListBy ... distinguish` (HS ProofMethod.hs:
+    // 485-490).
+    //
+    // Arm order is preserved from `EquationStore::perform_split`, which
+    // matches HS's `performSplit eqs2 splitId` enumeration order (Maude
+    // unifier result order).
+    let arm_eq_stores: Vec<crate::tools::equation_store::EquationStore> =
+        if term_eqs.is_empty() || h17_6 {
+            // No refineSubst (h17_6 defers it post-conjoin); keep current
+            // eq_store as the sole arm.
+            vec![refined.sys.eq_store.clone()]
+        } else {
+            let outcome = refined.solve_term_eqs(SplitStrategy::SplitNow, &term_eqs);
+            match outcome {
+                Err(_) | Ok(SolveOutcome::Contradictory) => {
+                    dbg("refineSubst-contradictory");
+                    return Vec::new();
+                }
+                Ok(SolveOutcome::Linear(_)) => {
+                    // Single arm: solve_term_eqs already installed it
+                    // into refined.sys.eq_store.  Mirror as a single-arm
+                    // Vec so the post-continuation runs once with that
+                    // store.
+                    vec![refined.sys.eq_store.clone()]
+                }
+                Ok(SolveOutcome::Cases(arms)) => {
+                    if std::env::var("TAM_RS_DBG_APPLY_SRC_FANOUT").is_ok() {
+                        eprintln!("[apply_src_fanout] case={} arms={}",
+                            case_label, arms.len());
+                    }
+                    arms
+                }
+            }
+        };
+
+    // Fork off a per-arm continuation.  Each arm gets its own clone of
+    // the post-refineSubst `refined.sys`, then runs `subst_system` →
+    // `restrict_eq_store_to_stable_vars` → `freshen` → `conjoin` →
+    // `solve_fact_eqs` → `close_trivial_chains` — same flow as before
+    // but per-arm so each arm's eq_store substitutes through the rest
+    // of the case body independently.
+    let post_solve_sys_template = refined.sys.clone();
+    let mut out_arms: Vec<(System, crate::fact::LNFact)> =
+        Vec::with_capacity(arm_eq_stores.len());
+
+    for arm_eq_store in arm_eq_stores {
+        // Install this arm's eq_store into a fresh per-arm Reduction
+        // whose system body is the post-refineSubst template.  This
+        // mirrors HS's `DisjT` replication of the Reduction continuation
+        // (Reduction.hs:776 `disjunctionOfList performSplit`).
+        let mut arm_sys = post_solve_sys_template.clone();
+        arm_sys.eq_store = arm_eq_store;
+        let mut refined = Reduction::new(ctx, arm_sys);
     if std::env::var("TAM_DBG_APPLY_REFINE").is_ok() {
         eprintln!("[apply_refine] case={} POST-solve_term_eqs eq_store entries:", case_label);
         for (v, t) in refined.sys.eq_store.subst.to_list().iter().take(15) {
@@ -6857,7 +6968,7 @@ fn apply_source_case_action(
     }
     if refined.sys.eq_store.is_false() {
         dbg("post-subst-eq-store-false");
-        return None;
+        continue;
     }
     if std::env::var("TAM_DBG_APPLY_REFINE").is_ok() {
         eprintln!("[apply_refine] case={} POST-subst:", case_label);
@@ -7027,7 +7138,7 @@ fn apply_source_case_action(
         });
     let live_action = match live_action_opt {
         Some(la) => la,
-        None => { dbg("no-KU-action-in-freshened-case"); return None; },
+        None => { dbg("no-KU-action-in-freshened-case"); continue; },
     };
 
     // ---------------------------------------------------------------
@@ -7078,7 +7189,7 @@ fn apply_source_case_action(
         });
         crate::state_trace::emit(
             "applySource_drop", Some(&live_goal_for_trace), &r.sys);
-        return None;
+        continue;
     }
 
     // H17.6 (2026-05-28): Defer match-bindings to AFTER conjoin instead
@@ -7095,7 +7206,7 @@ fn apply_source_case_action(
         let res = r.solve_term_eqs(SplitStrategy::SplitNow, &deferred_term_eqs);
         if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
             dbg("h17_6-deferred-term-eqs-contradictory");
-            return None;
+            continue;
         }
     }
 
@@ -7140,7 +7251,7 @@ fn apply_source_case_action(
         if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
             crate::state_trace::emit(
                 "applySource_drop_edge_eqs", Some(&live_goal_for_trace), &r.sys);
-            return None;
+            continue;
         }
         r.subst_system();
     }
@@ -7171,7 +7282,9 @@ fn apply_source_case_action(
 
     crate::state_trace::emit(
         "applySource_out", Some(&live_goal_for_trace), &r.sys);
-    Some((r.sys, live_action))
+    out_arms.push((r.sys, live_action));
+    } // end `for arm_eq_store in arm_eq_stores`
+    out_arms
 }
 
 /// Haskell-faithful `applySource` for Premise goals.  Mirrors
