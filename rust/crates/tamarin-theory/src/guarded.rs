@@ -340,16 +340,31 @@ pub fn reducible_formula(fm: &Guarded) -> bool {
     }
 }
 
-/// Smart `Conj` — flatten one level and short-circuit.
+/// Smart `Conj` — recursively flatten nested `Conj`s and short-circuit.
+/// HS-faithful: mirrors Haskell `gconj` (Guarded.hs:413-421), whose
+/// helper `flatten (GConj conj) = concatMap flatten $ getConj conj`
+/// recursively unwraps every level of nested conjunction.  Prior RS
+/// implementation only unwrapped ONE level, leaving e.g. binary-Or
+/// chains parsed as `Conj(Conj(Conj(a, b), c), d)` only partially
+/// flattened — the runtime then saw a 2-item Conj instead of a 4-item
+/// one, which mismatched HS's case-enumeration shape.
 pub fn gconj(items: Vec<Guarded>) -> Guarded {
+    fn flatten(item: Guarded, out: &mut Vec<Guarded>) -> bool {
+        // returns true if gfalse encountered (absorbs)
+        match item {
+            Guarded::Conj(inner) => {
+                for x in inner {
+                    if flatten(x, out) { return true; }
+                }
+                false
+            }
+            x if x == gfalse() => true,
+            x => { out.push(x); false }
+        }
+    }
     let mut out = Vec::new();
     for it in items {
-        match it {
-            Guarded::Conj(inner) => out.extend(inner),
-            // Conj([gfalse, ...]) = gfalse
-            x if x == gfalse() => return gfalse(),
-            x => out.push(x),
-        }
+        if flatten(it, &mut out) { return gfalse(); }
     }
     // Mirror Haskell `gconj`'s `nub gfs` (Guarded.hs:418).
     let mut deduped: Vec<Guarded> = Vec::with_capacity(out.len());
@@ -498,24 +513,34 @@ pub fn try_gfact_to_fact(f: &GFact) -> Option<p::Fact> {
 /// the order graph) and we'd split a 2-case Disj goal whose branches
 /// both close — Haskell collapses this to `gfalse` directly.
 pub fn gdisj(items: Vec<Guarded>) -> Guarded {
-    let mut out = Vec::new();
-    for it in items {
-        match it {
+    // Recursively flatten nested `Disj`s. HS-faithful: mirrors Haskell
+    // `gdisj` (Guarded.hs:423-435) whose helper
+    // `flatten (GDisj disj) = concatMap flatten $ getDisj disj`
+    // recursively unwraps every level. Prior RS implementation only
+    // unwrapped ONE level, leaving e.g. a 5-way `∨` parsed as a binary
+    // `Or` chain (`Disj(Disj(Disj(Disj(a, b), c), d), e)`) only partially
+    // flattened — the runtime then saw a 2-alt Disj goal instead of the
+    // 5-alt one HS sees, which mismatched the case-enumeration of
+    // skeleton proofs like YubiSecure slightly_weaker_invariant.
+    fn flatten(item: Guarded, out: &mut Vec<Guarded>) -> bool {
+        // returns true if gtrue encountered (absorbs)
+        match item {
             Guarded::Disj(inner) => {
                 for x in inner {
-                    if x == gtrue() { return gtrue(); }
-                    if x == gfalse() { continue; }
-                    out.push(x);
+                    if flatten(x, out) { return true; }
                 }
+                false
             }
-            x if x == gtrue() => return gtrue(),
-            x if x == gfalse() => continue,
-            x => out.push(x),
+            x if x == gtrue() => true,
+            x if x == gfalse() => false,
+            x => { out.push(x); false }
         }
     }
-    // Mirror Haskell `gdisj`'s `nub gfs` (Guarded.hs:432).  Removes
-    // syntactic-equal duplicates while preserving order. Order-preserving
-    // dedup, like `Data.List.nub`.
+    let mut out = Vec::new();
+    for it in items {
+        if flatten(it, &mut out) { return gtrue(); }
+    }
+    // Mirror Haskell `gdisj`'s `nub gfs` (Guarded.hs:432).
     let mut deduped: Vec<Guarded> = Vec::with_capacity(out.len());
     for x in out {
         if !deduped.contains(&x) { deduped.push(x); }
