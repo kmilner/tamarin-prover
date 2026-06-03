@@ -1500,7 +1500,22 @@ impl<'ctx> Reduction<'ctx> {
                         // (N5_u) and simp_injective_fact_eq_mon
                         // closing the i=j branch correctly when
                         // unifying incompatible rule instances.
-                        if !self.sys.solved_formulas.contains(&g) {
+                        //
+                        // HS-faithful: `markAsSolved = when mark $
+                        // modM sSolvedFormulas $ S.insert fm`
+                        // (Reduction.hs:585) — only mark when called
+                        // at the TOP level.  Children of a Conj/Ex
+                        // body recurse with mark=False, so the
+                        // negated-atom CR-rule must NOT mark itself
+                        // solved in that case.  Yubikey
+                        // slightly_weaker_invariant: when the IH-body
+                        // Conj decomposes, the nested ¬Less / ¬Eq
+                        // arrive here with mark=False; HS keeps
+                        // sSolvedFormulas at 3, RS previously bumped
+                        // it to 4 (+ ¬Less, ¬Eq) → IH-Disj reads as
+                        // already-solved, skeleton replay picks the
+                        // wrong open goal.
+                        if mark && !self.sys.solved_formulas.contains(&g) {
                             self.sys.solved_formulas.push(g.clone());
                         }
                         let d = crate::guarded::Guarded::Disj(vec![
@@ -1522,7 +1537,10 @@ impl<'ctx> Reduction<'ctx> {
                         if term_to_node_id(i).is_some() && term_to_node_id(j).is_some() =>
                     {
                         // i = j is false (i,j are node ids) ⇒ i < j ∨ j < i
-                        if !self.sys.solved_formulas.contains(&g) {
+                        // HS-faithful: only mark when called from top-level
+                        // (`mark=True`), mirroring `markAsSolved = when mark
+                        // ...` (Reduction.hs:585).
+                        if mark && !self.sys.solved_formulas.contains(&g) {
                             self.sys.solved_formulas.push(g.clone());
                         }
                         let d = crate::guarded::Guarded::Disj(vec![
@@ -1549,7 +1567,10 @@ impl<'ctx> Reduction<'ctx> {
                         // our earlier guard made `last_atom` get set later
                         // (during simplify) instead — emitting an extra
                         // visible `simplify` step where Haskell shows none.
-                        if !self.sys.solved_formulas.contains(&g) {
+                        // HS-faithful: only mark when called from top-level
+                        // (`mark=True`), mirroring `markAsSolved = when mark
+                        // ...` (Reduction.hs:585).
+                        if mark && !self.sys.solved_formulas.contains(&g) {
                             self.sys.solved_formulas.push(g.clone());
                         }
                         let last_node = match &self.sys.last_atom {
@@ -1580,7 +1601,10 @@ impl<'ctx> Reduction<'ctx> {
                     }
                     AAtom::Subterm(s, b) => {
                         // ¬(s ⊏ b) — record as a negative subterm.
-                        if !self.sys.solved_formulas.contains(&g) {
+                        // HS-faithful: only mark when called from top-level
+                        // (`mark=True`), mirroring `markAsSolved = when mark
+                        // ...` (Reduction.hs:585).
+                        if mark && !self.sys.solved_formulas.contains(&g) {
                             self.sys.solved_formulas.push(g.clone());
                         }
                         if let (Some(ts), Some(tb)) = (
