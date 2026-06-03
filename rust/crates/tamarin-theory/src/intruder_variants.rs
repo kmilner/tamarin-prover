@@ -109,13 +109,22 @@ impl std::error::Error for IntrRuleParseError {}
 ///   . T.unpack . TE.decodeUtf8
 /// ```
 ///
-/// The `_msig` parameter is captured but not currently used: this port's
-/// parser always recognises every builtin operator at the syntactic
-/// level (semantic gating happens during elaboration), so the `setState
-/// (mkStateSig msig)` step is a no-op here.  The argument is retained
-/// to mirror the HS signature.
+/// The `setState (mkStateSig msig)` step is critical: HS's term parser
+/// (Theory/Text/Parser/Term.hs:139-143) dispatches bare identifiers via
+/// `nullaryApp` against `funSyms maudeSig` to distinguish 0-arity NoEq
+/// applications (e.g. `one`, `DH_neutral` for `dhFunSig`) from free
+/// variables.  Without it, the cached DH file's
+/// `[ ] --[ !KU( one ) ]-> [ !KU( one ) ]` rule (intruder_variants_dh.spthy:8)
+/// parses `one` as a Msg-sort variable whose !KU-action unifies with
+/// every KU goal — adding a spurious `c_one` case to every source-case
+/// enumeration and falsely closing branches with `SOLVED // trace found`.
+///
+/// We mirror this here via [`MaudeSigNullaryGuard`], which pushes the
+/// 0-arity NoEq names from `msig` into the `USER_NULLARY_FUNS`
+/// thread-local read by `term_to_lnterm`'s `Var` branch
+/// (elaborate.rs:847-871).  The guard restores the prior state on drop.
 pub fn parse_intruder_rules(
-    _msig: &MaudeSig,
+    msig: &MaudeSig,
     ctxt_desc: &str,
     source: &str,
 ) -> Result<Vec<IntrRuleAC>, IntrRuleParseError> {
@@ -124,6 +133,11 @@ pub fn parse_intruder_rules(
             ctxt_desc: ctxt_desc.to_string(),
             message: e.to_string(),
         })?;
+
+    // Mirror HS `setState (mkStateSig msig)` — make the term-conversion
+    // pass below see the 0-arity NoEq names from `msig` so bare
+    // identifiers like `one` / `DH_neutral` are recognised as constants.
+    let _nullary_guard = elaborate::MaudeSigNullaryGuard::set(msig);
 
     let mut out = Vec::with_capacity(parser_rules.len());
     for r in parser_rules {
@@ -461,6 +475,103 @@ mod tests {
                 "bridge test note: cached DH rule count = {}, runtime = {} \
                  — investigate if today's Maude has drifted from the cached file",
                 cached.len(), runtime.len());
+        }
+    }
+
+    /// Regression test for the `c_one` / `c_DH_neutral` soundness bug
+    /// (commit landing this fix): under `dh_maude_sig()`, the cached
+    /// rule `[ ] --[ !KU( one ) ]-> [ !KU( one ) ]` must produce an
+    /// action term whose ROOT is the 0-arity NoEq application
+    /// `oneSym{}`, NOT a Msg-sort variable named `one`.  HS reference:
+    /// Theory/Text/Parser/Term.hs:139-143 (`nullaryApp` against
+    /// `funSyms maudeSig`) and lib/term/src/Term/Term/FunctionSymbols.hs:163
+    /// (`oneSym = ("one",(0,Public,Constructor))`).
+    ///
+    /// Before the fix, the parser produced a free variable that
+    /// unified with every KU goal — this is the root cause of 8+
+    /// wrong-verdict (`SOLVED // trace found` in RS, `by contradiction`
+    /// in HS) corpus divergences across DH examples.
+    #[test]
+    fn dh_one_and_dh_neutral_parse_as_constants() {
+        use tamarin_term::function_symbols::{
+            DH_NEUTRAL_SYM_STRING, ONE_SYM_STRING,
+        };
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+
+        let rules = mk_dh_intruder_variants(&dh_maude_sig());
+        let c_one = rules.iter().find(|r| match &r.info {
+            IntrRuleACInfo::ConstrRule(n) => n.as_slice() == b"_one",
+            _ => false,
+        }).expect("c_one rule should be present");
+        let c_dh_neutral = rules.iter().find(|r| match &r.info {
+            IntrRuleACInfo::ConstrRule(n) => n.as_slice() == b"_DH_neutral",
+            _ => false,
+        }).expect("c_DH_neutral rule should be present");
+
+        // Each rule has shape `[ ] --[ !KU( <const> ) ]-> [ !KU( <const> ) ]`.
+        // The action and conclusion fact must carry a 0-arity NoEq term
+        // whose name is the canonical sym-string.  Crucially, it must
+        // NOT be a `Term::Lit(Lit::Var(_))` — that was the bug.
+        for (label, rule, expected_name) in [
+            ("c_one", c_one, ONE_SYM_STRING),
+            ("c_DH_neutral", c_dh_neutral, DH_NEUTRAL_SYM_STRING),
+        ] {
+            assert_eq!(rule.actions.len(), 1, "{}: expected one action", label);
+            let action_term = &rule.actions[0].terms[0];
+            match action_term {
+                Term::App(sym, args) => {
+                    if let tamarin_term::function_symbols::FunSym::NoEq(s) = sym {
+                        assert_eq!(s.name.as_slice(), expected_name,
+                            "{}: action term sym name", label);
+                        assert_eq!(s.arity, 0, "{}: action term arity", label);
+                        assert!(args.is_empty(), "{}: action term args", label);
+                    } else {
+                        panic!("{}: expected NoEq sym, got {:?}", label, sym);
+                    }
+                }
+                Term::Lit(Lit::Var(v)) => panic!(
+                    "{}: REGRESSION — action term is a free variable {:?} \
+                     instead of a 0-arity NoEq constant. The `{}` symbol \
+                     was not recognised against the MaudeSig; check that \
+                     `parse_intruder_rules` threads the MaudeSig through \
+                     `MaudeSigNullaryGuard`.",
+                    label, v, String::from_utf8_lossy(expected_name),
+                ),
+                other => panic!("{}: unexpected action term {:?}", label, other),
+            }
+        }
+    }
+
+    /// Counterpart to `dh_one_and_dh_neutral_parse_as_constants`: with
+    /// NO DH builtin enabled, parsing a rule containing a bare `one`
+    /// must NOT magically convert it to a constant — the
+    /// `USER_NULLARY_FUNS` lookup is gated on the MaudeSig.  HS
+    /// behaviour: under `pairMaudeSig`, `funSyms` excludes `oneSym`, so
+    /// `nullaryApp` falls through to `plit` and `one` parses as a
+    /// variable.  Confirms our MaudeSig gating mirrors HS.
+    #[test]
+    fn one_is_var_when_no_dh_builtin_in_maude_sig() {
+        use tamarin_term::maude_sig::pair_maude_sig;
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+
+        let src = "rule (modulo AC) c_test:\n   [ ] --[ !KU( one ) ]-> [ !KU( one ) ]\n";
+        let rules = parse_intruder_rules(&pair_maude_sig(), "<no-dh>", src)
+            .expect("parse_intruder_rules under pair_maude_sig");
+        assert_eq!(rules.len(), 1);
+        let action_term = &rules[0].actions[0].terms[0];
+        match action_term {
+            Term::Lit(Lit::Var(v)) => {
+                assert_eq!(v.name, "one",
+                    "under pair_maude_sig, `one` should remain a Var; HS-equivalent: \
+                     `funSyms pairMaudeSig` does not include `oneSym`");
+            }
+            other => panic!(
+                "expected Var (no DH builtin → MaudeSig has no `one` constant), \
+                 got {:?}",
+                other,
+            ),
         }
     }
 }

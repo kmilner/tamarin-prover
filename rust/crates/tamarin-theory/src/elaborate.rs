@@ -199,18 +199,48 @@ pub fn elaborate(parser_thy: &p::Theory) -> Result<Theory, ElabError> {
     elaborate_already_expanded(&thy_clone)
 }
 
+/// Extracts the 0-arity NoEq function-symbol names from a `MaudeSig`.
+/// Mirrors HS `nullaryApp` (Theory/Text/Parser/Term.hs:139-143):
+///
+/// ```haskell
+/// nullaryApp = do
+///   maudeSig <- sig <$> getState
+///   asum [ try (symbol (BC.unpack sym)) $> fApp fs []
+///        | fs@(NoEq (sym,(0,_,_))) <- S.toList $ funSyms maudeSig ]
+/// ```
+///
+/// HS's parser consults `funSyms maudeSig` when disambiguating a bare
+/// identifier from a free variable.  Our parser is too lexer-driven to
+/// thread the MaudeSig through the parser-state, so we populate the
+/// `USER_NULLARY_FUNS` thread-local with the same names instead.  By
+/// asking the MaudeSig directly here (rather than maintaining a parallel
+/// hand-curated table) we guarantee the set we recognise matches HS's
+/// `funSyms`, e.g. `oneSymString = "one"` and
+/// `dhNeutralSymString = "DH_neutral"` for `dhFunSig`
+/// (lib/term/src/Term/Term/FunctionSymbols.hs:134,137,153,163,192).
+fn builtin_nullary_names_from_msig(msig: &MaudeSig) -> Vec<String> {
+    msig.fun_syms.iter().filter_map(|fs| match fs {
+        tamarin_term::function_symbols::FunSym::NoEq(s) if s.arity == 0 =>
+            String::from_utf8(s.name.clone()).ok(),
+        _ => None,
+    }).collect()
+}
+
 /// Returns the 0-arity function symbol names introduced by a given
-/// `builtins:` declaration.  Mirrors `note_builtin` in the parser and
-/// the Haskell `enableBuiltin` paths.  Used to populate the
-/// `USER_NULLARY_FUNS` thread-local so `term_to_lnterm` can convert
-/// bare identifiers like `true` into 0-arity applications instead of
-/// free Msg-sort variables.
-fn builtin_nullary_constants(name: &str) -> &'static [&'static str] {
-    match name {
-        "diffie-hellman" | "bilinear-pairing" => &["1", "DH_neutral"],
-        "xor" => &["zero"],
-        "signing" | "dest-signing" | "revealing-signing" => &["true"],
-        _ => &[],
+/// `builtins:` declaration name.  Resolves the name to its MaudeSig via
+/// `builtin_sig` and then extracts the 0-arity NoEq names via
+/// [`builtin_nullary_names_from_msig`].  This mirrors HS exactly: a
+/// `builtins: foo` declaration triggers `enableBuiltin foo` which
+/// installs the corresponding `*FunSig` into the parser-state MaudeSig,
+/// and `nullaryApp` then consults that signature.
+///
+/// Returns an empty vector for unknown builtin names (HS would never
+/// reach this point: `enableBuiltin` is exhaustive over the parsed
+/// keywords; unknowns fail at the parser).
+fn builtin_nullary_constants(name: &str) -> Vec<String> {
+    match builtin_sig(name) {
+        Some(msig) => builtin_nullary_names_from_msig(&msig),
+        None => Vec::new(),
     }
 }
 
@@ -314,6 +344,32 @@ pub struct UserFunsForTheoryGuard {
     _unary: UserUnaryFunsGuard,
     _nullary: UserNullaryFunsGuard,
     _private: UserPrivateFunsGuard,
+}
+
+/// RAII guard that swaps in the 0-arity NoEq function-symbol names from
+/// a `MaudeSig` for the duration of a parse, then restores the previous
+/// `USER_NULLARY_FUNS` on drop.  Use this around any call that builds
+/// LNTerms via [`term_to_lnterm`] from a string the user/HS wrote
+/// against a specific MaudeSig (e.g. the cached intruder-variant files
+/// in `data/`).
+///
+/// HS analogue: the parser-state MaudeSig consulted by `nullaryApp`
+/// (Theory/Text/Parser/Term.hs:139-143).  HS sets it via
+/// `setState (mkStateSig msig)` at the top of `parseIntruderRules`
+/// (Theory/Text/Parser/Rule.hs:200-204).
+pub struct MaudeSigNullaryGuard {
+    _nullary: UserNullaryFunsGuard,
+}
+
+impl MaudeSigNullaryGuard {
+    /// Push the 0-arity NoEq names from `msig` into `USER_NULLARY_FUNS`.
+    pub fn set(msig: &MaudeSig) -> Self {
+        let nullary_funs: BTreeSet<String> =
+            builtin_nullary_names_from_msig(msig).into_iter().collect();
+        MaudeSigNullaryGuard {
+            _nullary: UserNullaryFunsGuard::set(nullary_funs),
+        }
+    }
 }
 
 /// Re-collects the user-declared unary / nullary / private function
@@ -881,17 +937,42 @@ pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
             let n = Name::new(NameTag::Nat, s.clone());
             Some(Term::Lit(Lit::Con(n)))
         }
-        p::Term::Number(_) | p::Term::NumberOne | p::Term::NatOne | p::Term::DhNeutral => {
-            // We don't yet model these as LNTerm constants. Use a
-            // public constant placeholder.
-            let s = match t {
-                p::Term::NumberOne => "1",
-                p::Term::NatOne => "1:nat",
-                p::Term::DhNeutral => "DH_neutral",
-                p::Term::Number(_) => "n",
-                _ => "?",
-            };
-            let n = Name::new(NameTag::Pub, s.to_string());
+        p::Term::NumberOne => {
+            // HS `fAppOne = fAppNoEq oneSym []` (Term/Term.hs:127); the
+            // `"1"` keyword in the term parser dispatches to this
+            // (Theory/Text/Parser/Term.hs:130).  Mirror exactly — emit
+            // a 0-arity NoEq application of `oneSym`, NOT a public
+            // constant.  Treating it as `Lit::Con(Pub,"1")` causes
+            // source-case enumeration to mismatch HS's `c_one` rule.
+            Some(f_app_no_eq(
+                tamarin_term::function_symbols::one_sym(),
+                vec![],
+            ))
+        }
+        p::Term::DhNeutral => {
+            // HS `fAppDHNeutral = fAppNoEq dhNeutralSym []` (Term/Term.hs:130);
+            // dispatched by `symbol "DH_neutral" *> pure fAppDHNeutral`
+            // (Theory/Text/Parser/Term.hs:127).
+            Some(f_app_no_eq(
+                tamarin_term::function_symbols::dh_neutral_sym(),
+                vec![],
+            ))
+        }
+        p::Term::NatOne => {
+            // HS `fAppNatOne = fAppNoEq natOneSym []` (Term/Term.hs); the
+            // `1:nat` / `%1` keywords dispatch to this
+            // (Theory/Text/Parser/Term.hs:128-129).
+            Some(f_app_no_eq(
+                tamarin_term::function_symbols::nat_one_sym(),
+                vec![],
+            ))
+        }
+        p::Term::Number(_) => {
+            // Generic numeric literal — surface form `1`, `2`, …  We
+            // don't yet model these as LNTerm constants in a
+            // type-correct way; fall back to a public constant
+            // placeholder.  TODO: model as proper nat / public name.
+            let n = Name::new(NameTag::Pub, "n".to_string());
             Some(Term::Lit(Lit::Con(n)))
         }
         p::Term::App(name, args) => {
