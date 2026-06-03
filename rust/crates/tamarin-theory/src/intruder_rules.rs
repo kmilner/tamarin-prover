@@ -894,6 +894,26 @@ pub fn norm_rule(
 /// all such constraints are solved directly — but the constructors
 /// always appear in the message theory (mirrors HS comment at
 /// IntruderRules.hs:235-237).
+///
+/// # Role: cache REGENERATOR (not the production runtime path)
+///
+/// HS uses this function only inside `Main.Mode.Intruder.run`
+/// (src/Main/Mode/Intruder.hs:48) to PRODUCE `data/intruder_variants_dh.spthy`:
+/// ```haskell
+/// let dhRules = dhIntruderRules False `runReader` dhHnd
+/// ```
+/// The production theory-load path
+/// (`Main.TheoryLoader.addMessageDeductionRuleVariants`,
+/// TheoryLoader.hs:776-791) parses the CACHED file via
+/// `mkDhIntruderVariants` — see [`crate::intruder_variants::mk_dh_intruder_variants`].
+///
+/// The Rust port now also takes the cached-file path in production
+/// (see `constraint::solver::context::ProofContext::new_with_restrictions`,
+/// the `intruder_variants::mk_dh_intruder_variants` call); this
+/// function is retained as the regenerator and is exercised by the
+/// bridge test
+/// `intruder_variants::tests::bridge_runtime_generator_matches_cached_file_on_counts_and_names`,
+/// which flags drift between today's Maude and the cached file.
 pub fn dh_intruder_rules(
     diff: bool,
     maude: &tamarin_term::maude_proc::MaudeHandle,

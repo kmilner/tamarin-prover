@@ -365,25 +365,49 @@ impl ProofContext {
             }
         }
         intruder_rules.extend(crate::intruder_rules::special_intruder_rules(false));
-        // DH intruder variants — port of HS `dhIntruderRules`
-        // (Theory/Tools/IntruderRules.hs:230-283).  In HS, the
-        // production path (TheoryLoader.hs:780,784-789) appends a
-        // PRE-COMPUTED parse of `data/intruder_variants_dh.spthy`
-        // (`mkDhIntruderVariants` → `parseIntruderRules` of the embedded
-        // file).  The Rust port skips the cached-file dance and
-        // re-runs the canonical generator `dh_intruder_rules` here —
-        // exactly what HS's `Main.Mode.Intruder.run` does to PRODUCE
-        // that file in the first place (Main/Mode/Intruder.hs:48).
+        // DH / BP intruder variants — port of HS
+        // `Main.TheoryLoader.addMessageDeductionRuleVariants`
+        // (src/Main/TheoryLoader.hs:776-791):
         //
-        // Ordering: HS `addMessageDeductionRuleVariants` puts the DH
-        // variants AFTER subterm + special + nat + mset + xor rules
-        // (TheoryLoader.hs:785-791).  Mirror that here.
+        // ```haskell
+        // addMessageDeductionRuleVariants thy0
+        //   | enableBP msig = addIntruderVariants
+        //                       [mkDhIntruderVariants, mkBpIntruderVariants]
+        //   | enableDH msig = addIntruderVariants [mkDhIntruderVariants]
+        //   | otherwise     = thy
+        // ```
         //
-        // CRITICAL: gate on `enable_dh` exactly like HS does
-        // (TheoryLoader.hs:780).
-        if sig.enable_dh {
+        // HS's `mkDhIntruderVariants` (TheoryLoader.hs:766-769)
+        // parses the PRE-COMPUTED `data/intruder_variants_dh.spthy`
+        // (Template-Haskell `embedFile`), not the runtime
+        // `dhIntruderRules` generator.  HS's `Main.Mode.Intruder.run`
+        // is what PRODUCES that cache file in the first place
+        // (Main/Mode/Intruder.hs:48), but the production theory-load
+        // path always reads the cache.
+        //
+        // Switching from the runtime generator (previous commit
+        // `2f715f4e`) to the cached-file parser
+        // (`mk_dh_intruder_variants` / `mk_bp_intruder_variants` from
+        // `crate::intruder_variants`) makes us mechanism-identical to
+        // HS.  The runtime generator (`dh_intruder_rules`) is retained
+        // as the regenerator (callable when one wants to refresh the
+        // cache from local Maude); a bridge test in
+        // `intruder_variants.rs` flags any divergence.
+        //
+        // Ordering matches HS exactly: DH BEFORE BP, both AFTER
+        // subterm + special rules.  When BP is enabled HS adds DH
+        // FIRST (the list `[mkDhIntruderVariants, mkBpIntruderVariants]`
+        // — TheoryLoader.hs:777).
+        if sig.enable_bp {
             intruder_rules.extend(
-                crate::intruder_rules::dh_intruder_rules(false, &maude)
+                crate::intruder_variants::mk_dh_intruder_variants(&sig)
+            );
+            intruder_rules.extend(
+                crate::intruder_variants::mk_bp_intruder_variants(&sig)
+            );
+        } else if sig.enable_dh {
+            intruder_rules.extend(
+                crate::intruder_variants::mk_dh_intruder_variants(&sig)
             );
         }
         // Detect injective fact instances ahead of time — mirrors
