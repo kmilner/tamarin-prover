@@ -1208,9 +1208,22 @@ smartRanking ctxt allowPremiseGLoopBreakers sys ags0 =
     let result = (moveNatToEnd . sortOnUsefulness . unmark . sortDecisionTree notSolveLast . sortDecisionTree solveFirst . goalNrRanking) ags0
         dbg = unsafePerformIO $
               maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_DBG_SMART_RANK"
+        -- TAM_HS_DBG_SMART_RANK=1: also dump the FULL sGoals (including
+        -- entries hidden by openGoals filtering — e.g. KU(MsgVar)).
+        allGoalsStr = intercalate " ; "
+            [ "#" ++ show (L.get gsNr st) ++ ":"
+              ++ goalKindStr g
+              ++ (case msgPremise g of
+                    Just t  -> "/KU=" ++ show t
+                    Nothing -> "")
+              ++ (if L.get gsSolved st then "/SOLVED" else "/OPEN")
+            | (g, st) <- M.toList (L.get sGoals sys) ]
     in if dbg
        then trace ("[HS_SMART_RANK] in=" ++ show (length ags0) ++
-                   " head=" ++ show (take 5 (map (goalKindStr . fst) result)))
+                   " head=" ++ show (take 8 (map (goalKindStr . fst) result)) ++
+                   "\n[HS_SMART_RANK_DETAIL] " ++
+                   intercalate " | " (map detailStr (take 8 result)) ++
+                   "\n[HS_SMART_RANK_ALL] " ++ allGoalsStr)
             result
        else result
   where
@@ -1220,6 +1233,39 @@ smartRanking ctxt allowPremiseGLoopBreakers sys ags0 =
     goalKindStr (ActionG _ fa)  = "Action(" ++ show (factTag fa) ++ ")"
     goalKindStr (SplitG _)      = "Split"
     goalKindStr (SubtermG _)    = "Subterm"
+
+    -- TAM_HS_DBG_SMART_RANK detailed per-goal trace: dump goal-nr, kind,
+    -- the KU term (for KU action goals), usefulness, and which slot in
+    -- solveFirst surfaced it (Chain=0..NoLargeSplit=12, -1 = none).
+    detailStr ag@(g, (nr, u)) =
+        "#" ++ show nr ++ ":" ++ goalKindStr g
+        ++ (case msgPremise g of
+              Just t  -> "/KU=" ++ show t
+              Nothing -> "")
+        ++ "/use=" ++ show u
+        ++ "/slot=" ++ slotIdx ag
+
+    -- Index of the first solveFirst predicate that fires for the
+    -- annotated goal ag, or -1 if none fires (i.e. falls through to
+    -- the default tier).  Mirrors solveFirst (ProofMethod.hs:1271-1284).
+    slotIdx ag@(g, _) =
+      let preds =
+            [ ("Chain",          isChainGoal g)
+            , ("Disj",           isDisjGoal g)
+            , ("SolveFirst",     isSolveFirstGoal g)
+            , ("NonLBProto",     isNonLoopBreakerProtoFactGoal ag)
+            , ("StdAction",      isStandardActionGoal g)
+            , ("NotAuthOut",     isNotAuthOut g)
+            , ("PrivKnows",      isPrivateKnowsGoal g)
+            , ("FreshKnows",     isFreshKnowsGoal g)
+            , ("SplitSmall",     isSplitGoalSmall g)
+            , ("MsgOneCase",     isMsgOneCaseGoal g)
+            , ("Signature",      isSignatureGoal g)
+            , ("DoubleExp",      isDoubleExpGoal g)
+            , ("NoLargeSplit",   isNoLargeSplitGoal g) ]
+      in case findIndex snd preds of
+           Just i  -> show i ++ "(" ++ fst (preds !! i) ++ ")"
+           Nothing -> "-1"
 
     oneCaseOnlyRaw = catMaybes . map getMsgOneCase . L.get pcSources $ ctxt
     -- TAM_HS_DBG_ONE_CASE=1: dump the oneCaseOnly symbol set on every

@@ -275,19 +275,24 @@ pub fn rank_goals_with(
     let _result = rank_goals_with_inner(sys, ctx);
     if std::env::var("TAM_RS_DBG_RANK").as_deref() == Ok("1") {
         let in_pre = crate::constraint::solver::sources::in_precompute_mode();
-        let top3: Vec<String> = _result.iter().take(3).map(|a| {
+        let top: Vec<String> = _result.iter().take(8).map(|a| {
             use crate::constraint::constraints::Goal;
-            match &a.goal {
+            let kind = match &a.goal {
                 Goal::Chain(_, _) => "Chain".to_string(),
                 Goal::Disj(_) => "Disj".to_string(),
                 Goal::Premise(_, fa) => format!("Premise({:?})", fa.tag),
                 Goal::Action(_, fa) => format!("Action({:?})", fa.tag),
                 Goal::Split(_) => "Split".to_string(),
                 Goal::Subterm(_) => "Subterm".to_string(),
-            }
+            };
+            let ku = msg_premise(&a.goal)
+                .map(|t| format!("/KU={:?}", t))
+                .unwrap_or_default();
+            format!("{}{}/use={:?}", kind, ku, a.usefulness)
         }).collect();
-        eprintln!("[RS_RANK] precompute={} n={} top3={:?}",
-            in_pre, _result.len(), top3);
+        let path = crate::constraint::solver::trace::case_path_string();
+        eprintln!("[RS_RANK] precompute={} path={} n={} top={:?}",
+            in_pre, path, _result.len(), top);
     }
     _result
 }

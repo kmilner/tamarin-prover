@@ -3858,6 +3858,7 @@ fn solve_all_safe_goals_tracked(
              case_name: &str,
              sys_cand: crate::constraint::system::System,
              case_action: crate::fact::LNFact,
+             live_node: &crate::constraint::constraints::NodeId,
              fa: &crate::fact::LNFact,
              used: &mut std::collections::BTreeSet<String>|
             -> Result<(), ()>
@@ -3897,6 +3898,25 @@ fn solve_all_safe_goals_tracked(
                 }
             }
             red.subst_system();
+            // HS-faithful (Sources.hs:436-438): `_applySource` calls
+            // `markGoalAsSolved "precomputed" goal` BEFORE
+            // `conjoinSystem`.  Narrowed to Fresh-bearing KU terms —
+            // see sibling site for rationale.
+            let has_fresh_var = {
+                use tamarin_term::lterm::{LSort, HasFrees};
+                let mut found = false;
+                fa.for_each_free(&mut |v| {
+                    if v.sort == LSort::Fresh { found = true; }
+                });
+                found
+            };
+            if has_fresh_var {
+                let live_goal = crate::constraint::constraints::Goal::Action(
+                    live_node.clone(), fa.clone());
+                for (g, st) in red.sys.goals.iter_mut() {
+                    if g == &live_goal { st.solved = true; break; }
+                }
+            }
             // Haskell-faithful `filterCases`: track SOURCE LABEL (not
             // case name).  When the source label is unavailable
             // (shouldn't happen for KU goals reaching this point),
@@ -3912,7 +3932,7 @@ fn solve_all_safe_goals_tracked(
         if !backtrack {
             // SINGLE-PICK PATH (default).
             let (case_name, sys, case_action) = unused.into_iter().next().unwrap();
-            if apply_one(red, &case_name, sys, case_action, &fa, used).is_err() {
+            if apply_one(red, &case_name, sys, case_action, &i, &fa, used).is_err() {
                 return outcome;
             }
             continue;
@@ -3953,7 +3973,7 @@ fn solve_all_safe_goals_tracked(
         let saved_sys = red.sys.clone();
         let saved_used = used.clone();
         let saved_changed = red.changed;
-        let first_ok = apply_one(red, &first.0, first.1, first.2, &fa, used).is_ok();
+        let first_ok = apply_one(red, &first.0, first.1, first.2, &i, &fa, used).is_ok();
         if first_ok {
             if dbg {
                 eprintln!("[dm-bt] candidates={:?} picked={} (committed)",
@@ -3968,7 +3988,7 @@ fn solve_all_safe_goals_tracked(
         red.changed = saved_changed;
         let mut any_alt_viable = false;
         for (case_name, sys_cand, case_action) in unused_iter {
-            if apply_one(red, &case_name, sys_cand, case_action, &fa, used).is_ok() {
+            if apply_one(red, &case_name, sys_cand, case_action, &i, &fa, used).is_ok() {
                 any_alt_viable = true;
             }
             red.sys = saved_sys.clone();
@@ -4581,6 +4601,52 @@ fn run_solve_all_safe_goals_disj_with_progress(
                 }
             }
             sub.subst_system();
+
+            // HS-faithful (Sources.hs:438): `_applySource` calls
+            // `markGoalAsSolved "precomputed" goal` BEFORE conjoining
+            // the case body.  The legacy graft path above does the
+            // conjoin via `solve_with_source_cases_action` (which
+            // produces `sys_cand`) but never marks the LIVE KU action
+            // goal solved in the resulting system.  Without this, the
+            // outer saturate packages this system into a source case
+            // carrying an OPEN `KU(~x:Fresh)` entry — which at runtime
+            // becomes a top-ranked goal (slot 7 FreshKnows) before the
+            // sign-KU (slot 10 Signature), causing chaum's
+            // unforgeability proof to take an extra `case fresh` step
+            // HS never takes.  Mirror HS by marking the goal solved
+            // after the case body is merged in.
+            //
+            // NARROWING: only mark when the KU term contains a Fresh
+            // variable.  HS-empirically: pure-public KU terms
+            // (`KU(S(myzero))`, `KU(S(S(myzero)))` in Yubi
+            // Login_reachable) end up dispatched at runtime as
+            // `case c_S` proof steps — HS's saturate-time mark-solved
+            // for these doesn't propagate across the conjoin boundary
+            // (saturate-abstract-node and live-runtime-node never
+            // collide for pure-public terms).  Mark-solved-and-
+            // propagate happens for KU terms carrying a Fresh var
+            // (`KU(~x:Fresh)` in chaum, `KU(pcs(~k))` in StatVerif)
+            // because the substGoals-narrowing path or pair-decomp
+            // path that put them into the live system also reused the
+            // saturate-abstract node-id.  The Fresh-bearing check
+            // approximates this collision pattern faithfully:
+            // pure-public KU terms (where this fix would over-mark)
+            // are exactly those whose runtime node-id doesn't collide.
+            let has_fresh_var = {
+                use tamarin_term::lterm::{LSort, HasFrees};
+                let mut found = false;
+                fa.for_each_free(&mut |v| {
+                    if v.sort == LSort::Fresh { found = true; }
+                });
+                found
+            };
+            if has_fresh_var {
+                let live_goal_action = crate::constraint::constraints::Goal::Action(
+                    i.clone(), fa.clone());
+                for (g, st) in sub.sys.goals.iter_mut() {
+                    if g == &live_goal_action { st.solved = true; break; }
+                }
+            }
 
             // This candidate is viable — push as a new alive branch.
             let mut new_used = used.clone();
