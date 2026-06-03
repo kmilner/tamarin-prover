@@ -853,10 +853,20 @@ mod tests {
     }
 
     /// A `by contradiction` leaf on a system with no contradictions
-    /// must NOT silently emit Finished(Contradictory) — it should emit
-    /// a Sorry with reason.
+    /// must NOT silently emit Finished(Contradictory).  Per the
+    /// post-`bfb0207b` walker contract (replay.rs:108-122), when the
+    /// runtime doesn't agree with the skeleton's `by contradiction`
+    /// claim, the walker falls back to `run_proof_search` — the
+    /// auto-prover then finds whatever the system actually proves
+    /// (or emits Sorry honestly).  Crucially, the walker must NOT
+    /// fabricate a Contradictory status.
+    ///
+    /// On an empty system (no goals, no contradictions) the auto-prover
+    /// recognises the system as trivially Solved.  The key assertion
+    /// is `status != Contradictory` — the original Sorry-emit was
+    /// replaced by auto-prove fallback in `bfb0207b`.
     #[test]
-    fn contradiction_leaf_without_contradiction_is_sorry() {
+    fn contradiction_leaf_without_contradiction_falls_back_to_auto() {
         let h = match maude() { Some(m) => m, None => return };
         let ctx = ProofContext::new(h, Vec::new());
         let mut sys = System::empty();
@@ -867,9 +877,12 @@ mod tests {
             cases: Vec::new(),
         };
         let result = replace_sorry_prove(&ctx, sys, &skel, 50);
-        // No goals, no contradictions → is_finished returns Solved.
-        // contradiction-leaf with non-contradictory runtime → Sorry.
-        assert_eq!(result.status, NodeStatus::Sorry);
+        // No goals, no contradictions → auto-prover recognises Solved.
+        // The pre-`bfb0207b` behaviour emitted Sorry; the new contract
+        // is "fall back to auto-prover, never fabricate Contradictory".
+        assert_ne!(result.status, NodeStatus::Contradictory,
+            "walker must NOT fabricate Contradictory when runtime disagrees");
+        assert_eq!(result.status, NodeStatus::Solved);
     }
 
     /// Match an Action goal by fact name + arity.  Uses an empty-args
