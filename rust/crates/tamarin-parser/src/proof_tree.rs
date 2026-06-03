@@ -25,7 +25,7 @@
 //! formulas) is captured in `Other(text)` / `GoalSpec::Raw(text)` so
 //! the replay walker can fall back to the auto-prover.
 
-use crate::ast::{Fact, GoalSpec, ParsedMethod, ParsedProofTree};
+use crate::ast::{DisjAlt, Fact, GoalSpec, ParsedMethod, ParsedProofTree};
 use crate::lexer::{is_ident_char, Lexer};
 
 #[derive(Debug, Clone)]
@@ -272,19 +272,131 @@ impl<'a> TreeParser<'a> {
 ///     chainGoal, disjSplitGoal, eqSplitGoal ]
 /// ```
 ///
-/// For the two target lemmas (YubiSecure slightly_weaker_invariant and
-/// jcs18 sessions_unique) the only goal kinds appearing in the
-/// skeleton are Action (`Fact(...) @ #t`) and Premise
-/// (`Fact(...) ▶<n> #t`).  Other lemmas may have Disj / Split / Chain
-/// / Subterm — we land those in `GoalSpec::Raw` so the walker can
-/// fall back.
+/// We structurally recognise Action (`Fact(...) @ #t`), Premise
+/// (`Fact(...) ▶<n> #t`), and Disj (`gf1 ∥ gf2 ∥ ...` — HS
+/// `disjSplitGoal`, Proof.hs:61).  Chain / Subterm / Split go to
+/// `GoalSpec::Raw` and the walker falls back.
 pub fn parse_goal_spec(raw: &str) -> GoalSpec {
     let trimmed = raw.trim();
     let mut p = GoalParser { lx: Lexer::new(trimmed) };
     if let Some(spec) = p.try_action_or_premise() {
         return spec;
     }
+    if let Some(spec) = try_disj_split(trimmed) {
+        return spec;
+    }
     GoalSpec::Raw(trimmed.to_string())
+}
+
+/// Try to split the goal-spec text on top-level `∥` (HS U+2225, the
+/// disjunction-split separator).  Returns `GoalSpec::Disj { alts }` if
+/// at least one `∥` appears at top-level (depth-0 of `()/[]/<>/{}`),
+/// classifying each disjunct by its shape (`∀ / ∃ / NonQuant`).
+///
+/// Mirrors HS `disjSplitGoal = (DisjG . Disj) <$> sepBy1 guardedFormula
+/// (symbol "∥")` (Theory/Text/Parser/Proof.hs:61).  HS parses each
+/// disjunct as a full `Guarded` value — we capture only the shape so
+/// we can match against an existing `Goal::Disj` in `sys.goals` at
+/// replay time without rebuilding LVar identities.
+fn try_disj_split(text: &str) -> Option<GoalSpec> {
+    let parts = split_top_level_disj(text);
+    if parts.len() < 2 {
+        return None;
+    }
+    let alts: Vec<DisjAlt> = parts.iter().map(|p| classify_disj_alt(p)).collect();
+    Some(GoalSpec::Disj { alts })
+}
+
+/// Split `s` at top-level `∥` characters (U+2225).  Ignores any `∥`
+/// that lives inside a `()/[]/<>/{}` bracket pair.
+fn split_top_level_disj(s: &str) -> Vec<String> {
+    const SEP: char = '\u{2225}';
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut depth: i32 = 0;
+    for c in s.chars() {
+        match c {
+            '(' | '[' | '{' => { depth += 1; cur.push(c); }
+            ')' | ']' | '}' => { depth -= 1; cur.push(c); }
+            // `<` / `>` are used for tuple syntax inside facts; we don't
+            // need to bracket-track them here because the `∥` separator
+            // never appears inside `<…>`.  Tracking them would break on
+            // `#t1 < #t2` which is a TIMEPOINT-LESS atom, not a tuple.
+            _ if c == SEP && depth == 0 => {
+                out.push(std::mem::take(&mut cur));
+            }
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
+}
+
+/// Classify the shape of one disj-alt — its top-level quantifier, if
+/// any, plus the number of bound variables.  Strips any surrounding
+/// `(...)` so `(∀ x y. …)` and `∀ x y. …` classify identically.
+fn classify_disj_alt(raw: &str) -> DisjAlt {
+    let trimmed = strip_outer_parens(raw.trim());
+    // Look for a leading `∀` (U+2200) or `∃` (U+2203) after stripping
+    // any further whitespace.
+    let t = trimmed.trim_start();
+    if let Some(rest) = t.strip_prefix('\u{2200}') {
+        return DisjAlt::All { n_vars: count_quant_vars(rest) };
+    }
+    if let Some(rest) = t.strip_prefix('\u{2203}') {
+        return DisjAlt::Ex { n_vars: count_quant_vars(rest) };
+    }
+    DisjAlt::NonQuant
+}
+
+/// Strip ONE balanced layer of outer parens.  `"(x ∨ y)"` → `"x ∨ y"`;
+/// `"x ∨ y"` returns unchanged.  Only strips if the opening `(` at
+/// position 0 matches a closing `)` at the very end of the string with
+/// no intermediate depth-0 break.
+fn strip_outer_parens(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'(' || bytes[bytes.len()-1] != b')' {
+        return s;
+    }
+    // Verify the opening `(` matches the FINAL `)` (no depth-drop in between).
+    let mut depth: i32 = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    if i + c.len_utf8() == s.len() {
+                        // The first `(` closes at the last char — safe to strip.
+                        return &s[1..s.len()-1];
+                    }
+                    return s; // Closes early — not a wrapping pair.
+                }
+            }
+            _ => {}
+        }
+    }
+    s
+}
+
+/// Count the number of identifier-like variable names appearing after
+/// a `∀` / `∃` and before the next `.`.  HS's quantifier list is
+/// `\\forall x1 x2 … xN.` — we count whitespace-separated tokens that
+/// look like identifiers (possibly with a leading `#` for nodevars or
+/// `~` for fresh-name vars).  Stops at the first `.` (the
+/// quantifier-body separator).
+fn count_quant_vars(after_qua: &str) -> usize {
+    let mut n = 0usize;
+    let mut in_token = false;
+    for c in after_qua.chars() {
+        if c == '.' { break; }
+        if c == '#' || c == '~' || c == '$' || c == '%' || is_ident_char(c) {
+            if !in_token { n += 1; in_token = true; }
+        } else {
+            in_token = false;
+        }
+    }
+    n
 }
 
 struct GoalParser<'a> {
@@ -551,13 +663,62 @@ mod tests {
 
     #[test]
     fn raw_goalspec_fallback() {
-        // Disjunction / other unrecognised goal shape — should land in
-        // GoalSpec::Raw.
-        let src = "solve( (last(#t1)) \u{2225} (#t1 < #t2) ) by sorry";
+        // Subterm goals (`a ⊏ b`) — not handled yet, should fall back
+        // to GoalSpec::Raw.  Use a single non-disjunctive token.
+        let src = "solve( a \u{228F} b ) by sorry";
         let t = parse_proof_tree(src).expect("parse");
         match &t.method {
             ParsedMethod::SolveGoal(GoalSpec::Raw(_)) => {}
             other => panic!("expected Raw goal-spec, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn solve_disj_two_alts() {
+        // `solve( (last(#t1))  ∥ (#t1 < #t2) )` — two non-quant alts.
+        let src = "solve( (last(#t1)) \u{2225} (#t1 < #t2) ) by sorry";
+        let t = parse_proof_tree(src).expect("parse");
+        match &t.method {
+            ParsedMethod::SolveGoal(GoalSpec::Disj { alts }) => {
+                assert_eq!(alts.len(), 2);
+                assert!(matches!(alts[0], DisjAlt::NonQuant));
+                assert!(matches!(alts[1], DisjAlt::NonQuant));
+            }
+            other => panic!("expected Disj goal-spec, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn solve_disj_quantified_alts() {
+        // Yubikey slightly_weaker_invariant first solve(...) — 2 alts:
+        // ∀-quantified with 7 vars, ∃-quantified with 5 vars.
+        let src = "solve( (\u{2200} pid otc1 tc1 otc2 tc2 #t1 #t2. \
+                          (last(#t1)) \u{2228} (last(#t2))) \u{2225} \
+                          (\u{2203} #t1 #t2 a b c. (last(#t1))) ) by sorry";
+        let t = parse_proof_tree(src).expect("parse");
+        match &t.method {
+            ParsedMethod::SolveGoal(GoalSpec::Disj { alts }) => {
+                assert_eq!(alts.len(), 2);
+                assert_eq!(alts[0], DisjAlt::All { n_vars: 7 });
+                assert_eq!(alts[1], DisjAlt::Ex { n_vars: 5 });
+            }
+            other => panic!("expected Disj goal-spec, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn solve_disj_five_alts() {
+        // Yubikey slightly_weaker_invariant inner solve — 5 non-quant alts.
+        let src = "solve( (last(#t2)) \u{2225} (last(#t1)) \u{2225} \
+                          ((#t1 < #t2) \u{2227} (last(#t3))) \u{2225} \
+                          (#t2 < #t1) \u{2225} (#t1 = #t2) ) by sorry";
+        let t = parse_proof_tree(src).expect("parse");
+        match &t.method {
+            ParsedMethod::SolveGoal(GoalSpec::Disj { alts }) => {
+                assert_eq!(alts.len(), 5);
+                for a in alts.iter() { assert!(matches!(a, DisjAlt::NonQuant)); }
+            }
+            other => panic!("expected Disj goal-spec, got {:?}", other),
         }
     }
 }

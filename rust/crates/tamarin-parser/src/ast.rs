@@ -265,11 +265,12 @@ pub enum ParsedMethod {
 ///   - `Fact( ... ) @ #var`        →  ActionG
 ///   - `Fact( ... ) ▶<n> #var`     →  PremiseG (subscript-digit shows
 ///                                              the premise index)
-///   - chain / disj / subterm / splitEqs  →  Chain/Disj/Subterm/Split
+///   - `gf1 ∥ gf2 ∥ ...`           →  DisjG (Disj [guardedFormula])
+///   - chain / subterm / splitEqs  →  Chain/Subterm/Split
 ///
-/// We only build the cheap-to-recognise variants for the two target
-/// lemmas (Action, Premise); everything else lands in `Raw` and the
-/// replay walker falls back to the auto-prover.
+/// We build the cheap-to-recognise variants (Action, Premise, Disj);
+/// everything else lands in `Raw` and the replay walker falls back to
+/// the auto-prover.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GoalSpec {
     /// `Fact( args... ) @ #ivar` — action goal.
@@ -284,10 +285,47 @@ pub enum GoalSpec {
         prem_idx: usize,
         time_var: String,
     },
+    /// `gf1 ∥ gf2 ∥ ...` — disjunction-split goal.  Mirrors HS
+    /// `disjSplitGoal = (DisjG . Disj) <$> sepBy1 guardedFormula
+    /// (symbol "∥")` (Theory/Text/Parser/Proof.hs:61).
+    ///
+    /// HS parses each disjunct as a full `Guarded` value bearing
+    /// concrete LVar identities, then matches by structural equality
+    /// against the open `Goal::Disj(...)` in `sys.goals` (HS
+    /// ProofMethod.hs:374 `goal `M.member` sGoals`).
+    ///
+    /// We can't reconstruct skeleton-text LVar indices reliably (they
+    /// differ from runtime indices), so we capture each disjunct's
+    /// STRUCTURAL signature (its top-level shape: quantified or not,
+    /// and the number of bound vars).  The replay matcher then looks
+    /// for an open `Goal::Disj` whose `d.0` list has the same length
+    /// and whose entries share the same per-alt shape.  At the points
+    /// where the HS-parsed disjunction would be matched, only ONE open
+    /// `Goal::Disj` typically lives in `sys.goals`, so the shape
+    /// signature is a sufficient discriminator.
+    Disj { alts: Vec<DisjAlt> },
     /// Anything we didn't structurally recognise.  Kept as raw text so
     /// the walker can choose to either (a) fall back to auto-prover or
     /// (b) be extended later to handle it.
     Raw(String),
+}
+
+/// Structural signature of one alt inside a `solve( a ∥ b ∥ … )` text.
+/// See [`GoalSpec::Disj`] for context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DisjAlt {
+    /// `∀ x1 .. xN. …`  — universally quantified alt with `n_vars`
+    /// bound names.
+    All { n_vars: usize },
+    /// `∃ x1 .. xN. …`  — existentially quantified alt with `n_vars`
+    /// bound names.
+    Ex { n_vars: usize },
+    /// Atom, conjunction of atoms, or negated atom — anything that
+    /// does NOT begin with a top-level quantifier.  We don't try to
+    /// match deeper here; the count + shape mix is enough to
+    /// distinguish disjs that co-exist in `sys.goals` at any replay
+    /// point.
+    NonQuant,
 }
 
 // =============================================================================
