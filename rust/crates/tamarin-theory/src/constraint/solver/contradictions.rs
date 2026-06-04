@@ -152,7 +152,14 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
     if has_forbidden_chain(sys) { out.push(Contradiction::ForbiddenChain); }
     if has_forbidden_kd(sys) { out.push(Contradiction::ForbiddenKD); }
     if has_impossible_chain(_ctxt, sys) { out.push(Contradiction::ImpossibleChain); }
-    // Maude-dependent: NonNormalTerms / ForbiddenExp / ForbiddenBP —
+    // HS-faithful port: ForbiddenExp (Contradictions.hs:147 +
+    // 362-388).  Drops Exp-down rule instances whose g is simple,
+    // whose MsgVar args are KU-known earlier, and whose exponent
+    // factors are already in the up-premise.  Gated on enableDH.
+    if _ctxt.maude.maude_sig().enable_dh && has_forbidden_exp(sys) {
+        out.push(Contradiction::ForbiddenExp);
+    }
+    // Maude-dependent: NonNormalTerms / ForbiddenBP —
     // left for the Maude-driven fill.
     out.extend(node_after_last(sys));
     out.extend(non_injective_fact_instances(_ctxt, sys));
@@ -651,6 +658,216 @@ fn has_forbidden_chain(sys: &System) -> bool {
             if sys.always_before(id, &c.0) {
                 return true;
             }
+        }
+    }
+    false
+}
+
+/// HS-faithful port of `hasForbiddenExp`
+/// (`Theory.Constraint.Solver.Contradictions:364-388`).
+///
+/// Detects an `Exp-down` (d_exp) rule instance whose conclusion is
+/// not allowed in a normal dependency graph.
+///
+/// The check: for each node whose rule has shape
+///   [ KD(p1 :: exp(_, _)), KU(b) ] -> [ KD(conc) ]
+/// the rule is forbidden iff
+///   (1) conc has shape `KD(exp(g, c))` AND
+///       - `g` is simple (no fresh names/vars, no private syms)
+///       - all `MsgVar` args of `g` are KU-known earlier than `i`
+///       - every non-inverse factor of `c` is already a factor of `b`
+///         (`niFactors c \\ niFactors b == []`)
+///   OR
+///   (2) conc has shape `KD(g)` (not an exp) AND
+///       - `g` is simple
+///       - all `MsgVar` args of `g` are KU-known earlier than `i`
+///
+/// Without this, RS lets through every variant d_exp chain extend
+/// regardless of whether the resulting destruction is constructible
+/// from the original KU premise — at the saturate step for
+/// `KU(exp(t.1,t.2))`, RS produces 16 cases vs HS's 3, because each
+/// of the 4 surviving d_exp chain-extend variants would be dropped
+/// by ForbiddenExp in HS (verified in agent #11 trace: HS_SAS_CONTRA
+/// shows `[ForbiddenExp]` for 3 of 4 d_exp branches with
+/// cn=["...","d_exp"]).
+fn has_forbidden_exp(sys: &System) -> bool {
+    use crate::fact::FactTag;
+    use crate::rule::{IntrRuleACInfo, RuleInfo};
+    use tamarin_term::function_symbols::{EXP_SYM_STRING, FunSym, AcSym, INV_SYM_STRING};
+    use tamarin_term::lterm::{LNTerm, LSort, is_msg_var, frees, contains_private, sort_of_name};
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+
+    // `niFactors`: HS Term/LTerm.hs:351-355.  The non-inverse
+    // factors of a term.  `Mult(ts...)` → concat-map ni_factors;
+    // `Inv(t)` → ni_factors t; else `[t]`.
+    fn ni_factors(t: &LNTerm) -> Vec<LNTerm> {
+        match t {
+            Term::App(FunSym::Ac(AcSym::Mult), args) => {
+                let mut out = Vec::new();
+                for a in args { out.extend(ni_factors(a)); }
+                out
+            }
+            Term::App(FunSym::NoEq(s), args)
+                if s.name == INV_SYM_STRING && args.len() == 1 =>
+            {
+                ni_factors(&args[0])
+            }
+            _ => vec![t.clone()],
+        }
+    }
+
+    // `isSimpleTerm`: HS Term/LTerm.hs:383-386.
+    // `not (containsPrivate t) && all (LSortFresh /=) (lits t)`.
+    fn is_simple_term(t: &LNTerm) -> bool {
+        if contains_private(t) { return false; }
+        let mut ok = true;
+        let mut visit = |term: &LNTerm| {
+            match term {
+                Term::Lit(Lit::Var(v)) => {
+                    if v.sort == LSort::Fresh { ok = false; }
+                }
+                Term::Lit(Lit::Con(c)) => {
+                    if sort_of_name(c) == LSort::Fresh {
+                        ok = false;
+                    }
+                }
+                _ => {}
+            }
+        };
+        fn walk(t: &LNTerm, f: &mut dyn FnMut(&LNTerm)) {
+            f(t);
+            if let Term::App(_, args) = t {
+                for a in args { walk(a, f); }
+            }
+        }
+        walk(t, &mut visit);
+        ok
+    }
+
+    // `kFactView`: returns (DirTag, term) for KU / KD facts.
+    // DirTag::Up = KU (constructible), DirTag::Dn = KD (destruction).
+    #[derive(Copy, Clone, PartialEq, Eq)]
+    enum DirTag { Up, Dn }
+    fn k_fact_view<'a>(fa: &'a crate::fact::LNFact) -> Option<(DirTag, &'a LNTerm)> {
+        if fa.terms.len() != 1 { return None; }
+        match fa.tag {
+            FactTag::Ku => Some((DirTag::Up, &fa.terms[0])),
+            FactTag::Kd => Some((DirTag::Dn, &fa.terms[0])),
+            _ => None,
+        }
+    }
+    fn view_exp(t: &LNTerm) -> Option<(&LNTerm, &LNTerm)> {
+        if let Term::App(FunSym::NoEq(s), args) = t {
+            if s.name == EXP_SYM_STRING && args.len() == 2 {
+                return Some((&args[0], &args[1]));
+            }
+        }
+        None
+    }
+
+    // `allKUActions`: HS System.hs:1582-1585.  Unions
+    // `unsolvedActionAtoms sys` (open KU goals) and the
+    // `rActs` lists of each node.  Returns (NodeId, fact, term).
+    // For "knownEarlier" we only need (NodeId, term).
+    let mut all_ku: Vec<(NodeId, LNTerm)> = Vec::new();
+    for (g, st) in &sys.goals {
+        if st.solved { continue; }
+        if let crate::constraint::constraints::Goal::Action(i, fa) = g {
+            if matches!(fa.tag, FactTag::Ku) {
+                if let Some(m) = fa.terms.first() {
+                    all_ku.push((i.clone(), m.clone()));
+                }
+            }
+        }
+    }
+    for (id, rule) in &sys.nodes {
+        for fa in &rule.actions {
+            if matches!(fa.tag, FactTag::Ku) {
+                if let Some(m) = fa.terms.first() {
+                    all_ku.push((id.clone(), m.clone()));
+                }
+            }
+        }
+    }
+
+    // Mirror HS `forbiddenDExp` exactly.
+    for (i, ru) in &sys.nodes {
+        // Only intruder DestrRules can be exp-down; cheap pre-filter.
+        if !matches!(&ru.info,
+            RuleInfo::Intr(IntrRuleACInfo::DestrRule(_, _, _, _)))
+        { continue; }
+        if ru.premises.len() != 2 { continue; }
+        if ru.conclusions.len() != 1 { continue; }
+        let p1 = &ru.premises[0];
+        let p2 = &ru.premises[1];
+        let conc = &ru.conclusions[0];
+
+        let (dt1, p1_term) = match k_fact_view(p1) { Some(x) => x, None => continue };
+        if dt1 != DirTag::Dn { continue; }
+        if view_exp(p1_term).is_none() { continue; }
+        let (dt2, b) = match k_fact_view(p2) { Some(x) => x, None => continue };
+        if dt2 != DirTag::Up { continue; }
+
+        let (dtc, conc_term) = match k_fact_view(conc) { Some(x) => x, None => continue };
+        if dtc != DirTag::Dn { continue; }
+
+        // The "earlier MsgVars" set: KU-known terms which are MsgVars
+        // whose node `j` is `alwaysBefore` `i`.
+        let earlier_msg_vars = || -> Vec<LNTerm> {
+            let mut out = Vec::new();
+            for (j, t) in &all_ku {
+                if !is_msg_var(t) { continue; }
+                if sys.always_before(j, i) {
+                    out.push(t.clone());
+                }
+            }
+            out
+        };
+        let all_msg_vars_known_earlier = |g: &LNTerm| -> bool {
+            let mvs = earlier_msg_vars();
+            // `varTerm <$> frees g` then keep only MsgVars.
+            for v in frees(g) {
+                let vt: LNTerm = Term::Lit(Lit::Var(v.clone()));
+                if !is_msg_var(&vt) { continue; }
+                if !mvs.contains(&vt) {
+                    return false;
+                }
+            }
+            true
+        };
+
+        let forbidden = if let Some((g, c)) = view_exp(conc_term) {
+            // (1) conc = exp(g, c): g simple + all msg vars known earlier
+            //     + niFactors c \\ niFactors b == []
+            if !is_simple_term(g) { false }
+            else if !all_msg_vars_known_earlier(g) { false }
+            else {
+                let nfc = ni_factors(c);
+                let nfb = ni_factors(b);
+                // multiset difference: every element of nfc must appear in nfb.
+                let mut nfb_remaining = nfb.clone();
+                let mut all_in_b = true;
+                for x in &nfc {
+                    if let Some(pos) = nfb_remaining.iter().position(|y| y == x) {
+                        nfb_remaining.remove(pos);
+                    } else {
+                        all_in_b = false;
+                        break;
+                    }
+                }
+                all_in_b
+            }
+        } else {
+            // (2) conc = g (not exp-shaped)
+            is_simple_term(conc_term) && all_msg_vars_known_earlier(conc_term)
+        };
+
+        if forbidden {
+            if std::env::var("TAM_RS_DBG_FORBIDDEN_EXP").is_ok() {
+                eprintln!("[FORBIDDEN_EXP] node={:?} ru_concl={:?}", i, conc_term);
+            }
+            return true;
         }
     }
     false
