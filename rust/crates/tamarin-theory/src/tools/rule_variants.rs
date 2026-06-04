@@ -539,8 +539,19 @@ pub fn abstract_rule_and_variants(
     // After splitting, `commonSubst` carries `{z := m}` and the rule's
     // action becomes `Verify(m)` again; the SplitG only carries the
     // RESIDUAL disjuncts that differ between variants.
-    let (common_subst, residual) = crate::tools::equation_store::EquationStore::simp_disjunction(
-        composed_substs, |_, _| false);
+    // HS-faithful: variantsProtoRule (RuleVariants.hs:106) calls
+    // `simpDisjunction hnd ...` with a Maude handle, which routes through
+    // `simp1`'s FULL pipeline including `simpSingleton` (EquationStore.hs:596).
+    // That pass folds a single-variant disj into the free subst — so the
+    // residual returned to `makeRule` is `Nothing` and the variant subst
+    // content gets baked into the rule body via commonSubst.  RS's
+    // `simp_disjunction` (no Maude handle) SKIPS simpSingleton; use the
+    // `_with_maude` variant here to match HS.  Without it, e.g.
+    // JKL_TS1_2004 Init_2 keeps `z.0 → 'g'^lkR; z.1 → 'g'^(lkI*lkR)` in
+    // the residual instead of baking them into the rule's `!Sessk(...)`
+    // conclusion — diverging Sessk_reveal source-case numbering downstream.
+    let (common_subst, residual) = crate::tools::equation_store::EquationStore::simp_disjunction_with_maude(
+        composed_substs, |_, _| false, maude);
 
     // Apply common_subst to the abstracted rule's terms.
     let abstracted_rule = if common_subst.is_empty() {
@@ -605,12 +616,32 @@ pub fn abstract_rule_and_variants(
 
 /// Apply HS-style `renamePrecise` to a rule + its variant disjunction
 /// substs.  Mirrors HS `Precise.evalFresh (renamePrecise x) Precise.nothingUsed`
-/// where x = `(ProtoRuleE, [LNSubstVFresh])`.
+/// applied to a `Rule ProtoRuleACInfo` (variants live INSIDE info).
 ///
-/// `renamePrecise` walks the structure in deterministic order and
-/// re-binds each unique LVar to a freshly-allocated LVar keyed by name.
-/// PreciseFresh's per-name counter ensures different names get
-/// independent idxs (typically 0 for first allocation per name).
+/// HS traversal order (Rule.hs:279-292 `HasFrees (Rule i)`; Rule.hs:485-495
+/// `HasFrees ProtoRuleACInfo`; SubstVFresh.hs:196-202 `HasFrees SubstVFresh`):
+///
+///   mapFrees (Rule i ps cs as nvs) =
+///     Rule <$> mapFrees i  -- variants Disj walked here (KEYS-ONLY)
+///          <*> mapFrees ps
+///          <*> mapFrees cs
+///          <*> mapFrees as
+///          <*> mapFrees nvs
+///
+/// Crucially:
+///   - HS's `HasFrees (SubstVFresh n LVar)` walks ONLY the domain (keys),
+///     never the range (`foldFrees f = foldFrees f . M.keys . svMap`).
+///   - HS's `mapFrees` for `SubstVFresh` likewise only RENAMES keys; the
+///     range terms are passed through unchanged (`mapDomain (v, t) = (,t) <$>
+///     mapFrees f v`).
+///
+/// Past RS bug: walking + renaming subst RANGE introduced extra names into
+/// PreciseFreshState (contaminating per-name counters) and rewrote range
+/// vars HS leaves alone — diverging the abstrTerm-vs-original variable
+/// idxs that downstream `someRuleACInst`'s uniform shift produces, then
+/// flipping AC-sorted variant-subst order, then rotating
+/// performSplit-case numbering. Symptom on JKL_TS1_2004:
+/// `Sessk_reveal_case_3` (RS) vs `Sessk_reveal_case_4` (HS).
 fn rename_precise_rule_with_variants(
     rule: ProtoRuleE,
     substs: Vec<LNSubstVFresh>,
@@ -628,10 +659,19 @@ fn rename_precise_rule_with_variants(
         m.insert(v.clone(), new_v);
     };
 
-    // Phase 1: walk every free LVar in deterministic order to populate
-    // the binding map.  Order matches HS's `mapFrees` traversal of
-    // ProtoRule (premises, conclusions, actions, new_vars) followed by
-    // each constraint disj's substs (dom + range).
+    // Phase 1: walk every free LVar in HS's `mapFrees (Rule ProtoRuleACInfo)`
+    // order. ProtoRuleACInfo (Rule.hs:485-495) walks name|attr|variants|breakers;
+    // name/attr/breakers are empty (RuleAttributes.hs:446-449, etc.), so
+    // effectively variants Disj first (KEYS-ONLY per SubstVFresh.hs:196-202).
+    // THEN prems, concs, acts, new_vars (Rule.hs:279-292).
+    for s in &substs {
+        for (k, _t) in s.to_list() {
+            import(&k, &mut state, &mut map);
+            // Range NOT walked: HS `HasFrees (SubstVFresh n LVar)` is
+            // keys-only.  Walking the range here introduces extra names
+            // and shifts per-name counters away from HS.
+        }
+    }
     for f in &rule.premises {
         for t in &f.terms { t.for_each_free(&mut |v| import(v, &mut state, &mut map)); }
     }
@@ -643,12 +683,6 @@ fn rename_precise_rule_with_variants(
     }
     for t in &rule.new_vars {
         t.for_each_free(&mut |v| import(v, &mut state, &mut map));
-    }
-    for s in &substs {
-        for (k, t) in s.to_list() {
-            import(&k, &mut state, &mut map);
-            t.for_each_free(&mut |v| import(v, &mut state, &mut map));
-        }
     }
 
     if map.is_empty() {
@@ -692,9 +726,11 @@ fn rename_precise_rule_with_variants(
         new_actions,
     ).with_new_vars(new_nvs);
 
+    // HS-faithful: SubstVFresh.hs:199-202 — `mapFrees` only renames the
+    // DOMAIN, leaving the range terms identical (`(,t) <$> mapFrees f v`).
     let new_substs: Vec<LNSubstVFresh> = substs.into_iter().map(|s| {
         let pairs: Vec<(LVar, LNTerm)> = s.to_list().into_iter().map(|(k, t)| {
-            (map_var(&k), map_term(t))
+            (map_var(&k), t)
         }).collect();
         LNSubstVFresh::from_list(pairs)
     }).collect();

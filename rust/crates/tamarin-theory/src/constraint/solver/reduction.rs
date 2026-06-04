@@ -3021,6 +3021,16 @@ fn freshen_rule_with_constrs(
 ) -> (RuleACInst, Option<Vec<tamarin_term::subst_vfresh::LNSubstVFresh>>) {
     use tamarin_term::lterm::{HasFrees, LVar};
     // Combined bounds across rule + constrs.
+    //
+    // HS-faithful: `someRuleACInst` calls `rename` on the whole
+    // `Rule (ProtoInfo i)` where the variants Disj sits INSIDE info.
+    // `rename` uses `boundsVarIdx` (LTerm.hs:642-643), which folds via
+    // `HasFrees`. For `SubstVFresh n LVar` (SubstVFresh.hs:196-198),
+    // `foldFrees f = foldFrees f . M.keys . svMap` — DOMAIN only.
+    // Likewise `mapFrees` (line 199-202) maps the domain and leaves the
+    // range untouched.  RS previously walked + shifted the range too,
+    // producing different idxs on AC-narrowed variants vs HS (e.g.
+    // Mult(lkI.X, lkR.Y) sorted differently than HS's Mult(lkI.N, lkR.N)).
     let mut min = u64::MAX;
     let mut max = 0u64;
     let mut any = false;
@@ -3032,9 +3042,9 @@ fn freshen_rule_with_constrs(
     rule.for_each_free(&mut acc);
     if let Some(cs) = &constrs {
         for s in cs {
-            for (k, v) in s.to_list() {
+            for (k, _v) in s.to_list() {
                 acc(&k);
-                for_each_free_lvar_lnterm(&v, &mut acc);
+                // Range NOT walked (HS-faithful keys-only fold).
             }
         }
     }
@@ -3055,10 +3065,9 @@ fn freshen_rule_with_constrs(
                     sort: k.sort,
                     idx: shift_idx(k.idx),
                 };
-                let new_v = v.map_free(&mut |LVar { name, sort, idx }| LVar {
-                    name, sort, idx: shift_idx(idx),
-                });
-                (new_k, new_v)
+                // HS-faithful: SubstVFresh.hs:199-202 leaves range terms
+                // unchanged — `(,t) <$> mapFrees f v` only maps domain.
+                (new_k, v)
             }).collect();
             tamarin_term::subst_vfresh::LNSubstVFresh::from_list(pairs)
         }).collect()
