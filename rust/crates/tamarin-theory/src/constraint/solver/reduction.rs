@@ -4804,6 +4804,135 @@ impl<'ctx> Reduction<'ctx> {
         let conc_term_is_msg_var = fa_conc.terms.first()
             .map(|t| tamarin_term::lterm::is_msg_var(t))
             .unwrap_or(false);
+        // HS-faithful FUnion special branch (Goals.hs:348-364).  When the
+        // chain conc's KD term is a literal multiset `Union(t1,...,tn)`,
+        // HS bypasses the generic destructor pool and builds bespoke
+        // per-arg destructors `mkDUnionRule args arg_i` for each arg.
+        // Each bespoke rule has premise `KD(Union(t1..tn))` (identical
+        // to faConc by construction — no AC unification, no fanout) and
+        // conclusion `KD(arg_i)`.  This produces one case per arg with
+        // no AC-induced sibling cases.
+        //
+        // Without this branch, RS routes `KD(Union(...))` through the
+        // generic multiset destructor `mkDUnionRule [x_var,y_var] x_var`
+        // in `multiset_intruder_rules` — AC unification of `KD(x++y)`
+        // against `KD(~x++y)` produces 2 matchings (x↦~x,y↦y) and
+        // (x↦y,y↦~x), giving two `_case_1`/`_case_2` siblings that HS
+        // produces as a single case.  Manifests in
+        // `issue519.spthy::secret_freshVar` / `::secret_msgVar`.
+        let funion_args: Option<Vec<tamarin_term::lterm::LNTerm>> = match fa_conc.terms.first() {
+            Some(tamarin_term::term::Term::App(
+                tamarin_term::function_symbols::FunSym::Ac(
+                    tamarin_term::function_symbols::AcSym::Union),
+                args)) if args.len() >= 2 => Some(args.clone()),
+            _ => None,
+        };
+        if let Some(args) = funion_args {
+            use tamarin_term::function_symbols::UNION_SYM_STRING;
+            let avoid_max = bounds_max(&self.sys);
+            let mut next_node_idx = avoid_max.saturating_add(1);
+            let xy_union = tamarin_term::term::Term::App(
+                tamarin_term::function_symbols::FunSym::Ac(
+                    tamarin_term::function_symbols::AcSym::Union),
+                args.clone(),
+            );
+            let mut union_name = b"_".to_vec();
+            union_name.extend_from_slice(UNION_SYM_STRING);
+            for arg_i in &args {
+                // Build HS `mkDUnionRule args arg_i`:
+                //   Rule (DestrRule "_union" 0 True False)
+                //        [kdFact (Union args)] [kdFact arg_i] [] []
+                let ir = crate::rule::IntrRuleAC::new(
+                    crate::rule::IntrRuleACInfo::DestrRule(
+                        union_name.clone(), 0, true, false),
+                    vec![crate::fact::kd_fact(xy_union.clone())],
+                    vec![crate::fact::kd_fact(arg_i.clone())],
+                    vec![],
+                );
+                let ru_inst = intr_rule_to_rule_ac_inst(ir);
+                // HS allocates a fresh LVar via `freshLVar "vr" LSortNode`
+                // (Goals.hs:352) — no labelNodeId/exploitPrems wrapping
+                // since the rule has no Fresh/IRecv premises.  The premise
+                // is `KD(Union(args))` which exactly equals `faConc` by
+                // construction, so `insertEdges chain_extend` does no
+                // AC fanout.
+                let new_node = tamarin_term::lterm::LVar::new(
+                    "vr",
+                    tamarin_term::lterm::LSort::Node,
+                    next_node_idx,
+                );
+                next_node_idx = next_node_idx.saturating_add(1);
+                let mut sys_clone = self.sys.clone();
+                sys_clone.add_node(new_node.clone(), ru_inst.clone());
+                let mut sub = Reduction::new(self.ctx, sys_clone);
+                // HS `extendAndMark i ru v faPrem faConc` (Goals.hs:384-388):
+                //   insertEdgesLabeled "chain_extend" [(c, faConc, faPrem, (i, v))]
+                //   markGoalAsSolved "directly" (PremiseG (i, v) faPrem)
+                //   insertChain (i, ConcIdx 0) p
+                let res = sub.insert_edge_labeled(
+                    "chain_extend",
+                    crate::constraint::constraints::Edge {
+                        src: c.clone(),
+                        tgt: (new_node.clone(), crate::rule::PremIdx(0)),
+                    },
+                );
+                if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
+                    continue;
+                }
+                let case_name = rule_case_name(&ru_inst);
+                let post_edge_sys = sub.sys.clone();
+                let arm_systems: Vec<crate::constraint::system::System> = match res {
+                    Ok(SolveOutcome::Cases(arms)) => {
+                        arms.into_iter().map(|arm_eq| {
+                            let mut s = post_edge_sys.clone();
+                            s.eq_store = arm_eq;
+                            s
+                        }).collect()
+                    }
+                    _ => vec![post_edge_sys],
+                };
+                let prem0 = match ru_inst.premises.first() {
+                    Some(f) => f.clone(),
+                    None => continue,
+                };
+                for mut arm_sys in arm_systems {
+                    let mut arm_sub = Reduction::new(self.ctx, arm_sys);
+                    arm_sub.mark_goal_as_solved(&Goal::Premise(
+                        (new_node.clone(), crate::rule::PremIdx(0)),
+                        prem0.clone(),
+                    ));
+                    arm_sub.insert_goal(Goal::Chain(
+                        (new_node.clone(), crate::rule::ConcIdx(0)),
+                        p.clone(),
+                    ));
+                    arm_sys = arm_sub.sys;
+                    for (existing, status) in arm_sys.goals.iter_mut() {
+                        if existing == &g && !status.solved {
+                            status.solved = true;
+                            break;
+                        }
+                    }
+                    if trace_chains {
+                        eprintln!("[RS-CHAIN] UNION {}", case_name);
+                    }
+                    crate::constraint::solver::trace::trace_exec(
+                        &format!("solveChain UNION {}", case_name));
+                    all_cases.push((case_name.clone(), arm_sys));
+                }
+            }
+            // HS short-circuits the generic destructor loop in the FUnion
+            // arm (case-match on `viewTerm2`).  Mirror by skipping branch 2's
+            // generic loop below.
+            if all_cases.is_empty() { return GoalCases::Contradictory; }
+            if all_cases.len() == 1 {
+                let (name, sys) = all_cases.into_iter().next().unwrap();
+                self.sys = sys;
+                self.changed = ChangeIndicator::Changed;
+                return GoalCases::LinearNamed(name);
+            }
+            self.changed = ChangeIndicator::Changed;
+            return GoalCases::Cases(all_cases);
+        }
         if !conc_term_is_msg_var {
             let avoid_max = bounds_max(&self.sys);
             let mut next_node_idx = avoid_max.saturating_add(1);
