@@ -888,7 +888,53 @@ pub fn lnterm_to_term(t: &tamarin_term::lterm::LNTerm) -> p::Term {
                         p::Term::App(name, parser_args)
                     }
                 }
-                FunSym::Ac(_) | FunSym::C(_) | FunSym::List => {
+                FunSym::Ac(ac) => {
+                    // Round-trip AC heads back to parser BinOp so that a
+                    // later `term_to_lnterm` call rebuilds them as the
+                    // proper `FunSym::Ac` head (not as `NoEqSym("?")`).
+                    // Without this, `insert_implied_formulas_pass`'s
+                    // Maude-backed matcher (`match_atom_via_maude`) sees
+                    // a NoEq-headed pattern against an Ac-headed
+                    // subject, and AC matching fails — observed on
+                    // MTI_C0::Secrecy_..._Initiator where the lemma's
+                    // `AcceptedR(... exp(g, ~tid*~x.5) ...)` universal
+                    // pattern arrives at the matcher as
+                    // `exp(g, NoEq("?", 2, ekI, x))` and never matches
+                    // the system's `exp(g, Mult(x, ekI))`.
+                    // Mirrors HS's `viewTerm` round-trip via `FApp (AC m)`
+                    // (Term/Term.hs: viewTerm).
+                    use tamarin_term::function_symbols::AcSym;
+                    if parser_args.len() == 2 {
+                        let op = match ac {
+                            AcSym::Mult => p::BinOp::Mult,
+                            AcSym::Union => p::BinOp::Union,
+                            AcSym::Xor => p::BinOp::Xor,
+                            AcSym::NatPlus => p::BinOp::NatPlus,
+                        };
+                        // Right-fold: a parser BinOp is strictly arity-2,
+                        // so fold left-to-right when more than 2 args.
+                        let mut iter = parser_args.into_iter();
+                        let first = iter.next().unwrap();
+                        let second = iter.next().unwrap();
+                        let mut acc = p::Term::BinOp(op, Box::new(first), Box::new(second));
+                        for next in iter {
+                            acc = p::Term::BinOp(op, Box::new(acc), Box::new(next));
+                        }
+                        acc
+                    } else {
+                        // Defensive: 0- or 1-arg AC term shouldn't occur
+                        // (AC operators are arity-2), but emit a
+                        // recognisable placeholder if it does.
+                        let name = match ac {
+                            AcSym::Mult => "?Mult",
+                            AcSym::Union => "?Union",
+                            AcSym::Xor => "?Xor",
+                            AcSym::NatPlus => "?NatPlus",
+                        };
+                        p::Term::App(name.to_string(), parser_args)
+                    }
+                }
+                FunSym::C(_) | FunSym::List => {
                     let name = "?".to_string();
                     p::Term::App(name, parser_args)
                 }

@@ -903,12 +903,11 @@ impl MaudeHandle {
     /// constants of a special "skolem" sort; we mirror that with the
     /// synthetic-Name trick.
     ///
-    /// **Currently unused**: `insert_implied_formulas_pass` uses a pure
-    /// structural matcher in the constraint-solver layer (mirroring
-    /// Haskell's pre-Maude pass) for non-AC cases.  Kept here as
-    /// infrastructure for future AC-modulo `impliedFormulas`
-    /// matching, where structural matching wouldn't suffice.
-    #[allow(dead_code)]
+    /// Used by `insert_implied_formulas_pass` as the AC-fallback after
+    /// the pure structural matcher fails.  Mirrors HS's `matchAction`
+    /// (System.hs:1134) which delegates to Maude via `solveMatchLNTerm`
+    /// (Term/Subsumption.hs), with HS's `SkConst` encoding from
+    /// `skolemizeGuarded` represented here as synthetic named constants.
     pub fn match_eqs_const_subject(
         &self,
         eqs: &[Equal<LNTerm>],
