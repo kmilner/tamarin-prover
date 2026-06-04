@@ -4080,6 +4080,72 @@ pub fn run_solve_all_safe_goals_disj_for_probe_with_ths(
         .collect()
 }
 
+/// Read the K(U|D) conclusion term of `c` from `sys` — mirrors HS
+/// `kConcTerm` (Sources.hs:236-241): returns Some only when the
+/// node's conclusion fact at `c.1` is a KU or KD fact.  Module-level
+/// helper used by `run_solve_all_safe_goals_disj_with_progress`'s
+/// `lastChainTerm` filter.
+fn k_conc_term_for_chain(
+    sys: &crate::constraint::system::System,
+    c: &crate::constraint::constraints::NodeConc,
+) -> Option<tamarin_term::lterm::LNTerm> {
+    use crate::fact::FactTag;
+    let (id, idx) = (&c.0, &c.1);
+    let rule = sys.nodes.iter().find(|(n, _)| n == id).map(|(_, r)| r)?;
+    let fact = rule.conclusions.get(idx.0)?;
+    if !matches!(fact.tag, FactTag::Ku | FactTag::Kd) { return None; }
+    fact.terms.first().cloned()
+}
+
+/// Structural equality modulo fresh variable renaming.  Mirrors HS
+/// `eqModuloFreshnessNoAC` (LTerm.hs:632).  Two terms are equal iff
+/// they're structurally identical after renaming every free var to a
+/// fresh canonical name preserving ONLY sort.
+fn eq_modulo_freshness_no_ac(
+    a: &tamarin_term::lterm::LNTerm,
+    b: &tamarin_term::lterm::LNTerm,
+) -> bool {
+    use tamarin_term::lterm::LVar;
+    use std::collections::HashMap;
+    fn go(
+        a: &tamarin_term::lterm::LNTerm,
+        b: &tamarin_term::lterm::LNTerm,
+        ma: &mut HashMap<LVar, u64>,
+        mb: &mut HashMap<LVar, u64>,
+        next: &mut u64,
+    ) -> bool {
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+        match (a, b) {
+            (Term::Lit(Lit::Var(va)), Term::Lit(Lit::Var(vb))) => {
+                if va.sort != vb.sort { return false; }
+                let ka = ma.get(va).cloned();
+                let kb = mb.get(vb).cloned();
+                match (ka, kb) {
+                    (Some(x), Some(y)) => x == y,
+                    (None, None) => {
+                        let k = *next;
+                        *next += 1;
+                        ma.insert(va.clone(), k);
+                        mb.insert(vb.clone(), k);
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            (Term::Lit(Lit::Con(ca)), Term::Lit(Lit::Con(cb))) => ca == cb,
+            (Term::App(oa, xs), Term::App(ob, ys)) =>
+                oa == ob && xs.len() == ys.len()
+                    && xs.iter().zip(ys).all(|(x, y)| go(x, y, ma, mb, next)),
+            _ => false,
+        }
+    }
+    let mut ma = HashMap::new();
+    let mut mb = HashMap::new();
+    let mut next = 0;
+    go(a, b, &mut ma, &mut mb, &mut next)
+}
+
 fn run_solve_all_safe_goals_disj(
     ctx: &crate::constraint::solver::context::ProofContext,
     initial_sys: System,
@@ -4137,12 +4203,19 @@ fn run_solve_all_safe_goals_disj_with_progress(
     // step name ends and the next begins, so Rust accumulated
     // multi-step names ("Step1sencSetup_Key") that HS truncated to
     // single element ("Step1") at the refineSource boundary.
+    // `last_chain_term`: tracks the most recently solved Chain's
+    // conclusion term.  Mirrors HS `solveAllSafeGoals.solve`'s
+    // `lastChainTerm :: Maybe LNTerm` parameter (Sources.hs:175-211).
+    // Used to filter out chain goals whose conclusion is equal modulo
+    // freshness to the last solved one — loop-breaker that prevents
+    // user-equation destructor explosions.  Lead A from agent #35.
     type Entry = (System, Vec<String> /* step_names accumulator */,
-                  std::collections::BTreeSet<String>, i64, i64);
+                  std::collections::BTreeSet<String>, i64, i64,
+                  Option<tamarin_term::lterm::LNTerm> /* last_chain_term */);
     let mut worklist: Vec<Entry> = vec![
         (initial_sys, Vec::new() /* fresh accumulator for steps */,
          std::collections::BTreeSet::new(),
-         chains_limit, outer_cap)
+         chains_limit, outer_cap, None /* last_chain_term */)
     ];
     // `finished` holds (System, accumulated_step_names_list).
     // `combine` runs with `initial_name` after the loop terminates.
@@ -4158,7 +4231,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
     let mut total_steps: usize = 0;
     let total_step_cap: usize = branch_cap.saturating_mul(50).max(2000);
 
-    while let Some((sys, name, used, chains_left, iters_left)) = worklist.pop() {
+    while let Some((sys, name, used, chains_left, iters_left, last_chain_term)) = worklist.pop() {
         total_steps += 1;
         if total_steps > total_step_cap {
             finished.push((sys, name));
@@ -4241,6 +4314,44 @@ fn run_solve_all_safe_goals_disj_with_progress(
             .map(|(g, st)| (g.clone(), st.looping))
             .collect();
         goals.sort_by(|a, b| crate::constraint::solver::goals::goal_cmp(&a.0, &b.0));
+        // HS-faithful `lastChainTerm` filter (Sources.hs:182-186):
+        //   filterM (\(g,_) -> case g of
+        //     (ChainG c _) -> (\x -> return $ Just True /=
+        //                       liftM2 eqModuloFreshnessNoAC lastChainTerm x)
+        //                     =<< kConcTerm c
+        //     _            -> return True) goals
+        //
+        // Drops chain goals whose K-conclusion term is equal modulo
+        // freshness to the previously solved chain's conclusion — the
+        // loop-breaker that prevents user-equation destructor
+        // explosions.  Lead A from agent #35 — the
+        // `lastChainTerm` filter was only in the legacy single-pick
+        // `solve_all_safe_goals_tracked` and `close_chains_dfs`, not
+        // here.  MTI_C0 saturate iter 0 exhausts chains that HS leaves
+        // open (after lastChainTerm filter) — adding the filter
+        // restores the open Chain/Split goals HS picks up at iter 1
+        // and drops via solveChain's forbiddenEdge / illegalCoerce /
+        // isMsgVar plus solveSplit's eqsIsFalse.
+        let filter_disabled = std::env::var("TAM_RS_DISABLE_LCT_FILTER").is_ok();
+        let filtered_goals: Vec<(Goal, bool)> = if filter_disabled {
+            goals.clone()
+        } else {
+            goals.iter().filter(|(g, _)| {
+                match g {
+                    Goal::Chain(c, _) => {
+                        let this_t = k_conc_term_for_chain(&red.sys, c);
+                        // HS: `Just True /= liftM2 eqModuloFreshnessNoAC last this`
+                        // Drop iff `last` is Some AND `this` is Some AND
+                        // they're equal-mod-freshness.  Keep otherwise.
+                        match (last_chain_term.as_ref(), this_t.as_ref()) {
+                            (Some(lt), Some(tt)) => !eq_modulo_freshness_no_ac(lt, tt),
+                            _ => true,
+                        }
+                    }
+                    _ => true,
+                }
+            }).cloned().collect()
+        };
         // Unfiltered chains view — Haskell's `unsolvedChains`.
         let any_unsolved_chain = red.sys.goals.iter().any(|(g, st)|
             !st.solved && matches!(g, Goal::Chain(_, _)));
@@ -4294,9 +4405,32 @@ fn run_solve_all_safe_goals_disj_with_progress(
                 Goal::Split(_) => split_allowed && (!in_precompute || !h17_4_disabled),
             }
         };
+        // HS-faithful: kdPremGoals uses UNFILTERED goals (Sources.hs:200),
+        // safeGoals uses FILTERED (line 195).  Match HS by deriving each
+        // candidate from the correct source.
         let pick = goals.iter()
             .find(|(g, _)| is_kd_prem(g) || is_chain_prem1(g))
-            .or_else(|| goals.iter().find(|(g, _)| is_safe(g)));
+            .or_else(|| filtered_goals.iter().find(|(g, _)| is_safe(g)));
+        // HS-faithful update of `lastChainTerm'` (Sources.hs:209-211):
+        //   case (kdPremGoals, safeGoals) of
+        //     ([], ((ChainG c _):_)) -> ... (t <|> lastChainTerm) =<< kConcTerm c
+        //     _                      -> return lastChainTerm
+        // Update when no kd-prem goals exist AND first safe goal is a
+        // Chain.  HS: `t <|> lastChainTerm` keeps the existing value if
+        // the new chain has no K-term (`kConcTerm` returns Nothing).
+        let kd_prem_empty = !goals.iter().any(|(g, _)| is_kd_prem(g) || is_chain_prem1(g));
+        let first_safe = filtered_goals.iter().find(|(g, _)| is_safe(g));
+        let new_last_chain_term = if kd_prem_empty {
+            if let Some((Goal::Chain(c, _), _)) = first_safe {
+                let t = k_conc_term_for_chain(&red.sys, c);
+                // `t <|> lastChainTerm`: prefer new t, else keep old.
+                t.or(last_chain_term.clone())
+            } else {
+                last_chain_term.clone()
+            }
+        } else {
+            last_chain_term.clone()
+        };
 
         if let Some((goal, _)) = pick {
             let goal = goal.clone();
@@ -4313,7 +4447,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
                     // Single output, no name added.  red.sys was
                     // mutated in place.
                     worklist.push((red.sys, name, used,
-                        new_chains_left, iters_left - 1));
+                        new_chains_left, iters_left - 1, new_last_chain_term.clone()));
                 }
                 GoalCases::LinearNamed(sub_name) => {
                     // HS-faithful: INSIDE `solveAllSafeGoals.solve`
@@ -4334,7 +4468,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
                     let mut new_name = name.clone();
                     append_step_name_list(&mut new_name, &sub_name);
                     worklist.push((red.sys, new_name, used,
-                        new_chains_left, iters_left - 1));
+                        new_chains_left, iters_left - 1, new_last_chain_term.clone()));
                 }
                 GoalCases::Cases(cases) => {
                     // Multi-output — fork.  Each case's System
@@ -4367,7 +4501,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
                             let mut new_name = name.clone();
                             append_step_name_list(&mut new_name, &sub_name);
                             worklist.push((case_sys, new_name, used.clone(),
-                                new_chains_left, iters_left - 1));
+                                new_chains_left, iters_left - 1, new_last_chain_term.clone()));
                         }
                     } else {
                         let case_vec: Vec<_> = cases_iter.collect();
@@ -4375,7 +4509,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
                             let mut new_name = name.clone();
                             append_step_name_list(&mut new_name, &sub_name);
                             worklist.push((case_sys, new_name, used.clone(),
-                                new_chains_left, iters_left - 1));
+                                new_chains_left, iters_left - 1, new_last_chain_term.clone()));
                         }
                     }
                 }
@@ -4546,7 +4680,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
                 }
                 any_step_taken = true;
                 worklist.push((sys_cand, new_name, new_used,
-                    chains_left, iters_left - 1));
+                    chains_left, iters_left - 1, new_last_chain_term.clone()));
                 any_branched = true;
                 continue;
             }
@@ -4665,7 +4799,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
             }
             any_step_taken = true;
             worklist.push((sub.sys, new_name, new_used,
-                chains_left, iters_left - 1));
+                chains_left, iters_left - 1, new_last_chain_term.clone()));
             any_branched = true;
             if no_source_pick_fork { break; }
         }
