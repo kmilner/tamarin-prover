@@ -933,14 +933,29 @@ pub fn lnterm_to_term(t: &tamarin_term::lterm::LNTerm) -> p::Term {
                     // Mirrors HS's `viewTerm` round-trip via `FApp (AC m)`
                     // (Term/Term.hs: viewTerm).
                     use tamarin_term::function_symbols::AcSym;
-                    if parser_args.len() == 2 {
+                    // AC terms are flattened by `f_app_ac` to 2+ args.
+                    // Round-trip via parser BinOp (left-fold), which
+                    // term_to_lnterm later rebuilds as a flat AC App.
+                    // Previously this only fired on EXACTLY 2 args — any
+                    // flat 3+-arg AC term (common with multiset: `a + b + c`)
+                    // fell through to the `?Union` placeholder branch and
+                    // a downstream `term_to_lnterm` re-parse rebuilt it as
+                    // `App(NoEq("?Union"), [a,b,c])`, an opaque non-AC
+                    // 3-ary functor.  That broke Maude unification on
+                    // multiset equations (e.g. `('1'++x++z) = x` returned
+                    // No-unifier in the Eq branch but the LNTerm we
+                    // actually fed Maude was `Union(1,x,z) =? x` vs a
+                    // BROKEN return-form leaking into impl_formulas matches
+                    // and breaking the `1+x+z` → false simplification
+                    // chain for `counters_linear_order`.
+                    if parser_args.len() >= 2 {
                         let op = match ac {
                             AcSym::Mult => p::BinOp::Mult,
                             AcSym::Union => p::BinOp::Union,
                             AcSym::Xor => p::BinOp::Xor,
                             AcSym::NatPlus => p::BinOp::NatPlus,
                         };
-                        // Right-fold: a parser BinOp is strictly arity-2,
+                        // Left-fold: a parser BinOp is strictly arity-2,
                         // so fold left-to-right when more than 2 args.
                         let mut iter = parser_args.into_iter();
                         let first = iter.next().unwrap();
