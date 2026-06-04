@@ -384,7 +384,12 @@ fn smart_ranking(
         Box::new(|a: &AnnotatedGoal| is_split_goal_small(a, sys)),
         Box::new(|a: &AnnotatedGoal| is_msg_one_case_goal(a, &one_case_syms)),
         Box::new(is_signature_goal),
-        // is_double_exp_goal — needs Exp/Mult view; stubbed.
+        // `isDoubleExpGoal` (ProofMethod.hs:1404): slot 11 between
+        // `isSignatureGoal` and `isNoLargeSplitGoal`. Picks KU goals
+        // whose term is `exp(_, mult(_))` before the catch-all NoLargeSplit
+        // tier so DH double-exp KU goals (e.g. `KU(g^(~lkR*~x))`) win
+        // ranking ties against single-arg KU(exp(_, _)) goals.
+        Box::new(is_double_exp_goal),
         Box::new(|a: &AnnotatedGoal| is_no_large_split_goal(a, sys)),
     ];
     goals = sort_decision_tree_dyn(&solve_first, goals);
@@ -746,6 +751,36 @@ fn is_signature_goal(a: &AnnotatedGoal) -> bool {
         _ => false,
     }
 }
+
+/// `isDoubleExpGoal` (ProofMethod.hs:277-280):
+///   isDoubleExpGoal goal = case msgPremise goal of
+///     Just (viewTerm2 -> FExp _ (viewTerm2 -> FMult _)) -> True
+///     _                                                -> False
+///
+/// True when the KU action goal's term is `exp(_, mult(...))` — i.e.
+/// a DH exponentiation whose exponent is itself an AC product.
+/// HS's `viewTerm2` only treats `FAPP (NoEq exp)` (arity 2) as `FExp`,
+/// and `FAPP (AC Mult)` as `FMult` (Raw.hs:171-185); we mirror by
+/// matching `Term::App(NoEq(name="exp"), [_, App(Ac(Mult), _)])`.
+///
+/// Used by smartRanking's `solveFirst` slot 11 (between `isSignatureGoal`
+/// at slot 10 and `isNoLargeSplitGoal` at slot 12).  Without this,
+/// double-exp KU goals fall to the catch-all NoLargeSplit tier and lose
+/// ranking ties to other KU(exp(_)) goals — observed on UM_wPFS /
+/// JKL_TS2 / MTI_C0 where HS picks `KU(g^(~lkR*~x))` and RS picks
+/// `KU(hkI^~ekR)`.
+fn is_double_exp_goal(a: &AnnotatedGoal) -> bool {
+    use tamarin_term::function_symbols::{AcSym, FunSym, NoEqSym};
+    use tamarin_term::term::Term;
+    match msg_premise(&a.goal) {
+        Some(Term::App(FunSym::NoEq(NoEqSym { name, .. }), args))
+            if name.as_slice() == b"exp" && args.len() == 2 =>
+        {
+            matches!(&args[1], Term::App(FunSym::Ac(AcSym::Mult), _))
+        }
+        _ => false,
+    }
+}
 // -- injRanking priority-class predicates (ProofMethod.hs:1126-1198) ----------
 
 /// `isImmediateGoal` (ProofMethod.hs:1158-1161): a PremiseG/ActionG
@@ -788,10 +823,8 @@ fn is_med_priority_goal(
 
 /// `isLowPriorityGoal` (ProofMethod.hs:1151-1153):
 ///   isDoubleExpGoal || isSignatureGoal || isProtoFactGoal
-/// (`isDoubleExpGoal` is stubbed false — needs the Exp/Mult view, same
-/// as smartRanking.)
 fn is_low_priority_goal(a: &AnnotatedGoal) -> bool {
-    is_signature_goal(a) || is_proto_fact_goal(a)
+    is_double_exp_goal(a) || is_signature_goal(a) || is_proto_fact_goal(a)
 }
 
 /// `isProtoFactGoal` (ProofMethod.hs:1155-1156): a non-K PremiseG.
