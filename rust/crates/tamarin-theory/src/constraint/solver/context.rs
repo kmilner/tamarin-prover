@@ -365,6 +365,28 @@ impl ProofContext {
             }
         }
         intruder_rules.extend(crate::intruder_rules::special_intruder_rules(false));
+        // HS-faithful: theory-specific intruder rules (Nat, MSet, Xor) —
+        // port of `Main.TheoryLoader.addMessageDeductionRuleVariants`
+        // (src/Main/TheoryLoader.hs:786-789):
+        //
+        // ```haskell
+        // rules =
+        //   subtermIntruderRules False msig
+        //   ++ specialIntruderRules False
+        //   ++ (if enableNat  msig then natIntruderRules     else [])
+        //   ++ (if enableMSet msig then multisetIntruderRules else [])
+        //   ++ (if enableXor  msig then xorIntruderRules     else [])
+        // ```
+        //
+        // For multiset: adds `_union` destructor (`KD(x++y) → KD(x)`,
+        // subterm=True, budget=0) and `_union` constructor.  Without these,
+        // the precomputed `KU(t)` source-cases miss the chain-extension
+        // path through union-decomposition, causing `hasImpossibleChain`
+        // to fire on legitimate chains from `KD(t1++t2)` to `KD(t1)`.
+        // Root cause of the `minimal_multiset::Reachable`/`issue519` cluster.
+        if sig.enable_mset {
+            intruder_rules.extend(crate::intruder_rules::multiset_intruder_rules());
+        }
         // DH / BP intruder variants — port of HS
         // `Main.TheoryLoader.addMessageDeductionRuleVariants`
         // (src/Main/TheoryLoader.hs:776-791):
