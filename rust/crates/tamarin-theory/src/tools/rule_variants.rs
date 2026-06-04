@@ -56,6 +56,20 @@ impl From<MaudeError> for VariantsError {
 /// Returns `Ok(None)` when Maude reports no non-trivial variants; the
 /// caller can keep the rule as-is. Returns `Ok(Some(ac_rule))` with
 /// the variant substitutions populated.
+///
+/// HS-faithful: mirrors `variantsProtoRule` (RuleVariants.hs:61-91):
+///
+/// ```haskell
+/// x <- simpDisjunction hnd (const (const False)) (Disj substs)
+/// case x of
+///   (commonSubst, Nothing)         -> return $ makeRule abstrPsCsAs commonSubst trueDisj
+///   (commonSubst, Just freshSubsts) -> return $ makeRule abstrPsCsAs commonSubst freshSubsts
+/// ```
+///
+/// where `trueDisj = [emptySubstVFresh]` (RuleVariants.hs:120) and
+/// `makeRule` (RuleVariants.hs:111-118) applies `commonSubst` to the
+/// rule body and restricts the residual fresh substs to the new
+/// frees.
 pub fn variants_proto_rule(
     maude: &MaudeHandle,
     rule: &ProtoRuleE,
@@ -65,7 +79,7 @@ pub fn variants_proto_rule(
     let packed = pack_rule_terms(rule);
     if packed.is_none() {
         // No reducible terms → no variants beyond the identity.
-        return Ok(Some(make_proto_rule_ac(rule, vec![LNSubstVFresh::empty()])));
+        return Ok(Some(make_proto_rule_ac(rule, &LNSubst::default(), vec![LNSubstVFresh::empty()])));
     }
     let packed = packed.unwrap();
     let raw = maude.variants(&packed)?;
@@ -75,13 +89,27 @@ pub fn variants_proto_rule(
     let substs: Vec<LNSubstVFresh> = raw.into_iter()
         .map(|pairs| LNSubstVFresh::from_list(pairs.into_iter()))
         .collect();
-    // Haskell runs simpDisjunction here to factor out a common
-    // substitution across variants; our simp_disjunction collapses
-    // identity-containing disjunctions to `Nothing`, which throws away
-    // the non-identity variants we need for destructor-narrowing chain
-    // enumeration. Skip the simplification and surface the raw
-    // variants — downstream code wants every narrowing alternative.
-    Ok(Some(make_proto_rule_ac(rule, substs)))
+    // HS-faithful `simpDisjunction hnd (const (const False)) (Disj substs)`
+    // (RuleVariants.hs:82).  Routes through `simp1`'s full pipeline
+    // including `simpSingleton` (EquationStore.hs:596) — that pass
+    // folds a singleton-variant disj into the free subst, which is
+    // what HS's `commonSubst` carries.  Without this, the SplitG
+    // residual retains entries that HS bakes into the rule body via
+    // `makeRule`'s `apply commonSubst` (RuleVariants.hs:114-117) —
+    // which is the root of the NAXOS_eCK_private Init_1-vs-Ltk_reveal
+    // divergence.
+    //
+    // Previously this call was deliberately skipped because RS's
+    // simp_disjunction (no Maude handle) collapsed identity-containing
+    // disjunctions to Nothing.  Since f7321d2e added
+    // `simp_disjunction_with_maude` (which uses `simp_with_fresh_avoiding`
+    // → `simp_singleton` → only folds genuine singletons), the
+    // simplification is now safe to run.
+    let (common_subst, residual) = crate::tools::equation_store::EquationStore::simp_disjunction_with_maude(
+        substs, |_, _| false, maude);
+    // HS `trueDisj = [emptySubstVFresh]` (RuleVariants.hs:120).
+    let fresh_substs = residual.unwrap_or_else(|| vec![LNSubstVFresh::empty()]);
+    Ok(Some(make_proto_rule_ac(rule, &common_subst, fresh_substs)))
 }
 
 /// Pack every term-argument of every fact in `rule` into a single
@@ -99,10 +127,68 @@ fn pack_rule_terms(rule: &ProtoRuleE) -> Option<LNTerm> {
 
 /// Build a `ProtoRuleAC` from a `ProtoRuleE` plus the precomputed
 /// variants list.
+///
+/// HS `makeRule` (RuleVariants.hs:111-118) applies `commonSubst` (the
+/// free part returned by `simpDisjunction`) to the rule body, then
+/// restricts each fresh subst to the rule's surviving frees:
+///
+/// ```haskell
+/// makeRule (ps, cs, as, nvs) subst freshSubsts0 =
+///     Rule (ProtoRuleACInfo na attr (Disj freshSubsts) []) prems concs acts newvs
+///   where prems = apply subst ps
+///         concs = apply subst cs
+///         acts  = apply subst as
+///         newvs = apply subst nvs
+///         freshSubsts = map (restrictVFresh (frees (prems, concs, acts, newvs))) freshSubsts0
+/// ```
 fn make_proto_rule_ac(
     rule: &ProtoRuleE,
+    common_subst: &LNSubst,
     variants: Vec<LNSubstVFresh>,
 ) -> ProtoRuleAC {
+    // Apply commonSubst to the rule body (HS apply subst {ps,cs,as,nvs}).
+    let (premises, conclusions, actions, new_vars) = if common_subst.is_empty() {
+        (
+            rule.premises.clone(),
+            rule.conclusions.clone(),
+            rule.actions.clone(),
+            rule.new_vars.clone(),
+        )
+    } else {
+        let map_facts = |fs: &[Fact<LNTerm>]| -> Vec<Fact<LNTerm>> {
+            fs.iter()
+                .map(|f| f.clone().map(|t| apply_vterm(common_subst, t)))
+                .collect()
+        };
+        (
+            map_facts(&rule.premises),
+            map_facts(&rule.conclusions),
+            map_facts(&rule.actions),
+            rule.new_vars.iter().map(|t| apply_vterm(common_subst, t.clone())).collect(),
+        )
+    };
+
+    // Compute frees of the new rule body and restrict each variant
+    // subst to those (HS: `map (restrictVFresh (frees (prems, concs, acts, newvs))) freshSubsts0`).
+    use tamarin_term::lterm::HasFrees;
+    let mut frees_set: std::collections::BTreeSet<LVar> = std::collections::BTreeSet::new();
+    for f in &premises {
+        for t in &f.terms { t.for_each_free(&mut |v| { frees_set.insert(v.clone()); }); }
+    }
+    for f in &conclusions {
+        for t in &f.terms { t.for_each_free(&mut |v| { frees_set.insert(v.clone()); }); }
+    }
+    for f in &actions {
+        for t in &f.terms { t.for_each_free(&mut |v| { frees_set.insert(v.clone()); }); }
+    }
+    for t in &new_vars {
+        t.for_each_free(&mut |v| { frees_set.insert(v.clone()); });
+    }
+    let frees_vec: Vec<LVar> = frees_set.into_iter().collect();
+    let variants: Vec<LNSubstVFresh> = variants.into_iter()
+        .map(|s| s.restrict(&frees_vec))
+        .collect();
+
     let info = ProtoRuleACInfo {
         name: rule.info.name.clone(),
         attributes: rule.info.attributes.clone(),
@@ -111,10 +197,10 @@ fn make_proto_rule_ac(
     };
     crate::rule::Rule {
         info,
-        premises: rule.premises.clone(),
-        conclusions: rule.conclusions.clone(),
-        actions: rule.actions.clone(),
-        new_vars: rule.new_vars.clone(),
+        premises,
+        conclusions,
+        actions,
+        new_vars,
     }
 }
 
