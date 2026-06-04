@@ -4743,12 +4743,6 @@ impl<'ctx> Reduction<'ctx> {
                         src: c.clone(), tgt: p.clone(),
                     });
                     if !matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
-                        for (existing, status) in sub.sys.goals.iter_mut() {
-                            if existing == &g && !status.solved {
-                                status.solved = true;
-                                break;
-                            }
-                        }
                         // Direct-edge chain: name by the chain conc's KD
                         // term head, mirroring Haskell `caseName mPrem`
                         // (Goals.hs:337-338) — `showFunSymName` for App,
@@ -4758,12 +4752,36 @@ impl<'ctx> Reduction<'ctx> {
                         // (`senc`/`Var_fresh_7_ltkA` etc.).
                         let case_name = chain_direct_case_name(&fa_conc)
                             .unwrap_or_else(|| rule_case_name(&c_rule));
-                        if trace_chains {
-                            eprintln!("[RS-CHAIN] DIRECT {}", case_name);
+                        // HS-faithful per-arm fanout — mirrors the
+                        // `disjunctionOfList arms` in `solveTermEqs`
+                        // (Reduction.hs:888-897) routed through
+                        // `insertEdgesLabeled "chain_direct"`.  Each arm
+                        // becomes one independent solveChain DIRECT case.
+                        let post_edge_sys = sub.sys.clone();
+                        let arm_systems: Vec<crate::constraint::system::System> = match res {
+                            Ok(SolveOutcome::Cases(arms)) => {
+                                arms.into_iter().map(|arm_eq| {
+                                    let mut s = post_edge_sys.clone();
+                                    s.eq_store = arm_eq;
+                                    s
+                                }).collect()
+                            }
+                            _ => vec![post_edge_sys],
+                        };
+                        for mut arm_sys in arm_systems {
+                            for (existing, status) in arm_sys.goals.iter_mut() {
+                                if existing == &g && !status.solved {
+                                    status.solved = true;
+                                    break;
+                                }
+                            }
+                            if trace_chains {
+                                eprintln!("[RS-CHAIN] DIRECT {}", case_name);
+                            }
+                            crate::constraint::solver::trace::trace_exec(
+                                &format!("solveChain DIRECT {}", case_name));
+                            all_cases.push((case_name.clone(), arm_sys));
                         }
-                        crate::constraint::solver::trace::trace_exec(
-                            &format!("solveChain DIRECT {}", case_name));
-                        all_cases.push((case_name, sub.sys));
                     }
                 }
             }
@@ -4941,55 +4959,92 @@ impl<'ctx> Reduction<'ctx> {
                     }
                     continue;
                 }
-                // Step 3 (HS-faithful): leave sub.sys raw post-insertEdges.
-                // HS's simplifySystem (`Simplify.hs:97`) calls substSystem
-                // exactly ONCE at the start of each simplify iteration,
-                // NOT after every solveTermEqs inside a CR-rule.  So
-                // when the chain continuation goal Chain((new_node,
-                // ConcIdx 0), p) is later dispatched by solveGoal, HS
-                // reads sNodes which still holds ru's raw (pre-subst)
-                // conclusion fact — e.g. KD(~mw:Fresh) or KD(x:Msg) —
-                // and HS's `contradictoryIf (isMsgVar m)` (Goals.hs:367)
-                // fires mzero on the latter.
+                // HS-faithful: when `insertEdges chain_extend` produces
+                // multiple unifier arms via `solveTermEqs SplitNow ->
+                // disjunctionOfList` (Reduction.hs:888-897), HS's
+                // `disjunctionOfList arms` fans out IN the surrounding
+                // Disj monad — `extendAndMark` (Goals.hs:403-407) then
+                // completes the markGoalAsSolved / insertChain steps
+                // INDEPENDENTLY per arm, each arm carrying its own
+                // unifier subst.
                 //
-                // Previously Rust called `sub.subst_system()` here to
-                // propagate the chain_extend unification into nodes.
-                // This pre-resolved the destructor's conc-var so
-                // `is_msg_var` returned False every time, doubling
-                // chain_extend insertEdges entries vs HS on TLS.
+                // Previously Rust treated `Cases(arms)` as "Linear" —
+                // the edge was added to `sub.sys.edges` (line 264-266
+                // in insert_edge_labeled), but `sub.sys.eq_store` was
+                // left at the PRE-split state and only ONE case was
+                // pushed to all_cases.  This dropped (N-1) arms per
+                // multi-arm chain_extend dispatch.
                 //
-                // Sub.sys.eq_store still holds the binding; downstream
-                // consumers that need the resolved term call
-                // `lazy_views::node_conc_fact_subst` or run their own
-                // substSystem (e.g. the next simplifySystem iteration).
-                // The freshly-added prem-0 goal now has an incoming
-                // edge from `c`, so mark it solved (Haskell's
-                // `markGoalAsSolved "directly" (PremiseG (i, v) ...)`).
-                sub.mark_goal_as_solved(&Goal::Premise(
-                    (new_node.clone(), crate::rule::PremIdx(0)),
-                    prem0.clone(),
-                ));
-                // Insert the chain continuation (i, ConcIdx(0)) → p.
-                sub.insert_goal(Goal::Chain(
-                    (new_node.clone(), crate::rule::ConcIdx(0)),
-                    p.clone(),
-                ));
-                // Mark the original chain goal as solved in this case
-                // (it's been extended, not closed).
-                for (existing, status) in sub.sys.goals.iter_mut() {
-                    if existing == &g && !status.solved {
-                        status.solved = true;
-                        break;
-                    }
-                }
-                // Destructor-extend chain: name by destructor rule.
+                // Diagnosis: MTI_C0::Executable saturate source 5
+                // (KU(exp(g, x*y))) — 8 chain_extend dispatches each
+                // returning arms=2.  HS produces 8 extra transient
+                // cases (which iter 2's `noContradictoryEqStore:
+                // eqsIsFalse:insertEdges:chain_extend` cascade drops
+                // 23→7).  RS produced only 15 cases (no fanout, no
+                // transient contradictions to drop) — exactly the
+                // observed 8-line diff between HS's 7-case source 5
+                // and RS's 15-case source 5.
+                //
+                // Fix: collect per-arm systems.  For Cases, snapshot
+                // sub.sys (which has the chain_extend edge but the
+                // pre-split eq_store), then per arm install the arm's
+                // eq_store into a fresh clone and complete the
+                // mark_goal_as_solved / insert_goal / mark-g-solved
+                // sequence.  For Linear (single arm or no split),
+                // continue using `sub.sys` as before.
                 let case_name = rule_case_name(&ru_renamed);
-                if trace_chains {
-                    eprintln!("[RS-CHAIN] EXTEND {} prem=PremIdx(0)", case_name);
+                let post_edge_sys = sub.sys.clone();
+                let arm_systems: Vec<crate::constraint::system::System> = match res {
+                    Ok(SolveOutcome::Cases(arms)) => {
+                        arms.into_iter().map(|arm_eq| {
+                            let mut s = post_edge_sys.clone();
+                            s.eq_store = arm_eq;
+                            s
+                        }).collect()
+                    }
+                    _ => vec![post_edge_sys],
+                };
+                for mut arm_sys in arm_systems {
+                    // Step 3 (HS-faithful): leave sub.sys raw post-insertEdges.
+                    // HS's simplifySystem (`Simplify.hs:97`) calls substSystem
+                    // exactly ONCE at the start of each simplify iteration,
+                    // NOT after every solveTermEqs inside a CR-rule.  So
+                    // when the chain continuation goal Chain((new_node,
+                    // ConcIdx 0), p) is later dispatched by solveGoal, HS
+                    // reads sNodes which still holds ru's raw (pre-subst)
+                    // conclusion fact — e.g. KD(~mw:Fresh) or KD(x:Msg) —
+                    // and HS's `contradictoryIf (isMsgVar m)` (Goals.hs:367)
+                    // fires mzero on the latter.
+                    //
+                    // The freshly-added prem-0 goal now has an incoming
+                    // edge from `c`, so mark it solved (Haskell's
+                    // `markGoalAsSolved "directly" (PremiseG (i, v) ...)`).
+                    let mut arm_sub = Reduction::new(self.ctx, arm_sys);
+                    arm_sub.mark_goal_as_solved(&Goal::Premise(
+                        (new_node.clone(), crate::rule::PremIdx(0)),
+                        prem0.clone(),
+                    ));
+                    // Insert the chain continuation (i, ConcIdx(0)) → p.
+                    arm_sub.insert_goal(Goal::Chain(
+                        (new_node.clone(), crate::rule::ConcIdx(0)),
+                        p.clone(),
+                    ));
+                    arm_sys = arm_sub.sys;
+                    // Mark the original chain goal as solved in this case
+                    // (it's been extended, not closed).
+                    for (existing, status) in arm_sys.goals.iter_mut() {
+                        if existing == &g && !status.solved {
+                            status.solved = true;
+                            break;
+                        }
+                    }
+                    if trace_chains {
+                        eprintln!("[RS-CHAIN] EXTEND {} prem=PremIdx(0)", case_name);
+                    }
+                    crate::constraint::solver::trace::trace_exec(
+                        &format!("solveChain EXTEND {}", case_name));
+                    all_cases.push((case_name.clone(), arm_sys));
                 }
-                crate::constraint::solver::trace::trace_exec(
-                    &format!("solveChain EXTEND {}", case_name));
-                all_cases.push((case_name, sub.sys));
             }
         }
 
