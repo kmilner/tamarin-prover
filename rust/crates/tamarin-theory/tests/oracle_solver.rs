@@ -638,7 +638,7 @@ fn corpus_verdict_match_coverage_probe() {
         if src.contains("predicates:") { return None; }
         if src.contains("process:") { return None; }
         if src.contains("builtins:") &&
-           (src.contains("diffie-hellman") || src.contains("multiset") ||
+           (src.contains("diffie-hellman") ||
             src.contains("xor") || src.contains("bilinear-pairing"))
         { return None; }
 
@@ -895,8 +895,7 @@ fn corpus_proof_skeleton_match_probe() {
         if src.contains("predicates:") { return None; }
         if src.contains("process:") { return None; }
         if src.contains("builtins:") &&
-           (src.contains("multiset") ||
-            src.contains("xor") || src.contains("bilinear-pairing"))
+           (src.contains("xor") || src.contains("bilinear-pairing"))
         { return None; }
 
         let theory = tamarin_parser::parse_theory(&src, &[]).ok()?;

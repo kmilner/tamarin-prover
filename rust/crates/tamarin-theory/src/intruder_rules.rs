@@ -374,6 +374,58 @@ fn is_double_premise_rule(r: &IntrRuleAC) -> bool {
     rest_prems.iter().any(|f| f == &ku_t)
 }
 
+/// `multisetIntruderRules` — port of Haskell's
+/// `Theory.Tools.IntruderRules.multisetIntruderRules`
+/// (`lib/theory/src/Theory/Tools/IntruderRules.hs:327-333`):
+///
+/// ```haskell
+/// multisetIntruderRules = [mkDUnionRule [x_var, y_var] x_var,
+///                          mkCUnionRule [x_var, y_var]]
+///   where x_var = varTerm (LVar "x"  LSortMsg   0)
+///         y_var = varTerm (LVar "y"  LSortMsg   0)
+///
+/// mkDUnionRule t_prems t_conc =
+///     Rule (DestrRule (append (pack "_") unionSymString) 0 True False)
+///          [kdFact $ fAppAC Union t_prems]
+///          [kdFact t_conc] [] []
+///
+/// mkCUnionRule terms =
+///     Rule (ConstrRule (append (pack "_") unionSymString))
+///          (map kuFact terms)
+///          [kuFact $ fAppAC Union terms] [kuFact $ fAppAC Union terms] []
+/// ```
+///
+/// Added to the intruder rule pool when `enableMSet` (Main/TheoryLoader.hs:788).
+/// Note budget=0 (NOT -1) — `closeIntrRule` clause 3 passes through without
+/// further variant expansion since budget is not -1.  HS computes budget=0
+/// at definition time, so we mirror that here.
+pub fn multiset_intruder_rules() -> Vec<IntrRuleAC> {
+    use tamarin_term::function_symbols::{AcSym, FunSym, UNION_SYM_STRING};
+    use tamarin_term::term::Term;
+    let x_var = var_term(LVar::new("x", LSort::Msg, 0));
+    let y_var = var_term(LVar::new("y", LSort::Msg, 0));
+    let xy_union = Term::App(FunSym::Ac(AcSym::Union), vec![x_var.clone(), y_var.clone()]);
+    let mut name = b"_".to_vec();
+    name.extend_from_slice(UNION_SYM_STRING);
+    let d_rule = Rule::new(
+        IntrRuleACInfo::DestrRule(name.clone(), 0, true, false),
+        vec![kd_fact(xy_union.clone())],
+        vec![kd_fact(x_var.clone())],
+        vec![],
+    );
+    let c_rule = {
+        let mut r = Rule::new(
+            IntrRuleACInfo::ConstrRule(name),
+            vec![ku_fact(x_var.clone()), ku_fact(y_var)],
+            vec![ku_fact(xy_union.clone())],
+            vec![ku_fact(xy_union)],
+        );
+        r.new_vars = vec![];
+        r
+    };
+    vec![d_rule, c_rule]
+}
+
 /// `constructionRules`: for every public constructor `f/n` in the
 /// signature, emit a KU rule:
 ///
