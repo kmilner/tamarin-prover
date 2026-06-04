@@ -716,9 +716,87 @@ impl MaudeHandle {
             });
         }
         let mut out = Vec::with_capacity(msubsts.len());
-        for ms in &msubsts {
-            // Use the global counter (Haskell-faithful MonadFresh).
-            out.push(msubst_to_lnsubst_with_maude(ms, &mut ctx, input_max, Some(self))?);
+        // HS-faithful per-unifier conversion (Maude/Process.hs:255-256 +
+        // Types.hs:127-138).  HS does:
+        //   map (msubstToLSubstVFresh bindings) <$> parseUnifyReply ...
+        // where `msubstToLSubstVFresh bindings` calls
+        //   runBackConversion (traverse translate substMaude) bindings
+        // and `runBackConversion back bindings =
+        //   evalBindT back bindings `evalFreshAvoiding` M.elems bindings`.
+        //
+        // Each unifier conversion gets:
+        //   (a) the SAME initial bind-map `bindings` (the toMaude
+        //       conversion's output) — no carryover of FreshVar
+        //       allocations from one unifier to the next, AND
+        //   (b) a fresh supply starting at `max(M.elems bindings) + 1` —
+        //       same base per unifier.
+        // So if two unifiers each have a FreshVar(0), they both allocate
+        // it to LVar(x, sort, base) but the choices DOWNSTREAM of which
+        // domain key they bind diverge, producing different per-arm
+        // SubstVFresh contents.
+        //
+        // Concrete consequence on Resp_1 / Init_1 / generate_ltk multi-AC
+        // arms (UM_wPFS::wPFS_responder_key + JKL_TS2_2008 cluster):
+        // HS's Mult arm allocates witness `~x.20` to the rule-internal
+        // var bound first in traversal; the "everything-equates" arm
+        // (where Fresh-fresh and Msg-msg collapse) allocates `~x.21`
+        // because it traverses fewer distinct FreshVars before reaching
+        // the equate target.  Net: HS sorts Mult arm BEFORE Equates arm
+        // by the SubstVFresh Ord (Map-of-(key,value) lexicographic).
+        //
+        // Previously RS shared `ctx` AND advanced the global counter
+        // monotonically across unifiers (msubst_to_lnsubst_with_maude
+        // line 1136-1138).  Result: every unifier saw the previous
+        // unifier's mutations to ctx.inverse (so a FreshVar reuses the
+        // same LVar across arms) and started its counter where the prior
+        // ended.  Witness collisions across arms then collapsed the
+        // distinguishing per-arm idx differences HS produces, leaving
+        // RS's SubstVFresh Ord to fall back on the VALUE structure
+        // (Lit < App), putting Equates BEFORE Mult.
+        //
+        // Fix (HS-faithful): per unifier, CLONE ctx and RESET the global
+        // counter to a shared baseline.  After all unifiers, advance the
+        // counter to the high-water mark so subsequent allocations
+        // (next solveTermEqs / chain-close / etc.) don't collide with
+        // any per-arm witness.
+        //
+        // Single-unifier case: short-circuit to the original behaviour
+        // (no clone/reset overhead, identical observable output).
+        if msubsts.len() <= 1 {
+            for ms in &msubsts {
+                out.push(msubst_to_lnsubst_with_maude(ms, &mut ctx, input_max, Some(self))?);
+            }
+        } else {
+            // Snapshot the counter; each unifier resets to this base.
+            self.ensure_above(input_max);
+            for lit in ctx.bindings().values() {
+                if let crate::vterm::Lit::Var(lv) = lit {
+                    if lv.name == "x" {
+                        self.ensure_above(lv.idx);
+                    }
+                }
+            }
+            let baseline = self.fresh_counter_peek();
+            let mut high_water = baseline;
+            for ms in &msubsts {
+                // Clone ctx so inverse-map mutations don't carry across
+                // unifiers (mirrors HS's independent runBackConversion).
+                let mut per_arm_ctx = ctx.clone();
+                // Reset counter to the shared baseline (mirrors HS's
+                // `evalFreshAvoiding M.elems bindings` restarting per
+                // unifier).
+                self.reset_counter_to(baseline);
+                let arm = msubst_to_lnsubst_with_maude(
+                    ms, &mut per_arm_ctx, input_max, Some(self))?;
+                // Track high water for global counter restoration.
+                let cur = self.fresh_counter_peek();
+                if cur > high_water { high_water = cur; }
+                out.push(arm);
+            }
+            // Restore counter above any per-arm allocation so subsequent
+            // proof-session work doesn't collide with witness idxs we
+            // baked into the returned SubstVFresh arms.
+            self.reset_counter_to(high_water);
         }
         Ok(out)
     }
