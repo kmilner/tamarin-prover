@@ -992,6 +992,12 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
                     format!("{:?}", t)).unwrap_or_default();
                 eprintln!("  action[{}] @ {:?} tag={:?} term0={}",
                     i, id, fa.tag, t);
+                if std::env::var("TAM_DBG_IMPL_ALLT").is_ok() {
+                    for (j, t) in fa.terms.iter().enumerate() {
+                        eprintln!("    action[{}].term[{}]={}", i, j,
+                            format!("{:?}", t));
+                    }
+                }
             }
         }
         let dbg_eq = !red.sys.eq_store.subst.to_list().is_empty();
@@ -1597,13 +1603,9 @@ fn match_atom_via_maude(
     }
     if eqs.is_empty() { return Some(subst); }
 
-    // Structural matching: Haskell's `solveMatchLTerm` runs a pure
-    // structural matcher first and only falls back to Maude on
-    // AC-equation conflicts.  Maude's `match` won't help us here
-    // anyway because subject-side free variables are treated as
-    // variables (not constants), so plain `match` returns no
-    // matches whenever the subject has unbound `~k`-style
-    // variables (which is most of the time during search).
+    // Structural matching: Haskell's `solveMatchLTerm` (Term/Subsumption.hs)
+    // first attempts a pure structural matcher, then defers AC-shape
+    // arguments to Maude.  We mirror that two-phase matching here.
     //
     // The structural matcher binds each pattern var (LVar whose
     // (name, idx) appears in `vars`) to the corresponding subject
@@ -1615,14 +1617,43 @@ fn match_atom_via_maude(
     let mut struct_subst: std::collections::BTreeMap<
         tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm> =
         std::collections::BTreeMap::new();
+    let mut all_struct_ok = true;
     for eq in &eqs {
         if !structural_match(&eq.lhs, &eq.rhs, &pattern_vars, &mut struct_subst) {
-            return None;
+            all_struct_ok = false;
+            break;
         }
     }
-    let m: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)> =
-        struct_subst.into_iter().collect();
-    let _ = maude;
+    let m: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)>;
+    if all_struct_ok {
+        m = struct_subst.into_iter().collect();
+    } else {
+        // AC-fallback: structural matcher can't handle AC-symbol
+        // arguments (e.g. `exp(g, Mult(a, b))` vs
+        // `exp(g, Mult(b, a))`).  HS's `matchAction` calls
+        // `solveMatchLNTerm` (`runReader` over MaudeHandle) which
+        // delegates to Maude for AC.  Without this, DH-protocol lemmas
+        // like MTI_C0::Secrecy_..._Initiator fail to fire
+        // `impliedFormulas` on `AcceptedR(... exp(g, ~tid*~x.5) ...)`
+        // and the search enumerates spurious Sessionkey_Reveal cases.
+        // Maude.hs's `match` requires a ground subject; we skolemize
+        // subject-side free vars via `match_eqs_const_subject` (which
+        // mirrors HS's `SkConst` encoding from `skolemizeGuarded`).
+        if std::env::var("TAM_DBG_IMPL").is_ok() {
+            eprintln!("[impl] AC-fallback for {} @ {:?}: {} eqs",
+                g_fact.name, i, eqs.len());
+        }
+        let maude_res = maude.match_eqs_const_subject(&eqs, &pattern_vars);
+        let Ok(mut matches) = maude_res else { return None };
+        if matches.is_empty() { return None; }
+        // Take the first match (HS's matchAction's `runReader` returns
+        // a list; `candidateSubsts` does `do { sysAct <- sysActions;
+        // subst' <- matchAction ...; ... }` — we mirror this with the
+        // `for i, fa_sys in sys_actions` outer loop, and the first
+        // Maude-returned match is sufficient since later guards refine
+        // via `combine_substs`).
+        m = matches.remove(0);
+    }
 
     // Translate the LVar → LNTerm matches back to parser-AST.
     // Record bindings for universal-bound vars only — free system
