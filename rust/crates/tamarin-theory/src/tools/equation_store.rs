@@ -1770,6 +1770,45 @@ impl EquationStore {
         //
         // `TAM_RS_DISABLE_PER_VARIANT_COUNTER_RESET=1` opts out for diagnosis.
         let per_variant_reset = std::env::var("TAM_RS_DISABLE_PER_VARIANT_COUNTER_RESET").is_err();
+        // HS-faithful local-per-call counter mode: each `applyBound`
+        // invocation runs `renameAvoiding (range) avoidSet` →
+        // `evalFreshAvoiding (rename ...)` which seeds the supply at
+        // `succ (max idx in avoidSet)` LOCALLY — bounded by the call's
+        // own `avoid_max`, NOT the global session counter (LTerm.hs:647-664,
+        // EquationStore.hs:413-420).  RS previously used Maude's global
+        // counter for these per-variant witness allocations; because
+        // `ensure_above` is monotone, the counter advances to the
+        // high-water mark of all prior calls and never bounds back down.
+        // For long apply_eq_store cascades (e.g. SignedDH_PFS), this
+        // means later variants get witness idxs THOUSANDS higher than
+        // HS's, FLIPPING the SubstVFresh Ord that ranks the resulting
+        // arms in `perform_split` — observable as the swapped
+        // `solve…case Init_1/Resp/c_exp` block vs `by contradiction`
+        // ordering at the leaf level.
+        //
+        // When `TAM_RS_APPLYBOUND_LOCAL_RESET` is set (default-on after
+        // verification), each per-variant Maude call uses a LOCAL
+        // MaudeHandle (via `with_fresh_counter_from(avoid_max)`).  The
+        // local handle shares the underlying Maude process state but
+        // has its own counter that starts at `succ avoid_max` PER call.
+        // The global counter is untouched by these calls, so subsequent
+        // non-applyBound allocations (rule freshening, sources) keep
+        // their cross-call uniqueness guarantee (TESLA Sender0a).
+        //
+        // The witnesses minted here all live inside SubstVFresh range
+        // values (α-equivalent up to witness rename — VFresh-local), so
+        // discarding the local counter on exit cannot cause downstream
+        // collisions: `bounds_max` walks only the SubstVFresh DOMAIN
+        // keys (reduction.rs:2987-2994), so it won't reserve witnesses
+        // — but downstream Maude calls compute their own per-call
+        // `avoid_max` and use the global counter (which is the union
+        // of every non-applyBound allocation we've done so far), so
+        // they're guaranteed disjoint from any applyBound witness by
+        // VFresh α-equivalence.
+        //
+        // Opt-out via `TAM_RS_DISABLE_APPLYBOUND_LOCAL_RESET=1`.
+        let applybound_local_reset =
+            std::env::var("TAM_RS_DISABLE_APPLYBOUND_LOCAL_RESET").is_err();
         let initial_counter = maude.fresh_counter_peek();
         let mut high_water_mark = initial_counter;
         for d in self.conj.iter() {
@@ -1788,7 +1827,10 @@ impl EquationStore {
                 }
                 // HS-faithful: reset counter before each per-variant
                 // call so each variant's witness allocation starts fresh.
-                if per_variant_reset {
+                // Skipped when the local-handle path is on (the local
+                // handle has its own counter; the global one is left
+                // alone).
+                if per_variant_reset && !applybound_local_reset {
                     high_water_mark = high_water_mark.max(maude.fresh_counter_peek());
                     maude.reset_counter_to(initial_counter);
                 }
@@ -1875,6 +1917,28 @@ impl EquationStore {
                         e.rhs.for_each_free(&mut |v| if v.idx > max_idx { max_idx = v.idx; });
                     }
                 }
+                // HS-faithful local Maude handle for this `applyBound`
+                // invocation.  When `applybound_local_reset` is on, the
+                // unification, the witness lift (`reserve_idxs`), and
+                // the post-unify `reduce` calls all draw witness idxs
+                // from a fresh local counter seeded at `succ avoid_max`
+                // (mirroring HS's `evalFreshAvoiding (range) avoidSet`,
+                // LTerm.hs:647-664).  The Maude process state is shared
+                // (Arc cloned), only the counter is per-call — so the
+                // global counter advances ONLY for non-applyBound
+                // allocations.  See [[locked diagnosis 2026-06-04]].
+                let local_maude_owned;
+                let aes_maude: &tamarin_term::maude_proc::MaudeHandle =
+                    if applybound_local_reset {
+                        // Seed local counter at `max(avoid_max, max_idx)`
+                        // so witnesses don't collide with any var in the
+                        // unification problem either.
+                        let seed = avoid_max.max(max_idx);
+                        local_maude_owned = maude.with_fresh_counter_from(seed);
+                        &local_maude_owned
+                    } else {
+                        maude
+                    };
                 if let Some(input) = &dbg_in {
                     eprintln!("[rs-aes-applyBound] IN  : {:?}", input);
                 }
@@ -1895,16 +1959,16 @@ impl EquationStore {
                     eprintln!("[rs-aes-detail]   eqs: {:?}", eqs.iter().map(|e|
                         format!("{:?} =? {:?}", e.lhs, e.rhs)).collect::<Vec<_>>());
                 }
-                let counter_before_maude = maude.fresh_counter_peek();
-                let unifiers = match maude.unify_at_with_avoid(
+                let counter_before_maude = aes_maude.fresh_counter_peek();
+                let unifiers = match aes_maude.unify_at_with_avoid(
                     "apply_eq_store::re_unify", &eqs, max_idx) {
                     Ok(u) => u,
                     Err(e) => return Err(AddEqsError::Maude(format!("{}", e))),
                 };
                 if detail_dbg {
                     eprintln!("[rs-aes-detail] counter_after={} delta={} #unifiers={}",
-                        maude.fresh_counter_peek(),
-                        maude.fresh_counter_peek().saturating_sub(counter_before_maude),
+                        aes_maude.fresh_counter_peek(),
+                        aes_maude.fresh_counter_peek().saturating_sub(counter_before_maude),
                         unifiers.len());
                     for (i, u) in unifiers.iter().enumerate() {
                         eprintln!("[rs-aes-detail]   unifier[{}]: {:?}", i, u);
@@ -2010,11 +2074,12 @@ impl EquationStore {
                         });
                     }
                     // For each S in to_lift, allocate a fresh witness W
-                    // of S's sort.  Use the maude handle's global
-                    // counter so witness idxs don't collide.
+                    // of S's sort.  Use the local applyBound handle so
+                    // these witnesses share the per-call counter and
+                    // don't advance the global session counter.
                     let mut witnesses: Vec<(LVar, LVar)> = Vec::new();
                     if !to_lift.is_empty() {
-                        let base = maude.reserve_idxs(to_lift.len() as u64);
+                        let base = aes_maude.reserve_idxs(to_lift.len() as u64);
                         for (i, s) in to_lift.iter().enumerate() {
                             let w = LVar {
                                 name: s.name.clone(),
@@ -2054,7 +2119,12 @@ impl EquationStore {
                     // Opt-out via `TAM_RS_DISABLE_AES_NORM=1`.
                     if std::env::var("TAM_RS_DISABLE_AES_NORM").is_err() {
                         for (_, v) in lifted.iter_mut() {
-                            if let Ok(reduced) = maude.reduce(v) {
+                            // Use `aes_maude` so any internal witness
+                            // allocation in reduce() stays in the local
+                            // counter scope (in practice `reduce` is
+                            // pure normalisation, but the handle is
+                            // passed for consistency).
+                            if let Ok(reduced) = aes_maude.reduce(v) {
                                 *v = reduced;
                             }
                         }
@@ -2152,10 +2222,23 @@ impl EquationStore {
         // Without this, subsequent Maude calls might reuse witness idxs
         // already consumed by the per-variant outputs, causing
         // (name, sort, idx) collisions in the eq-store.
-        if per_variant_reset {
+        //
+        // In `applybound_local_reset` mode, this is unnecessary: each
+        // per-variant call uses its OWN counter (a local MaudeHandle
+        // clone), so the global counter never advanced from those calls
+        // in the first place.  The witnesses minted live only inside
+        // SubstVFresh range values, which are α-equivalent up to witness
+        // rename — VFresh-local.  Any subsequent allocation that needs
+        // to avoid these witnesses will see them via `bounds_max`'s
+        // walk of `eq_store.conj` (reduction.rs:2987-2994), which counts
+        // domain keys; the range/witness idxs don't affect cross-call
+        // uniqueness because they're per-SubstVFresh.
+        if per_variant_reset && !applybound_local_reset {
             high_water_mark = high_water_mark.max(maude.fresh_counter_peek());
             maude.ensure_above(high_water_mark.saturating_sub(1));
         }
+        // Silence the unused-warning when local-reset is on.
+        let _ = (initial_counter, high_water_mark);
         self.conj = new_conj;
         self.subst = new_subst;
         Ok(())
