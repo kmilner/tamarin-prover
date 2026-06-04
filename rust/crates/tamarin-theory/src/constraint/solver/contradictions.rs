@@ -405,13 +405,72 @@ fn root_sym(t: &tamarin_term::lterm::LNTerm) -> Option<RootSym> {
     }
 }
 
-/// `possibleEndSyms`: collect the root symbol of `t` and recursively
-/// of all its subterms.  Returns `None` if any subterm's root symbol
-/// is undetermined (Msg-var).
+/// Match DH-special cases (`FExp`, `FPMult`, `FEMap`) of HS's
+/// `viewTerm2`.  Returns one of:
+///   - `Some(DhKind::Exp(base))`: term is `exp(base, _)` — caller
+///     should recurse into `base` only (the exponent isn't reachable
+///     via subterm decomposition).
+///   - `Some(DhKind::PMult(scalar_base))`: term is `pmult(_, base)` —
+///     recurse into `base` only, prepend `[exp, pmult, emap]`.
+///   - `Some(DhKind::EMap)`: term is `em(_, _)` — return `[emap]`.
+///   - `None`: not a DH-special form; fall back to generic walk.
+fn dh_view(t: &tamarin_term::lterm::LNTerm) -> Option<DhView<'_>> {
+    use tamarin_term::function_symbols::{exp_sym, pmult_sym, CSym, FunSym};
+    use tamarin_term::term::Term;
+    if let Term::App(sym, args) = t {
+        match sym {
+            FunSym::NoEq(s) if *s == exp_sym() && args.len() == 2 =>
+                Some(DhView::Exp(&args[0])),
+            FunSym::NoEq(s) if *s == pmult_sym() && args.len() == 2 =>
+                Some(DhView::PMult(&args[1])),
+            FunSym::C(CSym::EMap) => Some(DhView::EMap),
+            _ => None,
+        }
+    } else { None }
+}
+
+enum DhView<'a> {
+    Exp(&'a tamarin_term::lterm::LNTerm),
+    PMult(&'a tamarin_term::lterm::LNTerm),
+    EMap,
+}
+
+/// `possibleEndSyms`: HS-faithful port using `viewTerm2` to apply DH-
+/// special cases (FExp/FPMult/FEMap).  Mirrors Sources.hs:277-286.
 fn possible_end_syms(
     t: &tamarin_term::lterm::LNTerm,
 ) -> Option<Vec<RootSym>> {
+    use tamarin_term::function_symbols::{exp_sym, pmult_sym, CSym, FunSym};
     use tamarin_term::term::Term;
+    // HS `viewTerm2` special cases first:
+    match dh_view(t) {
+        Some(DhView::Exp(base)) => {
+            // ((Right (NoEq expSym)):) <$> possibleEndSyms a
+            let mut out = vec![RootSym::Sym(FunSym::NoEq(exp_sym()))];
+            let rest = possible_end_syms(base)?;
+            out.extend(rest);
+            return Some(out);
+        }
+        Some(DhView::PMult(base)) => {
+            // ((Right <$> [NoEq expSym, NoEq pmultSym, C EMap])++) <$> possibleEndSyms a
+            let mut out = vec![
+                RootSym::Sym(FunSym::NoEq(exp_sym())),
+                RootSym::Sym(FunSym::NoEq(pmult_sym())),
+                RootSym::Sym(FunSym::C(CSym::EMap)),
+            ];
+            let rest = possible_end_syms(base)?;
+            out.extend(rest);
+            return Some(out);
+        }
+        Some(DhView::EMap) => {
+            return Some(vec![RootSym::Sym(FunSym::C(CSym::EMap))]);
+        }
+        None => {}
+    }
+    // Generic (non-DH) case.  HS:
+    //   _ -> case viewTerm t of
+    //          Lit _ -> (:[]) <$> rootSym t
+    //          FApp o args -> ((Right o):) . concat <$> mapM possibleEndSyms args
     let head = root_sym(t)?;
     match t {
         Term::App(_, args) => {
@@ -426,17 +485,55 @@ fn possible_end_syms(
     }
 }
 
-/// `possibleRootSyms`: same as `possible_end_syms` but returns
-/// `Some([])` (no possible decomposition) when the term cannot
-/// contain fresh names or private functions — equivalent to
+/// `possibleRootSyms`: HS-faithful port using `viewTerm2` to apply DH-
+/// special cases.  Mirrors Sources.hs:288-299.  Returns `Some([])`
+/// (no possible decomposition) when the term cannot contain fresh
+/// names or private functions — equivalent to
 /// `isForbiddenDeconstruction`.
 fn possible_root_syms(
     t: &tamarin_term::lterm::LNTerm,
 ) -> Option<Vec<RootSym>> {
+    use tamarin_term::function_symbols::{exp_sym, pmult_sym, CSym, FunSym};
+    use tamarin_term::term::Term;
     if never_contains_fresh_priv(t) {
         return Some(Vec::new());
     }
-    possible_end_syms(t)
+    // HS `viewTerm2` special cases first:
+    match dh_view(t) {
+        Some(DhView::Exp(base)) => {
+            let mut out = vec![RootSym::Sym(FunSym::NoEq(exp_sym()))];
+            let rest = possible_root_syms(base)?;
+            out.extend(rest);
+            return Some(out);
+        }
+        Some(DhView::PMult(base)) => {
+            let mut out = vec![
+                RootSym::Sym(FunSym::NoEq(exp_sym())),
+                RootSym::Sym(FunSym::NoEq(pmult_sym())),
+                RootSym::Sym(FunSym::C(CSym::EMap)),
+            ];
+            let rest = possible_root_syms(base)?;
+            out.extend(rest);
+            return Some(out);
+        }
+        Some(DhView::EMap) => {
+            return Some(vec![RootSym::Sym(FunSym::C(CSym::EMap))]);
+        }
+        None => {}
+    }
+    // Generic case.
+    let head = root_sym(t)?;
+    match t {
+        Term::App(_, args) => {
+            let mut out = vec![head];
+            for a in args {
+                let sub = possible_root_syms(a)?;
+                out.extend(sub);
+            }
+            Some(out)
+        }
+        Term::Lit(_) => Some(vec![head]),
+    }
 }
 
 /// `hasForbiddenKD` — port of Haskell's
