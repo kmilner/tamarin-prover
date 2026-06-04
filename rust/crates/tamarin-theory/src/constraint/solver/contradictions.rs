@@ -1,12 +1,12 @@
 //! Port of `Theory.Constraint.Solver.Contradictions`.
 //!
 //! Identifies all reasons a `System` is contradictory. The full
-//! Haskell version probes ~12 conditions, several of which require
-//! Maude-backed normalisation and signature-aware checks (forbidden
-//! KD/Exp/BP, normal form, injective fact instances). For the
-//! Rust port we implement the cheap structural ones now and stub the
-//! Maude-dependent ones with `false`-returning placeholders to mark
-//! their place.
+//! Haskell version probes ~12 conditions. Most are pure structural
+//! checks (cycles, false formulas, fact incompatibilities); a few
+//! consult signature-aware helpers (`nf_via_haskell`,
+//! `irreducible_fun_syms`, `enableDH`).  ForbiddenBP remains
+//! unported (small corpus impact); everything else has a faithful
+//! port below.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -159,8 +159,11 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
     if _ctxt.maude.maude_sig().enable_dh && has_forbidden_exp(sys) {
         out.push(Contradiction::ForbiddenExp);
     }
-    // Maude-dependent: NonNormalTerms / ForbiddenBP —
-    // left for the Maude-driven fill.
+    // ForbiddenBP — still unported (the BP-using corpus is small).
+    // Despite the original "Maude-dependent" comment, the HS BP
+    // check is structural (Contradictions.hs:357-388 mirrors the
+    // ForbiddenExp shape over `em`/`pmult`/`one`) and a future port
+    // can follow the ForbiddenExp pattern.
     out.extend(node_after_last(sys));
     out.extend(non_injective_fact_instances(_ctxt, sys));
     out
@@ -168,34 +171,49 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
 
 /// `hasNonNormalTerms` — port of Haskell's
 /// `Theory.Constraint.Solver.Contradictions.hasNonNormalTerms`
-/// (`Contradictions.hs:143`).
+/// (`Contradictions.hs:163-166`).
+///
+/// HS spec:
+/// ```haskell
+/// hasNonNormalTerms sig se =
+///     any (not . (`runReader` hnd) . nf') (maybeNonNormalTerms hnd se)
+///   where hnd = L.get sigmMaudeHandle sig
+/// ```
+///
+/// And `nf' = nfViaHaskell` (Norm.hs:130-131) — a PURE structural
+/// NF check that walks the term tree against the reducibility
+/// patterns in Norm.hs:60-99.  This is NOT a Maude-driven check;
+/// it's pattern-based on the signature's reducibility shape.
 ///
 /// Walks every node's premise, conclusion, action facts and
 /// `new_vars`; for each subterm whose head could be reducible,
-/// asks Maude whether the term equals its own reduction.  If any
-/// term is not in normal form, the system is contradictory (we
-/// only ever construct normal-form-respecting traces).
+/// asks `nf_via_haskell` whether the term is in normal form.  If
+/// any term is not in NF, the system is contradictory (we only
+/// ever construct normal-form-respecting traces).
 ///
 /// Skip optimization: when the proof context's signature has an
 /// empty `reducible_fun_syms` set (e.g. pair-only or hashing-only,
 /// which have no rewrite rules with a reducible head — all
 /// destructors come from intruder rules, not subterm rewriting),
 /// no term can be in non-normal form structurally, so we skip
-/// the per-term Maude calls.
+/// the per-term check.
+///
+/// The previous Rust implementation used `maude.reduce(t) != t`
+/// (mirroring `nfViaMaude`, Norm.hs:134-136 — `nfViaMaude sortOf t
+/// = (t ==) <$> norm sortOf t`).  HS does NOT use `nfViaMaude` for
+/// this purpose; it uses `nf'`.  The two predicates can disagree
+/// on AC operator argument order (Maude canonicalises `mult(tid,
+/// x)` and `mult(x, tid)` to the same form, but the pure
+/// structural check treats both as in NF) — the same reason
+/// `subst_creates_non_normal_terms` was switched to `nf_via_haskell`
+/// in commit `a7b2e3c5`.  The two checks are observably equivalent
+/// on the current corpus (no lemma's verdict changes) but the
+/// mechanism alignment to HS source is the point.
 fn has_non_normal_terms(ctx: &ProofContext, sys: &System) -> bool {
-    // Maude `reduce` is expensive; we call this from `is_finished`
-    // which runs on every expand step.  We early-exit when the
-    // signature has no reducible function symbols (line below) —
-    // for pair-only theories this short-circuits with no Maude
-    // call.  For theories with destructors (sdec, fst, snd, etc.),
-    // this check is soundness-critical: it catches stuck
-    // destructor applications like `snd(sdec(~mw, ~k))` where the
-    // first arg isn't a senc, which Tamarin's NF-respecting trace
-    // semantics rule out.  Without this, false-positive Solved
-    // leaves slip through on `[sources]` typing lemmas like
-    // `Typing_and_Destructors::type_assertion` where the
-    // c_fresh-constructed In(~mw) makes the Responder rule's
-    // `let body = sdec(msg, key)` produce non-normalisable terms.
+    // NF check is cheap (pure structural walk) but we call this
+    // from `is_finished` on every expand step, so the early-exit
+    // still helps for pair-only theories with no subterm rewrite
+    // rules.
     //
     // Set TAM_SKIP_NF=1 to disable (e.g. for speed-critical probes).
     if std::env::var("TAM_SKIP_NF").is_ok() { return false; }
@@ -220,12 +238,11 @@ fn has_non_normal_terms(ctx: &ProofContext, sys: &System) -> bool {
     }
     if candidates.is_empty() { return false; }
 
-    // Ask Maude for each candidate.  Short-circuit on the first
-    // term whose reduction differs from itself.
+    // HS-faithful NF check: `nf'` = `nfViaHaskell` (Norm.hs:131).
+    // Short-circuit on the first term that is NOT in NF.
     for t in &candidates {
-        match ctx.maude.reduce(t) {
-            Ok(t_red) => if &t_red != t { return true; }
-            Err(_) => continue, // be conservative on Maude errors
+        if !tamarin_term::norm::nf_via_haskell(&ctx.maude, t) {
+            return true;
         }
     }
     false
