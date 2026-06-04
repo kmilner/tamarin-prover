@@ -190,10 +190,35 @@ pub fn cmp_term(a: &GTerm, b: &GTerm) -> std::cmp::Ordering {
         (Pair(a1), Pair(a2)) => cmp_slice(a1, a2, cmp_term),
         (Diff(l1, r1), Diff(l2, r2)) =>
             cmp_term(l1, l2).then_with(|| cmp_term(r1, r2)),
-        (BinOp(o1, l1, r1), BinOp(o2, l2, r2)) =>
-            binop_tag(o1).cmp(&binop_tag(o2))
-                .then_with(|| cmp_term(l1, l2))
-                .then_with(|| cmp_term(r1, r2)),
+        // HS-faithful: for AC binary ops (Mult/Union/Xor/NatPlus), HS's
+        // `FAPP (AC op) args` has args as a flat sorted multiset list;
+        // `derived Ord` on FAPP compares operator then args list.  RS's
+        // nested `BinOp(o, l, r)` representation hides this — two
+        // structurally distinct trees with the same flat multiset
+        // content (e.g. `Union(Union(a,b), c)` vs `Union(a, Union(b,c))`)
+        // would compare differently here, even though HS sees them as
+        // identical `FAPP (AC Union) [a,b,c]`.
+        //
+        // Mirror HS by flattening AC chains into a sorted multiset key
+        // before comparison.  Exp is NOT AC and uses structural compare.
+        (BinOp(o1, l1, r1), BinOp(o2, l2, r2)) => {
+            let tag_cmp = binop_tag(o1).cmp(&binop_tag(o2));
+            if tag_cmp != std::cmp::Ordering::Equal { return tag_cmp; }
+            if is_ac_binop(o1) {
+                let mut args_a = Vec::new();
+                let mut args_b = Vec::new();
+                flatten_ac_binop(o1, a, &mut args_a);
+                flatten_ac_binop(o2, b, &mut args_b);
+                // HS-faithful: `FAPP (AC op) args` has args sorted as a
+                // multiset (Maude canonicalises).  Sort both sides via
+                // cmp_term so structurally-permuted AC chains collapse.
+                args_a.sort_by(cmp_term);
+                args_b.sort_by(cmp_term);
+                cmp_slice(&args_a, &args_b, cmp_term)
+            } else {
+                cmp_term(l1, l2).then_with(|| cmp_term(r1, r2))
+            }
+        }
         (PatMatch(a1), PatMatch(a2)) => cmp_term(a1, a2),
         _ => std::cmp::Ordering::Equal,
     }
@@ -235,6 +260,28 @@ fn binop_tag(o: &p::BinOp) -> u8 {
     use p::BinOp::*;
     match o {
         Exp => 0, Mult => 1, Union => 2, Xor => 3, NatPlus => 4,
+    }
+}
+
+/// HS-faithful: which `BinOp`s are AC (associative-commutative)?
+/// Mirrors HS's `MaudeSig`-attribute classification: Mult, Union, Xor,
+/// NatPlus are AC; Exp is NOT (right-associative algebraic).
+fn is_ac_binop(o: &p::BinOp) -> bool {
+    use p::BinOp::*;
+    matches!(o, Mult | Union | Xor | NatPlus)
+}
+
+/// Flatten an AC-BinOp chain into a flat arg list.  E.g.
+/// `BinOp(Union, BinOp(Union, a, b), c)` flattens to `[a, b, c]`.
+/// Non-matching outer terms are pushed verbatim (no recursion into
+/// nested non-Union/non-same-op subtrees).
+fn flatten_ac_binop(op: &p::BinOp, t: &GTerm, out: &mut Vec<GTerm>) {
+    match t {
+        GTerm::BinOp(inner_op, l, r) if inner_op == op => {
+            flatten_ac_binop(op, l, out);
+            flatten_ac_binop(op, r, out);
+        }
+        _ => out.push(t.clone()),
     }
 }
 
