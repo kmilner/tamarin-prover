@@ -731,7 +731,31 @@ fn is_not_auth_out(a: &AnnotatedGoal) -> bool {
     }
 }
 fn is_private_knows_goal(a: &AnnotatedGoal) -> bool {
-    msg_premise(&a.goal).map(contains_private).unwrap_or(false)
+    // HS `isPrivateKnowsGoal` (ProofMethod.hs:272-275):
+    //   isPrivateKnowsGoal goal = case msgPremise goal of
+    //     Just t -> isPrivateFunction t
+    //     _     -> False
+    // and `isPrivateFunction` (Term.hs:203-205) checks ONLY the TOP-LEVEL
+    // function symbol — it does NOT recurse into subterms:
+    //   isPrivateFunction (viewTerm -> FApp (NoEq (_, (_,Private,_))) _) = True
+    //   isPrivateFunction _                                            = False
+    //
+    // Previously we used `contains_private` (recursive) here, which
+    // mis-classified e.g. `KU(exp(Y, h1(<~ex, sk($A)>)))` as a
+    // private-knows goal because `sk` (private) appears deep inside.
+    // That collided with the genuine private-knows goal `KU(sk($A))` at
+    // the same slot, and the goalNr tie-break picked the wrong one —
+    // causing case-order swaps in NAXOS_eCK_PFS_private (and the
+    // non-PFS variant NAXOS_eCK_private).
+    msg_premise(&a.goal).map(is_private_function_toplevel).unwrap_or(false)
+}
+
+/// HS `isPrivateFunction` (Term.hs:203-205): top-level function symbol
+/// is Private.  Does NOT recurse into subterms.
+fn is_private_function_toplevel(t: &tamarin_term::lterm::LNTerm) -> bool {
+    use tamarin_term::function_symbols::{FunSym, NoEqSym, Privacy};
+    use tamarin_term::term::Term;
+    matches!(t, Term::App(FunSym::NoEq(NoEqSym { privacy: Privacy::Private, .. }), _))
 }
 fn is_fresh_knows_goal(a: &AnnotatedGoal) -> bool {
     use tamarin_term::lterm::LSort;
