@@ -150,6 +150,18 @@ pub fn elaborate_with_diagnostics(
 /// in-place against any `predicates:` declarations.
 pub fn elaborate(parser_thy: &p::Theory) -> Result<Theory, ElabError> {
     let mut thy_clone = parser_thy.clone();
+    // Apply macros at parser-AST level BEFORE predicate expansion.
+    // Mirrors HS's parse-time application: lemmas are expanded by
+    // `parseLemmaWithMacros` (Theory/Text/Parser.hs:97-105); rules by
+    // `closeProtoRule` (lib/theory/src/Rule.hs:96-98) before
+    // variantsProtoRule runs; restrictions by `applyMacroInRestriction`
+    // (Theory/Model/Restriction.hs:163-165).  We apply at the parser-AST
+    // level so a single pass handles every term-bearing item before any
+    // typed conversion (`term_to_lnterm` / `formula_to_guarded`) sees a
+    // macro call.  Predicate-expand may itself substitute the inlined
+    // predicate body into use sites, and the body could contain macro
+    // calls — so expand macros first.
+    crate::macro_expand::expand_theory_macros(&mut thy_clone);
     if let Err(e) = crate::predicate_expand::expand_theory_formulas(&mut thy_clone) {
         return Err(ElabError {
             message: format!("predicate expansion failed: {}", e.message),
@@ -493,6 +505,23 @@ fn elaborate_items(
                         Some(t) => t,
                         None => continue, // best-effort, skip on failure
                     };
+                    // Register macro fun-sym in MaudeSig — mirrors HS
+                    // `addMacroSym (op,(k,Private,Destructor))`
+                    // (Theory/Text/Parser/Macro.hs:48) and
+                    // `macroToFunSym` (Term/Macro.hs:30).  After parser-
+                    // AST macro expansion (run in `elaborate()` above)
+                    // call sites no longer reference the macro name, but
+                    // the fun-sym must still be present in MaudeSig so
+                    // Maude / source precomputation / round-trip parsers
+                    // see the same signature as HS.
+                    let sym = NoEqSym::new(
+                        m.name.as_bytes().to_vec(),
+                        args.len(),
+                        Privacy::Private,
+                        Constructability::Destructor,
+                    );
+                    out.signature.maude_sig =
+                        out.signature.maude_sig.clone().add_macro_sym(sym);
                     ms.push(LNMacro { name: m.name.clone(), args, body });
                 }
                 if !ms.is_empty() { out.items.push(TheoryItem::Macros(ms)); }

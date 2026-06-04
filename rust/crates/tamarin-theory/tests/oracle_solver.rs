@@ -631,7 +631,11 @@ fn corpus_verdict_match_coverage_probe() {
         // that consumed an incomplete source — preserving soundness
         // (no wrong-VERIFIED).
         if src.contains("diff(") { return None; }
-        if src.contains("macros:") || src.contains("predicates:") { return None; }
+        // Macros are now supported via parser-AST macro expansion
+        // (tamarin_theory::macro_expand).  Predicates still need their
+        // own port (RS predicate_expand handles formulas but elaborate
+        // skips predicate items at the typed layer).
+        if src.contains("predicates:") { return None; }
         if src.contains("process:") { return None; }
         if src.contains("builtins:") &&
            (src.contains("diffie-hellman") || src.contains("multiset") ||
@@ -886,7 +890,9 @@ fn corpus_proof_skeleton_match_probe() {
     let files: Vec<FileWork> = paths.par_iter().enumerate().filter_map(|(idx, path)| {
         let src = std::fs::read_to_string(path).ok()?;
         if src.contains("diff(") { return None; }
-        if src.contains("macros:") || src.contains("predicates:") { return None; }
+        // Macros are now supported via parser-AST macro expansion
+        // (tamarin_theory::macro_expand).
+        if src.contains("predicates:") { return None; }
         if src.contains("process:") { return None; }
         if src.contains("builtins:") &&
            (src.contains("multiset") ||
