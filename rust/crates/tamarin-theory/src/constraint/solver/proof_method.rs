@@ -603,7 +603,16 @@ pub fn exec_proof_method(
                         let key = if total > 1 {
                             let n = seen.entry(name.clone()).or_default();
                             *n += 1;
-                            format!("{}_case_{}", name, *n)
+                            // HS-faithful zero-padding: ProofMethod.hs:485-490
+                            //   distinguish n =
+                            //     [ (\(x,y) -> (... x ++ "_case_" ++ pad (show i), y))
+                            //     | i <- [(1::Int)..] ]
+                            //     where l      = length (show n)
+                            //           pad cs = replicate (l - length cs) '0' ++ cs
+                            // For total<10 width=1 (no padding); total>=10 width=2 ("01"..);
+                            // total>=100 width=3, etc.
+                            let width = total.to_string().len();
+                            format!("{}_case_{:0width$}", name, *n, width = width)
                         } else {
                             name
                         };
