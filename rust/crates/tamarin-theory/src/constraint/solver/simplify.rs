@@ -1300,12 +1300,18 @@ fn try_match_all_guards(
                 for (i, fa_sys) in sys_actions {
                     if &g_fact_subst.name != &fact_name(&fa_sys.tag) { continue; }
                     if g_fact_subst.args.len() != fa_sys.terms.len() { continue; }
-                    let Some(subst_here) = match_atom_via_maude(
-                        maude, vars, &g_fact_subst, &g_time_subst, i, &fa_sys.terms) else { continue };
-                    let Some(combined) = combine_substs(acc, &subst_here) else { continue };
-                    rec(maude, vars, guards, guard_idx + 1, sys_actions,
-                        &combined, body, existing_formulas, existing_solved,
-                        other_guards, sys, sys_maude, out);
+                    // HS-faithful: AC matching can yield multiple matchers
+                    // per (sys_action, pattern) pair. HS's `candidateSubsts`
+                    // (System.hs:1131-1135) iterates them via the list monad
+                    // — each match becomes its own candidate substitution.
+                    let substs_here = match_atom_via_maude(
+                        maude, vars, &g_fact_subst, &g_time_subst, i, &fa_sys.terms);
+                    for subst_here in substs_here {
+                        let Some(combined) = combine_substs(acc, &subst_here) else { continue };
+                        rec(maude, vars, guards, guard_idx + 1, sys_actions,
+                            &combined, body, existing_formulas, existing_solved,
+                            other_guards, sys, sys_maude, out);
+                    }
                 }
             }
             AAtom::Eq(s, t) => {
@@ -1571,16 +1577,16 @@ fn match_atom_via_maude(
     g_time: &tamarin_parser::ast::Term,
     i: &crate::constraint::constraints::NodeId,
     sys_args: &[tamarin_term::lterm::LNTerm],
-) -> Option<crate::guarded::VarSubst> {
+) -> Vec<crate::guarded::VarSubst> {
     use crate::guarded::VarSubst;
     use tamarin_parser::ast::Term as ATerm;
-    let mut subst = VarSubst::new();
+    let mut base_subst = VarSubst::new();
 
     // Time variable: must be a universal var; bind directly to the
     // system node id.
-    let ATerm::Var(g_t) = g_time else { return None };
+    let ATerm::Var(g_t) = g_time else { return Vec::new() };
     if !vars.iter().any(|v| v.name == g_t.name && v.idx == g_t.idx) {
-        return None;
+        return Vec::new();
     }
     let i_term = tamarin_parser::ast::Term::Var(tamarin_parser::ast::VarSpec {
         name: i.name.clone(),
@@ -1588,20 +1594,22 @@ fn match_atom_via_maude(
         sort: tamarin_parser::ast::SortHint::Node,
         typ: None,
     });
-    subst.insert((g_t.name.clone(), g_t.idx), i_term);
+    base_subst.insert((g_t.name.clone(), g_t.idx), i_term);
 
     // Build LNTerm patterns from g_fact.args and try to AC-match
     // them against sys_args. We send all pairwise equations to
     // Maude in one call so cross-arg constraints unify together.
     let mut eqs = Vec::new();
     for (g_arg, sys_term) in g_fact.args.iter().zip(sys_args.iter()) {
-        let pat = crate::elaborate::term_to_lnterm(g_arg)?;
+        let pat = match crate::elaborate::term_to_lnterm(g_arg) {
+            Some(p) => p, None => return Vec::new(),
+        };
         eqs.push(tamarin_term::rewriting::Equal {
             lhs: pat,
             rhs: sys_term.clone(),
         });
     }
-    if eqs.is_empty() { return Some(subst); }
+    if eqs.is_empty() { return vec![base_subst]; }
 
     // Structural matching: Haskell's `solveMatchLTerm` (Term/Subsumption.hs)
     // first attempts a pure structural matcher, then defers AC-shape
@@ -1624,9 +1632,14 @@ fn match_atom_via_maude(
             break;
         }
     }
-    let m: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)>;
+    let ms: Vec<Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)>>;
     if all_struct_ok {
-        m = struct_subst.into_iter().collect();
+        // Structural matcher yields a unique match (when it succeeds).
+        // HS's `matchRaw` succeeds with exactly one substitution per
+        // term pair when no `ACProblem` is raised — `matchTerms ms hnd`
+        // at Term/Unification.hs:209 returns `[substFromMap mappings]`,
+        // a single-element list.
+        ms = vec![struct_subst.into_iter().collect()];
     } else {
         // AC-fallback: structural matcher can't handle AC-symbol
         // arguments (e.g. `exp(g, Mult(a, b))` vs
@@ -1639,41 +1652,53 @@ fn match_atom_via_maude(
         // Maude.hs's `match` requires a ground subject; we skolemize
         // subject-side free vars via `match_eqs_const_subject` (which
         // mirrors HS's `SkConst` encoding from `skolemizeGuarded`).
+        //
+        // HS-faithful: Maude's AC `match` can return MULTIPLE matchers
+        // for a single pattern/subject pair (e.g. `match Union(a,x) <=?
+        // Union(b,c)` yields both `{a:=b, x:=c}` and `{a:=c, x:=b}`).
+        // HS's `candidateSubsts` (System.hs:1131-1135) iterates them via
+        // the list monad:
+        //   subst' <- (`runReader` hnd) $ matchAction sysAct ...
+        //   candidateSubsts (compose subst' subst) as
+        // — each match becomes its OWN candidate substitution that
+        // propagates into the next guard's matching call.  Previously
+        // Rust took `matches.remove(0)` (the first match only), which
+        // would silently under-fire whenever Maude returned >1 matcher.
         if std::env::var("TAM_DBG_IMPL").is_ok() {
             eprintln!("[impl] AC-fallback for {} @ {:?}: {} eqs",
                 g_fact.name, i, eqs.len());
         }
         let maude_res = maude.match_eqs_const_subject(&eqs, &pattern_vars);
-        let Ok(mut matches) = maude_res else { return None };
-        if matches.is_empty() { return None; }
-        // Take the first match (HS's matchAction's `runReader` returns
-        // a list; `candidateSubsts` does `do { sysAct <- sysActions;
-        // subst' <- matchAction ...; ... }` — we mirror this with the
-        // `for i, fa_sys in sys_actions` outer loop, and the first
-        // Maude-returned match is sufficient since later guards refine
-        // via `combine_substs`).
-        m = matches.remove(0);
+        let Ok(matches) = maude_res else { return Vec::new() };
+        if matches.is_empty() { return Vec::new(); }
+        ms = matches;
     }
 
-    // Translate the LVar → LNTerm matches back to parser-AST.
+    // Translate each LVar → LNTerm match back to parser-AST.
     // Record bindings for universal-bound vars only — free system
     // vars on the pattern side are SkConst-equivalent (per Haskell's
     // `skolemizeGuarded` upstream of `matchAction`) and cannot be
     // bound during matching.  Threading free-var bindings into `acc`
     // (the old behaviour) causes spurious propagation when later
     // guards re-encounter those names.
-    for (lv, lt) in m {
-        if !pattern_vars.contains(&(lv.name.clone(), lv.idx)) {
-            continue;
+    let mut out: Vec<VarSubst> = Vec::with_capacity(ms.len());
+    let dbg = std::env::var("TAM_DBG_IMPL").is_ok();
+    for m in ms {
+        let mut subst = base_subst.clone();
+        for (lv, lt) in m {
+            if !pattern_vars.contains(&(lv.name.clone(), lv.idx)) {
+                continue;
+            }
+            let term = crate::elaborate::lnterm_to_term(&lt);
+            subst.insert((lv.name, lv.idx), term);
         }
-        let term = crate::elaborate::lnterm_to_term(&lt);
-        subst.insert((lv.name, lv.idx), term);
+        if dbg {
+            eprintln!("[impl] MATCH SUCCEEDED: g_fact.name={} @ node={:?} subst={:?}",
+                g_fact.name, i, subst);
+        }
+        out.push(subst);
     }
-    if std::env::var("TAM_DBG_IMPL").is_ok() {
-        eprintln!("[impl] MATCH SUCCEEDED: g_fact.name={} @ node={:?} subst={:?}",
-            g_fact.name, i, subst);
-    }
-    Some(subst)
+    out
 }
 
 // Note: the previous structural matcher (`match_atom_against_action`,
@@ -3833,8 +3858,9 @@ mod tests {
         let i_node = tamarin_term::lterm::LVar::new(
             "n", tamarin_term::lterm::LSort::Node, 7);
         let sys_arg = mk_var_l("alpha", 3, tamarin_term::lterm::LSort::Msg);
-        let subst = match_atom_via_maude(&h, &vars, &g_fact, &g_time, &i_node, &[sys_arg]);
-        let subst = subst.expect("should match");
+        let substs = match_atom_via_maude(&h, &vars, &g_fact, &g_time, &i_node, &[sys_arg]);
+        assert!(!substs.is_empty(), "should match");
+        let subst = substs.into_iter().next().unwrap();
         // The time mapping is direct (we set it ourselves before
         // calling Maude). Should always be present.
         let i_map = subst.get(&("i".to_string(), 0u64)).cloned();
@@ -3890,9 +3916,10 @@ mod tests {
             mk_var_l("x", 5, tamarin_term::lterm::LSort::Msg),
             mk_var_l("y", 6, tamarin_term::lterm::LSort::Msg),
         ]);
-        let subst = match_atom_via_maude(&h, &vars, &g_fact, &g_time, &i_node, &[sys_pair]);
+        let substs = match_atom_via_maude(&h, &vars, &g_fact, &g_time, &i_node, &[sys_pair]);
         // Match exists.
-        let subst = subst.expect("pair pattern should match against pair subject");
+        assert!(!substs.is_empty(), "pair pattern should match against pair subject");
+        let subst = substs.into_iter().next().unwrap();
         // The time variable mapping is recorded by our matcher
         // directly (independent of Maude's output).
         assert!(subst.contains_key(&("i".to_string(), 0u64)));
@@ -3940,8 +3967,8 @@ mod tests {
         let g_time = tamarin_parser::ast::Term::PubLit("notavar".into());
         let i_node = tamarin_term::lterm::LVar::new(
             "n", tamarin_term::lterm::LSort::Node, 0);
-        let subst = match_atom_via_maude(&h, &vars, &g_fact, &g_time, &i_node, &[]);
-        assert!(subst.is_none());
+        let substs = match_atom_via_maude(&h, &vars, &g_fact, &g_time, &i_node, &[]);
+        assert!(substs.is_empty());
     }
 
     // =========================================================================
