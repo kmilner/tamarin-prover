@@ -1930,10 +1930,27 @@ impl EquationStore {
                 let local_maude_owned;
                 let aes_maude: &tamarin_term::maude_proc::MaudeHandle =
                     if applybound_local_reset {
-                        // Seed local counter at `max(avoid_max, max_idx)`
-                        // so witnesses don't collide with any var in the
-                        // unification problem either.
-                        let seed = avoid_max.max(max_idx);
+                        // HS-faithful seed: `avoid avoidSet = succ (max
+                        // idx in avoidSet)` where avoidSet =
+                        // `domVFresh s ∪ varsRange newsubst`
+                        // (LTerm.hs:647-664 `avoid`; EquationStore.hs:268-282
+                        // `renameAvoiding (range slist) (domVFresh s ∪ varsRange newsubst)`).
+                        // HS does NOT include `max_idx` (the post-shift
+                        // equation-system vars) in the seed — the shifted
+                        // RHS vars are themselves all > avoid_max by
+                        // construction.  Prior code used
+                        // `seed = avoid_max.max(max_idx)` as a safety
+                        // margin, which is non-faithful: two alpha-
+                        // equivalent input variants whose `rhs_min`
+                        // (and hence `max_idx`) differs seed at distinct
+                        // values → witness `reserve_idxs` returns
+                        // different base → outputs are alpha-equivalent
+                        // but structurally distinct → `sort + dedup`
+                        // (line 2161-2162) fails to collapse them.
+                        // KEA_plus_AdvKey::keaplus_{initiator,responder}_key
+                        // closed (4→0 diff) by this fix together with the
+                        // alpha-dedup below.
+                        let seed = avoid_max;
                         local_maude_owned = maude.with_fresh_counter_from(seed);
                         &local_maude_owned
                     } else {
@@ -2158,6 +2175,42 @@ impl EquationStore {
             // These regressions are HS-faithful: each marks a place
             // where Rust's apply_eq_store output structure diverges
             // from HS's — to chase next.
+            //
+            // ALPHA-DEDUP: before structural dedup, collapse substs that
+            // are alpha-equivalent under witness-renaming.  RS's local
+            // Maude counter inside `applyBound` is bumped to the max idx
+            // of the input eqs (including system vars in `apply newsubst
+            // (Var lv)`).  When two alpha-equivalent input variants have
+            // different witness idxs in their range but the same domain
+            // and the same system-side LHS pattern, the LHS's `input_max`
+            // is identical — but the local counter still depends on
+            // which witnesses the inner unifier allocates first, so the
+            // resulting per-variant LNSubstVFresh witness idxs can diverge
+            // structurally even though both are alpha-equivalent.  HS's
+            // `S.fromList` (EquationStore.hs:268-269) is also a structural
+            // dedup on the underlying Map's Ord, but HS's witnesses are
+            // bounded only by the `domVFresh s ∪ varsRange newsubst`
+            // avoid set (LTerm.hs:647-664 `avoid`; EquationStore.hs
+            // `renameAvoiding (range slist) (domVFresh s ∪ varsRange newsubst)`)
+            // — which IS identical for alpha-equivalent input variants —
+            // so HS's structural dedup catches them.  RS's local counter
+            // is bumped by the LHS system vars (`input_max` at
+            // unify_with_avoid, maude_proc.rs:706-717), which is not what
+            // HS does.  Canonicalising the witness namespace per subst
+            // (rename range fresh-vars to a deterministic sequence) lets
+            // RS catch the same alpha-duplicates HS catches.
+            {
+                use std::collections::BTreeSet;
+                let mut seen: BTreeSet<LNSubstVFresh> = BTreeSet::new();
+                let mut out: Vec<LNSubstVFresh> = Vec::with_capacity(new_substs.len());
+                for s in new_substs.drain(..) {
+                    let key = tamarin_term::subsumption::canonize_subst(&s);
+                    if seen.insert(key) {
+                        out.push(s);
+                    }
+                }
+                new_substs = out;
+            }
             new_substs.sort();
             new_substs.dedup();
             if std::env::var("TAM_DBG_AES_VARIANTS").is_ok() {
