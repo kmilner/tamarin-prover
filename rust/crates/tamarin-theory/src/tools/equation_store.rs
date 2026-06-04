@@ -1592,6 +1592,44 @@ impl EquationStore {
         }
     }
 
+    /// HS-faithful `simpDisjunction` (EquationStore.hs:483-497).  HS's
+    /// `simp` runs the FULL `simp1` pipeline including `simpSingleton`
+    /// (the b4 pass at EquationStore.hs:596) — that pass folds a
+    /// singleton-variant disj into the free subst via `freshToFree`.
+    ///
+    /// `simp_disjunction` (the test-friendly variant above) doesn't have
+    /// a fresh-idx allocator and skips simpSingleton — so a singleton
+    /// disj with non-renaming entries stays in the residual.  Callers
+    /// that have a Maude handle (e.g. `variantsProtoRule` at
+    /// RuleVariants.hs:106) MUST use this variant; otherwise the rule's
+    /// variant-disj retains abstrTerm entries that HS bakes into the
+    /// rule body via commonSubst (e.g. JKL_TS1_2004 Init_2: HS's rule
+    /// shows `!Sessk(~ekI, h(<~ekI, Y, 'g'^(~lkI*~lkR)>))`; without this
+    /// variant, RS's rule shows `!Sessk(~ekI, h(<~ekI, Y, z.1>))` with
+    /// the abstract `z.1` still in the residual subst → diverges
+    /// downstream source-case numbering).
+    pub fn simp_disjunction_with_maude<F: Fn(&LNSubst, &LNSubstVFresh) -> bool>(
+        substs: Vec<LNSubstVFresh>,
+        is_contr: F,
+        maude: &tamarin_term::maude_proc::MaudeHandle,
+    ) -> (LNSubst, Option<Vec<LNSubstVFresh>>) {
+        let mut store = EquationStore::empty();
+        let _ = store.add_disj(substs);
+        let alloc = |n: u64| maude.reserve_idxs(n);
+        let store = store.simp_with_fresh_avoiding(
+            is_contr,
+            alloc,
+            &BTreeSet::new(),
+            Some(maude),
+        );
+        let free = store.subst.clone();
+        match store.conj.as_slice() {
+            [] => (free, None),
+            [d] => (free, Some(d.substs.clone())),
+            _ => (free, Some(store.conj.into_iter().flat_map(|d| d.substs).collect())),
+        }
+    }
+
     /// Apply a free substitution to the entire store. Structural-only
     /// version (no Maude renormalisation). Use this when the new
     /// substitution can't introduce AC-unification opportunities.
