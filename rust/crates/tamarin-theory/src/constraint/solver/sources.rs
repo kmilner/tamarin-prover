@@ -4955,14 +4955,20 @@ pub fn solve_with_source_cases_ctx(
     let mut all_attempted: Vec<(String, bool)> = Vec::new();
     for (name, case_sys) in src.cases(ctx) {
         let case_label = saturated_chain_root(&name);
-        let applied = apply_source_case_premise(
+        let applied_arms = apply_source_case_premise(
             ctx, sys, src, &case_sys,
             goal_node, goal_prem_idx, fa_prem,
         );
-        let kept = applied.is_some();
+        let kept = !applied_arms.is_empty();
         if dbg { all_attempted.push((case_label.clone(), kept)); }
-        if let Some(final_sys) = applied {
-            out.push((case_label, final_sys));
+        // HS-faithful: refineSubst's multi-arm fanout (Reduction.hs:776
+        // `disjunctionOfList performSplit`) produces one System per AC
+        // unifier arm with the SAME case name.  Push each as a separate
+        // (case_label, sys) entry.  Sibling cases sharing the same
+        // case_label get `_case_N` suffixes via `distinguish`
+        // (ProofMethod.hs:485-490).
+        for final_sys in applied_arms {
+            out.push((case_label.clone(), final_sys));
         }
     }
     if dbg {
@@ -7437,7 +7443,7 @@ fn apply_source_case_premise(
     live_node: &crate::constraint::constraints::NodeId,
     live_prem_idx: crate::rule::PremIdx,
     fa_live: &crate::fact::LNFact,
-) -> Option<System> {
+) -> Vec<System> {
     use crate::constraint::solver::reduction::{
         Reduction, SolveOutcome, SplitStrategy, bounds_max,
     };
@@ -7474,13 +7480,13 @@ fn apply_source_case_premise(
         match &src.goal {
             crate::constraint::constraints::Goal::Premise((n, p), fa) =>
                 (n.clone(), *p, fa.clone()),
-            _ => { dbg("src-goal-not-Premise"); return None; },
+            _ => { dbg("src-goal-not-Premise"); return Vec::new(); },
         };
     if fa_live.tag != abstract_prem_fact_orig.tag
         || fa_live.terms.len() != abstract_prem_fact_orig.terms.len()
     {
         dbg("tag/arity-mismatch");
-        return None;
+        return Vec::new();
     }
 
     let live_goal_for_trace = crate::constraint::constraints::Goal::Premise(
@@ -7536,9 +7542,9 @@ fn apply_source_case_premise(
                 let substs_res = ctx.maude.match_eqs(&match_eqs);
                 let mut substs = match substs_res {
                     Ok(s) => s,
-                    Err(_) => { dbg("maude-match-err"); return None; },
+                    Err(_) => { dbg("maude-match-err"); return Vec::new(); },
                 };
-                if substs.is_empty() { dbg("match-empty"); return None; }
+                if substs.is_empty() { dbg("match-empty"); return Vec::new(); }
                 substs.swap_remove(0)
             }
         }
@@ -7589,13 +7595,50 @@ fn apply_source_case_premise(
             }
         })
         .collect();
-    if !term_eqs.is_empty() {
-        let r = refined.solve_term_eqs(SplitStrategy::SplitNow, &term_eqs);
-        if matches!(r, Err(_) | Ok(SolveOutcome::Contradictory)) {
-            dbg("refineSubst-contradictory");
-            return None;
-        }
-    }
+    // HS-faithful multi-arm fanout (Reduction.hs:776 + Sources.hs:330-333):
+    // `refineSubst subst = solveSubstEqs SplitNow subst >> substSystem`.
+    // `solveSubstEqs SplitNow` runs `disjunctionOfList $ performSplit eqs2
+    // splitId` when the AC unifier returns multiple solutions.  Each arm
+    // becomes a separate `Reduction` branch and `conjoinSystem sysTh`
+    // runs once per arm — producing one Source-applied System per arm.
+    //
+    // Mirror `apply_source_case_action`'s pattern: capture `Cases(arms)`
+    // from `solve_term_eqs` and re-run the post-`solve_term_eqs`
+    // continuation once per arm.  Without this, a multiset Counter
+    // premise solve yielded by HS as `Inc_case_1 | Inc_case_2` collapsed
+    // to a single Inc case in RS (the second AC arm's eq_store was
+    // silently dropped).
+    let arm_eq_stores: Vec<crate::tools::equation_store::EquationStore> =
+        if term_eqs.is_empty() {
+            vec![refined.sys.eq_store.clone()]
+        } else {
+            let outcome = refined.solve_term_eqs(SplitStrategy::SplitNow, &term_eqs);
+            match outcome {
+                Err(_) | Ok(SolveOutcome::Contradictory) => {
+                    dbg("refineSubst-contradictory");
+                    return Vec::new();
+                }
+                Ok(SolveOutcome::Linear(_)) => {
+                    vec![refined.sys.eq_store.clone()]
+                }
+                Ok(SolveOutcome::Cases(arms)) => {
+                    if std::env::var("TAM_RS_DBG_APPLY_SRC_FANOUT").is_ok() {
+                        eprintln!("[apply_src_prem_fanout] case={} arms={}",
+                            case_label, arms.len());
+                    }
+                    arms
+                }
+            }
+        };
+
+    let post_solve_sys_template = refined.sys.clone();
+    let mut out_arms: Vec<System> = Vec::with_capacity(arm_eq_stores.len());
+
+    for arm_eq_store in arm_eq_stores {
+        let mut arm_sys = post_solve_sys_template.clone();
+        arm_sys.eq_store = arm_eq_store;
+        let mut refined = Reduction::new(ctx, arm_sys);
+
     // H15.3 (2026-05-28): selectively defer pattern_var → App(...) substs
     // so enforce_ku_action_uniqueness can find structural matches on
     // generic pattern vars BEFORE they're specialized.  HS-faithful in
@@ -7644,7 +7687,7 @@ fn apply_source_case_premise(
     }
     if refined.sys.eq_store.is_false() {
         dbg("post-subst-eq-store-false");
-        return None;
+        continue;
     }
     let runtime_stable: std::collections::BTreeSet<tamarin_term::lterm::LVar> = {
         let mut s = std::collections::BTreeSet::new();
@@ -7708,7 +7751,7 @@ fn apply_source_case_premise(
         });
         crate::state_trace::emit(
             "applySource_prem_drop", Some(&live_goal_for_trace), &r.sys);
-        return None;
+        continue;
     }
 
     // E.5 — edge fact-equality propagation.  Mirror Haskell's runtime
@@ -7750,7 +7793,7 @@ fn apply_source_case_premise(
             crate::state_trace::emit(
                 "applySource_prem_drop_edge_eqs",
                 Some(&live_goal_for_trace), &r.sys);
-            return None;
+            continue;
         }
         r.subst_system();
     }
@@ -7793,7 +7836,9 @@ fn apply_source_case_premise(
     if src.incomplete { r.sys.used_incomplete_source = true; }
     crate::state_trace::emit(
         "applySource_prem_out", Some(&live_goal_for_trace), &r.sys);
-    Some(r.sys)
+    out_arms.push(r.sys);
+    } // end `for arm_eq_store in arm_eq_stores`
+    out_arms
 }
 
 /// True when `t` is a Msg-sorted free variable.  Used by

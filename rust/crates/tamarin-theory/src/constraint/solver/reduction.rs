@@ -4617,37 +4617,77 @@ impl<'ctx> Reduction<'ctx> {
                     &fa_conc,
                     fa_prem,
                 );
-                let mut sys = sub.sys;
                 match res {
                     Err(_) | Ok(SolveOutcome::Contradictory) => continue,
-                    Ok(_) => {
-                        for (existing, status) in sys.goals.iter_mut() {
-                            if existing == &g && !status.solved {
-                                status.solved = true;
-                                break;
+                    Ok(outcome) => {
+                        // HS-faithful multi-arm fanout (Reduction.hs:299-307).
+                        // `insertEdgesLabeled "solvePremise"` calls
+                        // `solveFactEqsLabeled SplitNow` whose inner
+                        // `solveTermEqsLabeled` runs
+                        //   `disjunctionOfList $ performSplit eqs2 splitId`
+                        // (Reduction.hs:776-778) when the AC unifier
+                        // yields multiple solutions.  Each arm becomes a
+                        // separate branch in HS's `Reduction` (Disj/list)
+                        // monad → `solvePremise` returns once per arm
+                        // with the SAME case name (`showRuleCaseName ru`,
+                        // Goals.hs:313).  Sibling cases sharing a name
+                        // get `_case_N` suffixes via `distinguish`
+                        // (ProofMethod.hs:468) — that's the source of
+                        // HS's `Inc_case_1` / `Inc_case_2` pair on
+                        // multiset Counter premise solving.
+                        //
+                        // Previously RS unconditionally `cases.push((name, sub.sys))`
+                        // — collapsing all AC unifier arms into a single
+                        // case.  Mirror `solve_chain_goal`'s post-edge
+                        // arm enumeration (Reduction.hs ~4760) to keep
+                        // the eq_store-from-arm and clone the rest of
+                        // sub.sys per arm.
+                        let post_edge_sys = sub.sys.clone();
+                        let arm_systems: Vec<crate::constraint::system::System> = match outcome {
+                            SolveOutcome::Cases(arms) => {
+                                arms.into_iter().map(|arm_eq| {
+                                    let mut s = post_edge_sys.clone();
+                                    s.eq_store = arm_eq;
+                                    s
+                                }).collect()
                             }
-                        }
-                        if std::env::var("TAM_DBG_PREM_CASE_OUT").is_ok() {
-                            for (id, ru) in &sys.nodes {
-                                let nm = crate::constraint::solver::reduction::rule_case_name(ru);
-                                if nm == "Serv_1" {
-                                    eprintln!("[prem_case_out] case={} id={}.{}",
-                                        case_name, id.name, id.idx);
-                                    for (i, p) in ru.premises.iter().enumerate() {
-                                        eprintln!("[prem_case_out]   prem[{}]: {:?}", i,
-                                            format!("{:?}", p).chars().take(400).collect::<String>());
-                                    }
-                                    eprintln!("[prem_case_out]   eq_store ({} entries):",
-                                        sys.eq_store.subst.to_list().len());
-                                    for (v, t) in sys.eq_store.subst.to_list().iter() {
-                                        eprintln!("[prem_case_out]     {}.{} → {}",
-                                            v.name, v.idx,
-                                            format!("{:?}", t).chars().take(120).collect::<String>());
+                            _ => vec![post_edge_sys],
+                        };
+                        for mut sys in arm_systems {
+                            for (existing, status) in sys.goals.iter_mut() {
+                                if existing == &g && !status.solved {
+                                    status.solved = true;
+                                    break;
+                                }
+                            }
+                            if std::env::var("TAM_DBG_PREM_CASE_OUT").is_ok() {
+                                for (id, ru) in &sys.nodes {
+                                    let nm = crate::constraint::solver::reduction::rule_case_name(ru);
+                                    if nm == "Serv_1" {
+                                        eprintln!("[prem_case_out] case={} id={}.{}",
+                                            case_name, id.name, id.idx);
+                                        for (i, p) in ru.premises.iter().enumerate() {
+                                            eprintln!("[prem_case_out]   prem[{}]: {:?}", i,
+                                                format!("{:?}", p).chars().take(400).collect::<String>());
+                                        }
+                                        eprintln!("[prem_case_out]   eq_store ({} entries):",
+                                            sys.eq_store.subst.to_list().len());
+                                        for (v, t) in sys.eq_store.subst.to_list().iter() {
+                                            eprintln!("[prem_case_out]     {}.{} → {}",
+                                                v.name, v.idx,
+                                                format!("{:?}", t).chars().take(120).collect::<String>());
+                                        }
                                     }
                                 }
                             }
+                            // Subst_system per arm so the variant subst
+                            // gets baked into node/edge/goal terms before
+                            // saving.  Mirrors `solve_chain_goal`'s
+                            // post-arm substitution.
+                            let mut sub_per_arm = Reduction::new(self.ctx, sys);
+                            sub_per_arm.subst_system();
+                            cases.push((case_name.clone(), sub_per_arm.sys));
                         }
-                        cases.push((case_name.clone(), sys));
                     }
                 }
             }
