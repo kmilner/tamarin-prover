@@ -2475,7 +2475,7 @@ fn enforce_kd_fact_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
 fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
     use crate::constraint::constraints::{LessAtom, Reason};
     use crate::fact::FactTag;
-    use tamarin_term::lterm::{HasFrees, LVar};
+    use tamarin_term::lterm::LVar;
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
 
@@ -2584,15 +2584,44 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
         let sup_rule = match nodes_snapshot.iter().find(|(id, _)| id == sup_id) {
             Some((_, r)) => r, None => continue,
         };
+        // HS-faithful: use `elemNotBelowReducible reducible ~x t'` rather
+        // than a raw free-var walk.  Haskell's `connectNodeToFreshes`
+        // (Simplify.hs:561-567) computes `containing` = the floodFill of
+        // (~x, ~x) over the subterm graph, then checks whether any t in
+        // `containing` satisfies `t `elemNotBelowReducible` t'` for some
+        // t' in the consumer's `rPrems ++ rActs` terms (Simplify.hs:564).
+        //
+        // We approximate the floodFill by starting with `containing =
+        // [~x]` (no transitive ⊏-subterm expansion — see the "KNOWN GAP
+        // task #275" comment above), but we MUST still respect the
+        // `elemNotBelowReducible` filter: ~x appearing under a reducible
+        // function symbol (e.g. `exp` in DH) does NOT count as
+        // "contained", because the equational theory could rewrite the
+        // enclosing term and eliminate ~x.
+        //
+        // Without this filter, Rust adds spurious `vr.X < vf.Y` Fresh
+        // less-atoms when the fresh appears under `exp` (the DH-protocol
+        // case), creating cycles HS doesn't detect.  Root cause of the
+        // STS_MAC_fix1::KI_Perfect_Forward_Secrecy_R divergence at the
+        // `case Resp_1` step where two Resp_1 instances' freshs are
+        // each consumed by the other's input ⇒ HS sees no cycle (freshs
+        // are under `exp`), Rust sees a 4-edge cycle ⇒ premature
+        // `by contradiction /* cyclic */`.
+        let reducible = &maude.maude_sig().reducible_fun_syms;
+        let fresh_term: tamarin_term::lterm::LNTerm =
+            tamarin_term::term::Term::Lit(
+                tamarin_term::vterm::Lit::Var(fresh_var.clone()));
         for (other_id, other_rule) in &nodes_snapshot {
             if other_id == sup_id { continue; }
             let mut found = false;
             for f in other_rule.premises.iter().chain(other_rule.actions.iter()) {
                 for t in &f.terms {
-                    t.for_each_free(&mut |v: &LVar| {
-                        if v == fresh_var { found = true; }
-                    });
-                    if found { break; }
+                    if crate::tools::subterm_store::elem_not_below_reducible(
+                        reducible, &fresh_term, t)
+                    {
+                        found = true;
+                        break;
+                    }
                 }
                 if found { break; }
             }
