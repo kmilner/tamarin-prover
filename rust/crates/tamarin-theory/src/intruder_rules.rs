@@ -380,19 +380,30 @@ fn is_double_premise_rule(r: &IntrRuleAC) -> bool {
 /// `[KU(x_1), ..., KU(x_n)] --[KU(f(x_1, ..., x_n))]-> [KU(f(x_1, ..., x_n))]`
 pub fn construction_rules(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<IntrRuleAC> {
     use tamarin_term::function_symbols::{
-        Constructability, FunSym, NoEqSym, Privacy,
+        Constructability, NoEqSym, Privacy,
     };
     use tamarin_term::term::f_app_no_eq;
+    // HS-faithful: `constructionRules (stFunSyms maudeSig)`
+    // (IntruderRules.hs:213).  `stFunSyms` is the SUBTERM-theory function
+    // signature — it EXCLUDES the DH / BP / MSet / Nat / Xor symbols
+    // (those are added by `funSyms` via `refresh`, MaudeSig.rs:74-78).
+    // The DH / BP intruder constructors (`c_exp` / `c_inv` / `c_mult`
+    // / `c_one` / `c_DH_neutral` / `c_pmult` / `c_emap`) come from the
+    // cached `intruder_variants_{dh,bp}.spthy` files via
+    // `addMessageDeductionRuleVariants` (TheoryLoader.hs:773-781) —
+    // adding them here would duplicate every DH constructor in
+    // `intruder_rules`, doubling each `c_exp` / `c_inv` / etc. branch
+    // at `solve_action_goal` rule enumeration and causing case-list
+    // over-enumeration (e.g. KEA_plus_eCK::eCK_initiator_key
+    // `case exp_case_1` vs HS `case exp`).
     let mut out = Vec::new();
-    for funsym in &sig.fun_syms {
-        let s = match funsym {
-            FunSym::NoEq(s)
-                if s.privacy == Privacy::Public
-                && s.constructability == Constructability::Constructor =>
-            {
-                s.clone()
-            }
-            _ => continue,
+    for s in &sig.st_fun_syms {
+        let s: NoEqSym = if s.privacy == Privacy::Public
+            && s.constructability == Constructability::Constructor
+        {
+            s.clone()
+        } else {
+            continue;
         };
         let arity = s.arity;
         // Build vars x_0 ... x_{n-1} : Msg
