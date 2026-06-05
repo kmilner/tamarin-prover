@@ -101,6 +101,9 @@ pub struct FileResult {
     pub out_file: Option<String>,
     pub results: Vec<LemmaResult>,
     pub elapsed_ms: u128,
+    /// Number of wellformedness check failures for this file.
+    /// Surfaced in `summary of summaries` per HS's format.
+    pub wf_count: usize,
 }
 
 /// Top-level dispatch. Reports any error as a `RunError` and returns
@@ -414,15 +417,30 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             RunError(format!("parse error in {}: {}", in_file, e))
         })?;
 
+        // Wellformedness checks — mirrors HS `checkWellformedness`
+        // (`Theory.Tools.Wellformedness:1270`).  Runs on every file
+        // (not gated by `--parse-only`) so a malformed theory is
+        // surfaced even without proving.
+        let wf_report = tamarin_parser::wf::check_theory(&parsed);
+
         if args.parse_only {
-            // Just re-emit the source verbatim.
-            emit_output(args, in_file, &src, None)?;
+            // Just re-emit the source verbatim.  Still surface wf
+            // warnings so callers don't get silent "clean" runs.
+            let body = format!("{}\n{}", src.trim_end(), format_wf_block(&wf_report));
+            emit_output(args, in_file, &body, None)?;
             file_results.push(FileResult {
                 in_file: in_file.clone(),
                 out_file: out_path_for(args, in_file),
                 results: Vec::new(),
                 elapsed_ms: t0.elapsed().as_millis(),
+                wf_count: wf_report.len(),
             });
+            if args.quit_on_warning && !wf_report.is_empty() {
+                return Err(RunError(format!(
+                    "{} wellformedness check(s) failed (--quit-on-warning set)",
+                    wf_report.len()
+                )));
+            }
             continue;
         }
 
@@ -556,8 +574,16 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             }
         }
 
-        let summary = format_summary(in_file, &results, t0.elapsed().as_millis());
-        let body = format!("{}\n{}\n", src.trim_end(), summary);
+        let summary = format_summary(in_file, &results, t0.elapsed().as_millis(), wf_report.len());
+        // Insert the wf block BEFORE the analysis summary block, matching
+        // HS's `Theory.Constraint.Solver.summarize` output order:
+        //   source ... -> wf-block -> generated-from -> end -> summary.
+        let body = format!(
+            "{}\n{}\n{}\n",
+            src.trim_end(),
+            format_wf_block(&wf_report),
+            summary
+        );
         emit_output(args, in_file, &body, None)?;
 
         file_results.push(FileResult {
@@ -565,7 +591,14 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             out_file: out_path_for(args, in_file),
             results,
             elapsed_ms: t0.elapsed().as_millis(),
+            wf_count: wf_report.len(),
         });
+        if args.quit_on_warning && !wf_report.is_empty() {
+            return Err(RunError(format!(
+                "{} wellformedness check(s) failed (--quit-on-warning set)",
+                wf_report.len()
+            )));
+        }
     }
 
     if !args.quiet {
@@ -573,6 +606,47 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
     }
 
     Ok(overall_status)
+}
+
+/// Format the `/* WARNING: ... */` or `/* All wellformedness checks
+/// were successful. */` block that goes BETWEEN the source body and
+/// the analysis summary.  Mirrors HS's `Theory.Tools.Wellformedness`
+/// pretty-printer (`prettyWfErrorReport`).
+fn format_wf_block(report: &[tamarin_parser::wf::WfError]) -> String {
+    if report.is_empty() {
+        return "/* All wellformedness checks were successful. */".to_string();
+    }
+    let mut out = String::new();
+    out.push_str("/*\nWARNING: the following wellformedness checks failed!\n\n");
+    // Group by topic, preserving FIRST-APPEARANCE order — mirrors HS's
+    // `checkWellformedness` concatMap-over-checks which yields reports
+    // in the order checks were run, NOT alphabetical.
+    let mut topic_order: Vec<&str> = Vec::new();
+    let mut grouped: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
+    for e in report {
+        if !grouped.contains_key(e.topic.as_str()) {
+            topic_order.push(e.topic.as_str());
+        }
+        grouped.entry(e.topic.as_str()).or_default().push(&e.message);
+    }
+    for topic in &topic_order {
+        let msgs = &grouped[topic];
+        out.push_str(topic);
+        out.push('\n');
+        for _ in 0..topic.len() { out.push('='); }
+        out.push_str("\n\n");
+        for m in msgs {
+            for line in m.lines() {
+                out.push_str("  ");
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.push('\n');
+        }
+    }
+    out.push_str("*/");
+    out
 }
 
 fn default_maude_path() -> String {
@@ -637,7 +711,7 @@ fn count_proof_steps(node: &tamarin_theory::constraint::solver::search::ProofNod
     1 + node.children.values().map(count_proof_steps).sum::<usize>()
 }
 
-fn format_summary(in_file: &str, results: &[LemmaResult], elapsed_ms: u128) -> String {
+fn format_summary(in_file: &str, results: &[LemmaResult], elapsed_ms: u128, wf_count: usize) -> String {
     // Mirrors HS `summarizeTheory` / `prettySummary` output: a
     // `/* analyzed: ... */` block ending with one line per lemma in
     // HS-faithful `(<quantifier>): <verdict> ...` form.
@@ -647,6 +721,13 @@ fn format_summary(in_file: &str, results: &[LemmaResult], elapsed_ms: u128) -> S
     s.push_str("\n");
     s.push_str(&format!("  processing time: {:.2}s\n", elapsed_ms as f64 / 1000.0));
     s.push_str("  \n");
+    if wf_count > 0 {
+        // HS uses `N wellformedness check failed!` (no pluralisation).
+        s.push_str(&format!(
+            "  WARNING: {} wellformedness check failed!\n", wf_count));
+        s.push_str("           The analysis results might be wrong!\n");
+        s.push_str("  \n");
+    }
     for r in results {
         s.push_str(&format!("  {}\n", format_lemma_summary_line(r)));
     }
@@ -671,6 +752,11 @@ fn print_overall_summary(file_results: &[FileResult]) {
         }
         println!("  processing time: {:.2}s", fr.elapsed_ms as f64 / 1000.0);
         println!("  ");
+        if fr.wf_count > 0 {
+            println!("  WARNING: {} wellformedness check failed!", fr.wf_count);
+            println!("           The analysis results might be wrong!");
+            println!("  ");
+        }
         for r in &fr.results {
             println!("  {}", format_lemma_summary_line(r));
         }
