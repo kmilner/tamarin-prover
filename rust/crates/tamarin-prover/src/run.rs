@@ -421,26 +421,27 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         // (`Theory.Tools.Wellformedness:1270`).  Runs on every file
         // (not gated by `--parse-only`) so a malformed theory is
         // surfaced even without proving.
-        let wf_report = tamarin_parser::wf::check_theory(&parsed);
+        let mut wf_report = tamarin_parser::wf::check_theory(&parsed);
+        // Strip the static "Message Derivation Checks" entry — the
+        // dynamic check below replaces it with the prover-based result.
+        // We keep the static check available for the `--parse-only`
+        // path (where no Maude is started).
+        if !args.parse_only {
+            wf_report.retain(|e| e.topic != "Message Derivation Checks");
+        }
 
         if args.parse_only {
-            // Just re-emit the source verbatim.  Still surface wf
-            // warnings so callers don't get silent "clean" runs.
-            let body = format!("{}\n{}", src.trim_end(), format_wf_block(&wf_report));
-            emit_output(args, in_file, &body, None)?;
+            // HS-faithful: `--parse-only` does NOT run wellformedness
+            // (checkWellformedness only fires inside `--prove`'s
+            // close-theory pipeline).  Just re-emit the source verbatim.
+            emit_output(args, in_file, &src, None)?;
             file_results.push(FileResult {
                 in_file: in_file.clone(),
                 out_file: out_path_for(args, in_file),
                 results: Vec::new(),
                 elapsed_ms: t0.elapsed().as_millis(),
-                wf_count: wf_report.len(),
+                wf_count: 0,
             });
-            if args.quit_on_warning && !wf_report.is_empty() {
-                return Err(RunError(format!(
-                    "{} wellformedness check(s) failed (--quit-on-warning set)",
-                    wf_report.len()
-                )));
-            }
             continue;
         }
 
@@ -449,6 +450,25 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             RunError(format!("elaboration error in {}: {}", in_file, e.message))
         })?;
         let maude_sig = elaborated.signature.maude_sig.clone();
+
+        // Dynamic Message Derivation Checks (mirrors HS
+        // `checkVariableDeducability`, gated by `--derivcheck-timeout`,
+        // default 5s).  Needs Maude, so we run it AFTER elaboration
+        // and BEFORE the main prove loop.  HS default is 5s; 0 disables.
+        // Each per-variable proof attempt is capped at this timeout.
+        let deriv_timeout = args.derivcheck_timeout.unwrap_or(5) as u32;
+        if deriv_timeout > 0 {
+            let deriv_maude = tamarin_term::maude_proc::MaudeHandle::start(
+                &args.maude_path.clone().unwrap_or_else(default_maude_path),
+                maude_sig.clone(),
+            );
+            if let Ok(m) = deriv_maude {
+                let extra = tamarin_theory::deriv_check::check_message_derivation(
+                    &parsed, &m, deriv_timeout,
+                );
+                wf_report.extend(extra);
+            }
+        }
 
         // Decide which lemmas to prove. Without --prove/--prove-all,
         // we never start the solver; output is just the source.
@@ -601,7 +621,10 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         }
     }
 
-    if !args.quiet {
+    // HS-faithful: `--parse-only` skips the `summary of summaries:`
+    // block entirely.  Only `--prove` (or any flag that actually runs
+    // the prover) emits it.
+    if !args.quiet && !args.parse_only {
         print_overall_summary(&file_results);
     }
 
