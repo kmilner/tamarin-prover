@@ -5700,7 +5700,6 @@ pub fn solve_with_source_cases_action_with_ctx(
         let head = match &fa_live.terms[0] {
             tamarin_term::term::Term::App(n, args) => format!("App({:?},{})", n, args.len()),
             tamarin_term::term::Term::Lit(_) => "Lit".to_string(),
-            _ => "other".to_string(),
         };
         eprintln!("[RUNTIME_CASES_ACT] head={} total={} kept={} all={:?} kept_names={:?}",
             head, total_n, out.len(), all_names, kept_names);

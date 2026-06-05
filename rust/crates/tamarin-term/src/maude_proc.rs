@@ -1118,7 +1118,6 @@ impl MaudeHandle {
     ) -> Result<Vec<Vec<(crate::lterm::LVar, LNTerm)>>, MaudeError>
     {
         use crate::lterm::{LVar, Name, NameTag};
-        use crate::vterm::Lit;
         if eqs.is_empty() {
             return Ok(vec![Vec::new()]);
         }

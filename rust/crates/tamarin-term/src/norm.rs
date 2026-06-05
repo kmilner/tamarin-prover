@@ -486,6 +486,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn nf_via_haskell_detects_inverse_cancellation() {
         let path = match maude_path() { Some(p) => p, None => return };
         let mut sig = crate::maude_sig::pair_maude_sig();
