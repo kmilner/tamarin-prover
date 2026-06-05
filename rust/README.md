@@ -54,10 +54,17 @@ The 56 skips break down as:
 
 ## Performance
 
-Measured single-threaded on aarch64 Linux, GHC 9.6.7 + Maude 3.5.1
-vs `cargo build --release`. Times in seconds; speedup = HS / RS.
+Two benchmark scenarios — single-thread per-thread CPU comparison
+(HS `+RTS -N1` constrained), and default-vs-default wall-clock (each
+prover with its out-of-the-box parallelism settings).
 
-| lemma | tier | HS | RS | speedup |
+### Single-thread (per-thread CPU efficiency)
+
+Measured on aarch64 Linux, GHC 9.6.7 + Maude 3.5.1. HS run with
+`+RTS -N1 -RTS`; RS with `--processors=1`. Times in seconds; speedup
+= HS / RS.
+
+| lemma | tier | HS `-N1` | RS `-p1` | speedup |
 |---|---|---:|---:|---:|
 | Tutorial::Client_session_key_secrecy | tiny | 0.19 | 0.02 | **9.5×** |
 | NSPK3::nonce_secrecy | small | 1.39 | 0.34 | **4.1×** |
@@ -74,22 +81,66 @@ vs `cargo build --release`. Times in seconds; speedup = HS / RS.
 | dnp3::countervalue_uniqueness | xlarge | 15.67 | 1.10 | **14.3×** |
 | dnp3::authed_sessions_unique | xlarge | TO(300s) | 31.34 | >9.6× |
 
-Geometric mean across the 19-lemma benchmark: ~3.5×. Inductive
-lemmas favour RS most (HS times out on dnp3 at 5 min where RS
-finishes in 31s).
+Geomean ~3.5× faster per thread. Inductive lemmas favour RS most
+(HS times out on dnp3 at 5 min where RS finishes in 31s).
+
+### Default-vs-default (wall-clock as the user would experience)
+
+HS uses `+RTS -N` by default (all cores + parallel GC + `parList`
+sites in lib/theory). RS defaults to `--processors=min(num_cpus, 4)`,
+mirroring HS's parallelism sites via rayon (rule-variant closure,
+saturate refinement, per-item pretty-print — see "Parallelism" below).
+Spot check on the parallelism-friendly wireguard benchmark
+(`--prove=exists_session`, hashing + DH, 10 rules, 8 lemmas):
+
+| | wall | user CPU |
+|---|---:|---:|
+| HS default (`+RTS -N`) | 8.8s | 17.1s |
+| HS `+RTS -N1` | 11.3s | 10.4s |
+| RS default (`--processors=4`) | **7.0s** | 8.6s |
+| RS `--processors=1` | 8.9s | 8.4s |
+
+RS default is ~1.25× faster wall-clock than HS default, with ~half
+the total user-CPU. The gap widens on multi-lemma theories (parallel
+rule-variant closure scales linearly with rule count) and narrows on
+single-lemma theories (HS's gain there is parallel GC, which Rust
+doesn't need).
 
 ### What drives the speedup
 
-Six commits this session:
+Stack of perf commits:
 
 | | what | gain |
 |---|---|---|
 | 1 | empty-result cache for `match_eqs_const_subject` | 1.22–1.49× on AC-heavy lemmas |
 | 2 | skip Maude when no AC operators present | another 1.07–1.28× (drives match calls to 0) |
-| 3 | mimalloc global allocator | another 1.5–2× across the board |
+| 3 | mimalloc global allocator (including the binary itself) | 1.5–2× across the board |
 | 4 | fat LTO + codegen-units=1 | another 1.13–1.19× |
 | 5 | drop System from ProofNodes after expand | wall-clock unchanged; memory: see below |
-| 6 | CLI alignment (exit codes, summary format) | (no perf impact; HS-faithfulness) |
+| 6 | hoist `ensure_saturated` out of per-variable deriv-check loop | 3.4× on deriv check (mirrors HS's once-per-theory `closeTheoryWithMaude`) |
+| 7 | HS-faithful rayon parallelism at 3 sites (variants / saturate / pretty-print) | 1.25× on multi-rule theories at default `--processors=4` |
+
+### Parallelism
+
+RS mirrors HS's `using parList rdeepseq` and `parMap rdeepseq` sites via
+rayon at three places (HS site → RS site):
+
+- `Prover.hs:195` per-rule variant closure → `populate_rule_variants` in `run.rs`
+- `Sources.hs:471` saturate refinement change detection → `saturate_sources_with_simp_opt`
+- `TheoryObject.hs:744,752` per-item pretty-print → `pretty_closed_theory`
+
+`Proof.hs:873`'s `parTraversable nfProofMethod` (forcing a `Map` of lazy
+proof sub-trees in `cutOnSolvedDFS`) is skipped: RS's proof tree is
+already strict, there's nothing to force in parallel.
+
+Default worker count is `min(num_cpus, 4)`, configurable via
+`--processors=N`. The cap is pragmatic: the parallel sites all
+contend on a single Maude IPC mutex (`Arc<Mutex>` around the
+subprocess), so empirically `N>4` gives diminishing returns. HS
+defaults to `+RTS -N` (all cores) and burns proportional user-CPU
+for it; capping at 4 trades a small wall-clock ceiling for a much
+smaller user-CPU footprint. Output is byte-identical across all
+worker counts.
 
 ### Memory
 
