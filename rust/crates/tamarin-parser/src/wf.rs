@@ -72,6 +72,12 @@ pub fn check_theory(thy: &Theory) -> WfReport {
     report.extend(nat_well_sorted_report(thy));
     // checkEquationsSubtermConvergence:
     report.extend(subterm_convergence_report(thy));
+    // Message Derivation Checks (HS: TheoryLoader.hs:172-176 +
+    // MessageDerivationChecks.hs:35).  HS's check is dynamic
+    // (per-variable prover invocation, --derivcheck-timeout default 5s);
+    // we run a static intersection that catches the same variables for
+    // the common case.  See `message_derivation_report` docstring.
+    report.extend(message_derivation_report(thy));
     report
 }
 
@@ -521,47 +527,47 @@ pub fn public_names_report(thy: &Theory) -> WfReport {
 // Unbound variables: vars in RHS / actions but not in LHS
 // =============================================================================
 
+/// Collect a rule's unbound variables (conclusion/action vars NOT in
+/// any premise / let-binding).  Returns the list in first-occurrence
+/// order, deduped, excluding pub-sort variables (which are implicitly
+/// adversary-known and so always bound).
+fn collect_rule_unbound_vars(r: &Rule) -> Vec<VarSpec> {
+    let mut bound: BTreeSet<(String, u64)> = BTreeSet::new();
+    for f in &r.premises {
+        for v in fact_vars(f) {
+            bound.insert((v.name.clone(), v.idx));
+        }
+    }
+    for binding in &r.let_block {
+        let mut vs = Vec::new();
+        term_vars(&binding.var, &mut vs);
+        term_vars(&binding.value, &mut vs);
+        for v in vs {
+            bound.insert((v.name, v.idx));
+        }
+    }
+    let mut unbound: Vec<VarSpec> = Vec::new();
+    let mut seen: BTreeSet<(String, u64)> = BTreeSet::new();
+    for f in r.actions.iter().chain(&r.conclusions) {
+        for v in fact_vars(f) {
+            if is_pub_sort(&v.sort) { continue; }
+            let key = (v.name.clone(), v.idx);
+            if bound.contains(&key) { continue; }
+            if seen.insert(key.clone()) {
+                unbound.push(v);
+            }
+        }
+    }
+    unbound
+}
+
 pub fn unbound_report(thy: &Theory) -> WfReport {
     let mut out = Vec::new();
     for r in theory_rules(thy) {
-        // Bound: all variables in premises (regardless of sort), plus
-        // variables introduced as let-binding LHSes (their values are
-        // computed from the rule's variables).
-        let mut bound: BTreeSet<(String, u64)> = BTreeSet::new();
-        for f in &r.premises {
-            for v in fact_vars(f) {
-                bound.insert((v.name.clone(), v.idx));
-            }
-        }
-        for binding in &r.let_block {
-            // Both the LHS and the RHS contribute bindings: the let
-            // semantically substitutes RHS into the rule, so any vars
-            // present on the RHS become bound by the resulting
-            // unification of substituted premises against actual facts.
-            let mut vs = Vec::new();
-            term_vars(&binding.var, &mut vs);
-            term_vars(&binding.value, &mut vs);
-            for v in vs {
-                bound.insert((v.name, v.idx));
-            }
-        }
-        // Vars used in conclusions/actions (excluding pub-sort vars,
-        // which are implicitly bound).
-        let mut unbound: Vec<VarSpec> = Vec::new();
-        let mut seen: BTreeSet<(String, u64)> = BTreeSet::new();
-        for f in r.actions.iter().chain(&r.conclusions) {
-            for v in fact_vars(f) {
-                if is_pub_sort(&v.sort) { continue; }
-                let key = (v.name.clone(), v.idx);
-                if bound.contains(&key) { continue; }
-                if seen.insert(key.clone()) {
-                    unbound.push(v);
-                }
-            }
-        }
+        let unbound = collect_rule_unbound_vars(r);
         if !unbound.is_empty() {
             let names: Vec<String> = unbound.iter()
-                .map(|v| format!("{}", render_var(v)))
+                .map(render_var)
                 .collect();
             // HS format: `rule `R' has unbound variables: \n    v1\n    v2\n...`
             // (Wellformedness.hs:493-510, `prettyVarList`).  One var
@@ -575,6 +581,51 @@ pub fn unbound_report(thy: &Theory) -> WfReport {
         }
     }
     out
+}
+
+/// Static analog of HS's `checkVariableDeducability`
+/// (`Theory.Tools.MessageDerivationChecks`).  HS spawns the prover on a
+/// synthetic theory per rule + per variable; we instead emit the
+/// SAME set of variables that `unbound_report` flags, under the
+/// distinct topic HS uses.
+///
+/// HS's check is a superset of ours: it also catches variables that ARE
+/// bound by a premise but whose containing fact is never produced by
+/// any other rule, so the intruder can't derive them.  Catching that
+/// requires the prover (see HS's `proveTheory` per-variable loop) and
+/// is gated behind `--derivcheck-timeout` (default 5s).  We currently
+/// implement only the static intersection — the common case — and
+/// preserve byte-identical output for it.  Extending to the dynamic
+/// check is documented as future work.
+pub fn message_derivation_report(thy: &Theory) -> WfReport {
+    // Aggregate (rule_name, [unbound_var_names]) pairs across the
+    // theory, skipping rules with the `no_derivcheck` attribute.
+    let mut per_rule: Vec<(String, Vec<String>)> = Vec::new();
+    for r in theory_rules(thy) {
+        if r.attributes.iter().any(|a| matches!(a,
+            crate::ast::RuleAttr::NoDerivCheck)) { continue; }
+        let unbound = collect_rule_unbound_vars(r);
+        if unbound.is_empty() { continue; }
+        let names: Vec<String> = unbound.iter()
+            .map(|v| v.name.clone())
+            .collect();
+        per_rule.push((r.name.clone(), names));
+    }
+    if per_rule.is_empty() { return Vec::new(); }
+    // HS emits this as a single WfErrorReport entry with a multi-line
+    // message: explanatory header + one block per affected rule.
+    let mut msg = String::from(
+        "The variables of the following rule(s) are not derivable \
+         from their premises, you may be performing unintended pattern \
+         matching.\n\n");
+    let rule_blocks: Vec<String> = per_rule.iter()
+        .map(|(rule_name, vars)| {
+            format!("Rule {}: \nFailed to derive Variable(s): {}",
+                rule_name, vars.join(", "))
+        })
+        .collect();
+    msg.push_str(&rule_blocks.join("\n\n"));
+    vec![WfError::new("Message Derivation Checks", msg)]
 }
 
 fn render_var(v: &VarSpec) -> String {

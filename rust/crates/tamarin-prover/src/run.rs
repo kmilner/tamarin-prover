@@ -637,13 +637,24 @@ fn format_wf_block(report: &[tamarin_parser::wf::WfError]) -> String {
         for _ in 0..topic.len() { out.push('='); }
         out.push_str("\n\n");
         for m in msgs {
+            // HS only adds the 2-space outer indent to the FIRST line
+            // of each message (`prettyWfErrorReport` uses `nest 2 . text`
+            // on the message head, then continuation lines preserve
+            // their embedded indent).
+            let mut first = true;
             for line in m.lines() {
-                out.push_str("  ");
+                if first { out.push_str("  "); first = false; }
                 out.push_str(line);
                 out.push('\n');
             }
             out.push('\n');
         }
+    }
+    // Drop the trailing blank line that follows the last message
+    // block — HS closes the comment on the line immediately after the
+    // last message line, not after a blank.
+    while out.ends_with("\n\n") {
+        out.pop();
     }
     out.push_str("*/");
     out
