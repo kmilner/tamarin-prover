@@ -408,6 +408,34 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
 
     let parser_flags: Vec<&str> = args.defines.iter().map(String::as_str).collect();
 
+    // HS prints the maude tool + version banner ONCE at the top of the
+    // batch run (`Main.Console.argExists` path).  Mirror that here:
+    // emit `maude tool: 'maude'\n checking version: X. OK.\n checking
+    // installation: OK.` before the first theory is loaded.  Suppressed
+    // by `--quiet`.
+    if !args.quiet && !args.parse_only {
+        let raw_path = args.maude_path.clone().unwrap_or_else(default_maude_path);
+        // HS prints just the basename when the user didn't pass --maude-path,
+        // and the full path when they did.  We can't tell which here without
+        // re-introspecting Args, but matching HS's default-banner shape is
+        // achieved by showing the basename when the user-supplied value is
+        // None.  Args' `maude_path` is already None when not provided.
+        let disp = if args.maude_path.is_some() {
+            raw_path.clone()
+        } else {
+            std::path::Path::new(&raw_path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&raw_path)
+                .to_string()
+        };
+        eprintln!("maude tool: '{}'", disp);
+        if let Some(v) = crate::cli::detect_maude_version_pub() {
+            eprintln!(" checking version: {}. OK.", v);
+            eprintln!(" checking installation: OK.");
+        }
+    }
+
     for in_file in &args.in_files {
         let t0 = Instant::now();
         let src = fs::read_to_string(in_file).map_err(|e| {
@@ -416,6 +444,12 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         let parsed = tamarin_parser::parse_theory(&src, &parser_flags).map_err(|e| {
             RunError(format!("parse error in {}: {}", in_file, e))
         })?;
+        // HS emits this trace marker as soon as the theory parses
+        // (TheoryLoader.hs:409).  `--parse-only` and `--quiet` skip it.
+        let theory_name = parsed.name.clone();
+        if !args.quiet && !args.parse_only {
+            eprintln!("[Theory {}] Theory loaded", theory_name);
+        }
 
         // Wellformedness checks — mirrors HS `checkWellformedness`
         // (`Theory.Tools.Wellformedness:1270`).  Runs on every file
@@ -450,6 +484,11 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             RunError(format!("elaboration error in {}: {}", in_file, e.message))
         })?;
         let maude_sig = elaborated.signature.maude_sig.clone();
+        // HS emits this marker after `translateTheory` finishes
+        // (TheoryLoader.hs:454).
+        if !args.quiet && !args.parse_only {
+            eprintln!("[Theory {}] Theory translated", theory_name);
+        }
 
         // Dynamic Message Derivation Checks (mirrors HS
         // `checkVariableDeducability`, gated by `--derivcheck-timeout`,
@@ -458,6 +497,11 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         // Each per-variable proof attempt is capped at this timeout.
         let deriv_timeout = args.derivcheck_timeout.unwrap_or(5) as u32;
         if deriv_timeout > 0 {
+            // HS emits these markers around the per-variable derivability
+            // check (TheoryLoader.hs:485, :498).
+            if !args.quiet && !args.parse_only {
+                eprintln!("[Theory {}] Derivation checks started", theory_name);
+            }
             let deriv_maude = tamarin_term::maude_proc::MaudeHandle::start(
                 &args.maude_path.clone().unwrap_or_else(default_maude_path),
                 maude_sig.clone(),
@@ -468,6 +512,9 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 );
                 wf_report.extend(extra);
             }
+            if !args.quiet && !args.parse_only {
+                eprintln!("[Theory {}] Derivation checks ended", theory_name);
+            }
         }
 
         // Decide which lemmas to prove. Without --prove/--prove-all,
@@ -476,6 +523,9 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         let prove_anything = args.prove_mode || args.prove_all;
 
         let mut results: Vec<LemmaResult> = Vec::new();
+        // Mirrors HS's per-lemma proof body for embedding in the
+        // pretty-printed theory output.  Filled by the prove loop below.
+        let mut proved_lemmas: Vec<tamarin_theory::pretty_theory::ProvedLemma> = Vec::new();
 
         if !prove_anything || args.precompute_only {
             // No proof step requested — record each lemma as Filtered
@@ -503,11 +553,10 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 });
             }
         } else {
-            // Spin up a Maude bridge per file.
+            // Spin up a Maude bridge per file.  The `maude tool: ...`
+            // banner is printed once at the top of the batch run (see
+            // above), matching HS.
             let maude_path = args.maude_path.clone().unwrap_or_else(default_maude_path);
-            if !args.quiet {
-                eprintln!("maude tool: '{}'", maude_path);
-            }
             let maude = MaudeHandle::start(&maude_path, maude_sig).map_err(|e| {
                 RunError(format!(
                     "failed to start maude at {:?}: {:?}",
@@ -537,12 +586,12 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                     });
                     continue;
                 }
-                if !args.quiet {
-                    eprintln!("proving lemma `{}` ...", lemma_name);
-                }
+                // HS does NOT print a per-lemma "proving lemma X ..."
+                // marker; the only progress lines are the `[Theory X]
+                // ...` set above.  Stay quiet here for HS-faithful stderr.
                 let lt = Instant::now();
                 let outcome = prove_lemma(&parsed, &lemma_name, maude.clone(), budget);
-                let (verdict, proof_steps) = match outcome {
+                let (verdict, proof_steps, proof_body) = match outcome {
                     Ok(root) => {
                         let steps = count_proof_steps(&root);
                         let v = match root.status {
@@ -570,10 +619,15 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                             | NodeStatus::Unfinishable
                             | NodeStatus::Open => LemmaVerdict::Analyzed,
                         };
-                        (v, steps)
+                        let body = tamarin_theory::pretty_theory::pretty_proof_body(&root);
+                        (v, steps, Some(body))
                     }
-                    Err(e) => (LemmaVerdict::Error(format!("{}", e)), 0),
+                    Err(e) => (LemmaVerdict::Error(format!("{}", e)), 0, None),
                 };
+                proved_lemmas.push(tamarin_theory::pretty_theory::ProvedLemma {
+                    name: lemma_name.clone(),
+                    proof_body,
+                });
                 results.push(LemmaResult {
                     name: lemma_name,
                     verdict,
@@ -594,15 +648,33 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             }
         }
 
-        let summary = format_summary(in_file, &results, t0.elapsed().as_millis(), wf_report.len());
-        // Insert the wf block BEFORE the analysis summary block, matching
-        // HS's `Theory.Constraint.Solver.summarize` output order:
-        //   source ... -> wf-block -> generated-from -> end -> summary.
-        let body = format!(
-            "{}\n{}\n{}\n",
-            src.trim_end(),
-            format_wf_block(&wf_report),
-            summary
+        // HS emits this marker after `closeTheory` finishes
+        // (TheoryLoader.hs:596).
+        if !args.quiet && !args.parse_only {
+            eprintln!("[Theory {}] Theory closed", theory_name);
+        }
+
+        // Build the HS-faithful theory pretty-print body.  This replaces
+        // the verbatim source dump with HS's `prettyClosedTheory`
+        // output shape — re-rendered signature, rules with `(modulo E)`
+        // prefix and AC-variant comments, lemmas with inline guarded
+        // formula and proof body, wellformedness block, and
+        // Generated-from footer.
+        let build_info = tamarin_theory::pretty_theory::BuildInfo {
+            tamarin_version: crate::cli::VERSION.to_string(),
+            maude_version: crate::cli::detect_maude_version_pub()
+                .unwrap_or_else(|| "unknown".to_string()),
+            git_revision: crate::cli::GIT_REV.to_string(),
+            git_branch: crate::cli::GIT_BRANCH.to_string(),
+            compiled_at: crate::cli::BUILD_TIMESTAMP.to_string(),
+        };
+        let wf_block = format_wf_block(&wf_report);
+        let body = tamarin_theory::pretty_theory::pretty_closed_theory(
+            &parsed,
+            &elaborated,
+            &proved_lemmas,
+            &wf_block,
+            &build_info,
         );
         emit_output(args, in_file, &body, None)?;
 
@@ -743,30 +815,6 @@ pub fn out_path_for(args: &Args, in_file: &str) -> Option<String> {
 /// Mirrors `Theory.Proof.proofStepCount`.
 fn count_proof_steps(node: &tamarin_theory::constraint::solver::search::ProofNode) -> usize {
     1 + node.children.values().map(count_proof_steps).sum::<usize>()
-}
-
-fn format_summary(in_file: &str, results: &[LemmaResult], elapsed_ms: u128, wf_count: usize) -> String {
-    // Mirrors HS `summarizeTheory` / `prettySummary` output: a
-    // `/* analyzed: ... */` block ending with one line per lemma in
-    // HS-faithful `(<quantifier>): <verdict> ...` form.
-    let mut s = String::new();
-    s.push_str("/*\n");
-    s.push_str(&format!("analyzed: {}\n", in_file));
-    s.push_str("\n");
-    s.push_str(&format!("  processing time: {:.2}s\n", elapsed_ms as f64 / 1000.0));
-    s.push_str("  \n");
-    if wf_count > 0 {
-        // HS uses `N wellformedness check failed!` (no pluralisation).
-        s.push_str(&format!(
-            "  WARNING: {} wellformedness check failed!\n", wf_count));
-        s.push_str("           The analysis results might be wrong!\n");
-        s.push_str("  \n");
-    }
-    for r in results {
-        s.push_str(&format!("  {}\n", format_lemma_summary_line(r)));
-    }
-    s.push_str("\n*/\n");
-    s
 }
 
 fn print_overall_summary(file_results: &[FileResult]) {

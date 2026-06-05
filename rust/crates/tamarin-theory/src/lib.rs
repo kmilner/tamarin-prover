@@ -30,6 +30,7 @@ pub mod intruder_variants;
 pub mod predicate;
 pub mod pretty_formula;
 pub mod pretty_system;
+pub mod pretty_theory;
 pub mod restriction;
 pub mod rule;
 pub mod constraint;
