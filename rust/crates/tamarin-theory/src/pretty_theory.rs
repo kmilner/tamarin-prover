@@ -790,8 +790,17 @@ fn render_lnterm(t: &tamarin_term::lterm::LNTerm) -> String {
             }
         }
         Term::Lit(Lit::Con(n)) => {
-            // Named constant.  Render via Debug for now.
-            format!("{:?}", n)
+            // HS-faithful constant rendering (Term/Term.hs::prettyTerm
+            // via the Show instance on `Name`): single-quoted literal
+            // with sort-prefix sigil.  `'g'`, `~'name'`, `%'n'`.
+            use tamarin_term::lterm::NameTag;
+            let prefix = match n.tag {
+                NameTag::Pub => "",
+                NameTag::Fresh => "~",
+                NameTag::Nat => "%",
+                NameTag::Node => "#",
+            };
+            format!("{}'{}'", prefix, n.id.0)
         }
         Term::App(FunSym::NoEq(sym), args) => {
             let name = String::from_utf8_lossy(&sym.name);
