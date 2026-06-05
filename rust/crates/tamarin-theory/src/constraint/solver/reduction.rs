@@ -39,6 +39,26 @@ pub struct Reduction<'ctx> {
     /// Whether the system has been mutated since the last
     /// `whileChanging` checkpoint.
     pub changed: ChangeIndicator,
+    /// Multi-arm eq-store fanout produced inside an `insert_atom`
+    /// `Atom::Eq` call (or, recursively, an `insert_formula`
+    /// invocation that opened to an Eq atom).  Mirrors HS's
+    /// `disjunctionOfList $ performSplit eqs2 splitId` inside
+    /// `solveTermEqs SplitNow` (Reduction.hs:776-778): each AC
+    /// unifier arm forks the surrounding `Reduction` (`DisjT`)
+    /// continuation.  Our port doesn't have a monad-level Disj layer,
+    /// so we surface the extra arms here: `insert_atom` Atom::Eq
+    /// installs arm[0] into `sys.eq_store` and stores arms[1..] in
+    /// `pending_eq_arms`.  Callers that wrap an `insert_formula`
+    /// invocation in a per-case fork (e.g. `solve_disj_goal`,
+    /// `insert_implied_formulas_pass`) drain `pending_eq_arms` after
+    /// the call and emit one additional case per arm with `sys`
+    /// cloned and `eq_store = arm`.  This mirrors HS's behaviour
+    /// where each AC unifier arm produces its own downstream
+    /// `Goals.hs:432-436` `case_N` entry — i.e. `case_2` of an outer
+    /// `solveDisjunction` further fans into `case_2_case_1`,
+    /// `case_2_case_2` via `uniqueListBy ... distinguish`
+    /// (ProofMethod.hs:468).
+    pub pending_eq_arms: Vec<crate::tools::equation_store::EquationStore>,
 }
 
 /// `ChangeIndicator` mirrors the `True`/`False` flag the Haskell
@@ -69,7 +89,11 @@ impl<'ctx> Reduction<'ctx> {
         // then start above our base, preventing cross-allocator
         // collisions on names like `~mw` that both routes mint.
         ctx.maude.ensure_above(avoid_max);
-        Reduction { ctx, sys, maude, changed: ChangeIndicator::Unchanged }
+        Reduction {
+            ctx, sys, maude,
+            changed: ChangeIndicator::Unchanged,
+            pending_eq_arms: Vec::new(),
+        }
     }
 
     /// Run a reduction step until it stops mutating the system. The
@@ -1249,8 +1273,31 @@ impl<'ctx> Reduction<'ctx> {
                     SplitStrategy::SplitNow,
                     &[tamarin_term::rewriting::Equal { lhs: tx, rhs: ty }],
                 );
-                if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
-                    self.mark_contradictory();
+                match res {
+                    Err(_) | Ok(SolveOutcome::Contradictory) => {
+                        self.mark_contradictory();
+                    }
+                    Ok(SolveOutcome::Linear(_)) => {}
+                    Ok(SolveOutcome::Cases(arms)) => {
+                        // HS-faithful fanout (Reduction.hs:776-778):
+                        // `disjunctionOfList $ performSplit eqs2 splitId`
+                        // forks the surrounding `Reduction` continuation
+                        // once per AC unifier arm.  We install arm[0]
+                        // as the current eq_store and stash arms[1..]
+                        // in `pending_eq_arms` for the outer-case caller
+                        // (e.g. `solve_disj_goal`) to drain.
+                        let mut it = arms.into_iter();
+                        if let Some(first) = it.next() {
+                            self.sys.eq_store = first;
+                        }
+                        for rest in it {
+                            self.pending_eq_arms.push(rest);
+                        }
+                        if std::env::var("TAM_RS_DBG_INSERT_ATOM_EQ_FANOUT").is_ok() {
+                            eprintln!("[insert_atom_eq_fanout] stashed {} extra arms",
+                                self.pending_eq_arms.len());
+                        }
+                    }
                 }
                 self.changed = ChangeIndicator::Changed;
                 true
@@ -3501,6 +3548,15 @@ impl<'ctx> Reduction<'ctx> {
                 // leaks Disj/Ex bodies past is_finished (see the
                 // companion fix in `insert_implied_formulas_pass`).
                 self.insert_formula(alts[0].clone());
+                // NOTE: if `insert_formula` opened to an `Atom::Eq`
+                // that produced AC unifier arms, `pending_eq_arms` is
+                // non-empty.  In the singleton-Disj path we cannot
+                // emit additional `case_N` entries (the caller treats
+                // Linear as no-fork); the arms are lost.  Singleton
+                // Disjs that route through EqE-fanout are not present
+                // in the current corpus — re-evaluate if a divergence
+                // surfaces.
+                self.pending_eq_arms.clear();
                 GoalCases::Linear
             }
             _ => {
@@ -3524,7 +3580,29 @@ impl<'ctx> Reduction<'ctx> {
                     // singleton branch.  Mirrors Haskell `solveDisjunction`
                     // → `insertFormula alt`.
                     sub.insert_formula(gfm.clone());
-                    cases.push((default_case_name(i), sub.sys));
+                    // HS-faithful multi-arm fanout (Reduction.hs:776-778):
+                    // if the chosen disjunct opened to an `Atom::Eq` whose
+                    // `solveTermEqs SplitNow` returned multiple AC unifier
+                    // arms, each arm forks the surrounding `Reduction`
+                    // continuation.  In HS this is invisible: the `DisjT`
+                    // monad replicates the rest of `solveDisjunction` per
+                    // arm and `solveGoal` returns one `(case_name, sys)`
+                    // entry per arm.  Sibling cases sharing `case_name`
+                    // get `_case_N` suffixes via `distinguish`
+                    // (ProofMethod.hs:468) — that's the source of HS's
+                    // `case_2_case_1` / `case_2_case_2` pair on multiset
+                    // EqE disjuncts.  Drain `pending_eq_arms` and emit
+                    // one extra case per arm with the same base label
+                    // and the arm's eq_store installed.
+                    let pending = std::mem::take(&mut sub.pending_eq_arms);
+                    let base_name = default_case_name(i);
+                    let post_sys = sub.sys.clone();
+                    cases.push((base_name.clone(), sub.sys));
+                    for arm_eq in pending {
+                        let mut arm_sys = post_sys.clone();
+                        arm_sys.eq_store = arm_eq;
+                        cases.push((base_name.clone(), arm_sys));
+                    }
                 }
                 self.changed = ChangeIndicator::Changed;
                 GoalCases::Cases(cases)
