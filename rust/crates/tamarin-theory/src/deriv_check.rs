@@ -52,19 +52,31 @@ pub fn check_message_derivation(
     if timeout_secs == 0 { return Vec::new(); }
     let timeout = Duration::from_secs(timeout_secs as u64);
     let dbg = std::env::var_os("TAM_DBG_DERIV_CHECK").is_some();
+    // TAM_DBG_DERIV_TIMING=1: emit per-rule / per-variable wall-clock
+    // timings on stderr.  Off-path when env var is absent.
+    let dbg_timing = std::env::var_os("TAM_DBG_DERIV_TIMING").is_some();
+    let t_total_start = std::time::Instant::now();
 
     let mut per_rule: Vec<(String, Vec<String>)> = Vec::new();
+    let mut rule_count = 0usize;
+    let mut var_count = 0usize;
+    let mut total_synth = Duration::ZERO;
+    let mut total_prove = Duration::ZERO;
     for (idx, rule) in protocol_rules(parsed).enumerate() {
         if rule.attributes.iter().any(|a| matches!(a, p::RuleAttr::NoDerivCheck)) {
             continue;
         }
         let free_vars = collect_rule_free_vars(rule);
         if free_vars.is_empty() { continue; }
+        rule_count += 1;
 
         // Build the probe theory ONCE per rule (it contains all the
         // per-variable lemmas).  The synthesised theory is small —
         // one rule, N lemmas, the original signature.
+        let t_synth = std::time::Instant::now();
         let probe = synthesise_probe_theory(parsed, rule, idx, &free_vars);
+        let synth_dt = t_synth.elapsed();
+        total_synth += synth_dt;
         if dbg {
             eprintln!("[deriv] rule={} free_vars={:?}", rule.name,
                 free_vars.iter().map(|v| &v.name).collect::<Vec<_>>());
@@ -82,16 +94,40 @@ pub fn check_message_derivation(
 
         // Try each variable's lemma.  HS's "TraceFound" status maps
         // to RS's `NodeStatus::Solved` for exists-trace lemmas.
-        let mut undecidable = Vec::new();
-        for v in &free_vars {
-            let lemma_name = format!("deriv_check_{}_{}", idx, v.name);
-            if !try_prove_within(&probe, &lemma_name, maude.clone(), timeout) {
-                undecidable.push(v.name.clone());
-            }
+        //
+        // HS-faithful structure: `closeTheoryWithMaude` is called ONCE
+        // per probe theory (HS `MessageDerivationChecks.hs:40-44`
+        // calls `closeTheoryWithMaude` once per modified theory; then
+        // `proveTheory` walks the N lemmas reusing the closed theory's
+        // sources/cache — `Prover.hs:260-279`).  Build the
+        // `ProofContext` + run `ensure_saturated()` ONCE per probe,
+        // then iterate the per-variable lemmas reusing it.  Previously
+        // each `prove_lemma` call rebuilt the context and re-saturated;
+        // on wireguard's bigger probes that was ~80% of the deriv-check
+        // wall-clock.
+        let undecidable = match prove_probe(&probe, maude.clone(), idx, &free_vars, timeout, dbg_timing, &rule.name, &mut total_prove, &mut var_count) {
+            Some(u) => u,
+            None => continue,
+        };
+        if dbg_timing {
+            eprintln!(
+                "[deriv-timing] rule={} synth={:.3}s nvars={} total_prove={:.3}s",
+                rule.name, synth_dt.as_secs_f64(), free_vars.len(),
+                total_prove.as_secs_f64(),
+            );
         }
         if !undecidable.is_empty() {
             per_rule.push((rule.name.clone(), undecidable));
         }
+    }
+    if dbg_timing {
+        eprintln!(
+            "[deriv-timing] TOTAL rules={} vars={} synth={:.3}s prove={:.3}s wall={:.3}s",
+            rule_count, var_count,
+            total_synth.as_secs_f64(),
+            total_prove.as_secs_f64(),
+            t_total_start.elapsed().as_secs_f64(),
+        );
     }
     format_deriv_report(&per_rule)
 }
@@ -320,8 +356,112 @@ fn synthesise_probe_theory(
     probe
 }
 
+/// HS-faithful per-probe prover.  Builds the elaborated probe theory
+/// and a single `ProofContext` (with one `ensure_saturated` call),
+/// then iterates the per-variable lemmas, invoking `run_proof_search`
+/// directly on each lemma's `System` with the shared, already-saturated
+/// context.
+///
+/// Mirrors HS's `closeTheoryWithMaude` (called once per modified theory
+/// in `MessageDerivationChecks.hs:40-44`) followed by `proveTheory`'s
+/// per-lemma walk (`Prover.hs:260-279`).  Returns `None` on elaboration
+/// failure (caller continues to the next probe rule); otherwise returns
+/// the list of variable names whose lemma did NOT find a trace
+/// (= non-derivable variables).
+fn prove_probe(
+    probe: &p::Theory,
+    maude: MaudeHandle,
+    idx: usize,
+    free_vars: &[p::VarSpec],
+    timeout: Duration,
+    dbg_timing: bool,
+    rule_name: &str,
+    total_prove: &mut Duration,
+    var_count: &mut usize,
+) -> Option<Vec<String>> {
+    use crate::constraint::solver::context::ProofContext;
+    use crate::constraint::solver::search::{run_proof_search, NodeStatus};
+    use crate::constraint::system::{formula_to_system, SourceKind};
+    use crate::elaborate::elaborate;
+    use crate::guarded::formula_to_guarded;
+    use crate::theory::OpenProtoRule;
+
+    // Per-prove deadline gate (mirrors `try_prove_within`'s previous
+    // behavior so each variable's search still honours `timeout`).
+    let prev_deadline = std::env::var("TAM_PROVE_DEADLINE_MS").ok();
+    let ms = (timeout.as_millis() as u64).max(1);
+    std::env::set_var("TAM_PROVE_DEADLINE_MS", ms.to_string());
+
+    let _user_funs_guard = crate::elaborate::set_user_funs_for_theory(probe);
+    let elaborated = match elaborate(probe) {
+        Ok(t) => t,
+        Err(_) => {
+            // Restore deadline before bailing.
+            match prev_deadline {
+                Some(v) => std::env::set_var("TAM_PROVE_DEADLINE_MS", v),
+                None => std::env::remove_var("TAM_PROVE_DEADLINE_MS"),
+            }
+            return None;
+        }
+    };
+    let rules: Vec<OpenProtoRule> = elaborated.rules().cloned().collect();
+    let mut ctx = ProofContext::new_with_restrictions(maude, rules, Vec::new());
+    ctx.is_exists_trace = true;
+    // Probes have no `[sources]`-tagged lemmas, so no typing
+    // assumptions — but `ensure_saturated()` still must run to compute
+    // the source-case cache exactly as HS's `closeTheoryWithMaude`
+    // does once per modified theory (Prover.hs:170-251).
+    ctx.ensure_saturated();
+
+    let mut undecidable = Vec::new();
+    for v in free_vars {
+        let lemma_name = format!("deriv_check_{}_{}", idx, v.name);
+        let lemma = match elaborated.lookup_lemma(&lemma_name) {
+            Some(l) => l,
+            None => continue,
+        };
+        let g = match formula_to_guarded(&lemma.formula) {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+        let sys = formula_to_system(
+            Vec::new(),
+            SourceKind::RawSources,
+            p::TraceQuantifier::ExistsTrace,
+            false,
+            &g,
+        );
+        let t_prove = std::time::Instant::now();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_proof_search(&ctx, sys, 1000)
+        }));
+        let ok = matches!(result, Ok(ref n) if matches!(n.status, NodeStatus::Solved));
+        let prove_dt = t_prove.elapsed();
+        *total_prove += prove_dt;
+        *var_count += 1;
+        if dbg_timing {
+            eprintln!(
+                "[deriv-timing] rule={} var={} prove={:.3}s ok={}",
+                rule_name, v.name, prove_dt.as_secs_f64(), ok,
+            );
+        }
+        if !ok {
+            undecidable.push(v.name.clone());
+        }
+    }
+
+    // Restore prior deadline so the deriv check doesn't leak into the
+    // main prove loop.
+    match prev_deadline {
+        Some(v) => std::env::set_var("TAM_PROVE_DEADLINE_MS", v),
+        None => std::env::remove_var("TAM_PROVE_DEADLINE_MS"),
+    }
+    Some(undecidable)
+}
+
 /// Run `prove_lemma` with a wall-clock cap of `timeout`.  Returns
 /// `true` iff the prover found a trace (Solved for exists-trace).
+#[allow(dead_code)]
 fn try_prove_within(
     parsed: &p::Theory,
     lemma_name: &str,
@@ -334,9 +474,20 @@ fn try_prove_within(
     // sub-second too, but a 0-ms deadline would immediately Sorry).
     let ms = (timeout.as_millis() as u64).max(1);
     std::env::set_var("TAM_PROVE_DEADLINE_MS", ms.to_string());
+    // TAM_DBG_DERIV_TIMING also propagates an inner phase trace via
+    // TAM_DBG_PHASE so we can see elaborate/saturate/search splits.
+    let restore_phase = if std::env::var_os("TAM_DBG_DERIV_TIMING").is_some()
+        && std::env::var_os("TAM_DBG_PHASE").is_none()
+    {
+        std::env::set_var("TAM_DBG_PHASE", "1");
+        true
+    } else { false };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::prove::prove_lemma(parsed, lemma_name, maude, 1000)
     }));
+    if restore_phase {
+        std::env::remove_var("TAM_DBG_PHASE");
+    }
     // Restore prior deadline so the deriv check doesn't leak into the
     // main prove loop.
     match prev_deadline {

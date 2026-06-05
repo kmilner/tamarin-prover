@@ -51,6 +51,11 @@ pub fn prove_lemma(
     max_steps: usize,
 ) -> Result<ProofNode, ProveError> {
     let trace = std::env::var("TAM_DBG_PHASE").is_ok();
+    // Per-phase wall-clock instrumentation, gated by TAM_DBG_PHASE.
+    // `Option<Instant>` keeps the disabled-path branch-predictable to
+    // a single `if let Some(_)` check at each phase boundary.
+    let t_phase: Option<std::time::Instant> =
+        if trace { Some(std::time::Instant::now()) } else { None };
     if trace { eprintln!("[phase] elaborate start"); }
     // Re-set the thread-locals that track user-declared function symbols
     // for the *duration of this prove call*.  `elaborate()` sets them
@@ -62,7 +67,10 @@ pub fn prove_lemma(
     // Elaborate to get the typed theory, then pull rules + restrictions.
     let theory = elaborate(parser_theory)
         .map_err(|e| ProveError::Elaboration(e.message))?;
-    if trace { eprintln!("[phase] elaborate done"); }
+    if trace { eprintln!("[phase] elaborate done dt={:.3}s",
+        t_phase.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64())); }
+    let t_after_elab: Option<std::time::Instant> =
+        if trace { Some(std::time::Instant::now()) } else { None };
 
     // Find the lemma (parser-AST formula stays accessible via Theory's items).
     // Our typed theory's lemma carries a parser-AST formula too — look it up.
@@ -136,11 +144,15 @@ pub fn prove_lemma(
     // architecture matching Haskell exactly — no workaround.
     sys.insert_lemmas(reuse_lemmas);
 
-    if trace { eprintln!("[phase] formula_to_system done; ProofContext::new start"); }
+    if trace { eprintln!("[phase] formula_to_system done dt={:.3}s; ProofContext::new start",
+        t_after_elab.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64())); }
+    let t_ctx: Option<std::time::Instant> =
+        if trace { Some(std::time::Instant::now()) } else { None };
     // Bridge the elaborated theory's rules into the proof context.
     let rules: Vec<OpenProtoRule> = theory.rules().cloned().collect();
     let mut ctx = ProofContext::new_with_restrictions(maude, rules, restrictions.clone());
-    if trace { eprintln!("[phase] ProofContext::new done"); }
+    if trace { eprintln!("[phase] ProofContext::new done dt={:.3}s",
+        t_ctx.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64())); }
     // Propagate the lemma's trace quantifier so `is_finished` can
     // decide whether the Fresh-conflation case-drop should convert
     // Contradictory→Unfinishable (sound only on exists-trace where
@@ -197,7 +209,13 @@ pub fn prove_lemma(
     // Done` at theory-close time — Rust does it per-lemma because the
     // ctx is per-lemma.
     ctx.typing_assumptions = typing_assumptions;
+    let t_sat: Option<std::time::Instant> =
+        if trace { Some(std::time::Instant::now()) } else { None };
     ctx.ensure_saturated();
+    if trace { eprintln!("[phase] ensure_saturated done dt={:.3}s",
+        t_sat.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64())); }
+    let t_search: Option<std::time::Instant> =
+        if trace { Some(std::time::Instant::now()) } else { None };
     if trace { eprintln!("[phase] run_proof_search start"); }
     // Phase marker so TAM_RS_DBG_* counts can be filtered to the
     // lemma-proof phase only.  Pair with HS's `[Saturating Sources]
@@ -252,7 +270,11 @@ pub fn prove_lemma(
                 lemma_name, lemma.proof.raw.len());
         }
     }
-    Ok(run_proof_search(&ctx, sys, max_steps))
+    let r = run_proof_search(&ctx, sys, max_steps);
+    if trace { eprintln!("[phase] run_proof_search done dt={:.3}s total={:.3}s",
+        t_search.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64()),
+        t_phase.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64())); }
+    Ok(r)
 }
 
 #[cfg(test)]
