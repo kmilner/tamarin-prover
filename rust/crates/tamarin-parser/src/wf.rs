@@ -30,7 +30,13 @@ use crate::ast::*;
 /// `"Fact arity issues"`).
 #[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd)]
 pub struct WfError {
+    /// Short title used for grouping/ordering — matches HS's
+    /// `underlineTopic` argument exactly (e.g. `"Reserved names"`).
     pub topic: String,
+    /// Fully-formatted HS-style block for this entry.  When multiple
+    /// `WfError`s share a topic the `format_wf_block` formatter
+    /// concatenates the messages, separated by blank lines, beneath
+    /// the topic header (which is part of `message`).
     pub message: String,
 }
 
@@ -173,6 +179,113 @@ fn term_name_lits(t: &Term, out: &mut Vec<(NameKind, String)>) {
 fn rule_terms(r: &Rule) -> impl Iterator<Item = &Term> {
     r.premises.iter().chain(&r.actions).chain(&r.conclusions)
         .flat_map(|f: &Fact| f.args.iter())
+}
+
+/// Build an HS `underlineTopic` block: `"<title>\n<====>\n"` where the
+/// underline matches the title length exactly (counting any trailing
+/// space).  Mirrors `underlineTopic` in `Theory.Tools.Wellformedness`.
+fn underline_topic(title: &str) -> String {
+    let len = title.chars().count();
+    let mut s = String::with_capacity(title.len() + len + 2);
+    s.push_str(title);
+    s.push('\n');
+    for _ in 0..len { s.push('='); }
+    s.push('\n');
+    s
+}
+
+/// Pretty-print a parser-AST fact in HS's `prettyLNFact` style:
+/// `!Name( arg, arg, ... )` for persistent, `Name( arg, arg, ... )`
+/// for linear.  Internal spaces match `nestShort'`.
+fn pp_wf_fact(fa: &Fact) -> String {
+    let mut s = String::new();
+    if fa.persistent { s.push('!'); }
+    s.push_str(&fa.name);
+    s.push_str("( ");
+    for (i, a) in fa.args.iter().enumerate() {
+        if i > 0 { s.push_str(", "); }
+        pp_wf_term(a, &mut s);
+    }
+    s.push_str(" )");
+    s
+}
+
+fn pp_wf_term(t: &Term, out: &mut String) {
+    use Term::*;
+    match t {
+        Var(v) => {
+            out.push_str(sort_prefix(&v.sort));
+            out.push_str(&v.name);
+            if v.idx > 0 { out.push('.'); out.push_str(&v.idx.to_string()); }
+        }
+        PubLit(s) => { out.push('\''); out.push_str(s); out.push('\''); }
+        FreshLit(s) => { out.push_str("~'"); out.push_str(s); out.push('\''); }
+        NatLit(s) => { out.push_str("%'"); out.push_str(s); out.push('\''); }
+        Number(n) => out.push_str(&n.to_string()),
+        NumberOne => out.push('1'),
+        NatOne => out.push_str("%1"),
+        DhNeutral => out.push_str("1:msg"),
+        Pair(items) => {
+            out.push('<');
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 { out.push_str(", "); }
+                pp_wf_term(it, out);
+            }
+            out.push('>');
+        }
+        App(name, args) => {
+            out.push_str(name);
+            if !args.is_empty() {
+                out.push('(');
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 { out.push_str(", "); }
+                    pp_wf_term(a, out);
+                }
+                out.push(')');
+            }
+        }
+        AlgApp(name, l, r) => {
+            // HS canonicalises `aenc{m}pk` as `aenc(m, pk)`.
+            out.push_str(name);
+            out.push('(');
+            pp_wf_term(l, out);
+            out.push_str(", ");
+            pp_wf_term(r, out);
+            out.push(')');
+        }
+        Diff(l, r) => {
+            out.push_str("diff(");
+            pp_wf_term(l, out);
+            out.push_str(", ");
+            pp_wf_term(r, out);
+            out.push(')');
+        }
+        BinOp(op, l, r) => {
+            let sym = match op {
+                crate::ast::BinOp::Exp => "^",
+                crate::ast::BinOp::Mult => "*",
+                crate::ast::BinOp::Union => "++",
+                crate::ast::BinOp::Xor => "\u{2295}",
+                crate::ast::BinOp::NatPlus => "%+",
+            };
+            pp_wf_term(l, out);
+            out.push_str(sym);
+            pp_wf_term(r, out);
+        }
+        PatMatch(inner) => { out.push('='); pp_wf_term(inner, out); }
+    }
+}
+
+fn sort_prefix(s: &SortHint) -> &'static str {
+    use SortHint::*;
+    use SuffixSort as SS;
+    match s {
+        Pub | Suffix(SS::Pub) => "$",
+        Fresh | Suffix(SS::Fresh) => "~",
+        Node | Suffix(SS::Node) => "#",
+        Nat | Suffix(SS::Nat) => "%",
+        Msg | Suffix(SS::Msg) | Untagged => "",
+    }
 }
 
 /// True if a sort hint indicates a fresh-sort variable.
@@ -382,6 +495,8 @@ struct FactObservation {
     name: String,
     arity: usize,
     persistent: bool,
+    /// The actual fact, retained so we can render it in WF messages.
+    fact: Fact,
 }
 
 fn collect_fact_observations(thy: &Theory) -> Vec<FactObservation> {
@@ -397,6 +512,7 @@ fn collect_fact_observations(thy: &Theory) -> Vec<FactObservation> {
                 name: f.name.clone(),
                 arity: f.args.len(),
                 persistent: f.persistent,
+                fact: f.clone(),
             });
         }
     }
@@ -410,30 +526,96 @@ pub fn fact_usage(thy: &Theory) -> WfReport {
         groups.entry(obs.name.to_lowercase()).or_default().push(obs);
     }
     let mut out = Vec::new();
+
+    // HS emits one block per issue type when ANY clash group exhibits
+    // it.  Collect first, then emit.
+    let mut cap_groups: Vec<&Vec<&FactObservation>> = Vec::new();
+    let mut arity_groups: Vec<&Vec<&FactObservation>> = Vec::new();
+    let mut mult_groups: Vec<&Vec<&FactObservation>> = Vec::new();
     for (_, group) in groups.iter().filter(|(_, g)| g.len() >= 2) {
         let cap_set: BTreeSet<&str> = group.iter().map(|o| o.name.as_str()).collect();
         let arity_set: BTreeSet<usize> = group.iter().map(|o| o.arity).collect();
         let mult_set: BTreeSet<bool> = group.iter().map(|o| o.persistent).collect();
-        if cap_set.len() > 1 {
-            out.push(WfError::new("Fact capitalization issues",
-                format!("Fact `{}`: clashing capitalizations {}",
-                    group[0].name.to_lowercase(),
-                    cap_set.iter().cloned().collect::<Vec<_>>().join(", "))));
-        }
-        if arity_set.len() > 1 {
-            let arities: Vec<String> = arity_set.iter().map(|n| n.to_string()).collect();
-            out.push(WfError::new("Fact arity issues",
-                format!("Fact `{}`: clashing arities {}",
-                    group[0].name.to_lowercase(),
-                    arities.join(", "))));
-        }
-        if mult_set.len() > 1 {
-            out.push(WfError::new("Fact multiplicity issues",
-                format!("Fact `{}`: clashing multiplicities (linear/persistent)",
-                    group[0].name.to_lowercase())));
-        }
+        if cap_set.len() > 1 { cap_groups.push(group); }
+        if arity_set.len() > 1 { arity_groups.push(group); }
+        if mult_set.len() > 1 { mult_groups.push(group); }
+    }
+
+    if !cap_groups.is_empty() {
+        let msg = "Fact names are case-sensitive, different capitalizations are \
+                  considered as different facts, i.e., Fact() is different from FAct(). \n\
+                  Check the capitalization of your fact names.";
+        out.push(format_fact_clash_block(
+            "Fact capitalization issues",
+            msg,
+            &cap_groups,
+            |o| format!("capitalization {:?}", o.name),
+        ));
+    }
+    if !arity_groups.is_empty() {
+        let msg = "Same fact is used with different arities, \
+                  i.e., Fact('A','B') is different from Fact('A'). \n\
+                  Check the arguments of your facts.";
+        out.push(format_fact_clash_block(
+            "Fact arity issues",
+            msg,
+            &arity_groups,
+            |o| format!("arity {}", o.arity),
+        ));
+    }
+    if !mult_groups.is_empty() {
+        let msg = "Same fact is used with different multiplicities, \
+                  i.e., !Fact() (Persistent fact) exists along with Fact() (Linear) in your rules. \n\
+                  Check the multiplicity (persistence) of your facts.";
+        out.push(format_fact_clash_block(
+            "Fact multiplicity issues",
+            msg,
+            &mult_groups,
+            |o| format!("multiplicity (persistence) {}",
+                if o.persistent { "Persistent" } else { "Linear" }),
+        ));
     }
     out
+}
+
+/// Emit one HS-style WfError block: title + underline + intro msg +
+/// per-clash numbered detail.  Layout matches the byte output of HS's
+/// `formatMultipIssue` / `formatArityIssue` / `formatCapIssue`
+/// (Wellformedness.hs:660-674).
+fn format_fact_clash_block<F>(
+    title: &str,
+    intro: &str,
+    groups: &[&Vec<&FactObservation>],
+    detail: F,
+) -> WfError
+where F: Fn(&FactObservation) -> String,
+{
+    let mut s = String::new();
+    s.push_str(&underline_topic(title));
+    s.push('\n');
+    s.push_str(intro);
+    s.push('\n');
+    s.push_str("  \n");  // trailing 2-space line from HS `text ""`
+    for group in groups {
+        s.push('\n');
+        let name = group[0].name.to_lowercase();
+        s.push_str(&format!("  Fact `{}':\n", name));
+        s.push('\n');
+        for (i, obs) in group.iter().enumerate() {
+            if i > 0 {
+                s.push_str("    \n");  // 4-space trailing line
+            }
+            s.push_str(&format!(
+                "    {}. Rule `{}', {}\n",
+                i + 1,
+                obs.rule_name,
+                detail(obs),
+            ));
+            s.push_str(&format!("         {}\n", pp_wf_fact(&obs.fact)));
+        }
+        s.push_str("  \n");  // 2-space trailing line after the group
+    }
+    WfError::new(title, s)
 }
 
 // =============================================================================
@@ -441,31 +623,68 @@ pub fn fact_usage(thy: &Theory) -> WfReport {
 // =============================================================================
 
 pub fn fact_lhs_occur_no_rhs(thy: &Theory) -> WfReport {
-    let mut rhs_keys: BTreeSet<(String, usize, bool)> = BTreeSet::new();
+    // Mirrors HS `factLhsOccurNoRhs` (Wellformedness.hs:233-249): for
+    // every premise fact that no rule produces, find a "similar" RHS
+    // (same name, may differ in arity/multiplicity) on some rule and
+    // emit a numbered suggestion list.
+    //
+    // Title carries a single trailing space, matching HS's source-literal
+    // `"Facts occur in the left-hand-side but not in any right-hand-side "`.
+    let title = "Facts occur in the left-hand-side but not in any right-hand-side ";
+
+    let mut rhs_by_name: BTreeMap<String, Vec<(String, Fact)>> = BTreeMap::new();
     for r in theory_rules(thy) {
         for f in &r.conclusions {
-            rhs_keys.insert((f.name.clone(), f.args.len(), f.persistent));
+            rhs_by_name.entry(f.name.clone())
+                .or_default()
+                .push((r.name.clone(), f.clone()));
         }
     }
-    let mut seen_lhs: BTreeMap<(String, usize, bool), Vec<String>> = BTreeMap::new();
+
+    // Detect orphan premises (LHS facts with no exactly-matching RHS).
+    let mut orphan_pairs: Vec<(String, Fact, Option<(String, Fact)>)> = Vec::new();
     for r in theory_rules(thy) {
         for f in &r.premises {
             if is_builtin_fact_name(&f.name) { continue; }
-            seen_lhs.entry((f.name.clone(), f.args.len(), f.persistent))
-                .or_default()
-                .push(r.name.clone());
+            let exact_match = rhs_by_name.get(&f.name)
+                .map(|v| v.iter().any(|(_, rf)|
+                    rf.args.len() == f.args.len() && rf.persistent == f.persistent))
+                .unwrap_or(false);
+            if exact_match { continue; }
+            // Suggest a same-name RHS that differs in arity/multiplicity.
+            let suggestion = rhs_by_name.get(&f.name)
+                .and_then(|v| v.first())
+                .map(|(rn, rf)| (rn.clone(), rf.clone()));
+            orphan_pairs.push((r.name.clone(), f.clone(), suggestion));
         }
     }
-    let mut out = Vec::new();
-    for (key, rules) in seen_lhs {
-        if !rhs_keys.contains(&key) {
-            out.push(WfError::new(
-                "Facts occur in the left-hand-side but not in any right-hand-side",
-                format!("Fact `{}`/{} appears only as a premise (rules: {})",
-                    key.0, key.1, rules.join(", "))));
-        }
+
+    if orphan_pairs.is_empty() { return Vec::new(); }
+
+    let mut s = String::new();
+    s.push_str(&underline_topic(title));
+    s.push('\n');
+    for (i, (rule_name, fa, suggestion)) in orphan_pairs.iter().enumerate() {
+        let primary = format!(
+            "in rule \"{}\":  factName `{}' arity: {} multiplicity: {}",
+            rule_name,
+            fa.name,
+            fa.args.len(),
+            if fa.persistent { "Persistent" } else { "Linear" },
+        );
+        let line = match suggestion {
+            Some((sug_rule, sug_fa)) => format!(
+                "  {}. {}. Perhaps you want to use the fact in rule \"{}\":  factName `{}' arity: {} multiplicity: {}",
+                i + 1, primary, sug_rule, sug_fa.name, sug_fa.args.len(),
+                if sug_fa.persistent { "Persistent" } else { "Linear" },
+            ),
+            None => format!("  {}. {}", i + 1, primary),
+        };
+        s.push_str(&line);
+        s.push('\n');
     }
-    out
+
+    vec![WfError::new(title, s)]
 }
 
 // =============================================================================
