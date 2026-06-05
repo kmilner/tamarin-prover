@@ -1398,24 +1398,79 @@ fn try_match_all_guards(
                 let Some(subj_lnt) = crate::elaborate::term_to_lnterm(&subj_term)
                     else { return };
                 let mut struct_subst = std::collections::BTreeMap::new();
-                if !structural_match(&pat_lnt, &subj_lnt,
-                    &pattern_vars, &mut struct_subst) {
-                    return;
-                }
-                // Translate the LVar → LNTerm bindings back to a
-                // parser-AST VarSubst, restricted to universal vars.
-                let mut subst_here = VarSubst::new();
-                for (lv, lt) in struct_subst {
-                    if !vars.iter().any(|v| v.name == lv.name && v.idx == lv.idx) {
-                        continue;
+                let struct_ok = structural_match(&pat_lnt, &subj_lnt,
+                    &pattern_vars, &mut struct_subst);
+                // HS-faithful: HS's `matchTerm` (Guarded.hs:810-815)
+                // delegates to `solveMatchLTerm` → Maude, which does AC
+                // matching modulo the equational theory.  Our pure
+                // `structural_match` succeeds only on syntactic match —
+                // it FAILS for AC-symbol patterns (e.g. multiset
+                // `y++z` against `'1'++y++h(y)` cannot be aligned
+                // element-wise even though the AC matcher binds
+                // `z = '1'++h(y)`).  When structural match fails, fall
+                // back to Maude's AC matcher via
+                // `match_eqs_skolemize_both` — analogous to what
+                // `match_atom_via_maude` already does for Action-guard
+                // matching, but with BOTH sides skolemized (mirroring
+                // HS's `skolemizeGuarded gf0` step in `impliedFormulas`
+                // at System.hs:1122).  HS skolemizes both pattern and
+                // subject so co-occurring free system vars (e.g. `y`
+                // in both `(y++z) = ('1'++y++h(y))`) map to the same
+                // constant; `match_eqs_const_subject` only skolemizes
+                // the subject, leaving the pattern's free non-pattern
+                // LVars as Maude variables that Maude would bind
+                // freely (producing a different match).
+                //
+                // Each Maude matcher becomes its own continuation,
+                // mirroring HS's `candidateSubsts` list-monad iteration
+                // (System.hs:1136-1145):
+                //   subst' <- (`runReader` hnd) $ matchTerm term pat
+                //   candidateSubsts (compose subst' subst) as
+                //
+                // Concrete fix: counter.spthy::lesser_senc_secret's
+                // `case_2_case_1` arm contains the IH-derived universal
+                //   ∀ z. (y++z) = ('1'++y++h(y)) ⇒ ⊥
+                // After multiset/AC EqE fanout, `insertImpliedFormulas`
+                // needs to match `y++z` against `'1'++y++h(y)` to
+                // instantiate the body `⊥` (gfalse), producing
+                // FormulasFalse.  HS's Maude-backed matchTerm binds
+                // `z = '1'++h(y)`; RS's structural matcher rejects the
+                // AC-shape mismatch.  Without this fallback the arm
+                // closes with extra `case_2`/`case_1` solves instead of
+                // HS's `by contradiction /* from formulas */`.
+                let candidates: Vec<std::collections::BTreeMap<
+                    tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm>> =
+                if struct_ok {
+                    vec![struct_subst]
+                } else {
+                    let eqs = vec![tamarin_term::rewriting::Equal {
+                        lhs: pat_lnt,
+                        rhs: subj_lnt,
+                    }];
+                    match maude.match_eqs_skolemize_both(&eqs, &pattern_vars) {
+                        Ok(matches) => matches.into_iter()
+                            .map(|m| m.into_iter().collect())
+                            .collect(),
+                        Err(_) => return,
                     }
-                    let term = crate::elaborate::lnterm_to_term(&lt);
-                    subst_here.insert((lv.name, lv.idx), term);
+                };
+                if candidates.is_empty() { return; }
+                for struct_subst in candidates {
+                    // Translate the LVar → LNTerm bindings back to a
+                    // parser-AST VarSubst, restricted to universal vars.
+                    let mut subst_here = VarSubst::new();
+                    for (lv, lt) in struct_subst {
+                        if !vars.iter().any(|v| v.name == lv.name && v.idx == lv.idx) {
+                            continue;
+                        }
+                        let term = crate::elaborate::lnterm_to_term(&lt);
+                        subst_here.insert((lv.name, lv.idx), term);
+                    }
+                    let Some(combined) = combine_substs(acc, &subst_here) else { continue };
+                    rec(maude, vars, guards, guard_idx + 1, sys_actions,
+                        &combined, body, existing_formulas, existing_solved,
+                        other_guards, sys, sys_maude, out);
                 }
-                let Some(combined) = combine_substs(acc, &subst_here) else { return };
-                rec(maude, vars, guards, guard_idx + 1, sys_actions,
-                    &combined, body, existing_formulas, existing_solved,
-                    other_guards, sys, sys_maude, out);
             }
             _ => return,
         }
