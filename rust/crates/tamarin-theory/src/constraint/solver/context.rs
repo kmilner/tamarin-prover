@@ -257,7 +257,6 @@ impl ProofContext {
                             tamarin_term::term::Term::App(n, args) =>
                                 format!("App({:?},{})", n, args.len()),
                             tamarin_term::term::Term::Lit(_) => "Lit".to_string(),
-                            _ => "other".to_string(),
                         }).unwrap_or_else(|| "no_terms".to_string());
                         format!("Action({:?},{})", f.tag, head)
                     }

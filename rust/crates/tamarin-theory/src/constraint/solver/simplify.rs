@@ -3381,7 +3381,7 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
         use tamarin_term::lterm::{is_fresh_var, is_pub_var, flattened_ac_terms};
         use tamarin_term::term::Term as LTerm;
         use tamarin_term::vterm::Lit as LLit;
-        use tamarin_term::function_symbols::{FunSym, AcSym};
+        use tamarin_term::function_symbols::FunSym;
         if s == t { return Some(false); }
         if elem_not_below_reducible(&reducible, t, s) { return Some(false); }
         if elem_not_below_reducible(&reducible, s, t) { return Some(true); }

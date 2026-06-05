@@ -34,7 +34,7 @@
 //! `args.derivcheck_timeout`; passing `0` disables it entirely (HS:
 //! `Main.TheoryLoader.hs:218`).
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tamarin_parser::ast as p;
 use tamarin_parser::wf::WfError;
 use tamarin_term::maude_proc::MaudeHandle;
@@ -115,7 +115,7 @@ fn protocol_rules(thy: &p::Theory) -> impl Iterator<Item = &p::Rule> {
 fn collect_rule_free_vars(r: &p::Rule) -> Vec<p::VarSpec> {
     let mut out: Vec<p::VarSpec> = Vec::new();
     let mut seen: std::collections::BTreeSet<(String, u64)> = std::collections::BTreeSet::new();
-    let mut push = |v: &p::VarSpec, out: &mut Vec<p::VarSpec>, seen: &mut std::collections::BTreeSet<_>| {
+    let push = |v: &p::VarSpec, out: &mut Vec<p::VarSpec>, seen: &mut std::collections::BTreeSet<_>| {
         if matches!(v.sort, p::SortHint::Pub | p::SortHint::Node) {
             return;
         }

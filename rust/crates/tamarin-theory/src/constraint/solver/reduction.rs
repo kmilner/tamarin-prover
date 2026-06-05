@@ -3122,16 +3122,6 @@ fn freshen_rule_with_constrs(
     (new_rule, new_constrs)
 }
 
-/// Helper: walk every free LVar in an LNTerm (analog of for_each_free
-/// for terms, since LNTerm = VTerm<Name, LVar>).
-fn for_each_free_lvar_lnterm<F: FnMut(&tamarin_term::lterm::LVar)>(
-    t: &tamarin_term::lterm::LNTerm,
-    f: &mut F,
-) {
-    use tamarin_term::lterm::HasFrees;
-    t.for_each_free(f);
-}
-
 fn freshen_rule(rule: RuleACInst, avoid_max: u64, maude: &tamarin_term::maude_proc::MaudeHandle) -> RuleACInst {
     use tamarin_term::lterm::HasFrees;
     let bounds = {
