@@ -87,24 +87,29 @@ Geomean ~3.5× faster per thread. Inductive lemmas favour RS most
 ### Default-vs-default (wall-clock as the user would experience)
 
 HS uses `+RTS -N` by default (all cores + parallel GC + `parList`
-sites in lib/theory). RS defaults to `--processors=min(num_cpus, 4)`,
+sites in lib/theory). RS defaults to `--processors=num_cpus` workers
+backed by `--maude-processes=max(1, num_cpus/2)` Maude subprocesses,
 mirroring HS's parallelism sites via rayon (rule-variant closure,
 saturate refinement, per-item pretty-print — see "Parallelism" below).
+
 Spot check on the parallelism-friendly wireguard benchmark
-(`--prove=exists_session`, hashing + DH, 10 rules, 8 lemmas):
+(`--prove=exists_session`, hashing + DH, 10 rules, 8 lemmas) on a
+16-core machine:
 
 | | wall | user CPU |
 |---|---:|---:|
 | HS default (`+RTS -N`) | 8.8s | 17.1s |
 | HS `+RTS -N1` | 11.3s | 10.4s |
-| RS default (`--processors=4`) | **7.0s** | 8.6s |
 | RS `--processors=1` | 8.9s | 8.4s |
+| RS `--processors=4 --maude-processes=2` | 7.5s | 8.5s |
+| RS `--processors=8 --maude-processes=4` | 6.9s | 8.6s |
+| RS `--processors=16 --maude-processes=8` (default on 16 cores) | **6.8s** | 8.7s |
 
-RS default is ~1.25× faster wall-clock than HS default, with ~half
-the total user-CPU. The gap widens on multi-lemma theories (parallel
-rule-variant closure scales linearly with rule count) and narrows on
-single-lemma theories (HS's gain there is parallel GC, which Rust
-doesn't need).
+RS default is ~1.3× faster wall-clock than HS default with ~half the
+total user-CPU. The scaling curve flattens around `processors=8` on
+wireguard because the protocol's parallel work (per-rule variants:
+10 items; per-source saturate: ~8 items) is only enough to keep ~8
+workers busy. Bigger theories (5G_AKA-class, ~30 rules) scale further.
 
 ### What drives the speedup
 
@@ -119,6 +124,7 @@ Stack of perf commits:
 | 5 | drop System from ProofNodes after expand | wall-clock unchanged; memory: see below |
 | 6 | hoist `ensure_saturated` out of per-variable deriv-check loop | 3.4× on deriv check (mirrors HS's once-per-theory `closeTheoryWithMaude`) |
 | 7 | HS-faithful rayon parallelism at 3 sites (variants / saturate / pretty-print) | 1.25× on multi-rule theories at default `--processors=4` |
+| 8 | `MaudePool` of N/2 subprocesses unblocks rayon scaling past `--processors=4` | another 1.1× at `--processors=16` |
 
 ### Parallelism
 
@@ -133,14 +139,33 @@ rayon at three places (HS site → RS site):
 proof sub-trees in `cutOnSolvedDFS`) is skipped: RS's proof tree is
 already strict, there's nothing to force in parallel.
 
-Default worker count is `min(num_cpus, 4)`, configurable via
-`--processors=N`. The cap is pragmatic: the parallel sites all
-contend on a single Maude IPC mutex (`Arc<Mutex>` around the
-subprocess), so empirically `N>4` gives diminishing returns. HS
-defaults to `+RTS -N` (all cores) and burns proportional user-CPU
-for it; capping at 4 trades a small wall-clock ceiling for a much
-smaller user-CPU footprint. Output is byte-identical across all
-worker counts.
+The 3 parallel sites query Maude on every iteration. To prevent them
+from serializing on a single subprocess's IPC mutex, RS maintains a
+`MaudePool` of M independent Maude subprocesses: workers borrow a
+handle via `acquire()` and return it on drop. Each subprocess has its
+own `fresh_counter`; combined with HS's `evalFreshTAvoiding` pattern
+(per-call counter scope via `MaudeHandle::with_fresh_counter_from`),
+output is byte-identical regardless of which subprocess serves a
+given call.
+
+Tuning knobs:
+
+- `--processors=N` — rayon worker count. Default: `num_cpus`.
+- `--maude-processes=M` — pool size. Default: `max(1, processors / 2)`.
+
+Memory cost: each pooled subprocess holds ~30-100 MB resident on real
+protocols, so the default `processors/2` ratio trades some concurrency
+for a smaller footprint. Memory-tight users on small VMs should
+override (`--maude-processes=2` or `--maude-processes=4`). HS uses a
+single Maude per ClosedTheory — RS goes further because Rust's
+`Arc<Mutex>` serialization isn't free; pooling is a Rust implementation
+optimisation that doesn't change semantics (Maude is a stateless query
+oracle in HS too).
+
+The remaining sequential time on wireguard at high N is ~3.5s in
+`ProofContext::new`'s intruder-rule variants computation
+(`closeIntrRule` / `variants_intruder`). HS doesn't parallelise this
+either; it's an HS-faithful sequential bottleneck.
 
 ### Memory
 
