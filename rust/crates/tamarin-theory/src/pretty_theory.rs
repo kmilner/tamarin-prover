@@ -244,20 +244,16 @@ fn wrap_with_lead(lead: &str, items: &[String]) -> String {
     out
 }
 
-/// `sep`-style multi-line layout for equations: when there's more than
-/// one item OR a single item overflows the line, lay out as
-/// `<lead>\n    item1,\n    item2,\n    ...,\n    itemN`.  Otherwise
-/// keep a single line.  HS's `sep [hdr, nest 2 (punctuate comma ds)]`
-/// produces this exact shape; with `defaultStyle` lineLength = 76 the
-/// vertical split fires for any multi-equation list.
+/// `sep`-style layout matching HS's `sep [hdr, nest 2 (punctuate comma ds)]`:
+/// try a single line `<lead> a, b, c`; if it overflows the 76-col
+/// default-style width, fall back to a vertical layout
+/// `<lead>\n    a,\n    b,\n    ...,\n    z`.
 fn sep_block_with_lead(lead: &str, items: &[String]) -> String {
     if items.is_empty() { return String::new(); }
     const WIDTH: usize = 76;
     let joined = items.join(", ");
     let single = format!("{} {}", lead, joined);
-    // HS triggers vertical layout when items.len() > 1 (each item gets
-    // its own line under the lead).  Single-line otherwise.
-    if items.len() == 1 && single.chars().count() <= WIDTH {
+    if single.chars().count() <= WIDTH {
         return single;
     }
     let mut out = String::new();
@@ -292,6 +288,7 @@ fn render_parsed_item(
             None
         }
         Rule(r) => Some(render_rule(r, elab)),
+        IntrRule(_) => None,
         Lemma(l) => Some(render_parsed_lemma(l, proved)),
         Restriction(r) => Some(render_parsed_restriction(r)),
         Predicates(_) | Macros(_) => {
@@ -308,25 +305,46 @@ fn render_parsed_item(
 // Rule
 // =============================================================================
 
-fn render_rule(parsed_rule: &p::Rule, _elab: &Theory) -> String {
+fn render_rule(parsed_rule: &p::Rule, elab: &Theory) -> String {
     let name = &parsed_rule.name;
-    let prems = &parsed_rule.premises;
-    let acts = &parsed_rule.actions;
-    let concs = &parsed_rule.conclusions;
-
-    let prems_str = render_fact_brackets(prems);
-    let concs_str = render_fact_brackets(concs);
-
     let mut out = String::new();
     out.push_str("rule (modulo E) ");
     out.push_str(name);
     out.push_str(":\n");
+    out.push_str(&render_rule_body(
+        &parsed_rule.premises,
+        &parsed_rule.actions,
+        &parsed_rule.conclusions,
+    ));
 
-    // Try single-line layout first.  HS's `prettyRuleRestrGen` uses
-    // `sep` which fits onto one line when possible; otherwise wraps
-    // each clause to its own line.  Width threshold: HS default 76,
-    // minus the leading 3-space indent the rule body uses.
+    // Look up the elaborated rule by name to decide between
+    // "trivial AC variant" and the full `/* rule (modulo AC) ... */`
+    // block.  HS-faithful: matches `prettyClosedProtoRule`
+    // (ClosedTheory.hs:332-363).
+    let elab_rule = elab.rules().find(|r| r.name() == name);
+    let nontrivial = elab_rule
+        .map(|r| !r.variant_substs.is_empty() && r.abstracted_rule.is_some()
+            && r.variant_substs.iter().any(|s| !s.is_empty()))
+        .unwrap_or(false);
+
+    if !nontrivial {
+        out.push_str("\n\n  /* has exactly the trivial AC variant */");
+    } else if let Some(r) = elab_rule {
+        out.push_str("\n\n");
+        out.push_str(&render_ac_variants_block(name, r));
+    }
+    out
+}
+
+/// Render `[ prems ] --[ acts ]-> [ concs ]` body shared between the
+/// modulo-E and modulo-AC renderers.  Tries single-line layout first;
+/// when it overflows the 76-col threshold, wraps each clause to its own
+/// line as HS's `prettyRuleRestrGen` does via `sep`.
+fn render_rule_body(prems: &[p::Fact], acts: &[p::Fact], concs: &[p::Fact]) -> String {
+    let prems_str = render_fact_brackets(prems);
+    let concs_str = render_fact_brackets(concs);
     const WIDTH: usize = 76;
+    let mut out = String::new();
     let single = if acts.is_empty() {
         format!("   {} --> {}", prems_str, concs_str)
     } else {
@@ -338,15 +356,6 @@ fn render_rule(parsed_rule: &p::Rule, _elab: &Theory) -> String {
     if single.chars().count() <= WIDTH {
         out.push_str(&single);
     } else {
-        // Multi-line layout:
-        //   <3sp>[ prems ]
-        //  <2sp>-->                 (no actions)
-        //  <2sp>--[ act1, act2 ]->  (with actions, fits one line)
-        //  <2sp>--[                 (with actions, overflows)
-        //  <2sp>act1,
-        //  <2sp>act2
-        //  <2sp>]->
-        //   <3sp>[ concs ]
         out.push_str("   ");
         out.push_str(&prems_str);
         out.push('\n');
@@ -372,11 +381,176 @@ fn render_rule(parsed_rule: &p::Rule, _elab: &Theory) -> String {
         out.push_str("   ");
         out.push_str(&concs_str);
     }
-    // For the rule case where there's exactly the trivial AC variant
-    // (no DH/XOR/etc.), HS emits a `/* has exactly the trivial AC
-    // variant */` comment indented 2 spaces, separated by a blank line.
-    out.push_str("\n\n  /* has exactly the trivial AC variant */");
     out
+}
+
+/// Render the HS `/* rule (modulo AC) <name>: ... variants (modulo AC)
+/// 1. ... */` comment block.  Mirrors `prettyClosedProtoRule`'s
+/// `multiComment $ prettyProtoRuleAC ruAC` branch (ClosedTheory.hs:354).
+fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule) -> String {
+    let mut s = String::new();
+    s.push_str("  /*\n");
+    s.push_str(&format!("  rule (modulo AC) {}:\n", name));
+    // Body of the abstracted rule.  Use the abstracted version when
+    // available; fall back to the original facts.
+    let prems = lnfacts_to_parser(&rule.abstracted_rule.as_ref()
+        .map(|r| r.premises.clone()).unwrap_or_default());
+    let acts = lnfacts_to_parser(&rule.abstracted_rule.as_ref()
+        .map(|r| r.actions.clone()).unwrap_or_default());
+    let concs = lnfacts_to_parser(&rule.abstracted_rule.as_ref()
+        .map(|r| r.conclusions.clone()).unwrap_or_default());
+    // Each line of the rule body needs an extra leading 2-space indent
+    // (we're inside the comment block, which already has 2 spaces).
+    let body = render_rule_body(&prems, &acts, &concs);
+    for line in body.split('\n') {
+        s.push_str("  ");
+        s.push_str(line);
+        s.push('\n');
+    }
+    s.push_str("    variants (modulo AC)\n");
+    for (i, subst) in rule.variant_substs.iter().enumerate() {
+        if i > 0 { s.push_str("    \n"); }
+        s.push_str(&render_variant_subst(i + 1, subst));
+    }
+    s.push_str("  */");
+    s
+}
+
+/// Render one entry of `prettyDisjLNSubstsVFresh`
+/// (SubstVFresh.hs:223-229): the variant's number, then each domain var
+/// followed by `= <range>`.  HS aligns the `=` at column 6 from the
+/// entry's local origin when the var name is short, otherwise wraps to
+/// a new line.
+fn render_variant_subst(n: usize, subst: &tamarin_term::subst_vfresh::LNSubstVFresh) -> String {
+    let mut s = String::new();
+    let bindings = subst.to_list();
+    for (i, (v, t)) in bindings.iter().enumerate() {
+        let var_str = render_lvar(v);
+        let term_str = render_lnterm(t);
+        let prefix = if i == 0 { format!("    {}. ", n) } else { "       ".to_string() };
+        // HS uses `prettyNTerm v $$ nest 6 (text "=" <-> prettyNTerm b)`:
+        // if the var name fits in 5 chars, put `= term` at col 6 (within
+        // the entry).  Otherwise wrap.
+        if var_str.chars().count() <= 5 {
+            // `var<padded to 5><sp>= term`
+            let padded = format!("{:<5}", var_str);
+            s.push_str(&prefix);
+            s.push_str(&padded);
+            s.push_str(" = ");
+            s.push_str(&term_str);
+            s.push('\n');
+        } else {
+            s.push_str(&prefix);
+            s.push_str(&var_str);
+            s.push('\n');
+            // Continuation line at col 7 with `      = term`.
+            let cont = if i == 0 { "             = " } else { "             = " };
+            s.push_str(cont);
+            s.push_str(&term_str);
+            s.push('\n');
+        }
+    }
+    s
+}
+
+fn render_lvar(v: &tamarin_term::lterm::LVar) -> String {
+    use tamarin_term::lterm::LSort;
+    let pre = match v.sort {
+        LSort::Pub => "$",
+        LSort::Fresh => "~",
+        LSort::Node => "#",
+        LSort::Nat => "%",
+        LSort::Msg => "",
+    };
+    if v.idx == 0 { format!("{}{}", pre, v.name) }
+    else { format!("{}{}.{}", pre, v.name, v.idx) }
+}
+
+/// Convert LNFacts (post-elaboration) to parser-AST Facts so we can
+/// reuse `render_fact`.  Drops fact annotations.
+fn lnfacts_to_parser(facts: &[crate::fact::LNFact]) -> Vec<p::Fact> {
+    facts.iter().map(lnfact_to_parser).collect()
+}
+
+fn lnfact_to_parser(fa: &crate::fact::LNFact) -> p::Fact {
+    use crate::fact::FactTag;
+    let (name, persistent) = match &fa.tag {
+        FactTag::Proto(crate::fact::Multiplicity::Persistent, n, _) => (n.clone(), true),
+        FactTag::Proto(_, n, _) => (n.clone(), false),
+        FactTag::Fresh => ("Fr".to_string(), false),
+        FactTag::In => ("In".to_string(), false),
+        FactTag::Out => ("Out".to_string(), false),
+        FactTag::Ku => ("KU".to_string(), false),
+        FactTag::Kd => ("KD".to_string(), false),
+        FactTag::Ded => ("Ded".to_string(), false),
+        FactTag::Term => ("Term".to_string(), false),
+    };
+    p::Fact {
+        persistent,
+        name,
+        args: fa.terms.iter().map(lnterm_to_parser).collect(),
+        annotations: Vec::new(),
+    }
+}
+
+fn lnterm_to_parser(t: &tamarin_term::lterm::LNTerm) -> p::Term {
+    use tamarin_term::function_symbols::{AcSym, FunSym};
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    use tamarin_term::lterm::LSort;
+    match t {
+        Term::Lit(Lit::Var(v)) => {
+            let sort = match v.sort {
+                LSort::Pub => p::SortHint::Pub,
+                LSort::Fresh => p::SortHint::Fresh,
+                LSort::Node => p::SortHint::Node,
+                LSort::Nat => p::SortHint::Nat,
+                LSort::Msg => p::SortHint::Msg,
+            };
+            p::Term::Var(p::VarSpec {
+                name: v.name.clone(),
+                idx: v.idx,
+                sort,
+                typ: None,
+            })
+        }
+        Term::Lit(Lit::Con(n)) => {
+            use tamarin_term::lterm::NameTag;
+            match n.tag {
+                NameTag::Pub => p::Term::PubLit(n.id.0.clone()),
+                NameTag::Fresh => p::Term::FreshLit(n.id.0.clone()),
+                NameTag::Nat => p::Term::NatLit(n.id.0.clone()),
+                NameTag::Node => p::Term::PubLit(n.id.0.clone()),
+            }
+        }
+        Term::App(FunSym::NoEq(sym), args) => {
+            let name = String::from_utf8_lossy(&sym.name).to_string();
+            if name == "pair" && args.len() == 2 {
+                return p::Term::Pair(args.iter().map(lnterm_to_parser).collect());
+            }
+            p::Term::App(name, args.iter().map(lnterm_to_parser).collect())
+        }
+        Term::App(FunSym::C(_), args) => {
+            p::Term::App("em".to_string(), args.iter().map(lnterm_to_parser).collect())
+        }
+        Term::App(FunSym::Ac(ac), args) => {
+            // Render AC as left-assoc binops to preserve display.
+            let op = match ac {
+                AcSym::Mult => p::BinOp::Mult,
+                AcSym::Union => p::BinOp::Union,
+                AcSym::NatPlus => p::BinOp::NatPlus,
+                AcSym::Xor => p::BinOp::Xor,
+            };
+            let mut it = args.iter();
+            let first = lnterm_to_parser(it.next().expect("AC needs at least one arg"));
+            it.fold(first, |acc, next| {
+                p::Term::BinOp(op, Box::new(acc), Box::new(lnterm_to_parser(next)))
+            })
+        }
+        Term::App(FunSym::List, args) => {
+            p::Term::App("LIST".to_string(), args.iter().map(lnterm_to_parser).collect())
+        }
+    }
 }
 
 /// Render `[ f1, f2, ... ]` with HS's fact spacing.  Inside the
