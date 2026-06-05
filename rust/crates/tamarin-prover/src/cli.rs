@@ -174,12 +174,24 @@ pub struct Args {
     /// `--processors=N` — size of the rayon worker pool used for
     /// HS-faithful internal parallelism (rule-variant closure,
     /// per-source saturate change-detection, per-item pretty-print).
-    /// `None` = use default (`available_parallelism().min(4)`).
+    /// `None` = use default (`available_parallelism()` — full machine).
     /// `Some(1)` = single-threaded, byte-identical to sequential output.
     /// Mirrors HS's `+RTS -N RTS_FLAG` in spirit — see
     /// `lib/theory/src/Prover.hs:102,195`, `Theory/Constraint/Solver/Sources.hs:471`,
     /// `lib/theory/src/TheoryObject.hs:744,752`.
     pub processors: Option<usize>,
+
+    /// `--maude-processes=M` — size of the pool of Maude subprocesses
+    /// the rayon workers borrow from at parallel sites.  Each
+    /// subprocess costs ~30-100 MB resident; too many → OOM on small
+    /// VMs.  Default is `max(1, processors / 2)`, balancing throughput
+    /// against memory.  `M=1` forces all workers to share one Maude
+    /// (pre-pool behaviour, byte-identical to sequential).  When
+    /// `--processors=1` we force `M=1` automatically (no point in a
+    /// pool with no parallelism).  HS uses a single Maude per
+    /// ClosedTheory — this pool is a Rust-specific implementation
+    /// improvement to remove the IPC mutex contention bottleneck.
+    pub maude_processes: Option<usize>,
 
     // Output options.
     pub output_file: Option<String>,
@@ -236,6 +248,7 @@ impl Default for Args {
             parse_only: false,
             precompute_only: false,
             processors: None,
+            maude_processes: None,
             output_file: None,
             output_dir: None,
             output_module: None,
@@ -401,6 +414,16 @@ pub fn parse_args(raw: &[String]) -> Result<Args, CliError> {
                     }
                     args.processors = Some(n);
                 }
+                "maude-processes" => {
+                    let v = take_val(&mut i, raw, val_inline, "maude-processes")?;
+                    let n: usize = parse_int(&v, "maude-processes")?;
+                    if n == 0 {
+                        return Err(CliError::Msg(
+                            "--maude-processes must be >= 1".to_string(),
+                        ));
+                    }
+                    args.maude_processes = Some(n);
+                }
                 // Output flags.
                 "output" => {
                     let v = take_val(&mut i, raw, val_inline, "output")?;
@@ -541,6 +564,43 @@ pub fn parse_args(raw: &[String]) -> Result<Args, CliError> {
     }
 
     Ok(args)
+}
+
+impl Args {
+    /// Resolve `--processors` (or its default).  Default = full
+    /// machine parallelism (`available_parallelism()`).  Previously
+    /// capped at 4 to avoid Maude IPC mutex contention from making
+    /// larger values unproductive; with `MaudePool` the contention
+    /// is gone and we let users use every core.
+    pub fn effective_processors(&self) -> usize {
+        match self.processors {
+            Some(n) => n.max(1),
+            None => std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1),
+        }
+    }
+
+    /// Resolve `--maude-processes` (or its default).
+    ///
+    /// Default = `max(1, effective_processors() / 2)` — balances Maude
+    /// memory cost (~30-100 MB per subprocess on real protocols)
+    /// against throughput; empirically a ratio of 1:2 (workers:maudes)
+    /// gives most of the benefit of 1:1 without doubling memory.
+    /// Tight-RAM users can override with `--maude-processes=2` etc.
+    ///
+    /// When `--processors=1`, force pool size 1 (no parallelism to
+    /// exploit; saves spawn cost).
+    pub fn effective_maude_processes(&self) -> usize {
+        let procs = self.effective_processors();
+        if procs == 1 {
+            return 1;
+        }
+        match self.maude_processes {
+            Some(n) => n.max(1),
+            None => (procs / 2).max(1),
+        }
+    }
 }
 
 fn split_eq(s: &str) -> (&str, Option<&str>) {
@@ -766,8 +826,12 @@ pub fn help_text() -> String {
     s.push_str("     --parse-only                       Just parse + pretty-print.\n");
     s.push_str("     --precompute-only                  Just run precomputation.\n");
     s.push_str("     --processors=N                     Rayon worker count for internal parallelism.\n");
-    s.push_str("                                        Default: min(available_parallelism(), 4).\n");
+    s.push_str("                                        Default: available_parallelism() (full machine).\n");
     s.push_str("                                        N=1 → byte-identical to sequential output.\n");
+    s.push_str("     --maude-processes=M                Maude subprocesses in the per-task pool.\n");
+    s.push_str("                                        Default: max(1, processors / 2).  Each costs\n");
+    s.push_str("                                        ~30-100 MB RAM; lower if memory is tight.\n");
+    s.push_str("                                        M=1 → single Maude (pre-pool behaviour).\n");
     s.push_str("\n");
     s.push_str("Output:\n");
     s.push_str("  -o --output=FILE                      Write analyzed theory to FILE.\n");
@@ -1060,5 +1124,38 @@ mod tests {
         assert!(lemma_matches(&f, "foo"));
         assert!(lemma_matches(&f, "barbaric"));
         assert!(!lemma_matches(&f, "baz"));
+    }
+
+    #[test]
+    fn maude_processes_parsed() {
+        let a = parse(&["--maude-processes=3", "x.spthy"]);
+        assert_eq!(a.maude_processes, Some(3));
+    }
+
+    #[test]
+    fn maude_processes_zero_rejected() {
+        let r = parse_args(&["--maude-processes=0".to_string()]);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn effective_maude_processes_single_processor_forces_one() {
+        let a = parse(&["--processors=1", "--maude-processes=8", "x.spthy"]);
+        // When processors=1, pool size collapses to 1 regardless of
+        // --maude-processes (no parallelism to exploit).
+        assert_eq!(a.effective_maude_processes(), 1);
+    }
+
+    #[test]
+    fn effective_maude_processes_default_is_half_processors() {
+        let a = parse(&["--processors=8", "x.spthy"]);
+        // 8/2 = 4 default
+        assert_eq!(a.effective_maude_processes(), 4);
+    }
+
+    #[test]
+    fn effective_maude_processes_explicit_override() {
+        let a = parse(&["--processors=8", "--maude-processes=2", "x.spthy"]);
+        assert_eq!(a.effective_maude_processes(), 2);
     }
 }

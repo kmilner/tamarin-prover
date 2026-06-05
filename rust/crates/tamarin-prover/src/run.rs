@@ -19,10 +19,12 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use tamarin_term::maude_proc::MaudeHandle;
+use tamarin_term::maude_proc::{MaudeHandle, MaudePool};
 use tamarin_theory::constraint::solver::search::NodeStatus;
 use tamarin_theory::elaborate::elaborate;
-use tamarin_theory::prove::prove_lemma;
+// `prove_lemma_with_pool` is called via its fully-qualified path
+// inside the prove loop (it lets us pass the optional Maude pool);
+// no top-level alias needed.
 
 use crate::cli::{lemma_matches, Args, Subcommand};
 
@@ -537,6 +539,41 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         };
         phase!("spawn maude");
 
+        // Spawn an auxiliary MaudePool of `effective_maude_processes()`
+        // EXTRA subprocesses for use at the rayon parallel sites
+        // (rule-variant closure, saturate refinement).  Workers
+        // `acquire()` one for the duration of one parallel task so they
+        // don't serialise on `file_maude`'s IPC mutex.
+        //
+        // - `--processors=1` ⇒ `effective_maude_processes=1`; we skip
+        //   the auxiliary pool entirely (sequential path uses
+        //   `file_maude` only — byte-identical to pre-pool behaviour).
+        // - `M >= 2` ⇒ spawn M independent Maudes.  Each costs
+        //   ~30-100 MB; `--maude-processes=N` lets the user override.
+        //
+        // The pool is kept SEPARATE from `file_maude`: sequential paths
+        // (main `prove_lemma` loop, derivation checks) keep using
+        // `file_maude` (counter state and caches stay coherent across
+        // lemmas); the pool is consumed only inside `par_iter` map
+        // closures.
+        let pool_size = args.effective_maude_processes();
+        let file_maude_pool: Option<std::sync::Arc<MaudePool>> =
+            if !args.parse_only && pool_size >= 2 {
+                match MaudePool::new(&maude_path, maude_sig.clone(), pool_size) {
+                    Ok(p) => Some(std::sync::Arc::new(p)),
+                    Err(e) => {
+                        if !args.quiet {
+                            eprintln!("[warn] failed to spawn MaudePool({}): {} \
+                                — falling back to single shared Maude", pool_size, e);
+                        }
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+        phase!("spawn maude pool");
+
         // Populate variant_substs + abstracted_rule for each protocol
         // rule whose RHS contains reducible-headed sub-terms.  Without
         // this the pretty-printer always emits `/* has exactly the
@@ -545,7 +582,8 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         // `closeTheoryWithMaude`'s variant pre-computation
         // (ClosedTheory.hs `closeTheory`).
         if let Some(m) = file_maude.as_ref() {
-            populate_rule_variants(&mut elaborated, m);
+            populate_rule_variants(&mut elaborated, m,
+                file_maude_pool.as_deref());
         }
         phase!("populate_rule_variants");
 
@@ -645,7 +683,9 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 // marker; the only progress lines are the `[Theory X]
                 // ...` set above.  Stay quiet here for HS-faithful stderr.
                 let lt = Instant::now();
-                let outcome = prove_lemma(&parsed, &lemma_name, maude.clone(), budget);
+                let outcome = tamarin_theory::prove::prove_lemma_with_pool(
+                    &parsed, &lemma_name, maude.clone(),
+                    file_maude_pool.clone(), budget);
                 if dbg_timing {
                     eprintln!("[TAM_DBG_RUN_TIMING] {:>26}: {:>8.1} ms  (lemma={})",
                               "prove_lemma", lt.elapsed().as_secs_f64() * 1000.0,
@@ -831,8 +871,18 @@ fn format_wf_block(report: &[tamarin_parser::wf::WfError]) -> String {
 /// so concurrent calls don't share counter state.  Maude IPC is
 /// serialised inside `MaudeHandle::inner` (Arc<Mutex>) — workers
 /// queue on Maude but don't corrupt it.
+///
+/// When `pool` is `Some`, each parallel task acquires its own Maude
+/// subprocess for the duration of one rule, so the M parallel
+/// `abstract_rule_and_variants` calls run on independent subprocesses
+/// instead of contending on the single shared `maude`'s IPC mutex.
+/// Per-call `with_fresh_counter_from(avoid_max)` already guarantees
+/// HS-faithful witness allocation regardless of which pool member
+/// handles a given rule, so output is byte-identical to the
+/// single-Maude path.
 fn populate_rule_variants(elaborated: &mut tamarin_theory::theory::Theory,
-                          maude: &MaudeHandle) {
+                          maude: &MaudeHandle,
+                          pool: Option<&MaudePool>) {
     use rayon::prelude::*;
     use tamarin_theory::theory::TheoryItem;
 
@@ -848,7 +898,19 @@ fn populate_rule_variants(elaborated: &mut tamarin_theory::theory::Theory,
     let outs: Vec<Option<(tamarin_theory::rule::ProtoRuleE, Vec<tamarin_term::subst_vfresh::LNSubstVFresh>)>> =
         elaborated.items.par_iter().map(|item| {
             let TheoryItem::Rule(opr) = item else { return None; };
-            match tamarin_theory::tools::rule_variants::abstract_rule_and_variants(maude, &opr.rule) {
+            // Per-task Maude: acquire from the pool when available so
+            // each rule's variant computation runs on its own
+            // subprocess (no IPC mutex contention).  Fall back to
+            // the shared `maude` when no pool is configured.
+            let result = if let Some(pool) = pool {
+                let pooled = pool.acquire();
+                tamarin_theory::tools::rule_variants::abstract_rule_and_variants(
+                    &*pooled, &opr.rule)
+            } else {
+                tamarin_theory::tools::rule_variants::abstract_rule_and_variants(
+                    maude, &opr.rule)
+            };
+            match result {
                 Ok(Some(pair)) => Some(pair),
                 _ => None,
             }
@@ -874,18 +936,14 @@ fn populate_rule_variants(elaborated: &mut tamarin_theory::theory::Theory,
 /// CLI flag.  Idempotent across files in a batch — `build_global`
 /// silently errors on the second call, which is what we want.
 ///
-/// Default: `min(available_parallelism(), 4)`.  The cap of 4 matches
-/// MEMORY.md's "JOBS<=6" discipline note — RS's Maude IPC mutex means
-/// larger pools yield diminishing returns and have caused OOM in
-/// corpus sweeps.
+/// Default: `available_parallelism()` (full machine).  Previously
+/// capped at 4 to avoid the Maude IPC mutex serialising every worker
+/// on a single subprocess; with `MaudePool` (`--maude-processes=M`)
+/// the contention is gone and users can productively scale to every
+/// core.  Memory budget is mediated by `--maude-processes`, which
+/// defaults to `processors / 2`.
 fn init_rayon_pool(args: &Args) {
-    let n = match args.processors {
-        Some(n) => n,
-        None => std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1)
-            .min(4),
-    };
+    let n = args.effective_processors();
     // `build_global` is idempotent-error: the SECOND call returns Err
     // even if N matches.  We swallow the error: the first invocation
     // wins (which is the desired behaviour — RS runs `run_batch` once

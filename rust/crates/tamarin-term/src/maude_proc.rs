@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::lterm::LNTerm;
 use crate::maude_parse;
@@ -1423,6 +1423,143 @@ fn msubst_to_lnsubst_with_maude(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// MaudePool — a pool of independent Maude subprocesses.
+//
+// The single shared `MaudeHandle` serialises every query on an internal
+// `Mutex<MaudeProcessInner>`.  Under rayon parallelism (rule-variant
+// closure, saturate refinement) every worker contends on that mutex,
+// capping speedup at the point where one Maude subprocess is fully busy
+// (~4 workers in practice).  A pool of M independent Maudes lets each
+// worker hold its own subprocess for the duration of its task, so
+// workers run truly in parallel.
+//
+// HS uses a single Maude per ClosedTheory (Term/Maude/Process.hs); this
+// pool is a Rust-specific implementation improvement — it doesn't
+// change semantics, only removes a serialisation point.  Per-call
+// fresh-counter scope (`with_fresh_counter_from`) already guarantees
+// HS-faithful witness allocation regardless of which pool member
+// handles a given task.
+// ---------------------------------------------------------------------------
+
+/// Pool of M independent Maude subprocesses, all initialised with the
+/// same `MaudeSig`.  Workers borrow a handle via `acquire()`; the
+/// returned `PooledMaude` releases back to the pool on drop.
+///
+/// Internally a `Mutex<Vec<MaudeHandle>>` LIFO works fine — the pool
+/// is small (≤ num_cpus) and `acquire` is rare on the hot path (it
+/// happens once per parallel task, not per Maude call).
+pub struct MaudePool {
+    free: Mutex<Vec<MaudeHandle>>,
+    notify: Condvar,
+    size: usize,
+}
+
+impl std::fmt::Debug for MaudePool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MaudePool(size={})", self.size)
+    }
+}
+
+impl MaudePool {
+    /// Spawn `n` Maude subprocesses with `sig`.  Returns Err if any
+    /// fail to start; partial pool is dropped on the error path (each
+    /// `MaudeHandle`'s `Drop` reaps its subprocess).
+    pub fn new(path: &str, sig: MaudeSig, n: usize) -> Result<Self, MaudeError> {
+        assert!(n >= 1, "MaudePool::new requires n >= 1");
+        let mut handles = Vec::with_capacity(n);
+        for _ in 0..n {
+            let h = MaudeHandle::start(path, sig.clone())?;
+            handles.push(h);
+        }
+        Ok(MaudePool {
+            free: Mutex::new(handles),
+            notify: Condvar::new(),
+            size: n,
+        })
+    }
+
+    /// Build a pool from an EXISTING handle plus `n - 1` newly-spawned
+    /// siblings.  The existing handle is used as-is (counter state and
+    /// caches preserved); the new siblings are spawned fresh with the
+    /// same signature.  Useful when the caller already has a "primary"
+    /// Maude they want to reuse for sequential paths AND add to the
+    /// pool for parallel paths.
+    pub fn from_handle_with_siblings(
+        primary: MaudeHandle,
+        path: &str,
+        n: usize,
+    ) -> Result<Self, MaudeError> {
+        assert!(n >= 1, "MaudePool::from_handle_with_siblings requires n >= 1");
+        let sig = primary.maude_sig();
+        let mut handles = Vec::with_capacity(n);
+        handles.push(primary);
+        for _ in 1..n {
+            handles.push(MaudeHandle::start(path, sig.clone())?);
+        }
+        Ok(MaudePool {
+            free: Mutex::new(handles),
+            notify: Condvar::new(),
+            size: n,
+        })
+    }
+
+    /// Block until a handle is free, then return it.  The handle is
+    /// returned to the pool when the returned `PooledMaude` is dropped.
+    pub fn acquire(&self) -> PooledMaude<'_> {
+        let mut free = self.free.lock().unwrap();
+        loop {
+            if let Some(h) = free.pop() {
+                return PooledMaude { pool: self, inner: Some(h) };
+            }
+            free = self.notify.wait(free).unwrap();
+        }
+    }
+
+    /// Number of subprocesses this pool was constructed with.
+    pub fn size(&self) -> usize { self.size }
+
+    /// Kill every pooled subprocess (watchdog).  Idempotent.
+    pub fn kill_all(&self) {
+        let free = self.free.lock().unwrap();
+        for h in free.iter() { h.kill_subprocess(); }
+    }
+}
+
+/// A borrowed Maude handle from a `MaudePool`.  `Deref`s to
+/// `MaudeHandle`; releases back to the pool on `Drop`.
+pub struct PooledMaude<'a> {
+    pool: &'a MaudePool,
+    inner: Option<MaudeHandle>,
+}
+
+impl<'a> PooledMaude<'a> {
+    /// Consume the guard and return an owned `MaudeHandle` whose Drop
+    /// will return the handle to the pool.  Useful when callers need
+    /// ownership semantics (e.g. cloning into a per-task `ProofContext`).
+    pub fn handle(&self) -> &MaudeHandle {
+        self.inner.as_ref().expect("PooledMaude inner not yet taken")
+    }
+}
+
+impl<'a> std::ops::Deref for PooledMaude<'a> {
+    type Target = MaudeHandle;
+    fn deref(&self) -> &MaudeHandle {
+        self.inner.as_ref().expect("PooledMaude inner not yet taken")
+    }
+}
+
+impl<'a> Drop for PooledMaude<'a> {
+    fn drop(&mut self) {
+        if let Some(h) = self.inner.take() {
+            let mut free = self.pool.free.lock().unwrap();
+            free.push(h);
+            // Only one waiter can take the handle we just pushed.
+            self.pool.notify.notify_one();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1550,5 +1687,67 @@ mod tests {
         let x = LVar::new("x", LSort::Msg, 0);
         let t: LNTerm = crate::term::Term::Lit(Lit::Var(x));
         assert_eq!(h.reduce(&t).expect("reduce"), t);
+    }
+
+    #[test]
+    fn pool_acquire_release_size() {
+        let path = match maude_path() { Some(p) => p, None => { eprintln!("skipping: no maude"); return; } };
+        let pool = MaudePool::new(&path, pair_maude_sig(), 3).expect("pool");
+        assert_eq!(pool.size(), 3);
+        // Acquire all three, then release them; second round should
+        // still succeed (handles must have been returned).
+        {
+            let _a = pool.acquire();
+            let _b = pool.acquire();
+            let _c = pool.acquire();
+        }
+        let a = pool.acquire();
+        let b = pool.acquire();
+        let c = pool.acquire();
+        drop(a); drop(b); drop(c);
+    }
+
+    #[test]
+    fn pool_parallel_reduce_returns_correct_results() {
+        use std::sync::Arc;
+        let path = match maude_path() { Some(p) => p, None => { eprintln!("skipping: no maude"); return; } };
+        let pool = Arc::new(MaudePool::new(&path, pair_maude_sig(), 2).expect("pool"));
+        let mut handles = Vec::new();
+        for i in 0u64..6 {
+            let pool = pool.clone();
+            handles.push(std::thread::spawn(move || {
+                let h = pool.acquire();
+                let x = LVar::new("x", LSort::Msg, i);
+                let t: LNTerm = crate::term::Term::Lit(Lit::Var(x));
+                h.reduce(&t).expect("reduce")
+            }));
+        }
+        for (i, h) in handles.into_iter().enumerate() {
+            let r = h.join().expect("thread");
+            // round-trip: x:Msg.i reduces to itself
+            let x = LVar::new("x", LSort::Msg, i as u64);
+            let expected: LNTerm = crate::term::Term::Lit(Lit::Var(x));
+            assert_eq!(r, expected);
+        }
+    }
+
+    #[test]
+    fn pool_blocks_when_exhausted() {
+        let path = match maude_path() { Some(p) => p, None => { eprintln!("skipping: no maude"); return; } };
+        let pool = std::sync::Arc::new(MaudePool::new(&path, pair_maude_sig(), 1).expect("pool"));
+        let g = pool.acquire();
+        // Spawn a thread that should block on acquire() until we drop g.
+        let pool_c = pool.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            let _h = pool_c.acquire();
+            tx.send(()).unwrap();
+        });
+        // Initially the worker should be blocked (no message yet).
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(100)).is_err());
+        drop(g);
+        // After releasing, the worker should wake up promptly.
+        rx.recv_timeout(std::time::Duration::from_secs(5)).expect("worker should unblock");
+        t.join().unwrap();
     }
 }

@@ -3539,12 +3539,31 @@ fn saturate_sources_with_simp_opt(
         // queue but don't race.
         let saturated_indexed: Vec<(usize, Source)> =
             saturated.into_iter().enumerate().collect();
+        // Per-worker MaudePool acquire: if a pool is set on the ctx, each
+        // par_iter task borrows its own Maude subprocess for the
+        // duration of `refine_one_source`, so workers don't serialise
+        // on the single shared `ctx.maude`'s IPC mutex.  Without a
+        // pool, every worker shares `ctx.maude` (the pre-pool
+        // behaviour; correct but contended).
+        //
+        // We build a per-task context with the pooled handle swapped
+        // in via `ctx.with_swapped_maude(...)`.  The PooledMaude guard
+        // releases back to the pool on drop at end of the closure.
         let per_source: Vec<(Vec<(Vec<String>, System)>, bool, usize)> =
             saturated_indexed.into_par_iter().map(|(_i, src)| {
-                refine_one_source(
-                    ctx, src, &ths_snapshot, branch_cap,
-                    aggressive_drop, single_pick, dbg,
-                )
+                if let Some(pool) = &ctx.maude_pool {
+                    let pooled = pool.acquire();
+                    let task_ctx = ctx.with_swapped_maude(pooled.handle().clone());
+                    refine_one_source(
+                        &task_ctx, src, &ths_snapshot, branch_cap,
+                        aggressive_drop, single_pick, dbg,
+                    )
+                } else {
+                    refine_one_source(
+                        ctx, src, &ths_snapshot, branch_cap,
+                        aggressive_drop, single_pick, dbg,
+                    )
+                }
             }).collect();
         for (i, (new_cases, per_changed, _)) in per_source.into_iter().enumerate() {
             let src_goal_and_incomplete = current.get(i)

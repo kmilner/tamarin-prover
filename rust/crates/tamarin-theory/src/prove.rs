@@ -50,6 +50,24 @@ pub fn prove_lemma(
     maude: tamarin_term::maude_proc::MaudeHandle,
     max_steps: usize,
 ) -> Result<ProofNode, ProveError> {
+    prove_lemma_with_pool(parser_theory, lemma_name, maude, None, max_steps)
+}
+
+/// Variant of [`prove_lemma`] that also accepts a `MaudePool` to be
+/// installed on the `ProofContext` for use at rayon parallel sites
+/// (saturate refinement).  Sequential code paths still use the
+/// single `maude` handle; the pool is consulted ONLY inside
+/// `par_iter` closures (see `sources.rs::saturate_sources_with_simp_opt`).
+///
+/// `None` for `pool` is equivalent to calling `prove_lemma` — workers
+/// share `maude`, same as before the pool feature landed.
+pub fn prove_lemma_with_pool(
+    parser_theory: &p::Theory,
+    lemma_name: &str,
+    maude: tamarin_term::maude_proc::MaudeHandle,
+    pool: Option<std::sync::Arc<tamarin_term::maude_proc::MaudePool>>,
+    max_steps: usize,
+) -> Result<ProofNode, ProveError> {
     let trace = std::env::var("TAM_DBG_PHASE").is_ok();
     // Per-phase wall-clock instrumentation, gated by TAM_DBG_PHASE.
     // `Option<Instant>` keeps the disabled-path branch-predictable to
@@ -150,7 +168,13 @@ pub fn prove_lemma(
         if trace { Some(std::time::Instant::now()) } else { None };
     // Bridge the elaborated theory's rules into the proof context.
     let rules: Vec<OpenProtoRule> = theory.rules().cloned().collect();
-    let mut ctx = ProofContext::new_with_restrictions(maude, rules, restrictions.clone());
+    // Install the optional `maude_pool` BEFORE the precompute phase
+    // runs inside the constructor — `precompute_full_sources` calls
+    // `saturate_sources_with_simp` which is parallel and benefits
+    // from the pool.  Setting `maude_pool` after construction would
+    // leave that initial precompute on the single shared `maude`.
+    let mut ctx = ProofContext::new_with_restrictions_and_pool(
+        maude, pool, rules, restrictions.clone());
     if trace { eprintln!("[phase] ProofContext::new done dt={:.3}s",
         t_ctx.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64())); }
     // Propagate the lemma's trace quantifier so `is_finished` can
