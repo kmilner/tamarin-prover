@@ -120,6 +120,15 @@ struct MaudeProcessInner {
     /// every search step — so the same subterm gets reduced repeatedly
     /// during a single proof.  Caching cuts those repeat round-trips.
     reduce_cache: std::collections::HashMap<LNTerm, LNTerm>,
+    /// Memo for `match_eqs_const_subject` EMPTY-result queries.
+    /// Profiling on csf17/keylessssl::injectivity showed 210 k calls
+    /// to this matcher, ALL returning empty.  Many are identical
+    /// (same skolemized pattern + subject re-tried across fixpoint
+    /// passes).  Caching the empty answer is safe — no witness LVars
+    /// to renumber.  Non-empty results are NOT cached (witnesses
+    /// need fresh-renaming per use, same reason `unifiable_cache`
+    /// only stores booleans).
+    match_empty_cache: std::collections::HashMap<(Vec<(LNTerm, LNTerm)>, Vec<(String, u64)>), ()>,
 }
 
 impl MaudeProcessInner {
@@ -285,6 +294,7 @@ impl MaudeHandle {
             path: PathBuf::from(maude_path),
             unifiable_cache: std::collections::HashMap::new(),
             reduce_cache: std::collections::HashMap::new(),
+            match_empty_cache: std::collections::HashMap::new(),
         };
         // Banner / initial prompt.
         let _ = inner.read_until_prompt()?;
@@ -879,6 +889,7 @@ impl MaudeHandle {
         inner.stats.match_count += 1;
         let sig = inner.sig.clone();
         drop(inner);
+        _tally_callsite("match_eqs");
         let msubsts = maude_parse::parse_match_reply(&sig, &reply)?;
         let mut out = Vec::with_capacity(msubsts.len());
         for ms in &msubsts {
@@ -918,6 +929,18 @@ impl MaudeHandle {
         use crate::vterm::Lit;
         if eqs.is_empty() {
             return Ok(vec![Vec::new()]);
+        }
+        // Empty-result cache.  Profiling showed 100 % of calls on
+        // AC-heavy lemmas (e.g. csf17/keylessssl::injectivity) return
+        // empty, with many repeats across fixpoint passes.  Cache the
+        // empty answer to skip the round-trip.
+        let cache_key: (Vec<(LNTerm, LNTerm)>, Vec<(String, u64)>) = (
+            eqs.iter().map(|e| (e.lhs.clone(), e.rhs.clone())).collect(),
+            pattern_vars.iter().cloned().collect(),
+        );
+        if self.inner.lock().unwrap().match_empty_cache.contains_key(&cache_key) {
+            _tally_callsite("match_eqs_const_subject::CACHE_HIT");
+            return Ok(Vec::new());
         }
         // Skolemize subject-side free vars not in `pattern_vars`:
         // walk each rhs LNTerm and replace such LVars with a public
@@ -1023,7 +1046,16 @@ impl MaudeHandle {
         inner.stats.match_count += 1;
         let sig = inner.sig.clone();
         drop(inner);
+        _tally_callsite("match_eqs_const_subject");
         let msubsts = maude_parse::parse_match_reply(&sig, &reply)?;
+        if msubsts.is_empty() {
+            _tally_callsite("match_eqs_const_subject::EMPTY");
+            // Re-acquire lock to insert into cache.  Safe — we already
+            // dropped `inner` above; only one thread holds the handle
+            // mutex anyway (it's wrapped in `Mutex<MaudeProcessInner>`).
+            self.inner.lock().unwrap().match_empty_cache.insert(cache_key, ());
+        }
+        else { _tally_callsite("match_eqs_const_subject::NONEMPTY"); }
         let mut out = Vec::with_capacity(msubsts.len());
         for ms in &msubsts {
             let lnsubst = msubst_to_lnsubst(ms, &mut ctx)?;
@@ -1183,6 +1215,7 @@ impl MaudeHandle {
         inner.stats.match_count += 1;
         let sig = inner.sig.clone();
         drop(inner);
+        _tally_callsite("match_eqs_skolemize_both");
         let msubsts = maude_parse::parse_match_reply(&sig, &reply)?;
         let mut out = Vec::with_capacity(msubsts.len());
         for ms in &msubsts {
