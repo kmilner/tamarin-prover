@@ -705,8 +705,15 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
 
 /// Format the `/* WARNING: ... */` or `/* All wellformedness checks
 /// were successful. */` block that goes BETWEEN the source body and
-/// the analysis summary.  Mirrors HS's `Theory.Tools.Wellformedness`
-/// pretty-printer (`prettyWfErrorReport`).
+/// the analysis summary.  Mirrors HS's `prettyWfErrorReport`
+/// (Wellformedness.hs:118-125).
+///
+/// Each `WfError.message` is expected to carry the FULL HS-style block
+/// for its topic: `Title\n=====\n\n<intro>\n<body>` — pre-formatted with
+/// the exact bytes HS emits, including trailing spaces from HS's
+/// `text ""` markers.  Multiple `WfError`s with the same topic are
+/// merged into one block (the per-clash bodies concatenated).  Topic
+/// groups are separated by blank lines.
 fn format_wf_block(report: &[tamarin_parser::wf::WfError]) -> String {
     if report.is_empty() {
         return "/* All wellformedness checks were successful. */".to_string();
@@ -714,8 +721,7 @@ fn format_wf_block(report: &[tamarin_parser::wf::WfError]) -> String {
     let mut out = String::new();
     out.push_str("/*\nWARNING: the following wellformedness checks failed!\n\n");
     // Group by topic, preserving FIRST-APPEARANCE order — mirrors HS's
-    // `checkWellformedness` concatMap-over-checks which yields reports
-    // in the order checks were run, NOT alphabetical.
+    // `groupOn fst` over a left-to-right concatMap-over-checks.
     let mut topic_order: Vec<&str> = Vec::new();
     let mut grouped: std::collections::HashMap<&str, Vec<&str>> =
         std::collections::HashMap::new();
@@ -725,32 +731,17 @@ fn format_wf_block(report: &[tamarin_parser::wf::WfError]) -> String {
         }
         grouped.entry(e.topic.as_str()).or_default().push(&e.message);
     }
-    for topic in &topic_order {
+    for (i, topic) in topic_order.iter().enumerate() {
         let msgs = &grouped[topic];
-        out.push_str(topic);
-        out.push('\n');
-        for _ in 0..topic.len() { out.push('='); }
-        out.push_str("\n\n");
-        for m in msgs {
-            // HS only adds the 2-space outer indent to the FIRST line
-            // of each message (`prettyWfErrorReport` uses `nest 2 . text`
-            // on the message head, then continuation lines preserve
-            // their embedded indent).
-            let mut first = true;
-            for line in m.lines() {
-                if first { out.push_str("  "); first = false; }
-                out.push_str(line);
-                out.push('\n');
-            }
-            out.push('\n');
+        if i > 0 { out.push('\n'); }
+        for (j, m) in msgs.iter().enumerate() {
+            if j > 0 { out.push('\n'); }
+            out.push_str(m);
+            if !m.ends_with('\n') { out.push('\n'); }
         }
     }
-    // Drop the trailing blank line that follows the last message
-    // block — HS closes the comment on the line immediately after the
-    // last message line, not after a blank.
-    while out.ends_with("\n\n") {
-        out.pop();
-    }
+    // Trim trailing blank lines but keep a single newline before `*/`.
+    while out.ends_with("\n\n") { out.pop(); }
     out.push_str("*/");
     out
 }
