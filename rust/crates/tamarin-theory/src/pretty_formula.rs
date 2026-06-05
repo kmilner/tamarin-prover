@@ -22,7 +22,7 @@ use crate::guarded::{Guarded, Quant};
 /// `prettyLNFormula` (Formula.hs:511).
 pub fn pretty_formula(f: &p::Formula) -> String {
     let mut s = String::new();
-    pp_formula(f, FormCtx::Top, &mut s);
+    pp_formula(f, FormCtx::Top, &[], &mut s);
     s
 }
 
@@ -37,21 +37,21 @@ pub fn pretty_guarded(g: &Guarded) -> String {
 /// Pretty-print an atom standalone (e.g. inside a goal label).
 pub fn pretty_atom(a: &p::Atom) -> String {
     let mut s = String::new();
-    pp_atom(a, &mut s);
+    pp_atom(a, &[], &mut s);
     s
 }
 
 /// Pretty-print a parser-AST term standalone.
 pub fn pretty_term(t: &p::Term) -> String {
     let mut s = String::new();
-    pp_term(t, TermPrec::Top, &mut s);
+    pp_term(t, TermPrec::Top, &[], &mut s);
     s
 }
 
 /// Pretty-print a fact `F(a,b,...)`.
 pub fn pretty_fact(fa: &p::Fact) -> String {
     let mut s = String::new();
-    pp_fact(fa, &mut s);
+    pp_fact(fa, &[], &mut s);
     s
 }
 
@@ -60,69 +60,112 @@ pub fn pretty_fact(fa: &p::Fact) -> String {
 // =============================================================================
 
 #[derive(Copy, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 enum FormCtx {
     Top,
     /// Inside a connective requiring parens for nested connectives.
+    /// Kept for back-compat; current renderer uses HS-faithful
+    /// `opParens` instead.
     Conn,
 }
 
-fn pp_formula(f: &p::Formula, ctx: FormCtx, out: &mut String) {
+/// `scope` is a flat list of bound var names→sort (innermost binder
+/// last).  When a body occurrence has no explicit sort hint, we look
+/// it up here so `Ex #i. A(k) @ i` renders the inner `i` as `#i`.
+fn pp_formula(f: &p::Formula, _ctx: FormCtx, scope: &[(String, p::SortHint)], out: &mut String) {
     use p::Formula::*;
     match f {
         True => out.push('\u{22A4}'),  // ⊤
         False => out.push('\u{22A5}'), // ⊥
-        Atom(a) => pp_atom(a, out),
+        Atom(a) => pp_atom(a, scope, out),
         Not(p_) => {
+            // HS `prettyLFormula` Not case: `¬<opParens p>` — wraps in
+            // parens if the operand is non-atomic.
             out.push('\u{00AC}'); // ¬
-            pp_formula(p_, FormCtx::Conn, out);
+            pp_formula_opparens(p_, scope, out);
         }
-        And(l, r) => {
-            let needs = ctx == FormCtx::Conn;
-            if needs { out.push('('); }
-            pp_formula(l, FormCtx::Conn, out);
-            out.push_str(" \u{2227} "); // ∧
-            pp_formula(r, FormCtx::Conn, out);
-            if needs { out.push(')'); }
-        }
-        Or(l, r) => {
-            let needs = ctx == FormCtx::Conn;
-            if needs { out.push('('); }
-            pp_formula(l, FormCtx::Conn, out);
-            out.push_str(" \u{2228} "); // ∨
-            pp_formula(r, FormCtx::Conn, out);
-            if needs { out.push(')'); }
-        }
-        Implies(l, r) => {
-            let needs = ctx == FormCtx::Conn;
-            if needs { out.push('('); }
-            pp_formula(l, FormCtx::Conn, out);
-            out.push_str(" \u{21D2} "); // ⇒
-            pp_formula(r, FormCtx::Conn, out);
-            if needs { out.push(')'); }
-        }
-        Iff(l, r) => {
-            let needs = ctx == FormCtx::Conn;
-            if needs { out.push('('); }
-            pp_formula(l, FormCtx::Conn, out);
-            out.push_str(" \u{21D4} "); // ⇔
-            pp_formula(r, FormCtx::Conn, out);
-            if needs { out.push(')'); }
-        }
+        And(l, r) => pp_binop(l, r, " \u{2227} ", scope, out),
+        Or(l, r) => pp_binop(l, r, " \u{2228} ", scope, out),
+        Implies(l, r) => pp_binop(l, r, " \u{21D2} ", scope, out),
+        Iff(l, r) => pp_binop(l, r, " \u{21D4} ", scope, out),
         Forall(vs, body) => {
             out.push('\u{2200}'); // ∀
             out.push(' ');
             pp_var_list(vs, out);
             out.push_str(". ");
-            pp_formula(body, FormCtx::Top, out);
+            let new_scope = extend_scope(scope, vs);
+            pp_formula(body, FormCtx::Top, &new_scope, out);
         }
         Exists(vs, body) => {
             out.push('\u{2203}'); // ∃
             out.push(' ');
             pp_var_list(vs, out);
             out.push_str(". ");
-            pp_formula(body, FormCtx::Top, out);
+            let new_scope = extend_scope(scope, vs);
+            pp_formula(body, FormCtx::Top, &new_scope, out);
         }
     }
+}
+
+/// HS `Conn` case: `sep [opParens p <-> op, opParens q]` — both sides
+/// wrapped in `opParens`, then sep.
+fn pp_binop(
+    l: &p::Formula,
+    r: &p::Formula,
+    op: &str,
+    scope: &[(String, p::SortHint)],
+    out: &mut String,
+) {
+    pp_formula_opparens(l, scope, out);
+    out.push_str(op);
+    pp_formula_opparens(r, scope, out);
+}
+
+/// HS `opParens`: wraps the inner doc in parens iff non-atomic.  Our
+/// atomicity check is structural: True/False/Pred-only atoms are
+/// atomic, everything else is non-atomic.
+fn pp_formula_opparens(
+    f: &p::Formula,
+    scope: &[(String, p::SortHint)],
+    out: &mut String,
+) {
+    if is_atomic_formula(f) {
+        pp_formula(f, FormCtx::Top, scope, out);
+    } else {
+        out.push('(');
+        pp_formula(f, FormCtx::Top, scope, out);
+        out.push(')');
+    }
+}
+
+fn is_atomic_formula(f: &p::Formula) -> bool {
+    use p::Formula::*;
+    match f {
+        True | False => true,
+        Atom(p::Atom::Pred(_)) => true,
+        _ => false,
+    }
+}
+
+fn extend_scope(scope: &[(String, p::SortHint)], vs: &[p::VarSpec]) -> Vec<(String, p::SortHint)> {
+    let mut s: Vec<(String, p::SortHint)> = scope.to_vec();
+    for v in vs {
+        s.push((v.name.clone(), v.sort));
+    }
+    s
+}
+
+fn resolved_sort(v: &p::VarSpec, scope: &[(String, p::SortHint)]) -> p::SortHint {
+    if !matches!(v.sort, p::SortHint::Untagged) {
+        return v.sort;
+    }
+    // Walk scope inner-most first.
+    for (name, sort) in scope.iter().rev() {
+        if name == &v.name {
+            return *sort;
+        }
+    }
+    v.sort
 }
 
 fn pp_var_list(vs: &[p::VarSpec], out: &mut String) {
@@ -134,6 +177,17 @@ fn pp_var_list(vs: &[p::VarSpec], out: &mut String) {
 
 fn pp_var(v: &p::VarSpec, out: &mut String) {
     out.push_str(sort_prefix_from_hint(v.sort));
+    out.push_str(&v.name);
+    if v.idx > 0 {
+        out.push('.');
+        out.push_str(&v.idx.to_string());
+    }
+}
+
+/// Variant that resolves an unsorted occurrence against a binding scope.
+fn pp_var_scoped(v: &p::VarSpec, scope: &[(String, p::SortHint)], out: &mut String) {
+    let sort = resolved_sort(v, scope);
+    out.push_str(sort_prefix_from_hint(sort));
     out.push_str(&v.name);
     if v.idx > 0 {
         out.push('.');
@@ -161,40 +215,40 @@ fn sort_prefix_from_hint(s: p::SortHint) -> &'static str {
 // Atom
 // =============================================================================
 
-fn pp_atom(a: &p::Atom, out: &mut String) {
+fn pp_atom(a: &p::Atom, scope: &[(String, p::SortHint)], out: &mut String) {
     use p::Atom::*;
     match a {
         Eq(l, r) => {
-            pp_term(l, TermPrec::Top, out);
+            pp_term(l, TermPrec::Top, scope, out);
             out.push_str(" = ");
-            pp_term(r, TermPrec::Top, out);
+            pp_term(r, TermPrec::Top, scope, out);
         }
         Less(l, r) => {
-            pp_term(l, TermPrec::Top, out);
+            pp_term(l, TermPrec::Top, scope, out);
             out.push_str(" < ");
-            pp_term(r, TermPrec::Top, out);
+            pp_term(r, TermPrec::Top, scope, out);
         }
         LessMset(l, r) => {
-            pp_term(l, TermPrec::Top, out);
+            pp_term(l, TermPrec::Top, scope, out);
             out.push_str(" (<) ");
-            pp_term(r, TermPrec::Top, out);
+            pp_term(r, TermPrec::Top, scope, out);
         }
         Subterm(l, r) => {
-            pp_term(l, TermPrec::Top, out);
+            pp_term(l, TermPrec::Top, scope, out);
             out.push_str(" \u{228F} "); // ⊏
-            pp_term(r, TermPrec::Top, out);
+            pp_term(r, TermPrec::Top, scope, out);
         }
         Action(fa, t) => {
-            pp_fact(fa, out);
+            pp_fact(fa, scope, out);
             out.push_str(" @ ");
-            pp_term(t, TermPrec::Top, out);
+            pp_term(t, TermPrec::Top, scope, out);
         }
         Last(t) => {
             out.push_str("last(");
-            pp_term(t, TermPrec::Top, out);
+            pp_term(t, TermPrec::Top, scope, out);
             out.push(')');
         }
-        Pred(fa) => pp_fact(fa, out),
+        Pred(fa) => pp_fact(fa, scope, out),
     }
 }
 
@@ -202,15 +256,18 @@ fn pp_atom(a: &p::Atom, out: &mut String) {
 // Fact
 // =============================================================================
 
-fn pp_fact(fa: &p::Fact, out: &mut String) {
+fn pp_fact(fa: &p::Fact, scope: &[(String, p::SortHint)], out: &mut String) {
+    // HS `prettyFact` uses `nestShort'` which renders as `Name( args )`
+    // with single-space padding inside the parens, comma-separated args.
+    // Empty-arg facts still keep the spacing.
     if fa.persistent { out.push('!'); }
     out.push_str(&fa.name);
-    out.push('(');
+    out.push_str("( ");
     for (i, t) in fa.args.iter().enumerate() {
         if i > 0 { out.push_str(", "); }
-        pp_term(t, TermPrec::Top, out);
+        pp_term(t, TermPrec::Top, scope, out);
     }
-    out.push(')');
+    out.push_str(" )");
 }
 
 // =============================================================================
@@ -225,10 +282,10 @@ enum TermPrec {
     InOp,
 }
 
-fn pp_term(t: &p::Term, prec: TermPrec, out: &mut String) {
+fn pp_term(t: &p::Term, prec: TermPrec, scope: &[(String, p::SortHint)], out: &mut String) {
     use p::Term::*;
     match t {
-        Var(v) => pp_var(v, out),
+        Var(v) => pp_var_scoped(v, scope, out),
         PubLit(s) => {
             out.push('\'');
             out.push_str(s);
@@ -254,7 +311,7 @@ fn pp_term(t: &p::Term, prec: TermPrec, out: &mut String) {
             out.push('<');
             for (i, it) in items.iter().enumerate() {
                 if i > 0 { out.push_str(", "); }
-                pp_term(it, TermPrec::Top, out);
+                pp_term(it, TermPrec::Top, scope, out);
             }
             out.push('>');
         }
@@ -264,36 +321,39 @@ fn pp_term(t: &p::Term, prec: TermPrec, out: &mut String) {
                 out.push('(');
                 for (i, a) in args.iter().enumerate() {
                     if i > 0 { out.push_str(", "); }
-                    pp_term(a, TermPrec::Top, out);
+                    pp_term(a, TermPrec::Top, scope, out);
                 }
                 out.push(')');
             }
         }
         AlgApp(name, l, r) => {
+            // HS pretty-prints `aenc{m}pk` as `aenc(m, pk)` (canonical
+            // function syntax) — the curly-brace form is parser sugar.
             out.push_str(name);
-            out.push('{');
-            pp_term(l, TermPrec::Top, out);
-            out.push('}');
-            pp_term(r, TermPrec::Top, out);
+            out.push('(');
+            pp_term(l, TermPrec::Top, scope, out);
+            out.push_str(", ");
+            pp_term(r, TermPrec::Top, scope, out);
+            out.push(')');
         }
         Diff(l, r) => {
             out.push_str("diff(");
-            pp_term(l, TermPrec::Top, out);
+            pp_term(l, TermPrec::Top, scope, out);
             out.push_str(", ");
-            pp_term(r, TermPrec::Top, out);
+            pp_term(r, TermPrec::Top, scope, out);
             out.push(')');
         }
         BinOp(op, l, r) => {
             let needs = prec == TermPrec::InOp;
             if needs { out.push('('); }
-            pp_term(l, TermPrec::InOp, out);
+            pp_term(l, TermPrec::InOp, scope, out);
             out.push_str(binop_symbol(*op));
-            pp_term(r, TermPrec::InOp, out);
+            pp_term(r, TermPrec::InOp, scope, out);
             if needs { out.push(')'); }
         }
         PatMatch(inner) => {
             out.push('=');
-            pp_term(inner, TermPrec::Top, out);
+            pp_term(inner, TermPrec::Top, scope, out);
         }
     }
 }
@@ -366,21 +426,21 @@ fn pp_guarded_inner(
         Guarded::GGuarded { qua, vars, guards, body } => {
             let mut new_scope: Vec<Vec<GBinding>> = scope.to_vec();
             new_scope.push(vars.clone());
-            // Special case: `∀[] [Atom].⊥` renders as `¬Atom`.
-            // Mirrors Guarded.hs:856-857.
+            // Special case: `∀[] [Atom].⊥` renders as `¬<dante>` where
+            // `dante = pp (GConj (Conj antecedent))` and Conj wraps each
+            // conjunct in `opParens` (Guarded.hs:856-857).  So single
+            // guard `¬(a)`, multiple `¬((a) ∧ (b))` (outer Conj from
+            // `pp`).
             if matches!(qua, Quant::All)
                 && vars.is_empty()
                 && body_is_false(body)
             {
                 out.push('\u{00AC}'); // ¬
-                if guards.len() == 1 {
-                    pp_gatom(&guards[0], &new_scope, out);
-                } else {
+                // Wrap each guard atom and join with ∧.
+                for (i, gd) in guards.iter().enumerate() {
+                    if i > 0 { out.push_str(" \u{2227} "); }
                     out.push('(');
-                    for (i, gd) in guards.iter().enumerate() {
-                        if i > 0 { out.push_str(" \u{2227} "); }
-                        pp_gatom(gd, &new_scope, out);
-                    }
+                    pp_gatom(gd, &new_scope, out);
                     out.push(')');
                 }
                 return;
@@ -403,25 +463,19 @@ fn pp_guarded_inner(
                     Quant::All => " \u{21D2} ", // ⇒
                     Quant::Ex => " \u{2227} ",  // ∧
                 };
+                // Mirror HS: `dante = pp (GConj (Conj antecedent))` —
+                // each guard atom is wrapped via `opParens`, then
+                // joined with `∧`.  Single atom → `(atom)`; multiple
+                // → `(a) ∧ (b)`.
+                for (i, gd) in guards.iter().enumerate() {
+                    if i > 0 { out.push_str(" \u{2227} "); }
+                    out.push('(');
+                    pp_gatom(gd, &new_scope, out);
+                    out.push(')');
+                }
                 // Special case: existential with trivially-true body
-                // renders as `∃ vs. guards` (Guarded.hs:854-855).
-                if matches!(qua, Quant::Ex) && body_is_true(body) {
-                    for (i, gd) in guards.iter().enumerate() {
-                        if i > 0 { out.push_str(" \u{2227} "); }
-                        pp_gatom(gd, &new_scope, out);
-                    }
-                } else {
-                    // (guards) connective body
-                    if guards.len() > 1 {
-                        out.push('(');
-                    }
-                    for (i, gd) in guards.iter().enumerate() {
-                        if i > 0 { out.push_str(" \u{2227} "); }
-                        pp_gatom(gd, &new_scope, out);
-                    }
-                    if guards.len() > 1 {
-                        out.push(')');
-                    }
+                // renders as `∃ vs. (guards)` (Guarded.hs:854-855).
+                if !(matches!(qua, Quant::Ex) && body_is_true(body)) {
                     out.push_str(connective);
                     pp_guarded_inner(body, true, &new_scope, out);
                 }
@@ -478,14 +532,15 @@ fn pp_gatom(a: &crate::guarded::GAtom, scope: &[Vec<crate::guarded::GBinding>], 
 }
 
 fn pp_gfact(fa: &crate::guarded::GFact, scope: &[Vec<crate::guarded::GBinding>], out: &mut String) {
+    // HS-faithful: `Name( args )` with internal spaces, matching `pp_fact`.
     if fa.persistent { out.push('!'); }
     out.push_str(&fa.name);
-    out.push('(');
+    out.push_str("( ");
     for (i, t) in fa.args.iter().enumerate() {
         if i > 0 { out.push_str(", "); }
         pp_gterm(t, TermPrec::Top, scope, out);
     }
-    out.push(')');
+    out.push_str(" )");
 }
 
 fn pp_gterm(t: &crate::guarded::GTerm, prec: TermPrec, scope: &[Vec<crate::guarded::GBinding>], out: &mut String) {
@@ -598,7 +653,8 @@ mod tests {
         );
         let s = pretty_formula(&f);
         assert!(s.contains("\u{2200}"));
-        assert!(s.contains("F(ni)"));
+        // HS-faithful: `Name( args )` with internal spaces.
+        assert!(s.contains("F( ni )"));
         assert!(s.contains("@ #i"));
         assert!(s.contains("\u{21D2}"));
     }

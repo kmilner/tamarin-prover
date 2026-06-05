@@ -199,13 +199,14 @@ pub fn prove_lemma(
     ctx.typing_assumptions = typing_assumptions;
     ctx.ensure_saturated();
     if trace { eprintln!("[phase] run_proof_search start"); }
-    // Permanent phase marker so TAM_RS_DBG_* counts can be filtered
-    // to the lemma-proof phase only.  Pair with HS's
-    // `[Saturating Sources] Done` marker for HS↔Rust diffing of just
-    // the lemma proof (excludes precompute/saturation).  Always-on
-    // because the marker line is cheap and useful for any trace
-    // analysis.
-    eprintln!("[rs-phase] lemma-proof START");
+    // Phase marker so TAM_RS_DBG_* counts can be filtered to the
+    // lemma-proof phase only.  Pair with HS's `[Saturating Sources]
+    // Done` marker for HS↔Rust diffing of just the lemma proof
+    // (excludes precompute/saturation).  Gated behind TAM_RS_DBG_PHASE
+    // so default --prove stderr stays HS-faithful.
+    if std::env::var("TAM_RS_DBG_PHASE").is_ok() {
+        eprintln!("[rs-phase] lemma-proof START");
+    }
     if std::env::var("TAM_DBG_LEMMA_INIT").is_ok() {
         eprintln!("[lemma-init] sys.formulas count = {}", sys.formulas.len());
         for (i, f) in sys.formulas.iter().enumerate() {
