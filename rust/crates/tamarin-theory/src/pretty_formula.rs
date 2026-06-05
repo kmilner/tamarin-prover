@@ -26,6 +26,19 @@ pub fn pretty_formula(f: &p::Formula) -> String {
     s
 }
 
+/// Pretty-print a formula with HS-style `sep`/`nest`-driven line
+/// wrapping.  `indent` is the column where the first character of the
+/// formula will land in the final output; `width` is the target line
+/// width (76 to match HS `defaultStyle`).
+///
+/// When the flat rendering fits within `width - indent`, returns that.
+/// Otherwise decomposes at the top-level operator, recursively laying
+/// out each operand with an indent appropriate to HS's `sep + nest`
+/// scheme (Formula.hs:486-502; Lemma.hs:117-127).
+pub fn pretty_formula_wrapped(f: &p::Formula, indent: usize, width: usize) -> String {
+    pp_formula_wrap(f, indent, width, &[], false)
+}
+
 /// Pretty-print a guarded formula.  Mirrors Haskell's
 /// `prettyGuarded` (Guarded.hs:822).
 pub fn pretty_guarded(g: &Guarded) -> String {
@@ -144,6 +157,117 @@ fn is_atomic_formula(f: &p::Formula) -> bool {
         True | False => true,
         Atom(p::Atom::Pred(_)) => true,
         _ => false,
+    }
+}
+
+// =============================================================================
+// HS-style wrapped layout
+// =============================================================================
+//
+// Port of `Text.PrettyPrint.HughesPJ`'s `sep` / `nest` semantics for
+// the subset used by `prettyLFormula` (Formula.hs:471-507) and
+// `prettyLemma` (Lemma.hs:117-127):
+//   - `sep [a, b]` tries to fit `a b` on one line; if it overflows the
+//     ribbon width, falls back to `a\n  b` (each at the current indent).
+//   - `nest n d` adds `n` to the current indent for `d`'s layout.
+//
+// We use a flat-then-wrap strategy: for each composite formula node,
+// first render flat; if it fits in `(width - indent)`, keep flat;
+// otherwise recursively lay out across lines.
+
+/// Width threshold used for wrapping.  HS's `defaultStyle` has
+/// `lineLength = 100` and `ribbonsPerLine = 1.5`, giving an effective
+/// ribbon width of ~67.  We use 76 to match the typical observed wrap
+/// point across the corpus.
+pub const WRAP_WIDTH: usize = 76;
+
+fn pp_formula_wrap(
+    f: &p::Formula,
+    indent: usize,
+    width: usize,
+    scope: &[(String, p::SortHint)],
+    inner_op: bool,
+) -> String {
+    let flat = {
+        let mut s = String::new();
+        if inner_op { pp_formula_opparens(f, scope, &mut s); }
+        else { pp_formula(f, FormCtx::Top, scope, &mut s); }
+        s
+    };
+    if indent + flat.chars().count() <= width {
+        return flat;
+    }
+    use p::Formula::*;
+    match f {
+        // Quantifier: `Q vs. body` flat, or `Q vs.\n<body_indent>body`.
+        // HS `sep [quant_vs., nest 1 body]` puts body at quant-col + 1.
+        // When `inner_op` is true the whole quantifier gets wrapped in
+        // parens — the `(` is at `indent` and the `∃` shifts right by
+        // one, so the body indent must account for that.
+        Forall(vs, body) | Exists(vs, body) => {
+            let sym = if matches!(f, Forall(_, _)) { "\u{2200}" } else { "\u{2203}" };
+            let mut vars_str = String::new();
+            pp_var_list(vs, &mut vars_str);
+            let head = format!("{} {}.", sym, vars_str);
+            let new_scope = extend_scope(scope, vs);
+            let quant_col = if inner_op { indent + 1 } else { indent };
+            let body_indent = quant_col + 1;
+            let body_str = pp_formula_wrap(body, body_indent, width, &new_scope, false);
+            let mut out = head;
+            out.push('\n');
+            out.push_str(&" ".repeat(body_indent));
+            out.push_str(&body_str);
+            if inner_op { format!("({})", out) } else { out }
+        }
+        // Conn op p q: try `(p) op (q)` one line, else
+        // `<p_layout> op\n<indent> <q_layout>`.
+        And(l, r) => pp_binop_wrap(l, r, "\u{2227}", indent, width, scope, inner_op),
+        Or(l, r) => pp_binop_wrap(l, r, "\u{2228}", indent, width, scope, inner_op),
+        Implies(l, r) => pp_binop_wrap(l, r, "\u{21D2}", indent, width, scope, inner_op),
+        Iff(l, r) => pp_binop_wrap(l, r, "\u{21D4}", indent, width, scope, inner_op),
+        // Not p: `¬<wrapped_p>`.
+        Not(p_) => {
+            let inner = pp_formula_wrap(p_, indent + 1, width, scope, true);
+            format!("\u{00AC}{}", inner)
+        }
+        // Atoms / True / False: just the flat form (no useful break).
+        _ => flat,
+    }
+}
+
+fn pp_binop_wrap(
+    l: &p::Formula,
+    r: &p::Formula,
+    op: &str,
+    indent: usize,
+    width: usize,
+    scope: &[(String, p::SortHint)],
+    outer_op: bool,
+) -> String {
+    // HS: `sep [opParens p <-> op, opParens q]`.  Lay out the left
+    // operand, then ` op` (when one-line) or `\n<indent>op<sp>` then
+    // the right operand at the same indent.
+    let l_str = pp_formula_wrap(l, indent, width, scope, true);
+    let r_indent = indent;
+    let r_str = pp_formula_wrap(r, r_indent, width, scope, true);
+    // If `l op r` (one line) fits, use it.
+    let one_line = format!("{} {} {}", l_str, op, r_str);
+    let mut needs_paren = outer_op;
+    if indent + one_line.chars().count() <= width && !l_str.contains('\n') && !r_str.contains('\n') {
+        return if needs_paren { format!("({})", one_line) } else { one_line };
+    }
+    // Multi-line: `<l_str> op\n<indent><r_str>` — l carries the op on
+    // its last line, then a newline + indent + r.
+    let pad = " ".repeat(r_indent);
+    needs_paren = outer_op;
+    let body = format!("{} {}\n{}{}", l_str, op, pad, r_str);
+    if needs_paren {
+        // HS wraps the parenthesised group as `(<body>)` — keep on
+        // the same multi-line shape; the closing paren attaches to the
+        // last line of body.
+        format!("({})", body)
+    } else {
+        body
     }
 }
 
