@@ -2,6 +2,17 @@
 //!
 //! Stays small: parse argv → dispatch to [`tamarin_prover::run::run`]
 //! → translate errors into a stderr message + non-zero exit code.
+//!
+//! Uses `mimalloc` as the global allocator, matching every other
+//! tamarin entry-point in the workspace (`maude_prof`, `dump_proof`,
+//! the `oracle_solver` test harness).  On wireguard.spthy's
+//! `exists_session` the switch cuts ~4s off the prove loop versus
+//! glibc malloc — the prover allocates millions of small Term/Subst
+//! nodes during graph search and slab/region allocators are dramatically
+//! cheaper for that churn pattern.
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::process::ExitCode;
 
