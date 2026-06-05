@@ -80,9 +80,45 @@ hs_cache_key() {
 }
 
 # --- Robust lemma-name list for a file (handles "lemma Foo:", "lemma Foo [..]:",
-#     "lemma Foo[..]:", "lemma Foo :").
+#     "lemma Foo[..]:", "lemma Foo :").  Strips block comments first so
+#     `lemma Foo` inside `/* ... */` doesn't get enumerated (HS-faithful:
+#     both provers parse-skip these, so they'd false-categorise as
+#     "no HS skeleton" otherwise).  Block comments NEST in Tamarin's
+#     grammar (`Theory.Text.Parser.Token.commentStyle`).
 lemmas_of() {
-    grep '^lemma ' "$1" 2>/dev/null | sed -E 's/^lemma[[:space:]]+([A-Za-z0-9_]+).*/\1/'
+    awk '
+        BEGIN { depth = 0 }
+        {
+            line = $0
+            while (length(line) > 0) {
+                if (depth > 0) {
+                    o = index(line, "/*")
+                    c = index(line, "*/")
+                    if (c == 0 && o == 0) { line = ""; break }
+                    if (o > 0 && (c == 0 || o < c)) {
+                        depth++; line = substr(line, o + 2)
+                    } else {
+                        depth--; line = substr(line, c + 2)
+                    }
+                } else {
+                    # Find earliest of //, /*, *
+                    lc = index(line, "//")
+                    bc = index(line, "/*")
+                    if (lc > 0 && (bc == 0 || lc < bc)) {
+                        print substr(line, 1, lc - 1); line = ""; break
+                    }
+                    if (bc > 0) {
+                        print substr(line, 1, bc - 1)
+                        depth++; line = substr(line, bc + 2)
+                    } else {
+                        print line; line = ""; break
+                    }
+                }
+            }
+        }
+    ' "$1" 2>/dev/null \
+        | grep '^lemma ' \
+        | sed -E 's/^lemma[[:space:]]+([A-Za-z0-9_]+).*/\1/'
 }
 
 # --- Slice one lemma's proof block out of a rendered theory and canonicalize.

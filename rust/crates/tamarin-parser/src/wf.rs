@@ -45,7 +45,17 @@ pub type WfReport = Vec<WfError>;
 /// Run every wellformedness check against `thy`. Topics from the result
 /// can be compared directly against `tamarin-prover`'s output.
 pub fn check_theory(thy: &Theory) -> WfReport {
+    // Mirrors HS `Theory.Tools.Wellformedness.checkWellformedness`
+    // (Wellformedness.hs:1270-1287) — same execution order so the
+    // emitted warning groups appear in the same order in `tamarin-prover
+    // --prove` output.
     let mut report = Vec::new();
+    report.extend(unbound_report(thy));
+    report.extend(fresh_names_report(thy));
+    report.extend(public_names_report(thy));
+    report.extend(left_right_rule_report(thy));    // ruleSortsReport
+    // ruleVariantsReport — not ported (needs MaudeHandle + variant solver).
+    // factReports group:
     report.extend(reserved_report(thy));
     report.extend(reserved_fact_name_rules(thy));
     report.extend(reserved_prefix_report(thy));
@@ -53,15 +63,15 @@ pub fn check_theory(thy: &Theory) -> WfReport {
     report.extend(special_facts_usage(thy));
     report.extend(fact_usage(thy));
     report.extend(fact_lhs_occur_no_rhs(thy));
-    report.extend(fresh_names_report(thy));
-    report.extend(public_names_report(thy));
-    report.extend(unbound_report(thy));
-    report.extend(mult_restricted_report(thy));
-    report.extend(lemma_attribute_report(thy));
-    report.extend(left_right_rule_report(thy));
-    report.extend(subterm_convergence_report(thy));
+    // formulaReports group:
     report.extend(formula_terms_report(thy));
+    // checkQuantifiers / checkGuarded — partial via formula_free_var_report.
+    // lemmaAttributeReport, multRestrictedReport, natWellSortedReport:
+    report.extend(lemma_attribute_report(thy));
+    report.extend(mult_restricted_report(thy));
     report.extend(nat_well_sorted_report(thy));
+    // checkEquationsSubtermConvergence:
+    report.extend(subterm_convergence_report(thy));
     report
 }
 
@@ -304,6 +314,32 @@ pub fn special_facts_usage(thy: &Theory) -> WfReport {
 // Fr facts must use a fresh- or msg-variable
 // =============================================================================
 
+/// Compact term pretty-printer for wf error messages.  Matches HS's
+/// `Theory.Tools.Wellformedness` rendering of variable sorts:
+///   `$name`  — public, `~name` — fresh, `#name` — node, `%name` — nat,
+///   bare `name` for msg-sorted or untagged variables.  Function
+///   applications use `f(arg, ...)` form.
+fn pp_term_short(t: &Term) -> String {
+    match t {
+        Term::Var(v) => {
+            let prefix = match v.sort {
+                SortHint::Pub => "$",
+                SortHint::Fresh => "~",
+                SortHint::Node => "#",
+                SortHint::Nat => "%",
+                _ => "",
+            };
+            format!("{}{}", prefix, v.name)
+        }
+        Term::App(name, args) => {
+            let parts: Vec<String> = args.iter().map(pp_term_short).collect();
+            format!("{}({})", name, parts.join(", "))
+        }
+        Term::PubLit(s) => format!("'{}'", s),
+        _ => format!("{:?}", t),
+    }
+}
+
 pub fn fresh_fact_arguments(thy: &Theory) -> WfReport {
     let mut out = Vec::new();
     for r in theory_rules(thy) {
@@ -321,7 +357,7 @@ pub fn fresh_fact_arguments(thy: &Theory) -> WfReport {
             if !ok {
                 out.push(WfError::new(
                     "Fr facts must only use a fresh- or a msg-variable",
-                    format!("rule '{}' fact: Fr({:?})", r.name, arg),
+                    format!("rule `{}' fact: Fr( {} )", r.name, pp_term_short(arg)),
                 ));
             }
         }
@@ -527,9 +563,15 @@ pub fn unbound_report(thy: &Theory) -> WfReport {
             let names: Vec<String> = unbound.iter()
                 .map(|v| format!("{}", render_var(v)))
                 .collect();
+            // HS format: `rule `R' has unbound variables: \n    v1\n    v2\n...`
+            // (Wellformedness.hs:493-510, `prettyVarList`).  One var
+            // per indented line.
+            let var_lines: String = names.iter()
+                .map(|n| format!("    {}", n))
+                .collect::<Vec<_>>()
+                .join("\n");
             out.push(WfError::new("Unbound variables",
-                format!("rule `{}' has unbound variables: {}",
-                    r.name, names.join(", "))));
+                format!("rule `{}' has unbound variables: \n{}", r.name, var_lines)));
         }
     }
     out
