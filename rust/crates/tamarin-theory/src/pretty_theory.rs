@@ -608,11 +608,34 @@ fn render_parsed_lemma(lem: &p::Lemma, proved: &[ProvedLemma]) -> String {
         out.push_str(&attrs);
         out.push(']');
     }
-    out.push_str(":\n  ");
-    out.push_str(quantifier_keyword(&lem.trace_quantifier));
-    out.push_str(" \"");
-    out.push_str(&pf::pretty_formula(&lem.formula));
-    out.push_str("\"\n");
+    out.push_str(":\n");
+
+    // Lemma body shape from HS `prettyLemma` (Lemma.hs:117-127):
+    //   `sep [<quantifier>, doubleQuotes <formula>]`, all under `nest 2`.
+    // When the combined fits on a single line, lay out as
+    //   `  <quant> "<formula>"`
+    // Otherwise wrap to:
+    //   `  <quant>
+    //   "<formula>"`
+    // Within the formula, recursively wrap on the same width budget.
+    let quant = quantifier_keyword(&lem.trace_quantifier);
+    let flat_formula = pf::pretty_formula(&lem.formula);
+    let one_line = format!("  {} \"{}\"", quant, flat_formula);
+    if one_line.chars().count() <= pf::WRAP_WIDTH {
+        out.push_str(&one_line);
+    } else {
+        // The formula starts at column 3 (`  "` prefix).  Width 76 means
+        // the formula's content has `76 - 3 = 73` cols available
+        // before wrap.  But the outer `"` should also fit, so allow up
+        // to 75 chars total inside the quotes — i.e. wrap at indent 3.
+        let wrapped = pf::pretty_formula_wrapped(&lem.formula, 3, pf::WRAP_WIDTH);
+        out.push_str("  ");
+        out.push_str(quant);
+        out.push_str("\n  \"");
+        out.push_str(&wrapped);
+        out.push('"');
+    }
+    out.push('\n');
 
     // /* guarded formula characterizing ... */
     out.push_str(&render_guarded_block(lem));
