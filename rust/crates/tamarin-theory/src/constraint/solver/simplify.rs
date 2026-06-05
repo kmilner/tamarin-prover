@@ -1625,6 +1625,22 @@ fn structural_match(
 /// Maude reports no match.
 ///
 /// Mirrors Haskell's `matchAction` flow in `impliedFormulas`.
+/// Returns true iff any term in `eqs` contains an AC operator
+/// (Union/Mult/Xor/NatPlus).  When false, the AC fallback can't
+/// produce matches that the structural matcher missed — bail.
+fn any_ac_op(eqs: &[tamarin_term::rewriting::Equal<tamarin_term::lterm::LNTerm>]) -> bool {
+    use tamarin_term::function_symbols::FunSym;
+    use tamarin_term::term::Term;
+    fn walk(t: &tamarin_term::lterm::LNTerm) -> bool {
+        match t {
+            Term::App(FunSym::Ac(_), _) => true,
+            Term::App(_, args) => args.iter().any(walk),
+            _ => false,
+        }
+    }
+    eqs.iter().any(|e| walk(&e.lhs) || walk(&e.rhs))
+}
+
 fn match_atom_via_maude(
     maude: &tamarin_term::maude_proc::MaudeHandle,
     vars: &[tamarin_parser::ast::VarSpec],
@@ -1722,6 +1738,16 @@ fn match_atom_via_maude(
         if std::env::var("TAM_DBG_IMPL").is_ok() {
             eprintln!("[impl] AC-fallback for {} @ {:?}: {} eqs",
                 g_fact.name, i, eqs.len());
+        }
+        // Fast path: if neither side contains any AC operator
+        // (Union/Mult/Xor/NatPlus), AC matching can't help where
+        // structural matching failed.  Skip the Maude round-trip.
+        // (Empty results are cached anyway, so the second + visit of
+        // an identical query is free — but the first visit pays the
+        // full IPC cost.  AC-free cases never need Maude.)
+        if !any_ac_op(&eqs) {
+            tamarin_term::maude_proc::_tally_callsite("ac_fallback::AC_FREE_BAIL");
+            return Vec::new();
         }
         let maude_res = maude.match_eqs_const_subject(&eqs, &pattern_vars);
         let Ok(matches) = maude_res else { return Vec::new() };
