@@ -94,6 +94,24 @@ pub fn pretty_closed_theory(
     // with a trailing '\n' after each line so we don't add another here.
     out.push_str(&render_signature(&elaborated.signature.maude_sig));
 
+    // HS `prettyTheory` (TheoryObject.hs:741-751) emits, between the
+    // signature and the cache block:
+    //   - `heuristic: <ranking>` line (only if non-empty heuristic)
+    //   - `ppCache` (the "looping facts with injective instances" comment).
+    // Mirror that here.
+    if !elaborated.heuristic.is_empty() {
+        out.push('\n');
+        out.push_str("heuristic: ");
+        out.push_str(&elaborated.heuristic.join(""));
+        out.push('\n');
+    }
+    let inj_block = render_injective_fact_insts(elaborated);
+    if !inj_block.is_empty() {
+        out.push('\n');
+        out.push_str(&inj_block);
+        out.push('\n');
+    }
+
     // Iterate parsed.items, mapping to elaborated entities where needed.
     // HS preserves source order via vsep over `thyItems`.  Each item is
     // separated from the previous block by a blank line.
@@ -129,6 +147,45 @@ pub fn pretty_closed_theory(
     out.push_str("\nend\n");
 
     out
+}
+
+/// Render HS `ppInjectiveFactInsts` (ClosedTheory.hs:413-418):
+///
+/// ```text
+/// /* looping facts with injective instances: T1/n1, T2/n2, ... */
+/// ```
+///
+/// Emits the empty string when no fact tags are injective.  Computes
+/// the set on demand from the elaborated rules + reducible function
+/// symbols — same call site as `ProofContext::new`
+/// (`constraint/solver/context.rs:493-495`).
+fn render_injective_fact_insts(elab: &Theory) -> String {
+    use crate::fact::{FactTag, Multiplicity};
+    let proto_rules: Vec<crate::rule::ProtoRuleE> = elab.rules()
+        .map(|r| r.rule.clone())
+        .collect();
+    let tags = crate::tools::injective_fact_instances::simple_injective_fact_instances(
+        &proto_rules,
+        &elab.signature.maude_sig.reducible_fun_syms,
+    );
+    if tags.is_empty() { return String::new(); }
+    // HS `showFactTagArity` (Fact.hs:526): persistent `!`-prefix + name
+    // + `/` + arity.
+    let label = |tag: &FactTag| -> String {
+        let prefix = match tag {
+            FactTag::Proto(Multiplicity::Persistent, _, _) => "!",
+            _ => "",
+        };
+        format!("{}{}/{}",
+            prefix,
+            crate::fact::fact_tag_name(tag),
+            crate::fact::fact_tag_arity(tag))
+    };
+    let parts: Vec<String> = tags.iter().map(|(t, _)| label(t)).collect();
+    format!(
+        "/* looping facts with injective instances: {} */",
+        parts.join(", "),
+    )
 }
 
 // =============================================================================
@@ -320,6 +377,15 @@ fn render_rule(parsed_rule: &p::Rule, elab: &Theory) -> String {
     out.push_str("rule (modulo E) ");
     out.push_str(name);
     out.push_str(":\n");
+    // Desugar `let x = t in ...` bindings before rendering — HS does
+    // this via `applyMacroInProtoRule`/`expandRuleLetBlock` so the
+    // emitted rule contains no bound names from the `let` block.
+    // Mirrors `apply_let_block` (`elaborate.rs:678`); same fix pattern
+    // as the deriv-check (commit 3b0202bb).  HS site:
+    // `lib/theory/src/TheoryObject.hs::prettyTheory` → `prettyRule` chain
+    // which operates on the post-`applyMacroInProtoRule` rule.
+    let desugared = crate::elaborate::apply_let_block(parsed_rule);
+    let parsed_rule = &desugared;
     out.push_str(&render_rule_body(
         &parsed_rule.premises,
         &parsed_rule.actions,
@@ -534,8 +600,39 @@ fn lnterm_to_parser(t: &tamarin_term::lterm::LNTerm) -> p::Term {
         }
         Term::App(FunSym::NoEq(sym), args) => {
             let name = String::from_utf8_lossy(&sym.name).to_string();
+            // `exp` is the DH exponentiation infix operator — HS
+            // `prettyTerm` (Term/Term.hs:274) renders `exp(a, b)` as `a^b`.
+            // Surface as `p::Term::BinOp(Exp, ..)` so `pp_term`'s special
+            // case applies.
+            if name == "exp" && args.len() == 2 {
+                return p::Term::BinOp(
+                    p::BinOp::Exp,
+                    Box::new(lnterm_to_parser(&args[0])),
+                    Box::new(lnterm_to_parser(&args[1])),
+                );
+            }
+            // `pair` chains flatten to n-ary tuple (HS `prettyTerm` at
+            // Term/Term.hs:277,292-293: `split` walks the right child
+            // while it is itself a pair).
             if name == "pair" && args.len() == 2 {
-                return p::Term::Pair(args.iter().map(lnterm_to_parser).collect());
+                let mut items: Vec<p::Term> = Vec::new();
+                items.push(lnterm_to_parser(&args[0]));
+                let mut tail = &args[1];
+                loop {
+                    match tail {
+                        Term::App(FunSym::NoEq(s2), a2)
+                            if a2.len() == 2 && String::from_utf8_lossy(&s2.name) == "pair" =>
+                        {
+                            items.push(lnterm_to_parser(&a2[0]));
+                            tail = &a2[1];
+                        }
+                        _ => {
+                            items.push(lnterm_to_parser(tail));
+                            break;
+                        }
+                    }
+                }
+                return p::Term::Pair(items);
             }
             p::Term::App(name, args.iter().map(lnterm_to_parser).collect())
         }
@@ -804,9 +901,37 @@ fn render_lnterm(t: &tamarin_term::lterm::LNTerm) -> String {
         }
         Term::App(FunSym::NoEq(sym), args) => {
             let name = String::from_utf8_lossy(&sym.name);
-            // Special-case `pair` → `<a, b>`.
+            // Special-case `exp` → `<a>^<b>` (infix DH exponentiation).
+            // Mirrors HS `prettyTerm` (Term/Term.hs:274):
+            //   `FApp (NoEq s) [t1,t2] | s == expSym -> ppTerm t1 <> text "^" <> ppTerm t2`
+            if &*name == "exp" && args.len() == 2 {
+                return format!("{}^{}", render_lnterm(&args[0]), render_lnterm(&args[1]));
+            }
+            // Special-case `pair` → `<a, b, c, ...>` (right-nested pair
+            // chains flattened to n-ary tuple).  Mirrors HS `prettyTerm`
+            // (Term/Term.hs:277,292-293):
+            //   `FApp (NoEq s) _ | s == pairSym -> ppTerms ", " 1 "<" ">" (split t)`
+            //   `split (viewTerm2 -> FPair t1 t2) = t1 : split t2`
+            //   `split t                          = [t]`
             if &*name == "pair" && args.len() == 2 {
-                return format!("<{}, {}>", render_lnterm(&args[0]), render_lnterm(&args[1]));
+                let mut parts: Vec<String> = Vec::new();
+                parts.push(render_lnterm(&args[0]));
+                let mut tail = &args[1];
+                loop {
+                    match tail {
+                        Term::App(FunSym::NoEq(s2), a2)
+                            if a2.len() == 2 && &*String::from_utf8_lossy(&s2.name) == "pair" =>
+                        {
+                            parts.push(render_lnterm(&a2[0]));
+                            tail = &a2[1];
+                        }
+                        _ => {
+                            parts.push(render_lnterm(tail));
+                            break;
+                        }
+                    }
+                }
+                return format!("<{}>", parts.join(", "));
             }
             let inner: Vec<String> = args.iter().map(render_lnterm).collect();
             if inner.is_empty() {
@@ -816,13 +941,17 @@ fn render_lnterm(t: &tamarin_term::lterm::LNTerm) -> String {
             }
         }
         Term::App(FunSym::Ac(ac), args) => {
+            // HS `prettyTerm` (Term/Term.hs:273):
+            //   `FApp (AC o) ts -> ppTerms (ppACOp o) 1 "(" ")" ts`
+            // Note the `"("`/`")"` lead/finish — AC products always
+            // print fully parenthesised (e.g. `'g'^(~ekI*~ltkB)`).
             let op = match ac {
                 AcSym::Mult => "*",
                 AcSym::Union => "++",
                 AcSym::NatPlus => "%+",
                 AcSym::Xor => "\u{2295}",
             };
-            args.iter().map(render_lnterm).collect::<Vec<_>>().join(op)
+            format!("({})", args.iter().map(render_lnterm).collect::<Vec<_>>().join(op))
         }
         Term::App(FunSym::C(sym), args) => {
             // `C` is the commutative-builtin family — currently just `em`.

@@ -492,12 +492,23 @@ fn pp_term(t: &p::Term, prec: TermPrec, scope: &[(String, p::SortHint)], out: &m
             out.push(')');
         }
         BinOp(op, l, r) => {
-            let needs = prec == TermPrec::InOp;
-            if needs { out.push('('); }
-            pp_term(l, TermPrec::InOp, scope, out);
+            // HS `prettyTerm` (Term/Term.hs:273-274):
+            //   `FApp (AC o)   ts -> ppTerms (ppACOp o) 1 "(" ")" ts`
+            //   `FApp (NoEq s) [t1,t2] | s == expSym -> ppTerm t1 <> text "^" <> ppTerm t2`
+            // — AC ops always print with surrounding `(` `)` (the
+            // `"("`/`")"` lead/finish in `ppTerms`); exp prints with
+            // no precedence/paren guard.
+            let is_exp = matches!(op, p::BinOp::Exp);
+            if !is_exp { out.push('('); }
+            // Within an exp, children print at Top (no extra parens for
+            // nested `^`).  Within an AC, children at Top — AC nesting
+            // already gets its own mandatory parens via the recursive
+            // call, and the parent's parens are unconditional.
+            pp_term(l, TermPrec::Top, scope, out);
             out.push_str(binop_symbol(*op));
-            pp_term(r, TermPrec::InOp, scope, out);
-            if needs { out.push(')'); }
+            pp_term(r, TermPrec::Top, scope, out);
+            if !is_exp { out.push(')'); }
+            let _ = prec; // precedence no longer needed
         }
         PatMatch(inner) => {
             out.push('=');
