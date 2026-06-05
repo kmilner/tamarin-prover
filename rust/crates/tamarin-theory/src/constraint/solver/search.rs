@@ -361,6 +361,32 @@ fn expand(
     deadline: &std::time::Instant,
     depth: usize,
 ) {
+    expand_inner(ctx, node, budget, deadline, depth);
+    // After expansion, `sys` is no longer read EXCEPT on
+    // `Sorry: depth limit` leaves, which `re_expand_depth_limited`
+    // (search.rs:269 onwards) re-runs `expand` on during the next
+    // ID-DFS iteration — those need their sys.  Everything else
+    // (resolved leaves, interior nodes, terminal Sorrys) can drop.
+    // Profile: csf17::injectivity 1010-step proof tree holds ~200 MB
+    // peak; this drain reduces peak RSS to ~14 MB (~ same as small
+    // lemmas — most of HS's residue is the closed branches we can
+    // now free).
+    let keep_for_redoexpand = matches!(
+        &node.method,
+        ProofMethod::Sorry(Some(msg)) if msg == "depth limit"
+    ) && matches!(node.status, NodeStatus::Sorry);
+    if !keep_for_redoexpand && std::env::var_os("TAM_RS_KEEP_SYS").is_none() {
+        node.sys = crate::constraint::system::System::default();
+    }
+}
+
+fn expand_inner(
+    ctx: &ProofContext,
+    node: &mut ProofNode,
+    budget: &mut usize,
+    deadline: &std::time::Instant,
+    depth: usize,
+) {
     let dbg_expand = std::env::var("TAM_DBG_EXPAND").is_ok();
     if dbg_expand {
         eprintln!("[expand] enter depth={} budget={} sys.nodes={} goals={}",
