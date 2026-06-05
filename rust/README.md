@@ -34,14 +34,23 @@ experiments    8/15   jcs18        43/70   csf18-alethea 0/1
 ```
 
 Every comparable lemma is byte-identical (canonicalised) to HS's proof
-tree. The 56 skips break down as:
+tree. Both `all-traces` (safety) and `exists-trace` (witness) lemmas
+are fully implemented — e.g. `NSPK3::session_key_setup_possible`
+(exists-trace) matches HS at `verified (5 steps)` with identical
+proof skeleton.
 
-- **15 exists-trace** lemmas where HS doesn't emit a proof skeleton
-  (HS's `prettyProof` short-circuits on `TraceFound`).
+The 56 skips break down as:
+
 - **24 timeouts at 900s** — HS itself times out on these
-  (jcs18-class inductive proofs).
+  (jcs18-class inductive proofs that HS can't finish in 15 min either).
 - **17 filtered** by unsupported builtins (xor, bilinear-pairing,
-  observational equivalence).
+  observational equivalence — see "Not yet ported" below).
+- **15 "no HS skeleton"** — a mix of: lemmas inside `/* */` block
+  comments that RS over-elaborates and HS skips (parser bug in RS);
+  slow HS proofs categorised as "no skeleton" when HS emits a
+  partial-but-unparseable output before the script's wall-clock cap;
+  lemmas with wellformedness errors HS refuses to prove.  None are
+  exists-trace specific.
 
 ## Performance
 
