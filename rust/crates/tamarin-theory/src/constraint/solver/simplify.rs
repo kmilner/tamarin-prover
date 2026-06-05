@@ -3352,14 +3352,56 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
     let is_true_false = |s: &tamarin_term::lterm::LNTerm,
                          t: &tamarin_term::lterm::LNTerm| -> Option<bool> {
         use crate::tools::subterm_store::elem_not_below_reducible;
-        use tamarin_term::lterm::{is_fresh_var, is_pub_var};
+        use tamarin_term::lterm::{is_fresh_var, is_pub_var, flattened_ac_terms};
         use tamarin_term::term::Term as LTerm;
         use tamarin_term::vterm::Lit as LLit;
+        use tamarin_term::function_symbols::{FunSym, AcSym};
         if s == t { return Some(false); }
         if elem_not_below_reducible(&reducible, t, s) { return Some(false); }
         if elem_not_below_reducible(&reducible, s, t) { return Some(true); }
         if let LTerm::Lit(LLit::Con(_)) = t { return Some(false); }
         if is_pub_var(t) || is_fresh_var(t) { return Some(false); }
+        // HS-faithful: CR-rule `S_subterm-ac-recurse` (SubtermStore.hs:350-354).
+        // When `t = FApp (AC f) _` and `AC f` is NOT a reducible function
+        // symbol, run `processACSubterm` to peel matched flat elements
+        // off both sides — if the small side becomes empty, the subterm
+        // relation is trivially true; if the big side becomes empty, it
+        // is trivially false; otherwise the test is inconclusive.
+        if let LTerm::App(FunSym::Ac(ac_sym), _) = t {
+            let ac_fun_sym = FunSym::Ac(*ac_sym);
+            if !reducible.contains(&ac_fun_sym) {
+                // processACSubterm (SubtermStore.hs:313-318):
+                //   sort + removeSame on flattenedACTerms of both sides.
+                let mut small_flat: Vec<tamarin_term::lterm::LNTerm> =
+                    flattened_ac_terms(*ac_sym, s).into_iter().cloned().collect();
+                let mut big_flat: Vec<tamarin_term::lterm::LNTerm> =
+                    flattened_ac_terms(*ac_sym, t).into_iter().cloned().collect();
+                small_flat.sort();
+                big_flat.sort();
+                // removeSame (SubtermStore.hs:323-326): walk both sorted
+                // lists in tandem, dropping equal pairs.
+                let mut small_rem: Vec<tamarin_term::lterm::LNTerm> = Vec::new();
+                let mut big_rem: Vec<tamarin_term::lterm::LNTerm> = Vec::new();
+                let mut i = 0;
+                let mut j = 0;
+                while i < small_flat.len() && j < big_flat.len() {
+                    match small_flat[i].cmp(&big_flat[j]) {
+                        std::cmp::Ordering::Equal => { i += 1; j += 1; }
+                        std::cmp::Ordering::Less => {
+                            small_rem.push(small_flat[i].clone()); i += 1;
+                        }
+                        std::cmp::Ordering::Greater => {
+                            big_rem.push(big_flat[j].clone()); j += 1;
+                        }
+                    }
+                }
+                while i < small_flat.len() { small_rem.push(small_flat[i].clone()); i += 1; }
+                while j < big_flat.len() { big_rem.push(big_flat[j].clone()); j += 1; }
+                if big_rem.is_empty() { return Some(false); }
+                if small_rem.is_empty() { return Some(true); }
+                // Otherwise inconclusive — fall through to None.
+            }
+        }
         None
     };
     let trivially_smaller = |s: &tamarin_term::lterm::LNTerm,
