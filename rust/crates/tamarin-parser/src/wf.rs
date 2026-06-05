@@ -746,11 +746,39 @@ pub fn public_names_report(thy: &Theory) -> WfReport {
 // Unbound variables: vars in RHS / actions but not in LHS
 // =============================================================================
 
+/// Collect every name declared by `functions: <name>/0 ...` blocks at
+/// any depth in the theory.  HS-faithful: the parser registers these
+/// in its `funSig` so `nullaryApp` resolves bare `<name>` tokens to
+/// `FApp (NoEq <sym>) []` rather than `Var <name>`
+/// (`lib/theory/src/Theory/Text/Parser/Term.hs::nullaryApp`).  In the
+/// Rust port that resolution happens during elaboration, but WF runs
+/// on the un-elaborated parser AST — so any walker that classifies
+/// `Var name` as "really a variable" needs this set to deny-list the
+/// 0-arity user funs.  Built-in nullaries (`signing`'s `true`, DH's
+/// `1`, etc.) are NOT included here; they live in the builtin sig
+/// which is registered at elaborate-time.  Today we only need to
+/// shadow user-declared 0-arity funs (wireguard.spthy's `true/0`).
+fn collect_nullary_fun_names(thy: &Theory) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    for it in &thy.items {
+        if let TheoryItem::Functions(decls) = it {
+            for d in decls {
+                if d.arg_types.is_empty() {
+                    out.insert(d.name.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Collect a rule's unbound variables (conclusion/action vars NOT in
 /// any premise / let-binding).  Returns the list in first-occurrence
 /// order, deduped, excluding pub-sort variables (which are implicitly
-/// adversary-known and so always bound).
-fn collect_rule_unbound_vars(r: &Rule) -> Vec<VarSpec> {
+/// adversary-known and so always bound) and excluding names declared
+/// as 0-arity functions (those are nullary function calls, not
+/// variables — HS resolves them via `nullaryApp` at parse-time).
+fn collect_rule_unbound_vars(r: &Rule, nullary_funs: &BTreeSet<String>) -> Vec<VarSpec> {
     let mut bound: BTreeSet<(String, u64)> = BTreeSet::new();
     for f in &r.premises {
         for v in fact_vars(f) {
@@ -770,6 +798,7 @@ fn collect_rule_unbound_vars(r: &Rule) -> Vec<VarSpec> {
     for f in r.actions.iter().chain(&r.conclusions) {
         for v in fact_vars(f) {
             if is_pub_sort(&v.sort) { continue; }
+            if nullary_funs.contains(&v.name) { continue; }
             let key = (v.name.clone(), v.idx);
             if bound.contains(&key) { continue; }
             if seen.insert(key.clone()) {
@@ -782,8 +811,9 @@ fn collect_rule_unbound_vars(r: &Rule) -> Vec<VarSpec> {
 
 pub fn unbound_report(thy: &Theory) -> WfReport {
     let mut out = Vec::new();
+    let nullary_funs = collect_nullary_fun_names(thy);
     for r in theory_rules(thy) {
-        let unbound = collect_rule_unbound_vars(r);
+        let unbound = collect_rule_unbound_vars(r, &nullary_funs);
         if !unbound.is_empty() {
             let names: Vec<String> = unbound.iter()
                 .map(render_var)
@@ -819,11 +849,12 @@ pub fn unbound_report(thy: &Theory) -> WfReport {
 pub fn message_derivation_report(thy: &Theory) -> WfReport {
     // Aggregate (rule_name, [unbound_var_names]) pairs across the
     // theory, skipping rules with the `no_derivcheck` attribute.
+    let nullary_funs = collect_nullary_fun_names(thy);
     let mut per_rule: Vec<(String, Vec<String>)> = Vec::new();
     for r in theory_rules(thy) {
         if r.attributes.iter().any(|a| matches!(a,
             crate::ast::RuleAttr::NoDerivCheck)) { continue; }
-        let unbound = collect_rule_unbound_vars(r);
+        let unbound = collect_rule_unbound_vars(r, &nullary_funs);
         if unbound.is_empty() { continue; }
         let names: Vec<String> = unbound.iter()
             .map(|v| v.name.clone())

@@ -249,7 +249,7 @@ fn builtin_nullary_names_from_msig(msig: &MaudeSig) -> Vec<String> {
 /// Returns an empty vector for unknown builtin names (HS would never
 /// reach this point: `enableBuiltin` is exhaustive over the parsed
 /// keywords; unknowns fail at the parser).
-fn builtin_nullary_constants(name: &str) -> Vec<String> {
+pub fn builtin_nullary_constants(name: &str) -> Vec<String> {
     match builtin_sig(name) {
         Some(msig) => builtin_nullary_names_from_msig(&msig),
         None => Vec::new(),
@@ -675,7 +675,7 @@ fn rule_to_proto_rule_e(r: &p::Rule) -> Result<ProtoRuleE, ElabError> {
 /// body (premises, actions, conclusions, embedded restrictions).
 /// Bindings are sequential — later bindings see earlier substitutions
 /// applied. Mirrors Haskell tamarin's rule-let desugaring.
-pub(crate) fn apply_let_block(r: &p::Rule) -> p::Rule {
+pub fn apply_let_block(r: &p::Rule) -> p::Rule {
     let mut out = r.clone();
     let bindings = std::mem::take(&mut out.let_block);
 
