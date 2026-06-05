@@ -917,34 +917,162 @@ fn pp_step(m: &crate::constraint::solver::proof_method::ProofMethod) -> String {
             Some(c) => format!("contradiction /* {} */", pp_contradiction(c)),
             None => "contradiction".to_string(),
         },
-        PM::SolveGoal(_g) => {
-            // Goal pretty-print is complex; render a placeholder for
-            // now.  TODO: port `prettyGoal` for HS-faithful output.
-            "solve(...)".to_string()
+        PM::SolveGoal(g) => {
+            // HS `prettyProofMethod` (ProofMethod.hs:1494):
+            //   SolveGoal goal ->
+            //     keyword_ "solve(" <-> prettyGoal goal <-> keyword_ ")"
+            // `<->` is hsep-with-space → `solve( <goal> )` (one space
+            // after `(` and before `)`).
+            format!("solve( {} )", render_goal(g))
         }
         PM::Invalidated => {
-            "// proof may have been invalidated by editing a reuse lemma above. You should".to_string()
+            // HS `prettyProofMethod` (ProofMethod.hs):
+            //   Invalidated -> lineComment_
+            //     "proof may have been invalidated by editing a reuse lemma above. You should "
+            // Note the trailing space inside the string literal — HS
+            // `lineComment_` renders the verbatim text after `// `.
+            "// proof may have been invalidated by editing a reuse lemma above. You should ".to_string()
         }
     }
 }
 
+/// Render a `Goal` for `solve(...)` output.  Mirrors HS `prettyGoal`
+/// (Constraints.hs:267-282).
+fn render_goal(g: &crate::constraint::constraints::Goal) -> String {
+    use crate::constraint::constraints::Goal;
+    use crate::rule::PremIdx;
+    match g {
+        // `prettyGoal (ActionG i fa) = prettyNAtom (Action (varTerm i) fa)`
+        // which expands (Atom.hs:214-215) to `prettyFact ppT fa <-> opAction <-> text (show v)`.
+        // `<->` is hsep-with-space → `<fact> @ <node-id>`.
+        Goal::Action(i, fa) =>
+            format!("{} @ {}", render_lnfact(fa), render_node_id(i)),
+        // `prettyGoal (ChainG c p) = prettyNodeConc c <-> operator_ "~~>" <-> prettyNodePrem p`
+        Goal::Chain(c, p) =>
+            format!("{} ~~> {}", render_node_conc(c), render_node_prem(p)),
+        // `prettyGoal (PremiseG (i, PremIdx v) fa) =
+        //    prettyLNFact fa <-> text ("▶" ++ subscript (show v)) <-> prettyNodeId i`
+        Goal::Premise((i, PremIdx(v)), fa) =>
+            format!("{} \u{25B6}{} {}",
+                render_lnfact(fa), goal_subscript(*v), render_node_id(i)),
+        // `prettyGoal (SplitG x) = text "splitEqs" <> parens (text $ show (unSplitId x))`
+        // `<>` is `<>` (no space) so it's `splitEqs(<n>)`.
+        Goal::Split(id) => format!("splitEqs({})", id.0),
+        // `prettyGoal (DisjG (Disj [])) = text "Disj" <-> operator_ "(⊥)"`
+        // → `Disj (⊥)` (one space, from `<->`).
+        Goal::Disj(d) if d.0.is_empty() => "Disj (\u{22A5})".to_string(),
+        // `prettyGoal (DisjG (Disj gfs)) =
+        //    fsep $ punctuate (operator_ "  ∥") (map (nest 1 . parens . prettyGuarded) gfs)`
+        // `punctuate` puts the separator AFTER each non-last element,
+        // and `fsep` joins with a space.  Result: each alt wrapped in
+        // parens, joined by `  ∥` (two spaces + ∥) plus the fsep space →
+        // `(<g1>)  ∥ (<g2>)  ∥ (<g3>)`.
+        Goal::Disj(d) => {
+            let parts: Vec<String> = d.0.iter()
+                .map(|c| format!("({})", crate::pretty_formula::pretty_guarded(c)))
+                .collect();
+            parts.join("  \u{2225} ")
+        }
+        // `prettyGoal (SubtermG (l,r)) =
+        //    prettyLNTerm l <-> operator_ "⊏" <-> prettyLNTerm r`
+        Goal::Subterm((l, r)) =>
+            format!("{} \u{228F} {}", render_lnterm(l), render_lnterm(r)),
+    }
+}
+
+/// Render an `LNFact` for goal output.  Mirrors HS `prettyFact`
+/// (Fact.hs:537-544) via `nestShort'` (Class.hs:218-223): in single-line
+/// form the body is sandwiched with spaces — `Name( arg1, arg2 )`.
+/// For arity-0: `Name( )`.  Persistent tags get a `!` prefix via
+/// `showFactTag` (Fact.hs:519-523).
+fn render_lnfact(fa: &crate::fact::LNFact) -> String {
+    use crate::fact::Multiplicity;
+    let prefix = match &fa.tag {
+        crate::fact::FactTag::Proto(Multiplicity::Persistent, _, _) => "!",
+        // HS `factTagMultiplicity` (Fact.hs:340-344): KU/KD are persistent.
+        crate::fact::FactTag::Ku | crate::fact::FactTag::Kd => "!",
+        _ => "",
+    };
+    let name = crate::fact::fact_tag_name(&fa.tag);
+    if fa.terms.is_empty() {
+        format!("{}{}( )", prefix, name)
+    } else {
+        let args: Vec<String> = fa.terms.iter().map(render_lnterm).collect();
+        format!("{}{}( {} )", prefix, name, args.join(", "))
+    }
+}
+
+/// Render a `NodeId` (`LVar` of Node sort).  HS `prettyNodeId`
+/// (LTerm.hs:848-849) is `text . show`, where `Show LVar`
+/// (LTerm.hs:525-532) yields `<sortPrefix><name>` (or `<...>.<idx>`).
+fn render_node_id(nid: &crate::constraint::constraints::NodeId) -> String {
+    render_lvar(nid)
+}
+
+/// Render a `NodeConc`.  Mirrors HS `prettyNodeConc`
+/// (Constraints.hs:250-251): `parens (prettyNodeId v <> comma <-> int i)`.
+/// `<>` joins with no space; `<->` adds a space — `(#i, 0)`.
+fn render_node_conc(c: &crate::constraint::constraints::NodeConc) -> String {
+    format!("({}, {})", render_node_id(&c.0), (c.1).0)
+}
+
+/// Render a `NodePrem`.  Mirrors HS `prettyNodePrem`
+/// (Constraints.hs:254-255): same layout as `prettyNodeConc`.
+fn render_node_prem(p: &crate::constraint::constraints::NodePrem) -> String {
+    format!("({}, {})", render_node_id(&p.0), (p.1).0)
+}
+
+/// Unicode-subscript digits for a non-negative integer.  Mirrors HS
+/// `subscript` used by `prettyGoal (PremiseG …)` in Constraints.hs:273.
+fn goal_subscript(n: usize) -> String {
+    n.to_string().chars().map(|c| match c {
+        '0' => '\u{2080}', '1' => '\u{2081}', '2' => '\u{2082}',
+        '3' => '\u{2083}', '4' => '\u{2084}', '5' => '\u{2085}',
+        '6' => '\u{2086}', '7' => '\u{2087}', '8' => '\u{2088}',
+        '9' => '\u{2089}', _ => c,
+    }).collect()
+}
+
 fn pp_contradiction(c: &crate::constraint::solver::contradictions::Contradiction) -> String {
     use crate::constraint::solver::contradictions::Contradiction as C;
+    // HS `prettyContradiction` (Contradictions.hs:493-511).
     match c {
         C::Cyclic => "cyclic".to_string(),
-        C::SubtermCyclic => "subterm cyclic".to_string(),
+        // HS: `SubtermCyclic -> text "contradictory subterm store"`
+        C::SubtermCyclic => "contradictory subterm store".to_string(),
         C::IncompatibleEqs => "incompatible equalities".to_string(),
-        C::FormulasFalse => "from formulas".to_string(),
-        C::SuperfluousLearn(_, _) => "non-normal terms".to_string(),
         C::NonNormalTerms => "non-normal terms".to_string(),
-        C::ForbiddenExp => "non-normal terms".to_string(),
-        C::ForbiddenBP => "non-normal terms".to_string(),
-        C::ForbiddenKD => "intruder knows constructed message".to_string(),
+        // HS: `ForbiddenExp -> text "non-normal exponentiation rule instance"`
+        C::ForbiddenExp => "non-normal exponentiation rule instance".to_string(),
+        // HS: `ForbiddenBP -> text "non-normal bilinear pairing rule instance"`
+        C::ForbiddenBP => "non-normal bilinear pairing rule instance".to_string(),
+        // HS: `ForbiddenKD -> text "forbidden KD-fact"`
+        C::ForbiddenKD => "forbidden KD-fact".to_string(),
         C::ForbiddenChain => "forbidden chain".to_string(),
         C::ImpossibleChain => "impossible chain".to_string(),
-        C::NonInjectiveFactInstance(_, _, _) =>
-            "non-injective fact instance".to_string(),
-        C::NodeAfterLast(_, _) => "node after last".to_string(),
+        // HS: `NonInjectiveFactInstance cex -> text $ "non-injective facts " ++ show cex`
+        // where `cex :: (NodeId, NodeId, NodeId)`.  HS `Show` for a
+        // tuple yields `(a,b,c)` (no spaces after commas), with each
+        // component rendered by `Show LVar` (LTerm.hs:525-532) — which
+        // is identical to our `render_lvar`.
+        C::NonInjectiveFactInstance(a, b, c) =>
+            format!("non-injective facts ({},{},{})",
+                render_lvar(a), render_lvar(b), render_lvar(c)),
+        C::FormulasFalse => "from formulas".to_string(),
+        // HS: `SuperfluousLearn m v ->
+        //        doubleQuotes (prettyLNTerm m) <->
+        //        text "derived before and after" <->
+        //        doubleQuotes (prettyNodeId v)`
+        // → `"<m>" derived before and after "<v>"`.
+        C::SuperfluousLearn(m, v) =>
+            format!("\"{}\" derived before and after \"{}\"",
+                render_lnterm(m), render_node_id(v)),
+        // HS: `NodeAfterLast (i,j) ->
+        //        text $ "node " ++ show j ++ " after last node " ++ show i`
+        // Note HS reverses the order: `j` first in the message, then `i`.
+        C::NodeAfterLast(i, j) =>
+            format!("node {} after last node {}",
+                render_lvar(j), render_lvar(i)),
     }
 }
 
