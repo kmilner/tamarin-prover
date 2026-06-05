@@ -644,14 +644,65 @@ pub fn lemma_matches(filter: &[String], lemma_name: &str) -> bool {
 /// The version string the binary prints in response to `--version`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Git revision + branch + build timestamp, populated by `build.rs`.
+pub const GIT_REV: &str = env!("TAMARIN_GIT_REV");
+pub const GIT_BRANCH: &str = env!("TAMARIN_GIT_BRANCH");
+pub const BUILD_TIMESTAMP: &str = env!("TAMARIN_BUILD_TIMESTAMP");
+
+/// `--version` output.  Mirrors HS's `Main.Console.versionStr` shape:
+/// banner + license + Maude self-check + `Generated from:` block.
 pub fn version_text() -> String {
+    let maude_version = detect_maude_version();
+    let maude_ok = maude_version.is_some();
+    let mv = maude_version.unwrap_or_else(|| "unknown".to_string());
     format!(
-        "tamarin-prover (Rust port) {}\n\
-         Copyright (C) 2010-2024 the Tamarin developers.\n\
-         This program comes with ABSOLUTELY NO WARRANTY. It is free software,\n\
-         distributed under the terms of GPL v3.\n",
-        VERSION
+        "maude tool: 'maude'\n\
+         \x20checking version: tamarin-prover {VERSION}, (C) David Basin, Cas Cremers, Jannik Dreier, Simon Meier, Ralf Sasse, Benedikt Schmidt, 2010-2023\n\
+         \n\
+         This program comes with ABSOLUTELY NO WARRANTY. It is free software, and you\n\
+         are welcome to redistribute it according to its LICENSE, see\n\
+         'https://github.com/tamarin-prover/tamarin-prover/blob/master/LICENSE'.\n\
+         \n\
+         {mv}. {ok}\n\
+         \x20checking installation: {ok}\n\
+         Generated from:\n\
+         Tamarin version {VERSION}\n\
+         Maude version {mv}\n\
+         Git revision: {GIT_REV}, branch: {GIT_BRANCH}\n\
+         Compiled at: {BUILD_TIMESTAMP}\n",
+        ok = if maude_ok { "OK." } else { "FAILED." },
     )
+}
+
+/// Public alias for `detect_maude_version` — exposed for `run::run_test`
+/// and `run::run_variants` so both subcommands can probe Maude using
+/// the same logic.
+pub fn detect_maude_version_pub() -> Option<String> {
+    detect_maude_version()
+}
+
+/// Probe `maude --version` (or the path from `--with-maude` if we had
+/// args here — but `version_text` runs before arg-routing).  Returns
+/// the version string when Maude is reachable, `None` otherwise.
+fn detect_maude_version() -> Option<String> {
+    // Mirror `default_maude_path()` in run.rs so we probe the same
+    // binary the prover will actually invoke.
+    for c in [
+        "/home/linuxbrew/.linuxbrew/bin/maude",
+        "/usr/local/bin/maude",
+        "/usr/bin/maude",
+        "maude",
+    ] {
+        if let Ok(out) = std::process::Command::new(c).arg("--version").output() {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout);
+                // Maude prints just the version number, e.g. "3.5.1".
+                let v = s.trim().to_string();
+                if !v.is_empty() { return Some(v); }
+            }
+        }
+    }
+    None
 }
 
 pub fn help_text() -> String {

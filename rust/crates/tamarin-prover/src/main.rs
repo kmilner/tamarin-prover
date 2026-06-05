@@ -10,17 +10,19 @@ fn main() -> ExitCode {
     let args = match tamarin_prover::parse_args(&raw) {
         Ok(a) => a,
         Err(e) => {
+            // HS-faithful: rc=1 for usage errors (CmdArgs's default).
             eprintln!("error: {}\n", e);
             eprintln!("{}", tamarin_prover::cli::help_text());
-            return ExitCode::from(2);
+            return ExitCode::from(1);
         }
     };
     match tamarin_prover::run(&args) {
         Ok(0) => ExitCode::SUCCESS,
-        Ok(n) => ExitCode::from(n.try_into().unwrap_or(2)),
+        Ok(n) => ExitCode::from(n.try_into().unwrap_or(1)),
         Err(e) => {
+            // HS-faithful: rc=1 for runtime errors.
             eprintln!("error: {}", e);
-            ExitCode::from(2)
+            ExitCode::from(1)
         }
     }
 }
