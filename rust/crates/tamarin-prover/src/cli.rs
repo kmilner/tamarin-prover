@@ -171,6 +171,16 @@ pub struct Args {
     pub parse_only: bool,
     pub precompute_only: bool,
 
+    /// `--processors=N` — size of the rayon worker pool used for
+    /// HS-faithful internal parallelism (rule-variant closure,
+    /// per-source saturate change-detection, per-item pretty-print).
+    /// `None` = use default (`available_parallelism().min(4)`).
+    /// `Some(1)` = single-threaded, byte-identical to sequential output.
+    /// Mirrors HS's `+RTS -N RTS_FLAG` in spirit — see
+    /// `lib/theory/src/Prover.hs:102,195`, `Theory/Constraint/Solver/Sources.hs:471`,
+    /// `lib/theory/src/TheoryObject.hs:744,752`.
+    pub processors: Option<usize>,
+
     // Output options.
     pub output_file: Option<String>,
     pub output_dir: Option<String>,
@@ -225,6 +235,7 @@ impl Default for Args {
             no_compress: false,
             parse_only: false,
             precompute_only: false,
+            processors: None,
             output_file: None,
             output_dir: None,
             output_module: None,
@@ -380,6 +391,16 @@ pub fn parse_args(raw: &[String]) -> Result<Args, CliError> {
                 "no-compress" => args.no_compress = true,
                 "parse-only" => args.parse_only = true,
                 "precompute-only" => args.precompute_only = true,
+                "processors" => {
+                    let v = take_val(&mut i, raw, val_inline, "processors")?;
+                    let n: usize = parse_int(&v, "processors")?;
+                    if n == 0 {
+                        return Err(CliError::Msg(
+                            "--processors must be >= 1".to_string(),
+                        ));
+                    }
+                    args.processors = Some(n);
+                }
                 // Output flags.
                 "output" => {
                     let v = take_val(&mut i, raw, val_inline, "output")?;
@@ -744,6 +765,9 @@ pub fn help_text() -> String {
     s.push_str("     --quit-on-warning                  Treat wellformedness warnings as fatal.\n");
     s.push_str("     --parse-only                       Just parse + pretty-print.\n");
     s.push_str("     --precompute-only                  Just run precomputation.\n");
+    s.push_str("     --processors=N                     Rayon worker count for internal parallelism.\n");
+    s.push_str("                                        Default: min(available_parallelism(), 4).\n");
+    s.push_str("                                        N=1 → byte-identical to sequential output.\n");
     s.push_str("\n");
     s.push_str("Output:\n");
     s.push_str("  -o --output=FILE                      Write analyzed theory to FILE.\n");

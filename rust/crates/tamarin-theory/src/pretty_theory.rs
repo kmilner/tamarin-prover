@@ -97,12 +97,21 @@ pub fn pretty_closed_theory(
     // Iterate parsed.items, mapping to elaborated entities where needed.
     // HS preserves source order via vsep over `thyItems`.  Each item is
     // separated from the previous block by a blank line.
-    for item in parsed.items.iter() {
-        if let Some(b) = render_parsed_item(item, 0, parsed, elaborated, proved) {
-            out.push('\n');
-            out.push_str(&b);
-            out.push('\n');
-        }
+    //
+    // HS-parallel: `lib/theory/src/TheoryObject.hs:744,752`
+    //   `parMap rdeepseq ppItem (theoryItems thy)` (and `OpenTheory.hs:921,933`).
+    // HS evaluates each item's `Doc` in parallel; the final `vsep`
+    // (sequential concatenation) preserves source order.  We mirror via
+    // rayon `par_iter().collect()` — parallel per-item render, sequential
+    // string append.
+    use rayon::prelude::*;
+    let rendered: Vec<Option<String>> = parsed.items.par_iter()
+        .map(|item| render_parsed_item(item, 0, parsed, elaborated, proved))
+        .collect();
+    for b in rendered.into_iter().flatten() {
+        out.push('\n');
+        out.push_str(&b);
+        out.push('\n');
     }
 
     // Wellformedness block (already preformatted: either the "all

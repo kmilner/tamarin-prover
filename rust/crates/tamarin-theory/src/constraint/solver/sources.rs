@@ -3204,14 +3204,164 @@ pub fn saturate_sources_with_simp_public(
     saturate_sources_with_simp(sources, limit, ctx)
 }
 
+/// Per-source body of `saturate_sources_with_simp_opt`'s inner loop —
+/// extracted so it can run in parallel via rayon (mirroring HS's
+/// `changes \`using\` parList rdeepseq` at Sources.hs:471).
+///
+/// Returns:
+///   - `new_cases` (the source's refined case list, post-restrict+dedup);
+///   - `changed` (HS's `not (null names)` change signal — i.e. did any
+///     case in this source advance via solveAllSafeGoals or get
+///     dropped via contradiction?);
+///   - `new_case_count` (count of surviving cases, == new_cases.len()).
+///
+/// Pure with respect to the caller's mutable state — does not touch
+/// `next`, `changed`, or `current` from the outer loop.  Reads `ctx`
+/// (shared, immutable), `ths_snapshot` (shared, immutable), and other
+/// scalar params.  Maude IPC inside is serialised via the handle's
+/// Mutex; `set_precompute_mode` is `thread_local!` so the per-worker
+/// flag toggle is independent.
+fn refine_one_source(
+    ctx: &crate::constraint::solver::context::ProofContext,
+    src: Source,
+    ths_snapshot: &[Source],
+    branch_cap: usize,
+    aggressive_drop: bool,
+    single_pick: bool,
+    dbg: bool,
+) -> (Vec<(Vec<String>, System)>, bool, usize) {
+    use crate::constraint::solver::contradictions::contradictions;
+    use crate::constraint::solver::reduction::Reduction;
+    let mut new_cases: Vec<(Vec<String>, System)> = Vec::new();
+    let mut changed = false;
+    for (name_list, sys) in src.cases_take_list() {
+        let case_name_for_dbg = case_name_list_to_string(&name_list);
+        if single_pick {
+            // Pre-#160 single-pick fallback.
+            let sys_orig = sys.clone();
+            let mut red = Reduction::new(ctx, sys);
+            set_precompute_mode(true);
+            let mut used: std::collections::BTreeSet<String> = Default::default();
+            let sasg_outcome = solve_all_safe_goals_tracked(
+                &mut red, ths_snapshot, &mut used, 10);
+            set_precompute_mode(false);
+            let after_contras = contradictions(ctx, &red.sys);
+            if !after_contras.is_empty() {
+                use crate::constraint::solver::contradictions::Contradiction;
+                let only_eq_or_subterm = after_contras.iter().all(|c|
+                    matches!(c, Contradiction::IncompatibleEqs
+                              | Contradiction::SubtermCyclic
+                              | Contradiction::NonNormalTerms));
+                let pre_has_contras = !contradictions(ctx, &sys_orig).is_empty();
+                let saturate_branched = sasg_outcome.disj_pick || sasg_outcome.source_pick;
+                let preserve = !aggressive_drop
+                    && only_eq_or_subterm
+                    && !pre_has_contras
+                    && saturate_branched;
+                if preserve {
+                    new_cases.push((name_list, sys_orig));
+                    changed = true;
+                    continue;
+                }
+                changed = true;
+                continue;
+            }
+            new_cases.push((name_list, red.sys));
+            continue;
+        }
+        // === Multi-branch path (default — Haskell-faithful) ===
+        set_precompute_mode(true);
+        // HS uses no iter cap on solveAllSafeGoals.  Rust's
+        // worklist needs a safety bound, but 40 is too low for
+        // deep chain-destruction cases (PRF inside senc inside
+        // pair inside C_2's Out): cases get pushed-as-is at
+        // outer_cap, then re-refined next saturate-outer iter,
+        // and the per-iter contradiction check kills them
+        // before they finish.  500 is enough to let HS's
+        // typical TLS-style chains run to fixpoint within one
+        // saturate-outer iter.  Tunable via
+        // TAM_DISJ_OUTER_CAP.
+        let outer_cap: i64 = std::env::var("TAM_DISJ_OUTER_CAP")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(500);
+        let (branches, branch_took_step) = run_solve_all_safe_goals_disj_with_progress(
+            ctx, sys, ths_snapshot, /*chains_limit*/ 10,
+            outer_cap, branch_cap, name_list);
+        if branch_took_step {
+            // HS-faithful `not (null names)` change signal —
+            // solveAllSafeGoals took at least one step (safe-goal
+            // solve or source-pick) on this case.  Drives outer
+            // saturate re-iteration even when case count doesn't
+            // grow, so multi-iter convergence patterns like
+            // chaum's KU(~x:Fresh)→1-case work.  See
+            // [[project-chaum-case-fresh-divergence]].
+            changed = true;
+        }
+        set_precompute_mode(false);
+        if dbg {
+            eprintln!("  case {:?}: refineSource produced {} branches",
+                case_name_for_dbg, branches.len());
+        }
+        // Haskell `refineSource`:
+        //   map (second (modify sSubst (restrict stableVars)))
+        // restricts each branch's eq-store subst to the
+        // STABLE vars (frees of the source's cdGoal) before
+        // dedup.  This narrows the subst to bindings the
+        // runtime case-matcher cares about; internal fresh
+        // bindings are dropped so equivalent branches dedupe.
+        // Without this, branches differing only in internal
+        // fresh-var bindings stay distinct → case explosion.
+        let mut stable_vars: std::collections::BTreeSet<
+            tamarin_term::lterm::LVar> = std::collections::BTreeSet::new();
+        goal_free_vars(&src.goal, &mut |v| {
+            stable_vars.insert(v.clone());
+        });
+        // Haskell-faithful `removeRedundantCases` (Sources.hs:240):
+        //   if enableBP msig || enableMSet msig then cases else cases0
+        // Outside BP/MSet theories, redundant-case dedup is a no-op —
+        // sibling cases with the same parent rule (e.g. multiple
+        // `A_1` cases under KU(sign(...)) for foo_eligibility) MUST
+        // be preserved so the renderer's `distinguish` can rename
+        // them `A_1_case_1`/`A_1_case_2`.
+        //
+        // The dedup-on-by-default behaviour collapsed those siblings
+        // under canonical-form equality, leaving Haskell-rendered
+        // siblings (A_1) missing from the Rust proof skeleton —
+        // root cause of the 8-lemma case_N cluster (foo/okamoto/
+        // NSLPK3/NSLPK3_untagged/TLS).
+        let msig = ctx.maude.maude_sig();
+        let dedup_enabled = msig.enable_bp || msig.enable_mset;
+        let mut seen: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for (mut branch_sys, branch_name_list) in branches {
+            if aggressive_drop && !contradictions(ctx, &branch_sys).is_empty() {
+                changed = true;
+                continue;
+            }
+            // Apply `restrict stableVars` to the branch's subst.
+            let restricted_pairs: Vec<_> = branch_sys.eq_store.subst.to_list()
+                .into_iter()
+                .filter(|(v, _)| stable_vars.contains(v))
+                .collect();
+            branch_sys.eq_store.subst =
+                tamarin_term::subst::Subst::from_list(restricted_pairs);
+            if dedup_enabled {
+                let key = canonicalise_system_full(&branch_sys);
+                if !seen.insert(key) { continue; }
+            }
+            new_cases.push((branch_name_list, branch_sys));
+        }
+    }
+    let count = new_cases.len();
+    (new_cases, changed, count)
+}
+
 fn saturate_sources_with_simp_opt(
     sources: Vec<Source>,
     limit: usize,
     ctx: &crate::constraint::solver::context::ProofContext,
     aggressive_drop: bool,
 ) -> Vec<Source> {
-    use crate::constraint::solver::contradictions::contradictions;
-    use crate::constraint::solver::reduction::Reduction;
+    use rayon::prelude::*;
     let mut current = sources;
     let dbg = std::env::var("TAM_DBG_REFINE").is_ok();
     if dbg {
@@ -3371,131 +3521,42 @@ fn saturate_sources_with_simp_opt(
         // remain findable via runtime case enumeration.  Toggle off
         // via `TAM_LEGACY_SINGLE_PICK=1` for diagnostic comparisons.
         let single_pick = std::env::var("TAM_LEGACY_SINGLE_PICK").is_ok();
-        for (i, src) in saturated.into_iter().enumerate() {
+        // HS-parallel: `lib/theory/src/Theory/Constraint/Solver/Sources.hs:471`
+        //   `any or (changes \`using\` parList rdeepseq)`
+        // HS evaluates each source's `refineSource` in parallel and
+        // unzips the result into `(changes, ths')`.  We mirror via
+        // rayon `par_iter().map(...).collect()` on the per-source body
+        // — index-preserved by `collect`, so subsequent code sees the
+        // same source ordering as the sequential version.
+        //
+        // Determinism: the per-source body has no shared mutable state.
+        // `set_precompute_mode` is `thread_local!`, so each worker's
+        // flag is independent.  `ctx`, `ths_snapshot`, `branch_cap`,
+        // `aggressive_drop`, `single_pick` are read-only.
+        // `run_solve_all_safe_goals_disj_with_progress` builds its own
+        // Reduction over an owned System, no aliasing.  Maude IPC
+        // serialises via `MaudeHandle::inner` (Arc<Mutex>) — workers
+        // queue but don't race.
+        let saturated_indexed: Vec<(usize, Source)> =
+            saturated.into_iter().enumerate().collect();
+        let per_source: Vec<(Vec<(Vec<String>, System)>, bool, usize)> =
+            saturated_indexed.into_par_iter().map(|(_i, src)| {
+                refine_one_source(
+                    ctx, src, &ths_snapshot, branch_cap,
+                    aggressive_drop, single_pick, dbg,
+                )
+            }).collect();
+        for (i, (new_cases, per_changed, _)) in per_source.into_iter().enumerate() {
+            let src_goal_and_incomplete = current.get(i)
+                .map(|s| (s.goal.clone(), s.incomplete))
+                .expect("saturate per_source index mismatch");
             let prev_case_count = current.get(i).map(|s| s.cases_or_empty_list().len()).unwrap_or(0);
-            let mut new_cases: Vec<(Vec<String>, System)> = Vec::new();
-            for (name_list, sys) in src.cases_take_list() {
-                let case_name_for_dbg = case_name_list_to_string(&name_list);
-                if single_pick {
-                    // Pre-#160 single-pick fallback.
-                    let sys_orig = sys.clone();
-                    let mut red = Reduction::new(ctx, sys);
-                    set_precompute_mode(true);
-                    let mut used: std::collections::BTreeSet<String> = Default::default();
-                    let sasg_outcome = solve_all_safe_goals_tracked(
-                        &mut red, &ths_snapshot, &mut used, 10);
-                    set_precompute_mode(false);
-                    let after_contras = contradictions(ctx, &red.sys);
-                    if !after_contras.is_empty() {
-                        use crate::constraint::solver::contradictions::Contradiction;
-                        let only_eq_or_subterm = after_contras.iter().all(|c|
-                            matches!(c, Contradiction::IncompatibleEqs
-                                      | Contradiction::SubtermCyclic
-                                      | Contradiction::NonNormalTerms));
-                        let pre_has_contras = !contradictions(ctx, &sys_orig).is_empty();
-                        let saturate_branched = sasg_outcome.disj_pick || sasg_outcome.source_pick;
-                        let preserve = !aggressive_drop
-                            && only_eq_or_subterm
-                            && !pre_has_contras
-                            && saturate_branched;
-                        if preserve {
-                            new_cases.push((name_list, sys_orig));
-                            changed = true;
-                            continue;
-                        }
-                        changed = true;
-                        continue;
-                    }
-                    new_cases.push((name_list, red.sys));
-                    continue;
-                }
-                // === Multi-branch path (default — Haskell-faithful) ===
-                set_precompute_mode(true);
-                // HS uses no iter cap on solveAllSafeGoals.  Rust's
-                // worklist needs a safety bound, but 40 is too low for
-                // deep chain-destruction cases (PRF inside senc inside
-                // pair inside C_2's Out): cases get pushed-as-is at
-                // outer_cap, then re-refined next saturate-outer iter,
-                // and the per-iter contradiction check kills them
-                // before they finish.  500 is enough to let HS's
-                // typical TLS-style chains run to fixpoint within one
-                // saturate-outer iter.  Tunable via
-                // TAM_DISJ_OUTER_CAP.
-                let outer_cap: i64 = std::env::var("TAM_DISJ_OUTER_CAP")
-                    .ok().and_then(|s| s.parse().ok()).unwrap_or(500);
-                let (branches, branch_took_step) = run_solve_all_safe_goals_disj_with_progress(
-                    ctx, sys, &ths_snapshot, /*chains_limit*/ 10,
-                    outer_cap, branch_cap, name_list);
-                if branch_took_step {
-                    // HS-faithful `not (null names)` change signal —
-                    // solveAllSafeGoals took at least one step (safe-goal
-                    // solve or source-pick) on this case.  Drives outer
-                    // saturate re-iteration even when case count doesn't
-                    // grow, so multi-iter convergence patterns like
-                    // chaum's KU(~x:Fresh)→1-case work.  See
-                    // [[project-chaum-case-fresh-divergence]].
-                    changed = true;
-                }
-                set_precompute_mode(false);
-                if dbg {
-                    eprintln!("  case {:?}: refineSource produced {} branches",
-                        case_name_for_dbg, branches.len());
-                }
-                // Haskell `refineSource`:
-                //   map (second (modify sSubst (restrict stableVars)))
-                // restricts each branch's eq-store subst to the
-                // STABLE vars (frees of the source's cdGoal) before
-                // dedup.  This narrows the subst to bindings the
-                // runtime case-matcher cares about; internal fresh
-                // bindings are dropped so equivalent branches dedupe.
-                // Without this, branches differing only in internal
-                // fresh-var bindings stay distinct → case explosion.
-                let mut stable_vars: std::collections::BTreeSet<
-                    tamarin_term::lterm::LVar> = std::collections::BTreeSet::new();
-                goal_free_vars(&src.goal, &mut |v| {
-                    stable_vars.insert(v.clone());
-                });
-                // Haskell-faithful `removeRedundantCases` (Sources.hs:240):
-                //   if enableBP msig || enableMSet msig then cases else cases0
-                // Outside BP/MSet theories, redundant-case dedup is a no-op —
-                // sibling cases with the same parent rule (e.g. multiple
-                // `A_1` cases under KU(sign(...)) for foo_eligibility) MUST
-                // be preserved so the renderer's `distinguish` can rename
-                // them `A_1_case_1`/`A_1_case_2`.
-                //
-                // The dedup-on-by-default behaviour collapsed those siblings
-                // under canonical-form equality, leaving Haskell-rendered
-                // siblings (A_1) missing from the Rust proof skeleton —
-                // root cause of the 8-lemma case_N cluster (foo/okamoto/
-                // NSLPK3/NSLPK3_untagged/TLS).
-                let msig = ctx.maude.maude_sig();
-                let dedup_enabled = msig.enable_bp || msig.enable_mset;
-                let mut seen: std::collections::BTreeSet<String> =
-                    std::collections::BTreeSet::new();
-                for (mut branch_sys, branch_name_list) in branches {
-                    if aggressive_drop && !contradictions(ctx, &branch_sys).is_empty() {
-                        changed = true;
-                        continue;
-                    }
-                    // Apply `restrict stableVars` to the branch's subst.
-                    let restricted_pairs: Vec<_> = branch_sys.eq_store.subst.to_list()
-                        .into_iter()
-                        .filter(|(v, _)| stable_vars.contains(v))
-                        .collect();
-                    branch_sys.eq_store.subst =
-                        tamarin_term::subst::Subst::from_list(restricted_pairs);
-                    if dedup_enabled {
-                        let key = canonicalise_system_full(&branch_sys);
-                        if !seen.insert(key) { continue; }
-                    }
-                    new_cases.push((branch_name_list, branch_sys));
-                }
-            }
+            if per_changed { changed = true; }
             // Determine if the case count changed for this source.
             let new_case_count = new_cases.len();
             if dbg {
                 eprintln!("[refine] source goal={:?} -> {} output cases:",
-                    src.goal, new_case_count);
+                    src_goal_and_incomplete.0, new_case_count);
                 let mut name_counts: std::collections::BTreeMap<String, usize>
                     = std::collections::BTreeMap::new();
                 for (n, _) in &new_cases {
@@ -3564,7 +3625,7 @@ fn saturate_sources_with_simp_opt(
                 }
             }
             if !new_cases.is_empty() {
-                next.push(Source::eager_list(src.goal, new_cases, src.incomplete));
+                next.push(Source::eager_list(src_goal_and_incomplete.0, new_cases, src_goal_and_incomplete.1));
             } else {
                 changed = true;
             }
