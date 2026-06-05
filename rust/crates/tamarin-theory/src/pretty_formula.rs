@@ -47,6 +47,19 @@ pub fn pretty_guarded(g: &Guarded) -> String {
     s
 }
 
+/// Pretty-print a guarded formula with HS-style `sep`/`nest`-driven
+/// line wrapping.  `indent` is the column where the first character of
+/// the formula will land in the final output; `width` is the target
+/// line width.  Mirrors Haskell's `prettyGuarded` (Guarded.hs:822-864)
+/// composed with the HughesPJ `sep`/`nest` layout semantics.
+///
+/// When the flat rendering fits within `width - indent`, returns that.
+/// Otherwise decomposes at the top-level operator following HS's
+/// `sep [quantifier, sep [dante, connective, dsucc]]` layout.
+pub fn pretty_guarded_wrapped(g: &Guarded, indent: usize, width: usize) -> String {
+    pp_guarded_inner_wrapped(g, false, indent, width, &[])
+}
+
 /// Pretty-print an atom standalone (e.g. inside a goal label).
 pub fn pretty_atom(a: &p::Atom) -> String {
     let mut s = String::new();
@@ -175,11 +188,14 @@ fn is_atomic_formula(f: &p::Formula) -> bool {
 // first render flat; if it fits in `(width - indent)`, keep flat;
 // otherwise recursively lay out across lines.
 
-/// Width threshold used for wrapping.  HS's `defaultStyle` has
-/// `lineLength = 100` and `ribbonsPerLine = 1.5`, giving an effective
-/// ribbon width of ~67.  We use 76 to match the typical observed wrap
-/// point across the corpus.
-pub const WRAP_WIDTH: usize = 76;
+/// Width threshold used for wrapping.  HS's `Main/Console.hs:236`
+/// sets `lineWidth = 110`, and `defaultStyle` has `ribbonsPerLine =
+/// 1.5`, giving an effective ribbon width of `floor(110/1.5) = 73`.
+/// HughesPJ's `sep` lays out flat iff `content_length <= ribbon`.  Our
+/// check uses `indent + chars().count() <= WRAP_WIDTH`; setting
+/// `WRAP_WIDTH = 73` reproduces HS's wrap decisions across Tutorial
+/// guarded blocks and surface lemma formulas.
+pub const WRAP_WIDTH: usize = 73;
 
 fn pp_formula_wrap(
     f: &p::Formula,
@@ -247,21 +263,29 @@ fn pp_binop_wrap(
     // HS: `sep [opParens p <-> op, opParens q]`.  Lay out the left
     // operand, then ` op` (when one-line) or `\n<indent>op<sp>` then
     // the right operand at the same indent.
-    let l_str = pp_formula_wrap(l, indent, width, scope, true);
-    let r_indent = indent;
-    let r_str = pp_formula_wrap(r, r_indent, width, scope, true);
+    //
+    // When the binop itself is wrapped in `(...)` (the caller's
+    // `opParens` / `outer_op=true`), the operands sit INSIDE the
+    // parens — their effective column is `indent + 1`.  This is the
+    // `sep` col for the inner punctuated list (matches HS's
+    // `parens (sep ...)` layout: `(` at col `indent`, items at col
+    // `indent+1`).
+    let sep_col = if outer_op { indent + 1 } else { indent };
+    let l_str = pp_formula_wrap(l, sep_col, width, scope, true);
+    let r_str = pp_formula_wrap(r, sep_col, width, scope, true);
     // If `l op r` (one line) fits, use it.
     let one_line = format!("{} {} {}", l_str, op, r_str);
-    let mut needs_paren = outer_op;
-    if indent + one_line.chars().count() <= width && !l_str.contains('\n') && !r_str.contains('\n') {
-        return if needs_paren { format!("({})", one_line) } else { one_line };
+    if indent + one_line.chars().count() <= width
+        && !l_str.contains('\n')
+        && !r_str.contains('\n')
+    {
+        return if outer_op { format!("({})", one_line) } else { one_line };
     }
-    // Multi-line: `<l_str> op\n<indent><r_str>` — l carries the op on
-    // its last line, then a newline + indent + r.
-    let pad = " ".repeat(r_indent);
-    needs_paren = outer_op;
+    // Multi-line: `<l_str> op\n<sep_col><r_str>` — l carries the op on
+    // its last line, then a newline + sep_col padding + r.
+    let pad = " ".repeat(sep_col);
     let body = format!("{} {}\n{}{}", l_str, op, pad, r_str);
-    if needs_paren {
+    if outer_op {
         // HS wraps the parenthesised group as `(<body>)` — keep on
         // the same multi-line shape; the closing paren attaches to the
         // last line of body.
@@ -531,15 +555,31 @@ fn pp_guarded_inner(
         Guarded::Disj(xs) if xs.is_empty() => out.push('\u{22A5}'), // ⊥
         Guarded::Conj(xs) if xs.is_empty() => out.push('\u{22A4}'), // ⊤
         Guarded::Disj(xs) => {
+            // HS Guarded.hs:833-835 — `parens $ sep $ punctuate ∨ ps`.
+            // The outer `parens` ALWAYS wraps (independent of the
+            // caller's `opParens`; the GDisj self-parenthesises).  A
+            // caller's `opParens` would double-wrap, but HS's
+            // `opParens . pp` for a GDisj also double-wraps — that's
+            // HS's behaviour.  Reproduce it by always emitting `(...)`
+            // here and letting the caller add its own `(...)` when
+            // `paren_atomic`.
             if paren_atomic { out.push('('); }
+            out.push('(');
             for (i, x) in xs.iter().enumerate() {
                 if i > 0 { out.push_str(" \u{2228} "); } // ∨
                 pp_guarded_inner(x, true, scope, out);
             }
+            out.push(')');
             if paren_atomic { out.push(')'); }
         }
         Guarded::Conj(xs) => {
-            let needs = paren_atomic && xs.len() > 1;
+            // HS Guarded.hs:840-842 — `sep $ punctuate ∧ ps` (no outer
+            // `parens` inside Conj itself).  When the caller applies
+            // `opParens` (the `paren_atomic=true` path), wrap in `(...)`.
+            // Single-conjunct degenerate case: `sep [opParens c]` = `(c)`,
+            // so an outer opParens would produce `((c))` — that's HS's
+            // literal behaviour; we match it for faithfulness.
+            let needs = paren_atomic;
             if needs { out.push('('); }
             for (i, x) in xs.iter().enumerate() {
                 if i > 0 { out.push_str(" \u{2227} "); } // ∧
@@ -601,10 +641,244 @@ fn pp_guarded_inner(
                 // renders as `∃ vs. (guards)` (Guarded.hs:854-855).
                 if !(matches!(qua, Quant::Ex) && body_is_true(body)) {
                     out.push_str(connective);
-                    pp_guarded_inner(body, true, &new_scope, out);
+                    // HS Guarded.hs:858-860: `dsucc <- nest 1 <$> pp gf`
+                    // — the body is rendered BARE (no `opParens`); only
+                    // the body's own pp may emit parens (e.g. GDisj
+                    // self-wraps).  paren_atomic=false here.
+                    pp_guarded_inner(body, false, &new_scope, out);
                 }
             }
             if paren_atomic { out.push(')'); }
+        }
+    }
+}
+
+// =============================================================================
+// HS-style wrapped layout for Guarded
+// =============================================================================
+//
+// Port of `prettyGuarded` (Guarded.hs:822-864) composed with HughesPJ's
+// `sep` / `nest` semantics.  Same flat-then-wrap strategy as
+// `pp_formula_wrap`: render flat first, and if it overflows the ribbon
+// width, decompose at the top-level operator.
+
+/// Wrap-aware variant of `pp_guarded_inner`.  `indent` is the column
+/// where the first character of the result will land in the final
+/// output; `width` is the target line width.
+fn pp_guarded_inner_wrapped(
+    g: &Guarded,
+    paren_atomic: bool,
+    indent: usize,
+    width: usize,
+    scope: &[Vec<crate::guarded::GBinding>],
+) -> String {
+    // Flat first.
+    let flat = {
+        let mut s = String::new();
+        pp_guarded_inner(g, paren_atomic, scope, &mut s);
+        s
+    };
+    if indent + flat.chars().count() <= width {
+        return flat;
+    }
+    use crate::guarded::GBinding;
+    match g {
+        Guarded::Atom(_) => flat,
+        Guarded::Disj(xs) if xs.is_empty() => flat,
+        Guarded::Conj(xs) if xs.is_empty() => flat,
+
+        Guarded::Disj(xs) => {
+            // HS Guarded.hs:833-835: `parens . sep . punctuate ∨ [opParens c]`.
+            // The Disj ALWAYS wraps itself in `(...)`.  When the caller
+            // additionally requested `opParens` (paren_atomic=true),
+            // there is an OUTER `(...)`.  Layout:
+            //   <outer_paren?>(<c0> ∨
+            //                  <c1> ∨
+            //                  ...
+            //                  <cn>)<outer_paren?>
+            // sep_col = indent + 1 (inside the inner `(`) when no
+            //           outer wrap, or indent + 2 when paren_atomic.
+            let outer = paren_atomic;
+            let inner_paren_col = if outer { indent + 1 } else { indent };
+            let sep_col = inner_paren_col + 1;
+            let mut out = String::new();
+            if outer { out.push('('); }
+            out.push('(');
+            for (i, x) in xs.iter().enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                    out.push_str(&" ".repeat(sep_col));
+                }
+                // Each child is opParens'd (paren_atomic=true).
+                let child = pp_guarded_inner_wrapped(x, true, sep_col, width, scope);
+                out.push_str(&child);
+                if i + 1 < xs.len() {
+                    out.push_str(" \u{2228}"); // ∨ at end of each but last
+                }
+            }
+            out.push(')');
+            if outer { out.push(')'); }
+            out
+        }
+
+        Guarded::Conj(xs) => {
+            // HS Guarded.hs:840-842: `sep . punctuate ∧ [opParens c]`.
+            // No self-wrap; caller's `opParens` (paren_atomic=true) adds
+            // the outer `(...)`.  Layout:
+            //   <paren?><c0> ∧
+            //           <c1> ∧
+            //           ...
+            //           <cn><paren?>
+            // sep_col = indent (no outer) or indent + 1 (outer).
+            let outer = paren_atomic;
+            let sep_col = if outer { indent + 1 } else { indent };
+            let mut out = String::new();
+            if outer { out.push('('); }
+            for (i, x) in xs.iter().enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                    out.push_str(&" ".repeat(sep_col));
+                }
+                let child = pp_guarded_inner_wrapped(x, true, sep_col, width, scope);
+                out.push_str(&child);
+                if i + 1 < xs.len() {
+                    out.push_str(" \u{2227}"); // ∧
+                }
+            }
+            if outer { out.push(')'); }
+            out
+        }
+
+        Guarded::GGuarded { qua, vars, guards, body } => {
+            let mut new_scope: Vec<Vec<GBinding>> = scope.to_vec();
+            new_scope.push(vars.clone());
+
+            // Negation shortcut (HS Guarded.hs:856-857).  Flat only.
+            if matches!(qua, Quant::All)
+                && vars.is_empty()
+                && body_is_false(body)
+            {
+                return flat;
+            }
+            // `∃ vs. (guards)` shortcut (HS Guarded.hs:854-855).
+            // Try flat (the only sensible layout); if the guards
+            // themselves are long, fall through to the generic path.
+            if matches!(qua, Quant::Ex) && body_is_true(body) {
+                return flat;
+            }
+            // Generic GGuarded: `sep [quantifier, sep [dante, conn, dsucc]]`.
+            // Outer sep col = indent (or indent+1 if paren_atomic).
+            // Inner sep col = same as outer sep col (because the inner
+            // sep lands at the outer sep's col when the outer wraps).
+            // With nest 1 on dante and dsucc:
+            //   dante at sep_col + 1
+            //   connective at sep_col
+            //   dsucc at sep_col + 1
+            let outer = paren_atomic;
+            let sep_col = if outer { indent + 1 } else { indent };
+            let body_col = sep_col + 1;
+
+            // Quantifier line.
+            let mut quantifier = String::new();
+            quantifier.push(match qua {
+                Quant::All => '\u{2200}',
+                Quant::Ex => '\u{2203}',
+            });
+            quantifier.push(' ');
+            pp_binding_list(vars, &mut quantifier);
+            quantifier.push_str(".");
+
+            // dante (antecedent): renders as `pp (GConj antecedent)` =
+            // `sep [opParens (pp g) | g <- antecedent]`.  Each guard
+            // becomes `(<atom>)`.  Try flat, then wrap if too long.
+            let dante_flat = if guards.is_empty() {
+                // `pp (GConj []) = ⊤` — but HS line 853-855 special-cases
+                // `(Ex, _, GConj [])` and (negation).  For other cases
+                // with empty antecedent, dante = `⊤` rendered.  In
+                // practice the generic path is only entered with at
+                // least one guard.  Defensive: render `⊤`.
+                "\u{22A4}".to_string()
+            } else {
+                let mut s = String::new();
+                for (i, gd) in guards.iter().enumerate() {
+                    if i > 0 { s.push_str(" \u{2227} "); }
+                    s.push('(');
+                    pp_gatom(gd, &new_scope, &mut s);
+                    s.push(')');
+                }
+                s
+            };
+            let dante_fits_flat = body_col + dante_flat.chars().count() <= width;
+            let dante_str = if dante_fits_flat || guards.len() <= 1 {
+                dante_flat
+            } else {
+                // Wrap dante across multiple lines.  `sep $ punctuate ∧
+                // [(g) for g in guards]` — placed at body_col.
+                let mut s = String::new();
+                for (i, gd) in guards.iter().enumerate() {
+                    if i > 0 {
+                        s.push('\n');
+                        s.push_str(&" ".repeat(body_col));
+                    }
+                    s.push('(');
+                    pp_gatom(gd, &new_scope, &mut s);
+                    s.push(')');
+                    if i + 1 < guards.len() {
+                        s.push_str(" \u{2227}");
+                    }
+                }
+                s
+            };
+
+            let connective = match qua {
+                Quant::All => "\u{21D2}", // ⇒
+                Quant::Ex => "\u{2227}",  // ∧
+            };
+
+            // dsucc (body): rendered BARE (no opParens), per
+            // Guarded.hs:858-860.  At body_col with width-budget.
+            let dsucc_str = pp_guarded_inner_wrapped(body, false, body_col, width, &new_scope);
+
+            // Try the inner sep flat at sep_col: `<dante> conn <dsucc>`
+            // on one line.  But we only reach here because the OUTER
+            // flat failed.  Re-try the inner flat (dante + conn + dsucc)
+            // at sep_col without the quantifier — if it fits, scheme 2:
+            //   <quantifier>
+            //   <sep_col><dante> <conn> <dsucc>
+            let inner_flat_one_line =
+                !dante_str.contains('\n')
+                && !dsucc_str.contains('\n')
+                && sep_col
+                    + dante_str.chars().count()
+                    + 1 + connective.chars().count() + 1
+                    + dsucc_str.chars().count()
+                    <= width;
+
+            let mut out = String::new();
+            if outer { out.push('('); }
+            out.push_str(&quantifier);
+            out.push('\n');
+            if inner_flat_one_line {
+                // Scheme 2: quantifier on its own line; inner sep flat.
+                out.push_str(&" ".repeat(sep_col));
+                out.push_str(&dante_str);
+                out.push(' ');
+                out.push_str(connective);
+                out.push(' ');
+                out.push_str(&dsucc_str);
+            } else {
+                // Scheme 3: full vertical inner sep.
+                out.push_str(&" ".repeat(body_col));
+                out.push_str(&dante_str);
+                out.push('\n');
+                out.push_str(&" ".repeat(sep_col));
+                out.push_str(connective);
+                out.push('\n');
+                out.push_str(&" ".repeat(body_col));
+                out.push_str(&dsucc_str);
+            }
+            if outer { out.push(')'); }
+            out
         }
     }
 }

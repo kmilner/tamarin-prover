@@ -695,10 +695,16 @@ fn render_guarded_block(lem: &p::Lemma) -> String {
     };
     // For all-traces lemmas, HS prints the negated guarded formula
     // (`gnot gf`).  The result is the "counter-example" form.
-    let gtext = match &lem.trace_quantifier {
-        p::TraceQuantifier::ExistsTrace => pf::pretty_guarded(&gf),
-        p::TraceQuantifier::AllTraces => pf::pretty_guarded(&crate::guarded::gnot(&gf)),
+    //
+    // The guarded block is rendered inside `multiComment` at col 0 with
+    // the formula wrapped in `doubleQuotes` — so the formula's first
+    // char sits at col 1 (right after the `"`).  We pass indent=1 so
+    // the sep/nest wrap-points align with HS output (Lemma.hs:131-141).
+    let to_render = match &lem.trace_quantifier {
+        p::TraceQuantifier::ExistsTrace => gf,
+        p::TraceQuantifier::AllTraces => crate::guarded::gnot(&gf),
     };
+    let gtext = pf::pretty_guarded_wrapped(&to_render, 1, pf::WRAP_WIDTH);
     format!("/*\n{}\n\"{}\"\n*/", header, gtext)
 }
 
