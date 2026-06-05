@@ -25,3 +25,4 @@ tamarin-accountability = { workspace = true }
 tamarin-export = { workspace = true }
 tamarin-server = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+mimalloc = { version = "0.1", default-features = false }
