@@ -2,6 +2,9 @@
 //!
 //! Usage: `cargo run --example dump_proof -- <theory.spthy> <lemma>`
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use tamarin_parser::parse_theory;
 use tamarin_theory::elaborate::elaborate;
 use tamarin_theory::prove::prove_lemma;
