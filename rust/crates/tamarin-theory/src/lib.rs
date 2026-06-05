@@ -33,6 +33,7 @@ pub mod pretty_system;
 pub mod restriction;
 pub mod rule;
 pub mod constraint;
+pub mod deriv_check;
 pub mod elaborate;
 pub mod guarded;
 pub mod guarded_types;
