@@ -930,6 +930,8 @@ impl MaudeHandle {
         if eqs.is_empty() {
             return Ok(vec![Vec::new()]);
         }
+        let prof = std::env::var_os("TAM_PROFILE_MAUDE_BREAKDOWN").is_some();
+        let t0 = if prof { Some(std::time::Instant::now()) } else { None };
         // Empty-result cache.  Profiling showed 100 % of calls on
         // AC-heavy lemmas (e.g. csf17/keylessssl::injectivity) return
         // empty, with many repeats across fixpoint passes.  Cache the
@@ -942,6 +944,7 @@ impl MaudeHandle {
             _tally_callsite("match_eqs_const_subject::CACHE_HIT");
             return Ok(Vec::new());
         }
+        let t_after_cache = if prof { Some(std::time::Instant::now()) } else { None };
         // Skolemize subject-side free vars not in `pattern_vars`:
         // walk each rhs LNTerm and replace such LVars with a public
         // `Name`-constant tagged with a deterministic synthetic
@@ -1023,6 +1026,7 @@ impl MaudeHandle {
             lhs: eq.lhs.clone(),
             rhs: rewrite_subject(&eq.rhs, &skolem_map),
         }).collect();
+        let t_after_skolem = if prof { Some(std::time::Instant::now()) } else { None };
 
         let mut inner = self.inner.lock().unwrap();
         let mut ctx = ConvCtx::new();
@@ -1042,7 +1046,9 @@ impl MaudeHandle {
         cmd.extend_from_slice(b" <=? ");
         cmd.extend(pp_list(&t1s));
         cmd.extend_from_slice(b" .\n");
+        let t_before_exec = if prof { Some(std::time::Instant::now()) } else { None };
         let reply = inner.execute(&cmd)?;
+        let t_after_exec = if prof { Some(std::time::Instant::now()) } else { None };
         inner.stats.match_count += 1;
         let sig = inner.sig.clone();
         drop(inner);
@@ -1065,6 +1071,16 @@ impl MaudeHandle {
                 .map(|(lv, lt)| (lv, unskolemize(&lt, &reverse)))
                 .collect();
             out.push(unskolemized);
+        }
+        if let (Some(a), Some(b), Some(c), Some(d), Some(e)) =
+            (t0, t_after_cache, t_after_skolem, t_before_exec, t_after_exec) {
+            let cache = (b - a).as_micros();
+            let skol = (c - b).as_micros();
+            let prep = (d - c).as_micros();
+            let exec = (e - d).as_micros();
+            let parse = std::time::Instant::now().duration_since(e).as_micros();
+            eprintln!("[mecs] cache={}us skol={}us prep={}us exec={}us parse={}us",
+                cache, skol, prep, exec, parse);
         }
         Ok(out)
     }
