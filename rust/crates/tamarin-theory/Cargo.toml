@@ -11,8 +11,8 @@ description = "Theory representation for the Tamarin prover (Rust port)."
 tamarin-utils = { workspace = true }
 tamarin-term = { workspace = true }
 tamarin-parser = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 walkdir = "2"
-rayon = "1"
 mimalloc = { version = "0.1", default-features = false }

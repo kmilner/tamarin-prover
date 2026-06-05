@@ -259,6 +259,8 @@ fn run_interactive(args: &Args) -> Result<i32, RunError> {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
 
+    init_rayon_pool(args);
+
     // Haskell defaults: 3001 on 127.0.0.1.
     let port = args.port.unwrap_or(DEFAULT_INTERACTIVE_PORT);
 
@@ -363,6 +365,16 @@ fn guess_frontend_dist(data_dir: &std::path::Path) -> Option<std::path::PathBuf>
 }
 
 fn run_batch(args: &Args) -> Result<i32, RunError> {
+    // HS-faithful internal parallelism via rayon.  Mirrors the four
+    // `using parList`/`parTraversable`/`parMap` sites HS uses (see
+    // `lib/theory/src/Prover.hs:102,195`, `Theory/Constraint/Solver/Sources.hs:471`,
+    // `lib/theory/src/TheoryObject.hs:744,752`).  Default: cap at 4
+    // workers — RS's per-thread Maude IPC mutex limits speedup, and
+    // larger pools have caused OOM in corpus sweeps (see MEMORY.md
+    // discipline note).  `--processors=1` falls back to a 1-thread
+    // pool, guaranteeing byte-identical output to the pre-parallel
+    // sequential path.
+    init_rayon_pool(args);
     if args.diff {
         return Err(RunError(
             "--diff (observational equivalence) is not yet ported to the Rust prover."
@@ -436,14 +448,34 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         }
     }
 
+    // TAM_DBG_RUN_TIMING=1 prints a per-phase wall-clock breakdown of
+    // run_batch to stderr.  Diagnostic-only — leave behind an env gate so
+    // it can be reused next time the prover-binary overhead is suspect.
+    let dbg_timing = std::env::var("TAM_DBG_RUN_TIMING")
+        .ok()
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
     for in_file in &args.in_files {
         let t0 = Instant::now();
+        let mut t_phase = Instant::now();
+        macro_rules! phase {
+            ($name:expr) => {
+                if dbg_timing {
+                    eprintln!("[TAM_DBG_RUN_TIMING] {:>26}: {:>8.1} ms",
+                              $name, t_phase.elapsed().as_secs_f64() * 1000.0);
+                    t_phase = Instant::now();
+                }
+            };
+        }
         let src = fs::read_to_string(in_file).map_err(|e| {
             RunError(format!("failed to read {}: {}", in_file, e))
         })?;
+        phase!("read_to_string");
         let parsed = tamarin_parser::parse_theory(&src, &parser_flags).map_err(|e| {
             RunError(format!("parse error in {}: {}", in_file, e))
         })?;
+        phase!("parse_theory");
         // HS emits this trace marker as soon as the theory parses
         // (TheoryLoader.hs:409).  `--parse-only` and `--quiet` skip it.
         let theory_name = parsed.name.clone();
@@ -483,6 +515,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         let mut elaborated = elaborate(&parsed).map_err(|e| {
             RunError(format!("elaboration error in {}: {}", in_file, e.message))
         })?;
+        phase!("elaborate");
         let maude_sig = elaborated.signature.maude_sig.clone();
         // HS emits this marker after `translateTheory` finishes
         // (TheoryLoader.hs:454).
@@ -502,6 +535,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         } else {
             None
         };
+        phase!("spawn maude");
 
         // Populate variant_substs + abstracted_rule for each protocol
         // rule whose RHS contains reducible-headed sub-terms.  Without
@@ -513,6 +547,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         if let Some(m) = file_maude.as_ref() {
             populate_rule_variants(&mut elaborated, m);
         }
+        phase!("populate_rule_variants");
 
         // Dynamic Message Derivation Checks (mirrors HS
         // `checkVariableDeducability`, gated by `--derivcheck-timeout`,
@@ -536,6 +571,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 eprintln!("[Theory {}] Derivation checks ended", theory_name);
             }
         }
+        phase!("derivation_checks");
 
         // Decide which lemmas to prove. Without --prove/--prove-all,
         // we never start the solver; output is just the source.
@@ -610,6 +646,11 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 // ...` set above.  Stay quiet here for HS-faithful stderr.
                 let lt = Instant::now();
                 let outcome = prove_lemma(&parsed, &lemma_name, maude.clone(), budget);
+                if dbg_timing {
+                    eprintln!("[TAM_DBG_RUN_TIMING] {:>26}: {:>8.1} ms  (lemma={})",
+                              "prove_lemma", lt.elapsed().as_secs_f64() * 1000.0,
+                              lemma_name);
+                }
                 let (verdict, proof_steps, proof_body) = match outcome {
                     Ok(root) => {
                         let steps = count_proof_steps(&root);
@@ -666,6 +707,10 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 }
             }
         }
+        // Reset the phase clock so "Theory closed" + pretty-print +
+        // emit_output are measured fresh (the prove loop reports its own
+        // per-lemma timings above).
+        t_phase = Instant::now();
 
         // HS emits this marker after `closeTheory` finishes
         // (TheoryLoader.hs:596).
@@ -695,7 +740,9 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             &wf_block,
             &build_info,
         );
+        phase!("pretty_closed_theory");
         emit_output(args, in_file, &body, None)?;
+        phase!("emit_output");
 
         file_results.push(FileResult {
             in_file: in_file.clone(),
@@ -771,21 +818,82 @@ fn format_wf_block(report: &[tamarin_parser::wf::WfError]) -> String {
 /// `closeTheory`.  Rules with no reducible-headed sub-terms (the common
 /// case for `pair/fst/snd` signatures) get an empty variants list,
 /// which the pretty-printer treats as "trivial AC variant".
+///
+/// HS-parallel: `lib/theory/src/Prover.hs:195`
+///   `(closeTheoryItem <$> L.get thyItems thy0) \`using\` parList rdeepseq`
+/// HS evaluates the per-item `closeTheoryItem` (which calls
+/// `variantsProtoRule`) in parallel via `parList rdeepseq`, preserving
+/// list order.  We mirror via rayon: each item is processed in its own
+/// task, results re-assembled in source order.
+///
+/// Determinism: `abstract_rule_and_variants` allocates fresh vars via
+/// `MaudeHandle::with_fresh_counter_from(avoid_max)` (per-call counter),
+/// so concurrent calls don't share counter state.  Maude IPC is
+/// serialised inside `MaudeHandle::inner` (Arc<Mutex>) — workers
+/// queue on Maude but don't corrupt it.
 fn populate_rule_variants(elaborated: &mut tamarin_theory::theory::Theory,
                           maude: &MaudeHandle) {
+    use rayon::prelude::*;
     use tamarin_theory::theory::TheoryItem;
-    for item in elaborated.items.iter_mut() {
+
+    // HS-faithful: skip variant computation if the signature has
+    // NO reducible function symbols — there's nothing to narrow.
+    // Compute once (signature is read-only here) rather than in the
+    // inner loop.
+    if maude.maude_sig().reducible_fun_syms.is_empty() { return; }
+
+    // Index → (abstracted_rule, variant_substs) for rules that have
+    // any.  Computed in parallel; the BTreeMap/Vec collect preserves
+    // source order via the keyed structure.
+    let outs: Vec<Option<(tamarin_theory::rule::ProtoRuleE, Vec<tamarin_term::subst_vfresh::LNSubstVFresh>)>> =
+        elaborated.items.par_iter().map(|item| {
+            let TheoryItem::Rule(opr) = item else { return None; };
+            match tamarin_theory::tools::rule_variants::abstract_rule_and_variants(maude, &opr.rule) {
+                Ok(Some(pair)) => Some(pair),
+                _ => None,
+            }
+        }).collect();
+
+    // Sequential writeback in source order — matches HS's
+    // `parList rdeepseq` semantics (parallel evaluation, sequential
+    // list materialisation).
+    for (item, out) in elaborated.items.iter_mut().zip(outs.into_iter()) {
         let TheoryItem::Rule(opr) = item else { continue };
-        // HS-faithful: skip variant computation if the signature has
-        // NO reducible function symbols — there's nothing to narrow.
-        if maude.maude_sig().reducible_fun_syms.is_empty() { continue; }
-        if let Ok(Some((abstr, substs))) =
-            tamarin_theory::tools::rule_variants::abstract_rule_and_variants(maude, &opr.rule)
-        {
+        if let Some((abstr, substs)) = out {
             opr.abstracted_rule = Some(abstr);
             opr.variant_substs = substs;
         }
     }
+}
+
+/// Install rayon's global worker pool to the size requested via
+/// `--processors=N` (or a sensible default).
+///
+/// HS-equivalent: GHC's `+RTS -N RTS_FLAG` sets the worker capacity for
+/// the `par*`/`Strategies` sites HS uses.  We mirror that surface via a
+/// CLI flag.  Idempotent across files in a batch — `build_global`
+/// silently errors on the second call, which is what we want.
+///
+/// Default: `min(available_parallelism(), 4)`.  The cap of 4 matches
+/// MEMORY.md's "JOBS<=6" discipline note — RS's Maude IPC mutex means
+/// larger pools yield diminishing returns and have caused OOM in
+/// corpus sweeps.
+fn init_rayon_pool(args: &Args) {
+    let n = match args.processors {
+        Some(n) => n,
+        None => std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .min(4),
+    };
+    // `build_global` is idempotent-error: the SECOND call returns Err
+    // even if N matches.  We swallow the error: the first invocation
+    // wins (which is the desired behaviour — RS runs `run_batch` once
+    // per process, and tests install their own pool).
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .thread_name(|i| format!("tamarin-rayon-{}", i))
+        .build_global();
 }
 
 fn default_maude_path() -> String {

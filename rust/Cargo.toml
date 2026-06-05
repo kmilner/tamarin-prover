@@ -33,6 +33,7 @@ sha2 = "0.10"
 base64 = "0.22"
 indexmap = "2"
 proptest = "1"
+rayon = "1"
 
 # Optimized release profile.  `lto = "fat"` enables cross-crate
 # inlining (FunSym match arms in the term crate inlined into hot
