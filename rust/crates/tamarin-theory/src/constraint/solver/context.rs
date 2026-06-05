@@ -14,7 +14,7 @@
 //! and the rules. As more solver components land we'll grow the
 //! context to match.
 
-use tamarin_term::maude_proc::MaudeHandle;
+use tamarin_term::maude_proc::{MaudeHandle, MaudePool};
 
 use crate::rule::IntrRuleAC;
 use crate::theory::OpenProtoRule;
@@ -23,6 +23,19 @@ use crate::theory::OpenProtoRule;
 #[derive(Debug)]
 pub struct ProofContext {
     pub maude: MaudeHandle,
+    /// Optional pool of additional Maude subprocesses used at rayon
+    /// parallel sites (rule-variant closure, saturate refinement) to
+    /// avoid serialising every worker on the single `maude`'s internal
+    /// IPC mutex.  `None` means "use the single `maude` only" (the
+    /// original behaviour; byte-identical to `--processors=1`).
+    ///
+    /// HS uses a single Maude per ClosedTheory; this pool is a
+    /// Rust-specific implementation improvement that doesn't change
+    /// semantics — workers acquire a pool member at task start and
+    /// reads/writes its own subprocess for the task's duration.  Each
+    /// pool member's `with_fresh_counter_from(avoid_max)` still gives
+    /// HS-faithful per-call witness allocation.
+    pub maude_pool: Option<std::sync::Arc<MaudePool>>,
     /// All protocol rules in scope, including their AC variants.
     pub rules: Vec<OpenProtoRule>,
     /// Special intruder rules — `Coerce`, `PubConstr`, `FreshConstr`,
@@ -116,6 +129,7 @@ impl Clone for ProofContext {
         let state = *self.saturate_state.lock().unwrap();
         ProofContext {
             maude: self.maude.clone(),
+            maude_pool: self.maude_pool.clone(),
             rules: self.rules.clone(),
             intruder_rules: self.intruder_rules.clone(),
             unique_sources: self.unique_sources.clone(),
@@ -140,6 +154,27 @@ pub enum UseInduction { UseInduction, AvoidInduction }
 impl ProofContext {
     pub fn new(maude: MaudeHandle, rules: Vec<OpenProtoRule>) -> Self {
         Self::new_with_restrictions(maude, rules, Vec::new())
+    }
+
+    /// Cheap-ish clone with `maude` replaced.  Used at the rayon
+    /// parallel sites where each worker wants its own subprocess
+    /// (acquired from `maude_pool`) for the duration of one task,
+    /// so workers don't serialise on a single Maude's IPC mutex.
+    ///
+    /// Most fields are `Arc`-of-Vec-friendly already (`MaudeHandle`,
+    /// `Source`'s lazy cell, etc.), so the deep clone is cheap in
+    /// practice; the heavy `Vec`s (rules, full_sources) are O(n) but
+    /// only happen once per parallel task, not once per Maude call.
+    ///
+    /// The new context drops `maude_pool` (set to None) — a worker
+    /// holding a pooled handle should NOT recursively borrow more
+    /// pool members from inside the same task; doing so could
+    /// deadlock if the pool is smaller than the rayon worker count.
+    pub fn with_swapped_maude(&self, maude: MaudeHandle) -> Self {
+        let mut c = self.clone();
+        c.maude = maude;
+        c.maude_pool = None;
+        c
     }
 
     /// HS-faithful lazy `saturateSources` (Sources.hs:373).  Runs at
@@ -295,6 +330,25 @@ impl ProofContext {
     /// Responder case for `KU(senc(...))` in Pattern_matching.
     pub fn new_with_restrictions(
         maude: MaudeHandle,
+        rules: Vec<OpenProtoRule>,
+        restrictions: Vec<crate::guarded::Guarded>,
+    ) -> Self {
+        Self::new_with_restrictions_and_pool(maude, None, rules, restrictions)
+    }
+
+    /// Like [`new_with_restrictions`] but also installs a
+    /// `MaudePool` on the constructed context so the precompute /
+    /// saturate phase (which happens INSIDE this constructor via
+    /// `precompute_full_sources`) can dispatch work across the pool
+    /// rather than serialising on the single shared Maude.
+    ///
+    /// Callers without a pool should keep calling
+    /// `new_with_restrictions` — the precompute will use the single
+    /// `maude` for every parallel task, which is correct (just
+    /// contended).
+    pub fn new_with_restrictions_and_pool(
+        maude: MaudeHandle,
+        maude_pool: Option<std::sync::Arc<MaudePool>>,
         mut rules: Vec<OpenProtoRule>,
         restrictions: Vec<crate::guarded::Guarded>,
     ) -> Self {
@@ -614,6 +668,7 @@ impl ProofContext {
         }
         let mut ctx = ProofContext {
             maude,
+            maude_pool,
             rules,
             intruder_rules,
             unique_sources: Vec::new(),
