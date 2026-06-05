@@ -290,7 +290,30 @@ pub fn abstract_rule_and_variants(
         for t in &rule.new_vars { t.for_each_free(&mut |v| visit(v)); }
         m.get()
     };
-    maude.ensure_above(avoid_max);
+    // HS-faithful: `convertRule \`evalFreshTAvoiding\` ru`
+    // (RuleVariants.hs:78) runs the variant computation in a Fresh monad
+    // whose counter starts at `max(ru.idxs)+1` PER RULE.  Without this,
+    // RS's global Maude counter keeps climbing across rules, so the
+    // variant value vars (allocated via the Maude back-conversion's
+    // `evalFreshAvoiding`) end up at much higher idxs than HS's — that's
+    // the +12 offset between RS (~ltkS.19/20/21) and HS (~ltkS.7/8/9)
+    // for Tutorial.spthy's Serv_1.
+    //
+    // `with_fresh_counter_from` clones the handle keeping the underlying
+    // Maude PROCESS shared but with a fresh PER-CALL counter — exactly
+    // HS's evalFreshTAvoiding semantics.
+    //
+    // `TAM_RS_DISABLE_VARIANT_LOCAL_FRESH=1` reverts to the global
+    // counter for diagnosis.
+    let use_local_fresh = std::env::var("TAM_RS_DISABLE_VARIANT_LOCAL_FRESH").is_err();
+    let local_maude_owned;
+    let maude: &MaudeHandle = if use_local_fresh {
+        local_maude_owned = maude.with_fresh_counter_from(avoid_max);
+        &local_maude_owned
+    } else {
+        maude.ensure_above(avoid_max);
+        maude
+    };
 
     fn sort_of_term(t: &LNTerm) -> tamarin_term::lterm::LSort {
         use tamarin_term::vterm::Lit;
