@@ -480,7 +480,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         }
 
         // Elaborate (mainly to get the protocol-specific MaudeSig).
-        let elaborated = elaborate(&parsed).map_err(|e| {
+        let mut elaborated = elaborate(&parsed).map_err(|e| {
             RunError(format!("elaboration error in {}: {}", in_file, e.message))
         })?;
         let maude_sig = elaborated.signature.maude_sig.clone();
@@ -488,6 +488,30 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         // (TheoryLoader.hs:454).
         if !args.quiet && !args.parse_only {
             eprintln!("[Theory {}] Theory translated", theory_name);
+        }
+
+        // Spawn a single Maude handle for this file.  Used by:
+        //   - the rule-variants computation that populates each rule's
+        //     `variant_substs` + `abstracted_rule` (so the pretty-printer
+        //     can emit HS's `variants (modulo AC) ...` block);
+        //   - the dynamic Message Derivation Check;
+        //   - the per-lemma prove loop.
+        let maude_path = args.maude_path.clone().unwrap_or_else(default_maude_path);
+        let file_maude: Option<MaudeHandle> = if !args.parse_only {
+            MaudeHandle::start(&maude_path, maude_sig.clone()).ok()
+        } else {
+            None
+        };
+
+        // Populate variant_substs + abstracted_rule for each protocol
+        // rule whose RHS contains reducible-headed sub-terms.  Without
+        // this the pretty-printer always emits `/* has exactly the
+        // trivial AC variant */` even when the signature carries
+        // destructors (e.g. `aenc/adec`).  HS-faithful: matches
+        // `closeTheoryWithMaude`'s variant pre-computation
+        // (ClosedTheory.hs `closeTheory`).
+        if let Some(m) = file_maude.as_ref() {
+            populate_rule_variants(&mut elaborated, m);
         }
 
         // Dynamic Message Derivation Checks (mirrors HS
@@ -502,13 +526,9 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             if !args.quiet && !args.parse_only {
                 eprintln!("[Theory {}] Derivation checks started", theory_name);
             }
-            let deriv_maude = tamarin_term::maude_proc::MaudeHandle::start(
-                &args.maude_path.clone().unwrap_or_else(default_maude_path),
-                maude_sig.clone(),
-            );
-            if let Ok(m) = deriv_maude {
+            if let Some(m) = file_maude.as_ref() {
                 let extra = tamarin_theory::deriv_check::check_message_derivation(
-                    &parsed, &m, deriv_timeout,
+                    &parsed, m, deriv_timeout,
                 );
                 wf_report.extend(extra);
             }
@@ -553,14 +573,13 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 });
             }
         } else {
-            // Spin up a Maude bridge per file.  The `maude tool: ...`
+            // Reuse the per-file maude handle.  The `maude tool: ...`
             // banner is printed once at the top of the batch run (see
             // above), matching HS.
-            let maude_path = args.maude_path.clone().unwrap_or_else(default_maude_path);
-            let maude = MaudeHandle::start(&maude_path, maude_sig).map_err(|e| {
+            let maude = file_maude.clone().ok_or_else(|| {
                 RunError(format!(
-                    "failed to start maude at {:?}: {:?}",
-                    maude_path, e
+                    "failed to start maude at {:?}",
+                    maude_path,
                 ))
             })?;
 
@@ -744,6 +763,29 @@ fn format_wf_block(report: &[tamarin_parser::wf::WfError]) -> String {
     while out.ends_with("\n\n") { out.pop(); }
     out.push_str("*/");
     out
+}
+
+/// Compute and store `variant_substs` + `abstracted_rule` on every
+/// `OpenProtoRule` whose RHS contains reducible-headed sub-terms.
+/// Mirrors HS's `variantsProtoRule` pre-computation performed during
+/// `closeTheory`.  Rules with no reducible-headed sub-terms (the common
+/// case for `pair/fst/snd` signatures) get an empty variants list,
+/// which the pretty-printer treats as "trivial AC variant".
+fn populate_rule_variants(elaborated: &mut tamarin_theory::theory::Theory,
+                          maude: &MaudeHandle) {
+    use tamarin_theory::theory::TheoryItem;
+    for item in elaborated.items.iter_mut() {
+        let TheoryItem::Rule(opr) = item else { continue };
+        // HS-faithful: skip variant computation if the signature has
+        // NO reducible function symbols — there's nothing to narrow.
+        if maude.maude_sig().reducible_fun_syms.is_empty() { continue; }
+        if let Ok(Some((abstr, substs))) =
+            tamarin_theory::tools::rule_variants::abstract_rule_and_variants(maude, &opr.rule)
+        {
+            opr.abstracted_rule = Some(abstr);
+            opr.variant_substs = substs;
+        }
+    }
 }
 
 fn default_maude_path() -> String {
