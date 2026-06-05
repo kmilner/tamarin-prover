@@ -15,6 +15,9 @@
 //! The harness skips silently when `tamarin-prover` isn't on `PATH`,
 //! so the test stays fast in environments without the binary.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

@@ -1,6 +1,9 @@
 //! Maude IO profiler - prints stats + per-callsite breakdown.
 //! Set TAM_PROFILE_MAUDE=1 to enable callsite tallying.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::time::Instant;
 use tamarin_parser::parse_theory;
 use tamarin_theory::elaborate::elaborate;
