@@ -2945,29 +2945,73 @@ fn premise_solving_rule_insts_with_constrs(
 /// shifted to `idx 1`) collide with the lemma's existential `A:Msg
 /// idx 1`, identifying them by structural equality and conflating
 /// downstream substitutions across what should be distinct variables.
+// `bounds_max`'s previous implementation walked the system using the
+// `HasFrees::for_each_free` trait method, which is declared with
+// `&mut dyn FnMut(&LVar)` — every node of every term takes a vtable
+// dispatch hit (~8.5% of CPU on the wireguard `--prove` profile).
+// `bounds_max` is also called recursively from many sites
+// (`Reduction::new`, `insert_goal_with_loop_flag`'s auto-decompose
+// loop, `solve_chain_goal`, etc.), magnifying the cost.
+//
+// This implementation uses specialised, statically-dispatched walkers
+// for the system's concrete types (`LVar` / `LNTerm` / `LNFact` /
+// `RuleACInst` / `Goal`).  The compiler inlines the recursion and
+// folds the per-node "is this idx larger than current max?" into a
+// register operation.  Semantically equivalent to the previous
+// HasFrees-based code.
+#[inline(always)]
+fn bm_term(t: &tamarin_term::lterm::LNTerm, max: &mut u64) {
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    match t {
+        Term::Lit(Lit::Var(v)) => {
+            if v.idx > *max { *max = v.idx; }
+        }
+        Term::Lit(Lit::Con(_)) => {}
+        Term::App(_, args) => {
+            for a in args.iter() {
+                bm_term(a, max);
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn bm_fact(fa: &crate::fact::LNFact, max: &mut u64) {
+    for t in &fa.terms {
+        bm_term(t, max);
+    }
+}
+
+#[inline(always)]
+fn bm_lvar(v: &tamarin_term::lterm::LVar, max: &mut u64) {
+    if v.idx > *max { *max = v.idx; }
+}
+
+#[inline(always)]
+fn bm_rule(r: &crate::rule::RuleACInst, max: &mut u64) {
+    for f in &r.premises  { bm_fact(f, max); }
+    for f in &r.conclusions { bm_fact(f, max); }
+    for f in &r.actions    { bm_fact(f, max); }
+    for t in &r.new_vars   { bm_term(t, max); }
+}
+
 pub fn bounds_max(sys: &System) -> u64 {
-    use std::cell::Cell;
-    use tamarin_term::lterm::HasFrees;
-    let max = Cell::new(0u64);
-    let visit = |v: &tamarin_term::lterm::LVar| {
-        let cur = max.get();
-        if v.idx > cur { max.set(v.idx); }
-    };
-    let mut do_visit = |v: &tamarin_term::lterm::LVar| visit(v);
+    let mut max = 0u64;
     for (id, rule) in &sys.nodes {
-        id.for_each_free(&mut do_visit);
-        rule.for_each_free(&mut do_visit);
+        bm_lvar(id, &mut max);
+        bm_rule(rule, &mut max);
     }
     for e in &sys.edges {
-        e.src.0.for_each_free(&mut do_visit);
-        e.tgt.0.for_each_free(&mut do_visit);
+        bm_lvar(&e.src.0, &mut max);
+        bm_lvar(&e.tgt.0, &mut max);
     }
     for l in &sys.less_atoms {
-        l.smaller.for_each_free(&mut do_visit);
-        l.larger.for_each_free(&mut do_visit);
+        bm_lvar(&l.smaller, &mut max);
+        bm_lvar(&l.larger,  &mut max);
     }
     if let Some(la) = &sys.last_atom {
-        la.for_each_free(&mut do_visit);
+        bm_lvar(la, &mut max);
     }
     // HS-faithful: `HasFrees System` folds field `e` = `_sSubtermStore`
     // (System.hs:1834-1847), and `HasFrees SubtermStore` (SubtermStore.hs:
@@ -2980,31 +3024,31 @@ pub fn bounds_max(sys: &System) -> u64 {
     // witness colliding with a subterm-store var that HS's `avoid`
     // reserves above.
     for c in &sys.subterm_store.subterms {
-        c.small.for_each_free(&mut do_visit);
-        c.big.for_each_free(&mut do_visit);
+        bm_term(&c.small, &mut max);
+        bm_term(&c.big,   &mut max);
     }
     for c in &sys.subterm_store.solved_subterms {
-        c.small.for_each_free(&mut do_visit);
-        c.big.for_each_free(&mut do_visit);
+        bm_term(&c.small, &mut max);
+        bm_term(&c.big,   &mut max);
     }
     for (g, _) in &sys.goals {
         use crate::constraint::constraints::Goal;
         match g {
             Goal::Action(i, fa) => {
-                i.for_each_free(&mut do_visit);
-                fa.for_each_free(&mut do_visit);
+                bm_lvar(i, &mut max);
+                bm_fact(fa, &mut max);
             }
             Goal::Premise(p, fa) => {
-                p.0.for_each_free(&mut do_visit);
-                fa.for_each_free(&mut do_visit);
+                bm_lvar(&p.0, &mut max);
+                bm_fact(fa, &mut max);
             }
             Goal::Chain(c, p) => {
-                c.0.for_each_free(&mut do_visit);
-                p.0.for_each_free(&mut do_visit);
+                bm_lvar(&c.0, &mut max);
+                bm_lvar(&p.0, &mut max);
             }
             Goal::Subterm((s, t)) => {
-                s.for_each_free(&mut do_visit);
-                t.for_each_free(&mut do_visit);
+                bm_term(s, &mut max);
+                bm_term(t, &mut max);
             }
             Goal::Disj(_) | Goal::Split(_) => {}
         }
@@ -3014,11 +3058,11 @@ pub fn bounds_max(sys: &System) -> u64 {
         .chain(sys.lemmas.iter())
     {
         let n = crate::guarded::max_var_idx(f);
-        if n > max.get() { max.set(n); }
+        if n > max { max = n; }
     }
     for (v, t) in sys.eq_store.subst.to_list() {
-        if v.idx > max.get() { max.set(v.idx); }
-        t.for_each_free(&mut do_visit);
+        if v.idx > max { max = v.idx; }
+        bm_term(&t, &mut max);
     }
     // Walk eq_store.conj (disjunctive substitutions).  HS-faithful:
     // `avoid sys = freshAvoiding (frees sys)`, and `frees` over the variant
@@ -3034,12 +3078,12 @@ pub fn bounds_max(sys: &System) -> u64 {
     for d in &sys.eq_store.conj {
         for s in &d.substs {
             for (v, _t) in s.to_list() {
-                if v.idx > max.get() { max.set(v.idx); }
+                if v.idx > max { max = v.idx; }
                 // Range vars NOT counted (HS-faithful: foldFrees over keys).
             }
         }
     }
-    max.get()
+    max
 }
 
 /// Fresh-rename a `RuleACInst` so its free variables don't collide
