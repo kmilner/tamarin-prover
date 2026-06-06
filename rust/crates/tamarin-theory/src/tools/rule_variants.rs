@@ -548,9 +548,30 @@ pub fn abstract_rule_and_variants(
             for t in &premise_terms_for_filter {
                 t.for_each_free(&mut |v| { frees.insert(v.clone()); });
             }
+            // HS-faithful: `freshToFreeAvoidingFast sFresh (frees premiseTerms)`
+            // (RuleVariants.hs:169) runs `rename` inside `evalFreshAvoiding
+            // (frees premiseTerms)` — a LOCAL Fresh scope seeded at
+            // `succ (max idx in frees premiseTerms)`.  Witnesses minted by
+            // this filter do NOT advance the outer (per-rule) MonadFresh
+            // counter (RuleVariants.hs:78 `convertRule \`evalFreshTAvoiding\` ru`)
+            // because `evalFreshAvoiding` nests its OWN Fresh state.
+            //
+            // RS previously used `maude.fresh_idx()` per variant, which
+            // advances the per-rule Maude counter by one per filter call.
+            // For Handshake_Resp's 133 raw variants, that pushed the per-rule
+            // counter from 27 (post-abstrTerm) to 160 BEFORE the simp pipeline
+            // even started.  That high counter then propagated into every
+            // downstream avoid_max computation: variant subst range vars
+            // ended up at idxs ~2255 (RS) instead of ~393 (HS).
+            //
+            // Mirror HS by seeding LOCALLY from `frees premiseTerms` and
+            // advancing only a local `counter`.  Maude's global counter
+            // stays untouched by this filter.
+            let frees_max: u64 = frees.iter().map(|v| v.idx).max().unwrap_or(0);
+            let filter_base: u64 = frees_max.saturating_add(1);
             raw_substs.into_iter().filter(|pairs| {
                 let s_fresh = LNSubstVFresh::from_list(pairs.clone());
-                let mut counter = maude.fresh_idx();
+                let mut counter = filter_base;
                 let subst = s_fresh.fresh_to_free_avoiding(
                     |n| { let b = counter; counter += n; b },
                     &frees,
