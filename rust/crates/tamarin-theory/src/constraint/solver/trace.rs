@@ -115,6 +115,23 @@ pub fn case_path_string() -> String {
     })
 }
 
+/// Snapshot the current case-path stack — used by parallel `expand`
+/// to seed worker threads with the parent thread's proof-tree path so
+/// trace output remains coherent across thread boundaries.
+pub fn case_path_snapshot() -> Vec<String> {
+    CASE_PATH.with(|p| p.borrow().clone())
+}
+
+/// Overwrite this thread's case-path stack — used at the start of each
+/// rayon worker task to seed it with the parent's snapshot.
+pub fn case_path_set(path: &[String]) {
+    CASE_PATH.with(|p| {
+        let mut v = p.borrow_mut();
+        v.clear();
+        v.extend_from_slice(path);
+    });
+}
+
 /// TAM_RS_TRACE_FORM=1 emits `[FORMULA_ADD] path=... kind=... <repr>` lines
 /// for each formula insertion into sys.formulas / sys.goals.  Pairs with
 /// HS's `TAM_HS_TRACE_FORM` for finding insertion divergences.
