@@ -897,9 +897,13 @@ fn corpus_proof_skeleton_match_probe() {
         // (tamarin_theory::macro_expand).
         if src.contains("predicates:") { return None; }
         if src.contains("process:") { return None; }
-        if src.contains("builtins:") &&
-           (src.contains("xor") || src.contains("bilinear-pairing"))
-        { return None; }
+        // XOR and bilinear-pairing builtins are SUPPORTED (we parse them,
+        // we have `AcSym::Xor` + cached `mk_dh/mk_bp_intruder_variants`,
+        // we elaborate `xor_maude_sig` / `bp_maude_sig`).  Earlier the
+        // probe excluded them as a TODO; that's stale now.  Removed so
+        // regressions in XOR/BP-using theories are caught — observed
+        // NSLPK3xor proof-shape divergence (RS 36/38 steps vs HS 11/13)
+        // which had been silently uncaught for the whole campaign.
 
         let theory = tamarin_parser::parse_theory(&src, &[]).ok()?;
         let out_path = format!("/tmp/proof_skel_corpus_{}_{}.spthy", pid, idx);
