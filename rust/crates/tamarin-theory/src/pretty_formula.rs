@@ -28,15 +28,36 @@ pub fn pretty_formula(f: &p::Formula) -> String {
 
 /// Pretty-print a formula with HS-style `sep`/`nest`-driven line
 /// wrapping.  `indent` is the column where the first character of the
-/// formula will land in the final output; `width` is the target line
-/// width (76 to match HS `defaultStyle`).
+/// formula will land in the final output; `width` is the (legacy)
+/// target line width.
 ///
-/// When the flat rendering fits within `width - indent`, returns that.
-/// Otherwise decomposes at the top-level operator, recursively laying
-/// out each operand with an indent appropriate to HS's `sep + nest`
-/// scheme (Formula.hs:486-502; Lemma.hs:117-127).
+/// HS's `Text.PrettyPrint.HughesPJ` decides "does flat fit on this
+/// line" via `fits ((w `min` r) - sl) p` (HughesPJ.hs:873), where
+///   - `w = lineLength` (Main/Console.hs:236, `lineWidth = 110`),
+///   - `r = ribbonLength = round(lineLength / ribbonsPerLine) = 73`
+///     (HughesPJ.hs:1010, `defaultStyle.ribbonsPerLine = 1.5`,
+///     HughesPJ.hs:940),
+///   - `sl` = chars already laid down on the current output line.
+/// I.e. a doc of flat length N fits at current column C on a line that
+/// began at column L iff `C + N <= min(lineLength, L + ribbon)`.
+///
+/// This function threads `line_start` (= L) through recursive calls so
+/// the fit budget matches HS's behavior on every line.  Top-level entry
+/// assumes `line_start = 0` (formula begins on a fresh output line).
 pub fn pretty_formula_wrapped(f: &p::Formula, indent: usize, width: usize) -> String {
-    pp_formula_wrap(f, indent, width, &[], false)
+    // Top-level callers do not yet pass line_start; assume the formula
+    // begins on a fresh output line (line_start = 0).  This is correct
+    // for the lemma-body call (formula at col 3 on a line that opens
+    // with `  "`, i.e. starts at col 0).
+    pp_formula_wrap(
+        f,
+        indent,
+        /*line_start=*/0,
+        /*eff_w=*/LINE_LENGTH,
+        width,
+        &[],
+        false,
+    )
 }
 
 /// Pretty-print a guarded formula.  Mirrors Haskell's
@@ -57,7 +78,9 @@ pub fn pretty_guarded(g: &Guarded) -> String {
 /// Otherwise decomposes at the top-level operator following HS's
 /// `sep [quantifier, sep [dante, connective, dsucc]]` layout.
 pub fn pretty_guarded_wrapped(g: &Guarded, indent: usize, width: usize) -> String {
-    pp_guarded_inner_wrapped(g, false, indent, width, &[])
+    // Top-level call: assume the formula begins on a fresh output
+    // line (line_start = 0).
+    pp_guarded_inner_wrapped(g, false, indent, /*line_start=*/0, width, &[])
 }
 
 /// Pretty-print an atom standalone (e.g. inside a goal label).
@@ -188,18 +211,45 @@ fn is_atomic_formula(f: &p::Formula) -> bool {
 // first render flat; if it fits in `(width - indent)`, keep flat;
 // otherwise recursively lay out across lines.
 
-/// Width threshold used for wrapping.  HS's `Main/Console.hs:236`
-/// sets `lineWidth = 110`, and `defaultStyle` has `ribbonsPerLine =
-/// 1.5`, giving an effective ribbon width of `floor(110/1.5) = 73`.
-/// HughesPJ's `sep` lays out flat iff `content_length <= ribbon`.  Our
-/// check uses `indent + chars().count() <= WRAP_WIDTH`; setting
-/// `WRAP_WIDTH = 73` reproduces HS's wrap decisions across Tutorial
-/// guarded blocks and surface lemma formulas.
-pub const WRAP_WIDTH: usize = 73;
+/// HS ribbon width.  HS sets `lineWidth = 110` (`Main/Console.hs:236`)
+/// and `defaultStyle.ribbonsPerLine = 1.5` (`HughesPJ.hs:940`), giving
+/// `ribbonLen = round(110/1.5) = 73` (`HughesPJ.hs:1010`).
+pub const RIBBON: usize = 73;
+
+/// HS hard page width.  Mirrors `lineWidth = 110`
+/// (`Main/Console.hs:236`).
+pub const LINE_LENGTH: usize = 110;
+
+/// Legacy alias kept for callers that pass a `width` argument; equal
+/// to `RIBBON` (HS ribbon).  The actual fit-decision now uses
+/// `fits_flat` (`line_start + RIBBON`-capped at `LINE_LENGTH`), not
+/// this constant.
+pub const WRAP_WIDTH: usize = RIBBON;
+
+/// HS-faithful fit check.  Returns `true` iff a flat doc of length
+/// `flat_len` whose first char would land at column `start_col`, on a
+/// line that began at column `line_start`, with effective remaining
+/// lineLength budget `eff_w`, would fit per HS HughesPJ
+/// `fits ((w `min` r) - sl) p` (HughesPJ.hs:873).
+///
+/// HS's check: `sl + flat_len <= min(w, r)`, where
+///   - `sl = start_col - line_start` (chars before the doc on the
+///     current line, in the `get1` TextBeside chain),
+///   - `w = eff_w` (HS's `w` at this point in the doc walk),
+///   - `r = RIBBON`.
+///
+/// Equivalently: `end_col <= line_start + min(eff_w, RIBBON)`.
+fn fits_flat(line_start: usize, start_col: usize, flat_len: usize, eff_w: usize) -> bool {
+    let end_col = start_col + flat_len;
+    let cap = line_start + std::cmp::min(eff_w, RIBBON);
+    end_col <= cap
+}
 
 fn pp_formula_wrap(
     f: &p::Formula,
     indent: usize,
+    line_start: usize,
+    eff_w: usize,
     width: usize,
     scope: &[(String, p::SortHint)],
     inner_op: bool,
@@ -210,7 +260,7 @@ fn pp_formula_wrap(
         else { pp_formula(f, FormCtx::Top, scope, &mut s); }
         s
     };
-    if indent + flat.chars().count() <= width {
+    if !flat.contains('\n') && fits_flat(line_start, indent, flat.chars().count(), eff_w) {
         return flat;
     }
     use p::Formula::*;
@@ -228,7 +278,10 @@ fn pp_formula_wrap(
             let new_scope = extend_scope(scope, vs);
             let quant_col = if inner_op { indent + 1 } else { indent };
             let body_indent = quant_col + 1;
-            let body_str = pp_formula_wrap(body, body_indent, width, &new_scope, false);
+            // Body lands on a fresh line at body_indent; its line_start
+            // is body_indent.  eff_w passes through — RIBBON dominates
+            // the budget.
+            let body_str = pp_formula_wrap(body, body_indent, body_indent, eff_w, width, &new_scope, false);
             let mut out = head;
             out.push('\n');
             out.push_str(&" ".repeat(body_indent));
@@ -237,10 +290,10 @@ fn pp_formula_wrap(
         }
         // Conn op p q: try `(p) op (q)` one line, else
         // `<p_layout> op\n<indent> <q_layout>`.
-        And(l, r) => pp_binop_wrap(l, r, "\u{2227}", indent, width, scope, inner_op),
-        Or(l, r) => pp_binop_wrap(l, r, "\u{2228}", indent, width, scope, inner_op),
-        Implies(l, r) => pp_binop_wrap(l, r, "\u{21D2}", indent, width, scope, inner_op),
-        Iff(l, r) => pp_binop_wrap(l, r, "\u{21D4}", indent, width, scope, inner_op),
+        And(l, r) => pp_binop_wrap(l, r, "\u{2227}", indent, line_start, eff_w, width, scope, inner_op),
+        Or(l, r) => pp_binop_wrap(l, r, "\u{2228}", indent, line_start, eff_w, width, scope, inner_op),
+        Implies(l, r) => pp_binop_wrap(l, r, "\u{21D2}", indent, line_start, eff_w, width, scope, inner_op),
+        Iff(l, r) => pp_binop_wrap(l, r, "\u{21D4}", indent, line_start, eff_w, width, scope, inner_op),
         // Not p: HS Formula.hs:481-483
         //   pp (Not p) = return $ operator_ "¬" <> opParens p'
         // The `¬` and `opParens p'` are joined via `<>` (horizontal,
@@ -256,7 +309,9 @@ fn pp_formula_wrap(
             // outer parens, `(` is at `indent` and `¬` shifts to
             // `indent+1`.
             let neg_col = if inner_op { indent + 1 } else { indent };
-            let inner = pp_formula_wrap(p_, neg_col + 1, width, scope, true);
+            // Inner lands on the SAME line as the `¬` — line_start and
+            // eff_w pass through unchanged.
+            let inner = pp_formula_wrap(p_, neg_col + 1, line_start, eff_w, width, scope, true);
             let body = format!("\u{00AC}{}", inner);
             if inner_op { format!("({})", body) } else { body }
         }
@@ -270,6 +325,8 @@ fn pp_binop_wrap(
     r: &p::Formula,
     op: &str,
     indent: usize,
+    line_start: usize,
+    eff_w: usize,
     width: usize,
     scope: &[(String, p::SortHint)],
     outer_op: bool,
@@ -285,13 +342,22 @@ fn pp_binop_wrap(
     // `parens (sep ...)` layout: `(` at col `indent`, items at col
     // `indent+1`).
     let sep_col = if outer_op { indent + 1 } else { indent };
-    let l_str = pp_formula_wrap(l, sep_col, width, scope, true);
-    let r_str = pp_formula_wrap(r, sep_col, width, scope, true);
-    // If `l op r` (one line) fits, use it.
+    // l lands on the SAME line as the caller's content (the `(` of
+    // opParens, when outer_op, lands at `indent` on the caller's line).
+    // So l's `line_start` is the caller's `line_start`, and eff_w
+    // passes through.
+    let l_str = pp_formula_wrap(l, sep_col, line_start, eff_w, width, scope, true);
+    // r lands on a fresh line at `sep_col` when the binop wraps; its
+    // line_start is `sep_col`.  When the binop stays flat, r is on the
+    // same line as l (line_start unchanged) — but in the flat case the
+    // r_str isn't read until after we've already verified flat fits.
+    let r_str = pp_formula_wrap(r, sep_col, sep_col, eff_w, width, scope, true);
+    // If `l op r` (one line) fits, use it.  HS-faithful: total end
+    // column from the line's start must satisfy `fits_flat`.
     let one_line = format!("{} {} {}", l_str, op, r_str);
-    if indent + one_line.chars().count() <= width
-        && !l_str.contains('\n')
+    if !l_str.contains('\n')
         && !r_str.contains('\n')
+        && fits_flat(line_start, indent, one_line.chars().count(), eff_w)
     {
         return if outer_op { format!("({})", one_line) } else { one_line };
     }
@@ -721,6 +787,7 @@ fn pp_guarded_inner_wrapped(
     g: &Guarded,
     paren_atomic: bool,
     indent: usize,
+    line_start: usize,
     width: usize,
     scope: &[Vec<crate::guarded::GBinding>],
 ) -> String {
@@ -730,9 +797,15 @@ fn pp_guarded_inner_wrapped(
         pp_guarded_inner(g, paren_atomic, scope, &mut s);
         s
     };
-    if indent + flat.chars().count() <= width {
+    // HS-faithful fit check: see `fits_flat`.
+    if !flat.contains('\n')
+        && fits_flat(line_start, indent, flat.chars().count(), LINE_LENGTH)
+    {
         return flat;
     }
+    // Legacy width check retained for compatibility with callers that
+    // pass a tighter `width`.
+    let _ = width;
     use crate::guarded::GBinding;
     match g {
         Guarded::Atom(_) => flat,
@@ -757,12 +830,16 @@ fn pp_guarded_inner_wrapped(
             if outer { out.push('('); }
             out.push('(');
             for (i, x) in xs.iter().enumerate() {
+                // First item is on the SAME line as the opening `(`
+                // (line_start unchanged); subsequent items are on
+                // fresh lines at `sep_col` (line_start = sep_col).
+                let child_line_start = if i == 0 { line_start } else { sep_col };
                 if i > 0 {
                     out.push('\n');
                     out.push_str(&" ".repeat(sep_col));
                 }
                 // Each child is opParens'd (paren_atomic=true).
-                let child = pp_guarded_inner_wrapped(x, true, sep_col, width, scope);
+                let child = pp_guarded_inner_wrapped(x, true, sep_col, child_line_start, width, scope);
                 out.push_str(&child);
                 if i + 1 < xs.len() {
                     out.push_str(" \u{2228}"); // ∨ at end of each but last
@@ -787,11 +864,14 @@ fn pp_guarded_inner_wrapped(
             let mut out = String::new();
             if outer { out.push('('); }
             for (i, x) in xs.iter().enumerate() {
+                // First item: same line as `(` (line_start preserved).
+                // Subsequent: fresh line at sep_col.
+                let child_line_start = if i == 0 { line_start } else { sep_col };
                 if i > 0 {
                     out.push('\n');
                     out.push_str(&" ".repeat(sep_col));
                 }
-                let child = pp_guarded_inner_wrapped(x, true, sep_col, width, scope);
+                let child = pp_guarded_inner_wrapped(x, true, sep_col, child_line_start, width, scope);
                 out.push_str(&child);
                 if i + 1 < xs.len() {
                     out.push_str(" \u{2227}"); // ∧
@@ -889,30 +969,48 @@ fn pp_guarded_inner_wrapped(
 
             // dsucc (body): rendered BARE (no opParens), per
             // Guarded.hs:858-860.  At body_col with width-budget.
-            let dsucc_str = pp_guarded_inner_wrapped(body, false, body_col, width, &new_scope);
+            // dsucc lands on a fresh line at body_col (line_start =
+            // body_col).
+            let dsucc_str = pp_guarded_inner_wrapped(body, false, body_col, body_col, width, &new_scope);
 
-            // Try the inner sep flat at sep_col: `<dante> conn <dsucc>`
-            // on one line.  But we only reach here because the OUTER
-            // flat failed.  Re-try the inner flat (dante + conn + dsucc)
-            // at sep_col without the quantifier — if it fits, scheme 2:
+            // Try the inner sep flat at body_col: `<dante> conn <dsucc>`
+            // on one line.  HS `nest 1` (Guarded.hs:852, 859) on dante
+            // and dsucc wraps the inner sep in `nest_ 1` via sep1's
+            // `sep1 g (Nest n p) k ys = nest_ n (sep1 g p (k-n) ys)`
+            // propagation (HughesPJ.hs:749).  At display, lay walks
+            // `Nest 1 inner_sep` at line start → shifts the WHOLE
+            // inner_sep by +1, so dante (and conn and dsucc) all land
+            // at `sep_col + 1 = body_col`, not at sep_col.
+            //
+            // Scheme 2 layout (used when inner_sep fits as one line):
             //   <quantifier>
-            //   <sep_col><dante> <conn> <dsucc>
+            //   <body_col><dante> <conn> <dsucc>
+            //
+            // Fit check uses the GGuarded's outer `line_start` (where
+            // the OUTER sep's line began, before any local NilAbove).
+            // HS's `nicest1 w r sl` at the inner_sep Union has `sl`
+            // counting the line's get1-chain ink — which started from
+            // the outer sep's line_start.
             let inner_flat_one_line =
                 !dante_str.contains('\n')
                 && !dsucc_str.contains('\n')
-                && sep_col
-                    + dante_str.chars().count()
-                    + 1 + connective.chars().count() + 1
-                    + dsucc_str.chars().count()
-                    <= width;
+                && fits_flat(
+                    line_start,
+                    body_col,
+                    dante_str.chars().count()
+                        + 1 + connective.chars().count() + 1
+                        + dsucc_str.chars().count(),
+                    LINE_LENGTH,
+                );
 
             let mut out = String::new();
             if outer { out.push('('); }
             out.push_str(&quantifier);
             out.push('\n');
             if inner_flat_one_line {
-                // Scheme 2: quantifier on its own line; inner sep flat.
-                out.push_str(&" ".repeat(sep_col));
+                // Scheme 2: quantifier on its own line; inner sep flat
+                // at body_col (HS's `nest_ 1` shift).
+                out.push_str(&" ".repeat(body_col));
                 out.push_str(&dante_str);
                 out.push(' ');
                 out.push_str(connective);
