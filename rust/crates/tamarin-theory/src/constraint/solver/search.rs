@@ -666,37 +666,6 @@ pub fn candidate_methods(
     out
 }
 
-/// Legacy single-method picker (kept for now in case callers expect
-/// it).  Returns the first candidate from `candidate_methods`.
-#[allow(dead_code)]
-fn pick_method(
-    sys: &System,
-    ctx: &ProofContext,
-) -> ProofMethod {
-    candidate_methods(sys, ctx).into_iter().next()
-        .unwrap_or(ProofMethod::Simplify)
-}
-
-/// Goal picker — delegates to `goals::rank_goals_with` (port of
-/// Haskell's `Theory.Constraint.Solver.ProofMethod.smartRanking`)
-/// and returns the first ranked open goal.  Threads the proof
-/// context through so source-cache predicates
-/// (`is_msg_one_case_goal`) can access `ctx.full_sources`.
-///
-/// Currently unused — live callers go through `candidate_methods` →
-/// `execProofMethod` which embeds the same ranking.  Kept as a
-/// reusable helper for diagnostic code that wants just the goal.
-#[allow(dead_code)]
-fn pick_open_goal(
-    sys: &System,
-    ctx: &ProofContext,
-) -> Option<crate::constraint::constraints::Goal> {
-    crate::constraint::solver::goals::rank_goals_with(sys, Some(ctx))
-        .into_iter()
-        .next()
-        .map(|a| a.goal)
-}
-
 /// Mirror of Haskell's `canApplyInduction` precondition: induction is
 /// only valid on the *initial* state of the system, before anything
 /// else has been added.

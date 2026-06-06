@@ -466,7 +466,13 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 if dbg_timing {
                     eprintln!("[TAM_DBG_RUN_TIMING] {:>26}: {:>8.1} ms",
                               $name, t_phase.elapsed().as_secs_f64() * 1000.0);
-                    t_phase = Instant::now();
+                    // Reassign so the next phase! call measures the
+                    // delta since this one.  The last invocation in the
+                    // loop iteration writes a value the compiler can't
+                    // see being read — that's fine, the discipline is
+                    // uniform across phase boundaries.
+                    #[allow(unused_assignments)]
+                    { t_phase = Instant::now(); }
                 }
             };
         }
