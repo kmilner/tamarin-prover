@@ -426,6 +426,97 @@ pub fn multiset_intruder_rules() -> Vec<IntrRuleAC> {
     vec![d_rule, c_rule]
 }
 
+/// `xorIntruderRules` — port of HS `Theory.Tools.IntruderRules.xorIntruderRules`
+/// (IntruderRules.hs:345-349):
+///
+/// ```haskell
+/// xorIntruderRules = [
+///     mkDXorRule [x, y] [y, z] (x ⊕ z),   -- KD(x⊕y) ∧ KU(y⊕z) → KD(x⊕z)
+///     mkDXorRule [x, y] [y]    x,         -- KD(x⊕y) ∧ KU(y)   → KD(x)
+///     mkCXorRule x y (x ⊕ y),             -- KU(x)   ∧ KU(y)   → KU(x⊕y)
+///     zeroConstructor                     -- KU(zero)
+/// ]
+/// ```
+///
+/// The two destructor rules let the adversary recover `x` (or `x⊕z`) when
+/// they know `x⊕y` (as KD, e.g. from an `Out(x⊕y)`) and can compose `y`
+/// (or `y⊕z`) themselves.  The constructor rule lets them XOR two known
+/// values together.  `zeroConstructor` makes `zero` always known.
+///
+/// Wired in `ProofContext::new_with_restrictions_and_pool` when
+/// `sig.enable_xor`, after `special_intruder_rules` and before the
+/// DH/BP intruder variants — mirroring HS `addMessageDeductionRule
+/// Variants` (TheoryLoader.hs:786-789).
+pub fn xor_intruder_rules() -> Vec<IntrRuleAC> {
+    use tamarin_term::function_symbols::{
+        AcSym, FunSym, NoEqSym, Privacy, Constructability,
+        XOR_SYM_STRING, ZERO_SYM_STRING,
+    };
+    use tamarin_term::term::Term;
+    let x = var_term(LVar::new("x", LSort::Msg, 0));
+    let y = var_term(LVar::new("y", LSort::Msg, 0));
+    let z = var_term(LVar::new("z", LSort::Msg, 0));
+    let _ = AcSym::Xor;  // discriminator referenced through xor2 closure
+    // `Term::App(Ac(Xor), [a, b])`.  Constructed via the AC-flatten/sort
+    // smart constructor so the operand order matches HS's `fAppAC` (sorted
+    // by Ord).
+    let xor2 = |a: LNTerm, b: LNTerm| -> LNTerm {
+        tamarin_term::term::f_app_ac(AcSym::Xor, vec![a, b])
+    };
+    let x_xor_y = xor2(x.clone(), y.clone());
+    let x_xor_z = xor2(x.clone(), z.clone());
+    let y_xor_z = xor2(y.clone(), z.clone());
+    let mut name = b"_".to_vec();
+    name.extend_from_slice(XOR_SYM_STRING);
+
+    // Rule 1: KD(x⊕y) ∧ KU(y⊕z) → KD(x⊕z)
+    // HS: mkDXorRule [x, y] [y, z] x_xor_z
+    let d_rule_1 = Rule::new(
+        IntrRuleACInfo::DestrRule(name.clone(), 1, true, false),
+        vec![kd_fact(x_xor_y.clone()), ku_fact(y_xor_z)],
+        vec![kd_fact(x_xor_z)],
+        vec![],
+    );
+    // Rule 2: KD(x⊕y) ∧ KU(y) → KD(x)
+    // HS: mkDXorRule [x, y] [y] x_var — note `fAppAC Xor [y]` is a singleton
+    // AC that the smart constructor strips to just `y`.
+    let d_rule_2 = Rule::new(
+        IntrRuleACInfo::DestrRule(name.clone(), 1, true, false),
+        vec![kd_fact(x_xor_y.clone()), ku_fact(y.clone())],
+        vec![kd_fact(x.clone())],
+        vec![],
+    );
+    // Rule 3: KU(x) ∧ KU(y) → KU(x⊕y)
+    // HS: mkCXorRule x y x_xor_y — constructor, action emits `KU(x⊕y)`.
+    let c_rule = {
+        let mut r = Rule::new(
+            IntrRuleACInfo::ConstrRule(name.clone()),
+            vec![ku_fact(x), ku_fact(y)],
+            vec![ku_fact(x_xor_y.clone())],
+            vec![ku_fact(x_xor_y)],
+        );
+        r.new_vars = vec![];
+        r
+    };
+    // Rule 4: zero constructor (HS `zeroConstructor`).
+    let zero_sym = NoEqSym::new(ZERO_SYM_STRING.to_vec(), 0,
+        Privacy::Public, Constructability::Constructor);
+    let zero_term: LNTerm = Term::App(FunSym::NoEq(zero_sym), Vec::<LNTerm>::new().into());
+    let mut zero_name = b"_".to_vec();
+    zero_name.extend_from_slice(ZERO_SYM_STRING);
+    let zero_rule = {
+        let mut r = Rule::new(
+            IntrRuleACInfo::ConstrRule(zero_name),
+            vec![],
+            vec![ku_fact(zero_term.clone())],
+            vec![ku_fact(zero_term)],
+        );
+        r.new_vars = vec![];
+        r
+    };
+    vec![d_rule_1, d_rule_2, c_rule, zero_rule]
+}
+
 /// `constructionRules`: for every public constructor `f/n` in the
 /// signature, emit a KU rule:
 ///
