@@ -828,7 +828,7 @@ impl ProofContext {
 /// 3. `dfs_loop_breakers` returns the set of `(rule_name, prem_idx)`
 ///    targets to mark — the premises whose goals should be tagged
 ///    loop-breaker.
-fn annotate_loop_breakers(
+pub fn annotate_loop_breakers(
     rules: &mut [OpenProtoRule],
     maude: &tamarin_term::maude_proc::MaudeHandle,
 ) {
