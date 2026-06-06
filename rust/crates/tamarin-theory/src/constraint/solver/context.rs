@@ -440,6 +440,19 @@ impl ProofContext {
         if sig.enable_mset {
             intruder_rules.extend(crate::intruder_rules::multiset_intruder_rules());
         }
+        // XOR intruder rules — port of HS `xorIntruderRules`
+        // (IntruderRules.hs:345-349) wired in `addMessageDeduction
+        // RuleVariants` (TheoryLoader.hs:790).  Two destructor rules
+        // for XOR cancellation (KD(x⊕y) ∧ KU(y⊕z) → KD(x⊕z) and
+        // KD(x⊕y) ∧ KU(y) → KD(x)), one constructor (KU(x⊕y) from
+        // KU(x), KU(y)), plus the `zero` constructor.  Without
+        // these every XOR-using theory was unsound: the canonical
+        // adversary attack `(x⊕y) ⊕ y = x` was unreachable, so
+        // `xor.spthy::Secret` and all `recentalive_tag`-style lemmas
+        // wrongly verified.  Mirrors HS's enableXor branch.
+        if sig.enable_xor {
+            intruder_rules.extend(crate::intruder_rules::xor_intruder_rules());
+        }
         // DH / BP intruder variants — port of HS
         // `Main.TheoryLoader.addMessageDeductionRuleVariants`
         // (src/Main/TheoryLoader.hs:776-791):
