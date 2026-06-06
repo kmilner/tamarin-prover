@@ -136,6 +136,7 @@ impl<'ctx> Reduction<'ctx> {
     pub fn mark_contradictory(&mut self) {
         let bot = crate::guarded::gfalse();
         let added_bot = if !self.sys.formulas.contains(&bot) {
+            self.sys.invalidate_max_var_idx_cache();
             self.sys.formulas.push(bot);
             true
         } else {
@@ -143,6 +144,7 @@ impl<'ctx> Reduction<'ctx> {
         };
         let flipped_eq = if !self.sys.eq_store.is_false() {
             let s = std::mem::take(&mut self.sys.eq_store);
+            self.sys.invalidate_max_var_idx_cache();
             self.sys.eq_store = s.set_false();
             true
         } else {
@@ -346,6 +348,7 @@ impl<'ctx> Reduction<'ctx> {
     {
         match self.sys.last_atom.clone() {
             None => {
+                self.sys.invalidate_max_var_idx_cache();
                 self.sys.last_atom = Some(i);
                 self.changed = ChangeIndicator::Changed;
                 Ok(SolveOutcome::Linear(ChangeIndicator::Unchanged))
@@ -409,6 +412,10 @@ impl<'ctx> Reduction<'ctx> {
     fn subst_system_once(&mut self) {
         let subst = self.sys.eq_store.subst.clone();
         if subst.is_empty() { return; }
+        // Substitution rewrites every term/fact/rule under the current
+        // subst — vars in the domain get replaced (possibly by vars
+        // with smaller idx), so max-var-idx can LOWER.  Invalidate.
+        self.sys.invalidate_max_var_idx_cache();
         let map_var = |v: tamarin_term::lterm::LVar| -> tamarin_term::lterm::LVar {
             let id_term = tamarin_term::term::Term::Lit(
                 tamarin_term::vterm::Lit::Var(v.clone()));
@@ -597,12 +604,14 @@ impl<'ctx> Reduction<'ctx> {
             eprintln!("[SET_NODES_RS] nodes_in={} collisions={} shape_mismatches={} rule_eqs_queued={}",
                 nodes_in, collisions, shape_mm, rule_eqs.len());
         }
+        self.sys.invalidate_max_var_idx_cache();
         self.sys.nodes = new_nodes;
         if shape_mismatch {
             // Force a `gfalse` formula so `has_false_formula` picks up
             // the contradiction in the next contradictions check.
             let bot = crate::guarded::gfalse();
             if !self.sys.formulas.contains(&bot) {
+                self.sys.invalidate_max_var_idx_cache();
                 self.sys.formulas.push(bot);
                 self.changed = ChangeIndicator::Changed;
             }
@@ -616,6 +625,7 @@ impl<'ctx> Reduction<'ctx> {
             // here matches that shape on the SolveGoal proof-tree filter.
             if !self.sys.eq_store.is_false() {
                 let s = std::mem::take(&mut self.sys.eq_store);
+                self.sys.invalidate_max_var_idx_cache();
                 self.sys.eq_store = s.set_false();
                 self.changed = ChangeIndicator::Changed;
             }
@@ -643,9 +653,11 @@ impl<'ctx> Reduction<'ctx> {
         let mut tmp: Vec<_> = std::mem::take(&mut self.sys.edges);
         tmp.sort();
         tmp.dedup();
+        self.sys.invalidate_max_var_idx_cache();
         self.sys.edges = tmp;
         // 3. Last-atom.
         if let Some(last) = self.sys.last_atom.take() {
+            self.sys.invalidate_max_var_idx_cache();
             self.sys.last_atom = Some(map_var(last));
         }
         // 4. Less atoms.
@@ -801,6 +813,7 @@ impl<'ctx> Reduction<'ctx> {
                 }
             }
         }
+        self.sys.invalidate_max_var_idx_cache();
         self.sys.goals = new_goals;
         for (i, fa, st) in to_insert_action {
             self.insert_goal_with_loop_flag(Goal::Action(i, fa), st.looping);
@@ -1048,12 +1061,15 @@ impl<'ctx> Reduction<'ctx> {
             if let Some(la) = &self.sys.last_atom { la.for_each_free(&mut visit); }
             let maude = self.maude.clone();
             let store = std::mem::take(&mut self.sys.eq_store);
+            self.sys.invalidate_max_var_idx_cache();
             self.sys.eq_store = store.simp_with_fresh_avoiding(
                 |_, _| false,
                 |n| maude.reserve_idxs(n),
                 &sys_vars,
                 Some(&maude),
             );
+            // eq_store simp can rewrite/drop subst entries → max may lower.
+            self.sys.invalidate_max_var_idx_cache();
             // Check if our disj was folded (singleton case).
             folded = !self.sys.eq_store.conj.iter().any(|d| d.split_id == id);
             if folded {
@@ -1288,6 +1304,7 @@ impl<'ctx> Reduction<'ctx> {
                         // (e.g. `solve_disj_goal`) to drain.
                         let mut it = arms.into_iter();
                         if let Some(first) = it.next() {
+                            self.sys.invalidate_max_var_idx_cache();
                             self.sys.eq_store = first;
                         }
                         for rest in it {
@@ -1330,6 +1347,7 @@ impl<'ctx> Reduction<'ctx> {
                     crate::elaborate::term_to_lnterm(s),
                     crate::elaborate::term_to_lnterm(b),
                 ) else { return false; };
+                self.sys.invalidate_max_var_idx_cache();
                 self.sys.subterm_store.add(ts, tb);
                 self.changed = ChangeIndicator::Changed;
                 true
@@ -1397,6 +1415,7 @@ impl<'ctx> Reduction<'ctx> {
                         crate::constraint::solver::trace::case_path_string());
                 }
                 if !already_in {
+                    self.sys.invalidate_max_var_idx_cache();
                     self.sys.formulas.push(g.clone());
                     self.changed = ChangeIndicator::Changed;
                 }
@@ -1412,6 +1431,7 @@ impl<'ctx> Reduction<'ctx> {
                     if already_in { "Disj-dedup" } else { "Disj" },
                     &crate::constraint::solver::trace::guarded_repr(&g));
                 if !already_in {
+                    self.sys.invalidate_max_var_idx_cache();
                     self.sys.formulas.push(g.clone());
                 }
                 let goal = Goal::Disj(crate::constraint::constraints::Disj::new(items));
@@ -1458,6 +1478,7 @@ impl<'ctx> Reduction<'ctx> {
                     let already_solved = self.sys.solved_formulas.iter().any(|f|
                         apply_canon(f) == canon);
                     if !already_solved {
+                        self.sys.invalidate_max_var_idx_cache();
                         self.sys.solved_formulas.push(g);
                         self.changed = ChangeIndicator::Changed;
                     }
@@ -1481,6 +1502,7 @@ impl<'ctx> Reduction<'ctx> {
                     }
                     return;
                 }
+                self.sys.invalidate_max_var_idx_cache();
                 self.sys.solved_formulas.push(outer);
                 let avoid_max = self.fresh_var_baseline();
                 self.maude.ensure_above(avoid_max);
@@ -1563,6 +1585,7 @@ impl<'ctx> Reduction<'ctx> {
                         // already-solved, skeleton replay picks the
                         // wrong open goal.
                         if mark && !self.sys.solved_formulas.contains(&g) {
+                            self.sys.invalidate_max_var_idx_cache();
                             self.sys.solved_formulas.push(g.clone());
                         }
                         let d = crate::guarded::Guarded::Disj(vec![
@@ -1576,6 +1599,7 @@ impl<'ctx> Reduction<'ctx> {
                         // Less on non-node terms — keep as formula.
                         if !self.sys.formulas.contains(&g)
                             && !self.sys.solved_formulas.contains(&g) {
+                            self.sys.invalidate_max_var_idx_cache();
                             self.sys.formulas.push(g);
                             self.changed = ChangeIndicator::Changed;
                         }
@@ -1588,6 +1612,7 @@ impl<'ctx> Reduction<'ctx> {
                         // (`mark=True`), mirroring `markAsSolved = when mark
                         // ...` (Reduction.hs:585).
                         if mark && !self.sys.solved_formulas.contains(&g) {
+                            self.sys.invalidate_max_var_idx_cache();
                             self.sys.solved_formulas.push(g.clone());
                         }
                         let d = crate::guarded::Guarded::Disj(vec![
@@ -1618,6 +1643,7 @@ impl<'ctx> Reduction<'ctx> {
                         // (`mark=True`), mirroring `markAsSolved = when mark
                         // ...` (Reduction.hs:585).
                         if mark && !self.sys.solved_formulas.contains(&g) {
+                            self.sys.invalidate_max_var_idx_cache();
                             self.sys.solved_formulas.push(g.clone());
                         }
                         let last_node = match &self.sys.last_atom {
@@ -1628,6 +1654,7 @@ impl<'ctx> Reduction<'ctx> {
                                     "last",
                                     tamarin_term::lterm::LSort::Node,
                                     baseline.saturating_add(1));
+                                self.sys.invalidate_max_var_idx_cache();
                                 self.sys.last_atom = Some(j.clone());
                                 j
                             }
@@ -1652,6 +1679,7 @@ impl<'ctx> Reduction<'ctx> {
                         // (`mark=True`), mirroring `markAsSolved = when mark
                         // ...` (Reduction.hs:585).
                         if mark && !self.sys.solved_formulas.contains(&g) {
+                            self.sys.invalidate_max_var_idx_cache();
                             self.sys.solved_formulas.push(g.clone());
                         }
                         if let (Some(ts), Some(tb)) = (
@@ -1669,6 +1697,7 @@ impl<'ctx> Reduction<'ctx> {
                         // a safety net so downstream contradictions can
                         // see it.
                         if !self.sys.formulas.contains(&g) {
+                            self.sys.invalidate_max_var_idx_cache();
                             self.sys.formulas.push(g);
                             self.changed = ChangeIndicator::Changed;
                         }
@@ -1677,6 +1706,7 @@ impl<'ctx> Reduction<'ctx> {
                         // Unhandled single-guard universal: keep in formulas.
                         if !self.sys.formulas.contains(&g)
                             && !self.sys.solved_formulas.contains(&g) {
+                            self.sys.invalidate_max_var_idx_cache();
                             self.sys.formulas.push(g);
                             self.changed = ChangeIndicator::Changed;
                         }
@@ -1695,6 +1725,7 @@ impl<'ctx> Reduction<'ctx> {
                 // reach Solved).
                 if !self.sys.formulas.contains(&g)
                     && !self.sys.solved_formulas.contains(&g) {
+                    self.sys.invalidate_max_var_idx_cache();
                     self.sys.formulas.push(g);
                     self.changed = ChangeIndicator::Changed;
                 }
@@ -1716,6 +1747,7 @@ impl<'ctx> Reduction<'ctx> {
         };
         if should_delete {
             let before = self.sys.goals.len();
+            self.sys.invalidate_max_var_idx_cache();
             self.sys.goals.retain(|(eg, _)| eg != g);
             if self.sys.goals.len() != before {
                 self.changed = ChangeIndicator::Changed;
@@ -1729,8 +1761,10 @@ impl<'ctx> Reduction<'ctx> {
             let f = Guarded::Disj(d.0.clone());
             let pos = self.sys.formulas.iter().position(|x| x == &f);
             if let Some(idx) = pos {
+                self.sys.invalidate_max_var_idx_cache();
                 self.sys.formulas.remove(idx);
                 if !self.sys.solved_formulas.contains(&f) {
+                    self.sys.invalidate_max_var_idx_cache();
                     self.sys.solved_formulas.push(f);
                 }
                 self.changed = ChangeIndicator::Changed;
@@ -1754,6 +1788,7 @@ impl<'ctx> Reduction<'ctx> {
             .map(|d| d.split_id)
             .collect();
         let before = self.sys.goals.len();
+        self.sys.invalidate_max_var_idx_cache();
         self.sys.goals.retain(|(g, status)| match g {
             G::Split(id) => !status.solved || valid.contains(id),
             _ => true,
@@ -1968,6 +2003,7 @@ impl<'ctx> Reduction<'ctx> {
                     // Install a false store so downstream is_false
                     // checks see it (mirrors HS noContradictoryEqStore
                     // firing mzero on every arm).
+                    self.sys.invalidate_max_var_idx_cache();
                     self.sys.eq_store = crate::tools::equation_store::EquationStore::default()
                         .set_false();
                     return Ok(SolveOutcome::Contradictory);
@@ -1977,6 +2013,7 @@ impl<'ctx> Reduction<'ctx> {
                     // Single arm survived: install as the current
                     // eq_store and return Linear (no caller-side fork
                     // needed).
+                    self.sys.invalidate_max_var_idx_cache();
                     self.sys.eq_store = live_arms.into_iter().next().unwrap();
                     Ok(SolveOutcome::Linear(ChangeIndicator::Changed))
                 } else {
@@ -1990,6 +2027,7 @@ impl<'ctx> Reduction<'ctx> {
             }
             (Some(id), SplitStrategy::SplitLater) => {
                 // No split fanout — simp once on the combined store.
+                self.sys.invalidate_max_var_idx_cache();
                 self.sys.eq_store = do_simp(store);
                 if self.sys.eq_store.is_false() {
                     return Ok(SolveOutcome::Contradictory);
@@ -2000,6 +2038,7 @@ impl<'ctx> Reduction<'ctx> {
             }
             (None, _) => {
                 // No split — simp once.
+                self.sys.invalidate_max_var_idx_cache();
                 self.sys.eq_store = do_simp(store);
                 if self.sys.eq_store.is_false() {
                     return Ok(SolveOutcome::Contradictory);
@@ -2062,6 +2101,7 @@ impl<'ctx> Reduction<'ctx> {
                 // (Reduction.hs:745) firing mzero on tag mismatch.
                 if !self.sys.eq_store.is_false() {
                     let s = std::mem::take(&mut self.sys.eq_store);
+                    self.sys.invalidate_max_var_idx_cache();
                     self.sys.eq_store = s.set_false();
                 }
                 return Ok(SolveOutcome::Contradictory);
@@ -2102,6 +2142,7 @@ impl<'ctx> Reduction<'ctx> {
             if e.lhs.info != e.rhs.info {
                 if !self.sys.eq_store.is_false() {
                     let s = std::mem::take(&mut self.sys.eq_store);
+                    self.sys.invalidate_max_var_idx_cache();
                     self.sys.eq_store = s.set_false();
                 }
                 return Ok(SolveOutcome::Contradictory);
@@ -2163,6 +2204,7 @@ impl<'ctx> Reduction<'ctx> {
             }
             canonical.push((id, keep));
         }
+        self.sys.invalidate_max_var_idx_cache();
         self.sys.nodes = canonical;
         if rule_eqs.is_empty() {
             return Ok(SolveOutcome::Linear(ChangeIndicator::Unchanged));
@@ -2267,11 +2309,13 @@ impl<'ctx> Reduction<'ctx> {
         // syntactic equality is sufficient for these sets).
         for f in &sys.solved_formulas {
             if !self.sys.solved_formulas.contains(f) {
+                self.sys.invalidate_max_var_idx_cache();
                 self.sys.solved_formulas.push(f.clone());
             }
         }
         for l in &sys.lemmas {
             if !self.sys.lemmas.contains(l) {
+                self.sys.invalidate_max_var_idx_cache();
                 self.sys.lemmas.push(l.clone());
             }
         }
@@ -2996,7 +3040,65 @@ fn bm_rule(r: &crate::rule::RuleACInst, max: &mut u64) {
     for t in &r.new_vars   { bm_term(t, max); }
 }
 
+// Public re-exports so `system.rs`'s incremental cache bumpers can
+// reuse the inline walkers.
+#[inline(always)]
+pub fn bm_term_pub(t: &tamarin_term::lterm::LNTerm, max: &mut u64) {
+    bm_term(t, max);
+}
+#[inline(always)]
+pub fn bm_fact_pub(fa: &crate::fact::LNFact, max: &mut u64) {
+    bm_fact(fa, max);
+}
+#[inline(always)]
+pub fn bm_rule_pub(r: &crate::rule::RuleACInst, max: &mut u64) {
+    bm_rule(r, max);
+}
+
+/// Cached entry point for the max free-var idx walk over the system.
+///
+/// Hot path: many sites (`Reduction::new`, `insert_goal_with_loop_flag`'s
+/// auto-decompose, `solve_chain_goal`, `freshen_rule`, etc.) call this
+/// dozens of times per proof-step.  `System` maintains an exact-max
+/// cache (`max_var_idx_cache`) maintained incrementally on additive
+/// mutations and invalidated on substitution / eq-store simp / node
+/// removal.  Cache hit = O(1); miss = full walk.
 pub fn bounds_max(sys: &System) -> u64 {
+    if let Some(v) = sys.max_var_idx_cache.get() {
+        if bounds_max_verify_enabled() {
+            let actual = bounds_max_uncached(sys);
+            if v != actual {
+                panic!(
+                    "bounds_max cache mismatch: cache={}, actual={}",
+                    v, actual,
+                );
+            }
+        }
+        return v;
+    }
+    let v = bounds_max_uncached(sys);
+    if !bounds_max_disable_enabled() {
+        sys.max_var_idx_cache.set(Some(v));
+    }
+    v
+}
+
+#[inline]
+fn bounds_max_verify_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_VERIFY_BOUNDS_CACHE").is_ok())
+}
+
+#[inline]
+fn bounds_max_disable_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_BOUNDS_CACHE").is_ok())
+}
+
+/// Full-walk implementation of `bounds_max` — bypass for the cache.
+pub fn bounds_max_uncached(sys: &System) -> u64 {
     let mut max = 0u64;
     for (id, rule) in &sys.nodes {
         bm_lvar(id, &mut max);
@@ -3634,6 +3736,7 @@ impl<'ctx> Reduction<'ctx> {
                     cases.push((base_name.clone(), sub.sys));
                     for arm_eq in pending {
                         let mut arm_sys = post_sys.clone();
+                        arm_sys.invalidate_max_var_idx_cache();
                         arm_sys.eq_store = arm_eq;
                         cases.push((base_name.clone(), arm_sys));
                     }
@@ -3821,6 +3924,7 @@ impl<'ctx> Reduction<'ctx> {
         // distinct Fresh suppliers, which then fired a false-positive
         // `enforce_edge_uniqueness:prem_idx_clash` and dropped the
         // Lowe-attack cases as FormulasFalse.
+        self.sys.invalidate_max_var_idx_cache();
         self.sys.edges.push(crate::constraint::constraints::Edge {
             src: (j, crate::rule::ConcIdx(0)),
             tgt: (i.clone(), idx),
@@ -5354,12 +5458,14 @@ impl<'ctx> Reduction<'ctx> {
         // Move from posSubterms → solvedSubterms.
         let before = self.sys.subterm_store.subterms.len();
         let mut moved = false;
+        self.sys.invalidate_max_var_idx_cache();
         self.sys.subterm_store.subterms.retain(|c| {
             let keep = !(c.small == st.0 && c.big == st.1);
             if !keep { moved = true; }
             keep
         });
         if moved {
+            self.sys.invalidate_max_var_idx_cache();
             self.sys.subterm_store.solved_subterms.push(
                 crate::tools::subterm_store::SubtermConstraint {
                     small: st.0.clone(),
@@ -5482,6 +5588,7 @@ impl<'ctx> Reduction<'ctx> {
             }
         };
         if cases.len() == 1 {
+            self.sys.invalidate_max_var_idx_cache();
             self.sys.eq_store = simplify_picked(
                 cases.into_iter().next().unwrap());
             self.mark_goal_as_solved(&g);
@@ -5492,6 +5599,7 @@ impl<'ctx> Reduction<'ctx> {
         let mut out = Vec::with_capacity(cases.len());
         for (i, store) in cases.into_iter().enumerate() {
             let mut sys = self.sys.clone();
+            sys.invalidate_max_var_idx_cache();
             sys.eq_store = simplify_picked(store);
             for (existing, status) in sys.goals.iter_mut() {
                 if existing == &g && !status.solved {
@@ -5623,6 +5731,7 @@ mod tests {
         // Add an edge i -> some target. (Source-only is enough — we
         // just want to verify the substitution propagates.)
         let tgt = LVar::new("t", LSort::Node, 99);
+        r.sys.invalidate_max_var_idx_cache();
         r.sys.edges.push(crate::constraint::constraints::Edge {
             src: (i.clone(), crate::rule::ConcIdx(0)),
             tgt: (tgt.clone(), crate::rule::PremIdx(0)),
@@ -5654,6 +5763,7 @@ mod tests {
         let i = LVar::new("i", LSort::Node, 2);
         let j = LVar::new("j", LSort::Node, 3);
         let target = LVar::new("t", LSort::Node, 9);
+        r.sys.invalidate_max_var_idx_cache();
         r.sys.less_atoms.push(crate::constraint::constraints::LessAtom::new(
             i.clone(), target.clone(),
             crate::constraint::constraints::Reason::Formula));
@@ -5836,6 +5946,7 @@ mod tests {
             tamarin_term::vterm::Lit::Var(v));
         let ty: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(
             tamarin_term::vterm::Lit::Var(w));
+        sys.invalidate_max_var_idx_cache();
         sys.subterm_store.add(tx.clone(), ty.clone());
         sys.add_goal(Goal::Subterm((tx.clone(), ty.clone())));
         let mut r = Reduction::new(&ctx, sys);
@@ -5854,6 +5965,7 @@ mod tests {
             "x", tamarin_term::lterm::LSort::Msg, 0);
         let tx: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(
             tamarin_term::vterm::Lit::Var(v));
+        sys.invalidate_max_var_idx_cache();
         sys.subterm_store.add(tx.clone(), tx.clone());
         let mut r = Reduction::new(&ctx, sys);
         let out = r.solve_subterm_goal(&(tx.clone(), tx));

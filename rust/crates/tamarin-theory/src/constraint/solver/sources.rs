@@ -1381,6 +1381,7 @@ fn saturate_sources_inner_with_options(
                                 }
                                 if !cross_sort_pairs.is_empty() {
                                     let added = tamarin_term::subst::Subst::from_list(cross_sort_pairs);
+                                    live_sys.invalidate_max_var_idx_cache();
                                     live_sys.eq_store.subst = added.compose(&live_sys.eq_store.subst);
                                 }
                             }
@@ -3124,6 +3125,7 @@ pub fn refine_with_source_asms(
         for (name, mut sys) in src.cases_take().into_iter() {
             sys.formulas.clear();
             sys.solved_formulas.clear();
+            sys.invalidate_max_var_idx_cache();
             sys.goals.retain(|(g, _)|
                 !matches!(g, crate::constraint::constraints::Goal::Disj(_)));
             new_cases.push((name, sys));
@@ -3342,6 +3344,7 @@ fn refine_one_source(
                 .into_iter()
                 .filter(|(v, _)| stable_vars.contains(v))
                 .collect();
+            branch_sys.invalidate_max_var_idx_cache();
             branch_sys.eq_store.subst =
                 tamarin_term::subst::Subst::from_list(restricted_pairs);
             if dedup_enabled {
@@ -6187,6 +6190,7 @@ fn restrict_eq_store_to_stable_vars(
         = sys.eq_store.subst.to_list().into_iter()
             .filter(|(v, _)| stable_vars.contains(v))
             .collect();
+    sys.invalidate_max_var_idx_cache();
     sys.eq_store.subst = tamarin_term::subst::Subst::from_list(kept);
 }
 
@@ -7130,6 +7134,7 @@ fn apply_source_case_action(
         // mirrors HS's `DisjT` replication of the Reduction continuation
         // (Reduction.hs:776 `disjunctionOfList performSplit`).
         let mut arm_sys = post_solve_sys_template.clone();
+        arm_sys.invalidate_max_var_idx_cache();
         arm_sys.eq_store = arm_eq_store;
         let mut refined = Reduction::new(ctx, arm_sys);
     if std::env::var("TAM_DBG_APPLY_REFINE").is_ok() {
@@ -7173,6 +7178,7 @@ fn apply_source_case_action(
             .filter(|(v, t)| !(pattern_vars.contains(v)
                 && matches!(t, tamarin_term::term::Term::App(_, _))))
             .collect();
+        refined.sys.invalidate_max_var_idx_cache();
         refined.sys.eq_store.subst = tamarin_term::subst::Subst::from_list(keep_entries);
         if std::env::var("TAM_RS_DBG_H15_3").is_ok() {
             eprintln!("[h15_3] deferred {} pattern→App substs in case={} (apply_action)",
@@ -7183,6 +7189,7 @@ fn apply_source_case_action(
     if !deferred.is_empty() {
         let mut current = refined.sys.eq_store.subst.to_list();
         current.extend(deferred);
+        refined.sys.invalidate_max_var_idx_cache();
         refined.sys.eq_store.subst = tamarin_term::subst::Subst::from_list(current);
     }
     if refined.sys.eq_store.is_false() {
@@ -7715,6 +7722,7 @@ fn apply_source_case_premise(
 
     for arm_eq_store in arm_eq_stores {
         let mut arm_sys = post_solve_sys_template.clone();
+        arm_sys.invalidate_max_var_idx_cache();
         arm_sys.eq_store = arm_eq_store;
         let mut refined = Reduction::new(ctx, arm_sys);
 
@@ -7752,6 +7760,7 @@ fn apply_source_case_premise(
             .filter(|(v, t)| !(pattern_vars.contains(v)
                 && matches!(t, tamarin_term::term::Term::App(_, _))))
             .collect();
+        refined.sys.invalidate_max_var_idx_cache();
         refined.sys.eq_store.subst = tamarin_term::subst::Subst::from_list(keep_entries);
         if std::env::var("TAM_RS_DBG_H15_3").is_ok() {
             eprintln!("[h15_3] deferred {} pattern→App substs in case={} (apply_premise)",
@@ -7762,6 +7771,7 @@ fn apply_source_case_premise(
     if !deferred.is_empty() {
         let mut current = refined.sys.eq_store.subst.to_list();
         current.extend(deferred);
+        refined.sys.invalidate_max_var_idx_cache();
         refined.sys.eq_store.subst = tamarin_term::subst::Subst::from_list(current);
     }
     if refined.sys.eq_store.is_false() {
@@ -8458,6 +8468,7 @@ mod tests {
         let pub_a = LVar::new("a", LSort::Pub, 0);
         let pub_b = LVar::new("b", LSort::Pub, 0);
         let mut sys = System::empty();
+        sys.invalidate_max_var_idx_cache();
         sys.eq_store.subst = Subst::from_list(vec![
             (t1.clone(),  Term::Lit(Lit::Var(pub_a))),
             (m19.clone(), Term::Lit(Lit::Var(pub_b))),
@@ -8499,6 +8510,7 @@ mod tests {
         let blind_arg = LVar::new("m", LSort::Msg, 28);
 
         let mut sys = System::empty();
+        sys.invalidate_max_var_idx_cache();
         sys.eq_store.subst = Subst::from_list(vec![
             (t1.clone(),  Term::Lit(Lit::Var(e10.clone()))),
             (e10.clone(), Term::Lit(Lit::Var(blind_arg.clone()))),
@@ -8533,6 +8545,7 @@ mod tests {
         let pub_a = LVar::new("a", LSort::Pub, 0);
         let pub_b = LVar::new("b", LSort::Pub, 0);
         let mut sys = System::empty();
+        sys.invalidate_max_var_idx_cache();
         sys.eq_store.subst = Subst::from_list(vec![
             (m19, Term::Lit(Lit::Var(pub_a))),
             (sk28, Term::Lit(Lit::Var(pub_b))),

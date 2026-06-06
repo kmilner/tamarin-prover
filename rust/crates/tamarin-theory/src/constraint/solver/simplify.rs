@@ -475,8 +475,10 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
         // effect of `insertAtom` was missed — leading to a vacuous
         // Simplify step downstream where Haskell goes straight to
         // Solve (injectivity_check class).
+        red.sys.invalidate_max_var_idx_cache();
         red.sys.formulas.retain(|f| f != &fm);
         if !red.sys.solved_formulas.contains(&fm) {
+            red.sys.invalidate_max_var_idx_cache();
             red.sys.solved_formulas.push(fm);
         }
         if simp != gtrue() && simp != gfalse() {
@@ -2956,6 +2958,7 @@ fn apply_node_eqs(
             }
         }
     }
+    red.sys.invalidate_max_var_idx_cache();
     red.sys.nodes = new_nodes;
     if shape_mismatch {
         mark_contradictory_labeled(red, "apply_node_eqs:shape_mismatch");
@@ -3026,6 +3029,7 @@ fn apply_node_eqs(
     let mut tmp: Vec<_> = std::mem::take(&mut red.sys.edges);
     tmp.sort();
     tmp.dedup();
+    red.sys.invalidate_max_var_idx_cache();
     red.sys.edges = tmp;
     // Less atoms.
     for l in red.sys.less_atoms.iter_mut() {
@@ -3640,6 +3644,7 @@ fn reduce_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     }
     if to_decompose.is_empty() { return ChangeIndicator::Unchanged; }
     // Remove them, then re-insert via the decomposition logic.
+    red.sys.invalidate_max_var_idx_cache();
     red.sys.formulas.retain(|f| !reducible_formula(f));
     for f in to_decompose {
         red.insert_formula(f);
@@ -3672,8 +3677,10 @@ fn drop_trivially_true_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     let before = red.sys.formulas.len();
     let gt = crate::guarded::gtrue();
     let had_gtrue = red.sys.formulas.contains(&gt);
+    red.sys.invalidate_max_var_idx_cache();
     red.sys.formulas.retain(|f| f != &gt);
     if had_gtrue && !red.sys.solved_formulas.contains(&gt) {
+        red.sys.invalidate_max_var_idx_cache();
         red.sys.solved_formulas.push(gt);
     }
     if red.sys.formulas.len() != before {
@@ -3763,7 +3770,9 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
         }
         kept.push(c);
     }
+    red.sys.invalidate_max_var_idx_cache();
     red.sys.subterm_store.subterms = kept;
+    red.sys.invalidate_max_var_idx_cache();
     red.sys.subterm_store.solved_subterms = solved;
     if contradictory {
         red.sys.subterm_store.contradictory = true;
@@ -3839,6 +3848,7 @@ mod tests {
             },
             mkvar_idx("j", 0),
         )));
+        sys.invalidate_max_var_idx_cache();
         sys.formulas.push(crate::guarded::Guarded::Conj(vec![a1.clone(), a2.clone()]));
         let mut r = Reduction::new(&ctx, sys);
         simplify_system(&mut r);
@@ -3881,6 +3891,7 @@ mod tests {
         // (Conj is) — reduce_formulas will trip on it and decompose
         // the Disj inside.
         let disj = crate::guarded::Guarded::Disj(vec![a1, a2]);
+        sys.invalidate_max_var_idx_cache();
         sys.formulas.push(crate::guarded::Guarded::Conj(vec![disj]));
         let mut r = Reduction::new(&ctx, sys);
         simplify_system(&mut r);
@@ -3930,6 +3941,7 @@ mod tests {
         let mut sys = System::empty();
         let n = mkvar_l("n", 0);
         let m = mkvar_l("m", 0);
+        sys.invalidate_max_var_idx_cache();
         sys.less_atoms.push(crate::constraint::constraints::LessAtom::new(
             n.clone(), m,
             crate::constraint::constraints::Reason::Formula,
@@ -3954,6 +3966,7 @@ mod tests {
             "x", tamarin_term::lterm::LSort::Msg, 0);
         let t: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(
             tamarin_term::vterm::Lit::Var(v));
+        sys.invalidate_max_var_idx_cache();
         sys.subterm_store.add(t.clone(), t);
         let mut r = Reduction::new(&ctx, sys);
         simplify_system(&mut r);

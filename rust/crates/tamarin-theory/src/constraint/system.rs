@@ -6,6 +6,8 @@
 //! haven't yet ported). The shape is close enough that incremental
 //! population keeps the whole module compiling.
 
+use std::cell::Cell;
+
 use crate::constraint::constraints::{Edge, Goal, LessAtom, NodeId};
 use crate::guarded::Guarded;
 use crate::rule::RuleACInst;
@@ -37,7 +39,7 @@ pub enum Side { LHS, RHS }
 /// `Hash` yet. Lookup is currently linear; once those derives land
 /// we can swap to ordered containers without changing the public
 /// surface.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Default)]
 pub struct System {
     pub source_kind: Option<SourceKind>,
     pub side: Option<Side>,
@@ -117,6 +119,78 @@ pub struct System {
     /// spurious `case case_1`/`case case_2` Disj-decomposition steps
     /// that appear in our proof trees for ~10 corpus lemmas.
     pub sources_lemma_universals: Vec<Guarded>,
+    /// Cached max free-var idx across the system.  `None` means
+    /// "invalid — lazily recompute on next `bounds_max` call".
+    /// Maintained incrementally on additive mutations and
+    /// invalidated on mutations that could LOWER the max.
+    ///
+    /// Excluded from `PartialEq`/`Clone` semantics: two systems with
+    /// the same content but different cache state are still equal,
+    /// and cloning copies the cached value verbatim.
+    ///
+    /// Wrapped in `Cell` so `bounds_max(&System)` can populate it
+    /// without requiring `&mut System` at every call site.
+    pub max_var_idx_cache: Cell<Option<u64>>,
+}
+
+// Manual `Clone` — copies the cache value (NOT invalidates).  System
+// gets cloned heavily (every prove-step grafts a child); a clone that
+// invalidated the cache would defeat the optimisation.
+impl Clone for System {
+    fn clone(&self) -> Self {
+        Self {
+            source_kind: self.source_kind,
+            side: self.side,
+            nodes: self.nodes.clone(),
+            edges: self.edges.clone(),
+            less_atoms: self.less_atoms.clone(),
+            formulas: self.formulas.clone(),
+            solved_formulas: self.solved_formulas.clone(),
+            lemmas: self.lemmas.clone(),
+            last_atom: self.last_atom.clone(),
+            eq_store: self.eq_store.clone(),
+            subterm_store: self.subterm_store.clone(),
+            goals: self.goals.clone(),
+            next_goal_nr: self.next_goal_nr,
+            next_split: self.next_split,
+            used_sources: self.used_sources.clone(),
+            shape_mismatch_conflation: self.shape_mismatch_conflation,
+            lost_conflation_case_apply_source:
+                self.lost_conflation_case_apply_source,
+            used_incomplete_source: self.used_incomplete_source,
+            sources_lemma_universals: self.sources_lemma_universals.clone(),
+            max_var_idx_cache: Cell::new(self.max_var_idx_cache.get()),
+        }
+    }
+}
+
+// Manual `PartialEq` — ignores the cache.  Two systems with identical
+// content but different cache state (e.g. one freshly cloned, one
+// after `bounds_max` populated its cache) must compare equal — see
+// `proof_method.rs:358` (`r.sys == cleanup(sys)`).
+impl PartialEq for System {
+    fn eq(&self, other: &Self) -> bool {
+        self.source_kind == other.source_kind
+            && self.side == other.side
+            && self.nodes == other.nodes
+            && self.edges == other.edges
+            && self.less_atoms == other.less_atoms
+            && self.formulas == other.formulas
+            && self.solved_formulas == other.solved_formulas
+            && self.lemmas == other.lemmas
+            && self.last_atom == other.last_atom
+            && self.eq_store == other.eq_store
+            && self.subterm_store == other.subterm_store
+            && self.goals == other.goals
+            && self.next_goal_nr == other.next_goal_nr
+            && self.next_split == other.next_split
+            && self.used_sources == other.used_sources
+            && self.shape_mismatch_conflation == other.shape_mismatch_conflation
+            && self.lost_conflation_case_apply_source
+                == other.lost_conflation_case_apply_source
+            && self.used_incomplete_source == other.used_incomplete_source
+            && self.sources_lemma_universals == other.sources_lemma_universals
+    }
 }
 
 /// Canonicalize a Goal for dedup-comparison in `add_goal_with_loop_flag`.
@@ -161,6 +235,90 @@ pub struct GoalStatus {
 impl System {
     pub fn empty() -> Self { Self::default() }
 
+    // ====== max_var_idx_cache maintenance ======
+
+    /// Invalidate the cached max-var-idx hint.  Call on any mutation
+    /// that could LOWER the max (substitution applied to the system,
+    /// eq-store simp, node removal, ...).  Cheap (single `Cell::set`).
+    #[inline]
+    pub fn invalidate_max_var_idx_cache(&self) {
+        self.max_var_idx_cache.set(None);
+    }
+
+    /// Bump the cache for a newly-added LVar.  No-op if invalidated.
+    #[inline]
+    pub fn bump_cache_lvar(&self, v: &tamarin_term::lterm::LVar) {
+        if let Some(cur) = self.max_var_idx_cache.get() {
+            if v.idx > cur {
+                self.max_var_idx_cache.set(Some(v.idx));
+            }
+        }
+    }
+
+    /// Bump the cache by walking a term.
+    #[inline]
+    pub fn bump_cache_term(&self, t: &tamarin_term::lterm::LNTerm) {
+        if let Some(cur) = self.max_var_idx_cache.get() {
+            let mut m = cur;
+            crate::constraint::solver::reduction::bm_term_pub(t, &mut m);
+            if m != cur { self.max_var_idx_cache.set(Some(m)); }
+        }
+    }
+
+    /// Bump the cache by walking a fact's terms.
+    #[inline]
+    pub fn bump_cache_fact(&self, fa: &crate::fact::LNFact) {
+        if let Some(cur) = self.max_var_idx_cache.get() {
+            let mut m = cur;
+            crate::constraint::solver::reduction::bm_fact_pub(fa, &mut m);
+            if m != cur { self.max_var_idx_cache.set(Some(m)); }
+        }
+    }
+
+    /// Bump the cache by walking a rule's free vars.
+    #[inline]
+    pub fn bump_cache_rule(&self, r: &crate::rule::RuleACInst) {
+        if let Some(cur) = self.max_var_idx_cache.get() {
+            let mut m = cur;
+            crate::constraint::solver::reduction::bm_rule_pub(r, &mut m);
+            if m != cur { self.max_var_idx_cache.set(Some(m)); }
+        }
+    }
+
+    /// Bump the cache by walking a guarded formula.
+    #[inline]
+    pub fn bump_cache_guarded(&self, f: &Guarded) {
+        if let Some(cur) = self.max_var_idx_cache.get() {
+            let n = crate::guarded::max_var_idx(f);
+            if n > cur { self.max_var_idx_cache.set(Some(n)); }
+        }
+    }
+
+    /// Bump the cache by walking a goal.
+    #[inline]
+    pub fn bump_cache_goal(&self, g: &Goal) {
+        if self.max_var_idx_cache.get().is_none() { return; }
+        match g {
+            Goal::Action(i, fa) => {
+                self.bump_cache_lvar(i);
+                self.bump_cache_fact(fa);
+            }
+            Goal::Premise(p, fa) => {
+                self.bump_cache_lvar(&p.0);
+                self.bump_cache_fact(fa);
+            }
+            Goal::Chain(c, p) => {
+                self.bump_cache_lvar(&c.0);
+                self.bump_cache_lvar(&p.0);
+            }
+            Goal::Subterm((s, t)) => {
+                self.bump_cache_term(s);
+                self.bump_cache_term(t);
+            }
+            Goal::Disj(_) | Goal::Split(_) => {}
+        }
+    }
+
     /// Add an open goal, no-op if already present (compared by `Goal`
     /// equality).
     pub fn add_goal(&mut self, g: Goal) {
@@ -171,6 +329,7 @@ impl System {
         if !self.goals.iter().any(|(existing, _)| existing == &g) {
             let mut st = GoalStatus::default();
             st.nr = age;
+            self.bump_cache_goal(&g);
             self.goals.push((g, st));
         }
     }
@@ -223,6 +382,7 @@ impl System {
         let mut st = GoalStatus::default();
         st.looping = looping;
         st.nr = age;
+        self.bump_cache_goal(&g);
         self.goals.push((g, st));
     }
 
@@ -297,9 +457,13 @@ impl System {
             panic!("[TAM_DBG_PANIC_ANY_IDX0_NODE] add_node at idx 0: id={:?} rule={}",
                 id, rule_name);
         }
-        if let Some(slot) = self.nodes.iter_mut().find(|(k, _)| k == &id) {
-            slot.1 = rule;
+        let pos = self.nodes.iter().position(|(k, _)| k == &id);
+        if let Some(i) = pos {
+            self.invalidate_max_var_idx_cache();
+            self.nodes[i].1 = rule;
         } else {
+            self.bump_cache_lvar(&id);
+            self.bump_cache_rule(&rule);
             self.nodes.push((id, rule));
         }
     }
@@ -315,6 +479,8 @@ impl System {
     /// `exploitPrem FreshFact`) should use this directly.
     pub fn add_edge(&mut self, e: Edge) {
         if !self.edges.contains(&e) {
+            self.bump_cache_lvar(&e.src.0);
+            self.bump_cache_lvar(&e.tgt.0);
             self.edges.push(e);
         }
     }
@@ -328,7 +494,11 @@ impl System {
     /// contradiction.  We still add it (so contradictions catches
     /// it) but log under TAM_DBG_SELF_LOOP for diagnosis.
     pub fn add_less(&mut self, l: LessAtom) {
-        if !self.less_atoms.iter().any(|x| x == &l) { self.less_atoms.push(l); }
+        if !self.less_atoms.iter().any(|x| x == &l) {
+            self.bump_cache_lvar(&l.smaller);
+            self.bump_cache_lvar(&l.larger);
+            self.less_atoms.push(l);
+        }
     }
 
     /// `alwaysBefore i j`: True iff `i < j` in every model of the system.
@@ -389,7 +559,10 @@ impl System {
                 for item in items { self.insert_lemma(item); }
             }
             other => {
-                if !self.lemmas.contains(&other) { self.lemmas.push(other); }
+                if !self.lemmas.contains(&other) {
+                    self.bump_cache_guarded(&other);
+                    self.lemmas.push(other);
+                }
             }
         }
     }

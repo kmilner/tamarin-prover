@@ -474,6 +474,7 @@ pub fn exec_proof_method(
                         &mut r.sys);
                 }
                 if !r.sys.eq_store.is_false() {
+                    r.sys.invalidate_max_var_idx_cache();
                     r.sys.eq_store.subst =
                         tamarin_term::subst::Subst::from_list(Vec::new());
                 }
@@ -647,12 +648,14 @@ pub fn exec_proof_method(
             // the empty-trace child — without it the child looks fresh
             // and search refuses to mark it Solved.
             let mut base_sys = sys.clone();
+            base_sys.invalidate_max_var_idx_cache();
             base_sys.formulas.remove(0);
             let mut br = Reduction::new(ctx, base_sys);
             br.insert_formula(base);
             simplify_system(&mut br);
 
             let mut step_sys = sys.clone();
+            step_sys.invalidate_max_var_idx_cache();
             step_sys.formulas.remove(0);
             let mut sr = Reduction::new(ctx, step_sys);
             sr.insert_formula(step);
