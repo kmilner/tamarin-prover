@@ -902,7 +902,7 @@ fn render_fact_brackets_at(facts: &[p::Fact], indent: usize, line_start: usize) 
     // Try inline first.
     let inline = render_fact_brackets_inline(facts);
     let inline_max_col = std::cmp::min(line_start + RIBBON, PAGE_WIDTH);
-    if !inline.contains('\n') && indent + inline.chars().count() <= inline_max_col {
+    if !inline.contains('\n') && indent + inline.chars().count() < inline_max_col {
         return inline;
     }
     // Multi-line: each fact at column `indent`, packed greedily.
@@ -963,7 +963,7 @@ fn render_fact_at(fa: &p::Fact, indent: usize, line_start: usize) -> String {
         s
     };
     let inline_max_col = std::cmp::min(line_start + RIBBON, PAGE_WIDTH);
-    if indent + inline.chars().count() <= inline_max_col && !inline.contains('\n') {
+    if indent + inline.chars().count() < inline_max_col && !inline.contains('\n') {
         return inline;
     }
     // Multi-line shape from `nestShort'`:
@@ -1062,7 +1062,7 @@ fn render_pair_at(items: &[p::Term], indent: usize, line_start: usize) -> String
         s
     };
     let inline_max_col = std::cmp::min(line_start + RIBBON, PAGE_WIDTH);
-    if indent + inline.chars().count() <= inline_max_col && !inline.contains('\n') {
+    if indent + inline.chars().count() < inline_max_col && !inline.contains('\n') {
         return inline;
     }
     let cont_indent = indent + 1;
@@ -1172,7 +1172,7 @@ fn render_app_at(name: &str, args: &[p::Term], indent: usize, line_start: usize)
         s
     };
     let inline_max_col = std::cmp::min(line_start + RIBBON, PAGE_WIDTH);
-    if indent + inline.chars().count() <= inline_max_col && !inline.contains('\n') {
+    if indent + inline.chars().count() < inline_max_col && !inline.contains('\n') {
         return inline;
     }
     // HS `ppFun` uses `text (f ++ "(") <> fsep (...)  <> text ")"` (no
@@ -1672,8 +1672,12 @@ fn pp_step_at(m: &crate::constraint::solver::proof_method::ProofMethod, indent: 
             // `<->` is hsep-with-space → `solve( <goal> )` (one space
             // after `(` and before `)`).
             // The goal lands at col `indent + len("solve( ")` = `indent + 7`.
-            // Pass that as the goal's indent for wrap purposes.
-            let goal_str = render_goal_at(g, indent + 7);
+            // Pass `indent` as the line_start so the goal's internal
+            // fact/term renderers see the ribbon budget measured from
+            // the line's actual start (where `solve(` sits), not from
+            // the goal's column — HS-faithful for the common case
+            // where solve(...) is the whole line content.
+            let goal_str = render_goal_at(g, indent + 7, indent);
             if goal_str.contains('\n') {
                 // Multi-line goal — keep the `solve( ` prefix attached to
                 // the goal's first line; the close `)` goes on its own
@@ -1700,13 +1704,17 @@ fn pp_step_at(m: &crate::constraint::solver::proof_method::ProofMethod, indent: 
 /// (Constraints.hs:267-282).
 #[allow(dead_code)]
 fn render_goal(g: &crate::constraint::constraints::Goal) -> String {
-    render_goal_at(g, 0)
+    render_goal_at(g, 0, 0)
 }
 
 /// Wrap-aware goal renderer.  `indent` is the column where the goal's
 /// first character will land — used so internal facts/terms can decide
-/// to wrap when their inline form overflows the ribbon.
-fn render_goal_at(g: &crate::constraint::constraints::Goal, indent: usize) -> String {
+/// to wrap when their inline form overflows the ribbon.  `line_start`
+/// is the column where the OUTPUT line that contains the goal started;
+/// it's used as the ribbon base for HS-faithful inline-fit decisions
+/// when the goal is placed mid-line (e.g. inside `solve( <goal> )`
+/// where the goal lands at col `line_start + 7`).
+fn render_goal_at(g: &crate::constraint::constraints::Goal, indent: usize, line_start: usize) -> String {
     use crate::constraint::constraints::Goal;
     use crate::rule::PremIdx;
     match g {
@@ -1714,7 +1722,7 @@ fn render_goal_at(g: &crate::constraint::constraints::Goal, indent: usize) -> St
         // which expands (Atom.hs:214-215) to `prettyFact ppT fa <-> opAction <-> text (show v)`.
         // `<->` is hsep-with-space → `<fact> @ <node-id>`.
         Goal::Action(i, fa) =>
-            format!("{} @ {}", render_lnfact_at(fa, indent, indent), render_node_id(i)),
+            format!("{} @ {}", render_lnfact_at(fa, indent, line_start), render_node_id(i)),
         // `prettyGoal (ChainG c p) = prettyNodeConc c <-> operator_ "~~>" <-> prettyNodePrem p`
         Goal::Chain(c, p) =>
             format!("{} ~~> {}", render_node_conc(c), render_node_prem(p)),
@@ -1722,7 +1730,7 @@ fn render_goal_at(g: &crate::constraint::constraints::Goal, indent: usize) -> St
         //    prettyLNFact fa <-> text ("▶" ++ subscript (show v)) <-> prettyNodeId i`
         Goal::Premise((i, PremIdx(v)), fa) =>
             format!("{} \u{25B6}{} {}",
-                render_lnfact_at(fa, indent, indent), goal_subscript(*v), render_node_id(i)),
+                render_lnfact_at(fa, indent, line_start), goal_subscript(*v), render_node_id(i)),
         // `prettyGoal (SplitG x) = text "splitEqs" <> parens (text $ show (unSplitId x))`
         // `<>` is `<>` (no space) so it's `splitEqs(<n>)`.
         Goal::Split(id) => format!("splitEqs({})", id.0),
