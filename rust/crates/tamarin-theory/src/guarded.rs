@@ -1194,6 +1194,127 @@ pub fn normalize_sort_hints(g: &Guarded) -> Guarded {
     rec(g)
 }
 
+/// Canonicalise AC-`BinOp` argument ordering inside a `Guarded` so two
+/// formulas differing only by AC permutation compare equal under `==`.
+///
+/// HS-faithful rationale.  HS represents formulas using LNTerm (which
+/// stores AC operators as flat sorted argument lists via `f_app_ac`).
+/// Every HS `mapFrees` / `apply` over LNTerm routes through `f_app_ac`,
+/// so AC heads stay in canonical sorted order after substitution.  Rust
+/// stores formulas in parser-AST `BinOp(op, l, r)` (strict arity-2), and
+/// `subst_term` / `subst_gterm` recurse into the children without
+/// re-sorting.
+///
+/// After `rename_precise_system` renumbers free vars (e.g. `ekR.5 →
+/// ekR.0`, `ltkI.7 → ltkI.0`), the LVar `Ord` (`idx`-first ⇒
+/// `name`-only on ties) flips: an originally-sorted
+/// `Mult(ltkI.5, ekR.7)` (`ltkI < ekR` by idx) becomes a NOW-unsorted
+/// `Mult(ltkI.0, ekR.0)` (`ekR < ltkI` by name).  The PARSER-AST slots
+/// stay in original order — no re-sort happens.  Meanwhile a fresh
+/// implied-formula built via `lnterm_to_term`-of-`f_app_ac` output
+/// arrives in canonical sorted form (`Mult(ekR.0, ltkI.0)`).  Dedup via
+/// bare `==` (or via `apply_canon`'s witness/bound normalisation) then
+/// fails, and `insert_implied_formulas_pass` adds a structurally-
+/// duplicate formula on every subsequent `simplifySystem` call —
+/// breaking idempotency.
+///
+/// This pass mirrors HS's invariant explicitly: for every AC head
+/// (`Mult`, `Union`, `Xor`, `NatPlus`), flatten the binary chain into
+/// the full multiset, sort it via `cmp_term` (the existing HS-faithful
+/// parser-AST Ord), then re-fold into a right-leaning canonical
+/// `BinOp(op, x0, BinOp(op, x1, ...))`.  Two AC-permuted parser-AST
+/// representations of the same multiset collapse to the same shape.
+pub fn canonicalize_ac_in_guarded(g: &Guarded) -> Guarded {
+    fn flatten_and_sort(op: &p::BinOp, t: &GTerm) -> Vec<GTerm> {
+        let mut out = Vec::new();
+        // Reuse the existing `flatten_ac_binop` helper via a local copy
+        // (the public API at `cmp_term`'s call site is module-private).
+        fn flatten(op: &p::BinOp, t: &GTerm, out: &mut Vec<GTerm>) {
+            match t {
+                GTerm::BinOp(inner_op, l, r) if inner_op == op => {
+                    flatten(op, l, out);
+                    flatten(op, r, out);
+                }
+                _ => out.push(t.clone()),
+            }
+        }
+        flatten(op, t, &mut out);
+        out.sort_by(cmp_term);
+        out
+    }
+    fn rec_term(t: &GTerm) -> GTerm {
+        match t {
+            GTerm::Var(_) | GTerm::PubLit(_) | GTerm::FreshLit(_)
+            | GTerm::NatLit(_) | GTerm::Number(_) | GTerm::NumberOne
+            | GTerm::NatOne | GTerm::DhNeutral => t.clone(),
+            GTerm::App(n, args) => GTerm::App(
+                n.clone(), args.iter().map(rec_term).collect()),
+            GTerm::Pair(args) => GTerm::Pair(args.iter().map(rec_term).collect()),
+            GTerm::AlgApp(n, a, b) => GTerm::AlgApp(
+                n.clone(), Box::new(rec_term(a)), Box::new(rec_term(b))),
+            GTerm::Diff(a, b) => GTerm::Diff(
+                Box::new(rec_term(a)), Box::new(rec_term(b))),
+            GTerm::BinOp(op, l, r) => {
+                if matches!(op, p::BinOp::Mult | p::BinOp::Union | p::BinOp::Xor | p::BinOp::NatPlus) {
+                    // Recurse into children first, then flatten the
+                    // whole AC chain rooted here and rebuild in sorted
+                    // multiset order.
+                    let l2 = rec_term(l);
+                    let r2 = rec_term(r);
+                    let mut flat = Vec::new();
+                    flat.extend(flatten_and_sort(op, &l2));
+                    flat.extend(flatten_and_sort(op, &r2));
+                    flat.sort_by(cmp_term);
+                    // Right-fold to a binary chain.  At least 2 args.
+                    let mut iter = flat.into_iter().rev();
+                    let last = iter.next().unwrap_or(GTerm::PubLit(String::new()));
+                    let mut acc = last;
+                    for prev in iter {
+                        acc = GTerm::BinOp(*op, Box::new(prev), Box::new(acc));
+                    }
+                    acc
+                } else {
+                    GTerm::BinOp(*op, Box::new(rec_term(l)), Box::new(rec_term(r)))
+                }
+            }
+            GTerm::PatMatch(inner) => GTerm::PatMatch(Box::new(rec_term(inner))),
+        }
+    }
+    fn rec_fact(f: &GFact) -> GFact {
+        GFact {
+            persistent: f.persistent,
+            name: f.name.clone(),
+            args: f.args.iter().map(rec_term).collect(),
+            annotations: f.annotations.clone(),
+        }
+    }
+    fn rec_atom(a: &GAtom) -> GAtom {
+        match a {
+            GAtom::Action(f, t) => GAtom::Action(rec_fact(f), rec_term(t)),
+            GAtom::Eq(x, y) => GAtom::Eq(rec_term(x), rec_term(y)),
+            GAtom::Less(x, y) => GAtom::Less(rec_term(x), rec_term(y)),
+            GAtom::LessMset(x, y) => GAtom::LessMset(rec_term(x), rec_term(y)),
+            GAtom::Subterm(x, y) => GAtom::Subterm(rec_term(x), rec_term(y)),
+            GAtom::Last(t) => GAtom::Last(rec_term(t)),
+            GAtom::Pred(f) => GAtom::Pred(rec_fact(f)),
+        }
+    }
+    fn rec(g: &Guarded) -> Guarded {
+        match g {
+            Guarded::Atom(a) => Guarded::Atom(rec_atom(a)),
+            Guarded::Disj(items) => Guarded::Disj(items.iter().map(rec).collect()),
+            Guarded::Conj(items) => Guarded::Conj(items.iter().map(rec).collect()),
+            Guarded::GGuarded { qua, vars, guards, body } => Guarded::GGuarded {
+                qua: qua.clone(),
+                vars: vars.clone(),
+                guards: guards.iter().map(rec_atom).collect(),
+                body: Box::new(rec(body)),
+            },
+        }
+    }
+    rec(g)
+}
+
 fn collect_witness_vars(g: &Guarded, out: &mut VarSubst) {
     match g {
         Guarded::Atom(a) => collect_witness_vars_atom(a, out),
