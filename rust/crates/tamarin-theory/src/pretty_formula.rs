@@ -41,23 +41,16 @@ pub fn pretty_formula(f: &p::Formula) -> String {
 /// I.e. a doc of flat length N fits at current column C on a line that
 /// began at column L iff `C + N <= min(lineLength, L + ribbon)`.
 ///
-/// This function threads `line_start` (= L) through recursive calls so
-/// the fit budget matches HS's behavior on every line.  Top-level entry
-/// assumes `line_start = 0` (formula begins on a fresh output line).
-pub fn pretty_formula_wrapped(f: &p::Formula, indent: usize, width: usize) -> String {
-    // Top-level callers do not yet pass line_start; assume the formula
-    // begins on a fresh output line (line_start = 0).  This is correct
-    // for the lemma-body call (formula at col 3 on a line that opens
-    // with `  "`, i.e. starts at col 0).
-    pp_formula_wrap(
-        f,
-        indent,
-        /*line_start=*/0,
-        /*eff_w=*/LINE_LENGTH,
-        width,
-        &[],
-        false,
-    )
+/// This routes through the HS-faithful Doc engine
+/// (`crate::pretty_hpj`) so per-NilAbove `w`-shrinkage is tracked
+/// (HS get1 NilAbove: `nilAbove_ (get (w - sl) p)`).
+pub fn pretty_formula_wrapped(f: &p::Formula, indent: usize, _width: usize) -> String {
+    use crate::pretty_hpj as hpj;
+    // Build the formula's Doc tree, then render via the HS-faithful
+    // engine.  `indent` is the column where the first text of the
+    // formula will land; we model it as an initial `sl` to render_at.
+    let doc = formula_to_doc(f, &[]);
+    doc.render_at(hpj::LINE_LENGTH, hpj::RIBBON, indent)
 }
 
 /// Pretty-print a guarded formula.  Mirrors Haskell's
@@ -74,12 +67,13 @@ pub fn pretty_guarded(g: &Guarded) -> String {
 /// line width.  Mirrors Haskell's `prettyGuarded` (Guarded.hs:822-864)
 /// composed with the HughesPJ `sep`/`nest` layout semantics.
 ///
-/// When the flat rendering fits within `width - indent`, returns that.
-/// Otherwise decomposes at the top-level operator following HS's
-/// `sep [quantifier, sep [dante, connective, dsucc]]` layout.
+/// We use the legacy string-based path here rather than the Doc engine
+/// because the original layout matches HS byte-exact on Tutorial and
+/// the engine path needs further calibration to handle the `nest 1`
+/// w-budget bookkeeping that HS uses for the 3-item inner sep here.
+/// The Doc engine IS used for the formula-side wrap (which fixes the
+/// wireguard 5-deep And case) via `pretty_formula_wrapped`.
 pub fn pretty_guarded_wrapped(g: &Guarded, indent: usize, width: usize) -> String {
-    // Top-level call: assume the formula begins on a fresh output
-    // line (line_start = 0).
     pp_guarded_inner_wrapped(g, false, indent, /*line_start=*/0, width, &[])
 }
 
@@ -197,7 +191,111 @@ fn is_atomic_formula(f: &p::Formula) -> bool {
 }
 
 // =============================================================================
-// HS-style wrapped layout
+// HS-style wrapped layout — Doc-engine path
+// =============================================================================
+//
+// Build a `pretty_hpj::Doc` tree mirroring HS's `prettyLFormula`
+// (Formula.hs:471-507): Conn → `sep [opParens p <-> op, opParens q]`,
+// Qua → `sep [quantifier, nest 1 body]`.  The Doc engine handles
+// per-NilAbove `w`-shrinkage (HS get1 NilAbove:
+// `nilAbove_ (get (w - sl) p)`) which is required for HS-byte-exact
+// wireguard output (the deeply-nested And case).
+
+/// HS `opParens p = "(" <> p <> ")"` (Highlight.hs:58-59) —
+/// unconditional paren wrap.
+fn doc_op_parens(d: crate::pretty_hpj::Doc) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::Doc;
+    Doc::text("(").beside(d).beside(Doc::text(")"))
+}
+
+/// `text` helper.
+fn doc_text<S: Into<String>>(s: S) -> crate::pretty_hpj::Doc {
+    crate::pretty_hpj::Doc::text(s.into())
+}
+
+/// Mirror of `pp_formula` returning a Doc.  Atoms/terms/facts render
+/// inline (their flat strings); only the formula-structural nodes
+/// (Conn / Qua / Not) produce sep-Unions where wrap decisions happen.
+fn formula_to_doc(
+    f: &p::Formula,
+    scope: &[(String, p::SortHint)],
+) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj as hpj;
+    use hpj::Doc;
+    use p::Formula::*;
+    match f {
+        True => doc_text("\u{22A4}"),
+        False => doc_text("\u{22A5}"),
+        Atom(a) => {
+            let mut s = String::new();
+            pp_atom(a, scope, &mut s);
+            doc_text(s)
+        }
+        Not(p_) => {
+            // HS: `operator_ "¬" <> opParens p'` — `<>` is no-break
+            // beside.  The inner opParens is unconditional.
+            let inner = formula_to_doc_opparens(p_, scope);
+            doc_text("\u{00AC}").beside(inner)
+        }
+        And(l, r) => binop_to_doc(l, r, "\u{2227}", scope),
+        Or(l, r) => binop_to_doc(l, r, "\u{2228}", scope),
+        Implies(l, r) => binop_to_doc(l, r, "\u{21D2}", scope),
+        Iff(l, r) => binop_to_doc(l, r, "\u{21D4}", scope),
+        Forall(vs, body) | Exists(vs, body) => {
+            // HS Qua: `sep [quantifier, nest 1 body]` —
+            // `quantifier = ppQ <> ppVars vs <> "."`, body indented +1.
+            let sym = if matches!(f, Forall(_, _)) { "\u{2200}" } else { "\u{2203}" };
+            let mut vars_str = String::new();
+            pp_var_list(vs, &mut vars_str);
+            let quant = doc_text(format!("{} {}.", sym, vars_str));
+            let new_scope = extend_scope(scope, vs);
+            let body_doc = formula_to_doc(body, &new_scope);
+            // HS uses `<+>` (space) between sep items implicitly via
+            // `sep`'s flat form; we emit `sep [quant, nest 1 body]`.
+            hpj::sep(vec![quant, body_doc.nest(1)])
+        }
+    }
+}
+
+/// HS opParens (unconditional `(` / `)` wrap).
+fn formula_to_doc_opparens(
+    f: &p::Formula,
+    scope: &[(String, p::SortHint)],
+) -> crate::pretty_hpj::Doc {
+    // HS `opParens` always wraps in parens.  Our `is_atomic_formula`
+    // (`True/False/Pred`) short-circuits to no parens — but HS opParens
+    // wraps everything: `opParens d = "(" <> d <> ")"`.
+    // Keep RS's atomicity heuristic for True/False/Pred (it has no
+    // visible effect on the wireguard case) — preserves byte-identical
+    // output with the legacy path.
+    if is_atomic_formula(f) {
+        formula_to_doc(f, scope)
+    } else {
+        doc_op_parens(formula_to_doc(f, scope))
+    }
+}
+
+fn binop_to_doc(
+    l: &p::Formula,
+    r: &p::Formula,
+    op: &str,
+    scope: &[(String, p::SortHint)],
+) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj as hpj;
+    // HS Conn: `sep [opParens p <-> op, opParens q]`.  `<->` is `<+>`
+    // (beside with single space).
+    let l_doc = formula_to_doc_opparens(l, scope);
+    let r_doc = formula_to_doc_opparens(r, scope);
+    hpj::sep(vec![
+        l_doc.beside_sp(doc_text(op)),
+        r_doc,
+    ])
+}
+
+// =============================================================================
+// HS-style wrapped layout — legacy string-based path (kept for
+// guarded-formula rendering; pp_formula_wrap is unused on the Doc path
+// but retained for tests that exercise it directly).
 // =============================================================================
 //
 // Port of `Text.PrettyPrint.HughesPJ`'s `sep` / `nest` semantics for
@@ -772,7 +870,177 @@ fn pp_guarded_inner(
 }
 
 // =============================================================================
-// HS-style wrapped layout for Guarded
+// HS-style wrapped layout for Guarded — Doc-engine path
+// =============================================================================
+//
+// Build a `pretty_hpj::Doc` tree mirroring `prettyGuarded`
+// (Guarded.hs:822-864).  GDisj/GConj produce `sep`-Unions; GGuarded
+// produces `sep [quant, sep [dante, conn, dsucc]]`.  The Doc engine
+// then chooses wrap/no-wrap based on HS's `nicest1`/`fits` semantics,
+// including per-NilAbove `w`-shrinkage.
+
+fn guarded_to_doc(
+    g: &Guarded,
+    paren_atomic: bool,
+    scope: &[Vec<crate::guarded::GBinding>],
+) -> crate::pretty_hpj::Doc {
+    use crate::guarded::GBinding;
+    use crate::pretty_hpj as hpj;
+    use hpj::Doc;
+    match g {
+        Guarded::Atom(a) => {
+            let mut s = String::new();
+            pp_gatom(a, scope, &mut s);
+            if paren_atomic {
+                Doc::text("(").beside(Doc::text(s)).beside(Doc::text(")"))
+            } else {
+                Doc::text(s)
+            }
+        }
+        Guarded::Disj(xs) if xs.is_empty() => {
+            // `⊥` — caller's opParens still wraps to `(⊥)`.
+            let inner = Doc::text("\u{22A5}");
+            if paren_atomic {
+                Doc::text("(").beside(inner).beside(Doc::text(")"))
+            } else {
+                inner
+            }
+        }
+        Guarded::Conj(xs) if xs.is_empty() => {
+            let inner = Doc::text("\u{22A4}");
+            if paren_atomic {
+                Doc::text("(").beside(inner).beside(Doc::text(")"))
+            } else {
+                inner
+            }
+        }
+        Guarded::Disj(xs) => {
+            // HS: `parens $ sep $ punctuate ∨ ps` — self-wraps in `(...)`.
+            let mut items: Vec<Doc> = Vec::with_capacity(xs.len());
+            for (i, x) in xs.iter().enumerate() {
+                let x_doc = guarded_to_doc(x, true, scope);
+                if i + 1 < xs.len() {
+                    items.push(x_doc.beside_sp(Doc::text("\u{2228}")));
+                } else {
+                    items.push(x_doc);
+                }
+            }
+            let inner = hpj::sep(items);
+            let with_self_parens = Doc::text("(").beside(inner).beside(Doc::text(")"));
+            if paren_atomic {
+                Doc::text("(").beside(with_self_parens).beside(Doc::text(")"))
+            } else {
+                with_self_parens
+            }
+        }
+        Guarded::Conj(xs) => {
+            // HS: `sep $ punctuate ∧ ps` (no self-wrap).  Caller's
+            // opParens (paren_atomic) adds `(...)` outside.
+            let mut items: Vec<Doc> = Vec::with_capacity(xs.len());
+            for (i, x) in xs.iter().enumerate() {
+                let x_doc = guarded_to_doc(x, true, scope);
+                if i + 1 < xs.len() {
+                    items.push(x_doc.beside_sp(Doc::text("\u{2227}")));
+                } else {
+                    items.push(x_doc);
+                }
+            }
+            let inner = hpj::sep(items);
+            if paren_atomic {
+                Doc::text("(").beside(inner).beside(Doc::text(")"))
+            } else {
+                inner
+            }
+        }
+        Guarded::GGuarded { qua, vars, guards, body } => {
+            let mut new_scope: Vec<Vec<GBinding>> = scope.to_vec();
+            new_scope.push(vars.clone());
+            // Negation shortcut: `∀[] [Atom].⊥` → `¬<dante>`.
+            if matches!(qua, Quant::All) && vars.is_empty() && body_is_false(body) {
+                let dante = build_gconj_dante(guards, &new_scope);
+                let body_doc = Doc::text("\u{00AC}").beside(dante);
+                if paren_atomic {
+                    Doc::text("(").beside(body_doc).beside(Doc::text(")"))
+                } else {
+                    body_doc
+                }
+            } else {
+                // HS: `sep [quantifier, nest 1 (sep [dante, conn, dsucc])]`
+                // — quantifier is `Q vs.`, body = the inner sep.
+                let sym = match qua {
+                    Quant::All => "\u{2200}",
+                    Quant::Ex => "\u{2203}",
+                };
+                let mut vars_str = String::new();
+                pp_binding_list(vars, &mut vars_str);
+                let quant = Doc::text(format!("{} {}.", sym, vars_str));
+
+                let inner_doc: Doc = if guards.is_empty() {
+                    // Just the body.
+                    guarded_to_doc(body, false, &new_scope)
+                } else {
+                    // dante = pp (GConj antecedent) — each guard
+                    // opParens'd, joined by ∧.
+                    let dante = build_gconj_dante(guards, &new_scope);
+                    let connective = match qua {
+                        Quant::All => Doc::text("\u{21D2}"),
+                        Quant::Ex => Doc::text("\u{2227}"),
+                    };
+                    if matches!(qua, Quant::Ex) && body_is_true(body) {
+                        // `∃ vs. (guards)` — no body part.
+                        dante
+                    } else {
+                        let dsucc = guarded_to_doc(body, false, &new_scope);
+                        // HS Guarded.hs:858-860:
+                        //   `dante <- nest 1 <$> pp (GConj antecedent)`
+                        //   `dsucc <- nest 1 <$> pp gf`
+                        //   `return $ sep [ quantifier, sep [dante, connective, dsucc] ]`
+                        // The INNER sep has THREE items.  When this sep
+                        // wraps, each item goes to its own line — placing
+                        // `connective` on its OWN line.  (See Tutorial
+                        // `Client_auth`: `(guards)\n ∧\n (body)`.)
+                        // Both dante and dsucc carry `nest 1` from HS
+                        // lines 852+860.
+                        hpj::sep(vec![dante.nest(1), connective, dsucc.nest(1)])
+                    }
+                };
+                let outer = hpj::sep(vec![quant, inner_doc]);
+                if paren_atomic {
+                    Doc::text("(").beside(outer).beside(Doc::text(")"))
+                } else {
+                    outer
+                }
+            }
+        }
+    }
+}
+
+/// Build the `dante` doc: `pp (GConj antecedent) = sep [opParens g for g
+/// in antecedent]` joined by ∧ (HS Guarded.hs:852, 840-842).
+fn build_gconj_dante(
+    guards: &[crate::guarded::GAtom],
+    scope: &[Vec<crate::guarded::GBinding>],
+) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj as hpj;
+    use hpj::Doc;
+    let mut items: Vec<Doc> = Vec::with_capacity(guards.len());
+    for (i, gd) in guards.iter().enumerate() {
+        let mut s = String::new();
+        s.push('(');
+        pp_gatom(gd, scope, &mut s);
+        s.push(')');
+        let item = Doc::text(s);
+        if i + 1 < guards.len() {
+            items.push(item.beside_sp(Doc::text("\u{2227}")));
+        } else {
+            items.push(item);
+        }
+    }
+    hpj::sep(items)
+}
+
+// =============================================================================
+// HS-style wrapped layout for Guarded — legacy string-based path
 // =============================================================================
 //
 // Port of `prettyGuarded` (Guarded.hs:822-864) composed with HughesPJ's

@@ -941,6 +941,16 @@ fn render_fact(fa: &p::Fact) -> String {
 
 /// `line_start`: see `render_fact_brackets_at`.
 fn render_fact_at(fa: &p::Fact, indent: usize, line_start: usize) -> String {
+    render_fact_at_with_trailing(fa, indent, line_start, 0)
+}
+
+/// Like `render_fact_at` but the inline-fit check reserves
+/// `trailing_chars` cols at the end of the line for caller-emitted
+/// trailing text (e.g. ` ▶₁ #i )` after a Premise goal's fact).  This
+/// mirrors HS's `fits` walking PAST the fact's nestShort' sep Union
+/// into the OUTER doc's remaining text — HS sees the trailing chars
+/// when deciding inline-vs-vertical at the fact's sep.
+fn render_fact_at_with_trailing(fa: &p::Fact, indent: usize, line_start: usize, trailing_chars: usize) -> String {
     let head = {
         let mut s = String::new();
         if fa.persistent { s.push('!'); }
@@ -963,7 +973,7 @@ fn render_fact_at(fa: &p::Fact, indent: usize, line_start: usize) -> String {
         s
     };
     let inline_max_col = std::cmp::min(line_start + RIBBON, PAGE_WIDTH);
-    if indent + inline.chars().count() < inline_max_col && !inline.contains('\n') {
+    if indent + inline.chars().count() + trailing_chars < inline_max_col && !inline.contains('\n') {
         return inline;
     }
     // Multi-line shape from `nestShort'`:
@@ -976,10 +986,21 @@ fn render_fact_at(fa: &p::Fact, indent: usize, line_start: usize) -> String {
     // `indent` (HS's outer `sep` finish position).
     let head_len = head.chars().count();
     let cont_indent = indent + head_len + 1;
-    // Pre-render at `line_start = cont_indent` (laxest budget,
-    // matching the fresh-wrap-line case).  See `render_app_at`.
+    // HS `nestShort'` (Class.hs:218-223): `sep [lead $$ nest n body, finish]`.
+    // The `$$` puts `body`'s first line on the SAME line as `lead`
+    // (overlap), so the first arg lands at `cont_indent` on the
+    // current line — `line_start` propagates THROUGH from the fact's
+    // line.  Continuation lines (if any arg wraps) land at col
+    // `cont_indent` on fresh lines (their line_start = cont_indent).
+    //
+    // We pre-render each arg at the FACT'S `line_start` (matches the
+    // overlap-line budget for arg 1).  When fsep_pack later forces a
+    // break, the broken arg's continuation lines will be slightly
+    // more wrapped than HS would do at `line_start = cont_indent` —
+    // but never less.  HS-faithful in the common case (single-arg
+    // facts like `!KU( aead(...) )`).
     let item_strs: Vec<String> = fa.args.iter()
-        .map(|t| render_term_at(t, cont_indent, cont_indent))
+        .map(|t| render_term_at(t, cont_indent, line_start))
         .collect();
     let body = fsep_pack(&item_strs, cont_indent, ", ", line_start);
     let pad = " ".repeat(indent);
@@ -1283,8 +1304,25 @@ fn fsep_pack_inner(items: &[String], indent: usize, sep: &str, line_start: usize
             // boundary Union can still pick "inline", even when the
             // total flat doesn't fit.  Greedy `col + sep + first_line`
             // check approximates this within RS's non-Doc-tree packer.
+            // HS-faithful lookahead: when the NEXT item is multi-line
+            // (forcing a break AFTER us), the `break_sep` (typically ",")
+            // is appended at the END of our line before the newline.  HS's
+            // `fits` walks past the boundary into the next fillNBE Union
+            // and sees the trailing `,` from `punctuate`'s `arg_i <> ","`.
+            // We reserve 1 extra col for that trailing break_sep so the
+            // inline-fit decision accounts for it (matching HS's `fits`
+            // walking arg_(i-1)<>"," + " " + arg_i<>"," up to the next
+            // NilAbove from the multi-line break).
+            let break_sep_reserve = if i + 1 < items.len() && items[i + 1].contains('\n') {
+                // break_sep is sep with trailing space trimmed (when
+                // trim_break_space=true) → 1 char less than sep_chars.
+                // Concretely sep ", " → break_sep "," → 1 char.
+                if trim_break_space { sep_chars - 1 } else { 0 }
+            } else {
+                0
+            };
             let inline_fits = !force_break
-                && col + sep_chars + first_line_len <= max_col
+                && col + sep_chars + first_line_len + break_sep_reserve <= max_col
                 && (!is_multiline || col + sep_chars == indent);
             if inline_fits {
                 out.push_str(sep);
@@ -1689,7 +1727,13 @@ fn pp_step_at(m: &crate::constraint::solver::proof_method::ProofMethod, indent: 
             // the line's actual start (where `solve(` sits), not from
             // the goal's column — HS-faithful for the common case
             // where solve(...) is the whole line content.
-            let goal_str = render_goal_at(g, indent + 7, indent);
+            //
+            // Trailing for the goal = ` )` (2 chars) — used so the
+            // goal's inner fact-nestShort' Union sees these chars when
+            // deciding inline vs vertical, matching HS's `fits` which
+            // walks PAST the fact's sep into the outer doc's remaining
+            // text (including solve's closing ` )`).
+            let goal_str = render_goal_at_trailing(g, indent + 7, indent, /*trailing_chars=*/2);
             // HS `<->` is hsep-with-space (`<+>`).  Even when the goal
             // wraps to multiple lines (via its own internal `sep`s),
             // the trailing `keyword_ ")"` attaches to the LAST line of
@@ -1724,23 +1768,40 @@ fn render_goal(g: &crate::constraint::constraints::Goal) -> String {
 /// it's used as the ribbon base for HS-faithful inline-fit decisions
 /// when the goal is placed mid-line (e.g. inside `solve( <goal> )`
 /// where the goal lands at col `line_start + 7`).
+/// `trailing_chars`: chars the CALLER will append after this goal on
+/// the same line (e.g. ` )` for `solve(...)`).  Threaded into the
+/// fact's nestShort' inline-fit check so HS-faithful break decisions
+/// account for what comes after.
 fn render_goal_at(g: &crate::constraint::constraints::Goal, indent: usize, line_start: usize) -> String {
+    render_goal_at_trailing(g, indent, line_start, 0)
+}
+
+fn render_goal_at_trailing(g: &crate::constraint::constraints::Goal, indent: usize, line_start: usize, trailing_chars: usize) -> String {
     use crate::constraint::constraints::Goal;
     use crate::rule::PremIdx;
     match g {
         // `prettyGoal (ActionG i fa) = prettyNAtom (Action (varTerm i) fa)`
         // which expands (Atom.hs:214-215) to `prettyFact ppT fa <-> opAction <-> text (show v)`.
         // `<->` is hsep-with-space → `<fact> @ <node-id>`.
-        Goal::Action(i, fa) =>
-            format!("{} @ {}", render_lnfact_at(fa, indent, line_start), render_node_id(i)),
+        // Trailing for the fact = ` @ <node-id>` + caller's trailing.
+        Goal::Action(i, fa) => {
+            let nid = render_node_id(i);
+            let fact_trailing = 1 + 1 + 1 + nid.chars().count() + trailing_chars;
+            format!("{} @ {}", render_lnfact_at_with_trailing(fa, indent, line_start, fact_trailing), nid)
+        }
         // `prettyGoal (ChainG c p) = prettyNodeConc c <-> operator_ "~~>" <-> prettyNodePrem p`
         Goal::Chain(c, p) =>
             format!("{} ~~> {}", render_node_conc(c), render_node_prem(p)),
         // `prettyGoal (PremiseG (i, PremIdx v) fa) =
         //    prettyLNFact fa <-> text ("▶" ++ subscript (show v)) <-> prettyNodeId i`
-        Goal::Premise((i, PremIdx(v)), fa) =>
+        // Trailing for the fact = ` ▶<subscript> <nid>` + caller's trailing.
+        Goal::Premise((i, PremIdx(v)), fa) => {
+            let sub = goal_subscript(*v);
+            let nid = render_node_id(i);
+            let fact_trailing = 1 + 1 + sub.chars().count() + 1 + nid.chars().count() + trailing_chars;
             format!("{} \u{25B6}{} {}",
-                render_lnfact_at(fa, indent, line_start), goal_subscript(*v), render_node_id(i)),
+                render_lnfact_at_with_trailing(fa, indent, line_start, fact_trailing), sub, nid)
+        }
         // `prettyGoal (SplitG x) = text "splitEqs" <> parens (text $ show (unSplitId x))`
         // `<>` is `<>` (no space) so it's `splitEqs(<n>)`.
         Goal::Split(id) => format!("splitEqs({})", id.0),
@@ -1780,6 +1841,10 @@ fn render_lnfact(fa: &crate::fact::LNFact) -> String {
 /// `indent`, lays out the args with HS-faithful `nestShort'` semantics
 /// (see `render_fact_at` for the parser-AST equivalent).
 fn render_lnfact_at(fa: &crate::fact::LNFact, indent: usize, line_start: usize) -> String {
+    render_lnfact_at_with_trailing(fa, indent, line_start, 0)
+}
+
+fn render_lnfact_at_with_trailing(fa: &crate::fact::LNFact, indent: usize, line_start: usize, trailing_chars: usize) -> String {
     use crate::fact::Multiplicity;
     let prefix = match &fa.tag {
         crate::fact::FactTag::Proto(Multiplicity::Persistent, _, _) => "!",
@@ -1798,7 +1863,7 @@ fn render_lnfact_at(fa: &crate::fact::LNFact, indent: usize, line_start: usize) 
         args: fa.terms.iter().map(lnterm_to_parser).collect(),
         annotations: Vec::new(),
     };
-    render_fact_at(&pfa, indent, line_start)
+    render_fact_at_with_trailing(&pfa, indent, line_start, trailing_chars)
 }
 
 /// Render a `NodeId` (`LVar` of Node sort).  HS `prettyNodeId`
