@@ -587,6 +587,36 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         }
         phase!("populate_rule_variants");
 
+        // Annotate per-rule loop breakers on the OUTER theory so
+        // `pretty_closed_theory` can render HS's `// loop breaker:
+        // [<idx>]` comments at the rule output.  HS faithfulness:
+        // `prettyClosedProtoRule` (ClosedTheory.hs:337,353) reads
+        // `prettyLoopBreakers` from the `ProtoRuleACInfo` baked into
+        // every closed rule by `closeTheoryWithMaude`.  Our prover
+        // computes them inside `ProofContext::new` on a LOCAL copy
+        // of the rules — so we re-run the same `annotate_loop_breakers`
+        // pass on the outer theory here to mirror the closed-theory
+        // structure HS persists.
+        if let Some(m) = file_maude.as_ref() {
+            use tamarin_theory::theory::TheoryItem;
+            let mut rules: Vec<tamarin_theory::theory::OpenProtoRule> =
+                elaborated.items.iter().filter_map(|i| match i {
+                    TheoryItem::Rule(r) => Some(r.clone()), _ => None,
+                }).collect();
+            tamarin_theory::constraint::solver::context::annotate_loop_breakers(
+                &mut rules, m);
+            // Sequential writeback in source order.
+            let mut iter = rules.into_iter();
+            for item in elaborated.items.iter_mut() {
+                if let TheoryItem::Rule(opr) = item {
+                    if let Some(updated) = iter.next() {
+                        opr.loop_breakers = updated.loop_breakers;
+                    }
+                }
+            }
+        }
+        phase!("annotate_loop_breakers");
+
         // Dynamic Message Derivation Checks (mirrors HS
         // `checkVariableDeducability`, gated by `--derivcheck-timeout`,
         // default 5s).  Needs Maude, so we run it AFTER elaboration

@@ -314,6 +314,10 @@ pub fn abstract_rule_and_variants(
         maude.ensure_above(avoid_max);
         maude
     };
+    if std::env::var("TAM_DBG_FRESH_TRACE").is_ok() {
+        eprintln!("[fresh-trace] rule={:?} avoid_max={} counter_at_entry={}",
+            rule.info.name, avoid_max, maude.fresh_counter_peek());
+    }
 
     fn sort_of_term(t: &LNTerm) -> tamarin_term::lterm::LSort {
         use tamarin_term::vterm::Lit;
@@ -391,23 +395,35 @@ pub fn abstract_rule_and_variants(
     // composeVFresh leaves the original rule's free vars unrenamed, which
     // makes Maude's variant-witness allocation collide across variants.
     //
+    // HS's `frees` (LTerm.hs:584-585) returns `sortednub . freesList` —
+    // a SORT+DEDUP list, ordered by `Ord LVar = idx <> sort <> name`
+    // (LTerm.hs:521-523).  Document-order iteration would assign fresh
+    // idxs based on which fact mentions a variable first, which decides
+    // the FIRST KEY of every Maude variant subst and hence the variants'
+    // post-`S.fromList` sort order in HS's `simpDisjunction`.
+    //
+    // For wireguard's `Handshake_Init`, document order visits `pkR`
+    // (premise `!F_StateInvariants(..., pkR, ...)`) before `~ekI`
+    // (premise `Fr(~ekI)`), so `pkR` ends up at a smaller fresh idx
+    // than `~ekI`; the variants then sort with `pkR` first → the
+    // DH_neutral variant lands before the AC-decomposed one.  HS's
+    // sorted `frees` puts `~ekI` (Fresh, idx 0, name "ekI") before
+    // `pkR` (Msg, idx 0, name "pkR") via `Fresh < Msg` on the LSort
+    // partial order, so `~ekI` gets the smaller fresh idx and the
+    // AC-decomposed variant lands before DH_neutral — matching HS.
+    //
     // `TAM_RS_DISABLE_LEAF_RENAME=1` opts out for diagnosis.
     let leaf_rename = std::env::var("TAM_RS_DISABLE_LEAF_RENAME").is_err();
     if leaf_rename {
-        let mut leaf_vars: Vec<LVar> = Vec::new();
-        let mut seen: std::collections::BTreeSet<LVar> = std::collections::BTreeSet::new();
-        // HS uses `frees` over a Map — deduplicated.  Order is the Map's
-        // traversal order (alphabetical by name/sort/idx via Ord).
-        let mut visit = |v: &LVar| {
-            if seen.insert(v.clone()) {
-                leaf_vars.push(v.clone());
-            }
-        };
+        // HS-faithful `frees`: a BTreeSet sorts insertion by `Ord LVar`
+        // and dedupes — exactly `sortednub` semantics.
+        let mut leaf_set: std::collections::BTreeSet<LVar> = std::collections::BTreeSet::new();
+        let mut visit = |v: &LVar| { leaf_set.insert(v.clone()); };
         for f in &rule.premises { f.terms.iter().for_each(|t| t.for_each_free(&mut visit)); }
         for f in &rule.actions { f.terms.iter().for_each(|t| t.for_each_free(&mut visit)); }
         for f in &rule.conclusions { f.terms.iter().for_each(|t| t.for_each_free(&mut visit)); }
         for t in &rule.new_vars { t.for_each_free(&mut visit); }
-        for v in leaf_vars {
+        for v in leaf_set {
             let leaf_term: LNTerm = Term::Lit(tamarin_term::vterm::Lit::Var(v));
             // The result is discarded; the side effect on `bindings` is
             // what matters.
@@ -498,6 +514,9 @@ pub fn abstract_rule_and_variants(
         eprintln!("[hs-compose] rule={:?} leaf_rename={} use_hs_compose={} #variants={}",
                   rule.info.name, leaf_rename, use_hs_compose, raw_substs.len());
     }
+    // TAM_DBG_FRESH_TRACE=1: diagnostic trace of the per-rule fresh counter
+    // before/after the variant pipeline.  Used to triangulate which step
+    // consumes how many idxs when comparing witness idxs against HS.
     // HS-faithful: filter variants via `isFreshRedundant` (RuleVariants.hs:128-134)
     // BEFORE composition. A variant is redundant if it forces a freshly
     // introduced term (from a Fresh-fact premise) to also appear in a
@@ -659,8 +678,16 @@ pub fn abstract_rule_and_variants(
     // JKL_TS1_2004 Init_2 keeps `z.0 → 'g'^lkR; z.1 → 'g'^(lkI*lkR)` in
     // the residual instead of baking them into the rule's `!Sessk(...)`
     // conclusion — diverging Sessk_reveal source-case numbering downstream.
+    if std::env::var("TAM_DBG_FRESH_TRACE").is_ok() {
+        eprintln!("[fresh-trace] rule={:?} pre-simp_disj counter={} composed_substs={}",
+            rule.info.name, maude.fresh_counter_peek(), composed_substs.len());
+    }
     let (common_subst, residual) = crate::tools::equation_store::EquationStore::simp_disjunction_with_maude(
         composed_substs, |_, _| false, maude);
+    if std::env::var("TAM_DBG_FRESH_TRACE").is_ok() {
+        eprintln!("[fresh-trace] rule={:?} post-simp_disj counter={}",
+            rule.info.name, maude.fresh_counter_peek());
+    }
 
     // Apply common_subst to the abstracted rule's terms.
     let abstracted_rule = if common_subst.is_empty() {
@@ -712,6 +739,13 @@ pub fn abstract_rule_and_variants(
     // — all rule keys at idx 0 → sorted by name first → CHECKSIGN
     // variant sort order matches HS for test4/test5.
     //
+    if std::env::var("TAM_DBG_VARIANT_OUT").is_ok() {
+        eprintln!("[variant-out-pre] rule={:?} #final_substs={}", rule.info.name, final_substs.len());
+        for (i, s) in final_substs.iter().enumerate() {
+            let keys: Vec<String> = s.dom().map(|v| format!("{}.{}/{:?}", v.name, v.idx, v.sort)).collect();
+            eprintln!("[variant-out-pre]   [{}] keys=[{}]", i, keys.join(","));
+        }
+    }
     // `TAM_RS_DISABLE_VARIANT_RENAME_PRECISE=1` opts out for diagnosis.
     let use_rename_precise = std::env::var("TAM_RS_DISABLE_VARIANT_RENAME_PRECISE").is_err();
     let (abstracted_rule, final_substs) = if use_rename_precise {
@@ -719,6 +753,14 @@ pub fn abstract_rule_and_variants(
     } else {
         (abstracted_rule, final_substs)
     };
+
+    if std::env::var("TAM_DBG_VARIANT_OUT").is_ok() {
+        eprintln!("[variant-out] rule={:?} #final_substs={}", rule.info.name, final_substs.len());
+        for (i, s) in final_substs.iter().enumerate() {
+            let keys: Vec<String> = s.dom().map(|v| format!("{}.{}/{:?}", v.name, v.idx, v.sort)).collect();
+            eprintln!("[variant-out]   [{}] keys=[{}]", i, keys.join(","));
+        }
+    }
 
     Ok(Some((abstracted_rule, final_substs)))
 }
