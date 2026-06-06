@@ -541,29 +541,123 @@ fn expand_inner(
     // their per-branch share before reaching a Solved leaf, even when
     // total budget was generous.  Each child sees the same shared
     // `budget` counter, decremented as it explores.
-    for (name, sys) in cases {
-        if any_solved { break; }  // Haskell-lazy: stop on first TraceFound.
-        let mut child = ProofNode {
-            method: ProofMethod::Sorry(None),
-            sys,
-            children: BTreeMap::new(),
-            status: NodeStatus::Open,
-        };
-        // Track proof-tree path for branch-aware lockstep tracing.
-        // Skip empty-name cases (Simplify produces a single "" case
-        // with no proof-tree label — they're transparent in HS too).
-        let push_path = !name.is_empty();
-        if push_path { crate::constraint::solver::trace::case_path_push(&name); }
-        expand(ctx, &mut child, budget, deadline, depth + 1);
-        if push_path { crate::constraint::solver::trace::case_path_pop(); }
-        match child.status {
-            NodeStatus::Solved => any_solved = true,
-            NodeStatus::Contradictory => any_contra = true,
-            NodeStatus::Unfinishable => { any_unfin = true; all_closed = false; }
-            NodeStatus::Sorry => { any_sorry = true; all_closed = false; }
-            NodeStatus::Open => { all_closed = false; }
+    //
+    // Per-child parallelism (env-opt: `TAM_RS_DISABLE_PARALLEL_EXPAND=1`
+    // disables; default ON).  Mirrors HS's `parTraversable nfProofMethod`
+    // at `Theory/Proof.hs:873` inside `cutOnSolvedDFS`: HS evaluates
+    // each child's proof-method/info/children in parallel via the Eval
+    // monad strategy.  We do the equivalent by running each child's
+    // `expand` on a rayon worker.  Faithful: case sort order, per-child
+    // sys cloning, rollup semantics are unchanged.  Trade-off: parallel
+    // mode loses the `any_solved` early-break short-circuit (HS's
+    // parTraversable also forces all elements; it doesn't have lazy
+    // per-element short-circuit), so on exists-trace lemmas we may
+    // explore siblings HS's foldMap would prune.  Bounded by rayon's
+    // global pool sized via `--processors=N`.
+    //
+    // Thread-locals propagated to workers: MAX_DEPTH (read-only), and
+    // DEPTH_LIMIT_HIT (each worker sets its local, aggregated OR after
+    // the parallel pass).  case_path is best-effort under parallel:
+    // each worker seeds its stack from the parent's snapshot at entry.
+    let n_cases = cases.len();
+    let dbg_serial_only = std::env::var("TAM_RS_DISABLE_PARALLEL_EXPAND").is_ok();
+    // Gate parallel mode on all-traces lemmas only.  Exists-trace
+    // lemmas rely on the `any_solved` early-break (HS's lazy `foldMap`
+    // short-circuit on `TraceFound`) — once a single witness branch
+    // is found, sibling branches are pruned.  Parallel exploration of
+    // siblings would invalidate that pruning and explore branches HS
+    // would skip — observable as an 8× user-CPU blow-up on wireguard
+    // exists_two_sessions when parallel was enabled unconditionally.
+    // All-traces lemmas never short-circuit on Solved (Solved means a
+    // counter-example was found; valid lemmas never see this), so for
+    // those parallel exploration of every sibling matches HS exactly.
+    let parallel = !dbg_serial_only
+        && !ctx.is_exists_trace
+        && n_cases >= 2
+        && depth <= 16;  // bound recursion-level parallel splits; deeper
+                         // splits hurt more than help under rayon's
+                         // work-stealing — see HS's parLTreeDFS which
+                         // is similarly shallow in practice.
+    if parallel {
+        use rayon::prelude::*;
+        // Snapshot data needed by each worker.  MAX_DEPTH is a per-
+        // search ID-DFS limit — read once here, restored at each worker.
+        let mp_snapshot = MAX_DEPTH.with(|m| m.get());
+        // Snapshot the proof-tree case_path so each worker can seed its
+        // own thread-local stack and produce coherent trace output.
+        let path_snapshot: Vec<String> =
+            crate::constraint::solver::trace::case_path_snapshot();
+        let deadline_snapshot = *deadline;
+        let results: Vec<(String, ProofNode, bool)> = cases.into_par_iter().map(|(name, sys)| {
+            // Each rayon worker has its own thread-locals.  Initialise
+            // them from the parent's captured state so downstream code
+            // (depth-limit check, DEPTH_LIMIT_HIT bookkeeping, trace
+            // case path) sees the correct values regardless of which
+            // worker thread we land on.
+            MAX_DEPTH.with(|m| m.set(mp_snapshot));
+            DEPTH_LIMIT_HIT.with(|f| f.set(false));
+            DEADLINE.with(|d| d.set(Some(deadline_snapshot)));
+            crate::constraint::solver::trace::case_path_set(&path_snapshot);
+            let push_path = !name.is_empty();
+            if push_path { crate::constraint::solver::trace::case_path_push(&name); }
+            let mut child = ProofNode {
+                method: ProofMethod::Sorry(None),
+                sys,
+                children: BTreeMap::new(),
+                status: NodeStatus::Open,
+            };
+            // Each worker gets its own budget cell — siblings no longer
+            // share a single counter, but with the default usize::MAX
+            // (no terminal cutoff) that's faithful: HS's lazy Disj
+            // exploration also doesn't share a counter.
+            let mut local_budget = *budget;
+            expand(ctx, &mut child, &mut local_budget, &deadline_snapshot, depth + 1);
+            if push_path { crate::constraint::solver::trace::case_path_pop(); }
+            let local_hit = DEPTH_LIMIT_HIT.with(|f| f.get());
+            (name, child, local_hit)
+        }).collect();
+        // Aggregate worker DEPTH_LIMIT_HIT into the parent thread —
+        // run_proof_search's ID-DFS loop reads this to decide whether
+        // to grow MAX_DEPTH for the next iteration.
+        let any_hit = results.iter().any(|(_, _, hit)| *hit);
+        if any_hit {
+            DEPTH_LIMIT_HIT.with(|f| f.set(true));
         }
-        node.children.insert(name, child);
+        for (name, child, _hit) in results {
+            match child.status {
+                NodeStatus::Solved => any_solved = true,
+                NodeStatus::Contradictory => any_contra = true,
+                NodeStatus::Unfinishable => { any_unfin = true; all_closed = false; }
+                NodeStatus::Sorry => { any_sorry = true; all_closed = false; }
+                NodeStatus::Open => { all_closed = false; }
+            }
+            node.children.insert(name, child);
+        }
+    } else {
+        for (name, sys) in cases {
+            if any_solved { break; }  // Haskell-lazy: stop on first TraceFound.
+            let mut child = ProofNode {
+                method: ProofMethod::Sorry(None),
+                sys,
+                children: BTreeMap::new(),
+                status: NodeStatus::Open,
+            };
+            // Track proof-tree path for branch-aware lockstep tracing.
+            // Skip empty-name cases (Simplify produces a single "" case
+            // with no proof-tree label — they're transparent in HS too).
+            let push_path = !name.is_empty();
+            if push_path { crate::constraint::solver::trace::case_path_push(&name); }
+            expand(ctx, &mut child, budget, deadline, depth + 1);
+            if push_path { crate::constraint::solver::trace::case_path_pop(); }
+            match child.status {
+                NodeStatus::Solved => any_solved = true,
+                NodeStatus::Contradictory => any_contra = true,
+                NodeStatus::Unfinishable => { any_unfin = true; all_closed = false; }
+                NodeStatus::Sorry => { any_sorry = true; all_closed = false; }
+                NodeStatus::Open => { all_closed = false; }
+            }
+            node.children.insert(name, child);
+        }
     }
     // Rollup follows Haskell's `Semigroup ProofStatus`
     // (`Theory.Proof:409`):
