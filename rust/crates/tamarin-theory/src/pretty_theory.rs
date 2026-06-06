@@ -1678,16 +1678,14 @@ fn pp_step_at(m: &crate::constraint::solver::proof_method::ProofMethod, indent: 
             // the goal's column — HS-faithful for the common case
             // where solve(...) is the whole line content.
             let goal_str = render_goal_at(g, indent + 7, indent);
-            if goal_str.contains('\n') {
-                // Multi-line goal — keep the `solve( ` prefix attached to
-                // the goal's first line; the close `)` goes on its own
-                // line at the goal's last-line continuation indent (the
-                // indent where `solve(` was) — HS uses sep semantics.
-                let pad = " ".repeat(indent);
-                format!("solve( {}\n{})", goal_str, pad)
-            } else {
-                format!("solve( {} )", goal_str)
-            }
+            // HS `<->` is hsep-with-space (`<+>`).  Even when the goal
+            // wraps to multiple lines (via its own internal `sep`s),
+            // the trailing `keyword_ ")"` attaches to the LAST line of
+            // the goal output with one separating space — it does NOT
+            // get pushed onto its own line.  Match by appending ` )`
+            // to the post-wrap `goal_str` unconditionally.
+            // HS ProofMethod.hs:1494.
+            format!("solve( {} )", goal_str)
         }
         PM::Invalidated => {
             // HS `prettyProofMethod` (ProofMethod.hs):
