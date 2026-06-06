@@ -73,24 +73,58 @@ pub fn rename_precise_system(sys: &mut System) {
         state.import(id);
         rule.for_each_free(&mut |v| { state.import(v); });
     }
-    for e in &sys.edges {
+    // HS-faithful: `instance HasFrees (S.Set a)` (Term/LTerm.hs:824-827)
+    // walks the set via `foldMap (foldFrees f)` — i.e. ascending Ord
+    // order.  HS's `_sEdges` / `_sLessAtoms` / `_sSubtermStore` fields
+    // are `S.Set` (System.hs:385-388 + SubtermStore.hs:546-548) and HS
+    // visits them sorted by their derived `Ord`.  RS's `Vec` is in
+    // insertion order, which DIVERGES from HS for `requiresKU`-driven
+    // Less-atom inserts whose new vk-LVars get appended later but sort
+    // earlier by `(smaller, larger)` than older atoms.  Sort copies here
+    // ONLY for the rename-precise walk so the per-name "vk" counter
+    // assigns canonical idxs in HS Set-order — matching HS's
+    // `evalFresh ... nothingUsed`-canonicalised numbering exactly —
+    // without touching the live `less_atoms` / `edges` Vec used
+    // elsewhere.  Root cause of wireguard `--prove=exists_session`
+    // `#vk.N` off-by-{1,6,7} divergence (resolved this commit).
+    let mut edges_sorted: Vec<&crate::constraint::constraints::Edge>
+        = sys.edges.iter().collect();
+    edges_sorted.sort();
+    for e in edges_sorted {
         state.import(&e.src.0);
         state.import(&e.tgt.0);
     }
-    for la in &sys.less_atoms {
+    let mut less_sorted: Vec<&crate::constraint::constraints::LessAtom>
+        = sys.less_atoms.iter().collect();
+    less_sorted.sort();
+    for la in less_sorted {
         state.import(&la.smaller);
         state.import(&la.larger);
     }
     if let Some(la) = &sys.last_atom { state.import(la); }
-    for c in &sys.subterm_store.subterms {
+    // HS `HasFrees SubtermStore` (SubtermStore.hs:546-548) walks
+    // `negSt <> st <> solvedSt`; each summand is a `S.Set` — sorted.
+    // SubtermConstraint isn't `Ord` in RS so sort by `(small, big)`
+    // which mirrors HS's derived ordering on the analogous field pair.
+    let mut sub_sorted: Vec<&crate::tools::subterm_store::SubtermConstraint>
+        = sys.subterm_store.subterms.iter().collect();
+    sub_sorted.sort_by(|a, b| (&a.small, &a.big).cmp(&(&b.small, &b.big)));
+    for c in sub_sorted {
         c.small.for_each_free(&mut |v| { state.import(v); });
         c.big.for_each_free(&mut |v| { state.import(v); });
     }
-    for c in &sys.subterm_store.solved_subterms {
+    let mut solved_sorted: Vec<&crate::tools::subterm_store::SubtermConstraint>
+        = sys.subterm_store.solved_subterms.iter().collect();
+    solved_sorted.sort_by(|a, b| (&a.small, &a.big).cmp(&(&b.small, &b.big)));
+    for c in solved_sorted {
         c.small.for_each_free(&mut |v| { state.import(v); });
         c.big.for_each_free(&mut |v| { state.import(v); });
     }
-    // eq_store.subst: visit keys (dom) and values (range).
+    // eq_store.subst: visit keys (dom) and values (range).  RS's
+    // `Subst` is `BTreeMap`-backed, so `to_list()` already returns
+    // pairs in ascending-key order — matches HS's `HasFrees (LSubst c)
+    // = foldFrees f . sMap` walking `M.Map LVar Term` ascending
+    // (SubstVFree.hs:221).
     for (k, t) in sys.eq_store.subst.to_list() {
         state.import(&k);
         t.for_each_free(&mut |v| { state.import(v); });
@@ -99,18 +133,50 @@ pub fn rename_precise_system(sys: &mut System) {
     // walks DOMAIN (keys), NOT values (SubstVFresh.hs:196-202).  This
     // preserves the witness idxs in values — crucial for
     // sort-discriminating across variants at perform_split.
+    //
+    // The outer container `Conj (SplitId, S.Set LNSubstVFresh)`
+    // (EquationStore.hs:131) is a `Conj`-list (insertion order — match
+    // with RS's `Vec<EqDisj>`).  The INNER `S.Set LNSubstVFresh` is Ord
+    // ascending — sort to match.
     for d in &sys.eq_store.conj {
-        for s in &d.substs {
+        let mut substs_sorted: Vec<&tamarin_term::subst_vfresh::SubstVFresh<tamarin_term::lterm::Name, LVar>>
+            = d.substs.iter().collect();
+        substs_sorted.sort();
+        for s in substs_sorted {
             for (k, _t) in s.to_list() {
                 state.import(&k);
                 // Note: value vars NOT imported (HS-faithful).
             }
         }
     }
-    for f in &sys.formulas { guarded_for_each_free(f, &mut |v| { state.import(v); }); }
-    for f in &sys.solved_formulas { guarded_for_each_free(f, &mut |v| { state.import(v); }); }
-    for f in &sys.lemmas { guarded_for_each_free(f, &mut |v| { state.import(v); }); }
-    for (g, _) in &sys.goals {
+    // HS-faithful: `_sFormulas` / `_sSolvedFormulas` / `_sLemmas` are
+    // `S.Set LNGuarded` (System.hs:390-392), walked via `HasFrees (S.Set
+    // a) = foldMap (foldFrees f)` in Ord-ascending.  RS's
+    // `Vec<Guarded>` is in insertion order — sort via the existing
+    // `cmp_guarded` helper (guarded.rs:66) which mirrors HS's derived
+    // `Ord Guarded` (Guarded.hs:121-129).
+    let mut formulas_sorted: Vec<&crate::guarded::Guarded>
+        = sys.formulas.iter().collect();
+    formulas_sorted.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
+    for f in formulas_sorted { guarded_for_each_free(f, &mut |v| { state.import(v); }); }
+    let mut solved_formulas_sorted: Vec<&crate::guarded::Guarded>
+        = sys.solved_formulas.iter().collect();
+    solved_formulas_sorted.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
+    for f in solved_formulas_sorted { guarded_for_each_free(f, &mut |v| { state.import(v); }); }
+    let mut lemmas_sorted: Vec<&crate::guarded::Guarded>
+        = sys.lemmas.iter().collect();
+    lemmas_sorted.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
+    for f in lemmas_sorted { guarded_for_each_free(f, &mut |v| { state.import(v); }); }
+    // HS-faithful: `_sGoals` is `M.Map Goal GoalStatus` (System.hs:393),
+    // walked via `HasFrees (M.Map k v) = M.foldrWithKey combine`
+    // (Term/LTerm.hs:829-836) in ascending key order (`Ord Goal`).
+    // `goal_cmp` matches HS's derived `Ord Goal`
+    // (System/Constraints.hs:155-168); see goals.rs:1687 test.
+    let mut goals_sorted: Vec<&(Goal, crate::constraint::system::GoalStatus)>
+        = sys.goals.iter().collect();
+    goals_sorted.sort_by(|a, b|
+        crate::constraint::solver::goals::goal_cmp(&a.0, &b.0));
+    for (g, _) in goals_sorted {
         goal_for_each_free(g, &mut |v| { state.import(v); });
     }
 
