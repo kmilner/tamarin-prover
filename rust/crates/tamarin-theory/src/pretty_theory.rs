@@ -1271,6 +1271,18 @@ fn fsep_pack_inner(items: &[String], indent: usize, sep: &str, line_start: usize
             // For multi-line items, also require they land at a fresh
             // break (col == indent) so continuation lines' pre-indent
             // matches the absolute col.  Otherwise force a break.
+            //
+            // Note: HS's `fsep`/`fill` (HughesPJ.hs:780-805) uses
+            // `fillNBE`/`fits` to decide at each item-boundary whether
+            // to inline.  `fits` walks the flat alt's RESOLVED doc tree
+            // and returns True as soon as it hits a `NilAbove` or
+            // `Empty`.  In practice this means "first line of flat
+            // alt fits".  When a later item internally breaks (its
+            // `nestShort'` Union picks multi-line), `fits` short-circuits
+            // True at that internal NilAbove — so the OUTER item's
+            // boundary Union can still pick "inline", even when the
+            // total flat doesn't fit.  Greedy `col + sep + first_line`
+            // check approximates this within RS's non-Doc-tree packer.
             let inline_fits = !force_break
                 && col + sep_chars + first_line_len <= max_col
                 && (!is_multiline || col + sep_chars == indent);
