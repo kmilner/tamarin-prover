@@ -1205,7 +1205,27 @@ fn try_match_all_guards(
             // Reverted to witness+bound normalisation only.
             let apply_canon = |f: &crate::guarded::Guarded| {
                 let f1 = crate::guarded::normalize_witness_lvars(f);
-                crate::guarded::normalize_bound_lvars(&f1)
+                let f2 = crate::guarded::normalize_bound_lvars(&f1);
+                // HS-faithful: collapse AC-`BinOp` permutations so two
+                // formulas that differ only by AC argument ordering
+                // (e.g. `Mult(ltkI, ekR)` vs `Mult(ekR, ltkI)`) compare
+                // equal under `==`.  HS stores formulas as LNTerm where
+                // every `mapFrees` re-sorts AC heads via `f_app_ac`; RS
+                // stores parser-AST `BinOp(op, l, r)` whose `subst_term`
+                // never re-sorts.  After `rename_precise_system` renumbers
+                // free vars (e.g. `ltkI.7 → ltkI.0`, `ekR.5 → ekR.0`), the
+                // LVar `Ord` (`idx`-first ⇒ `name`-only on ties) flips,
+                // leaving the stored formula's `BinOp` in a now-unsorted
+                // slot order — while a freshly built implied formula
+                // (lnterm_to_term of an `f_app_ac`-output) is in canonical
+                // sorted form.  Without this normalisation, dedup fails
+                // and `insertImpliedFormulas` adds a structurally-duplicate
+                // formula on every subsequent `simplifySystem` call,
+                // breaking idempotency (wireguard::key_secrecy: each call
+                // adds 1 RKeys-from-IKeys implication, RS emits an extra
+                // `simplify` proof-tree node where HS reports
+                // `Nothing` from the `sys' /= cleanup sys` guard).
+                crate::guarded::canonicalize_ac_in_guarded(&f2)
             };
             let canon = apply_canon(&implied);
             // TAM_RS_TRACE_FORM=1 also emits an `Impl-candidate` event
