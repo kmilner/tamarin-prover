@@ -784,7 +784,41 @@ fn pp_term(t: &p::Term, prec: TermPrec, scope: &[Bind], out: &mut String) {
             // — AC ops always print with surrounding `(` `)` (the
             // `"("`/`")"` lead/finish in `ppTerms`); exp prints with
             // no precedence/paren guard.
+            //
+            // For AC ops: HS's term is `FApp (AC op) [args]` — a flat
+            // n-ary node — so `ppTerms` joins with the op and a SINGLE
+            // outer paren-pair surrounds the whole chain.  Our parser
+            // AST represents AC as binary `BinOp(op, l, r)`; to match
+            // HS's flat rendering, flatten same-op children and join
+            // with the op symbol.  Without this, nested binary
+            // representations like `Xor(Xor(a, b), c)` print as
+            // `((a⊕b)⊕c)` instead of HS's `(a⊕b⊕c)`.
             let is_exp = matches!(op, p::BinOp::Exp);
+            let is_ac = matches!(op,
+                p::BinOp::Mult | p::BinOp::Union | p::BinOp::Xor | p::BinOp::NatPlus);
+            if is_ac {
+                fn flatten<'a>(op: p::BinOp, t: &'a p::Term, out: &mut Vec<&'a p::Term>) {
+                    match t {
+                        p::Term::BinOp(inner, l, r) if *inner == op => {
+                            flatten(op, l, out);
+                            flatten(op, r, out);
+                        }
+                        _ => out.push(t),
+                    }
+                }
+                let mut flat: Vec<&p::Term> = Vec::new();
+                flatten(*op, l, &mut flat);
+                flatten(*op, r, &mut flat);
+                out.push('(');
+                let sym = binop_symbol(*op);
+                for (i, child) in flat.iter().enumerate() {
+                    if i > 0 { out.push_str(sym); }
+                    pp_term(child, TermPrec::Top, scope, out);
+                }
+                out.push(')');
+                let _ = prec;
+                return;
+            }
             if !is_exp { out.push('('); }
             // Within an exp, children print at Top (no extra parens for
             // nested `^`).  Within an AC, children at Top — AC nesting

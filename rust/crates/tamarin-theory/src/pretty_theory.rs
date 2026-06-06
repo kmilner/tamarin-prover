@@ -503,7 +503,18 @@ fn same_rule_body(
 /// when it overflows the 76-col threshold, wraps each clause to its own
 /// line as HS's `prettyRuleRestrGen` does via `sep`.
 fn render_rule_body(prems: &[p::Fact], acts: &[p::Fact], concs: &[p::Fact]) -> String {
-    render_rule_body_at(prems, acts, concs, 3)
+    // AC-canonicalise the rule body BEFORE rendering — the parser produces
+    // left-associative nested `BinOp(Xor, BinOp(Xor, na, k), nb)` for
+    // `na ⊕ k ⊕ nb`, but HS's `fAppAC` at parse time flattens and sorts
+    // the multiset, producing a different visual order (`k ⊕ nb ⊕ na`).
+    // We apply the same canonicalisation to the parser AST so the rendered
+    // rule body matches HS byte-for-byte.  `term_to_lnterm` already
+    // canonicalises on the LNTerm path; this fixes the parser-AST path.
+    use crate::elaborate::canonicalize_ac_in_pfact;
+    let prems2: Vec<p::Fact> = prems.iter().map(canonicalize_ac_in_pfact).collect();
+    let acts2:  Vec<p::Fact> = acts.iter().map(canonicalize_ac_in_pfact).collect();
+    let concs2: Vec<p::Fact> = concs.iter().map(canonicalize_ac_in_pfact).collect();
+    render_rule_body_at(&prems2, &acts2, &concs2, 3)
 }
 
 /// Render rule body at column `indent`.  Used by the AC variant block
