@@ -691,17 +691,25 @@ fn pp_atom(a: &p::Atom, scope: &[Bind], out: &mut String) {
 // =============================================================================
 
 fn pp_fact(fa: &p::Fact, scope: &[Bind], out: &mut String) {
-    // HS `prettyFact` uses `nestShort'` which renders as `Name( args )`
-    // with single-space padding inside the parens, comma-separated args.
-    // Empty-arg facts still keep the spacing.
+    // HS `prettyFact` (Theory/Model/Fact.hs:539-544):
+    //   `ppFact n t = nestShort' (n ++ "(") ")" . fsep . punctuate comma $ map ppTerm t`
+    // `nestShort'` (Utils/PrettyPrint/Class.hs:221-223) wraps as
+    // `sep [text "Name(", body, text ")"]`. When `body` is empty
+    // (empty-arg fact), HS's HughesPJ `sep` collapses the empty middle
+    // and emits `Name( )` with ONE inner space; non-empty `body` emits
+    // `Name( a, b )` with one space pad on each side.
     if fa.persistent { out.push('!'); }
     out.push_str(&fa.name);
-    out.push_str("( ");
-    for (i, t) in fa.args.iter().enumerate() {
-        if i > 0 { out.push_str(", "); }
-        pp_term(t, TermPrec::Top, scope, out);
+    if fa.args.is_empty() {
+        out.push_str("( )");
+    } else {
+        out.push_str("( ");
+        for (i, t) in fa.args.iter().enumerate() {
+            if i > 0 { out.push_str(", "); }
+            pp_term(t, TermPrec::Top, scope, out);
+        }
+        out.push_str(" )");
     }
-    out.push_str(" )");
 }
 
 // =============================================================================
@@ -742,8 +750,33 @@ fn pp_term(t: &p::Term, prec: TermPrec, scope: &[Bind], out: &mut String) {
         NatOne => out.push_str("%1"),
         DhNeutral => out.push_str("1:msg"),
         Pair(items) => {
+            // HS `prettyTerm` (Term/Term.hs:277,292-293):
+            //   `FApp pairSym _ -> ppTerms ", " 1 "<" ">" (split t)`
+            //   `split (FPair t1 t2) = t1 : split t2`
+            // HS's right-associative `tupleterm` parser
+            // (Theory/Text/Parser/Term.hs:188) makes `<a, b, c>` into
+            // `Pair(a, Pair(b, c))`. When the last item of a Pair is
+            // itself a Pair (as in `<a, b, <c, d>>` →
+            // `Pair(a, Pair(b, Pair(c, d)))`), HS's recursive `split`
+            // walks the rightmost child and emits a flat
+            // `<a, b, c, d>`. Mirror that here: splice the last item
+            // when it's a Pair.
+            let mut flat: Vec<&p::Term> = Vec::with_capacity(items.len());
+            let mut cur: &[p::Term] = items;
+            loop {
+                let n = cur.len();
+                if n == 0 { break; }
+                for it in &cur[..n - 1] { flat.push(it); }
+                let last = &cur[n - 1];
+                if let Pair(inner) = last {
+                    cur = inner;
+                } else {
+                    flat.push(last);
+                    break;
+                }
+            }
             out.push('<');
-            for (i, it) in items.iter().enumerate() {
+            for (i, it) in flat.iter().enumerate() {
                 if i > 0 { out.push_str(", "); }
                 pp_term(it, TermPrec::Top, scope, out);
             }
@@ -1360,14 +1393,20 @@ fn pp_gatom(a: &crate::guarded::GAtom, scope: &[Vec<Bind>], out: &mut String) {
 
 fn pp_gfact(fa: &crate::guarded::GFact, scope: &[Vec<Bind>], out: &mut String) {
     // HS-faithful: `Name( args )` with internal spaces, matching `pp_fact`.
+    // Empty-arg case collapses to a single inner space — see `pp_fact`
+    // for the HS citation.
     if fa.persistent { out.push('!'); }
     out.push_str(&fa.name);
-    out.push_str("( ");
-    for (i, t) in fa.args.iter().enumerate() {
-        if i > 0 { out.push_str(", "); }
-        pp_gterm(t, TermPrec::Top, scope, out);
+    if fa.args.is_empty() {
+        out.push_str("( )");
+    } else {
+        out.push_str("( ");
+        for (i, t) in fa.args.iter().enumerate() {
+            if i > 0 { out.push_str(", "); }
+            pp_gterm(t, TermPrec::Top, scope, out);
+        }
+        out.push_str(" )");
     }
-    out.push_str(" )");
 }
 
 fn pp_gterm(t: &crate::guarded::GTerm, prec: TermPrec, scope: &[Vec<Bind>], out: &mut String) {

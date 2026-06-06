@@ -519,8 +519,18 @@ fn prove_probe(
 
 fn format_deriv_report(per_rule: &[(String, Vec<String>)]) -> Vec<WfError> {
     if per_rule.is_empty() { return Vec::new(); }
-    let mut msg = String::from(
-        "The variables of the following rule(s) are not derivable \
+    // HS `reportVars` (Theory/Tools/MessageDerivationChecks.hs:122-127)
+    //   `[(underlineTopic "Message Derivation Checks",
+    //     text $ "The variables of the following rule(s) ... pattern matching.\n\n" ++ errors)]`
+    // The renderer in HS (`prettyWfErrorReport`) lays the topic + body
+    // out as `<title>\n<====>\n\n  <body>\n`. The body is then indented
+    // by 2 spaces at its first line via `nest 2`-equivalent, then the
+    // per-rule blocks follow at col 0. See HS output bytes — the intro
+    // line has a 2-space leading indent.
+    let mut msg = tamarin_parser::wf::underline_topic("Message Derivation Checks");
+    msg.push('\n');
+    msg.push_str(
+        "  The variables of the following rule(s) are not derivable \
          from their premises, you may be performing unintended pattern \
          matching.\n\n");
     let blocks: Vec<String> = per_rule.iter()

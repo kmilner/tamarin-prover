@@ -555,20 +555,49 @@ fn render_rule_body_at(prems: &[p::Fact], acts: &[p::Fact], concs: &[p::Fact], i
         if !acts_inline.contains('\n') && acts_inline.chars().count() <= indent + RIBBON {
             out.push_str(&acts_inline);
         } else {
-            // Multi-line action list — HS `fsep [text "--[", ppList acts,
-            // text "]->"]` puts `--[` and `]->` on their own lines with
-            // packed acts in between.  We match the previous shape: each
-            // act on its own line under the `--[`, comma-suffixed.
-            out.push_str(&pad_arrow);
-            out.push_str("--[\n");
-            for (i, a) in acts.iter().enumerate() {
-                out.push_str(&pad_arrow);
-                out.push_str(&render_fact_at(a, indent.saturating_sub(1), indent.saturating_sub(1)));
-                if i + 1 < acts.len() { out.push(','); }
+            // HS `fsep [text "--[", ppList acts, text "]->"]` (Rule.hs:1258-1261)
+            // with `ppList = fsep . punctuate comma`. We mirror HS's
+            // fsep packing semantics in three stages:
+            //
+            //   (1) `--[ body ]->` all on one line — checked above.
+            //   (2) `--[ body` on one line + `]->` on next — i.e. only
+            //       the closer breaks. Picked when the body is short
+            //       enough to inline after `--[` but the closer pushes
+            //       over.
+            //   (3) `--[` alone, then body fsep-packed across lines,
+            //       then `]->` alone. Picked when (2) still overflows.
+            //
+            // The inner body in cases (2)/(3) is an `fsep . punctuate
+            // comma` over the acts, so multi-fact bodies pack across
+            // lines comma-by-comma (HS pattern at CH07 line 22-27).
+            let body_indent = indent.saturating_sub(1);
+            // Try (2): `--[ acts_inline_body` on one line.
+            let opener_inline = format!("{}--[ {}", pad_arrow, acts_inline_body);
+            let opener_fits = !opener_inline.contains('\n')
+                && opener_inline.chars().count() <= indent + RIBBON;
+            if opener_fits {
+                out.push_str(&opener_inline);
                 out.push('\n');
+                out.push_str(&pad_arrow);
+                out.push_str("]->");
+            } else {
+                // (3) `--[` alone, then packed body, then `]->`.
+                // Render each act at `body_indent` so any internal
+                // multi-line continuation aligns to that col (matches
+                // the original per-act layout). `body_indent ==
+                // indent-1 == pad_arrow.len()`.
+                let act_strs: Vec<String> = acts.iter()
+                    .map(|a| render_fact_at(a, body_indent, body_indent))
+                    .collect();
+                out.push_str(&pad_arrow);
+                out.push_str("--[\n");
+                out.push_str(&" ".repeat(body_indent));
+                let packed = fsep_pack(&act_strs, body_indent, ", ", body_indent);
+                out.push_str(&packed);
+                out.push('\n');
+                out.push_str(&pad_arrow);
+                out.push_str("]->");
             }
-            out.push_str(&pad_arrow);
-            out.push_str("]->");
         }
     }
     out.push('\n');
@@ -916,13 +945,32 @@ fn render_fact_brackets_at(facts: &[p::Fact], indent: usize, line_start: usize) 
     if !inline.contains('\n') && indent + inline.chars().count() < inline_max_col {
         return inline;
     }
-    // Multi-line: each fact at column `indent`, packed greedily.
-    // Each fact line starts at col `indent`, so line_start = indent.
+    // HS `ppFactsList list = fsep [text "[", ppFacts' list, text "]"]`
+    // (Rule.hs:1268). The three-doc fsep tries:
+    //   (1) `[ body ]` inline  (checked above)
+    //   (2) `[ body\n]`         — body inline after `[`, closer on
+    //                             its own line
+    //   (3) `[\n body \n]`      — full break around the body
+    //
+    // For (2)/(3) the body is itself `fsep . punctuate comma` so it
+    // packs across lines comma-by-comma.
+    let inline_body = facts.iter()
+        .map(render_fact)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let opener_inline_body = format!("[ {}", inline_body);
+    let opener_fits = !opener_inline_body.contains('\n')
+        && indent + opener_inline_body.chars().count() <= inline_max_col;
+    let pad = " ".repeat(indent);
+    if opener_fits {
+        // Layout (2): `[ body\n<pad>]`
+        return format!("{}\n{}]", opener_inline_body, pad);
+    }
+    // Layout (3): each fact at column `indent`, packed greedily.
     let items: Vec<String> = facts.iter()
         .map(|f| render_fact_at(f, indent, indent))
         .collect();
     let body = fsep_pack(&items, indent, ", ", indent);
-    let pad = " ".repeat(indent);
     format!("[\n{}{}\n{}]", pad, body, pad)
 }
 
@@ -1391,7 +1439,16 @@ fn render_parsed_lemma(lem: &p::Lemma, proved: &[ProvedLemma]) -> String {
     let quant = quantifier_keyword(&lem.trace_quantifier);
     let flat_formula = pf::pretty_formula(&lem.formula);
     let one_line = format!("  {} \"{}\"", quant, flat_formula);
-    if one_line.chars().count() <= pf::WRAP_WIDTH {
+    // HS-faithful fit check: HughesPJ's `fits` walks only the flat doc
+    // text (ignoring `Nest` indent), so the check budget compares the
+    // doc's CONTENT length against `min(lineLength, ribbon) - sl`. Here
+    // the sep is wrapped in `nest 2` on a fresh line (sl=0), so budget
+    // = min(110, 73) = 73 and content = total_chars - 2_indent. Sticking
+    // with `total_chars <= WRAP_WIDTH(=ribbon=73)` would reject docs of
+    // content-length 72 (HS-fit at 73 with 1 spare); subtract the
+    // leading nest indent so the check matches HS's `fits`.
+    let content_len = one_line.chars().count().saturating_sub(2);
+    if content_len <= pf::WRAP_WIDTH {
         out.push_str(&one_line);
     } else {
         // The formula starts at column 3 (`  "` prefix).  Width 76 means
