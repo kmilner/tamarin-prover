@@ -1271,12 +1271,27 @@ impl MaudeHandle {
         // # and %) and the second lookup returns the first's LVar.
         // `TAM_RS_DISABLE_VARIANT_CTX_ISOLATION=1` reverts for diagnosis.
         let isolate = std::env::var("TAM_RS_DISABLE_VARIANT_CTX_ISOLATION").is_err();
+        // HS-faithful: variant back-conversion uses hint "x" unconditionally
+        // (Maude/Types.hs:138), NOT the perform_split-motivated
+        // name-preserve path used by `unify`/`match`.  The variants flow
+        // into `composeVFresh`+`pracVariants` rendering; using "x" here
+        // matches both HS's printed `~k = ~x.5` form AND HS's variant
+        // ordering after the per-variant Ord sort (Ord LVar = idx <> sort
+        // <> name puts `~x.N` AFTER same-idx `~na.N`/`~nb.N`).
+        let force_x = std::env::var("TAM_RS_DISABLE_VARIANT_FORCE_X").is_err();
         for ms in &msubsts {
+            let conv = |ctx_ref: &mut ConvCtx| -> Result<_, MaudeError> {
+                if force_x {
+                    msubst_to_lnsubst_force_x(ms, ctx_ref)
+                } else {
+                    msubst_to_lnsubst(ms, ctx_ref)
+                }
+            };
             if isolate {
                 let mut variant_ctx = ctx.clone();
-                out.push(msubst_to_lnsubst(ms, &mut variant_ctx)?);
+                out.push(conv(&mut variant_ctx)?);
             } else {
-                out.push(msubst_to_lnsubst(ms, &mut ctx)?);
+                out.push(conv(&mut ctx)?);
             }
         }
         Ok(out)
@@ -1345,6 +1360,48 @@ fn msubst_to_lnsubst_with_avoid(
     avoid_max: u64,
 ) -> Result<Vec<(crate::lterm::LVar, LNTerm)>, MaudeError> {
     msubst_to_lnsubst_with_maude(ms, ctx, avoid_max, None)
+}
+
+/// Variant of `msubst_to_lnsubst` that forces the Maude-witness name hint
+/// to `"x"` regardless of whether the value is a pure rename — matching
+/// HS's `msubstToLSubstVFresh` (Maude/Types.hs:138) which always passes
+/// `mTermToLNTerm "x" mt` for Maude-introduced witnesses.
+///
+/// The non-`_force_x` form preserves the domain LVar's name when the
+/// value is a pure `Lit FreshVar`; that was added for the `perform_split`
+/// ordering of the EquationStore's runtime-narrowing unifiers (see
+/// project-split-case-divergence-root memory).  The `variants()` path,
+/// however, feeds `composeVFresh` (RuleVariants.hs:74) which then routes
+/// to `pracVariants`'s pretty-printer — and HS's hint there is
+/// unconditionally `"x"`.  Using the domain name there makes:
+///   (a) variant `~k = ~k.5` (RS) vs `~k = ~x.5` (HS) trace divergence;
+///   (b) the Ord-on-SubstVFresh permutation that reorders the variant
+///       list (e.g. CRxor's `initiator2` swaps variants 1↔3).
+fn msubst_to_lnsubst_force_x(
+    ms: &MSubst,
+    ctx: &mut ConvCtx,
+) -> Result<Vec<(crate::lterm::LVar, LNTerm)>, MaudeError> {
+    let mut out = Vec::with_capacity(ms.len());
+    let mut next: u64 = {
+        let mut n: u64 = 1;
+        for lit in ctx.bindings().values() {
+            if let crate::vterm::Lit::Var(lv) = lit {
+                if lv.name == "x" && lv.idx >= n {
+                    n = lv.idx + 1;
+                }
+            }
+        }
+        n
+    };
+    for ((sort, idx), mt) in ms {
+        let lv = crate::maude_types::substitute_lookup_var(ctx, *sort, *idx)
+            .ok_or_else(|| MaudeError::Other(format!(
+                "no binding for Maude variable x{}:{:?}", idx, sort)))?;
+        // HS-faithful: always hint "x", matching Maude/Types.hs:138.
+        let t = mterm_to_lnterm(mt, ctx, "x", &mut next);
+        out.push((lv, t));
+    }
+    Ok(out)
 }
 
 /// Maude-handle-aware variant: draws witness indices from the
