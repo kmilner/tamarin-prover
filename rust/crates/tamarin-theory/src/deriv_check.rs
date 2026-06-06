@@ -517,59 +517,6 @@ fn prove_probe(
     Some(undecidable)
 }
 
-/// Run `prove_lemma` with a wall-clock cap of `timeout`.  Returns
-/// `true` iff the prover found a trace (Solved for exists-trace).
-#[allow(dead_code)]
-fn try_prove_within(
-    parsed: &p::Theory,
-    lemma_name: &str,
-    maude: MaudeHandle,
-    timeout: Duration,
-) -> bool {
-    let prev_deadline = std::env::var("TAM_PROVE_DEADLINE_MS").ok();
-    // Convert duration to ms.  +1 to guard against rounding-to-0 for
-    // sub-second durations (HS clamps to whole seconds; we accept any
-    // sub-second too, but a 0-ms deadline would immediately Sorry).
-    let ms = (timeout.as_millis() as u64).max(1);
-    std::env::set_var("TAM_PROVE_DEADLINE_MS", ms.to_string());
-    // TAM_DBG_DERIV_TIMING also propagates an inner phase trace via
-    // TAM_DBG_PHASE so we can see elaborate/saturate/search splits.
-    let restore_phase = if std::env::var_os("TAM_DBG_DERIV_TIMING").is_some()
-        && std::env::var_os("TAM_DBG_PHASE").is_none()
-    {
-        std::env::set_var("TAM_DBG_PHASE", "1");
-        true
-    } else { false };
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::prove::prove_lemma(parsed, lemma_name, maude, 1000)
-    }));
-    if restore_phase {
-        std::env::remove_var("TAM_DBG_PHASE");
-    }
-    // Restore prior deadline so the deriv check doesn't leak into the
-    // main prove loop.
-    match prev_deadline {
-        Some(v) => std::env::set_var("TAM_PROVE_DEADLINE_MS", v),
-        None => std::env::remove_var("TAM_PROVE_DEADLINE_MS"),
-    }
-    match result {
-        Ok(Ok(node)) => {
-            if std::env::var_os("TAM_DBG_DERIV_CHECK").is_some() {
-                eprintln!("[deriv] prove {} -> status={:?} children={}",
-                    lemma_name, node.status, node.children.len());
-            }
-            matches!(node.status, crate::constraint::solver::search::NodeStatus::Solved)
-        }
-        Ok(Err(e)) => {
-            if std::env::var_os("TAM_DBG_DERIV_CHECK").is_some() {
-                eprintln!("[deriv] prove {} -> ProveError {:?}", lemma_name, e);
-            }
-            false
-        }
-        Err(_) => false,
-    }
-}
-
 fn format_deriv_report(per_rule: &[(String, Vec<String>)]) -> Vec<WfError> {
     if per_rule.is_empty() { return Vec::new(); }
     let mut msg = String::from(

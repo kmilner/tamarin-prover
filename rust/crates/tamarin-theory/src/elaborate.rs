@@ -88,8 +88,8 @@ use crate::rule::{
 use crate::signature::SignaturePure;
 use crate::guarded::formula_to_guarded;
 use crate::theory::{
-    AccLemma, CaseTest, DiffLemma, LNMacro, Lemma, LemmaAttr, OpenProtoRule,
-    OpenRestriction, Options, ProofSkeleton, Theory, TheoryItem, Side,
+    AccLemma, CaseTest, LNMacro, Lemma, LemmaAttr, OpenProtoRule,
+    OpenRestriction, ProofSkeleton, Theory, TheoryItem,
     TraceQuantifier, TranslationElement,
 };
 
@@ -1391,9 +1391,3 @@ mod tests {
     }
 }
 
-#[allow(unused)]
-fn _suppress_unused_imports() {
-    let _ = (Side::LHS, DiffLemma {
-        name: String::new(), attributes: Vec::new(), proof: ProofSkeleton::unproven(),
-    }, Options::default());
-}
