@@ -98,7 +98,7 @@ pub fn lterm_to_mterm_global(t: &LNTerm, ctx: &mut ConvCtx) -> MTerm {
         Term::Lit(lit) => Term::Lit(import_lit(lit, ctx)),
         Term::App(sym, args) => {
             let new_args: Vec<MTerm> = args.iter().map(|a| lterm_to_mterm_global(a, ctx)).collect();
-            Term::App(sym.clone(), new_args)
+            Term::App(sym.clone(), new_args.into())
         }
     }
 }
@@ -177,7 +177,7 @@ pub fn mterm_to_lnterm(
             // is preserved.
             match sym {
                 FunSym::Ac(op) => crate::term::f_app_ac(*op, new_args),
-                _ => Term::App(sym.clone(), new_args),
+                _ => Term::App(sym.clone(), new_args.into()),
             }
         }
     }

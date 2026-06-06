@@ -57,7 +57,7 @@ pub fn find_all_subterms(l: &LNTerm, r: &LNTerm) -> Option<Vec<Position>> {
         Term::App(_, args) => {
             if !direct.is_empty() { return Some(direct); }
             let mut out = Vec::new();
-            for sub in args {
+            for sub in args.iter() {
                 let parts = find_all_subterms(l, sub)?;
                 out.extend(parts);
             }

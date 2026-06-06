@@ -1150,7 +1150,7 @@ impl EquationStore {
             let first = &d.substs[0];
             for (v, t) in first.to_list() {
                 let (op, args0) = match &t {
-                    Term::App(o, a) => (o.clone(), a.clone()),
+                    Term::App(o, a) => (o.clone(), a.to_vec()),
                     _ => continue,
                 };
                 let mut argss: Vec<Vec<LNTerm>> = vec![args0];
@@ -1158,7 +1158,7 @@ impl EquationStore {
                 for other in d.substs.iter().skip(1) {
                     match other.image_of(&v) {
                         Some(Term::App(o2, a2)) if o2 == &op => {
-                            argss.push(a2.clone());
+                            argss.push(a2.to_vec());
                         }
                         _ => { ok = false; break; }
                     }
@@ -1253,7 +1253,7 @@ impl EquationStore {
                 Term::App(op.clone(), vec![
                     Term::Lit(Lit::Var(fv1.clone())),
                     Term::Lit(Lit::Var(fv2.clone())),
-                ]),
+                ].into()),
             )]);
             // HS-faithful order (`foreachDisjAt`): replace the disj FIRST,
             // then apply_eq_store the factor.  See the non-AC branch above
@@ -1276,7 +1276,7 @@ impl EquationStore {
                     let a_rest = if args.len() == 2 {
                         args[1].clone()
                     } else {
-                        Term::App(op.clone(), args[1..].to_vec())
+                        Term::App(op.clone(), args[1..].to_vec().into())
                     };
                     kept.push((fv1.clone(), a1));
                     kept.push((fv2.clone(), a_rest));

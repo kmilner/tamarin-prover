@@ -3257,12 +3257,12 @@ fn ku_decomp_subterms(t: &tamarin_term::lterm::LNTerm)
     match t {
         Term::App(FunSym::NoEq(s), args)
             if s.name == b"pair" && args.len() == 2
-                => Some(args.clone()),
+                => Some(args.to_vec()),
         Term::App(FunSym::NoEq(s), args)
             if s.name == INV_SYM_STRING && args.len() == 1
-                => Some(args.clone()),
-        Term::App(FunSym::Ac(AcSym::Mult), args) => Some(args.clone()),
-        Term::App(FunSym::Ac(AcSym::Union), args) => Some(args.clone()),
+                => Some(args.to_vec()),
+        Term::App(FunSym::Ac(AcSym::Mult), args) => Some(args.to_vec()),
+        Term::App(FunSym::Ac(AcSym::Union), args) => Some(args.to_vec()),
         _ => None,
     }
 }
@@ -4932,7 +4932,7 @@ impl<'ctx> Reduction<'ctx> {
             Some(tamarin_term::term::Term::App(
                 tamarin_term::function_symbols::FunSym::Ac(
                     tamarin_term::function_symbols::AcSym::Union),
-                args)) if args.len() >= 2 => Some(args.clone()),
+                args)) if args.len() >= 2 => Some(args.to_vec()),
             _ => None,
         };
         if let Some(args) = funion_args {
@@ -4942,7 +4942,7 @@ impl<'ctx> Reduction<'ctx> {
             let xy_union = tamarin_term::term::Term::App(
                 tamarin_term::function_symbols::FunSym::Ac(
                     tamarin_term::function_symbols::AcSym::Union),
-                args.clone(),
+                args.clone().into(),
             );
             let mut union_name = b"_".to_vec();
             union_name.extend_from_slice(UNION_SYM_STRING);

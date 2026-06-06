@@ -179,13 +179,13 @@ where
         (Term::App(FunSym::NoEq(lf), la), Term::App(FunSym::NoEq(rf), ra))
             if lf == rf && la.len() == ra.len() =>
         {
-            for (a, b) in la.clone().into_iter().zip(ra.clone()) {
+            for (a, b) in la.iter().cloned().zip(ra.iter().cloned()) {
                 unify_raw(sort_of_const, acc, a, b, src)?;
             }
             Ok(())
         }
         (Term::App(FunSym::List, la), Term::App(FunSym::List, ra)) if la.len() == ra.len() => {
-            for (a, b) in la.clone().into_iter().zip(ra.clone()) {
+            for (a, b) in la.iter().cloned().zip(ra.iter().cloned()) {
                 unify_raw(sort_of_const, acc, a, b, src)?;
             }
             Ok(())
@@ -267,13 +267,13 @@ where
         (Term::App(FunSym::NoEq(lf), la), Term::App(FunSym::NoEq(rf), ra))
             if lf == rf && la.len() == ra.len() =>
         {
-            for (a, b) in la.clone().into_iter().zip(ra.clone()) {
+            for (a, b) in la.iter().cloned().zip(ra.iter().cloned()) {
                 unify_raw_factored(sort_of_const, acc, delayed, a, b)?;
             }
             Ok(())
         }
         (Term::App(FunSym::List, la), Term::App(FunSym::List, ra)) if la.len() == ra.len() => {
-            for (a, b) in la.clone().into_iter().zip(ra.clone()) {
+            for (a, b) in la.iter().cloned().zip(ra.iter().cloned()) {
                 unify_raw_factored(sort_of_const, acc, delayed, a, b)?;
             }
             Ok(())
@@ -429,7 +429,7 @@ where
         },
         Term::App(FunSym::NoEq(pf), pargs) => match t {
             Term::App(FunSym::NoEq(tf), targs) if tf == pf && targs.len() == pargs.len() => {
-                for (a, b) in targs.into_iter().zip(pargs) {
+                for (a, b) in targs.iter().cloned().zip(pargs.iter().cloned()) {
                     match_raw(sort_of_const, mapping, a, b)?;
                 }
                 Ok(())
@@ -438,7 +438,7 @@ where
         },
         Term::App(FunSym::List, pargs) => match t {
             Term::App(FunSym::List, targs) if targs.len() == pargs.len() => {
-                for (a, b) in targs.into_iter().zip(pargs) {
+                for (a, b) in targs.iter().cloned().zip(pargs.iter().cloned()) {
                     match_raw(sort_of_const, mapping, a, b)?;
                 }
                 Ok(())

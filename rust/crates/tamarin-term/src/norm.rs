@@ -80,7 +80,7 @@ pub fn nf_structural(msig: &MaudeSig, t: &LNTerm) -> Option<bool> {
                 }
                 if irreducible.contains(sym) || matches!(sym, FunSym::List | FunSym::C(_)) {
                     let mut all_known = true;
-                    for a in args {
+                    for a in args.iter() {
                         match go(a, irreducible) {
                             Some(false) => return Some(false),
                             Some(true) => {}
@@ -432,7 +432,7 @@ pub fn maybe_not_nf_subterms(msig: &MaudeSig, t: &LNTerm) -> Vec<LNTerm> {
             Term::Lit(_) => {}
             Term::App(sym, args) => {
                 if irreducible.contains(sym) {
-                    for a in args { go(a, irreducible, out); }
+                    for a in args.iter() { go(a, irreducible, out); }
                 } else {
                     out.push(t.clone());
                 }
@@ -501,11 +501,11 @@ mod tests {
         let ekR_term: LNTerm = Term::Lit(Lit::Var(ekR));
         let inv_tid: LNTerm = Term::App(
             FunSym::NoEq(crate::function_symbols::inv_sym()),
-            vec![tid_term.clone()],
+            vec![tid_term.clone()].into(),
         );
         let mult: LNTerm = Term::App(
             FunSym::Ac(AcSym::Mult),
-            vec![tid_term, ekI_term, ekR_term, inv_tid],
+            vec![tid_term, ekI_term, ekR_term, inv_tid].into(),
         );
         // Test: mult(tid, ekI, ekR, inv(tid)) should NOT be in NF
         // (invalid_mult fires because tid appears as a factor and inside inv).

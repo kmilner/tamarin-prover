@@ -631,7 +631,7 @@ pub fn precompute_full_sources(
                 .collect();
             ku_patterns.push(tamarin_term::term::Term::App(
                 tamarin_term::function_symbols::FunSym::NoEq(noeq.clone()),
-                args));
+                args.into()));
         }
     }
     // TAM_DBG_SRC_PRECOMP=1: dump every ku_pattern + every fun_sym
@@ -2472,7 +2472,7 @@ fn saturate_out_premise(
                 (Term::Lit(Lit::Con(ca)), Term::Lit(Lit::Con(cb))) => ca == cb,
                 (Term::App(oa, xs), Term::App(ob, ys)) =>
                     oa == ob && xs.len() == ys.len()
-                        && xs.iter().zip(ys).all(|(x, y)| go(x, y, ma, mb, next)),
+                        && xs.iter().zip(ys.iter()).all(|(x, y)| go(x, y, ma, mb, next)),
                 _ => false,
             }
         }
@@ -4216,7 +4216,7 @@ fn eq_modulo_freshness_no_ac(
             (Term::Lit(Lit::Con(ca)), Term::Lit(Lit::Con(cb))) => ca == cb,
             (Term::App(oa, xs), Term::App(ob, ys)) =>
                 oa == ob && xs.len() == ys.len()
-                    && xs.iter().zip(ys).all(|(x, y)| go(x, y, ma, mb, next)),
+                    && xs.iter().zip(ys.iter()).all(|(x, y)| go(x, y, ma, mb, next)),
             _ => false,
         }
     }

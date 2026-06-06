@@ -404,7 +404,7 @@ pub fn multiset_intruder_rules() -> Vec<IntrRuleAC> {
     use tamarin_term::term::Term;
     let x_var = var_term(LVar::new("x", LSort::Msg, 0));
     let y_var = var_term(LVar::new("y", LSort::Msg, 0));
-    let xy_union = Term::App(FunSym::Ac(AcSym::Union), vec![x_var.clone(), y_var.clone()]);
+    let xy_union = Term::App(FunSym::Ac(AcSym::Union), vec![x_var.clone(), y_var.clone()].into());
     let mut name = b"_".to_vec();
     name.extend_from_slice(UNION_SYM_STRING);
     let d_rule = Rule::new(

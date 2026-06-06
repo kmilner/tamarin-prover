@@ -49,7 +49,7 @@ fn collect_vars<C, V: Clone>(t: &VTerm<C, V>, out: &mut Vec<V>) {
         Term::Lit(Lit::Var(v)) => out.push(v.clone()),
         Term::Lit(Lit::Con(_)) => {}
         Term::App(_, ts) => {
-            for t in ts {
+            for t in ts.iter() {
                 collect_vars(t, out);
             }
         }
@@ -79,7 +79,7 @@ fn collect_consts<C: Clone, V>(t: &VTerm<C, V>, out: &mut Vec<C>) {
         Term::Lit(Lit::Con(c)) => out.push(c.clone()),
         Term::Lit(Lit::Var(_)) => {}
         Term::App(_, ts) => {
-            for t in ts {
+            for t in ts.iter() {
                 collect_consts(t, out);
             }
         }
