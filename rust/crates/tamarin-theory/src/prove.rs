@@ -39,6 +39,262 @@ impl std::fmt::Display for ProveError {
     }
 }
 
+/// Per-file shared prover state — the bits of work that depend only on
+/// the theory, not on which lemma is being proved.  Built once via
+/// [`ProverSession::build`] and reused across `prove_lemma_in_session`
+/// calls so each lemma in a multi-lemma `--prove` run pays the heavy
+/// setup cost only ONCE.
+///
+/// Profile showed ~3s of `ProofContext::new` work (intruder rules,
+/// `close_intr_rule` Maude variants, DH/BP cached variants, per-rule
+/// `expand_rule_variants`, `precompute_sources`, `precompute_full_sources`)
+/// re-running per lemma.  On wireguard's 8 lemmas that was ~24s
+/// (HS amortises this across the file).  By sharing the template
+/// `ProofContext` we recover that cost; per-lemma we still run the
+/// lightweight `ensure_saturated` (each lemma needs its own
+/// `typing_assumptions`-refined source cases).
+pub struct ProverSession {
+    /// Elaborated typed theory.  Used to look up lemmas, restrictions,
+    /// rules, heuristic.  Constructed once.
+    pub theory: crate::theory::Theory,
+    /// File-level RAII guard for `set_user_funs_for_theory`.  Kept
+    /// alive for the whole session so per-lemma `term_to_lnterm`
+    /// calls see the right user-fn-symbol set.
+    _user_funs_guard: crate::elaborate::UserFunsForTheoryGuard,
+    /// Guarded-form restrictions (constructed once from theory).
+    restrictions: Vec<Guarded>,
+    /// Template `ProofContext` carrying the expensive precompute:
+    /// `rules` (with variants installed), `intruder_rules`,
+    /// `unique_sources`, `full_sources` (raw, unsaturated cells), etc.
+    /// Cloned per lemma; each clone sets its own
+    /// `typing_assumptions`/`heuristic`/`is_exists_trace`/`use_induction`
+    /// and runs `ensure_saturated` to materialise lemma-specific
+    /// refined source cases.
+    template_ctx: ProofContext,
+    /// Fresh-counter delta consumed by `ProofContext::new_with_…` during
+    /// template construction.  Each non-session `prove_lemma_with_pool`
+    /// call advances the global fresh-var counter by this amount
+    /// (`close_intr_rule` Maude calls + per-rule `expand_rule_variants`).
+    /// In session mode the template is built ONCE so the counter only
+    /// advances by `K` once.  Without re-bumping per lemma, lemma N's
+    /// runtime fresh allocations would start at `K + sum(prior_proofs)`
+    /// instead of the per-lemma path's `N*K + sum(prior_proofs)` — and
+    /// that delta is observable as a divergent proof on a small subset
+    /// of lemmas where allocated witness indices interact with rule-
+    /// variant subst indices (e.g. wireguard `identity_hiding` becomes
+    /// 1 step shorter without this bump).  `prove_lemma_in_session`
+    /// calls `maude.ensure_above` with an incrementing target so each
+    /// per-lemma counter trajectory matches the non-session path
+    /// exactly, byte-for-byte across the whole proof tree.
+    setup_counter_delta: u64,
+    /// Counter value BEFORE the template was built — used together
+    /// with `setup_counter_delta` to compute the per-lemma bump target.
+    setup_counter_before: u64,
+    /// Number of lemmas already processed via `prove_lemma_in_session`.
+    /// Drives the counter-bump trajectory.  Use `AtomicU64` so the
+    /// session can stay `&self` to its callers.
+    lemma_idx: std::sync::atomic::AtomicU64,
+}
+
+/// Compute the cumulative setup-counter advance the non-session
+/// `prove_lemma_with_pool` path would have done by lemma index `n`
+/// (1-indexed).  Each non-session call advances the counter by
+/// `setup_counter_delta`, so by the start of lemma `n` the counter
+/// would have advanced `n * delta`.  In session mode the template
+/// build only advanced it by `1 * delta`, so we need an extra
+/// `(n - 1) * delta` bump before lemma `n`'s runtime to match.
+fn setup_target_for(session: &ProverSession, n: u64) -> u64 {
+    session.setup_counter_delta.saturating_mul(n)
+}
+
+impl ProverSession {
+    /// Build the shared per-file state.  Does the expensive once-per-file
+    /// work: theory elaboration, restriction conversion, full
+    /// `ProofContext` construction (which runs intruder rule generation,
+    /// `close_intr_rule`, DH/BP cached variants, per-rule variant
+    /// expansion, source precomputation).
+    pub fn build(
+        parser_theory: &p::Theory,
+        maude: tamarin_term::maude_proc::MaudeHandle,
+        pool: Option<std::sync::Arc<tamarin_term::maude_proc::MaudePool>>,
+    ) -> Result<Self, ProveError> {
+        // RAII-set the user-fn-symbol thread-locals for the WHOLE
+        // session.  Per-lemma `term_to_lnterm` calls during search
+        // need these set; the parser-theory drives the set.
+        let _user_funs_guard = crate::elaborate::set_user_funs_for_theory(parser_theory);
+        let theory = elaborate(parser_theory)
+            .map_err(|e| ProveError::Elaboration(e.message))?;
+        let mut restrictions: Vec<Guarded> = Vec::new();
+        for r in theory.restrictions() {
+            if let Ok(rg) = formula_to_guarded(&r.formula) {
+                restrictions.push(rg);
+            }
+        }
+        let rules: Vec<OpenProtoRule> = theory.rules().cloned().collect();
+        // Capture the fresh-counter span around the template build so we
+        // can replay the bump per lemma (see `setup_counter_delta` docs).
+        let setup_counter_before = maude.fresh_counter_peek();
+        let template_ctx = ProofContext::new_with_restrictions_and_pool(
+            maude.clone(), pool, rules, restrictions.clone());
+        let setup_counter_after = maude.fresh_counter_peek();
+        let setup_counter_delta = setup_counter_after.saturating_sub(setup_counter_before);
+        Ok(ProverSession {
+            theory,
+            _user_funs_guard,
+            restrictions,
+            template_ctx,
+            setup_counter_delta,
+            setup_counter_before,
+            lemma_idx: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+}
+
+/// Prove a single lemma using a pre-built `ProverSession`.  Skips the
+/// expensive theory-level setup (which `ProverSession::build` did) and
+/// runs only the per-lemma work: guarded conversion of lemma+reuse
+/// formulas, `formula_to_system`, ProofContext clone +
+/// per-lemma-field setup, `ensure_saturated` (typing-asm refinement),
+/// and proof-tree search.
+pub fn prove_lemma_in_session(
+    session: &ProverSession,
+    lemma_name: &str,
+    max_steps: usize,
+) -> Result<ProofNode, ProveError> {
+    let trace = std::env::var("TAM_DBG_PHASE").is_ok();
+    let t_phase: Option<std::time::Instant> =
+        if trace { Some(std::time::Instant::now()) } else { None };
+
+    let theory = &session.theory;
+    let lemma = theory
+        .lookup_lemma(lemma_name)
+        .ok_or_else(|| ProveError::LemmaNotFound(lemma_name.to_string()))?;
+
+    let g = formula_to_guarded(&lemma.formula)
+        .map_err(|e| ProveError::Guarded(e.message))?;
+
+    // `[reuse]` lemmas declared BEFORE this one.  Same gather logic as
+    // the pre-session prove_lemma_with_pool path.
+    let mut reuse_lemmas: Vec<Guarded> = Vec::new();
+    for prior in theory.lemmas() {
+        if prior.name == lemma_name { break; }
+        if !prior.attributes.iter().any(|a| matches!(a, crate::theory::LemmaAttr::Reuse)) {
+            continue;
+        }
+        if !matches!(prior.trace_quantifier, crate::theory::TraceQuantifier::AllTraces) {
+            continue;
+        }
+        if let Ok(rg) = formula_to_guarded(&prior.formula) {
+            reuse_lemmas.push(rg);
+        }
+    }
+
+    let tq = match lemma.trace_quantifier {
+        crate::theory::TraceQuantifier::AllTraces => p::TraceQuantifier::AllTraces,
+        crate::theory::TraceQuantifier::ExistsTrace => p::TraceQuantifier::ExistsTrace,
+    };
+    let mut sys = formula_to_system(
+        session.restrictions.clone(),
+        SourceKind::RawSources,
+        tq,
+        false,
+        &g,
+    );
+    sys.insert_lemmas(reuse_lemmas);
+
+    if trace { eprintln!("[phase] (session) formula_to_system done dt={:.3}s",
+        t_phase.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64())); }
+    let t_ctx: Option<std::time::Instant> =
+        if trace { Some(std::time::Instant::now()) } else { None };
+    // Clone the template ProofContext.  The template was built once at
+    // session-construction time with raw (unsaturated) `full_sources`
+    // (each source's `cases_cell = None`).  Cloning copies those
+    // unsaturated cells, so each lemma's `ensure_saturated` populates
+    // ITS OWN clone's cells with refinements driven by ITS OWN
+    // `typing_assumptions` — no cross-lemma contamination.
+    let mut ctx = if std::env::var("TAM_DBG_SESSION_REBUILD").is_ok() {
+        let rules: Vec<OpenProtoRule> = theory.rules().cloned().collect();
+        ProofContext::new_with_restrictions_and_pool(
+            session.template_ctx.maude.clone(),
+            session.template_ctx.maude_pool.clone(),
+            rules,
+            session.restrictions.clone())
+    } else {
+        session.template_ctx.clone()
+    };
+    // Replay the fresh-counter bump that the legacy per-lemma
+    // `prove_lemma_with_pool` path would have done at this point via
+    // its own `ProofContext::new_with_restrictions_and_pool`.  In
+    // session mode the template was built ONCE, so the global counter
+    // only advanced by `K` once; without re-bumping per lemma, each
+    // lemma's runtime allocations would start at the wrong index and
+    // a small number of lemmas (e.g. wireguard `identity_hiding`)
+    // would diverge structurally.  Bump such that lemma `i` (0-indexed)
+    // sees the same counter value it would in the non-session path:
+    // `setup_counter_before + (i+1)*setup_counter_delta`.
+    let lemma_i = session.lemma_idx
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let target = session.setup_counter_before
+        .saturating_add(setup_target_for(session, lemma_i + 1));
+    ctx.maude.ensure_above(target.saturating_sub(1));
+    if trace { eprintln!("[phase] (session) ProofContext clone dt={:.3}s",
+        t_ctx.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64())); }
+    ctx.is_exists_trace = matches!(
+        lemma.trace_quantifier,
+        crate::theory::TraceQuantifier::ExistsTrace,
+    );
+    use crate::constraint::solver::goals::GoalRanking;
+    let lemma_heuristic: Option<&str> = lemma.attributes.iter().find_map(|a| match a {
+        crate::theory::LemmaAttr::Heuristic(s) => Some(s.as_str()),
+        _ => None,
+    });
+    ctx.heuristic = match lemma_heuristic {
+        Some(h) => Some(GoalRanking::from_str(h)),
+        None => theory.heuristic.first().map(|h| GoalRanking::from_str(h)),
+    };
+    let mut typing_assumptions: Vec<Guarded> = Vec::new();
+    for prior in theory.lemmas() {
+        if prior.name == lemma_name { continue; }
+        if !prior.attributes.iter().any(|a| matches!(a, crate::theory::LemmaAttr::Sources)) {
+            continue;
+        }
+        if !matches!(prior.trace_quantifier, crate::theory::TraceQuantifier::AllTraces) {
+            continue;
+        }
+        if let Ok(rg) = formula_to_guarded(&prior.formula) {
+            typing_assumptions.push(rg);
+        }
+    }
+    ctx.typing_assumptions = typing_assumptions;
+    let t_sat: Option<std::time::Instant> =
+        if trace { Some(std::time::Instant::now()) } else { None };
+    ctx.ensure_saturated();
+    if trace { eprintln!("[phase] (session) ensure_saturated dt={:.3}s",
+        t_sat.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64())); }
+    if std::env::var("TAM_RS_DBG_PHASE").is_ok() {
+        eprintln!("[rs-phase] lemma-proof START");
+    }
+    let force_induction = lemma.attributes.iter().any(|a| matches!(a,
+        crate::theory::LemmaAttr::UseInduction | crate::theory::LemmaAttr::Sources));
+    if force_induction {
+        ctx.use_induction = crate::constraint::solver::context::UseInduction::UseInduction;
+    }
+    // Skeleton replay: same logic as in `prove_lemma_with_pool`.
+    let replay_disabled = std::env::var("TAM_RS_DISABLE_SKELETON_REPLAY").is_ok();
+    if !replay_disabled {
+        if let Some(tree) = lemma.proof.tree.clone() {
+            return Ok(crate::replay::replace_sorry_prove(&ctx, sys, &tree, max_steps));
+        }
+    }
+    let t_search: Option<std::time::Instant> =
+        if trace { Some(std::time::Instant::now()) } else { None };
+    let r = run_proof_search(&ctx, sys, max_steps);
+    if trace { eprintln!("[phase] (session) run_proof_search dt={:.3}s total={:.3}s",
+        t_search.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64()),
+        t_phase.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64())); }
+    Ok(r)
+}
+
 /// Drive a proof attempt for one lemma in a parsed theory.
 ///
 /// `max_steps` bounds the proof-tree depth so the call always
