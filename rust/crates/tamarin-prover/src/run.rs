@@ -699,6 +699,23 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 .map(|b| b as usize)
                 .unwrap_or(500);
 
+            // Build the per-file shared prover session ONCE.  Profile
+            // showed that constructing a fresh `ProofContext` per lemma
+            // re-ran ~3s of file-level setup (intruder rules, Maude
+            // variants, `precompute_full_sources`) per lemma; HS does
+            // this work once at theory-close time.  `ProverSession`
+            // captures it once; each lemma clones the cheap template
+            // and runs only the per-lemma `ensure_saturated`
+            // refinement against its own typing assumptions.
+            //
+            // Fall-through path: if `ProverSession::build` errors we
+            // fall back to the per-lemma `prove_lemma_with_pool` path
+            // (which re-runs the setup per lemma but is more tolerant
+            // of theories where elaboration fails on a subset of
+            // lemmas).  Almost never hits in practice.
+            let session = tamarin_theory::prove::ProverSession::build(
+                &parsed, maude.clone(), file_maude_pool.clone()).ok();
+
             for l in elaborated.lemmas() {
                 let lemma_name = l.name.clone();
                 let exists_trace = matches!(
@@ -719,9 +736,13 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 // marker; the only progress lines are the `[Theory X]
                 // ...` set above.  Stay quiet here for HS-faithful stderr.
                 let lt = Instant::now();
-                let outcome = tamarin_theory::prove::prove_lemma_with_pool(
-                    &parsed, &lemma_name, maude.clone(),
-                    file_maude_pool.clone(), budget);
+                let outcome = match session.as_ref() {
+                    Some(s) => tamarin_theory::prove::prove_lemma_in_session(
+                        s, &lemma_name, budget),
+                    None => tamarin_theory::prove::prove_lemma_with_pool(
+                        &parsed, &lemma_name, maude.clone(),
+                        file_maude_pool.clone(), budget),
+                };
                 if dbg_timing {
                     eprintln!("[TAM_DBG_RUN_TIMING] {:>26}: {:>8.1} ms  (lemma={})",
                               "prove_lemma", lt.elapsed().as_secs_f64() * 1000.0,
