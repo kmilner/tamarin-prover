@@ -4463,6 +4463,139 @@ impl<'ctx> Reduction<'ctx> {
                         // fall back to plain rule enumeration below.
                     }
                 }
+                // HS-faithful XOR special case (Goals.hs:259-272 in
+                // `solveAction`).  When the action goal is `KU(x⊕y⊕…)`,
+                // HS does NOT use `labelNodeId` (rule enumeration with
+                // AC unification on the c_xor constructor rule's bare-var
+                // action), because that would lose the structural
+                // partition information of the live XOR sum.  Instead,
+                // HS enumerates `twoPartitions ts` and creates one case
+                // per partition:
+                //   - `(_, [])` (degenerate, all terms in one bucket)
+                //     → CoerceRule case with `KD(m)` premise + a
+                //       PremiseG goal so the proof must derive `KD(m)`.
+                //   - `(a', b')` (proper split) → ConstrRule("_xor") case
+                //     where `a = fAppAC Xor a'` and `b = fAppAC Xor b'`,
+                //     with two new KU action goals via `requiresKU`.
+                //
+                // Without this special case, RS falls through to the
+                // generic rule enumeration, which picks the c_xor rule
+                // with abstract `KU(x:Msg) ∧ KU(y:Msg) → KU(x⊕y:Msg)`
+                // action and runs AC unification `KU(live_xor) =
+                // KU(x⊕y)`.  With `SplitNow`, that returns `Cases(arms)`
+                // representing the AC alternatives; the caller treats
+                // the `Ok(_)` result as success and pushes `sub.sys`
+                // (whose eq_store still has the unsolved disj), but the
+                // bare `KU(x:Msg)` / `KU(y:Msg)` premises in the rule
+                // were never set up as separate action goals at
+                // predecessor nodes.  When the proof method then
+                // checks `is_open_in_sys`, the msg-vars `x`, `y` (still
+                // free, with no node binding) auto-skip — the case
+                // closes SOLVED prematurely.  Manifested as RS picking
+                // `c_lh → c_xor → SOLVED` (7 steps) for
+                // CH07::recentalive_tag where HS picks the full
+                // `tag1 → split → ... → c_xor → ... → reader1` chain
+                // (11 steps).  Same root explains CRxor + LAK06
+                // divergences.
+                if matches!(fa.tag, crate::fact::FactTag::Ku)
+                    && fa.terms.len() == 1
+                {
+                    use tamarin_term::function_symbols::{FunSym, AcSym};
+                    use tamarin_term::term::{Term, f_app_ac};
+                    if let Some(Term::App(FunSym::Ac(AcSym::Xor), ts)) =
+                        fa.terms.first().cloned()
+                    {
+                        let ts_vec: Vec<tamarin_term::lterm::LNTerm> =
+                            ts.iter().cloned().collect();
+                        let partitions = tamarin_utils::misc::two_partitions(&ts_vec);
+                        let mut cases: Vec<(String, crate::constraint::system::System)>
+                            = Vec::new();
+                        let m = fa.terms[0].clone();
+                        for (a_parts, b_parts) in partitions {
+                            // Each case is a fresh fork.
+                            let mut sub = Reduction::new(self.ctx, self.sys.clone());
+                            if b_parts.is_empty() {
+                                // Degenerate partition: CoerceRule.
+                                //   ru = Rule (IntrInfo CoerceRule)
+                                //              [kdFact m] [fa] [fa] []
+                                //   insert(i, ru)
+                                //   insertGoal (PremiseG (i, PremIdx 0)
+                                //                        (kdFact m)) False
+                                let kd_m = crate::fact::kd_fact(m.clone());
+                                let coerce_ru = crate::rule::Rule::new(
+                                    crate::rule::RuleInfo::Intr(
+                                        crate::rule::IntrRuleACInfo::Coerce),
+                                    vec![kd_m.clone()],
+                                    vec![fa.clone()],
+                                    vec![fa.clone()],
+                                );
+                                sub.sys.add_node(i.clone(), coerce_ru);
+                                // PremiseG (i, PremIdx 0) (kdFact m)
+                                sub.insert_goal(Goal::Premise(
+                                    (i.clone(), crate::rule::PremIdx(0)),
+                                    kd_m,
+                                ));
+                                let case_name = "coerce".to_string();
+                                for (existing, status) in sub.sys.goals.iter_mut() {
+                                    if existing == &g && !status.solved {
+                                        status.solved = true;
+                                        break;
+                                    }
+                                }
+                                cases.push((case_name, sub.sys));
+                            } else {
+                                // Proper split: ConstrRule "_xor".
+                                //   let a = fAppAC Xor a'
+                                //   let b = fAppAC Xor b'
+                                //   ru = Rule (IntrInfo (ConstrRule "_xor"))
+                                //              [kuFact a, kuFact b] [fa] [fa] []
+                                //   insert(i, ru)
+                                //   mapM_ requiresKU [a, b]
+                                let a_term = if a_parts.len() == 1 {
+                                    a_parts[0].clone()
+                                } else {
+                                    f_app_ac(AcSym::Xor, a_parts.clone())
+                                };
+                                let b_term = if b_parts.len() == 1 {
+                                    b_parts[0].clone()
+                                } else {
+                                    f_app_ac(AcSym::Xor, b_parts.clone())
+                                };
+                                let ku_a = crate::fact::ku_fact(a_term.clone());
+                                let ku_b = crate::fact::ku_fact(b_term.clone());
+                                let xor_ru = crate::rule::Rule::new(
+                                    crate::rule::RuleInfo::Intr(
+                                        crate::rule::IntrRuleACInfo::ConstrRule(
+                                            b"_xor".to_vec())),
+                                    vec![ku_a.clone(), ku_b.clone()],
+                                    vec![fa.clone()],
+                                    vec![fa.clone()],
+                                );
+                                sub.sys.add_node(i.clone(), xor_ru);
+                                // requiresKU a, requiresKU b
+                                sub.add_ku_action_before(i, &ku_a);
+                                sub.add_ku_action_before(i, &ku_b);
+                                let case_name = "c_xor".to_string();
+                                for (existing, status) in sub.sys.goals.iter_mut() {
+                                    if existing == &g && !status.solved {
+                                        status.solved = true;
+                                        break;
+                                    }
+                                }
+                                cases.push((case_name, sub.sys));
+                            }
+                        }
+                        if !cases.is_empty() {
+                            self.changed = ChangeIndicator::Changed;
+                            if cases.len() == 1 {
+                                let (name, sys) = cases.into_iter().next().unwrap();
+                                self.sys = sys;
+                                return GoalCases::LinearNamed(name);
+                            }
+                            return GoalCases::Cases(cases);
+                        }
+                    }
+                }
                 // Haskell `someRuleACInst` (Rule.hs:933): canonical rule
                 // per `OpenProtoRule` + variant substs installed as a
                 // SplitG goal via `solve_rule_constraints`
