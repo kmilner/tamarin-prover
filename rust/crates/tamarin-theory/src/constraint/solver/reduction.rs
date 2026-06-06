@@ -866,6 +866,65 @@ impl<'ctx> Reduction<'ctx> {
                 if &new_f != f { *f = new_f; self.changed = ChangeIndicator::Changed; }
             }
         }
+        // 5b. SubtermStore substitution — port of Haskell's
+        // `instance Apply LNSubst SubtermStore` (`SubtermStore.hs:560-561`):
+        // ```haskell
+        // apply subst (SubtermStore a b c d e) =
+        //   SubtermStore (apply subst a) (apply subst b) (apply subst c) d e
+        // ```
+        // HS's `substSystem` (Reduction.hs:634) applies the substitution
+        // to the whole `System` via the `Apply` instance, which threads
+        // through every component including the subterm store.  Without
+        // this, an eq-store binding like `a → $x` (introduced by unifying
+        // a lemma's `a` with a rule's `PubValue($x)` conclusion) never
+        // gets propagated to `subterm_store.subterms`, so a constraint
+        // `(b, a)` remains as `(b, a:Msg)` even after `a` should be
+        // `$x:Pub`.  Downstream `propagate_subterm_obvious` then misses
+        // the pub-var trivially-false case → spurious "trace found"
+        // verdict on `Sinvalid`-class lemmas (HS reports `simplify, by
+        // contradiction /* contradictory subterm store */`).
+        //
+        // Use a direct subst application (not the `apply_term` closure
+        // above) so the borrow of `self.maude` from `apply_term` doesn't
+        // outlive the `self.insert_goal_with_loop_flag` call above.  HS's
+        // `Apply LNSubst SubtermStore` doesn't normalise — neither do
+        // we.  (`apply_term`'s normalise path is only used when the
+        // eager-normalise env var is set; HS-default is non-normalising.)
+        let mut changed_sst = false;
+        let pos_subs = std::mem::take(&mut self.sys.subterm_store.subterms);
+        let mut new_subs = Vec::with_capacity(pos_subs.len());
+        for c in pos_subs {
+            let new_small = tamarin_term::subst::apply_vterm(&subst, c.small.clone());
+            let new_big = tamarin_term::subst::apply_vterm(&subst, c.big.clone());
+            if new_small != c.small || new_big != c.big {
+                changed_sst = true;
+            }
+            new_subs.push(crate::tools::subterm_store::SubtermConstraint {
+                small: new_small,
+                big: new_big,
+                propagated: c.propagated,
+            });
+        }
+        let solved = std::mem::take(&mut self.sys.subterm_store.solved_subterms);
+        let mut new_solved = Vec::with_capacity(solved.len());
+        for c in solved {
+            let new_small = tamarin_term::subst::apply_vterm(&subst, c.small.clone());
+            let new_big = tamarin_term::subst::apply_vterm(&subst, c.big.clone());
+            if new_small != c.small || new_big != c.big {
+                changed_sst = true;
+            }
+            new_solved.push(crate::tools::subterm_store::SubtermConstraint {
+                small: new_small,
+                big: new_big,
+                propagated: c.propagated,
+            });
+        }
+        self.sys.subterm_store.subterms = new_subs;
+        self.sys.subterm_store.solved_subterms = new_solved;
+        if changed_sst {
+            self.sys.invalidate_max_var_idx_cache();
+            self.changed = ChangeIndicator::Changed;
+        }
         // 6. Drain the queued rule-eqs from node merges. We resolve
         //    them by routing through `solve_fact_eqs` (Haskell uses
         //    `solveRuleEqs SplitLater`). This may add new substitutions
