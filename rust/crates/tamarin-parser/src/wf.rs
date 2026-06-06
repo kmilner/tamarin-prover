@@ -184,7 +184,7 @@ fn rule_terms(r: &Rule) -> impl Iterator<Item = &Term> {
 /// Build an HS `underlineTopic` block: `"<title>\n<====>\n"` where the
 /// underline matches the title length exactly (counting any trailing
 /// space).  Mirrors `underlineTopic` in `Theory.Tools.Wellformedness`.
-fn underline_topic(title: &str) -> String {
+pub fn underline_topic(title: &str) -> String {
     let len = title.chars().count();
     let mut s = String::with_capacity(title.len() + len + 2);
     s.push_str(title);
@@ -799,6 +799,16 @@ fn collect_rule_unbound_vars(r: &Rule, nullary_funs: &BTreeSet<String>) -> Vec<V
         for v in fact_vars(f) {
             if is_pub_sort(&v.sort) { continue; }
             if nullary_funs.contains(&v.name) { continue; }
+            // Builtin nullary constants (e.g. XOR's `zero`, DH's
+            // `DH_neutral`) parse as bare identifiers in the surface
+            // syntax but semantically denote 0-arity functions.  HS's
+            // parser binds them via `nullaryApp` so they never appear
+            // as variables in the rule AST; RS's parser still surfaces
+            // them as `Term::Var` and relies on this check to skip
+            // them when classifying "unbound".  Without this skip,
+            // rules like CRxor's `responder` (`Neq(na, zero)`) get
+            // bogus "has unbound variables: zero" warnings.
+            if is_known_nullary_constant_name(&v.name) { continue; }
             let key = (v.name.clone(), v.idx);
             if bound.contains(&key) { continue; }
             if seen.insert(key.clone()) {
@@ -914,21 +924,58 @@ fn term_has_reducible_op(t: &Term) -> bool {
     }
 }
 
+/// HS `multRestrictedReport'` (Wellformedness.hs:1047-1099). HS only
+/// flags a rule when:
+///   (a) it has any multiplication term `*` in its RHS conclusions, OR
+///   (b) abstracting reducible-headed terms in the rule introduces new
+///       unbound (non-public) vars in the RHS that weren't present
+///       pre-abstraction.
+///
+/// HS does NOT warn on every rule whose LHS contains any reducible op
+/// (xor / exp / inv) — those are explicitly permitted as long as (a)
+/// and (b) hold.
+///
+/// Implementation note: a previous draft of this check fired on every
+/// rule with ANY reducible LHS op and rendered the offending term with
+/// Rust's `{:?}` Debug formatter, generating false-positive WF warnings
+/// (e.g. on every CRxor/CH07/LAK06 rule). The fix keeps the check
+/// FAITHFUL to HS's narrower trigger: skip when no `*` is in RHS and no
+/// unbound is introduced. The full abstraction-based (b) check is not
+/// yet implemented; for now we conservatively skip when RHS has no `*`
+/// (which matches HS on all XOR/DH theories in the corpus).
 pub fn mult_restricted_report(thy: &Theory) -> WfReport {
     let mut out = Vec::new();
     for r in theory_rules(thy) {
-        let bad_lhs: Vec<String> = r.premises.iter()
+        // (a) HS `multTerms` over RHS conclusions: gather any `AC Mult`
+        //     sub-terms. Skip if RHS has no multiplication.
+        let rhs_has_mult = r.conclusions.iter()
             .flat_map(|f| f.args.iter())
-            .filter(|t| term_has_reducible_op(t))
-            .map(|t| format!("{:?}", t))
-            .collect();
-        if !bad_lhs.is_empty() {
-            out.push(WfError::new("Multiplication restriction of rules",
-                format!("rule `{}' has reducible operators on its LHS: {}",
-                    r.name, bad_lhs.join(", "))));
-        }
+            .any(term_has_mult_subterm);
+        if !rhs_has_mult { continue; }
+        // (b) is approximated by `rhs_has_mult`; the abstraction-based
+        // unbound-var check is not yet ported. When the unbound case
+        // comes up in the corpus we'll thread the rule-abstraction
+        // path through here.
+        out.push(WfError::new("Multiplication restriction of rules",
+            format!("rule `{}' has multiplication in its RHS",
+                r.name)));
     }
     out
+}
+
+/// True if `t` has any `AC Mult` (`*`) sub-term (mirrors HS `multTerms
+/// t = case viewTerm t of FApp (AC Mult) _ -> [t]; FApp _ ts ->
+/// concatMap multTerms ts; _ -> []`).
+fn term_has_mult_subterm(t: &Term) -> bool {
+    match t {
+        Term::BinOp(BinOp::Mult, _, _) => true,
+        Term::App(_, args) | Term::Pair(args) => args.iter().any(term_has_mult_subterm),
+        Term::AlgApp(_, a, b) => term_has_mult_subterm(a) || term_has_mult_subterm(b),
+        Term::Diff(a, b) => term_has_mult_subterm(a) || term_has_mult_subterm(b),
+        Term::BinOp(_, a, b) => term_has_mult_subterm(a) || term_has_mult_subterm(b),
+        Term::PatMatch(inner) => term_has_mult_subterm(inner),
+        _ => false,
+    }
 }
 
 // =============================================================================
