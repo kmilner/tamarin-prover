@@ -241,10 +241,24 @@ fn pp_formula_wrap(
         Or(l, r) => pp_binop_wrap(l, r, "\u{2228}", indent, width, scope, inner_op),
         Implies(l, r) => pp_binop_wrap(l, r, "\u{21D2}", indent, width, scope, inner_op),
         Iff(l, r) => pp_binop_wrap(l, r, "\u{21D4}", indent, width, scope, inner_op),
-        // Not p: `¬<wrapped_p>`.
+        // Not p: HS Formula.hs:481-483
+        //   pp (Not p) = return $ operator_ "¬" <> opParens p'
+        // The `¬` and `opParens p'` are joined via `<>` (horizontal,
+        // no-break) — `¬<inner>` is one atomic doc.  When this `¬…` is
+        // a child of a binary connective (the `Conn` case, Formula.hs
+        // line 489), HS wraps the WHOLE thing in `opParens` again,
+        // giving `(¬<inner>)`.  Mirror by adding outer parens when the
+        // caller passed `inner_op=true`.  The inner `<inner>` may itself
+        // span multiple lines if its own pp_formula_wrap decides to
+        // break (e.g. an Exists with a long body).
         Not(p_) => {
-            let inner = pp_formula_wrap(p_, indent + 1, width, scope, true);
-            format!("\u{00AC}{}", inner)
+            // `¬` sits at the line's first non-whitespace col.  With
+            // outer parens, `(` is at `indent` and `¬` shifts to
+            // `indent+1`.
+            let neg_col = if inner_op { indent + 1 } else { indent };
+            let inner = pp_formula_wrap(p_, neg_col + 1, width, scope, true);
+            let body = format!("\u{00AC}{}", inner);
+            if inner_op { format!("({})", body) } else { body }
         }
         // Atoms / True / False: just the flat form (no useful break).
         _ => flat,
@@ -562,9 +576,28 @@ fn pp_guarded_inner(
 ) {
     use crate::guarded::GBinding;
     match g {
-        Guarded::Atom(a) => pp_gatom(a, scope, out),
-        Guarded::Disj(xs) if xs.is_empty() => out.push('\u{22A5}'), // ⊥
-        Guarded::Conj(xs) if xs.is_empty() => out.push('\u{22A4}'), // ⊤
+        Guarded::Atom(a) => {
+            // HS `pp (GAto a) = prettyNAtom (bvarToLVar a)` (Guarded.hs
+            // 829) — bare atom.  The caller's `opParens` wrap (used in
+            // GConj/GDisj children, lines 834+841) is encoded as
+            // `paren_atomic=true` here; emit `(<atom>)`.
+            if paren_atomic { out.push('('); }
+            pp_gatom(a, scope, out);
+            if paren_atomic { out.push(')'); }
+        }
+        Guarded::Disj(xs) if xs.is_empty() => {
+            // HS `pp (GDisj (Disj [])) = operator_ "⊥"` (Guarded.hs:831).
+            // Caller's opParens still wraps to `(⊥)`.
+            if paren_atomic { out.push('('); }
+            out.push('\u{22A5}'); // ⊥
+            if paren_atomic { out.push(')'); }
+        }
+        Guarded::Conj(xs) if xs.is_empty() => {
+            // HS `pp (GConj (Conj [])) = operator_ "⊤"` (Guarded.hs:838).
+            if paren_atomic { out.push('('); }
+            out.push('\u{22A4}'); // ⊤
+            if paren_atomic { out.push(')'); }
+        }
         Guarded::Disj(xs) => {
             // HS Guarded.hs:833-835 — `parens $ sep $ punctuate ∨ ps`.
             // The outer `parens` ALWAYS wraps (independent of the
@@ -610,14 +643,22 @@ fn pp_guarded_inner(
                 && vars.is_empty()
                 && body_is_false(body)
             {
+                // HS Guarded.hs:856-857: `operator_ "¬" <> dante` —
+                // `<>` is no-break horizontal concat.  The caller's
+                // `opParens` (GConj/GDisj child position) adds outer
+                // parens around the whole `¬<dante>`.
+                if paren_atomic { out.push('('); }
                 out.push('\u{00AC}'); // ¬
-                // Wrap each guard atom and join with ∧.
+                // `dante = pp (GConj antecedent)` (Guarded.hs:852)
+                // emits each guard atom wrapped via `opParens` (lines
+                // 840-841) and joined by ` ∧ `.
                 for (i, gd) in guards.iter().enumerate() {
                     if i > 0 { out.push_str(" \u{2227} "); }
                     out.push('(');
                     pp_gatom(gd, &new_scope, out);
                     out.push(')');
                 }
+                if paren_atomic { out.push(')'); }
                 return;
             }
             // Quantifier line.
