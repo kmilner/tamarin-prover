@@ -600,6 +600,49 @@ fn expand_inner(
             crate::constraint::solver::trace::case_path_set(&path_snapshot);
             let push_path = !name.is_empty();
             if push_path { crate::constraint::solver::trace::case_path_push(&name); }
+            // === Determinism fix: per-worker MaudeHandle ===
+            //
+            // The original parallel branch shared `ctx.maude`'s
+            // `Arc<AtomicU64> fresh_counter` across sibling workers.
+            // Multiple sites mutate this counter as a side-effect of
+            // ordinary solving (proof_method.rs:288 `reset_counter_to`,
+            // reduction.rs:91 `ensure_above`, sources.rs:7262/7277/7280
+            // `ensure_above`/`reset_counter_to`/`reserve_idxs`, the
+            // per-var `reserve_idxs(1)` in `freshen_system_some_inst`).
+            // Under rayon, two workers' interleavings race on these
+            // ops: worker A's apply_source allocates LVar indices that
+            // depend on whether worker B's apply_source has run yet,
+            // producing different LVar.idx in A's subsystem across
+            // runs.  Because LVar.idx is part of System content (and
+            // hence of goal-equality, dedup, and rank inputs), the
+            // resulting proof tree shape diverges.  Observable on
+            // wireguard::key_secrecy as 190/189/188/163/151/147/126
+            // steps across runs (default --processors).
+            //
+            // HS-faithful fix: HS's `runReduction m ctxt sys (avoid sys)`
+            // is called per child case (ProofMethod.hs:443) with a
+            // FRESH FreshT counter seeded from `avoid sys`.  In HS
+            // siblings never share a counter — each child case has
+            // its own FreshT.  We mirror that by cloning `ctx.maude`
+            // with its OWN `fresh_counter` per worker, seeded the
+            // same way `Reduction::new` does (bounds_max(sys) + 1).
+            // Sibling workers' allocations are now independent and
+            // deterministic given the worker's own sys.  Within a
+            // worker the whole subtree is sequential, so the counter
+            // is race-free.
+            //
+            // If a `maude_pool` is configured, also borrow a per-worker
+            // Maude subprocess so workers don't serialise on the
+            // single shared IPC mutex.  Without a pool we share the
+            // single Maude process; the IPC mutex serialises queries,
+            // which is correctness-safe (just slower).
+            let avoid_max = crate::constraint::solver::reduction::bounds_max(&sys);
+            let pool_guard = ctx.maude_pool.as_ref().map(|pool| pool.acquire());
+            let worker_maude = match &pool_guard {
+                Some(pooled) => pooled.handle().with_fresh_counter_from(avoid_max),
+                None => ctx.maude.with_fresh_counter_from(avoid_max),
+            };
+            let worker_ctx = ctx.with_swapped_maude(worker_maude);
             let mut child = ProofNode {
                 method: ProofMethod::Sorry(None),
                 sys,
@@ -611,7 +654,11 @@ fn expand_inner(
             // (no terminal cutoff) that's faithful: HS's lazy Disj
             // exploration also doesn't share a counter.
             let mut local_budget = *budget;
-            expand(ctx, &mut child, &mut local_budget, &deadline_snapshot, depth + 1);
+            expand(&worker_ctx, &mut child, &mut local_budget, &deadline_snapshot, depth + 1);
+            // Drop the pooled Maude back to the pool only after expand
+            // returns — any Maude IPC inside expand uses the pooled
+            // handle via `worker_ctx.maude`.
+            drop(pool_guard);
             if push_path { crate::constraint::solver::trace::case_path_pop(); }
             let local_hit = DEPTH_LIMIT_HIT.with(|f| f.get());
             (name, child, local_hit)
