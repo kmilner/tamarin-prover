@@ -990,6 +990,93 @@ pub fn lnterm_to_term(t: &tamarin_term::lterm::LNTerm) -> p::Term {
 /// `None` on constructs we can't yet round-trip (e.g. `PatMatch`,
 /// algebraic-app `f{a}b` without enough context for proper sigil
 /// inference).
+/// AC-canonicalise a parser-AST term: for every `BinOp(op, l, r)` where op
+/// is AC (Mult/Union/Xor/NatPlus), flatten the chain into the full
+/// multiset, sort it (via the existing `cmp_term` for GTerm — we convert
+/// through GTerm transiently), then re-fold right-leaning so the
+/// canonical form matches HS's flat-sorted `FApp (AC op) args`.
+///
+/// Without this, parser-AST `BinOp` stays in the order the parser
+/// produced (left-associative left-to-right), so e.g.
+/// `na XOR ~k XOR ~nb` parses as `BinOp(Xor, BinOp(Xor, na, k), nb)`
+/// and pretty-prints as `((na⊕~k)⊕~nb)` — but HS prints the same source
+/// as `(~k⊕~nb⊕na)` because HS's `fAppAC` smart constructor flattens
+/// and sorts at parse time.  `term_to_lnterm` does call `f_app_ac` so
+/// LNTerm-side is already canonical; this fixes the parser-AST side
+/// for downstream consumers (rule body pretty-printing,
+/// guardedness checks, etc.) that operate on parser-AST directly.
+pub fn canonicalize_ac_in_pterm(t: &p::Term) -> p::Term {
+    use p::BinOp;
+    fn is_ac(op: BinOp) -> bool {
+        matches!(op, BinOp::Mult | BinOp::Union | BinOp::Xor | BinOp::NatPlus)
+    }
+    fn flatten(op: BinOp, t: &p::Term, out: &mut Vec<p::Term>) {
+        match t {
+            p::Term::BinOp(inner, l, r) if *inner == op => {
+                flatten(op, l, out);
+                flatten(op, r, out);
+            }
+            _ => out.push(t.clone()),
+        }
+    }
+    fn cmp_pterm(a: &p::Term, b: &p::Term) -> std::cmp::Ordering {
+        // Convert to GTerm transiently for the canonical `cmp_term`
+        // ordering.  GTerm and p::Term are structurally identical for
+        // Free-only inputs, so the comparison is faithful.
+        let ga = crate::guarded_types::term_to_gterm_free(a);
+        let gb = crate::guarded_types::term_to_gterm_free(b);
+        crate::guarded::cmp_term(&ga, &gb)
+    }
+    match t {
+        p::Term::Var(_) | p::Term::PubLit(_) | p::Term::FreshLit(_)
+        | p::Term::NatLit(_) | p::Term::Number(_) | p::Term::NumberOne
+        | p::Term::NatOne | p::Term::DhNeutral => t.clone(),
+        p::Term::App(n, args) =>
+            p::Term::App(n.clone(), args.iter().map(canonicalize_ac_in_pterm).collect()),
+        p::Term::AlgApp(n, a, b) =>
+            p::Term::AlgApp(n.clone(),
+                Box::new(canonicalize_ac_in_pterm(a)),
+                Box::new(canonicalize_ac_in_pterm(b))),
+        p::Term::Pair(items) =>
+            p::Term::Pair(items.iter().map(canonicalize_ac_in_pterm).collect()),
+        p::Term::Diff(a, b) =>
+            p::Term::Diff(
+                Box::new(canonicalize_ac_in_pterm(a)),
+                Box::new(canonicalize_ac_in_pterm(b))),
+        p::Term::PatMatch(inner) =>
+            p::Term::PatMatch(Box::new(canonicalize_ac_in_pterm(inner))),
+        p::Term::BinOp(op, l, r) => {
+            let l2 = canonicalize_ac_in_pterm(l);
+            let r2 = canonicalize_ac_in_pterm(r);
+            if !is_ac(*op) {
+                return p::Term::BinOp(*op, Box::new(l2), Box::new(r2));
+            }
+            // Flatten the WHOLE AC chain rooted at this BinOp, then sort.
+            let mut flat: Vec<p::Term> = Vec::new();
+            flatten(*op, &l2, &mut flat);
+            flatten(*op, &r2, &mut flat);
+            flat.sort_by(cmp_pterm);
+            // Right-fold into `BinOp(op, x_0, BinOp(op, x_1, ...))`.
+            let mut iter = flat.into_iter().rev();
+            let last = iter.next().expect("AC chain has at least one element");
+            let mut acc = last;
+            for prev in iter {
+                acc = p::Term::BinOp(*op, Box::new(prev), Box::new(acc));
+            }
+            acc
+        }
+    }
+}
+
+/// Apply `canonicalize_ac_in_pterm` to every term in a fact.
+pub fn canonicalize_ac_in_pfact(f: &p::Fact) -> p::Fact {
+    let mut out = f.clone();
+    for arg in out.args.iter_mut() {
+        *arg = canonicalize_ac_in_pterm(arg);
+    }
+    out
+}
+
 pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
     use tamarin_term::function_symbols::AcSym;
     use tamarin_term::term::f_app_ac;
@@ -1175,6 +1262,27 @@ fn builtin_sig(name: &str) -> Option<MaudeSig> {
 mod tests {
     use super::*;
     use tamarin_parser::parse_theory;
+
+    #[test]
+    fn canonicalize_ac_in_pterm_flattens_and_sorts() {
+        use tamarin_parser::ast as p;
+        // Build: BinOp(Xor, BinOp(Xor, na, k), nb)
+        let na = p::Term::Var(p::VarSpec { typ: None, name: "na".into(), sort: p::SortHint::Msg, idx: 0 });
+        let k = p::Term::Var(p::VarSpec { typ: None, name: "k".into(), sort: p::SortHint::Fresh, idx: 0 });
+        let nb = p::Term::Var(p::VarSpec { typ: None, name: "nb".into(), sort: p::SortHint::Fresh, idx: 0 });
+        let inner = p::Term::BinOp(p::BinOp::Xor, Box::new(na.clone()), Box::new(k.clone()));
+        let outer = p::Term::BinOp(p::BinOp::Xor, Box::new(inner), Box::new(nb.clone()));
+        // Canonicalised right-fold should be `BinOp(Xor, k, BinOp(Xor, nb, na))`.
+        let canon = canonicalize_ac_in_pterm(&outer);
+        let expected = p::Term::BinOp(p::BinOp::Xor,
+            Box::new(k),
+            Box::new(p::Term::BinOp(p::BinOp::Xor, Box::new(nb), Box::new(na))));
+        assert_eq!(canon, expected);
+        // And the LNTerm-side via `term_to_lnterm` should produce the
+        // flat sorted form (already byte-identical to HS).
+        let l = term_to_lnterm(&outer).unwrap();
+        assert_eq!(tamarin_term::pretty::pretty_lnterm(&l), "(~k\u{2295}~nb\u{2295}na)");
+    }
 
     #[test]
     fn elaborate_empty_theory() {
