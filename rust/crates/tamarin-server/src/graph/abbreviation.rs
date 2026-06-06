@@ -84,7 +84,7 @@ pub fn apply_abbreviations_term(
             let new_args: Vec<LNTerm> = args.iter()
                 .map(|a| apply_abbreviations_term(lookup, a))
                 .collect();
-            Term::App(s.clone(), new_args)
+            Term::App(s.clone(), new_args.into())
         }
     }
 }
@@ -252,7 +252,7 @@ fn sub_terms_no_pair(t: &LNTerm, out: &mut Vec<LNTerm>) {
         out.push(t.clone());
     }
     if let Term::App(_, args) = t {
-        for a in args {
+        for a in args.iter() {
             sub_terms_no_pair(a, out);
         }
     }
@@ -301,7 +301,7 @@ fn count_subterms_inner(t: &LNTerm, sub: &LNTerm) -> i64 {
     let mut total = 0i64;
     if t == sub { total += 1; }
     if let Term::App(_, args) = t {
-        for a in args {
+        for a in args.iter() {
             total += count_subterms_inner(a, sub);
         }
     }
@@ -387,7 +387,7 @@ fn apply_proper_subterms(
             let new_args: Vec<LNTerm> = args.iter()
                 .map(|a| apply_abbreviations_term(lookup, a))
                 .collect();
-            Term::App(s.clone(), new_args)
+            Term::App(s.clone(), new_args.into())
         }
     }
 }

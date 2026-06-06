@@ -845,7 +845,7 @@ fn collect_vars(t: &tamarin_term::lterm::LNTerm, out: &mut BTreeSet<LVar>) {
     match t {
         Term::Lit(Lit::Var(v)) => { out.insert(v.clone()); }
         Term::Lit(_) => {}
-        Term::App(_, args) => for a in args { collect_vars(a, out); }
+        Term::App(_, args) => for a in args.iter() { collect_vars(a, out); }
     }
 }
 

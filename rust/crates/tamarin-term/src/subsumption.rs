@@ -63,7 +63,7 @@ pub fn var_occurrences(ts: &[LNTerm]) -> BTreeMap<LVar, usize> {
                 *out.entry(v.clone()).or_insert(0) += 1;
             }
             Term::Lit(_) => {}
-            Term::App(_, args) => for a in args { go(a, out); }
+            Term::App(_, args) => for a in args.iter() { go(a, out); }
         }
     }
     for t in ts { go(t, &mut out); }

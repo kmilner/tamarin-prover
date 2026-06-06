@@ -122,7 +122,7 @@ fn pack_rule_terms(rule: &ProtoRuleE) -> Option<LNTerm> {
     for f in &rule.actions    { all.extend(f.terms.iter().cloned()); }
     for f in &rule.conclusions { all.extend(f.terms.iter().cloned()); }
     if all.is_empty() { None }
-    else { Some(Term::App(FunSym::List, all)) }
+    else { Some(Term::App(FunSym::List, all.into())) }
 }
 
 /// Build a `ProtoRuleAC` from a `ProtoRuleE` plus the precomputed
@@ -470,7 +470,7 @@ pub fn abstract_rule_and_variants(
 
     // `abstractedTerms = map snd eqsAbstr` — the ORIGINAL terms.
     let abstracted_terms: Vec<LNTerm> = bindings.iter().map(|(t, _)| t.clone()).collect();
-    let packed = Term::App(FunSym::List, abstracted_terms);
+    let packed = Term::App(FunSym::List, abstracted_terms.into());
     let raw_substs = match maude.variants(&packed) {
         Ok(v) => v,
         Err(e) => return Err(e.into()),
@@ -1090,7 +1090,7 @@ fn contains_subterm(needle: &LNTerm, haystack: &LNTerm) -> bool {
     use tamarin_term::term::Term;
     if needle == haystack { return true; }
     if let Term::App(_, args) = haystack {
-        for a in args { if contains_subterm(needle, a) { return true; } }
+        for a in args.iter() { if contains_subterm(needle, a) { return true; } }
     }
     false
 }

@@ -261,7 +261,7 @@ fn compute_new_vars(
         match t {
             Term::Lit(Lit::Var(v)) => { out.insert(v.clone()); }
             Term::Lit(_) => {}
-            Term::App(_, args) => for a in args { collect(a, out); }
+            Term::App(_, args) => for a in args.iter() { collect(a, out); }
         }
     }
 

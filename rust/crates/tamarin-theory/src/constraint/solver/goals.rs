@@ -1094,7 +1094,7 @@ fn union_args(t: &tamarin_term::lterm::LNTerm) -> Option<Vec<tamarin_term::lterm
     use tamarin_term::term::Term;
     match t {
         Term::App(FunSym::NoEq(s), args) if s.name == UNION_SYM_STRING =>
-            Some(args.clone()),
+            Some(args.to_vec()),
         _ => None,
     }
 }

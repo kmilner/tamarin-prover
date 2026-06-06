@@ -44,7 +44,7 @@ where
         Term::Lit(l) => Term::Lit(l),
         Term::App(fsym, args) => {
             let processed: Vec<VTerm<C, V>> =
-                args.into_iter().map(|a| apply_macros(macros, a)).collect();
+                args.iter().cloned().map(|a| apply_macros(macros, a)).collect();
             if let Some(m) = find_matching_macro(&fsym, macros) {
                 let pairs = m
                     .params

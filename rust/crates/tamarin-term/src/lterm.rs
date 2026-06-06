@@ -266,7 +266,7 @@ pub fn flattened_ac_terms<'a, A>(sym: AcSym, t: &'a Term<A>) -> Vec<&'a Term<A>>
     fn go<'b, A>(sym: AcSym, t: &'b Term<A>, out: &mut Vec<&'b Term<A>>) {
         if let Term::App(FunSym::Ac(s), args) = t {
             if *s == sym {
-                for a in args {
+                for a in args.iter() {
                     go(sym, a, out);
                 }
                 return;
@@ -285,8 +285,8 @@ pub fn fresh_to_const(t: LNTerm) -> LNTerm {
         Term::Lit(Lit::Var(ref v)) if v.sort == LSort::Fresh => variable_to_const(v),
         Term::Lit(_) => t,
         Term::App(f, args) => {
-            let mapped: Vec<LNTerm> = args.into_iter().map(fresh_to_const).collect();
-            Term::App(f, mapped)
+            let mapped: Vec<LNTerm> = args.iter().cloned().map(fresh_to_const).collect();
+            Term::App(f, mapped.into())
         }
     }
 }
@@ -350,7 +350,7 @@ pub fn free_term(t: LNTerm) -> BLTerm {
     match t {
         Term::Lit(Lit::Var(v)) => crate::term::lit(Lit::Var(BVar::Free(v))),
         Term::Lit(Lit::Con(c)) => crate::term::lit(Lit::Con(c)),
-        Term::App(f, args) => Term::App(f, args.into_iter().map(free_term).collect()),
+        Term::App(f, args) => Term::App(f, args.iter().cloned().map(free_term).collect::<Vec<_>>().into()),
     }
 }
 
@@ -468,7 +468,7 @@ where
         match self {
             Term::Lit(l) => l.for_each_free(f),
             Term::App(_, args) => {
-                for a in args { a.for_each_free(f); }
+                for a in args.iter() { a.for_each_free(f); }
             }
         }
     }
@@ -476,7 +476,7 @@ where
         match self {
             Term::Lit(l) => Term::Lit(l.map_free(f)),
             Term::App(fsym, args) => {
-                let mapped: Vec<Term<L>> = args.into_iter().map(|a| a.map_free(f)).collect();
+                let mapped: Vec<Term<L>> = args.iter().cloned().map(|a| a.map_free(f)).collect();
                 // Re-AC-normalise via smart constructors.
                 match fsym {
                     FunSym::Ac(s) => crate::term::f_app_ac(s, mapped),
@@ -553,8 +553,8 @@ pub fn nat_to_fresh_vars(t: LNTerm) -> LNTerm {
         }
         Term::Lit(_) => t,
         Term::App(f, args) => {
-            let mapped: Vec<LNTerm> = args.into_iter().map(nat_to_fresh_vars).collect();
-            Term::App(f, mapped)
+            let mapped: Vec<LNTerm> = args.iter().cloned().map(nat_to_fresh_vars).collect();
+            Term::App(f, mapped.into())
         }
     }
 }

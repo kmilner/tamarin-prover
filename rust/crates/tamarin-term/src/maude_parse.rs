@@ -296,14 +296,14 @@ fn build_app(msig: &MaudeSig, ident: &[u8], args: Vec<MTerm>) -> MTerm {
     }
     // C operator (em)?
     if ident == pp_maude_c_sym(CSym::EMap).as_slice() {
-        return Term::App(FunSym::C(CSym::EMap), args);
+        return Term::App(FunSym::C(CSym::EMap), args.into());
     }
     // List?
     if ident == b"list" {
         // `list(cons(t1, cons(...)))` flattens to `FunSym::List [t1, ...]`.
         if args.len() == 1 {
             let flat = flatten_cons(&args[0]);
-            return Term::App(FunSym::List, flat);
+            return Term::App(FunSym::List, flat.into());
         }
     }
     if ident == b"cons" || ident == b"nil" {
@@ -324,7 +324,7 @@ fn build_app(msig: &MaudeSig, ident: &[u8], args: Vec<MTerm>) -> MTerm {
         // Haskell version errors here, but lenient pass is fine for our
         // round-trip tests since we constructed the signature ourselves).
         let _ = msig;
-        return Term::App(FunSym::NoEq(sym), args);
+        return Term::App(FunSym::NoEq(sym), args.into());
     }
     // Unknown — fall back to a public-constructor symbol with the raw name
     // for forward compatibility; this matches Haskell only for certain
@@ -335,7 +335,7 @@ fn build_app(msig: &MaudeSig, ident: &[u8], args: Vec<MTerm>) -> MTerm {
         privacy: Privacy::Public,
         constructability: Constructability::Constructor,
     };
-    Term::App(FunSym::NoEq(sym), args)
+    Term::App(FunSym::NoEq(sym), args.into())
 }
 
 fn flatten_cons(t: &MTerm) -> Vec<MTerm> {

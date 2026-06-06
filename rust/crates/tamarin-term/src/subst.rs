@@ -131,7 +131,7 @@ pub fn apply_vterm<C: Ord + Clone, V: Ord + Clone>(
         Term::Lit(l) => apply_lit(s, &l),
         Term::App(fsym, args) => {
             let mapped: Vec<VTerm<C, V>> =
-                args.into_iter().map(|a| apply_vterm(s, a)).collect();
+                args.iter().cloned().map(|a| apply_vterm(s, a)).collect();
             match fsym {
                 FunSym::Ac(o) => f_app_ac(o, mapped),
                 FunSym::C(o) => f_app_c(o, mapped),
@@ -187,7 +187,7 @@ mod tests {
         let out = apply_vterm(&s, t);
         // Substitution may reorder; arguments must be sorted.
         if let Term::App(_, ts) = out {
-            assert_eq!(ts, vec![const_term(1), const_term(3)]);
+            assert_eq!(&*ts, &[const_term(1), const_term(3)][..]);
         } else {
             panic!("expected AC application");
         }

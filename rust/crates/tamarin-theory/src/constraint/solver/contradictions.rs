@@ -274,7 +274,7 @@ fn maybe_not_nf_subterms(
     match t {
         Term::Lit(Lit::Con(_)) => {}
         Term::App(sym, args) if irreducible.contains(sym) => {
-            for a in args {
+            for a in args.iter() {
                 maybe_not_nf_subterms(irreducible, a, out);
             }
         }
@@ -475,7 +475,7 @@ fn possible_end_syms(
     match t {
         Term::App(_, args) => {
             let mut out = vec![head];
-            for a in args {
+            for a in args.iter() {
                 let sub = possible_end_syms(a)?;
                 out.extend(sub);
             }
@@ -526,7 +526,7 @@ fn possible_root_syms(
     match t {
         Term::App(_, args) => {
             let mut out = vec![head];
-            for a in args {
+            for a in args.iter() {
                 let sub = possible_root_syms(a)?;
                 out.extend(sub);
             }
@@ -819,7 +819,7 @@ fn has_forbidden_exp(sys: &System) -> bool {
         match t {
             Term::App(FunSym::Ac(AcSym::Mult), args) => {
                 let mut out = Vec::new();
-                for a in args { out.extend(ni_factors(a)); }
+                for a in args.iter() { out.extend(ni_factors(a)); }
                 out
             }
             Term::App(FunSym::NoEq(s), args)
@@ -852,7 +852,7 @@ fn has_forbidden_exp(sys: &System) -> bool {
         fn walk(t: &LNTerm, f: &mut dyn FnMut(&LNTerm)) {
             f(t);
             if let Term::App(_, args) = t {
-                for a in args { walk(a, f); }
+                for a in args.iter() { walk(a, f); }
             }
         }
         walk(t, &mut visit);

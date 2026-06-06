@@ -6,6 +6,7 @@
 //! sorted into a canonical order.
 
 use crate::function_symbols::{AcSym, CSym, FunSym, NoEqSym};
+use std::sync::Arc;
 
 /// Diff annotation — whether the left or right interpretation of `diff` is
 /// in scope.
@@ -20,10 +21,26 @@ pub enum DiffType {
 /// A term over literal type `A`. Construct via [`lit`] / [`f_app`] /
 /// [`f_app_no_eq`] / [`f_app_list`] — never via the variants directly,
 /// because [`Term::App`] expects AC-normalised argument lists.
+///
+/// Children of [`Term::App`] are held in an `Arc<[_]>` so that cloning a
+/// `Term` is O(1) (one atomic refcount bump on `Arc<[_]>`) instead of a
+/// recursive deep clone.  This mirrors GHC's structural sharing of term
+/// subtrees: a `Term` in Haskell is a pointer-sized value that is shared
+/// across many sites by reference, never deep-copied.  Profiling shows
+/// that with the prior `Vec<Term<A>>` children, ~50% of solver CPU was
+/// spent in `Term::clone` / `mi_malloc` / `mi_free` on the hot path
+/// `subst_system_once → Goal::clone → Fact::clone → Vec::clone →
+/// Term::clone`.  The `Arc<[_]>` form makes that O(1).
+///
+/// Reading (`args.iter()`, `args.len()`, `args[i]`, `&args[..]`) is
+/// unchanged because `Arc<[_]>` derefs to `[_]`.  Construction sites
+/// convert via `vec.into()` (or `Arc::from(vec)`); destructure-and-
+/// consume patterns use `args.iter().cloned()` (each child clone is
+/// itself O(1)).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Term<A> {
     Lit(A),
-    App(FunSym, Vec<Term<A>>),
+    App(FunSym, Arc<[Term<A>]>),
 }
 
 /// Mirror view that distinguishes the two cases — kept for parity with the
@@ -58,8 +75,8 @@ pub fn f_app<A: Ord + Clone>(fsym: FunSym, ts: Vec<Term<A>>) -> Term<A> {
     match fsym {
         FunSym::Ac(s) => f_app_ac(s, ts),
         FunSym::C(c) => f_app_c(c, ts),
-        FunSym::List => Term::App(FunSym::List, ts),
-        FunSym::NoEq(_) => Term::App(fsym, ts),
+        FunSym::List => Term::App(FunSym::List, ts.into()),
+        FunSym::NoEq(_) => Term::App(fsym, ts.into()),
     }
 }
 
@@ -83,28 +100,28 @@ pub fn f_app_ac<A: Ord + Clone>(sym: AcSym, args: Vec<Term<A>>) -> Term<A> {
         }
     }
     flat.sort();
-    Term::App(target, flat)
+    Term::App(target, flat.into())
 }
 
 /// Commutative (non-associative) smart constructor: just sorts arguments.
 pub fn f_app_c<A: Ord + Clone>(sym: CSym, mut args: Vec<Term<A>>) -> Term<A> {
     args.sort();
-    Term::App(FunSym::C(sym), args)
+    Term::App(FunSym::C(sym), args.into())
 }
 
 /// Free (NoEq) smart constructor.
 pub fn f_app_no_eq<A>(sym: NoEqSym, args: Vec<Term<A>>) -> Term<A> {
-    Term::App(FunSym::NoEq(sym), args)
+    Term::App(FunSym::NoEq(sym), args.into())
 }
 
 /// `LIST` smart constructor.
 pub fn f_app_list<A>(args: Vec<Term<A>>) -> Term<A> {
-    Term::App(FunSym::List, args)
+    Term::App(FunSym::List, args.into())
 }
 
 /// Direct constructor — caller must ensure AC normalisation themselves.
 pub fn unsafe_f_app<A>(fsym: FunSym, args: Vec<Term<A>>) -> Term<A> {
-    Term::App(fsym, args)
+    Term::App(fsym, args.into())
 }
 
 // =============================================================================
@@ -148,8 +165,8 @@ pub fn replace_subterm<A: Clone, F: FnMut(Term<A>) -> Term<A>>(
         Term::Lit(_) => new,
         Term::App(s, ts) => {
             let new_ts: Vec<Term<A>> =
-                ts.into_iter().map(|c| replace_subterm(f, c)).collect();
-            Term::App(s, new_ts)
+                ts.iter().cloned().map(|c| replace_subterm(f, c)).collect();
+            Term::App(s, new_ts.into())
         }
     }
 }
@@ -161,8 +178,8 @@ pub fn replace_proper_subterm<A: Clone, F: FnMut(Term<A>) -> Term<A>>(
     match t {
         Term::App(s, ts) => {
             let new_ts: Vec<Term<A>> =
-                ts.into_iter().map(|c| replace_subterm(f, c)).collect();
-            Term::App(s, new_ts)
+                ts.iter().cloned().map(|c| replace_subterm(f, c)).collect();
+            Term::App(s, new_ts.into())
         }
         Term::Lit(_) => t,
     }
@@ -243,7 +260,7 @@ mod tests {
         let t = f_app_c(CSym::EMap, vec![nat(2), nat(1)]);
         match t {
             Term::App(FunSym::C(CSym::EMap), ts) => {
-                assert_eq!(ts, vec![nat(1), nat(2)]);
+                assert_eq!(&*ts, &[nat(1), nat(2)]);
             }
             _ => panic!(),
         }
@@ -256,7 +273,7 @@ mod tests {
         match t {
             Term::App(FunSym::NoEq(s), ts) => {
                 assert_eq!(s, pair_sym());
-                assert_eq!(ts, vec![nat(1), nat(2)]);
+                assert_eq!(&*ts, &[nat(1), nat(2)]);
             }
             _ => panic!(),
         }
@@ -295,7 +312,7 @@ mod tests {
         let r = replace_subterm(&mut f, t);
         match r {
             Term::App(_, ts) => {
-                assert_eq!(ts, vec![nat(11), nat(12)]);
+                assert_eq!(&*ts, &[nat(11), nat(12)]);
             }
             _ => panic!(),
         }

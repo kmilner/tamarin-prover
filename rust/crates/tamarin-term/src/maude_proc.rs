@@ -878,7 +878,7 @@ impl MaudeHandle {
             // pp_mterm on a constructed FunSym::List.
             use crate::function_symbols::FunSym;
             use crate::term::Term;
-            pp_mterm(&Term::App(FunSym::List, items.to_vec()))
+            pp_mterm(&Term::App(FunSym::List, items.to_vec().into()))
         };
         let mut cmd = b"match in MSG : ".to_vec();
         cmd.extend(pp_list(&t2s));
@@ -968,7 +968,7 @@ impl MaudeHandle {
                     }
                 }
                 crate::term::Term::App(_, args) => {
-                    for a in args { collect_subject_vars(a, pattern_vars, out); }
+                    for a in args.iter() { collect_subject_vars(a, pattern_vars, out); }
                 }
                 _ => {}
             }
@@ -1017,7 +1017,7 @@ impl MaudeHandle {
                     let new_args: Vec<LNTerm> = args.iter()
                         .map(|a| rewrite_subject(a, map))
                         .collect();
-                    crate::term::Term::App(sym.clone(), new_args)
+                    crate::term::Term::App(sym.clone(), new_args.into())
                 }
                 _ => t.clone(),
             }
@@ -1039,7 +1039,7 @@ impl MaudeHandle {
         let pp_list = |items: &[MTerm]| -> Vec<u8> {
             use crate::function_symbols::FunSym;
             use crate::term::Term;
-            pp_mterm(&Term::App(FunSym::List, items.to_vec()))
+            pp_mterm(&Term::App(FunSym::List, items.to_vec().into()))
         };
         let mut cmd = b"match in MSG : ".to_vec();
         cmd.extend(pp_list(&t2s));
@@ -1142,7 +1142,7 @@ impl MaudeHandle {
                     }
                 }
                 crate::term::Term::App(_, args) => {
-                    for a in args { collect_free_non_pattern(a, pattern_vars, out); }
+                    for a in args.iter() { collect_free_non_pattern(a, pattern_vars, out); }
                 }
                 _ => {}
             }
@@ -1185,7 +1185,7 @@ impl MaudeHandle {
                     let new_args: Vec<LNTerm> = args.iter()
                         .map(|a| rewrite(a, map))
                         .collect();
-                    crate::term::Term::App(sym.clone(), new_args)
+                    crate::term::Term::App(sym.clone(), new_args.into())
                 }
                 _ => t.clone(),
             }
@@ -1208,7 +1208,7 @@ impl MaudeHandle {
         let pp_list = |items: &[MTerm]| -> Vec<u8> {
             use crate::function_symbols::FunSym;
             use crate::term::Term;
-            pp_mterm(&Term::App(FunSym::List, items.to_vec()))
+            pp_mterm(&Term::App(FunSym::List, items.to_vec().into()))
         };
         // Maude's `match A <=? B` syntax means: find σ such that B = σ(A).
         // So A is the PATTERN (left), B is the SUBJECT (right).
@@ -1313,7 +1313,7 @@ fn unskolemize(
         }
         crate::term::Term::App(sym, args) => {
             let new_args: Vec<LNTerm> = args.iter().map(|a| unskolemize(a, reverse)).collect();
-            crate::term::Term::App(sym.clone(), new_args)
+            crate::term::Term::App(sym.clone(), new_args.into())
         }
         _ => t.clone(),
     }
@@ -1672,7 +1672,7 @@ mod tests {
         let a_pub = LVar::new("A", LSort::Pub, 0);
         let ltka = LVar::new("ltkA", LSort::Fresh, 0);
         let mk = |v: LVar| -> LNTerm { crate::term::Term::Lit(Lit::Var(v)) };
-        let pk_term = crate::term::Term::App(FunSym::NoEq(pk_sym), vec![mk(ltka)]);
+        let pk_term = crate::term::Term::App(FunSym::NoEq(pk_sym), vec![mk(ltka)].into());
         let us = h.unify(&[Equal { lhs: mk(a_pub), rhs: pk_term }]).expect("unify");
         assert!(us.is_empty(), "expected no unifier for Pub ↔ pk(Fresh)");
     }

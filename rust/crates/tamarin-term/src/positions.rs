@@ -17,7 +17,7 @@ pub fn at_pos<C: Ord + Clone, V: Ord + Clone>(t: &VTerm<C, V>, p: &[i64]) -> Opt
     if p.is_empty() { return Some(t.clone()); }
     match t {
         Term::Lit(_) => None,
-        Term::App(FunSym::Ac(s), args) => match (p[0], args.as_slice()) {
+        Term::App(FunSym::Ac(s), args) => match (p[0], &args[..]) {
             (_, []) => None,
             (0, [a, ..]) => at_pos(a, &p[1..]),
             (1, [_, only]) => at_pos(only, &p[1..]),
@@ -44,7 +44,7 @@ pub fn replace_pos<C: Ord + Clone, V: Ord + Clone>(
     if p.is_empty() { return Some(s.clone()); }
     match t {
         Term::Lit(_) => None,
-        Term::App(FunSym::Ac(sym), args) => match (p[0], args.as_slice()) {
+        Term::App(FunSym::Ac(sym), args) => match (p[0], &args[..]) {
             (0, [head, rest @ ..]) => {
                 let new_head = replace_pos(head, s, &p[1..])?;
                 let mut new_args = vec![new_head];
@@ -61,7 +61,7 @@ pub fn replace_pos<C: Ord + Clone, V: Ord + Clone>(
         Term::App(fsym, args) => {
             let i = p[0] as usize;
             if (p[0] as i64) < 0 || i >= args.len() { return None; }
-            let mut new = args.clone();
+            let mut new: Vec<_> = args.iter().cloned().collect();
             new[i] = replace_pos(&args[i], s, &p[1..])?;
             Some(f_app(fsym.clone(), new))
         }
