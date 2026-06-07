@@ -2160,30 +2160,24 @@ impl EquationStore {
                     for (s, w) in witnesses {
                         lifted.push((s, Term::Lit(Lit::Var(w))));
                     }
-                    // H16.7 (Path C): HS-faithful Maude normalisation
-                    // of variant range terms.  HS's `normSubstVFresh'`
-                    // (Term/Rewriting/Norm.hs:158) reduces every range
-                    // term via the equational theory after each variant
-                    // is built.  This reduces `convertpcs(zsk, pcs(sign(...)))`
-                    // to `sign(...)` etc.  Without this, RS's variants
-                    // keep unreduced equation heads even when their args
-                    // are structurally complete, breaking `simp_identify`
-                    // which needs same-image pairs to fire.  See
-                    // [[project-h16-5-simp-identify-precondition]].
-                    //
-                    // Opt-out via `TAM_RS_DISABLE_AES_NORM=1`.
-                    if std::env::var("TAM_RS_DISABLE_AES_NORM").is_err() {
-                        for (_, v) in lifted.iter_mut() {
-                            // Use `aes_maude` so any internal witness
-                            // allocation in reduce() stays in the local
-                            // counter scope (in practice `reduce` is
-                            // pure normalisation, but the handle is
-                            // passed for consistency).
-                            if let Ok(reduced) = aes_maude.reduce(v) {
-                                *v = reduced;
-                            }
-                        }
-                    }
+                    // HS-faithful: NO post-Maude normalisation of variant
+                    // range terms.  HS's `applyEqStore` (EquationStore.hs:351-435)
+                    // returns the raw Maude unifier outputs without
+                    // calling `normSubstVFresh'` — that normaliser is only
+                    // used during VARIANT COMPUTATION for rules
+                    // (RuleVariants.hs:88), NOT here.  Normalising here
+                    // hides non-NF range values (e.g. `Xor(~k,~k)` that
+                    // reduces to `zero`) from the post-fan-out
+                    // `simpMinimize`/`substCreatesNonNormalTerms` filter,
+                    // letting variant cases survive that HS drops.
+                    // Observable on LAK06::noninjectiveagreementTAG —
+                    // HS's per-arm simp narrows SId(1) variants to 0
+                    // (eq_store false) for cases 1/3/5/6/9 of SId(0);
+                    // RS's normalised variants stay NF and the simp leaves
+                    // them at conj=1 [1:1], so the cases survive
+                    // perform_split as bonus split_case_N branches.  See
+                    // [[locked diagnosis 2026-06-07 aes norm hides
+                    // substCheck]].
                     let pairs: Vec<(LVar, LNTerm)> = lifted.into_iter()
                         .filter(|(v, _)| restrict_set.contains(v))
                         .collect();
