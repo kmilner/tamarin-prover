@@ -664,7 +664,6 @@ removeSolvedSplitGoals = do
 -- the sequent.
 substSystem :: Reduction ChangeIndicator
 substSystem = do
-<<<<<<< HEAD
     -- The equation-store substitution is applied to the whole system after
     -- every solving step and is idempotent, so it is frequently empty (e.g.
     -- right after a proof step renamed and reset it). Applying an empty
