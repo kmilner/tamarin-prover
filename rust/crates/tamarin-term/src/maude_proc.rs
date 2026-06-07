@@ -808,6 +808,40 @@ impl MaudeHandle {
             // baked into the returned SubstVFresh arms.
             self.reset_counter_to(high_water);
         }
+        // HS-faithful `flattenUnif (subst, substs) = map (composeVFresh _ subst) substs`
+        // (Unification.hs:147).  For the AC path, RS sends the FULL eqs to
+        // Maude (HS sends only AC residuals after applying local non-AC subst),
+        // so `subst` from the local non-AC factored unification is effectively
+        // empty here.  We then need `composeVFresh empty_subst arm` — which
+        // RENAMES the witnesses (the arm's range vars) via HS's
+        // `freshToFreeAvoidingFast` uniform shift seeded by
+        // `succ (max idx in (s2=empty, s1_0=arm) domain)`.  Without this step,
+        // RS preserves the raw Maude-allocated witness idxs (e.g. ~x.39..~x.43
+        // because the per-call counter was advanced via `ensure_above(input_max)`
+        // to clear the input vars), while HS sees witnesses re-based to
+        // `~x.10..~x.14` (small idxs above just the arm's domain).
+        //
+        // Concrete divergence (LAK06::noninjectiveagreementTAG):
+        //   - HS apply_eq_store call producing 9 substs uses witness idxs
+        //     ~x.10..~x.14 for first applyBound batch (6 unifiers) and
+        //     ~x.27..~x.31 for second batch (1 unifier with different eqs).
+        //   - RS produces the same 9 substs but with witnesses ~x.39..~x.43
+        //     uniformly — because the local Maude counter was ensure_above
+        //     to clear x.38 in the input eqs.
+        //   - The resulting BTreeSet sort order of these alpha-equivalent
+        //     substs DIFFERS, flipping the perform_split case order
+        //     downstream → different `case_xor` chosen at split_case_N.
+        //
+        // Opt-out via `TAM_RS_DISABLE_AC_COMPOSE_VFRESH=1`.
+        if std::env::var("TAM_RS_DISABLE_AC_COMPOSE_VFRESH").is_err() {
+            let empty_subst = crate::subst::Subst::<crate::lterm::Name, crate::lterm::LVar>::empty();
+            let renamed: Vec<Vec<(crate::lterm::LVar, LNTerm)>> = out.into_iter().map(|arm| {
+                let arm_vfresh = crate::subst_vfresh::LSubstVFresh::<crate::lterm::Name>::from_list(arm);
+                let composed = crate::subst_vfresh::compose_vfresh(&arm_vfresh, &empty_subst);
+                composed.to_list()
+            }).collect();
+            return Ok(renamed);
+        }
         Ok(out)
     }
 
