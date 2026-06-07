@@ -261,36 +261,114 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
         preserve: &std::collections::BTreeSet<LVar>,
     ) -> crate::subst::Subst<C, LVar> {
         use crate::subst::Subst;
-        // Step 1: collect distinct range vars that are NOT in `preserve`.
-        // Those that are in `preserve` retain their identity (no rename).
-        let mut range_vars: Vec<LVar> = Vec::new();
-        for (_v, t) in self.to_list() {
-            for w in crate::vterm::vars_vterm(&t) {
-                if preserve.contains(&w) { continue; }
-                if !range_vars.iter().any(|r| r == &w) {
-                    range_vars.push(w);
-                }
-            }
-        }
-        // Step 2: allocate fresh indices and build a rename map.
-        let need = range_vars.len() as u64;
+        // HS-faithful port (Substitution.hs:54-66):
+        //
+        //   freshToFree subst = (`evalBindT` noBindings) $ do
+        //       let slist = sortOn (size . snd) $ substToListVFresh subst
+        //       substFromList <$> mapM convertMapping slist
+        //     where
+        //       convertMapping (lv,t) = (lv,) <$> mapFrees (Arbitrary importVar) t
+        //         where
+        //           importVar v = importBinding (\s i -> LVar s (lvarSort v) i) v (namehint v)
+        //           namehint v  = case viewTerm t of
+        //               Lit (Var _) -> lvarName lv -- keep name of oldvar
+        //               _           -> lvarName v
+        //
+        // Two key behaviours:
+        // 1. Sort by image size (singletons first) — gives single-var
+        //    images the chance to claim the fresh slot first.
+        // 2. Name hint: for a singleton-Var image `(lv, ~x.K)`, name the
+        //    fresh from the DOMAIN var's name (`lvarName lv`).  For an
+        //    App image like `(lv, h(...))`, the inner vars keep their
+        //    ORIGINAL names (`lvarName v`).
+        //
+        // `evalBindT noBindings` caches rename decisions per VFresh
+        // range var: the first binding to claim a range var sets its
+        // name+idx; subsequent uses reuse the cached fresh.  This is
+        // what makes `~k → ~x.11` followed by `~k.1 → ~x.11` produce a
+        // SHARED renamed var (both → ~k.<new>), folding the alpha-
+        // equivalence into the free subst.
+        //
+        // Previously RS named every range var by the range's own name,
+        // producing `~x.<idx>` everywhere and losing HS's per-binding
+        // name-hint structure — which then cascaded through `Ord LVar`
+        // → `S.toList performSplit` ordering → divergent canonical
+        // split_case_N labelling.
+
+        // Step 0: sort entries by size of image (smaller first).
+        // HS's `sortOn (size . snd)` — stable sort by size.
+        let mut slist: Vec<(LVar, VTerm<C, LVar>)> = self.to_list();
+        slist.sort_by_key(|(_, t)| term_size(t));
+
+        // Step 1: cache binding map (range var → new var), built
+        // incrementally as we walk substs in sorted order.
         let mut rename: BTreeMap<LVar, LVar> = BTreeMap::new();
-        if need > 0 {
-            let base = alloc_idxs(need);
-            for (k, old) in range_vars.into_iter().enumerate() {
-                let new = LVar { name: old.name.clone(),
-                                 sort: old.sort,
-                                 idx: base + (k as u64) };
-                rename.insert(old, new);
-            }
-        }
-        // Step 3: rewrite each (v, t) by renaming non-preserved vars.
-        let mut pairs: Vec<(LVar, VTerm<C, LVar>)> = Vec::new();
-        for (v, t) in self.to_list() {
-            let renamed = rename_lvars_in_vterm(&t, &rename);
-            pairs.push((v, renamed));
+
+        // Step 2: process each (lv, t) and rename inner vars per HS
+        // semantics.  When t is a singleton Var, use lv's name as hint;
+        // otherwise use the inner var's name.
+        let mut pairs: Vec<(LVar, VTerm<C, LVar>)> = Vec::with_capacity(slist.len());
+        for (lv, t) in slist.into_iter() {
+            // Determine the namehint mode based on the OUTER term shape.
+            let outer_is_singleton_var = matches!(&t, Term::Lit(Lit::Var(_)));
+            let renamed = rename_lvars_with_hint(&t, &mut rename, preserve, &mut alloc_idxs,
+                outer_is_singleton_var, &lv);
+            pairs.push((lv, renamed));
         }
         Subst::from_list(pairs)
+    }
+}
+
+/// Compute the "size" of a VTerm — number of leaves + interior App
+/// nodes.  HS's `Term.size` for sorting `freshToFree`'s input list.
+fn term_size<C, V>(t: &VTerm<C, V>) -> usize {
+    match t {
+        Term::Lit(_) => 1,
+        Term::App(_, args) => 1 + args.iter().map(term_size).sum::<usize>(),
+    }
+}
+
+/// Walk a VTerm, renaming each var via the rename map.  If a var
+/// isn't yet in the rename map, allocate a fresh idx for it and
+/// record the binding.  `outer_is_singleton_var` + `lv` together
+/// implement HS's `namehint v = if (Lit (Var _) == t) then lvarName lv
+/// else lvarName v` rule (Substitution.hs:64-66).
+fn rename_lvars_with_hint<C: Clone, F: FnMut(u64) -> u64>(
+    t: &VTerm<C, LVar>,
+    rename: &mut BTreeMap<LVar, LVar>,
+    preserve: &std::collections::BTreeSet<LVar>,
+    alloc_idxs: &mut F,
+    outer_is_singleton_var: bool,
+    lv: &LVar,
+) -> VTerm<C, LVar> {
+    match t {
+        Term::Lit(Lit::Var(v)) => {
+            if preserve.contains(v) {
+                Term::Lit(Lit::Var(v.clone()))
+            } else if let Some(new) = rename.get(v).cloned() {
+                Term::Lit(Lit::Var(new))
+            } else {
+                // Allocate a fresh idx; name hint depends on outer
+                // term shape.
+                let idx = alloc_idxs(1);
+                let name = if outer_is_singleton_var {
+                    lv.name.clone()
+                } else {
+                    v.name.clone()
+                };
+                let new = LVar { name, sort: v.sort, idx };
+                rename.insert(v.clone(), new.clone());
+                Term::Lit(Lit::Var(new))
+            }
+        }
+        Term::Lit(Lit::Con(c)) => Term::Lit(Lit::Con(c.clone())),
+        Term::App(f, args) => {
+            let new_args: Vec<_> = args.iter()
+                .map(|a| rename_lvars_with_hint(a, rename, preserve, alloc_idxs,
+                    outer_is_singleton_var, lv))
+                .collect();
+            Term::App(f.clone(), new_args.into())
+        }
     }
 }
 
