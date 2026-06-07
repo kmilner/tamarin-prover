@@ -1838,9 +1838,27 @@ impl<'ctx> Reduction<'ctx> {
         }
     }
 
-    /// Remove all solved `Split` goals whose split id is no longer
-    /// valid in the equation store. Matches Haskell's
-    /// `removeSolvedSplitGoals`.
+    /// Remove all `Split` goals whose split id is no longer valid in
+    /// the equation store. Matches Haskell's `removeSolvedSplitGoals`
+    /// at `Reduction.hs:652-657`:
+    ///
+    /// ```haskell
+    /// removeSolvedSplitGoals = do
+    ///     goals    <- getM sGoals
+    ///     existent <- splitExists <$> getM sEqStore
+    ///     sequence_ [ modM sGoals $ M.delete goal
+    ///               | goal@(SplitG i) <- M.keys goals, not (existent i) ]
+    /// ```
+    ///
+    /// HS removes EVERY `SplitG i` whose `i` is no longer in the eq
+    /// store — regardless of the goal's solved-status flag.  An
+    /// earlier `simp` pass on the eq store can drop disjunctions
+    /// (e.g. via `simpRemoveRenamings`, `simpEmptyDisj`, or by
+    /// substituting one disj's content into the global subst), which
+    /// leaves the `SplitG i` goal behind referring to a no-longer-
+    /// existent split-id.  When HS prunes those, the goal-rank input
+    /// shrinks, which on exists-trace lemmas like CH07::executable
+    /// changes which `split_case_N` the DFS picks first.
     pub fn remove_solved_split_goals(&mut self) {
         use crate::constraint::constraints::Goal as G;
         let valid: std::collections::BTreeSet<_> = self.sys.eq_store.conj.iter()
@@ -1848,8 +1866,11 @@ impl<'ctx> Reduction<'ctx> {
             .collect();
         let before = self.sys.goals.len();
         self.sys.invalidate_max_var_idx_cache();
-        self.sys.goals.retain(|(g, status)| match g {
-            G::Split(id) => !status.solved || valid.contains(id),
+        self.sys.goals.retain(|(g, _status)| match g {
+            // HS-faithful: drop the goal whenever the split_id no
+            // longer backs an eq-store disjunction (ignore solved
+            // flag).
+            G::Split(id) => valid.contains(id),
             _ => true,
         });
         if self.sys.goals.len() != before {
