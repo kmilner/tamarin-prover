@@ -1447,19 +1447,24 @@ fn msubst_to_lnsubst_with_maude(
         let lv = crate::maude_types::substitute_lookup_var(ctx, *sort, *idx)
             .ok_or_else(|| MaudeError::Other(format!(
                 "no binding for Maude variable x{}:{:?}", idx, sort)))?;
-        // HS-faithful: when the value is a pure rename (Lit FreshVar),
-        // use the domain LVar's name as the name hint so the witness
-        // gets named after the original variable (HS's `freshToFree`
-        // namehint logic at Substitution.hs:64 — `case viewTerm t of
-        // Lit (Var _) -> lvarName lv`).  Without this, all Rust
-        // witnesses get the generic name "x", and the resulting
-        // SubstVFresh Ord ordering at perform_split diverges from
-        // HS's (HS's identity-variant entries have value-side LVar
-        // names matching the key, e.g. `(pkA, pkA.K)`, while Rust
-        // produced `(pkA, x.K)`).  See [[project-split-case-divergence-root]].
-        // Use TAM_RS_DISABLE_NAME_PRESERVE=1 to revert to "x" for
-        // diagnostic comparison.
-        let use_name_preserve = std::env::var("TAM_RS_DISABLE_NAME_PRESERVE").is_err();
+        // HS-faithful: HS's `msubstToLSubstVFresh` (Maude/Types.hs:138)
+        // UNCONDITIONALLY uses `"x"` as the name hint for Maude-introduced
+        // witnesses inside `eqsConj` substitutions.  The commented-out
+        // alternative branch at Maude/Types.hs:134-137 (preserve domain
+        // name for `xi → xj` renames) is explicitly marked "seems wrong".
+        //
+        // A prior commit (8c360539) used the domain LVar's name for
+        // FreshVar-image entries, motivated by `freshToFree`'s namehint
+        // logic at Substitution.hs:64 — but that's a DIFFERENT layer.
+        // `freshToFree` is applied at SUBSTITUTION-APPLICATION time
+        // (via `composeVFresh`/`applyEqStore`), not at Maude-conversion
+        // time.  Mixing the two layers gave RS witness names that drift
+        // from HS's `~x.N` at perform_split (observable on LAK06::TAG and
+        // the XOR cluster).
+        //
+        // `TAM_RS_ENABLE_NAME_PRESERVE=1` opts in to the legacy
+        // domain-preserve path for diagnostic comparison.
+        let use_name_preserve = std::env::var("TAM_RS_ENABLE_NAME_PRESERVE").is_ok();
         let name_hint: &str = if use_name_preserve {
             if let crate::term::Term::Lit(crate::maude_types::MaudeLit::FreshVar(_, _)) = mt {
                 lv.name.as_str()
