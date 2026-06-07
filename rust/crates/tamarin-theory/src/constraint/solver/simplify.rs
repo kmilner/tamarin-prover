@@ -219,6 +219,224 @@ pub fn simplify_system(red: &mut Reduction) {
     add_non_injective_fact_instances(red);
 }
 
+/// Run one iteration of the simplify loop — every pass EXCEPT
+/// `solveUniqueActions`.  Used by both the in-place `simplify_system`
+/// (where the in-place `solve_unique_actions_pass` is called separately)
+/// and the fan-out variant (which uses `solve_unique_actions_pass_fan_out`).
+fn simp_iteration_pre_unique_actions(r: &mut Reduction) -> ChangeIndicator {
+    trace_subpass("substSystem", r, |r| { r.subst_system(); ChangeIndicator::Unchanged });
+    let mut c = ChangeIndicator::Unchanged;
+    if std::env::var("TAM_OFF_FRESH_UNIQ").is_err() {
+        c = c.or(trace_subpass("enforceFreshNodeUniqueness", r, enforce_fresh_node_uniqueness_pass));
+    }
+    if std::env::var("TAM_OFF_KD_UNIQ").is_err() {
+        c = c.or(trace_subpass("enforceKdFactUniqueness", r, enforce_kd_fact_uniqueness_pass));
+    }
+    if std::env::var("TAM_OFF_KU_UNIQ").is_err() {
+        c = c.or(trace_subpass("enforceKuActionUniqueness", r, enforce_ku_action_uniqueness_pass));
+    }
+    if std::env::var("TAM_OFF_EDGE_UNIQ").is_err() {
+        c = c.or(trace_subpass("enforceEdgeUniqueness", r, enforce_edge_uniqueness_pass));
+    }
+    c
+}
+
+/// Run the simplify-loop passes AFTER `solveUniqueActions`.  Shared
+/// between `simplify_system` and `simplify_system_fan_out`.
+fn simp_iteration_post_unique_actions(r: &mut Reduction) -> ChangeIndicator {
+    let mut c = ChangeIndicator::Unchanged;
+    c = c.or(trace_subpass("reduceFormulas", r, reduce_formulas_pass));
+    c = c.or(trace_subpass("evalFormulaAtoms", r, eval_formula_atoms_pass));
+    if std::env::var("TAM_OFF_IMPL").is_err() {
+        c = c.or(trace_subpass("insertImpliedFormulas", r, insert_implied_formulas_pass));
+    }
+    c = c.or(trace_subpass("enforceFreshOrdering", r, enforce_fresh_ordering_pass));
+    c = c.or(trace_subpass("propagateSubtermObvious", r, propagate_subterm_obvious));
+    c = c.or(trace_subpass("simpInjectiveFactEqMon", r, simp_injective_fact_eq_mon_pass));
+    c = c.or(trace_subpass("dedupeFormulas", r, dedupe_formulas_pass));
+    c = c.or(trace_subpass("dropTriviallyTrueFormulas", r, drop_trivially_true_formulas_pass));
+    c = c.or(trace_subpass("normaliseLessAtoms", r, normalise_less_atoms_pass));
+    c
+}
+
+/// Post-loop steps shared between `simplify_system` and `simplify_system_fan_out`.
+fn simp_post_loop_steps(red: &mut Reduction) {
+    exploit_unique_msg_order(red);
+    remove_solved_split_goals_pass(red);
+    add_non_injective_fact_instances(red);
+}
+
+/// Fan-out variant of `simplify_system` — port of HS's `simplifySystem`
+/// (Simplify.hs:65-87) run inside the `Reduction = StateT (FreshT (DisjT ...))`
+/// monad.  When `solveUniqueActions` internally calls `disjunctionOfList`
+/// (via `solveGoal (ActionG i fa)` → source-cases / variants / Maude
+/// AC unifiers), the DisjT layer fans the entire enclosing `simplifySystem`
+/// computation into N branches — one per fan-out case.  Each branch
+/// continues independently through the rest of that loop iteration AND
+/// any subsequent iterations + the post-loop steps.
+///
+/// Our `simplify_system` discards the fan-out (keeps only the in-place
+/// mutated `red.sys`); this version replays each case through the rest
+/// of the loop and post-loop, and returns one `System` per surviving
+/// branch.
+///
+/// `TAM_RS_DISABLE_SIMPLIFY_FANOUT=1` falls back to the in-place
+/// behaviour (returns a single-element vec) — used as a kill switch
+/// for regression debugging.
+pub fn simplify_system_with_fanout(
+    ctx: &crate::constraint::solver::context::ProofContext,
+    sys: crate::constraint::system::System,
+) -> Vec<crate::constraint::system::System> {
+    use crate::constraint::solver::reduction::Reduction;
+    if std::env::var("TAM_RS_DISABLE_SIMPLIFY_FANOUT").is_ok() {
+        let mut r = Reduction::new(ctx, sys);
+        simplify_system(&mut r);
+        return vec![r.sys];
+    }
+    let mut red = Reduction::new(ctx, sys);
+    let cases = simplify_system_fan_out_inner(&mut red);
+    cases
+}
+
+/// Inner driver — mirrors the body of `simplify_system` but propagates
+/// fan-out from two sources:
+///   1. `solve_unique_actions_pass_fan_out` — when `solveGoal (ActionG)`
+///      returns `GoalCases::Cases`.
+///   2. `red.pending_eq_arms` — when any pass calls `insert_formula`
+///      whose `Atom::Eq` triggers `solve_term_eqs SplitNow` with
+///      multiple AC unifier arms.  This is the fan-out site for
+///      Yubikey's `no_replay` and `slightly_weaker_invariant`: the
+///      `reduceFormulas` / `insertImpliedFormulas` pass processes
+///      `Smaller(otc, tc)` ⇒ `Ex z. otc++z = tc`, whose `Atom::Eq`
+///      fans into 7 AC unifiers (one per partition of the multiset
+///      `tc`).
+///
+/// The takes-ownership pattern (consumes `red`, returns systems) lets
+/// the recursive cases each start with a fresh `Reduction` whose
+/// FreshT counter is properly aligned to that case's `bounds_max`.
+fn simplify_system_fan_out_inner(
+    red: &mut Reduction,
+) -> Vec<crate::constraint::system::System> {
+    crate::constraint::solver::trace::trace_exec("simplifySystem");
+
+    let cap: u32 = std::env::var("TAM_SIMP_ITER_CAP").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(64);
+    let mut iter = 0u32;
+    let ctx = red.ctx;
+    let dbg = std::env::var("TAM_RS_DBG_SIMP_FANOUT").is_ok();
+
+    // Manual while_changing loop so we can break out on fan-out.
+    loop {
+        red.changed = ChangeIndicator::Unchanged;
+        iter += 1;
+        if iter > cap {
+            break;
+        }
+        // Pre-unique-actions passes.
+        let _ = simp_iteration_pre_unique_actions(red);
+        // Drain any AC-unifier fanout produced by the pre-unique-actions
+        // passes (e.g. `solve_fact_eqs` in `enforce_*_uniqueness` produces
+        // multiple arms when the merge equates AC-flavored facts).
+        if !red.pending_eq_arms.is_empty() {
+            if dbg { eprintln!("[SIMP_FANOUT] pending_eq_arms drained (pre-unique-actions) n={}",
+                red.pending_eq_arms.len()); }
+            return fan_out_on_pending_eq_arms(red, ctx);
+        }
+        // solveUniqueActions — may fan out.
+        match trace_subpass_fan_out("solveUniqueActions", red, solve_unique_actions_pass_fan_out) {
+            Ok(_c) => { /* no fan-out, continue */ }
+            Err(case_systems) => {
+                if dbg { eprintln!("[SIMP_FANOUT] solveUniqueActions fan-out n={}", case_systems.len()); }
+                // FAN-OUT: per HS, each case continues independently
+                // through the rest of the simplify computation.
+                // Recursively run `simplify_system_with_fanout` per
+                // case; each call rebuilds a fresh Reduction with its
+                // own FreshT counter (`bounds_max(sys)`).
+                let mut out: Vec<crate::constraint::system::System> = Vec::new();
+                for case_sys in case_systems {
+                    if case_sys.eq_store.is_false() { continue; }
+                    let mut sub = simplify_system_with_fanout(ctx, case_sys);
+                    out.append(&mut sub);
+                }
+                return out;
+            }
+        }
+        // Drain any AC-unifier fanout produced by the solveUniqueActions
+        // pass's downstream calls (exploitPrems → Fresh narrowing's
+        // solveTermEqs SplitNow).
+        if !red.pending_eq_arms.is_empty() {
+            if dbg { eprintln!("[SIMP_FANOUT] pending_eq_arms drained (post-unique-actions) n={}",
+                red.pending_eq_arms.len()); }
+            return fan_out_on_pending_eq_arms(red, ctx);
+        }
+        // Post-unique-actions passes.
+        let _ = simp_iteration_post_unique_actions(red);
+        // Drain any AC-unifier fanout from the post-unique-actions passes
+        // (reduceFormulas / evalFormulaAtoms / insertImpliedFormulas
+        // are the most common fan-out sources — they call
+        // `insert_formula` which routes EqE atoms through
+        // `solve_term_eqs SplitNow`).
+        if !red.pending_eq_arms.is_empty() {
+            if dbg { eprintln!("[SIMP_FANOUT] pending_eq_arms drained (post-iter) n={}",
+                red.pending_eq_arms.len()); }
+            return fan_out_on_pending_eq_arms(red, ctx);
+        }
+        if red.changed == ChangeIndicator::Unchanged { break; }
+    }
+    // Post-loop steps — same as `simplify_system`.
+    simp_post_loop_steps(red);
+    vec![std::mem::replace(&mut red.sys, crate::constraint::system::System::empty())]
+}
+
+/// Drain `red.pending_eq_arms`, fork the system for each arm, and
+/// recursively continue `simplify_system_with_fanout` for each fork.
+///
+/// At drain time, `red.sys.eq_store` already contains arm[0]'s
+/// eq-store (installed in-place by `insert_atom`'s Eq arm); we keep
+/// that as the first fork and reset `red.sys` for arms[1..] using a
+/// snapshot of the current system with the arm's eq_store substituted.
+fn fan_out_on_pending_eq_arms(
+    red: &mut Reduction,
+    ctx: &crate::constraint::solver::context::ProofContext,
+) -> Vec<crate::constraint::system::System> {
+    let pending = std::mem::take(&mut red.pending_eq_arms);
+    let arm0_sys = std::mem::replace(&mut red.sys, crate::constraint::system::System::empty());
+    let mut all_arm_systems: Vec<crate::constraint::system::System> = Vec::with_capacity(1 + pending.len());
+    all_arm_systems.push(arm0_sys.clone());
+    for arm_eq in pending {
+        let mut arm_sys = arm0_sys.clone();
+        arm_sys.invalidate_max_var_idx_cache();
+        arm_sys.eq_store = arm_eq;
+        all_arm_systems.push(arm_sys);
+    }
+    let mut out: Vec<crate::constraint::system::System> = Vec::new();
+    for arm_sys in all_arm_systems {
+        if arm_sys.eq_store.is_false() { continue; }
+        let mut sub = simplify_system_with_fanout(ctx, arm_sys);
+        out.append(&mut sub);
+    }
+    out
+}
+
+/// `trace_subpass` analog that lets the inner pass return a
+/// Result-typed value (Ok(ChangeIndicator) | Err(fan-out)).
+fn trace_subpass_fan_out<T, F>(
+    label: &'static str, red: &mut Reduction, f: F,
+) -> std::result::Result<ChangeIndicator, T>
+where
+    F: FnOnce(&mut Reduction) -> std::result::Result<ChangeIndicator, T>,
+{
+    let on = std::env::var("TAM_RS_TRACE_SIMPLIFY").is_ok();
+    if on { eprintln!("[SUBPASS] enter {}", label); }
+    let was_dead_before = is_dead_for_trace(red);
+    let r = f(red);
+    let dead_after = is_dead_for_trace(red);
+    if on && !(dead_after && !was_dead_before) {
+        eprintln!("[SUBPASS] exit  {}", label);
+    }
+    r
+}
+
 /// Direct port of Haskell `addNonInjectiveFactInstances`
 /// (Simplify.hs:730-735): collects (smaller, larger) pairs from
 /// `nonInjectiveFactInstances` (Simplify.hs:686) and inserts each as
@@ -2454,6 +2672,94 @@ fn solve_unique_actions_pass(red: &mut Reduction) -> ChangeIndicator {
         changed = ChangeIndicator::Changed;
     }
     changed
+}
+
+/// Fan-out variant of `solve_unique_actions_pass`.  Mirrors HS's
+/// `solveUniqueActions` (Simplify.hs:400-421) running inside the
+/// `Reduction = StateT System (FreshT (DisjT ...))` monad — when
+/// `solveGoal (ActionG i fa)` internally calls `disjunctionOfList`
+/// (over source-cases / variants / rule actions / Maude unifiers),
+/// the resulting `Disj` fans the entire simplify computation out
+/// into multiple branches.  Our in-place version above discards the
+/// `Cases` outcome and keeps only the mutated `red.sys`; this version
+/// returns the fan-out so the caller (`simplify_system_fan_out`) can
+/// continue the simplify loop for each branch independently.
+///
+/// Return shape:
+///   - `Ok(ChangeIndicator)` — pass ran to completion with no fan-out;
+///     `red.sys` mutated in place.
+///   - `Err(Vec<System>)` — the first action goal that fanned out
+///     produced multiple cases.  Each entry is the post-action-solve
+///     system for that case; subsequent action goals in the candidate
+///     list have NOT been processed and remain in each case's goal set
+///     (the caller will re-run this pass per case as part of the
+///     surrounding fixpoint).
+pub(crate) fn solve_unique_actions_pass_fan_out(
+    red: &mut Reduction,
+) -> std::result::Result<ChangeIndicator, Vec<crate::constraint::system::System>> {
+    use crate::constraint::constraints::Goal;
+    use crate::fact::{FactTag, LNFact};
+
+    let mut counts: std::collections::BTreeMap<(FactTag, usize), usize>
+        = std::collections::BTreeMap::new();
+    for r in &red.ctx.rules {
+        for fa in &r.rule.actions {
+            *counts.entry((fa.tag.clone(), fa.terms.len())).or_insert(0) += 1;
+        }
+    }
+    for r in &red.ctx.intruder_rules {
+        for fa in &r.actions {
+            *counts.entry((fa.tag.clone(), fa.terms.len())).or_insert(0) += 1;
+        }
+    }
+    let is_unique = |fa: &LNFact| -> bool {
+        for t in &fa.terms {
+            if has_funion_head(t) { return false; }
+        }
+        counts.get(&(fa.tag.clone(), fa.terms.len())).copied() == Some(1)
+    };
+
+    let mut candidates: Vec<(crate::constraint::constraints::NodeId, LNFact)> =
+        red.sys.goals.iter()
+            .filter_map(|(g, st)| match g {
+                Goal::Action(i, fa) if !st.solved && is_unique(fa) =>
+                    Some((i.clone(), fa.clone())),
+                _ => None,
+            })
+            .collect();
+    candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    if candidates.is_empty() { return Ok(ChangeIndicator::Unchanged); }
+    let mut changed = ChangeIndicator::Unchanged;
+    for (i, fa) in candidates {
+        let still_present = red.sys.goals.iter().any(|(g, st)| {
+            !st.solved && matches!(g, Goal::Action(gi, gfa)
+                if gi == &i && gfa == &fa)
+        });
+        if !still_present { continue; }
+        let outcome = red.solve_action_goal(&i, &fa);
+        use crate::constraint::solver::reduction::GoalCases;
+        match outcome {
+            GoalCases::Contradictory => {
+                mark_contradictory_labeled(red, "solve_unique_actions");
+                changed = ChangeIndicator::Changed;
+            }
+            GoalCases::Linear | GoalCases::LinearNamed(_) => {
+                // `red.sys` is already mutated in place by `solve_action_goal`.
+                changed = ChangeIndicator::Changed;
+            }
+            GoalCases::Cases(cases) => {
+                // Fan-out — return the case systems.  Per HS, the
+                // surviving cases each continue independently through
+                // the rest of the simplify computation.  The Action
+                // goal has already been marked solved inside
+                // `solve_action_goal` for each case's system.
+                let systems: Vec<crate::constraint::system::System> =
+                    cases.into_iter().map(|(_name, s)| s).collect();
+                return Err(systems);
+            }
+        }
+    }
+    Ok(changed)
 }
 
 /// True if any subterm has the AC `Union` head — multiset union.
