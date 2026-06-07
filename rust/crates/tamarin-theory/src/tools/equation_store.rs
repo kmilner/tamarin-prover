@@ -457,16 +457,26 @@ impl EquationStore {
         // mirrors Haskell's `solve _ (Just (m, [])) = (substFromMap m,
         // [emptySubstVFresh])` followed by `flattenUnif` which produces
         // a single SubstVFresh equal to the local subst.
+        //
+        // HS-faithful (EquationStore.hs:305):
+        //     (subst, [substFresh]) | substFresh == emptySubstVFresh ->
+        //         return (applyEqStoreAt "addEqs.single-unifier" hnd subst eqStore, Nothing)
+        // — applyEqStoreAt is called UNCONDITIONALLY, including when subst
+        // is empty.  With an empty asubst the disj loop is idempotent on
+        // disj substs whose KEYS are disjoint from self.subst.dom (the
+        // addRuleVariants invariant), BUT applyBound's restrict expansion
+        // to include `varsRange(newsubst)` lifts system-var range
+        // references in disj substs into the disj domain via
+        // EXTRACT-SYSTEM-VARS-TO-DOMAIN (see apply_eq_store body).  RS
+        // previously short-circuited the empty-empty case, skipping this
+        // lift — observable on the LAK06::noninjectiveagreementTAG path.
         if ac_residuals.is_empty() {
-            if local_subst.is_empty() {
-                return Ok(None);
+            if !local_subst.is_empty() {
+                log_fresh_bindings("local", &local_subst);
+                log_s_pub_bindings("local", &local_subst);
+                log_vr_node_bindings("local", &local_subst);
             }
-            log_fresh_bindings("local", &local_subst);
-            log_s_pub_bindings("local", &local_subst);
-            log_vr_node_bindings("local", &local_subst);
             if self.conj.is_empty() {
-                // HS would call applyEqStore with empty conj here.
-                // Tick to match HS's call count when comparing.
                 if std::env::var("TAM_RS_DBG_APPLY_EQ_STORE").is_ok() {
                     let filter = std::env::var("TAM_RS_DBG_APPLY_EQ_STORE_FILTER")
                         .map(|s| s == "substantive").unwrap_or(false);
@@ -474,7 +484,9 @@ impl EquationStore {
                         eprintln!("[rs-aes-tick] conj=0 substantive=false (short-circuit:add_eqs-no-ac)");
                     }
                 }
-                self.subst = local_subst.compose(&self.subst);
+                if !local_subst.is_empty() {
+                    self.subst = local_subst.compose(&self.subst);
+                }
             } else {
                 self.apply_eq_store(maude, &local_subst)?;
             }
@@ -568,19 +580,45 @@ impl EquationStore {
         // before storing as a disjunction (flattenUnif semantics).
         // The local subst becomes part of the free subst; the Maude
         // unifiers represent the disjunction over AC choices.
-        if !local_subst.is_empty() {
-            if self.conj.is_empty() {
-                if std::env::var("TAM_RS_DBG_APPLY_EQ_STORE").is_ok() {
-                    let filter = std::env::var("TAM_RS_DBG_APPLY_EQ_STORE_FILTER")
-                        .map(|s| s == "substantive").unwrap_or(false);
-                    if !filter {
-                        eprintln!("[rs-aes-tick] conj=0 substantive=false (short-circuit:add_eqs-multi-maude)");
-                    }
+        //
+        // HS-faithful (EquationStore.hs:307):
+        //     let (eqStore', sid) = addDisj (applyEqStoreAt "addEqs.multi-unifier"
+        //                                                   hnd subst eqStore)
+        //                                   (S.fromList substs)
+        // — applyEqStoreAt is called UNCONDITIONALLY (including when subst
+        // is empty), so existing disjs are re-narrowed via applyBound
+        // against the new free subst.  RS previously gated on
+        // `!local_subst.is_empty()`, which silently SKIPPED re-narrowing
+        // of pre-existing variant disjunctions when a multi-unifier
+        // add_eqs call produced no new free-subst bindings.  In LAK06's
+        // noninjectiveagreementTAG, accepttag's 10-subst disj sat at
+        // SplitId(0) when tag1's solveRuleConstraints → addRuleVariants
+        // + simp cascade fired; HS's applyEqStoreAt(empty) re-ran
+        // applyBound on accepttag's substs after subsequent unification
+        // bindings landed in eqsSubst (via simp_singleton / abstraction
+        // factor → applyEqStore chain), narrowing the disj to empty.
+        // RS kept the 10-subst disj alive → divergent split picks at
+        // first perform_split (1588-line diff).  See [[locked diagnosis
+        // 2026-06-07 apply_eq_store gating]].
+        if self.conj.is_empty() {
+            if std::env::var("TAM_RS_DBG_APPLY_EQ_STORE").is_ok() {
+                let filter = std::env::var("TAM_RS_DBG_APPLY_EQ_STORE_FILTER")
+                    .map(|s| s == "substantive").unwrap_or(false);
+                if !filter {
+                    eprintln!("[rs-aes-tick] conj=0 substantive=false (short-circuit:add_eqs-multi-maude)");
                 }
-                self.subst = local_subst.compose(&self.subst);
-            } else {
-                self.apply_eq_store(maude, &local_subst)?;
             }
+            if !local_subst.is_empty() {
+                self.subst = local_subst.compose(&self.subst);
+            }
+        } else {
+            // Unconditional apply_eq_store call (matches HS's
+            // unconditional applyEqStoreAt).  When local_subst is empty,
+            // newsubst = self.subst (unchanged) and each existing disj
+            // subst gets a fresh applyBound pass — idempotent IFF disj
+            // keys are disjoint from self.subst.dom (the addRuleVariants
+            // invariant), but observably equivalent to HS in any case.
+            self.apply_eq_store(maude, &local_subst)?;
         }
         let mut substs: Vec<LNSubstVFresh> = Vec::with_capacity(unifiers.len());
         for raw in unifiers {
