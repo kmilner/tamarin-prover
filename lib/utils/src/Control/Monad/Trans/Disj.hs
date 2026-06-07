@@ -21,7 +21,6 @@ import Control.Monad
 import Control.Monad.Disj.Class
 import Control.Monad.Reader
 import Control.Monad.Logic (LogicT, observeAllT)
-import ListT
 import qualified Debug.Trace               as Tr
 import qualified System.Environment        as SysEnv
 import           System.IO.Unsafe          (unsafePerformIO)
