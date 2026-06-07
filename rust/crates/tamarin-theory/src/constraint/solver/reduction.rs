@@ -668,7 +668,22 @@ impl<'ctx> Reduction<'ctx> {
         // 5. Goals: rewrite the Goal's free vars. Goals are deduped
         //    structurally; collapsed goals merge by keeping the first
         //    occurrence.
-        let goals = std::mem::take(&mut self.sys.goals);
+        let mut goals = std::mem::take(&mut self.sys.goals);
+        // HS-faithful (Reduction.hs:769-783): `substGoals` iterates
+        // `M.toList sGoals` which is Goal-Ord order (NodeId-first for
+        // ActionG / PremiseG / ChainG).  The order matters because
+        // `insertAction` for re-inserted KU msg-var goals assigns a
+        // NEW gsNr from `sNextGoalNr` (which monotonically increases),
+        // so the iteration order determines which goal gets the lower
+        // post-subst nr.  RS previously iterated insertion order
+        // (Vec push order) → diverged from HS.
+        //
+        // Closes CH07::executable and CRxor::executable XOR diffs
+        // (8 lines each) where HS picked `KU(~nb)` first (lower
+        // post-subst nr because its NodeId was smaller) while RS
+        // picked `KU(~na)` first.
+        goals.sort_by(|(g1, _), (g2, _)|
+            crate::constraint::solver::goals::goal_cmp(g1, g2));
         // Mirror node-fact handling above (lines 414-428): apply the
         // eq-store substitution, then Maude-normalize the result.
         // Without the normalize step a goal's term can stay non-normal
