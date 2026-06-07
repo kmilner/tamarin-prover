@@ -1215,16 +1215,21 @@ fn goal_usefulness(g: &Goal, looping: bool, sys: &System) -> Usefulness {
     Usefulness::Useful
 }
 
-/// Port of Haskell `hasKUGuards` (`Goals.hs:118-122`):
+/// Port of Haskell `hasKUGuards` (`Goals.hs:128-129`):
 ///
 /// ```haskell
-/// hasKUGuards = any (any ((KUFact ==) . factTag) . guardFactTags) (S.toList $ get sFormulas sys)
+/// hasKUGuards =
+///     any ((KUFact `elem`) . guardFactTags) $ S.toList $ get sFormulas sys
 /// ```
 ///
 /// True iff any guarded formula in `sys.formulas` has a `KU`-tagged
-/// fact atom in its guard list.  Conservative: walks every formula
-/// recursively, surfacing fact tags from inside `GGuarded`/`GAtom`/
-/// `Conj`/`Disj` structures.
+/// fact atom in its guard list.  HS only checks `sFormulas`, NOT
+/// `sLemmas` — reuse lemmas with `KU(...)` guards (e.g.
+/// `neither_k_nor_k2_are_ever_leaked_inv` in YubiSecure) must not
+/// trigger this short-circuit, otherwise every KU action goal is
+/// promoted to `Useful` and `currentlyDeducible` / `probablyConstructible`
+/// demotion never fires.  Walks recursively, surfacing KU action atoms
+/// from inside `GGuarded`/`GAtom`/`Conj`/`Disj` structures.
 fn has_ku_guards(sys: &System) -> bool {
     use crate::fact::FactTag;
     use crate::guarded::{Guarded, GAtom};
@@ -1245,7 +1250,6 @@ fn has_ku_guards(sys: &System) -> bool {
     }
     let _ = FactTag::Ku;
     sys.formulas.iter().any(walk_guards)
-        || sys.lemmas.iter().any(walk_guards)
 }
 
 /// `currentlyDeducible i m` — direct port of Haskell's
