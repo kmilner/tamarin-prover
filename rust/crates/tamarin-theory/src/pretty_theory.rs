@@ -1741,7 +1741,12 @@ fn pp_proof(
             out.push_str(&step);
             for (i, (name, child)) in multi.iter().enumerate() {
                 if i > 0 {
-                    out.push_str("\nnext");
+                    // HS Proof.hs:1089: `intersperse (prettyCase ps kwNext)`
+                    // — `next` is a sibling of `solve`/`qed`, so it sits at
+                    // the parent's indent (`depth*2`), not column 0.
+                    out.push('\n');
+                    out.push_str(&"  ".repeat(depth));
+                    out.push_str("next");
                 }
                 out.push('\n');
                 let pad = "  ".repeat(depth + 1);
