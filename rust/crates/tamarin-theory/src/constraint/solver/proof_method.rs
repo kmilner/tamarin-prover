@@ -300,45 +300,38 @@ pub fn exec_proof_method(
             // so the outer fixpoint loop below doesn't duplicate the
             // line.
             crate::constraint::solver::trace::trace_exec("simplifySystem");
-            let mut r = Reduction::new(ctx, sys.clone());
-            r.changed = ChangeIndicator::Unchanged;
-            // HS-faithful: `processLabeled` (ProofMethod.hs:443) runs
-            // `runReduction (m <* simplifySystem) ctxt sys (avoid sys)`
-            // — `simplifySystem` runs EXACTLY ONCE.  Its internal
-            // `go`-loop (Simplify.hs:89-208 / `while_changing`) is the
-            // ONLY fixpoint mechanism; there is no outer repeat in HS.
+            // HS-faithful simplify-time fan-out.  When
+            // `solveUniqueActions` calls `solveGoal (ActionG i fa)`,
+            // the `Reduction = StateT System (FreshT (DisjT ...))`
+            // monad lets `disjunctionOfList` (over source-cases /
+            // variants / Maude unifiers) fan out the entire enclosing
+            // `simplifySystem` into N branches — one per fan-out case.
+            // Each branch continues independently through the rest of
+            // the simplify loop and post-loop, and surfaces here as a
+            // sibling `Simplify` case.  HS's `process` then renders
+            // them as `case 1`/`case 2`/... via `distinguish n`.
             //
-            // A previous outer 32-iteration fixpoint loop here was NOT
-            // Haskell-faithful: it re-ran the whole pipeline (including
-            // the post-loop `addNonInjectiveFactInstances` /
-            // `exploitUniqueMsgOrder`), feeding each iteration's newly
-            // inserted injective-fact / N6 ordering atoms back as the
-            // next iteration's input.  `nonInjectiveFactInstances`
-            // would then derive *transitive* orderings (e.g. from an
-            // added `j < vr.0`, derive `j < vr.1`, `j < vr.2`) that HS
-            // never produces because HS computes all pairs ONCE against
-            // the fixed input system.  On count_unique those spurious
-            // orderings closed a `j → vr.k → j` cycle, so RS detected a
-            // `Cyclic` contradiction (via `isFinished`/`contradictions`)
-            // at the `*_case_2` children one proof-step EARLIER than HS,
-            // dropping the `simplify` node HS emits there (5 nodes).
-            simplify_system(&mut r);
-            // HS-faithful `cleanup` (ProofMethod.hs:453-454): EVERY proof
-            // method's cases pass through `map (fmap cleanup . fst)`
-            // (ProofMethod.hs:442), and `Simplify` goes through `process`
-            // (ProofMethod.hs:405-406) — so its output is ALSO cleaned.
-            // `cleanup s = L.set sSubst emptySubst (Precise.evalFresh
-            //   (renamePrecise s) Precise.nothingUsed)` resets ALL var
-            // indices per-name from 0 and clears the free subst.  The
-            // documented invariant (ProofMethod.hs:396-397): "the returned
-            // systems have their free substitution fully applied and all
-            // variable indices reset."  Without this on the Simplify path,
-            // RS's per-step counter reset (proof_method.rs:265 ≈ HS
-            // `runReduction … (avoid sys)`) seeds from an inflated
-            // `bounds_max` (e.g. Responder_secrecy: nodes i.3/j.4/vf.9 +
-            // terms msg.7/z.7 where HS canonicalises everything to idx 0),
-            // so the downstream Setup_Key `~k` nonce is minted at ~k.14
-            // instead of HS's ~k.3 — rotating the 3-way split.
+            // Without fan-out, RS collapses 7 HS siblings to 1 on
+            // Yubikey's `no_replay` (and 50 → 1 on
+            // `slightly_weaker_invariant`), because `solve_action_goal`'s
+            // Cases outcome was discarded.
+            //
+            // Kill switch: `TAM_RS_DISABLE_SIMPLIFY_FANOUT=1` reverts
+            // to the in-place behaviour.
+            let case_systems: Vec<System> =
+                if std::env::var("TAM_RS_DISABLE_SIMPLIFY_FANOUT").is_ok() {
+                    let mut r = Reduction::new(ctx, sys.clone());
+                    r.changed = ChangeIndicator::Unchanged;
+                    simplify_system(&mut r);
+                    vec![r.sys]
+                } else {
+                    crate::constraint::solver::simplify::simplify_system_with_fanout(ctx, sys.clone())
+                };
+            // HS-faithful `cleanup` (ProofMethod.hs:453-454): EVERY
+            // proof method's cases pass through `map (fmap cleanup .
+            // fst)` (ProofMethod.hs:442), and `Simplify` goes through
+            // `process` (ProofMethod.hs:405-406) — so its output is
+            // ALSO cleaned.
             let cleanup = |s: &System| -> System {
                 let mut s2 = s.clone();
                 if std::env::var("TAM_DISABLE_RENAME_PRECISE").is_err() {
@@ -349,14 +342,40 @@ pub fn exec_proof_method(
                     tamarin_term::subst::Subst::from_list(Vec::new());
                 s2
             };
-            r.sys = cleanup(&r.sys);
-            // Match Haskell's guard (ProofMethod.hs:410): if `Simplify`
-            // produced a system equal to `cleanup sys`, it failed — return
-            // None so search picks something else (or marks Sorry).  HS
-            // compares the CLEANED simplified system against the CLEANED
-            // original, NOT the raw input.
-            if r.sys == cleanup(sys) { return None; }
-            Some(vec![("".to_string(), r.sys)])
+            // HS-faithful filter: cases whose eq_store is false were
+            // mzero'd by `contradictoryIf` during simplify; they don't
+            // show up in HS's surviving Disj.  (Other contradiction
+            // reasons surface as explicit Finished(Contradictory) leaves.)
+            let cleaned: Vec<System> = case_systems.into_iter()
+                .filter(|s| !s.eq_store.is_false())
+                .map(|s| cleanup(&s))
+                .collect();
+            if cleaned.is_empty() { return None; }
+            let cleaned_input = cleanup(sys);
+            if cleaned.len() == 1 {
+                // Single-case path: HS's `Simplify` arm (ProofMethod.hs:419-424)
+                // checks whether the simplified system equals the cleaned
+                // input — if so, the method "failed" and we return None.
+                // Multi-case fan-out trivially can't satisfy that condition.
+                if cleaned[0] == cleaned_input { return None; }
+                return Some(vec![("".to_string(), cleaned.into_iter().next().unwrap())]);
+            }
+            // HS-faithful naming: `distinguish n` (ProofMethod.hs:527-532)
+            // with empty case name renders as `show i` ("1", "2", "3", ...)
+            // with NO `_case_` prefix and NO zero-padding (the `pad`
+            // call only runs in the else branch when the prefix is
+            // non-empty).
+            //
+            // Inner duplicate detection: HS's `M.fromListWith (error
+            // "case names not unique")` plus `uniqueListBy` dedups
+            // exact-name duplicates structurally; for our empty-name
+            // case all siblings get unique numeric names so no real
+            // dedup is needed.
+            let out: Vec<(String, System)> = cleaned.into_iter()
+                .enumerate()
+                .map(|(i, s)| ((i + 1).to_string(), s))
+                .collect();
+            Some(out)
         }
         ProofMethod::SolveGoal(g) => {
             let dbg_solve = std::env::var("TAM_DBG_SOLVE").is_ok();
@@ -409,82 +428,55 @@ pub fn exec_proof_method(
             // case fires a contradiction, the SolveGoal node has 0
             // children (rendered as a leaf "by solve(...)" in Haskell
             // / "by contradiction /* closed */" in our normalised diff).
-            let simplify = |sys: System| -> System {
+            //
+            // Returns `Vec<System>` to surface simplify-time fan-out: when
+            // `simplifySystem` internally fans out (via
+            // `solveUniqueActions → solveAction → solveFactEqs SplitNow`
+            // or any `insertFormula → insertAtom EqE → solveTermEqs
+            // SplitNow` whose Maude AC unification returns multiple
+            // arms), the DisjT-monad in HS's `runReduction` replicates
+            // the case once per arm.  Our `simplify_system_with_fanout`
+            // mirrors that, returning N systems.  Each is then cleaned
+            // (renamePrecise + clear subst) per HS's `cleanup`.
+            //
+            // Kill switch: `TAM_RS_DISABLE_SIMPLIFY_FANOUT=1` falls back
+            // to the in-place behaviour (returns a single-element vec).
+            let simplify = |sys: System| -> Vec<System> {
                 if dbg_solve {
                     eprintln!("[solve] simplify start (nodes={} goals={})",
                         sys.nodes.len(), sys.goals.len());
                 }
                 let t0 = std::time::Instant::now();
-                let mut r = Reduction::new(ctx, sys);
-                // HS-faithful: `processLabeled` (ProofMethod.hs:443) runs
-                // `runReduction (m <* simplifySystem) ctxt sys (avoid sys)`
-                // — `simplifySystem` runs EXACTLY ONCE per case.  Its
-                // internal `go`-loop is the only fixpoint mechanism.
-                //
-                // A previous outer 8-iteration loop here re-ran the whole
-                // pipeline (including post-loop `addNonInjectiveFactInstances`
-                // / `exploitUniqueMsgOrder`), feeding each iteration's newly
-                // inserted injective-fact ordering atoms back as the next
-                // iteration's input.  `nonInjectiveFactInstances` then
-                // derives *transitive* orderings (e.g. from a fed-back
-                // `j < vr.k`, derive `j < vr.m`) that HS NEVER produces
-                // (HS computes all pairs once against a fixed input).  On
-                // count_unique those spurious orderings closed a
-                // `j → vr.m → j` cycle, so RS hit a `Cyclic` contradiction
-                // at the `*_case_2` children one proof-step EARLIER than
-                // HS — dropping the 5 `simplify` nodes HS emits there.
-                simplify_system(&mut r);
+                let raw_systems: Vec<System> =
+                    if std::env::var("TAM_RS_DISABLE_SIMPLIFY_FANOUT").is_ok() {
+                        let mut r = Reduction::new(ctx, sys);
+                        simplify_system(&mut r);
+                        vec![r.sys]
+                    } else {
+                        crate::constraint::solver::simplify::simplify_system_with_fanout(ctx, sys)
+                    };
                 if dbg_solve {
-                    eprintln!("[solve] simplify done {:?} (nodes={} goals={})",
-                        t0.elapsed(), r.sys.nodes.len(), r.sys.goals.len());
+                    eprintln!("[solve] simplify done {:?} (n_systems={})",
+                        t0.elapsed(), raw_systems.len());
                 }
-                // Haskell-faithful `cleanup` (`ProofMethod.hs:443-444`):
-                //   cleanup s = L.set sSubst emptySubst (renamePrecise s)
-                //
-                // After `simplifySystem` runs, the eq-store's substitution
-                // has been propagated through every part of the system by
-                // `substSystem`. Holding on to those bindings post-simplify
-                // means future eq-store additions (e.g. from a downstream
-                // applySource graft) re-chain stale precompute-time
-                // bindings into the live state — that's the orphan-witness
-                // class of bugs we hit on TLS_Handshake.  Haskell clears
-                // it; we should too.
-                //
-                // Haskell `cleanup` (ProofMethod.hs:443-444):
+                // Cleanup each surviving system per HS
+                // `cleanup` (ProofMethod.hs:443-444):
                 //   cleanup s = L.set sSubst emptySubst
-                //                       (Precise.evalFresh (renamePrecise s)
-                //                                          Precise.nothingUsed)
-                //
-                // `renamePrecise` walks every free LVar in deterministic
-                // order and rebinds each unique var to a freshly-numbered
-                // LVar keyed by name. Two systems differing only by
-                // variable numbering then compare equal — which is what
-                // `M.fromListWith` needs in `process` (ProofMethod.hs:440)
-                // to dedup variant-divergent cases.
-                //
-                // Variant-heavy rules (e.g. TWO's `Equality(revealVerify
-                // (...))` action) generate multiple unifiers that
-                // produce structurally-equivalent systems differing only
-                // by Maude-witness LVar indices.  Without renamePrecise,
-                // we keep them as separate cases (`TWO_case_1`,
-                // `TWO_case_2`, …) where Haskell shows a single `TWO`.
-                // `TAM_DISABLE_RENAME_PRECISE=1` opts out (diagnostic only).
-                if std::env::var("TAM_DISABLE_RENAME_PRECISE").is_err() {
-                    crate::constraint::solver::rename_precise::rename_precise_system(
-                        &mut r.sys);
+                //                       (renamePrecise s)
+                let mut out: Vec<System> = Vec::with_capacity(raw_systems.len());
+                for mut s in raw_systems {
+                    if std::env::var("TAM_DISABLE_RENAME_PRECISE").is_err() {
+                        crate::constraint::solver::rename_precise::rename_precise_system(
+                            &mut s);
+                    }
+                    if !s.eq_store.is_false() {
+                        s.invalidate_max_var_idx_cache();
+                        s.eq_store.subst =
+                            tamarin_term::subst::Subst::from_list(Vec::new());
+                    }
+                    out.push(s);
                 }
-                if !r.sys.eq_store.is_false() {
-                    r.sys.invalidate_max_var_idx_cache();
-                    r.sys.eq_store.subst =
-                        tamarin_term::subst::Subst::from_list(Vec::new());
-                }
-                // HS-faithful: `cleanup` (ProofMethod.hs:443-444) runs
-                // `renamePrecise` ONCE on the post-`simplifySystem`
-                // system and clears the subst — it does NOT re-run
-                // `simplifySystem` afterward.  A previous outer 8-iter
-                // re-simplify loop here was the same non-faithful
-                // injective-ordering feedback as above; removed.
-                r.sys
+                out
             };
             // Filter cases the same way Haskell's `runReduction` does:
             // when a CR-rule called `contradictoryIf` during simplify
@@ -527,15 +519,19 @@ pub fn exec_proof_method(
             };
             match outcome {
                 GoalCases::Linear => {
-                    let s = simplify(r.sys);
+                    let systems = simplify(r.sys);
                     let mut out = Vec::new();
-                    if keep(&s, "") { out.push(("".to_string(), s)); }
+                    for s in systems {
+                        if keep(&s, "") { out.push(("".to_string(), s)); }
+                    }
                     Some(out)
                 }
                 GoalCases::LinearNamed(name) => {
-                    let s = simplify(r.sys);
+                    let systems = simplify(r.sys);
                     let mut out = Vec::new();
-                    if keep(&s, &name) { out.push((name, s)); }
+                    for s in systems {
+                        if keep(&s, &name) { out.push((name.clone(), s)); }
+                    }
                     Some(out)
                 }
                 GoalCases::Cases(cases) => {
@@ -559,10 +555,14 @@ pub fn exec_proof_method(
                     // which matches Haskell's `disjunctionOfList`
                     // iteration order (rule order in `joinAllRules`).
                     use std::collections::HashMap;
+                    // simplify can fan out per case — flat-map.
                     let kept_raw: Vec<(String, System)> = cases.into_iter()
-                        .filter_map(|(name, sys)| {
-                            let s = simplify(sys);
-                            if keep(&s, &name) { Some((name, s)) } else { None }
+                        .flat_map(|(name, sys)| {
+                            let systems = simplify(sys);
+                            systems.into_iter()
+                                .filter(|s| keep(s, &name))
+                                .map(|s| (name.clone(), s))
+                                .collect::<Vec<_>>()
                         })
                         .collect();
                     // Dedup cases that share BOTH a name and canonical
