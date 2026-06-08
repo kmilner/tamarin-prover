@@ -684,6 +684,12 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
             // normalization the parser applied (whitespace + `#`
             // stripped).
             if !shape_matches.is_empty() {
+                let dbg = std::env::var("TAM_RS_DBG_MATCH_GOAL_DISJ").is_ok();
+                if dbg {
+                    let path = crate::constraint::solver::trace::case_path_string();
+                    eprintln!("[MATCH_GOAL_DISJ] path={} shape_matches={} skel.alt_texts={:?}",
+                        path, shape_matches.len(), alt_texts);
+                }
                 if !alt_texts.iter().all(|s| s.is_empty()) {
                     let want: Vec<String> = alt_texts.clone();
                     let mut text_matches: Vec<&Goal> = shape_matches.iter().copied()
@@ -692,6 +698,10 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
                                 let runtime_texts: Vec<String> = d.0.iter()
                                     .map(|a| normalize_disj_alt_text_for_match(&pretty_disj_alt(a)))
                                     .collect();
+                                if dbg {
+                                    eprintln!("[MATCH_GOAL_DISJ]   runtime_alts={:?} match={}",
+                                        runtime_texts, runtime_texts == want);
+                                }
                                 runtime_texts == want
                             } else { false }
                         })
