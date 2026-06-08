@@ -140,6 +140,31 @@ pub fn run_proof_search(
 ) -> ProofNode {
     let deadline = proof_deadline();
     set_deadline(deadline);
+    // Optional hard-watchdog: opt-in via TAM_PROVE_DEADLINE_HARD_KILL=1.
+    // Spawns a detached thread that sleeps `deadline + grace_ms` and
+    // then calls `std::process::exit(124)`.  Catches cases where the
+    // co-operative `deadline_reached()` check misses because a single
+    // inner method (e.g. a long Maude variant enumeration in a
+    // bilinear-pairing theory) doesn't return between deadline checks.
+    // OFF by default to avoid surprising consumers (tests, library
+    // users) — only the `dump_proof` example and ProverSession callers
+    // who explicitly set it want this behaviour.  Grace defaults to
+    // 30s but is configurable via `TAM_PROVE_DEADLINE_GRACE_MS`.
+    if std::env::var("TAM_PROVE_DEADLINE_HARD_KILL").is_ok() {
+        let total_ms: u64 = std::env::var("TAM_PROVE_DEADLINE_MS").ok()
+            .and_then(|s| s.parse().ok()).unwrap_or(30_000);
+        let grace_ms: u64 = std::env::var("TAM_PROVE_DEADLINE_GRACE_MS").ok()
+            .and_then(|s| s.parse().ok()).unwrap_or(30_000);
+        let total = std::time::Duration::from_millis(total_ms + grace_ms);
+        std::thread::Builder::new()
+            .name("prove-watchdog".into())
+            .spawn(move || {
+                std::thread::sleep(total);
+                eprintln!("[prove-watchdog] deadline+grace ({} ms) exceeded; aborting", total_ms + grace_ms);
+                std::process::exit(124);
+            })
+            .ok();
+    }
     let id_dfs_disabled = std::env::var("TAM_DISABLE_ID_DFS").is_ok();
     let cap: usize = 2048;
     let mut current_max_depth: usize = if id_dfs_disabled { usize::MAX } else { 4 };
