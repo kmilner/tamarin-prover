@@ -57,7 +57,10 @@ fi
 timeout --kill-after=5 "$hs_timeout_s" "$hs_path" +RTS -N1 -RTS --prove="$lemma" "$f" 2>/dev/null > "$tmp/hs.out" || true
 awk -v lem="^lemma ${lemma}( |\\[|:)" '$0 ~ lem {p=1} p && /^lemma / && !($0 ~ lem) {exit} p' \
     "$tmp/hs.out" | python3 "$canon" > "$tmp/hs.canon"
-env $extra_env "$rs_path" "$f" "$lemma" 2>/dev/null | python3 "$canon" > "$tmp/rs.canon"
+# RS's TAM_PROVE_DEADLINE_MS is internal-only — doesn't trigger when RS is blocked
+# on Maude IPC. Wrap in `timeout` matching the HS deadline. Override via DIFF_RS_TIMEOUT_S.
+rs_timeout_s="${DIFF_RS_TIMEOUT_S:-$hs_timeout_s}"
+timeout --kill-after=5 "$rs_timeout_s" env $extra_env "$rs_path" "$f" "$lemma" 2>/dev/null | python3 "$canon" > "$tmp/rs.canon"
 
 d=$(diff "$tmp/hs.canon" "$tmp/rs.canon" 2>/dev/null | wc -l || true)
 hs_lines=$(wc -l < "$tmp/hs.canon")
