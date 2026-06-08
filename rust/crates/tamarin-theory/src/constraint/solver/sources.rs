@@ -3317,23 +3317,25 @@ fn refine_one_source(
         goal_free_vars(&src.goal, &mut |v| {
             stable_vars.insert(v.clone());
         });
-        // Haskell-faithful `removeRedundantCases` (Sources.hs:240):
-        //   if enableBP msig || enableMSet msig then cases else cases0
-        // Outside BP/MSet theories, redundant-case dedup is a no-op —
-        // sibling cases with the same parent rule (e.g. multiple
-        // `A_1` cases under KU(sign(...)) for foo_eligibility) MUST
-        // be preserved so the renderer's `distinguish` can rename
-        // them `A_1_case_1`/`A_1_case_2`.
+        // Haskell-faithful `removeRedundantCases` (Sources.hs:328-352):
+        //   removeRedundantCases ctxt stableVars getSys cases0 =
+        //       if enableBP msig || enableMSet msig then cases else cases0
+        //   where cases = sortednubBy compareSystemsUpToNewVars
+        //                 (map (decoratedCases addNormSys) cases0)
         //
-        // The dedup-on-by-default behaviour collapsed those siblings
-        // under canonical-form equality, leaving Haskell-rendered
-        // siblings (A_1) missing from the Rust proof skeleton —
-        // root cause of the 8-lemma case_N cluster (foo/okamoto/
-        // NSLPK3/NSLPK3_untagged/TLS).
+        // Gated on BP/MSet per HS short-circuit.  Outside BP/MSet,
+        // sibling cases (e.g. multiple `A_1` cases under KU(sign(...))
+        // for foo_eligibility) MUST be preserved so the renderer's
+        // `distinguish` can rename them `A_1_case_1`/`A_1_case_2`.
+        //
+        // Step 1 (per-branch): contradictions filter + `restrict stableVars`.
+        // Step 2 (per-source): `removeRedundantCases` via
+        //   compute_compare_systems_key, which builds an alpha-canonical
+        //   key matching HS's `renameDropNameHints + dropNameHintsBound +
+        //   compareSystemsUpToNewVars`.
         let msig = ctx.maude.maude_sig();
-        let dedup_enabled = msig.enable_bp || msig.enable_mset;
-        let mut seen: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
+        let mut filtered: Vec<(Vec<String>, crate::constraint::system::System)>
+            = Vec::with_capacity(branches.len());
         for (mut branch_sys, branch_name_list) in branches {
             if aggressive_drop && !contradictions(ctx, &branch_sys).is_empty() {
                 changed = true;
@@ -3347,11 +3349,26 @@ fn refine_one_source(
             branch_sys.invalidate_max_var_idx_cache();
             branch_sys.eq_store.subst =
                 tamarin_term::subst::Subst::from_list(restricted_pairs);
-            if dedup_enabled {
-                let key = canonicalise_system_full(&branch_sys);
-                if !seen.insert(key) { continue; }
-            }
-            new_cases.push((branch_name_list, branch_sys));
+            filtered.push((branch_name_list, branch_sys));
+        }
+        let pre_count = filtered.len();
+        if std::env::var("TAM_RS_DBG_REMOVE_REDUNDANT").is_ok() {
+            eprintln!("[RRC] === refine source goal={:?} input={} cases ===",
+                src.goal, pre_count);
+        }
+        let deduped = remove_redundant_cases(
+            msig.enable_bp,
+            msig.enable_mset,
+            &stable_vars,
+            |c| &c.1,
+            filtered,
+        );
+        let _ = pre_count;
+        // Mirrors HS: `changed` flows from `not (null names)` in
+        // `solveAllSafeGoals` (already accounted for via `branch_took_step`
+        // above).  Dedup doesn't propagate a separate change signal.
+        for c in deduped {
+            new_cases.push(c);
         }
     }
     let count = new_cases.len();
@@ -8146,22 +8163,795 @@ fn graft_case_into_action(
     Some(out)
 }
 
-/// Direct port of Haskell `removeRedundantCases` (Sources.hs:236-260)
-/// for the **non-BP/MSet branch** — Haskell short-circuits:
+// =============================================================================
+// removeRedundantCases — HS Sources.hs:328-352
+// =============================================================================
+//
+// Direct port of:
+//
+//   removeRedundantCases :: ProofContext -> [LVar] -> (a -> System) ->  [a] -> [a]
+//   removeRedundantCases ctxt stableVars getSys cases0 =
+//       if enableBP msig || enableMSet msig then cases else cases0
+//     where
+//       decoratedCases = map (second addNormSys) $  zip [(0::Int)..] cases0
+//       cases = map (fst . snd) . sortOn fst
+//             . sortednubBy (\(_,(_, x)) (_,(_, y)) -> compareSystemsUpToNewVars x y)
+//             $ decoratedCases
+//       addNormSys = id &&&
+//         ((modify sEqStore dropNameHintsBound) . renameDropNameHints . getSys)
+//       orderedVars sys =
+//           filter ((/= LSortNode) . lvarSort) $ map fst . sortOn snd . varOccurences $ sys
+//       renameDropNameHints sys =
+//         (`evalFresh` avoid stableVars) . (`evalBindT` stableVarBindings) $ do
+//             _ <- renameDropNamehint (orderedVars sys)
+//             renameDropNamehint sys
+//         where stableVarBindings = M.fromList (map (\v -> (v, v)) stableVars)
+//
+// Where:
+//   varOccurences sys: walks `_sNodes` ONLY (System's foldFreesOcc
+//     commented out everything except field a). Produces
+//     [(LVar, Set Occurence)] where Occurence = [String].
+//   renameDropNamehint: assigns each LVar a fresh idx with name "".
+//   compareSystemsUpToNewVars: compareNodesUpToNewVars first; if EQ
+//     fall through to structural compare on (b..m, empty nodes).
+//   compareRulesUpToNewVars: ignores `_rNewVars`.
+//   dropNameHintsBound: drops name hints in `eqStore.conj` VFresh substs.
+//
+// Implementation strategy (per HS):
+//   1. Gate on BP/MSet — non-BP/MSet returns cases0 as-is.
+//   2. For each case build a canonical key from the normalised system.
+//      The normalisation walks free vars in HS-determined order
+//      (varOccurences-ordered first, then foldFrees), assigning each a
+//      fresh idx with empty name. Then keys excluding rule.new_vars
+//      capture exactly what `compareSystemsUpToNewVars` compares.
+//   3. Dedup by key, first-occurrence wins (matches the merge-phase
+//      semantics of HS `sortednubBy`, which prefers the earlier-indexed
+//      element on EQ).  Survivors are emitted in original input order
+//      (matches `sortOn fst` in HS).
+
+/// Walk the free LVars of `sys.nodes` in HS `foldFreesOcc` order
+/// (`HS instance HasFrees System`: only field `a` is walked; commented
+/// out for `b..m`).  Produces a list of `(LVar, BTreeSet<Vec<String>>)`
+/// where the inner set is the set of occurrence-context strings each
+/// var appears in.  Mirrors `varOccurences`
+/// (`lib/term/src/Term/LTerm.hs:598`).
 ///
-/// ```haskell
-/// removeRedundantCases ctxt stableVars getSys cases0 =
-///     if enableBP msig || enableMSet msig then cases else cases0
-/// ```
+/// HS context format (per HasFrees-instance tree under `foldFreesOcc`):
+///   - Map (NodeId, RuleACInst):  context = same `p` for both k and v
+///     (`foldFreesOcc f p = M.foldrWithKey combine` calling
+///     `foldFreesOcc f p (k, v)`).
+///   - Tuple `(k, v)`:  k gets "0":p, v gets "1":p.
+///   - Rule i ps cs as _nvs:  the three fact lists run under
+///     `((show i):c)` as a (ps, cs, as) triple — each gets
+///     "0"/"1"/"2":((show i):c).
+///   - [a] (Vec):  each element runs under (show i):c.
+///   - Fact:  `f for_each_free` runs each term arg; we walk arg list
+///     positionally as well.
+///   - Term: a Var leaf returns the LVar with the current context.
 ///
-/// Without bilinear-pairing or multiset signatures, no AC-redundant
-/// cases can arise from `runReduction`, so the function is the identity.
-/// Our refineSource already dedups by canonical-system string and our
-/// `SolveGoal` arm dedups by case-name suffix, which together cover
-/// the BP/MSet branch's intent for the corpus we exercise.  No live
-/// callers today; left as a hook for when BP/MSet protocols enter the
-/// corpus and Haskell-equivalent system-normed dedup becomes needed.
-pub fn remove_redundant_cases<T: Clone>(cases: Vec<T>) -> Vec<T> { cases }
+/// We emit `(v, ctx)` pairs and bucket by var. The outer `_sNodes` map
+/// walks its (k,v) entries in BTreeMap key order — i.e. NodeId Ord. RS's
+/// `sys.nodes` is `Vec<(NodeId, RuleACInst)>`; we sort by NodeId before
+/// walking to match HS.
+fn var_occurrences_nodes(
+    sys: &crate::constraint::system::System,
+) -> Vec<(tamarin_term::lterm::LVar, std::collections::BTreeSet<Vec<String>>)> {
+    use tamarin_term::lterm::LVar;
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
+    // ctx is HS's [String] occurrence path; head is innermost.
+    // We push for each tree-descend, then mutate-and-pop is impractical;
+    // we just clone (HS uses persistent list = sharing tail).
+    fn visit_term(
+        t: &tamarin_term::lterm::LNTerm,
+        ctx: &[String],
+        out: &mut BTreeMap<LVar, BTreeSet<Vec<String>>>,
+    ) {
+        match t {
+            Term::Lit(Lit::Var(v)) => {
+                out.entry(v.clone()).or_default().insert(ctx.to_vec());
+            }
+            Term::Lit(Lit::Con(_)) => {}
+            Term::App(_, args) => {
+                for (i, a) in args.iter().enumerate() {
+                    let mut sub = vec![i.to_string()];
+                    sub.extend(ctx.iter().cloned());
+                    visit_term(a, &sub, out);
+                }
+            }
+        }
+    }
+    fn visit_fact(
+        f: &crate::fact::LNFact,
+        ctx: &[String],
+        out: &mut BTreeMap<LVar, BTreeSet<Vec<String>>>,
+    ) {
+        for (i, t) in f.terms.iter().enumerate() {
+            let mut sub = vec![i.to_string()];
+            sub.extend(ctx.iter().cloned());
+            visit_term(t, &sub, out);
+        }
+    }
+    fn visit_facts(
+        fs: &[crate::fact::LNFact],
+        ctx: &[String],
+        out: &mut BTreeMap<LVar, BTreeSet<Vec<String>>>,
+    ) {
+        for (i, f) in fs.iter().enumerate() {
+            let mut sub = vec![i.to_string()];
+            sub.extend(ctx.iter().cloned());
+            visit_fact(f, &sub, out);
+        }
+    }
+    // foldFreesOcc Rule:
+    //   foldFreesOcc f c (Rule i ps cs as _) =
+    //     foldFreesOcc f ((show i):c) (ps, cs, as)
+    // tuple (ps, cs, as) walks: ps → "0":c, cs → "1":c, as → "2":c.
+    fn visit_rule(
+        r: &crate::rule::RuleACInst,
+        ctx: &[String],
+        out: &mut BTreeMap<LVar, BTreeSet<Vec<String>>>,
+    ) {
+        let mut rule_ctx = vec![format!("{:?}", r.info)];
+        rule_ctx.extend(ctx.iter().cloned());
+        // ps
+        let mut ps_ctx = vec!["0".to_string()];
+        ps_ctx.extend(rule_ctx.iter().cloned());
+        visit_facts(&r.premises, &ps_ctx, out);
+        // cs
+        let mut cs_ctx = vec!["1".to_string()];
+        cs_ctx.extend(rule_ctx.iter().cloned());
+        visit_facts(&r.conclusions, &cs_ctx, out);
+        // as
+        let mut as_ctx = vec!["2".to_string()];
+        as_ctx.extend(rule_ctx.iter().cloned());
+        visit_facts(&r.actions, &as_ctx, out);
+    }
+    // M.Map's foldFreesOcc passes the same `p` to each (k, v) tuple, then
+    // the tuple instance splits "0":p and "1":p.  We walk in BTreeMap-key
+    // order (Ord LVar on NodeId) — HS's M.foldrWithKey iterates ASC.
+    let mut nodes_sorted: Vec<&(tamarin_term::lterm::LVar, crate::rule::RuleACInst)> =
+        sys.nodes.iter().collect();
+    nodes_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let base_ctx: Vec<String> = Vec::new();
+    let mut out: BTreeMap<LVar, BTreeSet<Vec<String>>> = BTreeMap::new();
+    for (nid, rule) in &nodes_sorted {
+        // For (k, v) tuple: "0":p for k (NodeId is just an LVar), "1":p for v.
+        let mut k_ctx = vec!["0".to_string()];
+        k_ctx.extend(base_ctx.iter().cloned());
+        out.entry((*nid).clone()).or_default().insert(k_ctx);
+        let mut v_ctx = vec!["1".to_string()];
+        v_ctx.extend(base_ctx.iter().cloned());
+        visit_rule(rule, &v_ctx, &mut out);
+    }
+    out.into_iter().collect()
+}
+
+/// Walk a Goal collecting free LVars in DFS order.
+fn goal_walk_frees(g: &crate::constraint::constraints::Goal, push: &mut dyn FnMut(&tamarin_term::lterm::LVar)) {
+    use crate::constraint::constraints::Goal;
+    use tamarin_term::lterm::HasFrees;
+    match g {
+        Goal::Action(i, fa) => { push(i); fa.for_each_free(push); }
+        Goal::Premise(p, fa) => { push(&p.0); fa.for_each_free(push); }
+        Goal::Chain(c, p) => { push(&c.0); push(&p.0); }
+        Goal::Subterm((a, b)) => { a.for_each_free(push); b.for_each_free(push); }
+        // Disj/Split: bound vars excluded for renaming purposes; for our
+        // canonical-key purpose, we walk free vars in Disj alternatives.
+        Goal::Disj(d) => {
+            for alt in &d.0 {
+                guarded_walk_frees(alt, push);
+            }
+        }
+        Goal::Split(_) => {}
+    }
+}
+
+/// Walk a Guarded collecting free LVars in DFS order.  Free LVars
+/// correspond to BVar::Free leaves; we reconstruct an LVar by combining
+/// VarSpec name/idx with a best-effort sort.  HS's `Guarded` lives over
+/// LVar directly, so its free vars carry full LSort.  RS's `Guarded`
+/// uses VarSpec which has a SortHint; we map it back to LSort.
+fn guarded_walk_frees(g: &crate::guarded::Guarded, push: &mut dyn FnMut(&tamarin_term::lterm::LVar)) {
+    let mut frees: Vec<tamarin_parser::ast::VarSpec> = Vec::new();
+    fn collect(g: &crate::guarded::Guarded, out: &mut Vec<tamarin_parser::ast::VarSpec>) {
+        use crate::guarded::Guarded;
+        match g {
+            Guarded::Atom(a) => crate::guarded_types::collect_free_atom(a, out),
+            Guarded::Disj(items) | Guarded::Conj(items) =>
+                for it in items { collect(it, out); },
+            Guarded::GGuarded { guards, body, .. } => {
+                for a in guards { crate::guarded_types::collect_free_atom(a, out); }
+                collect(body, out);
+            }
+        }
+    }
+    collect(g, &mut frees);
+    for vs in &frees {
+        let sort = varspec_sort_to_lsort(&vs.sort);
+        push(&tamarin_term::lterm::LVar { name: vs.name.clone(), sort, idx: vs.idx });
+    }
+}
+
+fn varspec_sort_to_lsort(s: &tamarin_parser::ast::SortHint) -> tamarin_term::lterm::LSort {
+    use tamarin_parser::ast::{SortHint, SuffixSort};
+    use tamarin_term::lterm::LSort;
+    match s {
+        SortHint::Msg => LSort::Msg,
+        SortHint::Pub => LSort::Pub,
+        SortHint::Fresh => LSort::Fresh,
+        SortHint::Node => LSort::Node,
+        SortHint::Nat => LSort::Nat,
+        SortHint::Suffix(SuffixSort::Msg) => LSort::Msg,
+        SortHint::Suffix(SuffixSort::Pub) => LSort::Pub,
+        SortHint::Suffix(SuffixSort::Fresh) => LSort::Fresh,
+        SortHint::Suffix(SuffixSort::Node) => LSort::Node,
+        SortHint::Suffix(SuffixSort::Nat) => LSort::Nat,
+        SortHint::Untagged => LSort::Msg,
+    }
+}
+
+/// HS `foldFrees`-order walk of every free LVar in a System.  The HS
+/// `instance HasFrees System` walks a..m in order (System.hs:1834-1848);
+/// we replicate field-by-field.  Each callback fires for every
+/// occurrence (including duplicates), so the binding-map registration
+/// is deterministic over DFS order.
+fn system_walk_frees(
+    sys: &crate::constraint::system::System,
+    push: &mut dyn FnMut(&tamarin_term::lterm::LVar),
+) {
+    use tamarin_term::lterm::HasFrees;
+    // a: sNodes (Map NodeId RuleACInst) — BTreeMap-key order.
+    let mut nodes_sorted: Vec<&(tamarin_term::lterm::LVar, crate::rule::RuleACInst)> =
+        sys.nodes.iter().collect();
+    nodes_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    for (nid, rule) in &nodes_sorted {
+        push(nid);
+        rule.for_each_free(push);
+    }
+    // b: sEdges (Set Edge) — set Ord order.
+    let mut edges_sorted: Vec<&crate::constraint::constraints::Edge> = sys.edges.iter().collect();
+    edges_sorted.sort();
+    for e in &edges_sorted {
+        push(&e.src.0);
+        push(&e.tgt.0);
+    }
+    // c: sLessAtoms (Set LessAtom) — set Ord order.
+    let mut less_sorted: Vec<&crate::constraint::constraints::LessAtom> =
+        sys.less_atoms.iter().collect();
+    less_sorted.sort();
+    for la in &less_sorted {
+        push(&la.smaller);
+        push(&la.larger);
+    }
+    // d: sLastAtom (Maybe NodeId).
+    if let Some(la) = &sys.last_atom { push(la); }
+    // e: sSubtermStore.
+    for st in &sys.subterm_store.subterms {
+        st.small.for_each_free(push);
+        st.big.for_each_free(push);
+    }
+    for st in &sys.subterm_store.solved_subterms {
+        st.small.for_each_free(push);
+        st.big.for_each_free(push);
+    }
+    // f: sEqStore (subst + conj + nextSplitId).
+    for (v, t) in sys.eq_store.subst.to_list() {
+        push(&v);
+        t.for_each_free(push);
+    }
+    for disj in &sys.eq_store.conj {
+        for sub in &disj.substs {
+            // VFresh: range vars are FRESH (don't enter the binding map);
+            // only the DOMAIN vars participate as free.  This mirrors
+            // HS's HasFrees instance for SubstVFresh which treats range
+            // vars as bound.
+            for (v, _) in sub.to_list() {
+                push(&v);
+            }
+        }
+    }
+    // g: sFormulas (Set LNGuarded).
+    let mut formulas_sorted: Vec<&crate::guarded::Guarded> = sys.formulas.iter().collect();
+    formulas_sorted.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+    for f in &formulas_sorted {
+        guarded_walk_frees(f, push);
+    }
+    // h: sSolvedFormulas.
+    let mut solved_sorted: Vec<&crate::guarded::Guarded> =
+        sys.solved_formulas.iter().collect();
+    solved_sorted.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+    for f in &solved_sorted {
+        guarded_walk_frees(f, push);
+    }
+    // i: sLemmas.
+    let mut lemmas_sorted: Vec<&crate::guarded::Guarded> = sys.lemmas.iter().collect();
+    lemmas_sorted.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+    for f in &lemmas_sorted {
+        guarded_walk_frees(f, push);
+    }
+    // j: sGoals (Map Goal GoalStatus).
+    let mut goals_sorted: Vec<&(crate::constraint::constraints::Goal,
+                                crate::constraint::system::GoalStatus)>
+        = sys.goals.iter().collect();
+    goals_sorted.sort_by(|a, b| {
+        let ka = format!("{:?}", a.0);
+        let kb = format!("{:?}", b.0);
+        ka.cmp(&kb)
+    });
+    for (g, _st) in &goals_sorted {
+        goal_walk_frees(g, push);
+    }
+    // k, l, m: no LVars.
+}
+
+/// Compute the HS-faithful rename map for `renameDropNameHints sys`
+/// (HS Sources.hs:345-348):
+///   1. Start binding = { v ↦ v | v ∈ stableVars }
+///   2. Fresh state = avoid stableVars (i.e. next idx > max stable idx)
+///   3. Walk orderedVars sys = filter (/= Node) . map fst . sortOn snd
+///      . varOccurences $ sys.  For each var not in binding, assign it a
+///      fresh LVar with name="", same sort, incrementing fresh idx.
+///   4. Walk sys.foldFrees (every field a..m).  Same import-binding
+///      logic: skip if bound, else assign fresh.
+///
+/// Returns the binding map.  Stable vars map to themselves (unchanged).
+fn compute_rename_map(
+    sys: &crate::constraint::system::System,
+    stable_vars: &std::collections::BTreeSet<tamarin_term::lterm::LVar>,
+) -> std::collections::BTreeMap<tamarin_term::lterm::LVar, tamarin_term::lterm::LVar> {
+    use tamarin_term::lterm::{LSort, LVar};
+    use std::collections::BTreeMap;
+    let mut rename: BTreeMap<LVar, LVar> = BTreeMap::new();
+    // Step 1: stable vars bind to themselves.
+    for v in stable_vars { rename.insert(v.clone(), v.clone()); }
+    // Step 2: fresh state = avoid stableVars.
+    let mut fresh_state = tamarin_utils::fresh::FastFreshState::nothing_used();
+    if let Some(max) = stable_vars.iter().map(|v| v.idx).max() {
+        fresh_state.fresh_idents(max + 1);
+    }
+    // Import helper.  HS's `importBinding (`LVar` lvarSort x) x ""`:
+    //   - mkR n i = LVar i (lvarSort x) n   -- argument order is
+    //     `LVar :: String -> LSort -> Integer -> LVar`, so `(`LVar` sort)`
+    //     partially applies sort → result is `\name idx -> LVar name sort idx`.
+    //   - Pre-bound vars stay; new vars get a fresh idx + empty name.
+    let import = |v: &LVar,
+                  rename: &mut BTreeMap<LVar, LVar>,
+                  fresh: &mut tamarin_utils::fresh::FastFreshState| {
+        if rename.contains_key(v) { return; }
+        let new_idx = fresh.fresh_ident();
+        let new_v = LVar { name: String::new(), sort: v.sort, idx: new_idx };
+        rename.insert(v.clone(), new_v);
+    };
+    // Step 3: orderedVars sys — varOccurences from nodes ONLY,
+    // sorted by occurrence set, filtered to non-Node sort.
+    let mut occs = var_occurrences_nodes(sys);
+    occs.sort_by(|a, b| a.1.cmp(&b.1));
+    for (v, _occs) in &occs {
+        if v.sort == LSort::Node { continue; }
+        import(v, &mut rename, &mut fresh_state);
+    }
+    // Step 4: system_walk_frees walks the entire System in HS foldFrees
+    // order, registering any var not yet bound.
+    system_walk_frees(sys, &mut |v: &LVar| {
+        import(v, &mut rename, &mut fresh_state);
+    });
+    rename
+}
+
+/// Apply rename to an LVar; if missing, return as-is (Node-sort vars
+/// without an occurrence in `_sNodes` may not appear in the map).
+fn rn(
+    rename: &std::collections::BTreeMap<tamarin_term::lterm::LVar, tamarin_term::lterm::LVar>,
+    v: &tamarin_term::lterm::LVar,
+) -> tamarin_term::lterm::LVar {
+    rename.get(v).cloned().unwrap_or_else(|| v.clone())
+}
+
+/// Write a term to the key buffer with renamed vars.
+fn write_term_to_key(
+    t: &tamarin_term::lterm::LNTerm,
+    rename: &std::collections::BTreeMap<tamarin_term::lterm::LVar, tamarin_term::lterm::LVar>,
+    out: &mut String,
+) {
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    use std::fmt::Write as _;
+    match t {
+        Term::Lit(Lit::Var(v)) => {
+            let rv = rn(rename, v);
+            let _ = write!(out, "v{}:{:?}", rv.idx, rv.sort);
+        }
+        Term::Lit(Lit::Con(c)) => { let _ = write!(out, "{:?}", c); }
+        Term::App(sym, args) => {
+            let _ = write!(out, "{:?}(", sym);
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                write_term_to_key(a, rename, out);
+            }
+            out.push(')');
+        }
+    }
+}
+
+fn write_fact_to_key(
+    f: &crate::fact::LNFact,
+    rename: &std::collections::BTreeMap<tamarin_term::lterm::LVar, tamarin_term::lterm::LVar>,
+    out: &mut String,
+) {
+    use std::fmt::Write as _;
+    let _ = write!(out, "{:?}:{:?}[", f.tag, f.annotations);
+    for (i, t) in f.terms.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        write_term_to_key(t, rename, out);
+    }
+    out.push(']');
+}
+
+fn write_rule_to_key_excl_new_vars(
+    r: &crate::rule::RuleACInst,
+    rename: &std::collections::BTreeMap<tamarin_term::lterm::LVar, tamarin_term::lterm::LVar>,
+    out: &mut String,
+) {
+    use std::fmt::Write as _;
+    let _ = write!(out, "info={:?};", r.info);
+    out.push_str("ps:[");
+    for (i, p) in r.premises.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        write_fact_to_key(p, rename, out);
+    }
+    out.push_str("];cs:[");
+    for (i, c) in r.conclusions.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        write_fact_to_key(c, rename, out);
+    }
+    out.push_str("];as:[");
+    for (i, a) in r.actions.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        write_fact_to_key(a, rename, out);
+    }
+    out.push(']');
+    // Crucial: rule.new_vars EXCLUDED per `compareRulesUpToNewVars`.
+}
+
+fn write_guarded_to_key(
+    g: &crate::guarded::Guarded,
+    rename: &std::collections::BTreeMap<tamarin_term::lterm::LVar, tamarin_term::lterm::LVar>,
+    out: &mut String,
+) {
+    // For Guarded we need a structural rendering with renamed free vars.
+    // Cleanest: collect free VarSpecs, build a VarSubst that maps each
+    // (name, idx) to the renamed VarSpec, apply via subst_guarded.
+    use std::collections::HashMap;
+    let mut frees: Vec<tamarin_parser::ast::VarSpec> = Vec::new();
+    fn collect(g: &crate::guarded::Guarded, out: &mut Vec<tamarin_parser::ast::VarSpec>) {
+        use crate::guarded::Guarded;
+        match g {
+            Guarded::Atom(a) => crate::guarded_types::collect_free_atom(a, out),
+            Guarded::Disj(items) | Guarded::Conj(items) =>
+                for it in items { collect(it, out); },
+            Guarded::GGuarded { guards, body, .. } => {
+                for a in guards { crate::guarded_types::collect_free_atom(a, out); }
+                collect(body, out);
+            }
+        }
+    }
+    collect(g, &mut frees);
+    let mut vs: HashMap<(String, u64), tamarin_parser::ast::Term> = HashMap::new();
+    for fv in &frees {
+        let sort = varspec_sort_to_lsort(&fv.sort);
+        let key = (fv.name.clone(), fv.idx);
+        let lv = tamarin_term::lterm::LVar { name: fv.name.clone(), sort, idx: fv.idx };
+        let rv = rn(rename, &lv);
+        if rv == lv { continue; }
+        // Build replacement VarSpec preserving original sort hint.
+        let new_vs = tamarin_parser::ast::VarSpec {
+            name: rv.name.clone(),
+            idx: rv.idx,
+            sort: fv.sort.clone(),
+            typ: fv.typ.clone(),
+        };
+        vs.insert(key, tamarin_parser::ast::Term::Var(new_vs));
+    }
+    let renamed = if vs.is_empty() { g.clone() } else { crate::guarded::subst_guarded(g, &vs) };
+    out.push_str(&format!("{:?}", renamed));
+}
+
+/// Build the canonical key used to identify a system up to alpha-renaming
+/// of non-stable vars and modulo rule.new_vars.  Two systems with the
+/// same key are considered redundant per HS's `compareSystemsUpToNewVars`
+/// + `renameDropNameHints` + `dropNameHintsBound`.
+fn compute_compare_systems_key(
+    sys: &crate::constraint::system::System,
+    stable_vars: &std::collections::BTreeSet<tamarin_term::lterm::LVar>,
+) -> String {
+    use std::fmt::Write as _;
+    let rename = compute_rename_map(sys, stable_vars);
+    let mut out = String::new();
+    // NODES (with renamed ids, excluding rule.new_vars).
+    out.push_str("NODES:[");
+    let mut nodes_sorted: Vec<&(tamarin_term::lterm::LVar, crate::rule::RuleACInst)> =
+        sys.nodes.iter().collect();
+    nodes_sorted.sort_by(|a, b| rn(&rename, &a.0).cmp(&rn(&rename, &b.0)));
+    for (nid, rule) in &nodes_sorted {
+        let rid = rn(&rename, nid);
+        let _ = write!(out, "{{id={}:{:?};", rid.idx, rid.sort);
+        write_rule_to_key_excl_new_vars(rule, &rename, &mut out);
+        out.push_str("};");
+    }
+    out.push(']');
+    // EDGES.
+    out.push_str(";EDGES:[");
+    let mut edges_renamed: Vec<(tamarin_term::lterm::LVar, crate::rule::ConcIdx,
+                                tamarin_term::lterm::LVar, crate::rule::PremIdx)>
+        = sys.edges.iter()
+            .map(|e| (rn(&rename, &e.src.0), e.src.1, rn(&rename, &e.tgt.0), e.tgt.1))
+            .collect();
+    edges_renamed.sort();
+    for (s, si, t, ti) in &edges_renamed {
+        let _ = write!(out, "{}:{:?}.{:?}->{}:{:?}.{:?};",
+            s.idx, s.sort, si, t.idx, t.sort, ti);
+    }
+    out.push(']');
+    // LESS.
+    out.push_str(";LESS:[");
+    let mut less_renamed: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LVar,
+                               crate::constraint::constraints::Reason)> = sys.less_atoms.iter()
+        .map(|la| (rn(&rename, &la.smaller), rn(&rename, &la.larger), la.reason))
+        .collect();
+    less_renamed.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    for (s, t, _r) in &less_renamed {
+        let _ = write!(out, "{}<{};", s.idx, t.idx);
+    }
+    out.push(']');
+    // LAST.
+    out.push_str(";LAST:");
+    if let Some(j) = &sys.last_atom {
+        let r = rn(&rename, j);
+        let _ = write!(out, "{}", r.idx);
+    }
+    // SUBTERM STORE.
+    out.push_str(";STORE:[");
+    for st in &sys.subterm_store.subterms {
+        write_term_to_key(&st.small, &rename, &mut out);
+        out.push_str("<<");
+        write_term_to_key(&st.big, &rename, &mut out);
+        out.push(';');
+    }
+    out.push_str("]/SOLVED:[");
+    for st in &sys.subterm_store.solved_subterms {
+        write_term_to_key(&st.small, &rename, &mut out);
+        out.push_str("<<");
+        write_term_to_key(&st.big, &rename, &mut out);
+        out.push(';');
+    }
+    out.push(']');
+    // EQSTORE.subst (free subst).
+    out.push_str(";SUBST:[");
+    let mut subst_pairs: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)> =
+        sys.eq_store.subst.to_list();
+    // Re-key by renamed var, then sort.
+    let mut subst_keyed: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)> =
+        subst_pairs.drain(..).map(|(v, t)| (rn(&rename, &v), t)).collect();
+    subst_keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    for (v, t) in &subst_keyed {
+        let _ = write!(out, "{}:{:?}=", v.idx, v.sort);
+        write_term_to_key(t, &rename, &mut out);
+        out.push(',');
+    }
+    out.push(']');
+    // EQSTORE.conj — domain vars renamed; range is VFresh so name-hints
+    // are dropped (we serialise range structurally with empty names).
+    out.push_str(";CONJ:[");
+    for disj in &sys.eq_store.conj {
+        let _ = write!(out, "id={:?};", disj.split_id);
+        let mut sub_strs: Vec<String> = Vec::new();
+        for sub in &disj.substs {
+            let mut s = String::new();
+            let mut entries: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)>
+                = sub.to_list().into_iter()
+                .map(|(v, t)| (rn(&rename, &v), t))
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            for (v, t) in &entries {
+                let _ = write!(s, "{}:{:?}=", v.idx, v.sort);
+                // For VFresh range vars: strip name hints by writing
+                // "v{idx}" using a local counter — equivalent to HS's
+                // `renameDropNamehint` over the range terms.
+                // Build a per-substitution local rename: range vars in
+                // DFS order → empty-name + fresh local idx.
+                let mut local_ren: std::collections::BTreeMap<
+                    tamarin_term::lterm::LVar, tamarin_term::lterm::LVar> = Default::default();
+                let mut local_next: u64 = 0;
+                let local_import = |v: &tamarin_term::lterm::LVar,
+                                    m: &mut std::collections::BTreeMap<
+                                        tamarin_term::lterm::LVar,
+                                        tamarin_term::lterm::LVar>,
+                                    n: &mut u64| {
+                    if !m.contains_key(v) {
+                        m.insert(v.clone(), tamarin_term::lterm::LVar {
+                            name: String::new(), sort: v.sort, idx: *n,
+                        });
+                        *n += 1;
+                    }
+                };
+                use tamarin_term::lterm::HasFrees;
+                t.for_each_free(&mut |v| local_import(v, &mut local_ren, &mut local_next));
+                write_term_to_key_local(t, &local_ren, &mut s);
+                s.push(',');
+            }
+            sub_strs.push(s);
+        }
+        sub_strs.sort();
+        for s in &sub_strs { out.push_str(s); out.push('|'); }
+        out.push(';');
+    }
+    out.push(']');
+    // FORMULAS.
+    out.push_str(";FORMS:[");
+    let mut forms_renamed: Vec<String> = sys.formulas.iter().map(|g| {
+        let mut s = String::new();
+        write_guarded_to_key(g, &rename, &mut s);
+        s
+    }).collect();
+    forms_renamed.sort();
+    for s in &forms_renamed { out.push_str(s); out.push(';'); }
+    out.push(']');
+    // SOLVED FORMULAS.
+    out.push_str(";SOLV_FORMS:[");
+    let mut solved_renamed: Vec<String> = sys.solved_formulas.iter().map(|g| {
+        let mut s = String::new();
+        write_guarded_to_key(g, &rename, &mut s);
+        s
+    }).collect();
+    solved_renamed.sort();
+    for s in &solved_renamed { out.push_str(s); out.push(';'); }
+    out.push(']');
+    // LEMMAS.
+    out.push_str(";LEMMAS:[");
+    let mut lemmas_renamed: Vec<String> = sys.lemmas.iter().map(|g| {
+        let mut s = String::new();
+        write_guarded_to_key(g, &rename, &mut s);
+        s
+    }).collect();
+    lemmas_renamed.sort();
+    for s in &lemmas_renamed { out.push_str(s); out.push(';'); }
+    out.push(']');
+    // GOALS (deterministic order, renamed-var keyed).
+    out.push_str(";GOALS:[");
+    let mut goal_strs: Vec<String> = sys.goals.iter().map(|(g, _st)| {
+        let mut s = String::new();
+        write_goal_to_key(g, &rename, &mut s);
+        s
+    }).collect();
+    goal_strs.sort();
+    for s in &goal_strs { out.push_str(&s); out.push(';'); }
+    out.push(']');
+    // SOURCE KIND / DIFF — affect compareSystemsUpToNewVars only via
+    // structural fallthrough when m != False.
+    let _ = write!(out, ";SK={:?};SIDE={:?}", sys.source_kind, sys.side);
+    out
+}
+
+/// Serialise a Goal with renamed vars.
+fn write_goal_to_key(
+    g: &crate::constraint::constraints::Goal,
+    rename: &std::collections::BTreeMap<tamarin_term::lterm::LVar, tamarin_term::lterm::LVar>,
+    out: &mut String,
+) {
+    use crate::constraint::constraints::Goal;
+    use std::fmt::Write as _;
+    match g {
+        Goal::Action(i, fa) => {
+            let ri = rn(rename, i);
+            let _ = write!(out, "A({}:{:?},", ri.idx, ri.sort);
+            write_fact_to_key(fa, rename, out);
+            out.push(')');
+        }
+        Goal::Premise(p, fa) => {
+            let ri = rn(rename, &p.0);
+            let _ = write!(out, "P({}:{:?}.{:?},", ri.idx, ri.sort, p.1);
+            write_fact_to_key(fa, rename, out);
+            out.push(')');
+        }
+        Goal::Chain(c, p) => {
+            let rc = rn(rename, &c.0);
+            let rp = rn(rename, &p.0);
+            let _ = write!(out, "C({}:{:?}.{:?}->{}:{:?}.{:?})",
+                rc.idx, rc.sort, c.1, rp.idx, rp.sort, p.1);
+        }
+        Goal::Subterm((a, b)) => {
+            out.push_str("S(");
+            write_term_to_key(a, rename, out);
+            out.push_str("<<");
+            write_term_to_key(b, rename, out);
+            out.push(')');
+        }
+        Goal::Split(id) => {
+            let _ = write!(out, "Sp({:?})", id);
+        }
+        Goal::Disj(d) => {
+            out.push_str("D[");
+            let mut alt_strs: Vec<String> = d.0.iter().map(|alt| {
+                let mut s = String::new();
+                write_guarded_to_key(alt, rename, &mut s);
+                s
+            }).collect();
+            alt_strs.sort();
+            for s in &alt_strs { out.push_str(s); out.push('|'); }
+            out.push(']');
+        }
+    }
+}
+
+/// Local variant of `write_term_to_key` that uses a local rename map
+/// for VFresh range vars (no fallback to identity).
+fn write_term_to_key_local(
+    t: &tamarin_term::lterm::LNTerm,
+    rename: &std::collections::BTreeMap<tamarin_term::lterm::LVar, tamarin_term::lterm::LVar>,
+    out: &mut String,
+) {
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    use std::fmt::Write as _;
+    match t {
+        Term::Lit(Lit::Var(v)) => {
+            let rv = rename.get(v).cloned().unwrap_or_else(|| v.clone());
+            let _ = write!(out, "v{}:{:?}", rv.idx, rv.sort);
+        }
+        Term::Lit(Lit::Con(c)) => { let _ = write!(out, "{:?}", c); }
+        Term::App(sym, args) => {
+            let _ = write!(out, "{:?}(", sym);
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                write_term_to_key_local(a, rename, out);
+            }
+            out.push(')');
+        }
+    }
+}
+
+/// Direct port of Haskell `removeRedundantCases` (Sources.hs:328-352).
+/// Gated on BP/MSet per HS short-circuit.  Survivors are returned in
+/// original input order with first-occurrence wins (matches HS's
+/// merge-phase semantics where `cmp == EQ` keeps the left/earlier
+/// element).
+pub fn remove_redundant_cases<T, F>(
+    enable_bp: bool,
+    enable_mset: bool,
+    stable_vars: &std::collections::BTreeSet<tamarin_term::lterm::LVar>,
+    get_sys: F,
+    cases: Vec<T>,
+) -> Vec<T>
+where
+    F: Fn(&T) -> &crate::constraint::system::System,
+{
+    if !(enable_bp || enable_mset) { return cases; }
+    let dbg = std::env::var("TAM_RS_DBG_REMOVE_REDUNDANT").is_ok();
+    let dump = std::env::var("TAM_RS_DBG_RRC_DUMP").is_ok();
+    let pre = cases.len();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut out: Vec<T> = Vec::with_capacity(cases.len());
+    for (idx, c) in cases.into_iter().enumerate() {
+        let key = compute_compare_systems_key(get_sys(&c), stable_vars);
+        if dbg {
+            eprintln!("[RRC] key_len={} stable_vars={} nodes={}",
+                key.len(), stable_vars.len(), get_sys(&c).nodes.len());
+        }
+        if dump && pre > 1 {
+            eprintln!("[RRC_DUMP] idx={} key={}", idx, key);
+        }
+        if seen.insert(key) {
+            out.push(c);
+        }
+    }
+    if dbg && out.len() != pre {
+        eprintln!("[RRC] dedup {} → {}", pre, out.len());
+    }
+    out
+}
 
 /// Saturate-time variant SplitG handler — Haskell-faithful no-op.
 ///

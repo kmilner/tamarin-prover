@@ -642,7 +642,21 @@ pub fn exec_proof_method(
                                 seen_systems.push((name, s));
                             }
                         }
-                        seen_systems
+                        // HS-faithful `removeRedundantCases ctxt [] snd`
+                        // (ProofMethod.hs:455).  Gated on BP/MSet per HS
+                        // short-circuit.  Empty stable_vars (HS passes `[]`).
+                        // No-op outside BP/MSet by `remove_redundant_cases`'s
+                        // own guard.
+                        let msig = ctx.maude.maude_sig();
+                        let empty_stable: std::collections::BTreeSet<tamarin_term::lterm::LVar>
+                            = std::collections::BTreeSet::new();
+                        crate::constraint::solver::sources::remove_redundant_cases(
+                            msig.enable_bp,
+                            msig.enable_mset,
+                            &empty_stable,
+                            |c| &c.1,
+                            seen_systems,
+                        )
                     };
                     let mut counts: HashMap<String, usize> = HashMap::new();
                     for (name, _) in &kept {
