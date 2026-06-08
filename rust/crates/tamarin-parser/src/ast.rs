@@ -303,7 +303,7 @@ pub enum GoalSpec {
     /// where the HS-parsed disjunction would be matched, only ONE open
     /// `Goal::Disj` typically lives in `sys.goals`, so the shape
     /// signature is a sufficient discriminator.
-    Disj { alts: Vec<DisjAlt> },
+    Disj { alts: Vec<DisjAlt>, alt_texts: Vec<String> },
     /// `(#i, n) ~~> (#j, m)` — chain-split goal.  Mirrors HS
     /// `chainGoal = ChainG <$> (try (nodeConc <* opChain)) <*> nodePrem`
     /// (Theory/Text/Parser/Proof.hs:59).  `nodeConc`/`nodePrem` parse
