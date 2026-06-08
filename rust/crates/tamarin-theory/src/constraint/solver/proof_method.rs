@@ -671,29 +671,38 @@ pub fn exec_proof_method(
                 Ok(p) => p,
                 Err(_) => return None,
             };
-            // Mirror Haskell's `setM sFormulas (singleton caseFormula)`
-            // followed by `process`'s `simplifySystem`.  We perform the
-            // `insertFormula` routing eagerly here — Haskell's
-            // `reduceFormulas` (Simplify.hs:317) would decompose the
-            // raw formula on its next fixpoint pass anyway, so the
-            // end state is identical and we save one simp iteration.
-            // The decomposition is essential because `Conj([])` (gtrue)
-            // is solved-marked by insertFormula's GConj arm, landing in
-            // `solved_formulas` so `isInitialSystem` returns false on
-            // the empty-trace child — without it the child looks fresh
-            // and search refuses to mark it Solved.
+            // HS-faithful: mirror Haskell's `induction` (ProofMethod.hs:521-525):
+            //   induction (baseCase, stepCase) = do
+            //     (caseName, caseFormula) <- disjunctionOfList
+            //         [("empty_trace", baseCase), ("non_empty_trace", stepCase)]
+            //     L.setM sFormulas (S.singleton caseFormula)
+            //     return caseName
+            // HS uses `setM` — direct field write into `sFormulas`, NOT
+            // `insertFormula`.  Calling `insertFormula` here would route
+            // through HS's GDisj arm (Reduction.hs:529-543) which adds the
+            // empty DisjG goal to `sGoals`; HS's `reduceFormulas`
+            // (Simplify.hs:426-433) filters by `reducibleFormula`
+            // (Reduction.hs:589-597) which returns False for `GDisj _`, so
+            // an `empty_trace` formula `Disj([])` (gfalse) stays in
+            // `sFormulas` untouched and never produces a DisjG goal —
+            // `FormulasFalse` contradiction picks it up directly.
+            // Before this fix, RS called `insert_formula(base)` which for
+            // `Disj([])` (empty_trace's base case) inserted an empty
+            // DisjG goal at gsNr=0, shifting every subsequent gsNr in
+            // every sibling branch and producing a divergent goal
+            // sequence vs HS at the very first insertGoal call.
             let mut base_sys = sys.clone();
             base_sys.invalidate_max_var_idx_cache();
-            base_sys.formulas.remove(0);
+            base_sys.formulas.clear();
+            base_sys.formulas.push(base);
             let mut br = Reduction::new(ctx, base_sys);
-            br.insert_formula(base);
             simplify_system(&mut br);
 
             let mut step_sys = sys.clone();
             step_sys.invalidate_max_var_idx_cache();
-            step_sys.formulas.remove(0);
+            step_sys.formulas.clear();
+            step_sys.formulas.push(step);
             let mut sr = Reduction::new(ctx, step_sys);
-            sr.insert_formula(step);
             simplify_system(&mut sr);
 
             Some(vec![

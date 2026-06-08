@@ -80,6 +80,8 @@ module Theory.Constraint.Solver.Reduction (
 import           Debug.Trace
 import qualified System.IO.Unsafe                        as Unsafe
 import qualified System.Environment                      as SysEnv
+import qualified Control.Exception                       as CtlExc
+import           Control.Exception                       (evaluate)
 import           Prelude                                 hiding (id, (.))
 
 import qualified Data.Foldable                           as F
@@ -619,11 +621,24 @@ dbgInsertGoalOn = Unsafe.unsafePerformIO $
 insertGoalStatus :: Goal -> GoalStatus -> Reduction ()
 insertGoalStatus goal status = do
     age <- getM sNextGoalNr
-    when dbgInsertGoalOn $
-        trace ("[HS_INS_GOAL] gsNr=" ++ show age ++
-               " solved=" ++ show (get gsSolved status) ++
-               " loops=" ++ show (get gsLoopBreaker status) ++
-               " goal=" ++ show goal) (return ())
+    when dbgInsertGoalOn $ do
+        ctxt <- ask
+        let lemmaName = Unsafe.unsafePerformIO $
+                CtlExc.try (evaluate (get pcLemmaName ctxt)) >>= \r ->
+                    case (r :: Either CtlExc.SomeException String) of
+                        Left _  -> return "<precompute>"
+                        Right n -> return n
+        let want = Unsafe.unsafePerformIO $
+                SysEnv.lookupEnv "TAM_HS_DBG_LEMMA_FILTER"
+        let emit = case want of
+              Nothing -> True
+              Just w  -> w == lemmaName
+        when emit $
+            trace ("[HS_INS_GOAL] lemma=" ++ lemmaName ++
+                   " gsNr=" ++ show age ++
+                   " solved=" ++ show (get gsSolved status) ++
+                   " loops=" ++ show (get gsLoopBreaker status) ++
+                   " goal=" ++ show goal) (return ())
     modM sGoals $ M'.insertWith combineGoalStatus goal (set gsNr age status)
     sNextGoalNr =: succ age
 
