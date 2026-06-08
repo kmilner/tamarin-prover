@@ -4373,7 +4373,8 @@ fn run_solve_all_safe_goals_disj_with_progress(
     use crate::constraint::solver::goals::dispatch_solve_goal;
     use crate::constraint::solver::reduction::{
         GoalCases, Reduction, SolveOutcome, SplitStrategy};
-    use crate::constraint::solver::simplify::simplify_system;
+    use crate::constraint::solver::simplify::{
+        simplify_system, simplify_system_with_fanout};
     use crate::fact::FactTag;
 
     // HS-faithful: track step names as a Vec<String> — HS's
@@ -4436,8 +4437,59 @@ fn run_solve_all_safe_goals_disj_with_progress(
             continue;
         }
 
+        // HS-faithful `simplifySystem` in DisjT (Sources.hs:222):
+        //   simplifySystem
+        //   ctxt <- ask
+        //   isContra <- gets (contradictorySystem ctxt)
+        //   contradictoryIf isContra
+        //
+        // HS's `Reduction = StateT (DisjT ...)` means any Disj-monad
+        // fan-out inside `simplifySystem` (e.g. internal `solveAction`
+        // on KU/KD goals, or `solveTermEqs SplitNow` AC-arms in
+        // `enforce_*_uniqueness`) SPLITS the current state into
+        // sibling branches BEFORE the contradictoryIf check.  Each
+        // sibling proceeds independently through the rest of
+        // `solveAllSafeGoals.solve`.
+        //
+        // Previously RS called `simplify_system(&mut red)` (in-place)
+        // here, dropping any Disj fan-out on the floor.  That collapsed
+        // N HS-siblings into 1 RS branch — exact same pattern as the
+        // 2026-06-07 `simplify_system_with_fanout` landing in
+        // `exec_proof_method` (memory entry `a0ae5655`).  We need the
+        // SAME fan-out propagation here in `solveAllSafeGoals.solve`.
+        //
+        // Strategy: split into N sibling systems, push the tail back
+        // onto worklist with same (name, used, chains_left, iters_left,
+        // last_chain_term), and process the head.  Empty result drops
+        // the branch (HS mzero-equivalent).
+        let disable_simp_fanout = std::env::var(
+            "TAM_RS_DISABLE_SAS_SIMPLIFY_FANOUT").is_ok();
+        let post_simp: Vec<System> = if disable_simp_fanout {
+            let mut red0 = Reduction::new(ctx, sys);
+            simplify_system(&mut red0);
+            vec![red0.sys]
+        } else {
+            simplify_system_with_fanout(ctx, sys)
+        };
+        // Pop one sibling to continue with; push the rest back for
+        // later processing.  Match HS's Disj-monad insertion order:
+        // first sibling processed first (LIFO worklist → push tail
+        // reversed so the head pops next).
+        let sys = match post_simp.len() {
+            0 => continue, // all siblings contradictory / dropped
+            1 => post_simp.into_iter().next().unwrap(),
+            _ => {
+                let mut iter = post_simp.into_iter();
+                let head = iter.next().unwrap();
+                let tail: Vec<System> = iter.collect();
+                for sib in tail.into_iter().rev() {
+                    worklist.push((sib, name.clone(), used.clone(),
+                        chains_left, iters_left, last_chain_term.clone()));
+                }
+                head
+            }
+        };
         let mut red = Reduction::new(ctx, sys);
-        simplify_system(&mut red);
         let contras = contradictions(red.ctx, &red.sys);
         // TAM_RS_DBG_BRANCH_STATE=1 dumps state for ALL branches (not just dropped).
         // Use it to find why a chain-based sub-case isn't dropping when HS would.
