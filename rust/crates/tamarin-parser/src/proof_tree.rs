@@ -316,7 +316,35 @@ fn try_disj_split(text: &str) -> Option<GoalSpec> {
         return None;
     }
     let alts: Vec<DisjAlt> = parts.iter().map(|p| classify_disj_alt(p)).collect();
-    Some(GoalSpec::Disj { alts })
+    // HS-faithful disambiguation: when multiple Disj goals in
+    // sys.goals share the same alt shape signature (e.g. binding-A
+    // and binding-B instantiations of the same IH-body 5-alt disj),
+    // the shape-only `disj_alts_match` can't distinguish them.  HS
+    // parses each alt as a full `Guarded` with concrete LVar
+    // identities (Proof.hs:61), enabling structural match in
+    // sys.goals.  We can't easily reconstruct those identities, but
+    // we CAN capture each alt's normalized text and use it as a
+    // tie-breaker when shape matching is ambiguous.  See
+    // Yubikey::slightly_weaker_invariant at
+    // /non_empty_trace/case_1: both binding-A's disj (alt[0] =
+    // `last(#t2)`) and binding-B's (alt[0] = `last(#t1)`) match the
+    // 5-alt NonQuant shape; without alt-text matching, match_goal
+    // picks the wrong one and the proof diverges.
+    let alt_texts: Vec<String> = parts.iter().map(|p| {
+        let s = strip_outer_parens(p.trim()).trim().to_string();
+        normalize_disj_alt_text(&s)
+    }).collect();
+    Some(GoalSpec::Disj { alts, alt_texts })
+}
+
+/// Normalize a disj-alt's text for cross-renderer comparison.  The HS
+/// skeleton uses `#t1` for time vars (with the leading `#`).  The
+/// runtime renderer produces e.g. `Var(Free(VarSpec { name: "t1", idx: 0
+/// }))`.  We canonicalize by stripping all whitespace and the leading
+/// `#` from time-var references so a simple substring/equality check
+/// reveals divergent var bindings.
+fn normalize_disj_alt_text(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace() && *c != '#').collect()
 }
 
 /// Split `s` at top-level `∥` characters (U+2225).  Ignores any `∥`
@@ -896,7 +924,7 @@ mod tests {
         let src = "solve( (last(#t1)) \u{2225} (#t1 < #t2) ) by sorry";
         let t = parse_proof_tree(src).expect("parse");
         match &t.method {
-            ParsedMethod::SolveGoal(GoalSpec::Disj { alts }) => {
+            ParsedMethod::SolveGoal(GoalSpec::Disj { alts, alt_texts: _ }) => {
                 assert_eq!(alts.len(), 2);
                 assert!(matches!(alts[0], DisjAlt::NonQuant));
                 assert!(matches!(alts[1], DisjAlt::NonQuant));
@@ -914,7 +942,7 @@ mod tests {
                           (\u{2203} #t1 #t2 a b c. (last(#t1))) ) by sorry";
         let t = parse_proof_tree(src).expect("parse");
         match &t.method {
-            ParsedMethod::SolveGoal(GoalSpec::Disj { alts }) => {
+            ParsedMethod::SolveGoal(GoalSpec::Disj { alts, alt_texts: _ }) => {
                 assert_eq!(alts.len(), 2);
                 assert_eq!(alts[0], DisjAlt::All { n_vars: 7 });
                 assert_eq!(alts[1], DisjAlt::Ex { n_vars: 5 });
@@ -931,7 +959,7 @@ mod tests {
                           (#t2 < #t1) \u{2225} (#t1 = #t2) ) by sorry";
         let t = parse_proof_tree(src).expect("parse");
         match &t.method {
-            ParsedMethod::SolveGoal(GoalSpec::Disj { alts }) => {
+            ParsedMethod::SolveGoal(GoalSpec::Disj { alts, alt_texts: _ }) => {
                 assert_eq!(alts.len(), 5);
                 for a in alts.iter() { assert!(matches!(a, DisjAlt::NonQuant)); }
             }

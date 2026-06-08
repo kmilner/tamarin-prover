@@ -196,6 +196,18 @@ fn replay_node(
 
     // Walk the skeleton's child cases in source order.
     for (skel_name, sub_tree) in &node.cases {
+        // Push for case_path tracking — mirrors search.rs's push at
+        // expand_inner's case loop.  Without this, contradictions fired
+        // during skeleton-replay show path=/ regardless of how deep we
+        // are.  Diagnostic-only; doesn't affect proof.
+        let push_path = !skel_name.is_empty();
+        if push_path {
+            crate::constraint::solver::trace::case_path_push(skel_name);
+        }
+        // Wrap the body in a function so we can ensure pop() on every
+        // exit path.  Original body below, just indented one level.
+        let _push_guard = (); // placeholder for symmetry
+        let _ = _push_guard;
         // Find the matching runtime case.  Two common shapes:
         //   - Skel case is "" (no name; from Simplify or single-case
         //     SolveGoal) → matches the single produced case.
@@ -233,6 +245,9 @@ fn replay_node(
                 };
                 children.insert(skel_name.clone(), placeholder);
                 any_sorry = true;
+                if push_path {
+                    crate::constraint::solver::trace::case_path_pop();
+                }
                 continue;
             }
         };
@@ -248,6 +263,9 @@ fn replay_node(
         // shows when rendering).
         let key = runtime_name_opt.unwrap_or_else(|| skel_name.clone());
         children.insert(key, child_node);
+        if push_path {
+            crate::constraint::solver::trace::case_path_pop();
+        }
     }
 
     // For runtime cases NOT covered by the skeleton (e.g. skeleton was
@@ -268,7 +286,14 @@ fn replay_node(
         {
             continue;
         }
+        let push_path = !rt_name.is_empty();
+        if push_path {
+            crate::constraint::solver::trace::case_path_push(&rt_name);
+        }
         let auto = run_proof_search(ctx, rt_sys, max_steps);
+        if push_path {
+            crate::constraint::solver::trace::case_path_pop();
+        }
         match auto.status {
             NodeStatus::Solved => any_solved = true,
             NodeStatus::Contradictory => any_contra = true,
@@ -606,7 +631,7 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
             }
             Some(shape_matches[0].clone())
         }
-        GoalSpec::Disj { alts } => {
+        GoalSpec::Disj { alts, alt_texts } => {
             // HS-faithful: HS parses the `solve(...)` text into a
             // `DisjG (Disj [GuardedFormula])` value via
             // `disjSplitGoal` (Theory/Text/Parser/Proof.hs:61), then
@@ -621,7 +646,26 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
             // the lemma corpus, at most one open Disj matches that
             // signature (the skeleton-text and runtime-Goal come from
             // the same lemma formula).  See HS Proof.hs:61.
-            let mut matches: Vec<&Goal> = sys.goals
+            //
+            // HS-faithful disambiguation when multiple Disj goals
+            // share the same alt shape signature: the
+            // insertImpliedFormulas pass at a single IH can produce
+            // multiple alpha-distinct disjunctions (one per matching
+            // action-tuple), all with the same 5-NonQuant shape.  HS
+            // distinguishes them via the parsed Guarded's concrete
+            // LVar identities; RS uses the textual alt_texts captured
+            // by the skeleton parser as a tie-breaker.  See
+            // Yubikey::slightly_weaker_invariant at
+            // /non_empty_trace/case_1: both binding-(t1,t2) and
+            // binding-(t2,t1) IH-body disjs have shape NonQuant×5,
+            // but their alt[0] texts differ (`last(#t2)` vs
+            // `last(#t1)`).  Without alt-text disambiguation, RS
+            // picks the wrong disj — RS's insertion order is reversed
+            // vs HS, so matches[0] picks binding (t2,t1) where HS
+            // picks (t1,t2), which propagates `last_atom = #t1`
+            // instead of `last_atom = #t2`, triggering a false-positive
+            // Cyclic contradiction downstream.
+            let shape_matches: Vec<&Goal> = sys.goals
                 .iter()
                 .filter(|(_, st)| !st.solved)
                 .filter_map(|(g, _)| match g {
@@ -629,14 +673,40 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
                     _ => None,
                 })
                 .collect();
-            if matches.len() == 1 {
-                return Some(matches.remove(0).clone());
+            if shape_matches.len() == 1 {
+                return Some(shape_matches[0].clone());
             }
-            // Ambiguous → pick the first in source order (creation
-            // order in `sGoals`).  This mirrors the Action/Premise
-            // ambiguity-resolution policy above.
-            if !matches.is_empty() {
-                return Some(matches[0].clone());
+            // Ambiguous shape — try alt-text tie-breaker.  Render each
+            // candidate disj's alts via `pretty_disj_alts` (a strict
+            // analogue of HS's `prettyGuarded`) and compare against
+            // skel `alt_texts`.  Pick the candidate whose rendered
+            // alts equal the skeleton's text alts after the same
+            // normalization the parser applied (whitespace + `#`
+            // stripped).
+            if !shape_matches.is_empty() {
+                if !alt_texts.iter().all(|s| s.is_empty()) {
+                    let want: Vec<String> = alt_texts.clone();
+                    let mut text_matches: Vec<&Goal> = shape_matches.iter().copied()
+                        .filter(|g| {
+                            if let Goal::Disj(d) = g {
+                                let runtime_texts: Vec<String> = d.0.iter()
+                                    .map(|a| normalize_disj_alt_text_for_match(&pretty_disj_alt(a)))
+                                    .collect();
+                                runtime_texts == want
+                            } else { false }
+                        })
+                        .collect();
+                    if text_matches.len() == 1 {
+                        return Some(text_matches.remove(0).clone());
+                    }
+                    if !text_matches.is_empty() {
+                        return Some(text_matches[0].clone());
+                    }
+                }
+                // No text match (or no text info) — fall back to source
+                // order (creation order in `sGoals`).  Mirrors the
+                // Action/Premise ambiguity-resolution policy above.
+                return Some(shape_matches[0].clone());
             }
             None
         }
@@ -779,6 +849,22 @@ fn canonicalise_term_text(s: &str) -> String {
 fn disj_alts_match(skel: &[DisjAlt], runtime: &[crate::guarded::Guarded]) -> bool {
     if skel.len() != runtime.len() { return false; }
     skel.iter().zip(runtime.iter()).all(|(s, r)| disj_alt_shape_matches(s, r))
+}
+
+/// Render a single Guarded alt to its HS-faithful `prettyGuarded`
+/// representation.  Used by `match_goal`'s GoalSpec::Disj branch to
+/// disambiguate among multiple shape-matching disjs via alt-text
+/// equality.  See HS `prettyGuarded` (Guarded.hs:822-864).
+fn pretty_disj_alt(g: &crate::guarded::Guarded) -> String {
+    crate::pretty_formula::pretty_guarded(g)
+}
+
+/// Normalize a rendered alt text to the same canonical form as the
+/// skeleton parser's `normalize_disj_alt_text` (proof_tree.rs): strip
+/// all whitespace and `#` characters.  This bridges the HS-render's
+/// `last(#t2)` style and the parser's pre-stripped form.
+fn normalize_disj_alt_text_for_match(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace() && *c != '#').collect()
 }
 
 fn disj_alt_shape_matches(skel: &DisjAlt, g: &crate::guarded::Guarded) -> bool {
@@ -1169,11 +1255,13 @@ mod tests {
         // Spec with 3 NonQuant alts must pick the 3-alt goal.
         let spec3 = GoalSpec::Disj {
             alts: vec![DisjAlt::NonQuant, DisjAlt::NonQuant, DisjAlt::NonQuant],
+            alt_texts: vec![String::new(), String::new(), String::new()],
         };
         assert_eq!(match_goal(&spec3, &sys).expect("should match"), three);
         // Spec with 2 NonQuant alts must pick the 2-alt goal.
         let spec2 = GoalSpec::Disj {
             alts: vec![DisjAlt::NonQuant, DisjAlt::NonQuant],
+            alt_texts: vec![String::new(), String::new()],
         };
         assert_eq!(match_goal(&spec2, &sys).expect("should match"), two);
     }

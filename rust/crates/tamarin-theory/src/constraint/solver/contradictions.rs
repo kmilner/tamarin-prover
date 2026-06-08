@@ -124,10 +124,11 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
         // H14-style diagnostic: dump the actual cycle path so a missing
         // less_atom (vs HS) can be identified by diffing the paths.
         if std::env::var("TAM_RS_DBG_CYCLE_PATH").is_ok() {
+            let cp = crate::constraint::solver::trace::case_path_string();
             let path = cyclic_with_path(&all_less);
             let path_str: Vec<String> = path.iter()
                 .map(|n| format!("{}_{}", n.name, n.idx)).collect();
-            eprintln!("[CYCLE_PATH] cycle: {}", path_str.join(" → "));
+            eprintln!("[CYCLE_PATH] path={} cycle: {}", cp, path_str.join(" → "));
         }
         out.push(Contradiction::Cyclic);
     }
