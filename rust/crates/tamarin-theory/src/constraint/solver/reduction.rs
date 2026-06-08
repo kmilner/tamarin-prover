@@ -5627,12 +5627,31 @@ impl<'ctx> Reduction<'ctx> {
                 // BEFORE chain_extend insertEdges fires, matching
                 // CONTRA-DUMP attribution exactly.
                 //
-                // Step 1: exploit suppliers + KU action goals (HS
-                // `exploitPrems i ru` in labelNodeId).  Suppliers route
-                // through `insert_edge_labeled` (fresh_supplier /
-                // isend_supplier) so any fact-unification failure
-                // sets sub.sys.eq_store.is_false() via mark_contradictory.
-                sub.exploit_prems_supplier_only(&new_node, &ru_renamed);
+                // Step 1: exploit suppliers + KU action goals + Kd/Ded
+                // Premise goals (HS `exploitPrems i ru` in labelNodeId).
+                // Suppliers route through `insert_edge_labeled`
+                // (fresh_supplier / isend_supplier) so any
+                // fact-unification failure sets sub.sys.eq_store.is_false()
+                // via mark_contradictory.
+                //
+                // 2026-06-08: switched from `exploit_prems_supplier_only`
+                // to full `exploit_prems` to be HS-faithful — Haskell's
+                // `solveChain EXTEND` path calls
+                // `insertFreshNode rules (Just cRule)` →
+                // `labelNodeId` → `exploitPrems` which inserts a
+                // `Goal::Premise` for every non-Fr/In/KU premise (incl.
+                // Kd / Ded).  Dropping these Premise goals on the floor
+                // (the prior supplier_only call) was a CORRECTNESS bug:
+                // for multi-premise destructor rules like `d_em`
+                // (Bilinear-Pairing Emap-down: two Kd premises), only
+                // prem 0 was tracked (as the chain), and prem 1's Kd
+                // premise had NO goal whatsoever — so the system was
+                // reported as Solved with an unsatisfied Kd input.
+                // This caused
+                // `ake/bilinear/Joux.spthy::Session_Key_Secrecy_PFS`
+                // to report "trace found" (verdict-falsified) where HS
+                // proves verified.
+                sub.exploit_prems(&new_node, &ru_renamed);
                 if sub.sys.eq_store.is_false() {
                     if dbg_filter {
                         eprintln!("[CHAIN_EXT_FILTER] DROP_AFTER_EXPLOIT rule={}",
