@@ -1579,6 +1579,12 @@ impl<'ctx> Reduction<'ctx> {
                 // the bound vars, substitute Bound → Free in guards/body,
                 // and recurse on `gconj([atoms..., body])`.
                 let outer = g.clone();
+                if std::env::var("TAM_RS_DBG_EX_INSERT").map(|v| v == "1").unwrap_or(false) {
+                    eprintln!("[RS_EX_INSERT] path={} mark={} fm={}",
+                        crate::constraint::solver::trace::case_path_string(),
+                        mark,
+                        crate::constraint::solver::trace::guarded_repr(&outer));
+                }
                 if std::env::var("TAM_DBG_EX_DECOMP").is_ok() {
                     eprintln!("[EX-DECOMP] ENTER mark={} vars={:?}",
                         mark,

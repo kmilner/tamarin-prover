@@ -548,6 +548,12 @@ insertFormula = do
           GGuarded Ex ss as gf -> do
               -- must always mark as solved, as we otherwise may repeatedly
               -- introduce fresh variables.
+              let dbgEx = Unsafe.unsafePerformIO $
+                    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_DBG_EX_INSERT"
+              when dbgEx $ Debug.Trace.traceM $
+                  "[HS_EX_INSERT] path=" ++ T.casePathString (Unsafe.unsafePerformIO T.getCasePath)
+                  ++ " mark=" ++ show mark
+                  ++ " fm=" ++ show fm
               modM sSolvedFormulas $ S.insert fm
               xs <- mapM (uncurry freshLVar) ss
               let body = gconj (map GAto as ++ [gf])

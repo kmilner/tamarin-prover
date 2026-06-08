@@ -1278,6 +1278,28 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
             &mut new_formulas,
         );
     }
+    // RS_IMPL_PATH_DUMP: at any path matching env var, dump the sys_actions list (post-eq subst)
+    // so we can see what RS sees vs HS.
+    if let Ok(target) = std::env::var("TAM_RS_DBG_IMPL_PATH") {
+        let path = crate::constraint::solver::trace::case_path_string();
+        if path == target {
+            eprintln!("[RS_IMPL_PATH_DUMP] path={} sys_actions=[", path);
+            for (i, (id, fa)) in sys_actions.iter().enumerate() {
+                eprintln!("  [{}] @{:?} tag={:?} terms={:?}", i, id, fa.tag, fa.terms);
+            }
+            eprintln!("] formulas={} lemmas={} solved_formulas={}",
+                red.sys.formulas.len(), red.sys.lemmas.len(),
+                red.sys.solved_formulas.len());
+            eprintln!("[RS_IMPL_PATH_DUMP] universals=[");
+            for (i, (_orig, vars, gd, body)) in universals.iter().enumerate() {
+                eprintln!("  [{}] vars={:?} guards={:?} body={}",
+                    i,
+                    vars.iter().map(|v| format!("{}#{}({:?})", v.name, v.idx, v.sort)).collect::<Vec<_>>(),
+                    gd, crate::constraint::solver::trace::guarded_repr(body));
+            }
+            eprintln!("]");
+        }
+    }
     if new_formulas.is_empty() { return ChangeIndicator::Unchanged; }
     // Route each implied-formula body through `insert_formula`
     // so Disj / Ex / Conj bodies generate the matching `Goal::Disj`,
@@ -1288,7 +1310,13 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     // satisfies both — so `is_finished` returns `Solved` even though the
     // disjunction is undecomposed.  Mirrors Haskell `insertFormula`'s
     // case dispatch (`Reduction.hs:insertFormula`).
+    let dbg_fire = std::env::var("TAM_RS_DBG_IMPL_FIRE").map(|v| v == "1").unwrap_or(false);
     for f in new_formulas {
+        if dbg_fire {
+            eprintln!("[RS_IMPL_FIRE] path={} implied={}",
+                crate::constraint::solver::trace::case_path_string(),
+                crate::constraint::solver::trace::guarded_repr(&f));
+        }
         red.insert_formula(f);
     }
     red.changed = ChangeIndicator::Changed;
