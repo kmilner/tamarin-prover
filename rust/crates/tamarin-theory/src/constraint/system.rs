@@ -326,6 +326,9 @@ impl System {
         // counter on EVERY call, even when the goal already exists.
         let age = self.next_goal_nr;
         self.next_goal_nr = self.next_goal_nr.wrapping_add(1);
+        if std::env::var("TAM_RS_DBG_INSERT_GOAL").is_ok() {
+            eprintln!("[RS_INS_GOAL] gsNr={} solved=false loops=false goal={:?}", age, g);
+        }
         if !self.goals.iter().any(|(existing, _)| existing == &g) {
             let mut st = GoalStatus::default();
             st.nr = age;
@@ -370,6 +373,9 @@ impl System {
         // combineGoalStatus` keeps the existing — smaller — nr).
         let age = self.next_goal_nr;
         self.next_goal_nr = self.next_goal_nr.wrapping_add(1);
+        if std::env::var("TAM_RS_DBG_INSERT_GOAL").is_ok() {
+            eprintln!("[RS_INS_GOAL] gsNr={} solved=false loops={} goal={:?}", age, looping, g);
+        }
         let canon_g = canonical_goal_for_dedup(&g);
         let is_new = !self.goals.iter().any(|(existing, _)|
             canonical_goal_for_dedup(existing) == canon_g);

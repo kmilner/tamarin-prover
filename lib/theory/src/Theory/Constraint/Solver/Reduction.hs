@@ -606,10 +606,24 @@ combineGoalStatus (GoalStatus solved1 age1 loops1)
                   (GoalStatus solved2 age2 loops2) =
     GoalStatus (solved1 || solved2) (min age1 age2) (loops1 || loops2)
 
+-- | TAM_HS_DBG_INSERT_GOAL=1 dumps every insertGoalStatus call's
+-- assigned gsNr and goal.  Pair with Rust's TAM_RS_DBG_INSERT_GOAL
+-- to lockstep-diff insertGoal sequences and find the divergent
+-- insertion path between HS and RS.
+dbgInsertGoalOn :: Bool
+dbgInsertGoalOn = Unsafe.unsafePerformIO $
+    maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_DBG_INSERT_GOAL"
+{-# NOINLINE dbgInsertGoalOn #-}
+
 -- | Insert a goal and its status with a new age. Merge status if goal exists.
 insertGoalStatus :: Goal -> GoalStatus -> Reduction ()
 insertGoalStatus goal status = do
     age <- getM sNextGoalNr
+    when dbgInsertGoalOn $
+        trace ("[HS_INS_GOAL] gsNr=" ++ show age ++
+               " solved=" ++ show (get gsSolved status) ++
+               " loops=" ++ show (get gsLoopBreaker status) ++
+               " goal=" ++ show goal) (return ())
     modM sGoals $ M'.insertWith combineGoalStatus goal (set gsNr age status)
     sNextGoalNr =: succ age
 
