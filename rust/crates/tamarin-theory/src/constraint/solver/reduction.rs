@@ -797,20 +797,36 @@ impl<'ctx> Reduction<'ctx> {
                 }
             } else {
                 // HS-faithful merge: mirror `M.insertWith combineGoalStatus`
-                // (Reduction.hs:527, 656).  When subst rewrites two
-                // pre-subst goals to the same post-subst form, merge
+                // (Reduction.hs:612-615, 648, 812).  When subst rewrites
+                // two pre-subst goals to the same post-subst form, merge
                 // their statuses:
-                //   solved = solved_old || solved_new
+                //   solved  = solved_old  || solved_new
+                //   gsNr    = min age_old age_new        ← HS-faithful!
                 //   looping = looping_old || looping_new
-                // (gsNr = min — we don't track it explicitly).
                 //
-                // Previously: kept the first occurrence and dropped the
-                // rest, which lost `solved=True` if it appeared later.
-                // For Disj goals specifically, this caused NSLPK3
-                // line-105 divergence: the 4 typing-lemma Disj firings
-                // post-subst collapse to 2 canonical Disjs in HS via
-                // `combineGoalStatus`, merging with prior solved
-                // entries; Rust kept 4 distinct entries instead.
+                // HS uses `Data.Map.insertWith combineGoalStatus`: when
+                // the key matches an existing entry, `combineGoalStatus`
+                // is called with the OLD value and the NEW value, and
+                // its `min age1 age2` chooses the SMALLER nr regardless
+                // of iteration order.
+                //
+                // Previously: RS kept the FIRST-iterated goal's gsNr and
+                // dropped subsequent goals' nrs entirely — so when two
+                // pre-subst goals (e.g. `Premise(#vr.3, p1) PCR(x.5)` at
+                // nr=14 and `Premise(#vr.10, p0) PCR(h(...obtain))` at
+                // nr=28) substitute to the SAME post-subst goal, RS
+                // could keep nr=28 (whichever came first in goal_cmp
+                // order) while HS kept nr=14.  This shifts the
+                // smartRanking pick: HS picks `PCR('pcr0')` at nr=14
+                // first, RS picks `PCR(h(...))` at nr=28 first — taking
+                // a different proof path.
+                //
+                // Surfaced on Envelope::Secret_and_Denied_exclusive
+                // (5828 diff lines): at /Alice1/PCR_Init/Alice2/PCR_Init/
+                // PCR_Unbind/PCR_Extend/Alice1/PCR_CertKey/Alice1/PCR_Quote/
+                // PCR_Extend/Alice2 the divergent pick was traced to this
+                // gsNr-merge gap, not to apply_source_case unifier
+                // selection (the prior diagnosis).
                 //
                 // Comparison key: `canonical_goal_for_dedup` (mirrors
                 // HS's Map-key equality on Goal, which is structural Eq
@@ -823,6 +839,7 @@ impl<'ctx> Reduction<'ctx> {
                 {
                     slot.1.solved = slot.1.solved || st.solved;
                     slot.1.looping = slot.1.looping || st.looping;
+                    slot.1.nr = std::cmp::min(slot.1.nr, st.nr);
                 } else {
                     new_goals.push((g2, st));
                 }
