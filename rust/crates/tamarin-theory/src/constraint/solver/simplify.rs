@@ -2740,7 +2740,7 @@ pub(crate) fn solve_unique_actions_pass_fan_out(
             *counts.entry((fa.tag.clone(), fa.terms.len())).or_insert(0) += 1;
         }
     }
-    let is_unique = |fa: &LNFact| -> bool {
+    let is_unique = move |fa: &LNFact| -> bool {
         for t in &fa.terms {
             if has_funion_head(t) { return false; }
         }
@@ -2758,7 +2758,8 @@ pub(crate) fn solve_unique_actions_pass_fan_out(
     candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     if candidates.is_empty() { return Ok(ChangeIndicator::Unchanged); }
     let mut changed = ChangeIndicator::Unchanged;
-    for (i, fa) in candidates {
+    let mut iter = candidates.into_iter();
+    while let Some((i, fa)) = iter.next() {
         let still_present = red.sys.goals.iter().any(|(g, st)| {
             !st.solved && matches!(g, Goal::Action(gi, gfa)
                 if gi == &i && gfa == &fa)
@@ -2776,18 +2777,125 @@ pub(crate) fn solve_unique_actions_pass_fan_out(
                 changed = ChangeIndicator::Changed;
             }
             GoalCases::Cases(cases) => {
-                // Fan-out — return the case systems.  Per HS, the
-                // surviving cases each continue independently through
-                // the rest of the simplify computation.  The Action
-                // goal has already been marked solved inside
-                // `solve_action_goal` for each case's system.
-                let systems: Vec<crate::constraint::system::System> =
-                    cases.into_iter().map(|(_name, s)| s).collect();
-                return Err(systems);
+                // HS-faithful fan-out (Simplify.hs:401-422):
+                //   solveUniqueActions = do
+                //     ...
+                //     actionAtoms <- gets unsolvedActionAtoms
+                //     mconcat <$> mapM trySolve actionAtoms
+                //
+                // The list `actionAtoms` is captured ONCE pre-mapM.  When
+                // a `trySolve` call's inner `solveGoal (ActionG i fa)`
+                // produces a DisjT fan-out (via `disjunctionOfList arms`
+                // in `solveFactEqs SplitNow`), every subsequent
+                // `trySolve` runs INSIDE the fanned branch using the
+                // SAME captured (i, fa) — NOT a re-substituted version.
+                //
+                // RS previously returned immediately on fan-out; the
+                // caller `simplify_system_with_fanout` then recursed
+                // per-case, and each recursion re-collected candidates
+                // from `red.sys.goals` AFTER substSystem applied the
+                // fan-out arm's eq_store.  On TAK1::session_key_establish
+                // this drops the `Accept(sc, ...)` goal from candidates
+                // because the substituted `k`-term carries a Union from
+                // sb's arm's unifier — `is_unique` rejects it.  HS sees
+                // the same goal as captured pre-substitution and keeps
+                // processing it.  Result: HS produces 6×6=36 simplify
+                // cases, RS produced 6×1=6.
+                //
+                // Fix: process the REMAINING captured candidates in
+                // EACH fanned arm using the ORIGINAL (i, fa) values
+                // (not re-collected from the substituted goal set).
+                // Recursively call `solve_unique_actions_pass_fan_out`
+                // analog: drain `iter` into each arm.
+                let remaining: Vec<(crate::constraint::constraints::NodeId, LNFact)> =
+                    iter.collect();
+                let mut out_systems: Vec<crate::constraint::system::System> = Vec::new();
+                for (_name, case_sys) in cases {
+                    if case_sys.eq_store.is_false() { continue; }
+                    let mut case_sub = drain_remaining_actions(
+                        red.ctx, case_sys, &remaining);
+                    out_systems.append(&mut case_sub);
+                }
+                return Err(out_systems);
             }
         }
     }
     Ok(changed)
+}
+
+/// Process the remaining (i, fa) action candidates in `case_sys`,
+/// mirroring HS's `mapM trySolve actionAtoms` continuation inside a
+/// DisjT-fanned branch.  Each remaining candidate's `solve_action_goal`
+/// call may itself fan out, producing more systems.  Returns the final
+/// list of systems after all remaining candidates have been processed.
+///
+/// The captured `(i, fa)` is the PRE-fan-out value.  HS's `mapM
+/// trySolve` does not call substSystem between iterations inside one
+/// `solveUniqueActions` call — only the outer simplify-iteration's
+/// `substSystem` (once at the start of `go`) propagates eq-store
+/// changes into nodes/edges.
+fn drain_remaining_actions(
+    ctx: &crate::constraint::solver::context::ProofContext,
+    case_sys: crate::constraint::system::System,
+    remaining: &[(crate::constraint::constraints::NodeId, crate::fact::LNFact)],
+) -> Vec<crate::constraint::system::System> {
+    use crate::constraint::constraints::Goal;
+    use crate::constraint::solver::reduction::GoalCases;
+    let mut red = Reduction::new(ctx, case_sys);
+    // HS-faithful: do NOT call subst_system here.  HS's `mapM trySolve
+    // actionAtoms` runs each subsequent solveAction inside the
+    // DisjT-fanned branch WITHOUT a substSystem in between — only the
+    // outer simplify-iteration's substSystem (called once at the start
+    // of `go`) propagates eq-store changes into nodes/edges.  The
+    // captured (i, fa) is what gets fed to solveAction.  Calling
+    // substSystem prematurely renames nodes/goals and breaks the
+    // captured-key match in `markGoalAsSolved`.
+    for (i, fa) in remaining {
+        // HS-faithful (Reduction.hs:656-680): `markGoalAsSolved` on a
+        // missing key just traces a warning and returns silently; the
+        // surrounding `solveGoal` proceeds with the captured (i, fa)
+        // regardless of whether the goal still exists post-subst.  RS
+        // previously short-circuited on a `still_present` check here,
+        // dropping the action goal's fan-out in branches where
+        // substSystem had renamed/rewritten the goal key.
+        //
+        // We DO want to skip if the goal exists but is solved (HS's
+        // `mayStatus = Just status` path) — that prevents double-solving
+        // the captured atom in branches where an earlier pass already
+        // resolved it.  In particular: when the previous fan-out's
+        // per-arm eq_store collapses sb's and sc's Accept-goal keys to
+        // the same structural form, marking sb's goal also marks the
+        // matching sc-goal entry as solved.  Without this skip, the
+        // outer `solve_action_goal` redispatches the same atom and
+        // emits an extra `Proto3` step in the proof tree.
+        let goal_solved = red.sys.goals.iter().any(|(g, st)| {
+            st.solved && matches!(g, Goal::Action(gi, gfa)
+                if gi == i && gfa == fa)
+        });
+        if goal_solved { continue; }
+        let outcome = red.solve_action_goal(i, fa);
+        match outcome {
+            GoalCases::Contradictory => {
+                mark_contradictory_labeled(&mut red, "solve_unique_actions");
+            }
+            GoalCases::Linear | GoalCases::LinearNamed(_) => {
+                // `red.sys` mutated in place — continue.
+            }
+            GoalCases::Cases(cases) => {
+                // Nested fan-out — recurse with remaining candidates.
+                let idx = remaining.iter().position(|(ii, ffa)| ii == i && ffa == fa).unwrap();
+                let next_remaining: Vec<_> = remaining[idx+1..].to_vec();
+                let mut out: Vec<crate::constraint::system::System> = Vec::new();
+                for (_name, case_sys) in cases {
+                    if case_sys.eq_store.is_false() { continue; }
+                    let mut sub = drain_remaining_actions(ctx, case_sys, &next_remaining);
+                    out.append(&mut sub);
+                }
+                return out;
+            }
+        }
+    }
+    vec![std::mem::replace(&mut red.sys, crate::constraint::system::System::empty())]
 }
 
 /// True if any subterm has the AC `Union` head — multiset union.
