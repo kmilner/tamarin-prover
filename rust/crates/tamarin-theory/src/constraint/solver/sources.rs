@@ -589,13 +589,38 @@ pub fn precompute_full_sources(
     let goal_node = tamarin_term::lterm::LVar::new(
         "i", tamarin_term::lterm::LSort::Node, 0);
     let mut ku_patterns: Vec<tamarin_term::lterm::LNTerm> = Vec::new();
-    // Fresh-sorted singleton: KU(t:Fresh).  This is the pattern that
-    // gates the chain for protocol-fresh values like ~ni, ~nr, ~ltk.
+    // Per HS Sources.hs:582-595, `absMsgFacts` is `asum $ sortednub $ [..]`
+    // i.e. the union of:
+    //   (1) fresh-sorted singleton t.1
+    //   (2) bilinear pairing em(t.1,t.2)  [if enableBP]
+    //   (3) nat 1, nat t.1 %+ t.2          [if enableNat]
+    //   (4) one fAppNoEq per non-implicit NoEq symbol of arity ≥ 1 OR Private
+    // After `sortednub`, the list is sorted by `Ord LNTerm`.  Term Ord
+    // tiebreaks first on the head FunSym; FunSym Ord is `NoEq < Ac < C`
+    // (see FunctionSymbols.hs:113-117; mirrored in
+    // `function_symbols.rs:62-69`).  So C(EMap)-headed em(...) sorts
+    // AFTER every NoEq-headed term — i.e. em ends up LAST in HS's
+    // SAT-FINAL output for Chen_Kudla / Joux / RYY / Scott / TAK1.
+    //
+    // Honour that ordering here so the runtime sees sources in the
+    // same order HS does — `solve_with_source_cases` consults
+    // `ctx.full_sources` in iteration order, and a divergent order
+    // alone is enough to swing rule-case picks (see Chen_Kudla:
+    // `case Resp_1` vs `case Init_1` regression when em was inserted
+    // 2nd instead of last).
+    //
+    // Strategy: push fresh first (sorts before any App), then all
+    // NoEq fAppNoEq's via the `msig.fun_syms` BTreeSet iter (already
+    // alphabetical by name), then C / AC symbols at the tail.
+    //
+    // Mirrors HS Sources.hs:584:
+    //     return $ varTerm (LVar "t" LSortFresh 1)
     ku_patterns.push(tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Var(
         tamarin_term::lterm::LVar::new(
             "t", tamarin_term::lterm::LSort::Fresh, 1))));
+    let msig = ctx.maude.maude_sig();
     // Per-function-symbol applications.  Use Msg-sorted arg vars.
-    // Mirrors Haskell `absMsgFacts` (Sources.hs:73-77):
+    // Mirrors Haskell `absMsgFacts` (Sources.hs:592-594):
     //     [ fAppNoEq o $ nMsgVars k
     //     | o@(_,(k,priv,_)) <- S.toList . noEqFunSyms $ msig
     //     , NoEq o `S.notMember` implicitFunSig
@@ -604,7 +629,7 @@ pub fn precompute_full_sources(
     // Private, excluding the implicit `pair`/`inv`/`Mult`/`Union`
     // symbols (FunctionSymbols.hs:228).  Includes both constructors
     // AND destructors (e.g. `adec`, `fst`, `snd`).
-    let msig = ctx.maude.maude_sig();
+    //
     // HS uses `noEqFunSyms msig` which is the full NoEq set, including
     // reducible symbols (`adec`, `fst`, `snd`, ...).  Rust's
     // `irreducible_fun_syms` filters these out, so use `fun_syms`
@@ -634,6 +659,39 @@ pub fn precompute_full_sources(
                 args.into()));
         }
     }
+    // Natural-numbers branch.  Mirrors HS Sources.hs:588-591:
+    //     if enableNat msig then
+    //       [ fAppNoEq natOneSym []
+    //       , fAppAC NatPlus [varTerm (LVar "t" LSortNat 1), varTerm (LVar "t" LSortNat 2)] ]
+    //       else []
+    // AC-headed; sorts BEFORE C-headed em per FunSym Ord NoEq<Ac<C.
+    if msig.enable_nat {
+        ku_patterns.push(tamarin_term::term::f_app_no_eq(
+            tamarin_term::function_symbols::nat_one_sym(), vec![]));
+        let nat_args: Vec<tamarin_term::lterm::LNTerm> = (1..=2u64)
+            .map(|i| tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Var(
+                tamarin_term::lterm::LVar::new(
+                    "t", tamarin_term::lterm::LSort::Nat, i))))
+            .collect();
+        ku_patterns.push(tamarin_term::term::f_app_ac(
+            tamarin_term::function_symbols::AcSym::NatPlus, nat_args));
+    }
+    // Bilinear pairing branch.  Mirrors HS Sources.hs:586:
+    //     if enableBP msig then return $ fAppC EMap $ nMsgVars (2::Int) else []
+    // C-headed; sortednub puts this LAST (after every NoEq + Ac term).
+    // Without this, BP-theory targets (Chen_Kudla, TAK1, Joux, RYY,
+    // Scott) miss the `KU(em(t.1,t.2))` source.  HS emitted 9 KU
+    // sources for Chen_Kudla; pre-fix RS emitted 8 — exactly the
+    // `em` source was missing.
+    if msig.enable_bp {
+        let args: Vec<tamarin_term::lterm::LNTerm> = (1..=2u64)
+            .map(|i| tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Var(
+                tamarin_term::lterm::LVar::new(
+                    "t", tamarin_term::lterm::LSort::Msg, i))))
+            .collect();
+        ku_patterns.push(tamarin_term::term::f_app_c(
+            tamarin_term::function_symbols::CSym::EMap, args));
+    }
     // TAM_DBG_SRC_PRECOMP=1: dump every ku_pattern + every fun_sym
     // considered, so we can verify that precompute generated sources
     // for the expected function symbols.
@@ -657,6 +715,26 @@ pub fn precompute_full_sources(
     }
 
     set_precompute_mode(false);
+    if std::env::var("TAM_DBG_SRC_LIST").is_ok() {
+        eprintln!("[src_list] precompute_full_sources emitted {} sources:", out.len());
+        for (i, src) in out.iter().enumerate() {
+            let s = format!("{:?}", src.goal).chars().take(200).collect::<String>();
+            eprintln!("  src[{}] = {}", i, s);
+        }
+    }
+    // TAM_DBG_SRC_CASES=1: force materialization of every source's
+    // cases and dump per-source case name list + count.  Mirrors HS
+    // SAT-FINAL output for byte-level comparison.
+    if std::env::var("TAM_DBG_SRC_CASES").is_ok() {
+        eprintln!("[src_cases] forcing materialization of {} sources:", out.len());
+        for (i, src) in out.iter().enumerate() {
+            let cases = src.cases(ctx);
+            let names: Vec<String> = cases.iter().map(|(n, _)| n.clone()).collect();
+            let g_str = format!("{:?}", src.goal).chars().take(120).collect::<String>();
+            eprintln!("  src[{}] cases={} names={:?} goal={}",
+                i, cases.len(), names, g_str);
+        }
+    }
     out
 }
 
@@ -9222,6 +9300,49 @@ mod tests {
         let a_src = a_src.unwrap();
         assert!(!a_src.cases_or_empty().is_empty(),
             "source for A should have at least one case (Init / Loop)");
+    }
+
+    /// Bilinear-pairing source: when `enableBP` is set, HS Sources.hs:586
+    /// emits a `KU(em(t.1, t.2))` source.  Without this, BP-theory
+    /// targets (Chen_Kudla, Joux, RYY, Scott, TAK1) miss the em
+    /// source-case enumeration entirely.  Pre-fix RS only iterated
+    /// `msig.fun_syms` for NoEq symbols and skipped C(EMap) silently.
+    #[test]
+    fn precompute_full_sources_emits_em_when_bp_enabled() {
+        use crate::constraint::constraints::Goal;
+        use crate::fact::{Fact, FactTag, Multiplicity, fresh_fact};
+        use crate::rule::{ProtoRuleE, ProtoRuleEInfo, Rule};
+        use tamarin_term::builtin::msg_var;
+
+        let path = match maude_path() { Some(p) => p, None => return };
+        let h = tamarin_term::maude_proc::MaudeHandle::start(
+            &path, tamarin_term::maude_sig::bp_maude_sig()).unwrap();
+
+        // Minimal protocol so there's at least one proto rule (so
+        // `precompute_full_sources` actually runs).
+        let a_tag = FactTag::Proto(Multiplicity::Linear, "A".to_string(), 1);
+        let a_fact = Fact::new(a_tag.clone(), vec![msg_var("x", 0)]);
+        let init: ProtoRuleE = Rule::new(
+            ProtoRuleEInfo::standard("Init"),
+            vec![fresh_fact(msg_var("x", 0))],
+            vec![a_fact.clone()],
+            vec![],
+        );
+        let rules = vec![crate::theory::OpenProtoRule::new(init)];
+        let ctx = crate::constraint::solver::context::ProofContext::new(h, rules);
+        // Find the KU(em(...)) source.
+        let em_src = ctx.full_sources.iter().find(|s| match &s.goal {
+            Goal::Action(_, fa) => {
+                if fa.tag != FactTag::Ku || fa.terms.len() != 1 { return false; }
+                matches!(&fa.terms[0], tamarin_term::term::Term::App(
+                    tamarin_term::function_symbols::FunSym::C(
+                        tamarin_term::function_symbols::CSym::EMap), _))
+            },
+            _ => false,
+        });
+        assert!(em_src.is_some(),
+            "expected a KU(em(...)) source for BP-enabled theory; got: {:?}",
+            ctx.full_sources.iter().map(|s| &s.goal).collect::<Vec<_>>());
     }
 
     #[test]
