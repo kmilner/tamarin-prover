@@ -3985,14 +3985,32 @@ fn solve_all_safe_goals_tracked(
         //     Haskell's Disj-monad `mzero` propagation when no branch
         //     survives).
         if ths.is_empty() { return outcome; }
+        // HS-faithful `usefulGoal` filter (Goals.hs:115-123 + Sources.hs:212-213):
+        // HS only source-picks KU goals tagged `Useful`.  KU goals tagged
+        // `CurrentlyDeducible` / `ProbablyConstructible` / `LoopBreaker`
+        // are NOT in `usefulGoals` → source-pick skips them, leaving
+        // them as open goals.  For bare-Msg-var KU goals (e.g. `KU(x.13)`
+        // from a destructor's KU(x) premise) `probablyConstructible`
+        // returns True → tag is `ProbablyConstructible`, NOT `Useful`,
+        // so HS does NOT source-pick on them.  Without this filter RS
+        // recursively source-picks on these abstract vars, fanning out
+        // KU(pmult) into 21+ cases vs HS's 9.  See agent #31 diagnosis.
+        //
         // Haskell-faithful `filterCases`: skip useful_kus whose source
         // label is already in `used` (whole source consumed).  Mirrors
         // Sources.hs:218-219 — picking case X from Source1 removes
         // Source1 entirely from the candidate list, not just the X
         // case-name.  When ALL useful_kus map to consumed sources,
         // return outcome (saturate complete for this iteration).
-        let useful_ku = goals.iter().find_map(|(g, _)| match g {
+        use crate::constraint::solver::annotated_goals::Usefulness;
+        let useful_ku = goals.iter().find_map(|(g, looping)| match g {
             Goal::Action(i, fa) if matches!(fa.tag, FactTag::Ku) => {
+                // HS-faithful: only KU goals tagged `Useful` are eligible.
+                if crate::constraint::solver::goals::goal_usefulness(g, *looping, &red.sys)
+                    != Usefulness::Useful
+                {
+                    return None;
+                }
                 if let Some(label) = ku_source_label_for_fa(fa) {
                     if used.contains(&label) { return None; }
                 }
@@ -4712,14 +4730,32 @@ fn run_solve_all_safe_goals_disj_with_progress(
         // with d_1_check_getmsg) to survive our drop pass, where
         // Haskell drops them via Cyclic+ForbiddenChain after
         // source-picking on a *later* KU goal (e.g. KU(pcs(...))).
+        // HS-faithful `usefulGoal` filter (Goals.hs:115-123 + Sources.hs:212-213):
+        // HS only source-picks KU goals tagged `Useful`.  KU goals tagged
+        // `CurrentlyDeducible` / `ProbablyConstructible` / `LoopBreaker`
+        // are NOT in `usefulGoals` → source-pick skips them, leaving
+        // them as open goals.  Bare-Msg-var KU goals (e.g. `KU(x.13)`
+        // from a destructor's KU(x) premise) get `ProbablyConstructible`,
+        // NOT `Useful`, so HS does NOT source-pick on them.  Without this
+        // filter, RS recursively source-picks on these abstract vars,
+        // fanning Chen_Kudla's KU(pmult) into 21+ over-saturated cases
+        // (vs HS's 9).  See agent #31 diagnosis.
+        //
         // Haskell-faithful `filterCases` (Sources.hs:218-219):
         // skip useful_kus whose source LABEL is already in `used` —
         // picking a case from Source S consumes S entirely, not just
         // the picked case-name.  See `ku_source_label_for_fa`.
+        use crate::constraint::solver::annotated_goals::Usefulness;
         let useful_kus: Vec<(crate::constraint::constraints::NodeId,
                               crate::fact::LNFact)> =
-            goals.iter().filter_map(|(g, _)| match g {
+            goals.iter().filter_map(|(g, looping)| match g {
                 Goal::Action(i, fa) if matches!(fa.tag, FactTag::Ku) => {
+                    // HS-faithful: only `Useful`-tagged KU goals.
+                    if crate::constraint::solver::goals::goal_usefulness(
+                        g, *looping, &red.sys) != Usefulness::Useful
+                    {
+                        return None;
+                    }
                     if let Some(label) = ku_source_label_for_fa(fa) {
                         if used.contains(&label) { return None; }
                     }
