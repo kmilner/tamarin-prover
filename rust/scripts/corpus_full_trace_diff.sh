@@ -51,13 +51,26 @@ HS_CANON_CACHE="${HS_CANON_CACHE:-$script_dir/.hs_canon_cache}"
 NO_HS_CACHE="${NO_HS_CACHE:-}"
 [ -n "$NO_HS_CACHE" ] || mkdir -p "$HS_CANON_CACHE" 2>/dev/null || true
 
-# --- Locate the HS binary (first match wins; same logic as diff_proof_tree.sh).
-hs_path=""
-for c in "$repo_root"/.stack-work/install/*/*/*/bin/tamarin-prover \
-         "$repo_root"/.stack-work/dist/*/ghc-*/build/tamarin-prover/tamarin-prover \
-         tamarin-prover; do
-    if command -v "$c" >/dev/null 2>&1 || [ -x "$c" ]; then hs_path="$c"; break; fi
-done
+# --- Locate the HS binary. Search worktree-local .stack-work first; fall back to
+# the main worktree's .stack-work (git worktree doesn't copy untracked dirs).
+find_hs_bin() {
+    local root="$1" c
+    for c in "$root"/.stack-work/install/*/*/*/bin/tamarin-prover \
+             "$root"/.stack-work/dist/*/ghc-*/build/tamarin-prover/tamarin-prover; do
+        if [ -x "$c" ]; then echo "$c"; return 0; fi
+    done
+    return 1
+}
+hs_path="$(find_hs_bin "$repo_root" 2>/dev/null || true)"
+if [ -z "$hs_path" ]; then
+    main_root="$(git -C "$repo_root" worktree list --porcelain 2>/dev/null | awk '/^worktree/{print $2; exit}')"
+    if [ -n "$main_root" ] && [ "$main_root" != "$repo_root" ]; then
+        hs_path="$(find_hs_bin "$main_root" 2>/dev/null || true)"
+    fi
+fi
+if [ -z "$hs_path" ]; then
+    hs_path="$(command -v tamarin-prover 2>/dev/null || true)"
+fi
 if [ -z "$hs_path" ]; then
     echo "corpus_full_trace_diff.sh: no HS tamarin-prover binary found" >&2
     exit 2
