@@ -1097,47 +1097,29 @@ impl<'ctx> Reduction<'ctx> {
             }
         }
         let id = self.sys.eq_store.add_disj(substs);
-        // Re-filter the newly-added variants against the existing free
-        // subst.  Without this, variant bindings that conflict with the
-        // already-established free subst stay in the disjunction.
-        //
-        // Concrete TESLA::authentic example: solve_premise_goal calls
-        // solve_fact_eqs FIRST (unifying rule conc with live premise,
-        // forcing z=true into eq_store.subst), THEN solve_rule_constraints
-        // adds the variant SplitG.  Variant [0] has z → verify(...) which
-        // conflicts with z=true.  Haskell's `applyEqStore`
-        // (EquationStore.hs:252-271) re-unifies each variant against the
-        // new free subst via Maude and drops variants whose Maude call
-        // returns no unifier.  Without this re-filter, both variants
-        // survive, the wrong one (variant [0], untyped signature) gets
-        // picked first by solve_split_goal, and the In premise's
-        // `signature → sign(...)` narrowing is lost.
-        //
-        // Passing an EMPTY asubst makes apply_eq_store re-unify variants
-        // against the existing free subst (new_subst = empty ∘ self.subst
-        // = self.subst).  Variants whose Maude call returns no unifier
-        // are dropped.  If only one variant remains, fold it via
-        // simp_with_fresh_avoiding so its bindings propagate to rule
-        // terms via the subsequent exploit_prems.
-        let folded;
-        // HS-faithful (Reduction.hs ~770): `solveRuleConstraints` flow is
+        // HS-faithful order (Reduction.hs:968-979): `solveRuleConstraints
+        // (Just eqConstr)` is
         //   (eqs, splitId) <- addRuleVariants eqConstr <$> getM sEqStore
-        //   insertGoal (SplitG splitId) False
+        //   insertGoal (SplitG splitId) False               -- BEFORE simp!
         //   setM sEqStore =<< simp hnd (const (const False)) eqs
-        // — NO apply_eq_store re-filter between addRuleVariants and simp.
+        //   noContradictoryEqStoreLabeled "solveRuleConstraints"
+        // — the `insertGoal` happens BEFORE `simp` and ALWAYS bumps
+        // `sNextGoalNr`, even when simp later folds the singleton variant
+        // disj into the free subst (`simpSingleton` collapses
+        // `Disj [emptySubstVFresh]` for non-destructor rules, so the
+        // SplitG ends up orphaned and `removeSolvedSplitGoals` deletes
+        // it later — but the gsNr bump persists).  Doing simp FIRST and
+        // skipping `insert_goal` when folded under-bumps the counter,
+        // desynchronising RS's gsNr trace from HS's at every
+        // destructor-free `labelNodeId` call.
+        //
         // Previously RS called apply_eq_store(maude, empty_subst) here to
         // drop variants conflicting with the existing free subst (added
-        // for TESLA::authentic — see [[project-h16-1-variant-orient-hs-faithful]]).
-        // That's HS-unfaithful: HS lets simp's own passes (simp_singleton +
+        // for TESLA::authentic — see
+        // [[project-h16-1-variant-orient-hs-faithful]]).  That's
+        // HS-unfaithful: HS lets simp's own passes (simp_singleton +
         // friends) handle the propagation.  Removed 2026-05-28 to restore
         // HS faithfulness; regressions allowed per project policy.
-        // Haskell-faithful: ALWAYS run simp after add_disj.  Mirrors
-        // `setM sEqStore =<< simp hnd (const (const False)) eqs` at the
-        // tail of `solveRuleConstraints` (Reduction.hs).  Even when the
-        // variant disj stays multi-valued, simp's `simpAbstractSortedVar`
-        // pass extracts the common factor `{v → ~witness:NarrowerSort}`
-        // into the free subst — narrowing rule body Msg-vars whose every
-        // variant image is a Fresh-sorted var.
         //
         // NOTE 2026-05-22 sess 10: simp_abstract_sorted_var is now wired
         // but currently a no-op for protocol variants because Rust's
@@ -1148,6 +1130,8 @@ impl<'ctx> Reduction<'ctx> {
         // from Maude) will let this pass narrow rule body Msg-vars to
         // Fresh witnesses, fixing the TLS Rule_case_N cluster
         // (impossible_chain skip on Msg-var chain conc).
+        self.insert_goal(Goal::Split(id));
+        let folded;
         {
             use tamarin_term::lterm::HasFrees;
             let mut sys_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar>
@@ -1177,17 +1161,15 @@ impl<'ctx> Reduction<'ctx> {
             );
             // eq_store simp can rewrite/drop subst entries → max may lower.
             self.sys.invalidate_max_var_idx_cache();
-            // Check if our disj was folded (singleton case).
+            // Check if our disj was folded (singleton case).  HS leaves
+            // the orphaned SplitG goal in `sGoals` until the next
+            // `removeSolvedSplitGoals` call (Reduction.hs:666-671) which
+            // is invoked from the simplifier loop — so we don't strip
+            // the goal here, matching HS's lazy cleanup.
             folded = !self.sys.eq_store.conj.iter().any(|d| d.split_id == id);
             if folded {
                 self.subst_system();
             }
-        }
-        // Only insert the Goal::Split if the disj wasn't already folded.
-        // If we folded it, the SplitG goal would be orphaned (perform_split
-        // would return None → Contradictory).
-        if !folded {
-            self.insert_goal(Goal::Split(id));
         }
         self.changed = ChangeIndicator::Changed;
         // HS-faithful: `noContradictoryEqStoreLabeled "solveRuleConstraints"`

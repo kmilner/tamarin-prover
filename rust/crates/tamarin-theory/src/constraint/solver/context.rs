@@ -606,29 +606,50 @@ impl ProofContext {
         // SplitG variants is the Haskell-faithful path
         // (`someRuleACInst` + `solveRuleConstraints` from Rule.hs:933 /
         // Reduction.hs:766-774).  Always on — there is no legacy fallback.
+        //
+        // HS-faithful (RuleVariants.hs:75-129): `variantsProtoRule` runs
+        // UNCONDITIONALLY for every closed protocol rule.  For rules with no
+        // reducible-headed sub-terms, the variant disjunction collapses to
+        // `Disj [emptySubstVFresh]` (the `trueDisj` constant at
+        // RuleVariants.hs:158); `someRuleACInst` (Rule.hs:940-955) then
+        // returns `Just (Disj [emptySubstVFresh])` for EVERY ProtoRule, so
+        // `solveRuleConstraints (Just trueDisj)` (Reduction.hs:967-979) still
+        // calls `insertGoal (SplitG splitId) False` — bumping `sNextGoalNr`
+        // by 1 at every `labelNodeId` call regardless of whether the rule has
+        // any destructors.  Skipping the variant-substs computation for
+        // non-destructor rules under-bumped that counter and desynchronised
+        // RS's gsNr trace from HS's at every destructor-free `labelNodeId`
+        // (e.g. Yubikey.spthy::Server, Yubikey.spthy::Setup), which the
+        // smart-rank tie-breaker then resolved differently.
         if !var_disabled {
             for (idx, o) in rules.iter().enumerate() {
                 if !o.variants.is_empty() { continue; }
-                if !rule_has_reducible(&o.rule) { continue; }
-                if let Ok(vs) = crate::tools::rule_variants::expand_rule_variants(
-                    &maude, &o.rule, &reducible_syms) {
-                    if !vs.is_empty() {
-                        if dbg_variants {
-                            eprintln!("[VARIANTS] rule={:?} expanded into {} variants",
-                                o.rule.info.name, vs.len());
-                            for (i, v) in vs.iter().enumerate() {
-                                eprintln!("  [{}] concs: {:?}", i,
-                                    v.conclusions.iter()
-                                        .map(|c| format!("{:?}={:?}", c.tag, c.terms))
-                                        .collect::<Vec<_>>());
+                // Pre-applied variant *rules* (legacy path) and the
+                // abstracted-rule form only make sense when the rule has
+                // reducible-headed sub-terms — otherwise they degenerate to
+                // duplicates of the canonical rule.
+                let has_reducible = rule_has_reducible(&o.rule);
+                if has_reducible {
+                    if let Ok(vs) = crate::tools::rule_variants::expand_rule_variants(
+                        &maude, &o.rule, &reducible_syms) {
+                        if !vs.is_empty() {
+                            if dbg_variants {
+                                eprintln!("[VARIANTS] rule={:?} expanded into {} variants",
+                                    o.rule.info.name, vs.len());
+                                for (i, v) in vs.iter().enumerate() {
+                                    eprintln!("  [{}] concs: {:?}", i,
+                                        v.conclusions.iter()
+                                            .map(|c| format!("{:?}={:?}", c.tag, c.terms))
+                                            .collect::<Vec<_>>());
+                                }
                             }
+                            let lb = o.loop_breakers.clone();
+                            let mut vs = vs;
+                            for v in vs.iter_mut() {
+                                v.info.loop_breakers = lb.clone();
+                            }
+                            computed_variants.push((idx, vs));
                         }
-                        let lb = o.loop_breakers.clone();
-                        let mut vs = vs;
-                        for v in vs.iter_mut() {
-                            v.info.loop_breakers = lb.clone();
-                        }
-                        computed_variants.push((idx, vs));
                     }
                 }
                 // Compute the variant substitutions in their raw form
@@ -636,6 +657,14 @@ impl ProofContext {
                 // will be installed as a SplitG goal at search time via
                 // `solve_rule_constraints`, mirroring Haskell's
                 // `solveRuleConstraints` (Reduction.hs:766-774).
+                //
+                // HS-faithful: ALWAYS attempt the computation, even for
+                // non-destructor rules where the result is `[emptySubstVFresh]`
+                // (`trueDisj`, RuleVariants.hs:158).  The downstream
+                // `solve_rule_constraints` path treats `Some([empty])` as a
+                // trivial-but-real Split that bumps `next_goal_nr` and lets
+                // simp's `simp_singleton` fold the disj — matching HS's
+                // `insertGoal (SplitG _) False ; simp _ _ eqs` order.
                 if let Ok(substs) = crate::tools::rule_variants::variant_substs_for_rule(
                     &maude, &o.rule) {
                     if !substs.is_empty() {
@@ -649,12 +678,15 @@ impl ProofContext {
                 // disjunction is keyed by those.  Without this, the
                 // canonical rule's destructor restrictions fire on
                 // un-narrowed forms and contradict before the SplitG
-                // can resolve.
-                if let Ok(Some((abstr, av_substs))) =
-                    crate::tools::rule_variants::abstract_rule_and_variants(
-                        &maude, &o.rule)
-                {
-                    computed_abstracted_rules.push((idx, abstr, av_substs));
+                // can resolve.  Only meaningful when the rule has
+                // reducible-headed sub-terms.
+                if has_reducible {
+                    if let Ok(Some((abstr, av_substs))) =
+                        crate::tools::rule_variants::abstract_rule_and_variants(
+                            &maude, &o.rule)
+                    {
+                        computed_abstracted_rules.push((idx, abstr, av_substs));
+                    }
                 }
             }
         }
