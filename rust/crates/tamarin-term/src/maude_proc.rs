@@ -272,6 +272,23 @@ impl std::fmt::Debug for MaudeHandle {
 impl MaudeHandle {
     /// Start a new Maude process and load the theory module for `sig`.
     pub fn start(maude_path: &str, sig: MaudeSig) -> Result<Self, MaudeError> {
+        // stderr: INHERIT, not pipe.  HS uses `runInteractiveCommand`
+        // (System.Process), which by default inherits stderr from the
+        // parent (see Process.hs:115 — only stdin/stdout are piped via
+        // the returned (hin, hout, herr, hproc); herr ends up bound to
+        // the parent's stderr handle since `runInteractiveCommand`
+        // forwards stderr to the parent terminal).
+        //
+        // We MUST mirror that: if we pipe stderr but never drain it,
+        // Maude eventually fills the ~64KB stderr pipe buffer (e.g.
+        // bilinear-pairing examples like `ake/bilinear/Scott.spthy`
+        // trigger Maude diagnostic chatter), then blocks in `write(2)`
+        // on stderr.  Our reader thread is meanwhile blocked in
+        // `read(2)` on stdout waiting for the prompt that Maude will
+        // never reach.  Classic pipe-buffer deadlock — verified on
+        // Scott.spthy::key_secrecy where the RS process sat at 0% CPU
+        // for 55s of a 60s timeout while Maude's wchan was
+        // `anon_pipe_write` and the RS reader was `anon_pipe_read`.
         let mut child = Command::new(maude_path)
             .arg("-interactive")
             .arg("-no-tecla")
@@ -280,7 +297,7 @@ impl MaudeHandle {
             .arg("-batch")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| MaudeError::Spawn(format!("{}: {}", maude_path, e)))?;
         let stdin = child.stdin.take().expect("piped stdin");

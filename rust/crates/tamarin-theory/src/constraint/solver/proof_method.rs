@@ -270,6 +270,22 @@ pub fn exec_proof_method(
     use crate::constraint::solver::reduction::{ChangeIndicator, GoalCases, Reduction};
     use crate::constraint::solver::simplify::simplify_system;
 
+    // Deadline short-circuit (entry-guard).  Without this, a single
+    // `exec_proof_method` invocation that internally enumerates many
+    // Maude unifiers / source-case branches (e.g. bilinear-pairing
+    // examples with large variant tables) can run for many seconds
+    // before any caller checks the deadline.  Returning `None` signals
+    // "no method applicable" — the caller in `expand_inner` then walks
+    // the rest of the candidate list, all of which also return `None`,
+    // and the node becomes `Sorry: no method`.  The next call up the
+    // recursion checks the deadline at the top of `expand_inner` (line
+    // 441 in search.rs) and bails to `Sorry: deadline reached`.
+    // Combined, this bounds the post-deadline runtime to O(depth) rather
+    // than O(remaining-work-in-current-method).
+    if crate::constraint::solver::search::deadline_reached() {
+        return None;
+    }
+
     // HS-faithful per-step Maude counter reset (ProofMethod.hs:443):
     //   `runReduction (m <* simplifySystem) ctxt sys (avoid sys)`
     // The FreshT counter starts at `avoid sys + 1` for EVERY proof step.
