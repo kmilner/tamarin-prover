@@ -1185,7 +1185,7 @@ fn has_top_pair_inv_prod(t: &tamarin_term::lterm::LNTerm) -> bool {
 /// matches `probablyConstructible` exactly and is strictly more
 /// conservative than `currentlyDeducible` (so the decision-tree
 /// sort still partitions correctly).
-fn goal_usefulness(g: &Goal, looping: bool, sys: &System) -> Usefulness {
+pub fn goal_usefulness(g: &Goal, looping: bool, sys: &System) -> Usefulness {
     if looping { return Usefulness::LoopBreaker; }
     if let Goal::Action(i, fa) = g {
         if fa.is_ku() {
