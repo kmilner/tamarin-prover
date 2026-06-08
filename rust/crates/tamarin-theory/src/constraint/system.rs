@@ -327,7 +327,13 @@ impl System {
         let age = self.next_goal_nr;
         self.next_goal_nr = self.next_goal_nr.wrapping_add(1);
         if std::env::var("TAM_RS_DBG_INSERT_GOAL").is_ok() {
-            eprintln!("[RS_INS_GOAL] gsNr={} solved=false loops=false goal={:?}", age, g);
+            let in_pre = crate::constraint::solver::sources::in_precompute_mode()
+                || crate::constraint::solver::sources::in_initial_source_cases();
+            let want_pre = std::env::var("TAM_RS_DBG_INSERT_GOAL_INCLUDE_PRECOMPUTE").is_ok();
+            if !in_pre || want_pre {
+                let tag = if in_pre { "<precompute>" } else { "<proof>" };
+                eprintln!("[RS_INS_GOAL] lemma={} gsNr={} solved=false loops=false goal={:?}", tag, age, g);
+            }
         }
         if !self.goals.iter().any(|(existing, _)| existing == &g) {
             let mut st = GoalStatus::default();
@@ -374,7 +380,13 @@ impl System {
         let age = self.next_goal_nr;
         self.next_goal_nr = self.next_goal_nr.wrapping_add(1);
         if std::env::var("TAM_RS_DBG_INSERT_GOAL").is_ok() {
-            eprintln!("[RS_INS_GOAL] gsNr={} solved=false loops={} goal={:?}", age, looping, g);
+            let in_pre = crate::constraint::solver::sources::in_precompute_mode()
+                || crate::constraint::solver::sources::in_initial_source_cases();
+            let want_pre = std::env::var("TAM_RS_DBG_INSERT_GOAL_INCLUDE_PRECOMPUTE").is_ok();
+            if !in_pre || want_pre {
+                let tag = if in_pre { "<precompute>" } else { "<proof>" };
+                eprintln!("[RS_INS_GOAL] lemma={} gsNr={} solved=false loops={} goal={:?}", tag, age, looping, g);
+            }
         }
         let canon_g = canonical_goal_for_dedup(&g);
         let is_new = !self.goals.iter().any(|(existing, _)|
