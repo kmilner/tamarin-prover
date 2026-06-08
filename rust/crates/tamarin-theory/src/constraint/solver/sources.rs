@@ -8929,15 +8929,26 @@ fn compute_compare_systems_key(
     for s in &lemmas_renamed { out.push_str(s); out.push(';'); }
     out.push(']');
     // GOALS (deterministic order, renamed-var keyed).
+    // HS structural Ord on System includes `_sGoals :: Map Goal
+    // GoalStatus` — both the Goal key AND the GoalStatus value
+    // participate.  GoalStatus = (gsSolved, gsNr, gsLoopBreaker)
+    // per System.hs:370-380.  RS previously stripped GoalStatus,
+    // making cases with the same goals but different goal-status
+    // (e.g. different gsNr from differing creation order) compare
+    // equal — under-discriminating per HS.  Include status fields.
     out.push_str(";GOALS:[");
-    let mut goal_strs: Vec<String> = sys.goals.iter().map(|(g, _st)| {
+    let mut goal_strs: Vec<String> = sys.goals.iter().map(|(g, st)| {
         let mut s = String::new();
         write_goal_to_key(g, &rename, &mut s);
+        let _ = write!(s, ":st={},{},{}", st.solved, st.nr, st.looping);
         s
     }).collect();
     goal_strs.sort();
     for s in &goal_strs { out.push_str(&s); out.push(';'); }
     out.push(']');
+    // HS also includes `_sNextGoalNr :: Integer` in the structural Ord
+    // (System.hs:394).  Include for faithfulness.
+    let _ = write!(out, ";NEXT_NR={}", sys.next_goal_nr);
     // SOURCE KIND / DIFF — affect compareSystemsUpToNewVars only via
     // structural fallthrough when m != False.
     let _ = write!(out, ";SK={:?};SIDE={:?}", sys.source_kind, sys.side);
