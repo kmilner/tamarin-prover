@@ -241,10 +241,23 @@ pub fn rename_precise_system(sys: &mut System) {
     }
 
     // 4. Less atoms.
-    for la in sys.less_atoms.iter_mut() {
+    //
+    // HS-faithful dedup post-rename: HS's `sLessAtoms :: Set LessAtom`
+    // is reconstructed via `S.map (apply subst)` on every rewrite,
+    // collapsing duplicates whose images coincide.  Mirror by deduping
+    // after the in-place rename.  See `subst_system_once`'s comment for
+    // detailed rationale.
+    let mut new_less: Vec<crate::constraint::constraints::LessAtom>
+        = Vec::with_capacity(sys.less_atoms.len());
+    for la in std::mem::take(&mut sys.less_atoms) {
+        let mut la = la;
         la.smaller = map_var(la.smaller.clone());
         la.larger  = map_var(la.larger.clone());
+        if !new_less.iter().any(|x| x == &la) {
+            new_less.push(la);
+        }
     }
+    sys.less_atoms = new_less;
 
     // 5. Goals — per-variant rewrite.
     let goals = std::mem::take(&mut sys.goals);
