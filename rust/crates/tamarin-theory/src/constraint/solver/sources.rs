@@ -7658,6 +7658,23 @@ fn apply_source_case_premise(
         }
     }
 
+    // TAM_RS_TRACE_APPLY_SRC_PREM=1: dump per-case match unifier so HS↔RS
+    // unifier-selection diffs are visible.  Logs the live goal, the case
+    // being applied, and the match_pairs (the substitution produced by
+    // matchToGoal / refineSubst-input).  Pair with HS's same flag.
+    if std::env::var("TAM_RS_TRACE_APPLY_SRC_PREM").is_ok() {
+        let path = crate::constraint::solver::trace::case_path_string();
+        let live_fact = format!("{:?}", fa_live);
+        let live_fact = live_fact.chars().take(220).collect::<String>();
+        eprintln!("[APPLY_SRC_PREM] path={} live={}@{:?}.p{} case={}",
+            path, live_fact, live_node, live_prem_idx.0, case_label);
+        for (v, t) in &match_pairs {
+            let t_str = format!("{:?}", t).chars().take(200).collect::<String>();
+            eprintln!("[APPLY_SRC_PREM]   subst {}.{}/{:?} -> {}",
+                v.name, v.idx, v.sort, t_str);
+        }
+    }
+
     // A.3 — refineSubst: solveSubstEqs SplitNow subst >> substSystem.
     let mut refined = Reduction::new(ctx, renamed_case);
     // H15.1 (2026-05-28): same flip as in apply_source_case_action.
