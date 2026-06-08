@@ -160,11 +160,20 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
     if _ctxt.maude.maude_sig().enable_dh && has_forbidden_exp(sys) {
         out.push(Contradiction::ForbiddenExp);
     }
-    // ForbiddenBP — still unported (the BP-using corpus is small).
-    // Despite the original "Maude-dependent" comment, the HS BP
-    // check is structural (Contradictions.hs:357-388 mirrors the
-    // ForbiddenExp shape over `em`/`pmult`/`one`) and a future port
-    // can follow the ForbiddenExp pattern.
+    // HS-faithful port: ForbiddenBP (Contradictions.hs:149 +
+    // 392-483).  Drops Pmult-down / Emap-down rule instances violating
+    // BP normal-form (redundant scalars, simplifiable em-then-exp
+    // compositions, tag-order violations on Emap's two protocol
+    // providers).  Gated on enableBP.
+    //
+    // Triggering case Chen_Kudla::key_agreement_reachable:
+    // RS's variant fan-out at saturate (`solve_chain_goal` produces
+    // one case per variant arm) leaks KGC_Setup / Init_1 source-case
+    // variants that HS would drop here.  Without this check the
+    // proof divergence at `case Resp_1` is masked by extra siblings.
+    if _ctxt.maude.maude_sig().enable_bp && has_forbidden_bp(sys) {
+        out.push(Contradiction::ForbiddenBP);
+    }
     out.extend(node_after_last(sys));
     out.extend(non_injective_fact_instances(_ctxt, sys));
     out
@@ -986,6 +995,306 @@ fn has_forbidden_exp(sys: &System) -> bool {
         }
     }
     false
+}
+
+/// `hasForbiddenBP` — port of Haskell's
+/// `Theory.Constraint.Solver.Contradictions.hasForbiddenBP`
+/// (`Contradictions.hs:392-396`).  Gated on `enableBP` at the caller.
+///
+/// Detects three non-normal bilinear-pairing rule instance patterns:
+///   1. `isForbiddenDPMult`: `Pmult-down` with redundant scalar
+///      (Contradictions.hs:400-411).
+///   2. `isForbiddenDEMap`:  `Emap-down` → `Exp-down` simplifiable
+///      composition (Contradictions.hs:427-446).
+///   3. `isForbiddenDEMapOrder`: `Emap-down` premise ordering
+///      violating tag-priority normal form
+///      (Contradictions.hs:454-483).
+///
+/// First found case suffices to flag the system contradictory.
+///
+/// Triggering example: Chen_Kudla::key_agreement_reachable.  RS's
+/// variant fan-out (vs HS's deferred SplitG) produced extra KGC_Setup
+/// and Init_1 source cases at runtime that HS dropped via
+/// `hasForbiddenBP` (the d_pmult case applied to a KGC_Setup chain
+/// is overcomplicated under HS's normal-form).  Without this port,
+/// RS kept 5 cases where HS keeps 2 — diverging the proof shape.
+fn has_forbidden_bp(sys: &System) -> bool {
+    if sys.nodes.iter().any(|(_, ru)| is_forbidden_d_pmult(ru)) {
+        if std::env::var("TAM_RS_DBG_FORBIDDEN_BP").is_ok() {
+            eprintln!("[FORBIDDEN_BP] dPMult fired");
+        }
+        return true;
+    }
+    if sys.nodes.iter().any(|(i, ru)| is_forbidden_d_emap(sys, i, ru)) {
+        if std::env::var("TAM_RS_DBG_FORBIDDEN_BP").is_ok() {
+            eprintln!("[FORBIDDEN_BP] dEMap fired");
+        }
+        return true;
+    }
+    if sys.nodes.iter().any(|(i, ru)| is_forbidden_d_emap_order(sys, i, ru)) {
+        if std::env::var("TAM_RS_DBG_FORBIDDEN_BP").is_ok() {
+            eprintln!("[FORBIDDEN_BP] dEMapOrder fired");
+        }
+        return true;
+    }
+    false
+}
+
+/// `isForbiddenDPMult` — Contradictions.hs:400-411.
+///
+/// A `Pmult-down` rule of shape `[KD(pmult(s,p)), KU(b)] → [KD(pmult(c,p))]`
+/// is forbidden when:
+///   - `p` never contains fresh/private terms, AND
+///   - every non-inverse factor of `c` is also a non-inverse factor of `b`.
+fn is_forbidden_d_pmult<I>(ru: &crate::rule::Rule<crate::rule::RuleInfo<I, crate::rule::IntrRuleACInfo>>) -> bool {
+    use tamarin_term::function_symbols::{FunSym, PMULT_SYM_STRING};
+    use tamarin_term::term::Term;
+
+    if ru.premises.len() != 2 { return false; }
+    if ru.conclusions.len() != 1 { return false; }
+
+    let p1 = &ru.premises[0];
+    let p2 = &ru.premises[1];
+    let conc = &ru.conclusions[0];
+
+    // p1 = KD(pmult(_, p))
+    let (dt1, p1_term) = match bp_k_fact_view(p1) { Some(x) => x, None => return false };
+    if dt1 != BpDirTag::Dn { return false; }
+    let _p = match bp_view_pmult(p1_term) { Some((_s, p)) => p, None => return false };
+    // p2 = KU(b)
+    let (dt2, b) = match bp_k_fact_view(p2) { Some(x) => x, None => return false };
+    if dt2 != BpDirTag::Up { return false; }
+    // conc = KD(pmult(c, p))
+    let (dtc, conc_term) = match bp_k_fact_view(conc) { Some(x) => x, None => return false };
+    if dtc != BpDirTag::Dn { return false; }
+    let (c, p_conc) = match bp_view_pmult(conc_term) { Some(x) => x, None => return false };
+
+    // Pre-filter: only Pmult-down rules.
+    if !crate::rule::is_d_pmult_rule(ru) { return false; }
+    // Drop the unused binding warning.
+    let _ = (Term::Lit::<()> as fn(_) -> _, FunSym::NoEq, PMULT_SYM_STRING);
+
+    if !never_contains_fresh_priv(p_conc) { return false; }
+    bp_factors_subset(c, b)
+}
+
+/// `isForbiddenDEMap` — Contradictions.hs:427-446.
+///
+/// A `dExp` rule whose first premise's provider is a `dEMap` rule
+/// instance, where the EMap's `[s]P / [r]Q` premises are
+/// "overcomplicated" relative to the `dExp`'s `ke` exponent.
+fn is_forbidden_d_emap(sys: &System,
+                       i: &crate::constraint::constraints::NodeId,
+                       ru_exp: &crate::rule::Rule<crate::rule::RuleInfo<
+                           crate::rule::ProtoRuleACInstInfo,
+                           crate::rule::IntrRuleACInfo>>) -> bool {
+    use crate::rule::PremIdx;
+    use crate::rule::is_d_exp_rule;
+    use crate::rule::is_d_emap_rule;
+    if !is_d_exp_rule(ru_exp) { return false; }
+    if ru_exp.premises.len() != 2 { return false; }
+
+    // ke_f := premIdx 1 of the dExp rule
+    let ke_f = &ru_exp.premises[1];
+    let (dt_ke, ke) = match bp_k_fact_view(ke_f) { Some(x) => x, None => return false };
+    if dt_ke != BpDirTag::Up { return false; }
+
+    // Find the edge ((ns,_) → (i, PremIdx 0)) i.e. the rule providing
+    // the dExp's first premise (the dEMap rule).
+    let edge_ns = sys.edges.iter().find_map(|e| {
+        if e.tgt.0 == *i && e.tgt.1 == PremIdx(0) {
+            Some(e.src.0.clone())
+        } else { None }
+    });
+    let Some(ns) = edge_ns else { return false; };
+    let Some((_, ru_emap)) = sys.nodes.iter().find(|(n, _)| n == &ns) else { return false; };
+    if !is_d_emap_rule(ru_emap) { return false; }
+    if ru_emap.premises.len() != 2 { return false; }
+
+    let sp_f = &ru_emap.premises[0];
+    let rq_f = &ru_emap.premises[1];
+    let (dt_sp, sp_term) = match bp_k_fact_view(sp_f) { Some(x) => x, None => return false };
+    if dt_sp != BpDirTag::Dn { return false; }
+    let (s_sc, p_pt) = match bp_view_pmult(sp_term) { Some(x) => x, None => return false };
+    let (dt_rq, rq_term) = match bp_k_fact_view(rq_f) { Some(x) => x, None => return false };
+    if dt_rq != BpDirTag::Dn { return false; }
+    let (r_sc, q_pt) = match bp_view_pmult(rq_term) { Some(x) => x, None => return false };
+
+    bp_over_complicated(s_sc, p_pt, ke) || bp_over_complicated(r_sc, q_pt, ke)
+}
+
+/// `isForbiddenDEMapOrder` — Contradictions.hs:454-483.
+///
+/// For a `dEMap` rule instance whose conclusion has the canonical
+/// shape `KD(exp(em(p,q), Mult([s,r])))`, find the two protocol
+/// rules feeding its premises (through an intermediate `IRecv`).
+/// Forbidden iff the first protocol rule's fact tags are strictly
+/// greater than the second's (normal-form fact-tag ordering).
+fn is_forbidden_d_emap_order(sys: &System,
+                             i: &crate::constraint::constraints::NodeId,
+                             ru: &crate::rule::Rule<crate::rule::RuleInfo<
+                                 crate::rule::ProtoRuleACInstInfo,
+                                 crate::rule::IntrRuleACInfo>>) -> bool {
+    use crate::rule::{PremIdx, is_d_emap_rule};
+    use tamarin_term::function_symbols::{AcSym, CSym, EXP_SYM_STRING, FunSym};
+    use tamarin_term::term::Term;
+    if !is_d_emap_rule(ru) { return false; }
+    if ru.premises.len() != 2 { return false; }
+    if ru.conclusions.len() != 1 { return false; }
+
+    let f_p0 = &ru.premises[0];
+    let f_p1 = &ru.premises[1];
+    let f_c0 = &ru.conclusions[0];
+
+    let (dt0, t0) = match bp_k_fact_view(f_p0) { Some(x) => x, None => return false };
+    if dt0 != BpDirTag::Dn { return false; }
+    let (s_sc, p_pt) = match bp_view_pmult(t0) { Some(x) => x, None => return false };
+
+    let (dt1, t1) = match bp_k_fact_view(f_p1) { Some(x) => x, None => return false };
+    if dt1 != BpDirTag::Dn { return false; }
+    let (r_sc, q_pt) = match bp_view_pmult(t1) { Some(x) => x, None => return false };
+
+    let (dtc, tc) = match bp_k_fact_view(f_c0) { Some(x) => x, None => return false };
+    if dtc != BpDirTag::Dn { return false; }
+
+    // tc = exp(em(p', q'), Mult([s', r', ...]))
+    let (em_t, mult_arg) = match tc {
+        Term::App(FunSym::NoEq(s), args)
+            if s.name == EXP_SYM_STRING && args.len() == 2 =>
+            (&args[0], &args[1]),
+        _ => return false,
+    };
+    let (p_p, q_p) = match em_t {
+        Term::App(FunSym::C(CSym::EMap), args) if args.len() == 2 =>
+            (&args[0], &args[1]),
+        _ => return false,
+    };
+    let mult_args: Vec<tamarin_term::lterm::LNTerm> = match mult_arg {
+        Term::App(FunSym::Ac(AcSym::Mult), args) => args.iter().cloned().collect(),
+        _ => return false,
+    };
+
+    // guard ((p,q) == (p',q') || (p,q) == (q',p'))
+    let ok_pair = (p_pt == p_p && q_pt == q_p) || (p_pt == q_p && q_pt == p_p);
+    if !ok_pair { return false; }
+    // && (mult_args \\ [s,r] == [])  — every mult_arg appears among [s,r]
+    let mut remaining: Vec<tamarin_term::lterm::LNTerm> = vec![s_sc.clone(), r_sc.clone()];
+    for a in &mult_args {
+        let Some(pos) = remaining.iter().position(|x| x == a) else { return false; };
+        remaining.remove(pos);
+    }
+    // remaining can be non-empty (HS only checks mult_args ⊆ [s,r]).
+
+    // For each premise of i, follow edge backwards through IRecv to
+    // the protocol rule.
+    let lookup_prem_provider = |k: &crate::constraint::constraints::NodeId,
+                                pi: PremIdx| -> Option<crate::constraint::constraints::NodeId> {
+        sys.edges.iter().find_map(|e|
+            if e.tgt.0 == *k && e.tgt.1 == pi { Some(e.src.0.clone()) } else { None })
+    };
+    let j1 = lookup_prem_provider(i, PremIdx(0));
+    let j2 = lookup_prem_provider(i, PremIdx(1));
+    let (Some(j1), Some(j2)) = (j1, j2) else { return false; };
+
+    let ru_proto1 = lookup_prem_provider(&j1, PremIdx(0))
+        .and_then(|n| sys.nodes.iter().find(|(nn, _)| nn == &n).map(|(_, r)| r));
+    let ru_proto2 = lookup_prem_provider(&j2, PremIdx(0))
+        .and_then(|n| sys.nodes.iter().find(|(nn, _)| nn == &n).map(|(_, r)| r));
+    let (Some(rp1), Some(rp2)) = (ru_proto1, ru_proto2) else { return false; };
+
+    // isStandRule: standard protocol rule (not Intr/Fresh/Pub).
+    use crate::rule::{ProtoRuleACInstInfo, ProtoRuleName, RuleInfo};
+    let is_stand = |r: &crate::rule::Rule<RuleInfo<ProtoRuleACInstInfo, crate::rule::IntrRuleACInfo>>|
+        -> bool {
+        match &r.info {
+            RuleInfo::Proto(p) => matches!(p.name, ProtoRuleName::Stand(_)),
+            _ => false,
+        }
+    };
+    if !is_stand(rp1) || !is_stand(rp2) { return false; }
+
+    // factTags ruProto1 > factTags ruProto2
+    let tags_of = |r: &crate::rule::Rule<RuleInfo<ProtoRuleACInstInfo, crate::rule::IntrRuleACInfo>>|
+        -> Vec<crate::fact::FactTag> {
+        let mut out = Vec::new();
+        for f in r.premises.iter().chain(r.conclusions.iter()).chain(r.actions.iter()) {
+            out.push(f.tag.clone());
+        }
+        out
+    };
+    tags_of(rp1) > tags_of(rp2)
+}
+
+/// `kFactView` (BP scope): returns (DirTag, term) for KU / KD facts.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum BpDirTag { Up, Dn }
+fn bp_k_fact_view<'a>(fa: &'a crate::fact::LNFact)
+    -> Option<(BpDirTag, &'a tamarin_term::lterm::LNTerm)>
+{
+    use crate::fact::FactTag;
+    if fa.terms.len() != 1 { return None; }
+    match fa.tag {
+        FactTag::Ku => Some((BpDirTag::Up, &fa.terms[0])),
+        FactTag::Kd => Some((BpDirTag::Dn, &fa.terms[0])),
+        _ => None,
+    }
+}
+
+/// View `pmult(scalar, point)` — returns `(scalar, point)`.
+fn bp_view_pmult(t: &tamarin_term::lterm::LNTerm)
+    -> Option<(&tamarin_term::lterm::LNTerm, &tamarin_term::lterm::LNTerm)>
+{
+    use tamarin_term::function_symbols::{FunSym, PMULT_SYM_STRING};
+    use tamarin_term::term::Term;
+    if let Term::App(FunSym::NoEq(s), args) = t {
+        if s.name == PMULT_SYM_STRING && args.len() == 2 {
+            return Some((&args[0], &args[1]));
+        }
+    }
+    None
+}
+
+/// Non-inverse factors of a term — see `ni_factors` inside
+/// `has_forbidden_exp`.  Duplicated here for BP-scope use.
+fn bp_ni_factors(t: &tamarin_term::lterm::LNTerm) -> Vec<tamarin_term::lterm::LNTerm> {
+    use tamarin_term::function_symbols::{AcSym, FunSym, INV_SYM_STRING};
+    use tamarin_term::term::Term;
+    match t {
+        Term::App(FunSym::Ac(AcSym::Mult), args) => {
+            let mut out = Vec::new();
+            for a in args.iter() { out.extend(bp_ni_factors(a)); }
+            out
+        }
+        Term::App(FunSym::NoEq(s), args)
+            if s.name == INV_SYM_STRING && args.len() == 1 =>
+            bp_ni_factors(&args[0]),
+        _ => vec![t.clone()],
+    }
+}
+
+/// `niFactors c \\ niFactors b == []`: every non-inverse factor of `c`
+/// appears in `b`'s non-inverse factors (multiset semantics).
+fn bp_factors_subset(c: &tamarin_term::lterm::LNTerm,
+                     b: &tamarin_term::lterm::LNTerm) -> bool {
+    let nfc = bp_ni_factors(c);
+    let nfb = bp_ni_factors(b);
+    let mut remaining = nfb.clone();
+    for x in &nfc {
+        if let Some(pos) = remaining.iter().position(|y| y == x) {
+            remaining.remove(pos);
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// `overComplicated scalar point ke` — Contradictions.hs:445-446.
+///   `(niFactors scalar \\ niFactors ke == []) && neverContainsFreshPriv point`
+fn bp_over_complicated(scalar: &tamarin_term::lterm::LNTerm,
+                       point: &tamarin_term::lterm::LNTerm,
+                       ke: &tamarin_term::lterm::LNTerm) -> bool {
+    bp_factors_subset(scalar, ke) && never_contains_fresh_priv(point)
 }
 
 /// Direct port of Haskell's `nonInjectiveFactInstances`
