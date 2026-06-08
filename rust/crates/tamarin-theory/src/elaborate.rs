@@ -978,7 +978,33 @@ pub fn lnterm_to_term(t: &tamarin_term::lterm::LNTerm) -> p::Term {
                         p::Term::App(name.to_string(), parser_args)
                     }
                 }
-                FunSym::C(_) | FunSym::List => {
+                FunSym::C(c) => {
+                    // HS-faithful: round-trip a C-symbol (bilinear-pairing
+                    // `em`) back through the parser AST under its proper
+                    // builtin name so a later `term_to_lnterm` rebuilds it
+                    // as `FunSym::C(EMap)` (via the `em` gate at
+                    // elaborate.rs:1201).  Without this, `lnterm_to_term`
+                    // emits `App("?", [a,b])` which `term_to_lnterm` rebuilds
+                    // as `NoEqSym(name="?", arity=2, Public, Constructor)` —
+                    // Maude rejects `tamXC?` as a bad token, returns empty
+                    // for every `match in MSG` over a guard that mentions
+                    // `em`, and `insert_implied_formulas_pass` silently
+                    // fails to instantiate the implications.  Symptom on
+                    // Scott::key_secrecy: lemma verifies in HS but RS
+                    // terminates `SOLVED // trace found` (wrong verdict).
+                    // Mirrors HS's `viewTerm` round-trip via `FApp (C EMap)`
+                    // followed by `naryOpApp` at Theory/Text/Parser/Term.hs:92.
+                    use tamarin_term::function_symbols::CSym;
+                    let name = match c {
+                        CSym::EMap => {
+                            String::from_utf8(
+                                tamarin_term::function_symbols::EMAP_SYM_STRING.to_vec()
+                            ).unwrap()
+                        }
+                    };
+                    p::Term::App(name, parser_args)
+                }
+                FunSym::List => {
                     let name = "?".to_string();
                     p::Term::App(name, parser_args)
                 }
