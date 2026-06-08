@@ -3,6 +3,7 @@
 {-# LANGUAGE TupleSections      #-}
 {-# LANGUAGE LambdaCase         #-}
 {-# LANGUAGE DoAndIfThenElse    #-}
+{-# LANGUAGE BangPatterns       #-}
 -- |
 -- Copyright   : (c) 2010-2012 Benedikt Schmidt & Simon Meier
 -- License     : GPL v3 (see LICENSE)
@@ -532,13 +533,42 @@ insertImpliedFormulas :: Reduction ChangeIndicator
 insertImpliedFormulas = do
     sys <- gets id
     hnd <- getMaudeHandle
+    let !_ = Unsafe.unsafePerformIO $ do
+          target <- SysEnv.lookupEnv "TAM_HS_DBG_IMPL_PATH"
+          case target of
+            Just t -> do
+              path <- T.casePathString <$> T.getCasePath
+              if path == t
+                then do
+                  putStrLn $ "[HS_IMPL_PATH_DUMP] path=" ++ path ++ " sys_actions=["
+                  mapM_ (\(i, fa) -> putStrLn ("  [" ++ show i ++ "] " ++ show fa)) (zip [(0::Int)..] (allActions sys))
+                  putStrLn $ "] formulas=" ++ show (S.size (get sFormulas sys))
+                              ++ " lemmas=" ++ show (S.size (get sLemmas sys))
+                              ++ " solved_formulas=" ++ show (S.size (get sSolvedFormulas sys))
+                  -- Dump the goals so we can see what's open
+                  putStrLn "[HS_IMPL_PATH_DUMP] open_goals=["
+                  mapM_ (\(g, st) ->
+                      putStrLn ("  " ++ show g ++ " " ++ show st))
+                      (M.toAscList (get sGoals sys))
+                  putStrLn "]"
+                else pure ()
+            Nothing -> pure ()
     applyChangeList $ do
         clause  <- (S.toList $ get sFormulas sys) ++
                    (S.toList $ get sLemmas sys)
         implied <- impliedFormulas hnd sys clause
         if ( implied `S.notMember` get sFormulas sys &&
              implied `S.notMember` get sSolvedFormulas sys )
-          then (if hsTraceFire then trace ("[IMPL-FIRE]" ++
+          then (let dbgImpl = Unsafe.unsafePerformIO $
+                      maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_DBG_IMPL_FIRE"
+                    pathStr = Unsafe.unsafePerformIO $
+                      T.casePathString <$> T.getCasePath
+                in if dbgImpl
+                   then trace ("[HS_IMPL_FIRE] path=" ++ pathStr
+                              ++ " implied=" ++ show implied
+                              ++ " from_clause=" ++ show clause) id
+                   else id) $
+               (if hsTraceFire then trace ("[IMPL-FIRE]" ++
                       "\n  clause:  " ++ show clause ++
                       "\n  clause-frees: " ++ show (frees clause) ++
                       "\n  implied: " ++ show implied ++
