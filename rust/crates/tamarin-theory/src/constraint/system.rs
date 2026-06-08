@@ -371,6 +371,20 @@ impl System {
         let age = self.next_goal_nr;
         self.next_goal_nr = self.next_goal_nr.wrapping_add(1);
         let canon_g = canonical_goal_for_dedup(&g);
+        let is_new = !self.goals.iter().any(|(existing, _)|
+            canonical_goal_for_dedup(existing) == canon_g);
+        if std::env::var("TAM_RS_TRACE_GOAL_INSERT").is_ok() {
+            let kindstr = match &g {
+                Goal::Action(i, fa) => format!("Action {:?} {:?}", i, fa),
+                Goal::Premise(p, fa) => format!("Premise {:?} {:?}", p, fa),
+                Goal::Chain(c, p) => format!("Chain {:?}->{:?}", c, p),
+                Goal::Split(sid) => format!("Split {:?}", sid),
+                Goal::Disj(_) => "Disj".to_string(),
+                Goal::Subterm(_) => "Subterm".to_string(),
+            };
+            eprintln!("[RS_GOAL_INSERT] gsNr={} isNew={} kind={}",
+                age, is_new, kindstr);
+        }
         if let Some(slot) = self.goals.iter_mut().find(|(existing, _)|
             canonical_goal_for_dedup(existing) == canon_g)
         {

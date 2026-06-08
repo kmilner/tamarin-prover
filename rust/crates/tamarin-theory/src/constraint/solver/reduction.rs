@@ -880,6 +880,39 @@ impl<'ctx> Reduction<'ctx> {
                 let new_f = apply_to_fixpoint(f);
                 if &new_f != f { *f = new_f; self.changed = ChangeIndicator::Changed; }
             }
+            // HS-faithful: `substFormulas`/`substSolvedFormulas`/`substLemmas`
+            // apply via `Apply LNSubst (Set Guarded)` (Reduction.hs:696-698),
+            // which in Haskell is `S.map (apply subst)`.  `S.map` rebuilds the
+            // Set, dropping entries that collide post-substitution.  Without
+            // this dedup, RS's Vec retains structurally-identical formulas
+            // produced by substitution-induced equality — e.g. two
+            // `impliedFormulas` matches that produced distinct
+            // `Ex.PCR_Write(h(<'pcr0',~n#1>))` and
+            // `Ex.PCR_Write(h(<'pcr0',~n#0>))` formulas which collapse to
+            // the same `Ex.PCR_Write(h(<'pcr0',~n#0>))` once eq_store binds
+            // `~n#1 → ~n#0`.  HS dedups via Set semantics; RS now mirrors.
+            //
+            // Concrete trigger: Envelope.spthy::Secret_and_Denied_exclusive
+            // at path `/.../PCR_Quote/PCR_Extend/Alice2`.  Pre-fix RS had
+            // 6 entries in solved_formulas (incl. two duplicate
+            // `Ex.PCR_Write(h(<'pcr0',~n#0>))` formulas — the second of
+            // which should have been a no-op insertFormula in HS due to
+            // Set semantics, but RS's Vec stored both since at INSERT
+            // time the duplicates differed in `~n#1` vs `~n#0` and the
+            // collision only emerged after a later substitution rewrote
+            // `~n#1 → ~n#0`).  HS had 5.  Post-fix RS matches HS at 5.
+            //
+            // Note: the Envelope proof-tree diff is unchanged by this fix
+            // alone — the divergent goal pick at the cascading
+            // `/Alice2/CreateLockedKey` state involves additional state
+            // differences (HS has Action(PCR_Write('pcr0')) goal RS lacks;
+            // upstream the smart-ranker tie-breaker on Premise(PCR/1) NRs
+            // also differs).  This fix is a real HS-faithfulness gap that
+            // happens to be load-bearing for many other lemmas via
+            // formula-count parity.
+            dedup_preserve_order(&mut self.sys.formulas);
+            dedup_preserve_order(&mut self.sys.solved_formulas);
+            dedup_preserve_order(&mut self.sys.lemmas);
         }
         // 5b. SubtermStore substitution — port of Haskell's
         // `instance Apply LNSubst SubtermStore` (`SubtermStore.hs:560-561`):
@@ -2756,6 +2789,24 @@ fn make_fresh_rule(m: tamarin_term::lterm::LNTerm) -> RuleACInst {
 /// `(name, idx)` to a parser-AST term obtained from
 /// `lnterm_to_term`.  Only entries that change are recorded
 /// (skipping identity mappings keeps the per-step subst small).
+/// Dedup a Vec in place while preserving the FIRST occurrence's position.
+///
+/// Mirrors HS's `S.map` behaviour on `Set Guarded` in `substFormulas` /
+/// `substSolvedFormulas` / `substLemmas` (Reduction.hs:696-698): when two
+/// formulas become structurally equal after substitution, `S.map` rebuilds
+/// the Set and only one survives.  Our `Vec<Guarded>` storage does NOT
+/// auto-dedup, so we need to mirror this explicitly after subst.
+fn dedup_preserve_order<T: PartialEq>(v: &mut Vec<T>) {
+    let mut i = 0;
+    while i < v.len() {
+        let mut j = i + 1;
+        while j < v.len() {
+            if v[j] == v[i] { v.remove(j); } else { j += 1; }
+        }
+        i += 1;
+    }
+}
+
 fn build_parser_subst_from_eq_store(
     subst: &crate::tools::equation_store::LNSubst,
 ) -> crate::guarded::VarSubst {

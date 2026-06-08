@@ -389,6 +389,41 @@ pub fn exec_proof_method(
             // sides, run the same theory, diff the outputs.
             crate::constraint::solver::trace::trace_state(sys);
             crate::constraint::solver::trace::trace_pick(g);
+            // TAM_RS_DBG_PICK_NR=1 (mirrors HS TAM_HS_DBG_PICK_NR):
+            // dump the picked goal's gsNr and the entire open-goal queue with
+            // their gsNrs. Lets HS↔RS comparison align picks by gsNr ordering.
+            if std::env::var("TAM_RS_DBG_PICK_NR").is_ok() {
+                use crate::constraint::constraints::Goal;
+                let pick_nr = sys.goals.iter()
+                    .find(|(eg, _)| eg == g)
+                    .map(|(_, st)| st.nr.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                let pick_kind = match g {
+                    Goal::Action(_, fa) => format!("Action {:?}", fa),
+                    Goal::Premise(_, fa) => format!("Premise {:?}", fa),
+                    Goal::Chain(_, _) => "Chain".to_string(),
+                    Goal::Split(_) => "Split".to_string(),
+                    Goal::Disj(_) => "Disj".to_string(),
+                    Goal::Subterm(_) => "Subterm".to_string(),
+                };
+                let all_open: Vec<String> = sys.goals.iter()
+                    .filter(|(_, st)| !st.solved)
+                    .map(|(eg, st)| {
+                        let k = match eg {
+                            Goal::Action(_, fa) => format!("Action({:?})", fa.tag),
+                            Goal::Premise(_, fa) => format!("Premise({:?})", fa.tag),
+                            Goal::Chain(_, _) => "Chain".to_string(),
+                            Goal::Split(_) => "Split".to_string(),
+                            Goal::Disj(_) => "Disj".to_string(),
+                            Goal::Subterm(_) => "Subterm".to_string(),
+                        };
+                        format!("#{}:{}/lb={}", st.nr, k, st.looping)
+                    })
+                    .collect();
+                let cpstr = crate::constraint::solver::trace::case_path_string();
+                eprintln!("[RS_PICK_NR] path={} #{}:{}", cpstr, pick_nr, pick_kind);
+                eprintln!("[RS_OPEN_NRS] path={} {}", cpstr, all_open.join(" ; "));
+            }
             let mut r = Reduction::new(ctx, sys.clone());
             let outcome = crate::constraint::solver::goals::dispatch_solve_goal(&mut r, g);
             if dbg_solve {
