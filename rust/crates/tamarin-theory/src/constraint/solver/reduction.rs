@@ -4322,24 +4322,34 @@ impl<'ctx> Reduction<'ctx> {
                 //
                 let mut cases = Vec::new();
                 for act in &ru.actions {
-                    let mut sys = self.sys.clone();
+                    let sys = self.sys.clone();
                     let mut sub = Reduction::new(self.ctx, sys);
                     let res = sub.solve_fact_eqs(
                         SplitStrategy::SplitNow,
                         &[tamarin_term::rewriting::Equal {
                             lhs: fa.clone(), rhs: act.clone() }]);
-                    sys = sub.sys;
-                    match res {
+                    // HS-faithful per-arm fan-out (Goals.hs:287-290).
+                    // When `solveFactEqs SplitNow` produces multiple AC
+                    // unifier arms, fan-out one branch per arm; otherwise
+                    // use `sub.sys`'s already-installed Linear eq_store.
+                    let arm_eq_stores: Vec<crate::tools::equation_store::EquationStore> = match res {
                         Err(_) | Ok(SolveOutcome::Contradictory) => continue,
-                        Ok(_) => {
-                            for (existing, status) in sys.goals.iter_mut() {
-                                if existing == &g && !status.solved {
-                                    status.solved = true;
-                                    break;
-                                }
+                        Ok(SolveOutcome::Cases(arms)) => arms,
+                        Ok(SolveOutcome::Linear(_)) =>
+                            vec![sub.sys.eq_store.clone()],
+                    };
+                    let post_sys = sub.sys.clone();
+                    for arm_eq in arm_eq_stores {
+                        let mut sys = post_sys.clone();
+                        sys.invalidate_max_var_idx_cache();
+                        sys.eq_store = arm_eq;
+                        for (existing, status) in sys.goals.iter_mut() {
+                            if existing == &g && !status.solved {
+                                status.solved = true;
+                                break;
                             }
-                            cases.push((rule_name.clone(), sys));
                         }
+                        cases.push((rule_name.clone(), sys));
                     }
                 }
                 if cases.is_empty() { return GoalCases::Contradictory; }
@@ -4831,18 +4841,40 @@ impl<'ctx> Reduction<'ctx> {
                             SplitStrategy::SplitNow,
                             &[tamarin_term::rewriting::Equal {
                                 lhs: fa.clone(), rhs: act.clone() }]);
-                        match res {
+                        // HS-faithful per-arm fan-out (Goals.hs:279-280):
+                        //   act <- disjunctionOfList (rActs ru)
+                        //   void (solveFactEqs SplitNow [Equal fa act])
+                        // The `disjunctionOfList` and `solveFactEqs SplitNow`
+                        // run in `Reduction = StateT (FreshT (DisjT ...))`
+                        // — when `solveFactEqs` produces multiple AC unifier
+                        // arms, the DisjT layer fans the entire enclosing
+                        // `solveAction` call into one branch per arm.  Each
+                        // branch's eq_store gets that arm's unifier installed.
+                        //
+                        // Without this fan-out RS picks the FIRST arm's
+                        // eq_store and silently drops the rest, collapsing
+                        // HS's N sibling simplify-cases to 1.  This is what
+                        // makes TAK1::session_key_establish show only `case
+                        // Proto2` after simplify where HS shows `case 17`
+                        // (the 17th surviving AC-unifier arm).
+                        let arm_eq_stores: Vec<crate::tools::equation_store::EquationStore> = match res {
                             Err(_) | Ok(SolveOutcome::Contradictory) => continue,
-                            Ok(_) => {
-                                let mut sys = sub.sys;
-                                for (existing, status) in sys.goals.iter_mut() {
-                                    if existing == &g && !status.solved {
-                                        status.solved = true;
-                                        break;
-                                    }
+                            Ok(SolveOutcome::Cases(arms)) => arms,
+                            Ok(SolveOutcome::Linear(_)) =>
+                                vec![sub.sys.eq_store.clone()],
+                        };
+                        let post_sys = sub.sys.clone();
+                        for arm_eq in arm_eq_stores {
+                            let mut sys = post_sys.clone();
+                            sys.invalidate_max_var_idx_cache();
+                            sys.eq_store = arm_eq;
+                            for (existing, status) in sys.goals.iter_mut() {
+                                if existing == &g && !status.solved {
+                                    status.solved = true;
+                                    break;
                                 }
-                                cases.push((case_name, sys));
                             }
+                            cases.push((case_name.clone(), sys));
                         }
                     }
                 }
