@@ -3314,6 +3314,16 @@ fn refine_one_source(
     use crate::constraint::solver::reduction::Reduction;
     let mut new_cases: Vec<(Vec<String>, System)> = Vec::new();
     let mut changed = false;
+    // HS-faithful `refineSource` (Sources.hs:131-148): the Reduction
+    // monad flattens all `getDisj cdCases th` into a single Disj of
+    // post-refine branches; `removeRedundantCases` deduplicates that
+    // flat list ONCE at the end.  Previously RS applied dedup PER
+    // input case (input=1 — a no-op for single-branch cases), so
+    // alpha-equivalent branches arising from DIFFERENT input cases
+    // were never compared.  Accumulate to a deferred list and
+    // dedup in a single pass after the loop.
+    let mut deferred_filtered: Vec<(Vec<String>, crate::constraint::system::System)>
+        = Vec::new();
     for (name_list, sys) in src.cases_take_list() {
         let case_name_for_dbg = case_name_list_to_string(&name_list);
         if single_pick {
@@ -3381,39 +3391,19 @@ fn refine_one_source(
             eprintln!("  case {:?}: refineSource produced {} branches",
                 case_name_for_dbg, branches.len());
         }
-        // Haskell `refineSource`:
+        // HS-faithful `refineSource` (Sources.hs:137):
         //   map (second (modify sSubst (restrict stableVars)))
-        // restricts each branch's eq-store subst to the
-        // STABLE vars (frees of the source's cdGoal) before
-        // dedup.  This narrows the subst to bindings the
-        // runtime case-matcher cares about; internal fresh
-        // bindings are dropped so equivalent branches dedupe.
-        // Without this, branches differing only in internal
-        // fresh-var bindings stay distinct → case explosion.
+        // restricts each branch's eq-store subst to the STABLE vars
+        // (frees of the source's `cdGoal`) before dedup.  This
+        // narrows the subst to bindings the runtime case-matcher
+        // cares about; internal fresh bindings are dropped so
+        // equivalent branches dedupe.  Dedup itself is applied ONCE
+        // across the flat preDedup list (after the loop, see below).
         let mut stable_vars: std::collections::BTreeSet<
             tamarin_term::lterm::LVar> = std::collections::BTreeSet::new();
         goal_free_vars(&src.goal, &mut |v| {
             stable_vars.insert(v.clone());
         });
-        // Haskell-faithful `removeRedundantCases` (Sources.hs:328-352):
-        //   removeRedundantCases ctxt stableVars getSys cases0 =
-        //       if enableBP msig || enableMSet msig then cases else cases0
-        //   where cases = sortednubBy compareSystemsUpToNewVars
-        //                 (map (decoratedCases addNormSys) cases0)
-        //
-        // Gated on BP/MSet per HS short-circuit.  Outside BP/MSet,
-        // sibling cases (e.g. multiple `A_1` cases under KU(sign(...))
-        // for foo_eligibility) MUST be preserved so the renderer's
-        // `distinguish` can rename them `A_1_case_1`/`A_1_case_2`.
-        //
-        // Step 1 (per-branch): contradictions filter + `restrict stableVars`.
-        // Step 2 (per-source): `removeRedundantCases` via
-        //   compute_compare_systems_key, which builds an alpha-canonical
-        //   key matching HS's `renameDropNameHints + dropNameHintsBound +
-        //   compareSystemsUpToNewVars`.
-        let msig = ctx.maude.maude_sig();
-        let mut filtered: Vec<(Vec<String>, crate::constraint::system::System)>
-            = Vec::with_capacity(branches.len());
         for (mut branch_sys, branch_name_list) in branches {
             if aggressive_drop && !contradictions(ctx, &branch_sys).is_empty() {
                 changed = true;
@@ -3427,28 +3417,33 @@ fn refine_one_source(
             branch_sys.invalidate_max_var_idx_cache();
             branch_sys.eq_store.subst =
                 tamarin_term::subst::Subst::from_list(restricted_pairs);
-            filtered.push((branch_name_list, branch_sys));
-        }
-        let pre_count = filtered.len();
-        if std::env::var("TAM_RS_DBG_REMOVE_REDUNDANT").is_ok() {
-            eprintln!("[RRC] === refine source goal={:?} input={} cases ===",
-                src.goal, pre_count);
-        }
-        let deduped = remove_redundant_cases(
-            msig.enable_bp,
-            msig.enable_mset,
-            &stable_vars,
-            |c| &c.1,
-            filtered,
-        );
-        let _ = pre_count;
-        // Mirrors HS: `changed` flows from `not (null names)` in
-        // `solveAllSafeGoals` (already accounted for via `branch_took_step`
-        // above).  Dedup doesn't propagate a separate change signal.
-        for c in deduped {
-            new_cases.push(c);
+            deferred_filtered.push((branch_name_list, branch_sys));
         }
     }
+    // HS-faithful `removeRedundantCases` (Sources.hs:138): applies
+    // ONCE to the flat list of post-refine branches across all input
+    // cases.  Gated on BP/MSet per HS short-circuit (`removeRedundantCases`
+    // Sources.hs:331 returns the input unchanged outside BP/MSet).
+    let msig = ctx.maude.maude_sig();
+    let mut stable_vars: std::collections::BTreeSet<
+        tamarin_term::lterm::LVar> = std::collections::BTreeSet::new();
+    goal_free_vars(&src.goal, &mut |v| {
+        stable_vars.insert(v.clone());
+    });
+    let pre_count = deferred_filtered.len();
+    if std::env::var("TAM_RS_DBG_REMOVE_REDUNDANT").is_ok() {
+        eprintln!("[RRC] === refine source goal={:?} input={} cases ===",
+            src.goal, pre_count);
+    }
+    let deduped = remove_redundant_cases(
+        msig.enable_bp,
+        msig.enable_mset,
+        &stable_vars,
+        |c| &c.1,
+        deferred_filtered,
+    );
+    let _ = pre_count;
+    new_cases.extend(deduped);
     let count = new_cases.len();
     (new_cases, changed, count)
 }
