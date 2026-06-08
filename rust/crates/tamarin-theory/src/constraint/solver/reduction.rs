@@ -661,10 +661,41 @@ impl<'ctx> Reduction<'ctx> {
             self.sys.last_atom = Some(map_var(last));
         }
         // 4. Less atoms.
-        for la in self.sys.less_atoms.iter_mut() {
+        //
+        // HS-faithful: HS's `substLessAtoms = substPart sLessAtoms`
+        // (Reduction.hs:728) applies the eq-store subst to
+        // `sLessAtoms :: Set LessAtom` via the `Apply s (S.Set a)`
+        // instance (`SubstVFree.hs:345-346`): `S.map (apply subst)`.
+        // `S.map` rebuilds the set from the post-subst image, which
+        // INHERENTLY DEDUPES — two distinct pre-subst atoms whose
+        // images collapse to the same `(smaller, larger, reason)`
+        // tuple become one Set element.
+        //
+        // RS's `less_atoms: Vec<LessAtom>` doesn't auto-dedupe, so
+        // post-subst duplicates survive.  Mirror HS by deduping after
+        // the in-place rewrite.  Without this, `compute_compare_systems_key`
+        // (used by `removeRedundantCases`) serialises duplicate
+        // `s<l` entries, producing different keys for systems that
+        // HS considers redundant.
+        //
+        // Triggering case: Scott::key_secrecy.  Two source-cases'
+        // saturated systems that HS dedupes (75→73 in
+        // `removeRedundantCases` at ProofMethod.hs:455) survived
+        // in RS, leaving 18 Reveal_ltk arms where HS shows 16.
+        //
+        // Source: HS `Theory.Constraint.Solver.Reduction.substLessAtoms`
+        //         + `Term.Substitution.SubstVFree.SubstVFree.hs:345`.
+        let mut new_less: Vec<crate::constraint::constraints::LessAtom>
+            = Vec::with_capacity(self.sys.less_atoms.len());
+        for la in std::mem::take(&mut self.sys.less_atoms) {
+            let mut la = la;
             la.smaller = map_var(la.smaller.clone());
             la.larger  = map_var(la.larger.clone());
+            if !new_less.iter().any(|x| x == &la) {
+                new_less.push(la);
+            }
         }
+        self.sys.less_atoms = new_less;
         // 5. Goals: rewrite the Goal's free vars. Goals are deduped
         //    structurally; collapsed goals merge by keeping the first
         //    occurrence.

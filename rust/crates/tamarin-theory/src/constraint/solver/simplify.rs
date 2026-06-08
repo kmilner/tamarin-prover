@@ -2079,6 +2079,22 @@ fn normalise_less_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
             changed = ChangeIndicator::Changed;
         }
     }
+    // HS-faithful dedup post-normalise: HS's `sLessAtoms` is a `Set`;
+    // post-subst image collapsing two distinct atoms is auto-deduped.
+    // See `subst_system_once` (reduction.rs:664+) for full rationale.
+    let pre_len = red.sys.less_atoms.len();
+    let mut new_less: Vec<crate::constraint::constraints::LessAtom>
+        = Vec::with_capacity(pre_len);
+    for la in std::mem::take(&mut red.sys.less_atoms) {
+        if !new_less.iter().any(|x| x == &la) {
+            new_less.push(la);
+        }
+    }
+    if new_less.len() != pre_len {
+        changed = ChangeIndicator::Changed;
+        red.sys.invalidate_max_var_idx_cache();
+    }
+    red.sys.less_atoms = new_less;
     if changed == ChangeIndicator::Changed { red.changed = ChangeIndicator::Changed; }
     changed
 }
@@ -3478,6 +3494,16 @@ fn apply_node_eqs(
         l.smaller = rn(&l.smaller);
         l.larger = rn(&l.larger);
     }
+    // HS-faithful dedup post-rename: HS's `sLessAtoms :: Set` dedupes
+    // automatically.  See `subst_system_once` for full rationale.
+    let mut new_less: Vec<crate::constraint::constraints::LessAtom>
+        = Vec::with_capacity(red.sys.less_atoms.len());
+    for la in std::mem::take(&mut red.sys.less_atoms) {
+        if !new_less.iter().any(|x| x == &la) {
+            new_less.push(la);
+        }
+    }
+    red.sys.less_atoms = new_less;
     // Goals.
     for (g, _) in red.sys.goals.iter_mut() {
         match g {
