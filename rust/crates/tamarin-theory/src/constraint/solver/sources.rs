@@ -8712,6 +8712,16 @@ fn rn(
 }
 
 /// Write a term to the key buffer with renamed vars.
+///
+/// For AC and C function symbols, child renderings are sorted alphabetically
+/// post-rename so that the key is invariant under permutation of AC args
+/// (HS's `renameDropNameHints` calls `fAppAC` which re-canonicalizes the
+/// term under the renamed-var Ord; our pre-rendered Vec retains the
+/// pre-rename order, so we sort the rendered children here to match).
+/// Without this, two systems that differ ONLY by which renamed var ends
+/// up in which AC slot (e.g. `Union(v4, v5)` vs `Union(v5, v4)` after
+/// renaming `B↔C` to `v4↔v5`) get distinct keys and survive
+/// `removeRedundantCases`.
 fn write_term_to_key(
     t: &tamarin_term::lterm::LNTerm,
     rename: &std::collections::BTreeMap<tamarin_term::lterm::LVar, tamarin_term::lterm::LVar>,
@@ -8728,9 +8738,26 @@ fn write_term_to_key(
         Term::Lit(Lit::Con(c)) => { let _ = write!(out, "{:?}", c); }
         Term::App(sym, args) => {
             let _ = write!(out, "{:?}(", sym);
-            for (i, a) in args.iter().enumerate() {
-                if i > 0 { out.push(','); }
-                write_term_to_key(a, rename, out);
+            // For AC/C symbols, sort child renderings (post-rename) to
+            // make the key permutation-invariant.
+            if sym.is_ac() || sym.is_c() {
+                let mut rendered: Vec<String> = args.iter()
+                    .map(|a| {
+                        let mut s = String::new();
+                        write_term_to_key(a, rename, &mut s);
+                        s
+                    })
+                    .collect();
+                rendered.sort();
+                for (i, s) in rendered.iter().enumerate() {
+                    if i > 0 { out.push(','); }
+                    out.push_str(s);
+                }
+            } else {
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 { out.push(','); }
+                    write_term_to_key(a, rename, out);
+                }
             }
             out.push(')');
         }
@@ -9076,9 +9103,27 @@ fn write_term_to_key_local(
         Term::Lit(Lit::Con(c)) => { let _ = write!(out, "{:?}", c); }
         Term::App(sym, args) => {
             let _ = write!(out, "{:?}(", sym);
-            for (i, a) in args.iter().enumerate() {
-                if i > 0 { out.push(','); }
-                write_term_to_key_local(a, rename, out);
+            // For AC/C symbols, sort child renderings (post-rename) to
+            // make the key permutation-invariant.  See `write_term_to_key`
+            // for the rationale.
+            if sym.is_ac() || sym.is_c() {
+                let mut rendered: Vec<String> = args.iter()
+                    .map(|a| {
+                        let mut s = String::new();
+                        write_term_to_key_local(a, rename, &mut s);
+                        s
+                    })
+                    .collect();
+                rendered.sort();
+                for (i, s) in rendered.iter().enumerate() {
+                    if i > 0 { out.push(','); }
+                    out.push_str(s);
+                }
+            } else {
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 { out.push(','); }
+                    write_term_to_key_local(a, rename, out);
+                }
             }
             out.push(')');
         }
