@@ -1180,6 +1180,30 @@ pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
                 }
                 new_args = vec![acc];
             }
+            // HS-faithful: `em(a, b)` (bilinear-pairing builtin) must be
+            // emitted as a C-symbol application, not NoEq.  Mirrors HS
+            // `naryOpApp` (Theory/Text/Parser/Term.hs:92):
+            //   `let app o = if BC.pack op == emapSymString then fAppC EMap
+            //                else fAppNoEq o`
+            // Without this gate, RS builds `em` as a NoEq function symbol
+            // → Maude theory declares `op tamem : Msg Msg -> Msg [comm]`
+            //   (via `op_c`, maude_print.rs:299-306), but rule terms get
+            //   emitted with the NoEq prefix `tamXCem` (maude_print.rs:118-123)
+            //   → Maude rejects the unknown `tamXCem` operator and `get
+            //     variants` returns an empty parse-error reply.  This is the
+            //   root cause of RYY_PFS::key_secrecy_PFS picking
+            //   `Init_1 → c_em → Reveal_ltk_case_1 → c_hp` (12-line diff)
+            //   vs HS's `Reveal_ltk_case_1 → split_case_1 → Init_1 → c_hp`:
+            //   variant disjunctions for `Init_2`/`Resp_1` were never
+            //   computed, so smartRanking saw the un-narrowed `em` shape
+            //   alongside `exp(Y,~ex)` at c_kdf instead of HS's normalised
+            //   `exp(em(hp($A),hp($B)),~n)`.
+            if name == "em" && new_args.len() == 2 {
+                let mut it = new_args.into_iter();
+                let a = it.next().unwrap();
+                let b = it.next().unwrap();
+                return Some(tamarin_term::builtin::emap(a, b));
+            }
             let sym = NoEqSym::new(name.as_bytes().to_vec(), new_args.len(),
                 user_fun_privacy(name), Constructability::Constructor);
             Some(f_app_no_eq(sym, new_args))
