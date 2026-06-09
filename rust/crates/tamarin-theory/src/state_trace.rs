@@ -221,8 +221,9 @@ pub fn emit(op: &str, goal: Option<&crate::constraint::constraints::Goal>,
             sys: &crate::constraint::system::System) {
     if !enabled() { return; }
     let s = next_step();
-    eprintln!("TRACE@{} {} goal={} sys={}",
-        s, op, goal_summary(goal), fingerprint(sys));
+    let path = crate::constraint::solver::trace::case_path_string();
+    eprintln!("[STATE path={} step={} op={} goal={} {}]",
+        path, s, op, goal_summary(goal), fingerprint(sys));
     dump_sys(sys);
 }
 
@@ -233,8 +234,9 @@ pub fn emit_case(op: &str, case_name: &str,
                  sys: &crate::constraint::system::System) {
     if !enabled() { return; }
     let s = next_step();
-    eprintln!("TRACE@{} {} case={} goal={} sys={}",
-        s, op, case_name, goal_summary(goal), fingerprint(sys));
+    let path = crate::constraint::solver::trace::case_path_string();
+    eprintln!("[STATE path={} step={} op={} case={} goal={} {}]",
+        path, s, op, case_name, goal_summary(goal), fingerprint(sys));
     dump_sys(sys);
 }
 
