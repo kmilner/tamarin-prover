@@ -825,6 +825,29 @@ impl MaudeHandle {
             // baked into the returned SubstVFresh arms.
             self.reset_counter_to(high_water);
         }
+        // HS-faithful `removeRenamings` (Maude/Types.hs:130): HS's
+        // `msubstToLSubstVFresh bindings substMaude` ends with
+        // `removeRenamings $ substFromListVFresh slist` — drops every
+        // entry whose image is just a Var with no role elsewhere in
+        // the substitution (`isRenamedVar` in SubstVFresh.hs:140-145).
+        // RS's `msubst_to_lnsubst_with_maude` returns the raw slist
+        // without this filter, so trivial rename entries leak into the
+        // disjunction's substs.  At Scott's
+        // `/case_2/Init_2/Init_1/c_kdf/split_case_3` these renames
+        // become extra node-id bindings that drive `setNodes` collisions
+        // → 14 spurious `shape_mismatch` drops.
+        //
+        // Kill: `TAM_RS_DISABLE_MAUDE_REMOVE_RENAMINGS=1`.
+        if std::env::var("TAM_RS_DISABLE_MAUDE_REMOVE_RENAMINGS").is_err() {
+            let filtered: Vec<Vec<(crate::lterm::LVar, LNTerm)>> = out.into_iter()
+                .map(|arm| {
+                    let vfresh = crate::subst_vfresh::LSubstVFresh::
+                        <crate::lterm::Name>::from_list(arm);
+                    vfresh.remove_renamings().to_list()
+                })
+                .collect();
+            out = filtered;
+        }
         // HS-faithful `flattenUnif (subst, substs) = map (composeVFresh _ subst) substs`
         // (Unification.hs:147).  For the AC path, RS sends the FULL eqs to
         // Maude (HS sends only AC residuals after applying local non-AC subst),
