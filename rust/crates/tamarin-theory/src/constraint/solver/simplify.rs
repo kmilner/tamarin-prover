@@ -699,26 +699,31 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
             red.sys.invalidate_max_var_idx_cache();
             red.sys.solved_formulas.push(fm);
         }
-        if simp != gtrue() && simp != gfalse() {
-            // Route through decomposition to fire `insert_atom`
-            // side effects (Last → set sys.last_atom, etc).
-            red.insert_formula(simp);
-        } else if simp == gfalse() {
-            // HS-faithful: `evalFormulaAtoms` (Simplify.hs:334-336)
-            // ends with `insertFormula fm'` — route the gfalse through
-            // `insert_formula` so the [FORMULA_ADD] trace fires for
-            // lockstep diff against HS, and so any other side-effects
-            // of insertFormula (markAsSolved, etc.) execute too.
-            //
-            // Previously we pushed `simp` to `formulas` directly,
-            // bypassing `insertFormula`'s GDisj branch.  Behaviour-
-            // identical at end-state (gfalse lands in sys.formulas
-            // either way), but the bypass hid 83 lines of NSPK3
-            // `types` proof-tree divergence (Rust never producing
-            // the GDisj trace events that HS emits per simplify
-            // iteration) and 90 lines on Tutorial `Client_auth`.
-            red.insert_formula(simp);
-        }
+        // HS-faithful: `evalFormulaAtoms` (Simplify.hs:444-454) ALWAYS
+        // calls `insertFormula fm'` regardless of whether `fm'` is gtrue,
+        // gfalse, or any other shape.  Critical for the empty-Conj
+        // (gtrue) case: `insertFormula gtrue` at mark=True enters the
+        // GConj branch (Reduction.hs:526-528) which `markAsSolved`s the
+        // empty Conj — adding `GConj (Conj [])` to `sSolvedFormulas`.
+        //
+        // Without this, when a wellformedness check like
+        // `All [] [EqE em(hp $A, hp $B) DH_neutral] gfalse` (= "x ≠ y")
+        // gets simplified — because partialAtomValuation tells us
+        // `EqE x y` evaluates to `Just False` for non-unifiable terms,
+        // making the All-with-False-atom simplify to gtrue — HS adds
+        // the empty Conj to solved while RS silently drops it.  The
+        // missing solved formula propagates downstream (e.g. Scott
+        // key_secrecy's c_kdf split: HS reaches 6/6 at split_case_1,
+        // RS reaches 6/5, and bindings diverge from there).
+        //
+        // Previously the gtrue branch was suppressed under the comment
+        // "skip — gtrue is no-op".  That's only true at the SEMANTIC
+        // level (gtrue can never falsify a model); HS's bookkeeping
+        // still tracks it explicitly so the next simp-loop iteration
+        // sees the empty Conj as already-solved and short-circuits the
+        // dedup check.  Without parity here we get +1 step counts at
+        // every checkpoint inside the affected proof subtree.
+        red.insert_formula(simp);
         changed = ChangeIndicator::Changed;
     }
     changed
