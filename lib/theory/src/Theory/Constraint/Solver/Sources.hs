@@ -137,9 +137,19 @@ refineSource ctxt proofStep th =
             mapped   = map (second (modify sSubst (restrict stableVars))) preDedup
             postDedup = removeRedundantCases ctxt stableVars snd mapped
             nc = Disj postDedup
-        in if T.flagDbgInitSrc
+            inputN = length (getDisj (get cdCases th))
+            traceRefineApply = Unsafe.unsafePerformIO $
+              maybe False (== "1") <$> System.Environment.lookupEnv "TAM_HS_TRACE_REFINE_APPLY"
+        in if traceRefineApply
+             then trace ("[HS_REFINE_APPLY] goal=" ++ show (get cdGoal th)
+                       ++ " in=" ++ show inputN
+                       ++ " preDedup=" ++ show (length preDedup)
+                       ++ " postDedup=" ++ show (length postDedup)
+                       ++ "\n  preDedup_names=" ++ show (map fst preDedup)
+                       ++ "\n  postDedup_names=" ++ show (map fst postDedup)) nc
+             else if T.flagDbgInitSrc
              then trace ("[HS_REFINE] goal=" ++ show (get cdGoal th)
-                       ++ " " ++ show (length (getDisj (get cdCases th)))
+                       ++ " " ++ show inputN
                        ++ " cases (input) → "
                        ++ show (length preDedup) ++ " pre-dedup → "
                        ++ show (length postDedup) ++ " post-dedup"

@@ -2117,6 +2117,18 @@ fn enforce_fresh_node_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         let path = crate::constraint::solver::trace::case_path_string();
         eprintln!("[DG4_ENTER] path={} fresh_count={}", path, n_fresh);
     }
+    if std::env::var("TAM_RS_DBG_DG4_RULES").is_ok() {
+        let path = crate::constraint::solver::trace::case_path_string();
+        let concs: Vec<String> = red.sys.nodes.iter()
+            .filter(|(_, r)| matches!(&r.info, RuleInfo::Proto(p) if p.name == ProtoRuleName::Fresh))
+            .map(|(id, r)| format!("{}.{}={:?}", id.name, id.idx, r.conclusions))
+            .collect();
+        let bindings: Vec<String> = red.sys.eq_store.subst.to_list().into_iter()
+            .map(|(k, v)| format!("{}.{}/{:?}→{:?}", k.name, k.idx, k.sort, v))
+            .collect();
+        eprintln!("[DG4_RULES] path={} concs={:?} subst={:?}",
+            path, concs, bindings);
+    }
     // Haskell-faithful (`Simplify.hs:220-230`): group by the raw
     // `RuleACInst` — two Fresh-rule instances merge only if their
     // full rule representations are syntactically identical.
