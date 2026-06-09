@@ -218,6 +218,23 @@ impl<'ctx> Reduction<'ctx> {
                     self.sys.goals.len(),
                 );
             }
+            // Path-aware compact dump — pair with TAM_TRACE_SET_FALSE_FULL.
+            if std::env::var("TAM_TRACE_MARK_CONTRA").is_ok() {
+                let bt = std::backtrace::Backtrace::force_capture();
+                let bt_s = format!("{bt}");
+                let frames: Vec<&str> = bt_s.lines()
+                    .filter(|l| l.contains("tamarin_theory") || l.contains("tamarin-theory"))
+                    .filter(|l| !l.contains("mark_contradictory"))
+                    .filter(|l| !l.contains("trace_subpass"))
+                    .filter(|l| !l.contains("while_changing"))
+                    .filter(|l| !l.contains("simp_with_fresh"))
+                    .take(6)
+                    .map(|s| s.trim())
+                    .collect();
+                let cpath = crate::constraint::solver::trace::case_path_string();
+                eprintln!("[mark_contra] path={} added_bot={} flipped_eq={} frames=[ {} ]",
+                    cpath, added_bot, flipped_eq, frames.join(" | "));
+            }
         }
     }
 
@@ -568,6 +585,7 @@ impl<'ctx> Reduction<'ctx> {
             id_renamed_nodes.push((new_id, rule));
         }
         // Pass 1b: dedupe by new_id, detecting collisions on RAW rules.
+        let dbg_shape = std::env::var("TAM_DBG_SHAPE_MM").is_ok();
         for (new_id, rule) in id_renamed_nodes {
             match id_to_index.get(&new_id).copied() {
                 Some(i) => {
@@ -576,11 +594,24 @@ impl<'ctx> Reduction<'ctx> {
                     if kept.info != rule.info {
                         shape_mismatch = true;
                         shape_mm += 1;
+                        if dbg_shape {
+                            let cpath = crate::constraint::solver::trace::case_path_string();
+                            eprintln!("[shape_mm:info] path={} collide_at={}.{} kept_rule={} new_rule={}",
+                                cpath, new_id.name, new_id.idx,
+                                rule_case_name(kept), rule_case_name(&rule));
+                        }
                     } else if kept.premises.len() != rule.premises.len()
                         || kept.conclusions.len() != rule.conclusions.len()
                         || kept.actions.len() != rule.actions.len()
                     {
                         shape_mismatch = true;
+                        if dbg_shape {
+                            let cpath = crate::constraint::solver::trace::case_path_string();
+                            eprintln!("[shape_mm:arity] path={} collide_at={}.{} kept={}/{}/{} new={}/{}/{}",
+                                cpath, new_id.name, new_id.idx,
+                                kept.premises.len(), kept.conclusions.len(), kept.actions.len(),
+                                rule.premises.len(), rule.conclusions.len(), rule.actions.len());
+                        }
                     } else {
                         for (a, b) in kept.premises.iter().zip(rule.premises.iter()) {
                             rule_eqs.push(tamarin_term::rewriting::Equal {

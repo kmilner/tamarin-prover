@@ -557,12 +557,29 @@ pub fn exec_proof_method(
             // leaves them as explicit `Finished(Contradictory(_))`
             // leaves.  Mirror the latter shape by *not* filtering them.
             let dbg_filter = std::env::var("TAM_DBG_FILTER").is_ok();
+            let dbg_filter_compact = std::env::var("TAM_DBG_FILTER_COMPACT").is_ok();
             let keep = |sys: &System, name: &str| -> bool {
                 let r = !sys.eq_store.is_false();
                 if dbg_filter {
                     let cs = crate::constraint::solver::contradictions::contradictions(ctx, sys);
                     eprintln!("[filter] goal={:?} case={:?} eqf={} contradictions={:?} keep={}",
                         g, name, sys.eq_store.is_false(), cs, r);
+                }
+                if dbg_filter_compact {
+                    let cs = crate::constraint::solver::contradictions::contradictions(ctx, sys);
+                    let cpath = crate::constraint::solver::trace::case_path_string();
+                    let goal_short = match g {
+                        crate::constraint::constraints::Goal::Action(i, fa) =>
+                            format!("Action(#{}.{}, {:?}/{}args)", i.name, i.idx, fa.tag, fa.terms.len()),
+                        crate::constraint::constraints::Goal::Premise((i, p), fa) =>
+                            format!("Premise(#{}.{}@{}, {:?}/{}args)", i.name, i.idx, p.0, fa.tag, fa.terms.len()),
+                        crate::constraint::constraints::Goal::Chain(_,_) => "Chain".to_string(),
+                        crate::constraint::constraints::Goal::Split(_) => "Split".to_string(),
+                        crate::constraint::constraints::Goal::Disj(_) => "Disj".to_string(),
+                        crate::constraint::constraints::Goal::Subterm(_) => "Subterm".to_string(),
+                    };
+                    eprintln!("[filtercomp] path={} goal={} case={} contras={:?} keep={}",
+                        cpath, goal_short, name, cs, r);
                 }
                 let op = if r { "case_keep" } else { "case_drop" };
                 crate::state_trace::emit_case(op, name, Some(&g), sys);
@@ -607,13 +624,26 @@ pub fn exec_proof_method(
                     // iteration order (rule order in `joinAllRules`).
                     use std::collections::HashMap;
                     // simplify can fan out per case — flat-map.
+                    // For debugging (TAM_DBG_FILTER_COMPACT), tag the case
+                    // path with the sibling name + index so traces map back
+                    // to the specific source-case being simplified.
+                    let trace_cases = std::env::var("TAM_DBG_TRACE_CASES").is_ok();
                     let kept_raw: Vec<(String, System)> = cases.into_iter()
-                        .flat_map(|(name, sys)| {
+                        .enumerate()
+                        .flat_map(|(idx, (name, sys))| {
+                            if trace_cases {
+                                crate::constraint::solver::trace::case_path_push(
+                                    &format!("cand_{}_{}", idx, name));
+                            }
                             let systems = simplify(sys);
-                            systems.into_iter()
+                            let out: Vec<(String, System)> = systems.into_iter()
                                 .filter(|s| keep(s, &name))
                                 .map(|s| (name.clone(), s))
-                                .collect::<Vec<_>>()
+                                .collect();
+                            if trace_cases {
+                                crate::constraint::solver::trace::case_path_pop();
+                            }
+                            out
                         })
                         .collect();
                     // Dedup cases that share BOTH a name and canonical
