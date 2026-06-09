@@ -628,6 +628,9 @@ pub fn exec_proof_method(
                     // path with the sibling name + index so traces map back
                     // to the specific source-case being simplified.
                     let trace_cases = std::env::var("TAM_DBG_TRACE_CASES").is_ok();
+                    let dbg_kr = std::env::var("TAM_RS_DBG_KEPT_RAW").is_ok();
+                    let mut kr_pre_counts: std::collections::HashMap<String, (usize, usize, usize)>
+                        = std::collections::HashMap::new();
                     let kept_raw: Vec<(String, System)> = cases.into_iter()
                         .enumerate()
                         .flat_map(|(idx, (name, sys))| {
@@ -636,16 +639,36 @@ pub fn exec_proof_method(
                                     &format!("cand_{}_{}", idx, name));
                             }
                             let systems = simplify(sys);
+                            let n_pre_keep = systems.len();
                             let out: Vec<(String, System)> = systems.into_iter()
                                 .filter(|s| keep(s, &name))
                                 .map(|s| (name.clone(), s))
                                 .collect();
+                            let n_post_keep = out.len();
+                            if dbg_kr {
+                                let entry = kr_pre_counts.entry(name.clone()).or_insert((0,0,0));
+                                entry.0 += 1; // incoming cases
+                                entry.1 += n_pre_keep; // post-simplify
+                                entry.2 += n_post_keep; // post-keep
+                            }
                             if trace_cases {
                                 crate::constraint::solver::trace::case_path_pop();
                             }
                             out
                         })
                         .collect();
+                    if dbg_kr {
+                        let cpath = crate::constraint::solver::trace::case_path_string();
+                        let goal_short = match g {
+                            crate::constraint::constraints::Goal::Action(_, fa) =>
+                                format!("Action({:?})", fa.tag),
+                            crate::constraint::constraints::Goal::Premise(_, fa) =>
+                                format!("Premise({:?})", fa.tag),
+                            _ => format!("{:?}", g),
+                        };
+                        eprintln!("[KEPT_RAW] path={} goal={} counts={:?}",
+                            cpath, goal_short, kr_pre_counts);
+                    }
                     // Dedup cases that share BOTH a name and canonical
                     // system (post-simplify + rename_precise).  Haskell's
                     // `someRuleACInst` encodes rule variants as a SplitG
@@ -664,13 +687,23 @@ pub fn exec_proof_method(
                         // systems.  Safety guard for actually-isomorphic
                         // cases; the proper Haskell-parity dedup is the
                         // SplitG-variants path (now always on).
+                        let dbg_dedup = std::env::var("TAM_RS_DBG_NAMESYS_DEDUP").is_ok();
                         let mut seen_systems: Vec<(String, System)> = Vec::new();
+                        let mut dup_count = 0usize;
+                        let mut dup_names: Vec<String> = Vec::new();
                         for (name, s) in kept_raw {
                             let dup = seen_systems.iter().any(|(prev_name, prev_sys)|
                                 prev_name == &name && prev_sys == &s);
                             if !dup {
                                 seen_systems.push((name, s));
+                            } else {
+                                dup_count += 1;
+                                if dbg_dedup { dup_names.push(name); }
                             }
+                        }
+                        if dbg_dedup && dup_count > 0 {
+                            eprintln!("[NAMESYS_DEDUP] dropped={} names={:?} kept={}",
+                                dup_count, dup_names, seen_systems.len());
                         }
                         // HS-faithful `removeRedundantCases ctxt [] snd`
                         // (ProofMethod.hs:455).  Gated on BP/MSet per HS
