@@ -6677,12 +6677,22 @@ fn freshen_system_some_inst(
     if let Some(la) = &sys.last_atom {
         import_var(la, &mut bindings);
     }
-    // sSubtermStore — walk small + big of each subterm constraint
-    for c in &sys.subterm_store.subterms {
+    // sSubtermStore — HS-faithful Set walk in Ord order
+    // (SubtermStore.hs `Set SubtermD` for both pos and neg + S.Set Set).
+    // Mirror `rename_precise.rs:129-142` Set-sorted walk so per-name
+    // PreciseFresh counters / global FastFresh allocations land at the
+    // same idxs HS does.
+    let mut sub_sorted: Vec<&crate::tools::subterm_store::SubtermConstraint>
+        = sys.subterm_store.subterms.iter().collect();
+    sub_sorted.sort_by(|a, b| (&a.small, &a.big).cmp(&(&b.small, &b.big)));
+    for c in sub_sorted {
         c.small.for_each_free(&mut |v| import_var(v, &mut bindings));
         c.big.for_each_free(&mut |v| import_var(v, &mut bindings));
     }
-    for c in &sys.subterm_store.solved_subterms {
+    let mut solved_sub_sorted: Vec<&crate::tools::subterm_store::SubtermConstraint>
+        = sys.subterm_store.solved_subterms.iter().collect();
+    solved_sub_sorted.sort_by(|a, b| (&a.small, &a.big).cmp(&(&b.small, &b.big)));
+    for c in solved_sub_sorted {
         c.small.for_each_free(&mut |v| import_var(v, &mut bindings));
         c.big.for_each_free(&mut |v| import_var(v, &mut bindings));
     }
@@ -6700,8 +6710,16 @@ fn freshen_system_some_inst(
     // iterations (e.g. Responder_secrecy: ~k.6 → ~k.31) and rotating the
     // 3-way split via `Ord LNSubstVFresh`.  Match `rename_precise.rs:98-109`
     // and import keys only.
+    // HS-faithful: inner `S.Set LNSubstVFresh` walks Ord-ascending
+    // (`mapFrees (Set a) = fmap S.fromList . mapFrees f . S.toList`,
+    // LTerm.hs:866).  RS's `Vec` is in insertion order — sort to match
+    // (mirroring `rename_precise.rs:144-153`).
     for d in sys.eq_store.conj.iter() {
-        for s in d.substs.iter() {
+        let mut substs_sorted: Vec<&tamarin_term::subst_vfresh::SubstVFresh<
+            tamarin_term::lterm::Name, tamarin_term::lterm::LVar>>
+            = d.substs.iter().collect();
+        substs_sorted.sort();
+        for s in substs_sorted {
             for (k, _t) in s.to_list() {
                 import_var(&k, &mut bindings);
                 // Range vars NOT imported (HS-faithful).
@@ -6729,9 +6747,23 @@ fn freshen_system_some_inst(
             v.clone()
         });
     };
-    for g in &sys.formulas { walk_guarded(g, &mut bindings); }
-    for g in &sys.solved_formulas { walk_guarded(g, &mut bindings); }
-    for g in &sys.lemmas { walk_guarded(g, &mut bindings); }
+    // HS-faithful: `_sFormulas` / `_sSolvedFormulas` / `_sLemmas` are
+    // `S.Set LNGuarded`; HS walks them in Ord-ascending (Term/LTerm.hs:866
+    // `foldMap (foldFrees f)`).  RS's `Vec<Guarded>` is in insertion order.
+    // Sort copies (mirroring `rename_precise.rs:178-189`) so per-name
+    // counter assignment matches HS exactly.
+    let mut formulas_sorted: Vec<&crate::guarded::Guarded>
+        = sys.formulas.iter().collect();
+    formulas_sorted.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
+    for g in formulas_sorted { walk_guarded(g, &mut bindings); }
+    let mut solved_formulas_sorted: Vec<&crate::guarded::Guarded>
+        = sys.solved_formulas.iter().collect();
+    solved_formulas_sorted.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
+    for g in solved_formulas_sorted { walk_guarded(g, &mut bindings); }
+    let mut lemmas_sorted: Vec<&crate::guarded::Guarded>
+        = sys.lemmas.iter().collect();
+    lemmas_sorted.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
+    for g in lemmas_sorted { walk_guarded(g, &mut bindings); }
     // sGoals: M.Map Goal GoalStatus → sort by Goal (using goal_cmp).
     let mut sorted_goals: Vec<&(crate::constraint::constraints::Goal,
                                 crate::constraint::system::GoalStatus)>
