@@ -59,6 +59,29 @@ pub struct Reduction<'ctx> {
     /// `case_2_case_2` via `uniqueListBy ... distinguish`
     /// (ProofMethod.hs:468).
     pub pending_eq_arms: Vec<crate::tools::equation_store::EquationStore>,
+    /// Fanout of `conjoinSystem`'s step 12 `solveSubstEqs SplitNow`
+    /// (Reduction.hs:847).  HS runs this inside the `Reduction` monad
+    /// whose `DisjT` layer replicates the surrounding `_applySource`
+    /// continuation per AC unifier arm — each arm flows into its own
+    /// post-conjoin `someInst`/`E.5 edge_eqs`/`close_trivial_chains`
+    /// computation.
+    ///
+    /// RS's `solve_term_eqs` collapses multi-arm `Cases` into the bare
+    /// eq_store without installing them; step 12 silently dropped the
+    /// extra arms.  Empirically: HS ≅ 26 `solveSubstEqs arms=3` events
+    /// on Scott::key_secrecy vs RS ≅ 18 — i.e. 8 lost fanout sites.
+    ///
+    /// Fix: when step 12 returns `Cases(arms)`, install `arms[0]`
+    /// in-place (the main `conjoin_system` return value), and stash a
+    /// per-arm clone of the post-step-13 system here, one per `arms[i]`
+    /// where i ≥ 1.  The caller (`apply_source_case_action` /
+    /// `apply_source_case_premise`) drains this Vec after
+    /// `conjoin_system` returns and replays the post-conjoin work
+    /// (E.5 edge_eqs, F close_trivial_chains, output push) per stashed
+    /// system.  Each stashed system has had `subst_system` already run
+    /// with that arm's eq_store, mirroring HS's per-arm `substSystem`
+    /// at Reduction.hs:850.
+    pub pending_conjoin_arm_systems: Vec<crate::constraint::system::System>,
 }
 
 /// `ChangeIndicator` mirrors the `True`/`False` flag the Haskell
@@ -93,6 +116,7 @@ impl<'ctx> Reduction<'ctx> {
             ctx, sys, maude,
             changed: ChangeIndicator::Unchanged,
             pending_eq_arms: Vec::new(),
+            pending_conjoin_arm_systems: Vec::new(),
         }
     }
 
@@ -2156,11 +2180,18 @@ impl<'ctx> Reduction<'ctx> {
                 let arms = store.perform_split(id)
                     .ok_or_else(|| crate::tools::equation_store::AddEqsError::Maude(
                         format!("split id {:?} not found", id)))?;
+                let raw_count = arms.len();
                 let mut live_arms: Vec<crate::tools::equation_store::EquationStore> = Vec::new();
                 for arm in arms {
                     let simped = do_simp(arm);
                     if simped.is_false() { continue; }
                     live_arms.push(simped);
+                }
+                if std::env::var("TAM_RS_DBG_STE_RAW").is_ok() {
+                    let loc = std::panic::Location::caller();
+                    eprintln!("[STE_RAW] raw={} live={} site={}:{} pending_eqs={}",
+                        raw_count, live_arms.len(), loc.file(), loc.line(),
+                        pending.len());
                 }
                 if live_arms.is_empty() {
                     // All arms contradicted under per-arm simp.
@@ -2588,6 +2619,19 @@ impl<'ctx> Reduction<'ctx> {
             self.insert_goal(crate::constraint::constraints::Goal::Split(id));
         }
         // 12. solveSubstEqs SplitNow on case's flat subst.
+        //
+        // HS-faithful fanout (Reduction.hs:847): `solveSubstEqs SplitNow`
+        // routes through `solveTermEqs SplitNow` which calls
+        // `disjunctionOfList $ performSplit eqs2 splitId` — the `DisjT`
+        // layer of the `Reduction` monad replicates the surrounding
+        // `_applySource` continuation per AC unifier arm.  In our port
+        // `solve_term_eqs` may return `Cases(arms)`.  We mirror the HS
+        // semantics by snapshotting the post-step-11 system (this is the
+        // `Reduction` state at the moment `solveSubstEqs` is entered, so
+        // it's what each arm's `DisjT` branch sees), installing arm[0]
+        // for the main return path, and stashing per-arm snapshots
+        // (with `substSystem` already applied) in
+        // `pending_conjoin_arm_systems` for the caller to drain.
         let case_subst_eqs: Vec<_> = sys.eq_store.subst.to_list().into_iter()
             .map(|(v, t)| tamarin_term::rewriting::Equal {
                 lhs: tamarin_term::term::Term::Lit(
@@ -2595,9 +2639,56 @@ impl<'ctx> Reduction<'ctx> {
                 rhs: t,
             })
             .collect();
+        // Snapshot pre-step-12 sys for per-arm fanout.  Only taken when
+        // we have any case_subst_eqs to feed (otherwise solve_term_eqs
+        // returns Linear-trivial and there's nothing to fan out).  Kill
+        // switch: `TAM_RS_DISABLE_CONJOIN_FANOUT=1` skips snapshot and
+        // arm-fanout, restoring the prior "collapse to one arm" behavior.
+        let conjoin_fanout_enabled = !case_subst_eqs.is_empty()
+            && std::env::var("TAM_RS_DISABLE_CONJOIN_FANOUT").is_err();
+        let pre_step12_snapshot: Option<crate::constraint::system::System> =
+            if conjoin_fanout_enabled { Some(self.sys.clone()) } else { None };
+        if std::env::var("TAM_RS_DBG_CONJOIN_STEP12").is_ok() {
+            eprintln!("[conjoin_step12] n_eqs={} fanout_enabled={}",
+                case_subst_eqs.len(), conjoin_fanout_enabled);
+        }
         let r = self.solve_term_eqs(SplitStrategy::SplitNow, &case_subst_eqs);
-        if matches!(r, Err(_) | Ok(SolveOutcome::Contradictory)) {
-            return r;
+        match r {
+            Err(_) | Ok(SolveOutcome::Contradictory) => { return r; }
+            Ok(SolveOutcome::Linear(_)) => {
+                // Single-arm path: solve_term_eqs already installed
+                // arm[0]; just proceed to step 13.
+            }
+            Ok(SolveOutcome::Cases(arms)) => {
+                // Multi-arm fanout.  solve_term_eqs returned Cases
+                // without installing any arm; install arm[0] here,
+                // then build per-arm snapshots for arms[1..].
+                if std::env::var("TAM_RS_DBG_CONJOIN_FANOUT").is_ok() {
+                    eprintln!("[conjoin_fanout] arms={} (step 12 solveSubstEqs)",
+                        arms.len());
+                }
+                let mut arm_iter = arms.into_iter();
+                let arm0 = arm_iter.next().expect("Cases has >=2 arms");
+                self.sys.invalidate_max_var_idx_cache();
+                self.sys.eq_store = arm0;
+                // Build per-arm fanout snapshots from the pre-step-12 sys.
+                // Each snapshot gets the arm's eq_store installed and
+                // step 13 (substSystem) applied locally.
+                if let Some(snapshot) = &pre_step12_snapshot {
+                    for arm_i in arm_iter {
+                        let mut arm_sys = snapshot.clone();
+                        arm_sys.invalidate_max_var_idx_cache();
+                        arm_sys.eq_store = arm_i;
+                        // Replicate step 13 substSystem locally on the
+                        // arm-i sys by spinning a transient Reduction.
+                        let mut arm_red = Reduction::new(self.ctx, arm_sys);
+                        arm_red.subst_system();
+                        if !arm_red.sys.eq_store.is_false() {
+                            self.pending_conjoin_arm_systems.push(arm_red.sys);
+                        }
+                    }
+                }
+            }
         }
         // 13. substSystem.
         self.subst_system();
