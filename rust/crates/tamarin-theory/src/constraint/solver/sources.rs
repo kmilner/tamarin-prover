@@ -7271,15 +7271,27 @@ fn apply_source_case_action(
         if term_eqs.is_empty() || h17_6 {
             // No refineSubst (h17_6 defers it post-conjoin); keep current
             // eq_store as the sole arm.
+            if std::env::var("TAM_RS_DBG_APPLY_SRC_FANOUT_ALL").is_ok() {
+                eprintln!("[apply_src_fanout] case={} arms=0/skip n_term_eqs={}",
+                    case_label, term_eqs.len());
+            }
             vec![refined.sys.eq_store.clone()]
         } else {
             let outcome = refined.solve_term_eqs(SplitStrategy::SplitNow, &term_eqs);
             match outcome {
                 Err(_) | Ok(SolveOutcome::Contradictory) => {
+                    if std::env::var("TAM_RS_DBG_APPLY_SRC_FANOUT_ALL").is_ok() {
+                        eprintln!("[apply_src_fanout] case={} arms=0/contra n_term_eqs={}",
+                            case_label, term_eqs.len());
+                    }
                     dbg("refineSubst-contradictory");
                     return Vec::new();
                 }
                 Ok(SolveOutcome::Linear(_)) => {
+                    if std::env::var("TAM_RS_DBG_APPLY_SRC_FANOUT_ALL").is_ok() {
+                        eprintln!("[apply_src_fanout] case={} arms=1/linear n_term_eqs={}",
+                            case_label, term_eqs.len());
+                    }
                     // Single arm: solve_term_eqs already installed it
                     // into refined.sys.eq_store.  Mirror as a single-arm
                     // Vec so the post-continuation runs once with that
@@ -7287,9 +7299,10 @@ fn apply_source_case_action(
                     vec![refined.sys.eq_store.clone()]
                 }
                 Ok(SolveOutcome::Cases(arms)) => {
-                    if std::env::var("TAM_RS_DBG_APPLY_SRC_FANOUT").is_ok() {
-                        eprintln!("[apply_src_fanout] case={} arms={}",
-                            case_label, arms.len());
+                    if std::env::var("TAM_RS_DBG_APPLY_SRC_FANOUT").is_ok()
+                        || std::env::var("TAM_RS_DBG_APPLY_SRC_FANOUT_ALL").is_ok() {
+                        eprintln!("[apply_src_fanout] case={} arms={} n_term_eqs={}",
+                            case_label, arms.len(), term_eqs.len());
                     }
                     arms
                 }
@@ -7596,6 +7609,33 @@ fn apply_source_case_action(
         continue;
     }
 
+    // Drain `conjoin_system`'s step-12 fanout (HS Reduction.hs:847
+    // `solveSubstEqs SplitNow` inside DisjT).  arm[0] is in r.sys;
+    // arms[1..] are post-substSystem snapshots in
+    // `pending_conjoin_arm_systems`.  We replay the rest of
+    // `_applySource` (E.5 edge_eqs, F close_trivial_chains, output
+    // push) per stashed sys.  HS-equivalent: each `DisjT` arm
+    // continues independently through the post-`solveSubstEqs`
+    // continuation.
+    let conjoin_arm_systems = std::mem::take(
+        &mut r.pending_conjoin_arm_systems);
+    let dbg_cf = std::env::var("TAM_RS_DBG_CONJOIN_FANOUT").is_ok();
+    if dbg_cf && !conjoin_arm_systems.is_empty() {
+        eprintln!("[conjoin_fanout] apply_source_case_action drained {} extra arms (case={})",
+            conjoin_arm_systems.len(), case_label);
+    }
+    // Build a Vec<Reduction> over arm0 + extra-arms so the post-conjoin
+    // work loop runs uniformly.  arm0 is the in-place `r`; arms[1..]
+    // each get a fresh Reduction with the pre-drained sys installed.
+    let mut arm_reductions: Vec<Reduction> = Vec::with_capacity(
+        1 + conjoin_arm_systems.len());
+    arm_reductions.push(r);
+    for sys_i in conjoin_arm_systems {
+        arm_reductions.push(Reduction::new(ctx, sys_i));
+    }
+
+    for mut r in arm_reductions {
+
     // H17.6 (2026-05-28): Defer match-bindings to AFTER conjoin instead
     // of applying them on the refined case body before grafting.  Goal
     // was to preserve pattern vars in case body through conjoin so eq_store
@@ -7686,7 +7726,8 @@ fn apply_source_case_action(
 
     crate::state_trace::emit(
         "applySource_out", Some(&live_goal_for_trace), &r.sys);
-    out_arms.push((r.sys, live_action));
+    out_arms.push((r.sys, live_action.clone()));
+    } // end `for r in arm_reductions`
     } // end `for arm_eq_store in arm_eq_stores`
     out_arms
 }
