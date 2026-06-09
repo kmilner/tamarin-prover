@@ -209,19 +209,25 @@ enforceNodeUniqueness =
             traceDg4 = Unsafe.unsafePerformIO $ do
               flagEnter <- maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_DG4_ENTER"
               when flagEnter $ do
+                path <- T.casePathString <$> T.getCasePath
                 let subst = get sSubst se
                     bindings = Term.Substitution.substToList subst
-                Debug.Trace.traceIO ("[HS_DG4_ENTER] fresh_count=" ++ show (length insts)
+                    eqs     = get sEqStore se
+                Debug.Trace.traceIO ("[HS_DG4_ENTER] path=" ++ path
+                                  ++ " fresh_count=" ++ show (length insts)
                                   ++ " subst_len=" ++ show (length bindings)
                                   ++ " subst=" ++ show bindings
+                                  ++ " eqs=" ++ show eqs
                                   ++ " concs=" ++ show [get rConcs ru | (ru, _) <- insts])
               flag <- maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_DG4"
               when flag $ do
+                path <- T.casePathString <$> T.getCasePath
                 let groups = groupSortOn fst insts
                 mapM_ (\g -> when (length g > 1) $ do
                     let ru = fst (head g)
                         ids = [i | (_, ((), i)) <- g]
-                    Debug.Trace.traceIO ("[HS_DG4_MERGE] ids=" ++ show ids
+                    Debug.Trace.traceIO ("[HS_DG4_MERGE] path=" ++ path
+                                  ++ " ids=" ++ show ids
                                   ++ " rule_conc=" ++ show (get rConcs ru))
                   ) groups
               return ()
@@ -295,16 +301,19 @@ enforceFreshAndKuNodeUniqueness =
             traceDg4 = Unsafe.unsafePerformIO $ do
               flag <- maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_DG4"
               when flag $ do
+                path <- T.casePathString <$> T.getCasePath
                 let groups = groupSortOn fst insts
                 mapM_ (\g -> when (length g > 1) $ do
                     let ru = fst (head g)
                         ids = [i | (_, ((), i)) <- g]
-                    Debug.Trace.traceIO ("[HS_DG4_MERGE] ids=" ++ show ids
+                    Debug.Trace.traceIO ("[HS_DG4_MERGE] path=" ++ path
+                                  ++ " ids=" ++ show ids
                                   ++ " rule_conc=" ++ show (get rConcs ru))
                   ) groups
               flagEnter <- maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_DG4_ENTER"
-              when flagEnter $
-                Debug.Trace.traceIO ("[HS_DG4_ENTER] fresh_count=" ++ show (length insts))
+              when flagEnter $ do
+                path <- T.casePathString <$> T.getCasePath
+                Debug.Trace.traceIO ("[HS_DG4_ENTER] path=" ++ path ++ " fresh_count=" ++ show (length insts))
               return ()
         in traceDg4 `seq` insts
 
