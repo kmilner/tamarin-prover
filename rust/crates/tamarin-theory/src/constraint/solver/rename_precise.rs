@@ -217,12 +217,24 @@ pub fn rename_precise_system(sys: &mut System) {
     };
 
     // 1. Nodes — id + rule.
+    //
+    // HS-faithful: `mapFrees (M.Map NodeId RuleACInst)`
+    // = `fmap M.fromList . mapFrees f . M.toList` (Term/LTerm.hs:876-877).
+    // `M.fromList` builds a Map keyed by Ord NodeId, so post-rename the
+    // entries land in ascending NEW NodeId order.  Without this sort,
+    // RS's `Vec<(NodeId, _)>` keeps the pre-rename insertion order — which
+    // diverges from HS for any downstream consumer that walks `sys.nodes`
+    // in storage order rather than re-sorting (most do their own sort, but
+    // some iterate directly).  Mirror HS by sorting here.
     let nodes = std::mem::take(&mut sys.nodes);
-    sys.nodes = nodes.into_iter().map(|(id, rule)| {
-        let new_id = map_var(id);
-        let new_rule = rule.map_free(&mut |v| map_var(v));
-        (new_id, new_rule)
-    }).collect();
+    let mut renamed: Vec<(crate::constraint::constraints::NodeId, crate::rule::RuleACInst)>
+        = nodes.into_iter().map(|(id, rule)| {
+            let new_id = map_var(id);
+            let new_rule = rule.map_free(&mut |v| map_var(v));
+            (new_id, new_rule)
+        }).collect();
+    renamed.sort_by(|a, b| a.0.cmp(&b.0));
+    sys.nodes = renamed;
 
     // 2. Edges.
     for e in sys.edges.iter_mut() {
@@ -247,6 +259,8 @@ pub fn rename_precise_system(sys: &mut System) {
     // collapsing duplicates whose images coincide.  Mirror by deduping
     // after the in-place rename.  See `subst_system_once`'s comment for
     // detailed rationale.
+    // HS `mapFrees (S.Set LessAtom)`: sort + dedup post-rename
+    // (Term/LTerm.hs:866 `fmap S.fromList . mapFrees f . S.toList`).
     let mut new_less: Vec<crate::constraint::constraints::LessAtom>
         = Vec::with_capacity(sys.less_atoms.len());
     for la in std::mem::take(&mut sys.less_atoms) {
@@ -257,6 +271,7 @@ pub fn rename_precise_system(sys: &mut System) {
             new_less.push(la);
         }
     }
+    new_less.sort();
     sys.less_atoms = new_less;
 
     // 5. Goals — per-variant rewrite.
@@ -294,19 +309,34 @@ pub fn rename_precise_system(sys: &mut System) {
             new_goals.push((g2, st));
         }
     }
+    // HS-faithful: `mapFrees (M.Map Goal GoalStatus)`
+    // = `fmap M.fromList . mapFrees f . M.toList` (Term/LTerm.hs:876-877).
+    // `M.fromList` builds a Map keyed by Ord Goal, so post-rename the
+    // entries land in ascending NEW Goal order.
+    new_goals.sort_by(|a, b|
+        crate::constraint::solver::goals::goal_cmp(&a.0, &b.0));
     sys.goals = new_goals;
 
     // 6. Formulas / solved / lemmas — via parser-level VarSubst.
+    //
+    // HS-faithful: `_sFormulas` / `_sSolvedFormulas` / `_sLemmas` are
+    // `S.Set LNGuarded`. `mapFrees (S.Set a) = fmap S.fromList . mapFrees
+    // f . S.toList` (Term/LTerm.hs:866) — rebuilds the set after mapping,
+    // so post-rename entries are sorted by NEW Ord Guarded AND
+    // collision-deduped.  Mirror by sorting+deduping after the in-place
+    // rename: post-rename two formulas that became equal collapse.
     if !formula_subst.is_empty() {
-        for f in sys.formulas.iter_mut() {
-            *f = subst_guarded(f, &formula_subst);
-        }
-        for f in sys.solved_formulas.iter_mut() {
-            *f = subst_guarded(f, &formula_subst);
-        }
-        for f in sys.lemmas.iter_mut() {
-            *f = subst_guarded(f, &formula_subst);
-        }
+        let sort_dedup_guarded = |v: &mut Vec<crate::guarded::Guarded>, sub: &VarSubst| {
+            for f in v.iter_mut() {
+                *f = subst_guarded(f, sub);
+            }
+            v.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
+            v.dedup_by(|a, b| crate::guarded::cmp_guarded(a, b)
+                == std::cmp::Ordering::Equal);
+        };
+        sort_dedup_guarded(&mut sys.formulas, &formula_subst);
+        sort_dedup_guarded(&mut sys.solved_formulas, &formula_subst);
+        sort_dedup_guarded(&mut sys.lemmas, &formula_subst);
     }
 
     // 7. eq_store — rewrite the subst (dom + range) and the conj.
@@ -348,14 +378,26 @@ pub fn rename_precise_system(sys: &mut System) {
     }
 
     // 8. Subterm store.
+    //
+    // HS-faithful: `_sSubtermStore` summands are `S.Set` (SubtermStore.hs
+    // `Set SubtermD` for both pos and neg).  `mapFrees (S.Set a) =
+    // fmap S.fromList . mapFrees f . S.toList` — sort + dedup post-rename.
     for c in sys.subterm_store.subterms.iter_mut() {
         c.small = apply_term(c.small.clone());
         c.big = apply_term(c.big.clone());
     }
+    sys.subterm_store.subterms.sort_by(|a, b|
+        (&a.small, &a.big).cmp(&(&b.small, &b.big)));
+    sys.subterm_store.subterms.dedup_by(|a, b|
+        (&a.small, &a.big) == (&b.small, &b.big));
     for c in sys.subterm_store.solved_subterms.iter_mut() {
         c.small = apply_term(c.small.clone());
         c.big = apply_term(c.big.clone());
     }
+    sys.subterm_store.solved_subterms.sort_by(|a, b|
+        (&a.small, &a.big).cmp(&(&b.small, &b.big)));
+    sys.subterm_store.solved_subterms.dedup_by(|a, b|
+        (&a.small, &a.big) == (&b.small, &b.big));
 }
 
 // =============================================================================
