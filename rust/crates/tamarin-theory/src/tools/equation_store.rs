@@ -175,6 +175,19 @@ impl EquationStore {
                 .trim();
             eprintln!("[set_false] caller={}", caller);
         }
+        if std::env::var("TAM_TRACE_SET_FALSE_FULL").is_ok() && !self.is_false() {
+            let bt = std::backtrace::Backtrace::force_capture();
+            let bt_s = format!("{bt}");
+            let cpath = crate::constraint::solver::trace::case_path_string();
+            let frames: Vec<&str> = bt_s.lines()
+                .filter(|l| l.contains("tamarin_theory") || l.contains("tamarin-theory") || l.contains("tamarin_term"))
+                .filter(|l| !l.contains("set_false"))
+                .filter(|l| !l.contains("std::"))
+                .take(8)
+                .map(|s| s.trim())
+                .collect();
+            eprintln!("[set_false_full] path={} frames=[ {} ]", cpath, frames.join(" | "));
+        }
         self.conj = Self::false_conj();
         self
     }
