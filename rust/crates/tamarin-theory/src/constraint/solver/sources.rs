@@ -5879,6 +5879,18 @@ pub fn solve_with_source_cases_action_with_ctx(
     let dbg_rt = std::env::var("TAM_RS_DBG_RUNTIME_CASES").as_deref() == Ok("1");
     let total_n = cases_iter.len();
     let mut out: Vec<(String, System, crate::fact::LNFact)> = Vec::new();
+    // Parallel Vec tracking each `out` entry's post-refineSubst+restrict
+    // case sub-system (only Some(_) for the HS-faithful applySource path;
+    // None for the legacy graft path).  After all source cases iterated,
+    // we run `remove_redundant_cases` keyed on this to mirror HS's
+    // `refineSource` → `removeRedundantCases ctxt stableVars` step
+    // (Sources.hs:138).  HS performs this dedup BEFORE `_applySource`'s
+    // someInst+conjoinSystem; we do it AFTER conjoin (storing the
+    // pre-conjoin sub-system) but use the SAME comparator + stable_vars,
+    // so two refineSubst arms whose pre-conjoin sub-systems alpha-coincide
+    // collapse to one.  Prevents RS `shape_mismatch` from dropping cases
+    // HS never conjoined because HS deduped them away.
+    let mut out_refined: Vec<Option<System>> = Vec::new();
     let mut kept_names: Vec<String> = Vec::new();
     let mut all_names: Vec<String> = Vec::new();
     for (name, case_sys) in cases_iter {
@@ -5907,7 +5919,7 @@ pub fn solve_with_source_cases_action_with_ctx(
                 // entry is one arm.  Same `case_label` for all arms;
                 // proof_method.rs::ProofMethod::SolveGoal handles
                 // `_case_N` disambiguation (HS ProofMethod.hs:485-490).
-                for (mut grafted_sys, live_action) in result {
+                for (mut grafted_sys, live_action, refined_case) in result {
                     if src.incomplete { grafted_sys.used_incomplete_source = true; }
                     if dbg_rt { kept_names.push(case_label.clone()); }
                     // Haskell-faithful: do NOT fan out variant SplitG
@@ -5929,6 +5941,7 @@ pub fn solve_with_source_cases_action_with_ctx(
                     // siblings that Haskell never has (StatVerif
                     // Resolve1_case_1/2, TLS S_2_case_1/2, etc.).
                     out.push((case_label.clone(), grafted_sys, live_action));
+                    out_refined.push(Some(refined_case));
                 }
                 let _ = name;
                 let _ = ctx_opt;
@@ -5956,6 +5969,7 @@ pub fn solve_with_source_cases_action_with_ctx(
         if src.incomplete { grafted.used_incomplete_source = true; }
         if dbg_rt { kept_names.push(case_label.clone()); }
         out.push((case_label, grafted, action_fact));
+        out_refined.push(None);
     }
     if dbg_rt {
         let head = match &fa_live.terms[0] {
@@ -5964,6 +5978,50 @@ pub fn solve_with_source_cases_action_with_ctx(
         };
         eprintln!("[RUNTIME_CASES_ACT] head={} total={} kept={} all={:?} kept_names={:?}",
             head, total_n, out.len(), all_names, kept_names);
+    }
+    // HS-faithful matchToGoal-level `removeRedundantCases` (Sources.hs:138).
+    // HS does this dedup INSIDE `refineSource`, BEFORE `_applySource`'s
+    // someInst+conjoinSystem.  RS dedups AFTER conjoin, but on the
+    // pre-conjoin case sub-system saved in `out_refined`.  Two refineSubst
+    // arms with alpha-equivalent pre-conjoin sub-systems (modulo non-
+    // stable_vars renaming) collapse to one — first-occurrence-wins.
+    //
+    // Gated on BP/MSet per HS's `removeRedundantCases` short-circuit
+    // (Sources.hs:331).  Skipped when no `ProofContext` is available
+    // (saturate-time `saturate_out_premise` path — that path's own
+    // refine_source_impl already deduplicates at line 3438).
+    if let Some(ctx) = ctx_opt {
+        let msig = ctx.maude.maude_sig();
+        // Gate via TAM_RS_DISABLE_MTG_DEDUP=1 to disable for rollback.
+        let mtg_enabled = std::env::var("TAM_RS_DISABLE_MTG_DEDUP").is_err();
+        if mtg_enabled && (msig.enable_bp || msig.enable_mset) {
+            use tamarin_term::lterm::HasFrees;
+            let stable_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar> = {
+                let mut s = std::collections::BTreeSet::new();
+                s.insert(goal_node.clone());
+                fa_live.for_each_free(&mut |v: &tamarin_term::lterm::LVar| {
+                    s.insert(v.clone());
+                });
+                s
+            };
+            let mut seen_keys: std::collections::BTreeSet<String>
+                = std::collections::BTreeSet::new();
+            let pairs: Vec<((String, System, crate::fact::LNFact), Option<System>)> =
+                out.into_iter().zip(out_refined.into_iter()).collect();
+            let mut kept_out: Vec<(String, System, crate::fact::LNFact)>
+                = Vec::with_capacity(pairs.len());
+            for (entry, refined_opt) in pairs {
+                let keep = match &refined_opt {
+                    Some(refined) => {
+                        let key = compute_compare_systems_key(refined, &stable_vars);
+                        seen_keys.insert(key)
+                    }
+                    None => true,
+                };
+                if keep { kept_out.push(entry); }
+            }
+            out = kept_out;
+        }
     }
     if out.is_empty() { return None; }
     Some(out)
@@ -6103,7 +6161,7 @@ fn auto_resolve_single_case_ku(
         let mut arms = apply_source_case_action(
             ctx, sys, src, case_sys, &live_node, &live_fa);
         if arms.is_empty() { break; }
-        let (mut grafted, _) = arms.swap_remove(0);
+        let (mut grafted, _, _) = arms.swap_remove(0);
         // Sanity: mark the live KU goal solved if not already.
         let live_goal = Goal::Action(live_node.clone(), live_fa.clone());
         for (g, st) in grafted.goals.iter_mut() {
@@ -7042,7 +7100,7 @@ fn apply_source_case_action(
     case_sys: &System,
     live_node: &crate::constraint::constraints::NodeId,
     fa_live: &crate::fact::LNFact,
-) -> Vec<(System, crate::fact::LNFact)> {
+) -> Vec<(System, crate::fact::LNFact, System)> {
     use crate::constraint::solver::reduction::{
         Reduction, SolveOutcome, SplitStrategy, bounds_max,
     };
@@ -7359,7 +7417,17 @@ fn apply_source_case_action(
     // but per-arm so each arm's eq_store substitutes through the rest
     // of the case body independently.
     let post_solve_sys_template = refined.sys.clone();
-    let mut out_arms: Vec<(System, crate::fact::LNFact)> =
+    // Each output entry is `(grafted_sys, live_action, refined_case)` —
+    // the third element is the post-refineSubst+restrict case sub-system
+    // BEFORE someInst+conjoinSystem.  Callers dedup on this to mirror
+    // HS's `refineSource` → `removeRedundantCases` step which happens
+    // BEFORE `_applySource`'s `someInst sysTh0 >> conjoinSystem sysTh`
+    // (Sources.hs:131-148, 444-468).  Two refineSubst arms whose
+    // post-restrict case sub-systems are alpha-equivalent should
+    // collapse to one — without this dedup, RS conjoins both, and
+    // any per-arm `setNodes:ruleInfoMismatch` (RS `shape_mismatch`)
+    // drops cases HS keeps because HS never conjoined the duplicate.
+    let mut out_arms: Vec<(System, crate::fact::LNFact, System)> =
         Vec::with_capacity(arm_eq_stores.len());
 
     for arm_eq_store in arm_eq_stores {
@@ -7470,6 +7538,11 @@ fn apply_source_case_action(
     crate::state_trace::emit(
         "applySource_refined", Some(&live_goal_for_trace), &refined.sys);
     let refined_case = refined.sys;
+    // Save a copy of the post-refineSubst+restrict case sub-system to
+    // attach to each output entry — used by the caller to dedup
+    // alpha-equivalent refineSubst arms across source cases
+    // (HS Sources.hs:138 `removeRedundantCases ctxt stableVars`).
+    let refined_case_for_dedup = refined_case.clone();
 
     // ---------------------------------------------------------------
     // D — `evalBindT (someInst sysTh0) keepVarBindings`.
@@ -7769,7 +7842,7 @@ fn apply_source_case_action(
 
     crate::state_trace::emit(
         "applySource_out", Some(&live_goal_for_trace), &r.sys);
-    out_arms.push((r.sys, live_action.clone()));
+    out_arms.push((r.sys, live_action.clone(), refined_case_for_dedup.clone()));
     } // end `for r in arm_reductions`
     } // end `for arm_eq_store in arm_eq_stores`
     out_arms
