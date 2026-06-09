@@ -7111,7 +7111,18 @@ fn apply_source_case_action(
         live_node.for_each_free(&mut visit);
         fa_live.for_each_free(&mut visit);
     }
-    let rename_shift = goal_max.saturating_add(1);
+    // HS's `_applySource` runs `someInst sysTh0` inside the Reduction
+    // monad's FreshT (Sources.hs:453), which is initialized from the
+    // LIVE system's global fresh counter — so the case's non-goal vars
+    // get fresh indices above EVERY live var, not just the goal's frees.
+    // Previously we shifted only past goal_max; that left case vars like
+    // `vr.0`/`i1.0` at index 0, colliding with live's existing
+    // `vr.0=Init_1`/`i1.0=Init_2` nodes at conjoinSystem→setNodes and
+    // tripping shape_mismatch on cases HS keeps.  Closes BP cluster
+    // (Joux PFS/EphkRev/establish, RYY/RYY_PFS key_secrecy, TAK1/
+    // TAK1_eCK_like session_key_establish, Chen_Kudla key_secrecy_*).
+    let live_max = system_max_idx(live_sys);
+    let rename_shift = goal_max.max(live_max).saturating_add(1);
     let shift_lvar = |v: &tamarin_term::lterm::LVar| {
         let mut v2 = v.clone();
         v2.idx = v2.idx.saturating_add(rename_shift);
@@ -7839,7 +7850,18 @@ fn apply_source_case_premise(
         live_node.for_each_free(&mut visit);
         fa_live.for_each_free(&mut visit);
     }
-    let rename_shift = goal_max.saturating_add(1);
+    // HS's `_applySource` runs `someInst sysTh0` inside the Reduction
+    // monad's FreshT (Sources.hs:453), which is initialized from the
+    // LIVE system's global fresh counter — so the case's non-goal vars
+    // get fresh indices above EVERY live var, not just the goal's frees.
+    // Previously we shifted only past goal_max; that left case vars like
+    // `vr.0`/`i1.0` at index 0, colliding with live's existing
+    // `vr.0=Init_1`/`i1.0=Init_2` nodes at conjoinSystem→setNodes and
+    // tripping shape_mismatch on cases HS keeps.  Closes BP cluster
+    // (Joux PFS/EphkRev/establish, RYY/RYY_PFS key_secrecy, TAK1/
+    // TAK1_eCK_like session_key_establish, Chen_Kudla key_secrecy_*).
+    let live_max = system_max_idx(live_sys);
+    let rename_shift = goal_max.max(live_max).saturating_add(1);
     let shift_lvar = |v: &tamarin_term::lterm::LVar| {
         let mut v2 = v.clone();
         v2.idx = v2.idx.saturating_add(rename_shift);
