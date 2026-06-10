@@ -242,6 +242,40 @@ pub fn pretty_fact(fa: &p::Fact) -> String {
     s
 }
 
+/// HS `ppFactsList list = fsep [operator_ "[", ppList (map ppFact list),
+/// operator_ "]"]` where `ppList = fsep . punctuate comma`
+/// (Theory/Model/Rule.hs:1266-1268).
+fn facts_list_doc(facts: &[p::Fact]) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let inner: Vec<Doc> = facts.iter().map(|f| fact_to_doc(f, &[])).collect();
+    let body = hpj::fsep(hpj::punctuate(comma_doc(), inner));
+    hpj::fsep(vec![Doc::text("["), body, Doc::text("]")])
+}
+
+/// HS `prettyRuleRestrGen` (Theory/Model/Rule.hs:1254-1262):
+///   `sep [ nest 1 (ppFactsList prems)
+///        , if null acts then "-->"
+///          else fsep ["--[", ppList (map ppFact acts), "]->"]
+///        , nest 1 (ppFactsList concls) ]`
+/// Built as a `pretty_hpj::Doc` so the `sep`/`fsep` wrapping is HS-exact.
+pub fn rule_body_to_doc(
+    prems: &[p::Fact],
+    acts: &[p::Fact],
+    concls: &[p::Fact],
+) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let prem_doc = facts_list_doc(prems).nest(1);
+    let arrow = if acts.is_empty() {
+        Doc::text("-->")
+    } else {
+        let act_docs: Vec<Doc> = acts.iter().map(|f| fact_to_doc(f, &[])).collect();
+        let act_body = hpj::fsep(hpj::punctuate(comma_doc(), act_docs));
+        hpj::fsep(vec![Doc::text("--["), act_body, Doc::text("]->")])
+    };
+    let conc_doc = facts_list_doc(concls).nest(1);
+    hpj::sep(vec![prem_doc, arrow, conc_doc])
+}
+
 // =============================================================================
 // Precise-Fresh state seeding (HS `avoidPrecise = avoidPreciseVars . frees`,
 // LTerm.hs:672-680).  We seed `name -> maxIdx+1` for every free-var name
@@ -803,8 +837,160 @@ fn pp_fact(fa: &p::Fact, scope: &[Bind], out: &mut String) {
 }
 
 // =============================================================================
-// Term
+// Term / Fact — HughesPJ Doc engine (HS-faithful wrapping)
+//
+// `term_to_doc` mirrors HS `prettyTerm` (Term/Term.hs:268-296): pairs use
+// `ppTerms ", " 1 "<" ">" = fcat . (text "<":) . (++[text ">"]) . map (nest 1)
+// . punctuate ", " . map ppTerm`; function applications use
+// `ppFun f ts = text (f ++ "(") <> fsep (punctuate comma (map ppTerm ts))
+// <> text ")"`.  `fact_to_doc` mirrors HS `prettyFact`/`ppFact`
+// (Theory/Model/Fact.hs:539-544) = `nestShort' (n++"(") ")" . fsep .
+// punctuate comma $ map ppTerm ts`, with `nestShort' lead finish =
+// nestShort (length lead + 1) (text lead) (text finish)` and
+// `nestShort n lead finish body = sep [lead $$ nest n body, finish]`
+// (Class.hs:218-223).  Building these as real `pretty_hpj::Doc` trees and
+// letting the ported HughesPJ engine lay them out makes the fcat/fsep/sep
+// wrap decisions byte-identical to HS, replacing the hand-rolled string
+// packers in pretty_theory.rs.
 // =============================================================================
+
+/// HS `comma = char ','`.
+fn comma_doc() -> crate::pretty_hpj::Doc {
+    crate::pretty_hpj::Doc::char(',')
+}
+
+/// Pretty-print a parser-AST term as a `pretty_hpj::Doc`.  Faithful to HS
+/// `prettyTerm`.  `scope` carries bound-var display names (empty for rule
+/// bodies; populated when rendering proof-tree/formula terms).
+pub fn term_to_doc(t: &p::Term, scope: &[Bind]) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::Doc;
+    use p::Term::*;
+    match t {
+        // Atomic / non-wrapping leaves: render via the existing string
+        // printer (these never break internally in HS either).
+        Var(_) | PubLit(_) | FreshLit(_) | NatLit(_) | Number(_) | NumberOne
+        | NatOne | DhNeutral | PatMatch(_) => {
+            let mut s = String::new();
+            pp_term(t, TermPrec::Top, scope, &mut s);
+            Doc::text(s)
+        }
+        Pair(items) => {
+            // Flatten right-associative pairs exactly as HS `split` does
+            // (Term/Term.hs:292-293), splicing a trailing Pair.
+            let mut flat: Vec<&p::Term> = Vec::with_capacity(items.len());
+            let mut cur: &[p::Term] = items;
+            loop {
+                let n = cur.len();
+                if n == 0 { break; }
+                for it in &cur[..n - 1] { flat.push(it); }
+                let last = &cur[n - 1];
+                if let Pair(inner) = last { cur = inner; } else { flat.push(last); break; }
+            }
+            pair_doc(&flat, scope)
+        }
+        App(name, args) => {
+            if args.is_empty() {
+                // HS `FApp (NoEq (f,_)) [] -> text f` (Term/Term.hs:278).
+                Doc::text(name.clone())
+            } else {
+                fun_doc(name, args, scope)
+            }
+        }
+        AlgApp(name, l, r) => fun_doc_two(name, l, r, scope),
+        Diff(l, r) => fun_doc_two("diff", l, r, scope),
+        BinOp(_, _, _) => {
+            // exp/AC: never break in HS prettyTerm; render flat.
+            let mut s = String::new();
+            pp_term(t, TermPrec::Top, scope, &mut s);
+            Doc::text(s)
+        }
+    }
+}
+
+/// HS `ppTerms ", " 1 "<" ">" flat` (Term/Term.hs:288-290) — a fcat of
+/// `text "<"`, each element `nest 1`'d and comma-suffixed (except last),
+/// and `text ">"`.
+fn pair_doc(flat: &[&p::Term], scope: &[Bind]) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let n = flat.len();
+    let mut parts: Vec<Doc> = Vec::with_capacity(n + 2);
+    parts.push(Doc::text("<"));
+    for (i, t) in flat.iter().enumerate() {
+        // HS punctuates with `text ", "`, so all but the last get a
+        // trailing ", "; then each is `nest 1`.
+        let mut d = term_to_doc(t, scope);
+        if i + 1 < n {
+            d = d.beside(Doc::text(", "));
+        }
+        parts.push(d.nest(1));
+    }
+    parts.push(Doc::text(">"));
+    hpj::fcat(parts)
+}
+
+/// HS `ppFun f ts = text (f ++ "(") <> fsep (punctuate comma (map ppTerm ts))
+/// <> text ")"` (Term/Term.hs:295-296).
+fn fun_doc(name: &str, args: &[p::Term], scope: &[Bind]) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let arg_docs: Vec<Doc> = args.iter().map(|a| term_to_doc(a, scope)).collect();
+    let body = hpj::fsep(hpj::punctuate(comma_doc(), arg_docs));
+    Doc::text(format!("{}(", name)).beside(body).beside(Doc::text(")"))
+}
+
+/// `fun_doc` for the binary algebraic / diff shapes that the parser stores
+/// as boxed pairs rather than a `Vec`.
+fn fun_doc_two(
+    name: &str,
+    l: &p::Term,
+    r: &p::Term,
+    scope: &[Bind],
+) -> crate::pretty_hpj::Doc {
+    let args = [l.clone(), r.clone()];
+    fun_doc(name, &args, scope)
+}
+
+/// Pretty-print a fact as a `pretty_hpj::Doc`.  Faithful to HS `prettyFact`
+/// / `ppFact` (Theory/Model/Fact.hs:539-544) with `nestShort'`
+/// (Class.hs:218-223).
+pub fn fact_to_doc(fa: &p::Fact, scope: &[Bind]) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let lead = {
+        let mut s = String::new();
+        if fa.persistent { s.push('!'); }
+        s.push_str(&fa.name);
+        s.push('(');
+        s
+    };
+    let arg_docs: Vec<Doc> = fa.args.iter().map(|a| term_to_doc(a, scope)).collect();
+    let body = hpj::fsep(hpj::punctuate(comma_doc(), arg_docs));
+    let mut d = nest_short_doc(&lead, ")", body);
+    // Fact annotations: `<> ppAnn an = brackets . fsep . punctuate comma`.
+    if !fa.annotations.is_empty() {
+        let mut ann = String::from("[");
+        for (i, a) in fa.annotations.iter().enumerate() {
+            if i > 0 { ann.push_str(", "); }
+            ann.push_str(match a {
+                p::FactAnnotation::SolveFirst => "+",
+                p::FactAnnotation::SolveLast => "-",
+                p::FactAnnotation::NoSources => "no_precomp",
+            });
+        }
+        ann.push(']');
+        d = d.beside(Doc::text(ann));
+    }
+    d
+}
+
+/// HS `nestShort' lead finish body =
+///   nestShort (length lead + 1) (text lead) (text finish) body
+///   = sep [ text lead $$ nest n (text finish-less body), text finish ]`
+/// where `$$` is HughesPJ `above` (Class.hs:218-223).
+fn nest_short_doc(lead: &str, finish: &str, body: crate::pretty_hpj::Doc) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let n = lead.chars().count() as isize + 1;
+    let above = Doc::text(lead).above(body.nest(n));
+    hpj::sep(vec![above, Doc::text(finish)])
+}
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum TermPrec {
@@ -1535,3 +1721,5 @@ mod tests {
         assert!(s.contains("#i < #j"));
     }
 }
+
+

@@ -583,92 +583,21 @@ fn render_rule_body(prems: &[p::Fact], acts: &[p::Fact], concs: &[p::Fact]) -> S
 }
 
 /// Render rule body at column `indent`.  Used by the AC variant block
-/// (indent=5) and the top-level rule (indent=3).  The brackets, arrow,
-/// and concs all sit at column `indent` when wrapped.
+/// (via `render_rule_body`, which prepends 2 spaces) and the top-level
+/// rule (indent=3).
+///
+/// HS `prettyNamedRule` wraps the body as `nest 2 (prettyRule ...)`
+/// (Theory/Model/Rule.hs:1286-1287), and `prettyRuleRestrGen`
+/// (Rule.hs:1254-1262) lays out `sep [nest 1 (ppFactsList prems), arrow,
+/// nest 1 (ppFactsList concls)]`.  The combined `nest 2 + nest 1` puts
+/// the bracket `[` at col 3, the arrow at col 2.  We build the whole body
+/// as one `pretty_hpj::Doc` (`rule_body_to_doc`) nested by `indent - 1`
+/// (== 2 for indent=3) so the HughesPJ engine makes the `sep`/`fsep`
+/// wrap decisions byte-identically to HS, instead of the hand-rolled
+/// string packers.
 fn render_rule_body_at(prems: &[p::Fact], acts: &[p::Fact], concs: &[p::Fact], indent: usize) -> String {
-    let pad = " ".repeat(indent);
-    let pad_arrow = " ".repeat(indent.saturating_sub(1));
-    // Single-line trial: render brackets inline (force no wrap by trying
-    // a wide budget first; if any internal wrap happened the multi-line
-    // path will catch it).
-    let prems_inline = render_fact_brackets_inline(prems);
-    let concs_inline = render_fact_brackets_inline(concs);
-    let acts_inline_body = acts.iter().map(render_fact).collect::<Vec<_>>().join(", ");
-    let single = if acts.is_empty() {
-        format!("{}{} --> {}", pad, prems_inline, concs_inline)
-    } else {
-        format!("{}{} --[ {} ]-> {}", pad, prems_inline, acts_inline_body, concs_inline)
-    };
-    if !single.contains('\n') && single.chars().count() <= indent + RIBBON
-        && !prems_inline.is_empty() && !concs_inline.is_empty()
-    {
-        return single;
-    }
-    // Multi-line clause layout (HS `sep [prems, arrow, concs]`).  Each
-    // clause is rendered at column `indent` with internal wrap allowed.
-    let prems_str = render_fact_brackets_at(prems, indent, indent);
-    let concs_str = render_fact_brackets_at(concs, indent, indent);
-    let mut out = String::new();
-    out.push_str(&pad);
-    out.push_str(&prems_str);
-    out.push('\n');
-    if acts.is_empty() {
-        out.push_str(&pad_arrow);
-        out.push_str("-->");
-    } else {
-        let acts_inline = format!("{}--[ {} ]->", pad_arrow, acts_inline_body);
-        if !acts_inline.contains('\n') && acts_inline.chars().count() <= indent + RIBBON {
-            out.push_str(&acts_inline);
-        } else {
-            // HS `fsep [text "--[", ppList acts, text "]->"]` (Rule.hs:1258-1261)
-            // with `ppList = fsep . punctuate comma`. We mirror HS's
-            // fsep packing semantics in three stages:
-            //
-            //   (1) `--[ body ]->` all on one line — checked above.
-            //   (2) `--[ body` on one line + `]->` on next — i.e. only
-            //       the closer breaks. Picked when the body is short
-            //       enough to inline after `--[` but the closer pushes
-            //       over.
-            //   (3) `--[` alone, then body fsep-packed across lines,
-            //       then `]->` alone. Picked when (2) still overflows.
-            //
-            // The inner body in cases (2)/(3) is an `fsep . punctuate
-            // comma` over the acts, so multi-fact bodies pack across
-            // lines comma-by-comma (HS pattern at CH07 line 22-27).
-            let body_indent = indent.saturating_sub(1);
-            // Try (2): `--[ acts_inline_body` on one line.
-            let opener_inline = format!("{}--[ {}", pad_arrow, acts_inline_body);
-            let opener_fits = !opener_inline.contains('\n')
-                && opener_inline.chars().count() <= indent + RIBBON;
-            if opener_fits {
-                out.push_str(&opener_inline);
-                out.push('\n');
-                out.push_str(&pad_arrow);
-                out.push_str("]->");
-            } else {
-                // (3) `--[` alone, then packed body, then `]->`.
-                // Render each act at `body_indent` so any internal
-                // multi-line continuation aligns to that col (matches
-                // the original per-act layout). `body_indent ==
-                // indent-1 == pad_arrow.len()`.
-                let act_strs: Vec<String> = acts.iter()
-                    .map(|a| render_fact_at(a, body_indent, body_indent))
-                    .collect();
-                out.push_str(&pad_arrow);
-                out.push_str("--[\n");
-                out.push_str(&" ".repeat(body_indent));
-                let packed = fsep_pack(&act_strs, body_indent, ", ", body_indent);
-                out.push_str(&packed);
-                out.push('\n');
-                out.push_str(&pad_arrow);
-                out.push_str("]->");
-            }
-        }
-    }
-    out.push('\n');
-    out.push_str(&pad);
-    out.push_str(&concs_str);
-    out
+    let nest = indent.saturating_sub(1) as isize;
+    pf::rule_body_to_doc(prems, acts, concs).nest(nest).render()
 }
 
 /// Inline-only bracket list (no wrap).  Used to check single-line fit
