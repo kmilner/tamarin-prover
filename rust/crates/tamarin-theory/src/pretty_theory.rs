@@ -363,6 +363,20 @@ fn render_parsed_item(
             // theories yet — leave empty so output is well-formed.
             None
         }
+        FormalComment { header, body } => {
+            // HS `prettyFormalComment` (lib/theory/src/Pretty.hs:19-21):
+            //   prettyFormalComment ""     body = multiComment_ [body]
+            //   prettyFormalComment header body = text $ header ++ "{*" ++ body ++ "*}"
+            // User `section{* .. *}` / `text{* .. *}` items always carry a
+            // non-empty header, so they render verbatim as
+            // `header{*body*}`.  (An empty header only arises from
+            // machine-injected comments via `addComment`.)
+            if header.is_empty() {
+                Some(format!("/*\n{}\n*/", body))
+            } else {
+                Some(format!("{}{{*{}*}}", header, body))
+            }
+        }
         _ => None,
     }
 }
@@ -370,6 +384,78 @@ fn render_parsed_item(
 // =============================================================================
 // Rule
 // =============================================================================
+
+/// Names of arity-1 NoEq function symbols in the closed theory signature.
+/// Mirrors HS `lookupArity` reading the parser-state signature for
+/// `naryOpApp`'s `k == 1` tuple-folding (Theory/Text/Parser/Term.hs:58-93).
+fn arity1_noeq_names(elab: &Theory) -> std::collections::HashSet<String> {
+    elab.signature
+        .maude_sig()
+        .no_eq_fun_syms()
+        .iter()
+        .filter(|s| s.arity == 1)
+        .map(|s| String::from_utf8_lossy(&s.name).to_string())
+        .collect()
+}
+
+/// Re-fold surplus arguments of arity-1 function applications into a single
+/// right-associative pair, mirroring HS `naryOpApp` for `k == 1`
+/// (Theory/Text/Parser/Term.hs:84-87):
+///   `ts <- parens $ if k == 1 then return <$> tupleterm ... else commaSep ...`
+/// where `tupleterm = chainr1 (...) (fAppPair <$ comma)`.  So for an arity-1
+/// symbol `f`, the surface `f(a, b, c)` parses to `f(<a, b, c>)` — a single
+/// argument which is the right-associative pair `<a, b, c>`.  RS's term
+/// parser is arity-unaware and keeps `App("f", [a, b, c])`, so the stored
+/// rule-body AST carries surplus args.  Re-fold them before rendering so the
+/// theory printout matches HS's `prettyTerm`, which prints the symbol's
+/// actual argument list verbatim (`ppFun f ts`, Term/Term.hs:295-296 — it
+/// does NOT itself flatten a tuple arg into a comma list).
+fn rewrite_arity1_term(
+    t: &p::Term,
+    arity1: &std::collections::HashSet<String>,
+) -> p::Term {
+    use p::Term::*;
+    match t {
+        App(name, args) => {
+            let new_args: Vec<p::Term> =
+                args.iter().map(|a| rewrite_arity1_term(a, arity1)).collect();
+            if arity1.contains(name) && new_args.len() > 1 {
+                App(name.clone(), vec![Pair(new_args)])
+            } else {
+                App(name.clone(), new_args)
+            }
+        }
+        Pair(items) => Pair(items.iter().map(|i| rewrite_arity1_term(i, arity1)).collect()),
+        AlgApp(name, l, r) => AlgApp(
+            name.clone(),
+            Box::new(rewrite_arity1_term(l, arity1)),
+            Box::new(rewrite_arity1_term(r, arity1)),
+        ),
+        Diff(l, r) => Diff(
+            Box::new(rewrite_arity1_term(l, arity1)),
+            Box::new(rewrite_arity1_term(r, arity1)),
+        ),
+        BinOp(op, l, r) => BinOp(
+            *op,
+            Box::new(rewrite_arity1_term(l, arity1)),
+            Box::new(rewrite_arity1_term(r, arity1)),
+        ),
+        PatMatch(inner) => PatMatch(Box::new(rewrite_arity1_term(inner, arity1))),
+        other => other.clone(),
+    }
+}
+
+fn rewrite_arity1_fact(
+    fa: &p::Fact,
+    arity1: &std::collections::HashSet<String>,
+) -> p::Fact {
+    p::Fact {
+        persistent: fa.persistent,
+        name: fa.name.clone(),
+        args: fa.args.iter().map(|a| rewrite_arity1_term(a, arity1)).collect(),
+        annotations: fa.annotations.clone(),
+    }
+}
 
 fn render_rule(parsed_rule: &p::Rule, elab: &Theory) -> String {
     let name = &parsed_rule.name;
@@ -385,11 +471,21 @@ fn render_rule(parsed_rule: &p::Rule, elab: &Theory) -> String {
     // `lib/theory/src/TheoryObject.hs::prettyTheory` → `prettyRule` chain
     // which operates on the post-`applyMacroInProtoRule` rule.
     let desugared = crate::elaborate::apply_let_block(parsed_rule);
-    let parsed_rule = &desugared;
+    // HS-faithful: an arity-1 function applied with a comma list, `f(a,b,c)`,
+    // is folded by `naryOpApp`'s `k == 1` branch into `f(<a,b,c>)`
+    // (Theory/Text/Parser/Term.hs:84-87).  RS's term parser keeps the surplus
+    // args, so re-fold here before rendering.  See `rewrite_arity1_term`.
+    let arity1 = arity1_noeq_names(elab);
+    let premises: Vec<p::Fact> =
+        desugared.premises.iter().map(|f| rewrite_arity1_fact(f, &arity1)).collect();
+    let actions: Vec<p::Fact> =
+        desugared.actions.iter().map(|f| rewrite_arity1_fact(f, &arity1)).collect();
+    let conclusions: Vec<p::Fact> =
+        desugared.conclusions.iter().map(|f| rewrite_arity1_fact(f, &arity1)).collect();
     out.push_str(&render_rule_body(
-        &parsed_rule.premises,
-        &parsed_rule.actions,
-        &parsed_rule.conclusions,
+        &premises,
+        &actions,
+        &conclusions,
     ));
 
     // Look up the elaborated rule by name to decide between
