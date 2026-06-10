@@ -3361,18 +3361,19 @@ fn refine_one_source(
         }
         // === Multi-branch path (default — Haskell-faithful) ===
         set_precompute_mode(true);
-        // HS uses no iter cap on solveAllSafeGoals.  Rust's
-        // worklist needs a safety bound, but 40 is too low for
-        // deep chain-destruction cases (PRF inside senc inside
-        // pair inside C_2's Out): cases get pushed-as-is at
-        // outer_cap, then re-refined next saturate-outer iter,
-        // and the per-iter contradiction check kills them
-        // before they finish.  500 is enough to let HS's
-        // typical TLS-style chains run to fixpoint within one
-        // saturate-outer iter.  Tunable via
-        // TAM_DISJ_OUTER_CAP.
+        // HS-faithful: NO per-branch step cap.  HS `solveAllSafeGoals`
+        // (Sources.hs:201-211) recurses until no safe goal and no
+        // source-pick remains; the ONLY exploration bounds are the
+        // open-chains limit (`chainsLeft`, paramOpenChainsLimit=10,
+        // Sources.hs:206-208) and the outer saturation limit
+        // (paramSaturationLimit, Sources.hs:481).  A finite default
+        // here PARKED branches mid-flight as emitted cases — states
+        // with open chain/KD goals HS would have solved or
+        // contradicted — ballooning Chen_Kudla's KU(exp) source from
+        // HS's 29 cases to 276 and flipping the no_WPFS verdict.
+        // TAM_DISJ_OUTER_CAP remains as a diagnostic override.
         let outer_cap: i64 = std::env::var("TAM_DISJ_OUTER_CAP")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(500);
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(i64::MAX);
         let (branches, branch_took_step) = run_solve_all_safe_goals_disj_with_progress(
             ctx, sys, ths_snapshot, /*chains_limit*/ 10,
             outer_cap, branch_cap, name_list);
@@ -3587,12 +3588,16 @@ fn saturate_sources_with_simp_opt(
         // is what `refineSource` (Sources.hs:118-133) does via
         // `runReduction proofStep ctxt se fs`.
         //
-        // Per-input-case branch cap (TAM_DISJ_BRANCH_CAP, default 50):
-        // bounds the worklist size to avoid exponential blow-up on
-        // protocols with many source-pick candidates.  Haskell uses
-        // lazy evaluation to dodge this; we need an explicit cap.
+        // HS-faithful: NO branch cap.  HS `refineSource` collects
+        // every Disj-monad branch `runReduction proofStep` yields
+        // (Sources.hs:118-133) — there is no bound on the number of
+        // output cases.  The old default (50) parked branches as
+        // half-refined cases once 50 finished, which is a non-HS
+        // mechanism (see TAM_DISJ_OUTER_CAP comment in
+        // refine_one_source).  TAM_DISJ_BRANCH_CAP remains as a
+        // diagnostic override.
         let branch_cap: usize = std::env::var("TAM_DISJ_BRANCH_CAP")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
         // Default is single-pick saturate (pre-#160 behaviour) — it
         // gives 53/103 corpus baseline and finds NSPK3 attack within
         // budget=500.  TAM_DISJ_REFINE=1 enables Haskell-faithful
