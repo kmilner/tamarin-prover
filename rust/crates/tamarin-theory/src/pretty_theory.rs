@@ -1429,40 +1429,14 @@ fn render_parsed_lemma(lem: &p::Lemma, proved: &[ProvedLemma]) -> String {
     }
     out.push_str(":\n");
 
-    // Lemma body shape from HS `prettyLemma` (Lemma.hs:117-127):
-    //   `sep [<quantifier>, doubleQuotes <formula>]`, all under `nest 2`.
-    // When the combined fits on a single line, lay out as
-    //   `  <quant> "<formula>"`
-    // Otherwise wrap to:
-    //   `  <quant>
-    //   "<formula>"`
-    // Within the formula, recursively wrap on the same width budget.
+    // Lemma body shape from HS `prettyLemma` (Lemma.hs:119-122):
+    //   `nest 2 $ sep [ prettyTraceQuantifier, doubleQuotes (prettyLNFormula f) ]`
+    // Routed through the HS-faithful Doc engine so the quant-vs-formula
+    // `sep` wrap, the formula's internal `sep`/`nest` wrapping, and the
+    // continuation indents are byte-identical to HS.  The `nest 2` indent
+    // is included in the rendered output (HS renders it at theory col 0).
     let quant = quantifier_keyword(&lem.trace_quantifier);
-    let flat_formula = pf::pretty_formula(&lem.formula);
-    let one_line = format!("  {} \"{}\"", quant, flat_formula);
-    // HS-faithful fit check: HughesPJ's `fits` walks only the flat doc
-    // text (ignoring `Nest` indent), so the check budget compares the
-    // doc's CONTENT length against `min(lineLength, ribbon) - sl`. Here
-    // the sep is wrapped in `nest 2` on a fresh line (sl=0), so budget
-    // = min(110, 73) = 73 and content = total_chars - 2_indent. Sticking
-    // with `total_chars <= WRAP_WIDTH(=ribbon=73)` would reject docs of
-    // content-length 72 (HS-fit at 73 with 1 spare); subtract the
-    // leading nest indent so the check matches HS's `fits`.
-    let content_len = one_line.chars().count().saturating_sub(2);
-    if content_len <= pf::WRAP_WIDTH {
-        out.push_str(&one_line);
-    } else {
-        // The formula starts at column 3 (`  "` prefix).  Width 76 means
-        // the formula's content has `76 - 3 = 73` cols available
-        // before wrap.  But the outer `"` should also fit, so allow up
-        // to 75 chars total inside the quotes — i.e. wrap at indent 3.
-        let wrapped = pf::pretty_formula_wrapped(&lem.formula, 3, pf::WRAP_WIDTH);
-        out.push_str("  ");
-        out.push_str(quant);
-        out.push_str("\n  \"");
-        out.push_str(&wrapped);
-        out.push('"');
-    }
+    out.push_str(&pf::lemma_header_line(quant, &lem.formula));
     out.push('\n');
 
     // /* guarded formula characterizing ... */
@@ -1525,15 +1499,17 @@ fn render_guarded_block(lem: &p::Lemma) -> String {
     // (`gnot gf`).  The result is the "counter-example" form.
     //
     // The guarded block is rendered inside `multiComment` at col 0 with
-    // the formula wrapped in `doubleQuotes` — so the formula's first
-    // char sits at col 1 (right after the `"`).  We pass indent=1 so
-    // the sep/nest wrap-points align with HS output (Lemma.hs:131-141).
+    // the formula wrapped in `doubleQuotes` (HS Lemma.hs:138/141:
+    // `doubleQuotes (prettyGuarded gf)`).  `pretty_guarded_doublequoted`
+    // models the `"` as a real `Doc` `beside`, so HughesPJ's column-shift
+    // puts continuation lines at the formula's start column (1) — exactly
+    // like HS's `"\"" <> prettyGuarded <> "\""`.
     let to_render = match &lem.trace_quantifier {
         p::TraceQuantifier::ExistsTrace => gf,
         p::TraceQuantifier::AllTraces => crate::guarded::gnot(&gf),
     };
-    let gtext = pf::pretty_guarded_wrapped(&to_render, 1, pf::WRAP_WIDTH);
-    format!("/*\n{}\n\"{}\"\n*/", header, gtext)
+    let quoted = pf::pretty_guarded_doublequoted(&to_render);
+    format!("/*\n{}\n{}\n*/", header, quoted)
 }
 
 // =============================================================================
@@ -1544,10 +1520,13 @@ fn render_parsed_restriction(r: &p::Restriction) -> String {
     let mut out = String::new();
     out.push_str("restriction ");
     out.push_str(&r.name);
-    out.push_str(":\n  \"");
-    let formula_str = pf::pretty_formula(&r.formula);
-    out.push_str(&formula_str);
-    out.push('"');
+    out.push_str(":\n");
+    // HS `prettyRestriction` (TheoryObject.hs:850):
+    //   `nest 2 $ doubleQuotes (prettyLNFormula f)` — routed through the
+    // HS-faithful Doc engine so the formula's `sep`/`nest` wrapping and
+    // continuation indents match HS byte-exact.  The `nest 2` indent and
+    // the surrounding `"` are part of the rendered Doc.
+    out.push_str(&pf::formula_doublequoted_nested(&r.formula, 2));
     // HS's `prettyRestriction`:
     //   `nest 2 (if safety then "// safety formula" else emptyDoc)`
     //   `case ogFormula of Just _ -> /* expanded formula: "..." */`
@@ -1556,9 +1535,9 @@ fn render_parsed_restriction(r: &p::Restriction) -> String {
     if is_safety_formula(&r.formula) {
         out.push_str("\n  // safety formula");
     }
-    out.push_str("\n\n  /*\n  expanded formula:\n  \"");
-    out.push_str(&formula_str);
-    out.push_str("\"\n  */");
+    out.push_str("\n\n  /*\n  expanded formula:\n");
+    out.push_str(&pf::formula_doublequoted_nested(&r.formula, 2));
+    out.push_str("\n  */");
     out
 }
 
@@ -1790,31 +1769,27 @@ fn pp_step_at(m: &crate::constraint::solver::proof_method::ProofMethod, indent: 
             None => "contradiction".to_string(),
         },
         PM::SolveGoal(g) => {
+            use crate::constraint::constraints::Goal;
             // HS `prettyProofMethod` (ProofMethod.hs:1494):
             //   SolveGoal goal ->
             //     keyword_ "solve(" <-> prettyGoal goal <-> keyword_ ")"
-            // `<->` is hsep-with-space → `solve( <goal> )` (one space
-            // after `(` and before `)`).
-            // The goal lands at col `indent + len("solve( ")` = `indent + 7`.
-            // Pass `indent` as the line_start so the goal's internal
-            // fact/term renderers see the ribbon budget measured from
-            // the line's actual start (where `solve(` sits), not from
-            // the goal's column — HS-faithful for the common case
-            // where solve(...) is the whole line content.
-            //
-            // Trailing for the goal = ` )` (2 chars) — used so the
-            // goal's inner fact-nestShort' Union sees these chars when
-            // deciding inline vs vertical, matching HS's `fits` which
-            // walks PAST the fact's sep into the outer doc's remaining
-            // text (including solve's closing ` )`).
+            // For a non-empty `DisjG`, `prettyGoal` is
+            //   `fsep $ punctuate "  ∥" (map (nest 1 . parens . prettyGuarded) gfs)`
+            // (Constraints.hs:281-283) — a multi-disjunct guarded formula
+            // that HS wraps across lines inside the global proof-tree Doc.
+            // Route this whole `solve( ... )` line through the HS-faithful
+            // Doc engine so the `fsep`/`sep`/`nest` wrap decisions and the
+            // continuation-line indents (col `indent + 7`, after `solve( `)
+            // are byte-identical to HS.
+            if let Goal::Disj(d) = g {
+                if !d.0.is_empty() {
+                    return pf::solve_disj_goal_line(&d.0, indent);
+                }
+            }
+            // Other goal shapes keep the existing nestShort'-based path.
+            // `<->` is hsep-with-space → `solve( <goal> )` (one space after
+            // `(` and before `)`).  The goal lands at col `indent + 7`.
             let goal_str = render_goal_at_trailing(g, indent + 7, indent, /*trailing_chars=*/2);
-            // HS `<->` is hsep-with-space (`<+>`).  Even when the goal
-            // wraps to multiple lines (via its own internal `sep`s),
-            // the trailing `keyword_ ")"` attaches to the LAST line of
-            // the goal output with one separating space — it does NOT
-            // get pushed onto its own line.  Match by appending ` )`
-            // to the post-wrap `goal_str` unconditionally.
-            // HS ProofMethod.hs:1494.
             format!("solve( {} )", goal_str)
         }
         PM::Invalidated => {

@@ -76,6 +76,40 @@ pub fn pretty_formula_wrapped(f: &p::Formula, indent: usize, _width: usize) -> S
     doc.render_at(hpj::LINE_LENGTH, hpj::RIBBON, indent)
 }
 
+/// Render the lemma-header line, mirroring HS `prettyLemma`
+/// (Lemma.hs:119-122):
+///   `nest 2 $ sep [ prettyTraceQuantifier, doubleQuotes (prettyLNFormula f) ]`
+/// Built as ONE `Doc` through the HS-faithful engine so the `sep`
+/// (quant-keyword vs formula) flat-or-wrap decision, the formula's
+/// internal `sep`/`nest` wrapping, and the continuation-line indents are
+/// byte-identical to HS.  `quant` is the trace-quantifier keyword (e.g.
+/// `"all-traces"` / `"exists-trace"`).  The returned string begins at
+/// column 0 (the `nest 2` indent IS included in the output, like HS's
+/// `nest 2` rendered at the theory's column 0).
+pub fn lemma_header_line(quant: &str, f: &p::Formula) -> String {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let mut state = avoid_precise_formula(f);
+    let formula_doc = formula_to_doc(f, &[], &mut state);
+    // `doubleQuotes d = "\"" <> d <> "\""` (Class.hs:148).
+    let dq = Doc::text("\"").beside(formula_doc).beside(Doc::text("\""));
+    // `sep [quant, dq]` then `nest 2`.
+    let line = hpj::sep(vec![Doc::text(quant), dq]).nest(2);
+    line.render()
+}
+
+/// Render `nest n $ doubleQuotes (prettyLNFormula f)` through the
+/// HS-faithful engine (the restriction-body shape, TheoryObject.hs:850).
+/// The `nest n` indent is included in the output; the `"` is a real Doc
+/// `beside` so the formula's wrapped continuation lines indent to the
+/// formula's start column.
+pub fn formula_doublequoted_nested(f: &p::Formula, nest_n: usize) -> String {
+    use crate::pretty_hpj::Doc;
+    let mut state = avoid_precise_formula(f);
+    let formula_doc = formula_to_doc(f, &[], &mut state);
+    let dq = Doc::text("\"").beside(formula_doc).beside(Doc::text("\""));
+    dq.nest(nest_n as isize).render()
+}
+
 /// Pretty-print a guarded formula.  Mirrors Haskell's
 /// `prettyGuarded` (Guarded.hs:822-826):
 ///
@@ -101,15 +135,90 @@ pub fn pretty_guarded(g: &Guarded) -> String {
 /// line width.  Mirrors Haskell's `prettyGuarded` (Guarded.hs:822-864)
 /// composed with the HughesPJ `sep`/`nest` layout semantics.
 ///
-/// We use the legacy string-based path here rather than the Doc engine
-/// because the original layout matches HS byte-exact on Tutorial and
-/// the engine path needs further calibration to handle the `nest 1`
-/// w-budget bookkeeping that HS uses for the 3-item inner sep here.
-/// The Doc engine IS used for the formula-side wrap (which fixes the
-/// wireguard 5-deep And case) via `pretty_formula_wrapped`.
-pub fn pretty_guarded_wrapped(g: &Guarded, indent: usize, width: usize) -> String {
+/// Routes through the HS-faithful Doc engine (`crate::pretty_hpj`):
+/// `guarded_to_doc` builds a `Doc` tree that mirrors HS `prettyGuarded`'s
+/// `sep`/`nest`/`fsep` structure node-for-node, then `render_at` lays it
+/// out with the same `get1` per-NilAbove `w`-shrinkage HughesPJ uses
+/// (HughesPJ.hs:1011).  `indent` is the column where the formula's first
+/// char will land (e.g. 1, right after the opening `"` of the lemma's
+/// `doubleQuotes` wrap, Lemma.hs:138/141).
+///
+/// NOTE: `render_at`'s `sl_initial` only shrinks the budget; it does NOT
+/// shift continuation lines by the leading prefix width.  In HS the
+/// `prettyGuarded` doc is the RIGHT operand of `doubleQuotes`'s `<>`
+/// (`"\"" <> prettyGuarded <> "\""`, Class.hs:148), and HughesPJ `beside`
+/// DOES shift the right doc's vertical layout by the leading `"`'s width
+/// (1 col).  Callers that place the formula after a 1-col prefix must use
+/// `pretty_guarded_doublequoted` (which models the `"` as a real Doc
+/// `beside`, getting the continuation indent right).  This bare entry
+/// point is kept for callers that pass `indent=0`.
+pub fn pretty_guarded_wrapped(g: &Guarded, indent: usize, _width: usize) -> String {
+    use crate::pretty_hpj as hpj;
     let mut state = avoid_precise_guarded(g);
-    pp_guarded_inner_wrapped(g, false, indent, /*line_start=*/0, width, &[], &mut state)
+    let doc = guarded_to_doc(g, &[], &mut state);
+    doc.render_at(hpj::LINE_LENGTH, hpj::RIBBON, indent)
+}
+
+/// HS `doubleQuotes (prettyGuarded gf)` (Lemma.hs:138/141, Class.hs:148).
+/// Builds `"\"" <> guarded_doc <> "\""` as a single Doc and renders it,
+/// so HughesPJ `beside`'s column-shift puts continuation lines at the
+/// formula's start column (1, right after the opening quote) — matching
+/// HS byte-exact.  The result is the full `"..."` string.
+pub fn pretty_guarded_doublequoted(g: &Guarded) -> String {
+    use crate::pretty_hpj::Doc;
+    let mut state = avoid_precise_guarded(g);
+    let doc = guarded_to_doc(g, &[], &mut state);
+    Doc::text("\"").beside(doc).beside(Doc::text("\"")).render()
+}
+
+/// Build the `pretty_hpj::Doc` for a `prettyGoal (DisjG (Disj gfs))`
+/// (Constraints.hs:281-283):
+///   `fsep $ punctuate (operator_ "  ∥") (map (nest 1 . parens . prettyGuarded) gfs)`
+/// Each disjunct is `nest 1 (parens (prettyGuarded gf))`, the separator is
+/// `"  ∥"` (two spaces + ∥) placed AFTER each non-last item by `punctuate`,
+/// and the items are joined by `fsep` (paragraph-fill, one space between).
+pub fn disj_goal_to_doc(gfs: &[Guarded]) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let items: Vec<Doc> = gfs.iter()
+        .map(|g| {
+            let mut state = avoid_precise_guarded(g);
+            let inner = guarded_to_doc(g, &[], &mut state);
+            // `nest 1 (parens (prettyGuarded gf))` — `parens` (Class.hs:149)
+            // is `"(" <> d <> ")"`.
+            Doc::text("(").beside(inner).beside(Doc::text(")")).nest(1)
+        })
+        .collect();
+    let punct = hpj::punctuate(Doc::text("  \u{2225}"), items); // "  ∥"
+    hpj::fsep(punct)
+}
+
+/// Render a full `solve( <DisjG> )` proof-method line through the
+/// HS-faithful engine, mirroring HS
+///   `SolveGoal goal -> keyword_ "solve(" <-> prettyGoal goal <-> keyword_ ")"`
+/// (ProofMethod.hs:1494) where `<->` is `<+>` (beside-with-space).  The
+/// whole thing is built as ONE `Doc` so HughesPJ's beside column-shift
+/// indents the goal's wrapped continuation lines to the column after
+/// `solve( ` (= `indent + 7`), byte-identical to HS.
+///
+/// `indent` is the column where `solve(` starts (the proof-tree depth
+/// indent).  The returned string's FIRST line has NO leading indent (the
+/// proof-tree printer adds that itself); continuation lines carry their
+/// full absolute indentation.
+pub fn solve_disj_goal_line(gfs: &[Guarded], indent: usize) -> String {
+    use crate::pretty_hpj::Doc;
+    let goal_doc = disj_goal_to_doc(gfs);
+    // `keyword_ "solve(" <+> goal <+> keyword_ ")"`.
+    let line = Doc::text("solve(")
+        .beside_sp(goal_doc)
+        .beside_sp(Doc::text(")"));
+    // Place at column `indent`: nest by `indent` so continuation lines are
+    // indented to absolute columns, then strip the leading `indent` spaces
+    // from the first line (the proof-tree printer prepends them itself).
+    let indented = line.nest(indent as isize);
+    let rendered = indented.render();
+    // The first line begins with exactly `indent` spaces from the nest.
+    let strip = rendered.chars().take(indent).take_while(|c| *c == ' ').count();
+    rendered[strip..].to_string()
 }
 
 /// Pretty-print an atom standalone (e.g. inside a goal label).
@@ -553,25 +662,6 @@ pub const LINE_LENGTH: usize = 110;
 /// `fits_flat` (`line_start + RIBBON`-capped at `LINE_LENGTH`), not
 /// this constant.
 pub const WRAP_WIDTH: usize = RIBBON;
-
-/// HS-faithful fit check.  Returns `true` iff a flat doc of length
-/// `flat_len` whose first char would land at column `start_col`, on a
-/// line that began at column `line_start`, with effective remaining
-/// lineLength budget `eff_w`, would fit per HS HughesPJ
-/// `fits ((w `min` r) - sl) p` (HughesPJ.hs:873).
-///
-/// HS's check: `sl + flat_len <= min(w, r)`, where
-///   - `sl = start_col - line_start` (chars before the doc on the
-///     current line, in the `get1` TextBeside chain),
-///   - `w = eff_w` (HS's `w` at this point in the doc walk),
-///   - `r = RIBBON`.
-///
-/// Equivalently: `end_col <= line_start + min(eff_w, RIBBON)`.
-fn fits_flat(line_start: usize, start_col: usize, flat_len: usize, eff_w: usize) -> bool {
-    let end_col = start_col + flat_len;
-    let cap = line_start + std::cmp::min(eff_w, RIBBON);
-    end_col <= cap
-}
 
 fn resolved_sort(v: &p::VarSpec, scope: &[Bind]) -> p::SortHint {
     if !matches!(v.sort, p::SortHint::Untagged) {
@@ -1081,275 +1171,158 @@ fn pp_binding_list_with_display(bs: &[Bind], out: &mut String) {
 
 
 // =============================================================================
-// HS-style wrapped layout for Guarded — legacy string-based path
+// HS-faithful wrapped layout for Guarded — Doc-engine path
 // =============================================================================
 //
-// Port of `prettyGuarded` (Guarded.hs:822-864) composed with HughesPJ's
-// `sep` / `nest` semantics.  Same flat-then-wrap strategy as
-// `pp_formula_wrap`: render flat first, and if it overflows the ribbon
-// width, decompose at the top-level operator.
+// Build a `pretty_hpj::Doc` tree mirroring HS `prettyGuarded`
+// (Guarded.hs:822-867) EXACTLY, then render it via the HughesPJ-faithful
+// engine (`crate::pretty_hpj`).  The atoms/terms render to flat strings
+// (HS `prettyNAtom` produces no internal sep/nest), so only the
+// formula-structural nodes (GDisj/GConj/GGuarded) produce sep-Unions
+// where the engine makes byte-exact wrap decisions.
+//
+// HS recurrences (Guarded.hs:830-866):
+//   pp (GAto a)        = prettyNAtom (bvarToLVar a)            -- flat
+//   pp (GDisj [])      = operator_ "⊥"
+//   pp (GDisj xs)      = parens $ sep $ punctuate " ∨" (map opParens ps)
+//   pp (GConj [])      = operator_ "⊤"
+//   pp (GConj xs)      = sep $ punctuate " ∧" (map opParens ps)
+//   pp (GGuarded ...)  = scopeFreshness $ ... with
+//       dante      = nest 1 (pp (GConj antecedent))
+//       quantifier = operator_ ppQ <-> ppVars vs <> operator_ "."
+//       (Ex,_,GConj []) -> sep [quantifier, dante]
+//       (All,[],GDisj []) | gfalse -> operator_ "¬" <> dante
+//       _               -> dsucc = nest 1 (pp gf);
+//                          sep [quantifier, sep [dante, connective, dsucc]]
 
-/// Wrap-aware variant of `pp_guarded_inner`.  `indent` is the column
-/// where the first character of the result will land in the final
-/// output; `width` is the target line width.
-fn pp_guarded_inner_wrapped(
+/// HS `opParens d = operator_ "(" <> d <> operator_ ")"` — for the plain
+/// `Doc` instance `operator_ = text` and `highlight = id`, so this is an
+/// unconditional `"(" <> d <> ")"` (Highlight.hs:58-59).
+fn gdoc_op_parens(d: crate::pretty_hpj::Doc) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::Doc;
+    Doc::text("(").beside(d).beside(Doc::text(")"))
+}
+
+/// Build a `pretty_hpj::Doc` for a guarded formula, mirroring HS `pp`
+/// inside `prettyGuarded` (Guarded.hs:830-866).  Threads the Precise
+/// fresh `state` exactly as `pp_guarded_inner` does (scope-freshness at
+/// each GGuarded), and reuses `pp_gatom`/`pp_binding_list_with_display`
+/// for the flat atom and binder strings.
+fn guarded_to_doc(
     g: &Guarded,
-    paren_atomic: bool,
-    indent: usize,
-    line_start: usize,
-    width: usize,
     scope: &[Vec<Bind>],
     state: &mut PreciseFreshState,
-) -> String {
-    // Flat first.
-    let flat = {
-        let mut s = String::new();
-        // Clone state for the flat probe — pp_guarded_inner mutates state
-        // at GGuarded scope-freshness boundaries but restores on exit, so
-        // a clone is safe and the outer state remains unchanged.
-        let mut probe_state = state.clone();
-        pp_guarded_inner(g, paren_atomic, scope, &mut probe_state, &mut s);
-        s
-    };
-    // HS-faithful fit check: see `fits_flat`.
-    if !flat.contains('\n')
-        && fits_flat(line_start, indent, flat.chars().count(), LINE_LENGTH)
-    {
-        return flat;
-    }
-    // Legacy width check retained for compatibility with callers that
-    // pass a tighter `width`.
-    let _ = width;
+) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
     match g {
-        Guarded::Atom(_) => flat,
-        Guarded::Disj(xs) if xs.is_empty() => flat,
-        Guarded::Conj(xs) if xs.is_empty() => flat,
-
+        Guarded::Atom(a) => {
+            // HS `pp (GAto a) = prettyNAtom (bvarToLVar a)` — flat atom.
+            let mut s = String::new();
+            pp_gatom(a, scope, &mut s);
+            Doc::text(s)
+        }
+        Guarded::Disj(xs) if xs.is_empty() => Doc::text("\u{22A5}"), // ⊥
+        Guarded::Conj(xs) if xs.is_empty() => Doc::text("\u{22A4}"), // ⊤
         Guarded::Disj(xs) => {
-            // HS Guarded.hs:833-835: `parens . sep . punctuate ∨ [opParens c]`.
-            // The Disj ALWAYS wraps itself in `(...)`.  When the caller
-            // additionally requested `opParens` (paren_atomic=true),
-            // there is an OUTER `(...)`.  Layout:
-            //   <outer_paren?>(<c0> ∨
-            //                  <c1> ∨
-            //                  ...
-            //                  <cn>)<outer_paren?>
-            // sep_col = indent + 1 (inside the inner `(`) when no
-            //           outer wrap, or indent + 2 when paren_atomic.
-            let outer = paren_atomic;
-            let inner_paren_col = if outer { indent + 1 } else { indent };
-            let sep_col = inner_paren_col + 1;
-            let mut out = String::new();
-            if outer { out.push('('); }
-            out.push('(');
-            for (i, x) in xs.iter().enumerate() {
-                // First item is on the SAME line as the opening `(`
-                // (line_start unchanged); subsequent items are on
-                // fresh lines at `sep_col` (line_start = sep_col).
-                let child_line_start = if i == 0 { line_start } else { sep_col };
-                if i > 0 {
-                    out.push('\n');
-                    out.push_str(&" ".repeat(sep_col));
-                }
-                // Each child is opParens'd (paren_atomic=true).
-                let child = pp_guarded_inner_wrapped(x, true, sep_col, child_line_start, width, scope, state);
-                out.push_str(&child);
-                if i + 1 < xs.len() {
-                    out.push_str(" \u{2228}"); // ∨ at end of each but last
-                }
-            }
-            out.push(')');
-            if outer { out.push(')'); }
-            out
+            // HS: `parens $ sep $ punctuate (operator_ " ∨") (map opParens ps)`.
+            let ps: Vec<Doc> = xs.iter()
+                .map(|x| gdoc_op_parens(guarded_to_doc(x, scope, state)))
+                .collect();
+            let punct = hpj::punctuate(Doc::text(" \u{2228}"), ps); // " ∨"
+            // `parens` (Class.hs:149) is `"(" <> d <> ")"` (no space).
+            Doc::text("(").beside(hpj::sep(punct)).beside(Doc::text(")"))
         }
-
         Guarded::Conj(xs) => {
-            // HS Guarded.hs:840-842: `sep . punctuate ∧ [opParens c]`.
-            // No self-wrap; caller's `opParens` (paren_atomic=true) adds
-            // the outer `(...)`.  Layout:
-            //   <paren?><c0> ∧
-            //           <c1> ∧
-            //           ...
-            //           <cn><paren?>
-            // sep_col = indent (no outer) or indent + 1 (outer).
-            let outer = paren_atomic;
-            let sep_col = if outer { indent + 1 } else { indent };
-            let mut out = String::new();
-            if outer { out.push('('); }
-            for (i, x) in xs.iter().enumerate() {
-                // First item: same line as `(` (line_start preserved).
-                // Subsequent: fresh line at sep_col.
-                let child_line_start = if i == 0 { line_start } else { sep_col };
-                if i > 0 {
-                    out.push('\n');
-                    out.push_str(&" ".repeat(sep_col));
-                }
-                let child = pp_guarded_inner_wrapped(x, true, sep_col, child_line_start, width, scope, state);
-                out.push_str(&child);
-                if i + 1 < xs.len() {
-                    out.push_str(" \u{2227}"); // ∧
-                }
-            }
-            if outer { out.push(')'); }
-            out
+            // HS: `sep $ punctuate (operator_ " ∧") (map opParens ps)`.
+            let ps: Vec<Doc> = xs.iter()
+                .map(|x| gdoc_op_parens(guarded_to_doc(x, scope, state)))
+                .collect();
+            let punct = hpj::punctuate(Doc::text(" \u{2227}"), ps); // " ∧"
+            hpj::sep(punct)
         }
-
         Guarded::GGuarded { qua, vars, guards, body } => {
-            // HS `scopeFreshness` boundary (Guarded.hs:844-846): save
-            // Precise state, allocate display names, render, restore.
+            // HS: `scopeFreshness $ do ...` (Guarded.hs:846-862).
             state.scope_freshness(|state| {
-            let alloc = allocate_guarded_binders(vars, scope, state);
-            let mut new_scope: Vec<Vec<Bind>> = scope.to_vec();
-            new_scope.push(alloc);
-
-            // Negation shortcut (HS Guarded.hs:856-857).  Flat only.
-            if matches!(qua, Quant::All)
-                && vars.is_empty()
-                && body_is_false(body)
-            {
-                return flat.clone();
-            }
-            // `∃ vs. (guards)` shortcut (HS Guarded.hs:854-855).
-            // Try flat (the only sensible layout); if the guards
-            // themselves are long, fall through to the generic path.
-            if matches!(qua, Quant::Ex) && body_is_true(body) {
-                return flat.clone();
-            }
-            // Generic GGuarded: `sep [quantifier, sep [dante, conn, dsucc]]`.
-            // Outer sep col = indent (or indent+1 if paren_atomic).
-            // Inner sep col = same as outer sep col (because the inner
-            // sep lands at the outer sep's col when the outer wraps).
-            // With nest 1 on dante and dsucc:
-            //   dante at sep_col + 1
-            //   connective at sep_col
-            //   dsucc at sep_col + 1
-            let outer = paren_atomic;
-            let sep_col = if outer { indent + 1 } else { indent };
-            let body_col = sep_col + 1;
-
-            // Quantifier line.
-            let mut quantifier = String::new();
-            quantifier.push(match qua {
-                Quant::All => '\u{2200}',
-                Quant::Ex => '\u{2203}',
-            });
-            quantifier.push(' ');
-            pp_binding_list_with_display(&new_scope[scope.len()], &mut quantifier);
-            quantifier.push_str(".");
-
-            // dante (antecedent): renders as `pp (GConj antecedent)` =
-            // `sep [opParens (pp g) | g <- antecedent]`.  Each guard
-            // becomes `(<atom>)`.  Try flat, then wrap if too long.
-            let dante_flat = if guards.is_empty() {
-                // `pp (GConj []) = ⊤` — but HS line 853-855 special-cases
-                // `(Ex, _, GConj [])` and (negation).  For other cases
-                // with empty antecedent, dante = `⊤` rendered.  In
-                // practice the generic path is only entered with at
-                // least one guard.  Defensive: render `⊤`.
-                "\u{22A4}".to_string()
-            } else {
-                let mut s = String::new();
-                for (i, gd) in guards.iter().enumerate() {
-                    if i > 0 { s.push_str(" \u{2227} "); }
-                    s.push('(');
-                    pp_gatom(gd, &new_scope, &mut s);
-                    s.push(')');
-                }
-                s
-            };
-            let dante_fits_flat = body_col + dante_flat.chars().count() <= width;
-            let dante_str = if dante_fits_flat || guards.len() <= 1 {
-                dante_flat
-            } else {
-                // Wrap dante across multiple lines.  `sep $ punctuate ∧
-                // [(g) for g in guards]` — placed at body_col.
-                let mut s = String::new();
-                for (i, gd) in guards.iter().enumerate() {
-                    if i > 0 {
-                        s.push('\n');
-                        s.push_str(&" ".repeat(body_col));
-                    }
-                    s.push('(');
-                    pp_gatom(gd, &new_scope, &mut s);
-                    s.push(')');
-                    if i + 1 < guards.len() {
-                        s.push_str(" \u{2227}");
-                    }
-                }
-                s
-            };
-
-            let connective = match qua {
-                Quant::All => "\u{21D2}", // ⇒
-                Quant::Ex => "\u{2227}",  // ∧
-            };
-
-            // dsucc (body): rendered BARE (no opParens), per
-            // Guarded.hs:858-860.  At body_col with width-budget.
-            // dsucc lands on a fresh line at body_col (line_start =
-            // body_col).
-            let dsucc_str = pp_guarded_inner_wrapped(body, false, body_col, body_col, width, &new_scope, state);
-
-            // Try the inner sep flat at body_col: `<dante> conn <dsucc>`
-            // on one line.  HS `nest 1` (Guarded.hs:852, 859) on dante
-            // and dsucc wraps the inner sep in `nest_ 1` via sep1's
-            // `sep1 g (Nest n p) k ys = nest_ n (sep1 g p (k-n) ys)`
-            // propagation (HughesPJ.hs:749).  At display, lay walks
-            // `Nest 1 inner_sep` at line start → shifts the WHOLE
-            // inner_sep by +1, so dante (and conn and dsucc) all land
-            // at `sep_col + 1 = body_col`, not at sep_col.
-            //
-            // Scheme 2 layout (used when inner_sep fits as one line):
-            //   <quantifier>
-            //   <body_col><dante> <conn> <dsucc>
-            //
-            // Fit check uses the GGuarded's outer `line_start` (where
-            // the OUTER sep's line began, before any local NilAbove).
-            // HS's `nicest1 w r sl` at the inner_sep Union has `sl`
-            // counting the line's get1-chain ink — which started from
-            // the outer sep's line_start.
-            let inner_flat_one_line =
-                !dante_str.contains('\n')
-                && !dsucc_str.contains('\n')
-                && fits_flat(
-                    line_start,
-                    body_col,
-                    dante_str.chars().count()
-                        + 1 + connective.chars().count() + 1
-                        + dsucc_str.chars().count(),
-                    LINE_LENGTH,
-                );
-
-            let mut out = String::new();
-            if outer { out.push('('); }
-            out.push_str(&quantifier);
-            out.push('\n');
-            if inner_flat_one_line {
-                // Scheme 2: quantifier on its own line; inner sep flat
-                // at body_col (HS's `nest_ 1` shift).
-                out.push_str(&" ".repeat(body_col));
-                out.push_str(&dante_str);
-                out.push(' ');
-                out.push_str(connective);
-                out.push(' ');
-                out.push_str(&dsucc_str);
-            } else {
-                // Scheme 3: full vertical inner sep.
-                out.push_str(&" ".repeat(body_col));
-                out.push_str(&dante_str);
-                out.push('\n');
-                out.push_str(&" ".repeat(sep_col));
-                out.push_str(connective);
-                out.push('\n');
-                out.push_str(&" ".repeat(body_col));
-                out.push_str(&dsucc_str);
-            }
-            if outer { out.push(')'); }
-            out
+                gguarded_to_doc(qua, vars, guards, body, scope, state)
             })
         }
     }
 }
+
+/// Doc for a `GGuarded`, after `scopeFreshness` saved the Precise state.
+/// Mirrors HS Guarded.hs:849-866.
+fn gguarded_to_doc(
+    qua: &Quant,
+    vars: &[crate::guarded::GBinding],
+    guards: &[crate::guarded::GAtom],
+    body: &Guarded,
+    scope: &[Vec<Bind>],
+    state: &mut PreciseFreshState,
+) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let alloc = allocate_guarded_binders(vars, scope, state);
+    let mut new_scope: Vec<Vec<Bind>> = scope.to_vec();
+    new_scope.push(alloc);
+
+    // `dante = nest 1 $ pp (GConj (Conj antecedent))` (Guarded.hs:854).
+    // The antecedent is `map (GAto ...) atoms`, so `pp (GConj ...)` =
+    // `sep $ punctuate " ∧" (map opParens [GAto a])` — each guard is a
+    // flat atom wrapped in opParens.
+    let dante = {
+        if guards.is_empty() {
+            // `pp (GConj (Conj [])) = operator_ "⊤"`.
+            Doc::text("\u{22A4}").nest(1)
+        } else {
+            let ps: Vec<Doc> = guards.iter()
+                .map(|gd| {
+                    let mut s = String::new();
+                    pp_gatom(gd, &new_scope, &mut s);
+                    gdoc_op_parens(Doc::text(s))
+                })
+                .collect();
+            let punct = hpj::punctuate(Doc::text(" \u{2227}"), ps);
+            hpj::sep(punct).nest(1)
+        }
+    };
+
+    // `quantifier = operator_ ppQuant <-> ppVars vs <> operator_ "."`.
+    // `<->` is `<+>` (beside with one space); `ppVars = fsep (map show)`.
+    let sym = match qua { Quant::All => "\u{2200}", Quant::Ex => "\u{2203}" };
+    let var_docs: Vec<Doc> = new_scope[scope.len()].iter()
+        .map(|b| {
+            let mut s = String::new();
+            s.push_str(sort_prefix_from_hint(b.1));
+            s.push_str(&b.2);
+            Doc::text(s)
+        })
+        .collect();
+    let ppvars = hpj::fsep(var_docs);
+    // `operator_ sym <+> ppvars <> operator_ "."`
+    let quantifier = Doc::text(sym).beside_sp(ppvars).beside(Doc::text("."));
+
+    // Case analysis (Guarded.hs:855-862).
+    let is_ex_trivial = matches!(qua, Quant::Ex) && body_is_true(body);
+    let is_neg = matches!(qua, Quant::All) && vars.is_empty() && body_is_false(body);
+
+    if is_neg {
+        // `(All, [], GDisj []) | gf == gfalse -> operator_ "¬" <> dante`.
+        Doc::text("\u{00AC}").beside(dante)
+    } else if is_ex_trivial {
+        // `(Ex, _, GConj []) -> sep [quantifier, dante]`.
+        hpj::sep(vec![quantifier, dante])
+    } else {
+        // `_ -> dsucc = nest 1 (pp gf);
+        //       sep [quantifier, sep [dante, connective, dsucc]]`.
+        let connective = Doc::text(match qua {
+            Quant::All => "\u{21D2}", // ⇒
+            Quant::Ex => "\u{2227}",  // ∧
+        });
+        let dsucc = guarded_to_doc(body, &new_scope, state).nest(1);
+        let inner = hpj::sep(vec![dante, connective, dsucc]);
+        hpj::sep(vec![quantifier, inner])
+    }
+}
+
 
 /// Pretty-print a binder list — uses each entry's display name, which
 /// is the source name (idx==0) or `name.<idx>` (HS `show LVar`,

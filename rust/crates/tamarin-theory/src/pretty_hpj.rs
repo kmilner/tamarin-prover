@@ -118,6 +118,13 @@ impl Doc {
         self.render_with(LINE_LENGTH, RIBBON)
     }
 
+    /// Debug: pretty-print the (pre-render) Doc tree structure.
+    pub fn dbg_tree(&self) -> String {
+        let mut s = String::new();
+        dbg_node(self, 0, &mut s);
+        s
+    }
+
     pub fn render_with(self, line_length: usize, ribbon: usize) -> String {
         let reduced = reduce_doc(self);
         let r = ribbon as isize;
@@ -125,6 +132,13 @@ impl Doc {
         let mut out = String::new();
         lay(0, &best, &mut out);
         out
+    }
+
+    /// Debug: dump the post-`get` (chosen-layout) reduced tree.
+    pub fn dbg_reduced(self, line_length: usize, ribbon: usize) -> String {
+        let reduced = reduce_doc(self);
+        let best = get_doc(line_length as isize, ribbon as isize, &reduced);
+        best.dbg_tree()
     }
 
     /// Render assuming `sl_initial` chars have already been emitted on
@@ -147,6 +161,18 @@ impl Doc {
 // ============================================================================
 // Smart constructors (internal)
 // ============================================================================
+
+fn dbg_node(d: &Doc, depth: usize, out: &mut String) {
+    let pad = "  ".repeat(depth);
+    match d {
+        Doc::Empty => out.push_str(&format!("{}Empty\n", pad)),
+        Doc::NoDoc => out.push_str(&format!("{}NoDoc\n", pad)),
+        Doc::NilAbove(p) => { out.push_str(&format!("{}NilAbove\n", pad)); dbg_node(p, depth+1, out); }
+        Doc::TextBeside(s, w, p) => { out.push_str(&format!("{}Text({:?},{})\n", pad, s, w)); dbg_node(p, depth+1, out); }
+        Doc::Nest(k, p) => { out.push_str(&format!("{}Nest({})\n", pad, k)); dbg_node(p, depth+1, out); }
+        Doc::Union(a, b) => { out.push_str(&format!("{}Union\n", pad)); dbg_node(a, depth+1, out); dbg_node(b, depth+1, out); }
+    }
+}
 
 fn rc(d: Doc) -> Rc<Doc> { Rc::new(d) }
 
@@ -206,16 +232,33 @@ fn beside_text(p: Doc, q: Doc) -> Doc {
 
 fn beside_inner(p: Doc, g: bool, q: Doc) -> Doc {
     match p {
+        // HS `beside NoDoc _ _ = NoDoc`.
         Doc::NoDoc => Doc::NoDoc,
+        // HS `beside Empty _ q = q`.
         Doc::Empty => q,
+        // HS `beside (Nest k p) g q = nest_ k $! beside p g q`.
         Doc::Nest(k, inner) => nest_(k, beside_inner((*inner).clone(), g, q)),
+        // HS `beside (p1 Union p2) g q = beside p1 g q union beside p2 g q`.
         Doc::Union(a, b) => union_(
             beside_inner((*a).clone(), g, q.clone()),
             beside_inner((*b).clone(), g, q),
         ),
+        // HS `beside (NilAbove p) g q = nilAbove_ $! beside p g q`.
         Doc::NilAbove(p1) => nil_above_(beside_inner((*p1).clone(), g, q)),
+        // HS `beside (TextBeside t p) g q = TextBeside t rest
+        //       where rest = case p of { Empty -> nilBeside g q
+        //                               ; _     -> beside p g q }`.
+        // CRITICAL: when the inner doc ends (rest = Empty), HS routes the
+        // tail `q` through `nilBeside g`, which ELIDES q's leading `Nest`
+        // (`nilBeside g (Nest _ p) = nilBeside g p`).  Recursing through
+        // `beside_inner(Empty, g, q)` instead would RETAIN that leading
+        // Nest, shifting later wrap columns by the nest amount (the NSPK3
+        // GGuarded inner-sep drift).
         Doc::TextBeside(s, w, rest) => {
-            let rest_inner = beside_inner((*rest).clone(), g, q);
+            let rest_inner = match &*rest {
+                Doc::Empty => nil_beside(g, q),
+                _ => beside_inner((*rest).clone(), g, q),
+            };
             text_beside_(s, w, rest_inner)
         }
     }
@@ -307,19 +350,48 @@ pub fn fsep(ds: Vec<Doc>) -> Doc { fill(true, ds) }
 /// HS `fcat` — fill-style paragraph, no separator.
 pub fn fcat(ds: Vec<Doc>) -> Doc { fill(false, ds) }
 
-/// HS `hsep` — single line, space-separated.
+/// HS `hsep = foldr (\p q -> Beside p True q) empty` then reduce
+/// (HughesPJ.hs:500).  RIGHT fold, no Empty-filtering — the `beside_`
+/// smart constructor handles Empty.  Using a LEFT fold (or pre-filtering
+/// Empty) builds a structurally different RDoc whose `Nest`/`Union`
+/// accumulation diverges from HS for 3+ items (NSPK3 GGuarded inner sep).
 pub fn hsep(ds: Vec<Doc>) -> Doc {
-    ds.into_iter().filter(|d| !matches!(d, Doc::Empty)).fold(Doc::Empty, |a, b| a.beside_sp(b))
+    foldr_beside(true, ds)
 }
 
-/// HS `hcat` — single line, no separator.
+/// HS `hcat = foldr (\p q -> Beside p False q) empty` (HughesPJ.hs:496).
 pub fn hcat(ds: Vec<Doc>) -> Doc {
-    ds.into_iter().filter(|d| !matches!(d, Doc::Empty)).fold(Doc::Empty, |a, b| a.beside(b))
+    foldr_beside(false, ds)
 }
 
-/// HS `vcat` — always vertical.
+/// HS `vcat = foldr (\p q -> Above p False q) empty` (HughesPJ.hs:504).
+/// RIGHT fold.
 pub fn vcat(ds: Vec<Doc>) -> Doc {
-    ds.into_iter().filter(|d| !matches!(d, Doc::Empty)).fold(Doc::Empty, |a, b| a.above(b))
+    // foldr Above empty ds  →  d0 $$ (d1 $$ (... $$ empty))
+    let mut acc = Doc::Empty;
+    for d in ds.into_iter().rev() {
+        acc = above_g(d, false, acc);
+    }
+    acc
+}
+
+/// HS `foldr (\p q -> Beside p g q) empty` (the hsep/hcat shape).
+fn foldr_beside(g: bool, ds: Vec<Doc>) -> Doc {
+    let mut acc = Doc::Empty;
+    for d in ds.into_iter().rev() {
+        // `beside_ d g acc`: Empty operands collapse (Class/HughesPJ
+        // `beside_ p _ Empty = p; beside_ Empty _ q = q`).
+        acc = if matches!(d, Doc::Empty) {
+            acc
+        } else if matches!(acc, Doc::Empty) {
+            d
+        } else if g {
+            d.beside_sp(acc)
+        } else {
+            d.beside(acc)
+        };
+    }
+    acc
 }
 
 fn sep_x(x: bool, mut ds: Vec<Doc>) -> Doc {
@@ -354,10 +426,12 @@ fn sep_nb(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
     match p {
         Doc::Nest(_, inner) => sep_nb(g, (*inner).clone(), k, ys),
         Doc::Empty => {
-            // HS: `oneLiner (nilBeside g (reduceDoc rest))
-            //     `mkUnion` nilAboveNest False k (reduceDoc (vcat ys))`
-            //  where rest | g = hsep ys
-            //             | otherwise = hcat ys
+            // HS `sepNB g Empty k ys` (pretty-1.1.3.6 HughesPJ.hs:760-766):
+            //   = oneLiner (nilBeside g (reduceDoc rest)) `mkUnion`
+            //     nilAboveNest False k (reduceDoc (vcat ys))
+            //   where rest | g = hsep ys | otherwise = hcat ys
+            // The flag is `False` (see the XXX comment in pretty-1.1.3.6
+            // — GHC's bundled pretty settled on False).
             let rest = if g { hsep(ys.clone()) } else { hcat(ys.clone()) };
             let left = one_liner(nil_beside(g, reduce_doc(rest)));
             let right = nil_above_nest(false, k, reduce_doc(vcat(ys)));
@@ -432,7 +506,11 @@ fn fill_nb(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
     }
 }
 
-/// HS `fillNBE`.
+/// HS `fillNBE` (pretty-1.1.3.6 HughesPJ.hs:824+):
+///   fillNBE g k y ys
+///     = nilBeside g (fill1 g ((elideNest . oneLiner . reduceDoc) y) k1 ys)
+///         `mkUnion` nilAboveNest False k (fill g (y:ys))
+///     where k1 | g = k - 1 | otherwise = k
 fn fill_nbe(g: bool, k: isize, y: Doc, ys: Vec<Doc>) -> Doc {
     let k1 = if g { k - 1 } else { k };
     let inner_y = elide_nest(one_liner(reduce_doc(y.clone())));
@@ -858,5 +936,68 @@ mod tests {
         // Verify '<' is on first line, '>' is on its own line or
         // attached to ddd.
         assert!(out.starts_with('<'), "got: {out:?}");
+    }
+}
+
+#[cfg(test)]
+mod sep_nb_regression {
+    use super::*;
+
+    /// Regression for the `sepNB`/`fillNBE` `nilAboveNest` flag fix.
+    ///
+    /// HS `sepNB g Empty k ys` uses `nilAboveNest True k ...` (the flag
+    /// is `True`, not `False`); with `False` and `k > 0` the wrapped tail
+    /// item was inlined `k` spaces and dropped one column to the left.
+    ///
+    /// This case mirrors NSPK3 injective_agree's all-counterexamples
+    /// guarded formula: a GDisj whose disjuncts are GGuarded with
+    /// recursive `∀`-bodies that themselves wrap.  The expected output is
+    /// byte-identical to `Text.PrettyPrint.HughesPJ` (verified against the
+    /// real library at width 50 / ribbon 33).
+    #[test]
+    fn nested_sep_disjunct_second_item_column() {
+        let opp = |d: Doc| Doc::text("(").beside(d).beside(Doc::text(")"));
+        let fa = |atom: &str| {
+            let quant = Doc::text("F.");
+            let dante = opp(Doc::text(atom)).nest(1);
+            let conn = Doc::text("=>");
+            let dsucc = Doc::text("RHS").nest(1);
+            sep(vec![quant, sep(vec![dante, conn, dsucc])])
+        };
+        let mkdj = |label: &str| {
+            let quant = Doc::text(format!("Q{}.", label));
+            let dante = opp(Doc::text("DANTE")).nest(1);
+            let conn = Doc::text("C");
+            let g1 = opp(fa("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")).beside(Doc::text(" &"));
+            let g2 = opp(fa("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"));
+            let dsucc = sep(vec![g1, g2]).nest(1);
+            sep(vec![quant, sep(vec![dante, conn, dsucc])])
+        };
+        let mp = punctuate(Doc::text(" |"), vec![opp(mkdj("x")), opp(mkdj("y"))]);
+        let out = Doc::text("(").beside(sep(mp)).beside(Doc::text(")")).render_with(50, 33);
+        let expected = "\
+((Qx.
+   (DANTE)
+  C
+   (F.
+     (AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA)
+    =>
+     RHS) &
+   (F.
+     (BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB)
+    =>
+     RHS)) |
+ (Qy.
+   (DANTE)
+  C
+   (F.
+     (AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA)
+    =>
+     RHS) &
+   (F.
+     (BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB)
+    =>
+     RHS)))";
+        assert_eq!(out, expected, "got:\n{out}");
     }
 }
