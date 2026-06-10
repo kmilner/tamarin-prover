@@ -155,8 +155,9 @@ export HS_PATH="$hs_path" RS_PATH="$rs_path" CANON="$canon" TIMEOUT EXTRA_ENV \
        HS_CANON_CACHE CACHE_VERSION NO_HS_CACHE
 
 # --- Per-lemma worker. Emits ONE machine-parseable line on stdout:
-#       <file>\t<lemma>\t<status>\t<hs_lines>\t<rs_lines>\t<diff>
+#       <file>\t<lemma>\t<status>\t<hs_lines>\t<rs_lines>\t<diff>\t<hs_ms>\t<rs_ms>
 #     status in {MATCH, DIFF, SKIP_NO_HS, SKIP_RS_ERR, SKIP_TIMEOUT}.
+#     hs_ms is "-" when HS came from the canon cache (not re-run).
 worker() {
     local f="$1" lemma="$2"
     local tmp; tmp="$(mktemp -d)"
@@ -177,7 +178,7 @@ worker() {
     # sweep — and the timeouts happen to be the heaviest jcs18 lemmas
     # using GB of RAM each.  Caching the negative outcomes cuts warm-sweep
     # CPU dramatically.
-    local hs_canon="$tmp/hs.canon" hs_rc=0
+    local hs_canon="$tmp/hs.canon" hs_rc=0 hs_ms="-"
     local key="" key_empty="" key_timeout=""
     if [ -z "$NO_HS_CACHE" ]; then
         key="$HS_CANON_CACHE/$(hs_cache_key "$f" "$lemma")"
@@ -195,8 +196,10 @@ worker() {
     elif [ -n "$key" ] && [ -f "$key" ]; then
         hs_canon="$key"
     else
+        local hs_t0; hs_t0=$(date +%s%3N)
         timeout "$TIMEOUT" "$HS_PATH" +RTS -N1 -RTS --prove="$lemma" "$f" 2>/dev/null > "$tmp/hs.out"
         hs_rc=$?
+        hs_ms=$(( $(date +%s%3N) - hs_t0 ))
         slice_canon "$lemma" "$tmp/hs.out" "$tmp/hs.canon"
         if [ -n "$key" ]; then
             if [ "$hs_rc" -eq 124 ]; then
@@ -210,31 +213,33 @@ worker() {
     fi
 
     # --- RS: dump_proof emits only the proof tree for this lemma (per-lemma).
+    local rs_t0; rs_t0=$(date +%s%3N)
     timeout "$TIMEOUT" env $EXTRA_ENV "$RS_PATH" "$f" "$lemma" 2>/dev/null | python3 "$CANON" > "$tmp/rs.canon" 2>/dev/null
     local rs_rc=${PIPESTATUS[0]}
+    local rs_ms=$(( $(date +%s%3N) - rs_t0 ))
 
     local hs_lines rs_lines d
     hs_lines=$(grep -c . "$hs_canon"); hs_lines=${hs_lines// /}
     rs_lines=$(grep -c . "$tmp/rs.canon"); rs_lines=${rs_lines// /}
 
     if [ "$hs_rc" -eq 124 ] || [ "$rs_rc" -eq 124 ]; then
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$f" "$lemma" "SKIP_TIMEOUT" "$hs_lines" "$rs_lines" "-"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$f" "$lemma" "SKIP_TIMEOUT" "$hs_lines" "$rs_lines" "-" "$hs_ms" "$rs_ms"
         return 0
     fi
     if [ "$hs_lines" -eq 0 ]; then
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$f" "$lemma" "SKIP_NO_HS" "$hs_lines" "$rs_lines" "-"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$f" "$lemma" "SKIP_NO_HS" "$hs_lines" "$rs_lines" "-" "$hs_ms" "$rs_ms"
         return 0
     fi
     if [ "$rs_lines" -eq 0 ]; then
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$f" "$lemma" "SKIP_RS_ERR" "$hs_lines" "$rs_lines" "-"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$f" "$lemma" "SKIP_RS_ERR" "$hs_lines" "$rs_lines" "-" "$hs_ms" "$rs_ms"
         return 0
     fi
 
     d=$(diff "$hs_canon" "$tmp/rs.canon" 2>/dev/null | wc -l); d=${d// /}
     if [ "$d" -eq 0 ]; then
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$f" "$lemma" "MATCH" "$hs_lines" "$rs_lines" "0"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$f" "$lemma" "MATCH" "$hs_lines" "$rs_lines" "0" "$hs_ms" "$rs_ms"
     else
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$f" "$lemma" "DIFF" "$hs_lines" "$rs_lines" "$d"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$f" "$lemma" "DIFF" "$hs_lines" "$rs_lines" "$d" "$hs_ms" "$rs_ms"
     fi
     return 0
 }
@@ -314,18 +319,46 @@ tr '\t' '\n' < "$tasklist" | xargs -d '\n' -P "$JOBS" -n 2 bash -c 'worker "$0" 
 sort -t$'\t' -k1,1 -k2,2 "$results" > "$results.sorted"
 
 match=0; diffn=0; skip_no_hs=0; skip_rs_err=0; skip_timeout=0
-declare -a divergent=()
-while IFS=$'\t' read -r f lem status hs rs d; do
+declare -a divergent=() rs_times=() hs_times=()
+declare -a rs_slow=() hs_slow=()
+while IFS=$'\t' read -r f lem status hs rs d hs_ms rs_ms; do
+    hs_ms="${hs_ms:--}"; rs_ms="${rs_ms:--}"
+    if [ "$hs_ms" = "-" ]; then t=" [hs:cache rs:${rs_ms}ms]"; else t=" [hs:${hs_ms}ms rs:${rs_ms}ms]"; fi
     case "$status" in
-        MATCH)        match=$((match+1));        echo "$f::$lem: MATCH (HS:$hs, RS:$rs)";;
-        DIFF)         diffn=$((diffn+1));         echo "$f::$lem: $d diff lines (HS:$hs, RS:$rs)"; divergent+=("$d"$'\t'"$f::$lem (HS:$hs, RS:$rs)");;
-        SKIP_NO_HS)   skip_no_hs=$((skip_no_hs+1));   echo "$f::$lem: SKIP (no HS skeleton)";;
-        SKIP_RS_ERR)  skip_rs_err=$((skip_rs_err+1)); echo "$f::$lem: SKIP (RS produced no tree; HS:$hs)";;
-        SKIP_TIMEOUT) skip_timeout=$((skip_timeout+1)); echo "$f::$lem: SKIP (timeout ${TIMEOUT}s)";;
+        MATCH)        match=$((match+1));        echo "$f::$lem: MATCH (HS:$hs, RS:$rs)$t";;
+        DIFF)         diffn=$((diffn+1));         echo "$f::$lem: $d diff lines (HS:$hs, RS:$rs)$t"; divergent+=("$d"$'\t'"$f::$lem (HS:$hs, RS:$rs)");;
+        SKIP_NO_HS)   skip_no_hs=$((skip_no_hs+1));   echo "$f::$lem: SKIP (no HS skeleton)$t";;
+        SKIP_RS_ERR)  skip_rs_err=$((skip_rs_err+1)); echo "$f::$lem: SKIP (RS produced no tree; HS:$hs)$t";;
+        SKIP_TIMEOUT) skip_timeout=$((skip_timeout+1)); echo "$f::$lem: SKIP (timeout ${TIMEOUT}s)$t";;
         *)            echo "$f::$lem: SKIP (unknown status '$status')"; skip_no_hs=$((skip_no_hs+1));;
     esac
+    if [ "$rs_ms" != "-" ]; then
+        rs_times+=("$rs_ms"); rs_slow+=("$rs_ms"$'\t'"$status"$'\t'"$f::$lem")
+    fi
+    if [ "$hs_ms" != "-" ]; then
+        hs_times+=("$hs_ms"); hs_slow+=("$hs_ms"$'\t'"$status"$'\t'"$f::$lem")
+    fi
 done < "$results.sorted"
 rm -f "$results.sorted"
+
+# --- Timing distribution helpers (input: array of ms values).
+pctl() { # pctl <p> <sorted-file>
+    local n; n=$(wc -l < "$2"); [ "$n" -eq 0 ] && { echo "-"; return; }
+    local i=$(( (n * $1 + 99) / 100 )); [ "$i" -lt 1 ] && i=1
+    sed -n "${i}p" "$2"
+}
+print_timing() { # print_timing <label> <times-array-name> <slow-array-name>
+    local -n times_ref=$2 slow_ref=$3
+    local n=${#times_ref[@]}
+    if [ "$n" -eq 0 ]; then echo "$1: no timed runs"; return; fi
+    local sorted; sorted="$(mktemp)"
+    printf '%s\n' "${times_ref[@]}" | sort -n > "$sorted"
+    echo "$1 ($n timed runs, ms): p50=$(pctl 50 "$sorted") p90=$(pctl 90 "$sorted") p99=$(pctl 99 "$sorted") max=$(pctl 100 "$sorted")"
+    echo "  slowest:"
+    printf '%s\n' "${slow_ref[@]}" | sort -t$'\t' -k1,1nr | head -10 | \
+        awk -F'\t' '{printf "    %8dms  %-12s %s\n", $1, $2, $3}'
+    rm -f "$sorted"
+}
 
 total=$((match+diffn+skip_no_hs+skip_rs_err+skip_timeout))
 echo ""
@@ -342,3 +375,7 @@ if [ "${#divergent[@]}" -gt 0 ]; then
     echo "divergent lemmas (largest diff first):"
     printf '%s\n' "${divergent[@]}" | sort -t$'\t' -k1,1nr | sed 's/^/  /; s/\t/ diff lines: /'
 fi
+echo ""
+echo "================ TIMING ================"
+print_timing "RS" rs_times rs_slow
+print_timing "HS (uncached only)" hs_times hs_slow
