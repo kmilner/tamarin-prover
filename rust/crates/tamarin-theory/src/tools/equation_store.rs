@@ -101,6 +101,83 @@ fn freshen_witness_range(
         .collect()
 }
 
+// ============================================================================
+// TAM_RS_DBG_IMPURE_FOLD=1 — pure-fresh-range invariant probes.
+//
+// HS enforces that every var in a VFresh subst's RANGE is fresh (to be
+// renamed at application time): Maude unifiers go through
+// `msubstToLSubstVFresh` which ERRORS on non-fresh range vars
+// (Maude/Types.hs:121-130), and `composeVFresh` lifts live vars entering a
+// VFresh range via `extendWithRenaming (varsRange s2) s1_0`
+// (Substitution.hs:39-47).  Any RS site that stores a disjunction subst
+// whose range references a LIVE system var violates this invariant; when
+// `simpSingleton` later folds such a subst, `fresh_to_free_avoiding`
+// renames the live var and severs its linkage to the system.
+//
+// These probes are zero-cost when the env var is unset.  The origin
+// registry maps a subst fingerprint to the label of the site that created
+// it, so an impure FOLD can be traced back to its CREATION site.
+// ============================================================================
+
+pub(crate) fn impure_dbg_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TAM_RS_DBG_IMPURE_FOLD").is_ok())
+}
+
+fn impure_dbg_registry()
+    -> &'static std::sync::Mutex<std::collections::HashMap<String, String>>
+{
+    static REG: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, String>>,
+    > = std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn impure_dbg_fp(s: &SubstVFresh<Name, LVar>) -> String {
+    format!("{:?}", s.to_list())
+}
+
+/// Register `s` as having been created/last-transformed at `label`.
+/// First-wins: pass-through sites (e.g. perform_split) re-register the
+/// same fingerprint, preserving the ORIGINAL creator's label.
+pub fn dbg_register_subst_origin(label: &str, s: &SubstVFresh<Name, LVar>) {
+    if !impure_dbg_enabled() { return; }
+    impure_dbg_registry().lock().unwrap()
+        .entry(impure_dbg_fp(s))
+        .or_insert_with(|| label.to_string());
+}
+
+/// Chain-register: a transformation site registers its OUTPUT subst with
+/// a label that includes the INPUT subst's origin, preserving provenance
+/// across rewrites (applyBound, simp passes).
+pub fn dbg_register_subst_transform(
+    label: &str,
+    input: &SubstVFresh<Name, LVar>,
+    output: &SubstVFresh<Name, LVar>,
+) {
+    if !impure_dbg_enabled() { return; }
+    let mut reg = impure_dbg_registry().lock().unwrap();
+    let in_origin = reg.get(&impure_dbg_fp(input)).cloned()
+        .unwrap_or_else(|| "?".to_string());
+    reg.entry(impure_dbg_fp(output))
+        .or_insert_with(|| format!("{}<-{}", label, in_origin));
+}
+
+pub fn dbg_subst_origin(s: &SubstVFresh<Name, LVar>) -> String {
+    impure_dbg_registry().lock().unwrap()
+        .get(&impure_dbg_fp(s)).cloned()
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Range vars of `s` that intersect `live` — nonempty means the
+/// pure-fresh-range invariant is violated w.r.t. that live set.
+pub fn dbg_impure_range_vars(
+    s: &SubstVFresh<Name, LVar>,
+    live: &BTreeSet<LVar>,
+) -> Vec<LVar> {
+    s.vars_range().into_iter().filter(|v| live.contains(v)).collect()
+}
+
 /// Index of a disjunction in the equation store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SplitId(pub i64);
@@ -670,7 +747,9 @@ impl EquationStore {
         }
         let mut substs: Vec<LNSubstVFresh> = Vec::with_capacity(unifiers.len());
         for raw in unifiers {
-            substs.push(LNSubstVFresh::from_list(raw.into_iter()));
+            let s = LNSubstVFresh::from_list(raw.into_iter());
+            dbg_register_subst_origin("addEqs.disj", &s);
+            substs.push(s);
         }
         if std::env::var("TAM_DBG_ADDEQS_VARIANTS").is_ok() {
             eprintln!("[addEqs_variants] inserted {} variants for eqs:", substs.len());
@@ -909,6 +988,11 @@ impl EquationStore {
                 LNSubstVFresh::from_list(kept)
             })
             .collect();
+        if impure_dbg_enabled() {
+            for (i, o) in self.conj[idx].substs.iter().zip(new_substs.iter()) {
+                dbg_register_subst_transform("simpAbstractName", i, o);
+            }
+        }
         self.conj[idx].substs = new_substs;
         if let Some(m) = maude {
             if self.apply_eq_store(m, &factor).is_err() {
@@ -1048,6 +1132,11 @@ impl EquationStore {
                 LNSubstVFresh::from_list(kept)
             })
             .collect();
+        if impure_dbg_enabled() {
+            for (i, o) in self.conj[idx].substs.iter().zip(new_substs.iter()) {
+                dbg_register_subst_transform("simpIdentify", i, o);
+            }
+        }
         self.conj[idx].substs = new_substs;
         if let Some(m) = maude {
             if self.apply_eq_store(m, &factor).is_err() {
@@ -1169,6 +1258,11 @@ impl EquationStore {
                 LNSubstVFresh::from_list(kept)
             })
             .collect();
+        if impure_dbg_enabled() {
+            for (i, o) in self.conj[idx].substs.iter().zip(new_substs.iter()) {
+                dbg_register_subst_transform("simpAbstractSortedVar", i, o);
+            }
+        }
         self.conj[idx].substs = new_substs;
         if let Some(m) = maude {
             if self.apply_eq_store(m, &factor).is_err() {
@@ -1318,6 +1412,11 @@ impl EquationStore {
                     LNSubstVFresh::from_list(kept)
                 })
                 .collect();
+            if impure_dbg_enabled() {
+                for (i, o) in self.conj[idx].substs.iter().zip(new_substs.iter()) {
+                    dbg_register_subst_transform("simpAbstractFun", i, o);
+                }
+            }
             self.conj[idx].substs = new_substs;
             if let Some(m) = maude {
                 if self.apply_eq_store(m, &factor).is_err() {
@@ -1369,6 +1468,11 @@ impl EquationStore {
                     LNSubstVFresh::from_list(kept)
                 })
                 .collect();
+            if impure_dbg_enabled() {
+                for (i, o) in self.conj[idx].substs.iter().zip(new_substs.iter()) {
+                    dbg_register_subst_transform("simpAbstractFunAC", i, o);
+                }
+            }
             self.conj[idx].substs = new_substs;
             if let Some(m) = maude {
                 if self.apply_eq_store(m, &factor).is_err() {
@@ -1618,6 +1722,22 @@ impl EquationStore {
                     .map(|v| format!("{}.{}", v.name, v.idx))
                     .collect();
                 eprintln!("[fold_variant]   preserve(ltkS/request): {:?}", pre_ltks);
+            }
+        }
+        // TAM_RS_DBG_IMPURE_FOLD=1: detect folding of a disj subst whose
+        // RANGE references live system vars (external_preserve).  Under
+        // HS's pure-fresh-range invariant this never happens; in RS it
+        // means a creation site stored an impure subst and the rename
+        // below severs a live linkage.
+        if impure_dbg_enabled() {
+            let bad = dbg_impure_range_vars(&subst_vf, external_preserve);
+            if !bad.is_empty() {
+                let path = crate::constraint::solver::trace::case_path_string();
+                let bad_s: Vec<String> = bad.iter()
+                    .map(|v| format!("{}.{}/{:?}", v.name, v.idx, v.sort)).collect();
+                eprintln!("[IMPURE_FOLD] origin={} path={} bad_range_vars=[{}] subst={:?}",
+                    dbg_subst_origin(&subst_vf), path, bad_s.join(","),
+                    subst_vf.to_list());
             }
         }
         let new_subst = subst_vf.fresh_to_free_avoiding(|n| alloc(n), &preserve);
@@ -2233,6 +2353,7 @@ impl EquationStore {
                     if dbg_in.is_some() {
                         eprintln!("  OUT: {:?}", out_subst.to_list());
                     }
+                    dbg_register_subst_transform("applyBound", s, &out_subst);
                     new_substs.push(out_subst);
                 }
             }

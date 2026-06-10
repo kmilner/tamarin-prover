@@ -5597,6 +5597,12 @@ fn graft_case_into(
             }).collect();
             tamarin_term::subst_vfresh::SubstVFresh::from_list(pairs)
         }).collect();
+        if crate::tools::equation_store::impure_dbg_enabled() {
+            for s in &renamed_substs {
+                crate::tools::equation_store::dbg_register_subst_origin(
+                    "applySourceCaseGraft", s);
+            }
+        }
         let new_id = out.eq_store.add_disj(renamed_substs);
         // Add the goal at the same position as the new disj.
         out.add_goal(crate::constraint::constraints::Goal::Split(new_id));

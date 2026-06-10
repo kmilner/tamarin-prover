@@ -1199,6 +1199,12 @@ impl<'ctx> Reduction<'ctx> {
                 eprintln!("[vs-dump]   [{}]: {}", i, pairs.join(" ; "));
             }
         }
+        if crate::tools::equation_store::impure_dbg_enabled() {
+            for s in &substs {
+                crate::tools::equation_store::dbg_register_subst_origin(
+                    "solveRuleConstraints", s);
+            }
+        }
         let id = self.sys.eq_store.add_disj(substs);
         // HS-faithful order (Reduction.hs:968-979): `solveRuleConstraints
         // (Just eqConstr)` is
@@ -2636,6 +2642,12 @@ impl<'ctx> Reduction<'ctx> {
                         .collect();
                     eprintln!("[conjoin_disj] sid={:?} subst[{}] entries=[{}]",
                         disj.split_id, j, pairs.join(", "));
+                }
+            }
+            if crate::tools::equation_store::impure_dbg_enabled() {
+                for s in &disj.substs {
+                    crate::tools::equation_store::dbg_register_subst_origin(
+                        "conjoinSystem", s);
                 }
             }
             let id = self.sys.eq_store.add_disj(disj.substs.clone());
