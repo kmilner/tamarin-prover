@@ -534,7 +534,40 @@ impl EquationStore {
             *self = self.clone().set_false();
             return Ok(None);
         }
-        if unifiers.len() == 1 {
+        // HS-faithful (EquationStore.hs:300-308): the compose-without-disj
+        // arm fires ONLY when the unifier list is exactly
+        // `[emptySubstVFresh]`:
+        //     (subst, [substFresh]) | substFresh == emptySubstVFresh ->
+        //         return (applyEqStoreAt "addEqs.single-unifier" hnd subst
+        //                                eqStore, Nothing)
+        // A SINGLE NON-EMPTY Maude unifier hits HS's THIRD arm
+        // (EquationStore.hs:306-308):
+        //     (subst, substs) -> addDisj (applyEqStoreAt ... subst eqStore)
+        //                                (S.fromList substs)  -- Just sid
+        // — it's stored as a SINGLETON VFresh disjunction (with split id),
+        // NOT eagerly composed.  Faithful consequences vs the old eager
+        // compose: (a) the fold happens via `simp`'s `simpSingleton`
+        // (`freshToFree` witness naming, EquationStore.hs:639-645) plus a
+        // SECOND `applyEqStoreAt "foreachDisj:simpSingleton"` round over
+        // the remaining disjs (EquationStore.hs:791-811) — two applyBound
+        // rounds with the local subst and the Maude unifier SEPARATELY,
+        // not one round with their composition; (b) SplitLater callers get
+        // a SplitG goal + a live singleton disj (HS Reduction.hs:942-944);
+        // (c) addDisj bumps the next-split-id counter.  The old eager
+        // compose used `freshen_witness_range` naming and one combined
+        // apply_eq_store round, with no HS counterpart for non-empty
+        // unifiers.  (Note: paired HS/RS traces on Scott::key_secrecy
+        // showed applyBound itself never SPLITS a disj subst on this
+        // corpus — out>1 occurred 0 times on both sides — so the effect
+        // of this fix is the naming/cadence/goal-counter alignment, not
+        // disj expansion.)
+        // Kill-switch: TAM_RS_DISABLE_ADDEQS_SINGLETON_DISJ=1 restores the
+        // old eager-compose for single non-empty unifiers.
+        let eager_single_disabled =
+            std::env::var("TAM_RS_DISABLE_ADDEQS_SINGLETON_DISJ").is_ok();
+        if unifiers.len() == 1
+            && (unifiers[0].is_empty() || eager_single_disabled)
+        {
             // Single unifier composes directly into the free substitution.
             // BUT first rename the witness range vars (vars Maude
             // introduced as auxiliaries that aren't in the input nor
@@ -588,7 +621,9 @@ impl EquationStore {
             return Ok(None);
         }
 
-        // Multiple unifiers → record as a fresh-range disjunction.
+        // Multiple unifiers — or a SINGLE NON-EMPTY unifier (HS's third
+        // arm, EquationStore.hs:306-308; see comment above) — record as
+        // a fresh-range disjunction.
         // Haskell composes each Maude unifier with the local subst
         // before storing as a disjunction (flattenUnif semantics).
         // The local subst becomes part of the free subst; the Maude
