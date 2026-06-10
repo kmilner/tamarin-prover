@@ -710,6 +710,7 @@ fn render_variant_subst(
     subst: &tamarin_term::subst_vfresh::LNSubstVFresh,
     n_width: usize,
 ) -> String {
+    use crate::pretty_hpj::Doc;
     let mut s = String::new();
     let bindings = subst.to_list();
     // Continuation prefix's width depends on `n_width` so subsequent lines
@@ -718,33 +719,32 @@ fn render_variant_subst(
     let cont_indent = " ".repeat(label.chars().count());
     for (i, (v, t)) in bindings.iter().enumerate() {
         let var_str = render_lvar(v);
-        let term_str = render_lnterm(t);
         let prefix = if i == 0 {
             format!("    {}", label)
         } else {
             format!("    {}", cont_indent)
         };
-        // HS uses `prettyNTerm v $$ nest 6 (text "=" <-> prettyNTerm b)`:
-        // if the var name fits in 5 chars, put `= term` at col 6 (within
-        // the entry).  Otherwise wrap.
-        if var_str.chars().count() <= 5 {
-            // `var<padded to 5><sp>= term`
-            let padded = format!("{:<5}", var_str);
-            s.push_str(&prefix);
-            s.push_str(&padded);
-            s.push_str(" = ");
-            s.push_str(&term_str);
-            s.push('\n');
-        } else {
-            s.push_str(&prefix);
-            s.push_str(&var_str);
-            s.push('\n');
-            // Continuation line at col 7 with `      = term`.
-            let cont = if i == 0 { "             = " } else { "             = " };
-            s.push_str(cont);
-            s.push_str(&term_str);
-            s.push('\n');
-        }
+        // HS `prettyEq (a,b) = prettyNTerm (Var a) $$ nest 6 (text "="
+        // <-> prettyNTerm b)` (SubstVFresh.hs:228-229).  `$$` overlaps the
+        // (single-line) var onto the same line as the nest-6 `= <term>`,
+        // giving `z     = term` with `=` at col 6; the term itself wraps
+        // via `prettyTerm`'s fcat/fsep, with continuation aligned under the
+        // first argument.  Build it as one Doc so the engine reproduces the
+        // term wrap and continuation indent byte-identically.  `<->` is
+        // `<+>` (beside-with-space).
+        let term_doc = pf::term_to_doc(&lnterm_to_parser(t), &[]);
+        let rhs = Doc::text("=").beside_sp(term_doc).nest(6);
+        let entry = Doc::text(var_str).above(rhs);
+        // Place the entry at its absolute column = prefix width.  Nest by
+        // that amount, render, then strip the leading prefix-width spaces
+        // from the first line (we emit `prefix` explicitly so the label /
+        // continuation-indent is right).
+        let col = prefix.chars().count();
+        let rendered = entry.nest(col as isize).render();
+        let strip = rendered.chars().take(col).take_while(|c| *c == ' ').count();
+        s.push_str(&prefix);
+        s.push_str(&rendered[strip..]);
+        s.push('\n');
     }
     s
 }
