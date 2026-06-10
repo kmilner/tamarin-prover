@@ -418,6 +418,36 @@ fn fan_out_on_pending_eq_arms(
     out
 }
 
+/// Install a multi-arm `SolveOutcome::Cases` result produced inside a
+/// simplify pass: arm[0] becomes the current eq-store, arms[1..] are
+/// stashed in `pending_eq_arms` for `simplify_system_fan_out_inner`'s
+/// drain points to fork on.
+///
+/// HS-faithful: `enforceNodeUniqueness` (Simplify.hs:192-197) merges
+/// KD-conclusions via `solveRuleEqs SplitNow`, KU-actions via
+/// `solveFactEqs SplitNow` and node-ids via `solveNodeIdEqs` — all of
+/// which run `disjunctionOfList $ performSplit eqs2 splitId`
+/// (Reduction.hs:730-738) when Maude returns multiple AC unifiers,
+/// forking the WHOLE remaining simplify continuation per arm in the
+/// `DisjT` layer.  RS's `solve_term_eqs` returns `Cases(arms)` WITHOUT
+/// installing any arm (the `mem::take`'d default store stays in
+/// `sys.eq_store`); a caller that ignores `Cases` therefore both DROPS
+/// every arm's bindings AND continues with a wiped store
+/// (conj=[], next_split=0) — the Bug #2/#3 "DisjT fan-out" family.
+fn install_pass_cases_arms(
+    red: &mut Reduction,
+    arms: Vec<crate::tools::equation_store::EquationStore>,
+) {
+    let mut it = arms.into_iter();
+    if let Some(first) = it.next() {
+        red.sys.invalidate_max_var_idx_cache();
+        red.sys.eq_store = first;
+    }
+    for rest in it {
+        red.pending_eq_arms.push(rest);
+    }
+}
+
 /// `trace_subpass` analog that lets the inner pass return a
 /// Result-typed value (Ok(ChangeIndicator) | Err(fan-out)).
 fn trace_subpass_fan_out<T, F>(
@@ -2186,15 +2216,20 @@ fn enforce_fresh_node_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         // swallowed `Ok(Contradictory)` and `Err(_)`, so a Fresh-rule
         // node id eqs that produced an mzero in Haskell stayed silent
         // here — funnel both through `mark_contradictory` so the
-        // mzero proxy stays in sync.  `Cases(_)` is treated as success
-        // (matches the pattern in `enforce_ku_action_uniqueness_pass`).
+        // mzero proxy stays in sync.  `Cases(arms)` must install arm[0]
+        // + stash the rest (see `install_pass_cases_arms`); ignoring it
+        // leaves the `mem::take`'d default eq-store installed.
         let res = red.solve_node_id_eqs(&eqs);
         match res {
             Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)
             | Err(_) => {
                 hit_contra = true;
             }
-            Ok(_) => {
+            Ok(crate::constraint::solver::reduction::SolveOutcome::Cases(arms)) => {
+                install_pass_cases_arms(red, arms);
+                changed = changed.or(ChangeIndicator::Changed);
+            }
+            Ok(crate::constraint::solver::reduction::SolveOutcome::Linear(_)) => {
                 changed = changed.or(ChangeIndicator::Changed);
             }
         }
@@ -2401,7 +2436,12 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         match res {
             Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)
             | Err(_) => hit_contra = true,
-            Ok(_) => changed = ChangeIndicator::Changed,
+            Ok(crate::constraint::solver::reduction::SolveOutcome::Cases(arms)) => {
+                install_pass_cases_arms(red, arms);
+                changed = ChangeIndicator::Changed;
+            }
+            Ok(crate::constraint::solver::reduction::SolveOutcome::Linear(_)) =>
+                changed = ChangeIndicator::Changed,
         }
     }
     if !node_eqs.is_empty() {
@@ -2409,7 +2449,12 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         match res {
             Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)
             | Err(_) => hit_contra = true,
-            Ok(_) => changed = ChangeIndicator::Changed,
+            Ok(crate::constraint::solver::reduction::SolveOutcome::Cases(arms)) => {
+                install_pass_cases_arms(red, arms);
+                changed = ChangeIndicator::Changed;
+            }
+            Ok(crate::constraint::solver::reduction::SolveOutcome::Linear(_)) =>
+                changed = ChangeIndicator::Changed,
         }
     }
     if hit_contra {
@@ -3033,7 +3078,15 @@ fn enforce_kd_fact_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     }
     let mut hit_contra = false;
     if !rule_eqs.is_empty() {
-        // Haskell uses `solveRuleEqs SplitNow` for the kdConcs merger.
+        // Haskell uses `solveRuleEqs SplitNow` for the kdConcs merger
+        // (Simplify.hs:196 `merge "ENU.kdConcs" (solveRuleEqs SplitNow)`).
+        // Multi-arm AC unifications fork the DisjT continuation in HS
+        // (Reduction.hs:730-738); mirror via install + pending_eq_arms.
+        // Bug #3 (Joux_EphkRev): ignoring `Cases` here left the
+        // `mem::take`'d default eq-store (conj=[], next_split=0)
+        // installed — the next substSystem then parked its setNodes
+        // rule-eq disjunctions at SplitId(0)/(1)/(2) as spurious
+        // splitEqs goals HS never has.
         let res = red.solve_rule_eqs(
             crate::constraint::solver::reduction::SplitStrategy::SplitNow,
             &rule_eqs,
@@ -3041,7 +3094,10 @@ fn enforce_kd_fact_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         match res {
             Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)
             | Err(_) => hit_contra = true,
-            Ok(_) => {}
+            Ok(crate::constraint::solver::reduction::SolveOutcome::Cases(arms)) => {
+                install_pass_cases_arms(red, arms);
+            }
+            Ok(crate::constraint::solver::reduction::SolveOutcome::Linear(_)) => {}
         }
     }
     if !node_eqs.is_empty() {
@@ -3049,7 +3105,10 @@ fn enforce_kd_fact_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         match res {
             Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)
             | Err(_) => hit_contra = true,
-            Ok(_) => {}
+            Ok(crate::constraint::solver::reduction::SolveOutcome::Cases(arms)) => {
+                install_pass_cases_arms(red, arms);
+            }
+            Ok(crate::constraint::solver::reduction::SolveOutcome::Linear(_)) => {}
         }
     }
     if hit_contra {
@@ -3767,6 +3826,12 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         mark_contradictory_labeled(red, "enforce_edge_uniqueness:node_id_eqs_contradictory");
         return ChangeIndicator::Changed;
     }
+    if let Ok(crate::constraint::solver::reduction::SolveOutcome::Cases(arms)) = res {
+        // Multi-arm node-id unification: install arm[0] + stash the
+        // rest (HS DisjT fork, Reduction.hs:730-738).  Falling through
+        // would leave the `mem::take`'d default eq-store installed.
+        install_pass_cases_arms(red, arms);
+    }
     // HS-faithful: HS's `enforceEdgeUniqueness` only calls
     // `solveTermEqs SplitNow` (via `solveNodeIdEqs`) — it adds node-id
     // bindings to the eq-store but does NOT immediately rename node
@@ -4069,6 +4134,11 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
         if matches!(res, Err(_) | Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)) {
             hit_contra = true;
         } else {
+            if let Ok(crate::constraint::solver::reduction::SolveOutcome::Cases(arms)) = res {
+                // HS DisjT fork (Reduction.hs:730-738): install arm[0]
+                // + stash the rest; never leave the taken default store.
+                install_pass_cases_arms(red, arms);
+            }
             apply_node_eqs(red, &node_eqs);
         }
     }
