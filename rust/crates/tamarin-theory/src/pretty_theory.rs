@@ -265,49 +265,18 @@ fn render_equations(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<String> {
     items
 }
 
-/// HS's `ppNonEmptyList` with `keyword <-> fsep . punctuate comma`:
-/// when the line fits, emit `<lead> a, b, c`. When it overflows the
-/// default 80-col width, wrap with continuation indent equal to
-/// `length lead + 1`.  HS uses `text` width 80 (Pretty.hs default).
+/// HS `ppNonEmptyList' name pp xs = (keyword_ name <->) . fsep $
+/// punctuate comma (map pp xs)` (Term/Maude/Signature.hs:229-231).
+/// `<->` is HughesPJ `<+>` (beside-with-space), and `fsep` is the
+/// fill-paragraph combinator, so the wrap decisions must come from the
+/// ported HughesPJ Doc engine (LINE_LENGTH=110, RIBBON=73) — not a
+/// hand-rolled greedy fill at a guessed width.  Route through `pretty_hpj`.
 fn wrap_with_lead(lead: &str, items: &[String]) -> String {
-    // Empty: emit nothing.
+    use crate::pretty_hpj::{self as hpj, Doc};
     if items.is_empty() { return String::new(); }
-    // HS uses `defaultStyle = Style { lineLength = 76, .. }` (Pretty.hs)
-    // for `fsep` / `sep` wrapping.
-    const WIDTH: usize = 76;
-    let lead_len = lead.chars().count();
-    let cont_indent: String = " ".repeat(lead_len + 1);
-    // First try: single line `lead a, b, c`.
-    let joined = items.join(", ");
-    let single = format!("{} {}", lead, joined);
-    if single.chars().count() <= WIDTH {
-        return single;
-    }
-    // Multi-line: greedy fill respecting WIDTH.  HS's `fsep` packs
-    // tokens onto each line greedily.
-    let mut out = String::new();
-    out.push_str(lead);
-    let mut cur_col = lead_len;
-    for (i, it) in items.iter().enumerate() {
-        let tok = if i + 1 < items.len() {
-            format!("{},", it)
-        } else {
-            it.clone()
-        };
-        let need = tok.chars().count() + 1; // +1 for leading space
-        if cur_col + need > WIDTH {
-            // Wrap.
-            out.push('\n');
-            out.push_str(&cont_indent);
-            out.push_str(&tok);
-            cur_col = cont_indent.chars().count() + tok.chars().count();
-        } else {
-            out.push(' ');
-            out.push_str(&tok);
-            cur_col += need;
-        }
-    }
-    out
+    let docs: Vec<Doc> = items.iter().map(Doc::text).collect();
+    let body = hpj::fsep(hpj::punctuate(Doc::char(','), docs));
+    Doc::text(lead).beside_sp(body).render()
 }
 
 /// `sep`-style layout matching HS's `sep [hdr, nest 2 (punctuate comma ds)]`:
