@@ -241,17 +241,13 @@ worker() {
 export -f worker
 
 # --- File-content filter (mirror corpus_proof_skeleton_match_probe exactly).
+# Builtins (diffie-hellman/multiset/xor/bilinear-pairing) and macros are fully
+# supported now — the probe dropped those filters and so do we (2026-06-10).
 file_is_comparable() {
     local f="$1"
     grep -q 'diff('       "$f" 2>/dev/null && return 1
-    grep -q 'macros:'     "$f" 2>/dev/null && return 1
     grep -q 'predicates:' "$f" 2>/dev/null && return 1
     grep -q 'process:'    "$f" 2>/dev/null && return 1
-    if grep -q 'builtins:' "$f" 2>/dev/null; then
-        if grep -Eq 'diffie-hellman|multiset|xor|bilinear-pairing' "$f" 2>/dev/null; then
-            return 1
-        fi
-    fi
     return 0
 }
 
@@ -274,7 +270,7 @@ case "${1:-}" in
     "" )
         target_dirs=(loops csf23-subterms experiments regression ccs15 classic \
                      features related_work post17 cav13 jcs18 csf18-alethea \
-                     csf17 csf12 testParser)
+                     csf17 csf12 testParser ake sp14)
         for dir in "${target_dirs[@]}"; do
             dpath="$CORPUS_ROOT/$dir"
             [ -d "$dpath" ] || continue

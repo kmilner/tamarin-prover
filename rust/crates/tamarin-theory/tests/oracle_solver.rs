@@ -864,6 +864,10 @@ fn corpus_proof_skeleton_match_probe() {
         "post17", "cav13", "jcs18", "csf18-alethea",
         "csf17", "csf12",
         "testParser",
+        // ake + sp14 hold the bilinear-pairing theories (Scott, Chen_Kudla,
+        // Joux, RYY, ...) — added once BP support reached byte-faithfulness
+        // (2026-06-10), so BP regressions are caught corpus-wide.
+        "ake", "sp14",
     ];
 
     // Phase 1: collect candidate spthy paths.
