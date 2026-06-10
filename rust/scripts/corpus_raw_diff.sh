@@ -157,6 +157,15 @@ worker() {
         fi
     fi
 
+    # HS timed out (cached marker or live run): the comparison is void, so do
+    # NOT run RS at all. The lemmas where HS times out are exactly the
+    # jcs18-class monsters where RS's 300s of unbounded search OOMs the
+    # machine (observed 17-43 GB RSS per worker, 2026-06-10).
+    if [ "$hs_rc" -eq 124 ]; then
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$f" "$lemma" "SKIP_TIMEOUT" "0" "0" "-" "$hs_ms" "-"
+        return 0
+    fi
+
     local rs_t0; rs_t0=$(date +%s%3N)
     timeout "$TIMEOUT" env $EXTRA_ENV "$RS_PATH" --prove="$lemma" "$f" 2>/dev/null > "$tmp/rs.out"
     local rs_rc=$?

@@ -230,6 +230,14 @@ worker() {
         fi
     fi
 
+    # HS timed out (cached marker or live run): skip the RS run entirely —
+    # the lemma is SKIP_TIMEOUT either way, and HS-timeout lemmas are exactly
+    # where RS's unbounded search OOMs the machine (17-43 GB RSS observed).
+    if [ "$hs_rc" -eq 124 ]; then
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$f" "$lemma" "SKIP_TIMEOUT" "0" "0" "-" "$hs_ms" "-"
+        return 0
+    fi
+
     # --- RS: dump_proof emits only the proof tree for this lemma (per-lemma).
     local rs_t0; rs_t0=$(date +%s%3N)
     timeout "$TIMEOUT" env $EXTRA_ENV "$RS_PATH" "$f" "$lemma" 2>/dev/null | python3 "$CANON" > "$tmp/rs.canon" 2>/dev/null
