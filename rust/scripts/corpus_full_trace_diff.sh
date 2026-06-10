@@ -77,6 +77,16 @@ if [ -z "$hs_path" ]; then
 fi
 
 # --- Locate the RS dump_proof binary.
+# Always (re)build it first — plain `cargo build --release` does NOT rebuild
+# examples, which has silently produced stale-binary measurements. No-op (<1s)
+# when already fresh. Skip: TAM_RS_NO_AUTO_BUILD=1.
+if [ -z "${TAM_RS_NO_AUTO_BUILD:-}" ]; then
+    if ! cargo build --release --example dump_proof \
+            --manifest-path "$repo_root/rust/Cargo.toml" >&2; then
+        echo "corpus_full_trace_diff.sh: cargo build --example dump_proof failed" >&2
+        exit 2
+    fi
+fi
 rs_path="$repo_root/rust/target/release/examples/dump_proof"
 if [ ! -x "$rs_path" ]; then rs_path="$repo_root/rust/target/debug/examples/dump_proof"; fi
 if [ ! -x "$rs_path" ]; then
