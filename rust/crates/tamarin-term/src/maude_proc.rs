@@ -609,11 +609,21 @@ impl MaudeHandle {
         if eqs.is_empty() {
             return Ok(vec![Vec::new()]);
         }
-        // Fast path: if every equation has lhs == rhs syntactically,
-        // the unifier is trivial.  Avoids a subprocess round-trip.
-        if eqs.iter().all(|eq| eq.lhs == eq.rhs) {
-            return Ok(vec![Vec::new()]);
-        }
+        // NOTE: no syntactic-equality fast path here.  HS's `unifyRaw`
+        // (Unification.hs:277-282) delays AC-headed and C-headed pairs
+        // to Maude UNCONDITIONALLY — even when lhs == rhs syntactically.
+        // Maude's complete unifier set for a self-equal AC/C term is
+        // NOT just the identity: e.g. `em(hp(a),hp(b)) =? em(hp(a),hp(b))`
+        // (C/comm) also has the "diagonal" unifier a=b, and
+        // `mult(x,y) =? mult(x,y)` has the x=y merge.  RS previously
+        // short-circuited `all(lhs == rhs)` to `[identity]`, dropping
+        // these diagonal arms — observable on Scott::key_secrecy where
+        // HS's refineSubst fan-out at /case_2/Init_2/Init_1/c_kdf/
+        // split_case_3 yields 4 unifier arms for em/Mult-headed source
+        // cases (the surviving Resp_1_case_01/06/09/10 arms) while RS
+        // yielded only 2.  Self-equal NON-AC eq sets still avoid the
+        // Maude round-trip via the local `unify_lnterm_no_ac_with_counter`
+        // fast path below (HS-faithful: unifyRaw solves them locally).
         // AC-free fast path: when the signature has no DH / XOR /
         // multiset / nat / BP operators, free (Robinson) unification
         // with Maude-shape sort narrowing (fresh `~mw` witness at
