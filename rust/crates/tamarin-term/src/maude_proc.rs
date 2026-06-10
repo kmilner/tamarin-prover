@@ -713,10 +713,64 @@ impl MaudeHandle {
                 }
             }
         }
+        // HS-faithful `unifyLTermFactored` (Unification.hs:107-120):
+        //
+        //   unif = sequence [ unifyRaw t p | Equal t p <- eqs ]
+        //   solve h (Just (m, leqs)) =
+        //       (subst, unifyViaMaude h sortOf $ map (applyVTerm subst <$>) leqs)
+        //     where subst = substFromMap m
+        //
+        // i.e. run the LOCAL non-AC unifier first to extract a non-AC
+        // substitution `m` and the residual AC equations `leqs`, then send
+        // ONLY the residuals (with `m` applied) to Maude.  Finally
+        // `flattenUnif (subst, substs) = map (`composeVFresh` subst) substs`
+        // (Unification.hs:144-147) composes each Maude arm with `subst = m`.
+        //
+        // Previously RS sent the FULL `eqs` to Maude and composed each arm
+        // with the EMPTY substitution.  That left `m`'s non-AC bindings
+        // (e.g. `X.18 → em(...)`, `~ey.16 → ~ey.11`) to be re-derived by
+        // Maude per arm, with witness idxs allocated against the full input
+        // var set rather than just the AC residual's vars.
+        //
+        // Opt-out via `TAM_RS_DISABLE_FACTOR_AC=1` (sends full eqs, empty m).
+        let factor_ac = std::env::var("TAM_RS_DISABLE_FACTOR_AC").is_err();
+        let (factored_m, residual_eqs): (
+            crate::subst::Subst<crate::lterm::Name, crate::lterm::LVar>,
+            Vec<Equal<LNTerm>>,
+        ) = if factor_ac {
+            match crate::unification::unify_lnterm_factored(
+                eqs.iter().cloned().collect(),
+            ) {
+                Some((m, leqs)) => (m, leqs),
+                // unifyRaw failed during factoring → no unifier (HS `solve _
+                // Nothing = (emptySubst, [])` → flattenUnif maps over []).
+                None => return Ok(Vec::new()),
+            }
+        } else {
+            (
+                crate::subst::Subst::empty(),
+                eqs.iter().cloned().collect(),
+            )
+        };
+        // If factoring already solved everything (no AC residual), HS returns
+        // `(substFromMap m, [emptySubstVFresh])`; flattenUnif then yields
+        // `[emptyVFresh `composeVFresh` m]`.  Mirror that without a Maude
+        // round-trip.
+        if factor_ac && residual_eqs.is_empty() {
+            if std::env::var("TAM_RS_DISABLE_AC_COMPOSE_VFRESH").is_ok() {
+                return Ok(vec![factored_m.to_list()]);
+            }
+            let empty_vfresh =
+                crate::subst_vfresh::LSubstVFresh::<crate::lterm::Name>::empty();
+            let composed = crate::subst_vfresh::compose_vfresh(&empty_vfresh, &factored_m);
+            return Ok(vec![composed.to_list()]);
+        }
+        // The equations actually sent to Maude are the AC residuals.
+        let maude_eqs: &[Equal<LNTerm>] = &residual_eqs;
         let mut inner = self.inner.lock().unwrap();
         let mut ctx = ConvCtx::new();
         let mut cmd = b"unify in MSG : ".to_vec();
-        for (i, eq) in eqs.iter().enumerate() {
+        for (i, eq) in maude_eqs.iter().enumerate() {
             if i > 0 { cmd.extend_from_slice(b" /\\ "); }
             let lm = lterm_to_mterm_global(&eq.lhs, &mut ctx);
             let rm = lterm_to_mterm_global(&eq.rhs, &mut ctx);
@@ -733,7 +787,7 @@ impl MaudeHandle {
         // Also avoid colliding with vars in the input eqs (their `~mw`
         // indices set a floor for the witness counter).
         let mut input_max = avoid_max;
-        for eq in eqs {
+        for eq in maude_eqs {
             use crate::lterm::HasFrees;
             eq.lhs.for_each_free(&mut |v| {
                 if v.idx > input_max { input_max = v.idx; }
@@ -873,16 +927,32 @@ impl MaudeHandle {
         //     downstream → different `case_xor` chosen at split_case_N.
         //
         // Opt-out via `TAM_RS_DISABLE_AC_COMPOSE_VFRESH=1`.
+        //
+        // HS `flattenUnif (subst, substs) = map (`composeVFresh` subst) substs`
+        // (Unification.hs:147) composes each Maude arm with `subst = m`, the
+        // non-AC factored substitution.  Previously RS composed with the
+        // empty substitution because it sent the full eqs to Maude; now that
+        // we factor and send only AC residuals, `factored_m` carries the
+        // non-AC bindings and MUST be the second argument to composeVFresh.
         if std::env::var("TAM_RS_DISABLE_AC_COMPOSE_VFRESH").is_err() {
-            let empty_subst = crate::subst::Subst::<crate::lterm::Name, crate::lterm::LVar>::empty();
             let renamed: Vec<Vec<(crate::lterm::LVar, LNTerm)>> = out.into_iter().map(|arm| {
                 let arm_vfresh = crate::subst_vfresh::LSubstVFresh::<crate::lterm::Name>::from_list(arm);
-                let composed = crate::subst_vfresh::compose_vfresh(&arm_vfresh, &empty_subst);
+                let composed = crate::subst_vfresh::compose_vfresh(&arm_vfresh, &factored_m);
                 composed.to_list()
             }).collect();
             return Ok(renamed);
         }
-        Ok(out)
+        // Diagnostic kill-switch path (TAM_RS_DISABLE_AC_COMPOSE_VFRESH=1):
+        // skip the witness re-basing rename, but still apply `factored_m`'s
+        // non-AC bindings so the result remains a valid composed unifier.
+        // `arm `compose` factored_m` then re-tag range as fresh (HS's
+        // composeVFresh sans freshToFreeAvoidingFast witness shift).
+        let renamed: Vec<Vec<(crate::lterm::LVar, LNTerm)>> = out.into_iter().map(|arm| {
+            let arm_free = crate::subst::Subst::<crate::lterm::Name, crate::lterm::LVar>::from_list(arm);
+            let composed = arm_free.compose(&factored_m);
+            crate::subst_vfresh::free_to_fresh_raw(composed).to_list()
+        }).collect();
+        Ok(renamed)
     }
 
     /// Variant unification — uses Maude's `variant unify in M : t1 =? t2 .`
