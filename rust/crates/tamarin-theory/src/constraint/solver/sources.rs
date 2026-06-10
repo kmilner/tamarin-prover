@@ -7793,7 +7793,30 @@ fn apply_source_case_action(
     // `∀a. AnswerRequest($S, ~k) @ a ⇒ ⊥` matcher fails when
     // Serv_1's action references `$S.Pub.0` while the lemma's
     // universal references `$S.Pub.1`.
+    //
+    // SCOPING (HS-faithful): HS's `conjoinSystem` (Reduction.hs:824-846)
+    // performs NO edge fact-equality solve at all — `joinSets sEdges`
+    // unions the edge SET and relies on the saturated case being
+    // edge-consistent.  This E.5 step is an RS-only compensation for
+    // saturate output that isn't fully edge-consistent.  It MUST only
+    // touch edges INTRODUCED by the grafted case — re-solving a
+    // pre-existing LIVE edge re-narrows the live equation store and can
+    // collapse live disjunctions HS keeps (Joux_EphkRev: re-solving the
+    // live em-exponent Kd-pair chain edge folded the `splitEqs(3)/(4)`
+    // disjunctions, turning HS's Split×3/×4 cascade into RS's Split×1).
+    // A grafted edge is one with at least one endpoint NOT a pre-existing
+    // live node.  Opt-out via TAM_RS_DISABLE_E5_LIVE_EDGE_SKIP=1.
+    let live_node_ids: std::collections::BTreeSet<crate::constraint::constraints::NodeId> =
+        live_sys.nodes.iter().map(|(n, _)| n.clone()).collect();
+    let skip_live_edges =
+        std::env::var("TAM_RS_DISABLE_E5_LIVE_EDGE_SKIP").is_err();
     let edge_eqs: Vec<_> = r.sys.edges.iter().filter_map(|e| {
+        if skip_live_edges
+            && live_node_ids.contains(&e.src.0)
+            && live_node_ids.contains(&e.tgt.0)
+        {
+            return None;
+        }
         let conc = r.sys.nodes.iter()
             .find(|(n, _)| n == &e.src.0)?
             .1.conclusions.get(e.src.1.0).cloned()?;
@@ -7815,17 +7838,63 @@ fn apply_source_case_action(
                 format!("{:?}", e.rhs).chars().take(160).collect::<String>());
         }
     }
+    // E.5 fanout: `solve_fact_eqs(SplitNow)` may return `Cases(arms)`
+    // when the edge-fact unification yields multiple AC unifier arms
+    // (HS `solveFactEqs SplitNow` → `solveTermEqs SplitNow` →
+    // `disjunctionOfList $ performSplit eqs2 splitId` forks the
+    // `Reduction`/`DisjT` continuation, Reduction.hs:730-738).  We
+    // mirror that here: each arm continues the rest of `_applySource`
+    // (F close_trivial_chains + output push) independently.  Each arm's
+    // eq-store (from `perform_split`) PRESERVES the live system's other
+    // disjunctions — `solve_term_eqs`'s `Cases` branch does NOT
+    // reinstall `self.sys.eq_store` (it leaves the `mem::take`'d default
+    // store, equation_store.rs:2159 / reduction.rs Cases arm), so the
+    // caller MUST install an arm.  Previously this code only handled
+    // `Linear`/`Contradictory` and fell through on `Cases` with `r.sys`
+    // carrying the wiped default eq-store (conj=[], next_split=0) — that
+    // silently dropped the live `splitEqs` disjunctions, collapsing
+    // Joux_EphkRev's EphkRev cascade (HS Split×3/×4 → RS Split×1).
+    let mut e5_arm_systems: Vec<System> = Vec::new();
     if !edge_eqs.is_empty() {
         let res = r.solve_fact_eqs(
             crate::constraint::solver::reduction::SplitStrategy::SplitNow,
             &edge_eqs);
-        if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
-            crate::state_trace::emit(
-                "applySource_drop_edge_eqs", Some(&live_goal_for_trace), &r.sys);
-            continue;
+        match res {
+            Err(_) | Ok(SolveOutcome::Contradictory) => {
+                crate::state_trace::emit(
+                    "applySource_drop_edge_eqs", Some(&live_goal_for_trace), &r.sys);
+                continue;
+            }
+            Ok(SolveOutcome::Linear(_)) => {
+                // Single arm: `solve_term_eqs` already installed it into
+                // `r.sys.eq_store`.
+                r.subst_system();
+                e5_arm_systems.push(r.sys.clone());
+            }
+            Ok(SolveOutcome::Cases(arms)) => {
+                // Multi-arm fanout: `solve_term_eqs` returned the arms
+                // WITHOUT installing any into `r.sys`.  Install each arm
+                // into a clone of the pre-solve `r.sys`, run substSystem,
+                // and continue the rest of `_applySource` per arm.
+                let template = r.sys.clone();
+                for arm_eq in arms {
+                    let mut arm_sys = template.clone();
+                    arm_sys.invalidate_max_var_idx_cache();
+                    arm_sys.eq_store = arm_eq;
+                    let mut arm_red = Reduction::new(ctx, arm_sys);
+                    arm_red.subst_system();
+                    if arm_red.sys.eq_store.is_false() { continue; }
+                    e5_arm_systems.push(arm_red.sys);
+                }
+                if e5_arm_systems.is_empty() { continue; }
+            }
         }
-        r.subst_system();
+    } else {
+        e5_arm_systems.push(r.sys.clone());
     }
+
+    for r_sys in e5_arm_systems {
+    let mut r = Reduction::new(ctx, r_sys);
 
     // ---------------------------------------------------------------
     // F — Close trivial chains via direct-edge unification.
@@ -7854,6 +7923,7 @@ fn apply_source_case_action(
     crate::state_trace::emit(
         "applySource_out", Some(&live_goal_for_trace), &r.sys);
     out_arms.push((r.sys, live_action.clone(), refined_case_for_dedup.clone()));
+    } // end `for r_sys in e5_arm_systems`
     } // end `for r in arm_reductions`
     } // end `for arm_eq_store in arm_eq_stores`
     out_arms
