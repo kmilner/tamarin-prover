@@ -26,6 +26,14 @@ lemma="$2"
 HS_BIN=$(ls /home/parallels/tamarin-prover-2/.stack-work/install/*/*/*/bin/tamarin-prover 2>/dev/null | head -1)
 RS_BIN=/home/parallels/tamarin-prover-2/rust/target/release/examples/dump_proof
 
+# Rebuild dump_proof first — plain `cargo build --release` does NOT rebuild
+# examples (stale-binary trap). No-op when fresh. Skip: TAM_RS_NO_AUTO_BUILD=1.
+if [ -z "${TAM_RS_NO_AUTO_BUILD:-}" ]; then
+    cargo build --release --example dump_proof \
+        --manifest-path /home/parallels/tamarin-prover-2/rust/Cargo.toml >&2 \
+        || { echo "Error: cargo build --example dump_proof failed" >&2; exit 1; }
+fi
+
 if [ ! -x "$HS_BIN" ]; then
     echo "Error: HS binary not found ($HS_BIN)" >&2
     exit 1
