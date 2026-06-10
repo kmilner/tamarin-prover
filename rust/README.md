@@ -14,187 +14,65 @@ utils → term → theory → {sapic, accountability} → export → tamarin-pro
 ```
 cd rust
 cargo build --release       # produces target/release/tamarin-prover
-cargo test                  # 437 unit + integration tests
+cargo test                  # unit + integration tests
 ```
 
-The release profile uses `lto = "fat"` and `codegen-units = 1`;
-expect ~40s for a clean release build.
+The release profile uses `lto = "fat"` and `codegen-units = 1`.
+Note: `cargo build --release` does NOT rebuild cargo examples — the
+measurement scripts depend on `target/release/examples/dump_proof` and
+auto-build it themselves; build it explicitly
+(`cargo build --release --example dump_proof`) when invoking it directly.
 
 ## Status
 
-Verified against the Haskell prover on 238 lemmas across the corpus
-in `../examples/` (15 directories, 14 supported builtins):
+**Zero known proof-tree divergences against HS** (as of 2026-06-10).
+Every comparable lemma produces a byte-identical canonicalised proof
+tree, including both `all-traces` and `exists-trace` lemmas, across
+all supported builtins — `xor` and `bilinear-pairing` included.
 
-```
-classic       14/14   loops        40/45   csf12         6/9    cav13         0/1
-regression    13/17   features     13/13   post17       11/12   testParser    7/7
-csf17         50/50   ccs15         0/0    related_work 27/34   csf23-subterms 6/6
-experiments    8/15   jcs18        43/70   csf18-alethea 0/1
-                                           TOTAL    238 MATCH / 0 DIFF / 56 SKIP
-```
-
-Every comparable lemma is byte-identical (canonicalised) to HS's proof
-tree. Both `all-traces` (safety) and `exists-trace` (witness) lemmas
-are fully implemented — e.g. `NSPK3::session_key_setup_possible`
-(exists-trace) matches HS at `verified (5 steps)` with identical
-proof skeleton.
-
-The 56 skips break down as:
-
-- **24 timeouts at 900s** — HS itself times out on these
-  (jcs18-class inductive proofs that HS can't finish in 15 min either).
-- **17 filtered** by unsupported builtins (xor, bilinear-pairing,
-  observational equivalence — see "Not yet ported" below).
-- **15 "no HS skeleton"** — a mix of: lemmas inside `/* */` block
-  comments that RS over-elaborates and HS skips (parser bug in RS);
-  slow HS proofs categorised as "no skeleton" when HS emits a
-  partial-but-unparseable output before the script's wall-clock cap;
-  lemmas with wellformedness errors HS refuses to prove.  None are
-  exists-trace specific.
+The last measured baseline on the old filtered corpus (276 lemmas,
+17 directories) was 238 MATCH / 0 DIFF / 38 SKIP, where every skip is
+either an HS-side timeout (heavy jcs18-class inductive proofs that HS
+itself can't finish), an HS failure (missing heuristic-oracle file,
+HS parse error on embedded proofs), or an HS process killed by memory
+pressure. The corpus enumeration has since been expanded to the whole
+`../examples/` tree — 11,621 lemmas across 597 comparable files — and
+a new baseline sweep is in progress.
 
 ## Performance
 
-Two benchmark scenarios — single-thread per-thread CPU comparison
-(HS `+RTS -N1` constrained), and default-vs-default wall-clock (each
-prover with its out-of-the-box parallelism settings).
+Numbers below are from a 2026-06 measurement pass on aarch64 Linux
+(GHC 9.6.7, Maude 3.5.1); they predate the latest solver changes but
+the orders of magnitude hold.
 
-### Single-thread (per-thread CPU efficiency)
+Single-thread (HS `+RTS -N1`, RS `--processors=1`): geomean ~3.5×
+faster per thread, ranging from ~2× on large csf17 lemmas to >9× on
+dnp3-class inductive proofs (where HS times out at 5 min and RS
+finishes in 31 s).
 
-Measured on aarch64 Linux, GHC 9.6.7 + Maude 3.5.1. HS run with
-`+RTS -N1 -RTS`; RS with `--processors=1`. Times in seconds; speedup
-= HS / RS.
+Default-vs-default wall-clock (each prover's out-of-the-box
+parallelism, 16-core machine, wireguard benchmark): RS ~1.3× faster
+than HS with about half the total user-CPU.
 
-| lemma | tier | HS `-N1` | RS `-p1` | speedup |
-|---|---|---:|---:|---:|
-| Tutorial::Client_session_key_secrecy | tiny | 0.19 | 0.02 | **9.5×** |
-| NSPK3::nonce_secrecy | small | 1.39 | 0.34 | **4.1×** |
-| NSLPK3::injective_agree | small | 1.22 | 0.23 | **5.4×** |
-| KAS2_eCK::eCK_key_secrecy | medium | 1.95 | 0.67 | **2.9×** |
-| KAS2_original::KAS_key_secrecy | medium | 3.39 | 1.42 | **2.4×** |
-| TESLA::authentic | medium | 2.66 | 0.78 | **3.4×** |
-| counter::counters_linear_order | medium | 0.21 | 0.07 | **3.1×** |
-| matching_detects_prior_misuse | large | 2.17 | 0.48 | **4.5×** |
-| csf17::detect_sound | large | 3.18 | 0.92 | **3.5×** |
-| csf17::count_unique | large | 4.21 | 1.36 | **3.1×** |
-| csf17::sessions_injective | large | 8.46 | 4.97 | **1.7×** |
-| csf17::injectivity | large | 19.05 | 9.69 | **2.0×** |
-| dnp3::countervalue_uniqueness | xlarge | 15.67 | 1.10 | **14.3×** |
-| dnp3::authed_sessions_unique | xlarge | TO(300s) | 31.34 | >9.6× |
-
-Geomean ~3.5× faster per thread. Inductive lemmas favour RS most
-(HS times out on dnp3 at 5 min where RS finishes in 31s).
-
-### Default-vs-default (wall-clock as the user would experience)
-
-HS uses `+RTS -N` by default (all cores + parallel GC + `parList`
-sites in lib/theory). RS defaults to `--processors=num_cpus` workers
-backed by `--maude-processes=max(1, num_cpus/2)` Maude subprocesses,
-mirroring HS's parallelism sites via rayon (rule-variant closure,
-saturate refinement, per-item pretty-print — see "Parallelism" below).
-
-Spot check on the parallelism-friendly wireguard benchmark
-(`--prove=exists_session`, hashing + DH, 10 rules, 8 lemmas) on a
-16-core machine:
-
-| | wall | user CPU |
-|---|---:|---:|
-| HS default (`+RTS -N`) | 8.8s | 17.1s |
-| HS `+RTS -N1` | 11.3s | 10.4s |
-| RS `--processors=1` | 8.9s | 8.4s |
-| RS `--processors=4 --maude-processes=2` | 7.5s | 8.5s |
-| RS `--processors=8 --maude-processes=4` | 6.9s | 8.6s |
-| RS `--processors=16 --maude-processes=8` (default on 16 cores) | **6.8s** | 8.7s |
-
-RS default is ~1.3× faster wall-clock than HS default with ~half the
-total user-CPU. The scaling curve flattens around `processors=8` on
-wireguard because the protocol's parallel work (per-rule variants:
-10 items; per-source saturate: ~8 items) is only enough to keep ~8
-workers busy. Bigger theories (5G_AKA-class, ~30 rules) scale further.
-
-### What drives the speedup
-
-Stack of perf commits:
-
-| | what | gain |
-|---|---|---|
-| 1 | empty-result cache for `match_eqs_const_subject` | 1.22–1.49× on AC-heavy lemmas |
-| 2 | skip Maude when no AC operators present | another 1.07–1.28× (drives match calls to 0) |
-| 3 | mimalloc global allocator (including the binary itself) | 1.5–2× across the board |
-| 4 | fat LTO + codegen-units=1 | another 1.13–1.19× |
-| 5 | drop System from ProofNodes after expand | wall-clock unchanged; memory: see below |
-| 6 | hoist `ensure_saturated` out of per-variable deriv-check loop | 3.4× on deriv check (mirrors HS's once-per-theory `closeTheoryWithMaude`) |
-| 7 | HS-faithful rayon parallelism at 3 sites (variants / saturate / pretty-print) | 1.25× on multi-rule theories at default `--processors=4` |
-| 8 | `MaudePool` of N/2 subprocesses unblocks rayon scaling past `--processors=4` | another 1.1× at `--processors=16` |
+Memory: geomean peak RSS ~25% of HS's. Most lemmas sit at 14–50 MB
+regardless of proof size (deterministic drops + mimalloc), where HS's
+footprint scales with proof size (csf17::injectivity: 599 MB HS vs
+48 MB RS).
 
 ### Parallelism
 
-RS mirrors HS's `using parList rdeepseq` and `parMap rdeepseq` sites via
-rayon at three places (HS site → RS site):
+RS mirrors HS's `parList`/`parMap` sites via rayon (HS site → RS site):
 
-- `Prover.hs:195` per-rule variant closure → `populate_rule_variants` in `run.rs`
-- `Sources.hs:471` saturate refinement change detection → `saturate_sources_with_simp_opt`
+- `Prover.hs:195` per-rule variant closure → `populate_rule_variants`
+- `Sources.hs:471` saturate refinement → `saturate_sources_with_simp_opt`
 - `TheoryObject.hs:744,752` per-item pretty-print → `pretty_closed_theory`
 
-`Proof.hs:873`'s `parTraversable nfProofMethod` (forcing a `Map` of lazy
-proof sub-trees in `cutOnSolvedDFS`) is skipped: RS's proof tree is
-already strict, there's nothing to force in parallel.
-
-The 3 parallel sites query Maude on every iteration. To prevent them
-from serializing on a single subprocess's IPC mutex, RS maintains a
-`MaudePool` of M independent Maude subprocesses: workers borrow a
-handle via `acquire()` and return it on drop. Each subprocess has its
-own `fresh_counter`; combined with HS's `evalFreshTAvoiding` pattern
-(per-call counter scope via `MaudeHandle::with_fresh_counter_from`),
-output is byte-identical regardless of which subprocess serves a
-given call.
-
-Tuning knobs:
-
-- `--processors=N` — rayon worker count. Default: `num_cpus`.
-- `--maude-processes=M` — pool size. Default: `max(1, processors / 2)`.
-
-Memory cost: each pooled subprocess holds ~30-100 MB resident on real
-protocols, so the default `processors/2` ratio trades some concurrency
-for a smaller footprint. Memory-tight users on small VMs should
-override (`--maude-processes=2` or `--maude-processes=4`). HS uses a
-single Maude per ClosedTheory — RS goes further because Rust's
-`Arc<Mutex>` serialization isn't free; pooling is a Rust implementation
-optimisation that doesn't change semantics (Maude is a stateless query
-oracle in HS too).
-
-The remaining sequential time on wireguard at high N is ~3.5s in
-`ProofContext::new`'s intruder-rule variants computation
-(`closeIntrRule` / `variants_intruder`). HS doesn't parallelise this
-either; it's an HS-faithful sequential bottleneck.
-
-### Memory
-
-Peak RSS, same lemma set:
-
-| lemma | tier | HS (MB) | RS (MB) | ratio |
-|---|---|---:|---:|---:|
-| NSPK3::nonce_secrecy | small | 65.3 | 13.1 | 0.20× |
-| KAS2_eCK | medium | 109.4 | 17.3 | 0.16× |
-| TESLA::authentic | medium | 125.3 | 14.8 | 0.12× |
-| counter::counters_linear_order | medium | 45.4 | 13.7 | 0.30× |
-| csf17::detect_sound | large | 107.3 | 18.0 | 0.17× |
-| csf17::count_unique | large | 173.2 | 16.6 | 0.10× |
-| csf17::sessions_injective | large | 455.4 | 30.0 | 0.07× |
-| csf17::injectivity | large | 599.4 | 47.9 | 0.08× |
-| dnp3::countervalue_uniqueness | xlarge | 391.5 | 34.9 | 0.09× |
-
-Geomean ~25% of HS's peak (4× less RAM). Most lemmas sit at 14-50 MB
-regardless of complexity, where HS's footprint scales with proof size.
-Two structural reasons:
-
-1. GHC's GC retains heap residue between collections; Rust drops
-   deterministically — closed proof-tree branches are freed
-   immediately (`ProofNode.sys` is reset in `expand`).
-2. mimalloc returns memory to the OS more aggressively than glibc
-   or GHC's RTS (which holds a contiguous heap by design).
-
-For parallel proving: a 16 GB machine fits ~300 RS workers on the
-heaviest lemmas vs ~25 HS workers.
+To stop the parallel sites serialising on one Maude subprocess's IPC
+mutex, RS keeps a `MaudePool` of independent Maude subprocesses; each
+has its own fresh-counter scope so output is byte-identical regardless
+of which subprocess serves a call. Knobs: `--processors=N` (rayon
+workers, default `num_cpus`) and `--maude-processes=M` (pool size,
+default `max(1, processors/2)`; each subprocess holds ~30–100 MB).
 
 ## Implemented
 
@@ -204,13 +82,13 @@ heaviest lemmas vs ~25 HS workers.
 - **Elaborator**: rule signatures, lemma formulas → guarded form,
   macro expansion, restriction insertion, source-kind classification.
 - **Builtins**: `hashing`, `symmetric-encryption`, `asymmetric-encryption`,
-  `signing`, `revealing-signing`, `diffie-hellman`, `multiset`,
-  `natural-numbers`, `subterm`, `locations-report`, custom function
-  symbols and equations.
+  `signing`, `revealing-signing`, `diffie-hellman`, `xor`,
+  `bilinear-pairing`, `multiset`, `natural-numbers`, `subterm`,
+  `locations-report`, custom function symbols and equations.
 - **Solver**: full constraint-system port with simplify / source-application
   / chain-extension / contradiction-detection / induction.
   Smart-rank heuristic, source-kind reasoning, AC-modulo unification
-  via long-lived Maude subprocess, deterministic case enumeration.
+  via pooled Maude subprocesses, deterministic case enumeration.
 - **CLI**: `--prove`, `--lemma`, `--bound`, `--heuristic`, `--saturation`,
   `--open-chains`, `--derivcheck-timeout`, `--auto-sources`,
   `--oraclename`, `--partial-evaluation`, `--parse-only`,
@@ -222,27 +100,15 @@ heaviest lemmas vs ~25 HS workers.
 
 ## Not yet ported
 
-Lemmas using these builtins are filtered out of the corpus probe:
-
-- **`builtins: xor`** — `^` operator + XOR AC theory.
-- **`builtins: bilinear-pairing`** — `em`, `pmult` and the BP variants
-  (would close the 53→125 gap in the `variants` subcommand).
 - **`process:`** — SAPiC frontend (separate compiler producing rules).
+- **`predicates:`** — typed-layer elaboration of predicate items.
 - **`diff(...)` / `--diff`** — observational equivalence mode.
 
-These are deeper functional gaps requiring substantial porting work,
-not configuration choices.
-
-CLI-level gaps (low severity, mostly export tooling):
-
-- `--output-json` / `--output-dot` — accepts the flag and writes an
-  empty stub file; full trace graph serialisation isn't ported.
-- `--output-module=proverif|deepsec|spthytyped|msr|...` — accepted
-  but errors when actually selected.
-- `--replication-bound` — accepted, no effect.
-- `test` subcommand omits HS's 55-case unit test suite; runs only the
-  Maude + GraphViz reachability checks. `cargo test` covers the unit
-  suite at build time.
+Files using these are excluded from the corpus sweep. CLI-level gaps
+(low severity): `--output-json`/`--output-dot` write stub files;
+`--output-module=proverif|deepsec|...` errors when selected;
+`--replication-bound` has no effect; the `test` subcommand runs only
+the Maude + GraphViz checks (the unit suite lives in `cargo test`).
 
 ## Repository layout
 
@@ -259,7 +125,7 @@ crates/
   tamarin-prover/        the binary + CLI parser + run dispatch
 scripts/
   diff_proof_tree.sh        per-lemma HS↔RS proof tree diff
-  corpus_full_trace_diff.sh full-corpus parity sweep
+  corpus_full_trace_diff.sh full-corpus parity sweep (HS canon cache + timing)
   canon_proof_tree.py       proof tree canonicaliser (strips display details)
 tests/                      cross-crate integration fixtures
 ```
@@ -273,18 +139,20 @@ cd rust
 cargo test --release --test oracle_solver corpus_proof_skeleton_match_probe
 ```
 
-This compares the structural proof tree against HS on the full corpus
-(currently 191 lemmas at 0 divergent). The `corpus_full_trace_diff.sh`
-script extends this to the full canonicalised proof text and runs the
-broader 238-lemma sweep.
+This compares structural proof trees against HS across the corpus.
+`scripts/corpus_full_trace_diff.sh` extends it to the full
+canonicalised proof text over the whole `../examples/` tree, with an
+HS-side result cache and per-lemma timing; both it and
+`diff_proof_tree.sh` rebuild `dump_proof` automatically before
+measuring.
 
-For per-lemma debugging:
+Per-lemma debugging:
 
 ```
 scripts/diff_proof_tree.sh examples/classic/NSPK3.spthy injective_agree
 ```
 
-For HS-vs-RS Maude command tracing (lock-step):
+HS-vs-RS Maude command tracing (lock-step):
 
 ```
 TAM_DBG_MAUDE_IO=full TAM_DBG_MAUDE_IO_FILTER=unify \
