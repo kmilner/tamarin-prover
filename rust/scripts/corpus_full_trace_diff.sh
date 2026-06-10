@@ -173,6 +173,11 @@ worker() {
     #                   (classify as SKIP_TIMEOUT without re-running HS;
     #                   delete the marker manually to retry, e.g. after
     #                   raising TIMEOUT)
+    # Additionally every non-timeout HS run stores the RAW stdout gzipped at
+    #   <key>.full.gz - full uncanonicalised HS output (whole rendered theory).
+    # The canon entry is derived data; the .full.gz is the source of truth so
+    # that a future switch to direct (un-canonicalised) matching does not
+    # require re-running HS over the whole corpus.
     # Previously only the non-empty case was cached, so SKIP_NO_HS (~32 of
     # 292 corpus lemmas) and SKIP_TIMEOUT (~20 of 292) re-ran HS every
     # sweep — and the timeouts happen to be the heaviest jcs18 lemmas
@@ -195,6 +200,16 @@ worker() {
         hs_canon="$tmp/hs.canon"
     elif [ -n "$key" ] && [ -f "$key" ]; then
         hs_canon="$key"
+    elif [ -n "$key" ] && [ -f "${key%.canon}.full.gz" ]; then
+        # Derive the canon entry from the cached raw output (written by this
+        # script or by corpus_raw_diff.sh) instead of re-running HS.
+        gzip -dc "${key%.canon}.full.gz" 2>/dev/null > "$tmp/hs.full"
+        slice_canon "$lemma" "$tmp/hs.full" "$tmp/hs.canon"
+        if [ "$(grep -c . "$tmp/hs.canon")" -gt 0 ]; then
+            cp -f "$tmp/hs.canon" "$key" 2>/dev/null || true
+        else
+            : > "$key_empty" 2>/dev/null || true
+        fi
     else
         local hs_t0; hs_t0=$(date +%s%3N)
         timeout "$TIMEOUT" "$HS_PATH" +RTS -N1 -RTS --prove="$lemma" "$f" 2>/dev/null > "$tmp/hs.out"
@@ -204,10 +219,13 @@ worker() {
         if [ -n "$key" ]; then
             if [ "$hs_rc" -eq 124 ]; then
                 : > "$key_timeout" 2>/dev/null || true
-            elif [ "$(grep -c . "$tmp/hs.canon")" -gt 0 ]; then
-                cp -f "$tmp/hs.canon" "$key" 2>/dev/null || true
             else
-                : > "$key_empty" 2>/dev/null || true
+                gzip -c "$tmp/hs.out" > "${key%.canon}.full.gz" 2>/dev/null || true
+                if [ "$(grep -c . "$tmp/hs.canon")" -gt 0 ]; then
+                    cp -f "$tmp/hs.canon" "$key" 2>/dev/null || true
+                else
+                    : > "$key_empty" 2>/dev/null || true
+                fi
             fi
         fi
     fi
