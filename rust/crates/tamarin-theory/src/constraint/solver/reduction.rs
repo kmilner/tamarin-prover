@@ -4685,57 +4685,69 @@ impl<'ctx> Reduction<'ctx> {
                             // `solveSubstEqs >> substSystem` — propagate
                             // the action-unify bindings into the grafted
                             // case's nodes/edges BEFORE computing
-                            // chain_eqs.  Without this, the case-side
-                            // syntactic forms still reference the pre-
-                            // graft vars (e.g. ~nb_case#shifted vs
-                            // ~nb_live), so chain_eqs's per-edge fact
-                            // unification sees mismatched terms that
-                            // would have aligned trivially after subst.
-                            // For protocols with chained pair-Out
-                            // producers (e.g. CR's responder), this is
-                            // what lets the grafted Fresh node share
-                            // the live Fresh node's term so
-                            // `enforce_fresh_node_uniqueness` can merge
-                            // them in simplify (instead of leaving two
-                            // distinct fresh-producers that
-                            // edge-uniqueness then over-collapses,
-                            // ending in `IncompatibleEqs`).
-                            if matches!(res, Ok(SolveOutcome::Linear(_)) | Ok(SolveOutcome::Cases(_))) {
-                                sub.subst_system();
-                            }
-                            match res {
-                                Err(_) | Ok(SolveOutcome::Contradictory) => continue,
-                                Ok(_) => {
-                                    // Edge-induced fact unification:
-                                    // walk each edge in the grafted case
-                                    // and equate the source-conclusion's
-                                    // fact with the target-premise's
-                                    // fact.  At precompute time these
-                                    // are already unified within the
-                                    // case's local namespace, but the
-                                    // case carries chain-internal vars
-                                    // that have no binding to the live
-                                    // system's vars.  Re-running
-                                    // unification in the live eq-store
-                                    // context propagates the case vars
-                                    // (sec#24:Fresh) → live lemma vars
-                                    // (~mw#11:Msg), narrowing sorts
-                                    // through Maude AC unification.
-                                    // Per-edge fact unification.  In a
-                                    // well-formed Tamarin system every
-                                    // edge MUST connect facts with the
-                                    // same tag/arity; a tag mismatch
-                                    // means the case carries an invariant
-                                    // violation (typically from node-id
-                                    // substitution collapsing two
-                                    // distinct rules onto one id).
-                                    // Detect such edges and drop the
-                                    // case as Contradictory rather than
-                                    // silently swallowing the mismatch.
+                            // chain_eqs.
+                            //
+                            // The action-unify `solveFactEqs SplitNow`
+                            // can fan out into multiple AC unifier arms
+                            // (HS forks the `Reduction`/`DisjT`
+                            // continuation per arm via `disjunctionOfList
+                            // performSplit`, Reduction.hs:730-738).  On
+                            // `Cases`, `solve_term_eqs` returns the arms
+                            // WITHOUT installing any into `sub.sys`
+                            // (it leaves the `mem::take`'d default
+                            // eq-store, equation_store.rs:2159) — so we
+                            // MUST install an arm per continuation,
+                            // otherwise `sub.sys` carries a wiped
+                            // eq-store (conj=[], next_split=0) that drops
+                            // every live disjunction (the Joux_EphkRev
+                            // `splitEqs` cascade collapse).
+                            let action_arm_systems: Vec<crate::constraint::system::System> =
+                                match res {
+                                    Err(_) | Ok(SolveOutcome::Contradictory) => continue,
+                                    Ok(SolveOutcome::Linear(_)) => {
+                                        sub.subst_system();
+                                        vec![sub.sys.clone()]
+                                    }
+                                    Ok(SolveOutcome::Cases(arms)) => {
+                                        let template = sub.sys.clone();
+                                        let mut v = Vec::new();
+                                        for arm_eq in arms {
+                                            let mut arm_sys = template.clone();
+                                            arm_sys.invalidate_max_var_idx_cache();
+                                            arm_sys.eq_store = arm_eq;
+                                            let mut arm_red = Reduction::new(self.ctx, arm_sys);
+                                            arm_red.subst_system();
+                                            if arm_red.sys.eq_store.is_false() { continue; }
+                                            v.push(arm_red.sys);
+                                        }
+                                        v
+                                    }
+                                };
+                            // Live node ids (as of this solve_action_goal
+                            // entry): chain_eqs below must NOT re-solve
+                            // pre-existing live edges (HS conjoinSystem
+                            // runs no edge fact-eqs; re-solving live edges
+                            // re-narrows live disjunctions HS keeps).
+                            let action_live_node_ids: std::collections::BTreeSet<
+                                crate::constraint::constraints::NodeId> =
+                                self.sys.nodes.iter().map(|(n, _)| n.clone()).collect();
+                            let skip_live_e =
+                                std::env::var("TAM_RS_DISABLE_E5_LIVE_EDGE_SKIP").is_err();
+                            'arm: for arm_sys in action_arm_systems {
+                                    let mut sub = Reduction::new(self.ctx, arm_sys);
+                                    // Edge-induced fact unification over
+                                    // GRAFTED edges only (skip live-live
+                                    // edges — see action_live_node_ids
+                                    // note above).
                                     let mut tag_mismatch_edge = false;
                                     let chain_eqs: Vec<_> = sub.sys.edges
                                         .iter()
                                         .filter_map(|e| {
+                                            if skip_live_e
+                                                && action_live_node_ids.contains(&e.src.0)
+                                                && action_live_node_ids.contains(&e.tgt.0) {
+                                                return None;
+                                            }
                                             let (_, src_rule) = sub.sys.nodes.iter()
                                                 .find(|(n, _)| n == &e.src.0)?;
                                             let (_, tgt_rule) = sub.sys.nodes.iter()
@@ -4755,25 +4767,38 @@ impl<'ctx> Reduction<'ctx> {
                                             })
                                         })
                                         .collect();
-                                    if tag_mismatch_edge { continue; }
+                                    if tag_mismatch_edge { continue 'arm; }
                                     if !chain_eqs.is_empty() {
                                         let r2 = sub.solve_fact_eqs(
                                             SplitStrategy::SplitNow, &chain_eqs);
-                                        if matches!(r2,
-                                            Err(_) | Ok(SolveOutcome::Contradictory))
-                                        {
-                                            continue;
+                                        match r2 {
+                                            Err(_) | Ok(SolveOutcome::Contradictory) =>
+                                                continue 'arm,
+                                            Ok(SolveOutcome::Linear(_)) => {}
+                                            Ok(SolveOutcome::Cases(arms2)) => {
+                                                // chain_eqs fan-out: install
+                                                // each arm and recurse the push.
+                                                let template2 = sub.sys.clone();
+                                                for arm2 in arms2 {
+                                                    let mut s2 = template2.clone();
+                                                    s2.invalidate_max_var_idx_cache();
+                                                    s2.eq_store = arm2;
+                                                    let mut r3 = Reduction::new(self.ctx, s2);
+                                                    r3.subst_system();
+                                                    if r3.sys.eq_store.is_false() { continue; }
+                                                    r3.sys.used_sources.push(case_name.clone());
+                                                    out.push((case_name.clone(), r3.sys));
+                                                }
+                                                continue 'arm;
+                                            }
                                         }
                                     }
                                     sub.subst_system();
                                     // Haskell-faithful: push every case
                                     // and let the next simplify+contradictions
                                     // pass catch any real impossibilities.
-                                    // Haskell's `applySource` does not drop
-                                    // cases pre-simplify.
                                     sub.sys.used_sources.push(case_name.clone());
-                                    out.push((case_name, sub.sys));
-                                }
+                                    out.push((case_name.clone(), sub.sys));
                             }
                         }
                         if !out.is_empty() {
