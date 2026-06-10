@@ -1,0 +1,320 @@
+//! Port of `Term.Maude.Signature` from
+//! `lib/term/src/Term/Maude/Signature.hs`.
+//!
+//! `MaudeSig` describes the equational theory the prover is configured
+//! with — which built-in AC operators are enabled (DH, BP, MSet, Nat,
+//! XOR), plus user-supplied subterm rules.
+
+use std::collections::BTreeSet;
+
+use crate::builtin::{
+    asym_enc_fun_sig, hash_fun_sig, location_report_fun_sig, mset_rules,
+    reveal_signature_fun_sig, signature_fun_sig, sym_enc_fun_sig,
+    asym_enc_fun_dest_sig, sym_enc_fun_dest_sig, signature_fun_dest_sig,
+    bp_rules, dh_rules, xor_rules,
+};
+use crate::function_symbols::{
+    bp_fun_sig, bp_reducible_fun_sig, dh_fun_sig, dh_reducible_fun_sig,
+    fst_dest_sym, fst_sym, mset_fun_sig, nat_fun_sig, pair_fun_sig,
+    snd_dest_sym, snd_sym, xor_fun_sig, xor_reducible_fun_sig, FunSig,
+    FunSym, NoEqFunSig, NoEqSym,
+};
+use crate::lterm::LNTerm;
+use crate::rewriting::RRule;
+use crate::subterm_rule::CtxtStRule;
+use crate::term::Term;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaudeSig {
+    pub enable_dh: bool,
+    pub enable_bp: bool,
+    pub enable_mset: bool,
+    pub enable_nat: bool,
+    pub enable_xor: bool,
+    pub enable_diff: bool,
+    pub st_fun_syms: BTreeSet<NoEqSym>,
+    pub st_rules: BTreeSet<CtxtStRule>,
+    pub macro_names: BTreeSet<NoEqSym>,
+    pub eq_convergent: bool,
+    pub fun_syms: FunSig,
+    pub irreducible_fun_syms: FunSig,
+    pub reducible_fun_syms: FunSig,
+}
+
+impl Default for MaudeSig {
+    fn default() -> Self {
+        MaudeSig {
+            enable_dh: false,
+            enable_bp: false,
+            enable_mset: false,
+            enable_nat: false,
+            enable_xor: false,
+            enable_diff: false,
+            st_fun_syms: BTreeSet::new(),
+            st_rules: BTreeSet::new(),
+            macro_names: BTreeSet::new(),
+            eq_convergent: false,
+            fun_syms: BTreeSet::new(),
+            irreducible_fun_syms: BTreeSet::new(),
+            reducible_fun_syms: BTreeSet::new(),
+        }
+    }
+}
+
+impl MaudeSig {
+    /// Refresh the cached `fun_syms` / `irreducible_fun_syms` /
+    /// `reducible_fun_syms` from the source-of-truth flags.
+    pub fn refresh(mut self) -> Self {
+        if self.enable_bp { self.enable_dh = true; }
+        let mut all_funs: FunSig = self
+            .st_fun_syms
+            .iter()
+            .map(|s| FunSym::NoEq(s.clone()))
+            .collect();
+        if self.enable_dh || self.enable_bp { all_funs.extend(dh_fun_sig()); }
+        if self.enable_bp { all_funs.extend(bp_fun_sig()); }
+        if self.enable_mset { all_funs.extend(mset_fun_sig()); }
+        if self.enable_nat { all_funs.extend(nat_fun_sig()); }
+        if self.enable_xor { all_funs.extend(xor_fun_sig()); }
+
+        // Reducible roots: any function symbol at the root of an stRules LHS,
+        // plus DH/BP/XOR reducible. AC Mult is intentionally absent.
+        let mut reducible_without_mult: FunSig = BTreeSet::new();
+        for r in &self.st_rules {
+            if let Term::App(o, _) = &r.lhs {
+                reducible_without_mult.insert(o.clone());
+            }
+        }
+        reducible_without_mult.extend(dh_reducible_fun_sig());
+        reducible_without_mult.extend(bp_reducible_fun_sig());
+        reducible_without_mult.extend(xor_reducible_fun_sig());
+
+        let irreducible: FunSig =
+            all_funs.difference(&reducible_without_mult).cloned().collect();
+
+        let mut reducible: FunSig = BTreeSet::new();
+        for r in self.rrules() {
+            if let Term::App(o, _) = &r.lhs {
+                reducible.insert(o.clone());
+            }
+        }
+
+        self.fun_syms = all_funs;
+        self.irreducible_fun_syms = irreducible;
+        self.reducible_fun_syms = reducible;
+        self
+    }
+
+    /// `rrulesForMaudeSig`: every rewrite rule active for this signature.
+    pub fn rrules(&self) -> BTreeSet<RRule<LNTerm>> {
+        let mut s: BTreeSet<RRule<LNTerm>> = self
+            .st_rules
+            .iter()
+            .map(|r| r.to_rrule())
+            .collect();
+        if self.enable_dh { s.extend(dh_rules()); }
+        if self.enable_bp { s.extend(bp_rules()); }
+        if self.enable_mset { s.extend(mset_rules()); }
+        if self.enable_xor { s.extend(xor_rules()); }
+        s
+    }
+
+    pub fn no_eq_fun_syms(&self) -> NoEqFunSig {
+        self.fun_syms
+            .iter()
+            .filter_map(|f| if let FunSym::NoEq(s) = f { Some(s.clone()) } else { None })
+            .collect()
+    }
+
+    /// Add a free function symbol.
+    pub fn add_fun_sym(mut self, sym: NoEqSym) -> Self {
+        self.st_fun_syms.insert(sym);
+        self.refresh()
+    }
+
+    /// Add a macro symbol.
+    pub fn add_macro_sym(mut self, sym: NoEqSym) -> Self {
+        self.macro_names.insert(sym);
+        self.refresh()
+    }
+
+    /// Add a context subterm rule.
+    pub fn add_ctxt_st_rule(mut self, rule: CtxtStRule) -> Self {
+        self.st_rules.insert(rule);
+        self.refresh()
+    }
+
+    pub fn merge(self, other: Self) -> Self {
+        let merged = MaudeSig {
+            enable_dh: self.enable_dh || other.enable_dh,
+            enable_bp: self.enable_bp || other.enable_bp,
+            enable_mset: self.enable_mset || other.enable_mset,
+            enable_nat: self.enable_nat || other.enable_nat,
+            enable_xor: self.enable_xor || other.enable_xor,
+            enable_diff: self.enable_diff || other.enable_diff,
+            st_fun_syms: union_except_pair_sym(&self.st_fun_syms, &other.st_fun_syms),
+            st_rules: self.st_rules.union(&other.st_rules).cloned().collect(),
+            macro_names: self.macro_names.union(&other.macro_names).cloned().collect(),
+            eq_convergent: false,
+            fun_syms: BTreeSet::new(),
+            irreducible_fun_syms: BTreeSet::new(),
+            reducible_fun_syms: BTreeSet::new(),
+        };
+        merged.refresh()
+    }
+}
+
+fn union_except_pair_sym(
+    a: &BTreeSet<NoEqSym>,
+    b: &BTreeSet<NoEqSym>,
+) -> BTreeSet<NoEqSym> {
+    // Mirrors the Haskell exclusion: don't have both `fst` and `fstDest`
+    // (or `snd`/`sndDest`) in the merged signature; the destructor wins
+    // if present in either operand.
+    let mut out: BTreeSet<NoEqSym> = a.union(b).cloned().collect();
+    let fst_d = fst_dest_sym();
+    let snd_d = snd_dest_sym();
+    if out.contains(&fst_d) { out.remove(&fst_sym()); }
+    if out.contains(&snd_d) { out.remove(&snd_sym()); }
+    out
+}
+
+// =============================================================================
+// Predefined signatures
+// =============================================================================
+
+pub fn dh_maude_sig() -> MaudeSig {
+    MaudeSig { enable_dh: true, ..MaudeSig::default() }.refresh()
+}
+pub fn bp_maude_sig() -> MaudeSig {
+    MaudeSig { enable_bp: true, ..MaudeSig::default() }.refresh()
+}
+pub fn mset_maude_sig() -> MaudeSig {
+    MaudeSig { enable_mset: true, ..MaudeSig::default() }.refresh()
+}
+pub fn nat_maude_sig() -> MaudeSig {
+    MaudeSig { enable_nat: true, ..MaudeSig::default() }.refresh()
+}
+pub fn xor_maude_sig() -> MaudeSig {
+    MaudeSig { enable_xor: true, ..MaudeSig::default() }.refresh()
+}
+
+pub fn pair_maude_sig() -> MaudeSig {
+    MaudeSig {
+        st_fun_syms: pair_fun_sig(),
+        st_rules: crate::builtin::pair_rules(),
+        ..MaudeSig::default()
+    }.refresh()
+}
+
+pub fn hash_maude_sig() -> MaudeSig {
+    MaudeSig {
+        st_fun_syms: hash_fun_sig(),
+        // Hash is one-way: no destructor rules.
+        ..MaudeSig::default()
+    }.refresh()
+}
+
+pub fn sym_enc_maude_sig() -> MaudeSig {
+    MaudeSig {
+        st_fun_syms: sym_enc_fun_sig(),
+        st_rules: crate::builtin::sym_enc_rules(),
+        ..MaudeSig::default()
+    }.refresh()
+}
+
+pub fn asym_enc_maude_sig() -> MaudeSig {
+    MaudeSig {
+        st_fun_syms: asym_enc_fun_sig(),
+        st_rules: crate::builtin::asym_enc_rules(),
+        ..MaudeSig::default()
+    }.refresh()
+}
+
+pub fn signature_maude_sig() -> MaudeSig {
+    MaudeSig {
+        st_fun_syms: signature_fun_sig(),
+        st_rules: crate::builtin::signature_rules(),
+        ..MaudeSig::default()
+    }.refresh()
+}
+
+pub fn reveal_signature_maude_sig() -> MaudeSig {
+    MaudeSig {
+        st_fun_syms: reveal_signature_fun_sig(),
+        st_rules: crate::builtin::reveal_signature_rules(),
+        ..MaudeSig::default()
+    }.refresh()
+}
+
+pub fn location_report_maude_sig() -> MaudeSig {
+    MaudeSig {
+        st_fun_syms: location_report_fun_sig(),
+        ..MaudeSig::default()
+    }.refresh()
+}
+
+pub fn sym_enc_dest_maude_sig() -> MaudeSig {
+    MaudeSig { st_fun_syms: sym_enc_fun_dest_sig(), ..MaudeSig::default() }.refresh()
+}
+
+pub fn asym_enc_dest_maude_sig() -> MaudeSig {
+    MaudeSig { st_fun_syms: asym_enc_fun_dest_sig(), ..MaudeSig::default() }.refresh()
+}
+
+pub fn signature_dest_maude_sig() -> MaudeSig {
+    MaudeSig {
+        st_fun_syms: signature_fun_dest_sig(),
+        st_rules: crate::builtin::signature_dest_rules(),
+        ..MaudeSig::default()
+    }.refresh()
+}
+
+pub fn minimal_maude_sig(diff: bool) -> MaudeSig {
+    MaudeSig {
+        enable_diff: diff,
+        st_fun_syms: pair_fun_sig(),
+        st_rules: crate::builtin::pair_rules(),
+        ..MaudeSig::default()
+    }.refresh()
+}
+
+pub fn enable_diff_maude_sig() -> MaudeSig {
+    MaudeSig { enable_diff: true, ..MaudeSig::default() }.refresh()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dh_signature_includes_dh_rules() {
+        let sig = dh_maude_sig();
+        assert!(sig.enable_dh);
+        assert_eq!(sig.rrules().len(), 13);
+    }
+
+    #[test]
+    fn bp_implies_dh() {
+        let sig = bp_maude_sig();
+        // bp turns on dh in refresh().
+        assert!(sig.enable_dh);
+        // 13 dh + 3 bp = 16
+        assert_eq!(sig.rrules().len(), 16);
+    }
+
+    #[test]
+    fn merge_combines_flags() {
+        let merged = dh_maude_sig().merge(xor_maude_sig());
+        assert!(merged.enable_dh);
+        assert!(merged.enable_xor);
+        // 13 dh + 3 xor = 16
+        assert_eq!(merged.rrules().len(), 16);
+    }
+
+    #[test]
+    fn empty_signature_has_no_rules() {
+        let sig = MaudeSig::default().refresh();
+        assert!(sig.rrules().is_empty());
+    }
+}

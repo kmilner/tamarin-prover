@@ -1,0 +1,247 @@
+//! Canonical state tracer for cross-solver (Haskell vs Rust) comparison.
+//!
+//! Emitting a one-line summary at each major solver event lets us
+//! diff two proof runs (Haskell's `tamarin-prover` vs our Rust port)
+//! side-by-side and localize where the two diverge.  Format is
+//! deliberately compact and stable; the Haskell side emits exactly
+//! the same lines (see the patched `Theory.Constraint.Solver.Sources`
+//! and `Theory.Constraint.Solver.Goals` modules).
+//!
+//! ## Usage
+//!
+//! Set `TAM_TRACE_STATE=1` and run the prover; lines go to stderr.
+//! For TLS investigation:
+//!
+//! ```sh
+//! TAM_TRACE_STATE=1 cargo run -p tamarin-theory --release --example probe_lemma \
+//!     -- examples/classic/TLS_Handshake.spthy session_key_setup_possible 200 \
+//!     2>/tmp/rust.trace
+//! TAM_TRACE_STATE=1 tamarin-prover --prove=session_key_setup_possible \
+//!     examples/classic/TLS_Handshake.spthy 2>/tmp/haskell.trace
+//! diff /tmp/haskell.trace /tmp/rust.trace
+//! ```
+//!
+//! ## Format
+//!
+//! One event per line:
+//!
+//! ```text
+//! TRACE@<step> <op> goal=<goal_summary> sys=<fingerprint>
+//! ```
+//!
+//! Fields:
+//! - `<step>`: monotonically-increasing per-session counter (so
+//!   side-by-side line `N` of the two traces are comparable when the
+//!   first divergence is at step `N`).
+//! - `<op>`: short verb identifying the event (`expand`, `pick`,
+//!   `case`, `applySource`, `simplify_in`, `simplify_out`, …).
+//! - `<goal_summary>`: compact form of the current goal (or `-`).
+//! - `<fingerprint>`: `n=<#nodes> e=<#edges> gO=<#open-goals>`
+//!   ` f=<#formulas> sf=<#solved-formulas> eqs=<#subst-entries>`
+//!   ` la=<Y|N>`.
+//!
+//! Keeping the format identical on both sides lets us use `diff` /
+//! `comm` / `paste` to localize the first divergence.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static STEP: AtomicU64 = AtomicU64::new(0);
+
+/// Whether tracing is enabled (env var `TAM_TRACE_STATE` set).
+pub fn enabled() -> bool {
+    std::env::var("TAM_TRACE_STATE").is_ok()
+}
+
+/// Compact one-line summary of a `System`'s shape.  Matches
+/// Haskell's tracer format exactly.
+pub fn fingerprint(sys: &crate::constraint::system::System) -> String {
+    let n = sys.nodes.len();
+    let e = sys.edges.len();
+    let g_open = sys.goals.iter().filter(|(_, st)| !st.solved).count();
+    let f = sys.formulas.len();
+    let sf = sys.solved_formulas.len();
+    let eqs = sys.eq_store.subst.to_list().len();
+    let la = if sys.last_atom.is_some() { 'Y' } else { 'N' };
+    format!(
+        "n={} e={} gO={} f={} sf={} eqs={} la={}",
+        n, e, g_open, f, sf, eqs, la
+    )
+}
+
+/// Compact one-line summary of a `Goal` (or `-` when no goal).
+pub fn goal_summary(g: Option<&crate::constraint::constraints::Goal>) -> String {
+    use crate::constraint::constraints::Goal;
+    use crate::fact::FactTag;
+    let tag_label = |fa: &crate::fact::LNFact, prefix: &str| -> String {
+        let label = match &fa.tag {
+            FactTag::Ku => "KU".to_string(),
+            FactTag::Kd => "KD".to_string(),
+            FactTag::Proto(_, name, _) => name.clone(),
+            FactTag::Fresh => "Fr".to_string(),
+            FactTag::In => "In".to_string(),
+            FactTag::Out => "Out".to_string(),
+            FactTag::Ded => "Ded".to_string(),
+            FactTag::Term => "Term".to_string(),
+        };
+        format!("{}{}({})", prefix, label, terms_summary(&fa.terms))
+    };
+    match g {
+        None => "-".into(),
+        Some(Goal::Action(_, fa)) => tag_label(fa, ""),
+        Some(Goal::Premise(_, fa)) => tag_label(fa, "Pre/"),
+        Some(Goal::Chain(_, _)) => "Chain".into(),
+        Some(Goal::Disj(_)) => "Disj".into(),
+        Some(Goal::Split(_)) => "Split".into(),
+        Some(Goal::Subterm(_)) => "Subterm".into(),
+    }
+}
+
+/// Compact summary of a term list — preserves function symbols but
+/// elides arguments for compactness.
+fn terms_summary(ts: &[tamarin_term::lterm::LNTerm]) -> String {
+    let mut out = String::new();
+    for (i, t) in ts.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        out.push_str(&term_summary(t));
+    }
+    out
+}
+
+/// Compact summary of a single term.  Preserves the head symbol,
+/// abbreviates vars to their name (sort 1-char + idx is dropped
+/// for compactness), shows `<...>` for pair sub-trees.
+pub fn term_summary(t: &tamarin_term::lterm::LNTerm) -> String {
+    use tamarin_term::lterm::LSort;
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    use tamarin_term::function_symbols::FunSym;
+    match t {
+        Term::Lit(Lit::Var(v)) => {
+            let sort_ch = match v.sort {
+                LSort::Msg => 'M',
+                LSort::Pub => 'P',
+                LSort::Fresh => 'F',
+                LSort::Nat => 'N',
+                LSort::Node => 'I',
+            };
+            // Include idx for witness vars so we can debug
+            // sort-conflation issues — comparing identical-looking
+            // names with different idxs.
+            if v.name == "x" {
+                format!("{}:{}:{}", v.name, sort_ch, v.idx)
+            } else {
+                format!("{}:{}", v.name, sort_ch)
+            }
+        }
+        Term::Lit(Lit::Con(c)) => format!("'{}'", c.id.0),
+        Term::App(FunSym::NoEq(noeq), args) => {
+            let name = String::from_utf8_lossy(&noeq.name);
+            if name == "pair" {
+                let mut inner = Vec::new();
+                fn flatten<'a>(t: &'a tamarin_term::lterm::LNTerm,
+                               out: &mut Vec<&'a tamarin_term::lterm::LNTerm>) {
+                    if let Term::App(FunSym::NoEq(ns), args) = t {
+                        if ns.name == b"pair" {
+                            flatten(&args[0], out);
+                            flatten(&args[1], out);
+                            return;
+                        }
+                    }
+                    out.push(t);
+                }
+                flatten(t, &mut inner);
+                let s: Vec<String> = inner.iter().map(|x| term_summary(x)).collect();
+                format!("<{}>", s.join(","))
+            } else {
+                let s: Vec<String> = args.iter().map(term_summary).collect();
+                format!("{}({})", name, s.join(","))
+            }
+        }
+        Term::App(FunSym::List, args) => {
+            let s: Vec<String> = args.iter().map(term_summary).collect();
+            format!("[{}]", s.join(","))
+        }
+        Term::App(FunSym::Ac(_), _) | Term::App(FunSym::C(_), _) => "AC?".into(),
+    }
+}
+
+/// Bump the step counter and return its previous value.
+fn next_step() -> u64 {
+    STEP.fetch_add(1, Ordering::SeqCst)
+}
+
+/// Whether full goal/formula dumps are enabled (`TAM_TRACE_DUMP=1`).
+fn dump_enabled() -> bool {
+    std::env::var("TAM_TRACE_DUMP").is_ok()
+}
+
+/// Dump system goals and formulas to stderr — useful when fingerprint
+/// counts diverge and we need to know exactly what's on each side.
+fn dump_sys(sys: &crate::constraint::system::System) {
+    if !dump_enabled() { return; }
+    eprintln!("  goals:");
+    for (g, st) in sys.goals.iter() {
+        eprintln!("    [{}{}] {}",
+            if st.solved { "S" } else { "-" },
+            if st.looping { "L" } else { "-" },
+            goal_summary(Some(g)));
+    }
+    eprintln!("  nodes:");
+    for (id, rule) in sys.nodes.iter() {
+        eprintln!("    {}:{} prems=[{}] concs=[{}] acts=[{}]",
+            id.name, id.idx,
+            rule.premises.iter().map(|p| format!("{}",
+                state_trace_fact_brief(p))).collect::<Vec<_>>().join(","),
+            rule.conclusions.iter().map(|c| format!("{}",
+                state_trace_fact_brief(c))).collect::<Vec<_>>().join(","),
+            rule.actions.iter().map(|a| format!("{}",
+                state_trace_fact_brief(a))).collect::<Vec<_>>().join(","));
+    }
+    eprintln!("  edges: {}", sys.edges.len());
+}
+
+fn state_trace_fact_brief(fa: &crate::fact::LNFact) -> String {
+    use crate::fact::FactTag;
+    let label = match &fa.tag {
+        FactTag::Ku => "KU".to_string(),
+        FactTag::Kd => "KD".to_string(),
+        FactTag::Proto(_, name, _) => name.clone(),
+        FactTag::Fresh => "Fr".to_string(),
+        FactTag::In => "In".to_string(),
+        FactTag::Out => "Out".to_string(),
+        FactTag::Ded => "Ded".to_string(),
+        FactTag::Term => "Term".to_string(),
+    };
+    let args: Vec<String> = fa.terms.iter().map(term_summary).collect();
+    format!("{}({})", label, args.join(","))
+}
+
+/// Emit one trace event line.
+pub fn emit(op: &str, goal: Option<&crate::constraint::constraints::Goal>,
+            sys: &crate::constraint::system::System) {
+    if !enabled() { return; }
+    let s = next_step();
+    let path = crate::constraint::solver::trace::case_path_string();
+    eprintln!("[STATE path={} step={} op={} goal={} {}]",
+        path, s, op, goal_summary(goal), fingerprint(sys));
+    dump_sys(sys);
+}
+
+/// Emit a trace event with an extra `case=<name>` tag (used by
+/// case-selection points like the SolveGoal filter).
+pub fn emit_case(op: &str, case_name: &str,
+                 goal: Option<&crate::constraint::constraints::Goal>,
+                 sys: &crate::constraint::system::System) {
+    if !enabled() { return; }
+    let s = next_step();
+    let path = crate::constraint::solver::trace::case_path_string();
+    eprintln!("[STATE path={} step={} op={} case={} goal={} {}]",
+        path, s, op, case_name, goal_summary(goal), fingerprint(sys));
+    dump_sys(sys);
+}
+
+/// Reset the step counter (for a fresh session).  Called at the
+/// start of `prove_lemma`.
+pub fn reset() {
+    STEP.store(0, Ordering::SeqCst);
+}

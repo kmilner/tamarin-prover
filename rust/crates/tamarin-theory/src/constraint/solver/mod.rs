@@ -1,0 +1,35 @@
+//! Solver layer (port of `Theory.Constraint.Solver.*`).
+//!
+//! Submodules:
+//! - [`contradictions`] — port of `Solver.Contradictions`. Identifies
+//!   all reasons a `System` is contradictory.
+//! - [`proof_method`] — port of `Solver.ProofMethod`. The
+//!   external small-step interface to the constraint solver
+//!   (`ProofMethod`, `Result`, `is_finished`, `exec_proof_method`).
+//! - [`context`] — port of the `ProofContext` data type used by every
+//!   solver entry point.
+//!
+//! The full Haskell source is ~4 k LOC across `ProofMethod`,
+//! `Reduction`, `Goals`, `Sources`, `Simplify`, `Contradictions`. This
+//! Rust port lays the data/control skeleton; per-rule reduction logic
+//! comes alongside the unification + AC narrowing port.
+
+pub mod annotated_goals;
+pub mod context;
+pub mod contradictions;
+pub mod goals;
+pub mod lazy_views;
+pub mod proof_method;
+pub mod reduction;
+pub mod rename_precise;
+pub mod search;
+pub mod simplify;
+pub mod sources;
+pub mod trace;
+
+pub use context::ProofContext;
+pub use contradictions::{contradictions, Contradiction};
+pub use proof_method::{
+    exec_proof_method, is_finished, ProofMethod, Result as ProofResult,
+};
+pub use search::{run_proof_search, NodeStatus, ProofNode};

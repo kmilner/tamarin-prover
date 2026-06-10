@@ -1,0 +1,14 @@
+[package]
+name = "tamarin-export"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Export to other provers for the Tamarin prover (Rust port)."
+
+[dependencies]
+tamarin-utils = { workspace = true }
+tamarin-term = { workspace = true }
+tamarin-theory = { workspace = true }
+tamarin-sapic = { workspace = true }
