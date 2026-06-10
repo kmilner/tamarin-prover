@@ -782,8 +782,9 @@ fn lnfact_to_parser(fa: &crate::fact::LNFact) -> p::Fact {
         FactTag::Fresh => ("Fr".to_string(), false),
         FactTag::In => ("In".to_string(), false),
         FactTag::Out => ("Out".to_string(), false),
-        FactTag::Ku => ("KU".to_string(), false),
-        FactTag::Kd => ("KD".to_string(), false),
+        // KU and KD are Persistent per factTagMultiplicity (Model/Fact.hs:358-359).
+        FactTag::Ku => ("KU".to_string(), true),
+        FactTag::Kd => ("KD".to_string(), true),
         FactTag::Ded => ("Ded".to_string(), false),
         FactTag::Term => ("Term".to_string(), false),
     };

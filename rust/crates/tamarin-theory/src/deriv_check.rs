@@ -389,7 +389,10 @@ fn synthesise_probe_theory(
         let t1 = p::VarSpec { name: "t1".into(), idx: 0, sort: p::SortHint::Node, typ: None };
         let gen_at = action_atom(action.clone(), p::Term::Var(t0.clone()));
         let ku_fact = p::Fact {
-            persistent: false,
+            // KU is Persistent per factTagMultiplicity (Model/Fact.hs:358);
+            // keep the "for special names, persistent == tag multiplicity"
+            // invariant so GFact equality with parsed KU facts is faithful.
+            persistent: true,
             name: "KU".into(),
             args: vec![p::Term::Var(v_renamed)],
             annotations: Vec::new(),
