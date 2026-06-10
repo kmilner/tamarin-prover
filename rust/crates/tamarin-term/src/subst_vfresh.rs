@@ -261,6 +261,39 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
         preserve: &std::collections::BTreeSet<LVar>,
     ) -> crate::subst::Subst<C, LVar> {
         use crate::subst::Subst;
+        // === HS-faithfulness gate (2026-06-10) ===
+        // HS has NO preserve concept in ANY freshToFree* variant:
+        //   - `freshToFree` (Substitution.hs:54-66) imports EVERY range
+        //     var to a brand-new fresh var via `importBinding`;
+        //   - `freshToFreeAvoiding` (:69-71) is just
+        //     `freshToFree s \`evalFreshAvoiding\` t` — `evalFreshAvoiding`
+        //     only SEEDS the fresh counter above t's max idx, it never
+        //     skips a variable;
+        //   - `freshToFreeAvoidingFast` (:74-81) renames all range vars
+        //     via `rename ... \`evalFreshAvoiding\` t` — same.
+        // The preserve-keep-identity behaviour below was introduced by
+        // `f6a193aa`, whose commit message misread `evalFreshAvoiding`
+        // as "vars appearing in t are SKIPPED".  Keeping a range var's
+        // identity can FUSE a Maude witness with an unrelated live
+        // system var that happens to share (name, sort, idx) — observed
+        // on Scott::key_secrecy where the c_kdf source's case6/case10
+        // msk var fused with the exponent's Msg-factor witness
+        // (`ex.0 → ~x.12` colliding with the msk `~x.12`), spuriously
+        // merging Fresh nodes at conjoin and killing Resp_1 arms HS
+        // keeps.  It also drops the domain-name hint for preserved vars
+        // (witnesses stay "x"-named where HS yields protocol names like
+        // `~ex`/`~msk`).  HS instead maintains the invariant that VFresh
+        // ranges are pure-fresh (composeVFresh's `extendWithRenaming`,
+        // Substitution.hs:40-47) and renames unconditionally.
+        // Kill: `TAM_RS_LEGACY_FOLD_PRESERVE=1` restores the f6a193aa
+        // behaviour.
+        let empty_preserve = std::collections::BTreeSet::new();
+        let preserve: &std::collections::BTreeSet<LVar> =
+            if std::env::var("TAM_RS_LEGACY_FOLD_PRESERVE").is_ok() {
+                preserve
+            } else {
+                &empty_preserve
+            };
         // HS-faithful port (Substitution.hs:54-66):
         //
         //   freshToFree subst = (`evalBindT` noBindings) $ do
