@@ -273,17 +273,12 @@ case "${1:-}" in
         done
         ;;
     "" )
-        target_dirs=(loops csf23-subterms experiments regression ccs15 classic \
-                     features related_work post17 cav13 jcs18 csf18-alethea \
-                     csf17 csf12 testParser ake sp14)
-        for dir in "${target_dirs[@]}"; do
-            dpath="$CORPUS_ROOT/$dir"
-            [ -d "$dpath" ] || continue
-            while IFS= read -r cand; do
-                case "$cand" in */testParser/include/*) continue;; esac
-                files+=("$cand")
-            done < <(find "$dpath" -maxdepth 2 -name '*.spthy' 2>/dev/null | sort)
-        done
+        # Whole examples/ tree (folder filter dropped 2026-06-10; previously a
+        # 17-dir allowlist at maxdepth 2). Content filters above still apply.
+        while IFS= read -r cand; do
+            case "$cand" in */testParser/include/*) continue;; esac
+            files+=("$cand")
+        done < <(find "$CORPUS_ROOT" -name '*.spthy' 2>/dev/null | sort)
         ;;
     *)
         for cand in "$@"; do [ -f "$cand" ] && files+=("$cand"); done

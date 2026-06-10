@@ -858,29 +858,17 @@ fn corpus_proof_skeleton_match_probe() {
     std::env::set_var("TAM_PROVE_DEADLINE_MS", "10000");
 
     let corpus_root = std::path::PathBuf::from("/home/parallels/tamarin-prover/examples");
-    let target_dirs = [
-        "loops", "csf23-subterms", "experiments", "regression",
-        "ccs15", "classic", "features", "related_work",
-        "post17", "cav13", "jcs18", "csf18-alethea",
-        "csf17", "csf12",
-        "testParser",
-        // ake + sp14 hold the bilinear-pairing theories (Scott, Chen_Kudla,
-        // Joux, RYY, ...) — added once BP support reached byte-faithfulness
-        // (2026-06-10), so BP regressions are caught corpus-wide.
-        "ake", "sp14",
-    ];
 
-    // Phase 1: collect candidate spthy paths.
+    // Phase 1: collect candidate spthy paths — the WHOLE examples/ tree.
+    // (Folder allowlist dropped 2026-06-10, after BP/XOR/DH/multiset support
+    // reached byte-faithfulness; the content filters below still skip
+    // diff-mode and SAPIC files. 922 files / 597 comparable as of removal.)
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
-    for dir in &target_dirs {
-        let dir_path = corpus_root.join(dir);
-        if !dir_path.exists() { continue; }
-        for e in walkdir::WalkDir::new(&dir_path).max_depth(2).into_iter().filter_map(|e| e.ok()) {
-            if e.path().extension().and_then(|s| s.to_str()) == Some("spthy") {
-                let p = e.path();
-                if p.to_string_lossy().contains("/testParser/include/") { continue; }
-                paths.push(p.to_path_buf());
-            }
+    for e in walkdir::WalkDir::new(&corpus_root).into_iter().filter_map(|e| e.ok()) {
+        if e.path().extension().and_then(|s| s.to_str()) == Some("spthy") {
+            let p = e.path();
+            if p.to_string_lossy().contains("/testParser/include/") { continue; }
+            paths.push(p.to_path_buf());
         }
     }
 
