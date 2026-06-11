@@ -576,12 +576,38 @@ fn render_rule(parsed_rule: &p::Rule, elab: &Theory) -> String {
     // (e.g. `'g'^~ltkB^~ltkA` → `'g'^(~ltkA*~ltkB)` under DH), in which
     // case HS prints the AC body as a comment block rather than the
     // trivial-variant annotation.
+    //
+    // MACRO CASE (ClosedTheory.hs:334 + Rule.hs:762-764): When the theory
+    // uses macros, HS's `cprRuleE` keeps the MACRO form of the rule while
+    // `cprRuleAC` has the EXPANDED form (closeProtoRule runs
+    // `applyMacroInRule` before `variantsProtoRule` but stores the original
+    // `ruE` untouched — Rule.hs:96-98).  `isTrivialProtoVariantAC` then
+    // returns `False` because `ps != ps'` (macro term ≠ expanded term).
+    // RS's `opr.rule` stores the EXPANDED form (post-`expand_theory_macros`)
+    // so we must additionally check whether the DISPLAY form (parsed_rule,
+    // which still has macro calls) matches the elaborated body.  If they
+    // differ, even a rule with no AC variants must show the AC comment block
+    // containing the expanded form.
     let elab_rule = elab.rules().find(|r| r.name() == name);
+    // Rendered text of the display body (macro form) — already computed
+    // above from `premises`/`actions`/`conclusions`.  We compare against
+    // the elaborated rule's body text to detect macro-expansion differences.
+    let display_body_text = render_rule_body(&premises, &actions, &conclusions);
     let trivial = elab_rule
         .map(|r| {
             let no_residual_substs = r.variant_substs.iter().all(|s| s.is_empty());
             let ac_body_matches = match &r.abstracted_rule {
-                None => true,
+                None => {
+                    // No AC abstraction — but the display body (macro form)
+                    // might still differ from the elaborated body (expanded
+                    // form).  Mirror HS `ps == ps'` check: compare rendered
+                    // body text so that macro ≠ expansion → not trivial.
+                    let ep = lnfacts_to_parser(&r.rule.premises);
+                    let ea = lnfacts_to_parser(&r.rule.actions);
+                    let ec = lnfacts_to_parser(&r.rule.conclusions);
+                    let elab_body_text = render_rule_body(&ep, &ea, &ec);
+                    display_body_text == elab_body_text
+                }
                 Some(ac) => same_rule_body(&r.rule, ac),
             };
             no_residual_substs && ac_body_matches
@@ -759,12 +785,17 @@ fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule) -> 
     s.push_str(&format!("  rule (modulo AC) {}:\n", name));
     // Body of the abstracted rule.  Use the abstracted version when
     // available; fall back to the original facts.
-    let prems = lnfacts_to_parser(&rule.abstracted_rule.as_ref()
-        .map(|r| r.premises.clone()).unwrap_or_default());
-    let acts = lnfacts_to_parser(&rule.abstracted_rule.as_ref()
-        .map(|r| r.actions.clone()).unwrap_or_default());
-    let concs = lnfacts_to_parser(&rule.abstracted_rule.as_ref()
-        .map(|r| r.conclusions.clone()).unwrap_or_default());
+    // Use the abstracted rule's facts when available; when `abstracted_rule`
+    // is `None` (no reducible-headed sub-terms), fall back to the ELABORATED
+    // rule's facts (`rule.rule`).  This is the macro case: the elaborated
+    // facts have macro calls expanded (e.g. `aenc(~k, pkS)` instead of
+    // `encrypt(~k, pkS)`) — exactly what HS's `cprRuleAC` holds after
+    // `variantsProtoRule (applyMacroInRule macros ruE)`.  Previously we
+    // fell back to empty vecs, producing an empty AC body.
+    let ac_rule = rule.abstracted_rule.as_ref().unwrap_or(&rule.rule);
+    let prems = lnfacts_to_parser(&ac_rule.premises);
+    let acts = lnfacts_to_parser(&ac_rule.actions);
+    let concs = lnfacts_to_parser(&ac_rule.conclusions);
     // Each line of the rule body needs an extra leading 2-space indent
     // (we're inside the comment block, which already has 2 spaces).
     let body = render_rule_body(&prems, &acts, &concs);
