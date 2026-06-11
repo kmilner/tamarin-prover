@@ -1103,6 +1103,55 @@ pub fn canonicalize_ac_in_pfact(f: &p::Fact) -> p::Fact {
     out
 }
 
+/// Apply `canonicalize_ac_in_pterm` to every term in a parser-AST atom.
+pub fn canonicalize_ac_in_atom(a: &p::Atom) -> p::Atom {
+    use p::Atom::*;
+    let ct = canonicalize_ac_in_pterm;
+    match a {
+        Eq(x, y) => Eq(ct(x), ct(y)),
+        Less(x, y) => Less(ct(x), ct(y)),
+        LessMset(x, y) => LessMset(ct(x), ct(y)),
+        Subterm(x, y) => Subterm(ct(x), ct(y)),
+        Action(f, t) => Action(canonicalize_ac_in_pfact(f), ct(t)),
+        Last(t) => Last(ct(t)),
+        Pred(f) => Pred(canonicalize_ac_in_pfact(f)),
+    }
+}
+
+/// Apply `canonicalize_ac_in_pterm` to every term in a parser-AST formula.
+///
+/// HS-faithful: HS sorts AC arguments at parse time when building LNTerm via
+/// `fAppAC` (Term/Term/Raw.hs:118-122) over the *free* logical variables,
+/// using `Ord LVar` = (idx, sort, name) (LTerm.hs:522-524).  Our parser keeps
+/// `BinOp` trees in written order; this walk re-establishes the canonical AC
+/// order on the free-variable parser AST so the subsequent guarded conversion
+/// (Free→Bound abstraction) preserves exactly what HS would have produced.
+pub fn canonicalize_ac_in_formula(f: &p::Formula) -> p::Formula {
+    use p::Formula::*;
+    match f {
+        False => False,
+        True => True,
+        Atom(a) => Atom(canonicalize_ac_in_atom(a)),
+        Not(g) => Not(Box::new(canonicalize_ac_in_formula(g))),
+        And(g, h) => And(
+            Box::new(canonicalize_ac_in_formula(g)),
+            Box::new(canonicalize_ac_in_formula(h))),
+        Or(g, h) => Or(
+            Box::new(canonicalize_ac_in_formula(g)),
+            Box::new(canonicalize_ac_in_formula(h))),
+        Implies(g, h) => Implies(
+            Box::new(canonicalize_ac_in_formula(g)),
+            Box::new(canonicalize_ac_in_formula(h))),
+        Iff(g, h) => Iff(
+            Box::new(canonicalize_ac_in_formula(g)),
+            Box::new(canonicalize_ac_in_formula(h))),
+        Forall(vs, g) => Forall(vs.clone(),
+            Box::new(canonicalize_ac_in_formula(g))),
+        Exists(vs, g) => Exists(vs.clone(),
+            Box::new(canonicalize_ac_in_formula(g))),
+    }
+}
+
 pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
     use tamarin_term::function_symbols::AcSym;
     use tamarin_term::term::f_app_ac;
