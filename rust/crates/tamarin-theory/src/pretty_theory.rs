@@ -358,7 +358,18 @@ fn render_parsed_item(
             // These are absorbed into the signature/configuration headers.
             None
         }
-        Rule(r) => Some(render_rule(r, elab, &macros)),
+        Rule(r) => {
+            // HS closeProtoRule (Rule.hs:97-98): `ClosedProtoRule ruE <$>
+            // maybeToList (variantsProtoRule hnd ruE)` — a rule with no
+            // variants yields NO closed rule, so it is absent from the
+            // closed theory and never rendered.  Such rules are removed
+            // from the elaborated theory in run.rs; mirror the absence here.
+            if elab.rules().any(|er| er.name() == r.name) {
+                Some(render_rule(r, elab, &macros))
+            } else {
+                None
+            }
+        }
         IntrRule(_) => None,
         Lemma(l) => Some(render_parsed_lemma(l, &macros, proved)),
         Restriction(r) => Some(render_parsed_restriction(r, &macros)),
@@ -1700,8 +1711,28 @@ fn render_guarded_block(lem: &p::Lemma, macros: &[p::Macro]) -> String {
     let gf = match crate::guarded::formula_to_guarded(&expanded_formula) {
         Ok(g) => g,
         Err(e) => {
-            // HS renders `/* conversion to guarded formula failed: ... */`.
-            return format!("/*\nconversion to guarded formula failed:\n  {}\n*/", e);
+            // HS Lemma.hs:132-134: `multiComment (text "conversion to
+            // guarded formula failed:" $$ nest 2 err)` where `err` is the
+            // full `ppError` doc (Guarded.hs:479): the error text, the
+            // quoted failing sub-formula (Guarded.hs:508-514/561-563 both
+            // include `ppFormula f0`), then "in the formula" + the quoted
+            // formula passed to `formulaToGuarded` (nest 2 . doubleQuotes).
+            let mut block = String::from("/*\nconversion to guarded formula failed:\n");
+            for line in e.message.lines() {
+                block.push_str("  ");
+                block.push_str(line);
+                block.push('\n');
+            }
+            let full_text = crate::pretty_formula::pretty_formula(&expanded_formula);
+            let sub_text = e.subject_formula.as_ref()
+                .map(|f| crate::pretty_formula::pretty_formula(f))
+                .unwrap_or_else(|| full_text.clone());
+            block.push_str("    \"");
+            block.push_str(&sub_text);
+            block.push_str("\"\n  in the formula\n    \"");
+            block.push_str(&full_text);
+            block.push_str("\"\n*/");
+            return block;
         }
     };
     // For all-traces lemmas, HS prints the negated guarded formula
