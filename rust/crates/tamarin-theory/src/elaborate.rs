@@ -144,6 +144,124 @@ pub fn elaborate_with_diagnostics(
     Ok((thy, diags))
 }
 
+/// Port of HS `checkGuarded` called inside `formulaReports`
+/// (Wellformedness.hs:988-1004).
+///
+/// For each lemma/restriction formula that fails `formulaToGuarded`,
+/// produce a `WfError` with:
+///   - topic `" Formula guardedness"` (leading space, matching HS
+///     `underlineTopic " Formula guardedness"` at Wellformedness.hs:1004)
+///   - message layout matching HS's `prettyWfErrorReport` + `checkGuarded`:
+///
+/// ```
+///  Formula guardedness
+/// ====================
+///
+///   {header} cannot be converted to a guarded formula:
+///     {error_text}
+///       "{sub_formula}"
+///     in the formula
+///       "{full_formula}"
+/// ```
+///
+/// Indentation: 2 (prettyWfErrorReport nest 2) + 2 (checkGuarded nest 2
+/// err) + 2 (ppFormula nest 2) = 6 spaces for formula text.
+///
+/// HS `msum` semantics: in `formulaReports` the check order is
+/// `checkQuantifiers`, `checkTerms`, `checkGuarded` — the FIRST that
+/// fires for a given formula wins and the others are skipped.  This
+/// function is called with `already_failed_terms = true` for formulas
+/// that already triggered "Formula terms" (checkTerms), so it can skip
+/// the guardedness check for those formulas and preserve the `msum`
+/// semantics.  The caller (run.rs) must filter accordingly.
+pub fn check_guarded_wf(parser_thy: &p::Theory) -> Vec<tamarin_parser::wf::WfError> {
+    use tamarin_parser::wf::underline_topic;
+    use crate::pretty_formula::pretty_formula;
+
+    // Apply macros so the WF check sees the expanded formulas, just as
+    // HS's `formulaReports` applies `applyMacroInFormula` before checking.
+    let mut thy_clone = parser_thy.clone();
+    crate::macro_expand::expand_theory_macros(&mut thy_clone);
+
+    let mut out: Vec<tamarin_parser::wf::WfError> = Vec::new();
+
+    // Iterate lemmas and restrictions in theory order, mirroring HS's
+    // `annFormulas` list monad in `formulaReports` (Wellformedness.hs:1007-1014).
+    for item in &thy_clone.items {
+        let (header, formula) = match item {
+            p::TheoryItem::Lemma(l) => {
+                (format!("Lemma `{}'", l.name), &l.formula)
+            }
+            p::TheoryItem::Restriction(r) | p::TheoryItem::LegacyAxiom(r) => {
+                (format!("Restriction `{}'", r.name), &r.formula)
+            }
+            _ => continue,
+        };
+
+        let e = match formula_to_guarded(formula) {
+            Ok(_) => continue,   // guard check passed
+            Err(e) => e,
+        };
+
+        // Render the formula text (the full formula).
+        let full_formula_text = pretty_formula(formula);
+
+        // Render the sub-formula text (the innermost failing quantifier,
+        // or the full formula if no sub-formula was tracked — which
+        // matches HS's `ppFormula fmOrig` for the top-level case).
+        let sub_formula_text = e.subject_formula.as_ref()
+            .map(|f| pretty_formula(f))
+            .unwrap_or_else(|| full_formula_text.clone());
+
+        // Build the HS-faithful message block.
+        // Layout (indent levels):
+        //   2:  "{header} cannot be converted to a guarded formula:"
+        //   4:  "{error_text}"
+        //   6:  '"{sub_formula}"'     (if sub_formula != full_formula)
+        //   4:  "in the formula"
+        //   6:  '"{full_formula}"'
+        //
+        // The `underlineTopic` of " Formula guardedness" includes the
+        // trailing newline; we add one blank line before the body (from
+        // `$-$` in `ppTopic` of `prettyWfErrorReport`).
+        let topic = " Formula guardedness";
+        let mut msg = String::new();
+        msg.push_str(&underline_topic(topic));
+        msg.push('\n');                 // blank line between header and body
+        msg.push_str("  ");            // nest 2 (prettyWfErrorReport)
+        msg.push_str(&header);
+        msg.push_str(" cannot be converted to a guarded formula:\n");
+
+        // Indent the error body by 4 spaces (nest 2 inside checkGuarded).
+        for line in e.message.lines() {
+            msg.push_str("    ");
+            msg.push_str(line);
+            msg.push('\n');
+        }
+
+        // If the sub-formula is different from the full formula (nested
+        // quantifier case), emit the sub-formula line (6 spaces).
+        // This mirrors HS's `noUnguardedVars` which includes `ppFormula f0`
+        // (the sub-formula) as part of the `d` doc, then `ppError` appends
+        // "in the formula" + full formula.
+        // When sub == full (top-level quantifier failure), HS still emits
+        // the formula once under the error text and once under "in the formula"
+        // — the same text appears twice.
+        msg.push_str("      ");        // 6 spaces
+        msg.push('"');
+        msg.push_str(&sub_formula_text);
+        msg.push_str("\"\n");
+        msg.push_str("    in the formula\n");
+        msg.push_str("      ");        // 6 spaces
+        msg.push('"');
+        msg.push_str(&full_formula_text);
+        msg.push_str("\"\n");
+
+        out.push(tamarin_parser::wf::WfError::new(topic, msg));
+    }
+    out
+}
+
 /// Elaborate a parser theory into a typed `Theory`. The signature
 /// is initialised from the union of `builtins:` declarations. Before
 /// the structural conversion runs, predicate atoms are expanded

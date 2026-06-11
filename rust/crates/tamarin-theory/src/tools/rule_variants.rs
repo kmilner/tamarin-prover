@@ -1094,3 +1094,83 @@ fn contains_subterm(needle: &LNTerm, haystack: &LNTerm) -> bool {
     }
     false
 }
+
+/// WF-only check: mirrors HS `variantsCheck` (Wellformedness.hs:354-372)
+/// sub-check `guard (null recomputedVariants)`.  Returns `true` iff
+/// `variantsProtoRule hnd rule` would return `Nothing` — i.e. the rule
+/// has no non-fresh-redundant variants.
+///
+/// HS faithfulness: `recomputedVariants` is empty iff
+/// `variantsProtoRule` returns `Nothing`, which happens when
+/// `convertRule`'s `substs` list (RuleVariants.hs:87-91) is empty after
+/// `isFreshRedundant` filtering.
+///
+/// Two paths lead to empty `substs`:
+///
+/// 1. **Contradiction (no-reducible) path**: the rule has no reducible-
+///    headed sub-terms.  Maude returns only identity/renaming variants,
+///    which become `{}` after `removeRenamings`.  `isFreshRedundant {}`
+///    fires iff any freshly-introduced term `~v` (from `Fr(~v)`) appears
+///    as a sub-term of any non-Fr premise term.  For the canonical case
+///    `Fr(~x), In(~x)`: `~x` IS in both `freshlyIntroduced` and
+///    `premiseTerms` → all variants redundant → `Nothing`.
+///
+/// 2. **Reducible path**: the rule has reducible-headed terms.  Maude
+///    may return non-renaming variants, but after composition and the
+///    full `isFreshRedundant` pipeline all may still be filtered.  This
+///    is handled by `abstract_rule_and_variants` returning `Ok(None)`.
+///
+/// `maude` is only needed for path 2; for path 1 the check is purely
+/// syntactic.  The function requires a `MaudeHandle` for completeness.
+pub fn rule_has_no_variants_for_wf(
+    maude: &MaudeHandle,
+    rule: &ProtoRuleE,
+) -> bool {
+    // Path 1: syntactic fresh-redundancy check (no Maude call needed).
+    //
+    // If the rule has NO reducible-headed sub-terms, the only Maude
+    // variant is identity/renaming → collapses to `{}` after
+    // `removeRenamings`.  `isFreshRedundant {}` = True iff any
+    // Fr-introduced term also appears in a non-Fr premise.
+    let has_reducible = {
+        fn term_has_red(t: &LNTerm, irred: &std::collections::BTreeSet<tamarin_term::function_symbols::FunSym>) -> bool {
+            use tamarin_term::term::Term;
+            if let Term::App(f, args) = t {
+                if !irred.contains(f) { return true; }
+                args.iter().any(|a| term_has_red(a, irred))
+            } else {
+                false
+            }
+        }
+        let irred = &maude.maude_sig().irreducible_fun_syms;
+        rule.premises.iter().chain(rule.actions.iter()).chain(rule.conclusions.iter())
+            .any(|f| f.terms.iter().any(|t| term_has_red(t, irred)))
+            || rule.new_vars.iter().any(|t| term_has_red(t, irred))
+    };
+
+    if !has_reducible {
+        // Syntactic `isFreshRedundant {}` check.
+        let freshly_introduced: Vec<&LNTerm> = rule.premises.iter()
+            .filter(|f| matches!(f.tag, crate::fact::FactTag::Fresh))
+            .filter_map(|f| f.terms.first())
+            .collect();
+        let premise_terms: Vec<&LNTerm> = rule.premises.iter()
+            .filter(|f| !matches!(f.tag, crate::fact::FactTag::Fresh))
+            .flat_map(|f| f.terms.iter())
+            .collect();
+        if freshly_introduced.is_empty() || premise_terms.is_empty() {
+            // No Fr facts or no non-Fr premise terms → identity variant
+            // survives → rule HAS a variant.
+            return false;
+        }
+        // isFreshRedundant {} = True iff any fresh term appears in a
+        // non-Fr premise (i.e. all identity variants are redundant).
+        return freshly_introduced.iter().any(|ft| {
+            premise_terms.iter().any(|p| contains_subterm(ft, p))
+        });
+    }
+
+    // Path 2: reducible rule — use `abstract_rule_and_variants`.
+    // Returns `Ok(None)` when all composed substs are filtered out.
+    matches!(abstract_rule_and_variants(maude, rule), Ok(None))
+}
