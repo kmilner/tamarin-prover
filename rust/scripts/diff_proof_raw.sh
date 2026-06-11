@@ -93,7 +93,8 @@ else
         echo "$lemma: HS TIMEOUT (${TIMEOUT}s)"
         exit 1
     fi
-    [ -n "$key" ] && gzip -c "$tmp/hs.out" > "$key.full.gz" 2>/dev/null || true
+    # Never cache empty HS output (startup failures poison the cache).
+    [ -n "$key" ] && [ -s "$tmp/hs.out" ] && gzip -c "$tmp/hs.out" > "$key.full.gz" 2>/dev/null || true
     hs_src="run"
 fi
 

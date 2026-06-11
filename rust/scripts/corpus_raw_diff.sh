@@ -151,7 +151,11 @@ worker() {
         if [ -n "$key" ]; then
             if [ "$hs_rc" -eq 124 ]; then
                 : > "$key_timeout" 2>/dev/null || true
-            else
+            elif [ -s "$hs_out" ]; then
+                # Never cache EMPTY HS output: empty means HS failed to start
+                # (missing maude on PATH, unset LANG, OOM, ...) and caching it
+                # poisons every later sweep (642 entries on 2026-06-11).
+                # Leave uncached so the lemma is retried next run.
                 gzip -c "$hs_out" > "$key_full" 2>/dev/null || true
             fi
         fi
