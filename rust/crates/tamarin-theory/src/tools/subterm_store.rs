@@ -18,14 +18,26 @@ pub struct SubtermConstraint {
     pub propagated: bool,
 }
 
-/// Subterm store. Mirrors the open data shape Tamarin uses, without
-/// the simplification/propagation logic (which needs Maude).
+/// Subterm store. Mirrors HS's 5-field `SubtermStore`
+/// (SubtermStore.hs:90-96):
+///   negSubterms / posSubterms / solvedSubterms / isContradictory /
+///   oldNegSubterms.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SubtermStore {
     pub subterms: Vec<SubtermConstraint>,
     pub solved_subterms: Vec<SubtermConstraint>,
     /// Whether the store has been determined contradictory.
     pub contradictory: bool,
+    /// Negative subterm constraints `¬(small ⊏ big)` — HS `_negSubterms`
+    /// (S.Set, so kept sorted by the LNTerm pair Ord for HS-faithful
+    /// `S.toList` iteration order).
+    pub neg_subterms: Vec<(LNTerm, LNTerm)>,
+    /// Copy of `neg_subterms` that is NOT changed by apply/HasFrees/
+    /// add_neg — HS `_oldNegSubterms` (SubtermStore.hs:95).  Only the
+    /// `simpSplitNegSt` pass updates it; the set difference
+    /// `neg_subterms \ old_neg_subterms` is the change-detection
+    /// mechanism deciding which negative subterms get (re-)split.
+    pub old_neg_subterms: Vec<(LNTerm, LNTerm)>,
 }
 
 impl SubtermStore {
@@ -34,6 +46,17 @@ impl SubtermStore {
     /// Record a new `small << big` constraint.
     pub fn add(&mut self, small: LNTerm, big: LNTerm) {
         self.subterms.push(SubtermConstraint { small, big, propagated: false });
+    }
+
+    /// `addNegSubterm` (SubtermStore.hs:125-126): set-insert into
+    /// negSubterms.  Sorted insert keeps HS `S.toList` iteration order.
+    /// Returns true if the pair was newly added.
+    pub fn add_neg(&mut self, small: LNTerm, big: LNTerm) -> bool {
+        let pair = (small, big);
+        match self.neg_subterms.binary_search(&pair) {
+            Ok(_) => false,
+            Err(pos) => { self.neg_subterms.insert(pos, pair); true }
+        }
     }
 
     pub fn is_false(&self) -> bool { self.contradictory }
@@ -45,12 +68,8 @@ impl SubtermStore {
     ///   = SubtermStore (a1 `S.union` a2) (b1 `S.union` b2)
     ///                  (c1 `S.union` c2) (d1 || d2) (e1 `S.union` e2)
     /// ```
-    /// Rust's SubtermStore is currently a 3-field subset of HS's 5-field
-    /// shape: `subterms` (HS posSubterms), `solved_subterms`
-    /// (HS solvedSubterms), and `contradictory` (HS boolean field).
-    /// The missing HS fields are `negSubterms` and `natSubterms` —
-    /// not yet ported; tracked separately.  This method unifies the
-    /// 3 fields we DO have using HS's set-union + OR semantics.
+    /// All five HS fields union per HS semantics: neg/pos/solved set-union,
+    /// `isContradictory` OR, `oldNegSubterms` set-union.
     pub fn conjoin(&mut self, other: &SubtermStore) {
         for st in &other.subterms {
             if !self.subterms.contains(st) {
@@ -63,6 +82,14 @@ impl SubtermStore {
             }
         }
         self.contradictory = self.contradictory || other.contradictory;
+        for (s, t) in &other.neg_subterms {
+            self.add_neg(s.clone(), t.clone());
+        }
+        for p in &other.old_neg_subterms {
+            if let Err(pos) = self.old_neg_subterms.binary_search(p) {
+                self.old_neg_subterms.insert(pos, p.clone());
+            }
+        }
     }
 }
 

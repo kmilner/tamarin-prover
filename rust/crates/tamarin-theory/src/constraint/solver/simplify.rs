@@ -1023,19 +1023,6 @@ fn partial_atom_valuation(
             if let LTerm::Lit(LLit::Con(_)) = &big_lt { return Some(false); }
             // small ⊏ Var (pub|fresh) -> False  (CR-rule S_invalid)
             if is_pub_var(&big_lt) || is_fresh_var(&big_lt) { return Some(false); }
-            // small `redElem` big -> True  (small appears in big not below
-            // any reducible function symbol).
-            let reducible = &sys.subterm_store.contradictory; // placeholder
-            let _ = reducible;
-            // We don't carry MaudeSig here; pull reducible from the
-            // existing positive/negative-subterm membership only.
-            let pos = sys.subterm_store.subterms.iter()
-                .chain(sys.subterm_store.solved_subterms.iter())
-                .any(|c| c.small == small_lt && c.big == big_lt);
-            if pos { return Some(true); }
-            // negSubterms not yet ported into SubtermStore; Haskell's
-            // `isInside / isNegatedInside` check there is skipped.
-            //
             // Reducible-syntactic check (redElem): port of Haskell's
             // `small `redElem` big` line in `isTrueFalse`
             // (SubtermStore.hs:342).
@@ -1043,6 +1030,21 @@ fn partial_atom_valuation(
             if elem_not_below_reducible(&reducible_syms, &small_lt, &big_lt) {
                 return Some(true);
             }
+            // HS `isTrueFalse reducible (Just sst)` (SubtermStore.hs:356-371):
+            // after the structural checks come the store-membership ones —
+            //   isInside  && !isNegatedInside → Just True
+            //   isNegatedInside && !isInside  → Just False
+            // (The `cyclic || natCyclic → Just False` arm — insert-and-
+            // check hasSubtermCycle / natSubtermEqualities — is not yet
+            // ported here; those cycle checks run in
+            // propagate_subterm_obvious / the contradiction pass instead.)
+            let is_inside = sys.subterm_store.subterms.iter()
+                .chain(sys.subterm_store.solved_subterms.iter())
+                .any(|c| c.small == small_lt && c.big == big_lt);
+            let is_negated_inside = sys.subterm_store.neg_subterms.iter()
+                .any(|(s, t)| *s == small_lt && *t == big_lt);
+            if is_inside && !is_negated_inside { return Some(true); }
+            if is_negated_inside && !is_inside { return Some(false); }
             None
         }
         _ => None,
@@ -4327,11 +4329,12 @@ fn dedupe_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
 ///     unrolled level via `step_pos`, which suffices for the corpus
 ///     because `simpSubterms` is fixpointed by `simplifySystem`.
 ///
-/// Negative subterms live as `gnotAtom(Subterm s t)` guarded formulas
-/// in `sys.formulas` rather than in a dedicated `negSubterms` field
-/// (RS's `SubtermStore` is a 3-field subset of HS's 5-field shape).
-/// `read_neg_subterms` extracts the current neg-subterm set from
-/// `sys.formulas` so this pass can mirror HS's two-set joint reasoning.
+/// Negative subterms live in the store's `neg_subterms` field, exactly
+/// as HS's `_negSubterms` — `insert_formula` consumes the
+/// `∀[].[Subterm i j].⊥` shape into the store at insert time
+/// (Reduction.hs:567-570), and the `neg_subterms \ old_neg_subterms`
+/// difference (HS `oldNegSubterms`, SubtermStore.hs:95,189) decides
+/// which entries this pass (re-)splits.
 fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
     use crate::tools::subterm_store::elem_not_below_reducible;
     use tamarin_term::lterm::{is_fresh_var, is_pub_var, is_msg_var,
@@ -4502,35 +4505,6 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
         }
     }
 
-    // -------------------------------------------------------------
-    // Extract negSt entries from sys.formulas: HS stores them in a
-    // dedicated `negSubterms` field; RS represents them as
-    // `gnotAtom(Subterm s t) = GGuarded All [] [Subterm s t] gfalse`.
-    // -------------------------------------------------------------
-    let neg_subterms: Vec<(tamarin_term::lterm::LNTerm, tamarin_term::lterm::LNTerm)> = {
-        use crate::guarded::{Guarded, GAtom, Quant, try_gterm_to_term};
-        use crate::elaborate::term_to_lnterm;
-        let mut out: Vec<(tamarin_term::lterm::LNTerm, tamarin_term::lterm::LNTerm)> = Vec::new();
-        for f in &red.sys.formulas {
-            if let Guarded::GGuarded { qua: Quant::All, vars, guards, body } = f {
-                if vars.is_empty()
-                    && guards.len() == 1
-                    && matches!(body.as_ref(), Guarded::Disj(v) if v.is_empty())
-                {
-                    if let GAtom::Subterm(gs, gt) = &guards[0] {
-                        if let (Some(ps), Some(pt)) = (try_gterm_to_term(gs), try_gterm_to_term(gt)) {
-                            if let (Some(s), Some(t)) = (term_to_lnterm(&ps), term_to_lnterm(&pt)) {
-                                let pair = (s, t);
-                                if !out.contains(&pair) { out.push(pair); }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        out
-    };
-
     let mut new_formulas: Vec<crate::guarded::Guarded> = Vec::new();
     // Build an Eq atom from two LNTerms.
     let mk_eq_atom = |s: &tamarin_term::lterm::LNTerm, t: &tamarin_term::lterm::LNTerm|
@@ -4538,12 +4512,6 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
         let s_ast = crate::elaborate::lnterm_to_term(s);
         let t_ast = crate::elaborate::lnterm_to_term(t);
         crate::guarded::atom_to_gatom_free(&tamarin_parser::ast::Atom::Eq(s_ast, t_ast))
-    };
-    let mk_subterm_atom = |s: &tamarin_term::lterm::LNTerm, t: &tamarin_term::lterm::LNTerm|
-        -> crate::guarded::GAtom {
-        let s_ast = crate::elaborate::lnterm_to_term(s);
-        let t_ast = crate::elaborate::lnterm_to_term(t);
-        crate::guarded::atom_to_gatom_free(&tamarin_parser::ast::Atom::Subterm(s_ast, t_ast))
     };
     let emit_neg_eq =
         |s: tamarin_term::lterm::LNTerm, t: tamarin_term::lterm::LNTerm,
@@ -4553,8 +4521,109 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
             let f = crate::guarded::gall(Vec::new(), vec![atom], crate::guarded::gfalse());
             if !new_formulas.contains(&f) { new_formulas.push(f); }
         };
+    let mut contradictory = false;
     // -------------------------------------------------------------
-    // Phase 1 — process positive subterms (simpSplitPosSt analog).
+    // Phase 1 — simpSplitNegSt (HS SubtermStore.hs:187-204).  HS runs
+    // the NEGATIVE split BEFORE the positive one (simpSubtermStore,
+    // SubtermStore.hs:144-152), and only on the CHANGED set
+    // `negSubterms \ oldNegSubterms`:
+    //   - recursive splitSubterm on each changed `¬(s ⊏ t)`;
+    //   - `TrueD ∈ splits` ⇒ isContradictory (line 202);
+    //   - `EqualD (x,y)` ⇒ emit `¬(x = y)` (line 193);
+    //   - `NatSubtermD (s,t)` with isNatSubterm ⇒ flip into posSubterms
+    //     as `(t, s %+ 1)` (line 192,198);
+    //   - SubD/NatD leaves union back into negSubterms (line 191,199);
+    //   - changed entries whose split is empty are already-false ⇒
+    //     removed from negSubterms (line 195-196,200);
+    //   - oldNegSubterms := the ORIGINAL negSubterms (line 201).
+    // -------------------------------------------------------------
+    {
+        type Pair = (tamarin_term::lterm::LNTerm, tamarin_term::lterm::LNTerm);
+        let original_negs: Vec<Pair> = red.sys.subterm_store.neg_subterms.clone();
+        let changed_negs: Vec<Pair> = original_negs.iter()
+            .filter(|p| red.sys.subterm_store.old_neg_subterms.binary_search(p).is_err())
+            .cloned().collect();
+        let mut splits_all: Vec<Split> = Vec::new();
+        let mut already_false: Vec<Pair> = Vec::new();
+        for (s, t) in &changed_negs {
+            let splits = recurse_split(&reducible, &is_true_false, s.clone(), t.clone());
+            if splits.is_empty() {
+                already_false.push((s.clone(), t.clone()));
+            }
+            splits_all.extend(splits);
+        }
+        if splits_all.iter().any(|x| matches!(x, Split::True_)) {
+            contradictory = true;
+            changed = ChangeIndicator::Changed;
+        }
+        // eqFormulas — ¬(x = y) for each EqualD (HS line 193).
+        for x in &splits_all {
+            if let Split::EqD(l, r) = x {
+                let prev = new_formulas.len();
+                emit_neg_eq(l.clone(), r.clone(), &mut new_formulas);
+                if new_formulas.len() > prev {
+                    changed = ChangeIndicator::Changed;
+                }
+            }
+        }
+        // flippedNatSubterms — `(t, s %+ 1)` for NatSubtermD with
+        // isNatSubterm (HS line 192), unioned into posSubterms (line 198).
+        for x in &splits_all {
+            if let Split::NatD(ns, nt) = x {
+                let s_is_nat_or_msg = matches!(sort_of_lnterm(ns), LSort::Nat)
+                    || is_msg_var(ns);
+                let t_is_nat = matches!(sort_of_lnterm(nt), LSort::Nat);
+                if s_is_nat_or_msg && t_is_nat {
+                    use tamarin_term::function_symbols::{nat_one_sym, AcSym};
+                    use tamarin_term::term::{f_app_ac, f_app_no_eq};
+                    let one_term: tamarin_term::lterm::LNTerm =
+                        f_app_no_eq(nat_one_sym(), vec![]);
+                    let s_plus_one = f_app_ac(AcSym::NatPlus,
+                        vec![ns.clone(), one_term]);
+                    let exists = red.sys.subterm_store.subterms.iter()
+                        .any(|c| c.small == *nt && c.big == s_plus_one)
+                        || red.sys.subterm_store.solved_subterms.iter()
+                            .any(|c| c.small == *nt && c.big == s_plus_one);
+                    if !exists {
+                        red.sys.invalidate_max_var_idx_cache();
+                        red.sys.subterm_store.subterms.push(
+                            crate::tools::subterm_store::SubtermConstraint {
+                                small: nt.clone(),
+                                big: s_plus_one,
+                                propagated: false,
+                            });
+                        changed = ChangeIndicator::Changed;
+                    }
+                }
+            }
+        }
+        // splitSubterms — SubD + NatD leaves union into negSubterms
+        // (HS line 191,199).
+        for x in &splits_all {
+            if let Split::SubD(s, t) | Split::NatD(s, t) = x {
+                red.sys.invalidate_max_var_idx_cache();
+                if red.sys.subterm_store.add_neg(s.clone(), t.clone()) {
+                    changed = ChangeIndicator::Changed;
+                }
+            }
+        }
+        // negSubterms \ alreadyFalse (HS line 200).
+        for p in &already_false {
+            if let Ok(pos) = red.sys.subterm_store.neg_subterms.binary_search(p) {
+                red.sys.invalidate_max_var_idx_cache();
+                red.sys.subterm_store.neg_subterms.remove(pos);
+                changed = ChangeIndicator::Changed;
+            }
+        }
+        // oldNegSubterms := original negSubterms (HS line 201).  This is
+        // the only place `old_neg_subterms` is written; updating it alone
+        // does NOT count as a change (HS simpSubterms compares stores
+        // `ignoringOldSst1`, Simplify.hs:679).
+        red.sys.subterm_store.old_neg_subterms = original_negs;
+    }
+
+    // -------------------------------------------------------------
+    // Phase 2 — process positive subterms (simpSplitPosSt analog).
     // -------------------------------------------------------------
     // Classify every positive constraint by the trivial-true/false
     // rules from Haskell `Theory.Tools.SubtermStore.isTrueFalse`
@@ -4569,8 +4638,11 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
     let mut kept: Vec<crate::tools::subterm_store::SubtermConstraint> = Vec::new();
     let mut solved: Vec<crate::tools::subterm_store::SubtermConstraint> =
         std::mem::take(&mut red.sys.subterm_store.solved_subterms);
-    let mut contradictory = false;
-    let subs = std::mem::take(&mut red.sys.subterm_store.subterms);
+    let mut subs = std::mem::take(&mut red.sys.subterm_store.subterms);
+    // sst0 — `posSubterms \ solvedSubterms` (HS SubtermStore.hs:146):
+    // a substitution may have rewritten a live subterm into one that
+    // is already solved.
+    subs.retain(|c| !solved.iter().any(|x| x.small == c.small && x.big == c.big));
     for c in subs {
         // small ⊏ small → contradiction
         if c.small == c.big { contradictory = true; changed = ChangeIndicator::Changed; continue; }
@@ -4610,7 +4682,7 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
                 if ss.len() == 2 && s1 == s2 && b1 == b2 {
                     // st = (s1, b1)
                     let st_pair = (s1.clone(), b1.clone());
-                    if neg_subterms.contains(&st_pair) {
+                    if red.sys.subterm_store.neg_subterms.binary_search(&st_pair).is_ok() {
                         // emit l = r as positive equality
                         let atom = mk_eq_atom(s1, b1);
                         let f = crate::guarded::Guarded::Atom(atom);
@@ -4638,133 +4710,34 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
     red.sys.subterm_store.solved_subterms = solved;
 
     // -------------------------------------------------------------
-    // Phase 2 — process negative subterms (simpSplitNegSt analog).
+    // Phase 3 — negativeSubtermVars / CR-rule S_neg (HS SubtermStore.hs:377-385):
+    //   @s ¬⊏ r, t ⊏ r --insert--> s ¬⊏ t, s ≠ t@
+    // For each (s ¬⊏ r) and (t ⊏ r) with the same r, emit ¬(s = t) and
+    // add (s, t) DIRECTLY to negSubterms (HS line 384-385) — the next
+    // simplify iteration's simpSplitNegSt picks it up via the
+    // changed-set (`negSubterms \ oldNegSubterms`) and recurse-splits
+    // it (flipping isContradictory if it is trivially true).
     // -------------------------------------------------------------
-    // Accumulate "flipped nat subterms" — HS line 192:
-    //   flippedNatSubterms = [(t, s ++: fAppNatOne) | NatSubtermD (s, t) <- splits, isNatSubterm (s, t)]
-    // These are added to `posSubterms` after Phase 2 so that simpNatCycles
-    // (Phase 4 below) can detect UTVPI contradictions from negative
-    // subterm constraints in the nat fragment.
-    let mut flipped_nat_pos: Vec<(tamarin_term::lterm::LNTerm, tamarin_term::lterm::LNTerm)> = Vec::new();
-    if !contradictory {
-        for (s, t) in &neg_subterms {
-            // isTrueFalse Just True → contradicts ¬⊏
-            if let Some(true) = is_true_false(s, t) {
-                contradictory = true;
-                changed = ChangeIndicator::Changed;
-                continue;
-            }
-            let splits = recurse_split(&reducible, &is_true_false, s.clone(), t.clone());
-            // If splits contain TrueD → contradiction (HS SubtermStore.hs:202).
-            if splits.iter().any(|x| matches!(x, Split::True_)) {
-                contradictory = true;
-                changed = ChangeIndicator::Changed;
-                continue;
-            }
-            // Emit ¬(x = y) for each EqualD in the split (HS SubtermStore.hs:193).
-            for x in &splits {
-                if let Split::EqD(l, r) = x {
-                    let prev = new_formulas.len();
-                    emit_neg_eq(l.clone(), r.clone(), &mut new_formulas);
-                    if new_formulas.len() > prev {
-                        changed = ChangeIndicator::Changed;
-                    }
-                }
-            }
-            // HS SubtermStore.hs:192 — for each `NatSubtermD (ns, nt)` in
-            // splits where `isNatSubterm`, accumulate the flipped pair
-            // `(nt, ns + 1)` to seed `posSubterms`.  This is the load-
-            // bearing step that lets `simpNatCycles` see negative
-            // nat-subterm constraints: `¬(ns ⊏ nt)` over Nat means
-            // `nt ≤ ns`, which is `nt ⊏ ns + 1`.
-            for x in &splits {
-                if let Split::NatD(ns, nt) = x {
-                    let s_is_nat_or_msg = matches!(sort_of_lnterm(ns), LSort::Nat)
-                        || is_msg_var(ns);
-                    let t_is_nat = matches!(sort_of_lnterm(nt), LSort::Nat);
-                    if s_is_nat_or_msg && t_is_nat {
-                        use tamarin_term::function_symbols::{nat_one_sym, AcSym};
-                        use tamarin_term::term::{f_app_ac, f_app_no_eq};
-                        let one_term: tamarin_term::lterm::LNTerm =
-                            f_app_no_eq(nat_one_sym(), vec![]);
-                        let s_plus_one = f_app_ac(
-                            AcSym::NatPlus,
-                            vec![ns.clone(), one_term],
-                        );
-                        let pair = (nt.clone(), s_plus_one);
-                        if !flipped_nat_pos.contains(&pair) {
-                            flipped_nat_pos.push(pair);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Add `flippedNatSubterms` to the positive subterm store (HS line 198:
-    // `modify posSubterms (S.union flippedNatSubterms)`).  Only added when
-    // not already present.  These flow into Phase 4 (`simpNatCycles`).
-    if !flipped_nat_pos.is_empty() {
-        use crate::tools::subterm_store::SubtermConstraint;
-        red.sys.invalidate_max_var_idx_cache();
-        for (s, t) in &flipped_nat_pos {
-            let exists = red.sys.subterm_store.subterms.iter()
-                .any(|c| c.small == *s && c.big == *t)
-                || red.sys.subterm_store.solved_subterms.iter()
-                    .any(|c| c.small == *s && c.big == *t);
-            if !exists {
-                red.sys.subterm_store.subterms.push(SubtermConstraint {
-                    small: s.clone(),
-                    big: t.clone(),
-                    propagated: false,
-                });
-                changed = ChangeIndicator::Changed;
-            }
-        }
-    }
-
-    // -------------------------------------------------------------
-    // Phase 3 — negativeSubtermVars / CR-rule S_neg (HS SubtermStore.hs:377-385).
-    // For each (s ¬⊏ r) and (t ⊏ r) with same r, derive s ¬⊏ t and emit ¬(s = t).
-    // -------------------------------------------------------------
-    if !contradictory {
+    {
+        let negs: Vec<(tamarin_term::lterm::LNTerm, tamarin_term::lterm::LNTerm)> =
+            red.sys.subterm_store.neg_subterms.clone();
         let pos: Vec<(tamarin_term::lterm::LNTerm, tamarin_term::lterm::LNTerm)> =
             red.sys.subterm_store.subterms.iter()
                 .chain(red.sys.subterm_store.solved_subterms.iter())
                 .map(|c| (c.small.clone(), c.big.clone()))
                 .collect();
-        for (ns, nr) in &neg_subterms {
+        for (ns, nr) in &negs {
             for (ps, pr) in &pos {
-                if nr == pr && ns != ps {
-                    // Fast-path contradiction: if `ns ⊏ ps` is trivially
-                    // true (e.g., `ns` syntactically appears in `ps` not
-                    // below a reducible head), HS's `simpSplitNegSt`
-                    // recurse on the freshly-added `(ns, ps)` negSt would
-                    // return `[TrueD]`, flipping `isContradictory = True`.
-                    // Mirror that by setting `subterm_store.contradictory`
-                    // here directly so the contradiction is attributed to
-                    // SubtermCyclic (HS's "/* contradictory subterm store */"
-                    // tag) rather than "/* from formulas */".
-                    if let Some(true) = is_true_false(ns, ps) {
-                        contradictory = true;
-                        changed = ChangeIndicator::Changed;
-                        continue;
-                    }
+                if nr == pr {
                     // emit ¬(ns = ps)
                     let prev = new_formulas.len();
                     emit_neg_eq(ns.clone(), ps.clone(), &mut new_formulas);
                     if new_formulas.len() > prev {
                         changed = ChangeIndicator::Changed;
                     }
-                    // Also derive the new ¬⊏ via formula `¬(ns ⊏ ps)`,
-                    // which we mirror with a `gall [] [Subterm ns ps] gfalse`
-                    // formula so the next simplify iteration picks it
-                    // up as a fresh neg-subterm and recurse-splits it.
-                    let na = mk_subterm_atom(ns, ps);
-                    let nf = crate::guarded::gall(
-                        Vec::new(), vec![na], crate::guarded::gfalse());
-                    if !new_formulas.contains(&nf) {
-                        new_formulas.push(nf);
+                    // negSubterms ∪ {(ns, ps)} (HS line 384-385).
+                    red.sys.invalidate_max_var_idx_cache();
+                    if red.sys.subterm_store.add_neg(ns.clone(), ps.clone()) {
                         changed = ChangeIndicator::Changed;
                     }
                 }

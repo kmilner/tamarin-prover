@@ -398,6 +398,14 @@ pub fn rename_precise_system(sys: &mut System) {
         (&a.small, &a.big).cmp(&(&b.small, &b.big)));
     sys.subterm_store.solved_subterms.dedup_by(|a, b|
         (&a.small, &a.big) == (&b.small, &b.big));
+    // negSubterms are mapped too; oldNegSubterms are NOT (HS mapFrees
+    // keeps `oldNegSt` with `pure` — SubtermStore.hs:550-555).
+    for p in sys.subterm_store.neg_subterms.iter_mut() {
+        p.0 = apply_term(p.0.clone());
+        p.1 = apply_term(p.1.clone());
+    }
+    sys.subterm_store.neg_subterms.sort();
+    sys.subterm_store.neg_subterms.dedup();
 }
 
 // =============================================================================
