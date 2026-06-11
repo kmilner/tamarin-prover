@@ -770,7 +770,7 @@ fn pp_var_scoped(v: &p::VarSpec, scope: &[Bind], out: &mut String) {
     }
 }
 
-fn sort_prefix_from_hint(s: p::SortHint) -> &'static str {
+pub fn sort_prefix_from_hint(s: p::SortHint) -> &'static str {
     use p::SortHint::*;
     use p::SuffixSort;
     match s {
