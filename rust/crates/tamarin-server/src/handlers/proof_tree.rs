@@ -554,6 +554,8 @@ pub fn method_label(m: &ProofMethod) -> String {
         }
         ProofMethod::Invalidated =>
             "// proof may have been invalidated by editing a reuse lemma above. You should".to_string(),
+        ProofMethod::RawSolve(inner) =>
+            format!("solve( {} )", inner),
     }
 }
 

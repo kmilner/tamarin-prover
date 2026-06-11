@@ -46,6 +46,12 @@ pub enum ProofMethod {
     Induction,
     Finished(Result),
     Invalidated,
+    /// Display-only: `solve( <raw_inner> )`.  Used for HS-faithful
+    /// unannotated subtree display (replay.rs `parsed_to_unannotated`)
+    /// where we have the original skeleton text but no live Goal object.
+    /// HS `noSystemPrf` (Proof.hs:469) carries the original ProofMethod
+    /// verbatim; RS uses raw inner text as the closest equivalent.
+    RawSolve(String),
 }
 
 /// `isFinished`: returns the appropriate `Result` if the system is in
@@ -309,7 +315,7 @@ pub fn exec_proof_method(
 
     match method {
         ProofMethod::Sorry(_) | ProofMethod::Finished(_) => Some(Vec::new()),
-        ProofMethod::Invalidated => None,
+        ProofMethod::Invalidated | ProofMethod::RawSolve(_) => None,
         ProofMethod::Simplify => {
             // HS-faithful: `simplifySystem` (Simplify.hs:65-67) emits
             // its `traceExecM "simplifySystem"` ONCE per call; its
@@ -860,6 +866,7 @@ pub fn check_and_exec_proof_method(
             if !sys.goals.iter().any(|(existing, _)| existing == g) { return None; }
         }
         ProofMethod::Simplify | ProofMethod::Sorry(_) | ProofMethod::Invalidated => {}
+        ProofMethod::RawSolve(_) => return None,
     }
     exec_proof_method(ctx, method, sys)
 }

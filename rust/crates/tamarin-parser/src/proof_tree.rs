@@ -158,7 +158,7 @@ impl<'a> TreeParser<'a> {
             let inner = self.read_balanced_paren()?;
             // `read_balanced_paren` consumed the matching `)`.
             let spec = parse_goal_spec(&inner);
-            return Ok(ParsedMethod::SolveGoal(spec));
+            return Ok(ParsedMethod::SolveGoal(spec, inner));
         }
         // Unrecognised token — capture the next identifier-like word
         // so we can carry it through to `Other(...)`.
@@ -760,7 +760,7 @@ mod tests {
         let src = "solve( Foo( x ) @ #i )";
         let t = parse_proof_tree(&format!("{} by sorry", src)).expect("parse");
         match &t.method {
-            ParsedMethod::SolveGoal(GoalSpec::Action { fact, time_var }) => {
+            ParsedMethod::SolveGoal(GoalSpec::Action { fact, time_var }, _) => {
                 assert_eq!(fact.name, "Foo");
                 assert_eq!(fact.args.len(), 1);
                 assert_eq!(time_var, "i");
@@ -778,7 +778,7 @@ mod tests {
         let src = "solve( Server( pid, sid, otc ) \u{25B6}\u{2080} #t1 )";
         let t = parse_proof_tree(&format!("{} by sorry", src)).expect("parse");
         match &t.method {
-            ParsedMethod::SolveGoal(GoalSpec::Premise { fact, prem_idx, time_var }) => {
+            ParsedMethod::SolveGoal(GoalSpec::Premise { fact, prem_idx, time_var }, _) => {
                 assert_eq!(fact.name, "Server");
                 assert_eq!(*prem_idx, 0);
                 assert_eq!(time_var, "t1");
@@ -793,7 +793,7 @@ mod tests {
         let src = "solve( !F_OutSessKeys( a, b ) \u{25B6}\u{2082} #i )";
         let t = parse_proof_tree(&format!("{} by sorry", src)).expect("parse");
         match &t.method {
-            ParsedMethod::SolveGoal(GoalSpec::Premise { fact, prem_idx, .. }) => {
+            ParsedMethod::SolveGoal(GoalSpec::Premise { fact, prem_idx, .. }, _) => {
                 assert!(fact.persistent);
                 assert_eq!(fact.name, "F_OutSessKeys");
                 assert_eq!(*prem_idx, 2);
@@ -820,7 +820,7 @@ mod tests {
             qed
         ";
         let t = parse_proof_tree(src).expect("parse");
-        assert!(matches!(t.method, ParsedMethod::SolveGoal(_)));
+        assert!(matches!(t.method, ParsedMethod::SolveGoal(_, _)));
         assert_eq!(t.cases.len(), 2);
         assert_eq!(t.cases[0].0, "case_1");
         assert_eq!(t.cases[0].1.cases.len(), 2);
@@ -837,7 +837,7 @@ mod tests {
         let src = "solve( garbage_no_marker ) by sorry";
         let t = parse_proof_tree(src).expect("parse");
         match &t.method {
-            ParsedMethod::SolveGoal(GoalSpec::Raw(_)) => {}
+            ParsedMethod::SolveGoal(GoalSpec::Raw(_), _) => {}
             other => panic!("expected Raw goal-spec, got {:?}", other),
         }
     }
@@ -849,7 +849,7 @@ mod tests {
         let src = "solve( (#i, 0) ~~> (#j, 2) ) by sorry";
         let t = parse_proof_tree(src).expect("parse");
         match &t.method {
-            ParsedMethod::SolveGoal(GoalSpec::Chain { src_var, conc_idx, tgt_var, prem_idx }) => {
+            ParsedMethod::SolveGoal(GoalSpec::Chain { src_var, conc_idx, tgt_var, prem_idx }, _) => {
                 assert_eq!(src_var, "i");
                 assert_eq!(*conc_idx, 0);
                 assert_eq!(tgt_var, "j");
@@ -866,7 +866,7 @@ mod tests {
         let src = "solve( (#i.5, 1) ~~> (#j.7, 0) ) by sorry";
         let t = parse_proof_tree(src).expect("parse");
         match &t.method {
-            ParsedMethod::SolveGoal(GoalSpec::Chain { src_var, conc_idx, tgt_var, prem_idx }) => {
+            ParsedMethod::SolveGoal(GoalSpec::Chain { src_var, conc_idx, tgt_var, prem_idx }, _) => {
                 // Freshen suffix stripped from the var ROOT.
                 assert_eq!(src_var, "i");
                 assert_eq!(*conc_idx, 1);
@@ -884,7 +884,7 @@ mod tests {
         let src = "solve( foo(a, b) \u{228F} bar(c) ) by sorry";
         let t = parse_proof_tree(src).expect("parse");
         match &t.method {
-            ParsedMethod::SolveGoal(GoalSpec::Subterm { small_raw, big_raw }) => {
+            ParsedMethod::SolveGoal(GoalSpec::Subterm { small_raw, big_raw }, _) => {
                 assert_eq!(small_raw, "foo(a, b)");
                 assert_eq!(big_raw, "bar(c)");
             }
@@ -898,7 +898,7 @@ mod tests {
         let src = "solve( splitEqs(42) ) by sorry";
         let t = parse_proof_tree(src).expect("parse");
         match &t.method {
-            ParsedMethod::SolveGoal(GoalSpec::Split { split_id }) => {
+            ParsedMethod::SolveGoal(GoalSpec::Split { split_id }, _) => {
                 assert_eq!(*split_id, 42);
             }
             other => panic!("expected Split goal-spec, got {:?}", other),
@@ -911,7 +911,7 @@ mod tests {
         let src = "solve( splitEqs(0) ) by sorry";
         let t = parse_proof_tree(src).expect("parse");
         match &t.method {
-            ParsedMethod::SolveGoal(GoalSpec::Split { split_id }) => {
+            ParsedMethod::SolveGoal(GoalSpec::Split { split_id }, _) => {
                 assert_eq!(*split_id, 0);
             }
             other => panic!("expected Split goal-spec, got {:?}", other),
@@ -924,7 +924,7 @@ mod tests {
         let src = "solve( (last(#t1)) \u{2225} (#t1 < #t2) ) by sorry";
         let t = parse_proof_tree(src).expect("parse");
         match &t.method {
-            ParsedMethod::SolveGoal(GoalSpec::Disj { alts, alt_texts: _ }) => {
+            ParsedMethod::SolveGoal(GoalSpec::Disj { alts, alt_texts: _ }, _) => {
                 assert_eq!(alts.len(), 2);
                 assert!(matches!(alts[0], DisjAlt::NonQuant));
                 assert!(matches!(alts[1], DisjAlt::NonQuant));
@@ -942,7 +942,7 @@ mod tests {
                           (\u{2203} #t1 #t2 a b c. (last(#t1))) ) by sorry";
         let t = parse_proof_tree(src).expect("parse");
         match &t.method {
-            ParsedMethod::SolveGoal(GoalSpec::Disj { alts, alt_texts: _ }) => {
+            ParsedMethod::SolveGoal(GoalSpec::Disj { alts, alt_texts: _ }, _) => {
                 assert_eq!(alts.len(), 2);
                 assert_eq!(alts[0], DisjAlt::All { n_vars: 7 });
                 assert_eq!(alts[1], DisjAlt::Ex { n_vars: 5 });
@@ -959,7 +959,7 @@ mod tests {
                           (#t2 < #t1) \u{2225} (#t1 = #t2) ) by sorry";
         let t = parse_proof_tree(src).expect("parse");
         match &t.method {
-            ParsedMethod::SolveGoal(GoalSpec::Disj { alts, alt_texts: _ }) => {
+            ParsedMethod::SolveGoal(GoalSpec::Disj { alts, alt_texts: _ }, _) => {
                 assert_eq!(alts.len(), 5);
                 for a in alts.iter() { assert!(matches!(a, DisjAlt::NonQuant)); }
             }

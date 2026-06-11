@@ -175,14 +175,28 @@ pub fn pretty_closed_theory(
 /// Render HS `ppInjectiveFactInsts` (ClosedTheory.hs:413-418):
 ///
 /// ```text
-/// /* looping facts with injective instances: T1/n1, T2/n2, ... */
+/// /*
+/// looping facts with injective instances:
+///   T1/n1, T2/n2, ...
+/// */
 /// ```
+///
+/// HS:
+/// ```haskell
+/// multiComment $ sep
+///   [ text "looping facts with injective instances:"
+///   , nest 2 $ fsepList (text . showFactTagArity) (map fst tags) ]
+/// ```
+/// where `multiComment d = comment $ fsep [text "/*", d, text "*/"]`
+/// (Pretty.hs:102-103) and `fsepList pp = fsep . punctuate comma . map pp`
+/// (Pretty.hs:88-89).
 ///
 /// Emits the empty string when no fact tags are injective.  Computes
 /// the set on demand from the elaborated rules + reducible function
 /// symbols — same call site as `ProofContext::new`
 /// (`constraint/solver/context.rs:493-495`).
 fn render_injective_fact_insts(elab: &Theory) -> String {
+    use crate::pretty_hpj::{self as hpj, Doc, punctuate};
     use crate::fact::{FactTag, Multiplicity};
     let proto_rules: Vec<crate::rule::ProtoRuleE> = elab.rules()
         .map(|r| r.rule.clone())
@@ -204,11 +218,17 @@ fn render_injective_fact_insts(elab: &Theory) -> String {
             crate::fact::fact_tag_name(tag),
             crate::fact::fact_tag_arity(tag))
     };
-    let parts: Vec<String> = tags.iter().map(|(t, _)| label(t)).collect();
-    format!(
-        "/* looping facts with injective instances: {} */",
-        parts.join(", "),
-    )
+    let tag_docs: Vec<Doc> = tags.iter().map(|(t, _)| Doc::text(label(t))).collect();
+    // fsepList (text . showFactTagArity) (map fst tags)
+    let list_doc = hpj::fsep(punctuate(Doc::text(","), tag_docs));
+    // sep [text "looping facts...", nest 2 list_doc]
+    let inner = hpj::sep(vec![
+        Doc::text("looping facts with injective instances:"),
+        list_doc.nest(2),
+    ]);
+    // multiComment inner = comment $ fsep [text "/*", inner, text "*/"]
+    let doc = hpj::fsep(vec![Doc::text("/*"), inner, Doc::text("*/")]);
+    doc.render()
 }
 
 // =============================================================================
@@ -1993,6 +2013,13 @@ fn pp_proof(
             out.push_str(&step);
             out.push_str(unann);
             out.push('\n');
+            // HS `ppCases ps [("", prf)] = prettyStep ps $-$ ppPrf prf`
+            // (Proof.hs:1086).  `$-$` is "above" — the child is rendered
+            // at the SAME indent column as the parent step.  In our output
+            // model the caller writes the indent before calling pp_proof, so
+            // we reproduce that here: write the same `depth`-level indent
+            // before recursing into the child.
+            out.push_str(&"  ".repeat(depth));
             pp_proof(child, out, depth);
         }
         (_, multi) => {
@@ -2082,6 +2109,16 @@ fn pp_step_at(m: &crate::constraint::solver::proof_method::ProofMethod, indent: 
             // Note the trailing space inside the string literal — HS
             // `lineComment_` renders the verbatim text after `// `.
             "// proof may have been invalidated by editing a reuse lemma above. You should ".to_string()
+        }
+        PM::RawSolve(inner) => {
+            // Display-only: skeleton raw text preserved for unannotated
+            // subtrees (replay.rs `parsed_to_unannotated`).  Mirrors
+            // HS `noSystemPrf` (Proof.hs:469) which keeps the original
+            // ProofMethod value verbatim.  Output: `solve( <inner> )`.
+            // Trim the inner text: the parser's `read_balanced_paren`
+            // returns the content between `( ... )` which may carry a
+            // trailing space → `solve(  ...  )` if we don't trim.
+            format!("solve( {} )", inner.trim())
         }
     }
 }
