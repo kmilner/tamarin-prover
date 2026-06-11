@@ -928,13 +928,58 @@ pub fn term_to_doc(t: &p::Term, scope: &[Bind]) -> crate::pretty_hpj::Doc {
         }
         AlgApp(name, l, r) => fun_doc_two(name, l, r, scope),
         Diff(l, r) => fun_doc_two("diff", l, r, scope),
-        BinOp(_, _, _) => {
-            // exp/AC: never break in HS prettyTerm; render flat.
-            let mut s = String::new();
-            pp_term(t, TermPrec::Top, scope, &mut s);
-            Doc::text(s)
+        BinOp(op, l, r) => {
+            // HS `prettyTerm` (Term/Term.hs:273-274):
+            //   `FApp (AC o) ts -> ppTerms (ppACOp o) 1 "(" ")" ts`  (wraps via fcat)
+            //   `FApp (NoEq s) [t1,t2] | s == expSym -> ppTerm t1 <> "^" <> ppTerm t2`
+            //     (flat beside, never breaks).
+            // exp renders flat; AC ops (Mult/Union/Xor/NatPlus) use the SAME
+            // fcat structure as pairs, with `(`/`)` lead/finish and the AC-op
+            // symbol as separator (no surrounding spaces).
+            if matches!(op, p::BinOp::Exp) {
+                let mut s = String::new();
+                pp_term(t, TermPrec::Top, scope, &mut s);
+                Doc::text(s)
+            } else {
+                // Flatten same-op children to the n-ary chain HS's `viewTerm`
+                // exposes for AC symbols.
+                fn flatten<'a>(op: p::BinOp, t: &'a p::Term, out: &mut Vec<&'a p::Term>) {
+                    match t {
+                        p::Term::BinOp(inner, l, r) if *inner == op => {
+                            flatten(op, l, out);
+                            flatten(op, r, out);
+                        }
+                        _ => out.push(t),
+                    }
+                }
+                let mut flat: Vec<&p::Term> = Vec::new();
+                flatten(*op, l, &mut flat);
+                flatten(*op, r, &mut flat);
+                ac_op_doc(binop_symbol(*op), &flat, scope)
+            }
         }
     }
+}
+
+/// HS `ppTerms (ppACOp o) 1 "(" ")" ts` (Term/Term.hs:273,288-290) — a fcat
+/// of `text "("`, each element `nest 1`'d and AC-op-suffixed (except last),
+/// and `text ")"`.  Structurally identical to `pair_doc` with different
+/// lead/finish/separator.  The AC-op symbol carries NO surrounding spaces
+/// (HS `punctuate (text sepa)` with `sepa = "++"`/`"*"`/`"⊕"`/`"%+"`).
+fn ac_op_doc(sym: &str, flat: &[&p::Term], scope: &[Bind]) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let n = flat.len();
+    let mut parts: Vec<Doc> = Vec::with_capacity(n + 2);
+    parts.push(Doc::text("("));
+    for (i, t) in flat.iter().enumerate() {
+        let mut d = term_to_doc(t, scope);
+        if i + 1 < n {
+            d = d.beside(Doc::text(sym.to_string()));
+        }
+        parts.push(d.nest(1));
+    }
+    parts.push(Doc::text(")"));
+    hpj::fcat(parts)
 }
 
 /// HS `ppTerms ", " 1 "<" ">" flat` (Term/Term.hs:288-290) — a fcat of
@@ -1009,6 +1054,232 @@ pub fn fact_to_doc(fa: &p::Fact, scope: &[Bind]) -> crate::pretty_hpj::Doc {
         d = d.beside(Doc::text(ann));
     }
     d
+}
+
+// =============================================================================
+// GTerm / GFact / GAtom — HughesPJ Doc engine (HS-faithful wrapping)
+//
+// HS has ONE term renderer: `prettyTerm` (Term/Term.hs:268-296). The guarded
+// path's `prettyNAtom = prettyAtom prettyNTerm` and `prettyNTerm = prettyTerm
+// (text . show)` (LTerm.hs:893-894) use the EXACT same `prettyTerm`, only with
+// a different leaf-printer for variables/literals. So `gterm_to_doc` is
+// structurally identical to `term_to_doc`; only the leaf cases (Var, lits)
+// differ and reuse `pp_gterm`'s leaf string-rendering (which already handles
+// bound-var De Bruijn lookup against the multi-level `scope`).
+// =============================================================================
+
+/// Pretty-print a `GTerm` as a `Doc`, faithful to HS `prettyTerm`
+/// (Term/Term.hs:268-296) — the SAME renderer the rule-body / parser-Term
+/// path uses via `term_to_doc`. Mirrors that function's structure exactly.
+fn gterm_to_doc(t: &crate::guarded::GTerm, scope: &[Vec<Bind>]) -> crate::pretty_hpj::Doc {
+    use crate::guarded::GTerm::*;
+    use crate::pretty_hpj::Doc;
+    match t {
+        // Atomic / non-wrapping leaves — render via `pp_gterm` (these never
+        // break internally in HS either; Var carries De Bruijn lookup).
+        Var(_) | PubLit(_) | FreshLit(_) | NatLit(_) | Number(_) | NumberOne
+        | NatOne | DhNeutral | PatMatch(_) => {
+            let mut s = String::new();
+            pp_gterm(t, TermPrec::Top, scope, &mut s);
+            Doc::text(s)
+        }
+        Pair(items) => {
+            // HS `split` flattens right-associative pairs (Term/Term.hs:292-293).
+            let mut flat: Vec<&crate::guarded::GTerm> = Vec::with_capacity(items.len());
+            let mut cur: &[crate::guarded::GTerm] = items;
+            loop {
+                let n = cur.len();
+                if n == 0 { break; }
+                for it in &cur[..n - 1] { flat.push(it); }
+                let last = &cur[n - 1];
+                if let Pair(inner) = last { cur = inner; } else { flat.push(last); break; }
+            }
+            gpair_doc(&flat, scope)
+        }
+        App(name, args) => {
+            if args.is_empty() {
+                Doc::text(name.clone()) // `FApp (NoEq (f,_)) [] -> text f`
+            } else {
+                gfun_doc(name, args, scope)
+            }
+        }
+        AlgApp(name, l, r) => {
+            // HS aenc{m}pk surface form, rendered flat (pp_gterm emits it).
+            let mut s = String::new();
+            pp_gterm(t, TermPrec::Top, scope, &mut s);
+            let _ = (name, l, r);
+            Doc::text(s)
+        }
+        Diff(l, r) => {
+            let args = [(**l).clone(), (**r).clone()];
+            gfun_doc("diff", &args, scope)
+        }
+        BinOp(op, l, r) => {
+            // exp flat; AC ops wrap via fcat (Term/Term.hs:273-274).
+            if matches!(op, p::BinOp::Exp) {
+                let mut s = String::new();
+                pp_gterm(t, TermPrec::Top, scope, &mut s);
+                Doc::text(s)
+            } else {
+                fn flatten<'a>(
+                    op: p::BinOp,
+                    t: &'a crate::guarded::GTerm,
+                    out: &mut Vec<&'a crate::guarded::GTerm>,
+                ) {
+                    match t {
+                        crate::guarded::GTerm::BinOp(inner, l, r) if *inner == op => {
+                            flatten(op, l, out);
+                            flatten(op, r, out);
+                        }
+                        _ => out.push(t),
+                    }
+                }
+                let mut flat: Vec<&crate::guarded::GTerm> = Vec::new();
+                flatten(*op, l, &mut flat);
+                flatten(*op, r, &mut flat);
+                gac_op_doc(binop_symbol(*op), &flat, scope)
+            }
+        }
+    }
+}
+
+/// HS `ppTerms ", " 1 "<" ">"` for `GTerm` (mirror of `pair_doc`).
+fn gpair_doc(flat: &[&crate::guarded::GTerm], scope: &[Vec<Bind>]) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let n = flat.len();
+    let mut parts: Vec<Doc> = Vec::with_capacity(n + 2);
+    parts.push(Doc::text("<"));
+    for (i, t) in flat.iter().enumerate() {
+        let mut d = gterm_to_doc(t, scope);
+        if i + 1 < n {
+            d = d.beside(Doc::text(", "));
+        }
+        parts.push(d.nest(1));
+    }
+    parts.push(Doc::text(">"));
+    hpj::fcat(parts)
+}
+
+/// HS `ppTerms (ppACOp o) 1 "(" ")"` for `GTerm` (mirror of `ac_op_doc`).
+fn gac_op_doc(
+    sym: &str,
+    flat: &[&crate::guarded::GTerm],
+    scope: &[Vec<Bind>],
+) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let n = flat.len();
+    let mut parts: Vec<Doc> = Vec::with_capacity(n + 2);
+    parts.push(Doc::text("("));
+    for (i, t) in flat.iter().enumerate() {
+        let mut d = gterm_to_doc(t, scope);
+        if i + 1 < n {
+            d = d.beside(Doc::text(sym.to_string()));
+        }
+        parts.push(d.nest(1));
+    }
+    parts.push(Doc::text(")"));
+    hpj::fcat(parts)
+}
+
+/// HS `ppFun f ts` for `GTerm` (mirror of `fun_doc`).
+fn gfun_doc(
+    name: &str,
+    args: &[crate::guarded::GTerm],
+    scope: &[Vec<Bind>],
+) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let arg_docs: Vec<Doc> = args.iter().map(|a| gterm_to_doc(a, scope)).collect();
+    let body = hpj::fsep(hpj::punctuate(comma_doc(), arg_docs));
+    Doc::text(format!("{}(", name)).beside(body).beside(Doc::text(")"))
+}
+
+/// Pretty-print a `GFact` as a `Doc`, faithful to HS `prettyFact`
+/// (Theory/Model/Fact.hs:539-544) — mirror of `fact_to_doc`.
+fn gfact_to_doc(fa: &crate::guarded::GFact, scope: &[Vec<Bind>]) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let lead = {
+        let mut s = String::new();
+        if fa.persistent { s.push('!'); }
+        s.push_str(&fa.name);
+        s.push('(');
+        s
+    };
+    let arg_docs: Vec<Doc> = fa.args.iter().map(|a| gterm_to_doc(a, scope)).collect();
+    let body = hpj::fsep(hpj::punctuate(comma_doc(), arg_docs));
+    let mut d = nest_short_doc(&lead, ")", body);
+    if !fa.annotations.is_empty() {
+        let mut ann = String::from("[");
+        for (i, a) in fa.annotations.iter().enumerate() {
+            if i > 0 { ann.push_str(", "); }
+            ann.push_str(match a {
+                p::FactAnnotation::SolveFirst => "+",
+                p::FactAnnotation::SolveLast => "-",
+                p::FactAnnotation::NoSources => "no_precomp",
+            });
+        }
+        ann.push(']');
+        d = d.beside(Doc::text(ann));
+    }
+    d
+}
+
+/// Pretty-print a `GAtom` as a `Doc`, faithful to HS `prettyProtoAtom`
+/// (Theory/Model/Atom.hs:212-224). The terms/facts inside wrap via the same
+/// `prettyTerm`/`prettyFact` Docs; `Less` operands are time-point variables
+/// printed via `show` (atomic, never break).
+fn gatom_to_doc(a: &crate::guarded::GAtom, scope: &[Vec<Bind>]) -> crate::pretty_hpj::Doc {
+    use crate::guarded::GAtom::*;
+    use crate::pretty_hpj::{self as hpj, Doc};
+    match a {
+        // HS `EqE l r -> sep [ppT l <-> opEqual, ppT r]` — the `=` binds to
+        // the LHS via `<+>`, and the whole thing is a `sep` so it may break
+        // between `lhs =` and `rhs`.
+        Eq(l, r) => hpj::sep(vec![
+            gterm_to_doc(l, scope).beside_sp(Doc::text("=")),
+            gterm_to_doc(r, scope),
+        ]),
+        // HS `Subterm l r -> sep [ppT l <-> opSubterm, ppT r]`.
+        Subterm(l, r) => hpj::sep(vec![
+            gterm_to_doc(l, scope).beside_sp(Doc::text("\u{228F}")), // ⊏
+            gterm_to_doc(r, scope),
+        ]),
+        // HS `Less u v -> text (show u) <-> opLess <-> text (show v)` — both
+        // operands are time-point vars (atomic). RS may carry non-var terms
+        // here defensively; render flat via pp_gterm (matches show-style).
+        Less(l, r) => {
+            let mut s = String::new();
+            pp_gterm(l, TermPrec::Top, scope, &mut s);
+            s.push_str(" < ");
+            pp_gterm(r, TermPrec::Top, scope, &mut s);
+            Doc::text(s)
+        }
+        LessMset(l, r) => {
+            let mut s = String::new();
+            pp_gterm(l, TermPrec::Top, scope, &mut s);
+            s.push_str(" (<) ");
+            pp_gterm(r, TermPrec::Top, scope, &mut s);
+            Doc::text(s)
+        }
+        // HS `Action v fa -> prettyFact ppT fa <-> opAction <-> text (show v)`
+        // — `<->` (= `<+>`, single space) between the fact, `@`, and the
+        // time-point var. The fact wraps; `@ #t` stays beside.
+        Action(fa, t) => {
+            let mut tv = String::new();
+            pp_gterm(t, TermPrec::Top, scope, &mut tv);
+            gfact_to_doc(fa, scope)
+                .beside_sp(Doc::text("@"))
+                .beside_sp(Doc::text(tv))
+        }
+        // HS `Last i -> operator_ "last" <> parens (text (show i))`.
+        Last(t) => {
+            let mut s = String::new();
+            s.push_str("last(");
+            pp_gterm(t, TermPrec::Top, scope, &mut s);
+            s.push(')');
+            Doc::text(s)
+        }
+        Pred(fa) => gfact_to_doc(fa, scope),
+    }
 }
 
 /// HS `nestShort' lead finish body =
@@ -1432,10 +1703,10 @@ fn guarded_to_doc(
     use crate::pretty_hpj::{self as hpj, Doc};
     match g {
         Guarded::Atom(a) => {
-            // HS `pp (GAto a) = prettyNAtom (bvarToLVar a)` — flat atom.
-            let mut s = String::new();
-            pp_gatom(a, scope, &mut s);
-            Doc::text(s)
+            // HS `pp (GAto a) = prettyNAtom (bvarToLVar a)`.  `prettyNAtom`
+            // builds a real Doc (Atom.hs:212-224) whose terms/facts wrap via
+            // `prettyTerm`/`prettyFact` — NOT a flat string.
+            gatom_to_doc(a, scope)
         }
         Guarded::Disj(xs) if xs.is_empty() => Doc::text("\u{22A5}"), // ⊥
         Guarded::Conj(xs) if xs.is_empty() => Doc::text("\u{22A4}"), // ⊤
@@ -1490,11 +1761,7 @@ fn gguarded_to_doc(
             Doc::text("\u{22A4}").nest(1)
         } else {
             let ps: Vec<Doc> = guards.iter()
-                .map(|gd| {
-                    let mut s = String::new();
-                    pp_gatom(gd, &new_scope, &mut s);
-                    gdoc_op_parens(Doc::text(s))
-                })
+                .map(|gd| gdoc_op_parens(gatom_to_doc(gd, &new_scope)))
                 .collect();
             let punct = hpj::punctuate(Doc::text(" \u{2227}"), ps);
             hpj::sep(punct).nest(1)
