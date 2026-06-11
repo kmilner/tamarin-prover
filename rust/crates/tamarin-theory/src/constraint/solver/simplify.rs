@@ -3902,7 +3902,17 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
     let mut by_inj: Vec<(crate::constraint::constraints::NodeId,
                          crate::fact::LNFact,
                          &Vec<MonotonicBehaviour>)> = Vec::new();
-    for (id, rule) in &red.sys.nodes {
+    // HS-faithful: `getPairs`'s `behaviourTerms = M.map ... nodes` is a
+    // `Map NodeId`, and the `paired` comprehension iterates
+    // `M.toList behaviourTerms` for both i and j (Simplify.hs:812-830) —
+    // i.e. ASCENDING NodeId order, with a node's premises kept in their
+    // original `rPrems` order.  Iterate nodes sorted by NodeId (stable
+    // within a node) so the (i, j) pair enumeration matches HS; the
+    // `sys.nodes` Vec is in insertion order, not NodeId order.
+    let mut sorted_nodes: Vec<&(crate::constraint::constraints::NodeId, crate::rule::RuleACInst)> =
+        red.sys.nodes.iter().collect();
+    sorted_nodes.sort_by(|a, b| a.0.cmp(&b.0));
+    for (id, rule) in sorted_nodes {
         for prem in &rule.premises {
             if let Some((_, behaviours)) = red.ctx.injective_fact_insts.iter()
                 .find(|(t, _)| t == &prem.tag) {
