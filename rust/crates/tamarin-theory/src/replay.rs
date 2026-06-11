@@ -735,6 +735,31 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
             if shape_matches.is_empty() {
                 return None;
             }
+            // Multi-match: disambiguate by TERM text first.  When several
+            // premise goals share the same fact name / arity / premise
+            // index (e.g. multiple `Receivable( ... ) ▶₀ #i` goals from
+            // different rule instances), the fact's argument terms are the
+            // reliable discriminator — HS matches the exact parsed
+            // `PremiseG (i,v) fa`.  Compare the spec's rendered argument
+            // terms against each candidate's terms (whitespace-canonical).
+            let want_args: Vec<String> = fact.args.iter()
+                .map(|a| canonicalise_term_text(&crate::pretty_formula::pretty_term(a)))
+                .collect();
+            let by_terms: Vec<&Goal> = shape_matches.iter().copied()
+                .filter(|g| match g {
+                    Goal::Premise(_, fa) => {
+                        fa.terms.len() == want_args.len()
+                            && fa.terms.iter().zip(&want_args).all(|(t, w)| {
+                                &canonicalise_term_text(
+                                    &crate::pretty_theory::render_lnterm(t)) == w
+                            })
+                    }
+                    _ => false,
+                })
+                .collect();
+            if by_terms.len() == 1 {
+                return Some(by_terms[0].clone());
+            }
             // Multi-match: disambiguate by node-var name.
             let by_time: Vec<&Goal> = shape_matches.iter().copied()
                 .filter(|g| match g {
