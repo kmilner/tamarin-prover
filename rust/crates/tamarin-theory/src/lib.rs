@@ -47,5 +47,6 @@ pub mod replay;
 pub mod state_trace;
 pub mod sapic;
 pub mod signature;
+pub mod tactic;
 pub mod theory;
 pub mod tools;

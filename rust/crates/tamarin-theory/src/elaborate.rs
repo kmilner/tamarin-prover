@@ -549,7 +549,7 @@ fn elaborate_items(
                 out.heuristic.push(h.clone());
             }
             p::TheoryItem::Tactic(t) => {
-                out.tactic.push(t.raw.clone());
+                out.tactic.push(crate::tactic::Tactic::parse(&t.name, &t.raw));
             }
             p::TheoryItem::Restriction(r) => {
                 let or = OpenRestriction::new(r.name.clone(), r.formula.clone());

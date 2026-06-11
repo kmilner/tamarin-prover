@@ -95,10 +95,20 @@ pub fn pretty_closed_theory(
     out.push_str(&render_signature(&elaborated.signature.maude_sig));
 
     // HS `prettyTheory` (TheoryObject.hs:741-751) emits, between the
-    // signature and the cache block:
+    // signature and the cache block, in this order:
+    //   - `vcat $ map prettyTactic thyT` (only if non-empty tactics)
     //   - `heuristic: <ranking>` line (only if non-empty heuristic)
     //   - `ppCache` (the "looping facts with injective instances" comment).
+    // `vsep` separates each non-empty element with a blank line.
     // Mirror that here.
+    if !elaborated.tactic.is_empty() {
+        // `vcat $ map prettyTactic thyT`: tactics joined by a single
+        // newline (no blank line between them).
+        let blocks: Vec<String> = elaborated.tactic.iter().map(|t| t.render()).collect();
+        out.push('\n');
+        out.push_str(&blocks.join("\n"));
+        out.push('\n');
+    }
     if !elaborated.heuristic.is_empty() {
         out.push('\n');
         out.push_str("heuristic: ");
