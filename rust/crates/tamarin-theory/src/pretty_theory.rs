@@ -213,8 +213,12 @@ fn render_signature(sig: &tamarin_term::maude_sig::MaudeSig) -> String {
     if sig.enable_nat { builtins.push("natural-numbers"); }
     if sig.enable_xor { builtins.push("xor"); }
     if !builtins.is_empty() {
-        out.push_str("builtins: ");
-        out.push_str(&builtins.join(", "));
+        // HS renders builtins via the same `ppNonEmptyList'` as functions:
+        // `(keyword_ "builtins:" <->) . fsep . punctuate comma`
+        // (Term/Maude/Signature.hs:220,229-231) — so the list wraps through
+        // the HughesPJ engine, not a flat join.
+        let items: Vec<String> = builtins.iter().map(|s| s.to_string()).collect();
+        out.push_str(&wrap_with_lead("builtins:", &items));
         out.push('\n');
     }
 
