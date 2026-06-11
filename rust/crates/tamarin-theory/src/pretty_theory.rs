@@ -339,11 +339,20 @@ fn sep_block_with_lead(lead: &str, items: &[String]) -> String {
 fn render_parsed_item(
     item: &p::TheoryItem,
     _idx: usize,
-    _parsed: &p::Theory,
+    parsed: &p::Theory,
     elab: &Theory,
     proved: &[ProvedLemma],
 ) -> Option<String> {
     use p::TheoryItem::*;
+    // Collect macros from the parsed theory so restriction/lemma renderers
+    // can apply them to get the expanded formula (mirrors HS
+    // `applyMacroInRestriction` + `parseLemmaWithMacros` which store the
+    // expanded formula separately from the original).
+    let macros: Vec<p::Macro> = parsed.items.iter()
+        .filter_map(|i| if let p::TheoryItem::Macros(ms) = i { Some(ms.as_slice()) } else { None })
+        .flatten()
+        .cloned()
+        .collect();
     match item {
         Builtins(_) | Functions(_) | Equations { .. } | Options(_) | Heuristic(_) | Tactic(_) => {
             // These are absorbed into the signature/configuration headers.
@@ -351,8 +360,8 @@ fn render_parsed_item(
         }
         Rule(r) => Some(render_rule(r, elab)),
         IntrRule(_) => None,
-        Lemma(l) => Some(render_parsed_lemma(l, proved)),
-        Restriction(r) => Some(render_parsed_restriction(r)),
+        Lemma(l) => Some(render_parsed_lemma(l, &macros, proved)),
+        Restriction(r) => Some(render_parsed_restriction(r, &macros)),
         Predicates(_) => {
             // TODO: render predicates (port HS prettyPredicate).
             None
@@ -1546,7 +1555,7 @@ fn fsep_pack_pair(items: &[String], indent: usize, line_start: usize) -> String 
 // Lemma
 // =============================================================================
 
-fn render_parsed_lemma(lem: &p::Lemma, proved: &[ProvedLemma]) -> String {
+fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], proved: &[ProvedLemma]) -> String {
     let mut out = String::new();
     out.push_str("lemma ");
     out.push_str(&lem.name);
@@ -1575,7 +1584,7 @@ fn render_parsed_lemma(lem: &p::Lemma, proved: &[ProvedLemma]) -> String {
     out.push('\n');
 
     // /* guarded formula characterizing ... */
-    out.push_str(&render_guarded_block(lem));
+    out.push_str(&render_guarded_block(lem, macros));
 
     // Proof body — either the prover's result (if --prove ran) or
     // the lemma's stored skeleton.
@@ -1618,12 +1627,21 @@ fn quantifier_keyword(q: &p::TraceQuantifier) -> &'static str {
     }
 }
 
-fn render_guarded_block(lem: &p::Lemma) -> String {
+fn render_guarded_block(lem: &p::Lemma, macros: &[p::Macro]) -> String {
     let header = match &lem.trace_quantifier {
         p::TraceQuantifier::ExistsTrace => "guarded formula characterizing all satisfying traces:",
         p::TraceQuantifier::AllTraces => "guarded formula characterizing all counter-examples:",
     };
-    let gf = match crate::guarded::formula_to_guarded(&lem.formula) {
+    // HS `parseLemmaWithMacros` (Theory/Text/Parser.hs:97-105) applies macros
+    // to the lemma formula before converting to guarded form.  The guarded
+    // block displays the EXPANDED formula so that macro calls like
+    // `A( m(x) )` become `A( x )` (when `m(x) = x`).
+    let expanded_formula = if macros.is_empty() {
+        lem.formula.clone()
+    } else {
+        crate::macro_expand::apply_macros_formula(macros, &lem.formula)
+    };
+    let gf = match crate::guarded::formula_to_guarded(&expanded_formula) {
         Ok(g) => g,
         Err(e) => {
             // HS renders `/* conversion to guarded formula failed: ... */`.
@@ -1651,27 +1669,36 @@ fn render_guarded_block(lem: &p::Lemma) -> String {
 // Restriction
 // =============================================================================
 
-fn render_parsed_restriction(r: &p::Restriction) -> String {
+fn render_parsed_restriction(r: &p::Restriction, macros: &[p::Macro]) -> String {
+    // HS `prettyRestriction` (TheoryObject.hs:846-857):
+    //   The `Restriction` carries two formulas after `applyMacroInRestriction`:
+    //   - `_rstrFormula`         = macro-EXPANDED formula  (displayed in expanded block)
+    //   - `_rstrOriginalFormula` = original macro-form     (displayed on top)
+    //   HS always has `ogFormula = Just _` (applyMacroInRestriction sets it
+    //   even when there are no macros: `Just $ maybe f id ofm`).
+    //
+    // RS's `r.formula` is the parser-form (macro calls present).  Apply
+    // the theory's macros to get the expanded formula used in the block.
+    let expanded = if macros.is_empty() {
+        r.formula.clone()
+    } else {
+        crate::macro_expand::apply_macros_formula(macros, &r.formula)
+    };
     let mut out = String::new();
     out.push_str("restriction ");
     out.push_str(&r.name);
     out.push_str(":\n");
-    // HS `prettyRestriction` (TheoryObject.hs:850):
-    //   `nest 2 $ doubleQuotes (prettyLNFormula f)` — routed through the
-    // HS-faithful Doc engine so the formula's `sep`/`nest` wrapping and
-    // continuation indents match HS byte-exact.  The `nest 2` indent and
-    // the surrounding `"` are part of the rendered Doc.
+    // Top-level display: original formula (macro form) — `fromMaybe expandedFormula ogFormula`.
+    // Since ogFormula = Just original, this always shows `r.formula` (macro form).
     out.push_str(&pf::formula_doublequoted_nested(&r.formula, 2));
-    // HS's `prettyRestriction`:
-    //   `nest 2 (if safety then "// safety formula" else emptyDoc)`
-    //   `case ogFormula of Just _ -> /* expanded formula: "..." */`
-    // We treat every parsed restriction as having Just ogFormula (the
-    // parser always stores it), so always emit the expanded block.
-    if is_safety_formula(&r.formula) {
+    // Safety annotation: `if safety then "// safety formula" else emptyDoc`.
+    // HS checks `isSafetyFormula (formulaToGuarded_ expandedFormula)`.
+    if is_safety_formula(&expanded) {
         out.push_str("\n  // safety formula");
     }
+    // Expanded formula block (always emitted — HS always has ogFormula = Just _).
     out.push_str("\n\n  /*\n  expanded formula:\n");
-    out.push_str(&pf::formula_doublequoted_nested(&r.formula, 2));
+    out.push_str(&pf::formula_doublequoted_nested(&expanded, 2));
     out.push_str("\n  */");
     out
 }
