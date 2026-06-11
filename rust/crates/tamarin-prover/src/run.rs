@@ -512,6 +512,21 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         if !args.parse_only {
             wf_report.retain(|e| e.topic != "Message Derivation Checks");
         }
+        // HS `checkIfLemmasInTheory` (Wellformedness.hs:1156-1171) — FIRST
+        // in HS's checkWellformedness list (line 1272).  Checks that every
+        // --prove=X / --lemma=X name corresponds to a theory lemma.  This
+        // check needs the CLI args (not embedded in the parser AST), so we
+        // call it separately and PREPEND the result so it sorts first —
+        // matching HS's `checkIfLemmasInTheory : ...` order.
+        {
+            let lemma_check = tamarin_parser::wf::check_if_lemmas_in_theory(
+                &args.lemma_names, &parsed);
+            if !lemma_check.is_empty() {
+                let mut new_report = lemma_check;
+                new_report.extend(wf_report);
+                wf_report = new_report;
+            }
+        }
 
         if args.parse_only {
             // HS-faithful: `--parse-only` does NOT run wellformedness

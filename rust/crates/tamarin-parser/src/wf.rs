@@ -93,6 +93,102 @@ pub fn topics(report: &WfReport) -> BTreeSet<String> {
 }
 
 // =============================================================================
+// Check that CLI --prove/--lemma arguments name actual lemmas in the theory
+// =============================================================================
+
+/// Port of HS `checkIfLemmasInTheory` (Wellformedness.hs:1156-1171).
+///
+/// HS threads `_lemmasToProve` through the theory's `Options` record.
+/// In the Rust port the CLI args are not embedded in the parser AST,
+/// so we take them as a separate parameter.
+///
+/// Semantics (mirror of `findNotProvedLemmas` / `lemmaChecker`):
+///   - An empty `lemma_names` slice (no `--prove` / `--lemma` flag)
+///     means "prove all" → skip the check.
+///   - A list that is exactly `[""]` (bare `--prove` with no value)
+///     also means "all" → skip.
+///   - Otherwise: for each name in `lemma_names`, it "corresponds" if
+///     • there is a theory lemma whose name equals it exactly, OR
+///     • the name ends with `*` and its prefix is a prefix of at least
+///       one theory-lemma name.
+///     Names that don't correspond are collected; if any exist the WF
+///     check fires.
+pub fn check_if_lemmas_in_theory(lemma_names: &[String], thy: &Theory) -> WfReport {
+    // HS: `| lemmaArgsNames == [[]] = []`
+    // HS stores lemmaArgsNames as [String]; [[]] is [""], meaning bare
+    // `--prove` with no argument value.
+    let non_empty: Vec<&str> = lemma_names.iter()
+        .map(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if non_empty.is_empty() {
+        // Either no --prove was given, or it was bare (no value) → skip.
+        return Vec::new();
+    }
+
+    let theory_lemma_names: Vec<&str> = theory_lemmas(thy)
+        .into_iter()
+        .map(|l| l.name.as_str())
+        .collect();
+
+    // HS `findNotProvedLemmas` folds left, prepending mismatches in
+    // reverse order.  The final `notProvedLemmas` list is therefore in
+    // REVERSE order of the original lemma_names list.  Mirror that
+    // (reversal is visible in the rendered message when multiple names
+    // are given, so faithfulness matters).
+    let mut not_proved: Vec<&str> = Vec::new();
+    for name in non_empty.iter().rev() {
+        if !arg_matches_any_lemma(name, &theory_lemma_names) {
+            not_proved.push(name);
+        }
+    }
+
+    if not_proved.is_empty() {
+        return Vec::new();
+    }
+
+    // HS topic: `underlineTopic "Check presence of the --prove/--lemma
+    // arguments in theory"` (Wellformedness.hs:1169).
+    let topic_str = "Check presence of the --prove/--lemma arguments in theory";
+    // HS body: `vcat [text $ "--> '" ++ intercalate "', '" notProvedLemmas
+    //   ++ "'" ++ " from arguments do(es) not correspond ..."]`
+    // Rendered via `prettyWfErrorReport` → `nest 2`:
+    //   "<topic>\n<===>\n\n  --> '<names>' from arguments ...\n"
+    let names_str = not_proved.join("', '");
+    let body_line = format!(
+        "--> '{}' from arguments do(es) not correspond to a specified lemma in the theory ",
+        names_str,
+    );
+
+    // Build the message in the same shape that format_wf_block expects:
+    // the topic header (underlineTopic output) followed by a blank line,
+    // followed by the 2-space-indented body line.
+    // HS prettyWfErrorReport: `text topic $-$ (nest 2 . vcat ... $ map snd errs)`
+    // `text topic` renders the underlineTopic string (title\n====\n),
+    // `$-$` appends one more newline, so we get title\n====\n\n<body>.
+    let mut msg = String::new();
+    msg.push_str(&underline_topic(topic_str));
+    msg.push('\n');                   // blank line between header and body
+    msg.push_str("  ");              // nest 2
+    msg.push_str(&body_line);
+    msg.push('\n');
+
+    vec![WfError::new(topic_str, msg)]
+}
+
+/// True if `arg` "corresponds" to at least one lemma name in
+/// `theory_lemmas`.  Mirrors HS `lemmaChecker`:
+///   - suffix `*` → prefix match on the lemma name (no `*` in result)
+///   - otherwise  → exact equality
+fn arg_matches_any_lemma(arg: &str, theory_lemmas: &[&str]) -> bool {
+    if let Some(prefix) = arg.strip_suffix('*') {
+        theory_lemmas.iter().any(|n| n.starts_with(prefix))
+    } else {
+        theory_lemmas.iter().any(|n| *n == arg)
+    }
+}
+
+// =============================================================================
 // Helpers — collecting facts and variables
 // =============================================================================
 
