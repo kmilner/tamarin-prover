@@ -114,30 +114,45 @@ pub fn topics(report: &WfReport) -> BTreeSet<String> {
 ///     Names that don't correspond are collected; if any exist the WF
 ///     check fires.
 pub fn check_if_lemmas_in_theory(lemma_names: &[String], thy: &Theory) -> WfReport {
-    // HS: `| lemmaArgsNames == [[]] = []`
-    // HS stores lemmaArgsNames as [String]; [[]] is [""], meaning bare
-    // `--prove` with no argument value.
-    let non_empty: Vec<&str> = lemma_names.iter()
-        .map(|s| s.as_str())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if non_empty.is_empty() {
-        // Either no --prove was given, or it was bare (no value) → skip.
+    // HS: `| lemmaArgsNames == [[]] = []`  (Wellformedness.hs:1158)
+    // HS stores lemmaArgsNames as [String]; [[]] is [""] (a list
+    // containing exactly one empty string), which means bare `--prove`
+    // with no argument value.  Skip the check ONLY in that case.
+    //
+    // When lemma_names is EMPTY (no --prove at all) → also skip.
+    // When lemma_names has MIXED entries (e.g. `--prove --lemma=BadX`
+    // → ["", "BadX"]) the HS condition fails so the check DOES run —
+    // the empty string is reported as "not found" too (faithfulness
+    // requires we keep empty strings in the probe list).
+    if lemma_names.is_empty() {
         return Vec::new();
     }
+    // Exactly one entry and it is empty → bare `--prove` → skip.
+    if lemma_names == [""] {
+        return Vec::new();
+    }
+    // Collect non-empty names for the "matches any lemma" test;
+    // empty strings are kept in the fold below since HS does NOT
+    // filter them (they trivially fail argFilter).
+    let all_names: Vec<&str> = lemma_names.iter().map(|s| s.as_str()).collect();
 
     let theory_lemma_names: Vec<&str> = theory_lemmas(thy)
         .into_iter()
         .map(|l| l.name.as_str())
         .collect();
 
-    // HS `findNotProvedLemmas` folds left, prepending mismatches in
-    // reverse order.  The final `notProvedLemmas` list is therefore in
-    // REVERSE order of the original lemma_names list.  Mirror that
-    // (reversal is visible in the rendered message when multiple names
-    // are given, so faithfulness matters).
+    // HS `findNotProvedLemmas` (Wellformedness.hs:1141) is a `foldl`
+    // that PREPENDS mismatches.  HS's Arguments list is built with
+    // `addArg` which prepends each CLI flag, so the stored arg list is
+    // in REVERSE CLI order.  `findArg` returns them in that reversed
+    // order; `foldl`-prepend of a reversed list re-reverses → the final
+    // `notProvedLemmas` is in ORIGINAL CLI order.
+    //
+    // RS's `lemma_names` is already in CLI order (no prepend in
+    // `parse_args`), so a simple forward-iterate-and-push yields the
+    // same result as the double-reversed HS fold.
     let mut not_proved: Vec<&str> = Vec::new();
-    for name in non_empty.iter().rev() {
+    for name in all_names.iter() {
         if !arg_matches_any_lemma(name, &theory_lemma_names) {
             not_proved.push(name);
         }
