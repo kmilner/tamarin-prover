@@ -719,6 +719,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             use tamarin_parser::wf::underline_topic;
 
             let mut variants_errors: Vec<WfE> = Vec::new();
+            let mut no_variant_rules: Vec<String> = Vec::new();
 
             for item in &elaborated.items {
                 let TheoryItem::Rule(opr) = item else { continue };
@@ -741,6 +742,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                     //   <> text "For exaple, ..."
                     // "For exaple" is a typo in HS source, preserved faithfully.
                     let rule_name = opr.name().to_string();
+                    no_variant_rules.push(rule_name.clone());
                     let topic = "Rule has no variants";
                     let body = format!(
                         "  Rule {} has no variants.\n  \n  Most likely, this means that \
@@ -776,6 +778,19 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 let tail = wf_report.split_off(insert_before);
                 wf_report.extend(variants_errors);
                 wf_report.extend(tail);
+            }
+
+            // HS closeProtoRule (Rule.hs:97-98): `ClosedProtoRule ruE <$>
+            // maybeToList (variantsProtoRule hnd ruE)` — a rule with NO
+            // variants produces NO closed rule.  It is dropped from the
+            // closed theory entirely: it participates in neither rendering
+            // nor proof search.  (The wf warning above fires on the OPEN
+            // theory, before closing, so it is emitted regardless.)
+            if !no_variant_rules.is_empty() {
+                elaborated.items.retain(|item| match item {
+                    TheoryItem::Rule(r) => !no_variant_rules.iter().any(|n| n == r.name()),
+                    _ => true,
+                });
             }
         }
 
@@ -970,6 +985,16 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                         let body = tamarin_theory::pretty_theory::pretty_proof_body(&root);
                         (v, steps, Some(body))
                     }
+                    Err(tamarin_theory::prove::ProveError::Guarded(msg)) => {
+                        // HS `formulaToGuarded_ = either (error . render) id`
+                        // (Guarded.hs:466-467): a proven lemma whose formula
+                        // cannot be converted to a guarded formula kills the
+                        // whole run — message on stderr, exit 1, and NO
+                        // theory output on stdout (HS renders lazily after
+                        // proving, so the abort precedes all stdout output).
+                        eprintln!("tamarin-prover: {}", msg);
+                        std::process::exit(1);
+                    }
                     Err(e) => (LemmaVerdict::Error(format!("{}", e)), 0, None),
                 };
                 proved_lemmas.push(tamarin_theory::pretty_theory::ProvedLemma {
@@ -1051,7 +1076,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
     // block entirely.  Only `--prove` (or any flag that actually runs
     // the prover) emits it.
     if !args.quiet && !args.parse_only {
-        print_overall_summary(&file_results);
+        print_overall_summary(&file_results, args.prove_mode || args.prove_all);
     }
 
     Ok(overall_status)
@@ -1264,7 +1289,7 @@ fn count_proof_steps(node: &tamarin_theory::constraint::solver::search::ProofNod
     1 + node.children.values().map(count_proof_steps).sum::<usize>()
 }
 
-fn print_overall_summary(file_results: &[FileResult]) {
+fn print_overall_summary(file_results: &[FileResult], prove_mode: bool) {
     // Mirrors HS `summary of summaries:` block (`Main.Mode.Batch`).
     let line = "=".repeat(78);
     println!();
@@ -1283,7 +1308,12 @@ fn print_overall_summary(file_results: &[FileResult]) {
         println!("  ");
         if fr.wf_count > 0 {
             println!("  WARNING: {} wellformedness check failed!", fr.wf_count);
-            println!("           The analysis results might be wrong!");
+            // HS Batch.hs:246 emits this second line only in prove mode:
+            //   [ Pretty.text "         The analysis results might be wrong!"
+            //   | thyLoadOptions.proveMode ]
+            if prove_mode {
+                println!("           The analysis results might be wrong!");
+            }
             println!("  ");
         }
         for r in &fr.results {
