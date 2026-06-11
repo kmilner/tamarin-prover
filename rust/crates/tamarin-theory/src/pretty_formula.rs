@@ -582,13 +582,6 @@ fn pp_formula_opparens(
     out.push(')');
 }
 
-fn is_atomic_formula(f: &p::Formula) -> bool {
-    use p::Formula::*;
-    match f {
-        Atom(p::Atom::Pred(_)) => true,
-        _ => false,
-    }
-}
 
 // =============================================================================
 // HS-style wrapped layout — Doc-engine path
