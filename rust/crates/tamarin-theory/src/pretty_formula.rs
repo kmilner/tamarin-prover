@@ -2054,6 +2054,64 @@ mod tests {
         assert!(s.starts_with("\u{00AC}"));
         assert!(s.contains("#i < #j"));
     }
+
+    /// Build the parser Term `<'1', g1> ++ <'2', g2> ++ <'3', g3>` where the
+    /// pair payloads are long enough that the flat AC chain exceeds the ribbon
+    /// and HS `prettyTerm` (Term/Term.hs:273 `FApp (AC o) -> ppTerms ...`) must
+    /// wrap it with the `++` operator at line ends and each element `nest 1`'d.
+    fn ac_chain_term() -> p::Term {
+        let pair = |n: &str, payload: &str| {
+            p::Term::Pair(vec![
+                p::Term::PubLit(n.into()),
+                p::Term::Var(v(payload, p::SortHint::Fresh)),
+            ])
+        };
+        // ((p1 ++ p2) ++ p3) — binary, same-op; renderer flattens to n-ary.
+        p::Term::BinOp(
+            p::BinOp::Union,
+            Box::new(p::Term::BinOp(
+                p::BinOp::Union,
+                Box::new(pair("1", "longPayloadNameNumberOne")),
+                Box::new(pair("2", "longPayloadNameNumberTwo")),
+            )),
+            Box::new(pair("3", "longPayloadNameNumberThree")),
+        )
+    }
+
+    #[test]
+    fn ac_union_chain_wraps_in_rule_term() {
+        // term_to_doc routes AC ops through ac_op_doc (fcat).  Rendered at a
+        // deep indent the chain must break; HS puts `++` at the end of each
+        // non-last element's lines and `(`-wraps the whole chain.
+        let t = ac_chain_term();
+        let doc = term_to_doc(&t, &[]);
+        // place at column 20 (a typical proof-tree/rule indent) so it wraps.
+        let s = doc.render_at(LINE_LENGTH, RIBBON, 20);
+        assert!(s.contains("++\n"), "AC chain did not wrap with ++ at line end:\n{s}");
+        assert!(s.starts_with('('), "AC chain missing leading paren:\n{s}");
+        assert!(s.trim_end().ends_with(')'), "AC chain missing trailing paren:\n{s}");
+        // Each pair element renders fully (its payload var appears).
+        assert!(s.contains("~longPayloadNameNumberOne"));
+        assert!(s.contains("~longPayloadNameNumberThree"));
+    }
+
+    #[test]
+    fn ac_union_chain_wraps_in_guarded_formula() {
+        // gterm_to_doc (guarded path) must wrap the SAME AC chain identically,
+        // since HS uses ONE prettyTerm for both rule terms and formula terms.
+        // Build `z = <chain>` as a guarded Eq atom and render wrapped.
+        let eq = p::Atom::Eq(
+            p::Term::Var(v("z", p::SortHint::Msg)),
+            ac_chain_term(),
+        );
+        let g = Guarded::Atom(crate::guarded::atom_to_gatom_free(&eq));
+        // indent 12 (a proof-tree depth) forces the RHS chain to wrap.
+        let s = pretty_guarded_wrapped(&g, 12, 0);
+        assert!(s.contains("++\n"), "guarded AC chain did not wrap:\n{s}");
+        assert!(s.contains("~longPayloadNameNumberTwo"), "payload missing:\n{s}");
+        // The Eq's `=` is rendered (HS `sep [ppT l <-> opEqual, ppT r]`).
+        assert!(s.contains("z ="), "Eq operator missing:\n{s}");
+    }
 }
 
 
