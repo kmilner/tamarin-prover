@@ -18,14 +18,25 @@
 #   corpus_raw_diff.sh --all           # whole examples/ tree
 #   corpus_raw_diff.sh file1 [file2..] # only the given .spthy files
 #
-# Env: TIMEOUT (default 120), JOBS (default nproc), EXTRA_ENV (RS env vars),
-#      HS_CANON_CACHE, NO_HS_CACHE=1, CACHE_VERSION, CORPUS_ROOT.
+# Env: TIMEOUT (HS-side cap, default 120), RS_TIMEOUT (RS-side cap, default 30),
+#      JOBS (default nproc), EXTRA_ENV (RS env vars),
+#      HS_CANON_CACHE, NO_HS_CACHE=1, CACHE_VERSION, CORPUS_ROOT,
+#      RESULTS_TSV (persisted per-lemma TSV, default /tmp/corpus_raw_diff_results.tsv).
+#
+# The two caps are split on purpose (run-3 sweep data, 2026-06-11, 644 RS runs):
+# the HS side has a real 30-300s band on uncached runs but is a one-time cached
+# cost, so it keeps the high cap; the RS side is paid on EVERY sweep and its
+# distribution has a knee at 30s (RS_TIMEOUT=30 keeps 193/201 MATCH + 251/281
+# DIFF at ~18min wall vs ~104min at 300s; 30->60s buys only 2 more lemmas).
+# The lost tail is the known slow noise/jcs18/SAPIC families - reverify those
+# manually with RS_TIMEOUT=300 when working on them.
 set -uo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
 
 TIMEOUT="${TIMEOUT:-120}"
+RS_TIMEOUT="${RS_TIMEOUT:-30}"
 JOBS="${JOBS:-$(nproc)}"
 EXTRA_ENV="${EXTRA_ENV:-}"
 CORPUS_ROOT="${CORPUS_ROOT:-/home/parallels/tamarin-prover/examples}"
@@ -120,7 +131,7 @@ strip_env_lines() {
     grep -v -e '^Git revision:' -e '^Compiled at:' -e '^[[:space:]]*processing time:' "$1"
 }
 export -f hs_cache_key lemmas_of strip_env_lines
-export HS_PATH="$hs_path" RS_PATH="$rs_path" TIMEOUT EXTRA_ENV \
+export HS_PATH="$hs_path" RS_PATH="$rs_path" TIMEOUT RS_TIMEOUT EXTRA_ENV \
        HS_CANON_CACHE CACHE_VERSION NO_HS_CACHE
 
 # --- Per-lemma worker. Emits ONE machine-parseable line:
@@ -171,7 +182,7 @@ worker() {
     fi
 
     local rs_t0; rs_t0=$(date +%s%3N)
-    timeout "$TIMEOUT" env $EXTRA_ENV "$RS_PATH" --prove="$lemma" "$f" 2>/dev/null > "$tmp/rs.out"
+    timeout "$RS_TIMEOUT" env $EXTRA_ENV "$RS_PATH" --prove="$lemma" "$f" 2>/dev/null > "$tmp/rs.out"
     local rs_rc=$?
     local rs_ms=$(( $(date +%s%3N) - rs_t0 ))
 
@@ -257,13 +268,19 @@ for f in "${files[@]}"; do
 done
 
 n_tasks=$(wc -l < "$tasklist"); n_tasks=${n_tasks// /}
-echo "# corpus_raw_diff: $n_tasks lemmas across $((total_files-filtered_files)) files (filtered out $filtered_files of $total_files), JOBS=$JOBS, TIMEOUT=${TIMEOUT}s, HS-cache=$([ -n "$NO_HS_CACHE" ] && echo off || echo "$HS_CANON_CACHE")" >&2
+echo "# corpus_raw_diff: $n_tasks lemmas across $((total_files-filtered_files)) files (filtered out $filtered_files of $total_files), JOBS=$JOBS, TIMEOUT=${TIMEOUT}s, RS_TIMEOUT=${RS_TIMEOUT}s, HS-cache=$([ -n "$NO_HS_CACHE" ] && echo off || echo "$HS_CANON_CACHE")" >&2
 
 results="$(mktemp)"
 trap "rm -f '$tasklist' '$results'" EXIT
 tr '\t' '\n' < "$tasklist" | xargs -d '\n' -P "$JOBS" -n 2 bash -c 'worker "$0" "$1"' > "$results"
 
 sort -t$'\t' -k1,1 -k2,2 "$results" > "$results.sorted"
+
+# Persist the raw per-lemma TSV (path lemma status hs_lines rs_lines diff
+# hs_ms rs_ms) - it carries the timing data the summary only aggregates.
+RESULTS_TSV="${RESULTS_TSV:-/tmp/corpus_raw_diff_results.tsv}"
+cp "$results.sorted" "$RESULTS_TSV" 2>/dev/null || true
+echo "# per-lemma results: $RESULTS_TSV" >&2
 
 match=0; diffn=0; skip_no_hs=0; skip_rs_err=0; skip_timeout=0
 declare -a divergent=() rs_times=() hs_times=()
@@ -276,7 +293,7 @@ while IFS=$'\t' read -r f lem status hs rs d hs_ms rs_ms; do
         DIFF)         diffn=$((diffn+1));         echo "$f::$lem: $d diff lines (HS:$hs, RS:$rs)$t"; divergent+=("$d"$'\t'"$f::$lem (HS:$hs, RS:$rs)");;
         SKIP_NO_HS)   skip_no_hs=$((skip_no_hs+1));   echo "$f::$lem: SKIP (no HS output)$t";;
         SKIP_RS_ERR)  skip_rs_err=$((skip_rs_err+1)); echo "$f::$lem: SKIP (RS produced no output; HS:$hs)$t";;
-        SKIP_TIMEOUT) skip_timeout=$((skip_timeout+1)); echo "$f::$lem: SKIP (timeout ${TIMEOUT}s)$t";;
+        SKIP_TIMEOUT) skip_timeout=$((skip_timeout+1)); echo "$f::$lem: SKIP (timeout HS:${TIMEOUT}s/RS:${RS_TIMEOUT}s)$t";;
         *)            echo "$f::$lem: SKIP (unknown status '$status')"; skip_no_hs=$((skip_no_hs+1));;
     esac
     if [ "$rs_ms" != "-" ]; then
@@ -315,7 +332,7 @@ echo "  divergent (DIFF)      : $diffn"
 echo "  skipped               : $((skip_no_hs+skip_rs_err+skip_timeout))"
 echo "      no HS output      : $skip_no_hs"
 echo "      RS no output/err  : $skip_rs_err"
-echo "      timeout (${TIMEOUT}s)  : $skip_timeout"
+echo "      timeout (HS ${TIMEOUT}s / RS ${RS_TIMEOUT}s) : $skip_timeout"
 if [ "${#divergent[@]}" -gt 0 ]; then
     echo ""
     echo "divergent lemmas (largest diff first):"
