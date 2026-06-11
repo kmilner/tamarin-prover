@@ -1622,12 +1622,49 @@ fn pp_gterm(t: &crate::guarded::GTerm, prec: TermPrec, scope: &[Vec<Bind>], out:
             out.push(')');
         }
         GTerm::BinOp(op, l, r) => {
-            let needs = prec == TermPrec::InOp;
-            if needs { out.push('('); }
-            pp_gterm(l, TermPrec::InOp, scope, out);
-            out.push_str(binop_symbol(*op));
-            pp_gterm(r, TermPrec::InOp, scope, out);
-            if needs { out.push(')'); }
+            // HS `prettyTerm` (Term/Term.hs:273-274,287-290):
+            //   `FApp (AC o)   ts -> ppTerms (ppACOp o) 1 "(" ")" ts`
+            //   `FApp (NoEq s) [t1,t2] | s == expSym -> ppTerm t1 <> "^" <> ppTerm t2`
+            // AC ops (Mult/Union/Xor/NatPlus) ALWAYS print with a SINGLE
+            // surrounding `(` `)` (the lead/finish in `ppTerms`) around the
+            // whole FLAT n-ary chain; `exp` prints with no paren guard.
+            // Our AST stores AC as binary `BinOp(op, l, r)`; flatten same-op
+            // children and join under one paren-pair to match HS — without
+            // this `('1'++x)++z` stayed nested instead of HS `('1'++x++z)`,
+            // and `x++z = y` lost HS's outer `(x++z)` parens.  Mirror of the
+            // parser-AST `pp_term` AC handling (this fn, ~l.1108).
+            let is_exp = matches!(op, p::BinOp::Exp);
+            if is_exp {
+                pp_gterm(l, TermPrec::Top, scope, out);
+                out.push_str(binop_symbol(*op));
+                pp_gterm(r, TermPrec::Top, scope, out);
+                let _ = prec;
+                return;
+            }
+            fn flatten<'a>(
+                op: p::BinOp,
+                t: &'a crate::guarded::GTerm,
+                out: &mut Vec<&'a crate::guarded::GTerm>,
+            ) {
+                match t {
+                    crate::guarded::GTerm::BinOp(inner, l, r) if *inner == op => {
+                        flatten(op, l, out);
+                        flatten(op, r, out);
+                    }
+                    _ => out.push(t),
+                }
+            }
+            let mut flat: Vec<&crate::guarded::GTerm> = Vec::new();
+            flatten(*op, l, &mut flat);
+            flatten(*op, r, &mut flat);
+            out.push('(');
+            let sym = binop_symbol(*op);
+            for (i, child) in flat.iter().enumerate() {
+                if i > 0 { out.push_str(sym); }
+                pp_gterm(child, TermPrec::Top, scope, out);
+            }
+            out.push(')');
+            let _ = prec;
         }
         GTerm::PatMatch(inner) => {
             out.push('=');
