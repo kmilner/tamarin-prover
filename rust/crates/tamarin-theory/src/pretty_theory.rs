@@ -1440,7 +1440,13 @@ fn render_parsed_lemma(lem: &p::Lemma, proved: &[ProvedLemma]) -> String {
     // continuation indents are byte-identical to HS.  The `nest 2` indent
     // is included in the rendered output (HS renders it at theory col 0).
     let quant = quantifier_keyword(&lem.trace_quantifier);
-    out.push_str(&pf::lemma_header_line(quant, &lem.formula));
+    // HS sorts AC arguments at parse time when building `LNTerm` via `fAppAC`
+    // (Term/Term/Raw.hs:118-122); our parser keeps `BinOp` trees in written
+    // order, so re-establish the canonical AC operand order on the formula
+    // before rendering the header (matches the guarded-block path which
+    // already canonicalises via guarded.rs:684).
+    let canon_formula = crate::elaborate::canonicalize_ac_in_formula(&lem.formula);
+    out.push_str(&pf::lemma_header_line(quant, &canon_formula));
     out.push('\n');
 
     // /* guarded formula characterizing ... */
