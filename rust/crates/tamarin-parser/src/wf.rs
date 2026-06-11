@@ -908,23 +908,6 @@ fn render_var(v: &VarSpec) -> String {
 // Multiplication restriction of rules
 // =============================================================================
 
-/// True if `t` (or any subterm) uses the AC `*` (mult) or `^` (exp) op
-/// or appears as `inv(...)` — these are reducible roots forbidden in
-/// rule LHS.
-fn term_has_reducible_op(t: &Term) -> bool {
-    match t {
-        Term::BinOp(BinOp::Mult, _, _) | Term::BinOp(BinOp::Exp, _, _)
-        | Term::BinOp(BinOp::Xor, _, _) => true,
-        Term::App(name, _) if name == "inv" => true,
-        Term::App(_, args) | Term::Pair(args) => args.iter().any(term_has_reducible_op),
-        Term::AlgApp(_, a, b) => term_has_reducible_op(a) || term_has_reducible_op(b),
-        Term::Diff(a, b) => term_has_reducible_op(a) || term_has_reducible_op(b),
-        Term::BinOp(_, a, b) => term_has_reducible_op(a) || term_has_reducible_op(b),
-        Term::PatMatch(inner) => term_has_reducible_op(inner),
-        _ => false,
-    }
-}
-
 /// HS `multRestrictedReport'` (Wellformedness.hs:1047-1099). HS only
 /// flags a rule when:
 ///   (a) it has any multiplication term `*` in its RHS conclusions, OR

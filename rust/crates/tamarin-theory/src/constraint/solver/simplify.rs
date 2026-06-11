@@ -640,7 +640,7 @@ fn exploit_unique_msg_order(red: &mut Reduction) {
 /// to a known truth value collapse to `gtrue`/`gfalse`, dropping
 /// out of disjunctions or short-circuiting conjunctions.
 fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
-    use crate::guarded::{simplify_guarded_with, gfalse, gtrue, Guarded};
+    use crate::guarded::{simplify_guarded_with, Guarded};
     // HS-faithful: `evalFormulaAtoms` iterates `S.toList sFormulas` —
     // Simplify.hs:402-404 — ascending Guarded Ord.  Rust's Vec is in
     // insertion order; sort first to match HS's iteration.

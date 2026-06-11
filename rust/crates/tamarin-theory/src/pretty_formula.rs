@@ -261,7 +261,7 @@ pub fn pretty_atom(a: &p::Atom) -> String {
 /// Pretty-print a parser-AST term standalone.
 pub fn pretty_term(t: &p::Term) -> String {
     let mut s = String::new();
-    pp_term(t, TermPrec::Top, &[], &mut s);
+    pp_term(t, &[], &mut s);
     s
 }
 
@@ -807,33 +807,33 @@ fn pp_atom(a: &p::Atom, scope: &[Bind], out: &mut String) {
     use p::Atom::*;
     match a {
         Eq(l, r) => {
-            pp_term(l, TermPrec::Top, scope, out);
+            pp_term(l, scope, out);
             out.push_str(" = ");
-            pp_term(r, TermPrec::Top, scope, out);
+            pp_term(r, scope, out);
         }
         Less(l, r) => {
-            pp_term(l, TermPrec::Top, scope, out);
+            pp_term(l, scope, out);
             out.push_str(" < ");
-            pp_term(r, TermPrec::Top, scope, out);
+            pp_term(r, scope, out);
         }
         LessMset(l, r) => {
-            pp_term(l, TermPrec::Top, scope, out);
+            pp_term(l, scope, out);
             out.push_str(" (<) ");
-            pp_term(r, TermPrec::Top, scope, out);
+            pp_term(r, scope, out);
         }
         Subterm(l, r) => {
-            pp_term(l, TermPrec::Top, scope, out);
+            pp_term(l, scope, out);
             out.push_str(" \u{228F} "); // ⊏
-            pp_term(r, TermPrec::Top, scope, out);
+            pp_term(r, scope, out);
         }
         Action(fa, t) => {
             pp_fact(fa, scope, out);
             out.push_str(" @ ");
-            pp_term(t, TermPrec::Top, scope, out);
+            pp_term(t, scope, out);
         }
         Last(t) => {
             out.push_str("last(");
-            pp_term(t, TermPrec::Top, scope, out);
+            pp_term(t, scope, out);
             out.push(')');
         }
         Pred(fa) => pp_fact(fa, scope, out),
@@ -860,7 +860,7 @@ fn pp_fact(fa: &p::Fact, scope: &[Bind], out: &mut String) {
         out.push_str("( ");
         for (i, t) in fa.args.iter().enumerate() {
             if i > 0 { out.push_str(", "); }
-            pp_term(t, TermPrec::Top, scope, out);
+            pp_term(t, scope, out);
         }
         out.push_str(" )");
     }
@@ -901,7 +901,7 @@ pub fn term_to_doc(t: &p::Term, scope: &[Bind]) -> crate::pretty_hpj::Doc {
         Var(_) | PubLit(_) | FreshLit(_) | NatLit(_) | Number(_) | NumberOne
         | NatOne | DhNeutral | PatMatch(_) => {
             let mut s = String::new();
-            pp_term(t, TermPrec::Top, scope, &mut s);
+            pp_term(t, scope, &mut s);
             Doc::text(s)
         }
         Pair(items) => {
@@ -938,7 +938,7 @@ pub fn term_to_doc(t: &p::Term, scope: &[Bind]) -> crate::pretty_hpj::Doc {
             // symbol as separator (no surrounding spaces).
             if matches!(op, p::BinOp::Exp) {
                 let mut s = String::new();
-                pp_term(t, TermPrec::Top, scope, &mut s);
+                pp_term(t, scope, &mut s);
                 Doc::text(s)
             } else {
                 // Flatten same-op children to the n-ary chain HS's `viewTerm`
@@ -1080,7 +1080,7 @@ fn gterm_to_doc(t: &crate::guarded::GTerm, scope: &[Vec<Bind>]) -> crate::pretty
         Var(_) | PubLit(_) | FreshLit(_) | NatLit(_) | Number(_) | NumberOne
         | NatOne | DhNeutral | PatMatch(_) => {
             let mut s = String::new();
-            pp_gterm(t, TermPrec::Top, scope, &mut s);
+            pp_gterm(t, scope, &mut s);
             Doc::text(s)
         }
         Pair(items) => {
@@ -1106,7 +1106,7 @@ fn gterm_to_doc(t: &crate::guarded::GTerm, scope: &[Vec<Bind>]) -> crate::pretty
         AlgApp(name, l, r) => {
             // HS aenc{m}pk surface form, rendered flat (pp_gterm emits it).
             let mut s = String::new();
-            pp_gterm(t, TermPrec::Top, scope, &mut s);
+            pp_gterm(t, scope, &mut s);
             let _ = (name, l, r);
             Doc::text(s)
         }
@@ -1118,7 +1118,7 @@ fn gterm_to_doc(t: &crate::guarded::GTerm, scope: &[Vec<Bind>]) -> crate::pretty
             // exp flat; AC ops wrap via fcat (Term/Term.hs:273-274).
             if matches!(op, p::BinOp::Exp) {
                 let mut s = String::new();
-                pp_gterm(t, TermPrec::Top, scope, &mut s);
+                pp_gterm(t, scope, &mut s);
                 Doc::text(s)
             } else {
                 fn flatten<'a>(
@@ -1248,16 +1248,16 @@ fn gatom_to_doc(a: &crate::guarded::GAtom, scope: &[Vec<Bind>]) -> crate::pretty
         // here defensively; render flat via pp_gterm (matches show-style).
         Less(l, r) => {
             let mut s = String::new();
-            pp_gterm(l, TermPrec::Top, scope, &mut s);
+            pp_gterm(l, scope, &mut s);
             s.push_str(" < ");
-            pp_gterm(r, TermPrec::Top, scope, &mut s);
+            pp_gterm(r, scope, &mut s);
             Doc::text(s)
         }
         LessMset(l, r) => {
             let mut s = String::new();
-            pp_gterm(l, TermPrec::Top, scope, &mut s);
+            pp_gterm(l, scope, &mut s);
             s.push_str(" (<) ");
-            pp_gterm(r, TermPrec::Top, scope, &mut s);
+            pp_gterm(r, scope, &mut s);
             Doc::text(s)
         }
         // HS `Action v fa -> prettyFact ppT fa <-> opAction <-> text (show v)`
@@ -1265,7 +1265,7 @@ fn gatom_to_doc(a: &crate::guarded::GAtom, scope: &[Vec<Bind>]) -> crate::pretty
         // time-point var. The fact wraps; `@ #t` stays beside.
         Action(fa, t) => {
             let mut tv = String::new();
-            pp_gterm(t, TermPrec::Top, scope, &mut tv);
+            pp_gterm(t, scope, &mut tv);
             gfact_to_doc(fa, scope)
                 .beside_sp(Doc::text("@"))
                 .beside_sp(Doc::text(tv))
@@ -1274,7 +1274,7 @@ fn gatom_to_doc(a: &crate::guarded::GAtom, scope: &[Vec<Bind>]) -> crate::pretty
         Last(t) => {
             let mut s = String::new();
             s.push_str("last(");
-            pp_gterm(t, TermPrec::Top, scope, &mut s);
+            pp_gterm(t, scope, &mut s);
             s.push(')');
             Doc::text(s)
         }
@@ -1293,15 +1293,7 @@ fn nest_short_doc(lead: &str, finish: &str, body: crate::pretty_hpj::Doc) -> cra
     hpj::sep(vec![above, Doc::text(finish)])
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum TermPrec {
-    Top,
-    /// Inside an AC operator — parenthesise nested binops with lower
-    /// precedence than the parent.
-    InOp,
-}
-
-fn pp_term(t: &p::Term, prec: TermPrec, scope: &[Bind], out: &mut String) {
+fn pp_term(t: &p::Term, scope: &[Bind], out: &mut String) {
     use p::Term::*;
     match t {
         Var(v) => pp_var_scoped(v, scope, out),
@@ -1355,7 +1347,7 @@ fn pp_term(t: &p::Term, prec: TermPrec, scope: &[Bind], out: &mut String) {
             out.push('<');
             for (i, it) in flat.iter().enumerate() {
                 if i > 0 { out.push_str(", "); }
-                pp_term(it, TermPrec::Top, scope, out);
+                pp_term(it, scope, out);
             }
             out.push('>');
         }
@@ -1365,7 +1357,7 @@ fn pp_term(t: &p::Term, prec: TermPrec, scope: &[Bind], out: &mut String) {
                 out.push('(');
                 for (i, a) in args.iter().enumerate() {
                     if i > 0 { out.push_str(", "); }
-                    pp_term(a, TermPrec::Top, scope, out);
+                    pp_term(a, scope, out);
                 }
                 out.push(')');
             }
@@ -1375,16 +1367,16 @@ fn pp_term(t: &p::Term, prec: TermPrec, scope: &[Bind], out: &mut String) {
             // function syntax) — the curly-brace form is parser sugar.
             out.push_str(name);
             out.push('(');
-            pp_term(l, TermPrec::Top, scope, out);
+            pp_term(l, scope, out);
             out.push_str(", ");
-            pp_term(r, TermPrec::Top, scope, out);
+            pp_term(r, scope, out);
             out.push(')');
         }
         Diff(l, r) => {
             out.push_str("diff(");
-            pp_term(l, TermPrec::Top, scope, out);
+            pp_term(l, scope, out);
             out.push_str(", ");
-            pp_term(r, TermPrec::Top, scope, out);
+            pp_term(r, scope, out);
             out.push(')');
         }
         BinOp(op, l, r) => {
@@ -1423,10 +1415,9 @@ fn pp_term(t: &p::Term, prec: TermPrec, scope: &[Bind], out: &mut String) {
                 let sym = binop_symbol(*op);
                 for (i, child) in flat.iter().enumerate() {
                     if i > 0 { out.push_str(sym); }
-                    pp_term(child, TermPrec::Top, scope, out);
+                    pp_term(child, scope, out);
                 }
                 out.push(')');
-                let _ = prec;
                 return;
             }
             if !is_exp { out.push('('); }
@@ -1434,15 +1425,14 @@ fn pp_term(t: &p::Term, prec: TermPrec, scope: &[Bind], out: &mut String) {
             // nested `^`).  Within an AC, children at Top — AC nesting
             // already gets its own mandatory parens via the recursive
             // call, and the parent's parens are unconditional.
-            pp_term(l, TermPrec::Top, scope, out);
+            pp_term(l, scope, out);
             out.push_str(binop_symbol(*op));
-            pp_term(r, TermPrec::Top, scope, out);
+            pp_term(r, scope, out);
             if !is_exp { out.push(')'); }
-            let _ = prec; // precedence no longer needed
         }
         PatMatch(inner) => {
             out.push('=');
-            pp_term(inner, TermPrec::Top, scope, out);
+            pp_term(inner, scope, out);
         }
     }
 }
@@ -1814,33 +1804,33 @@ fn pp_gatom(a: &crate::guarded::GAtom, scope: &[Vec<Bind>], out: &mut String) {
     use crate::guarded::GAtom;
     match a {
         GAtom::Eq(l, r) => {
-            pp_gterm(l, TermPrec::Top, scope, out);
+            pp_gterm(l, scope, out);
             out.push_str(" = ");
-            pp_gterm(r, TermPrec::Top, scope, out);
+            pp_gterm(r, scope, out);
         }
         GAtom::Less(l, r) => {
-            pp_gterm(l, TermPrec::Top, scope, out);
+            pp_gterm(l, scope, out);
             out.push_str(" < ");
-            pp_gterm(r, TermPrec::Top, scope, out);
+            pp_gterm(r, scope, out);
         }
         GAtom::LessMset(l, r) => {
-            pp_gterm(l, TermPrec::Top, scope, out);
+            pp_gterm(l, scope, out);
             out.push_str(" (<) ");
-            pp_gterm(r, TermPrec::Top, scope, out);
+            pp_gterm(r, scope, out);
         }
         GAtom::Subterm(l, r) => {
-            pp_gterm(l, TermPrec::Top, scope, out);
+            pp_gterm(l, scope, out);
             out.push_str(" \u{228F} "); // ⊏
-            pp_gterm(r, TermPrec::Top, scope, out);
+            pp_gterm(r, scope, out);
         }
         GAtom::Action(fa, t) => {
             pp_gfact(fa, scope, out);
             out.push_str(" @ ");
-            pp_gterm(t, TermPrec::Top, scope, out);
+            pp_gterm(t, scope, out);
         }
         GAtom::Last(t) => {
             out.push_str("last(");
-            pp_gterm(t, TermPrec::Top, scope, out);
+            pp_gterm(t, scope, out);
             out.push(')');
         }
         GAtom::Pred(fa) => pp_gfact(fa, scope, out),
@@ -1859,13 +1849,13 @@ fn pp_gfact(fa: &crate::guarded::GFact, scope: &[Vec<Bind>], out: &mut String) {
         out.push_str("( ");
         for (i, t) in fa.args.iter().enumerate() {
             if i > 0 { out.push_str(", "); }
-            pp_gterm(t, TermPrec::Top, scope, out);
+            pp_gterm(t, scope, out);
         }
         out.push_str(" )");
     }
 }
 
-fn pp_gterm(t: &crate::guarded::GTerm, prec: TermPrec, scope: &[Vec<Bind>], out: &mut String) {
+fn pp_gterm(t: &crate::guarded::GTerm, scope: &[Vec<Bind>], out: &mut String) {
     use crate::guarded::{GTerm, BVar};
     match t {
         GTerm::Var(BVar::Free(v)) => pp_var(v, out),
@@ -1892,30 +1882,30 @@ fn pp_gterm(t: &crate::guarded::GTerm, prec: TermPrec, scope: &[Vec<Bind>], out:
             out.push('(');
             for (i, a) in args.iter().enumerate() {
                 if i > 0 { out.push_str(", "); }
-                pp_gterm(a, TermPrec::Top, scope, out);
+                pp_gterm(a, scope, out);
             }
             out.push(')');
         }
         GTerm::AlgApp(name, a, b) => {
             out.push_str(name);
             out.push('{');
-            pp_gterm(a, TermPrec::Top, scope, out);
+            pp_gterm(a, scope, out);
             out.push('}');
-            pp_gterm(b, TermPrec::Top, scope, out);
+            pp_gterm(b, scope, out);
         }
         GTerm::Pair(items) => {
             out.push('<');
             for (i, it) in items.iter().enumerate() {
                 if i > 0 { out.push_str(", "); }
-                pp_gterm(it, TermPrec::Top, scope, out);
+                pp_gterm(it, scope, out);
             }
             out.push('>');
         }
         GTerm::Diff(l, r) => {
             out.push_str("diff(");
-            pp_gterm(l, TermPrec::Top, scope, out);
+            pp_gterm(l, scope, out);
             out.push_str(", ");
-            pp_gterm(r, TermPrec::Top, scope, out);
+            pp_gterm(r, scope, out);
             out.push(')');
         }
         GTerm::BinOp(op, l, r) => {
@@ -1932,10 +1922,9 @@ fn pp_gterm(t: &crate::guarded::GTerm, prec: TermPrec, scope: &[Vec<Bind>], out:
             // parser-AST `pp_term` AC handling (this fn, ~l.1108).
             let is_exp = matches!(op, p::BinOp::Exp);
             if is_exp {
-                pp_gterm(l, TermPrec::Top, scope, out);
+                pp_gterm(l, scope, out);
                 out.push_str(binop_symbol(*op));
-                pp_gterm(r, TermPrec::Top, scope, out);
-                let _ = prec;
+                pp_gterm(r, scope, out);
                 return;
             }
             fn flatten<'a>(
@@ -1958,14 +1947,13 @@ fn pp_gterm(t: &crate::guarded::GTerm, prec: TermPrec, scope: &[Vec<Bind>], out:
             let sym = binop_symbol(*op);
             for (i, child) in flat.iter().enumerate() {
                 if i > 0 { out.push_str(sym); }
-                pp_gterm(child, TermPrec::Top, scope, out);
+                pp_gterm(child, scope, out);
             }
             out.push(')');
-            let _ = prec;
         }
         GTerm::PatMatch(inner) => {
             out.push('=');
-            pp_gterm(inner, TermPrec::Top, scope, out);
+            pp_gterm(inner, scope, out);
         }
     }
 }
