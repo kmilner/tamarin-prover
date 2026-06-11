@@ -798,6 +798,29 @@ pub fn exec_proof_method(
             let mut sr = Reduction::new(ctx, step_sys);
             simplify_system(&mut sr);
 
+            // HS-faithful `cleanup` (ProofMethod.hs:453-468): induction is
+            //   `Induction -> process . induction <$> getInductionCases sys`
+            // (ProofMethod.hs:428), and `process`/`processLabeled` apply
+            //   `map (fmap cleanup . fst)` (ProofMethod.hs:456) where
+            //   cleanup s = L.set sSubst emptySubst
+            //                 (Precise.evalFresh (renamePrecise s) nothingUsed)
+            // So EVERY surviving induction case is renamePrecise'd with an
+            // empty per-name Precise fresh supply, then has its substitution
+            // cleared.  Without this, the IH disjunction's free vars (opened
+            // from the `Ex` IH via global-counter freshLVar during simplify)
+            // keep their high `.N` indices (e.g. `last(#z.7)`) instead of the
+            // canonical per-name idx-0 form (`last(#z)`) HS renders.
+            let cleanup = |s: &mut System| {
+                if std::env::var("TAM_DISABLE_RENAME_PRECISE").is_err() {
+                    crate::constraint::solver::rename_precise::rename_precise_system(s);
+                }
+                s.invalidate_max_var_idx_cache();
+                s.eq_store.subst =
+                    tamarin_term::subst::Subst::from_list(Vec::new());
+            };
+            cleanup(&mut br.sys);
+            cleanup(&mut sr.sys);
+
             Some(vec![
                 ("empty_trace".to_string(), br.sys),
                 ("non_empty_trace".to_string(), sr.sys),
