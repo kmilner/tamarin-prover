@@ -82,9 +82,22 @@ pub fn pretty_closed_theory(
 ) -> String {
     let mut out = String::new();
 
-    // theory <name>\n\nbegin\n\n
+    // HS `prettyTheory` (TheoryObject.hs:741-756):
+    //   vsep [ kwTheoryName name
+    //        , ...configBlocks...  (filter isConfigBlock thyItems, before begin)
+    //        , kwTheoryBegin, ... ]
+    // ConfigBlocks: `prettyConfigBlock cb = text "configuration: " <> doubleQuotes (text cb)`
+    // RS stores the configuration string directly in `parsed.configuration`.
     out.push_str("theory ");
     out.push_str(&elaborated.name);
+    if let Some(cfg) = &parsed.configuration {
+        // HS: `text "configuration: " <> doubleQuotes (text cb)`
+        // = `configuration: "<cb>"`
+        // Emitted via vsep (blank-line separated from theory name and begin).
+        out.push_str("\n\nconfiguration: \"");
+        out.push_str(cfg);
+        out.push('"');
+    }
     out.push_str("\n\nbegin\n\n");
 
     // // Function signature and definition of the equational theory E\n\n
