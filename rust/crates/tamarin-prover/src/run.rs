@@ -504,7 +504,18 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         // (`Theory.Tools.Wellformedness:1270`).  Runs on every file
         // (not gated by `--parse-only`) so a malformed theory is
         // surfaced even without proving.
-        let mut wf_report = tamarin_parser::wf::check_theory(&parsed);
+        //
+        // HS-faithful: HS's `thyProtoRules` (Wellformedness.hs:134)
+        // applies `applyMacroInRule (theoryMacros thy)` to every rule
+        // BEFORE the checks run — so `Fr(test())` where `test() = ~x`
+        // becomes `Fr(~x)` and passes.  We mirror by cloning `parsed`
+        // and expanding macros before handing it to `check_theory`.
+        let parsed_for_wf = {
+            let mut tmp = parsed.clone();
+            tamarin_theory::macro_expand::expand_theory_macros(&mut tmp);
+            tmp
+        };
+        let mut wf_report = tamarin_parser::wf::check_theory(&parsed_for_wf);
         // Strip the static "Message Derivation Checks" entry — the
         // dynamic check below replaces it with the prover-based result.
         // We keep the static check available for the `--parse-only`
