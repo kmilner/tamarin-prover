@@ -245,8 +245,11 @@ fn finished_subterms(ctx: &ProofContext, sys: &System) -> bool {
             _ => true,
         }
     };
+    // HS `hasReducibleOperatorsOnTop` walks posSubterms ∪ negSubterms ∪
+    // solvedSubterms (SubtermStore.hs:131-133).
     sys.subterm_store.subterms.iter().all(|s| top_is_not_reducible(&s.big))
         && sys.subterm_store.solved_subterms.iter().all(|s| top_is_not_reducible(&s.big))
+        && sys.subterm_store.neg_subterms.iter().all(|(_, big)| top_is_not_reducible(big))
 }
 
 /// Execute a proof method against `sys`, returning the resulting

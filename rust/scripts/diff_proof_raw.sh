@@ -13,6 +13,10 @@
 #
 # Env:
 #   TIMEOUT=<secs>    wall-clock cap per side (default 300)
+#   RS_TIMEOUT=<secs> RS-side cap (default: TIMEOUT). This is the manual
+#                     single-lemma tool, so unlike corpus_raw_diff.sh (whose
+#                     RS cap defaults to 30s for sweep speed) it lets RS run
+#                     the full window by default.
 #   QUIET=1           print only the summary line, not the diff body
 #   NO_HS_CACHE=1     ignore the shared raw HS cache
 #   HS_CANON_CACHE    cache dir (default <script_dir>/.hs_canon_cache); HS raw
@@ -27,6 +31,7 @@ if [ $# -lt 2 ]; then
 fi
 file="$1"; lemma="$2"; extra_env="${3:-}"
 TIMEOUT="${TIMEOUT:-300}"
+RS_TIMEOUT="${RS_TIMEOUT:-$TIMEOUT}"
 QUIET="${QUIET:-}"
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -100,10 +105,10 @@ fi
 
 # --- RS.
 # shellcheck disable=SC2086
-timeout "$TIMEOUT" env $extra_env "$rs_path" --prove="$lemma" "$file" 2>/dev/null > "$tmp/rs.out"
+timeout "$RS_TIMEOUT" env $extra_env "$rs_path" --prove="$lemma" "$file" 2>/dev/null > "$tmp/rs.out"
 rs_rc=$?
 if [ "$rs_rc" -eq 124 ]; then
-    echo "$lemma: RS TIMEOUT (${TIMEOUT}s)"
+    echo "$lemma: RS TIMEOUT (${RS_TIMEOUT}s)"
     exit 1
 fi
 

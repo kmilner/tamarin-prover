@@ -47,6 +47,10 @@ pub enum LemmaVerdict {
     Falsified,
     /// We exhausted the search budget or hit `Sorry`.
     Analyzed,
+    /// HS `UnfinishableProof`: no open goals but subterm store has reducible
+    /// operators.  HS `showProofStatus` (Theory/Proof.hs:1128):
+    ///   "analysis cannot be finished (reducible operators in subterms)"
+    Unfinishable,
     /// `[reuse]`-only lemma that we didn't try to prove (out of filter).
     Skipped,
     /// Lemma was filtered out by `--prove=FOO` / `--lemma=FOO`.
@@ -60,6 +64,7 @@ impl LemmaVerdict {
             LemmaVerdict::Verified => "verified",
             LemmaVerdict::Falsified => "falsified",
             LemmaVerdict::Analyzed => "analysis incomplete",
+            LemmaVerdict::Unfinishable => "analysis cannot be finished (reducible operators in subterms)",
             LemmaVerdict::Skipped => "analysis incomplete",
             LemmaVerdict::Filtered => "analysis incomplete",
             LemmaVerdict::Error(_) => "error",
@@ -71,6 +76,7 @@ impl LemmaVerdict {
 ///   `<lemma> (<quantifier>): falsified - found trace (<N> steps)`
 ///   `<lemma> (<quantifier>): verified (<N> steps)`
 ///   `<lemma> (<quantifier>): analysis incomplete (<N> steps)`
+///   `<lemma> (<quantifier>): analysis cannot be finished (reducible operators in subterms) (<N> steps)`
 fn format_lemma_summary_line(r: &LemmaResult) -> String {
     let quantifier = if r.exists_trace { "exists-trace" } else { "all-traces" };
     let body = match &r.verdict {
@@ -79,6 +85,9 @@ fn format_lemma_summary_line(r: &LemmaResult) -> String {
         LemmaVerdict::Analyzed
         | LemmaVerdict::Skipped
         | LemmaVerdict::Filtered => format!("analysis incomplete ({} steps)", r.proof_steps),
+        // HS `showProofStatus _ UnfinishableProof` (Theory/Proof.hs:1128).
+        LemmaVerdict::Unfinishable =>
+            format!("analysis cannot be finished (reducible operators in subterms) ({} steps)", r.proof_steps),
         LemmaVerdict::Error(msg) => format!("error: {}", msg),
     };
     format!("{} ({}): {}", r.name, quantifier, body)
@@ -777,8 +786,8 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                                     LemmaVerdict::Verified
                                 }
                             }
+                            NodeStatus::Unfinishable => LemmaVerdict::Unfinishable,
                             NodeStatus::Sorry
-                            | NodeStatus::Unfinishable
                             | NodeStatus::Open => LemmaVerdict::Analyzed,
                         };
                         let body = tamarin_theory::pretty_theory::pretty_proof_body(&root);

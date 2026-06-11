@@ -261,18 +261,167 @@ fn pp_wf_term(t: &Term, out: &mut String) {
             out.push(')');
         }
         BinOp(op, l, r) => {
+            use crate::ast::BinOp as B;
             let sym = match op {
-                crate::ast::BinOp::Exp => "^",
-                crate::ast::BinOp::Mult => "*",
-                crate::ast::BinOp::Union => "++",
-                crate::ast::BinOp::Xor => "\u{2295}",
-                crate::ast::BinOp::NatPlus => "%+",
+                B::Exp => "^",
+                B::Mult => "*",
+                B::Union => "++",
+                B::Xor => "\u{2295}",
+                B::NatPlus => "%+",
             };
-            pp_wf_term(l, out);
-            out.push_str(sym);
-            pp_wf_term(r, out);
+            // HS builds AC operators (Mult/Union/Xor/NatPlus) via `fAppAC`,
+            // which flattens the chain, sorts the operands (Ord LTerm), and
+            // renders them parenthesised by `prettyTerm` (e.g. `(%x%+%1%+%1)`).
+            // Exp is NOT AC: rendered binary, no surrounding parens.
+            if matches!(op, B::Mult | B::Union | B::Xor | B::NatPlus) {
+                let mut flat: Vec<&Term> = Vec::new();
+                flatten_ac(*op, t, &mut flat);
+                flat.sort_by(|a, b| cmp_wf_term(a, b));
+                out.push('(');
+                for (i, a) in flat.iter().enumerate() {
+                    if i > 0 { out.push_str(sym); }
+                    pp_wf_term(a, out);
+                }
+                out.push(')');
+            } else {
+                pp_wf_term(l, out);
+                out.push_str(sym);
+                pp_wf_term(r, out);
+            }
         }
         PatMatch(inner) => { out.push('='); pp_wf_term(inner, out); }
+    }
+}
+
+/// Substitute every `let`-binding of a rule into its facts, mirroring HS,
+/// whose rule parser inlines the `let` block before building the
+/// `ProtoRuleE` (so wellformedness checks see fully-substituted facts).
+/// Bindings are applied in order, with earlier substitutions baked into
+/// later binding values — matching `elaborate::apply_let_block`.
+fn rule_facts_with_lets(r: &Rule) -> (Vec<Fact>, Vec<Fact>, Vec<Fact>) {
+    let mut prems = r.premises.clone();
+    let mut acts = r.actions.clone();
+    let mut concs = r.conclusions.clone();
+    let mut applied: Vec<(Term, Term)> = Vec::new();
+    for b in &r.let_block {
+        let mut value = b.value.clone();
+        for (k, v) in &applied {
+            value = subst_let_term(&value, k, v);
+        }
+        applied.push((b.var.clone(), value));
+    }
+    for (k, v) in &applied {
+        for f in prems.iter_mut() { subst_let_fact(f, k, v); }
+        for f in acts.iter_mut()  { subst_let_fact(f, k, v); }
+        for f in concs.iter_mut() { subst_let_fact(f, k, v); }
+    }
+    (prems, acts, concs)
+}
+
+fn subst_let_fact(f: &mut Fact, key: &Term, val: &Term) {
+    for a in f.args.iter_mut() {
+        *a = subst_let_term(a, key, val);
+    }
+}
+
+fn subst_let_term(t: &Term, key: &Term, val: &Term) -> Term {
+    if t == key { return val.clone(); }
+    use Term::*;
+    match t {
+        App(name, args) =>
+            App(name.clone(), args.iter().map(|a| subst_let_term(a, key, val)).collect()),
+        AlgApp(name, a, b) =>
+            AlgApp(name.clone(),
+                Box::new(subst_let_term(a, key, val)),
+                Box::new(subst_let_term(b, key, val))),
+        Pair(args) =>
+            Pair(args.iter().map(|a| subst_let_term(a, key, val)).collect()),
+        Diff(a, b) =>
+            Diff(Box::new(subst_let_term(a, key, val)),
+                 Box::new(subst_let_term(b, key, val))),
+        BinOp(op, a, b) =>
+            BinOp(*op, Box::new(subst_let_term(a, key, val)),
+                       Box::new(subst_let_term(b, key, val))),
+        PatMatch(a) => PatMatch(Box::new(subst_let_term(a, key, val))),
+        Var(_) | PubLit(_) | FreshLit(_) | NatLit(_) | Number(_)
+        | NumberOne | NatOne | DhNeutral => t.clone(),
+    }
+}
+
+/// Flatten an AC `BinOp` chain (same operator) into its operand list,
+/// mirroring HS `fAppAC`'s flatten-then-sort (Term/Term/Raw.hs:118-128).
+fn flatten_ac<'a>(op: crate::ast::BinOp, t: &'a Term, out: &mut Vec<&'a Term>) {
+    match t {
+        Term::BinOp(inner, l, r) if *inner == op => {
+            flatten_ac(op, l, out);
+            flatten_ac(op, r, out);
+        }
+        _ => out.push(t),
+    }
+}
+
+/// HS `Ord LTerm` for the subset of parser terms we render here.
+///
+/// HS-faithful class order (Term/Term/Raw.hs:72-74, VTerm.hs:56-57):
+/// `LIT _ < FAPP _ _`, and within `LIT`, `Con < Var`, with constant Names
+/// ordered by NameTag (Fresh < Pub < Nat, LTerm.hs:215).  The nullary
+/// builtins `1`/`%1`/`DH-neutral` are `fAppNoEq … []` so they live in the
+/// FAPP class.  Within a class we fall back to a structural tie-break that
+/// is enough for the AC operand lists that arise here.
+fn cmp_wf_term(a: &Term, b: &Term) -> std::cmp::Ordering {
+    fn class(t: &Term) -> (u8, u8) {
+        use Term::*;
+        match t {
+            // LIT (Con name): constants, by NameTag Fresh<Pub<Nat.
+            FreshLit(_) => (0, 0),
+            PubLit(_) => (0, 1),
+            NatLit(_) => (0, 2),
+            Number(_) => (0, 3),
+            // LIT (Var v): variables sort after all constants.
+            Var(_) => (0, 4),
+            // FAPP: nullary builtins are NoEq applications, not literals.
+            NumberOne => (1, 0),
+            NatOne => (1, 1),
+            DhNeutral => (1, 2),
+            App(..) => (1, 3),
+            AlgApp(..) => (1, 4),
+            Pair(_) => (1, 5),
+            Diff(..) => (1, 6),
+            BinOp(..) => (1, 7),
+            PatMatch(_) => (1, 8),
+        }
+    }
+    let (ca, sa) = class(a);
+    let (cb, sb) = class(b);
+    if ca != cb { return ca.cmp(&cb); }
+    if sa != sb { return sa.cmp(&sb); }
+    use Term::*;
+    match (a, b) {
+        (Var(v1), Var(v2)) => {
+            // HS Ord LVar = (idx, sort, name) (LTerm.hs:521-523).
+            v1.idx.cmp(&v2.idx)
+                .then_with(|| sort_tag(&v1.sort).cmp(&sort_tag(&v2.sort)))
+                .then_with(|| v1.name.cmp(&v2.name))
+        }
+        (PubLit(s1), PubLit(s2)) => s1.cmp(s2),
+        (FreshLit(s1), FreshLit(s2)) => s1.cmp(s2),
+        (NatLit(s1), NatLit(s2)) => s1.cmp(s2),
+        (Number(n1), Number(n2)) => n1.cmp(n2),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+/// HS LSort declaration order (Term/LTerm.hs:161-166):
+/// Pub < Fresh < Msg < Node < Nat.
+fn sort_tag(s: &SortHint) -> u8 {
+    use SortHint::*;
+    use SuffixSort as SS;
+    match s {
+        Pub | Suffix(SS::Pub) => 0,
+        Fresh | Suffix(SS::Fresh) => 1,
+        Msg | Suffix(SS::Msg) | Untagged => 2,
+        Node | Suffix(SS::Node) => 3,
+        Nat | Suffix(SS::Nat) => 4,
     }
 }
 
@@ -354,14 +503,17 @@ const KLOG_NAMES: &[&str] = &["KU", "KD", "K", "Ded"];
 pub fn reserved_fact_name_rules(thy: &Theory) -> WfReport {
     let mut out = Vec::new();
     for r in theory_rules(thy) {
-        let bad_lhs: Vec<&Fact> = r.premises.iter()
+        // HS checks the let-substituted `ProtoRuleE`, so the emitted facts
+        // carry their fully-inlined terms (Term/Term/Raw.hs fAppAC order).
+        let (prems, acts, concs) = rule_facts_with_lets(r);
+        let bad_lhs: Vec<&Fact> = prems.iter()
             .filter(|f| KLOG_NAMES.contains(&f.name.as_str()))
             .collect();
-        let bad_acts: Vec<&Fact> = r.actions.iter()
+        let bad_acts: Vec<&Fact> = acts.iter()
             .filter(|f| KLOG_NAMES.contains(&f.name.as_str())
                 || matches!(f.name.as_str(), "In" | "Out" | "Fr"))
             .collect();
-        let bad_rhs: Vec<&Fact> = r.conclusions.iter()
+        let bad_rhs: Vec<&Fact> = concs.iter()
             .filter(|f| KLOG_NAMES.contains(&f.name.as_str()))
             .collect();
         for (msg, fs) in [
@@ -370,10 +522,27 @@ pub fn reserved_fact_name_rules(thy: &Theory) -> WfReport {
             ("on the right-hand-side", bad_rhs),
         ] {
             if !fs.is_empty() {
-                let names: Vec<String> = fs.iter().map(|f| f.name.clone()).collect();
-                out.push(WfError::new("Reserved names",
-                    format!("Rule '{}' contains facts with reserved names {}: {}",
-                        r.name, msg, names.join(", "))));
+                // HS `reservedFactNameRules'` (Wellformedness.hs:530-550):
+                //   (underlineTopic "Reserved names",
+                //      text ("Rule " ++ quote (showRuleCaseName ru))
+                //      <-> text ("contains facts with reserved names"++msg) $-$
+                //      nest 2 (fsep $ punctuate comma $ map prettyLNFact fas))
+                // grouped/nested by `prettyWfErrorReport` (text topic $-$
+                // nest 2 body): the rule line gets 2-space indent, the fact
+                // line 4-space (2 from ppTopic + 2 from the inner nest 2).
+                let facts: Vec<String> =
+                    fs.iter().map(|f| pp_wf_fact(f)).collect();
+                let mut s = String::new();
+                s.push_str(&underline_topic("Reserved names"));
+                s.push('\n');
+                s.push_str(&format!(
+                    "  Rule `{}' contains facts with reserved names {}:\n",
+                    r.name, msg,
+                ));
+                s.push_str("    ");
+                s.push_str(&facts.join(", "));
+                s.push('\n');
+                out.push(WfError::new("Reserved names", s));
             }
         }
     }
@@ -664,6 +833,11 @@ pub fn fact_lhs_occur_no_rhs(thy: &Theory) -> WfReport {
     let mut s = String::new();
     s.push_str(&underline_topic(title));
     s.push('\n');
+    // HS `numbered'` = `numbered (text "")`: items are interspersed with
+    // `text ""` separators and joined by `$-$`.  `text ""` at indent 2
+    // (from the `nest 2` in the caller) renders as `"  "` (2 spaces).
+    // Result: item1\n  \nitem2\n  \nitem3\n (blank 2-space lines between items).
+    let last_idx = orphan_pairs.len() - 1;
     for (i, (rule_name, fa, suggestion)) in orphan_pairs.iter().enumerate() {
         let primary = format!(
             "in rule \"{}\":  factName `{}' arity: {} multiplicity: {}",
@@ -682,6 +856,11 @@ pub fn fact_lhs_occur_no_rhs(thy: &Theory) -> WfReport {
         };
         s.push_str(&line);
         s.push('\n');
+        // HS `numbered (text "")` inserts `text ""` between items.
+        // At 2-space indent this renders as "  \n".
+        if i < last_idx {
+            s.push_str("  \n");
+        }
     }
 
     vec![WfError::new(title, s)]
@@ -907,23 +1086,6 @@ fn render_var(v: &VarSpec) -> String {
 // =============================================================================
 // Multiplication restriction of rules
 // =============================================================================
-
-/// True if `t` (or any subterm) uses the AC `*` (mult) or `^` (exp) op
-/// or appears as `inv(...)` — these are reducible roots forbidden in
-/// rule LHS.
-fn term_has_reducible_op(t: &Term) -> bool {
-    match t {
-        Term::BinOp(BinOp::Mult, _, _) | Term::BinOp(BinOp::Exp, _, _)
-        | Term::BinOp(BinOp::Xor, _, _) => true,
-        Term::App(name, _) if name == "inv" => true,
-        Term::App(_, args) | Term::Pair(args) => args.iter().any(term_has_reducible_op),
-        Term::AlgApp(_, a, b) => term_has_reducible_op(a) || term_has_reducible_op(b),
-        Term::Diff(a, b) => term_has_reducible_op(a) || term_has_reducible_op(b),
-        Term::BinOp(_, a, b) => term_has_reducible_op(a) || term_has_reducible_op(b),
-        Term::PatMatch(inner) => term_has_reducible_op(inner),
-        _ => false,
-    }
-}
 
 /// HS `multRestrictedReport'` (Wellformedness.hs:1047-1099). HS only
 /// flags a rule when:

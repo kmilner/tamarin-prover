@@ -1070,8 +1070,26 @@ impl<'ctx> Reduction<'ctx> {
                 propagated: c.propagated,
             });
         }
+        // negSubterms (HS field `a`) get substituted too; oldNegSubterms
+        // (field `e`) do NOT — this is what re-arms the simpSplitNegSt
+        // change-detection (`negSubterms \ oldNegSubterms`) after a
+        // substitution alters a stored negative subterm.
+        let negs = std::mem::take(&mut self.sys.subterm_store.neg_subterms);
+        let mut new_negs: Vec<(tamarin_term::lterm::LNTerm, tamarin_term::lterm::LNTerm)> =
+            Vec::with_capacity(negs.len());
+        for (s, t) in negs {
+            let new_s = tamarin_term::subst::apply_vterm(&subst, s.clone());
+            let new_t = tamarin_term::subst::apply_vterm(&subst, t.clone());
+            if new_s != s || new_t != t {
+                changed_sst = true;
+            }
+            let pair = (new_s, new_t);
+            if !new_negs.contains(&pair) { new_negs.push(pair); }
+        }
+        new_negs.sort();
         self.sys.subterm_store.subterms = new_subs;
         self.sys.subterm_store.solved_subterms = new_solved;
+        self.sys.subterm_store.neg_subterms = new_negs;
         if changed_sst {
             self.sys.invalidate_max_var_idx_cache();
             self.changed = ChangeIndicator::Changed;
@@ -1878,7 +1896,15 @@ impl<'ctx> Reduction<'ctx> {
                         self.changed = ChangeIndicator::Changed;
                     }
                     AAtom::Subterm(s, b) => {
-                        // ¬(s ⊏ b) — record as a negative subterm.
+                        // ¬(s ⊏ b) — HS `insertFormula` "negative Subterm"
+                        // arm (Reduction.hs:567-570):
+                        //   markAsSolved
+                        //   insertNegSubterm (bTermToLTerm i) (bTermToLTerm j)
+                        // The formula is CONSUMED into the subterm store's
+                        // negSubterms — it never enters sFormulas, so the
+                        // atom-valuation pass can't collapse it to ⊥ and the
+                        // eventual contradiction is attributed to the store
+                        // ("contradictory subterm store"), exactly as HS.
                         // HS-faithful: only mark when called from top-level
                         // (`mark=True`), mirroring `markAsSolved = when mark
                         // ...` (Reduction.hs:585).
@@ -1890,17 +1916,14 @@ impl<'ctx> Reduction<'ctx> {
                             crate::elaborate::term_to_lnterm(s),
                             crate::elaborate::term_to_lnterm(b),
                         ) {
-                            // The subterm store doesn't yet expose a
-                            // negative-subterm list; for now just
-                            // record the original constraint so a
-                            // future simpSubterms pass can pick it up
-                            // and decide it.  TODO wire up negSubterms.
-                            let _ = (ts, tb);
-                        }
-                        // Fall through to push original to formulas as
-                        // a safety net so downstream contradictions can
-                        // see it.
-                        if !self.sys.formulas.contains(&g) {
+                            self.sys.invalidate_max_var_idx_cache();
+                            if self.sys.subterm_store.add_neg(ts, tb) {
+                                self.changed = ChangeIndicator::Changed;
+                            }
+                        } else if !self.sys.formulas.contains(&g) {
+                            // Defensive fallback for terms our LNTerm
+                            // conversion can't represent — keep visible
+                            // as a formula rather than dropping.
                             self.sys.invalidate_max_var_idx_cache();
                             self.sys.formulas.push(g);
                             self.changed = ChangeIndicator::Changed;
@@ -3448,6 +3471,12 @@ pub fn bounds_max_uncached(sys: &System) -> u64 {
     for c in &sys.subterm_store.solved_subterms {
         bm_term(&c.small, &mut max);
         bm_term(&c.big,   &mut max);
+    }
+    // HS `HasFrees SubtermStore` folds `negSt` too (and skips
+    // `oldNegSubterms` — SubtermStore.hs:546-548).
+    for (s, t) in &sys.subterm_store.neg_subterms {
+        bm_term(s, &mut max);
+        bm_term(t, &mut max);
     }
     for (g, _) in &sys.goals {
         use crate::constraint::constraints::Goal;

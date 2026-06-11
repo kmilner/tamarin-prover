@@ -82,9 +82,22 @@ pub fn pretty_closed_theory(
 ) -> String {
     let mut out = String::new();
 
-    // theory <name>\n\nbegin\n\n
+    // HS `prettyTheory` (TheoryObject.hs:741-756):
+    //   vsep [ kwTheoryName name
+    //        , ...configBlocks...  (filter isConfigBlock thyItems, before begin)
+    //        , kwTheoryBegin, ... ]
+    // ConfigBlocks: `prettyConfigBlock cb = text "configuration: " <> doubleQuotes (text cb)`
+    // RS stores the configuration string directly in `parsed.configuration`.
     out.push_str("theory ");
     out.push_str(&elaborated.name);
+    if let Some(cfg) = &parsed.configuration {
+        // HS: `text "configuration: " <> doubleQuotes (text cb)`
+        // = `configuration: "<cb>"`
+        // Emitted via vsep (blank-line separated from theory name and begin).
+        out.push_str("\n\nconfiguration: \"");
+        out.push_str(cfg);
+        out.push('"');
+    }
     out.push_str("\n\nbegin\n\n");
 
     // // Function signature and definition of the equational theory E\n\n
@@ -213,8 +226,12 @@ fn render_signature(sig: &tamarin_term::maude_sig::MaudeSig) -> String {
     if sig.enable_nat { builtins.push("natural-numbers"); }
     if sig.enable_xor { builtins.push("xor"); }
     if !builtins.is_empty() {
-        out.push_str("builtins: ");
-        out.push_str(&builtins.join(", "));
+        // HS renders builtins via the same `ppNonEmptyList'` as functions:
+        // `(keyword_ "builtins:" <->) . fsep . punctuate comma`
+        // (Term/Maude/Signature.hs:220,229-231) — so the list wraps through
+        // the HughesPJ engine, not a flat join.
+        let items: Vec<String> = builtins.iter().map(|s| s.to_string()).collect();
+        out.push_str(&wrap_with_lead("builtins:", &items));
         out.push('\n');
     }
 
@@ -336,11 +353,13 @@ fn render_parsed_item(
         IntrRule(_) => None,
         Lemma(l) => Some(render_parsed_lemma(l, proved)),
         Restriction(r) => Some(render_parsed_restriction(r)),
-        Predicates(_) | Macros(_) => {
-            // TODO: render predicates and macros (port HS prettyPredicate
-            // and prettyMacros).  Not exercised by the simple test
-            // theories yet — leave empty so output is well-formed.
+        Predicates(_) => {
+            // TODO: render predicates (port HS prettyPredicate).
             None
+        }
+        Macros(macros) => {
+            if macros.is_empty() { return None; }
+            Some(render_parsed_macros(macros))
         }
         FormalComment { header, body } => {
             // HS `prettyFormalComment` (lib/theory/src/Pretty.hs:19-21):
@@ -434,6 +453,81 @@ fn rewrite_arity1_fact(
         args: fa.args.iter().map(|a| rewrite_arity1_term(a, arity1)).collect(),
         annotations: fa.annotations.clone(),
     }
+}
+
+/// HS `prettyMacros` / `prettyMacro` (TheoryObject.hs:819-840).
+///
+/// HS: `prettyMacros m = keyword_ "macros:" $$ nest 4 (vcat [macros...])`
+/// HS: `prettyMacro (op, args, out) =
+///       vcat [ppNonEmptyList (\ds -> sep (map (nest 4) ds)) text [op++"("]
+///             <-> prettyVarList args <-> text ") = " <-> prettyTerm show out]`
+///
+/// `ppNonEmptyList hdr pp [x] = hdr [pp x] = sep [nest 4 (text x)]`
+/// = `nest 4 (text (name++"("))`.
+///
+/// With `keyword_ "macros:" $$ nest 4 (nest 4 "name(" <+> args <+> ") = " <+> body)`:
+/// the double-nest (8 total) combined with `keyword_`'s 7-char width makes
+/// `nil_above_nest` inline the content (k = -7+8 = 1 > 0), putting everything
+/// on ONE line: `macros: name( args ) =  body`.
+///
+/// For multiple macros, each is nested 4 levels inside the outer `nest 4`,
+/// giving 8-space indent on subsequent lines.
+/// HS `prettyMacros` / `prettyMacro` (TheoryObject.hs:819-840).
+///
+/// HS: `prettyMacros m = keyword_ "macros:" $$ nest 4 (vcat [macros...])`
+/// HS: `prettyMacro (op, args, out) =
+///       vcat [ppNonEmptyList (\ds -> sep (map (nest 4) ds)) text [op++"("]
+///             <-> prettyVarList args <-> text ") = " <-> prettyTerm show out]`
+///
+/// `ppNonEmptyList hdr pp [x] = hdr [pp x] = sep [nest 4 (text x)]`
+/// = `nest 4 (text (name++"("))`.
+///
+/// With `keyword_ "macros:" $$ nest 4 (nest 4 "name(" <+> args <+> ") = " <+> body)`:
+/// the double-nest (8 total) combined with `keyword_`'s 7-char width makes
+/// `nil_above_nest` inline the content (k = -7+8 = 1 > 0), putting everything
+/// on ONE line: `macros: name( args ) =  body`.
+///
+/// For multiple macros, each is nested 4 levels inside the outer `nest 4`,
+/// giving 8-space indent on subsequent lines.
+fn render_parsed_macros(macros: &[p::Macro]) -> String {
+    use crate::pretty_hpj::{self as hpj, Doc};
+
+    let last_idx = macros.len() - 1;
+    let macro_docs: Vec<Doc> = macros.iter().enumerate().map(|(i, m)| {
+        // HS: `ppNonEmptyList (\ds -> sep (map (nest 4) ds)) text [op++"("]`
+        // = `sep [nest 4 (text (op ++ "("))]` = `nest 4 (text (op ++ "("))`.
+        let name_open = Doc::text(format!("{}(", m.name)).nest(4);
+        // HS: `prettyVarList args = fsep . punctuate comma . map prettyLVar`
+        // For macro args (bare LVar names, sort-prefix from hint):
+        let args_parts: Vec<String> = m.args.iter().map(|v| {
+            let mut s = pf::sort_prefix_from_hint(v.sort).to_string();
+            s.push_str(&v.name);
+            if v.idx > 0 { s.push('.'); s.push_str(&v.idx.to_string()); }
+            s
+        }).collect();
+        let args_str = args_parts.join(", ");
+        // HS: `prettyTerm (text . show) body`
+        let body_str = pf::pretty_term(&m.body);
+        // Build: `nest 4 "name(" <+> args <+> ") = " <+> body`
+        // HS <-> = HughesPJ <+> (beside with space = beside_sp).
+        let mut doc = name_open;
+        if !m.args.is_empty() {
+            doc = doc.beside_sp(Doc::text(args_str));
+        }
+        doc = doc.beside_sp(Doc::text(") = "));
+        doc = doc.beside_sp(Doc::text(body_str));
+        // HS: last macro has no trailing comma
+        if i < last_idx {
+            doc.beside(Doc::text(","))
+        } else {
+            doc
+        }
+    }).collect();
+
+    // HS: `keyword_ "macros:" $$ nest 4 (vcat macro_docs)`
+    let body = hpj::vcat(macro_docs).nest(4);
+    let header = Doc::text("macros:");
+    header.above(body).render()
 }
 
 fn render_rule(parsed_rule: &p::Rule, elab: &Theory) -> String {
@@ -1440,7 +1534,13 @@ fn render_parsed_lemma(lem: &p::Lemma, proved: &[ProvedLemma]) -> String {
     // continuation indents are byte-identical to HS.  The `nest 2` indent
     // is included in the rendered output (HS renders it at theory col 0).
     let quant = quantifier_keyword(&lem.trace_quantifier);
-    out.push_str(&pf::lemma_header_line(quant, &lem.formula));
+    // HS sorts AC arguments at parse time when building `LNTerm` via `fAppAC`
+    // (Term/Term/Raw.hs:118-122); our parser keeps `BinOp` trees in written
+    // order, so re-establish the canonical AC operand order on the formula
+    // before rendering the header (matches the guarded-block path which
+    // already canonicalises via guarded.rs:684).
+    let canon_formula = crate::elaborate::canonicalize_ac_in_formula(&lem.formula);
+    out.push_str(&pf::lemma_header_line(quant, &canon_formula));
     out.push('\n');
 
     // /* guarded formula characterizing ... */
