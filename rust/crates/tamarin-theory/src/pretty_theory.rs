@@ -358,7 +358,7 @@ fn render_parsed_item(
             // These are absorbed into the signature/configuration headers.
             None
         }
-        Rule(r) => Some(render_rule(r, elab)),
+        Rule(r) => Some(render_rule(r, elab, &macros)),
         IntrRule(_) => None,
         Lemma(l) => Some(render_parsed_lemma(l, &macros, proved)),
         Restriction(r) => Some(render_parsed_restriction(r, &macros)),
@@ -539,7 +539,7 @@ fn render_parsed_macros(macros: &[p::Macro]) -> String {
     header.above(body).render()
 }
 
-fn render_rule(parsed_rule: &p::Rule, elab: &Theory) -> String {
+fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro]) -> String {
     let name = &parsed_rule.name;
     let mut out = String::new();
     out.push_str("rule (modulo E) ");
@@ -598,24 +598,54 @@ fn render_rule(parsed_rule: &p::Rule, elab: &Theory) -> String {
     // differ, even a rule with no AC variants must show the AC comment block
     // containing the expanded form.
     let elab_rule = elab.rules().find(|r| r.name() == name);
-    // Rendered text of the display body (macro form) — already computed
-    // above from `premises`/`actions`/`conclusions`.  We compare against
-    // the elaborated rule's body text to detect macro-expansion differences.
-    let display_body_text = render_rule_body(&premises, &actions, &conclusions);
     let trivial = elab_rule
         .map(|r| {
             let no_residual_substs = r.variant_substs.iter().all(|s| s.is_empty());
+            // HS `isTrivialProtoVariantAC` (Rule.hs:761-764):
+            //   variants == [emptySubstVFresh] && ps == ps' && as == as' && cs == cs' && nvs == nvs'
+            //
+            // In HS, `cprRuleE` (E-rule) and `cprRuleAC` (AC-rule) live in
+            // the SAME term universe — AC smart-constructors normalise at
+            // construction time everywhere, so the only difference between
+            // them arises from (a) genuine non-trivial AC variants or (b)
+            // macro expansion changing terms.
+            //
+            // In RS: `abstracted_rule = Some(ac)` iff Maude found a
+            // non-trivial abstraction (reducible sub-terms, yielding a
+            // different AC form) — compare the E-rule against the abstracted
+            // AC form via `same_rule_body`.
+            // `abstracted_rule = None` means `abstract_rule_and_variants`
+            // returned `Ok(None)` (common_subst empty AND no residual
+            // substs) — i.e., the AC form IS the E form.  The only remaining
+            // source of divergence is macro expansion: if the display body
+            // (`premises`/`actions`/`conclusions`, from `parsed_rule` before
+            // macro expansion) contains macro calls, it differs from the
+            // elaborated form and HS's `ps != ps'` would fire.  Detect this
+            // by applying macros to the display facts and checking whether
+            // any term changed (HS `applyMacroInRule` / Rule.hs:98).
+            //
+            // Crucially: do NOT compare rendered text across AST↔LN spaces —
+            // AC ordering and nat-constant representation differ between the
+            // parsed form and `lnfacts_to_parser(r.rule.*)`, producing false
+            // negatives for plain rules like those in ParserTests.spthy.
             let ac_body_matches = match &r.abstracted_rule {
                 None => {
-                    // No AC abstraction — but the display body (macro form)
-                    // might still differ from the elaborated body (expanded
-                    // form).  Mirror HS `ps == ps'` check: compare rendered
-                    // body text so that macro ≠ expansion → not trivial.
-                    let ep = lnfacts_to_parser(&r.rule.premises);
-                    let ea = lnfacts_to_parser(&r.rule.actions);
-                    let ec = lnfacts_to_parser(&r.rule.conclusions);
-                    let elab_body_text = render_rule_body(&ep, &ea, &ec);
-                    display_body_text == elab_body_text
+                    // Trivial unless macros fired on this rule's display body.
+                    // Apply macros to the display facts; if unchanged, the
+                    // rule has no macro calls → display == elaborated → trivial.
+                    let macro_prems: Vec<p::Fact> = premises.iter()
+                        .map(|f| crate::macro_expand::apply_macros_fact(macros, f))
+                        .collect();
+                    let macro_acts: Vec<p::Fact> = actions.iter()
+                        .map(|f| crate::macro_expand::apply_macros_fact(macros, f))
+                        .collect();
+                    let macro_concs: Vec<p::Fact> = conclusions.iter()
+                        .map(|f| crate::macro_expand::apply_macros_fact(macros, f))
+                        .collect();
+                    // Same iff no macro call in this rule's terms changed anything.
+                    macro_prems == premises
+                        && macro_acts == actions
+                        && macro_concs == conclusions
                 }
                 Some(ac) => same_rule_body(&r.rule, ac),
             };
