@@ -568,28 +568,23 @@ fn pp_binop(
     pp_formula_opparens(r, scope, state, out);
 }
 
-/// HS `opParens`: wraps the inner doc in parens iff non-atomic.  Our
-/// atomicity check is structural: True/False/Pred-only atoms are
-/// atomic, everything else is non-atomic.
+/// HS `opParens`: unconditional paren wrap.
+/// HS Highlight.hs:58-59: `opParens d = operator_ "(" <> d <> operator_ ")"`
+/// — wraps everything, including `True`/`False` atoms.
 fn pp_formula_opparens(
     f: &p::Formula,
     scope: &[Bind],
     state: &mut PreciseFreshState,
     out: &mut String,
 ) {
-    if is_atomic_formula(f) {
-        pp_formula(f, FormCtx::Top, scope, state, out);
-    } else {
-        out.push('(');
-        pp_formula(f, FormCtx::Top, scope, state, out);
-        out.push(')');
-    }
+    out.push('(');
+    pp_formula(f, FormCtx::Top, scope, state, out);
+    out.push(')');
 }
 
 fn is_atomic_formula(f: &p::Formula) -> bool {
     use p::Formula::*;
     match f {
-        True | False => true,
         Atom(p::Atom::Pred(_)) => true,
         _ => false,
     }
@@ -669,22 +664,14 @@ fn formula_to_doc(
 }
 
 /// HS opParens (unconditional `(` / `)` wrap).
+/// HS Highlight.hs:58-59: `opParens d = operator_ "(" <> d <> operator_ ")"`
+/// — wraps everything unconditionally, including `True`/`False` atoms.
 fn formula_to_doc_opparens(
     f: &p::Formula,
     scope: &[Bind],
     state: &mut PreciseFreshState,
 ) -> crate::pretty_hpj::Doc {
-    // HS `opParens` always wraps in parens.  Our `is_atomic_formula`
-    // (`True/False/Pred`) short-circuits to no parens — but HS opParens
-    // wraps everything: `opParens d = "(" <> d <> ")"`.
-    // Keep RS's atomicity heuristic for True/False/Pred (it has no
-    // visible effect on the wireguard case) — preserves byte-identical
-    // output with the legacy path.
-    if is_atomic_formula(f) {
-        formula_to_doc(f, scope, state)
-    } else {
-        doc_op_parens(formula_to_doc(f, scope, state))
-    }
+    doc_op_parens(formula_to_doc(f, scope, state))
 }
 
 fn binop_to_doc(
