@@ -1702,8 +1702,16 @@ fn pp_proof(
             out.push_str(&step);
         }
         (_, []) => {
-            // No children: `by <step>` form.
+            // No children: `by <step>` form.  HS `ppCases ps [] =
+            // prettyCase ps (kwBy <> text " ") <> prettyStep ps` (Proof.hs:
+            // 1085-1086) — `<>` is beside, so the `prettyStep` Doc is laid
+            // out BESIDE `by ` and HughesPJ's beside column-shift indents
+            // the step's wrapped continuation lines by the width of `by `
+            // (3 chars).  Render the step at col `depth*2 + 3` so wrapped
+            // `solve(...)` continuation lines align under the post-`by `
+            // column, not the bare proof-tree indent.
             out.push_str("by ");
+            let step = pp_step_at(&node.method, depth * 2 + 3);
             out.push_str(&step);
         }
         (_, [(label, child)]) if label.is_empty() => {
@@ -1780,11 +1788,15 @@ fn pp_step_at(m: &crate::constraint::solver::proof_method::ProofMethod, indent: 
                     return pf::solve_disj_goal_line(&d.0, indent);
                 }
             }
-            // Other goal shapes keep the existing nestShort'-based path.
-            // `<->` is hsep-with-space → `solve( <goal> )` (one space after
-            // `(` and before `)`).  The goal lands at col `indent + 7`.
-            let goal_str = render_goal_at_trailing(g, indent + 7, indent, /*trailing_chars=*/2);
-            format!("solve( {} )", goal_str)
+            // ActionG/ChainG/PremiseG/SplitG/SubtermG: route the whole
+            // `solve( <goal> )` line through the same HS-faithful Doc engine
+            // as DisjG (4a6b6d5a) so `prettyLNFact`'s `nestShort'` wrapping
+            // (Fact.hs:539-544) and the `<+>` beside column-shift indent the
+            // goal's continuation lines to the column after `solve( `
+            // (= indent+7), byte-identical to HS.  HS `prettyGoal`
+            // (Constraints.hs:273-287).
+            let goal_doc = solve_goal_to_doc(g);
+            pf::solve_goal_line_from_doc(goal_doc, indent)
         }
         PM::Invalidated => {
             // HS `prettyProofMethod` (ProofMethod.hs):
@@ -1900,13 +1912,67 @@ fn render_lnfact_at_with_trailing(fa: &crate::fact::LNFact, indent: usize, line_
         return format!("{}{}( )", prefix, name);
     }
     // Convert to parser-AST and reuse the wrap-aware fact renderer.
-    let pfa = p::Fact {
-        persistent: prefix == "!",
-        name: name.to_string(),
-        args: fa.terms.iter().map(lnterm_to_parser).collect(),
-        annotations: Vec::new(),
-    };
+    let pfa = lnfact_to_parser(fa);
     render_fact_at_with_trailing(&pfa, indent, line_start, trailing_chars)
+}
+
+/// Build a `pretty_hpj::Doc` for a non-DisjG `Goal`, mirroring HS
+/// `prettyGoal` (Constraints.hs:273-287).  `<->` = `<+>` (beside-with-
+/// space).  Facts go through `prettyLNFact`'s `nestShort'` wrapping (via
+/// `pf::fact_doc`); terms through `prettyLNTerm` (via `pf::term_doc`);
+/// node-ids / node-conc / node-prem are atomic strings (HS `prettyNodeId`
+/// is `text . show`).  The DisjG case is handled by `solve_disj_goal_line`
+/// upstream and never reaches here.
+fn solve_goal_to_doc(
+    g: &crate::constraint::constraints::Goal,
+) -> crate::pretty_hpj::Doc {
+    use crate::constraint::constraints::Goal;
+    use crate::rule::PremIdx;
+    use crate::pretty_hpj::Doc;
+    match g {
+        // `prettyGoal (ActionG i fa) = prettyNAtom (Action (varTerm i) fa)`
+        // = `prettyFact fa <-> opAction <-> text (show i)` (Atom.hs:216-217),
+        // `opAction = "@"` (Pretty.hs:170).
+        Goal::Action(i, fa) => {
+            let nid = render_node_id(i);
+            pf::fact_doc(&lnfact_to_parser(fa))
+                .beside_sp(Doc::text("@"))
+                .beside_sp(Doc::text(nid))
+        }
+        // `prettyGoal (ChainG c p) =
+        //    prettyNodeConc c <-> operator_ "~~>" <-> prettyNodePrem p`.
+        Goal::Chain(c, p) => {
+            Doc::text(render_node_conc(c))
+                .beside_sp(Doc::text("~~>"))
+                .beside_sp(Doc::text(render_node_prem(p)))
+        }
+        // `prettyGoal (PremiseG (i, PremIdx v) fa) =
+        //    prettyLNFact fa <-> text ("▶" ++ subscript (show v)) <-> prettyNodeId i`.
+        Goal::Premise((i, PremIdx(v)), fa) => {
+            let sub = goal_subscript(*v);
+            let nid = render_node_id(i);
+            pf::fact_doc(&lnfact_to_parser(fa))
+                .beside_sp(Doc::text(format!("\u{25B6}{}", sub)))
+                .beside_sp(Doc::text(nid))
+        }
+        // `prettyGoal (SplitG x) = text "splitEqs" <> parens (text (show ...))`
+        // `<>` = no space → `splitEqs(N)`.
+        Goal::Split(id) => Doc::text(format!("splitEqs({})", id.0)),
+        // `prettyGoal (DisjG (Disj [])) = text "Disj" <-> operator_ "(⊥)"`.
+        Goal::Disj(d) if d.0.is_empty() => {
+            Doc::text("Disj").beside_sp(Doc::text("(\u{22A5})"))
+        }
+        // Non-empty DisjG is routed via `solve_disj_goal_line` upstream;
+        // fall back to the Doc form for safety.
+        Goal::Disj(d) => pf::disj_goal_to_doc(&d.0),
+        // `prettyGoal (SubtermG (l,r)) =
+        //    prettyLNTerm l <-> operator_ "⊏" <-> prettyLNTerm r`.
+        Goal::Subterm((l, r)) => {
+            pf::term_doc(&lnterm_to_parser(l))
+                .beside_sp(Doc::text("\u{228F}"))
+                .beside_sp(pf::term_doc(&lnterm_to_parser(r)))
+        }
+    }
 }
 
 /// Render a `NodeId` (`LVar` of Node sort).  HS `prettyNodeId`

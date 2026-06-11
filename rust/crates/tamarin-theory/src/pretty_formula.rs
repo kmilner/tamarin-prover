@@ -221,6 +221,36 @@ pub fn solve_disj_goal_line(gfs: &[Guarded], indent: usize) -> String {
     rendered[strip..].to_string()
 }
 
+/// Build the `solve( <goal> )` line for a NON-DisjG goal, where the
+/// caller has already constructed `goal_doc` for the goal body (HS
+/// `prettyGoal`, Constraints.hs:273-287).  Mirrors HS
+///   `SolveGoal goal -> keyword_ "solve(" <-> prettyGoal goal <-> keyword_ ")"`
+/// (ProofMethod.hs:1494), `<->` = `<+>` (beside-with-space).  The whole
+/// line is ONE `Doc` so HughesPJ's beside column-shift indents the goal's
+/// wrapped continuation lines to the column after `solve( ` (= indent+7),
+/// byte-identical to HS.  Same wrapping plumbing as `solve_disj_goal_line`.
+pub fn solve_goal_line_from_doc(goal_doc: crate::pretty_hpj::Doc, indent: usize) -> String {
+    use crate::pretty_hpj::Doc;
+    let line = Doc::text("solve(")
+        .beside_sp(goal_doc)
+        .beside_sp(Doc::text(")"));
+    let indented = line.nest(indent as isize);
+    let rendered = indented.render();
+    let strip = rendered.chars().take(indent).take_while(|c| *c == ' ').count();
+    rendered[strip..].to_string()
+}
+
+/// Public accessor for the Doc-based fact renderer (HS `prettyLNFact` /
+/// `prettyFact`), for use building goal Docs in pretty_theory.rs.
+pub fn fact_doc(fa: &p::Fact) -> crate::pretty_hpj::Doc {
+    fact_to_doc(fa, &[])
+}
+
+/// Public accessor for the Doc-based term renderer (HS `prettyLNTerm`).
+pub fn term_doc(t: &p::Term) -> crate::pretty_hpj::Doc {
+    term_to_doc(t, &[])
+}
+
 /// Pretty-print an atom standalone (e.g. inside a goal label).
 pub fn pretty_atom(a: &p::Atom) -> String {
     let mut s = String::new();
