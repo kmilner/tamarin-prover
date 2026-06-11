@@ -126,6 +126,7 @@ impl ProofState {
                 sys,
                 children: BTreeMap::new(),
                 status: NodeStatus::Open,
+                annotated: true,
             };
             by_lemma.insert(lname, LemmaProofState { root });
         }
@@ -184,6 +185,7 @@ impl ProofState {
                     sys,
                     children: BTreeMap::new(),
                     status,
+                    annotated: true,
                 };
                 node.children.insert(name, child);
             }
@@ -750,6 +752,7 @@ end
             sys: tamarin_theory::constraint::system::System::empty(),
             children: BTreeMap::new(),
             status: NodeStatus::Open,
+            annotated: true,
         };
         let html = render_proof_tree_html(1, "L", &root);
         assert!(html.contains("Proof of"));

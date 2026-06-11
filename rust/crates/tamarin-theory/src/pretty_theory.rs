@@ -1570,7 +1570,7 @@ fn no_existential(g: &crate::guarded::Guarded) -> bool {
 // LNTerm rendering (for equations)
 // =============================================================================
 
-fn render_lnterm(t: &tamarin_term::lterm::LNTerm) -> String {
+pub(crate) fn render_lnterm(t: &tamarin_term::lterm::LNTerm) -> String {
     use tamarin_term::function_symbols::{AcSym, FunSym};
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
@@ -1703,6 +1703,15 @@ fn pp_proof(
     use crate::constraint::solver::proof_method::{ProofMethod, Result as MR};
     // The step's first char lands at col `depth*2` (proof body uses
     // 2-space indent per nesting level).
+    //
+    // HS `prettyIncrementalProof` (ProofSkeleton.hs:80-84) renders each
+    // step as `sep [prettyProofMethod, if Nothing then "/* unannotated
+    // */" else empty]`.  A step whose constraint system could not be
+    // re-attached during the close-time `checkProof` replay
+    // (`annotated == false`) gets the `/* unannotated */` comment beside
+    // its method.  Fully-searched / successfully-replayed steps stay
+    // `Just System` (annotated == true) and render without it.
+    let unann = if node.annotated { "" } else { " /* unannotated */" };
     let step = pp_step_at(&node.method, depth * 2);
     let cases: Vec<(&String, &crate::constraint::solver::search::ProofNode)> =
         node.children.iter().collect();
@@ -1710,6 +1719,7 @@ fn pp_proof(
     match (&node.method, cases.as_slice()) {
         (ProofMethod::Finished(MR::Solved), []) => {
             out.push_str(&step);
+            out.push_str(unann);
         }
         (_, []) => {
             // No children: `by <step>` form.  HS `ppCases ps [] =
@@ -1723,14 +1733,17 @@ fn pp_proof(
             out.push_str("by ");
             let step = pp_step_at(&node.method, depth * 2 + 3);
             out.push_str(&step);
+            out.push_str(unann);
         }
         (_, [(label, child)]) if label.is_empty() => {
             out.push_str(&step);
+            out.push_str(unann);
             out.push('\n');
             pp_proof(child, out, depth);
         }
         (_, multi) => {
             out.push_str(&step);
+            out.push_str(unann);
             for (i, (name, child)) in multi.iter().enumerate() {
                 if i > 0 {
                     // HS Proof.hs:1089: `intersperse (prettyCase ps kwNext)`

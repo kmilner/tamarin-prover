@@ -161,6 +161,31 @@ pub fn prove_lemma_in_session(
     lemma_name: &str,
     max_steps: usize,
 ) -> Result<ProofNode, ProveError> {
+    prove_lemma_in_session_mode(session, lemma_name, max_steps, true)
+}
+
+/// Replay a non-target lemma's stored skeleton WITHOUT auto-proving its
+/// open leaves — HS's close-time `checkAndExtendProver (sorryProver
+/// Nothing)` (Prover.hs:174-185).  Used for lemmas the `--prove`
+/// selector does not target: HS retains their close-time-replayed proof
+/// verbatim (Prover.hs:273-275) and reports the stored status.  Returns
+/// the lemma's own start system + a `Sorry` placeholder when no stored
+/// skeleton exists (HS keeps the parsed `unproven ()` skeleton, which is
+/// a single `sorry`).
+pub fn check_and_extend_lemma_in_session(
+    session: &ProverSession,
+    lemma_name: &str,
+    max_steps: usize,
+) -> Result<ProofNode, ProveError> {
+    prove_lemma_in_session_mode(session, lemma_name, max_steps, false)
+}
+
+fn prove_lemma_in_session_mode(
+    session: &ProverSession,
+    lemma_name: &str,
+    max_steps: usize,
+    auto_prove: bool,
+) -> Result<ProofNode, ProveError> {
     let trace = std::env::var("TAM_DBG_PHASE").is_ok();
     let t_phase: Option<std::time::Instant> =
         if trace { Some(std::time::Instant::now()) } else { None };
@@ -283,8 +308,20 @@ pub fn prove_lemma_in_session(
     let replay_disabled = std::env::var("TAM_RS_DISABLE_SKELETON_REPLAY").is_ok();
     if !replay_disabled {
         if let Some(tree) = lemma.proof.tree.clone() {
-            return Ok(crate::replay::replace_sorry_prove(&ctx, sys, &tree, max_steps));
+            if auto_prove {
+                return Ok(crate::replay::replace_sorry_prove(&ctx, sys, &tree, max_steps));
+            } else {
+                // Non-target lemma: HS close-time check-and-extend
+                // replay, no auto-proving of open leaves.
+                return Ok(crate::replay::check_and_extend(&ctx, sys, &tree, max_steps));
+            }
         }
+    }
+    if !auto_prove {
+        // Non-target lemma with no stored skeleton: HS keeps the parsed
+        // `unproven ()` single-`sorry` proof (ProofSkeleton.hs:61) — an
+        // unannotated Sorry at the lemma's start system.
+        return Ok(crate::replay::unannotated_sorry_root(sys));
     }
     let t_search: Option<std::time::Instant> =
         if trace { Some(std::time::Instant::now()) } else { None };
