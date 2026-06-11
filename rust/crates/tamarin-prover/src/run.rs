@@ -1314,7 +1314,16 @@ fn print_overall_summary(file_results: &[FileResult], prove_mode: bool) {
             if prove_mode {
                 println!("           The analysis results might be wrong!");
             }
-            println!("  ");
+            // HS `summary = ppWf report $--$ prettyClosedSummary` (Batch.hs:228-229):
+            // `$--$` (above with a blank-line gap) inserts the blank ONLY when
+            // both operands are non-empty.  Under the enclosing `nest 2` a
+            // blank `Pretty.text ""` renders as `"  "`.  So this separator
+            // appears between the warning block and the per-lemma summary
+            // lines ONLY when there are summary lines to follow; emitting it
+            // unconditionally added a spurious trailing `"  "` line.
+            if !fr.results.is_empty() {
+                println!("  ");
+            }
         }
         for r in &fr.results {
             println!("  {}", format_lemma_summary_line(r));

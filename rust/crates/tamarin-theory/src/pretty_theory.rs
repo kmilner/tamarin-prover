@@ -280,15 +280,17 @@ fn render_fun_syms(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<String> {
 /// RHS term (after reading positions/term out of `StRhs`).  HS renders
 /// `lhs = rhs`, sorted by some key (we use the `BTreeSet`'s natural
 /// order which mirrors HS's `S.toList`).
-fn render_equations(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<String> {
-    let mut items: Vec<String> = Vec::new();
+fn render_equations(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<(String, String)> {
+    let mut items: Vec<(String, String)> = Vec::new();
     for r in &sig.st_rules {
         let lhs = render_lnterm(&r.lhs);
         let rhs = render_lnterm(&r.rhs.term);
-        items.push(format!("{} = {}", lhs, rhs));
+        items.push((lhs, rhs));
     }
-    // Sort by LHS string for stable HS-like ordering.
-    items.sort();
+    // Sort by `lhs = rhs` string for stable HS-like ordering.
+    items.sort_by(|a, b| {
+        format!("{} = {}", a.0, a.1).cmp(&format!("{} = {}", b.0, b.1))
+    });
     items
 }
 
@@ -306,30 +308,37 @@ fn wrap_with_lead(lead: &str, items: &[String]) -> String {
     Doc::text(lead).beside_sp(body).render()
 }
 
-/// `sep`-style layout matching HS's `sep [hdr, nest 2 (punctuate comma ds)]`:
-/// try a single line `<lead> a, b, c`; if it overflows the 76-col
-/// default-style width, fall back to a vertical layout
-/// `<lead>\n    a,\n    b,\n    ...,\n    z`.
-fn sep_block_with_lead(lead: &str, items: &[String]) -> String {
+/// HS `equations:` layout (Term/Maude/Signature.hs:224-225):
+///   `P.sep ( keyword_ "equations:" : map (P.nest 2) ds )`
+/// where `ds = P.punctuate P.comma (map prettyCtxtStRule rules)` — i.e. the
+/// comma is appended to the END of each equation doc (all but the last), and
+/// each resulting doc is `nest 2`'d, then `sep`-joined.
+///
+/// Each equation doc is itself (SubtermRule.hs:121-123):
+///   `prettyCtxtStRule r = sep [ nest 2 (prettyLNTerm lhs)
+///                             , operator_ "=" <-> prettyLNTerm rhs ]`
+/// — so the LHS carries an *inner* `nest 2`.  When the outer `sep` breaks and
+/// lays each equation on its own line at indent 2, the inner `nest 2` adds a
+/// further 2, yielding the 4-space indent HS emits.  Reproducing that requires
+/// the structured doc, not a pre-joined `lhs = rhs` string.  Route through the
+/// ported HughesPJ engine so the break decision and indentation are HS-exact.
+fn sep_block_with_lead(lead: &str, items: &[(String, String)]) -> String {
+    use crate::pretty_hpj::{self as hpj, Doc};
     if items.is_empty() { return String::new(); }
-    const WIDTH: usize = 76;
-    let joined = items.join(", ");
-    let single = format!("{} {}", lead, joined);
-    if single.chars().count() <= WIDTH {
-        return single;
-    }
-    let mut out = String::new();
-    out.push_str(lead);
-    let indent = "    ";
-    for (i, it) in items.iter().enumerate() {
-        out.push('\n');
-        out.push_str(indent);
-        out.push_str(it);
-        if i + 1 < items.len() {
-            out.push(',');
+    let n = items.len();
+    let mut docs: Vec<Doc> = Vec::with_capacity(n + 1);
+    docs.push(Doc::text(lead));
+    for (i, (lhs, rhs)) in items.iter().enumerate() {
+        // prettyCtxtStRule: sep [ nest 2 lhs, "=" <-> rhs ]
+        let lhs_doc = Doc::text(lhs).nest(2);
+        let eq_doc = Doc::text("=").beside_sp(Doc::text(rhs));
+        let mut d = hpj::sep(vec![lhs_doc, eq_doc]);
+        if i + 1 < n {
+            d = d.beside(Doc::char(','));
         }
+        docs.push(d.nest(2));
     }
-    out
+    hpj::sep(docs).render()
 }
 
 // =============================================================================

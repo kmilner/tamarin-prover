@@ -1298,7 +1298,13 @@ fn pp_term(t: &p::Term, scope: &[Bind], out: &mut String) {
             out.push('\'');
         }
         Number(n) => out.push_str(&n.to_string()),
-        NumberOne => out.push('1'),
+        // HS `fAppOne = fAppNoEq oneSym []` (Term/Term.hs:127), and
+        // `prettyTerm` has NO special case for `oneSym` (Term/Term.hs:266-280)
+        // — a nullary `NoEq` symbol falls through to `text (BC.unpack f)`,
+        // i.e. its symbol string `"one"` (FunctionSymbols.hs:134,163).  The
+        // `1` keyword is only a *parser* spelling for this constant; HS always
+        // renders it back as `one`.
+        NumberOne => out.push_str("one"),
         NatOne => out.push_str("%1"),
         DhNeutral => out.push_str("1:msg"),
         Pair(items) => {
@@ -1935,7 +1941,9 @@ fn pp_gterm(t: &crate::guarded::GTerm, scope: &[Vec<Bind>], out: &mut String) {
         GTerm::FreshLit(s) => { out.push_str("~'"); out.push_str(s); out.push('\''); }
         GTerm::NatLit(s) => { out.push_str("%'"); out.push_str(s); out.push('\''); }
         GTerm::Number(n) => { out.push_str(&n.to_string()); }
-        GTerm::NumberOne => out.push('1'),
+        // HS `oneSym` renders as its symbol string `"one"` — see note in
+        // `pp_term` (no `prettyTerm` special case; Term/Term.hs:266-280).
+        GTerm::NumberOne => out.push_str("one"),
         GTerm::NatOne => out.push_str("%1"),
         GTerm::DhNeutral => out.push('1'),
         GTerm::App(name, args) => {
