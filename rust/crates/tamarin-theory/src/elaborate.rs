@@ -1149,6 +1149,14 @@ pub fn lnterm_to_term(t: &tamarin_term::lterm::LNTerm) -> p::Term {
 /// LNTerm-side is already canonical; this fixes the parser-AST side
 /// for downstream consumers (rule body pretty-printing,
 /// guardedness checks, etc.) that operate on parser-AST directly.
+///
+/// Also canonicalises `C`-symbol applications: `em(a, b)` is
+/// commutative (not associative), so HS's `fAppC EMap [a, b]` sorts the
+/// two arguments (Raw.hs:132-133).  Mirror that here so the parser-AST
+/// display path matches HS — `em` args from let-block desugaring may
+/// arrive in source order, which can differ from canonical order.
+/// HS site: `Theory/Text/Parser/Term.hs:92` / `Term/Term/Raw.hs:132-133`:
+///   `fAppC nacsym as = FAPP (C nacsym) (sort as)`
 pub fn canonicalize_ac_in_pterm(t: &p::Term) -> p::Term {
     use p::BinOp;
     fn is_ac(op: BinOp) -> bool {
@@ -1175,6 +1183,18 @@ pub fn canonicalize_ac_in_pterm(t: &p::Term) -> p::Term {
         p::Term::Var(_) | p::Term::PubLit(_) | p::Term::FreshLit(_)
         | p::Term::NatLit(_) | p::Term::Number(_) | p::Term::NumberOne
         | p::Term::NatOne | p::Term::DhNeutral => t.clone(),
+        // `em(a, b)` — commutative C-symbol: sort the two args to match
+        // HS `fAppC EMap [a,b] = FAPP (C EMap) (sort [a,b])` (Raw.hs:132-133).
+        p::Term::App(n, args) if n == "em" && args.len() == 2 => {
+            let a2 = canonicalize_ac_in_pterm(&args[0]);
+            let b2 = canonicalize_ac_in_pterm(&args[1]);
+            let (first, second) = if cmp_pterm(&a2, &b2) != std::cmp::Ordering::Greater {
+                (a2, b2)
+            } else {
+                (b2, a2)
+            };
+            p::Term::App(n.clone(), vec![first, second])
+        }
         p::Term::App(n, args) =>
             p::Term::App(n.clone(), args.iter().map(canonicalize_ac_in_pterm).collect()),
         p::Term::AlgApp(n, a, b) =>
