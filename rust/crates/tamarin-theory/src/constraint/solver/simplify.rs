@@ -4109,8 +4109,32 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                     // writes the `i := j` substitution into the eq-store,
                     // and the NEXT simplify iteration's `substSystem`
                     // performs the node merge + shape-mismatch contradiction.
-                    MonotonicBehaviour::StrictlyIncreasing if s == t => {
-                        if ii != jj {
+                    // HS-faithful StrictlyIncreasing arm (Simplify.hs:746-
+                    // 751).  HS does NOT gate on `s == t` vs `s /= t`: the
+                    // whole arm runs and EACH of cases (2),(4),(3),(5) is
+                    // a separate list-comprehension with its OWN guard, so
+                    // several can fire together.  In particular, when the
+                    // value at a strictly-increasing position has been
+                    // equated (`s == t`), case (2) emits `i = j` AND case
+                    // (5) STILL fires whenever a stale `s ≠ t` inequality
+                    // is present (`triviallyNotSmaller s t` holds for
+                    // `s == t`, and `ineq s t` holds because the negated
+                    // equality survives in the formula set) — emitting the
+                    // strict ordering `(j, i)`.  The NEXT iteration's
+                    // `substSystem` applies the `j := i` merge to that
+                    // `(j, i)` (and the symmetric `(i, j)` from the (j,i)
+                    // pair) less-atom, collapsing it to the `(#i,#i)`
+                    // self-loop that `contradictions` reads as `cyclic`.
+                    //
+                    // RS previously split this arm into `if s == t` (only
+                    // case 2) and `if s != t` (cases 4,3,5), so case (5)
+                    // never fired once the value equality landed — the
+                    // strict atom was lost and the merge produced no self-
+                    // loop, mislabelling the leaf `from formulas` instead
+                    // of `cyclic` (counter.spthy::counters_linear_order).
+                    MonotonicBehaviour::StrictlyIncreasing => {
+                        // case (2) (Simplify.hs:747): [EqE i j | s == t]
+                        if s == t && ii != jj {
                             let i_g = crate::guarded::term_to_gterm_free(
                                 &crate::elaborate::lnterm_to_term(
                                     &node_id_to_lnterm(ii)));
@@ -4120,12 +4144,8 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                             new_formulas.push(crate::guarded::Guarded::Atom(
                                 crate::guarded::GAtom::Eq(i_g, j_g)));
                         }
-                    }
-                    // HS-faithful case (4) (Simplify.hs:655): for a
-                    // StrictlyIncreasing position where the two nodes
-                    // are order-comparable, the value at that position
-                    // must differ — emit `s ≠ t`.
-                    MonotonicBehaviour::StrictlyIncreasing if s != t => {
+                        // case (4) (Simplify.hs:748): [¬EqE s t |
+                        //   alwaysBefore i j || alwaysBefore j i, notIneq s t]
                         let comparable = red.sys.always_before(ii, jj)
                                       || red.sys.always_before(jj, ii);
                         let already_ineq = inequalities.contains(&(s.clone(), t.clone()))
@@ -4141,13 +4161,13 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                             );
                             new_formulas.push(neg);
                         }
-                        // HS-faithful case (3) (Simplify.hs:657):
-                        //   triviallySmaller s t && !alwaysBefore i j → emit i<j.
-                        // HS-faithful case (5) (Simplify.hs:658):
-                        //   triviallyNotSmaller s t && !alwaysBefore j i && ineq s t → emit j<i.
+                        // case (3) (Simplify.hs:750): [(i,j) |
+                        //   triviallySmaller s t, not alwaysBefore i j]
                         if trivially_smaller(s, t) && !red.sys.always_before(ii, jj) {
                             new_lesses.push((ii.clone(), jj.clone()));
                         }
+                        // case (5) (Simplify.hs:751): [(j,i) |
+                        //   triviallyNotSmaller s t, not alwaysBefore j i, ineq s t]
                         if trivially_not_smaller(s, t)
                             && !red.sys.always_before(jj, ii)
                             && (inequalities.contains(&(s.clone(), t.clone()))
@@ -4155,10 +4175,12 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                             new_lesses.push((jj.clone(), ii.clone()));
                         }
                     }
-                    // HS-faithful Increasing (Simplify.hs:659):
-                    //   delegates to StrictlyIncreasing for less-atoms
-                    //   only (no new formulas at this position).
-                    MonotonicBehaviour::Increasing if s != t => {
+                    // HS-faithful Increasing (Simplify.hs:752-754):
+                    //   `Increasing -> ([], snd $ simpSingle (StrictlyIncreasing,
+                    //    (i,s),(j,t)))` — no new formulas, but the SAME
+                    //   less-atom cases (3) and (5) as StrictlyIncreasing,
+                    //   again NOT gated on `s == t`.
+                    MonotonicBehaviour::Increasing => {
                         if trivially_smaller(s, t) && !red.sys.always_before(ii, jj) {
                             new_lesses.push((ii.clone(), jj.clone()));
                         }
