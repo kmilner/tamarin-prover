@@ -1556,16 +1556,29 @@ fn fsep_pack_pair(items: &[String], indent: usize, line_start: usize) -> String 
 // =============================================================================
 
 fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], proved: &[ProvedLemma]) -> String {
+    use crate::pretty_hpj::{self as hpj, Doc};
     let mut out = String::new();
-    out.push_str("lemma ");
-    out.push_str(&lem.name);
-    let attrs = render_lemma_attrs(&lem.attributes);
-    if !attrs.is_empty() {
-        out.push_str(" [");
-        out.push_str(&attrs);
-        out.push(']');
-    }
-    out.push_str(":\n");
+    // HS `prettyLemmaName` (Lemma.hs:91-95):
+    //   `text name <-> brackets (fsep (punctuate comma attrs))`
+    // The whole header line is:
+    //   `kwLemma <-> prettyLemmaName lem <> colon`
+    // Rendered via HughesPJ so `fsep` wraps the attributes list when the
+    // line is long (e.g. `[heuristic={…}, use_induction,\n<col>reuse]`).
+    let kw = Doc::text("lemma");
+    let name_doc = Doc::text(lem.name.clone());
+    let header_doc = if lem.attributes.is_empty() {
+        kw.beside_sp(name_doc).beside(Doc::text(":"))
+    } else {
+        let attr_docs: Vec<Doc> = lemma_attr_docs(&lem.attributes);
+        // `brackets (fsep (punctuate comma attrs))` — no space after `[`
+        // (beside, not beside_sp) so fsep's continuation aligns with the
+        // first attr character (i.e. right after `[`).
+        let attrs_fsep = hpj::fsep(hpj::punctuate(Doc::text(","), attr_docs));
+        let brackets = Doc::text("[").beside(attrs_fsep).beside(Doc::text("]"));
+        kw.beside_sp(name_doc).beside_sp(brackets).beside(Doc::text(":"))
+    };
+    out.push_str(&header_doc.render());
+    out.push('\n');
 
     // Lemma body shape from HS `prettyLemma` (Lemma.hs:119-122):
     //   `nest 2 $ sep [ prettyTraceQuantifier, doubleQuotes (prettyLNFormula f) ]`
@@ -1598,26 +1611,39 @@ fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], proved: &[ProvedLemm
     out
 }
 
-fn render_lemma_attrs(attrs: &[p::LemmaAttr]) -> String {
-    let mut parts: Vec<String> = Vec::new();
+/// Build `Doc` nodes for each lemma attribute.  Mirrors HS
+/// `prettyLemmaAttribute` (Lemma.hs:97-107): each attribute becomes a
+/// `text "..."` Doc; these are assembled into
+/// `brackets (fsep (punctuate comma docs))` by the caller.
+fn lemma_attr_docs(attrs: &[p::LemmaAttr]) -> Vec<crate::pretty_hpj::Doc> {
+    use crate::pretty_hpj::Doc;
+    let mut out = Vec::new();
     for a in attrs {
         use p::LemmaAttr::*;
-        match a {
-            Sources => parts.push("sources".into()),
-            Reuse => parts.push("reuse".into()),
-            DiffReuse => parts.push("diff_reuse".into()),
-            UseInduction => parts.push("use_induction".into()),
-            HideLemma(s) => parts.push(format!("hide_lemma={}", s)),
-            Heuristic(s) => parts.push(format!("heuristic={}", s)),
-            Output(modules) => {
-                parts.push(format!("output=[{}]", modules.join(",")))
-            }
-            Left => parts.push("left".into()),
-            Right => parts.push("right".into()),
-            _ => {}
-        }
+        let s: Option<String> = match a {
+            Sources => Some("sources".into()),
+            Reuse => Some("reuse".into()),
+            DiffReuse => Some("diff_reuse".into()),
+            UseInduction => Some("use_induction".into()),
+            HideLemma(s) => Some(format!("hide_lemma={}", s)),
+            Heuristic(s) => Some(format!("heuristic={}", s)),
+            Output(modules) => Some(format!("output=[{}]", modules.join(","))),
+            Left => Some("left".into()),
+            Right => Some("right".into()),
+            _ => None,
+        };
+        if let Some(s) = s { out.push(Doc::text(s)); }
     }
-    parts.join(", ")
+    out
+}
+
+// Legacy string-join form (kept for any direct callers).
+#[allow(dead_code)]
+fn render_lemma_attrs(attrs: &[p::LemmaAttr]) -> String {
+    lemma_attr_docs(attrs).iter()
+        .map(|d| d.clone().render())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn quantifier_keyword(q: &p::TraceQuantifier) -> &'static str {
