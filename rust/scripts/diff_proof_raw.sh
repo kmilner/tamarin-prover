@@ -89,7 +89,13 @@ if [ -z "$NO_HS_CACHE" ]; then
     key="$HS_CANON_CACHE/${h}__${lemma}__v${CACHE_VERSION}"
 fi
 if [ -n "$key" ] && [ -f "$key.full.gz" ]; then
-    gzip -dc "$key.full.gz" > "$tmp/hs.out" 2>/dev/null
+    # The cache is keyed by file CONTENT, but HS echoes the input path verbatim
+    # on its "analyzed:" line. A hit recorded from another checkout/worktree
+    # would otherwise produce a spurious path-only diff — rewrite it to the
+    # path of THIS invocation (exactly what HS would print for it).
+    gzip -dc "$key.full.gz" 2>/dev/null \
+        | awk -v f="$file" '/^analyzed: / { print "analyzed: " f; next } { print }' \
+        > "$tmp/hs.out"
     hs_src="cache"
 else
     timeout "$TIMEOUT" "$hs_path" +RTS -N1 -RTS --prove="$lemma" "$file" 2>/dev/null > "$tmp/hs.out"
