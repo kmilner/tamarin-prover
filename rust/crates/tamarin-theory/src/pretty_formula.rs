@@ -1117,6 +1117,9 @@ fn gterm_to_doc(t: &crate::guarded::GTerm, scope: &[Vec<Bind>]) -> crate::pretty
                 let mut flat: Vec<&crate::guarded::GTerm> = Vec::new();
                 flatten(*op, l, &mut flat);
                 flatten(*op, r, &mut flat);
+                // HS re-sorts AC args after opening the binder (see
+                // `sort_ac_args_for_display` / Guarded.hs:846-849,290).
+                sort_ac_args_for_display(&mut flat, scope);
                 gac_op_doc(binop_symbol(*op), &flat, scope)
             }
         }
@@ -1452,6 +1455,84 @@ fn lookup_bound<'a>(n: u32, scope: &'a [Vec<Bind>]) -> Option<&'a Bind> {
         m -= vars.len();
     }
     None
+}
+
+/// Resolve a `Bound(n)` leaf to the `VarSpec` of its (opened) binder, using
+/// the display name+sort+idx allocated by `allocate_guarded_binders` (HS
+/// `openGuarded`'s `freshLVar`, Guarded.hs:362-371).  The binder's idx is
+/// recovered from the display name (`name` ⇒ 0, `name.k` ⇒ k).
+fn bound_to_varspec(n: u32, scope: &[Vec<Bind>]) -> Option<p::VarSpec> {
+    let b = lookup_bound(n, scope)?;
+    let (src_name, sort, display) = b;
+    // display = src_name (idx 0) | "src_name.idx".
+    let idx = if display == src_name {
+        0
+    } else if let Some(suffix) = display.strip_prefix(src_name.as_str())
+        .and_then(|s| s.strip_prefix('.'))
+    {
+        suffix.parse::<u64>().unwrap_or(0)
+    } else {
+        0
+    };
+    Some(p::VarSpec { name: src_name.clone(), idx, sort: *sort, typ: None })
+}
+
+/// Produce an "opened" copy of a `GTerm` in which every `Bound(n)` leaf is
+/// replaced by its opened `Free` `VarSpec` (resolved via the binder scope).
+///
+/// HS-faithful: `prettyGuarded` (Guarded.hs:846-849) renders a `GGuarded`
+/// via `openGuarded`, whose `openas`/`opengf` apply `substBoundAtom`/
+/// `substBound` — both `fmapTerm (fmap subst)` (Guarded.hs:290) which rebuild
+/// every `FApp` through `fApp`/`fAppAC` (Term/Raw.hs:111,118-122,208-209),
+/// RE-SORTING AC arguments by the term Ord with the bound variable now a
+/// concrete `Free` LVar.  RS stores AC args in source order and renders by
+/// name lookup, so it must reproduce that re-sort at display time.  This
+/// helper builds the key whose `cmp_term` order matches HS's opened order.
+fn open_gterm_for_sort(t: &crate::guarded::GTerm, scope: &[Vec<Bind>]) -> crate::guarded::GTerm {
+    use crate::guarded::{BVar, GTerm};
+    match t {
+        GTerm::Var(BVar::Bound(n)) => match bound_to_varspec(*n, scope) {
+            Some(vs) => GTerm::Var(BVar::Free(vs)),
+            None => t.clone(),
+        },
+        GTerm::Var(_) | GTerm::PubLit(_) | GTerm::FreshLit(_) | GTerm::NatLit(_)
+        | GTerm::Number(_) | GTerm::NumberOne | GTerm::NatOne | GTerm::DhNeutral => t.clone(),
+        GTerm::App(n, args) => GTerm::App(
+            n.clone(), args.iter().map(|a| open_gterm_for_sort(a, scope)).collect()),
+        GTerm::Pair(args) => GTerm::Pair(
+            args.iter().map(|a| open_gterm_for_sort(a, scope)).collect()),
+        GTerm::AlgApp(n, a, b) => GTerm::AlgApp(
+            n.clone(), Box::new(open_gterm_for_sort(a, scope)),
+            Box::new(open_gterm_for_sort(b, scope))),
+        GTerm::Diff(a, b) => GTerm::Diff(
+            Box::new(open_gterm_for_sort(a, scope)),
+            Box::new(open_gterm_for_sort(b, scope))),
+        GTerm::BinOp(op, a, b) => GTerm::BinOp(
+            *op, Box::new(open_gterm_for_sort(a, scope)),
+            Box::new(open_gterm_for_sort(b, scope))),
+        GTerm::PatMatch(t) => GTerm::PatMatch(Box::new(open_gterm_for_sort(t, scope))),
+    }
+}
+
+/// Sort the flattened arguments of an AC term for display, mirroring HS's
+/// `fAppAC` re-sort after `openGuarded` (see `open_gterm_for_sort`).  Stable,
+/// by the term Ord (`cmp_term`) with `Bound` leaves resolved to their opened
+/// `Free` LVars.  Operates on `&GTerm` references so callers keep rendering
+/// the ORIGINAL terms (whose `Bound` leaves resolve to display names).
+fn sort_ac_args_for_display<'a>(
+    flat: &mut [&'a crate::guarded::GTerm],
+    scope: &[Vec<Bind>],
+) {
+    // Precompute the opened keys once per element (avoids O(n log n) re-opens).
+    let keyed: Vec<(crate::guarded::GTerm, &'a crate::guarded::GTerm)> = flat
+        .iter()
+        .map(|t| (open_gterm_for_sort(t, scope), *t))
+        .collect();
+    let mut keyed = keyed;
+    keyed.sort_by(|a, b| crate::guarded::cmp_term(&a.0, &b.0));
+    for (slot, (_, orig)) in flat.iter_mut().zip(keyed.into_iter()) {
+        *slot = orig;
+    }
 }
 
 /// `paren_atomic` controls whether non-atomic shapes (Disj/Conj with
@@ -1923,6 +2004,9 @@ fn pp_gterm(t: &crate::guarded::GTerm, scope: &[Vec<Bind>], out: &mut String) {
             let mut flat: Vec<&crate::guarded::GTerm> = Vec::new();
             flatten(*op, l, &mut flat);
             flatten(*op, r, &mut flat);
+            // HS re-sorts AC args after opening the binder (see
+            // `sort_ac_args_for_display` / Guarded.hs:846-849,290).
+            sort_ac_args_for_display(&mut flat, scope);
             out.push('(');
             let sym = binop_symbol(*op);
             for (i, child) in flat.iter().enumerate() {

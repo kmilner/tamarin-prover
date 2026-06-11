@@ -650,6 +650,19 @@ pub fn gall(vars: Vec<GBinding>, guards: Vec<GAtom>, body: Guarded) -> Guarded {
 #[derive(Debug, Clone)]
 pub struct GuardError {
     pub message: String,
+    /// The parser-AST sub-formula at the point of failure, mirroring HS's
+    /// `f0` in `convert polarity f0@(Qua qua0 _ _)` — the innermost
+    /// quantifier that failed the guard check.  Used by callers to render
+    /// the HS-faithful:
+    ///   ```
+    ///   <error_text>
+    ///     "<sub_formula>"
+    ///   in the formula
+    ///     "<full_formula>"
+    ///   ```
+    /// block.  `None` means the error occurred outside a quantifier context
+    /// (shouldn't happen in practice but handled gracefully).
+    pub subject_formula: Option<tamarin_parser::ast::Formula>,
 }
 
 impl std::fmt::Display for GuardError {
@@ -660,7 +673,7 @@ impl std::fmt::Display for GuardError {
 impl std::error::Error for GuardError {}
 
 fn err(msg: impl Into<String>) -> GuardError {
-    GuardError { message: msg.into() }
+    GuardError { message: msg.into(), subject_formula: None }
 }
 
 // =============================================================================
@@ -857,13 +870,25 @@ fn convert(polarity: bool, f: &p::Formula) -> Result<Guarded, GuardError> {
         p::Formula::Forall(_, _) | p::Formula::Exists(_, _) => {
             let (xs, body) = open_quantifier_prefix(f);
             let same_qua = matches!(f, p::Formula::Forall(_, _));
-            if same_qua {
+            let result = if same_qua {
                 let out_qua = if polarity { Quant::Ex } else { Quant::All };
                 convert_all(&xs, body, polarity, out_qua)
             } else {
                 let out_qua = if polarity { Quant::All } else { Quant::Ex };
                 convert_ex(&xs, body, polarity, out_qua)
-            }
+            };
+            // HS: the error from `convEx`/`convAll` is decorated with
+            // `ppFormula f0` (the current quantifier sub-formula) by
+            // `noUnguardedVars` / the toplevel-implication check.
+            // We mirror by attaching `f.clone()` as `subject_formula`
+            // on the INNERMOST failure (guard: set only when not yet set,
+            // so the deepest quantifier sub-formula wins).
+            result.map_err(|mut e| {
+                if e.subject_formula.is_none() {
+                    e.subject_formula = Some(f.clone());
+                }
+                e
+            })
         }
     }
 }
@@ -1039,7 +1064,15 @@ fn remaining_unguarded(xs: &[p::VarSpec], atoms: &[p::Atom]) -> Vec<p::VarSpec> 
 }
 
 fn unguarded_error(vars: &[p::VarSpec]) -> GuardError {
-    let names: Vec<String> = vars.iter().map(|v| v.name.clone()).collect();
+    // HS: `map (quotes . text . show) unguarded` — each name is shown
+    // via Haskell's `show LVar` which renders as `'name'` (single-quoted).
+    // The Haskell `show` for LVar is its `Show` instance, which we can
+    // find at LTerm.hs:197: `show (LVar n s i) = ...` with no explicit
+    // instance → derives Show, producing `LVar "name" LSortMsg 0` style.
+    // But `quotes` wraps in single quotes at the Doc level.  The resulting
+    // `text . show` on each unguarded LVar produces `'name'` in the
+    // rendered Doc via `quotes (text "name")`.
+    let names: Vec<String> = vars.iter().map(|v| format!("'{}'", v.name)).collect();
     err(format!("unguarded variable(s) {} in the subformula", names.join(", ")))
 }
 

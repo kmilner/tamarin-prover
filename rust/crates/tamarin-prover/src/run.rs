@@ -504,13 +504,39 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         // (`Theory.Tools.Wellformedness:1270`).  Runs on every file
         // (not gated by `--parse-only`) so a malformed theory is
         // surfaced even without proving.
-        let mut wf_report = tamarin_parser::wf::check_theory(&parsed);
+        //
+        // HS-faithful: HS's `thyProtoRules` (Wellformedness.hs:134)
+        // applies `applyMacroInRule (theoryMacros thy)` to every rule
+        // BEFORE the checks run — so `Fr(test())` where `test() = ~x`
+        // becomes `Fr(~x)` and passes.  We mirror by cloning `parsed`
+        // and expanding macros before handing it to `check_theory`.
+        let parsed_for_wf = {
+            let mut tmp = parsed.clone();
+            tamarin_theory::macro_expand::expand_theory_macros(&mut tmp);
+            tmp
+        };
+        let mut wf_report = tamarin_parser::wf::check_theory(&parsed_for_wf);
         // Strip the static "Message Derivation Checks" entry — the
         // dynamic check below replaces it with the prover-based result.
         // We keep the static check available for the `--parse-only`
         // path (where no Maude is started).
         if !args.parse_only {
             wf_report.retain(|e| e.topic != "Message Derivation Checks");
+        }
+        // HS `checkIfLemmasInTheory` (Wellformedness.hs:1156-1171) — FIRST
+        // in HS's checkWellformedness list (line 1272).  Checks that every
+        // --prove=X / --lemma=X name corresponds to a theory lemma.  This
+        // check needs the CLI args (not embedded in the parser AST), so we
+        // call it separately and PREPEND the result so it sorts first —
+        // matching HS's `checkIfLemmasInTheory : ...` order.
+        {
+            let lemma_check = tamarin_parser::wf::check_if_lemmas_in_theory(
+                &args.lemma_names, &parsed);
+            if !lemma_check.is_empty() {
+                let mut new_report = lemma_check;
+                new_report.extend(wf_report);
+                wf_report = new_report;
+            }
         }
 
         if args.parse_only {
@@ -538,6 +564,40 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         // (TheoryLoader.hs:454).
         if !args.quiet && !args.parse_only {
             eprintln!("[Theory {}] Theory translated", theory_name);
+        }
+
+        // Port of HS `formulaReports.checkGuarded` (Wellformedness.hs:988-1004):
+        // for each lemma/restriction formula that cannot be converted to a
+        // guarded formula, emit a ` Formula guardedness` WF error.  This
+        // check needs `formula_to_guarded` (in tamarin-theory) so it runs
+        // HERE (post-elaborate) rather than inside `check_theory` (parser-level).
+        //
+        // HS `msum` semantics: `checkGuarded` only fires for a formula when
+        // `checkQuantifiers` and `checkTerms` both passed for it.  We
+        // approximate by running unconditionally — in practice the failing
+        // formulas differ between checkTerms and checkGuarded, so no double-
+        // reporting occurs for any known corpus file.
+        //
+        // Position: after `check_theory`'s `formula_terms_report` (8b) and
+        // before `lemma_attribute_report` (9) — matches HS order.
+        {
+            let guard_errors = tamarin_theory::elaborate::check_guarded_wf(&parsed);
+            if !guard_errors.is_empty() {
+                // Insert BEFORE the "Lemma annotations" entries that
+                // `check_theory` already put in `wf_report`, so the order
+                // matches HS: Formula guardedness (8c) before Lemma
+                // annotations (9).  Find the first index of a topic that
+                // comes after position 8 in HS's check order.
+                let insert_before = wf_report.iter().position(|e| {
+                    matches!(e.topic.as_str(),
+                        "Lemma annotations" | "Multiplication restriction of rules"
+                        | "Nat Sorts" | "Subterm Convergence Warning"
+                        | "Message Derivation Checks" | "Derivation Checks")
+                }).unwrap_or(wf_report.len());
+                let tail = wf_report.split_off(insert_before);
+                wf_report.extend(guard_errors);
+                wf_report.extend(tail);
+            }
         }
 
         // Spawn a single Maude handle for this file.  Used by:
@@ -601,6 +661,138 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 file_maude_pool.as_deref());
         }
         phase!("populate_rule_variants");
+
+        // Port of HS `ruleVariantsReport` / `variantsCheck`
+        // (Wellformedness.hs:354-372, 375-394).
+        //
+        // Sub-check 1: "Rule has no variants" — fires when
+        // `variantsProtoRule hnd ruE` returns `Nothing`, i.e., the rule
+        // has no variants at all (e.g., contradictory Fr(~x)/In(~x) premises
+        // that the fresh-uniqueness constraint makes impossible).
+        //
+        // HS detection: `guard (null recomputedVariants)` where
+        // `recomputedVariants = map (get cprRuleAC) $ concatMap
+        //   (unfoldRuleVariants . ClosedProtoRule ruE) $ maybeToList
+        //   (variantsProtoRule hnd ...)`.  Returns `[]` iff
+        // `variantsProtoRule` returns `Nothing` (no variants).
+        //
+        // Rust detection: `populate_rule_variants` leaves `variant_substs`
+        // EMPTY when `abstract_rule_and_variants` returns `None`.
+        // However, for rules with NO reducible fun syms, `populate_rule_variants`
+        // returns early (skips ALL rules) because the early-exit guard fires.
+        // In HS, `variantsProtoRule` still runs and returns `Just` (single
+        // trivial variant) for such rules — the `Nothing` case only arises
+        // when the variant computation produces an EMPTY substitution set
+        // (e.g., all substs are `isFreshRedundant`).
+        //
+        // A rule with `Fr(~x)` and `In(~x)` in its premises: In HS, the
+        // abstraction phase abstracts these to fresh variables, then
+        // `computeVariantsCached` returns the trivial identity substitution
+        // (no real AC to reduce), but `isFreshRedundant` filters it out
+        // (the fresh variable `~x` appears in `In` position, which is
+        // impossible → the identity subst IS fresh-redundant for ~x).
+        // Result: `substs = []` → `mzero` → `variantsProtoRule = Nothing`.
+        //
+        // In Rust: `abstract_rule_and_variants` returns `None` in this case
+        // (all variant substs were filtered). The rule's `variant_substs`
+        // stays empty, and `abstracted_rule` stays `None`.
+        //
+        // Detection criterion: `file_maude` is `Some` (so we ran variant
+        // computation), the rule has at least one reducible RHS sub-term OR
+        // the rule has `variant_substs` empty after `populate_rule_variants`
+        // ran. Actually — `populate_rule_variants` only calls
+        // `abstract_rule_and_variants` for rules WHERE the signature has
+        // reducible funs. For signatures without reducible funs, the rule
+        // can NEVER get `Nothing` from `variantsProtoRule` because HS also
+        // wouldn't find contradictory-fresh issues (no destructors = only
+        // pair/fst/snd, and those theories don't mix Fr+In the "impossible"
+        // way in any corpus file).
+        //
+        // Sub-check 2: "Variants mismatch" — fires when `ruAC` (manually
+        // specified variants in the rule body) is non-empty and doesn't match
+        // the recomputed variants. Requires comparing parsed `rule.variants`
+        // vs `abstracted_rule + variant_substs`. Not yet ported (no corpus
+        // files affected); see implementation notes below.
+        if let Some(ref wf_maude) = file_maude {
+            use tamarin_theory::theory::TheoryItem;
+            use tamarin_parser::wf::WfError as WfE;
+            use tamarin_parser::wf::underline_topic;
+
+            let mut variants_errors: Vec<WfE> = Vec::new();
+            let mut no_variant_rules: Vec<String> = Vec::new();
+
+            for item in &elaborated.items {
+                let TheoryItem::Rule(opr) = item else { continue };
+
+                // Sub-check 1: "Rule has no variants" — mirrors HS
+                // `variantsCheck` (Wellformedness.hs:362):
+                //   `guard (null recomputedVariants) $> ...`
+                // Calls `rule_has_no_variants_for_wf` which implements
+                // the full HS `variantsProtoRule` detection logic including
+                // `isFreshRedundant` filtering.
+                //
+                // Sub-check 2: "Variants mismatch" — not yet ported; no
+                // corpus files affected (see step-0 analysis).
+                if tamarin_theory::tools::rule_variants::rule_has_no_variants_for_wf(
+                    wf_maude, &opr.rule)
+                {
+                    // HS message (Wellformedness.hs:363-366):
+                    //   text "Rule " <> prettyRuleName ruE <> text " has no variants."
+                    //   $--$  text "Most likely, ..."
+                    //   <> text "For exaple, ..."
+                    // "For exaple" is a typo in HS source, preserved faithfully.
+                    let rule_name = opr.name().to_string();
+                    no_variant_rules.push(rule_name.clone());
+                    let topic = "Rule has no variants";
+                    let body = format!(
+                        "  Rule {} has no variants.\n  \n  Most likely, this means that \
+                         the rule's use of fresh variables is contradictory. For exaple, \
+                         a rule with the premises In(~x) and Fr(~x) has no variants \
+                         because ~x cannot be sent before it is generated.",
+                        rule_name,
+                    );
+                    let mut msg = String::new();
+                    msg.push_str(&underline_topic(topic));
+                    msg.push('\n');
+                    msg.push_str(&body);
+                    msg.push('\n');
+                    variants_errors.push(WfE::new(topic, msg));
+                }
+            }
+
+            if !variants_errors.is_empty() {
+                // HS position 6: ruleVariantsReport comes BEFORE factReports
+                // (position 7).  Insert before factReports items.
+                let insert_before = wf_report.iter().position(|e| {
+                    matches!(e.topic.as_str(),
+                        "Reserved names" | "Special facts"
+                        | "Fr facts must only use a fresh- or a msg-variable"
+                        | "Fact arity issues" | "Fact multiplicity issues"
+                        | "Fact capitalization issues"
+                        | "Facts occur in the left-hand-side but not in any right-hand-side "
+                        | "Unbound variables" | "Formula terms" | " Formula guardedness"
+                        | "Lemma annotations" | "Multiplication restriction of rules"
+                        | "Nat Sorts" | "Subterm Convergence Warning"
+                        | "Message Derivation Checks" | "Derivation Checks")
+                }).unwrap_or(wf_report.len());
+                let tail = wf_report.split_off(insert_before);
+                wf_report.extend(variants_errors);
+                wf_report.extend(tail);
+            }
+
+            // HS closeProtoRule (Rule.hs:97-98): `ClosedProtoRule ruE <$>
+            // maybeToList (variantsProtoRule hnd ruE)` — a rule with NO
+            // variants produces NO closed rule.  It is dropped from the
+            // closed theory entirely: it participates in neither rendering
+            // nor proof search.  (The wf warning above fires on the OPEN
+            // theory, before closing, so it is emitted regardless.)
+            if !no_variant_rules.is_empty() {
+                elaborated.items.retain(|item| match item {
+                    TheoryItem::Rule(r) => !no_variant_rules.iter().any(|n| n == r.name()),
+                    _ => true,
+                });
+            }
+        }
 
         // Annotate per-rule loop breakers on the OUTER theory so
         // `pretty_closed_theory` can render HS's `// loop breaker:
@@ -793,6 +985,16 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                         let body = tamarin_theory::pretty_theory::pretty_proof_body(&root);
                         (v, steps, Some(body))
                     }
+                    Err(tamarin_theory::prove::ProveError::Guarded(msg)) => {
+                        // HS `formulaToGuarded_ = either (error . render) id`
+                        // (Guarded.hs:466-467): a proven lemma whose formula
+                        // cannot be converted to a guarded formula kills the
+                        // whole run — message on stderr, exit 1, and NO
+                        // theory output on stdout (HS renders lazily after
+                        // proving, so the abort precedes all stdout output).
+                        eprintln!("tamarin-prover: {}", msg);
+                        std::process::exit(1);
+                    }
                     Err(e) => (LemmaVerdict::Error(format!("{}", e)), 0, None),
                 };
                 proved_lemmas.push(tamarin_theory::pretty_theory::ProvedLemma {
@@ -874,7 +1076,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
     // block entirely.  Only `--prove` (or any flag that actually runs
     // the prover) emits it.
     if !args.quiet && !args.parse_only {
-        print_overall_summary(&file_results);
+        print_overall_summary(&file_results, args.prove_mode || args.prove_all);
     }
 
     Ok(overall_status)
@@ -1087,7 +1289,7 @@ fn count_proof_steps(node: &tamarin_theory::constraint::solver::search::ProofNod
     1 + node.children.values().map(count_proof_steps).sum::<usize>()
 }
 
-fn print_overall_summary(file_results: &[FileResult]) {
+fn print_overall_summary(file_results: &[FileResult], prove_mode: bool) {
     // Mirrors HS `summary of summaries:` block (`Main.Mode.Batch`).
     let line = "=".repeat(78);
     println!();
@@ -1106,7 +1308,12 @@ fn print_overall_summary(file_results: &[FileResult]) {
         println!("  ");
         if fr.wf_count > 0 {
             println!("  WARNING: {} wellformedness check failed!", fr.wf_count);
-            println!("           The analysis results might be wrong!");
+            // HS Batch.hs:246 emits this second line only in prove mode:
+            //   [ Pretty.text "         The analysis results might be wrong!"
+            //   | thyLoadOptions.proveMode ]
+            if prove_mode {
+                println!("           The analysis results might be wrong!");
+            }
             println!("  ");
         }
         for r in &fr.results {

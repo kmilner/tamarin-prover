@@ -339,20 +339,40 @@ fn sep_block_with_lead(lead: &str, items: &[String]) -> String {
 fn render_parsed_item(
     item: &p::TheoryItem,
     _idx: usize,
-    _parsed: &p::Theory,
+    parsed: &p::Theory,
     elab: &Theory,
     proved: &[ProvedLemma],
 ) -> Option<String> {
     use p::TheoryItem::*;
+    // Collect macros from the parsed theory so restriction/lemma renderers
+    // can apply them to get the expanded formula (mirrors HS
+    // `applyMacroInRestriction` + `parseLemmaWithMacros` which store the
+    // expanded formula separately from the original).
+    let macros: Vec<p::Macro> = parsed.items.iter()
+        .filter_map(|i| if let p::TheoryItem::Macros(ms) = i { Some(ms.as_slice()) } else { None })
+        .flatten()
+        .cloned()
+        .collect();
     match item {
         Builtins(_) | Functions(_) | Equations { .. } | Options(_) | Heuristic(_) | Tactic(_) => {
             // These are absorbed into the signature/configuration headers.
             None
         }
-        Rule(r) => Some(render_rule(r, elab)),
+        Rule(r) => {
+            // HS closeProtoRule (Rule.hs:97-98): `ClosedProtoRule ruE <$>
+            // maybeToList (variantsProtoRule hnd ruE)` — a rule with no
+            // variants yields NO closed rule, so it is absent from the
+            // closed theory and never rendered.  Such rules are removed
+            // from the elaborated theory in run.rs; mirror the absence here.
+            if elab.rules().any(|er| er.name() == r.name) {
+                Some(render_rule(r, elab, &macros))
+            } else {
+                None
+            }
+        }
         IntrRule(_) => None,
-        Lemma(l) => Some(render_parsed_lemma(l, proved)),
-        Restriction(r) => Some(render_parsed_restriction(r)),
+        Lemma(l) => Some(render_parsed_lemma(l, &macros, proved)),
+        Restriction(r) => Some(render_parsed_restriction(r, &macros)),
         Predicates(_) => {
             // TODO: render predicates (port HS prettyPredicate).
             None
@@ -530,7 +550,7 @@ fn render_parsed_macros(macros: &[p::Macro]) -> String {
     header.above(body).render()
 }
 
-fn render_rule(parsed_rule: &p::Rule, elab: &Theory) -> String {
+fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro]) -> String {
     let name = &parsed_rule.name;
     let mut out = String::new();
     out.push_str("rule (modulo E) ");
@@ -576,12 +596,68 @@ fn render_rule(parsed_rule: &p::Rule, elab: &Theory) -> String {
     // (e.g. `'g'^~ltkB^~ltkA` → `'g'^(~ltkA*~ltkB)` under DH), in which
     // case HS prints the AC body as a comment block rather than the
     // trivial-variant annotation.
+    //
+    // MACRO CASE (ClosedTheory.hs:334 + Rule.hs:762-764): When the theory
+    // uses macros, HS's `cprRuleE` keeps the MACRO form of the rule while
+    // `cprRuleAC` has the EXPANDED form (closeProtoRule runs
+    // `applyMacroInRule` before `variantsProtoRule` but stores the original
+    // `ruE` untouched — Rule.hs:96-98).  `isTrivialProtoVariantAC` then
+    // returns `False` because `ps != ps'` (macro term ≠ expanded term).
+    // RS's `opr.rule` stores the EXPANDED form (post-`expand_theory_macros`)
+    // so we must additionally check whether the DISPLAY form (parsed_rule,
+    // which still has macro calls) matches the elaborated body.  If they
+    // differ, even a rule with no AC variants must show the AC comment block
+    // containing the expanded form.
     let elab_rule = elab.rules().find(|r| r.name() == name);
     let trivial = elab_rule
         .map(|r| {
             let no_residual_substs = r.variant_substs.iter().all(|s| s.is_empty());
+            // HS `isTrivialProtoVariantAC` (Rule.hs:761-764):
+            //   variants == [emptySubstVFresh] && ps == ps' && as == as' && cs == cs' && nvs == nvs'
+            //
+            // In HS, `cprRuleE` (E-rule) and `cprRuleAC` (AC-rule) live in
+            // the SAME term universe — AC smart-constructors normalise at
+            // construction time everywhere, so the only difference between
+            // them arises from (a) genuine non-trivial AC variants or (b)
+            // macro expansion changing terms.
+            //
+            // In RS: `abstracted_rule = Some(ac)` iff Maude found a
+            // non-trivial abstraction (reducible sub-terms, yielding a
+            // different AC form) — compare the E-rule against the abstracted
+            // AC form via `same_rule_body`.
+            // `abstracted_rule = None` means `abstract_rule_and_variants`
+            // returned `Ok(None)` (common_subst empty AND no residual
+            // substs) — i.e., the AC form IS the E form.  The only remaining
+            // source of divergence is macro expansion: if the display body
+            // (`premises`/`actions`/`conclusions`, from `parsed_rule` before
+            // macro expansion) contains macro calls, it differs from the
+            // elaborated form and HS's `ps != ps'` would fire.  Detect this
+            // by applying macros to the display facts and checking whether
+            // any term changed (HS `applyMacroInRule` / Rule.hs:98).
+            //
+            // Crucially: do NOT compare rendered text across AST↔LN spaces —
+            // AC ordering and nat-constant representation differ between the
+            // parsed form and `lnfacts_to_parser(r.rule.*)`, producing false
+            // negatives for plain rules like those in ParserTests.spthy.
             let ac_body_matches = match &r.abstracted_rule {
-                None => true,
+                None => {
+                    // Trivial unless macros fired on this rule's display body.
+                    // Apply macros to the display facts; if unchanged, the
+                    // rule has no macro calls → display == elaborated → trivial.
+                    let macro_prems: Vec<p::Fact> = premises.iter()
+                        .map(|f| crate::macro_expand::apply_macros_fact(macros, f))
+                        .collect();
+                    let macro_acts: Vec<p::Fact> = actions.iter()
+                        .map(|f| crate::macro_expand::apply_macros_fact(macros, f))
+                        .collect();
+                    let macro_concs: Vec<p::Fact> = conclusions.iter()
+                        .map(|f| crate::macro_expand::apply_macros_fact(macros, f))
+                        .collect();
+                    // Same iff no macro call in this rule's terms changed anything.
+                    macro_prems == premises
+                        && macro_acts == actions
+                        && macro_concs == conclusions
+                }
                 Some(ac) => same_rule_body(&r.rule, ac),
             };
             no_residual_substs && ac_body_matches
@@ -759,12 +835,17 @@ fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule) -> 
     s.push_str(&format!("  rule (modulo AC) {}:\n", name));
     // Body of the abstracted rule.  Use the abstracted version when
     // available; fall back to the original facts.
-    let prems = lnfacts_to_parser(&rule.abstracted_rule.as_ref()
-        .map(|r| r.premises.clone()).unwrap_or_default());
-    let acts = lnfacts_to_parser(&rule.abstracted_rule.as_ref()
-        .map(|r| r.actions.clone()).unwrap_or_default());
-    let concs = lnfacts_to_parser(&rule.abstracted_rule.as_ref()
-        .map(|r| r.conclusions.clone()).unwrap_or_default());
+    // Use the abstracted rule's facts when available; when `abstracted_rule`
+    // is `None` (no reducible-headed sub-terms), fall back to the ELABORATED
+    // rule's facts (`rule.rule`).  This is the macro case: the elaborated
+    // facts have macro calls expanded (e.g. `aenc(~k, pkS)` instead of
+    // `encrypt(~k, pkS)`) — exactly what HS's `cprRuleAC` holds after
+    // `variantsProtoRule (applyMacroInRule macros ruE)`.  Previously we
+    // fell back to empty vecs, producing an empty AC body.
+    let ac_rule = rule.abstracted_rule.as_ref().unwrap_or(&rule.rule);
+    let prems = lnfacts_to_parser(&ac_rule.premises);
+    let acts = lnfacts_to_parser(&ac_rule.actions);
+    let concs = lnfacts_to_parser(&ac_rule.conclusions);
     // Each line of the rule body needs an extra leading 2-space indent
     // (we're inside the comment block, which already has 2 spaces).
     let body = render_rule_body(&prems, &acts, &concs);
@@ -1515,17 +1596,30 @@ fn fsep_pack_pair(items: &[String], indent: usize, line_start: usize) -> String 
 // Lemma
 // =============================================================================
 
-fn render_parsed_lemma(lem: &p::Lemma, proved: &[ProvedLemma]) -> String {
+fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], proved: &[ProvedLemma]) -> String {
+    use crate::pretty_hpj::{self as hpj, Doc};
     let mut out = String::new();
-    out.push_str("lemma ");
-    out.push_str(&lem.name);
-    let attrs = render_lemma_attrs(&lem.attributes);
-    if !attrs.is_empty() {
-        out.push_str(" [");
-        out.push_str(&attrs);
-        out.push(']');
-    }
-    out.push_str(":\n");
+    // HS `prettyLemmaName` (Lemma.hs:91-95):
+    //   `text name <-> brackets (fsep (punctuate comma attrs))`
+    // The whole header line is:
+    //   `kwLemma <-> prettyLemmaName lem <> colon`
+    // Rendered via HughesPJ so `fsep` wraps the attributes list when the
+    // line is long (e.g. `[heuristic={…}, use_induction,\n<col>reuse]`).
+    let kw = Doc::text("lemma");
+    let name_doc = Doc::text(lem.name.clone());
+    let header_doc = if lem.attributes.is_empty() {
+        kw.beside_sp(name_doc).beside(Doc::text(":"))
+    } else {
+        let attr_docs: Vec<Doc> = lemma_attr_docs(&lem.attributes);
+        // `brackets (fsep (punctuate comma attrs))` — no space after `[`
+        // (beside, not beside_sp) so fsep's continuation aligns with the
+        // first attr character (i.e. right after `[`).
+        let attrs_fsep = hpj::fsep(hpj::punctuate(Doc::text(","), attr_docs));
+        let brackets = Doc::text("[").beside(attrs_fsep).beside(Doc::text("]"));
+        kw.beside_sp(name_doc).beside_sp(brackets).beside(Doc::text(":"))
+    };
+    out.push_str(&header_doc.render());
+    out.push('\n');
 
     // Lemma body shape from HS `prettyLemma` (Lemma.hs:119-122):
     //   `nest 2 $ sep [ prettyTraceQuantifier, doubleQuotes (prettyLNFormula f) ]`
@@ -1544,7 +1638,7 @@ fn render_parsed_lemma(lem: &p::Lemma, proved: &[ProvedLemma]) -> String {
     out.push('\n');
 
     // /* guarded formula characterizing ... */
-    out.push_str(&render_guarded_block(lem));
+    out.push_str(&render_guarded_block(lem, macros));
 
     // Proof body — either the prover's result (if --prove ran) or
     // the lemma's stored skeleton.
@@ -1558,26 +1652,39 @@ fn render_parsed_lemma(lem: &p::Lemma, proved: &[ProvedLemma]) -> String {
     out
 }
 
-fn render_lemma_attrs(attrs: &[p::LemmaAttr]) -> String {
-    let mut parts: Vec<String> = Vec::new();
+/// Build `Doc` nodes for each lemma attribute.  Mirrors HS
+/// `prettyLemmaAttribute` (Lemma.hs:97-107): each attribute becomes a
+/// `text "..."` Doc; these are assembled into
+/// `brackets (fsep (punctuate comma docs))` by the caller.
+fn lemma_attr_docs(attrs: &[p::LemmaAttr]) -> Vec<crate::pretty_hpj::Doc> {
+    use crate::pretty_hpj::Doc;
+    let mut out = Vec::new();
     for a in attrs {
         use p::LemmaAttr::*;
-        match a {
-            Sources => parts.push("sources".into()),
-            Reuse => parts.push("reuse".into()),
-            DiffReuse => parts.push("diff_reuse".into()),
-            UseInduction => parts.push("use_induction".into()),
-            HideLemma(s) => parts.push(format!("hide_lemma={}", s)),
-            Heuristic(s) => parts.push(format!("heuristic={}", s)),
-            Output(modules) => {
-                parts.push(format!("output=[{}]", modules.join(",")))
-            }
-            Left => parts.push("left".into()),
-            Right => parts.push("right".into()),
-            _ => {}
-        }
+        let s: Option<String> = match a {
+            Sources => Some("sources".into()),
+            Reuse => Some("reuse".into()),
+            DiffReuse => Some("diff_reuse".into()),
+            UseInduction => Some("use_induction".into()),
+            HideLemma(s) => Some(format!("hide_lemma={}", s)),
+            Heuristic(s) => Some(format!("heuristic={}", s)),
+            Output(modules) => Some(format!("output=[{}]", modules.join(","))),
+            Left => Some("left".into()),
+            Right => Some("right".into()),
+            _ => None,
+        };
+        if let Some(s) = s { out.push(Doc::text(s)); }
     }
-    parts.join(", ")
+    out
+}
+
+// Legacy string-join form (kept for any direct callers).
+#[allow(dead_code)]
+fn render_lemma_attrs(attrs: &[p::LemmaAttr]) -> String {
+    lemma_attr_docs(attrs).iter()
+        .map(|d| d.clone().render())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn quantifier_keyword(q: &p::TraceQuantifier) -> &'static str {
@@ -1587,16 +1694,45 @@ fn quantifier_keyword(q: &p::TraceQuantifier) -> &'static str {
     }
 }
 
-fn render_guarded_block(lem: &p::Lemma) -> String {
+fn render_guarded_block(lem: &p::Lemma, macros: &[p::Macro]) -> String {
     let header = match &lem.trace_quantifier {
         p::TraceQuantifier::ExistsTrace => "guarded formula characterizing all satisfying traces:",
         p::TraceQuantifier::AllTraces => "guarded formula characterizing all counter-examples:",
     };
-    let gf = match crate::guarded::formula_to_guarded(&lem.formula) {
+    // HS `parseLemmaWithMacros` (Theory/Text/Parser.hs:97-105) applies macros
+    // to the lemma formula before converting to guarded form.  The guarded
+    // block displays the EXPANDED formula so that macro calls like
+    // `A( m(x) )` become `A( x )` (when `m(x) = x`).
+    let expanded_formula = if macros.is_empty() {
+        lem.formula.clone()
+    } else {
+        crate::macro_expand::apply_macros_formula(macros, &lem.formula)
+    };
+    let gf = match crate::guarded::formula_to_guarded(&expanded_formula) {
         Ok(g) => g,
         Err(e) => {
-            // HS renders `/* conversion to guarded formula failed: ... */`.
-            return format!("/*\nconversion to guarded formula failed:\n  {}\n*/", e);
+            // HS Lemma.hs:132-134: `multiComment (text "conversion to
+            // guarded formula failed:" $$ nest 2 err)` where `err` is the
+            // full `ppError` doc (Guarded.hs:479): the error text, the
+            // quoted failing sub-formula (Guarded.hs:508-514/561-563 both
+            // include `ppFormula f0`), then "in the formula" + the quoted
+            // formula passed to `formulaToGuarded` (nest 2 . doubleQuotes).
+            let mut block = String::from("/*\nconversion to guarded formula failed:\n");
+            for line in e.message.lines() {
+                block.push_str("  ");
+                block.push_str(line);
+                block.push('\n');
+            }
+            let full_text = crate::pretty_formula::pretty_formula(&expanded_formula);
+            let sub_text = e.subject_formula.as_ref()
+                .map(|f| crate::pretty_formula::pretty_formula(f))
+                .unwrap_or_else(|| full_text.clone());
+            block.push_str("    \"");
+            block.push_str(&sub_text);
+            block.push_str("\"\n  in the formula\n    \"");
+            block.push_str(&full_text);
+            block.push_str("\"\n*/");
+            return block;
         }
     };
     // For all-traces lemmas, HS prints the negated guarded formula
@@ -1620,27 +1756,36 @@ fn render_guarded_block(lem: &p::Lemma) -> String {
 // Restriction
 // =============================================================================
 
-fn render_parsed_restriction(r: &p::Restriction) -> String {
+fn render_parsed_restriction(r: &p::Restriction, macros: &[p::Macro]) -> String {
+    // HS `prettyRestriction` (TheoryObject.hs:846-857):
+    //   The `Restriction` carries two formulas after `applyMacroInRestriction`:
+    //   - `_rstrFormula`         = macro-EXPANDED formula  (displayed in expanded block)
+    //   - `_rstrOriginalFormula` = original macro-form     (displayed on top)
+    //   HS always has `ogFormula = Just _` (applyMacroInRestriction sets it
+    //   even when there are no macros: `Just $ maybe f id ofm`).
+    //
+    // RS's `r.formula` is the parser-form (macro calls present).  Apply
+    // the theory's macros to get the expanded formula used in the block.
+    let expanded = if macros.is_empty() {
+        r.formula.clone()
+    } else {
+        crate::macro_expand::apply_macros_formula(macros, &r.formula)
+    };
     let mut out = String::new();
     out.push_str("restriction ");
     out.push_str(&r.name);
     out.push_str(":\n");
-    // HS `prettyRestriction` (TheoryObject.hs:850):
-    //   `nest 2 $ doubleQuotes (prettyLNFormula f)` — routed through the
-    // HS-faithful Doc engine so the formula's `sep`/`nest` wrapping and
-    // continuation indents match HS byte-exact.  The `nest 2` indent and
-    // the surrounding `"` are part of the rendered Doc.
+    // Top-level display: original formula (macro form) — `fromMaybe expandedFormula ogFormula`.
+    // Since ogFormula = Just original, this always shows `r.formula` (macro form).
     out.push_str(&pf::formula_doublequoted_nested(&r.formula, 2));
-    // HS's `prettyRestriction`:
-    //   `nest 2 (if safety then "// safety formula" else emptyDoc)`
-    //   `case ogFormula of Just _ -> /* expanded formula: "..." */`
-    // We treat every parsed restriction as having Just ogFormula (the
-    // parser always stores it), so always emit the expanded block.
-    if is_safety_formula(&r.formula) {
+    // Safety annotation: `if safety then "// safety formula" else emptyDoc`.
+    // HS checks `isSafetyFormula (formulaToGuarded_ expandedFormula)`.
+    if is_safety_formula(&expanded) {
         out.push_str("\n  // safety formula");
     }
+    // Expanded formula block (always emitted — HS always has ogFormula = Just _).
     out.push_str("\n\n  /*\n  expanded formula:\n");
-    out.push_str(&pf::formula_doublequoted_nested(&r.formula, 2));
+    out.push_str(&pf::formula_doublequoted_nested(&expanded, 2));
     out.push_str("\n  */");
     out
 }

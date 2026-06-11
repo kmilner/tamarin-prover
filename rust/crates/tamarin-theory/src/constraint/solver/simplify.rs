@@ -3883,6 +3883,14 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
 /// The richer Increasing / subterm / pre-restriction-constraint
 /// machinery from Haskell is left for a follow-up; this minimal port
 /// is sound and unblocks the common Loop / Init-Copy-Stop pattern.
+/// Lift a `NodeId` (an `LVar` of sort Node) to an `LNTerm` variable —
+/// HS `varTerm (Free i)` for a node-id.
+fn node_id_to_lnterm(
+    n: &crate::constraint::constraints::NodeId,
+) -> tamarin_term::lterm::LNTerm {
+    tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Var(n.clone()))
+}
+
 fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
     use crate::tools::injective_fact_instances::MonotonicBehaviour;
 
@@ -3894,7 +3902,17 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
     let mut by_inj: Vec<(crate::constraint::constraints::NodeId,
                          crate::fact::LNFact,
                          &Vec<MonotonicBehaviour>)> = Vec::new();
-    for (id, rule) in &red.sys.nodes {
+    // HS-faithful: `getPairs`'s `behaviourTerms = M.map ... nodes` is a
+    // `Map NodeId`, and the `paired` comprehension iterates
+    // `M.toList behaviourTerms` for both i and j (Simplify.hs:812-830) —
+    // i.e. ASCENDING NodeId order, with a node's premises kept in their
+    // original `rPrems` order.  Iterate nodes sorted by NodeId (stable
+    // within a node) so the (i, j) pair enumeration matches HS; the
+    // `sys.nodes` Vec is in insertion order, not NodeId order.
+    let mut sorted_nodes: Vec<&(crate::constraint::constraints::NodeId, crate::rule::RuleACInst)> =
+        red.sys.nodes.iter().collect();
+    sorted_nodes.sort_by(|a, b| a.0.cmp(&b.0));
+    for (id, rule) in sorted_nodes {
         for prem in &rule.premises {
             if let Some((_, behaviours)) = red.ctx.injective_fact_insts.iter()
                 .find(|(t, _)| t == &prem.tag) {
@@ -3933,11 +3951,31 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
         }
         set
     };
-    let mut term_eqs: Vec<tamarin_term::rewriting::Equal<tamarin_term::lterm::LNTerm>>
-        = Vec::new();
-    let mut node_eqs: Vec<tamarin_term::rewriting::Equal<crate::constraint::constraints::NodeId>>
-        = Vec::new();
-    let mut new_inequalities: Vec<crate::guarded::Guarded> = Vec::new();
+    // HS-faithful: capture the formula set BEFORE this pass runs so the
+    // change-detection at the end can mirror Simplify.hs:765-769
+    //   updatedFormulas == oldFormulas && null newLesses → Unchanged.
+    // HS `oldFormulas = sFormulas ∪ sSolvedFormulas`.  `Guarded` is not
+    // `Ord`, so we model the Set as a sorted-by-`cmp_guarded` deduped
+    // Vec for the `==` comparison below.
+    let formula_set = |red: &Reduction| -> Vec<crate::guarded::Guarded> {
+        let mut v: Vec<crate::guarded::Guarded> = red.sys.formulas.iter()
+            .chain(red.sys.solved_formulas.iter())
+            .cloned()
+            .collect();
+        v.sort_by(crate::guarded::cmp_guarded);
+        v.dedup();
+        v
+    };
+    let old_formulas = formula_set(red);
+    // HS `simpInjectiveFactEqMon` inserts cases (1), (2) and (4) ALL as
+    // deferred formulas via `mapM_ insertFormula newFormulas`
+    // (Simplify.hs:745,747,748,760) — it does NO eager equation solving
+    // in this pass.  Case (1) `GAto $ EqE s t`, case (2) `GAto $ EqE
+    // (Free i) (Free j)`, case (4) `gnotAtom $ EqE s t`.  The merge /
+    // equation-solving is realised LATER by the formula machinery
+    // (`insertFormula`→`insertAtom`→`solveTermEqs SplitNow`), and the
+    // node merge by the next simplify iteration's `substSystem`.
+    let mut new_formulas: Vec<crate::guarded::Guarded> = Vec::new();
     let mut new_lesses: Vec<(crate::constraint::constraints::NodeId,
                              crate::constraint::constraints::NodeId)> = Vec::new();
     let reducible = red.ctx.maude.maude_sig().reducible_fun_syms.clone();
@@ -4047,23 +4085,67 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                     other => (other.clone(), i, j),
                 };
                 match eff_bh {
+                    // HS-faithful case (1) (Simplify.hs:745):
+                    //   Constant → [GAto $ EqE (lTermToBTerm s) (lTermToBTerm t) | s/=t]
+                    // Inserted LATER as a deferred formula (NOT eagerly
+                    // solved) — `insertFormula`→`insertAtom`→`solveTermEqs
+                    // SplitNow` realises the term equation with the same
+                    // contradiction checks the eager path had.
                     MonotonicBehaviour::Constant if s != t => {
-                        term_eqs.push(tamarin_term::rewriting::Equal {
-                            lhs: s.clone(), rhs: t.clone(),
-                        });
+                        let s_g = crate::guarded::term_to_gterm_free(
+                            &crate::elaborate::lnterm_to_term(s));
+                        let t_g = crate::guarded::term_to_gterm_free(
+                            &crate::elaborate::lnterm_to_term(t));
+                        new_formulas.push(crate::guarded::Guarded::Atom(
+                            crate::guarded::GAtom::Eq(s_g, t_g)));
                     }
-                    MonotonicBehaviour::StrictlyIncreasing if s == t => {
-                        if ii != jj {
-                            node_eqs.push(tamarin_term::rewriting::Equal {
-                                lhs: ii.clone(), rhs: jj.clone(),
-                            });
+                    // HS-faithful case (2) (Simplify.hs:747):
+                    //   StrictlyIncreasing, s==t →
+                    //     [GAto $ EqE (varTerm $ Free i) (varTerm $ Free j)]
+                    // The node-id equality `i = j` is inserted as a
+                    // deferred formula; `insertFormula`→`insertAtom`→
+                    // `solveTermEqs SplitNow [Equal (varTerm i) (varTerm j)]`
+                    // (identical to HS `solveNodeIdEqs`, Reduction.hs:956)
+                    // writes the `i := j` substitution into the eq-store,
+                    // and the NEXT simplify iteration's `substSystem`
+                    // performs the node merge + shape-mismatch contradiction.
+                    // HS-faithful StrictlyIncreasing arm (Simplify.hs:746-
+                    // 751).  HS does NOT gate on `s == t` vs `s /= t`: the
+                    // whole arm runs and EACH of cases (2),(4),(3),(5) is
+                    // a separate list-comprehension with its OWN guard, so
+                    // several can fire together.  In particular, when the
+                    // value at a strictly-increasing position has been
+                    // equated (`s == t`), case (2) emits `i = j` AND case
+                    // (5) STILL fires whenever a stale `s ≠ t` inequality
+                    // is present (`triviallyNotSmaller s t` holds for
+                    // `s == t`, and `ineq s t` holds because the negated
+                    // equality survives in the formula set) — emitting the
+                    // strict ordering `(j, i)`.  The NEXT iteration's
+                    // `substSystem` applies the `j := i` merge to that
+                    // `(j, i)` (and the symmetric `(i, j)` from the (j,i)
+                    // pair) less-atom, collapsing it to the `(#i,#i)`
+                    // self-loop that `contradictions` reads as `cyclic`.
+                    //
+                    // RS previously split this arm into `if s == t` (only
+                    // case 2) and `if s != t` (cases 4,3,5), so case (5)
+                    // never fired once the value equality landed — the
+                    // strict atom was lost and the merge produced no self-
+                    // loop, mislabelling the leaf `from formulas` instead
+                    // of `cyclic` (counter.spthy::counters_linear_order).
+                    MonotonicBehaviour::StrictlyIncreasing => {
+                        // case (2) (Simplify.hs:747): [EqE i j | s == t]
+                        if s == t && ii != jj {
+                            let i_g = crate::guarded::term_to_gterm_free(
+                                &crate::elaborate::lnterm_to_term(
+                                    &node_id_to_lnterm(ii)));
+                            let j_g = crate::guarded::term_to_gterm_free(
+                                &crate::elaborate::lnterm_to_term(
+                                    &node_id_to_lnterm(jj)));
+                            new_formulas.push(crate::guarded::Guarded::Atom(
+                                crate::guarded::GAtom::Eq(i_g, j_g)));
                         }
-                    }
-                    // HS-faithful case (4) (Simplify.hs:655): for a
-                    // StrictlyIncreasing position where the two nodes
-                    // are order-comparable, the value at that position
-                    // must differ — emit `s ≠ t`.
-                    MonotonicBehaviour::StrictlyIncreasing if s != t => {
+                        // case (4) (Simplify.hs:748): [¬EqE s t |
+                        //   alwaysBefore i j || alwaysBefore j i, notIneq s t]
                         let comparable = red.sys.always_before(ii, jj)
                                       || red.sys.always_before(jj, ii);
                         let already_ineq = inequalities.contains(&(s.clone(), t.clone()))
@@ -4077,15 +4159,15 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                                     &tamarin_parser::ast::Atom::Eq(s_ast, t_ast))],
                                 crate::guarded::gfalse(),
                             );
-                            new_inequalities.push(neg);
+                            new_formulas.push(neg);
                         }
-                        // HS-faithful case (3) (Simplify.hs:657):
-                        //   triviallySmaller s t && !alwaysBefore i j → emit i<j.
-                        // HS-faithful case (5) (Simplify.hs:658):
-                        //   triviallyNotSmaller s t && !alwaysBefore j i && ineq s t → emit j<i.
+                        // case (3) (Simplify.hs:750): [(i,j) |
+                        //   triviallySmaller s t, not alwaysBefore i j]
                         if trivially_smaller(s, t) && !red.sys.always_before(ii, jj) {
                             new_lesses.push((ii.clone(), jj.clone()));
                         }
+                        // case (5) (Simplify.hs:751): [(j,i) |
+                        //   triviallyNotSmaller s t, not alwaysBefore j i, ineq s t]
                         if trivially_not_smaller(s, t)
                             && !red.sys.always_before(jj, ii)
                             && (inequalities.contains(&(s.clone(), t.clone()))
@@ -4093,10 +4175,12 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                             new_lesses.push((jj.clone(), ii.clone()));
                         }
                     }
-                    // HS-faithful Increasing (Simplify.hs:659):
-                    //   delegates to StrictlyIncreasing for less-atoms
-                    //   only (no new formulas at this position).
-                    MonotonicBehaviour::Increasing if s != t => {
+                    // HS-faithful Increasing (Simplify.hs:752-754):
+                    //   `Increasing -> ([], snd $ simpSingle (StrictlyIncreasing,
+                    //    (i,s),(j,t)))` — no new formulas, but the SAME
+                    //   less-atom cases (3) and (5) as StrictlyIncreasing,
+                    //   again NOT gated on `s == t`.
+                    MonotonicBehaviour::Increasing => {
                         if trivially_smaller(s, t) && !red.sys.always_before(ii, jj) {
                             new_lesses.push((ii.clone(), jj.clone()));
                         }
@@ -4112,55 +4196,39 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
             }
         }
     }
-    if term_eqs.is_empty() && node_eqs.is_empty()
-        && new_inequalities.is_empty() && new_lesses.is_empty() {
-        return ChangeIndicator::Unchanged;
-    }
-    // Haskell `simpInjectiveFactEqMon` runs the term/node-id
-    // equation solvers via monadic bind that propagates failure.
-    // Surface Err / Contradictory as gfalse so the next
-    // contradictions check picks it up (FormulasFalse).  Without
-    // this, an injective-fact equation that fails to unify is
-    // silently dropped — leading to inconsistent state.
-    let mut hit_contra = false;
-    if !term_eqs.is_empty() {
-        let res = red.solve_term_eqs(
-            crate::constraint::solver::reduction::SplitStrategy::SplitLater,
-            &term_eqs);
-        if matches!(res, Err(_) | Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)) {
-            hit_contra = true;
-        }
-    }
-    if !node_eqs.is_empty() {
-        let res = red.solve_node_id_eqs(&node_eqs);
-        if matches!(res, Err(_) | Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)) {
-            hit_contra = true;
-        } else {
-            if let Ok(crate::constraint::solver::reduction::SolveOutcome::Cases(arms)) = res {
-                // HS DisjT fork (Reduction.hs:730-738): install arm[0]
-                // + stash the rest; never leave the taken default store.
-                install_pass_cases_arms(red, arms);
-            }
-            apply_node_eqs(red, &node_eqs);
-        }
-    }
-    // Insert the StrictlyIncreasing case-(4) `s ≠ t` formulas, mirroring
-    // HS `mapM_ insertFormula newFormulas` (Simplify.hs:667).
-    for neg in new_inequalities {
-        red.insert_formula(neg);
+    // HS `simpInjectiveFactEqMon` (Simplify.hs:758-762):
+    //   mapM_ insertFormula newFormulas
+    //   mapM_ (\(x,y) -> insertLess (LessAtom x y InjectiveFacts)) newLesses
+    // Formulas FIRST (cases 1, 2, 4), then less-atoms (cases 3, 5).
+    // `insertFormula` for an `EqE` atom routes through `insertAtom`→
+    // `solveTermEqs SplitNow`, which carries the same contradiction
+    // checks the old eager `solve_term_eqs`/`solve_node_id_eqs` path
+    // had (Contradictory → `mark_contradictory`; AC-multi-unifier →
+    // `pending_eq_arms` DisjT fork, drained by the outer simplify
+    // fan-out loop).  The node merge for case (2) is realised by the
+    // next iteration's `substSystem` once the `i := j` binding lands
+    // in the eq-store — so NO eager `apply_node_eqs` is needed.
+    for f in new_formulas {
+        red.insert_formula(f);
     }
     // Insert case (3)/(5) less-atoms with `InjectiveFacts` reason,
     // mirroring HS `mapM_ (\(x, y) -> insertLess (LessAtom x y
-    // InjectiveFacts)) newLesses` (Simplify.hs:668-669).
+    // InjectiveFacts)) newLesses` (Simplify.hs:761-762).
+    let any_new_lesses = !new_lesses.is_empty();
     for (sm, lg) in new_lesses {
         red.insert_less(crate::constraint::constraints::LessAtom::new(
             sm, lg, crate::constraint::constraints::Reason::InjectiveFacts));
     }
-    if hit_contra {
-        mark_contradictory_labeled(red, "simp_injective_fact_eq_mon");
+    // HS change-detection (Simplify.hs:765-769):
+    //   updatedFormulas = sFormulas ∪ sSolvedFormulas (AFTER inserts)
+    //   Changed iff (updatedFormulas /= oldFormulas) || not (null newLesses)
+    let updated_formulas = formula_set(red);
+    if updated_formulas == old_formulas && !any_new_lesses {
+        ChangeIndicator::Unchanged
+    } else {
+        red.changed = ChangeIndicator::Changed;
+        ChangeIndicator::Changed
     }
-    red.changed = ChangeIndicator::Changed;
-    ChangeIndicator::Changed
 }
 
 /// `reduceFormulas` — decompose every reducible formula in the open

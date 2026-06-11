@@ -153,7 +153,12 @@ worker() {
         hs_rc=124
         : > "$hs_out"
     elif [ -n "$key" ] && [ -f "$key_full" ]; then
-        gzip -dc "$key_full" > "$hs_out" 2>/dev/null
+        # Content-keyed cache: rewrite the path-echoing "analyzed:" line to
+        # THIS invocation's path (a hit recorded from another checkout/worktree
+        # would otherwise produce a spurious path-only diff).
+        gzip -dc "$key_full" 2>/dev/null \
+            | awk -v f="$f" '/^analyzed: / { print "analyzed: " f; next } { print }' \
+            > "$hs_out"
     else
         local hs_t0; hs_t0=$(date +%s%3N)
         timeout "$TIMEOUT" "$HS_PATH" +RTS -N1 -RTS --prove="$lemma" "$f" 2>/dev/null > "$hs_out"

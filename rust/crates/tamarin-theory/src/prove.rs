@@ -29,6 +29,24 @@ pub enum ProveError {
     Guarded(String),
 }
 
+/// Render the full HS `ppError` doc (Guarded.hs:479) for a failed guarded
+/// conversion: the error text, the quoted failing sub-formula (both
+/// quantifier-level errors include `ppFormula f0`, Guarded.hs:508-514 and
+/// 561-563), then "in the formula" + the quoted converted formula.  This is
+/// the exact message HS's `formulaToGuarded_ = either (error . render) id`
+/// (Guarded.hs:466-467) dies with when a proven lemma's formula cannot be
+/// converted.
+fn guard_error_doc(
+    e: &crate::guarded::GuardError,
+    formula: &tamarin_parser::ast::Formula,
+) -> String {
+    let full = crate::pretty_formula::pretty_formula(formula);
+    let sub = e.subject_formula.as_ref()
+        .map(|f| crate::pretty_formula::pretty_formula(f))
+        .unwrap_or_else(|| full.clone());
+    format!("{}\n  \"{}\"\nin the formula\n  \"{}\"", e.message, sub, full)
+}
+
 impl std::fmt::Display for ProveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -196,7 +214,7 @@ fn prove_lemma_in_session_mode(
         .ok_or_else(|| ProveError::LemmaNotFound(lemma_name.to_string()))?;
 
     let g = formula_to_guarded(&lemma.formula)
-        .map_err(|e| ProveError::Guarded(e.message))?;
+        .map_err(|e| ProveError::Guarded(guard_error_doc(&e, &lemma.formula)))?;
 
     // `[reuse]` lemmas declared BEFORE this one.  Same gather logic as
     // the pre-session prove_lemma_with_pool path.
@@ -390,7 +408,7 @@ pub fn prove_lemma_with_pool(
         .ok_or_else(|| ProveError::LemmaNotFound(lemma_name.to_string()))?;
 
     let g = formula_to_guarded(&lemma.formula)
-        .map_err(|e| ProveError::Guarded(e.message))?;
+        .map_err(|e| ProveError::Guarded(guard_error_doc(&e, &lemma.formula)))?;
 
     // Convert restrictions to guarded — drop any that fail conversion.
     let mut restrictions: Vec<Guarded> = Vec::new();
