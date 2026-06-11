@@ -833,6 +833,11 @@ pub fn fact_lhs_occur_no_rhs(thy: &Theory) -> WfReport {
     let mut s = String::new();
     s.push_str(&underline_topic(title));
     s.push('\n');
+    // HS `numbered'` = `numbered (text "")`: items are interspersed with
+    // `text ""` separators and joined by `$-$`.  `text ""` at indent 2
+    // (from the `nest 2` in the caller) renders as `"  "` (2 spaces).
+    // Result: item1\n  \nitem2\n  \nitem3\n (blank 2-space lines between items).
+    let last_idx = orphan_pairs.len() - 1;
     for (i, (rule_name, fa, suggestion)) in orphan_pairs.iter().enumerate() {
         let primary = format!(
             "in rule \"{}\":  factName `{}' arity: {} multiplicity: {}",
@@ -851,6 +856,11 @@ pub fn fact_lhs_occur_no_rhs(thy: &Theory) -> WfReport {
         };
         s.push_str(&line);
         s.push('\n');
+        // HS `numbered (text "")` inserts `text ""` between items.
+        // At 2-space indent this renders as "  \n".
+        if i < last_idx {
+            s.push_str("  \n");
+        }
     }
 
     vec![WfError::new(title, s)]
