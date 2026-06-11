@@ -507,7 +507,20 @@ fn prove_probe(
             );
         }
         if !ok {
-            undecidable.push(v.name.clone());
+            // HS reports `show LVar` — sort prefix included
+            // (MessageDerivationChecks.hs:138,156).
+            let prefix = match v.sort {
+                p::SortHint::Fresh | p::SortHint::Suffix(p::SuffixSort::Fresh) => "~",
+                p::SortHint::Pub | p::SortHint::Suffix(p::SuffixSort::Pub) => "$",
+                p::SortHint::Node | p::SortHint::Suffix(p::SuffixSort::Node) => "#",
+                p::SortHint::Nat | p::SortHint::Suffix(p::SuffixSort::Nat) => "%",
+                _ => "",
+            };
+            if v.idx == 0 {
+                undecidable.push(format!("{}{}", prefix, v.name));
+            } else {
+                undecidable.push(format!("{}{}.{}", prefix, v.name, v.idx));
+            }
         }
     }
 
