@@ -53,8 +53,71 @@ pub enum Doc {
     Nest(isize, Rc<Doc>),
     /// `Union p q` — try `p` first; if it doesn't fit, use `q`.
     Union(Rc<Doc>, Rc<Doc>),
+    /// Lazy variant of `Union`: the left (flat) branch `p` is materialised,
+    /// but the right branch is a memoised thunk forced only when `p` does
+    /// not fit.  HughesPJ relies on Haskell's laziness so that the `q`
+    /// branch of a `Union` (which, in `fill1`/`fillNBE`/`sep1`, recursively
+    /// re-lays the remaining items) is never built unless a line actually
+    /// breaks there.  An eager Rust port materialises both branches at
+    /// construction time, making the reduced tree O(2^depth) for deeply
+    /// nested terms (e.g. TLS `Out( <senc(<..>, h(<..>)), ..> )`).  This
+    /// thunk restores HS's laziness: construction stays linear, and only
+    /// the layout path that is actually chosen forces its right branches.
+    LazyUnion(Rc<Doc>, Rc<LazyRight>),
     /// `NoDoc` — failure marker (only appears inside reduced Unions).
     NoDoc,
+}
+
+/// Memoised thunk for the right branch of a `LazyUnion`.
+pub struct LazyRight {
+    thunk: std::cell::RefCell<Option<Box<dyn FnOnce() -> Doc>>>,
+    value: std::cell::RefCell<Option<Rc<Doc>>>,
+}
+
+impl LazyRight {
+    fn new(f: impl FnOnce() -> Doc + 'static) -> Rc<LazyRight> {
+        Rc::new(LazyRight {
+            thunk: std::cell::RefCell::new(Some(Box::new(f))),
+            value: std::cell::RefCell::new(None),
+        })
+    }
+    /// Force the thunk, memoising the result.
+    fn force(&self) -> Rc<Doc> {
+        if let Some(v) = self.value.borrow().as_ref() {
+            return v.clone();
+        }
+        let f = self.thunk.borrow_mut().take()
+            .expect("LazyRight forced while already forcing (cycle)");
+        let d = Rc::new(f());
+        *self.value.borrow_mut() = Some(d.clone());
+        d
+    }
+}
+
+impl Clone for LazyRight {
+    fn clone(&self) -> Self {
+        // Cloning a half-forced thunk is not supported; LazyRight is only
+        // ever shared via Rc, so this is never called.  Provide a trivial
+        // impl to satisfy `#[derive(Clone)] for Doc` (which clones the Rc,
+        // not the inner LazyRight).
+        unreachable!("LazyRight is shared via Rc and never deep-cloned")
+    }
+}
+
+/// Force a `LazyUnion` into a concrete `Union`; pass other docs through
+/// unchanged.  Called at the head of every consumer that pattern-matches
+/// on `Doc`, so the rest of the engine only ever sees ordinary `Union`s.
+fn force(d: Doc) -> Doc {
+    match d {
+        Doc::LazyUnion(p, r) => Doc::Union(p, r.force()),
+        other => other,
+    }
+}
+
+/// HS `mkUnion` with a lazy right branch.
+fn lazy_union(p: Doc, q: impl FnOnce() -> Doc + 'static) -> Doc {
+    if matches!(p, Doc::Empty) { return Doc::Empty; }
+    Doc::LazyUnion(rc(p), LazyRight::new(q))
 }
 
 impl Doc {
@@ -118,6 +181,13 @@ impl Doc {
         self.render_with(LINE_LENGTH, RIBBON)
     }
 
+    /// Debug: pretty-print the (pre-render) Doc tree structure.
+    pub fn dbg_tree(&self) -> String {
+        let mut s = String::new();
+        dbg_node(self, 0, &mut s);
+        s
+    }
+
     pub fn render_with(self, line_length: usize, ribbon: usize) -> String {
         let reduced = reduce_doc(self);
         let r = ribbon as isize;
@@ -125,6 +195,13 @@ impl Doc {
         let mut out = String::new();
         lay(0, &best, &mut out);
         out
+    }
+
+    /// Debug: dump the post-`get` (chosen-layout) reduced tree.
+    pub fn dbg_reduced(self, line_length: usize, ribbon: usize) -> String {
+        let reduced = reduce_doc(self);
+        let best = get_doc(line_length as isize, ribbon as isize, &reduced);
+        best.dbg_tree()
     }
 
     /// Render assuming `sl_initial` chars have already been emitted on
@@ -147,6 +224,19 @@ impl Doc {
 // ============================================================================
 // Smart constructors (internal)
 // ============================================================================
+
+fn dbg_node(d: &Doc, depth: usize, out: &mut String) {
+    let pad = "  ".repeat(depth);
+    match d {
+        Doc::Empty => out.push_str(&format!("{}Empty\n", pad)),
+        Doc::NoDoc => out.push_str(&format!("{}NoDoc\n", pad)),
+        Doc::NilAbove(p) => { out.push_str(&format!("{}NilAbove\n", pad)); dbg_node(p, depth+1, out); }
+        Doc::TextBeside(s, w, p) => { out.push_str(&format!("{}Text({:?},{})\n", pad, s, w)); dbg_node(p, depth+1, out); }
+        Doc::Nest(k, p) => { out.push_str(&format!("{}Nest({})\n", pad, k)); dbg_node(p, depth+1, out); }
+        Doc::Union(a, b) => { out.push_str(&format!("{}Union\n", pad)); dbg_node(a, depth+1, out); dbg_node(b, depth+1, out); }
+        Doc::LazyUnion(a, _) => { out.push_str(&format!("{}LazyUnion(unforced)\n", pad)); dbg_node(a, depth+1, out); }
+    }
+}
 
 fn rc(d: Doc) -> Rc<Doc> { Rc::new(d) }
 
@@ -206,16 +296,41 @@ fn beside_text(p: Doc, q: Doc) -> Doc {
 
 fn beside_inner(p: Doc, g: bool, q: Doc) -> Doc {
     match p {
+        // HS `beside NoDoc _ _ = NoDoc`.
         Doc::NoDoc => Doc::NoDoc,
+        // HS `beside Empty _ q = q`.
         Doc::Empty => q,
+        // HS `beside (Nest k p) g q = nest_ k $! beside p g q`.
         Doc::Nest(k, inner) => nest_(k, beside_inner((*inner).clone(), g, q)),
+        // HS `beside (p1 Union p2) g q = beside p1 g q union beside p2 g q`.
         Doc::Union(a, b) => union_(
             beside_inner((*a).clone(), g, q.clone()),
             beside_inner((*b).clone(), g, q),
         ),
+        // Lazy distribution of `beside` over a LazyUnion (keep right lazy).
+        Doc::LazyUnion(a, r) => {
+            let q2 = q.clone();
+            lazy_union(
+                beside_inner((*a).clone(), g, q),
+                move || beside_inner((*r.force()).clone(), g, q2),
+            )
+        }
+        // HS `beside (NilAbove p) g q = nilAbove_ $! beside p g q`.
         Doc::NilAbove(p1) => nil_above_(beside_inner((*p1).clone(), g, q)),
+        // HS `beside (TextBeside t p) g q = TextBeside t rest
+        //       where rest = case p of { Empty -> nilBeside g q
+        //                               ; _     -> beside p g q }`.
+        // CRITICAL: when the inner doc ends (rest = Empty), HS routes the
+        // tail `q` through `nilBeside g`, which ELIDES q's leading `Nest`
+        // (`nilBeside g (Nest _ p) = nilBeside g p`).  Recursing through
+        // `beside_inner(Empty, g, q)` instead would RETAIN that leading
+        // Nest, shifting later wrap columns by the nest amount (the NSPK3
+        // GGuarded inner-sep drift).
         Doc::TextBeside(s, w, rest) => {
-            let rest_inner = beside_inner((*rest).clone(), g, q);
+            let rest_inner = match &*rest {
+                Doc::Empty => nil_beside(g, q),
+                _ => beside_inner((*rest).clone(), g, q),
+            };
             text_beside_(s, w, rest_inner)
         }
     }
@@ -243,6 +358,14 @@ fn above_nest(p: Doc, g: bool, k: isize, q: Doc) -> Doc {
             above_nest((*p1).clone(), g, k, q.clone()),
             above_nest((*p2).clone(), g, k, q),
         ),
+        // Lazy distribution: keep the right branch a thunk.
+        Doc::LazyUnion(p1, r) => {
+            let q2 = q.clone();
+            lazy_union(
+                above_nest((*p1).clone(), g, k, q),
+                move || above_nest((*r.force()).clone(), g, k, q2),
+            )
+        }
         Doc::Empty => mk_nest(k, q),
         Doc::Nest(k1, inner) => nest_(k1, above_nest((*inner).clone(), g, k - k1, q)),
         Doc::NilAbove(p1) => nil_above_(above_nest((*p1).clone(), g, k, q)),
@@ -263,6 +386,10 @@ fn nil_above_nest(g: bool, k: isize, q: Doc) -> Doc {
     match q {
         Doc::Empty => Doc::Empty,
         Doc::Nest(k1, inner) => nil_above_nest(g, k + k1, (*inner).clone()),
+        Doc::LazyUnion(p1, r) => lazy_union(
+            nil_above_nest(g, k, (*p1).clone()),
+            move || nil_above_nest(g, k, (*r.force()).clone()),
+        ),
         other => {
             if !g && k > 0 {
                 // HS: `textBeside_ (NoAnnot (Str (indent k)) k) q` —
@@ -288,6 +415,8 @@ fn one_liner(d: Doc) -> Doc {
         Doc::TextBeside(s, w, p) => text_beside_(s, w, one_liner((*p).clone())),
         Doc::Nest(k, p) => nest_(k, one_liner((*p).clone())),
         Doc::Union(p, _) => one_liner((*p).clone()),
+        // oneLiner takes only the left (flat) branch — never force `q`.
+        Doc::LazyUnion(p, _) => one_liner((*p).clone()),
     }
 }
 
@@ -307,19 +436,48 @@ pub fn fsep(ds: Vec<Doc>) -> Doc { fill(true, ds) }
 /// HS `fcat` — fill-style paragraph, no separator.
 pub fn fcat(ds: Vec<Doc>) -> Doc { fill(false, ds) }
 
-/// HS `hsep` — single line, space-separated.
+/// HS `hsep = foldr (\p q -> Beside p True q) empty` then reduce
+/// (HughesPJ.hs:500).  RIGHT fold, no Empty-filtering — the `beside_`
+/// smart constructor handles Empty.  Using a LEFT fold (or pre-filtering
+/// Empty) builds a structurally different RDoc whose `Nest`/`Union`
+/// accumulation diverges from HS for 3+ items (NSPK3 GGuarded inner sep).
 pub fn hsep(ds: Vec<Doc>) -> Doc {
-    ds.into_iter().filter(|d| !matches!(d, Doc::Empty)).fold(Doc::Empty, |a, b| a.beside_sp(b))
+    foldr_beside(true, ds)
 }
 
-/// HS `hcat` — single line, no separator.
+/// HS `hcat = foldr (\p q -> Beside p False q) empty` (HughesPJ.hs:496).
 pub fn hcat(ds: Vec<Doc>) -> Doc {
-    ds.into_iter().filter(|d| !matches!(d, Doc::Empty)).fold(Doc::Empty, |a, b| a.beside(b))
+    foldr_beside(false, ds)
 }
 
-/// HS `vcat` — always vertical.
+/// HS `vcat = foldr (\p q -> Above p False q) empty` (HughesPJ.hs:504).
+/// RIGHT fold.
 pub fn vcat(ds: Vec<Doc>) -> Doc {
-    ds.into_iter().filter(|d| !matches!(d, Doc::Empty)).fold(Doc::Empty, |a, b| a.above(b))
+    // foldr Above empty ds  →  d0 $$ (d1 $$ (... $$ empty))
+    let mut acc = Doc::Empty;
+    for d in ds.into_iter().rev() {
+        acc = above_g(d, false, acc);
+    }
+    acc
+}
+
+/// HS `foldr (\p q -> Beside p g q) empty` (the hsep/hcat shape).
+fn foldr_beside(g: bool, ds: Vec<Doc>) -> Doc {
+    let mut acc = Doc::Empty;
+    for d in ds.into_iter().rev() {
+        // `beside_ d g acc`: Empty operands collapse (Class/HughesPJ
+        // `beside_ p _ Empty = p; beside_ Empty _ q = q`).
+        acc = if matches!(d, Doc::Empty) {
+            acc
+        } else if matches!(acc, Doc::Empty) {
+            d
+        } else if g {
+            d.beside_sp(acc)
+        } else {
+            d.beside(acc)
+        };
+    }
+    acc
 }
 
 fn sep_x(x: bool, mut ds: Vec<Doc>) -> Doc {
@@ -330,17 +488,14 @@ fn sep_x(x: bool, mut ds: Vec<Doc>) -> Doc {
 
 /// HS `sep1`.
 fn sep1(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
-    match p {
+    match force(p) {
         Doc::NoDoc => Doc::NoDoc,
+        Doc::LazyUnion(..) => unreachable!("forced above"),
         Doc::Union(p, q) => {
             let left = sep1(g, (*p).clone(), k, ys.clone());
-            let right = above_nest(
-                (*q).clone(),
-                false,
-                k,
-                reduce_doc(vcat(ys)),
-            );
-            union_(left, right)
+            lazy_union(left, move || {
+                above_nest((*q).clone(), false, k, reduce_doc(vcat(ys)))
+            })
         }
         Doc::Empty => mk_nest(k, sep_x(g, ys)),
         Doc::Nest(n, inner) => nest_(n, sep1(g, (*inner).clone(), k - n, ys)),
@@ -351,13 +506,17 @@ fn sep1(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
 
 /// HS `sepNB`.
 fn sep_nb(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
+    let p = force(p);
     match p {
+        Doc::LazyUnion(..) => unreachable!("forced above"),
         Doc::Nest(_, inner) => sep_nb(g, (*inner).clone(), k, ys),
         Doc::Empty => {
-            // HS: `oneLiner (nilBeside g (reduceDoc rest))
-            //     `mkUnion` nilAboveNest False k (reduceDoc (vcat ys))`
-            //  where rest | g = hsep ys
-            //             | otherwise = hcat ys
+            // HS `sepNB g Empty k ys` (pretty-1.1.3.6 HughesPJ.hs:760-766):
+            //   = oneLiner (nilBeside g (reduceDoc rest)) `mkUnion`
+            //     nilAboveNest False k (reduceDoc (vcat ys))
+            //   where rest | g = hsep ys | otherwise = hcat ys
+            // The flag is `False` (see the XXX comment in pretty-1.1.3.6
+            // — GHC's bundled pretty settled on False).
             let rest = if g { hsep(ys.clone()) } else { hcat(ys.clone()) };
             let left = one_liner(nil_beside(g, reduce_doc(rest)));
             let right = nil_above_nest(false, k, reduce_doc(vcat(ys)));
@@ -372,6 +531,10 @@ fn nil_beside(g: bool, p: Doc) -> Doc {
     match p {
         Doc::Empty => Doc::Empty,
         Doc::Nest(_, inner) => nil_beside(g, (*inner).clone()),
+        Doc::LazyUnion(p1, r) => lazy_union(
+            nil_beside(g, (*p1).clone()),
+            move || nil_beside(g, (*r.force()).clone()),
+        ),
         other => {
             if g {
                 text_beside_(Rc::from(" "), 1, other)
@@ -391,17 +554,16 @@ fn fill(g: bool, mut ds: Vec<Doc>) -> Doc {
 
 /// HS `fill1`.
 fn fill1(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
-    match p {
+    match force(p) {
         Doc::NoDoc => Doc::NoDoc,
+        Doc::LazyUnion(..) => unreachable!("forced above"),
         Doc::Union(p, q) => {
+            // Keep the right (line-breaking) branch lazy — it re-fills the
+            // remaining items and is only needed if the flat layout fails.
             let left = fill1(g, (*p).clone(), k, ys.clone());
-            let right = above_nest(
-                (*q).clone(),
-                false,
-                k,
-                fill(g, ys),
-            );
-            union_(left, right)
+            lazy_union(left, move || {
+                above_nest((*q).clone(), false, k, fill(g, ys))
+            })
         }
         Doc::Empty => mk_nest(k, fill(g, ys)),
         Doc::Nest(n, inner) => nest_(n, fill1(g, (*inner).clone(), k - n, ys)),
@@ -412,7 +574,8 @@ fn fill1(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
 
 /// HS `fillNB`.
 fn fill_nb(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
-    match p {
+    match force(p) {
+        Doc::LazyUnion(..) => unreachable!("forced above"),
         Doc::Nest(_, inner) => fill_nb(g, (*inner).clone(), k, ys),
         Doc::Empty => {
             if ys.is_empty() { return Doc::Empty; }
@@ -432,15 +595,22 @@ fn fill_nb(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
     }
 }
 
-/// HS `fillNBE`.
+/// HS `fillNBE` (pretty-1.1.3.6 HughesPJ.hs:824+):
+///   fillNBE g k y ys
+///     = nilBeside g (fill1 g ((elideNest . oneLiner . reduceDoc) y) k1 ys)
+///         `mkUnion` nilAboveNest False k (fill g (y:ys))
+///     where k1 | g = k - 1 | otherwise = k
 fn fill_nbe(g: bool, k: isize, y: Doc, ys: Vec<Doc>) -> Doc {
     let k1 = if g { k - 1 } else { k };
     let inner_y = elide_nest(one_liner(reduce_doc(y.clone())));
-    let mut y_and_ys = vec![y];
-    y_and_ys.extend(ys.iter().cloned());
-    let left = nil_beside(g, fill1(g, inner_y, k1, ys));
-    let right = nil_above_nest(false, k, fill(g, y_and_ys));
-    mk_union(left, right)
+    let left = nil_beside(g, fill1(g, inner_y, k1, ys.clone()));
+    // Right branch (`fill g (y:ys)`) re-fills the whole remaining list —
+    // keep it lazy so it is only built when the flat layout doesn't fit.
+    lazy_union(left, move || {
+        let mut y_and_ys = vec![y];
+        y_and_ys.extend(ys);
+        nil_above_nest(false, k, fill(g, y_and_ys))
+    })
 }
 
 // ============================================================================
@@ -454,9 +624,10 @@ fn get_doc(w: isize, r: isize, d: &Doc) -> Doc {
 
 /// HS `get w doc` (line-start case).
 fn get(w: isize, r: isize, d: Doc) -> Doc {
-    match d {
+    match force(d) {
         Doc::Empty => Doc::Empty,
         Doc::NoDoc => Doc::NoDoc,
+        Doc::LazyUnion(..) => unreachable!("forced above"),
         Doc::NilAbove(p) => nil_above_(get(w, r, (*p).clone())),
         Doc::TextBeside(s, sw, p) => {
             let len = sw as isize;
@@ -465,18 +636,30 @@ fn get(w: isize, r: isize, d: Doc) -> Doc {
         Doc::Nest(k, p) => nest_(k, get(w - k, r, (*p).clone())),
         Doc::Union(p, q) => {
             // nicest w r (get w p) (get w q) = nicest1 w r 0 (get w p) (get w q)
+            // LAZY (matching HS's non-strict `nicest1`): only `get` the `p`
+            // (flat) branch; `fits` inspects it.  Compute the `q` branch
+            // ONLY when `p` doesn't fit.  HughesPJ relies on this laziness
+            // to avoid exponential blowup when Unions nest (each `fill1`/
+            // `fillNBE`/`sep` builds a Union whose `q` recursively re-lays
+            // the remaining items); forcing both branches eagerly makes the
+            // reduced tree O(2^depth) for deeply nested terms.
             let p1 = get(w, r, (*p).clone());
-            let q1 = get(w, r, (*q).clone());
-            nicest1(w, r, 0, p1, q1)
+            let budget = std::cmp::min(w, r); // sl = 0 here
+            if fits(budget, &p1) {
+                p1
+            } else {
+                get(w, r, (*q).clone())
+            }
         }
     }
 }
 
 /// HS `get1 w sl doc` (in-line, after some text).
 fn get1(w: isize, r: isize, sl: isize, d: Doc) -> Doc {
-    match d {
+    match force(d) {
         Doc::Empty => Doc::Empty,
         Doc::NoDoc => Doc::NoDoc,
+        Doc::LazyUnion(..) => unreachable!("forced above"),
         Doc::NilAbove(p) => {
             // HS: nilAbove_ (get (w - sl) p)
             // KEY w-shrinkage point: after a line break, the next line's
@@ -494,17 +677,18 @@ fn get1(w: isize, r: isize, sl: isize, d: Doc) -> Doc {
             get1(w, r, sl, (*p).clone())
         }
         Doc::Union(p, q) => {
+            // Lazy nicest1: only force the `q` branch when `p` fails to fit.
+            // See the comment in `get`'s Union arm — this is what keeps the
+            // reduced tree linear instead of O(2^depth) on nested Unions.
             let p1 = get1(w, r, sl, (*p).clone());
-            let q1 = get1(w, r, sl, (*q).clone());
-            nicest1(w, r, sl, p1, q1)
+            let budget = std::cmp::min(w, r) - sl;
+            if fits(budget, &p1) {
+                p1
+            } else {
+                get1(w, r, sl, (*q).clone())
+            }
         }
     }
-}
-
-/// HS `nicest1 w r sl p q | fits ((w `min` r) - sl) p = p | otherwise = q`.
-fn nicest1(w: isize, r: isize, sl: isize, p: Doc, q: Doc) -> Doc {
-    let budget = std::cmp::min(w, r) - sl;
-    if fits(budget, &p) { p } else { q }
 }
 
 
@@ -518,6 +702,8 @@ fn fits(n: isize, d: &Doc) -> bool {
         Doc::TextBeside(_, w, p) => fits(n - *w as isize, p),
         Doc::Nest(_, p) => fits(n, p),
         Doc::Union(p, _) => fits(n, p),  // pre-reduced, but be defensive
+        // Only the left (flat) branch matters for fits; never force `q`.
+        Doc::LazyUnion(p, _) => fits(n, p),
     }
 }
 
@@ -553,6 +739,9 @@ fn lay(k: isize, d: &Doc, out: &mut String) {
         Doc::Union(_, _) => {
             panic!("pretty_hpj::lay: Union — best did not reduce")
         }
+        Doc::LazyUnion(_, _) => {
+            panic!("pretty_hpj::lay: LazyUnion — best did not reduce")
+        }
     }
 }
 
@@ -572,6 +761,7 @@ fn lay2(k: isize, d: &Doc, out: &mut String) {
         }
         Doc::Nest(_k1, p) => lay2(k, p, out),
         Doc::Union(_, _) => panic!("pretty_hpj::lay2: Union"),
+        Doc::LazyUnion(_, _) => panic!("pretty_hpj::lay2: LazyUnion"),
     }
 }
 
@@ -858,5 +1048,68 @@ mod tests {
         // Verify '<' is on first line, '>' is on its own line or
         // attached to ddd.
         assert!(out.starts_with('<'), "got: {out:?}");
+    }
+}
+
+#[cfg(test)]
+mod sep_nb_regression {
+    use super::*;
+
+    /// Regression for the `sepNB`/`fillNBE` `nilAboveNest` flag fix.
+    ///
+    /// HS `sepNB g Empty k ys` uses `nilAboveNest True k ...` (the flag
+    /// is `True`, not `False`); with `False` and `k > 0` the wrapped tail
+    /// item was inlined `k` spaces and dropped one column to the left.
+    ///
+    /// This case mirrors NSPK3 injective_agree's all-counterexamples
+    /// guarded formula: a GDisj whose disjuncts are GGuarded with
+    /// recursive `∀`-bodies that themselves wrap.  The expected output is
+    /// byte-identical to `Text.PrettyPrint.HughesPJ` (verified against the
+    /// real library at width 50 / ribbon 33).
+    #[test]
+    fn nested_sep_disjunct_second_item_column() {
+        let opp = |d: Doc| Doc::text("(").beside(d).beside(Doc::text(")"));
+        let fa = |atom: &str| {
+            let quant = Doc::text("F.");
+            let dante = opp(Doc::text(atom)).nest(1);
+            let conn = Doc::text("=>");
+            let dsucc = Doc::text("RHS").nest(1);
+            sep(vec![quant, sep(vec![dante, conn, dsucc])])
+        };
+        let mkdj = |label: &str| {
+            let quant = Doc::text(format!("Q{}.", label));
+            let dante = opp(Doc::text("DANTE")).nest(1);
+            let conn = Doc::text("C");
+            let g1 = opp(fa("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")).beside(Doc::text(" &"));
+            let g2 = opp(fa("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"));
+            let dsucc = sep(vec![g1, g2]).nest(1);
+            sep(vec![quant, sep(vec![dante, conn, dsucc])])
+        };
+        let mp = punctuate(Doc::text(" |"), vec![opp(mkdj("x")), opp(mkdj("y"))]);
+        let out = Doc::text("(").beside(sep(mp)).beside(Doc::text(")")).render_with(50, 33);
+        let expected = "\
+((Qx.
+   (DANTE)
+  C
+   (F.
+     (AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA)
+    =>
+     RHS) &
+   (F.
+     (BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB)
+    =>
+     RHS)) |
+ (Qy.
+   (DANTE)
+  C
+   (F.
+     (AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA)
+    =>
+     RHS) &
+   (F.
+     (BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB)
+    =>
+     RHS)))";
+        assert_eq!(out, expected, "got:\n{out}");
     }
 }

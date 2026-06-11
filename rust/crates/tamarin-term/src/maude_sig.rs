@@ -127,8 +127,17 @@ impl MaudeSig {
     }
 
     /// Add a free function symbol.
+    ///
+    /// HS `addFunSym funsym msig = msig <> mempty {stFunSyms = [funsym]}`
+    /// (Term/Maude/Signature.hs:152-154) — the `<>` routes through
+    /// `unionExceptPairSym`, so adding the `fst`/`snd` DESTRUCTOR variant
+    /// removes the built-in CONSTRUCTOR variant (and vice versa).  A plain
+    /// `insert` would leave BOTH `fst/1` and `fst/1[destructor]` in the set,
+    /// printing the symbol twice in the `functions:` header.
     pub fn add_fun_sym(mut self, sym: NoEqSym) -> Self {
-        self.st_fun_syms.insert(sym);
+        let mut singleton: BTreeSet<NoEqSym> = BTreeSet::new();
+        singleton.insert(sym);
+        self.st_fun_syms = union_except_pair_sym(&self.st_fun_syms, &singleton);
         self.refresh()
     }
 
@@ -164,19 +173,53 @@ impl MaudeSig {
     }
 }
 
+/// HS `unionExceptPairSym` (Term/Maude/Signature.hs:134-141):
+///
+///   unionExceptPairSym st1 st2 =
+///       removeIfNecessary (removeIfNecessary st1 st2 fstSym fstDestSym)
+///                         st2 sndSym sndDestSym
+///   removeIfNecessary st1 st2 x y =
+///       removeIfNecessary' (removeIfNecessary' st1 st2 x y) st2 y x
+///   removeIfNecessary' st1 st2 toAdd toRemove =
+///       if toAdd `member` st2 then union (delete toRemove st1) st2
+///                             else union st1 st2
+///
+/// The `fst`/`snd` constructor and destructor variants are mutually
+/// exclusive: whichever variant `st2` carries WINS, and the opposite
+/// variant is removed from `st1`.  This is asymmetric in `st2`, matching
+/// HS's monoid `<>` (where the right operand is the newly-added symbol).
 fn union_except_pair_sym(
     a: &BTreeSet<NoEqSym>,
     b: &BTreeSet<NoEqSym>,
 ) -> BTreeSet<NoEqSym> {
-    // Mirrors the Haskell exclusion: don't have both `fst` and `fstDest`
-    // (or `snd`/`sndDest`) in the merged signature; the destructor wins
-    // if present in either operand.
-    let mut out: BTreeSet<NoEqSym> = a.union(b).cloned().collect();
-    let fst_d = fst_dest_sym();
-    let snd_d = snd_dest_sym();
-    if out.contains(&fst_d) { out.remove(&fst_sym()); }
-    if out.contains(&snd_d) { out.remove(&snd_sym()); }
-    out
+    // removeIfNecessary' st1 st2 toAdd toRemove
+    fn remove_if_necessary_prime(
+        st1: &BTreeSet<NoEqSym>,
+        st2: &BTreeSet<NoEqSym>,
+        to_add: &NoEqSym,
+        to_remove: &NoEqSym,
+    ) -> BTreeSet<NoEqSym> {
+        if st2.contains(to_add) {
+            let mut out: BTreeSet<NoEqSym> = st1.clone();
+            out.remove(to_remove);
+            out.extend(st2.iter().cloned());
+            out
+        } else {
+            st1.union(st2).cloned().collect()
+        }
+    }
+    // removeIfNecessary st1 st2 x y
+    fn remove_if_necessary(
+        st1: &BTreeSet<NoEqSym>,
+        st2: &BTreeSet<NoEqSym>,
+        x: &NoEqSym,
+        y: &NoEqSym,
+    ) -> BTreeSet<NoEqSym> {
+        let s = remove_if_necessary_prime(st1, st2, x, y);
+        remove_if_necessary_prime(&s, st2, y, x)
+    }
+    let after_fst = remove_if_necessary(a, b, &fst_sym(), &fst_dest_sym());
+    remove_if_necessary(&after_fst, b, &snd_sym(), &snd_dest_sym())
 }
 
 // =============================================================================

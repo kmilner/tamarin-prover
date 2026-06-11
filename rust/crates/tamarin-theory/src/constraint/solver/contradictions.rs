@@ -132,50 +132,53 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
         }
         out.push(Contradiction::Cyclic);
     }
-    // Sort-conflated LVars defence-in-depth: two LVars sharing
-    // `(name, idx)` but with disjoint sub-sorts (Pub vs Fresh, etc.)
-    // can't be reconciled.  Haskell freshens globally so this never
-    // arises; our Maude-witness pipeline could in principle produce
-    // such pairs across grafted source-cases.  Empirically this check
-    // doesn't fire on the current NSLPK3 false-positive corpus (those
-    // FPs have a different root cause — see solver-memory #26), but
-    // it's a cheap correctness guard for any future regression.
-    if has_sort_conflated_lvars(sys) { out.push(Contradiction::IncompatibleEqs); }
+    // HS-faithful enumeration ORDER (`contradictionsRaw`, Contradictions.hs:
+    // 134-165): the returned list's HEAD is the recorded reason, so the push
+    // order MUST mirror HS's `asum [...]` exactly:
+    //   Cyclic, SubtermCyclic, NonNormalTerms, ForbiddenKD, ImpossibleChain,
+    //   ForbiddenExp, ForbiddenBP, ForbiddenChain, IncompatibleEqs,
+    //   FormulasFalse, then NonInjectiveFactInstance, then NodeAfterLast.
+    //
+    // RS-only defence-in-depth checks that have no HS counterpart map onto
+    // `IncompatibleEqs` (CR-rules S_≐/S_≈) and are placed at that slot.
+
+    // 2. SubtermCyclic — `isContradictory subtermStore`.
     if sys.subterm_store.is_false() { out.push(Contradiction::SubtermCyclic); }
     if has_subterm_cycle_contra(_ctxt, sys) { out.push(Contradiction::SubtermCyclic); }
+    // 3. NonNormalTerms.
     if has_non_normal_terms(_ctxt, sys) { out.push(Contradiction::NonNormalTerms); }
-    if has_incompatible_edge_facts(sys) { out.push(Contradiction::IncompatibleEqs); }
-    if has_fresh_fact_sort_violation(sys) { out.push(Contradiction::IncompatibleEqs); }
-    if sys.eq_store.is_false() { out.push(Contradiction::IncompatibleEqs); }
-    // FormulasFalse: detect a `gfalse` (empty disjunction) at the top
-    // level. Our `Guarded` represents False as `Disj([])`.
-    if has_false_formula(sys) { out.push(Contradiction::FormulasFalse); }
-    if has_forbidden_chain(sys) { out.push(Contradiction::ForbiddenChain); }
+    // 4. ForbiddenKD.
     if has_forbidden_kd(sys) { out.push(Contradiction::ForbiddenKD); }
+    // 5. ImpossibleChain.
     if has_impossible_chain(_ctxt, sys) { out.push(Contradiction::ImpossibleChain); }
-    // HS-faithful port: ForbiddenExp (Contradictions.hs:147 +
-    // 362-388).  Drops Exp-down rule instances whose g is simple,
-    // whose MsgVar args are KU-known earlier, and whose exponent
-    // factors are already in the up-premise.  Gated on enableDH.
+    // 6. ForbiddenExp (Contradictions.hs:147 + 362-388).  Drops Exp-down rule
+    //    instances whose g is simple, whose MsgVar args are KU-known earlier,
+    //    and whose exponent factors are already in the up-premise.  enableDH.
     if _ctxt.maude.maude_sig().enable_dh && has_forbidden_exp(sys) {
         out.push(Contradiction::ForbiddenExp);
     }
-    // HS-faithful port: ForbiddenBP (Contradictions.hs:149 +
-    // 392-483).  Drops Pmult-down / Emap-down rule instances violating
-    // BP normal-form (redundant scalars, simplifiable em-then-exp
-    // compositions, tag-order violations on Emap's two protocol
-    // providers).  Gated on enableBP.
-    //
-    // Triggering case Chen_Kudla::key_agreement_reachable:
-    // RS's variant fan-out at saturate (`solve_chain_goal` produces
-    // one case per variant arm) leaks KGC_Setup / Init_1 source-case
-    // variants that HS would drop here.  Without this check the
-    // proof divergence at `case Resp_1` is masked by extra siblings.
+    // 7. ForbiddenBP (Contradictions.hs:149 + 392-483).  Drops Pmult-down /
+    //    Emap-down rule instances violating BP normal-form (redundant scalars,
+    //    simplifiable em-then-exp compositions, Emap tag-order violations).
+    //    enableBP.  (Chen_Kudla::key_agreement_reachable relies on this.)
     if _ctxt.maude.maude_sig().enable_bp && has_forbidden_bp(sys) {
         out.push(Contradiction::ForbiddenBP);
     }
-    out.extend(node_after_last(sys));
+    // 8. ForbiddenChain.
+    if has_forbidden_chain(sys) { out.push(Contradiction::ForbiddenChain); }
+    // 9. IncompatibleEqs — `eqsIsFalse sEqStore` plus RS-only sort/edge-fact
+    //    guards that are likewise irreconcilable-equality contradictions.
+    if has_sort_conflated_lvars(sys) { out.push(Contradiction::IncompatibleEqs); }
+    if has_incompatible_edge_facts(sys) { out.push(Contradiction::IncompatibleEqs); }
+    if has_fresh_fact_sort_violation(sys) { out.push(Contradiction::IncompatibleEqs); }
+    if sys.eq_store.is_false() { out.push(Contradiction::IncompatibleEqs); }
+    // 10. FormulasFalse — `gfalse ∈ sFormulas` (our `Disj([])`).
+    if has_false_formula(sys) { out.push(Contradiction::FormulasFalse); }
+    // 11. NonInjectiveFactInstance (×n) — BEFORE NodeAfterLast, matching HS's
+    //     list concatenation order (Contradictions.hs:162 then :165).
     out.extend(non_injective_fact_instances(_ctxt, sys));
+    // 12. NodeAfterLast (×n).
+    out.extend(node_after_last(sys));
     out
 }
 

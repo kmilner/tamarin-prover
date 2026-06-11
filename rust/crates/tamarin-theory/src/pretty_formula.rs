@@ -76,6 +76,40 @@ pub fn pretty_formula_wrapped(f: &p::Formula, indent: usize, _width: usize) -> S
     doc.render_at(hpj::LINE_LENGTH, hpj::RIBBON, indent)
 }
 
+/// Render the lemma-header line, mirroring HS `prettyLemma`
+/// (Lemma.hs:119-122):
+///   `nest 2 $ sep [ prettyTraceQuantifier, doubleQuotes (prettyLNFormula f) ]`
+/// Built as ONE `Doc` through the HS-faithful engine so the `sep`
+/// (quant-keyword vs formula) flat-or-wrap decision, the formula's
+/// internal `sep`/`nest` wrapping, and the continuation-line indents are
+/// byte-identical to HS.  `quant` is the trace-quantifier keyword (e.g.
+/// `"all-traces"` / `"exists-trace"`).  The returned string begins at
+/// column 0 (the `nest 2` indent IS included in the output, like HS's
+/// `nest 2` rendered at the theory's column 0).
+pub fn lemma_header_line(quant: &str, f: &p::Formula) -> String {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let mut state = avoid_precise_formula(f);
+    let formula_doc = formula_to_doc(f, &[], &mut state);
+    // `doubleQuotes d = "\"" <> d <> "\""` (Class.hs:148).
+    let dq = Doc::text("\"").beside(formula_doc).beside(Doc::text("\""));
+    // `sep [quant, dq]` then `nest 2`.
+    let line = hpj::sep(vec![Doc::text(quant), dq]).nest(2);
+    line.render()
+}
+
+/// Render `nest n $ doubleQuotes (prettyLNFormula f)` through the
+/// HS-faithful engine (the restriction-body shape, TheoryObject.hs:850).
+/// The `nest n` indent is included in the output; the `"` is a real Doc
+/// `beside` so the formula's wrapped continuation lines indent to the
+/// formula's start column.
+pub fn formula_doublequoted_nested(f: &p::Formula, nest_n: usize) -> String {
+    use crate::pretty_hpj::Doc;
+    let mut state = avoid_precise_formula(f);
+    let formula_doc = formula_to_doc(f, &[], &mut state);
+    let dq = Doc::text("\"").beside(formula_doc).beside(Doc::text("\""));
+    dq.nest(nest_n as isize).render()
+}
+
 /// Pretty-print a guarded formula.  Mirrors Haskell's
 /// `prettyGuarded` (Guarded.hs:822-826):
 ///
@@ -101,15 +135,120 @@ pub fn pretty_guarded(g: &Guarded) -> String {
 /// line width.  Mirrors Haskell's `prettyGuarded` (Guarded.hs:822-864)
 /// composed with the HughesPJ `sep`/`nest` layout semantics.
 ///
-/// We use the legacy string-based path here rather than the Doc engine
-/// because the original layout matches HS byte-exact on Tutorial and
-/// the engine path needs further calibration to handle the `nest 1`
-/// w-budget bookkeeping that HS uses for the 3-item inner sep here.
-/// The Doc engine IS used for the formula-side wrap (which fixes the
-/// wireguard 5-deep And case) via `pretty_formula_wrapped`.
-pub fn pretty_guarded_wrapped(g: &Guarded, indent: usize, width: usize) -> String {
+/// Routes through the HS-faithful Doc engine (`crate::pretty_hpj`):
+/// `guarded_to_doc` builds a `Doc` tree that mirrors HS `prettyGuarded`'s
+/// `sep`/`nest`/`fsep` structure node-for-node, then `render_at` lays it
+/// out with the same `get1` per-NilAbove `w`-shrinkage HughesPJ uses
+/// (HughesPJ.hs:1011).  `indent` is the column where the formula's first
+/// char will land (e.g. 1, right after the opening `"` of the lemma's
+/// `doubleQuotes` wrap, Lemma.hs:138/141).
+///
+/// NOTE: `render_at`'s `sl_initial` only shrinks the budget; it does NOT
+/// shift continuation lines by the leading prefix width.  In HS the
+/// `prettyGuarded` doc is the RIGHT operand of `doubleQuotes`'s `<>`
+/// (`"\"" <> prettyGuarded <> "\""`, Class.hs:148), and HughesPJ `beside`
+/// DOES shift the right doc's vertical layout by the leading `"`'s width
+/// (1 col).  Callers that place the formula after a 1-col prefix must use
+/// `pretty_guarded_doublequoted` (which models the `"` as a real Doc
+/// `beside`, getting the continuation indent right).  This bare entry
+/// point is kept for callers that pass `indent=0`.
+pub fn pretty_guarded_wrapped(g: &Guarded, indent: usize, _width: usize) -> String {
+    use crate::pretty_hpj as hpj;
     let mut state = avoid_precise_guarded(g);
-    pp_guarded_inner_wrapped(g, false, indent, /*line_start=*/0, width, &[], &mut state)
+    let doc = guarded_to_doc(g, &[], &mut state);
+    doc.render_at(hpj::LINE_LENGTH, hpj::RIBBON, indent)
+}
+
+/// HS `doubleQuotes (prettyGuarded gf)` (Lemma.hs:138/141, Class.hs:148).
+/// Builds `"\"" <> guarded_doc <> "\""` as a single Doc and renders it,
+/// so HughesPJ `beside`'s column-shift puts continuation lines at the
+/// formula's start column (1, right after the opening quote) — matching
+/// HS byte-exact.  The result is the full `"..."` string.
+pub fn pretty_guarded_doublequoted(g: &Guarded) -> String {
+    use crate::pretty_hpj::Doc;
+    let mut state = avoid_precise_guarded(g);
+    let doc = guarded_to_doc(g, &[], &mut state);
+    Doc::text("\"").beside(doc).beside(Doc::text("\"")).render()
+}
+
+/// Build the `pretty_hpj::Doc` for a `prettyGoal (DisjG (Disj gfs))`
+/// (Constraints.hs:281-283):
+///   `fsep $ punctuate (operator_ "  ∥") (map (nest 1 . parens . prettyGuarded) gfs)`
+/// Each disjunct is `nest 1 (parens (prettyGuarded gf))`, the separator is
+/// `"  ∥"` (two spaces + ∥) placed AFTER each non-last item by `punctuate`,
+/// and the items are joined by `fsep` (paragraph-fill, one space between).
+pub fn disj_goal_to_doc(gfs: &[Guarded]) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let items: Vec<Doc> = gfs.iter()
+        .map(|g| {
+            let mut state = avoid_precise_guarded(g);
+            let inner = guarded_to_doc(g, &[], &mut state);
+            // `nest 1 (parens (prettyGuarded gf))` — `parens` (Class.hs:149)
+            // is `"(" <> d <> ")"`.
+            Doc::text("(").beside(inner).beside(Doc::text(")")).nest(1)
+        })
+        .collect();
+    let punct = hpj::punctuate(Doc::text("  \u{2225}"), items); // "  ∥"
+    hpj::fsep(punct)
+}
+
+/// Render a full `solve( <DisjG> )` proof-method line through the
+/// HS-faithful engine, mirroring HS
+///   `SolveGoal goal -> keyword_ "solve(" <-> prettyGoal goal <-> keyword_ ")"`
+/// (ProofMethod.hs:1494) where `<->` is `<+>` (beside-with-space).  The
+/// whole thing is built as ONE `Doc` so HughesPJ's beside column-shift
+/// indents the goal's wrapped continuation lines to the column after
+/// `solve( ` (= `indent + 7`), byte-identical to HS.
+///
+/// `indent` is the column where `solve(` starts (the proof-tree depth
+/// indent).  The returned string's FIRST line has NO leading indent (the
+/// proof-tree printer adds that itself); continuation lines carry their
+/// full absolute indentation.
+pub fn solve_disj_goal_line(gfs: &[Guarded], indent: usize) -> String {
+    use crate::pretty_hpj::Doc;
+    let goal_doc = disj_goal_to_doc(gfs);
+    // `keyword_ "solve(" <+> goal <+> keyword_ ")"`.
+    let line = Doc::text("solve(")
+        .beside_sp(goal_doc)
+        .beside_sp(Doc::text(")"));
+    // Place at column `indent`: nest by `indent` so continuation lines are
+    // indented to absolute columns, then strip the leading `indent` spaces
+    // from the first line (the proof-tree printer prepends them itself).
+    let indented = line.nest(indent as isize);
+    let rendered = indented.render();
+    // The first line begins with exactly `indent` spaces from the nest.
+    let strip = rendered.chars().take(indent).take_while(|c| *c == ' ').count();
+    rendered[strip..].to_string()
+}
+
+/// Build the `solve( <goal> )` line for a NON-DisjG goal, where the
+/// caller has already constructed `goal_doc` for the goal body (HS
+/// `prettyGoal`, Constraints.hs:273-287).  Mirrors HS
+///   `SolveGoal goal -> keyword_ "solve(" <-> prettyGoal goal <-> keyword_ ")"`
+/// (ProofMethod.hs:1494), `<->` = `<+>` (beside-with-space).  The whole
+/// line is ONE `Doc` so HughesPJ's beside column-shift indents the goal's
+/// wrapped continuation lines to the column after `solve( ` (= indent+7),
+/// byte-identical to HS.  Same wrapping plumbing as `solve_disj_goal_line`.
+pub fn solve_goal_line_from_doc(goal_doc: crate::pretty_hpj::Doc, indent: usize) -> String {
+    use crate::pretty_hpj::Doc;
+    let line = Doc::text("solve(")
+        .beside_sp(goal_doc)
+        .beside_sp(Doc::text(")"));
+    let indented = line.nest(indent as isize);
+    let rendered = indented.render();
+    let strip = rendered.chars().take(indent).take_while(|c| *c == ' ').count();
+    rendered[strip..].to_string()
+}
+
+/// Public accessor for the Doc-based fact renderer (HS `prettyLNFact` /
+/// `prettyFact`), for use building goal Docs in pretty_theory.rs.
+pub fn fact_doc(fa: &p::Fact) -> crate::pretty_hpj::Doc {
+    fact_to_doc(fa, &[])
+}
+
+/// Public accessor for the Doc-based term renderer (HS `prettyLNTerm`).
+pub fn term_doc(t: &p::Term) -> crate::pretty_hpj::Doc {
+    term_to_doc(t, &[])
 }
 
 /// Pretty-print an atom standalone (e.g. inside a goal label).
@@ -131,6 +270,40 @@ pub fn pretty_fact(fa: &p::Fact) -> String {
     let mut s = String::new();
     pp_fact(fa, &[], &mut s);
     s
+}
+
+/// HS `ppFactsList list = fsep [operator_ "[", ppList (map ppFact list),
+/// operator_ "]"]` where `ppList = fsep . punctuate comma`
+/// (Theory/Model/Rule.hs:1266-1268).
+fn facts_list_doc(facts: &[p::Fact]) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let inner: Vec<Doc> = facts.iter().map(|f| fact_to_doc(f, &[])).collect();
+    let body = hpj::fsep(hpj::punctuate(comma_doc(), inner));
+    hpj::fsep(vec![Doc::text("["), body, Doc::text("]")])
+}
+
+/// HS `prettyRuleRestrGen` (Theory/Model/Rule.hs:1254-1262):
+///   `sep [ nest 1 (ppFactsList prems)
+///        , if null acts then "-->"
+///          else fsep ["--[", ppList (map ppFact acts), "]->"]
+///        , nest 1 (ppFactsList concls) ]`
+/// Built as a `pretty_hpj::Doc` so the `sep`/`fsep` wrapping is HS-exact.
+pub fn rule_body_to_doc(
+    prems: &[p::Fact],
+    acts: &[p::Fact],
+    concls: &[p::Fact],
+) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let prem_doc = facts_list_doc(prems).nest(1);
+    let arrow = if acts.is_empty() {
+        Doc::text("-->")
+    } else {
+        let act_docs: Vec<Doc> = acts.iter().map(|f| fact_to_doc(f, &[])).collect();
+        let act_body = hpj::fsep(hpj::punctuate(comma_doc(), act_docs));
+        hpj::fsep(vec![Doc::text("--["), act_body, Doc::text("]->")])
+    };
+    let conc_doc = facts_list_doc(concls).nest(1);
+    hpj::sep(vec![prem_doc, arrow, conc_doc])
 }
 
 // =============================================================================
@@ -554,25 +727,6 @@ pub const LINE_LENGTH: usize = 110;
 /// this constant.
 pub const WRAP_WIDTH: usize = RIBBON;
 
-/// HS-faithful fit check.  Returns `true` iff a flat doc of length
-/// `flat_len` whose first char would land at column `start_col`, on a
-/// line that began at column `line_start`, with effective remaining
-/// lineLength budget `eff_w`, would fit per HS HughesPJ
-/// `fits ((w `min` r) - sl) p` (HughesPJ.hs:873).
-///
-/// HS's check: `sl + flat_len <= min(w, r)`, where
-///   - `sl = start_col - line_start` (chars before the doc on the
-///     current line, in the `get1` TextBeside chain),
-///   - `w = eff_w` (HS's `w` at this point in the doc walk),
-///   - `r = RIBBON`.
-///
-/// Equivalently: `end_col <= line_start + min(eff_w, RIBBON)`.
-fn fits_flat(line_start: usize, start_col: usize, flat_len: usize, eff_w: usize) -> bool {
-    let end_col = start_col + flat_len;
-    let cap = line_start + std::cmp::min(eff_w, RIBBON);
-    end_col <= cap
-}
-
 fn resolved_sort(v: &p::VarSpec, scope: &[Bind]) -> p::SortHint {
     if !matches!(v.sort, p::SortHint::Untagged) {
         return v.sort;
@@ -713,8 +867,431 @@ fn pp_fact(fa: &p::Fact, scope: &[Bind], out: &mut String) {
 }
 
 // =============================================================================
-// Term
+// Term / Fact — HughesPJ Doc engine (HS-faithful wrapping)
+//
+// `term_to_doc` mirrors HS `prettyTerm` (Term/Term.hs:268-296): pairs use
+// `ppTerms ", " 1 "<" ">" = fcat . (text "<":) . (++[text ">"]) . map (nest 1)
+// . punctuate ", " . map ppTerm`; function applications use
+// `ppFun f ts = text (f ++ "(") <> fsep (punctuate comma (map ppTerm ts))
+// <> text ")"`.  `fact_to_doc` mirrors HS `prettyFact`/`ppFact`
+// (Theory/Model/Fact.hs:539-544) = `nestShort' (n++"(") ")" . fsep .
+// punctuate comma $ map ppTerm ts`, with `nestShort' lead finish =
+// nestShort (length lead + 1) (text lead) (text finish)` and
+// `nestShort n lead finish body = sep [lead $$ nest n body, finish]`
+// (Class.hs:218-223).  Building these as real `pretty_hpj::Doc` trees and
+// letting the ported HughesPJ engine lay them out makes the fcat/fsep/sep
+// wrap decisions byte-identical to HS, replacing the hand-rolled string
+// packers in pretty_theory.rs.
 // =============================================================================
+
+/// HS `comma = char ','`.
+fn comma_doc() -> crate::pretty_hpj::Doc {
+    crate::pretty_hpj::Doc::char(',')
+}
+
+/// Pretty-print a parser-AST term as a `pretty_hpj::Doc`.  Faithful to HS
+/// `prettyTerm`.  `scope` carries bound-var display names (empty for rule
+/// bodies; populated when rendering proof-tree/formula terms).
+pub fn term_to_doc(t: &p::Term, scope: &[Bind]) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::Doc;
+    use p::Term::*;
+    match t {
+        // Atomic / non-wrapping leaves: render via the existing string
+        // printer (these never break internally in HS either).
+        Var(_) | PubLit(_) | FreshLit(_) | NatLit(_) | Number(_) | NumberOne
+        | NatOne | DhNeutral | PatMatch(_) => {
+            let mut s = String::new();
+            pp_term(t, TermPrec::Top, scope, &mut s);
+            Doc::text(s)
+        }
+        Pair(items) => {
+            // Flatten right-associative pairs exactly as HS `split` does
+            // (Term/Term.hs:292-293), splicing a trailing Pair.
+            let mut flat: Vec<&p::Term> = Vec::with_capacity(items.len());
+            let mut cur: &[p::Term] = items;
+            loop {
+                let n = cur.len();
+                if n == 0 { break; }
+                for it in &cur[..n - 1] { flat.push(it); }
+                let last = &cur[n - 1];
+                if let Pair(inner) = last { cur = inner; } else { flat.push(last); break; }
+            }
+            pair_doc(&flat, scope)
+        }
+        App(name, args) => {
+            if args.is_empty() {
+                // HS `FApp (NoEq (f,_)) [] -> text f` (Term/Term.hs:278).
+                Doc::text(name.clone())
+            } else {
+                fun_doc(name, args, scope)
+            }
+        }
+        AlgApp(name, l, r) => fun_doc_two(name, l, r, scope),
+        Diff(l, r) => fun_doc_two("diff", l, r, scope),
+        BinOp(op, l, r) => {
+            // HS `prettyTerm` (Term/Term.hs:273-274):
+            //   `FApp (AC o) ts -> ppTerms (ppACOp o) 1 "(" ")" ts`  (wraps via fcat)
+            //   `FApp (NoEq s) [t1,t2] | s == expSym -> ppTerm t1 <> "^" <> ppTerm t2`
+            //     (flat beside, never breaks).
+            // exp renders flat; AC ops (Mult/Union/Xor/NatPlus) use the SAME
+            // fcat structure as pairs, with `(`/`)` lead/finish and the AC-op
+            // symbol as separator (no surrounding spaces).
+            if matches!(op, p::BinOp::Exp) {
+                let mut s = String::new();
+                pp_term(t, TermPrec::Top, scope, &mut s);
+                Doc::text(s)
+            } else {
+                // Flatten same-op children to the n-ary chain HS's `viewTerm`
+                // exposes for AC symbols.
+                fn flatten<'a>(op: p::BinOp, t: &'a p::Term, out: &mut Vec<&'a p::Term>) {
+                    match t {
+                        p::Term::BinOp(inner, l, r) if *inner == op => {
+                            flatten(op, l, out);
+                            flatten(op, r, out);
+                        }
+                        _ => out.push(t),
+                    }
+                }
+                let mut flat: Vec<&p::Term> = Vec::new();
+                flatten(*op, l, &mut flat);
+                flatten(*op, r, &mut flat);
+                ac_op_doc(binop_symbol(*op), &flat, scope)
+            }
+        }
+    }
+}
+
+/// HS `ppTerms (ppACOp o) 1 "(" ")" ts` (Term/Term.hs:273,288-290) — a fcat
+/// of `text "("`, each element `nest 1`'d and AC-op-suffixed (except last),
+/// and `text ")"`.  Structurally identical to `pair_doc` with different
+/// lead/finish/separator.  The AC-op symbol carries NO surrounding spaces
+/// (HS `punctuate (text sepa)` with `sepa = "++"`/`"*"`/`"⊕"`/`"%+"`).
+fn ac_op_doc(sym: &str, flat: &[&p::Term], scope: &[Bind]) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let n = flat.len();
+    let mut parts: Vec<Doc> = Vec::with_capacity(n + 2);
+    parts.push(Doc::text("("));
+    for (i, t) in flat.iter().enumerate() {
+        let mut d = term_to_doc(t, scope);
+        if i + 1 < n {
+            d = d.beside(Doc::text(sym.to_string()));
+        }
+        parts.push(d.nest(1));
+    }
+    parts.push(Doc::text(")"));
+    hpj::fcat(parts)
+}
+
+/// HS `ppTerms ", " 1 "<" ">" flat` (Term/Term.hs:288-290) — a fcat of
+/// `text "<"`, each element `nest 1`'d and comma-suffixed (except last),
+/// and `text ">"`.
+fn pair_doc(flat: &[&p::Term], scope: &[Bind]) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let n = flat.len();
+    let mut parts: Vec<Doc> = Vec::with_capacity(n + 2);
+    parts.push(Doc::text("<"));
+    for (i, t) in flat.iter().enumerate() {
+        // HS punctuates with `text ", "`, so all but the last get a
+        // trailing ", "; then each is `nest 1`.
+        let mut d = term_to_doc(t, scope);
+        if i + 1 < n {
+            d = d.beside(Doc::text(", "));
+        }
+        parts.push(d.nest(1));
+    }
+    parts.push(Doc::text(">"));
+    hpj::fcat(parts)
+}
+
+/// HS `ppFun f ts = text (f ++ "(") <> fsep (punctuate comma (map ppTerm ts))
+/// <> text ")"` (Term/Term.hs:295-296).
+fn fun_doc(name: &str, args: &[p::Term], scope: &[Bind]) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let arg_docs: Vec<Doc> = args.iter().map(|a| term_to_doc(a, scope)).collect();
+    let body = hpj::fsep(hpj::punctuate(comma_doc(), arg_docs));
+    Doc::text(format!("{}(", name)).beside(body).beside(Doc::text(")"))
+}
+
+/// `fun_doc` for the binary algebraic / diff shapes that the parser stores
+/// as boxed pairs rather than a `Vec`.
+fn fun_doc_two(
+    name: &str,
+    l: &p::Term,
+    r: &p::Term,
+    scope: &[Bind],
+) -> crate::pretty_hpj::Doc {
+    let args = [l.clone(), r.clone()];
+    fun_doc(name, &args, scope)
+}
+
+/// Pretty-print a fact as a `pretty_hpj::Doc`.  Faithful to HS `prettyFact`
+/// / `ppFact` (Theory/Model/Fact.hs:539-544) with `nestShort'`
+/// (Class.hs:218-223).
+pub fn fact_to_doc(fa: &p::Fact, scope: &[Bind]) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let lead = {
+        let mut s = String::new();
+        if fa.persistent { s.push('!'); }
+        s.push_str(&fa.name);
+        s.push('(');
+        s
+    };
+    let arg_docs: Vec<Doc> = fa.args.iter().map(|a| term_to_doc(a, scope)).collect();
+    let body = hpj::fsep(hpj::punctuate(comma_doc(), arg_docs));
+    let mut d = nest_short_doc(&lead, ")", body);
+    // Fact annotations: `<> ppAnn an = brackets . fsep . punctuate comma`.
+    if !fa.annotations.is_empty() {
+        let mut ann = String::from("[");
+        for (i, a) in fa.annotations.iter().enumerate() {
+            if i > 0 { ann.push_str(", "); }
+            ann.push_str(match a {
+                p::FactAnnotation::SolveFirst => "+",
+                p::FactAnnotation::SolveLast => "-",
+                p::FactAnnotation::NoSources => "no_precomp",
+            });
+        }
+        ann.push(']');
+        d = d.beside(Doc::text(ann));
+    }
+    d
+}
+
+// =============================================================================
+// GTerm / GFact / GAtom — HughesPJ Doc engine (HS-faithful wrapping)
+//
+// HS has ONE term renderer: `prettyTerm` (Term/Term.hs:268-296). The guarded
+// path's `prettyNAtom = prettyAtom prettyNTerm` and `prettyNTerm = prettyTerm
+// (text . show)` (LTerm.hs:893-894) use the EXACT same `prettyTerm`, only with
+// a different leaf-printer for variables/literals. So `gterm_to_doc` is
+// structurally identical to `term_to_doc`; only the leaf cases (Var, lits)
+// differ and reuse `pp_gterm`'s leaf string-rendering (which already handles
+// bound-var De Bruijn lookup against the multi-level `scope`).
+// =============================================================================
+
+/// Pretty-print a `GTerm` as a `Doc`, faithful to HS `prettyTerm`
+/// (Term/Term.hs:268-296) — the SAME renderer the rule-body / parser-Term
+/// path uses via `term_to_doc`. Mirrors that function's structure exactly.
+fn gterm_to_doc(t: &crate::guarded::GTerm, scope: &[Vec<Bind>]) -> crate::pretty_hpj::Doc {
+    use crate::guarded::GTerm::*;
+    use crate::pretty_hpj::Doc;
+    match t {
+        // Atomic / non-wrapping leaves — render via `pp_gterm` (these never
+        // break internally in HS either; Var carries De Bruijn lookup).
+        Var(_) | PubLit(_) | FreshLit(_) | NatLit(_) | Number(_) | NumberOne
+        | NatOne | DhNeutral | PatMatch(_) => {
+            let mut s = String::new();
+            pp_gterm(t, TermPrec::Top, scope, &mut s);
+            Doc::text(s)
+        }
+        Pair(items) => {
+            // HS `split` flattens right-associative pairs (Term/Term.hs:292-293).
+            let mut flat: Vec<&crate::guarded::GTerm> = Vec::with_capacity(items.len());
+            let mut cur: &[crate::guarded::GTerm] = items;
+            loop {
+                let n = cur.len();
+                if n == 0 { break; }
+                for it in &cur[..n - 1] { flat.push(it); }
+                let last = &cur[n - 1];
+                if let Pair(inner) = last { cur = inner; } else { flat.push(last); break; }
+            }
+            gpair_doc(&flat, scope)
+        }
+        App(name, args) => {
+            if args.is_empty() {
+                Doc::text(name.clone()) // `FApp (NoEq (f,_)) [] -> text f`
+            } else {
+                gfun_doc(name, args, scope)
+            }
+        }
+        AlgApp(name, l, r) => {
+            // HS aenc{m}pk surface form, rendered flat (pp_gterm emits it).
+            let mut s = String::new();
+            pp_gterm(t, TermPrec::Top, scope, &mut s);
+            let _ = (name, l, r);
+            Doc::text(s)
+        }
+        Diff(l, r) => {
+            let args = [(**l).clone(), (**r).clone()];
+            gfun_doc("diff", &args, scope)
+        }
+        BinOp(op, l, r) => {
+            // exp flat; AC ops wrap via fcat (Term/Term.hs:273-274).
+            if matches!(op, p::BinOp::Exp) {
+                let mut s = String::new();
+                pp_gterm(t, TermPrec::Top, scope, &mut s);
+                Doc::text(s)
+            } else {
+                fn flatten<'a>(
+                    op: p::BinOp,
+                    t: &'a crate::guarded::GTerm,
+                    out: &mut Vec<&'a crate::guarded::GTerm>,
+                ) {
+                    match t {
+                        crate::guarded::GTerm::BinOp(inner, l, r) if *inner == op => {
+                            flatten(op, l, out);
+                            flatten(op, r, out);
+                        }
+                        _ => out.push(t),
+                    }
+                }
+                let mut flat: Vec<&crate::guarded::GTerm> = Vec::new();
+                flatten(*op, l, &mut flat);
+                flatten(*op, r, &mut flat);
+                gac_op_doc(binop_symbol(*op), &flat, scope)
+            }
+        }
+    }
+}
+
+/// HS `ppTerms ", " 1 "<" ">"` for `GTerm` (mirror of `pair_doc`).
+fn gpair_doc(flat: &[&crate::guarded::GTerm], scope: &[Vec<Bind>]) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let n = flat.len();
+    let mut parts: Vec<Doc> = Vec::with_capacity(n + 2);
+    parts.push(Doc::text("<"));
+    for (i, t) in flat.iter().enumerate() {
+        let mut d = gterm_to_doc(t, scope);
+        if i + 1 < n {
+            d = d.beside(Doc::text(", "));
+        }
+        parts.push(d.nest(1));
+    }
+    parts.push(Doc::text(">"));
+    hpj::fcat(parts)
+}
+
+/// HS `ppTerms (ppACOp o) 1 "(" ")"` for `GTerm` (mirror of `ac_op_doc`).
+fn gac_op_doc(
+    sym: &str,
+    flat: &[&crate::guarded::GTerm],
+    scope: &[Vec<Bind>],
+) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let n = flat.len();
+    let mut parts: Vec<Doc> = Vec::with_capacity(n + 2);
+    parts.push(Doc::text("("));
+    for (i, t) in flat.iter().enumerate() {
+        let mut d = gterm_to_doc(t, scope);
+        if i + 1 < n {
+            d = d.beside(Doc::text(sym.to_string()));
+        }
+        parts.push(d.nest(1));
+    }
+    parts.push(Doc::text(")"));
+    hpj::fcat(parts)
+}
+
+/// HS `ppFun f ts` for `GTerm` (mirror of `fun_doc`).
+fn gfun_doc(
+    name: &str,
+    args: &[crate::guarded::GTerm],
+    scope: &[Vec<Bind>],
+) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let arg_docs: Vec<Doc> = args.iter().map(|a| gterm_to_doc(a, scope)).collect();
+    let body = hpj::fsep(hpj::punctuate(comma_doc(), arg_docs));
+    Doc::text(format!("{}(", name)).beside(body).beside(Doc::text(")"))
+}
+
+/// Pretty-print a `GFact` as a `Doc`, faithful to HS `prettyFact`
+/// (Theory/Model/Fact.hs:539-544) — mirror of `fact_to_doc`.
+fn gfact_to_doc(fa: &crate::guarded::GFact, scope: &[Vec<Bind>]) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let lead = {
+        let mut s = String::new();
+        if fa.persistent { s.push('!'); }
+        s.push_str(&fa.name);
+        s.push('(');
+        s
+    };
+    let arg_docs: Vec<Doc> = fa.args.iter().map(|a| gterm_to_doc(a, scope)).collect();
+    let body = hpj::fsep(hpj::punctuate(comma_doc(), arg_docs));
+    let mut d = nest_short_doc(&lead, ")", body);
+    if !fa.annotations.is_empty() {
+        let mut ann = String::from("[");
+        for (i, a) in fa.annotations.iter().enumerate() {
+            if i > 0 { ann.push_str(", "); }
+            ann.push_str(match a {
+                p::FactAnnotation::SolveFirst => "+",
+                p::FactAnnotation::SolveLast => "-",
+                p::FactAnnotation::NoSources => "no_precomp",
+            });
+        }
+        ann.push(']');
+        d = d.beside(Doc::text(ann));
+    }
+    d
+}
+
+/// Pretty-print a `GAtom` as a `Doc`, faithful to HS `prettyProtoAtom`
+/// (Theory/Model/Atom.hs:212-224). The terms/facts inside wrap via the same
+/// `prettyTerm`/`prettyFact` Docs; `Less` operands are time-point variables
+/// printed via `show` (atomic, never break).
+fn gatom_to_doc(a: &crate::guarded::GAtom, scope: &[Vec<Bind>]) -> crate::pretty_hpj::Doc {
+    use crate::guarded::GAtom::*;
+    use crate::pretty_hpj::{self as hpj, Doc};
+    match a {
+        // HS `EqE l r -> sep [ppT l <-> opEqual, ppT r]` — the `=` binds to
+        // the LHS via `<+>`, and the whole thing is a `sep` so it may break
+        // between `lhs =` and `rhs`.
+        Eq(l, r) => hpj::sep(vec![
+            gterm_to_doc(l, scope).beside_sp(Doc::text("=")),
+            gterm_to_doc(r, scope),
+        ]),
+        // HS `Subterm l r -> sep [ppT l <-> opSubterm, ppT r]`.
+        Subterm(l, r) => hpj::sep(vec![
+            gterm_to_doc(l, scope).beside_sp(Doc::text("\u{228F}")), // ⊏
+            gterm_to_doc(r, scope),
+        ]),
+        // HS `Less u v -> text (show u) <-> opLess <-> text (show v)` — both
+        // operands are time-point vars (atomic). RS may carry non-var terms
+        // here defensively; render flat via pp_gterm (matches show-style).
+        Less(l, r) => {
+            let mut s = String::new();
+            pp_gterm(l, TermPrec::Top, scope, &mut s);
+            s.push_str(" < ");
+            pp_gterm(r, TermPrec::Top, scope, &mut s);
+            Doc::text(s)
+        }
+        LessMset(l, r) => {
+            let mut s = String::new();
+            pp_gterm(l, TermPrec::Top, scope, &mut s);
+            s.push_str(" (<) ");
+            pp_gterm(r, TermPrec::Top, scope, &mut s);
+            Doc::text(s)
+        }
+        // HS `Action v fa -> prettyFact ppT fa <-> opAction <-> text (show v)`
+        // — `<->` (= `<+>`, single space) between the fact, `@`, and the
+        // time-point var. The fact wraps; `@ #t` stays beside.
+        Action(fa, t) => {
+            let mut tv = String::new();
+            pp_gterm(t, TermPrec::Top, scope, &mut tv);
+            gfact_to_doc(fa, scope)
+                .beside_sp(Doc::text("@"))
+                .beside_sp(Doc::text(tv))
+        }
+        // HS `Last i -> operator_ "last" <> parens (text (show i))`.
+        Last(t) => {
+            let mut s = String::new();
+            s.push_str("last(");
+            pp_gterm(t, TermPrec::Top, scope, &mut s);
+            s.push(')');
+            Doc::text(s)
+        }
+        Pred(fa) => gfact_to_doc(fa, scope),
+    }
+}
+
+/// HS `nestShort' lead finish body =
+///   nestShort (length lead + 1) (text lead) (text finish) body
+///   = sep [ text lead $$ nest n (text finish-less body), text finish ]`
+/// where `$$` is HughesPJ `above` (Class.hs:218-223).
+fn nest_short_doc(lead: &str, finish: &str, body: crate::pretty_hpj::Doc) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let n = lead.chars().count() as isize + 1;
+    let above = Doc::text(lead).above(body.nest(n));
+    hpj::sep(vec![above, Doc::text(finish)])
+}
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum TermPrec {
@@ -1081,275 +1658,154 @@ fn pp_binding_list_with_display(bs: &[Bind], out: &mut String) {
 
 
 // =============================================================================
-// HS-style wrapped layout for Guarded — legacy string-based path
+// HS-faithful wrapped layout for Guarded — Doc-engine path
 // =============================================================================
 //
-// Port of `prettyGuarded` (Guarded.hs:822-864) composed with HughesPJ's
-// `sep` / `nest` semantics.  Same flat-then-wrap strategy as
-// `pp_formula_wrap`: render flat first, and if it overflows the ribbon
-// width, decompose at the top-level operator.
+// Build a `pretty_hpj::Doc` tree mirroring HS `prettyGuarded`
+// (Guarded.hs:822-867) EXACTLY, then render it via the HughesPJ-faithful
+// engine (`crate::pretty_hpj`).  The atoms/terms render to flat strings
+// (HS `prettyNAtom` produces no internal sep/nest), so only the
+// formula-structural nodes (GDisj/GConj/GGuarded) produce sep-Unions
+// where the engine makes byte-exact wrap decisions.
+//
+// HS recurrences (Guarded.hs:830-866):
+//   pp (GAto a)        = prettyNAtom (bvarToLVar a)            -- flat
+//   pp (GDisj [])      = operator_ "⊥"
+//   pp (GDisj xs)      = parens $ sep $ punctuate " ∨" (map opParens ps)
+//   pp (GConj [])      = operator_ "⊤"
+//   pp (GConj xs)      = sep $ punctuate " ∧" (map opParens ps)
+//   pp (GGuarded ...)  = scopeFreshness $ ... with
+//       dante      = nest 1 (pp (GConj antecedent))
+//       quantifier = operator_ ppQ <-> ppVars vs <> operator_ "."
+//       (Ex,_,GConj []) -> sep [quantifier, dante]
+//       (All,[],GDisj []) | gfalse -> operator_ "¬" <> dante
+//       _               -> dsucc = nest 1 (pp gf);
+//                          sep [quantifier, sep [dante, connective, dsucc]]
 
-/// Wrap-aware variant of `pp_guarded_inner`.  `indent` is the column
-/// where the first character of the result will land in the final
-/// output; `width` is the target line width.
-fn pp_guarded_inner_wrapped(
+/// HS `opParens d = operator_ "(" <> d <> operator_ ")"` — for the plain
+/// `Doc` instance `operator_ = text` and `highlight = id`, so this is an
+/// unconditional `"(" <> d <> ")"` (Highlight.hs:58-59).
+fn gdoc_op_parens(d: crate::pretty_hpj::Doc) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::Doc;
+    Doc::text("(").beside(d).beside(Doc::text(")"))
+}
+
+/// Build a `pretty_hpj::Doc` for a guarded formula, mirroring HS `pp`
+/// inside `prettyGuarded` (Guarded.hs:830-866).  Threads the Precise
+/// fresh `state` exactly as `pp_guarded_inner` does (scope-freshness at
+/// each GGuarded), and reuses `pp_gatom`/`pp_binding_list_with_display`
+/// for the flat atom and binder strings.
+fn guarded_to_doc(
     g: &Guarded,
-    paren_atomic: bool,
-    indent: usize,
-    line_start: usize,
-    width: usize,
     scope: &[Vec<Bind>],
     state: &mut PreciseFreshState,
-) -> String {
-    // Flat first.
-    let flat = {
-        let mut s = String::new();
-        // Clone state for the flat probe — pp_guarded_inner mutates state
-        // at GGuarded scope-freshness boundaries but restores on exit, so
-        // a clone is safe and the outer state remains unchanged.
-        let mut probe_state = state.clone();
-        pp_guarded_inner(g, paren_atomic, scope, &mut probe_state, &mut s);
-        s
-    };
-    // HS-faithful fit check: see `fits_flat`.
-    if !flat.contains('\n')
-        && fits_flat(line_start, indent, flat.chars().count(), LINE_LENGTH)
-    {
-        return flat;
-    }
-    // Legacy width check retained for compatibility with callers that
-    // pass a tighter `width`.
-    let _ = width;
+) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
     match g {
-        Guarded::Atom(_) => flat,
-        Guarded::Disj(xs) if xs.is_empty() => flat,
-        Guarded::Conj(xs) if xs.is_empty() => flat,
-
+        Guarded::Atom(a) => {
+            // HS `pp (GAto a) = prettyNAtom (bvarToLVar a)`.  `prettyNAtom`
+            // builds a real Doc (Atom.hs:212-224) whose terms/facts wrap via
+            // `prettyTerm`/`prettyFact` — NOT a flat string.
+            gatom_to_doc(a, scope)
+        }
+        Guarded::Disj(xs) if xs.is_empty() => Doc::text("\u{22A5}"), // ⊥
+        Guarded::Conj(xs) if xs.is_empty() => Doc::text("\u{22A4}"), // ⊤
         Guarded::Disj(xs) => {
-            // HS Guarded.hs:833-835: `parens . sep . punctuate ∨ [opParens c]`.
-            // The Disj ALWAYS wraps itself in `(...)`.  When the caller
-            // additionally requested `opParens` (paren_atomic=true),
-            // there is an OUTER `(...)`.  Layout:
-            //   <outer_paren?>(<c0> ∨
-            //                  <c1> ∨
-            //                  ...
-            //                  <cn>)<outer_paren?>
-            // sep_col = indent + 1 (inside the inner `(`) when no
-            //           outer wrap, or indent + 2 when paren_atomic.
-            let outer = paren_atomic;
-            let inner_paren_col = if outer { indent + 1 } else { indent };
-            let sep_col = inner_paren_col + 1;
-            let mut out = String::new();
-            if outer { out.push('('); }
-            out.push('(');
-            for (i, x) in xs.iter().enumerate() {
-                // First item is on the SAME line as the opening `(`
-                // (line_start unchanged); subsequent items are on
-                // fresh lines at `sep_col` (line_start = sep_col).
-                let child_line_start = if i == 0 { line_start } else { sep_col };
-                if i > 0 {
-                    out.push('\n');
-                    out.push_str(&" ".repeat(sep_col));
-                }
-                // Each child is opParens'd (paren_atomic=true).
-                let child = pp_guarded_inner_wrapped(x, true, sep_col, child_line_start, width, scope, state);
-                out.push_str(&child);
-                if i + 1 < xs.len() {
-                    out.push_str(" \u{2228}"); // ∨ at end of each but last
-                }
-            }
-            out.push(')');
-            if outer { out.push(')'); }
-            out
+            // HS: `parens $ sep $ punctuate (operator_ " ∨") (map opParens ps)`.
+            let ps: Vec<Doc> = xs.iter()
+                .map(|x| gdoc_op_parens(guarded_to_doc(x, scope, state)))
+                .collect();
+            let punct = hpj::punctuate(Doc::text(" \u{2228}"), ps); // " ∨"
+            // `parens` (Class.hs:149) is `"(" <> d <> ")"` (no space).
+            Doc::text("(").beside(hpj::sep(punct)).beside(Doc::text(")"))
         }
-
         Guarded::Conj(xs) => {
-            // HS Guarded.hs:840-842: `sep . punctuate ∧ [opParens c]`.
-            // No self-wrap; caller's `opParens` (paren_atomic=true) adds
-            // the outer `(...)`.  Layout:
-            //   <paren?><c0> ∧
-            //           <c1> ∧
-            //           ...
-            //           <cn><paren?>
-            // sep_col = indent (no outer) or indent + 1 (outer).
-            let outer = paren_atomic;
-            let sep_col = if outer { indent + 1 } else { indent };
-            let mut out = String::new();
-            if outer { out.push('('); }
-            for (i, x) in xs.iter().enumerate() {
-                // First item: same line as `(` (line_start preserved).
-                // Subsequent: fresh line at sep_col.
-                let child_line_start = if i == 0 { line_start } else { sep_col };
-                if i > 0 {
-                    out.push('\n');
-                    out.push_str(&" ".repeat(sep_col));
-                }
-                let child = pp_guarded_inner_wrapped(x, true, sep_col, child_line_start, width, scope, state);
-                out.push_str(&child);
-                if i + 1 < xs.len() {
-                    out.push_str(" \u{2227}"); // ∧
-                }
-            }
-            if outer { out.push(')'); }
-            out
+            // HS: `sep $ punctuate (operator_ " ∧") (map opParens ps)`.
+            let ps: Vec<Doc> = xs.iter()
+                .map(|x| gdoc_op_parens(guarded_to_doc(x, scope, state)))
+                .collect();
+            let punct = hpj::punctuate(Doc::text(" \u{2227}"), ps); // " ∧"
+            hpj::sep(punct)
         }
-
         Guarded::GGuarded { qua, vars, guards, body } => {
-            // HS `scopeFreshness` boundary (Guarded.hs:844-846): save
-            // Precise state, allocate display names, render, restore.
+            // HS: `scopeFreshness $ do ...` (Guarded.hs:846-862).
             state.scope_freshness(|state| {
-            let alloc = allocate_guarded_binders(vars, scope, state);
-            let mut new_scope: Vec<Vec<Bind>> = scope.to_vec();
-            new_scope.push(alloc);
-
-            // Negation shortcut (HS Guarded.hs:856-857).  Flat only.
-            if matches!(qua, Quant::All)
-                && vars.is_empty()
-                && body_is_false(body)
-            {
-                return flat.clone();
-            }
-            // `∃ vs. (guards)` shortcut (HS Guarded.hs:854-855).
-            // Try flat (the only sensible layout); if the guards
-            // themselves are long, fall through to the generic path.
-            if matches!(qua, Quant::Ex) && body_is_true(body) {
-                return flat.clone();
-            }
-            // Generic GGuarded: `sep [quantifier, sep [dante, conn, dsucc]]`.
-            // Outer sep col = indent (or indent+1 if paren_atomic).
-            // Inner sep col = same as outer sep col (because the inner
-            // sep lands at the outer sep's col when the outer wraps).
-            // With nest 1 on dante and dsucc:
-            //   dante at sep_col + 1
-            //   connective at sep_col
-            //   dsucc at sep_col + 1
-            let outer = paren_atomic;
-            let sep_col = if outer { indent + 1 } else { indent };
-            let body_col = sep_col + 1;
-
-            // Quantifier line.
-            let mut quantifier = String::new();
-            quantifier.push(match qua {
-                Quant::All => '\u{2200}',
-                Quant::Ex => '\u{2203}',
-            });
-            quantifier.push(' ');
-            pp_binding_list_with_display(&new_scope[scope.len()], &mut quantifier);
-            quantifier.push_str(".");
-
-            // dante (antecedent): renders as `pp (GConj antecedent)` =
-            // `sep [opParens (pp g) | g <- antecedent]`.  Each guard
-            // becomes `(<atom>)`.  Try flat, then wrap if too long.
-            let dante_flat = if guards.is_empty() {
-                // `pp (GConj []) = ⊤` — but HS line 853-855 special-cases
-                // `(Ex, _, GConj [])` and (negation).  For other cases
-                // with empty antecedent, dante = `⊤` rendered.  In
-                // practice the generic path is only entered with at
-                // least one guard.  Defensive: render `⊤`.
-                "\u{22A4}".to_string()
-            } else {
-                let mut s = String::new();
-                for (i, gd) in guards.iter().enumerate() {
-                    if i > 0 { s.push_str(" \u{2227} "); }
-                    s.push('(');
-                    pp_gatom(gd, &new_scope, &mut s);
-                    s.push(')');
-                }
-                s
-            };
-            let dante_fits_flat = body_col + dante_flat.chars().count() <= width;
-            let dante_str = if dante_fits_flat || guards.len() <= 1 {
-                dante_flat
-            } else {
-                // Wrap dante across multiple lines.  `sep $ punctuate ∧
-                // [(g) for g in guards]` — placed at body_col.
-                let mut s = String::new();
-                for (i, gd) in guards.iter().enumerate() {
-                    if i > 0 {
-                        s.push('\n');
-                        s.push_str(&" ".repeat(body_col));
-                    }
-                    s.push('(');
-                    pp_gatom(gd, &new_scope, &mut s);
-                    s.push(')');
-                    if i + 1 < guards.len() {
-                        s.push_str(" \u{2227}");
-                    }
-                }
-                s
-            };
-
-            let connective = match qua {
-                Quant::All => "\u{21D2}", // ⇒
-                Quant::Ex => "\u{2227}",  // ∧
-            };
-
-            // dsucc (body): rendered BARE (no opParens), per
-            // Guarded.hs:858-860.  At body_col with width-budget.
-            // dsucc lands on a fresh line at body_col (line_start =
-            // body_col).
-            let dsucc_str = pp_guarded_inner_wrapped(body, false, body_col, body_col, width, &new_scope, state);
-
-            // Try the inner sep flat at body_col: `<dante> conn <dsucc>`
-            // on one line.  HS `nest 1` (Guarded.hs:852, 859) on dante
-            // and dsucc wraps the inner sep in `nest_ 1` via sep1's
-            // `sep1 g (Nest n p) k ys = nest_ n (sep1 g p (k-n) ys)`
-            // propagation (HughesPJ.hs:749).  At display, lay walks
-            // `Nest 1 inner_sep` at line start → shifts the WHOLE
-            // inner_sep by +1, so dante (and conn and dsucc) all land
-            // at `sep_col + 1 = body_col`, not at sep_col.
-            //
-            // Scheme 2 layout (used when inner_sep fits as one line):
-            //   <quantifier>
-            //   <body_col><dante> <conn> <dsucc>
-            //
-            // Fit check uses the GGuarded's outer `line_start` (where
-            // the OUTER sep's line began, before any local NilAbove).
-            // HS's `nicest1 w r sl` at the inner_sep Union has `sl`
-            // counting the line's get1-chain ink — which started from
-            // the outer sep's line_start.
-            let inner_flat_one_line =
-                !dante_str.contains('\n')
-                && !dsucc_str.contains('\n')
-                && fits_flat(
-                    line_start,
-                    body_col,
-                    dante_str.chars().count()
-                        + 1 + connective.chars().count() + 1
-                        + dsucc_str.chars().count(),
-                    LINE_LENGTH,
-                );
-
-            let mut out = String::new();
-            if outer { out.push('('); }
-            out.push_str(&quantifier);
-            out.push('\n');
-            if inner_flat_one_line {
-                // Scheme 2: quantifier on its own line; inner sep flat
-                // at body_col (HS's `nest_ 1` shift).
-                out.push_str(&" ".repeat(body_col));
-                out.push_str(&dante_str);
-                out.push(' ');
-                out.push_str(connective);
-                out.push(' ');
-                out.push_str(&dsucc_str);
-            } else {
-                // Scheme 3: full vertical inner sep.
-                out.push_str(&" ".repeat(body_col));
-                out.push_str(&dante_str);
-                out.push('\n');
-                out.push_str(&" ".repeat(sep_col));
-                out.push_str(connective);
-                out.push('\n');
-                out.push_str(&" ".repeat(body_col));
-                out.push_str(&dsucc_str);
-            }
-            if outer { out.push(')'); }
-            out
+                gguarded_to_doc(qua, vars, guards, body, scope, state)
             })
         }
     }
 }
+
+/// Doc for a `GGuarded`, after `scopeFreshness` saved the Precise state.
+/// Mirrors HS Guarded.hs:849-866.
+fn gguarded_to_doc(
+    qua: &Quant,
+    vars: &[crate::guarded::GBinding],
+    guards: &[crate::guarded::GAtom],
+    body: &Guarded,
+    scope: &[Vec<Bind>],
+    state: &mut PreciseFreshState,
+) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let alloc = allocate_guarded_binders(vars, scope, state);
+    let mut new_scope: Vec<Vec<Bind>> = scope.to_vec();
+    new_scope.push(alloc);
+
+    // `dante = nest 1 $ pp (GConj (Conj antecedent))` (Guarded.hs:854).
+    // The antecedent is `map (GAto ...) atoms`, so `pp (GConj ...)` =
+    // `sep $ punctuate " ∧" (map opParens [GAto a])` — each guard is a
+    // flat atom wrapped in opParens.
+    let dante = {
+        if guards.is_empty() {
+            // `pp (GConj (Conj [])) = operator_ "⊤"`.
+            Doc::text("\u{22A4}").nest(1)
+        } else {
+            let ps: Vec<Doc> = guards.iter()
+                .map(|gd| gdoc_op_parens(gatom_to_doc(gd, &new_scope)))
+                .collect();
+            let punct = hpj::punctuate(Doc::text(" \u{2227}"), ps);
+            hpj::sep(punct).nest(1)
+        }
+    };
+
+    // `quantifier = operator_ ppQuant <-> ppVars vs <> operator_ "."`.
+    // `<->` is `<+>` (beside with one space); `ppVars = fsep (map show)`.
+    let sym = match qua { Quant::All => "\u{2200}", Quant::Ex => "\u{2203}" };
+    let var_docs: Vec<Doc> = new_scope[scope.len()].iter()
+        .map(|b| {
+            let mut s = String::new();
+            s.push_str(sort_prefix_from_hint(b.1));
+            s.push_str(&b.2);
+            Doc::text(s)
+        })
+        .collect();
+    let ppvars = hpj::fsep(var_docs);
+    // `operator_ sym <+> ppvars <> operator_ "."`
+    let quantifier = Doc::text(sym).beside_sp(ppvars).beside(Doc::text("."));
+
+    // Case analysis (Guarded.hs:855-862).
+    let is_ex_trivial = matches!(qua, Quant::Ex) && body_is_true(body);
+    let is_neg = matches!(qua, Quant::All) && vars.is_empty() && body_is_false(body);
+
+    if is_neg {
+        // `(All, [], GDisj []) | gf == gfalse -> operator_ "¬" <> dante`.
+        Doc::text("\u{00AC}").beside(dante)
+    } else if is_ex_trivial {
+        // `(Ex, _, GConj []) -> sep [quantifier, dante]`.
+        hpj::sep(vec![quantifier, dante])
+    } else {
+        // `_ -> dsucc = nest 1 (pp gf);
+        //       sep [quantifier, sep [dante, connective, dsucc]]`.
+        let connective = Doc::text(match qua {
+            Quant::All => "\u{21D2}", // ⇒
+            Quant::Ex => "\u{2227}",  // ∧
+        });
+        let dsucc = guarded_to_doc(body, &new_scope, state).nest(1);
+        let inner = hpj::sep(vec![dante, connective, dsucc]);
+        hpj::sep(vec![quantifier, inner])
+    }
+}
+
 
 /// Pretty-print a binder list — uses each entry's display name, which
 /// is the source name (idx==0) or `name.<idx>` (HS `show LVar`,
@@ -1463,12 +1919,49 @@ fn pp_gterm(t: &crate::guarded::GTerm, prec: TermPrec, scope: &[Vec<Bind>], out:
             out.push(')');
         }
         GTerm::BinOp(op, l, r) => {
-            let needs = prec == TermPrec::InOp;
-            if needs { out.push('('); }
-            pp_gterm(l, TermPrec::InOp, scope, out);
-            out.push_str(binop_symbol(*op));
-            pp_gterm(r, TermPrec::InOp, scope, out);
-            if needs { out.push(')'); }
+            // HS `prettyTerm` (Term/Term.hs:273-274,287-290):
+            //   `FApp (AC o)   ts -> ppTerms (ppACOp o) 1 "(" ")" ts`
+            //   `FApp (NoEq s) [t1,t2] | s == expSym -> ppTerm t1 <> "^" <> ppTerm t2`
+            // AC ops (Mult/Union/Xor/NatPlus) ALWAYS print with a SINGLE
+            // surrounding `(` `)` (the lead/finish in `ppTerms`) around the
+            // whole FLAT n-ary chain; `exp` prints with no paren guard.
+            // Our AST stores AC as binary `BinOp(op, l, r)`; flatten same-op
+            // children and join under one paren-pair to match HS — without
+            // this `('1'++x)++z` stayed nested instead of HS `('1'++x++z)`,
+            // and `x++z = y` lost HS's outer `(x++z)` parens.  Mirror of the
+            // parser-AST `pp_term` AC handling (this fn, ~l.1108).
+            let is_exp = matches!(op, p::BinOp::Exp);
+            if is_exp {
+                pp_gterm(l, TermPrec::Top, scope, out);
+                out.push_str(binop_symbol(*op));
+                pp_gterm(r, TermPrec::Top, scope, out);
+                let _ = prec;
+                return;
+            }
+            fn flatten<'a>(
+                op: p::BinOp,
+                t: &'a crate::guarded::GTerm,
+                out: &mut Vec<&'a crate::guarded::GTerm>,
+            ) {
+                match t {
+                    crate::guarded::GTerm::BinOp(inner, l, r) if *inner == op => {
+                        flatten(op, l, out);
+                        flatten(op, r, out);
+                    }
+                    _ => out.push(t),
+                }
+            }
+            let mut flat: Vec<&crate::guarded::GTerm> = Vec::new();
+            flatten(*op, l, &mut flat);
+            flatten(*op, r, &mut flat);
+            out.push('(');
+            let sym = binop_symbol(*op);
+            for (i, child) in flat.iter().enumerate() {
+                if i > 0 { out.push_str(sym); }
+                pp_gterm(child, TermPrec::Top, scope, out);
+            }
+            out.push(')');
+            let _ = prec;
         }
         GTerm::PatMatch(inner) => {
             out.push('=');
@@ -1561,4 +2054,64 @@ mod tests {
         assert!(s.starts_with("\u{00AC}"));
         assert!(s.contains("#i < #j"));
     }
+
+    /// Build the parser Term `<'1', g1> ++ <'2', g2> ++ <'3', g3>` where the
+    /// pair payloads are long enough that the flat AC chain exceeds the ribbon
+    /// and HS `prettyTerm` (Term/Term.hs:273 `FApp (AC o) -> ppTerms ...`) must
+    /// wrap it with the `++` operator at line ends and each element `nest 1`'d.
+    fn ac_chain_term() -> p::Term {
+        let pair = |n: &str, payload: &str| {
+            p::Term::Pair(vec![
+                p::Term::PubLit(n.into()),
+                p::Term::Var(v(payload, p::SortHint::Fresh)),
+            ])
+        };
+        // ((p1 ++ p2) ++ p3) — binary, same-op; renderer flattens to n-ary.
+        p::Term::BinOp(
+            p::BinOp::Union,
+            Box::new(p::Term::BinOp(
+                p::BinOp::Union,
+                Box::new(pair("1", "longPayloadNameNumberOne")),
+                Box::new(pair("2", "longPayloadNameNumberTwo")),
+            )),
+            Box::new(pair("3", "longPayloadNameNumberThree")),
+        )
+    }
+
+    #[test]
+    fn ac_union_chain_wraps_in_rule_term() {
+        // term_to_doc routes AC ops through ac_op_doc (fcat).  Rendered at a
+        // deep indent the chain must break; HS puts `++` at the end of each
+        // non-last element's lines and `(`-wraps the whole chain.
+        let t = ac_chain_term();
+        let doc = term_to_doc(&t, &[]);
+        // place at column 20 (a typical proof-tree/rule indent) so it wraps.
+        let s = doc.render_at(LINE_LENGTH, RIBBON, 20);
+        assert!(s.contains("++\n"), "AC chain did not wrap with ++ at line end:\n{s}");
+        assert!(s.starts_with('('), "AC chain missing leading paren:\n{s}");
+        assert!(s.trim_end().ends_with(')'), "AC chain missing trailing paren:\n{s}");
+        // Each pair element renders fully (its payload var appears).
+        assert!(s.contains("~longPayloadNameNumberOne"));
+        assert!(s.contains("~longPayloadNameNumberThree"));
+    }
+
+    #[test]
+    fn ac_union_chain_wraps_in_guarded_formula() {
+        // gterm_to_doc (guarded path) must wrap the SAME AC chain identically,
+        // since HS uses ONE prettyTerm for both rule terms and formula terms.
+        // Build `z = <chain>` as a guarded Eq atom and render wrapped.
+        let eq = p::Atom::Eq(
+            p::Term::Var(v("z", p::SortHint::Msg)),
+            ac_chain_term(),
+        );
+        let g = Guarded::Atom(crate::guarded::atom_to_gatom_free(&eq));
+        // indent 12 (a proof-tree depth) forces the RHS chain to wrap.
+        let s = pretty_guarded_wrapped(&g, 12, 0);
+        assert!(s.contains("++\n"), "guarded AC chain did not wrap:\n{s}");
+        assert!(s.contains("~longPayloadNameNumberTwo"), "payload missing:\n{s}");
+        // The Eq's `=` is rendered (HS `sep [ppT l <-> opEqual, ppT r]`).
+        assert!(s.contains("z ="), "Eq operator missing:\n{s}");
+    }
 }
+
+

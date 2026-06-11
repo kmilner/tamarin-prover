@@ -30,6 +30,14 @@ pub struct ProofNode {
     pub sys: System,
     pub children: BTreeMap<String, ProofNode>,
     pub status: NodeStatus,
+    /// Whether this step carries a valid constraint-system annotation
+    /// (HS `psInfo step == Just sys`).  `false` mirrors HS's
+    /// `Nothing`-annotated steps produced by `checkProof`
+    /// (Proof.hs:467-469) when a stored skeleton step could not be
+    /// replayed; `prettyIncrementalProof` (ProofSkeleton.hs:80-84) then
+    /// appends `/* unannotated */`.  Defaults to `true` for every
+    /// freshly-searched / successfully-replayed node.
+    pub annotated: bool,
 }
 
 /// What's the proof-tree node currently saying?
@@ -173,6 +181,7 @@ pub fn run_proof_search(
         sys: initial.clone(),
         children: BTreeMap::new(),
         status: NodeStatus::Open,
+        annotated: true,
     };
     let mut first_iter = true;
     loop {
@@ -673,6 +682,7 @@ fn expand_inner(
                 sys,
                 children: BTreeMap::new(),
                 status: NodeStatus::Open,
+                annotated: true,
             };
             // Each worker gets its own budget cell — siblings no longer
             // share a single counter, but with the default usize::MAX
@@ -713,6 +723,7 @@ fn expand_inner(
                 sys,
                 children: BTreeMap::new(),
                 status: NodeStatus::Open,
+                annotated: true,
             };
             // Track proof-tree path for branch-aware lockstep tracing.
             // Skip empty-name cases (Simplify produces a single "" case

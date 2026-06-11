@@ -236,23 +236,40 @@ pub fn cmp_bvar(a: &BVar, b: &BVar) -> std::cmp::Ordering {
 }
 
 /// Returns `(class, sub_tag)` where class=0 for Lit-like, 1 for FApp-like.
+///
+/// HS-faithful: a `GTerm` corresponds to `Term (Lit Name (BVar v))`, whose
+/// derived `Ord` is `LIT _ < FAPP _ _` (Term/Term/Raw.hs:72-74), and within
+/// `LIT`, `Lit c v = Con c | Var v` derives `Con < Var` (VTerm.hs:56-57).
+/// Therefore ALL constant literals (Pub/Fresh/Nat names) sort BEFORE any
+/// variable.  Among constants, `Ord Name` compares the `NameTag` first
+/// (`FreshName | PubName | NodeName | NatName`, LTerm.hs:215) so the literal
+/// order is Fresh < Pub < Nat, then by name string.  Variables come last in
+/// the `LIT` class.
+///
+/// The 0-arity builtins `NumberOne`/`NatOne`/`DhNeutral` are NOT literals in
+/// HS — they are `fAppNoEq oneSym []` / `fAppNoEq natOneSym []` /
+/// `fAppNoEq dhNeutralSym []` (Term/Term.hs:127-130), i.e. nullary function
+/// applications, so they belong to the FApp class.
 fn term_class(t: &GTerm) -> (u8, u8) {
     use GTerm::*;
     match t {
-        Var(_) => (0, 0),
+        // LIT (Con name): constants, ordered by Name's NameTag (Fresh<Pub<Nat).
+        FreshLit(_) => (0, 0),
         PubLit(_) => (0, 1),
-        FreshLit(_) => (0, 2),
-        NatLit(_) => (0, 3),
-        Number(_) => (0, 4),
-        NumberOne => (0, 5),
-        NatOne => (0, 6),
-        DhNeutral => (0, 7),
-        App(_, _) => (1, 0),
-        AlgApp(_, _, _) => (1, 1),
-        Pair(_) => (1, 2),
-        Diff(_, _) => (1, 3),
-        BinOp(_, _, _) => (1, 4),
-        PatMatch(_) => (1, 5),
+        NatLit(_) => (0, 2),
+        Number(_) => (0, 3),
+        // LIT (Var v): variables sort after all constants.
+        Var(_) => (0, 4),
+        // FAPP: nullary builtins are NoEq function applications, not literals.
+        NumberOne => (1, 0),
+        NatOne => (1, 1),
+        DhNeutral => (1, 2),
+        App(_, _) => (1, 3),
+        AlgApp(_, _, _) => (1, 4),
+        Pair(_) => (1, 5),
+        Diff(_, _) => (1, 6),
+        BinOp(_, _, _) => (1, 7),
+        PatMatch(_) => (1, 8),
     }
 }
 
@@ -652,7 +669,20 @@ fn err(msg: impl Into<String>) -> GuardError {
 
 /// Convert a surface formula to its guarded form.
 pub fn formula_to_guarded(f: &p::Formula) -> Result<Guarded, GuardError> {
-    convert(false, f)
+    // HS-faithful: HS represents formula terms as LNTerm, where every AC head
+    // (`Mult`/`Union`/`Xor`/`NatPlus`) is stored as a flat, `fAppAC`-sorted
+    // argument list (Term/Term/Raw.hs:118-122).  The sort happens at PARSE
+    // time over the FREE logical variables, ordered by `Ord LVar` =
+    // (idx, sort, name) (LTerm.hs:522-524) — for freshly-parsed lemma vars
+    // (all idx 0) this is name-alphabetical, e.g. `x + z` stays `x++z` and
+    // `y + z` stays `y++z`.  `formulaToGuarded` then abstracts Free→Bound via
+    // a structural `fmap` (Guarded.hs:289-308) that preserves the AC arg
+    // positions.  Our parser stores formula terms as nested `BinOp(op, l, r)`
+    // trees in source order and never sorts them, so we canonicalise the AC
+    // chains over the FREE-variable parser AST FIRST (mirroring HS's
+    // parse-time `fAppAC` on free LVars), then convert to guarded form.
+    let canon = crate::elaborate::canonicalize_ac_in_formula(f);
+    convert(false, &canon)
 }
 
 /// Returns `true` if the formula is "safety": closed (no free vars)
@@ -1225,94 +1255,96 @@ pub fn normalize_sort_hints(g: &Guarded) -> Guarded {
 /// `BinOp(op, x0, BinOp(op, x1, ...))`.  Two AC-permuted parser-AST
 /// representations of the same multiset collapse to the same shape.
 pub fn canonicalize_ac_in_guarded(g: &Guarded) -> Guarded {
-    fn flatten_and_sort(op: &p::BinOp, t: &GTerm) -> Vec<GTerm> {
-        let mut out = Vec::new();
-        // Reuse the existing `flatten_ac_binop` helper via a local copy
-        // (the public API at `cmp_term`'s call site is module-private).
-        fn flatten(op: &p::BinOp, t: &GTerm, out: &mut Vec<GTerm>) {
-            match t {
-                GTerm::BinOp(inner_op, l, r) if inner_op == op => {
-                    flatten(op, l, out);
-                    flatten(op, r, out);
+    canonicalize_ac_in_guarded_with(g, cmp_term)
+}
+
+type GCmp = fn(&GTerm, &GTerm) -> std::cmp::Ordering;
+
+fn cac_flatten(op: &p::BinOp, t: &GTerm, out: &mut Vec<GTerm>) {
+    match t {
+        GTerm::BinOp(inner_op, l, r) if inner_op == op => {
+            cac_flatten(op, l, out);
+            cac_flatten(op, r, out);
+        }
+        _ => out.push(t.clone()),
+    }
+}
+
+fn cac_rec_term(t: &GTerm, cmp: GCmp) -> GTerm {
+    match t {
+        GTerm::Var(_) | GTerm::PubLit(_) | GTerm::FreshLit(_)
+        | GTerm::NatLit(_) | GTerm::Number(_) | GTerm::NumberOne
+        | GTerm::NatOne | GTerm::DhNeutral => t.clone(),
+        GTerm::App(n, args) => GTerm::App(
+            n.clone(), args.iter().map(|a| cac_rec_term(a, cmp)).collect()),
+        GTerm::Pair(args) => GTerm::Pair(
+            args.iter().map(|a| cac_rec_term(a, cmp)).collect()),
+        GTerm::AlgApp(n, a, b) => GTerm::AlgApp(
+            n.clone(), Box::new(cac_rec_term(a, cmp)), Box::new(cac_rec_term(b, cmp))),
+        GTerm::Diff(a, b) => GTerm::Diff(
+            Box::new(cac_rec_term(a, cmp)), Box::new(cac_rec_term(b, cmp))),
+        GTerm::BinOp(op, l, r) => {
+            if matches!(op, p::BinOp::Mult | p::BinOp::Union | p::BinOp::Xor | p::BinOp::NatPlus) {
+                // Recurse into children first, then flatten the whole AC
+                // chain rooted here and rebuild in sorted multiset order.
+                let l2 = cac_rec_term(l, cmp);
+                let r2 = cac_rec_term(r, cmp);
+                let mut flat = Vec::new();
+                cac_flatten(op, &l2, &mut flat);
+                cac_flatten(op, &r2, &mut flat);
+                flat.sort_by(|a, b| cmp(a, b));
+                // Right-fold to a binary chain.  At least 2 args.
+                let mut iter = flat.into_iter().rev();
+                let last = iter.next().unwrap_or(GTerm::PubLit(String::new()));
+                let mut acc = last;
+                for prev in iter {
+                    acc = GTerm::BinOp(*op, Box::new(prev), Box::new(acc));
                 }
-                _ => out.push(t.clone()),
+                acc
+            } else {
+                GTerm::BinOp(*op, Box::new(cac_rec_term(l, cmp)),
+                    Box::new(cac_rec_term(r, cmp)))
             }
         }
-        flatten(op, t, &mut out);
-        out.sort_by(cmp_term);
-        out
+        GTerm::PatMatch(inner) => GTerm::PatMatch(Box::new(cac_rec_term(inner, cmp))),
     }
-    fn rec_term(t: &GTerm) -> GTerm {
-        match t {
-            GTerm::Var(_) | GTerm::PubLit(_) | GTerm::FreshLit(_)
-            | GTerm::NatLit(_) | GTerm::Number(_) | GTerm::NumberOne
-            | GTerm::NatOne | GTerm::DhNeutral => t.clone(),
-            GTerm::App(n, args) => GTerm::App(
-                n.clone(), args.iter().map(rec_term).collect()),
-            GTerm::Pair(args) => GTerm::Pair(args.iter().map(rec_term).collect()),
-            GTerm::AlgApp(n, a, b) => GTerm::AlgApp(
-                n.clone(), Box::new(rec_term(a)), Box::new(rec_term(b))),
-            GTerm::Diff(a, b) => GTerm::Diff(
-                Box::new(rec_term(a)), Box::new(rec_term(b))),
-            GTerm::BinOp(op, l, r) => {
-                if matches!(op, p::BinOp::Mult | p::BinOp::Union | p::BinOp::Xor | p::BinOp::NatPlus) {
-                    // Recurse into children first, then flatten the
-                    // whole AC chain rooted here and rebuild in sorted
-                    // multiset order.
-                    let l2 = rec_term(l);
-                    let r2 = rec_term(r);
-                    let mut flat = Vec::new();
-                    flat.extend(flatten_and_sort(op, &l2));
-                    flat.extend(flatten_and_sort(op, &r2));
-                    flat.sort_by(cmp_term);
-                    // Right-fold to a binary chain.  At least 2 args.
-                    let mut iter = flat.into_iter().rev();
-                    let last = iter.next().unwrap_or(GTerm::PubLit(String::new()));
-                    let mut acc = last;
-                    for prev in iter {
-                        acc = GTerm::BinOp(*op, Box::new(prev), Box::new(acc));
-                    }
-                    acc
-                } else {
-                    GTerm::BinOp(*op, Box::new(rec_term(l)), Box::new(rec_term(r)))
-                }
-            }
-            GTerm::PatMatch(inner) => GTerm::PatMatch(Box::new(rec_term(inner))),
-        }
+}
+
+fn cac_rec_fact(f: &GFact, cmp: GCmp) -> GFact {
+    GFact {
+        persistent: f.persistent,
+        name: f.name.clone(),
+        args: f.args.iter().map(|a| cac_rec_term(a, cmp)).collect(),
+        annotations: f.annotations.clone(),
     }
-    fn rec_fact(f: &GFact) -> GFact {
-        GFact {
-            persistent: f.persistent,
-            name: f.name.clone(),
-            args: f.args.iter().map(rec_term).collect(),
-            annotations: f.annotations.clone(),
-        }
+}
+
+fn cac_rec_atom(a: &GAtom, cmp: GCmp) -> GAtom {
+    match a {
+        GAtom::Action(f, t) => GAtom::Action(cac_rec_fact(f, cmp), cac_rec_term(t, cmp)),
+        GAtom::Eq(x, y) => GAtom::Eq(cac_rec_term(x, cmp), cac_rec_term(y, cmp)),
+        GAtom::Less(x, y) => GAtom::Less(cac_rec_term(x, cmp), cac_rec_term(y, cmp)),
+        GAtom::LessMset(x, y) => GAtom::LessMset(cac_rec_term(x, cmp), cac_rec_term(y, cmp)),
+        GAtom::Subterm(x, y) => GAtom::Subterm(cac_rec_term(x, cmp), cac_rec_term(y, cmp)),
+        GAtom::Last(t) => GAtom::Last(cac_rec_term(t, cmp)),
+        GAtom::Pred(f) => GAtom::Pred(cac_rec_fact(f, cmp)),
     }
-    fn rec_atom(a: &GAtom) -> GAtom {
-        match a {
-            GAtom::Action(f, t) => GAtom::Action(rec_fact(f), rec_term(t)),
-            GAtom::Eq(x, y) => GAtom::Eq(rec_term(x), rec_term(y)),
-            GAtom::Less(x, y) => GAtom::Less(rec_term(x), rec_term(y)),
-            GAtom::LessMset(x, y) => GAtom::LessMset(rec_term(x), rec_term(y)),
-            GAtom::Subterm(x, y) => GAtom::Subterm(rec_term(x), rec_term(y)),
-            GAtom::Last(t) => GAtom::Last(rec_term(t)),
-            GAtom::Pred(f) => GAtom::Pred(rec_fact(f)),
-        }
+}
+
+fn canonicalize_ac_in_guarded_with(g: &Guarded, cmp: GCmp) -> Guarded {
+    match g {
+        Guarded::Atom(a) => Guarded::Atom(cac_rec_atom(a, cmp)),
+        Guarded::Disj(items) => Guarded::Disj(
+            items.iter().map(|i| canonicalize_ac_in_guarded_with(i, cmp)).collect()),
+        Guarded::Conj(items) => Guarded::Conj(
+            items.iter().map(|i| canonicalize_ac_in_guarded_with(i, cmp)).collect()),
+        Guarded::GGuarded { qua, vars, guards, body } => Guarded::GGuarded {
+            qua: qua.clone(),
+            vars: vars.clone(),
+            guards: guards.iter().map(|a| cac_rec_atom(a, cmp)).collect(),
+            body: Box::new(canonicalize_ac_in_guarded_with(body, cmp)),
+        },
     }
-    fn rec(g: &Guarded) -> Guarded {
-        match g {
-            Guarded::Atom(a) => Guarded::Atom(rec_atom(a)),
-            Guarded::Disj(items) => Guarded::Disj(items.iter().map(rec).collect()),
-            Guarded::Conj(items) => Guarded::Conj(items.iter().map(rec).collect()),
-            Guarded::GGuarded { qua, vars, guards, body } => Guarded::GGuarded {
-                qua: qua.clone(),
-                vars: vars.clone(),
-                guards: guards.iter().map(rec_atom).collect(),
-                body: Box::new(rec(body)),
-            },
-        }
-    }
-    rec(g)
 }
 
 fn collect_witness_vars(g: &Guarded, out: &mut VarSubst) {

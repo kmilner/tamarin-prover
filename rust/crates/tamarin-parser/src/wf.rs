@@ -866,8 +866,9 @@ pub fn message_derivation_report(thy: &Theory) -> WfReport {
             crate::ast::RuleAttr::NoDerivCheck)) { continue; }
         let unbound = collect_rule_unbound_vars(r, &nullary_funs);
         if unbound.is_empty() { continue; }
+        // HS shows the LVar (sort prefix included): MessageDerivationChecks.hs:138
         let names: Vec<String> = unbound.iter()
-            .map(|v| v.name.clone())
+            .map(render_var)
             .collect();
         per_rule.push((r.name.clone(), names));
     }

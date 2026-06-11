@@ -1595,6 +1595,52 @@ impl<'a> Parser<'a> {
                 self.require_punct("]")?;
             }
         }
+        // HS-faithful parse-time canonicalisation, mirroring
+        // `Theory.Text.Parser.Fact.mkProtoFact` (Fact.hs:56-63) combined with
+        // `factTagMultiplicity` (Model/Fact.hs:354-360) and `factTagName`
+        // (Model/Fact.hs:507-517).  Any fact whose name uppercases to one of
+        // the reserved special names becomes that special fact, which:
+        //   * fixes the CANONICAL name (KU/KD/Ded/Fr/In/Out),
+        //   * fixes the multiplicity from the tag (KU and KD are Persistent;
+        //     everything else here is Linear), discarding the user-written `!`,
+        //   * enforces arity one (`singleTerm`) — a parse `fail` on mismatch,
+        //   * drops annotations for all special facts except IN
+        //     (`inFactAnn ann` keeps them; outFact/kuFact/kdFact/dedLogFact/
+        //     freshFact take no annotations),
+        //   * rejects `!Fr(...)` ("fresh facts cannot be persistent").
+        // Because HS wraps the whole `fact'` body in `try`, a `fail` here
+        // backtracks; in rule context this surfaces as a hard load error,
+        // and in formula context the alternative (term atom) is tried.  We
+        // mirror that by returning `Err` from `fact()`.
+        let upper = name.to_ascii_uppercase();
+        // (canonical name, persistent, keep-annotations)
+        let canonical: Option<(&str, bool, bool)> = match upper.as_str() {
+            "OUT" => Some(("Out", false, false)),
+            "IN"  => Some(("In", false, true)),
+            "KU"  => Some(("KU", true, false)),
+            "KD"  => Some(("KD", true, false)),
+            "DED" => Some(("Ded", false, false)),
+            "FR"  => Some(("Fr", false, false)),
+            _     => None,
+        };
+        if let Some((cname, cpersistent, keep_ann)) = canonical {
+            // `!Fr(...)` is a parse error (Fact.hs:45).
+            if upper == "FR" && persistent {
+                return Err(self.err("fresh facts cannot be persistent"));
+            }
+            // `singleTerm`: special facts have arity one (Fact.hs:52-54).
+            if args.len() != 1 {
+                return Err(self.err(format!(
+                    "fact '{}' used with arity {} instead of arity one",
+                    name, args.len())));
+            }
+            return Ok(Fact {
+                persistent: cpersistent,
+                name: cname.to_string(),
+                args,
+                annotations: if keep_ann { annotations } else { Vec::new() },
+            });
+        }
         Ok(Fact { persistent, name, args, annotations })
     }
 

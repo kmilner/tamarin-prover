@@ -95,10 +95,20 @@ pub fn pretty_closed_theory(
     out.push_str(&render_signature(&elaborated.signature.maude_sig));
 
     // HS `prettyTheory` (TheoryObject.hs:741-751) emits, between the
-    // signature and the cache block:
+    // signature and the cache block, in this order:
+    //   - `vcat $ map prettyTactic thyT` (only if non-empty tactics)
     //   - `heuristic: <ranking>` line (only if non-empty heuristic)
     //   - `ppCache` (the "looping facts with injective instances" comment).
+    // `vsep` separates each non-empty element with a blank line.
     // Mirror that here.
+    if !elaborated.tactic.is_empty() {
+        // `vcat $ map prettyTactic thyT`: tactics joined by a single
+        // newline (no blank line between them).
+        let blocks: Vec<String> = elaborated.tactic.iter().map(|t| t.render()).collect();
+        out.push('\n');
+        out.push_str(&blocks.join("\n"));
+        out.push('\n');
+    }
     if !elaborated.heuristic.is_empty() {
         out.push('\n');
         out.push_str("heuristic: ");
@@ -265,49 +275,18 @@ fn render_equations(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<String> {
     items
 }
 
-/// HS's `ppNonEmptyList` with `keyword <-> fsep . punctuate comma`:
-/// when the line fits, emit `<lead> a, b, c`. When it overflows the
-/// default 80-col width, wrap with continuation indent equal to
-/// `length lead + 1`.  HS uses `text` width 80 (Pretty.hs default).
+/// HS `ppNonEmptyList' name pp xs = (keyword_ name <->) . fsep $
+/// punctuate comma (map pp xs)` (Term/Maude/Signature.hs:229-231).
+/// `<->` is HughesPJ `<+>` (beside-with-space), and `fsep` is the
+/// fill-paragraph combinator, so the wrap decisions must come from the
+/// ported HughesPJ Doc engine (LINE_LENGTH=110, RIBBON=73) — not a
+/// hand-rolled greedy fill at a guessed width.  Route through `pretty_hpj`.
 fn wrap_with_lead(lead: &str, items: &[String]) -> String {
-    // Empty: emit nothing.
+    use crate::pretty_hpj::{self as hpj, Doc};
     if items.is_empty() { return String::new(); }
-    // HS uses `defaultStyle = Style { lineLength = 76, .. }` (Pretty.hs)
-    // for `fsep` / `sep` wrapping.
-    const WIDTH: usize = 76;
-    let lead_len = lead.chars().count();
-    let cont_indent: String = " ".repeat(lead_len + 1);
-    // First try: single line `lead a, b, c`.
-    let joined = items.join(", ");
-    let single = format!("{} {}", lead, joined);
-    if single.chars().count() <= WIDTH {
-        return single;
-    }
-    // Multi-line: greedy fill respecting WIDTH.  HS's `fsep` packs
-    // tokens onto each line greedily.
-    let mut out = String::new();
-    out.push_str(lead);
-    let mut cur_col = lead_len;
-    for (i, it) in items.iter().enumerate() {
-        let tok = if i + 1 < items.len() {
-            format!("{},", it)
-        } else {
-            it.clone()
-        };
-        let need = tok.chars().count() + 1; // +1 for leading space
-        if cur_col + need > WIDTH {
-            // Wrap.
-            out.push('\n');
-            out.push_str(&cont_indent);
-            out.push_str(&tok);
-            cur_col = cont_indent.chars().count() + tok.chars().count();
-        } else {
-            out.push(' ');
-            out.push_str(&tok);
-            cur_col += need;
-        }
-    }
-    out
+    let docs: Vec<Doc> = items.iter().map(Doc::text).collect();
+    let body = hpj::fsep(hpj::punctuate(Doc::char(','), docs));
+    Doc::text(lead).beside_sp(body).render()
 }
 
 /// `sep`-style layout matching HS's `sep [hdr, nest 2 (punctuate comma ds)]`:
@@ -363,6 +342,20 @@ fn render_parsed_item(
             // theories yet — leave empty so output is well-formed.
             None
         }
+        FormalComment { header, body } => {
+            // HS `prettyFormalComment` (lib/theory/src/Pretty.hs:19-21):
+            //   prettyFormalComment ""     body = multiComment_ [body]
+            //   prettyFormalComment header body = text $ header ++ "{*" ++ body ++ "*}"
+            // User `section{* .. *}` / `text{* .. *}` items always carry a
+            // non-empty header, so they render verbatim as
+            // `header{*body*}`.  (An empty header only arises from
+            // machine-injected comments via `addComment`.)
+            if header.is_empty() {
+                Some(format!("/*\n{}\n*/", body))
+            } else {
+                Some(format!("{}{{*{}*}}", header, body))
+            }
+        }
         _ => None,
     }
 }
@@ -370,6 +363,78 @@ fn render_parsed_item(
 // =============================================================================
 // Rule
 // =============================================================================
+
+/// Names of arity-1 NoEq function symbols in the closed theory signature.
+/// Mirrors HS `lookupArity` reading the parser-state signature for
+/// `naryOpApp`'s `k == 1` tuple-folding (Theory/Text/Parser/Term.hs:58-93).
+fn arity1_noeq_names(elab: &Theory) -> std::collections::HashSet<String> {
+    elab.signature
+        .maude_sig()
+        .no_eq_fun_syms()
+        .iter()
+        .filter(|s| s.arity == 1)
+        .map(|s| String::from_utf8_lossy(&s.name).to_string())
+        .collect()
+}
+
+/// Re-fold surplus arguments of arity-1 function applications into a single
+/// right-associative pair, mirroring HS `naryOpApp` for `k == 1`
+/// (Theory/Text/Parser/Term.hs:84-87):
+///   `ts <- parens $ if k == 1 then return <$> tupleterm ... else commaSep ...`
+/// where `tupleterm = chainr1 (...) (fAppPair <$ comma)`.  So for an arity-1
+/// symbol `f`, the surface `f(a, b, c)` parses to `f(<a, b, c>)` — a single
+/// argument which is the right-associative pair `<a, b, c>`.  RS's term
+/// parser is arity-unaware and keeps `App("f", [a, b, c])`, so the stored
+/// rule-body AST carries surplus args.  Re-fold them before rendering so the
+/// theory printout matches HS's `prettyTerm`, which prints the symbol's
+/// actual argument list verbatim (`ppFun f ts`, Term/Term.hs:295-296 — it
+/// does NOT itself flatten a tuple arg into a comma list).
+fn rewrite_arity1_term(
+    t: &p::Term,
+    arity1: &std::collections::HashSet<String>,
+) -> p::Term {
+    use p::Term::*;
+    match t {
+        App(name, args) => {
+            let new_args: Vec<p::Term> =
+                args.iter().map(|a| rewrite_arity1_term(a, arity1)).collect();
+            if arity1.contains(name) && new_args.len() > 1 {
+                App(name.clone(), vec![Pair(new_args)])
+            } else {
+                App(name.clone(), new_args)
+            }
+        }
+        Pair(items) => Pair(items.iter().map(|i| rewrite_arity1_term(i, arity1)).collect()),
+        AlgApp(name, l, r) => AlgApp(
+            name.clone(),
+            Box::new(rewrite_arity1_term(l, arity1)),
+            Box::new(rewrite_arity1_term(r, arity1)),
+        ),
+        Diff(l, r) => Diff(
+            Box::new(rewrite_arity1_term(l, arity1)),
+            Box::new(rewrite_arity1_term(r, arity1)),
+        ),
+        BinOp(op, l, r) => BinOp(
+            *op,
+            Box::new(rewrite_arity1_term(l, arity1)),
+            Box::new(rewrite_arity1_term(r, arity1)),
+        ),
+        PatMatch(inner) => PatMatch(Box::new(rewrite_arity1_term(inner, arity1))),
+        other => other.clone(),
+    }
+}
+
+fn rewrite_arity1_fact(
+    fa: &p::Fact,
+    arity1: &std::collections::HashSet<String>,
+) -> p::Fact {
+    p::Fact {
+        persistent: fa.persistent,
+        name: fa.name.clone(),
+        args: fa.args.iter().map(|a| rewrite_arity1_term(a, arity1)).collect(),
+        annotations: fa.annotations.clone(),
+    }
+}
 
 fn render_rule(parsed_rule: &p::Rule, elab: &Theory) -> String {
     let name = &parsed_rule.name;
@@ -385,11 +450,21 @@ fn render_rule(parsed_rule: &p::Rule, elab: &Theory) -> String {
     // `lib/theory/src/TheoryObject.hs::prettyTheory` → `prettyRule` chain
     // which operates on the post-`applyMacroInProtoRule` rule.
     let desugared = crate::elaborate::apply_let_block(parsed_rule);
-    let parsed_rule = &desugared;
+    // HS-faithful: an arity-1 function applied with a comma list, `f(a,b,c)`,
+    // is folded by `naryOpApp`'s `k == 1` branch into `f(<a,b,c>)`
+    // (Theory/Text/Parser/Term.hs:84-87).  RS's term parser keeps the surplus
+    // args, so re-fold here before rendering.  See `rewrite_arity1_term`.
+    let arity1 = arity1_noeq_names(elab);
+    let premises: Vec<p::Fact> =
+        desugared.premises.iter().map(|f| rewrite_arity1_fact(f, &arity1)).collect();
+    let actions: Vec<p::Fact> =
+        desugared.actions.iter().map(|f| rewrite_arity1_fact(f, &arity1)).collect();
+    let conclusions: Vec<p::Fact> =
+        desugared.conclusions.iter().map(|f| rewrite_arity1_fact(f, &arity1)).collect();
     out.push_str(&render_rule_body(
-        &parsed_rule.premises,
-        &parsed_rule.actions,
-        &parsed_rule.conclusions,
+        &premises,
+        &actions,
+        &conclusions,
     ));
 
     // Look up the elaborated rule by name to decide between
@@ -518,92 +593,21 @@ fn render_rule_body(prems: &[p::Fact], acts: &[p::Fact], concs: &[p::Fact]) -> S
 }
 
 /// Render rule body at column `indent`.  Used by the AC variant block
-/// (indent=5) and the top-level rule (indent=3).  The brackets, arrow,
-/// and concs all sit at column `indent` when wrapped.
+/// (via `render_rule_body`, which prepends 2 spaces) and the top-level
+/// rule (indent=3).
+///
+/// HS `prettyNamedRule` wraps the body as `nest 2 (prettyRule ...)`
+/// (Theory/Model/Rule.hs:1286-1287), and `prettyRuleRestrGen`
+/// (Rule.hs:1254-1262) lays out `sep [nest 1 (ppFactsList prems), arrow,
+/// nest 1 (ppFactsList concls)]`.  The combined `nest 2 + nest 1` puts
+/// the bracket `[` at col 3, the arrow at col 2.  We build the whole body
+/// as one `pretty_hpj::Doc` (`rule_body_to_doc`) nested by `indent - 1`
+/// (== 2 for indent=3) so the HughesPJ engine makes the `sep`/`fsep`
+/// wrap decisions byte-identically to HS, instead of the hand-rolled
+/// string packers.
 fn render_rule_body_at(prems: &[p::Fact], acts: &[p::Fact], concs: &[p::Fact], indent: usize) -> String {
-    let pad = " ".repeat(indent);
-    let pad_arrow = " ".repeat(indent.saturating_sub(1));
-    // Single-line trial: render brackets inline (force no wrap by trying
-    // a wide budget first; if any internal wrap happened the multi-line
-    // path will catch it).
-    let prems_inline = render_fact_brackets_inline(prems);
-    let concs_inline = render_fact_brackets_inline(concs);
-    let acts_inline_body = acts.iter().map(render_fact).collect::<Vec<_>>().join(", ");
-    let single = if acts.is_empty() {
-        format!("{}{} --> {}", pad, prems_inline, concs_inline)
-    } else {
-        format!("{}{} --[ {} ]-> {}", pad, prems_inline, acts_inline_body, concs_inline)
-    };
-    if !single.contains('\n') && single.chars().count() <= indent + RIBBON
-        && !prems_inline.is_empty() && !concs_inline.is_empty()
-    {
-        return single;
-    }
-    // Multi-line clause layout (HS `sep [prems, arrow, concs]`).  Each
-    // clause is rendered at column `indent` with internal wrap allowed.
-    let prems_str = render_fact_brackets_at(prems, indent, indent);
-    let concs_str = render_fact_brackets_at(concs, indent, indent);
-    let mut out = String::new();
-    out.push_str(&pad);
-    out.push_str(&prems_str);
-    out.push('\n');
-    if acts.is_empty() {
-        out.push_str(&pad_arrow);
-        out.push_str("-->");
-    } else {
-        let acts_inline = format!("{}--[ {} ]->", pad_arrow, acts_inline_body);
-        if !acts_inline.contains('\n') && acts_inline.chars().count() <= indent + RIBBON {
-            out.push_str(&acts_inline);
-        } else {
-            // HS `fsep [text "--[", ppList acts, text "]->"]` (Rule.hs:1258-1261)
-            // with `ppList = fsep . punctuate comma`. We mirror HS's
-            // fsep packing semantics in three stages:
-            //
-            //   (1) `--[ body ]->` all on one line — checked above.
-            //   (2) `--[ body` on one line + `]->` on next — i.e. only
-            //       the closer breaks. Picked when the body is short
-            //       enough to inline after `--[` but the closer pushes
-            //       over.
-            //   (3) `--[` alone, then body fsep-packed across lines,
-            //       then `]->` alone. Picked when (2) still overflows.
-            //
-            // The inner body in cases (2)/(3) is an `fsep . punctuate
-            // comma` over the acts, so multi-fact bodies pack across
-            // lines comma-by-comma (HS pattern at CH07 line 22-27).
-            let body_indent = indent.saturating_sub(1);
-            // Try (2): `--[ acts_inline_body` on one line.
-            let opener_inline = format!("{}--[ {}", pad_arrow, acts_inline_body);
-            let opener_fits = !opener_inline.contains('\n')
-                && opener_inline.chars().count() <= indent + RIBBON;
-            if opener_fits {
-                out.push_str(&opener_inline);
-                out.push('\n');
-                out.push_str(&pad_arrow);
-                out.push_str("]->");
-            } else {
-                // (3) `--[` alone, then packed body, then `]->`.
-                // Render each act at `body_indent` so any internal
-                // multi-line continuation aligns to that col (matches
-                // the original per-act layout). `body_indent ==
-                // indent-1 == pad_arrow.len()`.
-                let act_strs: Vec<String> = acts.iter()
-                    .map(|a| render_fact_at(a, body_indent, body_indent))
-                    .collect();
-                out.push_str(&pad_arrow);
-                out.push_str("--[\n");
-                out.push_str(&" ".repeat(body_indent));
-                let packed = fsep_pack(&act_strs, body_indent, ", ", body_indent);
-                out.push_str(&packed);
-                out.push('\n');
-                out.push_str(&pad_arrow);
-                out.push_str("]->");
-            }
-        }
-    }
-    out.push('\n');
-    out.push_str(&pad);
-    out.push_str(&concs_str);
-    out
+    let nest = indent.saturating_sub(1) as isize;
+    pf::rule_body_to_doc(prems, acts, concs).nest(nest).render()
 }
 
 /// Inline-only bracket list (no wrap).  Used to check single-line fit
@@ -716,6 +720,7 @@ fn render_variant_subst(
     subst: &tamarin_term::subst_vfresh::LNSubstVFresh,
     n_width: usize,
 ) -> String {
+    use crate::pretty_hpj::Doc;
     let mut s = String::new();
     let bindings = subst.to_list();
     // Continuation prefix's width depends on `n_width` so subsequent lines
@@ -724,33 +729,32 @@ fn render_variant_subst(
     let cont_indent = " ".repeat(label.chars().count());
     for (i, (v, t)) in bindings.iter().enumerate() {
         let var_str = render_lvar(v);
-        let term_str = render_lnterm(t);
         let prefix = if i == 0 {
             format!("    {}", label)
         } else {
             format!("    {}", cont_indent)
         };
-        // HS uses `prettyNTerm v $$ nest 6 (text "=" <-> prettyNTerm b)`:
-        // if the var name fits in 5 chars, put `= term` at col 6 (within
-        // the entry).  Otherwise wrap.
-        if var_str.chars().count() <= 5 {
-            // `var<padded to 5><sp>= term`
-            let padded = format!("{:<5}", var_str);
-            s.push_str(&prefix);
-            s.push_str(&padded);
-            s.push_str(" = ");
-            s.push_str(&term_str);
-            s.push('\n');
-        } else {
-            s.push_str(&prefix);
-            s.push_str(&var_str);
-            s.push('\n');
-            // Continuation line at col 7 with `      = term`.
-            let cont = if i == 0 { "             = " } else { "             = " };
-            s.push_str(cont);
-            s.push_str(&term_str);
-            s.push('\n');
-        }
+        // HS `prettyEq (a,b) = prettyNTerm (Var a) $$ nest 6 (text "="
+        // <-> prettyNTerm b)` (SubstVFresh.hs:228-229).  `$$` overlaps the
+        // (single-line) var onto the same line as the nest-6 `= <term>`,
+        // giving `z     = term` with `=` at col 6; the term itself wraps
+        // via `prettyTerm`'s fcat/fsep, with continuation aligned under the
+        // first argument.  Build it as one Doc so the engine reproduces the
+        // term wrap and continuation indent byte-identically.  `<->` is
+        // `<+>` (beside-with-space).
+        let term_doc = pf::term_to_doc(&lnterm_to_parser(t), &[]);
+        let rhs = Doc::text("=").beside_sp(term_doc).nest(6);
+        let entry = Doc::text(var_str).above(rhs);
+        // Place the entry at its absolute column = prefix width.  Nest by
+        // that amount, render, then strip the leading prefix-width spaces
+        // from the first line (we emit `prefix` explicitly so the label /
+        // continuation-indent is right).
+        let col = prefix.chars().count();
+        let rendered = entry.nest(col as isize).render();
+        let strip = rendered.chars().take(col).take_while(|c| *c == ' ').count();
+        s.push_str(&prefix);
+        s.push_str(&rendered[strip..]);
+        s.push('\n');
     }
     s
 }
@@ -782,8 +786,9 @@ fn lnfact_to_parser(fa: &crate::fact::LNFact) -> p::Fact {
         FactTag::Fresh => ("Fr".to_string(), false),
         FactTag::In => ("In".to_string(), false),
         FactTag::Out => ("Out".to_string(), false),
-        FactTag::Ku => ("KU".to_string(), false),
-        FactTag::Kd => ("KD".to_string(), false),
+        // KU and KD are Persistent per factTagMultiplicity (Model/Fact.hs:358-359).
+        FactTag::Ku => ("KU".to_string(), true),
+        FactTag::Kd => ("KD".to_string(), true),
         FactTag::Ded => ("Ded".to_string(), false),
         FactTag::Term => ("Term".to_string(), false),
     };
@@ -1428,40 +1433,14 @@ fn render_parsed_lemma(lem: &p::Lemma, proved: &[ProvedLemma]) -> String {
     }
     out.push_str(":\n");
 
-    // Lemma body shape from HS `prettyLemma` (Lemma.hs:117-127):
-    //   `sep [<quantifier>, doubleQuotes <formula>]`, all under `nest 2`.
-    // When the combined fits on a single line, lay out as
-    //   `  <quant> "<formula>"`
-    // Otherwise wrap to:
-    //   `  <quant>
-    //   "<formula>"`
-    // Within the formula, recursively wrap on the same width budget.
+    // Lemma body shape from HS `prettyLemma` (Lemma.hs:119-122):
+    //   `nest 2 $ sep [ prettyTraceQuantifier, doubleQuotes (prettyLNFormula f) ]`
+    // Routed through the HS-faithful Doc engine so the quant-vs-formula
+    // `sep` wrap, the formula's internal `sep`/`nest` wrapping, and the
+    // continuation indents are byte-identical to HS.  The `nest 2` indent
+    // is included in the rendered output (HS renders it at theory col 0).
     let quant = quantifier_keyword(&lem.trace_quantifier);
-    let flat_formula = pf::pretty_formula(&lem.formula);
-    let one_line = format!("  {} \"{}\"", quant, flat_formula);
-    // HS-faithful fit check: HughesPJ's `fits` walks only the flat doc
-    // text (ignoring `Nest` indent), so the check budget compares the
-    // doc's CONTENT length against `min(lineLength, ribbon) - sl`. Here
-    // the sep is wrapped in `nest 2` on a fresh line (sl=0), so budget
-    // = min(110, 73) = 73 and content = total_chars - 2_indent. Sticking
-    // with `total_chars <= WRAP_WIDTH(=ribbon=73)` would reject docs of
-    // content-length 72 (HS-fit at 73 with 1 spare); subtract the
-    // leading nest indent so the check matches HS's `fits`.
-    let content_len = one_line.chars().count().saturating_sub(2);
-    if content_len <= pf::WRAP_WIDTH {
-        out.push_str(&one_line);
-    } else {
-        // The formula starts at column 3 (`  "` prefix).  Width 76 means
-        // the formula's content has `76 - 3 = 73` cols available
-        // before wrap.  But the outer `"` should also fit, so allow up
-        // to 75 chars total inside the quotes — i.e. wrap at indent 3.
-        let wrapped = pf::pretty_formula_wrapped(&lem.formula, 3, pf::WRAP_WIDTH);
-        out.push_str("  ");
-        out.push_str(quant);
-        out.push_str("\n  \"");
-        out.push_str(&wrapped);
-        out.push('"');
-    }
+    out.push_str(&pf::lemma_header_line(quant, &lem.formula));
     out.push('\n');
 
     // /* guarded formula characterizing ... */
@@ -1524,15 +1503,17 @@ fn render_guarded_block(lem: &p::Lemma) -> String {
     // (`gnot gf`).  The result is the "counter-example" form.
     //
     // The guarded block is rendered inside `multiComment` at col 0 with
-    // the formula wrapped in `doubleQuotes` — so the formula's first
-    // char sits at col 1 (right after the `"`).  We pass indent=1 so
-    // the sep/nest wrap-points align with HS output (Lemma.hs:131-141).
+    // the formula wrapped in `doubleQuotes` (HS Lemma.hs:138/141:
+    // `doubleQuotes (prettyGuarded gf)`).  `pretty_guarded_doublequoted`
+    // models the `"` as a real `Doc` `beside`, so HughesPJ's column-shift
+    // puts continuation lines at the formula's start column (1) — exactly
+    // like HS's `"\"" <> prettyGuarded <> "\""`.
     let to_render = match &lem.trace_quantifier {
         p::TraceQuantifier::ExistsTrace => gf,
         p::TraceQuantifier::AllTraces => crate::guarded::gnot(&gf),
     };
-    let gtext = pf::pretty_guarded_wrapped(&to_render, 1, pf::WRAP_WIDTH);
-    format!("/*\n{}\n\"{}\"\n*/", header, gtext)
+    let quoted = pf::pretty_guarded_doublequoted(&to_render);
+    format!("/*\n{}\n{}\n*/", header, quoted)
 }
 
 // =============================================================================
@@ -1543,10 +1524,13 @@ fn render_parsed_restriction(r: &p::Restriction) -> String {
     let mut out = String::new();
     out.push_str("restriction ");
     out.push_str(&r.name);
-    out.push_str(":\n  \"");
-    let formula_str = pf::pretty_formula(&r.formula);
-    out.push_str(&formula_str);
-    out.push('"');
+    out.push_str(":\n");
+    // HS `prettyRestriction` (TheoryObject.hs:850):
+    //   `nest 2 $ doubleQuotes (prettyLNFormula f)` — routed through the
+    // HS-faithful Doc engine so the formula's `sep`/`nest` wrapping and
+    // continuation indents match HS byte-exact.  The `nest 2` indent and
+    // the surrounding `"` are part of the rendered Doc.
+    out.push_str(&pf::formula_doublequoted_nested(&r.formula, 2));
     // HS's `prettyRestriction`:
     //   `nest 2 (if safety then "// safety formula" else emptyDoc)`
     //   `case ogFormula of Just _ -> /* expanded formula: "..." */`
@@ -1555,9 +1539,9 @@ fn render_parsed_restriction(r: &p::Restriction) -> String {
     if is_safety_formula(&r.formula) {
         out.push_str("\n  // safety formula");
     }
-    out.push_str("\n\n  /*\n  expanded formula:\n  \"");
-    out.push_str(&formula_str);
-    out.push_str("\"\n  */");
+    out.push_str("\n\n  /*\n  expanded formula:\n");
+    out.push_str(&pf::formula_doublequoted_nested(&r.formula, 2));
+    out.push_str("\n  */");
     out
 }
 
@@ -1586,7 +1570,7 @@ fn no_existential(g: &crate::guarded::Guarded) -> bool {
 // LNTerm rendering (for equations)
 // =============================================================================
 
-fn render_lnterm(t: &tamarin_term::lterm::LNTerm) -> String {
+pub(crate) fn render_lnterm(t: &tamarin_term::lterm::LNTerm) -> String {
     use tamarin_term::function_symbols::{AcSym, FunSym};
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
@@ -1719,6 +1703,15 @@ fn pp_proof(
     use crate::constraint::solver::proof_method::{ProofMethod, Result as MR};
     // The step's first char lands at col `depth*2` (proof body uses
     // 2-space indent per nesting level).
+    //
+    // HS `prettyIncrementalProof` (ProofSkeleton.hs:80-84) renders each
+    // step as `sep [prettyProofMethod, if Nothing then "/* unannotated
+    // */" else empty]`.  A step whose constraint system could not be
+    // re-attached during the close-time `checkProof` replay
+    // (`annotated == false`) gets the `/* unannotated */` comment beside
+    // its method.  Fully-searched / successfully-replayed steps stay
+    // `Just System` (annotated == true) and render without it.
+    let unann = if node.annotated { "" } else { " /* unannotated */" };
     let step = pp_step_at(&node.method, depth * 2);
     let cases: Vec<(&String, &crate::constraint::solver::search::ProofNode)> =
         node.children.iter().collect();
@@ -1726,19 +1719,31 @@ fn pp_proof(
     match (&node.method, cases.as_slice()) {
         (ProofMethod::Finished(MR::Solved), []) => {
             out.push_str(&step);
+            out.push_str(unann);
         }
         (_, []) => {
-            // No children: `by <step>` form.
+            // No children: `by <step>` form.  HS `ppCases ps [] =
+            // prettyCase ps (kwBy <> text " ") <> prettyStep ps` (Proof.hs:
+            // 1085-1086) — `<>` is beside, so the `prettyStep` Doc is laid
+            // out BESIDE `by ` and HughesPJ's beside column-shift indents
+            // the step's wrapped continuation lines by the width of `by `
+            // (3 chars).  Render the step at col `depth*2 + 3` so wrapped
+            // `solve(...)` continuation lines align under the post-`by `
+            // column, not the bare proof-tree indent.
             out.push_str("by ");
+            let step = pp_step_at(&node.method, depth * 2 + 3);
             out.push_str(&step);
+            out.push_str(unann);
         }
         (_, [(label, child)]) if label.is_empty() => {
             out.push_str(&step);
+            out.push_str(unann);
             out.push('\n');
             pp_proof(child, out, depth);
         }
         (_, multi) => {
             out.push_str(&step);
+            out.push_str(unann);
             for (i, (name, child)) in multi.iter().enumerate() {
                 if i > 0 {
                     // HS Proof.hs:1089: `intersperse (prettyCase ps kwNext)`
@@ -1789,32 +1794,32 @@ fn pp_step_at(m: &crate::constraint::solver::proof_method::ProofMethod, indent: 
             None => "contradiction".to_string(),
         },
         PM::SolveGoal(g) => {
+            use crate::constraint::constraints::Goal;
             // HS `prettyProofMethod` (ProofMethod.hs:1494):
             //   SolveGoal goal ->
             //     keyword_ "solve(" <-> prettyGoal goal <-> keyword_ ")"
-            // `<->` is hsep-with-space → `solve( <goal> )` (one space
-            // after `(` and before `)`).
-            // The goal lands at col `indent + len("solve( ")` = `indent + 7`.
-            // Pass `indent` as the line_start so the goal's internal
-            // fact/term renderers see the ribbon budget measured from
-            // the line's actual start (where `solve(` sits), not from
-            // the goal's column — HS-faithful for the common case
-            // where solve(...) is the whole line content.
-            //
-            // Trailing for the goal = ` )` (2 chars) — used so the
-            // goal's inner fact-nestShort' Union sees these chars when
-            // deciding inline vs vertical, matching HS's `fits` which
-            // walks PAST the fact's sep into the outer doc's remaining
-            // text (including solve's closing ` )`).
-            let goal_str = render_goal_at_trailing(g, indent + 7, indent, /*trailing_chars=*/2);
-            // HS `<->` is hsep-with-space (`<+>`).  Even when the goal
-            // wraps to multiple lines (via its own internal `sep`s),
-            // the trailing `keyword_ ")"` attaches to the LAST line of
-            // the goal output with one separating space — it does NOT
-            // get pushed onto its own line.  Match by appending ` )`
-            // to the post-wrap `goal_str` unconditionally.
-            // HS ProofMethod.hs:1494.
-            format!("solve( {} )", goal_str)
+            // For a non-empty `DisjG`, `prettyGoal` is
+            //   `fsep $ punctuate "  ∥" (map (nest 1 . parens . prettyGuarded) gfs)`
+            // (Constraints.hs:281-283) — a multi-disjunct guarded formula
+            // that HS wraps across lines inside the global proof-tree Doc.
+            // Route this whole `solve( ... )` line through the HS-faithful
+            // Doc engine so the `fsep`/`sep`/`nest` wrap decisions and the
+            // continuation-line indents (col `indent + 7`, after `solve( `)
+            // are byte-identical to HS.
+            if let Goal::Disj(d) = g {
+                if !d.0.is_empty() {
+                    return pf::solve_disj_goal_line(&d.0, indent);
+                }
+            }
+            // ActionG/ChainG/PremiseG/SplitG/SubtermG: route the whole
+            // `solve( <goal> )` line through the same HS-faithful Doc engine
+            // as DisjG (4a6b6d5a) so `prettyLNFact`'s `nestShort'` wrapping
+            // (Fact.hs:539-544) and the `<+>` beside column-shift indent the
+            // goal's continuation lines to the column after `solve( `
+            // (= indent+7), byte-identical to HS.  HS `prettyGoal`
+            // (Constraints.hs:273-287).
+            let goal_doc = solve_goal_to_doc(g);
+            pf::solve_goal_line_from_doc(goal_doc, indent)
         }
         PM::Invalidated => {
             // HS `prettyProofMethod` (ProofMethod.hs):
@@ -1930,13 +1935,67 @@ fn render_lnfact_at_with_trailing(fa: &crate::fact::LNFact, indent: usize, line_
         return format!("{}{}( )", prefix, name);
     }
     // Convert to parser-AST and reuse the wrap-aware fact renderer.
-    let pfa = p::Fact {
-        persistent: prefix == "!",
-        name: name.to_string(),
-        args: fa.terms.iter().map(lnterm_to_parser).collect(),
-        annotations: Vec::new(),
-    };
+    let pfa = lnfact_to_parser(fa);
     render_fact_at_with_trailing(&pfa, indent, line_start, trailing_chars)
+}
+
+/// Build a `pretty_hpj::Doc` for a non-DisjG `Goal`, mirroring HS
+/// `prettyGoal` (Constraints.hs:273-287).  `<->` = `<+>` (beside-with-
+/// space).  Facts go through `prettyLNFact`'s `nestShort'` wrapping (via
+/// `pf::fact_doc`); terms through `prettyLNTerm` (via `pf::term_doc`);
+/// node-ids / node-conc / node-prem are atomic strings (HS `prettyNodeId`
+/// is `text . show`).  The DisjG case is handled by `solve_disj_goal_line`
+/// upstream and never reaches here.
+fn solve_goal_to_doc(
+    g: &crate::constraint::constraints::Goal,
+) -> crate::pretty_hpj::Doc {
+    use crate::constraint::constraints::Goal;
+    use crate::rule::PremIdx;
+    use crate::pretty_hpj::Doc;
+    match g {
+        // `prettyGoal (ActionG i fa) = prettyNAtom (Action (varTerm i) fa)`
+        // = `prettyFact fa <-> opAction <-> text (show i)` (Atom.hs:216-217),
+        // `opAction = "@"` (Pretty.hs:170).
+        Goal::Action(i, fa) => {
+            let nid = render_node_id(i);
+            pf::fact_doc(&lnfact_to_parser(fa))
+                .beside_sp(Doc::text("@"))
+                .beside_sp(Doc::text(nid))
+        }
+        // `prettyGoal (ChainG c p) =
+        //    prettyNodeConc c <-> operator_ "~~>" <-> prettyNodePrem p`.
+        Goal::Chain(c, p) => {
+            Doc::text(render_node_conc(c))
+                .beside_sp(Doc::text("~~>"))
+                .beside_sp(Doc::text(render_node_prem(p)))
+        }
+        // `prettyGoal (PremiseG (i, PremIdx v) fa) =
+        //    prettyLNFact fa <-> text ("▶" ++ subscript (show v)) <-> prettyNodeId i`.
+        Goal::Premise((i, PremIdx(v)), fa) => {
+            let sub = goal_subscript(*v);
+            let nid = render_node_id(i);
+            pf::fact_doc(&lnfact_to_parser(fa))
+                .beside_sp(Doc::text(format!("\u{25B6}{}", sub)))
+                .beside_sp(Doc::text(nid))
+        }
+        // `prettyGoal (SplitG x) = text "splitEqs" <> parens (text (show ...))`
+        // `<>` = no space → `splitEqs(N)`.
+        Goal::Split(id) => Doc::text(format!("splitEqs({})", id.0)),
+        // `prettyGoal (DisjG (Disj [])) = text "Disj" <-> operator_ "(⊥)"`.
+        Goal::Disj(d) if d.0.is_empty() => {
+            Doc::text("Disj").beside_sp(Doc::text("(\u{22A5})"))
+        }
+        // Non-empty DisjG is routed via `solve_disj_goal_line` upstream;
+        // fall back to the Doc form for safety.
+        Goal::Disj(d) => pf::disj_goal_to_doc(&d.0),
+        // `prettyGoal (SubtermG (l,r)) =
+        //    prettyLNTerm l <-> operator_ "⊏" <-> prettyLNTerm r`.
+        Goal::Subterm((l, r)) => {
+            pf::term_doc(&lnterm_to_parser(l))
+                .beside_sp(Doc::text("\u{228F}"))
+                .beside_sp(pf::term_doc(&lnterm_to_parser(r)))
+        }
+    }
 }
 
 /// Render a `NodeId` (`LVar` of Node sort).  HS `prettyNodeId`

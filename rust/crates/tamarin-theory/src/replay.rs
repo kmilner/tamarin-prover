@@ -72,21 +72,73 @@ pub fn replace_sorry_prove(
     skeleton: &ParsedProofTree,
     max_steps: usize,
 ) -> ProofNode {
-    replay_node(ctx, initial, skeleton, max_steps)
+    replay_node(ctx, initial, skeleton, max_steps, true)
 }
 
-/// Replay one node of the skeleton against `sys`.
+/// Replay a stored skeleton WITHOUT auto-proving its open/sorry leaves —
+/// the equivalent of HS's close-time `checkAndExtendProver (sorryProver
+/// Nothing)` (Prover.hs:185, Proof.hs:626-632).  Each step's method and
+/// children are taken verbatim from the skeleton; every fall-through that
+/// `checkProof` would turn into a `Sorry` with a `Nothing` system
+/// (Proof.hs:459-469) becomes an *unannotated* `ProofNode`
+/// (`annotated == false`), so the lemma renders byte-identically to HS's
+/// reprint of a non-target lemma (incl. `/* unannotated */` markers) and
+/// its summary status reflects the stored proof — NOT a fresh search.
+///
+/// Used for lemmas the `--prove` selector does NOT target (HS keeps their
+/// close-time-replayed proof untouched, Prover.hs:273-275).
+pub fn check_and_extend(
+    ctx: &ProofContext,
+    initial: System,
+    skeleton: &ParsedProofTree,
+    max_steps: usize,
+) -> ProofNode {
+    replay_node(ctx, initial, skeleton, max_steps, false)
+}
+
+/// Build an annotated `Sorry` leaf seeded with `sys`.  HS `checkProof`
+/// keeps the *node itself* annotated (`node ... = ProofStep m (Just
+/// info, Just sys)`, Proof.hs:467) — only its forced children are
+/// `Nothing`.  A stored `by sorry` leaf therefore renders as plain
+/// `by sorry` (no `/* unannotated */`).
+fn annotated_sorry(reason: Option<String>, sys: System) -> ProofNode {
+    ProofNode {
+        method: ProofMethod::Sorry(reason),
+        sys,
+        children: BTreeMap::new(),
+        status: NodeStatus::Sorry,
+        annotated: true,
+    }
+}
+
+/// Public root-level annotated `sorry` leaf (HS keeps the parsed
+/// `unproven ()` proof when a lemma has no stored skeleton —
+/// ProofSkeleton.hs:61; checkProof annotates it with the start system).
+pub fn unannotated_sorry_root(sys: System) -> ProofNode {
+    annotated_sorry(None, sys)
+}
+
+/// Replay one node of the skeleton against `sys`.  When `auto_prove` is
+/// false, fall-throughs that would otherwise invoke the auto-prover emit
+/// unannotated `Sorry` leaves instead (HS check-and-extend semantics).
 fn replay_node(
     ctx: &ProofContext,
     sys: System,
     node: &ParsedProofTree,
     max_steps: usize,
+    auto_prove: bool,
 ) -> ProofNode {
     // ---- Leaf cases first (HS `replace prf@(... Sorry ...)`). ----
     // `by sorry` leaf → invoke the auto-prover on `sys`.  HS:
     //   replace prf@(LNode (ProofStep (Sorry _) (Just se)) _) =
     //       fromMaybe prf $ runProver prover0 ctxt d se prf
     if matches!(node.method, ParsedMethod::Sorry) && node.cases.is_empty() {
+        // HS check-and-extend keeps a stored `Sorry` leaf annotated
+        // (Proof.hs:459,467: `sorryNode reason cs` → node carries
+        // `Just sys`), so it renders as plain `by sorry`.
+        if !auto_prove {
+            return annotated_sorry(None, sys);
+        }
         return run_proof_search(ctx, sys, max_steps);
     }
 
@@ -106,18 +158,29 @@ fn replay_node(
     //       elsewhere), the auto-prover will find a valid proof or
     //       Sorry — neither lies about the result.
     if matches!(node.method, ParsedMethod::Contradiction) && node.cases.is_empty() {
-        if let Some(MethodResult::Contradictory(c)) = is_finished(ctx, &sys) {
+        if let Some(MethodResult::Contradictory(_)) = is_finished(ctx, &sys) {
+            // HS replay (checkProof, Proof.hs:458-467) preserves the
+            // skeleton's STORED method verbatim — the parser builds
+            // `Finished (Contradictory Nothing)` for `by contradiction`
+            // (Proof.hs:81), so the reprinted method carries no reason
+            // (`prettyProofMethod` → plain `by contradiction`).  Emit
+            // `Contradictory(None)`, NOT a freshly-recomputed reason
+            // (which would print a spurious `/* from formulas */`).
             return ProofNode {
-                method: ProofMethod::Finished(MethodResult::Contradictory(c)),
+                method: ProofMethod::Finished(MethodResult::Contradictory(None)),
                 sys,
                 children: BTreeMap::new(),
                 status: NodeStatus::Contradictory,
+                annotated: true,
             };
         }
         // Runtime doesn't immediately agree with the skeleton's
-        // `by contradiction` claim.  Fall back to the auto-prover (as
-        // documented above in (a)/(b)/(c)) — it will either find a
-        // valid proof or emit Sorry honestly.
+        // `by contradiction` claim.  In check-and-extend mode HS leaves
+        // a `Nothing`-annotated step (Proof.hs:461); else fall back to
+        // the auto-prover.
+        if !auto_prove {
+            return annotated_sorry(Some("invalid proof step encountered".into()), sys);
+        }
         return run_proof_search(ctx, sys, max_steps);
     }
 
@@ -133,7 +196,11 @@ fn replay_node(
                 sys,
                 children: BTreeMap::new(),
                 status: NodeStatus::Solved,
+                annotated: true,
             };
+        }
+        if !auto_prove {
+            return annotated_sorry(Some("invalid proof step encountered".into()), sys);
         }
         return run_proof_search(ctx, sys, max_steps);
     }
@@ -147,7 +214,11 @@ fn replay_node(
                 sys,
                 children: BTreeMap::new(),
                 status: NodeStatus::Unfinishable,
+                annotated: true,
             };
+        }
+        if !auto_prove {
+            return annotated_sorry(Some("invalid proof step encountered".into()), sys);
         }
         return run_proof_search(ctx, sys, max_steps);
     }
@@ -164,8 +235,12 @@ fn replay_node(
     let (method, cases) = match exec_method_for(&node.method, &sys, ctx, &node.cases) {
         Some(p) => p,
         None => {
-            // Couldn't resolve OR the method didn't apply.  Fall back
-            // to the auto-prover.  Honest faithfulness divergence.
+            // Couldn't resolve OR the method didn't apply.  HS
+            // check-and-extend marks the step `Nothing` (Proof.hs:461);
+            // else fall back to the auto-prover.
+            if !auto_prove {
+                return annotated_sorry(Some("invalid proof step encountered".into()), sys);
+            }
             return run_proof_search(ctx, sys, max_steps);
         }
     };
@@ -181,6 +256,7 @@ fn replay_node(
             sys,
             children: BTreeMap::new(),
             status: NodeStatus::Contradictory,
+            annotated: true,
         };
     }
 
@@ -234,14 +310,21 @@ fn replay_node(
                 // mismatch" Sorry leaf seeded with the parent system
                 // so the user gets a visible signal.  Honest
                 // divergence reporting; not a paper-over.
-                let placeholder = ProofNode {
-                    method: ProofMethod::Sorry(Some(format!(
-                        "skeleton case `{}` not produced at replay",
-                        skel_name
-                    ))),
-                    sys: sys.clone(),
-                    children: BTreeMap::new(),
-                    status: NodeStatus::Sorry,
+                let placeholder = if auto_prove {
+                    ProofNode {
+                        method: ProofMethod::Sorry(Some(format!(
+                            "skeleton case `{}` not produced at replay",
+                            skel_name
+                        ))),
+                        sys: sys.clone(),
+                        children: BTreeMap::new(),
+                        status: NodeStatus::Sorry,
+                        annotated: true,
+                    }
+                } else {
+                    // HS check-and-extend: unhandled case → `sorry`
+                    // (Nothing) (Proof.hs:464, sorryProver Nothing).
+                    annotated_sorry(None, sys.clone())
                 };
                 children.insert(skel_name.clone(), placeholder);
                 any_sorry = true;
@@ -251,7 +334,7 @@ fn replay_node(
                 continue;
             }
         };
-        let child_node = replay_node(ctx, child_sys, sub_tree, max_steps);
+        let child_node = replay_node(ctx, child_sys, sub_tree, max_steps, auto_prove);
         match child_node.status {
             NodeStatus::Solved => any_solved = true,
             NodeStatus::Contradictory => any_contra = true,
@@ -290,7 +373,13 @@ fn replay_node(
         if push_path {
             crate::constraint::solver::trace::case_path_push(&rt_name);
         }
-        let auto = run_proof_search(ctx, rt_sys, max_steps);
+        let auto = if auto_prove {
+            run_proof_search(ctx, rt_sys, max_steps)
+        } else {
+            // HS check-and-extend: a runtime case the stored skeleton
+            // doesn't cover → unhandled case → `sorry` (Nothing).
+            annotated_sorry(None, rt_sys)
+        };
         if push_path {
             crate::constraint::solver::trace::case_path_pop();
         }
@@ -316,7 +405,7 @@ fn replay_node(
         NodeStatus::Sorry
     };
 
-    ProofNode { method, sys, children, status }
+    ProofNode { method, sys, children, status, annotated: true }
 }
 
 /// Resolve a parsed method against `sys` and produce a (method, cases)
@@ -523,6 +612,12 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
             let want_name = &fact.name;
             let want_arity = fact.args.len();
             let want_persistent = fact.persistent;
+            // The skeleton may explicitly solve a `!KU( t ) @ #i` action
+            // goal (HS skeletons do — e.g. noise secrecy proofs).  Only
+            // exclude runtime `KU` goals when the spec does NOT name
+            // `KU`; otherwise a non-KU spec could spuriously bind a KU
+            // goal of matching arity.
+            let want_ku = want_name == "KU";
             let shape_matches: Vec<&Goal> = sys
                 .goals
                 .iter()
@@ -532,7 +627,7 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
                         if name_matches(&fa.tag, want_name)
                             && fa.terms.len() == want_arity
                             && tag_persistent(&fa.tag) == want_persistent
-                            && !matches!(fa.tag, FactTag::Ku)
+                            && (want_ku || !matches!(fa.tag, FactTag::Ku))
                         {
                             Some(g)
                         } else { None }
@@ -545,6 +640,37 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
             }
             if shape_matches.is_empty() {
                 return None;
+            }
+            // Multiple shape-matches — first disambiguate by TERM text.
+            // The skeleton names the fact arguments (e.g. `!KU( ~n )` vs
+            // `!KU( ~psk )`); HS matches the exact `ActionG i fa` whose
+            // fact equals the parsed one.  Several same-name/arity goals
+            // (notably `!KU(_)` knowledge goals) coexist at one state, so
+            // the term content — not the (unstable) skeleton timepoint —
+            // is the reliable discriminator.  Compare the spec's arg
+            // text against each candidate's rendered terms (canonicalised
+            // for whitespace).
+            let want_args: Vec<String> = fact.args.iter()
+                .map(|a| canonicalise_term_text(&crate::pretty_formula::pretty_term(a)))
+                .collect();
+            let by_terms: Vec<&Goal> = shape_matches.iter().copied()
+                .filter(|g| match g {
+                    Goal::Action(_, fa) => {
+                        fa.terms.len() == want_args.len()
+                            && fa.terms.iter().zip(&want_args).all(|(t, w)| {
+                                &canonicalise_term_text(
+                                    &crate::pretty_theory::render_lnterm(t)) == w
+                            })
+                    }
+                    _ => false,
+                })
+                .collect();
+            if by_terms.len() == 1 {
+                return Some(by_terms[0].clone());
+            }
+            if by_terms.len() > 1 {
+                // Same term, different timepoints — fall through to the
+                // time-var / first-match disambiguation over this subset.
             }
             // Multiple shape-matches — disambiguate by time-var root
             // name (after stripping the `#` prefix already done by
@@ -608,6 +734,31 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
             }
             if shape_matches.is_empty() {
                 return None;
+            }
+            // Multi-match: disambiguate by TERM text first.  When several
+            // premise goals share the same fact name / arity / premise
+            // index (e.g. multiple `Receivable( ... ) ▶₀ #i` goals from
+            // different rule instances), the fact's argument terms are the
+            // reliable discriminator — HS matches the exact parsed
+            // `PremiseG (i,v) fa`.  Compare the spec's rendered argument
+            // terms against each candidate's terms (whitespace-canonical).
+            let want_args: Vec<String> = fact.args.iter()
+                .map(|a| canonicalise_term_text(&crate::pretty_formula::pretty_term(a)))
+                .collect();
+            let by_terms: Vec<&Goal> = shape_matches.iter().copied()
+                .filter(|g| match g {
+                    Goal::Premise(_, fa) => {
+                        fa.terms.len() == want_args.len()
+                            && fa.terms.iter().zip(&want_args).all(|(t, w)| {
+                                &canonicalise_term_text(
+                                    &crate::pretty_theory::render_lnterm(t)) == w
+                            })
+                    }
+                    _ => false,
+                })
+                .collect();
+            if by_terms.len() == 1 {
+                return Some(by_terms[0].clone());
             }
             // Multi-match: disambiguate by node-var name.
             let by_time: Vec<&Goal> = shape_matches.iter().copied()
@@ -910,7 +1061,14 @@ fn name_matches(tag: &FactTag, want: &str) -> bool {
 }
 
 fn tag_persistent(tag: &FactTag) -> bool {
-    matches!(tag, FactTag::Proto(Multiplicity::Persistent, _, _))
+    // `KU`/`KD` knowledge facts are persistent (Fact.hs:155;
+    // `factTagMultiplicity` → Persistent), and the skeleton pretty-prints
+    // them with the `!` prefix (e.g. `solve( !KU( ~n ) @ #vk )`), so the
+    // parsed spec's `persistent` flag is `true` and must match here.
+    matches!(
+        tag,
+        FactTag::Proto(Multiplicity::Persistent, _, _) | FactTag::Ku | FactTag::Kd
+    )
 }
 
 #[cfg(test)]

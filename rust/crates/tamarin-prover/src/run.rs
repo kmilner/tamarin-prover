@@ -722,24 +722,29 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                     l.trace_quantifier,
                     tamarin_theory::theory::TraceQuantifier::ExistsTrace,
                 );
-                if !lemma_matches(lemma_filter, &lemma_name) {
-                    results.push(LemmaResult {
-                        name: lemma_name,
-                        verdict: LemmaVerdict::Filtered,
-                        elapsed_ms: 0,
-                        proof_steps: 1,  // HS: default `Sorry` proof = 1 LNode.
-                        exists_trace,
-                    });
-                    continue;
-                }
+                // HS faithfulness: `closeTheory` runs
+                // `checkAndExtendProver` (Prover.hs:174-185) over ALL
+                // lemmas, re-attaching the constraint system to each
+                // stored skeleton step.  `--prove=X` then runs the
+                // auto-prover ONLY on lemmas matching the selector
+                // (Prover.hs:273-275); the rest keep their close-time
+                // replayed proof, reprinted verbatim with the stored
+                // status.  We mirror that: the target lemma(s) run the
+                // full skeleton-replay+auto-prove; non-target lemmas run
+                // check-and-extend (replay only, no auto-proving open
+                // leaves) — which also keeps us from launching a heavy
+                // search on lemmas the user didn't ask to prove.
+                let is_target = lemma_matches(lemma_filter, &lemma_name);
                 // HS does NOT print a per-lemma "proving lemma X ..."
                 // marker; the only progress lines are the `[Theory X]
                 // ...` set above.  Stay quiet here for HS-faithful stderr.
                 let lt = Instant::now();
-                let outcome = match session.as_ref() {
-                    Some(s) => tamarin_theory::prove::prove_lemma_in_session(
+                let outcome = match (session.as_ref(), is_target) {
+                    (Some(s), true) => tamarin_theory::prove::prove_lemma_in_session(
                         s, &lemma_name, budget),
-                    None => tamarin_theory::prove::prove_lemma_with_pool(
+                    (Some(s), false) => tamarin_theory::prove::check_and_extend_lemma_in_session(
+                        s, &lemma_name, budget),
+                    (None, _) => tamarin_theory::prove::prove_lemma_with_pool(
                         &parsed, &lemma_name, maude.clone(),
                         file_maude_pool.clone(), budget),
                 };
