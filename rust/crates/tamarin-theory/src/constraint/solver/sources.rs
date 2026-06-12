@@ -4406,31 +4406,44 @@ fn run_solve_all_safe_goals_disj_with_progress(
     // Used to filter out chain goals whose conclusion is equal modulo
     // freshness to the last solved one — loop-breaker that prevents
     // user-equation destructor explosions.  Lead A from agent #35.
+    // The trailing `bool` is the per-branch `took_step` flag: True iff
+    // this branch (or an ancestor) dispatched a solve-step.  Mirrors
+    // HS's per-Disj-branch `names` accumulator — a branch's step-taken
+    // flag is only observed if the branch SURVIVES to a leaf, since
+    // HS's `changes = map fst (getDisj refinement)` collects `x = not
+    // (null names)` ONLY from surviving Disj branches (Sources.hs:118-
+    // 133).  A branch that takes a step then mzero's contributes
+    // nothing.  (Previously RS used a single mutable `any_step_taken`
+    // set on ANY step incl. branches that later die — an over-count
+    // that drove an EXTRA saturate iteration vs HS, collapsing e.g.
+    // TLS_Handshake's PRF C_2/S_2 deconstruction cases that HS keeps.)
     type Entry = (System, Vec<String> /* step_names accumulator */,
                   std::collections::BTreeSet<String>, i64, i64,
-                  Option<tamarin_term::lterm::LNTerm> /* last_chain_term */);
+                  Option<tamarin_term::lterm::LNTerm> /* last_chain_term */,
+                  bool /* took_step */);
     let mut worklist: Vec<Entry> = vec![
         (initial_sys, Vec::new() /* fresh accumulator for steps */,
          std::collections::BTreeSet::new(),
-         chains_limit, outer_cap, None /* last_chain_term */)
+         chains_limit, outer_cap, None /* last_chain_term */, false)
     ];
     // `finished` holds (System, accumulated_step_names_list).
     // `combine` runs with `initial_name` after the loop terminates.
     let mut finished: Vec<(System, Vec<String>)> = Vec::new();
-    // HS-faithful `not (null names)` progress flag: True iff any
-    // branch dispatched a solve-step (safe-goal or source-pick) that
-    // produced a named step (so `caseNames ++ x` would have been
-    // non-empty in HS's `solveAllSafeGoals`).  This drives the outer
-    // saturate's "changes" detection.
+    // HS-faithful `not (null names)` progress flag: True iff some
+    // SURVIVING branch dispatched a solve-step.  Accumulated only at
+    // `finished.push` (a branch reaching a leaf) — see the per-branch
+    // `took_step` field on `Entry`.  This drives the outer saturate's
+    // "changes" detection (Sources.hs:118-133,498-503).
     let mut any_step_taken: bool = false;
     // Safety: hard limit on total worklist processing iterations to
     // avoid runaway exploration if branching is pathological.
     let mut total_steps: usize = 0;
     let total_step_cap: usize = branch_cap.saturating_mul(50).max(2000);
 
-    while let Some((sys, name, used, chains_left, iters_left, last_chain_term)) = worklist.pop() {
+    while let Some((sys, name, used, chains_left, iters_left, last_chain_term, took_step)) = worklist.pop() {
         total_steps += 1;
         if total_steps > total_step_cap {
+            any_step_taken |= took_step;
             finished.push((sys, name));
             continue;
         }
@@ -4438,6 +4451,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
         // park this branch as-is (its final state is whatever we
         // accumulated so far).
         if finished.len() + 1 > branch_cap || iters_left <= 0 {
+            any_step_taken |= took_step;
             finished.push((sys, name));
             continue;
         }
@@ -4489,7 +4503,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
                 let tail: Vec<System> = iter.collect();
                 for sib in tail.into_iter().rev() {
                     worklist.push((sib, name.clone(), used.clone(),
-                        chains_left, iters_left, last_chain_term.clone()));
+                        chains_left, iters_left, last_chain_term.clone(), took_step));
                 }
                 head
             }
@@ -4605,6 +4619,23 @@ fn run_solve_all_safe_goals_disj_with_progress(
             !st.solved && matches!(g, Goal::Chain(_, _)));
         let any_chain_goal = goals.iter()
             .any(|(g, _)| matches!(g, Goal::Chain(_, _)));
+        // TAM_RS_SAS_ITER=1: per-solve-step trace mirroring HS's
+        // [HS_SAS_ITER] (Sources.hs:254-267).  Lets the PRF/senc
+        // deconstruction-chain trajectories be diffed HS↔RS.
+        if std::env::var("TAM_RS_SAS_ITER").is_ok() {
+            let n_chains = red.sys.goals.iter().filter(|(g, st)|
+                !st.solved && matches!(g, Goal::Chain(_, _))).count();
+            let kinds: Vec<String> = goals.iter().map(|(g, _)| match g {
+                Goal::Action(_, fa) => format!("Act-{:?}", fa.tag),
+                Goal::Premise(_, fa) => format!("Prem-{:?}", fa.tag),
+                Goal::Chain(_, _) => "Chain".to_string(),
+                Goal::Disj(_) => "Disj".to_string(),
+                Goal::Split(_) => "Split".to_string(),
+                Goal::Subterm(_) => "Subterm".to_string(),
+            }).collect();
+            eprintln!("[RS_SAS_ITER] cn={:?} goals={} chains={} chainsLeft={} goalKinds={:?}",
+                name, goals.len(), n_chains, chains_left, kinds);
+        }
         let split_allowed = !any_chain_goal && any_unsolved_chain;
         // Haskell parity (Sources.hs:169-170, 159) — same fix as
         // solve_all_safe_goals_tracked above.
@@ -4704,9 +4735,10 @@ fn run_solve_all_safe_goals_disj_with_progress(
                     // deconstruction cases — e.g. chaum's pk C_2 cases —
                     // un-collapsed because they never got driven to their
                     // typing-contradiction mzero.)
-                    any_step_taken = true;
+                    // HS-faithful: mark THIS branch as having taken a step;
+                    // it only counts if the branch survives to a leaf.
                     worklist.push((red.sys, name, used,
-                        new_chains_left, iters_left - 1, new_last_chain_term.clone()));
+                        new_chains_left, iters_left - 1, new_last_chain_term.clone(), true));
                 }
                 GoalCases::LinearNamed(sub_name) => {
                     // HS-faithful: INSIDE `solveAllSafeGoals.solve`
@@ -4728,11 +4760,10 @@ fn run_solve_all_safe_goals_disj_with_progress(
                     // so pk stayed non-goodTh and c_pk was never grafted).
                     // Restoring HS faithfulness here; any TLS/PRF fallout
                     // is a SEPARATE faithfulness bug to fix on its own.
-                    any_step_taken = true;
                     let mut new_name = name.clone();
                     append_step_name_list(&mut new_name, &sub_name);
                     worklist.push((red.sys, new_name, used,
-                        new_chains_left, iters_left - 1, new_last_chain_term.clone()));
+                        new_chains_left, iters_left - 1, new_last_chain_term.clone(), true));
                 }
                 GoalCases::Cases(cases) => {
                     // Multi-output — fork.  Each case's System
@@ -4757,17 +4788,15 @@ fn run_solve_all_safe_goals_disj_with_progress(
                     // types and similar source-saturated lemmas.
                     let toplevel_only = std::env::var("TAM_DISJ_REFINE_TOPLEVEL").is_ok();
                     let mut cases_iter = cases.into_iter();
-                    // HS-faithful change flag: a forking safe-goal step is
-                    // a step → outer saturate re-iterates (see LinearNamed
-                    // comment above for the full rationale on removing the
-                    // source-pick-only workaround).
-                    any_step_taken = true;
+                    // HS-faithful change flag: a forking safe-goal step is a
+                    // step → each forked branch inherits took_step=true; it
+                    // only counts toward `changes` if that branch survives.
                     if toplevel_only {
                         if let Some((sub_name, case_sys)) = cases_iter.next() {
                             let mut new_name = name.clone();
                             append_step_name_list(&mut new_name, &sub_name);
                             worklist.push((case_sys, new_name, used.clone(),
-                                new_chains_left, iters_left - 1, new_last_chain_term.clone()));
+                                new_chains_left, iters_left - 1, new_last_chain_term.clone(), true));
                         }
                     } else {
                         let case_vec: Vec<_> = cases_iter.collect();
@@ -4775,7 +4804,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
                             let mut new_name = name.clone();
                             append_step_name_list(&mut new_name, &sub_name);
                             worklist.push((case_sys, new_name, used.clone(),
-                                new_chains_left, iters_left - 1, new_last_chain_term.clone()));
+                                new_chains_left, iters_left - 1, new_last_chain_term.clone(), true));
                         }
                     }
                 }
@@ -4786,6 +4815,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
         // No safe goal — try source-pick (Haskell's third disjunct
         // of `nextStep`, line 205).
         if ths.is_empty() {
+            any_step_taken |= took_step;
             finished.push((red.sys, name));
             continue;
         }
@@ -4834,6 +4864,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
                 _ => None,
             }).collect();
         if useful_kus.is_empty() {
+            any_step_taken |= took_step;
             finished.push((red.sys, name));
             continue;
         }
@@ -4904,6 +4935,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
             if trace {
                 eprintln!("[disj-refine] name={:?} -- no goal had matching source", name);
             }
+            any_step_taken |= took_step;
             finished.push((red.sys, name));
             continue;
         };
@@ -4923,6 +4955,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
             if trace {
                 eprintln!("[disj-refine] name={:?} -- ALL USED", name);
             }
+            any_step_taken |= took_step;
             finished.push((red.sys, name));
             continue;
         }
@@ -4962,9 +4995,8 @@ fn run_solve_all_safe_goals_disj_with_progress(
                     eprintln!("[disj-refine] commit ctx-aware case={} -> {:?}",
                         case_name, new_name);
                 }
-                any_step_taken = true;
                 worklist.push((sys_cand, new_name, new_used,
-                    chains_left, iters_left - 1, new_last_chain_term.clone()));
+                    chains_left, iters_left - 1, new_last_chain_term.clone(), true));
                 any_branched = true;
                 continue;
             }
@@ -5081,9 +5113,8 @@ fn run_solve_all_safe_goals_disj_with_progress(
                 eprintln!("[disj-refine] commit legacy case={} -> {:?}",
                     case_name, new_name);
             }
-            any_step_taken = true;
             worklist.push((sub.sys, new_name, new_used,
-                chains_left, iters_left - 1, new_last_chain_term.clone()));
+                chains_left, iters_left - 1, new_last_chain_term.clone(), true));
             any_branched = true;
             if no_source_pick_fork { break; }
         }
@@ -5091,7 +5122,9 @@ fn run_solve_all_safe_goals_disj_with_progress(
         if !any_branched {
             // No candidate was viable — Haskell `asum [mzero, ...] =
             // mzero` → `nextStep = Nothing` → `solve` returns
-            // `caseNames` (keep current state).
+            // `caseNames` (keep current state).  This branch survives,
+            // so its `took_step` flag now counts toward `changes`.
+            any_step_taken |= took_step;
             finished.push((red.sys, name));
         }
     }
