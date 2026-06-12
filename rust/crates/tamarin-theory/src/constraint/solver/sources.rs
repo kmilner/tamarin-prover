@@ -4694,6 +4694,17 @@ fn run_solve_all_safe_goals_disj_with_progress(
                 GoalCases::Linear => {
                     // Single output, no name added.  red.sys was
                     // mutated in place.
+                    // HS-faithful change flag: a safe-goal step IS a step
+                    // (`names` grows via `caseNames ++ x`, so `not (null
+                    // names)` is True — Sources.hs:163-166,499-502).  The
+                    // outer `saturateSources` re-iterates on ANY step, not
+                    // just source-picks.  (The prior `any_step_taken`-only-
+                    // on-source-pick behaviour was a non-HS workaround that
+                    // converged refined saturation prematurely, leaving
+                    // deconstruction cases — e.g. chaum's pk C_2 cases —
+                    // un-collapsed because they never got driven to their
+                    // typing-contradiction mzero.)
+                    any_step_taken = true;
                     worklist.push((red.sys, name, used,
                         new_chains_left, iters_left - 1, new_last_chain_term.clone()));
                 }
@@ -4705,14 +4716,19 @@ fn run_solve_all_safe_goals_disj_with_progress(
                     // `refineSource` level once per saturate-outer
                     // iter (between calls to solveAllSafeGoals), not
                     // per step within solveAllSafeGoals.
-                    // NOTE: `any_step_taken` is NOT set here — safe-goal
-                    // steps are normal HS behaviour and stable across
-                    // iters; flagging them re-iterates over-refining
-                    // C_2/S_2 chain cases on TLS_Handshake (kills PRF
-                    // C_2/S_2 cases at iter 3).  Only source-pick steps
-                    // mark progress for outer re-iter.  See
-                    // [[project-chaum-case-fresh-divergence]] for full
-                    // rationale.
+                    // HS-faithful change flag: a named safe-goal step is a
+                    // step → `not (null names)` True → outer saturate
+                    // re-iterates (Sources.hs:163-166,499-502).  The prior
+                    // "only source-pick steps mark progress" was a non-HS
+                    // workaround introduced to suppress a TLS_Handshake/PRF
+                    // C_2/S_2 over-refinement; that masked, rather than
+                    // fixed, the over-refinement AND broke refined-source
+                    // convergence (deconstruction cases like chaum's pk
+                    // C_2 never reached their typing-contradiction mzero,
+                    // so pk stayed non-goodTh and c_pk was never grafted).
+                    // Restoring HS faithfulness here; any TLS/PRF fallout
+                    // is a SEPARATE faithfulness bug to fix on its own.
+                    any_step_taken = true;
                     let mut new_name = name.clone();
                     append_step_name_list(&mut new_name, &sub_name);
                     worklist.push((red.sys, new_name, used,
@@ -4741,9 +4757,11 @@ fn run_solve_all_safe_goals_disj_with_progress(
                     // types and similar source-saturated lemmas.
                     let toplevel_only = std::env::var("TAM_DISJ_REFINE_TOPLEVEL").is_ok();
                     let mut cases_iter = cases.into_iter();
-                    // NOTE: `any_step_taken` NOT set — see LinearNamed
-                    // comment above.  Safe-goal cases are normal HS
-                    // behavior and stable across iters.
+                    // HS-faithful change flag: a forking safe-goal step is
+                    // a step → outer saturate re-iterates (see LinearNamed
+                    // comment above for the full rationale on removing the
+                    // source-pick-only workaround).
+                    any_step_taken = true;
                     if toplevel_only {
                         if let Some((sub_name, case_sys)) = cases_iter.next() {
                             let mut new_name = name.clone();
