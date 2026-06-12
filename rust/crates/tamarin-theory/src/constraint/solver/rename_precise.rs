@@ -107,6 +107,15 @@ pub fn rename_precise_system(sys: &mut System) {
     if let Some(la) = &sys.last_atom { state.import(la); }
     // HS `HasFrees SubtermStore` (SubtermStore.hs:546-548) walks
     // `negSt <> st <> solvedSt`; each summand is a `S.Set` — sorted.
+    // `neg_subterms` (negSt) must be visited FIRST to match HS order.
+    // HS `neg_subterms` is `S.Set (LNTerm, LNTerm)` — sorted by pair Ord.
+    let mut neg_sorted: Vec<&(tamarin_term::lterm::LNTerm, tamarin_term::lterm::LNTerm)>
+        = sys.subterm_store.neg_subterms.iter().collect();
+    neg_sorted.sort();
+    for (s, b) in neg_sorted {
+        s.for_each_free(&mut |v| { state.import(v); });
+        b.for_each_free(&mut |v| { state.import(v); });
+    }
     // SubtermConstraint isn't `Ord` in RS so sort by `(small, big)`
     // which mirrors HS's derived ordering on the analogous field pair.
     let mut sub_sorted: Vec<&crate::tools::subterm_store::SubtermConstraint>
