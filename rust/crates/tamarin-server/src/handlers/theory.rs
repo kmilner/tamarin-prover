@@ -147,7 +147,7 @@ fn apply_method_and_redirect(
         let ctx_guard = src_ps.ctx.lock();
         let methods: Vec<_> =
             tamarin_theory::constraint::solver::search::candidate_methods(
-                &sys_at_path, &ctx_guard)
+                &sys_at_path, &ctx_guard, 0)
                 .into_iter()
                 .filter(|m| tamarin_theory::constraint::solver::proof_method::
                     exec_proof_method(&ctx_guard, m, &sys_at_path).is_some())

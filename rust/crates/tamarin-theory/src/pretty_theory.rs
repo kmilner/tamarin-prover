@@ -72,6 +72,163 @@ pub struct ProvedLemma {
     pub proof_body: Option<String>,
 }
 
+// =============================================================================
+// Heuristic / GoalRanking rendering
+// =============================================================================
+
+/// Compute the default oracle name for a theory file.
+///
+/// Mirrors HS `defaultOracleNames` (System.hs:551-561): when an oracle
+/// ranking carries no explicit relative-path, the name is derived from the
+/// theory file path by the following algorithm (faithful port of the HS
+/// `groupBy` computation):
+///
+/// 1. Take the prefix before the first `.` in `in_file`.
+/// 2. Take the suffix after the last `/` in that prefix.
+/// 3. Append `".oracle"`.
+/// 4. If that file exists on disk → use it; otherwise → fall back to `"oracle"`.
+///
+/// For absolute paths the step-2 suffix starts with `/` (e.g. `/defaultoracle`),
+/// so the resulting path `"/defaultoracle.oracle"` almost never exists, and the
+/// function returns `"oracle"` — matching observed HS behaviour.
+pub(crate) fn oracle_name_for_theory(in_file: &str) -> String {
+    // Step 1: HS `head $ groupBy (\_ b -> b /= '.') srcThyInFileName`.
+    // `groupBy` always keeps the first character in the head group, then
+    // extends it up to (not including) the first '.' at position >= 1.  So
+    // a LEADING '.' (e.g. "./foo.spthy") belongs to the prefix and is NOT a
+    // terminator — the prefix is "./foo".  Mirror that by ignoring a '.' at
+    // char-position 0.
+    let split = in_file
+        .char_indices()
+        .enumerate()
+        .find(|(pos, (_, ch))| *pos >= 1 && *ch == '.')
+        .map(|(_, (byte, _))| byte)
+        .unwrap_or(in_file.len());
+    let before_dot = &in_file[..split];
+    // Step 2: suffix after last '/' in before_dot.
+    // HS `groupBy (\_ b -> b /= '/') s` splits `s` at every '/', then `last`
+    // takes the final segment.  For absolute paths this segment starts with
+    // '/' (e.g. "/defaultoracle"), so `inFileOracleName` is "/defaultoracle.oracle".
+    let after_slash = match before_dot.rfind('/') {
+        Some(i) => &before_dot[i..],   // includes the '/' prefix, mirroring HS
+        None => before_dot,
+    };
+    // Step 3: append ".oracle"
+    let candidate = format!("{}.oracle", after_slash);
+    // Step 4: existence check
+    if std::path::Path::new(&candidate).exists() {
+        candidate
+    } else {
+        "oracle".to_string()
+    }
+}
+
+/// Render a single `GoalRanking` token from the raw heuristic string.
+///
+/// Mirrors HS `prettyGoalRanking` (System.hs:710-728):
+/// - `OracleRanking`/`OracleSmartRanking` → `<char> "<oraclename>"`
+/// - `InternalTacticRanking`              → `{<name>}`
+/// - all others                           → single char
+///
+/// `oracle_name` is the already-computed default oracle name for the theory
+/// (from `oracle_name_for_theory`); it is used when the ranking carries no
+/// explicit name.
+fn render_single_ranking(ch: char, explicit_oracle: Option<&str>, oracle_name: &str) -> String {
+    match ch {
+        'o' | 'O' => {
+            let name = explicit_oracle.unwrap_or(oracle_name);
+            format!("{} \"{}\"", ch, name)
+        }
+        _ => ch.to_string(),
+    }
+}
+
+/// Parse a raw heuristic string and re-render it in HS style.
+///
+/// Mirrors `prettyGoalRankings rs = unwords (map prettyGoalRanking rs)`
+/// (System.hs:707-708).  The raw string is the verbatim text stored after
+/// `heuristic:` / `heuristic=` in the source file.  It may be compact
+/// (`"osopo"`) or already-expanded (`"o \"oracle\" s"`).
+///
+/// Grammar (mirrors HS `goalRanking` in Signature.hs:293-311):
+///   rankings     ::= ranking+
+///   ranking      ::= oracle_ranking | tactic_ranking | letter
+///   oracle_ranking ::= ('o' | 'O') ws* ('"' name '"' ws*)?
+///   tactic_ranking ::= '{' [^}]* '}'
+///   letter       ::= [a-zA-Z] ws*
+pub fn pretty_goal_rankings(raw: &str, in_file: &str) -> String {
+    let oracle_name = oracle_name_for_theory(in_file);
+    let mut result = Vec::new();
+    let chars: Vec<char> = raw.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        // Skip comments.  HS's lexer consumes `/* … */` block and `// …`
+        // line comments BETWEEN ranking tokens before parsing them, so a
+        // heuristic like `p /* note for SAPIC */` parses to just `[p]`.
+        // The raw string RS stores is read verbatim to end-of-line, so we
+        // must skip comments here too — otherwise the comment's letters are
+        // mis-tokenised as bogus rankings (and an `o` even as an oracle).
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            i += 2;
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            i = (i + 2).min(chars.len()); // consume closing `*/`
+            continue;
+        }
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+            // Line comment runs to the end of the (single-line) raw string.
+            break;
+        }
+        if c == '{' {
+            // Tactic ranking: collect up to '}'
+            // HS InternalTacticRanking → '{' ++ name ++ '}'
+            let start = i;
+            i += 1;
+            while i < chars.len() && chars[i] != '}' {
+                i += 1;
+            }
+            if i < chars.len() {
+                i += 1; // consume '}'
+            }
+            // Re-emit as-is (includes braces)
+            let tok: String = chars[start..i].iter().collect();
+            result.push(tok);
+        } else if c == 'o' || c == 'O' {
+            i += 1;
+            // Skip whitespace
+            while i < chars.len() && chars[i] == ' ' { i += 1; }
+            // Look for optional quoted oracle name
+            if i < chars.len() && chars[i] == '"' {
+                i += 1; // consume opening '"'
+                let name_start = i;
+                while i < chars.len() && chars[i] != '"' && chars[i] != '\n' && chars[i] != '\r' {
+                    i += 1;
+                }
+                let explicit_name: String = chars[name_start..i].iter().collect();
+                if i < chars.len() && chars[i] == '"' { i += 1; } // consume closing '"'
+                result.push(render_single_ranking(c, Some(&explicit_name), &oracle_name));
+            } else {
+                result.push(render_single_ranking(c, None, &oracle_name));
+            }
+        } else if c.is_ascii_alphabetic() {
+            result.push(c.to_string());
+            i += 1;
+        } else {
+            // Unknown character — skip
+            i += 1;
+        }
+    }
+    result.join(" ")
+}
+
+// =============================================================================
+
 /// Render the analyzed theory in HS's `prettyClosedTheory` shape.
 pub fn pretty_closed_theory(
     parsed: &p::Theory,
@@ -79,6 +236,7 @@ pub fn pretty_closed_theory(
     proved: &[ProvedLemma],
     wf_block: &str,
     build: &BuildInfo,
+    in_file: &str,
 ) -> String {
     let mut out = String::new();
 
@@ -123,9 +281,16 @@ pub fn pretty_closed_theory(
         out.push('\n');
     }
     if !elaborated.heuristic.is_empty() {
+        // HS `TheoryObject.hs:749`: `text "heuristic: " <> text (prettyGoalRankings thyH)`
+        // where `prettyGoalRankings = unwords . map prettyGoalRanking` (System.hs:707-708).
+        // Each ranking in the Vec is a raw heuristic string; join their expansions with a
+        // space.  (In practice there is only one `heuristic:` item per theory.)
+        let rendered: Vec<String> = elaborated.heuristic.iter()
+            .map(|raw| pretty_goal_rankings(raw, in_file))
+            .collect();
         out.push('\n');
         out.push_str("heuristic: ");
-        out.push_str(&elaborated.heuristic.join(""));
+        out.push_str(&rendered.join(" "));
         out.push('\n');
     }
     let inj_block = render_injective_fact_insts(elaborated);
@@ -147,7 +312,7 @@ pub fn pretty_closed_theory(
     // string append.
     use rayon::prelude::*;
     let rendered: Vec<Option<String>> = parsed.items.par_iter()
-        .map(|item| render_parsed_item(item, 0, parsed, elaborated, proved))
+        .map(|item| render_parsed_item(item, 0, parsed, elaborated, proved, in_file))
         .collect();
     for b in rendered.into_iter().flatten() {
         out.push('\n');
@@ -175,14 +340,28 @@ pub fn pretty_closed_theory(
 /// Render HS `ppInjectiveFactInsts` (ClosedTheory.hs:413-418):
 ///
 /// ```text
-/// /* looping facts with injective instances: T1/n1, T2/n2, ... */
+/// /*
+/// looping facts with injective instances:
+///   T1/n1, T2/n2, ...
+/// */
 /// ```
+///
+/// HS:
+/// ```haskell
+/// multiComment $ sep
+///   [ text "looping facts with injective instances:"
+///   , nest 2 $ fsepList (text . showFactTagArity) (map fst tags) ]
+/// ```
+/// where `multiComment d = comment $ fsep [text "/*", d, text "*/"]`
+/// (Pretty.hs:102-103) and `fsepList pp = fsep . punctuate comma . map pp`
+/// (Pretty.hs:88-89).
 ///
 /// Emits the empty string when no fact tags are injective.  Computes
 /// the set on demand from the elaborated rules + reducible function
 /// symbols — same call site as `ProofContext::new`
 /// (`constraint/solver/context.rs:493-495`).
 fn render_injective_fact_insts(elab: &Theory) -> String {
+    use crate::pretty_hpj::{self as hpj, Doc, punctuate};
     use crate::fact::{FactTag, Multiplicity};
     let proto_rules: Vec<crate::rule::ProtoRuleE> = elab.rules()
         .map(|r| r.rule.clone())
@@ -204,11 +383,17 @@ fn render_injective_fact_insts(elab: &Theory) -> String {
             crate::fact::fact_tag_name(tag),
             crate::fact::fact_tag_arity(tag))
     };
-    let parts: Vec<String> = tags.iter().map(|(t, _)| label(t)).collect();
-    format!(
-        "/* looping facts with injective instances: {} */",
-        parts.join(", "),
-    )
+    let tag_docs: Vec<Doc> = tags.iter().map(|(t, _)| Doc::text(label(t))).collect();
+    // fsepList (text . showFactTagArity) (map fst tags)
+    let list_doc = hpj::fsep(punctuate(Doc::text(","), tag_docs));
+    // sep [text "looping facts...", nest 2 list_doc]
+    let inner = hpj::sep(vec![
+        Doc::text("looping facts with injective instances:"),
+        list_doc.nest(2),
+    ]);
+    // multiComment inner = comment $ fsep [text "/*", inner, text "*/"]
+    let doc = hpj::fsep(vec![Doc::text("/*"), inner, Doc::text("*/")]);
+    doc.render()
 }
 
 // =============================================================================
@@ -280,15 +465,17 @@ fn render_fun_syms(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<String> {
 /// RHS term (after reading positions/term out of `StRhs`).  HS renders
 /// `lhs = rhs`, sorted by some key (we use the `BTreeSet`'s natural
 /// order which mirrors HS's `S.toList`).
-fn render_equations(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<String> {
-    let mut items: Vec<String> = Vec::new();
+fn render_equations(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<(String, String)> {
+    let mut items: Vec<(String, String)> = Vec::new();
     for r in &sig.st_rules {
         let lhs = render_lnterm(&r.lhs);
         let rhs = render_lnterm(&r.rhs.term);
-        items.push(format!("{} = {}", lhs, rhs));
+        items.push((lhs, rhs));
     }
-    // Sort by LHS string for stable HS-like ordering.
-    items.sort();
+    // Sort by `lhs = rhs` string for stable HS-like ordering.
+    items.sort_by(|a, b| {
+        format!("{} = {}", a.0, a.1).cmp(&format!("{} = {}", b.0, b.1))
+    });
     items
 }
 
@@ -306,30 +493,37 @@ fn wrap_with_lead(lead: &str, items: &[String]) -> String {
     Doc::text(lead).beside_sp(body).render()
 }
 
-/// `sep`-style layout matching HS's `sep [hdr, nest 2 (punctuate comma ds)]`:
-/// try a single line `<lead> a, b, c`; if it overflows the 76-col
-/// default-style width, fall back to a vertical layout
-/// `<lead>\n    a,\n    b,\n    ...,\n    z`.
-fn sep_block_with_lead(lead: &str, items: &[String]) -> String {
+/// HS `equations:` layout (Term/Maude/Signature.hs:224-225):
+///   `P.sep ( keyword_ "equations:" : map (P.nest 2) ds )`
+/// where `ds = P.punctuate P.comma (map prettyCtxtStRule rules)` — i.e. the
+/// comma is appended to the END of each equation doc (all but the last), and
+/// each resulting doc is `nest 2`'d, then `sep`-joined.
+///
+/// Each equation doc is itself (SubtermRule.hs:121-123):
+///   `prettyCtxtStRule r = sep [ nest 2 (prettyLNTerm lhs)
+///                             , operator_ "=" <-> prettyLNTerm rhs ]`
+/// — so the LHS carries an *inner* `nest 2`.  When the outer `sep` breaks and
+/// lays each equation on its own line at indent 2, the inner `nest 2` adds a
+/// further 2, yielding the 4-space indent HS emits.  Reproducing that requires
+/// the structured doc, not a pre-joined `lhs = rhs` string.  Route through the
+/// ported HughesPJ engine so the break decision and indentation are HS-exact.
+fn sep_block_with_lead(lead: &str, items: &[(String, String)]) -> String {
+    use crate::pretty_hpj::{self as hpj, Doc};
     if items.is_empty() { return String::new(); }
-    const WIDTH: usize = 76;
-    let joined = items.join(", ");
-    let single = format!("{} {}", lead, joined);
-    if single.chars().count() <= WIDTH {
-        return single;
-    }
-    let mut out = String::new();
-    out.push_str(lead);
-    let indent = "    ";
-    for (i, it) in items.iter().enumerate() {
-        out.push('\n');
-        out.push_str(indent);
-        out.push_str(it);
-        if i + 1 < items.len() {
-            out.push(',');
+    let n = items.len();
+    let mut docs: Vec<Doc> = Vec::with_capacity(n + 1);
+    docs.push(Doc::text(lead));
+    for (i, (lhs, rhs)) in items.iter().enumerate() {
+        // prettyCtxtStRule: sep [ nest 2 lhs, "=" <-> rhs ]
+        let lhs_doc = Doc::text(lhs).nest(2);
+        let eq_doc = Doc::text("=").beside_sp(Doc::text(rhs));
+        let mut d = hpj::sep(vec![lhs_doc, eq_doc]);
+        if i + 1 < n {
+            d = d.beside(Doc::char(','));
         }
+        docs.push(d.nest(2));
     }
-    out
+    hpj::sep(docs).render()
 }
 
 // =============================================================================
@@ -342,6 +536,7 @@ fn render_parsed_item(
     parsed: &p::Theory,
     elab: &Theory,
     proved: &[ProvedLemma],
+    in_file: &str,
 ) -> Option<String> {
     use p::TheoryItem::*;
     // Collect macros from the parsed theory so restriction/lemma renderers
@@ -371,7 +566,7 @@ fn render_parsed_item(
             }
         }
         IntrRule(_) => None,
-        Lemma(l) => Some(render_parsed_lemma(l, &macros, proved)),
+        Lemma(l) => Some(render_parsed_lemma(l, &macros, proved, in_file)),
         Restriction(r) => Some(render_parsed_restriction(r, &macros)),
         Predicates(_) => {
             // TODO: render predicates (port HS prettyPredicate).
@@ -394,6 +589,23 @@ fn render_parsed_item(
             } else {
                 Some(format!("{}{{*{}*}}", header, body))
             }
+        }
+        IfDef { then_items, else_items, .. } => {
+            // HS preprocesses `#ifdef` at the text level, so by parse time
+            // the surviving branch's items are ordinary top-level theory
+            // items.  RS's parser instead keeps the `#ifdef` structure as an
+            // `IfDef` node, populating ONLY the live branch (`then_items` XOR
+            // `else_items`).  Render that live branch in place — recursively,
+            // since a branch may hold nested `#ifdef`s / rules / lemmas —
+            // mirroring the same flattening `elaborate_items` does for the
+            // solver (elaborate.rs:732-738).  Without this the nested rules
+            // solve but never print (e.g. testParser/define.spthy).
+            let mut active: Vec<&p::TheoryItem> = then_items.iter().collect();
+            if let Some(else_b) = else_items { active.extend(else_b.iter()); }
+            let blocks: Vec<String> = active.iter()
+                .filter_map(|it| render_parsed_item(it, 0, parsed, elab, proved, in_file))
+                .collect();
+            if blocks.is_empty() { None } else { Some(blocks.join("\n\n")) }
         }
         _ => None,
     }
@@ -1596,7 +1808,7 @@ fn fsep_pack_pair(items: &[String], indent: usize, line_start: usize) -> String 
 // Lemma
 // =============================================================================
 
-fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], proved: &[ProvedLemma]) -> String {
+fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], proved: &[ProvedLemma], in_file: &str) -> String {
     use crate::pretty_hpj::{self as hpj, Doc};
     let mut out = String::new();
     // HS `prettyLemmaName` (Lemma.hs:91-95):
@@ -1610,7 +1822,7 @@ fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], proved: &[ProvedLemm
     let header_doc = if lem.attributes.is_empty() {
         kw.beside_sp(name_doc).beside(Doc::text(":"))
     } else {
-        let attr_docs: Vec<Doc> = lemma_attr_docs(&lem.attributes);
+        let attr_docs: Vec<Doc> = lemma_attr_docs(&lem.attributes, in_file);
         // `brackets (fsep (punctuate comma attrs))` — no space after `[`
         // (beside, not beside_sp) so fsep's continuation aligns with the
         // first attr character (i.e. right after `[`).
@@ -1656,7 +1868,7 @@ fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], proved: &[ProvedLemm
 /// `prettyLemmaAttribute` (Lemma.hs:97-107): each attribute becomes a
 /// `text "..."` Doc; these are assembled into
 /// `brackets (fsep (punctuate comma docs))` by the caller.
-fn lemma_attr_docs(attrs: &[p::LemmaAttr]) -> Vec<crate::pretty_hpj::Doc> {
+fn lemma_attr_docs(attrs: &[p::LemmaAttr], in_file: &str) -> Vec<crate::pretty_hpj::Doc> {
     use crate::pretty_hpj::Doc;
     let mut out = Vec::new();
     for a in attrs {
@@ -1667,7 +1879,10 @@ fn lemma_attr_docs(attrs: &[p::LemmaAttr]) -> Vec<crate::pretty_hpj::Doc> {
             DiffReuse => Some("diff_reuse".into()),
             UseInduction => Some("use_induction".into()),
             HideLemma(s) => Some(format!("hide_lemma={}", s)),
-            Heuristic(s) => Some(format!("heuristic={}", s)),
+            // HS `prettyLemmaAttribute (LemmaHeuristic h)` (Lemma.hs:103):
+            //   `text ("heuristic=" ++ prettyGoalRankings h)`
+            // Mirror space-separated, oracle-name-expanded rendering.
+            Heuristic(s) => Some(format!("heuristic={}", pretty_goal_rankings(s, in_file))),
             Output(modules) => Some(format!("output=[{}]", modules.join(","))),
             Left => Some("left".into()),
             Right => Some("right".into()),
@@ -1680,8 +1895,8 @@ fn lemma_attr_docs(attrs: &[p::LemmaAttr]) -> Vec<crate::pretty_hpj::Doc> {
 
 // Legacy string-join form (kept for any direct callers).
 #[allow(dead_code)]
-fn render_lemma_attrs(attrs: &[p::LemmaAttr]) -> String {
-    lemma_attr_docs(attrs).iter()
+fn render_lemma_attrs(attrs: &[p::LemmaAttr], in_file: &str) -> String {
+    lemma_attr_docs(attrs, in_file).iter()
         .map(|d| d.clone().render())
         .collect::<Vec<_>>()
         .join(", ")
@@ -1970,20 +2185,42 @@ fn pp_proof(
             // No children: `by <step>` form.  HS `ppCases ps [] =
             // prettyCase ps (kwBy <> text " ") <> prettyStep ps` (Proof.hs:
             // 1085-1086) — `<>` is beside, so the `prettyStep` Doc is laid
-            // out BESIDE `by ` and HughesPJ's beside column-shift indents
-            // the step's wrapped continuation lines by the width of `by `
-            // (3 chars).  Render the step at col `depth*2 + 3` so wrapped
-            // `solve(...)` continuation lines align under the post-`by `
-            // column, not the bare proof-tree indent.
-            out.push_str("by ");
-            let step = pp_step_at(&node.method, depth * 2 + 3);
-            out.push_str(&step);
+            // out BESIDE `by `.  For a `SolveGoal` step the goal can wrap, and
+            // HughesPJ counts the `by ` (3 cols) toward the ribbon when
+            // deciding the `fsep`/`sep` break — so we must render `by ` as
+            // line CONTENT, not as part of the indent (see `solve_line_render`;
+            // the NAXOS/KAS2 `Match( a,` / `<…>` divergence).  Route SolveGoal
+            // through the prefix-aware Doc builder at the bare proof indent;
+            // all other (non-wrapping) steps keep the simple string form.
+            use crate::constraint::constraints::Goal;
+            match &node.method {
+                ProofMethod::SolveGoal(g) => {
+                    let line = match g {
+                        Goal::Disj(d) if !d.0.is_empty() =>
+                            pf::solve_disj_goal_line_pfx(&d.0, depth * 2, "by "),
+                        _ =>
+                            pf::solve_goal_line_from_doc_pfx(solve_goal_to_doc(g), depth * 2, "by "),
+                    };
+                    out.push_str(&line);
+                }
+                _ => {
+                    out.push_str("by ");
+                    out.push_str(&pp_step_at(&node.method, depth * 2 + 3));
+                }
+            }
             out.push_str(unann);
         }
         (_, [(label, child)]) if label.is_empty() => {
             out.push_str(&step);
             out.push_str(unann);
             out.push('\n');
+            // HS `ppCases ps [("", prf)] = prettyStep ps $-$ ppPrf prf`
+            // (Proof.hs:1086).  `$-$` is "above" — the child is rendered
+            // at the SAME indent column as the parent step.  In our output
+            // model the caller writes the indent before calling pp_proof, so
+            // we reproduce that here: write the same `depth`-level indent
+            // before recursing into the child.
+            out.push_str(&"  ".repeat(depth));
             pp_proof(child, out, depth);
         }
         (_, multi) => {
@@ -2074,11 +2311,26 @@ fn pp_step_at(m: &crate::constraint::solver::proof_method::ProofMethod, indent: 
             // `lineComment_` renders the verbatim text after `// `.
             "// proof may have been invalidated by editing a reuse lemma above. You should ".to_string()
         }
+        PM::RawSolve(inner) => {
+            // Display-only: skeleton raw text preserved for unannotated
+            // subtrees (replay.rs `parsed_to_unannotated`).  Mirrors
+            // HS `noSystemPrf` (Proof.hs:469) which keeps the original
+            // ProofMethod value verbatim.  Output: `solve( <inner> )`.
+            // Trim the inner text: the parser's `read_balanced_paren`
+            // returns the content between `( ... )` which may carry a
+            // trailing space → `solve(  ...  )` if we don't trim.
+            format!("solve( {} )", inner.trim())
+        }
     }
 }
 
 /// Render a `Goal` for `solve(...)` output.  Mirrors HS `prettyGoal`
 /// (Constraints.hs:267-282).
+/// Also used as oracle stdin goal text (ProofMethod.hs:828).
+pub(crate) fn render_goal_for_oracle(g: &crate::constraint::constraints::Goal) -> String {
+    render_goal_at(g, 0, 0)
+}
+
 #[allow(dead_code)]
 fn render_goal(g: &crate::constraint::constraints::Goal) -> String {
     render_goal_at(g, 0, 0)

@@ -1257,17 +1257,40 @@ fn term_has_mult_subterm(t: &Term) -> bool {
 // =============================================================================
 
 pub fn lemma_attribute_report(thy: &Theory) -> WfReport {
-    let mut out = Vec::new();
-    for l in theory_lemmas(thy) {
-        let is_exists = matches!(l.trace_quantifier, TraceQuantifier::ExistsTrace);
-        let is_reuse = l.attributes.iter().any(|a| matches!(a, LemmaAttr::Reuse));
-        if is_exists && is_reuse {
-            out.push(WfError::new("Lemma annotations",
-                format!("Lemma `{}': cannot reuse 'exists-trace' lemmas",
-                    l.name)));
-        }
+    // HS `lemmaAttributeReport` (Wellformedness.hs:924-932): each
+    // exists-trace lemma tagged `reuse` yields a body line
+    //   `Lemma `<name>': cannot reuse 'exists-trace' lemmas`
+    // all under the single topic `Lemma annotations`.  HS's
+    // `prettyWfErrorReport` (Wellformedness.hs:118-125) renders a topic
+    // group as `underlineTopic topic $-$ nest 2 (vcat (intersperse "" bodies))`
+    // — i.e. ONE underlined header, then the bodies `nest 2`'d and
+    // blank-line-separated.  Emit a single `WfError` carrying that whole
+    // block so the header appears exactly once even with several lemmas.
+    let topic = "Lemma annotations";
+    let bodies: Vec<String> = theory_lemmas(thy)
+        .into_iter()
+        .filter(|l| matches!(l.trace_quantifier, TraceQuantifier::ExistsTrace)
+            && l.attributes.iter().any(|a| matches!(a, LemmaAttr::Reuse)))
+        .map(|l| format!("  Lemma `{}': cannot reuse 'exists-trace' lemmas", l.name))
+        .collect();
+    if bodies.is_empty() {
+        return Vec::new();
     }
-    out
+    // `underline_topic` already ends with a newline after the `===` rule;
+    // the extra `\n` is HS's `$-$` blank line before the (nest-2) bodies.
+    // Bodies are joined by a blank line that is ITSELF `nest 2`'d — HS
+    // `nest 2 (vcat (intersperse (text "") bodies))` indents the empty
+    // separator line to two spaces, so the join separator is `\n  \n`,
+    // not `\n\n`.  (NB: the corpus has at most one reuse-exists lemma per
+    // file, so this multi-body path is exercised only synthetically; the
+    // per-lemma error COUNT in the `N wellformedness check failed` summary
+    // still collapses to one here — matching that would require the wider
+    // `format_wf_block` refactor that renders topic headers from raw
+    // body-only entries.)
+    let mut msg = underline_topic(topic);
+    msg.push('\n');
+    msg.push_str(&bodies.join("\n  \n"));
+    vec![WfError::new(topic, msg)]
 }
 
 // =============================================================================
@@ -1352,8 +1375,15 @@ fn rules_equivalent_up_to_actions(a: &Rule, b: &Rule) -> bool {
 /// True if `lhs = rhs` is a subterm-convergent rewrite rule: every
 /// proper subterm of the RHS occurs as a subterm of the LHS, OR the
 /// RHS is exactly a constant `true`.
+///
+/// HS site: `Wellformedness.hs:1222-1232` — `checkEquationsSubtermConvergence`.
+/// Emits ONE WfError with the full formatted block:
+///   `underlineTopic "Subterm Convergence Warning" $-$ introText $-$
+///    vcat (map prettyCtxtStRule nonSubtermEquations) $-$ manualRef`
+/// where `prettyCtxtStRule` uses `sep [nest 2 lhsDoc, "=" <-> rhsDoc]`.
 pub fn subterm_convergence_report(thy: &Theory) -> WfReport {
-    let mut out = Vec::new();
+    // Collect all non-subterm-convergent equations across all `equations` items.
+    let mut non_conv: Vec<(&Term, &Term)> = Vec::new();
     for it in &thy.items {
         let (eqs, convergent) = match it {
             TheoryItem::Equations { eqs, convergent } => (eqs, *convergent),
@@ -1362,13 +1392,104 @@ pub fn subterm_convergence_report(thy: &Theory) -> WfReport {
         if convergent { continue; }
         for eq in eqs {
             if !is_subterm_convergent(&eq.lhs, &eq.rhs) {
-                out.push(WfError::new("Subterm Convergence Warning",
-                    format!("equation is not subterm-convergent: {:?} = {:?}",
-                        eq.lhs, eq.rhs)));
+                non_conv.push((&eq.lhs, &eq.rhs));
             }
         }
     }
-    out
+    if non_conv.is_empty() { return Vec::new(); }
+
+    // HS `prettyCtxtStRule r = sep [nest 2 (prettyLNTerm lhs), "=" <-> prettyLNTerm rhs]`
+    // For equations that fit on one line, `sep` renders inline:
+    // `  {lhs} = {rhs}` (two spaces from the outer nest-2 context inside `vcat`).
+    // HS's outer `$-$` / `vcat` adds no extra indent — each rule renders
+    // with its own `nest 2` inside the sep.  Result: `    {lhs} = {rhs}`
+    // (4 spaces: 2 from `nest 2` on prettyLNTerm, but actually the outer
+    // context in `doc` has no extra nest, so `nest 2 (prettyLNTerm lhs)`
+    // → 2 spaces before lhs).  Observed HS output: 4 leading spaces.
+    // Reconstruction: `sep [nest 2 lhs, "=" <-> rhs]` inline →
+    // `  {lhs} = {rhs}` (2 spaces).  Then the wrapping `doc` context adds
+    // another 2 via `nest 2 $ vcat ...`?  Let's pin to the observed 4.
+    let mut eq_lines = String::new();
+    for (lhs, rhs) in &non_conv {
+        let lhs_s = pp_term_for_wf(lhs);
+        let rhs_s = pp_term_for_wf(rhs);
+        // `sep [nest 2 lhsDoc, "=" <-> rhsDoc]` inline → `  lhs = rhs`
+        // HS output observed: `    unblind(...) = sign(...)` (4-space indent).
+        // The top-level `$-$ vcat (map pretty ...) $-$` gives no extra indent,
+        // but prettyWfErrorReport wraps the body in `nest 2`:
+        // `(nest 2 . vcat . map snd) errs` (Wellformedness.hs:122).
+        // So the per-rule `nest 2 lhs` + outer `nest 2` = 4 spaces total.
+        eq_lines.push_str("    ");
+        eq_lines.push_str(&lhs_s);
+        eq_lines.push_str(" = ");
+        eq_lines.push_str(&rhs_s);
+        eq_lines.push('\n');
+    }
+
+    // Assemble the full message block (topic header + intro + equations + footer).
+    // HS: `underlineTopic "Subterm Convergence Warning"` produces
+    //   `"Subterm Convergence Warning\n===========================\n"`.
+    // Then `$-$` (blank-line separator) adds a blank line before the intro.
+    // Then `vcat` adds the equations, then `$-$` + manual reference text.
+    let mut msg = String::new();
+    msg.push_str(&underline_topic("Subterm Convergence Warning"));
+    msg.push('\n'); // blank line before intro (HS `$-$`)
+    // The intro text — HS: `text "User-defined equations must be convergent..."`.
+    // Wrapped at 2-space indent (outer nest-2 in prettyWfErrorReport).
+    msg.push_str("  User-defined equations must be convergent and have the finite variant property. The following equations are not subterm convergent. If you are sure that the set of equations is nevertheless convergent and has the finite variant property, you can ignore this warning and continue \n");
+    msg.push('\n'); // blank line after intro (HS `$-$` before vcat)
+    msg.push_str(&eq_lines);
+    // HS: `$-$ text " \n For more information..."` — note the leading space.
+    msg.push_str("   \n For more information, please refer to the manual : https://tamarin-prover.com/manual/master/book/010_modeling-issues.html ");
+
+    vec![WfError::new("Subterm Convergence Warning", msg)]
+}
+
+/// Minimal pretty-printer for parser-AST `Term` for the WF subterm-convergence
+/// warning.  Mirrors HS `prettyLNTerm` output for the restricted case of
+/// equations: function applications, variables, public/fresh literals.
+/// (No HughesPJ wrapping needed — equations are expected to fit on one line.)
+fn pp_term_for_wf(t: &Term) -> String {
+    match t {
+        Term::Var(v) => v.name.clone(),
+        Term::PubLit(s) => format!("'{}'", s),
+        Term::FreshLit(s) => format!("~'{}'", s),
+        Term::NatLit(s) => format!("%'{}'", s),
+        Term::Number(n) => n.to_string(),
+        Term::NumberOne => "one".to_string(),
+        Term::NatOne => "%1".to_string(),
+        Term::DhNeutral => "1:msg".to_string(),
+        Term::App(name, args) => {
+            if args.is_empty() {
+                name.clone()
+            } else {
+                let args_s: Vec<String> = args.iter().map(pp_term_for_wf).collect();
+                format!("{}({})", name, args_s.join(", "))
+            }
+        }
+        Term::AlgApp(name, a, b) => {
+            format!("{}({}, {})", name, pp_term_for_wf(a), pp_term_for_wf(b))
+        }
+        Term::Pair(items) => {
+            let parts: Vec<String> = items.iter().map(pp_term_for_wf).collect();
+            format!("<{}>", parts.join(", "))
+        }
+        Term::Diff(a, b) => {
+            format!("diff({}, {})", pp_term_for_wf(a), pp_term_for_wf(b))
+        }
+        Term::BinOp(op, a, b) => {
+            use crate::ast::BinOp;
+            let sym = match op {
+                BinOp::Exp => "^",
+                BinOp::Mult => "*",
+                BinOp::Union => "++",
+                BinOp::Xor => "\u{2295}",
+                BinOp::NatPlus => "%+",
+            };
+            format!("({}{}{})", pp_term_for_wf(a), sym, pp_term_for_wf(b))
+        }
+        Term::PatMatch(inner) => pp_term_for_wf(inner),
+    }
 }
 
 fn is_subterm_convergent(lhs: &Term, rhs: &Term) -> bool {

@@ -420,7 +420,7 @@ fn write_applicable_methods(
     // semantics (otherwise the user can click an inapplicable method
     // and get an alert).  Filtering is exactly Haskell's
     // `execProofMethod` call — same cost the search loop pays.
-    let methods: Vec<ProofMethod> = candidate_methods(sys, ctx)
+    let methods: Vec<ProofMethod> = candidate_methods(sys, ctx, 0)
         .into_iter()
         .filter(|m| exec_proof_method(ctx, m, sys).is_some())
         .collect();
@@ -554,6 +554,8 @@ pub fn method_label(m: &ProofMethod) -> String {
         }
         ProofMethod::Invalidated =>
             "// proof may have been invalidated by editing a reuse lemma above. You should".to_string(),
+        ProofMethod::RawSolve(inner) =>
+            format!("solve( {} )", inner),
     }
 }
 

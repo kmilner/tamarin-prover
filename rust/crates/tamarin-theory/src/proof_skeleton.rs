@@ -85,7 +85,8 @@ fn render_node(node: &ProofNode, indent: usize, out: &mut String) {
             ProofMethod::Simplify
             | ProofMethod::SolveGoal(_)
             | ProofMethod::Induction
-            | ProofMethod::Invalidated => {
+            | ProofMethod::Invalidated
+            | ProofMethod::RawSolve(_) => {
                 // Non-terminal method with no children — must have
                 // closed contradictorily without producing cases.
                 // Haskell renders this as `by solve(...)` / `by simplify`
@@ -195,6 +196,7 @@ fn method_keyword(m: &ProofMethod) -> &'static str {
         ProofMethod::Sorry(_) => "",     // handled at leaf-emit time
         ProofMethod::Finished(_) => "",  // handled at leaf-emit time
         ProofMethod::Invalidated => "INVALIDATED",
+        ProofMethod::RawSolve(_) => "solve", // display-only; handled in pp_step_at
     }
 }
 

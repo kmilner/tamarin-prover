@@ -101,14 +101,23 @@ pub struct ProofContext {
     /// when False, all possible subterm syms of the chain-end are
     /// checked for intersection (a more LENIENT test).
     pub pc_true_subterm: bool,
-    /// The goal ranking selected by the theory's / lemma's `heuristic:`
-    /// directive.  Mirrors HS's `_pcHeuristic :: Maybe (Heuristic
-    /// ProofContext)` (System.hs) consulted by `selectHeuristic`
-    /// (Proof.hs:707).  `None` ⇒ HS's `defaultHeuristic False`
-    /// (`SmartRanking False`).  Resolved per-lemma in `prove_lemma`
+    /// The goal ranking list for this lemma, mirroring HS's
+    /// `Heuristic ProofContext = Heuristic [GoalRanking ProofContext]`
+    /// (System.hs:527).  `None` ⇒ HS's `defaultHeuristic False`
+    /// (`[SmartRanking False]`).  Resolved per-lemma in `prove_lemma`
     /// (per-lemma `[heuristic=..]` overrides the theory-level directive,
     /// matching `apDefaultHeuristic <|> pcHeuristic`).
-    pub heuristic: Option<crate::constraint::solver::goals::GoalRanking>,
+    /// Round-robin scheduling: depth d → `rankings[d % n]`
+    /// (ProofMethod.hs:802-811).
+    pub heuristic: Option<Vec<crate::constraint::solver::goals::GoalRanking>>,
+    /// The name of the lemma being proved.  Passed as `argv[1]` to
+    /// the oracle script (HS `L.get pcLemmaName ctxt`, ProofMethod.hs:829).
+    pub lemma_name: String,
+    /// Path to the theory file being proved.  Used to resolve the
+    /// oracle script path as `takeDirectory theory_file </> oracle_rel_path`
+    /// (HS Parser.hs:304, System.hs:574-575).  Stored as the absolute
+    /// path passed to `--prove`.
+    pub theory_file: String,
     /// `saturate_state` — gates the lazy `ensure_saturated()` call.
     /// HS's `saturateSources` is lazy in `cdCases`: it only emits
     /// `[EXEC] solveGoal / exploitPrems / ...` traces when a consumer
@@ -141,7 +150,9 @@ impl Clone for ProofContext {
             restrictions: self.restrictions.clone(),
             typing_assumptions: self.typing_assumptions.clone(),
             pc_true_subterm: self.pc_true_subterm,
-            heuristic: self.heuristic,
+            heuristic: self.heuristic.clone(),
+            lemma_name: self.lemma_name.clone(),
+            theory_file: self.theory_file.clone(),
             saturate_state: std::sync::Mutex::new(state),
             saturation_limit: self.saturation_limit,
         }
@@ -726,6 +737,8 @@ impl ProofContext {
             typing_assumptions: Vec::new(),
             pc_true_subterm,
             heuristic: None,
+            lemma_name: String::new(),
+            theory_file: String::new(),
             saturate_state: std::sync::Mutex::new(SaturateState::Pending),
             saturation_limit: std::env::var("TAM_SATURATION_LIMIT").ok()
                 .and_then(|s| s.parse::<usize>().ok())
@@ -890,6 +903,60 @@ pub fn annotate_loop_breakers(
     // Indexed view.
     let keys: Vec<String> = rules.iter().map(rule_key).collect();
 
+    // HS `premSolvingRelAC` builds the dataflow relation over `instances`:
+    //   `instances ru fa = [ apply (subst `freshToFreeAvoiding` fa) fa
+    //                       | subst <- eVariants ru ]`   (LoopBreakers.hs:55-57)
+    // where `eVariants ru` is the rule's AC-VARIANT disjunction
+    // (`variantsProtoRule`).  For a rule whose conclusion carries a
+    // reducible/DH-laden term (e.g. GDH RecvOthers concludes
+    // `!AO(.., 'g'^y^~esk)`), a variant substitution expands that term to a
+    // syntactic-AC form (`z.1 = 'g'^(~esk*y)`) that Maude's plain `unify`
+    // can solve against another rule's premise (`!AO(.., 'g'^y)`).  Unifying
+    // the RAW E-rule facts instead — as RS did — sends the local `unifyRaw`
+    // (and Maude) `exp(exp('g',y),esk) =? exp('g',y')`, a NESTED-exp
+    // narrowing problem the AC unifier rejects, so the dataflow edge (and
+    // hence the loop-breaker cycle) is never found.
+    //
+    // `populate_rule_variants` (run.rs) already computed and stored each
+    // rule's variant disjunction (keyed by the *abstracted* rule's fresh
+    // z-vars) on every `OpenProtoRule` BEFORE `annotate_loop_breakers`
+    // runs, so reuse `o.variant_substs`/`o.abstracted_rule` rather than
+    // recomputing via the narrowing-only `variant_substs_for_rule` (which
+    // misses DH `exp`/`mult` variant expansion).  When variants are empty
+    // (no reducible sub-terms, or this is the precompute call before
+    // population) `instances` yields the bare fact, preserving prior
+    // behaviour.
+    let variant_substs: Vec<&Vec<tamarin_term::subst_vfresh::LNSubstVFresh>> =
+        rules.iter().map(|o| &o.variant_substs).collect();
+
+    // `instances ru fa`: apply each variant subst (as a free subst via
+    // `freshToFreeAvoiding`) to `fa`.  Empty variant list ⇒ `[fa]`.
+    let instances = |rule_idx: usize, fa: &crate::fact::LNFact| -> Vec<crate::fact::LNFact> {
+        use tamarin_term::lterm::HasFrees;
+        let substs = variant_substs[rule_idx];
+        if substs.is_empty() || substs.iter().all(|s| s.is_empty()) {
+            return vec![fa.clone()];
+        }
+        substs.iter().map(|s| {
+            // HS `apply (subst `freshToFreeAvoiding` fa) fa`: rename the
+            // VFresh range vars to fresh free vars avoiding `fa`'s frees,
+            // then apply.  We seed the witness counter above the max idx
+            // appearing in `fa` (the avoid set), matching HS's
+            // `evalFreshAvoiding (frees fa)`.
+            let mut avoid_max: u64 = 0;
+            fa.for_each_free(&mut |v| { if v.idx + 1 > avoid_max { avoid_max = v.idx + 1; } });
+            let mut next = avoid_max;
+            let free = s.fresh_to_free(|_| { let i = next; next += 1; i });
+            crate::fact::LNFact {
+                tag: fa.tag.clone(),
+                annotations: fa.annotations.clone(),
+                terms: fa.terms.iter()
+                    .map(|t| tamarin_term::subst::apply_vterm(&free, t.clone()))
+                    .collect(),
+            }
+        }).collect()
+    };
+
     // Build the prem-solving relation, mirroring HS's `premSolvingRelAC`
     // (`LoopBreakers.hs:35-58`) EXACTLY, including iteration nesting —
     // `dfsLoopBreakers` walks the relation in list order, so the order
@@ -909,10 +976,19 @@ pub fn annotate_loop_breakers(
     // toPrem(of ruFrom, innermost).  Each emitted element's FIRST
     // component is (ruTo, premIdx); the relation appears grouped by
     // ruFrom because that's the outermost loop.
+    // HS enumerates premises/conclusions of the AC rule, i.e. the
+    // *abstracted* rule (whose reducible-headed sub-terms are replaced by
+    // the fresh z-vars the variant substs are keyed on).  Use
+    // `abstracted_rule` when present, falling back to the raw E-rule.
+    let ac_rules: Vec<&crate::rule::ProtoRuleE> = rules.iter()
+        .map(|o| o.abstracted_rule.as_ref().unwrap_or(&o.rule))
+        .collect();
     let mut relation: Vec<((String, PremIdx), (String, PremIdx))> = Vec::new();
-    for (i_from, ru_from) in rules.iter().enumerate() {
-        for (i_to, ru_to) in rules.iter().enumerate() {
-            for (to_prem_idx, prem_fa) in ru_to.rule.enumerate_premises() {
+    for (i_from, _ru_from) in rules.iter().enumerate() {
+        let ru_from_ac = ac_rules[i_from];
+        for (i_to, _ru_to) in rules.iter().enumerate() {
+            let ru_to_ac = ac_rules[i_to];
+            for (to_prem_idx, prem_fa) in ru_to_ac.enumerate_premises() {
                 // Skip K-facts and built-ins — they're handled by intruder
                 // rules and never participate in protocol-rule loops.
                 if !matches!(prem_fa.tag, crate::fact::FactTag::Proto(_, _, _)) {
@@ -931,29 +1007,37 @@ pub fn annotate_loop_breakers(
                 // do NOT unify), which fabricate extra cycles and over-mark
                 // loop breakers.  Use real Maude unifiability, mirroring HS.
                 //
-                // HS renames the conclusion to avoid the premise's free
-                // vars (`concFaFresh = rename concFa \`evalFresh\` avoid
-                // premFa`, LoopBreakers.hs:52) so the unifier treats them
-                // as distinct rule instances rather than capturing shared
-                // names.  Replicate that here.
-                let conc_unifies = ru_from.rule.conclusions.iter().any(|c| {
-                    if c.tag != prem_fa.tag { return false; }
-                    let mut fresh = tamarin_term::lterm::avoid(prem_fa);
-                    let conc_fresh = tamarin_term::lterm::rename(c.clone(), &mut fresh);
-                    crate::rule::unifiable_ln_facts(maude, &conc_fresh, prem_fa)
-                        .unwrap_or(false)
+                // HS `dataflowRelAC` (LoopBreakers.hs:49-53):
+                //   guard $ or $ do
+                //     premFa <- instances ruTo premFa0
+                //     concFa <- instances ruFrom =<< (snd <$> eConcs ruFrom)
+                //     let concFaFresh = rename concFa `evalFresh` avoid premFa
+                //     return $ unifiableLNFacts concFaFresh premFa
+                // i.e. iterate the VARIANT INSTANCES of both the premise and
+                // each conclusion, rename the conclusion away from the
+                // premise's frees, and check Maude AC-unifiability.
+                let prem_insts = instances(i_to, prem_fa);
+                let conc_unifies = ru_from_ac.conclusions.iter().any(|c0| {
+                    if c0.tag != prem_fa.tag { return false; }
+                    instances(i_from, c0).iter().any(|conc| {
+                        prem_insts.iter().any(|prem| {
+                            let mut fresh = tamarin_term::lterm::avoid(prem);
+                            let conc_fresh =
+                                tamarin_term::lterm::rename(conc.clone(), &mut fresh);
+                            crate::rule::unifiable_ln_facts(maude, &conc_fresh, prem)
+                                .unwrap_or(false)
+                        })
+                    })
                 });
                 if !conc_unifies { continue; }
-                for (from_prem_idx, _) in ru_from.rule.enumerate_premises() {
+                for (from_prem_idx, _) in ru_from_ac.enumerate_premises() {
                     relation.push((
                         (keys[i_to].clone(), to_prem_idx),
                         (keys[i_from].clone(), from_prem_idx),
                     ));
                 }
-                let _ = i_to;
             }
         }
-        let _ = i_from;
     }
     // Run DFS loop-breaker selection.
     let breakers: Vec<(String, PremIdx)> =

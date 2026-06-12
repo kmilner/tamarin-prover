@@ -244,8 +244,10 @@ pub enum ParsedMethod {
     /// `induction` (HS: `Induction`).
     Induction,
     /// `solve( <goal-text> )` (HS: `SolveGoal <parsed-goal>`).  We
-    /// capture the raw text plus a best-effort parsed `GoalSpec`.
-    SolveGoal(GoalSpec),
+    /// capture the raw inner text plus a best-effort parsed `GoalSpec`.
+    /// The String is the raw text inside `solve( ... )`, preserved for
+    /// HS-faithful unannotated subtree display (see `replay.rs`).
+    SolveGoal(GoalSpec, String),
     /// `SOLVED` (HS: `Finished Solved`).
     SolvedLeaf,
     /// `UNFINISHABLE` (HS: `Finished Unfinishable`).

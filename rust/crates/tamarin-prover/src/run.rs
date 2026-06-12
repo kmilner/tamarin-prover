@@ -80,6 +80,13 @@ impl LemmaVerdict {
 fn format_lemma_summary_line(r: &LemmaResult) -> String {
     let quantifier = if r.exists_trace { "exists-trace" } else { "all-traces" };
     let body = match &r.verdict {
+        // HS `showProofStatus` (Theory/Proof.hs:1124-1127): a falsified
+        // exists-trace lemma is a `CompleteProof` of `ExistsSomeTrace`
+        // ("falsified - no trace found"), whereas a falsified all-traces
+        // lemma is a `TraceFound` for `ExistsNoTrace` ("falsified - found
+        // trace").  The wording therefore depends on the quantifier.
+        LemmaVerdict::Falsified if r.exists_trace =>
+            format!("falsified - no trace found ({} steps)", r.proof_steps),
         LemmaVerdict::Falsified => format!("falsified - found trace ({} steps)", r.proof_steps),
         LemmaVerdict::Verified => format!("verified ({} steps)", r.proof_steps),
         LemmaVerdict::Analyzed
@@ -914,8 +921,8 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             // (which re-runs the setup per lemma but is more tolerant
             // of theories where elaboration fails on a subset of
             // lemmas).  Almost never hits in practice.
-            let session = tamarin_theory::prove::ProverSession::build(
-                &parsed, maude.clone(), file_maude_pool.clone()).ok();
+            let session = tamarin_theory::prove::ProverSession::build_with_in_file(
+                &parsed, maude.clone(), file_maude_pool.clone(), in_file).ok();
 
             for l in elaborated.lemmas() {
                 let lemma_name = l.name.clone();
@@ -945,9 +952,9 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                         s, &lemma_name, budget),
                     (Some(s), false) => tamarin_theory::prove::check_and_extend_lemma_in_session(
                         s, &lemma_name, budget),
-                    (None, _) => tamarin_theory::prove::prove_lemma_with_pool(
+                    (None, _) => tamarin_theory::prove::prove_lemma_with_pool_and_file(
                         &parsed, &lemma_name, maude.clone(),
-                        file_maude_pool.clone(), budget),
+                        file_maude_pool.clone(), budget, in_file),
                 };
                 if dbg_timing {
                     eprintln!("[TAM_DBG_RUN_TIMING] {:>26}: {:>8.1} ms  (lemma={})",
@@ -1052,6 +1059,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             &proved_lemmas,
             &wf_block,
             &build_info,
+            in_file,
         );
         phase!("pretty_closed_theory");
         emit_output(args, in_file, &body, None)?;
@@ -1314,7 +1322,16 @@ fn print_overall_summary(file_results: &[FileResult], prove_mode: bool) {
             if prove_mode {
                 println!("           The analysis results might be wrong!");
             }
-            println!("  ");
+            // HS `summary = ppWf report $--$ prettyClosedSummary` (Batch.hs:228-229):
+            // `$--$` (above with a blank-line gap) inserts the blank ONLY when
+            // both operands are non-empty.  Under the enclosing `nest 2` a
+            // blank `Pretty.text ""` renders as `"  "`.  So this separator
+            // appears between the warning block and the per-lemma summary
+            // lines ONLY when there are summary lines to follow; emitting it
+            // unconditionally added a spurious trailing `"  "` line.
+            if !fr.results.is_empty() {
+                println!("  ");
+            }
         }
         for r in &fr.results {
             println!("  {}", format_lemma_summary_line(r));

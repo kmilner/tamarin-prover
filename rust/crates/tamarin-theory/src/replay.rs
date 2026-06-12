@@ -111,6 +111,57 @@ fn annotated_sorry(reason: Option<String>, sys: System) -> ProofNode {
     }
 }
 
+/// HS `noSystemPrf` (Proof.hs:469): `mapProofInfo (\i -> (Just i, Nothing))`.
+///
+/// When `checkProof` finds an invalid proof step it creates
+/// `sorryNode reason (M.singleton "" prf)` where `prf` is the original
+/// proof subtree.  `M.map noSystemPrf` is applied to `prf` — it maps
+/// info to `(Just i, Nothing)` **recursively** so every node in the
+/// subtree has a `Nothing` system annotation (→ `/* unannotated */`).
+///
+/// We mirror this by converting the `ParsedProofTree` to `ProofNode`
+/// with `annotated: false` throughout.  The `sys` placeholder is the
+/// parent's sys (unused in display but required by `ProofNode`).
+///
+/// Converts:
+/// - `Simplify`    → `ProofMethod::Simplify`
+/// - `Induction`   → `ProofMethod::Induction`
+/// - `Sorry`       → `ProofMethod::Sorry(None)`
+/// - `Contradiction` → `ProofMethod::Finished(Contradictory(None))`
+/// - `SolveGoal(_, raw)` → `ProofMethod::RawSolve(raw)` (display-only)
+/// - `SolvedLeaf`  → `ProofMethod::Finished(Solved)`
+/// - other         → `ProofMethod::Sorry(None)` (safe fallback)
+fn parsed_to_unannotated(node: &ParsedProofTree, sys: System) -> ProofNode {
+    let method = parsed_method_to_display(&node.method);
+    let status = match &method {
+        ProofMethod::Finished(MethodResult::Contradictory(_)) => NodeStatus::Contradictory,
+        ProofMethod::Finished(MethodResult::Solved) => NodeStatus::Solved,
+        ProofMethod::Finished(MethodResult::Unfinishable) => NodeStatus::Unfinishable,
+        ProofMethod::Sorry(_) if node.cases.is_empty() => NodeStatus::Sorry,
+        _ => NodeStatus::Open,
+    };
+    let children: BTreeMap<String, ProofNode> = node.cases.iter()
+        .map(|(name, sub)| (name.clone(), parsed_to_unannotated(sub, sys.clone())))
+        .collect();
+    ProofNode { method, sys, children, status, annotated: false }
+}
+
+/// Convert a `ParsedMethod` to the best display-only `ProofMethod`.
+/// Used exclusively by `parsed_to_unannotated` — not for exec.
+fn parsed_method_to_display(pm: &ParsedMethod) -> ProofMethod {
+    match pm {
+        ParsedMethod::Simplify      => ProofMethod::Simplify,
+        ParsedMethod::Induction     => ProofMethod::Induction,
+        ParsedMethod::Sorry         => ProofMethod::Sorry(None),
+        ParsedMethod::Contradiction => ProofMethod::Finished(MethodResult::Contradictory(None)),
+        ParsedMethod::SolveGoal(_, raw) => ProofMethod::RawSolve(raw.clone()),
+        ParsedMethod::SolvedLeaf    => ProofMethod::Finished(MethodResult::Solved),
+        ParsedMethod::Unfinishable  => ProofMethod::Finished(MethodResult::Unfinishable),
+        ParsedMethod::Invalidated   => ProofMethod::Invalidated,
+        ParsedMethod::Other(s)      => ProofMethod::Sorry(Some(s.clone())),
+    }
+}
+
 /// Public root-level annotated `sorry` leaf (HS keeps the parsed
 /// `unproven ()` proof when a lemma has no stored skeleton —
 /// ProofSkeleton.hs:61; checkProof annotates it with the start system).
@@ -175,11 +226,20 @@ fn replay_node(
             };
         }
         // Runtime doesn't immediately agree with the skeleton's
-        // `by contradiction` claim.  In check-and-extend mode HS leaves
-        // a `Nothing`-annotated step (Proof.hs:461); else fall back to
-        // the auto-prover.
+        // `by contradiction` claim.  HS `checkProof` (Proof.hs:461-462):
+        //   `sorryNode (Just "invalid proof step encountered") (M.singleton "" prf)`
+        // where `prf` is the current leaf, `noSystemPrf`'d → unannotated.
         if !auto_prove {
-            return annotated_sorry(Some("invalid proof step encountered".into()), sys);
+            let child = parsed_to_unannotated(node, sys.clone());
+            let mut children = BTreeMap::new();
+            children.insert("".to_string(), child);
+            return ProofNode {
+                method: ProofMethod::Sorry(Some("invalid proof step encountered".into())),
+                sys,
+                children,
+                status: NodeStatus::Sorry,
+                annotated: true,
+            };
         }
         return run_proof_search(ctx, sys, max_steps);
     }
@@ -200,7 +260,16 @@ fn replay_node(
             };
         }
         if !auto_prove {
-            return annotated_sorry(Some("invalid proof step encountered".into()), sys);
+            let child = parsed_to_unannotated(node, sys.clone());
+            let mut children = BTreeMap::new();
+            children.insert("".to_string(), child);
+            return ProofNode {
+                method: ProofMethod::Sorry(Some("invalid proof step encountered".into())),
+                sys,
+                children,
+                status: NodeStatus::Sorry,
+                annotated: true,
+            };
         }
         return run_proof_search(ctx, sys, max_steps);
     }
@@ -218,7 +287,16 @@ fn replay_node(
             };
         }
         if !auto_prove {
-            return annotated_sorry(Some("invalid proof step encountered".into()), sys);
+            let child = parsed_to_unannotated(node, sys.clone());
+            let mut children = BTreeMap::new();
+            children.insert("".to_string(), child);
+            return ProofNode {
+                method: ProofMethod::Sorry(Some("invalid proof step encountered".into())),
+                sys,
+                children,
+                status: NodeStatus::Sorry,
+                annotated: true,
+            };
         }
         return run_proof_search(ctx, sys, max_steps);
     }
@@ -236,10 +314,23 @@ fn replay_node(
         Some(p) => p,
         None => {
             // Couldn't resolve OR the method didn't apply.  HS
-            // check-and-extend marks the step `Nothing` (Proof.hs:461);
-            // else fall back to the auto-prover.
+            // check-and-extend marks the step `Nothing` (Proof.hs:461):
+            //   sorryNode (Just "invalid proof step encountered") (M.singleton "" prf)
+            // where `prf` is the current node (method + children) passed
+            // through `noSystemPrf` → `annotated = false`.  RS mirrors
+            // this by creating a sorry with one child "" → the original
+            // ParsedProofTree converted to unannotated ProofNodes.
             if !auto_prove {
-                return annotated_sorry(Some("invalid proof step encountered".into()), sys);
+                let child = parsed_to_unannotated(node, sys.clone());
+                let mut children = BTreeMap::new();
+                children.insert("".to_string(), child);
+                return ProofNode {
+                    method: ProofMethod::Sorry(Some("invalid proof step encountered".into())),
+                    sys,
+                    children,
+                    status: NodeStatus::Sorry,
+                    annotated: true,
+                };
             }
             return run_proof_search(ctx, sys, max_steps);
         }
@@ -450,19 +541,21 @@ fn exec_method_for(
     // doc-comment), so we approximate by trusting the heuristic
     // ranking — for the patterns we hit in the target lemmas, the
     // top-ranked goal IS the one HS parsed.
-    if !matches!(parsed, ParsedMethod::SolveGoal(GoalSpec::Raw(_))) {
+    if !matches!(parsed, ParsedMethod::SolveGoal(GoalSpec::Raw(_), _)) {
         return None;
     }
     let skel_names: Vec<&str> = skel_children.iter().map(|(s, _)| s.as_str()).collect();
     if dbg {
         let raw = match parsed {
-            ParsedMethod::SolveGoal(GoalSpec::Raw(r)) =>
+            ParsedMethod::SolveGoal(GoalSpec::Raw(r), _) =>
                 r.chars().take(120).collect::<String>(),
             _ => String::new(),
         };
         eprintln!("[replay] raw-solve skel_names={:?} (raw text: {:?})", skel_names, raw);
     }
-    let candidates = crate::constraint::solver::search::candidate_methods(sys, ctx);
+    // depth=0 for replay: replayed steps don't need round-robin since the
+    // skeleton already specifies the goal.
+    let candidates = crate::constraint::solver::search::candidate_methods(sys, ctx, 0);
     let mut tried = 0usize;
     // Cap candidate iteration to avoid pathological case-enumeration
     // explosion (each `exec_proof_method` for a SolveGoal can be
@@ -500,6 +593,7 @@ fn method_kind(m: &ProofMethod) -> String {
         ProofMethod::Finished(_) => "Finished".into(),
         ProofMethod::Invalidated => "Invalidated".into(),
         ProofMethod::SolveGoal(g) => format!("SolveGoal({})", goal_kind(g)),
+        ProofMethod::RawSolve(_) => "RawSolve".into(),
     }
 }
 
@@ -563,7 +657,7 @@ fn resolve_method(parsed: &ParsedMethod, sys: &System) -> Option<ProofMethod> {
             // followed by `case` blocks — malformed.  Fall back.
             None
         }
-        ParsedMethod::SolveGoal(spec) => {
+        ParsedMethod::SolveGoal(spec, _raw) => {
             let g = match_goal(spec, sys)?;
             Some(ProofMethod::SolveGoal(g))
         }

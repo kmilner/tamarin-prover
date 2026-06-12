@@ -231,6 +231,31 @@ fn collect_rule_free_vars(
     for f in &r.premises { for a in &f.args { visit_term(a, &mut out, &mut seen); } }
     for f in &r.actions { for a in &f.args { visit_term(a, &mut out, &mut seen); } }
     for f in &r.conclusions { for a in &f.args { visit_term(a, &mut out, &mut seen); } }
+    // HS-faithful: sort by (idx, sort, name) to match HS's `LVar Ord`
+    // (LTerm.hs:522-524: `compare x3 y3 <> compare x2 y2 <> compare x1 y1`
+    //  where x3=idx, x2=sort, x1=name).  HS uses `frees . L.get oprRuleE` →
+    // `S.toList` which returns elements in ascending LVar Ord.
+    fn sort_hint_ord(s: &p::SortHint) -> u8 {
+        // mirrors HS LSort derived-Ord: Pub=0, Fresh=1, Msg=2, Node=3, Nat=4
+        match s {
+            p::SortHint::Pub => 0,
+            p::SortHint::Fresh => 1,
+            p::SortHint::Msg => 2,
+            p::SortHint::Node => 3,
+            p::SortHint::Nat => 4,
+            p::SortHint::Suffix(p::SuffixSort::Pub) => 0,
+            p::SortHint::Suffix(p::SuffixSort::Fresh) => 1,
+            p::SortHint::Suffix(p::SuffixSort::Msg) => 2,
+            p::SortHint::Suffix(p::SuffixSort::Node) => 3,
+            p::SortHint::Suffix(p::SuffixSort::Nat) => 4,
+            p::SortHint::Untagged => 2, // untagged → Msg by default
+        }
+    }
+    out.sort_by(|a, b| {
+        a.idx.cmp(&b.idx)
+            .then_with(|| sort_hint_ord(&a.sort).cmp(&sort_hint_ord(&b.sort)))
+            .then_with(|| a.name.cmp(&b.name))
+    });
     out
 }
 

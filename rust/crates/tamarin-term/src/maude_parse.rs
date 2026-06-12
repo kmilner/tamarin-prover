@@ -295,8 +295,10 @@ fn build_app(msig: &MaudeSig, ident: &[u8], args: Vec<MTerm>) -> MTerm {
         }
     }
     // C operator (em)?
+    // Mirror HS `fAppC EMap args` (Maude/Parser.hs:355): sort the two
+    // arguments so `em` is canonical regardless of Maude's output order.
     if ident == pp_maude_c_sym(CSym::EMap).as_slice() {
-        return Term::App(FunSym::C(CSym::EMap), args.into());
+        return crate::term::f_app_c(CSym::EMap, args);
     }
     // List?
     if ident == b"list" {
