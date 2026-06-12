@@ -2185,14 +2185,29 @@ fn pp_proof(
             // No children: `by <step>` form.  HS `ppCases ps [] =
             // prettyCase ps (kwBy <> text " ") <> prettyStep ps` (Proof.hs:
             // 1085-1086) — `<>` is beside, so the `prettyStep` Doc is laid
-            // out BESIDE `by ` and HughesPJ's beside column-shift indents
-            // the step's wrapped continuation lines by the width of `by `
-            // (3 chars).  Render the step at col `depth*2 + 3` so wrapped
-            // `solve(...)` continuation lines align under the post-`by `
-            // column, not the bare proof-tree indent.
-            out.push_str("by ");
-            let step = pp_step_at(&node.method, depth * 2 + 3);
-            out.push_str(&step);
+            // out BESIDE `by `.  For a `SolveGoal` step the goal can wrap, and
+            // HughesPJ counts the `by ` (3 cols) toward the ribbon when
+            // deciding the `fsep`/`sep` break — so we must render `by ` as
+            // line CONTENT, not as part of the indent (see `solve_line_render`;
+            // the NAXOS/KAS2 `Match( a,` / `<…>` divergence).  Route SolveGoal
+            // through the prefix-aware Doc builder at the bare proof indent;
+            // all other (non-wrapping) steps keep the simple string form.
+            use crate::constraint::constraints::Goal;
+            match &node.method {
+                ProofMethod::SolveGoal(g) => {
+                    let line = match g {
+                        Goal::Disj(d) if !d.0.is_empty() =>
+                            pf::solve_disj_goal_line_pfx(&d.0, depth * 2, "by "),
+                        _ =>
+                            pf::solve_goal_line_from_doc_pfx(solve_goal_to_doc(g), depth * 2, "by "),
+                    };
+                    out.push_str(&line);
+                }
+                _ => {
+                    out.push_str("by ");
+                    out.push_str(&pp_step_at(&node.method, depth * 2 + 3));
+                }
+            }
             out.push_str(unann);
         }
         (_, [(label, child)]) if label.is_empty() => {

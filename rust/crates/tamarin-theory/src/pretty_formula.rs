@@ -205,19 +205,43 @@ pub fn disj_goal_to_doc(gfs: &[Guarded]) -> crate::pretty_hpj::Doc {
 /// proof-tree printer adds that itself); continuation lines carry their
 /// full absolute indentation.
 pub fn solve_disj_goal_line(gfs: &[Guarded], indent: usize) -> String {
+    solve_disj_goal_line_pfx(gfs, indent, "")
+}
+
+/// As `solve_disj_goal_line`, but with a leading `prefix` (e.g. `"by "`)
+/// laid out as line CONTENT before `solve(`.  See `solve_line_render`.
+pub fn solve_disj_goal_line_pfx(gfs: &[Guarded], base_indent: usize, prefix: &str) -> String {
     use crate::pretty_hpj::Doc;
-    let goal_doc = disj_goal_to_doc(gfs);
-    // `keyword_ "solve(" <+> goal <+> keyword_ ")"`.
-    let line = Doc::text("solve(")
-        .beside_sp(goal_doc)
+    let body = Doc::text("solve(")
+        .beside_sp(disj_goal_to_doc(gfs))
         .beside_sp(Doc::text(")"));
-    // Place at column `indent`: nest by `indent` so continuation lines are
-    // indented to absolute columns, then strip the leading `indent` spaces
-    // from the first line (the proof-tree printer prepends them itself).
-    let indented = line.nest(indent as isize);
+    solve_line_render(body, base_indent, prefix)
+}
+
+/// Render a `solve( … )` proof-step line, optionally prefixed with
+/// `prefix` (`"by "` for childless leaf steps, `""` otherwise).
+///
+/// CRITICAL — ribbon faithfulness: HS lays a leaf step out as
+/// `kwBy <> text " " <> prettyStep` (Proof.hs:1085) — the `by ` is line
+/// CONTENT laid out BESIDE the step, so HughesPJ counts its 3 columns
+/// toward the ribbon when deciding where the step's `fsep`/`sep` break.
+/// Folding `by ` into the indent instead (rendering the step nested at
+/// `depth*2 + 3`) leaves the ribbon budget 3 columns too generous, so a
+/// fact argument that HS wraps stays inline (the NAXOS/KAS2 `Match( a,`
+/// / `<…>` divergence).  We therefore lay `by ` out as a `beside` text and
+/// nest the whole line at the bare proof indent: the `beside` column-shift
+/// still indents wrapped continuation lines to `base_indent + len(prefix)`
+/// (= the column after `by `), while the ribbon now sees `by `.
+fn solve_line_render(solve_body: crate::pretty_hpj::Doc, base_indent: usize, prefix: &str) -> String {
+    use crate::pretty_hpj::Doc;
+    let line = if prefix.is_empty() {
+        solve_body
+    } else {
+        Doc::text(prefix).beside(solve_body)
+    };
+    let indented = line.nest(base_indent as isize);
     let rendered = indented.render();
-    // The first line begins with exactly `indent` spaces from the nest.
-    let strip = rendered.chars().take(indent).take_while(|c| *c == ' ').count();
+    let strip = rendered.chars().take(base_indent).take_while(|c| *c == ' ').count();
     rendered[strip..].to_string()
 }
 
@@ -230,14 +254,17 @@ pub fn solve_disj_goal_line(gfs: &[Guarded], indent: usize) -> String {
 /// wrapped continuation lines to the column after `solve( ` (= indent+7),
 /// byte-identical to HS.  Same wrapping plumbing as `solve_disj_goal_line`.
 pub fn solve_goal_line_from_doc(goal_doc: crate::pretty_hpj::Doc, indent: usize) -> String {
+    solve_goal_line_from_doc_pfx(goal_doc, indent, "")
+}
+
+/// As `solve_goal_line_from_doc`, but with a leading `prefix` (e.g. `"by "`)
+/// laid out as line CONTENT before `solve(`.  See `solve_line_render`.
+pub fn solve_goal_line_from_doc_pfx(goal_doc: crate::pretty_hpj::Doc, base_indent: usize, prefix: &str) -> String {
     use crate::pretty_hpj::Doc;
-    let line = Doc::text("solve(")
+    let body = Doc::text("solve(")
         .beside_sp(goal_doc)
         .beside_sp(Doc::text(")"));
-    let indented = line.nest(indent as isize);
-    let rendered = indented.render();
-    let strip = rendered.chars().take(indent).take_while(|c| *c == ' ').count();
-    rendered[strip..].to_string()
+    solve_line_render(body, base_indent, prefix)
 }
 
 /// Public accessor for the Doc-based fact renderer (HS `prettyLNFact` /
