@@ -1257,17 +1257,40 @@ fn term_has_mult_subterm(t: &Term) -> bool {
 // =============================================================================
 
 pub fn lemma_attribute_report(thy: &Theory) -> WfReport {
-    let mut out = Vec::new();
-    for l in theory_lemmas(thy) {
-        let is_exists = matches!(l.trace_quantifier, TraceQuantifier::ExistsTrace);
-        let is_reuse = l.attributes.iter().any(|a| matches!(a, LemmaAttr::Reuse));
-        if is_exists && is_reuse {
-            out.push(WfError::new("Lemma annotations",
-                format!("Lemma `{}': cannot reuse 'exists-trace' lemmas",
-                    l.name)));
-        }
+    // HS `lemmaAttributeReport` (Wellformedness.hs:924-932): each
+    // exists-trace lemma tagged `reuse` yields a body line
+    //   `Lemma `<name>': cannot reuse 'exists-trace' lemmas`
+    // all under the single topic `Lemma annotations`.  HS's
+    // `prettyWfErrorReport` (Wellformedness.hs:118-125) renders a topic
+    // group as `underlineTopic topic $-$ nest 2 (vcat (intersperse "" bodies))`
+    // — i.e. ONE underlined header, then the bodies `nest 2`'d and
+    // blank-line-separated.  Emit a single `WfError` carrying that whole
+    // block so the header appears exactly once even with several lemmas.
+    let topic = "Lemma annotations";
+    let bodies: Vec<String> = theory_lemmas(thy)
+        .into_iter()
+        .filter(|l| matches!(l.trace_quantifier, TraceQuantifier::ExistsTrace)
+            && l.attributes.iter().any(|a| matches!(a, LemmaAttr::Reuse)))
+        .map(|l| format!("  Lemma `{}': cannot reuse 'exists-trace' lemmas", l.name))
+        .collect();
+    if bodies.is_empty() {
+        return Vec::new();
     }
-    out
+    // `underline_topic` already ends with a newline after the `===` rule;
+    // the extra `\n` is HS's `$-$` blank line before the (nest-2) bodies.
+    // Bodies are joined by a blank line that is ITSELF `nest 2`'d — HS
+    // `nest 2 (vcat (intersperse (text "") bodies))` indents the empty
+    // separator line to two spaces, so the join separator is `\n  \n`,
+    // not `\n\n`.  (NB: the corpus has at most one reuse-exists lemma per
+    // file, so this multi-body path is exercised only synthetically; the
+    // per-lemma error COUNT in the `N wellformedness check failed` summary
+    // still collapses to one here — matching that would require the wider
+    // `format_wf_block` refactor that renders topic headers from raw
+    // body-only entries.)
+    let mut msg = underline_topic(topic);
+    msg.push('\n');
+    msg.push_str(&bodies.join("\n  \n"));
+    vec![WfError::new(topic, msg)]
 }
 
 // =============================================================================
