@@ -80,6 +80,13 @@ impl LemmaVerdict {
 fn format_lemma_summary_line(r: &LemmaResult) -> String {
     let quantifier = if r.exists_trace { "exists-trace" } else { "all-traces" };
     let body = match &r.verdict {
+        // HS `showProofStatus` (Theory/Proof.hs:1124-1127): a falsified
+        // exists-trace lemma is a `CompleteProof` of `ExistsSomeTrace`
+        // ("falsified - no trace found"), whereas a falsified all-traces
+        // lemma is a `TraceFound` for `ExistsNoTrace` ("falsified - found
+        // trace").  The wording therefore depends on the quantifier.
+        LemmaVerdict::Falsified if r.exists_trace =>
+            format!("falsified - no trace found ({} steps)", r.proof_steps),
         LemmaVerdict::Falsified => format!("falsified - found trace ({} steps)", r.proof_steps),
         LemmaVerdict::Verified => format!("verified ({} steps)", r.proof_steps),
         LemmaVerdict::Analyzed
