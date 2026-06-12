@@ -101,14 +101,23 @@ pub struct ProofContext {
     /// when False, all possible subterm syms of the chain-end are
     /// checked for intersection (a more LENIENT test).
     pub pc_true_subterm: bool,
-    /// The goal ranking selected by the theory's / lemma's `heuristic:`
-    /// directive.  Mirrors HS's `_pcHeuristic :: Maybe (Heuristic
-    /// ProofContext)` (System.hs) consulted by `selectHeuristic`
-    /// (Proof.hs:707).  `None` ⇒ HS's `defaultHeuristic False`
-    /// (`SmartRanking False`).  Resolved per-lemma in `prove_lemma`
+    /// The goal ranking list for this lemma, mirroring HS's
+    /// `Heuristic ProofContext = Heuristic [GoalRanking ProofContext]`
+    /// (System.hs:527).  `None` ⇒ HS's `defaultHeuristic False`
+    /// (`[SmartRanking False]`).  Resolved per-lemma in `prove_lemma`
     /// (per-lemma `[heuristic=..]` overrides the theory-level directive,
     /// matching `apDefaultHeuristic <|> pcHeuristic`).
-    pub heuristic: Option<crate::constraint::solver::goals::GoalRanking>,
+    /// Round-robin scheduling: depth d → `rankings[d % n]`
+    /// (ProofMethod.hs:802-811).
+    pub heuristic: Option<Vec<crate::constraint::solver::goals::GoalRanking>>,
+    /// The name of the lemma being proved.  Passed as `argv[1]` to
+    /// the oracle script (HS `L.get pcLemmaName ctxt`, ProofMethod.hs:829).
+    pub lemma_name: String,
+    /// Path to the theory file being proved.  Used to resolve the
+    /// oracle script path as `takeDirectory theory_file </> oracle_rel_path`
+    /// (HS Parser.hs:304, System.hs:574-575).  Stored as the absolute
+    /// path passed to `--prove`.
+    pub theory_file: String,
     /// `saturate_state` — gates the lazy `ensure_saturated()` call.
     /// HS's `saturateSources` is lazy in `cdCases`: it only emits
     /// `[EXEC] solveGoal / exploitPrems / ...` traces when a consumer
@@ -141,7 +150,9 @@ impl Clone for ProofContext {
             restrictions: self.restrictions.clone(),
             typing_assumptions: self.typing_assumptions.clone(),
             pc_true_subterm: self.pc_true_subterm,
-            heuristic: self.heuristic,
+            heuristic: self.heuristic.clone(),
+            lemma_name: self.lemma_name.clone(),
+            theory_file: self.theory_file.clone(),
             saturate_state: std::sync::Mutex::new(state),
             saturation_limit: self.saturation_limit,
         }
@@ -726,6 +737,8 @@ impl ProofContext {
             typing_assumptions: Vec::new(),
             pc_true_subterm,
             heuristic: None,
+            lemma_name: String::new(),
+            theory_file: String::new(),
             saturate_state: std::sync::Mutex::new(SaturateState::Pending),
             saturation_limit: std::env::var("TAM_SATURATION_LIMIT").ok()
                 .and_then(|s| s.parse::<usize>().ok())

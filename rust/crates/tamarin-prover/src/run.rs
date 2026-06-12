@@ -921,8 +921,8 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             // (which re-runs the setup per lemma but is more tolerant
             // of theories where elaboration fails on a subset of
             // lemmas).  Almost never hits in practice.
-            let session = tamarin_theory::prove::ProverSession::build(
-                &parsed, maude.clone(), file_maude_pool.clone()).ok();
+            let session = tamarin_theory::prove::ProverSession::build_with_in_file(
+                &parsed, maude.clone(), file_maude_pool.clone(), in_file).ok();
 
             for l in elaborated.lemmas() {
                 let lemma_name = l.name.clone();
@@ -952,9 +952,9 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                         s, &lemma_name, budget),
                     (Some(s), false) => tamarin_theory::prove::check_and_extend_lemma_in_session(
                         s, &lemma_name, budget),
-                    (None, _) => tamarin_theory::prove::prove_lemma_with_pool(
+                    (None, _) => tamarin_theory::prove::prove_lemma_with_pool_and_file(
                         &parsed, &lemma_name, maude.clone(),
-                        file_maude_pool.clone(), budget),
+                        file_maude_pool.clone(), budget, in_file),
                 };
                 if dbg_timing {
                     eprintln!("[TAM_DBG_RUN_TIMING] {:>26}: {:>8.1} ms  (lemma={})",

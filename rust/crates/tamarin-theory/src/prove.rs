@@ -57,6 +57,38 @@ impl std::fmt::Display for ProveError {
     }
 }
 
+/// Prepend the theory file's directory to any Oracle/OracleSmart rankings
+/// whose path is not already absolute.
+///
+/// Mirrors HS `oraclePath oracle = takeDirectory inFile </> normalise relPath`
+/// (System.hs:574-575, Parser.hs:304).  The `normalise relPath` in HS is
+/// `System.FilePath.normalise` which collapses `.`/`..`; we use
+/// `std::path::Path::join` which does the same.
+fn prepend_theory_dir_to_oracle_paths(
+    rankings: &mut Vec<crate::constraint::solver::goals::GoalRanking>,
+    in_file: &str,
+) {
+    use crate::constraint::solver::goals::GoalRanking;
+    let work_dir = std::path::Path::new(in_file).parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    for r in rankings.iter_mut() {
+        match r {
+            GoalRanking::Oracle { oracle_path, .. }
+            | GoalRanking::OracleSmart { oracle_path, .. } => {
+                let p = std::path::Path::new(oracle_path.as_str());
+                if !p.is_absolute() {
+                    let resolved = work_dir.join(p);
+                    // Normalise (collapse ./ ../ etc.)
+                    let resolved = resolved.to_string_lossy().to_string();
+                    *oracle_path = resolved;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Per-file shared prover state — the bits of work that depend only on
 /// the theory, not on which lemma is being proved.  Built once via
 /// [`ProverSession::build`] and reused across `prove_lemma_in_session`
@@ -136,12 +168,24 @@ impl ProverSession {
         maude: tamarin_term::maude_proc::MaudeHandle,
         pool: Option<std::sync::Arc<tamarin_term::maude_proc::MaudePool>>,
     ) -> Result<Self, ProveError> {
+        Self::build_with_in_file(parser_theory, maude, pool, "")
+    }
+
+    /// Like `build` but also sets `theory.in_file` for oracle path resolution.
+    pub fn build_with_in_file(
+        parser_theory: &p::Theory,
+        maude: tamarin_term::maude_proc::MaudeHandle,
+        pool: Option<std::sync::Arc<tamarin_term::maude_proc::MaudePool>>,
+        in_file: &str,
+    ) -> Result<Self, ProveError> {
         // RAII-set the user-fn-symbol thread-locals for the WHOLE
         // session.  Per-lemma `term_to_lnterm` calls during search
         // need these set; the parser-theory drives the set.
         let _user_funs_guard = crate::elaborate::set_user_funs_for_theory(parser_theory);
-        let theory = elaborate(parser_theory)
+        let mut theory = elaborate(parser_theory)
             .map_err(|e| ProveError::Elaboration(e.message))?;
+        // Set in_file for oracle path resolution (HS Parser.hs:304).
+        theory.in_file = in_file.to_string();
         let mut restrictions: Vec<Guarded> = Vec::new();
         for r in theory.restrictions() {
             if let Ok(rg) = formula_to_guarded(&r.formula) {
@@ -286,15 +330,23 @@ fn prove_lemma_in_session_mode(
         lemma.trace_quantifier,
         crate::theory::TraceQuantifier::ExistsTrace,
     );
-    use crate::constraint::solver::goals::GoalRanking;
+    use crate::constraint::solver::goals::parse_heuristic_str;
+    let session_in_file = &theory.in_file;
     let lemma_heuristic: Option<&str> = lemma.attributes.iter().find_map(|a| match a {
         crate::theory::LemmaAttr::Heuristic(s) => Some(s.as_str()),
         _ => None,
     });
-    ctx.heuristic = match lemma_heuristic {
-        Some(h) => Some(GoalRanking::from_str(h)),
-        None => theory.heuristic.first().map(|h| GoalRanking::from_str(h)),
+    let session_heuristic_raw: Option<String> = match lemma_heuristic {
+        Some(h) => Some(h.to_string()),
+        None => theory.heuristic.first().cloned(),
     };
+    ctx.heuristic = session_heuristic_raw.map(|h| {
+        let mut rankings = parse_heuristic_str(&h, session_in_file);
+        prepend_theory_dir_to_oracle_paths(&mut rankings, session_in_file);
+        rankings
+    });
+    ctx.lemma_name = lemma_name.to_string();
+    ctx.theory_file = session_in_file.clone();
     let mut typing_assumptions: Vec<Guarded> = Vec::new();
     for prior in theory.lemmas() {
         if prior.name == lemma_name { continue; }
@@ -379,6 +431,20 @@ pub fn prove_lemma_with_pool(
     pool: Option<std::sync::Arc<tamarin_term::maude_proc::MaudePool>>,
     max_steps: usize,
 ) -> Result<ProofNode, ProveError> {
+    prove_lemma_with_pool_and_file(parser_theory, lemma_name, maude, pool, max_steps, "")
+}
+
+/// Like [`prove_lemma_with_pool`] but also provides the source file path
+/// for oracle path resolution (HS `oraclePath oracle = takeDirectory inFile
+/// </> normalise relPath`, System.hs:574-575, Parser.hs:304).
+pub fn prove_lemma_with_pool_and_file(
+    parser_theory: &p::Theory,
+    lemma_name: &str,
+    maude: tamarin_term::maude_proc::MaudeHandle,
+    pool: Option<std::sync::Arc<tamarin_term::maude_proc::MaudePool>>,
+    max_steps: usize,
+    in_file: &str,
+) -> Result<ProofNode, ProveError> {
     let trace = std::env::var("TAM_DBG_PHASE").is_ok();
     // Per-phase wall-clock instrumentation, gated by TAM_DBG_PHASE.
     // `Option<Instant>` keeps the disabled-path branch-predictable to
@@ -394,8 +460,10 @@ pub fn prove_lemma_with_pool(
     // the whole prover lifetime.
     let _user_funs_guard = crate::elaborate::set_user_funs_for_theory(parser_theory);
     // Elaborate to get the typed theory, then pull rules + restrictions.
-    let theory = elaborate(parser_theory)
+    let mut theory = elaborate(parser_theory)
         .map_err(|e| ProveError::Elaboration(e.message))?;
+    // Set in_file for oracle path resolution (HS Parser.hs:304).
+    if !in_file.is_empty() { theory.in_file = in_file.to_string(); }
     if trace { eprintln!("[phase] elaborate done dt={:.3}s",
         t_phase.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64())); }
     let t_after_elab: Option<std::time::Instant> =
@@ -501,18 +569,31 @@ pub fn prove_lemma_with_pool(
     // `getProofContext.specifiedHeuristic` (ClosedTheory.hs:123-131):
     //   per-lemma `[heuristic=..]` > theory-level `heuristic:` > None.
     // `None` falls back to `SmartRanking False` in `rank_goals_with`
-    // (= HS's `defaultHeuristic False`).  We currently only parse the
-    // first ranking identifier (the comparable corpus uses single-char
-    // heuristics; HS schedules a list round-robin by depth).
-    use crate::constraint::solver::goals::GoalRanking;
+    // (= HS's `defaultHeuristic False`).
+    // `parse_heuristic_str` returns the full list for round-robin
+    // scheduling (ProofMethod.hs:802-811) and resolves oracle paths.
+    use crate::constraint::solver::goals::parse_heuristic_str;
+    let in_file = &theory.in_file;
     let lemma_heuristic: Option<&str> = lemma.attributes.iter().find_map(|a| match a {
         crate::theory::LemmaAttr::Heuristic(s) => Some(s.as_str()),
         _ => None,
     });
-    ctx.heuristic = match lemma_heuristic {
-        Some(h) => Some(GoalRanking::from_str(h)),
-        None => theory.heuristic.first().map(|h| GoalRanking::from_str(h)),
+    // Build raw heuristic string: per-lemma overrides theory-level.
+    let heuristic_raw: Option<String> = match lemma_heuristic {
+        Some(h) => Some(h.to_string()),
+        None => theory.heuristic.first().cloned(),
     };
+    ctx.heuristic = heuristic_raw.map(|h| {
+        // Resolve oracle paths relative to theory file dir.
+        // HS `oraclePath oracle = takeDirectory inFile </> normalise relPath`
+        // (System.hs:574-575, Parser.hs:304).
+        let mut rankings = parse_heuristic_str(&h, in_file);
+        prepend_theory_dir_to_oracle_paths(&mut rankings, in_file);
+        rankings
+    });
+    // Set lemma_name and theory_file on ctx for oracle invocation.
+    ctx.lemma_name = lemma_name.to_string();
+    ctx.theory_file = in_file.clone();
 
     // `refineWithSourceAsms`: prune precomputed source cases by
     // assumptions from `[sources]`-tagged lemmas.  Mirrors Haskell's

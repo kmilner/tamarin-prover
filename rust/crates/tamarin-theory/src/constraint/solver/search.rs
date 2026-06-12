@@ -499,7 +499,7 @@ fn expand_inner(
     //     UseInduction   -> (Induction, "") : simplify : gs
     //
     // Then `execMethods` filters to those that succeed.
-    let candidates = candidate_methods(&node.sys, ctx);
+    let candidates = candidate_methods(&node.sys, ctx, depth);
     if dbg_expand {
         let names: Vec<String> = candidates.iter().map(|m| format!("{:?}", m).chars().take(180).collect()).collect();
         eprintln!("[expand] candidates: {:?}", names);
@@ -801,6 +801,7 @@ fn expand_inner(
 pub fn candidate_methods(
     sys: &System,
     ctx: &ProofContext,
+    depth: usize,
 ) -> Vec<ProofMethod> {
     use crate::constraint::solver::context::UseInduction;
     let mut out: Vec<ProofMethod> = Vec::new();
@@ -815,7 +816,31 @@ pub fn candidate_methods(
     // Previously we only added the FIRST ranked goal, causing search
     // to Sorry whenever the top goal was un-solvable — even if a
     // lower-ranked goal could have made progress.
-    let goals = crate::constraint::solver::goals::rank_goals_with(sys, Some(ctx));
+    //
+    // `depth` drives round-robin heuristic scheduling (ProofMethod.hs:802-811).
+    let goals_result = crate::constraint::solver::goals::rank_goals_with(sys, Some(ctx), depth);
+    let goals = match goals_result {
+        Ok(gs) => gs,
+        Err(e) if e.0 == "__ORACLE_QUIT_ON_EMPTY__" => {
+            // Oracle ranked nothing and quitOnEmpty is set: emit ApplySorry.
+            // HS: `guard (quitOnEmpty && not (null inp) && null ranked) *> Just ApplySorry`
+            // (ProofMethod.hs:842) — stoppingMethod fires.
+            // We represent this as an empty candidate list with a special Sorry.
+            return vec![ProofMethod::Sorry(Some("Oracle ranked no proof methods".into()))];
+        }
+        Err(e) => {
+            // Oracle exec failed — hard abort.  HS behaviour: uncaught IO
+            // exception → whole tamarin-prover invocation dies with
+            // EMPTY stdout (ProofMethod.hs:829 `readProcess` throws).
+            // Mirror exactly: print to stderr, flush stdout (so nothing
+            // is printed), exit with code 1.
+            eprintln!("tamarin-prover: {}", e);
+            // Flush stdout to ensure nothing leaks before exit.
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            std::process::exit(1);
+        }
+    };
     // Construct: [Simplify, goal_1, goal_2, ..., goal_N].
     out.push(ProofMethod::Simplify);
     for g in goals.into_iter() {

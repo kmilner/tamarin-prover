@@ -91,7 +91,7 @@ pub struct ProvedLemma {
 /// For absolute paths the step-2 suffix starts with `/` (e.g. `/defaultoracle`),
 /// so the resulting path `"/defaultoracle.oracle"` almost never exists, and the
 /// function returns `"oracle"` — matching observed HS behaviour.
-fn oracle_name_for_theory(in_file: &str) -> String {
+pub(crate) fn oracle_name_for_theory(in_file: &str) -> String {
     // Step 1: HS `head $ groupBy (\_ b -> b /= '.') srcThyInFileName`.
     // `groupBy` always keeps the first character in the head group, then
     // extends it up to (not including) the first '.' at position >= 1.  So
@@ -2311,6 +2311,11 @@ fn pp_step_at(m: &crate::constraint::solver::proof_method::ProofMethod, indent: 
 
 /// Render a `Goal` for `solve(...)` output.  Mirrors HS `prettyGoal`
 /// (Constraints.hs:267-282).
+/// Also used as oracle stdin goal text (ProofMethod.hs:828).
+pub(crate) fn render_goal_for_oracle(g: &crate::constraint::constraints::Goal) -> String {
+    render_goal_at(g, 0, 0)
+}
+
 #[allow(dead_code)]
 fn render_goal(g: &crate::constraint::constraints::Goal) -> String {
     render_goal_at(g, 0, 0)

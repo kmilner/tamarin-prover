@@ -115,7 +115,8 @@ fn main() {
         }
 
         // Pick first open goal.
-        let goal = tamarin_theory::constraint::solver::goals::rank_goals_with(&sys, Some(&ctx))
+        let goal = tamarin_theory::constraint::solver::goals::rank_goals_with(&sys, Some(&ctx), 0)
+            .unwrap_or_default()
             .into_iter()
             .next()
             .map(|a| a.goal);

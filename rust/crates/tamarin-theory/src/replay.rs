@@ -553,7 +553,9 @@ fn exec_method_for(
         };
         eprintln!("[replay] raw-solve skel_names={:?} (raw text: {:?})", skel_names, raw);
     }
-    let candidates = crate::constraint::solver::search::candidate_methods(sys, ctx);
+    // depth=0 for replay: replayed steps don't need round-robin since the
+    // skeleton already specifies the goal.
+    let candidates = crate::constraint::solver::search::candidate_methods(sys, ctx, 0);
     let mut tried = 0usize;
     // Cap candidate iteration to avoid pathological case-enumeration
     // explosion (each `exec_proof_method` for a SolveGoal can be

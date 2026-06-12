@@ -13,54 +13,136 @@ use crate::constraint::constraints::Goal;
 use crate::constraint::solver::annotated_goals::{AnnotatedGoal, Usefulness};
 use crate::constraint::system::System;
 
+
 /// The goal ranking selected by a theory / lemma `heuristic:` directive.
 ///
 /// Port of the relevant `Theory.Constraint.System.GoalRanking` variants
-/// (`System.hs:506-520`).  We currently implement the two non-oracle,
-/// non-tactic rankings that the comparable corpus exercises:
+/// (`System.hs:506-520`).  Implements:
 ///
-///   * `SmartRanking Bool`  (heuristic `s`/`S`, the default)
-///   * `InjRanking  Bool`   (heuristic `i`/`I`)
+///   * `SmartRanking Bool`         — heuristic `s`/`S`
+///   * `InjRanking   Bool`         — heuristic `i`/`I`
+///   * `Oracle       { quit_on_empty, oracle_path }` — heuristic `o`
+///     (HS `OracleRanking`, System.hs:589)
+///   * `OracleSmart  { quit_on_empty, oracle_path }` — heuristic `O`
+///     (HS `OracleSmartRanking`, System.hs:590)
 ///
-/// All other ranking identifiers (oracle `o`/`O`, sapic `p`/`P`,
-/// `c`/`C`, tactic `{..}`) parse to `Smart(false)` for now — the files
-/// that use them are filtered out of the comparable corpus.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `{..}` (InternalTacticRanking) and `p`/`P`/`c`/`C` fall back to
+/// `Smart(false)` — they are out of scope for this implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalRanking {
     /// `SmartRanking useLoopBreakers` (ProofMethod.hs:1203).
     Smart(bool),
     /// `InjRanking useLoopBreakers` (ProofMethod.hs:1096).
     Inj(bool),
+    /// `OracleRanking quitOnEmpty oracle` (ProofMethod.hs:695).
+    /// preSort = `const goalNrRanking`.
+    /// `oracle_path` is the resolved filesystem path of the oracle script.
+    Oracle { quit_on_empty: bool, oracle_path: String },
+    /// `OracleSmartRanking quitOnEmpty oracle` (ProofMethod.hs:696).
+    /// preSort = `smartRanking ctxt False`.
+    OracleSmart { quit_on_empty: bool, oracle_path: String },
 }
 
 impl GoalRanking {
     /// Parse a single heuristic character into a `GoalRanking`,
-    /// mirroring HS's `goalRankingIdentifiers` (System.hs:585-598) /
-    /// `stringToGoalRanking`.  Unhandled identifiers fall back to the
-    /// default `Smart(false)` so behaviour for filtered-out files is
-    /// unchanged.
-    pub fn from_char(c: char) -> GoalRanking {
+    /// mirroring HS's `goalRankingIdentifiers` (System.hs:585-598).
+    /// Oracle variants use `oracle_path` for the resolved path.
+    /// Unhandled identifiers fall back to the default `Smart(false)`.
+    pub fn from_char_with_oracle(c: char, oracle_path: &str) -> GoalRanking {
         match c {
             's' => GoalRanking::Smart(false),
             'S' => GoalRanking::Smart(true),
             'i' => GoalRanking::Inj(false),
             'I' => GoalRanking::Inj(true),
+            // HS `OracleRanking False defaultOracle` (System.hs:589)
+            'o' => GoalRanking::Oracle { quit_on_empty: false, oracle_path: oracle_path.to_string() },
+            // HS `OracleSmartRanking False defaultOracle` (System.hs:590)
+            'O' => GoalRanking::OracleSmart { quit_on_empty: false, oracle_path: oracle_path.to_string() },
             _ => GoalRanking::Smart(false),
         }
     }
 
-    /// Parse the first ranking identifier out of a heuristic string
-    /// (e.g. `"I"`, `"s"`).  HS's `Heuristic` is a *list* of rankings
-    /// scheduled round-robin by proof depth (`useHeuristic`,
-    /// ProofMethod.hs:736); for the single-character heuristics in the
-    /// comparable corpus the list has one element, so taking the first
-    /// identifier is exact.  A leading `{` (tactic ranking) or quote is
-    /// treated as the default.
+    /// Parse the first ranking identifier out of a heuristic string.
+    /// Used only for the non-oracle single-char case; oracle callers
+    /// use `parse_heuristic_str` which computes the oracle path.
     pub fn from_str(s: &str) -> GoalRanking {
         match s.trim().chars().next() {
-            Some(c) if c.is_ascii_alphabetic() => GoalRanking::from_char(c),
+            Some(c) if c.is_ascii_alphabetic() => GoalRanking::from_char_with_oracle(c, "oracle"),
             _ => GoalRanking::Smart(false),
         }
+    }
+}
+
+/// Parse a full heuristic string into a list of `GoalRanking`s,
+/// mirroring HS's `Heuristic` list (ProofMethod.hs:802-811).
+///
+/// `theory_file` is the path to the `.spthy` file; used to compute
+/// the default oracle name via `oracle_name_for_theory`
+/// (pretty_theory.rs, HS `defaultOracleNames` System.hs:551-561).
+///
+/// Grammar (mirrors HS `goalRanking` Signature.hs:293-311):
+///   heuristic   ::= ranking+
+///   ranking     ::= oracle_ranking | tactic_ranking | letter
+///   oracle_ranking ::= ('o' | 'O') ('"' name '"')?
+///   tactic_ranking ::= '{' [^}]* '}'
+///   letter      ::= [a-zA-Z]
+pub fn parse_heuristic_str(s: &str, theory_file: &str) -> Vec<GoalRanking> {
+    let default_oracle = crate::pretty_theory::oracle_name_for_theory(theory_file);
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    let mut out = Vec::new();
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() { i += 1; continue; }
+        // Skip block comments `/* … */`
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            i += 2;
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') { i += 1; }
+            i = (i + 2).min(chars.len());
+            continue;
+        }
+        // Skip line comments `// …`
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+            break;
+        }
+        // Tactic ranking `{name}` — out of scope; map to Smart(false)
+        if c == '{' {
+            i += 1;
+            while i < chars.len() && chars[i] != '}' { i += 1; }
+            if i < chars.len() { i += 1; }
+            out.push(GoalRanking::Smart(false));
+            continue;
+        }
+        // Oracle rankings with optional quoted path
+        if c == 'o' || c == 'O' {
+            i += 1;
+            while i < chars.len() && chars[i] == ' ' { i += 1; }
+            let explicit_path: Option<String> = if i < chars.len() && chars[i] == '"' {
+                i += 1;
+                let start = i;
+                while i < chars.len() && chars[i] != '"' && chars[i] != '\n' { i += 1; }
+                let name: String = chars[start..i].iter().collect();
+                if i < chars.len() && chars[i] == '"' { i += 1; }
+                Some(name)
+            } else {
+                None
+            };
+            let oracle_path = explicit_path.as_deref().unwrap_or(&default_oracle);
+            out.push(GoalRanking::from_char_with_oracle(c, oracle_path));
+            continue;
+        }
+        if c.is_ascii_alphabetic() {
+            out.push(GoalRanking::from_char_with_oracle(c, &default_oracle));
+            i += 1;
+            continue;
+        }
+        i += 1; // skip unknown
+    }
+    if out.is_empty() {
+        // HS `defaultHeuristic False = Heuristic [SmartRanking False]`
+        vec![GoalRanking::Smart(false)]
+    } else {
+        out
     }
 }
 
@@ -234,6 +316,22 @@ pub fn plain_open_goals(sys: &System) -> Vec<Goal> {
     open_goals(sys).into_iter().map(|a| a.goal).collect()
 }
 
+/// Error type for oracle execution failures.
+///
+/// When oracle exec fails, HS throws an uncaught IO exception → the
+/// whole tamarin-prover invocation dies (ProofMethod.hs:826-829,
+/// `readProcess` throws on non-zero exit or spawn failure).  RS
+/// mirrors this with a hard error that propagates to the top level.
+#[derive(Debug)]
+pub struct OracleError(pub String);
+
+impl std::fmt::Display for OracleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl std::error::Error for OracleError {}
+
 // =============================================================================
 // smartRanking — port of `Theory.Constraint.Solver.ProofMethod.smartRanking`
 // =============================================================================
@@ -261,18 +359,23 @@ pub fn plain_open_goals(sys: &System) -> Vec<Goal> {
 /// other criterion.  When the stubs are filled in, behaviour aligns
 /// without further changes here.
 pub fn rank_goals(sys: &System) -> Vec<AnnotatedGoal> {
-    rank_goals_with(sys, None)
+    rank_goals_with(sys, None, 0).expect("no oracle without context")
 }
 
 /// Variant that takes a proof context for source-cache predicates
-/// (`is_msg_one_case_goal`).  Without context, those predicates
-/// fall back to `false` — same behaviour as before the source-cache
-/// wiring landed.
+/// and the current proof depth for round-robin heuristic scheduling.
+///
+/// Returns `Err(OracleError)` when an oracle script cannot be
+/// executed — callers must propagate this as a hard abort.
+///
+/// `depth` mirrors HS's `useHeuristic (Heuristic rankings) depth =
+/// rankings !! (depth mod n)` (ProofMethod.hs:802-811).
 pub fn rank_goals_with(
     sys: &System,
     ctx: Option<&crate::constraint::solver::context::ProofContext>,
-) -> Vec<AnnotatedGoal> {
-    let _result = rank_goals_with_inner(sys, ctx);
+    depth: usize,
+) -> Result<Vec<AnnotatedGoal>, OracleError> {
+    let _result = rank_goals_with_inner(sys, ctx, depth)?;
     if std::env::var("TAM_RS_DBG_RANK").as_deref() == Ok("1") {
         let in_pre = crate::constraint::solver::sources::in_precompute_mode();
         let top: Vec<String> = _result.iter().take(8).map(|a| {
@@ -294,31 +397,162 @@ pub fn rank_goals_with(
         eprintln!("[RS_RANK] precompute={} path={} n={} top={:?}",
             in_pre, path, _result.len(), top);
     }
-    _result
+    Ok(_result)
 }
 
 fn rank_goals_with_inner(
     sys: &System,
     ctx: Option<&crate::constraint::solver::context::ProofContext>,
-) -> Vec<AnnotatedGoal> {
-    // Dispatch on the theory/lemma `heuristic:` directive, mirroring
-    // HS's `rankGoals` (ProofMethod.hs:636) which pattern-matches the
-    // `GoalRanking`.  When no context (or no heuristic) is supplied we
-    // default to `SmartRanking False` — exactly HS's
+    depth: usize,
+) -> Result<Vec<AnnotatedGoal>, OracleError> {
+    // Round-robin heuristic scheduling: `useHeuristic (Heuristic rankings) depth =
+    // rankings !! (depth mod n)` (ProofMethod.hs:802-811).
+    // When no context (or no heuristic) is supplied we default to
+    // `SmartRanking False` — exactly HS's
     // `defaultHeuristic False = Heuristic [SmartRanking False]`
     // (System.hs:527).
     let ranking = ctx
-        .and_then(|c| c.heuristic)
+        .and_then(|c| c.heuristic.as_ref())
+        .and_then(|h| {
+            let n = h.len();
+            if n == 0 { None } else { Some(&h[depth % n]) }
+        })
+        .cloned()
         .unwrap_or(GoalRanking::Smart(false));
     match ranking {
         GoalRanking::Inj(use_loop_breakers) => {
-            inj_ranking(sys, ctx, use_loop_breakers)
+            Ok(inj_ranking(sys, ctx, use_loop_breakers))
         }
         GoalRanking::Smart(use_loop_breakers) => {
-            smart_ranking(sys, ctx, use_loop_breakers)
+            Ok(smart_ranking(sys, ctx, use_loop_breakers))
+        }
+        GoalRanking::Oracle { quit_on_empty, oracle_path } => {
+            // HS `oracleRanking (const goalNrRanking) oracle quitOnEmpty ctxt sys ags`
+            // (ProofMethod.hs:695): preSort = goalNrRanking (open_goals is already nr-sorted)
+            let ags = open_goals(sys);
+            oracle_ranking(ags, &oracle_path, quit_on_empty, ctx, sys)
+        }
+        GoalRanking::OracleSmart { quit_on_empty, oracle_path } => {
+            // HS `oracleRanking (smartRanking ctxt False) oracle quitOnEmpty ctxt sys ags`
+            // (ProofMethod.hs:696): preSort = smartRanking ctxt False
+            let ags = smart_ranking(sys, ctx, false);
+            oracle_ranking(ags, &oracle_path, quit_on_empty, ctx, sys)
         }
     }
 }
+
+/// Port of HS `oracleRanking` (ProofMethod.hs:819-844).
+///
+/// Protocol:
+/// 1. `ags = preSort sys ags0`  (already done by caller).
+/// 2. Build stdin: `unlines $ zipWith (\i ag -> show i ++": "++ rendered_goal) [0..] ags`.
+/// 3. `readProcess oraclePath [lemmaName] stdin` — exec the oracle.
+/// 4. Parse stdout: each line as `usize`; non-integer lines skipped;
+///    out-of-range indices skipped.
+/// 5. Result = `ranked ++ (ags \\ ranked)` in original order.
+/// 6. If `quit_on_empty && !inp.is_empty() && ranked.is_empty()` →
+///    signal ApplySorry via `OracleError::sorry` sentinel.
+///
+/// On any exec failure (spawn error / non-zero exit) → `Err(OracleError)`,
+/// propagated as a hard abort (mirrors HS's uncaught IO exception).
+fn oracle_ranking(
+    ags: Vec<AnnotatedGoal>,
+    oracle_path: &str,
+    quit_on_empty: bool,
+    ctx: Option<&crate::constraint::solver::context::ProofContext>,
+    _sys: &System,
+) -> Result<Vec<AnnotatedGoal>, OracleError> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let lemma_name = ctx.map(|c| c.lemma_name.as_str()).unwrap_or("");
+
+    // Step 2: build stdin — `show i ++": "++ concat . lines . render $ prettyGoal g`
+    // HS `concat . lines . render` collapses multi-line renders to one line
+    // (ProofMethod.hs:828).
+    let inp: String = ags.iter().enumerate().map(|(i, ag)| {
+        let goal_text = crate::pretty_theory::render_goal_for_oracle(&ag.goal);
+        // concat . lines = remove all newlines
+        let single_line: String = goal_text.lines().collect::<Vec<_>>().concat();
+        format!("{}: {}\n", i, single_line)
+    }).collect();
+
+    // Step 3: exec oracle
+    let mut child = Command::new(oracle_path)
+        .arg(lemma_name)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| OracleError(format!(
+            "oracle exec error: {}: {}", oracle_path, e)))?;
+
+    // Write stdin and close pipe
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(inp.as_bytes())
+            .map_err(|e| OracleError(format!("oracle stdin write error: {}", e)))?;
+    }
+
+    let output = child.wait_with_output()
+        .map_err(|e| OracleError(format!("oracle wait error: {}", e)))?;
+
+    if !output.status.success() {
+        return Err(OracleError(format!(
+            "oracle process exited with status {}: {}", output.status, oracle_path)));
+    }
+
+    let outp = String::from_utf8_lossy(&output.stdout);
+
+    // HS debug trace (ProofMethod.hs:834-839) — optional stderr logging
+    if std::env::var("TAM_RS_ORACLE_TRACE").is_ok() {
+        eprintln!(">>>>>>>>>>>>>>>>>>>>>>>> START INPUT\n{}", inp);
+        eprintln!(">>>>>>>>>>>>>>>>>>>>>>>> START OUTPUT\n{}", outp);
+        eprintln!(">>>>>>>>>>>>>>>>>>>>>>>> END Oracle call");
+    }
+
+    // Step 4: parse stdout indices — `mapMaybe readMay (lines outp)`
+    let indices: Vec<usize> = outp.lines()
+        .filter_map(|l| l.trim().parse::<usize>().ok())
+        .collect();
+
+    // Step 5: ranked goals + remaining (filter(notElem ranked) ags)
+    let mut ranked: Vec<AnnotatedGoal> = indices.iter()
+        .filter_map(|&idx| ags.get(idx).cloned())
+        .collect();
+
+    // De-duplicate: HS `mapMaybe (atMay ags) indices` can repeat if oracle
+    // outputs the same index twice; HS's `filter (notElem ranked)` then
+    // excludes duplicates from remaining but keeps first occurrence.
+    // Keep same semantics: deduplicate ranked by index.
+    let mut seen = std::collections::BTreeSet::new();
+    ranked.retain(|ag| {
+        // find original index
+        let idx = ags.iter().position(|a| std::ptr::eq(a, ag) || a.seq == ag.seq);
+        if let Some(i) = idx {
+            seen.insert(i)
+        } else {
+            true
+        }
+    });
+
+    let remaining: Vec<AnnotatedGoal> = ags.into_iter().enumerate()
+        .filter(|(i, _)| !seen.contains(i))
+        .map(|(_, ag)| ag)
+        .collect();
+
+    // Step 6: quitOnEmpty check
+    // HS: `guard $ quitOnEmpty && not (null inp) && null ranked`
+    // The `guard` in the IO monad returns `mzero` when condition is True,
+    // which causes the sorry instruction to fire (ProofMethod.hs:842).
+    if quit_on_empty && !inp.is_empty() && ranked.is_empty() {
+        return Err(OracleError("__ORACLE_QUIT_ON_EMPTY__".to_string()));
+    }
+
+    let mut result = ranked;
+    result.extend(remaining);
+    Ok(result)
+}
+
 
 /// Port of HS `smartRanking ctxt allowPremiseGLoopBreakers sys`
 /// (ProofMethod.hs:1203):
