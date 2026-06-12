@@ -72,6 +72,137 @@ pub struct ProvedLemma {
     pub proof_body: Option<String>,
 }
 
+// =============================================================================
+// Heuristic / GoalRanking rendering
+// =============================================================================
+
+/// Compute the default oracle name for a theory file.
+///
+/// Mirrors HS `defaultOracleNames` (System.hs:551-561): when an oracle
+/// ranking carries no explicit relative-path, the name is derived from the
+/// theory file path by the following algorithm (faithful port of the HS
+/// `groupBy` computation):
+///
+/// 1. Take the prefix before the first `.` in `in_file`.
+/// 2. Take the suffix after the last `/` in that prefix.
+/// 3. Append `".oracle"`.
+/// 4. If that file exists on disk → use it; otherwise → fall back to `"oracle"`.
+///
+/// For absolute paths the step-2 suffix starts with `/` (e.g. `/defaultoracle`),
+/// so the resulting path `"/defaultoracle.oracle"` almost never exists, and the
+/// function returns `"oracle"` — matching observed HS behaviour.
+fn oracle_name_for_theory(in_file: &str) -> String {
+    // Step 1: prefix before first '.'
+    let before_dot = match in_file.find('.') {
+        Some(i) => &in_file[..i],
+        None => in_file,
+    };
+    // Step 2: suffix after last '/' in before_dot.
+    // HS `groupBy (\_ b -> b /= '/') s` splits `s` at every '/', then `last`
+    // takes the final segment.  For absolute paths this segment starts with
+    // '/' (e.g. "/defaultoracle"), so `inFileOracleName` is "/defaultoracle.oracle".
+    let after_slash = match before_dot.rfind('/') {
+        Some(i) => &before_dot[i..],   // includes the '/' prefix, mirroring HS
+        None => before_dot,
+    };
+    // Step 3: append ".oracle"
+    let candidate = format!("{}.oracle", after_slash);
+    // Step 4: existence check
+    if std::path::Path::new(&candidate).exists() {
+        candidate
+    } else {
+        "oracle".to_string()
+    }
+}
+
+/// Render a single `GoalRanking` token from the raw heuristic string.
+///
+/// Mirrors HS `prettyGoalRanking` (System.hs:710-728):
+/// - `OracleRanking`/`OracleSmartRanking` → `<char> "<oraclename>"`
+/// - `InternalTacticRanking`              → `{<name>}`
+/// - all others                           → single char
+///
+/// `oracle_name` is the already-computed default oracle name for the theory
+/// (from `oracle_name_for_theory`); it is used when the ranking carries no
+/// explicit name.
+fn render_single_ranking(ch: char, explicit_oracle: Option<&str>, oracle_name: &str) -> String {
+    match ch {
+        'o' | 'O' => {
+            let name = explicit_oracle.unwrap_or(oracle_name);
+            format!("{} \"{}\"", ch, name)
+        }
+        _ => ch.to_string(),
+    }
+}
+
+/// Parse a raw heuristic string and re-render it in HS style.
+///
+/// Mirrors `prettyGoalRankings rs = unwords (map prettyGoalRanking rs)`
+/// (System.hs:707-708).  The raw string is the verbatim text stored after
+/// `heuristic:` / `heuristic=` in the source file.  It may be compact
+/// (`"osopo"`) or already-expanded (`"o \"oracle\" s"`).
+///
+/// Grammar (mirrors HS `goalRanking` in Signature.hs:293-311):
+///   rankings     ::= ranking+
+///   ranking      ::= oracle_ranking | tactic_ranking | letter
+///   oracle_ranking ::= ('o' | 'O') ws* ('"' name '"' ws*)?
+///   tactic_ranking ::= '{' [^}]* '}'
+///   letter       ::= [a-zA-Z] ws*
+pub fn pretty_goal_rankings(raw: &str, in_file: &str) -> String {
+    let oracle_name = oracle_name_for_theory(in_file);
+    let mut result = Vec::new();
+    let chars: Vec<char> = raw.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c == '{' {
+            // Tactic ranking: collect up to '}'
+            // HS InternalTacticRanking → '{' ++ name ++ '}'
+            let start = i;
+            i += 1;
+            while i < chars.len() && chars[i] != '}' {
+                i += 1;
+            }
+            if i < chars.len() {
+                i += 1; // consume '}'
+            }
+            // Re-emit as-is (includes braces)
+            let tok: String = chars[start..i].iter().collect();
+            result.push(tok);
+        } else if c == 'o' || c == 'O' {
+            i += 1;
+            // Skip whitespace
+            while i < chars.len() && chars[i] == ' ' { i += 1; }
+            // Look for optional quoted oracle name
+            if i < chars.len() && chars[i] == '"' {
+                i += 1; // consume opening '"'
+                let name_start = i;
+                while i < chars.len() && chars[i] != '"' && chars[i] != '\n' && chars[i] != '\r' {
+                    i += 1;
+                }
+                let explicit_name: String = chars[name_start..i].iter().collect();
+                if i < chars.len() && chars[i] == '"' { i += 1; } // consume closing '"'
+                result.push(render_single_ranking(c, Some(&explicit_name), &oracle_name));
+            } else {
+                result.push(render_single_ranking(c, None, &oracle_name));
+            }
+        } else if c.is_ascii_alphabetic() {
+            result.push(c.to_string());
+            i += 1;
+        } else {
+            // Unknown character — skip
+            i += 1;
+        }
+    }
+    result.join(" ")
+}
+
+// =============================================================================
+
 /// Render the analyzed theory in HS's `prettyClosedTheory` shape.
 pub fn pretty_closed_theory(
     parsed: &p::Theory,
@@ -79,6 +210,7 @@ pub fn pretty_closed_theory(
     proved: &[ProvedLemma],
     wf_block: &str,
     build: &BuildInfo,
+    in_file: &str,
 ) -> String {
     let mut out = String::new();
 
@@ -123,9 +255,16 @@ pub fn pretty_closed_theory(
         out.push('\n');
     }
     if !elaborated.heuristic.is_empty() {
+        // HS `TheoryObject.hs:749`: `text "heuristic: " <> text (prettyGoalRankings thyH)`
+        // where `prettyGoalRankings = unwords . map prettyGoalRanking` (System.hs:707-708).
+        // Each ranking in the Vec is a raw heuristic string; join their expansions with a
+        // space.  (In practice there is only one `heuristic:` item per theory.)
+        let rendered: Vec<String> = elaborated.heuristic.iter()
+            .map(|raw| pretty_goal_rankings(raw, in_file))
+            .collect();
         out.push('\n');
         out.push_str("heuristic: ");
-        out.push_str(&elaborated.heuristic.join(""));
+        out.push_str(&rendered.join(" "));
         out.push('\n');
     }
     let inj_block = render_injective_fact_insts(elaborated);
@@ -147,7 +286,7 @@ pub fn pretty_closed_theory(
     // string append.
     use rayon::prelude::*;
     let rendered: Vec<Option<String>> = parsed.items.par_iter()
-        .map(|item| render_parsed_item(item, 0, parsed, elaborated, proved))
+        .map(|item| render_parsed_item(item, 0, parsed, elaborated, proved, in_file))
         .collect();
     for b in rendered.into_iter().flatten() {
         out.push('\n');
@@ -371,6 +510,7 @@ fn render_parsed_item(
     parsed: &p::Theory,
     elab: &Theory,
     proved: &[ProvedLemma],
+    in_file: &str,
 ) -> Option<String> {
     use p::TheoryItem::*;
     // Collect macros from the parsed theory so restriction/lemma renderers
@@ -400,7 +540,7 @@ fn render_parsed_item(
             }
         }
         IntrRule(_) => None,
-        Lemma(l) => Some(render_parsed_lemma(l, &macros, proved)),
+        Lemma(l) => Some(render_parsed_lemma(l, &macros, proved, in_file)),
         Restriction(r) => Some(render_parsed_restriction(r, &macros)),
         Predicates(_) => {
             // TODO: render predicates (port HS prettyPredicate).
@@ -437,7 +577,7 @@ fn render_parsed_item(
             let mut active: Vec<&p::TheoryItem> = then_items.iter().collect();
             if let Some(else_b) = else_items { active.extend(else_b.iter()); }
             let blocks: Vec<String> = active.iter()
-                .filter_map(|it| render_parsed_item(it, 0, parsed, elab, proved))
+                .filter_map(|it| render_parsed_item(it, 0, parsed, elab, proved, in_file))
                 .collect();
             if blocks.is_empty() { None } else { Some(blocks.join("\n\n")) }
         }
@@ -1642,7 +1782,7 @@ fn fsep_pack_pair(items: &[String], indent: usize, line_start: usize) -> String 
 // Lemma
 // =============================================================================
 
-fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], proved: &[ProvedLemma]) -> String {
+fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], proved: &[ProvedLemma], in_file: &str) -> String {
     use crate::pretty_hpj::{self as hpj, Doc};
     let mut out = String::new();
     // HS `prettyLemmaName` (Lemma.hs:91-95):
@@ -1656,7 +1796,7 @@ fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], proved: &[ProvedLemm
     let header_doc = if lem.attributes.is_empty() {
         kw.beside_sp(name_doc).beside(Doc::text(":"))
     } else {
-        let attr_docs: Vec<Doc> = lemma_attr_docs(&lem.attributes);
+        let attr_docs: Vec<Doc> = lemma_attr_docs(&lem.attributes, in_file);
         // `brackets (fsep (punctuate comma attrs))` — no space after `[`
         // (beside, not beside_sp) so fsep's continuation aligns with the
         // first attr character (i.e. right after `[`).
@@ -1702,7 +1842,7 @@ fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], proved: &[ProvedLemm
 /// `prettyLemmaAttribute` (Lemma.hs:97-107): each attribute becomes a
 /// `text "..."` Doc; these are assembled into
 /// `brackets (fsep (punctuate comma docs))` by the caller.
-fn lemma_attr_docs(attrs: &[p::LemmaAttr]) -> Vec<crate::pretty_hpj::Doc> {
+fn lemma_attr_docs(attrs: &[p::LemmaAttr], in_file: &str) -> Vec<crate::pretty_hpj::Doc> {
     use crate::pretty_hpj::Doc;
     let mut out = Vec::new();
     for a in attrs {
@@ -1713,7 +1853,10 @@ fn lemma_attr_docs(attrs: &[p::LemmaAttr]) -> Vec<crate::pretty_hpj::Doc> {
             DiffReuse => Some("diff_reuse".into()),
             UseInduction => Some("use_induction".into()),
             HideLemma(s) => Some(format!("hide_lemma={}", s)),
-            Heuristic(s) => Some(format!("heuristic={}", s)),
+            // HS `prettyLemmaAttribute (LemmaHeuristic h)` (Lemma.hs:103):
+            //   `text ("heuristic=" ++ prettyGoalRankings h)`
+            // Mirror space-separated, oracle-name-expanded rendering.
+            Heuristic(s) => Some(format!("heuristic={}", pretty_goal_rankings(s, in_file))),
             Output(modules) => Some(format!("output=[{}]", modules.join(","))),
             Left => Some("left".into()),
             Right => Some("right".into()),
@@ -1726,8 +1869,8 @@ fn lemma_attr_docs(attrs: &[p::LemmaAttr]) -> Vec<crate::pretty_hpj::Doc> {
 
 // Legacy string-join form (kept for any direct callers).
 #[allow(dead_code)]
-fn render_lemma_attrs(attrs: &[p::LemmaAttr]) -> String {
-    lemma_attr_docs(attrs).iter()
+fn render_lemma_attrs(attrs: &[p::LemmaAttr], in_file: &str) -> String {
+    lemma_attr_docs(attrs, in_file).iter()
         .map(|d| d.clone().render())
         .collect::<Vec<_>>()
         .join(", ")

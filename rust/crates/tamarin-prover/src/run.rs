@@ -1059,6 +1059,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             &proved_lemmas,
             &wf_block,
             &build_info,
+            in_file,
         );
         phase!("pretty_closed_theory");
         emit_output(args, in_file, &body, None)?;
