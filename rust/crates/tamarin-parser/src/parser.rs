@@ -207,6 +207,14 @@ impl<'a> Parser<'a> {
         else { self.restore(save); false }
     }
 
+    /// Non-consuming lookahead for a punctuation token.
+    fn peek_punct(&mut self, p: &str) -> bool {
+        let save = self.save();
+        let m = self.try_punct(p);
+        self.restore(save);
+        m
+    }
+
     fn ident(&mut self) -> Result<String, ParseError> {
         self.lx.identifier().ok_or_else(|| self.err("expected identifier"))
     }
@@ -628,7 +636,10 @@ impl<'a> Parser<'a> {
                 loop {
                     let t = self.type_p()?;
                     args.push(t);
+                    // HS `parens (commaSep typep)` (Signature.hs:156): `sepEndBy`
+                    // permits a trailing comma before `)`.
                     if !self.try_punct(",") { break; }
+                    if self.peek_punct(")") { break; }
                 }
                 self.require_punct(")")?;
             }
@@ -696,7 +707,9 @@ impl<'a> Parser<'a> {
                 loop {
                     let v = self.var_spec()?;
                     args.push(v);
+                    // HS `parens $ commaSep lvar` (Macro.hs:38): trailing comma OK.
                     if !self.try_punct(",") { break; }
+                    if self.peek_punct(")") { break; }
                 }
                 self.require_punct(")")?;
             }
@@ -813,7 +826,10 @@ impl<'a> Parser<'a> {
                         FactOrRestr::Fact(f) => acts.push(f),
                         FactOrRestr::Restr(phi) => rstrs.push(phi),
                     }
+                    // HS `commaSep` (Rule.hs:186) = `sepEndBy comma`: a trailing
+                    // comma before `]->` is permitted.
                     if !self.try_punct(",") { break; }
+                    if self.peek_punct("]->") { break; }
                 }
                 self.require_punct("]->")?;
             }
@@ -869,7 +885,10 @@ impl<'a> Parser<'a> {
                         FactOrRestr::Fact(f) => acts.push(f),
                         FactOrRestr::Restr(phi) => rstrs.push(phi),
                     }
+                    // HS `commaSep` (Rule.hs:186) = `sepEndBy comma`: a trailing
+                    // comma before `]->` is permitted.
                     if !self.try_punct(",") { break; }
+                    if self.peek_punct("]->") { break; }
                 }
                 self.require_punct("]->")?;
             }
@@ -1015,7 +1034,10 @@ impl<'a> Parser<'a> {
         loop {
             let f = self.fact()?;
             fs.push(f);
+            // HS `commaSep1 fact` (Rule.hs:196) = `sepEndBy1 comma`: a trailing
+            // comma before `]` is permitted.
             if !self.try_punct(",") { break; }
+            if self.peek_punct("]") { break; }
         }
         self.require_punct("]")?;
         Ok(fs)
@@ -1144,7 +1166,10 @@ impl<'a> Parser<'a> {
                     loop {
                         let id = self.ident()?;
                         outs.push(id);
+                        // HS `list constructorp` (Lemma.hs:49) = `brackets . commaSep`:
+                        // trailing comma before `]` is permitted.
                         if !self.try_punct(",") { break; }
+                        if self.peek_punct("]") { break; }
                     }
                     self.require_punct("]")?;
                 }
@@ -1279,7 +1304,9 @@ impl<'a> Parser<'a> {
                 loop {
                     let v = self.var_spec()?;
                     vs.push(v);
+                    // HS `parens $ commaSep sapicvar` (Sapic.hs:69): trailing comma OK.
                     if !self.try_punct(",") { break; }
+                    if self.peek_punct(")") { break; }
                 }
                 self.require_punct(")")?;
             }
@@ -1454,7 +1481,10 @@ impl<'a> Parser<'a> {
                     loop {
                         let t = self.term(false)?;
                         ts.push(t);
+                        // HS `parens $ commaSep (msetterm ...)` (Sapic.hs:296):
+                        // trailing comma before `)` is permitted.
                         if !self.try_punct(",") { break; }
+                        if self.peek_punct(")") { break; }
                     }
                     self.require_punct(")")?;
                 }
@@ -1543,7 +1573,9 @@ impl<'a> Parser<'a> {
                             FactOrRestr::Fact(f) => acts.push(f),
                             FactOrRestr::Restr(p) => rs.push(p),
                         }
+                        // HS `commaSep` action facts (Rule.hs:186): trailing comma OK.
                         if !self.try_punct(",") { break; }
+                        if self.peek_punct("]->") { break; }
                     }
                     self.require_punct("]->")?;
                 }
@@ -1578,7 +1610,9 @@ impl<'a> Parser<'a> {
             loop {
                 let t = self.term(false)?;
                 args.push(t);
+                // HS `parens (commaSep pterm)` (Fact.hs:47): trailing comma OK.
                 if !self.try_punct(",") { break; }
+                if self.peek_punct(")") { break; }
             }
             self.require_punct(")")?;
         }
@@ -2056,6 +2090,12 @@ impl<'a> Parser<'a> {
                     loop {
                         let t = self.msetterm(eqn)?;
                         ts.push(t);
+                        // NB: HS `naryOpApp` (Term.hs:84-87) is arity-dependent —
+                        // arity-1 ops parse args via `tupleterm`/`chainr1` (strict,
+                        // no trailing comma), only arity≠1 via `commaSep` (trailing
+                        // comma OK). This parser has no arity at this point, so we
+                        // keep the strict form to avoid accepting `g(x,)` for a
+                        // unary `g`, which HS rejects.
                         if !self.try_punct(",") { break; }
                     }
                     self.require_punct(")")?;
