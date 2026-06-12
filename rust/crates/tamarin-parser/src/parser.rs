@@ -207,6 +207,14 @@ impl<'a> Parser<'a> {
         else { self.restore(save); false }
     }
 
+    /// Non-consuming lookahead for a punctuation token.
+    fn peek_punct(&mut self, p: &str) -> bool {
+        let save = self.save();
+        let m = self.try_punct(p);
+        self.restore(save);
+        m
+    }
+
     fn ident(&mut self) -> Result<String, ParseError> {
         self.lx.identifier().ok_or_else(|| self.err("expected identifier"))
     }
@@ -813,7 +821,10 @@ impl<'a> Parser<'a> {
                         FactOrRestr::Fact(f) => acts.push(f),
                         FactOrRestr::Restr(phi) => rstrs.push(phi),
                     }
+                    // HS `commaSep` (Rule.hs:186) = `sepEndBy comma`: a trailing
+                    // comma before `]->` is permitted.
                     if !self.try_punct(",") { break; }
+                    if self.peek_punct("]->") { break; }
                 }
                 self.require_punct("]->")?;
             }
@@ -869,7 +880,10 @@ impl<'a> Parser<'a> {
                         FactOrRestr::Fact(f) => acts.push(f),
                         FactOrRestr::Restr(phi) => rstrs.push(phi),
                     }
+                    // HS `commaSep` (Rule.hs:186) = `sepEndBy comma`: a trailing
+                    // comma before `]->` is permitted.
                     if !self.try_punct(",") { break; }
+                    if self.peek_punct("]->") { break; }
                 }
                 self.require_punct("]->")?;
             }
@@ -1015,7 +1029,10 @@ impl<'a> Parser<'a> {
         loop {
             let f = self.fact()?;
             fs.push(f);
+            // HS `commaSep1 fact` (Rule.hs:196) = `sepEndBy1 comma`: a trailing
+            // comma before `]` is permitted.
             if !self.try_punct(",") { break; }
+            if self.peek_punct("]") { break; }
         }
         self.require_punct("]")?;
         Ok(fs)
