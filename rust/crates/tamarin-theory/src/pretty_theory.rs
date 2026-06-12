@@ -92,11 +92,19 @@ pub struct ProvedLemma {
 /// so the resulting path `"/defaultoracle.oracle"` almost never exists, and the
 /// function returns `"oracle"` — matching observed HS behaviour.
 fn oracle_name_for_theory(in_file: &str) -> String {
-    // Step 1: prefix before first '.'
-    let before_dot = match in_file.find('.') {
-        Some(i) => &in_file[..i],
-        None => in_file,
-    };
+    // Step 1: HS `head $ groupBy (\_ b -> b /= '.') srcThyInFileName`.
+    // `groupBy` always keeps the first character in the head group, then
+    // extends it up to (not including) the first '.' at position >= 1.  So
+    // a LEADING '.' (e.g. "./foo.spthy") belongs to the prefix and is NOT a
+    // terminator — the prefix is "./foo".  Mirror that by ignoring a '.' at
+    // char-position 0.
+    let split = in_file
+        .char_indices()
+        .enumerate()
+        .find(|(pos, (_, ch))| *pos >= 1 && *ch == '.')
+        .map(|(_, (byte, _))| byte)
+        .unwrap_or(in_file.len());
+    let before_dot = &in_file[..split];
     // Step 2: suffix after last '/' in before_dot.
     // HS `groupBy (\_ b -> b /= '/') s` splits `s` at every '/', then `last`
     // takes the final segment.  For absolute paths this segment starts with
@@ -158,6 +166,24 @@ pub fn pretty_goal_rankings(raw: &str, in_file: &str) -> String {
         if c.is_whitespace() {
             i += 1;
             continue;
+        }
+        // Skip comments.  HS's lexer consumes `/* … */` block and `// …`
+        // line comments BETWEEN ranking tokens before parsing them, so a
+        // heuristic like `p /* note for SAPIC */` parses to just `[p]`.
+        // The raw string RS stores is read verbatim to end-of-line, so we
+        // must skip comments here too — otherwise the comment's letters are
+        // mis-tokenised as bogus rankings (and an `o` even as an oracle).
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            i += 2;
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            i = (i + 2).min(chars.len()); // consume closing `*/`
+            continue;
+        }
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+            // Line comment runs to the end of the (single-line) raw string.
+            break;
         }
         if c == '{' {
             // Tactic ranking: collect up to '}'
