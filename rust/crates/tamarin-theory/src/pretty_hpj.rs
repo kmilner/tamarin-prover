@@ -64,6 +64,15 @@ pub enum Doc {
     /// thunk restores HS's laziness: construction stays linear, and only
     /// the layout path that is actually chosen forces its right branches.
     LazyUnion(Rc<Doc>, Rc<LazyRight>),
+    /// Deferred reduction continuation: a memoised thunk holding the
+    /// `get`/`get1` reduction of some sub-doc.  `get`/`get1` wrap each
+    /// recursive position in a `Deferred` so that — exactly as in HS's
+    /// call-by-need `best` — the reduced doc past the first line break is
+    /// NOT built until `fits` (which stops at the first `NilAbove`) or
+    /// `lay` actually walks into it.  This is what keeps reduction linear
+    /// in the output size instead of eagerly materialising every layout
+    /// alternative (the 56 s / 64 GB blowup on `arpki`'s `ILS_Reg_ILS`).
+    Deferred(Rc<LazyRight>),
     /// `NoDoc` — failure marker (only appears inside reduced Unions).
     NoDoc,
 }
@@ -110,8 +119,18 @@ impl Clone for LazyRight {
 fn force(d: Doc) -> Doc {
     match d {
         Doc::LazyUnion(p, r) => Doc::Union(p, r.force()),
+        // A `Deferred` reduction node forces to the (memoised) reduced
+        // doc.  `get`/`get1` never return a `Deferred` at the head, so a
+        // single force suffices (no Deferred-of-Deferred chains).
+        Doc::Deferred(c) => (*c.force()).clone(),
         other => other,
     }
+}
+
+/// Wrap a `get`/`get1` reduction step as a memoised `Deferred` node, so
+/// it is only run when `fits`/`lay` walks into it.
+fn defer(f: impl FnOnce() -> Doc + 'static) -> Doc {
+    Doc::Deferred(LazyRight::new(f))
 }
 
 /// HS `mkUnion` with a lazy right branch.
@@ -235,6 +254,7 @@ fn dbg_node(d: &Doc, depth: usize, out: &mut String) {
         Doc::Nest(k, p) => { out.push_str(&format!("{}Nest({})\n", pad, k)); dbg_node(p, depth+1, out); }
         Doc::Union(a, b) => { out.push_str(&format!("{}Union\n", pad)); dbg_node(a, depth+1, out); dbg_node(b, depth+1, out); }
         Doc::LazyUnion(a, _) => { out.push_str(&format!("{}LazyUnion(unforced)\n", pad)); dbg_node(a, depth+1, out); }
+        Doc::Deferred(_) => out.push_str(&format!("{}Deferred(unforced)\n", pad)),
     }
 }
 
@@ -333,6 +353,9 @@ fn beside_inner(p: Doc, g: bool, q: Doc) -> Doc {
             };
             text_beside_(s, w, rest_inner)
         }
+        // `Deferred` is produced only by `get`/`get1` during reduction,
+        // never by the construction combinators that feed `beside`.
+        Doc::Deferred(_) => unreachable!("Deferred only appears in reduced docs"),
     }
 }
 
@@ -378,6 +401,7 @@ fn above_nest(p: Doc, g: bool, k: isize, q: Doc) -> Doc {
             };
             text_beside_(s, w, rest_q)
         }
+        Doc::Deferred(_) => unreachable!("Deferred only appears in reduced docs"),
     }
 }
 
@@ -417,6 +441,7 @@ fn one_liner(d: Doc) -> Doc {
         Doc::Union(p, _) => one_liner((*p).clone()),
         // oneLiner takes only the left (flat) branch — never force `q`.
         Doc::LazyUnion(p, _) => one_liner((*p).clone()),
+        Doc::Deferred(_) => unreachable!("Deferred only appears in reduced docs"),
     }
 }
 
@@ -490,7 +515,7 @@ fn sep_x(x: bool, mut ds: Vec<Doc>) -> Doc {
 fn sep1(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
     match force(p) {
         Doc::NoDoc => Doc::NoDoc,
-        Doc::LazyUnion(..) => unreachable!("forced above"),
+        Doc::LazyUnion(..) | Doc::Deferred(..) => unreachable!("forced above"),
         Doc::Union(p, q) => {
             let left = sep1(g, (*p).clone(), k, ys.clone());
             lazy_union(left, move || {
@@ -508,7 +533,7 @@ fn sep1(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
 fn sep_nb(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
     let p = force(p);
     match p {
-        Doc::LazyUnion(..) => unreachable!("forced above"),
+        Doc::LazyUnion(..) | Doc::Deferred(..) => unreachable!("forced above"),
         Doc::Nest(_, inner) => sep_nb(g, (*inner).clone(), k, ys),
         Doc::Empty => {
             // HS `sepNB g Empty k ys` (pretty-1.1.3.6 HughesPJ.hs:760-766):
@@ -556,7 +581,7 @@ fn fill(g: bool, mut ds: Vec<Doc>) -> Doc {
 fn fill1(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
     match force(p) {
         Doc::NoDoc => Doc::NoDoc,
-        Doc::LazyUnion(..) => unreachable!("forced above"),
+        Doc::LazyUnion(..) | Doc::Deferred(..) => unreachable!("forced above"),
         Doc::Union(p, q) => {
             // Keep the right (line-breaking) branch lazy — it re-fills the
             // remaining items and is only needed if the flat layout fails.
@@ -575,7 +600,7 @@ fn fill1(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
 /// HS `fillNB`.
 fn fill_nb(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
     match force(p) {
-        Doc::LazyUnion(..) => unreachable!("forced above"),
+        Doc::LazyUnion(..) | Doc::Deferred(..) => unreachable!("forced above"),
         Doc::Nest(_, inner) => fill_nb(g, (*inner).clone(), k, ys),
         Doc::Empty => {
             if ys.is_empty() { return Doc::Empty; }
@@ -623,73 +648,61 @@ fn get_doc(w: isize, r: isize, d: &Doc) -> Doc {
 }
 
 /// HS `get w doc` (line-start case).
+///
+/// LAZINESS (the whole point — see `Doc::Deferred`): every recursive
+/// reduction is wrapped in `defer`, so this returns only the HEAD
+/// constructor of the reduced doc; the tail is a memoised thunk forced on
+/// demand.  `fits` (which stops at the first `NilAbove`) therefore forces
+/// only the first line of a `Union`'s left branch before deciding, and the
+/// unchosen alternatives are never materialised.  This mirrors HS's
+/// call-by-need `best` and keeps reduction O(output) instead of O(2^depth).
 fn get(w: isize, r: isize, d: Doc) -> Doc {
     match force(d) {
         Doc::Empty => Doc::Empty,
         Doc::NoDoc => Doc::NoDoc,
-        Doc::LazyUnion(..) => unreachable!("forced above"),
-        Doc::NilAbove(p) => nil_above_(get(w, r, (*p).clone())),
+        Doc::LazyUnion(..) | Doc::Deferred(..) => unreachable!("forced above"),
+        Doc::NilAbove(p) => nil_above_(defer(move || get(w, r, (*p).clone()))),
         Doc::TextBeside(s, sw, p) => {
             let len = sw as isize;
-            text_beside_(s, sw, get1(w, r, len, (*p).clone()))
+            text_beside_(s, sw, defer(move || get1(w, r, len, (*p).clone())))
         }
-        Doc::Nest(k, p) => nest_(k, get(w - k, r, (*p).clone())),
+        Doc::Nest(k, p) => nest_(k, defer(move || get(w - k, r, (*p).clone()))),
         Doc::Union(p, q) => {
-            // nicest w r (get w p) (get w q) = nicest1 w r 0 (get w p) (get w q)
-            // LAZY (matching HS's non-strict `nicest1`): only `get` the `p`
-            // (flat) branch; `fits` inspects it.  Compute the `q` branch
-            // ONLY when `p` doesn't fit.  HughesPJ relies on this laziness
-            // to avoid exponential blowup when Unions nest (each `fill1`/
-            // `fillNBE`/`sep` builds a Union whose `q` recursively re-lays
-            // the remaining items); forcing both branches eagerly makes the
-            // reduced tree O(2^depth) for deeply nested terms.
+            // nicest1 w r 0 (get w p) (get w q): only `get` the flat branch
+            // `p` (returns its head + deferred tail); `fits` forces just its
+            // first line.  The line-breaking branch `q` is reduced ONLY when
+            // `p` overflows.
             let p1 = get(w, r, (*p).clone());
             let budget = std::cmp::min(w, r); // sl = 0 here
-            if fits(budget, &p1) {
-                p1
-            } else {
-                get(w, r, (*q).clone())
-            }
+            if fits(budget, &p1) { p1 } else { get(w, r, (*q).clone()) }
         }
     }
 }
 
-/// HS `get1 w sl doc` (in-line, after some text).
+/// HS `get1 w sl doc` (in-line, after `sl` cols of text).
 fn get1(w: isize, r: isize, sl: isize, d: Doc) -> Doc {
     match force(d) {
         Doc::Empty => Doc::Empty,
         Doc::NoDoc => Doc::NoDoc,
-        Doc::LazyUnion(..) => unreachable!("forced above"),
+        Doc::LazyUnion(..) | Doc::Deferred(..) => unreachable!("forced above"),
         Doc::NilAbove(p) => {
-            // HS: nilAbove_ (get (w - sl) p)
-            // KEY w-shrinkage point: after a line break, the next line's
-            // budget shrinks by `sl` (the column where the prior doc
-            // started on the just-ended line).
-            nil_above_(get(w - sl, r, (*p).clone()))
+            // After a line break the next line's budget shrinks by `sl`.
+            nil_above_(defer(move || get(w - sl, r, (*p).clone())))
         }
         Doc::TextBeside(s, sw, p) => {
             let len = sw as isize;
-            text_beside_(s, sw, get1(w, r, sl + len, (*p).clone()))
+            text_beside_(s, sw, defer(move || get1(w, r, sl + len, (*p).clone())))
         }
-        Doc::Nest(_k, p) => {
-            // HS: get1 w sl (Nest _ p) = get1 w sl p
-            // (Nest is a no-op while we're already mid-line.)
-            get1(w, r, sl, (*p).clone())
-        }
+        // Nest is a no-op while we're already mid-line.
+        Doc::Nest(_k, p) => get1(w, r, sl, (*p).clone()),
         Doc::Union(p, q) => {
-            // Lazy nicest1: only force the `q` branch when `p` fails to fit.
-            // See the comment in `get`'s Union arm — this is what keeps the
-            // reduced tree linear instead of O(2^depth) on nested Unions.
             let p1 = get1(w, r, sl, (*p).clone());
             let budget = std::cmp::min(w, r) - sl;
-            if fits(budget, &p1) {
-                p1
-            } else {
-                get1(w, r, sl, (*q).clone())
-            }
+            if fits(budget, &p1) { p1 } else { get1(w, r, sl, (*q).clone()) }
         }
     }
 }
+
 
 
 /// HS `fits`.
@@ -704,6 +717,10 @@ fn fits(n: isize, d: &Doc) -> bool {
         Doc::Union(p, _) => fits(n, p),  // pre-reduced, but be defensive
         // Only the left (flat) branch matters for fits; never force `q`.
         Doc::LazyUnion(p, _) => fits(n, p),
+        // A deferred reduction tail: force it (memoised) and continue.
+        // `fits` stops at the first `NilAbove`, so this only ever forces
+        // the first line of a reduced branch.
+        Doc::Deferred(c) => fits(n, &c.force()),
     }
 }
 
@@ -736,6 +753,7 @@ fn lay(k: isize, d: &Doc, out: &mut String) {
             out.push_str(s);
             lay2(k + *_w as isize, p, out);
         }
+        Doc::Deferred(c) => lay(k, &c.force(), out),
         Doc::Union(_, _) => {
             panic!("pretty_hpj::lay: Union — best did not reduce")
         }
@@ -760,6 +778,7 @@ fn lay2(k: isize, d: &Doc, out: &mut String) {
             lay2(k + *w as isize, p, out);
         }
         Doc::Nest(_k1, p) => lay2(k, p, out),
+        Doc::Deferred(c) => lay2(k, &c.force(), out),
         Doc::Union(_, _) => panic!("pretty_hpj::lay2: Union"),
         Doc::LazyUnion(_, _) => panic!("pretty_hpj::lay2: LazyUnion"),
     }
