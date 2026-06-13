@@ -372,7 +372,6 @@ fn prove_lemma_in_session_mode(
         lemma.trace_quantifier,
         crate::theory::TraceQuantifier::ExistsTrace,
     );
-    use crate::constraint::solver::goals::parse_heuristic_str;
     let session_in_file = &theory.in_file;
     let lemma_heuristic: Option<&str> = lemma.attributes.iter().find_map(|a| match a {
         crate::theory::LemmaAttr::Heuristic(s) => Some(s.as_str()),
@@ -383,7 +382,8 @@ fn prove_lemma_in_session_mode(
         None => theory.heuristic.first().cloned(),
     };
     ctx.heuristic = session_heuristic_raw.map(|h| {
-        let mut rankings = parse_heuristic_str(&h, session_in_file);
+        let mut rankings = crate::constraint::solver::goals::parse_heuristic_str_with_tactics(
+            &h, session_in_file, &theory.tactic);
         prepend_theory_dir_to_oracle_paths(&mut rankings, session_in_file);
         rankings
     });
@@ -667,7 +667,6 @@ pub fn prove_lemma_with_pool_and_file(
     // (= HS's `defaultHeuristic False`).
     // `parse_heuristic_str` returns the full list for round-robin
     // scheduling (ProofMethod.hs:802-811) and resolves oracle paths.
-    use crate::constraint::solver::goals::parse_heuristic_str;
     let in_file = &theory.in_file;
     let lemma_heuristic: Option<&str> = lemma.attributes.iter().find_map(|a| match a {
         crate::theory::LemmaAttr::Heuristic(s) => Some(s.as_str()),
@@ -682,7 +681,10 @@ pub fn prove_lemma_with_pool_and_file(
         // Resolve oracle paths relative to theory file dir.
         // HS `oraclePath oracle = takeDirectory inFile </> normalise relPath`
         // (System.hs:574-575, Parser.hs:304).
-        let mut rankings = parse_heuristic_str(&h, in_file);
+        // Resolve `{name}` tactic rankings against `theory.tactic`
+        // (HS `chosenTactic`, ProofMethod.hs:706-715).
+        let mut rankings = crate::constraint::solver::goals::parse_heuristic_str_with_tactics(
+            &h, in_file, &theory.tactic);
         prepend_theory_dir_to_oracle_paths(&mut rankings, in_file);
         rankings
     });

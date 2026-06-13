@@ -12,6 +12,7 @@ tamarin-utils = { workspace = true }
 tamarin-term = { workspace = true }
 tamarin-parser = { workspace = true }
 rayon = { workspace = true }
+fancy-regex = "0.18"
 
 [dev-dependencies]
 walkdir = "2"
