@@ -407,24 +407,20 @@ fn pp_wf_term(t: &Term, out: &mut String) {
 /// Substitute every `let`-binding of a rule into its facts, mirroring HS,
 /// whose rule parser inlines the `let` block before building the
 /// `ProtoRuleE` (so wellformedness checks see fully-substituted facts).
-/// Bindings are applied in order, with earlier substitutions baked into
-/// later binding values — matching `elaborate::apply_let_block`.
+///
+/// HS `letBlock` (Parser/Let.hs:34) is `foldr1 compose` over singleton
+/// substitutions — equivalent to applying each binding sequentially in
+/// REVERSE binding order ("bottom-up").  Backward references expand;
+/// FORWARD references survive as free variables.  Matches
+/// `elaborate::apply_let_block`.
 fn rule_facts_with_lets(r: &Rule) -> (Vec<Fact>, Vec<Fact>, Vec<Fact>) {
     let mut prems = r.premises.clone();
     let mut acts = r.actions.clone();
     let mut concs = r.conclusions.clone();
-    let mut applied: Vec<(Term, Term)> = Vec::new();
-    for b in &r.let_block {
-        let mut value = b.value.clone();
-        for (k, v) in &applied {
-            value = subst_let_term(&value, k, v);
-        }
-        applied.push((b.var.clone(), value));
-    }
-    for (k, v) in &applied {
-        for f in prems.iter_mut() { subst_let_fact(f, k, v); }
-        for f in acts.iter_mut()  { subst_let_fact(f, k, v); }
-        for f in concs.iter_mut() { subst_let_fact(f, k, v); }
+    for b in r.let_block.iter().rev() {
+        for f in prems.iter_mut() { subst_let_fact(f, &b.var, &b.value); }
+        for f in acts.iter_mut()  { subst_let_fact(f, &b.var, &b.value); }
+        for f in concs.iter_mut() { subst_let_fact(f, &b.var, &b.value); }
     }
     (prems, acts, concs)
 }
