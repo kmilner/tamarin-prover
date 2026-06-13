@@ -138,21 +138,38 @@ ppMaudeCSym EMap = funSymPrefix <> emapSymString
 
 
 -- | @ppMaude t@ pretty prints the term @t@ for Maude.
+--
+-- Rather than repeatedly @<>@-ing strict 'ByteString's (each append copies its
+-- whole left operand, so the naive recursion recopied every subterm's
+-- rendering at each enclosing level — ≈O(n·depth) allocation), we collect the
+-- leaf fragments into a difference list and 'B.concat' them once. 'B.concat'
+-- allocates the result exactly once (sum of the fragment lengths), so this is
+-- O(n) with no per-call buffer overhead. The produced bytes are byte-for-byte
+-- identical to the previous formulation.
 ppMaude :: Term MaudeLit -> ByteString
-ppMaude t = case viewTerm t of
-    Lit (MaudeVar i lsort)   -> "x" <> ppInt i <> ":" <> ppLSort lsort
-    Lit (MaudeConst i lsort) -> ppLSortSym lsort <> "(" <> ppInt i <> ")"
+ppMaude t = B.concat (ppMaudeDL t [])
+
+-- | Render @t@ as a difference list of 'ByteString' fragments, prepended to
+--   @rest@ (see 'ppMaude').
+ppMaudeDL :: Term MaudeLit -> [ByteString] -> [ByteString]
+ppMaudeDL t rest = case viewTerm t of
+    Lit (MaudeVar i lsort)   -> "x" : ppInt i : ":" : ppLSort lsort : rest
+    Lit (MaudeConst i lsort) -> ppLSortSym lsort : "(" : ppInt i : ")" : rest
     Lit (FreshVar _ _)       -> error "Term.Maude.Types.ppMaude: FreshVar not allowed"
-    FApp (NoEq fsym) []      -> ppMaudeNoEqSym fsym
-    FApp (NoEq fsym) as      -> ppMaudeNoEqSym fsym <> ppArgs as
-    FApp (C fsym) as         -> ppMaudeCSym fsym    <> ppArgs as
-    FApp (AC op) as          -> ppMaudeACSym op     <> ppArgs as
-    FApp List as             -> "list(" <> ppList as <> ")"
+    FApp (NoEq fsym) []      -> ppMaudeNoEqSym fsym : rest
+    FApp (NoEq fsym) as      -> ppMaudeNoEqSym fsym : ppArgs as rest
+    FApp (C fsym) as         -> ppMaudeCSym fsym    : ppArgs as rest
+    FApp (AC op) as          -> ppMaudeACSym op     : ppArgs as rest
+    FApp List as             -> "list(" : ppList as (")" : rest)
   where
-    ppArgs as     = "(" <> (B.intercalate "," (map ppMaude as)) <> ")"
-    ppInt         = BC.pack . show
-    ppList []     = "nil"
-    ppList (x:xs) = "cons(" <> ppMaude x <> "," <> ppList xs <> ")"
+    ppInt           = BC.pack . show
+    -- "(" arg1 "," arg2 ... ")" — same bytes as @"(" <> intercalate "," ... <> ")"@
+    ppArgs as r     = "(" : go as
+      where go []     = ")" : r          -- unreachable: 'as' is non-empty here
+            go [x]    = ppMaudeDL x (")" : r)
+            go (x:xs) = ppMaudeDL x ("," : go xs)
+    ppList []       = ("nil" :)
+    ppList (x:xs)   = \r -> "cons(" : ppMaudeDL x ("," : ppList xs (")" : r))
 
 ------------------------------------------------------------------------------
 -- Pretty printing a 'MaudeSig' as a Maude functional module.

@@ -160,9 +160,11 @@ normSubstVFresh' s = reader $ \hnd -> mapRangeVFresh (\t -> norm' t `runReader` 
 
 -- | Returns all subterms that may be not in normal form.
 maybeNotNfSubterms :: MaudeSig -> LNTerm -> [LNTerm]
-maybeNotNfSubterms msig t0 = go t0
+maybeNotNfSubterms msig t0 = go t0 []
   where irreducible = irreducibleFunSyms msig
-        go t = case viewTerm t of
-            Lit (Con _)                            -> []
-            (FApp o as) | o `S.member` irreducible -> concatMap go as
-            _                                      -> [t]
+        -- accumulator form: avoids the intermediate lists built by @concatMap@
+        -- + @[t]@; produces exactly the same list as the naive version.
+        go t acc = case viewTerm t of
+            Lit (Con _)                            -> acc
+            (FApp o as) | o `S.member` irreducible -> foldr go acc as
+            _                                      -> t:acc
