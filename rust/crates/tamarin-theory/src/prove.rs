@@ -732,7 +732,7 @@ mod tests {
             node.sys.goals.len(), node.sys.nodes.len(), node.sys.formulas.len(),
             node.sys.less_atoms.len(), node.sys.edges.len(), reason);
         if depth > 0 {
-            for (id, ru) in &node.sys.nodes {
+            for (id, ru) in node.sys.nodes.iter() {
                 let info = match &ru.info {
                     crate::rule::RuleInfo::Proto(p) => format!("{:?}", p.name),
                     crate::rule::RuleInfo::Intr(i) => format!("Intr({:?})", i),

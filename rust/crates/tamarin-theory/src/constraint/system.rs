@@ -7,6 +7,7 @@
 //! population keeps the whole module compiling.
 
 use std::cell::Cell;
+use std::sync::Arc;
 
 use crate::constraint::constraints::{Edge, Goal, LessAtom, NodeId};
 use crate::guarded::Guarded;
@@ -44,7 +45,18 @@ pub struct System {
     pub source_kind: Option<SourceKind>,
     pub side: Option<Side>,
     /// Node id → rule instance providing its conclusion.
-    pub nodes: Vec<(NodeId, RuleACInst)>,
+    ///
+    /// Wrapped in `Arc` for copy-on-write structural sharing: cloning a
+    /// `System` (which happens at every proof branch / source-case fork)
+    /// only bumps the refcount instead of deep-copying every
+    /// `RuleACInst` (the biggest payload — many `LNFact`s / `LNTerm`s).
+    /// Mutations go through `Arc::make_mut`, which clones the inner
+    /// `Vec` only when the `Arc` is actually shared.  Reads via `Deref`
+    /// are unchanged.  `Arc`'s `PartialEq`/`Ord`/`Hash` forward to the
+    /// inner `Vec` (content comparison, not pointer identity), so
+    /// equality semantics — critical for goal/case dedup — are
+    /// preserved.
+    pub nodes: Arc<Vec<(NodeId, RuleACInst)>>,
     /// Edges from conclusions to premises.
     pub edges: Vec<Edge>,
     /// `i < j` constraints with reason tags.
@@ -63,7 +75,10 @@ pub struct System {
     /// Subterm store.
     pub subterm_store: SubtermStore,
     /// Open goals paired with their current status.
-    pub goals: Vec<(Goal, GoalStatus)>,
+    ///
+    /// `Arc`-wrapped for copy-on-write structural sharing (see `nodes`).
+    /// Cloned at every proof fork; mutated through `goals_mut`.
+    pub goals: Arc<Vec<(Goal, GoalStatus)>>,
     /// Monotonic goal-number counter (`_sNextGoalNr`,
     /// System.hs:394).  Advanced on every goal insertion (even when
     /// the goal already exists — HS's `insertGoalStatus`
@@ -235,6 +250,21 @@ pub struct GoalStatus {
 impl System {
     pub fn empty() -> Self { Self::default() }
 
+    /// Copy-on-write mutable access to `nodes`.  Clones the inner `Vec`
+    /// only if the `Arc` is shared with another `System` (refcount > 1);
+    /// otherwise hands out a `&mut` to the existing storage.  Use this
+    /// for any in-place mutation of the node list.
+    #[inline]
+    pub fn nodes_mut(&mut self) -> &mut Vec<(NodeId, RuleACInst)> {
+        Arc::make_mut(&mut self.nodes)
+    }
+
+    /// Copy-on-write mutable access to `goals` (see `nodes_mut`).
+    #[inline]
+    pub fn goals_mut(&mut self) -> &mut Vec<(Goal, GoalStatus)> {
+        Arc::make_mut(&mut self.goals)
+    }
+
     // ====== max_var_idx_cache maintenance ======
 
     /// Invalidate the cached max-var-idx hint.  Call on any mutation
@@ -339,7 +369,7 @@ impl System {
             let mut st = GoalStatus::default();
             st.nr = age;
             self.bump_cache_goal(&g);
-            self.goals.push((g, st));
+            self.goals_mut().push((g, st));
         }
     }
 
@@ -403,7 +433,7 @@ impl System {
             eprintln!("[RS_GOAL_INSERT] gsNr={} isNew={} kind={}",
                 age, is_new, kindstr);
         }
-        if let Some(slot) = self.goals.iter_mut().find(|(existing, _)|
+        if let Some(slot) = self.goals_mut().iter_mut().find(|(existing, _)|
             canonical_goal_for_dedup(existing) == canon_g)
         {
             slot.1.looping = slot.1.looping || looping;
@@ -415,7 +445,7 @@ impl System {
         st.looping = looping;
         st.nr = age;
         self.bump_cache_goal(&g);
-        self.goals.push((g, st));
+        self.goals_mut().push((g, st));
     }
 
     /// Insert a new node into the sequent. Replaces an existing entry
@@ -492,11 +522,11 @@ impl System {
         let pos = self.nodes.iter().position(|(k, _)| k == &id);
         if let Some(i) = pos {
             self.invalidate_max_var_idx_cache();
-            self.nodes[i].1 = rule;
+            self.nodes_mut()[i].1 = rule;
         } else {
             self.bump_cache_lvar(&id);
             self.bump_cache_rule(&rule);
-            self.nodes.push((id, rule));
+            self.nodes_mut().push((id, rule));
         }
     }
 
@@ -557,7 +587,7 @@ impl System {
         }
         // HS-faithful `unsolvedChains` contribution to rawEdgeRel
         // (`System.hs:1613-1616`).
-        for (g, st) in &self.goals {
+        for (g, st) in self.goals.iter() {
             if st.solved { continue; }
             if let crate::constraint::constraints::Goal::Chain(c, p) = g {
                 adj.entry(c.0.clone()).or_default().push(p.0.clone());

@@ -322,7 +322,7 @@ impl ProofContext {
                         eprintln!("[SAT_FINAL]   edge {:?}.{:?} → {:?}.{:?}",
                             e.src.0, e.src.1, e.tgt.0, e.tgt.1);
                     }
-                    for (g, st) in &sys.goals {
+                    for (g, st) in sys.goals.iter() {
                         eprintln!("[SAT_FINAL]   goal solved={} {:?}",
                             st.solved, format!("{:?}", g).chars().take(120).collect::<String>());
                     }

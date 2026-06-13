@@ -166,7 +166,7 @@ fn pretty_eq_store(sys: &System) -> String {
 fn pretty_goals(sys: &System, want_solved: bool) -> String {
     let mut lines: Vec<String> = Vec::new();
     let mut nr = 0;
-    for (g, st) in &sys.goals {
+    for (g, st) in sys.goals.iter() {
         if st.solved != want_solved { continue; }
         nr += 1;
         let lb = if st.looping { " (loop breaker)".to_string() } else { String::new() };
@@ -226,7 +226,7 @@ fn pretty_source_kind(sk: Option<SourceKind>) -> String {
 // ---------------------------------------------------------------------
 
 fn pretty_nodes(sys: &System) -> String {
-    let mut sorted = sys.nodes.clone();
+    let mut sorted = (*sys.nodes).clone();
     sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
     let lines: Vec<String> = sorted.iter()
         .map(|(nid, ru)| format!("{}: {}", pretty_node_id(nid), pretty_rule_inst(ru)))

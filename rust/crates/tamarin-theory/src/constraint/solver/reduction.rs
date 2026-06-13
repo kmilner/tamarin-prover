@@ -473,7 +473,8 @@ impl<'ctx> Reduction<'ctx> {
         //    Haskell's `setNodes` → `solveRuleEqs`). We solve those
         //    equalities AFTER the rest of substSystem has run, so the
         //    triggered re-substitution sees a consistent state.
-        let nodes = std::mem::take(&mut self.sys.nodes);
+        let nodes = std::sync::Arc::unwrap_or_clone(
+            std::mem::take(&mut self.sys.nodes));
         let mut new_nodes: Vec<(crate::constraint::constraints::NodeId, RuleACInst)>
             = Vec::with_capacity(nodes.len());
         let mut id_to_index: std::collections::HashMap<crate::constraint::constraints::NodeId, usize>
@@ -660,7 +661,7 @@ impl<'ctx> Reduction<'ctx> {
                 nodes_in, collisions, shape_mm, rule_eqs.len());
         }
         self.sys.invalidate_max_var_idx_cache();
-        self.sys.nodes = new_nodes;
+        self.sys.nodes = std::sync::Arc::new(new_nodes);
         if shape_mismatch {
             // Force a `gfalse` formula so `has_false_formula` picks up
             // the contradiction in the next contradictions check.
@@ -754,7 +755,8 @@ impl<'ctx> Reduction<'ctx> {
         // 5. Goals: rewrite the Goal's free vars. Goals are deduped
         //    structurally; collapsed goals merge by keeping the first
         //    occurrence.
-        let mut goals = std::mem::take(&mut self.sys.goals);
+        let mut goals = std::sync::Arc::unwrap_or_clone(
+            std::mem::take(&mut self.sys.goals));
         // HS-faithful (Reduction.hs:769-783): `substGoals` iterates
         // `M.toList sGoals` which is Goal-Ord order (NodeId-first for
         // ActionG / PremiseG / ChainG).  The order matters because
@@ -932,7 +934,7 @@ impl<'ctx> Reduction<'ctx> {
             }
         }
         self.sys.invalidate_max_var_idx_cache();
-        self.sys.goals = new_goals;
+        self.sys.goals = std::sync::Arc::new(new_goals);
         for (i, fa, st) in to_insert_action {
             self.insert_goal_with_loop_flag(Goal::Action(i, fa), st.looping);
         }
@@ -1264,7 +1266,7 @@ impl<'ctx> Reduction<'ctx> {
             let mut sys_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar>
                 = std::collections::BTreeSet::new();
             let mut visit = |v: &tamarin_term::lterm::LVar| { sys_vars.insert(v.clone()); };
-            for (id, rule) in &self.sys.nodes {
+            for (id, rule) in self.sys.nodes.iter() {
                 id.for_each_free(&mut visit);
                 rule.for_each_free(&mut visit);
             }
@@ -1311,7 +1313,7 @@ impl<'ctx> Reduction<'ctx> {
             eprintln!("[variant_contra] solve_rule_constraints contradiction fired");
         }
         if std::env::var("TAM_DBG_VS_POST").is_ok() {
-            for (id, ru) in &self.sys.nodes {
+            for (id, ru) in self.sys.nodes.iter() {
                 let nm = crate::constraint::solver::reduction::rule_case_name(ru);
                 if nm == "Serv_1" {
                     eprintln!("[vs_post] AFTER solve_rule_constraints: id={}.{} folded={}",
@@ -1975,7 +1977,7 @@ impl<'ctx> Reduction<'ctx> {
         if should_delete {
             let before = self.sys.goals.len();
             self.sys.invalidate_max_var_idx_cache();
-            self.sys.goals.retain(|(eg, _)| eg != g);
+            self.sys.goals_mut().retain(|(eg, _)| eg != g);
             if self.sys.goals.len() != before {
                 self.changed = ChangeIndicator::Changed;
             }
@@ -1997,7 +1999,7 @@ impl<'ctx> Reduction<'ctx> {
                 self.changed = ChangeIndicator::Changed;
             }
         }
-        for (existing, status) in self.sys.goals.iter_mut() {
+        for (existing, status) in self.sys.goals_mut().iter_mut() {
             if existing == g && !status.solved {
                 status.solved = true;
                 self.changed = ChangeIndicator::Changed;
@@ -2034,7 +2036,7 @@ impl<'ctx> Reduction<'ctx> {
             .collect();
         let before = self.sys.goals.len();
         self.sys.invalidate_max_var_idx_cache();
-        self.sys.goals.retain(|(g, _status)| match g {
+        self.sys.goals_mut().retain(|(g, _status)| match g {
             // HS-faithful: drop the goal whenever the split_id no
             // longer backs an eq-store disjunction (ignore solved
             // flag).
@@ -2147,7 +2149,7 @@ impl<'ctx> Reduction<'ctx> {
             use tamarin_term::lterm::HasFrees;
             let mut s = std::collections::BTreeSet::new();
             let mut visit = |v: &tamarin_term::lterm::LVar| { s.insert(v.clone()); };
-            for (id, rule) in &self.sys.nodes {
+            for (id, rule) in self.sys.nodes.iter() {
                 id.for_each_free(&mut visit);
                 rule.for_each_free(&mut visit);
             }
@@ -2160,7 +2162,7 @@ impl<'ctx> Reduction<'ctx> {
                 l.larger.for_each_free(&mut visit);
             }
             if let Some(la) = &self.sys.last_atom { la.for_each_free(&mut visit); }
-            for (g, _) in &self.sys.goals {
+            for (g, _) in self.sys.goals.iter() {
                 match g {
                     crate::constraint::constraints::Goal::Action(n, fa) => {
                         n.for_each_free(&mut visit);
@@ -2460,7 +2462,7 @@ impl<'ctx> Reduction<'ctx> {
             canonical.push((id, keep));
         }
         self.sys.invalidate_max_var_idx_cache();
-        self.sys.nodes = canonical;
+        self.sys.nodes = std::sync::Arc::new(canonical);
         if rule_eqs.is_empty() {
             return Ok(SolveOutcome::Linear(ChangeIndicator::Unchanged));
         }
@@ -2516,7 +2518,7 @@ impl<'ctx> Reduction<'ctx> {
                 path, live_fresh, case_fresh, case_subst, live_subst);
             // ALL live nodes summary
             eprintln!("[CONJOIN]   live_all_nodes:");
-            for (id, r) in &self.sys.nodes {
+            for (id, r) in self.sys.nodes.iter() {
                 eprintln!("[CONJOIN]     {}.{} = {}", id.name, id.idx,
                     crate::constraint::solver::reduction::rule_case_name(r));
             }
@@ -2527,7 +2529,7 @@ impl<'ctx> Reduction<'ctx> {
                     e.tgt.0.name, e.tgt.0.idx, e.tgt.1.0);
             }
             eprintln!("[CONJOIN]   case_all_nodes:");
-            for (id, r) in &sys.nodes {
+            for (id, r) in sys.nodes.iter() {
                 eprintln!("[CONJOIN]     {}.{} = {}", id.name, id.idx,
                     crate::constraint::solver::reduction::rule_case_name(r));
             }
@@ -2538,7 +2540,7 @@ impl<'ctx> Reduction<'ctx> {
                     e.tgt.0.name, e.tgt.0.idx, e.tgt.1.0);
             }
             // Also dump Serv_1/Register_pk-like nodes from BOTH live and case.
-            for (id, r) in &self.sys.nodes {
+            for (id, r) in self.sys.nodes.iter() {
                 let nm = crate::constraint::solver::reduction::rule_case_name(r);
                 if nm == "Serv_1" || nm == "Register_pk" {
                     eprintln!("[CONJOIN]   live {:?} → {}: prems={:?} concs={:?} acts={:?}",
@@ -2548,7 +2550,7 @@ impl<'ctx> Reduction<'ctx> {
                         r.actions.iter().map(|f| format!("{:?}", f.terms).chars().take(70).collect::<String>()).collect::<Vec<_>>());
                 }
             }
-            for (id, r) in &sys.nodes {
+            for (id, r) in sys.nodes.iter() {
                 let nm = crate::constraint::solver::reduction::rule_case_name(r);
                 if nm == "Serv_1" || nm == "Register_pk" {
                     eprintln!("[CONJOIN]   case {:?} → {}: prems={:?} concs={:?} acts={:?}",
@@ -2613,7 +2615,7 @@ impl<'ctx> Reduction<'ctx> {
             if matches!(g, crate::constraint::constraints::Goal::Split(_)) {
                 continue;
             }
-            match self.sys.goals.iter_mut().find(|(eg, _)| eg == g) {
+            match self.sys.goals_mut().iter_mut().find(|(eg, _)| eg == g) {
                 Some((_, slot)) => {
                     // combineGoalStatus: solved OR-ing, looping OR-ing.
                     if st.solved { slot.solved = true; }
@@ -2622,7 +2624,7 @@ impl<'ctx> Reduction<'ctx> {
                 None => {
                     self.sys.add_goal_with_loop_flag(g.clone(), st.looping);
                     if st.solved {
-                        if let Some((_, slot)) = self.sys.goals.iter_mut()
+                        if let Some((_, slot)) = self.sys.goals_mut().iter_mut()
                             .find(|(eg, _)| eg == g) {
                             slot.solved = true;
                         }
@@ -2647,7 +2649,7 @@ impl<'ctx> Reduction<'ctx> {
             self.insert_formula(f.clone());
         }
         // 8. setNodes (case_nodes ++ live_nodes).
-        let mut all_nodes: Vec<_> = sys.nodes.clone();
+        let mut all_nodes: Vec<_> = (*sys.nodes).clone();
         all_nodes.extend(self.sys.nodes.iter().cloned());
         let r = self.set_nodes(all_nodes);
         if matches!(r, Err(_) | Ok(SolveOutcome::Contradictory)) {
@@ -3439,7 +3441,7 @@ fn bounds_max_disable_enabled() -> bool {
 /// Full-walk implementation of `bounds_max` — bypass for the cache.
 pub fn bounds_max_uncached(sys: &System) -> u64 {
     let mut max = 0u64;
-    for (id, rule) in &sys.nodes {
+    for (id, rule) in sys.nodes.iter() {
         bm_lvar(id, &mut max);
         bm_rule(rule, &mut max);
     }
@@ -3478,7 +3480,7 @@ pub fn bounds_max_uncached(sys: &System) -> u64 {
         bm_term(s, &mut max);
         bm_term(t, &mut max);
     }
-    for (g, _) in &sys.goals {
+    for (g, _) in sys.goals.iter() {
         use crate::constraint::constraints::Goal;
         match g {
             Goal::Action(i, fa) => {
@@ -3694,7 +3696,7 @@ fn has_fresh_consumer_conflation(
     use tamarin_term::vterm::Lit;
     let subst = sys.eq_store.subst.clone();
     let mut consumers: Vec<(crate::constraint::constraints::NodeId, LVar)> = Vec::new();
-    for (id, rule) in &sys.nodes {
+    for (id, rule) in sys.nodes.iter() {
         for prem in &rule.premises {
             if !matches!(prem.tag, FactTag::Fresh) { continue; }
             let t = match prem.terms.first() { Some(t) => t, None => continue };
@@ -4015,7 +4017,7 @@ impl<'ctx> Reduction<'ctx> {
                 eprintln!("  less: {:?} < {:?}", la.smaller, la.larger);
             }
             eprintln!("[DISJ_SPLIT] node ids:");
-            for (id, _) in &self.sys.nodes {
+            for (id, _) in self.sys.nodes.iter() {
                 eprintln!("  node: {:?}", id);
             }
         }
@@ -4044,7 +4046,7 @@ impl<'ctx> Reduction<'ctx> {
                 let mut cases = Vec::with_capacity(alts.len());
                 for (i, gfm) in alts.iter().enumerate() {
                     let mut sub = Reduction::new(self.ctx, self.sys.clone());
-                    for (existing, status) in sub.sys.goals.iter_mut() {
+                    for (existing, status) in sub.sys.goals_mut().iter_mut() {
                         if existing == &g && !status.solved {
                             status.solved = true;
                             break;
@@ -4537,7 +4539,7 @@ impl<'ctx> Reduction<'ctx> {
                         let mut sys = post_sys.clone();
                         sys.invalidate_max_var_idx_cache();
                         sys.eq_store = arm_eq;
-                        for (existing, status) in sys.goals.iter_mut() {
+                        for (existing, status) in sys.goals_mut().iter_mut() {
                             if existing == &g && !status.solved {
                                 status.solved = true;
                                 break;
@@ -4675,7 +4677,7 @@ impl<'ctx> Reduction<'ctx> {
                         let _ = ku_goal_fingerprint(fa);
                         for (case_label, mut sys, case_action) in case_pairs.into_iter() {
                             let case_idx: usize = 0; let _ = case_idx;
-                            if let Some(slot) = sys.goals.iter_mut()
+                            if let Some(slot) = sys.goals_mut().iter_mut()
                                 .find(|(g, _)| g == &live_goal) {
                                 slot.1.solved = true;
                             }
@@ -4916,7 +4918,7 @@ impl<'ctx> Reduction<'ctx> {
                                     kd_m,
                                 ));
                                 let case_name = "coerce".to_string();
-                                for (existing, status) in sub.sys.goals.iter_mut() {
+                                for (existing, status) in sub.sys.goals_mut().iter_mut() {
                                     if existing == &g && !status.solved {
                                         status.solved = true;
                                         break;
@@ -4956,7 +4958,7 @@ impl<'ctx> Reduction<'ctx> {
                                 sub.add_ku_action_before(i, &ku_a);
                                 sub.add_ku_action_before(i, &ku_b);
                                 let case_name = "c_xor".to_string();
-                                for (existing, status) in sub.sys.goals.iter_mut() {
+                                for (existing, status) in sub.sys.goals_mut().iter_mut() {
                                     if existing == &g && !status.solved {
                                         status.solved = true;
                                         break;
@@ -5087,7 +5089,7 @@ impl<'ctx> Reduction<'ctx> {
                             let mut sys = post_sys.clone();
                             sys.invalidate_max_var_idx_cache();
                             sys.eq_store = arm_eq;
-                            for (existing, status) in sys.goals.iter_mut() {
+                            for (existing, status) in sys.goals_mut().iter_mut() {
                                 if existing == &g && !status.solved {
                                     status.solved = true;
                                     break;
@@ -5405,14 +5407,14 @@ impl<'ctx> Reduction<'ctx> {
                             _ => vec![post_edge_sys],
                         };
                         for mut sys in arm_systems {
-                            for (existing, status) in sys.goals.iter_mut() {
+                            for (existing, status) in sys.goals_mut().iter_mut() {
                                 if existing == &g && !status.solved {
                                     status.solved = true;
                                     break;
                                 }
                             }
                             if std::env::var("TAM_DBG_PREM_CASE_OUT").is_ok() {
-                                for (id, ru) in &sys.nodes {
+                                for (id, ru) in sys.nodes.iter() {
                                     let nm = crate::constraint::solver::reduction::rule_case_name(ru);
                                     if nm == "Serv_1" {
                                         eprintln!("[prem_case_out] case={} id={}.{}",
@@ -5560,7 +5562,7 @@ impl<'ctx> Reduction<'ctx> {
                             _ => vec![post_edge_sys],
                         };
                         for mut arm_sys in arm_systems {
-                            for (existing, status) in arm_sys.goals.iter_mut() {
+                            for (existing, status) in arm_sys.goals_mut().iter_mut() {
                                 if existing == &g && !status.solved {
                                     status.solved = true;
                                     break;
@@ -5697,7 +5699,7 @@ impl<'ctx> Reduction<'ctx> {
                         p.clone(),
                     ));
                     arm_sys = arm_sub.sys;
-                    for (existing, status) in arm_sys.goals.iter_mut() {
+                    for (existing, status) in arm_sys.goals_mut().iter_mut() {
                         if existing == &g && !status.solved {
                             status.solved = true;
                             break;
@@ -5971,7 +5973,7 @@ impl<'ctx> Reduction<'ctx> {
                     arm_sys = arm_sub.sys;
                     // Mark the original chain goal as solved in this case
                     // (it's been extended, not closed).
-                    for (existing, status) in arm_sys.goals.iter_mut() {
+                    for (existing, status) in arm_sys.goals_mut().iter_mut() {
                         if existing == &g && !status.solved {
                             status.solved = true;
                             break;
@@ -6086,7 +6088,7 @@ impl<'ctx> Reduction<'ctx> {
             use tamarin_term::lterm::HasFrees;
             let mut s = std::collections::BTreeSet::new();
             let mut visit = |v: &tamarin_term::lterm::LVar| { s.insert(v.clone()); };
-            for (id, rule) in &self.sys.nodes {
+            for (id, rule) in self.sys.nodes.iter() {
                 id.for_each_free(&mut visit);
                 rule.for_each_free(&mut visit);
             }
@@ -6099,7 +6101,7 @@ impl<'ctx> Reduction<'ctx> {
                 l.larger.for_each_free(&mut visit);
             }
             if let Some(la) = &self.sys.last_atom { la.for_each_free(&mut visit); }
-            for (g, _) in &self.sys.goals {
+            for (g, _) in self.sys.goals.iter() {
                 match g {
                     crate::constraint::constraints::Goal::Action(n, fa) => {
                         n.for_each_free(&mut visit);
@@ -6155,7 +6157,7 @@ impl<'ctx> Reduction<'ctx> {
             let mut sys = self.sys.clone();
             sys.invalidate_max_var_idx_cache();
             sys.eq_store = simplify_picked(store);
-            for (existing, status) in sys.goals.iter_mut() {
+            for (existing, status) in sys.goals_mut().iter_mut() {
                 if existing == &g && !status.solved {
                     status.solved = true;
                     break;

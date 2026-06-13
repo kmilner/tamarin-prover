@@ -1056,7 +1056,7 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
             // `EquationStore::add_disj`), so an exact id-match is
             // correct here — no variable-renaming concerns.
             let want = crate::constraint::constraints::SplitId(*split_id);
-            for (g, st) in &sys.goals {
+            for (g, st) in sys.goals.iter() {
                 if st.solved { continue; }
                 if let Goal::Split(id) = g {
                     if *id == want {
@@ -1243,7 +1243,7 @@ mod tests {
         let fact = Fact::new(tag, Vec::new());
         let goal = Goal::Action(i.clone(), fact);
         let mut sys = System::empty();
-        sys.goals.push((goal.clone(), Default::default()));
+        sys.goals_mut().push((goal.clone(), Default::default()));
         let spec = GoalSpec::Action {
             fact: PFact {
                 persistent: false,
@@ -1266,7 +1266,7 @@ mod tests {
         let fact = Fact::new(tag, Vec::new());
         let goal = Goal::Action(i, fact);
         let mut sys = System::empty();
-        sys.goals.push((goal, Default::default()));
+        sys.goals_mut().push((goal, Default::default()));
         let spec = GoalSpec::Action {
             fact: PFact {
                 persistent: false,
@@ -1304,8 +1304,8 @@ mod tests {
             Fact::new(tag, vec![tamarin_term::term::Term::Lit(
                 tamarin_term::vterm::Lit::Var(LVar::new("y", LSort::Msg, 0)))]));
         let mut sys = System::empty();
-        sys.goals.push((g1.clone(), Default::default()));
-        sys.goals.push((g2.clone(), Default::default()));
+        sys.goals_mut().push((g1.clone(), Default::default()));
+        sys.goals_mut().push((g2.clone(), Default::default()));
         // Skeleton spec asking for time-var t2 specifically.
         let spec = GoalSpec::Action {
             fact: PFact {
@@ -1357,8 +1357,8 @@ mod tests {
         let g1 = Goal::Premise((n1, PremIdx(0)), Fact::new(tag.clone(), Vec::new()));
         let g2 = Goal::Premise((n2, PremIdx(0)), Fact::new(tag, Vec::new()));
         let mut sys = System::empty();
-        sys.goals.push((g1, Default::default()));
-        sys.goals.push((g2, Default::default()));
+        sys.goals_mut().push((g1, Default::default()));
+        sys.goals_mut().push((g2, Default::default()));
         let spec = GoalSpec::Premise {
             fact: PFact {
                 persistent: false, name: "Inp".into(),
@@ -1387,8 +1387,8 @@ mod tests {
         let g_ij = Goal::Chain((i.clone(), ConcIdx(0)), (j.clone(), PremIdx(2)));
         let g_jk = Goal::Chain((j.clone(), ConcIdx(1)), (k.clone(), PremIdx(0)));
         let mut sys = System::empty();
-        sys.goals.push((g_ij.clone(), Default::default()));
-        sys.goals.push((g_jk.clone(), Default::default()));
+        sys.goals_mut().push((g_ij.clone(), Default::default()));
+        sys.goals_mut().push((g_jk.clone(), Default::default()));
         // Ask for (#j, 1) ~~> (#k, 0).
         let spec = GoalSpec::Chain {
             src_var: "j".into(), conc_idx: 1,
@@ -1422,7 +1422,7 @@ mod tests {
         let big = Term::Lit(Lit::Var(LVar::new("y", LSort::Msg, 0)));
         let goal = Goal::Subterm((small.clone(), big.clone()));
         let mut sys = System::empty();
-        sys.goals.push((goal.clone(), Default::default()));
+        sys.goals_mut().push((goal.clone(), Default::default()));
         // Skeleton-parsed small_raw / big_raw must canonicalise to the
         // same text as `pretty_lnterm(small)` / `pretty_lnterm(big)`.
         use tamarin_term::pretty::pretty_lnterm;
@@ -1448,7 +1448,7 @@ mod tests {
         let big = Term::Lit(Lit::Var(LVar::new("y", LSort::Msg, 99)));
         let goal = Goal::Subterm((small, big));
         let mut sys = System::empty();
-        sys.goals.push((goal.clone(), Default::default()));
+        sys.goals_mut().push((goal.clone(), Default::default()));
         // Skeleton small/big text deliberately uses a name the runtime
         // doesn't have — text mismatch but unique-Subterm fallback
         // still picks the goal.
@@ -1467,8 +1467,8 @@ mod tests {
         let goal_a = Goal::Split(SplitId(7));
         let goal_b = Goal::Split(SplitId(3));
         let mut sys = System::empty();
-        sys.goals.push((goal_a.clone(), Default::default()));
-        sys.goals.push((goal_b.clone(), Default::default()));
+        sys.goals_mut().push((goal_a.clone(), Default::default()));
+        sys.goals_mut().push((goal_b.clone(), Default::default()));
         let spec = GoalSpec::Split { split_id: 3 };
         let matched = match_goal(&spec, &sys).expect("should match");
         assert_eq!(matched, goal_b);
@@ -1512,8 +1512,8 @@ mod tests {
                 BVar::Free(mk_vs("e"))))),
         ]));
         let mut sys = System::empty();
-        sys.goals.push((two.clone(), Default::default()));
-        sys.goals.push((three.clone(), Default::default()));
+        sys.goals_mut().push((two.clone(), Default::default()));
+        sys.goals_mut().push((three.clone(), Default::default()));
         // Spec with 3 NonQuant alts must pick the 3-alt goal.
         let spec3 = GoalSpec::Disj {
             alts: vec![DisjAlt::NonQuant, DisjAlt::NonQuant, DisjAlt::NonQuant],

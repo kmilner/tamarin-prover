@@ -290,13 +290,13 @@ pub fn compute_basic_graph_repr(sys: &System) -> GraphRepr {
     let mut nodes: Vec<GNode> = Vec::new();
     let mut seen_ids: BTreeSet<NodeId> = BTreeSet::new();
     // 1. System rule instances.
-    for (nid, ru) in &sys.nodes {
+    for (nid, ru) in sys.nodes.iter() {
         nodes.push(GNode { id: nid.clone(), ty: NodeType::System(ru.clone()) });
         seen_ids.insert(nid.clone());
     }
     // 2. Unsolved action atoms — collect by node id.
     let mut by_node: BTreeMap<NodeId, Vec<LNFact>> = BTreeMap::new();
-    for (g, st) in &sys.goals {
+    for (g, st) in sys.goals.iter() {
         if st.solved { continue; }
         if let Goal::Action(nid, fa) = g {
             if seen_ids.contains(nid) { continue; }
@@ -359,7 +359,7 @@ pub fn compute_basic_graph_repr(sys: &System) -> GraphRepr {
     for la in &sys.less_atoms {
         edges.push(GEdge::Less(la.clone()));
     }
-    for (g, st) in &sys.goals {
+    for (g, st) in sys.goals.iter() {
         if st.solved { continue; }
         if let Goal::Chain(src, tgt) = g {
             edges.push(GEdge::UnsolvedChain(src.clone(), tgt.clone()));
