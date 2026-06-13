@@ -1090,14 +1090,23 @@ fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule, att
     let prems = lnfacts_to_parser(&ac_rule.premises);
     let acts = lnfacts_to_parser(&ac_rule.actions);
     let concs = lnfacts_to_parser(&ac_rule.conclusions);
-    // Each line of the rule body needs an extra leading 2-space indent
-    // (we're inside the comment block, which already has 2 spaces).
-    let body = render_rule_body(&prems, &acts, &concs);
-    for line in body.split('\n') {
-        s.push_str("  ");
-        s.push_str(line);
-        s.push('\n');
-    }
+    // The comment block sits inside HS's `nest 2 (multiComment
+    // (prettyNamedRule …))` (ClosedTheory.hs:354), so the rule body's
+    // facts land at absolute column 5 (2 comment + 2 rule nest + 1
+    // bracket).  CRITICAL: render the body with the ENGINE aware of the
+    // full indent (nest 4 via indent=5) rather than rendering at the
+    // modulo-E indent and prepending 2 literal spaces per line — the
+    // prepend shifted every line +2 columns AFTER the HughesPJ width
+    // decisions were made, so lines within 2 columns of the boundary
+    // kept elements HS breaks (the spdm R_KE_Response tuple at visual
+    // col 111 vs HS's break at 95).
+    use crate::elaborate::canonicalize_ac_in_pfact;
+    let prems2: Vec<p::Fact> = prems.iter().map(canonicalize_ac_in_pfact).collect();
+    let acts2:  Vec<p::Fact> = acts.iter().map(canonicalize_ac_in_pfact).collect();
+    let concs2: Vec<p::Fact> = concs.iter().map(canonicalize_ac_in_pfact).collect();
+    let body = render_rule_body_at(&prems2, &acts2, &concs2, 5);
+    s.push_str(&body);
+    if !body.ends_with('\n') { s.push('\n'); }
     // HS `ppVariants (Disj [subst]) | subst == emptySubstVFresh = emptyDoc`
     // (Rule.hs:1289): skip the variants sub-block when there's no
     // residual disjunction beyond the identity.
