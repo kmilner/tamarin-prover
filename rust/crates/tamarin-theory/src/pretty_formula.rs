@@ -1156,11 +1156,12 @@ fn gterm_to_doc(t: &crate::guarded::GTerm, scope: &[Vec<Bind>]) -> crate::pretty
             }
         }
         AlgApp(name, l, r) => {
-            // HS aenc{m}pk surface form, rendered flat (pp_gterm emits it).
-            let mut s = String::new();
-            pp_gterm(t, scope, &mut s);
-            let _ = (name, l, r);
-            Doc::text(s)
+            // The curly-brace form `name{a}b` is parser-only sugar
+            // (parser.rs:2111); HS `prettyTerm`/`ppFun` (Term/Term.hs:268-296)
+            // has no brace case and emits these NoEq applications in function
+            // form `name(a, b)`.  Render identically to `App(name, [l, r])`.
+            let args = [(**l).clone(), (**r).clone()];
+            gfun_doc(name, &args, scope)
         }
         Diff(l, r) => {
             let args = [(**l).clone(), (**r).clone()];
@@ -2028,11 +2029,16 @@ fn pp_gterm(t: &crate::guarded::GTerm, scope: &[Vec<Bind>], out: &mut String) {
             out.push(')');
         }
         GTerm::AlgApp(name, a, b) => {
+            // Curly-brace form `name{a}b` is parser-only sugar
+            // (parser.rs:2111); HS `prettyTerm`/`ppFun` (Term/Term.hs:268-296)
+            // has no brace case and renders these in function form
+            // `name(a, b)`.
             out.push_str(name);
-            out.push('{');
+            out.push('(');
             pp_gterm(a, scope, out);
-            out.push('}');
+            out.push_str(", ");
             pp_gterm(b, scope, out);
+            out.push(')');
         }
         GTerm::Pair(items) => {
             out.push('<');
@@ -2243,6 +2249,84 @@ mod tests {
         assert!(s.contains("~longPayloadNameNumberTwo"), "payload missing:\n{s}");
         // The Eq's `=` is rendered (HS `sep [ppT l <-> opEqual, ppT r]`).
         assert!(s.contains("z ="), "Eq operator missing:\n{s}");
+    }
+
+    // The curly-brace form `name{a}b` in the source is parser-only sugar
+    // (parser.rs:2111); HS `prettyTerm`/`ppFun` (Term/Term.hs:268-296) has no
+    // brace case and re-emits these NoEq applications in function form
+    // `name(a, b)`.  Every term renderer (flat + Doc, parser-AST + GTerm) must
+    // match that.
+    #[test]
+    fn algapp_renders_function_form_flat_term() {
+        // sdec{body}key  ->  sdec(body, key)
+        let t = p::Term::AlgApp(
+            "sdec".into(),
+            Box::new(p::Term::Var(v("body", p::SortHint::Untagged))),
+            Box::new(p::Term::Var(v("key", p::SortHint::Untagged))),
+        );
+        assert_eq!(pretty_term(&t), "sdec(body, key)");
+    }
+
+    #[test]
+    fn algapp_pair_arg_renders_function_form_flat_term() {
+        // senc{a,b}k  ->  AlgApp(senc, <a, b>, k)  ->  senc(<a, b>, k)
+        let t = p::Term::AlgApp(
+            "senc".into(),
+            Box::new(p::Term::Pair(vec![
+                p::Term::Var(v("a", p::SortHint::Untagged)),
+                p::Term::Var(v("b", p::SortHint::Untagged)),
+            ])),
+            Box::new(p::Term::Var(v("k", p::SortHint::Untagged))),
+        );
+        assert_eq!(pretty_term(&t), "senc(<a, b>, k)");
+    }
+
+    #[test]
+    fn algapp_renders_function_form_doc_term() {
+        let t = p::Term::AlgApp(
+            "sdec".into(),
+            Box::new(p::Term::Var(v("body", p::SortHint::Untagged))),
+            Box::new(p::Term::Var(v("key", p::SortHint::Untagged))),
+        );
+        assert_eq!(term_to_doc(&t, &[]).render(), "sdec(body, key)");
+    }
+
+    #[test]
+    fn algapp_renders_function_form_flat_gterm() {
+        let g = crate::guarded::GTerm::AlgApp(
+            "sdec".into(),
+            Box::new(crate::guarded::GTerm::Var(crate::guarded::BVar::Free(
+                v("body", p::SortHint::Untagged),
+            ))),
+            Box::new(crate::guarded::GTerm::Var(crate::guarded::BVar::Free(
+                v("key", p::SortHint::Untagged),
+            ))),
+        );
+        let mut s = String::new();
+        pp_gterm(&g, &[], &mut s);
+        assert_eq!(s, "sdec(body, key)");
+    }
+
+    #[test]
+    fn algapp_pair_arg_renders_function_form_doc_gterm() {
+        // senc{a,b}k as a GTerm -> senc(<a, b>, k) via the Doc renderer
+        let g = crate::guarded::GTerm::AlgApp(
+            "senc".into(),
+            Box::new(crate::guarded::GTerm::Pair(vec![
+                crate::guarded::GTerm::Var(crate::guarded::BVar::Free(v(
+                    "a",
+                    p::SortHint::Untagged,
+                ))),
+                crate::guarded::GTerm::Var(crate::guarded::BVar::Free(v(
+                    "b",
+                    p::SortHint::Untagged,
+                ))),
+            ])),
+            Box::new(crate::guarded::GTerm::Var(crate::guarded::BVar::Free(
+                v("k", p::SortHint::Untagged),
+            ))),
+        );
+        assert_eq!(gterm_to_doc(&g, &[]).render(), "senc(<a, b>, k)");
     }
 }
 
