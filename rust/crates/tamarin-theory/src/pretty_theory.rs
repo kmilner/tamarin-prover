@@ -762,11 +762,43 @@ fn render_parsed_macros(macros: &[p::Macro]) -> String {
     header.above(body).render()
 }
 
+/// Render a rule's attribute block `[...]`, mirroring HS `prettyRuleAttributes`
+/// / `prettyRuleAttribute` (Model/Rule.hs:1201-1217).  HS emits a FIXED-order
+/// `catMaybes [color, process, no_derivcheck, issapicrule, role]` joined by
+/// `fsep . punctuate comma` (", "), wrapped in `[`..`]`; empty → nothing.
+/// External (`x-…`) attributes are NOT in HS's list, so they are dropped.
+fn render_rule_attributes(attrs: &[p::RuleAttr]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    // color= : HS `text "color=" <> text (rgbToHex c)`; `rgbToHex` is
+    // `'#':` + lowercase 2-digit-per-channel hex (Data/Color.hs:141).
+    if let Some(hex) = attrs.iter().find_map(|a| match a {
+        p::RuleAttr::Color(c) => Some(c), _ => None }) {
+        parts.push(format!("color=#{}", hex.trim_start_matches('#').to_lowercase()));
+    }
+    // process= : HS renders the SAPIC process; we emit the stored raw text.
+    if let Some(pr) = attrs.iter().find_map(|a| match a {
+        p::RuleAttr::Process(s) => Some(s), _ => None }) {
+        parts.push(format!("process=\"{}\"", pr));
+    }
+    if attrs.iter().any(|a| matches!(a, p::RuleAttr::NoDerivCheck)) {
+        parts.push("no_derivcheck".to_string());
+    }
+    if attrs.iter().any(|a| matches!(a, p::RuleAttr::IsSapicRule)) {
+        parts.push("issapicrule".to_string());
+    }
+    if let Some(r) = attrs.iter().find_map(|a| match a {
+        p::RuleAttr::Role(r) => Some(r), _ => None }) {
+        parts.push(format!("role='{}'", r));
+    }
+    if parts.is_empty() { String::new() } else { format!("[{}]", parts.join(", ")) }
+}
+
 fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro]) -> String {
     let name = &parsed_rule.name;
     let mut out = String::new();
     out.push_str("rule (modulo E) ");
     out.push_str(name);
+    out.push_str(&render_rule_attributes(&parsed_rule.attributes));
     out.push_str(":\n");
     // Desugar `let x = t in ...` bindings before rendering — HS does
     // this via `applyMacroInProtoRule`/`expandRuleLetBlock` so the
@@ -891,7 +923,7 @@ fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro]) -> Str
     } else if let Some(r) = elab_rule {
         out.push_str("\n\n");
         out.push_str(&outer_loop_breaker);
-        out.push_str(&render_ac_variants_block(name, r));
+        out.push_str(&render_ac_variants_block(name, r, &parsed_rule.attributes));
     }
     out
 }
@@ -1041,10 +1073,10 @@ fn render_fact_inline(fa: &p::Fact) -> String {
 /// header — matching HS byte-for-byte for the AddPublicKey-style case
 /// where the AC body differs from the E body but no residual variant
 /// disjunction remains.
-fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule) -> String {
+fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule, attrs: &[p::RuleAttr]) -> String {
     let mut s = String::new();
     s.push_str("  /*\n");
-    s.push_str(&format!("  rule (modulo AC) {}:\n", name));
+    s.push_str(&format!("  rule (modulo AC) {}{}:\n", name, render_rule_attributes(attrs)));
     // Body of the abstracted rule.  Use the abstracted version when
     // available; fall back to the original facts.
     // Use the abstracted rule's facts when available; when `abstracted_rule`
@@ -1058,14 +1090,23 @@ fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule) -> 
     let prems = lnfacts_to_parser(&ac_rule.premises);
     let acts = lnfacts_to_parser(&ac_rule.actions);
     let concs = lnfacts_to_parser(&ac_rule.conclusions);
-    // Each line of the rule body needs an extra leading 2-space indent
-    // (we're inside the comment block, which already has 2 spaces).
-    let body = render_rule_body(&prems, &acts, &concs);
-    for line in body.split('\n') {
-        s.push_str("  ");
-        s.push_str(line);
-        s.push('\n');
-    }
+    // The comment block sits inside HS's `nest 2 (multiComment
+    // (prettyNamedRule …))` (ClosedTheory.hs:354), so the rule body's
+    // facts land at absolute column 5 (2 comment + 2 rule nest + 1
+    // bracket).  CRITICAL: render the body with the ENGINE aware of the
+    // full indent (nest 4 via indent=5) rather than rendering at the
+    // modulo-E indent and prepending 2 literal spaces per line — the
+    // prepend shifted every line +2 columns AFTER the HughesPJ width
+    // decisions were made, so lines within 2 columns of the boundary
+    // kept elements HS breaks (the spdm R_KE_Response tuple at visual
+    // col 111 vs HS's break at 95).
+    use crate::elaborate::canonicalize_ac_in_pfact;
+    let prems2: Vec<p::Fact> = prems.iter().map(canonicalize_ac_in_pfact).collect();
+    let acts2:  Vec<p::Fact> = acts.iter().map(canonicalize_ac_in_pfact).collect();
+    let concs2: Vec<p::Fact> = concs.iter().map(canonicalize_ac_in_pfact).collect();
+    let body = render_rule_body_at(&prems2, &acts2, &concs2, 5);
+    s.push_str(&body);
+    if !body.ends_with('\n') { s.push('\n'); }
     // HS `ppVariants (Disj [subst]) | subst == emptySubstVFresh = emptyDoc`
     // (Rule.hs:1289): skip the variants sub-block when there's no
     // residual disjunction beyond the identity.
@@ -2171,15 +2212,24 @@ fn pp_proof(
     // (`annotated == false`) gets the `/* unannotated */` comment beside
     // its method.  Fully-searched / successfully-replayed steps stay
     // `Just System` (annotated == true) and render without it.
-    let unann = if node.annotated { "" } else { " /* unannotated */" };
-    let step = pp_step_at(&node.method, depth * 2);
+    // HS `prettyIncrementalProof.ppStep` (ProofSkeleton.hs:80-84) wraps
+    // every step as `sep [prettyProofMethod, comment-or-empty]`, where
+    // `comment = multiComment_ ["unannotated"]` iff `psInfo == Nothing`
+    // (`annotated == false`).  `sep` lays method+comment inline when they
+    // fit the ribbon, else drops the comment to its OWN line at the
+    // step's base indent (`depth*2`).  We build the method as a Doc and
+    // run it through the same HughesPJ engine so the break is
+    // byte-identical to HS — replacing the prior literal-string append
+    // that always kept the comment inline.
+    let base = depth * 2;
+    let annotated = node.annotated;
     let cases: Vec<(&String, &crate::constraint::solver::search::ProofNode)> =
         node.children.iter().collect();
 
     match (&node.method, cases.as_slice()) {
         (ProofMethod::Finished(MR::Solved), []) => {
-            out.push_str(&step);
-            out.push_str(unann);
+            let doc = pp_step_doc(&node.method, base, "");
+            out.push_str(&pf::step_line_with_unann(doc, base, annotated));
         }
         (_, []) => {
             // No children: `by <step>` form.  HS `ppCases ps [] =
@@ -2189,30 +2239,16 @@ fn pp_proof(
             // HughesPJ counts the `by ` (3 cols) toward the ribbon when
             // deciding the `fsep`/`sep` break — so we must render `by ` as
             // line CONTENT, not as part of the indent (see `solve_line_render`;
-            // the NAXOS/KAS2 `Match( a,` / `<…>` divergence).  Route SolveGoal
-            // through the prefix-aware Doc builder at the bare proof indent;
-            // all other (non-wrapping) steps keep the simple string form.
-            use crate::constraint::constraints::Goal;
-            match &node.method {
-                ProofMethod::SolveGoal(g) => {
-                    let line = match g {
-                        Goal::Disj(d) if !d.0.is_empty() =>
-                            pf::solve_disj_goal_line_pfx(&d.0, depth * 2, "by "),
-                        _ =>
-                            pf::solve_goal_line_from_doc_pfx(solve_goal_to_doc(g), depth * 2, "by "),
-                    };
-                    out.push_str(&line);
-                }
-                _ => {
-                    out.push_str("by ");
-                    out.push_str(&pp_step_at(&node.method, depth * 2 + 3));
-                }
-            }
-            out.push_str(unann);
+            // the NAXOS/KAS2 `Match( a,` / `<…>` divergence).  The `by `
+            // prefix is `beside`-prepended into the method Doc by
+            // `pp_step_doc`, then `step_line_with_unann` appends the
+            // optional `/* unannotated */` via `sep`.
+            let doc = pp_step_doc(&node.method, base, "by ");
+            out.push_str(&pf::step_line_with_unann(doc, base, annotated));
         }
         (_, [(label, child)]) if label.is_empty() => {
-            out.push_str(&step);
-            out.push_str(unann);
+            let doc = pp_step_doc(&node.method, base, "");
+            out.push_str(&pf::step_line_with_unann(doc, base, annotated));
             out.push('\n');
             // HS `ppCases ps [("", prf)] = prettyStep ps $-$ ppPrf prf`
             // (Proof.hs:1086).  `$-$` is "above" — the child is rendered
@@ -2224,8 +2260,8 @@ fn pp_proof(
             pp_proof(child, out, depth);
         }
         (_, multi) => {
-            out.push_str(&step);
-            out.push_str(unann);
+            let doc = pp_step_doc(&node.method, base, "");
+            out.push_str(&pf::step_line_with_unann(doc, base, annotated));
             for (i, (name, child)) in multi.iter().enumerate() {
                 if i > 0 {
                     // HS Proof.hs:1089: `intersperse (prettyCase ps kwNext)`
@@ -2256,6 +2292,52 @@ fn pp_proof(
 #[allow(dead_code)]
 fn pp_step(m: &crate::constraint::solver::proof_method::ProofMethod) -> String {
     pp_step_at(m, 0)
+}
+
+/// Build the proof-step method as a `pretty_hpj::Doc`, mirroring
+/// `pp_step_at` but yielding a Doc (so it can be combined with the
+/// `/* unannotated */` comment via `sep`, per HS
+/// `prettyIncrementalProof.ppStep`, ProofSkeleton.hs:80-84).
+///
+/// `prefix` is the leaf-step keyword (`"by "` for childless steps, `""`
+/// otherwise); it is laid out BESIDE the method as line content (NOT
+/// folded into the indent) so HughesPJ counts its columns toward the
+/// ribbon, identical to `solve_line_render`/`pp_proof`'s string path.
+///
+/// `base_indent` is the column where the step's first char lands; used
+/// by the SolveGoal goal builders so wrapped continuation lines indent
+/// to the column after `solve( ` (= base_indent + len(prefix) + 7).
+fn pp_step_doc(
+    m: &crate::constraint::solver::proof_method::ProofMethod,
+    base_indent: usize,
+    prefix: &str,
+) -> crate::pretty_hpj::Doc {
+    use crate::constraint::constraints::Goal;
+    use crate::constraint::solver::proof_method::ProofMethod as PM;
+    use crate::pretty_hpj::Doc;
+    // `solve( <goal> )` builds its own goal Doc; everything else is a
+    // flat string with no internal wrapping, so `Doc::text` of the
+    // string form is faithful.
+    let body = match m {
+        PM::SolveGoal(g) => {
+            let inner = match g {
+                Goal::Disj(d) if !d.0.is_empty() => pf::disj_goal_to_doc(&d.0),
+                _ => solve_goal_to_doc(g),
+            };
+            Doc::text("solve(")
+                .beside_sp(inner)
+                .beside_sp(Doc::text(")"))
+        }
+        // For non-SolveGoal methods the goal indent argument is unused;
+        // reuse `pp_step_at`'s string form.  `by `-prefixed leaf steps
+        // (e.g. `by sorry`) render the method at the post-prefix column.
+        _ => Doc::text(pp_step_at(m, base_indent + prefix.chars().count())),
+    };
+    if prefix.is_empty() {
+        body
+    } else {
+        Doc::text(prefix).beside(body)
+    }
 }
 
 fn pp_step_at(m: &crate::constraint::solver::proof_method::ProofMethod, indent: usize) -> String {

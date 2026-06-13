@@ -41,6 +41,11 @@ JOBS="${JOBS:-$(nproc)}"
 EXTRA_ENV="${EXTRA_ENV:-}"
 CORPUS_ROOT="${CORPUS_ROOT:-/home/parallels/tamarin-prover/examples}"
 CACHE_VERSION="${CACHE_VERSION:-1}"
+# Deriv-check timeout (secs) passed to BOTH binaries so the message-derivation
+# section compares deterministically.  HS default 5s fires on heavy theories
+# (records a "Derivation checks timed out" placeholder) while RS computes fully
+# — a spurious DIFF.  30s lets both compute fully (deriv-check verified faithful).
+DERIVCHECK_TIMEOUT="${DERIVCHECK_TIMEOUT:-30}"
 HS_CANON_CACHE="${HS_CANON_CACHE:-$script_dir/.hs_canon_cache}"
 NO_HS_CACHE="${NO_HS_CACHE:-}"
 [ -n "$NO_HS_CACHE" ] || mkdir -p "$HS_CANON_CACHE" 2>/dev/null || true
@@ -132,7 +137,7 @@ strip_env_lines() {
 }
 export -f hs_cache_key lemmas_of strip_env_lines
 export HS_PATH="$hs_path" RS_PATH="$rs_path" TIMEOUT RS_TIMEOUT EXTRA_ENV \
-       HS_CANON_CACHE CACHE_VERSION NO_HS_CACHE
+       HS_CANON_CACHE CACHE_VERSION NO_HS_CACHE DERIVCHECK_TIMEOUT
 
 # --- Per-lemma worker. Emits ONE machine-parseable line:
 #       <file>\t<lemma>\t<status>\t<hs_lines>\t<rs_lines>\t<diff>\t<hs_ms>\t<rs_ms>
@@ -161,7 +166,7 @@ worker() {
             > "$hs_out"
     else
         local hs_t0; hs_t0=$(date +%s%3N)
-        timeout "$TIMEOUT" "$HS_PATH" +RTS -N1 -RTS --prove="$lemma" "$f" 2>/dev/null > "$hs_out"
+        timeout "$TIMEOUT" "$HS_PATH" +RTS -N1 -RTS --derivcheck-timeout="$DERIVCHECK_TIMEOUT" --prove="$lemma" "$f" 2>/dev/null > "$hs_out"
         hs_rc=$?
         hs_ms=$(( $(date +%s%3N) - hs_t0 ))
         if [ -n "$key" ]; then
@@ -187,7 +192,7 @@ worker() {
     fi
 
     local rs_t0; rs_t0=$(date +%s%3N)
-    timeout "$RS_TIMEOUT" env $EXTRA_ENV "$RS_PATH" --prove="$lemma" "$f" 2>/dev/null > "$tmp/rs.out"
+    timeout "$RS_TIMEOUT" env $EXTRA_ENV "$RS_PATH" --derivcheck-timeout="$DERIVCHECK_TIMEOUT" --prove="$lemma" "$f" 2>/dev/null > "$tmp/rs.out"
     local rs_rc=$?
     local rs_ms=$(( $(date +%s%3N) - rs_t0 ))
 

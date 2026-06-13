@@ -220,7 +220,7 @@ fn try_hide_action(v: &NodeId, sys: System) -> Result<System, System> {
         }
     }
     // Remove KU action goals at v.
-    new_sys.goals.retain(|(g, _)| match g {
+    new_sys.goals_mut().retain(|(g, _)| match g {
         Goal::Action(n, fa) => !(n == v && matches!(fa.tag, FactTag::Ku)),
         _ => true,
     });
@@ -289,7 +289,7 @@ fn try_hide_rule(v: &NodeId, ru: RuleACInst, sys: System) -> Result<System, Syst
             new_sys.edges.push(e);
         }
     }
-    new_sys.nodes.retain(|(id, _)| id != v);
+    new_sys.nodes_mut().retain(|(id, _)| id != v);
     Ok(new_sys)
 }
 

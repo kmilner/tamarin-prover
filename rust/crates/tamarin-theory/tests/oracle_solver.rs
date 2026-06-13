@@ -1215,7 +1215,7 @@ fn probe_nspk3_cyclic_leaf() {
         use tamarin_term::lterm::HasFrees;
         let mut fresh_consumers: Vec<(tamarin_term::lterm::LVar,
             tamarin_term::lterm::LVar, String)> = Vec::new();
-        for (id, ru) in &leaf.sys.nodes {
+        for (id, ru) in leaf.sys.nodes.iter() {
             for prem in &ru.premises {
                 if matches!(prem.tag, tamarin_theory::fact::FactTag::Fresh) {
                     let mut vars = Vec::new();
@@ -1314,7 +1314,7 @@ fn probe_chaum_unforgeability() {
                     eprintln!("  case: {}", name);
                     // Dump key state for diffing
                     eprintln!("    nodes ({}):", case_sys.nodes.len());
-                    for (id, ru) in &case_sys.nodes {
+                    for (id, ru) in case_sys.nodes.iter() {
                         let ru_dbg = format!("{:?}", ru).chars().take(140).collect::<String>();
                         eprintln!("      #{:?} → {}", id, ru_dbg);
                     }
@@ -1577,7 +1577,7 @@ fn probe_cr_executable() {
                 if matches!(c, Some(Contradiction::Cyclic)) {
                     eprintln!("\n== CYCLIC LEAF at depth {} ==", depth);
                     eprintln!("nodes ({}):", node.sys.nodes.len());
-                    for (id, rule) in &node.sys.nodes {
+                    for (id, rule) in node.sys.nodes.iter() {
                         let name = tamarin_theory::constraint::solver::reduction::rule_case_name(rule);
                         let ku_acts: Vec<_> = rule.actions.iter()
                             .filter(|a| matches!(a.tag, tamarin_theory::fact::FactTag::Ku))

@@ -103,6 +103,38 @@ fn prepend_theory_dir_to_oracle_paths(
 /// `ProofContext` we recover that cost; per-lemma we still run the
 /// lightweight `ensure_saturated` (each lemma needs its own
 /// `typing_assumptions`-refined source cases).
+/// One theory-level cache entry of refined source cases — the result of
+/// a `ctx.ensure_saturated()` pass, snapshotted per `Source` by goal.
+/// Keyed (in [`ProverSession::source_cache`]) by the SORTED set of
+/// `[sources]`-lemma names folded into `typing_assumptions`.
+///
+/// Why this is safe to share across lemmas (lever #3 — HS computes
+/// `_crcRefinedSources` ONCE per `ClosedRuleCache` and reuses it for
+/// every lemma; RuleItem.hs:64-69, Prover.hs:170-184):
+///   * The saturated+refined cases are a pure function of the (shared
+///     template) raw sources + rules + restrictions + `typing_assumptions`.
+///     Two lemmas with the same source-name key feed identical inputs, so
+///     they produce identical cases.
+///   * We ONLY cache (and therefore only reuse) entries whose producing
+///     `ensure_saturated` consumed ZERO fresh Maude vars (`delta == 0`).
+///     With no fresh allocation the cases embed only template-sourced var
+///     indices (shared, identical across clones) AND the per-lemma
+///     fresh-counter trajectory is unperturbed — so a cache hit is
+///     byte-identical to recomputing, both in the cases and in the counter
+///     state the subsequent proof search starts from.  `delta` is
+///     deterministic for a given key, so a key that cached once (delta 0)
+///     yields delta 0 on every hit.  Sources lemmas (which DO allocate,
+///     e.g. NSLPK3 `types` delta=5, and carry a self-excluded key) are
+///     never cached and keep recomputing — they are rare and proved once.
+struct CachedSources {
+    /// Per source: (goal join-key, refined case list, incomplete flag).
+    sources: Vec<(
+        crate::constraint::constraints::Goal,
+        Vec<(Vec<String>, crate::constraint::system::System)>,
+        bool,
+    )>,
+}
+
 pub struct ProverSession {
     /// Elaborated typed theory.  Used to look up lemmas, restrictions,
     /// rules, heuristic.  Constructed once.
@@ -144,6 +176,15 @@ pub struct ProverSession {
     /// Drives the counter-bump trajectory.  Use `AtomicU64` so the
     /// session can stay `&self` to its callers.
     lemma_idx: std::sync::atomic::AtomicU64,
+    /// Lever #3 — shared refined-source cache (see [`CachedSources`]).
+    /// Keyed by the sorted `[sources]`-lemma name set.  Populated lazily
+    /// on the first lemma of each key; reused by all later lemmas with the
+    /// same key (every normal lemma shares the all-sources key), letting
+    /// the expensive `saturate_sources_with_simp` pass run once per theory
+    /// instead of once per lemma.  `Mutex` keeps the session `&self`.
+    source_cache: std::sync::Mutex<
+        std::collections::HashMap<Vec<String>, CachedSources>,
+    >,
 }
 
 /// Compute the cumulative setup-counter advance the non-session
@@ -208,6 +249,7 @@ impl ProverSession {
             setup_counter_delta,
             setup_counter_before,
             lemma_idx: std::sync::atomic::AtomicU64::new(0),
+            source_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 }
@@ -348,6 +390,12 @@ fn prove_lemma_in_session_mode(
     ctx.lemma_name = lemma_name.to_string();
     ctx.theory_file = session_in_file.clone();
     let mut typing_assumptions: Vec<Guarded> = Vec::new();
+    // `source_key` identifies the refined-source computation: the SORTED
+    // set of `[sources]`-lemma names folded into `typing_assumptions`.
+    // Every normal lemma yields the full set (the current lemma, being
+    // normal, is never a `[sources]` lemma so the `continue` below never
+    // fires for it); a `[sources]` lemma yields the set minus itself.
+    let mut source_key: Vec<String> = Vec::new();
     for prior in theory.lemmas() {
         if prior.name == lemma_name { continue; }
         if !prior.attributes.iter().any(|a| matches!(a, crate::theory::LemmaAttr::Sources)) {
@@ -358,14 +406,61 @@ fn prove_lemma_in_session_mode(
         }
         if let Ok(rg) = formula_to_guarded(&prior.formula) {
             typing_assumptions.push(rg);
+            source_key.push(prior.name.clone());
         }
     }
+    source_key.sort();
     ctx.typing_assumptions = typing_assumptions;
     let t_sat: Option<std::time::Instant> =
         if trace { Some(std::time::Instant::now()) } else { None };
-    ctx.ensure_saturated();
-    if trace { eprintln!("[phase] (session) ensure_saturated dt={:.3}s",
-        t_sat.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64())); }
+    // Lever #3: reuse a previously-computed refined-source set when one
+    // exists for this exact `source_key`.  See [`CachedSources`] for why a
+    // hit is byte-identical (only delta==0 results are ever cached).
+    let cache_disabled = std::env::var("TAM_RS_NO_SOURCE_CACHE").is_ok();
+    let mut cache_hit = false;
+    if !cache_disabled {
+        let guard = session.source_cache.lock().unwrap();
+        if let Some(entry) = guard.get(&source_key) {
+            // Restore cached cases onto this clone's lazy sources by goal,
+            // then mark saturation Done so `cases(ctx)` reads them directly
+            // and the expensive `ensure_saturated` pass is skipped.
+            for src in &mut ctx.full_sources {
+                if let Some((_, cases, incomplete)) =
+                    entry.sources.iter().find(|(g, _, _)| *g == src.goal)
+                {
+                    src.cases_set_list(cases.clone());
+                    src.incomplete = *incomplete;
+                }
+            }
+            ctx.mark_saturated_done();
+            cache_hit = true;
+        }
+    }
+    if !cache_hit {
+        let cnt_before = ctx.maude.fresh_counter_peek();
+        ctx.ensure_saturated();
+        let delta = ctx.maude.fresh_counter_peek().saturating_sub(cnt_before);
+        if std::env::var("TAM_DBG_SAT_COUNTER").is_ok() {
+            eprintln!("[SAT_COUNTER] lemma={} key={:?} delta={} (computed)",
+                lemma_name, source_key, delta);
+        }
+        // Only cache results that allocated NO fresh vars — those are the
+        // ones safe to replay byte-identically (counter unperturbed, cases
+        // carry only template-sourced var indices).  Sources lemmas (delta
+        // > 0) keep recomputing.
+        if !cache_disabled && delta == 0 {
+            let snapshot: Vec<_> = ctx.full_sources.iter()
+                .map(|s| (s.goal.clone(), s.cases_or_empty_list(), s.incomplete))
+                .collect();
+            session.source_cache.lock().unwrap()
+                .entry(source_key)
+                .or_insert(CachedSources { sources: snapshot });
+        }
+    } else if std::env::var("TAM_DBG_SAT_COUNTER").is_ok() {
+        eprintln!("[SAT_COUNTER] lemma={} key={:?} (cache hit)", lemma_name, source_key);
+    }
+    if trace { eprintln!("[phase] (session) ensure_saturated dt={:.3}s hit={}",
+        t_sat.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64()), cache_hit); }
     if std::env::var("TAM_RS_DBG_PHASE").is_ok() {
         eprintln!("[rs-phase] lemma-proof START");
     }
@@ -732,7 +827,7 @@ mod tests {
             node.sys.goals.len(), node.sys.nodes.len(), node.sys.formulas.len(),
             node.sys.less_atoms.len(), node.sys.edges.len(), reason);
         if depth > 0 {
-            for (id, ru) in &node.sys.nodes {
+            for (id, ru) in node.sys.nodes.iter() {
                 let info = match &ru.info {
                     crate::rule::RuleInfo::Proto(p) => format!("{:?}", p.name),
                     crate::rule::RuleInfo::Intr(i) => format!("Intr({:?})", i),

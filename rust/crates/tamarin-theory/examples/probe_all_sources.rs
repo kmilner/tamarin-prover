@@ -28,7 +28,7 @@ fn main() {
             if let Some(ref c) = only_case { if c != n { continue; } }
             println!("    --- case: {} ---", n);
             println!("    nodes: {}", sys.nodes.len());
-            for (id, ru) in &sys.nodes {
+            for (id, ru) in sys.nodes.iter() {
                 let info = match &ru.info {
                     tamarin_theory::rule::RuleInfo::Proto(p) =>
                         format!("Proto({:?})", p.name),
@@ -48,7 +48,7 @@ fn main() {
                 println!("      {:?} → {:?}", v, t);
             }
             println!("    goals:");
-            for (g, st) in &sys.goals {
+            for (g, st) in sys.goals.iter() {
                 let solved = if st.solved { "S" } else { "-" };
                 println!("      [{}] {:?}", solved, g);
             }

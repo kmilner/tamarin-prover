@@ -110,7 +110,7 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
     // relation for cycle detection. Without this, RS misses cycles HS
     // catches when the cycle goes through an open chain. Root cause of
     // StatVerif KU(pcs) saturate over-enumeration.
-    for (g, st) in &sys.goals {
+    for (g, st) in sys.goals.iter() {
         if st.solved { continue; }
         if let crate::constraint::constraints::Goal::Chain(c, p) = g {
             all_less.push(LessAtom {
@@ -239,7 +239,7 @@ fn has_non_normal_terms(ctx: &ProofContext, sys: &System) -> bool {
     // ∘ `maybeNotNfSubterms`.
     let mut candidates: std::collections::BTreeSet<tamarin_term::lterm::LNTerm>
         = std::collections::BTreeSet::new();
-    for (_, rule) in &sys.nodes {
+    for (_, rule) in sys.nodes.iter() {
         for f in rule.premises.iter().chain(&rule.conclusions).chain(&rule.actions) {
             for t in &f.terms {
                 maybe_not_nf_subterms(irreducible, t, &mut candidates);
@@ -326,7 +326,7 @@ fn has_impossible_chain(ctx: &ProofContext, sys: &System) -> bool {
     use crate::fact::FactTag;
     let dbg = std::env::var("TAM_RS_DBG_IMPOSSIBLE_CHAIN").is_ok();
 
-    for (g, st) in &sys.goals {
+    for (g, st) in sys.goals.iter() {
         if st.solved { continue; }
         let Goal::Chain(c, p) = g else { continue };
         let c_rule = sys.nodes.iter().find(|(id, _)| id == &c.0)
@@ -573,7 +573,7 @@ fn possible_root_syms(
 fn has_forbidden_kd(sys: &System) -> bool {
     use crate::fact::FactTag;
     if sys.side.is_some() { return false; } // diff-system guard
-    for (_, rule) in &sys.nodes {
+    for (_, rule) in sys.nodes.iter() {
         for fa in &rule.conclusions {
             if !matches!(fa.tag, FactTag::Kd) { continue; }
             let Some(t) = fa.terms.first() else { continue };
@@ -704,7 +704,7 @@ fn has_forbidden_chain(sys: &System) -> bool {
         }
     }
 
-    for (g, st) in &sys.goals {
+    for (g, st) in sys.goals.iter() {
         if st.solved { continue; }
         let Goal::Chain(c, p) = g else { continue };
         // Look up the chain-conc fact.
@@ -763,7 +763,7 @@ fn has_forbidden_chain(sys: &System) -> bool {
         // case survival.
         //
         // Walk node actions first:
-        for (id, rule) in &sys.nodes {
+        for (id, rule) in sys.nodes.iter() {
             for fa in &rule.actions {
                 if !matches!(fa.tag, FactTag::Ku) { continue; }
                 let t_ku = match fa.terms.first() { Some(t) => t, None => continue };
@@ -775,7 +775,7 @@ fn has_forbidden_chain(sys: &System) -> bool {
             }
         }
         // Then walk unsolved ActionG goals (HS's `unsolvedActionAtoms`):
-        for (g, gst) in &sys.goals {
+        for (g, gst) in sys.goals.iter() {
             if gst.solved { continue; }
             let Goal::Action(id, fa) = g else { continue };
             if !matches!(fa.tag, FactTag::Ku) { continue; }
@@ -898,7 +898,7 @@ fn has_forbidden_exp(sys: &System) -> bool {
     // `rActs` lists of each node.  Returns (NodeId, fact, term).
     // For "knownEarlier" we only need (NodeId, term).
     let mut all_ku: Vec<(NodeId, LNTerm)> = Vec::new();
-    for (g, st) in &sys.goals {
+    for (g, st) in sys.goals.iter() {
         if st.solved { continue; }
         if let crate::constraint::constraints::Goal::Action(i, fa) = g {
             if matches!(fa.tag, FactTag::Ku) {
@@ -908,7 +908,7 @@ fn has_forbidden_exp(sys: &System) -> bool {
             }
         }
     }
-    for (id, rule) in &sys.nodes {
+    for (id, rule) in sys.nodes.iter() {
         for fa in &rule.actions {
             if matches!(fa.tag, FactTag::Ku) {
                 if let Some(m) = fa.terms.first() {
@@ -919,7 +919,7 @@ fn has_forbidden_exp(sys: &System) -> bool {
     }
 
     // Mirror HS `forbiddenDExp` exactly.
-    for (i, ru) in &sys.nodes {
+    for (i, ru) in sys.nodes.iter() {
         // Only intruder DestrRules can be exp-down; cheap pre-filter.
         if !matches!(&ru.info,
             RuleInfo::Intr(IntrRuleACInfo::DestrRule(_, _, _, _)))
@@ -1415,7 +1415,7 @@ fn has_sort_conflated_lvars(sys: &System) -> bool {
             }
         }
     };
-    for (id, rule) in &sys.nodes {
+    for (id, rule) in sys.nodes.iter() {
         id.for_each_free(&mut visit);
         rule.for_each_free(&mut visit);
         if *conflict.borrow() { return true; }
@@ -1431,7 +1431,7 @@ fn has_sort_conflated_lvars(sys: &System) -> bool {
         if *conflict.borrow() { return true; }
     }
     if let Some(la) = &sys.last_atom { la.for_each_free(&mut visit); }
-    for (g, _) in &sys.goals {
+    for (g, _) in sys.goals.iter() {
         match g {
             crate::constraint::constraints::Goal::Action(n, fa) => {
                 n.for_each_free(&mut visit);
@@ -1473,7 +1473,7 @@ fn has_fresh_fact_sort_violation(sys: &System) -> bool {
     use tamarin_term::vterm::Lit;
     use crate::fact::FactTag;
     let subst = &sys.eq_store.subst;
-    for (_, rule) in &sys.nodes {
+    for (_, rule) in sys.nodes.iter() {
         // Check premises (where Fr lives) and conclusions/actions
         // for completeness — any Fresh-tagged fact with a non-Fresh
         // term is a sort violation.
@@ -1652,11 +1652,11 @@ fn node_after_last(sys: &System) -> Vec<Contradiction> {
     }
     // isInTrace: collect every node-id that is "in the trace".
     let mut in_trace: BTreeSet<NodeId> = BTreeSet::new();
-    for (id, _) in &sys.nodes {
+    for (id, _) in sys.nodes.iter() {
         in_trace.insert(id.clone());
     }
     in_trace.insert(last.clone()); // isLast is true for `last`
-    for (g, st) in &sys.goals {
+    for (g, st) in sys.goals.iter() {
         if st.solved { continue; }
         if let crate::constraint::constraints::Goal::Action(id, _) = g {
             in_trace.insert(id.clone());
@@ -1688,7 +1688,7 @@ pub fn maybe_non_normal_terms(
 ) -> Vec<tamarin_term::lterm::LNTerm> {
     let mut candidates: std::collections::BTreeSet<tamarin_term::lterm::LNTerm>
         = std::collections::BTreeSet::new();
-    for (_, rule) in &sys.nodes {
+    for (_, rule) in sys.nodes.iter() {
         for f in rule.premises.iter().chain(&rule.conclusions).chain(&rule.actions) {
             for t in &f.terms {
                 maybe_not_nf_subterms(irreducible, t, &mut candidates);

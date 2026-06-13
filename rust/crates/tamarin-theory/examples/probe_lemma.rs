@@ -74,7 +74,7 @@ fn main() {
             if dump_at_depth == Some(depth) {
                 println!("{}=== FULL DUMP at depth {} ===", pad, depth);
                 println!("{}-- nodes --", pad);
-                for (id, ru) in &node.sys.nodes {
+                for (id, ru) in node.sys.nodes.iter() {
                     println!("{}  {:?} → {}", pad, id,
                         tamarin_theory::constraint::solver::reduction::rule_case_name(ru));
                     for (i, p) in ru.premises.iter().enumerate() {
@@ -100,7 +100,7 @@ fn main() {
                     println!("{}-- last_atom: {:?} --", pad, la);
                 }
                 println!("{}-- goals --", pad);
-                for (g, st) in &node.sys.goals {
+                for (g, st) in node.sys.goals.iter() {
                     println!("{}  solved={} loop={} {:?}", pad, st.solved, st.looping, g);
                 }
                 println!("{}-- subst --", pad);
@@ -168,7 +168,7 @@ fn main() {
         if let Some(leaf) = find_solved(&root) {
             println!("--- SOLVED LEAF ---");
             println!("nodes ({}):", leaf.sys.nodes.len());
-            for (id, ru) in &leaf.sys.nodes {
+            for (id, ru) in leaf.sys.nodes.iter() {
                 println!("  {:?} -> {:?}", id, tamarin_theory::constraint::solver::reduction::rule_case_name(ru));
                 for (i, p) in ru.premises.iter().enumerate() {
                     println!("    prem[{}]: {:?}({:?})", i, p.tag, p.terms);
@@ -185,7 +185,7 @@ fn main() {
                 println!("  {:?} -> {:?}", e.src, e.tgt);
             }
             println!("goals ({}):", leaf.sys.goals.len());
-            for (g, st) in &leaf.sys.goals {
+            for (g, st) in leaf.sys.goals.iter() {
                 println!("  solved={} {:?}", st.solved, g);
             }
             println!("less_atoms ({}):", leaf.sys.less_atoms.len());

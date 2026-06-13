@@ -791,28 +791,37 @@ fn rule_to_proto_rule_e(r: &p::Rule) -> Result<ProtoRuleE, ElabError> {
 /// Desugar a rule's `let x_1 = t_1 ... x_n = t_n in body` block by
 /// substituting each binding's RHS for occurrences of the LHS in the
 /// body (premises, actions, conclusions, embedded restrictions).
-/// Bindings are sequential — later bindings see earlier substitutions
-/// applied. Mirrors Haskell tamarin's rule-let desugaring.
+///
+/// HS `letBlock` (Parser/Let.hs:34): `toSubst = foldr1 compose . map
+/// (substFromList . return)` with `compose s1 s2` = "apply s2 first,
+/// then s1" (SubstVFree.hs:188-194).  `foldr1 compose [b1..bn]` is
+/// therefore equivalent to applying each binding as a SINGLETON
+/// substitution sequentially in REVERSE binding order ("bottom-up
+/// application semantics", Let.hs:22).  Consequences:
+///   * backward references expand: binding i's RHS, once introduced
+///     into the body at step i, is rewritten by the later-applied
+///     steps j < i;
+///   * FORWARD references survive as free variables: by the time an
+///     early binding introduces a later binding's name into the body,
+///     that later binding has already been applied (spdm's `cipher_in
+///     = senc(message_in, resp_master_secret)` with
+///     `resp_master_secret` defined 20 lines below keeps it as a free
+///     Msg-var in the rule — semantically MORE GENERAL than the
+///     expanded term, affecting unification and proof search).
+///
+/// The previous implementation pre-expanded each RHS with earlier
+/// bindings and applied all bindings to the body in FORWARD order,
+/// which wrongly expanded forward references.
 pub fn apply_let_block(r: &p::Rule) -> p::Rule {
     let mut out = r.clone();
     let bindings = std::mem::take(&mut out.let_block);
 
-    // Apply each binding in order, accumulating later RHS rewrites with
-    // earlier substitutions already baked in.
-    let mut applied: Vec<(p::Term, p::Term)> = Vec::new();
-    for b in bindings {
-        let mut value = b.value;
-        for (k, v) in &applied {
-            value = subst_term(&value, k, v);
-        }
-        applied.push((b.var, value));
-    }
-    for (k, v) in &applied {
-        for f in &mut out.premises    { subst_fact_in_place(f, k, v); }
-        for f in &mut out.actions     { subst_fact_in_place(f, k, v); }
-        for f in &mut out.conclusions { subst_fact_in_place(f, k, v); }
+    for b in bindings.iter().rev() {
+        for f in &mut out.premises    { subst_fact_in_place(f, &b.var, &b.value); }
+        for f in &mut out.actions     { subst_fact_in_place(f, &b.var, &b.value); }
+        for f in &mut out.conclusions { subst_fact_in_place(f, &b.var, &b.value); }
         for phi in &mut out.embedded_restrictions {
-            subst_formula_in_place(phi, k, v);
+            subst_formula_in_place(phi, &b.var, &b.value);
         }
     }
     out
@@ -1697,6 +1706,33 @@ mod tests {
                 other => panic!("expected h(~k), got h({:?})", other),
             },
             other => panic!("expected h(~k), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn let_block_forward_reference_stays_free() {
+        // HS bottom-up semantics (Parser/Let.hs:22,34): a binding whose
+        // RHS references a LATER binding keeps that name as a free var —
+        // by the time `a`'s application introduces `b` into the body,
+        // `b`'s singleton substitution has already been applied.
+        //   let a = h(b) b = ~k in [In(a), Fr(~k)]
+        // After desugaring: In(h(b)) with `b` a free Msg-var, NOT h(~k).
+        let src = r#"theory T begin
+            rule R: let a = h(b) b = ~k in [In(a), Fr(~k)] --[]-> []
+        end"#;
+        let p = parse_theory(src, &[]).unwrap();
+        let r = match &p.items[0] {
+            p::TheoryItem::Rule(r) => r, _ => unreachable!(),
+        };
+        let desugared = apply_let_block(r);
+        let in_fact = &desugared.premises[0];
+        match &in_fact.args[0] {
+            p::Term::App(name, args) if name == "h" => match &args[0] {
+                p::Term::Var(vs) if vs.name == "b"
+                    && vs.sort != p::SortHint::Fresh => {}
+                other => panic!("expected h(b) with free b, got h({:?})", other),
+            },
+            other => panic!("expected h(b), got {:?}", other),
         }
     }
 

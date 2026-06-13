@@ -108,7 +108,7 @@ pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
         if std::env::var("TAM_RS_DBG_SOLVED_GOALS").as_deref() == Ok("1") {
             use crate::constraint::constraints::Goal;
             eprintln!("[SOLVED_GOALS] all open_goals empty. Showing all goal statuses:");
-            for (g, st) in &sys.goals {
+            for (g, st) in sys.goals.iter() {
                 let kind = match g {
                     Goal::Action(_, fa) => format!("Action({:?})", fa.tag),
                     Goal::Premise(_, fa) => format!("Premise({:?})", fa.tag),
@@ -135,7 +135,7 @@ pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
                 sys.lemmas.len(), sys.edges.len(),
                 sys.eq_store.subst.to_list().len());
             eprintln!("[SOLVED_DUMP]   nodes:");
-            for (id, r) in &sys.nodes {
+            for (id, r) in sys.nodes.iter() {
                 let acts: Vec<String> = r.actions.iter()
                     .map(|a| format!("{:?}({:?})", a.tag,
                         a.terms.iter().map(|t| format!("{:?}", t).chars().take(80).collect::<String>())
@@ -179,7 +179,7 @@ pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
                     e.tgt.0.name, e.tgt.0.idx, tgt_rule, e.tgt.1.0);
             }
             eprintln!("[SOLVED_DUMP]   node-premises by node:");
-            for (id, r) in &sys.nodes {
+            for (id, r) in sys.nodes.iter() {
                 let prems: Vec<String> = r.premises.iter()
                     .map(|f| format!("{:?}", f.tag))
                     .collect();

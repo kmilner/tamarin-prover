@@ -812,7 +812,7 @@ fn case_has_impossible_open_chain(
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
 
-    for (g, st) in &sys.goals {
+    for (g, st) in sys.goals.iter() {
         if st.solved { continue; }
         let Goal::Chain(c, p) = g else { continue; };
         let c_rule = sys.nodes.iter().find(|(id, _)| id == &c.0).map(|(_, r)| r);
@@ -1072,7 +1072,7 @@ fn saturate_sources_inner_with_options(
             for (name, sys) in src.cases_or_empty() {
                 if !name.contains("Serv_1") { continue; }
                 eprintln!("[sat_serv1]   case={} (BEFORE saturate)", name);
-                for (id, ru) in &sys.nodes {
+                for (id, ru) in sys.nodes.iter() {
                     let nm = crate::constraint::solver::reduction::rule_case_name(ru);
                     if nm != "Serv_1" && nm != "Register_pk" { continue; }
                     eprintln!("[sat_serv1]     node {}.{} → {}", id.name, id.idx, nm);
@@ -1104,7 +1104,7 @@ fn saturate_sources_inner_with_options(
                 for (name, sys) in src.cases_or_empty() {
                     if !name.contains("Serv_1") { continue; }
                     eprintln!("[sat_serv1] iter={} case={}", iter, name);
-                    for (id, ru) in &sys.nodes {
+                    for (id, ru) in sys.nodes.iter() {
                         let nm = crate::constraint::solver::reduction::rule_case_name(ru);
                         if nm != "Serv_1" && nm != "Register_pk" { continue; }
                         eprintln!("[sat_serv1]   node {}.{} → {}", id.name, id.idx, nm);
@@ -2200,7 +2200,7 @@ fn saturate_out_premise(
         if any_serv {
             eprintln!("[sat_out_prem] AFTER solve_premise_goal: outer={} fa.tag={:?}",
                 outer_name, fa.tag);
-            for (id, ru) in &red.sys.nodes {
+            for (id, ru) in red.sys.nodes.iter() {
                 let nm = crate::constraint::solver::reduction::rule_case_name(ru);
                 if nm == "Serv_1" || nm == "Register_pk" {
                     eprintln!("[sat_out_prem]   node {}.{} → {}", id.name, id.idx, nm);
@@ -2650,7 +2650,7 @@ fn saturate_out_premise(
                 eprintln!("\n[branch] outer={} sub_name={:?} idx={}",
                     outer_name, sub_name, idx);
                 eprintln!("  nodes ({}):", s.nodes.len());
-                for (nid, rule) in &s.nodes {
+                for (nid, rule) in s.nodes.iter() {
                     let rname = format!("{:?}", rule.info)
                         .chars().take(80).collect::<String>();
                     eprintln!("    {:?} → {}", nid, rname);
@@ -2860,7 +2860,7 @@ fn saturate_ku_action_via_sources(
         // Without this, the KU sub-goal stays open in the
         // saturated case-system and runtime's smartRanking picks
         // it instead of the protocol-rule-driven sub-goal.
-        for (g, st) in sub.sys.goals.iter_mut() {
+        for (g, st) in sub.sys.goals_mut().iter_mut() {
             if g == &live_goal { st.solved = true; break; }
         }
         // Haskell `refineSource.combine` (Sources.hs:135-137):
@@ -2935,7 +2935,7 @@ fn apply_lvar_subst(
             else { v }
         } else { v }
     };
-    out.nodes = out.nodes.into_iter()
+    out.nodes = std::sync::Arc::new(std::sync::Arc::unwrap_or_clone(out.nodes).into_iter()
         .map(|(id, ru)| {
             let new_id = if let Some(t) = subst.get(&id) {
                 if let Term::Lit(Lit::Var(nv)) = t { nv.clone() }
@@ -2943,7 +2943,7 @@ fn apply_lvar_subst(
             } else { id };
             (new_id, ru.map_free(&mut |v| map_var(v)))
         })
-        .collect();
+        .collect());
     out.edges = out.edges.into_iter()
         .map(|e| {
             let new_src = if let Some(t) = subst.get(&e.src.0) {
@@ -2969,7 +2969,7 @@ fn apply_lvar_subst(
             crate::constraint::constraints::LessAtom::new(smaller, larger, l.reason)
         })
         .collect();
-    out.goals = out.goals.into_iter()
+    out.goals = std::sync::Arc::new(std::sync::Arc::unwrap_or_clone(out.goals).into_iter()
         .map(|(g, st)| {
             let g2 = match g {
                 crate::constraint::constraints::Goal::Premise(p, fa) => {
@@ -2992,7 +2992,7 @@ fn apply_lvar_subst(
             };
             (g2, st)
         })
-        .collect();
+        .collect());
     // Also rewrite the eq_store: both the free subst (keys + RHS
     // terms) and the conjunctive disj substs.  Without this, the
     // saturate's sort-narrowing rewrites system nodes from
@@ -3056,7 +3056,7 @@ fn system_max_idx(sys: &System) -> u64 {
         let cur = max.get();
         if v.idx > cur { max.set(v.idx); }
     };
-    for (id, ru) in &sys.nodes {
+    for (id, ru) in sys.nodes.iter() {
         id.for_each_free(&mut visit);
         ru.for_each_free(&mut visit);
     }
@@ -3072,7 +3072,7 @@ fn system_max_idx(sys: &System) -> u64 {
         la.for_each_free(&mut visit);
     }
     // Goals: walk node-ids and fact terms.
-    for (g, _) in &sys.goals {
+    for (g, _) in sys.goals.iter() {
         match g {
             Goal::Action(i, fa) => {
                 i.for_each_free(&mut visit);
@@ -3204,7 +3204,7 @@ pub fn refine_with_source_asms(
             sys.formulas.clear();
             sys.solved_formulas.clear();
             sys.invalidate_max_var_idx_cache();
-            sys.goals.retain(|(g, _)|
+            sys.goals_mut().retain(|(g, _)|
                 !matches!(g, crate::constraint::constraints::Goal::Disj(_)));
             new_cases.push((name, sys));
         }
@@ -3474,7 +3474,7 @@ fn saturate_sources_with_simp_opt(
                         let t_str = format!("{:?}", t).chars().take(180).collect::<String>();
                         eprintln!("      eq {} → {}", v_str, t_str);
                     }
-                    for (nid, rule) in &sys.nodes {
+                    for (nid, rule) in sys.nodes.iter() {
                         let rname = match &rule.info {
                             crate::rule::RuleInfo::Proto(p) =>
                                 format!("Proto({:?})", p.name),
@@ -3508,7 +3508,7 @@ fn saturate_sources_with_simp_opt(
                         eprintln!("      edge {:?}.{:?} → {:?}.{:?}",
                             e.src.0, e.src.1, e.tgt.0, e.tgt.1);
                     }
-                    for (g, st) in &sys.goals {
+                    for (g, st) in sys.goals.iter() {
                         eprintln!("      goal solved={} {:?}", st.solved, g);
                     }
                 }
@@ -3690,7 +3690,7 @@ fn saturate_sources_with_simp_opt(
                         let nm = case_name_list_to_string(n);
                         if nm.starts_with("Resolve1") || nm.starts_with("Resolve2") {
                             eprintln!("[refine]     nodes:");
-                            for (id, rule) in &sys.nodes {
+                            for (id, rule) in sys.nodes.iter() {
                                 let rname = match &rule.info {
                                     crate::rule::RuleInfo::Proto(p) =>
                                         format!("Proto({:?})", p.name),
@@ -3706,14 +3706,14 @@ fn saturate_sources_with_simp_opt(
                                     e.tgt.0.name, e.tgt.0.idx, e.tgt.1.0);
                             }
                             eprintln!("[refine]     unsolved goals:");
-                            for (g, st) in &sys.goals {
+                            for (g, st) in sys.goals.iter() {
                                 if !st.solved {
                                     let gs = format!("{:?}", g).chars().take(500).collect::<String>();
                                     eprintln!("[refine]       {}", gs);
                                 }
                             }
                             eprintln!("[refine]     i_0 node detail:");
-                            for (id, rule) in &sys.nodes {
+                            for (id, rule) in sys.nodes.iter() {
                                 if id.name == "i" {
                                     eprintln!("[refine]       i_{} acts: {:?}", id.idx,
                                         rule.actions);
@@ -4109,7 +4109,7 @@ fn solve_all_safe_goals_tracked(
             if has_fresh_var {
                 let live_goal = crate::constraint::constraints::Goal::Action(
                     live_node.clone(), fa.clone());
-                for (g, st) in red.sys.goals.iter_mut() {
+                for (g, st) in red.sys.goals_mut().iter_mut() {
                     if g == &live_goal { st.solved = true; break; }
                 }
             }
@@ -5093,7 +5093,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
             if has_fresh_var {
                 let live_goal_action = crate::constraint::constraints::Goal::Action(
                     i.clone(), fa.clone());
-                for (g, st) in sub.sys.goals.iter_mut() {
+                for (g, st) in sub.sys.goals_mut().iter_mut() {
                     if g == &live_goal_action { st.solved = true; break; }
                 }
             }
@@ -5397,7 +5397,7 @@ fn freshen_system(
         let sys_max = {
             let mut m: u64 = 0;
             let mut walk = |v: &tamarin_term::lterm::LVar| { if v.idx > m { m = v.idx; } };
-            for (id, ru) in &sys.nodes {
+            for (id, ru) in sys.nodes.iter() {
                 id.for_each_free(&mut walk);
                 ru.for_each_free(&mut walk);
             }
@@ -5409,7 +5409,7 @@ fn freshen_system(
                 l.smaller.for_each_free(&mut walk);
                 l.larger.for_each_free(&mut walk);
             }
-            for (g, _) in &sys.goals {
+            for (g, _) in sys.goals.iter() {
                 match g {
                     crate::constraint::constraints::Goal::Action(n, fa) => {
                         n.for_each_free(&mut walk); fa.for_each_free(&mut walk);
@@ -5441,11 +5441,11 @@ fn freshen_system(
         v2
     };
     let mut out = sys.clone();
-    out.nodes = out.nodes.into_iter()
+    out.nodes = std::sync::Arc::new(std::sync::Arc::unwrap_or_clone(out.nodes).into_iter()
         .map(|(id, ru)| {
             (shift_lvar(&id),
              ru.map_free(&mut |v| shift_lvar(&v))) })
-        .collect();
+        .collect());
     out.edges = out.edges.into_iter()
         .map(|e| crate::constraint::constraints::Edge {
             src: (shift_lvar(&e.src.0), e.src.1),
@@ -5458,7 +5458,7 @@ fn freshen_system(
             shift_lvar(&l.larger),
             l.reason))
         .collect();
-    out.goals = out.goals.into_iter()
+    out.goals = std::sync::Arc::new(std::sync::Arc::unwrap_or_clone(out.goals).into_iter()
         .map(|(g, st)| {
             let g2 = match g {
                 crate::constraint::constraints::Goal::Action(n, fa) =>
@@ -5477,7 +5477,7 @@ fn freshen_system(
             };
             (g2, st)
         })
-        .collect();
+        .collect());
     if let Some(la) = out.last_atom.take() {
         out.last_atom = Some(shift_lvar(&la));
     }
@@ -5558,7 +5558,7 @@ fn graft_case_into(
     let rename_node = |n: &crate::constraint::constraints::NodeId| {
         if n == abstract_node { live_node.clone() } else { n.clone() }
     };
-    for (id, rule) in &case_sys.nodes {
+    for (id, rule) in case_sys.nodes.iter() {
         if id == abstract_node { continue; }
         let new_id = rename_node(id);
         if !out.nodes.iter().any(|(n, _)| n == &new_id) {
@@ -5598,7 +5598,7 @@ fn graft_case_into(
     // causing the search to re-pick `case Register_pk` for premises that
     // Haskell shows as already resolved. Now we add them with their
     // solved flag intact, matching Haskell's behaviour.
-    for (g, st) in &case_sys.goals {
+    for (g, st) in case_sys.goals.iter() {
         let renamed_goal = match g {
             crate::constraint::constraints::Goal::Premise(p, _fa)
                 if &p.0 == abstract_node => continue,
@@ -5615,12 +5615,12 @@ fn graft_case_into(
         // overwrite — Haskell's `M.union` is left-biased.  Otherwise
         // push with the case's status.
         if !out.goals.iter().any(|(existing, _)| existing == &renamed_goal) {
-            out.goals.push((renamed_goal, st.clone()));
+            out.goals_mut().push((renamed_goal, st.clone()));
         }
     }
     let live_goal = crate::constraint::constraints::Goal::Premise(
         (live_node.clone(), live_prem_idx), fa_prem.clone());
-    if let Some(slot) = out.goals.iter_mut().find(|(g, _)| g == &live_goal) {
+    if let Some(slot) = out.goals_mut().iter_mut().find(|(g, _)| g == &live_goal) {
         slot.1.solved = true;
     }
     // Copy the case's variant SplitG disjunctions into the live system.
@@ -5719,7 +5719,7 @@ fn graft_case_into(
             let mut sys_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar>
                 = std::collections::BTreeSet::new();
             let mut visit = |v: &tamarin_term::lterm::LVar| { sys_vars.insert(v.clone()); };
-            for (id, rule) in &out.nodes {
+            for (id, rule) in out.nodes.iter() {
                 id.for_each_free(&mut visit);
                 rule.for_each_free(&mut visit);
             }
@@ -5901,7 +5901,7 @@ pub fn solve_with_source_cases_action_with_ctx(
         for (n, c) in src.cases_or_empty() {
             eprintln!("[src_case] name={} nodes={} edges={} goals={} last_atom={:?}",
                 n, c.nodes.len(), c.edges.len(), c.goals.len(), c.last_atom);
-            for (id, ru) in &c.nodes {
+            for (id, ru) in c.nodes.iter() {
                 let nm = crate::constraint::solver::reduction::rule_case_name(ru);
                 let fact_dump = |fs: &[crate::fact::LNFact]| -> Vec<String> {
                     fs.iter().map(|a| format!("{}({:?})", crate::fact::fact_tag_name(&a.tag),
@@ -5915,7 +5915,7 @@ pub fn solve_with_source_cases_action_with_ctx(
                 eprintln!("[src_case]   edge {:?}.c{} → {:?}.p{}",
                     e.src.0, e.src.1.0, e.tgt.0, e.tgt.1.0);
             }
-            for (g, _) in &c.goals {
+            for (g, _) in c.goals.iter() {
                 eprintln!("[src_case]   goal {:?}", g);
             }
             for (v, t) in c.eq_store.subst.to_list().iter() {
@@ -6226,7 +6226,7 @@ fn auto_resolve_single_case_ku(
         let (mut grafted, _, _) = arms.swap_remove(0);
         // Sanity: mark the live KU goal solved if not already.
         let live_goal = Goal::Action(live_node.clone(), live_fa.clone());
-        for (g, st) in grafted.goals.iter_mut() {
+        for (g, st) in grafted.goals_mut().iter_mut() {
             if g == &live_goal { st.solved = true; break; }
         }
         let _ = avoid_max;  // avoid unused-var warning
@@ -6585,9 +6585,9 @@ fn freshen_system_keep_with_shift(
         }
     };
     let mut out = sys.clone();
-    out.nodes = out.nodes.into_iter()
+    out.nodes = std::sync::Arc::new(std::sync::Arc::unwrap_or_clone(out.nodes).into_iter()
         .map(|(id, ru)| (shift_lvar(&id), ru.map_free(&mut |v| shift_lvar(&v))))
-        .collect();
+        .collect());
     out.edges = out.edges.into_iter()
         .map(|e| crate::constraint::constraints::Edge {
             src: (shift_lvar(&e.src.0), e.src.1),
@@ -6601,7 +6601,7 @@ fn freshen_system_keep_with_shift(
             l.reason,
         ))
         .collect();
-    out.goals = out.goals.into_iter()
+    out.goals = std::sync::Arc::new(std::sync::Arc::unwrap_or_clone(out.goals).into_iter()
         .map(|(g, st)| {
             let g2 = match g {
                 crate::constraint::constraints::Goal::Action(n, fa) =>
@@ -6635,7 +6635,7 @@ fn freshen_system_keep_with_shift(
             };
             (g2, st)
         })
-        .collect();
+        .collect());
     if let Some(la) = out.last_atom.take() {
         out.last_atom = Some(shift_lvar(&la));
     }
@@ -6941,9 +6941,9 @@ fn freshen_system_some_inst(
     };
 
     let mut out = sys.clone();
-    out.nodes = out.nodes.into_iter()
+    out.nodes = std::sync::Arc::new(std::sync::Arc::unwrap_or_clone(out.nodes).into_iter()
         .map(|(id, ru)| (lookup(&id), ru.map_free(&mut |v| lookup(&v))))
-        .collect();
+        .collect());
     out.edges = out.edges.into_iter()
         .map(|e| crate::constraint::constraints::Edge {
             src: (lookup(&e.src.0), e.src.1),
@@ -6957,7 +6957,7 @@ fn freshen_system_some_inst(
             l.reason,
         ))
         .collect();
-    out.goals = out.goals.into_iter()
+    out.goals = std::sync::Arc::new(std::sync::Arc::unwrap_or_clone(out.goals).into_iter()
         .map(|(g, st)| {
             let g2 = match g {
                 crate::constraint::constraints::Goal::Action(n, fa) =>
@@ -6987,7 +6987,7 @@ fn freshen_system_some_inst(
             };
             (g2, st)
         })
-        .collect();
+        .collect());
     if let Some(la) = out.last_atom.take() {
         out.last_atom = Some(lookup(&la));
     }
@@ -7255,7 +7255,7 @@ fn apply_source_case_action(
         = std::collections::BTreeSet::new();
     if std::env::var("TAM_DBG_CASE_PRE_FRESHEN").is_ok() {
         eprintln!("[case_pre_freshen] case={}: case_sys.nodes:", case_label);
-        for (id, ru) in &case_sys.nodes {
+        for (id, ru) in case_sys.nodes.iter() {
             let nm = crate::constraint::solver::reduction::rule_case_name(ru);
             if nm == "Serv_1" || nm == "Register_pk" || nm == "Client_1" {
                 eprintln!("[case_pre_freshen]   node {:?} → {}", id, nm);
@@ -7562,7 +7562,7 @@ fn apply_source_case_action(
     }
     if std::env::var("TAM_DBG_APPLY_REFINE").is_ok() {
         eprintln!("[apply_refine] case={} POST-subst:", case_label);
-        for (id, ru) in &refined.sys.nodes {
+        for (id, ru) in refined.sys.nodes.iter() {
             let nm = crate::constraint::solver::reduction::rule_case_name(ru);
             if nm == "Serv_1" || nm == "Register_pk" {
                 eprintln!("[apply_refine]   node {:?} → {}", id, nm);
@@ -7678,7 +7678,7 @@ fn apply_source_case_action(
                         seen: &mut std::collections::BTreeSet<tamarin_term::lterm::LVar>| {
                 if seen.insert(v.clone()) { out.push(v.clone()); }
             };
-            for (id, ru) in &sys.nodes {
+            for (id, ru) in sys.nodes.iter() {
                 push(id, &mut out, &mut seen);
                 ru.for_each_free(&mut |v| push(v, &mut out, &mut seen));
             }
@@ -7686,7 +7686,7 @@ fn apply_source_case_action(
                 push(&e.src.0, &mut out, &mut seen);
                 push(&e.tgt.0, &mut out, &mut seen);
             }
-            for (g, _) in &sys.goals {
+            for (g, _) in sys.goals.iter() {
                 match g {
                     crate::constraint::constraints::Goal::Action(n, fa) => {
                         push(n, &mut out, &mut seen);
@@ -7768,7 +7768,7 @@ fn apply_source_case_action(
     // Gate the mark on `!in_precompute_mode()` so saturate-time
     // grafts emit a sub-system whose ActionG goals match HS's
     // safe-goal-only saturation outputs.
-    if let Some(slot) = r.sys.goals.iter_mut().find(|(g, _)| g == &live_goal) {
+    if let Some(slot) = r.sys.goals_mut().iter_mut().find(|(g, _)| g == &live_goal) {
         if !in_precompute_mode() {
             slot.1.solved = true;
         }
@@ -8128,7 +8128,7 @@ fn apply_source_case_premise(
             e.tgt = new_prem.clone();
         }
     }
-    for (g, _) in renamed_case.goals.iter_mut() {
+    for (g, _) in renamed_case.goals_mut().iter_mut() {
         if let crate::constraint::constraints::Goal::Premise(p, _) = g {
             if *p == pat_prem {
                 *p = new_prem.clone();
@@ -8321,7 +8321,7 @@ fn apply_source_case_premise(
     let mut r = Reduction::new(ctx, live_sys.clone());
     let live_goal = crate::constraint::constraints::Goal::Premise(
         (live_node.clone(), live_prem_idx), fa_live.clone());
-    if let Some(slot) = r.sys.goals.iter_mut().find(|(g, _)| g == &live_goal) {
+    if let Some(slot) = r.sys.goals_mut().iter_mut().find(|(g, _)| g == &live_goal) {
         slot.1.solved = true;
     }
     crate::state_trace::emit(
@@ -8507,7 +8507,7 @@ fn close_trivial_chains_in_graft(
             Ok(_) => {
                 // Mark the chain solved.
                 let chain_goal = Goal::Chain(c, p);
-                if let Some(slot) = r.sys.goals.iter_mut()
+                if let Some(slot) = r.sys.goals_mut().iter_mut()
                     .find(|(g, _)| g == &chain_goal)
                 {
                     slot.1.solved = true;
@@ -8534,7 +8534,7 @@ fn graft_case_into_action(
     let rename_node = |n: &crate::constraint::constraints::NodeId| {
         if n == abstract_node { live_node.clone() } else { n.clone() }
     };
-    for (id, rule) in &case_sys.nodes {
+    for (id, rule) in case_sys.nodes.iter() {
         let new_id = rename_node(id);
         if !out.nodes.iter().any(|(n, _)| n == &new_id) {
             out.add_node(new_id, rule.clone());
@@ -8560,7 +8560,7 @@ fn graft_case_into_action(
     // goals must stay marked solved in the live system, or downstream
     // search re-picks them as `case Register_pk` for already-resolved
     // premises (the KAS2_eCK case_1.Resp_2 divergence).
-    for (g, st) in &case_sys.goals {
+    for (g, st) in case_sys.goals.iter() {
         let renamed_goal = match g {
             crate::constraint::constraints::Goal::Action(n, _fa)
                 if n == abstract_node => continue,
@@ -8572,12 +8572,12 @@ fn graft_case_into_action(
             other => other.clone(),
         };
         if !out.goals.iter().any(|(existing, _)| existing == &renamed_goal) {
-            out.goals.push((renamed_goal, st.clone()));
+            out.goals_mut().push((renamed_goal, st.clone()));
         }
     }
     let live_goal = crate::constraint::constraints::Goal::Action(
         live_node.clone(), fa_live.clone());
-    if let Some(slot) = out.goals.iter_mut().find(|(g, _)| g == &live_goal) {
+    if let Some(slot) = out.goals_mut().iter_mut().find(|(g, _)| g == &live_goal) {
         // HS-faithful: see the matching gate in `apply_source_case_action`.
         // `solveAllSafeGoals.safeGoal` (Sources.hs:202) excludes KU
         // ActionG goals from saturate-time dispatch, so applying a
@@ -9663,7 +9663,7 @@ mod tests {
         for (name, sys) in a_src.cases_or_empty() {
             let mut x_vars: std::collections::BTreeSet<u64> = Default::default();
             let mut details: Vec<String> = Vec::new();
-            for (id, ru) in &sys.nodes {
+            for (id, ru) in sys.nodes.iter() {
                 for fa in ru.premises.iter().chain(ru.conclusions.iter()) {
                     if fa.tag != a_tag { continue; }
                     if let Some(t) = fa.terms.first() {

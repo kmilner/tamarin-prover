@@ -374,7 +374,7 @@ pub fn trace_state(sys: &crate::constraint::system::System) {
         // Helper_Loop_and_success: HS has Loop(~n, f(f(k.1)), kOrig)
         // at parent path; Rust only has Loop(~n, k, kOrig) / Loop(~n,
         // f(k), kOrig) — missing the third chain level).
-        for (id, rule) in &sys.nodes {
+        for (id, rule) in sys.nodes.iter() {
             let rc = crate::constraint::solver::reduction::rule_case_name(rule);
             let acts: Vec<String> = rule.actions.iter()
                 .map(canonical_fact_with_idx).collect();
@@ -394,7 +394,7 @@ pub fn trace_state(sys: &crate::constraint::system::System) {
         // and are critical for diagnosing IH-Forall-fires-but-misses-
         // gfalse divergences at case-3 (Helper_Loop_and_success).
         use crate::constraint::constraints::Goal;
-        for (g, st) in &sys.goals {
+        for (g, st) in sys.goals.iter() {
             if st.solved { continue; }
             if let Goal::Action(node, fa) = g {
                 eprintln!("[STATE_GOAL] path={} Action@{}.{}={}",
@@ -531,7 +531,7 @@ fn canonical_node_actions(sys: &crate::constraint::system::System) -> String {
     // Haskell's `allActions sys` (M.toList sNodes <- rActs).  Idxs
     // suppressed for clean diff.
     let mut acts: Vec<String> = Vec::new();
-    for (_, rule) in &sys.nodes {
+    for (_, rule) in sys.nodes.iter() {
         for a in &rule.actions {
             acts.push(canonical_fact(a));
         }
@@ -544,7 +544,7 @@ fn canonical_node_actions(sys: &crate::constraint::system::System) -> String {
 fn canonical_open_actions(sys: &crate::constraint::system::System) -> String {
     use crate::constraint::constraints::Goal;
     let mut acts: Vec<String> = Vec::new();
-    for (g, st) in &sys.goals {
+    for (g, st) in sys.goals.iter() {
         if st.solved { continue; }
         if let Goal::Action(_, fa) = g {
             acts.push(canonical_fact(fa));

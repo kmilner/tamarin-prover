@@ -235,7 +235,7 @@ pub fn rename_precise_system(sys: &mut System) {
     // diverges from HS for any downstream consumer that walks `sys.nodes`
     // in storage order rather than re-sorting (most do their own sort, but
     // some iterate directly).  Mirror HS by sorting here.
-    let nodes = std::mem::take(&mut sys.nodes);
+    let nodes = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut sys.nodes));
     let mut renamed: Vec<(crate::constraint::constraints::NodeId, crate::rule::RuleACInst)>
         = nodes.into_iter().map(|(id, rule)| {
             let new_id = map_var(id);
@@ -243,7 +243,7 @@ pub fn rename_precise_system(sys: &mut System) {
             (new_id, new_rule)
         }).collect();
     renamed.sort_by(|a, b| a.0.cmp(&b.0));
-    sys.nodes = renamed;
+    sys.nodes = std::sync::Arc::new(renamed);
 
     // 2. Edges.
     for e in sys.edges.iter_mut() {
@@ -284,7 +284,7 @@ pub fn rename_precise_system(sys: &mut System) {
     sys.less_atoms = new_less;
 
     // 5. Goals — per-variant rewrite.
-    let goals = std::mem::take(&mut sys.goals);
+    let goals = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut sys.goals));
     let apply_term = |t: LNTerm| -> LNTerm {
         tamarin_term::subst::apply_vterm(&term_subst, t)
     };
@@ -324,7 +324,7 @@ pub fn rename_precise_system(sys: &mut System) {
     // entries land in ascending NEW Goal order.
     new_goals.sort_by(|a, b|
         crate::constraint::solver::goals::goal_cmp(&a.0, &b.0));
-    sys.goals = new_goals;
+    sys.goals = std::sync::Arc::new(new_goals);
 
     // 6. Formulas / solved / lemmas — via parser-level VarSubst.
     //

@@ -245,6 +245,65 @@ fn solve_line_render(solve_body: crate::pretty_hpj::Doc, base_indent: usize, pre
     rendered[strip..].to_string()
 }
 
+/// HS `multiComment_ ["unannotated"]`
+/// (Theory/Text/Pretty.hs:105-106):
+///   `comment $ fsep [text "/*", vcat $ map text ls, text "*/"]`
+/// With a single line `"unannotated"`, `vcat [text "unannotated"]` is
+/// just `text "unannotated"`, and `fsep` joins the three with single
+/// spaces when they fit (they always do at any indent ≤ ribbon), giving
+/// `/* unannotated */`.  `comment` is a highlight wrapper — a no-op for
+/// raw (non-coloured) output.
+pub fn unannotated_comment_doc() -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    hpj::fsep(vec![
+        Doc::text("/*"),
+        Doc::text("unannotated"),
+        Doc::text("*/"),
+    ])
+}
+
+/// Render a proof-step line that may carry the `/* unannotated */`
+/// comment, reproducing HS `prettyIncrementalProof.ppStep`
+/// (ProofSkeleton.hs:80-84):
+///   `sep [ prettyProofMethod (psMethod step)
+///        , if isNothing (psInfo step) then multiComment_ ["unannotated"]
+///                                     else emptyDoc ]`
+///
+/// `method_doc` is the rendered proof method (e.g. `solve( … )`,
+/// `simplify`, `by sorry` — the `by ` prefix, if any, must already be
+/// `beside`-prepended into `method_doc` by the caller).  When `annotated`
+/// is true the comment is omitted and only the method is laid out
+/// (byte-identical to the prior string path).  When false, HughesPJ's
+/// `sep` first tries to fit `method <space> /* unannotated */` on one
+/// line; if the (flattened) method + comment exceeds the ribbon, the
+/// comment drops to its OWN line at the sep's base indent
+/// (= `base_indent`, the proof step's depth indent).
+///
+/// As with `solve_line_render`, the whole step is `nest`ed at
+/// `base_indent` and the leading `base_indent` spaces are stripped from
+/// the FIRST line (the caller has already emitted that indent), while a
+/// dropped comment line retains its `base_indent` leading spaces.
+pub fn step_line_with_unann(
+    method_doc: crate::pretty_hpj::Doc,
+    base_indent: usize,
+    annotated: bool,
+) -> String {
+    use crate::pretty_hpj as hpj;
+    let step = if annotated {
+        method_doc
+    } else {
+        hpj::sep(vec![method_doc, unannotated_comment_doc()])
+    };
+    let indented = step.nest(base_indent as isize);
+    let rendered = indented.render();
+    let strip = rendered
+        .chars()
+        .take(base_indent)
+        .take_while(|c| *c == ' ')
+        .count();
+    rendered[strip..].to_string()
+}
+
 /// Build the `solve( <goal> )` line for a NON-DisjG goal, where the
 /// caller has already constructed `goal_doc` for the goal body (HS
 /// `prettyGoal`, Constraints.hs:273-287).  Mirrors HS
@@ -646,11 +705,7 @@ fn formula_to_doc(
     match f {
         True => doc_text("\u{22A4}"),
         False => doc_text("\u{22A5}"),
-        Atom(a) => {
-            let mut s = String::new();
-            pp_atom(a, scope, &mut s);
-            doc_text(s)
-        }
+        Atom(a) => atom_to_doc(a, scope),
         Not(p_) => {
             // HS: `operator_ "¬" <> opParens p'` — `<>` is no-break
             // beside.  The inner opParens is unconditional.
@@ -666,20 +721,84 @@ fn formula_to_doc(
             // `quantifier = ppQ <> ppVars vs <> "."`, body indented +1.
             // HS `pp (Qua _ _ _) = scopeFreshness $ do ...`
             // (Formula.hs:496-502) — every Qua saves/restores state.
-            let sym = if matches!(f, Forall(_, _)) { "\u{2200}" } else { "\u{2203}" };
+            // HS `ppQuant qua <> ppVars vs <> operator_ "."` where
+            // `ppVars = fsep . map (text . show)` (Formula.hs:505-508) and
+            // `opExists = operator_ "∃ "` / `opForall = operator_ "∀ "`
+            // (Pretty.hs:177-178) carry their own trailing space.  The
+            // `fsep` makes the bound-var list BREAKABLE, so a long var list
+            // wraps across lines (continuation aligned after the `∃ ` prefix
+            // via `<>`'s nesting offset) — matching HS byte-for-byte.
+            // Previously the prefix was a single flat `Doc::text`, so it
+            // could never wrap.
+            let sym = if matches!(f, Forall(_, _)) { "\u{2200} " } else { "\u{2203} " };
             state.scope_freshness(|state| {
                 let new_scope = allocate_formula_binders(vs, scope, state);
-                let mut vars_str = String::new();
-                for (i, b) in new_scope[scope.len()..].iter().enumerate() {
-                    if i > 0 { vars_str.push(' '); }
-                    vars_str.push_str(sort_prefix_from_hint(b.1));
-                    vars_str.push_str(&b.2);
-                }
-                let quant = doc_text(format!("{} {}.", sym, vars_str));
+                let var_docs: Vec<hpj::Doc> = new_scope[scope.len()..]
+                    .iter()
+                    .map(|b| {
+                        let mut s = String::new();
+                        s.push_str(sort_prefix_from_hint(b.1));
+                        s.push_str(&b.2);
+                        doc_text(s)
+                    })
+                    .collect();
+                // `opQuant <> fsep(vars) <> "."`
+                let quant = doc_text(sym)
+                    .beside(hpj::fsep(var_docs))
+                    .beside(doc_text("."));
                 let body_doc = formula_to_doc(body, &new_scope, state);
                 hpj::sep(vec![quant, body_doc.nest(1)])
             })
         }
+    }
+}
+
+/// Build a breakable `Doc` for a formula atom, mirroring HS
+/// `prettyProtoAtom` (Theory/Model/Atom.hs:216-224).  Crucially the
+/// fact/term sub-Docs are the SAME breakable `fact_to_doc`/`term_to_doc`
+/// used elsewhere, so a fact like `F( a, b, c )` can drop its closing `)`
+/// onto its own line (HS `prettyFact`'s `nestShort'`) when the ribbon is
+/// exceeded — e.g. spdm Attack_Session_Mode_Switch's deeply-nested
+/// conjunction.  Previously the atom was flattened to one `Doc::text`,
+/// so it could never break inside a formula and overflowed the ribbon
+/// where HS wraps.  When the atom fits on the line the Doc renders
+/// byte-identically to the old flat string, so this only changes
+/// over-wide atoms (toward HS), never fitting ones.
+fn atom_to_doc(a: &p::Atom, scope: &[Bind]) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    use p::Atom::*;
+    match a {
+        // HS `EqE l r -> sep [ppT l <-> opEqual, ppT r]` (Atom.hs:219).
+        Eq(l, r) => hpj::sep(vec![
+            term_to_doc(l, scope).beside_sp(Doc::text("=")),
+            term_to_doc(r, scope),
+        ]),
+        // HS `Subterm l r -> sep [ppT l <-> opSubterm, ppT r]` (Atom.hs:221).
+        Subterm(l, r) => hpj::sep(vec![
+            term_to_doc(l, scope).beside_sp(Doc::text("\u{228F}")),
+            term_to_doc(r, scope),
+        ]),
+        // HS `Less u v -> text (show u) <-> opLess <-> text (show v)`
+        // (Atom.hs:222) — `<->` is `<+>`, no break.
+        Less(l, r) => term_to_doc(l, scope)
+            .beside_sp(Doc::text("<"))
+            .beside_sp(term_to_doc(r, scope)),
+        // Rust-only multiset-`(<)` ordering atom; mirror `Less`'s shape.
+        LessMset(l, r) => term_to_doc(l, scope)
+            .beside_sp(Doc::text("(<)"))
+            .beside_sp(term_to_doc(r, scope)),
+        // HS `Action v fa -> prettyFact ppT fa <-> opAction <-> text (show v)`
+        // (Atom.hs:216-217).  Breakability lives inside `prettyFact`.
+        Action(fa, t) => fact_to_doc(fa, scope)
+            .beside_sp(Doc::text("@"))
+            .beside_sp(term_to_doc(t, scope)),
+        // HS `Last i -> operator_ "last" <> parens (text (show i))`
+        // (Atom.hs:224) — `<>` is no-space beside.
+        Last(t) => Doc::text("last(")
+            .beside(term_to_doc(t, scope))
+            .beside(Doc::text(")")),
+        // HS syntactic-sugar predicate: `prettyPred (Pred fa) = prettyNFact fa`.
+        Pred(fa) => fact_to_doc(fa, scope),
     }
 }
 
@@ -1111,11 +1230,12 @@ fn gterm_to_doc(t: &crate::guarded::GTerm, scope: &[Vec<Bind>]) -> crate::pretty
             }
         }
         AlgApp(name, l, r) => {
-            // HS aenc{m}pk surface form, rendered flat (pp_gterm emits it).
-            let mut s = String::new();
-            pp_gterm(t, scope, &mut s);
-            let _ = (name, l, r);
-            Doc::text(s)
+            // The curly-brace form `name{a}b` is parser-only sugar
+            // (parser.rs:2111); HS `prettyTerm`/`ppFun` (Term/Term.hs:268-296)
+            // has no brace case and emits these NoEq applications in function
+            // form `name(a, b)`.  Render identically to `App(name, [l, r])`.
+            let args = [(**l).clone(), (**r).clone()];
+            gfun_doc(name, &args, scope)
         }
         Diff(l, r) => {
             let args = [(**l).clone(), (**r).clone()];
@@ -1333,7 +1453,11 @@ fn pp_term(t: &p::Term, scope: &[Bind], out: &mut String) {
         // renders it back as `one`.
         NumberOne => out.push_str("one"),
         NatOne => out.push_str("%1"),
-        DhNeutral => out.push_str("1:msg"),
+        // HS `dhNeutralSym` is a nullary NoEq public constructor; HS
+        // `prettyTerm` renders `FApp (NoEq (f,_)) []` as `text f` =
+        // `dhNeutralSymString` = "DH_neutral" (Term/Term.hs:73,278,
+        // function_symbols.rs:93).  NOT `1:msg`/`1`.
+        DhNeutral => out.push_str("DH_neutral"),
         Pair(items) => {
             // HS `prettyTerm` (Term/Term.hs:277,292-293):
             //   `FApp pairSym _ -> ppTerms ", " 1 "<" ">" (split t)`
@@ -1972,7 +2096,9 @@ fn pp_gterm(t: &crate::guarded::GTerm, scope: &[Vec<Bind>], out: &mut String) {
         // `pp_term` (no `prettyTerm` special case; Term/Term.hs:266-280).
         GTerm::NumberOne => out.push_str("one"),
         GTerm::NatOne => out.push_str("%1"),
-        GTerm::DhNeutral => out.push('1'),
+        // HS renders `dhNeutralSym` (nullary NoEq) as its symbol string
+        // "DH_neutral" (Term/Term.hs:278), not `1`.
+        GTerm::DhNeutral => out.push_str("DH_neutral"),
         GTerm::App(name, args) => {
             out.push_str(name);
             out.push('(');
@@ -1983,11 +2109,16 @@ fn pp_gterm(t: &crate::guarded::GTerm, scope: &[Vec<Bind>], out: &mut String) {
             out.push(')');
         }
         GTerm::AlgApp(name, a, b) => {
+            // Curly-brace form `name{a}b` is parser-only sugar
+            // (parser.rs:2111); HS `prettyTerm`/`ppFun` (Term/Term.hs:268-296)
+            // has no brace case and renders these in function form
+            // `name(a, b)`.
             out.push_str(name);
-            out.push('{');
+            out.push('(');
             pp_gterm(a, scope, out);
-            out.push('}');
+            out.push_str(", ");
             pp_gterm(b, scope, out);
+            out.push(')');
         }
         GTerm::Pair(items) => {
             out.push('<');
@@ -2080,6 +2211,53 @@ mod tests {
     }
 
     #[test]
+    fn unannotated_comment_renders_inline() {
+        // `multiComment_ ["unannotated"]` → `/* unannotated */`.
+        assert_eq!(
+            unannotated_comment_doc().render(),
+            "/* unannotated */"
+        );
+    }
+
+    #[test]
+    fn step_unann_inline_when_short() {
+        // A short method + comment fit on one line: `sep` keeps the
+        // `/* unannotated */` inline beside the method (HS ppStep,
+        // ProofSkeleton.hs:80-84).
+        use crate::pretty_hpj::Doc;
+        let m = Doc::text("simplify");
+        let out = step_line_with_unann(m, 2, /*annotated=*/ false);
+        assert_eq!(out, "simplify /* unannotated */");
+    }
+
+    #[test]
+    fn step_annotated_omits_comment() {
+        // When the step is annotated (psInfo = Just _), NO comment.
+        use crate::pretty_hpj::Doc;
+        let m = Doc::text("by sorry");
+        let out = step_line_with_unann(m, 4, /*annotated=*/ true);
+        assert_eq!(out, "by sorry");
+    }
+
+    #[test]
+    fn step_unann_breaks_past_ribbon() {
+        // When the method line is so long that method + ` /* unannotated
+        // */` exceeds the ribbon (73), `sep` drops the comment to its OWN
+        // line at the step's base indent (here base_indent = 2).  The
+        // method's own (single-line) text stays put; only the comment
+        // moves.  Mirrors Reproducer A.
+        use crate::pretty_hpj::Doc;
+        let long = "solve( (last(#k))  \u{2225} (something quite long here indeed yes) )";
+        assert!(long.chars().count() + " /* unannotated */".chars().count() > 73);
+        let out = step_line_with_unann(Doc::text(long), 2, /*annotated=*/ false);
+        let lines: Vec<&str> = out.split('\n').collect();
+        assert_eq!(lines.len(), 2, "comment should drop to its own line: {out:?}");
+        assert_eq!(lines[0], long, "method line unchanged");
+        // Dropped comment sits at the step's base indent (2 spaces).
+        assert_eq!(lines[1], "  /* unannotated */");
+    }
+
+    #[test]
     fn forall_with_action() {
         // ∀ ni #i. F(ni)@#i ⇒ ⊥
         let fa = p::Fact {
@@ -2103,6 +2281,40 @@ mod tests {
         assert!(s.contains("F( ni )"));
         assert!(s.contains("@ #i"));
         assert!(s.contains("\u{21D2}"));
+    }
+
+    #[test]
+    fn long_quantifier_varlist_wraps() {
+        // HS `ppVars = fsep . map (text . show)` (Formula.hs:508): a long
+        // bound-var list wraps across lines, the continuation aligned after
+        // the `∃ ` prefix (column 2, the `<>` nesting offset).  Build an
+        // existential with enough vars to overflow the ribbon, body `⊥`.
+        let names = [
+            "i1", "i2", "j1", "j2", "h1", "h2", "ss", "vote2", "fstcode1",
+            "sndcode1", "fstcode2", "sndcode2", "ess", "hv1", "hv2", "hy1",
+            "hy2", "x1", "x2", "adv1", "adv2", "ek", "bb", "sks", "y1", "y2",
+            "aa", "ea", "el", "em",
+        ];
+        let vs: Vec<p::VarSpec> =
+            names.iter().map(|n| v(n, p::SortHint::Untagged)).collect();
+        let f = p::Formula::Exists(vs, Box::new(p::Formula::False));
+        let out = pretty_formula_wrapped(&f, 0, 110);
+        let lines: Vec<&str> = out.split('\n').collect();
+        assert!(lines.len() >= 2, "long var list must wrap: {out:?}");
+        // First line opens with the existential symbol and a space.
+        assert!(lines[0].starts_with("\u{2203} "), "first line: {:?}", lines[0]);
+        // Continuation lines are indented by 2 (aligned after `∃ `), i.e.
+        // exactly the column where the first bound var landed.
+        for cont in &lines[1..] {
+            // Skip the final body-only line if it is just the nested `⊥`.
+            if cont.trim_start() == "\u{22A5}" { continue; }
+            assert!(
+                cont.starts_with("  ") && !cont.starts_with("   "),
+                "continuation var line should align at col 2: {cont:?}"
+            );
+        }
+        // No bound var was dropped: the rendered text contains every name.
+        for n in names { assert!(out.contains(n), "missing var {n} in {out:?}"); }
     }
 
     #[test]
@@ -2198,6 +2410,84 @@ mod tests {
         assert!(s.contains("~longPayloadNameNumberTwo"), "payload missing:\n{s}");
         // The Eq's `=` is rendered (HS `sep [ppT l <-> opEqual, ppT r]`).
         assert!(s.contains("z ="), "Eq operator missing:\n{s}");
+    }
+
+    // The curly-brace form `name{a}b` in the source is parser-only sugar
+    // (parser.rs:2111); HS `prettyTerm`/`ppFun` (Term/Term.hs:268-296) has no
+    // brace case and re-emits these NoEq applications in function form
+    // `name(a, b)`.  Every term renderer (flat + Doc, parser-AST + GTerm) must
+    // match that.
+    #[test]
+    fn algapp_renders_function_form_flat_term() {
+        // sdec{body}key  ->  sdec(body, key)
+        let t = p::Term::AlgApp(
+            "sdec".into(),
+            Box::new(p::Term::Var(v("body", p::SortHint::Untagged))),
+            Box::new(p::Term::Var(v("key", p::SortHint::Untagged))),
+        );
+        assert_eq!(pretty_term(&t), "sdec(body, key)");
+    }
+
+    #[test]
+    fn algapp_pair_arg_renders_function_form_flat_term() {
+        // senc{a,b}k  ->  AlgApp(senc, <a, b>, k)  ->  senc(<a, b>, k)
+        let t = p::Term::AlgApp(
+            "senc".into(),
+            Box::new(p::Term::Pair(vec![
+                p::Term::Var(v("a", p::SortHint::Untagged)),
+                p::Term::Var(v("b", p::SortHint::Untagged)),
+            ])),
+            Box::new(p::Term::Var(v("k", p::SortHint::Untagged))),
+        );
+        assert_eq!(pretty_term(&t), "senc(<a, b>, k)");
+    }
+
+    #[test]
+    fn algapp_renders_function_form_doc_term() {
+        let t = p::Term::AlgApp(
+            "sdec".into(),
+            Box::new(p::Term::Var(v("body", p::SortHint::Untagged))),
+            Box::new(p::Term::Var(v("key", p::SortHint::Untagged))),
+        );
+        assert_eq!(term_to_doc(&t, &[]).render(), "sdec(body, key)");
+    }
+
+    #[test]
+    fn algapp_renders_function_form_flat_gterm() {
+        let g = crate::guarded::GTerm::AlgApp(
+            "sdec".into(),
+            Box::new(crate::guarded::GTerm::Var(crate::guarded::BVar::Free(
+                v("body", p::SortHint::Untagged),
+            ))),
+            Box::new(crate::guarded::GTerm::Var(crate::guarded::BVar::Free(
+                v("key", p::SortHint::Untagged),
+            ))),
+        );
+        let mut s = String::new();
+        pp_gterm(&g, &[], &mut s);
+        assert_eq!(s, "sdec(body, key)");
+    }
+
+    #[test]
+    fn algapp_pair_arg_renders_function_form_doc_gterm() {
+        // senc{a,b}k as a GTerm -> senc(<a, b>, k) via the Doc renderer
+        let g = crate::guarded::GTerm::AlgApp(
+            "senc".into(),
+            Box::new(crate::guarded::GTerm::Pair(vec![
+                crate::guarded::GTerm::Var(crate::guarded::BVar::Free(v(
+                    "a",
+                    p::SortHint::Untagged,
+                ))),
+                crate::guarded::GTerm::Var(crate::guarded::BVar::Free(v(
+                    "b",
+                    p::SortHint::Untagged,
+                ))),
+            ])),
+            Box::new(crate::guarded::GTerm::Var(crate::guarded::BVar::Free(
+                v("k", p::SortHint::Untagged),
+            ))),
+        );
+        assert_eq!(gterm_to_doc(&g, &[]).render(), "senc(<a, b>, k)");
     }
 }
 

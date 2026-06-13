@@ -115,7 +115,7 @@ pub fn simplify_system(red: &mut Reduction) {
                 format!("{:?}({})", f.tag,
                     f.terms.iter().map(term_compact).collect::<Vec<_>>().join(","))
             };
-            for (id, r) in &red.sys.nodes {
+            for (id, r) in red.sys.nodes.iter() {
                 let prems: Vec<String> = r.premises.iter().map(&fact_compact).collect();
                 let acts: Vec<String> = r.actions.iter().map(&fact_compact).collect();
                 let concs: Vec<String> = r.conclusions.iter().map(&fact_compact).collect();
@@ -584,7 +584,7 @@ fn exploit_unique_msg_order(red: &mut Reduction) {
 
     // Collect KD-conclusion (term, node) pairs.
     let mut kd_conc: BTreeMap<LNTerm, NodeId> = BTreeMap::new();
-    for (id, rule) in &red.sys.nodes {
+    for (id, rule) in red.sys.nodes.iter() {
         for fa in &rule.conclusions {
             if matches!(fa.tag, FactTag::Kd) {
                 if let Some(m) = fa.terms.first() {
@@ -603,7 +603,7 @@ fn exploit_unique_msg_order(red: &mut Reduction) {
     // decomposition (e.g. `∃ #j. KU(t) @ j`) don't participate in
     // N6's NormalForm ordering, leaving a Cyclic detection gap.
     let mut ku_act: BTreeMap<LNTerm, NodeId> = BTreeMap::new();
-    for (id, rule) in &red.sys.nodes {
+    for (id, rule) in red.sys.nodes.iter() {
         for fa in &rule.actions {
             if matches!(fa.tag, FactTag::Ku) {
                 if let Some(m) = fa.terms.first() {
@@ -612,7 +612,7 @@ fn exploit_unique_msg_order(red: &mut Reduction) {
             }
         }
     }
-    for (goal, st) in &red.sys.goals {
+    for (goal, st) in red.sys.goals.iter() {
         if st.solved { continue; }
         if let crate::constraint::constraints::Goal::Action(i, fa) = goal {
             if matches!(fa.tag, FactTag::Ku) {
@@ -703,7 +703,7 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
         if let Guarded::Disj(items) = &fm {
             let disj_goal = crate::constraint::constraints::Goal::Disj(
                 crate::constraint::constraints::Disj::new(items.clone()));
-            for (g, st) in red.sys.goals.iter_mut() {
+            for (g, st) in red.sys.goals_mut().iter_mut() {
                 if g == &disj_goal && !st.solved {
                     st.solved = true;
                     break;
@@ -788,7 +788,7 @@ fn partial_atom_valuation(
                                j: &crate::constraint::constraints::NodeId| -> bool {
         let mut ri = None;
         let mut rj = None;
-        for (id, ru) in &sys.nodes {
+        for (id, ru) in sys.nodes.iter() {
             if id == i { ri = Some(ru); }
             if id == j { rj = Some(ru); }
         }
@@ -906,14 +906,14 @@ fn partial_atom_valuation(
             // state — `M.member` in Haskell is presence-based.  Both
             // solved and unsolved Action goals at (n, fa) imply the
             // action exists in every model.
-            for (g, _st) in &sys.goals {
+            for (g, _st) in sys.goals.iter() {
                 if let crate::constraint::constraints::Goal::Action(gi, gfa) = g {
                     if gi == &n && gfa == &lnfa {
                         return Some(true);
                     }
                 }
             }
-            for (id, rule) in &sys.nodes {
+            for (id, rule) in sys.nodes.iter() {
                 if id != &n { continue; }
                 if rule.actions.iter().any(|a| a == &lnfa) {
                     return Some(true);
@@ -1200,7 +1200,7 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     unsolved_actions.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     let mut node_actions: Vec<(crate::constraint::constraints::NodeId, crate::fact::LNFact)>
         = Vec::new();
-    for (id, rule) in &red.sys.nodes {
+    for (id, rule) in red.sys.nodes.iter() {
         for a in &rule.actions {
             node_actions.push((id.clone(), a.clone()));
         }
@@ -2175,7 +2175,7 @@ fn enforce_fresh_node_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     // with a linear scan (Fresh-rule count is small in practice).
     let mut buckets: Vec<(crate::rule::RuleACInst,
         Vec<crate::constraint::constraints::NodeId>)> = Vec::new();
-    for (id, rule) in &red.sys.nodes {
+    for (id, rule) in red.sys.nodes.iter() {
         let is_fresh = matches!(&rule.info,
             RuleInfo::Proto(p) if p.name == ProtoRuleName::Fresh);
         if !is_fresh { continue; }
@@ -2289,7 +2289,7 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
 
     // H14.3 diagnostic: dump i_0's KU action at the moment of the merge.
     if std::env::var("TAM_RS_DBG_KU_I0_ACT").is_ok() {
-        for (id, rule) in &red.sys.nodes {
+        for (id, rule) in red.sys.nodes.iter() {
             if id.name == "i" && id.idx == 0 {
                 for fa in &rule.actions {
                     if matches!(fa.tag, FactTag::Ku) {
@@ -2342,7 +2342,7 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     // Simplify.hs:279 + 311 (`kuActions se = (\(i,fa,m) -> (m,(fa,i)))
     // <$> allKUActions se`).
     let mut acts: Vec<(NodeId, LNFact, LNTerm)> = Vec::new();
-    for (g, st) in &red.sys.goals {
+    for (g, st) in red.sys.goals.iter() {
         if st.solved { continue; }
         if let Goal::Action(i, fa) = g {
             if matches!(fa.tag, FactTag::Ku) {
@@ -2352,7 +2352,7 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
             }
         }
     }
-    for (id, rule) in &red.sys.nodes {
+    for (id, rule) in red.sys.nodes.iter() {
         for fa in &rule.actions {
             if matches!(fa.tag, FactTag::Ku) {
                 if let Some(m) = fa.terms.first() {
@@ -2510,7 +2510,7 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         use crate::constraint::constraints::{LessAtom, Reason};
         let mut action_kus: Vec<(crate::constraint::constraints::NodeId, LNTerm)>
             = Vec::new();
-        for (id, rule) in &red.sys.nodes {
+        for (id, rule) in red.sys.nodes.iter() {
             for fa in &rule.actions {
                 if matches!(fa.tag, FactTag::Ku) {
                     if let Some(m) = fa.terms.first() {
@@ -2521,7 +2521,7 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         }
         let mut prem_kus: Vec<(crate::constraint::constraints::NodeId, LNTerm)>
             = Vec::new();
-        for (id, rule) in &red.sys.nodes {
+        for (id, rule) in red.sys.nodes.iter() {
             for fa in &rule.premises {
                 if matches!(fa.tag, FactTag::Ku) {
                     if let Some(m) = fa.terms.first() {
@@ -2585,7 +2585,7 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         // Collect (node, KU action term).
         let mut action_kus: Vec<(crate::constraint::constraints::NodeId, LNTerm)>
             = Vec::new();
-        for (id, rule) in &red.sys.nodes {
+        for (id, rule) in red.sys.nodes.iter() {
             for fa in &rule.actions {
                 if matches!(fa.tag, FactTag::Ku) {
                     if let Some(m) = fa.terms.first() {
@@ -2597,7 +2597,7 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         // Collect (node, KU premise term).
         let mut prem_kus: Vec<(crate::constraint::constraints::NodeId, LNTerm)>
             = Vec::new();
-        for (id, rule) in &red.sys.nodes {
+        for (id, rule) in red.sys.nodes.iter() {
             for fa in &rule.premises {
                 if matches!(fa.tag, FactTag::Ku) {
                     if let Some(m) = fa.terms.first() {
@@ -3021,7 +3021,7 @@ fn enforce_kd_fact_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     //
     // Collect (node, rule, term) for every KD-conc.
     let mut kd_concs: Vec<(NodeId, RuleACInst, LNTerm)> = Vec::new();
-    for (id, rule) in &red.sys.nodes {
+    for (id, rule) in red.sys.nodes.iter() {
         for fa in &rule.conclusions {
             if matches!(fa.tag, FactTag::Kd) {
                 if let Some(m) = fa.terms.first() {
@@ -3149,7 +3149,7 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
     // whose premise is `Fr(~x)`. Matches Haskell's `getFreshVars`.
     let mut suppliers: Vec<(crate::constraint::constraints::NodeId, LVar)>
         = Vec::new();
-    for (id, rule) in &red.sys.nodes {
+    for (id, rule) in red.sys.nodes.iter() {
         for prem in &rule.premises {
             if !matches!(prem.tag, FactTag::Fresh) { continue; }
             let t = match prem.terms.first() { Some(t) => t, None => continue };
@@ -3187,7 +3187,7 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
     // be the *same* instance, in which case adding `i < j` AND `j < i`
     // would create a spurious cycle.  Skipping unifiable pairs lets
     // node-uniqueness merge them via the eq-store first.
-    let nodes_snapshot: Vec<_> = red.sys.nodes.clone();
+    let nodes_snapshot: Vec<_> = (*red.sys.nodes).clone();
     let edges_snapshot: Vec<_> = red.sys.edges.clone();
     let maude = red.ctx.maude.clone();
     let mut changed = ChangeIndicator::Unchanged;
@@ -3411,7 +3411,8 @@ fn apply_node_eqs(
     let mut shape_mismatch = false;
     let mut rule_eqs: Vec<tamarin_term::rewriting::Equal<crate::fact::LNFact>>
         = Vec::new();
-    for (id, rule) in red.sys.nodes.drain(..) {
+    for (id, rule) in std::sync::Arc::unwrap_or_clone(
+        std::mem::take(&mut red.sys.nodes)).into_iter() {
         let new_id = rn(&id);
         match id_to_index.get(&new_id).copied() {
             Some(i) => {
@@ -3495,7 +3496,7 @@ fn apply_node_eqs(
         }
     }
     red.sys.invalidate_max_var_idx_cache();
-    red.sys.nodes = new_nodes;
+    red.sys.nodes = std::sync::Arc::new(new_nodes);
     if shape_mismatch {
         mark_contradictory_labeled(red, "apply_node_eqs:shape_mismatch");
     }
@@ -3583,7 +3584,7 @@ fn apply_node_eqs(
     }
     red.sys.less_atoms = new_less;
     // Goals.
-    for (g, _) in red.sys.goals.iter_mut() {
+    for (g, _) in red.sys.goals_mut().iter_mut() {
         match g {
             crate::constraint::constraints::Goal::Action(i, _) => *i = rn(i),
             crate::constraint::constraints::Goal::Premise(p, _) => p.0 = rn(&p.0),
@@ -3627,7 +3628,7 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     // (NodeId, ConcIdx) pairs that are persistent conclusions.
     let mut persistent_concs: std::collections::BTreeSet<(crate::constraint::constraints::NodeId, usize)>
         = std::collections::BTreeSet::new();
-    for (id, rule) in &red.sys.nodes {
+    for (id, rule) in red.sys.nodes.iter() {
         for (i, c) in rule.conclusions.iter().enumerate() {
             if matches!(&c.tag,
                 FactTag::Proto(crate::fact::Multiplicity::Persistent, _, _)

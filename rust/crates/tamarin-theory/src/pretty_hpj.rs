@@ -323,10 +323,20 @@ fn beside_inner(p: Doc, g: bool, q: Doc) -> Doc {
         // HS `beside (Nest k p) g q = nest_ k $! beside p g q`.
         Doc::Nest(k, inner) => nest_(k, beside_inner((*inner).clone(), g, q)),
         // HS `beside (p1 Union p2) g q = beside p1 g q union beside p2 g q`.
-        Doc::Union(a, b) => union_(
-            beside_inner((*a).clone(), g, q.clone()),
-            beside_inner((*b).clone(), g, q),
-        ),
+        // CRITICAL: HS's `union` is lazy in its right argument (a GHC thunk),
+        // and `best`/`fits` only forces the right branch when the left fails to
+        // fit.  Distributing `beside` over BOTH branches eagerly duplicates `q`
+        // into each branch at CONSTRUCTION time; for a doc with nested `sep`s
+        // (e.g. a large conjunction `A & B & C & …`) that builds a 2^depth tree
+        // before reduction even starts, OOMing the renderer.  Mirror HS by
+        // deferring the right branch exactly as the `LazyUnion` arm below does.
+        Doc::Union(a, b) => {
+            let q2 = q.clone();
+            lazy_union(
+                beside_inner((*a).clone(), g, q),
+                move || beside_inner((*b).clone(), g, q2),
+            )
+        }
         // Lazy distribution of `beside` over a LazyUnion (keep right lazy).
         Doc::LazyUnion(a, r) => {
             let q2 = q.clone();

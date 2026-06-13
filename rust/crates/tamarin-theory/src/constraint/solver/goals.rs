@@ -1864,7 +1864,7 @@ mod tests {
             "k", tamarin_term::lterm::LSort::Msg, 0);
         let f = crate::fact::LNFact::new(crate::fact::FactTag::Out, vec![]);
         sys.add_goal(Goal::Action(v, f));
-        sys.goals[0].1.solved = true;
+        sys.goals_mut()[0].1.solved = true;
         assert!(open_goals(&sys).is_empty());
     }
 

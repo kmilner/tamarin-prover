@@ -37,6 +37,12 @@ QUIET="${QUIET:-}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
 CACHE_VERSION="${CACHE_VERSION:-1}"
+# Deriv-check timeout (secs) passed to BOTH binaries so the message-derivation
+# section is compared deterministically.  HS's DEFAULT is 5s, which fires on
+# heavy theories and records a "Derivation checks timed out" placeholder while
+# RS (computing fully) shows the real results — a spurious DIFF.  30s lets both
+# compute fully on the corpus (deriv-check output verified faithful when both run).
+DERIVCHECK_TIMEOUT="${DERIVCHECK_TIMEOUT:-30}"
 HS_CANON_CACHE="${HS_CANON_CACHE:-$script_dir/.hs_canon_cache}"
 NO_HS_CACHE="${NO_HS_CACHE:-}"
 [ -n "$NO_HS_CACHE" ] || mkdir -p "$HS_CANON_CACHE" 2>/dev/null || true
@@ -98,7 +104,7 @@ if [ -n "$key" ] && [ -f "$key.full.gz" ]; then
         > "$tmp/hs.out"
     hs_src="cache"
 else
-    timeout "$TIMEOUT" "$hs_path" +RTS -N1 -RTS --prove="$lemma" "$file" 2>/dev/null > "$tmp/hs.out"
+    timeout "$TIMEOUT" "$hs_path" +RTS -N1 -RTS --derivcheck-timeout="$DERIVCHECK_TIMEOUT" --prove="$lemma" "$file" 2>/dev/null > "$tmp/hs.out"
     hs_rc=$?
     if [ "$hs_rc" -eq 124 ]; then
         echo "$lemma: HS TIMEOUT (${TIMEOUT}s)"
@@ -111,7 +117,7 @@ fi
 
 # --- RS.
 # shellcheck disable=SC2086
-timeout "$RS_TIMEOUT" env $extra_env "$rs_path" --prove="$lemma" "$file" 2>/dev/null > "$tmp/rs.out"
+timeout "$RS_TIMEOUT" env $extra_env "$rs_path" --derivcheck-timeout="$DERIVCHECK_TIMEOUT" --prove="$lemma" "$file" 2>/dev/null > "$tmp/rs.out"
 rs_rc=$?
 if [ "$rs_rc" -eq 124 ]; then
     echo "$lemma: RS TIMEOUT (${RS_TIMEOUT}s)"
