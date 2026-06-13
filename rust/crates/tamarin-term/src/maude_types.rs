@@ -6,7 +6,6 @@
 
 use std::collections::BTreeMap;
 
-use crate::function_symbols::FunSym;
 use crate::lterm::{LNTerm, LSort, LVar, Name, NameTag};
 use crate::term::Term;
 use crate::vterm::Lit;
@@ -173,12 +172,20 @@ pub fn mterm_to_lnterm(
                 .iter()
                 .map(|a| mterm_to_lnterm(a, ctx, name_hint, next_idx))
                 .collect();
-            // Application via the smart constructors so AC normalisation
-            // is preserved.
-            match sym {
-                FunSym::Ac(op) => crate::term::f_app_ac(*op, new_args),
-                _ => Term::App(sym.clone(), new_args.into()),
-            }
+            // Application via the smart constructors so AC/C normalisation
+            // is preserved.  Mirrors HS `mTermToLNTerm`'s
+            //   `go (FApp o as) = fApp o <$> mapM (go . viewTerm) as`
+            // (Term/Maude/Types.hs:88): `fApp` dispatches to `fAppAC`
+            // (flatten+sort) for AC symbols AND `fAppC` (sort) for C
+            // symbols (`em`/EMap).  Crucially the sort happens AFTER the
+            // child args have been back-converted from `MaudeVar`s to the
+            // canonical `LVar`s, so `em`'s two args are ordered by the FULL
+            // `LVar` order (idx-first), not by the transient Maude-side
+            // ordering.  Routing only `FunSym::Ac` through the smart
+            // constructor (and building `FunSym::C(EMap)` directly) left
+            // `em` args in Maude's back-conversion order, producing
+            // `em(XB.10, x.9)` where HS prints the sorted `em(x.9, XB.10)`.
+            crate::term::f_app(sym.clone(), new_args)
         }
     }
 }
@@ -261,5 +268,51 @@ mod tests {
         let mut next = 0;
         let back = mterm_to_lnterm(&mt, &mut ctx, "x", &mut next);
         assert_eq!(t2, back);
+    }
+
+    /// Regression for #330: `mterm_to_lnterm` must sort `em` (C/EMap) args
+    /// by the FINAL `LVar` order, not leave them in Maude's back-conversion
+    /// order.  An MTerm `em(<id for x.10>, <id for x.9>)` whose args map
+    /// back to `x.10` and `x.9` must come back as `em(x.9, x.10)` (idx-first
+    /// `LVar` order), matching HS `mTermToLNTerm`'s `fApp o`/`fAppC EMap`.
+    #[test]
+    fn emap_args_sorted_by_final_lvar_order() {
+        use crate::function_symbols::{CSym, FunSym};
+        // Build the MaudeVar ids in the REVERSE-of-sorted order: id 0 binds
+        // to the larger var (x.10), id 1 to the smaller (x.9).  So the raw
+        // MTerm `em(x0, x1)` is em(x.10, x.9) — unsorted.
+        let x10 = LVar::new("x", LSort::Msg, 10);
+        let x9 = LVar::new("x", LSort::Msg, 9);
+        let mut ctx = ConvCtx::new();
+        let m0 = MaudeLit::MaudeVar(0, LSort::Msg);
+        let m1 = MaudeLit::MaudeVar(1, LSort::Msg);
+        ctx.inverse.insert(m0.clone(), Lit::Var(x10.clone()));
+        ctx.inverse.insert(m1.clone(), Lit::Var(x9.clone()));
+
+        let mt: MTerm = Term::App(
+            FunSym::C(CSym::EMap),
+            vec![Term::Lit(m0), Term::Lit(m1)].into(),
+        );
+        let mut next = 100;
+        let back = mterm_to_lnterm(&mt, &mut ctx, "x", &mut next);
+
+        // Expected: em(x.9, x.10) — args sorted idx-first.
+        let expected: LNTerm = crate::term::f_app_c(
+            CSym::EMap,
+            vec![
+                Term::Lit(Lit::Var(x9)),
+                Term::Lit(Lit::Var(x10)),
+            ],
+        );
+        assert_eq!(back, expected);
+        // And concretely: first arg is x.9, not x.10.
+        if let Term::App(_, args) = &back {
+            assert_eq!(
+                args[0],
+                Term::Lit(Lit::Var(LVar::new("x", LSort::Msg, 9)))
+            );
+        } else {
+            panic!("expected an App");
+        }
     }
 }
