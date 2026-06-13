@@ -457,6 +457,34 @@ impl<'ctx> Reduction<'ctx> {
         // subst — vars in the domain get replaced (possibly by vars
         // with smaller idx), so max-var-idx can LOWER.  Invalidate.
         self.sys.invalidate_max_var_idx_cache();
+        // Build the parser-AST `VarSubst` ONCE for the whole pass.  It is
+        // derived purely from `subst` (fixed above), so it is identical
+        // for every `Disj` goal AND the formula/lemma substitution below.
+        // Previously it was rebuilt inside the per-goal loop (one
+        // `build_parser_subst_from_eq_store` — which `lnterm_to_term`-
+        // converts every entry — per `Disj` goal), making `subst_system`
+        // O(num_disj_goals × subst_size).  spdm's attack lemmas carry ~15
+        // `All…==>#x=#y` uniqueness disjuncts, so this was the single
+        // largest avoidable cost in the proof/refine hot path (~7.5% of
+        // the whole run in `perf`).  Built once here, reused everywhere.
+        //
+        // Further: the parser subst is consumed ONLY by `Disj` goals (the
+        // goal loop below) and the formula/solved-formula/lemma rewrites
+        // (after the loop).  `build_parser_subst_from_eq_store` chain-
+        // chases and `lnterm_to_term`-converts EVERY eq-store entry, which
+        // is pure waste when the system carries none of those — common in
+        // deep proof states where the lemma's formulas are already
+        // discharged.  Gate the build so it only runs when a consumer
+        // exists.
+        let needs_parser_subst = !self.sys.formulas.is_empty()
+            || !self.sys.solved_formulas.is_empty()
+            || !self.sys.lemmas.is_empty()
+            || self.sys.goals.iter().any(|(g, _)| matches!(g, Goal::Disj(_)));
+        let parser_subst = if needs_parser_subst {
+            build_parser_subst_from_eq_store(&subst)
+        } else {
+            crate::guarded::VarSubst::new()
+        };
         let map_var = |v: tamarin_term::lterm::LVar| -> tamarin_term::lterm::LVar {
             let id_term = tamarin_term::term::Term::Lit(
                 tamarin_term::vterm::Lit::Var(v.clone()));
@@ -858,7 +886,6 @@ impl<'ctx> Reduction<'ctx> {
                         (map_var(c.0), c.1),
                         (map_var(p.0), p.1)),
                 Goal::Disj(d) => {
-                    let parser_subst = build_parser_subst_from_eq_store(&subst);
                     if parser_subst.is_empty() {
                         Goal::Disj(d)
                     } else {
@@ -952,7 +979,7 @@ impl<'ctx> Reduction<'ctx> {
         // insert_implied_formulas) misses contradictions like a
         // surviving `All r. Rev(?key) @ r ==> ⊥` when the trace
         // contains `Rev(~k15) @ vr_14` — that's a soundness gap.
-        let formula_subst = build_parser_subst_from_eq_store(&subst);
+        let formula_subst = &parser_subst;
         if !formula_subst.is_empty() {
             // Iterate per-formula until subst_guarded reaches a fixpoint
             // — eq-store entries can form chains (e.g. `x:1 → x:13`,
@@ -967,7 +994,7 @@ impl<'ctx> Reduction<'ctx> {
             let apply_to_fixpoint = |f: &Guarded| -> Guarded {
                 let mut cur = f.clone();
                 for _ in 0..16 {
-                    let nxt = crate::guarded::subst_guarded(&cur, &formula_subst);
+                    let nxt = crate::guarded::subst_guarded(&cur, formula_subst);
                     if nxt == cur { break; }
                     cur = nxt;
                 }
