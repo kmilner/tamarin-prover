@@ -39,12 +39,12 @@ fn main() {
                             println!("      {:?} → {:?}", v, t);
                         }
                         println!("    -- nodes --");
-                        for (id, rule) in &sys.nodes {
+                        for (id, rule) in sys.nodes.iter() {
                             let name = tamarin_theory::constraint::solver::reduction::rule_case_name(rule);
                             println!("      {:?} = {}", id, name);
                         }
                         println!("    -- goals --");
-                        for (g, st) in &sys.goals {
+                        for (g, st) in sys.goals.iter() {
                             let extra = match g {
                                 tamarin_theory::constraint::constraints::Goal::Split(id) => {
                                     sys.eq_store.split_size(*id)

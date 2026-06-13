@@ -74,11 +74,11 @@ fn main() {
         println!("  [{}] {:?}", i, f);
     }
     println!("\ngoals:");
-    for (g, st) in &s1.goals {
+    for (g, st) in s1.goals.iter() {
         println!("  solved={} {:?}", st.solved, g);
     }
     println!("\nnodes ({}):", s1.nodes.len());
-    for (id, r) in &s1.nodes {
+    for (id, r) in s1.nodes.iter() {
         let prems: Vec<_> = r.premises.iter().map(|f|
             format!("{:?}({})", &f.tag,
                 f.terms.iter().map(|t| format!("{:?}", t)).collect::<Vec<_>>().join(","))).collect();

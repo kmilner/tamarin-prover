@@ -75,7 +75,7 @@ fn main() {
             println!("  unsolved goals: {}",
                 sys.goals.iter().filter(|(_, s)| !s.solved).count());
             println!("  nodes: {}", sys.nodes.len());
-            for (id, rule) in &sys.nodes {
+            for (id, rule) in sys.nodes.iter() {
                 let rname = match &rule.info {
                     tamarin_theory::rule::RuleInfo::Proto(p) =>
                         format!("Proto({:?})", p.name),
@@ -129,7 +129,7 @@ fn main() {
                     sys.formulas.len(), sys.goals.len(),
                     sys.nodes.len(), sys.less_atoms.len(), sys.edges.len());
                 println!("\nAll goals:");
-                for (g, st) in &sys.goals {
+                for (g, st) in sys.goals.iter() {
                     println!("  solved={} looping={} {:?}", st.solved, st.looping, g);
                 }
                 println!("\nOpen-goal filter (is_open + non-solved):");
