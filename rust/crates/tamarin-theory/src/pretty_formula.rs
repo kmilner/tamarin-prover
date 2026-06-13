@@ -1379,7 +1379,11 @@ fn pp_term(t: &p::Term, scope: &[Bind], out: &mut String) {
         // renders it back as `one`.
         NumberOne => out.push_str("one"),
         NatOne => out.push_str("%1"),
-        DhNeutral => out.push_str("1:msg"),
+        // HS `dhNeutralSym` is a nullary NoEq public constructor; HS
+        // `prettyTerm` renders `FApp (NoEq (f,_)) []` as `text f` =
+        // `dhNeutralSymString` = "DH_neutral" (Term/Term.hs:73,278,
+        // function_symbols.rs:93).  NOT `1:msg`/`1`.
+        DhNeutral => out.push_str("DH_neutral"),
         Pair(items) => {
             // HS `prettyTerm` (Term/Term.hs:277,292-293):
             //   `FApp pairSym _ -> ppTerms ", " 1 "<" ">" (split t)`
@@ -2018,7 +2022,9 @@ fn pp_gterm(t: &crate::guarded::GTerm, scope: &[Vec<Bind>], out: &mut String) {
         // `pp_term` (no `prettyTerm` special case; Term/Term.hs:266-280).
         GTerm::NumberOne => out.push_str("one"),
         GTerm::NatOne => out.push_str("%1"),
-        GTerm::DhNeutral => out.push('1'),
+        // HS renders `dhNeutralSym` (nullary NoEq) as its symbol string
+        // "DH_neutral" (Term/Term.hs:278), not `1`.
+        GTerm::DhNeutral => out.push_str("DH_neutral"),
         GTerm::App(name, args) => {
             out.push_str(name);
             out.push('(');
