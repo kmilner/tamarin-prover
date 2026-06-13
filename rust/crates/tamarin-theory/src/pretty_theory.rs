@@ -2212,15 +2212,24 @@ fn pp_proof(
     // (`annotated == false`) gets the `/* unannotated */` comment beside
     // its method.  Fully-searched / successfully-replayed steps stay
     // `Just System` (annotated == true) and render without it.
-    let unann = if node.annotated { "" } else { " /* unannotated */" };
-    let step = pp_step_at(&node.method, depth * 2);
+    // HS `prettyIncrementalProof.ppStep` (ProofSkeleton.hs:80-84) wraps
+    // every step as `sep [prettyProofMethod, comment-or-empty]`, where
+    // `comment = multiComment_ ["unannotated"]` iff `psInfo == Nothing`
+    // (`annotated == false`).  `sep` lays method+comment inline when they
+    // fit the ribbon, else drops the comment to its OWN line at the
+    // step's base indent (`depth*2`).  We build the method as a Doc and
+    // run it through the same HughesPJ engine so the break is
+    // byte-identical to HS — replacing the prior literal-string append
+    // that always kept the comment inline.
+    let base = depth * 2;
+    let annotated = node.annotated;
     let cases: Vec<(&String, &crate::constraint::solver::search::ProofNode)> =
         node.children.iter().collect();
 
     match (&node.method, cases.as_slice()) {
         (ProofMethod::Finished(MR::Solved), []) => {
-            out.push_str(&step);
-            out.push_str(unann);
+            let doc = pp_step_doc(&node.method, base, "");
+            out.push_str(&pf::step_line_with_unann(doc, base, annotated));
         }
         (_, []) => {
             // No children: `by <step>` form.  HS `ppCases ps [] =
@@ -2230,30 +2239,16 @@ fn pp_proof(
             // HughesPJ counts the `by ` (3 cols) toward the ribbon when
             // deciding the `fsep`/`sep` break — so we must render `by ` as
             // line CONTENT, not as part of the indent (see `solve_line_render`;
-            // the NAXOS/KAS2 `Match( a,` / `<…>` divergence).  Route SolveGoal
-            // through the prefix-aware Doc builder at the bare proof indent;
-            // all other (non-wrapping) steps keep the simple string form.
-            use crate::constraint::constraints::Goal;
-            match &node.method {
-                ProofMethod::SolveGoal(g) => {
-                    let line = match g {
-                        Goal::Disj(d) if !d.0.is_empty() =>
-                            pf::solve_disj_goal_line_pfx(&d.0, depth * 2, "by "),
-                        _ =>
-                            pf::solve_goal_line_from_doc_pfx(solve_goal_to_doc(g), depth * 2, "by "),
-                    };
-                    out.push_str(&line);
-                }
-                _ => {
-                    out.push_str("by ");
-                    out.push_str(&pp_step_at(&node.method, depth * 2 + 3));
-                }
-            }
-            out.push_str(unann);
+            // the NAXOS/KAS2 `Match( a,` / `<…>` divergence).  The `by `
+            // prefix is `beside`-prepended into the method Doc by
+            // `pp_step_doc`, then `step_line_with_unann` appends the
+            // optional `/* unannotated */` via `sep`.
+            let doc = pp_step_doc(&node.method, base, "by ");
+            out.push_str(&pf::step_line_with_unann(doc, base, annotated));
         }
         (_, [(label, child)]) if label.is_empty() => {
-            out.push_str(&step);
-            out.push_str(unann);
+            let doc = pp_step_doc(&node.method, base, "");
+            out.push_str(&pf::step_line_with_unann(doc, base, annotated));
             out.push('\n');
             // HS `ppCases ps [("", prf)] = prettyStep ps $-$ ppPrf prf`
             // (Proof.hs:1086).  `$-$` is "above" — the child is rendered
@@ -2265,8 +2260,8 @@ fn pp_proof(
             pp_proof(child, out, depth);
         }
         (_, multi) => {
-            out.push_str(&step);
-            out.push_str(unann);
+            let doc = pp_step_doc(&node.method, base, "");
+            out.push_str(&pf::step_line_with_unann(doc, base, annotated));
             for (i, (name, child)) in multi.iter().enumerate() {
                 if i > 0 {
                     // HS Proof.hs:1089: `intersperse (prettyCase ps kwNext)`
@@ -2297,6 +2292,52 @@ fn pp_proof(
 #[allow(dead_code)]
 fn pp_step(m: &crate::constraint::solver::proof_method::ProofMethod) -> String {
     pp_step_at(m, 0)
+}
+
+/// Build the proof-step method as a `pretty_hpj::Doc`, mirroring
+/// `pp_step_at` but yielding a Doc (so it can be combined with the
+/// `/* unannotated */` comment via `sep`, per HS
+/// `prettyIncrementalProof.ppStep`, ProofSkeleton.hs:80-84).
+///
+/// `prefix` is the leaf-step keyword (`"by "` for childless steps, `""`
+/// otherwise); it is laid out BESIDE the method as line content (NOT
+/// folded into the indent) so HughesPJ counts its columns toward the
+/// ribbon, identical to `solve_line_render`/`pp_proof`'s string path.
+///
+/// `base_indent` is the column where the step's first char lands; used
+/// by the SolveGoal goal builders so wrapped continuation lines indent
+/// to the column after `solve( ` (= base_indent + len(prefix) + 7).
+fn pp_step_doc(
+    m: &crate::constraint::solver::proof_method::ProofMethod,
+    base_indent: usize,
+    prefix: &str,
+) -> crate::pretty_hpj::Doc {
+    use crate::constraint::constraints::Goal;
+    use crate::constraint::solver::proof_method::ProofMethod as PM;
+    use crate::pretty_hpj::Doc;
+    // `solve( <goal> )` builds its own goal Doc; everything else is a
+    // flat string with no internal wrapping, so `Doc::text` of the
+    // string form is faithful.
+    let body = match m {
+        PM::SolveGoal(g) => {
+            let inner = match g {
+                Goal::Disj(d) if !d.0.is_empty() => pf::disj_goal_to_doc(&d.0),
+                _ => solve_goal_to_doc(g),
+            };
+            Doc::text("solve(")
+                .beside_sp(inner)
+                .beside_sp(Doc::text(")"))
+        }
+        // For non-SolveGoal methods the goal indent argument is unused;
+        // reuse `pp_step_at`'s string form.  `by `-prefixed leaf steps
+        // (e.g. `by sorry`) render the method at the post-prefix column.
+        _ => Doc::text(pp_step_at(m, base_indent + prefix.chars().count())),
+    };
+    if prefix.is_empty() {
+        body
+    } else {
+        Doc::text(prefix).beside(body)
+    }
 }
 
 fn pp_step_at(m: &crate::constraint::solver::proof_method::ProofMethod, indent: usize) -> String {

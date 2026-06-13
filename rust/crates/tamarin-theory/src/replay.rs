@@ -413,9 +413,18 @@ fn replay_node(
                         annotated: true,
                     }
                 } else {
-                    // HS check-and-extend: unhandled case → `sorry`
-                    // (Nothing) (Proof.hs:464, sorryProver Nothing).
-                    annotated_sorry(None, sys.clone())
+                    // HS check-and-extend, `mergeMapsWith` rightOnly branch
+                    // (Proof.hs:465): a case present in the stored skeleton
+                    // but NOT produced by re-executing the method is mapped
+                    // through `noSystemPrf` (Proof.hs:468-469) =
+                    // `mapProofInfo (\i -> (Just i, Nothing))`, applied to
+                    // the WHOLE skeleton subtree.  After `mapProofInfo snd`
+                    // (checkAndExtendProver, Proof.hs:628) the info is
+                    // `Nothing` for every node, so the entire subtree
+                    // renders unannotated (`/* unannotated */`).  Mirror
+                    // this with `parsed_to_unannotated`, NOT a single
+                    // annotated sorry leaf.
+                    parsed_to_unannotated(sub_tree, sys.clone())
                 };
                 children.insert(skel_name.clone(), placeholder);
                 any_sorry = true;
@@ -467,8 +476,17 @@ fn replay_node(
         let auto = if auto_prove {
             run_proof_search(ctx, rt_sys, max_steps)
         } else {
-            // HS check-and-extend: a runtime case the stored skeleton
-            // doesn't cover → unhandled case → `sorry` (Nothing).
+            // HS check-and-extend, `mergeMapsWith` leftOnly branch
+            // (Proof.hs:465): a case PRODUCED by re-executing the method
+            // but absent from the stored skeleton is handled by
+            // `unhandledCase = mapProofInfo (Nothing,) . prover d`
+            // (Proof.hs:464).  `prover` there is
+            // `sorryProver Nothing` (Proof.hs:631-632, runProver), which
+            // yields `sorry Nothing (Just se)` — info `(Nothing, Just se)`.
+            // After `mapProofInfo snd` (Proof.hs:628) the info is
+            // `Just se`, so the leaf is ANNOTATED → plain `by sorry`
+            // (NO `/* unannotated */`).  This differs from the rightOnly
+            // branch above, which is `Nothing`.
             annotated_sorry(None, rt_sys)
         };
         if push_path {
@@ -1526,5 +1544,33 @@ mod tests {
             alt_texts: vec![String::new(), String::new()],
         };
         assert_eq!(match_goal(&spec2, &sys).expect("should match"), two);
+    }
+
+    /// HS check-and-extend, `mergeMapsWith` rightOnly branch
+    /// (Proof.hs:465,468-469): a stored-skeleton case that the
+    /// re-executed method does NOT produce is mapped through
+    /// `noSystemPrf` over the WHOLE subtree → every node `Nothing` →
+    /// `/* unannotated */`.  `parsed_to_unannotated` must therefore set
+    /// `annotated == false` on EVERY node of the converted subtree, not
+    /// just the root.  (Regression guard for fix B: the rightOnly path
+    /// previously emitted a single `annotated == true` sorry leaf.)
+    #[test]
+    fn parsed_to_unannotated_marks_whole_subtree() {
+        // Skeleton:  simplify → case "a" (by sorry), case "b" (by sorry)
+        let leaf = |m| ParsedProofTree { method: m, cases: Vec::new() };
+        let skel = ParsedProofTree {
+            method: ParsedMethod::Simplify,
+            cases: vec![
+                ("a".to_string(), leaf(ParsedMethod::Sorry)),
+                ("b".to_string(), leaf(ParsedMethod::Sorry)),
+            ],
+        };
+        let node = parsed_to_unannotated(&skel, System::empty());
+        assert!(!node.annotated, "root must be unannotated");
+        assert_eq!(node.children.len(), 2);
+        for (name, child) in &node.children {
+            assert!(!child.annotated, "child `{name}` must be unannotated");
+            assert!(matches!(child.method, ProofMethod::Sorry(None)));
+        }
     }
 }

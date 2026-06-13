@@ -245,6 +245,65 @@ fn solve_line_render(solve_body: crate::pretty_hpj::Doc, base_indent: usize, pre
     rendered[strip..].to_string()
 }
 
+/// HS `multiComment_ ["unannotated"]`
+/// (Theory/Text/Pretty.hs:105-106):
+///   `comment $ fsep [text "/*", vcat $ map text ls, text "*/"]`
+/// With a single line `"unannotated"`, `vcat [text "unannotated"]` is
+/// just `text "unannotated"`, and `fsep` joins the three with single
+/// spaces when they fit (they always do at any indent ≤ ribbon), giving
+/// `/* unannotated */`.  `comment` is a highlight wrapper — a no-op for
+/// raw (non-coloured) output.
+pub fn unannotated_comment_doc() -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    hpj::fsep(vec![
+        Doc::text("/*"),
+        Doc::text("unannotated"),
+        Doc::text("*/"),
+    ])
+}
+
+/// Render a proof-step line that may carry the `/* unannotated */`
+/// comment, reproducing HS `prettyIncrementalProof.ppStep`
+/// (ProofSkeleton.hs:80-84):
+///   `sep [ prettyProofMethod (psMethod step)
+///        , if isNothing (psInfo step) then multiComment_ ["unannotated"]
+///                                     else emptyDoc ]`
+///
+/// `method_doc` is the rendered proof method (e.g. `solve( … )`,
+/// `simplify`, `by sorry` — the `by ` prefix, if any, must already be
+/// `beside`-prepended into `method_doc` by the caller).  When `annotated`
+/// is true the comment is omitted and only the method is laid out
+/// (byte-identical to the prior string path).  When false, HughesPJ's
+/// `sep` first tries to fit `method <space> /* unannotated */` on one
+/// line; if the (flattened) method + comment exceeds the ribbon, the
+/// comment drops to its OWN line at the sep's base indent
+/// (= `base_indent`, the proof step's depth indent).
+///
+/// As with `solve_line_render`, the whole step is `nest`ed at
+/// `base_indent` and the leading `base_indent` spaces are stripped from
+/// the FIRST line (the caller has already emitted that indent), while a
+/// dropped comment line retains its `base_indent` leading spaces.
+pub fn step_line_with_unann(
+    method_doc: crate::pretty_hpj::Doc,
+    base_indent: usize,
+    annotated: bool,
+) -> String {
+    use crate::pretty_hpj as hpj;
+    let step = if annotated {
+        method_doc
+    } else {
+        hpj::sep(vec![method_doc, unannotated_comment_doc()])
+    };
+    let indented = step.nest(base_indent as isize);
+    let rendered = indented.render();
+    let strip = rendered
+        .chars()
+        .take(base_indent)
+        .take_while(|c| *c == ' ')
+        .count();
+    rendered[strip..].to_string()
+}
+
 /// Build the `solve( <goal> )` line for a NON-DisjG goal, where the
 /// caller has already constructed `goal_doc` for the goal body (HS
 /// `prettyGoal`, Constraints.hs:273-287).  Mirrors HS
@@ -2134,6 +2193,53 @@ mod tests {
     fn trivial_formulas() {
         assert_eq!(pretty_formula(&p::Formula::True), "\u{22A4}");
         assert_eq!(pretty_formula(&p::Formula::False), "\u{22A5}");
+    }
+
+    #[test]
+    fn unannotated_comment_renders_inline() {
+        // `multiComment_ ["unannotated"]` → `/* unannotated */`.
+        assert_eq!(
+            unannotated_comment_doc().render(),
+            "/* unannotated */"
+        );
+    }
+
+    #[test]
+    fn step_unann_inline_when_short() {
+        // A short method + comment fit on one line: `sep` keeps the
+        // `/* unannotated */` inline beside the method (HS ppStep,
+        // ProofSkeleton.hs:80-84).
+        use crate::pretty_hpj::Doc;
+        let m = Doc::text("simplify");
+        let out = step_line_with_unann(m, 2, /*annotated=*/ false);
+        assert_eq!(out, "simplify /* unannotated */");
+    }
+
+    #[test]
+    fn step_annotated_omits_comment() {
+        // When the step is annotated (psInfo = Just _), NO comment.
+        use crate::pretty_hpj::Doc;
+        let m = Doc::text("by sorry");
+        let out = step_line_with_unann(m, 4, /*annotated=*/ true);
+        assert_eq!(out, "by sorry");
+    }
+
+    #[test]
+    fn step_unann_breaks_past_ribbon() {
+        // When the method line is so long that method + ` /* unannotated
+        // */` exceeds the ribbon (73), `sep` drops the comment to its OWN
+        // line at the step's base indent (here base_indent = 2).  The
+        // method's own (single-line) text stays put; only the comment
+        // moves.  Mirrors Reproducer A.
+        use crate::pretty_hpj::Doc;
+        let long = "solve( (last(#k))  \u{2225} (something quite long here indeed yes) )";
+        assert!(long.chars().count() + " /* unannotated */".chars().count() > 73);
+        let out = step_line_with_unann(Doc::text(long), 2, /*annotated=*/ false);
+        let lines: Vec<&str> = out.split('\n').collect();
+        assert_eq!(lines.len(), 2, "comment should drop to its own line: {out:?}");
+        assert_eq!(lines[0], long, "method line unchanged");
+        // Dropped comment sits at the step's base indent (2 spaces).
+        assert_eq!(lines[1], "  /* unannotated */");
     }
 
     #[test]
