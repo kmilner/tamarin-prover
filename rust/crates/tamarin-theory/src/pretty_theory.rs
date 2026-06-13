@@ -762,11 +762,43 @@ fn render_parsed_macros(macros: &[p::Macro]) -> String {
     header.above(body).render()
 }
 
+/// Render a rule's attribute block `[...]`, mirroring HS `prettyRuleAttributes`
+/// / `prettyRuleAttribute` (Model/Rule.hs:1201-1217).  HS emits a FIXED-order
+/// `catMaybes [color, process, no_derivcheck, issapicrule, role]` joined by
+/// `fsep . punctuate comma` (", "), wrapped in `[`..`]`; empty → nothing.
+/// External (`x-…`) attributes are NOT in HS's list, so they are dropped.
+fn render_rule_attributes(attrs: &[p::RuleAttr]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    // color= : HS `text "color=" <> text (rgbToHex c)`; `rgbToHex` is
+    // `'#':` + lowercase 2-digit-per-channel hex (Data/Color.hs:141).
+    if let Some(hex) = attrs.iter().find_map(|a| match a {
+        p::RuleAttr::Color(c) => Some(c), _ => None }) {
+        parts.push(format!("color=#{}", hex.trim_start_matches('#').to_lowercase()));
+    }
+    // process= : HS renders the SAPIC process; we emit the stored raw text.
+    if let Some(pr) = attrs.iter().find_map(|a| match a {
+        p::RuleAttr::Process(s) => Some(s), _ => None }) {
+        parts.push(format!("process=\"{}\"", pr));
+    }
+    if attrs.iter().any(|a| matches!(a, p::RuleAttr::NoDerivCheck)) {
+        parts.push("no_derivcheck".to_string());
+    }
+    if attrs.iter().any(|a| matches!(a, p::RuleAttr::IsSapicRule)) {
+        parts.push("issapicrule".to_string());
+    }
+    if let Some(r) = attrs.iter().find_map(|a| match a {
+        p::RuleAttr::Role(r) => Some(r), _ => None }) {
+        parts.push(format!("role='{}'", r));
+    }
+    if parts.is_empty() { String::new() } else { format!("[{}]", parts.join(", ")) }
+}
+
 fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro]) -> String {
     let name = &parsed_rule.name;
     let mut out = String::new();
     out.push_str("rule (modulo E) ");
     out.push_str(name);
+    out.push_str(&render_rule_attributes(&parsed_rule.attributes));
     out.push_str(":\n");
     // Desugar `let x = t in ...` bindings before rendering — HS does
     // this via `applyMacroInProtoRule`/`expandRuleLetBlock` so the
@@ -891,7 +923,7 @@ fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro]) -> Str
     } else if let Some(r) = elab_rule {
         out.push_str("\n\n");
         out.push_str(&outer_loop_breaker);
-        out.push_str(&render_ac_variants_block(name, r));
+        out.push_str(&render_ac_variants_block(name, r, &parsed_rule.attributes));
     }
     out
 }
@@ -1041,10 +1073,10 @@ fn render_fact_inline(fa: &p::Fact) -> String {
 /// header — matching HS byte-for-byte for the AddPublicKey-style case
 /// where the AC body differs from the E body but no residual variant
 /// disjunction remains.
-fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule) -> String {
+fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule, attrs: &[p::RuleAttr]) -> String {
     let mut s = String::new();
     s.push_str("  /*\n");
-    s.push_str(&format!("  rule (modulo AC) {}:\n", name));
+    s.push_str(&format!("  rule (modulo AC) {}{}:\n", name, render_rule_attributes(attrs)));
     // Body of the abstracted rule.  Use the abstracted version when
     // available; fall back to the original facts.
     // Use the abstracted rule's facts when available; when `abstracted_rule`
