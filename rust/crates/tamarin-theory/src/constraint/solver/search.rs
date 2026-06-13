@@ -64,14 +64,23 @@ pub enum NodeStatus {
 /// Per-lemma wall-clock cap on `run_proof_search`. Mirrors Haskell
 /// tamarin's `--prove-timeout` flag: when the search tree branches
 /// faster than CR-rules can prune (e.g. with a richer signature), we'd
-/// rather mark the lemma `Sorry` than spin forever. Set via the
-/// `TAM_PROVE_DEADLINE_MS` env var; default 30s, which matches
-/// tamarin's per-lemma default.
+/// rather mark the lemma `Sorry` than spin forever.
+///
+/// HS-faithful: HS has NO per-lemma wall-clock deadline — its iterative
+/// deepening runs to completion.  So by DEFAULT we apply NO cutoff either
+/// (a far-future deadline that never fires); termination is still
+/// guaranteed by the ID-DFS depth cap (`MAX_DEPTH`, 2048).  A cutoff is
+/// applied ONLY when the caller explicitly opts in via the
+/// `TAM_PROVE_DEADLINE_MS` env var (e.g. corpus sweeps that want to bound
+/// per-lemma wall time).
 fn proof_deadline() -> std::time::Instant {
-    let ms: u64 = std::env::var("TAM_PROVE_DEADLINE_MS").ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30_000);
-    std::time::Instant::now() + std::time::Duration::from_millis(ms)
+    match std::env::var("TAM_PROVE_DEADLINE_MS").ok().and_then(|s| s.parse::<u64>().ok()) {
+        Some(ms) => std::time::Instant::now() + std::time::Duration::from_millis(ms),
+        // No env override → run unbounded (faithful to HS).  ~10 years is
+        // effectively infinite and safe against `Instant` overflow.
+        None => std::time::Instant::now()
+            + std::time::Duration::from_secs(10 * 365 * 24 * 3600),
+    }
 }
 
 thread_local! {
