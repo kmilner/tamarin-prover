@@ -646,11 +646,7 @@ fn formula_to_doc(
     match f {
         True => doc_text("\u{22A4}"),
         False => doc_text("\u{22A5}"),
-        Atom(a) => {
-            let mut s = String::new();
-            pp_atom(a, scope, &mut s);
-            doc_text(s)
-        }
+        Atom(a) => atom_to_doc(a, scope),
         Not(p_) => {
             // HS: `operator_ "¬" <> opParens p'` — `<>` is no-break
             // beside.  The inner opParens is unconditional.
@@ -680,6 +676,55 @@ fn formula_to_doc(
                 hpj::sep(vec![quant, body_doc.nest(1)])
             })
         }
+    }
+}
+
+/// Build a breakable `Doc` for a formula atom, mirroring HS
+/// `prettyProtoAtom` (Theory/Model/Atom.hs:216-224).  Crucially the
+/// fact/term sub-Docs are the SAME breakable `fact_to_doc`/`term_to_doc`
+/// used elsewhere, so a fact like `F( a, b, c )` can drop its closing `)`
+/// onto its own line (HS `prettyFact`'s `nestShort'`) when the ribbon is
+/// exceeded — e.g. spdm Attack_Session_Mode_Switch's deeply-nested
+/// conjunction.  Previously the atom was flattened to one `Doc::text`,
+/// so it could never break inside a formula and overflowed the ribbon
+/// where HS wraps.  When the atom fits on the line the Doc renders
+/// byte-identically to the old flat string, so this only changes
+/// over-wide atoms (toward HS), never fitting ones.
+fn atom_to_doc(a: &p::Atom, scope: &[Bind]) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    use p::Atom::*;
+    match a {
+        // HS `EqE l r -> sep [ppT l <-> opEqual, ppT r]` (Atom.hs:219).
+        Eq(l, r) => hpj::sep(vec![
+            term_to_doc(l, scope).beside_sp(Doc::text("=")),
+            term_to_doc(r, scope),
+        ]),
+        // HS `Subterm l r -> sep [ppT l <-> opSubterm, ppT r]` (Atom.hs:221).
+        Subterm(l, r) => hpj::sep(vec![
+            term_to_doc(l, scope).beside_sp(Doc::text("\u{228F}")),
+            term_to_doc(r, scope),
+        ]),
+        // HS `Less u v -> text (show u) <-> opLess <-> text (show v)`
+        // (Atom.hs:222) — `<->` is `<+>`, no break.
+        Less(l, r) => term_to_doc(l, scope)
+            .beside_sp(Doc::text("<"))
+            .beside_sp(term_to_doc(r, scope)),
+        // Rust-only multiset-`(<)` ordering atom; mirror `Less`'s shape.
+        LessMset(l, r) => term_to_doc(l, scope)
+            .beside_sp(Doc::text("(<)"))
+            .beside_sp(term_to_doc(r, scope)),
+        // HS `Action v fa -> prettyFact ppT fa <-> opAction <-> text (show v)`
+        // (Atom.hs:216-217).  Breakability lives inside `prettyFact`.
+        Action(fa, t) => fact_to_doc(fa, scope)
+            .beside_sp(Doc::text("@"))
+            .beside_sp(term_to_doc(t, scope)),
+        // HS `Last i -> operator_ "last" <> parens (text (show i))`
+        // (Atom.hs:224) — `<>` is no-space beside.
+        Last(t) => Doc::text("last(")
+            .beside(term_to_doc(t, scope))
+            .beside(Doc::text(")")),
+        // HS syntactic-sugar predicate: `prettyPred (Pred fa) = prettyNFact fa`.
+        Pred(fa) => fact_to_doc(fa, scope),
     }
 }
 
