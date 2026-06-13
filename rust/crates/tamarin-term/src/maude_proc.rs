@@ -1171,13 +1171,43 @@ impl MaudeHandle {
             use crate::term::Term;
             pp_mterm(&Term::App(FunSym::List, items.to_vec().into()))
         };
+        // Maude's `match A <=? B` finds σ with `B == σ(A)`: A is the
+        // PATTERN (whose vars get bound), B is the SUBJECT (treated as
+        // ground).  Callers pass `Equal { lhs = pattern, rhs = subject }`
+        // (see `match_atom_via_maude` in simplify.rs, which builds the
+        // guard-fact pattern as `lhs` and the system action term as
+        // `rhs`), and this routine already skolemizes the SUBJECT side
+        // (`eq.rhs`) into ground constants above.  So the command must be
+        //   match  <pattern = t1s = lhs>  <=?  <subject = t2s = rhs>.
+        //
+        // PREVIOUSLY this emitted the two sides SWAPPED — `match t2s <=?
+        // t1s` — which placed the (ground, skolemized) subject in the
+        // pattern slot and the pattern (with its universal-bound vars) in
+        // the subject slot.  Maude then treated the pattern's vars as
+        // opaque constants, so any AC match where a pattern var must
+        // ABSORB a sub-multiset failed: e.g. matching the guard
+        //   BB_Cs(BB, <'codes', codeOther ++ <cp(..),cp(..)>>)
+        // against a system action with a 3-element multiset
+        //   <'codes', code2 ++ x ++ <cp(..),cp(..)>>
+        // needs `codeOther → code2 ++ x`, which Maude only does when
+        // `codeOther` sits on the PATTERN side.  With the swap it
+        // returned "No match", `insertImpliedFormulas` never derived
+        // gfalse for that case, and alethea `indivVerif` was FALSIFIED
+        // (false attack) where Haskell VERIFIES it.  HS sends
+        // `match pattern <=? subject` (Term/Maude.hs matchCmd); we now do
+        // the same.  Sibling `match_eqs_skolemize_both` already had the
+        // correct order.
         let mut cmd = b"match in MSG : ".to_vec();
-        cmd.extend(pp_list(&t2s));
-        cmd.extend_from_slice(b" <=? ");
         cmd.extend(pp_list(&t1s));
+        cmd.extend_from_slice(b" <=? ");
+        cmd.extend(pp_list(&t2s));
         cmd.extend_from_slice(b" .\n");
         let t_before_exec = if prof { Some(std::time::Instant::now()) } else { None };
         let reply = inner.execute(&cmd)?;
+        if std::env::var_os("TAM_DBG_MECS_RAW").is_some() {
+            eprintln!("[MECS_RAW] cmd={}", String::from_utf8_lossy(&cmd));
+            eprintln!("[MECS_RAW] reply={}", String::from_utf8_lossy(&reply));
+        }
         let t_after_exec = if prof { Some(std::time::Instant::now()) } else { None };
         inner.stats.match_count += 1;
         let sig = inner.sig.clone();
@@ -1941,5 +1971,46 @@ mod tests {
         // After releasing, the worker should wake up promptly.
         rx.recv_timeout(std::time::Duration::from_secs(5)).expect("worker should unblock");
         t.join().unwrap();
+    }
+
+    // Regression (alethea `indivVerif` false-attack, fixed by emitting
+    // `match PATTERN <=? SUBJECT` in the right order):
+    // pattern multiset `codeOther ++ <a,b>` (codeOther is the only
+    // pattern var) must AC-match subject `code2 ++ x ++ <a,b>` by
+    // binding `codeOther -> code2 ++ x`.  HS's Maude matchAction does
+    // this; `match_eqs_const_subject` previously swapped pattern/subject
+    // and returned "No match", which left `insertImpliedFormulas` from
+    // deriving gfalse and FALSIFIED a true lemma.
+    #[test]
+    fn match_eqs_const_subject_mset_var_to_submultiset() {
+        let path = match maude_path() { Some(p) => p, None => { eprintln!("skipping: no maude"); return; } };
+        use crate::function_symbols::{AcSym, NoEqSym, FunSym, Privacy, Constructability};
+        let pair_sym = NoEqSym::new(b"pair".to_vec(), 2, Privacy::Public, Constructability::Constructor);
+        let sig = crate::maude_sig::mset_maude_sig().add_fun_sym(pair_sym.clone());
+        let h = MaudeHandle::start(&path, sig).expect("start");
+        let mk = |v: LVar| -> LNTerm { crate::term::Term::Lit(Lit::Var(v)) };
+        // ground "pair" payload a,b -> use public name constants
+        let a = crate::term::Term::Lit(Lit::Con(crate::lterm::Name::new(crate::lterm::NameTag::Pub, "a")));
+        let b = crate::term::Term::Lit(Lit::Con(crate::lterm::Name::new(crate::lterm::NameTag::Pub, "b")));
+        let payload = crate::term::Term::App(FunSym::NoEq(pair_sym.clone()), vec![a, b].into());
+        // pattern var codeOther:Msg idx 89 (the universal-bound var)
+        let code_other = LVar::new("codeOther", LSort::Msg, 89);
+        let pat = crate::term::f_app_ac(AcSym::Union, vec![mk(code_other.clone()), payload.clone()]);
+        // subject: code2:Msg, x:Msg (free system vars, skolemized by the fn)
+        let code2 = LVar::new("code2", LSort::Msg, 8);
+        let xv = LVar::new("x", LSort::Msg, 9);
+        let subj = crate::term::f_app_ac(AcSym::Union, vec![mk(code2.clone()), mk(xv.clone()), payload.clone()]);
+        let mut pattern_vars = std::collections::BTreeSet::new();
+        pattern_vars.insert(("codeOther".to_string(), 89u64));
+        let res = h.match_eqs_const_subject(
+            &[Equal { lhs: pat, rhs: subj }], &pattern_vars).expect("match");
+        eprintln!("[REPRO] match result count = {}", res.len());
+        for m in &res {
+            for (lv, lt) in m {
+                eprintln!("[REPRO]   {}#{} -> {:?}", lv.name, lv.idx, lt);
+            }
+        }
+        assert!(!res.is_empty(),
+            "expected codeOther to AC-match a 2-element sub-multiset");
     }
 }
