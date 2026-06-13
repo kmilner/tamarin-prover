@@ -23,6 +23,7 @@
 //! - Top-level `Theory` module (open/closed theories)
 
 pub mod atom;
+pub mod check_terms;
 pub mod fact;
 pub mod formula;
 pub mod intruder_rules;

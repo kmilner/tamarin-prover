@@ -70,8 +70,18 @@ fn every_fixture_parses_and_matches() {
         };
         if fx.is_diff { thy.is_diff = true; }
         let topics = wf::topics(&wf::check_theory(&thy));
-        if !fx.expected.is_subset(&topics) {
-            let missing: Vec<_> = fx.expected.difference(&topics).collect();
+        // The "Formula terms" check (HS `checkTerms`) needs the elaborated
+        // `MaudeSig` for reducible/irreducible funsym classification, so it
+        // lives in `tamarin_theory::check_terms` and runs post-elaboration
+        // (wired in `tamarin-prover`'s `run.rs`) — NOT in the parser-level
+        // `check_theory`.  It is covered by `check_terms`'s own unit tests
+        // and the corpus raw-diff sweep.  Drop it from this parser-only
+        // comparison so the fixtures that exercise it aren't spuriously
+        // failed here.
+        let mut expected = fx.expected.clone();
+        expected.remove("Formula terms");
+        if !expected.is_subset(&topics) {
+            let missing: Vec<_> = expected.difference(&topics).collect();
             failures.push(format!(
                 "TOPIC  {}: missing {:?} (got {:?})", fx.name, missing, topics));
         }

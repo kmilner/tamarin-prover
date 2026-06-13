@@ -573,6 +573,36 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             eprintln!("[Theory {}] Theory translated", theory_name);
         }
 
+        // Port of HS `formulaReports.checkTerms` (Wellformedness.hs:960-985,
+        // "Formula terms" topic).  This check needs the elaborated `MaudeSig`
+        // (reducible/irreducible funsym classification, `irreducibleFunSyms
+        // maudeSig`) so it runs HERE (post-elaborate) rather than inside
+        // `check_theory` (parser-level).  Macros were already expanded into
+        // `parsed_for_wf`; `check_terms_wf` re-expands its own clone the same
+        // way (HS `applyMacroInFormula`).
+        //
+        // Position: HS `formulaReports` order is Quantifier sorts (8a),
+        // Formula terms (8b), Formula guardedness (8c).  After `groupOn`,
+        // "Formula terms" sorts before "Formula guardedness", so insert this
+        // block BEFORE the guardedness block below.  Insert before the first
+        // topic that comes after position 8b.
+        {
+            let term_errors = tamarin_theory::check_terms::check_terms_wf(
+                &parsed_for_wf, &maude_sig);
+            if !term_errors.is_empty() {
+                let insert_before = wf_report.iter().position(|e| {
+                    matches!(e.topic.as_str(),
+                        " Formula guardedness"
+                        | "Lemma annotations" | "Multiplication restriction of rules"
+                        | "Nat Sorts" | "Subterm Convergence Warning"
+                        | "Message Derivation Checks" | "Derivation Checks")
+                }).unwrap_or(wf_report.len());
+                let tail = wf_report.split_off(insert_before);
+                wf_report.extend(term_errors);
+                wf_report.extend(tail);
+            }
+        }
+
         // Port of HS `formulaReports.checkGuarded` (Wellformedness.hs:988-1004):
         // for each lemma/restriction formula that cannot be converted to a
         // guarded formula, emit a ` Formula guardedness` WF error.  This
