@@ -332,6 +332,16 @@ impl ProofContext {
         *self.saturate_state.lock().unwrap() = SaturateState::Done;
     }
 
+    /// Mark this context's sources as already saturated, bypassing the
+    /// `ensure_saturated` pass.  Used by the session-level refined-source
+    /// cache (lever #3): when the cases have been restored from a sibling
+    /// lemma's identical computation, set the state to `Done` so later
+    /// `cases(ctx)` calls read the restored cells directly instead of
+    /// re-running the (expensive) `saturate_sources_with_simp` pass.
+    pub fn mark_saturated_done(&self) {
+        *self.saturate_state.lock().unwrap() = SaturateState::Done;
+    }
+
     /// Variant that accepts the theory-level restrictions.  Mirrors
     /// Haskell's `precomputeSources parameters ctxt restrictions`
     /// which threads restrictions into each `initialSource`'s system
