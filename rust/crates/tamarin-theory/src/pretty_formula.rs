@@ -721,16 +721,31 @@ fn formula_to_doc(
             // `quantifier = ppQ <> ppVars vs <> "."`, body indented +1.
             // HS `pp (Qua _ _ _) = scopeFreshness $ do ...`
             // (Formula.hs:496-502) — every Qua saves/restores state.
-            let sym = if matches!(f, Forall(_, _)) { "\u{2200}" } else { "\u{2203}" };
+            // HS `ppQuant qua <> ppVars vs <> operator_ "."` where
+            // `ppVars = fsep . map (text . show)` (Formula.hs:505-508) and
+            // `opExists = operator_ "∃ "` / `opForall = operator_ "∀ "`
+            // (Pretty.hs:177-178) carry their own trailing space.  The
+            // `fsep` makes the bound-var list BREAKABLE, so a long var list
+            // wraps across lines (continuation aligned after the `∃ ` prefix
+            // via `<>`'s nesting offset) — matching HS byte-for-byte.
+            // Previously the prefix was a single flat `Doc::text`, so it
+            // could never wrap.
+            let sym = if matches!(f, Forall(_, _)) { "\u{2200} " } else { "\u{2203} " };
             state.scope_freshness(|state| {
                 let new_scope = allocate_formula_binders(vs, scope, state);
-                let mut vars_str = String::new();
-                for (i, b) in new_scope[scope.len()..].iter().enumerate() {
-                    if i > 0 { vars_str.push(' '); }
-                    vars_str.push_str(sort_prefix_from_hint(b.1));
-                    vars_str.push_str(&b.2);
-                }
-                let quant = doc_text(format!("{} {}.", sym, vars_str));
+                let var_docs: Vec<hpj::Doc> = new_scope[scope.len()..]
+                    .iter()
+                    .map(|b| {
+                        let mut s = String::new();
+                        s.push_str(sort_prefix_from_hint(b.1));
+                        s.push_str(&b.2);
+                        doc_text(s)
+                    })
+                    .collect();
+                // `opQuant <> fsep(vars) <> "."`
+                let quant = doc_text(sym)
+                    .beside(hpj::fsep(var_docs))
+                    .beside(doc_text("."));
                 let body_doc = formula_to_doc(body, &new_scope, state);
                 hpj::sep(vec![quant, body_doc.nest(1)])
             })
@@ -2266,6 +2281,40 @@ mod tests {
         assert!(s.contains("F( ni )"));
         assert!(s.contains("@ #i"));
         assert!(s.contains("\u{21D2}"));
+    }
+
+    #[test]
+    fn long_quantifier_varlist_wraps() {
+        // HS `ppVars = fsep . map (text . show)` (Formula.hs:508): a long
+        // bound-var list wraps across lines, the continuation aligned after
+        // the `∃ ` prefix (column 2, the `<>` nesting offset).  Build an
+        // existential with enough vars to overflow the ribbon, body `⊥`.
+        let names = [
+            "i1", "i2", "j1", "j2", "h1", "h2", "ss", "vote2", "fstcode1",
+            "sndcode1", "fstcode2", "sndcode2", "ess", "hv1", "hv2", "hy1",
+            "hy2", "x1", "x2", "adv1", "adv2", "ek", "bb", "sks", "y1", "y2",
+            "aa", "ea", "el", "em",
+        ];
+        let vs: Vec<p::VarSpec> =
+            names.iter().map(|n| v(n, p::SortHint::Untagged)).collect();
+        let f = p::Formula::Exists(vs, Box::new(p::Formula::False));
+        let out = pretty_formula_wrapped(&f, 0, 110);
+        let lines: Vec<&str> = out.split('\n').collect();
+        assert!(lines.len() >= 2, "long var list must wrap: {out:?}");
+        // First line opens with the existential symbol and a space.
+        assert!(lines[0].starts_with("\u{2203} "), "first line: {:?}", lines[0]);
+        // Continuation lines are indented by 2 (aligned after `∃ `), i.e.
+        // exactly the column where the first bound var landed.
+        for cont in &lines[1..] {
+            // Skip the final body-only line if it is just the nested `⊥`.
+            if cont.trim_start() == "\u{22A5}" { continue; }
+            assert!(
+                cont.starts_with("  ") && !cont.starts_with("   "),
+                "continuation var line should align at col 2: {cont:?}"
+            );
+        }
+        // No bound var was dropped: the rendered text contains every name.
+        for n in names { assert!(out.contains(n), "missing var {n} in {out:?}"); }
     }
 
     #[test]
