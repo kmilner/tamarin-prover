@@ -24,19 +24,42 @@ use crate::term::Term;
 /// configured equational theory. Returns `None` if the two are
 /// incomparable, or `Some(Ord)` otherwise.
 ///
-/// Uses Maude's matcher. `Some(Ordering::Greater)` means `t1` is
-/// strictly more specific than `t2` (there's a match `t2 = pattern,
-/// t1 = subject`); `Less` is the reverse; `Equal` means both
-/// directions match.
+/// Uses Maude's matcher. Port of HS `compareTermSubs`
+/// (`lib/term/src/Term/Subsumption.hs:37-45`):
+///
+/// ```haskell
+/// compareTermSubs t1 t2 = check <$> solveMatchLNTerm (t1 `matchWith` t2)
+///                               <*> solveMatchLNTerm (t2 `matchWith` t1)
+///   where check (_:_) []    = Just GT
+///         check []    (_:_) = Just LT
+///         check (_:_) (_:_) = Just EQ
+///         check []    []    = Nothing
+/// ```
+///
+/// `matchWith t p = DelayedMatches [(t, p)]` is `(subject, pattern)`
+/// (`Definitions.hs:90-93`). So arm A = `t1 matchWith t2` matches
+/// **subject t1** against **pattern t2** (∃σ. `t1 =AC σ(t2)`, i.e.
+/// `t2` subsumes `t1`); A non-empty + B empty ⇒ `GT`. Hence
+/// `Some(Greater)` means `t1` is strictly MORE SPECIFIC than `t2`.
+///
+/// **Convention trap.** `match_eqs` takes `Equal { lhs = subject,
+/// rhs = pattern }` (HS's `Equal subject pattern`, see its doc). So
+/// HS's `t1 matchWith t2` ⇒ `Equal { lhs: t1, rhs: t2 }`. An earlier
+/// version of this code wrote `Equal { lhs: t2, rhs: t1 }` here
+/// (mistaking RS's `Equal` for the flipped `pattern,subject` order),
+/// which SWAPPED `Greater`/`Less`. The only consumer is `eq_term_subs`
+/// (which tests `Equal`, invariant under the swap), so the bug was
+/// latent — but it is fixed here to stay faithful to HS.
 pub fn compare_term_subs(
     maude: &MaudeHandle,
     t1: &LNTerm,
     t2: &LNTerm,
 ) -> Result<Option<Ordering>, MaudeError> {
-    // pattern =? subject means we want subject to match pattern.
-    let match_12 = maude.match_eqs(&[Equal { lhs: t2.clone(), rhs: t1.clone() }])?;
-    let match_21 = maude.match_eqs(&[Equal { lhs: t1.clone(), rhs: t2.clone() }])?;
-    Ok(match (match_12.is_empty(), match_21.is_empty()) {
+    // arm A: `t1 matchWith t2` = subject t1, pattern t2.
+    let match_a = maude.match_eqs(&[Equal { lhs: t1.clone(), rhs: t2.clone() }])?;
+    // arm B: `t2 matchWith t1` = subject t2, pattern t1.
+    let match_b = maude.match_eqs(&[Equal { lhs: t2.clone(), rhs: t1.clone() }])?;
+    Ok(match (match_a.is_empty(), match_b.is_empty()) {
         (true, true) => None,
         (false, true) => Some(Ordering::Greater),
         (true, false) => Some(Ordering::Less),

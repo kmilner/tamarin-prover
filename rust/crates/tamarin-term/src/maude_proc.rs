@@ -986,7 +986,33 @@ impl MaudeHandle {
         Ok(out)
     }
 
-    /// Compute matches: each `Equal { lhs = pattern, rhs = subject }`.
+    /// Compute AC matchers for a batch of `(subject, pattern)` problems.
+    ///
+    /// **Convention — faithful to Haskell.** Each `Equal { lhs, rhs }`
+    /// has `lhs = subject` (term to be matched, treated ground) and
+    /// `rhs = pattern` (vars bind). This mirrors HS exactly:
+    /// `matchWith t p = DelayedMatches [(t, p)]` is `(subject, pattern)`
+    /// (`Term/Rewriting/Definitions.hs:90-93`), and `matchViaMaude`
+    /// turns each pair into `Equal subject pattern` via
+    /// `uncurry Equal <$> ms` (`Term/Maude/Process.hs:283-284`). The
+    /// emitted Maude command is then `match PATTERN <=? SUBJECT`,
+    /// i.e. `matchCmd`'s `ppTerms t2s <> " <=? " <> ppTerms t1s` where
+    /// `(t1s, t2s) = unzip [(a, b) | Equal a b <- eqs]` so `t2s = b =
+    /// pattern` lands on Maude's LEFT (pattern slot) and `t1s = a =
+    /// subject` on the RIGHT (subject slot) — `Process.hs:265-270`.
+    ///
+    /// Maude's `match A <=? B` binds vars in **A (PATTERN, left)** and
+    /// treats **B (SUBJECT, right)** as ground (empirically confirmed;
+    /// see the `match_eqs_const_subject` fix in eadeb1c4 and the twin
+    /// fix to this function). So pattern must go LEFT — which is why
+    /// `pp_list(&pats)` (= `t2s` = each `eq.rhs`) is emitted first.
+    ///
+    /// NOTE the opposite field order from `Equal` as used by callers
+    /// that pass `Equal { lhs = pattern, rhs = subject }`: HS's `Equal`
+    /// holds `(subject, pattern)`, and so does this routine. Callers
+    /// constructed from `matchFact`/`matchWith` (e.g. `sources.rs`,
+    /// `subsumption.rs::compare_term_subs`) MUST therefore put the
+    /// subject in `lhs` and the pattern in `rhs`.
     pub fn match_eqs(&self, eqs: &[Equal<LNTerm>]) -> Result<Vec<Vec<(crate::lterm::LVar, LNTerm)>>, MaudeError>
     {
         if eqs.is_empty() {
@@ -994,15 +1020,17 @@ impl MaudeHandle {
         }
         let mut inner = self.inner.lock().unwrap();
         let mut ctx = ConvCtx::new();
-        let mut t1s: Vec<MTerm> = Vec::with_capacity(eqs.len());
-        let mut t2s: Vec<MTerm> = Vec::with_capacity(eqs.len());
+        // `subjs` ← each `eq.lhs` (HS `t1s = a = subject`);
+        // `pats`  ← each `eq.rhs` (HS `t2s = b = pattern`).
+        let mut subjs: Vec<MTerm> = Vec::with_capacity(eqs.len());
+        let mut pats: Vec<MTerm> = Vec::with_capacity(eqs.len());
         for eq in eqs {
-            t1s.push(lterm_to_mterm_global(&eq.lhs, &mut ctx));
-            t2s.push(lterm_to_mterm_global(&eq.rhs, &mut ctx));
+            subjs.push(lterm_to_mterm_global(&eq.lhs, &mut ctx));
+            pats.push(lterm_to_mterm_global(&eq.rhs, &mut ctx));
         }
-        // `match in MSG : list(t2s) <=? list(t1s) .`
-        // Mirrors Haskell's `matchCmd`: subjects on the left, patterns on
-        // the right (Maude convention).
+        // `match in MSG : list(pats) <=? list(subjs) .`
+        // Mirrors HS `matchCmd` (`Process.hs:265-270`): PATTERN on the
+        // left (vars bind), SUBJECT on the right (ground).
         let pp_list = |items: &[MTerm]| -> Vec<u8> {
             // Emit as `list( cons(t1, cons(t2, nil)) )` style by reusing
             // pp_mterm on a constructed FunSym::List.
@@ -1011,14 +1039,20 @@ impl MaudeHandle {
             pp_mterm(&Term::App(FunSym::List, items.to_vec().into()))
         };
         let mut cmd = b"match in MSG : ".to_vec();
-        cmd.extend(pp_list(&t2s));
+        cmd.extend(pp_list(&pats));
         cmd.extend_from_slice(b" <=? ");
-        cmd.extend(pp_list(&t1s));
+        cmd.extend(pp_list(&subjs));
         cmd.extend_from_slice(b" .\n");
+        if std::env::var_os("TAM_DBG_MATCH_EQS_RAW").is_some() {
+            eprintln!("[match_eqs RAW] {}", String::from_utf8_lossy(&cmd).trim_end());
+        }
         let reply = inner.execute(&cmd)?;
         inner.stats.match_count += 1;
         let sig = inner.sig.clone();
         drop(inner);
+        if std::env::var_os("TAM_DBG_MATCH_EQS_RAW").is_some() {
+            eprintln!("[match_eqs REPLY] {}", String::from_utf8_lossy(&reply).trim_end());
+        }
         _tally_callsite("match_eqs");
         let msubsts = maude_parse::parse_match_reply(&sig, &reply)?;
         let mut out = Vec::with_capacity(msubsts.len());
@@ -1372,15 +1406,17 @@ impl MaudeHandle {
         };
         // Maude's `match A <=? B` syntax means: find σ such that B = σ(A).
         // So A is the PATTERN (left), B is the SUBJECT (right).
-        // Callers pass `Equal { lhs = pattern, rhs = subject }`, so the
-        // command is `match pattern <=? subject`.  This differs from
-        // `match_eqs_const_subject` which uses `match subject <=? pattern`
-        // — that historic ordering is consistent with HS's `matchCmd` but
-        // because HS callers use `Equal subject pattern` (reversed lhs/rhs
-        // from RS), the on-the-wire bytes match HS only when callers
-        // happen to also flip lhs/rhs.  We use the correct Maude
-        // `match PATTERN <=? SUBJECT` directly here, since the caller
-        // convention in RS is `lhs = pattern, rhs = subject`.
+        // Callers of THIS routine pass `Equal { lhs = pattern, rhs =
+        // subject }`, so the command is `match pattern(lhs) <=?
+        // subject(rhs)`.  CONVENTION WARNING: `match_eqs_const_subject`
+        // (post-eadeb1c4) ALSO uses `Equal { lhs = pattern, rhs =
+        // subject }` and emits `match pattern <=? subject` — same as
+        // here.  But the plain `match_eqs` uses the OPPOSITE `Equal`
+        // field order (`lhs = subject, rhs = pattern`, faithful to HS's
+        // `Equal a b = Equal subject pattern`); it still emits
+        // `match PATTERN <=? SUBJECT` on the wire, just sourced from the
+        // flipped fields.  So all three matchers emit pattern-on-the-left,
+        // which is what Maude requires (vars bind in the left operand).
         let mut cmd = b"match in MSG : ".to_vec();
         cmd.extend(pp_list(&pats));
         cmd.extend_from_slice(b" <=? ");
@@ -2012,5 +2048,57 @@ mod tests {
         }
         assert!(!res.is_empty(),
             "expected codeOther to AC-match a 2-element sub-multiset");
+    }
+
+    /// Directional regression for the `match_eqs` / `compare_term_subs`
+    /// flipped-`Equal`-convention bug.
+    ///
+    /// HS `compareTermSubs t1 t2` (`Subsumption.hs:37-45`) returns `GT`
+    /// when `t1` is strictly MORE SPECIFIC than `t2`, `LT` when more
+    /// general. With `t1 = h(x)` (general) and `t2 = h(a)` (ground,
+    /// specific):
+    ///   - arm A = `t1 matchWith t2` = subject h(x) vs pattern h(a):
+    ///     h(x)'s free var sits in the SUBJECT (ground) slot, h(a) is
+    ///     the pattern with no vars ⇒ No match (empty).
+    ///   - arm B = `t2 matchWith t1` = subject h(a) vs pattern h(x):
+    ///     x --> a ⇒ matches.
+    ///   - check [] (_:_) = LT ⇒ `compareTermSubs(h(x),h(a)) = Just LT`
+    ///     and symmetrically `compareTermSubs(h(a),h(x)) = Just GT`.
+    ///
+    /// Before the fix, `compare_term_subs` constructed `Equal { lhs:
+    /// t2, rhs: t1 }` for arm A (mistaking RS's `Equal` for the
+    /// `pattern,subject` order used by the const_subject sibling),
+    /// which SWAPPED the result: it returned `Greater` for `(h(x),h(a))`
+    /// and `Less` for `(h(a),h(x))` — the inverse of HS. (Latent
+    /// because the sole consumer `eq_term_subs` tests only `Equal`.)
+    #[test]
+    fn compare_term_subs_direction_matches_hs() {
+        let path = match maude_path() { Some(p) => p, None => { eprintln!("skipping: no maude"); return; } };
+        use crate::function_symbols::{NoEqSym, FunSym, Privacy, Constructability};
+        let h_sym = NoEqSym::new(b"h".to_vec(), 1, Privacy::Public, Constructability::Constructor);
+        let sig = pair_maude_sig().add_fun_sym(h_sym.clone());
+        let hnd = MaudeHandle::start(&path, sig).expect("start");
+        let mk = |v: LVar| -> LNTerm { crate::term::Term::Lit(Lit::Var(v)) };
+        let x = LVar::new("x", LSort::Msg, 0);
+        let a = crate::term::Term::Lit(Lit::Con(crate::lterm::Name::new(crate::lterm::NameTag::Pub, "a")));
+        let t_gen = crate::term::Term::App(FunSym::NoEq(h_sym.clone()), vec![mk(x)].into()); // h(x) general
+        let t_spec = crate::term::Term::App(FunSym::NoEq(h_sym.clone()), vec![a].into());    // h(a) specific
+        // general vs specific => general is LESS specific => Less.
+        assert_eq!(
+            crate::subsumption::compare_term_subs(&hnd, &t_gen, &t_spec).expect("cmp"),
+            Some(std::cmp::Ordering::Less),
+            "h(x) is more general than h(a); HS compareTermSubs gives Less");
+        // specific vs general => specific is MORE specific => Greater.
+        assert_eq!(
+            crate::subsumption::compare_term_subs(&hnd, &t_spec, &t_gen).expect("cmp"),
+            Some(std::cmp::Ordering::Greater),
+            "h(a) is more specific than h(x); HS compareTermSubs gives Greater");
+        // Identical (modulo renaming) terms compare Equal (invariant).
+        let y = LVar::new("y", LSort::Msg, 1);
+        let t_gen2 = crate::term::Term::App(FunSym::NoEq(h_sym.clone()), vec![mk(y)].into());
+        assert_eq!(
+            crate::subsumption::compare_term_subs(&hnd, &t_gen, &t_gen2).expect("cmp"),
+            Some(std::cmp::Ordering::Equal),
+            "h(x) and h(y) are equal modulo renaming => Equal");
     }
 }
