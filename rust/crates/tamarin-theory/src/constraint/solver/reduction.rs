@@ -2656,20 +2656,26 @@ impl<'ctx> Reduction<'ctx> {
             if matches!(g, crate::constraint::constraints::Goal::Split(_)) {
                 continue;
             }
-            match self.sys.goals_mut().iter_mut().find(|(eg, _)| eg == g) {
-                Some((_, slot)) => {
-                    // combineGoalStatus: solved OR-ing, looping OR-ing.
-                    if st.solved { slot.solved = true; }
-                    if st.looping { slot.looping = true; }
-                }
-                None => {
-                    self.sys.add_goal_with_loop_flag(g.clone(), st.looping);
-                    if st.solved {
-                        if let Some((_, slot)) = self.sys.goals_mut().iter_mut()
-                            .find(|(eg, _)| eg == g) {
-                            slot.solved = true;
-                        }
-                    }
+            // HS `insertGoalStatus` runs `succ sNextGoalNr` on EVERY
+            // non-split goal — even when the goal key already exists,
+            // where `insertWith combineGoalStatus` keeps the smaller nr.
+            // Route both the new and the already-present case through
+            // `add_goal_with_loop_flag`, which advances the counter
+            // unconditionally and (on a canonical-key collision) merges
+            // looping while keeping the smaller nr.  Previously the
+            // existing-goal arm merged status in place WITHOUT advancing
+            // `next_goal_nr`, so every conjoin that hit a shared goal left
+            // RS's counter one behind HS, shifting all later gsNr values
+            // (the goalNrRanking tie-break) and the chosen proof path.
+            // Then OR-in `solved` (combineGoalStatus) on the canonically
+            // matching slot.
+            self.sys.add_goal_with_loop_flag(g.clone(), st.looping);
+            if st.solved {
+                let canon = crate::constraint::system::canonical_goal_for_dedup(g);
+                if let Some((_, slot)) = self.sys.goals_mut().iter_mut()
+                    .find(|(eg, _)| crate::constraint::system::canonical_goal_for_dedup(eg) == canon)
+                {
+                    slot.solved = true;
                 }
             }
         }
