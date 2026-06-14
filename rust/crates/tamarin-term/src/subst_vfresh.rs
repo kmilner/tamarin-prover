@@ -368,7 +368,7 @@ fn term_size<C, V>(t: &VTerm<C, V>) -> usize {
 /// record the binding.  `outer_is_singleton_var` + `lv` together
 /// implement HS's `namehint v = if (Lit (Var _) == t) then lvarName lv
 /// else lvarName v` rule (Substitution.hs:64-66).
-fn rename_lvars_with_hint<C: Clone, F: FnMut(u64) -> u64>(
+fn rename_lvars_with_hint<C: Ord + Clone, F: FnMut(u64) -> u64>(
     t: &VTerm<C, LVar>,
     rename: &mut BTreeMap<LVar, LVar>,
     preserve: &std::collections::BTreeSet<LVar>,
@@ -402,7 +402,16 @@ fn rename_lvars_with_hint<C: Clone, F: FnMut(u64) -> u64>(
                 .map(|a| rename_lvars_with_hint(a, rename, preserve, alloc_idxs,
                     outer_is_singleton_var, lv))
                 .collect();
-            Term::App(f.clone(), new_args.into())
+            // Route through the smart constructor so AC/C argument lists
+            // are re-sorted: freshToFree allocates a brand-new, non-
+            // monotone idx per range var, so children that were sorted
+            // under the old vars are no longer canonical under the new
+            // ones.  HS does the same via `mapFrees (Arbitrary _)
+            // (FApp o l) = fApp o <$> ...` (LTerm.hs).  (The sibling
+            // `rename_lvars_in_vterm` stays raw — it mirrors HS's
+            // Monotone `unsafefApp` path under a uniform, order-
+            // preserving shift, where re-sorting is unnecessary.)
+            crate::term::f_app(f.clone(), new_args)
         }
     }
 }
