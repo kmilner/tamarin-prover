@@ -8695,10 +8695,19 @@ fn graft_case_into_action(
 //      (varOccurences-ordered first, then foldFrees), assigning each a
 //      fresh idx with empty name. Then keys excluding rule.new_vars
 //      capture exactly what `compareSystemsUpToNewVars` compares.
-//   3. Dedup by key, first-occurrence wins (matches the merge-phase
-//      semantics of HS `sortednubBy`, which prefers the earlier-indexed
-//      element on EQ).  Survivors are emitted in original input order
-//      (matches `sortOn fst` in HS).
+//   3. Run a verbatim port of HS `sortednubBy` (`sortednub_by`) over the
+//      index-decorated list, comparing on the canonical key, then
+//      `sortOn fst` to restore original-index order (matches `sortOn fst`
+//      in HS).  NOTE: `sortednubBy` does NOT keep the first element of an
+//      EQ-group — its run-detection phase (`sequences`) does
+//      `EQ -> sequences xs`, dropping the earlier element and keeping the
+//      LATER one; the `merge` phase drops the right-list element on EQ.
+//      Since every EQ-group member has an identical key and `sortOn fst`
+//      washes out cross-group order, the observable effect is "keep the
+//      highest-original-index member of each equal-key group".  (The
+//      previous `BTreeSet` first-wins dedup was unfaithful — it flipped
+//      the surviving representative on symmetric AC peers, e.g. Joux/Scott
+//      `Session_Key_Secrecy_PFS`'s B↔C mirror.)
 
 /// Walk the free LVars of `sys.nodes` in HS `foldFreesOcc` order
 /// (`HS instance HasFrees System`: only field `a` is walked; commented
@@ -9460,11 +9469,185 @@ fn write_term_to_key_local(
     }
 }
 
-/// Direct port of Haskell `removeRedundantCases` (Sources.hs).
-/// Gated on BP/MSet per HS short-circuit.  Survivors are returned in
-/// original input order with first-occurrence wins (matches HS's
-/// merge-phase semantics where `cmp == EQ` keeps the left/earlier
-/// element).
+/// Direct port of Haskell `removeRedundantCases` (Sources.hs:328-352).
+/// Direct port of HS `sortednubBy` (`lib/utils/src/Extension/Prelude.hs:52`,
+/// GHC's `Data.List.sortBy` adapted to drop duplicates).  Sorts by `cmp`
+/// AND removes elements for which an earlier-in-the-merge element compares
+/// `EQ`.  The survivor of an `EQ`-group is NOT simply the first input
+/// element: the run-detection phase (`sequences`) does `EQ -> sequences xs`
+/// which drops the *earlier* element and keeps the *later* one, while the
+/// `merge` phase drops the right-list element on `EQ`.  We replicate the
+/// algorithm verbatim so survivor selection matches HS exactly.
+fn sortednub_by<T, C>(cmp: &C, xs: Vec<T>) -> Vec<T>
+where
+    C: Fn(&T, &T) -> std::cmp::Ordering,
+{
+    use std::cmp::Ordering::*;
+    // sequences: build maximal ascending/descending runs, dropping EQ.
+    fn sequences<T, C>(cmp: &C, mut xs: Vec<T>) -> Vec<Vec<T>>
+    where
+        C: Fn(&T, &T) -> std::cmp::Ordering,
+    {
+        // Iteratively consume `xs`; mirrors the recursive HS `sequences`.
+        let mut runs: Vec<Vec<T>> = Vec::new();
+        loop {
+            if xs.len() < 2 {
+                runs.push(xs);
+                return runs;
+            }
+            // pop first two (a, b) preserving the rest order.
+            let mut it = xs.into_iter();
+            let a = it.next().unwrap();
+            let b = it.next().unwrap();
+            let rest: Vec<T> = it.collect();
+            match cmp(&a, &b) {
+                Greater => {
+                    // descending b [a] rest'
+                    let (run, remaining) = descending(cmp, b, vec![a], rest);
+                    runs.push(run);
+                    xs = remaining;
+                }
+                Equal => {
+                    // a `cmp` b == EQ -> sequences xs (drop a, keep from b)
+                    let mut next = Vec::with_capacity(rest.len() + 1);
+                    next.push(b);
+                    next.extend(rest);
+                    xs = next;
+                }
+                Less => {
+                    // ascending b (a:) rest
+                    let (run, remaining) = ascending(cmp, b, vec![a], rest);
+                    runs.push(run);
+                    xs = remaining;
+                }
+            }
+        }
+    }
+
+    // descending a as (b:bs) | a `cmp` b == GT = descending b (a:as) bs
+    // descending a as bs = (a:as) : sequences bs   -- (a:as) already reversed -> ascending
+    fn descending<T, C>(cmp: &C, mut a: T, mut acc: Vec<T>, mut bs: Vec<T>) -> (Vec<T>, Vec<T>)
+    where
+        C: Fn(&T, &T) -> std::cmp::Ordering,
+    {
+        loop {
+            if let Some(b_ref) = bs.first() {
+                if cmp(&a, b_ref) == Greater {
+                    let mut it = bs.into_iter();
+                    let b = it.next().unwrap();
+                    bs = it.collect();
+                    acc.insert(0, a); // a:as  (acc holds run in ascending order)
+                    a = b;
+                    continue;
+                }
+            }
+            // (a:as) : run is acc with a prepended; acc already ascending, so result ascending
+            acc.insert(0, a);
+            return (acc, bs);
+        }
+    }
+
+    // ascending a as (b:bs) | a `cmp` b == LT = ascending b (\ys -> as (a:ys)) bs
+    // ascending a as bs = as [a] : sequences bs
+    fn ascending<T, C>(cmp: &C, mut a: T, mut acc: Vec<T>, mut bs: Vec<T>) -> (Vec<T>, Vec<T>)
+    where
+        C: Fn(&T, &T) -> std::cmp::Ordering,
+    {
+        loop {
+            if let Some(b_ref) = bs.first() {
+                if cmp(&a, b_ref) == Less {
+                    let mut it = bs.into_iter();
+                    let b = it.next().unwrap();
+                    bs = it.collect();
+                    acc.push(a); // as ++ [a]
+                    a = b;
+                    continue;
+                }
+            }
+            acc.push(a); // as [a]
+            return (acc, bs);
+        }
+    }
+
+    // merge two sorted-deduped runs, dropping EQ (right element).
+    fn merge<T, C>(cmp: &C, a: Vec<T>, b: Vec<T>) -> Vec<T>
+    where
+        C: Fn(&T, &T) -> std::cmp::Ordering,
+    {
+        let cap = a.len() + b.len();
+        let mut out: Vec<T> = Vec::with_capacity(cap);
+        let mut ai = a.into_iter().peekable();
+        let mut bi = b.into_iter().peekable();
+        loop {
+            match (ai.peek(), bi.peek()) {
+                (Some(av), Some(bv)) => match cmp(av, bv) {
+                    Greater => out.push(bi.next().unwrap()),
+                    Equal => {
+                        // drop the right-list element (b), keep left
+                        bi.next();
+                    }
+                    Less => out.push(ai.next().unwrap()),
+                },
+                (Some(_), None) => {
+                    out.extend(ai);
+                    return out;
+                }
+                (None, _) => {
+                    out.extend(bi);
+                    return out;
+                }
+            }
+        }
+    }
+
+    fn merge_pairs<T, C>(cmp: &C, xs: Vec<Vec<T>>) -> Vec<Vec<T>>
+    where
+        C: Fn(&T, &T) -> std::cmp::Ordering,
+    {
+        let mut out: Vec<Vec<T>> = Vec::with_capacity((xs.len() + 1) / 2);
+        let mut it = xs.into_iter();
+        loop {
+            match (it.next(), it.next()) {
+                (Some(a), Some(b)) => out.push(merge(cmp, a, b)),
+                (Some(a), None) => {
+                    out.push(a);
+                    return out;
+                }
+                (None, _) => return out,
+            }
+        }
+    }
+
+    fn merge_all<T, C>(cmp: &C, mut xs: Vec<Vec<T>>) -> Vec<T>
+    where
+        C: Fn(&T, &T) -> std::cmp::Ordering,
+    {
+        if xs.is_empty() {
+            return Vec::new();
+        }
+        while xs.len() > 1 {
+            xs = merge_pairs(cmp, xs);
+        }
+        xs.into_iter().next().unwrap()
+    }
+
+    merge_all(cmp, sequences(cmp, xs))
+}
+
+/// Gated on BP/MSet per HS short-circuit.  Faithful port of HS
+/// `removeRedundantCases` (`Sources.hs:338-348`): decorate each case with
+/// its original index, run `sortednubBy compareSystemsUpToNewVars` over the
+/// decorated list, then `sortOn fst` to restore original-index order.  The
+/// survivor of an alpha-equivalent group is the one `sortednubBy` keeps —
+/// which is the LAST element of an `EQ`-run, NOT the first (the previous
+/// implementation's `BTreeSet` first-wins was WRONG; cf. Joux/Scott
+/// `Session_Key_Secrecy_PFS` B↔C mirror).  We port `sortednubBy` verbatim
+/// rather than approximate it: for the common case (an `EQ`-group of pure
+/// alpha-duplicates with identical keys) this keeps the LAST member and,
+/// after `sortOn fst`, emits survivors in original-index order — the exact
+/// flip the Joux/Scott mirror needed.  (The string key encodes what
+/// `compareSystemsUpToNewVars` distinguishes, so two cases compare `EQ`
+/// here iff they are alpha-equivalent there.)
 pub fn remove_redundant_cases<T, F>(
     enable_bp: bool,
     enable_mset: bool,
@@ -9479,8 +9662,12 @@ where
     let dbg = std::env::var("TAM_RS_DBG_REMOVE_REDUNDANT").is_ok();
     let dump = std::env::var("TAM_RS_DBG_RRC_DUMP").is_ok();
     let pre = cases.len();
-    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut out: Vec<T> = Vec::with_capacity(cases.len());
+    // Decorate with (original index, canonical key).  HS:
+    //   decoratedCases = map (second addNormSys) $ zip [0..] cases0
+    // where addNormSys produces the renamed/normed system; we precompute
+    // the string key (which encodes exactly what compareSystemsUpToNewVars
+    // distinguishes) instead of carrying the normed System.
+    let mut decorated: Vec<(usize, String, T)> = Vec::with_capacity(pre);
     for (idx, c) in cases.into_iter().enumerate() {
         let key = compute_compare_systems_key(get_sys(&c), stable_vars);
         if dbg {
@@ -9490,10 +9677,17 @@ where
         if dump && pre > 1 {
             eprintln!("[RRC_DUMP] idx={} key={}", idx, key);
         }
-        if seen.insert(key) {
-            out.push(c);
-        }
+        decorated.push((idx, key, c));
     }
+    // sortednubBy (\(_,x) (_,y) -> compare x y)  -- compare on the key only,
+    // matching HS comparing on the normed system via compareSystemsUpToNewVars.
+    let deduped = sortednub_by(&|a: &(usize, String, T), b: &(usize, String, T)| {
+        a.1.cmp(&b.1)
+    }, decorated);
+    // sortOn fst : restore original-index order.
+    let mut deduped = deduped;
+    deduped.sort_by(|a, b| a.0.cmp(&b.0));
+    let out: Vec<T> = deduped.into_iter().map(|(_, _, c)| c).collect();
     if dbg && out.len() != pre {
         eprintln!("[RRC] dedup {} → {}", pre, out.len());
     }
