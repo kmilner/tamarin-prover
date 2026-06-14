@@ -6,10 +6,9 @@
 //! general (i.e. has at most as much information as) of the two.
 //!
 //! The Haskell version uses Maude AC matching to decide subsumption.
-//! For the Rust port we expose the same shape (`compare_term_subs`)
-//! but rely on a callable `match_oracle` so callers can plug in a
-//! Maude-driven matcher. A `MaudeHandle`-backed convenience exists
-//! too.
+//! Likewise here: `compare_term_subs` / `eq_term_subs` decide
+//! subsumption by issuing two `maude.match_eqs` calls directly against
+//! a `&MaudeHandle`.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;

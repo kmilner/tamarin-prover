@@ -201,14 +201,15 @@ pub fn parse_heuristic_str_with_tactics(
 /// `openGoals`: enumerate annotated goals still to be solved.
 ///
 /// Haskell iterates `M.toList $ get sGoals sys` in Goal-derived-Ord
-/// order; we use insertion-order.  With the Sk-matcher port now in
-/// (commits 28567ab1 applySkAction + this commit's permissive
-/// structural_match), Goal-Ord wiring is the natural next parity step
-/// — but its interaction with the 10s corpus-probe deadline causes
-/// runtime-perf regressions (Destroy_charn, Device_Init_Use_Set) that
-/// verify with a 30s deadline.  Wire `goal_cmp` here when the corpus
-/// probe deadline can accommodate the deeper search Goal-Ord induces
-/// on those lemmas; `goal_cmp` is dead-code-allow below until then.
+/// order; here `open_goals` itself yields goals in insertion-order.
+/// Goal-Ord is instead applied at the goal-iteration / ranking sites
+/// that need it: `goal_cmp` (below) is the HS-`Ord Goal`-faithful
+/// comparator, wired into the goal sorts in `reduction.rs`,
+/// `sources.rs`, and `rename_precise.rs` (~7 call sites).  Wiring it
+/// directly into `open_goals` was deferred because the deeper search
+/// Goal-Ord induces on a few lemmas (Destroy_charn,
+/// Device_Init_Use_Set) regressed under the old 10s corpus-probe
+/// deadline.
 pub fn open_goals(sys: &System) -> Vec<AnnotatedGoal> {
     let mut out = Vec::new();
     for (goal, status) in sys.goals.iter() {
@@ -399,17 +400,16 @@ impl std::error::Error for OracleError {}
 ///     . goalNrRanking
 /// ```
 ///
-/// Some Haskell predicates depend on data we haven't ported yet:
+/// `isMsgOneCaseGoal` (`pcSources`/`full_sources` analysis, via
+/// `is_msg_one_case_goal` + `collect_one_case_syms`), `isSplitGoalSmall`
+/// (`is_split_goal_small`, reading `eq_store.split_size`), and
+/// `isNoLargeSplitGoal` (`is_no_large_split_goal`) are all ported and
+/// wired in as live predicates in the decision tree below.
 ///
-///   - `isMsgOneCaseGoal` needs `pcSources` source-cache analysis.
-///   - `isSplitGoalSmall` / `isNoLargeSplitGoal` need split-size info
-///     from the eq-store.
-///   - `moveNatToEnd` needs `isNatSubterm` over subterms.
-///
-/// These are treated conservatively (predicate returns `false`) so the
-/// remaining decision-tree partitioning still matches Haskell on every
-/// other criterion.  When the stubs are filled in, behaviour aligns
-/// without further changes here.
+/// One predicate remains a conservative stub: `moveNatToEnd` (via
+/// `is_nat_subterm_split`) needs `isNatSubterm` over subterms and for
+/// now returns `false` (safe — it only ever moves goals later, never
+/// earlier).
 pub fn rank_goals(sys: &System) -> Vec<AnnotatedGoal> {
     rank_goals_with(sys, None, 0).expect("no oracle without context")
 }

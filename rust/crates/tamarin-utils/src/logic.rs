@@ -4,8 +4,6 @@
 //! and disjunctions of atoms. The Haskell `MonadDisj` typeclass is omitted
 //! — Rust callers can construct `Disj`/`Conj` values directly.
 
-use std::iter::FromIterator;
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Conj<T>(pub Vec<T>);
 

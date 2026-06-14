@@ -8,9 +8,10 @@
 //! - `smaller_fact` and the `builtinPredicates` list (just `Smaller`)
 //! - `lookup_predicate`
 //!
-//! Not yet ported: `expandFormula` — needs a full `traverseFormulaAtom`
-//! and substitution machinery over `ProtoFormula`. That's deferred until
-//! `Theory.Model.Formula` has its NNF / atom traversal helpers ported.
+//! `expandFormula` is ported separately in `predicate_expand.rs`
+//! (operating on parser-AST formulas / predicates), providing
+//! `expand_formula` / `expand_theory_formulas` including the builtin
+//! `Smaller` handling.
 
 use crate::fact::{Fact, FactTag, Multiplicity};
 use crate::formula::LNFormula;

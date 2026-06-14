@@ -12,16 +12,23 @@
 //! - [`subterm_rule`] ← `Term.SubtermRule`
 //! - [`positions`] ← `Term.Positions` (AC-aware position math)
 //! - [`maude_sig`] ← `Term.Maude.Signature`
-//! - [`maude`] ← `Term.Maude.{Process, Parser, Types}` — **stub**, see module docs
+//! - [`maude_proc`] ← `Term.Maude.Process` (spawns/drives the Maude
+//!   subprocess; backs AC unification / matching / variants via
+//!   `unify` / `unify_with_avoid` / `unifiable` / `match_eqs` /
+//!   `variant_unify_eqs`)
+//! - [`maude_parse`] / [`maude_print`] / [`maude_types`] ←
+//!   `Term.Maude.{Parser, ...}` (Maude reply parsing, term printing,
+//!   and the LNTerm↔Maude conversion context)
 //! - [`unification`] ← `Term.Unification` — **non-AC fragment only**
+//!   (AC unification is delegated to Maude via [`maude_proc`])
+//! - [`macro_expand`] ← `Term.Macro`
+//! - [`subsumption`] ← `Term.Subsumption`
+//! - [`norm`] ← `Term.Rewriting.Norm` (calls into Maude)
 //!
 //! Not yet ported:
-//! - `Term.Macro` (trivial after `Substitution`)
-//! - `Term.Subsumption` (depends on full unification)
-//! - `Term.Rewriting.Norm` (uses Maude)
 //! - `Term.Narrowing.{Variants, Variants.Check, Variants.Compute, Narrow}`
-//! - `Term.Maude.{Process, Parser, Types}` proper implementations
-//! - AC unification / matching (needs Maude subprocess driver)
+//!   (variant computation as a standalone module; the variant-unification
+//!   entry point Tamarin needs lives in [`maude_proc`])
 
 pub mod builtin;
 pub mod function_symbols;

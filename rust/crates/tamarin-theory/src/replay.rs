@@ -162,10 +162,12 @@ fn parsed_method_to_display(pm: &ParsedMethod) -> ProofMethod {
     }
 }
 
-/// Public root-level annotated `sorry` leaf (HS keeps the parsed
+/// Public root-level **annotated** `sorry` leaf (HS keeps the parsed
 /// `unproven ()` proof when a lemma has no stored skeleton —
-/// ProofSkeleton.hs:61; checkProof annotates it with the start system).
-pub fn unannotated_sorry_root(sys: System) -> ProofNode {
+/// ProofSkeleton.hs:61; checkProof annotates the node with the start
+/// system, so it renders as plain `by sorry` with no `/* unannotated */`
+/// — see `annotated_sorry`).
+pub fn annotated_sorry_root(sys: System) -> ProofNode {
     annotated_sorry(None, sys)
 }
 

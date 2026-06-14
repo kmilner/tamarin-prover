@@ -5,9 +5,10 @@
 //! for the prover's built-in equational theories. Function symbols and
 //! signatures cover DH, BP, XOR, multiset, pair, encryption, signatures,
 //! hashing, and location reports; rewrite-rule sets are ported for DH, BP,
-//! XOR, multiset, pair, encryption, and signatures (`locationReportRules`,
-//! `pairDestRules`, `symEncDestRules`, `asymEncDestRules`, `fstDestRule`,
-//! and `sndDestRule` from `Rules.hs` are not yet ported).
+//! XOR, multiset, pair, encryption, and signatures. The `Rules.hs`
+//! destructor / location sets are ported too: `location_report_rules`,
+//! `pair_dest_rules` (covering the `fstDestRule`/`sndDestRule` shapes),
+//! `sym_enc_dest_rules`, and `asym_enc_dest_rules`.
 
 use std::collections::BTreeSet;
 

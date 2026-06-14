@@ -320,8 +320,10 @@ fn collect_term_vars(t: &p::Term, out: &mut Vec<p::VarSpec>) {
 ///       [ Out(t) for each premise term in R ]
 ///
 ///     lemma deriv_check_<idx>_<v>: exists-trace
-///       "Ex v1 v2 ... #i. Generated_<idx>(...) @ #i & K(v) @ #i"
-///     ...one per free var...
+///       "Ex v1 v2 ... #t0 #t1. Generated_<idx>(...) @ #t0 & KU(v) @ #t1"
+///     ...one per free var...  (two distinct timepoints; the knowledge
+///     predicate is `KU`, not `K` — consistent with the module header
+///     and the inline comment in the body.)
 fn synthesise_probe_theory(
     src: &p::Theory,
     rule: &p::Rule,

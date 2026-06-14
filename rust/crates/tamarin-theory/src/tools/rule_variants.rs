@@ -206,26 +206,6 @@ fn make_proto_rule_ac(
     }
 }
 
-/// Compute the rule variants for `rule` and return one `ProtoRuleAC`
-/// per Maude-returned variant, each with the variant's substitution
-/// already applied to the rule's terms. Returns the empty vector when
-/// Maude reports a single identity variant (caller can use the raw
-/// rule).
-///
-/// Mirrors the result-shape of Haskell's `variantsProtoRule` plumbed
-/// into the solver: `OpenProtoRule.variants` is a `Vec<ProtoRuleAC>`
-/// where each entry has the variant's narrowing already baked in.
-/// Destructor-narrowed conclusions (e.g. `Out(snd(sdec(msg, key)))`
-/// reduced via `msg → senc(pair(_, t), key)` to `Out(t)`) become
-/// enumerable by chain-fold without any extra Maude calls at search
-/// time.
-///
-/// Only emits variants whose conclusion terms contain **no** reducible
-/// function symbols — the partial-narrowing intermediates (e.g.
-/// `Out(snd(senc-something))`) carry redundant destructor heads that
-/// can't unify with a destructor-free goal and just bloat the search
-/// case tree. The fully-narrowed forms are the ones chain-fold
-/// actually needs.
 /// Like `expand_rule_variants`, but returns the raw variant substitutions
 /// (the `Disj LNSubstVFresh` of `RuleACConstrs` in Haskell) — the
 /// substitutions that should be installed as a SplitG goal via

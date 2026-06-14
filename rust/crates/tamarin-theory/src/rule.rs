@@ -1,10 +1,13 @@
 //! Port of `Theory.Model.Rule` from `lib/theory/src/Theory/Model/Rule.hs`.
 //!
 //! Rewriting rules describing protocol execution and intruder deduction.
-//! This port covers the data types, accessors, queries, and basic
-//! conversions. Not yet ported:
-//! - `someRuleACInst*` (rule instantiation — needs HasFrees over Rules)
-//! - Pretty-printing and dot rendering
+//! This file covers the data types, accessors, queries, and basic
+//! conversions.  Two related pieces of `Rule.hs` live elsewhere in the
+//! crate rather than here:
+//! - `someRuleACInst*` (rule instantiation) — in
+//!   `constraint::solver::reduction` (`some_rule_ac_inst`).
+//! - Pretty-printing / dot rendering — `pretty_rule_inst` in
+//!   `pretty_system.rs` and `render_rule` in `pretty_theory.rs`.
 //!
 //! The Haskell version uses `fclabels` lenses heavily; we replace those
 //! with public fields plus accessor methods.

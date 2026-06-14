@@ -1128,11 +1128,16 @@ mod tests {
 mod sep_nb_regression {
     use super::*;
 
-    /// Regression for the `sepNB`/`fillNBE` `nilAboveNest` flag fix.
+    /// Regression for the `sepNB`/`fillNBE` `nilAboveNest` column
+    /// behaviour.
     ///
-    /// HS `sepNB g Empty k ys` uses `nilAboveNest True k ...` (the flag
-    /// is `True`, not `False`); with `False` and `k > 0` the wrapped tail
-    /// item was inlined `k` spaces and dropped one column to the left.
+    /// HS `sepNB g Empty k ys` builds its wrapped tail via
+    /// `nilAboveNest False k ...` — the flag is `False` (GHC's bundled
+    /// pretty-1.1.3.6 settled on `False`; see the matching comment on
+    /// the `sep_nb` `Empty` arm).  `nilAboveNest`'s flag governs where
+    /// the wrapped tail item lands: this test pins that the second
+    /// disjunct keeps its expected column rather than being inlined and
+    /// dropped one column to the left.
     ///
     /// This case mirrors NSPK3 injective_agree's all-counterexamples
     /// guarded formula: a GDisj whose disjuncts are GGuarded with

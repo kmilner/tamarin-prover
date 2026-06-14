@@ -1482,12 +1482,15 @@ impl<'ctx> Reduction<'ctx> {
         if self.sys.goals.len() != before { self.changed = ChangeIndicator::Changed; }
     }
 
-    /// Compute a fresh-var baseline — the max idx across:
-    ///   - all vars in nodes' rules
-    ///   - all vars in stored & solved formulas
-    ///   - any LessAtom node-id idx
-    ///     Plus a constant headroom so multiple Ex-decompositions in
-    ///     quick succession don't clash. Used by `Ex` decomposition.
+    /// Compute a fresh-var baseline — the max var idx across:
+    ///   - all vars in nodes' rules, stored & solved formulas, and
+    ///     lemmas, plus any LessAtom node-id idx (all folded by
+    ///     `bounds_max`)
+    ///   - the stored & solved formulas again (the explicit loops
+    ///     below; redundant with `bounds_max`, kept for now)
+    ///
+    /// Returns the plain max — no extra headroom is added. Used by `Ex`
+    /// decomposition to pick fresh var indices.
     pub fn fresh_var_baseline(&self) -> u64 {
         let mut m = bounds_max(&self.sys);
         for f in &self.sys.formulas {

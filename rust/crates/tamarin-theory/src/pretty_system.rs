@@ -15,8 +15,9 @@
 //!   unsolved constraints: ...
 //!   solved constraints: ...
 //!
-//! For the lemma view we also emit the graph-bearing sections
-//! (`nodes`, `actions`, `edges`, `less`) via `pretty_system_full`.
+//! For the lemma view `pretty_system` also emits the graph-bearing
+//! sections (`nodes`, `edges`, `less`); unlike Haskell's `prettySystem`
+//! no `actions` section is produced.
 
 use tamarin_term::pretty::{pp_lvar, pretty_lnterm};
 

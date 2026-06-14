@@ -363,7 +363,9 @@ fn re_expand_depth_limited(
             // state-traces from re-expanded subtrees report just
             // the deepest pushed case (e.g. `/c_sdec`) instead of
             // the full lemma-proof path (`/Setup_Key/.../c_sdec`).
-            // Mirrors expand_cases at search.rs:489-492.
+            // Mirrors the case_path push/pop in the serial branch of
+            // `expand_inner` (the `if push_path { case_path_push(..) }`
+            // around the recursive `expand` call further down this file).
             let push_path = !name.is_empty();
             if push_path { crate::constraint::solver::trace::case_path_push(&name); }
             re_expand_depth_limited(ctx, child, budget, deadline, depth + 1);

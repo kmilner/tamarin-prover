@@ -5,22 +5,37 @@
 //! - [`fact`] ← `Theory.Model.Fact`
 //! - [`atom`] ← `Theory.Model.Atom`
 //! - [`formula`] ← `Theory.Model.Formula` (data type + builders)
-//! - [`restriction`] ← `Theory.Model.Restriction` (data type only)
-//! - [`rule`] ← `Theory.Model.Rule` (data layer + indices + info types)
+//! - [`guarded`] / [`guarded_types`] ← `Theory.Model.Formula` (guarded
+//!   formulas)
+//! - [`restriction`] ← `Theory.Model.Restriction`
+//! - [`rule`] ← `Theory.Model.Rule` (data layer + indices + info types);
+//!   instantiation (`someRuleACInst*`) lives in
+//!   [`constraint::solver::reduction`]
 //! - [`sapic`] ← `Theory.Sapic.{Position, Term, Annotation, Process, Pattern}`
-//! - [`intruder_rules`] ← `Theory.Tools.IntruderRules` (special intruder rules)
-//! - [`predicate`] ← `Theory.Syntactic.Predicate` (data + lookup; expansion deferred)
+//! - [`intruder_rules`] / [`intruder_variants`] ←
+//!   `Theory.Tools.IntruderRules`
+//! - [`predicate`] / [`predicate_expand`] ← `Theory.Syntactic.Predicate`
+//!   (data + lookup + `expandFormula`)
+//! - [`constraint`] ← `Theory.Constraint.*` (the constraint solver,
+//!   ~32k LOC: system, reduction, goals, sources, simplify,
+//!   contradictions, search, …)
+//! - [`tools`] ← `Theory.Tools.*` (equation store, subterm store,
+//!   abstract interpretation, loop breakers, rule-variants,
+//!   injective-fact instances)
+//! - [`check_terms`] ← well-formedness checks; [`deriv_check`] ←
+//!   message-derivation checks
+//! - [`theory`] ← top-level `Theory` (open/closed theories);
+//!   [`elaborate`] ← theory elaboration/closing
+//! - [`tactic`] ← heuristic tactics; [`proof_skeleton`] / [`replay`] /
+//!   [`prove`] ← proof skeletons, replay, and the per-lemma prover driver
+//! - [`pretty_theory`] / [`pretty_system`] / [`pretty_formula`] /
+//!   [`pretty_hpj`] ← theory / system / formula pretty-printing
+//! - [`state_trace`] ← solver state tracing
+//!
+//! The `.spthy` parser lives in the sibling `tamarin-parser` crate.
 //!
 //! Not yet ported:
-//! - `Theory.Model.Rule`: instantiation (`someRuleACInst*`), AC unification
-//!   over rules, pretty/dot rendering
-//! - `Theory.Constraint.*` (~10k LOC — the constraint solver)
-//! - Most of `Theory.Tools.*` (well-formedness, equation store, subterm
-//!   store, abstract interpretation, loop breakers, message-derivation
-//!   checks, rule-variants computation, partial evaluation)
-//! - `Theory.Text.Parser.*` (~3k LOC — `.spthy` parser)
 //! - Remaining `Theory.Sapic.*` (Substitution, Print)
-//! - Top-level `Theory` module (open/closed theories)
 
 pub mod atom;
 pub mod check_terms;

@@ -1,7 +1,11 @@
 //! Port of `Theory.Tools.IntruderRules` from
 //! `lib/theory/src/Theory/Tools/IntruderRules.hs` — covers the
-//! always-included "special" intruder rules. The DH/BP/XOR/multiset
-//! variant computations need narrowing + Maude and are deferred.
+//! always-included "special" intruder rules plus the DH/XOR/multiset
+//! variant generators (`dh_intruder_rules`, `xor_intruder_rules`,
+//! `multiset_intruder_rules`) and the `close_intr_rule` /
+//! `variants_intruder` / `construction_rules` narrowing pipeline (which
+//! drives Maude). Only the BP intruder rules lack a runtime generator
+//! here — those are loaded from the cached file via `intruder_variants.rs`.
 
 use tamarin_term::lterm::{LNTerm, LSort, LVar};
 use tamarin_term::vterm::var_term;
