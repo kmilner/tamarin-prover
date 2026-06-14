@@ -15,8 +15,8 @@ use crate::builtin::{
 };
 use crate::function_symbols::{
     bp_fun_sig, bp_reducible_fun_sig, dh_fun_sig, dh_reducible_fun_sig,
-    fst_dest_sym, fst_sym, mset_fun_sig, nat_fun_sig, pair_fun_sig,
-    snd_dest_sym, snd_sym, xor_fun_sig, xor_reducible_fun_sig, FunSig,
+    fst_dest_sym, fst_sym, mset_fun_sig, nat_fun_sig, pair_fun_dest_sig,
+    pair_fun_sig, snd_dest_sym, snd_sym, xor_fun_sig, xor_reducible_fun_sig, FunSig,
     FunSym, NoEqFunSig, NoEqSym,
 };
 use crate::lterm::LNTerm;
@@ -228,6 +228,17 @@ pub fn pair_maude_sig() -> MaudeSig {
     MaudeSig {
         st_fun_syms: pair_fun_sig(),
         st_rules: crate::builtin::pair_rules(),
+        ..MaudeSig::default()
+    }.refresh()
+}
+
+/// `pairDestMaudeSig` (Signature.hs:202): the `dest-pairing` variant —
+/// fst/snd are DESTRUCTORS (`pair_fun_dest_sig`) with the destructor
+/// rewrite rules (`pair_dest_rules`), rather than constructors.
+pub fn pair_dest_maude_sig() -> MaudeSig {
+    MaudeSig {
+        st_fun_syms: pair_fun_dest_sig(),
+        st_rules: crate::builtin::pair_dest_rules(),
         ..MaudeSig::default()
     }.refresh()
 }

@@ -77,7 +77,7 @@ use tamarin_term::vterm::Lit;
 use tamarin_term::maude_sig::{
     asym_enc_dest_maude_sig, asym_enc_maude_sig, bp_maude_sig, dh_maude_sig,
     enable_diff_maude_sig, hash_maude_sig, location_report_maude_sig,
-    mset_maude_sig, nat_maude_sig, pair_maude_sig,
+    mset_maude_sig, nat_maude_sig, pair_dest_maude_sig,
     reveal_signature_maude_sig, signature_dest_maude_sig, signature_maude_sig,
     sym_enc_dest_maude_sig, sym_enc_maude_sig, xor_maude_sig, MaudeSig,
 };
@@ -1496,7 +1496,7 @@ fn builtin_sig(name: &str) -> Option<MaudeSig> {
         "dest-symmetric-encryption" => Some(sym_enc_dest_maude_sig()),
         "dest-asymmetric-encryption" => Some(asym_enc_dest_maude_sig()),
         "dest-signing" => Some(signature_dest_maude_sig()),
-        "dest-pairing" => Some(pair_maude_sig()), // pair-with-destructors
+        "dest-pairing" => Some(pair_dest_maude_sig()), // pair-with-destructors
         _ => None,
     }
 }

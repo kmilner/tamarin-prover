@@ -283,6 +283,29 @@ pub fn pair_rules() -> BTreeSet<crate::subterm_rule::CtxtStRule> {
     s
 }
 
+/// `pairDestRules` (Rules.hs:115): the DESTRUCTOR variant of
+/// `pair_rules`, used by the `dest-pairing` builtin.  Same rewrite
+/// shapes as `fstRule`/`sndRule` but rooted at the destructor symbols:
+/// `fstDest(pair(x1,x2)) = x1` (`fstDestRule`) and
+/// `sndDest(pair(x1,x2)) = x2` (`sndDestRule`).
+pub fn pair_dest_rules() -> BTreeSet<crate::subterm_rule::CtxtStRule> {
+    use crate::subterm_rule::{CtxtStRule, StRhs};
+    let x1 = msg_var("x", 1);
+    let x2 = msg_var("x", 2);
+    let mut s = BTreeSet::new();
+    s.insert(CtxtStRule::new(
+        f_app_no_eq(crate::function_symbols::fst_dest_sym(),
+                    vec![pair(x1.clone(), x2.clone())]),
+        StRhs { positions: vec![vec![0, 0]], term: x1.clone() },
+    ));
+    s.insert(CtxtStRule::new(
+        f_app_no_eq(crate::function_symbols::snd_dest_sym(),
+                    vec![pair(x1.clone(), x2.clone())]),
+        StRhs { positions: vec![vec![0, 1]], term: x2 },
+    ));
+    s
+}
+
 /// `symEncRules`: `sdec(senc(x, y), y) = x`.
 pub fn sym_enc_rules() -> BTreeSet<crate::subterm_rule::CtxtStRule> {
     use crate::subterm_rule::{CtxtStRule, StRhs};
