@@ -87,15 +87,13 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
         let Some(t) = self.image_of(v) else { return false; };
         let Term::Lit(Lit::Var(target)) = t else { return false; };
         if target.sort != v.sort { return false; }
-        // target must not appear in any other range entry.
-        let others: Vec<VTerm<C, LVar>> = self
-            .map
+        // target must not appear in any other range entry.  Borrow each
+        // range term and scan in place (short-circuiting), avoiding the
+        // per-key clone of every other range term + `f_app_list` bundle.
+        self.map
             .iter()
             .filter(|(w, _)| *w != v)
-            .map(|(_, t)| t.clone())
-            .collect();
-        let bundle: VTerm<C, LVar> = f_app_list(others);
-        !crate::vterm::occurs_vterm(target, &bundle)
+            .all(|(_, t)| !crate::vterm::occurs_vterm(target, t))
     }
 
     /// `isRenaming`: every entry is a rename.

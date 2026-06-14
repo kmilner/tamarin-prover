@@ -195,13 +195,22 @@ impl MaudeProcessInner {
         let mut buf = Vec::new();
         let mut tmp = [0u8; 4096];
         loop {
+            // The prompt can only straddle the boundary between bytes read
+            // before this iteration and the newly-appended chunk, so scan
+            // only `buf[start..]` (keeping `PROMPT.len()-1` bytes of overlap)
+            // instead of re-scanning the whole accumulated buffer each read
+            // — O(N) total rather than O(N^2).  Result is identical because
+            // `find_subseq` returns the first match and earlier prefixes
+            // were already scanned (and rejected) on prior iterations.
+            let start = buf.len().saturating_sub(PROMPT.len() - 1);
             let n = self.stdout.read(&mut tmp)?;
             if n == 0 {
                 return Err(MaudeError::Other(
                     "Maude exited unexpectedly".into()));
             }
             buf.extend_from_slice(&tmp[..n]);
-            if let Some(pos) = find_subseq(&buf, PROMPT) {
+            if let Some(rel) = find_subseq(&buf[start..], PROMPT) {
+                let pos = start + rel;
                 let before = buf[..pos].to_vec();
                 return Ok(before);
             }

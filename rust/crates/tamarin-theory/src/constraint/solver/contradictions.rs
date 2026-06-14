@@ -254,7 +254,7 @@ fn has_non_normal_terms(ctx: &ProofContext, sys: &System) -> bool {
     // HS-faithful NF check: `nf'` = `nfViaHaskell` (Norm.hs:131).
     // Short-circuit on the first term that is NOT in NF.
     for t in &candidates {
-        if !tamarin_term::norm::nf_via_haskell(&ctx.maude, t) {
+        if !tamarin_term::norm::nf_via_haskell(&sig, t) {
             return true;
         }
     }
@@ -1360,8 +1360,18 @@ fn non_injective_fact_instances(
         reach_cache.borrow_mut().insert(from.clone(), out.clone());
         out
     };
+    // Resolve node-id → rule via a once-built map instead of a linear
+    // `nodes.iter().find` per `i`/`j`.  `or_insert` keeps the FIRST rule
+    // for a given id, matching `find`'s first-match semantics.
+    let node_rule_map: std::collections::HashMap<&NodeId, &crate::rule::RuleACInst> = {
+        let mut m = std::collections::HashMap::new();
+        for (n, r) in sys.nodes.iter() {
+            m.entry(n).or_insert(r);
+        }
+        m
+    };
     let lookup_node = |id: &NodeId| -> Option<&crate::rule::RuleACInst> {
-        sys.nodes.iter().find(|(n, _)| n == id).map(|(_, r)| r)
+        node_rule_map.get(id).copied()
     };
 
     for e in &sys.edges {
@@ -1524,10 +1534,18 @@ fn has_fresh_fact_sort_violation(sys: &System) -> bool {
 /// an unrelated live node — the edge survives the rename but
 /// connects incompatible facts.  Such a system has no model.
 fn has_incompatible_edge_facts(sys: &System) -> bool {
+    // One node-id → rule map (instead of two linear `nodes.iter().find`
+    // scans per edge → O(edges*nodes)).  `or_insert` keeps the FIRST rule
+    // for a given id, matching `find`'s first-match semantics.
+    let mut node_rule_map: std::collections::HashMap<&NodeId, &crate::rule::RuleACInst> =
+        std::collections::HashMap::new();
+    for (id, r) in sys.nodes.iter() {
+        node_rule_map.entry(id).or_insert(r);
+    }
     for e in &sys.edges {
-        let src_rule = sys.nodes.iter().find(|(id, _)| id == &e.src.0);
-        let tgt_rule = sys.nodes.iter().find(|(id, _)| id == &e.tgt.0);
-        let (Some((_, sr)), Some((_, tr))) = (src_rule, tgt_rule) else {
+        let src_rule = node_rule_map.get(&e.src.0).copied();
+        let tgt_rule = node_rule_map.get(&e.tgt.0).copied();
+        let (Some(sr), Some(tr)) = (src_rule, tgt_rule) else {
             continue;
         };
         let fc = match sr.conclusions.get(e.src.1.0) { Some(f) => f, None => continue };
@@ -1774,7 +1792,7 @@ pub fn subst_creates_non_normal_terms(
         // for AC-reordered arms, over-filtering `simpMinimize` and
         // dropping legitimate `solve_term_eqs` cases in DH protocols
         // (JKL_TS2_2004{,_KI_wPFS} key-secrecy lemmas).
-        let is_nf = tamarin_term::norm::nf_via_haskell(maude, &t_prime);
+        let is_nf = tamarin_term::norm::nf_via_haskell(&sig, &t_prime);
         if !is_nf {
             if std::env::var("TAM_RS_DBG_SUBST_NF").is_ok() {
                 eprintln!("[rs-subst-nf] CREATES t={:?} t_prime={:?}", t, t_prime);

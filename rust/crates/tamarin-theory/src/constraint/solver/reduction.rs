@@ -2198,10 +2198,15 @@ impl<'ctx> Reduction<'ctx> {
         // empty reducible signatures — pair-only theories never
         // produce non-normal subterms structurally so the check is
         // pure overhead.  See contradictions.rs::subst_creates_non_normal_terms.
-        let sys_snapshot = self.sys.clone();
-        let maude_for_check = maude.clone();
         let has_reducible = !maude.maude_sig().reducible_fun_syms.is_empty()
             && std::env::var("TAM_DISABLE_SUBST_NF").is_err();
+        // The snapshot + Maude clone are consumed ONLY by the
+        // `subst_creates_non_normal_terms` check in the `if has_reducible`
+        // arm of `do_simp` below.  Gate the (deep) System clone + Maude
+        // handle clone on `has_reducible` so pair-only / non-reducible-
+        // signature theories pay nothing on this hot unification path.
+        let sys_snapshot = has_reducible.then(|| self.sys.clone());
+        let maude_for_check = has_reducible.then(|| maude.clone());
         // Collect live system vars so `simp_singleton`'s `fresh_to_free`
         // doesn't rename them.  Mirrors `solve_split_goal`'s approach.
         let system_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar> = {
@@ -2255,9 +2260,13 @@ impl<'ctx> Reduction<'ctx> {
         let do_simp = |s: crate::tools::equation_store::EquationStore|
                 -> crate::tools::equation_store::EquationStore {
             if has_reducible {
+                // Safe: both are `Some` exactly when `has_reducible` is true
+                // (they were built via `has_reducible.then(...)`).
+                let maude_for_check = maude_for_check.as_ref().unwrap();
+                let sys_snapshot = sys_snapshot.as_ref().unwrap();
                 s.simp_with_fresh_avoiding(
                     |fs, vfs| crate::constraint::solver::contradictions::subst_creates_non_normal_terms(
-                        &maude_for_check, &sys_snapshot, fs, vfs,
+                        maude_for_check, sys_snapshot, fs, vfs,
                     ),
                     |n| maude_alloc.reserve_idxs(n),
                     &system_vars,
@@ -3643,7 +3652,12 @@ fn has_fresh_consumer_conflation(
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
     let subst = sys.eq_store.subst.clone();
-    let mut consumers: Vec<(crate::constraint::constraints::NodeId, LVar)> = Vec::new();
+    // Capture the rule reference alongside each consumer at build time —
+    // it is exactly the node's rule we are already iterating, so the
+    // inner pair loop need not re-scan `sys.nodes` (O(consumers^2 * nodes)
+    // → O(consumers^2)).
+    let mut consumers: Vec<(crate::constraint::constraints::NodeId, LVar, &crate::rule::RuleACInst)> =
+        Vec::new();
     for (id, rule) in sys.nodes.iter() {
         for prem in &rule.premises {
             if !matches!(prem.tag, FactTag::Fresh) { continue; }
@@ -3651,7 +3665,7 @@ fn has_fresh_consumer_conflation(
             let t_norm = tamarin_term::subst::apply_vterm(&subst, t.clone());
             if let Term::Lit(Lit::Var(v)) = t_norm {
                 if v.sort == LSort::Fresh {
-                    consumers.push((id.clone(), v));
+                    consumers.push((id.clone(), v, rule));
                 }
             }
         }
@@ -3661,9 +3675,7 @@ fn has_fresh_consumer_conflation(
         for j in (i + 1)..consumers.len() {
             if consumers[i].1 != consumers[j].1 { continue; }
             if consumers[i].0 == consumers[j].0 { continue; }
-            let ri = sys.nodes.iter().find(|(n, _)| n == &consumers[i].0).map(|(_, r)| r);
-            let rj = sys.nodes.iter().find(|(n, _)| n == &consumers[j].0).map(|(_, r)| r);
-            let (Some(ri), Some(rj)) = (ri, rj) else { continue };
+            let (ri, rj) = (consumers[i].2, consumers[j].2);
             match crate::rule::unifiable_rule_ac_insts(maude, ri, rj) {
                 Ok(true) => continue,  // could be merged; not a conflation
                 Ok(false) => return true,  // distinct rules, same fresh → conflation
@@ -4750,34 +4762,54 @@ impl<'ctx> Reduction<'ctx> {
                                     // GRAFTED edges only (skip live-live
                                     // edges — see action_live_node_ids
                                     // note above).
-                                    let mut tag_mismatch_edge = false;
-                                    let chain_eqs: Vec<_> = sub.sys.edges
-                                        .iter()
-                                        .filter_map(|e| {
-                                            if skip_live_e
-                                                && action_live_node_ids.contains(&e.src.0)
-                                                && action_live_node_ids.contains(&e.tgt.0) {
-                                                return None;
+                                    // Build chain_eqs in a block so the
+                                    // node-id → rule map (which borrows
+                                    // `sub.sys.nodes`) drops before the later
+                                    // `&mut sub` uses.  The map makes the
+                                    // per-edge src/tgt resolution O(1) instead
+                                    // of two linear `nodes.iter().find` scans
+                                    // (O(arms*edges*nodes) → O(arms*(nodes+edges)));
+                                    // `or_insert` keeps the FIRST rule for a
+                                    // given id, matching `find`'s first-match.
+                                    let (chain_eqs, tag_mismatch_edge): (Vec<_>, bool) = {
+                                        let mut tag_mismatch_edge = false;
+                                        let node_rule_map: std::collections::HashMap<
+                                            &crate::constraint::constraints::NodeId,
+                                            &crate::rule::RuleACInst,
+                                        > = {
+                                            let mut m = std::collections::HashMap::new();
+                                            for (n, r) in sub.sys.nodes.iter() {
+                                                m.entry(n).or_insert(r);
                                             }
-                                            let (_, src_rule) = sub.sys.nodes.iter()
-                                                .find(|(n, _)| n == &e.src.0)?;
-                                            let (_, tgt_rule) = sub.sys.nodes.iter()
-                                                .find(|(n, _)| n == &e.tgt.0)?;
-                                            let fc = src_rule.conclusions
-                                                .get(e.src.1.0)?.clone();
-                                            let fp = tgt_rule.premises
-                                                .get(e.tgt.1.0)?.clone();
-                                            if fc.tag != fp.tag
-                                                || fc.terms.len() != fp.terms.len() {
-                                                tag_mismatch_edge = true;
-                                                return None;
-                                            }
-                                            if fc == fp { return None; }
-                                            Some(tamarin_term::rewriting::Equal {
-                                                lhs: fc, rhs: fp,
+                                            m
+                                        };
+                                        let chain_eqs: Vec<_> = sub.sys.edges
+                                            .iter()
+                                            .filter_map(|e| {
+                                                if skip_live_e
+                                                    && action_live_node_ids.contains(&e.src.0)
+                                                    && action_live_node_ids.contains(&e.tgt.0) {
+                                                    return None;
+                                                }
+                                                let src_rule = *node_rule_map.get(&e.src.0)?;
+                                                let tgt_rule = *node_rule_map.get(&e.tgt.0)?;
+                                                let fc = src_rule.conclusions
+                                                    .get(e.src.1.0)?.clone();
+                                                let fp = tgt_rule.premises
+                                                    .get(e.tgt.1.0)?.clone();
+                                                if fc.tag != fp.tag
+                                                    || fc.terms.len() != fp.terms.len() {
+                                                    tag_mismatch_edge = true;
+                                                    return None;
+                                                }
+                                                if fc == fp { return None; }
+                                                Some(tamarin_term::rewriting::Equal {
+                                                    lhs: fc, rhs: fp,
+                                                })
                                             })
-                                        })
-                                        .collect();
+                                            .collect();
+                                        (chain_eqs, tag_mismatch_edge)
+                                    };
                                     if tag_mismatch_edge { continue 'arm; }
                                     if !chain_eqs.is_empty() {
                                         let r2 = sub.solve_fact_eqs(

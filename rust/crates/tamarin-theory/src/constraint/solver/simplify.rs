@@ -515,8 +515,18 @@ fn non_injective_fact_instances_pairs(
         ctxt.injective_fact_insts.iter().map(|(t, _)| t).collect();
     if inj_tags.is_empty() { return out; }
 
+    // Resolve node-id → rule via a once-built map instead of a linear
+    // `nodes.iter().find` per lookup.  `or_insert` keeps the FIRST rule
+    // for a given id, matching `find`'s first-match semantics.
+    let node_rule_map: std::collections::HashMap<&NodeId, &crate::rule::RuleACInst> = {
+        let mut m = std::collections::HashMap::new();
+        for (n, r) in sys.nodes.iter() {
+            m.entry(n).or_insert(r);
+        }
+        m
+    };
     let lookup_node = |id: &NodeId| -> Option<&crate::rule::RuleACInst> {
-        sys.nodes.iter().find(|(n, _)| n == id).map(|(_, r)| r)
+        node_rule_map.get(id).copied()
     };
     let non_unifiable_nodes = |i: &NodeId, j: &NodeId| -> bool {
         let (Some(ri), Some(rj)) = (lookup_node(i), lookup_node(j))
