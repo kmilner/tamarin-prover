@@ -4,9 +4,10 @@
 //! The Haskell version uses a locally-nameless representation: bound
 //! variables are `BVar::Bound(de_bruijn_idx)`, free variables are `Free(v)`.
 //!
-//! Not yet ported: `nnf`, `pullquants`, `prenex`, `pnf`, `simplifyFormula`,
-//! pretty-printing. Those are pure transformations on the data type and
-//! can be added incrementally.
+//! Not yet ported: `nnf`, `pullquants`, `prenex`, `pnf`, `simplifyFormula`.
+//! Those are pure transformations on the data type and can be added
+//! incrementally. (Pretty-printing of the parser-AST formula representation
+//! lives in `pretty_formula.rs`; this `ProtoFormula` has no pretty-printer.)
 
 use crate::atom::{ProtoAtom, Unit2};
 use tamarin_term::lterm::{BVar, LVar, Name};
@@ -80,8 +81,10 @@ impl<S, H, C, V> ProtoFormula<S, H, C, V> {
     }
 }
 
-/// Visit every atom in the formula. Useful for renaming/free-variable
-/// computation built on top.
+/// Scope-blind rewrite of every atom in the formula. Note that scope-aware
+/// operations (`quantify`/`openFormula`/`shiftFreeIndices`) need the
+/// `foldFormulaScope`-style binder-depth index, which this helper does not
+/// thread, so they cannot be built directly on top of it.
 pub fn map_atoms<S, H, C, V, F>(f: &mut F, formula: ProtoFormula<S, H, C, V>) -> ProtoFormula<S, H, C, V>
 where
     F: FnMut(ProtoAtom<S, VTerm<C, BVar<V>>>) -> ProtoAtom<S, VTerm<C, BVar<V>>>,

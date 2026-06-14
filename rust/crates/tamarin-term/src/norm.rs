@@ -249,7 +249,7 @@ fn go_nf(t: &LNTerm, msig: &MaudeSig, irreducible: &BTreeSet<&FunSym>) -> bool {
                     }
                     // inv(mult(...)) where any factor is inverse → reducible
                     if let Term::App(FunSym::Ac(AcSym::Mult), inner_args) = &args[0] {
-                        if inner_args.iter().any(|f| is_inverse(f)) { return false; }
+                        if inner_args.iter().any(is_inverse) { return false; }
                     }
                     // inv(one) → reducible
                     if is_nullary(&args[0], ONE_SYM_STRING) { return false; }
@@ -273,13 +273,13 @@ fn go_nf(t: &LNTerm, msig: &MaudeSig, irreducible: &BTreeSet<&FunSym>) -> bool {
                         // contains one / DH_neutral, nested mult, or invalidMult → reducible
                         if args.iter().any(|a| is_nullary(a, ONE_SYM_STRING)) { return false; }
                         if args.iter().any(|a| is_nullary(a, DH_NEUTRAL_SYM_STRING)) { return false; }
-                        if args.iter().any(|a| is_product(a)) { return false; }
+                        if args.iter().any(is_product) { return false; }
                         if invalid_mult(args) { return false; }
                         return args.iter().all(|a| go_nf(a, msig, irreducible));
                     }
                     AcSym::Xor => {
                         if args.iter().any(|a| is_nullary(a, ZERO_SYM_STRING)) { return false; }
-                        if args.iter().any(|a| is_xor(a)) { return false; }
+                        if args.iter().any(is_xor) { return false; }
                         if invalid_xor(args) { return false; }
                         return args.iter().all(|a| go_nf(a, msig, irreducible));
                     }

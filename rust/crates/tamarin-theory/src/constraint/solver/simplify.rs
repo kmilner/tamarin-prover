@@ -1,4 +1,4 @@
-//! Skeleton port of `Theory.Constraint.Solver.Simplify`.
+//! Port of `Theory.Constraint.Solver.Simplify`.
 //!
 //! `simplifySystem` runs CR-rules that don't case-split until the
 //! system stabilises. The full Haskell list:
@@ -14,8 +14,7 @@
 //! - simpInjectiveFactEqMon
 //!
 //! Each is a `Reduction` step that may modify the system. This Rust
-//! port wires the loop and exposes empty hooks; individual passes
-//! land as the constituent solver pieces are filled in.
+//! port implements the full fixpoint loop and every pass above.
 
 use crate::constraint::solver::reduction::{ChangeIndicator, Reduction};
 
@@ -45,7 +44,7 @@ fn trace_subpass<F: FnOnce(&mut Reduction) -> ChangeIndicator>(
     // monadic action ran to completion WITHOUT mzero'ing.  In Rust,
     // mark_contradictory is the closest analog — if the pass marked
     // contradictory (and wasn't already), it "mzero'd" mid-pass.
-    if on && !(dead_after && !was_dead_before) {
+    if (was_dead_before || !dead_after) && on {
         eprintln!("[SUBPASS] exit  {}", label);
     }
     r
@@ -59,9 +58,10 @@ fn is_dead_for_trace(red: &Reduction) -> bool {
 
 /// `simplifySystem` — run all non-case-splitting CR-rules to a fixpoint.
 ///
-/// The loop is bounded to 256 iterations as a safety net — without
-/// goal-ranking we can hit pathological cases where two passes keep
-/// undoing each other's work. Real proofs converge well within this.
+/// The loop is bounded (default 64 iterations, configurable via
+/// `TAM_SIMP_ITER_CAP`) as a safety net — without goal-ranking we can
+/// hit pathological cases where two passes keep undoing each other's
+/// work. Real proofs converge well within this.
 pub fn simplify_system(red: &mut Reduction) {
     crate::constraint::solver::trace::trace_exec("simplifySystem");
     if std::env::var("TAM_DBG_SIMP_ENTER").is_ok() {
@@ -294,8 +294,8 @@ pub fn simplify_system_with_fanout(
         return vec![r.sys];
     }
     let mut red = Reduction::new(ctx, sys);
-    let cases = simplify_system_fan_out_inner(&mut red);
-    cases
+    
+    simplify_system_fan_out_inner(&mut red)
 }
 
 /// Inner driver — mirrors the body of `simplify_system` but propagates
@@ -461,7 +461,7 @@ where
     let was_dead_before = is_dead_for_trace(red);
     let r = f(red);
     let dead_after = is_dead_for_trace(red);
-    if on && !(dead_after && !was_dead_before) {
+    if (was_dead_before || !dead_after) && on {
         eprintln!("[SUBPASS] exit  {}", label);
     }
     r
@@ -528,7 +528,7 @@ fn non_injective_fact_instances_pairs(
         = sys.nodes.iter().collect();
     nodes_sorted.sort_by(|a, b| a.0.cmp(&b.0));
     for e in &edges_sorted {
-        let (i, conc_idx) = (e.src.0.clone(), e.src.1.clone());
+        let (i, conc_idx) = (e.src.0.clone(), e.src.1);
         let k = e.tgt.0.clone();
         let i_rule = match lookup_node(&i) { Some(r) => r, None => continue };
         let k_fa_prem = match i_rule.conclusions.get(conc_idx.0) {
@@ -645,7 +645,7 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
     // Simplify.hs:402-404 — ascending Guarded Ord.  Rust's Vec is in
     // insertion order; sort first to match HS's iteration.
     let mut formulas = red.sys.formulas.clone();
-    formulas.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
+    formulas.sort_by(crate::guarded::cmp_guarded);
     // HS-faithful: `evalFormulaAtoms` builds a CHANGE LIST via
     // `applyChangeList`'s list comprehension (Simplify.hs:444-454) where
     // every `fm'` is computed from the SINGLE `valuation` captured at
@@ -890,7 +890,7 @@ fn partial_atom_valuation(
             }
         }
         Atom::Action(fa, t) => {
-            let n = match parser_node_id(t) { Some(v) => v, None => return None };
+            let n = parser_node_id(t)?;
             let lnfa = match crate::elaborate::fact_to_lnfact(fa) {
                 Ok(f) => f, Err(_) => return None,
             };
@@ -1101,7 +1101,7 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     //
     // TAM_PROVENANCE_SKIP_SOURCES_OFF=1 reverts to the old workaround
     // for diagnostic comparison.
-    let skip_sources = !std::env::var("TAM_PROVENANCE_SKIP_SOURCES_OFF").is_ok()
+    let skip_sources = std::env::var("TAM_PROVENANCE_SKIP_SOURCES_OFF").is_err()
         && !crate::constraint::solver::sources::in_precompute_mode()
         && !red.sys.sources_lemma_universals.is_empty();
     // Mirror Haskell's `openGuarded` (Guarded.hs:openGuarded): allocate
@@ -1251,8 +1251,7 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
                     i, id, fa.tag, t);
                 if std::env::var("TAM_DBG_IMPL_ALLT").is_ok() {
                     for (j, t) in fa.terms.iter().enumerate() {
-                        eprintln!("    action[{}].term[{}]={}", i, j,
-                            format!("{:?}", t));
+                        eprintln!("    action[{}].term[{}]={:?}", i, j, t);
                     }
                 }
             }
@@ -1603,7 +1602,7 @@ fn try_match_all_guards(
                 let g_fact_subst = subst_fact(g_fact, acc);
                 let g_time_subst = subst_term(g_time, acc);
                 for (i, fa_sys) in sys_actions {
-                    if &g_fact_subst.name != &fact_name(&fa_sys.tag) { continue; }
+                    if g_fact_subst.name != fact_name(&fa_sys.tag) { continue; }
                     if g_fact_subst.args.len() != fa_sys.terms.len() { continue; }
                     // HS-faithful: AC matching can yield multiple matchers
                     // per (sys_action, pattern) pair. HS's `candidateSubsts`
@@ -1777,7 +1776,7 @@ fn try_match_all_guards(
                         other_guards, sys, sys_maude, out);
                 }
             }
-            _ => return,
+            _ => (),
         }
     }
 
@@ -1863,10 +1862,10 @@ fn structural_match(
         // Subsort lattice: Pub < Msg, Fresh < Msg, Nat < Msg,
         // Node has its own line, Msg < TOP.
         if pat_sort == subj_sort { return true; }
-        match (pat_sort, subj_sort) {
-            (LSort::Msg, LSort::Pub | LSort::Fresh | LSort::Nat) => true,
-            _ => false,
-        }
+        matches!(
+            (pat_sort, subj_sort),
+            (LSort::Msg, LSort::Pub | LSort::Fresh | LSort::Nat)
+        )
     }
     fn term_lsort(t: &tamarin_term::lterm::LNTerm) -> LSort {
         use tamarin_term::function_symbols::FunSym;
@@ -2008,14 +2007,14 @@ fn match_atom_via_maude(
             break;
         }
     }
-    let ms: Vec<Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)>>;
+    let ms: Vec<Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)>> =
     if all_struct_ok {
         // Structural matcher yields a unique match (when it succeeds).
         // HS's `matchRaw` succeeds with exactly one substitution per
         // term pair when no `ACProblem` is raised — `matchTerms ms hnd`
         // at Term/Unification.hs:209 returns `[substFromMap mappings]`,
         // a single-element list.
-        ms = vec![struct_subst.into_iter().collect()];
+        vec![struct_subst.into_iter().collect()]
     } else {
         // AC-fallback: structural matcher can't handle AC-symbol
         // arguments (e.g. `exp(g, Mult(a, b))` vs
@@ -2057,8 +2056,8 @@ fn match_atom_via_maude(
         let maude_res = maude.match_eqs_const_subject(&eqs, &pattern_vars);
         let Ok(matches) = maude_res else { return Vec::new() };
         if matches.is_empty() { return Vec::new(); }
-        ms = matches;
-    }
+        matches
+    };
 
     // Translate each LVar → LNTerm match back to parser-AST.
     // Record bindings for universal-bound vars only — free system
@@ -3081,7 +3080,7 @@ fn enforce_kd_fact_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     let mut hit_contra = false;
     if !rule_eqs.is_empty() {
         // Haskell uses `solveRuleEqs SplitNow` for the kdConcs merger
-        // (Simplify.hs:196 `merge "ENU.kdConcs" (solveRuleEqs SplitNow)`).
+        // (Simplify.hs `merge (solveRuleEqs SplitNow) kdConcs`).
         // Multi-arm AC unifications fork the DisjT continuation in HS
         // (Reduction.hs:730-738); mirror via install + pending_eq_arms.
         // Bug #3 (Joux_EphkRev): ignoring `Cases` here left the
@@ -3174,7 +3173,7 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
     //
     // KNOWN GAP (task #275): Haskell additionally `floodFill`s over the
     // subterm graph (`posSubterms` + `elemNotBelowReducible` edges,
-    // Simplify.hs:464-467) so transitively-contained subterms (via
+    // Simplify.hs `floodFill`/`termsContaining`) so transitively-contained subterms (via
     // `⊏`-chains) are picked up as "containing ~x" too.  Rust only does
     // direct `for_each_free` matching.  No current 116-corpus lemma
     // exposes this — Order2 passes via compensating fixes, and the
@@ -3192,7 +3191,7 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
     let maude = red.ctx.maude.clone();
     let mut changed = ChangeIndicator::Unchanged;
 
-    // Build the route() function as a closure (Simplify.hs:486-496).
+    // Build the route() function as a closure (Simplify.hs `getRoute`/`plainRoute`).
     // `route nid` follows linear-fact edges from a node's single
     // linear conclusion, returning the chain of node ids until either
     // the node has multiple conclusions, the single conclusion is
@@ -3250,10 +3249,10 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
         };
         // HS-faithful: use `elemNotBelowReducible reducible ~x t'` rather
         // than a raw free-var walk.  Haskell's `connectNodeToFreshes`
-        // (Simplify.hs:561-567) computes `containing` = the floodFill of
+        // (Simplify.hs) computes `containing` = the floodFill of
         // (~x, ~x) over the subterm graph, then checks whether any t in
         // `containing` satisfies `t `elemNotBelowReducible` t'` for some
-        // t' in the consumer's `rPrems ++ rActs` terms (Simplify.hs:564).
+        // t' in the consumer's `rPrems ++ rActs` terms (Simplify.hs).
         //
         // We approximate the floodFill by starting with `containing =
         // [~x]` (no transitive ⊏-subterm expansion — see the "KNOWN GAP
@@ -3307,7 +3306,7 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
         }
     }
 
-    // Step 3 — `enhancedLesses` (Simplify.hs:468).
+    // Step 3 — `enhancedLesses` (Simplify.hs).
     //
     // ```haskell
     // enhancedLesses = [ LessAtom (last rs) j Fresh
@@ -3461,6 +3460,10 @@ fn apply_node_eqs(
                 // instances at the same node id (same shape but
                 // different rule names/infos) is just as contradictory
                 // as a shape mismatch.
+                // Keep the rInfo check and the arity/shape check as
+                // separate arms to mirror Haskell's `solveRuleEqs`
+                // ordering, even though both set `shape_mismatch`.
+                #[allow(clippy::if_same_then_else)]
                 if kept.info != rule.info {
                     shape_mismatch = true;
                 } else if kept.premises.len() != rule.premises.len()
@@ -3905,7 +3908,7 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                          &Vec<MonotonicBehaviour>)> = Vec::new();
     // HS-faithful: `getPairs`'s `behaviourTerms = M.map ... nodes` is a
     // `Map NodeId`, and the `paired` comprehension iterates
-    // `M.toList behaviourTerms` for both i and j (Simplify.hs:812-830) —
+    // `M.toList behaviourTerms` for both i and j (Simplify.hs) —
     // i.e. ASCENDING NodeId order, with a node's premises kept in their
     // original `rPrems` order.  Iterate nodes sorted by NodeId (stable
     // within a node) so the (i, j) pair enumeration matches HS; the
@@ -3926,7 +3929,7 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
     // Pre-collect the existing `gnotAtom (EqE s t)` inequalities from
     // formulas + solved_formulas so case (4) below can skip when we
     // already know s ≠ t.  Mirrors HS `inequalities` set
-    // (Simplify.hs:637-643).
+    // (Simplify.hs).
     let inequalities: std::collections::BTreeSet<(tamarin_term::lterm::LNTerm,
                                                   tamarin_term::lterm::LNTerm)> = {
         let mut set = std::collections::BTreeSet::new();
@@ -3953,7 +3956,7 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
         set
     };
     // HS-faithful: capture the formula set BEFORE this pass runs so the
-    // change-detection at the end can mirror Simplify.hs:765-769
+    // change-detection at the end can mirror Simplify.hs
     //   updatedFormulas == oldFormulas && null newLesses → Unchanged.
     // HS `oldFormulas = sFormulas ∪ sSolvedFormulas`.  `Guarded` is not
     // `Ord`, so we model the Set as a sorted-by-`cmp_guarded` deduped
@@ -3970,7 +3973,7 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
     let old_formulas = formula_set(red);
     // HS `simpInjectiveFactEqMon` inserts cases (1), (2) and (4) ALL as
     // deferred formulas via `mapM_ insertFormula newFormulas`
-    // (Simplify.hs:745,747,748,760) — it does NO eager equation solving
+    // (Simplify.hs) — it does NO eager equation solving
     // in this pass.  Case (1) `GAto $ EqE s t`, case (2) `GAto $ EqE
     // (Free i) (Free j)`, case (4) `gnotAtom $ EqE s t`.  The merge /
     // equation-solving is realised LATER by the formula machinery
@@ -3983,7 +3986,7 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
     // Mirror of HS `isTrueFalse reducible Nothing (small, big)`
     // (SubtermStore.hs:334-355) — the cheap structural classification
     // used by `triviallySmaller` / `triviallyNotSmaller` inside
-    // simpInjectiveFactEqMon (Simplify.hs:634-635). The subterm-store-
+    // simpInjectiveFactEqMon (Simplify.hs). The subterm-store-
     // backed cases are skipped (matches HS using `Just sst` here only
     // when sst is empty/atom — for the injective-fact pass HS calls
     // `isTrueFalse reducible (Just sst) (s,t)` but the sst membership
@@ -4053,11 +4056,12 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                                  t: &tamarin_term::lterm::LNTerm| {
         is_true_false(s, t) == Some(false)
     };
-    // HS-faithful: iterate ALL (i, j) pairs with i != j (not just
-    // unordered `a < b`).  Cases (3) and (5) are NOT symmetric — they
-    // emit `(i, j)` or `(j, i)` LessAtoms whose direction depends on
-    // which side has the "smaller" term.  Mirrors HS `paired` list
-    // comprehension (Simplify.hs:728-734).
+    // HS-faithful: iterate ALL ordered pairs of `by_inj` entries,
+    // skipping only the diagonal (`a == b`, same entry index) — not
+    // just unordered `a < b`.  Cases (3) and (5) are NOT symmetric —
+    // they emit `(i, j)` or `(j, i)` LessAtoms whose direction depends
+    // on which side has the "smaller" term.  Mirrors HS `paired` list
+    // comprehension (Simplify.hs).
     for a in 0..by_inj.len() {
         for b in 0..by_inj.len() {
             if a == b { continue; }
@@ -4073,7 +4077,7 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                 let pos = k + 1;
                 let s = match fa_i.terms.get(pos) { Some(t) => t, None => continue };
                 let t = match fa_j.terms.get(pos) { Some(t) => t, None => continue };
-                // HS `simpSingle` (Simplify.hs:646) handles
+                // HS `simpSingle` (Simplify.hs) handles
                 // Decreasing/StrictlyDecreasing by swapping i↔j and
                 // recursing into Increasing/StrictlyIncreasing.  We
                 // mirror that swap here so case (3) / (5) emit
@@ -4083,10 +4087,10 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                         (MonotonicBehaviour::Increasing, j, i),
                     MonotonicBehaviour::StrictlyDecreasing =>
                         (MonotonicBehaviour::StrictlyIncreasing, j, i),
-                    other => (other.clone(), i, j),
+                    other => (*other, i, j),
                 };
                 match eff_bh {
-                    // HS-faithful case (1) (Simplify.hs:745):
+                    // HS-faithful case (1) (Simplify.hs):
                     //   Constant → [GAto $ EqE (lTermToBTerm s) (lTermToBTerm t) | s/=t]
                     // Inserted LATER as a deferred formula (NOT eagerly
                     // solved) — `insertFormula`→`insertAtom`→`solveTermEqs
@@ -4100,7 +4104,7 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                         new_formulas.push(crate::guarded::Guarded::Atom(
                             crate::guarded::GAtom::Eq(s_g, t_g)));
                     }
-                    // HS-faithful case (2) (Simplify.hs:747):
+                    // HS-faithful case (2) (Simplify.hs):
                     //   StrictlyIncreasing, s==t →
                     //     [GAto $ EqE (varTerm $ Free i) (varTerm $ Free j)]
                     // The node-id equality `i = j` is inserted as a
@@ -4110,8 +4114,8 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                     // writes the `i := j` substitution into the eq-store,
                     // and the NEXT simplify iteration's `substSystem`
                     // performs the node merge + shape-mismatch contradiction.
-                    // HS-faithful StrictlyIncreasing arm (Simplify.hs:746-
-                    // 751).  HS does NOT gate on `s == t` vs `s /= t`: the
+                    // HS-faithful StrictlyIncreasing arm (Simplify.hs).
+                    // HS does NOT gate on `s == t` vs `s /= t`: the
                     // whole arm runs and EACH of cases (2),(4),(3),(5) is
                     // a separate list-comprehension with its OWN guard, so
                     // several can fire together.  In particular, when the
@@ -4134,7 +4138,7 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                     // loop, mislabelling the leaf `from formulas` instead
                     // of `cyclic` (counter.spthy::counters_linear_order).
                     MonotonicBehaviour::StrictlyIncreasing => {
-                        // case (2) (Simplify.hs:747): [EqE i j | s == t]
+                        // case (2) (Simplify.hs): [EqE i j | s == t]
                         if s == t && ii != jj {
                             let i_g = crate::guarded::term_to_gterm_free(
                                 &crate::elaborate::lnterm_to_term(
@@ -4145,7 +4149,7 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                             new_formulas.push(crate::guarded::Guarded::Atom(
                                 crate::guarded::GAtom::Eq(i_g, j_g)));
                         }
-                        // case (4) (Simplify.hs:748): [¬EqE s t |
+                        // case (4) (Simplify.hs): [¬EqE s t |
                         //   alwaysBefore i j || alwaysBefore j i, notIneq s t]
                         let comparable = red.sys.always_before(ii, jj)
                                       || red.sys.always_before(jj, ii);
@@ -4162,12 +4166,12 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                             );
                             new_formulas.push(neg);
                         }
-                        // case (3) (Simplify.hs:750): [(i,j) |
+                        // case (3) (Simplify.hs): [(i,j) |
                         //   triviallySmaller s t, not alwaysBefore i j]
                         if trivially_smaller(s, t) && !red.sys.always_before(ii, jj) {
                             new_lesses.push((ii.clone(), jj.clone()));
                         }
-                        // case (5) (Simplify.hs:751): [(j,i) |
+                        // case (5) (Simplify.hs): [(j,i) |
                         //   triviallyNotSmaller s t, not alwaysBefore j i, ineq s t]
                         if trivially_not_smaller(s, t)
                             && !red.sys.always_before(jj, ii)
@@ -4176,7 +4180,7 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                             new_lesses.push((jj.clone(), ii.clone()));
                         }
                     }
-                    // HS-faithful Increasing (Simplify.hs:752-754):
+                    // HS-faithful Increasing (Simplify.hs):
                     //   `Increasing -> ([], snd $ simpSingle (StrictlyIncreasing,
                     //    (i,s),(j,t)))` — no new formulas, but the SAME
                     //   less-atom cases (3) and (5) as StrictlyIncreasing,
@@ -4197,7 +4201,7 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
             }
         }
     }
-    // HS `simpInjectiveFactEqMon` (Simplify.hs:758-762):
+    // HS `simpInjectiveFactEqMon` (Simplify.hs):
     //   mapM_ insertFormula newFormulas
     //   mapM_ (\(x,y) -> insertLess (LessAtom x y InjectiveFacts)) newLesses
     // Formulas FIRST (cases 1, 2, 4), then less-atoms (cases 3, 5).
@@ -4214,13 +4218,13 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
     }
     // Insert case (3)/(5) less-atoms with `InjectiveFacts` reason,
     // mirroring HS `mapM_ (\(x, y) -> insertLess (LessAtom x y
-    // InjectiveFacts)) newLesses` (Simplify.hs:761-762).
+    // InjectiveFacts)) newLesses` (Simplify.hs).
     let any_new_lesses = !new_lesses.is_empty();
     for (sm, lg) in new_lesses {
         red.insert_less(crate::constraint::constraints::LessAtom::new(
             sm, lg, crate::constraint::constraints::Reason::InjectiveFacts));
     }
-    // HS change-detection (Simplify.hs:765-769):
+    // HS change-detection (Simplify.hs):
     //   updatedFormulas = sFormulas ∪ sSolvedFormulas (AFTER inserts)
     //   Changed iff (updatedFormulas /= oldFormulas) || not (null newLesses)
     let updated_formulas = formula_set(red);
@@ -4248,7 +4252,7 @@ fn reduce_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
         .filter(|f| reducible_formula(f))
         .cloned()
         .collect();
-    to_decompose.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
+    to_decompose.sort_by(crate::guarded::cmp_guarded);
     if std::env::var("TAM_DBG_REDUCE_FORM").is_ok() {
         let total = red.sys.formulas.len();
         eprintln!("[REDUCE_FORM] total_formulas={} to_decompose={}", total, to_decompose.len());
@@ -4898,9 +4902,9 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
 ///      variables that appear in nat-subterm edges.
 ///   2. `formatEdge`: each nat-subterm `s ⊏ t` (with `isNatSubterm`)
 ///      becomes either:
+///      Edge weight `d = 2 * (countOnes(r) - countOnes(l) - 1)`, and:
 ///        - 1 var total → 1 edge.
 ///        - 2 vars total → 2 edges (symmetric).
-///      Edge weight `d = 2 * (countOnes(r) - countOnes(l) - 1)`.
 ///   3. `oneEdges`: self-loop `(False, x) → (True, x)` with weight
 ///      `-2` for every `(True, x)` vertex.
 ///   4. `rawEdges = realEdges ++ oneEdges`.
@@ -5260,7 +5264,7 @@ fn nat_subterm_equalities(
             s
         })
         .collect();
-    scc_vertices.sort_by(|a, b| a.cmp(b));
+    scc_vertices.sort();
 
     for scc in &scc_vertices {
         // `smallest = foldr1 (\x y -> if getValue x < getValue y then x else y)`

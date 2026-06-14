@@ -339,7 +339,7 @@ async fn test_overview_help_panes_are_direct_body_children() {
                     let is_self_close = tag.ends_with('/');
                     let starts = i + 1;
                     let name_end = tag[1..]
-                        .find(|c: char| c == ' ' || c == '>' || c == '/')
+                        .find([' ', '>', '/'])
                         .map(|x| x + 1)
                         .unwrap_or(tag.len());
                     let name = &inner[starts..starts + (name_end - 1)];

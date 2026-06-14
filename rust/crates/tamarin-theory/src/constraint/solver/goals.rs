@@ -2,12 +2,13 @@
 //!
 //! `openGoals` enumerates the list of goals from a `System` that
 //! still need to be solved, with `Usefulness` annotations driving
-//! the heuristic. The full Haskell version filters via
-//! `kFactView`, sort checks, AC predicates, and chain-conclusion
-//! analysis. The Rust port currently implements the cheap structural
-//! filter (skip already-solved goals, drop `DisjG (Disj [])`) and
-//! defers the message-knowledge filtering until those view helpers
-//! are available.
+//! the heuristic. This port implements the full Haskell `openGoals`
+//! filter — KU sort/pair/inv/prod/union checks, `chainToEquality`,
+//! `allMsgVarsKnownEarlier`, `splitExists`, and `SubtermG`
+//! membership — together with the usefulness annotation
+//! (`currentlyDeducible` / `extractible` / `probablyConstructible` /
+//! `hasKUGuards`).  A few helpers remain conservative stubs (e.g.
+//! `is_nat_subterm_split`).
 
 use crate::constraint::constraints::Goal;
 use crate::constraint::solver::annotated_goals::{AnnotatedGoal, Usefulness};
@@ -30,9 +31,9 @@ use crate::constraint::system::System;
 /// `Smart(false)` — they are out of scope for this implementation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalRanking {
-    /// `SmartRanking useLoopBreakers` (ProofMethod.hs:1203).
+    /// `SmartRanking useLoopBreakers` (ProofMethod.hs).
     Smart(bool),
-    /// `InjRanking useLoopBreakers` (ProofMethod.hs:1096).
+    /// `InjRanking useLoopBreakers` (ProofMethod.hs).
     Inj(bool),
     /// `OracleRanking quitOnEmpty oracle` (ProofMethod.hs:695).
     /// preSort = `const goalNrRanking`.
@@ -165,7 +166,7 @@ pub fn open_goals(sys: &System) -> Vec<AnnotatedGoal> {
         let u = goal_usefulness(goal, status.looping, sys);
         // Use the persistent goal-number (`_gsNr`), NOT the Vec
         // position.  Haskell's `openGoals` returns `(goal, (gsNr,
-        // useful))` (Goals.hs:125) and the rankings begin with
+        // useful))` (Goals.hs) and the rankings begin with
         // `goalNrRanking = sortOn (fst . snd)` (ProofMethod.hs:748),
         // i.e. ordering by creation number.  We carry `status.nr`
         // here and sort below so the heuristic priority classes break
@@ -208,10 +209,10 @@ fn guarded_canon_idx_first(d: &crate::constraint::constraints::Disj<crate::guard
     fn render_atom(a: &crate::guarded::GAtom, out: &mut String) {
         use crate::guarded::GAtom;
         match a {
-            GAtom::Eq(s, t) => { out.push_str("E"); render_term(s, out); render_term(t, out); }
-            GAtom::Less(s, t) => { out.push_str("L"); render_term(s, out); render_term(t, out); }
-            GAtom::LessMset(s, t) => { out.push_str("M"); render_term(s, out); render_term(t, out); }
-            GAtom::Subterm(s, t) => { out.push_str("S"); render_term(s, out); render_term(t, out); }
+            GAtom::Eq(s, t) => { out.push('E'); render_term(s, out); render_term(t, out); }
+            GAtom::Less(s, t) => { out.push('L'); render_term(s, out); render_term(t, out); }
+            GAtom::LessMset(s, t) => { out.push('M'); render_term(s, out); render_term(t, out); }
+            GAtom::Subterm(s, t) => { out.push('S'); render_term(s, out); render_term(t, out); }
             GAtom::Last(s) => { out.push_str("La"); render_term(s, out); }
             GAtom::Action(f, t) => {
                 out.push_str(&format!("Ac{}/{}", f.name, f.args.len()));
@@ -555,7 +556,7 @@ fn oracle_ranking(
 
 
 /// Port of HS `smartRanking ctxt allowPremiseGLoopBreakers sys`
-/// (ProofMethod.hs:1203):
+/// (ProofMethod.hs):
 ///
 /// ```text
 ///   moveNatToEnd . sortOnUsefulness . unmark
@@ -608,7 +609,7 @@ fn smart_ranking(
         Box::new(is_standard_action_goal),
         Box::new(is_not_auth_out),
         Box::new(is_private_knows_goal),
-        // Haskell `smartRanking` solveFirst (ProofMethod.hs:1219-1232)
+        // Haskell `smartRanking` solveFirst (ProofMethod.hs)
         // includes `isFreshKnowsGoal` AND `isSignatureGoal` — both are
         // active in the smart ranking. Previous comment incorrectly cited
         // `sapicRanking` (line 953) where they're commented out. TPM
@@ -618,7 +619,7 @@ fn smart_ranking(
         Box::new(|a: &AnnotatedGoal| is_split_goal_small(a, sys)),
         Box::new(|a: &AnnotatedGoal| is_msg_one_case_goal(a, &one_case_syms)),
         Box::new(is_signature_goal),
-        // `isDoubleExpGoal` (ProofMethod.hs:1404): slot 11 between
+        // `isDoubleExpGoal` (ProofMethod.hs): slot 11 between
         // `isSignatureGoal` and `isNoLargeSplitGoal`. Picks KU goals
         // whose term is `exp(_, mult(_))` before the catch-all NoLargeSplit
         // tier so DH double-exp KU goals (e.g. `KU(g^(~lkR*~x))`) win
@@ -672,7 +673,7 @@ fn smart_ranking(
 }
 
 /// Port of HS `injRanking ctxt allowLoopBreakers sys`
-/// (ProofMethod.hs:1096):
+/// (ProofMethod.hs):
 ///
 /// ```text
 ///   sortOnUsefulness . unmark
@@ -690,7 +691,7 @@ fn smart_ranking(
 ///
 /// The crucial difference vs `smartRanking`: standard action goals and
 /// Disj goals share the SAME priority class (`isMedPriorityGoal`,
-/// ProofMethod.hs:1144-1149), so within that class they keep goal-nr
+/// ProofMethod.hs), so within that class they keep goal-nr
 /// order rather than Disj always winning.  This is why the csf17
 /// `heuristic: I` lemmas solve their protocol-action goal before the
 /// `¬(j<i)` disjunction.
@@ -720,10 +721,10 @@ fn inj_ranking(
     // relative order from goalNrRanking (insertion / nr order) is
     // preserved by the stable partition.
     //
-    //   isImmediateGoal     (ProofMethod.hs:1158-1161)
-    //   isHighPriorityGoal  (ProofMethod.hs:1139-1142)
-    //   isMedPriorityGoal   (ProofMethod.hs:1144-1149)
-    //   isLowPriorityGoal   (ProofMethod.hs:1151-1153)
+    //   isImmediateGoal     (ProofMethod.hs)
+    //   isHighPriorityGoal  (ProofMethod.hs)
+    //   isMedPriorityGoal   (ProofMethod.hs)
+    //   isLowPriorityGoal   (ProofMethod.hs)
     let solve_first: Vec<Pred> = vec![
         Box::new(is_immediate_goal),
         Box::new(is_high_priority_goal),
@@ -778,7 +779,7 @@ fn sort_decision_tree_dyn(
 
 /// `isSplitGoalSmall`: a `Goal::Split(id)` is small if its
 /// `splitSize` ≤ 3 (Haskell's `smallSplitGoalSize = 3`).
-/// Mirrors `ProofMethod.hs:836`.
+/// Mirrors `ProofMethod.hs`.
 fn is_split_goal_small(a: &AnnotatedGoal, sys: &System) -> bool {
     use crate::constraint::constraints::Goal;
     const SMALL_SPLIT_GOAL_SIZE: usize = 3;
@@ -803,7 +804,7 @@ fn is_no_large_split_goal(a: &AnnotatedGoal, sys: &System) -> bool {
 
 /// `isMsgOneCaseGoal`: the goal's premise is `KU(FApp o _)` where
 /// the operator `o` has only one source case in `pcSources`.
-/// Mirrors `ProofMethod.hs:780`.
+/// Mirrors `ProofMethod.hs`.
 ///
 /// We approximate `pcSources` via `ctx.full_sources` — for each
 /// precomputed source whose goal is a KU goal with a `FApp(o, _)`
@@ -873,7 +874,7 @@ fn is_msg_one_case_goal(
     use crate::fact::FactTag;
     use tamarin_term::function_symbols::FunSym;
     use tamarin_term::term::Term;
-    // Haskell `isMsgOneCaseGoal` (ProofMethod.hs:1248-1250) routes
+    // Haskell `isMsgOneCaseGoal` (ProofMethod.hs) routes
     // through `msgPremise`, which is defined ONLY for `ActionG` (the
     // KU-action arm).  Premise-side KU goals (rare — Goal::Premise with
     // a KU fact) are excluded.  Mirror exactly to avoid spurious
@@ -995,22 +996,17 @@ fn is_fresh_knows_goal(a: &AnnotatedGoal) -> bool {
     use tamarin_term::lterm::LSort;
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
-    match msg_premise(&a.goal) {
-        Some(Term::Lit(Lit::Var(v))) if v.sort == LSort::Fresh => true,
-        _ => false,
-    }
+    matches!(msg_premise(&a.goal), Some(Term::Lit(Lit::Var(v))) if v.sort == LSort::Fresh)
 }
 fn is_signature_goal(a: &AnnotatedGoal) -> bool {
     use tamarin_term::function_symbols::{FunSym, NoEqSym};
     use tamarin_term::term::Term;
-    match msg_premise(&a.goal) {
+    matches!(msg_premise(&a.goal),
         Some(Term::App(FunSym::NoEq(NoEqSym { name, .. }), _))
-            if name.as_slice() == b"sign" => true,
-        _ => false,
-    }
+            if name.as_slice() == b"sign")
 }
 
-/// `isDoubleExpGoal` (ProofMethod.hs:277-280):
+/// `isDoubleExpGoal` (ProofMethod.hs):
 ///   isDoubleExpGoal goal = case msgPremise goal of
 ///     Just (viewTerm2 -> FExp _ (viewTerm2 -> FMult _)) -> True
 ///     _                                                -> False
@@ -1039,9 +1035,9 @@ fn is_double_exp_goal(a: &AnnotatedGoal) -> bool {
         _ => false,
     }
 }
-// -- injRanking priority-class predicates (ProofMethod.hs:1126-1198) ----------
+// -- injRanking priority-class predicates (ProofMethod.hs) --------------------
 
-/// `isImmediateGoal` (ProofMethod.hs:1158-1161): a PremiseG/ActionG
+/// `isImmediateGoal` (ProofMethod.hs): a PremiseG/ActionG
 /// whose fact name has the `I_` prefix, OR a KU goal of a fresh name
 /// var whose name has the `I_` prefix (`isKnowsImmediateNameGoal`).
 fn is_immediate_goal(a: &AnnotatedGoal) -> bool {
@@ -1052,7 +1048,7 @@ fn is_immediate_goal(a: &AnnotatedGoal) -> bool {
     }
 }
 
-/// `isHighPriorityGoal` (ProofMethod.hs:1139-1142):
+/// `isHighPriorityGoal` (ProofMethod.hs):
 ///   isKnowsFirstNameGoal || isSolveFirstGoal || isChainGoal
 ///   || isFreshKnowsGoal
 fn is_high_priority_goal(a: &AnnotatedGoal) -> bool {
@@ -1062,7 +1058,7 @@ fn is_high_priority_goal(a: &AnnotatedGoal) -> bool {
         || is_fresh_knows_goal(a)
 }
 
-/// `isMedPriorityGoal` (ProofMethod.hs:1144-1149):
+/// `isMedPriorityGoal` (ProofMethod.hs):
 ///   isStandardActionGoal || isDisjGoal || isPrivateKnowsGoal
 ///   || isSplitGoalSmall || isMsgOneCaseGoal
 ///   || isNonLoopBreakerProtoFactGoal
@@ -1079,13 +1075,13 @@ fn is_med_priority_goal(
         || is_non_loop_breaker_proto_fact_goal(a)
 }
 
-/// `isLowPriorityGoal` (ProofMethod.hs:1151-1153):
+/// `isLowPriorityGoal` (ProofMethod.hs):
 ///   isDoubleExpGoal || isSignatureGoal || isProtoFactGoal
 fn is_low_priority_goal(a: &AnnotatedGoal) -> bool {
     is_double_exp_goal(a) || is_signature_goal(a) || is_proto_fact_goal(a)
 }
 
-/// `isProtoFactGoal` (ProofMethod.hs:1155-1156): a non-K PremiseG.
+/// `isProtoFactGoal` (ProofMethod.hs): a non-K PremiseG.
 fn is_proto_fact_goal(a: &AnnotatedGoal) -> bool {
     match &a.goal {
         Goal::Premise(_, fa) => !fa.is_k_fact(),
@@ -1093,7 +1089,7 @@ fn is_proto_fact_goal(a: &AnnotatedGoal) -> bool {
     }
 }
 
-/// `isKnowsFirstNameGoal` (ProofMethod.hs:267-269): KU goal of a fresh
+/// `isKnowsFirstNameGoal` (ProofMethod.hs): KU goal of a fresh
 /// name var whose name has the `F_` prefix.
 fn is_knows_first_name_goal(a: &AnnotatedGoal) -> bool {
     use tamarin_term::lterm::LSort;
@@ -1106,7 +1102,7 @@ fn is_knows_first_name_goal(a: &AnnotatedGoal) -> bool {
     }
 }
 
-/// `isKnowsImmediateNameGoal` (ProofMethod.hs:1177-1179): KU goal of a
+/// `isKnowsImmediateNameGoal` (ProofMethod.hs): KU goal of a
 /// fresh name var whose name has the `I_` prefix.
 fn is_knows_immediate_name_goal(a: &AnnotatedGoal) -> bool {
     use tamarin_term::lterm::LSort;
@@ -1119,17 +1115,15 @@ fn is_knows_immediate_name_goal(a: &AnnotatedGoal) -> bool {
     }
 }
 
-/// `isNotKnowsLastNameGoal` (ProofMethod.hs:1173-1175): True unless the
+/// `isNotKnowsLastNameGoal` (ProofMethod.hs): True unless the
 /// goal is a KU goal of a fresh name var with an `L_` prefix.
 fn is_not_knows_last_name_goal(a: &AnnotatedGoal) -> bool {
     use tamarin_term::lterm::LSort;
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
-    match msg_premise(&a.goal) {
+    !matches!(msg_premise(&a.goal),
         Some(Term::Lit(Lit::Var(v)))
-            if v.sort == LSort::Fresh && v.name.starts_with("L_") => false,
-        _ => true,
-    }
+            if v.sort == LSort::Fresh && v.name.starts_with("L_"))
 }
 
 /// `isNonSolveLastGoal` — PremiseG/ActionG NOT tagged SolveLast.
@@ -1324,11 +1318,13 @@ fn is_msg_var(t: &tamarin_term::lterm::LNTerm) -> bool {
 /// Extract args if the term is a multiset-union (`FUnion`) — Haskell's
 /// `viewTerm2 → FUnion args`.  Returns None for any other term shape.
 fn union_args(t: &tamarin_term::lterm::LNTerm) -> Option<Vec<tamarin_term::lterm::LNTerm>> {
-    use tamarin_term::function_symbols::{FunSym, UNION_SYM_STRING};
+    use tamarin_term::function_symbols::{AcSym, FunSym};
     use tamarin_term::term::Term;
     match t {
-        Term::App(FunSym::NoEq(s), args) if s.name == UNION_SYM_STRING =>
-            Some(args.to_vec()),
+        // Multiset union is an AC symbol (`Ac(Union)`), never a `NoEq`
+        // — matching the representation used everywhere else in this
+        // file (e.g. `has_top_pair_inv_prod`).
+        Term::App(FunSym::Ac(AcSym::Union), args) => Some(args.to_vec()),
         _ => None,
     }
 }
@@ -1361,12 +1357,10 @@ fn all_msg_vars_known_earlier(
 fn is_nullary_public_function(t: &tamarin_term::lterm::LNTerm) -> bool {
     use tamarin_term::function_symbols::FunSym;
     use tamarin_term::term::Term;
-    match t {
+    matches!(t,
         Term::App(FunSym::NoEq(s), args)
             if args.is_empty()
-                && matches!(s.privacy, tamarin_term::function_symbols::Privacy::Public) => true,
-        _ => false,
-    }
+                && matches!(s.privacy, tamarin_term::function_symbols::Privacy::Public))
 }
 
 /// True if the term is a sort-Pub or sort-Nat literal (variable or
@@ -1423,7 +1417,7 @@ pub fn goal_usefulness(g: &Goal, looping: bool, sys: &System) -> Usefulness {
     if looping { return Usefulness::LoopBreaker; }
     if let Goal::Action(i, fa) = g {
         if fa.is_ku() {
-            // Haskell `hasKUGuards` (Goals.hs:118-122): if ANY system
+            // Haskell `hasKUGuards` (Goals.hs): if ANY system
             // formula has a `KUFact`-tagged action atom in its guards
             // (`KU(?) @ ?` quantifier-binding), every KU goal is
             // **Useful** regardless of `currentlyDeducible` /
@@ -1449,7 +1443,7 @@ pub fn goal_usefulness(g: &Goal, looping: bool, sys: &System) -> Usefulness {
     Usefulness::Useful
 }
 
-/// Port of Haskell `hasKUGuards` (`Goals.hs:128-129`):
+/// Port of Haskell `hasKUGuards` (`Goals.hs`):
 ///
 /// ```haskell
 /// hasKUGuards =
@@ -1632,13 +1626,11 @@ fn lit_sort_contains(t: &tamarin_term::lterm::LNTerm, target: tamarin_term::lter
     use tamarin_term::vterm::Lit;
     match t {
         Term::Lit(Lit::Var(v)) => v.sort == target,
-        Term::Lit(Lit::Con(c)) => match (target, c.tag) {
-            (LSort::Pub,   NameTag::Pub)   => true,
-            (LSort::Fresh, NameTag::Fresh) => true,
-            (LSort::Node,  NameTag::Node)  => true,
-            (LSort::Nat,   NameTag::Nat)   => true,
-            _ => false,
-        },
+        Term::Lit(Lit::Con(c)) => matches!((target, c.tag),
+            (LSort::Pub,   NameTag::Pub)
+            | (LSort::Fresh, NameTag::Fresh)
+            | (LSort::Node,  NameTag::Node)
+            | (LSort::Nat,   NameTag::Nat)),
         Term::App(_, args) => args.iter().any(|a| lit_sort_contains(a, target)),
     }
 }

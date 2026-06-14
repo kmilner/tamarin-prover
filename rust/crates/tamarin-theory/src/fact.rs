@@ -1,9 +1,9 @@
 //! Port of `Theory.Model.Fact` from `lib/theory/src/Theory/Model/Fact.hs`.
 //!
 //! Multiset-rewriting facts. This port covers the data type plus the
-//! tagging / construction / query API. The Maude-backed `unifyLNFactEqs`,
-//! `unifiableLNFacts`, and normalisation entry points are not included
-//! yet — those need the AC unification bridge that's still a stub.
+//! tagging / construction / query API. The Maude-backed `unifyLNFactEqs`
+//! and `unifiableLNFacts` entry points live in `rule.rs` and call the
+//! live Maude unification bridge (`maude.unify_at`).
 
 use std::collections::BTreeSet;
 
@@ -348,8 +348,9 @@ mod tests {
         assert!(kd.is_kd() && !kd.is_ku());
     }
 
-    /// `is_klog` is true for K-facts (KU or KD) and false for Proto/Fresh
-    /// /In/Out/Ded/Term.  Mirrors Haskell `isKLogFact`.
+    /// `is_klog` is true for KU, KD, and Ded facts and false for
+    /// Proto/Fresh/In/Out/Term.  (Note: this does NOT mirror Haskell
+    /// `isKLogFact`, which is true only for a ProtoFact named "K".)
     #[test]
     fn is_klog_only_for_ku_or_kd() {
         let x = msg_var("x", 0);

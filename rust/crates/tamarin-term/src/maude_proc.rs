@@ -83,7 +83,7 @@ thread_local! {
     /// originate from `eq_store::add_eqs` (so optimisation effort
     /// should target the fact-equation engine, not other call sites).
     static MAUDE_CALLSITE_COUNTS: std::cell::RefCell<std::collections::BTreeMap<&'static str, u64>>
-        = std::cell::RefCell::new(std::collections::BTreeMap::new());
+        = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
 }
 
 #[doc(hidden)]
@@ -503,7 +503,7 @@ impl MaudeHandle {
         if eqs.is_empty() { return Ok(true); }
         if eqs.iter().all(|eq| eq.lhs == eq.rhs) { return Ok(true); }
         if self.is_ac_free() {
-            let eqs_owned: Vec<Equal<LNTerm>> = eqs.iter().cloned().collect();
+            let eqs_owned: Vec<Equal<LNTerm>> = eqs.to_vec();
             return Ok(crate::unification::unify_lnterm_no_ac(eqs_owned).is_ok());
         }
         let key: Vec<(LNTerm, LNTerm)> = eqs.iter()
@@ -521,42 +521,18 @@ impl MaudeHandle {
         Ok(answer)
     }
 
-    /// True when the signature carries no AC-flavoured operators AND
-    /// no user-defined [variant] equations.  In that regime free
-    /// (Robinson) unification is complete; we can answer every Maude
-    /// unifiability query locally.
-    ///
-    /// User [variant] equations (e.g. `check_getmsg(pk(x), sign(x,m)) = m`,
-    /// `convertpcs(...) = sign(...)`, `checkpcs(...) = true`) require
-    /// Maude's narrowing — the local unifier fails for different App
-    /// heads where Maude's `unify in MSG` would find narrowing variants.
-    /// See `project_statverif_aborted_pcs_divergence.md`.
-    ///
-    /// TAM_RS_LEGACY_FAST_PATH=1 reverts to the prior AC-only check
-    /// for performance comparison.
     /// True when the local Robinson unifier is complete for this
-    /// signature.  Requires: no AC operators (DH/XOR/multiset/nat/BP)
-    /// AND no user-defined `[variant]` equations.  When user equations
-    /// are present (e.g. `check_getmsg(pk(x), sign(x,m)) = m`,
-    /// `convertpcs(...) = sign(...)`, `checkpcs(...) = true`), Maude's
-    /// `unify in MSG` narrows via the `[variant]`-attributed equations
-    /// — the local fast path is incomplete because it can't narrow
-    /// different-App-head equations.  See StatVerif_GM_Contract_Signing
-    /// where `true =? checkpcs(...)` requires narrowing to keep
-    /// variants alive past Eq_checks_succeed propagation.
+    /// signature, so every Maude unifiability query can be answered
+    /// locally.  Requires: no AC operators (DH/XOR/multiset/nat/BP)
+    /// AND no user-defined `[variant]` equations (`sig.st_rules` empty).
     ///
-    /// `TAM_RS_LEGACY_FAST_PATH=1` reverts to the prior AC-only check
-    /// for performance comparison.
-    /// True when the local Robinson unifier is complete for this
-    /// signature.  Requires: no AC operators (DH/XOR/multiset/nat/BP)
-    /// AND no user-defined `[variant]` equations.  When user equations
-    /// are present (e.g. `check_getmsg(pk(x), sign(x,m)) = m`,
-    /// `convertpcs(...) = sign(...)`, `checkpcs(...) = true`), Maude's
-    /// `unify in MSG` narrows via the `[variant]`-attributed equations
-    /// (see ppTheory in HS's Term.Maude.Parser:248-249, mirrored by
-    /// Rust's maude_print.rs:327) — the local fast path is incomplete
-    /// because Robinson unification can't narrow different-App-head
-    /// equations like `true =? checkpcs(...)`.
+    /// When user equations are present (e.g.
+    /// `check_getmsg(pk(x), sign(x,m)) = m`, `convertpcs(...) = sign(...)`,
+    /// `checkpcs(...) = true`), Maude's `unify in MSG` narrows via the
+    /// `[variant]`-attributed equations (see ppTheory in HS's
+    /// Term.Maude.Parser, mirrored by Rust's maude_print.rs) — the local
+    /// fast path is incomplete because Robinson unification can't narrow
+    /// different-App-head equations like `true =? checkpcs(...)`.
     ///
     /// StatVerif_GM_Contract_Signing: keeping the variant disj alive
     /// past `Eq_checks_succeed`'s `z.10 → true` propagation requires
@@ -695,7 +671,7 @@ impl MaudeHandle {
                     if v.name == "x" { self.ensure_above(v.idx); }
                 });
             }
-            let eqs_owned: Vec<Equal<LNTerm>> = eqs.iter().cloned().collect();
+            let eqs_owned: Vec<Equal<LNTerm>> = eqs.to_vec();
             let result = crate::unification::unify_lnterm_no_ac_with_counter(
                 eqs_owned, &self.fresh_counter,
             );
@@ -704,7 +680,7 @@ impl MaudeHandle {
                     // HS-faithful flattenUnif: success, return [vfresh ∘ subst].
                     return Ok(if std::env::var("TAM_RS_DISABLE_FLATTEN_UNIF").is_ok() {
                         let bindings: Vec<(crate::lterm::LVar, LNTerm)> = subst.to_list()
-                            .into_iter().map(|(v, t)| (v, t)).collect();
+                            .into_iter().collect();
                         vec![bindings]
                     } else {
                         let empty_vfresh = crate::subst_vfresh::LSubstVFresh::<crate::lterm::Name>::empty();
@@ -749,7 +725,7 @@ impl MaudeHandle {
             Vec<Equal<LNTerm>>,
         ) = if factor_ac {
             match crate::unification::unify_lnterm_factored(
-                eqs.iter().cloned().collect(),
+                eqs.to_vec(),
             ) {
                 Some((m, leqs)) => (m, leqs),
                 // unifyRaw failed during factoring → no unifier (HS `solve _
@@ -759,7 +735,7 @@ impl MaudeHandle {
         } else {
             (
                 crate::subst::Subst::empty(),
-                eqs.iter().cloned().collect(),
+                eqs.to_vec(),
             )
         };
         // If factoring already solved everything (no AC residual), HS returns

@@ -582,7 +582,7 @@ mod tests {
         ));
 
         // close: x → Bound 0 at depth 0
-        let close_s = close_subst(&[x.clone()]);
+        let close_s = close_subst(std::slice::from_ref(&x));
         let closed = subst_free_atom_at_depth(&p_atom, &close_s, 0);
 
         // verify x became Bound(0) in the closed form
@@ -595,7 +595,7 @@ mod tests {
         }
 
         // open: Bound 0 → x (reuse same LVar identity)
-        let open_s = open_subst(&[x.clone()]);
+        let open_s = open_subst(std::slice::from_ref(&x));
         let opened = subst_bound_atom_at_depth(&closed, &open_s, 0);
 
         // round-trip equality
@@ -671,7 +671,7 @@ mod tests {
         // HS substFree applies at the OUTER LAYER first, then mapGuardedAtoms
         // hands inner atoms a depth ≥ 1.  Substitution: x → Bound 0 at depth 0,
         // so at depth 1 it's Bound 1.
-        let close_s = close_subst(&[x.clone()]);
+        let close_s = close_subst(std::slice::from_ref(&x));
         inner_body = subst_free_atom_at_depth(&inner_body, &close_s, 1);
 
         // x should now be Bound(1); y is still Bound(0).

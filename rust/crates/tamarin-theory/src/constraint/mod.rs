@@ -8,9 +8,6 @@
 //! - `Theory.Constraint.System`             — the `System` sequent (the
 //!   solver's working state)
 //! - `Theory.Constraint.Solver.*`           — the actual proof-search loop
-//!
-//! For now we expose only the data layer needed to hand the solver
-//! something it can work on.
 
 pub mod constraints;
 pub mod solver;

@@ -14,11 +14,13 @@
 //! 5. Wrap as a `ProtoRuleAC` with the surviving substitutions stored
 //!    in its `variants` field.
 //!
-//! For the first cut we implement steps 2-5 directly on the
-//! rule's free variables (no abstraction). That's adequate for rules
-//! whose terms are already in a form Maude can variant-narrow; it
-//! covers most parsed rules. The full `abstrTerm` machinery follows
-//! once we've ported `Term.Narrowing.Variants`.
+//! The full `abstrTerm` machinery (step 1 above) lives in
+//! `abstract_rule_and_variants`, which is the HS-faithful production
+//! path used by `run.rs` and the constraint solver's `context.rs`.
+//! `variants_proto_rule` is a lighter helper that runs steps 2-5
+//! directly on the rule's free variables (no abstraction); it is
+//! retained for the callers that already have terms in a form Maude
+//! can variant-narrow.
 
 use tamarin_term::lterm::{LNTerm, LVar, Name};
 use tamarin_term::maude_proc::{MaudeError, MaudeHandle};
@@ -87,7 +89,7 @@ pub fn variants_proto_rule(
         return Ok(None);
     }
     let substs: Vec<LNSubstVFresh> = raw.into_iter()
-        .map(|pairs| LNSubstVFresh::from_list(pairs.into_iter()))
+        .map(LNSubstVFresh::from_list)
         .collect();
     // HS-faithful `simpDisjunction hnd (const (const False)) (Disj substs)`
     // (RuleVariants.hs:82).  Routes through `simp1`'s full pipeline
@@ -471,10 +473,7 @@ pub fn abstract_rule_and_variants(
     // `abstractedTerms = map snd eqsAbstr` — the ORIGINAL terms.
     let abstracted_terms: Vec<LNTerm> = bindings.iter().map(|(t, _)| t.clone()).collect();
     let packed = Term::App(FunSym::List, abstracted_terms.into());
-    let raw_substs = match maude.variants(&packed) {
-        Ok(v) => v,
-        Err(e) => return Err(e.into()),
-    };
+    let raw_substs = maude.variants(&packed)?;
     if raw_substs.is_empty() {
         return Ok(None);
     }
@@ -1010,79 +1009,6 @@ pub fn expand_rule_variants(
     Ok(out)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tamarin_term::lterm::{LSort, LVar};
-    use tamarin_term::maude_sig::pair_maude_sig;
-    use tamarin_term::vterm::Lit;
-
-    use crate::fact::{Fact, FactTag};
-    use crate::rule::{ProtoRuleEInfo, ProtoRuleName, RuleAttributes, Rule};
-
-    fn maude_path() -> Option<String> {
-        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        let candidates = [
-            "/home/linuxbrew/.linuxbrew/bin/maude",
-            "/usr/local/bin/maude",
-            "/usr/bin/maude",
-            "maude",
-        ];
-        for c in &candidates {
-            if std::path::Path::new(c).exists() { return Some((*c).to_string()); }
-        }
-        None
-    }
-
-    fn empty_rule(name: &str) -> ProtoRuleE {
-        let info = ProtoRuleEInfo {
-            name: ProtoRuleName::Stand(name.to_string()),
-            attributes: RuleAttributes::empty(),
-            restrictions: Vec::new(),
-        };
-        Rule::new(info, Vec::new(), Vec::new(), Vec::new())
-    }
-
-    #[test]
-    fn variants_of_rule_with_no_terms_is_identity() {
-        let path = match maude_path() {
-            Some(p) => p,
-            None => { eprintln!("skipping: no maude"); return; }
-        };
-        let h = MaudeHandle::start(&path, pair_maude_sig()).unwrap();
-        let rule = empty_rule("R");
-        let ac = variants_proto_rule(&h, &rule).expect("variants").unwrap();
-        // No terms → identity variant.
-        assert_eq!(ac.info.variants.len(), 1);
-        assert!(ac.info.variants[0].is_empty());
-    }
-
-    #[test]
-    fn variants_of_simple_rule_via_maude() {
-        let path = match maude_path() {
-            Some(p) => p,
-            None => { eprintln!("skipping: no maude"); return; }
-        };
-        let h = MaudeHandle::start(&path, pair_maude_sig()).unwrap();
-        // Rule: [Fr(~k)] --> [Out(~k)]
-        let k = LVar::new("k", LSort::Fresh, 0);
-        let kt: LNTerm = Term::Lit(Lit::Var(k));
-        let prem = Fact::new(FactTag::Fresh, vec![kt.clone()]);
-        let conc = Fact::new(FactTag::Out, vec![kt.clone()]);
-        let info = ProtoRuleEInfo {
-            name: ProtoRuleName::Stand("R".into()),
-            attributes: RuleAttributes::empty(),
-            restrictions: Vec::new(),
-        };
-        let rule = Rule::new(info, vec![prem], vec![conc], Vec::new());
-        let ac = variants_proto_rule(&h, &rule).expect("variants").unwrap();
-        // For a rule with no reducible operators, Maude returns one
-        // trivial variant (the identity).
-        assert!(!ac.info.variants.is_empty(),
-            "expected at least one variant, got none");
-    }
-}
-
 /// `findPos`-style subterm check: returns true if `needle` appears
 /// anywhere within `haystack` (including as the whole term).  Mirrors
 /// HS's `isJust . findPos` used in `isFreshRedundant`.
@@ -1173,4 +1099,77 @@ pub fn rule_has_no_variants_for_wf(
     // Path 2: reducible rule — use `abstract_rule_and_variants`.
     // Returns `Ok(None)` when all composed substs are filtered out.
     matches!(abstract_rule_and_variants(maude, rule), Ok(None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tamarin_term::lterm::{LSort, LVar};
+    use tamarin_term::maude_sig::pair_maude_sig;
+    use tamarin_term::vterm::Lit;
+
+    use crate::fact::{Fact, FactTag};
+    use crate::rule::{ProtoRuleEInfo, ProtoRuleName, RuleAttributes, Rule};
+
+    fn maude_path() -> Option<String> {
+        if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
+        let candidates = [
+            "/home/linuxbrew/.linuxbrew/bin/maude",
+            "/usr/local/bin/maude",
+            "/usr/bin/maude",
+            "maude",
+        ];
+        for c in &candidates {
+            if std::path::Path::new(c).exists() { return Some((*c).to_string()); }
+        }
+        None
+    }
+
+    fn empty_rule(name: &str) -> ProtoRuleE {
+        let info = ProtoRuleEInfo {
+            name: ProtoRuleName::Stand(name.to_string()),
+            attributes: RuleAttributes::empty(),
+            restrictions: Vec::new(),
+        };
+        Rule::new(info, Vec::new(), Vec::new(), Vec::new())
+    }
+
+    #[test]
+    fn variants_of_rule_with_no_terms_is_identity() {
+        let path = match maude_path() {
+            Some(p) => p,
+            None => { eprintln!("skipping: no maude"); return; }
+        };
+        let h = MaudeHandle::start(&path, pair_maude_sig()).unwrap();
+        let rule = empty_rule("R");
+        let ac = variants_proto_rule(&h, &rule).expect("variants").unwrap();
+        // No terms → identity variant.
+        assert_eq!(ac.info.variants.len(), 1);
+        assert!(ac.info.variants[0].is_empty());
+    }
+
+    #[test]
+    fn variants_of_simple_rule_via_maude() {
+        let path = match maude_path() {
+            Some(p) => p,
+            None => { eprintln!("skipping: no maude"); return; }
+        };
+        let h = MaudeHandle::start(&path, pair_maude_sig()).unwrap();
+        // Rule: [Fr(~k)] --> [Out(~k)]
+        let k = LVar::new("k", LSort::Fresh, 0);
+        let kt: LNTerm = Term::Lit(Lit::Var(k));
+        let prem = Fact::new(FactTag::Fresh, vec![kt.clone()]);
+        let conc = Fact::new(FactTag::Out, vec![kt.clone()]);
+        let info = ProtoRuleEInfo {
+            name: ProtoRuleName::Stand("R".into()),
+            attributes: RuleAttributes::empty(),
+            restrictions: Vec::new(),
+        };
+        let rule = Rule::new(info, vec![prem], vec![conc], Vec::new());
+        let ac = variants_proto_rule(&h, &rule).expect("variants").unwrap();
+        // For a rule with no reducible operators, Maude returns one
+        // trivial variant (the identity).
+        assert!(!ac.info.variants.is_empty(),
+            "expected at least one variant, got none");
+    }
 }

@@ -158,7 +158,7 @@ fn main() {
         let method = ProofMethod::SolveGoal(goal);
         let map = exec_proof_method(&ctx, &method, &sys).expect("solve");
         // Always print cases (full distribution).
-        println!("  {} cases: {:?}", map.len(), map.keys().collect::<Vec<_>>());
+        println!("  {} cases: {:?}", map.len(), map.iter().map(|(n, _)| n).collect::<Vec<_>>());
         // Take the first case (matches search's depth-first traversal).
         sys = map.into_iter().next().unwrap().1;
         // Print eq-store summary.

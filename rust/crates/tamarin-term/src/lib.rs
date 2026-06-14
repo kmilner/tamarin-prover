@@ -27,7 +27,6 @@ pub mod builtin;
 pub mod function_symbols;
 pub mod lterm;
 pub mod macro_expand;
-pub mod maude;
 pub mod maude_parse;
 pub mod maude_print;
 pub mod maude_proc;

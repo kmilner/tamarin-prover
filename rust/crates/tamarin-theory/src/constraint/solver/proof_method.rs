@@ -12,10 +12,11 @@
 //!     - Induction → split into base/step cases
 //! ```
 //!
-//! The Rust port currently implements the trivial cases and stubs
-//! the non-trivial ones with `unimplemented!()`-equivalent results
-//! (returns `None` / empty map). The shape is in place so the rest
-//! can grow incrementally.
+//! All arms are fully ported: the trivial cases (Sorry / Finished /
+//! Invalidated), `Simplify` (with the per-step simplify fan-out and
+//! dedup/distinguish case naming), `SolveGoal` (full goal dispatch via
+//! `solve_*_goal`), and `Induction` (base/step split via `ginduct`).
+//! `None` results mean "no applicable method", not unfinished stubs.
 
 use crate::constraint::constraints::Goal;
 use crate::constraint::solver::context::ProofContext;
@@ -201,13 +202,6 @@ pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
     else { None }
 }
 
-/// Approximation of Haskell's `isInitialSystem`:
-///   `null sSolvedFormulas && not (bot ∈ sFormulas)`
-///
-/// We add the structural-emptiness checks too, since our `System`
-/// carries more state than Haskell's at this stage. The crucial
-/// property is the `not bot in formulas` clause — a system whose
-/// open formulas contain ⊥ is *contradictory*, not initial.
 /// Direct port of Haskell `isInitialSystem`:
 ///   isInitialSystem sys = null (get sSolvedFormulas sys) && not (member bot (get sFormulas sys))
 /// (`System.hs:828`).  Just two conditions: no solved formulas yet,
@@ -259,18 +253,17 @@ fn finished_subterms(ctx: &ProofContext, sys: &System) -> bool {
 }
 
 /// Execute a proof method against `sys`, returning the resulting
-/// case list IN INSERTION ORDER. `Sorry` / `Finished` produce empty
-/// cases; `Simplify` runs `simplify_system` and returns one case;
-/// `SolveGoal(g)` dispatches via `solve_*_goal` and converts
-/// `GoalCases` to a case list. `Induction` is left as a stub.
+/// case list in dispatch order. `Sorry` / `Finished` produce empty
+/// cases; `Simplify` runs the simplify fan-out and returns one case
+/// per surviving branch; `SolveGoal(g)` dispatches via `solve_*_goal`
+/// and converts `GoalCases` to a case list; `Induction` splits the
+/// first formula into base/step cases via `ginduct`.
 ///
-/// **Order matters**: Haskell's `disjunctionOfList` and the
-/// downstream `runReduction` preserve the order of rules /
-/// destructors as iterated in `joinAllRules` / saturate output.
-/// Returning `Vec` (not `BTreeMap`) preserves that order so the
-/// search explores cases in Haskell's same order, allowing the
-/// `case c_aenc`-style trace-found paths to be reached without
-/// being starved by alphabetically-earlier siblings.
+/// The case list is returned as a `Vec` in the order branches were
+/// produced, but callers do not rely on that order: both `search.rs`
+/// and `replay.rs` re-sort the cases by name before walking them, to
+/// reproduce Haskell's `Data.Map` (alphabetical) iteration order from
+/// `execProofMethod`'s `M.fromListWith`.
 pub fn exec_proof_method(
     ctx: &ProofContext,
     method: &ProofMethod,
@@ -591,7 +584,7 @@ pub fn exec_proof_method(
                         cpath, goal_short, name, cs, r);
                 }
                 let op = if r { "case_keep" } else { "case_drop" };
-                crate::state_trace::emit_case(op, name, Some(&g), sys);
+                crate::state_trace::emit_case(op, name, Some(g), sys);
                 r
             };
             match outcome {
@@ -859,7 +852,7 @@ pub fn check_and_exec_proof_method(
         }
         ProofMethod::Induction => {
             if !is_initial_system(sys) { return None; }
-            if sys.solved_formulas.len() != 0 { return None; }
+            if !sys.solved_formulas.is_empty() { return None; }
             if sys.formulas.len() != 1 { return None; }
         }
         ProofMethod::SolveGoal(g) => {
@@ -872,12 +865,12 @@ pub fn check_and_exec_proof_method(
 }
 
 fn same_kind(a: &Result, b: &Result) -> bool {
-    match (a, b) {
-        (Result::Solved, Result::Solved) => true,
-        (Result::Unfinishable, Result::Unfinishable) => true,
-        (Result::Contradictory(_), Result::Contradictory(_)) => true,
-        _ => false,
-    }
+    matches!(
+        (a, b),
+        (Result::Solved, Result::Solved)
+            | (Result::Unfinishable, Result::Unfinishable)
+            | (Result::Contradictory(_), Result::Contradictory(_))
+    )
 }
 
 #[cfg(test)]

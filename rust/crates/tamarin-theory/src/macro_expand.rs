@@ -284,9 +284,14 @@ fn expand_rule(macros: &[p::Macro], r: &mut p::Rule) {
         b.value = apply_macros_term(macros, &b.value);
         b.var = apply_macros_term(macros, &b.var);
     }
-    // Variants: HS represents rule variants as separate Rule values.
-    // For SAPIC / multi-set rewriting these come in as nested Rule
-    // children; recursively expand.
+    // Variants / diff sides: `variants` holds the user-written explicit
+    // `variants ...` block (HS OpenProtoRule's ruAC) and `left_right` holds
+    // the diff `left ... right ...` block (HS DiffProtoRule's sides). HS does
+    // NOT macro-expand these: applyMacroInProtoRule / applyMacroInDiffProtoRule
+    // (ClosedTheory.hs) only run applyMacroInRule on the main rule and pass
+    // the variants/sides through unchanged. RS recurses into them anyway; this
+    // is harmless because these nested rules normally carry no macro call-sites
+    // (and re-expanding an already-expanded body is idempotent).
     for v in &mut r.variants {
         expand_rule(macros, v);
     }

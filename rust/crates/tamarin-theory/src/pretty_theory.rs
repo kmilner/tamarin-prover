@@ -704,23 +704,6 @@ fn rewrite_arity1_fact(
 ///
 /// For multiple macros, each is nested 4 levels inside the outer `nest 4`,
 /// giving 8-space indent on subsequent lines.
-/// HS `prettyMacros` / `prettyMacro` (TheoryObject.hs:819-840).
-///
-/// HS: `prettyMacros m = keyword_ "macros:" $$ nest 4 (vcat [macros...])`
-/// HS: `prettyMacro (op, args, out) =
-///       vcat [ppNonEmptyList (\ds -> sep (map (nest 4) ds)) text [op++"("]
-///             <-> prettyVarList args <-> text ") = " <-> prettyTerm show out]`
-///
-/// `ppNonEmptyList hdr pp [x] = hdr [pp x] = sep [nest 4 (text x)]`
-/// = `nest 4 (text (name++"("))`.
-///
-/// With `keyword_ "macros:" $$ nest 4 (nest 4 "name(" <+> args <+> ") = " <+> body)`:
-/// the double-nest (8 total) combined with `keyword_`'s 7-char width makes
-/// `nil_above_nest` inline the content (k = -7+8 = 1 > 0), putting everything
-/// on ONE line: `macros: name( args ) =  body`.
-///
-/// For multiple macros, each is nested 4 levels inside the outer `nest 4`,
-/// giving 8-space indent on subsequent lines.
 fn render_parsed_macros(macros: &[p::Macro]) -> String {
     use crate::pretty_hpj::{self as hpj, Doc};
 
@@ -1652,7 +1635,7 @@ fn render_pair_at(items: &[p::Term], indent: usize, line_start: usize) -> String
         (indent + 1 + body_last_line_len, body_line_start)
     };
     let close_max = std::cmp::min(gt_line_start + RIBBON, PAGE_WIDTH);
-    let close_fits = !last_is_multiline && gt_col + 1 <= close_max;
+    let close_fits = !last_is_multiline && gt_col < close_max;
     if first_is_multiline {
         // `<\n<inner_pad><body>\n<pad>>` (close on own line when last
         // is multi-line; attached when fits).
@@ -1981,7 +1964,7 @@ fn render_guarded_block(lem: &p::Lemma, macros: &[p::Macro]) -> String {
             }
             let full_text = crate::pretty_formula::pretty_formula(&expanded_formula);
             let sub_text = e.subject_formula.as_ref()
-                .map(|f| crate::pretty_formula::pretty_formula(f))
+                .map(crate::pretty_formula::pretty_formula)
                 .unwrap_or_else(|| full_text.clone());
             block.push_str("    \"");
             block.push_str(&sub_text);

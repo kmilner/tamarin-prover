@@ -58,7 +58,7 @@ impl<'a> Cursor<'a> {
             .and_then(|s| s.parse().ok()) }
     }
     fn skip_eol(&mut self) -> bool {
-        if self.eat_str(b"\r\n") || self.eat(b'\n') { true } else { false }
+        self.eat_str(b"\r\n") || self.eat(b'\n')
     }
     /// Take while predicate holds, return slice consumed.
     fn take_while<F: Fn(u8) -> bool>(&mut self, f: F) -> &'a [u8] {

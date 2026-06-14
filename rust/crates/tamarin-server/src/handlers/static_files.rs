@@ -2,12 +2,12 @@
 //!
 //! Tamarin's frontend pulls JS/CSS from two places:
 //!
-//!   1. `data/`             — jQuery, jQuery-UI, smoothness theme,
-//!                            tamarin-prover-ui.js, base CSS, images
-//!   2. `frontend/dist/`    — built `intdot-graph.es.js`,
-//!                            `intdot-staticgraph.es.js`,
-//!                            `intdot-dynamicgraph.es.js`, plus
-//!                            `intdot-style.css`
+//!   1. `data/` — jQuery, jQuery-UI, smoothness theme,
+//!      tamarin-prover-ui.js, base CSS, images
+//!   2. `frontend/dist/` — built `intdot-graph.es.js`,
+//!      `intdot-staticgraph.es.js`,
+//!      `intdot-dynamicgraph.es.js`, plus
+//!      `intdot-style.css`
 //!
 //! Strategy:
 //!   - Serve `data/<rest>` via tower-http `ServeDir`.

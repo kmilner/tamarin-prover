@@ -1084,7 +1084,7 @@ fn probe_tpm_left_reachable() {
     let h = tamarin_term::maude_proc::MaudeHandle::start(&mp, elab.signature.maude_sig.clone()).unwrap();
     // Print sources first
     use tamarin_theory::constraint::solver::context::ProofContext;
-    let rules: Vec<_> = (&elab).rules().cloned().collect();
+    let rules: Vec<_> = elab.rules().cloned().collect();
     let h_probe = tamarin_term::maude_proc::MaudeHandle::start(&mp, elab.signature.maude_sig.clone()).unwrap();
     let ctx = ProofContext::new(h_probe, rules);
     use tamarin_theory::constraint::constraints::Goal;
@@ -1112,7 +1112,7 @@ fn probe_tpm_left_reachable() {
             };
             *m.entry(key).or_insert(0) += 1;
         }
-        for (_, c) in &n.children { count_results(c, m); }
+        for c in n.children.values() { count_results(c, m); }
     }
     let mut m = std::collections::BTreeMap::new();
     count_results(&root, &mut m);
@@ -1154,7 +1154,7 @@ fn probe_nspk3_fresh_sources() {
     let theory = tamarin_parser::parse_theory(&src, &[]).unwrap();
     let elab = tamarin_theory::elaborate::elaborate(&theory).unwrap();
     let h = tamarin_term::maude_proc::MaudeHandle::start(&mp, elab.signature.maude_sig.clone()).unwrap();
-    let rules: Vec<_> = (&elab).rules().cloned().collect();
+    let rules: Vec<_> = elab.rules().cloned().collect();
     let ctx = ProofContext::new(h, rules);
     let sources = precompute_full_sources(&ctx);
     eprintln!("Precomputed sources: {}", sources.len());
@@ -1195,7 +1195,7 @@ fn probe_nspk3_cyclic_leaf() {
     let root = prove_lemma(&theory, "nonce_secrecy", h, 500).unwrap();
     eprintln!("NSPK3 status={:?}", root.status);
     // Find first Cyclic leaf and dump its system state.
-    fn find_cyclic<'a>(n: &'a ProofNode, path: Vec<String>) -> Option<(&'a ProofNode, Vec<String>)> {
+    fn find_cyclic(n: &ProofNode, path: Vec<String>) -> Option<(&ProofNode, Vec<String>)> {
         use tamarin_theory::constraint::solver::proof_method::{ProofMethod, Result};
         if let ProofMethod::Finished(Result::Contradictory(Some(c))) = &n.method {
             if format!("{:?}", c).contains("Cyclic") {
@@ -1288,7 +1288,7 @@ fn probe_chaum_unforgeability() {
         eprintln!("{}", tamarin_theory::proof_skeleton::render(&root));
     }
     let h_probe = tamarin_term::maude_proc::MaudeHandle::start(&mp, elab.signature.maude_sig.clone()).unwrap();
-    let rules: Vec<_> = (&elab).rules().cloned().collect();
+    let rules: Vec<_> = elab.rules().cloned().collect();
     let ctx = ProofContext::new(h_probe, rules);
     // Dump destructor intruder rules (used by close_chains_dfs's
     // destructor-extension branch).
@@ -1372,7 +1372,7 @@ fn probe_tls_setup_possible() {
     {
         let h_probe = tamarin_term::maude_proc::MaudeHandle::start(
             &mp, elab.signature.maude_sig.clone()).unwrap();
-        let rules: Vec<_> = (&elab).rules().cloned().collect();
+        let rules: Vec<_> = elab.rules().cloned().collect();
         let ctx = tamarin_theory::constraint::solver::context::ProofContext::new(h_probe, rules);
         use tamarin_theory::constraint::constraints::Goal;
         eprintln!("== Precomputed full_sources ({} entries) ==", ctx.full_sources.len());
@@ -1400,12 +1400,12 @@ fn probe_tls_setup_possible() {
     // Find the first node whose case-name ends in `_case_N` and print its
     // children + open goals before the split.
     use tamarin_theory::constraint::solver::search::ProofNode;
-    fn find_case_n<'a>(
-        n: &'a ProofNode, path: Vec<String>,
-    ) -> Option<(&'a ProofNode, Vec<String>)> {
+    fn find_case_n(
+        n: &ProofNode, path: Vec<String>,
+    ) -> Option<(&ProofNode, Vec<String>)> {
         // If any child's case-name contains "_case_", this node is the
         // source of the split.
-        for (name, _) in &n.children {
+        for name in n.children.keys() {
             if name.contains("_case_") { return Some((n, path)); }
         }
         for (name, c) in &n.children {
@@ -1420,7 +1420,7 @@ fn probe_tls_setup_possible() {
         eprintln!("Path to it: {:?}", path);
         eprintln!("Method: {:?}", format!("{:?}", node.method).chars().take(200).collect::<String>());
         eprintln!("Children ({}):", node.children.len());
-        for (name, _c) in &node.children {
+        for name in node.children.keys() {
             eprintln!("  - {}", name);
         }
         eprintln!("\n== System state at this node ==");
@@ -1469,7 +1469,7 @@ fn probe_nslpk3_nonce_secrecy() {
     {
         let h_probe = tamarin_term::maude_proc::MaudeHandle::start(
             &mp, elab.signature.maude_sig.clone()).unwrap();
-        let rules: Vec<_> = (&elab).rules().cloned().collect();
+        let rules: Vec<_> = elab.rules().cloned().collect();
         let ctx = tamarin_theory::constraint::solver::context::ProofContext::new(h_probe, rules);
         use tamarin_theory::constraint::constraints::Goal;
         eprintln!("== Precomputed full_sources ({} entries) ==", ctx.full_sources.len());
@@ -1602,7 +1602,7 @@ fn probe_cr_executable() {
                 }
             }
         }
-        for (_, child) in &node.children {
+        for child in node.children.values() {
             walk(child, depth + 1);
         }
     }

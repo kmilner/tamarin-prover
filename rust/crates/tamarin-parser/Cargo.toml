@@ -9,3 +9,6 @@ repository.workspace = true
 
 [dev-dependencies]
 walkdir = "2"
+
+[lints]
+workspace = true

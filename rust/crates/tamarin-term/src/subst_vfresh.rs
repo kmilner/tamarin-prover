@@ -245,16 +245,15 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
         self.fresh_to_free_avoiding(alloc_idxs, &std::collections::BTreeSet::new())
     }
 
-    /// `freshToFreeAvoidingFast`: convert VFresh → free subst, but
-    /// PRESERVE any range var that's in `preserve` — those are live
-    /// system vars (not fresh witnesses) and renaming them would
-    /// break sharing with the rest of the system.
+    /// `freshToFreeAvoidingFast`: convert VFresh → free subst.
     ///
-    /// Mirrors Haskell `freshToFreeAvoidingFast s t` which renames
-    /// range vars via `rename ... \`evalFreshAvoiding\` t` — Haskell's
-    /// `evalFreshAvoiding` avoids vars in `t`, so the renamer simply
-    /// skips them.  Our equivalent: pass `varsRange(eq_store.subst)`
-    /// (or similar) as `preserve`.
+    /// Mirrors Haskell `freshToFreeAvoidingFast s t`, which renames
+    /// every range var unconditionally (HS has no "preserve" concept —
+    /// `evalFreshAvoiding` only seeds the fresh counter above `t`'s max
+    /// idx, it never skips a variable).  The `preserve` argument is
+    /// therefore IGNORED by default; it is only honoured under the
+    /// legacy kill-switch `TAM_RS_LEGACY_FOLD_PRESERVE` (see the
+    /// HS-faithfulness gate in the body).
     pub fn fresh_to_free_avoiding<F: FnMut(u64) -> u64>(
         &self,
         mut alloc_idxs: F,
@@ -287,13 +286,16 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
         // Substitution.hs:40-47) and renames unconditionally.
         // Kill: `TAM_RS_LEGACY_FOLD_PRESERVE=1` restores the f6a193aa
         // behaviour.
+        // Read the legacy kill-switch once and cache it: its value
+        // cannot change within a run, and this runs in the hot eq-store
+        // fold path — avoids a getenv + String allocation per call.
+        use std::sync::OnceLock;
+        static LEGACY_FOLD_PRESERVE: OnceLock<bool> = OnceLock::new();
+        let legacy = *LEGACY_FOLD_PRESERVE
+            .get_or_init(|| std::env::var("TAM_RS_LEGACY_FOLD_PRESERVE").is_ok());
         let empty_preserve = std::collections::BTreeSet::new();
         let preserve: &std::collections::BTreeSet<LVar> =
-            if std::env::var("TAM_RS_LEGACY_FOLD_PRESERVE").is_ok() {
-                preserve
-            } else {
-                &empty_preserve
-            };
+            if legacy { preserve } else { &empty_preserve };
         // HS-faithful port (Substitution.hs:54-66):
         //
         //   freshToFree subst = (`evalBindT` noBindings) $ do

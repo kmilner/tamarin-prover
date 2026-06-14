@@ -44,14 +44,14 @@ where
     K: Ord,
     F: FnMut(&T) -> K,
 {
-    xs.sort_by(|a, b| proj(a).cmp(&proj(b)));
+    xs.sort_by_key(|a| proj(a));
     xs.dedup_by(|a, b| proj(a) == proj(b));
     xs
 }
 
 /// `nubOn proj xs`: keep the first occurrence of each projection value.
-/// Order-preserving. O(n^2) in the simple version; if needed for larger
-/// inputs, callers should switch to a `HashSet`-based variant.
+/// Order-preserving. O(n) via a `HashSet` of seen projections, hence the
+/// `K: Eq + Hash` bound.
 pub fn nub_on<T: Clone, K: Eq + Hash, F: FnMut(&T) -> K>(xs: &[T], mut proj: F) -> Vec<T> {
     let mut seen: std::collections::HashSet<K> = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(xs.len());
@@ -110,7 +110,7 @@ where
     K: Ord,
     F: FnMut(&T) -> K,
 {
-    xs.sort_by(|a, b| proj(a).cmp(&proj(b)));
+    xs.sort_by_key(|a| proj(a));
     xs
 }
 

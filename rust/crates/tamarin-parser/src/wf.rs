@@ -52,14 +52,19 @@ pub type WfReport = Vec<WfError>;
 /// can be compared directly against `tamarin-prover`'s output.
 pub fn check_theory(thy: &Theory) -> WfReport {
     // Mirrors HS `Theory.Tools.Wellformedness.checkWellformedness`
-    // (Wellformedness.hs:1270-1287) — same execution order so the
-    // emitted warning groups appear in the same order in `tamarin-prover
-    // --prove` output.
+    // (Wellformedness.hs:1270-1287).  The order here is close but NOT
+    // identical: HS's `ruleSortsReport` (the "Variable with mismatching
+    // sorts" / sort-clash check) runs before factReports, whereas we run
+    // it later inside `formula_terms_report`; and `left_right_rule_report`
+    // (the diff-only Left/Right check) is interleaved here rather than
+    // appearing where HS places `leftRightRuleReportDiff`.
     let mut report = Vec::new();
     report.extend(unbound_report(thy));
     report.extend(fresh_names_report(thy));
     report.extend(public_names_report(thy));
-    report.extend(left_right_rule_report(thy));    // ruleSortsReport
+    report.extend(left_right_rule_report(thy));    // leftRightRuleReportDiff (diff only)
+    // HS `ruleSortsReport` (sortsClashCheck) is ported as
+    // `variable_sort_clashes`, run later via `formula_terms_report`.
     // ruleVariantsReport — not ported (needs MaudeHandle + variant solver).
     // factReports group:
     report.extend(reserved_report(thy));
@@ -110,7 +115,7 @@ pub fn topics(report: &WfReport) -> BTreeSet<String> {
 ///   - Otherwise: for each name in `lemma_names`, it "corresponds" if
 ///     • there is a theory lemma whose name equals it exactly, OR
 ///     • the name ends with `*` and its prefix is a prefix of at least
-///       one theory-lemma name.
+///     one theory-lemma name.
 ///     Names that don't correspond are collected; if any exist the WF
 ///     check fires.
 pub fn check_if_lemmas_in_theory(lemma_names: &[String], thy: &Theory) -> WfReport {
@@ -199,7 +204,7 @@ fn arg_matches_any_lemma(arg: &str, theory_lemmas: &[&str]) -> bool {
     if let Some(prefix) = arg.strip_suffix('*') {
         theory_lemmas.iter().any(|n| n.starts_with(prefix))
     } else {
-        theory_lemmas.iter().any(|n| *n == arg)
+        theory_lemmas.contains(&arg)
     }
 }
 
@@ -1114,9 +1119,10 @@ pub fn unbound_report(thy: &Theory) -> WfReport {
             let names: Vec<String> = unbound.iter()
                 .map(render_var)
                 .collect();
-            // HS format: `rule `R' has unbound variables: \n    v1\n    v2\n...`
-            // (Wellformedness.hs:493-510, `prettyVarList`).  One var
-            // per indented line.
+            // HS `unboundCheck` (Wellformedness.hs, `prettyVarList`)
+            // renders the vars comma-separated and word-wrapped under a
+            // 2-space `nest`.  Here we instead emit one var per line,
+            // each 4-space indented.
             let var_lines: String = names.iter()
                 .map(|n| format!("    {}", n))
                 .collect::<Vec<_>>()

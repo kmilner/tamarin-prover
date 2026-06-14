@@ -832,11 +832,10 @@ pub fn variants_intruder(
         let conc_terms: Vec<&LNTerm> = ruvariant.conclusions.iter()
             .flat_map(|f| f.terms.iter())
             .collect();
-        if conc_terms.len() == 1 {
-            if matches!(conc_terms[0], Term::App(FunSym::Ac(AcSym::Mult), _)) {
+        if conc_terms.len() == 1
+            && matches!(conc_terms[0], Term::App(FunSym::Ac(AcSym::Mult), _)) {
                 continue;
             }
-        }
 
         produced.push(ruvariant);
     }
@@ -1703,7 +1702,7 @@ mod tests {
                 String::from_utf8_lossy(n));
         }
         // Specific names present.
-        let name_strings: Vec<&[u8]> = names.iter().copied().collect();
+        let name_strings: Vec<&[u8]> = names.to_vec();
         for expected in &[&b"_exp"[..], b"_inv", b"_DH_neutral", b"_one", b"_mult"] {
             assert!(name_strings.contains(expected),
                 "missing constructor rule named {}; got names {:?}",

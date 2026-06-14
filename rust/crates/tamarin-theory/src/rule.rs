@@ -4,7 +4,6 @@
 //! This port covers the data types, accessors, queries, and basic
 //! conversions. Not yet ported:
 //! - `someRuleACInst*` (rule instantiation — needs HasFrees over Rules)
-//! - `unifyRuleACInstEqs` / `unifiableRuleACInsts` (need AC unification)
 //! - Pretty-printing and dot rendering
 //!
 //! The Haskell version uses `fclabels` lenses heavily; we replace those
@@ -151,6 +150,7 @@ impl<P, I> RuleInfo<P, I> {
 // =============================================================================
 
 #[derive(Debug, Clone, PartialEq)]
+#[derive(Default)]
 pub struct RuleAttributes {
     /// Color for graphical display.
     pub color: Option<Rgb>,
@@ -162,17 +162,6 @@ pub struct RuleAttributes {
     pub role: Option<String>,
 }
 
-impl Default for RuleAttributes {
-    fn default() -> Self {
-        RuleAttributes {
-            color: None,
-            process: None,
-            ignore_deriv_checks: false,
-            is_sapic_rule: false,
-            role: None,
-        }
-    }
-}
 
 impl RuleAttributes {
     pub fn empty() -> Self { Self::default() }
@@ -463,7 +452,7 @@ pub fn set_remaining_rule_applications<I>(
 /// Mirrors Haskell `getRuleName` (Theory/Model/Rule.hs:767-781).  Intr
 /// rules — especially `DestrRule` — MUST return their proper names here;
 /// otherwise the `forbiddenEdge` same-rule loop-breaker
-/// (Goals.hs:367-371) never fires for destructors, letting `solveChain`
+/// (Goals.hs) never fires for destructors, letting `solveChain`
 /// recurse indefinitely through `d_0_sdec → d_0_sdec → ...` chains that
 /// Haskell prunes after one application (per `paciRemainingApplications`).
 pub fn rule_name_string(

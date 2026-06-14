@@ -9,8 +9,9 @@
 //! line-based pretty-printer that supports the combinators the prover
 //! actually uses: `text`, `<>`, `<+>` (`besides`), `$$` and `$-$`,
 //! `hcat`/`hsep`/`vcat`, `nest`, and `caseEmpty`. Width-sensitive
-//! `sep`/`cat`/`fsep`/`fcat` fall back to `vcat` (always-vertical) which is
-//! slightly verbose but always correct. Improving them is a follow-up.
+//! `sep`/`cat` fall back to `vcat` (always-vertical) while `fsep`/`fcat` fall
+//! back to `hsep`/`hcat` (always-horizontal); this is slightly verbose but
+//! always correct. Improving them is a follow-up.
 //!
 //! Highlight styling (`Comment`/`Keyword`/`Operator`) is carried as an enum
 //! tag on a `Doc` node; the plain-text renderer ignores it. The HTML renderer

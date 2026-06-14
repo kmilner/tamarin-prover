@@ -4,9 +4,9 @@
 //!
 //! Produces the same surface syntax Tamarin's interactive UI uses:
 //!
-//! - AC operators render in infix form: `Mult` => `*`, `Xor` => `XOR`
-//!   (rendered as `XOR` to remain ASCII-safe; the Haskell side uses the
-//!   single character `\8853`), `Union` => `++`, `NatPlus` => `%+`.
+//! - AC operators render in infix form: `Mult` => `*`, `Xor` => `⊕`
+//!   (the single character U+2295, matching the Haskell side's `\8853`),
+//!   `Union` => `++`, `NatPlus` => `%+`.
 //! - `pair`-trees flatten into `<a,b,c>` notation.
 //! - `exp(a,b)` renders as `a^b`, `diff(a,b)` stays as `diff(a, b)`.
 //! - The `%1` constant (`tone`) prints as `%1`.

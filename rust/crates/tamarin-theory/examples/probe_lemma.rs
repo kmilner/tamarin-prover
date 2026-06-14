@@ -20,7 +20,7 @@ fn main() {
 
     let src = std::fs::read_to_string(path).expect("read");
     let theory = tamarin_parser::parse_theory(&src, &[]).expect("parse");
-    let lemma = theory.items.iter().find_map(|it| match it {
+    let _lemma = theory.items.iter().find_map(|it| match it {
         TheoryItem::Lemma(l) if l.name == *lemma_name => Some(l.clone()),
         _ => None,
     }).expect("lemma not found");
@@ -160,7 +160,7 @@ fn main() {
             if matches!(node.status, NodeStatus::Solved) && node.children.is_empty() {
                 return Some(node);
             }
-            for (_, c) in &node.children {
+            for c in node.children.values() {
                 if let Some(r) = find_solved(c) { return Some(r); }
             }
             None

@@ -10,47 +10,14 @@
 //! Matching follows the same split.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use crate::function_symbols::FunSym;
 use crate::lterm::{sort_compare, sort_of_lterm, LSort, LTerm, LVar, Name};
 use crate::rewriting::{Equal, Match};
-use crate::subst::{apply_vterm, Subst};
+use crate::subst::{apply_vterm, apply_vterm_map, Subst};
 use crate::term::Term;
 use crate::vterm::Lit;
-
-/// Source of fresh witness indices for the local non-AC unifier.
-///
-/// Wraps either a private local counter (legacy "per-call" behaviour,
-/// kept for callers that don't have a shared counter) or a shared
-/// `AtomicU64` (the Haskell-faithful `MonadFresh` path, used by
-/// `MaudeHandle::unify_with_avoid`).  Allocating from a shared counter
-/// guarantees indices are globally unique across all calls in a proof
-/// session — the fix for the TESLA::authentic_reachable
-/// `~mw:Pub:17` / `~mw:Msg:17` cross-call collision.
-// Carrier kept around because callers thread it through `unify_raw`
-// for future use (e.g. minting witnesses when sort narrowing is
-// extended past the current named-var-orientation logic).  The
-// fields/method are reserved for that path.
-#[allow(dead_code)]
-enum FreshSrc<'a> {
-    Local(u64),
-    Shared(&'a AtomicU64),
-}
-
-#[allow(dead_code)]
-impl<'a> FreshSrc<'a> {
-    fn next(&mut self) -> u64 {
-        match self {
-            FreshSrc::Local(c) => {
-                let v = 1_000_000_000 + *c;
-                *c += 1;
-                v
-            }
-            FreshSrc::Shared(a) => a.fetch_add(1, Ordering::SeqCst),
-        }
-    }
-}
 
 #[derive(Debug)]
 pub enum UnifyError {
@@ -62,13 +29,9 @@ pub enum UnifyError {
 /// `unifyLTermNoAC` — non-AC unification. Returns a single most-general
 /// unifier or `Err(UnifyError::NoUnifier)` / `Err(UnifyError::NeedsAC)`.
 ///
-/// **Sort narrowing**: when two LVars have disjoint sub-sorts, the
-/// unifier mints a fresh `~mw` witness at the narrower sort and binds
-/// both inputs to it.  This mirrors Maude's order-sorted output shape
-/// so the downstream eq-store + freshen_witness_range pipeline can
-/// treat local unifier output and Maude output uniformly.  The
-/// witness index starts at `u64::MAX - n` for the n-th witness so
-/// callers can recognise and re-fresh them globally.
+/// Two LVars with incomparable sorts yield `Err(UnifyError::NoUnifier)`;
+/// when one sort is broader it becomes the elimination key. No witnesses
+/// are minted (cf. HS `unifyRaw`).
 pub fn unify_lterm_no_ac<C, F>(
     sort_of_const: &F,
     eqs: Vec<Equal<LTerm<C>>>,
@@ -78,9 +41,8 @@ where
     F: Fn(&C) -> LSort,
 {
     let mut acc: BTreeMap<LVar, LTerm<C>> = BTreeMap::new();
-    let mut src = FreshSrc::Local(0);
     for Equal { lhs, rhs } in eqs {
-        unify_raw(sort_of_const, &mut acc, lhs, rhs, &mut src)?;
+        unify_raw(sort_of_const, &mut acc, lhs, rhs)?;
     }
     Ok(Subst::from_map(acc))
 }
@@ -92,21 +54,15 @@ pub fn unify_lnterm_no_ac(
     unify_lterm_no_ac(&|n: &Name| crate::lterm::sort_of_name(n), eqs)
 }
 
-/// Variant that draws witness idxs from a shared atomic counter
-/// (Haskell `MonadFresh`).  Use this when calling from inside a Maude
-/// bridge so witnesses get globally-unique idxs across all unify
-/// calls — preventing the cross-call collision class.
+/// Variant accepting a shared atomic counter for parity with the
+/// Maude-backed unifier call sites.  The counter is currently unused by
+/// the AC-free unification logic (no witnesses are minted), so this is
+/// identical to `unify_lnterm_no_ac`.
 pub fn unify_lnterm_no_ac_with_counter(
     eqs: Vec<Equal<crate::lterm::LNTerm>>,
-    counter: &AtomicU64,
+    _counter: &AtomicU64,
 ) -> Result<Subst<Name, LVar>, UnifyError> {
-    let sort_of_const = |n: &Name| crate::lterm::sort_of_name(n);
-    let mut acc: BTreeMap<LVar, LTerm<Name>> = BTreeMap::new();
-    let mut src = FreshSrc::Shared(counter);
-    for Equal { lhs, rhs } in eqs {
-        unify_raw(&sort_of_const, &mut acc, lhs, rhs, &mut src)?;
-    }
-    Ok(Subst::from_map(acc))
+    unify_lnterm_no_ac(eqs)
 }
 
 /// `unifiableLNTermsNoAC`: shorthand for "is there a unifier?".
@@ -114,7 +70,7 @@ pub fn unifiable_lnterms_no_ac(
     a: crate::lterm::LNTerm,
     b: crate::lterm::LNTerm,
 ) -> bool {
-    matches!(unify_lnterm_no_ac(vec![Equal::new(a, b)]), Ok(_))
+    unify_lnterm_no_ac(vec![Equal::new(a, b)]).is_ok()
 }
 
 fn unify_raw<C, F>(
@@ -122,15 +78,15 @@ fn unify_raw<C, F>(
     acc: &mut BTreeMap<LVar, LTerm<C>>,
     lhs: LTerm<C>,
     rhs: LTerm<C>,
-    src: &mut FreshSrc<'_>,
 ) -> Result<(), UnifyError>
 where
     C: Ord + Clone,
     F: Fn(&C) -> LSort,
 {
-    let snapshot = Subst::from_map(acc.clone());
-    let l = apply_vterm(&snapshot, lhs);
-    let r = apply_vterm(&snapshot, rhs);
+    // Apply the accumulator by borrowing it directly — avoids cloning
+    // the whole map into a `Subst` on every recursion (hot path).
+    let l = apply_vterm_map(&*acc, lhs);
+    let r = apply_vterm_map(&*acc, rhs);
 
     match (&l, &r) {
         (Term::Lit(Lit::Var(vl)), Term::Lit(Lit::Var(vr))) if vl == vr => Ok(()),
@@ -180,13 +136,13 @@ where
             if lf == rf && la.len() == ra.len() =>
         {
             for (a, b) in la.iter().cloned().zip(ra.iter().cloned()) {
-                unify_raw(sort_of_const, acc, a, b, src)?;
+                unify_raw(sort_of_const, acc, a, b)?;
             }
             Ok(())
         }
         (Term::App(FunSym::List, la), Term::App(FunSym::List, ra)) if la.len() == ra.len() => {
             for (a, b) in la.iter().cloned().zip(ra.iter().cloned()) {
-                unify_raw(sort_of_const, acc, a, b, src)?;
+                unify_raw(sort_of_const, acc, a, b)?;
             }
             Ok(())
         }
@@ -222,9 +178,10 @@ where
     C: Ord + Clone,
     F: Fn(&C) -> LSort,
 {
-    let snapshot = Subst::from_map(acc.clone());
-    let l = apply_vterm(&snapshot, lhs);
-    let r = apply_vterm(&snapshot, rhs);
+    // Apply the accumulator by borrowing it directly — avoids cloning
+    // the whole map into a `Subst` on every recursion (hot path).
+    let l = apply_vterm_map(&*acc, lhs);
+    let r = apply_vterm_map(&*acc, rhs);
 
     match (&l, &r) {
         (Term::Lit(Lit::Var(vl)), Term::Lit(Lit::Var(vr))) if vl == vr => Ok(()),

@@ -159,7 +159,7 @@ fn proof_state(entry: &TheoryEntry) -> String {
             "<div class=\"lemma-row\">\n\
              <span class=\"hl_keyword\">lemma</span> {n}:{attrs}<br>\n\
              &nbsp;&nbsp;{tq} \"{f}\"<br>\n\
-             &nbsp; <a class=\"ajax-action proof-step autoprove\" href=\"/thy/trace/{idx}/autoprove/idfs/0/false/proof/{n_url}\">[autoprove]</a>\n",
+             &nbsp; <a class=\"ajax-action proof-step autoprove\" href=\"/thy/trace/{idx}/autoprove/idfs/0/False/proof/{n_url}\">[autoprove]</a>\n",
             idx = idx,
             n = html_escape(&l.name),
             n_url = url_path_escape_local(&l.name),
@@ -355,9 +355,9 @@ fn lemma_html(entry: &TheoryEntry, name: &str) -> String {
                  <p><em>{tq}</em></p>\n\
                  <pre class=\"formula\">\"{f}\"</pre>\n\
                  <p>\n\
-                 <a class=\"ajax-action\" href=\"/thy/trace/{idx}/autoprove/idfs/0/false/proof/{n}\">[autoprove (dfs)]</a>\n\
+                 <a class=\"ajax-action\" href=\"/thy/trace/{idx}/autoprove/idfs/0/False/proof/{n}\">[autoprove (dfs)]</a>\n\
                  &nbsp;\n\
-                 <a class=\"ajax-action\" href=\"/thy/trace/{idx}/autoprove/bfs/0/false/proof/{n}\">[autoprove (bfs)]</a>\n\
+                 <a class=\"ajax-action\" href=\"/thy/trace/{idx}/autoprove/bfs/0/False/proof/{n}\">[autoprove (bfs)]</a>\n\
                  </p>\n",
                 n = html_escape(name),
                 tq = tq,
@@ -425,7 +425,7 @@ pub fn proof_html(entry: &TheoryEntry, lemma: &str, sub: &[String]) -> String {
          <span class=\"proof-actions\">\n\
          <a class=\"ajax-action proof-step\" href=\"/thy/trace/{idx}/proof-step/{lemma}/simplify\">[simplify]</a>\n\
          <a class=\"ajax-action proof-step\" href=\"/thy/trace/{idx}/proof-step/{lemma}/induction\">[induction]</a>\n\
-         <a class=\"ajax-action\" href=\"/thy/trace/{idx}/autoprove/idfs/0/false/proof/{lemma}\">[autoprove (dfs)]</a>\n\
+         <a class=\"ajax-action\" href=\"/thy/trace/{idx}/autoprove/idfs/0/False/proof/{lemma}\">[autoprove (dfs)]</a>\n\
          </span>\n\
          </div>\n",
         idx = entry.idx,

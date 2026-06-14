@@ -42,7 +42,7 @@ fn guard_error_doc(
 ) -> String {
     let full = crate::pretty_formula::pretty_formula(formula);
     let sub = e.subject_formula.as_ref()
-        .map(|f| crate::pretty_formula::pretty_formula(f))
+        .map(crate::pretty_formula::pretty_formula)
         .unwrap_or_else(|| full.clone());
     format!("{}\n  \"{}\"\nin the formula\n  \"{}\"", e.message, sub, full)
 }
@@ -1094,7 +1094,7 @@ end";
         // Diagnostic: count lemmas in the proof tree's leaves.
         fn collect_max_lemmas(n: &super::ProofNode, out: &mut usize) {
             *out = (*out).max(n.sys.lemmas.len());
-            for (_, c) in &n.children { collect_max_lemmas(c, out); }
+            for c in n.children.values() { collect_max_lemmas(c, out); }
         }
         let mut max_lemmas = 0;
         collect_max_lemmas(&root, &mut max_lemmas);

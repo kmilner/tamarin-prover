@@ -71,9 +71,13 @@ pub fn var_occurrences(ts: &[LNTerm]) -> BTreeMap<LVar, usize> {
 }
 
 /// Canonicalise a fresh-range substitution: rename the range
-/// variables to a deterministic sequence (`x.1`, `x.2`, ...) using
-/// the order of first occurrence (with ties broken by occurrence
-/// count, matching Haskell's `sortOn (`lookup` occs)`).
+/// variables to a deterministic sequence (`x.1`, `x.2`, ...) ordered
+/// by the key `(occurrence count, sort, first-occurrence position)`
+/// — see lines 167-171.  This intentionally DIVERGES from HS's
+/// `canonizeSubst`, which orders by `sortOn (`lookup` occs)` where
+/// `occs` keys on a SET of context paths (`S.Set Occurence`,
+/// `Occurence = [String]`), not a count; the count-based key here is
+/// an alpha-invariant substitute, explained in the block below.
 ///
 /// Two substitutions equivalent modulo renaming will canonicalise to
 /// the same value.

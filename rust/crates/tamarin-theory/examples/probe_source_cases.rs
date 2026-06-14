@@ -34,8 +34,9 @@ fn main() {
     println!("Full sources ({}):", ctx.full_sources.len());
     for src in &ctx.full_sources {
         println!("\n  Goal: {:?}", src.goal);
-        println!("  Cases ({}):", src.cases.len());
-        for (name, sys) in &src.cases {
+        let cases = src.cases(&ctx);
+        println!("  Cases ({}):", cases.len());
+        for (name, sys) in &cases {
             println!("    \"{}\":", name);
             println!("      nodes: {}, edges: {}, less: {}, formulas: {}",
                 sys.nodes.len(), sys.edges.len(), sys.less_atoms.len(),

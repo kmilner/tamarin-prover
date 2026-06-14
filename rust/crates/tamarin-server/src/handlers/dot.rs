@@ -216,8 +216,7 @@ fn try_render_dot_to_svg(dot: &str) -> std::io::Result<Vec<u8>> {
     }
     let out = child.wait_with_output()?;
     if !out.status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             format!("dot exited with status {:?}", out.status)));
     }
     Ok(out.stdout)
@@ -264,7 +263,7 @@ impl DotBuilder {
             header.clone()
         } else {
             let acts: Vec<String> = ru.actions.iter()
-                .map(|fa| format_fact(fa))
+                .map(format_fact)
                 .collect();
             format!("{} [{}]", header, escape_dot(&acts.join(", ")))
         };
@@ -274,7 +273,7 @@ impl DotBuilder {
         if !prems.is_empty() {
             sections.push(format!("{{ {} }}", prems));
         }
-        sections.push(format!("{}", escape_dot(&mid)));
+        sections.push(escape_dot(&mid).to_string());
         if !concs.is_empty() {
             sections.push(format!("{{ {} }}", concs));
         }

@@ -1,20 +1,23 @@
-//! Skeleton port of `Theory.Constraint.Solver.Reduction`.
+//! Port of `Theory.Constraint.Solver.Reduction`.
 //!
-//! In Haskell, `Reduction` is a state-and-disjunction monad:
+//! In Haskell, `Reduction` is a state-fresh-disjunction monad over a
+//! `ProofContext` reader:
 //!
 //! ```haskell
-//! type Reduction = ReaderT ProofContext (StateT System (DisjT FreshT IO))
+//! type Reduction = StateT System (FreshT (DisjT (Reader ProofContext)))
 //! ```
 //!
 //! Each constraint-reduction rule runs as a `Reduction`, possibly
 //! producing multiple cases. The monad provides primitives like
 //! `insertNode`, `insertEdge`, `insertGoal`, `solveTermEqs`, etc.
 //!
-//! For the Rust port we model `Reduction` as a small struct holding
-//! mutable state and a context reference. Disjunctive results are
-//! returned as `Vec`s. This is enough for the simpler reduction
-//! steps; the full solver eventually inlines this with proper
-//! fresh-variable threading and disjunctive case splitting.
+//! For the Rust port we model `Reduction` as a struct holding mutable
+//! `System` state plus a `ProofContext` reference, with its own
+//! fresh-variable supply (see `Reduction::maude`). Disjunctive results
+//! are surfaced as `Vec`s rather than a monad-level `DisjT` layer. This
+//! module implements the full reduction surface: `substSystem`,
+//! `conjoinSystem`, the `solve*Eqs` family, `insertFormula`, and the
+//! associated CR-rules.
 
 use crate::constraint::constraints::{Disj, Edge, Goal, LessAtom, NodeId};
 use crate::constraint::solver::context::ProofContext;
@@ -43,7 +46,7 @@ pub struct Reduction<'ctx> {
     /// `Atom::Eq` call (or, recursively, an `insert_formula`
     /// invocation that opened to an Eq atom).  Mirrors HS's
     /// `disjunctionOfList $ performSplit eqs2 splitId` inside
-    /// `solveTermEqs SplitNow` (Reduction.hs:776-778): each AC
+    /// `solveTermEqs SplitNow` (Reduction.hs): each AC
     /// unifier arm forks the surrounding `Reduction` (`DisjT`)
     /// continuation.  Our port doesn't have a monad-level Disj layer,
     /// so we surface the extra arms here: `insert_atom` Atom::Eq
@@ -821,6 +824,11 @@ impl<'ctx> Reduction<'ctx> {
         };
         let mut new_goals: Vec<(Goal, crate::constraint::system::GoalStatus)>
             = Vec::with_capacity(goals.len());
+        // Dedup keys, kept parallel to `new_goals`: precomputing each
+        // goal's `canonical_goal_for_dedup` once (rather than re-deriving
+        // it for every accumulated goal on every iteration) keeps the
+        // merge below from being quadratic in canonicalisation cost.
+        let mut new_goal_keys: Vec<Goal> = Vec::with_capacity(goals.len());
         // Apply full term substitution to a fact's term list — required
         // when the eq-store maps a var to a non-var term (e.g.
         // `m → h(...)` from an Eq restriction), in which case
@@ -832,7 +840,7 @@ impl<'ctx> Reduction<'ctx> {
                 tag: fa.tag,
                 annotations: fa.annotations,
                 terms: fa.terms.into_iter()
-                    .map(|t| apply_term(t))
+                    .map(&apply_term)
                     .collect(),
             }
         };
@@ -949,14 +957,14 @@ impl<'ctx> Reduction<'ctx> {
                 // `normalize_bound_lvars` to match HS's DeBruijn
                 // semantics, see system.rs::canonical_goal_for_dedup).
                 let canon_g2 = crate::constraint::system::canonical_goal_for_dedup(&g2);
-                if let Some(slot) = new_goals.iter_mut().find(|(eg, _)|
-                    crate::constraint::system::canonical_goal_for_dedup(eg) == canon_g2)
-                {
-                    slot.1.solved = slot.1.solved || st.solved;
-                    slot.1.looping = slot.1.looping || st.looping;
-                    slot.1.nr = std::cmp::min(slot.1.nr, st.nr);
+                if let Some(i) = new_goal_keys.iter().position(|k| *k == canon_g2) {
+                    let st_old = &mut new_goals[i].1;
+                    st_old.solved = st_old.solved || st.solved;
+                    st_old.looping = st_old.looping || st.looping;
+                    st_old.nr = std::cmp::min(st_old.nr, st.nr);
                 } else {
                     new_goals.push((g2, st));
+                    new_goal_keys.push(canon_g2);
                 }
             }
         }
@@ -1387,16 +1395,13 @@ impl<'ctx> Reduction<'ctx> {
         if std::env::var("TAM_DBG_PANIC_GOAL_IDX0").is_ok() {
             use tamarin_term::lterm::HasFrees;
             let mut found_idx0: Option<tamarin_term::lterm::LVar> = None;
-            match &g {
-                Goal::Action(_, fa) => fa.for_each_free(&mut |v| {
-                    if v.idx == 0 && matches!(v.name.as_str(),
-                        "ni" | "nr" | "m1" | "m2" | "s" | "R" | "ltkA" | "ltkI")
-                        && found_idx0.is_none() {
-                        found_idx0 = Some(v.clone());
-                    }
-                }),
-                _ => {}
-            }
+            if let Goal::Action(_, fa) = &g { fa.for_each_free(&mut |v| {
+                if v.idx == 0 && matches!(v.name.as_str(),
+                    "ni" | "nr" | "m1" | "m2" | "s" | "R" | "ltkA" | "ltkI")
+                    && found_idx0.is_none() {
+                    found_idx0 = Some(v.clone());
+                }
+            }) }
             if let Some(v) = found_idx0 {
                 panic!("[TAM_DBG_PANIC_GOAL_IDX0] insert_goal: Goal::Action with idx-0 var {:?} (goal={:?})",
                     v, g);
@@ -1466,8 +1471,8 @@ impl<'ctx> Reduction<'ctx> {
     ///   - all vars in nodes' rules
     ///   - all vars in stored & solved formulas
     ///   - any LessAtom node-id idx
-    /// Plus a constant headroom so multiple Ex-decompositions in
-    /// quick succession don't clash. Used by `Ex` decomposition.
+    ///     Plus a constant headroom so multiple Ex-decompositions in
+    ///     quick succession don't clash. Used by `Ex` decomposition.
     pub fn fresh_var_baseline(&self) -> u64 {
         let mut m = bounds_max(&self.sys);
         for f in &self.sys.formulas {
@@ -1489,11 +1494,17 @@ impl<'ctx> Reduction<'ctx> {
     /// - `Last(t)`      → set `last_atom` if `t` is a node variable
     /// - `Action(fa,t)` → push a `Goal::Action(node_id, lnfact)`
     /// - `Subterm(s,b)` → push a subterm-store entry
-    /// - `Pred(_)`      → no-op (predicates would have been expanded)
-    /// - `LessMset(_,_)`→ ignored for now (multiset ordering goal)
+    /// - `Pred(_)`      → returns `false`: predicates are pre-expanded
+    ///   during translation and have no `LNAtom` form
+    /// - `LessMset(_,_)`→ returns `false`: multiset ordering is not a
+    ///   temporal `LNAtom`, so it never reaches here
+    ///
+    /// HS's `LNAtom` (Reduction.hs `insertAtom`) only has
+    /// `EqE`/`Subterm`/`Action`/`Less`/`Last`/`Syntactic`; the two
+    /// parser-AST shapes above have no counterpart and are rejected.
     ///
     /// Returns `true` if the atom was successfully decomposed,
-    /// `false` if it was a shape we don't yet handle.
+    /// `false` if it was a shape with no `LNAtom` counterpart.
     pub fn insert_atom(&mut self, a: &tamarin_parser::ast::Atom) -> bool {
         use tamarin_parser::ast::Atom;
         match a {
@@ -1540,7 +1551,7 @@ impl<'ctx> Reduction<'ctx> {
                     }
                     Ok(SolveOutcome::Linear(_)) => {}
                     Ok(SolveOutcome::Cases(arms)) => {
-                        // HS-faithful fanout (Reduction.hs:776-778):
+                        // HS-faithful fanout (Reduction.hs):
                         // `disjunctionOfList $ performSplit eqs2 splitId`
                         // forks the surrounding `Reduction` continuation
                         // once per AC unifier arm.  We install arm[0]
@@ -1606,9 +1617,13 @@ impl<'ctx> Reduction<'ctx> {
     ///
     /// Implemented cases (mark-as-solved on the *outermost* call only):
     /// - `Conj fms`     → recurse on each subformula (CR-rule *S_∧*)
-    /// - `Disj`         → store + insert `Goal::Disj` (defer split)
-    /// - `Atom`         → no-op (would need parser-atom→LNAtom bridge)
-    /// - `Ex` / `All`   → store as-is for now (need fresh supply for ∃)
+    /// - `Disj`         → store + insert `Goal::Disj` (defer split, CR *S_∨*)
+    /// - `Atom`         → `insert_atom` via `gatom_to_atom` (atom insertion)
+    /// - `Ex`           → CR-rule *S_∃*: allocate fresh LVars, `substBound`,
+    ///   recurse on `gconj([guards…, body])`
+    /// - `All` (¬, single guard, body=⊥) → CR-rules for `Less`/`Eq`/`Last`
+    ///   (split into ordering disjunctions), `Subterm`
+    ///   (`insertNegSubterm`); otherwise kept in `formulas`
     pub fn insert_formula(&mut self, g: Guarded) {
         self.insert_formula_inner(g, true);
     }
@@ -1729,8 +1744,7 @@ impl<'ctx> Reduction<'ctx> {
                     }
                 }
             }
-            Guarded::GGuarded { qua, vars, guards, body }
-                if matches!(qua, crate::guarded::Quant::Ex) => {
+            Guarded::GGuarded { qua: crate::guarded::Quant::Ex, vars, guards, body } => {
                 // CR-rule *S_∃*: openGuarded — allocate fresh LVars for
                 // the bound vars, substitute Bound → Free in guards/body,
                 // and recurse on `gconj([atoms..., body])`.
@@ -2837,46 +2851,6 @@ fn canonical_rule_inst_with(
     }
 }
 
-/// Convert `OpenProtoRule`s to `RuleACInst`s, applying a per-rule
-/// keep predicate.  Returns the abstracted form so premise-goal /
-/// chain-fold paths see the same rule shape as the SplitG action-goal
-/// path.  Mirrors Haskell's `someRuleACInst` semantics for code paths
-/// that don't carry the variant disjunction (chain-fold, etc.).
-///
-/// Currently unused — all live callers use the `*_with_constrs`
-/// variants below.  Kept for the rare diagnostic where
-/// `TAM_NO_PRECOMPUTE_VARIANTS=1` populates the legacy `variants`
-/// field; that path needs this expansion.
-#[allow(dead_code)]
-fn rule_insts_with<F: Fn(&RuleACInst) -> bool>(
-    open: &[crate::theory::OpenProtoRule], keep: F,
-) -> Vec<RuleACInst> {
-    let mut out = Vec::new();
-    for o in open {
-        let push = |inst: RuleACInst, out: &mut Vec<RuleACInst>| {
-            if keep(&inst) { out.push(inst); }
-        };
-        if o.variants.is_empty() {
-            push(canonical_rule_inst_with(o, /* prefer_abstracted= */ true), &mut out);
-        } else {
-            // Legacy pre-applied variants — kept for the rare case
-            // where `o.variants` is populated externally; under the
-            // standard load path `variants` stays empty and the
-            // abstracted form + SplitG carries the variant data.
-            for v in &o.variants {
-                let mut inst = crate::rule::proto_rule_ac_to_rule_ac_inst(v.clone());
-                if let crate::rule::RuleInfo::Proto(p) = &mut inst.info {
-                    if p.loop_breakers.is_empty() {
-                        p.loop_breakers = o.loop_breakers.clone();
-                    }
-                }
-                push(inst, &mut out);
-            }
-        }
-    }
-    out
-}
-
 /// `someRuleACInst`-style rule enumeration (Rule.hs:933): one canonical
 /// `RuleACInst` per `OpenProtoRule`, paired with its variant disjunction
 /// (`Maybe RuleACConstrs`). Callers should add the disjunction to the
@@ -2902,26 +2876,7 @@ fn rule_insts_with_constrs<F: Fn(&RuleACInst) -> bool>(
     out
 }
 
-/// `nonSilentRules` lite: rules with at least one action. Includes
-/// the proof context's intruder rules so KU goals can be discharged.
-///
-/// Unused — superseded by `non_silent_rule_insts_with_constrs` which
-/// carries the SplitG variant disjunction. Kept for parity with the
-/// (likewise unused) `rule_insts_with` legacy path.
-#[allow(dead_code)]
-fn non_silent_rule_insts(
-    ctx: &crate::constraint::solver::context::ProofContext,
-) -> Vec<RuleACInst> {
-    let mut out = rule_insts_with(&ctx.rules, |r| !r.actions.is_empty());
-    for ir in &ctx.intruder_rules {
-        if !ir.actions.is_empty() {
-            out.push(intr_rule_to_rule_ac_inst(ir.clone()));
-        }
-    }
-    out
-}
-
-/// SplitG-faithful variant of `non_silent_rule_insts`: returns the
+/// SplitG-faithful non-silent rule enumeration: returns the
 /// canonical rule per `OpenProtoRule` plus its variant disjunction.
 /// Intruder rules carry `None` (no variants).
 ///
@@ -3229,71 +3184,13 @@ fn is_product(t: &tamarin_term::lterm::LNTerm) -> bool {
     matches!(t, tamarin_term::term::Term::App(FunSym::Ac(AcSym::Mult), _))
 }
 
-/// Rules with conclusions matching the given premise's tag/arity.
+/// SplitG-aware premise-solving rule enumeration: returns the
+/// canonical (possibly abstracted) rule per `OpenProtoRule` plus its
+/// variant disjunction.  Intruder rules carry `None` (no variants).
 /// For non-K premises this favours protocol rules with non-K
-/// conclusions; for K-premises (KD/KU) it includes the intruder
-/// rules.
-///
-/// **Source-cache short-circuit**: if the proof context has a
-/// `UniqueSource` for the premise's fact tag (= exactly one rule in
-/// the theory produces it), we restrict the candidates to just that
-/// rule — Haskell's `solveWithSource` does the same. Cuts down search
-/// breadth for premise goals with deterministic sources.
-///
-/// Unused — superseded by `premise_solving_rule_insts_with_constrs`
-/// which carries the SplitG variant disjunction.
-#[allow(dead_code)]
-fn premise_solving_rule_insts(
-    ctx: &crate::constraint::solver::context::ProofContext,
-    fa_prem: &crate::fact::LNFact,
-) -> Vec<RuleACInst> {
-    let unique_rule_name = ctx.unique_sources.iter()
-        .find(|s| s.fact_tag == fa_prem.tag)
-        .map(|s| s.rule_name.clone());
-    let mut out: Vec<RuleACInst> = if !fa_prem.is_k_fact() {
-        // Non-K premise → protocol rules whose conclusions are non-K.
-        // If the source cache says exactly one rule matches, restrict.
-        let keep_rule_name = unique_rule_name.clone();
-        rule_insts_with(&ctx.rules, move |r| {
-            if !r.conclusions.iter().any(|c| !c.is_k_fact()) {
-                return false;
-            }
-            if let Some(name) = &keep_rule_name {
-                let r_name = match &r.info {
-                    crate::rule::RuleInfo::Proto(p) => match &p.name {
-                        crate::rule::ProtoRuleName::Stand(s) => s.clone(),
-                        crate::rule::ProtoRuleName::Fresh => "Fresh".to_string(),
-                    },
-                    _ => return true,
-                };
-                return &r_name == name;
-            }
-            true
-        })
-    } else {
-        // K-premise → all rules.
-        rule_insts_with(&ctx.rules, |_| true)
-    };
-    // Add intruder rules whose conclusions can match the live premise
-    // tag.  Mirrors Haskell's `crProtocol ++ crConstruct ++ crDestruct`
-    // narrowing in `solvePremise` — protocol-fact premises don't ask
-    // intruder rules to produce them, so we don't enumerate them as
-    // candidates.  Without this, sig-aware MaudeSig added 5+ rules
-    // per protocol-fact premise that never matched, blowing the
-    // search budget.
-    for ir in &ctx.intruder_rules {
-        let inst = intr_rule_to_rule_ac_inst(ir.clone());
-        if inst.conclusions.iter().any(|c| c.tag == fa_prem.tag) {
-            out.push(inst);
-        }
-    }
-    out
-}
-
-/// SplitG-aware variant: returns the canonical (possibly abstracted)
-/// rule per `OpenProtoRule` plus its variant disjunction.  Intruder
-/// rules carry `None` (no variants).  Same filtering as
-/// `premise_solving_rule_insts`.
+/// conclusions and honours the `UniqueSource` source-cache
+/// short-circuit (Haskell's `solveWithSource`); for K-premises it
+/// includes the intruder rules.
 fn premise_solving_rule_insts_with_constrs(
     ctx: &crate::constraint::solver::context::ProofContext,
     _fa_prem: &crate::fact::LNFact,
@@ -3801,7 +3698,7 @@ pub fn default_case_name(i: usize) -> String {
 /// `fresh`, coercion uses `coerce`, IRecv/ISend use their internal
 /// names.
 /// Haskell-faithful direct-close case name for a chain.  Mirrors
-/// Haskell `caseName mPrem` (Goals.hs:337-338) where `mPrem` is the
+/// Haskell `caseName mPrem` (Goals.hs) where `mPrem` is the
 /// chain conc's KD term:
 ///   * `Lit (Var v)`  → `Var_<sortSuffix>_<idx-or-name>` (see Haskell
 ///     `showLitName`, LTerm.hs:864).
@@ -4090,7 +3987,7 @@ impl<'ctx> Reduction<'ctx> {
                     // singleton branch.  Mirrors Haskell `solveDisjunction`
                     // → `insertFormula alt`.
                     sub.insert_formula(gfm.clone());
-                    // HS-faithful multi-arm fanout (Reduction.hs:776-778):
+                    // HS-faithful multi-arm fanout (Reduction.hs):
                     // if the chosen disjunct opened to an `Atom::Eq` whose
                     // `solveTermEqs SplitNow` returned multiple AC unifier
                     // arms, each arm forks the surrounding `Reduction`
@@ -4498,16 +4395,16 @@ impl<'ctx> Reduction<'ctx> {
         if std::env::var("TAM_DBG_SAG").is_ok() {
             eprintln!("[sag] ENTRY i={:?} fa.tag={:?} existing={:?}",
                 i, fa.tag,
-                existing.as_ref().map(|r| rule_case_name(r)));
+                existing.as_ref().map(rule_case_name));
         }
         if std::env::var("TAM_DBG_SRC_CASE").is_ok() {
             eprintln!("[src_case] solve_action_goal ENTRY: i={:?} fa.tag={:?} existing={:?}",
                 i, fa.tag,
-                existing.as_ref().map(|r| crate::constraint::solver::reduction::rule_case_name(r)));
+                existing.as_ref().map(crate::constraint::solver::reduction::rule_case_name));
         }
         match existing {
             Some(ru) => {
-                // HS-faithful (Goals.hs:287-290):
+                // HS-faithful (Goals.hs):
                 //
                 //   Just ru -> do
                 //     unless (fa `elem` get rActs ru) $ do
@@ -4551,7 +4448,7 @@ impl<'ctx> Reduction<'ctx> {
                         SplitStrategy::SplitNow,
                         &[tamarin_term::rewriting::Equal {
                             lhs: fa.clone(), rhs: act.clone() }]);
-                    // HS-faithful per-arm fan-out (Goals.hs:287-290).
+                    // HS-faithful per-arm fan-out (Goals.hs).
                     // When `solveFactEqs SplitNow` produces multiple AC
                     // unifier arms, fan-out one branch per arm; otherwise
                     // use `sub.sys`'s already-installed Linear eq_store.
@@ -5174,7 +5071,7 @@ impl<'ctx> Reduction<'ctx> {
         // defer via `insert_goal` to keep each call bounded — the
         // search driver enumerates the goal in its own `expand` step.
         if matches!(fa_prem.tag, crate::fact::FactTag::Kd) {
-            if fa_prem.terms.first().is_none() {
+            if fa_prem.terms.is_empty() {
                 return GoalCases::Contradictory;
             }
             // Haskell `solvePremise rules p faPrem | isKDFact faPrem`:
@@ -5394,7 +5291,7 @@ impl<'ctx> Reduction<'ctx> {
                         src: (new_node.clone(), c_idx),
                         tgt: p.clone(),
                     },
-                    &fa_conc,
+                    fa_conc,
                     fa_prem,
                 );
                 match res {
@@ -5405,7 +5302,7 @@ impl<'ctx> Reduction<'ctx> {
                         // `solveFactEqsLabeled SplitNow` whose inner
                         // `solveTermEqsLabeled` runs
                         //   `disjunctionOfList $ performSplit eqs2 splitId`
-                        // (Reduction.hs:776-778) when the AC unifier
+                        // (Reduction.hs) when the AC unifier
                         // yields multiple solutions.  Each arm becomes a
                         // separate branch in HS's `Reduction` (Disj/list)
                         // monad → `solvePremise` returns once per arm
@@ -5565,7 +5462,7 @@ impl<'ctx> Reduction<'ctx> {
                     if !matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
                         // Direct-edge chain: name by the chain conc's KD
                         // term head, mirroring Haskell `caseName mPrem`
-                        // (Goals.hs:337-338) — `showFunSymName` for App,
+                        // (Goals.hs) — `showFunSymName` for App,
                         // `showLitName` for Lit.  Previously Rust used the
                         // producer rule's name (`rule_case_name`), which
                         // diverges from Haskell's proof-skeleton naming
@@ -5574,7 +5471,7 @@ impl<'ctx> Reduction<'ctx> {
                             .unwrap_or_else(|| rule_case_name(&c_rule));
                         // HS-faithful per-arm fanout — mirrors the
                         // `disjunctionOfList arms` in `solveTermEqs`
-                        // (Reduction.hs:888-897) routed through
+                        // (Reduction.hs) routed through
                         // `insertEdgesLabeled "chain_direct"`.  Each arm
                         // becomes one independent solveChain DIRECT case.
                         let post_edge_sys = sub.sys.clone();
@@ -5609,7 +5506,7 @@ impl<'ctx> Reduction<'ctx> {
 
         // ---------------- Branch 2: extend by destructor ----------------
         // Skip ONLY when the chain's term is a message variable
-        // (Haskell `contradictoryIf (isMsgVar m)`, Goals.hs:370).
+        // (Haskell `contradictoryIf (isMsgVar m)`, Goals.hs).
         //
         // We previously also skipped during precompute (`saturate_sources`
         // handles chains via a separate chain-fold path), but with the
@@ -5622,7 +5519,7 @@ impl<'ctx> Reduction<'ctx> {
         // 10-30× off.  HS Goals.hs:316-380 runs both branches via
         // `disjunction` unconditionally.
         let conc_term_is_msg_var = fa_conc.terms.first()
-            .map(|t| tamarin_term::lterm::is_msg_var(t))
+            .map(tamarin_term::lterm::is_msg_var)
             .unwrap_or(false);
         // HS-faithful FUnion special branch (Goals.hs:348-364).  When the
         // chain conc's KD term is a literal multiset `Union(t1,...,tn)`,
@@ -5766,7 +5663,7 @@ impl<'ctx> Reduction<'ctx> {
                 // decrement the destructor's budget by 1.  This is the
                 // chain-extension loop-breaker: the budget reaches 1 after
                 // N consecutive same-name extensions, at which point
-                // `forbiddenEdge` (Goals.hs:399-400) mzero's the branch.
+                // `forbiddenEdge` (Goals.hs) mzero's the branch.
                 //
                 // Previously Rust didn't decrement, so the destructor's
                 // budget stayed at its initial value forever — the
@@ -5929,7 +5826,7 @@ impl<'ctx> Reduction<'ctx> {
                 }
                 // HS-faithful: when `insertEdges chain_extend` produces
                 // multiple unifier arms via `solveTermEqs SplitNow ->
-                // disjunctionOfList` (Reduction.hs:888-897), HS's
+                // disjunctionOfList` (Reduction.hs), HS's
                 // `disjunctionOfList arms` fans out IN the surrounding
                 // Disj monad — `extendAndMark` (Goals.hs:403-407) then
                 // completes the markGoalAsSolved / insertChain steps
@@ -5981,7 +5878,7 @@ impl<'ctx> Reduction<'ctx> {
                     // ConcIdx 0), p) is later dispatched by solveGoal, HS
                     // reads sNodes which still holds ru's raw (pre-subst)
                     // conclusion fact — e.g. KD(~mw:Fresh) or KD(x:Msg) —
-                    // and HS's `contradictoryIf (isMsgVar m)` (Goals.hs:367)
+                    // and HS's `contradictoryIf (isMsgVar m)` (Goals.hs)
                     // fires mzero on the latter.
                     //
                     // The freshly-added prem-0 goal now has an incoming
@@ -6560,7 +6457,7 @@ mod tests {
     /// already has the matching action, `solve_action_goal` emits
     /// `GoalCases::LinearNamed(rule_case_name)` instead of bare
     /// `Linear` — mirrors HS `solveAction`'s `Just ru -> ... return ru`
-    /// arm (Goals.hs:287-290) whose surrounding `showRuleCaseName <$>`
+    /// arm (Goals.hs) whose surrounding `showRuleCaseName <$>`
     /// (Goals.hs:257) unconditionally emits the rule's case name.
     /// The test was originally written for the pre-`90af50b7` bare-Linear
     /// behaviour; we update the assertion to recognise `LinearNamed`.
@@ -6997,7 +6894,7 @@ mod tests {
     ///     `solved_formulas` untouched.
     ///   - `insert_formula_inner(_, mark=true)` (the top-level
     ///     `insert_formula` entrypoint) must push the formula.
-    /// Both calls produce the same decomposition (`#i = #j ∨ #j < #i`).
+    ///     Both calls produce the same decomposition (`#i = #j ∨ #j < #i`).
     #[test]
     fn insert_formula_negated_less_mark_false_does_not_push_solved() {
         let ctx = match ctx() { Some(c) => c, None => return };

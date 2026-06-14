@@ -4,8 +4,8 @@
 //! Haskell version probes ~12 conditions. Most are pure structural
 //! checks (cycles, false formulas, fact incompatibilities); a few
 //! consult signature-aware helpers (`nf_via_haskell`,
-//! `irreducible_fun_syms`, `enableDH`).  ForbiddenBP remains
-//! unported (small corpus impact); everything else has a faithful
+//! `irreducible_fun_syms`, `enableDH`).  ForbiddenBP is ported too
+//! (gated on `enableBP` at the caller); everything has a faithful
 //! port below.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -854,11 +854,10 @@ fn has_forbidden_exp(sys: &System) -> bool {
                 Term::Lit(Lit::Var(v)) => {
                     if v.sort == LSort::Fresh { ok = false; }
                 }
-                Term::Lit(Lit::Con(c)) => {
-                    if sort_of_name(c) == LSort::Fresh {
+                Term::Lit(Lit::Con(c))
+                    if sort_of_name(c) == LSort::Fresh => {
                         ok = false;
                     }
-                }
                 _ => {}
             }
         };
@@ -876,7 +875,7 @@ fn has_forbidden_exp(sys: &System) -> bool {
     // DirTag::Up = KU (constructible), DirTag::Dn = KD (destruction).
     #[derive(Copy, Clone, PartialEq, Eq)]
     enum DirTag { Up, Dn }
-    fn k_fact_view<'a>(fa: &'a crate::fact::LNFact) -> Option<(DirTag, &'a LNTerm)> {
+    fn k_fact_view(fa: &crate::fact::LNFact) -> Option<(DirTag, &LNTerm)> {
         if fa.terms.len() != 1 { return None; }
         match fa.tag {
             FactTag::Ku => Some((DirTag::Up, &fa.terms[0])),
@@ -967,8 +966,7 @@ fn has_forbidden_exp(sys: &System) -> bool {
         let forbidden = if let Some((g, c)) = view_exp(conc_term) {
             // (1) conc = exp(g, c): g simple + all msg vars known earlier
             //     + niFactors c \\ niFactors b == []
-            if !is_simple_term(g) { false }
-            else if !all_msg_vars_known_earlier(g) { false }
+            if !is_simple_term(g) || !all_msg_vars_known_earlier(g) { false }
             else {
                 let nfc = ni_factors(c);
                 let nfb = ni_factors(b);
@@ -1231,8 +1229,8 @@ fn is_forbidden_d_emap_order(sys: &System,
 /// `kFactView` (BP scope): returns (DirTag, term) for KU / KD facts.
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum BpDirTag { Up, Dn }
-fn bp_k_fact_view<'a>(fa: &'a crate::fact::LNFact)
-    -> Option<(BpDirTag, &'a tamarin_term::lterm::LNTerm)>
+fn bp_k_fact_view(fa: &crate::fact::LNFact)
+    -> Option<(BpDirTag, &tamarin_term::lterm::LNTerm)>
 {
     use crate::fact::FactTag;
     if fa.terms.len() != 1 { return None; }
@@ -1347,7 +1345,7 @@ fn non_injective_fact_instances(
     };
 
     for e in &sys.edges {
-        let (i, conc_idx) = (e.src.0.clone(), e.src.1.clone());
+        let (i, conc_idx) = (e.src.0.clone(), e.src.1);
         let k = e.tgt.0.clone();
         // Look up the conclusion fact at (i, conc_idx).
         let i_rule = match lookup_node(&i) { Some(r) => r, None => continue };

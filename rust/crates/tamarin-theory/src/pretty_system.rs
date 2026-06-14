@@ -47,9 +47,10 @@ pub fn pretty_non_graph_system(sys: &System) -> String {
 }
 
 /// Full system rendering — emits the graph-bearing sections
-/// (`nodes`/`actions`/`edges`/`less`) plus everything in
+/// (`nodes`/`edges`/`less`) plus everything in
 /// `pretty_non_graph_system`.  Mirrors Haskell's `prettySystem`
-/// (Constraints.hs around line 277) up to the omitted diff sections.
+/// (System.hs) except that the `actions` section
+/// (`fsepList ppActionAtom $ unsolvedActionAtoms se`) is omitted.
 #[allow(dead_code)]
 pub fn pretty_system(sys: &System) -> String {
     let mut out = String::new();

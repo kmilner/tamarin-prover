@@ -20,7 +20,7 @@ pub fn should_trace(key: &str) -> bool {
 pub fn etrace_section_ln(key: &str, title: &str) {
     if !should_trace(key) { return; }
     let bar_len = 80usize.saturating_sub(5 + title.chars().count());
-    let bar: String = std::iter::repeat('=').take(bar_len).collect();
+    let bar: String = "=".repeat(bar_len);
     eprintln!("=== {} {}", title, bar);
 }
 

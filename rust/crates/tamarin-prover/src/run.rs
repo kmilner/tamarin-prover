@@ -250,7 +250,7 @@ fn run_variants(args: &Args) -> Result<i32, RunError> {
                 FactTag::Term => "Term".into(),
             };
             let args: Vec<String> = f.terms.iter()
-                .map(|t| tamarin_term::pretty::pretty_lnterm(t))
+                .map(tamarin_term::pretty::pretty_lnterm)
                 .collect();
             format!("{}{}({})", prefix, name, args.join(", "))
         };
@@ -385,13 +385,13 @@ fn guess_frontend_dist(data_dir: &std::path::Path) -> Option<std::path::PathBuf>
 fn run_batch(args: &Args) -> Result<i32, RunError> {
     // HS-faithful internal parallelism via rayon.  Mirrors the four
     // `using parList`/`parTraversable`/`parMap` sites HS uses (see
-    // `lib/theory/src/Prover.hs:102,195`, `Theory/Constraint/Solver/Sources.hs:471`,
-    // `lib/theory/src/TheoryObject.hs:744,752`).  Default: cap at 4
-    // workers — RS's per-thread Maude IPC mutex limits speedup, and
-    // larger pools have caused OOM in corpus sweeps (see MEMORY.md
-    // discipline note).  `--processors=1` falls back to a 1-thread
-    // pool, guaranteeing byte-identical output to the pre-parallel
-    // sequential path.
+    // `lib/theory/src/Prover.hs:102,195`, `Theory/Constraint/Solver/Sources.hs`,
+    // `lib/theory/src/TheoryObject.hs:744,752`).  Default: full machine
+    // parallelism (`available_parallelism()`, uncapped — `MaudePool`
+    // removed the Maude IPC mutex contention that previously made larger
+    // pools unproductive; memory is budgeted via `--maude-processes`).
+    // `--processors=1` falls back to a 1-thread pool, guaranteeing
+    // byte-identical output to the pre-parallel sequential path.
     init_rayon_pool(args);
     if args.diff {
         return Err(RunError(
@@ -1216,7 +1216,7 @@ fn populate_rule_variants(elaborated: &mut tamarin_theory::theory::Theory,
             let result = if let Some(pool) = pool {
                 let pooled = pool.acquire();
                 tamarin_theory::tools::rule_variants::abstract_rule_and_variants(
-                    &*pooled, &opr.rule)
+                    &pooled, &opr.rule)
             } else {
                 tamarin_theory::tools::rule_variants::abstract_rule_and_variants(
                     maude, &opr.rule)
@@ -1230,7 +1230,7 @@ fn populate_rule_variants(elaborated: &mut tamarin_theory::theory::Theory,
     // Sequential writeback in source order — matches HS's
     // `parList rdeepseq` semantics (parallel evaluation, sequential
     // list materialisation).
-    for (item, out) in elaborated.items.iter_mut().zip(outs.into_iter()) {
+    for (item, out) in elaborated.items.iter_mut().zip(outs) {
         let TheoryItem::Rule(opr) = item else { continue };
         if let Some((abstr, substs)) = out {
             opr.abstracted_rule = Some(abstr);
@@ -1439,14 +1439,14 @@ mod tests {
         // without ever opening a socket.
         let a = parse(&["interactive", "--interface=not-an-ip"]);
         let r = run(&a);
-        assert!(matches!(r, Err(_)), "expected interface parse error");
+        assert!(r.is_err(), "expected interface parse error");
     }
 
     #[test]
     fn no_input_files_errors() {
         let a = parse(&[]);
         let r = run(&a);
-        assert!(matches!(r, Err(_)));
+        assert!(r.is_err());
     }
 
     #[test]

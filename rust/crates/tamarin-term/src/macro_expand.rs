@@ -50,7 +50,7 @@ where
                     .params
                     .iter()
                     .cloned()
-                    .zip(processed.into_iter())
+                    .zip(processed)
                     .collect::<Vec<_>>();
                 let s = Subst::from_list(pairs);
                 let expanded = apply_vterm(&s, m.body.clone());
@@ -67,6 +67,17 @@ fn find_matching_macro<'a, C, V>(
     macros: &'a [Macro<C, V>],
 ) -> Option<&'a Macro<C, V>> {
     macros.iter().find(|m| &macro_to_fun_sym(m) == fsym)
+}
+
+// Helper for tests: extract the inner NoEqSym out of a FunSym we know is NoEq.
+#[cfg(test)]
+impl FunSym {
+    fn into_no_eq(self) -> NoEqSym {
+        match self {
+            FunSym::NoEq(s) => s,
+            _ => panic!("not a NoEq symbol"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -109,16 +120,5 @@ mod tests {
 
         let expanded = apply_macros(std::slice::from_ref(&m), invoke);
         assert_eq!(expanded, pair(msg_var("b", 0), msg_var("a", 0)));
-    }
-}
-
-// Helper for tests: extract the inner NoEqSym out of a FunSym we know is NoEq.
-#[cfg(test)]
-impl FunSym {
-    fn into_no_eq(self) -> NoEqSym {
-        match self {
-            FunSym::NoEq(s) => s,
-            _ => panic!("not a NoEq symbol"),
-        }
     }
 }

@@ -619,7 +619,7 @@ fn fill_nb(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
             let y_first = loop {
                 match iter.next() {
                     None => return Doc::Empty,
-                    Some(d) if matches!(d, Doc::Empty) => continue,
+                    Some(Doc::Empty) => continue,
                     Some(d) => break d,
                 }
             };

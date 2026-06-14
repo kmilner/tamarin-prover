@@ -2,8 +2,12 @@
 //! `lib/term/src/Term/Builtin/`.
 //!
 //! Predefined function symbols, smart constructors, and rewrite-rule sets
-//! for the prover's built-in equational theories (DH, BP, XOR, multiset,
-//! pair, encryption, signatures, hashing, location reports).
+//! for the prover's built-in equational theories. Function symbols and
+//! signatures cover DH, BP, XOR, multiset, pair, encryption, signatures,
+//! hashing, and location reports; rewrite-rule sets are ported for DH, BP,
+//! XOR, multiset, pair, encryption, and signatures (`locationReportRules`,
+//! `pairDestRules`, `symEncDestRules`, `asymEncDestRules`, `fstDestRule`,
+//! and `sndDestRule` from `Rules.hs` are not yet ported).
 
 use std::collections::BTreeSet;
 

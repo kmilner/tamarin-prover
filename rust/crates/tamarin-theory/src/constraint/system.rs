@@ -366,8 +366,7 @@ impl System {
             }
         }
         if !self.goals.iter().any(|(existing, _)| existing == &g) {
-            let mut st = GoalStatus::default();
-            st.nr = age;
+            let st = GoalStatus { nr: age, ..Default::default() };
             self.bump_cache_goal(&g);
             self.goals_mut().push((g, st));
         }
@@ -441,9 +440,7 @@ impl System {
             // existing one is always smaller, so leave it unchanged.
             return;
         }
-        let mut st = GoalStatus::default();
-        st.looping = looping;
-        st.nr = age;
+        let st = GoalStatus { looping, nr: age, ..Default::default() };
         self.bump_cache_goal(&g);
         self.goals_mut().push((g, st));
     }
@@ -500,7 +497,7 @@ impl System {
                     .and_then(|p| p.terms.first())
                     .map(|t| format!("{:?}", t).chars().take(120).collect::<String>())
                     .unwrap_or_default();
-                let prem0 = rule.premises.get(0)
+                let prem0 = rule.premises.first()
                     .and_then(|p| p.terms.first())
                     .map(|t| format!("{:?}", t).chars().take(80).collect::<String>())
                     .unwrap_or_default();
@@ -548,13 +545,12 @@ impl System {
     }
 
     /// Add a `<` atom if not already present (equality ignores reason).
-    /// Add a less-atom. Self-loops (a < a) are degenerate — they
-    /// produce immediate contradictions via the cyclic check.  In
-    /// most cases such a self-loop arises from subst_system collapsing
-    /// two distinct nodes to the same id AFTER a less-atom between
-    /// them was already recorded; the resulting `a < a` is a true
-    /// contradiction.  We still add it (so contradictions catches
-    /// it) but log under TAM_DBG_SELF_LOOP for diagnosis.
+    /// Self-loops (a < a) are degenerate — they produce immediate
+    /// contradictions via the cyclic check.  In most cases such a
+    /// self-loop arises from subst_system collapsing two distinct
+    /// nodes to the same id AFTER a less-atom between them was already
+    /// recorded; the resulting `a < a` is a true contradiction.  We
+    /// still add it so the contradiction check catches it.
     pub fn add_less(&mut self, l: LessAtom) {
         if !self.less_atoms.iter().any(|x| x == &l) {
             self.bump_cache_lvar(&l.smaller);

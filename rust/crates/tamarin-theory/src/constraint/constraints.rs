@@ -2,10 +2,13 @@
 //! graph-constraint primitives (`Edge`, `LessAtom`), goal types
 //! (`Goal`), and small helpers.
 //!
-//! Lacks the full `Apply LNSubst` / `HasFrees` instance machinery
-//! because we don't yet have the typed substitution layer ported. The
-//! data shapes match Haskell so that, when we port the substitution
-//! infrastructure, slotting it in is mechanical.
+//! These types do not carry generic `Apply LNSubst` / `HasFrees`
+//! instances. The substitution layer is ported (`apply_vterm` in
+//! `tamarin_term::subst`, the `HasFrees` trait in
+//! `tamarin_term::lterm`); the solver applies substitutions to these
+//! constraints directly in `constraint::solver::reduction`
+//! (`subst_system` / `subst_system_once`, mirroring Haskell's
+//! `substSystem`).
 
 use tamarin_term::lterm::{LNTerm, LVar};
 

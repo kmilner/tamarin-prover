@@ -68,11 +68,10 @@ pub fn cyclic<T: Ord + Clone>(rel: &Relation<T>) -> bool {
     let mut visited = BTreeSet::new();
     for (src, _) in rel {
         let mut parents = BTreeSet::new();
-        if !visited.contains(src) {
-            if find_loop(rel, &mut parents, &mut visited, src.clone()) {
+        if !visited.contains(src)
+            && find_loop(rel, &mut parents, &mut visited, src.clone()) {
                 return true;
             }
-        }
     }
     false
 }

@@ -108,10 +108,10 @@ pub struct ProofContext {
     /// (per-lemma `[heuristic=..]` overrides the theory-level directive,
     /// matching `apDefaultHeuristic <|> pcHeuristic`).
     /// Round-robin scheduling: depth d → `rankings[d % n]`
-    /// (ProofMethod.hs:802-811).
+    /// (ProofMethod.hs).
     pub heuristic: Option<Vec<crate::constraint::solver::goals::GoalRanking>>,
     /// The name of the lemma being proved.  Passed as `argv[1]` to
-    /// the oracle script (HS `L.get pcLemmaName ctxt`, ProofMethod.hs:829).
+    /// the oracle script (HS `L.get pcLemmaName ctxt`, ProofMethod.hs).
     pub lemma_name: String,
     /// Path to the theory file being proved.  Used to resolve the
     /// oracle script path as `takeDirectory theory_file </> oracle_rel_path`
@@ -252,7 +252,7 @@ impl ProofContext {
         // HS verifies) as separate missing-HS-behaviour bugs rather
         // than reverting to the trace-divergent chain-fold path.
         let raw: Vec<crate::constraint::solver::sources::Source> =
-            self.full_sources.iter().cloned().collect();
+            self.full_sources.to_vec();
         let saturated = crate::constraint::solver::sources::saturate_sources_with_simp_public(
             raw, self.saturation_limit, self);
         // HS-faithful: apply `refineWithSourceAsms` AFTER saturate.
@@ -280,17 +280,16 @@ impl ProofContext {
         // join key.
         for orig in &self.full_sources {
             let sat = refined.iter().find(|s| s.goal == orig.goal);
-            match sat {
-                Some(s) => orig.cases_set(s.cases_or_empty()),
-                // No matching saturated source — saturate dropped it
-                // entirely (all branches contradicted).  HS's
-                // `saturateSources` would leave the source with the
-                // initial cases in this case (its `solver` returns
-                // `(False, [])` on every iter, so `cdCases` stays
-                // unchanged from `initialSource`'s output).  Mirror by
-                // leaving the cell as-set by `initial_source_cases`
-                // earlier in `ensure_saturated` — no overwrite.
-                None => {}
+            // No matching saturated source — saturate dropped it
+            // entirely (all branches contradicted).  HS's
+            // `saturateSources` would leave the source with the
+            // initial cases in this case (its `solver` returns
+            // `(False, [])` on every iter, so `cdCases` stays
+            // unchanged from `initialSource`'s output).  Mirror by
+            // leaving the cell as-set by `initial_source_cases`
+            // earlier in `ensure_saturated` — no overwrite.
+            if let Some(s) = sat {
+                orig.cases_set(s.cases_or_empty());
             }
         }
         if std::env::var("TAM_DBG_SAT_FINAL").is_ok() {
@@ -428,10 +427,10 @@ impl ProofContext {
                 if let crate::rule::IntrRuleACInfo::DestrRule(n, b, st, c) = &r.info {
                     use tamarin_term::pretty::pretty_lnterm;
                     let prems_s: Vec<String> = r.premises.iter().flat_map(|f|
-                        f.terms.iter().map(|t| pretty_lnterm(t))
+                        f.terms.iter().map(pretty_lnterm)
                     ).collect();
                     let concs_s: Vec<String> = r.conclusions.iter().flat_map(|f|
-                        f.terms.iter().map(|t| pretty_lnterm(t))
+                        f.terms.iter().map(pretty_lnterm)
                     ).collect();
                     eprintln!("  destr: {} b={} st={} const={}\n    prems={:?}\n    concs={:?}",
                         String::from_utf8_lossy(n), b, st, c, prems_s, concs_s);
@@ -593,8 +592,8 @@ impl ProofContext {
             r.conclusions.iter()
                 .chain(r.premises.iter())
                 .chain(r.actions.iter())
-                .any(|f| f.terms.iter().any(|t| term_has_reducible(t)))
-                || r.new_vars.iter().any(|t| term_has_reducible(t))
+                .any(|f| f.terms.iter().any(&term_has_reducible))
+                || r.new_vars.iter().any(&term_has_reducible)
         };
         // Rule-variant plumbing: enabled by default to match Haskell's
         // `variantsProtoRule` behaviour. Broadens search for protocols
@@ -887,12 +886,12 @@ impl ProofContext {
 /// `useAutoLoopBreakersAC`:
 ///
 /// 1. Build a dataflow over-approximation:
-///        (ruFrom, (ruTo, premIdx))
+///    `(ruFrom, (ruTo, premIdx))`
 ///    where some conclusion of `ruFrom` has the same fact tag as the
 ///    `premIdx`-th premise of `ruTo`.
 /// 2. Lift to the premise-solving relation by pairing every `(ruTo,
 ///    premIdx)` with every premise of `ruFrom`:
-///        ((ruTo, premIdx), (ruFrom, fromPrem))
+///    `((ruTo, premIdx), (ruFrom, fromPrem))`
 /// 3. `dfs_loop_breakers` returns the set of `(rule_name, prem_idx)`
 ///    targets to mark — the premises whose goals should be tagged
 ///    loop-breaker.

@@ -11,7 +11,6 @@
 use std::collections::BTreeMap;
 
 use tamarin_term::lterm::LVar;
-use tamarin_utils::pretty::Doc;
 
 use crate::fact::fact_tag_name;
 use crate::predicate::Predicate;
@@ -29,13 +28,13 @@ pub type OpenRestriction = ProtoRestriction<tamarin_parser::ast::Formula>;
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpenProtoRule {
     pub rule: ProtoRuleE,
-    /// Pre-applied variant rules (legacy path) — each entry is a
-    /// fully-narrowed `ProtoRuleAC` with its variant subst applied.
-    /// `rule_insts_with` historically expanded these into separate
-    /// `RuleACInst`s, producing N variant cases per rule at the
-    /// action/premise-goal level.  Now superseded by `variant_substs`
-    /// for the SplitG-based path; kept temporarily for backward
-    /// compat until callers fully migrate.
+    /// Pre-applied variant rules — each entry is a fully-narrowed
+    /// `ProtoRuleAC` with its variant subst applied.  Populated by
+    /// `ProofContext::new` (context.rs) for rules with reducible-headed
+    /// sub-terms and still read by live code: `macro_expand` rewrites
+    /// each variant's terms, `intruder_variants` asserts intruder rules
+    /// carry none, and `context.rs` short-circuits when already filled.
+    /// The SplitG-based solving path uses `variant_substs` instead.
     pub variants: Vec<ProtoRuleAC>,
     /// Variant substitutions as a disjunction (`RuleACConstrs` in
     /// Haskell — `Disj LNSubstVFresh`).  The canonical rule (`rule`)
@@ -351,7 +350,11 @@ impl<R, P, S> Theory<R, P, S> {
     }
 
     /// Add a rule, returning Err if a rule with the same name already
-    /// exists. Mirrors Haskell's `addOpenProtoRule`.
+    /// exists.  Simplified convenience helper, not a faithful mirror of
+    /// Haskell's `addOpenProtoRule` (OpenTheory.hs): it rejects *any*
+    /// name collision (HS lets you re-add the identical rule via its
+    /// `ru ==` allowance) and does not check the rule's own AC-variant
+    /// name uniqueness (HS `allRuleNamesAreDifferent`).
     pub fn add_rule_unique(&mut self, rule: R, name: impl Fn(&R) -> &str) -> Result<&mut Self, &'static str> {
         let new_name = name(&rule).to_string();
         if self.rules().any(|r| name(r) == new_name) {
@@ -396,17 +399,6 @@ impl<R, R2, P, P2> DiffTheory<R, R2, P, P2> {
             is_sapic: false,
         }
     }
-}
-
-// =============================================================================
-// Pretty-printing stubs
-// =============================================================================
-
-/// Pretty-print a theory's name. Full pretty printer comes once we
-/// port `Theory.Text.Pretty` (Hughes-PJ-style output that matches
-/// `tamarin-prover --parse-only`).
-impl<R, P, S> Theory<R, P, S> {
-    pub fn pp_name(&self) -> Doc { Doc::text(format!("theory {}", self.name)) }
 }
 
 #[cfg(test)]

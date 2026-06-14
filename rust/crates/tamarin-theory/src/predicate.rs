@@ -52,7 +52,8 @@ pub fn smaller_fact<T>(t1: T, t2: T) -> Fact<T> {
 }
 
 /// `lookupPredicate fa preds`: find the predicate whose fact tag matches
-/// `fa`'s tag. Search includes the built-in predicates list.
+/// `fa`'s tag. Only `preds` is searched; unlike the Haskell original this
+/// does not append the built-in predicates list.
 pub fn lookup_predicate<'a, T: Eq>(
     fa: &Fact<T>,
     preds: &'a [Predicate],

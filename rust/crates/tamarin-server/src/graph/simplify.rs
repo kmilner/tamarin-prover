@@ -179,7 +179,7 @@ fn try_hide_action(v: &NodeId, sys: System) -> Result<System, System> {
     if ku_actions.is_empty() { return Err(sys); }
     // All KU terms must be pair, inverse, pub, or nat — otherwise bail.
     if !ku_actions.iter().all(|(_, fa)| {
-        fa.terms.first().map_or(false, |t| eligible_term(t))
+        fa.terms.first().is_some_and(eligible_term)
     }) {
         return Err(sys);
     }
@@ -399,9 +399,8 @@ fn has_cycle(less: &[LessAtom], nodes: &BTreeSet<NodeId>) -> bool {
     // DFS cycle detection per starting node.
     let mut color: BTreeMap<NodeId, u8> = BTreeMap::new();
     for n in nodes {
-        if color.get(n).copied().unwrap_or(0) == 0 {
-            if dfs_has_cycle(n, &adj, &mut color) { return true; }
-        }
+        if color.get(n).copied().unwrap_or(0) == 0
+            && dfs_has_cycle(n, &adj, &mut color) { return true; }
     }
     false
 }

@@ -125,9 +125,9 @@ impl<'a> Lexer<'a> {
         let save = self.pos;
         if !self.rest().starts_with(s) { return false; }
         // Word-boundary check for keyword-like symbols.
-        if s.chars().last().map_or(false, |c| is_ident_char(c)) {
+        if s.chars().last().is_some_and(is_ident_char) {
             let after = &self.rest()[s.len()..];
-            if after.chars().next().map_or(false, is_ident_char) {
+            if after.chars().next().is_some_and(is_ident_char) {
                 return false;
             }
         }

@@ -1,9 +1,15 @@
-//! Skeleton port of `Theory.Tools.SubtermStore`.
+//! Port of `Theory.Tools.SubtermStore`.
 //!
 //! The subterm store accumulates `t1 << t2` constraints during proof
-//! search, propagating them and detecting contradictions. The full
-//! implementation depends on the AC-unification layer; for now we
-//! expose the core data shape so other modules can refer to it.
+//! search, propagating them and detecting contradictions. This module
+//! holds the store data type plus the pieces the solver calls directly:
+//! constraint accumulation (`add`/`add_neg`), `conjoin` (HS
+//! `conjoinSubtermStores`), the subterm-cycle check `has_subterm_cycle`
+//! (HS `hasSubtermCycle`, the CR-rule S_chain test), and the
+//! `elem_not_below_reducible` predicate (HS `Term.elemNotBelowReducible`).
+//! The simplification passes that depend on AC-unification —
+//! `simpSubtermStore`, `simpSplitNegSt`, and the recursive `splitSubterm`
+//! — are ported in `constraint::solver::simplify` rather than here.
 
 use tamarin_term::function_symbols::{FunSig, FunSym};
 use tamarin_term::lterm::LNTerm;

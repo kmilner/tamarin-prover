@@ -11,11 +11,12 @@ fn main() {
     let parsed = parse_theory(&source, &[]).expect("parse");
     let elaborated = elaborate(&parsed).expect("elaborate");
     let maude = MaudeHandle::start("/home/linuxbrew/.linuxbrew/bin/maude", elaborated.signature.maude_sig.clone()).expect("maude");
-    for r in &elaborated.signature.rules {
-        let n = String::from_utf8_lossy(match &r.info.name {
-            tamarin_theory::rule::ProtoRuleName::Stand(s) => s.as_slice(),
-            _ => &[][..],
-        });
+    for open in elaborated.rules() {
+        let r = &open.rule;
+        let n = match &r.info.name {
+            tamarin_theory::rule::ProtoRuleName::Stand(s) => s.as_str(),
+            _ => "",
+        };
         if n == *rule_name {
             println!("rule {}: pre", n);
             for f in &r.premises { println!("  prem: {:?}", f); }

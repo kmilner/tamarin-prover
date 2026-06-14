@@ -18,11 +18,12 @@
 //! where each `sigma_ij` is a *fresh-range* substitution (its
 //! variables are existentially quantified).
 //!
-//! This Rust port currently exposes the data structure and
-//! Maude-free operations: empty, false-detection, adding a
-//! disjunction, performing a split, and listing splits. Operations
-//! that need AC unification — `addEqs`, `apply_eq_store`, `simp` —
-//! will land alongside the AC-unification port.
+//! This Rust port exposes both the data structure / Maude-free
+//! operations (empty, false-detection, adding a disjunction,
+//! performing a split, listing splits) and the Maude-backed
+//! operations: `add_eqs`, `apply_eq_store`, and the full `simp`
+//! pipeline (`simp`, `simp_with_fresh_avoiding`,
+//! `simp_disjunction_with_maude`).
 
 use std::collections::BTreeSet;
 
@@ -351,7 +352,7 @@ impl EquationStore {
             }
         }
         // H16.6 (Path A): HS-faithful Set ordering of variant substs.
-        // HS's `addDisj` (EquationStore.hs:209) does `addDisj eqStore
+        // HS's `addDisj` (EquationStore.hs) does `addDisj eqStore
         // (S.fromList substs)` — substs go into a Set, sorted by Ord
         // LNSubstVFresh.  Without sorting here, RS's `Vec`-based disj
         // preserves insertion order from `maude.variants()`, putting
@@ -548,7 +549,7 @@ impl EquationStore {
         // [emptySubstVFresh])` followed by `flattenUnif` which produces
         // a single SubstVFresh equal to the local subst.
         //
-        // HS-faithful (EquationStore.hs:305):
+        // HS-faithful (EquationStore.hs `addEqs`):
         //     (subst, [substFresh]) | substFresh == emptySubstVFresh ->
         //         return (applyEqStoreAt "addEqs.single-unifier" hnd subst eqStore, Nothing)
         // — applyEqStoreAt is called UNCONDITIONALLY, including when subst
@@ -611,22 +612,23 @@ impl EquationStore {
             *self = self.clone().set_false();
             return Ok(None);
         }
-        // HS-faithful (EquationStore.hs:300-308): the compose-without-disj
+        // HS-faithful (EquationStore.hs `addEqs`): the compose-without-disj
         // arm fires ONLY when the unifier list is exactly
         // `[emptySubstVFresh]`:
         //     (subst, [substFresh]) | substFresh == emptySubstVFresh ->
         //         return (applyEqStoreAt "addEqs.single-unifier" hnd subst
         //                                eqStore, Nothing)
         // A SINGLE NON-EMPTY Maude unifier hits HS's THIRD arm
-        // (EquationStore.hs:306-308):
+        // (EquationStore.hs `addEqs`):
         //     (subst, substs) -> addDisj (applyEqStoreAt ... subst eqStore)
         //                                (S.fromList substs)  -- Just sid
         // — it's stored as a SINGLETON VFresh disjunction (with split id),
         // NOT eagerly composed.  Faithful consequences vs the old eager
         // compose: (a) the fold happens via `simp`'s `simpSingleton`
-        // (`freshToFree` witness naming, EquationStore.hs:639-645) plus a
-        // SECOND `applyEqStoreAt "foreachDisj:simpSingleton"` round over
-        // the remaining disjs (EquationStore.hs:791-811) — two applyBound
+        // (`freshToFree` witness naming, EquationStore.hs `simpSingleton`)
+        // plus a SECOND `applyEqStoreAt "foreachDisj:simpSingleton"` round
+        // over the remaining disjs (EquationStore.hs `foreachDisj`) — two
+        // applyBound
         // rounds with the local subst and the Maude unifier SEPARATELY,
         // not one round with their composition; (b) SplitLater callers get
         // a SplitG goal + a live singleton disj (HS Reduction.hs:942-944);
@@ -699,14 +701,14 @@ impl EquationStore {
         }
 
         // Multiple unifiers — or a SINGLE NON-EMPTY unifier (HS's third
-        // arm, EquationStore.hs:306-308; see comment above) — record as
+        // arm, EquationStore.hs `addEqs`; see comment above) — record as
         // a fresh-range disjunction.
         // Haskell composes each Maude unifier with the local subst
         // before storing as a disjunction (flattenUnif semantics).
         // The local subst becomes part of the free subst; the Maude
         // unifiers represent the disjunction over AC choices.
         //
-        // HS-faithful (EquationStore.hs:307):
+        // HS-faithful (EquationStore.hs `addEqs`):
         //     let (eqStore', sid) = addDisj (applyEqStoreAt "addEqs.multi-unifier"
         //                                                   hnd subst eqStore)
         //                                   (S.fromList substs)
@@ -747,7 +749,7 @@ impl EquationStore {
         }
         let mut substs: Vec<LNSubstVFresh> = Vec::with_capacity(unifiers.len());
         for raw in unifiers {
-            let s = LNSubstVFresh::from_list(raw.into_iter());
+            let s = LNSubstVFresh::from_list(raw);
             dbg_register_subst_origin("addEqs.disj", &s);
             substs.push(s);
         }
@@ -814,20 +816,21 @@ impl EquationStore {
     /// Mirrors `simp` from Haskell: a fixed-point loop running each
     /// simp1 pass until no further changes. Returns the new store.
     ///
-    /// The Maude-using passes (`simp_abstract_*` and friends that need
-    /// fresh-variable generation) are not yet wired in. The currently-
-    /// implemented passes are:
+    /// The Maude-using passes (`simp_singleton`, `simp_abstract_*`
+    /// that need fresh-variable generation) are not run here — use
+    /// `simp_with_fresh_avoiding` for the full pipeline. The passes
+    /// this variant runs, in execution order, are:
     ///
-    /// - `simp_empty_disj`
-    /// - `simp_remove_renamings`
     /// - `simp_minimize` (with a caller-supplied contradiction predicate)
-    /// - `simp_abstract_name`
+    /// - `simp_remove_renamings`
+    /// - `simp_empty_disj`
     /// - `simp_identify`
+    /// - `simp_abstract_name`
     pub fn simp<F: Fn(&LNSubst, &LNSubstVFresh) -> bool>(
         mut self,
         is_contr: F,
     ) -> Self {
-        // HS-faithful pass order (EquationStore.hs:518-541 simp1).  This
+        // HS-faithful pass order (EquationStore.hs `simp1`).  This
         // variant lacks a fresh-idx allocator + Maude handle, so it skips
         // the passes that need them: simpSingleton, simpAbstractSortedVar,
         // simpAbstractFun.  Callers that need the full simp pipeline
@@ -943,7 +946,7 @@ impl EquationStore {
     /// HS-faithful variant of `simp_abstract_name` that takes a Maude
     /// handle and calls `apply_eq_store` on the factored subst to
     /// re-unify remaining disjs (mirrors HS's `foreachDisj` at
-    /// EquationStore.hs:696).
+    /// EquationStore.hs).
     pub fn simp_abstract_name_with_maude(
         &mut self,
         maude: Option<&tamarin_term::maude_proc::MaudeHandle>,
@@ -975,7 +978,7 @@ impl EquationStore {
         // Compose `{v → t}` into the free substitution and drop `v`
         // from every subst in disjunction `idx`.
         let factor = LNSubst::from_list(vec![(v.clone(), t)]);
-        // HS-faithful order (`foreachDisjAt`, EquationStore.hs:812-814):
+        // HS-faithful order (`foreachDisj`, EquationStore.hs):
         // REPLACE the disj FIRST, THEN applyEqStore.  (For simpAbstractName
         // the factor's range is a constant, so order is behaviourally
         // neutral, but we keep the HS order for consistency.)
@@ -1118,7 +1121,7 @@ impl EquationStore {
         let _id_guard = crate::constraint::solver::trace::OpLabelGuard::force(
             &format!("simpIdentify@{}",
                 crate::constraint::solver::trace::current_op_label()));
-        // HS-faithful order (`foreachDisjAt`): REPLACE the disj (remove
+        // HS-faithful order (`foreachDisj`): REPLACE the disj (remove
         // `keep` from every subst) FIRST, THEN apply_eq_store the factor.
         // Same rationale as simpAbstractFun (avoids splitting shared range
         // witnesses by re-unifying the un-updated disj).
@@ -1189,7 +1192,7 @@ impl EquationStore {
     /// HS-faithful variant of `simp_abstract_sorted_var` that takes a
     /// Maude handle and calls `apply_eq_store` on the factored subst
     /// to re-unify remaining disjs (mirrors HS's `foreachDisj` at
-    /// EquationStore.hs:696).
+    /// EquationStore.hs).
     pub fn simp_abstract_sorted_var_with_maude<F: FnMut(u64) -> u64>(
         &mut self,
         alloc: &mut F,
@@ -1241,7 +1244,7 @@ impl EquationStore {
         let factor = LNSubst::from_list(vec![
             (v.clone(), Term::Lit(Lit::Var(fv.clone()))),
         ]);
-        // HS-faithful: foreachDisjAt (EquationStore.hs:812-814) REPLACES
+        // HS-faithful: foreachDisj (EquationStore.hs) REPLACES
         // the disj with the abstracted substs FIRST, THEN calls
         // `applyEqStore hnd msubst`.  Apply the abstraction to the disj
         // before re-unifying (matching the simpAbstractFun fix — see
@@ -1285,7 +1288,7 @@ impl EquationStore {
     /// "left/right split" is meaningful): factor `{v → o(x1, x2)}` with
     /// `x2 → o(rest)` if the original had >2 args.
     ///
-    /// Mirrors HS `simpAbstractFun` (EquationStore.hs:584-624).
+    /// Mirrors HS `simpAbstractFun` (EquationStore.hs).
     pub fn simp_abstract_fun<F: FnMut(u64) -> u64>(
         &mut self,
         alloc: &mut F,
@@ -1296,7 +1299,7 @@ impl EquationStore {
     /// HS-faithful variant of `simp_abstract_fun` that takes a Maude
     /// handle and calls `apply_eq_store` on the factored subst to
     /// re-unify remaining disjs (mirrors HS's `foreachDisj` at
-    /// EquationStore.hs:696).
+    /// EquationStore.hs).
     ///
     /// H17.7 (2026-05-28): opt-out via `TAM_RS_DISABLE_SIMP_ABSTRACT_FUN=1`
     /// for diagnostic comparison.  Lifting common operators may introduce
@@ -1386,7 +1389,7 @@ impl EquationStore {
             let _abs_fun_guard = crate::constraint::solver::trace::OpLabelGuard::force(
                 &format!("simpAbstractFun@{}",
                     crate::constraint::solver::trace::current_op_label()));
-            // HS-faithful order (`foreachDisjAt`, EquationStore.hs:812-814):
+            // HS-faithful order (`foreachDisj`, EquationStore.hs):
             // REPLACE the disjunction with the abstracted substs FIRST,
             // THEN run `applyEqStore` with the factored free subst.  RS
             // previously ran apply_eq_store BEFORE replacing the disj, so
@@ -1440,7 +1443,7 @@ impl EquationStore {
                     Term::Lit(Lit::Var(fv2.clone())),
                 ].into()),
             )]);
-            // HS-faithful order (`foreachDisjAt`): replace the disj FIRST,
+            // HS-faithful order (`foreachDisj`): replace the disj FIRST,
             // then apply_eq_store the factor.  See the non-AC branch above
             // for the rationale (resolved1 linkage break).
             // For each subst with args = [a1, a2, ...]:
@@ -1530,7 +1533,7 @@ impl EquationStore {
                 eprintln!("[SIMP_DISJ_IN] sizes={:?}", sizes);
             }
         }
-        // HS-faithful pass order (EquationStore.hs:518-541 simp1):
+        // HS-faithful pass order (EquationStore.hs `simp1`):
         //   1. simpMinimize
         //   2. simpRemoveRenamings
         //   3. simpEmptyDisj
@@ -1564,11 +1567,12 @@ impl EquationStore {
             changed |= self.simp_empty_disj();
             // increment 2 (2026-05-29): ALWAYS fold singleton variant
             // disjs into the free subst — this is exactly what HS does.
-            // HS's `simp1` runs `foreachDisjAt "simpSingleton"`
-            // unconditionally on every disj (EquationStore.hs:596), with
+            // HS's `simp1` runs `foreachDisj hnd simpSingleton`
+            // unconditionally on every disj (EquationStore.hs), with
             // NO precompute guard; `simpSingleton [subst0]` folds a
             // singleton disj via `freshToFree` into the free subst
-            // (EquationStore.hs:640-642).  Increment 1's H29 had skipped
+            // (EquationStore.hs `simpSingleton`).  Increment 1's H29 had
+            // skipped
             // this fold during precompute on the premise that HS keeps
             // the variant disj "lazy in cdCases".  That premise was
             // wrong: `cdCases`'s laziness is Haskell *thunk* evaluation
@@ -1656,7 +1660,7 @@ impl EquationStore {
     /// If `maude` is `Some`, after composing the folded factor into the
     /// free subst, also re-unifies any REMAINING disj substs against
     /// the new free subst via `apply_eq_store`.  HS-faithful:
-    /// `foreachDisj` (EquationStore.hs:696) does
+    /// `foreachDisj` (EquationStore.hs) does
     /// `MS.modify (applyEqStore hnd msubst)` after replacing the
     /// disj.  Without this, remaining variants stay un-refined and
     /// `perform_split` enumerates stale shapes.  Pass `None` for the
@@ -1695,7 +1699,7 @@ impl EquationStore {
         //   4. every other disjunct's dom/range (cross-disjunct sharing)
         let mut preserve: BTreeSet<LVar> = external_preserve.clone();
         preserve.extend(self.subst.range()
-            .flat_map(|t| tamarin_term::vterm::vars_vterm(t)));
+            .flat_map(tamarin_term::vterm::vars_vterm));
         preserve.extend(self.subst.dom().cloned());
         for d in &self.conj {
             for s in &d.substs {
@@ -1740,7 +1744,7 @@ impl EquationStore {
                     subst_vf.to_list());
             }
         }
-        let new_subst = subst_vf.fresh_to_free_avoiding(|n| alloc(n), &preserve);
+        let new_subst = subst_vf.fresh_to_free_avoiding(alloc, &preserve);
         if std::env::var("TAM_DBG_FOLD_VARIANT").is_ok() {
             let pairs: Vec<String> = new_subst.to_list().iter()
                 .filter(|(k, _)| k.name.contains("ltkS") || k.name.contains("request"))
@@ -1751,7 +1755,7 @@ impl EquationStore {
                 eprintln!("[fold_variant]  AFTER fresh_to_free: {:?}", pairs);
             }
         }
-        // HS-faithful: foreachDisj at EquationStore.hs:696 calls
+        // HS-faithful: foreachDisj at EquationStore.hs calls
         // `MS.modify (applyEqStore hnd msubst)` after replacing the
         // singleton disj.  applyEqStore composes msubst into eqsSubst
         // AND re-unifies remaining disj substs against the new
@@ -1798,9 +1802,9 @@ impl EquationStore {
         }
     }
 
-    /// HS-faithful `simpDisjunction` (EquationStore.hs:483-497).  HS's
+    /// HS-faithful `simpDisjunction` (EquationStore.hs).  HS's
     /// `simp` runs the FULL `simp1` pipeline including `simpSingleton`
-    /// (the b4 pass at EquationStore.hs:596) — that pass folds a
+    /// (the b4 pass in EquationStore.hs `simp1`) — that pass folds a
     /// singleton-variant disj into the free subst via `freshToFree`.
     ///
     /// `simp_disjunction` (the test-friendly variant above) doesn't have
@@ -1884,7 +1888,7 @@ impl EquationStore {
         // Domain/range disjointness check.
         let dom: BTreeSet<LVar> = asubst.dom().cloned().collect();
         let range_vars: BTreeSet<LVar> = asubst.range()
-            .flat_map(|t| tamarin_term::vterm::vars_vterm(t))
+            .flat_map(tamarin_term::vterm::vars_vterm)
             .collect();
         if dom.intersection(&range_vars).count() > 0 {
             return Err(AddEqsError::Maude(
@@ -1953,7 +1957,7 @@ impl EquationStore {
         use tamarin_term::vterm::Lit;
         let fresh_base = self.fresh_baseline();
         let new_subst_range_vars: BTreeSet<LVar> = new_subst.range()
-            .flat_map(|t| tamarin_term::vterm::vars_vterm(t))
+            .flat_map(tamarin_term::vterm::vars_vterm)
             .collect();
         let mut new_conj: Vec<EqDisj> = Vec::with_capacity(self.conj.len());
         // HS-faithful per-variant fresh-state isolation.  In HS, each
@@ -1981,7 +1985,8 @@ impl EquationStore {
         // `evalFreshAvoiding (rename ...)` which seeds the supply at
         // `succ (max idx in avoidSet)` LOCALLY — bounded by the call's
         // own `avoid_max`, NOT the global session counter (LTerm.hs:647-664,
-        // EquationStore.hs:413-420).  RS previously used Maude's global
+        // EquationStore.hs `applyEqStore`/`applyBound`).  RS previously used
+        // Maude's global
         // counter for these per-variant witness allocations; because
         // `ensure_above` is monotone, the counter advances to the
         // high-water mark of all prior calls and never bounds back down.
@@ -2065,7 +2070,7 @@ impl EquationStore {
                 // shift = freshStart - rhs_min, where freshStart = avoid_max + 1.
                 // Shift may be negative (rhs already above avoid); use i128.
                 //
-                // HS `applyBound` (EquationStore.hs:413-420):
+                // HS `applyBound` (EquationStore.hs `applyEqStore`):
                 //   ran = renameAvoiding (map snd slist) avoidSet
                 // where `renameAvoiding s t = evalFreshAvoiding (rename s) t`
                 // (LTerm.hs:663-664) and `rename` (LTerm.hs:607-614) is a
@@ -2105,7 +2110,7 @@ impl EquationStore {
                 // Build equations.  LHS = `apply new_subst (Var lv)`,
                 // RHS = renamed `t`.
                 let eqs: Vec<Equal<LNTerm>> = bindings.iter()
-                    .zip(renamed_rhs.into_iter())
+                    .zip(renamed_rhs)
                     .map(|((lv, _), t)| {
                         let lv_t = Term::Lit(Lit::Var(lv.clone()));
                         Equal {
@@ -2208,7 +2213,7 @@ impl EquationStore {
                 // its domain to `varsRange(new_subst) ∪ dom(s)` so we
                 // don't leak Maude witnesses.
                 let restrict_set: BTreeSet<LVar> = new_subst.range()
-                    .flat_map(|t| tamarin_term::vterm::vars_vterm(t))
+                    .flat_map(tamarin_term::vterm::vars_vterm)
                     .chain(bindings.iter().map(|(v, _)| v.clone()))
                     .collect();
                 for raw in unifiers {
@@ -2329,7 +2334,7 @@ impl EquationStore {
                         lifted.push((s, Term::Lit(Lit::Var(w))));
                     }
                     // HS-faithful: NO post-Maude normalisation of variant
-                    // range terms.  HS's `applyEqStore` (EquationStore.hs:351-435)
+                    // range terms.  HS's `applyEqStore` (EquationStore.hs)
                     // returns the raw Maude unifier outputs without
                     // calling `normSubstVFresh'` — that normaliser is only
                     // used during VARIANT COMPUTATION for rules
@@ -2601,7 +2606,7 @@ mod tests {
     }
 
     // A distinct subst per `idx`.  `add_disj`/`add_rule_variants` dedup
-    // identical substs (HS-faithful `S.fromList`, EquationStore.hs:209),
+    // identical substs (HS-faithful `S.fromList`, EquationStore.hs),
     // so building a multi-element disjunction from repeated `fresh_subst()`
     // collapses to a single element.  Tests that need a genuine N-element
     // disjunction use distinct substs via this helper.

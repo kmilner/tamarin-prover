@@ -14,9 +14,22 @@
 //! 3. A tag is injective if every rule using it satisfies the
 //!    Fr-fact-or-single-premise condition.
 //!
-//! The Rust port currently exposes the `MonotonicBehaviour` enum and
-//! a `simple_injective_fact_instances` stub. A real implementation
-//! follows once we have macro expansion + the typed rule layer.
+//! `simple_injective_fact_instances` implements this under-approximation
+//! and is used in production: its result is stored in
+//! `ProofContext.injective_fact_insts` (see `context.rs`) and consumed by
+//! the solver (`simplify.rs`, `contradictions.rs`) and by
+//! `pretty_theory.rs` (the looping-facts comment).
+//!
+//! Known divergences from the Haskell `simpleInjectiveFactInstances`:
+//!   - Pair-flattening of arguments (`getPairTerms` / `shapeTerm` /
+//!     `trimmedPairTerms`): we treat each argument position as a single
+//!     behaviour rather than one behaviour per pair-leaf, so the result
+//!     is a flat `Vec<MonotonicBehaviour>` instead of a list-of-lists.
+//!   - The `duplicateFirstTerms` check (a tag with the same first term in
+//!     two premises cannot be injective) is not implemented.
+//!   - The constraint-based `getBehaviour` cases (monotonicity derived
+//!     from rule restrictions) are omitted; not exercised by current
+//!     callers.
 
 use crate::fact::FactTag;
 use crate::rule::ProtoRuleE;

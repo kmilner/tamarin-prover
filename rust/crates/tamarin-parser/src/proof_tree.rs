@@ -582,7 +582,7 @@ impl<'a> GoalParser<'a> {
         self.lx.skip_ws();
         // Fact name: starts with uppercase.
         let name = self.lx.identifier()?;
-        if !name.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+        if !name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
             self.lx.set_pos(save);
             return None;
         }

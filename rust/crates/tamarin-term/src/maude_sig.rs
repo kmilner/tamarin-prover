@@ -25,6 +25,7 @@ use crate::subterm_rule::CtxtStRule;
 use crate::term::Term;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct MaudeSig {
     pub enable_dh: bool,
     pub enable_bp: bool,
@@ -41,25 +42,6 @@ pub struct MaudeSig {
     pub reducible_fun_syms: FunSig,
 }
 
-impl Default for MaudeSig {
-    fn default() -> Self {
-        MaudeSig {
-            enable_dh: false,
-            enable_bp: false,
-            enable_mset: false,
-            enable_nat: false,
-            enable_xor: false,
-            enable_diff: false,
-            st_fun_syms: BTreeSet::new(),
-            st_rules: BTreeSet::new(),
-            macro_names: BTreeSet::new(),
-            eq_convergent: false,
-            fun_syms: BTreeSet::new(),
-            irreducible_fun_syms: BTreeSet::new(),
-            reducible_fun_syms: BTreeSet::new(),
-        }
-    }
-}
 
 impl MaudeSig {
     /// Refresh the cached `fun_syms` / `irreducible_fun_syms` /

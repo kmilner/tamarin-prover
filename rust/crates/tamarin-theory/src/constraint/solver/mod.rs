@@ -10,15 +10,13 @@
 //!   solver entry point.
 //!
 //! The full Haskell source is ~4 k LOC across `ProofMethod`,
-//! `Reduction`, `Goals`, `Sources`, `Simplify`, `Contradictions`. This
-//! Rust port lays the data/control skeleton; per-rule reduction logic
-//! comes alongside the unification + AC narrowing port.
+//! `Reduction`, `Goals`, `Sources`, `Simplify`, `Contradictions`, all
+//! of which are ported here.
 
 pub mod annotated_goals;
 pub mod context;
 pub mod contradictions;
 pub mod goals;
-pub mod lazy_views;
 pub mod proof_method;
 pub mod reduction;
 pub mod rename_precise;
