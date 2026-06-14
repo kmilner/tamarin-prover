@@ -286,16 +286,25 @@ pub fn reveal_signature_maude_sig() -> MaudeSig {
 pub fn location_report_maude_sig() -> MaudeSig {
     MaudeSig {
         st_fun_syms: location_report_fun_sig(),
+        st_rules: crate::builtin::location_report_rules(),
         ..MaudeSig::default()
     }.refresh()
 }
 
 pub fn sym_enc_dest_maude_sig() -> MaudeSig {
-    MaudeSig { st_fun_syms: sym_enc_fun_dest_sig(), ..MaudeSig::default() }.refresh()
+    MaudeSig {
+        st_fun_syms: sym_enc_fun_dest_sig(),
+        st_rules: crate::builtin::sym_enc_dest_rules(),
+        ..MaudeSig::default()
+    }.refresh()
 }
 
 pub fn asym_enc_dest_maude_sig() -> MaudeSig {
-    MaudeSig { st_fun_syms: asym_enc_fun_dest_sig(), ..MaudeSig::default() }.refresh()
+    MaudeSig {
+        st_fun_syms: asym_enc_fun_dest_sig(),
+        st_rules: crate::builtin::asym_enc_dest_rules(),
+        ..MaudeSig::default()
+    }.refresh()
 }
 
 pub fn signature_dest_maude_sig() -> MaudeSig {
