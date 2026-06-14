@@ -667,7 +667,32 @@ pub fn abstract_rule_and_variants(
             LNSubstVFresh::from_list(composed_pairs)
         }
     })
-    .filter(|s| !s.is_renaming())
+    // HS-faithful: `variantsProtoRule` (RuleVariants.hs:87-91) builds the
+    // composed `substs` list with NO post-composition renaming filter — the
+    // only filter is `not $ isFreshRedundant vsubst` on the RAW Maude variant
+    // (applied above as the H20 pass).  Each composed entry is
+    //   `restrictVFresh (frees abstrPsCsAs) $ removeRenamings $
+    //      normSubstVFresh' $ composeVFresh vsubst abstractionSubst`
+    // and is kept verbatim.  A previous `.filter(|s| !s.is_renaming())` here
+    // (carried over from the pre-`compose_vfresh` manual path) dropped any
+    // composed subst that restricted-down to a pure renaming — which is
+    // EXACTLY HS's narrowing variant for a rule like foo_eligibility's `C_2`.
+    //
+    // `C_2`'s `commit(open(x,r),r)` abstracts to `commit(z,r)` with z=open(x,r).
+    // Maude returns 2 variants: identity, and the narrowing `x ↦ commit(_,r)`
+    // making `open(x,r) → z`.  After compose+removeRenamings+restrict the
+    // narrowing variant becomes `{A↦A', r↦x.5, z↦x.6}` — a renaming once the
+    // out-of-`abstrPsCsAs` `x ↦ commit(x.6,x.5)` entry is restricted away.  HS
+    // KEEPS this renaming subst (its `frees abstrPsCsAs = {A.1,r.2,z.4}` and
+    // restrictVFresh produces the same all-renaming subst, fed to
+    // `simpDisjunction` unfiltered).  With it present, `simpDisjunction` sees a
+    // genuine 2-way disjunction and does NOT fold `z ↦ open(x,r)` into
+    // `commonSubst`, so the stored rule keeps the abstracted `commit(z,r)`.
+    // Dropping it left RS with a single `{z ↦ open(x,r)}` subst, which
+    // `simpSingleton` folded into the rule body, un-abstracting it back to
+    // `commit(open(x,r),r)` — RS then renders "trivial AC variant" and the
+    // exists-trace `exec` lemma can no longer narrow `open(x,r)` to reach
+    // `case V_2` (the trace), so it was wrongly `falsified` (soundness bug).
     .collect();
 
     if composed_substs.is_empty() {
