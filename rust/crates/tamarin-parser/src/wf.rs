@@ -1111,24 +1111,42 @@ fn collect_rule_unbound_vars(r: &Rule, nullary_funs: &BTreeSet<String>) -> Vec<V
 }
 
 pub fn unbound_report(thy: &Theory) -> WfReport {
-    let mut out = Vec::new();
+    // HS `unboundReport` (Wellformedness.hs:514-519) produces one `WfError`
+    // PER offending rule, all sharing the topic "Unbound variables".  The
+    // WARNING count printed in the summary is `length rep` (Batch.hs:245),
+    // i.e. the number of these un-grouped entries — so we must emit one
+    // entry per rule, NOT a single aggregated block.
+    //
+    // The renderer `prettyWfErrorReport` (Wellformedness.hs:118-125) then
+    // `groupOn`s by topic and lays each group out as
+    //   `text topic $-$ (nest 2 . vcat . intersperse (text "") $ map snd errs)`.
+    // i.e. the underlineTopic header is emitted ONCE for the group, the
+    // per-rule bodies are indented by 2 spaces and separated by a 2-space
+    // blank line.  Each body is `text info $-$ nest 2 (prettyVarList vars)`
+    // (Wellformedness.hs:497-498), so the `rule ... has unbound variables:`
+    // line gets 2 spaces and the variable list 2+2 = 4 spaces.  RS's
+    // `format_wf_block` applies that group-level header + 2-space layout
+    // (see below); each entry here carries ONLY its body (`snd err`).
     let nullary_funs = collect_nullary_fun_names(thy);
+    let mut out = Vec::new();
     for r in theory_rules(thy) {
         let unbound = collect_rule_unbound_vars(r, &nullary_funs);
         if !unbound.is_empty() {
+            // HS `prettyVarList = fsep . punctuate comma . map prettyLVar`
+            // (TheoryObject.hs:815-816): comma-separated, word-wrapped.  The
+            // sibling `reservedFactNameRules` block renders its list the
+            // same way; we comma-join at the 4-space inner `nest 2` indent
+            // (variable lists are short, so the fsep wrap never triggers in
+            // practice — identical bytes to HS for the common case).
             let names: Vec<String> = unbound.iter()
                 .map(render_var)
                 .collect();
-            // HS `unboundCheck` (Wellformedness.hs, `prettyVarList`)
-            // renders the vars comma-separated and word-wrapped under a
-            // 2-space `nest`.  Here we instead emit one var per line,
-            // each 4-space indented.
-            let var_lines: String = names.iter()
-                .map(|n| format!("    {}", n))
-                .collect::<Vec<_>>()
-                .join("\n");
-            out.push(WfError::new("Unbound variables",
-                format!("rule `{}' has unbound variables: \n{}", r.name, var_lines)));
+            // Body only: `  rule `{name}' has unbound variables: ` (2-space
+            // ppTopic nest, trailing space from HS's `info`) then the
+            // variable list at 4 spaces.  format_wf_block adds the header.
+            out.push(WfError::new("Unbound variables", format!(
+                "  rule `{}' has unbound variables: \n    {}",
+                r.name, names.join(", "))));
         }
     }
     out

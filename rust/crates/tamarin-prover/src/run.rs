@@ -1151,10 +1151,31 @@ fn format_wf_block(report: &[tamarin_parser::wf::WfError]) -> String {
     for (i, topic) in topic_order.iter().enumerate() {
         let msgs = &grouped[topic];
         if i > 0 { out.push('\n'); }
-        for (j, m) in msgs.iter().enumerate() {
-            if j > 0 { out.push('\n'); }
-            out.push_str(m);
-            if !m.ends_with('\n') { out.push('\n'); }
+        // HS `prettyWfErrorReport` (Wellformedness.hs:118-125) groups by
+        // topic and renders each group as
+        //   `text topic $-$ (nest 2 . vcat . intersperse (text "") $ bodies)`
+        // — the underlineTopic header ONCE per group, then the 2-space-nested
+        // bodies separated by a 2-space blank line.  Most RS checks already
+        // pre-render the FULL block (header + indent) into a single per-topic
+        // message, and we concatenate those as-is (legacy path, unchanged).
+        //
+        // The "Unbound variables" topic is the one check that emits one
+        // HEADER-LESS body per offending rule (`unbound_report` — one entry
+        // per rule so the summary's `length rep` WARNING count stays
+        // HS-faithful, Batch.hs:245).  Assemble that group HS-style: header
+        // once, bodies joined by the `intersperse (text "")` 2-space
+        // separator.  Scoped to this topic so no other check's bytes change.
+        if *topic == "Unbound variables" {
+            out.push_str(&tamarin_parser::wf::underline_topic(topic));
+            out.push('\n'); // `$-$` blank line after the header
+            out.push_str(&msgs.join("\n  \n"));
+            out.push('\n');
+        } else {
+            for (j, m) in msgs.iter().enumerate() {
+                if j > 0 { out.push('\n'); }
+                out.push_str(m);
+                if !m.ends_with('\n') { out.push('\n'); }
+            }
         }
     }
     // Trim trailing blank lines but keep a single newline before `*/`.
