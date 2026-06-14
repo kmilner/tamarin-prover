@@ -298,6 +298,9 @@ solveAction rules (i, fa@(Fact _ ann _)) = do
             else ru
     requiresKU t = do
         j <- freshLVar "vk" LSortNode
+        when (Unsafe.unsafePerformIO $
+                maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_VK_CREATE") $
+            Debug.Trace.traceM ("[HS_VK_CREATE] site=solveActionGoal_requiresKU j=" ++ show j)
         let faKU = kuFact t
         insertLess (LessAtom j i Adversary)
         void (insertAction j faKU)

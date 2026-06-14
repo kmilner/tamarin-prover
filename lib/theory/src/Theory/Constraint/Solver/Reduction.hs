@@ -310,6 +310,14 @@ labelNodeId = \i rules parent -> do
           -- corresponding KU-actions before this node.
         _ | isKUFact fa -> do
               j <- freshLVar "vk" LSortNode
+              -- TAM_HS_TRACE_VK_CREATE=1: mirror of Rust's
+              -- TAM_RS_TRACE_VK_CREATE.  `freshLVar` is the pure monotonic
+              -- FreshT counter (FastFresh.hs), seeded per-Reduction by
+              -- `avoid sys`; logging every `vk` allocation lets the HS-vs-Rust
+              -- allocation sequences be diffed when a `#vk.N` index diverges.
+              when (Unsafe.unsafePerformIO $
+                      maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_VK_CREATE") $
+                  Debug.Trace.traceM ("[HS_VK_CREATE] site=exploitPrem_KU j=" ++ show j)
               insertLess (LessAtom j i Adversary)
               void (insertAction j fa)
 
@@ -449,6 +457,13 @@ insertAction i fa@(Fact _ ann _) = do
     -- loop due to generating new KU-nodes that are merged immediately.
     requiresKU t = do
       j <- freshLVar "vk" LSortNode
+      -- TAM_HS_TRACE_VK_CREATE=1: mirror of Rust's TAM_RS_TRACE_VK_CREATE.
+      -- Each pair/inv/mult KU-decomposition sub-term advances the FreshT
+      -- counter here (`freshLVar`); the Rust `ku_decomp_subterms` path does
+      -- NOT advance its counter, which is the divergence this hook locates.
+      when (Unsafe.unsafePerformIO $
+              maybe False (== "1") <$> SysEnv.lookupEnv "TAM_HS_TRACE_VK_CREATE") $
+          Debug.Trace.traceM ("[HS_VK_CREATE] site=insertAction_requiresKU j=" ++ show j)
       let faKU = kuFactAnn ann t
       insertLess (LessAtom j i Adversary)
       void (insertAction j faKU)

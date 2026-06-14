@@ -1445,6 +1445,21 @@ impl<'ctx> Reduction<'ctx> {
                                 tamarin_term::lterm::LSort::Node,
                                 next_idx,
                             );
+                            // TAM_RS_TRACE_VK_CREATE: mirror of the HS
+                            // `TAM_HS_TRACE_VK_CREATE` hook (Reduction.hs /
+                            // Goals.hs `requiresKU` + `exploitPrem`).  Logs
+                            // every `vk` fresh-node allocation so the HS-vs-RS
+                            // allocation sequences can be diffed when a `#vk.N`
+                            // index diverges.  `cnt`/`bm` expose the maude
+                            // fresh-counter and bounds_max at allocation — this
+                            // path (`ku_decomp_subterms`) derives the index from
+                            // `max(bm, outer.idx)+1` and does NOT advance the
+                            // counter, unlike HS `freshLVar`.
+                            if std::env::var("TAM_RS_TRACE_VK_CREATE").is_ok() {
+                                let path = crate::constraint::solver::trace::case_path_string();
+                                eprintln!("[RS_VK_CREATE] path={} site=ku_decomp_subterms vk.{} cnt={} bm={}",
+                                    path, next_idx, self.maude.fresh_counter_peek(), bounds_max(&self.sys));
+                            }
                             let sub_fa = crate::fact::ku_fact(sub);
                             self.insert_goal_with_loop_flag(
                                 Goal::Action(sub_node.clone(), sub_fa),
@@ -4347,6 +4362,15 @@ impl<'ctx> Reduction<'ctx> {
         let next = self.next_fresh_node_idx();
         let j = tamarin_term::lterm::LVar::new(
             "vk", tamarin_term::lterm::LSort::Node, next);
+        // TAM_RS_TRACE_VK_CREATE: mirror of HS `TAM_HS_TRACE_VK_CREATE`.
+        // This path (`add_ku_action_before`, the HS `requiresKU`/`exploitPrem`
+        // analog) DOES advance the maude fresh-counter via
+        // `next_fresh_node_idx` = `max(counter, bm+1)`.
+        if std::env::var("TAM_RS_TRACE_VK_CREATE").is_ok() {
+            let path = crate::constraint::solver::trace::case_path_string();
+            eprintln!("[RS_VK_CREATE] path={} site=add_ku_action_before vk.{} cnt={} bm={}",
+                path, next, self.maude.fresh_counter_peek(), bounds_max(&self.sys));
+        }
         self.insert_less(crate::constraint::constraints::LessAtom::new(
             j.clone(), i.clone(),
             crate::constraint::constraints::Reason::Adversary,
