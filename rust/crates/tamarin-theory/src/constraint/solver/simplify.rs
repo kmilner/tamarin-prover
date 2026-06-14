@@ -1957,19 +1957,44 @@ fn match_atom_via_maude(
     use tamarin_parser::ast::Term as ATerm;
     let mut base_subst = VarSubst::new();
 
-    // Time variable: must be a universal var; bind directly to the
-    // system node id.
+    // Time variable.  HS's `matchAction` (Guarded.hs:805-807) matches
+    // the time node `i1 matchWith i2` ALONGSIDE the fact — the time is
+    // just another term in the match problem.  Two cases:
+    //
+    //   (a) The guard's time is an as-yet-unbound UNIVERSAL var (the
+    //       first guard mentioning this `@b`): bind it to the system
+    //       node id `i` (a free pattern var binds to the subject).
+    //
+    //   (b) The guard's time is NOT a universal var.  This happens for
+    //       MULTI-GUARD universals sharing the same time `@b` (e.g. the
+    //       alethea negated-conclusion `BB_Cs(...)@b ∧ BB_V(n1,..)@b ∧
+    //       BB_V(n2,..)@b ⇒ ⊥`): after the FIRST guard matched, the
+    //       accumulated subst (`applySkAction subst (a,fa)` upstream)
+    //       has already replaced `b` with the concrete system node it
+    //       was bound to.  In HS that node is a `SkConst`/ground term on
+    //       the PATTERN side, so it matches the subject's time ONLY when
+    //       it is the SAME node.  Mirror that: require `g_t == i`.
+    //       Previously we rejected ANY non-universal-var time outright —
+    //       so every action guard after the first NEVER matched, leaving
+    //       the negated-conclusion universal unfired and its `gfalse`
+    //       (`from formulas`) contradiction never produced.  RS then
+    //       drove the c_PeqPVote branch to a spurious SOLVED leaf where
+    //       HS reports `by contradiction /* from formulas */`
+    //       (alethea Universal_VerProofV/Y_v1..v8: RS falsified, HS
+    //       verified).
     let ATerm::Var(g_t) = g_time else { return Vec::new() };
-    if !vars.iter().any(|v| v.name == g_t.name && v.idx == g_t.idx) {
+    if vars.iter().any(|v| v.name == g_t.name && v.idx == g_t.idx) {
+        let i_term = tamarin_parser::ast::Term::Var(tamarin_parser::ast::VarSpec {
+            name: i.name.clone(),
+            idx: i.idx,
+            sort: tamarin_parser::ast::SortHint::Node,
+            typ: None,
+        });
+        base_subst.insert((g_t.name.clone(), g_t.idx), i_term);
+    } else if !(g_t.name == i.name && g_t.idx == i.idx) {
+        // Bound (ground) time that is not this system node — no match.
         return Vec::new();
     }
-    let i_term = tamarin_parser::ast::Term::Var(tamarin_parser::ast::VarSpec {
-        name: i.name.clone(),
-        idx: i.idx,
-        sort: tamarin_parser::ast::SortHint::Node,
-        typ: None,
-    });
-    base_subst.insert((g_t.name.clone(), g_t.idx), i_term);
 
     // Build LNTerm patterns from g_fact.args and try to AC-match
     // them against sys_args. We send all pairwise equations to
