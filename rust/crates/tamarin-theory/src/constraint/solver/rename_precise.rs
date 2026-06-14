@@ -507,8 +507,13 @@ fn atom_for_each_free(a: &crate::guarded::GAtom, f: &mut dyn FnMut(&LVar)) {
             term_for_each_free(y, f);
         }
         GAtom::Action(fa, t) => {
-            for arg in &fa.args { term_for_each_free(arg, f); }
+            // HS `Traversable ProtoAtom` visits the timepoint BEFORE the
+            // fact: `traverse f (Action i fa) = Action <$> f i <*> traverse f fa`
+            // (Atom.hs).  renamePrecise allocates fresh per-name indices
+            // in visit order, so the timepoint must be walked first to
+            // match HS's idx assignment.
             term_for_each_free(t, f);
+            for arg in &fa.args { term_for_each_free(arg, f); }
         }
         GAtom::Last(t) => term_for_each_free(t, f),
         GAtom::Pred(fa) => { for arg in &fa.args { term_for_each_free(arg, f); } }
