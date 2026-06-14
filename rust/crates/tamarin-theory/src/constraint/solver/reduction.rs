@@ -5274,27 +5274,13 @@ impl<'ctx> Reduction<'ctx> {
                 &self.sys,
                 &p.0, p.1, fa_prem,
             ) {
-                let dbg_inacases = std::env::var("TAM_RS_DBG_INA_CASES").is_ok()
-                    && format!("{:?}", fa_prem).contains("In_A");
-                if dbg_inacases {
-                    eprintln!("[INA_CASES] source path: n_raw_cases={} names={:?}",
-                        case_pairs.len(),
-                        case_pairs.iter().map(|(n,_)| n.clone()).collect::<Vec<_>>());
-                }
                 let mut out: Vec<(String, crate::constraint::system::System)> = Vec::new();
                 for (case_name, mut sys) in case_pairs {
                     if has_fresh_consumer_conflation(&sys, &self.maude) {
-                        if dbg_inacases {
-                            eprintln!("[INA_CASES]   DROPPED by fresh_consumer_conflation: {}", case_name);
-                        }
                         continue;
                     }
                     sys.used_sources.push(case_name.clone());
                     out.push((case_name, sys));
-                }
-                if dbg_inacases {
-                    eprintln!("[INA_CASES] after conflation filter: n={} names={:?}",
-                        out.len(), out.iter().map(|(n,_)| n.clone()).collect::<Vec<_>>());
                 }
                 if !out.is_empty() {
                     self.changed = ChangeIndicator::Changed;

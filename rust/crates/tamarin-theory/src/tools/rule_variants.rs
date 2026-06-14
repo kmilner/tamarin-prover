@@ -726,24 +726,50 @@ pub fn abstract_rule_and_variants(
         crate::rule::Rule::new(rule.info.clone(), prems, concs, acts).with_new_vars(nvs)
     };
 
-    // Filter out trivial-true disjuncts and degenerate cases.
+    // HS-faithful `variantsProtoRule` disjunction selection
+    // (RuleVariants.hs:121-129):
+    //   (commonSubst, Nothing)        -> makeRule abstrPsCsAs commonSubst trueDisj
+    //   (commonSubst, Just freshSubsts) -> makeRule abstrPsCsAs commonSubst freshSubsts
+    // where `trueDisj = [emptySubstVFresh]` (RuleVariants.hs:158).
+    //
+    // When `simpDisjunction` collapses the variant disjunction to a single
+    // case (`residual == Nothing`), HS does NOT drop the variant disjunction
+    // — it keeps `[emptySubstVFresh]`, the trivial-but-present SplitG.  That
+    // disjunction is later added by `solveRuleConstraints`
+    // (Reduction.hs:967-979) via `addRuleVariants` → `addDisj`, which bumps
+    // `eqsNextSplitId` by 1 at EVERY `labelNodeId` for such a rule even though
+    // `simp`'s `simpSingleton` immediately folds the singleton and
+    // `removeSolvedSplitGoals` later deletes the orphaned SplitG (the
+    // split-id counter bump persists).  RS previously used `Vec::new()` here,
+    // dropping the trivial disjunction entirely → no `add_disj` → its
+    // `eqsNextSplitId` ran one BEHIND HS for each rule whose variants collapse
+    // to the identity (spdm121 `I_KE_Request`/`I_KE_RequestPK`: Maude returns
+    // the single identity variant, `simp` collapses it to `residual=Nothing`).
+    // That under-bump shifted every later `splitEqs(N)` render label by -1
+    // (spdm121 `Attack_Responder_Requester_Mode_Switch`: HS `splitEqs(4)` vs
+    // RS `splitEqs(3)`).
+    //
+    // Mirror HS exactly: `Nothing -> trueDisj`, `Just fs -> fs` (the
+    // pre-simp `removeRenamings`/`isFreshRedundant` already ran on the
+    // composed substs at the `composed_substs` build site, matching
+    // RuleVariants.hs:87-91; no additional post-simp renaming/range filter,
+    // which HS does not have).
     let final_substs: Vec<LNSubstVFresh> = match residual {
-        Some(rs) => rs.into_iter()
-            .filter(|s| !s.is_renaming())
-            .filter(|s| s.range().any(|t| matches!(t, Term::App(_, _))) ||
-                        !s.is_empty())
-            .collect(),
-        None => Vec::new(),
+        // `simpDisjunction` returning `Just fs` with `fs` non-empty is HS's
+        // `(commonSubst, Just freshSubsts)` arm.  A `Just []` cannot arise
+        // from a satisfiable disjunction (an unsatisfiable one is carried as
+        // `falseEqConstrConj`, not here); treat the degenerate empty case as
+        // the collapse (trueDisj) so we never emit an empty SplitG disj.
+        Some(rs) if !rs.is_empty() => rs,
+        _ => vec![LNSubstVFresh::empty()],
     };
 
-    // Even if there are no useful residual substs, the common_subst
-    // application changed the rule — we still need to return the
-    // abstracted rule shape so the canonical-rule path picks it up.
-    // But if common_subst was empty AND no residual, there's nothing
-    // to gain from abstraction.
-    if common_subst.is_empty() && final_substs.is_empty() {
-        return Ok(None);
-    }
+    // HS `variantsProtoRule` returns the abstracted rule whenever the
+    // composed-substs list was non-empty (RuleVariants.hs:93-94 only `mzero`s
+    // on an EMPTY composed list — handled earlier via `raw_substs.is_empty()`
+    // and the composed-substs build).  With `final_substs` now always
+    // non-empty (trueDisj at minimum), the abstracted form is always
+    // produced, matching HS's `makeRule` for the collapse case.
 
     // HS-faithful `renamePrecise` wrap (RuleVariants.hs:64):
     //   `(`Precise.evalFresh` Precise.nothingUsed) . renamePrecise $ ...`

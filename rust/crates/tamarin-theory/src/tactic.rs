@@ -14,20 +14,50 @@
 //! `function`/`functionNot`/`functionAnd`/`functionOr`), then renders it
 //! through the ported `prettyTactic` so output is byte-identical.
 
+/// A single selector function as written in a tactic, e.g.
+/// `regex "In_S"` or `dhreNoise "curve"`.  Mirrors HS `function`
+/// (Tactics.hs:66-70) producing `nameToFunction (name, params)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectorLeaf {
+    /// The function name (`regex`, `dhreNoise`, `isFactName`, …).
+    pub name: String,
+    /// The double-quoted parameters in source order.
+    pub params: Vec<String>,
+}
+
+/// The boolean expression tree HS builds per `disjuncts` line via
+/// `functionNot`/`functionAnd`/`functionOr` (Tactics.hs:72-91).  One
+/// `SelectorExpr` corresponds to one entry of HS `functionsPrio`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectorExpr {
+    Leaf(SelectorLeaf),
+    Not(Box<SelectorExpr>),
+    And(Box<SelectorExpr>, Box<SelectorExpr>),
+    Or(Box<SelectorExpr>, Box<SelectorExpr>),
+}
+
 /// A parsed `prio:`/`deprio:` block.
 ///
 /// `ranking` is the `{...}` selector name (HS `stringRankingPrio`,
 /// defaulting to `"id"`); `disjuncts` are the per-line string
 /// representations HS stores in `stringsPrio` — one entry per parsed
 /// `disjuncts` (a `f "p" | g "q"` chain) in source order.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `selectors` is the EVALUABLE form of those same disjuncts — one
+/// `SelectorExpr` per `disjuncts` line, in the same order, mirroring HS
+/// `functionsPrio :: [(AnnotatedGoal, ctx, System) -> Bool]`
+/// (System.hs:442).  The prio recognises a goal iff ANY of these
+/// expressions evaluates to True (HS `isPrio = or . sequenceA`,
+/// ProofMethod.hs:884).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrioBlock {
     pub ranking: String,
     pub disjuncts: Vec<String>,
+    pub selectors: Vec<SelectorExpr>,
 }
 
 /// A structured tactic: HS `Tactic { _name, _presort, _prios, _deprios }`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tactic {
     pub name: String,
     /// The single-character presort identifier as rendered by HS
@@ -246,6 +276,7 @@ impl<'a> TacticParser<'a> {
         // option "id" (braced identifier)
         let ranking = self.braced_ident().unwrap_or_else(|| "id".to_string());
         let mut disjuncts = Vec::new();
+        let mut selectors = Vec::new();
         // many1 disjuncts — keep parsing until a block keyword or EOF.
         loop {
             self.skip_ws();
@@ -259,11 +290,11 @@ impl<'a> TacticParser<'a> {
                 }
             }
             match self.disjuncts() {
-                Some(d) => disjuncts.push(d),
+                Some((d, e)) => { disjuncts.push(d); selectors.push(e); }
                 None => break,
             }
         }
-        PrioBlock { ranking, disjuncts }
+        PrioBlock { ranking, disjuncts, selectors }
     }
 
     /// Optional `{ident}` (HS `braced identifier`).
@@ -291,41 +322,43 @@ impl<'a> TacticParser<'a> {
     /// `disjuncts = chainl1 conjuncts opLOr`; `conjuncts = chainl1
     /// negation opLAnd`; `negation = opLNot? function`. We build the HS
     /// *string representation* (Tactics.hs:70-91) for the whole chain.
-    fn disjuncts(&mut self) -> Option<String> {
-        let mut s = self.conjuncts()?;
+    fn disjuncts(&mut self) -> Option<(String, SelectorExpr)> {
+        let (mut s, mut e) = self.conjuncts()?;
         loop {
             self.skip_ws();
             if self.i < self.s.len() && self.s[self.i] == b'|' {
                 self.i += 1;
-                let rhs = self.conjuncts()?;
-                s = format!("{} | {}", s, rhs);
+                let (rs, re) = self.conjuncts()?;
+                s = format!("{} | {}", s, rs);
+                e = SelectorExpr::Or(Box::new(e), Box::new(re));
             } else {
                 break;
             }
         }
-        Some(s)
+        Some((s, e))
     }
 
-    fn conjuncts(&mut self) -> Option<String> {
-        let mut s = self.negation()?;
+    fn conjuncts(&mut self) -> Option<(String, SelectorExpr)> {
+        let (mut s, mut e) = self.negation()?;
         loop {
             self.skip_ws();
             if self.i < self.s.len() && self.s[self.i] == b'&' {
                 self.i += 1;
-                let rhs = self.negation()?;
-                s = format!("{} & {}", s, rhs);
+                let (rs, re) = self.negation()?;
+                s = format!("{} & {}", s, rs);
+                e = SelectorExpr::And(Box::new(e), Box::new(re));
             } else {
                 break;
             }
         }
-        Some(s)
+        Some((s, e))
     }
 
-    fn negation(&mut self) -> Option<String> {
+    fn negation(&mut self) -> Option<(String, SelectorExpr)> {
         // opLNot is the word `not`.
         if self.try_kw("not") {
-            let f = self.function()?;
-            Some(format!("not {}", f))
+            let (s, e) = self.function()?;
+            Some((format!("not {}", s), SelectorExpr::Not(Box::new(e))))
         } else {
             self.function()
         }
@@ -333,7 +366,7 @@ impl<'a> TacticParser<'a> {
 
     /// `function = identifier (doubleQuoted functionValue)+`
     /// rendered as `f "p1" "p2"` (Tactics.hs:66-70).
-    fn function(&mut self) -> Option<String> {
+    fn function(&mut self) -> Option<(String, SelectorExpr)> {
         self.skip_ws();
         let start = self.i;
         while self.i < self.s.len() && is_ident_byte(self.s[self.i]) {
@@ -372,7 +405,8 @@ impl<'a> TacticParser<'a> {
         s.push_str(" \"");
         s.push_str(&params.join("\" \""));
         s.push('"');
-        Some(s)
+        let leaf = SelectorExpr::Leaf(SelectorLeaf { name, params });
+        Some((s, leaf))
     }
 }
 

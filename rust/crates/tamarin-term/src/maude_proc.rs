@@ -1010,7 +1010,33 @@ impl MaudeHandle {
         Ok(out)
     }
 
-    /// Compute matches: each `Equal { lhs = pattern, rhs = subject }`.
+    /// Compute AC matchers for a batch of `(subject, pattern)` problems.
+    ///
+    /// **Convention — faithful to Haskell.** Each `Equal { lhs, rhs }`
+    /// has `lhs = subject` (term to be matched, treated ground) and
+    /// `rhs = pattern` (vars bind). This mirrors HS exactly:
+    /// `matchWith t p = DelayedMatches [(t, p)]` is `(subject, pattern)`
+    /// (`Term/Rewriting/Definitions.hs:90-93`), and `matchViaMaude`
+    /// turns each pair into `Equal subject pattern` via
+    /// `uncurry Equal <$> ms` (`Term/Maude/Process.hs:283-284`). The
+    /// emitted Maude command is then `match PATTERN <=? SUBJECT`,
+    /// i.e. `matchCmd`'s `ppTerms t2s <> " <=? " <> ppTerms t1s` where
+    /// `(t1s, t2s) = unzip [(a, b) | Equal a b <- eqs]` so `t2s = b =
+    /// pattern` lands on Maude's LEFT (pattern slot) and `t1s = a =
+    /// subject` on the RIGHT (subject slot) — `Process.hs:265-270`.
+    ///
+    /// Maude's `match A <=? B` binds vars in **A (PATTERN, left)** and
+    /// treats **B (SUBJECT, right)** as ground (empirically confirmed;
+    /// see the `match_eqs_const_subject` fix in eadeb1c4 and the twin
+    /// fix to this function). So pattern must go LEFT — which is why
+    /// `pp_list(&pats)` (= `t2s` = each `eq.rhs`) is emitted first.
+    ///
+    /// NOTE the opposite field order from `Equal` as used by callers
+    /// that pass `Equal { lhs = pattern, rhs = subject }`: HS's `Equal`
+    /// holds `(subject, pattern)`, and so does this routine. Callers
+    /// constructed from `matchFact`/`matchWith` (e.g. `sources.rs`,
+    /// `subsumption.rs::compare_term_subs`) MUST therefore put the
+    /// subject in `lhs` and the pattern in `rhs`.
     pub fn match_eqs(&self, eqs: &[Equal<LNTerm>]) -> Result<Vec<Vec<(crate::lterm::LVar, LNTerm)>>, MaudeError>
     {
         if eqs.is_empty() {
@@ -1018,15 +1044,17 @@ impl MaudeHandle {
         }
         let mut inner = self.inner.lock().unwrap();
         let mut ctx = ConvCtx::new();
-        let mut t1s: Vec<MTerm> = Vec::with_capacity(eqs.len());
-        let mut t2s: Vec<MTerm> = Vec::with_capacity(eqs.len());
+        // `subjs` ← each `eq.lhs` (HS `t1s = a = subject`);
+        // `pats`  ← each `eq.rhs` (HS `t2s = b = pattern`).
+        let mut subjs: Vec<MTerm> = Vec::with_capacity(eqs.len());
+        let mut pats: Vec<MTerm> = Vec::with_capacity(eqs.len());
         for eq in eqs {
-            t1s.push(lterm_to_mterm_global(&eq.lhs, &mut ctx));
-            t2s.push(lterm_to_mterm_global(&eq.rhs, &mut ctx));
+            subjs.push(lterm_to_mterm_global(&eq.lhs, &mut ctx));
+            pats.push(lterm_to_mterm_global(&eq.rhs, &mut ctx));
         }
-        // `match in MSG : list(t2s) <=? list(t1s) .`
-        // Mirrors Haskell's `matchCmd`: subjects on the left, patterns on
-        // the right (Maude convention).
+        // `match in MSG : list(pats) <=? list(subjs) .`
+        // Mirrors HS `matchCmd` (`Process.hs:265-270`): PATTERN on the
+        // left (vars bind), SUBJECT on the right (ground).
         let pp_list = |items: &[MTerm]| -> Vec<u8> {
             // Emit as `list( cons(t1, cons(t2, nil)) )` style by reusing
             // pp_mterm on a constructed FunSym::List.
@@ -1035,14 +1063,20 @@ impl MaudeHandle {
             pp_mterm(&Term::App(FunSym::List, items.to_vec().into()))
         };
         let mut cmd = b"match in MSG : ".to_vec();
-        cmd.extend(pp_list(&t2s));
+        cmd.extend(pp_list(&pats));
         cmd.extend_from_slice(b" <=? ");
-        cmd.extend(pp_list(&t1s));
+        cmd.extend(pp_list(&subjs));
         cmd.extend_from_slice(b" .\n");
+        if std::env::var_os("TAM_DBG_MATCH_EQS_RAW").is_some() {
+            eprintln!("[match_eqs RAW] {}", String::from_utf8_lossy(&cmd).trim_end());
+        }
         let reply = inner.execute(&cmd)?;
         inner.stats.match_count += 1;
         let sig = inner.sig.clone();
         drop(inner);
+        if std::env::var_os("TAM_DBG_MATCH_EQS_RAW").is_some() {
+            eprintln!("[match_eqs REPLY] {}", String::from_utf8_lossy(&reply).trim_end());
+        }
         _tally_callsite("match_eqs");
         let msubsts = maude_parse::parse_match_reply(&sig, &reply)?;
         let mut out = Vec::with_capacity(msubsts.len());
@@ -1195,13 +1229,43 @@ impl MaudeHandle {
             use crate::term::Term;
             pp_mterm(&Term::App(FunSym::List, items.to_vec().into()))
         };
+        // Maude's `match A <=? B` finds σ with `B == σ(A)`: A is the
+        // PATTERN (whose vars get bound), B is the SUBJECT (treated as
+        // ground).  Callers pass `Equal { lhs = pattern, rhs = subject }`
+        // (see `match_atom_via_maude` in simplify.rs, which builds the
+        // guard-fact pattern as `lhs` and the system action term as
+        // `rhs`), and this routine already skolemizes the SUBJECT side
+        // (`eq.rhs`) into ground constants above.  So the command must be
+        //   match  <pattern = t1s = lhs>  <=?  <subject = t2s = rhs>.
+        //
+        // PREVIOUSLY this emitted the two sides SWAPPED — `match t2s <=?
+        // t1s` — which placed the (ground, skolemized) subject in the
+        // pattern slot and the pattern (with its universal-bound vars) in
+        // the subject slot.  Maude then treated the pattern's vars as
+        // opaque constants, so any AC match where a pattern var must
+        // ABSORB a sub-multiset failed: e.g. matching the guard
+        //   BB_Cs(BB, <'codes', codeOther ++ <cp(..),cp(..)>>)
+        // against a system action with a 3-element multiset
+        //   <'codes', code2 ++ x ++ <cp(..),cp(..)>>
+        // needs `codeOther → code2 ++ x`, which Maude only does when
+        // `codeOther` sits on the PATTERN side.  With the swap it
+        // returned "No match", `insertImpliedFormulas` never derived
+        // gfalse for that case, and alethea `indivVerif` was FALSIFIED
+        // (false attack) where Haskell VERIFIES it.  HS sends
+        // `match pattern <=? subject` (Term/Maude.hs matchCmd); we now do
+        // the same.  Sibling `match_eqs_skolemize_both` already had the
+        // correct order.
         let mut cmd = b"match in MSG : ".to_vec();
-        cmd.extend(pp_list(&t2s));
-        cmd.extend_from_slice(b" <=? ");
         cmd.extend(pp_list(&t1s));
+        cmd.extend_from_slice(b" <=? ");
+        cmd.extend(pp_list(&t2s));
         cmd.extend_from_slice(b" .\n");
         let t_before_exec = if prof { Some(std::time::Instant::now()) } else { None };
         let reply = inner.execute(&cmd)?;
+        if std::env::var_os("TAM_DBG_MECS_RAW").is_some() {
+            eprintln!("[MECS_RAW] cmd={}", String::from_utf8_lossy(&cmd));
+            eprintln!("[MECS_RAW] reply={}", String::from_utf8_lossy(&reply));
+        }
         let t_after_exec = if prof { Some(std::time::Instant::now()) } else { None };
         inner.stats.match_count += 1;
         let sig = inner.sig.clone();
@@ -1366,15 +1430,17 @@ impl MaudeHandle {
         };
         // Maude's `match A <=? B` syntax means: find σ such that B = σ(A).
         // So A is the PATTERN (left), B is the SUBJECT (right).
-        // Callers pass `Equal { lhs = pattern, rhs = subject }`, so the
-        // command is `match pattern <=? subject`.  This differs from
-        // `match_eqs_const_subject` which uses `match subject <=? pattern`
-        // — that historic ordering is consistent with HS's `matchCmd` but
-        // because HS callers use `Equal subject pattern` (reversed lhs/rhs
-        // from RS), the on-the-wire bytes match HS only when callers
-        // happen to also flip lhs/rhs.  We use the correct Maude
-        // `match PATTERN <=? SUBJECT` directly here, since the caller
-        // convention in RS is `lhs = pattern, rhs = subject`.
+        // Callers of THIS routine pass `Equal { lhs = pattern, rhs =
+        // subject }`, so the command is `match pattern(lhs) <=?
+        // subject(rhs)`.  CONVENTION WARNING: `match_eqs_const_subject`
+        // (post-eadeb1c4) ALSO uses `Equal { lhs = pattern, rhs =
+        // subject }` and emits `match pattern <=? subject` — same as
+        // here.  But the plain `match_eqs` uses the OPPOSITE `Equal`
+        // field order (`lhs = subject, rhs = pattern`, faithful to HS's
+        // `Equal a b = Equal subject pattern`); it still emits
+        // `match PATTERN <=? SUBJECT` on the wire, just sourced from the
+        // flipped fields.  So all three matchers emit pattern-on-the-left,
+        // which is what Maude requires (vars bind in the left operand).
         let mut cmd = b"match in MSG : ".to_vec();
         cmd.extend(pp_list(&pats));
         cmd.extend_from_slice(b" <=? ");
@@ -1965,5 +2031,162 @@ mod tests {
         // After releasing, the worker should wake up promptly.
         rx.recv_timeout(std::time::Duration::from_secs(5)).expect("worker should unblock");
         t.join().unwrap();
+    }
+
+    // Regression (alethea `indivVerif` false-attack, fixed by emitting
+    // `match PATTERN <=? SUBJECT` in the right order):
+    // pattern multiset `codeOther ++ <a,b>` (codeOther is the only
+    // pattern var) must AC-match subject `code2 ++ x ++ <a,b>` by
+    // binding `codeOther -> code2 ++ x`.  HS's Maude matchAction does
+    // this; `match_eqs_const_subject` previously swapped pattern/subject
+    // and returned "No match", which left `insertImpliedFormulas` from
+    // deriving gfalse and FALSIFIED a true lemma.
+    #[test]
+    fn match_eqs_const_subject_mset_var_to_submultiset() {
+        let path = match maude_path() { Some(p) => p, None => { eprintln!("skipping: no maude"); return; } };
+        use crate::function_symbols::{AcSym, NoEqSym, FunSym, Privacy, Constructability};
+        let pair_sym = NoEqSym::new(b"pair".to_vec(), 2, Privacy::Public, Constructability::Constructor);
+        let sig = crate::maude_sig::mset_maude_sig().add_fun_sym(pair_sym.clone());
+        let h = MaudeHandle::start(&path, sig).expect("start");
+        let mk = |v: LVar| -> LNTerm { crate::term::Term::Lit(Lit::Var(v)) };
+        // ground "pair" payload a,b -> use public name constants
+        let a = crate::term::Term::Lit(Lit::Con(crate::lterm::Name::new(crate::lterm::NameTag::Pub, "a")));
+        let b = crate::term::Term::Lit(Lit::Con(crate::lterm::Name::new(crate::lterm::NameTag::Pub, "b")));
+        let payload = crate::term::Term::App(FunSym::NoEq(pair_sym.clone()), vec![a, b].into());
+        // pattern var codeOther:Msg idx 89 (the universal-bound var)
+        let code_other = LVar::new("codeOther", LSort::Msg, 89);
+        let pat = crate::term::f_app_ac(AcSym::Union, vec![mk(code_other.clone()), payload.clone()]);
+        // subject: code2:Msg, x:Msg (free system vars, skolemized by the fn)
+        let code2 = LVar::new("code2", LSort::Msg, 8);
+        let xv = LVar::new("x", LSort::Msg, 9);
+        let subj = crate::term::f_app_ac(AcSym::Union, vec![mk(code2.clone()), mk(xv.clone()), payload.clone()]);
+        let mut pattern_vars = std::collections::BTreeSet::new();
+        pattern_vars.insert(("codeOther".to_string(), 89u64));
+        let res = h.match_eqs_const_subject(
+            &[Equal { lhs: pat, rhs: subj }], &pattern_vars).expect("match");
+        eprintln!("[REPRO] match result count = {}", res.len());
+        for m in &res {
+            for (lv, lt) in m {
+                eprintln!("[REPRO]   {}#{} -> {:?}", lv.name, lv.idx, lt);
+            }
+        }
+        assert!(!res.is_empty(),
+            "expected codeOther to AC-match a 2-element sub-multiset");
+    }
+
+    // Regression (DH key-exchange over-match, fixed by routing the
+    // `insertImpliedFormulas` Action-guard AC-fallback through
+    // `match_eqs_skolemize_both` instead of `match_eqs_const_subject`).
+    //
+    // HS's `impliedFormulas` runs `skolemizeGuarded` over the WHOLE
+    // clause (`System.hs:1122`): every FREE (non-universal) LVar of the
+    // guard pattern becomes a Maude *constant* (`MaudeConst`), only the
+    // universal-bound vars stay bindable Maude variables.  So a guard
+    // pattern position holding a free system var must match the system
+    // action's corresponding position as CONSTANT-vs-CONSTANT.
+    //
+    // Mirrors the real STS_MAC_fix2 `AcceptedR` guard match (sent as
+    // per-argument equations, one for each fact position).  The guard
+    // pattern has ONE universal-bound var `kpartner` and several FREE
+    // system vars (`ekI`,`ekR`) that, after a prior guard's binding,
+    // occupy positions whose subject counterparts are DIFFERENT free
+    // system vars (`x`,`tid`).  Two equations:
+    //   eq1:  exp(g, ekI)  <=?  exp(g, x)     (pattern free ekI vs x)
+    //   eq2:  exp(g, ekR)  <=?  exp(g, tid)   (pattern free ekR vs tid)
+    // With `match_eqs_const_subject` the pattern's `ekI`,`ekR` are Maude
+    // VARIABLES, so Maude binds `ekI->x`, `ekR->tid` and the match
+    // SUCCEEDS — the spurious match that fired `gfalse` one step early.
+    // With `match_eqs_skolemize_both` every free var is a distinct
+    // CONSTANT, so `exp(g,c_ekI)` != `exp(g,c_x)` and the match FAILS,
+    // exactly as HS's `skolemizeGuarded`-then-`matchAction` does.
+    #[test]
+    fn impl_guard_match_skolemizes_pattern_free_vars() {
+        let path = match maude_path() { Some(p) => p, None => { eprintln!("skipping: no maude"); return; } };
+        use crate::function_symbols::{FunSym, exp_sym};
+        let sig = crate::maude_sig::dh_maude_sig();
+        let h = MaudeHandle::start(&path, sig).expect("start");
+        let mk = |v: LVar| -> LNTerm { crate::term::Term::Lit(Lit::Var(v)) };
+        let g = crate::term::Term::Lit(Lit::Con(crate::lterm::Name::new(crate::lterm::NameTag::Pub, "g")));
+        let exp = |base: LNTerm, e: LNTerm|
+            crate::term::Term::App(FunSym::NoEq(exp_sym()), vec![base, e].into());
+        // free (non-universal) system vars — NONE of these is in
+        // `pattern_vars`, so HS skolemizes them all to constants.
+        let ek_i = LVar::new("ekI", LSort::Fresh, 0);
+        let ek_r = LVar::new("ekR", LSort::Fresh, 0);
+        let xv   = LVar::new("x",   LSort::Fresh, 21);
+        let tid  = LVar::new("tid", LSort::Fresh, 15);
+        let eqs = vec![
+            Equal { lhs: exp(g.clone(), mk(ek_i.clone())), rhs: exp(g.clone(), mk(xv.clone())) },
+            Equal { lhs: exp(g.clone(), mk(ek_r.clone())), rhs: exp(g.clone(), mk(tid.clone())) },
+        ];
+        // No universal-bound vars in these positions.
+        let pattern_vars: std::collections::BTreeSet<(String, u64)> =
+            std::collections::BTreeSet::new();
+        // const_subject (the OLD Action-guard path) OVER-MATCHES: the
+        // pattern's free `ekI`,`ekR` are Maude variables binding to x,tid.
+        let over = h.match_eqs_const_subject(&eqs, &pattern_vars).expect("m1");
+        eprintln!("[REPRO] const_subject matches = {} (over-match expected: >=1)", over.len());
+        assert!(!over.is_empty(),
+            "sanity: const_subject is expected to OVER-match here (the bug)");
+        // skolemize_both (the FIX): ekI,ekR,x,tid are distinct constants,
+        // so neither equation can be satisfied → NO match, matching HS.
+        let fixed = h.match_eqs_skolemize_both(&eqs, &pattern_vars).expect("m2");
+        eprintln!("[REPRO] skolemize_both matches = {} (HS-faithful: 0)", fixed.len());
+        assert!(fixed.is_empty(),
+            "skolemize_both must NOT over-match: pattern-side free system \
+             vars (ekI,ekR) are CONSTANTS and cannot bind to the subject's \
+             different free vars (x,tid); got {:?}", fixed);
+    }
+
+    /// Directional regression for the `match_eqs` / `compare_term_subs`
+    /// flipped-`Equal`-convention bug.
+    ///
+    /// HS `compareTermSubs t1 t2` (`Subsumption.hs:37-45`) returns `GT`
+    /// when `t1` is strictly MORE SPECIFIC than `t2`, `LT` when more
+    /// general. With `t1 = h(x)` (general) and `t2 = h(a)` (ground,
+    /// specific):
+    ///   - arm A = `t1 matchWith t2` = subject h(x) vs pattern h(a):
+    ///     h(x)'s free var sits in the SUBJECT (ground) slot, h(a) is
+    ///     the pattern with no vars ⇒ No match (empty).
+    ///   - arm B = `t2 matchWith t1` = subject h(a) vs pattern h(x):
+    ///     x --> a ⇒ matches.
+    ///   - check [] (_:_) = LT ⇒ `compareTermSubs(h(x),h(a)) = Just LT`
+    ///     and symmetrically `compareTermSubs(h(a),h(x)) = Just GT`.
+    ///
+    /// Before the fix, `compare_term_subs` constructed `Equal { lhs:
+    /// t2, rhs: t1 }` for arm A (mistaking RS's `Equal` for the
+    /// `pattern,subject` order used by the const_subject sibling),
+    /// which SWAPPED the result: it returned `Greater` for `(h(x),h(a))`
+    /// and `Less` for `(h(a),h(x))` — the inverse of HS. (Latent
+    /// because the sole consumer `eq_term_subs` tests only `Equal`.)
+    #[test]
+    fn compare_term_subs_direction_matches_hs() {
+        let path = match maude_path() { Some(p) => p, None => { eprintln!("skipping: no maude"); return; } };
+        use crate::function_symbols::{NoEqSym, FunSym, Privacy, Constructability};
+        let h_sym = NoEqSym::new(b"h".to_vec(), 1, Privacy::Public, Constructability::Constructor);
+        let sig = pair_maude_sig().add_fun_sym(h_sym.clone());
+        let hnd = MaudeHandle::start(&path, sig).expect("start");
+        let mk = |v: LVar| -> LNTerm { crate::term::Term::Lit(Lit::Var(v)) };
+        let x = LVar::new("x", LSort::Msg, 0);
+        let a = crate::term::Term::Lit(Lit::Con(crate::lterm::Name::new(crate::lterm::NameTag::Pub, "a")));
+        let t_gen = crate::term::Term::App(FunSym::NoEq(h_sym.clone()), vec![mk(x)].into()); // h(x) general
+        let t_spec = crate::term::Term::App(FunSym::NoEq(h_sym.clone()), vec![a].into());    // h(a) specific
+        // general vs specific => general is LESS specific => Less.
+        assert_eq!(
+            crate::subsumption::compare_term_subs(&hnd, &t_gen, &t_spec).expect("cmp"),
+            Some(std::cmp::Ordering::Less),
+            "h(x) is more general than h(a); HS compareTermSubs gives Less");
+        // specific vs general => specific is MORE specific => Greater.
+        assert_eq!(
+            crate::subsumption::compare_term_subs(&hnd, &t_spec, &t_gen).expect("cmp"),
+            Some(std::cmp::Ordering::Greater),
+            "h(a) is more specific than h(x); HS compareTermSubs gives Greater");
+        // Identical (modulo renaming) terms compare Equal (invariant).
+        let y = LVar::new("y", LSort::Msg, 1);
+        let t_gen2 = crate::term::Term::App(FunSym::NoEq(h_sym.clone()), vec![mk(y)].into());
+        assert_eq!(
+            crate::subsumption::compare_term_subs(&hnd, &t_gen, &t_gen2).expect("cmp"),
+            Some(std::cmp::Ordering::Equal),
+            "h(x) and h(y) are equal modulo renaming => Equal");
     }
 }

@@ -34,6 +34,12 @@ pub enum GoalRanking {
     Smart(bool),
     /// `InjRanking useLoopBreakers` (ProofMethod.hs:1096).
     Inj(bool),
+    /// `GoalNrRanking` (ProofMethod.hs:694): `sortOn (fst . snd)` —
+    /// presort identifier `C`.
+    GoalNr,
+    /// `UsefulGoalNrRanking` (ProofMethod.hs:697):
+    /// `sortOn (\(_, (nr, useless)) -> (useless, nr))` — presort `c`.
+    UsefulGoalNr,
     /// `OracleRanking quitOnEmpty oracle` (ProofMethod.hs:695).
     /// preSort = `const goalNrRanking`.
     /// `oracle_path` is the resolved filesystem path of the oracle script.
@@ -41,6 +47,10 @@ pub enum GoalRanking {
     /// `OracleSmartRanking quitOnEmpty oracle` (ProofMethod.hs:696).
     /// preSort = `smartRanking ctxt False`.
     OracleSmart { quit_on_empty: bool, oracle_path: String },
+    /// `InternalTacticRanking quitOnEmpty (Tactic …)` (ProofMethod.hs:703).
+    /// The resolved per-lemma tactic (presort + prio/deprio selectors).
+    /// `quit_on_empty` is True for the `{.}` form, False for `{name}`.
+    Tactic { quit_on_empty: bool, tactic: std::sync::Arc<crate::tactic::Tactic> },
 }
 
 impl GoalRanking {
@@ -54,6 +64,10 @@ impl GoalRanking {
             'S' => GoalRanking::Smart(true),
             'i' => GoalRanking::Inj(false),
             'I' => GoalRanking::Inj(true),
+            // HS `GoalNrRanking` (System.hs `goalRankingIdentifiers`: 'C')
+            'C' => GoalRanking::GoalNr,
+            // HS `UsefulGoalNrRanking` ('c')
+            'c' => GoalRanking::UsefulGoalNr,
             // HS `OracleRanking False defaultOracle` (System.hs:589)
             'o' => GoalRanking::Oracle { quit_on_empty: false, oracle_path: oracle_path.to_string() },
             // HS `OracleSmartRanking False defaultOracle` (System.hs:590)
@@ -87,6 +101,20 @@ impl GoalRanking {
 ///   tactic_ranking ::= '{' [^}]* '}'
 ///   letter      ::= [a-zA-Z]
 pub fn parse_heuristic_str(s: &str, theory_file: &str) -> Vec<GoalRanking> {
+    parse_heuristic_str_with_tactics(s, theory_file, &[])
+}
+
+/// Like [`parse_heuristic_str`] but resolves `{name}` tactic rankings
+/// against the theory's tactic list (HS `chosenTactic`, ProofMethod.hs:
+/// 706-715).  A `{.}` (no name) resolves to HS `defaultTactic`
+/// (`Tactic "default" (SmartRanking False) [] []`, System.hs:534).  An
+/// unknown `{name}` falls back to `Smart(false)` (HS would `error`; we
+/// stay robust so non-tactic output is unaffected).
+pub fn parse_heuristic_str_with_tactics(
+    s: &str,
+    theory_file: &str,
+    tactics: &[crate::tactic::Tactic],
+) -> Vec<GoalRanking> {
     let default_oracle = crate::pretty_theory::oracle_name_for_theory(theory_file);
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
@@ -105,12 +133,35 @@ pub fn parse_heuristic_str(s: &str, theory_file: &str) -> Vec<GoalRanking> {
         if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
             break;
         }
-        // Tactic ranking `{name}` — out of scope; map to Smart(false)
+        // Tactic ranking `{name}` / `{.}` — HS `internalTacticRanking`
+        // (Signature.hs:298-303).  Resolve the name against the theory's
+        // tactic list (HS `chosenTactic`).  `{.}` (or name "." ) → HS
+        // `defaultTactic`.  quitOnEmpty is always False from parsing
+        // (HS `("{.}", InternalTacticRanking False defaultTactic)`,
+        // System.hs:597).
         if c == '{' {
             i += 1;
+            while i < chars.len() && chars[i] == ' ' { i += 1; }
+            let start = i;
             while i < chars.len() && chars[i] != '}' { i += 1; }
-            if i < chars.len() { i += 1; }
-            out.push(GoalRanking::Smart(false));
+            let name: String = chars[start..i].iter().collect::<String>().trim().to_string();
+            if i < chars.len() { i += 1; } // consume '}'
+            while i < chars.len() && chars[i] == ' ' { i += 1; }
+            let resolved = if name.is_empty() || name == "." {
+                // HS defaultTactic — Smart presort, no prios.  With no
+                // prios/deprios `itRanking` leaves the presort order
+                // unchanged, so this is equivalent to Smart(false).
+                GoalRanking::Smart(false)
+            } else {
+                match tactics.iter().find(|t| t.name == name) {
+                    Some(t) => GoalRanking::Tactic {
+                        quit_on_empty: false,
+                        tactic: std::sync::Arc::new(t.clone()),
+                    },
+                    None => GoalRanking::Smart(false),
+                }
+            };
+            out.push(resolved);
             continue;
         }
         // Oracle rankings with optional quoted path
@@ -426,6 +477,28 @@ fn rank_goals_with_inner(
         GoalRanking::Smart(use_loop_breakers) => {
             Ok(smart_ranking(sys, ctx, use_loop_breakers))
         }
+        GoalRanking::GoalNr => {
+            // HS `goalNrRanking = sortOn (fst . snd)` (ProofMethod.hs:814).
+            // `open_goals` already sorts by creation nr.
+            Ok(open_goals(sys))
+        }
+        GoalRanking::UsefulGoalNr => {
+            // HS `UsefulGoalNrRanking -> plainRanking (sortOn (\(_, (nr,
+            // useless)) -> (useless, nr)) ags)` (ProofMethod.hs:697).
+            let mut ags = open_goals(sys);
+            ags.sort_by(|a, b| {
+                tag_usefulness(a.usefulness)
+                    .cmp(&tag_usefulness(b.usefulness))
+                    .then_with(|| a.seq.cmp(&b.seq))
+            });
+            Ok(ags)
+        }
+        GoalRanking::Tactic { quit_on_empty, tactic } => {
+            // HS `InternalTacticRanking quitOnEmpty tactic ->
+            //   internalTacticRanking (chosenTactic ..) quitOnEmpty ..`
+            // (ProofMethod.hs:703,916).
+            internal_tactic_ranking(&tactic, quit_on_empty, ctx, sys)
+        }
         GoalRanking::Oracle { quit_on_empty, oracle_path } => {
             // HS `oracleRanking (const goalNrRanking) oracle quitOnEmpty ctxt sys ags`
             // (ProofMethod.hs:695): preSort = goalNrRanking (open_goals is already nr-sorted)
@@ -551,6 +624,313 @@ fn oracle_ranking(
     let mut result = ranked;
     result.extend(remaining);
     Ok(result)
+}
+
+// =============================================================================
+// Tactic ranking — port of `internalTacticRanking` / `itRanking`
+// (ProofMethod.hs:848-933) + selector evaluation (Parser/Tactics.hs:117-220).
+// =============================================================================
+
+/// Resolve the tactic's `_presort` (a `char` in the parsed `Tactic`) into
+/// a concrete `GoalRanking`.  Mirrors HS `selectedPreSort`
+/// (Tactics.hs:52-57) — defaults to `SmartRanking False` ('s').
+fn presort_ranking(presort: char) -> GoalRanking {
+    GoalRanking::from_char_with_oracle(presort, "oracle")
+}
+
+/// Apply a single `GoalRanking` (used as a tactic presort) to a list of
+/// already-open annotated goals.  The presort rankings the corpus uses
+/// are `C` (GoalNr), `c` (UsefulGoalNr), `s`/`S` (Smart).  This mirrors
+/// HS `rankGoals ctxt defaultMethod [tactic] _sys ags0`
+/// (ProofMethod.hs:920) restricted to the non-oracle, non-tactic
+/// presorts (a tactic presort cannot itself be a tactic or an oracle).
+fn apply_presort(
+    presort: &GoalRanking,
+    ags: Vec<AnnotatedGoal>,
+    sys: &System,
+    ctx: Option<&crate::constraint::solver::context::ProofContext>,
+) -> Vec<AnnotatedGoal> {
+    match presort {
+        GoalRanking::GoalNr => {
+            // sortOn (fst . snd) — ags from open_goals are already nr-sorted.
+            let mut a = ags;
+            a.sort_by_key(|g| g.seq);
+            a
+        }
+        GoalRanking::UsefulGoalNr => {
+            let mut a = ags;
+            a.sort_by(|x, y| {
+                tag_usefulness(x.usefulness)
+                    .cmp(&tag_usefulness(y.usefulness))
+                    .then_with(|| x.seq.cmp(&y.seq))
+            });
+            a
+        }
+        GoalRanking::Smart(use_loop_breakers) => {
+            // smartRanking re-derives the open-goal list from `sys`; the
+            // tactic presort 's' is the default. We re-run smart_ranking
+            // over the full system (it internally calls open_goals).
+            smart_ranking(sys, ctx, *use_loop_breakers)
+        }
+        GoalRanking::Inj(use_loop_breakers) => {
+            inj_ranking(sys, ctx, *use_loop_breakers)
+        }
+        // A tactic presort can only be one of the plain rankings above
+        // (Tactics.hs `goalRankingPresort` parses with `noOracle`, so an
+        // oracle/tactic presort is unreachable).  Fall back to nr order.
+        _ => {
+            let mut a = ags;
+            a.sort_by_key(|g| g.seq);
+            a
+        }
+    }
+}
+
+/// Port of HS `internalTacticRanking` (ProofMethod.hs:916-933):
+///   defaultMethod = _presort tactic
+///   ags = ranked $ rankGoals ctxt defaultMethod [tactic] _sys ags0
+///   res = itRanking tactic ags quitOnEmpty ctxt _sys
+fn internal_tactic_ranking(
+    tactic: &crate::tactic::Tactic,
+    quit_on_empty: bool,
+    ctx: Option<&crate::constraint::solver::context::ProofContext>,
+    sys: &System,
+) -> Result<Vec<AnnotatedGoal>, OracleError> {
+    let presort = presort_ranking(tactic.presort);
+    let ags0 = open_goals(sys);
+    let ags = apply_presort(&presort, ags0, sys, ctx);
+    it_ranking(tactic, ags, quit_on_empty, ctx, sys)
+}
+
+/// Port of HS `itRanking` (ProofMethod.hs:848-909) — the core tactic
+/// reordering algorithm:
+///
+///   * For each goal, `indexPrio` = index of the FIRST prio that
+///     recognises it (any selector true), or `Nothing`.
+///   * `indexedPrio = sortOn fst (zip indexPrio ags)`; goals with the
+///     same first-matching prio are grouped, in ascending prio order;
+///     unmatched goals (`Nothing` = greatest) are dropped.
+///   * Within each prio group, apply that prio's optional `rankingPrio`
+///     sub-ordering function (`smallest` / `id`).
+///   * `rankedPrioGoals = concat` of those.  Same for deprio.
+///   * `nonRanked = ags \\ (rankedPrioGoals ++ rankedDeprioGoals)`
+///     preserving presort order.
+///   * `result = rankedPrioGoals ++ nonRanked ++ rankedDeprioGoals`.
+fn it_ranking(
+    tactic: &crate::tactic::Tactic,
+    ags: Vec<AnnotatedGoal>,
+    quit_on_empty: bool,
+    ctx: Option<&crate::constraint::solver::context::ProofContext>,
+    sys: &System,
+) -> Result<Vec<AnnotatedGoal>, OracleError> {
+    let ranked_prio = rank_by_blocks(&tactic.prios, &ags, ctx, sys);
+    let ranked_deprio = rank_by_blocks(&tactic.deprios, &ags, ctx, sys);
+
+    // nonRanked = filter (`notElem` rankedPrio ++ rankedDeprio) ags
+    // (preserves presort order).  Compare by goal identity (seq + goal).
+    let in_set = |g: &AnnotatedGoal, set: &[AnnotatedGoal]| -> bool {
+        set.iter().any(|x| x.seq == g.seq && x.goal == g.goal)
+    };
+    let non_ranked: Vec<AnnotatedGoal> = ags
+        .iter()
+        .filter(|g| !in_set(g, &ranked_prio) && !in_set(g, &ranked_deprio))
+        .cloned()
+        .collect();
+
+    // quitOnEmpty: `guard (quitOnEmpty && null rankedPrioGoals &&
+    //   null rankedDeprioGoals) *> Just ApplySorry` (ProofMethod.hs:850).
+    if quit_on_empty && ranked_prio.is_empty() && ranked_deprio.is_empty() {
+        return Err(OracleError("__ORACLE_QUIT_ON_EMPTY__".to_string()));
+    }
+
+    // result = rankedPrioGoals ++ nonRanked ++ rankedDeprioGoals
+    let mut result = ranked_prio;
+    result.extend(non_ranked);
+    result.extend(ranked_deprio);
+    Ok(result)
+}
+
+/// Compute `rankedPrioGoals` (or `rankedDeprioGoals`) for one block list.
+///
+/// Mirrors the `indexPrio` / `groupedPrio` / `rankingPrio` pipeline in
+/// `itRanking` (ProofMethod.hs:853-863):
+///   1. For each goal, find the index of the first block whose ANY
+///      selector matches (`findIndex (==True) . applyIsPrio`).
+///   2. Stable-group goals by that index in ascending order; drop
+///      unmatched goals.
+///   3. Within each group, apply that block's ranking function.
+///   4. Concatenate.
+fn rank_by_blocks(
+    blocks: &[crate::tactic::PrioBlock],
+    ags: &[AnnotatedGoal],
+    ctx: Option<&crate::constraint::solver::context::ProofContext>,
+    sys: &System,
+) -> Vec<AnnotatedGoal> {
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+    // index_of_first_matching_block for each goal.
+    // HS `indexedPrio = sortOn fst (zip indexPrio ags)` then `groupBy`
+    // on equal index.  `sortOn` is STABLE, so within one index the goals
+    // keep their presort (ags) order.  `Nothing` sorts AFTER `Just _`
+    // and is dropped.  We replicate by iterating block indices 0..n and
+    // collecting the goals whose first-match is that index, in ags order.
+    let first_match: Vec<Option<usize>> = ags
+        .iter()
+        .map(|g| {
+            blocks
+                .iter()
+                .position(|b| block_matches(b, g, ctx, sys))
+        })
+        .collect();
+
+    let mut out = Vec::new();
+    for (bi, block) in blocks.iter().enumerate() {
+        let group: Vec<AnnotatedGoal> = ags
+            .iter()
+            .zip(first_match.iter())
+            .filter(|(_, fm)| **fm == Some(bi))
+            .map(|(g, _)| g.clone())
+            .collect();
+        if group.is_empty() {
+            continue;
+        }
+        // Apply this block's ranking function (id / smallest).
+        out.extend(apply_ranking_fn(&block.ranking, group));
+    }
+    out
+}
+
+/// HS `rankingFunctions` (Tactics.hs:244-265): `id` (identity) and
+/// `smallest` (sort by rendered-goal string length, stable).
+fn apply_ranking_fn(name: &str, group: Vec<AnnotatedGoal>) -> Vec<AnnotatedGoal> {
+    match name {
+        "smallest" => {
+            // sortOn (length . render . prettyGoal) — STABLE.
+            let mut g = group;
+            g.sort_by_key(|a| {
+                let s = crate::pretty_theory::render_goal_for_oracle(&a.goal);
+                s.lines().collect::<Vec<_>>().concat().chars().count()
+            });
+            g
+        }
+        // "id" / "" / anything else → identity.
+        _ => group,
+    }
+}
+
+/// Does block `b` recognise goal `g`? HS `isPrio = or . sequenceA
+/// functionsPrio` (ProofMethod.hs:884): True iff ANY of the block's
+/// disjunct selector-expressions evaluates True.
+fn block_matches(
+    b: &crate::tactic::PrioBlock,
+    g: &AnnotatedGoal,
+    ctx: Option<&crate::constraint::solver::context::ProofContext>,
+    sys: &System,
+) -> bool {
+    b.selectors.iter().any(|e| eval_selector(e, g, ctx, sys))
+}
+
+/// Evaluate a `SelectorExpr` against a goal.  Mirrors HS's
+/// `functionNot`/`functionAnd`/`functionOr` combinators
+/// (Tactics.hs:72-79) bottoming out at `nameToFunction`.
+fn eval_selector(
+    e: &crate::tactic::SelectorExpr,
+    g: &AnnotatedGoal,
+    ctx: Option<&crate::constraint::solver::context::ProofContext>,
+    sys: &System,
+) -> bool {
+    use crate::tactic::SelectorExpr;
+    match e {
+        SelectorExpr::Leaf(leaf) => eval_leaf(leaf, g, ctx, sys),
+        SelectorExpr::Not(inner) => !eval_selector(inner, g, ctx, sys),
+        SelectorExpr::And(a, b) => {
+            eval_selector(a, g, ctx, sys) && eval_selector(b, g, ctx, sys)
+        }
+        SelectorExpr::Or(a, b) => {
+            eval_selector(a, g, ctx, sys) || eval_selector(b, g, ctx, sys)
+        }
+    }
+}
+
+/// The rendered-goal string HS `regex` matches against:
+/// `pg = concat . lines . render $ prettyGoal agoal` (Tactics.hs:134).
+fn tactic_pg(g: &AnnotatedGoal) -> String {
+    let s = crate::pretty_theory::render_goal_for_oracle(&g.goal);
+    s.lines().collect::<Vec<_>>().concat()
+}
+
+/// Evaluate one selector leaf (`regex "..."`, `dhreNoise "..."`, …).
+/// Mirrors HS `tacticFunctions` (Tactics.hs:117-220).
+fn eval_leaf(
+    leaf: &crate::tactic::SelectorLeaf,
+    g: &AnnotatedGoal,
+    _ctx: Option<&crate::constraint::solver::context::ProofContext>,
+    _sys: &System,
+) -> bool {
+    match leaf.name.as_str() {
+        "regex" => {
+            // HS `regex' (regex:_) (agoal,_,_) = pg =~ regex`
+            // (Tactics.hs:128-130).  `=~ :: Bool` with Text.Regex.PCRE is
+            // an UNANCHORED search (matches if found anywhere).  We use
+            // `fancy-regex` (PCRE-compatible: lookaround, backrefs) and
+            // `is_match` for the same unanchored Bool semantics.
+            match leaf.params.first() {
+                Some(pat) => regex_is_match(pat, &tactic_pg(g)),
+                None => false,
+            }
+        }
+        // The remaining selectors (dhreNoise, reasonableNoncesNoise,
+        // defaultNoise, nonAbsurdConstraint, isFactName, isInFactTerms)
+        // inspect the System's `sFormulas` reveal-terms and DH-exp
+        // patterns via `show`-based string matching (Tactics.hs:136-220).
+        // These are NOT yet faithfully ported.
+        //
+        // HONESTY NOTE: `dhreNoise` / `reasonableNoncesNoise` DO appear
+        // inside tactics driving real corpus `[heuristic={..}]` lemmas —
+        // the `features/noise/secrecy_{2_IK,3_passive_K1X1,4_passiveIN..}`
+        // family.  For those, this conservative `false` (the prio simply
+        // does not recognise the goal, which then falls through to
+        // `nonRanked`) lets the proof still COMPLETE but is NOT
+        // byte-identical to HS — it perturbs the DH-goal ordering (~186
+        // raw-diff lines on secrecy_2_IK).  The alethea family and every
+        // other corpus tactic verified here use ONLY `regex` selectors,
+        // which are faithful.  Porting the noise selectors faithfully
+        // requires replicating HS's `show (LVar/term)` byte-for-byte and
+        // is left as a distinct follow-up.
+        other => {
+            if std::env::var("TAM_RS_TACTIC_DBG").is_ok() {
+                eprintln!("[RS_TACTIC] unimplemented selector '{}' → false \
+                    (noise family not byte-faithful)", other);
+            }
+            false
+        }
+    }
+}
+
+/// PCRE-compatible unanchored match, mirroring HS `pg =~ regex` with
+/// `Text.Regex.PCRE`.  Compiled patterns are cached per-string.
+fn regex_is_match(pattern: &str, haystack: &str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<std::sync::Arc<fancy_regex::Regex>>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let compiled = {
+        let mut map = cache.lock().unwrap();
+        map.entry(pattern.to_string())
+            .or_insert_with(|| {
+                fancy_regex::Regex::new(pattern)
+                    .ok()
+                    .map(std::sync::Arc::new)
+            })
+            .clone()
+    };
+    match compiled {
+        Some(re) => re.is_match(haystack).unwrap_or(false),
+        None => false,
+    }
 }
 
 
@@ -2032,5 +2412,134 @@ mod tests {
                     "variants {} and {} share a discriminant!", i, j);
             }
         }
+    }
+
+    // -- Tactic ranking tests -------------------------------------------------
+
+    /// HS `pg =~ regex` is an UNANCHORED PCRE search (matches anywhere).
+    #[test]
+    fn regex_unanchored_and_pcre_features() {
+        // Unanchored substring search.
+        assert!(regex_is_match("In_S", "solve( In_S( 'H1' ) )"));
+        assert!(!regex_is_match("In_S", "solve( In_A( 'H1' ) )"));
+        // Literal escaped paren `\(` (PCRE).
+        assert!(regex_is_match(r"In_A\( 'S'", "In_A( 'S', <'codes'>)"));
+        assert!(!regex_is_match(r"In_A\( 'S'", "In_A( 'BB', x)"));
+        // Quoted-literal pattern from the corpus tactics.
+        assert!(regex_is_match("'proofV'", "BB_C( <'proofV', x> )"));
+        // PCRE negative lookahead — fancy-regex feature the `regex` crate
+        // can't compile.  `!KU( <not one|true> )`.
+        let pat = r"!KU\( (?!(one|true))[a-zA-Z0-9.]+ \)";
+        assert!(regex_is_match(pat, "!KU( foo )"));
+        assert!(!regex_is_match(pat, "!KU( one )"));
+        // PCRE lookbehind.
+        let lb = r"(?<!'g'\^)~[a-zA-Z.0-9]*";
+        assert!(regex_is_match(lb, "x ~n1"));
+        assert!(!regex_is_match(lb, "'g'^~n1"));
+        // A regex that fails to compile yields `false`, never panics.
+        assert!(!regex_is_match("(", "anything"));
+    }
+
+    /// `apply_ranking_fn "smallest"` sorts by rendered length, stably;
+    /// "id"/unknown is identity.
+    #[test]
+    fn ranking_fn_smallest_and_id() {
+        use crate::fact::ku_fact;
+        use tamarin_term::lterm::fresh_term;
+        let mk = |s: &str, seq: u64| {
+            let v = tamarin_term::lterm::LVar::new("x", tamarin_term::lterm::LSort::Msg, 0);
+            AnnotatedGoal::new(Goal::Action(v, ku_fact(fresh_term(s))), seq, Usefulness::Useful)
+        };
+        // `~aaaa` renders longer than `~a`.
+        let g_long = mk("aaaa", 0);
+        let g_short = mk("a", 1);
+        let out = apply_ranking_fn("smallest", vec![g_long.clone(), g_short.clone()]);
+        assert_eq!(out[0].seq, 1, "shortest rendered goal first");
+        assert_eq!(out[1].seq, 0);
+        // id keeps input order.
+        let out2 = apply_ranking_fn("id", vec![g_long.clone(), g_short.clone()]);
+        assert_eq!(out2[0].seq, 0);
+        assert_eq!(out2[1].seq, 1);
+    }
+
+    /// `it_ranking` result = rankedPrioGoals ++ nonRanked ++ rankedDeprioGoals,
+    /// with prio groups in ascending-block order and unmatched goals
+    /// preserved in presort order.
+    #[test]
+    fn it_ranking_prio_nonranked_deprio_order() {
+        use crate::fact::ku_fact;
+        use crate::tactic::{PrioBlock, SelectorExpr, SelectorLeaf, Tactic};
+        use tamarin_term::lterm::fresh_term;
+
+        let mk = |s: &str, seq: u64| {
+            let v = tamarin_term::lterm::LVar::new("x", tamarin_term::lterm::LSort::Msg, 0);
+            AnnotatedGoal::new(Goal::Action(v, ku_fact(fresh_term(s))), seq, Usefulness::Useful)
+        };
+        // Goals render as `!KU( ~skS )`, `!KU( ~r )`, `!KU( ~x )`.
+        let g_sks = mk("skS", 0);
+        let g_r = mk("r", 1);
+        let g_x = mk("x", 2);
+        let ags = vec![g_sks.clone(), g_r.clone(), g_x.clone()];
+
+        let prio = |pat: &str| PrioBlock {
+            ranking: "id".to_string(),
+            disjuncts: vec![format!("regex \"{}\"", pat)],
+            selectors: vec![SelectorExpr::Leaf(SelectorLeaf {
+                name: "regex".to_string(),
+                params: vec![pat.to_string()],
+            })],
+        };
+        // Fresh names render as `~'skS'` etc.  prio 0 matches ~'r',
+        // prio 1 matches ~'skS'; ~'x' matches no prio. deprio matches ~'x'.
+        let tactic = Tactic {
+            name: "t".to_string(),
+            presort: 'C',
+            prios: vec![prio("~'r'"), prio("~'skS'")],
+            deprios: vec![prio("~'x'")],
+        };
+
+        let sys = System::empty();
+        let out = it_ranking(&tactic, ags, false, None, &sys).unwrap();
+        let seqs: Vec<u64> = out.iter().map(|a| a.seq).collect();
+        // rankedPrio = [~r (block0), ~skS (block1)]; nonRanked = []
+        // (every goal matched a prio or deprio); rankedDeprio = [~x].
+        assert_eq!(seqs, vec![1, 0, 2],
+            "prio(~r) then prio(~skS) then deprio(~x); got {:?}", seqs);
+    }
+
+    /// A goal matching NO prio/deprio lands in `nonRanked`, between the
+    /// prio'd and deprio'd goals, in presort order.
+    #[test]
+    fn it_ranking_nonranked_preserved() {
+        use crate::fact::ku_fact;
+        use crate::tactic::{PrioBlock, SelectorExpr, SelectorLeaf, Tactic};
+        use tamarin_term::lterm::fresh_term;
+        let mk = |s: &str, seq: u64| {
+            let v = tamarin_term::lterm::LVar::new("x", tamarin_term::lterm::LSort::Msg, 0);
+            AnnotatedGoal::new(Goal::Action(v, ku_fact(fresh_term(s))), seq, Usefulness::Useful)
+        };
+        // Put the prio-matching goal LAST in presort order so a passing
+        // result genuinely proves reordering (not a no-op).
+        let g_b = mk("b", 0); // no match → nonRanked
+        let g_c = mk("c", 1); // no match → nonRanked
+        let g_a = mk("a", 2); // matches prio → moves to front
+        let prio = PrioBlock {
+            ranking: "id".to_string(),
+            disjuncts: vec!["regex \"~'a'\"".to_string()],
+            selectors: vec![SelectorExpr::Leaf(SelectorLeaf {
+                name: "regex".to_string(),
+                params: vec!["~'a'".to_string()],
+            })],
+        };
+        let tactic = Tactic {
+            name: "t".to_string(), presort: 'C',
+            prios: vec![prio], deprios: vec![],
+        };
+        let sys = System::empty();
+        let out = it_ranking(&tactic, vec![g_b, g_c, g_a], false, None, &sys).unwrap();
+        let seqs: Vec<u64> = out.iter().map(|a| a.seq).collect();
+        // ~'a' (prio, seq 2) first, then nonRanked [~'b'=0, ~'c'=1] in
+        // presort order.
+        assert_eq!(seqs, vec![2, 0, 1]);
     }
 }

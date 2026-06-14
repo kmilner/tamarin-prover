@@ -1063,9 +1063,18 @@ pub fn term_to_doc(t: &p::Term, scope: &[Bind]) -> crate::pretty_hpj::Doc {
             // fcat structure as pairs, with `(`/`)` lead/finish and the AC-op
             // symbol as separator (no surrounding spaces).
             if matches!(op, p::BinOp::Exp) {
-                let mut s = String::new();
-                pp_term(t, scope, &mut s);
-                Doc::text(s)
+                // HS `prettyTerm` (Term/Term.hs:274):
+                //   `FApp (NoEq s) [t1,t2] | s == expSym -> ppTerm t1 <> "^" <> ppTerm t2`
+                // The exp itself never breaks at the `^`, but its operands are
+                // recursively `ppTerm`'d, so an AC exponent (e.g.
+                // `'g'^(~a*~b)`) keeps its inner `fcat` BREAK POINTS — the
+                // `*`-operands wrap when the term overruns at deep indent.
+                // Flattening the whole exp to a string (the old behaviour)
+                // destroyed those break points.  Compose the operand Docs with
+                // `beside` (HS `<>`) so the inner fcat survives.
+                term_to_doc(l, scope)
+                    .beside(Doc::text("^"))
+                    .beside(term_to_doc(r, scope))
             } else {
                 // Flatten same-op children to the n-ary chain HS's `viewTerm`
                 // exposes for AC symbols.
@@ -1242,11 +1251,15 @@ fn gterm_to_doc(t: &crate::guarded::GTerm, scope: &[Vec<Bind>]) -> crate::pretty
             gfun_doc("diff", &args, scope)
         }
         BinOp(op, l, r) => {
-            // exp flat; AC ops wrap via fcat (Term/Term.hs:273-274).
+            // exp never breaks at `^`, but its operands are recursively
+            // `ppTerm`'d (Term/Term.hs:274 `ppTerm t1 <> "^" <> ppTerm t2`),
+            // so an AC exponent (`'g'^(~a*~b)`) keeps its inner `fcat` break
+            // points.  Composing operand Docs with `beside` preserves them;
+            // flattening the whole exp to a string destroyed them.
             if matches!(op, p::BinOp::Exp) {
-                let mut s = String::new();
-                pp_gterm(t, scope, &mut s);
-                Doc::text(s)
+                gterm_to_doc(l, scope)
+                    .beside(Doc::text("^"))
+                    .beside(gterm_to_doc(r, scope))
             } else {
                 fn flatten<'a>(
                     op: p::BinOp,
@@ -2410,6 +2423,48 @@ mod tests {
         assert!(s.contains("~longPayloadNameNumberTwo"), "payload missing:\n{s}");
         // The Eq's `=` is rendered (HS `sep [ppT l <-> opEqual, ppT r]`).
         assert!(s.contains("z ="), "Eq operator missing:\n{s}");
+    }
+
+    /// Regression: the AC `*` exponent inside an `exp` term must keep its
+    /// `fcat` break points.  HS `prettyTerm` (Term/Term.hs:274) renders exp as
+    /// `ppTerm t1 <> "^" <> ppTerm t2`, so the exponent `t2 = (~a*~b)` stays a
+    /// breakable `fcat`.  The old Doc renderer flattened the whole exp to a
+    /// string, so `hmac('g'^(~a*~b), ...)` ran past LINE_LENGTH=110 instead of
+    /// wrapping the `*`-operands like HS.  Mirrors the spdm
+    /// `hmac('g'^(~newPrivKey*~respPrivKey), ...)` proof-line divergence.
+    #[test]
+    fn exp_with_ac_exponent_wraps_inside_fun() {
+        // hmac('g'^(~longFreshPrivKeyOne*~longFreshPrivKeyTwo), ~longSaltArgument)
+        let exp = p::Term::BinOp(
+            p::BinOp::Exp,
+            Box::new(p::Term::PubLit("g".into())),
+            Box::new(p::Term::BinOp(
+                p::BinOp::Mult,
+                Box::new(p::Term::Var(v("longFreshPrivKeyOne", p::SortHint::Fresh))),
+                Box::new(p::Term::Var(v("longFreshPrivKeyTwo", p::SortHint::Fresh))),
+            )),
+        );
+        let t = p::Term::App(
+            "hmac".into(),
+            vec![exp.clone(), p::Term::Var(v("longSaltArgumentName", p::SortHint::Fresh))],
+        );
+        let doc = term_to_doc(&t, &[]);
+        // Deep indent (col 30) so the flat term overruns and the `*`-operands
+        // must each break onto their own line at `nest 1` (HS layout).
+        let s = doc.render_at(LINE_LENGTH, RIBBON, 30);
+        assert!(s.contains("*\n"),
+            "AC `*` exponent inside exp did not wrap:\n{s}");
+        // exp's `^` and `'g'` stay on the first line (exp never breaks at `^`).
+        assert!(s.lines().next().unwrap().contains("'g'^("),
+            "exp head should stay flat as `'g'^(`:\n{s}");
+        // No flat line exceeds the page width.
+        for line in s.lines() {
+            assert!(line.chars().count() <= LINE_LENGTH,
+                "line overruns LINE_LENGTH:\n{line}");
+        }
+        // The plain (well-fitting) exp still renders flat with no wrap.
+        let flat = term_to_doc(&exp, &[]).render_at(LINE_LENGTH, RIBBON, 0);
+        assert_eq!(flat, "'g'^(~longFreshPrivKeyOne*~longFreshPrivKeyTwo)");
     }
 
     // The curly-brace form `name{a}b` in the source is parser-only sugar

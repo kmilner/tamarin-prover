@@ -2025,9 +2025,37 @@ fn match_atom_via_maude(
         // like MTI_C0::Secrecy_..._Initiator fail to fire
         // `impliedFormulas` on `AcceptedR(... exp(g, ~tid*~x.5) ...)`
         // and the search enumerates spurious Sessionkey_Reveal cases.
-        // Maude.hs's `match` requires a ground subject; we skolemize
-        // subject-side free vars via `match_eqs_const_subject` (which
-        // mirrors HS's `SkConst` encoding from `skolemizeGuarded`).
+        //
+        // HS-faithful skolemization (CRITICAL): HS's `impliedFormulas`
+        // (`System.hs:1112,1122`) runs `gf = skolemizeGuarded gf0`, which
+        // turns EVERY free LVar of the guarded clause into `Con (SkConst
+        // v)` — a Maude *constant* (`lTermToMTerm` ⇒ `MaudeConst`,
+        // `Maude/Types.hs:75`) — while the universal's BOUND vars,
+        // instantiated by `openGuarded`, stay `Var lv` ⇒ `MaudeVar`
+        // (bindable).  `sysActions` (`System.hs:1128-1129`) likewise
+        // `skolemizeTerm`s the system action, so its vars are also
+        // `SkConst`.  So in HS's `matchAction sysAct (guard)` the PATTERN's
+        // free (non-universal) vars are GROUND CONSTANTS, not bindable.
+        //
+        // Therefore both sides must be skolemized with a SHARED map (same
+        // LVar ⇒ same constant on both sides, so a free var occurring in
+        // BOTH still matches itself) — exactly `match_eqs_skolemize_both`.
+        // The earlier `match_eqs_const_subject` only skolemized the
+        // SUBJECT, leaving the pattern's free non-universal vars as Maude
+        // VARIABLES that Maude binds to anything.  On DH key-exchange
+        // lemmas (csf12/STS_MAC_fix2, sp14/group_joux, csf12/JKL_TS1_*)
+        // the multi-guard `∀ … SesskRev(tpartner)@i3 ∧
+        // AcceptedR(tpartner,I,R,hki,hkr,kpartner)@i4 ⇒ ⊥` universal then
+        // over-matched a system `AcceptedR(tid,I.16,R.17,exp(g,x.21),
+        // exp(g,tid),KDF(exp(g,ekI*ekR)))`: the pattern's free system vars
+        // `I,R,ekI,ekR` (NOT in the universal's bound set) bound freely to
+        // the action's *different* skolem constants, so `gfalse` fired one
+        // node early (at /Init_1/…/Resp_1 instead of under the
+        // `splitEqs(1)` `case split`), verifying in fewer steps than HS.
+        // With shared skolemization those positions are constant-vs-
+        // constant and the match correctly fails there — matching HS.
+        // (eadeb1c4 got the match COMMAND direction right but left this
+        // pattern-skolemization gap; the OLD swapped command masked it.)
         //
         // HS-faithful: Maude's AC `match` can return MULTIPLE matchers
         // for a single pattern/subject pair (e.g. `match Union(a,x) <=?
@@ -2054,7 +2082,7 @@ fn match_atom_via_maude(
             tamarin_term::maude_proc::_tally_callsite("ac_fallback::AC_FREE_BAIL");
             return Vec::new();
         }
-        let maude_res = maude.match_eqs_const_subject(&eqs, &pattern_vars);
+        let maude_res = maude.match_eqs_skolemize_both(&eqs, &pattern_vars);
         let Ok(matches) = maude_res else { return Vec::new() };
         if matches.is_empty() { return Vec::new(); }
         ms = matches;

@@ -1094,18 +1094,52 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
 /// `pretty_lnterm` produce slightly different spacing around commas
 /// and operators).  Collapses any run of ASCII whitespace into a single
 /// space and trims.
+///
+/// Additionally removes whitespace that sits *immediately inside* a
+/// bracket / paren delimiter — i.e. directly after `<`, `(` or directly
+/// before `>`, `)`.  The skeleton text comes from the STORED proof,
+/// whose `solve(...)` terms are pretty-printed by HughesPJ with line
+/// wrapping: a pair `<a, b>` that overflows the ribbon wraps to
+/// `<\n        a,\n        b\n      >`, and after the whitespace-collapse
+/// above that becomes `< a, b >`.  The runtime `render_lnterm` renders
+/// the same term un-wrapped as `<a, b>` (no inner space).  Without this
+/// extra normalisation the two strings differ only by those wrap-induced
+/// `< `/` >`/`( `/` )` spaces, the term-text disambiguation in
+/// `match_goal` returns 0 matches, and the fallback time-var tie-break
+/// then mis-selects the smallest-idx `#vk` knowledge goal (e.g.
+/// `!KU($USR)`) in place of the skeleton's intended `!KU(hmac(...))`.
+/// The spacing is purely cosmetic (it only ever arises from wrapping),
+/// so stripping it is structure-preserving and HS-faithful.
 fn canonicalise_term_text(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    // Pass 1: collapse runs of ASCII whitespace to a single space, trim.
+    let mut collapsed = String::with_capacity(s.len());
     let mut last_ws = true; // suppress leading whitespace
     for c in s.chars() {
         if c.is_whitespace() {
-            if !last_ws { out.push(' '); last_ws = true; }
+            if !last_ws { collapsed.push(' '); last_ws = true; }
         } else {
-            out.push(c);
+            collapsed.push(c);
             last_ws = false;
         }
     }
-    if out.ends_with(' ') { out.pop(); }
+    if collapsed.ends_with(' ') { collapsed.pop(); }
+    // Pass 2: drop a space that immediately follows `<`/`(` (opening
+    // delimiter) or immediately precedes `>`/`)` (closing delimiter).
+    let bytes: Vec<char> = collapsed.chars().collect();
+    let mut out = String::with_capacity(bytes.len());
+    let mut prev: Option<char> = None;
+    for (idx, &c) in bytes.iter().enumerate() {
+        if c == ' ' {
+            if matches!(prev, Some('<') | Some('(')) {
+                continue; // space right after an opening delimiter
+            }
+            if matches!(bytes.get(idx + 1), Some('>') | Some(')')) {
+                continue; // space right before a closing delimiter
+            }
+        }
+        out.push(c);
+        prev = Some(c);
+    }
     out
 }
 
@@ -1200,6 +1234,41 @@ mod tests {
             None
         })?;
         MaudeHandle::start(&path, pair_maude_sig()).ok()
+    }
+
+    /// `canonicalise_term_text` must normalise away the wrap-induced
+    /// whitespace that a STORED proof's pretty-printer inserts directly
+    /// inside `<…>` / `(…)` delimiters when a term overflows the ribbon.
+    /// Regression for the trace-existence `exists_trace` replay bug: the
+    /// skeleton `solve( !KU(hmac(<KSQ, $USR, senc(<…>, …)>, …)) )` term
+    /// wraps as `senc(< … CD_j.1 >, …)` (note `< `/` >`), while the
+    /// runtime renders `senc(<…CD_j.1>, …)` (no inner space).  If these
+    /// don't canonicalise equal, term-disambiguation in `match_goal`
+    /// fails and the time-var fallback mis-picks the smallest-idx `#vk`
+    /// knowledge goal (`!KU($USR)`) instead of the intended hmac goal.
+    #[test]
+    fn canonicalise_strips_wrap_spaces_inside_brackets() {
+        // Wrapped (skeleton) form after the whitespace-collapse pass:
+        let skel = "hmac(<KSQ, $USR, senc(< ~CDSK_j_USR_O, ~MDSK_j_USR_O, KSQ, $USR, keystatus, CD_j.1 >, ~UK_i_USR_O) >, ~MDSK_j_USR_O)";
+        // Runtime (un-wrapped) form:
+        let rt = "hmac(<KSQ, $USR, senc(<~CDSK_j_USR_O, ~MDSK_j_USR_O, KSQ, $USR, keystatus, CD_j.1>, ~UK_i_USR_O)>, ~MDSK_j_USR_O)";
+        assert_eq!(canonicalise_term_text(skel), canonicalise_term_text(rt));
+        // The canonical form must carry NO space adjacent to the inside
+        // of a bracket/paren.
+        let c = canonicalise_term_text(skel);
+        assert!(!c.contains("< "), "no `< ` in {c}");
+        assert!(!c.contains(" >"), "no ` >` in {c}");
+        assert!(!c.contains("( "), "no `( ` in {c}");
+        assert!(!c.contains(" )"), "no ` )` in {c}");
+        // Multi-line input (raw skeleton text with newlines + indent)
+        // canonicalises identically to the runtime form.
+        let multiline = "hmac(<KSQ, \n   $USR, \n   senc(<\n     ~CDSK_j_USR_O, KSQ, $USR, keystatus, CD_j.1\n    >,\n    ~UK_i_USR_O)\n   >,\n   ~MDSK_j_USR_O)";
+        let rt2 = "hmac(<KSQ, $USR, senc(<~CDSK_j_USR_O, KSQ, $USR, keystatus, CD_j.1>, ~UK_i_USR_O)>, ~MDSK_j_USR_O)";
+        assert_eq!(canonicalise_term_text(multiline), canonicalise_term_text(rt2));
+        // Inter-token spaces (e.g. after commas) are PRESERVED so distinct
+        // terms never collapse together.
+        assert_eq!(canonicalise_term_text("<a, b>"), "<a, b>");
+        assert_ne!(canonicalise_term_text("<a, b>"), canonicalise_term_text("<a, c>"));
     }
 
     /// A Sorry-only skeleton on an empty system should be a degenerate
