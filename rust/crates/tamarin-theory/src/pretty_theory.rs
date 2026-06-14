@@ -1096,16 +1096,11 @@ fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule, att
     let has_residual_variants = rule.variant_substs.iter().any(|sub| !sub.is_empty());
     if has_residual_variants {
         s.push_str("    variants (modulo AC)\n");
-        // HS `numbered'` (PrettyPrint/Class.hs:252-259) right-pads each
-        // variant number to the width of the largest number so the dots
-        // line up: e.g. with 21 variants, variant 1 is rendered as
-        // ` 1.` (leading space) to align with `21.`.
-        let total = rule.variant_substs.len();
-        let n_width = total.to_string().len();
-        for (i, subst) in rule.variant_substs.iter().enumerate() {
-            if i > 0 { s.push_str("    \n"); }
-            s.push_str(&render_variant_subst(i + 1, subst, n_width));
-        }
+        // HS `prettyDisjLNSubstsVFresh = numbered' (map ppConj substs)`
+        // (SubstVFresh.hs:223-227).  Built and rendered as ONE Doc at
+        // `nest 4` so the `text i <> ". " <> vcat` beside-onto-multiline
+        // ribbon interaction is HS-faithful — see `variant_subst_doc`.
+        s.push_str(&render_variant_substs_block(&rule.variant_substs));
     }
     // HS `prettyProtoRuleACInfo i = ppVariants ... $-$ prettyLoopBreakers i`
     // (Rule.hs:1284-1287): the loop-breaker line also appears INSIDE the
@@ -1117,55 +1112,74 @@ fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule, att
     s
 }
 
-/// Render one entry of `prettyDisjLNSubstsVFresh`
-/// (SubstVFresh.hs:223-229): the variant's number, then each domain var
-/// followed by `= <range>`.  HS aligns the `=` at column 6 from the
-/// entry's local origin when the var name is short, otherwise wraps to
-/// a new line.
+/// Render one entry of `prettyDisjLNSubstsVFresh` (SubstVFresh.hs:223-229)
+/// as a Doc: the variant's number, then each domain var followed by
+/// `= <range>`.  `n_width` is the width of the largest variant number
+/// (HS `numbered`'s `nWidth = length (show n)`, Class.hs:258); each
+/// variant's number is right-flushed in that width so dots line up.
 ///
-/// `n_width` is the width of the largest variant number (HS's
-/// `numbered`'s `nWidth = length (show n)` at PrettyPrint/Class.hs:258);
-/// each variant's number is right-flushed in that width so dots line up.
-fn render_variant_subst(
+/// HS `numbered` (Class.hs:252-259) renders each variant as
+/// `pp (i, d) = text (flushRight nWidth (show i)) <> d` where `d` is
+/// `text ". " <> vcat (map prettyEq bindings)`.  The whole `numbered'`
+/// block sits at `nest 4` inside the rule's `multiComment`.
+///
+/// CRITICAL: the `text ". " <>` is a BESIDE onto the multi-line `vcat`.
+/// In HughesPJ the ribbon budget for the inner (wrapped) lines is then
+/// measured from the OUTER line start (the `text i` column), not from the
+/// var column.  Rendering each binding STANDALONE (`entry.nest(col)`)
+/// instead measures the ribbon from the var column, shifting wrap
+/// decisions for terms sitting within a few columns of the ribbon
+/// boundary — e.g. an 11-tuple `<x.16, …, x.26>` whose `x.26>` packs onto
+/// the overflow line standalone but breaks BEFORE `x.26` (gluing `>`)
+/// under the HS structure (pkcs11-templates `cannot_obtain_key` et al.).
+/// So build the whole numbered conjunction as ONE Doc and render it at
+/// `nest 4`, mirroring HS byte-for-byte.
+fn variant_subst_doc(
     n: usize,
     subst: &tamarin_term::subst_vfresh::LNSubstVFresh,
     n_width: usize,
-) -> String {
-    use crate::pretty_hpj::Doc;
-    let mut s = String::new();
+) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
     let bindings = subst.to_list();
-    // Continuation prefix's width depends on `n_width` so subsequent lines
-    // line up under the first variable column.
-    let label = format!("{:>width$}. ", n, width = n_width);
-    let cont_indent = " ".repeat(label.chars().count());
-    for (i, (v, t)) in bindings.iter().enumerate() {
-        let var_str = render_lvar(v);
-        let prefix = if i == 0 {
-            format!("    {}", label)
-        } else {
-            format!("    {}", cont_indent)
-        };
-        // HS `prettyEq (a,b) = prettyNTerm (Var a) $$ nest 6 (text "="
-        // <-> prettyNTerm b)` (SubstVFresh.hs:228-229).  `$$` overlaps the
-        // (single-line) var onto the same line as the nest-6 `= <term>`,
-        // giving `z     = term` with `=` at col 6; the term itself wraps
-        // via `prettyTerm`'s fcat/fsep, with continuation aligned under the
-        // first argument.  Build it as one Doc so the engine reproduces the
-        // term wrap and continuation indent byte-identically.  `<->` is
-        // `<+>` (beside-with-space).
+    // HS `prettyEq (a,b) = prettyNTerm (Var a) $$ nest 6 (text "="
+    // <-> prettyNTerm b)` (SubstVFresh.hs:228-229).  `<->` is `<+>`
+    // (beside-with-space).
+    let eq_docs: Vec<Doc> = bindings.iter().map(|(v, t)| {
         let term_doc = pf::term_to_doc(&lnterm_to_parser(t), &[]);
         let rhs = Doc::text("=").beside_sp(term_doc).nest(6);
-        let entry = Doc::text(var_str).above(rhs);
-        // Place the entry at its absolute column = prefix width.  Nest by
-        // that amount, render, then strip the leading prefix-width spaces
-        // from the first line (we emit `prefix` explicitly so the label /
-        // continuation-indent is right).
-        let col = prefix.chars().count();
-        let rendered = entry.nest(col as isize).render();
-        let strip = rendered.chars().take(col).take_while(|c| *c == ' ').count();
-        s.push_str(&prefix);
-        s.push_str(&rendered[strip..]);
-        s.push('\n');
+        Doc::text(render_lvar(v)).above(rhs)
+    }).collect();
+    let conj = hpj::vcat(eq_docs);
+    // HS `pp (i, d) = text (flushRight nWidth (show i)) <> d`, with
+    // `d = text ". " <> conj` (from `numbered' = numbered (text "")
+    // . map (text ". " <>)`).
+    let label = format!("{:>width$}", n, width = n_width);
+    Doc::text(label).beside(Doc::text(". ").beside(conj))
+}
+
+/// Render the full `prettyDisjLNSubstsVFresh` (numbered') block.  HS
+/// `numbered vsep ds = foldr1 ($-$) $ intersperse vsep $ map pp ...` with
+/// `vsep = text ""` (a blank separator line at the block's nest).
+///
+/// Each numbered conjunction is an independent Doc rendered at `nest 4`
+/// (the `multiComment` indent) — they don't interact across the blank
+/// separators, so rendering them individually is faithful — and joined by
+/// the blank `"    \n"` line (HS `text ""` at nest 4).  Building each
+/// conjunction as a single Doc (not per-binding) is what reproduces the
+/// `text i <> ". " <> vcat` beside-onto-multiline ribbon decision.
+fn render_variant_substs_block(
+    substs: &[tamarin_term::subst_vfresh::LNSubstVFresh],
+) -> String {
+    let n_width = substs.len().to_string().len();
+    let mut s = String::new();
+    for (i, subst) in substs.iter().enumerate() {
+        if i > 0 {
+            // HS `intersperse (text "")` → a blank line at nest 4.
+            s.push_str("    \n");
+        }
+        let mut rendered = variant_subst_doc(i + 1, subst, n_width).nest(4).render();
+        rendered.push('\n');
+        s.push_str(&rendered);
     }
     s
 }
