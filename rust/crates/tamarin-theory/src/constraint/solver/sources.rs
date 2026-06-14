@@ -8358,18 +8358,51 @@ fn apply_source_case_premise(
         if conc == prem { return None; }
         Some(tamarin_term::rewriting::Equal { lhs: conc, rhs: prem })
     }).collect();
+    // E.5 fanout: `solve_fact_eqs(SplitNow)` may return `Cases(arms)`
+    // when the edge-fact unification yields multiple AC unifier arms.
+    // `solve_term_eqs`'s `Cases` branch does NOT reinstall `r.sys.eq_store`
+    // (it leaves the `mem::take`'d default store), so we MUST install each
+    // arm — otherwise the system proceeds with a wiped eq-store, silently
+    // dropping every live/grafted disjunction.  This mirrors the action
+    // variant's E.5 fanout; the premise path previously only branched on
+    // Err/Contradictory and fell through on `Cases` with the wiped store.
+    // Continue the rest of `_applySource` (F + push) per arm.
+    let mut e5_arm_systems: Vec<System> = Vec::new();
     if !edge_eqs.is_empty() {
         let res = r.solve_fact_eqs(
             crate::constraint::solver::reduction::SplitStrategy::SplitNow,
             &edge_eqs);
-        if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
-            crate::state_trace::emit(
-                "applySource_prem_drop_edge_eqs",
-                Some(&live_goal_for_trace), &r.sys);
-            continue;
+        match res {
+            Err(_) | Ok(SolveOutcome::Contradictory) => {
+                crate::state_trace::emit(
+                    "applySource_prem_drop_edge_eqs",
+                    Some(&live_goal_for_trace), &r.sys);
+                continue;
+            }
+            Ok(SolveOutcome::Linear(_)) => {
+                r.subst_system();
+                e5_arm_systems.push(r.sys.clone());
+            }
+            Ok(SolveOutcome::Cases(arms)) => {
+                let template = r.sys.clone();
+                for arm_eq in arms {
+                    let mut arm_sys = template.clone();
+                    arm_sys.invalidate_max_var_idx_cache();
+                    arm_sys.eq_store = arm_eq;
+                    let mut arm_red = Reduction::new(ctx, arm_sys);
+                    arm_red.subst_system();
+                    if arm_red.sys.eq_store.is_false() { continue; }
+                    e5_arm_systems.push(arm_red.sys);
+                }
+                if e5_arm_systems.is_empty() { continue; }
+            }
         }
-        r.subst_system();
+    } else {
+        e5_arm_systems.push(r.sys.clone());
     }
+
+    for r_sys in e5_arm_systems {
+    let mut r = Reduction::new(ctx, r_sys);
 
     // F — close trivial chains.
     close_trivial_chains_in_graft(&mut r);
@@ -8410,6 +8443,7 @@ fn apply_source_case_premise(
     crate::state_trace::emit(
         "applySource_prem_out", Some(&live_goal_for_trace), &r.sys);
     out_arms.push(r.sys);
+    } // end `for r_sys in e5_arm_systems`
     } // end `for arm_eq_store in arm_eq_stores`
     out_arms
 }
@@ -8486,15 +8520,22 @@ fn close_trivial_chains_in_graft(
             &[tamarin_term::rewriting::Equal { lhs: fa_conc, rhs: fa_prem }],
         );
         match res {
-            Err(_) | Ok(SolveOutcome::Contradictory) => {
-                // Direct-edge closure not possible.  Restore and bail
-                // — the chain stays open for the search layer to
-                // handle (Branch 2 destructor or Disj-case).
+            Err(_) | Ok(SolveOutcome::Contradictory) | Ok(SolveOutcome::Cases(_)) => {
+                // Direct-edge closure not possible, OR it SPLIT into
+                // multiple AC arms.  On the `Cases` path `solve_term_eqs`
+                // does NOT reinstall the eq-store (it leaves the
+                // `mem::take`'d default), so continuing would corrupt the
+                // system with a wiped store; and this function's contract
+                // is explicitly "if Branch 1 fails or splits, leave the
+                // chain as-is".  Restore the snapshot and bail — the chain
+                // stays open for the search layer (Branch 2 destructor or
+                // Disj-case).
                 r.sys = snapshot;
                 break;
             }
-            Ok(_) => {
-                // Mark the chain solved.
+            Ok(SolveOutcome::Linear(_)) => {
+                // Single arm: `solve_term_eqs` installed it.  Mark the
+                // chain solved.
                 let chain_goal = Goal::Chain(c, p);
                 if let Some(slot) = r.sys.goals_mut().iter_mut()
                     .find(|(g, _)| g == &chain_goal)
