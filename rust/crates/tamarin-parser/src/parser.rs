@@ -167,15 +167,6 @@ impl<'a> Parser<'a> {
 
     fn skip_ws(&mut self) { self.lx.skip_ws(); }
 
-    #[allow(dead_code)]
-    fn expect_eof(&mut self) -> Result<(), ParseError> {
-        self.skip_ws();
-        if self.lx.is_eof() { Ok(()) } else {
-            Err(self.err(format!("expected EOF, got {:?}",
-                self.lx.rest().chars().take(30).collect::<String>())))
-        }
-    }
-
     fn at_keyword(&mut self, kw: &str) -> bool {
         if !self.lx.peek_symbol(kw) { return false; }
         // Reject if followed by `-` (e.g. `rule-equivalence` is NOT `rule`).
@@ -1923,9 +1914,9 @@ impl<'a> Parser<'a> {
 
     fn expterm(&mut self, eqn: bool) -> Result<Term, ParseError> {
         let mut lhs = self.atom_term(eqn)?;
-        // `^` is right-associative in Tamarin (Haskell `chainl1` actually but
-        // the operator is conventionally treated as such). Use left-assoc to
-        // match `chainl1` semantics.
+        // HS `expterm` is "a left-associative sequence of exponentiations"
+        // (`chainl1`, Parser/Term.hs:150-152), so build left-associative
+        // `^` trees here to match.
         while self.try_punct("^") {
             let rhs = self.atom_term(eqn)?;
             lhs = Term::BinOp(BinOp::Exp, Box::new(lhs), Box::new(rhs));
@@ -2281,11 +2272,6 @@ pub fn parse_formula_str(s: &str) -> Result<Formula, ParseError> {
     }
     Ok(f)
 }
-
-// We need to silence one unused method warning if `is_ident_char` appears
-// unused in some configurations.
-#[allow(dead_code)]
-fn _kw_anchor() { let _ = is_ident_char('a'); }
 
 #[cfg(test)]
 mod tests {

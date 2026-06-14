@@ -8,7 +8,7 @@
 //! `data.alert` / `data.html` (in that order), see
 //! `data/js/tamarin-prover-ui.js`.
 
-use axum::{Json, response::IntoResponse};
+use axum::Json;
 use serde_json::{json, Value};
 
 /// Build a `{ html, title }` JSON response.
@@ -26,7 +26,3 @@ pub fn redirect(url: impl Into<String>) -> Json<Value> {
     Json(json!({ "redirect": url.into() }))
 }
 
-/// 501 with a JSON alert body, for unimplemented features.
-pub fn not_implemented(msg: impl Into<String>) -> impl IntoResponse {
-    (axum::http::StatusCode::NOT_IMPLEMENTED, alert(msg))
-}

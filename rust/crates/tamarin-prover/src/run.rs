@@ -550,7 +550,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             // HS-faithful: `--parse-only` does NOT run wellformedness
             // (checkWellformedness only fires inside `--prove`'s
             // close-theory pipeline).  Just re-emit the source verbatim.
-            emit_output(args, in_file, &src, None)?;
+            emit_output(args, in_file, &src)?;
             file_results.push(FileResult {
                 in_file: in_file.clone(),
                 out_file: out_path_for(args, in_file),
@@ -1092,7 +1092,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             in_file,
         );
         phase!("pretty_closed_theory");
-        emit_output(args, in_file, &body, None)?;
+        emit_output(args, in_file, &body)?;
         phase!("emit_output");
 
         file_results.push(FileResult {
@@ -1300,7 +1300,7 @@ fn default_maude_path() -> String {
 }
 
 /// Emit `body` to `--output` / `-O` / stdout.
-fn emit_output(args: &Args, in_file: &str, body: &str, _override_out: Option<&str>) -> Result<(), RunError> {
+fn emit_output(args: &Args, in_file: &str, body: &str) -> Result<(), RunError> {
     if let Some(out) = out_path_for(args, in_file) {
         // Ensure parent dir exists.
         if let Some(parent) = std::path::Path::new(&out).parent() {

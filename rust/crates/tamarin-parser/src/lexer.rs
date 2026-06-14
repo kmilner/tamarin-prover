@@ -122,7 +122,6 @@ impl<'a> Lexer<'a> {
     /// require the next char to NOT be alphanum (word boundary).
     pub fn symbol(&mut self, s: &str) -> bool {
         self.skip_ws();
-        let save = self.pos;
         if !self.rest().starts_with(s) { return false; }
         // Word-boundary check for keyword-like symbols.
         if s.chars().last().is_some_and(is_ident_char) {
@@ -133,7 +132,6 @@ impl<'a> Lexer<'a> {
         }
         for _ in s.chars() { self.bump(); }
         self.skip_ws();
-        let _ = save;
         true
     }
 
@@ -204,21 +202,6 @@ impl<'a> Lexer<'a> {
             self.bump();
         }
         if got { self.skip_ws(); Some(n) } else { None }
-    }
-
-    /// Parse `(name, idx)` where idx is optional `.<natural>`.
-    pub fn indexed_identifier(&mut self) -> Option<(String, u64)> {
-        let save = self.pos;
-        let name = self.identifier()?;
-        let idx = if self.try_symbol(".") {
-            if let Some(n) = self.natural() { n } else {
-                // Not actually a `.<natural>` — back up to before the dot.
-                self.pos = save;
-                let _ = self.identifier();
-                0
-            }
-        } else { 0 };
-        Some((name, idx))
     }
 
     /// String literal in double quotes, escape via `\`.
@@ -314,11 +297,6 @@ impl<'a> Lexer<'a> {
         if !self.eat_str("x-") { self.pos = save; return None; }
         let id = self.identifier()?;
         Some(format!("x-{}", id))
-    }
-
-    /// Slice from a saved position to current position.
-    pub fn slice_from(&self, save: Pos) -> &'a str {
-        &self.src[save.offset..self.pos.offset]
     }
 }
 

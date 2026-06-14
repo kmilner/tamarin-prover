@@ -231,14 +231,6 @@ fn theory_lemmas(thy: &Theory) -> Vec<&Lemma> {
     }).collect()
 }
 
-#[allow(dead_code)]
-fn theory_restrictions(thy: &Theory) -> Vec<&Restriction> {
-    thy.items.iter().filter_map(|it| match it {
-        TheoryItem::Restriction(r) | TheoryItem::LegacyAxiom(r) => Some(r),
-        _ => None,
-    }).collect()
-}
-
 /// Iterate all facts in a rule (premises ∪ actions ∪ conclusions),
 /// labelled with which side they appeared on.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -771,7 +763,6 @@ pub fn fresh_fact_arguments(thy: &Theory) -> WfReport {
 
 #[derive(Debug, Clone)]
 struct FactObservation {
-    #[allow(dead_code)]
     rule_name: String,
     name: String,
     arity: usize,
@@ -1006,24 +997,22 @@ pub fn fresh_names_report(thy: &Theory) -> WfReport {
 // =============================================================================
 
 pub fn public_names_report(thy: &Theory) -> WfReport {
-    let mut all: Vec<(String, String)> = Vec::new(); // (rule_name, pub_name)
+    let mut by_lower: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for r in theory_rules(thy) {
         let mut names = Vec::new();
         for t in rule_terms(r) {
             term_name_lits(t, &mut names);
         }
         for (k, n) in names {
-            if k == NameKind::Pub { all.push((r.name.clone(), n)); }
+            if k == NameKind::Pub {
+                by_lower.entry(n.to_lowercase()).or_default().insert(n);
+            }
         }
-    }
-    let mut by_lower: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for (_ru, n) in &all {
-        by_lower.entry(n.to_lowercase()).or_default().insert(n.clone());
     }
     let mut out = Vec::new();
     for (_lower, set) in by_lower.iter().filter(|(_, s)| s.len() > 1) {
-        let mut names: Vec<&String> = set.iter().collect();
-        names.sort();
+        // `set` is a `BTreeSet`, so iteration is already sorted.
+        let names: Vec<&String> = set.iter().collect();
         out.push(WfError::new(
             "Public constants with mismatching capitalization",
             format!("clashing public-name capitalizations: {}",

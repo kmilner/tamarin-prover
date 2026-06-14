@@ -34,8 +34,8 @@
 //!   --output=FILE, -o FILE     write the analyzed theory to FILE
 //!   --Output=DIR, -O DIR       write analyzed theory to DIR/<basename>_analyzed.spthy
 //!   --output-module=MODULE -m  output module selector (errors: not yet ported)
-//!   --output-json=FILE, --oj   serialize traces to JSON (errors: not yet ported)
-//!   --output-dot=FILE, --od    serialize traces to dot (errors: not yet ported)
+//!   --output-json=FILE, --oj   serialize traces to JSON (writes empty stub + warns; not yet ported)
+//!   --output-dot=FILE, --od    serialize traces to dot (writes empty stub + warns; not yet ported)
 //!   --with-maude=PATH          path to `maude` (default: looked up via PATH)
 //!   --with-dot=PATH            path to GraphViz `dot` (parsed, not yet routed)
 //!   --with-json=PATH           path to JSON renderer (parsed, not yet routed)

@@ -3590,9 +3590,6 @@ pub enum GoalCases {
     Contradictory,
 }
 
-/// For a KU-action term `m`, return the sub-terms a KU goal on `m`
-/// should decompose into (per Haskell's `insertAction` pair/inv/prod
-/// handling).  Returns `None` if no decomposition applies.
 /// Returns true if the system has two distinct non-AC-unifiable
 /// nodes consuming the same Fresh value as their `Fr(~x)` premise.
 /// Such a state is logically inconsistent (Fresh is linear, so the

@@ -143,6 +143,8 @@ pub fn destruction_rules(
     let mut name_acc: Vec<u8> = Vec::new();
     let mut posname = String::new();
     let pos_iter: Vec<i64> = pos.clone();
+    // `rhs` is loop-invariant, so compute `frees(rhs).is_empty()` once.
+    let rhs_frees_empty = frees(rhs).is_empty();
     if std::env::var("TAM_RS_DBG_DESTR_POS").is_ok() {
         use tamarin_term::pretty::pretty_lnterm;
         eprintln!("[destr_pos] lhs={} rhs={} pos={:?}",
@@ -168,7 +170,7 @@ pub fn destruction_rules(
                 // `prefix(enc(<X,Y>,k)) = enc(X,k)` (positions [0,0,0]
                 // and [0,1]); at the LAST step into pair(X,Y) and
                 // enc(X,Y), Haskell skips.
-                if pos_iter.len() == step_idx + 1 && !frees(rhs).is_empty() {
+                if pos_iter.len() == step_idx + 1 && !rhs_frees_empty {
                     return out;
                 }
                 // Build uprems' = uprems ++ siblings.
@@ -182,9 +184,7 @@ pub fn destruction_rules(
                 };
                 // Emit the rule unless the next step's term equals rhs
                 // and rhs already in uprems' (Haskell's filter).
-                let rhs_at_pos = at_pos(lhs, &pos_iter[..=step_idx]);
                 let cond_emit = t_new != *rhs && !new_uprems.contains(rhs);
-                let _ = rhs_at_pos;
                 if cond_emit {
                     // Build the rule name: `_<i><pd>` ++ funs.
                     let posname_now = format!("_{}{}", i, posname);
@@ -200,7 +200,7 @@ pub fn destruction_rules(
                         name,
                         -1,
                         rhs == &at_pos(lhs, pos),
-                        frees(rhs).is_empty(),
+                        rhs_frees_empty,
                     );
                     let mut prems = vec![kd_fact(t_new.clone())];
                     for u in &new_uprems { prems.push(ku_fact(u.clone())); }
@@ -460,7 +460,6 @@ pub fn xor_intruder_rules() -> Vec<IntrRuleAC> {
     let x = var_term(LVar::new("x", LSort::Msg, 0));
     let y = var_term(LVar::new("y", LSort::Msg, 0));
     let z = var_term(LVar::new("z", LSort::Msg, 0));
-    let _ = AcSym::Xor;  // discriminator referenced through xor2 closure
     // `Term::App(Ac(Xor), [a, b])`.  Constructed via the AC-flatten/sort
     // smart constructor so the operand order matches HS's `fAppAC` (sorted
     // by Ord).
@@ -564,8 +563,6 @@ pub fn construction_rules(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<IntrRu
         // Encode the constructor name in the IntrRuleACInfo.
         let mut name = b"_".to_vec();
         name.extend_from_slice(&s.name);
-        let _ = NoEqSym::new(b"".to_vec(), 0,
-            Privacy::Public, Constructability::Constructor); // suppress warning
         let info = IntrRuleACInfo::ConstrRule(name);
         out.push(Rule::new(info, prems, vec![conc], vec![act]));
     }

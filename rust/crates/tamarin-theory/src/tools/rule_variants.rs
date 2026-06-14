@@ -38,14 +38,12 @@ type LNSubst = Subst<Name, LVar>;
 #[derive(Debug, Clone)]
 pub enum VariantsError {
     Maude(String),
-    NoVariants,
 }
 
 impl std::fmt::Display for VariantsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VariantsError::Maude(s) => write!(f, "Maude error: {}", s),
-            VariantsError::NoVariants => write!(f, "no variants returned by Maude"),
         }
     }
 }

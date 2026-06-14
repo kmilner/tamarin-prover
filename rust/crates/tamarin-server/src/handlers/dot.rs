@@ -3,10 +3,10 @@
 //! Graphviz DOT representation suitable for `dot -Tsvg`.
 //!
 //! This is a deliberately conservative subset of the Haskell pipeline:
-//! we render the same kinds of nodes / edges / clusters, but using
-//! plain DOT records (no HTML tables for the legend, no clustering by
-//! similar-name) so the result is a single self-contained DOT
-//! document. The Tamarin frontend's `intdot-staticgraph.es.js` /
+//! we render the same kinds of nodes / edges / clusters as a single
+//! self-contained DOT document, including an HTML-table legend for the
+//! chosen abbreviations and similar-name / role clustering. The Tamarin
+//! frontend's `intdot-staticgraph.es.js` /
 //! `intdot-dynamicgraph.es.js` are forgiving about the exact DOT
 //! syntax — they parse the standard Graphviz attributes we emit.
 //!
@@ -105,7 +105,7 @@ pub fn system_to_dot_with(sys: &System, opts: &GraphOptions) -> String {
     for (i, cluster) in repr.clusters.iter().enumerate() {
         g.open_subgraph(i, &cluster.name);
         for node in &cluster.nodes {
-            emit_node(&mut g, node, &working, &abbrev_lookup);
+            emit_node(&mut g, node, &abbrev_lookup);
         }
         for edge in &cluster.edges {
             emit_edge(&mut g, edge, &working);
@@ -114,7 +114,7 @@ pub fn system_to_dot_with(sys: &System, opts: &GraphOptions) -> String {
     }
     // 4b. Top-level nodes / edges.
     for node in &repr.nodes {
-        emit_node(&mut g, node, &working, &abbrev_lookup);
+        emit_node(&mut g, node, &abbrev_lookup);
     }
     for edge in &repr.edges {
         emit_edge(&mut g, edge, &working);
@@ -130,10 +130,8 @@ pub fn system_to_dot_with(sys: &System, opts: &GraphOptions) -> String {
 fn emit_node(
     g: &mut DotBuilder,
     node: &GNode,
-    sys: &System,
     abbrev: &dyn Fn(&LNTerm) -> Option<LNTerm>,
 ) {
-    let _ = sys;
     match &node.ty {
         NodeType::System(ru) => {
             let ru_abbreviated = abbreviate_rule(ru, abbrev);

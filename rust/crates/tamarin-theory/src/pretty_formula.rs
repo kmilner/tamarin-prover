@@ -44,7 +44,7 @@ type Bind = (String, p::SortHint, String);
 pub fn pretty_formula(f: &p::Formula) -> String {
     let mut s = String::new();
     let mut state = avoid_precise_formula(f);
-    pp_formula(f, FormCtx::Top, &[], &mut state, &mut s);
+    pp_formula(f, &[], &mut state, &mut s);
     s
 }
 
@@ -337,13 +337,6 @@ pub fn term_doc(t: &p::Term) -> crate::pretty_hpj::Doc {
     term_to_doc(t, &[])
 }
 
-/// Pretty-print an atom standalone (e.g. inside a goal label).
-pub fn pretty_atom(a: &p::Atom) -> String {
-    let mut s = String::new();
-    pp_atom(a, &[], &mut s);
-    s
-}
-
 /// Pretty-print a parser-AST term standalone.
 pub fn pretty_term(t: &p::Term) -> String {
     let mut s = String::new();
@@ -568,16 +561,6 @@ fn allocate_guarded_binders(
 // Formula (parser AST)
 // =============================================================================
 
-#[derive(Copy, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-enum FormCtx {
-    Top,
-    /// Inside a connective requiring parens for nested connectives.
-    /// Kept for back-compat; current renderer uses HS-faithful
-    /// `opParens` instead.
-    Conn,
-}
-
 /// `scope` is a flat list of binder entries (innermost binder last).
 /// Each entry carries the binder's source name+sort plus the display
 /// name allocated via `Precise.freshIdent` — when an inner binder
@@ -588,7 +571,6 @@ enum FormCtx {
 /// boundaries (Formula.hs:496-502 — every `Qua` saves/restores state).
 fn pp_formula(
     f: &p::Formula,
-    _ctx: FormCtx,
     scope: &[Bind],
     state: &mut PreciseFreshState,
     out: &mut String,
@@ -635,7 +617,7 @@ fn pp_qua(
             out.push_str(&b.2);
         }
         out.push_str(". ");
-        pp_formula(body, FormCtx::Top, &new_scope, state, out);
+        pp_formula(body, &new_scope, state, out);
     })
 }
 
@@ -664,7 +646,7 @@ fn pp_formula_opparens(
     out: &mut String,
 ) {
     out.push('(');
-    pp_formula(f, FormCtx::Top, scope, state, out);
+    pp_formula(f, scope, state, out);
     out.push(')');
 }
 
@@ -846,12 +828,6 @@ pub const RIBBON: usize = 73;
 /// HS hard page width.  Mirrors `lineWidth = 110`
 /// (`Main/Console.hs:236`).
 pub const LINE_LENGTH: usize = 110;
-
-/// Legacy alias kept for callers that pass a `width` argument; equal
-/// to `RIBBON` (HS ribbon).  The actual fit-decision now uses
-/// `fits_flat` (`line_start + RIBBON`-capped at `LINE_LENGTH`), not
-/// this constant.
-pub const WRAP_WIDTH: usize = RIBBON;
 
 fn resolved_sort(v: &p::VarSpec, scope: &[Bind]) -> p::SortHint {
     if !matches!(v.sort, p::SortHint::Untagged) {

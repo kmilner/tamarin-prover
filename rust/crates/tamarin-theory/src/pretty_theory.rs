@@ -312,7 +312,7 @@ pub fn pretty_closed_theory(
     // string append.
     use rayon::prelude::*;
     let rendered: Vec<Option<String>> = parsed.items.par_iter()
-        .map(|item| render_parsed_item(item, 0, parsed, elaborated, proved, in_file))
+        .map(|item| render_parsed_item(item, parsed, elaborated, proved, in_file))
         .collect();
     for b in rendered.into_iter().flatten() {
         out.push('\n');
@@ -532,7 +532,6 @@ fn sep_block_with_lead(lead: &str, items: &[(String, String)]) -> String {
 
 fn render_parsed_item(
     item: &p::TheoryItem,
-    _idx: usize,
     parsed: &p::Theory,
     elab: &Theory,
     proved: &[ProvedLemma],
@@ -603,7 +602,7 @@ fn render_parsed_item(
             let mut active: Vec<&p::TheoryItem> = then_items.iter().collect();
             if let Some(else_b) = else_items { active.extend(else_b.iter()); }
             let blocks: Vec<String> = active.iter()
-                .filter_map(|it| render_parsed_item(it, 0, parsed, elab, proved, in_file))
+                .filter_map(|it| render_parsed_item(it, parsed, elab, proved, in_file))
                 .collect();
             if blocks.is_empty() { None } else { Some(blocks.join("\n\n")) }
         }

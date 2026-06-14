@@ -29,7 +29,7 @@ use tamarin_term::term::Term;
 pub fn compress_system(mut sys: System) -> System {
     sys = drop_entailed_ord_constraints(sys);
     let node_ids: Vec<NodeId> = sys.nodes.iter().map(|(id, _)| id.clone()).collect();
-    let mut last_atom_id: Option<NodeId> = sys.last_atom.clone();
+    let last_atom_id: Option<NodeId> = sys.last_atom.clone();
     for v in node_ids {
         sys = try_hide_node_id(&v, sys);
     }
@@ -42,7 +42,7 @@ pub fn compress_system(mut sys: System) -> System {
         extra.insert(la.smaller.clone());
         extra.insert(la.larger.clone());
     }
-    if let Some(la_id) = last_atom_id.take() { extra.insert(la_id); }
+    if let Some(la_id) = last_atom_id { extra.insert(la_id); }
     for v in extra {
         sys = try_hide_node_id(&v, sys);
     }

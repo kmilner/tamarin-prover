@@ -83,7 +83,7 @@ use tamarin_term::maude_sig::{
 };
 
 use crate::rule::{
-    ConcIdx, PremIdx, ProtoRuleE, ProtoRuleEInfo, ProtoRuleName,
+    ProtoRuleE, ProtoRuleEInfo, ProtoRuleName,
     Rule, RuleAttributes,
 };
 use crate::signature::SignaturePure;
@@ -784,7 +784,6 @@ fn rule_to_proto_rule_e(r: &p::Rule) -> Result<ProtoRuleE, ElabError> {
     let concs = r_eff.conclusions.iter().map(fact_to_lnfact)
         .collect::<Result<Vec<_>, _>>()?;
     let new_vars = compute_new_vars(&prems, &concs, &acts);
-    let _ = (std::marker::PhantomData::<PremIdx>, std::marker::PhantomData::<ConcIdx>);
 
     Ok(Rule::new(info, prems, concs, acts).with_new_vars(new_vars))
 }

@@ -183,6 +183,16 @@ fn aes_dbg_bad_disj() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("TAM_DBG_BAD_DISJ").is_ok())
 }
+#[inline]
+fn aes_dbg_add_disj_full() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_ADD_DISJ_FULL").is_ok())
+}
+#[inline]
+fn aes_dbg_add_disj() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_ADD_DISJ").is_ok())
+}
 
 fn impure_dbg_registry()
     -> &'static std::sync::Mutex<std::collections::HashMap<String, String>>
@@ -375,7 +385,7 @@ impl EquationStore {
                 }
             }
         }
-        if std::env::var("TAM_DBG_ADD_DISJ_FULL").is_ok() {
+        if aes_dbg_add_disj_full() {
             // Full backtrace + pre-state for every call.
             let bt = std::backtrace::Backtrace::force_capture();
             let bt_s = format!("{}", bt);
@@ -389,7 +399,7 @@ impl EquationStore {
             eprintln!("[add_disj-full-pre] eq_store@{:x} {} existing disjs, next_split={:?}",
                 self_id, self.conj.len(), self.next_split);
         }
-        if std::env::var("TAM_DBG_ADD_DISJ").is_ok() {
+        if aes_dbg_add_disj() {
             // TAM_DBG_ADD_DISJ=stack also prints a short backtrace of the
             // caller chain, filtered to tamarin-theory frames.
             if std::env::var("TAM_DBG_ADD_DISJ").map(|s| s == "stack").unwrap_or(false) {

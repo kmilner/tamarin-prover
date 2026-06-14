@@ -833,9 +833,8 @@ fn convert(polarity: bool, f: &p::Formula) -> Result<Guarded, GuardError> {
         }
         p::Formula::Not(g) => convert(!polarity, g),
         p::Formula::And(a, b) => {
-            let mut sub = vec![convert(polarity, a)?, convert(polarity, b)?];
+            let sub = vec![convert(polarity, a)?, convert(polarity, b)?];
             if polarity {
-                sub.reverse(); sub.reverse(); // no-op, satisfy borrow patterns
                 Ok(gdisj(sub))
             } else {
                 Ok(gconj(sub))

@@ -22,8 +22,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use tower_http::services::ServeDir;
@@ -49,7 +48,6 @@ pub fn serve(state: Arc<AppState>) -> axum::Router<Arc<AppState>> {
 async fn intdot_js_or_data(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
-    req: Request<Body>,
 ) -> Response {
     if name.starts_with("intdot-") && name.ends_with(".es.js") {
         if let Some(ref dist) = state.cfg.frontend_dist {
@@ -59,13 +57,12 @@ async fn intdot_js_or_data(
         }
     }
     // Fall through to data/js/<name>.
-    fallback_to_data(state, "js", &name, req).await
+    fallback_to_data(state, "js", &name).await
 }
 
 async fn intdot_css_or_data(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
-    req: Request<Body>,
 ) -> Response {
     if name.starts_with("intdot-") && name.ends_with(".css") {
         if let Some(ref dist) = state.cfg.frontend_dist {
@@ -74,14 +71,13 @@ async fn intdot_css_or_data(
             }
         }
     }
-    fallback_to_data(state, "css", &name, req).await
+    fallback_to_data(state, "css", &name).await
 }
 
 async fn fallback_to_data(
     state: Arc<AppState>,
     subdir: &str,
     name: &str,
-    _req: Request<Body>,
 ) -> Response {
     let candidate = state.cfg.data_dir.join(subdir).join(name);
     let mime = guess_mime(&candidate);

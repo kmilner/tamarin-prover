@@ -7,9 +7,11 @@
 //! Not yet ported from this module:
 //! - The `MonotoneFunction` split (AC-preserving vs. arbitrary updates);
 //!   here `HasFrees` exposes only the common cases.
-//! - `varOccurences`, `eqModuloFreshnessNoAC`, `someInst`/`renamePrecise`,
-//!   `freshToFreeAvoiding`, etc.
 //! - Pretty-printing instances.
+//!
+//! (`varOccurences`, `eqModuloFreshnessNoAC`, `someInst`/`renamePrecise`,
+//! and `freshToFreeAvoiding` are ported elsewhere — see `subsumption.rs`,
+//! `sources.rs`, `constraint::solver::rename_precise`, and `subst_vfresh.rs`.)
 
 use std::cmp::Ordering;
 

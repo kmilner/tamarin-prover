@@ -11,7 +11,7 @@
 //! `simpSubtermStore`, `simpSplitNegSt`, and the recursive `splitSubterm`
 //! — are ported in `constraint::solver::simplify` rather than here.
 
-use tamarin_term::function_symbols::{FunSig, FunSym};
+use tamarin_term::function_symbols::FunSig;
 use tamarin_term::lterm::LNTerm;
 use tamarin_term::term::Term;
 
@@ -178,12 +178,6 @@ fn find_loop(
     parents.remove(x);
     visited.insert(x.clone());
     Some(())
-}
-
-/// True if `sym` is among the reducible function symbols.  Helper to
-/// avoid spreading `FunSig.contains` calls.
-fn _is_reducible(sym: &FunSym, reducible: &FunSig) -> bool {
-    reducible.contains(sym)
 }
 
 #[cfg(test)]

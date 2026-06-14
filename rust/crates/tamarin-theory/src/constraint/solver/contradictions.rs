@@ -46,20 +46,30 @@ pub enum Contradiction {
     NodeAfterLast(NodeId, NodeId),
 }
 
+/// `TAM_DBG_IMPL` opt-in debug flag, cached so the per-node scans it
+/// guards stay off the solver hot path (mirrors `proof_method::dbg_impl_enabled`).
+#[inline]
+fn dbg_impl_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_IMPL").is_ok())
+}
+
 /// Collect every contradiction currently witnessed by the system.
 pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> {
     let mut out = Vec::new();
-    let has_i_1 = sys.nodes.iter().any(|(_, r)|
-        matches!(&r.info, crate::rule::RuleInfo::Proto(p)
-            if matches!(&p.name, crate::rule::ProtoRuleName::Stand(s) if s == "I_1")));
-    let has_r_1 = sys.nodes.iter().any(|(_, r)|
-        matches!(&r.info, crate::rule::RuleInfo::Proto(p)
-            if matches!(&p.name, crate::rule::ProtoRuleName::Stand(s) if s == "R_1")));
-    if std::env::var("TAM_DBG_IMPL").is_ok() && has_i_1 && has_r_1 {
-        let has_bot = sys.formulas.iter()
-            .any(|f| matches!(f, crate::guarded::Guarded::Disj(v) if v.is_empty()));
-        eprintln!("[contra] HAS I_1+R_1: formulas.len={} has_bot={}",
-            sys.formulas.len(), has_bot);
+    if dbg_impl_enabled() {
+        let has_i_1 = sys.nodes.iter().any(|(_, r)|
+            matches!(&r.info, crate::rule::RuleInfo::Proto(p)
+                if matches!(&p.name, crate::rule::ProtoRuleName::Stand(s) if s == "I_1")));
+        let has_r_1 = sys.nodes.iter().any(|(_, r)|
+            matches!(&r.info, crate::rule::RuleInfo::Proto(p)
+                if matches!(&p.name, crate::rule::ProtoRuleName::Stand(s) if s == "R_1")));
+        if has_i_1 && has_r_1 {
+            let has_bot = sys.formulas.iter()
+                .any(|f| matches!(f, crate::guarded::Guarded::Disj(v) if v.is_empty()));
+            eprintln!("[contra] HAS I_1+R_1: formulas.len={} has_bot={}",
+                sys.formulas.len(), has_bot);
+        }
     }
     // Mirror Haskell's `rawLessRel = sLessAtoms ++ rawEdgeRel` —
     // every graph edge induces a strict ordering src < tgt, and the
@@ -298,7 +308,8 @@ fn maybe_not_nf_subterms(
 /// Run `has_subterm_cycle` against the system's positive subterm
 /// dag.  Equivalent to one prong of Haskell's `simpSubterms` →
 /// `hasSubtermCycle` check; we run it eagerly during contradiction
-/// detection because our `simpSubterms` pass is currently a stub.
+/// detection (the `simpSubterms` simplification pass — see
+/// `propagate_subterm_obvious` in `simplify.rs` — handles the rest).
 fn has_subterm_cycle_contra(ctx: &ProofContext, sys: &System) -> bool {
     let reducible = &ctx.maude.maude_sig().reducible_fun_syms;
     crate::tools::subterm_store::has_subterm_cycle(reducible, &sys.subterm_store)
@@ -1057,9 +1068,6 @@ fn has_forbidden_bp(sys: &System) -> bool {
 ///   - `p` never contains fresh/private terms, AND
 ///   - every non-inverse factor of `c` is also a non-inverse factor of `b`.
 fn is_forbidden_d_pmult<I>(ru: &crate::rule::Rule<crate::rule::RuleInfo<I, crate::rule::IntrRuleACInfo>>) -> bool {
-    use tamarin_term::function_symbols::{FunSym, PMULT_SYM_STRING};
-    use tamarin_term::term::Term;
-
     if ru.premises.len() != 2 { return false; }
     if ru.conclusions.len() != 1 { return false; }
 
@@ -1081,8 +1089,6 @@ fn is_forbidden_d_pmult<I>(ru: &crate::rule::Rule<crate::rule::RuleInfo<I, crate
 
     // Pre-filter: only Pmult-down rules.
     if !crate::rule::is_d_pmult_rule(ru) { return false; }
-    // Drop the unused binding warning.
-    let _ = (Term::Lit::<()> as fn(_) -> _, FunSym::NoEq, PMULT_SYM_STRING);
 
     if !never_contains_fresh_priv(p_conc) { return false; }
     bp_factors_subset(c, b)

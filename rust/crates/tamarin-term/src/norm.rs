@@ -14,7 +14,7 @@
 //! when the answer is decidable from syntax alone, or `None` to
 //! defer to Maude.
 
-use crate::function_symbols::{AcSym, FunSig, FunSym, NoEqSym};
+use crate::function_symbols::{AcSym, FunSig, FunSym};
 use crate::lterm::LNTerm;
 use crate::maude_proc::{MaudeError, MaudeHandle};
 use crate::maude_sig::MaudeSig;
@@ -394,7 +394,6 @@ fn rule_applies(t: &LNTerm, lhs: &LNTerm, rhs: &LNTerm) -> bool {
         &|n| crate::lterm::sort_of_name(n),
         problem,
     );
-    let _ = matched.is_some(); // placeholder
     // HS: StRhs [] s -> not (t == s) ; StRhs _ _ -> True
     // The `StRhs [] s` case (RHS is a closed constant — no LHS-positions)
     // can be detected by checking `frees(rhs).is_empty() && positions_in_lhs == 0`,
@@ -438,10 +437,6 @@ pub fn maybe_not_nf_subterms(msig: &MaudeSig, t: &LNTerm) -> Vec<LNTerm> {
     go(t, irreducible, &mut out);
     out
 }
-
-/// Suppress unused warnings.
-#[allow(dead_code)]
-fn _suppress(_: NoEqSym) {}
 
 #[cfg(test)]
 mod tests {
