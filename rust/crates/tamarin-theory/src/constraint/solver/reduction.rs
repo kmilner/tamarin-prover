@@ -3699,8 +3699,31 @@ fn ku_decomp_subterms(t: &tamarin_term::lterm::LNTerm)
         Term::App(FunSym::NoEq(s), args)
             if s.name == INV_SYM_STRING && args.len() == 1
                 => Some(args.to_vec()),
-        Term::App(FunSym::Ac(AcSym::Mult), args) => Some(args.to_vec()),
-        Term::App(FunSym::Ac(AcSym::Union), args) => Some(args.to_vec()),
+        // For AC operators (Mult, Union) HS reads the decomposition
+        // sub-terms via `viewTerm2 -> FMult ms` / `FUnion ms`, where `ms`
+        // is the operator's multiset normal form — ALWAYS sorted by the
+        // term `Ord` (idx-first), because every AC term is built through
+        // `fAppAC` which does `sort (...)` (Term/Term/Raw.hs:121-122).
+        // HS's `insertAction` then allocates one fresh `vk` node per
+        // sub-term in that SORTED order (`mapM_ requiresKU ms`,
+        // Reduction.hs:411-429).  A substituted/Maude-derived AC term can
+        // reach this point in RS with its args in Maude's (unsorted)
+        // order; reading `args.to_vec()` verbatim would allocate the
+        // `vk` nodes in a different order than HS, shifting the surviving
+        // KU-node index by the position delta (e.g. Scott key_secrecy's
+        // `inv(~ex*x)` case: RS stored `[x, ~ex]` (Maude order) vs HS's
+        // sorted `[~ex, x]`, so RS's surviving `KU(~ex)` landed at
+        // `#vk.N+1`).  Sort to recover HS's `viewTerm2` multiset order.
+        Term::App(FunSym::Ac(AcSym::Mult), args) => {
+            let mut v = args.to_vec();
+            v.sort();
+            Some(v)
+        }
+        Term::App(FunSym::Ac(AcSym::Union), args) => {
+            let mut v = args.to_vec();
+            v.sort();
+            Some(v)
+        }
         _ => None,
     }
 }

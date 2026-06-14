@@ -391,6 +391,13 @@ traceStateM sys
                                         ++ " " ++ show i ++ "=" ++ showRuleCaseName ru
                                         ++ " actions=" ++ show (L.get rActs ru)))
                       (M.toList (L.get sNodes sys))
+                -- Open Action goals with idx-preserved fact content.
+                -- Mirrors Rust's [STATE_GOAL]: lets the HS↔Rust open-goal
+                -- node-id allocation be diffed (e.g. the Scott key_secrecy
+                -- #vk.N KU-decomposition chain divergence).
+                mapM_ (\(i, fa) -> traceM ("[STATE_GOAL] path=" ++ casePathString path
+                                        ++ " Action@" ++ show i ++ "=" ++ show fa))
+                      (unsolvedActionAtoms sys)
                 mapM_ (\e -> traceM ("[STATE_EDGE] path=" ++ casePathString path
                                   ++ " " ++ show e))
                       (S.toList (L.get sEdges sys))
