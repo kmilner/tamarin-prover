@@ -704,6 +704,11 @@ fn has_forbidden_chain(sys: &System) -> bool {
         }
     }
 
+    // The `alwaysBefore` adjacency is invariant across the chain/node/goal
+    // loops below (`sys` is read-only here), so build it once and query it
+    // with `always_before_with` instead of rebuilding the full relation per
+    // `always_before` call.
+    let ab_adj = sys.build_always_before_adj();
     for (g, st) in sys.goals.iter() {
         if st.solved { continue; }
         let Goal::Chain(c, p) = g else { continue };
@@ -769,7 +774,7 @@ fn has_forbidden_chain(sys: &System) -> bool {
                 let t_ku = match fa.terms.first() { Some(t) => t, None => continue };
                 if !candidate_terms.contains(t_ku) { continue; }
                 if id == &c.0 { continue; }
-                if sys.always_before(id, &c.0) {
+                if sys.always_before_with(&ab_adj, id, &c.0) {
                     return true;
                 }
             }
@@ -782,7 +787,7 @@ fn has_forbidden_chain(sys: &System) -> bool {
             let t_ku = match fa.terms.first() { Some(t) => t, None => continue };
             if !candidate_terms.contains(t_ku) { continue; }
             if id == &c.0 { continue; }
-            if sys.always_before(id, &c.0) {
+            if sys.always_before_with(&ab_adj, id, &c.0) {
                 return true;
             }
         }
@@ -917,6 +922,10 @@ fn has_forbidden_exp(sys: &System) -> bool {
         }
     }
 
+    // The `alwaysBefore` adjacency is invariant across the node loop and
+    // the `earlier_msg_vars` scan below (`sys` is read-only), so build it
+    // once and query it with `always_before_with`.
+    let ab_adj = sys.build_always_before_adj();
     // Mirror HS `forbiddenDExp` exactly.
     for (i, ru) in sys.nodes.iter() {
         // Only intruder DestrRules can be exp-down; cheap pre-filter.
@@ -944,7 +953,7 @@ fn has_forbidden_exp(sys: &System) -> bool {
             let mut out = Vec::new();
             for (j, t) in &all_ku {
                 if !is_msg_var(t) { continue; }
-                if sys.always_before(j, i) {
+                if sys.always_before_with(&ab_adj, j, i) {
                     out.push(t.clone());
                 }
             }
@@ -1328,7 +1337,17 @@ fn non_injective_fact_instances(
     for e in &sys.edges {
         adj.entry(e.src.0.clone()).or_default().push(e.tgt.0.clone());
     }
+    // `adj` is invariant across this function, so memoize each node's
+    // reachable set: `reachable(i)` is taken once per edge and `reachable(j)`
+    // once per reachable `j`, with the same `j` recurring across edges.
+    // The cache stores the exact value the un-memoized closure returned
+    // (the set with `from` removed), so this is a pure speedup.
+    let reach_cache: std::cell::RefCell<BTreeMap<NodeId, BTreeSet<NodeId>>> =
+        std::cell::RefCell::new(BTreeMap::new());
     let reachable = |from: &NodeId| -> BTreeSet<NodeId> {
+        if let Some(cached) = reach_cache.borrow().get(from) {
+            return cached.clone();
+        }
         let mut out = BTreeSet::new();
         let mut stack = vec![from.clone()];
         while let Some(n) = stack.pop() {
@@ -1338,6 +1357,7 @@ fn non_injective_fact_instances(
             }
         }
         out.remove(from);
+        reach_cache.borrow_mut().insert(from.clone(), out.clone());
         out
     };
     let lookup_node = |id: &NodeId| -> Option<&crate::rule::RuleACInst> {

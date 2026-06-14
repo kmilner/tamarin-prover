@@ -1591,13 +1591,18 @@ fn chain_to_equality(
     if !is_equality { return false; }
     // ku_before: there's a KU action for t_start at some node that
     // is reachable-before c.0 in the less-relation.
+    //
+    // `always_before(id, &c.0)` is invariant across the actions of a node
+    // (it does not depend on `fa`) and the relation is invariant across the
+    // node loop, so build the adjacency once and test the cheap tag/term
+    // predicate before the single per-node `always_before_with` query.
+    let ab_adj = sys.build_always_before_adj();
     let ku_before = sys.nodes.iter().any(|(id, rule)| {
         if id == &c.0 { return false; }
         rule.actions.iter().any(|fa| {
             matches!(fa.tag, crate::fact::FactTag::Ku)
                 && fa.terms.first() == Some(t_start)
-                && sys.always_before(id, &c.0)
-        })
+        }) && sys.always_before_with(&ab_adj, id, &c.0)
     });
     ku_before
 }
@@ -1720,10 +1725,13 @@ fn all_msg_vars_known_earlier(
 ) -> bool {
     if !args.iter().all(is_msg_var) { return false; }
     let i = &c.0;
+    // `always_before(j, i)` does not depend on `arg`, and the relation is
+    // invariant across both loops (`sys` is read-only), so build it once.
+    let ab_adj = sys.build_always_before_adj();
     args.iter().all(|arg| {
         sys.nodes.iter().any(|(j, rule)| {
             j != i
-                && sys.always_before(j, i)
+                && sys.always_before_with(&ab_adj, j, i)
                 && rule.actions.iter().any(|fa| {
                     matches!(fa.tag, crate::fact::FactTag::Ku)
                         && fa.terms.first() == Some(arg)

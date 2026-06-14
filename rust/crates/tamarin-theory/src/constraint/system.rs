@@ -15,6 +15,22 @@ use crate::rule::RuleACInst;
 use crate::tools::{EquationStore, SubtermStore};
 
 // =============================================================================
+// Prebuilt always-before adjacency
+// =============================================================================
+
+/// A prebuilt `alwaysBefore` adjacency map (`rawLessRel`), produced by
+/// [`System::build_always_before_adj`] and queried by
+/// [`System::always_before_with`]. Hoisting this build out of nested loops
+/// turns the per-call O(less+edges+chains) map rebuild into a single build
+/// per pass; the queries are pure BFS lookups. The relation is invariant
+/// across the inner loops (the system is not mutated mid-pass), so the
+/// hoisted result is identical to repeated per-call `always_before`.
+#[derive(Debug, Clone, Default)]
+pub struct PrebuiltAdj {
+    adj: std::collections::BTreeMap<NodeId, Vec<NodeId>>,
+}
+
+// =============================================================================
 // Source kind / side annotations
 // =============================================================================
 
@@ -619,8 +635,20 @@ impl System {
     /// `cyclic` and `has_forbidden_chain` miss contradictions HS catches
     /// (root cause of the StatVerif KU(pcs) over-saturation).
     pub fn always_before(&self, i: &NodeId, j: &NodeId) -> bool {
-        if i == j { return false; }
-        // Build adjacency from less atoms + edges + unsolved chains.
+        // Build the adjacency once and query it once; this keeps the old
+        // per-call path provably identical to the hoisted callers that
+        // call `build_always_before_adj` / `always_before_with`.
+        let adj = self.build_always_before_adj();
+        self.always_before_with(&adj, i, j)
+    }
+
+    /// Build the `alwaysBefore` adjacency map (`rawLessRel`) from
+    /// `sLessAtoms ++ sEdges ++ unsolvedChains`. This is exactly the map
+    /// that `always_before` constructs per call; hoist it out of loops via
+    /// [`always_before_with`] so the relation is built once per pass and
+    /// queried many times. The relation depends only on `&self`, never on
+    /// the `i`/`j` query arguments.
+    pub fn build_always_before_adj(&self) -> PrebuiltAdj {
         let mut adj: std::collections::BTreeMap<NodeId, Vec<NodeId>>
             = std::collections::BTreeMap::new();
         for l in &self.less_atoms {
@@ -637,6 +665,16 @@ impl System {
                 adj.entry(c.0.clone()).or_default().push(p.0.clone());
             }
         }
+        PrebuiltAdj { adj }
+    }
+
+    /// `alwaysBefore i j` against a prebuilt adjacency map (see
+    /// [`build_always_before_adj`](Self::build_always_before_adj)). The BFS
+    /// is byte-for-byte the one in the original per-call `always_before`,
+    /// so hoisting the adjacency build is a pure refactor.
+    pub fn always_before_with(&self, adj: &PrebuiltAdj, i: &NodeId, j: &NodeId) -> bool {
+        if i == j { return false; }
+        let adj = &adj.adj;
         // BFS from i until j.
         let mut frontier: std::collections::VecDeque<NodeId>
             = std::collections::VecDeque::new();

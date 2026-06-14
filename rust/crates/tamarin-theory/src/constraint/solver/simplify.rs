@@ -541,6 +541,10 @@ fn non_injective_fact_instances_pairs(
     let mut nodes_sorted: Vec<&(crate::constraint::constraints::NodeId, crate::rule::RuleACInst)>
         = sys.nodes.iter().collect();
     nodes_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    // The `alwaysBefore` adjacency is invariant across the edge/node loop
+    // (`sys` is read-only), so build it once and query with
+    // `always_before_with` instead of rebuilding the relation per pair.
+    let ab_adj = sys.build_always_before_adj();
     for e in &edges_sorted {
         let (i, conc_idx) = (e.src.0.clone(), e.src.1);
         let k = e.tgt.0.clone();
@@ -559,7 +563,7 @@ fn non_injective_fact_instances_pairs(
             if j == &i || j == &k { continue; }
             // Haskell's `guard (k ∈ reachableSet [j] less)` runs
             // *before* the case dispatch — so we require it up-front.
-            if !sys.always_before(j, &k) { continue; }
+            if !sys.always_before_with(&ab_adj, j, &k) { continue; }
             let has_conflict = j_rule.premises.iter().any(conflicting)
                 || j_rule.conclusions.iter().any(conflicting);
             if !has_conflict { continue; }
@@ -571,7 +575,7 @@ fn non_injective_fact_instances_pairs(
             // checkRuleIJ: i<j and nonUnifiable(k, j) — return (k, j)
             // Haskell's IJ branch uses `D.reachableSet [i] less`; we
             // mirror that with `i < j`.
-            if sys.always_before(&i, j) && non_unifiable_nodes(&k, j) {
+            if sys.always_before_with(&ab_adj, &i, j) && non_unifiable_nodes(&k, j) {
                 out.push((k.clone(), j.clone()));
             }
         }
@@ -859,8 +863,11 @@ fn partial_atom_valuation(
             // the case was dropped, where HS instead keeps the 2-way DisjG
             // split and closes only `I_1_case_1` via a Cyclic contradiction.
             if ni == nj { return Some(false); }
-            if sys.always_before(&nj, &ni) { return Some(false); }
-            if sys.always_before(&ni, &nj) { return Some(true); }
+            // Both `always_before` checks below query the same (invariant)
+            // relation, so build the adjacency once and reuse it.
+            let ab_adj = sys.build_always_before_adj();
+            if sys.always_before_with(&ab_adj, &nj, &ni) { return Some(false); }
+            if sys.always_before_with(&ab_adj, &ni, &nj) { return Some(true); }
             // Haskell:
             //   isLast sys i && isInTrace sys j  -> Just False
             //   isLast sys j && isInTrace sys i &&
@@ -878,7 +885,9 @@ fn partial_atom_valuation(
             // Node-id case: compare via the order relation and
             // rule-instance unifiability.
             if let (Some(ni), Some(nj)) = (parser_node_id(x), parser_node_id(y)) {
-                if sys.always_before(&ni, &nj) || sys.always_before(&nj, &ni) {
+                let ab_adj = sys.build_always_before_adj();
+                if sys.always_before_with(&ab_adj, &ni, &nj)
+                    || sys.always_before_with(&ab_adj, &nj, &ni) {
                     return Some(false);
                 }
                 if non_unifiable_nodes(&ni, &nj) { return Some(false); }
@@ -4129,6 +4138,11 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
     // they emit `(i, j)` or `(j, i)` LessAtoms whose direction depends
     // on which side has the "smaller" term.  Mirrors HS `paired` list
     // comprehension (Simplify.hs).
+    // The `alwaysBefore` relation is invariant across this pair loop: all
+    // results below accumulate into `new_formulas`/`new_lesses` and are only
+    // applied to `red` AFTER the loop, so `red.sys` is read-only here. Build
+    // the adjacency once and query it with `always_before_with`.
+    let ab_adj = red.sys.build_always_before_adj();
     for a in 0..by_inj.len() {
         for b in 0..by_inj.len() {
             if a == b { continue; }
@@ -4205,6 +4219,10 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                     // loop, mislabelling the leaf `from formulas` instead
                     // of `cyclic` (counter.spthy::counters_linear_order).
                     MonotonicBehaviour::StrictlyIncreasing => {
+                        // `alwaysBefore ii jj` and `alwaysBefore jj ii` are
+                        // each used by two cases below; compute each once.
+                        let ab_ij = red.sys.always_before_with(&ab_adj, ii, jj);
+                        let ab_ji = red.sys.always_before_with(&ab_adj, jj, ii);
                         // case (2) (Simplify.hs): [EqE i j | s == t]
                         if s == t && ii != jj {
                             let i_g = crate::guarded::term_to_gterm_free(
@@ -4218,8 +4236,7 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                         }
                         // case (4) (Simplify.hs): [¬EqE s t |
                         //   alwaysBefore i j || alwaysBefore j i, notIneq s t]
-                        let comparable = red.sys.always_before(ii, jj)
-                                      || red.sys.always_before(jj, ii);
+                        let comparable = ab_ij || ab_ji;
                         let already_ineq = inequalities.contains(&(s.clone(), t.clone()))
                                         || inequalities.contains(&(t.clone(), s.clone()));
                         if comparable && !already_ineq {
@@ -4235,13 +4252,13 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                         }
                         // case (3) (Simplify.hs): [(i,j) |
                         //   triviallySmaller s t, not alwaysBefore i j]
-                        if trivially_smaller(s, t) && !red.sys.always_before(ii, jj) {
+                        if trivially_smaller(s, t) && !ab_ij {
                             new_lesses.push((ii.clone(), jj.clone()));
                         }
                         // case (5) (Simplify.hs): [(j,i) |
                         //   triviallyNotSmaller s t, not alwaysBefore j i, ineq s t]
                         if trivially_not_smaller(s, t)
-                            && !red.sys.always_before(jj, ii)
+                            && !ab_ji
                             && (inequalities.contains(&(s.clone(), t.clone()))
                                 || inequalities.contains(&(t.clone(), s.clone()))) {
                             new_lesses.push((jj.clone(), ii.clone()));
@@ -4253,11 +4270,12 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                     //   less-atom cases (3) and (5) as StrictlyIncreasing,
                     //   again NOT gated on `s == t`.
                     MonotonicBehaviour::Increasing => {
-                        if trivially_smaller(s, t) && !red.sys.always_before(ii, jj) {
+                        if trivially_smaller(s, t)
+                            && !red.sys.always_before_with(&ab_adj, ii, jj) {
                             new_lesses.push((ii.clone(), jj.clone()));
                         }
                         if trivially_not_smaller(s, t)
-                            && !red.sys.always_before(jj, ii)
+                            && !red.sys.always_before_with(&ab_adj, jj, ii)
                             && (inequalities.contains(&(s.clone(), t.clone()))
                                 || inequalities.contains(&(t.clone(), s.clone()))) {
                             new_lesses.push((jj.clone(), ii.clone()));
