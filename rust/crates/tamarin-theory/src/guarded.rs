@@ -1712,9 +1712,8 @@ pub fn contains_action(g: &Guarded) -> bool {
         Guarded::Atom(a) => matches!(a, GAtom::Action(_, _)),
         Guarded::Disj(xs) | Guarded::Conj(xs) => xs.iter().any(contains_action),
         Guarded::GGuarded { guards, body, .. } => {
-            !guards.is_empty()
-                || guards.iter().any(|a| matches!(a, GAtom::Action(_, _)))
-                || contains_action(body)
+            // Haskell `Guarded.hs:636-637`: `\_ _ as body -> not (null as) || body`.
+            !guards.is_empty() || contains_action(body)
         }
     }
 }

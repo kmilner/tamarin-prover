@@ -1805,31 +1805,6 @@ impl MaudePool {
         })
     }
 
-    /// Build a pool from an EXISTING handle plus `n - 1` newly-spawned
-    /// siblings.  The existing handle is used as-is (counter state and
-    /// caches preserved); the new siblings are spawned fresh with the
-    /// same signature.  Useful when the caller already has a "primary"
-    /// Maude they want to reuse for sequential paths AND add to the
-    /// pool for parallel paths.
-    pub fn from_handle_with_siblings(
-        primary: MaudeHandle,
-        path: &str,
-        n: usize,
-    ) -> Result<Self, MaudeError> {
-        assert!(n >= 1, "MaudePool::from_handle_with_siblings requires n >= 1");
-        let sig = primary.maude_sig();
-        let mut handles = Vec::with_capacity(n);
-        handles.push(primary);
-        for _ in 1..n {
-            handles.push(MaudeHandle::start(path, sig.clone())?);
-        }
-        Ok(MaudePool {
-            free: Mutex::new(handles),
-            notify: Condvar::new(),
-            size: n,
-        })
-    }
-
     /// Block until a handle is free, then return it.  The handle is
     /// returned to the pool when the returned `PooledMaude` is dropped.
     pub fn acquire(&self) -> PooledMaude<'_> {
@@ -1844,12 +1819,6 @@ impl MaudePool {
 
     /// Number of subprocesses this pool was constructed with.
     pub fn size(&self) -> usize { self.size }
-
-    /// Kill every pooled subprocess (watchdog).  Idempotent.
-    pub fn kill_all(&self) {
-        let free = self.free.lock().unwrap();
-        for h in free.iter() { h.kill_subprocess(); }
-    }
 }
 
 /// A borrowed Maude handle from a `MaudePool`.  `Deref`s to

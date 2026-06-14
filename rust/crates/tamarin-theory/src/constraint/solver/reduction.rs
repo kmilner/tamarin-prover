@@ -3157,47 +3157,6 @@ fn illegal_coerce(p_rule: &RuleACInst, fa_prem: &crate::fact::LNFact) -> bool {
     is_pair(t) || is_inverse(t) || is_product(t)
 }
 
-/// Build a structural fingerprint of a !KU goal's term for runtime
-/// filterCases. Two goals with the same fingerprint are "the same
-/// shape" — re-grafting the same chain-composed source case for
-/// the same shape risks the sources_assertion-class infinite descent.
-/// Two goals with different fingerprints (e.g. different head symbols)
-/// may legitimately use the same case.
-///
-/// Strategy: dump the term head + immediate argument heads, with
-/// variables collapsed to `?`. Catches structural recursion without
-/// over-merging distinct goal shapes.
-fn ku_goal_fingerprint(fa: &crate::fact::LNFact) -> String {
-    use tamarin_term::term::Term;
-    use tamarin_term::vterm::Lit;
-    fn head(t: &tamarin_term::lterm::LNTerm) -> String {
-        match t {
-            Term::Lit(Lit::Var(v)) => format!("V:{:?}", v.sort),
-            Term::Lit(Lit::Con(_)) => "Con".into(),
-            Term::App(sym, args) => {
-                let name: String = match sym {
-                    tamarin_term::function_symbols::FunSym::NoEq(s) =>
-                        String::from_utf8_lossy(&s.name).to_string(),
-                    tamarin_term::function_symbols::FunSym::Ac(_) => "AC".into(),
-                    tamarin_term::function_symbols::FunSym::C(_) => "C".into(),
-                    tamarin_term::function_symbols::FunSym::List => "List".into(),
-                };
-                let arg_heads: Vec<String> = args.iter().map(|a| match a {
-                    Term::Lit(Lit::Var(v)) => format!("V:{:?}", v.sort),
-                    Term::Lit(Lit::Con(_)) => "Con".into(),
-                    Term::App(s, _) => match s {
-                        tamarin_term::function_symbols::FunSym::NoEq(ss) =>
-                            String::from_utf8_lossy(&ss.name).to_string(),
-                        _ => "?".into(),
-                    },
-                }).collect();
-                format!("{}({})", name, arg_heads.join(","))
-            }
-        }
-    }
-    fa.terms.first().map(head).unwrap_or_else(|| "?".into())
-}
-
 fn is_pair(t: &tamarin_term::lterm::LNTerm) -> bool {
     use tamarin_term::function_symbols::FunSym;
     if let tamarin_term::term::Term::App(FunSym::NoEq(s), args) = t {
@@ -4608,67 +4567,15 @@ impl<'ctx> Reduction<'ctx> {
                     ) {
                         let live_goal = Goal::Action(i.clone(), fa.clone());
                         let mut out: Vec<(String, crate::constraint::system::System)> = Vec::new();
-                        // filterCases: skip cases whose source name was
-                        // already used in this branch (mirrors Haskell's
-                        // `solveAllSafeGoals` filterCases invariant).
-                        // A chain-saturated case left open KU goals at
-                        // saturate-time; without this filter the same
-                        // case keeps getting re-grafted at runtime to
-                        // discharge its own re-spawned KU sub-goals,
-                        // looping forever.  Single-case cases (the c_*
-                        // intruder constructors and unique-producer
-                        // protocol rules) are still allowed to repeat
-                        // — only the chain-saturated multi-rule cases
-                        // carry the "name" structure that risks loops.
-                        // filterCases applies ONLY to chain-saturated
-                        // cases — those whose name encodes a multi-rule
-                        // chain (contains an underscore).  Single-rule
-                        // case names (e.g. "Send", "c_senc") may be
-                        // legitimately re-applied for distinct sub-goals
-                        // in the same branch; only the multi-rule
-                        // saturated cases carry the open re-spawning
-                        // KU goals that loop.
-                        let used = self.sys.used_sources.clone();
-                        // A case is "saturated" (chain-folded across
-                        // multiple rules) if its name encodes more than
-                        // one rule.  Saturated cases collect open KU
-                        // goals at saturate time, so re-applying the
-                        // same case at runtime risks looping.  Single-
-                        // rule names (e.g. `R_2`, `Reveal_ltk`,
-                        // `Register_pk`) typically have 0–1 underscores;
-                        // chain-saturated names like `Initiator_Setup_Key`
-                        // or `R_1_Register_pk_Register_pk` have 2+.  We
-                        // also skip names starting with `c_` (intruder
-                        // constructors are always atomic) and `case_N`
-                        // (Disj/Ex case-split markers).
-                        // Filter chain-saturated source-cases that have
-                        // already been used in this branch — mirrors
-                        // Haskell's `filterCases` in
-                        // `Theory.Constraint.Solver.Sources`. A
-                        // chain-saturated case name encodes a multi-rule
-                        // composition (`Rule_A_Rule_B`); re-applying it
-                        // in the same branch lets the !KU source-case
-                        // enumeration recurse infinitely on typing
-                        // lemmas where the IH disjunction case_1 keeps
-                        // demanding the same shape of !KU.  The
-                        // saturate-time filter only catches the
-                        // precompute path; the runtime path can
-                        // re-graft when the IH spawns fresh KU goals.
-                        //
-                        // Heuristics for "is this a saturated case":
-                        //   - `c_*` (intruder constructors) and
-                        //     `case_N` (Disj/Ex case-split markers) are
-                        //     atomic — always allowed to repeat.
-                        //   - Names with 2+ underscores encode rule
-                        //     chains; treat as saturated and filter.
-                        // Runtime filterCases — disabled (see task #115).
-                        // The right fix is N5_u-driven KU action-node
-                        // unification on identical terms, which then
-                        // surfaces a cyclic-ordering contradiction.
-                        let _ = &used;
-                        let _ = ku_goal_fingerprint(fa);
+                        // Runtime filterCases (mirroring Haskell's
+                        // `filterCases` in
+                        // `Theory.Constraint.Solver.Sources`, which skips
+                        // already-used chain-saturated source cases) is
+                        // disabled here (see task #115).  The right fix is
+                        // N5_u-driven KU action-node unification on
+                        // identical terms, which surfaces a
+                        // cyclic-ordering contradiction.
                         for (case_label, mut sys, case_action) in case_pairs.into_iter() {
-                            let case_idx: usize = 0; let _ = case_idx;
                             if let Some(slot) = sys.goals_mut().iter_mut()
                                 .find(|(g, _)| g == &live_goal) {
                                 slot.1.solved = true;

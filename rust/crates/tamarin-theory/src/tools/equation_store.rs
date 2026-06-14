@@ -529,13 +529,6 @@ impl EquationStore {
         m
     }
 
-    /// Apply a free substitution and a list of equations would go here once
-    /// AC unification is wired up. For now this is a stub.
-    #[allow(unused_variables)]
-    pub fn add_eqs_stub(&mut self, eqs: &[(LNTerm, LNTerm)]) -> Result<Option<SplitId>, &'static str> {
-        Err("addEqs requires Maude-backed AC unification — not yet implemented")
-    }
-
     /// Maude-backed `addEqs` with a caller-supplied freshness baseline.
     /// `extra_avoid` is the max idx seen anywhere in the surrounding
     /// system (beyond just the eq-store).  Without this, Maude

@@ -2036,14 +2036,6 @@ fn contains_private(t: &tamarin_term::lterm::LNTerm) -> bool {
     }
 }
 
-/// `solveGoal` placeholder: the full implementation lives in the
-/// Reduction monad and applies the appropriate constraint-reduction
-/// rule for the goal type. For now this is a stub.
-#[allow(unused_variables)]
-pub fn solve_goal(g: &Goal, sys: &mut System) -> Option<()> {
-    None
-}
-
 /// Dispatch a goal to the appropriate `solve_*_goal` primitive on a
 /// `Reduction`. Mirrors the case dispatch at the top of Haskell's
 /// `solveGoal`. Returns the corresponding `GoalCases` outcome.
