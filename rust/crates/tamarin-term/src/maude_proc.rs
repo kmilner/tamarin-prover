@@ -2050,6 +2050,70 @@ mod tests {
             "expected codeOther to AC-match a 2-element sub-multiset");
     }
 
+    // Regression (DH key-exchange over-match, fixed by routing the
+    // `insertImpliedFormulas` Action-guard AC-fallback through
+    // `match_eqs_skolemize_both` instead of `match_eqs_const_subject`).
+    //
+    // HS's `impliedFormulas` runs `skolemizeGuarded` over the WHOLE
+    // clause (`System.hs:1122`): every FREE (non-universal) LVar of the
+    // guard pattern becomes a Maude *constant* (`MaudeConst`), only the
+    // universal-bound vars stay bindable Maude variables.  So a guard
+    // pattern position holding a free system var must match the system
+    // action's corresponding position as CONSTANT-vs-CONSTANT.
+    //
+    // Mirrors the real STS_MAC_fix2 `AcceptedR` guard match (sent as
+    // per-argument equations, one for each fact position).  The guard
+    // pattern has ONE universal-bound var `kpartner` and several FREE
+    // system vars (`ekI`,`ekR`) that, after a prior guard's binding,
+    // occupy positions whose subject counterparts are DIFFERENT free
+    // system vars (`x`,`tid`).  Two equations:
+    //   eq1:  exp(g, ekI)  <=?  exp(g, x)     (pattern free ekI vs x)
+    //   eq2:  exp(g, ekR)  <=?  exp(g, tid)   (pattern free ekR vs tid)
+    // With `match_eqs_const_subject` the pattern's `ekI`,`ekR` are Maude
+    // VARIABLES, so Maude binds `ekI->x`, `ekR->tid` and the match
+    // SUCCEEDS — the spurious match that fired `gfalse` one step early.
+    // With `match_eqs_skolemize_both` every free var is a distinct
+    // CONSTANT, so `exp(g,c_ekI)` != `exp(g,c_x)` and the match FAILS,
+    // exactly as HS's `skolemizeGuarded`-then-`matchAction` does.
+    #[test]
+    fn impl_guard_match_skolemizes_pattern_free_vars() {
+        let path = match maude_path() { Some(p) => p, None => { eprintln!("skipping: no maude"); return; } };
+        use crate::function_symbols::{FunSym, exp_sym};
+        let sig = crate::maude_sig::dh_maude_sig();
+        let h = MaudeHandle::start(&path, sig).expect("start");
+        let mk = |v: LVar| -> LNTerm { crate::term::Term::Lit(Lit::Var(v)) };
+        let g = crate::term::Term::Lit(Lit::Con(crate::lterm::Name::new(crate::lterm::NameTag::Pub, "g")));
+        let exp = |base: LNTerm, e: LNTerm|
+            crate::term::Term::App(FunSym::NoEq(exp_sym()), vec![base, e].into());
+        // free (non-universal) system vars — NONE of these is in
+        // `pattern_vars`, so HS skolemizes them all to constants.
+        let ek_i = LVar::new("ekI", LSort::Fresh, 0);
+        let ek_r = LVar::new("ekR", LSort::Fresh, 0);
+        let xv   = LVar::new("x",   LSort::Fresh, 21);
+        let tid  = LVar::new("tid", LSort::Fresh, 15);
+        let eqs = vec![
+            Equal { lhs: exp(g.clone(), mk(ek_i.clone())), rhs: exp(g.clone(), mk(xv.clone())) },
+            Equal { lhs: exp(g.clone(), mk(ek_r.clone())), rhs: exp(g.clone(), mk(tid.clone())) },
+        ];
+        // No universal-bound vars in these positions.
+        let pattern_vars: std::collections::BTreeSet<(String, u64)> =
+            std::collections::BTreeSet::new();
+        // const_subject (the OLD Action-guard path) OVER-MATCHES: the
+        // pattern's free `ekI`,`ekR` are Maude variables binding to x,tid.
+        let over = h.match_eqs_const_subject(&eqs, &pattern_vars).expect("m1");
+        eprintln!("[REPRO] const_subject matches = {} (over-match expected: >=1)", over.len());
+        assert!(!over.is_empty(),
+            "sanity: const_subject is expected to OVER-match here (the bug)");
+        // skolemize_both (the FIX): ekI,ekR,x,tid are distinct constants,
+        // so neither equation can be satisfied → NO match, matching HS.
+        let fixed = h.match_eqs_skolemize_both(&eqs, &pattern_vars).expect("m2");
+        eprintln!("[REPRO] skolemize_both matches = {} (HS-faithful: 0)", fixed.len());
+        assert!(fixed.is_empty(),
+            "skolemize_both must NOT over-match: pattern-side free system \
+             vars (ekI,ekR) are CONSTANTS and cannot bind to the subject's \
+             different free vars (x,tid); got {:?}", fixed);
+    }
+
     /// Directional regression for the `match_eqs` / `compare_term_subs`
     /// flipped-`Equal`-convention bug.
     ///
