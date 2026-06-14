@@ -125,6 +125,65 @@ pub(crate) fn impure_dbg_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("TAM_RS_DBG_IMPURE_FOLD").is_ok())
 }
 
+// --- Cached kill-switch / debug env flags for apply_eq_store -----------
+// `apply_eq_store` is one of the hottest solver methods (per proof step,
+// plus recursively from every simp pass).  These env vars are constant
+// for the process; cache each behind a `OnceLock<bool>` (mirroring
+// `impure_dbg_enabled`) so the steady-state cost is an atomic load, not
+// an env-lock + `String` alloc per call / per variant.  Semantics are
+// preserved exactly (`.is_ok()` opt-in, `.is_err()` opt-out, and the
+// `== "substantive"` value match).
+#[inline]
+fn aes_dbg() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DBG_APPLY_EQ_STORE").is_ok())
+}
+/// `TAM_RS_DBG_APPLY_EQ_STORE_FILTER` selects the "substantive" filter by
+/// exact value, so cache the equality test (not a bare `.is_ok()`).
+#[inline]
+fn aes_dbg_filter_substantive() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DBG_APPLY_EQ_STORE_FILTER")
+        .map(|s| s == "substantive").unwrap_or(false))
+}
+/// `TAM_RS_DISABLE_PER_VARIANT_COUNTER_RESET` is an opt-OUT (`.is_err()`).
+#[inline]
+fn aes_per_variant_reset() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_PER_VARIANT_COUNTER_RESET").is_err())
+}
+/// `TAM_RS_DISABLE_APPLYBOUND_LOCAL_RESET` is an opt-OUT (`.is_err()`).
+#[inline]
+fn aes_applybound_local_reset() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_APPLYBOUND_LOCAL_RESET").is_err())
+}
+#[inline]
+fn aes_dbg_variant() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_AES_VARIANT").is_ok())
+}
+#[inline]
+fn aes_dbg_detail() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DBG_AES_DETAIL").is_ok())
+}
+#[inline]
+fn aes_dbg_raw_unifier() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_RAW_UNIFIER").is_ok())
+}
+#[inline]
+fn aes_dbg_variants() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_AES_VARIANTS").is_ok())
+}
+#[inline]
+fn aes_dbg_bad_disj() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_BAD_DISJ").is_ok())
+}
+
 fn impure_dbg_registry()
     -> &'static std::sync::Mutex<std::collections::HashMap<String, String>>
 {
@@ -279,7 +338,7 @@ impl EquationStore {
         // TAM_DBG_BAD_DISJ=1: print backtrace when a disj subst has two
         // distinct keys mapping to the same VTerm value (the canonical
         // KAS-divergence pattern: ~ltkA.0 and ~ltkA.1 both → ~ltkA.X).
-        if std::env::var("TAM_DBG_BAD_DISJ").is_ok() {
+        if aes_dbg_bad_disj() {
             for s in &substs {
                 let entries: Vec<(LVar, LNTerm)> = s.to_list();
                 let mut seen: std::collections::BTreeMap<String, (LVar, LVar)>
@@ -1904,18 +1963,22 @@ impl EquationStore {
         // compared apples-to-apples against HS.
         // TAM_RS_DBG_APPLY_EQ_STORE_FILTER=substantive limits dump to
         // calls with non-empty conj (matches HS's substantive filter).
-        let rs_dbg = std::env::var("TAM_RS_DBG_APPLY_EQ_STORE").is_ok();
-        let rs_dbg_filter_substantive = std::env::var("TAM_RS_DBG_APPLY_EQ_STORE_FILTER")
-            .map(|s| s == "substantive").unwrap_or(false);
+        let rs_dbg = aes_dbg();
+        let rs_dbg_filter_substantive = aes_dbg_filter_substantive();
         let rs_substantive = self.conj.iter().any(|d| !d.substs.is_empty());
-        let op_label = crate::constraint::solver::trace::current_op_label();
         // Build a HS-comparable site label: `<rust_site>@<op_label>`.
         // HS emits e.g. `addEqs.single-unifier@solveTermEqs` — the part
         // before `@` is the apply_eq_store internal call site, after `@`
         // is the originating Reduction operation.  Match RS's convention
-        // so per-label diffs work.
-        let aes_site = format!("{}:{}@{}",
-            __aes_caller.file(), __aes_caller.line(), op_label);
+        // so per-label diffs work.  The `current_op_label()` thread-local
+        // clone + `format!` only feed the `rs_dbg`-gated traces below, so
+        // skip both entirely in the common (untraced) production path.
+        let aes_site = if rs_dbg {
+            format!("{}:{}@{}", __aes_caller.file(), __aes_caller.line(),
+                crate::constraint::solver::trace::current_op_label())
+        } else {
+            String::new()
+        };
         if rs_dbg && (rs_substantive || !rs_dbg_filter_substantive) {
             eprintln!("[rs-aes-tick] site={} conj={} substantive={}",
                 aes_site, self.conj.len(), rs_substantive);
@@ -1979,7 +2042,7 @@ impl EquationStore {
         // don't reuse these idxs.  Mirrors HS's per-call evalFreshAvoiding.
         //
         // `TAM_RS_DISABLE_PER_VARIANT_COUNTER_RESET=1` opts out for diagnosis.
-        let per_variant_reset = std::env::var("TAM_RS_DISABLE_PER_VARIANT_COUNTER_RESET").is_err();
+        let per_variant_reset = aes_per_variant_reset();
         // HS-faithful local-per-call counter mode: each `applyBound`
         // invocation runs `renameAvoiding (range) avoidSet` →
         // `evalFreshAvoiding (rename ...)` which seeds the supply at
@@ -2018,8 +2081,7 @@ impl EquationStore {
         // VFresh α-equivalence.
         //
         // Opt-out via `TAM_RS_DISABLE_APPLYBOUND_LOCAL_RESET=1`.
-        let applybound_local_reset =
-            std::env::var("TAM_RS_DISABLE_APPLYBOUND_LOCAL_RESET").is_err();
+        let applybound_local_reset = aes_applybound_local_reset();
         let initial_counter = maude.fresh_counter_peek();
         let mut high_water_mark = initial_counter;
         for d in self.conj.iter() {
@@ -2170,7 +2232,7 @@ impl EquationStore {
                 if let Some(input) = &dbg_in {
                     eprintln!("[rs-aes-applyBound] IN  : {:?}", input);
                 }
-                if std::env::var("TAM_DBG_AES_VARIANT").is_ok() {
+                if aes_dbg_variant() {
                     let pairs: Vec<String> = bindings.iter()
                         .map(|(k, v)| format!("{}.{} → {}", k.name, k.idx,
                             format!("{:?}", v).chars().take(80).collect::<String>()))
@@ -2180,7 +2242,7 @@ impl EquationStore {
                 // TAM_RS_DBG_AES_DETAIL=1: dump per-variant rhs_min, shift,
                 // avoid_max, max_idx, counter before/after Maude.  Used to
                 // diagnose witness idx divergence vs HS (split_case ordering).
-                let detail_dbg = std::env::var("TAM_RS_DBG_AES_DETAIL").is_ok();
+                let detail_dbg = aes_dbg_detail();
                 if detail_dbg {
                     eprintln!("[rs-aes-detail] avoid_max={} rhs_min={:?} max_idx={} counter_before={}",
                         avoid_max, rhs_min, max_idx, maude.fresh_counter_peek());
@@ -2218,7 +2280,7 @@ impl EquationStore {
                     .collect();
                 for raw in unifiers {
                     // TAM_DBG_RAW_UNIFIER=1: dump Maude's raw output.
-                    if std::env::var("TAM_DBG_RAW_UNIFIER").is_ok() {
+                    if aes_dbg_raw_unifier() {
                         eprintln!("[rs-raw-unifier] sid={:?} raw entries:", d.split_id);
                         for (k, t) in &raw {
                             eprintln!("[rs-raw-unifier]   {}.{}/{:?} → {:?}",
@@ -2419,7 +2481,7 @@ impl EquationStore {
             }
             new_substs.sort();
             new_substs.dedup();
-            if std::env::var("TAM_DBG_AES_VARIANTS").is_ok() {
+            if aes_dbg_variants() {
                 eprintln!("[aes_variants] disj split_id={:?} before→after: {} → {} substs",
                     d.split_id, d.substs.len(), new_substs.len());
                 eprintln!("[aes_variants]   BEFORE (input variants):");
@@ -2439,7 +2501,7 @@ impl EquationStore {
                 }
             }
             // TAM_DBG_BAD_DISJ=1: detect collision in new_substs.
-            if std::env::var("TAM_DBG_BAD_DISJ").is_ok() {
+            if aes_dbg_bad_disj() {
                 for s in &new_substs {
                     let entries: Vec<(LVar, LNTerm)> = s.to_list();
                     let mut seen: std::collections::BTreeMap<String, LVar>

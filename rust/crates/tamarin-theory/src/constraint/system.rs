@@ -247,6 +247,54 @@ pub struct GoalStatus {
     pub nr: u64,
 }
 
+// --- Cached debug env flags for the node/goal insertion hot path -------
+// `add_node`/`add_goal`/`add_goal_with_loop_flag` are the core insertion
+// path (34+ `add_node` call sites; goal inserts per KU-decomposition /
+// conjoinSystem).  These diagnostic env vars are constant for the
+// process, so cache each behind a `OnceLock<bool>` (mirroring
+// `reduction::bounds_max_verify_enabled`) instead of an env-lock +
+// `String` alloc per insertion.
+#[inline]
+fn dbg_insert_goal() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DBG_INSERT_GOAL").is_ok())
+}
+#[inline]
+fn dbg_insert_goal_include_precompute() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DBG_INSERT_GOAL_INCLUDE_PRECOMPUTE").is_ok())
+}
+#[inline]
+fn trace_goal_insert() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_TRACE_GOAL_INSERT").is_ok())
+}
+#[inline]
+fn dbg_panic_idx0() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_PANIC_IDX0").is_ok())
+}
+#[inline]
+fn dbg_panic_idx0_runtime_only() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_PANIC_IDX0_RUNTIME_ONLY").is_ok())
+}
+#[inline]
+fn dbg_add_node_serv1() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_ADD_NODE_SERV1").is_ok())
+}
+#[inline]
+fn dbg_trace_add_node() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_TRACE_ADD_NODE").is_ok())
+}
+#[inline]
+fn dbg_panic_any_idx0_node() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_PANIC_ANY_IDX0_NODE").is_ok())
+}
+
 impl System {
     pub fn empty() -> Self { Self::default() }
 
@@ -356,10 +404,10 @@ impl System {
         // counter on EVERY call, even when the goal already exists.
         let age = self.next_goal_nr;
         self.next_goal_nr = self.next_goal_nr.wrapping_add(1);
-        if std::env::var("TAM_RS_DBG_INSERT_GOAL").is_ok() {
+        if dbg_insert_goal() {
             let in_pre = crate::constraint::solver::sources::in_precompute_mode()
                 || crate::constraint::solver::sources::in_initial_source_cases();
-            let want_pre = std::env::var("TAM_RS_DBG_INSERT_GOAL_INCLUDE_PRECOMPUTE").is_ok();
+            let want_pre = dbg_insert_goal_include_precompute();
             if !in_pre || want_pre {
                 let tag = if in_pre { "<precompute>" } else { "<proof>" };
                 eprintln!("[RS_INS_GOAL] lemma={} gsNr={} solved=false loops=false goal={:?}", tag, age, g);
@@ -408,10 +456,10 @@ impl System {
         // combineGoalStatus` keeps the existing — smaller — nr).
         let age = self.next_goal_nr;
         self.next_goal_nr = self.next_goal_nr.wrapping_add(1);
-        if std::env::var("TAM_RS_DBG_INSERT_GOAL").is_ok() {
+        if dbg_insert_goal() {
             let in_pre = crate::constraint::solver::sources::in_precompute_mode()
                 || crate::constraint::solver::sources::in_initial_source_cases();
-            let want_pre = std::env::var("TAM_RS_DBG_INSERT_GOAL_INCLUDE_PRECOMPUTE").is_ok();
+            let want_pre = dbg_insert_goal_include_precompute();
             if !in_pre || want_pre {
                 let tag = if in_pre { "<precompute>" } else { "<proof>" };
                 eprintln!("[RS_INS_GOAL] lemma={} gsNr={} solved=false loops={} goal={:?}", tag, age, looping, g);
@@ -420,7 +468,7 @@ impl System {
         let canon_g = canonical_goal_for_dedup(&g);
         let is_new = !self.goals.iter().any(|(existing, _)|
             canonical_goal_for_dedup(existing) == canon_g);
-        if std::env::var("TAM_RS_TRACE_GOAL_INSERT").is_ok() {
+        if trace_goal_insert() {
             let kindstr = match &g {
                 Goal::Action(i, fa) => format!("Action {:?} {:?}", i, fa),
                 Goal::Premise(p, fa) => format!("Premise {:?} {:?}", p, fa),
@@ -451,9 +499,9 @@ impl System {
         // DIAGNOSTIC: panic if an instance rule with user-named idx-0 vars
         // gets added.  Gated by env var so it doesn't affect production.
         // Honors TAM_DBG_PANIC_IDX0_RUNTIME_ONLY=1 to skip during precompute.
-        if std::env::var("TAM_DBG_PANIC_IDX0").is_ok() {
+        if dbg_panic_idx0() {
             let in_precompute = crate::constraint::solver::sources::in_precompute_mode();
-            let skip_during_precompute = std::env::var("TAM_DBG_PANIC_IDX0_RUNTIME_ONLY").is_ok();
+            let skip_during_precompute = dbg_panic_idx0_runtime_only();
             let active = !(skip_during_precompute && in_precompute);
             if active {
                 use tamarin_term::lterm::HasFrees;
@@ -472,7 +520,7 @@ impl System {
             }
         }
         // DIAGNOSTIC: dump Serv_1 rule contents at the moment of add_node.
-        if std::env::var("TAM_DBG_ADD_NODE_SERV1").is_ok() {
+        if dbg_add_node_serv1() {
             let nm = crate::constraint::solver::reduction::rule_case_name(&rule);
             if nm == "Serv_1" {
                 eprintln!("[add_node_serv1] adding Serv_1 at {}.{}", id.name, id.idx);
@@ -489,7 +537,7 @@ impl System {
         }
         // DIAGNOSTIC: trace every node addition with its id+rule_name.
         // Captures both pre-saturation (precompute) and runtime grafts.
-        if std::env::var("TAM_DBG_TRACE_ADD_NODE").is_ok() {
+        if dbg_trace_add_node() {
             let rule_name = crate::constraint::solver::reduction::rule_case_name(&rule);
             // Also dump prem[1] term if id is j:N (R_1/I_1 candidates).
             if id.name == "j" {
@@ -511,7 +559,7 @@ impl System {
         // with id idx 0 (excluding the very first node, which is legitimate).
         // Used to find the source of the idx-0 leak.  Set
         // TAM_DBG_PANIC_ANY_IDX0_NODE=1 to enable.
-        if std::env::var("TAM_DBG_PANIC_ANY_IDX0_NODE").is_ok() && id.idx == 0 {
+        if dbg_panic_any_idx0_node() && id.idx == 0 {
             let rule_name = crate::constraint::solver::reduction::rule_case_name(&rule);
             panic!("[TAM_DBG_PANIC_ANY_IDX0_NODE] add_node at idx 0: id={:?} rule={}",
                 id, rule_name);

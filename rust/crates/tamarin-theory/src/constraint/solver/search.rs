@@ -61,6 +61,31 @@ pub enum NodeStatus {
     Sorry,
 }
 
+// --- Cached kill-switch / debug env flags -------------------------------
+// `expand`/`expand_inner` run once per proof-tree node (thousands of
+// times per lemma); these env vars are constant for the process, so cache
+// each behind a `OnceLock<bool>` (mirroring `trace::flag()`).  Semantics
+// preserved exactly: `TAM_RS_KEEP_SYS` is `var_os`-presence, so cache it
+// as the affirmative `keep_sys()` and negate at the call site.
+
+#[inline]
+fn keep_sys() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("TAM_RS_KEEP_SYS").is_some())
+}
+
+#[inline]
+fn dbg_expand_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_EXPAND").is_ok())
+}
+
+#[inline]
+fn disable_parallel_expand() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_PARALLEL_EXPAND").is_ok())
+}
+
 /// Per-lemma wall-clock cap on `run_proof_search`. Mirrors Haskell
 /// tamarin's `--prove-timeout` flag: when the search tree branches
 /// faster than CR-rules can prune (e.g. with a richer signature), we'd
@@ -426,7 +451,7 @@ fn expand(
         &node.method,
         ProofMethod::Sorry(Some(msg)) if msg == "depth limit"
     ) && matches!(node.status, NodeStatus::Sorry);
-    if !keep_for_redoexpand && std::env::var_os("TAM_RS_KEEP_SYS").is_none() {
+    if !keep_for_redoexpand && !keep_sys() {
         node.sys = crate::constraint::system::System::default();
     }
 }
@@ -438,7 +463,7 @@ fn expand_inner(
     deadline: &std::time::Instant,
     depth: usize,
 ) {
-    let dbg_expand = std::env::var("TAM_DBG_EXPAND").is_ok();
+    let dbg_expand = dbg_expand_enabled();
     if dbg_expand {
         eprintln!("[expand] enter depth={} budget={} sys.nodes={} goals={}",
             depth, *budget, node.sys.nodes.len(), node.sys.goals.len());
@@ -622,7 +647,7 @@ fn expand_inner(
     // the parallel pass).  case_path is best-effort under parallel:
     // each worker seeds its stack from the parent's snapshot at entry.
     let n_cases = cases.len();
-    let dbg_serial_only = std::env::var("TAM_RS_DISABLE_PARALLEL_EXPAND").is_ok();
+    let dbg_serial_only = disable_parallel_expand();
     // Gate parallel mode on all-traces lemmas only.  Exists-trace
     // lemmas rely on the `any_solved` early-break (HS's lazy `foldMap`
     // short-circuit on `TraceFound`) — once a single witness branch

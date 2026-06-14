@@ -28,6 +28,14 @@ fn mark_contradictory_labeled(red: &mut Reduction, pass: &'static str) {
     red.mark_contradictory();
 }
 
+/// `TAM_RS_TRACE_SIMPLIFY=1` — cached once per process (env vars are
+/// constant for the run); mirrors `trace::flag()`/`bounds_max_verify_enabled`.
+#[inline]
+fn simplify_trace_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_TRACE_SIMPLIFY").is_ok())
+}
+
 /// `TAM_RS_TRACE_SIMPLIFY=1` — per-subpass enter/exit traces matching
 /// HS's `tracePassPair` format.  Lets us count contradiction-firing per
 /// pass via `delta = enter - exit` (an exit MISSING means the pass
@@ -35,8 +43,12 @@ fn mark_contradictory_labeled(red: &mut Reduction, pass: &'static str) {
 fn trace_subpass<F: FnOnce(&mut Reduction) -> ChangeIndicator>(
     label: &'static str, red: &mut Reduction, f: F,
 ) -> ChangeIndicator {
-    let on = std::env::var("TAM_RS_TRACE_SIMPLIFY").is_ok();
-    if on { eprintln!("[SUBPASS] enter {}", label); }
+    // Tracing off (the default): skip the two `is_dead_for_trace` scans
+    // entirely — they are only observed through the `&& on` guard below.
+    if !simplify_trace_enabled() {
+        return f(red);
+    }
+    eprintln!("[SUBPASS] enter {}", label);
     let was_dead_before = is_dead_for_trace(red);
     let r = f(red);
     let dead_after = is_dead_for_trace(red);
@@ -44,7 +56,7 @@ fn trace_subpass<F: FnOnce(&mut Reduction) -> ChangeIndicator>(
     // monadic action ran to completion WITHOUT mzero'ing.  In Rust,
     // mark_contradictory is the closest analog — if the pass marked
     // contradictory (and wasn't already), it "mzero'd" mid-pass.
-    if (was_dead_before || !dead_after) && on {
+    if was_dead_before || !dead_after {
         eprintln!("[SUBPASS] exit  {}", label);
     }
     r
@@ -456,12 +468,14 @@ fn trace_subpass_fan_out<T, F>(
 where
     F: FnOnce(&mut Reduction) -> std::result::Result<ChangeIndicator, T>,
 {
-    let on = std::env::var("TAM_RS_TRACE_SIMPLIFY").is_ok();
-    if on { eprintln!("[SUBPASS] enter {}", label); }
+    if !simplify_trace_enabled() {
+        return f(red);
+    }
+    eprintln!("[SUBPASS] enter {}", label);
     let was_dead_before = is_dead_for_trace(red);
     let r = f(red);
     let dead_after = is_dead_for_trace(red);
-    if (was_dead_before || !dead_after) && on {
+    if was_dead_before || !dead_after {
         eprintln!("[SUBPASS] exit  {}", label);
     }
     r

@@ -131,6 +131,59 @@ struct MaudeProcessInner {
     match_empty_cache: std::collections::HashMap<(Vec<(LNTerm, LNTerm)>, Vec<(String, u64)>), ()>,
 }
 
+/// Cached `TAM_DBG_MAUDE_IO` / `TAM_DBG_MAUDE_IO_FILTER` configuration.
+/// Both env vars are constant for the process; `execute()` is the single
+/// chokepoint for every Maude IPC round-trip, so read them once instead
+/// of per call.  Returns `(trace_enabled, trace_full, filter)` preserving
+/// the exact 3-way `TAM_DBG_MAUDE_IO` semantics (`""` / `"full"` / other)
+/// and the substring `filter` value.
+fn maude_io_trace_config() -> &'static (bool, bool, String) {
+    static CFG: std::sync::OnceLock<(bool, bool, String)> = std::sync::OnceLock::new();
+    CFG.get_or_init(|| {
+        let trace_mode = std::env::var("TAM_DBG_MAUDE_IO").unwrap_or_default();
+        let trace_enabled = !trace_mode.is_empty();
+        let trace_full = trace_mode == "full";
+        let filter = std::env::var("TAM_DBG_MAUDE_IO_FILTER").unwrap_or_default();
+        (trace_enabled, trace_full, filter)
+    })
+}
+
+// --- Cached kill-switch env flags for unify_with_avoid -----------------
+// `unify` is the dominant Maude operation; the non-AC fast path is hit
+// almost exclusively on non-AC protocols and otherwise avoids Maude IPC,
+// so the per-call env-lock + `String` alloc is a large relative cost.
+// These diagnostic kill-switches are constant per process; cache each
+// behind a `OnceLock<bool>`, preserving the exact `.is_ok()` / `.is_err()`
+// sense at each call site.
+#[inline]
+fn no_ac_fast_path_enabled() -> bool {
+    // `TAM_RS_DISABLE_NO_AC_FAST_PATH` is an opt-OUT (`.is_err()`).
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_NO_AC_FAST_PATH").is_err())
+}
+#[inline]
+fn flatten_unif_disabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_FLATTEN_UNIF").is_ok())
+}
+#[inline]
+fn factor_ac_enabled() -> bool {
+    // `TAM_RS_DISABLE_FACTOR_AC` is an opt-OUT (`.is_err()`).
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_FACTOR_AC").is_err())
+}
+#[inline]
+fn ac_compose_vfresh_disabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_AC_COMPOSE_VFRESH").is_ok())
+}
+#[inline]
+fn maude_remove_renamings_enabled() -> bool {
+    // `TAM_RS_DISABLE_MAUDE_REMOVE_RENAMINGS` is an opt-OUT (`.is_err()`).
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_MAUDE_REMOVE_RENAMINGS").is_err())
+}
+
 impl MaudeProcessInner {
     fn write_line(&mut self, line: &[u8]) -> Result<(), MaudeError> {
         self.stdin.write_all(line)?;
@@ -162,18 +215,24 @@ impl MaudeProcessInner {
         // `TAM_DBG_MAUDE_IO_FILTER=unify` — only dump unify/variant unify
         //   calls (suppresses set/show/reduce noise).  Matches HS's
         //   `TAM_HS_DBG_MAUDE_IO` semantics.
-        let trace_mode = std::env::var("TAM_DBG_MAUDE_IO").unwrap_or_default();
-        let trace_enabled = !trace_mode.is_empty();
-        let trace_full = trace_mode == "full";
-        let filter = std::env::var("TAM_DBG_MAUDE_IO_FILTER").unwrap_or_default();
-        let cmd_str_full: String = cmd.iter().map(|&b| b as char).collect();
-        let cmd_keep = if filter.is_empty() { true }
-            else { cmd_str_full.contains(filter.as_str()) };
-        if trace_enabled && cmd_keep {
-            let cmd_str = if trace_full { cmd_str_full.clone() }
-                else { cmd_str_full.chars().take(200).collect() };
-            eprintln!("[maude>] {}", cmd_str.replace('\n', "\\n"));
-        }
+        let (trace_enabled, trace_full, filter) = maude_io_trace_config();
+        let (trace_enabled, trace_full) = (*trace_enabled, *trace_full);
+        // Only materialise the full command string when something will
+        // actually read it — i.e. tracing is on, or a non-empty filter
+        // needs the `contains` check.  In the common untraced path this
+        // skips a heap allocation + byte-for-byte copy of the command.
+        let cmd_keep = if trace_enabled || !filter.is_empty() {
+            let cmd_str_full: String = cmd.iter().map(|&b| b as char).collect();
+            let keep = filter.is_empty() || cmd_str_full.contains(filter.as_str());
+            if trace_enabled && keep {
+                let cmd_str = if trace_full { cmd_str_full }
+                    else { cmd_str_full.chars().take(200).collect() };
+                eprintln!("[maude>] {}", cmd_str.replace('\n', "\\n"));
+            }
+            keep
+        } else {
+            true
+        };
         self.write_line(cmd)?;
         let result = self.read_until_prompt();
         if trace_enabled && cmd_keep {
@@ -659,7 +718,7 @@ impl MaudeHandle {
         // [[project-h16-9-maude-trace-and-fix]].
         //
         // Opt-out via `TAM_RS_DISABLE_NO_AC_FAST_PATH=1` for diagnosis.
-        let try_fast_path = std::env::var("TAM_RS_DISABLE_NO_AC_FAST_PATH").is_err();
+        let try_fast_path = no_ac_fast_path_enabled();
         if try_fast_path {
             self.ensure_above(avoid_max);
             use crate::lterm::HasFrees;
@@ -678,7 +737,7 @@ impl MaudeHandle {
             match result {
                 Ok(subst) => {
                     // HS-faithful flattenUnif: success, return [vfresh ∘ subst].
-                    return Ok(if std::env::var("TAM_RS_DISABLE_FLATTEN_UNIF").is_ok() {
+                    return Ok(if flatten_unif_disabled() {
                         let bindings: Vec<(crate::lterm::LVar, LNTerm)> = subst.to_list()
                             .into_iter().collect();
                         vec![bindings]
@@ -719,7 +778,7 @@ impl MaudeHandle {
         // var set rather than just the AC residual's vars.
         //
         // Opt-out via `TAM_RS_DISABLE_FACTOR_AC=1` (sends full eqs, empty m).
-        let factor_ac = std::env::var("TAM_RS_DISABLE_FACTOR_AC").is_err();
+        let factor_ac = factor_ac_enabled();
         let (factored_m, residual_eqs): (
             crate::subst::Subst<crate::lterm::Name, crate::lterm::LVar>,
             Vec<Equal<LNTerm>>,
@@ -743,7 +802,7 @@ impl MaudeHandle {
         // `[emptyVFresh `composeVFresh` m]`.  Mirror that without a Maude
         // round-trip.
         if factor_ac && residual_eqs.is_empty() {
-            if std::env::var("TAM_RS_DISABLE_AC_COMPOSE_VFRESH").is_ok() {
+            if ac_compose_vfresh_disabled() {
                 return Ok(vec![factored_m.to_list()]);
             }
             let empty_vfresh =
@@ -878,7 +937,7 @@ impl MaudeHandle {
         // → 14 spurious `shape_mismatch` drops.
         //
         // Kill: `TAM_RS_DISABLE_MAUDE_REMOVE_RENAMINGS=1`.
-        if std::env::var("TAM_RS_DISABLE_MAUDE_REMOVE_RENAMINGS").is_err() {
+        if maude_remove_renamings_enabled() {
             let filtered: Vec<Vec<(crate::lterm::LVar, LNTerm)>> = out.into_iter()
                 .map(|arm| {
                     let vfresh = crate::subst_vfresh::LSubstVFresh::
@@ -920,7 +979,7 @@ impl MaudeHandle {
         // empty substitution because it sent the full eqs to Maude; now that
         // we factor and send only AC residuals, `factored_m` carries the
         // non-AC bindings and MUST be the second argument to composeVFresh.
-        if std::env::var("TAM_RS_DISABLE_AC_COMPOSE_VFRESH").is_err() {
+        if !ac_compose_vfresh_disabled() {
             let renamed: Vec<Vec<(crate::lterm::LVar, LNTerm)>> = out.into_iter().map(|arm| {
                 let arm_vfresh = crate::subst_vfresh::LSubstVFresh::<crate::lterm::Name>::from_list(arm);
                 let composed = crate::subst_vfresh::compose_vfresh(&arm_vfresh, &factored_m);

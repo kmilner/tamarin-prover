@@ -4336,6 +4336,68 @@ fn run_solve_all_safe_goals_disj(
         ctx, initial_sys, ths, chains_limit, outer_cap, branch_cap, initial_name).0
 }
 
+// --- Cached kill-switch / debug env flags for the saturation worklist ---
+// `run_solve_all_safe_goals_disj_with_progress`'s `while let` loop is the
+// core saturation explorer (up to `branch_cap*50` ~ 2000+ iterations per
+// call, once per source per saturate iter).  These env vars are constant
+// for the process, so cache each behind a `OnceLock<bool>` (mirroring
+// `trace::flag()`) instead of re-reading the environment per branch.
+#[inline]
+fn sas_disable_simp_fanout() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_SAS_SIMPLIFY_FANOUT").is_ok())
+}
+#[inline]
+fn sas_dbg_branch_state() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DBG_BRANCH_STATE").is_ok())
+}
+#[inline]
+fn sas_dbg_branch_drop() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_BRANCH_DROP").is_ok())
+}
+#[inline]
+fn sas_lct_filter_disabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_LCT_FILTER").is_ok())
+}
+#[inline]
+fn sas_iter_trace() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_SAS_ITER").is_ok())
+}
+#[inline]
+fn sas_h17_4_disabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_H17_4").is_ok())
+}
+#[inline]
+fn disj_refine_toplevel_only() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DISJ_REFINE_TOPLEVEL").is_ok())
+}
+#[inline]
+fn disj_refine_ctx_aware() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DISJ_REFINE_CTX").is_ok())
+}
+#[inline]
+fn disj_refine_trace() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DISJ_REFINE_TRACE").is_ok())
+}
+#[inline]
+fn dbg_useful_kus() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_USEFUL_KUS").is_ok())
+}
+#[inline]
+fn disj_refine_no_source_pick() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DISJ_REFINE_NO_SOURCE_PICK").is_ok())
+}
+
 /// Variant that also returns a flag indicating whether ANY branch took
 /// at least one solve step (safe-goal solve or source-pick).  This is
 /// HS-faithful `not (null names)` from `solveAllSafeGoals`'s `caseNames`
@@ -4462,8 +4524,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
         // onto worklist with same (name, used, chains_left, iters_left,
         // last_chain_term), and process the head.  Empty result drops
         // the branch (HS mzero-equivalent).
-        let disable_simp_fanout = std::env::var(
-            "TAM_RS_DISABLE_SAS_SIMPLIFY_FANOUT").is_ok();
+        let disable_simp_fanout = sas_disable_simp_fanout();
         let post_simp: Vec<System> = if disable_simp_fanout {
             let mut red0 = Reduction::new(ctx, sys);
             simplify_system(&mut red0);
@@ -4493,7 +4554,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
         let contras = contradictions(red.ctx, &red.sys);
         // TAM_RS_DBG_BRANCH_STATE=1 dumps state for ALL branches (not just dropped).
         // Use it to find why a chain-based sub-case isn't dropping when HS would.
-        if std::env::var("TAM_RS_DBG_BRANCH_STATE").is_ok()
+        if sas_dbg_branch_state()
             && name.iter().any(|s| s.contains("Resolve2") || s.contains("Resolve1"))
         {
             let chains: Vec<_> = red.sys.goals.iter().filter_map(|(g, st)|
@@ -4536,7 +4597,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
                 name, contras, subst, conj, chains, ku_acts);
         }
         if !contras.is_empty() {
-            if std::env::var("TAM_DBG_BRANCH_DROP").is_ok() {
+            if sas_dbg_branch_drop() {
                 eprintln!("[branch_drop] name={:?} dropped by contras: {:?}",
                     name, contras.iter().map(|c| format!("{:?}", c).chars().take(40).collect::<String>()).collect::<Vec<_>>());
             }
@@ -4575,7 +4636,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
         // restores the open Chain/Split goals HS picks up at iter 1
         // and drops via solveChain's forbiddenEdge / illegalCoerce /
         // isMsgVar plus solveSplit's eqsIsFalse.
-        let filter_disabled = std::env::var("TAM_RS_DISABLE_LCT_FILTER").is_ok();
+        let filter_disabled = sas_lct_filter_disabled();
         let filtered_goals: Vec<(Goal, bool)> = if filter_disabled {
             goals.clone()
         } else {
@@ -4603,7 +4664,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
         // TAM_RS_SAS_ITER=1: per-solve-step trace mirroring HS's
         // [HS_SAS_ITER] (Sources.hs:254-267).  Lets the PRF/senc
         // deconstruction-chain trajectories be diffed HS↔RS.
-        if std::env::var("TAM_RS_SAS_ITER").is_ok() {
+        if sas_iter_trace() {
             let n_chains = red.sys.goals.iter().filter(|(g, st)|
                 !st.solved && matches!(g, Goal::Chain(_, _))).count();
             let kinds: Vec<String> = goals.iter().map(|(g, _)| match g {
@@ -4642,7 +4703,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
         // drop via Cyclic at cn=[c_pcs]).  See
         // [[project-h17-resolve1-narrowing-mechanism]].
         // Opt-out via TAM_RS_DISABLE_H17_4=1 for diagnostic comparison.
-        let h17_4_disabled = std::env::var("TAM_RS_DISABLE_H17_4").is_ok();
+        let h17_4_disabled = sas_h17_4_disabled();
         let in_precompute = crate::constraint::solver::sources::in_precompute_mode();
         let is_safe = |g: &Goal| -> bool {
             match g {
@@ -4767,7 +4828,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
                     // order from `solveChain` (Goals.hs:316-380),
                     // matching HS's case ordering at NSPK3/NSLPK3
                     // types and similar source-saturated lemmas.
-                    let toplevel_only = std::env::var("TAM_DISJ_REFINE_TOPLEVEL").is_ok();
+                    let toplevel_only = disj_refine_toplevel_only();
                     let mut cases_iter = cases.into_iter();
                     // HS-faithful change flag: a forking safe-goal step is a
                     // step → each forked branch inherits took_step=true; it
@@ -4850,8 +4911,8 @@ fn run_solve_all_safe_goals_disj_with_progress(
             continue;
         }
         let avoid_max = system_max_idx(&red.sys);
-        let use_ctx_aware = std::env::var("TAM_DISJ_REFINE_CTX").is_ok();
-        let trace = std::env::var("TAM_DISJ_REFINE_TRACE").is_ok();
+        let use_ctx_aware = disj_refine_ctx_aware();
+        let trace = disj_refine_trace();
         // Iterate useful goals in order; first one with a matching
         // source wins (Haskell `asum`).
         let mut picked: Option<(crate::constraint::constraints::NodeId,
@@ -4862,7 +4923,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
         // TAM_DBG_USEFUL_KUS=1: dumps useful_kus + ths content + source-pick results
         // per branch.  Used to diagnose source-availability divergences vs HS.
         // See [[project-h17-2-resolve1-narrowing-mechanism]].
-        let dbg_useful = std::env::var("TAM_DBG_USEFUL_KUS").is_ok();
+        let dbg_useful = dbg_useful_kus();
         if dbg_useful {
             eprintln!("[useful_kus] name={:?} n={} used={:?} ths_count={}",
                 name, useful_kus.len(), used, ths.len());
@@ -4951,7 +5012,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
         // Disj/Split/Subterm branching active.  Tests whether the
         // wrong-VERIFY on NSPK3 attack comes from source-pick branching
         // or from safe-goal branching.
-        let no_source_pick_fork = std::env::var("TAM_DISJ_REFINE_NO_SOURCE_PICK").is_ok();
+        let no_source_pick_fork = disj_refine_no_source_pick();
         let mut any_branched = false;
         for (case_name, sys_cand, case_action) in unused {
             if use_ctx_aware {
