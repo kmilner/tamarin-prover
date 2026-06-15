@@ -415,12 +415,38 @@ fn prove_lemma_in_session_mode(
     ctx.typing_assumptions = typing_assumptions;
     let t_sat: Option<std::time::Instant> =
         if trace { Some(std::time::Instant::now()) } else { None };
+    // HS-faithful laziness: refined sources are a lazy `where`-bound thunk
+    // in HS's `ClosedRuleCache` (`refinedSources` = `precomputeSources` →
+    // `refineWithSourceAsms`, Rule.hs:156-157), forced ONLY when a proof
+    // method reads `pcSources` (ProofMethod.hs:504).  A non-target lemma
+    // with NO stored skeleton replays HS's parsed `unproven () = sorry`
+    // (ProofSkeleton.hs:61) via `checkAndExtendProver`'s `sorry` walk
+    // (Proof.hs:626-632) — that single `Sorry` node consults no source,
+    // so HS never forces the (potentially very expensive) refined-source
+    // thunk for it.  RS mirrors that here: such a lemma will hit the
+    // `annotated_sorry_root` early return below WITHOUT touching
+    // `cases(ctx)`, so we must NOT eagerly run `ensure_saturated` for it.
+    // (Eagerly saturating every lemma — even bare-sorry ones — made
+    // `--prove=__nomatch__`-style runs over a multiset theory spend the
+    // full per-lemma source-saturation budget × #lemmas while HS returned
+    // in moments; e.g. spdm121 `--prove=<no match>` was ~61s vs HS 0.7s.
+    // The `cases(ctx)` accessor (sources.rs) still calls `ensure_saturated`
+    // lazily for every path that DOES consult a source — skeleton replay
+    // and `run_proof_search` — so correctness is unchanged.)
+    let replay_disabled = std::env::var("TAM_RS_DISABLE_SKELETON_REPLAY").is_ok();
+    let will_emit_bare_sorry =
+        !auto_prove && (replay_disabled || lemma.proof.tree.is_none());
     // Lever #3: reuse a previously-computed refined-source set when one
     // exists for this exact `source_key`.  See [`CachedSources`] for why a
     // hit is byte-identical (only delta==0 results are ever cached).
     let cache_disabled = std::env::var("TAM_RS_NO_SOURCE_CACHE").is_ok();
     let mut cache_hit = false;
-    if !cache_disabled {
+    if will_emit_bare_sorry {
+        // Skip the eager saturate + cache entirely — this lemma forces no
+        // source case (matches HS's lazy `pcSources`).  Leave the lazy
+        // `cases(ctx)` hook in place in case some future path consults a
+        // source; for the bare-sorry early return it never fires.
+    } else if !cache_disabled {
         let guard = session.source_cache.lock().unwrap();
         if let Some(entry) = guard.get(&source_key) {
             // Restore cached cases onto this clone's lazy sources by goal,
@@ -438,7 +464,12 @@ fn prove_lemma_in_session_mode(
             cache_hit = true;
         }
     }
-    if !cache_hit {
+    if will_emit_bare_sorry {
+        if std::env::var("TAM_DBG_SAT_COUNTER").is_ok() {
+            eprintln!("[SAT_COUNTER] lemma={} key={:?} (bare-sorry, saturation deferred)",
+                lemma_name, source_key);
+        }
+    } else if !cache_hit {
         let cnt_before = ctx.maude.fresh_counter_peek();
         ctx.ensure_saturated();
         let delta = ctx.maude.fresh_counter_peek().saturating_sub(cnt_before);
@@ -472,7 +503,8 @@ fn prove_lemma_in_session_mode(
         ctx.use_induction = crate::constraint::solver::context::UseInduction::UseInduction;
     }
     // Skeleton replay: same logic as in `prove_lemma_with_pool`.
-    let replay_disabled = std::env::var("TAM_RS_DISABLE_SKELETON_REPLAY").is_ok();
+    // (`replay_disabled` was computed above where it also gates the
+    // bare-sorry saturation skip.)
     if !replay_disabled {
         if let Some(tree) = lemma.proof.tree.clone() {
             if auto_prove {
