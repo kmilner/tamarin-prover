@@ -954,6 +954,18 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             let session = tamarin_theory::prove::ProverSession::build_with_in_file(
                 &parsed, maude.clone(), file_maude_pool.clone(), in_file).ok();
 
+            // HS prints "[Theory X] Theory closed" right after `closeTheory`
+            // (TheoryLoader.hs:596) and BEFORE the proof search, which it
+            // forces lazily as `provedThy` is serialised — so the marker
+            // appears in moments regardless of proving cost.  RS's
+            // `ProverSession::build` is the `closeTheory` analog, so emit the
+            // marker here (before the prove loop) to match HS's observable
+            // stderr order.  The no-prove / precompute-only paths (which skip
+            // the prove loop) emit it below instead.
+            if !args.quiet && !args.parse_only {
+                eprintln!("[Theory {}] Theory closed", theory_name);
+            }
+
             for l in elaborated.lemmas() {
                 let lemma_name = l.name.clone();
                 let exists_trace = matches!(
@@ -1063,8 +1075,10 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         t_phase = Instant::now();
 
         // HS emits this marker after `closeTheory` finishes
-        // (TheoryLoader.hs:596).
-        if !args.quiet && !args.parse_only {
+        // (TheoryLoader.hs:596).  In prove mode it is emitted before the
+        // prove loop (above); here it covers only the no-prove /
+        // precompute-only paths, which skip that loop.
+        if !args.quiet && !args.parse_only && (!prove_anything || args.precompute_only) {
             eprintln!("[Theory {}] Theory closed", theory_name);
         }
 
