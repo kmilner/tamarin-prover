@@ -565,8 +565,8 @@ fn render_parsed_item(
             }
         }
         IntrRule(_) => None,
-        Lemma(l) => Some(render_parsed_lemma(l, &macros, proved, in_file)),
-        Restriction(r) => Some(render_parsed_restriction(r, &macros)),
+        Lemma(l) => Some(render_parsed_lemma(l, &macros, proved, in_file, elab)),
+        Restriction(r) => Some(render_parsed_restriction(r, &macros, elab)),
         Predicates(_) => {
             // TODO: render predicates (port HS prettyPredicate).
             None
@@ -618,72 +618,18 @@ fn render_parsed_item(
 /// Mirrors HS `lookupArity` reading the parser-state signature for
 /// `naryOpApp`'s `k == 1` tuple-folding (Theory/Text/Parser/Term.hs:58-93).
 fn arity1_noeq_names(elab: &Theory) -> std::collections::HashSet<String> {
-    elab.signature
-        .maude_sig()
-        .no_eq_fun_syms()
-        .iter()
-        .filter(|s| s.arity == 1)
-        .map(|s| String::from_utf8_lossy(&s.name).to_string())
-        .collect()
+    crate::elaborate::arity1_noeq_names(elab.signature.maude_sig())
 }
 
-/// Re-fold surplus arguments of arity-1 function applications into a single
-/// right-associative pair, mirroring HS `naryOpApp` for `k == 1`
-/// (Theory/Text/Parser/Term.hs:84-87):
-///   `ts <- parens $ if k == 1 then return <$> tupleterm ... else commaSep ...`
-/// where `tupleterm = chainr1 (...) (fAppPair <$ comma)`.  So for an arity-1
-/// symbol `f`, the surface `f(a, b, c)` parses to `f(<a, b, c>)` — a single
-/// argument which is the right-associative pair `<a, b, c>`.  RS's term
-/// parser is arity-unaware and keeps `App("f", [a, b, c])`, so the stored
-/// rule-body AST carries surplus args.  Re-fold them before rendering so the
-/// theory printout matches HS's `prettyTerm`, which prints the symbol's
-/// actual argument list verbatim (`ppFun f ts`, Term/Term.hs:295-296 — it
-/// does NOT itself flatten a tuple arg into a comma list).
-fn rewrite_arity1_term(
-    t: &p::Term,
-    arity1: &std::collections::HashSet<String>,
-) -> p::Term {
-    use p::Term::*;
-    match t {
-        App(name, args) => {
-            let new_args: Vec<p::Term> =
-                args.iter().map(|a| rewrite_arity1_term(a, arity1)).collect();
-            if arity1.contains(name) && new_args.len() > 1 {
-                App(name.clone(), vec![Pair(new_args)])
-            } else {
-                App(name.clone(), new_args)
-            }
-        }
-        Pair(items) => Pair(items.iter().map(|i| rewrite_arity1_term(i, arity1)).collect()),
-        AlgApp(name, l, r) => AlgApp(
-            name.clone(),
-            Box::new(rewrite_arity1_term(l, arity1)),
-            Box::new(rewrite_arity1_term(r, arity1)),
-        ),
-        Diff(l, r) => Diff(
-            Box::new(rewrite_arity1_term(l, arity1)),
-            Box::new(rewrite_arity1_term(r, arity1)),
-        ),
-        BinOp(op, l, r) => BinOp(
-            *op,
-            Box::new(rewrite_arity1_term(l, arity1)),
-            Box::new(rewrite_arity1_term(r, arity1)),
-        ),
-        PatMatch(inner) => PatMatch(Box::new(rewrite_arity1_term(inner, arity1))),
-        other => other.clone(),
-    }
-}
-
+/// Apply the arity-1 surplus-arg pair-fold (HS `naryOpApp` `k == 1`,
+/// Term.hs:84-87) to every term in a parser-AST fact.  Thin alias over the
+/// shared [`crate::elaborate::rewrite_arity1_fact`] so the rule
+/// pretty-printer and the lemma/formula paths share one implementation.
 fn rewrite_arity1_fact(
     fa: &p::Fact,
     arity1: &std::collections::HashSet<String>,
 ) -> p::Fact {
-    p::Fact {
-        persistent: fa.persistent,
-        name: fa.name.clone(),
-        args: fa.args.iter().map(|a| rewrite_arity1_term(a, arity1)).collect(),
-        annotations: fa.annotations.clone(),
-    }
+    crate::elaborate::rewrite_arity1_fact(fa, arity1)
 }
 
 /// HS `prettyMacros` / `prettyMacro` (TheoryObject.hs:819-840).
@@ -1710,7 +1656,7 @@ fn fsep_pack_pair(items: &[String], indent: usize, line_start: usize) -> String 
 // Lemma
 // =============================================================================
 
-fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], proved: &[ProvedLemma], in_file: &str) -> String {
+fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], proved: &[ProvedLemma], in_file: &str, elab: &Theory) -> String {
     use crate::pretty_hpj::{self as hpj, Doc};
     let mut out = String::new();
     // HS `prettyLemmaName` (Lemma.hs:91-95):
@@ -1742,17 +1688,23 @@ fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], proved: &[ProvedLemm
     // continuation indents are byte-identical to HS.  The `nest 2` indent
     // is included in the rendered output (HS renders it at theory col 0).
     let quant = quantifier_keyword(&lem.trace_quantifier);
+    // HS folds surplus args of arity-1 functions into a pair at parse time
+    // (`naryOpApp` `k == 1`, Term.hs:84-87) — e.g. `h(H, x)` → `h(<H, x>)` —
+    // so the rendered formula must do the same.  Apply BEFORE the AC sort so
+    // the canonicaliser sees the folded `h(<…>)` shape.
+    let arity1 = arity1_noeq_names(elab);
+    let folded_formula = crate::elaborate::rewrite_arity1_formula(&lem.formula, &arity1);
     // HS sorts AC arguments at parse time when building `LNTerm` via `fAppAC`
     // (Term/Term/Raw.hs:118-122); our parser keeps `BinOp` trees in written
     // order, so re-establish the canonical AC operand order on the formula
     // before rendering the header (matches the guarded-block path which
     // already canonicalises via guarded.rs:684).
-    let canon_formula = crate::elaborate::canonicalize_ac_in_formula(&lem.formula);
+    let canon_formula = crate::elaborate::canonicalize_ac_in_formula(&folded_formula);
     out.push_str(&pf::lemma_header_line(quant, &canon_formula));
     out.push('\n');
 
     // /* guarded formula characterizing ... */
-    out.push_str(&render_guarded_block(lem, macros));
+    out.push_str(&render_guarded_block(lem, macros, &arity1));
 
     // Proof body — either the prover's result (if --prove ran) or
     // the lemma's stored skeleton.
@@ -1802,7 +1754,7 @@ fn quantifier_keyword(q: &p::TraceQuantifier) -> &'static str {
     }
 }
 
-fn render_guarded_block(lem: &p::Lemma, macros: &[p::Macro]) -> String {
+fn render_guarded_block(lem: &p::Lemma, macros: &[p::Macro], arity1: &std::collections::HashSet<String>) -> String {
     let header = match &lem.trace_quantifier {
         p::TraceQuantifier::ExistsTrace => "guarded formula characterizing all satisfying traces:",
         p::TraceQuantifier::AllTraces => "guarded formula characterizing all counter-examples:",
@@ -1816,6 +1768,10 @@ fn render_guarded_block(lem: &p::Lemma, macros: &[p::Macro]) -> String {
     } else {
         crate::macro_expand::apply_macros_formula(macros, &lem.formula)
     };
+    // Fold surplus args of arity-1 functions into a pair (HS `naryOpApp`
+    // `k == 1`, Term.hs:84-87) so the guarded form carries `h(<…>)` not
+    // `h(…)`.  Same fold as the header path above.
+    let expanded_formula = crate::elaborate::rewrite_arity1_formula(&expanded_formula, arity1);
     let gf = match crate::guarded::formula_to_guarded(&expanded_formula) {
         Ok(g) => g,
         Err(e) => {
@@ -1864,7 +1820,7 @@ fn render_guarded_block(lem: &p::Lemma, macros: &[p::Macro]) -> String {
 // Restriction
 // =============================================================================
 
-fn render_parsed_restriction(r: &p::Restriction, macros: &[p::Macro]) -> String {
+fn render_parsed_restriction(r: &p::Restriction, macros: &[p::Macro], elab: &Theory) -> String {
     // HS `prettyRestriction` (TheoryObject.hs:846-857):
     //   The `Restriction` carries two formulas after `applyMacroInRestriction`:
     //   - `_rstrFormula`         = macro-EXPANDED formula  (displayed in expanded block)
@@ -1874,10 +1830,16 @@ fn render_parsed_restriction(r: &p::Restriction, macros: &[p::Macro]) -> String 
     //
     // RS's `r.formula` is the parser-form (macro calls present).  Apply
     // the theory's macros to get the expanded formula used in the block.
+    // Fold arity-1 surplus args into a pair first (HS `naryOpApp` `k == 1`,
+    // Term.hs:84-87), exactly as the parser would — applies to BOTH the
+    // original and expanded displays since HS folds at parse time.
+    let arity1 = arity1_noeq_names(elab);
+    let original = crate::elaborate::rewrite_arity1_formula(&r.formula, &arity1);
     let expanded = if macros.is_empty() {
-        r.formula.clone()
+        original.clone()
     } else {
-        crate::macro_expand::apply_macros_formula(macros, &r.formula)
+        crate::elaborate::rewrite_arity1_formula(
+            &crate::macro_expand::apply_macros_formula(macros, &r.formula), &arity1)
     };
     let mut out = String::new();
     out.push_str("restriction ");
@@ -1885,7 +1847,7 @@ fn render_parsed_restriction(r: &p::Restriction, macros: &[p::Macro]) -> String 
     out.push_str(":\n");
     // Top-level display: original formula (macro form) — `fromMaybe expandedFormula ogFormula`.
     // Since ogFormula = Just original, this always shows `r.formula` (macro form).
-    out.push_str(&pf::formula_doublequoted_nested(&r.formula, 2));
+    out.push_str(&pf::formula_doublequoted_nested(&original, 2));
     // Safety annotation: `if safety then "// safety formula" else emptyDoc`.
     // HS checks `isSafetyFormula (formulaToGuarded_ expandedFormula)`.
     if is_safety_formula(&expanded) {
