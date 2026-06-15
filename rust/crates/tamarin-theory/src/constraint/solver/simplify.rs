@@ -3063,15 +3063,32 @@ fn drain_remaining_actions(
     vec![std::mem::replace(&mut red.sys, crate::constraint::system::System::empty())]
 }
 
-/// True if any subterm has the AC `Union` head — multiset union.
+/// True if the term's TOP-LEVEL symbol is the AC `Union` head —
+/// i.e. it is itself a multiset union (HS `viewTerm2 t == FUnion _`).
 fn has_funion_head(t: &tamarin_term::lterm::LNTerm) -> bool {
+    // HS-faithful: `solveUniqueActions`'s exclusion is
+    //   null [ () | t <- ts, FUnion _ <- return (viewTerm2 t) ]
+    // (Simplify.hs:468).  `viewTerm2 t` inspects ONLY the TOP-LEVEL
+    // symbol of `t` — it does NOT recurse into arguments.  So a fact
+    // term excludes the action from `solveUniqueActions` ONLY when the
+    // term is itself a top-level multiset union (`FUnion`), e.g. a bare
+    // `y1++y2` argument.  A pair-wrapped union like `<'ySG', y1++y2>`
+    // views as `FPair` and is NOT excluded — HS still treats such an
+    // action as "unique" and solves it during simplify (the AC
+    // unification of the wrapped multiset against the rule's instance
+    // is what fans the simplify step into the per-partition cases, as
+    // on alethea `Universal_VerProof*`).
+    //
+    // A previous recursive version returned true for any term
+    // CONTAINING a union anywhere, over-excluding pair-wrapped
+    // multiset actions (`Learn_A_YSGs($S,$A,<'ySG',y1++y2>)`,
+    // `Learn_A_Cs($S,$A,<'codes',c1++c2>)`) — so RS deferred the
+    // multiset AC fan-out to deep runtime solving (verdict-correct but
+    // ~3.5x longer proofs) instead of producing HS's shallow simplify
+    // case split.
     use tamarin_term::function_symbols::{AcSym, FunSym};
     use tamarin_term::term::Term;
-    match t {
-        Term::App(FunSym::Ac(AcSym::Union), _) => true,
-        Term::App(_, args) => args.iter().any(has_funion_head),
-        _ => false,
-    }
+    matches!(t, Term::App(FunSym::Ac(AcSym::Union), _))
 }
 
 /// CR-rule *N5_d* (KD-fact uniqueness).  Mirrors the `kdConcs` arm
