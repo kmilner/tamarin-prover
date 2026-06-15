@@ -466,6 +466,35 @@ pub fn exec_proof_method(
                 .filter(|s| !s.eq_store.is_false())
                 .map(|s| cleanup(&s))
                 .collect();
+            // HS-faithful `removeRedundantCases ctxt [] snd`
+            // (ProofMethod.hs:455): `process`/`processLabeled` apply it to
+            // EVERY proof method's Disj fan-out, including `Simplify`
+            // (which uses `process (return "")`, ProofMethod.hs:420).
+            // RS previously applied it only in the `SolveGoal` arm.  When
+            // `simplifySystem`'s `solveUniqueActions` fans out an action
+            // whose AC-multiset unification yields several unifiers that
+            // are equal up to variable renaming (e.g. alethea's
+            // `Learn_A_Ys(A,S,<'ys',<y1,no1>++<y2,no2>>)` — the straight
+            // vs swapped pairing), HS collapses them via
+            // `compareSystemsUpToNewVars` to a SINGLE surviving case (no
+            // top-level `case N`), whereas RS surfaced both as `case 1`/
+            // `case 2`.  Gated on BP/MSet by `remove_redundant_cases`'s
+            // own guard (HS short-circuits to `cases0` otherwise), and
+            // empty stable_vars (HS passes `[]`).  Runs BEFORE the
+            // single-case `sys' /= cleanup sys` check, matching HS's order
+            // (the check inspects the post-dedup `M.toList cases`).
+            let cleaned: Vec<System> = {
+                let msig = ctx.maude.maude_sig();
+                let empty_stable: std::collections::BTreeSet<tamarin_term::lterm::LVar>
+                    = std::collections::BTreeSet::new();
+                crate::constraint::solver::sources::remove_redundant_cases(
+                    msig.enable_bp,
+                    msig.enable_mset,
+                    &empty_stable,
+                    |s: &System| s,
+                    cleaned,
+                )
+            };
             if cleaned.is_empty() { return None; }
             let cleaned_input = cleanup(sys);
             if cleaned.len() == 1 {
