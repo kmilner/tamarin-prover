@@ -1316,6 +1316,135 @@ pub fn canonicalize_ac_in_formula(f: &p::Formula) -> p::Formula {
     }
 }
 
+/// Names of arity-1 NoEq function symbols in the (closed-theory) signature.
+/// Mirrors HS `lookupArity` reading the parser-state signature for
+/// `naryOpApp`'s `k == 1` tuple-folding (Theory/Text/Parser/Term.hs:58-93).
+pub fn arity1_noeq_names(sig: &tamarin_term::maude_sig::MaudeSig)
+    -> std::collections::HashSet<String>
+{
+    sig.no_eq_fun_syms()
+        .iter()
+        .filter(|s| s.arity == 1)
+        .map(|s| String::from_utf8_lossy(&s.name).to_string())
+        .collect()
+}
+
+/// Re-fold surplus arguments of an arity-1 function application into a
+/// single right-associative pair, mirroring HS `naryOpApp` for `k == 1`
+/// (Theory/Text/Parser/Term.hs:84-87):
+///   `ts <- parens $ if k == 1 then return <$> tupleterm ... else commaSep ...`
+/// where `tupleterm = chainr1 (...) (fAppPair <$ comma)`.  So for an arity-1
+/// symbol `f`, the surface `f(a, b, c)` parses to `f(<a, b, c>)` — a single
+/// argument which is the right-associative pair `<a, b, c>`.
+///
+/// HS performs this fold at PARSE time, so every downstream consumer (the
+/// lemma/restriction pretty-printer, the guarded-formula conversion, and the
+/// "Formula terms" wellformedness check) sees the already-folded form.  RS's
+/// term parser is arity-unaware and keeps `App("f", [a, b, c])`, so the
+/// prover-side LNTerm conversion folds it back in `term_to_lnterm`, but the
+/// parser-AST formula consumers (which run on the un-folded AST) need this
+/// same fold applied first.  This is the shared root behind the alethea
+/// `h(<a,b>)` formula-rendering divergence AND the spurious "reducible
+/// function symbols are disallowed" wf warning (a unary `h` applied with
+/// surplus args looks to the wf check like an unknown reducible `h/n`).
+pub fn rewrite_arity1_term(
+    t: &p::Term,
+    arity1: &std::collections::HashSet<String>,
+) -> p::Term {
+    use p::Term::*;
+    match t {
+        App(name, args) => {
+            let new_args: Vec<p::Term> =
+                args.iter().map(|a| rewrite_arity1_term(a, arity1)).collect();
+            if arity1.contains(name) && new_args.len() > 1 {
+                App(name.clone(), vec![Pair(new_args)])
+            } else {
+                App(name.clone(), new_args)
+            }
+        }
+        Pair(items) =>
+            Pair(items.iter().map(|i| rewrite_arity1_term(i, arity1)).collect()),
+        AlgApp(name, l, r) => AlgApp(
+            name.clone(),
+            Box::new(rewrite_arity1_term(l, arity1)),
+            Box::new(rewrite_arity1_term(r, arity1)),
+        ),
+        Diff(l, r) => Diff(
+            Box::new(rewrite_arity1_term(l, arity1)),
+            Box::new(rewrite_arity1_term(r, arity1)),
+        ),
+        BinOp(op, l, r) => BinOp(
+            *op,
+            Box::new(rewrite_arity1_term(l, arity1)),
+            Box::new(rewrite_arity1_term(r, arity1)),
+        ),
+        PatMatch(inner) => PatMatch(Box::new(rewrite_arity1_term(inner, arity1))),
+        other => other.clone(),
+    }
+}
+
+/// Apply [`rewrite_arity1_term`] to every term in a parser-AST fact.
+pub fn rewrite_arity1_fact(
+    fa: &p::Fact,
+    arity1: &std::collections::HashSet<String>,
+) -> p::Fact {
+    p::Fact {
+        persistent: fa.persistent,
+        name: fa.name.clone(),
+        args: fa.args.iter().map(|a| rewrite_arity1_term(a, arity1)).collect(),
+        annotations: fa.annotations.clone(),
+    }
+}
+
+/// Apply [`rewrite_arity1_term`] to every term in a parser-AST atom.
+pub fn rewrite_arity1_atom(
+    a: &p::Atom,
+    arity1: &std::collections::HashSet<String>,
+) -> p::Atom {
+    use p::Atom::*;
+    let rt = |t: &p::Term| rewrite_arity1_term(t, arity1);
+    match a {
+        Eq(x, y) => Eq(rt(x), rt(y)),
+        Less(x, y) => Less(rt(x), rt(y)),
+        LessMset(x, y) => LessMset(rt(x), rt(y)),
+        Subterm(x, y) => Subterm(rt(x), rt(y)),
+        Action(f, t) => Action(rewrite_arity1_fact(f, arity1), rt(t)),
+        Last(t) => Last(rt(t)),
+        Pred(f) => Pred(rewrite_arity1_fact(f, arity1)),
+    }
+}
+
+/// Apply [`rewrite_arity1_term`] to every term in a parser-AST formula.
+/// See [`rewrite_arity1_term`] for the HS-faithfulness rationale.
+pub fn rewrite_arity1_formula(
+    f: &p::Formula,
+    arity1: &std::collections::HashSet<String>,
+) -> p::Formula {
+    use p::Formula::*;
+    match f {
+        False => False,
+        True => True,
+        Atom(a) => Atom(rewrite_arity1_atom(a, arity1)),
+        Not(g) => Not(Box::new(rewrite_arity1_formula(g, arity1))),
+        And(g, h) => And(
+            Box::new(rewrite_arity1_formula(g, arity1)),
+            Box::new(rewrite_arity1_formula(h, arity1))),
+        Or(g, h) => Or(
+            Box::new(rewrite_arity1_formula(g, arity1)),
+            Box::new(rewrite_arity1_formula(h, arity1))),
+        Implies(g, h) => Implies(
+            Box::new(rewrite_arity1_formula(g, arity1)),
+            Box::new(rewrite_arity1_formula(h, arity1))),
+        Iff(g, h) => Iff(
+            Box::new(rewrite_arity1_formula(g, arity1)),
+            Box::new(rewrite_arity1_formula(h, arity1))),
+        Forall(vs, g) => Forall(vs.clone(),
+            Box::new(rewrite_arity1_formula(g, arity1))),
+        Exists(vs, g) => Exists(vs.clone(),
+            Box::new(rewrite_arity1_formula(g, arity1))),
+    }
+}
+
 pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
     use tamarin_term::function_symbols::AcSym;
     use tamarin_term::term::f_app_ac;

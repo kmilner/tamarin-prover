@@ -2925,11 +2925,36 @@ pub(crate) fn solve_unique_actions_pass_fan_out(
     let mut changed = ChangeIndicator::Unchanged;
     let mut iter = candidates.into_iter();
     while let Some((i, fa)) = iter.next() {
-        let still_present = red.sys.goals.iter().any(|(g, st)| {
-            !st.solved && matches!(g, Goal::Action(gi, gfa)
-                if gi == &i && gfa == &fa)
-        });
-        if !still_present { continue; }
+        // HS-faithful (`solveUniqueActions`, Simplify.hs:411-433): the
+        // captured `actionAtoms` list is processed by `mapM trySolve`,
+        // and `trySolve (i, fa) = solveGoal (ActionG i fa)` runs
+        // UNCONDITIONALLY on every captured `isUnique` atom — there is NO
+        // "is this goal still open with this exact fact?" guard.
+        // `solveGoal` first calls `markGoalAsSolved` (which, via
+        // `updateStatus`, silently no-ops on a missing/changed key —
+        // Reduction.hs:688-694) and then `solveAction (i, fa)`
+        // unconditionally (Goals.hs:208-221).  `solveAction` branches on
+        // whether NODE `i` already exists in `sNodes`, NOT on the goal
+        // status (Goals.hs:256-290): if the node is absent it labels a
+        // fresh rule instance (creating the node + its premise goals); if
+        // present it merely unifies `fa` against the node's actions.
+        //
+        // RS previously skipped any captured atom whose EXACT (i, fa) was
+        // no longer an unsolved goal.  But solving an earlier candidate
+        // (e.g. `Comm_D_Y@j1`/`@j2`, rule D_4) substitutes the live
+        // goals' facts via the eq-store, so a captured atom like
+        // `Learn_H_Ys@k1` no longer matches the (now-substituted) live
+        // goal by exact equality — and got skipped.  That suppressed the
+        // creation of node #k1 (and its `AgSt_H0 ▶₀ #k1` premise) at the
+        // captured position, so #k2's premise was created first and
+        // received the smaller `gsNr`.  `goalNrRanking` then ranked the
+        // symmetric H2 premise ahead of H1, flipping the witness-trace
+        // pick (alethea functional_env1/env2: HS solves `AgSt_H0('H1',…)`
+        // first, RS solved `AgSt_H0('H2',…)`).  Calling `solve_action_goal`
+        // on every captured atom restores HS's node-existence-driven
+        // semantics; an already-solved atom whose node exists with `fa`
+        // among its actions is a harmless no-op (the `Some(ru)` /
+        // `ru.actions.contains(fa)` arm in `solve_action_goal`).
         let outcome = red.solve_action_goal(&i, &fa);
         use crate::constraint::solver::reduction::GoalCases;
         match outcome {

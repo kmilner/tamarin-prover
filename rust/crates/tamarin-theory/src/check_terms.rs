@@ -163,20 +163,34 @@ pub fn check_terms_wf(thy: &p::Theory, sig: &MaudeSig) -> Vec<WfError> {
     let irr = Irreducible::from_sig(sig);
     let mut out = Vec::new();
 
+    // HS folds surplus args of an arity-1 function into a pair at PARSE time
+    // (`naryOpApp` `k == 1`, Theory/Text/Parser/Term.hs:84-87), so the AST the
+    // wf check inspects already carries `h(<a, b>)` (an irreducible `h/1`
+    // applied to a pair), NOT `h(a, b)`.  RS's arity-unaware parser keeps the
+    // surplus args, so without this fold a unary `h(a, b)` resolves to a
+    // non-existent reducible `h/2` and is spuriously flagged "uses terms of
+    // the wrong form: reducible function symbols are disallowed".  Fold first
+    // (mirrors the lemma/restriction pretty-printer in pretty_theory.rs).
+    let arity1 = crate::elaborate::arity1_noeq_names(sig);
+
     // HS `annFormulas = lemmas <|> restrictions` — all lemmas (theory
     // order) then all restrictions (theory order).
-    let mut lemmas: Vec<(String, &Formula)> = Vec::new();
-    let mut restrictions: Vec<(String, &Formula)> = Vec::new();
+    let mut lemmas: Vec<(String, Formula)> = Vec::new();
+    let mut restrictions: Vec<(String, Formula)> = Vec::new();
     for item in &thy.items {
         match item {
-            p::TheoryItem::Lemma(l) => lemmas.push((format!("Lemma `{}'", l.name), &l.formula)),
+            p::TheoryItem::Lemma(l) => lemmas.push((
+                format!("Lemma `{}'", l.name),
+                crate::elaborate::rewrite_arity1_formula(&l.formula, &arity1))),
             p::TheoryItem::Restriction(r) | p::TheoryItem::LegacyAxiom(r) =>
-                restrictions.push((format!("Restriction `{}'", r.name), &r.formula)),
+                restrictions.push((
+                    format!("Restriction `{}'", r.name),
+                    crate::elaborate::rewrite_arity1_formula(&r.formula, &arity1))),
             _ => {}
         }
     }
     for (header, fm) in lemmas.into_iter().chain(restrictions) {
-        if let Some(msg) = check_one(&header, fm, &irr) {
+        if let Some(msg) = check_one(&header, &fm, &irr) {
             out.push(WfError::new("Formula terms", msg));
         }
     }
@@ -666,6 +680,21 @@ mod tests {
                    end\n";
         let (thy, sig) = sig_of(src);
         assert!(check_terms_wf(&thy, &sig).is_empty());
+    }
+
+    #[test]
+    fn unary_hash_with_surplus_args_is_allowed() {
+        // `hashing` gives `h/1`.  Surface `h(x, y)` is folded to `h(<x, y>)`
+        // (an irreducible `h/1` applied to a pair) at parse time in HS
+        // (naryOpApp k==1) — so it is ALLOWED, not flagged as a reducible
+        // `h/2`.  This is the alethea selectionphase root.
+        let src = "theory T begin\n\
+                   builtins: hashing\n\
+                   lemma L:\n  \"All x y #i. K(h(x, y)) @ i ==> F\"\n\
+                   end\n";
+        let (thy, sig) = sig_of(src);
+        let report = check_terms_wf(&thy, &sig);
+        assert!(report.is_empty(), "expected no offenders, got {:?}", report);
     }
 
     #[test]
