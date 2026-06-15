@@ -11,3 +11,6 @@ description = "Accountability extension for the Tamarin prover (Rust port)."
 tamarin-utils = { workspace = true }
 tamarin-term = { workspace = true }
 tamarin-theory = { workspace = true }
+
+[lints]
+workspace = true

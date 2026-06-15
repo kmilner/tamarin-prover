@@ -8,8 +8,6 @@
 //! - `pp_mterm(&Term<MaudeLit>) -> String`: a Maude-syntax rendering of a
 //!   term used in queries.
 
-use std::collections::BTreeSet;
-
 use crate::function_symbols::{
     AcSym, CSym, Constructability, FunSym, NoEqSym, Privacy,
     EMAP_SYM_STRING, MULT_SYM_STRING, MUN_SYM_STRING,
@@ -263,12 +261,10 @@ pub fn pp_theory(msig: &MaudeSig) -> String {
         op_eq(&mut out, "tone", "-> TamNat");
         op_ac(&mut out, "tplus", "TamNat TamNat -> TamNat");
     }
-    // User-defined free symbols.
-    let mut sorted: BTreeSet<&NoEqSym> = msig.st_fun_syms.iter().collect();
-    let mut sorted_v: Vec<&NoEqSym> = sorted.iter().copied().collect();
-    sorted_v.sort();
-    sorted.clear();
-    for sym in sorted_v {
+    // User-defined free symbols.  `st_fun_syms` is a `BTreeSet`, so
+    // iterating it directly already yields the symbols deduplicated and
+    // in `NoEqSym`-`Ord` order.
+    for sym in &msig.st_fun_syms {
         let name = String::from_utf8_lossy(&replace_underscore(&sym.name)).into_owned();
         let args = "Msg ".repeat(sym.arity);
         let fsort = format!("{} : {}-> Msg", name, args);

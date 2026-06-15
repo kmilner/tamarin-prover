@@ -4,8 +4,8 @@
 //! Haskell version probes ~12 conditions. Most are pure structural
 //! checks (cycles, false formulas, fact incompatibilities); a few
 //! consult signature-aware helpers (`nf_via_haskell`,
-//! `irreducible_fun_syms`, `enableDH`).  ForbiddenBP remains
-//! unported (small corpus impact); everything else has a faithful
+//! `irreducible_fun_syms`, `enableDH`).  ForbiddenBP is ported too
+//! (gated on `enableBP` at the caller); everything has a faithful
 //! port below.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -46,20 +46,30 @@ pub enum Contradiction {
     NodeAfterLast(NodeId, NodeId),
 }
 
+/// `TAM_DBG_IMPL` opt-in debug flag, cached so the per-node scans it
+/// guards stay off the solver hot path (mirrors `proof_method::dbg_impl_enabled`).
+#[inline]
+fn dbg_impl_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_IMPL").is_ok())
+}
+
 /// Collect every contradiction currently witnessed by the system.
 pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> {
     let mut out = Vec::new();
-    let has_i_1 = sys.nodes.iter().any(|(_, r)|
-        matches!(&r.info, crate::rule::RuleInfo::Proto(p)
-            if matches!(&p.name, crate::rule::ProtoRuleName::Stand(s) if s == "I_1")));
-    let has_r_1 = sys.nodes.iter().any(|(_, r)|
-        matches!(&r.info, crate::rule::RuleInfo::Proto(p)
-            if matches!(&p.name, crate::rule::ProtoRuleName::Stand(s) if s == "R_1")));
-    if std::env::var("TAM_DBG_IMPL").is_ok() && has_i_1 && has_r_1 {
-        let has_bot = sys.formulas.iter()
-            .any(|f| matches!(f, crate::guarded::Guarded::Disj(v) if v.is_empty()));
-        eprintln!("[contra] HAS I_1+R_1: formulas.len={} has_bot={}",
-            sys.formulas.len(), has_bot);
+    if dbg_impl_enabled() {
+        let has_i_1 = sys.nodes.iter().any(|(_, r)|
+            matches!(&r.info, crate::rule::RuleInfo::Proto(p)
+                if matches!(&p.name, crate::rule::ProtoRuleName::Stand(s) if s == "I_1")));
+        let has_r_1 = sys.nodes.iter().any(|(_, r)|
+            matches!(&r.info, crate::rule::RuleInfo::Proto(p)
+                if matches!(&p.name, crate::rule::ProtoRuleName::Stand(s) if s == "R_1")));
+        if has_i_1 && has_r_1 {
+            let has_bot = sys.formulas.iter()
+                .any(|f| matches!(f, crate::guarded::Guarded::Disj(v) if v.is_empty()));
+            eprintln!("[contra] HAS I_1+R_1: formulas.len={} has_bot={}",
+                sys.formulas.len(), has_bot);
+        }
     }
     // Mirror Haskell's `rawLessRel = sLessAtoms ++ rawEdgeRel` —
     // every graph edge induces a strict ordering src < tgt, and the
@@ -254,7 +264,7 @@ fn has_non_normal_terms(ctx: &ProofContext, sys: &System) -> bool {
     // HS-faithful NF check: `nf'` = `nfViaHaskell` (Norm.hs:131).
     // Short-circuit on the first term that is NOT in NF.
     for t in &candidates {
-        if !tamarin_term::norm::nf_via_haskell(&ctx.maude, t) {
+        if !tamarin_term::norm::nf_via_haskell(&sig, t) {
             return true;
         }
     }
@@ -298,7 +308,8 @@ fn maybe_not_nf_subterms(
 /// Run `has_subterm_cycle` against the system's positive subterm
 /// dag.  Equivalent to one prong of Haskell's `simpSubterms` →
 /// `hasSubtermCycle` check; we run it eagerly during contradiction
-/// detection because our `simpSubterms` pass is currently a stub.
+/// detection (the `simpSubterms` simplification pass — see
+/// `propagate_subterm_obvious` in `simplify.rs` — handles the rest).
 fn has_subterm_cycle_contra(ctx: &ProofContext, sys: &System) -> bool {
     let reducible = &ctx.maude.maude_sig().reducible_fun_syms;
     crate::tools::subterm_store::has_subterm_cycle(reducible, &sys.subterm_store)
@@ -704,6 +715,11 @@ fn has_forbidden_chain(sys: &System) -> bool {
         }
     }
 
+    // The `alwaysBefore` adjacency is invariant across the chain/node/goal
+    // loops below (`sys` is read-only here), so build it once and query it
+    // with `always_before_with` instead of rebuilding the full relation per
+    // `always_before` call.
+    let ab_adj = sys.build_always_before_adj();
     for (g, st) in sys.goals.iter() {
         if st.solved { continue; }
         let Goal::Chain(c, p) = g else { continue };
@@ -769,7 +785,7 @@ fn has_forbidden_chain(sys: &System) -> bool {
                 let t_ku = match fa.terms.first() { Some(t) => t, None => continue };
                 if !candidate_terms.contains(t_ku) { continue; }
                 if id == &c.0 { continue; }
-                if sys.always_before(id, &c.0) {
+                if sys.always_before_with(&ab_adj, id, &c.0) {
                     return true;
                 }
             }
@@ -782,7 +798,7 @@ fn has_forbidden_chain(sys: &System) -> bool {
             let t_ku = match fa.terms.first() { Some(t) => t, None => continue };
             if !candidate_terms.contains(t_ku) { continue; }
             if id == &c.0 { continue; }
-            if sys.always_before(id, &c.0) {
+            if sys.always_before_with(&ab_adj, id, &c.0) {
                 return true;
             }
         }
@@ -854,11 +870,10 @@ fn has_forbidden_exp(sys: &System) -> bool {
                 Term::Lit(Lit::Var(v)) => {
                     if v.sort == LSort::Fresh { ok = false; }
                 }
-                Term::Lit(Lit::Con(c)) => {
-                    if sort_of_name(c) == LSort::Fresh {
+                Term::Lit(Lit::Con(c))
+                    if sort_of_name(c) == LSort::Fresh => {
                         ok = false;
                     }
-                }
                 _ => {}
             }
         };
@@ -876,7 +891,7 @@ fn has_forbidden_exp(sys: &System) -> bool {
     // DirTag::Up = KU (constructible), DirTag::Dn = KD (destruction).
     #[derive(Copy, Clone, PartialEq, Eq)]
     enum DirTag { Up, Dn }
-    fn k_fact_view<'a>(fa: &'a crate::fact::LNFact) -> Option<(DirTag, &'a LNTerm)> {
+    fn k_fact_view(fa: &crate::fact::LNFact) -> Option<(DirTag, &LNTerm)> {
         if fa.terms.len() != 1 { return None; }
         match fa.tag {
             FactTag::Ku => Some((DirTag::Up, &fa.terms[0])),
@@ -918,6 +933,10 @@ fn has_forbidden_exp(sys: &System) -> bool {
         }
     }
 
+    // The `alwaysBefore` adjacency is invariant across the node loop and
+    // the `earlier_msg_vars` scan below (`sys` is read-only), so build it
+    // once and query it with `always_before_with`.
+    let ab_adj = sys.build_always_before_adj();
     // Mirror HS `forbiddenDExp` exactly.
     for (i, ru) in sys.nodes.iter() {
         // Only intruder DestrRules can be exp-down; cheap pre-filter.
@@ -945,7 +964,7 @@ fn has_forbidden_exp(sys: &System) -> bool {
             let mut out = Vec::new();
             for (j, t) in &all_ku {
                 if !is_msg_var(t) { continue; }
-                if sys.always_before(j, i) {
+                if sys.always_before_with(&ab_adj, j, i) {
                     out.push(t.clone());
                 }
             }
@@ -967,8 +986,7 @@ fn has_forbidden_exp(sys: &System) -> bool {
         let forbidden = if let Some((g, c)) = view_exp(conc_term) {
             // (1) conc = exp(g, c): g simple + all msg vars known earlier
             //     + niFactors c \\ niFactors b == []
-            if !is_simple_term(g) { false }
-            else if !all_msg_vars_known_earlier(g) { false }
+            if !is_simple_term(g) || !all_msg_vars_known_earlier(g) { false }
             else {
                 let nfc = ni_factors(c);
                 let nfb = ni_factors(b);
@@ -1050,9 +1068,6 @@ fn has_forbidden_bp(sys: &System) -> bool {
 ///   - `p` never contains fresh/private terms, AND
 ///   - every non-inverse factor of `c` is also a non-inverse factor of `b`.
 fn is_forbidden_d_pmult<I>(ru: &crate::rule::Rule<crate::rule::RuleInfo<I, crate::rule::IntrRuleACInfo>>) -> bool {
-    use tamarin_term::function_symbols::{FunSym, PMULT_SYM_STRING};
-    use tamarin_term::term::Term;
-
     if ru.premises.len() != 2 { return false; }
     if ru.conclusions.len() != 1 { return false; }
 
@@ -1074,8 +1089,6 @@ fn is_forbidden_d_pmult<I>(ru: &crate::rule::Rule<crate::rule::RuleInfo<I, crate
 
     // Pre-filter: only Pmult-down rules.
     if !crate::rule::is_d_pmult_rule(ru) { return false; }
-    // Drop the unused binding warning.
-    let _ = (Term::Lit::<()> as fn(_) -> _, FunSym::NoEq, PMULT_SYM_STRING);
 
     if !never_contains_fresh_priv(p_conc) { return false; }
     bp_factors_subset(c, b)
@@ -1231,8 +1244,8 @@ fn is_forbidden_d_emap_order(sys: &System,
 /// `kFactView` (BP scope): returns (DirTag, term) for KU / KD facts.
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum BpDirTag { Up, Dn }
-fn bp_k_fact_view<'a>(fa: &'a crate::fact::LNFact)
-    -> Option<(BpDirTag, &'a tamarin_term::lterm::LNTerm)>
+fn bp_k_fact_view(fa: &crate::fact::LNFact)
+    -> Option<(BpDirTag, &tamarin_term::lterm::LNTerm)>
 {
     use crate::fact::FactTag;
     if fa.terms.len() != 1 { return None; }
@@ -1330,7 +1343,17 @@ fn non_injective_fact_instances(
     for e in &sys.edges {
         adj.entry(e.src.0.clone()).or_default().push(e.tgt.0.clone());
     }
+    // `adj` is invariant across this function, so memoize each node's
+    // reachable set: `reachable(i)` is taken once per edge and `reachable(j)`
+    // once per reachable `j`, with the same `j` recurring across edges.
+    // The cache stores the exact value the un-memoized closure returned
+    // (the set with `from` removed), so this is a pure speedup.
+    let reach_cache: std::cell::RefCell<BTreeMap<NodeId, BTreeSet<NodeId>>> =
+        std::cell::RefCell::new(BTreeMap::new());
     let reachable = |from: &NodeId| -> BTreeSet<NodeId> {
+        if let Some(cached) = reach_cache.borrow().get(from) {
+            return cached.clone();
+        }
         let mut out = BTreeSet::new();
         let mut stack = vec![from.clone()];
         while let Some(n) = stack.pop() {
@@ -1340,14 +1363,25 @@ fn non_injective_fact_instances(
             }
         }
         out.remove(from);
+        reach_cache.borrow_mut().insert(from.clone(), out.clone());
         out
     };
+    // Resolve node-id → rule via a once-built map instead of a linear
+    // `nodes.iter().find` per `i`/`j`.  `or_insert` keeps the FIRST rule
+    // for a given id, matching `find`'s first-match semantics.
+    let node_rule_map: std::collections::HashMap<&NodeId, &crate::rule::RuleACInst> = {
+        let mut m = std::collections::HashMap::new();
+        for (n, r) in sys.nodes.iter() {
+            m.entry(n).or_insert(r);
+        }
+        m
+    };
     let lookup_node = |id: &NodeId| -> Option<&crate::rule::RuleACInst> {
-        sys.nodes.iter().find(|(n, _)| n == id).map(|(_, r)| r)
+        node_rule_map.get(id).copied()
     };
 
     for e in &sys.edges {
-        let (i, conc_idx) = (e.src.0.clone(), e.src.1.clone());
+        let (i, conc_idx) = (e.src.0.clone(), e.src.1);
         let k = e.tgt.0.clone();
         // Look up the conclusion fact at (i, conc_idx).
         let i_rule = match lookup_node(&i) { Some(r) => r, None => continue };
@@ -1506,10 +1540,18 @@ fn has_fresh_fact_sort_violation(sys: &System) -> bool {
 /// an unrelated live node — the edge survives the rename but
 /// connects incompatible facts.  Such a system has no model.
 fn has_incompatible_edge_facts(sys: &System) -> bool {
+    // One node-id → rule map (instead of two linear `nodes.iter().find`
+    // scans per edge → O(edges*nodes)).  `or_insert` keeps the FIRST rule
+    // for a given id, matching `find`'s first-match semantics.
+    let mut node_rule_map: std::collections::HashMap<&NodeId, &crate::rule::RuleACInst> =
+        std::collections::HashMap::new();
+    for (id, r) in sys.nodes.iter() {
+        node_rule_map.entry(id).or_insert(r);
+    }
     for e in &sys.edges {
-        let src_rule = sys.nodes.iter().find(|(id, _)| id == &e.src.0);
-        let tgt_rule = sys.nodes.iter().find(|(id, _)| id == &e.tgt.0);
-        let (Some((_, sr)), Some((_, tr))) = (src_rule, tgt_rule) else {
+        let src_rule = node_rule_map.get(&e.src.0).copied();
+        let tgt_rule = node_rule_map.get(&e.tgt.0).copied();
+        let (Some(sr), Some(tr)) = (src_rule, tgt_rule) else {
             continue;
         };
         let fc = match sr.conclusions.get(e.src.1.0) { Some(f) => f, None => continue };
@@ -1756,7 +1798,7 @@ pub fn subst_creates_non_normal_terms(
         // for AC-reordered arms, over-filtering `simpMinimize` and
         // dropping legitimate `solve_term_eqs` cases in DH protocols
         // (JKL_TS2_2004{,_KI_wPFS} key-secrecy lemmas).
-        let is_nf = tamarin_term::norm::nf_via_haskell(maude, &t_prime);
+        let is_nf = tamarin_term::norm::nf_via_haskell(&sig, &t_prime);
         if !is_nf {
             if std::env::var("TAM_RS_DBG_SUBST_NF").is_ok() {
                 eprintln!("[rs-subst-nf] CREATES t={:?} t_prime={:?}", t, t_prime);

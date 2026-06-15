@@ -83,7 +83,7 @@ thread_local! {
     /// originate from `eq_store::add_eqs` (so optimisation effort
     /// should target the fact-equation engine, not other call sites).
     static MAUDE_CALLSITE_COUNTS: std::cell::RefCell<std::collections::BTreeMap<&'static str, u64>>
-        = std::cell::RefCell::new(std::collections::BTreeMap::new());
+        = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
 }
 
 #[doc(hidden)]
@@ -131,6 +131,59 @@ struct MaudeProcessInner {
     match_empty_cache: std::collections::HashMap<(Vec<(LNTerm, LNTerm)>, Vec<(String, u64)>), ()>,
 }
 
+/// Cached `TAM_DBG_MAUDE_IO` / `TAM_DBG_MAUDE_IO_FILTER` configuration.
+/// Both env vars are constant for the process; `execute()` is the single
+/// chokepoint for every Maude IPC round-trip, so read them once instead
+/// of per call.  Returns `(trace_enabled, trace_full, filter)` preserving
+/// the exact 3-way `TAM_DBG_MAUDE_IO` semantics (`""` / `"full"` / other)
+/// and the substring `filter` value.
+fn maude_io_trace_config() -> &'static (bool, bool, String) {
+    static CFG: std::sync::OnceLock<(bool, bool, String)> = std::sync::OnceLock::new();
+    CFG.get_or_init(|| {
+        let trace_mode = std::env::var("TAM_DBG_MAUDE_IO").unwrap_or_default();
+        let trace_enabled = !trace_mode.is_empty();
+        let trace_full = trace_mode == "full";
+        let filter = std::env::var("TAM_DBG_MAUDE_IO_FILTER").unwrap_or_default();
+        (trace_enabled, trace_full, filter)
+    })
+}
+
+// --- Cached kill-switch env flags for unify_with_avoid -----------------
+// `unify` is the dominant Maude operation; the non-AC fast path is hit
+// almost exclusively on non-AC protocols and otherwise avoids Maude IPC,
+// so the per-call env-lock + `String` alloc is a large relative cost.
+// These diagnostic kill-switches are constant per process; cache each
+// behind a `OnceLock<bool>`, preserving the exact `.is_ok()` / `.is_err()`
+// sense at each call site.
+#[inline]
+fn no_ac_fast_path_enabled() -> bool {
+    // `TAM_RS_DISABLE_NO_AC_FAST_PATH` is an opt-OUT (`.is_err()`).
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_NO_AC_FAST_PATH").is_err())
+}
+#[inline]
+fn flatten_unif_disabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_FLATTEN_UNIF").is_ok())
+}
+#[inline]
+fn factor_ac_enabled() -> bool {
+    // `TAM_RS_DISABLE_FACTOR_AC` is an opt-OUT (`.is_err()`).
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_FACTOR_AC").is_err())
+}
+#[inline]
+fn ac_compose_vfresh_disabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_AC_COMPOSE_VFRESH").is_ok())
+}
+#[inline]
+fn maude_remove_renamings_enabled() -> bool {
+    // `TAM_RS_DISABLE_MAUDE_REMOVE_RENAMINGS` is an opt-OUT (`.is_err()`).
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_MAUDE_REMOVE_RENAMINGS").is_err())
+}
+
 impl MaudeProcessInner {
     fn write_line(&mut self, line: &[u8]) -> Result<(), MaudeError> {
         self.stdin.write_all(line)?;
@@ -142,13 +195,22 @@ impl MaudeProcessInner {
         let mut buf = Vec::new();
         let mut tmp = [0u8; 4096];
         loop {
+            // The prompt can only straddle the boundary between bytes read
+            // before this iteration and the newly-appended chunk, so scan
+            // only `buf[start..]` (keeping `PROMPT.len()-1` bytes of overlap)
+            // instead of re-scanning the whole accumulated buffer each read
+            // — O(N) total rather than O(N^2).  Result is identical because
+            // `find_subseq` returns the first match and earlier prefixes
+            // were already scanned (and rejected) on prior iterations.
+            let start = buf.len().saturating_sub(PROMPT.len() - 1);
             let n = self.stdout.read(&mut tmp)?;
             if n == 0 {
                 return Err(MaudeError::Other(
                     "Maude exited unexpectedly".into()));
             }
             buf.extend_from_slice(&tmp[..n]);
-            if let Some(pos) = find_subseq(&buf, PROMPT) {
+            if let Some(rel) = find_subseq(&buf[start..], PROMPT) {
+                let pos = start + rel;
                 let before = buf[..pos].to_vec();
                 return Ok(before);
             }
@@ -162,18 +224,24 @@ impl MaudeProcessInner {
         // `TAM_DBG_MAUDE_IO_FILTER=unify` — only dump unify/variant unify
         //   calls (suppresses set/show/reduce noise).  Matches HS's
         //   `TAM_HS_DBG_MAUDE_IO` semantics.
-        let trace_mode = std::env::var("TAM_DBG_MAUDE_IO").unwrap_or_default();
-        let trace_enabled = !trace_mode.is_empty();
-        let trace_full = trace_mode == "full";
-        let filter = std::env::var("TAM_DBG_MAUDE_IO_FILTER").unwrap_or_default();
-        let cmd_str_full: String = cmd.iter().map(|&b| b as char).collect();
-        let cmd_keep = if filter.is_empty() { true }
-            else { cmd_str_full.contains(filter.as_str()) };
-        if trace_enabled && cmd_keep {
-            let cmd_str = if trace_full { cmd_str_full.clone() }
-                else { cmd_str_full.chars().take(200).collect() };
-            eprintln!("[maude>] {}", cmd_str.replace('\n', "\\n"));
-        }
+        let (trace_enabled, trace_full, filter) = maude_io_trace_config();
+        let (trace_enabled, trace_full) = (*trace_enabled, *trace_full);
+        // Only materialise the full command string when something will
+        // actually read it — i.e. tracing is on, or a non-empty filter
+        // needs the `contains` check.  In the common untraced path this
+        // skips a heap allocation + byte-for-byte copy of the command.
+        let cmd_keep = if trace_enabled || !filter.is_empty() {
+            let cmd_str_full: String = cmd.iter().map(|&b| b as char).collect();
+            let keep = filter.is_empty() || cmd_str_full.contains(filter.as_str());
+            if trace_enabled && keep {
+                let cmd_str = if trace_full { cmd_str_full }
+                    else { cmd_str_full.chars().take(200).collect() };
+                eprintln!("[maude>] {}", cmd_str.replace('\n', "\\n"));
+            }
+            keep
+        } else {
+            true
+        };
         self.write_line(cmd)?;
         let result = self.read_until_prompt();
         if trace_enabled && cmd_keep {
@@ -329,11 +397,11 @@ impl MaudeHandle {
         Ok(MaudeHandle {
             inner: Arc::new(Mutex::new(inner)),
             child: Arc::new(Mutex::new(reaper)),
-            // EXPERIMENTAL: init counter to safe-zone (agent's option 2) to test
-            // whether idx-0 collisions with lemma bound vars are causing
-            // NSLPK3 line-105 divergence.  NOT HS-faithful — proper fix is
-            // PreciseFresh per-name counter or DeBruijn binders.  Just here
-            // for diagnosis: if NSLPK3 changes, we know the bug class.
+            // The global fresh counter starts at 0 (HS-faithful).  The
+            // `TAM_FRESH_SAFE_ZONE` env override seeds it higher, a
+            // diagnostic knob for probing idx-collision bug classes
+            // (e.g. idx-0 clashing with lemma bound vars); unset in
+            // normal operation.
             fresh_counter: Arc::new(AtomicU64::new(
                 std::env::var("TAM_FRESH_SAFE_ZONE").ok()
                     .and_then(|s| s.parse().ok()).unwrap_or(0))),
@@ -503,7 +571,7 @@ impl MaudeHandle {
         if eqs.is_empty() { return Ok(true); }
         if eqs.iter().all(|eq| eq.lhs == eq.rhs) { return Ok(true); }
         if self.is_ac_free() {
-            let eqs_owned: Vec<Equal<LNTerm>> = eqs.iter().cloned().collect();
+            let eqs_owned: Vec<Equal<LNTerm>> = eqs.to_vec();
             return Ok(crate::unification::unify_lnterm_no_ac(eqs_owned).is_ok());
         }
         let key: Vec<(LNTerm, LNTerm)> = eqs.iter()
@@ -521,42 +589,18 @@ impl MaudeHandle {
         Ok(answer)
     }
 
-    /// True when the signature carries no AC-flavoured operators AND
-    /// no user-defined [variant] equations.  In that regime free
-    /// (Robinson) unification is complete; we can answer every Maude
-    /// unifiability query locally.
-    ///
-    /// User [variant] equations (e.g. `check_getmsg(pk(x), sign(x,m)) = m`,
-    /// `convertpcs(...) = sign(...)`, `checkpcs(...) = true`) require
-    /// Maude's narrowing — the local unifier fails for different App
-    /// heads where Maude's `unify in MSG` would find narrowing variants.
-    /// See `project_statverif_aborted_pcs_divergence.md`.
-    ///
-    /// TAM_RS_LEGACY_FAST_PATH=1 reverts to the prior AC-only check
-    /// for performance comparison.
     /// True when the local Robinson unifier is complete for this
-    /// signature.  Requires: no AC operators (DH/XOR/multiset/nat/BP)
-    /// AND no user-defined `[variant]` equations.  When user equations
-    /// are present (e.g. `check_getmsg(pk(x), sign(x,m)) = m`,
-    /// `convertpcs(...) = sign(...)`, `checkpcs(...) = true`), Maude's
-    /// `unify in MSG` narrows via the `[variant]`-attributed equations
-    /// — the local fast path is incomplete because it can't narrow
-    /// different-App-head equations.  See StatVerif_GM_Contract_Signing
-    /// where `true =? checkpcs(...)` requires narrowing to keep
-    /// variants alive past Eq_checks_succeed propagation.
+    /// signature, so every Maude unifiability query can be answered
+    /// locally.  Requires: no AC operators (DH/XOR/multiset/nat/BP)
+    /// AND no user-defined `[variant]` equations (`sig.st_rules` empty).
     ///
-    /// `TAM_RS_LEGACY_FAST_PATH=1` reverts to the prior AC-only check
-    /// for performance comparison.
-    /// True when the local Robinson unifier is complete for this
-    /// signature.  Requires: no AC operators (DH/XOR/multiset/nat/BP)
-    /// AND no user-defined `[variant]` equations.  When user equations
-    /// are present (e.g. `check_getmsg(pk(x), sign(x,m)) = m`,
-    /// `convertpcs(...) = sign(...)`, `checkpcs(...) = true`), Maude's
-    /// `unify in MSG` narrows via the `[variant]`-attributed equations
-    /// (see ppTheory in HS's Term.Maude.Parser:248-249, mirrored by
-    /// Rust's maude_print.rs:327) — the local fast path is incomplete
-    /// because Robinson unification can't narrow different-App-head
-    /// equations like `true =? checkpcs(...)`.
+    /// When user equations are present (e.g.
+    /// `check_getmsg(pk(x), sign(x,m)) = m`, `convertpcs(...) = sign(...)`,
+    /// `checkpcs(...) = true`), Maude's `unify in MSG` narrows via the
+    /// `[variant]`-attributed equations (see ppTheory in HS's
+    /// Term.Maude.Parser, mirrored by Rust's maude_print.rs) — the local
+    /// fast path is incomplete because Robinson unification can't narrow
+    /// different-App-head equations like `true =? checkpcs(...)`.
     ///
     /// StatVerif_GM_Contract_Signing: keeping the variant disj alive
     /// past `Eq_checks_succeed`'s `z.10 → true` propagation requires
@@ -683,7 +727,7 @@ impl MaudeHandle {
         // [[project-h16-9-maude-trace-and-fix]].
         //
         // Opt-out via `TAM_RS_DISABLE_NO_AC_FAST_PATH=1` for diagnosis.
-        let try_fast_path = std::env::var("TAM_RS_DISABLE_NO_AC_FAST_PATH").is_err();
+        let try_fast_path = no_ac_fast_path_enabled();
         if try_fast_path {
             self.ensure_above(avoid_max);
             use crate::lterm::HasFrees;
@@ -695,16 +739,16 @@ impl MaudeHandle {
                     if v.name == "x" { self.ensure_above(v.idx); }
                 });
             }
-            let eqs_owned: Vec<Equal<LNTerm>> = eqs.iter().cloned().collect();
+            let eqs_owned: Vec<Equal<LNTerm>> = eqs.to_vec();
             let result = crate::unification::unify_lnterm_no_ac_with_counter(
                 eqs_owned, &self.fresh_counter,
             );
             match result {
                 Ok(subst) => {
                     // HS-faithful flattenUnif: success, return [vfresh ∘ subst].
-                    return Ok(if std::env::var("TAM_RS_DISABLE_FLATTEN_UNIF").is_ok() {
+                    return Ok(if flatten_unif_disabled() {
                         let bindings: Vec<(crate::lterm::LVar, LNTerm)> = subst.to_list()
-                            .into_iter().map(|(v, t)| (v, t)).collect();
+                            .into_iter().collect();
                         vec![bindings]
                     } else {
                         let empty_vfresh = crate::subst_vfresh::LSubstVFresh::<crate::lterm::Name>::empty();
@@ -743,13 +787,13 @@ impl MaudeHandle {
         // var set rather than just the AC residual's vars.
         //
         // Opt-out via `TAM_RS_DISABLE_FACTOR_AC=1` (sends full eqs, empty m).
-        let factor_ac = std::env::var("TAM_RS_DISABLE_FACTOR_AC").is_err();
+        let factor_ac = factor_ac_enabled();
         let (factored_m, residual_eqs): (
             crate::subst::Subst<crate::lterm::Name, crate::lterm::LVar>,
             Vec<Equal<LNTerm>>,
         ) = if factor_ac {
             match crate::unification::unify_lnterm_factored(
-                eqs.iter().cloned().collect(),
+                eqs.to_vec(),
             ) {
                 Some((m, leqs)) => (m, leqs),
                 // unifyRaw failed during factoring → no unifier (HS `solve _
@@ -759,7 +803,7 @@ impl MaudeHandle {
         } else {
             (
                 crate::subst::Subst::empty(),
-                eqs.iter().cloned().collect(),
+                eqs.to_vec(),
             )
         };
         // If factoring already solved everything (no AC residual), HS returns
@@ -767,7 +811,7 @@ impl MaudeHandle {
         // `[emptyVFresh `composeVFresh` m]`.  Mirror that without a Maude
         // round-trip.
         if factor_ac && residual_eqs.is_empty() {
-            if std::env::var("TAM_RS_DISABLE_AC_COMPOSE_VFRESH").is_ok() {
+            if ac_compose_vfresh_disabled() {
                 return Ok(vec![factored_m.to_list()]);
             }
             let empty_vfresh =
@@ -902,7 +946,7 @@ impl MaudeHandle {
         // → 14 spurious `shape_mismatch` drops.
         //
         // Kill: `TAM_RS_DISABLE_MAUDE_REMOVE_RENAMINGS=1`.
-        if std::env::var("TAM_RS_DISABLE_MAUDE_REMOVE_RENAMINGS").is_err() {
+        if maude_remove_renamings_enabled() {
             let filtered: Vec<Vec<(crate::lterm::LVar, LNTerm)>> = out.into_iter()
                 .map(|arm| {
                     let vfresh = crate::subst_vfresh::LSubstVFresh::
@@ -944,7 +988,7 @@ impl MaudeHandle {
         // empty substitution because it sent the full eqs to Maude; now that
         // we factor and send only AC residuals, `factored_m` carries the
         // non-AC bindings and MUST be the second argument to composeVFresh.
-        if std::env::var("TAM_RS_DISABLE_AC_COMPOSE_VFRESH").is_err() {
+        if !ac_compose_vfresh_disabled() {
             let renamed: Vec<Vec<(crate::lterm::LVar, LNTerm)>> = out.into_iter().map(|arm| {
                 let arm_vfresh = crate::subst_vfresh::LSubstVFresh::<crate::lterm::Name>::from_list(arm);
                 let composed = crate::subst_vfresh::compose_vfresh(&arm_vfresh, &factored_m);
@@ -1761,31 +1805,6 @@ impl MaudePool {
         })
     }
 
-    /// Build a pool from an EXISTING handle plus `n - 1` newly-spawned
-    /// siblings.  The existing handle is used as-is (counter state and
-    /// caches preserved); the new siblings are spawned fresh with the
-    /// same signature.  Useful when the caller already has a "primary"
-    /// Maude they want to reuse for sequential paths AND add to the
-    /// pool for parallel paths.
-    pub fn from_handle_with_siblings(
-        primary: MaudeHandle,
-        path: &str,
-        n: usize,
-    ) -> Result<Self, MaudeError> {
-        assert!(n >= 1, "MaudePool::from_handle_with_siblings requires n >= 1");
-        let sig = primary.maude_sig();
-        let mut handles = Vec::with_capacity(n);
-        handles.push(primary);
-        for _ in 1..n {
-            handles.push(MaudeHandle::start(path, sig.clone())?);
-        }
-        Ok(MaudePool {
-            free: Mutex::new(handles),
-            notify: Condvar::new(),
-            size: n,
-        })
-    }
-
     /// Block until a handle is free, then return it.  The handle is
     /// returned to the pool when the returned `PooledMaude` is dropped.
     pub fn acquire(&self) -> PooledMaude<'_> {
@@ -1800,12 +1819,6 @@ impl MaudePool {
 
     /// Number of subprocesses this pool was constructed with.
     pub fn size(&self) -> usize { self.size }
-
-    /// Kill every pooled subprocess (watchdog).  Idempotent.
-    pub fn kill_all(&self) {
-        let free = self.free.lock().unwrap();
-        for h in free.iter() { h.kill_subprocess(); }
-    }
 }
 
 /// A borrowed Maude handle from a `MaudePool`.  `Deref`s to

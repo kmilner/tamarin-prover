@@ -29,7 +29,7 @@ pub fn at_pos<C: Ord + Clone, V: Ord + Clone>(t: &VTerm<C, V>, p: &[i64]) -> Opt
         },
         Term::App(_, args) => {
             let i = p[0] as usize;
-            if (p[0] as i64) < 0 || i >= args.len() { return None; }
+            if p[0] < 0 || i >= args.len() { return None; }
             at_pos(&args[i], &p[1..])
         }
     }
@@ -60,7 +60,7 @@ pub fn replace_pos<C: Ord + Clone, V: Ord + Clone>(
         },
         Term::App(fsym, args) => {
             let i = p[0] as usize;
-            if (p[0] as i64) < 0 || i >= args.len() { return None; }
+            if p[0] < 0 || i >= args.len() { return None; }
             let mut new: Vec<_> = args.iter().cloned().collect();
             new[i] = replace_pos(&args[i], s, &p[1..])?;
             Some(f_app(fsym.clone(), new))

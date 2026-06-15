@@ -5,15 +5,21 @@
 //! 2. Executing it to produce zero or more child sub-systems.
 //! 3. Recursing on each child.
 //!
-//! The full ranking is large (`rankGoals` enumerates many Tamarin
-//! priorities); for now we implement the "first open goal, then
-//! simplify" heuristic — enough to drive small examples end-to-end
-//! and exercise the solver wiring.
+//! `candidate_methods` builds the FULL heuristic-ranked candidate list
+//! (Simplify + every open goal as `SolveGoal`, plus `Induction` in the
+//! initial state per `pcUseInduction`) and picks the first method whose
+//! `exec_proof_method` succeeds — mirroring `rankProofMethods` /
+//! `execMethods`.  The driver runs iterative-deepening DFS with
+//! memoized re-expansion (only `Sorry: depth limit` leaves are re-run
+//! across iterations), optional per-child parallel expansion, oracle
+//! handling, and solved-path extraction — a port of HS's
+//! `cutOnSolvedDFS`.
 //!
-//! The search is bounded by the ID-DFS depth (`MAX_DEPTH`, capped at
-//! 2048) plus a per-lemma wall-clock deadline — mirroring HS's
-//! `cutOnSolvedDFS` (`dMax` + `--prove-timeout`), which has no
-//! step/node budget.
+//! Termination is HS-faithfully bounded by the ID-DFS depth alone
+//! (`MAX_DEPTH`, doubling from 4 up to a 2048 cap) — `cutOnSolvedDFS`
+//! has only `dMax` and no step/node budget.  The per-lemma wall-clock
+//! deadline is a Rust-only addition, OFF by default (opt in via
+//! `TAM_PROVE_DEADLINE_MS`); see `proof_deadline`.
 
 use std::collections::BTreeMap;
 
@@ -55,6 +61,31 @@ pub enum NodeStatus {
     Sorry,
 }
 
+// --- Cached kill-switch / debug env flags -------------------------------
+// `expand`/`expand_inner` run once per proof-tree node (thousands of
+// times per lemma); these env vars are constant for the process, so cache
+// each behind a `OnceLock<bool>` (mirroring `trace::flag()`).  Semantics
+// preserved exactly: `TAM_RS_KEEP_SYS` is `var_os`-presence, so cache it
+// as the affirmative `keep_sys()` and negate at the call site.
+
+#[inline]
+fn keep_sys() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("TAM_RS_KEEP_SYS").is_some())
+}
+
+#[inline]
+fn dbg_expand_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_EXPAND").is_ok())
+}
+
+#[inline]
+fn disable_parallel_expand() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_PARALLEL_EXPAND").is_ok())
+}
+
 /// Per-lemma wall-clock cap on `run_proof_search`. Mirrors Haskell
 /// tamarin's `--prove-timeout` flag: when the search tree branches
 /// faster than CR-rules can prune (e.g. with a richer signature), we'd
@@ -86,18 +117,18 @@ thread_local! {
     /// `exec_proof_method` enumerating thousands of cases would
     /// otherwise sit unchecked).
     static DEADLINE: std::cell::Cell<Option<std::time::Instant>> =
-        std::cell::Cell::new(None);
+        const { std::cell::Cell::new(None) };
 
     /// ID-DFS depth limit for the current iteration.  `usize::MAX` =
     /// no limit (default; matches pre-ID-DFS behaviour).  Set per
     /// iteration in `run_proof_search`'s ID-DFS loop.
-    static MAX_DEPTH: std::cell::Cell<usize> = std::cell::Cell::new(usize::MAX);
+    static MAX_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
 
     /// Set to true by `expand` whenever a node hits `MAX_DEPTH`.  The
     /// top-level loop reads this between iterations to decide whether
     /// to retry with doubled depth.  Mirrors Haskell's `MaybeNoSolution`
     /// sentinel in `cutOnSolvedDFS` (Proof.hs:855-877).
-    static DEPTH_LIMIT_HIT: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    static DEPTH_LIMIT_HIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// True iff the current search is past its wall-clock deadline.
@@ -357,7 +388,9 @@ fn re_expand_depth_limited(
             // state-traces from re-expanded subtrees report just
             // the deepest pushed case (e.g. `/c_sdec`) instead of
             // the full lemma-proof path (`/Setup_Key/.../c_sdec`).
-            // Mirrors expand_cases at search.rs:489-492.
+            // Mirrors the case_path push/pop in the serial branch of
+            // `expand_inner` (the `if push_path { case_path_push(..) }`
+            // around the recursive `expand` call further down this file).
             let push_path = !name.is_empty();
             if push_path { crate::constraint::solver::trace::case_path_push(&name); }
             re_expand_depth_limited(ctx, child, budget, deadline, depth + 1);
@@ -418,7 +451,7 @@ fn expand(
         &node.method,
         ProofMethod::Sorry(Some(msg)) if msg == "depth limit"
     ) && matches!(node.status, NodeStatus::Sorry);
-    if !keep_for_redoexpand && std::env::var_os("TAM_RS_KEEP_SYS").is_none() {
+    if !keep_for_redoexpand && !keep_sys() {
         node.sys = crate::constraint::system::System::default();
     }
 }
@@ -430,7 +463,7 @@ fn expand_inner(
     deadline: &std::time::Instant,
     depth: usize,
 ) {
-    let dbg_expand = std::env::var("TAM_DBG_EXPAND").is_ok();
+    let dbg_expand = dbg_expand_enabled();
     if dbg_expand {
         eprintln!("[expand] enter depth={} budget={} sys.nodes={} goals={}",
             depth, *budget, node.sys.nodes.len(), node.sys.goals.len());
@@ -545,8 +578,19 @@ fn expand_inner(
     }
     node.method = method;
     if cases.is_empty() {
-        // Empty case-map after exec means contradictory closure.
-        node.status = NodeStatus::Contradictory;
+        // An empty case-map after exec normally means contradictory
+        // closure.  The one exception is a `Sorry` method (e.g. an
+        // oracle/tactic with `quit_on_empty` that ranked no goals):
+        // its node folds up as an *incomplete* proof, not a closed
+        // one.  Haskell's `proofStepStatus (ProofStep (Sorry _) (Just
+        // _)) = IncompleteProof` (Theory/Proof.hs), i.e. `Sorry`, NOT
+        // `CompleteProof`/contradictory — otherwise an all-traces
+        // lemma blocked only by the oracle would be reported verified.
+        node.status = if matches!(&node.method, ProofMethod::Sorry(_)) {
+            NodeStatus::Sorry
+        } else {
+            NodeStatus::Contradictory
+        };
         return;
     }
     let mut all_closed = true;       // All children are Solved OR Contradictory
@@ -603,7 +647,7 @@ fn expand_inner(
     // the parallel pass).  case_path is best-effort under parallel:
     // each worker seeds its stack from the parent's snapshot at entry.
     let n_cases = cases.len();
-    let dbg_serial_only = std::env::var("TAM_RS_DISABLE_PARALLEL_EXPAND").is_ok();
+    let dbg_serial_only = disable_parallel_expand();
     // Gate parallel mode on all-traces lemmas only.  Exists-trace
     // lemmas rely on the `any_solved` early-break (HS's lazy `foldMap`
     // short-circuit on `TraceFound`) — once a single witness branch

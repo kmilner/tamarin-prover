@@ -1,6 +1,6 @@
 //! Port of `Term.LTerm.renamePrecise` applied to a `System`.
 //!
-//! Haskell `cleanup` (ProofMethod.hs:443-444):
+//! Haskell `cleanup` (ProofMethod.hs):
 //! ```haskell
 //! cleanup s = L.set sSubst emptySubst (Precise.evalFresh (renamePrecise s) Precise.nothingUsed)
 //! ```
@@ -8,8 +8,11 @@
 //! `renamePrecise` walks every free `LVar` in a value in a deterministic
 //! traversal order and rebinds each *unique* `LVar` to a freshly-allocated
 //! `LVar` keyed by name. The result is canonical for two values that differ
-//! only by variable indices — exactly the property `M.fromListWith` needs in
-//! `process` (ProofMethod.hs:440) to dedup variant-divergent case maps.
+//! only by variable indices. `process` (ProofMethod.hs) relies on that
+//! canonical form when it `removeRedundantCases`-collapses variant-divergent
+//! case maps and when the `Simplify` method compares `sys' /= cleanup sys`;
+//! note `M.fromListWith (error "case names not unique")` there *errors* on a
+//! duplicate case name rather than deduping.
 //!
 //! In Rust we don't have a single `mapFrees` typeclass that covers `System`,
 //! so we walk each field by hand. The walk-order mirrors
@@ -292,7 +295,7 @@ pub fn rename_precise_system(sys: &mut System) {
         crate::fact::Fact {
             tag: fa.tag,
             annotations: fa.annotations,
-            terms: fa.terms.into_iter().map(|t| apply_term(t)).collect(),
+            terms: fa.terms.into_iter().map(&apply_term).collect(),
         }
     };
     let mut new_goals: Vec<(Goal, crate::constraint::system::GoalStatus)> =
@@ -339,7 +342,7 @@ pub fn rename_precise_system(sys: &mut System) {
             for f in v.iter_mut() {
                 *f = subst_guarded(f, sub);
             }
-            v.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
+            v.sort_by(crate::guarded::cmp_guarded);
             v.dedup_by(|a, b| crate::guarded::cmp_guarded(a, b)
                 == std::cmp::Ordering::Equal);
         };
@@ -504,8 +507,13 @@ fn atom_for_each_free(a: &crate::guarded::GAtom, f: &mut dyn FnMut(&LVar)) {
             term_for_each_free(y, f);
         }
         GAtom::Action(fa, t) => {
-            for arg in &fa.args { term_for_each_free(arg, f); }
+            // HS `Traversable ProtoAtom` visits the timepoint BEFORE the
+            // fact: `traverse f (Action i fa) = Action <$> f i <*> traverse f fa`
+            // (Atom.hs).  renamePrecise allocates fresh per-name indices
+            // in visit order, so the timepoint must be walked first to
+            // match HS's idx assignment.
             term_for_each_free(t, f);
+            for arg in &fa.args { term_for_each_free(arg, f); }
         }
         GAtom::Last(t) => term_for_each_free(t, f),
         GAtom::Pred(fa) => { for arg in &fa.args { term_for_each_free(arg, f); } }

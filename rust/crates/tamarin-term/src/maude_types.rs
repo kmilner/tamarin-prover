@@ -64,12 +64,6 @@ impl ConvCtx {
     pub fn bindings(&self) -> &BTreeMap<MaudeLit, Lit<Name, LVar>> {
         &self.inverse
     }
-
-    /// Replace the inverse map. Used when handing the bindings back to the
-    /// reverse-conversion to share the same id ↔ literal correspondence.
-    pub fn set_bindings(&mut self, b: BTreeMap<MaudeLit, Lit<Name, LVar>>) {
-        self.inverse = b;
-    }
 }
 
 // =============================================================================

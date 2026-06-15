@@ -188,9 +188,8 @@ pub enum LemmaAttr {
 /// auto-prover output at proof-replay time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProofSkeleton {
-    /// Raw source text of the proof skeleton (kept for diagnostics and
-    /// back-compatibility with downstream emitters that haven't been
-    /// migrated yet).
+    /// Raw source text of the proof skeleton (used for diagnostics/logging and
+    /// propagated into theory.rs's `ProofSkeleton` during elaboration).
     pub raw: String,
     /// Structured parse of `raw`.  `None` only if `try_proof_skeleton`
     /// failed to interpret the token stream (we always set this for
@@ -266,7 +265,7 @@ pub enum ParsedMethod {
 ///
 ///   - `Fact( ... ) @ #var`        →  ActionG
 ///   - `Fact( ... ) ▶<n> #var`     →  PremiseG (subscript-digit shows
-///                                              the premise index)
+///     the premise index)
 ///   - `gf1 ∥ gf2 ∥ ...`           →  DisjG (Disj [guardedFormula])
 ///   - chain / subterm / splitEqs  →  Chain/Subterm/Split
 ///
@@ -545,6 +544,7 @@ pub struct VarSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum SortHint {
     Msg,
     Pub,    // $x
@@ -554,15 +554,13 @@ pub enum SortHint {
     /// Sort given by suffix `: msg | : pub | : fresh | : node | : nat`.
     Suffix(SuffixSort),
     /// No sort hint: bare identifier, sort to be inferred.
+    #[default]
     Untagged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SuffixSort { Msg, Pub, Fresh, Node, Nat }
 
-impl Default for SortHint {
-    fn default() -> Self { SortHint::Untagged }
-}
 
 // =============================================================================
 // Flag formulas (for #ifdef)

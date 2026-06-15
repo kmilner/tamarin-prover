@@ -1,5 +1,5 @@
 //! Skeleton-replay prover — port of HS `replaceSorryProver`
-//! (lib/theory/src/Theory/Proof.hs:644-652).
+//! (lib/theory/src/Theory/Proof.hs).
 //!
 //! HS's `--prove` flag wires `replaceSorryProver $ runAutoProver`
 //! (TheoryLoader.hs:606) so the auto-prover runs **only at `by sorry`
@@ -8,7 +8,7 @@
 //! `.spthy` file even when the auto-prover would have picked a
 //! different (still-sound) decomposition.
 //!
-//! ## HS reference (Theory/Proof.hs:644-652)
+//! ## HS reference (Theory/Proof.hs)
 //!
 //! ```haskell
 //! -- | Replace all annotated sorry steps using the given prover.
@@ -62,7 +62,7 @@ use crate::fact::{fact_tag_name, FactTag, Multiplicity};
 
 /// Drive a single lemma's skeleton.  Equivalent of HS
 /// `runProver (replaceSorryProver (runAutoProver autoProver)) ctxt 0
-///  initial sysOnTree` (Proof.hs:644-652).
+///  initial sysOnTree` (Proof.hs).
 ///
 /// `max_steps` is plumbed through to `run_proof_search` for the
 /// fall-through auto-prover invocations.
@@ -77,10 +77,10 @@ pub fn replace_sorry_prove(
 
 /// Replay a stored skeleton WITHOUT auto-proving its open/sorry leaves —
 /// the equivalent of HS's close-time `checkAndExtendProver (sorryProver
-/// Nothing)` (Prover.hs:185, Proof.hs:626-632).  Each step's method and
+/// Nothing)` (Prover.hs:185, Proof.hs).  Each step's method and
 /// children are taken verbatim from the skeleton; every fall-through that
 /// `checkProof` would turn into a `Sorry` with a `Nothing` system
-/// (Proof.hs:459-469) becomes an *unannotated* `ProofNode`
+/// (Proof.hs) becomes an *unannotated* `ProofNode`
 /// (`annotated == false`), so the lemma renders byte-identically to HS's
 /// reprint of a non-target lemma (incl. `/* unannotated */` markers) and
 /// its summary status reflects the stored proof — NOT a fresh search.
@@ -98,7 +98,7 @@ pub fn check_and_extend(
 
 /// Build an annotated `Sorry` leaf seeded with `sys`.  HS `checkProof`
 /// keeps the *node itself* annotated (`node ... = ProofStep m (Just
-/// info, Just sys)`, Proof.hs:467) — only its forced children are
+/// info, Just sys)`, Proof.hs) — only its forced children are
 /// `Nothing`.  A stored `by sorry` leaf therefore renders as plain
 /// `by sorry` (no `/* unannotated */`).
 fn annotated_sorry(reason: Option<String>, sys: System) -> ProofNode {
@@ -111,7 +111,7 @@ fn annotated_sorry(reason: Option<String>, sys: System) -> ProofNode {
     }
 }
 
-/// HS `noSystemPrf` (Proof.hs:469): `mapProofInfo (\i -> (Just i, Nothing))`.
+/// HS `noSystemPrf` (Proof.hs): `mapProofInfo (\i -> (Just i, Nothing))`.
 ///
 /// When `checkProof` finds an invalid proof step it creates
 /// `sorryNode reason (M.singleton "" prf)` where `prf` is the original
@@ -162,10 +162,12 @@ fn parsed_method_to_display(pm: &ParsedMethod) -> ProofMethod {
     }
 }
 
-/// Public root-level annotated `sorry` leaf (HS keeps the parsed
+/// Public root-level **annotated** `sorry` leaf (HS keeps the parsed
 /// `unproven ()` proof when a lemma has no stored skeleton —
-/// ProofSkeleton.hs:61; checkProof annotates it with the start system).
-pub fn unannotated_sorry_root(sys: System) -> ProofNode {
+/// ProofSkeleton.hs:61; checkProof annotates the node with the start
+/// system, so it renders as plain `by sorry` with no `/* unannotated */`
+/// — see `annotated_sorry`).
+pub fn annotated_sorry_root(sys: System) -> ProofNode {
     annotated_sorry(None, sys)
 }
 
@@ -185,7 +187,7 @@ fn replay_node(
     //       fromMaybe prf $ runProver prover0 ctxt d se prf
     if matches!(node.method, ParsedMethod::Sorry) && node.cases.is_empty() {
         // HS check-and-extend keeps a stored `Sorry` leaf annotated
-        // (Proof.hs:459,467: `sorryNode reason cs` → node carries
+        // (Proof.hs: `sorryNode reason cs` → node carries
         // `Just sys`), so it renders as plain `by sorry`.
         if !auto_prove {
             return annotated_sorry(None, sys);
@@ -210,7 +212,7 @@ fn replay_node(
     //       Sorry — neither lies about the result.
     if matches!(node.method, ParsedMethod::Contradiction) && node.cases.is_empty() {
         if let Some(MethodResult::Contradictory(_)) = is_finished(ctx, &sys) {
-            // HS replay (checkProof, Proof.hs:458-467) preserves the
+            // HS replay (checkProof, Proof.hs) preserves the
             // skeleton's STORED method verbatim — the parser builds
             // `Finished (Contradictory Nothing)` for `by contradiction`
             // (Proof.hs:81), so the reprinted method carries no reason
@@ -226,7 +228,7 @@ fn replay_node(
             };
         }
         // Runtime doesn't immediately agree with the skeleton's
-        // `by contradiction` claim.  HS `checkProof` (Proof.hs:461-462):
+        // `by contradiction` claim.  HS `checkProof` (Proof.hs):
         //   `sorryNode (Just "invalid proof step encountered") (M.singleton "" prf)`
         // where `prf` is the current leaf, `noSystemPrf`'d → unannotated.
         if !auto_prove {
@@ -314,7 +316,7 @@ fn replay_node(
         Some(p) => p,
         None => {
             // Couldn't resolve OR the method didn't apply.  HS
-            // check-and-extend marks the step `Nothing` (Proof.hs:461):
+            // check-and-extend marks the step `Nothing` (Proof.hs):
             //   sorryNode (Just "invalid proof step encountered") (M.singleton "" prf)
             // where `prf` is the current node (method + children) passed
             // through `noSystemPrf` → `annotated = false`.  RS mirrors
@@ -373,8 +375,6 @@ fn replay_node(
         }
         // Wrap the body in a function so we can ensure pop() on every
         // exit path.  Original body below, just indented one level.
-        let _push_guard = (); // placeholder for symmetry
-        let _ = _push_guard;
         // Find the matching runtime case.  Two common shapes:
         //   - Skel case is "" (no name; from Simplify or single-case
         //     SolveGoal) → matches the single produced case.
@@ -414,12 +414,12 @@ fn replay_node(
                     }
                 } else {
                     // HS check-and-extend, `mergeMapsWith` rightOnly branch
-                    // (Proof.hs:465): a case present in the stored skeleton
+                    // (Proof.hs): a case present in the stored skeleton
                     // but NOT produced by re-executing the method is mapped
-                    // through `noSystemPrf` (Proof.hs:468-469) =
+                    // through `noSystemPrf` (Proof.hs) =
                     // `mapProofInfo (\i -> (Just i, Nothing))`, applied to
                     // the WHOLE skeleton subtree.  After `mapProofInfo snd`
-                    // (checkAndExtendProver, Proof.hs:628) the info is
+                    // (checkAndExtendProver, Proof.hs) the info is
                     // `Nothing` for every node, so the entire subtree
                     // renders unannotated (`/* unannotated */`).  Mirror
                     // this with `parsed_to_unannotated`, NOT a single
@@ -477,13 +477,13 @@ fn replay_node(
             run_proof_search(ctx, rt_sys, max_steps)
         } else {
             // HS check-and-extend, `mergeMapsWith` leftOnly branch
-            // (Proof.hs:465): a case PRODUCED by re-executing the method
+            // (Proof.hs): a case PRODUCED by re-executing the method
             // but absent from the stored skeleton is handled by
             // `unhandledCase = mapProofInfo (Nothing,) . prover d`
-            // (Proof.hs:464).  `prover` there is
-            // `sorryProver Nothing` (Proof.hs:631-632, runProver), which
+            // (Proof.hs).  `prover` there is
+            // `sorryProver Nothing` (Proof.hs, runProver), which
             // yields `sorry Nothing (Just se)` — info `(Nothing, Just se)`.
-            // After `mapProofInfo snd` (Proof.hs:628) the info is
+            // After `mapProofInfo snd` (Proof.hs) the info is
             // `Just se`, so the leaf is ANNOTATED → plain `by sorry`
             // (NO `/* unannotated */`).  This differs from the rightOnly
             // branch above, which is `Nothing`.
@@ -577,7 +577,7 @@ fn exec_method_for(
     let mut tried = 0usize;
     // Cap candidate iteration to avoid pathological case-enumeration
     // explosion (each `exec_proof_method` for a SolveGoal can be
-    // expensive — Maude calls, system clones, simplify loops).  64
+    // expensive — Maude calls, system clones, simplify loops).  32
     // candidates is generous; HS's first-match-wins ranking typically
     // hits at the top.
     const MAX_CANDIDATES: usize = 32;
@@ -629,7 +629,7 @@ fn goal_kind(g: &Goal) -> String {
 /// Match the produced case-name set against the skeleton's child case
 /// names.
 ///
-/// HS's `checkProof` (Proof.hs:455-469) uses `mergeMapsWith
+/// HS's `checkProof` (Proof.hs) uses `mergeMapsWith
 /// unhandledCase noSystemPrf (go (d+1))` — it tolerates BOTH (a) cases
 /// the skeleton has but runtime doesn't produce (preserved as
 /// `noSystemPrf` — Sorry-style placeholders), and (b) cases the
@@ -1616,7 +1616,7 @@ mod tests {
     }
 
     /// HS check-and-extend, `mergeMapsWith` rightOnly branch
-    /// (Proof.hs:465,468-469): a stored-skeleton case that the
+    /// (Proof.hs): a stored-skeleton case that the
     /// re-executed method does NOT produce is mapped through
     /// `noSystemPrf` over the WHOLE subtree → every node `Nothing` →
     /// `/* unannotated */`.  `parsed_to_unannotated` must therefore set

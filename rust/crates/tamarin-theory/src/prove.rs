@@ -42,7 +42,7 @@ fn guard_error_doc(
 ) -> String {
     let full = crate::pretty_formula::pretty_formula(formula);
     let sub = e.subject_formula.as_ref()
-        .map(|f| crate::pretty_formula::pretty_formula(f))
+        .map(crate::pretty_formula::pretty_formula)
         .unwrap_or_else(|| full.clone());
     format!("{}\n  \"{}\"\nin the formula\n  \"{}\"", e.message, sub, full)
 }
@@ -61,9 +61,10 @@ impl std::fmt::Display for ProveError {
 /// whose path is not already absolute.
 ///
 /// Mirrors HS `oraclePath oracle = takeDirectory inFile </> normalise relPath`
-/// (System.hs:574-575, Parser.hs:304).  The `normalise relPath` in HS is
-/// `System.FilePath.normalise` which collapses `.`/`..`; we use
-/// `std::path::Path::join` which does the same.
+/// (System.hs:574-575, Parser.hs:304).  NOTE: HS's `normalise relPath`
+/// (`System.FilePath.normalise`) collapses `.`/`..` segments; we only
+/// directory-prefix via `std::path::Path::join`, which is purely lexical
+/// and does NOT collapse `.`/`..` (`a/b/../c` stays as-is).
 fn prepend_theory_dir_to_oracle_paths(
     rankings: &mut Vec<crate::constraint::solver::goals::GoalRanking>,
     in_file: &str,
@@ -79,7 +80,8 @@ fn prepend_theory_dir_to_oracle_paths(
                 let p = std::path::Path::new(oracle_path.as_str());
                 if !p.is_absolute() {
                     let resolved = work_dir.join(p);
-                    // Normalise (collapse ./ ../ etc.)
+                    // Directory-prefix only — `Path::join` is lexical and
+                    // does NOT collapse `./` `../` (unlike HS `normalise`).
                     let resolved = resolved.to_string_lossy().to_string();
                     *oracle_path = resolved;
                 }
@@ -89,20 +91,6 @@ fn prepend_theory_dir_to_oracle_paths(
     }
 }
 
-/// Per-file shared prover state — the bits of work that depend only on
-/// the theory, not on which lemma is being proved.  Built once via
-/// [`ProverSession::build`] and reused across `prove_lemma_in_session`
-/// calls so each lemma in a multi-lemma `--prove` run pays the heavy
-/// setup cost only ONCE.
-///
-/// Profile showed ~3s of `ProofContext::new` work (intruder rules,
-/// `close_intr_rule` Maude variants, DH/BP cached variants, per-rule
-/// `expand_rule_variants`, `precompute_sources`, `precompute_full_sources`)
-/// re-running per lemma.  On wireguard's 8 lemmas that was ~24s
-/// (HS amortises this across the file).  By sharing the template
-/// `ProofContext` we recover that cost; per-lemma we still run the
-/// lightweight `ensure_saturated` (each lemma needs its own
-/// `typing_assumptions`-refined source cases).
 /// One theory-level cache entry of refined source cases — the result of
 /// a `ctx.ensure_saturated()` pass, snapshotted per `Source` by goal.
 /// Keyed (in [`ProverSession::source_cache`]) by the SORTED set of
@@ -135,6 +123,20 @@ struct CachedSources {
     )>,
 }
 
+/// Per-file shared prover state — the bits of work that depend only on
+/// the theory, not on which lemma is being proved.  Built once via
+/// [`ProverSession::build`] and reused across `prove_lemma_in_session`
+/// calls so each lemma in a multi-lemma `--prove` run pays the heavy
+/// setup cost only ONCE.
+///
+/// Profile showed ~3s of `ProofContext::new` work (intruder rules,
+/// `close_intr_rule` Maude variants, DH/BP cached variants, per-rule
+/// `expand_rule_variants`, `precompute_sources`, `precompute_full_sources`)
+/// re-running per lemma.  On wireguard's 8 lemmas that was ~24s
+/// (HS amortises this across the file).  By sharing the template
+/// `ProofContext` we recover that cost; per-lemma we still run the
+/// lightweight `ensure_saturated` (each lemma needs its own
+/// `typing_assumptions`-refined source cases).
 pub struct ProverSession {
     /// Elaborated typed theory.  Used to look up lemmas, restrictions,
     /// rules, heuristic.  Constructed once.
@@ -485,8 +487,9 @@ fn prove_lemma_in_session_mode(
     if !auto_prove {
         // Non-target lemma with no stored skeleton: HS keeps the parsed
         // `unproven ()` single-`sorry` proof (ProofSkeleton.hs:61) — an
-        // unannotated Sorry at the lemma's start system.
-        return Ok(crate::replay::unannotated_sorry_root(sys));
+        // annotated Sorry at the lemma's start system (the node carries
+        // the start system, so it renders as plain `by sorry`).
+        return Ok(crate::replay::annotated_sorry_root(sys));
     }
     let t_search: Option<std::time::Instant> =
         if trace { Some(std::time::Instant::now()) } else { None };
@@ -1096,7 +1099,7 @@ end";
         // Diagnostic: count lemmas in the proof tree's leaves.
         fn collect_max_lemmas(n: &super::ProofNode, out: &mut usize) {
             *out = (*out).max(n.sys.lemmas.len());
-            for (_, c) in &n.children { collect_max_lemmas(c, out); }
+            for c in n.children.values() { collect_max_lemmas(c, out); }
         }
         let mut max_lemmas = 0;
         collect_max_lemmas(&root, &mut max_lemmas);

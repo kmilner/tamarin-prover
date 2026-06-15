@@ -69,7 +69,15 @@ fn every_fixture_parses_and_matches() {
             }
         };
         if fx.is_diff { thy.is_diff = true; }
-        let topics = wf::topics(&wf::check_theory(&thy));
+        // Normalise trailing whitespace: some HS wellformedness titles
+        // carry a source-literal trailing space (e.g.
+        // "...not in any right-hand-side "), which the comma-separated
+        // `expected.txt` cannot represent because its entries are
+        // `.trim()`-ed when parsed.  Compare titles modulo trailing space.
+        let topics: BTreeSet<String> = wf::topics(&wf::check_theory(&thy))
+            .into_iter()
+            .map(|s| s.trim_end().to_string())
+            .collect();
         // The "Formula terms" check (HS `checkTerms`) needs the elaborated
         // `MaudeSig` for reducible/irreducible funsym classification, so it
         // lives in `tamarin_theory::check_terms` and runs post-elaboration

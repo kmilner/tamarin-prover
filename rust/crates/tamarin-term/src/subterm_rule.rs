@@ -1,7 +1,7 @@
 //! Port of `Term.SubtermRule` from `lib/term/src/Term/SubtermRule.hs`.
 
 use crate::lterm::{frees, LNTerm};
-use crate::positions::{positions, positions_non_var, Position};
+use crate::positions::{positions, Position};
 use crate::rewriting::RRule;
 use crate::term::Term;
 
@@ -70,20 +70,64 @@ pub fn find_all_subterms(l: &LNTerm, r: &LNTerm) -> Option<Vec<Position>> {
     }
 }
 
+/// `subterms args [] 1` (SubtermRule.hs:60-67): for each top-level arg
+/// `t`, find the positions where `t` occurs as a subterm of a SIBLING
+/// arg, each prefixed with that sibling's top-level index.  HS visits the
+/// remaining siblings (`zip [i..] ts`) before the already-processed ones
+/// (`zip [0..] done`); we preserve that order.
+fn subterms(args: &[LNTerm]) -> Vec<Position> {
+    let mut out = Vec::new();
+    for (k, t) in args.iter().enumerate() {
+        // Remaining siblings first, at their true indices k+1, k+2, …
+        for (off, y) in args[k + 1..].iter().enumerate() {
+            let x = (k + 1 + off) as i64;
+            for mut p in find_subterm(y, t) {
+                let mut full = vec![x];
+                full.append(&mut p);
+                out.push(full);
+            }
+        }
+        // Then the already-processed siblings, at indices 0 .. k-1.
+        for (x, y) in args[..k].iter().enumerate() {
+            for mut p in find_subterm(y, t) {
+                let mut full = vec![x as i64];
+                full.append(&mut p);
+                out.push(full);
+            }
+        }
+    }
+    out
+}
+
+/// `constantPositions` (SubtermRule.hs:56-69): for an `FApp _ args` LHS,
+/// the sibling-subterm positions of its args; if the LHS contains a
+/// private function symbol, or no sibling-subterm is found, every
+/// position of the LHS.
+fn constant_positions(lhs: &LNTerm) -> Vec<Position> {
+    match lhs {
+        Term::App(_, args) => {
+            if crate::lterm::contains_private(lhs) {
+                positions(lhs)
+            } else {
+                let pos = subterms(args);
+                if pos.is_empty() { positions(lhs) } else { pos }
+            }
+        }
+        // HS `constantPositions` only matches `FApp`; a non-App LHS has no
+        // sibling structure — fall back to all positions.
+        _ => positions(lhs),
+    }
+}
+
 /// `rRuleToCtxtStRule`: convert an `RRule` to a `CtxtStRule` if possible.
 pub fn rrule_to_ctxt_st_rule(rule: &RRule<LNTerm>) -> Option<CtxtStRule> {
     if frees(&rule.rhs).is_empty() {
-        // Pure right-hand-side; positions are constant positions of LHS.
-        let positions = if crate::lterm::contains_private(&rule.lhs) {
-            positions(&rule.lhs)
-        } else {
-            // Constant positions: positions in non-variable subterm structure.
-            let candidates = positions_non_var(&rule.lhs);
-            if candidates.is_empty() { positions(&rule.lhs) } else { candidates }
-        };
+        // Pure right-hand-side: the positions are the LHS's constant
+        // positions — HS `constantPositions` (a sibling-subterm search),
+        // NOT all non-variable positions.
         return Some(CtxtStRule::new(
             rule.lhs.clone(),
-            StRhs { positions, term: rule.rhs.clone() },
+            StRhs { positions: constant_positions(&rule.lhs), term: rule.rhs.clone() },
         ));
     }
     let positions = find_all_subterms(&rule.lhs, &rule.rhs)?;

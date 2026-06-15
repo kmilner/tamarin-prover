@@ -46,10 +46,11 @@ pub fn parse_theory(input: &str, flags: &[&str]) -> Result<Theory, ParseError> {
     Ok(thy)
 }
 
-/// Parse either an `OpenTheory` or `OpenDiffTheory`. Decided by first
-/// inspecting the file for a `diff` flag or by trying diff first.
-/// In practice we just try a regular theory; the diff flag is set in the
-/// preamble via `#define diff` or by the caller passing `flags`.
+/// Parse a theory. Currently always delegates to `parse_theory`, which parses
+/// a regular (non-diff) theory: `is_diff` is hardcoded to `false` and neither
+/// `flags` nor a `#define diff` preamble is inspected to switch into diff mode.
+/// (HS's `theory` derives diff from `"diff" \`S.member\` flags0`; that wiring is
+/// not yet ported here, so diff selection is left to the caller.)
 pub fn parse_theory_or_diff(input: &str, flags: &[&str]) -> Result<Theory, ParseError> {
     parse_theory(input, flags)
 }
@@ -99,8 +100,9 @@ pub struct Parser<'a> {
     lx: Lexer<'a>,
     /// Defined preprocessor flags. Mutated by `#define` directives.
     flags: HashSet<String>,
-    /// Whether we're parsing a diff theory (set when `theory ...` is followed
-    /// by `--diff` mode or when input includes `#define diff`).
+    /// Whether we're parsing a diff theory. Set only from the `Parser::new`
+    /// argument supplied by the caller and echoed into `Theory::is_diff`;
+    /// `theory()` does not derive it from `flags` or a `#define diff` preamble.
     is_diff: bool,
     /// Currently-known function symbols (added by builtins / functions:).
     /// Used to disambiguate `f(...)` (function app) from a process call by
@@ -164,15 +166,6 @@ impl<'a> Parser<'a> {
     fn restore(&mut self, p: Pos) { self.lx.set_pos(p); }
 
     fn skip_ws(&mut self) { self.lx.skip_ws(); }
-
-    #[allow(dead_code)]
-    fn expect_eof(&mut self) -> Result<(), ParseError> {
-        self.skip_ws();
-        if self.lx.is_eof() { Ok(()) } else {
-            Err(self.err(format!("expected EOF, got {:?}",
-                self.lx.rest().chars().take(30).collect::<String>())))
-        }
-    }
 
     fn at_keyword(&mut self, kw: &str) -> bool {
         if !self.lx.peek_symbol(kw) { return false; }
@@ -425,9 +418,8 @@ impl<'a> Parser<'a> {
                         if depth == 0 { return BranchEnd::Endif; }
                         depth -= 1;
                     }
-                    "else" => {
-                        if depth == 0 { return BranchEnd::Else; }
-                    }
+                    "else"
+                        if depth == 0 => { return BranchEnd::Else; }
                     _ => {}
                 }
                 let _ = save;
@@ -1601,7 +1593,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         let persistent = self.try_punct("!");
         let name = self.ident()?;
-        if !name.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+        if !name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
             return Err(self.err(format!("fact name `{}` must start with uppercase", name)));
         }
         self.require_punct("(")?;
@@ -1617,8 +1609,8 @@ impl<'a> Parser<'a> {
             self.require_punct(")")?;
         }
         let mut annotations = Vec::new();
-        if self.try_punct("[") {
-            if !self.try_punct("]") {
+        if self.try_punct("[")
+            && !self.try_punct("]") {
                 loop {
                     if self.try_punct("+") { annotations.push(FactAnnotation::SolveFirst); }
                     else if self.try_punct("-") { annotations.push(FactAnnotation::SolveLast); }
@@ -1628,7 +1620,6 @@ impl<'a> Parser<'a> {
                 }
                 self.require_punct("]")?;
             }
-        }
         // HS-faithful parse-time canonicalisation, mirroring
         // `Theory.Text.Parser.Fact.mkProtoFact` (Fact.hs:56-63) combined with
         // `factTagMultiplicity` (Model/Fact.hs:354-360) and `factTagName`
@@ -1923,9 +1914,9 @@ impl<'a> Parser<'a> {
 
     fn expterm(&mut self, eqn: bool) -> Result<Term, ParseError> {
         let mut lhs = self.atom_term(eqn)?;
-        // `^` is right-associative in Tamarin (Haskell `chainl1` actually but
-        // the operator is conventionally treated as such). Use left-assoc to
-        // match `chainl1` semantics.
+        // HS `expterm` is "a left-associative sequence of exponentiations"
+        // (`chainl1`, Parser/Term.hs:150-152), so build left-associative
+        // `^` trees here to match.
         while self.try_punct("^") {
             let rhs = self.atom_term(eqn)?;
             lhs = Term::BinOp(BinOp::Exp, Box::new(lhs), Box::new(rhs));
@@ -1984,8 +1975,10 @@ impl<'a> Parser<'a> {
         if self.try_punct("1:nat") { return Ok(Term::NatOne); }
         if self.try_punct("%1") { return Ok(Term::NatOne); }
         // `1` only valid when DH is enabled; we accept it always at parse level.
-        // Word-boundary: don't match `1` if it's the start of a longer
-        // identifier like `1G` or `1abc`.
+        // Divergence from HS: HS uses a bare `symbol "1"` (Term.hs) with no word
+        // boundary, so it would match the `1` prefix of `1G`/`1abc`. Here we add
+        // a word-boundary guard so `1` is only the DH unit when not immediately
+        // followed by an alphanumeric or `_`.
         {
             let save = self.save();
             self.skip_ws();
@@ -1993,7 +1986,7 @@ impl<'a> Parser<'a> {
                 let mut probe = self.lx.clone();
                 probe.bump();
                 let next = probe.peek();
-                if next.map_or(true, |c| !c.is_alphanumeric() && c != '_') {
+                if next.is_none_or(|c| !c.is_alphanumeric() && c != '_') {
                     self.lx.bump();
                     self.skip_ws();
                     return Ok(Term::NumberOne);
@@ -2279,11 +2272,6 @@ pub fn parse_formula_str(s: &str) -> Result<Formula, ParseError> {
     }
     Ok(f)
 }
-
-// We need to silence one unused method warning if `is_ident_char` appears
-// unused in some configurations.
-#[allow(dead_code)]
-fn _kw_anchor() { let _ = is_ident_char('a'); }
 
 #[cfg(test)]
 mod tests {

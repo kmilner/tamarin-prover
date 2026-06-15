@@ -250,7 +250,7 @@ fn run_variants(args: &Args) -> Result<i32, RunError> {
                 FactTag::Term => "Term".into(),
             };
             let args: Vec<String> = f.terms.iter()
-                .map(|t| tamarin_term::pretty::pretty_lnterm(t))
+                .map(tamarin_term::pretty::pretty_lnterm)
                 .collect();
             format!("{}{}({})", prefix, name, args.join(", "))
         };
@@ -385,13 +385,13 @@ fn guess_frontend_dist(data_dir: &std::path::Path) -> Option<std::path::PathBuf>
 fn run_batch(args: &Args) -> Result<i32, RunError> {
     // HS-faithful internal parallelism via rayon.  Mirrors the four
     // `using parList`/`parTraversable`/`parMap` sites HS uses (see
-    // `lib/theory/src/Prover.hs:102,195`, `Theory/Constraint/Solver/Sources.hs:471`,
-    // `lib/theory/src/TheoryObject.hs:744,752`).  Default: cap at 4
-    // workers — RS's per-thread Maude IPC mutex limits speedup, and
-    // larger pools have caused OOM in corpus sweeps (see MEMORY.md
-    // discipline note).  `--processors=1` falls back to a 1-thread
-    // pool, guaranteeing byte-identical output to the pre-parallel
-    // sequential path.
+    // `lib/theory/src/Prover.hs:102,195`, `Theory/Constraint/Solver/Sources.hs`,
+    // `lib/theory/src/TheoryObject.hs:744,752`).  Default: full machine
+    // parallelism (`available_parallelism()`, uncapped — `MaudePool`
+    // removed the Maude IPC mutex contention that previously made larger
+    // pools unproductive; memory is budgeted via `--maude-processes`).
+    // `--processors=1` falls back to a 1-thread pool, guaranteeing
+    // byte-identical output to the pre-parallel sequential path.
     init_rayon_pool(args);
     if args.diff {
         return Err(RunError(
@@ -550,7 +550,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             // HS-faithful: `--parse-only` does NOT run wellformedness
             // (checkWellformedness only fires inside `--prove`'s
             // close-theory pipeline).  Just re-emit the source verbatim.
-            emit_output(args, in_file, &src, None)?;
+            emit_output(args, in_file, &src)?;
             file_results.push(FileResult {
                 in_file: in_file.clone(),
                 out_file: out_path_for(args, in_file),
@@ -1092,7 +1092,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             in_file,
         );
         phase!("pretty_closed_theory");
-        emit_output(args, in_file, &body, None)?;
+        emit_output(args, in_file, &body)?;
         phase!("emit_output");
 
         file_results.push(FileResult {
@@ -1151,10 +1151,31 @@ fn format_wf_block(report: &[tamarin_parser::wf::WfError]) -> String {
     for (i, topic) in topic_order.iter().enumerate() {
         let msgs = &grouped[topic];
         if i > 0 { out.push('\n'); }
-        for (j, m) in msgs.iter().enumerate() {
-            if j > 0 { out.push('\n'); }
-            out.push_str(m);
-            if !m.ends_with('\n') { out.push('\n'); }
+        // HS `prettyWfErrorReport` (Wellformedness.hs:118-125) groups by
+        // topic and renders each group as
+        //   `text topic $-$ (nest 2 . vcat . intersperse (text "") $ bodies)`
+        // — the underlineTopic header ONCE per group, then the 2-space-nested
+        // bodies separated by a 2-space blank line.  Most RS checks already
+        // pre-render the FULL block (header + indent) into a single per-topic
+        // message, and we concatenate those as-is (legacy path, unchanged).
+        //
+        // The "Unbound variables" topic is the one check that emits one
+        // HEADER-LESS body per offending rule (`unbound_report` — one entry
+        // per rule so the summary's `length rep` WARNING count stays
+        // HS-faithful, Batch.hs:245).  Assemble that group HS-style: header
+        // once, bodies joined by the `intersperse (text "")` 2-space
+        // separator.  Scoped to this topic so no other check's bytes change.
+        if *topic == "Unbound variables" {
+            out.push_str(&tamarin_parser::wf::underline_topic(topic));
+            out.push('\n'); // `$-$` blank line after the header
+            out.push_str(&msgs.join("\n  \n"));
+            out.push('\n');
+        } else {
+            for (j, m) in msgs.iter().enumerate() {
+                if j > 0 { out.push('\n'); }
+                out.push_str(m);
+                if !m.ends_with('\n') { out.push('\n'); }
+            }
         }
     }
     // Trim trailing blank lines but keep a single newline before `*/`.
@@ -1216,7 +1237,7 @@ fn populate_rule_variants(elaborated: &mut tamarin_theory::theory::Theory,
             let result = if let Some(pool) = pool {
                 let pooled = pool.acquire();
                 tamarin_theory::tools::rule_variants::abstract_rule_and_variants(
-                    &*pooled, &opr.rule)
+                    &pooled, &opr.rule)
             } else {
                 tamarin_theory::tools::rule_variants::abstract_rule_and_variants(
                     maude, &opr.rule)
@@ -1230,7 +1251,7 @@ fn populate_rule_variants(elaborated: &mut tamarin_theory::theory::Theory,
     // Sequential writeback in source order — matches HS's
     // `parList rdeepseq` semantics (parallel evaluation, sequential
     // list materialisation).
-    for (item, out) in elaborated.items.iter_mut().zip(outs.into_iter()) {
+    for (item, out) in elaborated.items.iter_mut().zip(outs) {
         let TheoryItem::Rule(opr) = item else { continue };
         if let Some((abstr, substs)) = out {
             opr.abstracted_rule = Some(abstr);
@@ -1279,7 +1300,7 @@ fn default_maude_path() -> String {
 }
 
 /// Emit `body` to `--output` / `-O` / stdout.
-fn emit_output(args: &Args, in_file: &str, body: &str, _override_out: Option<&str>) -> Result<(), RunError> {
+fn emit_output(args: &Args, in_file: &str, body: &str) -> Result<(), RunError> {
     if let Some(out) = out_path_for(args, in_file) {
         // Ensure parent dir exists.
         if let Some(parent) = std::path::Path::new(&out).parent() {
@@ -1439,14 +1460,14 @@ mod tests {
         // without ever opening a socket.
         let a = parse(&["interactive", "--interface=not-an-ip"]);
         let r = run(&a);
-        assert!(matches!(r, Err(_)), "expected interface parse error");
+        assert!(r.is_err(), "expected interface parse error");
     }
 
     #[test]
     fn no_input_files_errors() {
         let a = parse(&[]);
         let r = run(&a);
-        assert!(matches!(r, Err(_)));
+        assert!(r.is_err());
     }
 
     #[test]

@@ -380,7 +380,7 @@ pub fn render_sub_proof_snippet(
     // Sub-cases.
     let n_cases = node.children.len();
     out.push_str(&format!("<h3>{} sub-case(s)</h3>\n", n_cases));
-    for (case_name, _child) in &node.children {
+    for case_name in node.children.keys() {
         let mut child_path = proof_path.to_vec();
         child_path.push(case_name.clone());
         let child_url = encode_path(&child_path);
@@ -453,9 +453,9 @@ fn write_applicable_methods(
     out.push_str("</pre></div>\n");
     // Autoprove links — match Haskell's `a.` / `b.` / `s.` style.
     out.push_str(&format!(
-        "<p>a. <a class=\"internal-link autoprove\" href=\"/thy/trace/{idx}/autoprove/idfs/0/false/proof/{lemma}{path}\">autoprove</a> &nbsp; \
-         b. <a class=\"internal-link bounded-autoprove\" href=\"/thy/trace/{idx}/autoprove/idfs/5/false/proof/{lemma}{path}\">autoprove</a> with proof-depth bound 5 &nbsp; \
-         s. <a class=\"internal-link autoprove-all\" href=\"/thy/trace/{idx}/autoprove-all/idfs/0/proof/{lemma}{path}\">autoprove</a> for all lemmas\n</p>\n",
+        "<p>a. <a class=\"internal-link autoprove\" href=\"/thy/trace/{idx}/autoprove/idfs/0/False/proof/{lemma}{path}\">autoprove</a> &nbsp; \
+         b. <a class=\"internal-link bounded-autoprove\" href=\"/thy/trace/{idx}/autoprove/idfs/5/False/proof/{lemma}{path}\">autoprove</a> with proof-depth bound 5 &nbsp; \
+         s. <a class=\"internal-link autoprove-all\" href=\"/thy/trace/{idx}/autoproveAll/idfs/0/proof/{lemma}{path}\">autoprove</a> for all lemmas\n</p>\n",
         idx = idx,
         lemma = url_path_escape(lemma),
         path = url_path,

@@ -53,14 +53,10 @@ pub fn parse_proof_tree(raw: &str) -> Result<ParsedProofTree, ProofTreeParseErro
     p.lx.skip_ws();
     let tree = p.proof_skeleton()?;
     p.lx.skip_ws();
-    if !p.lx.is_eof() {
-        // Trailing junk — likely the outer `qed` from a higher-level
-        // case block.  HS proofSkeleton consumes proper `qed` inside
-        // interProof; anything left is fine for our purposes (caller's
-        // `read_until_next_top_level` already framed the input).  We
-        // could be stricter, but let's tolerate trailing whitespace
-        // and stray characters here.
-    }
+    // Any trailing junk is tolerated — likely the outer `qed` from a
+    // higher-level case block.  HS proofSkeleton consumes proper `qed`
+    // inside interProof; anything left is fine for our purposes (caller's
+    // `read_until_next_top_level` already framed the input).
     Ok(tree)
 }
 
@@ -582,7 +578,7 @@ impl<'a> GoalParser<'a> {
         self.lx.skip_ws();
         // Fact name: starts with uppercase.
         let name = self.lx.identifier()?;
-        if !name.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+        if !name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
             self.lx.set_pos(save);
             return None;
         }

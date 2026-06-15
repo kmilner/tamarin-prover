@@ -1,16 +1,17 @@
-//! Port of `Term.LTerm` data types from `lib/term/src/Term/LTerm.hs`
-//! (the first ~420 lines: sorts, names, logical variables, simple
-//! predicates and convertors).
+//! Port of `Term.LTerm` data types from `lib/term/src/Term/LTerm.hs`:
+//! sorts, names, logical variables, simple predicates and convertors,
+//! the `BVar`/`BLVar`/`BLTerm` bound-variable wrappers, the `HasFrees`
+//! trait with `frees`/`occurs`/`bounds_var_idx`/`avoid`/`rename`, and
+//! `nat_to_fresh_vars`.
 //!
 //! Not yet ported from this module:
-//! - `HasFrees` typeclass and `MonotoneFunction` machinery (~250 lines).
-//!   These deal with free-variable computation, renaming, and avoiding
-//!   capture using a `MonadFresh`. In Rust they'll likely be a
-//!   `HasFrees` trait + helpers that take `&mut PreciseFreshState`.
-//! - `BVar`/`BLVar`/`BLTerm` (bound-variable wrapper for binders, ~80
-//!   lines).
-//! - `rename`, `avoid`, `freshToFreeAvoiding`, etc.
+//! - The `MonotoneFunction` split (AC-preserving vs. arbitrary updates);
+//!   here `HasFrees` exposes only the common cases.
 //! - Pretty-printing instances.
+//!
+//! (`varOccurences`, `eqModuloFreshnessNoAC`, `someInst`/`renamePrecise`,
+//! and `freshToFreeAvoiding` are ported elsewhere — see `subsumption.rs`,
+//! `sources.rs`, `constraint::solver::rename_precise`, and `subst_vfresh.rs`.)
 
 use std::cmp::Ordering;
 
@@ -211,7 +212,7 @@ pub fn sort_of_lit(l: &Lit<Name, LVar>) -> LSort {
 
 /// Most precise sort of an `LNTerm`.
 pub fn sort_of_lnterm(t: &LNTerm) -> LSort {
-    sort_of_lterm(t, |n| sort_of_name(n))
+    sort_of_lterm(t, sort_of_name)
 }
 
 /// Generic sort-of-LTerm given a sort function for constants.
@@ -261,7 +262,7 @@ pub fn contains_private<A>(t: &Term<A>) -> bool {
 
 /// `flattenedACTerms sym t`: flattened `+`-children list (no nested same
 /// AC operator).
-pub fn flattened_ac_terms<'a, A>(sym: AcSym, t: &'a Term<A>) -> Vec<&'a Term<A>> {
+pub fn flattened_ac_terms<A>(sym: AcSym, t: &Term<A>) -> Vec<&Term<A>> {
     let mut out = Vec::new();
     fn go<'b, A>(sym: AcSym, t: &'b Term<A>, out: &mut Vec<&'b Term<A>>) {
         if let Term::App(FunSym::Ac(s), args) = t {
@@ -309,8 +310,6 @@ pub fn variable_to_const(v: &LVar) -> LNTerm {
     const_term(Name::new(tag, id))
 }
 
-/// `natToFreshVars t`: replace every nat-sort variable with a fresh-sort
-/// variable of the same name and index.
 // =============================================================================
 // BVar — bound or free variable (for binders / formulas)
 // =============================================================================

@@ -2,9 +2,9 @@
 //!
 //! Mirrors the Haskell reference:
 //!   - data type:  `Theory.Constraint.System.Tactic / Prio / Deprio`
-//!                 (lib/theory/src/Theory/Constraint/System.hs:439-504)
+//!     (lib/theory/src/Theory/Constraint/System.hs:439-504)
 //!   - parser:     `Theory.Text.Parser.Tactics`
-//!                 (lib/theory/src/Theory/Text/Parser/Tactics.hs:60-115)
+//!     (lib/theory/src/Theory/Text/Parser/Tactics.hs:60-115)
 //!   - pretty:     `prettyTactic` (lib/theory/src/TheoryObject.hs:881-909)
 //!
 //! The Rust parser captures the raw tactic body verbatim; this module

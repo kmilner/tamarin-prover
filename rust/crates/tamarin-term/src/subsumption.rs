@@ -6,10 +6,9 @@
 //! general (i.e. has at most as much information as) of the two.
 //!
 //! The Haskell version uses Maude AC matching to decide subsumption.
-//! For the Rust port we expose the same shape (`compare_term_subs`)
-//! but rely on a callable `match_oracle` so callers can plug in a
-//! Maude-driven matcher. A `MaudeHandle`-backed convenience exists
-//! too.
+//! Likewise here: `compare_term_subs` / `eq_term_subs` decide
+//! subsumption by issuing two `maude.match_eqs` calls directly against
+//! a `&MaudeHandle`.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -94,9 +93,13 @@ pub fn var_occurrences(ts: &[LNTerm]) -> BTreeMap<LVar, usize> {
 }
 
 /// Canonicalise a fresh-range substitution: rename the range
-/// variables to a deterministic sequence (`x.1`, `x.2`, ...) using
-/// the order of first occurrence (with ties broken by occurrence
-/// count, matching Haskell's `sortOn (`lookup` occs)`).
+/// variables to a deterministic sequence (`x.1`, `x.2`, ...) ordered
+/// by the key `(occurrence count, sort, first-occurrence position)`
+/// — see lines 167-171.  This intentionally DIVERGES from HS's
+/// `canonizeSubst`, which orders by `sortOn (`lookup` occs)` where
+/// `occs` keys on a SET of context paths (`S.Set Occurence`,
+/// `Occurence = [String]`), not a count; the count-based key here is
+/// an alpha-invariant substitute, explained in the block below.
 ///
 /// Two substitutions equivalent modulo renaming will canonicalise to
 /// the same value.

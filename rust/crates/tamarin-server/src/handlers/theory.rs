@@ -248,8 +248,10 @@ pub async fn source_(
     let Some(entry) = state.store.get(idx) else {
         return missing_idx_html(idx);
     };
-    // We don't have a full prettyClosedTheory port yet — pretty-print
-    // what we can.  TODO: wire `Theory::pp` once it's exposed.
+    // This handler still emits the placeholder `(...)` form below.
+    // TODO: wire up the existing `prettyClosedTheory` port
+    // (`pretty_theory::pretty_closed_theory`) so this renders the full
+    // theory source instead.
     let mut s = format!("theory {}\n\nbegin\n\n", entry.name);
     for r in entry.typed_theory.rules() {
         s.push_str(&format!("rule {}: (...)\n", r.name()));

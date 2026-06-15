@@ -15,8 +15,8 @@ use crate::builtin::{
 };
 use crate::function_symbols::{
     bp_fun_sig, bp_reducible_fun_sig, dh_fun_sig, dh_reducible_fun_sig,
-    fst_dest_sym, fst_sym, mset_fun_sig, nat_fun_sig, pair_fun_sig,
-    snd_dest_sym, snd_sym, xor_fun_sig, xor_reducible_fun_sig, FunSig,
+    fst_dest_sym, fst_sym, mset_fun_sig, nat_fun_sig, pair_fun_dest_sig,
+    pair_fun_sig, snd_dest_sym, snd_sym, xor_fun_sig, xor_reducible_fun_sig, FunSig,
     FunSym, NoEqFunSig, NoEqSym,
 };
 use crate::lterm::LNTerm;
@@ -25,6 +25,7 @@ use crate::subterm_rule::CtxtStRule;
 use crate::term::Term;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct MaudeSig {
     pub enable_dh: bool,
     pub enable_bp: bool,
@@ -41,25 +42,6 @@ pub struct MaudeSig {
     pub reducible_fun_syms: FunSig,
 }
 
-impl Default for MaudeSig {
-    fn default() -> Self {
-        MaudeSig {
-            enable_dh: false,
-            enable_bp: false,
-            enable_mset: false,
-            enable_nat: false,
-            enable_xor: false,
-            enable_diff: false,
-            st_fun_syms: BTreeSet::new(),
-            st_rules: BTreeSet::new(),
-            macro_names: BTreeSet::new(),
-            eq_convergent: false,
-            fun_syms: BTreeSet::new(),
-            irreducible_fun_syms: BTreeSet::new(),
-            reducible_fun_syms: BTreeSet::new(),
-        }
-    }
-}
 
 impl MaudeSig {
     /// Refresh the cached `fun_syms` / `irreducible_fun_syms` /
@@ -250,6 +232,17 @@ pub fn pair_maude_sig() -> MaudeSig {
     }.refresh()
 }
 
+/// `pairDestMaudeSig` (Signature.hs:202): the `dest-pairing` variant —
+/// fst/snd are DESTRUCTORS (`pair_fun_dest_sig`) with the destructor
+/// rewrite rules (`pair_dest_rules`), rather than constructors.
+pub fn pair_dest_maude_sig() -> MaudeSig {
+    MaudeSig {
+        st_fun_syms: pair_fun_dest_sig(),
+        st_rules: crate::builtin::pair_dest_rules(),
+        ..MaudeSig::default()
+    }.refresh()
+}
+
 pub fn hash_maude_sig() -> MaudeSig {
     MaudeSig {
         st_fun_syms: hash_fun_sig(),
@@ -293,16 +286,25 @@ pub fn reveal_signature_maude_sig() -> MaudeSig {
 pub fn location_report_maude_sig() -> MaudeSig {
     MaudeSig {
         st_fun_syms: location_report_fun_sig(),
+        st_rules: crate::builtin::location_report_rules(),
         ..MaudeSig::default()
     }.refresh()
 }
 
 pub fn sym_enc_dest_maude_sig() -> MaudeSig {
-    MaudeSig { st_fun_syms: sym_enc_fun_dest_sig(), ..MaudeSig::default() }.refresh()
+    MaudeSig {
+        st_fun_syms: sym_enc_fun_dest_sig(),
+        st_rules: crate::builtin::sym_enc_dest_rules(),
+        ..MaudeSig::default()
+    }.refresh()
 }
 
 pub fn asym_enc_dest_maude_sig() -> MaudeSig {
-    MaudeSig { st_fun_syms: asym_enc_fun_dest_sig(), ..MaudeSig::default() }.refresh()
+    MaudeSig {
+        st_fun_syms: asym_enc_fun_dest_sig(),
+        st_rules: crate::builtin::asym_enc_dest_rules(),
+        ..MaudeSig::default()
+    }.refresh()
 }
 
 pub fn signature_dest_maude_sig() -> MaudeSig {

@@ -14,9 +14,7 @@
 //! when the answer is decidable from syntax alone, or `None` to
 //! defer to Maude.
 
-use std::collections::BTreeSet;
-
-use crate::function_symbols::{AcSym, FunSym, NoEqSym};
+use crate::function_symbols::{AcSym, FunSig, FunSym};
 use crate::lterm::LNTerm;
 use crate::maude_proc::{MaudeError, MaudeHandle};
 use crate::maude_sig::MaudeSig;
@@ -68,8 +66,8 @@ pub fn norm_subst_vfresh(
 /// symbols only). Returns `None` for cases the structural check
 /// can't decide on its own.
 pub fn nf_structural(msig: &MaudeSig, t: &LNTerm) -> Option<bool> {
-    let irreducible: BTreeSet<&FunSym> = msig.irreducible_fun_syms.iter().collect();
-    fn go(t: &LNTerm, irreducible: &BTreeSet<&FunSym>) -> Option<bool> {
+    let irreducible = &msig.irreducible_fun_syms;
+    fn go(t: &LNTerm, irreducible: &FunSig) -> Option<bool> {
         match t {
             Term::Lit(_) => Some(true),
             Term::App(sym, args) => {
@@ -94,7 +92,7 @@ pub fn nf_structural(msig: &MaudeSig, t: &LNTerm) -> Option<bool> {
             }
         }
     }
-    go(t, &irreducible)
+    go(t, irreducible)
 }
 
 /// Recognise top-level shapes that are immediately reducible by the
@@ -171,13 +169,11 @@ fn is_zero_constant(t: &LNTerm) -> bool {
 ///     patterns: return `false`
 ///   - subterm-rule LHS matches: return `false`
 ///   - else: walk subterms
-pub fn nf_via_haskell(maude: &MaudeHandle, t: &LNTerm) -> bool {
-    let msig = maude.maude_sig();
-    let irreducible: BTreeSet<&FunSym> = msig.irreducible_fun_syms.iter().collect();
-    go_nf(t, &msig, &irreducible)
+pub fn nf_via_haskell(msig: &MaudeSig, t: &LNTerm) -> bool {
+    go_nf(t, msig, &msig.irreducible_fun_syms)
 }
 
-fn go_nf(t: &LNTerm, msig: &MaudeSig, irreducible: &BTreeSet<&FunSym>) -> bool {
+fn go_nf(t: &LNTerm, msig: &MaudeSig, irreducible: &FunSig) -> bool {
     use crate::function_symbols::{
         AcSym, DH_NEUTRAL_SYM_STRING, EXP_SYM_STRING, INV_SYM_STRING, ONE_SYM_STRING,
         ZERO_SYM_STRING,
@@ -249,7 +245,7 @@ fn go_nf(t: &LNTerm, msig: &MaudeSig, irreducible: &BTreeSet<&FunSym>) -> bool {
                     }
                     // inv(mult(...)) where any factor is inverse → reducible
                     if let Term::App(FunSym::Ac(AcSym::Mult), inner_args) = &args[0] {
-                        if inner_args.iter().any(|f| is_inverse(f)) { return false; }
+                        if inner_args.iter().any(is_inverse) { return false; }
                     }
                     // inv(one) → reducible
                     if is_nullary(&args[0], ONE_SYM_STRING) { return false; }
@@ -273,13 +269,13 @@ fn go_nf(t: &LNTerm, msig: &MaudeSig, irreducible: &BTreeSet<&FunSym>) -> bool {
                         // contains one / DH_neutral, nested mult, or invalidMult → reducible
                         if args.iter().any(|a| is_nullary(a, ONE_SYM_STRING)) { return false; }
                         if args.iter().any(|a| is_nullary(a, DH_NEUTRAL_SYM_STRING)) { return false; }
-                        if args.iter().any(|a| is_product(a)) { return false; }
+                        if args.iter().any(is_product) { return false; }
                         if invalid_mult(args) { return false; }
                         return args.iter().all(|a| go_nf(a, msig, irreducible));
                     }
                     AcSym::Xor => {
                         if args.iter().any(|a| is_nullary(a, ZERO_SYM_STRING)) { return false; }
-                        if args.iter().any(|a| is_xor(a)) { return false; }
+                        if args.iter().any(is_xor) { return false; }
                         if invalid_xor(args) { return false; }
                         return args.iter().all(|a| go_nf(a, msig, irreducible));
                     }
@@ -398,7 +394,6 @@ fn rule_applies(t: &LNTerm, lhs: &LNTerm, rhs: &LNTerm) -> bool {
         &|n| crate::lterm::sort_of_name(n),
         problem,
     );
-    let _ = matched.is_some(); // placeholder
     // HS: StRhs [] s -> not (t == s) ; StRhs _ _ -> True
     // The `StRhs [] s` case (RHS is a closed constant — no LHS-positions)
     // can be detected by checking `frees(rhs).is_empty() && positions_in_lhs == 0`,
@@ -426,8 +421,8 @@ fn rule_applies(t: &LNTerm, lhs: &LNTerm, rhs: &LNTerm) -> bool {
 /// Maude callouts.
 pub fn maybe_not_nf_subterms(msig: &MaudeSig, t: &LNTerm) -> Vec<LNTerm> {
     let mut out = Vec::new();
-    let irreducible: BTreeSet<&FunSym> = msig.irreducible_fun_syms.iter().collect();
-    fn go(t: &LNTerm, irreducible: &BTreeSet<&FunSym>, out: &mut Vec<LNTerm>) {
+    let irreducible = &msig.irreducible_fun_syms;
+    fn go(t: &LNTerm, irreducible: &FunSig, out: &mut Vec<LNTerm>) {
         match t {
             Term::Lit(_) => {}
             Term::App(sym, args) => {
@@ -439,13 +434,9 @@ pub fn maybe_not_nf_subterms(msig: &MaudeSig, t: &LNTerm) -> Vec<LNTerm> {
             }
         }
     }
-    go(t, &irreducible, &mut out);
+    go(t, irreducible, &mut out);
     out
 }
-
-/// Suppress unused warnings.
-#[allow(dead_code)]
-fn _suppress(_: NoEqSym) {}
 
 #[cfg(test)]
 mod tests {
@@ -509,7 +500,7 @@ mod tests {
         );
         // Test: mult(tid, ekI, ekR, inv(tid)) should NOT be in NF
         // (invalid_mult fires because tid appears as a factor and inside inv).
-        assert!(!nf_via_haskell(&h, &mult),
+        assert!(!nf_via_haskell(&h.maude_sig(), &mult),
             "mult(tid, ekI, ekR, inv(tid)) should be non-NF");
     }
 

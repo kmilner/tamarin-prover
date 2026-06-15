@@ -87,15 +87,13 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
         let Some(t) = self.image_of(v) else { return false; };
         let Term::Lit(Lit::Var(target)) = t else { return false; };
         if target.sort != v.sort { return false; }
-        // target must not appear in any other range entry.
-        let others: Vec<VTerm<C, LVar>> = self
-            .map
+        // target must not appear in any other range entry.  Borrow each
+        // range term and scan in place (short-circuiting), avoiding the
+        // per-key clone of every other range term + `f_app_list` bundle.
+        self.map
             .iter()
             .filter(|(w, _)| *w != v)
-            .map(|(_, t)| t.clone())
-            .collect();
-        let bundle: VTerm<C, LVar> = f_app_list(others);
-        !crate::vterm::occurs_vterm(target, &bundle)
+            .all(|(_, t)| !crate::vterm::occurs_vterm(target, t))
     }
 
     /// `isRenaming`: every entry is a rename.
@@ -245,16 +243,15 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
         self.fresh_to_free_avoiding(alloc_idxs, &std::collections::BTreeSet::new())
     }
 
-    /// `freshToFreeAvoidingFast`: convert VFresh → free subst, but
-    /// PRESERVE any range var that's in `preserve` — those are live
-    /// system vars (not fresh witnesses) and renaming them would
-    /// break sharing with the rest of the system.
+    /// `freshToFreeAvoidingFast`: convert VFresh → free subst.
     ///
-    /// Mirrors Haskell `freshToFreeAvoidingFast s t` which renames
-    /// range vars via `rename ... \`evalFreshAvoiding\` t` — Haskell's
-    /// `evalFreshAvoiding` avoids vars in `t`, so the renamer simply
-    /// skips them.  Our equivalent: pass `varsRange(eq_store.subst)`
-    /// (or similar) as `preserve`.
+    /// Mirrors Haskell `freshToFreeAvoidingFast s t`, which renames
+    /// every range var unconditionally (HS has no "preserve" concept —
+    /// `evalFreshAvoiding` only seeds the fresh counter above `t`'s max
+    /// idx, it never skips a variable).  The `preserve` argument is
+    /// therefore IGNORED by default; it is only honoured under the
+    /// legacy kill-switch `TAM_RS_LEGACY_FOLD_PRESERVE` (see the
+    /// HS-faithfulness gate in the body).
     pub fn fresh_to_free_avoiding<F: FnMut(u64) -> u64>(
         &self,
         mut alloc_idxs: F,
@@ -287,13 +284,16 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
         // Substitution.hs:40-47) and renames unconditionally.
         // Kill: `TAM_RS_LEGACY_FOLD_PRESERVE=1` restores the f6a193aa
         // behaviour.
+        // Read the legacy kill-switch once and cache it: its value
+        // cannot change within a run, and this runs in the hot eq-store
+        // fold path — avoids a getenv + String allocation per call.
+        use std::sync::OnceLock;
+        static LEGACY_FOLD_PRESERVE: OnceLock<bool> = OnceLock::new();
+        let legacy = *LEGACY_FOLD_PRESERVE
+            .get_or_init(|| std::env::var("TAM_RS_LEGACY_FOLD_PRESERVE").is_ok());
         let empty_preserve = std::collections::BTreeSet::new();
         let preserve: &std::collections::BTreeSet<LVar> =
-            if std::env::var("TAM_RS_LEGACY_FOLD_PRESERVE").is_ok() {
-                preserve
-            } else {
-                &empty_preserve
-            };
+            if legacy { preserve } else { &empty_preserve };
         // HS-faithful port (Substitution.hs:54-66):
         //
         //   freshToFree subst = (`evalBindT` noBindings) $ do
@@ -366,7 +366,7 @@ fn term_size<C, V>(t: &VTerm<C, V>) -> usize {
 /// record the binding.  `outer_is_singleton_var` + `lv` together
 /// implement HS's `namehint v = if (Lit (Var _) == t) then lvarName lv
 /// else lvarName v` rule (Substitution.hs:64-66).
-fn rename_lvars_with_hint<C: Clone, F: FnMut(u64) -> u64>(
+fn rename_lvars_with_hint<C: Ord + Clone, F: FnMut(u64) -> u64>(
     t: &VTerm<C, LVar>,
     rename: &mut BTreeMap<LVar, LVar>,
     preserve: &std::collections::BTreeSet<LVar>,
@@ -400,7 +400,16 @@ fn rename_lvars_with_hint<C: Clone, F: FnMut(u64) -> u64>(
                 .map(|a| rename_lvars_with_hint(a, rename, preserve, alloc_idxs,
                     outer_is_singleton_var, lv))
                 .collect();
-            Term::App(f.clone(), new_args.into())
+            // Route through the smart constructor so AC/C argument lists
+            // are re-sorted: freshToFree allocates a brand-new, non-
+            // monotone idx per range var, so children that were sorted
+            // under the old vars are no longer canonical under the new
+            // ones.  HS does the same via `mapFrees (Arbitrary _)
+            // (FApp o l) = fApp o <$> ...` (LTerm.hs).  (The sibling
+            // `rename_lvars_in_vterm` stays raw — it mirrors HS's
+            // Monotone `unsafefApp` path under a uniform, order-
+            // preserving shift, where re-sorting is unnecessary.)
+            crate::term::f_app(f.clone(), new_args)
         }
     }
 }

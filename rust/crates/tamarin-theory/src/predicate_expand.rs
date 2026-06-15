@@ -113,17 +113,10 @@ fn expand(
             Box::new(expand(a, preds, subst)?),
             Box::new(expand(b, preds, subst)?),
         )),
-        p::Formula::Forall(vs, body) => {
-            // Drop any subst entries that this binder shadows.
-            let new_subst = strip_shadowed(subst, vs);
-            Ok(p::Formula::Forall(vs.clone(),
-                Box::new(expand(body, preds, &new_subst)?)))
-        }
-        p::Formula::Exists(vs, body) => {
-            let new_subst = strip_shadowed(subst, vs);
-            Ok(p::Formula::Exists(vs.clone(),
-                Box::new(expand(body, preds, &new_subst)?)))
-        }
+        p::Formula::Forall(vs, body) =>
+            expand_quantified(vs, body, preds, subst, p::Formula::Forall),
+        p::Formula::Exists(vs, body) =>
+            expand_quantified(vs, body, preds, subst, p::Formula::Exists),
     }
 }
 
@@ -131,6 +124,116 @@ fn strip_shadowed(subst: &Subst, vs: &[p::VarSpec]) -> Subst {
     let mut out = subst.clone();
     for v in vs { out.map.remove(&v.name); }
     out
+}
+
+/// Expand the body of a quantifier, applying CAPTURE-AVOIDING
+/// substitution.  Haskell's `expandFormula` works over De-Bruijn-indexed
+/// formulas and shifts use-site terms past the body's binders
+/// (`compSubst`, Predicate.hs), so a substituted variable can never be
+/// captured by an inner quantifier.  Our parser AST is name-based, so we
+/// emulate that: when a binder's name also occurs in the RANGE of the
+/// active substitution, that binder would capture the substituted
+/// variable — so we alpha-rename the binder to a fresh name first (by
+/// adding `binder → fresh` to the subst used for the body, which the
+/// normal name-substitution then applies, respecting inner shadowing via
+/// `strip_shadowed`).
+fn expand_quantified(
+    vs: &[p::VarSpec],
+    body: &p::Formula,
+    preds: &[p::Predicate],
+    subst: &Subst,
+    make: fn(Vec<p::VarSpec>, Box<p::Formula>) -> p::Formula,
+) -> Result<p::Formula, ExpandError> {
+    let new_subst = strip_shadowed(subst, vs);
+    let capture = subst_range_vars(&new_subst);
+    // Fast path: no binder collides with a substituted variable.
+    if !vs.iter().any(|v| capture.contains(&v.name)) {
+        return Ok(make(vs.to_vec(), Box::new(expand(body, preds, &new_subst)?)));
+    }
+    // Alpha-rename the colliding binders to fresh names.
+    let mut avoid = capture.clone();
+    collect_formula_vars(body, &mut avoid);
+    for v in vs { avoid.insert(v.name.clone()); }
+    let mut new_vs = vs.to_vec();
+    let mut body_subst = new_subst;
+    for v in new_vs.iter_mut() {
+        if capture.contains(&v.name) {
+            let fresh = fresh_name(&v.name, &avoid);
+            avoid.insert(fresh.clone());
+            let mut fv = v.clone();
+            fv.name = fresh.clone();
+            body_subst.map.insert(v.name.clone(), p::Term::Var(fv));
+            v.name = fresh;
+        }
+    }
+    Ok(make(new_vs, Box::new(expand(body, preds, &body_subst)?)))
+}
+
+/// Variable names occurring in the RANGE (values) of a substitution —
+/// the variables at risk of capture by a binder of the same name.
+fn subst_range_vars(subst: &Subst) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for v in subst.map.values() { collect_term_vars(v, &mut out); }
+    out
+}
+
+/// A variant of `base` (e.g. `z` → `z1`) not present in `avoid`.
+fn fresh_name(base: &str, avoid: &std::collections::BTreeSet<String>) -> String {
+    let mut n = 1u64;
+    loop {
+        let cand = format!("{}{}", base, n);
+        if !avoid.contains(&cand) { return cand; }
+        n += 1;
+    }
+}
+
+fn collect_term_vars(t: &p::Term, out: &mut std::collections::BTreeSet<String>) {
+    match t {
+        p::Term::Var(v) => { out.insert(v.name.clone()); }
+        p::Term::App(_, args) | p::Term::Pair(args) =>
+            args.iter().for_each(|a| collect_term_vars(a, out)),
+        p::Term::AlgApp(_, a, b) | p::Term::Diff(a, b) | p::Term::BinOp(_, a, b) => {
+            collect_term_vars(a, out);
+            collect_term_vars(b, out);
+        }
+        p::Term::PatMatch(inner) => collect_term_vars(inner, out),
+        _ => {}
+    }
+}
+
+fn collect_atom_vars(a: &p::Atom, out: &mut std::collections::BTreeSet<String>) {
+    match a {
+        p::Atom::Pred(fact) => fact.args.iter().for_each(|t| collect_term_vars(t, out)),
+        p::Atom::Eq(s, t) | p::Atom::Less(s, t)
+        | p::Atom::LessMset(s, t) | p::Atom::Subterm(s, t) => {
+            collect_term_vars(s, out);
+            collect_term_vars(t, out);
+        }
+        p::Atom::Action(fact, t) => {
+            fact.args.iter().for_each(|a| collect_term_vars(a, out));
+            collect_term_vars(t, out);
+        }
+        p::Atom::Last(t) => collect_term_vars(t, out),
+    }
+}
+
+/// Every variable name (free or bound) anywhere in a formula — used as
+/// the avoid-set when minting fresh binder names.
+fn collect_formula_vars(f: &p::Formula, out: &mut std::collections::BTreeSet<String>) {
+    match f {
+        p::Formula::True | p::Formula::False => {}
+        p::Formula::Atom(a) => collect_atom_vars(a, out),
+        p::Formula::Not(g) => collect_formula_vars(g, out),
+        p::Formula::And(a, b) | p::Formula::Or(a, b)
+        | p::Formula::Implies(a, b) | p::Formula::Iff(a, b) => {
+            collect_formula_vars(a, out);
+            collect_formula_vars(b, out);
+        }
+        p::Formula::Forall(vs, b) | p::Formula::Exists(vs, b) => {
+            for v in vs { out.insert(v.name.clone()); }
+            collect_formula_vars(b, out);
+        }
+    }
 }
 
 fn expand_atom(
@@ -176,9 +279,20 @@ fn expand_atom(
                     // No matching predicate. If it's the builtin `Smaller`,
                     // expand it inline (a hard-coded multiset less-than).
                     if fact.name.eq_ignore_ascii_case("smaller") && sub_args.len() == 2 {
-                        // Smaller(x, y) <=> ∃ z. y = x + z
+                        // Smaller(x, y) <=> ∃ z. y = x + z.  Pick `z`'s
+                        // name capture-avoidingly: a use-site arg may
+                        // itself mention `z`, which the bound `z` would
+                        // otherwise capture.
+                        let mut avoid = std::collections::BTreeSet::new();
+                        collect_term_vars(&sub_args[0], &mut avoid);
+                        collect_term_vars(&sub_args[1], &mut avoid);
+                        let zname = if avoid.contains("z") {
+                            fresh_name("z", &avoid)
+                        } else {
+                            "z".to_string()
+                        };
                         let z = p::VarSpec {
-                            name: "z".to_string(),
+                            name: zname,
                             idx: 0,
                             sort: p::SortHint::Untagged,
                             typ: None,
@@ -283,6 +397,31 @@ mod tests {
         // — actually as a Pred. So expansion fails because there's no
         // such predicate.
         assert!(res.is_err(), "got {:?}", res);
+    }
+
+    #[test]
+    fn expand_avoids_variable_capture() {
+        // P(x) <=> Ex z #i. Act(x, z) @ #i.  Applying it at use-site P(z)
+        // (free z) must NOT let the body's `Ex z` capture the substituted
+        // z: the binder is alpha-renamed, so no surviving quantifier binds
+        // `z`.  (Without capture-avoidance the body became Act(z, z).)
+        let preds = pred("P(x) <=> Ex z #i. Act(x, z) @ #i");
+        let f = parse_formula_str("P(z)").unwrap();
+        let expanded = expand_formula(&f, &preds).unwrap();
+        assert!(!binds_var_named(&expanded, "z"),
+            "variable capture: a quantifier still binds `z`: {:?}", expanded);
+    }
+
+    fn binds_var_named(f: &p::Formula, name: &str) -> bool {
+        match f {
+            p::Formula::True | p::Formula::False | p::Formula::Atom(_) => false,
+            p::Formula::Not(g) => binds_var_named(g, name),
+            p::Formula::And(a, b) | p::Formula::Or(a, b)
+            | p::Formula::Implies(a, b) | p::Formula::Iff(a, b) =>
+                binds_var_named(a, name) || binds_var_named(b, name),
+            p::Formula::Forall(vs, b) | p::Formula::Exists(vs, b) =>
+                vs.iter().any(|v| v.name == name) || binds_var_named(b, name),
+        }
     }
 
     fn has_pred_atom(f: &p::Formula) -> bool {

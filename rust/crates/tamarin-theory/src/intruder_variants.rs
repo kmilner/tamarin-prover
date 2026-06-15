@@ -185,7 +185,7 @@ fn ast_rule_to_intr_rule_ac(r: &p::Rule) -> Result<IntrRuleAC, String> {
     // HS `intrInfo` rejects non-c/d-prefixed names.  Mirror that here.
     let bytes = r.name.as_bytes();
     if bytes.is_empty() {
-        return Err(format!("empty intruder rule name"));
+        return Err("empty intruder rule name".to_string());
     }
     let (kind, rest) = (bytes[0], &bytes[1..]);
     let info: IntrRuleACInfo = match kind {
@@ -239,13 +239,14 @@ fn ast_rule_to_intr_rule_ac(r: &p::Rule) -> Result<IntrRuleAC, String> {
     // HS `newVariables ps cs` — variables that appear in conclusions
     // but not premises.  The intruder-rule `.spthy` files don't have
     // any (all RHS vars are LHS vars), but compute it faithfully for
-    // robustness.  HS reference: Theory.Tools.Rule.newVariables.
+    // robustness.  HS reference: Theory.Model.Fact.newVariables
+    // (lib/theory/src/Theory/Model/Fact.hs:494).
     let new_vars = compute_new_vars(&prems, &concs);
 
     Ok(Rule::new(info, prems, concs, acts).with_new_vars(new_vars))
 }
 
-/// Mirrors HS `newVariables` (`lib/theory/src/Theory/Tools/Rule.hs`):
+/// Mirrors HS `newVariables` (`lib/theory/src/Theory/Model/Fact.hs:494`):
 /// the set of variables in `conclusions` that are not in `premises`,
 /// returned in deterministic order.
 fn compute_new_vars(
@@ -294,7 +295,7 @@ mod tests {
     /// The cached DH file is documented to contain exactly 51 rules:
     /// 5 constructors (`c_exp`, `c_inv`, `c_one`, `c_DH_neutral`, `c_mult`)
     /// + 45 `d_exp` destructor variants + 1 `d_inv` destructor variant.
-    /// `grep -c "^rule " data/intruder_variants_dh.spthy` = 51.
+    ///   `grep -c "^rule " data/intruder_variants_dh.spthy` = 51.
     #[test]
     fn dh_variants_file_parses_to_51_rules() {
         let rules = mk_dh_intruder_variants(&dh_maude_sig());
@@ -362,9 +363,9 @@ mod tests {
                     "DestrRule limit must be 0 (HS Rule.hs:168 `fromIntegral limit` \
                      with `option 0 natural` and no numeric in the cached file); \
                      got {}", limit);
-                assert_eq!(*subterm, true,
+                assert!(*subterm,
                     "DestrRule subterm must be True (HS Rule.hs:168 hard-codes True)");
-                assert_eq!(*constant, false,
+                assert!(!(*constant),
                     "DestrRule constant must be False (HS Rule.hs:168 hard-codes False)");
                 // Names in the DH file: only `_exp` and `_inv`.
                 assert!(name == b"_exp" || name == b"_inv",

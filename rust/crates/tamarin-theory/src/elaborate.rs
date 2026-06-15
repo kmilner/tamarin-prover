@@ -12,8 +12,9 @@
 //! - `functions:` → `st_fun_syms` extension
 //! - `equations:` → recorded as `CtxtStRule`s when convertible
 //! - Rules — `parser::Rule` → `OpenProtoRule(ProtoRuleE, [])`
-//! - Lemmas — passthrough; the formula is kept as parser AST until
-//!   we port `formulaToGuarded`
+//! - Lemmas — passthrough; the formula is intentionally retained as
+//!   parser AST, with guarded conversion done lazily via
+//!   `formula_to_guarded`
 //! - Restrictions — passthrough as `OpenRestriction`
 //! - Predicates, macros, formal comments — copied verbatim
 //!
@@ -41,7 +42,7 @@ thread_local! {
     /// `functions: PRF/1` would reach Maude as a 3-arg call, which
     /// Maude silently rejects, and our `reduce` loop spins forever.
     static USER_UNARY_FUNS: RefCell<BTreeSet<String>>
-        = RefCell::new(BTreeSet::new());
+        = const { RefCell::new(BTreeSet::new()) };
 
     /// Names of nullary (0-arity) function symbols available in the
     /// theory currently being elaborated.  Set by `elaborate()` from
@@ -58,7 +59,7 @@ thread_local! {
     /// eq-store — undermining the signing builtin's semantics and
     /// causing TLS_Handshake-class lemmas to be wrong-falsified.
     static USER_NULLARY_FUNS: RefCell<BTreeSet<String>>
-        = RefCell::new(BTreeSet::new());
+        = const { RefCell::new(BTreeSet::new()) };
 
     /// Names of user-declared function symbols marked `private`.
     /// Populated from `FunctionDecl.private` across all arities.  Read
@@ -68,7 +69,7 @@ thread_local! {
     /// filtered by `is_nullary_public_function` (because we say
     /// Public), causing `is_finished` to incorrectly report Solved.
     static USER_PRIVATE_FUNS: RefCell<BTreeSet<String>>
-        = RefCell::new(BTreeSet::new());
+        = const { RefCell::new(BTreeSet::new()) };
 }
 use tamarin_term::term::{f_app_no_eq, Term};
 use tamarin_term::lterm::{Name, NameTag};
@@ -76,13 +77,13 @@ use tamarin_term::vterm::Lit;
 use tamarin_term::maude_sig::{
     asym_enc_dest_maude_sig, asym_enc_maude_sig, bp_maude_sig, dh_maude_sig,
     enable_diff_maude_sig, hash_maude_sig, location_report_maude_sig,
-    mset_maude_sig, nat_maude_sig, pair_maude_sig,
+    mset_maude_sig, nat_maude_sig, pair_dest_maude_sig,
     reveal_signature_maude_sig, signature_dest_maude_sig, signature_maude_sig,
     sym_enc_dest_maude_sig, sym_enc_maude_sig, xor_maude_sig, MaudeSig,
 };
 
 use crate::rule::{
-    ConcIdx, PremIdx, ProtoRuleE, ProtoRuleEInfo, ProtoRuleName,
+    ProtoRuleE, ProtoRuleEInfo, ProtoRuleName,
     Rule, RuleAttributes,
 };
 use crate::signature::SignaturePure;
@@ -210,7 +211,7 @@ pub fn check_guarded_wf(parser_thy: &p::Theory) -> Vec<tamarin_parser::wf::WfErr
         // or the full formula if no sub-formula was tracked — which
         // matches HS's `ppFormula fmOrig` for the top-level case).
         let sub_formula_text = e.subject_formula.as_ref()
-            .map(|f| pretty_formula(f))
+            .map(pretty_formula)
             .unwrap_or_else(|| full_formula_text.clone());
 
         // Build the HS-faithful message block.
@@ -386,8 +387,8 @@ impl UserUnaryFunsGuard {
     fn set(new: BTreeSet<String>) -> Self {
         let previous = USER_UNARY_FUNS.with(|c| {
             let mut b = c.borrow_mut();
-            let prev = std::mem::replace(&mut *b, new);
-            prev
+            
+            std::mem::replace(&mut *b, new)
         });
         UserUnaryFunsGuard { previous }
     }
@@ -783,7 +784,6 @@ fn rule_to_proto_rule_e(r: &p::Rule) -> Result<ProtoRuleE, ElabError> {
     let concs = r_eff.conclusions.iter().map(fact_to_lnfact)
         .collect::<Result<Vec<_>, _>>()?;
     let new_vars = compute_new_vars(&prems, &concs, &acts);
-    let _ = (std::marker::PhantomData::<PremIdx>, std::marker::PhantomData::<ConcIdx>);
 
     Ok(Rule::new(info, prems, concs, acts).with_new_vars(new_vars))
 }
@@ -792,9 +792,9 @@ fn rule_to_proto_rule_e(r: &p::Rule) -> Result<ProtoRuleE, ElabError> {
 /// substituting each binding's RHS for occurrences of the LHS in the
 /// body (premises, actions, conclusions, embedded restrictions).
 ///
-/// HS `letBlock` (Parser/Let.hs:34): `toSubst = foldr1 compose . map
+/// HS `letBlock` (Parser/Let.hs): `toSubst = foldr1 compose . map
 /// (substFromList . return)` with `compose s1 s2` = "apply s2 first,
-/// then s1" (SubstVFree.hs:188-194).  `foldr1 compose [b1..bn]` is
+/// then s1" (SubstVFree.hs).  `foldr1 compose [b1..bn]` is
 /// therefore equivalent to applying each binding as a SINGLETON
 /// substitution sequentially in REVERSE binding order ("bottom-up
 /// application semantics", Let.hs:22).  Consequences:
@@ -991,7 +991,6 @@ fn sort_of(s: &p::SortHint) -> LSort {
     }
 }
 
-/// Best-effort conversion of a parser term to an `LNTerm`. Returns
 /// Convert an `LNTerm` back to a parser-AST term. Used when we
 /// need to translate Maude-produced substitutions back into the
 /// parser-AST world (e.g. for `insert_implied_formulas`).
@@ -1040,6 +1039,27 @@ pub fn lnterm_to_term(t: &tamarin_term::lterm::LNTerm) -> p::Term {
                             other => flat.push(other.clone()),
                         }
                         p::Term::Pair(flat)
+                    } else if name == "exp" && parser_args.len() == 2 {
+                        // Round-trip the `exp` NoEq head back to parser
+                        // `BinOp(Exp, ..)` (the inverse of `term_to_lnterm`'s
+                        // `p::BinOp::Exp` arm at elaborate.rs:1467-1470).
+                        // HS `viewTerm` exposes `exp(b,e)` as
+                        // `FApp (NoEq s) [t1,t2] | s == expSym`, and
+                        // `prettyTerm` (Term/Term.hs:274) renders that arm as
+                        // `ppTerm t1 <> text "^" <> ppTerm t2` — infix `b^e`,
+                        // uniformly at every nesting depth (the printer is
+                        // recursive).  Without this round-trip the runtime
+                        // exp term reaches the formula/guard term path as a
+                        // generic `App("exp", [..])`, which `term_to_doc`/
+                        // `pp_term` render PREFIX `exp(b, e)` — diverging from
+                        // HS for every exp nested inside a multiset/pair/
+                        // equation in a guard or contradiction (e.g.
+                        // DHKEA_NAXOS `eCK_key_secrecy`).  Same NoEq
+                        // round-trip rationale as the AC/`em` arms above.
+                        let mut iter = parser_args.into_iter();
+                        let base = iter.next().unwrap();
+                        let exponent = iter.next().unwrap();
+                        p::Term::BinOp(p::BinOp::Exp, Box::new(base), Box::new(exponent))
                     } else {
                         p::Term::App(name, parser_args)
                     }
@@ -1140,9 +1160,6 @@ pub fn lnterm_to_term(t: &tamarin_term::lterm::LNTerm) -> p::Term {
     }
 }
 
-/// `None` on constructs we can't yet round-trip (e.g. `PatMatch`,
-/// algebraic-app `f{a}b` without enough context for proper sigil
-/// inference).
 /// AC-canonicalise a parser-AST term: for every `BinOp(op, l, r)` where op
 /// is AC (Mult/Union/Xor/NatPlus), flatten the chain into the full
 /// multiset, sort it (via the existing `cmp_term` for GTerm — we convert
@@ -1499,7 +1516,7 @@ fn builtin_sig(name: &str) -> Option<MaudeSig> {
         "dest-symmetric-encryption" => Some(sym_enc_dest_maude_sig()),
         "dest-asymmetric-encryption" => Some(asym_enc_dest_maude_sig()),
         "dest-signing" => Some(signature_dest_maude_sig()),
-        "dest-pairing" => Some(pair_maude_sig()), // pair-with-destructors
+        "dest-pairing" => Some(pair_dest_maude_sig()), // pair-with-destructors
         _ => None,
     }
 }

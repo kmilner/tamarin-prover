@@ -34,8 +34,11 @@ pub enum EvaluationStyle { Silent, Summary, Tracing }
 /// - `state_facts`: project the state to a fact list.
 /// - `rules`: the rules to refine.
 ///
-/// Returns the sequence of `(state, refined_rules)` pairs produced
-/// until the state stops changing.
+/// Unimplemented stub: rather than iterating `refineRule` to a
+/// fixpoint, it seeds the state with empty-term In/Fresh facts (HS
+/// uses `inFact (varTerm z)` / `freshFact (varTerm z)`) and returns a
+/// single `(state, rules)` pair with the rules passed through
+/// unrefined. Revisit when typed-rule unification is ported.
 pub fn interpret_abstractly<S, R, U, AddF, GetF>(
     _unify_fact_eqs: U,
     init_state: S,

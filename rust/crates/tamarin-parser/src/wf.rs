@@ -52,14 +52,19 @@ pub type WfReport = Vec<WfError>;
 /// can be compared directly against `tamarin-prover`'s output.
 pub fn check_theory(thy: &Theory) -> WfReport {
     // Mirrors HS `Theory.Tools.Wellformedness.checkWellformedness`
-    // (Wellformedness.hs:1270-1287) — same execution order so the
-    // emitted warning groups appear in the same order in `tamarin-prover
-    // --prove` output.
+    // (Wellformedness.hs:1270-1287).  The order here is close but NOT
+    // identical: HS's `ruleSortsReport` (the "Variable with mismatching
+    // sorts" / sort-clash check) runs before factReports, whereas we run
+    // it later inside `formula_terms_report`; and `left_right_rule_report`
+    // (the diff-only Left/Right check) is interleaved here rather than
+    // appearing where HS places `leftRightRuleReportDiff`.
     let mut report = Vec::new();
     report.extend(unbound_report(thy));
     report.extend(fresh_names_report(thy));
     report.extend(public_names_report(thy));
-    report.extend(left_right_rule_report(thy));    // ruleSortsReport
+    report.extend(left_right_rule_report(thy));    // leftRightRuleReportDiff (diff only)
+    // HS `ruleSortsReport` (sortsClashCheck) is ported as
+    // `variable_sort_clashes`, run later via `formula_terms_report`.
     // ruleVariantsReport — not ported (needs MaudeHandle + variant solver).
     // factReports group:
     report.extend(reserved_report(thy));
@@ -110,7 +115,7 @@ pub fn topics(report: &WfReport) -> BTreeSet<String> {
 ///   - Otherwise: for each name in `lemma_names`, it "corresponds" if
 ///     • there is a theory lemma whose name equals it exactly, OR
 ///     • the name ends with `*` and its prefix is a prefix of at least
-///       one theory-lemma name.
+///     one theory-lemma name.
 ///     Names that don't correspond are collected; if any exist the WF
 ///     check fires.
 pub fn check_if_lemmas_in_theory(lemma_names: &[String], thy: &Theory) -> WfReport {
@@ -199,7 +204,7 @@ fn arg_matches_any_lemma(arg: &str, theory_lemmas: &[&str]) -> bool {
     if let Some(prefix) = arg.strip_suffix('*') {
         theory_lemmas.iter().any(|n| n.starts_with(prefix))
     } else {
-        theory_lemmas.iter().any(|n| *n == arg)
+        theory_lemmas.contains(&arg)
     }
 }
 
@@ -222,14 +227,6 @@ fn theory_rules(thy: &Theory) -> Vec<&Rule> {
 fn theory_lemmas(thy: &Theory) -> Vec<&Lemma> {
     thy.items.iter().filter_map(|it| match it {
         TheoryItem::Lemma(l) => Some(l),
-        _ => None,
-    }).collect()
-}
-
-#[allow(dead_code)]
-fn theory_restrictions(thy: &Theory) -> Vec<&Restriction> {
-    thy.items.iter().filter_map(|it| match it {
-        TheoryItem::Restriction(r) | TheoryItem::LegacyAxiom(r) => Some(r),
         _ => None,
     }).collect()
 }
@@ -766,7 +763,6 @@ pub fn fresh_fact_arguments(thy: &Theory) -> WfReport {
 
 #[derive(Debug, Clone)]
 struct FactObservation {
-    #[allow(dead_code)]
     rule_name: String,
     name: String,
     arity: usize,
@@ -1001,24 +997,22 @@ pub fn fresh_names_report(thy: &Theory) -> WfReport {
 // =============================================================================
 
 pub fn public_names_report(thy: &Theory) -> WfReport {
-    let mut all: Vec<(String, String)> = Vec::new(); // (rule_name, pub_name)
+    let mut by_lower: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for r in theory_rules(thy) {
         let mut names = Vec::new();
         for t in rule_terms(r) {
             term_name_lits(t, &mut names);
         }
         for (k, n) in names {
-            if k == NameKind::Pub { all.push((r.name.clone(), n)); }
+            if k == NameKind::Pub {
+                by_lower.entry(n.to_lowercase()).or_default().insert(n);
+            }
         }
-    }
-    let mut by_lower: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for (_ru, n) in &all {
-        by_lower.entry(n.to_lowercase()).or_default().insert(n.clone());
     }
     let mut out = Vec::new();
     for (_lower, set) in by_lower.iter().filter(|(_, s)| s.len() > 1) {
-        let mut names: Vec<&String> = set.iter().collect();
-        names.sort();
+        // `set` is a `BTreeSet`, so iteration is already sorted.
+        let names: Vec<&String> = set.iter().collect();
         out.push(WfError::new(
             "Public constants with mismatching capitalization",
             format!("clashing public-name capitalizations: {}",
@@ -1106,23 +1100,42 @@ fn collect_rule_unbound_vars(r: &Rule, nullary_funs: &BTreeSet<String>) -> Vec<V
 }
 
 pub fn unbound_report(thy: &Theory) -> WfReport {
-    let mut out = Vec::new();
+    // HS `unboundReport` (Wellformedness.hs:514-519) produces one `WfError`
+    // PER offending rule, all sharing the topic "Unbound variables".  The
+    // WARNING count printed in the summary is `length rep` (Batch.hs:245),
+    // i.e. the number of these un-grouped entries — so we must emit one
+    // entry per rule, NOT a single aggregated block.
+    //
+    // The renderer `prettyWfErrorReport` (Wellformedness.hs:118-125) then
+    // `groupOn`s by topic and lays each group out as
+    //   `text topic $-$ (nest 2 . vcat . intersperse (text "") $ map snd errs)`.
+    // i.e. the underlineTopic header is emitted ONCE for the group, the
+    // per-rule bodies are indented by 2 spaces and separated by a 2-space
+    // blank line.  Each body is `text info $-$ nest 2 (prettyVarList vars)`
+    // (Wellformedness.hs:497-498), so the `rule ... has unbound variables:`
+    // line gets 2 spaces and the variable list 2+2 = 4 spaces.  RS's
+    // `format_wf_block` applies that group-level header + 2-space layout
+    // (see below); each entry here carries ONLY its body (`snd err`).
     let nullary_funs = collect_nullary_fun_names(thy);
+    let mut out = Vec::new();
     for r in theory_rules(thy) {
         let unbound = collect_rule_unbound_vars(r, &nullary_funs);
         if !unbound.is_empty() {
+            // HS `prettyVarList = fsep . punctuate comma . map prettyLVar`
+            // (TheoryObject.hs:815-816): comma-separated, word-wrapped.  The
+            // sibling `reservedFactNameRules` block renders its list the
+            // same way; we comma-join at the 4-space inner `nest 2` indent
+            // (variable lists are short, so the fsep wrap never triggers in
+            // practice — identical bytes to HS for the common case).
             let names: Vec<String> = unbound.iter()
                 .map(render_var)
                 .collect();
-            // HS format: `rule `R' has unbound variables: \n    v1\n    v2\n...`
-            // (Wellformedness.hs:493-510, `prettyVarList`).  One var
-            // per indented line.
-            let var_lines: String = names.iter()
-                .map(|n| format!("    {}", n))
-                .collect::<Vec<_>>()
-                .join("\n");
-            out.push(WfError::new("Unbound variables",
-                format!("rule `{}' has unbound variables: \n{}", r.name, var_lines)));
+            // Body only: `  rule `{name}' has unbound variables: ` (2-space
+            // ppTopic nest, trailing space from HS's `info`) then the
+            // variable list at 4 spaces.  format_wf_block adds the header.
+            out.push(WfError::new("Unbound variables", format!(
+                "  rule `{}' has unbound variables: \n    {}",
+                r.name, names.join(", "))));
         }
     }
     out

@@ -12,3 +12,6 @@ tamarin-utils = { workspace = true }
 tamarin-term = { workspace = true }
 tamarin-theory = { workspace = true }
 tamarin-sapic = { workspace = true }
+
+[lints]
+workspace = true

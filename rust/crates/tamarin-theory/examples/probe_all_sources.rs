@@ -23,8 +23,9 @@ fn main() {
             Goal::Premise(_, fa) => format!("Premise({:?}, terms={:?})", fa.tag, fa.terms),
             other => format!("{:?}", other),
         };
-        println!("[{}] cdGoal={} -> {} cases:", idx, goal_str, src.cases.len());
-        for (n, sys) in &src.cases {
+        let cases = src.cases(&ctx);
+        println!("[{}] cdGoal={} -> {} cases:", idx, goal_str, cases.len());
+        for (n, sys) in &cases {
             if let Some(ref c) = only_case { if c != n { continue; } }
             println!("    --- case: {} ---", n);
             println!("    nodes: {}", sys.nodes.len());

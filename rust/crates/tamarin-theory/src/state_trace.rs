@@ -3,9 +3,10 @@
 //! Emitting a one-line summary at each major solver event lets us
 //! diff two proof runs (Haskell's `tamarin-prover` vs our Rust port)
 //! side-by-side and localize where the two diverge.  Format is
-//! deliberately compact and stable; the Haskell side emits exactly
-//! the same lines (see the patched `Theory.Constraint.Solver.Sources`
-//! and `Theory.Constraint.Solver.Goals` modules).
+//! deliberately compact and stable; matching it against an equivalently
+//! instrumented Haskell tree (the `Theory.Constraint.Solver.Sources`
+//! and `Theory.Constraint.Solver.Goals` modules) lets the two traces be
+//! compared line-by-line.
 //!
 //! ## Usage
 //!
@@ -23,13 +24,21 @@
 //!
 //! ## Format
 //!
-//! One event per line:
+//! One event per line, bracketed:
 //!
 //! ```text
-//! TRACE@<step> <op> goal=<goal_summary> sys=<fingerprint>
+//! [STATE path=<path> step=<step> op=<op> goal=<goal_summary> <fingerprint>]
+//! ```
+//!
+//! Case-selection points (`emit_case`) add a `case=<name>` field after
+//! `op=`:
+//!
+//! ```text
+//! [STATE path=<path> step=<step> op=<op> case=<name> goal=<goal_summary> <fingerprint>]
 //! ```
 //!
 //! Fields:
+//! - `<path>`: the current case path (see `solver::trace`).
 //! - `<step>`: monotonically-increasing per-session counter (so
 //!   side-by-side line `N` of the two traces are comparable when the
 //!   first divergence is at step `N`).
@@ -48,8 +57,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static STEP: AtomicU64 = AtomicU64::new(0);
 
 /// Whether tracing is enabled (env var `TAM_TRACE_STATE` set).
+/// `emit`/`emit_case` call this from solver inner loops (thousands of
+/// times per proof), so cache the read once per process behind a
+/// `OnceLock<bool>` — the disabled-path emit calls then stay free.
 pub fn enabled() -> bool {
-    std::env::var("TAM_TRACE_STATE").is_ok()
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_TRACE_STATE").is_ok())
 }
 
 /// Compact one-line summary of a `System`'s shape.  Matches
@@ -172,7 +185,8 @@ fn next_step() -> u64 {
 
 /// Whether full goal/formula dumps are enabled (`TAM_TRACE_DUMP=1`).
 fn dump_enabled() -> bool {
-    std::env::var("TAM_TRACE_DUMP").is_ok()
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_TRACE_DUMP").is_ok())
 }
 
 /// Dump system goals and formulas to stderr — useful when fingerprint
@@ -190,12 +204,9 @@ fn dump_sys(sys: &crate::constraint::system::System) {
     for (id, rule) in sys.nodes.iter() {
         eprintln!("    {}:{} prems=[{}] concs=[{}] acts=[{}]",
             id.name, id.idx,
-            rule.premises.iter().map(|p| format!("{}",
-                state_trace_fact_brief(p))).collect::<Vec<_>>().join(","),
-            rule.conclusions.iter().map(|c| format!("{}",
-                state_trace_fact_brief(c))).collect::<Vec<_>>().join(","),
-            rule.actions.iter().map(|a| format!("{}",
-                state_trace_fact_brief(a))).collect::<Vec<_>>().join(","));
+            rule.premises.iter().map(|p| state_trace_fact_brief(p).to_string()).collect::<Vec<_>>().join(","),
+            rule.conclusions.iter().map(|c| state_trace_fact_brief(c).to_string()).collect::<Vec<_>>().join(","),
+            rule.actions.iter().map(|a| state_trace_fact_brief(a).to_string()).collect::<Vec<_>>().join(","));
     }
     eprintln!("  edges: {}", sys.edges.len());
 }

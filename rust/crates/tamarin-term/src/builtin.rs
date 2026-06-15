@@ -2,8 +2,13 @@
 //! `lib/term/src/Term/Builtin/`.
 //!
 //! Predefined function symbols, smart constructors, and rewrite-rule sets
-//! for the prover's built-in equational theories (DH, BP, XOR, multiset,
-//! pair, encryption, signatures, hashing, location reports).
+//! for the prover's built-in equational theories. Function symbols and
+//! signatures cover DH, BP, XOR, multiset, pair, encryption, signatures,
+//! hashing, and location reports; rewrite-rule sets are ported for DH, BP,
+//! XOR, multiset, pair, encryption, and signatures. The `Rules.hs`
+//! destructor / location sets are ported too: `location_report_rules`,
+//! `pair_dest_rules` (covering the `fstDestRule`/`sndDestRule` shapes),
+//! `sym_enc_dest_rules`, and `asym_enc_dest_rules`.
 
 use std::collections::BTreeSet;
 
@@ -279,6 +284,29 @@ pub fn pair_rules() -> BTreeSet<crate::subterm_rule::CtxtStRule> {
     s
 }
 
+/// `pairDestRules` (Rules.hs:115): the DESTRUCTOR variant of
+/// `pair_rules`, used by the `dest-pairing` builtin.  Same rewrite
+/// shapes as `fstRule`/`sndRule` but rooted at the destructor symbols:
+/// `fstDest(pair(x1,x2)) = x1` (`fstDestRule`) and
+/// `sndDest(pair(x1,x2)) = x2` (`sndDestRule`).
+pub fn pair_dest_rules() -> BTreeSet<crate::subterm_rule::CtxtStRule> {
+    use crate::subterm_rule::{CtxtStRule, StRhs};
+    let x1 = msg_var("x", 1);
+    let x2 = msg_var("x", 2);
+    let mut s = BTreeSet::new();
+    s.insert(CtxtStRule::new(
+        f_app_no_eq(crate::function_symbols::fst_dest_sym(),
+                    vec![pair(x1.clone(), x2.clone())]),
+        StRhs { positions: vec![vec![0, 0]], term: x1.clone() },
+    ));
+    s.insert(CtxtStRule::new(
+        f_app_no_eq(crate::function_symbols::snd_dest_sym(),
+                    vec![pair(x1.clone(), x2.clone())]),
+        StRhs { positions: vec![vec![0, 1]], term: x2 },
+    ));
+    s
+}
+
 /// `symEncRules`: `sdec(senc(x, y), y) = x`.
 pub fn sym_enc_rules() -> BTreeSet<crate::subterm_rule::CtxtStRule> {
     use crate::subterm_rule::{CtxtStRule, StRhs};
@@ -315,6 +343,56 @@ pub fn signature_rules() -> BTreeSet<crate::subterm_rule::CtxtStRule> {
     s.insert(CtxtStRule::new(
         verify(sign(x1.clone(), x2.clone()), x1, pk(x2)),
         StRhs { positions: vec![vec![0, 0]], term: true_term },
+    ));
+    s
+}
+
+/// `locationReportRules` (Rules.hs:112-114): `check_rep(rep(x1,x2), x2) = x1`
+/// and `get_rep(rep(x1,x2)) = x1`.  Used by the `locations-report` builtin.
+pub fn location_report_rules() -> BTreeSet<crate::subterm_rule::CtxtStRule> {
+    use crate::subterm_rule::{CtxtStRule, StRhs};
+    let x1 = msg_var("x", 1);
+    let x2 = msg_var("x", 2);
+    let mut s = BTreeSet::new();
+    s.insert(CtxtStRule::new(
+        f_app_no_eq(check_rep_sym(),
+            vec![f_app_no_eq(rep_sym(), vec![x1.clone(), x2.clone()]), x2.clone()]),
+        StRhs { positions: vec![vec![0, 0]], term: x1.clone() },
+    ));
+    s.insert(CtxtStRule::new(
+        f_app_no_eq(get_rep_sym(),
+            vec![f_app_no_eq(rep_sym(), vec![x1.clone(), x2.clone()])]),
+        StRhs { positions: vec![vec![0, 0]], term: x1 },
+    ));
+    s
+}
+
+/// `symEncDestRules` (Rules.hs:116): `sdecDest(senc(x1,x2), x2) = x1` —
+/// the DESTRUCTOR variant of `sym_enc_rules`, used by the
+/// `dest-symmetric-encryption` builtin.
+pub fn sym_enc_dest_rules() -> BTreeSet<crate::subterm_rule::CtxtStRule> {
+    use crate::subterm_rule::{CtxtStRule, StRhs};
+    let x1 = msg_var("x", 1);
+    let x2 = msg_var("x", 2);
+    let mut s = BTreeSet::new();
+    s.insert(CtxtStRule::new(
+        f_app_no_eq(sdec_dest_sym(), vec![senc(x1.clone(), x2.clone()), x2]),
+        StRhs { positions: vec![vec![0, 0]], term: x1 },
+    ));
+    s
+}
+
+/// `asymEncDestRules` (Rules.hs:117): `adecDest(aenc(x1, pk(x2)), x2) = x1`
+/// — the DESTRUCTOR variant of `asym_enc_rules`, used by the
+/// `dest-asymmetric-encryption` builtin.
+pub fn asym_enc_dest_rules() -> BTreeSet<crate::subterm_rule::CtxtStRule> {
+    use crate::subterm_rule::{CtxtStRule, StRhs};
+    let x1 = msg_var("x", 1);
+    let x2 = msg_var("x", 2);
+    let mut s = BTreeSet::new();
+    s.insert(CtxtStRule::new(
+        f_app_no_eq(adec_dest_sym(), vec![aenc(x1.clone(), pk(x2.clone())), x2]),
+        StRhs { positions: vec![vec![0, 0]], term: x1 },
     ));
     s
 }

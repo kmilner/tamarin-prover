@@ -165,7 +165,7 @@ pub fn show_dot(label: &str, graph: &DotGraph) -> String {
         if c == '"' { vec!['\\', '"'] } else { vec![c] }
     }).collect();
     let mut out = String::new();
-    write!(&mut out, "digraph \"{}\" {{\n", escaped).unwrap();
+    writeln!(&mut out, "digraph \"{}\" {{", escaped).unwrap();
     for e in graph.elements() {
         out.push_str(&show_element(e));
         out.push('\n');

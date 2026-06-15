@@ -23,16 +23,18 @@
 //!   GET  /thy/trace/<idx>/main/*path                        TheoryPathMR
 //!   GET  /thy/trace/<idx>/source                            TheorySourceR
 //!   GET  /thy/trace/<idx>/autoprove/<ext>/<bound>/<quit>/*p AutoProverR
-//!   GET  /thy/trace/<idx>/unload                            UnloadTheoryR (stub)
+//!   GET  /thy/trace/<idx>/unload                            UnloadTheoryR
 //!   GET  /static/*                                          StaticR (serve data/ + frontend/dist/)
 //!   GET  /favicon.ico                                       FaviconR
 //!   GET  /robots.txt                                        RobotsR
 //!
+//! Implemented: graph rendering (`graph` renders live SVG via the DOT
+//! pipeline, with a DOT-text fallback), `delete` (clones a new idx and
+//! redirects), and `unload` (removes the theory and redirects).
+//!
 //! Stubs / 501-with-message:
-//!   - graph rendering (`graph`, `interactive-graph-def`, `intdot`)
-//!     requires Tamarin's dot-pipeline which is a separate port
 //!   - diff theories (`/thy/equiv/...`)
-//!   - lemma editing (`edit`, `add`, `delete`)
+//!   - lemma editing (`edit`, `add`)
 
 pub mod graph;
 pub mod handlers;

@@ -20,7 +20,7 @@ fn main() {
         if let Goal::Action(_, fa) = &src.goal {
             if matches!(fa.tag, FactTag::Ku) {
                 println!("KU source: pattern = {:?}", fa.terms.first());
-                for (name, sys) in &src.cases {
+                for (name, sys) in src.cases(&ctx) {
                     let unsolved_prem_goals: usize = sys.goals.iter()
                         .filter(|(g, st)| !st.solved && matches!(g,
                             tamarin_theory::constraint::constraints::Goal::Premise(_, _)))
@@ -33,7 +33,7 @@ fn main() {
                         name, sys.nodes.len(), sys.edges.len(),
                         unsolved_prem_goals, chains,
                         sys.eq_store.subst.to_list().len());
-                    if want_case.as_deref() == Some(name) {
+                    if want_case.as_deref() == Some(name.as_str()) {
                         println!("    -- subst entries --");
                         for (v, t) in sys.eq_store.subst.to_list().iter() {
                             println!("      {:?} → {:?}", v, t);

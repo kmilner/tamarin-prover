@@ -15,8 +15,9 @@
 //!   unsolved constraints: ...
 //!   solved constraints: ...
 //!
-//! For the lemma view we also emit the graph-bearing sections
-//! (`nodes`, `actions`, `edges`, `less`) via `pretty_system_full`.
+//! For the lemma view `pretty_system` also emits the graph-bearing
+//! sections (`nodes`, `edges`, `less`); unlike Haskell's `prettySystem`
+//! no `actions` section is produced.
 
 use tamarin_term::pretty::{pp_lvar, pretty_lnterm};
 
@@ -47,9 +48,10 @@ pub fn pretty_non_graph_system(sys: &System) -> String {
 }
 
 /// Full system rendering — emits the graph-bearing sections
-/// (`nodes`/`actions`/`edges`/`less`) plus everything in
+/// (`nodes`/`edges`/`less`) plus everything in
 /// `pretty_non_graph_system`.  Mirrors Haskell's `prettySystem`
-/// (Constraints.hs around line 277) up to the omitted diff sections.
+/// (System.hs) except that the `actions` section
+/// (`fsepList ppActionAtom $ unsolvedActionAtoms se`) is omitted.
 #[allow(dead_code)]
 pub fn pretty_system(sys: &System) -> String {
     let mut out = String::new();

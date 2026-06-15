@@ -22,7 +22,7 @@ use std::process::Command;
 use tamarin_parser::{parse_theory, wf};
 
 fn main() {
-    let mut args = env::args().skip(1);
+    let args = env::args().skip(1);
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent().unwrap()
         .parent().unwrap()
@@ -30,7 +30,7 @@ fn main() {
         .join("wellformedness_fixtures");
     let mut run_tamarin_oracle = true;
     let mut positional: Vec<String> = Vec::new();
-    while let Some(a) = args.next() {
+    for a in args {
         match a.as_str() {
             "--no-tamarin" => run_tamarin_oracle = false,
             other => positional.push(other.to_string()),

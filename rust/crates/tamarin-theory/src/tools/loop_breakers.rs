@@ -63,7 +63,7 @@ pub fn dfs_loop_breakers<N: Clone + Ord>(
     let mut breakers: Vec<N> = Vec::new();
 
     // `image x rel` — successors of `x` in relation list order.
-    fn image<'a, N: Clone + Ord>(x: &N, rel: &'a [(N, N)]) -> Vec<N> {
+    fn image<N: Clone + Ord>(x: &N, rel: &[(N, N)]) -> Vec<N> {
         rel.iter()
             .filter(|(a, _)| a == x)
             .map(|(_, b)| b.clone())

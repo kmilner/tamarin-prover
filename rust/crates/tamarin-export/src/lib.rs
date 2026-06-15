@@ -8,6 +8,7 @@
 //! - `Export` (~2100 lines — main ProVerif/DeepSec exporters)
 //! - `RuleTranslation` (~600 lines — multiset rewriting → process
 //!   calculus translation)
+//!
 //! Both depend heavily on `tamarin-theory` and `tamarin-sapic`, which
 //! still have substantial work remaining.
 

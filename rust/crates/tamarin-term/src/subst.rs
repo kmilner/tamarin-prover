@@ -95,7 +95,7 @@ where
     /// `compose s1 s2` = `s1 . s2`. Effect: applying the result is the same
     /// as applying `s2` then `s1`.
     pub fn compose(&self, other: &Self) -> Self {
-        let mut composed = self.apply_subst(other).map.clone();
+        let mut composed = self.apply_subst(other).map;
         // Add bindings from `self` whose domain is not already in `other`.
         for (v, t) in &self.map {
             if !other.map.contains_key(v) {
@@ -113,13 +113,7 @@ fn equal_to_var<C, V: PartialEq>(t: &VTerm<C, V>, v: &V) -> bool {
 
 /// `applyLit`: substitute a single literal.
 pub fn apply_lit<C: Ord + Clone, V: Ord + Clone>(s: &Subst<C, V>, l: &Lit<C, V>) -> VTerm<C, V> {
-    match l {
-        Lit::Var(v) => match s.image_of(v) {
-            Some(t) => t.clone(),
-            None => lit(Lit::Var(v.clone())),
-        },
-        Lit::Con(c) => lit(Lit::Con(c.clone())),
-    }
+    apply_lit_map(&s.map, l)
 }
 
 /// `applyVTerm`: substitute through a whole term, re-AC-normalising.
@@ -127,11 +121,39 @@ pub fn apply_vterm<C: Ord + Clone, V: Ord + Clone>(
     s: &Subst<C, V>,
     t: VTerm<C, V>,
 ) -> VTerm<C, V> {
+    apply_vterm_map(&s.map, t)
+}
+
+/// `applyLit` against a raw substitution map — the borrowing
+/// counterpart of [`apply_lit`].  Hot unification loops call this to
+/// avoid cloning the accumulator into a [`Subst`] on every recursion.
+/// Output is identical to applying the [`Subst::from_map`]-built subst:
+/// a trivial `x ~> x` entry (which `from_map` would drop) returns the
+/// same `x` whether found in the map or falling through to identity.
+pub fn apply_lit_map<C: Ord + Clone, V: Ord + Clone>(
+    map: &BTreeMap<V, VTerm<C, V>>,
+    l: &Lit<C, V>,
+) -> VTerm<C, V> {
+    match l {
+        Lit::Var(v) => match map.get(v) {
+            Some(t) => t.clone(),
+            None => lit(Lit::Var(v.clone())),
+        },
+        Lit::Con(c) => lit(Lit::Con(c.clone())),
+    }
+}
+
+/// `applyVTerm` against a raw substitution map — the borrowing
+/// counterpart of [`apply_vterm`], producing byte-identical output.
+pub fn apply_vterm_map<C: Ord + Clone, V: Ord + Clone>(
+    map: &BTreeMap<V, VTerm<C, V>>,
+    t: VTerm<C, V>,
+) -> VTerm<C, V> {
     match t {
-        Term::Lit(l) => apply_lit(s, &l),
+        Term::Lit(l) => apply_lit_map(map, &l),
         Term::App(fsym, args) => {
             let mapped: Vec<VTerm<C, V>> =
-                args.iter().cloned().map(|a| apply_vterm(s, a)).collect();
+                args.iter().cloned().map(|a| apply_vterm_map(map, a)).collect();
             match fsym {
                 FunSym::Ac(o) => f_app_ac(o, mapped),
                 FunSym::C(o) => f_app_c(o, mapped),

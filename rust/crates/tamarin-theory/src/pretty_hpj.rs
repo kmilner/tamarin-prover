@@ -619,7 +619,7 @@ fn fill_nb(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
             let y_first = loop {
                 match iter.next() {
                     None => return Doc::Empty,
-                    Some(d) if matches!(d, Doc::Empty) => continue,
+                    Some(Doc::Empty) => continue,
                     Some(d) => break d,
                 }
             };
@@ -1058,6 +1058,50 @@ mod tests {
     // pass — see `pretty_formula.rs::pretty_guarded_wrapped`.
 
     #[test]
+    fn pkcs11_eleven_tuple_close_bracket_glue() {
+        // Regression for the pkcs11-templates variant-subst tuple wrap
+        // (cannot_obtain_key et al.).  HS renders the AC-variant block via
+        //   numbered' (map ppConj substs)   (SubstVFresh.hs:223-227)
+        // where each numbered item is `text i <> ". " <> vcat[prettyEq..]`
+        // at nest 4.  The `". " <>` BESIDE onto the multi-line vcat measures
+        // the inner fcat's ribbon from the OUTER (numbered) line start, so an
+        // 11-tuple `<x.16, …, x.26>` breaks BEFORE x.26 (gluing `>`).  The
+        // earlier RS code rendered each binding STANDALONE (entry.nest(7)),
+        // measuring ribbon from the var column, which packed x.26 and put `>`
+        // on its own line.  Confirms the engine reproduces the HS structure
+        // byte-for-byte (verified against Text.PrettyPrint.HughesPJ ll=110).
+        // term_doc = pair_doc(11 elements) = fcat([ "<", e0", ", ... e10, ">" ]).
+        // Elements x.16..x.26 are 4 chars each, nest(1)'d, comma-suffixed.
+        let mk_pair = || {
+            let n = 11;
+            let mut parts: Vec<Doc> = Vec::with_capacity(n + 2);
+            parts.push(Doc::text("<"));
+            for i in 0..n {
+                let name = format!("x.{}", 16 + i);
+                let mut d = Doc::text(name);
+                if i + 1 < n {
+                    d = d.beside(Doc::text(", "));
+                }
+                parts.push(d.nest(1));
+            }
+            parts.push(Doc::text(">"));
+            fcat(parts)
+        };
+        // HS structure (SubstVFresh.hs:227-229 + Class.hs:252-264):
+        //   numbered' = numbered (text "") . map (text ". " <>)
+        //   each item = text(flushRight w i) <> (text ". " <> vcat[prettyEq..])
+        //   prettyEq (a,b) = text a $$ nest 6 (text "=" <-> term)
+        // The whole `variants (modulo AC)` block sits at nest 4.
+        let prettyeq = |v: &str, t: Doc| Doc::text(v).above(Doc::text("=").beside_sp(t).nest(6));
+        let conj = prettyeq("v", mk_pair());
+        let item = Doc::text("3").beside(Doc::text(". ").beside(conj));
+        let out = item.nest(4).render();
+        // HS-faithful expectation: break BEFORE x.26, glue '>' to it.
+        let expected = "    3. v     = <x.16, x.17, x.18, x.19, x.20, x.21, x.22, x.23, x.24, x.25, \n                x.26>";
+        assert_eq!(out, expected, "got:\n{out}");
+    }
+
+    #[test]
     fn fcat_close_bracket_separate_item() {
         // Pattern 1: pair `<a, b, c>` modeled as fcat with `>` as a
         // separate final item.  When the items pack to fit, then add
@@ -1084,11 +1128,16 @@ mod tests {
 mod sep_nb_regression {
     use super::*;
 
-    /// Regression for the `sepNB`/`fillNBE` `nilAboveNest` flag fix.
+    /// Regression for the `sepNB`/`fillNBE` `nilAboveNest` column
+    /// behaviour.
     ///
-    /// HS `sepNB g Empty k ys` uses `nilAboveNest True k ...` (the flag
-    /// is `True`, not `False`); with `False` and `k > 0` the wrapped tail
-    /// item was inlined `k` spaces and dropped one column to the left.
+    /// HS `sepNB g Empty k ys` builds its wrapped tail via
+    /// `nilAboveNest False k ...` — the flag is `False` (GHC's bundled
+    /// pretty-1.1.3.6 settled on `False`; see the matching comment on
+    /// the `sep_nb` `Empty` arm).  `nilAboveNest`'s flag governs where
+    /// the wrapped tail item lands: this test pins that the second
+    /// disjunct keeps its expected column rather than being inlined and
+    /// dropped one column to the left.
     ///
     /// This case mirrors NSPK3 injective_agree's all-counterexamples
     /// guarded formula: a GDisj whose disjuncts are GGuarded with

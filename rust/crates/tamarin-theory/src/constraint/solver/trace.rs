@@ -537,8 +537,8 @@ fn canonical_node_actions(sys: &crate::constraint::system::System) -> String {
         }
     }
     acts.sort();
-    let compressed = compress_dups(&acts);
-    compressed
+    
+    compress_dups(&acts)
 }
 
 fn canonical_open_actions(sys: &crate::constraint::system::System) -> String {
@@ -551,8 +551,8 @@ fn canonical_open_actions(sys: &crate::constraint::system::System) -> String {
         }
     }
     acts.sort();
-    let compressed = compress_dups(&acts);
-    compressed
+    
+    compress_dups(&acts)
 }
 
 /// Emit a [PICK] line indicating which goal was selected for this dispatch.
@@ -591,7 +591,7 @@ pub fn trace_pick(g: &crate::constraint::constraints::Goal) {
         use tamarin_term::pretty::pretty_lnterm;
         let term_repr = match g {
             Goal::Action(_, fa) | Goal::Premise(_, fa) => {
-                let ts: Vec<String> = fa.terms.iter().map(|t| pretty_lnterm(t)).collect();
+                let ts: Vec<String> = fa.terms.iter().map(pretty_lnterm).collect();
                 format!("{}({})", fact_tag_short(&fa.tag), ts.join(", "))
             }
             _ => String::new(),

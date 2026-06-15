@@ -80,10 +80,14 @@ impl<V: Clone> ProcessAnnotation<V> {
         Self { else_branch: b, ..Default::default() }
     }
 
-    /// Combine two annotations. Optional fields prefer the *first* defined
-    /// value (mirroring Haskell's `Maybe` semigroup which is left-biased
-    /// only for `Just`/`Just`); booleans are OR'ed; `else_branch` is taken
-    /// from the right operand.
+    /// Combine two annotations. All optional fields here prefer the *first*
+    /// defined value (`Option::or`). This matches Haskell's `mayMerge`
+    /// (left-biased on `Just`/`Just`, used for `destructor_equation` and
+    /// `is_state_channel`), but diverges for the `AnVar` fields (`lock`,
+    /// `unlock`, `secret_channel`, `state_channel`): Haskell combines those
+    /// via `Maybe`'s `<>`, whose inner `AnVar` `<>` is right-biased
+    /// (`(<>) _ b = b`), so `Just`/`Just` keeps the *right* value there.
+    /// `pure_state` is OR'ed; `else_branch` is taken from the right operand.
     pub fn append(self, other: Self) -> Self {
         ProcessAnnotation {
             parsing_ann: self.parsing_ann.append(other.parsing_ann),

@@ -12,10 +12,11 @@
 //!     - Induction → split into base/step cases
 //! ```
 //!
-//! The Rust port currently implements the trivial cases and stubs
-//! the non-trivial ones with `unimplemented!()`-equivalent results
-//! (returns `None` / empty map). The shape is in place so the rest
-//! can grow incrementally.
+//! All arms are fully ported: the trivial cases (Sorry / Finished /
+//! Invalidated), `Simplify` (with the per-step simplify fan-out and
+//! dedup/distinguish case naming), `SolveGoal` (full goal dispatch via
+//! `solve_*_goal`), and `Induction` (base/step split via `ginduct`).
+//! `None` results mean "no applicable method", not unfinished stubs.
 
 use crate::constraint::constraints::Goal;
 use crate::constraint::solver::context::ProofContext;
@@ -54,6 +55,104 @@ pub enum ProofMethod {
     RawSolve(String),
 }
 
+// --- Cached kill-switch / debug env flags -------------------------------
+// Env vars are constant for a process; reading them per-node/per-step
+// (env-table lock + `String` alloc each) is pure overhead on the solver
+// hot path.  Cache each behind a `OnceLock<bool>`, mirroring
+// `trace::flag()` and `reduction::bounds_max_verify_enabled`.  Each
+// helper preserves the call site's EXACT semantics (`.is_ok()` opt-in vs
+// `.is_err()` opt-out).
+
+#[inline]
+fn dbg_impl_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_IMPL").is_ok())
+}
+
+/// `TAM_RS_PER_STEP_RESET_LEGACY` is an opt-OUT: the per-step Maude
+/// counter reset runs UNLESS the var is set, so cache it as `.is_err()`.
+#[inline]
+fn per_step_reset_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_PER_STEP_RESET_LEGACY").is_err())
+}
+
+#[inline]
+fn disable_simplify_fanout() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_SIMPLIFY_FANOUT").is_ok())
+}
+
+/// `TAM_DISABLE_RENAME_PRECISE` is an opt-OUT: renamePrecise runs UNLESS
+/// the var is set, so cache it as `.is_err()`.
+#[inline]
+fn rename_precise_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DISABLE_RENAME_PRECISE").is_err())
+}
+
+#[inline]
+fn dbg_solve_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_SOLVE").is_ok())
+}
+
+#[inline]
+fn dbg_pick_nr_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DBG_PICK_NR").is_ok())
+}
+
+#[inline]
+fn dbg_filter_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_FILTER").is_ok())
+}
+
+#[inline]
+fn dbg_filter_compact_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_FILTER_COMPACT").is_ok())
+}
+
+#[inline]
+fn dbg_trace_cases_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_TRACE_CASES").is_ok())
+}
+
+#[inline]
+fn dbg_kept_raw_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DBG_KEPT_RAW").is_ok())
+}
+
+#[inline]
+fn dbg_namesys_dedup_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DBG_NAMESYS_DEDUP").is_ok())
+}
+
+/// `TAM_RS_DBG_SOLVED_GOALS` is matched against the exact value `"1"`,
+/// so cache the equality test (not a bare `.is_ok()`) to preserve semantics.
+#[inline]
+fn dbg_solved_goals_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DBG_SOLVED_GOALS").as_deref() == Ok("1"))
+}
+
+#[inline]
+fn dbg_solved_dump_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_SOLVED_DUMP").is_ok())
+}
+
+#[inline]
+fn dbg_solve_nodes_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_SOLVE_NODES").is_ok())
+}
+
 /// `isFinished`: returns the appropriate `Result` if the system is in
 /// a terminal state — solved, contradictory, or unfinishable.
 pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
@@ -73,7 +172,7 @@ pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
         // search verdict.  Removed the Unfinishable downgrade to match.
         return Some(Result::Contradictory(Some(c)));
     }
-    if std::env::var("TAM_DBG_IMPL").is_ok() {
+    if dbg_impl_enabled() {
         let has_i_1 = sys.nodes.iter().any(|(_, r)|
             matches!(&r.info, crate::rule::RuleInfo::Proto(p)
                 if matches!(&p.name, crate::rule::ProtoRuleName::Stand(s) if s == "I_1")));
@@ -105,7 +204,7 @@ pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
     let no_open_goals = open_goals(sys).is_empty();
     let sub_finished = finished_subterms(ctx, sys);
     if no_open_goals && sub_finished {
-        if std::env::var("TAM_RS_DBG_SOLVED_GOALS").as_deref() == Ok("1") {
+        if dbg_solved_goals_enabled() {
             use crate::constraint::constraints::Goal;
             eprintln!("[SOLVED_GOALS] all open_goals empty. Showing all goal statuses:");
             for (g, st) in sys.goals.iter() {
@@ -127,7 +226,7 @@ pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
                 eprintln!("[SOLVED_GOALS]   solved={} {} {}", st.solved, kind, term_dump);
             }
         }
-        if std::env::var("TAM_DBG_SOLVED_DUMP").is_ok() {
+        if dbg_solved_dump_enabled() {
             let path = crate::constraint::solver::trace::case_path_string();
             eprintln!("[SOLVED_DUMP] path={} nodes={} actions=?, formulas={}, solved_formulas={}, lemmas={}, edges={}, eq_store_n={}",
                 path, sys.nodes.len(),
@@ -201,13 +300,6 @@ pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
     else { None }
 }
 
-/// Approximation of Haskell's `isInitialSystem`:
-///   `null sSolvedFormulas && not (bot ∈ sFormulas)`
-///
-/// We add the structural-emptiness checks too, since our `System`
-/// carries more state than Haskell's at this stage. The crucial
-/// property is the `not bot in formulas` clause — a system whose
-/// open formulas contain ⊥ is *contradictory*, not initial.
 /// Direct port of Haskell `isInitialSystem`:
 ///   isInitialSystem sys = null (get sSolvedFormulas sys) && not (member bot (get sFormulas sys))
 /// (`System.hs:828`).  Just two conditions: no solved formulas yet,
@@ -259,18 +351,17 @@ fn finished_subterms(ctx: &ProofContext, sys: &System) -> bool {
 }
 
 /// Execute a proof method against `sys`, returning the resulting
-/// case list IN INSERTION ORDER. `Sorry` / `Finished` produce empty
-/// cases; `Simplify` runs `simplify_system` and returns one case;
-/// `SolveGoal(g)` dispatches via `solve_*_goal` and converts
-/// `GoalCases` to a case list. `Induction` is left as a stub.
+/// case list in dispatch order. `Sorry` / `Finished` produce empty
+/// cases; `Simplify` runs the simplify fan-out and returns one case
+/// per surviving branch; `SolveGoal(g)` dispatches via `solve_*_goal`
+/// and converts `GoalCases` to a case list; `Induction` splits the
+/// first formula into base/step cases via `ginduct`.
 ///
-/// **Order matters**: Haskell's `disjunctionOfList` and the
-/// downstream `runReduction` preserve the order of rules /
-/// destructors as iterated in `joinAllRules` / saturate output.
-/// Returning `Vec` (not `BTreeMap`) preserves that order so the
-/// search explores cases in Haskell's same order, allowing the
-/// `case c_aenc`-style trace-found paths to be reached without
-/// being starved by alphabetically-earlier siblings.
+/// The case list is returned as a `Vec` in the order branches were
+/// produced, but callers do not rely on that order: both `search.rs`
+/// and `replay.rs` re-sort the cases by name before walking them, to
+/// reproduce Haskell's `Data.Map` (alphabetical) iteration order from
+/// `execProofMethod`'s `M.fromListWith`.
 pub fn exec_proof_method(
     ctx: &ProofContext,
     method: &ProofMethod,
@@ -308,7 +399,7 @@ pub fn exec_proof_method(
     // both → `~ltkA.425` after lifting forces $R=$I via setNodes merge).
     //
     // Opt-out via `TAM_RS_PER_STEP_RESET_LEGACY=1`.
-    if std::env::var("TAM_RS_PER_STEP_RESET_LEGACY").is_err() {
+    if per_step_reset_enabled() {
         let avoid = crate::constraint::solver::reduction::bounds_max(sys);
         ctx.maude.reset_counter_to(avoid.saturating_add(1));
     }
@@ -344,7 +435,7 @@ pub fn exec_proof_method(
             // Kill switch: `TAM_RS_DISABLE_SIMPLIFY_FANOUT=1` reverts
             // to the in-place behaviour.
             let case_systems: Vec<System> =
-                if std::env::var("TAM_RS_DISABLE_SIMPLIFY_FANOUT").is_ok() {
+                if disable_simplify_fanout() {
                     let mut r = Reduction::new(ctx, sys.clone());
                     r.changed = ChangeIndicator::Unchanged;
                     simplify_system(&mut r);
@@ -359,7 +450,7 @@ pub fn exec_proof_method(
             // ALSO cleaned.
             let cleanup = |s: &System| -> System {
                 let mut s2 = s.clone();
-                if std::env::var("TAM_DISABLE_RENAME_PRECISE").is_err() {
+                if rename_precise_enabled() {
                     crate::constraint::solver::rename_precise::rename_precise_system(
                         &mut s2);
                 }
@@ -403,7 +494,7 @@ pub fn exec_proof_method(
             Some(out)
         }
         ProofMethod::SolveGoal(g) => {
-            let dbg_solve = std::env::var("TAM_DBG_SOLVE").is_ok();
+            let dbg_solve = dbg_solve_enabled();
             let t_dispatch = std::time::Instant::now();
             // State snapshot BEFORE dispatch — paired with HS's
             // `[STATE]` line in `Theory.Constraint.Solver.ProofMethod.solve`.
@@ -417,7 +508,7 @@ pub fn exec_proof_method(
             // TAM_RS_DBG_PICK_NR=1 (mirrors HS TAM_HS_DBG_PICK_NR):
             // dump the picked goal's gsNr and the entire open-goal queue with
             // their gsNrs. Lets HS↔RS comparison align picks by gsNr ordering.
-            if std::env::var("TAM_RS_DBG_PICK_NR").is_ok() {
+            if dbg_pick_nr_enabled() {
                 use crate::constraint::constraints::Goal;
                 let pick_nr = sys.goals.iter()
                     .find(|(eg, _)| eg == g)
@@ -465,7 +556,7 @@ pub fn exec_proof_method(
                     crate::constraint::solver::reduction::GoalCases::Contradictory => "Contradictory".to_string(),
                 };
                 eprintln!("[solve] dispatch {} → {} in {:?}", name, kind, t_dispatch.elapsed());
-                if std::env::var("TAM_DBG_SOLVE_NODES").is_ok() {
+                if dbg_solve_nodes_enabled() {
                     // Dump sys.nodes (rule names per node) so we can
                     // see which rules are grafted when the goal is
                     // dispatched.
@@ -508,7 +599,7 @@ pub fn exec_proof_method(
                 }
                 let t0 = std::time::Instant::now();
                 let raw_systems: Vec<System> =
-                    if std::env::var("TAM_RS_DISABLE_SIMPLIFY_FANOUT").is_ok() {
+                    if disable_simplify_fanout() {
                         let mut r = Reduction::new(ctx, sys);
                         simplify_system(&mut r);
                         vec![r.sys]
@@ -525,7 +616,7 @@ pub fn exec_proof_method(
                 //                       (renamePrecise s)
                 let mut out: Vec<System> = Vec::with_capacity(raw_systems.len());
                 for mut s in raw_systems {
-                    if std::env::var("TAM_DISABLE_RENAME_PRECISE").is_err() {
+                    if rename_precise_enabled() {
                         crate::constraint::solver::rename_precise::rename_precise_system(
                             &mut s);
                     }
@@ -565,8 +656,8 @@ pub fn exec_proof_method(
             // catches them earlier (before the case is even built) or
             // leaves them as explicit `Finished(Contradictory(_))`
             // leaves.  Mirror the latter shape by *not* filtering them.
-            let dbg_filter = std::env::var("TAM_DBG_FILTER").is_ok();
-            let dbg_filter_compact = std::env::var("TAM_DBG_FILTER_COMPACT").is_ok();
+            let dbg_filter = dbg_filter_enabled();
+            let dbg_filter_compact = dbg_filter_compact_enabled();
             let keep = |sys: &System, name: &str| -> bool {
                 let r = !sys.eq_store.is_false();
                 if dbg_filter {
@@ -591,7 +682,7 @@ pub fn exec_proof_method(
                         cpath, goal_short, name, cs, r);
                 }
                 let op = if r { "case_keep" } else { "case_drop" };
-                crate::state_trace::emit_case(op, name, Some(&g), sys);
+                crate::state_trace::emit_case(op, name, Some(g), sys);
                 r
             };
             match outcome {
@@ -636,8 +727,8 @@ pub fn exec_proof_method(
                     // For debugging (TAM_DBG_FILTER_COMPACT), tag the case
                     // path with the sibling name + index so traces map back
                     // to the specific source-case being simplified.
-                    let trace_cases = std::env::var("TAM_DBG_TRACE_CASES").is_ok();
-                    let dbg_kr = std::env::var("TAM_RS_DBG_KEPT_RAW").is_ok();
+                    let trace_cases = dbg_trace_cases_enabled();
+                    let dbg_kr = dbg_kept_raw_enabled();
                     let mut kr_pre_counts: std::collections::HashMap<String, (usize, usize, usize)>
                         = std::collections::HashMap::new();
                     let kept_raw: Vec<(String, System)> = cases.into_iter()
@@ -696,7 +787,7 @@ pub fn exec_proof_method(
                         // systems.  Safety guard for actually-isomorphic
                         // cases; the proper Haskell-parity dedup is the
                         // SplitG-variants path (now always on).
-                        let dbg_dedup = std::env::var("TAM_RS_DBG_NAMESYS_DEDUP").is_ok();
+                        let dbg_dedup = dbg_namesys_dedup_enabled();
                         let mut seen_systems: Vec<(String, System)> = Vec::new();
                         let mut dup_count = 0usize;
                         let mut dup_names: Vec<String> = Vec::new();
@@ -820,7 +911,7 @@ pub fn exec_proof_method(
             // keep their high `.N` indices (e.g. `last(#z.7)`) instead of the
             // canonical per-name idx-0 form (`last(#z)`) HS renders.
             let cleanup = |s: &mut System| {
-                if std::env::var("TAM_DISABLE_RENAME_PRECISE").is_err() {
+                if rename_precise_enabled() {
                     crate::constraint::solver::rename_precise::rename_precise_system(s);
                 }
                 s.invalidate_max_var_idx_cache();
@@ -859,7 +950,7 @@ pub fn check_and_exec_proof_method(
         }
         ProofMethod::Induction => {
             if !is_initial_system(sys) { return None; }
-            if sys.solved_formulas.len() != 0 { return None; }
+            if !sys.solved_formulas.is_empty() { return None; }
             if sys.formulas.len() != 1 { return None; }
         }
         ProofMethod::SolveGoal(g) => {
@@ -872,12 +963,12 @@ pub fn check_and_exec_proof_method(
 }
 
 fn same_kind(a: &Result, b: &Result) -> bool {
-    match (a, b) {
-        (Result::Solved, Result::Solved) => true,
-        (Result::Unfinishable, Result::Unfinishable) => true,
-        (Result::Contradictory(_), Result::Contradictory(_)) => true,
-        _ => false,
-    }
+    matches!(
+        (a, b),
+        (Result::Solved, Result::Solved)
+            | (Result::Unfinishable, Result::Unfinishable)
+            | (Result::Contradictory(_), Result::Contradictory(_))
+    )
 }
 
 #[cfg(test)]

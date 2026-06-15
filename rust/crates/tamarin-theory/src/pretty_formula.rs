@@ -44,7 +44,7 @@ type Bind = (String, p::SortHint, String);
 pub fn pretty_formula(f: &p::Formula) -> String {
     let mut s = String::new();
     let mut state = avoid_precise_formula(f);
-    pp_formula(f, FormCtx::Top, &[], &mut state, &mut s);
+    pp_formula(f, &[], &mut state, &mut s);
     s
 }
 
@@ -60,8 +60,8 @@ pub fn pretty_formula(f: &p::Formula) -> String {
 ///     (HughesPJ.hs:1010, `defaultStyle.ribbonsPerLine = 1.5`,
 ///     HughesPJ.hs:940),
 ///   - `sl` = chars already laid down on the current output line.
-/// I.e. a doc of flat length N fits at current column C on a line that
-/// began at column L iff `C + N <= min(lineLength, L + ribbon)`.
+///     I.e. a doc of flat length N fits at current column C on a line that
+///     began at column L iff `C + N <= min(lineLength, L + ribbon)`.
 ///
 /// This routes through the HS-faithful Doc engine
 /// (`crate::pretty_hpj`) so per-NilAbove `w`-shrinkage is tracked
@@ -337,13 +337,6 @@ pub fn term_doc(t: &p::Term) -> crate::pretty_hpj::Doc {
     term_to_doc(t, &[])
 }
 
-/// Pretty-print an atom standalone (e.g. inside a goal label).
-pub fn pretty_atom(a: &p::Atom) -> String {
-    let mut s = String::new();
-    pp_atom(a, &[], &mut s);
-    s
-}
-
 /// Pretty-print a parser-AST term standalone.
 pub fn pretty_term(t: &p::Term) -> String {
     let mut s = String::new();
@@ -568,16 +561,6 @@ fn allocate_guarded_binders(
 // Formula (parser AST)
 // =============================================================================
 
-#[derive(Copy, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-enum FormCtx {
-    Top,
-    /// Inside a connective requiring parens for nested connectives.
-    /// Kept for back-compat; current renderer uses HS-faithful
-    /// `opParens` instead.
-    Conn,
-}
-
 /// `scope` is a flat list of binder entries (innermost binder last).
 /// Each entry carries the binder's source name+sort plus the display
 /// name allocated via `Precise.freshIdent` — when an inner binder
@@ -588,7 +571,6 @@ enum FormCtx {
 /// boundaries (Formula.hs:496-502 — every `Qua` saves/restores state).
 fn pp_formula(
     f: &p::Formula,
-    _ctx: FormCtx,
     scope: &[Bind],
     state: &mut PreciseFreshState,
     out: &mut String,
@@ -635,7 +617,7 @@ fn pp_qua(
             out.push_str(&b.2);
         }
         out.push_str(". ");
-        pp_formula(body, FormCtx::Top, &new_scope, state, out);
+        pp_formula(body, &new_scope, state, out);
     })
 }
 
@@ -664,7 +646,7 @@ fn pp_formula_opparens(
     out: &mut String,
 ) {
     out.push('(');
-    pp_formula(f, FormCtx::Top, scope, state, out);
+    pp_formula(f, scope, state, out);
     out.push(')');
 }
 
@@ -847,19 +829,13 @@ pub const RIBBON: usize = 73;
 /// (`Main/Console.hs:236`).
 pub const LINE_LENGTH: usize = 110;
 
-/// Legacy alias kept for callers that pass a `width` argument; equal
-/// to `RIBBON` (HS ribbon).  The actual fit-decision now uses
-/// `fits_flat` (`line_start + RIBBON`-capped at `LINE_LENGTH`), not
-/// this constant.
-pub const WRAP_WIDTH: usize = RIBBON;
-
 fn resolved_sort(v: &p::VarSpec, scope: &[Bind]) -> p::SortHint {
     if !matches!(v.sort, p::SortHint::Untagged) {
         return v.sort;
     }
     // Walk scope inner-most first.
     for b in scope.iter().rev() {
-        if &b.0 == &v.name {
+        if b.0 == v.name {
             return b.1;
         }
     }
@@ -1109,7 +1085,7 @@ fn ac_op_doc(sym: &str, flat: &[&p::Term], scope: &[Bind]) -> crate::pretty_hpj:
     for (i, t) in flat.iter().enumerate() {
         let mut d = term_to_doc(t, scope);
         if i + 1 < n {
-            d = d.beside(Doc::text(sym.to_string()));
+            d = d.beside(Doc::text(sym));
         }
         parts.push(d.nest(1));
     }
@@ -1316,7 +1292,7 @@ fn gac_op_doc(
     for (i, t) in flat.iter().enumerate() {
         let mut d = gterm_to_doc(t, scope);
         if i + 1 < n {
-            d = d.beside(Doc::text(sym.to_string()));
+            d = d.beside(Doc::text(sym));
         }
         parts.push(d.nest(1));
     }
@@ -1616,7 +1592,7 @@ fn pp_guarded(g: &Guarded, state: &mut PreciseFreshState, out: &mut String) {
 /// the display name carries the `.<idx>` suffix when shadowing
 /// (HS `show LVar`, LTerm.hs:526-532; allocated by `openGuarded` via
 /// `freshLVar`, Guarded.hs:362-371).
-fn lookup_bound<'a>(n: u32, scope: &'a [Vec<Bind>]) -> Option<&'a Bind> {
+fn lookup_bound(n: u32, scope: &[Vec<Bind>]) -> Option<&Bind> {
     let mut m = n as usize;
     for vars in scope.iter().rev() {
         if m < vars.len() {
@@ -1700,7 +1676,7 @@ fn sort_ac_args_for_display<'a>(
         .collect();
     let mut keyed = keyed;
     keyed.sort_by(|a, b| crate::guarded::cmp_term(&a.0, &b.0));
-    for (slot, (_, orig)) in flat.iter_mut().zip(keyed.into_iter()) {
+    for (slot, (_, orig)) in flat.iter_mut().zip(keyed) {
         *slot = orig;
     }
 }

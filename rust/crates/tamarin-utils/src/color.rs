@@ -89,7 +89,7 @@ pub fn rgb_to_gray(c: Rgb) -> f64 { c.r.max(c.g.max(c.b)) }
 pub fn rgb_to_hex(c: Rgb) -> String {
     fn channel(f: f64) -> String {
         let i = (256.0 * f).floor() as i32;
-        let i = i.max(0).min(255);
+        let i = i.clamp(0, 255);
         format!("{:02x}", i)
     }
     format!("#{}{}{}", channel(c.r), channel(c.g), channel(c.b))

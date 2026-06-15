@@ -15,6 +15,22 @@ use crate::rule::RuleACInst;
 use crate::tools::{EquationStore, SubtermStore};
 
 // =============================================================================
+// Prebuilt always-before adjacency
+// =============================================================================
+
+/// A prebuilt `alwaysBefore` adjacency map (`rawLessRel`), produced by
+/// [`System::build_always_before_adj`] and queried by
+/// [`System::always_before_with`]. Hoisting this build out of nested loops
+/// turns the per-call O(less+edges+chains) map rebuild into a single build
+/// per pass; the queries are pure BFS lookups. The relation is invariant
+/// across the inner loops (the system is not mutated mid-pass), so the
+/// hoisted result is identical to repeated per-call `always_before`.
+#[derive(Debug, Clone, Default)]
+pub struct PrebuiltAdj {
+    adj: std::collections::BTreeMap<NodeId, Vec<NodeId>>,
+}
+
+// =============================================================================
 // Source kind / side annotations
 // =============================================================================
 
@@ -247,6 +263,54 @@ pub struct GoalStatus {
     pub nr: u64,
 }
 
+// --- Cached debug env flags for the node/goal insertion hot path -------
+// `add_node`/`add_goal`/`add_goal_with_loop_flag` are the core insertion
+// path (34+ `add_node` call sites; goal inserts per KU-decomposition /
+// conjoinSystem).  These diagnostic env vars are constant for the
+// process, so cache each behind a `OnceLock<bool>` (mirroring
+// `reduction::bounds_max_verify_enabled`) instead of an env-lock +
+// `String` alloc per insertion.
+#[inline]
+fn dbg_insert_goal() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DBG_INSERT_GOAL").is_ok())
+}
+#[inline]
+fn dbg_insert_goal_include_precompute() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DBG_INSERT_GOAL_INCLUDE_PRECOMPUTE").is_ok())
+}
+#[inline]
+fn trace_goal_insert() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_TRACE_GOAL_INSERT").is_ok())
+}
+#[inline]
+fn dbg_panic_idx0() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_PANIC_IDX0").is_ok())
+}
+#[inline]
+fn dbg_panic_idx0_runtime_only() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_PANIC_IDX0_RUNTIME_ONLY").is_ok())
+}
+#[inline]
+fn dbg_add_node_serv1() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_ADD_NODE_SERV1").is_ok())
+}
+#[inline]
+fn dbg_trace_add_node() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_TRACE_ADD_NODE").is_ok())
+}
+#[inline]
+fn dbg_panic_any_idx0_node() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_DBG_PANIC_ANY_IDX0_NODE").is_ok())
+}
+
 impl System {
     pub fn empty() -> Self { Self::default() }
 
@@ -356,18 +420,17 @@ impl System {
         // counter on EVERY call, even when the goal already exists.
         let age = self.next_goal_nr;
         self.next_goal_nr = self.next_goal_nr.wrapping_add(1);
-        if std::env::var("TAM_RS_DBG_INSERT_GOAL").is_ok() {
+        if dbg_insert_goal() {
             let in_pre = crate::constraint::solver::sources::in_precompute_mode()
                 || crate::constraint::solver::sources::in_initial_source_cases();
-            let want_pre = std::env::var("TAM_RS_DBG_INSERT_GOAL_INCLUDE_PRECOMPUTE").is_ok();
+            let want_pre = dbg_insert_goal_include_precompute();
             if !in_pre || want_pre {
                 let tag = if in_pre { "<precompute>" } else { "<proof>" };
                 eprintln!("[RS_INS_GOAL] lemma={} gsNr={} solved=false loops=false goal={:?}", tag, age, g);
             }
         }
         if !self.goals.iter().any(|(existing, _)| existing == &g) {
-            let mut st = GoalStatus::default();
-            st.nr = age;
+            let st = GoalStatus { nr: age, ..Default::default() };
             self.bump_cache_goal(&g);
             self.goals_mut().push((g, st));
         }
@@ -409,10 +472,10 @@ impl System {
         // combineGoalStatus` keeps the existing — smaller — nr).
         let age = self.next_goal_nr;
         self.next_goal_nr = self.next_goal_nr.wrapping_add(1);
-        if std::env::var("TAM_RS_DBG_INSERT_GOAL").is_ok() {
+        if dbg_insert_goal() {
             let in_pre = crate::constraint::solver::sources::in_precompute_mode()
                 || crate::constraint::solver::sources::in_initial_source_cases();
-            let want_pre = std::env::var("TAM_RS_DBG_INSERT_GOAL_INCLUDE_PRECOMPUTE").is_ok();
+            let want_pre = dbg_insert_goal_include_precompute();
             if !in_pre || want_pre {
                 let tag = if in_pre { "<precompute>" } else { "<proof>" };
                 eprintln!("[RS_INS_GOAL] lemma={} gsNr={} solved=false loops={} goal={:?}", tag, age, looping, g);
@@ -421,7 +484,7 @@ impl System {
         let canon_g = canonical_goal_for_dedup(&g);
         let is_new = !self.goals.iter().any(|(existing, _)|
             canonical_goal_for_dedup(existing) == canon_g);
-        if std::env::var("TAM_RS_TRACE_GOAL_INSERT").is_ok() {
+        if trace_goal_insert() {
             let kindstr = match &g {
                 Goal::Action(i, fa) => format!("Action {:?} {:?}", i, fa),
                 Goal::Premise(p, fa) => format!("Premise {:?} {:?}", p, fa),
@@ -441,9 +504,7 @@ impl System {
             // existing one is always smaller, so leave it unchanged.
             return;
         }
-        let mut st = GoalStatus::default();
-        st.looping = looping;
-        st.nr = age;
+        let st = GoalStatus { looping, nr: age, ..Default::default() };
         self.bump_cache_goal(&g);
         self.goals_mut().push((g, st));
     }
@@ -454,9 +515,9 @@ impl System {
         // DIAGNOSTIC: panic if an instance rule with user-named idx-0 vars
         // gets added.  Gated by env var so it doesn't affect production.
         // Honors TAM_DBG_PANIC_IDX0_RUNTIME_ONLY=1 to skip during precompute.
-        if std::env::var("TAM_DBG_PANIC_IDX0").is_ok() {
+        if dbg_panic_idx0() {
             let in_precompute = crate::constraint::solver::sources::in_precompute_mode();
-            let skip_during_precompute = std::env::var("TAM_DBG_PANIC_IDX0_RUNTIME_ONLY").is_ok();
+            let skip_during_precompute = dbg_panic_idx0_runtime_only();
             let active = !(skip_during_precompute && in_precompute);
             if active {
                 use tamarin_term::lterm::HasFrees;
@@ -475,7 +536,7 @@ impl System {
             }
         }
         // DIAGNOSTIC: dump Serv_1 rule contents at the moment of add_node.
-        if std::env::var("TAM_DBG_ADD_NODE_SERV1").is_ok() {
+        if dbg_add_node_serv1() {
             let nm = crate::constraint::solver::reduction::rule_case_name(&rule);
             if nm == "Serv_1" {
                 eprintln!("[add_node_serv1] adding Serv_1 at {}.{}", id.name, id.idx);
@@ -492,7 +553,7 @@ impl System {
         }
         // DIAGNOSTIC: trace every node addition with its id+rule_name.
         // Captures both pre-saturation (precompute) and runtime grafts.
-        if std::env::var("TAM_DBG_TRACE_ADD_NODE").is_ok() {
+        if dbg_trace_add_node() {
             let rule_name = crate::constraint::solver::reduction::rule_case_name(&rule);
             // Also dump prem[1] term if id is j:N (R_1/I_1 candidates).
             if id.name == "j" {
@@ -500,7 +561,7 @@ impl System {
                     .and_then(|p| p.terms.first())
                     .map(|t| format!("{:?}", t).chars().take(120).collect::<String>())
                     .unwrap_or_default();
-                let prem0 = rule.premises.get(0)
+                let prem0 = rule.premises.first()
                     .and_then(|p| p.terms.first())
                     .map(|t| format!("{:?}", t).chars().take(80).collect::<String>())
                     .unwrap_or_default();
@@ -514,7 +575,7 @@ impl System {
         // with id idx 0 (excluding the very first node, which is legitimate).
         // Used to find the source of the idx-0 leak.  Set
         // TAM_DBG_PANIC_ANY_IDX0_NODE=1 to enable.
-        if std::env::var("TAM_DBG_PANIC_ANY_IDX0_NODE").is_ok() && id.idx == 0 {
+        if dbg_panic_any_idx0_node() && id.idx == 0 {
             let rule_name = crate::constraint::solver::reduction::rule_case_name(&rule);
             panic!("[TAM_DBG_PANIC_ANY_IDX0_NODE] add_node at idx 0: id={:?} rule={}",
                 id, rule_name);
@@ -548,13 +609,12 @@ impl System {
     }
 
     /// Add a `<` atom if not already present (equality ignores reason).
-    /// Add a less-atom. Self-loops (a < a) are degenerate — they
-    /// produce immediate contradictions via the cyclic check.  In
-    /// most cases such a self-loop arises from subst_system collapsing
-    /// two distinct nodes to the same id AFTER a less-atom between
-    /// them was already recorded; the resulting `a < a` is a true
-    /// contradiction.  We still add it (so contradictions catches
-    /// it) but log under TAM_DBG_SELF_LOOP for diagnosis.
+    /// Self-loops (a < a) are degenerate — they produce immediate
+    /// contradictions via the cyclic check.  In most cases such a
+    /// self-loop arises from subst_system collapsing two distinct
+    /// nodes to the same id AFTER a less-atom between them was already
+    /// recorded; the resulting `a < a` is a true contradiction.  We
+    /// still add it so the contradiction check catches it.
     pub fn add_less(&mut self, l: LessAtom) {
         if !self.less_atoms.iter().any(|x| x == &l) {
             self.bump_cache_lvar(&l.smaller);
@@ -575,8 +635,20 @@ impl System {
     /// `cyclic` and `has_forbidden_chain` miss contradictions HS catches
     /// (root cause of the StatVerif KU(pcs) over-saturation).
     pub fn always_before(&self, i: &NodeId, j: &NodeId) -> bool {
-        if i == j { return false; }
-        // Build adjacency from less atoms + edges + unsolved chains.
+        // Build the adjacency once and query it once; this keeps the old
+        // per-call path provably identical to the hoisted callers that
+        // call `build_always_before_adj` / `always_before_with`.
+        let adj = self.build_always_before_adj();
+        self.always_before_with(&adj, i, j)
+    }
+
+    /// Build the `alwaysBefore` adjacency map (`rawLessRel`) from
+    /// `sLessAtoms ++ sEdges ++ unsolvedChains`. This is exactly the map
+    /// that `always_before` constructs per call; hoist it out of loops via
+    /// [`always_before_with`] so the relation is built once per pass and
+    /// queried many times. The relation depends only on `&self`, never on
+    /// the `i`/`j` query arguments.
+    pub fn build_always_before_adj(&self) -> PrebuiltAdj {
         let mut adj: std::collections::BTreeMap<NodeId, Vec<NodeId>>
             = std::collections::BTreeMap::new();
         for l in &self.less_atoms {
@@ -593,6 +665,16 @@ impl System {
                 adj.entry(c.0.clone()).or_default().push(p.0.clone());
             }
         }
+        PrebuiltAdj { adj }
+    }
+
+    /// `alwaysBefore i j` against a prebuilt adjacency map (see
+    /// [`build_always_before_adj`](Self::build_always_before_adj)). The BFS
+    /// is byte-for-byte the one in the original per-call `always_before`,
+    /// so hoisting the adjacency build is a pure refactor.
+    pub fn always_before_with(&self, adj: &PrebuiltAdj, i: &NodeId, j: &NodeId) -> bool {
+        if i == j { return false; }
+        let adj = &adj.adj;
         // BFS from i until j.
         let mut frontier: std::collections::VecDeque<NodeId>
             = std::collections::VecDeque::new();

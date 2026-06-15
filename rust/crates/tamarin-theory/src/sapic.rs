@@ -207,8 +207,9 @@ impl<Ann, V> Process<Ann, V> {
     }
 }
 
-/// `pfoldMap`: visit every node in the process tree (post-order) calling `f`,
-/// concatenating outputs.
+/// `pfoldMap`: visit every node in the process tree calling `f`,
+/// concatenating outputs. Self-first (pre-order): each node is emitted
+/// before its children (body for `Action`; left then right for `Comb`).
 pub fn pfold_map<Ann, V, T, F: FnMut(&Process<Ann, V>) -> Vec<T>>(
     p: &Process<Ann, V>,
     f: &mut F,

@@ -825,17 +825,16 @@ pub fn subst_bound_guarded(g: &Guarded, s: &[(u32, p::VarSpec)]) -> Guarded {
 
 fn convert(polarity: bool, f: &p::Formula) -> Result<Guarded, GuardError> {
     match f {
-        p::Formula::True => Ok(gtf(polarity != true)),
-        p::Formula::False => Ok(gtf(polarity != false)),
+        p::Formula::True => Ok(gtf(!polarity)),
+        p::Formula::False => Ok(gtf(polarity)),
         p::Formula::Atom(a) => {
             let ga = atom_to_gatom_free(a);
             if polarity { Ok(gnot_atom(&ga)) } else { Ok(Guarded::Atom(ga)) }
         }
         p::Formula::Not(g) => convert(!polarity, g),
         p::Formula::And(a, b) => {
-            let mut sub = vec![convert(polarity, a)?, convert(polarity, b)?];
+            let sub = vec![convert(polarity, a)?, convert(polarity, b)?];
             if polarity {
-                sub.reverse(); sub.reverse(); // no-op, satisfy borrow patterns
                 Ok(gdisj(sub))
             } else {
                 Ok(gconj(sub))
@@ -1147,14 +1146,14 @@ pub fn normalize_witness_lvars(g: &Guarded) -> Guarded {
     subst_guarded(g, &subst)
 }
 
-/// `normalize_bound_lvars` from the pre-DeBruijn implementation has been
-/// REMOVED.  With HS-faithful DeBruijn bindings, alpha-equivalent formulas
-/// compare equal under structural `Eq` automatically — Bound vars carry no
-/// idx, so `Ex j:5. KU(s)@j:5` and `Ex j:6. KU(s)@j:6` both yield
-/// `GGuarded { vars: [(j, Node)], body: ... Bound(0) ... }`.
-///
-/// Kept as a no-op stub for any straggling caller; will be deleted once
-/// every site is migrated.
+/// Identity no-op on `Guarded`, kept so callers can express the intent of
+/// alpha-canonicalisation.  With HS-faithful DeBruijn bindings, alpha-equivalent
+/// formulas compare equal under structural `Eq` automatically — Bound vars carry
+/// no idx, so `Ex j:5. KU(s)@j:5` and `Ex j:6. KU(s)@j:6` both yield
+/// `GGuarded { vars: [(j, Node)], body: ... Bound(0) ... }` — so no rewriting is
+/// needed.  Called from `constraint::system`, `solver::reduction`, and
+/// `solver::simplify` to mark the spots where HS relied on its DeBruijn
+/// invariant.
 pub fn normalize_bound_lvars(g: &Guarded) -> Guarded {
     g.clone()
 }
@@ -1325,7 +1324,7 @@ fn cac_rec_term(t: &GTerm, cmp: GCmp) -> GTerm {
                 let mut flat = Vec::new();
                 cac_flatten(op, &l2, &mut flat);
                 cac_flatten(op, &r2, &mut flat);
-                flat.sort_by(|a, b| cmp(a, b));
+                flat.sort_by(&cmp);
                 // Right-fold to a binary chain.  At least 2 args.
                 let mut iter = flat.into_iter().rev();
                 let last = iter.next().unwrap_or(GTerm::PubLit(String::new()));
@@ -1712,9 +1711,8 @@ pub fn contains_action(g: &Guarded) -> bool {
         Guarded::Atom(a) => matches!(a, GAtom::Action(_, _)),
         Guarded::Disj(xs) | Guarded::Conj(xs) => xs.iter().any(contains_action),
         Guarded::GGuarded { guards, body, .. } => {
-            !guards.is_empty()
-                || guards.iter().any(|a| matches!(a, GAtom::Action(_, _)))
-                || contains_action(body)
+            // Haskell `Guarded.hs:636-637`: `\_ _ as body -> not (null as) || body`.
+            !guards.is_empty() || contains_action(body)
         }
     }
 }
@@ -1768,7 +1766,7 @@ pub fn to_induction_hypothesis(g: &Guarded) -> Result<Guarded, String> {
                 Quant::All => {
                     // gex ss as (gconj (map gnotAtom lastAtos ++ [gf']))
                     let mut items: Vec<Guarded> = last_atos.iter()
-                        .map(|g| gnot(g)).collect();
+                        .map(gnot).collect();
                     items.push(body2);
                     Ok(gex(vars.clone(), guards.clone(), gconj(items)))
                 }
@@ -2158,10 +2156,10 @@ mod tests {
         // Closed + has action atoms → ginduct should succeed.
         let (base, step) = ginduct(&g).expect("ginduct should succeed");
         // Step case is gconj([orig, IH]).
-        match step {
-            Guarded::Conj(items) => assert_eq!(items.len(), 2),
-            // gconj may flatten if a sub-Conj appears.
-            _ => {} // accept any shape — the contract is just that ginduct returned
+        // gconj may flatten if a sub-Conj appears; otherwise accept any shape —
+        // the contract is just that ginduct returned.
+        if let Guarded::Conj(items) = step {
+            assert_eq!(items.len(), 2);
         }
         let _ = base;
     }
@@ -2348,6 +2346,9 @@ mod tests {
         };
         let a_clone = a.clone();
         let b_clone = b.clone();
+        // The `b_clone` arm is kept conceptually distinct from the default to
+        // mirror the test valuation (a → drop, b → keep, others → unknown).
+        #[allow(clippy::if_same_then_else)]
         let val = move |atom: &p::Atom| {
             if atom == &a_clone { Some(true) }   // drop
             else if atom == &b_clone { None }    // keep

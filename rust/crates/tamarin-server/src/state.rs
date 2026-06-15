@@ -74,7 +74,6 @@ impl TheoryOrigin {
             TheoryOrigin::Interactive => "(interactively created)".into(),
         }
     }
-    pub fn is_local(&self) -> bool { matches!(self, TheoryOrigin::Local(_)) }
 }
 
 #[derive(Default, Clone)]
@@ -85,7 +84,6 @@ pub struct TheoryStore {
 #[derive(Default)]
 struct TheoryStoreInner {
     by_idx: BTreeMap<usize, TheoryEntry>,
-    next_idx: usize,
 }
 
 impl TheoryStore {
@@ -100,7 +98,6 @@ impl TheoryStore {
         };
         entry.idx = idx;
         inner.by_idx.insert(idx, entry);
-        inner.next_idx = idx + 1;
         idx
     }
 
@@ -141,7 +138,6 @@ impl TheoryStore {
         // lazily).  See doc comment above.
         clone.proof_state = None;
         inner.by_idx.insert(new_idx, clone);
-        inner.next_idx = new_idx + 1;
         Some(new_idx)
     }
 
@@ -168,7 +164,6 @@ impl TheoryStore {
         // proof state, the clone starts from scratch (`None`).
         clone.proof_state = clone.proof_state.as_ref().map(|ps| Arc::new(ps.fork()));
         inner.by_idx.insert(new_idx, clone);
-        inner.next_idx = new_idx + 1;
         Some(new_idx)
     }
 

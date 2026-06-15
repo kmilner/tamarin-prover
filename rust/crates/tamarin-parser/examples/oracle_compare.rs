@@ -143,8 +143,10 @@ fn parse_tamarin_output(s: &str) -> Option<Counts> {
 }
 
 fn count_ours(t: &ast::Theory) -> Counts {
-    let mut c = Counts::default();
-    c.name = t.name.clone();
+    let mut c = Counts {
+        name: t.name.clone(),
+        ..Default::default()
+    };
     for it in &t.items {
         match it {
             ast::TheoryItem::Rule(_) | ast::TheoryItem::IntrRule(_) => c.rules += 1,

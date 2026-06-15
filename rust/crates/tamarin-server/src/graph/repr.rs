@@ -231,21 +231,16 @@ pub fn add_cluster(
         }
     }
     // Collect all the edges and node ids absorbed by sub_clusters.
-    let absorbed_edges: BTreeSet<*const GEdge> = sub_clusters.iter()
-        .flat_map(|c| c.edges.iter().map(|e| e as *const _))
-        .collect();
+    // The cloned cluster edges live at different addresses than the
+    // elements of `all_edges`, so absorbed edges must be filtered by
+    // structural equality (not pointer identity).
     let absorbed_node_ids: BTreeSet<NodeId> = sub_clusters.iter()
         .flat_map(|c| c.nodes.iter().map(|n| n.id.clone()))
         .collect();
-    let remaining_edges: Vec<GEdge> = all_edges.into_iter()
-        .filter(|e| !absorbed_edges.contains(&(e as *const _)))
-        .collect();
-    // Pointer equality is unsafe to rely on across iterations after
-    // cloning — re-filter by structural equality instead.
     let absorbed_edges_struct: Vec<GEdge> = sub_clusters.iter()
         .flat_map(|c| c.edges.iter().cloned())
         .collect();
-    let remaining_edges: Vec<GEdge> = remaining_edges.into_iter()
+    let remaining_edges: Vec<GEdge> = all_edges.into_iter()
         .filter(|e| !absorbed_edges_struct.iter().any(|ae| ae == e))
         .collect();
     let remaining_nodes: Vec<GNode> = repr.nodes.iter()

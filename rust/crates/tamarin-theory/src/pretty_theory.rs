@@ -312,7 +312,7 @@ pub fn pretty_closed_theory(
     // string append.
     use rayon::prelude::*;
     let rendered: Vec<Option<String>> = parsed.items.par_iter()
-        .map(|item| render_parsed_item(item, 0, parsed, elaborated, proved, in_file))
+        .map(|item| render_parsed_item(item, parsed, elaborated, proved, in_file))
         .collect();
     for b in rendered.into_iter().flatten() {
         out.push('\n');
@@ -532,7 +532,6 @@ fn sep_block_with_lead(lead: &str, items: &[(String, String)]) -> String {
 
 fn render_parsed_item(
     item: &p::TheoryItem,
-    _idx: usize,
     parsed: &p::Theory,
     elab: &Theory,
     proved: &[ProvedLemma],
@@ -603,7 +602,7 @@ fn render_parsed_item(
             let mut active: Vec<&p::TheoryItem> = then_items.iter().collect();
             if let Some(else_b) = else_items { active.extend(else_b.iter()); }
             let blocks: Vec<String> = active.iter()
-                .filter_map(|it| render_parsed_item(it, 0, parsed, elab, proved, in_file))
+                .filter_map(|it| render_parsed_item(it, parsed, elab, proved, in_file))
                 .collect();
             if blocks.is_empty() { None } else { Some(blocks.join("\n\n")) }
         }
@@ -687,23 +686,6 @@ fn rewrite_arity1_fact(
     }
 }
 
-/// HS `prettyMacros` / `prettyMacro` (TheoryObject.hs:819-840).
-///
-/// HS: `prettyMacros m = keyword_ "macros:" $$ nest 4 (vcat [macros...])`
-/// HS: `prettyMacro (op, args, out) =
-///       vcat [ppNonEmptyList (\ds -> sep (map (nest 4) ds)) text [op++"("]
-///             <-> prettyVarList args <-> text ") = " <-> prettyTerm show out]`
-///
-/// `ppNonEmptyList hdr pp [x] = hdr [pp x] = sep [nest 4 (text x)]`
-/// = `nest 4 (text (name++"("))`.
-///
-/// With `keyword_ "macros:" $$ nest 4 (nest 4 "name(" <+> args <+> ") = " <+> body)`:
-/// the double-nest (8 total) combined with `keyword_`'s 7-char width makes
-/// `nil_above_nest` inline the content (k = -7+8 = 1 > 0), putting everything
-/// on ONE line: `macros: name( args ) =  body`.
-///
-/// For multiple macros, each is nested 4 levels inside the outer `nest 4`,
-/// giving 8-space indent on subsequent lines.
 /// HS `prettyMacros` / `prettyMacro` (TheoryObject.hs:819-840).
 ///
 /// HS: `prettyMacros m = keyword_ "macros:" $$ nest 4 (vcat [macros...])`
@@ -1024,43 +1006,6 @@ fn render_rule_body_at(prems: &[p::Fact], acts: &[p::Fact], concs: &[p::Fact], i
     pf::rule_body_to_doc(prems, acts, concs).nest(nest).render()
 }
 
-/// Inline-only bracket list (no wrap).  Used to check single-line fit
-/// of the rule body before deciding to wrap the inner brackets.
-fn render_fact_brackets_inline(facts: &[p::Fact]) -> String {
-    if facts.is_empty() {
-        return "[ ]".to_string();
-    }
-    let mut s = String::from("[ ");
-    for (i, f) in facts.iter().enumerate() {
-        if i > 0 { s.push_str(", "); }
-        // Use the indent-unaware path so each fact is also inline.
-        s.push_str(&render_fact_inline(f));
-    }
-    s.push_str(" ]");
-    s
-}
-
-fn render_fact_inline(fa: &p::Fact) -> String {
-    let mut s = String::new();
-    if fa.persistent { s.push('!'); }
-    s.push_str(&fa.name);
-    s.push_str("( ");
-    for (i, t) in fa.args.iter().enumerate() {
-        if i > 0 { s.push_str(", "); }
-        s.push_str(&pf::pretty_term(t));
-    }
-    if fa.args.is_empty() {
-        // Already opened `( `; just close with ` )` to give `Name(  )`?
-        // No — match `Name( )` single-space form.  Pop the trailing
-        // space and emit `)` directly.
-        s.pop();
-        s.push_str(" )");
-    } else {
-        s.push_str(" )");
-    }
-    s
-}
-
 /// Render the HS `/* rule (modulo AC) <name>: ... variants (modulo AC)
 /// 1. ... */` comment block.  Mirrors `prettyClosedProtoRule`'s
 /// `multiComment $ prettyProtoRuleAC ruAC` branch (ClosedTheory.hs:354).
@@ -1113,16 +1058,11 @@ fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule, att
     let has_residual_variants = rule.variant_substs.iter().any(|sub| !sub.is_empty());
     if has_residual_variants {
         s.push_str("    variants (modulo AC)\n");
-        // HS `numbered'` (PrettyPrint/Class.hs:252-259) right-pads each
-        // variant number to the width of the largest number so the dots
-        // line up: e.g. with 21 variants, variant 1 is rendered as
-        // ` 1.` (leading space) to align with `21.`.
-        let total = rule.variant_substs.len();
-        let n_width = total.to_string().len();
-        for (i, subst) in rule.variant_substs.iter().enumerate() {
-            if i > 0 { s.push_str("    \n"); }
-            s.push_str(&render_variant_subst(i + 1, subst, n_width));
-        }
+        // HS `prettyDisjLNSubstsVFresh = numbered' (map ppConj substs)`
+        // (SubstVFresh.hs:223-227).  Built and rendered as ONE Doc at
+        // `nest 4` so the `text i <> ". " <> vcat` beside-onto-multiline
+        // ribbon interaction is HS-faithful — see `variant_subst_doc`.
+        s.push_str(&render_variant_substs_block(&rule.variant_substs));
     }
     // HS `prettyProtoRuleACInfo i = ppVariants ... $-$ prettyLoopBreakers i`
     // (Rule.hs:1284-1287): the loop-breaker line also appears INSIDE the
@@ -1134,55 +1074,74 @@ fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule, att
     s
 }
 
-/// Render one entry of `prettyDisjLNSubstsVFresh`
-/// (SubstVFresh.hs:223-229): the variant's number, then each domain var
-/// followed by `= <range>`.  HS aligns the `=` at column 6 from the
-/// entry's local origin when the var name is short, otherwise wraps to
-/// a new line.
+/// Render one entry of `prettyDisjLNSubstsVFresh` (SubstVFresh.hs:223-229)
+/// as a Doc: the variant's number, then each domain var followed by
+/// `= <range>`.  `n_width` is the width of the largest variant number
+/// (HS `numbered`'s `nWidth = length (show n)`, Class.hs:258); each
+/// variant's number is right-flushed in that width so dots line up.
 ///
-/// `n_width` is the width of the largest variant number (HS's
-/// `numbered`'s `nWidth = length (show n)` at PrettyPrint/Class.hs:258);
-/// each variant's number is right-flushed in that width so dots line up.
-fn render_variant_subst(
+/// HS `numbered` (Class.hs:252-259) renders each variant as
+/// `pp (i, d) = text (flushRight nWidth (show i)) <> d` where `d` is
+/// `text ". " <> vcat (map prettyEq bindings)`.  The whole `numbered'`
+/// block sits at `nest 4` inside the rule's `multiComment`.
+///
+/// CRITICAL: the `text ". " <>` is a BESIDE onto the multi-line `vcat`.
+/// In HughesPJ the ribbon budget for the inner (wrapped) lines is then
+/// measured from the OUTER line start (the `text i` column), not from the
+/// var column.  Rendering each binding STANDALONE (`entry.nest(col)`)
+/// instead measures the ribbon from the var column, shifting wrap
+/// decisions for terms sitting within a few columns of the ribbon
+/// boundary — e.g. an 11-tuple `<x.16, …, x.26>` whose `x.26>` packs onto
+/// the overflow line standalone but breaks BEFORE `x.26` (gluing `>`)
+/// under the HS structure (pkcs11-templates `cannot_obtain_key` et al.).
+/// So build the whole numbered conjunction as ONE Doc and render it at
+/// `nest 4`, mirroring HS byte-for-byte.
+fn variant_subst_doc(
     n: usize,
     subst: &tamarin_term::subst_vfresh::LNSubstVFresh,
     n_width: usize,
-) -> String {
-    use crate::pretty_hpj::Doc;
-    let mut s = String::new();
+) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
     let bindings = subst.to_list();
-    // Continuation prefix's width depends on `n_width` so subsequent lines
-    // line up under the first variable column.
-    let label = format!("{:>width$}. ", n, width = n_width);
-    let cont_indent = " ".repeat(label.chars().count());
-    for (i, (v, t)) in bindings.iter().enumerate() {
-        let var_str = render_lvar(v);
-        let prefix = if i == 0 {
-            format!("    {}", label)
-        } else {
-            format!("    {}", cont_indent)
-        };
-        // HS `prettyEq (a,b) = prettyNTerm (Var a) $$ nest 6 (text "="
-        // <-> prettyNTerm b)` (SubstVFresh.hs:228-229).  `$$` overlaps the
-        // (single-line) var onto the same line as the nest-6 `= <term>`,
-        // giving `z     = term` with `=` at col 6; the term itself wraps
-        // via `prettyTerm`'s fcat/fsep, with continuation aligned under the
-        // first argument.  Build it as one Doc so the engine reproduces the
-        // term wrap and continuation indent byte-identically.  `<->` is
-        // `<+>` (beside-with-space).
+    // HS `prettyEq (a,b) = prettyNTerm (Var a) $$ nest 6 (text "="
+    // <-> prettyNTerm b)` (SubstVFresh.hs:228-229).  `<->` is `<+>`
+    // (beside-with-space).
+    let eq_docs: Vec<Doc> = bindings.iter().map(|(v, t)| {
         let term_doc = pf::term_to_doc(&lnterm_to_parser(t), &[]);
         let rhs = Doc::text("=").beside_sp(term_doc).nest(6);
-        let entry = Doc::text(var_str).above(rhs);
-        // Place the entry at its absolute column = prefix width.  Nest by
-        // that amount, render, then strip the leading prefix-width spaces
-        // from the first line (we emit `prefix` explicitly so the label /
-        // continuation-indent is right).
-        let col = prefix.chars().count();
-        let rendered = entry.nest(col as isize).render();
-        let strip = rendered.chars().take(col).take_while(|c| *c == ' ').count();
-        s.push_str(&prefix);
-        s.push_str(&rendered[strip..]);
-        s.push('\n');
+        Doc::text(render_lvar(v)).above(rhs)
+    }).collect();
+    let conj = hpj::vcat(eq_docs);
+    // HS `pp (i, d) = text (flushRight nWidth (show i)) <> d`, with
+    // `d = text ". " <> conj` (from `numbered' = numbered (text "")
+    // . map (text ". " <>)`).
+    let label = format!("{:>width$}", n, width = n_width);
+    Doc::text(label).beside(Doc::text(". ").beside(conj))
+}
+
+/// Render the full `prettyDisjLNSubstsVFresh` (numbered') block.  HS
+/// `numbered vsep ds = foldr1 ($-$) $ intersperse vsep $ map pp ...` with
+/// `vsep = text ""` (a blank separator line at the block's nest).
+///
+/// Each numbered conjunction is an independent Doc rendered at `nest 4`
+/// (the `multiComment` indent) — they don't interact across the blank
+/// separators, so rendering them individually is faithful — and joined by
+/// the blank `"    \n"` line (HS `text ""` at nest 4).  Building each
+/// conjunction as a single Doc (not per-binding) is what reproduces the
+/// `text i <> ". " <> vcat` beside-onto-multiline ribbon decision.
+fn render_variant_substs_block(
+    substs: &[tamarin_term::subst_vfresh::LNSubstVFresh],
+) -> String {
+    let n_width = substs.len().to_string().len();
+    let mut s = String::new();
+    for (i, subst) in substs.iter().enumerate() {
+        if i > 0 {
+            // HS `intersperse (text "")` → a blank line at nest 4.
+            s.push_str("    \n");
+        }
+        let mut rendered = variant_subst_doc(i + 1, subst, n_width).nest(4).render();
+        rendered.push('\n');
+        s.push_str(&rendered);
     }
     s
 }
@@ -1201,7 +1160,7 @@ fn render_lvar(v: &tamarin_term::lterm::LVar) -> String {
 }
 
 /// Convert LNFacts (post-elaboration) to parser-AST Facts so we can
-/// reuse `render_fact`.  Drops fact annotations.
+/// reuse the parser-AST fact rendering path.  Drops fact annotations.
 fn lnfacts_to_parser(facts: &[crate::fact::LNFact]) -> Vec<p::Fact> {
     facts.iter().map(lnfact_to_parser).collect()
 }
@@ -1338,105 +1297,7 @@ const RIBBON: usize = 73;
 /// how generous the ribbon would be.
 const PAGE_WIDTH: usize = 110;
 
-/// Render `[ f1, f2, ... ]` with HS's fact spacing.  Inside the
-/// brackets there is a single space pad; facts are separated by `, `.
-/// HS emits `[ ]` (with single space) for an empty list.
-///
-/// Inline form `[ a, b, c ]` is tried first.  When it overflows the
-/// ribbon (`indent + RIBBON`), falls back to HS's `ppFactsList`
-/// multi-line layout (Rule.hs:1258 —
-/// `fsep [operator_ "[", ppFacts' list, operator_ "]"]`):
-///
-/// ```text
-/// [
-/// f1, f2, f3,
-/// f4
-/// ]
-/// ```
-///
-/// Each content line at `indent` (same as the `[`).  Facts pack
-/// greedily; we punctuate with `, ` and break when the next fact would
-/// push the current line past `indent + RIBBON`.
-#[allow(dead_code)]
-fn render_fact_brackets(facts: &[p::Fact]) -> String {
-    render_fact_brackets_at(facts, 3, 3)
-}
-
-/// `line_start`: column where the OUTPUT line on which this bracket
-/// list begins started.  Equal to `indent` when the `[` is at the start
-/// of a fresh line; less than `indent` when the bracket list is being
-/// laid out mid-line (e.g. inside a `Fact( ... )` whose body fsep-packs
-/// it).  Used for HS-faithful ribbon checks `cur_col - line_start <=
-/// RIBBON`.
-fn render_fact_brackets_at(facts: &[p::Fact], indent: usize, line_start: usize) -> String {
-    if facts.is_empty() {
-        return "[ ]".to_string();
-    }
-    // Try inline first.
-    let inline = render_fact_brackets_inline(facts);
-    let inline_max_col = std::cmp::min(line_start + RIBBON, PAGE_WIDTH);
-    if !inline.contains('\n') && indent + inline.chars().count() < inline_max_col {
-        return inline;
-    }
-    // HS `ppFactsList list = fsep [text "[", ppFacts' list, text "]"]`
-    // (Rule.hs:1268). The three-doc fsep tries:
-    //   (1) `[ body ]` inline  (checked above)
-    //   (2) `[ body\n]`         — body inline after `[`, closer on
-    //                             its own line
-    //   (3) `[\n body \n]`      — full break around the body
-    //
-    // For (2)/(3) the body is itself `fsep . punctuate comma` so it
-    // packs across lines comma-by-comma.
-    let inline_body = facts.iter()
-        .map(render_fact)
-        .collect::<Vec<_>>()
-        .join(", ");
-    let opener_inline_body = format!("[ {}", inline_body);
-    let opener_fits = !opener_inline_body.contains('\n')
-        && indent + opener_inline_body.chars().count() <= inline_max_col;
-    let pad = " ".repeat(indent);
-    if opener_fits {
-        // Layout (2): `[ body\n<pad>]`
-        return format!("{}\n{}]", opener_inline_body, pad);
-    }
-    // Layout (3): each fact at column `indent`, packed greedily.
-    let items: Vec<String> = facts.iter()
-        .map(|f| render_fact_at(f, indent, indent))
-        .collect();
-    let body = fsep_pack(&items, indent, ", ", indent);
-    format!("[\n{}{}\n{}]", pad, body, pad)
-}
-
-
-/// HS `prettyFact`: emit `Name( arg1, arg2 )` with spaces inside the
-/// parens (from `nestShort'`), commas between args.  Mirrors
-/// `prettyFact` (Fact.hs:537-542):
-///
-/// ```haskell
-/// ppFact n ts = nestShort' (n ++ "(") ")" . fsep . punctuate comma $ map ppTerm ts
-/// ```
-///
-/// `nestShort'` (Class.hs:221-223) produces:
-///   - flat: `Name( a, b, c )`
-///   - multi: lead and finish on separate lines surrounding the nested
-///     body, with `$$` allowing lead and body's first line to overlap
-///     when columns permit.
-///
-/// Our wrap-aware variant: try inline first; on overflow, emit
-/// `Name( <first_arg>,\n<col_of_paren+1>more args fsep-packed\n<col_of_name>)`.
-fn render_fact(fa: &p::Fact) -> String {
-    // Indent-unaware entry-point used when called from generic code
-    // (acts list join, AC variant body inline).  Uses a conservative
-    // indent of 3 (the typical rule-body column).
-    render_fact_at(fa, 3, 3)
-}
-
-/// `line_start`: see `render_fact_brackets_at`.
-fn render_fact_at(fa: &p::Fact, indent: usize, line_start: usize) -> String {
-    render_fact_at_with_trailing(fa, indent, line_start, 0)
-}
-
-/// Like `render_fact_at` but the inline-fit check reserves
+/// Like `render_fact_at_with_trailing` but the inline-fit check reserves
 /// `trailing_chars` cols at the end of the line for caller-emitted
 /// trailing text (e.g. ` ▶₁ #i )` after a Premise goal's fact).  This
 /// mirrors HS's `fits` walking PAST the fact's nestShort' sep Union
@@ -1652,7 +1513,7 @@ fn render_pair_at(items: &[p::Term], indent: usize, line_start: usize) -> String
         (indent + 1 + body_last_line_len, body_line_start)
     };
     let close_max = std::cmp::min(gt_line_start + RIBBON, PAGE_WIDTH);
-    let close_fits = !last_is_multiline && gt_col + 1 <= close_max;
+    let close_fits = !last_is_multiline && gt_col < close_max;
     if first_is_multiline {
         // `<\n<inner_pad><body>\n<pad>>` (close on own line when last
         // is multi-line; attached when fits).
@@ -1934,15 +1795,6 @@ fn lemma_attr_docs(attrs: &[p::LemmaAttr], in_file: &str) -> Vec<crate::pretty_h
     out
 }
 
-// Legacy string-join form (kept for any direct callers).
-#[allow(dead_code)]
-fn render_lemma_attrs(attrs: &[p::LemmaAttr], in_file: &str) -> String {
-    lemma_attr_docs(attrs, in_file).iter()
-        .map(|d| d.clone().render())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 fn quantifier_keyword(q: &p::TraceQuantifier) -> &'static str {
     match q {
         p::TraceQuantifier::AllTraces => "all-traces",
@@ -1981,7 +1833,7 @@ fn render_guarded_block(lem: &p::Lemma, macros: &[p::Macro]) -> String {
             }
             let full_text = crate::pretty_formula::pretty_formula(&expanded_formula);
             let sub_text = e.subject_formula.as_ref()
-                .map(|f| crate::pretty_formula::pretty_formula(f))
+                .map(crate::pretty_formula::pretty_formula)
                 .unwrap_or_else(|| full_text.clone());
             block.push_str("    \"");
             block.push_str(&sub_text);
@@ -2287,13 +2139,6 @@ fn pp_proof(
     }
 }
 
-/// Render a single proof method.  Mirrors `prettyProofMethod`
-/// (ProofMethod.hs:1486).
-#[allow(dead_code)]
-fn pp_step(m: &crate::constraint::solver::proof_method::ProofMethod) -> String {
-    pp_step_at(m, 0)
-}
-
 /// Build the proof-step method as a `pretty_hpj::Doc`, mirroring
 /// `pp_step_at` but yielding a Doc (so it can be combined with the
 /// `/* unannotated */` comment via `sep`, per HS
@@ -2413,11 +2258,6 @@ pub(crate) fn render_goal_for_oracle(g: &crate::constraint::constraints::Goal) -
     render_goal_at(g, 0, 0)
 }
 
-#[allow(dead_code)]
-fn render_goal(g: &crate::constraint::constraints::Goal) -> String {
-    render_goal_at(g, 0, 0)
-}
-
 /// Wrap-aware goal renderer.  `indent` is the column where the goal's
 /// first character will land — used so internal facts/terms can decide
 /// to wrap when their inline form overflows the ribbon.  `line_start`
@@ -2489,18 +2329,10 @@ fn render_goal_at_trailing(g: &crate::constraint::constraints::Goal, indent: usi
 /// form the body is sandwiched with spaces — `Name( arg1, arg2 )`.
 /// For arity-0: `Name( )`.  Persistent tags get a `!` prefix via
 /// `showFactTag` (Fact.hs:519-523).
-#[allow(dead_code)]
-fn render_lnfact(fa: &crate::fact::LNFact) -> String {
-    render_lnfact_at(fa, 0, 0)
-}
-
-/// Wrap-aware variant.  When the inline form exceeds the ribbon from
-/// `indent`, lays out the args with HS-faithful `nestShort'` semantics
-/// (see `render_fact_at` for the parser-AST equivalent).
-fn render_lnfact_at(fa: &crate::fact::LNFact, indent: usize, line_start: usize) -> String {
-    render_lnfact_at_with_trailing(fa, indent, line_start, 0)
-}
-
+///
+/// Wrap-aware: when the inline form exceeds the ribbon from `indent`,
+/// lays out the args with HS-faithful `nestShort'` semantics (see
+/// `render_fact_at_with_trailing` for the parser-AST equivalent).
 fn render_lnfact_at_with_trailing(fa: &crate::fact::LNFact, indent: usize, line_start: usize, trailing_chars: usize) -> String {
     use crate::fact::Multiplicity;
     let prefix = match &fa.tag {

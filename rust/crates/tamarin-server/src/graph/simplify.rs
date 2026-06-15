@@ -29,7 +29,7 @@ use tamarin_term::term::Term;
 pub fn compress_system(mut sys: System) -> System {
     sys = drop_entailed_ord_constraints(sys);
     let node_ids: Vec<NodeId> = sys.nodes.iter().map(|(id, _)| id.clone()).collect();
-    let mut last_atom_id: Option<NodeId> = sys.last_atom.clone();
+    let last_atom_id: Option<NodeId> = sys.last_atom.clone();
     for v in node_ids {
         sys = try_hide_node_id(&v, sys);
     }
@@ -42,7 +42,7 @@ pub fn compress_system(mut sys: System) -> System {
         extra.insert(la.smaller.clone());
         extra.insert(la.larger.clone());
     }
-    if let Some(la_id) = last_atom_id.take() { extra.insert(la_id); }
+    if let Some(la_id) = last_atom_id { extra.insert(la_id); }
     for v in extra {
         sys = try_hide_node_id(&v, sys);
     }
@@ -179,7 +179,7 @@ fn try_hide_action(v: &NodeId, sys: System) -> Result<System, System> {
     if ku_actions.is_empty() { return Err(sys); }
     // All KU terms must be pair, inverse, pub, or nat — otherwise bail.
     if !ku_actions.iter().all(|(_, fa)| {
-        fa.terms.first().map_or(false, |t| eligible_term(t))
+        fa.terms.first().is_some_and(eligible_term)
     }) {
         return Err(sys);
     }
@@ -399,9 +399,8 @@ fn has_cycle(less: &[LessAtom], nodes: &BTreeSet<NodeId>) -> bool {
     // DFS cycle detection per starting node.
     let mut color: BTreeMap<NodeId, u8> = BTreeMap::new();
     for n in nodes {
-        if color.get(n).copied().unwrap_or(0) == 0 {
-            if dfs_has_cycle(n, &adj, &mut color) { return true; }
-        }
+        if color.get(n).copied().unwrap_or(0) == 0
+            && dfs_has_cycle(n, &adj, &mut color) { return true; }
     }
     false
 }
