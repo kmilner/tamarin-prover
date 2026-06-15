@@ -1039,6 +1039,27 @@ pub fn lnterm_to_term(t: &tamarin_term::lterm::LNTerm) -> p::Term {
                             other => flat.push(other.clone()),
                         }
                         p::Term::Pair(flat)
+                    } else if name == "exp" && parser_args.len() == 2 {
+                        // Round-trip the `exp` NoEq head back to parser
+                        // `BinOp(Exp, ..)` (the inverse of `term_to_lnterm`'s
+                        // `p::BinOp::Exp` arm at elaborate.rs:1467-1470).
+                        // HS `viewTerm` exposes `exp(b,e)` as
+                        // `FApp (NoEq s) [t1,t2] | s == expSym`, and
+                        // `prettyTerm` (Term/Term.hs:274) renders that arm as
+                        // `ppTerm t1 <> text "^" <> ppTerm t2` — infix `b^e`,
+                        // uniformly at every nesting depth (the printer is
+                        // recursive).  Without this round-trip the runtime
+                        // exp term reaches the formula/guard term path as a
+                        // generic `App("exp", [..])`, which `term_to_doc`/
+                        // `pp_term` render PREFIX `exp(b, e)` — diverging from
+                        // HS for every exp nested inside a multiset/pair/
+                        // equation in a guard or contradiction (e.g.
+                        // DHKEA_NAXOS `eCK_key_secrecy`).  Same NoEq
+                        // round-trip rationale as the AC/`em` arms above.
+                        let mut iter = parser_args.into_iter();
+                        let base = iter.next().unwrap();
+                        let exponent = iter.next().unwrap();
+                        p::Term::BinOp(p::BinOp::Exp, Box::new(base), Box::new(exponent))
                     } else {
                         p::Term::App(name, parser_args)
                     }
