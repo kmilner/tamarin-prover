@@ -4672,8 +4672,6 @@ impl<'ctx> Reduction<'ctx> {
                             let action_live_node_ids: std::collections::BTreeSet<
                                 crate::constraint::constraints::NodeId> =
                                 self.sys.nodes.iter().map(|(n, _)| n.clone()).collect();
-                            let skip_live_e =
-                                std::env::var("TAM_RS_DISABLE_E5_LIVE_EDGE_SKIP").is_err();
                             'arm: for arm_sys in action_arm_systems {
                                     let mut sub = Reduction::new(self.ctx, arm_sys);
                                     // Edge-induced fact unification over
@@ -4704,8 +4702,7 @@ impl<'ctx> Reduction<'ctx> {
                                         let chain_eqs: Vec<_> = sub.sys.edges
                                             .iter()
                                             .filter_map(|e| {
-                                                if skip_live_e
-                                                    && action_live_node_ids.contains(&e.src.0)
+                                                if action_live_node_ids.contains(&e.src.0)
                                                     && action_live_node_ids.contains(&e.tgt.0) {
                                                     return None;
                                                 }
