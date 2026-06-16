@@ -358,16 +358,45 @@ pub fn free_term(t: LNTerm) -> BLTerm {
 // =============================================================================
 
 /// A type that contains free `LVar`s. The Haskell typeclass takes a
-/// `MonotoneFunction` distinguishing AC-preserving updates from arbitrary
-/// ones. In Rust we expose only the common cases.
+/// `MonotoneFunction` (LTerm.hs:550) distinguishing AC-position-preserving
+/// updates (`Monotone`, used by `rename`/`renameIgnoring`/`renameAvoiding*`
+/// index shifts) from arbitrary ones (`Arbitrary`, used by `someInst`,
+/// `applyVTerm` substitution, `fmap`). The two differ only at AC sub-terms:
+/// `Arbitrary` re-sorts the AC argument list (`fApp` -> `fAppAC`), while
+/// `Monotone` preserves the relative argument order (`unsafefApp`) because a
+/// monotone shift cannot change the AC-normal form ordering (LTerm.hs:753-754).
 pub trait HasFrees {
     /// Visit every free `LVar` exactly once in deterministic order.
     fn for_each_free(&self, f: &mut dyn FnMut(&LVar));
 
-    /// Map every free `LVar` through `f`. Implementations are expected to
-    /// rebuild themselves with the renamed variables and re-AC-normalise as
-    /// needed.
-    fn map_free(self, f: &mut dyn FnMut(LVar) -> LVar) -> Self;
+    /// Map every free `LVar` through `f`, threading the `monotone` flag down
+    /// to AC sub-terms.  When `monotone == false` (the `Arbitrary` case) AC
+    /// argument lists are re-sorted via the smart constructors; when
+    /// `monotone == true` (the `Monotone` case) AC argument order is
+    /// preserved (`unsafe_f_app`).  Implementations rebuild themselves with
+    /// the renamed variables.
+    fn map_free_with(self, f: &mut dyn FnMut(LVar) -> LVar, monotone: bool) -> Self;
+
+    /// `Arbitrary` map (HS default): re-AC-normalises sub-terms.  Use for
+    /// `someInst`, substitution application, and any non-order-preserving
+    /// remap.
+    fn map_free(self, f: &mut dyn FnMut(LVar) -> LVar) -> Self
+    where
+        Self: Sized,
+    {
+        self.map_free_with(f, false)
+    }
+
+    /// `Monotone` map: preserves AC argument order.  Use ONLY where HS uses
+    /// `rename`/`renameIgnoring`/`renameAvoiding*`/`someRuleACInst*` — i.e.
+    /// pure index shifts whose monotonicity guarantees the AC-normal form
+    /// does not change (LTerm.hs:545-550).
+    fn map_free_monotone(self, f: &mut dyn FnMut(LVar) -> LVar) -> Self
+    where
+        Self: Sized,
+    {
+        self.map_free_with(f, true)
+    }
 }
 
 /// `freesList`: every free `LVar`, in traversal order (with duplicates).
@@ -420,14 +449,14 @@ pub fn avoid<T: HasFrees>(t: &T) -> tamarin_utils::fresh::FastFreshState {
 
 impl HasFrees for LVar {
     fn for_each_free(&self, f: &mut dyn FnMut(&LVar)) { f(self); }
-    fn map_free(self, f: &mut dyn FnMut(LVar) -> LVar) -> Self { f(self) }
+    fn map_free_with(self, f: &mut dyn FnMut(LVar) -> LVar, _monotone: bool) -> Self { f(self) }
 }
 
 impl<C: Clone, V: HasFreesV> HasFrees for Lit<C, V> {
     fn for_each_free(&self, f: &mut dyn FnMut(&LVar)) {
         if let Lit::Var(v) = self { v.for_each_free_v(f); }
     }
-    fn map_free(self, f: &mut dyn FnMut(LVar) -> LVar) -> Self {
+    fn map_free_with(self, f: &mut dyn FnMut(LVar) -> LVar, _monotone: bool) -> Self {
         match self {
             Lit::Var(v) => Lit::Var(v.map_free_v(f)),
             l @ Lit::Con(_) => l,
@@ -471,17 +500,27 @@ where
             }
         }
     }
-    fn map_free(self, f: &mut dyn FnMut(LVar) -> LVar) -> Self {
+    fn map_free_with(self, f: &mut dyn FnMut(LVar) -> LVar, monotone: bool) -> Self {
         match self {
-            Term::Lit(l) => Term::Lit(l.map_free(f)),
+            Term::Lit(l) => Term::Lit(l.map_free_with(f, monotone)),
             Term::App(fsym, args) => {
-                let mapped: Vec<Term<L>> = args.iter().cloned().map(|a| a.map_free(f)).collect();
-                // Re-AC-normalise via smart constructors.
-                match fsym {
-                    FunSym::Ac(s) => crate::term::f_app_ac(s, mapped),
-                    FunSym::C(c) => crate::term::f_app_c(c, mapped),
-                    FunSym::List => crate::term::f_app_list(mapped),
-                    FunSym::NoEq(s) => crate::term::f_app_no_eq(s, mapped),
+                let mapped: Vec<Term<L>> =
+                    args.iter().cloned().map(|a| a.map_free_with(f, monotone)).collect();
+                // Mirrors HS `mapFrees` for `Term l` (LTerm.hs:752-754):
+                //   Arbitrary -> `fApp o`     (re-sorts AC/C via `fAppAC`/`fAppC`)
+                //   Monotone  -> `unsafefApp o` (preserves arg order for EVERY
+                //                symbol — a monotone shift cannot change the
+                //                AC/C-normal-form ordering, so the unsorted
+                //                rebuild equals the sorted one).
+                if monotone {
+                    crate::term::unsafe_f_app(fsym, mapped)
+                } else {
+                    match fsym {
+                        FunSym::Ac(s) => crate::term::f_app_ac(s, mapped),
+                        FunSym::C(c) => crate::term::f_app_c(c, mapped),
+                        FunSym::List => crate::term::f_app_list(mapped),
+                        FunSym::NoEq(s) => crate::term::f_app_no_eq(s, mapped),
+                    }
                 }
             }
         }
@@ -498,8 +537,8 @@ impl<T: HasFrees> HasFrees for Vec<T> {
     fn for_each_free(&self, f: &mut dyn FnMut(&LVar)) {
         for t in self { t.for_each_free(f); }
     }
-    fn map_free(self, f: &mut dyn FnMut(LVar) -> LVar) -> Self {
-        self.into_iter().map(|t| t.map_free(f)).collect()
+    fn map_free_with(self, f: &mut dyn FnMut(LVar) -> LVar, monotone: bool) -> Self {
+        self.into_iter().map(|t| t.map_free_with(f, monotone)).collect()
     }
 }
 
@@ -508,8 +547,8 @@ impl<A: HasFrees, B: HasFrees> HasFrees for (A, B) {
         self.0.for_each_free(f);
         self.1.for_each_free(f);
     }
-    fn map_free(self, f: &mut dyn FnMut(LVar) -> LVar) -> Self {
-        (self.0.map_free(f), self.1.map_free(f))
+    fn map_free_with(self, f: &mut dyn FnMut(LVar) -> LVar, monotone: bool) -> Self {
+        (self.0.map_free_with(f, monotone), self.1.map_free_with(f, monotone))
     }
 }
 
@@ -517,8 +556,8 @@ impl<T: HasFrees> HasFrees for Option<T> {
     fn for_each_free(&self, f: &mut dyn FnMut(&LVar)) {
         if let Some(t) = self { t.for_each_free(f); }
     }
-    fn map_free(self, f: &mut dyn FnMut(LVar) -> LVar) -> Self {
-        self.map(|t| t.map_free(f))
+    fn map_free_with(self, f: &mut dyn FnMut(LVar) -> LVar, monotone: bool) -> Self {
+        self.map(|t| t.map_free_with(f, monotone))
     }
 }
 
@@ -536,7 +575,9 @@ pub fn rename<T: HasFrees>(t: T, fresh: &mut tamarin_utils::fresh::FastFreshStat
             let span = max - min + 1;
             let fresh_start = fresh.fresh_idents(span);
             let shift = fresh_start as i128 - min as i128;
-            t.map_free(&mut |LVar { name, sort, idx }| LVar {
+            // HS `rename` (LTerm.hs:619) uses `mapFrees (Monotone ...)`: the
+            // index shift is monotone, so AC arg order is preserved.
+            t.map_free_monotone(&mut |LVar { name, sort, idx }| LVar {
                 name,
                 sort,
                 idx: ((idx as i128) + shift) as u64,

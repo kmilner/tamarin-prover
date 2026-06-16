@@ -92,13 +92,13 @@ impl<I: Clone> HasFrees for Rule<I> {
         for a in &self.actions { a.for_each_free(f); }
         for v in &self.new_vars { v.for_each_free(f); }
     }
-    fn map_free(self, f: &mut dyn FnMut(LVar) -> LVar) -> Self {
+    fn map_free_with(self, f: &mut dyn FnMut(LVar) -> LVar, monotone: bool) -> Self {
         Rule {
             info: self.info,
-            premises: self.premises.into_iter().map(|x| x.map_free(f)).collect(),
-            conclusions: self.conclusions.into_iter().map(|x| x.map_free(f)).collect(),
-            actions: self.actions.into_iter().map(|x| x.map_free(f)).collect(),
-            new_vars: self.new_vars.into_iter().map(|x| x.map_free(f)).collect(),
+            premises: self.premises.into_iter().map(|x| x.map_free_with(f, monotone)).collect(),
+            conclusions: self.conclusions.into_iter().map(|x| x.map_free_with(f, monotone)).collect(),
+            actions: self.actions.into_iter().map(|x| x.map_free_with(f, monotone)).collect(),
+            new_vars: self.new_vars.into_iter().map(|x| x.map_free_with(f, monotone)).collect(),
         }
     }
 }

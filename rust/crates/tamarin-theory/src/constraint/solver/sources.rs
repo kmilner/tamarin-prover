@@ -4974,11 +4974,15 @@ fn freshen_system(
         v2.idx = v2.idx.saturating_add(shift);
         v2
     };
+    // HS `matchToGoal` line 409: `th = (evalFresh avoid goalTerm) . rename`.
+    // `rename` (LTerm.hs:619) is Monotone — the uniform `shift_lvar` index
+    // bump preserves AC arg order (`unsafefApp`), so use `map_free_monotone`
+    // throughout this freshening.
     let mut out = sys.clone();
     out.nodes = std::sync::Arc::new(std::sync::Arc::unwrap_or_clone(out.nodes).into_iter()
         .map(|(id, ru)| {
             (shift_lvar(&id),
-             ru.map_free(&mut |v| shift_lvar(&v))) })
+             ru.map_free_monotone(&mut |v| shift_lvar(&v))) })
         .collect());
     out.edges = out.edges.into_iter()
         .map(|e| crate::constraint::constraints::Edge {
@@ -4998,11 +5002,11 @@ fn freshen_system(
                 crate::constraint::constraints::Goal::Action(n, fa) =>
                     crate::constraint::constraints::Goal::Action(
                         shift_lvar(&n),
-                        fa.map_free(&mut |v| shift_lvar(&v))),
+                        fa.map_free_monotone(&mut |v| shift_lvar(&v))),
                 crate::constraint::constraints::Goal::Premise(p, fa) =>
                     crate::constraint::constraints::Goal::Premise(
                         (shift_lvar(&p.0), p.1),
-                        fa.map_free(&mut |v| shift_lvar(&v))),
+                        fa.map_free_monotone(&mut |v| shift_lvar(&v))),
                 crate::constraint::constraints::Goal::Chain(c, p) =>
                     crate::constraint::constraints::Goal::Chain(
                         (shift_lvar(&c.0), c.1),
@@ -5034,12 +5038,14 @@ fn freshen_system(
     out.formulas = out.formulas.iter().map(shift_g).collect();
     out.solved_formulas = out.solved_formulas.iter().map(shift_g).collect();
     out.lemmas = out.lemmas.iter().map(shift_g).collect();
-    // Eq-store: shift both domain LVars and range terms.
+    // Eq-store: shift both domain LVars and range terms.  This whole
+    // freshening is HS `rename` (Monotone), so range-term shifts preserve
+    // AC arg order — `map_free_monotone`.
     {
         let shifted_subst: Vec<_> = out.eq_store.subst.to_list().iter()
             .map(|(v, t)| {
                 let v2 = shift_lvar(v);
-                let t2 = (*t).clone().map_free(&mut |w| shift_lvar(&w));
+                let t2 = (*t).clone().map_free_monotone(&mut |w| shift_lvar(&w));
                 (v2, t2)
             })
             .collect();
@@ -5049,7 +5055,7 @@ fn freshen_system(
                 let shifted: Vec<_> = s.to_list().iter()
                     .map(|(v, t)| {
                         let v2 = shift_lvar(v);
-                        let t2 = (*t).clone().map_free(&mut |w| shift_lvar(&w));
+                        let t2 = (*t).clone().map_free_monotone(&mut |w| shift_lvar(&w));
                         (v2, t2)
                     })
                     .collect();
@@ -5057,13 +5063,14 @@ fn freshen_system(
             }
         }
     }
-    // Subterm-store: shift the LNTerm pairs (small/big).
+    // Subterm-store: shift the LNTerm pairs (small/big).  Part of the same
+    // Monotone `rename` — preserve AC arg order.
     {
         let shift_st = |s: &crate::tools::subterm_store::SubtermConstraint|
             -> crate::tools::subterm_store::SubtermConstraint {
             crate::tools::subterm_store::SubtermConstraint {
-                small: s.small.clone().map_free(&mut |w| shift_lvar(&w)),
-                big: s.big.clone().map_free(&mut |w| shift_lvar(&w)),
+                small: s.small.clone().map_free_monotone(&mut |w| shift_lvar(&w)),
+                big: s.big.clone().map_free_monotone(&mut |w| shift_lvar(&w)),
                 propagated: s.propagated,
             }
         };

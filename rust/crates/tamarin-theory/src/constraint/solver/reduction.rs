@@ -3541,7 +3541,9 @@ fn freshen_rule_with_constrs(
     let base = maude.reserve_idxs(span);
     let shift = (base as i128) - (min as i128);
     let shift_idx = |idx: u64| -> u64 { ((idx as i128) + shift) as u64 };
-    let new_rule = rule.map_free(&mut |LVar { name, sort, idx }| LVar {
+    // HS `someRuleACInst` = `rename` (Rule.hs:944, LTerm.hs:619) is Monotone:
+    // the uniform index shift preserves AC arg order (`unsafefApp`).
+    let new_rule = rule.map_free_monotone(&mut |LVar { name, sort, idx }| LVar {
         name, sort, idx: shift_idx(idx),
     });
     let new_constrs = constrs.map(|cs| {
@@ -3586,7 +3588,9 @@ fn freshen_rule(rule: RuleACInst, avoid_max: u64, maude: &tamarin_term::maude_pr
             let span = max.saturating_sub(min).saturating_add(1);
             let base = maude.reserve_idxs(span);
             let shift = (base as i128) - (min as i128);
-            rule.map_free(&mut |tamarin_term::lterm::LVar { name, sort, idx }|
+            // HS `someRuleACInstAvoiding` = `renameAvoiding` = `rename`
+            // (Rule.hs:963, LTerm.hs:619) is Monotone: AC arg order preserved.
+            rule.map_free_monotone(&mut |tamarin_term::lterm::LVar { name, sort, idx }|
                 tamarin_term::lterm::LVar {
                     name, sort,
                     idx: ((idx as i128) + shift) as u64,
