@@ -7224,14 +7224,11 @@ fn apply_source_case_action(
     // live em-exponent Kd-pair chain edge folded the `splitEqs(3)/(4)`
     // disjunctions, turning HS's Split×3/×4 cascade into RS's Split×1).
     // A grafted edge is one with at least one endpoint NOT a pre-existing
-    // live node.  Opt-out via TAM_RS_DISABLE_E5_LIVE_EDGE_SKIP=1.
+    // live node.
     let live_node_ids: std::collections::BTreeSet<crate::constraint::constraints::NodeId> =
         live_sys.nodes.iter().map(|(n, _)| n.clone()).collect();
-    let skip_live_edges =
-        std::env::var("TAM_RS_DISABLE_E5_LIVE_EDGE_SKIP").is_err();
     let edge_eqs: Vec<_> = r.sys.edges.iter().filter_map(|e| {
-        if skip_live_edges
-            && live_node_ids.contains(&e.src.0)
+        if live_node_ids.contains(&e.src.0)
             && live_node_ids.contains(&e.tgt.0)
         {
             return None;
@@ -7733,7 +7730,33 @@ fn apply_source_case_premise(
     // sFormulas → Rust does an extra solve step where Haskell sees
     // `by contradiction /* from formulas */`.  Same pattern as the
     // saturate-time edge fact-equality fix at sources.rs:1221-1244.
+    // SCOPING (HS-faithful): the E.5 edge-fact solve must only touch edges
+    // INTRODUCED by the grafted source case, NOT pre-existing LIVE edges.
+    // HS's `conjoinSystem` (Reduction.hs:824-846) does NO edge solve at all —
+    // `joinSets sEdges` unions the edge SET and lets the node-merge
+    // (`setNodes` → `solveRuleEqs SplitLater`) unify producer/consumer
+    // multisets of LIVE-LIVE edges LAZILY (as a deferred AC `splitEqs`).  RS's
+    // premise E.5 eagerly `solve_fact_eqs(SplitNow)`s every edge; re-solving a
+    // LIVE-LIVE edge re-narrows the live equation store and collapses
+    // disjunctions HS keeps deferred.  On alethea selectionphase this PINS the
+    // witness BB_2/AgSt_BB2 multiset code ('1') on the live `vr.5 → vr.11`
+    // edge before the `#a3` AgSt_A3 node-merge fires, turning HS's 2-unifier
+    // SplitLater merge into RS's pinned 1-unifier APPLY — which collapses
+    // `#a3`'s multiset nonce onto the witness `no1.0` (HS keeps it the fresh
+    // `no1.1`, with `#a3`'s y's fresh `.2`).  This is the SAME live-edge
+    // hazard already guarded on the ACTION-path E.5 (sources.rs:7228-7238,
+    // citing Joux_EphkRev's collapsed em-exponent splitEqs cascade); the
+    // premise path was missing the guard.  A grafted edge has at least one
+    // endpoint that is NOT a pre-existing live node — only those get the
+    // eager solve.
+    let prem_live_node_ids: std::collections::BTreeSet<crate::constraint::constraints::NodeId> =
+        live_sys.nodes.iter().map(|(n, _)| n.clone()).collect();
     let edge_eqs: Vec<_> = r.sys.edges.iter().filter_map(|e| {
+        if prem_live_node_ids.contains(&e.src.0)
+            && prem_live_node_ids.contains(&e.tgt.0)
+        {
+            return None;
+        }
         let conc = r.sys.nodes.iter()
             .find(|(n, _)| n == &e.src.0)?
             .1.conclusions.get(e.src.1.0).cloned()?;
