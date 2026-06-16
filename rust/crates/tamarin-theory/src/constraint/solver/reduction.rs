@@ -504,8 +504,22 @@ impl<'ctx> Reduction<'ctx> {
         //    Haskell's `setNodes` → `solveRuleEqs`). We solve those
         //    equalities AFTER the rest of substSystem has run, so the
         //    triggered re-substitution sees a consistent state.
-        let nodes = std::sync::Arc::unwrap_or_clone(
+        let mut nodes = std::sync::Arc::unwrap_or_clone(
             std::mem::take(&mut self.sys.nodes));
+        // HS-faithful node-merge keep-order: `substNodeIds` (Reduction.hs:796)
+        // reads `M.toList sNodes` — SORTED by node-id — so when several nodes
+        // collapse to one id (eq-store node-id binding), `setNodes`'
+        // stable `groupSortOn` keeps the rule of the LOWEST-OLD-ID node.  RS
+        // stored nodes in a Vec in insertion order (conjoin appends the
+        // freshly-grafted source case BEFORE the live nodes), so the dedup
+        // below kept the GRAFTED node's rule (high idx) and eliminated the
+        // live witness (low idx) — desyncing the witness multiset-nonce from
+        // the lemma witness var (e.g. alethea `#a2` noSel vs the BB_2 multiset
+        // nonce), which then leaves the downstream `#a3` AgSt_A3 merge a
+        // disjoint 2-unifier (→ deferred `splitEqs`) instead of HS's shared
+        // 1-unifier (→ direct `by contradiction`).  Sort by node-id here to
+        // mirror `M.toList`, so the live/lower-idx node's rule survives.
+        nodes.sort_by(|a, b| a.0.cmp(&b.0));
         let mut new_nodes: Vec<(crate::constraint::constraints::NodeId, RuleACInst)>
             = Vec::with_capacity(nodes.len());
         let mut id_to_index: std::collections::HashMap<crate::constraint::constraints::NodeId, usize>
