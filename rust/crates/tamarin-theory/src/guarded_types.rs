@@ -85,6 +85,37 @@ pub enum GAtom {
 // Used for terms that arrive without DeBruijn (post-opening, or constructed
 // fresh by the constraint solver). All variables become `BVar::Free`.
 
+/// Smart constructor for an n-ary `GTerm::Pair`, enforcing the canonical
+/// invariant that the LAST element is never itself a `Pair`.
+///
+/// RS encodes tuples as n-ary `Pair([t1,..,tn])`, corresponding to HS's
+/// binary right-nested `<t1, <t2, .. <t_{n-1}, tn>>>`
+/// (`fAppPair (x,y) = fAppNoEq pairSym [x,y]`, Term.hs:142).  Because HS
+/// pairs are binary, `<a,b,<c,d>>` and `<a,b,c,d>` are the SAME term; in
+/// RS's n-ary encoding those are the *distinct* trees
+/// `Pair([a,b,Pair([c,d])])` and `Pair([a,b,c,d])`.  Substituting a
+/// pair-valued var into a tuple tail (e.g. `<'UM3',B,A,matchingComm>` with
+/// `matchingComm := <'1','g'^~ex>`) produces the nested form, while the
+/// `impliedFormulas` / LNTerm round-trip path produces the flat form.
+/// Keeping both defeats the structural `==` dedup in `insertFormula`
+/// (`solved_formulas` membership) and the goal-store
+/// `canonical_goal_for_dedup` merge — the re-derived formula no longer
+/// matches the substituted solved one, so it re-inserts an open Disj goal
+/// and the prover re-solves a disjunction HS already discharged
+/// (UM_three_pass `CK_secure_UM3` blow-up).  Canonicalise to the flat form
+/// by splicing a trailing `Pair`, exactly the identity HS gets for free
+/// from binary pairs.  Only the LAST element is spliced: a `Pair` in a
+/// non-tail position (`<<a,b>,c>` = `pair(pair(a,b),c)`) is a genuinely
+/// different term and must be preserved.
+pub fn mk_gpair(mut items: Vec<GTerm>) -> GTerm {
+    while matches!(items.last(), Some(GTerm::Pair(_))) {
+        if let Some(GTerm::Pair(inner)) = items.pop() {
+            items.extend(inner);
+        }
+    }
+    GTerm::Pair(items)
+}
+
 /// Lift `p::Term` to `GTerm` treating every variable as `Free`.
 ///
 /// HS equivalent: `lTermToBTerm` — `fmapTerm (fmap Free)`.
@@ -103,7 +134,7 @@ pub fn term_to_gterm_free(t: &p::Term) -> GTerm {
         p::Term::AlgApp(n, a, b) =>
             GTerm::AlgApp(n.clone(), Box::new(term_to_gterm_free(a)), Box::new(term_to_gterm_free(b))),
         p::Term::Pair(items) =>
-            GTerm::Pair(items.iter().map(term_to_gterm_free).collect()),
+            mk_gpair(items.iter().map(term_to_gterm_free).collect()),
         p::Term::Diff(a, b) =>
             GTerm::Diff(Box::new(term_to_gterm_free(a)), Box::new(term_to_gterm_free(b))),
         p::Term::BinOp(op, a, b) =>

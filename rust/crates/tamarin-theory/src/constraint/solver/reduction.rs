@@ -919,7 +919,12 @@ impl<'ctx> Reduction<'ctx> {
                                     if nxt == cur { break; }
                                     cur = nxt;
                                 }
-                                cur
+                                // Re-canonicalise AC after substitution so the
+                                // substituted Disj-goal body matches the
+                                // flat-sorted re-derived form for the goal-store
+                                // dedup (see the formula-subst comment in
+                                // `subst_system_once`).
+                                crate::guarded::canonicalize_ac_in_guarded(&cur)
                             })
                             .collect();
                         Goal::Disj(crate::constraint::constraints::Disj(new_alts))
@@ -1020,7 +1025,19 @@ impl<'ctx> Reduction<'ctx> {
                     if nxt == cur { break; }
                     cur = nxt;
                 }
-                cur
+                // Re-canonicalise AC operators after substitution.  Substituting
+                // an AC-valued var into an AC context (`rest ++ matchingComm`
+                // with `matchingComm := <a>++<b>`) leaves a nested/unsorted
+                // `Union(rest, Union(a,b))` that no longer structurally matches
+                // the flat-sorted form `impliedFormulas` produces
+                // (`canonicalize_ac_in_guarded`, simplify.rs:1545) — defeating
+                // the `solved_formulas` dedup, so the prover re-derives and
+                // re-solves a disjunction HS already discharged
+                // (UM_three_pass `CK_secure_UM3`).  HS's AC constructors
+                // (`fAppAC`) flatten+sort on construction, so HS never sees the
+                // nested form; mirror that here.  (Tuple pairs are already
+                // canonicalised inside `subst_gterm` via `mk_gpair`.)
+                crate::guarded::canonicalize_ac_in_guarded(&cur)
             };
             for f in self.sys.formulas.iter_mut() {
                 let new_f = apply_to_fixpoint(f);
