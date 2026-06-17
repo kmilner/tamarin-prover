@@ -2043,7 +2043,7 @@ fn pp_proof(
     match (&node.method, cases.as_slice()) {
         (ProofMethod::Finished(MR::Solved), []) => {
             let doc = pp_step_doc(&node.method, base, "");
-            out.push_str(&pf::step_line_with_unann(doc, base, annotated));
+            out.push_str(&pf::step_line_with_unann(doc, base, annotated, ""));
         }
         (_, []) => {
             // No children: `by <step>` form.  HS `ppCases ps [] =
@@ -2054,15 +2054,19 @@ fn pp_proof(
             // deciding the `fsep`/`sep` break — so we must render `by ` as
             // line CONTENT, not as part of the indent (see `solve_line_render`;
             // the NAXOS/KAS2 `Match( a,` / `<…>` divergence).  The `by `
-            // prefix is `beside`-prepended into the method Doc by
-            // `pp_step_doc`, then `step_line_with_unann` appends the
-            // optional `/* unannotated */` via `sep`.
-            let doc = pp_step_doc(&node.method, base, "by ");
-            out.push_str(&pf::step_line_with_unann(doc, base, annotated));
+            // prefix is laid out by `step_line_with_unann` BESIDE the WHOLE
+            // `sep [method, comment]` (HS `prettyCase ps (kwBy<>" ") <>
+            // prettyStep ps`), so a dropped `/* unannotated */` aligns at
+            // `base + len("by ")` (= +3), not `base`.  `beside` still shifts
+            // the method's own wrapped continuation columns by the prefix
+            // width and counts it toward the ribbon, so the method lines stay
+            // byte-identical to the old baked-in layout.
+            let doc = pp_step_doc(&node.method, base, "");
+            out.push_str(&pf::step_line_with_unann(doc, base, annotated, "by "));
         }
         (_, [(label, child)]) if label.is_empty() => {
             let doc = pp_step_doc(&node.method, base, "");
-            out.push_str(&pf::step_line_with_unann(doc, base, annotated));
+            out.push_str(&pf::step_line_with_unann(doc, base, annotated, ""));
             out.push('\n');
             // HS `ppCases ps [("", prf)] = prettyStep ps $-$ ppPrf prf`
             // (Proof.hs:1086).  `$-$` is "above" — the child is rendered
@@ -2075,7 +2079,7 @@ fn pp_proof(
         }
         (_, multi) => {
             let doc = pp_step_doc(&node.method, base, "");
-            out.push_str(&pf::step_line_with_unann(doc, base, annotated));
+            out.push_str(&pf::step_line_with_unann(doc, base, annotated, ""));
             for (i, (name, child)) in multi.iter().enumerate() {
                 if i > 0 {
                     // HS Proof.hs:1089: `intersperse (prettyCase ps kwNext)`
