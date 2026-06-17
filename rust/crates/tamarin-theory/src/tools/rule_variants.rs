@@ -443,13 +443,34 @@ pub fn abstract_rule_and_variants(
     //
     // With leaf-rename, this includes BOTH leaf entries `(lv_renamed,
     // Var v_orig)` AND reducible entries `(z_i, complex_term)`.
-    let abstraction_pairs: Vec<(LVar, LNTerm)> = bindings.iter()
+    //
+    // CRITICAL: HS's `bindings :: M.Map LNTerm LVar` is keyed by the
+    // ORIGINAL term (`importBinding (\`LVar\` sortOfLNTerm t) t ...`,
+    // RuleVariants.hs:104), and `M.toList bindings` therefore yields the
+    // entries SORTED by the original term's `Ord` — NOT by insertion
+    // order.  `abstractedTerms = map snd eqsAbstr` (RuleVariants.hs:69)
+    // is consequently a term-`Ord`-sorted list, and it is exactly the
+    // payload of the `get variants in MSG : list(cons(...))` Maude query
+    // (`fAppList abstractedTerms`, RuleVariants.hs:72).  RS previously
+    // walked `bindings` in INSERTION order (the order terms were first
+    // visited), so the `list(...)` query had its arguments in a different
+    // order than HS — which seeds Maude's persistent variable-name
+    // interning table differently and flips the enumeration order of
+    // AC-symmetric unifiers far downstream (the UM_three_pass
+    // `CK_secure_UM3` `R_Complete_case_1↔case_2` arm swap at proof line
+    // 1305).  Mirror `M.toList` by sorting the binding entries by their
+    // ORIGINAL-term key.  Both `abstractionSubst` (substFromList — itself
+    // a Map, so order-insensitive) and `abstractedTerms` (the ordered
+    // query payload) read from this sorted view.
+    let mut sorted_bindings: Vec<&(LNTerm, LVar)> = bindings.iter().collect();
+    sorted_bindings.sort_by(|a, b| a.0.cmp(&b.0));
+    let abstraction_pairs: Vec<(LVar, LNTerm)> = sorted_bindings.iter()
         .map(|(t, v)| (v.clone(), t.clone()))
         .collect();
     let abstraction_subst: LNSubst = Subst::from_list(abstraction_pairs.clone());
 
     // `abstractedTerms = map snd eqsAbstr` — the ORIGINAL terms.
-    let abstracted_terms: Vec<LNTerm> = bindings.iter().map(|(t, _)| t.clone()).collect();
+    let abstracted_terms: Vec<LNTerm> = sorted_bindings.iter().map(|(t, _)| t.clone()).collect();
     let packed = Term::App(FunSym::List, abstracted_terms.into());
     let raw_substs = maude.variants(&packed)?;
     if raw_substs.is_empty() {
