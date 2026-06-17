@@ -867,8 +867,11 @@ fn eval_leaf(
     leaf: &crate::tactic::SelectorLeaf,
     g: &AnnotatedGoal,
     _ctx: Option<&crate::constraint::solver::context::ProofContext>,
-    _sys: &System,
+    sys: &System,
 ) -> bool {
+    use crate::constraint::solver::tactic_show as ts;
+    let params = &leaf.params;
+    let head = |i: usize| params.get(i).map(String::as_str).unwrap_or("");
     match leaf.name.as_str() {
         "regex" => {
             // HS `regex' (regex:_) (agoal,_,_) = pg =~ regex`
@@ -876,62 +879,169 @@ fn eval_leaf(
             // an UNANCHORED search (matches if found anywhere).  We use
             // `fancy-regex` (PCRE-compatible: lookaround, backrefs) and
             // `is_match` for the same unanchored Bool semantics.
-            match leaf.params.first() {
+            match params.first() {
                 Some(pat) => regex_is_match(pat, &tactic_pg(g)),
                 None => false,
             }
         }
-        // The remaining selectors (dhreNoise, reasonableNoncesNoise,
-        // defaultNoise, nonAbsurdConstraint, isFactName, isInFactTerms)
-        // inspect the System's `sFormulas` reveal-terms and DH-exp
-        // patterns via `show`-based string matching (Tactics.hs:136-220).
-        // These are NOT yet faithfully ported.
-        //
-        // HONESTY NOTE: `dhreNoise` / `reasonableNoncesNoise` DO appear
-        // inside tactics driving real corpus `[heuristic={..}]` lemmas —
-        // the `features/noise/secrecy_{2_IK,3_passive_K1X1,4_passiveIN..}`
-        // family.  For those, this conservative `false` (the prio simply
-        // does not recognise the goal, which then falls through to
-        // `nonRanked`) lets the proof still COMPLETE but is NOT
-        // byte-identical to HS — it perturbs the DH-goal ordering (~186
-        // raw-diff lines on secrecy_2_IK).  The alethea family and every
-        // other corpus tactic verified here use ONLY `regex` selectors,
-        // which are faithful.  Porting the noise selectors faithfully
-        // requires replicating HS's `show (LVar/term)` byte-for-byte and
-        // is left as a distinct follow-up.
+
+        // dhreNoise (Tactics.hs:152-161): `pg =~ goalPattern`, where the
+        // pattern is a DH-product/inverse over a sys-specific nonce class.
+        "dhreNoise" => {
+            let oracle_type = head(0);
+            let pg = tactic_pg(g);
+            // sysPatternDiff = "(~[a-zA-Z0-9.]*)"
+            let sys_pattern_diff = "(~[a-zA-Z0-9.]*)";
+            // sysPattern: alternation of "~n" + the shown reveal-vars.
+            // For "curve" a `(?!...)` negative-lookahead suffix is appended.
+            let reveal = ts::sys_reveal_shown(oracle_type, &sys.formulas);
+            let sys_pattern = if oracle_type == "curve" {
+                format!("(~n|{})(?![.0-9a-zA-Z])", join_alt(&reveal))
+            } else {
+                format!("(~n|{})", join_alt(&reveal))
+            };
+            let goal_pattern = if oracle_type == "diff" {
+                format!(
+                    ".*(\\(({sd}\\*)+{sd}\\)|inv\\({sd}\\))",
+                    sd = sys_pattern_diff
+                )
+            } else {
+                format!(
+                    ".*(\\(({sp}\\*)+{sp}\\)|inv\\({sp}\\))",
+                    sp = sys_pattern
+                )
+            };
+            regex_is_match(&goal_pattern, &pg)
+        }
+
+        // defaultNoise (Tactics.hs:163-173): `or $ map (flip elem sysPattern)
+        // goalMatches` — every regex-match substring of the pretty goal that
+        // equals a shown reveal-var.
+        "defaultNoise" => {
+            let param_goal = head(0);
+            let oracle_type = head(1);
+            let pg = tactic_pg(g);
+            let goal_matches = regex_all_matches(param_goal, &pg);
+            let sys_pattern = ts::sys_reveal_shown(oracle_type, &sys.formulas);
+            goal_matches.iter().any(|m| sys_pattern.iter().any(|s| s == m))
+        }
+
+        // reasonableNoncesNoise (Tactics.hs:175-188): `or $ map (flip elem
+        // sysPattern) nonces`, where nonces = map show (getFactTerms_ goal)
+        // and sysPattern = "~n" : shown reveal-vars.
+        "reasonableNoncesNoise" => {
+            let oracle_type = head(0);
+            let nonces: Vec<String> = ts::action_goal_fact_terms(&g.goal)
+                .iter()
+                .map(ts::show_lnterm)
+                .collect();
+            let mut sys_pattern = vec!["~n".to_string()];
+            sys_pattern.extend(ts::sys_reveal_shown(oracle_type, &sys.formulas));
+            nonces.iter().any(|n| sys_pattern.iter().any(|s| s == n))
+        }
+
+        // nonAbsurdConstraint (Tactics.hs:136-150): hasSafeNonces && isSubset.
+        "nonAbsurdConstraint" => {
+            let oracle_type = head(0);
+            let pg = tactic_pg(g);
+            // isSubset: every function appearing in pg is in {Ku, inv}.
+            let functions_detection = "[^A-Za-z0-9][A-Za-z0-9]+\\(";
+            let functions: Vec<String> = regex_all_matches(functions_detection, &pg)
+                .iter()
+                // `map init . map tail`: drop first (delimiter) + last ('(')
+                .map(|m| {
+                    let mut chars: Vec<char> = m.chars().collect();
+                    if !chars.is_empty() {
+                        chars.remove(0);
+                    }
+                    chars.pop();
+                    chars.into_iter().collect::<String>()
+                })
+                .collect();
+            let is_subset = functions.iter().all(|f| f == "Ku" || f == "inv");
+            // hasSafeNonces: pg does NOT contain a "safe" nonce.
+            let reveal = ts::sys_reveal_shown(oracle_type, &sys.formulas);
+            let safe_pattern = format!("(~n|{})(?![.0-9a-zA-Z])", join_alt(&reveal));
+            let has_safe_nonces = !regex_is_match(&safe_pattern, &pg);
+            has_safe_nonces && is_subset
+        }
+
+        // isFactName (Tactics.hs:212-216).
+        "isFactName" => {
+            let s = head(0);
+            match ts::fact_name_probe(&g.goal) {
+                ts::FactNameProbe::PremiseLinearName(name) => name == s,
+                ts::FactNameProbe::ActionShowTag(shown) => shown == s,
+                ts::FactNameProbe::None => false,
+            }
+        }
+
+        // isInFactTerms (Tactics.hs:218-220): single-term action fact whose
+        // `show` matches the regex.
+        "isInFactTerms" => {
+            let s = head(0);
+            match ts::action_goal_single_term(&g.goal) {
+                Some(t) => regex_is_match(s, &ts::show_lnterm(t)),
+                None => false,
+            }
+        }
+
         other => {
             if std::env::var("TAM_RS_TACTIC_DBG").is_ok() {
-                eprintln!("[RS_TACTIC] unimplemented selector '{}' → false \
-                    (noise family not byte-faithful)", other);
+                eprintln!("[RS_TACTIC] unimplemented selector '{}' → false", other);
             }
             false
         }
     }
 }
 
+/// Join shown reveal-vars into a regex alternation body (no surrounding
+/// parens), mirroring HS `intercalate "|" (map show ...)`.
+fn join_alt(reveal: &[String]) -> String {
+    reveal.join("|")
+}
+
 /// PCRE-compatible unanchored match, mirroring HS `pg =~ regex` with
 /// `Text.Regex.PCRE`.  Compiled patterns are cached per-string.
-fn regex_is_match(pattern: &str, haystack: &str) -> bool {
+pub(crate) fn regex_is_match(pattern: &str, haystack: &str) -> bool {
+    match compile_regex(pattern) {
+        Some(re) => re.is_match(haystack).unwrap_or(false),
+        None => false,
+    }
+}
+
+/// All non-overlapping full-match substrings, mirroring HS
+/// `getAllTextMatches $ haystack =~ pattern` over `Text.Regex.PCRE`.
+/// (HS's `getAllTextMatches` yields the WHOLE matched text of each
+/// non-overlapping match, left-to-right.)
+pub(crate) fn regex_all_matches(pattern: &str, haystack: &str) -> Vec<String> {
+    match compile_regex(pattern) {
+        Some(re) => re
+            .find_iter(haystack)
+            .filter_map(|m| m.ok())
+            .map(|m| m.as_str().to_string())
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Compile + cache a PCRE pattern (`fancy-regex`).  Shared by the
+/// boolean-match and all-matches helpers.
+fn compile_regex(pattern: &str) -> Option<std::sync::Arc<fancy_regex::Regex>> {
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::OnceLock;
     static CACHE: OnceLock<Mutex<HashMap<String, Option<std::sync::Arc<fancy_regex::Regex>>>>> =
         OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let compiled = {
-        let mut map = cache.lock().unwrap();
-        map.entry(pattern.to_string())
-            .or_insert_with(|| {
-                fancy_regex::Regex::new(pattern)
-                    .ok()
-                    .map(std::sync::Arc::new)
-            })
-            .clone()
-    };
-    match compiled {
-        Some(re) => re.is_match(haystack).unwrap_or(false),
-        None => false,
-    }
+    let mut map = cache.lock().unwrap();
+    map.entry(pattern.to_string())
+        .or_insert_with(|| {
+            fancy_regex::Regex::new(pattern)
+                .ok()
+                .map(std::sync::Arc::new)
+        })
+        .clone()
 }
 
 

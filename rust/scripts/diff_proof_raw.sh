@@ -45,6 +45,14 @@ CACHE_VERSION="${CACHE_VERSION:-1}"
 DERIVCHECK_TIMEOUT="${DERIVCHECK_TIMEOUT:-30}"
 HS_CANON_CACHE="${HS_CANON_CACHE:-$script_dir/.hs_canon_cache}"
 NO_HS_CACHE="${NO_HS_CACHE:-}"
+# HS RTS flags. Upstream commit 00a282da ("Canonicalise maude's returned
+# substitution entries", Maude/Types.hs:134) made HS proofs schedule-
+# INDEPENDENT — `+RTS -Nk` for any k now yields byte-identical proofs
+# (verified on UM3: all -N share md5 cd93570e…). So we no longer force
+# single-thread; HS_RTS defaults to `-N` (all cores) to speed up cache
+# regeneration. Override `HS_RTS=-N1` to reproduce the pre-canonicalisation
+# single-thread reference if ever needed.
+HS_RTS="${HS_RTS:--N}"
 [ -n "$NO_HS_CACHE" ] || mkdir -p "$HS_CANON_CACHE" 2>/dev/null || true
 
 find_hs_bin() {
@@ -104,7 +112,7 @@ if [ -n "$key" ] && [ -f "$key.full.gz" ]; then
         > "$tmp/hs.out"
     hs_src="cache"
 else
-    timeout "$TIMEOUT" "$hs_path" +RTS -N1 -RTS --derivcheck-timeout="$DERIVCHECK_TIMEOUT" --prove="$lemma" "$file" 2>/dev/null > "$tmp/hs.out"
+    timeout "$TIMEOUT" "$hs_path" +RTS $HS_RTS -RTS --derivcheck-timeout="$DERIVCHECK_TIMEOUT" --prove="$lemma" "$file" 2>/dev/null > "$tmp/hs.out"
     hs_rc=$?
     if [ "$hs_rc" -eq 124 ]; then
         echo "$lemma: HS TIMEOUT (${TIMEOUT}s)"

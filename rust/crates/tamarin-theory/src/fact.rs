@@ -96,11 +96,11 @@ impl<T: HasFrees> HasFrees for Fact<T> {
     fn for_each_free(&self, f: &mut dyn FnMut(&LVar)) {
         for t in &self.terms { t.for_each_free(f); }
     }
-    fn map_free(self, f: &mut dyn FnMut(LVar) -> LVar) -> Self {
+    fn map_free_with(self, f: &mut dyn FnMut(LVar) -> LVar, monotone: bool) -> Self {
         Fact {
             tag: self.tag,
             annotations: self.annotations,
-            terms: self.terms.into_iter().map(|t| t.map_free(f)).collect(),
+            terms: self.terms.into_iter().map(|t| t.map_free_with(f, monotone)).collect(),
         }
     }
 }

@@ -287,12 +287,29 @@ pub fn step_line_with_unann(
     method_doc: crate::pretty_hpj::Doc,
     base_indent: usize,
     annotated: bool,
+    prefix: &str,
 ) -> String {
     use crate::pretty_hpj as hpj;
-    let step = if annotated {
+    use crate::pretty_hpj::Doc;
+    let core = if annotated {
         method_doc
     } else {
         hpj::sep(vec![method_doc, unannotated_comment_doc()])
+    };
+    // HS `ppCases ps [] = prettyCase ps (kwBy <> text " ") <> prettyStep ps`
+    // (Proof.hs:1085): the `by ` keyword is laid out BESIDE the WHOLE
+    // `sep [method, comment]`, NOT folded into the first `sep` element.
+    // So when `sep` breaks vertically the dropped `/* unannotated */`
+    // aligns at the sep's start column = `base_indent + len(prefix)`.
+    // Baking `by ` inside the `sep`'s first element (the previous RS
+    // structure) put the sep's base at `base_indent`, dropping the comment
+    // a `len("by ")` = 3 spaces too shallow — the dnp3-proven
+    // `/* unannotated */` divergence.  `beside` shifts the comment's
+    // continuation column identically to HughesPJ.
+    let step = if prefix.is_empty() {
+        core
+    } else {
+        Doc::text(prefix).beside(core)
     };
     let indented = step.nest(base_indent as isize);
     let rendered = indented.render();
@@ -2215,7 +2232,7 @@ mod tests {
         // ProofSkeleton.hs:80-84).
         use crate::pretty_hpj::Doc;
         let m = Doc::text("simplify");
-        let out = step_line_with_unann(m, 2, /*annotated=*/ false);
+        let out = step_line_with_unann(m, 2, /*annotated=*/ false, "");
         assert_eq!(out, "simplify /* unannotated */");
     }
 
@@ -2224,7 +2241,7 @@ mod tests {
         // When the step is annotated (psInfo = Just _), NO comment.
         use crate::pretty_hpj::Doc;
         let m = Doc::text("by sorry");
-        let out = step_line_with_unann(m, 4, /*annotated=*/ true);
+        let out = step_line_with_unann(m, 4, /*annotated=*/ true, "");
         assert_eq!(out, "by sorry");
     }
 
@@ -2238,7 +2255,7 @@ mod tests {
         use crate::pretty_hpj::Doc;
         let long = "solve( (last(#k))  \u{2225} (something quite long here indeed yes) )";
         assert!(long.chars().count() + " /* unannotated */".chars().count() > 73);
-        let out = step_line_with_unann(Doc::text(long), 2, /*annotated=*/ false);
+        let out = step_line_with_unann(Doc::text(long), 2, /*annotated=*/ false, "");
         let lines: Vec<&str> = out.split('\n').collect();
         assert_eq!(lines.len(), 2, "comment should drop to its own line: {out:?}");
         assert_eq!(lines[0], long, "method line unchanged");

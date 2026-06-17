@@ -1591,8 +1591,15 @@ pub fn subst_gterm(t: &GTerm, s: &VarSubst) -> GTerm {
             GTerm::App(n.clone(), args.iter().map(|a| subst_gterm(a, s)).collect()),
         GTerm::AlgApp(n, a, b) => GTerm::AlgApp(
             n.clone(), Box::new(subst_gterm(a, s)), Box::new(subst_gterm(b, s))),
+        // Canonicalise via `mk_gpair`: substituting a pair-valued var into a
+        // tuple tail (`<..,matchingComm>` with `matchingComm := <a,b>`) would
+        // otherwise leave a non-canonical `Pair([..,Pair([a,b])])` that no
+        // longer structurally matches the flat form produced by the
+        // `impliedFormulas`/LNTerm path — defeating the `solved_formulas`
+        // dedup and re-deriving discharged disjunctions.  See `mk_gpair`.
         GTerm::Pair(items) =>
-            GTerm::Pair(items.iter().map(|i| subst_gterm(i, s)).collect()),
+            crate::guarded_types::mk_gpair(
+                items.iter().map(|i| subst_gterm(i, s)).collect()),
         GTerm::Diff(a, b) => GTerm::Diff(
             Box::new(subst_gterm(a, s)), Box::new(subst_gterm(b, s))),
         GTerm::BinOp(op, a, b) => GTerm::BinOp(

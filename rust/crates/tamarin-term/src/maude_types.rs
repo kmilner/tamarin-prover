@@ -39,25 +39,36 @@ pub struct ConvCtx {
     forward: BTreeMap<Lit<Name, LVar>, MaudeLit>,
     /// Inverse map (built when we want to translate back).
     inverse: BTreeMap<MaudeLit, Lit<Name, LVar>>,
-    /// Counters per sort for variables.
-    var_counters: BTreeMap<LSort, u64>,
-    /// Counters per sort for constants.
-    const_counters: BTreeMap<LSort, u64>,
+    /// Single shared fresh-id counter for ALL variables and constants,
+    /// allocated in first-encounter (term-walk) order.
+    ///
+    /// HS-faithful: HS's `runConversion` (Term/Maude/Types.hs) runs the
+    /// `lTermToMTerm` BindT computation under the *global* `FastFresh`
+    /// monad (`type FreshState = Integer`), so `freshIdent "x"` (vars) and
+    /// `freshIdent "a"` (constants) BOTH draw from ONE Integer counter that
+    /// ignores the name hint.  Variables and constants therefore share a
+    /// single 0,1,2,… encounter-order numbering (`x2:Fresh`, `p(3)`, `x4:Msg`,
+    /// …).  RS previously used SEPARATE per-sort counters
+    /// (`var_counters[sort]`, `const_counters[sort]`), so `x0:Fresh`,
+    /// `x0:Msg`, `x0:Pub` all got idx 0 — producing DIFFERENT Maude variable
+    /// names than HS for the same term.  Maude's AC-unifier enumeration is
+    /// sensitive to those names, so the per-sort numbering flipped the order
+    /// of the 2 symmetric unifiers on AC-symmetric problems (e.g. the
+    /// UM_three_pass `CK_secure_UM3` `R_Complete_case_1↔case_2` arm swap).
+    counter: u64,
 }
 
 impl ConvCtx {
     pub fn new() -> Self { Self::default() }
 
-    pub fn fresh_var(&mut self, sort: LSort) -> u64 {
-        let n = self.var_counters.entry(sort).or_insert(0);
-        let id = *n;
-        *n += 1;
+    pub fn fresh_var(&mut self, _sort: LSort) -> u64 {
+        let id = self.counter;
+        self.counter += 1;
         id
     }
-    pub fn fresh_const(&mut self, sort: LSort) -> u64 {
-        let n = self.const_counters.entry(sort).or_insert(0);
-        let id = *n;
-        *n += 1;
+    pub fn fresh_const(&mut self, _sort: LSort) -> u64 {
+        let id = self.counter;
+        self.counter += 1;
         id
     }
 

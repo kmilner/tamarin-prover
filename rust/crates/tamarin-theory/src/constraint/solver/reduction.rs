@@ -919,7 +919,12 @@ impl<'ctx> Reduction<'ctx> {
                                     if nxt == cur { break; }
                                     cur = nxt;
                                 }
-                                cur
+                                // Re-canonicalise AC after substitution so the
+                                // substituted Disj-goal body matches the
+                                // flat-sorted re-derived form for the goal-store
+                                // dedup (see the formula-subst comment in
+                                // `subst_system_once`).
+                                crate::guarded::canonicalize_ac_in_guarded(&cur)
                             })
                             .collect();
                         Goal::Disj(crate::constraint::constraints::Disj(new_alts))
@@ -1020,7 +1025,19 @@ impl<'ctx> Reduction<'ctx> {
                     if nxt == cur { break; }
                     cur = nxt;
                 }
-                cur
+                // Re-canonicalise AC operators after substitution.  Substituting
+                // an AC-valued var into an AC context (`rest ++ matchingComm`
+                // with `matchingComm := <a>++<b>`) leaves a nested/unsorted
+                // `Union(rest, Union(a,b))` that no longer structurally matches
+                // the flat-sorted form `impliedFormulas` produces
+                // (`canonicalize_ac_in_guarded`, simplify.rs:1545) — defeating
+                // the `solved_formulas` dedup, so the prover re-derives and
+                // re-solves a disjunction HS already discharged
+                // (UM_three_pass `CK_secure_UM3`).  HS's AC constructors
+                // (`fAppAC`) flatten+sort on construction, so HS never sees the
+                // nested form; mirror that here.  (Tuple pairs are already
+                // canonicalised inside `subst_gterm` via `mk_gpair`.)
+                crate::guarded::canonicalize_ac_in_guarded(&cur)
             };
             for f in self.sys.formulas.iter_mut() {
                 let new_f = apply_to_fixpoint(f);
@@ -3524,7 +3541,9 @@ fn freshen_rule_with_constrs(
     let base = maude.reserve_idxs(span);
     let shift = (base as i128) - (min as i128);
     let shift_idx = |idx: u64| -> u64 { ((idx as i128) + shift) as u64 };
-    let new_rule = rule.map_free(&mut |LVar { name, sort, idx }| LVar {
+    // HS `someRuleACInst` = `rename` (Rule.hs:944, LTerm.hs:619) is Monotone:
+    // the uniform index shift preserves AC arg order (`unsafefApp`).
+    let new_rule = rule.map_free_monotone(&mut |LVar { name, sort, idx }| LVar {
         name, sort, idx: shift_idx(idx),
     });
     let new_constrs = constrs.map(|cs| {
@@ -3569,7 +3588,9 @@ fn freshen_rule(rule: RuleACInst, avoid_max: u64, maude: &tamarin_term::maude_pr
             let span = max.saturating_sub(min).saturating_add(1);
             let base = maude.reserve_idxs(span);
             let shift = (base as i128) - (min as i128);
-            rule.map_free(&mut |tamarin_term::lterm::LVar { name, sort, idx }|
+            // HS `someRuleACInstAvoiding` = `renameAvoiding` = `rename`
+            // (Rule.hs:963, LTerm.hs:619) is Monotone: AC arg order preserved.
+            rule.map_free_monotone(&mut |tamarin_term::lterm::LVar { name, sort, idx }|
                 tamarin_term::lterm::LVar {
                     name, sort,
                     idx: ((idx as i128) + shift) as u64,

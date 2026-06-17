@@ -899,7 +899,7 @@ impl MaudeHandle {
         // (no clone/reset overhead, identical observable output).
         if msubsts.len() <= 1 {
             for ms in &msubsts {
-                out.push(msubst_to_lnsubst_with_maude(ms, &mut ctx, input_max, Some(self))?);
+                out.push(msubst_to_lnsubst_with_maude(ms, &mut ctx, input_max, Some(self), true)?);
             }
         } else {
             // Snapshot the counter; each unifier resets to this base.
@@ -922,7 +922,7 @@ impl MaudeHandle {
                 // unifier).
                 self.reset_counter_to(baseline);
                 let arm = msubst_to_lnsubst_with_maude(
-                    ms, &mut per_arm_ctx, input_max, Some(self))?;
+                    ms, &mut per_arm_ctx, input_max, Some(self), true)?;
                 // Track high water for global counter restoration.
                 let cur = self.fresh_counter_peek();
                 if cur > high_water { high_water = cur; }
@@ -1049,7 +1049,8 @@ impl MaudeHandle {
         let msubsts = maude_parse::parse_unify_reply(&sig, &reply)?;
         let mut out = Vec::with_capacity(msubsts.len());
         for ms in &msubsts {
-            out.push(msubst_to_lnsubst(ms, &mut ctx)?);
+            // VFresh (unify) path → canonical domain sort.
+            out.push(msubst_to_lnsubst_unify(ms, &mut ctx)?);
         }
         Ok(out)
     }
@@ -1548,7 +1549,8 @@ impl MaudeHandle {
                 if force_x {
                     msubst_to_lnsubst_force_x(ms, ctx_ref)
                 } else {
-                    msubst_to_lnsubst(ms, ctx_ref)
+                    // VFresh (variants) path → canonical domain sort.
+                    msubst_to_lnsubst_unify(ms, ctx_ref)
                 }
             };
             if isolate {
@@ -1611,19 +1613,56 @@ fn unskolemize(
 /// previously-generated witness from another call, silently
 /// conflating distinct semantic variables (the root cause of bug
 /// #21 — variable-conflation in source-case grafting).
+/// HS `msubstToLSubstVFresh` (Maude/Types.hs:134) sorts the Maude
+/// substitution by the domain variable's integer index
+/// (`sortBy (comparing (snd . fst))`) before the back-conversion, so the
+/// fresh-witness allocation order — and hence the witness indices baked
+/// into the resulting `SubstVFresh` — is canonical regardless of the
+/// order Maude happened to emit the bindings.  Upstream added this sort
+/// so proofs become reproducible across thread counts (`-N`): the
+/// unsorted Maude order was a hidden, schedule-dependent global-interning
+/// artifact (see [[rs-hs-thread-schedule-divergence]]).
+///
+/// `msubstToLSubstVFree` (the *match* path, Maude/Types.hs:158) does NOT
+/// sort, so this is gated by `sort_domain`: unify/variants → `true`,
+/// match → `false`.
+///
+/// Returns the iteration order over `ms` (a permutation of `0..ms.len()`).
+/// HS's `sortBy` is a stable mergesort; `Vec::sort_by_key` is likewise
+/// stable, so entries with an equal index keep their Maude order.
+fn msubst_iter_order(ms: &MSubst, sort_domain: bool) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..ms.len()).collect();
+    if sort_domain {
+        order.sort_by_key(|&i| (ms[i].0).1);
+    }
+    order
+}
+
+/// Match-path conversion (HS `msubstToLSubstVFree`): does NOT canonicalise
+/// the domain order — `sort_domain = false`.
 fn msubst_to_lnsubst(
     ms: &MSubst,
     ctx: &mut ConvCtx,
 ) -> Result<Vec<(crate::lterm::LVar, LNTerm)>, MaudeError> {
-    msubst_to_lnsubst_with_avoid(ms, ctx, 0)
+    msubst_to_lnsubst_with_avoid(ms, ctx, 0, false)
+}
+
+/// Unify/variants-path conversion (HS `msubstToLSubstVFresh`): sorts the
+/// domain by variable index before back-conversion — `sort_domain = true`.
+fn msubst_to_lnsubst_unify(
+    ms: &MSubst,
+    ctx: &mut ConvCtx,
+) -> Result<Vec<(crate::lterm::LVar, LNTerm)>, MaudeError> {
+    msubst_to_lnsubst_with_avoid(ms, ctx, 0, true)
 }
 
 fn msubst_to_lnsubst_with_avoid(
     ms: &MSubst,
     ctx: &mut ConvCtx,
     avoid_max: u64,
+    sort_domain: bool,
 ) -> Result<Vec<(crate::lterm::LVar, LNTerm)>, MaudeError> {
-    msubst_to_lnsubst_with_maude(ms, ctx, avoid_max, None)
+    msubst_to_lnsubst_with_maude(ms, ctx, avoid_max, None, sort_domain)
 }
 
 /// Variant of `msubst_to_lnsubst` that forces the Maude-witness name hint
@@ -1657,7 +1696,10 @@ fn msubst_to_lnsubst_force_x(
         }
         n
     };
-    for ((sort, idx), mt) in ms {
+    // HS-faithful: variants use `msubstToLSubstVFresh`, which sorts the
+    // domain by variable index before back-conversion (Maude/Types.hs:134).
+    for &i in &msubst_iter_order(ms, true) {
+        let ((sort, idx), mt) = &ms[i];
         let lv = crate::maude_types::substitute_lookup_var(ctx, *sort, *idx)
             .ok_or_else(|| MaudeError::Other(format!(
                 "no binding for Maude variable x{}:{:?}", idx, sort)))?;
@@ -1680,6 +1722,7 @@ fn msubst_to_lnsubst_with_maude(
     ctx: &mut ConvCtx,
     avoid_max: u64,
     maude: Option<&MaudeHandle>,
+    sort_domain: bool,
 ) -> Result<Vec<(crate::lterm::LVar, LNTerm)>, MaudeError> {
     let mut out = Vec::with_capacity(ms.len());
     // Initialise `next`.  With a global counter, push it above
@@ -1707,7 +1750,12 @@ fn msubst_to_lnsubst_with_maude(
         }
         n
     };
-    for ((sort, idx), mt) in ms {
+    // HS-faithful: the unify/variants path (`msubstToLSubstVFresh`) sorts
+    // the domain by variable index before back-conversion so the
+    // fresh-witness allocation order is canonical (Maude/Types.hs:134);
+    // the match path (`msubstToLSubstVFree`) passes `sort_domain = false`.
+    for &i in &msubst_iter_order(ms, sort_domain) {
+        let ((sort, idx), mt) = &ms[i];
         let lv = crate::maude_types::substitute_lookup_var(ctx, *sort, *idx)
             .ok_or_else(|| MaudeError::Other(format!(
                 "no binding for Maude variable x{}:{:?}", idx, sort)))?;

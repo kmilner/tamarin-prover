@@ -23,6 +23,7 @@ pub mod rename_precise;
 pub mod search;
 pub mod simplify;
 pub mod sources;
+pub mod tactic_show;
 pub mod trace;
 
 pub use context::ProofContext;
