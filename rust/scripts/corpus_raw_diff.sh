@@ -48,6 +48,15 @@ CACHE_VERSION="${CACHE_VERSION:-1}"
 DERIVCHECK_TIMEOUT="${DERIVCHECK_TIMEOUT:-30}"
 HS_CANON_CACHE="${HS_CANON_CACHE:-$script_dir/.hs_canon_cache}"
 NO_HS_CACHE="${NO_HS_CACHE:-}"
+# HS RTS flags. Upstream commit 00a282da ("Canonicalise maude's returned
+# substitution entries", Maude/Types.hs:134) made HS proofs schedule-
+# INDEPENDENT — `+RTS -Nk` for any k now yields byte-identical proofs. So
+# the cache can be (re)generated with PARALLEL HS instead of forced -N1,
+# which is much faster for individually-slow lemmas. HS_RTS defaults to
+# `-N$HS_N` cores per HS run; with JOBS lemmas in flight the product
+# HS_N*JOBS should stay near nproc to avoid oversubscription.
+HS_N="${HS_N:-4}"
+HS_RTS="${HS_RTS:--N$HS_N}"
 [ -n "$NO_HS_CACHE" ] || mkdir -p "$HS_CANON_CACHE" 2>/dev/null || true
 
 # --- Locate the HS binary (same discovery as corpus_full_trace_diff.sh).
@@ -137,7 +146,7 @@ strip_env_lines() {
 }
 export -f hs_cache_key lemmas_of strip_env_lines
 export HS_PATH="$hs_path" RS_PATH="$rs_path" TIMEOUT RS_TIMEOUT EXTRA_ENV \
-       HS_CANON_CACHE CACHE_VERSION NO_HS_CACHE DERIVCHECK_TIMEOUT
+       HS_CANON_CACHE CACHE_VERSION NO_HS_CACHE DERIVCHECK_TIMEOUT HS_RTS
 
 # --- Per-lemma worker. Emits ONE machine-parseable line:
 #       <file>\t<lemma>\t<status>\t<hs_lines>\t<rs_lines>\t<diff>\t<hs_ms>\t<rs_ms>
@@ -166,7 +175,7 @@ worker() {
             > "$hs_out"
     else
         local hs_t0; hs_t0=$(date +%s%3N)
-        timeout "$TIMEOUT" "$HS_PATH" +RTS -N1 -RTS --derivcheck-timeout="$DERIVCHECK_TIMEOUT" --prove="$lemma" "$f" 2>/dev/null > "$hs_out"
+        timeout "$TIMEOUT" "$HS_PATH" +RTS $HS_RTS -RTS --derivcheck-timeout="$DERIVCHECK_TIMEOUT" --prove="$lemma" "$f" 2>/dev/null > "$hs_out"
         hs_rc=$?
         hs_ms=$(( $(date +%s%3N) - hs_t0 ))
         if [ -n "$key" ]; then
