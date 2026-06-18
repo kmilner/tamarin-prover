@@ -47,8 +47,8 @@ pub enum GTerm {
     NumberOne,
     NatOne,
     DhNeutral,
-    App(String, std::sync::Arc<[GTerm]>),
-    AlgApp(String, std::sync::Arc<GTerm>, std::sync::Arc<GTerm>),
+    App(std::sync::Arc<str>, std::sync::Arc<[GTerm]>),
+    AlgApp(std::sync::Arc<str>, std::sync::Arc<GTerm>, std::sync::Arc<GTerm>),
     Pair(std::sync::Arc<[GTerm]>),
     Diff(std::sync::Arc<GTerm>, std::sync::Arc<GTerm>),
     BinOp(p::BinOp, std::sync::Arc<GTerm>, std::sync::Arc<GTerm>),
@@ -134,9 +134,9 @@ pub fn term_to_gterm_free(t: &p::Term) -> GTerm {
         p::Term::NatOne => GTerm::NatOne,
         p::Term::DhNeutral => GTerm::DhNeutral,
         p::Term::App(n, args) =>
-            GTerm::App(n.clone(), args.iter().map(term_to_gterm_free).collect()),
+            GTerm::App(n.as_str().into(), args.iter().map(term_to_gterm_free).collect()),
         p::Term::AlgApp(n, a, b) =>
-            GTerm::AlgApp(n.clone(), ga(term_to_gterm_free(a)), ga(term_to_gterm_free(b))),
+            GTerm::AlgApp(n.as_str().into(), ga(term_to_gterm_free(a)), ga(term_to_gterm_free(b))),
         p::Term::Pair(items) =>
             mk_gpair(items.iter().map(term_to_gterm_free).collect()),
         p::Term::Diff(a, b) =>
@@ -195,9 +195,9 @@ pub fn gterm_to_term(g: &GTerm) -> p::Term {
         GTerm::NatOne => p::Term::NatOne,
         GTerm::DhNeutral => p::Term::DhNeutral,
         GTerm::App(n, args) =>
-            p::Term::App(n.clone(), args.iter().map(gterm_to_term).collect()),
+            p::Term::App(n.to_string(), args.iter().map(gterm_to_term).collect()),
         GTerm::AlgApp(n, a, b) =>
-            p::Term::AlgApp(n.clone(), Box::new(gterm_to_term(a)), Box::new(gterm_to_term(b))),
+            p::Term::AlgApp(n.to_string(), Box::new(gterm_to_term(a)), Box::new(gterm_to_term(b))),
         GTerm::Pair(items) =>
             p::Term::Pair(items.iter().map(gterm_to_term).collect()),
         GTerm::Diff(a, b) =>
@@ -255,46 +255,78 @@ pub fn gatom_to_atom(a: &GAtom) -> p::Atom {
 /// body reference as `Untagged`).  This mirrors the pre-DeBruijn Rust
 /// behaviour where `VarSubst` keys were `(String, u64)`.
 pub fn subst_free_term_at_depth(t: &GTerm, s: &[(p::VarSpec, u32)], depth: u32) -> GTerm {
+    match subst_free_term_cow(t, s, depth) {
+        Some(g) => g,
+        None => t.clone(),
+    }
+}
+
+/// Copy-on-write core of `subst_free_term_at_depth`.  Returns `None` when no
+/// Free leaf in the subtree matches a substitution key, so the caller can
+/// reuse the input `Arc`.  These `subst_free`/`subst_bound` paths never call
+/// `mk_gpair` (they only retag Var leaves Free↔Bound, never inserting a Pair),
+/// so `Pair` reuse is unconditional on "no child changed".
+fn subst_free_term_cow(t: &GTerm, s: &[(p::VarSpec, u32)], depth: u32) -> Option<GTerm> {
     match t {
         GTerm::Var(BVar::Free(v)) => {
             for (lv, db) in s {
                 if lv.name == v.name && lv.idx == v.idx {
-                    return GTerm::Var(BVar::Bound(db + depth));
+                    return Some(GTerm::Var(BVar::Bound(db + depth)));
                 }
             }
-            GTerm::Var(BVar::Free(v.clone()))
+            None
         }
-        GTerm::Var(b) => GTerm::Var(b.clone()),
-        GTerm::PubLit(s_) => GTerm::PubLit(s_.clone()),
-        GTerm::FreshLit(s_) => GTerm::FreshLit(s_.clone()),
-        GTerm::NatLit(s_) => GTerm::NatLit(s_.clone()),
-        GTerm::Number(n) => GTerm::Number(*n),
-        GTerm::NumberOne => GTerm::NumberOne,
-        GTerm::NatOne => GTerm::NatOne,
-        GTerm::DhNeutral => GTerm::DhNeutral,
-        GTerm::App(n, args) => GTerm::App(
-            n.clone(),
-            args.iter().map(|a| subst_free_term_at_depth(a, s, depth)).collect(),
-        ),
-        GTerm::AlgApp(n, a, b) => GTerm::AlgApp(
-            n.clone(),
-            ga(subst_free_term_at_depth(a, s, depth)),
-            ga(subst_free_term_at_depth(b, s, depth)),
-        ),
-        GTerm::Pair(items) => GTerm::Pair(
-            items.iter().map(|a| subst_free_term_at_depth(a, s, depth)).collect(),
-        ),
-        GTerm::Diff(a, b) => GTerm::Diff(
-            ga(subst_free_term_at_depth(a, s, depth)),
-            ga(subst_free_term_at_depth(b, s, depth)),
-        ),
-        GTerm::BinOp(op, a, b) => GTerm::BinOp(
-            *op,
-            ga(subst_free_term_at_depth(a, s, depth)),
-            ga(subst_free_term_at_depth(b, s, depth)),
-        ),
-        GTerm::PatMatch(t) => GTerm::PatMatch(ga(subst_free_term_at_depth(t, s, depth))),
+        GTerm::Var(_) | GTerm::PubLit(_) | GTerm::FreshLit(_) | GTerm::NatLit(_)
+        | GTerm::Number(_) | GTerm::NumberOne | GTerm::NatOne | GTerm::DhNeutral => None,
+        GTerm::App(n, args) => subst_free_slice(args, s, depth)
+            .map(|new| GTerm::App(n.clone(), new)),
+        GTerm::Pair(items) => subst_free_slice(items, s, depth)
+            .map(GTerm::Pair),
+        GTerm::AlgApp(n, a, b) => {
+            let a2 = subst_free_term_cow(a, s, depth);
+            let b2 = subst_free_term_cow(b, s, depth);
+            if a2.is_none() && b2.is_none() { return None; }
+            Some(GTerm::AlgApp(
+                n.clone(),
+                a2.map(ga).unwrap_or_else(|| a.clone()),
+                b2.map(ga).unwrap_or_else(|| b.clone()),
+            ))
+        }
+        GTerm::Diff(a, b) => {
+            let a2 = subst_free_term_cow(a, s, depth);
+            let b2 = subst_free_term_cow(b, s, depth);
+            if a2.is_none() && b2.is_none() { return None; }
+            Some(GTerm::Diff(
+                a2.map(ga).unwrap_or_else(|| a.clone()),
+                b2.map(ga).unwrap_or_else(|| b.clone()),
+            ))
+        }
+        GTerm::BinOp(op, a, b) => {
+            let a2 = subst_free_term_cow(a, s, depth);
+            let b2 = subst_free_term_cow(b, s, depth);
+            if a2.is_none() && b2.is_none() { return None; }
+            Some(GTerm::BinOp(
+                *op,
+                a2.map(ga).unwrap_or_else(|| a.clone()),
+                b2.map(ga).unwrap_or_else(|| b.clone()),
+            ))
+        }
+        GTerm::PatMatch(inner) => subst_free_term_cow(inner, s, depth)
+            .map(|g| GTerm::PatMatch(ga(g))),
     }
+}
+
+fn subst_free_slice(args: &std::sync::Arc<[GTerm]>, s: &[(p::VarSpec, u32)], depth: u32)
+    -> Option<std::sync::Arc<[GTerm]>>
+{
+    let mut out: Option<Vec<GTerm>> = None;
+    for (i, a) in args.iter().enumerate() {
+        match subst_free_term_cow(a, s, depth) {
+            Some(g) => out.get_or_insert_with(|| args[..i].to_vec()).push(g),
+            None => if let Some(v) = out.as_mut() { v.push(a.clone()); }
+        }
+    }
+    out.map(std::sync::Arc::from)
 }
 
 /// `subst_free_fact_at_depth(f, s, depth)` — analogous for facts.
@@ -353,48 +385,78 @@ pub fn subst_free_atom_at_depth(a: &GAtom, s: &[(p::VarSpec, u32)], depth: u32) 
 /// look up `(i, lvar)` where `n = i + depth`; if found, replace with
 /// `Free(lvar)`.
 pub fn subst_bound_term_at_depth(t: &GTerm, s: &[(u32, p::VarSpec)], depth: u32) -> GTerm {
+    match subst_bound_term_cow(t, s, depth) {
+        Some(g) => g,
+        None => t.clone(),
+    }
+}
+
+/// Copy-on-write core of `subst_bound_term_at_depth` (see
+/// `subst_free_term_cow` for the COW rationale).  Returns `None` when no
+/// `Bound` leaf in the subtree matches a substitution key.
+fn subst_bound_term_cow(t: &GTerm, s: &[(u32, p::VarSpec)], depth: u32) -> Option<GTerm> {
     match t {
         GTerm::Var(BVar::Bound(n)) => {
             for (i, lv) in s {
                 if let Some(target) = i.checked_add(depth) {
                     if target == *n {
-                        return GTerm::Var(BVar::Free(lv.clone()));
+                        return Some(GTerm::Var(BVar::Free(lv.clone())));
                     }
                 }
             }
-            GTerm::Var(BVar::Bound(*n))
+            None
         }
-        GTerm::Var(b) => GTerm::Var(b.clone()),
-        GTerm::PubLit(s_) => GTerm::PubLit(s_.clone()),
-        GTerm::FreshLit(s_) => GTerm::FreshLit(s_.clone()),
-        GTerm::NatLit(s_) => GTerm::NatLit(s_.clone()),
-        GTerm::Number(n) => GTerm::Number(*n),
-        GTerm::NumberOne => GTerm::NumberOne,
-        GTerm::NatOne => GTerm::NatOne,
-        GTerm::DhNeutral => GTerm::DhNeutral,
-        GTerm::App(n, args) => GTerm::App(
-            n.clone(),
-            args.iter().map(|a| subst_bound_term_at_depth(a, s, depth)).collect(),
-        ),
-        GTerm::AlgApp(n, a, b) => GTerm::AlgApp(
-            n.clone(),
-            ga(subst_bound_term_at_depth(a, s, depth)),
-            ga(subst_bound_term_at_depth(b, s, depth)),
-        ),
-        GTerm::Pair(items) => GTerm::Pair(
-            items.iter().map(|a| subst_bound_term_at_depth(a, s, depth)).collect(),
-        ),
-        GTerm::Diff(a, b) => GTerm::Diff(
-            ga(subst_bound_term_at_depth(a, s, depth)),
-            ga(subst_bound_term_at_depth(b, s, depth)),
-        ),
-        GTerm::BinOp(op, a, b) => GTerm::BinOp(
-            *op,
-            ga(subst_bound_term_at_depth(a, s, depth)),
-            ga(subst_bound_term_at_depth(b, s, depth)),
-        ),
-        GTerm::PatMatch(t) => GTerm::PatMatch(ga(subst_bound_term_at_depth(t, s, depth))),
+        GTerm::Var(_) | GTerm::PubLit(_) | GTerm::FreshLit(_) | GTerm::NatLit(_)
+        | GTerm::Number(_) | GTerm::NumberOne | GTerm::NatOne | GTerm::DhNeutral => None,
+        GTerm::App(n, args) => subst_bound_slice(args, s, depth)
+            .map(|new| GTerm::App(n.clone(), new)),
+        GTerm::Pair(items) => subst_bound_slice(items, s, depth)
+            .map(GTerm::Pair),
+        GTerm::AlgApp(n, a, b) => {
+            let a2 = subst_bound_term_cow(a, s, depth);
+            let b2 = subst_bound_term_cow(b, s, depth);
+            if a2.is_none() && b2.is_none() { return None; }
+            Some(GTerm::AlgApp(
+                n.clone(),
+                a2.map(ga).unwrap_or_else(|| a.clone()),
+                b2.map(ga).unwrap_or_else(|| b.clone()),
+            ))
+        }
+        GTerm::Diff(a, b) => {
+            let a2 = subst_bound_term_cow(a, s, depth);
+            let b2 = subst_bound_term_cow(b, s, depth);
+            if a2.is_none() && b2.is_none() { return None; }
+            Some(GTerm::Diff(
+                a2.map(ga).unwrap_or_else(|| a.clone()),
+                b2.map(ga).unwrap_or_else(|| b.clone()),
+            ))
+        }
+        GTerm::BinOp(op, a, b) => {
+            let a2 = subst_bound_term_cow(a, s, depth);
+            let b2 = subst_bound_term_cow(b, s, depth);
+            if a2.is_none() && b2.is_none() { return None; }
+            Some(GTerm::BinOp(
+                *op,
+                a2.map(ga).unwrap_or_else(|| a.clone()),
+                b2.map(ga).unwrap_or_else(|| b.clone()),
+            ))
+        }
+        GTerm::PatMatch(inner) => subst_bound_term_cow(inner, s, depth)
+            .map(|g| GTerm::PatMatch(ga(g))),
     }
+}
+
+fn subst_bound_slice(args: &std::sync::Arc<[GTerm]>, s: &[(u32, p::VarSpec)], depth: u32)
+    -> Option<std::sync::Arc<[GTerm]>>
+{
+    let mut out: Option<Vec<GTerm>> = None;
+    for (i, a) in args.iter().enumerate() {
+        match subst_bound_term_cow(a, s, depth) {
+            Some(g) => out.get_or_insert_with(|| args[..i].to_vec()).push(g),
+            None => if let Some(v) = out.as_mut() { v.push(a.clone()); }
+        }
+    }
+    out.map(std::sync::Arc::from)
 }
 
 /// `subst_bound_fact_at_depth(f, s, depth)` — analogous for facts.
@@ -764,7 +826,7 @@ mod tests {
     #[test]
     fn collect_free_skips_bound() {
         let t = GTerm::App(
-            "f".to_string(),
+            "f".into(),
             vec![
                 GTerm::Var(BVar::Free(vs("x", 0))),
                 GTerm::Var(BVar::Bound(0)),
@@ -781,7 +843,7 @@ mod tests {
     #[test]
     fn map_free_skips_bound() {
         let t = GTerm::App(
-            "f".to_string(),
+            "f".into(),
             vec![
                 GTerm::Var(BVar::Free(vs("x", 0))),
                 GTerm::Var(BVar::Bound(0)),

@@ -619,10 +619,10 @@ pub fn try_gterm_to_term(t: &GTerm) -> Option<p::Term> {
         GTerm::App(n, args) => {
             let mut acc = Vec::with_capacity(args.len());
             for a in args.iter() { acc.push(try_gterm_to_term(a)?); }
-            p::Term::App(n.clone(), acc)
+            p::Term::App(n.to_string(), acc)
         }
         GTerm::AlgApp(n, a, b) =>
-            p::Term::AlgApp(n.clone(), Box::new(try_gterm_to_term(a)?), Box::new(try_gterm_to_term(b)?)),
+            p::Term::AlgApp(n.to_string(), Box::new(try_gterm_to_term(a)?), Box::new(try_gterm_to_term(b)?)),
         GTerm::Pair(items) => {
             let mut acc = Vec::with_capacity(items.len());
             for it in items.iter() { acc.push(try_gterm_to_term(it)?); }
@@ -1382,18 +1382,50 @@ fn cac_flatten(op: &p::BinOp, t: &GTerm, out: &mut Vec<GTerm>) {
 }
 
 fn cac_rec_term(t: &GTerm, cmp: GCmp) -> GTerm {
+    // Wrapper: materialise the COW result, reusing `t` when nothing changed.
+    match cac_rec_term_cow(t, cmp) {
+        Some(g) => g,
+        None => t.clone(),
+    }
+}
+
+/// Copy-on-write core of `cac_rec_term`.  Returns `None` when the subtree is
+/// already in canonical form (no AC chain needed re-sorting and no descendant
+/// changed), so the caller can reuse the input `Arc` without allocating a
+/// rebuilt copy.  `Some(g)` carries the rebuilt subtree.
+///
+/// The produced canonical form is byte-identical to the eager version: every
+/// `None`-reuse path is gated on the recursive results being structurally
+/// unchanged, and the AC branch only returns `None` after confirming the
+/// re-folded sorted chain equals the input (`acc == *t`).
+fn cac_rec_term_cow(t: &GTerm, cmp: GCmp) -> Option<GTerm> {
     match t {
         GTerm::Var(_) | GTerm::PubLit(_) | GTerm::FreshLit(_)
         | GTerm::NatLit(_) | GTerm::Number(_) | GTerm::NumberOne
-        | GTerm::NatOne | GTerm::DhNeutral => t.clone(),
-        GTerm::App(n, args) => GTerm::App(
-            n.clone(), args.iter().map(|a| cac_rec_term(a, cmp)).collect()),
-        GTerm::Pair(args) => GTerm::Pair(
-            args.iter().map(|a| cac_rec_term(a, cmp)).collect()),
-        GTerm::AlgApp(n, a, b) => GTerm::AlgApp(
-            n.clone(), ga(cac_rec_term(a, cmp)), ga(cac_rec_term(b, cmp))),
-        GTerm::Diff(a, b) => GTerm::Diff(
-            ga(cac_rec_term(a, cmp)), ga(cac_rec_term(b, cmp))),
+        | GTerm::NatOne | GTerm::DhNeutral => None,
+        GTerm::App(n, args) =>
+            cac_rec_slice(args, cmp).map(|new| GTerm::App(n.clone(), new)),
+        GTerm::Pair(args) =>
+            cac_rec_slice(args, cmp).map(GTerm::Pair),
+        GTerm::AlgApp(n, a, b) => {
+            let a2 = cac_rec_term_cow(a, cmp);
+            let b2 = cac_rec_term_cow(b, cmp);
+            if a2.is_none() && b2.is_none() { return None; }
+            Some(GTerm::AlgApp(
+                n.clone(),
+                a2.map(ga).unwrap_or_else(|| a.clone()),
+                b2.map(ga).unwrap_or_else(|| b.clone()),
+            ))
+        }
+        GTerm::Diff(a, b) => {
+            let a2 = cac_rec_term_cow(a, cmp);
+            let b2 = cac_rec_term_cow(b, cmp);
+            if a2.is_none() && b2.is_none() { return None; }
+            Some(GTerm::Diff(
+                a2.map(ga).unwrap_or_else(|| a.clone()),
+                b2.map(ga).unwrap_or_else(|| b.clone()),
+            ))
+        }
         GTerm::BinOp(op, l, r) => {
             if matches!(op, p::BinOp::Mult | p::BinOp::Union | p::BinOp::Xor | p::BinOp::NatPlus) {
                 // Recurse into children first, then flatten the whole AC
@@ -1411,14 +1443,38 @@ fn cac_rec_term(t: &GTerm, cmp: GCmp) -> GTerm {
                 for prev in iter {
                     acc = GTerm::BinOp(*op, ga(prev), ga(acc));
                 }
-                acc
+                // Reuse the input only if the canonical chain is byte-identical
+                // (children unchanged AND already sorted+right-leaning).
+                if acc == *t { None } else { Some(acc) }
             } else {
-                GTerm::BinOp(*op, ga(cac_rec_term(l, cmp)),
-                    ga(cac_rec_term(r, cmp)))
+                let l2 = cac_rec_term_cow(l, cmp);
+                let r2 = cac_rec_term_cow(r, cmp);
+                if l2.is_none() && r2.is_none() { return None; }
+                Some(GTerm::BinOp(
+                    *op,
+                    l2.map(ga).unwrap_or_else(|| l.clone()),
+                    r2.map(ga).unwrap_or_else(|| r.clone()),
+                ))
             }
         }
-        GTerm::PatMatch(inner) => GTerm::PatMatch(ga(cac_rec_term(inner, cmp))),
+        GTerm::PatMatch(inner) =>
+            cac_rec_term_cow(inner, cmp).map(|g| GTerm::PatMatch(ga(g))),
     }
+}
+
+/// COW over a slice of `Arc<[GTerm]>` children: returns `None` if every child
+/// is unchanged, else `Some` of the rebuilt slice (reusing unchanged children
+/// by cloning their `Arc`).  Single-pass: the output `Vec` is allocated lazily
+/// only when (and after) the first child changes.
+fn cac_rec_slice(args: &std::sync::Arc<[GTerm]>, cmp: GCmp) -> Option<std::sync::Arc<[GTerm]>> {
+    let mut out: Option<Vec<GTerm>> = None;
+    for (i, a) in args.iter().enumerate() {
+        match cac_rec_term_cow(a, cmp) {
+            Some(g) => out.get_or_insert_with(|| args[..i].to_vec()).push(g),
+            None => if let Some(v) = out.as_mut() { v.push(a.clone()); }
+        }
+    }
+    out.map(std::sync::Arc::from)
 }
 
 fn cac_rec_fact(f: &GFact, cmp: GCmp) -> GFact {
@@ -1649,42 +1705,119 @@ pub fn subst_gfact(f: &GFact, s: &VarSubst) -> GFact {
 
 /// Substitute Free LVar leaves in a `GTerm`.
 pub fn subst_gterm(t: &GTerm, s: &VarSubst) -> GTerm {
+    match subst_gterm_cow(t, s) {
+        Some(g) => g,
+        None => t.clone(),
+    }
+}
+
+/// Copy-on-write core of `subst_gterm`.  Returns `None` when the subtree
+/// contains no variable in the substitution's domain (so no leaf is replaced
+/// and no `mk_gpair` flattening can fire), letting the caller reuse the input
+/// `Arc` without rebuilding.  `Some(g)` carries the rebuilt subtree.
+///
+/// Faithfulness: the result is byte-identical to the eager version.
+/// - A `None`-reuse on `App`/`AlgApp`/`Diff`/`BinOp`/`PatMatch` is gated on
+///   every child returning `None`, i.e. no substitution touched the subtree.
+/// - The `Pair` case is the delicate one: the eager code always runs
+///   `mk_gpair`, which flattens a *trailing* `Pair` child even under an
+///   empty-effect substitution.  So we only return `None` when no child
+///   changed AND the input's last element is not a `Pair` (i.e. it is already
+///   in `mk_gpair`-canonical form, hence `mk_gpair(items) == *t`).  When any
+///   child changed, or the tail is a `Pair`, we run `mk_gpair` exactly as the
+///   eager code did.
+fn subst_gterm_cow(t: &GTerm, s: &VarSubst) -> Option<GTerm> {
     match t {
         GTerm::Var(BVar::Free(v)) => {
             let key = (v.name.clone(), v.idx);
-            if let Some(target) = s.get(&key) {
-                term_to_gterm_free(target)
-            } else {
-                GTerm::Var(BVar::Free(v.clone()))
-            }
+            s.get(&key).map(term_to_gterm_free)
         }
-        GTerm::Var(b) => GTerm::Var(b.clone()),
-        GTerm::PubLit(s_) => GTerm::PubLit(s_.clone()),
-        GTerm::FreshLit(s_) => GTerm::FreshLit(s_.clone()),
-        GTerm::NatLit(s_) => GTerm::NatLit(s_.clone()),
-        GTerm::Number(n) => GTerm::Number(*n),
-        GTerm::NumberOne => GTerm::NumberOne,
-        GTerm::NatOne => GTerm::NatOne,
-        GTerm::DhNeutral => GTerm::DhNeutral,
+        GTerm::Var(_) | GTerm::PubLit(_) | GTerm::FreshLit(_) | GTerm::NatLit(_)
+        | GTerm::Number(_) | GTerm::NumberOne | GTerm::NatOne | GTerm::DhNeutral => None,
         GTerm::App(n, args) =>
-            GTerm::App(n.clone(), args.iter().map(|a| subst_gterm(a, s)).collect()),
-        GTerm::AlgApp(n, a, b) => GTerm::AlgApp(
-            n.clone(), ga(subst_gterm(a, s)), ga(subst_gterm(b, s))),
+            subst_gterm_slice(args, s).map(|new| GTerm::App(n.clone(), new)),
+        GTerm::AlgApp(n, a, b) => {
+            let a2 = subst_gterm_cow(a, s);
+            let b2 = subst_gterm_cow(b, s);
+            if a2.is_none() && b2.is_none() { return None; }
+            Some(GTerm::AlgApp(
+                n.clone(),
+                a2.map(ga).unwrap_or_else(|| a.clone()),
+                b2.map(ga).unwrap_or_else(|| b.clone()),
+            ))
+        }
         // Canonicalise via `mk_gpair`: substituting a pair-valued var into a
         // tuple tail (`<..,matchingComm>` with `matchingComm := <a,b>`) would
         // otherwise leave a non-canonical `Pair([..,Pair([a,b])])` that no
         // longer structurally matches the flat form produced by the
         // `impliedFormulas`/LNTerm path — defeating the `solved_formulas`
         // dedup and re-deriving discharged disjunctions.  See `mk_gpair`.
-        GTerm::Pair(items) =>
-            crate::guarded_types::mk_gpair(
-                items.iter().map(|i| subst_gterm(i, s)).collect()),
-        GTerm::Diff(a, b) => GTerm::Diff(
-            ga(subst_gterm(a, s)), ga(subst_gterm(b, s))),
-        GTerm::BinOp(op, a, b) => GTerm::BinOp(
-            *op, ga(subst_gterm(a, s)), ga(subst_gterm(b, s))),
-        GTerm::PatMatch(t) => GTerm::PatMatch(ga(subst_gterm(t, s))),
+        GTerm::Pair(items) => {
+            // The eager code always calls `mk_gpair`, which flattens a trailing
+            // `Pair` even under an empty-effect substitution.  Reuse the input
+            // (`None`) only if nothing changed AND it is already
+            // `mk_gpair`-canonical (tail not a `Pair`).  Otherwise we must
+            // materialise the full child list and run `mk_gpair`, exactly as
+            // the eager code did.  Single-pass: allocate the rebuild `Vec`
+            // lazily on the first changed child.
+            let mut out: Option<Vec<GTerm>> = None;
+            for (i, it) in items.iter().enumerate() {
+                match subst_gterm_cow(it, s) {
+                    Some(g) => out.get_or_insert_with(|| items[..i].to_vec()).push(g),
+                    None => if let Some(v) = out.as_mut() { v.push(it.clone()); }
+                }
+            }
+            match out {
+                Some(rebuilt) => Some(crate::guarded_types::mk_gpair(rebuilt)),
+                None => {
+                    // No child changed.  Flatten only if the tail is a `Pair`.
+                    if matches!(items.last(), Some(GTerm::Pair(_))) {
+                        Some(crate::guarded_types::mk_gpair(items.to_vec()))
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+        GTerm::Diff(a, b) => {
+            let a2 = subst_gterm_cow(a, s);
+            let b2 = subst_gterm_cow(b, s);
+            if a2.is_none() && b2.is_none() { return None; }
+            Some(GTerm::Diff(
+                a2.map(ga).unwrap_or_else(|| a.clone()),
+                b2.map(ga).unwrap_or_else(|| b.clone()),
+            ))
+        }
+        GTerm::BinOp(op, a, b) => {
+            let a2 = subst_gterm_cow(a, s);
+            let b2 = subst_gterm_cow(b, s);
+            if a2.is_none() && b2.is_none() { return None; }
+            Some(GTerm::BinOp(
+                *op,
+                a2.map(ga).unwrap_or_else(|| a.clone()),
+                b2.map(ga).unwrap_or_else(|| b.clone()),
+            ))
+        }
+        GTerm::PatMatch(inner) =>
+            subst_gterm_cow(inner, s).map(|g| GTerm::PatMatch(ga(g))),
     }
+}
+
+/// COW over an `Arc<[GTerm]>` argument slice: `None` if every child is
+/// unchanged, else `Some` of the rebuilt slice (unchanged children reuse their
+/// `Arc`).  Used by the non-`Pair` n-ary case (`App`), which never flattens.
+/// Single-pass: the output `Vec` is allocated lazily on first change.
+fn subst_gterm_slice(args: &std::sync::Arc<[GTerm]>, s: &VarSubst)
+    -> Option<std::sync::Arc<[GTerm]>>
+{
+    let mut out: Option<Vec<GTerm>> = None;
+    for (i, a) in args.iter().enumerate() {
+        match subst_gterm_cow(a, s) {
+            Some(g) => out.get_or_insert_with(|| args[..i].to_vec()).push(g),
+            None => if let Some(v) = out.as_mut() { v.push(a.clone()); }
+        }
+    }
+    out.map(std::sync::Arc::from)
 }
 
 /// Find the maximum variable idx used in a guarded formula. Used
