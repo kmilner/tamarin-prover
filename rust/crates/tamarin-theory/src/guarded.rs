@@ -172,7 +172,55 @@ pub fn cmp_term(a: &GTerm, b: &GTerm) -> std::cmp::Ordering {
     let (ca, sa) = term_class(a);
     let (cb, sb) = term_class(b);
     if ca != cb { return ca.cmp(&cb); }
-    if sa != sb { return sa.cmp(&sb); }
+    // FApp class (ca == cb == 1): HS `Ord (Term a)` compares `FAPP fsym ts`
+    // by `compare fsym` THEN `compare ts` (derived Ord on
+    // `Term a = LIT a | FAPP FunSym [Term a]`, Term/Raw.hs:74).  The
+    // `FunSym` Ord is `NoEq < AC < C < List`, and within `NoEq` it is
+    // `Ord NoEqSym = (name, (arity, privacy, constructability))`
+    // (FunctionSymbols.hs:117) — i.e. compared by NAME first.
+    //
+    // RS special-cases several HS `FAPP (NoEq sym)` terms into dedicated
+    // `GTerm` variants (`Pair`=pair, `BinOp Exp`=exp, `Diff`=diff,
+    // `NumberOne`=one, `NatOne`=tone, `DhNeutral`=DH_neutral) and AC
+    // ops into `BinOp Mult/Union/Xor/NatPlus`.  The OLD `term_class`
+    // ordered these by RUST VARIANT (Pair=5, BinOp=7, ...) — which does
+    // NOT match HS's name-based `FunSym` Ord (e.g. HS sorts `exp(...)`
+    // BEFORE `pair(...)` because `"exp" < "pair"`, but the variant order
+    // put Pair=5 before BinOp(Exp)=7).  That swapped the `S.toList
+    // sFormulas` iteration order in `evalFormulaAtoms`, flipping which
+    // co-created SidUpdated DisjG got the lower `gsNr` (UM3
+    // `CK_secure_UM3` line-3438 abstract-vs-transcript disj swap).
+    //
+    // Faithful: compare two FApp-class terms by their HS `FunSym` key
+    // (`funsym_key`), then by the argument list (flattened+sorted for AC,
+    // matching `fAppAC`'s `sort (...)`, Term/Raw.hs:122).
+    if ca == 1 {
+        // Borrowed FunSym key (no per-comparison allocation): compare
+        // (outer, name-bytes, arity) in HS order without materialising a
+        // `Vec`.  `cmp_term` is a very hot path (every BTreeSet/Map op on
+        // guarded terms), so the name must be compared as a `&[u8]` slice.
+        let (oa, na, aa) = funsym_key(a);
+        let (ob, nb, ab) = funsym_key(b);
+        let kc = oa.cmp(&ob)
+            .then_with(|| na.cmp(nb))
+            .then_with(|| aa.cmp(&ab));
+        if kc != std::cmp::Ordering::Equal { return kc; }
+        // Same FunSym: compare argument lists in HS `[Term a]` order.
+        // AC ops compare a sorted, flattened multiset (HS stores args
+        // pre-sorted by `fAppAC`); everything else compares positionally.
+        if let (BinOp(o1, _, _), BinOp(o2, _, _)) = (a, b) {
+            if is_ac_binop(o1) && is_ac_binop(o2) {
+                let mut args_a = Vec::new();
+                let mut args_b = Vec::new();
+                flatten_ac_binop(o1, a, &mut args_a);
+                flatten_ac_binop(o2, b, &mut args_b);
+                args_a.sort_by(cmp_term);
+                args_b.sort_by(cmp_term);
+                return cmp_slice(&args_a, &args_b, cmp_term);
+            }
+        }
+        return cmp_fapp_args(a, b);
+    }
     match (a, b) {
         // Lit class:
         (Var(v1), Var(v2)) => cmp_bvar(v1, v2),
@@ -180,47 +228,84 @@ pub fn cmp_term(a: &GTerm, b: &GTerm) -> std::cmp::Ordering {
         (FreshLit(s1), FreshLit(s2)) => s1.cmp(s2),
         (NatLit(s1), NatLit(s2)) => s1.cmp(s2),
         (Number(n1), Number(n2)) => n1.cmp(n2),
-        (NumberOne, NumberOne) | (NatOne, NatOne) | (DhNeutral, DhNeutral)
-            => std::cmp::Ordering::Equal,
-        // FApp class:
-        (App(n1, args1), App(n2, args2)) =>
-            n1.cmp(n2).then_with(|| cmp_slice(args1, args2, cmp_term)),
-        (AlgApp(n1, l1, r1), AlgApp(n2, l2, r2)) =>
-            n1.cmp(n2).then_with(|| cmp_term(l1, l2)).then_with(|| cmp_term(r1, r2)),
-        (Pair(a1), Pair(a2)) => cmp_slice(a1, a2, cmp_term),
+        _ => {
+            // Lit-class sub-discriminator (Con < Var; among Con by NameTag
+            // then name) — handled by `term_class`'s sub_tag.
+            sa.cmp(&sb)
+        }
+    }
+}
+
+/// HS `FunSym` Ord key for a FApp-class `GTerm`.  Returns
+/// `(outer, name, arity)` where `outer` mirrors HS's `FunSym` constructor
+/// order `NoEq(0) < AC(1) < C(2) < List(3)` (FunctionSymbols.hs:113-117)
+/// and, within `NoEq`, `(name, arity)` mirrors `Ord NoEqSym` (compared by
+/// name then arity — privacy/constructability never disambiguate two
+/// distinct symbols sharing a name+arity).  AC ops carry no name; their
+/// `ACSym` order is `Union < Mult < Xor < NatPlus` (FunctionSymbols.hs:93),
+/// encoded in the second field as an index so AC terms sort among
+/// themselves by ACSym and after every NoEq term.
+fn funsym_key(t: &GTerm) -> (u8, &[u8], usize) {
+    use GTerm::*;
+    // NoEq syms: outer = 0, key by (name-bytes, arity).  Static byte-string
+    // literals (`b"pair"` etc.) are `&'static [u8]` and coerce to the
+    // elided output lifetime; `n.as_bytes()` borrows from `t`.  No alloc.
+    match t {
+        // RS special-cased HS `FAPP (NoEq sym)` terms:
+        Pair(_) => (0, b"pair", 2),
+        BinOp(p::BinOp::Exp, _, _) => (0, b"exp", 2),
+        Diff(_, _) => (0, b"diff", 2),
+        NumberOne => (0, b"one", 0),
+        NatOne => (0, b"tone", 0),
+        DhNeutral => (0, b"DH_neutral", 0),
+        App(n, args) => (0, n.as_bytes(), args.len()),
+        AlgApp(n, _, _) => (0, n.as_bytes(), 2),
+        // AC ops: outer = 1, ACSym order Union<Mult<Xor<NatPlus> in field 3.
+        BinOp(p::BinOp::Union, _, _)   => (1, b"", 0),
+        BinOp(p::BinOp::Mult, _, _)    => (1, b"", 1),
+        BinOp(p::BinOp::Xor, _, _)     => (1, b"", 2),
+        BinOp(p::BinOp::NatPlus, _, _) => (1, b"", 3),
+        // PatMatch is RS-only with no HS equivalent — sort after all.
+        PatMatch(_) => (255, b"", 0),
+        // Lit-class terms never reach here (ca != 1).
+        _ => (254, b"", 0),
+    }
+}
+
+/// Compare the argument lists of two same-FunSym, non-AC FApp terms,
+/// mirroring HS's positional `compare ts` on `[Term a]`.
+fn cmp_fapp_args(a: &GTerm, b: &GTerm) -> std::cmp::Ordering {
+    use GTerm::*;
+    match (a, b) {
+        (App(_, x), App(_, y)) => cmp_slice(x, y, cmp_term),
+        (Pair(x), Pair(y)) => cmp_slice(x, y, cmp_term),
+        (AlgApp(_, l1, r1), AlgApp(_, l2, r2)) =>
+            cmp_term(l1, l2).then_with(|| cmp_term(r1, r2)),
         (Diff(l1, r1), Diff(l2, r2)) =>
             cmp_term(l1, l2).then_with(|| cmp_term(r1, r2)),
-        // HS-faithful: for AC binary ops (Mult/Union/Xor/NatPlus), HS's
-        // `FAPP (AC op) args` has args as a flat sorted multiset list;
-        // `derived Ord` on FAPP compares operator then args list.  RS's
-        // nested `BinOp(o, l, r)` representation hides this — two
-        // structurally distinct trees with the same flat multiset
-        // content (e.g. `Union(Union(a,b), c)` vs `Union(a, Union(b,c))`)
-        // would compare differently here, even though HS sees them as
-        // identical `FAPP (AC Union) [a,b,c]`.
-        //
-        // Mirror HS by flattening AC chains into a sorted multiset key
-        // before comparison.  Exp is NOT AC and uses structural compare.
-        (BinOp(o1, l1, r1), BinOp(o2, l2, r2)) => {
-            let tag_cmp = binop_tag(o1).cmp(&binop_tag(o2));
-            if tag_cmp != std::cmp::Ordering::Equal { return tag_cmp; }
-            if is_ac_binop(o1) {
-                let mut args_a = Vec::new();
-                let mut args_b = Vec::new();
-                flatten_ac_binop(o1, a, &mut args_a);
-                flatten_ac_binop(o2, b, &mut args_b);
-                // HS-faithful: `FAPP (AC op) args` has args sorted as a
-                // multiset (Maude canonicalises).  Sort both sides via
-                // cmp_term so structurally-permuted AC chains collapse.
-                args_a.sort_by(cmp_term);
-                args_b.sort_by(cmp_term);
-                cmp_slice(&args_a, &args_b, cmp_term)
-            } else {
-                cmp_term(l1, l2).then_with(|| cmp_term(r1, r2))
-            }
-        }
-        (PatMatch(a1), PatMatch(a2)) => cmp_term(a1, a2),
-        _ => std::cmp::Ordering::Equal,
+        (BinOp(_, l1, r1), BinOp(_, l2, r2)) =>
+            cmp_term(l1, l2).then_with(|| cmp_term(r1, r2)),
+        (PatMatch(x), PatMatch(y)) => cmp_term(x, y),
+        // 0-arity builtins (one/tone/DH_neutral): no args.
+        (NumberOne, NumberOne) | (NatOne, NatOne) | (DhNeutral, DhNeutral)
+            => std::cmp::Ordering::Equal,
+        // Cross-variant pairs only reach here when funsym_key tied them
+        // (e.g. App("pair",[..]) vs Pair([..]) — both key (0,"pair",2));
+        // compare their flattened arg lists positionally.
+        _ => cmp_slice(&fapp_args(a), &fapp_args(b), cmp_term),
+    }
+}
+
+/// Collect the positional argument list of a FApp-class term (for
+/// cross-representation comparison when two terms share a FunSym key).
+fn fapp_args(t: &GTerm) -> Vec<GTerm> {
+    use GTerm::*;
+    match t {
+        App(_, x) => x.clone(),
+        Pair(x) => x.clone(),
+        AlgApp(_, l, r) | Diff(l, r) | BinOp(_, l, r) => vec![(**l).clone(), (**r).clone()],
+        PatMatch(x) => vec![(**x).clone()],
+        _ => Vec::new(),
     }
 }
 
@@ -270,13 +355,6 @@ fn term_class(t: &GTerm) -> (u8, u8) {
         Diff(_, _) => (1, 6),
         BinOp(_, _, _) => (1, 7),
         PatMatch(_) => (1, 8),
-    }
-}
-
-fn binop_tag(o: &p::BinOp) -> u8 {
-    use p::BinOp::*;
-    match o {
-        Exp => 0, Mult => 1, Union => 2, Xor => 3, NatPlus => 4,
     }
 }
 
