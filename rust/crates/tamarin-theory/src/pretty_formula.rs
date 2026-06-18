@@ -1665,15 +1665,15 @@ fn open_gterm_for_sort(t: &crate::guarded::GTerm, scope: &[Vec<Bind>]) -> crate:
         GTerm::Pair(args) => GTerm::Pair(
             args.iter().map(|a| open_gterm_for_sort(a, scope)).collect()),
         GTerm::AlgApp(n, a, b) => GTerm::AlgApp(
-            n.clone(), Box::new(open_gterm_for_sort(a, scope)),
-            Box::new(open_gterm_for_sort(b, scope))),
+            n.clone(), crate::guarded_types::ga(open_gterm_for_sort(a, scope)),
+            crate::guarded_types::ga(open_gterm_for_sort(b, scope))),
         GTerm::Diff(a, b) => GTerm::Diff(
-            Box::new(open_gterm_for_sort(a, scope)),
-            Box::new(open_gterm_for_sort(b, scope))),
+            crate::guarded_types::ga(open_gterm_for_sort(a, scope)),
+            crate::guarded_types::ga(open_gterm_for_sort(b, scope))),
         GTerm::BinOp(op, a, b) => GTerm::BinOp(
-            *op, Box::new(open_gterm_for_sort(a, scope)),
-            Box::new(open_gterm_for_sort(b, scope))),
-        GTerm::PatMatch(t) => GTerm::PatMatch(Box::new(open_gterm_for_sort(t, scope))),
+            *op, crate::guarded_types::ga(open_gterm_for_sort(a, scope)),
+            crate::guarded_types::ga(open_gterm_for_sort(b, scope))),
+        GTerm::PatMatch(t) => GTerm::PatMatch(crate::guarded_types::ga(open_gterm_for_sort(t, scope))),
     }
 }
 
@@ -2504,10 +2504,10 @@ mod tests {
     fn algapp_renders_function_form_flat_gterm() {
         let g = crate::guarded::GTerm::AlgApp(
             "sdec".into(),
-            Box::new(crate::guarded::GTerm::Var(crate::guarded::BVar::Free(
+            std::sync::Arc::new(crate::guarded::GTerm::Var(crate::guarded::BVar::Free(
                 v("body", p::SortHint::Untagged),
             ))),
-            Box::new(crate::guarded::GTerm::Var(crate::guarded::BVar::Free(
+            std::sync::Arc::new(crate::guarded::GTerm::Var(crate::guarded::BVar::Free(
                 v("key", p::SortHint::Untagged),
             ))),
         );
@@ -2521,7 +2521,7 @@ mod tests {
         // senc{a,b}k as a GTerm -> senc(<a, b>, k) via the Doc renderer
         let g = crate::guarded::GTerm::AlgApp(
             "senc".into(),
-            Box::new(crate::guarded::GTerm::Pair(vec![
+            std::sync::Arc::new(crate::guarded::GTerm::Pair(vec![
                 crate::guarded::GTerm::Var(crate::guarded::BVar::Free(v(
                     "a",
                     p::SortHint::Untagged,
@@ -2530,8 +2530,8 @@ mod tests {
                     "b",
                     p::SortHint::Untagged,
                 ))),
-            ])),
-            Box::new(crate::guarded::GTerm::Var(crate::guarded::BVar::Free(
+            ].into())),
+            std::sync::Arc::new(crate::guarded::GTerm::Var(crate::guarded::BVar::Free(
                 v("k", p::SortHint::Untagged),
             ))),
         );

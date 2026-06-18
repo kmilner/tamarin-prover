@@ -282,11 +282,11 @@ fn guarded_canon_idx_first(d: &crate::constraint::constraints::Disj<crate::guard
             GTerm::Var(BVar::Bound(n)) => out.push_str(&format!("B{}", n)),
             GTerm::App(name, args) => {
                 out.push_str(&format!("a{}/{}", name, args.len()));
-                for arg in args { render_term(arg, out); }
+                for arg in args.iter() { render_term(arg, out); }
             }
             GTerm::Pair(items) => {
                 out.push_str(&format!("p/{}", items.len()));
-                for it in items { render_term(it, out); }
+                for it in items.iter() { render_term(it, out); }
             }
             GTerm::AlgApp(name, a, b) => {
                 out.push_str(&format!("g{}", name));

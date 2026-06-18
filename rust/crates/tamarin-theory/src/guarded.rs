@@ -18,6 +18,7 @@ use std::collections::BTreeSet;
 use tamarin_parser::ast as p;
 
 pub use crate::guarded_types::{
+    ga,
     BVar, GAtom, GBinding, GFact, GTerm,
     atom_to_gatom_free, fact_to_gfact_free, term_to_gterm_free,
     gatom_to_atom, gfact_to_fact, gterm_to_term,
@@ -301,8 +302,8 @@ fn cmp_fapp_args(a: &GTerm, b: &GTerm) -> std::cmp::Ordering {
 fn fapp_args(t: &GTerm) -> Vec<GTerm> {
     use GTerm::*;
     match t {
-        App(_, x) => x.clone(),
-        Pair(x) => x.clone(),
+        App(_, x) => x.to_vec(),
+        Pair(x) => x.to_vec(),
         AlgApp(_, l, r) | Diff(l, r) | BinOp(_, l, r) => vec![(**l).clone(), (**r).clone()],
         PatMatch(x) => vec![(**x).clone()],
         _ => Vec::new(),
@@ -617,14 +618,14 @@ pub fn try_gterm_to_term(t: &GTerm) -> Option<p::Term> {
         GTerm::DhNeutral => p::Term::DhNeutral,
         GTerm::App(n, args) => {
             let mut acc = Vec::with_capacity(args.len());
-            for a in args { acc.push(try_gterm_to_term(a)?); }
+            for a in args.iter() { acc.push(try_gterm_to_term(a)?); }
             p::Term::App(n.clone(), acc)
         }
         GTerm::AlgApp(n, a, b) =>
             p::Term::AlgApp(n.clone(), Box::new(try_gterm_to_term(a)?), Box::new(try_gterm_to_term(b)?)),
         GTerm::Pair(items) => {
             let mut acc = Vec::with_capacity(items.len());
-            for it in items { acc.push(try_gterm_to_term(it)?); }
+            for it in items.iter() { acc.push(try_gterm_to_term(it)?); }
             p::Term::Pair(acc)
         }
         GTerm::Diff(a, b) =>
@@ -1290,12 +1291,12 @@ pub fn normalize_sort_hints(g: &Guarded) -> Guarded {
                 n.clone(), args.iter().map(norm_term).collect()),
             GTerm::Pair(args) => GTerm::Pair(args.iter().map(norm_term).collect()),
             GTerm::AlgApp(n, a, b) => GTerm::AlgApp(
-                n.clone(), Box::new(norm_term(a)), Box::new(norm_term(b))),
+                n.clone(), ga(norm_term(a)), ga(norm_term(b))),
             GTerm::Diff(a, b) => GTerm::Diff(
-                Box::new(norm_term(a)), Box::new(norm_term(b))),
+                ga(norm_term(a)), ga(norm_term(b))),
             GTerm::BinOp(op, a, b) => GTerm::BinOp(
-                *op, Box::new(norm_term(a)), Box::new(norm_term(b))),
-            GTerm::PatMatch(inner) => GTerm::PatMatch(Box::new(norm_term(inner))),
+                *op, ga(norm_term(a)), ga(norm_term(b))),
+            GTerm::PatMatch(inner) => GTerm::PatMatch(ga(norm_term(inner))),
             _ => t.clone(),
         }
     }
@@ -1390,9 +1391,9 @@ fn cac_rec_term(t: &GTerm, cmp: GCmp) -> GTerm {
         GTerm::Pair(args) => GTerm::Pair(
             args.iter().map(|a| cac_rec_term(a, cmp)).collect()),
         GTerm::AlgApp(n, a, b) => GTerm::AlgApp(
-            n.clone(), Box::new(cac_rec_term(a, cmp)), Box::new(cac_rec_term(b, cmp))),
+            n.clone(), ga(cac_rec_term(a, cmp)), ga(cac_rec_term(b, cmp))),
         GTerm::Diff(a, b) => GTerm::Diff(
-            Box::new(cac_rec_term(a, cmp)), Box::new(cac_rec_term(b, cmp))),
+            ga(cac_rec_term(a, cmp)), ga(cac_rec_term(b, cmp))),
         GTerm::BinOp(op, l, r) => {
             if matches!(op, p::BinOp::Mult | p::BinOp::Union | p::BinOp::Xor | p::BinOp::NatPlus) {
                 // Recurse into children first, then flatten the whole AC
@@ -1408,15 +1409,15 @@ fn cac_rec_term(t: &GTerm, cmp: GCmp) -> GTerm {
                 let last = iter.next().unwrap_or(GTerm::PubLit(String::new()));
                 let mut acc = last;
                 for prev in iter {
-                    acc = GTerm::BinOp(*op, Box::new(prev), Box::new(acc));
+                    acc = GTerm::BinOp(*op, ga(prev), ga(acc));
                 }
                 acc
             } else {
-                GTerm::BinOp(*op, Box::new(cac_rec_term(l, cmp)),
-                    Box::new(cac_rec_term(r, cmp)))
+                GTerm::BinOp(*op, ga(cac_rec_term(l, cmp)),
+                    ga(cac_rec_term(r, cmp)))
             }
         }
-        GTerm::PatMatch(inner) => GTerm::PatMatch(Box::new(cac_rec_term(inner, cmp))),
+        GTerm::PatMatch(inner) => GTerm::PatMatch(ga(cac_rec_term(inner, cmp))),
     }
 }
 
@@ -1503,7 +1504,7 @@ fn collect_witness_vars_term(t: &GTerm, out: &mut VarSubst) {
         }
         GTerm::Var(BVar::Bound(_)) => {}  // bound vars have no LVar idx
         GTerm::App(_, args) | GTerm::Pair(args) => {
-            for a in args { collect_witness_vars_term(a, out); }
+            for a in args.iter() { collect_witness_vars_term(a, out); }
         }
         GTerm::AlgApp(_, a, b) | GTerm::Diff(a, b) | GTerm::BinOp(_, a, b) => {
             collect_witness_vars_term(a, out);
@@ -1668,7 +1669,7 @@ pub fn subst_gterm(t: &GTerm, s: &VarSubst) -> GTerm {
         GTerm::App(n, args) =>
             GTerm::App(n.clone(), args.iter().map(|a| subst_gterm(a, s)).collect()),
         GTerm::AlgApp(n, a, b) => GTerm::AlgApp(
-            n.clone(), Box::new(subst_gterm(a, s)), Box::new(subst_gterm(b, s))),
+            n.clone(), ga(subst_gterm(a, s)), ga(subst_gterm(b, s))),
         // Canonicalise via `mk_gpair`: substituting a pair-valued var into a
         // tuple tail (`<..,matchingComm>` with `matchingComm := <a,b>`) would
         // otherwise leave a non-canonical `Pair([..,Pair([a,b])])` that no
@@ -1679,10 +1680,10 @@ pub fn subst_gterm(t: &GTerm, s: &VarSubst) -> GTerm {
             crate::guarded_types::mk_gpair(
                 items.iter().map(|i| subst_gterm(i, s)).collect()),
         GTerm::Diff(a, b) => GTerm::Diff(
-            Box::new(subst_gterm(a, s)), Box::new(subst_gterm(b, s))),
+            ga(subst_gterm(a, s)), ga(subst_gterm(b, s))),
         GTerm::BinOp(op, a, b) => GTerm::BinOp(
-            *op, Box::new(subst_gterm(a, s)), Box::new(subst_gterm(b, s))),
-        GTerm::PatMatch(t) => GTerm::PatMatch(Box::new(subst_gterm(t, s))),
+            *op, ga(subst_gterm(a, s)), ga(subst_gterm(b, s))),
+        GTerm::PatMatch(t) => GTerm::PatMatch(ga(subst_gterm(t, s))),
     }
 }
 
@@ -1694,7 +1695,7 @@ pub fn max_var_idx(g: &Guarded) -> u64 {
             GTerm::Var(BVar::Free(v)) => { if v.idx > *m { *m = v.idx; } }
             GTerm::Var(BVar::Bound(_)) => {}
             GTerm::App(_, args) | GTerm::Pair(args) => {
-                for a in args { rec_term(a, m); }
+                for a in args.iter() { rec_term(a, m); }
             }
             GTerm::AlgApp(_, a, b) | GTerm::Diff(a, b) | GTerm::BinOp(_, a, b) => {
                 rec_term(a, m); rec_term(b, m);

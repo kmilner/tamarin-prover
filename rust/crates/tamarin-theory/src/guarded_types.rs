@@ -47,13 +47,17 @@ pub enum GTerm {
     NumberOne,
     NatOne,
     DhNeutral,
-    App(String, Vec<GTerm>),
-    AlgApp(String, Box<GTerm>, Box<GTerm>),
-    Pair(Vec<GTerm>),
-    Diff(Box<GTerm>, Box<GTerm>),
-    BinOp(p::BinOp, Box<GTerm>, Box<GTerm>),
-    PatMatch(Box<GTerm>),
+    App(String, std::sync::Arc<[GTerm]>),
+    AlgApp(String, std::sync::Arc<GTerm>, std::sync::Arc<GTerm>),
+    Pair(std::sync::Arc<[GTerm]>),
+    Diff(std::sync::Arc<GTerm>, std::sync::Arc<GTerm>),
+    BinOp(p::BinOp, std::sync::Arc<GTerm>, std::sync::Arc<GTerm>),
+    PatMatch(std::sync::Arc<GTerm>),
 }
+
+/// O(1)-clone helper: wrap a recursive `GTerm` child in `Arc`.
+#[inline]
+pub fn ga(t: GTerm) -> std::sync::Arc<GTerm> { std::sync::Arc::new(t) }
 
 /// Mirrors HS `Fact (VTerm c (BVar v))`.
 #[derive(Debug, Clone, PartialEq)]
@@ -110,10 +114,10 @@ pub enum GAtom {
 pub fn mk_gpair(mut items: Vec<GTerm>) -> GTerm {
     while matches!(items.last(), Some(GTerm::Pair(_))) {
         if let Some(GTerm::Pair(inner)) = items.pop() {
-            items.extend(inner);
+            items.extend(inner.iter().cloned());
         }
     }
-    GTerm::Pair(items)
+    GTerm::Pair(items.into())
 }
 
 /// Lift `p::Term` to `GTerm` treating every variable as `Free`.
@@ -132,15 +136,15 @@ pub fn term_to_gterm_free(t: &p::Term) -> GTerm {
         p::Term::App(n, args) =>
             GTerm::App(n.clone(), args.iter().map(term_to_gterm_free).collect()),
         p::Term::AlgApp(n, a, b) =>
-            GTerm::AlgApp(n.clone(), Box::new(term_to_gterm_free(a)), Box::new(term_to_gterm_free(b))),
+            GTerm::AlgApp(n.clone(), ga(term_to_gterm_free(a)), ga(term_to_gterm_free(b))),
         p::Term::Pair(items) =>
             mk_gpair(items.iter().map(term_to_gterm_free).collect()),
         p::Term::Diff(a, b) =>
-            GTerm::Diff(Box::new(term_to_gterm_free(a)), Box::new(term_to_gterm_free(b))),
+            GTerm::Diff(ga(term_to_gterm_free(a)), ga(term_to_gterm_free(b))),
         p::Term::BinOp(op, a, b) =>
-            GTerm::BinOp(*op, Box::new(term_to_gterm_free(a)), Box::new(term_to_gterm_free(b))),
+            GTerm::BinOp(*op, ga(term_to_gterm_free(a)), ga(term_to_gterm_free(b))),
         p::Term::PatMatch(t) =>
-            GTerm::PatMatch(Box::new(term_to_gterm_free(t))),
+            GTerm::PatMatch(ga(term_to_gterm_free(t))),
     }
 }
 
@@ -274,22 +278,22 @@ pub fn subst_free_term_at_depth(t: &GTerm, s: &[(p::VarSpec, u32)], depth: u32) 
         ),
         GTerm::AlgApp(n, a, b) => GTerm::AlgApp(
             n.clone(),
-            Box::new(subst_free_term_at_depth(a, s, depth)),
-            Box::new(subst_free_term_at_depth(b, s, depth)),
+            ga(subst_free_term_at_depth(a, s, depth)),
+            ga(subst_free_term_at_depth(b, s, depth)),
         ),
         GTerm::Pair(items) => GTerm::Pair(
             items.iter().map(|a| subst_free_term_at_depth(a, s, depth)).collect(),
         ),
         GTerm::Diff(a, b) => GTerm::Diff(
-            Box::new(subst_free_term_at_depth(a, s, depth)),
-            Box::new(subst_free_term_at_depth(b, s, depth)),
+            ga(subst_free_term_at_depth(a, s, depth)),
+            ga(subst_free_term_at_depth(b, s, depth)),
         ),
         GTerm::BinOp(op, a, b) => GTerm::BinOp(
             *op,
-            Box::new(subst_free_term_at_depth(a, s, depth)),
-            Box::new(subst_free_term_at_depth(b, s, depth)),
+            ga(subst_free_term_at_depth(a, s, depth)),
+            ga(subst_free_term_at_depth(b, s, depth)),
         ),
-        GTerm::PatMatch(t) => GTerm::PatMatch(Box::new(subst_free_term_at_depth(t, s, depth))),
+        GTerm::PatMatch(t) => GTerm::PatMatch(ga(subst_free_term_at_depth(t, s, depth))),
     }
 }
 
@@ -374,22 +378,22 @@ pub fn subst_bound_term_at_depth(t: &GTerm, s: &[(u32, p::VarSpec)], depth: u32)
         ),
         GTerm::AlgApp(n, a, b) => GTerm::AlgApp(
             n.clone(),
-            Box::new(subst_bound_term_at_depth(a, s, depth)),
-            Box::new(subst_bound_term_at_depth(b, s, depth)),
+            ga(subst_bound_term_at_depth(a, s, depth)),
+            ga(subst_bound_term_at_depth(b, s, depth)),
         ),
         GTerm::Pair(items) => GTerm::Pair(
             items.iter().map(|a| subst_bound_term_at_depth(a, s, depth)).collect(),
         ),
         GTerm::Diff(a, b) => GTerm::Diff(
-            Box::new(subst_bound_term_at_depth(a, s, depth)),
-            Box::new(subst_bound_term_at_depth(b, s, depth)),
+            ga(subst_bound_term_at_depth(a, s, depth)),
+            ga(subst_bound_term_at_depth(b, s, depth)),
         ),
         GTerm::BinOp(op, a, b) => GTerm::BinOp(
             *op,
-            Box::new(subst_bound_term_at_depth(a, s, depth)),
-            Box::new(subst_bound_term_at_depth(b, s, depth)),
+            ga(subst_bound_term_at_depth(a, s, depth)),
+            ga(subst_bound_term_at_depth(b, s, depth)),
         ),
-        GTerm::PatMatch(t) => GTerm::PatMatch(Box::new(subst_bound_term_at_depth(t, s, depth))),
+        GTerm::PatMatch(t) => GTerm::PatMatch(ga(subst_bound_term_at_depth(t, s, depth))),
     }
 }
 
@@ -479,7 +483,7 @@ pub fn collect_free_term(t: &GTerm, out: &mut Vec<p::VarSpec>) {
         GTerm::Var(BVar::Free(v)) => out.push(v.clone()),
         GTerm::Var(BVar::Bound(_)) => {}
         GTerm::App(_, args) | GTerm::Pair(args) =>
-            for a in args { collect_free_term(a, out); },
+            for a in args.iter() { collect_free_term(a, out); },
         GTerm::AlgApp(_, a, b) | GTerm::Diff(a, b) | GTerm::BinOp(_, a, b) => {
             collect_free_term(a, out);
             collect_free_term(b, out);
@@ -521,14 +525,14 @@ pub fn map_free_term<F: FnMut(&p::VarSpec) -> p::VarSpec>(t: &GTerm, f: &mut F) 
         GTerm::App(n, args) =>
             GTerm::App(n.clone(), args.iter().map(|a| map_free_term(a, f)).collect()),
         GTerm::AlgApp(n, a, b) =>
-            GTerm::AlgApp(n.clone(), Box::new(map_free_term(a, f)), Box::new(map_free_term(b, f))),
+            GTerm::AlgApp(n.clone(), ga(map_free_term(a, f)), ga(map_free_term(b, f))),
         GTerm::Pair(items) =>
             GTerm::Pair(items.iter().map(|a| map_free_term(a, f)).collect()),
         GTerm::Diff(a, b) =>
-            GTerm::Diff(Box::new(map_free_term(a, f)), Box::new(map_free_term(b, f))),
+            GTerm::Diff(ga(map_free_term(a, f)), ga(map_free_term(b, f))),
         GTerm::BinOp(op, a, b) =>
-            GTerm::BinOp(*op, Box::new(map_free_term(a, f)), Box::new(map_free_term(b, f))),
-        GTerm::PatMatch(t) => GTerm::PatMatch(Box::new(map_free_term(t, f))),
+            GTerm::BinOp(*op, ga(map_free_term(a, f)), ga(map_free_term(b, f))),
+        GTerm::PatMatch(t) => GTerm::PatMatch(ga(map_free_term(t, f))),
     }
 }
 
@@ -765,7 +769,7 @@ mod tests {
                 GTerm::Var(BVar::Free(vs("x", 0))),
                 GTerm::Var(BVar::Bound(0)),
                 GTerm::Var(BVar::Free(vs("y", 1))),
-            ],
+            ].into(),
         );
         let mut out = Vec::new();
         collect_free_term(&t, &mut out);
@@ -781,7 +785,7 @@ mod tests {
             vec![
                 GTerm::Var(BVar::Free(vs("x", 0))),
                 GTerm::Var(BVar::Bound(0)),
-            ],
+            ].into(),
         );
         let mapped = map_free_term(&t, &mut |v: &p::VarSpec| p::VarSpec {
             name: v.name.clone(),
