@@ -52,19 +52,22 @@ pub type WfReport = Vec<WfError>;
 /// can be compared directly against `tamarin-prover`'s output.
 pub fn check_theory(thy: &Theory) -> WfReport {
     // Mirrors HS `Theory.Tools.Wellformedness.checkWellformedness`
-    // (Wellformedness.hs:1270-1287).  The order here is close but NOT
-    // identical: HS's `ruleSortsReport` (the "Variable with mismatching
-    // sorts" / sort-clash check) runs before factReports, whereas we run
-    // it later inside `formula_terms_report`; and `left_right_rule_report`
-    // (the diff-only Left/Right check) is interleaved here rather than
-    // appearing where HS places `leftRightRuleReportDiff`.
+    // (Wellformedness.hs:1270-1287), in HS check order: unbound,
+    // freshNames, publicNames, ruleSorts (variable_sort_clashes),
+    // factReports, formulaReports, lemmaAttribute, multRestricted,
+    // natWellSorted, subtermConvergence, then message-derivation.
+    // `left_right_rule_report` (the diff-only Left/Right check) is
+    // interleaved here rather than where HS places `leftRightRuleReportDiff`.
     let mut report = Vec::new();
     report.extend(unbound_report(thy));
     report.extend(fresh_names_report(thy));
     report.extend(public_names_report(thy));
     report.extend(left_right_rule_report(thy));    // leftRightRuleReportDiff (diff only)
-    // HS `ruleSortsReport` (sortsClashCheck) is ported as
-    // `variable_sort_clashes`, run later via `formula_terms_report`.
+    // HS `ruleSortsReport` (sortsClashCheck) runs HERE — after publicNamesReport
+    // and BEFORE factReports (Wellformedness.hs:1275).  It is ported as
+    // `variable_sort_clashes` ("Variable with mismatching sorts or
+    // capitalization").
+    report.extend(variable_sort_clashes(thy));
     // ruleVariantsReport — not ported (needs MaudeHandle + variant solver).
     // factReports group:
     report.extend(reserved_report(thy));
@@ -75,7 +78,7 @@ pub fn check_theory(thy: &Theory) -> WfReport {
     report.extend(fact_usage(thy));
     report.extend(fact_lhs_occur_no_rhs(thy));
     // formulaReports group:
-    report.extend(formula_terms_report(thy));
+    // (variable_sort_clashes moved UP to HS's ruleSortsReport position, above.)
     // checkQuantifiers / checkGuarded — partial via formula_free_var_report.
     // lemmaAttributeReport, multRestrictedReport, natWellSortedReport:
     report.extend(lemma_attribute_report(thy));
@@ -557,10 +560,6 @@ fn is_pub_sort(s: &SortHint) -> bool {
     matches!(s, SortHint::Pub | SortHint::Suffix(SuffixSort::Pub))
 }
 
-fn is_node_sort(s: &SortHint) -> bool {
-    matches!(s, SortHint::Node | SortHint::Suffix(SuffixSort::Node))
-}
-
 fn is_nat_sort(s: &SortHint) -> bool {
     matches!(s, SortHint::Nat | SortHint::Suffix(SuffixSort::Nat))
 }
@@ -636,16 +635,16 @@ pub fn reserved_fact_name_rules(thy: &Theory) -> WfReport {
                 // line 4-space (2 from ppTopic + 2 from the inner nest 2).
                 let facts: Vec<String> =
                     fs.iter().map(|f| pp_wf_fact(f)).collect();
+                // Headerless body (no trailing newline); `format_wf_block`
+                // emits the single "Reserved names" header for the group and
+                // joins per-rule/side bodies with the 2-space blank separator.
                 let mut s = String::new();
-                s.push_str(&underline_topic("Reserved names"));
-                s.push('\n');
                 s.push_str(&format!(
                     "  Rule `{}' contains facts with reserved names {}:\n",
                     r.name, msg,
                 ));
                 s.push_str("    ");
                 s.push_str(&facts.join(", "));
-                s.push('\n');
                 out.push(WfError::new("Reserved names", s));
             }
         }
@@ -763,15 +762,22 @@ pub fn fresh_fact_arguments(thy: &Theory) -> WfReport {
 
 #[derive(Debug, Clone)]
 struct FactObservation {
-    rule_name: String,
+    /// HS `origin`: `Rule \`X'` or `Lemma \`X'` (Wellformedness.hs:580,605).
+    origin: String,
     name: String,
     arity: usize,
     persistent: bool,
-    /// The actual fact, retained so we can render it in WF messages.
-    fact: Fact,
+    /// Pre-rendered fact body for the detail line: `prettyLNFact` for rule
+    /// facts, the Haskell `show` form for lemma-formula facts (HS
+    /// `theoryFacts`'s LemmaItem branch uses `text (show fa)`,
+    /// Wellformedness.hs:605-607).
+    pp: String,
 }
 
 fn collect_fact_observations(thy: &Theory) -> Vec<FactObservation> {
+    // HS `theoryFacts` (Wellformedness.hs:597-607): rule facts (E rules) then
+    // lemma-formula facts.  (AC-rule facts only differ for non-trivial-variant
+    // rules and never introduce a new arity/cap clash, so we omit them.)
     let mut out = Vec::new();
     for r in theory_rules(thy) {
         for (_, f) in rule_facts(r) {
@@ -780,15 +786,111 @@ fn collect_fact_observations(thy: &Theory) -> Vec<FactObservation> {
             // those separately.
             if is_builtin_fact_name(&f.name) { continue; }
             out.push(FactObservation {
-                rule_name: r.name.clone(),
+                origin: format!("Rule `{}'", r.name),
                 name: f.name.clone(),
                 arity: f.args.len(),
                 persistent: f.persistent,
-                fact: f.clone(),
+                pp: pp_wf_fact(f),
+            });
+        }
+    }
+    out.extend(lemma_fact_observations(thy));
+    out
+}
+
+/// HS `theoryFacts`'s LemmaItem branch (Wellformedness.hs:605-607):
+///   `(,) ("Lemma " ++ quote (get lName l)) $ do
+///        fa <- formulaFacts (get lFormula l); return (text (show fa), factInfo fa)`
+/// i.e. every Action-atom fact in the lemma formula, rendered as the Haskell
+/// `show` of `Fact (VTerm Name (BVar LVar))` — `Fact {factTag = ProtoFact
+/// Linear "X" n, factAnnotations = fromList [], factTerms = [Bound i, ...]}`.
+fn lemma_fact_observations(thy: &Theory) -> Vec<FactObservation> {
+    let mut out = Vec::new();
+    for l in theory_lemmas(thy) {
+        let mut facts: Vec<(Fact, Vec<String>)> = Vec::new();
+        collect_formula_facts(&l.formula, &mut Vec::new(), &mut facts);
+        for (fa, dbterms) in facts {
+            // HS show of the Fact: see `show_debruijn_fact`.
+            let pp = show_debruijn_fact(&fa, &dbterms);
+            out.push(FactObservation {
+                origin: format!("Lemma `{}'", l.name),
+                name: fa.name.clone(),
+                arity: fa.args.len(),
+                persistent: fa.persistent,
+                pp,
             });
         }
     }
     out
+}
+
+/// Walk a formula left-to-right (HS `foldFormula` order), collecting the fact
+/// of every `Action` atom together with its argument terms rendered in De
+/// Bruijn form (`Bound n` / `Free ...`).  `binders` is the enclosing
+/// quantifier stack (outermost first); the innermost binder has index 0.
+fn collect_formula_facts<'a>(
+    f: &'a Formula,
+    binders: &mut Vec<&'a VarSpec>,
+    out: &mut Vec<(Fact, Vec<String>)>,
+) {
+    match f {
+        Formula::Atom(Atom::Action(fa, _)) => {
+            let terms = fa.args.iter().map(|t| show_debruijn_term(t, binders)).collect();
+            out.push((fa.clone(), terms));
+        }
+        Formula::Atom(_) | Formula::True | Formula::False => {}
+        Formula::Not(a) => collect_formula_facts(a, binders, out),
+        Formula::And(a, b) | Formula::Or(a, b)
+        | Formula::Implies(a, b) | Formula::Iff(a, b) => {
+            collect_formula_facts(a, binders, out);
+            collect_formula_facts(b, binders, out);
+        }
+        Formula::Forall(vars, body) | Formula::Exists(vars, body) => {
+            let n = vars.len();
+            for v in vars { binders.push(v); }
+            collect_formula_facts(body, binders, out);
+            for _ in 0..n { binders.pop(); }
+        }
+    }
+}
+
+/// HS `show` of a `VTerm Name (BVar LVar)` (Term Show: `Lit l -> show l`,
+/// `FApp s as -> s(...)`, Term/Raw.hs:219-227; Lit Show: `Var v -> show v`,
+/// `Con n -> show n`, VTerm.hs:98-100; BVar `Bound i`/`Free v` derived).
+fn show_debruijn_term(t: &Term, binders: &[&VarSpec]) -> String {
+    match t {
+        Term::Var(v) => {
+            // Nearest (innermost) matching binder → Bound n; else Free.
+            for (pos, b) in binders.iter().enumerate().rev() {
+                if b.name == v.name && sort_tag(&b.sort) == sort_tag(&v.sort)
+                    && b.idx == v.idx {
+                    return format!("Bound {}", binders.len() - 1 - pos);
+                }
+            }
+            format!("Free {}", render_var(v))
+        }
+        Term::PubLit(s) => format!("'{}'", s),
+        Term::FreshLit(s) => format!("~'{}'", s),
+        Term::NatLit(s) => format!("%'{}'", s),
+        Term::App(name, args) if args.is_empty() => name.clone(),
+        Term::App(name, args) => format!("{}({})", name,
+            args.iter().map(|a| show_debruijn_term(a, binders))
+                .collect::<Vec<_>>().join(",")),
+        Term::Pair(items) => format!("pair({})",
+            items.iter().map(|a| show_debruijn_term(a, binders))
+                .collect::<Vec<_>>().join(",")),
+        other => format!("{:?}", other),
+    }
+}
+
+/// HS `show (Fact {...})` (derived Show, Fact.hs:153-158):
+/// `Fact {factTag = ProtoFact <Mult> "<name>" <arity>, factAnnotations =
+/// fromList [], factTerms = [<terms>]}`.
+fn show_debruijn_fact(fa: &Fact, dbterms: &[String]) -> String {
+    let mult = if fa.persistent { "Persistent" } else { "Linear" };
+    format!(
+        "Fact {{factTag = ProtoFact {} {:?} {}, factAnnotations = fromList [], factTerms = [{}]}}",
+        mult, fa.name, fa.args.len(), dbterms.join(","))
 }
 
 pub fn fact_usage(thy: &Theory) -> WfReport {
@@ -868,8 +970,12 @@ where F: Fn(&FactObservation) -> String,
     s.push_str(intro);
     s.push('\n');
     s.push_str("  \n");  // trailing 2-space line from HS `text ""`
-    for group in groups {
-        s.push('\n');
+    // HS body = `text "\n" $-$ vcat (map formatCapIssue groups)`: the leading
+    // blank line (`text "\n"`) appears ONCE before the first group; each group
+    // ends with its own trailing `  \n` (from `$-$ text ""`), which is the only
+    // separator between groups.  So push the leading blank only for group 0.
+    for (gi, group) in groups.iter().enumerate() {
+        if gi == 0 { s.push('\n'); }
         let name = group[0].name.to_lowercase();
         s.push_str(&format!("  Fact `{}':\n", name));
         s.push('\n');
@@ -878,12 +984,12 @@ where F: Fn(&FactObservation) -> String,
                 s.push_str("    \n");  // 4-space trailing line
             }
             s.push_str(&format!(
-                "    {}. Rule `{}', {}\n",
+                "    {}. {}, {}\n",
                 i + 1,
-                obs.rule_name,
+                obs.origin,
                 detail(obs),
             ));
-            s.push_str(&format!("         {}\n", pp_wf_fact(&obs.fact)));
+            s.push_str(&format!("         {}\n", obs.pp));
         }
         s.push_str("  \n");  // 2-space trailing line after the group
     }
@@ -894,39 +1000,72 @@ where F: Fn(&FactObservation) -> String,
 // Fact occurs in some LHS but not in any RHS
 // =============================================================================
 
+/// `isProtoFact` for parser facts: every user fact (including the
+/// reserved-named `K`, which HS parses as `ProtoFact "K"`) EXCEPT the
+/// truly-special fact tags (`Fr`/`In`/`Out`/`KU`/`KD`/`Ded`/`Term`).
+/// Mirrors HS `isProtoFact` (Fact.hs:311-313) — note `K` is a ProtoFact
+/// (`isKLogFact = isProtoFact && name=="K"`, Fact.hs:322).
+fn is_proto_fact_name(name: &str) -> bool {
+    !matches!(name, "Fr" | "In" | "Out" | "KU" | "KD" | "Ded" | "Term")
+}
+
+/// Levenshtein edit distance (HS `editDistance`, used by `mostSimilarName`).
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (n, m) = (a.len(), b.len());
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut cur = vec![0usize; m + 1];
+    for i in 1..=n {
+        cur[0] = i;
+        for j in 1..=m {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[m]
+}
+
 pub fn fact_lhs_occur_no_rhs(thy: &Theory) -> WfReport {
-    // Mirrors HS `factLhsOccurNoRhs` (Wellformedness.hs:233-249): for
-    // every premise fact that no rule produces, find a "similar" RHS
-    // (same name, may differ in arity/multiplicity) on some rule and
-    // emit a numbered suggestion list.
+    // Mirrors HS `factLhsOccurNoRhs'` (Wellformedness.hs:214-256): for every
+    // PROTO premise fact whose full factInfo (name, arity, multiplicity) is
+    // produced by no rule's conclusion, suggest the RHS proto fact with the
+    // smallest name edit-distance (<= 3, `mostSimilarName`).
     //
     // Title carries a single trailing space, matching HS's source-literal
     // `"Facts occur in the left-hand-side but not in any right-hand-side "`.
     let title = "Facts occur in the left-hand-side but not in any right-hand-side ";
 
-    let mut rhs_by_name: BTreeMap<String, Vec<(String, Fact)>> = BTreeMap::new();
+    // rhs = all proto conclusion facts in source order (regroup of getFacts
+    // rConcs).  factInfo = (name, arity, persistent).
+    let mut rhs: Vec<(String, Fact)> = Vec::new();
     for r in theory_rules(thy) {
         for f in &r.conclusions {
-            rhs_by_name.entry(f.name.clone())
-                .or_default()
-                .push((r.name.clone(), f.clone()));
+            if !is_proto_fact_name(&f.name) { continue; }
+            rhs.push((r.name.clone(), f.clone()));
         }
     }
+    let rhs_info: BTreeSet<(String, usize, bool)> = rhs.iter()
+        .map(|(_, f)| (f.name.clone(), f.args.len(), f.persistent))
+        .collect();
 
-    // Detect orphan premises (LHS facts with no exactly-matching RHS).
+    // Detect orphan premises (proto LHS facts whose factInfo is in no RHS).
     let mut orphan_pairs: Vec<(String, Fact, Option<(String, Fact)>)> = Vec::new();
     for r in theory_rules(thy) {
         for f in &r.premises {
-            if is_builtin_fact_name(&f.name) { continue; }
-            let exact_match = rhs_by_name.get(&f.name)
-                .map(|v| v.iter().any(|(_, rf)|
-                    rf.args.len() == f.args.len() && rf.persistent == f.persistent))
-                .unwrap_or(false);
-            if exact_match { continue; }
-            // Suggest a same-name RHS that differs in arity/multiplicity.
-            let suggestion = rhs_by_name.get(&f.name)
-                .and_then(|v| v.first())
-                .map(|(rn, rf)| (rn.clone(), rf.clone()));
+            if !is_proto_fact_name(&f.name) { continue; }
+            // HS `removeSame`: drop if the full factInfo occurs in some RHS.
+            if rhs_info.contains(&(f.name.clone(), f.args.len(), f.persistent)) {
+                continue;
+            }
+            // HS `minimalEdFact`: the RHS fact with minimum name edit distance
+            // (first in RHS order on ties); `isSimilar` keeps it only if <= 3.
+            let suggestion = rhs.iter()
+                .map(|(rn, rf)| (edit_distance(&f.name, &rf.name), rn, rf))
+                .min_by_key(|(d, _, _)| *d)
+                .filter(|(d, _, _)| *d <= 3)
+                .map(|(_, rn, rf)| (rn.clone(), rf.clone()));
             orphan_pairs.push((r.name.clone(), f.clone(), suggestion));
         }
     }
@@ -997,29 +1136,73 @@ pub fn fresh_names_report(thy: &Theory) -> WfReport {
 // =============================================================================
 
 pub fn public_names_report(thy: &Theory) -> WfReport {
-    let mut by_lower: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // Port of HS `publicNamesReport'` (Wellformedness.hs:463-484).
+    //   publicNames = [(ruleName, pubConstName)]   (public-NAME literals)
+    //   findClashes = clashesOn (lowerCase . show . snd) (show . snd)
+    // and each clash group is rendered as
+    //   numbered' (map (fsep . punctuate comma . map ppRuleAndName . groupOn fst))
+    // where ppRuleAndName lists the names of one rule together
+    //   `rule "R":  name 'a', 'b'`.
+    // This is a SINGLE WfError (count 1) carrying the full block; it uses the
+    // default `format_wf_block` path (header baked into the message).
+    let mut pairs: Vec<(String, String)> = Vec::new(); // (ruleName, pubName)
     for r in theory_rules(thy) {
         let mut names = Vec::new();
-        for t in rule_terms(r) {
-            term_name_lits(t, &mut names);
-        }
+        for t in rule_terms(r) { term_name_lits(t, &mut names); }
         for (k, n) in names {
-            if k == NameKind::Pub {
-                by_lower.entry(n.to_lowercase()).or_default().insert(n);
-            }
+            if k == NameKind::Pub { pairs.push((r.name.clone(), n)); }
         }
     }
-    let mut out = Vec::new();
-    for (_lower, set) in by_lower.iter().filter(|(_, s)| s.len() > 1) {
-        // `set` is a `BTreeSet`, so iteration is already sorted.
-        let names: Vec<&String> = set.iter().collect();
-        out.push(WfError::new(
-            "Public constants with mismatching capitalization",
-            format!("clashing public-name capitalizations: {}",
-                names.iter().map(|s| format!("'{}'", s))
-                    .collect::<Vec<_>>().join(", "))));
+    if pairs.is_empty() { return Vec::new(); }
+    // HS `show` of a (public) Name constant is the quoted form `'name'`.
+    let shw = |n: &str| format!("'{}'", n);
+    let f = |p: &(String, String)| shw(&p.1).to_lowercase(); // lowerCase.show.snd
+    let g = |p: &(String, String)| shw(&p.1);                 // show.snd
+    // clashesOn f g: stable-sort by f, group consecutive by f, each group
+    // sortednubOn g; keep groups with >= 2 distinct g.
+    let mut sorted: Vec<(String, String)> = pairs;
+    sorted.sort_by(|a, b| f(a).cmp(&f(b)));
+    let mut clashes: Vec<Vec<(String, String)>> = Vec::new();
+    let mut i = 0;
+    while i < sorted.len() {
+        let key = f(&sorted[i]);
+        let mut j = i + 1;
+        while j < sorted.len() && f(&sorted[j]) == key { j += 1; }
+        let mut grp: Vec<(String, String)> = sorted[i..j].to_vec();
+        grp.sort_by(|a, b| g(a).cmp(&g(b)));
+        grp.dedup_by(|a, b| g(a) == g(b));
+        if grp.len() >= 2 { clashes.push(grp); }
+        i = j;
     }
-    out
+    if clashes.is_empty() { return Vec::new(); }
+    let topic = "Public constants with mismatching capitalization";
+    let mut s = String::new();
+    s.push_str(&underline_topic(topic));
+    s.push('\n');
+    s.push_str("Identifiers are case-sensitive, mismatched capitalizations \
+        are considered as different, i.e., 'ID' is different from 'id'. \
+        Check the capitalization of your identifiers.\n");
+    s.push('\n');
+    let items: Vec<String> = clashes.iter().enumerate().map(|(k, grp)| {
+        // groupOn fst: list each rule's names together.
+        let mut parts: Vec<String> = Vec::new();
+        let mut m = 0;
+        while m < grp.len() {
+            let rule = &grp[m].0;
+            let mut names = vec![shw(&grp[m].1)];
+            let mut n2 = m + 1;
+            while n2 < grp.len() && &grp[n2].0 == rule {
+                names.push(shw(&grp[n2].1));
+                n2 += 1;
+            }
+            parts.push(format!("rule \"{}\":  name {}", rule, names.join(", ")));
+            m = n2;
+        }
+        format!("  {}. {}", k + 1, parts.join(", "))
+    }).collect();
+    s.push_str(&items.join("\n  \n"));
+    s.push('\n');
+    vec![WfError::new(topic, s)]
 }
 
 // =============================================================================
@@ -1059,23 +1242,24 @@ fn collect_nullary_fun_names(thy: &Theory) -> BTreeSet<String> {
 /// as 0-arity functions (those are nullary function calls, not
 /// variables — HS resolves them via `nullaryApp` at parse-time).
 fn collect_rule_unbound_vars(r: &Rule, nullary_funs: &BTreeSet<String>) -> Vec<VarSpec> {
-    let mut bound: BTreeSet<(String, u64)> = BTreeSet::new();
-    for f in &r.premises {
+    // HS `unboundCheck` (Wellformedness.hs:493-512) runs on the
+    // let-substituted, macro-applied `ProtoRuleE` (`thyProtoRules`).  So
+    // `let m1 = <'1',$A,~Na> in ... Out(m1)` is INLINED to `Out(<'1',$A,~Na>)`
+    // before the check — the let value's free vars are NOT bound, only the
+    // (now-substituted-away) let variable.  Mirror by inlining lets here.
+    let (prems, acts, concs) = rule_facts_with_lets(r);
+    // HS `boundVars = S.fromList $ frees (get rPrems ru)` keys on the full
+    // LVar (name AND sort AND idx), so `~ltk` (fresh) does NOT bind `ltk`
+    // (msg).  Key on (name, sort_tag, idx).
+    let mut bound: BTreeSet<(String, u8, u64)> = BTreeSet::new();
+    for f in &prems {
         for v in fact_vars(f) {
-            bound.insert((v.name.clone(), v.idx));
-        }
-    }
-    for binding in &r.let_block {
-        let mut vs = Vec::new();
-        term_vars(&binding.var, &mut vs);
-        term_vars(&binding.value, &mut vs);
-        for v in vs {
-            bound.insert((v.name, v.idx));
+            bound.insert((v.name.clone(), sort_tag(&v.sort), v.idx));
         }
     }
     let mut unbound: Vec<VarSpec> = Vec::new();
-    let mut seen: BTreeSet<(String, u64)> = BTreeSet::new();
-    for f in r.actions.iter().chain(&r.conclusions) {
+    let mut seen: BTreeSet<(String, u8, u64)> = BTreeSet::new();
+    for f in acts.iter().chain(&concs) {
         for v in fact_vars(f) {
             if is_pub_sort(&v.sort) { continue; }
             if nullary_funs.contains(&v.name) { continue; }
@@ -1089,7 +1273,7 @@ fn collect_rule_unbound_vars(r: &Rule, nullary_funs: &BTreeSet<String>) -> Vec<V
             // rules like CRxor's `responder` (`Neq(na, zero)`) get
             // bogus "has unbound variables: zero" warnings.
             if is_known_nullary_constant_name(&v.name) { continue; }
-            let key = (v.name.clone(), v.idx);
+            let key = (v.name.clone(), sort_tag(&v.sort), v.idx);
             if bound.contains(&key) { continue; }
             if seen.insert(key.clone()) {
                 unbound.push(v);
@@ -1557,34 +1741,63 @@ pub fn formula_terms_report(thy: &Theory) -> WfReport {
     variable_sort_clashes(thy)
 }
 
-/// Within each rule, a given variable name must use a consistent sort.
-/// `~x` and `$x` in the same rule trigger this check.
+/// Within each rule, variables whose names agree modulo case AND share an
+/// index, but differ in their full `LVar` (sort or capitalization), clash.
+/// Port of HS `sortsClashCheck`/`ruleSortsReport` (Wellformedness.hs:258-280):
+/// `clashesOn removeSort id $ frees ru` where `removeSort lv = (lowerCase
+/// (lvarName lv), lvarIdx lv)`.  Bare identifiers default to sort `msg`
+/// (HS LSortMsg), so `~ltk` (fresh) vs `ltk` (msg) clash.  Runs on the
+/// let-substituted rule (HS `thyProtoRules` applies let-subst).
+///
+/// Emits one `WfError` per offending rule (so the summary's `length rep`
+/// WARNING count matches HS, Batch.hs:245), all sharing the topic
+/// "Variable with mismatching sorts or capitalization"; `format_wf_block`
+/// renders the header + "Possible reasons" preamble ONCE for the group.
 pub fn variable_sort_clashes(thy: &Theory) -> WfReport {
     let mut out = Vec::new();
     for r in theory_rules(thy) {
-        let mut by_name: BTreeMap<String, BTreeSet<&'static str>> = BTreeMap::new();
-        let mut all_vars: Vec<VarSpec> = Vec::new();
-        for f in r.premises.iter().chain(&r.actions).chain(&r.conclusions) {
-            all_vars.extend(fact_vars(f));
+        let (prems, acts, concs) = rule_facts_with_lets(r);
+        let mut vars: Vec<VarSpec> = Vec::new();
+        for f in prems.iter().chain(&acts).chain(&concs) {
+            vars.extend(fact_vars(f));
         }
-        for v in &all_vars {
-            let label: &'static str = if is_fresh_sort(&v.sort) { "fresh" }
-                else if is_pub_sort(&v.sort) { "pub" }
-                else if is_node_sort(&v.sort) { "node" }
-                else if is_nat_sort(&v.sort) { "nat" }
-                else if matches!(v.sort, SortHint::Suffix(SuffixSort::Msg) | SortHint::Msg) { "msg" }
-                else { "?" };
-            // Skip "?" (untagged) — we only flag clashes between explicit sorts.
-            if label != "?" {
-                by_name.entry(v.name.clone()).or_default().insert(label);
-            }
+        // clashesOn removeSort id: sort+group by (lowercase name, idx).
+        vars.sort_by(|a, b| {
+            a.name.to_lowercase().cmp(&b.name.to_lowercase())
+                .then_with(|| a.idx.cmp(&b.idx))
+        });
+        let mut clash_groups: Vec<Vec<VarSpec>> = Vec::new();
+        let mut i = 0;
+        while i < vars.len() {
+            let key = (vars[i].name.to_lowercase(), vars[i].idx);
+            let mut j = i + 1;
+            while j < vars.len()
+                && (vars[j].name.to_lowercase(), vars[j].idx) == key { j += 1; }
+            // sortednubOn id: sort by HS LVar Ord (idx, sort, name) then dedup.
+            let mut grp: Vec<VarSpec> = vars[i..j].to_vec();
+            grp.sort_by(|a, b| {
+                a.idx.cmp(&b.idx)
+                    .then_with(|| sort_tag(&a.sort).cmp(&sort_tag(&b.sort)))
+                    .then_with(|| a.name.cmp(&b.name))
+            });
+            grp.dedup_by(|a, b| a.name == b.name
+                && sort_tag(&a.sort) == sort_tag(&b.sort) && a.idx == b.idx);
+            if grp.len() >= 2 { clash_groups.push(grp); }
+            i = j;
         }
-        for (name, sorts) in by_name.iter().filter(|(_, s)| s.len() > 1) {
-            out.push(WfError::new(
-                "Variable with mismatching sorts or capitalization",
-                format!("rule `{}': variable `{}' used at sorts {:?}",
-                    r.name, name, sorts.iter().cloned().collect::<Vec<_>>())));
-        }
+        if clash_groups.is_empty() { continue; }
+        // Body (headerless): HS snd = `text info $-$ nest 2 (numbered' $ map
+        // prettyVarList cs)`, with ppTopic's outer `nest 2` baked in →
+        // "  rule `X': \n    1. <vars>".  `numbered'` separates items by a
+        // blank `text ""` line, which at 4-space indent renders as "    ".
+        let mut body = format!("  rule `{}': \n", r.name);
+        let items: Vec<String> = clash_groups.iter().enumerate().map(|(k, grp)| {
+            let vs: Vec<String> = grp.iter().map(render_var).collect();
+            format!("    {}. {}", k + 1, vs.join(", "))
+        }).collect();
+        body.push_str(&items.join("\n    \n"));
+        out.push(WfError::new(
+            "Variable with mismatching sorts or capitalization", body));
     }
     out
 }

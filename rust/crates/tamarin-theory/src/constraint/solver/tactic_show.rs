@@ -519,8 +519,8 @@ mod tests {
         // 'g'^~s  ==>  exp('g',Free ~s)
         let t = GTerm::BinOp(
             p::BinOp::Exp,
-            Box::new(GTerm::PubLit("g".into())),
-            Box::new(GTerm::Var(BVar::Free(fresh("s")))),
+            std::sync::Arc::new(GTerm::PubLit("g".into())),
+            std::sync::Arc::new(GTerm::Var(BVar::Free(fresh("s")))),
         );
         assert_eq!(show_gterm(&t), "exp('g',Free ~s)");
     }
@@ -529,8 +529,8 @@ mod tests {
     fn show_term_list_matches_exp_g() {
         let t = GTerm::BinOp(
             p::BinOp::Exp,
-            Box::new(GTerm::PubLit("g".into())),
-            Box::new(GTerm::Var(BVar::Free(fresh("s")))),
+            std::sync::Arc::new(GTerm::PubLit("g".into())),
+            std::sync::Arc::new(GTerm::Var(BVar::Free(fresh("s")))),
         );
         let shown = show_term_list(std::slice::from_ref(&t));
         assert_eq!(shown, "[exp('g',Free ~s)]");

@@ -34,12 +34,25 @@ pub enum Constructability {
 /// Free (no-equation) function symbol — name plus arity, privacy, and
 /// constructability. Mirrors the Haskell tuple
 /// `(ByteString, (Int, Privacy, Constructability))`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NoEqSym {
     pub name: Vec<u8>,
     pub arity: usize,
     pub privacy: Privacy,
     pub constructability: Constructability,
+}
+
+// Render the name as a (lossy) string rather than a raw byte array, so debug
+// output is readable (e.g. `name: "MAC"` not `name: [77, 65, 67]`).
+impl std::fmt::Debug for NoEqSym {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NoEqSym")
+            .field("name", &String::from_utf8_lossy(&self.name))
+            .field("arity", &self.arity)
+            .field("privacy", &self.privacy)
+            .field("constructability", &self.constructability)
+            .finish()
+    }
 }
 
 impl NoEqSym {

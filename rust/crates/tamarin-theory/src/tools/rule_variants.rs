@@ -426,6 +426,25 @@ pub fn abstract_rule_and_variants(
         matches!(t, Term::App(f, _) if !irreducible.contains(f))
     });
     if !has_reducible_abstraction {
+        // HS's `variantsProtoRule` has NO such short-circuit: it abstracts
+        // every free var and applies `renamePrecise` (RuleVariants.hs:64,
+        // 78) even when the only variant is the identity.  For rules whose
+        // vars are already in renamePrecise normal form (the common case)
+        // the AC body equals the E body → `isTrivialProtoVariantAC` is True
+        // → "has exactly the trivial AC variant", so the short-circuit is
+        // faithful.  But when renamePrecise WOULD change a var — e.g. a rule
+        // with two free vars sharing a name (`~ltk` and `ltk`), where it
+        // disambiguates the second to `ltk.1` — the AC body differs from the
+        // E body and HS prints the full `rule (modulo AC) ...` block.  Since
+        // there are no reducible sub-terms, the sole variant IS the identity:
+        // return `renamePrecise(rule)` with the trivial disjunction directly
+        // (no Maude call).  This only diverges from the short-circuit for
+        // rules renamePrecise actually rewrites (issue527's Register_pk).
+        if rule_renames_under_precise(rule) {
+            let (ac, substs) = rename_precise_rule_with_variants(
+                rule.clone(), vec![LNSubstVFresh::empty()]);
+            return Ok(Some((ac, substs)));
+        }
         return Ok(None);
     }
 
@@ -863,6 +882,36 @@ pub fn abstract_rule_and_variants(
 /// flipping AC-sorted variant-subst order, then rotating
 /// performSplit-case numbering. Symptom on JKL_TS1_2004:
 /// `Sessk_reveal_case_3` (RS) vs `Sessk_reveal_case_4` (HS).
+/// Would HS's `renamePrecise` (per-name fresh indices, RuleVariants.hs:64)
+/// rewrite any of this rule's free vars?  True iff some var's renamePrecise
+/// index differs from its original — the realistic trigger being two free
+/// vars sharing a name (e.g. `~ltk` and `ltk` → the second becomes `ltk.1`).
+/// Walks vars in the SAME order as `rename_precise_rule_with_variants` (the
+/// variant disjunction has no keys for the trivial-disjunction case, so it
+/// reduces to prems, concs, acts, new_vars).
+fn rule_renames_under_precise(rule: &ProtoRuleE) -> bool {
+    use tamarin_term::lterm::HasFrees;
+    use tamarin_utils::fresh::PreciseFreshState;
+    use std::collections::HashMap;
+    let mut vars: Vec<LVar> = Vec::new();
+    {
+        let mut collect = |v: &LVar| vars.push(v.clone());
+        for f in &rule.premises { for t in &f.terms { t.for_each_free(&mut collect); } }
+        for f in &rule.conclusions { for t in &f.terms { t.for_each_free(&mut collect); } }
+        for f in &rule.actions { for t in &f.terms { t.for_each_free(&mut collect); } }
+        for t in &rule.new_vars { t.for_each_free(&mut collect); }
+    }
+    let mut state = PreciseFreshState::nothing_used();
+    let mut map: HashMap<LVar, LVar> = HashMap::new();
+    for v in &vars {
+        if map.contains_key(v) { continue; }
+        let idx = state.fresh_ident(&v.name);
+        if idx != v.idx { return true; }
+        map.insert(v.clone(), LVar { name: v.name.clone(), sort: v.sort, idx });
+    }
+    false
+}
+
 fn rename_precise_rule_with_variants(
     rule: ProtoRuleE,
     substs: Vec<LNSubstVFresh>,

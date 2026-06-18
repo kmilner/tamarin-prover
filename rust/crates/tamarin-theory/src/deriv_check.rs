@@ -209,8 +209,13 @@ fn collect_rule_free_vars(
     nullary_funs: &std::collections::BTreeSet<String>,
 ) -> Vec<p::VarSpec> {
     let mut out: Vec<p::VarSpec> = Vec::new();
-    let mut seen: std::collections::BTreeSet<(String, u64)> = std::collections::BTreeSet::new();
-    let push = |v: &p::VarSpec, out: &mut Vec<p::VarSpec>, seen: &mut std::collections::BTreeSet<_>| {
+    // HS `frees` keys on the full LVar (name AND sort AND idx), so `~ltk`
+    // (fresh) and `ltk` (msg) are DISTINCT free vars — both become
+    // derivability candidates.  Key the dedup set on (name, sort, idx) too;
+    // a (name, idx)-only key would let `~ltk` mask `ltk` and silently drop
+    // the non-derivable msg var (Register_pk `ltk`).
+    let mut seen: std::collections::BTreeSet<(String, u8, u64)> = std::collections::BTreeSet::new();
+    let push = |v: &p::VarSpec, out: &mut Vec<p::VarSpec>, seen: &mut std::collections::BTreeSet<(String, u8, u64)>| {
         if matches!(v.sort, p::SortHint::Pub | p::SortHint::Node) {
             return;
         }
@@ -222,7 +227,7 @@ fn collect_rule_free_vars(
         if nullary_funs.contains(&v.name) {
             return;
         }
-        let key = (v.name.clone(), v.idx);
+        let key = (v.name.clone(), sort_ord(&v.sort), v.idx);
         if seen.insert(key) {
             out.push(v.clone());
         }
@@ -239,59 +244,71 @@ fn collect_rule_free_vars(
     // (LTerm.hs:522-524: `compare x3 y3 <> compare x2 y2 <> compare x1 y1`
     //  where x3=idx, x2=sort, x1=name).  HS uses `frees . L.get oprRuleE` →
     // `S.toList` which returns elements in ascending LVar Ord.
-    fn sort_hint_ord(s: &p::SortHint) -> u8 {
-        // mirrors HS LSort derived-Ord: Pub=0, Fresh=1, Msg=2, Node=3, Nat=4
-        match s {
-            p::SortHint::Pub => 0,
-            p::SortHint::Fresh => 1,
-            p::SortHint::Msg => 2,
-            p::SortHint::Node => 3,
-            p::SortHint::Nat => 4,
-            p::SortHint::Suffix(p::SuffixSort::Pub) => 0,
-            p::SortHint::Suffix(p::SuffixSort::Fresh) => 1,
-            p::SortHint::Suffix(p::SuffixSort::Msg) => 2,
-            p::SortHint::Suffix(p::SuffixSort::Node) => 3,
-            p::SortHint::Suffix(p::SuffixSort::Nat) => 4,
-            p::SortHint::Untagged => 2, // untagged → Msg by default
-        }
-    }
     out.sort_by(|a, b| {
         a.idx.cmp(&b.idx)
-            .then_with(|| sort_hint_ord(&a.sort).cmp(&sort_hint_ord(&b.sort)))
+            .then_with(|| sort_ord(&a.sort).cmp(&sort_ord(&b.sort)))
             .then_with(|| a.name.cmp(&b.name))
     });
     out
 }
 
-/// Apply a (name,idx) → VarSpec rename map to all variables in a term.
-fn rename_term_vars(
+/// HS LSort derived-Ord: Pub=0, Fresh=1, Msg=2, Node=3, Nat=4 (untagged →
+/// Msg).  Used both for LVar ordering and as the sort component of the
+/// free-var identity key (a (name, idx)-only key would conflate `~ltk` and
+/// `ltk`).
+fn sort_ord(s: &p::SortHint) -> u8 {
+    match s {
+        p::SortHint::Pub | p::SortHint::Suffix(p::SuffixSort::Pub) => 0,
+        p::SortHint::Fresh | p::SortHint::Suffix(p::SuffixSort::Fresh) => 1,
+        p::SortHint::Msg | p::SortHint::Suffix(p::SuffixSort::Msg)
+            | p::SortHint::Untagged => 2,
+        p::SortHint::Node | p::SortHint::Suffix(p::SuffixSort::Node) => 3,
+        p::SortHint::Nat | p::SortHint::Suffix(p::SuffixSort::Nat) => 4,
+    }
+}
+
+/// HS `lvarToLnterm`: retype an LSortNat var to LSortFresh; otherwise keep
+/// the var's sort unchanged (MessageDerivationChecks.hs:213-215).
+fn nat_to_fresh_var(v: &p::VarSpec) -> p::VarSpec {
+    let mut nv = v.clone();
+    if matches!(v.sort, p::SortHint::Nat | p::SortHint::Suffix(p::SuffixSort::Nat)) {
+        nv.sort = p::SortHint::Fresh;
+    }
+    nv
+}
+
+/// Rename a premise term's variables for the probe: a free var (matched by
+/// (name, sort, idx)) becomes its `dvar<k>` probe var; any other var is
+/// retyped nat→fresh (HS `natToFreshVars`).  Keeps `Out(...)` referencing the
+/// same probe vars as the `Fr(...)` premises.
+fn rename_term_to_probe(
     t: &p::Term,
-    map: &std::collections::HashMap<(String, u64), p::VarSpec>,
+    map: &std::collections::HashMap<(String, u8, u64), p::VarSpec>,
 ) -> p::Term {
     match t {
         p::Term::Var(v) => {
-            if let Some(new) = map.get(&(v.name.clone(), v.idx)) {
-                p::Term::Var(new.clone())
-            } else {
-                t.clone()
+            let key = (v.name.clone(), sort_ord(&v.sort), v.idx);
+            match map.get(&key) {
+                Some(pv) => p::Term::Var(pv.clone()),
+                None => p::Term::Var(nat_to_fresh_var(v)),
             }
         }
         p::Term::App(name, args) => p::Term::App(
             name.clone(),
-            args.iter().map(|a| rename_term_vars(a, map)).collect(),
+            args.iter().map(|a| rename_term_to_probe(a, map)).collect(),
         ),
         p::Term::Pair(args) => p::Term::Pair(
-            args.iter().map(|a| rename_term_vars(a, map)).collect(),
+            args.iter().map(|a| rename_term_to_probe(a, map)).collect(),
         ),
         p::Term::BinOp(op, l, r) => p::Term::BinOp(
             *op,
-            Box::new(rename_term_vars(l, map)),
-            Box::new(rename_term_vars(r, map)),
+            Box::new(rename_term_to_probe(l, map)),
+            Box::new(rename_term_to_probe(r, map)),
         ),
         p::Term::AlgApp(name, l, r) => p::Term::AlgApp(
             name.clone(),
-            Box::new(rename_term_vars(l, map)),
-            Box::new(rename_term_vars(r, map)),
+            Box::new(rename_term_to_probe(l, map)),
+            Box::new(rename_term_to_probe(r, map)),
         ),
         _ => t.clone(),
     }
@@ -348,25 +365,38 @@ fn synthesise_probe_theory(
             _ => {}
         }
     }
-    // Rename ALL free vars to Fresh sort throughout the rule (mirrors
-    // HS's `freesToFresh` + the implicit retyping the synthetic rule
-    // needs to be wf — Fr( ) only accepts Fresh- or Msg-sorted args).
-    // We use Fresh so the resulting var IS a fresh-sourced nonce the
-    // intruder learns from Out, not a Msg-sort var.  The rename is
-    // applied consistently to (a) the new Fr( ) premises, (b) the
-    // action's args, (c) the Out( ) conclusions, AND (d) the lemma's
-    // existential quantifier and KU goal.
-    let rename: std::collections::HashMap<(String, u64), p::VarSpec> = free_vars.iter()
-        .map(|v| {
-            let mut vf = v.clone();
-            vf.sort = p::SortHint::Fresh;
-            ((v.name.clone(), v.idx), vf)
+    // HS `generateRule` (MessageDerivationChecks.hs:181) keeps each free
+    // var's ORIGINAL sort: premises = `freesToFresh . deleteGlobals` and
+    // `freesToFresh = map (freshFact . lvarToLnterm)` where `lvarToLnterm`
+    // only retypes LSortNat → LSortFresh (everything else stays as-is).
+    // So `~ltk` (fresh) and `ltk` (msg) become Fr(~ltk) and Fr(ltk) — two
+    // DISTINCT premises; Out(~ltk) makes ~ltk derivable while KU(ltk) is
+    // not.  Forcing every var to Fresh, and keying the rename map on
+    // (name, idx) only, collapsed same-named vars of different sorts into
+    // one (e.g. Register_pk's ~ltk/ltk), corrupting the probe.
+    // Each free var gets a UNIQUE probe name (`dvar<k>`) keeping its sort
+    // (nat→fresh).  HS distinguishes same-named/different-sort vars (`~ltk`
+    // vs `ltk`) via sort-aware LVar identity in de Bruijn conversion; RS's
+    // formula→guarded path binds quantifiers by name, so two `Ex ltk ltk`
+    // binders would be ambiguous and mis-resolve `KU(~ltk)`.  Unique names
+    // sidestep that with NO effect on derivability (variable names are
+    // immaterial to the intruder); the WfError still reports the ORIGINAL
+    // var name (prove_probe uses `free_vars`).
+    let probe_vars: Vec<p::VarSpec> = free_vars.iter().enumerate()
+        .map(|(k, v)| {
+            let mut nv = nat_to_fresh_var(v);
+            nv.name = format!("dvar{}", k);
+            nv.idx = 0;
+            nv
         })
         .collect();
-    let renamed_free_vars: Vec<p::VarSpec> = free_vars.iter()
-        .map(|v| rename[&(v.name.clone(), v.idx)].clone())
-        .collect();
-    let fresh_premises: Vec<p::Fact> = renamed_free_vars.iter()
+    // Sort-aware (name, sort, idx) → probe-var map for renaming premise terms
+    // (so `Out(~ltk)` references the same `dvar<k>` as `Fr(dvar<k>)`).
+    let rename: std::collections::HashMap<(String, u8, u64), p::VarSpec> =
+        free_vars.iter().enumerate()
+            .map(|(k, v)| ((v.name.clone(), sort_ord(&v.sort), v.idx), probe_vars[k].clone()))
+            .collect();
+    let fresh_premises: Vec<p::Fact> = probe_vars.iter()
         .map(|v| p::Fact {
             persistent: false,
             name: "Fr".into(),
@@ -377,15 +407,18 @@ fn synthesise_probe_theory(
     let action = p::Fact {
         persistent: false,
         name: format!("Generated_{}", idx),
-        args: renamed_free_vars.iter().map(|v| p::Term::Var(v.clone())).collect(),
+        args: probe_vars.iter().map(|v| p::Term::Var(v.clone())).collect(),
         annotations: Vec::new(),
     };
+    // premisesToOut = map (outFact . natToFreshVars) . concatMap factTerms:
+    // Out each premise term, with free-var occurrences renamed to their
+    // `dvar<k>` probe var (and nat-sort non-free vars retyped to fresh).
     let out_concs: Vec<p::Fact> = rule.premises.iter()
         .flat_map(|f| f.args.iter().cloned())
         .map(|t| p::Fact {
             persistent: false,
             name: "Out".into(),
-            args: vec![rename_term_vars(&t, &rename)],
+            args: vec![rename_term_to_probe(&t, &rename)],
             annotations: Vec::new(),
         })
         .collect();
@@ -413,9 +446,11 @@ fn synthesise_probe_theory(
     let action_atom = |action: p::Fact, t: p::Term| -> p::Formula {
         p::Formula::Atom(p::Atom::Action(action, t))
     };
-    for v in free_vars {
-        let lemma_name = format!("deriv_check_{}_{}", idx, v.name);
-        let v_renamed = rename[&(v.name.clone(), v.idx)].clone();
+    for (k, _v) in free_vars.iter().enumerate() {
+        // Lemma named by free-var INDEX (not name) so same-named vars don't
+        // collide; prove_probe re-derives the same name from the index.
+        let lemma_name = format!("deriv_check_{}_{}", idx, k);
+        let v_renamed = probe_vars[k].clone();
         let t0 = p::VarSpec { name: "t0".into(), idx: 0, sort: p::SortHint::Node, typ: None };
         let t1 = p::VarSpec { name: "t1".into(), idx: 0, sort: p::SortHint::Node, typ: None };
         let gen_at = action_atom(action.clone(), p::Term::Var(t0.clone()));
@@ -431,7 +466,7 @@ fn synthesise_probe_theory(
         let ku_at = action_atom(ku_fact, p::Term::Var(t1.clone()));
         let conj = p::Formula::And(Box::new(gen_at), Box::new(ku_at));
         // Ex t0 t1 vars... . <conj>
-        let mut all_quant = renamed_free_vars.clone();
+        let mut all_quant = probe_vars.clone();
         all_quant.push(t0);
         all_quant.push(t1);
         let body = p::Formula::Exists(all_quant, Box::new(conj));
@@ -506,8 +541,10 @@ fn prove_probe(
     ctx.ensure_saturated();
 
     let mut undecidable = Vec::new();
-    for v in free_vars {
-        let lemma_name = format!("deriv_check_{}_{}", idx, v.name);
+    for (k, v) in free_vars.iter().enumerate() {
+        // Lemma name keyed by free-var INDEX (matches synthesise_probe_theory);
+        // the reported var name below uses the ORIGINAL `v` (sort + name).
+        let lemma_name = format!("deriv_check_{}_{}", idx, k);
         let lemma = match elaborated.lookup_lemma(&lemma_name) {
             Some(l) => l,
             None => continue,

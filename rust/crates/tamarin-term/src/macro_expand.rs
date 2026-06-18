@@ -8,11 +8,22 @@ use crate::subst::{apply_vterm, Subst};
 use crate::term::{f_app, Term};
 use crate::vterm::VTerm;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Macro<C, V> {
     pub name: Vec<u8>,
     pub params: Vec<V>,
     pub body: VTerm<C, V>,
+}
+
+// Render the name as a (lossy) string rather than a raw byte array.
+impl<C: std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for Macro<C, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Macro")
+            .field("name", &String::from_utf8_lossy(&self.name))
+            .field("params", &self.params)
+            .field("body", &self.body)
+            .finish()
+    }
 }
 
 impl<C, V> Macro<C, V> {

@@ -8561,47 +8561,212 @@ fn write_rule_to_key_excl_new_vars(
     // Crucial: rule.new_vars EXCLUDED per `compareRulesUpToNewVars`.
 }
 
+/// Render a `Guarded` formula into the redundant-case dedup key buffer,
+/// applying the free-var alpha-`rename` INLINE.
+///
+/// PERF/FAITHFULNESS: this is a direct structural serializer.  The previous
+/// implementation cloned the whole formula via `subst_guarded` (to apply
+/// the rename) and then `format!("{:?}", _)`-ed it through the derived
+/// `Debug` machinery — that path was ~19% of UM3 self+children time
+/// (GTerm clone churn + the slow generic `Debug` formatter builders +
+/// an intermediate `String` allocation per formula).  We instead walk the
+/// formula once, renaming free LVar leaves in place and writing a compact
+/// structural fingerprint, with NO clone and NO `Debug` dispatch.
+///
+/// The produced key BYTES differ from the old `Debug` rendering, but the
+/// induced equivalence partition is IDENTICAL: `compute_compare_systems_key`
+/// keys are purely internal (never reach `--prove` output), and they are
+/// only ever compared for equality/ordering against other keys from the
+/// SAME `removeRedundantCases` call.  The `rename` map is a var→var alpha
+/// renaming (`compute_rename_map`), so substituting it never produces a
+/// `Pair` and `mk_gpair`'s tuple-flattening (the one non-rename effect of
+/// `subst_guarded`) can never fire here — i.e. the old `subst_guarded`
+/// step did *nothing but rename free vars* for this input class.  This
+/// serializer renames the same free vars and is injective over the formula
+/// structure, so two formulas collide here iff they collided before.
 fn write_guarded_to_key(
     g: &crate::guarded::Guarded,
     rename: &std::collections::BTreeMap<tamarin_term::lterm::LVar, tamarin_term::lterm::LVar>,
     out: &mut String,
 ) {
-    // For Guarded we need a structural rendering with renamed free vars.
-    // Cleanest: collect free VarSpecs, build a VarSubst that maps each
-    // (name, idx) to the renamed VarSpec, apply via subst_guarded.
-    use std::collections::HashMap;
-    let mut frees: Vec<tamarin_parser::ast::VarSpec> = Vec::new();
-    fn collect(g: &crate::guarded::Guarded, out: &mut Vec<tamarin_parser::ast::VarSpec>) {
-        use crate::guarded::Guarded;
-        match g {
-            Guarded::Atom(a) => crate::guarded_types::collect_free_atom(a, out),
-            Guarded::Disj(items) | Guarded::Conj(items) =>
-                for it in items { collect(it, out); },
-            Guarded::GGuarded { guards, body, .. } => {
-                for a in guards { crate::guarded_types::collect_free_atom(a, out); }
-                collect(body, out);
+    write_guarded_struct(g, rename, out);
+}
+
+/// Look up the renamed identity of a `Free` GTerm var and write it.
+fn write_gfree_var(
+    v: &tamarin_parser::ast::VarSpec,
+    rename: &std::collections::BTreeMap<tamarin_term::lterm::LVar, tamarin_term::lterm::LVar>,
+    out: &mut String,
+) {
+    use std::fmt::Write as _;
+    let sort = varspec_sort_to_lsort(&v.sort);
+    let lv = tamarin_term::lterm::LVar { name: v.name.clone(), sort, idx: v.idx };
+    let rv = rename.get(&lv).unwrap_or(&lv);
+    // Encode the renamed identity (name + idx + sort) — matches what the
+    // old subst_guarded+Debug path encoded for a Free leaf.
+    let _ = write!(out, "F{}#{}:{:?}", rv.name, rv.idx, rv.sort);
+}
+
+fn write_gterm_struct(
+    t: &crate::guarded_types::GTerm,
+    rename: &std::collections::BTreeMap<tamarin_term::lterm::LVar, tamarin_term::lterm::LVar>,
+    out: &mut String,
+) {
+    use crate::guarded_types::{BVar, GTerm};
+    use std::fmt::Write as _;
+    match t {
+        GTerm::Var(BVar::Free(v)) => write_gfree_var(v, rename, out),
+        GTerm::Var(BVar::Bound(n)) => { let _ = write!(out, "B{}", n); }
+        GTerm::PubLit(s) => { let _ = write!(out, "p'{}'", s); }
+        GTerm::FreshLit(s) => { let _ = write!(out, "f'{}'", s); }
+        GTerm::NatLit(s) => { let _ = write!(out, "n'{}'", s); }
+        GTerm::Number(x) => { let _ = write!(out, "#{}", x); }
+        GTerm::NumberOne => out.push_str("#1"),
+        GTerm::NatOne => out.push_str("%1"),
+        GTerm::DhNeutral => out.push_str("dhN"),
+        GTerm::App(name, args) => {
+            let _ = write!(out, "{}(", name);
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                write_gterm_struct(a, rename, out);
             }
+            out.push(')');
+        }
+        GTerm::AlgApp(name, a, b) => {
+            let _ = write!(out, "{}^(", name);
+            write_gterm_struct(a, rename, out);
+            out.push(',');
+            write_gterm_struct(b, rename, out);
+            out.push(')');
+        }
+        GTerm::Pair(items) => {
+            out.push_str("<");
+            for (i, a) in items.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                write_gterm_struct(a, rename, out);
+            }
+            out.push('>');
+        }
+        GTerm::Diff(a, b) => {
+            out.push_str("diff(");
+            write_gterm_struct(a, rename, out);
+            out.push(',');
+            write_gterm_struct(b, rename, out);
+            out.push(')');
+        }
+        GTerm::BinOp(op, a, b) => {
+            let _ = write!(out, "{:?}(", op);
+            write_gterm_struct(a, rename, out);
+            out.push(',');
+            write_gterm_struct(b, rename, out);
+            out.push(')');
+        }
+        GTerm::PatMatch(t) => {
+            out.push_str("=(");
+            write_gterm_struct(t, rename, out);
+            out.push(')');
         }
     }
-    collect(g, &mut frees);
-    let mut vs: HashMap<(String, u64), tamarin_parser::ast::Term> = HashMap::new();
-    for fv in &frees {
-        let sort = varspec_sort_to_lsort(&fv.sort);
-        let key = (fv.name.clone(), fv.idx);
-        let lv = tamarin_term::lterm::LVar { name: fv.name.clone(), sort, idx: fv.idx };
-        let rv = rn(rename, &lv);
-        if rv == lv { continue; }
-        // Build replacement VarSpec preserving original sort hint.
-        let new_vs = tamarin_parser::ast::VarSpec {
-            name: rv.name.clone(),
-            idx: rv.idx,
-            sort: fv.sort,
-            typ: fv.typ.clone(),
-        };
-        vs.insert(key, tamarin_parser::ast::Term::Var(new_vs));
+}
+
+fn write_gfact_struct(
+    f: &crate::guarded_types::GFact,
+    rename: &std::collections::BTreeMap<tamarin_term::lterm::LVar, tamarin_term::lterm::LVar>,
+    out: &mut String,
+) {
+    use std::fmt::Write as _;
+    let _ = write!(out, "{}{}:{:?}[", if f.persistent { "!" } else { "" }, f.name, f.annotations);
+    for (i, t) in f.args.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        write_gterm_struct(t, rename, out);
     }
-    let renamed = if vs.is_empty() { g.clone() } else { crate::guarded::subst_guarded(g, &vs) };
-    out.push_str(&format!("{:?}", renamed));
+    out.push(']');
+}
+
+fn write_gatom_struct(
+    a: &crate::guarded_types::GAtom,
+    rename: &std::collections::BTreeMap<tamarin_term::lterm::LVar, tamarin_term::lterm::LVar>,
+    out: &mut String,
+) {
+    use crate::guarded_types::GAtom;
+    let bin = |tag: &str, x: &crate::guarded_types::GTerm, y: &crate::guarded_types::GTerm,
+               out: &mut String| {
+        out.push_str(tag);
+        out.push('(');
+        write_gterm_struct(x, rename, out);
+        out.push(',');
+        write_gterm_struct(y, rename, out);
+        out.push(')');
+    };
+    match a {
+        GAtom::Eq(x, y) => bin("EQ", x, y, out),
+        GAtom::Less(x, y) => bin("LT", x, y, out),
+        GAtom::LessMset(x, y) => bin("LTm", x, y, out),
+        GAtom::Subterm(x, y) => bin("SUB", x, y, out),
+        GAtom::Action(f, t) => {
+            out.push_str("ACT(");
+            write_gfact_struct(f, rename, out);
+            out.push('@');
+            write_gterm_struct(t, rename, out);
+            out.push(')');
+        }
+        GAtom::Last(t) => {
+            out.push_str("LAST(");
+            write_gterm_struct(t, rename, out);
+            out.push(')');
+        }
+        GAtom::Pred(f) => {
+            out.push_str("PRED(");
+            write_gfact_struct(f, rename, out);
+            out.push(')');
+        }
+    }
+}
+
+fn write_guarded_struct(
+    g: &crate::guarded::Guarded,
+    rename: &std::collections::BTreeMap<tamarin_term::lterm::LVar, tamarin_term::lterm::LVar>,
+    out: &mut String,
+) {
+    use crate::guarded::Guarded;
+    use std::fmt::Write as _;
+    match g {
+        Guarded::Atom(a) => {
+            out.push_str("A{");
+            write_gatom_struct(a, rename, out);
+            out.push('}');
+        }
+        Guarded::Disj(items) => {
+            out.push_str("OR[");
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 { out.push(';'); }
+                write_guarded_struct(it, rename, out);
+            }
+            out.push(']');
+        }
+        Guarded::Conj(items) => {
+            out.push_str("AND[");
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 { out.push(';'); }
+                write_guarded_struct(it, rename, out);
+            }
+            out.push(']');
+        }
+        Guarded::GGuarded { qua, vars, guards, body } => {
+            let _ = write!(out, "G{:?}(", qua);
+            for (i, b) in vars.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                let _ = write!(out, "{}:{:?}", b.name, b.sort);
+            }
+            out.push_str("){");
+            for (i, a) in guards.iter().enumerate() {
+                if i > 0 { out.push(';'); }
+                write_gatom_struct(a, rename, out);
+            }
+            out.push_str("}=>");
+            write_guarded_struct(body, rename, out);
+        }
+    }
 }
 
 /// Build the canonical key used to identify a system up to alpha-renaming

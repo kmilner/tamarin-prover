@@ -531,7 +531,7 @@ fn term_for_each_free(t: &crate::guarded::GTerm, f: &mut dyn FnMut(&LVar)) {
         GTerm::PubLit(_) | GTerm::FreshLit(_) | GTerm::NatLit(_)
         | GTerm::Number(_) | GTerm::NumberOne | GTerm::NatOne | GTerm::DhNeutral => {}
         GTerm::App(_, args) | GTerm::Pair(args) => {
-            for a in args { term_for_each_free(a, f); }
+            for a in args.iter() { term_for_each_free(a, f); }
         }
         GTerm::AlgApp(_, a, b) | GTerm::Diff(a, b) | GTerm::BinOp(_, a, b) => {
             term_for_each_free(a, f);

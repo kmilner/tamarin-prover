@@ -18,6 +18,7 @@ use std::collections::BTreeSet;
 use tamarin_parser::ast as p;
 
 pub use crate::guarded_types::{
+    ga,
     BVar, GAtom, GBinding, GFact, GTerm,
     atom_to_gatom_free, fact_to_gfact_free, term_to_gterm_free,
     gatom_to_atom, gfact_to_fact, gterm_to_term,
@@ -172,7 +173,55 @@ pub fn cmp_term(a: &GTerm, b: &GTerm) -> std::cmp::Ordering {
     let (ca, sa) = term_class(a);
     let (cb, sb) = term_class(b);
     if ca != cb { return ca.cmp(&cb); }
-    if sa != sb { return sa.cmp(&sb); }
+    // FApp class (ca == cb == 1): HS `Ord (Term a)` compares `FAPP fsym ts`
+    // by `compare fsym` THEN `compare ts` (derived Ord on
+    // `Term a = LIT a | FAPP FunSym [Term a]`, Term/Raw.hs:74).  The
+    // `FunSym` Ord is `NoEq < AC < C < List`, and within `NoEq` it is
+    // `Ord NoEqSym = (name, (arity, privacy, constructability))`
+    // (FunctionSymbols.hs:117) — i.e. compared by NAME first.
+    //
+    // RS special-cases several HS `FAPP (NoEq sym)` terms into dedicated
+    // `GTerm` variants (`Pair`=pair, `BinOp Exp`=exp, `Diff`=diff,
+    // `NumberOne`=one, `NatOne`=tone, `DhNeutral`=DH_neutral) and AC
+    // ops into `BinOp Mult/Union/Xor/NatPlus`.  The OLD `term_class`
+    // ordered these by RUST VARIANT (Pair=5, BinOp=7, ...) — which does
+    // NOT match HS's name-based `FunSym` Ord (e.g. HS sorts `exp(...)`
+    // BEFORE `pair(...)` because `"exp" < "pair"`, but the variant order
+    // put Pair=5 before BinOp(Exp)=7).  That swapped the `S.toList
+    // sFormulas` iteration order in `evalFormulaAtoms`, flipping which
+    // co-created SidUpdated DisjG got the lower `gsNr` (UM3
+    // `CK_secure_UM3` line-3438 abstract-vs-transcript disj swap).
+    //
+    // Faithful: compare two FApp-class terms by their HS `FunSym` key
+    // (`funsym_key`), then by the argument list (flattened+sorted for AC,
+    // matching `fAppAC`'s `sort (...)`, Term/Raw.hs:122).
+    if ca == 1 {
+        // Borrowed FunSym key (no per-comparison allocation): compare
+        // (outer, name-bytes, arity) in HS order without materialising a
+        // `Vec`.  `cmp_term` is a very hot path (every BTreeSet/Map op on
+        // guarded terms), so the name must be compared as a `&[u8]` slice.
+        let (oa, na, aa) = funsym_key(a);
+        let (ob, nb, ab) = funsym_key(b);
+        let kc = oa.cmp(&ob)
+            .then_with(|| na.cmp(nb))
+            .then_with(|| aa.cmp(&ab));
+        if kc != std::cmp::Ordering::Equal { return kc; }
+        // Same FunSym: compare argument lists in HS `[Term a]` order.
+        // AC ops compare a sorted, flattened multiset (HS stores args
+        // pre-sorted by `fAppAC`); everything else compares positionally.
+        if let (BinOp(o1, _, _), BinOp(o2, _, _)) = (a, b) {
+            if is_ac_binop(o1) && is_ac_binop(o2) {
+                let mut args_a = Vec::new();
+                let mut args_b = Vec::new();
+                flatten_ac_binop(o1, a, &mut args_a);
+                flatten_ac_binop(o2, b, &mut args_b);
+                args_a.sort_by(cmp_term);
+                args_b.sort_by(cmp_term);
+                return cmp_slice(&args_a, &args_b, cmp_term);
+            }
+        }
+        return cmp_fapp_args(a, b);
+    }
     match (a, b) {
         // Lit class:
         (Var(v1), Var(v2)) => cmp_bvar(v1, v2),
@@ -180,47 +229,84 @@ pub fn cmp_term(a: &GTerm, b: &GTerm) -> std::cmp::Ordering {
         (FreshLit(s1), FreshLit(s2)) => s1.cmp(s2),
         (NatLit(s1), NatLit(s2)) => s1.cmp(s2),
         (Number(n1), Number(n2)) => n1.cmp(n2),
-        (NumberOne, NumberOne) | (NatOne, NatOne) | (DhNeutral, DhNeutral)
-            => std::cmp::Ordering::Equal,
-        // FApp class:
-        (App(n1, args1), App(n2, args2)) =>
-            n1.cmp(n2).then_with(|| cmp_slice(args1, args2, cmp_term)),
-        (AlgApp(n1, l1, r1), AlgApp(n2, l2, r2)) =>
-            n1.cmp(n2).then_with(|| cmp_term(l1, l2)).then_with(|| cmp_term(r1, r2)),
-        (Pair(a1), Pair(a2)) => cmp_slice(a1, a2, cmp_term),
+        _ => {
+            // Lit-class sub-discriminator (Con < Var; among Con by NameTag
+            // then name) — handled by `term_class`'s sub_tag.
+            sa.cmp(&sb)
+        }
+    }
+}
+
+/// HS `FunSym` Ord key for a FApp-class `GTerm`.  Returns
+/// `(outer, name, arity)` where `outer` mirrors HS's `FunSym` constructor
+/// order `NoEq(0) < AC(1) < C(2) < List(3)` (FunctionSymbols.hs:113-117)
+/// and, within `NoEq`, `(name, arity)` mirrors `Ord NoEqSym` (compared by
+/// name then arity — privacy/constructability never disambiguate two
+/// distinct symbols sharing a name+arity).  AC ops carry no name; their
+/// `ACSym` order is `Union < Mult < Xor < NatPlus` (FunctionSymbols.hs:93),
+/// encoded in the second field as an index so AC terms sort among
+/// themselves by ACSym and after every NoEq term.
+fn funsym_key(t: &GTerm) -> (u8, &[u8], usize) {
+    use GTerm::*;
+    // NoEq syms: outer = 0, key by (name-bytes, arity).  Static byte-string
+    // literals (`b"pair"` etc.) are `&'static [u8]` and coerce to the
+    // elided output lifetime; `n.as_bytes()` borrows from `t`.  No alloc.
+    match t {
+        // RS special-cased HS `FAPP (NoEq sym)` terms:
+        Pair(_) => (0, b"pair", 2),
+        BinOp(p::BinOp::Exp, _, _) => (0, b"exp", 2),
+        Diff(_, _) => (0, b"diff", 2),
+        NumberOne => (0, b"one", 0),
+        NatOne => (0, b"tone", 0),
+        DhNeutral => (0, b"DH_neutral", 0),
+        App(n, args) => (0, n.as_bytes(), args.len()),
+        AlgApp(n, _, _) => (0, n.as_bytes(), 2),
+        // AC ops: outer = 1, ACSym order Union<Mult<Xor<NatPlus> in field 3.
+        BinOp(p::BinOp::Union, _, _)   => (1, b"", 0),
+        BinOp(p::BinOp::Mult, _, _)    => (1, b"", 1),
+        BinOp(p::BinOp::Xor, _, _)     => (1, b"", 2),
+        BinOp(p::BinOp::NatPlus, _, _) => (1, b"", 3),
+        // PatMatch is RS-only with no HS equivalent — sort after all.
+        PatMatch(_) => (255, b"", 0),
+        // Lit-class terms never reach here (ca != 1).
+        _ => (254, b"", 0),
+    }
+}
+
+/// Compare the argument lists of two same-FunSym, non-AC FApp terms,
+/// mirroring HS's positional `compare ts` on `[Term a]`.
+fn cmp_fapp_args(a: &GTerm, b: &GTerm) -> std::cmp::Ordering {
+    use GTerm::*;
+    match (a, b) {
+        (App(_, x), App(_, y)) => cmp_slice(x, y, cmp_term),
+        (Pair(x), Pair(y)) => cmp_slice(x, y, cmp_term),
+        (AlgApp(_, l1, r1), AlgApp(_, l2, r2)) =>
+            cmp_term(l1, l2).then_with(|| cmp_term(r1, r2)),
         (Diff(l1, r1), Diff(l2, r2)) =>
             cmp_term(l1, l2).then_with(|| cmp_term(r1, r2)),
-        // HS-faithful: for AC binary ops (Mult/Union/Xor/NatPlus), HS's
-        // `FAPP (AC op) args` has args as a flat sorted multiset list;
-        // `derived Ord` on FAPP compares operator then args list.  RS's
-        // nested `BinOp(o, l, r)` representation hides this — two
-        // structurally distinct trees with the same flat multiset
-        // content (e.g. `Union(Union(a,b), c)` vs `Union(a, Union(b,c))`)
-        // would compare differently here, even though HS sees them as
-        // identical `FAPP (AC Union) [a,b,c]`.
-        //
-        // Mirror HS by flattening AC chains into a sorted multiset key
-        // before comparison.  Exp is NOT AC and uses structural compare.
-        (BinOp(o1, l1, r1), BinOp(o2, l2, r2)) => {
-            let tag_cmp = binop_tag(o1).cmp(&binop_tag(o2));
-            if tag_cmp != std::cmp::Ordering::Equal { return tag_cmp; }
-            if is_ac_binop(o1) {
-                let mut args_a = Vec::new();
-                let mut args_b = Vec::new();
-                flatten_ac_binop(o1, a, &mut args_a);
-                flatten_ac_binop(o2, b, &mut args_b);
-                // HS-faithful: `FAPP (AC op) args` has args sorted as a
-                // multiset (Maude canonicalises).  Sort both sides via
-                // cmp_term so structurally-permuted AC chains collapse.
-                args_a.sort_by(cmp_term);
-                args_b.sort_by(cmp_term);
-                cmp_slice(&args_a, &args_b, cmp_term)
-            } else {
-                cmp_term(l1, l2).then_with(|| cmp_term(r1, r2))
-            }
-        }
-        (PatMatch(a1), PatMatch(a2)) => cmp_term(a1, a2),
-        _ => std::cmp::Ordering::Equal,
+        (BinOp(_, l1, r1), BinOp(_, l2, r2)) =>
+            cmp_term(l1, l2).then_with(|| cmp_term(r1, r2)),
+        (PatMatch(x), PatMatch(y)) => cmp_term(x, y),
+        // 0-arity builtins (one/tone/DH_neutral): no args.
+        (NumberOne, NumberOne) | (NatOne, NatOne) | (DhNeutral, DhNeutral)
+            => std::cmp::Ordering::Equal,
+        // Cross-variant pairs only reach here when funsym_key tied them
+        // (e.g. App("pair",[..]) vs Pair([..]) — both key (0,"pair",2));
+        // compare their flattened arg lists positionally.
+        _ => cmp_slice(&fapp_args(a), &fapp_args(b), cmp_term),
+    }
+}
+
+/// Collect the positional argument list of a FApp-class term (for
+/// cross-representation comparison when two terms share a FunSym key).
+fn fapp_args(t: &GTerm) -> Vec<GTerm> {
+    use GTerm::*;
+    match t {
+        App(_, x) => x.to_vec(),
+        Pair(x) => x.to_vec(),
+        AlgApp(_, l, r) | Diff(l, r) | BinOp(_, l, r) => vec![(**l).clone(), (**r).clone()],
+        PatMatch(x) => vec![(**x).clone()],
+        _ => Vec::new(),
     }
 }
 
@@ -270,13 +356,6 @@ fn term_class(t: &GTerm) -> (u8, u8) {
         Diff(_, _) => (1, 6),
         BinOp(_, _, _) => (1, 7),
         PatMatch(_) => (1, 8),
-    }
-}
-
-fn binop_tag(o: &p::BinOp) -> u8 {
-    use p::BinOp::*;
-    match o {
-        Exp => 0, Mult => 1, Union => 2, Xor => 3, NatPlus => 4,
     }
 }
 
@@ -539,14 +618,14 @@ pub fn try_gterm_to_term(t: &GTerm) -> Option<p::Term> {
         GTerm::DhNeutral => p::Term::DhNeutral,
         GTerm::App(n, args) => {
             let mut acc = Vec::with_capacity(args.len());
-            for a in args { acc.push(try_gterm_to_term(a)?); }
-            p::Term::App(n.clone(), acc)
+            for a in args.iter() { acc.push(try_gterm_to_term(a)?); }
+            p::Term::App(n.to_string(), acc)
         }
         GTerm::AlgApp(n, a, b) =>
-            p::Term::AlgApp(n.clone(), Box::new(try_gterm_to_term(a)?), Box::new(try_gterm_to_term(b)?)),
+            p::Term::AlgApp(n.to_string(), Box::new(try_gterm_to_term(a)?), Box::new(try_gterm_to_term(b)?)),
         GTerm::Pair(items) => {
             let mut acc = Vec::with_capacity(items.len());
-            for it in items { acc.push(try_gterm_to_term(it)?); }
+            for it in items.iter() { acc.push(try_gterm_to_term(it)?); }
             p::Term::Pair(acc)
         }
         GTerm::Diff(a, b) =>
@@ -1212,12 +1291,12 @@ pub fn normalize_sort_hints(g: &Guarded) -> Guarded {
                 n.clone(), args.iter().map(norm_term).collect()),
             GTerm::Pair(args) => GTerm::Pair(args.iter().map(norm_term).collect()),
             GTerm::AlgApp(n, a, b) => GTerm::AlgApp(
-                n.clone(), Box::new(norm_term(a)), Box::new(norm_term(b))),
+                n.clone(), ga(norm_term(a)), ga(norm_term(b))),
             GTerm::Diff(a, b) => GTerm::Diff(
-                Box::new(norm_term(a)), Box::new(norm_term(b))),
+                ga(norm_term(a)), ga(norm_term(b))),
             GTerm::BinOp(op, a, b) => GTerm::BinOp(
-                *op, Box::new(norm_term(a)), Box::new(norm_term(b))),
-            GTerm::PatMatch(inner) => GTerm::PatMatch(Box::new(norm_term(inner))),
+                *op, ga(norm_term(a)), ga(norm_term(b))),
+            GTerm::PatMatch(inner) => GTerm::PatMatch(ga(norm_term(inner))),
             _ => t.clone(),
         }
     }
@@ -1303,18 +1382,50 @@ fn cac_flatten(op: &p::BinOp, t: &GTerm, out: &mut Vec<GTerm>) {
 }
 
 fn cac_rec_term(t: &GTerm, cmp: GCmp) -> GTerm {
+    // Wrapper: materialise the COW result, reusing `t` when nothing changed.
+    match cac_rec_term_cow(t, cmp) {
+        Some(g) => g,
+        None => t.clone(),
+    }
+}
+
+/// Copy-on-write core of `cac_rec_term`.  Returns `None` when the subtree is
+/// already in canonical form (no AC chain needed re-sorting and no descendant
+/// changed), so the caller can reuse the input `Arc` without allocating a
+/// rebuilt copy.  `Some(g)` carries the rebuilt subtree.
+///
+/// The produced canonical form is byte-identical to the eager version: every
+/// `None`-reuse path is gated on the recursive results being structurally
+/// unchanged, and the AC branch only returns `None` after confirming the
+/// re-folded sorted chain equals the input (`acc == *t`).
+fn cac_rec_term_cow(t: &GTerm, cmp: GCmp) -> Option<GTerm> {
     match t {
         GTerm::Var(_) | GTerm::PubLit(_) | GTerm::FreshLit(_)
         | GTerm::NatLit(_) | GTerm::Number(_) | GTerm::NumberOne
-        | GTerm::NatOne | GTerm::DhNeutral => t.clone(),
-        GTerm::App(n, args) => GTerm::App(
-            n.clone(), args.iter().map(|a| cac_rec_term(a, cmp)).collect()),
-        GTerm::Pair(args) => GTerm::Pair(
-            args.iter().map(|a| cac_rec_term(a, cmp)).collect()),
-        GTerm::AlgApp(n, a, b) => GTerm::AlgApp(
-            n.clone(), Box::new(cac_rec_term(a, cmp)), Box::new(cac_rec_term(b, cmp))),
-        GTerm::Diff(a, b) => GTerm::Diff(
-            Box::new(cac_rec_term(a, cmp)), Box::new(cac_rec_term(b, cmp))),
+        | GTerm::NatOne | GTerm::DhNeutral => None,
+        GTerm::App(n, args) =>
+            cac_rec_slice(args, cmp).map(|new| GTerm::App(n.clone(), new)),
+        GTerm::Pair(args) =>
+            cac_rec_slice(args, cmp).map(GTerm::Pair),
+        GTerm::AlgApp(n, a, b) => {
+            let a2 = cac_rec_term_cow(a, cmp);
+            let b2 = cac_rec_term_cow(b, cmp);
+            if a2.is_none() && b2.is_none() { return None; }
+            Some(GTerm::AlgApp(
+                n.clone(),
+                a2.map(ga).unwrap_or_else(|| a.clone()),
+                b2.map(ga).unwrap_or_else(|| b.clone()),
+            ))
+        }
+        GTerm::Diff(a, b) => {
+            let a2 = cac_rec_term_cow(a, cmp);
+            let b2 = cac_rec_term_cow(b, cmp);
+            if a2.is_none() && b2.is_none() { return None; }
+            Some(GTerm::Diff(
+                a2.map(ga).unwrap_or_else(|| a.clone()),
+                b2.map(ga).unwrap_or_else(|| b.clone()),
+            ))
+        }
         GTerm::BinOp(op, l, r) => {
             if matches!(op, p::BinOp::Mult | p::BinOp::Union | p::BinOp::Xor | p::BinOp::NatPlus) {
                 // Recurse into children first, then flatten the whole AC
@@ -1330,16 +1441,40 @@ fn cac_rec_term(t: &GTerm, cmp: GCmp) -> GTerm {
                 let last = iter.next().unwrap_or(GTerm::PubLit(String::new()));
                 let mut acc = last;
                 for prev in iter {
-                    acc = GTerm::BinOp(*op, Box::new(prev), Box::new(acc));
+                    acc = GTerm::BinOp(*op, ga(prev), ga(acc));
                 }
-                acc
+                // Reuse the input only if the canonical chain is byte-identical
+                // (children unchanged AND already sorted+right-leaning).
+                if acc == *t { None } else { Some(acc) }
             } else {
-                GTerm::BinOp(*op, Box::new(cac_rec_term(l, cmp)),
-                    Box::new(cac_rec_term(r, cmp)))
+                let l2 = cac_rec_term_cow(l, cmp);
+                let r2 = cac_rec_term_cow(r, cmp);
+                if l2.is_none() && r2.is_none() { return None; }
+                Some(GTerm::BinOp(
+                    *op,
+                    l2.map(ga).unwrap_or_else(|| l.clone()),
+                    r2.map(ga).unwrap_or_else(|| r.clone()),
+                ))
             }
         }
-        GTerm::PatMatch(inner) => GTerm::PatMatch(Box::new(cac_rec_term(inner, cmp))),
+        GTerm::PatMatch(inner) =>
+            cac_rec_term_cow(inner, cmp).map(|g| GTerm::PatMatch(ga(g))),
     }
+}
+
+/// COW over a slice of `Arc<[GTerm]>` children: returns `None` if every child
+/// is unchanged, else `Some` of the rebuilt slice (reusing unchanged children
+/// by cloning their `Arc`).  Single-pass: the output `Vec` is allocated lazily
+/// only when (and after) the first child changes.
+fn cac_rec_slice(args: &std::sync::Arc<[GTerm]>, cmp: GCmp) -> Option<std::sync::Arc<[GTerm]>> {
+    let mut out: Option<Vec<GTerm>> = None;
+    for (i, a) in args.iter().enumerate() {
+        match cac_rec_term_cow(a, cmp) {
+            Some(g) => out.get_or_insert_with(|| args[..i].to_vec()).push(g),
+            None => if let Some(v) = out.as_mut() { v.push(a.clone()); }
+        }
+    }
+    out.map(std::sync::Arc::from)
 }
 
 fn cac_rec_fact(f: &GFact, cmp: GCmp) -> GFact {
@@ -1425,7 +1560,7 @@ fn collect_witness_vars_term(t: &GTerm, out: &mut VarSubst) {
         }
         GTerm::Var(BVar::Bound(_)) => {}  // bound vars have no LVar idx
         GTerm::App(_, args) | GTerm::Pair(args) => {
-            for a in args { collect_witness_vars_term(a, out); }
+            for a in args.iter() { collect_witness_vars_term(a, out); }
         }
         GTerm::AlgApp(_, a, b) | GTerm::Diff(a, b) | GTerm::BinOp(_, a, b) => {
             collect_witness_vars_term(a, out);
@@ -1570,42 +1705,119 @@ pub fn subst_gfact(f: &GFact, s: &VarSubst) -> GFact {
 
 /// Substitute Free LVar leaves in a `GTerm`.
 pub fn subst_gterm(t: &GTerm, s: &VarSubst) -> GTerm {
+    match subst_gterm_cow(t, s) {
+        Some(g) => g,
+        None => t.clone(),
+    }
+}
+
+/// Copy-on-write core of `subst_gterm`.  Returns `None` when the subtree
+/// contains no variable in the substitution's domain (so no leaf is replaced
+/// and no `mk_gpair` flattening can fire), letting the caller reuse the input
+/// `Arc` without rebuilding.  `Some(g)` carries the rebuilt subtree.
+///
+/// Faithfulness: the result is byte-identical to the eager version.
+/// - A `None`-reuse on `App`/`AlgApp`/`Diff`/`BinOp`/`PatMatch` is gated on
+///   every child returning `None`, i.e. no substitution touched the subtree.
+/// - The `Pair` case is the delicate one: the eager code always runs
+///   `mk_gpair`, which flattens a *trailing* `Pair` child even under an
+///   empty-effect substitution.  So we only return `None` when no child
+///   changed AND the input's last element is not a `Pair` (i.e. it is already
+///   in `mk_gpair`-canonical form, hence `mk_gpair(items) == *t`).  When any
+///   child changed, or the tail is a `Pair`, we run `mk_gpair` exactly as the
+///   eager code did.
+fn subst_gterm_cow(t: &GTerm, s: &VarSubst) -> Option<GTerm> {
     match t {
         GTerm::Var(BVar::Free(v)) => {
             let key = (v.name.clone(), v.idx);
-            if let Some(target) = s.get(&key) {
-                term_to_gterm_free(target)
-            } else {
-                GTerm::Var(BVar::Free(v.clone()))
-            }
+            s.get(&key).map(term_to_gterm_free)
         }
-        GTerm::Var(b) => GTerm::Var(b.clone()),
-        GTerm::PubLit(s_) => GTerm::PubLit(s_.clone()),
-        GTerm::FreshLit(s_) => GTerm::FreshLit(s_.clone()),
-        GTerm::NatLit(s_) => GTerm::NatLit(s_.clone()),
-        GTerm::Number(n) => GTerm::Number(*n),
-        GTerm::NumberOne => GTerm::NumberOne,
-        GTerm::NatOne => GTerm::NatOne,
-        GTerm::DhNeutral => GTerm::DhNeutral,
+        GTerm::Var(_) | GTerm::PubLit(_) | GTerm::FreshLit(_) | GTerm::NatLit(_)
+        | GTerm::Number(_) | GTerm::NumberOne | GTerm::NatOne | GTerm::DhNeutral => None,
         GTerm::App(n, args) =>
-            GTerm::App(n.clone(), args.iter().map(|a| subst_gterm(a, s)).collect()),
-        GTerm::AlgApp(n, a, b) => GTerm::AlgApp(
-            n.clone(), Box::new(subst_gterm(a, s)), Box::new(subst_gterm(b, s))),
+            subst_gterm_slice(args, s).map(|new| GTerm::App(n.clone(), new)),
+        GTerm::AlgApp(n, a, b) => {
+            let a2 = subst_gterm_cow(a, s);
+            let b2 = subst_gterm_cow(b, s);
+            if a2.is_none() && b2.is_none() { return None; }
+            Some(GTerm::AlgApp(
+                n.clone(),
+                a2.map(ga).unwrap_or_else(|| a.clone()),
+                b2.map(ga).unwrap_or_else(|| b.clone()),
+            ))
+        }
         // Canonicalise via `mk_gpair`: substituting a pair-valued var into a
         // tuple tail (`<..,matchingComm>` with `matchingComm := <a,b>`) would
         // otherwise leave a non-canonical `Pair([..,Pair([a,b])])` that no
         // longer structurally matches the flat form produced by the
         // `impliedFormulas`/LNTerm path — defeating the `solved_formulas`
         // dedup and re-deriving discharged disjunctions.  See `mk_gpair`.
-        GTerm::Pair(items) =>
-            crate::guarded_types::mk_gpair(
-                items.iter().map(|i| subst_gterm(i, s)).collect()),
-        GTerm::Diff(a, b) => GTerm::Diff(
-            Box::new(subst_gterm(a, s)), Box::new(subst_gterm(b, s))),
-        GTerm::BinOp(op, a, b) => GTerm::BinOp(
-            *op, Box::new(subst_gterm(a, s)), Box::new(subst_gterm(b, s))),
-        GTerm::PatMatch(t) => GTerm::PatMatch(Box::new(subst_gterm(t, s))),
+        GTerm::Pair(items) => {
+            // The eager code always calls `mk_gpair`, which flattens a trailing
+            // `Pair` even under an empty-effect substitution.  Reuse the input
+            // (`None`) only if nothing changed AND it is already
+            // `mk_gpair`-canonical (tail not a `Pair`).  Otherwise we must
+            // materialise the full child list and run `mk_gpair`, exactly as
+            // the eager code did.  Single-pass: allocate the rebuild `Vec`
+            // lazily on the first changed child.
+            let mut out: Option<Vec<GTerm>> = None;
+            for (i, it) in items.iter().enumerate() {
+                match subst_gterm_cow(it, s) {
+                    Some(g) => out.get_or_insert_with(|| items[..i].to_vec()).push(g),
+                    None => if let Some(v) = out.as_mut() { v.push(it.clone()); }
+                }
+            }
+            match out {
+                Some(rebuilt) => Some(crate::guarded_types::mk_gpair(rebuilt)),
+                None => {
+                    // No child changed.  Flatten only if the tail is a `Pair`.
+                    if matches!(items.last(), Some(GTerm::Pair(_))) {
+                        Some(crate::guarded_types::mk_gpair(items.to_vec()))
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+        GTerm::Diff(a, b) => {
+            let a2 = subst_gterm_cow(a, s);
+            let b2 = subst_gterm_cow(b, s);
+            if a2.is_none() && b2.is_none() { return None; }
+            Some(GTerm::Diff(
+                a2.map(ga).unwrap_or_else(|| a.clone()),
+                b2.map(ga).unwrap_or_else(|| b.clone()),
+            ))
+        }
+        GTerm::BinOp(op, a, b) => {
+            let a2 = subst_gterm_cow(a, s);
+            let b2 = subst_gterm_cow(b, s);
+            if a2.is_none() && b2.is_none() { return None; }
+            Some(GTerm::BinOp(
+                *op,
+                a2.map(ga).unwrap_or_else(|| a.clone()),
+                b2.map(ga).unwrap_or_else(|| b.clone()),
+            ))
+        }
+        GTerm::PatMatch(inner) =>
+            subst_gterm_cow(inner, s).map(|g| GTerm::PatMatch(ga(g))),
     }
+}
+
+/// COW over an `Arc<[GTerm]>` argument slice: `None` if every child is
+/// unchanged, else `Some` of the rebuilt slice (unchanged children reuse their
+/// `Arc`).  Used by the non-`Pair` n-ary case (`App`), which never flattens.
+/// Single-pass: the output `Vec` is allocated lazily on first change.
+fn subst_gterm_slice(args: &std::sync::Arc<[GTerm]>, s: &VarSubst)
+    -> Option<std::sync::Arc<[GTerm]>>
+{
+    let mut out: Option<Vec<GTerm>> = None;
+    for (i, a) in args.iter().enumerate() {
+        match subst_gterm_cow(a, s) {
+            Some(g) => out.get_or_insert_with(|| args[..i].to_vec()).push(g),
+            None => if let Some(v) = out.as_mut() { v.push(a.clone()); }
+        }
+    }
+    out.map(std::sync::Arc::from)
 }
 
 /// Find the maximum variable idx used in a guarded formula. Used
@@ -1616,7 +1828,7 @@ pub fn max_var_idx(g: &Guarded) -> u64 {
             GTerm::Var(BVar::Free(v)) => { if v.idx > *m { *m = v.idx; } }
             GTerm::Var(BVar::Bound(_)) => {}
             GTerm::App(_, args) | GTerm::Pair(args) => {
-                for a in args { rec_term(a, m); }
+                for a in args.iter() { rec_term(a, m); }
             }
             GTerm::AlgApp(_, a, b) | GTerm::Diff(a, b) | GTerm::BinOp(_, a, b) => {
                 rec_term(a, m); rec_term(b, m);
