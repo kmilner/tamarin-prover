@@ -686,6 +686,384 @@ fn resolve_method(parsed: &ParsedMethod, sys: &System) -> Option<ProofMethod> {
     }
 }
 
+/// Structural-match a stored-proof fact (parsed only as raw argument
+/// text by the skeleton parser) against a runtime [`LNFact`]'s terms,
+/// **modulo variable renaming** (sort-aware alpha-equivalence).
+///
+/// HS resolves a `solve(...)` goal by structural equality of the parsed
+/// `Goal` against `sys.goals` (`goal `M.member` sGoals`,
+/// ProofMethod.hs:374); when the stored goal's term is absent from the
+/// (drifted) current system, HS's `checkProof` returns `Nothing` and
+/// marks the step `sorry /* invalid proof step encountered */`,
+/// preserving the stored subtree verbatim (Proof.hs:455-468).
+///
+/// Our skeleton parser captures each fact argument only as raw surface
+/// text (`build_fact` in proof_tree.rs stuffs it into a `Term::Var`
+/// name).  We can't reconstruct the parser's LVar identities, so exact
+/// structural equality is impossible; instead we re-parse the raw text
+/// into an AST [`tamarin_parser::ast::Term`] and compare its *shape*
+/// against the runtime term, allowing variables to differ in name/index
+/// (but not in SORT class) under a consistent bijection.  This is the
+/// faithful approximation of HS's `M.member` lookup: a VALID replay step
+/// has the same structure with a renamed var set (HS pretty-prints
+/// indices after a freshen, so the skeleton text's indices drift); a
+/// STALE step (the bug) has a *different* structure (e.g. a bare var
+/// `~r1` vs an `h(...)` application) and must be rejected so the caller
+/// emits the HS-faithful `invalid proof step encountered` placeholder.
+fn fact_terms_match_structurally(
+    parsed_args: &[tamarin_parser::ast::Term],
+    runtime_terms: &[tamarin_term::lterm::LNTerm],
+) -> bool {
+    if parsed_args.len() != runtime_terms.len() {
+        return false;
+    }
+    // Bijection between skeleton-var keys and runtime-LVar keys, shared
+    // across all argument positions (a var that recurs in the stored
+    // goal must map to the SAME runtime var everywhere, and vice-versa).
+    let mut bij = VarBijection::default();
+    for (p, r) in parsed_args.iter().zip(runtime_terms.iter()) {
+        // Re-parse the raw skeleton arg text into a structured term.  If
+        // it fails to parse (unexpected for well-formed stored proofs),
+        // be conservative and treat this position as non-discriminating
+        // (matches) — falling back to the legacy name+arity behaviour
+        // rather than spuriously rejecting.
+        let parsed = match parsed_term_of_arg(p) {
+            Some(t) => t,
+            None => continue,
+        };
+        if !term_matches(&parsed, r, &mut bij) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Recover a structured AST term from a skeleton fact argument.  The
+/// skeleton parser stores each arg as a `Term::Var` whose `name` holds
+/// the raw surface text (see `build_fact`); re-parse that text.  If the
+/// arg is already structured (future-proofing), return it directly.
+fn parsed_term_of_arg(
+    arg: &tamarin_parser::ast::Term,
+) -> Option<tamarin_parser::ast::Term> {
+    use tamarin_parser::ast::Term as PTerm;
+    match arg {
+        PTerm::Var(v) => tamarin_parser::parser::parse_term_str(&v.name).ok(),
+        other => Some(other.clone()),
+    }
+}
+
+/// Variable bijection used by [`term_matches`]: a parsed-var key maps to
+/// exactly one runtime-LVar, and each runtime-LVar is the image of at
+/// most one parsed-var key.
+#[derive(Default)]
+struct VarBijection {
+    fwd: std::collections::HashMap<(String, u64), tamarin_term::lterm::LVar>,
+    rev: std::collections::HashMap<tamarin_term::lterm::LVar, (String, u64)>,
+}
+
+impl VarBijection {
+    /// Record/verify that parsed var `key` (sort `psort`) corresponds to
+    /// runtime var `rv`.  Returns false on a sort mismatch or any
+    /// violation of the bijection (the key already maps elsewhere, or
+    /// `rv` is already the image of a different key).
+    fn bind(
+        &mut self,
+        key: (String, u64),
+        psort: tamarin_term::lterm::LSort,
+        rv: &tamarin_term::lterm::LVar,
+    ) -> bool {
+        if psort != rv.sort {
+            return false;
+        }
+        if let Some(prev) = self.fwd.get(&key) {
+            return prev == rv;
+        }
+        if self.rev.contains_key(rv) {
+            return false;
+        }
+        self.fwd.insert(key.clone(), rv.clone());
+        self.rev.insert(rv.clone(), key);
+        true
+    }
+}
+
+/// Map a parser `SortHint` (with possible leading-sigil text already
+/// consumed by the term parser) to the runtime [`LSort`], if determined.
+/// Untagged/Msg both map to `Msg` — the term parser tags a bare
+/// identifier `Untagged` and a `:msg`-suffixed one `Suffix(Msg)`; both
+/// are msg-sort at runtime.
+fn sort_hint_to_lsort(
+    h: &tamarin_parser::ast::SortHint,
+) -> tamarin_term::lterm::LSort {
+    use tamarin_parser::ast::{SortHint, SuffixSort};
+    use tamarin_term::lterm::LSort;
+    match h {
+        SortHint::Pub | SortHint::Suffix(SuffixSort::Pub) => LSort::Pub,
+        SortHint::Fresh | SortHint::Suffix(SuffixSort::Fresh) => LSort::Fresh,
+        SortHint::Node | SortHint::Suffix(SuffixSort::Node) => LSort::Node,
+        SortHint::Nat | SortHint::Suffix(SuffixSort::Nat) => LSort::Nat,
+        SortHint::Msg | SortHint::Suffix(SuffixSort::Msg) | SortHint::Untagged => {
+            LSort::Msg
+        }
+    }
+}
+
+/// Structural alpha-equivalence between a parsed AST term and a runtime
+/// [`LNTerm`], extending `bij`.  Variables match iff their sorts agree
+/// and the bijection stays consistent; everything else must match by
+/// constructor, function symbol, and arity.  AC operators (and the
+/// commutative `em`) match as multisets (a permutation of children that
+/// satisfies the bijection); pairs are flattened on both sides.
+fn term_matches(
+    p: &tamarin_parser::ast::Term,
+    r: &tamarin_term::lterm::LNTerm,
+    bij: &mut VarBijection,
+) -> bool {
+    use tamarin_parser::ast::{BinOp as PBinOp, Term as PTerm};
+    use tamarin_term::function_symbols::{AcSym, FunSym};
+    use tamarin_term::lterm::NameTag;
+    use tamarin_term::term::Term as RTerm;
+    use tamarin_term::vterm::Lit;
+
+    match p {
+        // -- Variable: must match a runtime variable of the same sort. --
+        PTerm::Var(v) => {
+            if let RTerm::Lit(Lit::Var(rv)) = r {
+                bij.bind((v.name.clone(), v.idx), sort_hint_to_lsort(&v.sort), rv)
+            } else {
+                false
+            }
+        }
+        // -- Literal constants: match a runtime `Con(Name)` of the same
+        //    sort.  The skeleton spells them `'x'` / `~'x'` / `%'x'`. --
+        PTerm::PubLit(s) => matches!(
+            r, RTerm::Lit(Lit::Con(n)) if n.tag == NameTag::Pub && n.id.0 == *s
+        ),
+        PTerm::FreshLit(s) => matches!(
+            r, RTerm::Lit(Lit::Con(n)) if n.tag == NameTag::Fresh && n.id.0 == *s
+        ),
+        PTerm::NatLit(s) => matches!(
+            r, RTerm::Lit(Lit::Con(n)) if n.tag == NameTag::Nat && n.id.0 == *s
+        ),
+        // -- Nullary built-in constants (rendered as `0`-ary apps). --
+        PTerm::NumberOne | PTerm::NatOne => matches!(
+            r, RTerm::App(FunSym::NoEq(s), a)
+                if a.is_empty()
+                    && matches!(s.name.as_slice(), b"one" | b"tone")
+        ),
+        PTerm::DhNeutral => matches!(
+            r, RTerm::App(FunSym::NoEq(s), a)
+                if a.is_empty() && s.name == b"DH_neutral"
+        ),
+        // A bare integer literal — accept matching a runtime nat var or a
+        // numeric term; conservatively treat as non-discriminating only
+        // if it isn't a clear structural mismatch.  These do not appear
+        // as goal-fact arguments in practice; require a `Con` nat name.
+        PTerm::Number(_) => false,
+        // -- Application by name. --
+        PTerm::App(name, args) => match r {
+            RTerm::App(FunSym::NoEq(sym), rargs) => {
+                sym.name.as_slice() == name.as_bytes()
+                    && args.len() == rargs.len()
+                    && args
+                        .iter()
+                        .zip(rargs.iter())
+                        .all(|(pa, ra)| term_matches(pa, ra, bij))
+            }
+            // `em(a,b)` is the commutative bilinear pairing — match as a
+            // 2-element multiset.
+            RTerm::App(FunSym::C(_), rargs) if name == "em" => {
+                multiset_match(&pflat_refs(args), rargs, bij)
+            }
+            _ => false,
+        },
+        // -- `op{l}r` algebraic syntax → binary application `op(l, r)`. --
+        PTerm::AlgApp(name, l, rgt) => match r {
+            RTerm::App(FunSym::NoEq(sym), rargs) => {
+                sym.name.as_slice() == name.as_bytes()
+                    && rargs.len() == 2
+                    && term_matches(l, &rargs[0], bij)
+                    && term_matches(rgt, &rargs[1], bij)
+            }
+            _ => false,
+        },
+        // -- `diff(a, b)`. --
+        PTerm::Diff(l, rgt) => match r {
+            RTerm::App(FunSym::NoEq(sym), rargs) if sym.name == b"diff" => {
+                rargs.len() == 2
+                    && term_matches(l, &rargs[0], bij)
+                    && term_matches(rgt, &rargs[1], bij)
+            }
+            _ => false,
+        },
+        // -- Tuple `<a, b, c>` → right-nested binary `pair`. --
+        PTerm::Pair(_) => {
+            let pflat = flatten_pair(p);
+            let rflat = flatten_runtime_pair(r);
+            pflat.len() == rflat.len()
+                && pflat
+                    .iter()
+                    .zip(rflat.iter())
+                    .all(|(pa, ra)| term_matches(pa, ra, bij))
+        }
+        // -- Binary operators. --
+        PTerm::BinOp(op, l, rgt) => {
+            match op {
+                // `^` (exp) → `NoEq exp` binary; positional.
+                PBinOp::Exp => match r {
+                    RTerm::App(FunSym::NoEq(sym), rargs)
+                        if sym.name == b"exp" && rargs.len() == 2 =>
+                    {
+                        term_matches(l, &rargs[0], bij)
+                            && term_matches(rgt, &rargs[1], bij)
+                    }
+                    _ => false,
+                },
+                // AC operators → flat sorted `App(Ac sym, ..)`; multiset.
+                PBinOp::Mult | PBinOp::Union | PBinOp::Xor | PBinOp::NatPlus => {
+                    let want = match op {
+                        PBinOp::Mult => AcSym::Mult,
+                        PBinOp::Union => AcSym::Union,
+                        PBinOp::Xor => AcSym::Xor,
+                        PBinOp::NatPlus => AcSym::NatPlus,
+                        PBinOp::Exp => unreachable!(),
+                    };
+                    match r {
+                        RTerm::App(FunSym::Ac(sym), rargs) if *sym == want => {
+                            let pflat = flatten_ac(p, *op);
+                            multiset_match(&pflat_refs(&pflat), rargs, bij)
+                        }
+                        _ => false,
+                    }
+                }
+            }
+        }
+        // -- SAPIC pattern-match `=t`: compare the inner term. --
+        PTerm::PatMatch(inner) => term_matches(inner, r, bij),
+    }
+}
+
+/// Flatten a parsed tuple `<a, b, <c, d>>` (right-nested binary `pair`)
+/// into its leaf sequence, mirroring HS's `split` on `FPair`.
+fn flatten_pair(t: &tamarin_parser::ast::Term) -> Vec<&tamarin_parser::ast::Term> {
+    use tamarin_parser::ast::Term as PTerm;
+    let mut out = Vec::new();
+    fn go<'a>(t: &'a PTerm, out: &mut Vec<&'a PTerm>) {
+        match t {
+            PTerm::Pair(items) => {
+                let n = items.len();
+                if n == 0 { return; }
+                for it in &items[..n - 1] { out.push(it); }
+                go(&items[n - 1], out);
+            }
+            other => out.push(other),
+        }
+    }
+    go(t, &mut out);
+    out
+}
+
+/// Flatten a runtime right-nested `pair(a, pair(b, c))` chain into its
+/// leaf sequence.
+fn flatten_runtime_pair(
+    t: &tamarin_term::lterm::LNTerm,
+) -> Vec<&tamarin_term::lterm::LNTerm> {
+    use tamarin_term::function_symbols::FunSym;
+    use tamarin_term::term::Term as RTerm;
+    let mut out = Vec::new();
+    let mut cur = t;
+    loop {
+        match cur {
+            RTerm::App(FunSym::NoEq(s), a) if s.name == b"pair" && a.len() == 2 => {
+                out.push(&a[0]);
+                cur = &a[1];
+            }
+            other => {
+                out.push(other);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Flatten a parsed AC binary chain of the same operator into its leaf
+/// args (the parser builds AC as nested binary `BinOp`).
+fn flatten_ac(
+    t: &tamarin_parser::ast::Term,
+    op: tamarin_parser::ast::BinOp,
+) -> Vec<tamarin_parser::ast::Term> {
+    use tamarin_parser::ast::Term as PTerm;
+    let mut out = Vec::new();
+    fn go(t: &PTerm, op: tamarin_parser::ast::BinOp, out: &mut Vec<PTerm>) {
+        match t {
+            PTerm::BinOp(inner, l, r) if *inner == op => {
+                go(l, op, out);
+                go(r, op, out);
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    go(t, op, &mut out);
+    out
+}
+
+fn pflat_refs(v: &[tamarin_parser::ast::Term]) -> Vec<&tamarin_parser::ast::Term> {
+    v.iter().collect()
+}
+
+/// Match a multiset of parsed terms against a multiset of runtime terms
+/// under the shared bijection, by backtracking over assignments.  Used
+/// for AC operators and the commutative `em`, whose runtime children are
+/// sorted (so positional comparison would be unfaithful) but whose
+/// parsed children are in arbitrary syntactic order.
+///
+/// The bijection is mutated in place; on a failed branch we restore it
+/// from a snapshot so alternative pairings start clean.
+fn multiset_match(
+    pterms: &[&tamarin_parser::ast::Term],
+    rterms: &[tamarin_term::lterm::LNTerm],
+    bij: &mut VarBijection,
+) -> bool {
+    if pterms.len() != rterms.len() {
+        return false;
+    }
+    let mut used = vec![false; rterms.len()];
+    ms_go(pterms, rterms, &mut used, bij)
+}
+
+fn ms_go(
+    pterms: &[&tamarin_parser::ast::Term],
+    rterms: &[tamarin_term::lterm::LNTerm],
+    used: &mut [bool],
+    bij: &mut VarBijection,
+) -> bool {
+    let i = match pterms.first() {
+        None => return true,
+        Some(_) => 0,
+    };
+    let p = pterms[i];
+    for (j, r) in rterms.iter().enumerate() {
+        if used[j] {
+            continue;
+        }
+        // Snapshot the bijection so a failed trial assignment doesn't
+        // leak partial bindings into the next candidate.
+        let snap_fwd = bij.fwd.clone();
+        let snap_rev = bij.rev.clone();
+        if term_matches(p, r, bij) {
+            used[j] = true;
+            if ms_go(&pterms[1..], rterms, used, bij) {
+                return true;
+            }
+            used[j] = false;
+        }
+        bij.fwd = snap_fwd;
+        bij.rev = snap_rev;
+    }
+    false
+}
+
 /// Find a [`Goal`] in `sys.goals` that matches the parsed [`GoalSpec`].
 ///
 /// The skeleton's `solve(...)` text identifies a goal by fact NAME and
@@ -747,48 +1125,42 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
                     _ => None,
                 })
                 .collect();
-            if shape_matches.len() == 1 {
-                return Some(shape_matches[0].clone());
-            }
             if shape_matches.is_empty() {
                 return None;
             }
-            // Multiple shape-matches — first disambiguate by TERM text.
-            // The skeleton names the fact arguments (e.g. `!KU( ~n )` vs
-            // `!KU( ~psk )`); HS matches the exact `ActionG i fa` whose
-            // fact equals the parsed one.  Several same-name/arity goals
-            // (notably `!KU(_)` knowledge goals) coexist at one state, so
-            // the term content — not the (unstable) skeleton timepoint —
-            // is the reliable discriminator.  Compare the spec's arg
-            // text against each candidate's rendered terms (canonicalised
-            // for whitespace).
-            let want_args: Vec<String> = fact.args.iter()
-                .map(|a| canonicalise_term_text(&crate::pretty_formula::pretty_term(a)))
-                .collect();
-            let by_terms: Vec<&Goal> = shape_matches.iter().copied()
+            // Narrow to candidates whose TERM STRUCTURE matches the
+            // stored goal (alpha-equivalence, sort-aware — see
+            // `fact_terms_match_structurally`).  HS resolves the parsed
+            // `ActionG i fa` by structural equality against `sys.goals`
+            // (ProofMethod.hs:374); when the stored goal's term is absent
+            // from the drifted system, HS returns `Nothing` and marks the
+            // step invalid (Proof.hs:455-468).  A name+arity match alone
+            // is NOT enough: a stale stored `!KU( ~r1 )` must not bind a
+            // present `!KU( h(...) )` of the same shape — that re-derives
+            // the wrong goal and cascades into a divergent subtree.
+            let by_struct: Vec<&Goal> = shape_matches.iter().copied()
                 .filter(|g| match g {
-                    Goal::Action(_, fa) => {
-                        fa.terms.len() == want_args.len()
-                            && fa.terms.iter().zip(&want_args).all(|(t, w)| {
-                                &canonicalise_term_text(
-                                    &crate::pretty_theory::render_lnterm(t)) == w
-                            })
-                    }
+                    Goal::Action(_, fa) =>
+                        fact_terms_match_structurally(&fact.args, &fa.terms),
                     _ => false,
                 })
                 .collect();
-            if by_terms.len() == 1 {
-                return Some(by_terms[0].clone());
+            if by_struct.is_empty() {
+                // No system goal structurally matches the stored goal —
+                // it's a stale (invalidated) proof step.  Return None so
+                // the caller emits the HS-faithful
+                // `sorry /* invalid proof step encountered */` and keeps
+                // the stored subtree verbatim.
+                return None;
             }
-            if by_terms.len() > 1 {
-                // Same term, different timepoints — fall through to the
-                // time-var / first-match disambiguation over this subset.
+            if by_struct.len() == 1 {
+                return Some(by_struct[0].clone());
             }
-            // Multiple shape-matches — disambiguate by time-var root
-            // name (after stripping the `#` prefix already done by
-            // `try_action_or_premise`).  HS resolves this via the
-            // exact LVar identity in `ActionG i fa`.
-            let by_time: Vec<&Goal> = shape_matches.iter().copied()
+            // Multiple structural matches (e.g. the same `!KU(_)` term at
+            // different timepoints) — disambiguate by time-var root name
+            // (HS resolves this via the exact LVar identity in
+            // `ActionG i fa`).
+            let by_time: Vec<&Goal> = by_struct.iter().copied()
                 .filter(|g| match g {
                     Goal::Action(i, _) => &i.name == time_var,
                     _ => false,
@@ -810,11 +1182,10 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
                 }
                 if let Some(g) = pick { return Some(g.clone()); }
             }
-            // Fallback: time-var didn't disambiguate (e.g. skeleton
-            // shows `#t` but runtime has `#t1`/`#t2` — HS-side names
-            // sometimes lose freshen-suffix annotation).  Pick first
-            // shape-match in source order — same policy as before.
-            Some(shape_matches[0].clone())
+            // Time-var didn't disambiguate (e.g. skeleton shows `#t` but
+            // runtime has `#t1`/`#t2`) — pick first structural match in
+            // source order (creation order in `sGoals`).
+            Some(by_struct[0].clone())
         }
         GoalSpec::Premise { fact, prem_idx, time_var } => {
             // HS `PremiseG (i, v) fa` carries the node-LVar `i` and
@@ -841,39 +1212,30 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
                     _ => None,
                 })
                 .collect();
-            if shape_matches.len() == 1 {
-                return Some(shape_matches[0].clone());
-            }
             if shape_matches.is_empty() {
                 return None;
             }
-            // Multi-match: disambiguate by TERM text first.  When several
-            // premise goals share the same fact name / arity / premise
-            // index (e.g. multiple `Receivable( ... ) ▶₀ #i` goals from
-            // different rule instances), the fact's argument terms are the
-            // reliable discriminator — HS matches the exact parsed
-            // `PremiseG (i,v) fa`.  Compare the spec's rendered argument
-            // terms against each candidate's terms (whitespace-canonical).
-            let want_args: Vec<String> = fact.args.iter()
-                .map(|a| canonicalise_term_text(&crate::pretty_formula::pretty_term(a)))
-                .collect();
-            let by_terms: Vec<&Goal> = shape_matches.iter().copied()
+            // Narrow to candidates whose TERM STRUCTURE matches the
+            // stored goal (alpha-equivalence, sort-aware).  Same rationale
+            // as the Action branch: HS matches the parsed `PremiseG (i,v)
+            // fa` by structural equality; a stale stored premise goal that
+            // no longer exists in the drifted system must be rejected so
+            // the caller emits the invalid-step placeholder.
+            let by_struct: Vec<&Goal> = shape_matches.iter().copied()
                 .filter(|g| match g {
-                    Goal::Premise(_, fa) => {
-                        fa.terms.len() == want_args.len()
-                            && fa.terms.iter().zip(&want_args).all(|(t, w)| {
-                                &canonicalise_term_text(
-                                    &crate::pretty_theory::render_lnterm(t)) == w
-                            })
-                    }
+                    Goal::Premise(_, fa) =>
+                        fact_terms_match_structurally(&fact.args, &fa.terms),
                     _ => false,
                 })
                 .collect();
-            if by_terms.len() == 1 {
-                return Some(by_terms[0].clone());
+            if by_struct.is_empty() {
+                return None;
+            }
+            if by_struct.len() == 1 {
+                return Some(by_struct[0].clone());
             }
             // Multi-match: disambiguate by node-var name.
-            let by_time: Vec<&Goal> = shape_matches.iter().copied()
+            let by_time: Vec<&Goal> = by_struct.iter().copied()
                 .filter(|g| match g {
                     Goal::Premise((node, _), _) => &node.name == time_var,
                     _ => false,
@@ -892,7 +1254,7 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
                 }
                 if let Some(g) = pick { return Some(g.clone()); }
             }
-            Some(shape_matches[0].clone())
+            Some(by_struct[0].clone())
         }
         GoalSpec::Disj { alts, alt_texts } => {
             // HS-faithful: HS parses the `solve(...)` text into a
