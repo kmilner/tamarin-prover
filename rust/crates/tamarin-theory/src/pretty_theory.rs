@@ -1105,6 +1105,16 @@ fn render_lvar(v: &tamarin_term::lterm::LVar) -> String {
     else { format!("{}{}.{}", pre, v.name, v.idx) }
 }
 
+/// Render a timepoint / node id from a (root-name, idx) pair the way HS's
+/// `Show LVar` (Node sort) does: `#name` for idx 0, else `#name.idx`.
+/// Mirrors [`render_lvar`] for a `LSort::Node` var without constructing one;
+/// used by `raw_goal_to_doc` to re-render an unannotated goal head with its
+/// timepoint index preserved (HS `prettyGoal`'s `show i`).
+fn render_node_id_str(name: &str, idx: u32) -> String {
+    if idx == 0 { format!("#{}", name) }
+    else { format!("#{}.{}", name, idx) }
+}
+
 /// Convert LNFacts (post-elaboration) to parser-AST Facts so we can
 /// reuse the parser-AST fact rendering path.  Drops fact annotations.
 fn lnfacts_to_parser(facts: &[crate::fact::LNFact]) -> Vec<p::Fact> {
@@ -2139,6 +2149,20 @@ fn pp_step_doc(
                 .beside_sp(inner)
                 .beside_sp(Doc::text(")"))
         }
+        // A `RawSolve` is the display-only method kept for an unannotated
+        // (replayed) subtree (replay.rs `parsed_to_unannotated`).  HS's
+        // `noSystemPrf` (Proof.hs:469 `mapProofInfo (\i -> (Just i,
+        // Nothing))`) keeps the STRUCTURED `ProofMethod` (`SolveGoal goal`)
+        // unchanged and re-renders it via `prettyProofMethod`
+        // (ProofMethod.hs:1494) → `prettyGoal` (Constraints.hs:273-287),
+        // which RE-WRAPS the goal at the current `lineLength`/`ribbon`.  The
+        // earlier RS path kept the goal's VERBATIM text from the input
+        // `.spthy` file, so any wrapping the stored file carried (e.g. an
+        // `∃ #j.\n  (body)` break, or a fact arg-list broken before `)`)
+        // leaked into the output where HS reflows it inline.  We mirror HS by
+        // re-parsing the goal text into a structured Doc and laying it out
+        // through the same engine the live `SolveGoal` path uses.
+        PM::RawSolve(raw) => raw_solve_to_doc(raw),
         // For non-SolveGoal methods the goal indent argument is unused;
         // reuse `pp_step_at`'s string form.  `by `-prefixed leaf steps
         // (e.g. `by sorry`) render the method at the post-prefix column.
@@ -2314,6 +2338,190 @@ fn render_lnfact_at_with_trailing(fa: &crate::fact::LNFact, indent: usize, line_
     // Convert to parser-AST and reuse the wrap-aware fact renderer.
     let pfa = lnfact_to_parser(fa);
     render_fact_at_with_trailing(&pfa, indent, line_start, trailing_chars)
+}
+
+/// Build the `solve( <goal> )` Doc for an unannotated (replayed) step from
+/// its raw goal text, re-rendering through the HS-faithful Doc engine.
+///
+/// HS `noSystemPrf` (Proof.hs:469) keeps the parsed `SolveGoal goal`
+/// structured, so `prettyProofMethod`/`prettyGoal` re-wraps it fresh.  We
+/// recover the structure from the raw `solve(...)` inner text and route it
+/// through the SAME builders the live-goal path uses
+/// (`pf::fact_doc`/`pf::term_doc`/`pf::disj_goal_to_doc`), so the wrapping
+/// is byte-identical to HS regardless of how the stored `.spthy` was laid
+/// out.  Goal shapes we cannot structurally recover (chain / `Raw`) fall
+/// back to the verbatim text — those goals are short and never wrap, so HS
+/// renders them on one line too.
+fn raw_solve_to_doc(raw: &str) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::Doc;
+    let goal_doc = raw_goal_to_doc(raw);
+    Doc::text("solve(")
+        .beside_sp(goal_doc)
+        .beside_sp(Doc::text(")"))
+}
+
+/// Re-render the goal text inside a `solve( ... )` (the part between the
+/// parens) as a Doc.  Mirrors HS `prettyGoal` (Constraints.hs:273-287) by
+/// reconstructing each goal kind from `parse_goal_spec`
+/// (proof_tree.rs:278) and laying it out with the live-goal builders.
+fn raw_goal_to_doc(raw: &str) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::Doc;
+    use tamarin_parser::ast::GoalSpec;
+    use tamarin_parser::proof_tree::parse_goal_spec;
+    use tamarin_parser::parser::{parse_formula_str, parse_term_str};
+    use crate::guarded::formula_to_guarded;
+
+    let trimmed = raw.trim();
+    match parse_goal_spec(trimmed) {
+        // `prettyGoal (ActionG i fa) = prettyFact fa <-> "@" <-> show i`.
+        // `show i` (HS `Show LVar`) keeps the timepoint idx: `#vk.6`, not
+        // `#vk`.  Reconstruct the node LVar and render via `render_lvar`
+        // (the same renderer the live-goal path uses, render_node_id) so
+        // the head is byte-identical to HS's re-render.
+        GoalSpec::Action { fact, time_var, time_idx } => {
+            reparse_fact_doc(&fact)
+                .beside_sp(Doc::text("@"))
+                .beside_sp(Doc::text(render_node_id_str(&time_var, time_idx)))
+        }
+        // `prettyGoal (PremiseG (i, PremIdx v) fa) =
+        //    prettyLNFact fa <-> "▶"<>subscript v <-> prettyNodeId i`.
+        GoalSpec::Premise { fact, prem_idx, time_var, time_idx } => {
+            reparse_fact_doc(&fact)
+                .beside_sp(Doc::text(format!("\u{25B6}{}", goal_subscript(prem_idx))))
+                .beside_sp(Doc::text(render_node_id_str(&time_var, time_idx)))
+        }
+        // `prettyGoal (DisjG (Disj gfs)) =
+        //    fsep $ punctuate "  ∥" (map (nest 1 . parens . prettyGuarded) gfs)`.
+        // Re-parse each disjunct's text into a Guarded and route through the
+        // same `disj_goal_to_doc` the live path uses.  If ANY disjunct fails
+        // to re-parse, fall back to verbatim (no structural loss vs the prior
+        // behaviour for the rare unparseable case).
+        GoalSpec::Disj { .. } => {
+            match parse_disjuncts_to_guarded(trimmed) {
+                Some(gfs) => pf::disj_goal_to_doc(&gfs),
+                None => Doc::text(trimmed),
+            }
+        }
+        // `prettyGoal (SubtermG (l,r)) = prettyLNTerm l <-> "⊏" <-> prettyLNTerm r`.
+        GoalSpec::Subterm { small_raw, big_raw } => {
+            match (parse_term_str(small_raw.trim()), parse_term_str(big_raw.trim())) {
+                (Ok(l), Ok(r)) => pf::term_doc(&l)
+                    .beside_sp(Doc::text("\u{228F}"))
+                    .beside_sp(pf::term_doc(&r)),
+                _ => Doc::text(trimmed),
+            }
+        }
+        // `splitEqs(N)` and `(#i,n) ~~> (#j,m)` never wrap; keep verbatim.
+        GoalSpec::Split { .. } | GoalSpec::Chain { .. } => Doc::text(trimmed),
+        // Unrecognised goal shapes: a lone guarded formula goal (e.g. a
+        // single quantified alt) parses here.  Try formula→guarded so it
+        // re-wraps like HS's `prettyGuarded`; else keep verbatim.
+        GoalSpec::Raw(_) => {
+            match parse_formula_str(trimmed).ok().and_then(|f| formula_to_guarded(&f).ok()) {
+                Some(g) => pf::disj_goal_to_doc(std::slice::from_ref(&g)),
+                None => Doc::text(trimmed),
+            }
+        }
+    }
+}
+
+/// Render an Action/Premise goal's `Fact` to a Doc, RE-PARSING each
+/// argument's term text into a structured term first.
+///
+/// `parse_goal_spec`'s Action/Premise parser (`build_fact`,
+/// proof_tree.rs:670) is a goal-MATCHING shim — it does NOT parse the
+/// argument terms, instead stuffing each top-level-comma-split arg's RAW
+/// TEXT (incl. any stored newlines / wrapping) into a `Term::Var` name.
+/// Rendering that via `pf::fact_doc` directly would echo the stored layout
+/// verbatim (the dnp3 `senc(<…>)` tuple wrapped exactly as the input file
+/// had it).  Here we re-parse each arg's text with `parse_term_str` so the
+/// fact's terms get their real structure and re-wrap through the Doc engine
+/// like HS's `prettyLNFact`.  If any arg fails to re-parse we keep that
+/// arg's raw text (it still renders, just not re-flowed) — a strictly
+/// no-worse fallback.
+fn reparse_fact_doc(fact: &tamarin_parser::ast::Fact) -> crate::pretty_hpj::Doc {
+    use tamarin_parser::ast::{Fact, Term};
+    use tamarin_parser::parser::parse_term_str;
+    let args: Vec<Term> = fact.args.iter().map(|a| match a {
+        // `build_fact` stored the raw arg text as a `Var` name; re-parse it.
+        Term::Var(v) => parse_term_str(v.name.trim()).unwrap_or_else(|_| a.clone()),
+        other => other.clone(),
+    }).collect();
+    let reparsed = Fact {
+        persistent: fact.persistent,
+        name: fact.name.clone(),
+        args,
+        annotations: fact.annotations.clone(),
+    };
+    pf::fact_doc(&reparsed)
+}
+
+/// Split the `solve(...)` disjunction text at top-level `∥`, re-parsing
+/// each disjunct as a guarded formula (HS `disjSplitGoal` parses each
+/// disjunct as a full `Guarded`, Theory/Text/Parser/Proof.hs:61).  Returns
+/// `None` if any disjunct fails to parse (caller falls back to verbatim).
+fn parse_disjuncts_to_guarded(text: &str) -> Option<Vec<crate::guarded::Guarded>> {
+    use tamarin_parser::parser::parse_formula_str;
+    use crate::guarded::formula_to_guarded;
+    let parts = split_top_level_disj_par(text);
+    let mut out = Vec::with_capacity(parts.len());
+    for p in &parts {
+        let inner = strip_one_outer_paren(p.trim());
+        let f = parse_formula_str(inner).ok()?;
+        let g = formula_to_guarded(&f).ok()?;
+        out.push(g);
+    }
+    Some(out)
+}
+
+/// Split `s` at top-level `∥` (U+2225), ignoring separators inside
+/// `()/[]/{}` brackets.  Mirrors the parser's `split_top_level_disj`
+/// (proof_tree.rs:348) so the disjunct boundaries match `parse_goal_spec`'s.
+fn split_top_level_disj_par(s: &str) -> Vec<String> {
+    const SEP: char = '\u{2225}';
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut depth: i32 = 0;
+    for c in s.chars() {
+        match c {
+            '(' | '[' | '{' => { depth += 1; cur.push(c); }
+            ')' | ']' | '}' => { depth -= 1; cur.push(c); }
+            _ if c == SEP && depth == 0 => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
+}
+
+/// Strip ONE balanced outer `(...)` layer if the whole string is wrapped
+/// in it; otherwise return the string unchanged.  Each disjunct in a
+/// `solve( (g1) ∥ (g2) )` carries its own `opParens` wrap (HS `map opParens`
+/// in `prettyGuarded`'s GDisj, Guarded.hs:836), which `parse_formula_str`
+/// would otherwise re-wrap — strip it so the re-parsed guarded matches the
+/// live-goal `Guarded` (which has no outer-paren node).
+fn strip_one_outer_paren(s: &str) -> &str {
+    let s = s.trim();
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'(' || bytes[bytes.len() - 1] != b')' {
+        return s;
+    }
+    let mut depth: i32 = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                // A depth-0 close before the final char means the leading
+                // `(` does NOT match the trailing `)` — don't strip.
+                if depth == 0 && i != s.len() - 1 {
+                    return s;
+                }
+            }
+            _ => {}
+        }
+    }
+    &s[1..s.len() - 1]
 }
 
 /// Build a `pretty_hpj::Doc` for a non-DisjG `Goal`, mirroring HS

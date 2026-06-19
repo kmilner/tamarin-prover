@@ -277,14 +277,24 @@ pub enum GoalSpec {
     /// `Fact( args... ) @ #ivar` — action goal.
     Action {
         fact: Fact,
+        /// Timepoint variable ROOT name (sigil/idx stripped), e.g. `vk`
+        /// from `#vk.6`.
         time_var: String,
+        /// Timepoint variable index (the `N` in `#vk.N`; `0` when absent).
+        /// HS's `ActionG i fa` carries the full LVar incl. idx, so this is
+        /// needed to re-render the goal head faithfully (`#vk.6`, not `#vk`)
+        /// and for exact goal-key matching at replay time.
+        time_idx: u32,
     },
     /// `Fact( args... ) ▶<idx> #ivar` — premise goal.  The premise
     /// index is the digit after `▶` (UTF-8 ▶₀..▶₉).
     Premise {
         fact: Fact,
         prem_idx: usize,
+        /// Node variable ROOT name (sigil/idx stripped).
         time_var: String,
+        /// Node variable index (the `N` in `#i.N`; `0` when absent).
+        time_idx: u32,
     },
     /// `gf1 ∥ gf2 ∥ ...` — disjunction-split goal.  Mirrors HS
     /// `disjSplitGoal = (DisjG . Disj) <$> sepBy1 guardedFormula

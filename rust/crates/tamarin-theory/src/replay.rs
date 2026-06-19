@@ -1083,7 +1083,7 @@ fn ms_go(
 /// auto-prover.
 fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
     match spec {
-        GoalSpec::Action { fact, time_var } => {
+        GoalSpec::Action { fact, time_var, .. } => {
             // Open Action goals whose fact name matches.  Skip KU
             // (auto-handled) for non-KU goal specs — the skeleton's
             // `solve(...)` always names protocol facts, never `KU(...)`.
@@ -1187,7 +1187,7 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
             // source order (creation order in `sGoals`).
             Some(by_struct[0].clone())
         }
-        GoalSpec::Premise { fact, prem_idx, time_var } => {
+        GoalSpec::Premise { fact, prem_idx, time_var, .. } => {
             // HS `PremiseG (i, v) fa` carries the node-LVar `i` and
             // PremIdx `v`.  Disambiguate by name + arity + prem_idx
             // first, then by time-var root if the (name, arity, idx)
@@ -1701,6 +1701,7 @@ mod tests {
                 annotations: Vec::new(),
             },
             time_var: "t".into(),
+            time_idx: 0,
         };
         let matched = match_goal(&spec, &sys).expect("should match");
         assert!(matches!(matched, Goal::Action(_, _)));
@@ -1724,6 +1725,7 @@ mod tests {
                 annotations: Vec::new(),
             },
             time_var: "t".into(),
+            time_idx: 0,
         };
         assert!(match_goal(&spec, &sys).is_none());
     }
@@ -1767,6 +1769,7 @@ mod tests {
                 annotations: Vec::new(),
             },
             time_var: "t2".into(),
+            time_idx: 0,
         };
         let matched = match_goal(&spec, &sys).expect("should match");
         match matched {
@@ -1786,6 +1789,7 @@ mod tests {
                 annotations: Vec::new(),
             },
             time_var: "t1".into(),
+            time_idx: 0,
         };
         let matched2 = match_goal(&spec2, &sys).expect("should match");
         match matched2 {
@@ -1815,6 +1819,7 @@ mod tests {
             },
             prem_idx: 0,
             time_var: "v".into(),
+            time_idx: 0,
         };
         let matched = match_goal(&spec, &sys).expect("should match");
         match matched {

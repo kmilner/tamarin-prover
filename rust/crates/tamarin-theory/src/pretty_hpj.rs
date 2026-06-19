@@ -1102,6 +1102,46 @@ mod tests {
     }
 
     #[test]
+    fn dnp3_tuple_fill_keystatus_on_first_line() {
+        // dnp3-proven Action goal:
+        //   solve( !KU( senc(<~CDSK_j_USR_O, MDSK_j_USR_O, KSQ.1, $USR,
+        //                     keystatus, CD_j>, ~UK_i_USR_O) ) @ #vk.11 )
+        // HS packs `keystatus,` on the FIRST line of the tuple `fcat`
+        // (the element fits within the ribbon measured from the line
+        // start).  This pins the `fcat` fill-boundary byte-for-byte vs
+        // `Text.PrettyPrint.HughesPJ` at lineLength 110 / ribbon 73.
+        let elems = ["~CDSK_j_USR_O","MDSK_j_USR_O","KSQ.1","$USR","keystatus","CD_j"];
+        let n = elems.len();
+        let mut parts: Vec<Doc> = Vec::new();
+        parts.push(Doc::text("<"));
+        for (i,e) in elems.iter().enumerate() {
+            let mut d = Doc::text(*e);
+            if i+1<n { d = d.beside(Doc::text(", ")); }
+            parts.push(d.nest(1));
+        }
+        parts.push(Doc::text(">"));
+        let tuple = fcat(parts);
+        // senc( tuple , ~UK_i_USR_O ): "senc(" <> fsep(punctuate(",", [tuple,key])) <> ")"
+        let senc_body = fsep(punctuate(Doc::char(','), vec![tuple, Doc::text("~UK_i_USR_O")]));
+        let senc = Doc::text("senc(").beside(senc_body).beside(Doc::text(")"));
+        // !KU( senc ): nestShort' ("!KU(", ")", fsep([senc]))
+        let lead="!KU(";
+        let nku_body = fsep(punctuate(Doc::char(','), vec![senc]));
+        let nn = lead.chars().count() as isize + 1;
+        let above = Doc::text(lead).above(nku_body.nest(nn));
+        let nku = sep(vec![above, Doc::text(")")]);
+        // Action goal: solve( !KU(...) @ #vk.11 )
+        let goal = nku.beside_sp(Doc::text("@")).beside_sp(Doc::text("#vk.11"));
+        let solve = Doc::text("solve(").beside_sp(goal).beside_sp(Doc::text(")"));
+        let out = solve.nest(16).render();
+        let first = out.split('\n').next().unwrap();
+        assert!(
+            first.trim_end().ends_with("keystatus,"),
+            "expected `keystatus,` on the first tuple line; got:\n{out}",
+        );
+    }
+
+    #[test]
     fn fcat_close_bracket_separate_item() {
         // Pattern 1: pair `<a, b, c>` modeled as fcat with `>` as a
         // separate final item.  When the items pack to fit, then add

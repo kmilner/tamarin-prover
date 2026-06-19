@@ -601,15 +601,16 @@ impl<'a> GoalParser<'a> {
                 Some(s) => s,
                 None => { self.lx.set_pos(save); return None; }
             };
-            // Skip `.idx` if present (we only care about the base name
-            // for goal matching at replay time — the System's goal
-            // term will have its own indices).
-            if self.lx.eat_str(".") {
-                let _ = self.lx.natural();
-            }
+            // Capture `.idx` if present (HS's `ActionG i fa` keeps the
+            // full timepoint LVar incl. idx — needed to re-render the head
+            // as `#vk.6` not `#vk`, and for exact goal matching).
+            let tidx = if self.lx.eat_str(".") {
+                self.lx.natural().unwrap_or(0) as u32
+            } else { 0 };
             return Some(GoalSpec::Action {
                 fact: build_fact(persistent, name, &args_text),
                 time_var: tvar,
+                time_idx: tidx,
             });
         }
         // Premise marker: `▶<digit>` — UTF-8 ▶ is `\u{25B6}`, the
@@ -631,13 +632,14 @@ impl<'a> GoalParser<'a> {
                 Some(s) => s,
                 None => { self.lx.set_pos(save); return None; }
             };
-            if self.lx.eat_str(".") {
-                let _ = self.lx.natural();
-            }
+            let tidx = if self.lx.eat_str(".") {
+                self.lx.natural().unwrap_or(0) as u32
+            } else { 0 };
             return Some(GoalSpec::Premise {
                 fact: build_fact(persistent, name, &args_text),
                 prem_idx: idx_val as usize,
                 time_var: tvar,
+                time_idx: tidx,
             });
         }
         self.lx.set_pos(save);
@@ -756,10 +758,11 @@ mod tests {
         let src = "solve( Foo( x ) @ #i )";
         let t = parse_proof_tree(&format!("{} by sorry", src)).expect("parse");
         match &t.method {
-            ParsedMethod::SolveGoal(GoalSpec::Action { fact, time_var }, _) => {
+            ParsedMethod::SolveGoal(GoalSpec::Action { fact, time_var, time_idx }, _) => {
                 assert_eq!(fact.name, "Foo");
                 assert_eq!(fact.args.len(), 1);
                 assert_eq!(time_var, "i");
+                assert_eq!(*time_idx, 0);
             }
             other => panic!("expected Action solve goal, got {:?}", other),
         }
@@ -769,15 +772,32 @@ mod tests {
     }
 
     #[test]
+    fn solve_action_goal_captures_timepoint_idx() {
+        // HS's `ActionG i fa` carries the full timepoint LVar incl. idx;
+        // dropping `.6` would re-render the head as `#vk` (regression) and
+        // break exact goal matching.
+        let src = "solve( !KU( ~AK ) @ #vk.6 )";
+        let t = parse_proof_tree(&format!("{} by sorry", src)).expect("parse");
+        match &t.method {
+            ParsedMethod::SolveGoal(GoalSpec::Action { time_var, time_idx, .. }, _) => {
+                assert_eq!(time_var, "vk");
+                assert_eq!(*time_idx, 6);
+            }
+            other => panic!("expected Action solve goal, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn solve_premise_goal_subscript() {
         // ▶₀ (subscript 0)
         let src = "solve( Server( pid, sid, otc ) \u{25B6}\u{2080} #t1 )";
         let t = parse_proof_tree(&format!("{} by sorry", src)).expect("parse");
         match &t.method {
-            ParsedMethod::SolveGoal(GoalSpec::Premise { fact, prem_idx, time_var }, _) => {
+            ParsedMethod::SolveGoal(GoalSpec::Premise { fact, prem_idx, time_var, time_idx }, _) => {
                 assert_eq!(fact.name, "Server");
                 assert_eq!(*prem_idx, 0);
                 assert_eq!(time_var, "t1");
+                assert_eq!(*time_idx, 0);
             }
             other => panic!("expected Premise solve goal, got {:?}", other),
         }
