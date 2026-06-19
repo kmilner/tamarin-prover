@@ -502,7 +502,16 @@ impl EquationStore {
                 eprintln!("[perform_split]   {:?} → {:?}", k, v);
             }
         }
+        // HS `performSplit` (EquationStore.hs:254) orders the cases via
+        //   orderedSubsts = sortOnMemo dropNameHintsLNSubstVFresh . S.toList
+        // i.e. a STABLE sort, by the substitution's canonical form (fresh range
+        // vars renumbered by first appearance, name hints dropped), of the
+        // `S.toList` (raw `Ord`) sequence. Without the canonical key the order
+        // would track the fresh-allocation counter, which differs between runs
+        // / implementations. `sort()` = `S.toList`; `sort_by_cached_key` is the
+        // stable, memoised `sortOnMemo dropNameHintsLNSubstVFresh`.
         sorted_substs.sort();
+        sorted_substs.sort_by_cached_key(|s| s.drop_name_hints());
         if std::env::var("TAM_DBG_PERFORM_SPLIT").is_ok() {
             eprintln!("[perform_split] sorted result:");
             for (i, s) in sorted_substs.iter().enumerate() {
