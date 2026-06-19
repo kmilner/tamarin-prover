@@ -73,7 +73,62 @@ where
     pub fn len(&self) -> usize { self.map.len() }
 }
 
+/// Rename every variable in `t` to a canonical fresh variable (empty name
+/// hint, sort preserved), assigning indices 0,1,2,… in order of FIRST
+/// appearance, threading `bindings`/`counter` so repeated occurrences (and
+/// later range terms in the same substitution) reuse earlier assignments.
+/// Left-to-right depth-first traversal mirrors HS `mapFrees`/`HasFrees`.
+fn rename_term_drop_hint<C: Clone>(
+    t: &VTerm<C, LVar>,
+    bindings: &mut BTreeMap<LVar, LVar>,
+    counter: &mut u64,
+) -> VTerm<C, LVar> {
+    match t {
+        Term::Lit(Lit::Con(c)) => Term::Lit(Lit::Con(c.clone())),
+        Term::Lit(Lit::Var(v)) => {
+            let nv = match bindings.get(v) {
+                Some(nv) => nv.clone(),
+                None => {
+                    let nv = LVar { name: String::new(), sort: v.sort, idx: *counter };
+                    *counter += 1;
+                    bindings.insert(v.clone(), nv.clone());
+                    nv
+                }
+            };
+            Term::Lit(Lit::Var(nv))
+        }
+        Term::App(sym, args) => {
+            let new_args: Vec<VTerm<C, LVar>> = args
+                .iter()
+                .map(|a| rename_term_drop_hint(a, bindings, counter))
+                .collect();
+            Term::App(sym.clone(), new_args.into())
+        }
+    }
+}
+
 impl<C: Ord + Clone> LSubstVFresh<C> {
+    /// `dropNameHintsLNSubstVFresh` (EquationStore.hs:154-158): the canonical
+    /// form used as the split-case sort key. Renames every RANGE variable to a
+    /// fresh variable with an EMPTY name hint, sort preserved, indices assigned
+    /// 0,1,2,… in order of first appearance across the range terms (visited in
+    /// domain-key order) — mirrors HS `renameDropNamehint` applied to
+    /// `map snd (substToListVFresh s)`. Domain keys are kept unchanged. Two
+    /// substitutions that are α-equivalent in their range map to the same
+    /// canonical form, so a stable `sort_by_cached_key(drop_name_hints)`
+    /// (= HS `sortOnMemo dropNameHintsLNSubstVFresh`) orders the split cases
+    /// structurally, independent of the fresh-allocation counter.
+    pub fn drop_name_hints(&self) -> Self {
+        let mut bindings: BTreeMap<LVar, LVar> = BTreeMap::new();
+        let mut counter: u64 = 0;
+        let renamed: Vec<(LVar, VTerm<C, LVar>)> = self
+            .map
+            .iter()
+            .map(|(k, t)| (k.clone(), rename_term_drop_hint(t, &mut bindings, &mut counter)))
+            .collect();
+        Self::from_list(renamed)
+    }
+
     /// `varsRangeVFresh`: every variable that appears in any range term.
     pub fn vars_range(&self) -> Vec<LVar> {
         let collected: Vec<VTerm<C, LVar>> = self.range().cloned().collect();

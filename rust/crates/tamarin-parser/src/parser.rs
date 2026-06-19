@@ -2273,6 +2273,25 @@ pub fn parse_formula_str(s: &str) -> Result<Formula, ParseError> {
     Ok(f)
 }
 
+/// Parse a standalone term from its source text into the AST [`Term`].
+///
+/// Used by the stored-proof replay matcher (`tamarin-theory::replay`) to
+/// recover the structure of a `solve(...)` goal's fact arguments — which
+/// the lightweight proof-tree skeleton parser captures only as raw text —
+/// so they can be compared structurally (modulo variable renaming) against
+/// the runtime goal terms.  All algebraic operators are enabled at parse
+/// time (see [`Parser::new`]); semantic gating is irrelevant here because
+/// we only need the operator/function shape.
+pub fn parse_term_str(s: &str) -> Result<Term, ParseError> {
+    let mut p = Parser::new(s, &[], false);
+    let t = p.term(false)?;
+    p.skip_ws();
+    if !p.lx.is_eof() {
+        return Err(p.err("trailing garbage in term string"));
+    }
+    Ok(t)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
