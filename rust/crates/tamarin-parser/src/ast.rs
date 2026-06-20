@@ -109,7 +109,6 @@ pub struct Rule {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuleAttr {
     Color(String),
-    Process(String),
     NoDerivCheck,
     Role(String),
     IsSapicRule,

@@ -919,9 +919,14 @@ impl<'a> Parser<'a> {
                 let c = self.lx.hex_color().ok_or_else(|| self.err("expected hex color"))?;
                 attrs.push(RuleAttr::Color(c));
             } else if self.try_kw("process") {
+                // HS `ruleAttribute` (Parser/Rule.hs:72) `parseAndIgnore`s
+                // `process=`: the value is parsed and DISCARDED, leaving
+                // `ruleProcess = Nothing`, so a user-written `process=` is never
+                // rendered.  `process=` is only emitted by HS for
+                // SAPIC-translation-generated rules (via `ruleProcess`, not this
+                // parser).  Mirror that: read and drop the value, push nothing.
                 self.require_punct("=")?;
-                let s = self.read_balanced_token()?;
-                attrs.push(RuleAttr::Process(s));
+                let _ = self.read_balanced_token()?;
             } else if self.try_kw("no_derivcheck") {
                 attrs.push(RuleAttr::NoDerivCheck);
             } else if self.try_kw("role") {

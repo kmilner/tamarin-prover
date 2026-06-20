@@ -695,18 +695,29 @@ fn render_parsed_macros(macros: &[p::Macro]) -> String {
 /// `catMaybes [color, process, no_derivcheck, issapicrule, role]` joined by
 /// `fsep . punctuate comma` (", "), wrapped in `[`..`]`; empty → nothing.
 /// External (`x-…`) attributes are NOT in HS's list, so they are dropped.
-fn render_rule_attributes(attrs: &[p::RuleAttr]) -> String {
+/// Build HS `prettyRuleAttribute`'s ordered part list (Model/Rule.hs:1202-1208).
+///
+/// HS stores the parsed attribute LIST folded into a `RuleAttributes` STRUCT via
+/// its `Semigroup` (Model/Rule.hs:370-385): for the `Maybe`-typed fields
+/// (`ruleColor`, `role`) `preferRight a b = if isJust b then b else a` ⇒ the
+/// LAST occurrence wins.  RS therefore takes the LAST match, not the first
+/// (`rev().find_map(..)`).  `no_derivcheck`/`issapicrule` are booleans combined
+/// with `||`, so order-independent (`.any(..)`).
+///
+/// Render order is the `catMaybes [color, process, no_derivcheck, issapicrule,
+/// role]` of `prettyRuleAttribute`.  HS's attribute parser `parseAndIgnore`s
+/// `process=` (Parser/Rule.hs:72), so a user-written `process=` never sets
+/// `ruleProcess` and is never rendered; RS mirrors this by discarding `process=`
+/// at parse time (no `RuleAttr::Process` variant exists).  `process=` is only
+/// emitted by HS for SAPIC-translation-generated rules (via `ruleProcess`),
+/// which RS does not yet translate, so there is nothing to render here.
+fn rule_attribute_parts(attrs: &[p::RuleAttr]) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
     // color= : HS `text "color=" <> text (rgbToHex c)`; `rgbToHex` is
     // `'#':` + lowercase 2-digit-per-channel hex (Data/Color.hs:141).
-    if let Some(hex) = attrs.iter().find_map(|a| match a {
+    if let Some(hex) = attrs.iter().rev().find_map(|a| match a {
         p::RuleAttr::Color(c) => Some(c), _ => None }) {
         parts.push(format!("color=#{}", hex.trim_start_matches('#').to_lowercase()));
-    }
-    // process= : HS renders the SAPIC process; we emit the stored raw text.
-    if let Some(pr) = attrs.iter().find_map(|a| match a {
-        p::RuleAttr::Process(s) => Some(s), _ => None }) {
-        parts.push(format!("process=\"{}\"", pr));
     }
     if attrs.iter().any(|a| matches!(a, p::RuleAttr::NoDerivCheck)) {
         parts.push("no_derivcheck".to_string());
@@ -714,20 +725,59 @@ fn render_rule_attributes(attrs: &[p::RuleAttr]) -> String {
     if attrs.iter().any(|a| matches!(a, p::RuleAttr::IsSapicRule)) {
         parts.push("issapicrule".to_string());
     }
-    if let Some(r) = attrs.iter().find_map(|a| match a {
+    if let Some(r) = attrs.iter().rev().find_map(|a| match a {
         p::RuleAttr::Role(r) => Some(r), _ => None }) {
         parts.push(format!("role='{}'", r));
     }
+    parts
+}
+
+/// Build the `prettyRuleAttributes` Doc (Model/Rule.hs:1217-1221):
+///   `mempty == ruleAttributes ⇒ emptyDoc`,
+///   else `hcat [text "[", prettyRuleAttribute ru, text "]"]`,
+/// where `prettyRuleAttribute = fsep $ punctuate comma [..]`.  Returning a Doc
+/// (not a flat string) lets the enclosing rule-header line wrap the attribute
+/// list via `fsep` at the ribbon width, exactly as HughesPJ does for HS.
+fn rule_attributes_doc(attrs: &[p::RuleAttr]) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let parts = rule_attribute_parts(attrs);
+    if parts.is_empty() {
+        return Doc::empty();
+    }
+    let part_docs: Vec<Doc> = parts.into_iter().map(Doc::text).collect();
+    // `fsep $ punctuate comma [..]` — comma is `text ","`, and the `fsep`
+    // continuation hangs at the column right after `[` (beside, no space).
+    let inner = hpj::fsep(hpj::punctuate(Doc::text(","), part_docs));
+    Doc::text("[").beside(inner).beside(Doc::text("]"))
+}
+
+/// Flat `[a, b, c]` rendering of the rule attributes (no `fsep` wrapping).
+/// Used for the `/* rule (modulo AC) … */` comment block, whose surrounding
+/// layout is built by string concatenation rather than the Doc engine.  Shares
+/// the last-wins / `process=`-dropping logic via [`rule_attribute_parts`].
+fn render_rule_attributes(attrs: &[p::RuleAttr]) -> String {
+    let parts = rule_attribute_parts(attrs);
     if parts.is_empty() { String::new() } else { format!("[{}]", parts.join(", ")) }
 }
 
 fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro]) -> String {
     let name = &parsed_rule.name;
     let mut out = String::new();
-    out.push_str("rule (modulo E) ");
-    out.push_str(name);
-    out.push_str(&render_rule_attributes(&parsed_rule.attributes));
-    out.push_str(":\n");
+    // HS rule-header line (`prettyNamedRule`, Model/Rule.hs:1285):
+    //   `prefix <-> prettyRuleName ru <> prettyRuleAttributes ru <> colon`
+    // i.e. `"rule (modulo E)" <+> name <> [attrs] <> ":"`.  Routed through the
+    // HughesPJ-faithful Doc engine so the attribute list's `fsep` wraps at the
+    // ribbon width (the continuation hangs right after the `[`), byte-identical
+    // to HS.  `<->`/`<+>` = space, `<>` = no space.
+    {
+        use crate::pretty_hpj::Doc;
+        let header = Doc::text("rule (modulo E)")
+            .beside_sp(Doc::text(name.clone()))
+            .beside(rule_attributes_doc(&parsed_rule.attributes))
+            .beside(Doc::text(":"));
+        out.push_str(&header.render());
+        out.push('\n');
+    }
     // Desugar `let x = t in ...` bindings before rendering — HS does
     // this via `applyMacroInProtoRule`/`expandRuleLetBlock` so the
     // emitted rule contains no bound names from the `let` block.
