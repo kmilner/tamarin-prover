@@ -1630,12 +1630,23 @@ fn unskolemize(
 /// Returns the iteration order over `ms` (a permutation of `0..ms.len()`).
 /// HS's `sortBy` is a stable mergesort; `Vec::sort_by_key` is likewise
 /// stable, so entries with an equal index keep their Maude order.
-fn msubst_iter_order(ms: &MSubst, sort_domain: bool) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..ms.len()).collect();
-    if sort_domain {
-        order.sort_by_key(|&i| (ms[i].0).1);
-    }
-    order
+fn msubst_iter_order(ms: &MSubst, _sort_domain: bool) -> Vec<usize> {
+    // Upstream `c9d456b8` ("More general fix for substitution
+    // canonicalisation") REMOVED the `sortBy (comparing (snd . fst))` from
+    // `msubstToLSubstVFresh` (Maude/Types.hs:131) — both the VFresh
+    // (unify/variants) and VFree (match) conversions now use Maude's RAW
+    // returned order.  The split-disjunction canonicalisation moved into
+    // `performSplit` (`sortOnMemo dropNameHintsLNSubstVFresh`,
+    // EquationStore.hs; mirrored in RS `perform_split`, 631e0a85), which
+    // subsumes the removed sort for SPLIT paths — but NOT for the
+    // variant/unify path.  Keeping the old `00a282da` sort here (the
+    // `sort_domain` branch) left RS sorting variant/unify substs where HS
+    // no longer does, re-breaking the bilinear source-case order on the
+    // rebase (Scott key_secrecy #vk.N source cases).  Mirror upstream: do
+    // NOT sort — return Maude's raw order (RS's Maude command stream is
+    // already aligned to HS, so the raw orders coincide).  `_sort_domain`
+    // is retained for caller compatibility but no longer distinguishes.
+    (0..ms.len()).collect()
 }
 
 /// Match-path conversion (HS `msubstToLSubstVFree`): does NOT canonicalise
