@@ -433,7 +433,7 @@ impl Drop for UserNullaryFunsGuard {
 
 /// True if `name` is registered as a 0-arity function for the current
 /// elaboration.  See `USER_NULLARY_FUNS` for the populating logic.
-fn is_user_nullary_fun(name: &str) -> bool {
+pub(crate) fn is_user_nullary_fun(name: &str) -> bool {
     USER_NULLARY_FUNS.with(|c| c.borrow().contains(name))
 }
 
