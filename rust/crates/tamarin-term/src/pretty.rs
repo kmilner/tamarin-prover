@@ -21,7 +21,9 @@
 
 use std::fmt;
 
-use crate::function_symbols::{AcSym, CSym, FunSym, EMAP_SYM_STRING};
+use crate::function_symbols::{
+    diff_sym, exp_sym, nat_one_sym, pair_sym, AcSym, CSym, FunSym, EMAP_SYM_STRING,
+};
 use crate::lterm::{sort_prefix, LSort, LVar, Name, NameTag};
 use crate::term::Term;
 use crate::vterm::Lit;
@@ -69,22 +71,25 @@ fn pp_term_lnterm(t: &Term<Lit<Name, LVar>>, out: &mut String) {
             }
             out.push(')');
         }
-        Term::App(FunSym::NoEq(sym), ts) if sym.name == b"exp" && ts.len() == 2 => {
+        // Haskell `prettyTerm` matches full `NoEqSym` equality (incl.
+        // privacy/constructability), e.g. `s == expSym` — not just the
+        // name+arity (Term.hs:274-277).
+        Term::App(FunSym::NoEq(sym), ts) if ts.len() == 2 && *sym == exp_sym() => {
             pp_term_lnterm(&ts[0], out);
             out.push('^');
             pp_term_lnterm(&ts[1], out);
         }
-        Term::App(FunSym::NoEq(sym), ts) if sym.name == b"diff" && ts.len() == 2 => {
+        Term::App(FunSym::NoEq(sym), ts) if ts.len() == 2 && *sym == diff_sym() => {
             out.push_str("diff(");
             pp_term_lnterm(&ts[0], out);
             out.push_str(", ");
             pp_term_lnterm(&ts[1], out);
             out.push(')');
         }
-        Term::App(FunSym::NoEq(sym), ts) if sym.name == b"tone" && ts.is_empty() => {
+        Term::App(FunSym::NoEq(sym), ts) if ts.is_empty() && *sym == nat_one_sym() => {
             out.push_str("%1");
         }
-        Term::App(FunSym::NoEq(sym), _) if sym.name == b"pair" => {
+        Term::App(FunSym::NoEq(sym), _) if *sym == pair_sym() => {
             // Flatten right-associated pair trees.
             let mut flat: Vec<&Term<Lit<Name, LVar>>> = Vec::new();
             collect_pair_tail(t, &mut flat);

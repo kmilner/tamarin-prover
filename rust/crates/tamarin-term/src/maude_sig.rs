@@ -131,6 +131,21 @@ impl MaudeSig {
 
     /// Add a context subterm rule.
     pub fn add_ctxt_st_rule(mut self, rule: CtxtStRule) -> Self {
+        // HS-faithful pair mutual-exclusion (`unionExceptPairRules`,
+        // Term/Maude/Signature.hs:135-141): the fst/snd CONSTRUCTOR and
+        // DESTRUCTOR rule variants are mutually exclusive.  `union` (above)
+        // applies this when merging signatures, but user `equations:` are
+        // installed here one rule at a time via plain `insert`, which bypasses
+        // it.  So an exported theory that declares `fst/1[destructor]` + the
+        // pairing equation kept BOTH the base constructor rule AND the user
+        // destructor rule, rendering the equation twice (e.g.
+        // noise/secrecy_4_passiveINpsk1_proof).  Apply the same exclusion here:
+        // inserting a pair destructor rule drops the constructor variant and
+        // vice versa, matching the declared symbol.
+        if rule == fst_dest_rule() { self.st_rules.remove(&fst_rule()); }
+        else if rule == fst_rule() { self.st_rules.remove(&fst_dest_rule()); }
+        else if rule == snd_dest_rule() { self.st_rules.remove(&snd_rule()); }
+        else if rule == snd_rule() { self.st_rules.remove(&snd_dest_rule()); }
         self.st_rules.insert(rule);
         self.refresh()
     }
@@ -144,7 +159,7 @@ impl MaudeSig {
             enable_xor: self.enable_xor || other.enable_xor,
             enable_diff: self.enable_diff || other.enable_diff,
             st_fun_syms: union_except_pair_sym(&self.st_fun_syms, &other.st_fun_syms),
-            st_rules: self.st_rules.union(&other.st_rules).cloned().collect(),
+            st_rules: union_except_pair_rules(&self.st_rules, &other.st_rules),
             macro_names: self.macro_names.union(&other.macro_names).cloned().collect(),
             eq_convergent: false,
             fun_syms: BTreeSet::new(),
@@ -202,6 +217,105 @@ fn union_except_pair_sym(
     }
     let after_fst = remove_if_necessary(a, b, &fst_sym(), &fst_dest_sym());
     remove_if_necessary(&after_fst, b, &snd_sym(), &snd_dest_sym())
+}
+
+/// HS `unionExceptPairRules` (Term/Maude/Signature.hs:135-141):
+///
+///   unionExceptPairRules st1 st2 =
+///       removeIfNecessary (removeIfNecessary st1 st2 fstDestRule fstRule)
+///                         st2 sndRule sndDestRule
+///
+/// The constructor/destructor pair REWRITE RULES are mutually exclusive
+/// exactly like the symbols (`unionExceptPairSym`): whichever variant
+/// `st2` (the right/newly-added operand) carries WINS, and the opposite
+/// variant is removed from `st1`.  Without this, merging `pairing`
+/// (`fstRule`/`sndRule`) with `dest-pairing` (`fstDestRule`/`sndDestRule`)
+/// would keep BOTH variants, emitting both `fst` rewrite variants and
+/// diverging the reducible/irreducible sets from Haskell.
+///
+/// Note the rule version's `removeIfNecessary` argument order differs
+/// from the symbol version: `fstDestRule fstRule` (vs `fstSym fstDestSym`)
+/// and `sndRule sndDestRule` — mirrored faithfully below.
+fn union_except_pair_rules(
+    a: &BTreeSet<CtxtStRule>,
+    b: &BTreeSet<CtxtStRule>,
+) -> BTreeSet<CtxtStRule> {
+    // removeIfNecessary' st1 st2 toAdd toRemove
+    fn remove_if_necessary_prime(
+        st1: &BTreeSet<CtxtStRule>,
+        st2: &BTreeSet<CtxtStRule>,
+        to_add: &CtxtStRule,
+        to_remove: &CtxtStRule,
+    ) -> BTreeSet<CtxtStRule> {
+        if st2.contains(to_add) {
+            let mut out: BTreeSet<CtxtStRule> = st1.clone();
+            out.remove(to_remove);
+            out.extend(st2.iter().cloned());
+            out
+        } else {
+            st1.union(st2).cloned().collect()
+        }
+    }
+    // removeIfNecessary st1 st2 x y
+    fn remove_if_necessary(
+        st1: &BTreeSet<CtxtStRule>,
+        st2: &BTreeSet<CtxtStRule>,
+        x: &CtxtStRule,
+        y: &CtxtStRule,
+    ) -> BTreeSet<CtxtStRule> {
+        let s = remove_if_necessary_prime(st1, st2, x, y);
+        remove_if_necessary_prime(&s, st2, y, x)
+    }
+    let after_fst = remove_if_necessary(a, b, &fst_dest_rule(), &fst_rule());
+    remove_if_necessary(&after_fst, b, &snd_rule(), &snd_dest_rule())
+}
+
+// The four individual constructor/destructor pair rules
+// (Term/Builtin/Rules.hs:101-104), used only by `union_except_pair_rules`.
+// `pair_rules`/`pair_dest_rules` in builtin.rs build the *sets*; these
+// reconstruct the individual `CtxtStRule`s so the union dedup can target
+// them precisely.
+fn fst_rule() -> CtxtStRule {
+    use crate::builtin::{fst, msg_var, pair};
+    use crate::subterm_rule::StRhs;
+    let x1 = msg_var("x", 1);
+    let x2 = msg_var("x", 2);
+    CtxtStRule::new(
+        fst(pair(x1.clone(), x2.clone())),
+        StRhs { positions: vec![vec![0, 0]], term: x1 },
+    )
+}
+fn snd_rule() -> CtxtStRule {
+    use crate::builtin::{msg_var, pair, snd};
+    use crate::subterm_rule::StRhs;
+    let x1 = msg_var("x", 1);
+    let x2 = msg_var("x", 2);
+    CtxtStRule::new(
+        snd(pair(x1.clone(), x2.clone())),
+        StRhs { positions: vec![vec![0, 1]], term: x2 },
+    )
+}
+fn fst_dest_rule() -> CtxtStRule {
+    use crate::builtin::{msg_var, pair};
+    use crate::subterm_rule::StRhs;
+    use crate::term::f_app_no_eq;
+    let x1 = msg_var("x", 1);
+    let x2 = msg_var("x", 2);
+    CtxtStRule::new(
+        f_app_no_eq(fst_dest_sym(), vec![pair(x1.clone(), x2.clone())]),
+        StRhs { positions: vec![vec![0, 0]], term: x1 },
+    )
+}
+fn snd_dest_rule() -> CtxtStRule {
+    use crate::builtin::{msg_var, pair};
+    use crate::subterm_rule::StRhs;
+    use crate::term::f_app_no_eq;
+    let x1 = msg_var("x", 1);
+    let x2 = msg_var("x", 2);
+    CtxtStRule::new(
+        f_app_no_eq(snd_dest_sym(), vec![pair(x1.clone(), x2.clone())]),
+        StRhs { positions: vec![vec![0, 1]], term: x2 },
+    )
 }
 
 // =============================================================================

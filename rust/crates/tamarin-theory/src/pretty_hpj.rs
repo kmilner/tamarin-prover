@@ -12,7 +12,7 @@
 //! shrinkage at each `NilAbove` (HS `get1` line 1011 of pretty-1.1.3.6:
 //! `get1 w sl (NilAbove p) = nilAbove_ (get (w - sl) p)`).
 //!
-//! Defaults: `lineLength = 110` (HS Main/Console.hs:236),
+//! Defaults: `lineLength = 110` (HS src/Main/Console.hs:236),
 //! `ribbonsPerLine = 1.5` (HS HughesPJ.hs:940), giving
 //! `ribbon = round(110/1.5) = 73` (HS HughesPJ.hs:1010).
 //!
@@ -22,11 +22,9 @@
 //! `TextBeside " "` between items.  We also omit annotations
 //! (`AnnotStart`/`AnnotEnd`) — text output only.
 
-#![allow(dead_code)]
-
 use std::rc::Rc;
 
-/// HS `lineLength` from `lib/main/src/Main/Console.hs:236`.
+/// HS `lineLength` from `src/Main/Console.hs:236`.
 pub const LINE_LENGTH: usize = 110;
 /// HS `ribbonLen = round(lineLength / ribbonsPerLine)` =
 /// `round(110/1.5) = 73` (`pretty-1.1.3.6/Text/PrettyPrint/HughesPJ.hs:1010`).
@@ -103,15 +101,12 @@ impl LazyRight {
     }
 }
 
-impl Clone for LazyRight {
-    fn clone(&self) -> Self {
-        // Cloning a half-forced thunk is not supported; LazyRight is only
-        // ever shared via Rc, so this is never called.  Provide a trivial
-        // impl to satisfy `#[derive(Clone)] for Doc` (which clones the Rc,
-        // not the inner LazyRight).
-        unreachable!("LazyRight is shared via Rc and never deep-cloned")
-    }
-}
+// `LazyRight` deliberately does NOT implement `Clone`.  It is only ever
+// shared via `Rc<LazyRight>` inside `Doc`, and `#[derive(Clone)] for Doc`
+// only requires the *fields* (`Rc<LazyRight>`) to be `Clone`, which they
+// always are — the `Rc` clone bumps the refcount without touching the inner
+// thunk.  Omitting the impl turns any stray direct deep-clone of a
+// `LazyRight` value into a compile error rather than a runtime panic.
 
 /// Force a `LazyUnion` into a concrete `Union`; pass other docs through
 /// unchanged.  Called at the head of every consumer that pattern-matches
@@ -201,6 +196,7 @@ impl Doc {
     }
 
     /// Debug: pretty-print the (pre-render) Doc tree structure.
+    #[allow(dead_code)]
     pub fn dbg_tree(&self) -> String {
         let mut s = String::new();
         dbg_node(self, 0, &mut s);
@@ -217,6 +213,7 @@ impl Doc {
     }
 
     /// Debug: dump the post-`get` (chosen-layout) reduced tree.
+    #[allow(dead_code)]
     pub fn dbg_reduced(self, line_length: usize, ribbon: usize) -> String {
         let reduced = reduce_doc(self);
         let best = get_doc(line_length as isize, ribbon as isize, &reduced);
@@ -244,6 +241,7 @@ impl Doc {
 // Smart constructors (internal)
 // ============================================================================
 
+#[allow(dead_code)]
 fn dbg_node(d: &Doc, depth: usize, out: &mut String) {
     let pad = "  ".repeat(depth);
     match d {

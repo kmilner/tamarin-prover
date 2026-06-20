@@ -186,14 +186,18 @@ pub fn replace_proper_subterm<A: Clone, F: FnMut(Term<A>) -> Term<A>>(
 }
 
 // =============================================================================
-// Sized: structural size including AC arg count.
+// TermSize: structural size including AC arg count.
 // =============================================================================
 
-pub trait Sized {
+/// Port of Haskell's `Sized` type class (`Term/Term/Classes.hs`).
+/// Renamed from `Sized` to avoid clashing with the built-in
+/// `std::marker::Sized` marker trait.
+pub trait TermSize {
     fn size(&self) -> usize;
 }
 
-impl<A: Sized> Sized for Term<A> {
+// Port of `instance Sized a => Sized (Term a)` (Term/Term/Raw.hs:235).
+impl<A: TermSize> TermSize for Term<A> {
     fn size(&self) -> usize {
         match self {
             Term::Lit(a) => a.size(),
@@ -202,11 +206,17 @@ impl<A: Sized> Sized for Term<A> {
     }
 }
 
+// Port of `instance Sized (Lit c v) where size _ = 1` (VTerm.hs:95).
+// This is what makes `TermSize` reachable for real `VTerm`/`LNTerm`.
+impl<C, V> TermSize for crate::vterm::Lit<C, V> {
+    fn size(&self) -> usize { 1 }
+}
+
 // Sensible default impls for the literal types we'll actually use.
-impl Sized for u64 { fn size(&self) -> usize { 1 } }
-impl Sized for i64 { fn size(&self) -> usize { 1 } }
-impl Sized for String { fn size(&self) -> usize { 1 } }
-impl Sized for &str { fn size(&self) -> usize { 1 } }
+impl TermSize for u64 { fn size(&self) -> usize { 1 } }
+impl TermSize for i64 { fn size(&self) -> usize { 1 } }
+impl TermSize for String { fn size(&self) -> usize { 1 } }
+impl TermSize for &str { fn size(&self) -> usize { 1 } }
 
 // =============================================================================
 // Tests

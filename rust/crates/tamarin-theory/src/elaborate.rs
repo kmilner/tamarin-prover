@@ -70,6 +70,20 @@ thread_local! {
     /// Public), causing `is_finished` to incorrectly report Solved.
     static USER_PRIVATE_FUNS: RefCell<BTreeSet<String>>
         = const { RefCell::new(BTreeSet::new()) };
+
+    /// Names of user-declared function symbols marked `[destructor]`.
+    /// Populated from `FunctionDecl.destructor` across all arities.
+    /// Read by `term_to_lnterm` when synthesizing the `NoEqSym` for a
+    /// user-defined function application so `Constructability::Destructor`
+    /// propagates through, mirroring Haskell's `naryOpApp`/`lookupArity`
+    /// which reads `(k,priv,cnstr)` from the signature
+    /// (Theory/Text/Parser/Term.hs:61-63,84,92).  `NoEqSym` derives
+    /// Eq/Ord/Hash over `constructability`, and the constructor/
+    /// destructor tag is encoded into the Maude operator name (`XC` vs
+    /// `XD`), so a Constructor-tagged term for a `[destructor]` symbol
+    /// would print as an operator Maude never declared.
+    static USER_DESTRUCTOR_FUNS: RefCell<BTreeSet<String>>
+        = const { RefCell::new(BTreeSet::new()) };
 }
 use tamarin_term::term::{f_app_no_eq, Term};
 use tamarin_term::lterm::{Name, NameTag};
@@ -119,6 +133,13 @@ pub struct GuardDiagnostic {
 /// restriction formula converts to a guarded formula. Returns the
 /// elaborated theory along with any guardedness diagnostics. Mirrors
 /// Haskell's `formulaReports.checkGuarded`.
+///
+/// NOTE: this is an example-only convenience (used by
+/// `examples/elaborate_all.rs`), NOT part of the run.rs prove pipeline,
+/// which uses [`check_guarded_wf`] to produce the byte-exact WF report.
+/// The two perform the same `formula_to_guarded` scan but format their
+/// output differently; keep them in sync if the guardedness check
+/// itself changes.
 pub fn elaborate_with_diagnostics(
     parser_thy: &p::Theory,
 ) -> Result<(Theory, Vec<GuardDiagnostic>), ElabError> {
@@ -154,7 +175,7 @@ pub fn elaborate_with_diagnostics(
 ///     `underlineTopic " Formula guardedness"` at Wellformedness.hs:1004)
 ///   - message layout matching HS's `prettyWfErrorReport` + `checkGuarded`:
 ///
-/// ```
+/// ```text
 ///  Formula guardedness
 /// ====================
 ///
@@ -170,11 +191,13 @@ pub fn elaborate_with_diagnostics(
 ///
 /// HS `msum` semantics: in `formulaReports` the check order is
 /// `checkQuantifiers`, `checkTerms`, `checkGuarded` — the FIRST that
-/// fires for a given formula wins and the others are skipped.  This
-/// function is called with `already_failed_terms = true` for formulas
-/// that already triggered "Formula terms" (checkTerms), so it can skip
-/// the guardedness check for those formulas and preserve the `msum`
-/// semantics.  The caller (run.rs) must filter accordingly.
+/// fires for a given formula wins and the others are skipped.  We do
+/// NOT model that filtering here: this function runs the guardedness
+/// check unconditionally on every lemma/restriction (it takes no
+/// `already_failed_terms`-style parameter and the caller in run.rs
+/// performs no msum filtering — it approximates by running this
+/// unconditionally).  The msum/skip semantics are therefore only
+/// approximated.
 pub fn check_guarded_wf(parser_thy: &p::Theory) -> Vec<tamarin_parser::wf::WfError> {
     use tamarin_parser::wf::underline_topic;
     use crate::pretty_formula::pretty_formula;
@@ -286,48 +309,62 @@ pub fn elaborate(parser_thy: &p::Theory) -> Result<Theory, ElabError> {
             message: format!("predicate expansion failed: {}", e.message),
         });
     }
-    // Collect user-declared arity-1 function names so `term_to_lnterm`'s
-    // auto-tuple branch fires for them as well as the built-in unary
-    // names (h, fst, snd, ...).  Scoped via a guard so concurrent
-    // elaborations on the same thread can't see stale state if one
-    // panics — see `UserUnaryFunsGuard`.
-    let unary_funs: BTreeSet<String> = thy_clone.items.iter().flat_map(|it| {
-        if let p::TheoryItem::Functions(decls) = it {
-            decls.iter().filter(|d| d.arg_types.len() == 1)
-                .map(|d| d.name.clone()).collect::<Vec<_>>()
-        } else { Vec::new() }
-    }).collect();
-    let _guard = UserUnaryFunsGuard::set(unary_funs);
-    // Collect 0-arity function names introduced by user `functions:` and
-    // by any enabled builtin (mirroring Haskell's parser-state-driven
-    // `nullaryApp` lookup).
-    let mut nullary_funs: BTreeSet<String> = thy_clone.items.iter().flat_map(|it| {
-        if let p::TheoryItem::Functions(decls) = it {
-            decls.iter().filter(|d| d.arg_types.is_empty())
-                .map(|d| d.name.clone()).collect::<Vec<_>>()
-        } else { Vec::new() }
-    }).collect();
-    for it in &thy_clone.items {
+    // Collect the user-declared unary / nullary / private / destructor
+    // function-name sets that drive `term_to_lnterm`.  Each is installed
+    // into its thread-local via an RAII guard, scoped so concurrent /
+    // sequential elaborations on the same thread can't bleed stale state.
+    let funs = collect_user_funs(&thy_clone.items);
+    let _guard = UserUnaryFunsGuard::set(funs.unary);
+    let _nullary_guard = UserNullaryFunsGuard::set(funs.nullary);
+    let _private_guard = UserPrivateFunsGuard::set(funs.private);
+    let _destructor_guard = UserDestructorFunsGuard::set(funs.destructor);
+    elaborate_already_expanded(&thy_clone)
+}
+
+/// The four user-declared function-name sets read by `term_to_lnterm`.
+struct CollectedUserFuns {
+    /// Arity-1 user `functions:` names (drives the auto-tuple fold, like
+    /// the built-in unary names h / fst / snd / ...).
+    unary: BTreeSet<String>,
+    /// 0-arity names from user `functions:` plus any enabled builtin's
+    /// 0-arity constants (mirroring HS's parser-state `nullaryApp` lookup).
+    nullary: BTreeSet<String>,
+    /// User `functions:` names marked `private` (any arity); threads
+    /// `Privacy::Private` through synthesized NoEqSyms.
+    private: BTreeSet<String>,
+    /// User `functions:` names marked `[destructor]` (any arity); threads
+    /// `Constructability::Destructor` through synthesized NoEqSyms.
+    destructor: BTreeSet<String>,
+}
+
+/// Single source of truth for collecting the user-declared function-name
+/// sets from a theory's items (shared by `elaborate` and
+/// `set_user_funs_for_theory`).
+fn collect_user_funs(items: &[p::TheoryItem]) -> CollectedUserFuns {
+    let user_names = |pred: fn(&p::FunctionDecl) -> bool| -> BTreeSet<String> {
+        items.iter().flat_map(|it| {
+            if let p::TheoryItem::Functions(decls) = it {
+                decls.iter().filter(|d| pred(d))
+                    .map(|d| d.name.clone()).collect::<Vec<_>>()
+            } else { Vec::new() }
+        }).collect()
+    };
+    let mut nullary = user_names(|d| d.arg_types.is_empty());
+    for it in items {
         if let p::TheoryItem::Builtins(names) = it {
             for n in names {
                 for c in builtin_nullary_constants(n) {
-                    nullary_funs.insert(c.to_string());
+                    nullary.insert(c.to_string());
                 }
             }
         }
     }
-    let _nullary_guard = UserNullaryFunsGuard::set(nullary_funs);
-    // Collect names of user-declared private function symbols (any
-    // arity).  Used by term_to_lnterm to thread Privacy::Private through
-    // synthesized NoEqSyms — without this, `KU(f)` for private nullary
-    // `f` is incorrectly filtered as a known public function.
-    let private_funs: BTreeSet<String> = thy_clone.items.iter().flat_map(|it| {
-        if let p::TheoryItem::Functions(decls) = it {
-            decls.iter().filter(|d| d.private).map(|d| d.name.clone()).collect::<Vec<_>>()
-        } else { Vec::new() }
-    }).collect();
-    let _private_guard = UserPrivateFunsGuard::set(private_funs);
-    elaborate_already_expanded(&thy_clone)
+    CollectedUserFuns {
+        unary: user_names(|d| d.arg_types.len() == 1),
+        nullary,
+        private: user_names(|d| d.private),
+        destructor: user_names(|d| d.destructor),
+    }
 }
 
 /// Extracts the 0-arity NoEq function-symbol names from a `MaudeSig`.
@@ -469,12 +506,50 @@ fn user_fun_privacy(name: &str) -> Privacy {
     })
 }
 
+/// RAII guard for the USER_DESTRUCTOR_FUNS thread-local.
+struct UserDestructorFunsGuard {
+    previous: BTreeSet<String>,
+}
+
+impl UserDestructorFunsGuard {
+    fn set(new: BTreeSet<String>) -> Self {
+        let previous = USER_DESTRUCTOR_FUNS.with(|c| {
+            let mut b = c.borrow_mut();
+            std::mem::replace(&mut *b, new)
+        });
+        UserDestructorFunsGuard { previous }
+    }
+}
+
+impl Drop for UserDestructorFunsGuard {
+    fn drop(&mut self) {
+        USER_DESTRUCTOR_FUNS.with(|c| {
+            *c.borrow_mut() = std::mem::take(&mut self.previous);
+        });
+    }
+}
+
+/// Returns `Constructability::Destructor` if `name` is a user-declared
+/// `[destructor]` function symbol; otherwise `Constructability::Constructor`.
+/// Mirrors Haskell's `lookupArity`, which reads `(k,priv,cnstr)` straight
+/// from the signature (Theory/Text/Parser/Term.hs:61-63,84,92).
+fn user_fun_constructability(name: &str) -> Constructability {
+    USER_DESTRUCTOR_FUNS.with(|c| {
+        if c.borrow().contains(name) {
+            Constructability::Destructor
+        } else {
+            Constructability::Constructor
+        }
+    })
+}
+
 /// Bundles RAII guards for all the user-declared function thread-locals,
 /// scoped to the lifetime of an outer call (typically `prove_lemma`).
 pub struct UserFunsForTheoryGuard {
     _unary: UserUnaryFunsGuard,
     _nullary: UserNullaryFunsGuard,
     _private: UserPrivateFunsGuard,
+    _destructor: UserDestructorFunsGuard,
 }
 
 /// RAII guard that swaps in the 0-arity NoEq function-symbol names from
@@ -509,36 +584,12 @@ impl MaudeSigNullaryGuard {
 /// restores the previous values.  Use from `prove_lemma` so search-
 /// time term conversions see the right per-theory signature info.
 pub fn set_user_funs_for_theory(parser_theory: &p::Theory) -> UserFunsForTheoryGuard {
-    let unary_funs: BTreeSet<String> = parser_theory.items.iter().flat_map(|it| {
-        if let p::TheoryItem::Functions(decls) = it {
-            decls.iter().filter(|d| d.arg_types.len() == 1)
-                .map(|d| d.name.clone()).collect::<Vec<_>>()
-        } else { Vec::new() }
-    }).collect();
-    let mut nullary_funs: BTreeSet<String> = parser_theory.items.iter().flat_map(|it| {
-        if let p::TheoryItem::Functions(decls) = it {
-            decls.iter().filter(|d| d.arg_types.is_empty())
-                .map(|d| d.name.clone()).collect::<Vec<_>>()
-        } else { Vec::new() }
-    }).collect();
-    for it in &parser_theory.items {
-        if let p::TheoryItem::Builtins(names) = it {
-            for n in names {
-                for c in builtin_nullary_constants(n) {
-                    nullary_funs.insert(c.to_string());
-                }
-            }
-        }
-    }
-    let private_funs: BTreeSet<String> = parser_theory.items.iter().flat_map(|it| {
-        if let p::TheoryItem::Functions(decls) = it {
-            decls.iter().filter(|d| d.private).map(|d| d.name.clone()).collect::<Vec<_>>()
-        } else { Vec::new() }
-    }).collect();
+    let funs = collect_user_funs(&parser_theory.items);
     UserFunsForTheoryGuard {
-        _unary: UserUnaryFunsGuard::set(unary_funs),
-        _nullary: UserNullaryFunsGuard::set(nullary_funs),
-        _private: UserPrivateFunsGuard::set(private_funs),
+        _unary: UserUnaryFunsGuard::set(funs.unary),
+        _nullary: UserNullaryFunsGuard::set(funs.nullary),
+        _private: UserPrivateFunsGuard::set(funs.private),
+        _destructor: UserDestructorFunsGuard::set(funs.destructor),
     }
 }
 
@@ -576,11 +627,12 @@ fn elaborate_items(
                     if let Some(sig) = builtin_sig(name) {
                         s = s.merge(sig);
                     }
-                    if name == "diff" || name == "diffie-hellman" {
-                        // ensure dh on
-                        s.enable_dh = true;
-                        s = s.refresh();
-                    }
+                    // NOTE: `diffie-hellman` already arrives with `enable_dh`
+                    // set (its MaudeSig is `dh_maude_sig`, see
+                    // builtinsNames in Theory/Text/Parser/Signature.hs:60),
+                    // and `merge` ORs `enable_dh`, so no explicit force is
+                    // needed here.  `diff` is a header/CLI flag handled via
+                    // `enable_diff_maude_sig`, never a `builtins:` entry.
                     out.items.push(TheoryItem::Translation(
                         TranslationElement::SignatureBuiltin(name.clone())));
                 }
@@ -592,8 +644,12 @@ fn elaborate_items(
                     let priv_ = if d.private { Privacy::Private } else { Privacy::Public };
                     let constr = if d.destructor { Constructability::Destructor } else { Constructability::Constructor };
                     let sym = NoEqSym::new(d.name.as_bytes().to_vec(), arity, priv_, constr);
-                    out.signature.maude_sig =
-                        out.signature.maude_sig.clone().add_fun_sym(sym);
+                    // `add_fun_sym` consumes `self` by value; move the
+                    // current sig out via `take` to avoid a per-declaration
+                    // deep clone of the whole MaudeSig.  Output order and
+                    // dedup are unchanged (same `add_fun_sym` path).
+                    let cur = std::mem::take(&mut out.signature.maude_sig);
+                    out.signature.maude_sig = cur.add_fun_sym(sym);
                 }
             }
             p::TheoryItem::Equations { eqs, convergent } => {
@@ -605,11 +661,26 @@ fn elaborate_items(
                 out.signature.maude_sig.eq_convergent = *convergent;
                 let mut s = out.signature.maude_sig.clone();
                 for eq in eqs {
+                    // Haskell's `equation` parser hard-fails with
+                    // "Not a correct equation: ..." when an LHS=RHS pair
+                    // cannot be converted to a CtxtStRule
+                    // (Theory/Text/Parser/Signature.hs:232-234).  Match
+                    // that failure behaviour rather than silently dropping.
                     let (Some(l), Some(r)) =
-                        (term_to_lnterm(&eq.lhs), term_to_lnterm(&eq.rhs)) else { continue };
+                        (term_to_lnterm(&eq.lhs), term_to_lnterm(&eq.rhs))
+                    else {
+                        return Err(ElabError {
+                            message: "Not a correct equation".to_string(),
+                        });
+                    };
                     let rrule = tamarin_term::rewriting::RRule::new(l, r);
-                    if let Some(ctxt) = tamarin_term::subterm_rule::rrule_to_ctxt_st_rule(&rrule) {
-                        s = s.add_ctxt_st_rule(ctxt);
+                    match tamarin_term::subterm_rule::rrule_to_ctxt_st_rule(&rrule) {
+                        Some(ctxt) => s = s.add_ctxt_st_rule(ctxt),
+                        None => {
+                            return Err(ElabError {
+                                message: "Not a correct equation".to_string(),
+                            });
+                        }
                     }
                 }
                 out.signature.maude_sig = s.refresh();
@@ -639,8 +710,11 @@ fn elaborate_items(
                         Privacy::Private,
                         Constructability::Destructor,
                     );
-                    out.signature.maude_sig =
-                        out.signature.maude_sig.clone().add_macro_sym(sym);
+                    // Move the sig out via `take` (add_macro_sym consumes
+                    // `self`) to avoid a per-macro deep clone; behaviour and
+                    // ordering are identical.
+                    let cur = std::mem::take(&mut out.signature.maude_sig);
+                    out.signature.maude_sig = cur.add_macro_sym(sym);
                     ms.push(LNMacro { name: m.name.clone(), args, body });
                 }
                 if !ms.is_empty() { out.items.push(TheoryItem::Macros(ms)); }
@@ -1055,7 +1129,7 @@ pub fn lnterm_to_term(t: &tamarin_term::lterm::LNTerm) -> p::Term {
                     } else if name == "exp" && parser_args.len() == 2 {
                         // Round-trip the `exp` NoEq head back to parser
                         // `BinOp(Exp, ..)` (the inverse of `term_to_lnterm`'s
-                        // `p::BinOp::Exp` arm at elaborate.rs:1467-1470).
+                        // `p::BinOp::Exp` arm at elaborate.rs:1721-1724).
                         // HS `viewTerm` exposes `exp(b,e)` as
                         // `FApp (NoEq s) [t1,t2] | s == expSym`, and
                         // `prettyTerm` (Term/Term.hs:274) renders that arm as
@@ -1498,7 +1572,7 @@ pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
         p::Term::NumberOne => {
             // HS `fAppOne = fAppNoEq oneSym []` (Term/Term.hs:127); the
             // `"1"` keyword in the term parser dispatches to this
-            // (Theory/Text/Parser/Term.hs:130).  Mirror exactly — emit
+            // (Theory/Text/Parser/Term.hs:134).  Mirror exactly — emit
             // a 0-arity NoEq application of `oneSym`, NOT a public
             // constant.  Treating it as `Lit::Con(Pub,"1")` causes
             // source-case enumeration to mismatch HS's `c_one` rule.
@@ -1541,10 +1615,19 @@ pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
             // KU source-cases (precomputed using the canonical
             // arity-1 signature) never match the runtime arity-3
             // term, leaving e.g. `c_h` out of the case list.
-            // Currently only `h` (from `builtins: hashing`) is
-            // unary; other multi-arg builtins (senc/aenc/sign/...)
-            // are genuinely multi-arg.
-            let unary_builtin = matches!(name.as_str(), "h" | "fst" | "snd" | "inv" | "pk")
+            // Builtin arity-1 NoEq symbols whose surplus comma-separated
+            // args must be folded into a single tuple, mirroring HS's
+            // signature-driven `naryOpApp` (`k == 1`) over `noEqFunSyms`
+            // (Theory/Text/Parser/Term.hs:84-87).  In addition to the
+            // common ones (h / fst / snd / inv / pk), this covers the
+            // less-common builtin unary symbols: `getMessage`
+            // (revealing-signing) and `get_rep` / `report`
+            // (locations-report) — see Term/Builtin/Signature.hs:38-40.
+            // Other multi-arg builtins (senc/aenc/sign/...) are
+            // genuinely multi-arg and are excluded.
+            let unary_builtin = matches!(name.as_str(),
+                    "h" | "fst" | "snd" | "inv" | "pk"
+                    | "getMessage" | "get_rep" | "report")
                 || is_user_unary_fun(name.as_str());
             let new_args: Option<Vec<_>> = args.iter().map(term_to_lnterm).collect();
             let mut new_args = new_args?;
@@ -1586,7 +1669,7 @@ pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
                 return Some(tamarin_term::builtin::emap(a, b));
             }
             let sym = NoEqSym::new(name.as_bytes().to_vec(), new_args.len(),
-                user_fun_privacy(name), Constructability::Constructor);
+                user_fun_privacy(name), user_fun_constructability(name));
             Some(f_app_no_eq(sym, new_args))
         }
         p::Term::Pair(items) => {
@@ -1608,8 +1691,11 @@ pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
             // use this for senc/aenc/sign/mac.
             let aa = term_to_lnterm(a)?;
             let bb = term_to_lnterm(b)?;
+            // Haskell `binaryAlgApp` also reads `(k,priv,cnstr)` from the
+            // signature via `lookupArity` (Theory/Text/Parser/Term.hs:101),
+            // so thread user privacy/constructability here too.
             let sym = NoEqSym::new(name.as_bytes().to_vec(), 2,
-                Privacy::Public, Constructability::Constructor);
+                user_fun_privacy(name), user_fun_constructability(name));
             Some(f_app_no_eq(sym, vec![aa, bb]))
         }
         p::Term::Diff(a, b) => {

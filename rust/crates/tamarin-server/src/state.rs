@@ -9,8 +9,10 @@
 //! used for accessor helpers (lemma list, restriction count, …).
 //!
 //! Concurrency: `parking_lot::Mutex` — interactive single-user UI, no
-//! need for an async lock.  Proof runs spawn off `tokio::task::spawn_blocking`
-//! anyway so they don't park the runtime.
+//! need for an async lock.  Only the autoprover (`autoprove` /
+//! `autoprove_all`) offloads its work onto `tokio::task::spawn_blocking`;
+//! interactive single-step applies and proof-state materialization run
+//! inline on the async handler thread.
 
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
@@ -47,7 +49,7 @@ pub struct TheoryEntry {
     /// would land here once we route them through the server).
     pub errors_html: String,
     /// Live proof state — built lazily on first request that needs it
-    /// (theory load → only kept-around-but-empty until `prove_state`
+    /// (theory load → only kept-around-but-empty until `ensure_proof_state`
     /// is asked for).  `None` here means "not yet built"; on first
     /// access we boot Maude and precompute the per-lemma initial
     /// systems.  Building this eagerly at load time would cost ~1s
@@ -90,12 +92,8 @@ impl TheoryStore {
     /// Insert a new theory and return the freshly assigned index.
     pub fn insert(&self, mut entry: TheoryEntry) -> usize {
         let mut inner = self.inner.lock();
-        let idx = if inner.by_idx.is_empty() {
-            1
-        } else {
-            // Match Haskell's `M.findMax + 1`.
-            inner.by_idx.keys().last().copied().unwrap_or(0) + 1
-        };
+        // Match Haskell's `M.findMax + 1` (BTreeMap max key); empty → 1.
+        let idx = inner.by_idx.keys().next_back().map_or(1, |k| k + 1);
         entry.idx = idx;
         inner.by_idx.insert(idx, entry);
         idx
@@ -168,15 +166,17 @@ impl TheoryStore {
     }
 
     /// Replace the entry at `idx` in place, keeping the idx the same.
-    /// Mirrors Haskell `replaceTheory` (`src/Web/Handler.hs` — used by
-    /// `reload` and `editProof`).  Returns the same `idx` on success
-    /// or `None` if no entry exists.
+    /// Mirrors Haskell `replaceTheory` (`src/Web/Handler.hs:307-318` —
+    /// used by `reload` and `editProof`).  Like `replaceTheory`'s
+    /// `M.insert idx newThy theories`, this inserts unconditionally
+    /// (creating the entry if `idx` is currently absent), and forces
+    /// `primary = false` to match `replaceTheory`'s hard-coded `False`
+    /// for the `primary` field (so a reloaded theory shows as
+    /// "Modified", not "Original").  Always returns `Some(idx)`.
     pub fn replace_at(&self, idx: usize, mut entry: TheoryEntry) -> Option<usize> {
         let mut inner = self.inner.lock();
-        if !inner.by_idx.contains_key(&idx) {
-            return None;
-        }
         entry.idx = idx;
+        entry.primary = false;
         inner.by_idx.insert(idx, entry);
         Some(idx)
     }
@@ -189,14 +189,30 @@ impl TheoryStore {
         idx: usize,
         maude_path: &str,
     ) -> Result<Arc<ProofState>, String> {
+        // Fast path: already materialised.  Clone out the `Arc<Theory>`
+        // we need, then release the store lock before the ~1s
+        // `ProofState::new` (Maude boot + source precompute) so unrelated
+        // handlers — and other tokio workers — aren't blocked for its
+        // duration.
+        let parser_theory = {
+            let inner = self.inner.lock();
+            let entry = inner.by_idx.get(&idx)
+                .ok_or_else(|| format!("theory index {} not found", idx))?;
+            if let Some(ps) = &entry.proof_state {
+                return Ok(ps.clone());
+            }
+            entry.parser_theory.clone()
+        };
+        let ps = Arc::new(ProofState::new(&parser_theory, maude_path)?);
+        // Re-lock and double-check: another thread may have built (and
+        // stored) the proof state while we held no lock.  If so, prefer
+        // the already-stored one so all callers share a single instance.
         let mut inner = self.inner.lock();
         let entry = inner.by_idx.get_mut(&idx)
             .ok_or_else(|| format!("theory index {} not found", idx))?;
-        if let Some(ps) = &entry.proof_state {
-            return Ok(ps.clone());
+        if let Some(existing) = &entry.proof_state {
+            return Ok(existing.clone());
         }
-        let ps = Arc::new(
-            ProofState::new(&entry.parser_theory, maude_path)?);
         entry.proof_state = Some(ps.clone());
         Ok(ps)
     }

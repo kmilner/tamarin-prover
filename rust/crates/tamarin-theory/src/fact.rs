@@ -131,7 +131,7 @@ pub fn fact_tag_arity(t: &FactTag) -> usize {
 }
 
 pub fn fact_tag_multiplicity(t: &FactTag) -> Multiplicity {
-    // Mirror Haskell's `factTagMultiplicity` (Fact.hs:340-344):
+    // Mirror Haskell's `factTagMultiplicity` (Fact.hs:353-358):
     //
     //   factTagMultiplicity tag = case tag of
     //       ProtoFact multi _ _ -> multi
@@ -139,17 +139,8 @@ pub fn fact_tag_multiplicity(t: &FactTag) -> Multiplicity {
     //       KDFact              -> Persistent
     //       _                   -> Linear
     //
-    // KU/KD encode adversary knowledge — they're inherently reusable.
-    // Treating them as Linear caused `plain_route` in
-    // `enforce_fresh_ordering_pass` to walk THROUGH coerce/destructor
-    // nodes (which output KU/KD) extending the data-flow chain past
-    // its proper end.  That made `enhancedLesses` end at coerce
-    // node-ids on both sides of a fresh-supplier pair, producing the
-    // cyclic `vk:0 < vk:2` + `vk:2 < vk:0` Less-relation on
-    // CR.spthy::executable (wrong-VERDICT, task #129 regression).
-    // HS's route stops at the KU/KD conclusion, ending the chain at
-    // the destructor's predecessor (irecv) — distinct chain ends, no
-    // cycle.
+    // KU/KD are Persistent because adversary knowledge is inherently
+    // reusable.
     match t {
         FactTag::Proto(m, _, _) => *m,
         FactTag::Ku | FactTag::Kd => Multiplicity::Persistent,
@@ -166,7 +157,10 @@ impl<T> Fact<T> {
     pub fn is_persistent(&self) -> bool { fact_tag_multiplicity(&self.tag) == Multiplicity::Persistent }
     pub fn is_proto(&self) -> bool { matches!(self.tag, FactTag::Proto(_, _, _)) }
     pub fn is_in_fact(&self) -> bool { self.tag == FactTag::In }
-    pub fn is_klog(&self) -> bool {
+    /// True for KU/KD/Ded facts. NB: this is NOT Haskell `isKLogFact`
+    /// (which is `isProtoFact && factTagName == "K"`, Fact.hs:319-320);
+    /// the production KU/KD test is `is_k_fact`.
+    pub fn is_k_or_ded_log(&self) -> bool {
         matches!(self.tag, FactTag::Ku | FactTag::Kd | FactTag::Ded)
     }
     pub fn is_k_fact(&self) -> bool {
@@ -271,8 +265,8 @@ mod tests {
     fn k_fact_categorisation() {
         assert!(ku_fact(msg_var("x", 0)).is_ku());
         assert!(kd_fact(msg_var("x", 0)).is_kd());
-        assert!(ku_fact(msg_var("x", 0)).is_klog());
-        assert!(!fresh_fact(msg_var("x", 0)).is_klog());
+        assert!(ku_fact(msg_var("x", 0)).is_k_or_ded_log());
+        assert!(!fresh_fact(msg_var("x", 0)).is_k_or_ded_log());
     }
 
     // =========================================================================
@@ -348,16 +342,16 @@ mod tests {
         assert!(kd.is_kd() && !kd.is_ku());
     }
 
-    /// `is_klog` is true for KU, KD, and Ded facts and false for
+    /// `is_k_or_ded_log` is true for KU, KD, and Ded facts and false for
     /// Proto/Fresh/In/Out/Term.  (Note: this does NOT mirror Haskell
     /// `isKLogFact`, which is true only for a ProtoFact named "K".)
     #[test]
-    fn is_klog_only_for_ku_or_kd() {
+    fn is_k_or_ded_log_only_for_ku_kd_ded() {
         let x = msg_var("x", 0);
-        assert!(ku_fact(x.clone()).is_klog());
-        assert!(kd_fact(x.clone()).is_klog());
-        assert!(!fresh_fact(x.clone()).is_klog());
+        assert!(ku_fact(x.clone()).is_k_or_ded_log());
+        assert!(kd_fact(x.clone()).is_k_or_ded_log());
+        assert!(!fresh_fact(x.clone()).is_k_or_ded_log());
         let proto = proto_fact(Multiplicity::Linear, "P", vec![x]);
-        assert!(!proto.is_klog());
+        assert!(!proto.is_k_or_ded_log());
     }
 }

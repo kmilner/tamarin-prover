@@ -13,9 +13,17 @@
 //!
 //!   For each rule R indexed by idx:
 //!     1. Drop ALL rules/lemmas/restrictions from the theory.
-//!     2. `makeFunsPublic`: rewrite every private NoEq fun-sym to public,
-//!        because the synthetic rule emits Out facts and the intruder must
-//!        be able to apply destructors.
+//!     2. `replacePrivate`: rewrite every private NoEq fun-sym to public
+//!        (HS `MessageDerivationChecks.hs:46,94-98` maps `replacePrivate`
+//!        over the Out terms; the synthetic theory is also closed over a
+//!        public signature).  This is needed because the synthetic rule
+//!        emits Out facts and the intruder must be able to apply former-
+//!        private destructors.  In RS, symbol privacy is resolved at
+//!        elaborate time from `FunctionDecl.private`, so `synthesise_probe_
+//!        theory` flips every copied Functions decl to `private: false`,
+//!        which has the same combined effect.  (HS `makeFunsPublic` is a
+//!        misnomer — it only does SignatureWithMaude→SignaturePure and does
+//!        NOT flip privacy; only `replacePrivate` does.)
 //!     3. Add a single generated rule:
 //!          rule Generated_<idx>:
 //!            [ Fr(~v1), Fr(~v2), ... ]                  // each free var of R
@@ -72,6 +80,19 @@ pub fn check_message_derivation(
     // `originalRules = map (applyMacroInProtoRule ...)`).
     let nullary_funs = collect_all_nullary_fun_names(parsed);
 
+    // Theory-level `macros:` declarations.  HS expands these into every
+    // protocol rule via `applyMacroInProtoRule (theoryMacros thy)`
+    // (MessageDerivationChecks.hs:39) BEFORE collecting free vars / building
+    // the probe.  The caller hands us the RAW parsed theory (theory macros
+    // un-expanded), so we must expand them here ourselves; otherwise a rule
+    // whose body uses a macro that introduces fresh vars (e.g.
+    // `macros: test() = ~x`) mis-collects vars and the rule is silently
+    // skipped.
+    let theory_macros: Vec<p::Macro> = parsed.items.iter().flat_map(|i| match i {
+        p::TheoryItem::Macros(ms) => ms.clone(),
+        _ => Vec::new(),
+    }).collect();
+
     let mut per_rule: Vec<(String, Vec<String>)> = Vec::new();
     let mut rule_count = 0usize;
     let mut var_count = 0usize;
@@ -81,14 +102,40 @@ pub fn check_message_derivation(
         if raw_rule.attributes.iter().any(|a| matches!(a, p::RuleAttr::NoDerivCheck)) {
             continue;
         }
-        // HS applies macros (which include let-bindings) before the
-        // deriv check (MessageDerivationChecks.hs:39 -- `originalRules
-        // = map (applyMacroInProtoRule (theoryMacros thy)) $
-        // theoryRules thy`).  Mirror that here: substitute let-bound
-        // names so we walk the same shape HS does.  Without this, RS
-        // flags every let-bound name (`pkB`, `mtr`, `ci2`, ...) as
-        // non-derivable.
-        let expanded = crate::elaborate::apply_let_block(raw_rule);
+        // HS applies theory macros before the deriv check
+        // (MessageDerivationChecks.hs:39 -- `originalRules = map
+        // (applyMacroInProtoRule (theoryMacros thy)) $ theoryRules thy`).
+        // Mirror that here: first expand theory-level `macros:` into the
+        // rule's premise/action/conclusion facts (the only parts the deriv
+        // check inspects), THEN substitute the rule-local `let { }` block.
+        // Theory macros are a DISTINCT AST node (`TheoryItem::Macros`) from
+        // the rule-local let-block (`Rule.let_block`); both must be resolved
+        // so we walk the same shape HS does.  Without macro expansion, a rule
+        // whose body uses a fresh-introducing macro is silently skipped; and
+        // without let-block substitution, RS flags every let-bound name
+        // (`pkB`, `mtr`, `ci2`, ...) as non-derivable.
+        let macro_expanded;
+        let macro_src = if theory_macros.is_empty() {
+            raw_rule
+        } else {
+            let mut r = raw_rule.clone();
+            for f in &mut r.premises {
+                *f = crate::macro_expand::apply_macros_fact(&theory_macros, f);
+            }
+            for f in &mut r.actions {
+                *f = crate::macro_expand::apply_macros_fact(&theory_macros, f);
+            }
+            for f in &mut r.conclusions {
+                *f = crate::macro_expand::apply_macros_fact(&theory_macros, f);
+            }
+            for b in &mut r.let_block {
+                b.value = crate::macro_expand::apply_macros_term(&theory_macros, &b.value);
+                b.var = crate::macro_expand::apply_macros_term(&theory_macros, &b.var);
+            }
+            macro_expanded = r;
+            &macro_expanded
+        };
+        let expanded = crate::elaborate::apply_let_block(macro_src);
         let rule = &expanded;
         let free_vars = collect_rule_free_vars(rule, &nullary_funs);
         if free_vars.is_empty() { continue; }
@@ -123,16 +170,17 @@ pub fn check_message_derivation(
         // per probe theory (HS `MessageDerivationChecks.hs:40-44`
         // calls `closeTheoryWithMaude` once per modified theory; then
         // `proveTheory` walks the N lemmas reusing the closed theory's
-        // sources/cache — `Prover.hs:260-279`).  Build the
-        // `ProofContext` + run `ensure_saturated()` ONCE per probe,
-        // then iterate the per-variable lemmas reusing it.  Previously
-        // each `prove_lemma` call rebuilt the context and re-saturated;
-        // on wireguard's bigger probes that was ~80% of the deriv-check
-        // wall-clock.
-        let undecidable = match prove_probe(&probe, maude.clone(), idx, &free_vars, timeout, dbg_timing, &rule.name, &mut total_prove, &mut var_count) {
-            Some(u) => u,
+        // sources/cache — `Prover.hs:260-279`).  `prove_probe` mirrors
+        // this: build the `ProofContext` + run `ensure_saturated()` ONCE
+        // per probe, then iterate the per-variable lemmas reusing it.
+        let outcome = match prove_probe(&probe, maude.clone(), idx, &free_vars, timeout, dbg_timing, &rule.name) {
+            Some(o) => o,
             None => continue,
         };
+        // Fold the probe's debug-only timing/count into the running totals.
+        total_prove += outcome.prove_time;
+        var_count += outcome.var_count;
+        let undecidable = outcome.undecidable;
         if dbg_timing {
             eprintln!(
                 "[deriv-timing] rule={} synth={:.3}s nvars={} total_prove={:.3}s",
@@ -195,7 +243,11 @@ fn collect_all_nullary_fun_names(thy: &p::Theory) -> std::collections::BTreeSet<
 }
 
 /// All variables that appear anywhere in a rule's premise / action /
-/// conclusion terms, in first-occurrence order, deduped, EXCLUDING:
+/// conclusion terms, deduped and returned sorted by HS `LVar` Ord
+/// (idx, then sort, then name) — matching HS `frees`/`S.toList`, which
+/// yields elements in ascending LVar Ord.  (Internally the dedup pass
+/// collects in first-occurrence order, but the result is re-sorted before
+/// return.)  EXCLUDING:
 ///   - `Pub`-sort vars (`$x`) — HS's `deleteGlobals` drops these:
 ///     they are adversary-known by definition.
 ///   - `Node`-sort vars (`#i`) — timepoints, not message vars.
@@ -328,6 +380,7 @@ fn collect_term_vars(t: &p::Term, out: &mut Vec<p::VarSpec>) {
 
 /// Build the per-rule probe theory:
 ///
+/// ```text
 ///   theory Probe_<idx>
 ///     <copy of original signature: builtins, functions, equations, macros>
 ///
@@ -338,9 +391,11 @@ fn collect_term_vars(t: &p::Term, out: &mut Vec<p::VarSpec>) {
 ///
 ///     lemma deriv_check_<idx>_<v>: exists-trace
 ///       "Ex v1 v2 ... #t0 #t1. Generated_<idx>(...) @ #t0 & KU(v) @ #t1"
-///     ...one per free var...  (two distinct timepoints; the knowledge
-///     predicate is `KU`, not `K` — consistent with the module header
-///     and the inline comment in the body.)
+/// ```
+///
+/// ...one per free var...  (two distinct timepoints; the knowledge
+/// predicate is `KU`, not `K` — consistent with the module header
+/// and the inline comment in the body.)
 fn synthesise_probe_theory(
     src: &p::Theory,
     rule: &p::Rule,
@@ -354,10 +409,34 @@ fn synthesise_probe_theory(
         items: Vec::new(),
     };
     // Carry over the signature items.  Drops rules/lemmas/restrictions.
+    //
+    // HS rewrites every private function symbol to public for the probe
+    // theory.  It does this two ways that, in the RS model, collapse into
+    // one: `replacePrivate` rewrites `FApp (NoEq (..,Private,..))` → Public
+    // on the Out terms (MessageDerivationChecks.hs:46,94-98), and the
+    // synthetic theory is closed over a signature in which those symbols are
+    // public, so the intruder may apply former-private destructors.  In RS,
+    // symbol privacy is NOT embedded per-occurrence in the parser AST; it is
+    // resolved at elaborate time from `FunctionDecl.private` (elaborate.rs
+    // `set_user_funs_for_theory`).  So flipping every copied Functions decl
+    // to `private: false` makes the elaborator treat those symbols as public
+    // EVERYWHERE — in the rule's Out terms AND in intruder-rule generation —
+    // which is exactly the combined effect of `replacePrivate` + closing
+    // over a public signature.  Without this, a variable derivable only via a
+    // private function is spuriously flagged "Failed to derive Variable(s)".
     for it in &src.items {
         match it {
+            p::TheoryItem::Functions(decls) => {
+                let public_decls: Vec<p::FunctionDecl> = decls.iter()
+                    .map(|d| {
+                        let mut d = d.clone();
+                        d.private = false;
+                        d
+                    })
+                    .collect();
+                probe.items.push(p::TheoryItem::Functions(public_decls));
+            }
             p::TheoryItem::Builtins(_)
-            | p::TheoryItem::Functions(_)
             | p::TheoryItem::Equations { .. }
             | p::TheoryItem::Macros(_) => {
                 probe.items.push(it.clone());
@@ -404,8 +483,13 @@ fn synthesise_probe_theory(
             annotations: Vec::new(),
         })
         .collect();
+    // HS `generateAction vars idx = protoFact Persistent ("Generated_" ++
+    // show idx) (...)` (MessageDerivationChecks.hs:185) — the Generated fact
+    // is Persistent.  For a ProtoFact the multiplicity rides in the tag, and
+    // both the probe rule's action and the lemma's action atom are built from
+    // this same `action`, so they stay mutually consistent.  Match HS exactly.
     let action = p::Fact {
-        persistent: false,
+        persistent: true,
         name: format!("Generated_{}", idx),
         args: probe_vars.iter().map(|v| p::Term::Var(v.clone())).collect(),
         annotations: Vec::new(),
@@ -483,6 +567,18 @@ fn synthesise_probe_theory(
     probe
 }
 
+/// Result of probing a single rule: the non-derivable variable names plus
+/// debug-only timing/count accumulators (folded into the caller's running
+/// totals at the call site).
+struct ProbeOutcome {
+    /// Variable names whose lemma did NOT find a trace (= non-derivable).
+    undecidable: Vec<String>,
+    /// Wall-clock spent in `run_proof_search` across this probe's lemmas.
+    prove_time: Duration,
+    /// Number of per-variable proof attempts made for this probe.
+    var_count: usize,
+}
+
 /// HS-faithful per-probe prover.  Builds the elaborated probe theory
 /// and a single `ProofContext` (with one `ensure_saturated` call),
 /// then iterates the per-variable lemmas, invoking `run_proof_search`
@@ -493,8 +589,8 @@ fn synthesise_probe_theory(
 /// in `MessageDerivationChecks.hs:40-44`) followed by `proveTheory`'s
 /// per-lemma walk (`Prover.hs:260-279`).  Returns `None` on elaboration
 /// failure (caller continues to the next probe rule); otherwise returns
-/// the list of variable names whose lemma did NOT find a trace
-/// (= non-derivable variables).
+/// a `ProbeOutcome` whose `undecidable` lists the variable names whose
+/// lemma did NOT find a trace (= non-derivable variables).
 fn prove_probe(
     probe: &p::Theory,
     maude: MaudeHandle,
@@ -503,9 +599,7 @@ fn prove_probe(
     timeout: Duration,
     dbg_timing: bool,
     rule_name: &str,
-    total_prove: &mut Duration,
-    var_count: &mut usize,
-) -> Option<Vec<String>> {
+) -> Option<ProbeOutcome> {
     use crate::constraint::solver::context::ProofContext;
     use crate::constraint::solver::search::{run_proof_search, NodeStatus};
     use crate::constraint::system::{formula_to_system, SourceKind};
@@ -541,6 +635,8 @@ fn prove_probe(
     ctx.ensure_saturated();
 
     let mut undecidable = Vec::new();
+    let mut prove_time = Duration::ZERO;
+    let mut var_count = 0usize;
     for (k, v) in free_vars.iter().enumerate() {
         // Lemma name keyed by free-var INDEX (matches synthesise_probe_theory);
         // the reported var name below uses the ORIGINAL `v` (sort + name).
@@ -564,10 +660,24 @@ fn prove_probe(
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_proof_search(&ctx, sys, 1000)
         }));
+        // A panic inside the prover is an INTERNAL bug, not a timeout
+        // (timeouts return a non-Solved status, not a panic).  Log it to
+        // stderr so it isn't silently mis-reported to the user as a
+        // "Failed to derive Variable(s)" wellformedness result.  We still
+        // fall through to `ok = false` (the variable is left in the report)
+        // to preserve the existing conservative behaviour.
+        if result.is_err() {
+            eprintln!(
+                "[deriv] WARNING: solver panicked while checking derivability of \
+                 variable `{}` in rule `{}`; reporting it as non-derivable. \
+                 This is an internal prover bug, not necessarily a theory problem.",
+                v.name, rule_name,
+            );
+        }
         let ok = matches!(result, Ok(ref n) if matches!(n.status, NodeStatus::Solved));
         let prove_dt = t_prove.elapsed();
-        *total_prove += prove_dt;
-        *var_count += 1;
+        prove_time += prove_dt;
+        var_count += 1;
         if dbg_timing {
             eprintln!(
                 "[deriv-timing] rule={} var={} prove={:.3}s ok={}",
@@ -575,20 +685,10 @@ fn prove_probe(
             );
         }
         if !ok {
-            // HS reports `show LVar` — sort prefix included
-            // (MessageDerivationChecks.hs:138,156).
-            let prefix = match v.sort {
-                p::SortHint::Fresh | p::SortHint::Suffix(p::SuffixSort::Fresh) => "~",
-                p::SortHint::Pub | p::SortHint::Suffix(p::SuffixSort::Pub) => "$",
-                p::SortHint::Node | p::SortHint::Suffix(p::SuffixSort::Node) => "#",
-                p::SortHint::Nat | p::SortHint::Suffix(p::SuffixSort::Nat) => "%",
-                _ => "",
-            };
-            if v.idx == 0 {
-                undecidable.push(format!("{}{}", prefix, v.name));
-            } else {
-                undecidable.push(format!("{}{}.{}", prefix, v.name, v.idx));
-            }
+            // HS reports `show LVar` (sortPrefix ++ body) for the
+            // undecidable variable (MessageDerivationChecks.hs:138,156).
+            // Shared with the wellformedness checker's identical renderer.
+            undecidable.push(crate::check_terms::show_lvar(v));
         }
     }
 
@@ -598,7 +698,7 @@ fn prove_probe(
         Some(v) => std::env::set_var("TAM_PROVE_DEADLINE_MS", v),
         None => std::env::remove_var("TAM_PROVE_DEADLINE_MS"),
     }
-    Some(undecidable)
+    Some(ProbeOutcome { undecidable, prove_time, var_count })
 }
 
 fn format_deriv_report(per_rule: &[(String, Vec<String>)]) -> Vec<WfError> {

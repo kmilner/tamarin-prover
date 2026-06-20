@@ -333,9 +333,12 @@ fn pp_wf_term(t: &Term, out: &mut String) {
         FreshLit(s) => { out.push_str("~'"); out.push_str(s); out.push('\''); }
         NatLit(s) => { out.push_str("%'"); out.push_str(s); out.push('\''); }
         Number(n) => out.push_str(&n.to_string()),
-        NumberOne => out.push('1'),
+        // HS `prettyTerm` renders the nullary builtins via `text (BC.unpack f)`
+        // except natOneSym ("%1"): oneSym → "one", dhNeutralSym → "DH_neutral"
+        // (FunctionSymbols.hs:134,137,144; Term.hs:276,278).
+        NumberOne => out.push_str("one"),
         NatOne => out.push_str("%1"),
-        DhNeutral => out.push_str("1:msg"),
+        DhNeutral => out.push_str("DH_neutral"),
         Pair(items) => {
             out.push('<');
             for (i, it) in items.iter().enumerate() {
@@ -514,8 +517,41 @@ fn cmp_wf_term(a: &Term, b: &Term) -> std::cmp::Ordering {
         (FreshLit(s1), FreshLit(s2)) => s1.cmp(s2),
         (NatLit(s1), NatLit(s2)) => s1.cmp(s2),
         (Number(n1), Number(n2)) => n1.cmp(n2),
+        // HS derived `Ord (Term a)` for two FAPP terms compares the FunSym
+        // first (for NoEq this is the function-name ByteString,
+        // FunctionSymbols.hs:106,113-117) and then the operand list
+        // element-wise (Term/Term/Raw.hs:72-74).  We approximate that here:
+        // App compares by name then args; the other FAPP classes (already
+        // separated by `class`) compare their operands element-wise.  This
+        // gives a total order on the AC operand lists that arise, rather than
+        // tying distinct complex operands as Equal.
+        (App(n1, a1), App(n2, a2)) =>
+            n1.cmp(n2).then_with(|| cmp_term_slices(a1, a2)),
+        (AlgApp(n1, l1, r1), AlgApp(n2, l2, r2)) =>
+            n1.cmp(n2)
+                .then_with(|| cmp_wf_term(l1, l2))
+                .then_with(|| cmp_wf_term(r1, r2)),
+        (Pair(a1), Pair(a2)) => cmp_term_slices(a1, a2),
+        (Diff(l1, r1), Diff(l2, r2)) =>
+            cmp_wf_term(l1, l2).then_with(|| cmp_wf_term(r1, r2)),
+        (BinOp(o1, l1, r1), BinOp(o2, l2, r2)) =>
+            (*o1 as u8).cmp(&(*o2 as u8))
+                .then_with(|| cmp_wf_term(l1, l2))
+                .then_with(|| cmp_wf_term(r1, r2)),
+        (PatMatch(i1), PatMatch(i2)) => cmp_wf_term(i1, i2),
         _ => std::cmp::Ordering::Equal,
     }
+}
+
+/// Lexicographic comparison of two operand lists by `cmp_wf_term`, with the
+/// shorter list ordering first on a common prefix (matching Haskell's derived
+/// `Ord [a]`).
+fn cmp_term_slices(a: &[Term], b: &[Term]) -> std::cmp::Ordering {
+    for (x, y) in a.iter().zip(b.iter()) {
+        let o = cmp_wf_term(x, y);
+        if o != std::cmp::Ordering::Equal { return o; }
+    }
+    a.len().cmp(&b.len())
 }
 
 /// HS LSort declaration order (Term/LTerm.hs:161-166):
@@ -601,7 +637,11 @@ pub fn reserved_report(thy: &Theory) -> WfReport {
 // Reserved KU/KD/K-log usage
 // =============================================================================
 
-const KLOG_NAMES: &[&str] = &["KU", "KD", "K", "Ded"];
+// HS `reservedFactNameRules'` (Wellformedness.hs:530-541) flags facts whose
+// tag is `KUFact`/`KDFact` or which satisfy `isKLogFact` (a `ProtoFact "K"`,
+// Fact.hs:319-320).  `Ded(..)` parses to tag `DedFact` (Fact.hs:285-286), which
+// is in NONE of those sets, so it must NOT appear here.
+const KLOG_NAMES: &[&str] = &["KU", "KD", "K"];
 
 pub fn reserved_fact_name_rules(thy: &Theory) -> WfReport {
     let mut out = Vec::new();
@@ -747,7 +787,9 @@ fn pp_term_short(t: &Term) -> String {
             format!("{}({})", name, parts.join(", "))
         }
         Term::PubLit(s) => format!("'{}'", s),
-        _ => format!("{:?}", t),
+        // Fall back to the shared prettyLNTerm-style printer rather than Rust's
+        // derived Debug (which would leak `App("h", [Var(VarSpec{..})])`).
+        _ => pp_term_for_wf(t),
     }
 }
 
@@ -801,10 +843,13 @@ fn collect_fact_observations(thy: &Theory) -> Vec<FactObservation> {
     let mut out = Vec::new();
     for r in theory_rules(thy) {
         for (_, f) in rule_facts(r) {
-            // Built-in tags (Fr, In, Out, ...) are not part of the
-            // capitalization/arity/multiplicity check — Tamarin treats
-            // those separately.
-            if is_builtin_fact_name(&f.name) { continue; }
+            // HS `theoryFacts` groups facts by `factTagName` with no builtin
+            // filter; a user-written `K(..)` is a `ProtoFact "K"`
+            // (`isKLogFact`/`isProtoFact`) whose tag-name is "K", so it MUST be
+            // included in the capitalization/arity/multiplicity clash grouping.
+            // We exclude only the genuine special tags (Fr/In/Out/KU/KD/Ded/Term)
+            // via `is_proto_fact_name`, matching the sibling check.
+            if !is_proto_fact_name(&f.name) { continue; }
             out.push(FactObservation {
                 origin: format!("Rule `{}'", r.name),
                 name: f.name.clone(),
@@ -899,7 +944,33 @@ fn show_debruijn_term(t: &Term, binders: &[&VarSpec]) -> String {
         Term::Pair(items) => format!("pair({})",
             items.iter().map(|a| show_debruijn_term(a, binders))
                 .collect::<Vec<_>>().join(",")),
-        other => format!("{:?}", other),
+        // Remaining `FApp` forms in HS `show` (Term/Raw.hs:219-227):
+        // `FApp (NoEq (s,_)) as -> s ++ "(" ++ intercalate "," (map show as) ++ ")"`
+        // and `FApp (AC o) as -> show o ++ "(" ++ ... ++ ")"` (show ACSym is the
+        // derived constructor name "Mult"/"Union"/"Xor"/"NatPlus").  Nullary
+        // builtins show via their symbol string.  Rendered explicitly here
+        // rather than via Rust's derived Debug.
+        Term::AlgApp(name, a, b) => format!("{}({},{})", name,
+            show_debruijn_term(a, binders), show_debruijn_term(b, binders)),
+        Term::Diff(a, b) => format!("diff({},{})",
+            show_debruijn_term(a, binders), show_debruijn_term(b, binders)),
+        Term::BinOp(op, a, b) => {
+            use crate::ast::BinOp as B;
+            let head = match op {
+                B::Exp => "exp",
+                B::Mult => "Mult",
+                B::Union => "Union",
+                B::Xor => "Xor",
+                B::NatPlus => "NatPlus",
+            };
+            format!("{}({},{})", head,
+                show_debruijn_term(a, binders), show_debruijn_term(b, binders))
+        }
+        Term::PatMatch(inner) => show_debruijn_term(inner, binders),
+        Term::Number(n) => n.to_string(),
+        Term::NumberOne => "one".to_string(),
+        Term::NatOne => "tone".to_string(),
+        Term::DhNeutral => "DH_neutral".to_string(),
     }
 }
 
@@ -1135,9 +1206,16 @@ pub fn fact_lhs_occur_no_rhs(thy: &Theory) -> WfReport {
 pub fn fresh_names_report(thy: &Theory) -> WfReport {
     let mut out = Vec::new();
     for r in theory_rules(thy) {
+        // HS `freshNamesReport` runs `universeBi` over the let-substituted
+        // `ProtoRuleE` (Wellformedness.hs:478,486), so a fresh name occurring
+        // only inside a `let` value (e.g. `let m = ~'foo' in ... Out(m)`) is
+        // inlined and surfaces here.  Mirror by walking the let-inlined facts.
+        let (prems, acts, concs) = rule_facts_with_lets(r);
         let mut names = Vec::new();
-        for t in rule_terms(r) {
-            term_name_lits(t, &mut names);
+        for f in prems.iter().chain(&acts).chain(&concs) {
+            for t in &f.args {
+                term_name_lits(t, &mut names);
+            }
         }
         let fresh_lits: Vec<String> = names.iter()
             .filter_map(|(k, n)| if *k == NameKind::Fresh { Some(n.clone()) } else { None })
@@ -1167,8 +1245,14 @@ pub fn public_names_report(thy: &Theory) -> WfReport {
     // default `format_wf_block` path (header baked into the message).
     let mut pairs: Vec<(String, String)> = Vec::new(); // (ruleName, pubName)
     for r in theory_rules(thy) {
+        // HS `publicNamesReport` runs `universeBi` over the let-substituted
+        // `ProtoRuleE` (Wellformedness.hs:447,456), so walk the let-inlined
+        // facts (a public name occurring only inside a `let` value surfaces).
+        let (prems, acts, concs) = rule_facts_with_lets(r);
         let mut names = Vec::new();
-        for t in rule_terms(r) { term_name_lits(t, &mut names); }
+        for f in prems.iter().chain(&acts).chain(&concs) {
+            for t in &f.args { term_name_lits(t, &mut names); }
+        }
         for (k, n) in names {
             if k == NameKind::Pub { pairs.push((r.name.clone(), n)); }
         }
@@ -1181,7 +1265,7 @@ pub fn public_names_report(thy: &Theory) -> WfReport {
     // clashesOn f g: stable-sort by f, group consecutive by f, each group
     // sortednubOn g; keep groups with >= 2 distinct g.
     let mut sorted: Vec<(String, String)> = pairs;
-    sorted.sort_by(|a, b| f(a).cmp(&f(b)));
+    sorted.sort_by_key(|a| f(a));
     let mut clashes: Vec<Vec<(String, String)>> = Vec::new();
     let mut i = 0;
     while i < sorted.len() {
@@ -1189,7 +1273,7 @@ pub fn public_names_report(thy: &Theory) -> WfReport {
         let mut j = i + 1;
         while j < sorted.len() && f(&sorted[j]) == key { j += 1; }
         let mut grp: Vec<(String, String)> = sorted[i..j].to_vec();
-        grp.sort_by(|a, b| g(a).cmp(&g(b)));
+        grp.sort_by_key(|a| g(a));
         grp.dedup_by(|a, b| g(a) == g(b));
         if grp.len() >= 2 { clashes.push(grp); }
         i = j;
@@ -1596,6 +1680,9 @@ fn rules_equivalent_up_to_actions(a: &Rule, b: &Rule) -> bool {
 /// where `prettyCtxtStRule` uses `sep [nest 2 lhsDoc, "=" <-> rhsDoc]`.
 pub fn subterm_convergence_report(thy: &Theory) -> WfReport {
     // Collect all non-subterm-convergent equations across all `equations` items.
+    // User-declared `/0` functions resolve to nullary constants (HS resolves
+    // them via the function signature at parse time, so they are variable-free).
+    let nullary_funs = collect_nullary_fun_names(thy);
     let mut non_conv: Vec<(&Term, &Term)> = Vec::new();
     for it in &thy.items {
         let (eqs, convergent) = match it {
@@ -1604,7 +1691,7 @@ pub fn subterm_convergence_report(thy: &Theory) -> WfReport {
         };
         if convergent { continue; }
         for eq in eqs {
-            if !is_subterm_convergent(&eq.lhs, &eq.rhs) {
+            if !is_subterm_convergent(&eq.lhs, &eq.rhs, &nullary_funs) {
                 non_conv.push((&eq.lhs, &eq.rhs));
             }
         }
@@ -1669,9 +1756,11 @@ fn pp_term_for_wf(t: &Term) -> String {
         Term::FreshLit(s) => format!("~'{}'", s),
         Term::NatLit(s) => format!("%'{}'", s),
         Term::Number(n) => n.to_string(),
+        // HS `prettyTerm`: oneSym → "one", natOneSym → "%1",
+        // dhNeutralSym → "DH_neutral" (Term.hs:276,278; FunctionSymbols.hs:134,137).
         Term::NumberOne => "one".to_string(),
         Term::NatOne => "%1".to_string(),
-        Term::DhNeutral => "1:msg".to_string(),
+        Term::DhNeutral => "DH_neutral".to_string(),
         Term::App(name, args) => {
             if args.is_empty() {
                 name.clone()
@@ -1705,23 +1794,42 @@ fn pp_term_for_wf(t: &Term) -> String {
     }
 }
 
-fn is_subterm_convergent(lhs: &Term, rhs: &Term) -> bool {
-    // Rules with RHS = `true` (a public constructor constant) are accepted.
-    // Tamarin treats certain reserved nullary names as constants; our parser
-    // may render bare `true` as either `App("true", [])` or `Var("true")`,
-    // so accept both forms.
-    if is_reserved_constant(rhs) { return true; }
+fn is_subterm_convergent(lhs: &Term, rhs: &Term, nullary_funs: &BTreeSet<String>) -> bool {
+    // HS `isSubtermConvergentCtxtRule` (SubtermRule.hs:107-114):
+    //   | isConstant rhs = True
+    //   | otherwise      = not (null (findSubterm lhs rhs))
+    // where `isConstant term = null (frees term)` (SubtermRule.hs:113-114) —
+    // i.e. ANY variable-free (ground) RHS is accepted, not just a fixed set
+    // of reserved names (e.g. `f(x) = 'c'`, `f(x) = g('a','b')`, or a user
+    // `c/0` constant), where `frees` collects only `LVar`s.
+    if rhs_is_ground(rhs, nullary_funs) { return true; }
     // Otherwise the RHS must literally appear as a subterm of the LHS.
     contains_subterm(lhs, rhs)
 }
 
-fn is_reserved_constant(t: &Term) -> bool {
+/// True if `t` has no free variables, mirroring HS `isConstant term =
+/// null (frees term)` where `frees` collects only `LVar`s.  A bare
+/// identifier that names a nullary constant — a known builtin nullary
+/// (`true`/`zero`/…) or a user-declared `/0` function — is resolved by HS
+/// at parse time to a variable-free `FApp`, so we do NOT count it as a free
+/// variable; any other `Term::Var` is a genuine free variable.
+fn rhs_is_ground(t: &Term, nullary_funs: &BTreeSet<String>) -> bool {
+    use Term::*;
     match t {
-        Term::App(name, args) if args.is_empty() =>
-            is_known_nullary_constant_name(name),
-        Term::Var(v) if matches!(v.sort, SortHint::Untagged) =>
-            is_known_nullary_constant_name(&v.name),
-        _ => false,
+        Var(v) => {
+            // Untagged bare names that resolve to a nullary constant are
+            // variable-free; everything else (and any sigil-tagged var) is a
+            // genuine free variable.
+            matches!(v.sort, SortHint::Untagged)
+                && (is_known_nullary_constant_name(&v.name)
+                    || nullary_funs.contains(&v.name))
+        }
+        App(_, args) | Pair(args) => args.iter().all(|a| rhs_is_ground(a, nullary_funs)),
+        AlgApp(_, a, b) | Diff(a, b) | BinOp(_, a, b) =>
+            rhs_is_ground(a, nullary_funs) && rhs_is_ground(b, nullary_funs),
+        PatMatch(inner) => rhs_is_ground(inner, nullary_funs),
+        PubLit(_) | FreshLit(_) | NatLit(_) | Number(_)
+        | NumberOne | NatOne | DhNeutral => true,
     }
 }
 
@@ -1751,15 +1859,13 @@ fn contains_subterm(haystack: &Term, needle: &Term) -> bool {
 // Variable sort/capitalization clashes (within a single rule)
 // =============================================================================
 
-pub fn formula_terms_report(thy: &Theory) -> WfReport {
-    // NOTE: the actual HS `checkTerms` ("Formula terms" topic) is ported
-    // faithfully in `tamarin_theory::check_terms::check_terms_wf`, which
-    // needs the elaborated `MaudeSig` (for reducible/irreducible funsym
-    // classification) and so runs post-elaboration in `run.rs`.  Here we
-    // only keep the parser-level "Variable with mismatching sorts or
-    // capitalization" sub-check (a different topic, no signature needed).
-    variable_sort_clashes(thy)
-}
+// NOTE: the actual HS `checkTerms` ("Formula terms" topic) is ported
+// faithfully in `tamarin_theory::check_terms::check_terms_wf`, which needs
+// the elaborated `MaudeSig` (for reducible/irreducible funsym classification)
+// and so runs post-elaboration in `run.rs`.  The parser-level
+// "Variable with mismatching sorts or capitalization" sub-check (a different
+// topic, no signature needed) is `variable_sort_clashes` below; callers
+// invoke it directly.
 
 /// Within each rule, variables whose names agree modulo case AND share an
 /// index, but differ in their full `LVar` (sort or capitalization), clash.
@@ -1777,24 +1883,30 @@ pub fn variable_sort_clashes(thy: &Theory) -> WfReport {
     let mut out = Vec::new();
     for r in theory_rules(thy) {
         let (prems, acts, concs) = rule_facts_with_lets(r);
-        let mut vars: Vec<VarSpec> = Vec::new();
+        // Pair each var with its lowercase name ONCE, so the sort/group steps
+        // below don't re-allocate a `to_lowercase` string per comparison/probe.
+        let mut vars: Vec<(String, VarSpec)> = Vec::new();
         for f in prems.iter().chain(&acts).chain(&concs) {
-            vars.extend(fact_vars(f));
+            for v in fact_vars(f) {
+                vars.push((v.name.to_lowercase(), v));
+            }
         }
         // clashesOn removeSort id: sort+group by (lowercase name, idx).
+        // Stable sort over the precomputed lowercase key — identical order to
+        // re-lowercasing in the comparator.
         vars.sort_by(|a, b| {
-            a.name.to_lowercase().cmp(&b.name.to_lowercase())
-                .then_with(|| a.idx.cmp(&b.idx))
+            a.0.cmp(&b.0).then_with(|| a.1.idx.cmp(&b.1.idx))
         });
         let mut clash_groups: Vec<Vec<VarSpec>> = Vec::new();
         let mut i = 0;
         while i < vars.len() {
-            let key = (vars[i].name.to_lowercase(), vars[i].idx);
+            let key = (vars[i].0.as_str(), vars[i].1.idx);
             let mut j = i + 1;
             while j < vars.len()
-                && (vars[j].name.to_lowercase(), vars[j].idx) == key { j += 1; }
+                && (vars[j].0.as_str(), vars[j].1.idx) == key { j += 1; }
             // sortednubOn id: sort by HS LVar Ord (idx, sort, name) then dedup.
-            let mut grp: Vec<VarSpec> = vars[i..j].to_vec();
+            let mut grp: Vec<VarSpec> =
+                vars[i..j].iter().map(|(_, v)| v.clone()).collect();
             grp.sort_by(|a, b| {
                 a.idx.cmp(&b.idx)
                     .then_with(|| sort_tag(&a.sort).cmp(&sort_tag(&b.sort)))
@@ -1833,11 +1945,10 @@ pub fn nat_well_sorted_report(thy: &Theory) -> WfReport {
             collect_nat_violations(t, r, &mut out);
         }
     }
-    for l in theory_lemmas(thy) {
-        let _ = l;
-        // formulas would need a separate walker; skipped for now since
-        // the nat tests that fire sit inside rules.
-    }
+    // HS `natWellSortedReport`'s `getItemTerms` also checks the formula terms
+    // of LemmaItem/RestrictionItem/PredicateItem (Wellformedness.hs:327-329).
+    // That formula-term walk is not yet implemented here; the nat checks that
+    // fire in the corpus all sit inside rules.
     out
 }
 
@@ -1879,12 +1990,14 @@ fn check_nat_operand(t: &Term, r: &Rule, out: &mut WfReport) {
         | Term::AlgApp(_, _, _) | Term::Diff(_, _) | Term::Number(_)
         | Term::NumberOne | Term::DhNeutral | Term::PatMatch(_) => {
             out.push(WfError::new("Nat Sorts",
-                format!("rule `{}': operand must be of sort nat: {:?}", r.name, t)));
+                format!("rule `{}': operand must be of sort nat: {}",
+                    r.name, pp_term_for_wf(t))));
         }
         Term::Var(_) => {} // Untagged var, accepted.
         Term::BinOp(_, _, _) => {
             out.push(WfError::new("Nat Sorts",
-                format!("rule `{}': operand must be of sort nat: {:?}", r.name, t)));
+                format!("rule `{}': operand must be of sort nat: {}",
+                    r.name, pp_term_for_wf(t))));
         }
     }
 }

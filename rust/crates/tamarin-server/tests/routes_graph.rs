@@ -29,9 +29,11 @@ async fn intdot_returns_well_formed_dot() {
 }
 
 #[tokio::test]
-async fn graph_for_help_returns_placeholder_svg() {
-    // For paths without a system (help / message / rules), the
-    // graph route returns a fixed placeholder SVG.
+async fn graph_for_help_returns_not_found() {
+    // For paths without an associated system (help / message / rules),
+    // the graph route returns 404 — matching Haskell `getTheoryGraphR`,
+    // which returns `notFound` when `imgThyPath` yields `Nothing`
+    // (`src/Web/Handler.hs`).  There is no placeholder SVG.
     let s = start_server_with_theory("issue193.spthy").await;
     let res = s
         .client
@@ -39,17 +41,7 @@ async fn graph_for_help_returns_placeholder_svg() {
         .send()
         .await
         .expect("send");
-    assert_eq!(res.status(), 200);
-    let ct = res
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    assert!(
-        ct.starts_with("image/svg+xml") || ct.starts_with("text/plain"),
-        "unexpected content-type: {:?}", ct,
-    );
+    assert_eq!(res.status(), 404);
 }
 
 #[tokio::test]

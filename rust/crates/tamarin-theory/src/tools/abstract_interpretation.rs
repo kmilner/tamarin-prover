@@ -13,6 +13,16 @@
 //! `interpret_abstractly` taking closures. The Maude-driven
 //! `partial_evaluation` lands when typed-rule unification is wired
 //! up.
+//!
+//! TRACKING: This module is currently an unused placeholder. Only
+//! `EvaluationStyle` is re-exported (tools/mod.rs); neither
+//! `interpret_abstractly` nor `partial_evaluation` has a caller yet, and
+//! both intentionally diverge from Haskell (the stub seeds empty-term
+//! `In`/`Fresh` facts where HS uses `inFact (varTerm z)` /
+//! `freshFact (varTerm z)`, and `partial_evaluation` returns its input
+//! untouched). They are retained as a typed signature to fill in once the
+//! typed-rule E-unification port exists; do NOT treat their current
+//! bodies as faithful ports.
 
 use crate::fact::LNFact;
 use crate::rule::ProtoRuleE;
@@ -39,6 +49,7 @@ pub enum EvaluationStyle { Silent, Summary, Tracing }
 /// uses `inFact (varTerm z)` / `freshFact (varTerm z)`) and returns a
 /// single `(state, rules)` pair with the rules passed through
 /// unrefined. Revisit when typed-rule unification is ported.
+#[allow(dead_code)] // unused placeholder; see module-level TRACKING note
 pub fn interpret_abstractly<S, R, U, AddF, GetF>(
     _unify_fact_eqs: U,
     init_state: S,
@@ -64,6 +75,7 @@ where
 
 /// `partialEvaluation` placeholder. Returns the input untouched
 /// until the underlying unification primitive is wired up.
+#[allow(dead_code)] // unused placeholder; see module-level TRACKING note
 pub fn partial_evaluation(_style: EvaluationStyle, rus: &[ProtoRuleE])
     -> (Vec<LNFact>, Vec<ProtoRuleE>)
 {

@@ -53,8 +53,16 @@ pub fn smaller_fact<T>(t1: T, t2: T) -> Fact<T> {
 }
 
 /// `lookupPredicate fa preds`: find the predicate whose fact tag matches
-/// `fa`'s tag. Only `preds` is searched; unlike the Haskell original this
-/// does not append the built-in predicates list.
+/// `fa`'s tag.
+///
+/// NOTE: This is a TEST-ONLY helper (its sole non-definition caller is
+/// its own unit test below). It deliberately searches only `preds` and
+/// does NOT append the built-in predicates list (HS Predicate.hs:78
+/// `lookupPredicate fact = find (sameName fact . pFact) . (++
+/// builtinPredicates)`). The real, runtime expansion path lives in
+/// `predicate_expand.rs`, which special-cases the only built-in predicate
+/// (`Smaller`) inline in `expand_atom`. Because nothing on the runtime
+/// path calls this function, the missing-builtin divergence is inert.
 pub fn lookup_predicate<'a, T: Eq>(
     fa: &Fact<T>,
     preds: &'a [Predicate],

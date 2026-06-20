@@ -238,30 +238,51 @@ pub fn expand_theory_macros(thy: &mut p::Theory) {
 
     if macros.is_empty() { return; }
 
-    for item in thy.items.iter_mut() {
+    expand_items(&macros, &mut thy.items);
+}
+
+/// Apply macros to a slice of theory items.  Recurses into `IfDef`
+/// branch items so that macro call-sites inside an `#ifdef`/`#ifndef`
+/// block are expanded too: the parser keeps the live branch wrapped in
+/// an `IfDef` node (it is only flattened later in elaboration), so
+/// without recursing here those items would be skipped via `_ => {}`.
+/// In Haskell `#ifdef` is resolved at parse time (Parser.hs `ifdef`
+/// calls `addItems` inline), so the live items become ordinary
+/// top-level items before macro application runs.
+fn expand_items(macros: &[p::Macro], items: &mut [p::TheoryItem]) {
+    for item in items.iter_mut() {
         match item {
             p::TheoryItem::Rule(r) | p::TheoryItem::IntrRule(r) => {
-                expand_rule(&macros, r);
+                expand_rule(macros, r);
             }
             p::TheoryItem::Lemma(l) => {
-                l.formula = apply_macros_formula(&macros, &l.formula);
+                l.formula = apply_macros_formula(macros, &l.formula);
             }
             p::TheoryItem::Restriction(r) | p::TheoryItem::LegacyAxiom(r) => {
-                r.formula = apply_macros_formula(&macros, &r.formula);
+                r.formula = apply_macros_formula(macros, &r.formula);
             }
             p::TheoryItem::CaseTest(c) => {
-                c.formula = apply_macros_formula(&macros, &c.formula);
+                c.formula = apply_macros_formula(macros, &c.formula);
             }
             p::TheoryItem::AccLemma(a) => {
-                a.formula = apply_macros_formula(&macros, &a.formula);
+                a.formula = apply_macros_formula(macros, &a.formula);
             }
             // Predicates: bodies are themselves formula templates. Apply
             // macros so a predicate body that calls a macro is expanded
             // before predicate-expand inlines it.
             p::TheoryItem::Predicates(ps) => {
                 for pred in ps.iter_mut() {
-                    pred.formula = apply_macros_formula(&macros, &pred.formula);
-                    pred.fact = apply_macros_fact(&macros, &pred.fact);
+                    pred.formula = apply_macros_formula(macros, &pred.formula);
+                    pred.fact = apply_macros_fact(macros, &pred.fact);
+                }
+            }
+            // Recurse into both branches of an `#ifdef`/`#ifndef` block:
+            // the parser keeps the live branch wrapped here until
+            // elaboration flattens it, so its items must be expanded too.
+            p::TheoryItem::IfDef { then_items, else_items, .. } => {
+                expand_items(macros, then_items);
+                if let Some(else_items) = else_items {
+                    expand_items(macros, else_items);
                 }
             }
             _ => {}
@@ -407,6 +428,41 @@ mod tests {
         } else {
             panic!("expected Pair, got {:?}", arg);
         }
+    }
+
+    #[test]
+    fn macro_inside_ifdef_is_expanded() {
+        // A rule under `#ifdef FLAG` whose premise calls a macro must be
+        // expanded just like a top-level rule. The parser keeps the live
+        // branch wrapped in an `IfDef` node, so `expand_theory_macros`
+        // must recurse into it.
+        let src = "theory T begin\n\
+            macros: id(x) = x\n\
+            #ifdef FLAG\n\
+            rule R: [ In(id(a)) ] --> [ ]\n\
+            #endif\n\
+            end\n";
+        let mut thy = parse_theory(src, &["FLAG"]).expect("parse");
+        expand_theory_macros(&mut thy);
+        // Find the rule nested inside the IfDef block.
+        fn find_rule(items: &[p::TheoryItem]) -> Option<&p::Rule> {
+            for it in items {
+                match it {
+                    p::TheoryItem::Rule(r) => return Some(r),
+                    p::TheoryItem::IfDef { then_items, else_items, .. } => {
+                        if let Some(r) = find_rule(then_items) { return Some(r); }
+                        if let Some(e) = else_items {
+                            if let Some(r) = find_rule(e) { return Some(r); }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        let rule = find_rule(&thy.items).expect("rule under ifdef");
+        let arg = &rule.premises[0].args[0];
+        assert!(matches!(arg, p::Term::Var(v) if v.name == "a"), "got {:?}", arg);
     }
 
     #[test]

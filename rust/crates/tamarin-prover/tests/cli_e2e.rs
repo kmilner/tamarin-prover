@@ -57,10 +57,12 @@ fn prove_chain_writes_output_with_verified_summary() {
     let code = run(&args).expect("run");
     assert_eq!(code, 0, "expected exit code 0, got {}", code);
 
-    // The output file should exist and contain a `verified` line for
-    // our chain lemma. `chain` is an exists-trace lemma and is
-    // satisfied by the example; the prove pipeline returns
-    // `Solved`, which `run.rs` translates to `Verified`.
+    // The proven theory is written to the output file with the chain
+    // lemma's proof inline.  HS-faithful: the `summary of summaries`
+    // verdict block (verified/analyzed/...) goes to STDOUT, not the `-o`
+    // file.  `chain` is an exists-trace lemma satisfied by the example, so
+    // its proof ends in `SOLVED // trace found` + `qed` (verified
+    // byte-identical to the Haskell binary's output file for this fixture).
     let body = std::fs::read_to_string(&out_path).expect("output written");
     assert!(
         body.contains("theory SingleRecv"),
@@ -68,9 +70,10 @@ fn prove_chain_writes_output_with_verified_summary() {
         body
     );
     assert!(
-        body.contains("chain")
-            && (body.contains("verified") || body.contains("falsified") || body.contains("analyzed")),
-        "output should contain a per-lemma summary line; got:\n{}",
+        body.contains("lemma chain")
+            && body.contains("SOLVED // trace found")
+            && body.contains("qed"),
+        "output file should contain the completed chain proof; got:\n{}",
         body
     );
 }
@@ -99,12 +102,13 @@ fn prove_lemma_filter_excludes_other_lemmas() {
     let code = run(&args).expect("run");
     assert_eq!(code, 0);
     let body = std::fs::read_to_string(&out_path).expect("output written");
-    // The `chain` lemma should be marked Filtered (printed as "not
-    // analyzed") since the filter doesn't match.
-    assert!(body.contains("chain"));
+    // The filter excludes every lemma, so `chain` is left unproven in the
+    // output file — HS writes it back as `by sorry` (the filtered / `not
+    // analyzed` status appears in the stdout summary, not the `-o` file;
+    // verified against the Haskell binary for this fixture).
     assert!(
-        body.contains("not analyzed") || body.contains("filtered"),
-        "expected filter status in summary; got:\n{}",
+        body.contains("lemma chain") && body.contains("by sorry"),
+        "filtered-out lemma should remain `by sorry` in the output; got:\n{}",
         body
     );
 }

@@ -40,10 +40,19 @@ use crate::pretty_hpj::{fsep, punctuate, Doc};
 
 /// The fixed render budget for the "Formula terms" WF block, determined
 /// empirically from HS output: HS lays the whole `/* WARNING ... */`
-/// comment at lineLength 110 / ribbon 73, but the nested topic body ends
-/// up wrapping at an effective budget of 69 columns (boundary verified
-/// against the real binary: an offender ending at column 69 stays on the
-/// header line, at column 70 it wraps).
+/// comment at `lineLength = 110` / `ribbon = 73` (see
+/// [`crate::pretty_hpj::LINE_LENGTH`] / [`crate::pretty_hpj::RIBBON`]), but
+/// the topic body is rendered already indented inside the surrounding
+/// `/* ... */` warning frame, so the effective wrap column for the body is
+/// 41 columns narrower than `lineLength`, i.e. 110 - 41 = 69. Boundary
+/// verified against the real binary: an offender ending at column 69 stays
+/// on the header line, at column 70 it wraps.
+///
+/// CAVEAT: this is a precomputed effective budget, NOT HS's own lineLength.
+/// We do not reproduce the outer warning-frame nesting in the `Doc`
+/// renderer, so if HS's `lineWidth` (Console.hs:236) or the WARNING-frame
+/// indentation ever changes, this constant (used at both `render_with`
+/// call sites in `render_block`) must be re-derived against the new binary.
 const WF_WIDTH: usize = 69;
 
 /// The constant explanatory paragraph (HS `wrappedText "..."`).  The text
@@ -430,7 +439,16 @@ fn resolve_var(v: &VarSpec, scope: &Scope, irr: &Irreducible, pos: TermPos) -> R
 }
 
 /// Find the innermost binder matching `v` and return its De-Bruijn index.
-/// Matching mirrors the existing free-variable check's name+sort-kind rule.
+///
+/// HS binds a use to its binder via full `LVar` equality — name AND sort AND
+/// idx (`quantify x = ... | v == x = Bound i`, Formula.hs:340-345; `LVar` `Eq`
+/// compares `idx`, sort and name, LTerm.hs). We compare name and `idx`
+/// exactly, and approximate the sort with the sort-*kind* derived from the
+/// use's explicit sigil (or the syntactic position when the use is untagged),
+/// matching the surrounding free-variable check's existing rule. The `idx`
+/// comparison ensures a binder and a use that share a name but carry
+/// different explicit dot-indices (e.g. `x.1` vs `x.2`) are NOT conflated,
+/// as in HS.
 fn lookup_bound(v: &VarSpec, scope: &Scope, pos: TermPos) -> Option<u32> {
     // Expected sort-kind from the use's explicit sigil, or the position.
     let expected: Option<u8> = match pos {
@@ -445,7 +463,7 @@ fn lookup_bound(v: &VarSpec, scope: &Scope, pos: TermPos) -> Option<u32> {
     };
     // Search innermost (last) first.
     for (i, b) in scope.iter().enumerate().rev() {
-        if b.name != v.name {
+        if b.name != v.name || b.idx != v.idx {
             continue;
         }
         let ok = match expected {
@@ -567,7 +585,8 @@ fn write_rterm(t: &RTerm, out: &mut String) {
 
 /// HS `Show LVar`: `sortPrefix s ++ body`, where body is the name (or, if
 /// `idx /= 0`, `name.idx`; if the name is empty, just the index).
-fn show_lvar(v: &VarSpec) -> String {
+/// Shared with the message-derivation probe (`deriv_check`).
+pub(crate) fn show_lvar(v: &VarSpec) -> String {
     let prefix = match v.sort {
         SortHint::Fresh | SortHint::Suffix(SuffixSort::Fresh) => "~",
         SortHint::Pub | SortHint::Suffix(SuffixSort::Pub) => "$",

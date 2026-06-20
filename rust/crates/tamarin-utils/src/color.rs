@@ -96,10 +96,15 @@ pub fn rgb_to_hex(c: Rgb) -> String {
 }
 
 pub fn hex_to_rgb(s: &str) -> Option<Rgb> {
-    if s.len() != 6 { return None; }
-    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
-    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
-    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    // Haskell `hexToRGB [r1,r2,g1,g2,b1,b2]` matches exactly six CHARACTERS;
+    // anything else falls through to `Nothing`. Collect chars (rather than
+    // byte-slicing) so multibyte input yields `None` instead of panicking on a
+    // char-boundary split.
+    let cs: Vec<char> = s.chars().collect();
+    if cs.len() != 6 { return None; }
+    let r = u8::from_str_radix(&cs[0..2].iter().collect::<String>(), 16).ok()?;
+    let g = u8::from_str_radix(&cs[2..4].iter().collect::<String>(), 16).ok()?;
+    let b = u8::from_str_radix(&cs[4..6].iter().collect::<String>(), 16).ok()?;
     Some(Rgb {
         r: r as f64 / 255.0,
         g: g as f64 / 255.0,
@@ -147,7 +152,9 @@ pub fn gen_color_groups(p: ColorParams, groups: &[usize]) -> Vec<((usize, usize)
     let mut out = Vec::new();
     for (group_idx, &group_size) in groups.iter().enumerate() {
         for elem_idx in 0..group_size {
-            let frac = if group_size == 0 { 0.0 } else { elem_idx as f64 / group_size as f64 };
+            // The loop excludes `group_size == 0`, so the division is always
+            // safe (mirrors Haskell's lazy `[0..groupSize-1]` comprehension).
+            let frac = elem_idx as f64 / group_size as f64;
             let h = to_shifted_group_hue(group_idx, frac);
             let v = p.v_bottom + p.v_range * to_group_hue(group_idx, frac);
             let s = p.s_bottom + p.s_range * to_group_hue(group_idx, frac);

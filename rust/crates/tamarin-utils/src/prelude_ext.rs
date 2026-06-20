@@ -116,17 +116,17 @@ where
 
 /// `groupSortOn proj xs`: sort by projection, then group consecutive equal-
 /// projection elements.
-pub fn group_sort_on<T: Clone, K: Ord + Clone, F: FnMut(&T) -> K + Copy>(
+pub fn group_sort_on<T: Clone, K: Ord + Clone, F: FnMut(&T) -> K>(
     xs: Vec<T>,
-    proj: F,
+    mut proj: F,
 ) -> Vec<Vec<T>> {
-    let sorted = sort_on(xs, proj);
-    group_on(&sorted, proj)
+    let sorted = sort_on(xs, &mut proj);
+    group_on(&sorted, &mut proj)
 }
 
 /// `eqClasses proj xs`: group elements by their projection's equivalence
 /// class. Output uses sorted-then-grouped semantics, matching Haskell.
-pub fn eq_classes<T: Clone, K: Ord + Clone, F: FnMut(&T) -> K + Copy>(
+pub fn eq_classes<T: Clone, K: Ord + Clone, F: FnMut(&T) -> K>(
     xs: Vec<T>,
     proj: F,
 ) -> Vec<Vec<T>> {
@@ -190,11 +190,21 @@ pub fn leave_one_out<T: Clone>(xs: &[T]) -> Vec<Vec<T>> {
 /// flags as masked.
 pub fn keep_first<T: Clone, F: FnMut(&T, &T) -> bool>(xs: &[T], mut mask: F) -> Vec<T> {
     let mut out: Vec<T> = Vec::new();
-    let mut remaining: Vec<T> = xs.to_vec();
-    while !remaining.is_empty() {
-        let head = remaining.remove(0);
-        remaining.retain(|y| !mask(&head, y));
-        out.push(head);
+    // `alive[i]` tracks whether element `i` survives the masking by earlier
+    // picks. Iterating with a cursor avoids the O(n) front-shift of
+    // `Vec::remove(0)` while preserving Haskell's left-to-right semantics:
+    // `keepFirst mask (x:xs) = x : keepFirst mask (filter (not . mask x) xs)`.
+    let mut alive: Vec<bool> = vec![true; xs.len()];
+    for i in 0..xs.len() {
+        if !alive[i] {
+            continue;
+        }
+        out.push(xs[i].clone());
+        for j in (i + 1)..xs.len() {
+            if alive[j] && mask(&xs[i], &xs[j]) {
+                alive[j] = false;
+            }
+        }
     }
     out
 }

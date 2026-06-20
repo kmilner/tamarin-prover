@@ -155,8 +155,20 @@ fn abbreviate_term(
     }
 }
 
-/// Walk a `GraphRepr` collecting all rendered string fragments and pick
-/// out alphanumeric runs (case-insensitive).  Mirror of `allNames`.
+/// Walk a `GraphRepr` collecting rendered string fragments and pick out
+/// alphanumeric runs (uppercased, sorted, deduped).  Used to avoid
+/// generating an abbreviation name that aliases an existing identifier.
+///
+/// APPROXIMATION of Haskell `allNames`, which renders the ENTIRE
+/// `GraphRepr` via `show repr` (every node variant incl. Missing/
+/// LastAction, all edges, NodeIds and constructor/field names) and then
+/// splits on non-alphanumerics.  We only dump node ids, fact tags and
+/// pretty-printed terms for System/UnsolvedAction nodes plus cluster
+/// names — i.e. the content that actually carries user identifiers.  The
+/// omitted tokens are long constructor/field words that cannot match a
+/// generated name's `<<=prefix_length letters><digits>` shape, so this
+/// cannot alias a real identifier differently in practice; any divergence
+/// from `show repr` is at worst a differently-numbered alias.
 fn collect_all_names(repr: &GraphRepr) -> Vec<String> {
     let mut buf = String::new();
     for n in &repr.nodes { dump_node(&mut buf, n); }
@@ -209,9 +221,11 @@ fn dump_fact(buf: &mut String, fa: &LNFact) {
 // Term collection & subterm helpers
 // ---------------------------------------------------------------------
 
-/// Walk a `GraphRepr` collecting every (sub)term that's a candidate for
-/// abbreviation.  We exclude top-level pair-trees (Haskell `isPair`)
-/// because pair siblings get rendered as `<a,b,c>` already.
+/// Walk a `GraphRepr` collecting candidate terms for abbreviation.
+/// For each fact term we keep only the term itself and its IMMEDIATE
+/// arguments (one level deep, mirroring `getSubTerms t = t : ts`),
+/// excluding any that are pairs (Haskell `isPair`) because pair
+/// siblings get rendered as `<a,b,c>` already.
 fn collect_all_terms(repr: &GraphRepr) -> Vec<LNTerm> {
     let mut out: Vec<LNTerm> = Vec::new();
     for n in &repr.nodes {
@@ -242,18 +256,24 @@ fn node_terms(n: &super::repr::GNode, out: &mut Vec<LNTerm>) {
 }
 
 fn fact_terms(fa: &LNFact, out: &mut Vec<LNTerm>) {
+    // Mirror `getFactTerms fact = filter (not . isPair) $ concatMap getSubTerms
+    // $ factTerms fact`, where `getSubTerms t = t : ts` collects the term and
+    // its IMMEDIATE arguments only (one level deep, not recursive).
     for t in &fa.terms {
         sub_terms_no_pair(t, out);
     }
 }
 
 fn sub_terms_no_pair(t: &LNTerm, out: &mut Vec<LNTerm>) {
+    // `getSubTerms`: the term itself plus its immediate arguments.
     if !is_pair(t) {
         out.push(t.clone());
     }
     if let Term::App(_, args) = t {
         for a in args.iter() {
-            sub_terms_no_pair(a, out);
+            if !is_pair(a) {
+                out.push(a.clone());
+            }
         }
     }
 }
@@ -288,24 +308,25 @@ fn judge_term(
 // Subterm-counting (used to decrement occurrences after chosing a term)
 // ---------------------------------------------------------------------
 
-/// Number of times `sub` appears as a proper subterm of `t`.
-fn count_proper_subterms(t: &LNTerm, sub: &LNTerm) -> i64 {
-    if t == sub {
-        // Don't count the term itself.
-        return count_subterms_inner(t, sub) - 1;
+/// Number of times `needle` appears as a PROPER subterm of `haystack`.
+/// Mirror of `countProperSubterms t (FApp _ ts) = sum $ map (countSubterms t) ts`
+/// (Raw.hs:255-257).
+fn count_proper_subterms(needle: &LNTerm, haystack: &LNTerm) -> i64 {
+    match haystack {
+        Term::App(_, args) => args.iter().map(|a| count_subterms(needle, a)).sum(),
+        _ => 0,
     }
-    count_subterms_inner(t, sub)
 }
 
-fn count_subterms_inner(t: &LNTerm, sub: &LNTerm) -> i64 {
-    let mut total = 0i64;
-    if t == sub { total += 1; }
-    if let Term::App(_, args) = t {
-        for a in args.iter() {
-            total += count_subterms_inner(a, sub);
-        }
+/// Mirror of `countSubterms t1 t2 = if t1 == t2 then 1 else countProperSubterms t1 t2`
+/// (Raw.hs:252-253).  Note: when `needle == haystack` it returns 1 and does NOT
+/// descend further (matches `if ... then 1 else ...`).
+fn count_subterms(needle: &LNTerm, haystack: &LNTerm) -> i64 {
+    if needle == haystack {
+        1
+    } else {
+        count_proper_subterms(needle, haystack)
     }
-    total
 }
 
 // ---------------------------------------------------------------------
@@ -335,10 +356,13 @@ pub fn compute_abbreviations(
                 (t.clone(), judge_term(&abbrevs, t, *occs, legend_occs))).collect();
         let mut positives: Vec<(LNTerm, i64)> = weighted.into_iter()
             .filter(|(_, w)| *w > 0).collect();
-        // Sort by descending weight, then by pretty string for determinism.
-        positives.sort_by(|a, b| {
-            b.1.cmp(&a.1).then_with(|| pretty_lnterm(&a.0).cmp(&pretty_lnterm(&b.0)))
-        });
+        // Haskell `filterCandidateTerm`: `sortOn (Down . snd)` over the
+        // `M.toList`-ordered (LNTerm `Ord`) weighted terms.  `sortOn` is
+        // stable, so equal-weight ties fall back to ascending LNTerm `Ord`
+        // (the BTreeMap iteration order).  `slice::sort_by` is likewise
+        // stable, so sorting purely on descending weight preserves that
+        // tie-break — do NOT add a pretty-string secondary key.
+        positives.sort_by_key(|x| std::cmp::Reverse(x.1));
         let (candidate, weight) = match positives.into_iter().next() {
             Some(x) => x,
             None => break,
@@ -352,6 +376,8 @@ pub fn compute_abbreviations(
         let mut new_term_occs: BTreeMap<LNTerm, (i64, Vec<i64>)> = BTreeMap::new();
         for (term, (occs, legend_occs)) in term_occs {
             if term == candidate { continue; }
+            // Haskell: `countProperSubterms term candidate` — occurrences of
+            // `term` (needle) inside `candidate` (haystack).
             let sub_count = count_proper_subterms(&term, &candidate);
             let mut new_legend_occs = legend_occs;
             new_legend_occs.push(sub_count);

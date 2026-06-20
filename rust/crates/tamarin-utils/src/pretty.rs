@@ -7,8 +7,9 @@
 //!
 //! We give up the full Hughes width-aware reflowing for now and provide a
 //! line-based pretty-printer that supports the combinators the prover
-//! actually uses: `text`, `<>`, `<+>` (`besides`), `$$` and `$-$`,
-//! `hcat`/`hsep`/`vcat`, `nest`, and `caseEmpty`. Width-sensitive
+//! actually uses: `text`, `<>` (`cat_with`), `<+>` (`beside`), `$-$`
+//! (`above`), and `hcat`/`hsep`/`vcat`, `nest`. (The Haskell `$$` and
+//! `caseEmptyDoc` class methods are not ported here.) Width-sensitive
 //! `sep`/`cat` fall back to `vcat` (always-vertical) while `fsep`/`fcat` fall
 //! back to `hsep`/`hcat` (always-horizontal); this is slightly verbose but
 //! always correct. Improving them is a follow-up.
@@ -57,10 +58,14 @@ impl Doc {
     pub fn zero_width_text<S: Into<String>>(s: S) -> Self { Doc(Node::ZeroWidth(s.into())) }
 
     pub fn is_empty(&self) -> bool {
+        // Mirrors HughesPJ `P.isEmpty`, which is true ONLY for `mempty`/`empty`,
+        // never for `text ""` / `zeroWidthText ""`. Combinators (`<>`, `$$`,
+        // `nest`, ...) collapse `empty` operands away, so a tree built only from
+        // `empty` (via `Cat`/`Above`/`Nest`/`Highlight`) is itself empty.
         fn check(n: &Node) -> bool {
             match n {
                 Node::Empty => true,
-                Node::Text(s) | Node::ZeroWidth(s) => s.is_empty(),
+                Node::Text(_) | Node::ZeroWidth(_) => false,
                 Node::Cat(a, b) | Node::Above(a, b) => check(a) && check(b),
                 Node::Nest(_, a) | Node::Highlight(_, a) => check(a),
             }
@@ -209,7 +214,12 @@ pub fn fixed_width_text(n: usize, s: &str) -> Doc {
 /// Treat a string as a single-column "symbol" (zero-width past column 1).
 pub fn symbol(s: &str) -> Doc { fixed_width_text(1, s) }
 
-/// `numbered vsep ds`: prefix each `d` with a right-flushed index, joined by `vsep`.
+/// `numbered vsep ds`: prefix each `d` with a right-flushed index, then join the
+/// items with `vsep` interspersed between them (Class.hs:252-261):
+///   `foldr1 ($-$) $ intersperse vsep $ map pp $ zip [1..] ds`.
+/// `vsep` is a standalone document placed on its own "line" via `$-$`, not glued
+/// horizontally onto the items — so `numbered (text "")` yields blank separator
+/// lines (because `text ""` is not empty).
 pub fn numbered(vsep: Doc, ds: Vec<Doc>) -> Doc {
     if ds.is_empty() { return Doc::empty(); }
     let n = ds.len();
@@ -221,8 +231,13 @@ pub fn numbered(vsep: Doc, ds: Vec<Doc>) -> Doc {
         let prefix = flush_right(n_width, &buf);
         Doc::text(prefix).cat_with(d)
     }).collect();
-    let with_seps = punctuate(vsep, lined);
-    vcat(with_seps)
+    // intersperse `vsep` between items, then foldr1 ($-$).
+    let mut iter = lined.into_iter();
+    let mut acc = iter.next().unwrap();
+    for d in iter {
+        acc = acc.above(vsep.clone()).above(d);
+    }
+    acc
 }
 
 pub fn numbered_dot(ds: Vec<Doc>) -> Doc {
@@ -291,9 +306,13 @@ fn layout_with<F: Fn(HighlightStyle, &str) -> String>(
         }
         Node::Nest(k, inner) => layout_with(inner, base_indent + k, wrap),
         Node::Highlight(style, inner) => {
-            // Wrap each rendered line's content with the wrapper. Multi-line
-            // highlights are handled per-line; this matches the
-            // `withTag`-style behaviour used by the HTML renderer.
+            // Re-wrap each rendered line's content separately. This coincides
+            // with Haskell's `withTag` (Html.hs:59-64) only for single-line
+            // spans: `withTag` splices ONE open tag before and ONE close tag
+            // after the whole `inner` document, so a multi-line highlight is
+            // `<span>line1<br/>line2</span>`, whereas this per-line wrapping
+            // emits `<span>line1</span>` ... `<span>line2</span>`. Highlights
+            // are overwhelmingly single tokens, so this rarely diverges.
             let mut ls = layout_with(inner, base_indent, wrap);
             for line in ls.iter_mut() {
                 line.content = wrap(*style, &line.content);
@@ -384,8 +403,10 @@ mod tests {
     #[test]
     fn numbered_dot_basic() {
         let d = numbered_dot(vec![Doc::text("alpha"), Doc::text("beta"), Doc::text("gamma")]);
-        // 3 → 1 char index width; entries get ". " prefix; vsep is empty text.
-        assert_eq!(d.render(), "1. alpha\n2. beta\n3. gamma");
+        // Haskell `numbered' = numbered (text "")` intersperses a (non-empty)
+        // `text ""` separator joined via `$-$`, producing a BLANK line between
+        // entries: "1. alpha\n\n2. beta\n\n3. gamma".
+        assert_eq!(d.render(), "1. alpha\n\n2. beta\n\n3. gamma");
     }
 
     #[test]
@@ -410,7 +431,9 @@ mod tests {
     #[test]
     fn is_empty_recurses() {
         assert!(Doc::empty().is_empty());
-        assert!(Doc::text("").is_empty());
+        // HughesPJ `P.isEmpty (text "") == False`: an explicit empty string is
+        // NOT the empty document.
+        assert!(!Doc::text("").is_empty());
         assert!(Doc::empty().nest(2).is_empty());
         assert!(!Doc::text("x").is_empty());
         assert!(!Doc::text("a").above(Doc::empty()).is_empty());

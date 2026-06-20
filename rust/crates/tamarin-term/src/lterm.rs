@@ -303,10 +303,17 @@ pub fn variable_to_const(v: &LVar) -> LNTerm {
         LSort::Nat => NameTag::Nat,
         LSort::Msg => panic!("variable_to_const: invalid sort Msg"),
     };
-    let id = format!(
-        "constVar_{:?}_{}_{}",
-        v.sort, v.idx, v.name
-    );
+    // Mirror Haskell `show vsort` (derived `Show LSort`), which yields
+    // "LSortPub"/"LSortFresh"/"LSortNode"/"LSortNat" — NOT the bare Rust
+    // Debug names ("Pub"/"Fresh"/...). See LTerm.hs:411-413 / 161-166.
+    let sort_show = match v.sort {
+        LSort::Pub => "LSortPub",
+        LSort::Fresh => "LSortFresh",
+        LSort::Msg => "LSortMsg",
+        LSort::Node => "LSortNode",
+        LSort::Nat => "LSortNat",
+    };
+    let id = format!("constVar_{}_{}_{}", sort_show, v.idx, v.name);
     const_term(Name::new(tag, id))
 }
 
@@ -326,7 +333,7 @@ impl<V> BVar<V> {
     pub fn into_free(self) -> V {
         match self {
             BVar::Free(v) => v,
-            BVar::Bound(i) => panic!("from_free: bound variable {}", i),
+            BVar::Bound(i) => panic!("into_free: bound variable {}", i),
         }
     }
     pub fn as_free(&self) -> Option<&V> {
@@ -364,7 +371,7 @@ pub fn free_term(t: LNTerm) -> BLTerm {
 /// `applyVTerm` substitution, `fmap`). The two differ only at AC sub-terms:
 /// `Arbitrary` re-sorts the AC argument list (`fApp` -> `fAppAC`), while
 /// `Monotone` preserves the relative argument order (`unsafefApp`) because a
-/// monotone shift cannot change the AC-normal form ordering (LTerm.hs:753-754).
+/// monotone shift cannot change the AC-normal form ordering (LTerm.hs:733-735).
 pub trait HasFrees {
     /// Visit every free `LVar` exactly once in deterministic order.
     fn for_each_free(&self, f: &mut dyn FnMut(&LVar));
@@ -506,7 +513,7 @@ where
             Term::App(fsym, args) => {
                 let mapped: Vec<Term<L>> =
                     args.iter().cloned().map(|a| a.map_free_with(f, monotone)).collect();
-                // Mirrors HS `mapFrees` for `Term l` (LTerm.hs:752-754):
+                // Mirrors HS `mapFrees` for `Term l` (LTerm.hs:733-735):
                 //   Arbitrary -> `fApp o`     (re-sorts AC/C via `fAppAC`/`fAppC`)
                 //   Monotone  -> `unsafefApp o` (preserves arg order for EVERY
                 //                symbol — a monotone shift cannot change the
@@ -575,7 +582,7 @@ pub fn rename<T: HasFrees>(t: T, fresh: &mut tamarin_utils::fresh::FastFreshStat
             let span = max - min + 1;
             let fresh_start = fresh.fresh_idents(span);
             let shift = fresh_start as i128 - min as i128;
-            // HS `rename` (LTerm.hs:619) uses `mapFrees (Monotone ...)`: the
+            // HS `rename` (LTerm.hs:607-614) uses `mapFrees (Monotone ...)`: the
             // index shift is monotone, so AC arg order is preserved.
             t.map_free_monotone(&mut |LVar { name, sort, idx }| LVar {
                 name,

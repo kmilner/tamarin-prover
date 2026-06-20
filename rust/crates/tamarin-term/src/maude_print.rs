@@ -5,7 +5,7 @@
 //! This module produces:
 //! - `pp_theory(&MaudeSig) -> String`: a `fmod MSG is … endfm` module that
 //!   declares the term algebra, AC operators, and rewriting rules.
-//! - `pp_mterm(&Term<MaudeLit>) -> String`: a Maude-syntax rendering of a
+//! - `pp_mterm(&Term<MaudeLit>) -> Vec<u8>`: a Maude-syntax rendering of a
 //!   term used in queries.
 
 use crate::function_symbols::{
@@ -267,7 +267,12 @@ pub fn pp_theory(msig: &MaudeSig) -> String {
     for sym in &msig.st_fun_syms {
         let name = String::from_utf8_lossy(&replace_underscore(&sym.name)).into_owned();
         let args = "Msg ".repeat(sym.arity);
-        let fsort = format!("{} : {}-> Msg", name, args);
+        // Match HS `theoryFunSym` (Parser.hs:247) byte-for-byte:
+        // `replaceUnderscore s <> " : " <> (concat $ replicate ar "Msg ") <> " -> Msg"`.
+        // `args` already ends in a trailing space (or is empty), and the
+        // literal " -> Msg" has a leading space, so there are two spaces
+        // before `->` for arity>0 (and `name :  -> Msg` for arity 0).
+        let fsort = format!("{} : {} -> Msg", name, args);
         op(&mut out, sym.privacy, sym.constructability, &fsort);
     }
     // Rewrite rules.

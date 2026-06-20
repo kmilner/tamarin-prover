@@ -61,8 +61,6 @@
 //! `--foo=VALUE` forms; we mirror that — a `--prove` with no value
 //! means "prove all lemmas".
 
-use std::collections::BTreeSet;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopOnTrace {
     Dfs,
@@ -96,7 +94,8 @@ impl PartialEval {
         match s.to_ascii_lowercase().as_str() {
             "summary" => Ok(PartialEval::Summary),
             "verbose" => Ok(PartialEval::Verbose),
-            other => Err(format!("unknown partial-evaluation mode: {}", other)),
+            // Mirror HS TheoryLoader.hs:320: `ArgumentError "partial-evaluation: unknown option"`.
+            _ => Err("partial-evaluation: unknown option".to_string()),
         }
     }
 }
@@ -177,7 +176,7 @@ pub struct Args {
     /// `None` = use default (`available_parallelism()` — full machine).
     /// `Some(1)` = single-threaded, byte-identical to sequential output.
     /// Mirrors HS's `+RTS -N RTS_FLAG` in spirit — see
-    /// `lib/theory/src/Prover.hs:102,195`, `Theory/Constraint/Solver/Sources.hs:471`,
+    /// `lib/theory/src/Prover.hs:102,195`, `Theory/Constraint/Solver/Sources.hs:362`,
     /// `lib/theory/src/TheoryObject.hs:744,752`.
     pub processors: Option<usize>,
 
@@ -494,56 +493,84 @@ pub fn parse_args(raw: &[String]) -> Result<Args, CliError> {
                 i += 1;
                 continue;
             }
-            // Single character short flags with separate value or
-            // inline `-Xvalue` / `-X=value`.
-            let (key, inline) = split_short(rest);
-            match key {
-                'h' | '?' => args.show_help = true,
-                'V' => args.show_version = true,
-                'v' => args.verbose = true,
-                'b' => {
-                    let v = take_short_val(&mut i, raw, inline, "bound")?;
-                    args.bound = Some(parse_int(&v, "bound")?);
+            // GNU-style clustering of boolean short flags, mirroring
+            // System.Console.CmdArgs.Explicit (`-vh` sets both verbose
+            // and help; HS `verbose`/`help`/`version` are all
+            // no-argument `flagNone`/`flagHelpSimple`/`flagVersion`).
+            // We walk the cluster char-by-char: a boolean short consumes
+            // exactly one char and we continue with the rest; the first
+            // value-taking short consumes the remainder of the token as
+            // its inline value (e.g. `-b12`, `-vb12`) — or the next
+            // token if nothing remains — and ends the cluster.
+            for (idx, key) in rest.char_indices() {
+                // Bytes after this char in the token form a potential
+                // inline value for a value-taking flag.  Strip a single
+                // leading `=` to keep `-b=12` working.
+                let after = &rest[idx + key.len_utf8()..];
+                let inline_raw = after.strip_prefix('=').unwrap_or(after);
+                let inline: Option<&str> =
+                    if inline_raw.is_empty() { None } else { Some(inline_raw) };
+                match key {
+                    'h' | '?' => {
+                        args.show_help = true;
+                        continue;
+                    }
+                    'V' => {
+                        args.show_version = true;
+                        continue;
+                    }
+                    'v' => {
+                        args.verbose = true;
+                        continue;
+                    }
+                    'b' => {
+                        let v = take_short_val(&mut i, raw, inline, "bound")?;
+                        args.bound = Some(parse_int(&v, "bound")?);
+                    }
+                    's' => {
+                        let v = take_short_val(&mut i, raw, inline, "saturation")?;
+                        args.saturation = Some(parse_int(&v, "saturation")?);
+                    }
+                    'c' => {
+                        let v = take_short_val(&mut i, raw, inline, "open-chains")?;
+                        args.open_chains = Some(parse_int(&v, "open-chains")?);
+                    }
+                    'd' => {
+                        let v = take_short_val(&mut i, raw, inline, "derivcheck-timeout")?;
+                        args.derivcheck_timeout = Some(parse_int(&v, "derivcheck-timeout")?);
+                    }
+                    'D' => {
+                        let v = take_short_val(&mut i, raw, inline, "defines")?;
+                        args.defines.push(v);
+                    }
+                    'o' => {
+                        let v = take_short_val(&mut i, raw, inline, "output")?;
+                        args.output_file = Some(v);
+                    }
+                    'O' => {
+                        let v = take_short_val(&mut i, raw, inline, "Output")?;
+                        args.output_dir = Some(v);
+                    }
+                    'm' => {
+                        let v = take_short_val(&mut i, raw, inline, "output-module")?;
+                        args.output_module = Some(v);
+                    }
+                    'p' => {
+                        let v = take_short_val(&mut i, raw, inline, "port")?;
+                        args.port = Some(parse_int(&v, "port")?);
+                    }
+                    'i' => {
+                        let v = take_short_val(&mut i, raw, inline, "interface")?;
+                        args.interface = Some(v);
+                    }
+                    other => {
+                        return Err(CliError::Msg(format!("unknown short flag: -{}", other)));
+                    }
                 }
-                's' => {
-                    let v = take_short_val(&mut i, raw, inline, "saturation")?;
-                    args.saturation = Some(parse_int(&v, "saturation")?);
-                }
-                'c' => {
-                    let v = take_short_val(&mut i, raw, inline, "open-chains")?;
-                    args.open_chains = Some(parse_int(&v, "open-chains")?);
-                }
-                'd' => {
-                    let v = take_short_val(&mut i, raw, inline, "derivcheck-timeout")?;
-                    args.derivcheck_timeout = Some(parse_int(&v, "derivcheck-timeout")?);
-                }
-                'D' => {
-                    let v = take_short_val(&mut i, raw, inline, "defines")?;
-                    args.defines.push(v);
-                }
-                'o' => {
-                    let v = take_short_val(&mut i, raw, inline, "output")?;
-                    args.output_file = Some(v);
-                }
-                'O' => {
-                    let v = take_short_val(&mut i, raw, inline, "Output")?;
-                    args.output_dir = Some(v);
-                }
-                'm' => {
-                    let v = take_short_val(&mut i, raw, inline, "output-module")?;
-                    args.output_module = Some(v);
-                }
-                'p' => {
-                    let v = take_short_val(&mut i, raw, inline, "port")?;
-                    args.port = Some(parse_int(&v, "port")?);
-                }
-                'i' => {
-                    let v = take_short_val(&mut i, raw, inline, "interface")?;
-                    args.interface = Some(v);
-                }
-                other => {
-                    return Err(CliError::Msg(format!("unknown short flag: -{}", other)));
-                }
+                // A value-taking flag consumed the remainder of the
+                // token (and possibly the next token); stop scanning
+                // this cluster.
+                break;
             }
             i += 1;
             continue;
@@ -607,18 +634,6 @@ fn split_eq(s: &str) -> (&str, Option<&str>) {
     match s.find('=') {
         Some(i) => (&s[..i], Some(&s[(i + 1)..])),
         None => (s, None),
-    }
-}
-
-fn split_short(s: &str) -> (char, Option<&str>) {
-    let mut chars = s.chars();
-    let c = chars.next().unwrap();
-    let rest = chars.as_str();
-    let rest = rest.strip_prefix('=').unwrap_or(rest);
-    if rest.is_empty() {
-        (c, None)
-    } else {
-        (c, Some(rest))
     }
 }
 
@@ -690,32 +705,29 @@ fn parse_int<T: std::str::FromStr>(s: &str, name: &str) -> Result<T, CliError> {
 }
 
 /// Does the lemma name match the user's `--prove`/`--lemma` filter?
-/// Empty filter or any entry equal to "" means "all lemmas".
-/// Otherwise the entry matches by exact name, OR by prefix when the
-/// entry ends in `*` (Haskell semantics).
+///
+/// Mirrors HS `lemmaSelector` (TheoryLoader.hs:378-389): the empty
+/// filter `[]`, the single-empty filter `[""]`, and the double-empty
+/// filter `["",""]` all mean "all lemmas".  Otherwise we run
+/// `any lemmaMatches filter` where a pattern ending in `*` matches by
+/// prefix (with the `*` dropped) and any other pattern (including a
+/// bare `""`) matches only by exact name.  Note this is NOT "drop all
+/// empties": three or more bare entries (e.g. `["","",""]`) fall
+/// through to the `any` arm and match nothing, exactly like HS.
 pub fn lemma_matches(filter: &[String], lemma_name: &str) -> bool {
-    if filter.is_empty() {
-        return true;
+    match filter.len() {
+        0 => return true,
+        1 if filter[0].is_empty() => return true,
+        2 if filter[0].is_empty() && filter[1].is_empty() => return true,
+        _ => {}
     }
-    let nonempty: BTreeSet<&str> = filter
-        .iter()
-        .map(|s| s.as_str())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if nonempty.is_empty() {
-        // bare `--prove` with no value — match all
-        return true;
-    }
-    for pat in nonempty {
+    filter.iter().any(|pat| {
         if let Some(prefix) = pat.strip_suffix('*') {
-            if lemma_name.starts_with(prefix) {
-                return true;
-            }
-        } else if pat == lemma_name {
-            return true;
+            lemma_name.starts_with(prefix)
+        } else {
+            pat == lemma_name
         }
-    }
-    false
+    })
 }
 
 // =============================================================================
@@ -730,56 +742,65 @@ pub const GIT_REV: &str = env!("TAMARIN_GIT_REV");
 pub const GIT_BRANCH: &str = env!("TAMARIN_GIT_BRANCH");
 pub const BUILD_TIMESTAMP: &str = env!("TAMARIN_BUILD_TIMESTAMP");
 
-/// `--version` output.  Mirrors HS's `Main.Console.versionStr` shape:
-/// banner + license + Maude self-check + `Generated from:` block.
+/// `--version` output.  Mirrors HS `--version` handling (Console.hs:328):
+/// `putStrLn versionStr` (the banner + license) is emitted first, THEN
+/// `ensureMaude` prints the `maude tool:` / ` checking version:` /
+/// ` checking installation:` self-check lines, and finally
+/// `getVersionIO` emits the `Generated from:` block (Console.hs:86-91).
+///
+/// In `ensureMaude` (Console.hs:151-165) ` checking version: ` carries
+/// the *maude* version followed by `. OK.` (`Right (strip out ++ ". OK.")`),
+/// not the tamarin banner.  HS additionally writes the self-check lines to
+/// stderr while the banner/`Generated from:` go to stdout; we keep a single
+/// combined string here for simplicity, but preserve HS's line ORDER.
 pub fn version_text() -> String {
-    let maude_version = detect_maude_version();
+    let maude_version = detect_maude_version_pub();
     let maude_ok = maude_version.is_some();
     let mv = maude_version.unwrap_or_else(|| "unknown".to_string());
+    let ok = if maude_ok { "OK." } else { "FAILED." };
     format!(
-        "maude tool: 'maude'\n\
-         \x20checking version: tamarin-prover {VERSION}, (C) David Basin, Cas Cremers, Jannik Dreier, Simon Meier, Ralf Sasse, Benedikt Schmidt, 2010-2023\n\
+        // versionStr: banner + license (Console.hs:220-231).
+        "tamarin-prover {VERSION}, (C) David Basin, Cas Cremers, Jannik Dreier, Simon Meier, Ralf Sasse, Benedikt Schmidt, 2010-2023\n\
          \n\
          This program comes with ABSOLUTELY NO WARRANTY. It is free software, and you\n\
          are welcome to redistribute it according to its LICENSE, see\n\
          'https://github.com/tamarin-prover/tamarin-prover/blob/master/LICENSE'.\n\
-         \n\
-         {mv}. {ok}\n\
+         maude tool: 'maude'\n\
+         \x20checking version: {mv}. {ok}\n\
          \x20checking installation: {ok}\n\
          Generated from:\n\
          Tamarin version {VERSION}\n\
          Maude version {mv}\n\
          Git revision: {GIT_REV}, branch: {GIT_BRANCH}\n\
          Compiled at: {BUILD_TIMESTAMP}\n",
-        ok = if maude_ok { "OK." } else { "FAILED." },
     )
 }
 
-/// Public alias for `detect_maude_version` — exposed for `run::run_test`
-/// and `run::run_variants` so both subcommands can probe Maude using
-/// the same logic.
+/// Probe `maude --version` on `PATH` and return the trimmed version
+/// string when Maude is reachable, `None` otherwise.
+///
+/// Mirrors HS `maudePath = fromMaybe "maude" . findArg "withMaude"`
+/// (Console.hs:84-85): when no `--with-maude` is supplied, HS probes the
+/// bare `maude` binary on `PATH` — it never consults hardcoded
+/// developer-box paths.  Use [`detect_maude_version_at`] to honor an
+/// explicit `--with-maude` path.
 pub fn detect_maude_version_pub() -> Option<String> {
-    detect_maude_version()
+    detect_maude_version_at("maude")
 }
 
-/// Probe `maude --version` (or the path from `--with-maude` if we had
-/// args here — but `version_text` runs before arg-routing).  Returns
-/// the version string when Maude is reachable, `None` otherwise.
-fn detect_maude_version() -> Option<String> {
-    // Mirror `default_maude_path()` in run.rs so we probe the same
-    // binary the prover will actually invoke.
-    for c in [
-        "/home/linuxbrew/.linuxbrew/bin/maude",
-        "/usr/local/bin/maude",
-        "/usr/bin/maude",
-        "maude",
-    ] {
-        if let Ok(out) = std::process::Command::new(c).arg("--version").output() {
-            if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout);
-                // Maude prints just the version number, e.g. "3.5.1".
-                let v = s.trim().to_string();
-                if !v.is_empty() { return Some(v); }
+/// Probe `<path> --version` and return the trimmed version string when
+/// the binary is reachable, `None` otherwise.  Callers that have an
+/// explicit `--with-maude` path (e.g. `run::run_test`/`run::run_variants`)
+/// should pass it here so the reported version matches the binary the
+/// prover will actually invoke (HS `ensureMaude` uses `maudePath as`).
+pub fn detect_maude_version_at(path: &str) -> Option<String> {
+    if let Ok(out) = std::process::Command::new(path).arg("--version").output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            // Maude prints just the version number, e.g. "3.5.1".
+            let v = s.trim().to_string();
+            if !v.is_empty() {
+                return Some(v);
             }
         }
     }
@@ -1124,6 +1145,54 @@ mod tests {
         assert!(lemma_matches(&f, "foo"));
         assert!(lemma_matches(&f, "barbaric"));
         assert!(!lemma_matches(&f, "baz"));
+    }
+
+    #[test]
+    fn lemma_matches_two_empties_match_all() {
+        // HS lemmaSelector special-cases `["", ""]` to True.
+        let f = vec![String::new(), String::new()];
+        assert!(lemma_matches(&f, "anything"));
+    }
+
+    #[test]
+    fn lemma_matches_three_empties_match_nothing() {
+        // HS lemmaSelector only special-cases null/[""]/["",""]; three
+        // bare entries fall through to `any lemmaMatches` and an empty
+        // pattern only matches a lemma literally named "".
+        let f = vec![String::new(), String::new(), String::new()];
+        assert!(!lemma_matches(&f, "anything"));
+        assert!(lemma_matches(&f, ""));
+    }
+
+    #[test]
+    fn clustered_boolean_shorts() {
+        // GNU-style clustering: `-vh` sets both verbose and help.
+        let a = parse(&["-vh"]);
+        assert!(a.verbose);
+        assert!(a.show_help);
+        let a = parse(&["-hV"]);
+        assert!(a.show_help);
+        assert!(a.show_version);
+    }
+
+    #[test]
+    fn clustered_bool_then_value_short() {
+        // A value-taking short ends the cluster, consuming the rest as
+        // its inline value: `-vb12` = verbose + bound 12.
+        let a = parse(&["-vb12"]);
+        assert!(a.verbose);
+        assert_eq!(a.bound, Some(12));
+    }
+
+    #[test]
+    fn partial_eval_unknown_message() {
+        let r = parse_args(&["--partial-evaluation=banana".to_string()]);
+        match r {
+            Err(CliError::Msg(m)) => {
+                assert_eq!(m, "partial-evaluation: unknown option");
+            }
+            _ => panic!("expected error"),
+        }
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! rules in the UI, and to wire `Autoprove` links the frontend
 //! recognises.
 
-use crate::handlers::path_parse::TheoryPath;
+use crate::handlers::path_parse::{url_path_escape, TheoryPath};
 use crate::handlers::root::html_escape;
 use crate::state::TheoryEntry;
 
@@ -162,7 +162,7 @@ fn proof_state(entry: &TheoryEntry) -> String {
              &nbsp; <a class=\"ajax-action proof-step autoprove\" href=\"/thy/trace/{idx}/autoprove/idfs/0/False/proof/{n_url}\">[autoprove]</a>\n",
             idx = idx,
             n = html_escape(&l.name),
-            n_url = url_path_escape_local(&l.name),
+            n_url = url_path_escape(&l.name),
             tq = tq,
             attrs = html_escape(&attrs),
             f = html_escape(&formula),
@@ -195,7 +195,7 @@ fn proof_state(entry: &TheoryEntry) -> String {
                  href=\"/thy/trace/{idx}/main/proof/{n_url}\">\
                  <span class=\"hl_keyword\">sorry</span></a><br>\n",
                 idx = idx,
-                n_url = url_path_escape_local(&l.name),
+                n_url = url_path_escape(&l.name),
             ));
         }
         out.push_str("</div>\n");
@@ -233,7 +233,7 @@ fn render_index_node(
         "<a class=\"internal-link proof-step {cls}\" href=\"/thy/trace/{idx}/main/proof/{lemma}{path}\">{label}</a><br>\n",
         cls = cls,
         idx = idx,
-        lemma = url_path_escape_local(lemma),
+        lemma = url_path_escape(lemma),
         path = url_path,
         label = html_escape(&label),
     ));
@@ -248,12 +248,6 @@ fn render_index_node(
     }
 }
 
-fn url_path_escape_local(s: &str) -> String {
-    s.chars().map(|c| match c {
-        c if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' => c.to_string(),
-        c => format!("%{:02X}", c as u32),
-    }).collect()
-}
 
 fn encode_index_path(path: &[String]) -> String {
     if path.is_empty() { return String::new(); }
@@ -263,7 +257,7 @@ fn encode_index_path(path: &[String]) -> String {
         let escaped = if seg.is_empty() { "_".to_string() }
             else if seg.starts_with('_') { format!("_{}", seg) }
             else { seg.to_string() };
-        s.push_str(&url_path_escape_local(&escaped));
+        s.push_str(&url_path_escape(&escaped));
     }
     s
 }

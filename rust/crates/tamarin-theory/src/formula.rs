@@ -81,28 +81,13 @@ impl<S, H, C, V> ProtoFormula<S, H, C, V> {
     }
 }
 
-/// Scope-blind rewrite of every atom in the formula. Note that scope-aware
-/// operations (`quantify`/`openFormula`/`shiftFreeIndices`) need the
-/// `foldFormulaScope`-style binder-depth index, which this helper does not
-/// thread, so they cannot be built directly on top of it.
-pub fn map_atoms<S, H, C, V, F>(f: &mut F, formula: ProtoFormula<S, H, C, V>) -> ProtoFormula<S, H, C, V>
-where
-    F: FnMut(ProtoAtom<S, VTerm<C, BVar<V>>>) -> ProtoAtom<S, VTerm<C, BVar<V>>>,
-{
-    match formula {
-        ProtoFormula::Atom(a) => ProtoFormula::Atom(f(a)),
-        ProtoFormula::Tf(b) => ProtoFormula::Tf(b),
-        ProtoFormula::Not(inner) => ProtoFormula::Not(Box::new(map_atoms(f, *inner))),
-        ProtoFormula::Conn(c, l, r) => ProtoFormula::Conn(
-            c,
-            Box::new(map_atoms(f, *l)),
-            Box::new(map_atoms(f, *r)),
-        ),
-        ProtoFormula::Qua(q, h, body) => {
-            ProtoFormula::Qua(q, h, Box::new(map_atoms(f, *body)))
-        }
-    }
-}
+// NOTE: Haskell `mapAtoms` (Formula.hs:264-267) is
+// `foldFormulaScope (\i a -> Ato $ f i a) ...`, i.e. its callback receives
+// the De Bruijn binder-depth `i` (threaded via `go (succ i)` at each `Qua`,
+// Formula.hs:163-170). The scope-aware machinery in the Rust port lives
+// elsewhere (depth-threaded rewrites in `guarded_types.rs`, macro
+// application in `macro_expand.rs::apply_macros_formula`), so no
+// depth-blind `mapAtoms` mirror is provided here.
 
 #[cfg(test)]
 mod tests {
@@ -136,9 +121,8 @@ mod tests {
     // Formula.hs:104-108: `data Connective = And | Or | Imp | Iff`
     //                     `data Quantifier = All | Ex`
     //
-    // These orders matter for any BTreeMap<Connective,_> iteration or
-    // structural comparison.  More importantly, Atom variant order
-    // affects partial_atom_valuation iteration in simplifyGuarded.
+    // These orders matter for any BTreeMap<Connective,_> iteration and for
+    // Haskell-faithful structural comparison / round-tripping of formulas.
     // =========================================================================
 
     /// `Connective` Ord — `And < Or < Imp < Iff` from Formula.hs:104.
@@ -151,10 +135,11 @@ mod tests {
 
     /// `Quantifier` Ord — `All < Ex` from Formula.hs:108.
     ///
-    /// This is the order that downstream `partial_atom_valuation`
-    /// and `simplify_guarded` use to decompose quantified formulas.
-    /// If Ex sorted before All, the simplifier would visit existentials
-    /// first and miss universal-driven contradictions.
+    /// The All<Ex order is required for Haskell-faithful structural /
+    /// BTreeMap comparisons and round-tripping of formulas, matching the
+    /// `data Quantifier = All | Ex` declaration order. (The guarded-formula
+    /// simplifier does not iterate quantifiers in this order; it
+    /// pattern-matches structurally — see `simplify_guarded_with`.)
     #[test]
     fn quantifier_ord_matches_haskell_declaration() {
         assert!(Quantifier::All < Quantifier::Ex,

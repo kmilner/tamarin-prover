@@ -15,9 +15,16 @@
 //! handling, and solved-path extraction — a port of HS's
 //! `cutOnSolvedDFS`.
 //!
-//! Termination is HS-faithfully bounded by the ID-DFS depth alone
-//! (`MAX_DEPTH`, doubling from 4 up to a 2048 cap) — `cutOnSolvedDFS`
-//! has only `dMax` and no step/node budget.  The per-lemma wall-clock
+//! Termination is bounded by the ID-DFS depth alone (`MAX_DEPTH`,
+//! doubling from 4) — `cutOnSolvedDFS` has only `dMax` and no
+//! step/node budget.  NOTE: unlike Haskell's `cutOnSolvedDFS`
+//! (Proof.hs:855-861), which doubles `dMax` without an upper bound,
+//! we cap the doubling at 2048 as a Rust-only termination safety
+//! guard.  This only diverges on pathological proofs whose witness
+//! sits below single-path depth 2048 (far beyond any realistic
+//! Tamarin proof); the divergence is conservative (we report
+//! `Sorry`, never a wrong verdict) and at that depth unbounded
+//! Haskell would itself likely hang/OOM.  The per-lemma wall-clock
 //! deadline is a Rust-only addition, OFF by default (opt in via
 //! `TAM_PROVE_DEADLINE_MS`); see `proof_deadline`.
 
@@ -349,7 +356,8 @@ pub fn run_proof_search(
     root
 }
 
-/// HS-faithful `extractSolved` (Proof.hs:922-927): walks the proof
+/// HS-faithful `extractSolved` (Proof.hs:879-884, the non-diff
+/// `cutOnSolvedDFS` variant): walks the proof
 /// tree, finds the first Solved-leaf path from root, and prunes all
 /// non-path siblings.  Mutates `root` in place.
 fn extract_solved_path(root: &mut ProofNode) {
@@ -463,7 +471,8 @@ fn re_expand_depth_limited(
         }
     }
     // Re-roll up the parent's status from current children — mirrors
-    // expand's rollup at lines 356-370.
+    // `expand_inner`'s `node.status = if any_solved ...` rollup
+    // (the `Semigroup ProofStatus` port below).
     let mut any_solved = false;
     let mut any_contra = false;
     let mut any_unfin = false;
@@ -502,7 +511,7 @@ fn expand(
     expand_inner(ctx, node, budget, deadline, depth);
     // After expansion, `sys` is no longer read EXCEPT on
     // `Sorry: depth limit` leaves, which `re_expand_depth_limited`
-    // (search.rs:269 onwards) re-runs `expand` on during the next
+    // (defined below in this file) re-runs `expand` on during the next
     // ID-DFS iteration — those need their sys.  Everything else
     // (resolved leaves, interior nodes, terminal Sorrys) can drop.
     // Profile: csf17::injectivity 1010-step proof tree holds ~200 MB
@@ -655,7 +664,6 @@ fn expand_inner(
         };
         return;
     }
-    let mut all_closed = true;       // All children are Solved OR Contradictory
     let mut any_contra = false;
     let mut any_solved = false;
     let mut any_unfin = false;
@@ -673,8 +681,9 @@ fn expand_inner(
     // Haskell finds the trace at one specific case (e.g. `c_aenc`)
     // after the lazy Disj-monad short-circuits other paths.
     //
-    // Case iteration order: `execProofMethod` (ProofMethod.hs:435-441)
-    // builds a `Data.Map` keyed by case name via `M.fromListWith`, so
+    // Case iteration order: `execProofMethod`'s `process` helper
+    // (ProofMethod.hs:302-308) builds a `Data.Map` keyed by case name
+    // via `M.fromListWith` (ProofMethod.hs:307), so
     // entries are alphabetically ordered.  `proveSystemDFS` /
     // `cutOnSolvedDFS` then walk in map order (Proof.hs:855-877 —
     // `foldMap`, `M.map`).  Our `Vec` preserves creation order
@@ -824,9 +833,9 @@ fn expand_inner(
             match child.status {
                 NodeStatus::Solved => any_solved = true,
                 NodeStatus::Contradictory => any_contra = true,
-                NodeStatus::Unfinishable => { any_unfin = true; all_closed = false; }
-                NodeStatus::Sorry => { any_sorry = true; all_closed = false; }
-                NodeStatus::Open => { all_closed = false; }
+                NodeStatus::Unfinishable => any_unfin = true,
+                NodeStatus::Sorry => any_sorry = true,
+                NodeStatus::Open => {}
             }
             node.children.insert(name, child);
         }
@@ -850,9 +859,9 @@ fn expand_inner(
             match child.status {
                 NodeStatus::Solved => any_solved = true,
                 NodeStatus::Contradictory => any_contra = true,
-                NodeStatus::Unfinishable => { any_unfin = true; all_closed = false; }
-                NodeStatus::Sorry => { any_sorry = true; all_closed = false; }
-                NodeStatus::Open => { all_closed = false; }
+                NodeStatus::Unfinishable => any_unfin = true,
+                NodeStatus::Sorry => any_sorry = true,
+                NodeStatus::Open => {}
             }
             node.children.insert(name, child);
         }
@@ -893,9 +902,8 @@ fn expand_inner(
         // case-set was already handled earlier as `Contradictory`.
         NodeStatus::Sorry
     };
-    let _ = all_closed; // unused now — kept the variable to mark
-                        // intent that `Contradictory` requires no
-                        // open branch (only Contradictory children).
+    // Note: `Contradictory` is only reached when no child is
+    // Solved/Sorry/Unfinishable — i.e. every branch closed to ⊥.
 }
 
 /// Build the priority-ordered list of candidate proof methods to
@@ -939,7 +947,7 @@ pub fn candidate_methods(
         Err(e) if e.0 == "__ORACLE_QUIT_ON_EMPTY__" => {
             // Oracle ranked nothing and quitOnEmpty is set: emit ApplySorry.
             // HS: `guard (quitOnEmpty && not (null inp) && null ranked) *> Just ApplySorry`
-            // (ProofMethod.hs:842) — stoppingMethod fires.
+            // (ProofMethod.hs:621, inside `oracleRanking`) — stoppingMethod fires.
             // We represent this as an empty candidate list with a special Sorry.
             return vec![ProofMethod::Sorry(Some("Oracle ranked no proof methods".into()))];
         }
@@ -962,7 +970,11 @@ pub fn candidate_methods(
         out.push(ProofMethod::SolveGoal(g.goal));
     }
     // Insert Induction at the appropriate position in initial state.
-    let initial = can_apply_induction(sys);
+    // Haskell's automatic path (`rankProofMethods`, ProofMethod.hs:527)
+    // gates `insertInduction` on `isInitialSystem sys` only; `execMethods`
+    // then filters non-applicable methods (the `ginduct` check below is
+    // our analog of `getInductionCases`).
+    let initial = is_initial_system(sys);
     if initial {
         let can_induct = sys.formulas.first()
             .map(|fm| crate::guarded::ginduct(fm).is_ok())
@@ -983,16 +995,18 @@ pub fn candidate_methods(
     out
 }
 
-/// Mirror of Haskell's `canApplyInduction` precondition: induction is
-/// only valid on the *initial* state of the system, before anything
-/// else has been added.
-fn can_apply_induction(sys: &System) -> bool {
-    sys.nodes.is_empty()
-        && sys.edges.is_empty()
-        && sys.less_atoms.is_empty()
-        && sys.solved_formulas.is_empty()
-        && sys.goals.is_empty()
-        && sys.formulas.len() == 1
+/// Mirror of Haskell's `isInitialSystem` (System.hs:828-829):
+///
+///   isInitialSystem sys =
+///     null (L.get sSolvedFormulas sys) && not (S.member bot (L.get sFormulas sys))
+///
+/// where `bot = GDisj (Disj [])` (our `gfalse()` = `Guarded::Disj(vec![])`).
+/// This is the exact gate the automatic-search path (`rankProofMethods`,
+/// ProofMethod.hs:527) uses to decide whether `insertInduction` runs — NOT
+/// the stricter replay-only `canApplyInduction` (ProofMethod.hs:264-270).
+fn is_initial_system(sys: &System) -> bool {
+    sys.solved_formulas.is_empty()
+        && !sys.formulas.contains(&crate::guarded::gfalse())
 }
 
 #[cfg(test)]

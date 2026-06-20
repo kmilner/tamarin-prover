@@ -8,11 +8,8 @@
 //! where polymorphism actually matters (open vs closed, diff vs trace)
 //! we model with explicit enums or distinct types.
 
-use std::collections::BTreeMap;
-
 use tamarin_term::lterm::LVar;
 
-use crate::fact::fact_tag_name;
 use crate::predicate::Predicate;
 use crate::restriction::ProtoRestriction;
 use crate::rule::{ProtoRuleAC, ProtoRuleE};
@@ -344,30 +341,6 @@ impl<R, P, S> Theory<R, P, S> {
         self.lemmas().find(|l| l.name == name)
     }
 
-    /// Look up a predicate by fact name (lower-cased).
-    pub fn lookup_predicate(&self, fact_name: &str) -> Option<&Predicate> {
-        self.predicates().find(|p| fact_tag_name(&p.fact.tag) == fact_name)
-    }
-
-    /// Add a rule, returning Err if a rule with the same name already
-    /// exists.  Simplified convenience helper, not a faithful mirror of
-    /// Haskell's `addOpenProtoRule` (OpenTheory.hs): it rejects *any*
-    /// name collision (HS lets you re-add the identical rule via its
-    /// `ru ==` allowance) and does not check the rule's own AC-variant
-    /// name uniqueness (HS `allRuleNamesAreDifferent`).
-    pub fn add_rule_unique(&mut self, rule: R, name: impl Fn(&R) -> &str) -> Result<&mut Self, &'static str> {
-        let new_name = name(&rule).to_string();
-        if self.rules().any(|r| name(r) == new_name) {
-            return Err("duplicate rule");
-        }
-        self.items.push(TheoryItem::Rule(rule));
-        Ok(self)
-    }
-
-    /// Index lemmas by name for quick lookup.
-    pub fn lemma_index(&self) -> BTreeMap<&str, &Lemma<P>> {
-        self.lemmas().map(|l| (l.name.as_str(), l)).collect()
-    }
 }
 
 // =============================================================================

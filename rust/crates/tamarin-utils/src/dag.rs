@@ -3,7 +3,6 @@
 //! Vertex-list-based DAG operations. A `Relation<T>` is `Vec<(T, T)>`.
 
 use std::collections::BTreeSet;
-use std::hash::Hash;
 
 pub type Relation<T> = Vec<(T, T)>;
 
@@ -115,7 +114,7 @@ pub fn toposort<T: Ord + Clone>(rel: &Relation<T>) -> Vec<T> {
 /// `dfsLoopBreakers rel`: a minimal set of vertices whose removal breaks
 /// every cycle, found by greedy DFS. Determinism follows the order of
 /// `rel`'s source vertices.
-pub fn dfs_loop_breakers<T: Ord + Clone + Hash>(rel: &Relation<T>) -> Vec<T> {
+pub fn dfs_loop_breakers<T: Ord + Clone>(rel: &Relation<T>) -> Vec<T> {
     let mut visited: BTreeSet<T> = BTreeSet::new();
     let mut breakers: Vec<T> = Vec::new();
 
@@ -167,6 +166,10 @@ pub fn trans_red<T: Ord + Clone>(dag: &Relation<T>) -> Relation<T> {
         }
     }
 
+    // Haskell `foldl' visit []` prepends kept edges (`x : newEdges`), so the
+    // returned list is in reverse processing order. We build forward (push) and
+    // reverse at the end to reproduce that order exactly. The reachability
+    // decision reads `new_edges` only as a set, so it is order-independent.
     let mut new_edges: Relation<T> = Vec::new();
     for (j, i) in indexed {
         let edge = (topo[j].clone(), topo[i].clone());
@@ -177,6 +180,7 @@ pub fn trans_red<T: Ord + Clone>(dag: &Relation<T>) -> Relation<T> {
             new_edges.push(edge);
         }
     }
+    new_edges.reverse();
     new_edges
 }
 

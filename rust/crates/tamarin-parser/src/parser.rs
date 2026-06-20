@@ -125,20 +125,14 @@ pub struct Parser<'a> {
     /// argument supplied by the caller and echoed into `Theory::is_diff`;
     /// `theory()` does not derive it from `flags` or a `#define diff` preamble.
     is_diff: bool,
-    /// Currently-known function symbols (added by builtins / functions:).
-    /// Used to disambiguate `f(...)` (function app) from a process call by
-    /// identifier in the term parser. Only an upper bound; we accept unknown
-    /// symbols too at parse level.
-    known_funcs: HashSet<String>,
     /// Whether to enable parsing of operators that depend on builtins.
-    /// We default-enable everything since this is a structural parser.
+    /// We default-enable everything since this is a structural parser, so these
+    /// are always `true`; they are kept as named gates for the operator-parsing
+    /// sites (`!eqn && self.enable_x`) should builtin-aware gating ever be added.
     enable_dh: bool,
     enable_xor: bool,
     enable_mset: bool,
     enable_nat: bool,
-    enable_bp: bool,
-    /// Builtin names that are reserved (e.g. the function `inv`, `pmult`, ...).
-    reserved_funcs: HashSet<String>,
     /// Directory of the file currently being parsed (`takeDirectory inFile0` in
     /// HS).  `#include "file"` resolves relative to this; `None` (no source
     /// file) means includes are taken verbatim, mirroring HS's `Nothing` case.
@@ -149,29 +143,20 @@ impl<'a> Parser<'a> {
     pub fn new(src: &'a str, flags: &[&str], is_diff: bool) -> Self {
         let mut flags_set = HashSet::new();
         for f in flags { flags_set.insert((*f).to_string()); }
-        let mut p = Parser {
-            lx: Lexer::new(src),
-            flags: flags_set,
-            is_diff,
-            known_funcs: HashSet::new(),
-            enable_dh: false,
-            enable_xor: false,
-            enable_mset: false,
-            enable_nat: false,
-            enable_bp: false,
-            reserved_funcs: HashSet::new(),
-            base_dir: None,
-        };
         // Always enable parse-time recognition of the operators. The parser is
         // syntactic — semantic gating against builtin enablement happens at
         // elaboration. This follows the practice of accepting more than the
         // strict Haskell grammar at the syntax level.
-        p.enable_dh = true;
-        p.enable_xor = true;
-        p.enable_mset = true;
-        p.enable_nat = true;
-        p.enable_bp = true;
-        p
+        Parser {
+            lx: Lexer::new(src),
+            flags: flags_set,
+            is_diff,
+            enable_dh: true,
+            enable_xor: true,
+            enable_mset: true,
+            enable_nat: true,
+            base_dir: None,
+        }
     }
 
     // -------- Error helpers --------
@@ -350,7 +335,9 @@ impl<'a> Parser<'a> {
         if self.at_keyword("let") { return self.process_def(); }
 
         // Accountability: `lemma X [accountability_attrs] ...` is matched by lemma_item.
-        // Also: anonymous lemmaAcc `lemma name : accounts for [..]`.
+        // A lemmaAcc requires >=1 case-test ident before `accounts for` (HS
+        // `commaSep1`, Accountability.hs:36); the zero-ident form falls back to
+        // a normal lemma.
 
         Err(self.err(format!(
             "unknown top-level construct, near {:?}",
@@ -496,8 +483,6 @@ impl<'a> Parser<'a> {
         let mut sub = Parser::new(content, &[], self.is_diff);
         // Thread parser state IN (HS `getState` before `parseFileWState`).
         sub.flags = self.flags.clone();
-        sub.known_funcs = self.known_funcs.clone();
-        sub.reserved_funcs = self.reserved_funcs.clone();
         sub.base_dir = sub_base;
 
         // Parse the header-less item stream: same loop as a theory body, but it
@@ -509,10 +494,8 @@ impl<'a> Parser<'a> {
         }
 
         // Thread parser state BACK (HS `putState st'` + `sig st'` merge): pick up
-        // any new function symbols / flags the included file declared.
+        // any new flags the included file declared.
         self.flags = sub.flags;
-        self.known_funcs = sub.known_funcs;
-        self.reserved_funcs = sub.reserved_funcs;
 
         Ok(items)
     }
@@ -563,8 +546,7 @@ impl<'a> Parser<'a> {
         let mut names = Vec::new();
         loop {
             let n = self.hyphen_identifier()?;
-            names.push(n.clone());
-            self.note_builtin(&n);
+            names.push(n);
             if !self.try_punct(",") { break; }
         }
         Ok(TheoryItem::Builtins(names))
@@ -592,31 +574,6 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(s)
-    }
-
-    fn note_builtin(&mut self, name: &str) {
-        let funcs: &[&str] = match name {
-            "diffie-hellman" => &["inv", "1"],
-            "bilinear-pairing" => &["inv", "1", "pmult", "em"],
-            "multiset" => &[],
-            "xor" => &["zero"],
-            "symmetric-encryption" => &["senc", "sdec"],
-            "asymmetric-encryption" => &["aenc", "adec", "pk"],
-            "signing" => &["sign", "verify", "true", "pk"],
-            "dest-pairing" => &["fst", "snd", "pair"],
-            "dest-symmetric-encryption" => &["senc", "sdec"],
-            "dest-asymmetric-encryption" => &["aenc", "adec", "pk"],
-            "dest-signing" => &["sign", "verify", "revealVerify", "getMessage", "true", "pk"],
-            "revealing-signing" => &["revealSign", "revealVerify", "getMessage", "verify", "true", "pk"],
-            "hashing" => &["h"],
-            "natural-numbers" => &[],
-            "locations-report" => &["rep", "check_rep"],
-            _ => &[],
-        };
-        for f in funcs {
-            self.known_funcs.insert((*f).to_string());
-            self.reserved_funcs.insert((*f).to_string());
-        }
     }
 
     fn options(&mut self) -> Result<TheoryItem, ParseError> {
@@ -733,7 +690,6 @@ impl<'a> Parser<'a> {
         let mut decls = Vec::new();
         loop {
             let f = self.function_decl()?;
-            self.known_funcs.insert(f.name.clone());
             decls.push(f);
             if !self.try_punct(",") { break; }
         }
@@ -785,10 +741,13 @@ impl<'a> Parser<'a> {
     /// SAPIC type: `<defaultSapicTypeS>` = `Any` placeholder, or an identifier.
     /// We accept any identifier as a type.
     fn type_p(&mut self) -> Result<Option<String>, ParseError> {
-        // Haskell uses `defaultSapicTypeS` — a literal token. We'll accept
-        // any identifier and additionally `Any` as the default placeholder.
+        // HS `typep` (Token.hs:472-473): `try (symbol defaultSapicTypeS) *>
+        // return Nothing <|> Just <$> identifier`, where `defaultSapicTypeS =
+        // "Any"` (Theory/Sapic/Term.hs:95) — the default placeholder is the
+        // literal `Any` (case-sensitive), anything else is `Just <ident>`.
+        // This port additionally accepts `*` and lowercase `any` as the default
+        // (parser-level permissiveness beyond the strict Haskell grammar).
         self.skip_ws();
-        // Peek for sentinel — Haskell uses `*` for default.
         if self.try_punct("*") { return Ok(None); }
         let id = self.ident()?;
         if id == "Any" || id == "any" { Ok(None) } else { Ok(Some(id)) }
@@ -796,8 +755,13 @@ impl<'a> Parser<'a> {
 
     fn equations(&mut self) -> Result<TheoryItem, ParseError> {
         self.require_kw("equations")?;
+        // HS `equations` (Signature.hs:219-224): `convergent` is set only when
+        // the literal `[convergent]` is present (`brackets (symbol "convergent")`);
+        // an empty `[]` makes the `try` block fail (convergent=False) and the
+        // subsequent `symbol "equations" *> colon` then errors on the `[`. So the
+        // `convergent` keyword is required inside the brackets here.
         let convergent = if self.try_punct("[") {
-            let _ = self.try_kw("convergent");
+            self.require_kw("convergent")?;
             self.require_punct("]")?;
             true
         } else { false };
@@ -833,8 +797,6 @@ impl<'a> Parser<'a> {
             }
             self.require_punct("=")?;
             let body = self.term(false)?;
-            // Macros are recognised as functions in subsequent terms.
-            self.known_funcs.insert(name.clone());
             ms.push(Macro { name, args, body });
             if !self.try_punct(",") { break; }
         }
@@ -981,7 +943,11 @@ impl<'a> Parser<'a> {
 
     fn parse_rule_ac(&mut self) -> Result<Rule, ParseError> {
         self.require_kw("rule")?;
-        // moduloAC required
+        // HS `protoRuleACInfo`/`intrRule` (Rule.hs:137-138/157) sequence a
+        // non-optional `moduloAC` here (`symbol "rule" *> moduloAC *> ...`).
+        // This port relaxes that: `try_modulo` returns `None` when the
+        // `(modulo AC)` head is absent and parsing proceeds. (More lenient than
+        // Haskell, but still accepts all valid Haskell input.)
         let modulo = self.try_modulo();
         let name = self.ident()?;
         let attributes = self.rule_attributes()?;
@@ -1091,21 +1057,32 @@ impl<'a> Parser<'a> {
     fn read_balanced_token(&mut self) -> Result<String, ParseError> {
         self.skip_ws();
         let start = self.save();
-        let pairs = [('(', ')'), ('[', ']'), ('{', '}'), ('"', '"'), ('\'', '\''), ('<', '>')];
+        // HS `parseAndIgnore = betweenMatching (\(l,r) -> manyCharsExcept [l,r] ...)`
+        // (Rule.hs:85). `betweenMatching` (Token.hs:305-316) tries each pair in
+        // `matches`, and `manyCharsExcept [l,r]` (Token.hs:320-321) consumes
+        // chars until the FIRST `l` or `r` (NO nesting), after which `between`
+        // requires the closing `r`. The pair set INCLUDES `('|','|')`.
+        let pairs = [
+            ('"', '"'), ('\'', '\''), ('(', ')'), ('[', ']'),
+            ('{', '}'), ('|', '|'), ('<', '>'),
+        ];
         if let Some(c) = self.lx.peek() {
             for (l, r) in pairs.iter() {
                 if c == *l {
                     self.lx.bump();
                     let mut s = String::new();
-                    let mut depth = 1u32;
-                    while depth > 0 {
+                    loop {
                         match self.lx.peek() {
                             None => return Err(self.err("unterminated bracketed value")),
-                            Some(ch) if ch == *l && *l != *r => { depth += 1; s.push(ch); self.lx.bump(); }
-                            Some(ch) if ch == *r => {
-                                depth -= 1;
-                                if depth > 0 { s.push(ch); }
+                            // Stop at the first `l` or `r` (matches
+                            // `manyCharsExcept`, which does not nest); the closer
+                            // `r` is then consumed by `between`.
+                            Some(ch) if ch == *r || ch == *l => {
+                                if ch != *r {
+                                    return Err(self.err("unterminated bracketed value"));
+                                }
                                 self.lx.bump();
+                                break;
                             }
                             Some(ch) => { s.push(ch); self.lx.bump(); }
                         }
@@ -1157,8 +1134,9 @@ impl<'a> Parser<'a> {
         loop {
             let f = self.fact()?;
             fs.push(f);
-            // HS `commaSep1 fact` (Rule.hs:196) = `sepEndBy1 comma`: a trailing
-            // comma before `]` is permitted.
+            // HS `list (fact ...)` (Rule.hs:183/188) = `brackets . commaSep`
+            // (Token.hs:362-363) with `commaSep = sepEndBy comma`: the list may
+            // be empty (handled above) and a trailing comma before `]` is OK.
             if !self.try_punct(",") { break; }
             if self.peek_punct("]") { break; }
         }
@@ -1232,6 +1210,13 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        // HS `lemmaAcc` (Accountability.hs:36) uses `commaSep1 $ identifier`,
+        // requiring at least one case-test identifier before `accounts for`.
+        // Since the whole `lemmaAcc` is `try`-wrapped, an empty list backtracks
+        // and the caller reparses as a normal lemma — so fall back here too.
+        if idents.is_empty() {
+            self.restore(save); return Ok(None);
+        }
         if !(self.try_kw("accounts") || self.try_kw("account")) {
             self.restore(save); return Ok(None);
         }
@@ -1301,10 +1286,16 @@ impl<'a> Parser<'a> {
             else if self.try_kw("left") { attrs.push(LemmaAttr::Left); }
             else if self.try_kw("right") { attrs.push(LemmaAttr::Right); }
             else {
-                // Generic hint attribute: read until `,` or `]`.
+                // HS `lemmaAttribute` (Lemma.hs:39-53) is a closed `asum` of the
+                // recognised attributes with no catch-all; an unknown attribute
+                // makes `list (lemmaAttribute ...)` fail and `protoLemma`'s outer
+                // `try` backtrack into a load error. An empty read here means we
+                // are at `]` (empty list) or a trailing `,`, both of which are
+                // permitted by `commaSep` — so break in that case, otherwise
+                // reject the unknown attribute to match Haskell.
                 let raw = self.read_until_attribute_end();
                 if raw.is_empty() { break; }
-                attrs.push(LemmaAttr::Hint(raw));
+                return Err(self.err(format!("unknown lemma attribute: {raw}")));
             }
             if !self.try_punct(",") { break; }
         }
@@ -1342,9 +1333,12 @@ impl<'a> Parser<'a> {
         // top-level keyword. If no proof tokens appear, return None.
         self.skip_ws();
         let save = self.save();
+        // Proof-method starter keywords. `rule` is deliberately excluded: a bare
+        // `rule` followed by `:` is a rule declaration, not a proof start (only
+        // the hyphenated `rule-equivalence` is a proof method).
         let proof_starters = [
             "simplify", "solve", "case", "qed", "by", "next", "induction",
-            "rule-equivalence", "backward-search", "sorry", "rule",
+            "rule-equivalence", "backward-search", "sorry",
             "step", "rev",
         ];
         // Check for hyphenated proof identifiers.
@@ -1352,16 +1346,6 @@ impl<'a> Parser<'a> {
         let starts = match probe {
             Some(id) => proof_starters.contains(&id.as_str()),
             None => false,
-        };
-        // For ambiguity: `rule` on its own followed by `:` is a rule, not a
-        // proof. We only treat `rule` as proof start if followed by hyphen.
-        let starts = starts && {
-            if let Some(id) = self.peek_hyphen_identifier() {
-                if id == "rule" {
-                    // not valid as proof start
-                    false
-                } else { true }
-            } else { false }
         };
         if !starts { self.restore(save); return Ok(None); }
         let raw = self.read_until_next_top_level();
@@ -1536,23 +1520,38 @@ impl<'a> Parser<'a> {
             // `let pat = t [, pat = t]* in p` or with newline-separated
             // bindings (Tamarin's `genericletBlock = many1 definition` has no
             // separator between bindings).
+            // HS `genericletBlock = many1 definition` (Let.hs:24) with
+            // `definition = sapicpatternterm <* equalSign <*> sapicterm`. There
+            // is no separator between bindings; `many1` greedily reparses a
+            // `definition` and backtracks when one fails to parse. We mirror that
+            // by attempting another `(pat = val)` binding and restoring on
+            // failure — this avoids a fixed first-char heuristic that missed
+            // patterns starting with `=` (PatternMatch) or `'` (public name).
             let mut bindings: Vec<(Term, Term)> = Vec::new();
-            loop {
+            // First binding is required.
+            {
                 let pat = self.term(false)?;
                 self.require_punct("=")?;
                 let val = self.term(false)?;
                 bindings.push((pat, val));
+            }
+            loop {
                 let _ = self.try_punct(",");
                 self.skip_ws();
                 if self.at_keyword("in") { break; }
-                // Heuristic: if the next token doesn't look like the start of
-                // another binding (an identifier or sigil-led variable), we
-                // also stop.
+                // Try to parse one more binding; backtrack if it doesn't parse
+                // (matching `many1`'s greedy-with-backtrack behaviour).
                 let probe = self.save();
-                let cont = matches!(self.lx.peek(),
-                    Some(c) if c.is_alphabetic() || c == '~' || c == '$' || c == '#' || c == '%' || c == '<');
-                self.restore(probe);
-                if !cont { break; }
+                let next = (|| -> Result<(Term, Term), ParseError> {
+                    let pat = self.term(false)?;
+                    self.require_punct("=")?;
+                    let val = self.term(false)?;
+                    Ok((pat, val))
+                })();
+                match next {
+                    Ok(b) => bindings.push(b),
+                    Err(_) => { self.restore(probe); break; }
+                }
             }
             self.require_kw("in")?;
             let p = self.process()?;
@@ -1937,6 +1936,12 @@ impl<'a> Parser<'a> {
             return Ok(Formula::Atom(Atom::LessMset(lhs, rhs)));
         }
         if self.try_punct("<") {
+            // HS `blatom` (Formula.hs:49) restricts both operands of `<` to
+            // node/timepoint variables: `Less <$> try (nodevarTerm <* opLess)
+            // <*> nodevarTerm`. This structural port intentionally accepts any
+            // `term` on both sides (parser-level permissiveness); the sort
+            // restriction is deferred to elaboration. Valid theories (which use
+            // timepoint vars with `<`) parse identically.
             let rhs = self.term(false)?;
             return Ok(Formula::Atom(Atom::Less(lhs, rhs)));
         }

@@ -61,12 +61,11 @@ pub struct ConvCtx {
 impl ConvCtx {
     pub fn new() -> Self { Self::default() }
 
-    pub fn fresh_var(&mut self, _sort: LSort) -> u64 {
-        let id = self.counter;
-        self.counter += 1;
-        id
-    }
-    pub fn fresh_const(&mut self, _sort: LSort) -> u64 {
+    /// Allocate the next id from the single shared encounter-order counter.
+    /// Both variables and constants draw from this counter (sort is
+    /// ignored), matching HS's global `FreshState = Integer` (see the
+    /// `counter` field doc above).
+    pub fn fresh_id(&mut self) -> u64 {
         let id = self.counter;
         self.counter += 1;
         id
@@ -81,8 +80,39 @@ impl ConvCtx {
 // Sort lookup for constants
 // =============================================================================
 
+/// Name-id prefix used by `maude_proc.rs` to mark a synthetic skolem
+/// constant whose intended Maude sort is `Msg`.
+///
+/// `NameTag` has no `Msg` variant (a `Name` constant is always Fresh,
+/// Pub, Node or Nat), and adding one would require non-exhaustive
+/// `match`es across many crates to be updated.  The Maude wire encoding,
+/// however, *does* support a `Msg`-sorted constant directly: the emitted
+/// theory declares `op c : Nat -> Msg` and `MaudeConst(i, LSort::Msg)`
+/// prints as `c(i)`.  So to faithfully mirror HS's
+/// `sortOfSkol (SkConst v) = lvarSort v` (Guarded.hs:805-808) — where a
+/// skolemized free variable keeps its *own* sort, which may be `Msg` —
+/// we carry a `Msg`-sorted skolem as a `NameTag::Pub` `Name` whose id
+/// begins with this sentinel, and recognise it here so that
+/// `sort_of_name` returns `LSort::Msg` (not the carrier tag's `Pub`).
+///
+/// `Pub` is a strict subsort of `Msg`, so without this a `Msg` skolem
+/// would be emitted as `p(i)` and Maude order-sorted matching would
+/// *over-match* (succeeding where HS, treating it as `Msg`, would not).
+///
+/// This sentinel is namespaced (double-underscore + `skMSG` + double
+/// underscore) so it cannot collide with any real protocol constant
+/// (which originate from `'...'`/`~'...'` literals).
+pub const SKOLEM_MSG_PREFIX: &str = "__skMSG__";
+
 /// `sortOfName` — the sort of a `Name` literal.
 pub fn sort_of_name(n: &Name) -> LSort {
+    // Msg-sorted skolem constants are carried as `NameTag::Pub` names
+    // with a sentinel id prefix; recover their true `Msg` sort here so
+    // the Maude wire constant is `c(i)` (Msg), not `p(i)` (Pub).  See
+    // `SKOLEM_MSG_PREFIX`.
+    if matches!(n.tag, NameTag::Pub) && n.id.as_str().starts_with(SKOLEM_MSG_PREFIX) {
+        return LSort::Msg;
+    }
     match n.tag {
         NameTag::Fresh => LSort::Fresh,
         NameTag::Pub => LSort::Pub,
@@ -102,7 +132,16 @@ pub fn lterm_to_mterm_global(t: &LNTerm, ctx: &mut ConvCtx) -> MTerm {
         Term::Lit(lit) => Term::Lit(import_lit(lit, ctx)),
         Term::App(sym, args) => {
             let new_args: Vec<MTerm> = args.iter().map(|a| lterm_to_mterm_global(a, ctx)).collect();
-            Term::App(sym.clone(), new_args.into())
+            // Smart constructor so AC args are flattened+sorted and C/EMap
+            // args sorted by MaudeLit order, matching HS `lTermToMTerm`
+            // (Term/Maude/Types.hs:72) `go (FApp o as) = fApp o <$> ...`,
+            // where `fApp (AC s) = fAppAC` (flatten+sort) and
+            // `fApp (C s) = fAppC` (sort) per Raw.hs:111-131.  Using the
+            // raw `Term::App` constructor here left AC/em args in the
+            // LNTerm-side order, which (because MaudeLit Ord keys on the
+            // global encounter-order id) can differ from HS's MaudeLit
+            // ordering and change the emitted Maude query string.
+            crate::term::f_app(sym.clone(), new_args)
         }
     }
 }
@@ -113,12 +152,12 @@ fn import_lit(l: &Lit<Name, LVar>, ctx: &mut ConvCtx) -> MaudeLit {
     }
     let m = match l {
         Lit::Var(lv) => {
-            let id = ctx.fresh_var(lv.sort);
+            let id = ctx.fresh_id();
             MaudeLit::MaudeVar(id, lv.sort)
         }
         Lit::Con(n) => {
             let s = sort_of_name(n);
-            let id = ctx.fresh_const(s);
+            let id = ctx.fresh_id();
             MaudeLit::MaudeConst(id, s)
         }
     };
@@ -153,6 +192,13 @@ pub fn mterm_to_lnterm(
             // come back as `~k1:Msg:6`). Recover the canonical original
             // LVar so subst lookups downstream don't see two distinct
             // (name, sort, idx) instances for the same logical variable.
+            //
+            // NB: this INTENTIONALLY DIVERGES from HS `mTermToLNTerm`'s
+            // `importLit` (Term/Maude/Types.hs:89), whose `lookupBinding`
+            // is strict in the full MaudeLit sort and would instead mint a
+            // fresh LVar at the widened sort.  We track Maude's ground
+            // truth here to avoid the TESLA Sender0a chain artifact rather
+            // than mirror HS's strict-sort lookup.
             if let MaudeLit::MaudeVar(idx, sort) = ml {
                 if let Some(orig) = lookup_canonical_var_lit(ctx, *sort, *idx) {
                     return Term::Lit(orig);
@@ -257,6 +303,30 @@ pub fn lookup_canonical_var_lit(
 mod tests {
     use super::*;
     use crate::vterm::var_term;
+
+    #[test]
+    fn skolem_msg_constant_sorts_as_msg() {
+        use crate::lterm::{Name, NameId, NameTag};
+        // A sentinel-prefixed Pub-carrier name is reported as Msg so the
+        // Maude wire constant is `c(i)` (HS `sortOfSkol = lvarSort v`).
+        let msg_skol = Name {
+            tag: NameTag::Pub,
+            id: NameId::new(format!("{}0_x_7_M", SKOLEM_MSG_PREFIX)),
+        };
+        assert_eq!(sort_of_name(&msg_skol), LSort::Msg);
+        // A non-skolem Pub constant is still Pub.
+        let real_pub = Name { tag: NameTag::Pub, id: NameId::new("alice") };
+        assert_eq!(sort_of_name(&real_pub), LSort::Pub);
+        // The sentinel only applies to Pub-tagged carriers.
+        let fresh = Name { tag: NameTag::Fresh, id: NameId::new("k") };
+        assert_eq!(sort_of_name(&fresh), LSort::Fresh);
+        // And the emitted Maude constant uses the `c` (Msg) symbol.
+        let t: LNTerm = Term::Lit(Lit::Con(msg_skol));
+        let mut ctx = ConvCtx::new();
+        let mt = lterm_to_mterm_global(&t, &mut ctx);
+        let wire = String::from_utf8(crate::maude_print::pp_mterm(&mt)).unwrap();
+        assert!(wire.starts_with("c("), "expected Msg constant `c(..)`, got {wire}");
+    }
 
     #[test]
     fn round_trip_var() {

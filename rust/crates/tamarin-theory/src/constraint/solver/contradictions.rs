@@ -161,13 +161,13 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
     if has_forbidden_kd(sys) { out.push(Contradiction::ForbiddenKD); }
     // 5. ImpossibleChain.
     if has_impossible_chain(_ctxt, sys) { out.push(Contradiction::ImpossibleChain); }
-    // 6. ForbiddenExp (Contradictions.hs:147 + 362-388).  Drops Exp-down rule
+    // 6. ForbiddenExp (Contradictions.hs:147 + 308-335).  Drops Exp-down rule
     //    instances whose g is simple, whose MsgVar args are KU-known earlier,
     //    and whose exponent factors are already in the up-premise.  enableDH.
     if _ctxt.maude.maude_sig().enable_dh && has_forbidden_exp(sys) {
         out.push(Contradiction::ForbiddenExp);
     }
-    // 7. ForbiddenBP (Contradictions.hs:149 + 392-483).  Drops Pmult-down /
+    // 7. ForbiddenBP (Contradictions.hs:149 + 336-420).  Drops Pmult-down /
     //    Emap-down rule instances violating BP normal-form (redundant scalars,
     //    simplifiable em-then-exp compositions, Emap tag-order violations).
     //    enableBP.  (Chen_Kudla::key_agreement_reachable relies on this.)
@@ -194,7 +194,7 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
 
 /// `hasNonNormalTerms` — port of Haskell's
 /// `Theory.Constraint.Solver.Contradictions.hasNonNormalTerms`
-/// (`Contradictions.hs:163-166`).
+/// (`Contradictions.hs:143-146`).
 ///
 /// HS spec:
 /// ```haskell
@@ -229,7 +229,7 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
 /// x)` and `mult(x, tid)` to the same form, but the pure
 /// structural check treats both as in NF) — the same reason
 /// `subst_creates_non_normal_terms` was switched to `nf_via_haskell`
-/// in commit `a7b2e3c5`.  The two checks are observably equivalent
+/// (the pure structural NF check) rather than `maude.reduce`.  The two checks are observably equivalent
 /// on the current corpus (no lemma's verdict changes) but the
 /// mechanism alignment to HS source is the point.
 fn has_non_normal_terms(ctx: &ProofContext, sys: &System) -> bool {
@@ -285,8 +285,8 @@ fn has_non_normal_terms(ctx: &ProofContext, sys: &System) -> bool {
 /// the `_` arm catches both `Lit (Var _)` and reducible `FApp`.
 ///
 /// For `has_non_normal_terms` the variable case is harmless:
-/// `reduce(z) == z` since variables are already NF, and the
-/// Maude bridge caches the result.
+/// variables are structurally in NF under `nf_via_haskell`, so an
+/// included bare variable never triggers a non-normal-term verdict.
 fn maybe_not_nf_subterms(
     irreducible: &tamarin_term::function_symbols::FunSig,
     t: &tamarin_term::lterm::LNTerm,
@@ -460,7 +460,8 @@ enum DhView<'a> {
 }
 
 /// `possibleEndSyms`: HS-faithful port using `viewTerm2` to apply DH-
-/// special cases (FExp/FPMult/FEMap).  Mirrors Sources.hs:277-286.
+/// special cases (FExp/FPMult/FEMap).  Mirrors Contradictions.hs:257-266
+/// (defined locally inside `hasImpossibleChain`).
 fn possible_end_syms(
     t: &tamarin_term::lterm::LNTerm,
 ) -> Option<Vec<RootSym>> {
@@ -510,7 +511,8 @@ fn possible_end_syms(
 }
 
 /// `possibleRootSyms`: HS-faithful port using `viewTerm2` to apply DH-
-/// special cases.  Mirrors Sources.hs:288-299.  Returns `Some([])`
+/// special cases.  Mirrors Contradictions.hs:268-279 (defined locally
+/// inside `hasImpossibleChain`).  Returns `Some([])`
 /// (no possible decomposition) when the term cannot contain fresh
 /// names or private functions — equivalent to
 /// `isForbiddenDeconstruction`.
@@ -807,7 +809,7 @@ fn has_forbidden_chain(sys: &System) -> bool {
 }
 
 /// HS-faithful port of `hasForbiddenExp`
-/// (`Theory.Constraint.Solver.Contradictions:364-388`).
+/// (`Theory.Constraint.Solver.Contradictions:308-335`).
 ///
 /// Detects an `Exp-down` (d_exp) rule instance whose conclusion is
 /// not allowed in a normal dependency graph.
@@ -1020,16 +1022,16 @@ fn has_forbidden_exp(sys: &System) -> bool {
 
 /// `hasForbiddenBP` — port of Haskell's
 /// `Theory.Constraint.Solver.Contradictions.hasForbiddenBP`
-/// (`Contradictions.hs:392-396`).  Gated on `enableBP` at the caller.
+/// (`Contradictions.hs:336-339`).  Gated on `enableBP` at the caller.
 ///
 /// Detects three non-normal bilinear-pairing rule instance patterns:
 ///   1. `isForbiddenDPMult`: `Pmult-down` with redundant scalar
-///      (Contradictions.hs:400-411).
+///      (Contradictions.hs:344-369).
 ///   2. `isForbiddenDEMap`:  `Emap-down` → `Exp-down` simplifiable
-///      composition (Contradictions.hs:427-446).
+///      composition (Contradictions.hs:371-396).
 ///   3. `isForbiddenDEMapOrder`: `Emap-down` premise ordering
 ///      violating tag-priority normal form
-///      (Contradictions.hs:454-483).
+///      (Contradictions.hs:398-420).
 ///
 /// First found case suffices to flag the system contradictory.
 ///
@@ -1061,7 +1063,7 @@ fn has_forbidden_bp(sys: &System) -> bool {
     false
 }
 
-/// `isForbiddenDPMult` — Contradictions.hs:400-411.
+/// `isForbiddenDPMult` — Contradictions.hs:344-369.
 ///
 /// A `Pmult-down` rule of shape `[KD(pmult(s,p)), KU(b)] → [KD(pmult(c,p))]`
 /// is forbidden when:
@@ -1094,7 +1096,7 @@ fn is_forbidden_d_pmult<I>(ru: &crate::rule::Rule<crate::rule::RuleInfo<I, crate
     bp_factors_subset(c, b)
 }
 
-/// `isForbiddenDEMap` — Contradictions.hs:427-446.
+/// `isForbiddenDEMap` — Contradictions.hs:371-396.
 ///
 /// A `dExp` rule whose first premise's provider is a `dEMap` rule
 /// instance, where the EMap's `[s]P / [r]Q` premises are
@@ -1139,7 +1141,7 @@ fn is_forbidden_d_emap(sys: &System,
     bp_over_complicated(s_sc, p_pt, ke) || bp_over_complicated(r_sc, q_pt, ke)
 }
 
-/// `isForbiddenDEMapOrder` — Contradictions.hs:454-483.
+/// `isForbiddenDEMapOrder` — Contradictions.hs:398-420.
 ///
 /// For a `dEMap` rule instance whose conclusion has the canonical
 /// shape `KD(exp(em(p,q), Mult([s,r])))`, find the two protocol
@@ -1230,13 +1232,18 @@ fn is_forbidden_d_emap_order(sys: &System,
     if !is_stand(rp1) || !is_stand(rp2) { return false; }
 
     // factTags ruProto1 > factTags ruProto2
+    //   where factTags ru = map (map factTag) [rPrems ru, rConcs ru, rActs ru]
+    // HS compares a list-OF-lists, so each fact group is a distinct inner
+    // list whose length is significant — they must NOT be flattened into a
+    // single sequence (that would cross group boundaries). Build
+    // `[[prem tags], [conc tags], [act tags]]` and compare lexicographically.
     let tags_of = |r: &crate::rule::Rule<RuleInfo<ProtoRuleACInstInfo, crate::rule::IntrRuleACInfo>>|
-        -> Vec<crate::fact::FactTag> {
-        let mut out = Vec::new();
-        for f in r.premises.iter().chain(r.conclusions.iter()).chain(r.actions.iter()) {
-            out.push(f.tag.clone());
-        }
-        out
+        -> Vec<Vec<crate::fact::FactTag>> {
+        vec![
+            r.premises.iter().map(|f| f.tag.clone()).collect(),
+            r.conclusions.iter().map(|f| f.tag.clone()).collect(),
+            r.actions.iter().map(|f| f.tag.clone()).collect(),
+        ]
     };
     tags_of(rp1) > tags_of(rp2)
 }
@@ -1305,7 +1312,7 @@ fn bp_factors_subset(c: &tamarin_term::lterm::LNTerm,
     true
 }
 
-/// `overComplicated scalar point ke` — Contradictions.hs:445-446.
+/// `overComplicated scalar point ke` — Contradictions.hs:389-396.
 ///   `(niFactors scalar \\ niFactors ke == []) && neverContainsFreshPriv point`
 fn bp_over_complicated(scalar: &tamarin_term::lterm::LNTerm,
                        point: &tamarin_term::lterm::LNTerm,
@@ -1342,6 +1349,18 @@ fn non_injective_fact_instances(
     }
     for e in &sys.edges {
         adj.entry(e.src.0.clone()).or_default().push(e.tgt.0.clone());
+    }
+    // HS `nonInjectiveFactInstances` uses `less = rawLessRel se`, and
+    // `rawLessRel = getLessRel sLessAtoms ++ rawEdgeRel` where
+    // `rawEdgeRel = sEdges ++ unsolvedChains` (System.hs:1613-1622). Each
+    // unsolved `ChainG c p` contributes a `(c.0, p.0)` edge to the
+    // reachability relation; without it we miss reachability through open
+    // chains. Matches `build_always_before_adj` (system.rs:660-667).
+    for (g, st) in sys.goals.iter() {
+        if st.solved { continue; }
+        if let crate::constraint::constraints::Goal::Chain(c, p) = g {
+            adj.entry(c.0.clone()).or_default().push(p.0.clone());
+        }
     }
     // `adj` is invariant across this function, so memoize each node's
     // reachable set: `reachable(i)` is taken once per edge and `reachable(j)`
@@ -1692,6 +1711,17 @@ fn node_after_last(sys: &System) -> Vec<Contradiction> {
     for e in &sys.edges {
         adj.entry(e.src.0.clone()).or_default().push(e.tgt.0.clone());
     }
+    // `rawLessRel = lessAtoms ∪ rawEdgeRel` and
+    // `rawEdgeRel = sEdges ++ unsolvedChains` (System.hs:1613-1622), so
+    // each unsolved `ChainG c p` contributes a `(c.0, p.0)` edge. Without
+    // it `reachableSet` misses successors reachable only through an open
+    // chain. Matches `build_always_before_adj` (system.rs:660-667).
+    for (g, st) in sys.goals.iter() {
+        if st.solved { continue; }
+        if let crate::constraint::constraints::Goal::Chain(c, p) = g {
+            adj.entry(c.0.clone()).or_default().push(p.0.clone());
+        }
+    }
     // isInTrace: collect every node-id that is "in the trace".
     let mut in_trace: BTreeSet<NodeId> = BTreeSet::new();
     for (id, _) in sys.nodes.iter() {
@@ -1723,7 +1753,7 @@ fn node_after_last(sys: &System) -> Vec<Contradiction> {
 /// returning every subterm that could be non-normal under some
 /// substitution.  Used by `subst_creates_non_normal_terms` below.
 /// Mirrors Haskell's `Contradictions.maybeNonNormalTerms`
-/// (Contradictions.hs:170-175).
+/// (Contradictions.hs:149-155).
 pub fn maybe_non_normal_terms(
     sys: &System,
     irreducible: &tamarin_term::function_symbols::FunSig,
@@ -1748,7 +1778,7 @@ pub fn maybe_non_normal_terms(
 /// substituted by `fsubst`) creates a non-normal-form term.  Used by
 /// `simp_minimize` to filter SplitG variants that would violate the
 /// nf-respecting trace semantics.  Mirrors Haskell's
-/// `Contradictions.substCreatesNonNormalTerms` (Contradictions.hs:177-184):
+/// `Contradictions.substCreatesNonNormalTerms` (Contradictions.hs:157-164):
 ///
 /// ```haskell
 /// substCreatesNonNormalTerms hnd sys fsubst =

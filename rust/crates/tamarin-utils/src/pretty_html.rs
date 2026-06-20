@@ -83,14 +83,45 @@ pub fn render_html_doc(doc: &Doc) -> String {
 
 /// Convert line breaks to `<br/>` and replace leading whitespace per line
 /// with `&nbsp;` runs.
+///
+/// Mirrors `postprocessHtmlDoc = unlines . map (addBreak . indent) . lines`
+/// (Html.hs:157-162). Note both `lines` (treats `\n` as a terminator, so a
+/// trailing `\n` does not yield an extra empty line) and `unlines` (appends
+/// `\n` after *every* line, including the last) are matched here.
 pub fn postprocess(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for (i, line) in s.split('\n').enumerate() {
-        if i > 0 { out.push('\n'); }
+    // Haskell `lines`: split on '\n' where '\n' is a line terminator. An empty
+    // input yields no lines; a trailing '\n' does not produce a trailing empty
+    // segment (`lines "a\n" == ["a"]`).
+    let mut rest = s;
+    loop {
+        let (line, tail, more) = match rest.find('\n') {
+            Some(idx) => (&rest[..idx], &rest[idx + 1..], true),
+            None => {
+                if rest.is_empty() {
+                    break;
+                }
+                (rest, "", false)
+            }
+        };
         let leading = line.chars().take_while(|c| c.is_whitespace()).count();
-        for _ in 0..leading { out.push_str("&nbsp;"); }
-        out.push_str(&line[line.char_indices().nth(leading).map(|(i, _)| i).unwrap_or(line.len())..]);
+        for _ in 0..leading {
+            out.push_str("&nbsp;");
+        }
+        out.push_str(
+            &line[line
+                .char_indices()
+                .nth(leading)
+                .map(|(i, _)| i)
+                .unwrap_or(line.len())..],
+        );
+        // addBreak + unlines: `<br/>` then a trailing newline for every line.
         out.push_str("<br/>");
+        out.push('\n');
+        if !more {
+            break;
+        }
+        rest = tail;
     }
     out
 }
@@ -128,13 +159,13 @@ mod tests {
     fn render_with_highlight_wraps_keyword() {
         let d = keyword(Doc::text("rule")).cat_with(Doc::text(" foo"));
         let html = render_html_doc(&d);
-        assert_eq!(html, "<span class=\"hl_keyword\">rule</span> foo<br/>");
+        assert_eq!(html, "<span class=\"hl_keyword\">rule</span> foo<br/>\n");
     }
 
     #[test]
     fn postprocess_handles_indent_and_newlines() {
         let s = "a\n  b\nc";
         let p = postprocess(s);
-        assert_eq!(p, "a<br/>\n&nbsp;&nbsp;b<br/>\nc<br/>");
+        assert_eq!(p, "a<br/>\n&nbsp;&nbsp;b<br/>\nc<br/>\n");
     }
 }

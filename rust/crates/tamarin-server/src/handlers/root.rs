@@ -24,9 +24,15 @@ pub async fn post(
     State(state): State<Arc<AppState>>,
     mut mp: Multipart,
 ) -> Response {
+    // Mirror Haskell `postRootR` (src/Web/Handler.hs:785-812): a missing
+    // `uploadedTheory` field → "Post request failed."; an empty file →
+    // "No theory file given."; a load error → "Theory loading failed:…";
+    // success → "Loaded new theory!".
     let mut alert_msg: Option<String> = None;
+    let mut found_field = false;
     while let Some(field) = mp.next_field().await.unwrap_or(None) {
         if field.name() != Some("uploadedTheory") { continue; }
+        found_field = true;
         let filename = field.file_name().unwrap_or("uploaded.spthy").to_string();
         let bytes: Bytes = match field.bytes().await {
             Ok(b) => b,
@@ -44,10 +50,17 @@ pub async fn post(
             Ok(entry) => {
                 let idx = state.store.insert(entry);
                 tracing::info!(idx, file = %filename, "uploaded theory");
+                // Haskell appends a wellformedness-warning suffix when the
+                // report is non-empty; the Rust load path does not surface
+                // that report, so we emit the no-warning message only.
+                alert_msg = Some("Loaded new theory!".into());
             }
             Err(e) => { alert_msg = Some(format!("Theory loading failed: {}", e)); }
         }
         break;
+    }
+    if !found_field && alert_msg.is_none() {
+        alert_msg = Some("Post request failed.".into());
     }
     let mut html = render_index(&state);
     if let Some(msg) = alert_msg {

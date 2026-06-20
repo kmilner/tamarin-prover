@@ -10,9 +10,9 @@
 //!    for negative cases.
 //!
 //! For the Rust port we expose the Maude-backed `norm` directly and
-//! a structural `nf` check that returns `Some(true)` / `Some(false)`
-//! when the answer is decidable from syntax alone, or `None` to
-//! defer to Maude.
+//! the pure structural `nf_via_haskell` check, which decides normal
+//! form from syntax alone (independent of any AC canonicalisation
+//! Maude might apply).
 
 use crate::function_symbols::{AcSym, FunSig, FunSym};
 use crate::lterm::LNTerm;
@@ -27,13 +27,6 @@ pub fn norm(maude: &MaudeHandle, t: &LNTerm) -> Result<LNTerm, MaudeError> {
     // Maude round-trip for them.
     if matches!(t, Term::Lit(_)) { return Ok(t.clone()); }
     maude.reduce(t)
-}
-
-/// `nf_via_maude` — normal-form check by computing the normal form
-/// and comparing.
-pub fn nf_via_maude(maude: &MaudeHandle, t: &LNTerm) -> Result<bool, MaudeError> {
-    let n = norm(maude, t)?;
-    Ok(&n == t)
 }
 
 /// `normSubstVFresh'` — normalise every range term of a `LNSubstVFresh`
@@ -57,96 +50,6 @@ pub fn norm_subst_vfresh(
         Ok(n) => n,
         Err(_) => t,
     })
-}
-
-/// Cheap structural NF check. Returns `Some(false)` for terms that
-/// are clearly reducible (e.g. `inv(inv(_))`, `(t1 ^ t2) ^ t3`,
-/// `1 ^ _`, `t * 1`, ...). Returns `Some(true)` if the term is
-/// guaranteed normal (literals, applications under irreducible
-/// symbols only). Returns `None` for cases the structural check
-/// can't decide on its own.
-pub fn nf_structural(msig: &MaudeSig, t: &LNTerm) -> Option<bool> {
-    let irreducible = &msig.irreducible_fun_syms;
-    fn go(t: &LNTerm, irreducible: &FunSig) -> Option<bool> {
-        match t {
-            Term::Lit(_) => Some(true),
-            Term::App(sym, args) => {
-                // Top-level reducible patterns we can recognise without
-                // looking at sort information.
-                if let Some(b) = obvious_reduction(t) {
-                    return Some(!b); // obvious_reduction true → reducible → nf=false
-                }
-                if irreducible.contains(sym) || matches!(sym, FunSym::List | FunSym::C(_)) {
-                    let mut all_known = true;
-                    for a in args.iter() {
-                        match go(a, irreducible) {
-                            Some(false) => return Some(false),
-                            Some(true) => {}
-                            None => all_known = false,
-                        }
-                    }
-                    return if all_known { Some(true) } else { None };
-                }
-                // Unknown reducibility: defer.
-                None
-            }
-        }
-    }
-    go(t, irreducible)
-}
-
-/// Recognise top-level shapes that are immediately reducible by the
-/// built-in rewrite rules. Returns `true` if the term IS reducible.
-fn obvious_reduction(t: &LNTerm) -> Option<bool> {
-    use crate::function_symbols::INV_SYM_STRING;
-    if let Term::App(FunSym::NoEq(s), args) = t {
-        // inv(inv(_)) — reducible.
-        if s.name == INV_SYM_STRING {
-            if let Some(Term::App(FunSym::NoEq(s2), inner)) = args.first() {
-                if s2.name == INV_SYM_STRING && inner.len() == 1 {
-                    return Some(true);
-                }
-            }
-        }
-    }
-    // (t1 ^ t2) ^ t3 — reducible by exp-down.
-    if let Term::App(FunSym::NoEq(s), args) = t {
-        const EXP: &[u8] = b"exp";
-        if s.name == EXP && args.len() == 2 {
-            // base is itself an exp?
-            if let Some(Term::App(FunSym::NoEq(s2), _)) = args.first() {
-                if s2.name == EXP { return Some(true); }
-            }
-            // exponent is `1`?
-            if let Some(rhs) = args.get(1) {
-                if is_one_constant(rhs) { return Some(true); }
-            }
-        }
-    }
-    // mult ts containing 1 / containing nested mult — reducible.
-    if let Term::App(FunSym::Ac(AcSym::Mult), args) = t {
-        if args.iter().any(is_one_constant) { return Some(true); }
-        if args.iter().any(|a| matches!(a, Term::App(FunSym::Ac(AcSym::Mult), _))) {
-            return Some(true);
-        }
-    }
-    // xor with `zero` — reducible.
-    if let Term::App(FunSym::Ac(AcSym::Xor), args) = t {
-        if args.iter().any(is_zero_constant) { return Some(true); }
-    }
-    None
-}
-
-fn is_one_constant(t: &LNTerm) -> bool {
-    if let Term::App(FunSym::NoEq(s), args) = t {
-        s.name == crate::function_symbols::ONE_SYM_STRING && args.is_empty()
-    } else { false }
-}
-
-fn is_zero_constant(t: &LNTerm) -> bool {
-    if let Term::App(FunSym::NoEq(s), args) = t {
-        s.name == crate::function_symbols::ZERO_SYM_STRING && args.is_empty()
-    } else { false }
 }
 
 /// `nfViaHaskell` — pure structural normal-form check.  Mirrors HS
@@ -219,7 +122,7 @@ fn go_nf(t: &LNTerm, msig: &MaudeSig, irreducible: &FunSig) -> bool {
             //    no-AC matcher is sufficient.  See subterm_rule.rs and
             //    builtin.rs.
             for rule in &msig.st_rules {
-                if rule_applies(t, &rule.lhs, &rule.rhs.term) {
+                if rule_applies(t, &rule.lhs, &rule.rhs) {
                     return false;
                 }
             }
@@ -386,29 +289,28 @@ fn invalid_xor(ts: &[LNTerm]) -> bool {
 
 /// `struleApplicable` — HS `Norm.hs:104-110`.  Returns true iff the
 /// rule's LHS matches `t` AND the rule actually rewrites `t` to
-/// something different (when the RHS is a constant).
-fn rule_applies(t: &LNTerm, lhs: &LNTerm, rhs: &LNTerm) -> bool {
+/// something different.
+fn rule_applies(t: &LNTerm, lhs: &LNTerm, rhs: &crate::subterm_rule::StRhs) -> bool {
     use crate::rewriting::Match;
     let problem = Match::match_with(t.clone(), lhs.clone());
     let matched = crate::unification::solve_match_lterm_no_ac(
         &|n| crate::lterm::sort_of_name(n),
         problem,
     );
-    // HS: StRhs [] s -> not (t == s) ; StRhs _ _ -> True
-    // The `StRhs [] s` case (RHS is a closed constant — no LHS-positions)
-    // can be detected by checking `frees(rhs).is_empty() && positions_in_lhs == 0`,
-    // but the StRhs struct in RS stores `positions` separately.  For the
-    // builtin rules used in tamarin, RHS is always either a variable that
-    // appears in LHS (e.g. `fst(pair(x,y)) → x`) or a constant.  When it
-    // appears in LHS, rule_applies returning True iff matched.is_some()
-    // is safe (the rewrite always changes `t` because the LHS structure
-    // is decomposed).  When RHS is a constant, returning True iff
-    // matched.is_some() && t != rhs preserves HS's behaviour.
+    // HS (Norm.hs:107-110):
+    //   _:_ -> case rhs of
+    //            StRhs [] s -> not (t == s)   -- reducible, but RHS might equal t
+    //            StRhs _  _ -> True
+    // i.e. the disambiguating branch is on the POSITIONS list being empty
+    // (`StRhs []`), NOT on the RHS term being ground.  `rRuleToCtxtStRule`
+    // always yields non-empty positions (constantPositions of an FApp is
+    // never empty; the non-ground branch returns None on empty), so the
+    // `StRhs []` arm is effectively dead and a match always returns True.
     match matched {
         None => false,
         Some(_) => {
-            if crate::lterm::frees(rhs).is_empty() {
-                t != rhs
+            if rhs.positions.is_empty() {
+                t != &rhs.term
             } else {
                 true
             }
@@ -466,14 +368,6 @@ mod tests {
         let t: LNTerm = Term::Lit(Lit::Var(v));
         let n = norm(&h, &t).unwrap();
         assert_eq!(t, n);
-    }
-
-    #[test]
-    fn nf_structural_lit_is_nf() {
-        let sig = pair_maude_sig();
-        let v = LVar::new("x", LSort::Msg, 0);
-        let t: LNTerm = Term::Lit(Lit::Var(v));
-        assert_eq!(nf_structural(&sig, &t), Some(true));
     }
 
     #[test]

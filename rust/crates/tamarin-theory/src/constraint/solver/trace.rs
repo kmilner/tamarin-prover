@@ -1,11 +1,18 @@
-//! Synchronized execution-trace facility for diffing against the
-//! Haskell tamarin-prover's `TAM_HS_TRACE_EXEC` output.
+//! RS-only execution-trace diagnostic scaffolding.
+//!
+//! This is a Rust-only facility with no counterpart in the canonical
+//! Haskell tree.  It was designed to diff against a *private/local*
+//! instrumented build of the Haskell tamarin-prover; the matching
+//! Haskell side (an `[EXEC]`-style `traceExecM` patch) was never
+//! committed upstream, so the labels below have no canonical
+//! `Simplify.hs` / `Goals.hs` / `Reduction.hs` / `Trace.hs`
+//! counterparts to cite.
 //!
 //! Set `TAM_RS_TRACE_EXEC=1` to enable.  Each major solver entry point
 //! emits a single `[EXEC] <function> <canonical-data>` line via
-//! [`trace_exec`].  Output format is intentionally identical to the
-//! Haskell side's `T.traceExecM` so the two logs can be `diff`-ed to
-//! find the first execution divergence between the implementations.
+//! [`trace_exec`].  The output is intended to be diffed against an
+//! equivalently-instrumented Haskell build to locate the first
+//! execution divergence between the implementations.
 //!
 //! Design choices:
 //! - The env var is read once via `std::sync::OnceLock` so the check
@@ -13,8 +20,7 @@
 //! - No sequence numbers in the output — keeps the diff focused on
 //!   trace-content drift instead of counter drift.
 //! - Data is normalised to suppress fresh-var indices (use canonical
-//!   sort prefix + name only).  Mirror Haskell's `goalKind` /
-//!   `factCanonical` choices in the trace sites.
+//!   sort prefix + name only).
 
 use std::sync::OnceLock;
 use std::cell::RefCell;
@@ -30,7 +36,7 @@ thread_local! {
     static CASE_PATH: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 
     /// Current operation label, set by callers of apply_eq_store/add_eqs.
-    /// Mirrors HS's `currentAddEqsLabel` IORef.  Used by [rs-aes]
+    /// RS-only.  Used by [rs-aes]
     /// trace to attribute each apply_eq_store call to the originating
     /// Reduction operation (solveTermEqs, solveFactEqs, chain_extend,
     /// ENU.kuActions, etc.) so HS↔RS apply_eq_store call counts can
@@ -133,8 +139,9 @@ pub fn case_path_set(path: &[String]) {
 }
 
 /// TAM_RS_TRACE_FORM=1 emits `[FORMULA_ADD] path=... kind=... <repr>` lines
-/// for each formula insertion into sys.formulas / sys.goals.  Pairs with
-/// HS's `TAM_HS_TRACE_FORM` for finding insertion divergences.
+/// for each formula insertion into sys.formulas / sys.goals.  RS-only; pairs
+/// with the equivalent insertion trace in the private instrumented HS build
+/// for finding insertion divergences.
 pub fn form_flag() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| std::env::var("TAM_RS_TRACE_FORM").is_ok())
@@ -220,23 +227,26 @@ fn flag() -> bool {
     *FLAG.get_or_init(|| std::env::var("TAM_RS_TRACE_EXEC").is_ok())
 }
 
-/// Static-string `traceExecM` labels that HS emits exactly once per
-/// program run due to GHC CSE on the literal `String` argument to
-/// `traceM`.  The full set, identified by grepping HS for
-/// `T.traceExecM "..."` (literal-only):
+/// Static-string trace labels that the (private) instrumented Haskell
+/// build emits exactly once per program run due to GHC CSE on the
+/// literal `String` argument to the trace call.  These four labels
+/// correspond to fixed string literals on the HS side (as opposed to
+/// labels concatenated with `show n` / a rule name, which are distinct
+/// per call and emit per-invocation):
 ///
-///   - `simplifySystem`            (Simplify.hs:67)
-///   - `solveChain ENTER`          (Goals.hs:323)
-///   - `FrNarrow`                  (Reduction.hs:271)
-///   - `exploitPrem InFact`        (Reduction.hs:250)
-///
-/// All other `traceExecM` callsites use a concatenated string
-/// (`++ show n`, `++ getRuleName ru`, etc.) which has a distinct
-/// expression per call and emits per-invocation in HS.
+///   - `simplifySystem`
+///   - `solveChain ENTER`
+///   - `FrNarrow`
+///   - `exploitPrem InFact`
 ///
 /// Rust's `trace_exec` would otherwise emit per call for these too —
-/// diverging from HS even though the underlying work matches.  Dedup
-/// here on first emission per program run, matching HS line-for-line.
+/// diverging from the instrumented HS build even though the underlying
+/// work matches.  Dedup here on first emission per program run.
+///
+/// NOTE: these labels reference a private/local Haskell instrumentation
+/// patch that is not part of the canonical upstream tree, so there are
+/// no canonical `Simplify.hs` / `Goals.hs` / `Reduction.hs` line
+/// citations to give.
 fn is_cse_deduplicated_label(label: &str) -> bool {
     matches!(label,
         "simplifySystem"
@@ -265,12 +275,12 @@ fn check_and_mark_emitted(label: &str) -> bool {
 
 /// Emit a `[EXEC] <label>` line to stderr when `TAM_RS_TRACE_EXEC=1`.
 /// No-op otherwise.  Keep `label` in the same canonical form as the
-/// Haskell `T.traceExecM` callsite so the outputs diff cleanly.
+/// (private) instrumented Haskell build so the outputs diff cleanly.
 ///
-/// For labels HS deduplicates via GHC CSE (see
+/// For labels the instrumented HS build deduplicates via GHC CSE (see
 /// [`is_cse_deduplicated_label`]), emit only on first occurrence per
-/// program run — matching HS's effective once-per-program emission
-/// for those literal-string `traceExecM` callsites.
+/// program run — matching its effective once-per-program emission for
+/// those literal-string trace callsites.
 #[inline]
 pub fn trace_exec(label: &str) {
     if !flag() { return; }
@@ -301,7 +311,8 @@ fn state_flag() -> bool {
 }
 
 /// Emit a `[STATE]` line summarising the system state in a form designed
-/// to diff against Haskell's `TAM_HS_TRACE_STATE` output.  Fields:
+/// to diff against the equivalent state trace in the private instrumented
+/// HS build.  RS-only.  Fields:
 ///
 /// - `nodes`: sorted, count-compressed list of rule-case-names
 ///   (e.g. `I_2×1, I_1×1, Register_pk×3, isend×2, Fresh×4, Secrecy_claim×1`).
@@ -309,7 +320,8 @@ fn state_flag() -> bool {
 ///   equal across HS/Rust idx allocation drift.
 /// - `goals`: sorted list of UNSOLVED goal kinds with canonical fact heads:
 ///   `Action(KU(aenc)), Premise(Secret), Disj[Ku(t)∥Out_R_1]`. The fact head
-///   matches Haskell `goalKind`'s `factCanonical` (Goals.hs:218-234).
+///   uses the same canonicalisation as the private instrumented HS build's
+///   goal-kind trace.
 /// - `formulas` / `solved_formulas`: counts only (full bodies elided to
 ///   keep the line readable; depth dumps available via other flags).
 ///
@@ -477,8 +489,9 @@ fn state_eqs_flag() -> bool {
 }
 
 /// Canonical dump of `sys.eq_store.subst`: sorted list of canonical
-/// `var → term` bindings, var idxs suppressed.  Mirrors HS's
-/// `canonicalEqStoreSubst` (Trace.hs) so the lines diff line-by-line.
+/// `var → term` bindings, var idxs suppressed.  RS-only; mirrors the
+/// equivalent dump in the private instrumented HS build so the lines
+/// diff line-by-line.
 fn canonical_eq_store_subst(sys: &crate::constraint::system::System) -> String {
     let mut entries: Vec<String> = sys.eq_store.subst.to_list().into_iter().map(|(k, v)| {
         let k_str = format!("{}{}:{:?}", sort_prefix(k.sort), k.name, k.sort);
@@ -556,7 +569,8 @@ fn canonical_open_actions(sys: &crate::constraint::system::System) -> String {
 }
 
 /// Emit a [PICK] line indicating which goal was selected for this dispatch.
-/// Paired with HS's `tracePickM` so we can compare goal-ranking decisions.
+/// RS-only; paired with the equivalent goal-pick trace in the private
+/// instrumented HS build so we can compare goal-ranking decisions.
 pub fn trace_pick(g: &crate::constraint::constraints::Goal) {
     use crate::constraint::constraints::Goal;
     if !state_flag() { return; }
@@ -652,13 +666,14 @@ fn disj_heads(d: &crate::constraint::constraints::Disj<crate::guarded::Guarded>)
 fn guarded_head(g: &crate::guarded::Guarded) -> String {
     use crate::guarded::Guarded;
     match g {
-        // HS Trace.hs::guardedHead returns just the literal `"Atom"` —
-        // no atom contents.  Keep Rust aligned for byte-equivalent diff.
+        // The private instrumented HS build's guarded-head trace returns
+        // just the literal `"Atom"` — no atom contents.  Keep Rust aligned
+        // for byte-equivalent diff.
         Guarded::Atom(_) => "Atom".to_string(),
         Guarded::Conj(_) => "Conj".to_string(),
         Guarded::Disj(_) => "Disj".to_string(),
-        // Format matches HS Trace.hs::guardedHead: `<Quant><N>v` (e.g. `Ex1v`).
-        // Suppresses bound-var names so HS/Rust line up.
+        // Format matches that HS build's guarded-head trace: `<Quant><N>v`
+        // (e.g. `Ex1v`).  Suppresses bound-var names so HS/Rust line up.
         Guarded::GGuarded { qua, vars, .. } => format!("{:?}{}v",
             qua, vars.len()),
     }

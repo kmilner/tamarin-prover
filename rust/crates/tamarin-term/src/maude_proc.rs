@@ -8,7 +8,6 @@
 //! Maude's response ends with the prompt `Maude> `.
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -104,7 +103,6 @@ struct MaudeProcessInner {
     stdout: ChildStdout,
     stats: MaudeStats,
     sig: MaudeSig,
-    path: PathBuf,
     /// Memo for `unifiable(...)` queries — see `MaudeHandle::unifiable`.
     /// Caches the *boolean* outcome (true = at least one unifier
     /// exists).  Witness LVars produced inside the subst aren't safe
@@ -224,8 +222,7 @@ impl MaudeProcessInner {
         // `TAM_DBG_MAUDE_IO_FILTER=unify` — only dump unify/variant unify
         //   calls (suppresses set/show/reduce noise).  Matches HS's
         //   `TAM_HS_DBG_MAUDE_IO` semantics.
-        let (trace_enabled, trace_full, filter) = maude_io_trace_config();
-        let (trace_enabled, trace_full) = (*trace_enabled, *trace_full);
+        let &(trace_enabled, trace_full, ref filter) = maude_io_trace_config();
         // Only materialise the full command string when something will
         // actually read it — i.e. tracing is on, or a non-empty filter
         // needs the `contains` check.  In the common untraced path this
@@ -341,13 +338,12 @@ impl MaudeHandle {
     /// Start a new Maude process and load the theory module for `sig`.
     pub fn start(maude_path: &str, sig: MaudeSig) -> Result<Self, MaudeError> {
         // stderr: INHERIT, not pipe.  HS uses `runInteractiveCommand`
-        // (System.Process), which by default inherits stderr from the
-        // parent (see Process.hs:115 — only stdin/stdout are piped via
-        // the returned (hin, hout, herr, hproc); herr ends up bound to
-        // the parent's stderr handle since `runInteractiveCommand`
-        // forwards stderr to the parent terminal).
-        //
-        // We MUST mirror that: if we pipe stderr but never drain it,
+        // (System.Process) at Process.hs:109, which opens a PIPE for
+        // stderr too — the returned `herr` (captured into the `MP` record
+        // at Process.hs:115) is a real stderr pipe handle.  HS simply
+        // never reads/drains that pipe.  We deliberately INHERIT stderr
+        // instead, because an undrained stderr pipe would deadlock us:
+        // if we pipe stderr but never drain it,
         // Maude eventually fills the ~64KB stderr pipe buffer (e.g.
         // bilinear-pairing examples like `ake/bilinear/Scott.spthy`
         // trigger Maude diagnostic chatter), then blocks in `write(2)`
@@ -376,7 +372,6 @@ impl MaudeHandle {
             stdout,
             stats: MaudeStats::default(),
             sig: sig.clone(),
-            path: PathBuf::from(maude_path),
             unifiable_cache: std::collections::HashMap::new(),
             reduce_cache: std::collections::HashMap::new(),
             match_empty_cache: std::collections::HashMap::new(),
@@ -483,10 +478,6 @@ impl MaudeHandle {
 
     pub fn maude_sig(&self) -> MaudeSig {
         self.inner.lock().unwrap().sig.clone()
-    }
-
-    pub fn file_path(&self) -> PathBuf {
-        self.inner.lock().unwrap().path.clone()
     }
 
     /// Kill the underlying Maude subprocess.  Use as a watchdog when a
@@ -729,16 +720,6 @@ impl MaudeHandle {
         // Opt-out via `TAM_RS_DISABLE_NO_AC_FAST_PATH=1` for diagnosis.
         let try_fast_path = no_ac_fast_path_enabled();
         if try_fast_path {
-            self.ensure_above(avoid_max);
-            use crate::lterm::HasFrees;
-            for eq in eqs {
-                eq.lhs.for_each_free(&mut |v| {
-                    if v.name == "x" { self.ensure_above(v.idx); }
-                });
-                eq.rhs.for_each_free(&mut |v| {
-                    if v.name == "x" { self.ensure_above(v.idx); }
-                });
-            }
             let eqs_owned: Vec<Equal<LNTerm>> = eqs.to_vec();
             let result = crate::unification::unify_lnterm_no_ac_with_counter(
                 eqs_owned, &self.fresh_counter,
@@ -763,7 +744,29 @@ impl MaudeHandle {
                     return Ok(Vec::new());
                 }
                 Err(crate::unification::UnifyError::NeedsAC) => {
-                    // Fall through to Maude call below.
+                    // Fall through to the Maude call below.
+                    //
+                    // Counter bookkeeping lives HERE (not before the
+                    // local unify attempt): `unify_lnterm_no_ac_with_counter`
+                    // does NOT read the global fresh counter (unification.rs:
+                    // `_counter` is unused — no witnesses are minted), and the
+                    // two terminating branches above return via `compose_vfresh`
+                    // / empty, neither of which reads the counter.  So the
+                    // counter only needs raising on the AC fall-through, where
+                    // the Maude witness allocator consumes it.  Floor it above
+                    // `avoid_max` and any input `~mw` (`name == "x"`) var here;
+                    // the residual-only `input_max` walk below additionally
+                    // covers the AC residuals' vars.
+                    self.ensure_above(avoid_max);
+                    use crate::lterm::HasFrees;
+                    for eq in eqs {
+                        eq.lhs.for_each_free(&mut |v| {
+                            if v.name == "x" { self.ensure_above(v.idx); }
+                        });
+                        eq.rhs.for_each_free(&mut |v| {
+                            if v.name == "x" { self.ensure_above(v.idx); }
+                        });
+                    }
                 }
             }
         }
@@ -899,7 +902,7 @@ impl MaudeHandle {
         // (no clone/reset overhead, identical observable output).
         if msubsts.len() <= 1 {
             for ms in &msubsts {
-                out.push(msubst_to_lnsubst_with_maude(ms, &mut ctx, input_max, Some(self), true)?);
+                out.push(msubst_to_lnsubst_with_maude(ms, &mut ctx, input_max, Some(self))?);
             }
         } else {
             // Snapshot the counter; each unifier resets to this base.
@@ -922,7 +925,7 @@ impl MaudeHandle {
                 // unifier).
                 self.reset_counter_to(baseline);
                 let arm = msubst_to_lnsubst_with_maude(
-                    ms, &mut per_arm_ctx, input_max, Some(self), true)?;
+                    ms, &mut per_arm_ctx, input_max, Some(self))?;
                 // Track high water for global counter restoration.
                 let cur = self.fresh_counter_peek();
                 if cur > high_water { high_water = cur; }
@@ -1021,6 +1024,13 @@ impl MaudeHandle {
     /// chain target consumes `true`. Without variant unification, the
     /// chain edge is rejected as sort-incompatible and the case is
     /// dropped → search loses witness paths.
+    ///
+    /// NOTE: this is a public-API entry point for the variant-unification
+    /// path that the (not-yet-ported) `Term.Narrowing.*` machinery needs
+    /// (see the crate-level "Not yet ported" note in `lib.rs`).  It has no
+    /// in-crate caller today and is intentionally kept wired so the entry
+    /// point is ready when narrowing lands; do not remove it as "dead code"
+    /// without also dropping the `lib.rs` doc reference.
     pub fn variant_unify_eqs(&self, eqs: &[Equal<LNTerm>])
         -> Result<Vec<Vec<(crate::lterm::LVar, LNTerm)>>, MaudeError>
     {
@@ -1158,7 +1168,7 @@ impl MaudeHandle {
         pattern_vars: &std::collections::BTreeSet<(String, u64)>,
     ) -> Result<Vec<Vec<(crate::lterm::LVar, LNTerm)>>, MaudeError>
     {
-        use crate::lterm::{LVar, Name, NameTag};
+        use crate::lterm::{LVar, Name};
         use crate::vterm::Lit;
         if eqs.is_empty() {
             return Ok(vec![Vec::new()]);
@@ -1212,25 +1222,8 @@ impl MaudeHandle {
             collect_subject_vars(&eq.rhs, pattern_vars, &mut subject_vars);
         }
         for lv in &subject_vars {
-            let synth_str = format!("__sk{}_{}_{}_{}", counter, lv.name, lv.idx, sort_tag(lv.sort));
+            let n = skolem_name(counter, lv);
             counter += 1;
-            // Preserve the original LVar's sort so subsort matching
-            // works (Pub < Msg, Fresh < Msg, etc.).  Maude's `match`
-            // requires the pattern's declared sort to be a supersort
-            // of the subject's sort.  Tamarin's Haskell mirrors this
-            // via `SkConst` carrying the original `LVar` sort.
-            let tag = match lv.sort {
-                crate::lterm::LSort::Pub => NameTag::Pub,
-                crate::lterm::LSort::Fresh => NameTag::Fresh,
-                crate::lterm::LSort::Nat => NameTag::Nat,
-                crate::lterm::LSort::Node => NameTag::Node,
-                // No NameTag::Msg — fall back to Pub which is a
-                // subsort of Msg.  This loses precision but lets
-                // matching succeed; revisit if Msg-sorted subject
-                // variables show up in real protocols.
-                crate::lterm::LSort::Msg => NameTag::Pub,
-            };
-            let n = Name::new(tag, synth_str);
             skolem_map.insert(lv.clone(), n.clone());
             reverse.insert(n, lv.clone());
         }
@@ -1380,7 +1373,7 @@ impl MaudeHandle {
         pattern_vars: &std::collections::BTreeSet<(String, u64)>,
     ) -> Result<Vec<Vec<(crate::lterm::LVar, LNTerm)>>, MaudeError>
     {
-        use crate::lterm::{LVar, Name, NameTag};
+        use crate::lterm::{LVar, Name};
         if eqs.is_empty() {
             return Ok(vec![Vec::new()]);
         }
@@ -1417,16 +1410,8 @@ impl MaudeHandle {
             collect_free_non_pattern(&eq.rhs, pattern_vars, &mut free_vars);
         }
         for lv in &free_vars {
-            let synth_str = format!("__sk{}_{}_{}_{}", counter, lv.name, lv.idx, sort_tag(lv.sort));
+            let n = skolem_name(counter, lv);
             counter += 1;
-            let tag = match lv.sort {
-                crate::lterm::LSort::Pub => NameTag::Pub,
-                crate::lterm::LSort::Fresh => NameTag::Fresh,
-                crate::lterm::LSort::Nat => NameTag::Nat,
-                crate::lterm::LSort::Node => NameTag::Node,
-                crate::lterm::LSort::Msg => NameTag::Pub,
-            };
-            let n = Name::new(tag, synth_str);
             skolem_map.insert(lv.clone(), n.clone());
             reverse.insert(n, lv.clone());
         }
@@ -1576,6 +1561,53 @@ fn sort_tag(s: crate::lterm::LSort) -> &'static str {
     }
 }
 
+/// Build the synthetic skolem-constant `Name` for a free/subject `LVar`
+/// `lv`, using `counter` to keep the id unique across one match call.
+///
+/// The constant must round-trip through Maude with the SAME order-sorted
+/// behaviour HS gives a `SkConst`, whose sort is `lvarSort v`
+/// (Guarded.hs:805-808) — i.e. the variable's *own* sort, which may be
+/// `Msg`.  Maude's `match A <=? B` requires the pattern's declared sort
+/// to be a supersort of the subject's, so encoding a `Msg`-sorted
+/// subject variable as `Pub` (a strict subsort of `Msg`) would let it
+/// match a `Msg` pattern position that HS would reject — an over-match
+/// that can change `--prove` results.
+///
+/// `NameTag` has no `Msg` variant, and adding one would break the many
+/// exhaustive `match`es on it across other crates.  Instead we carry a
+/// `Msg`-sorted skolem as a `NameTag::Pub` `Name` whose id begins with
+/// `maude_types::SKOLEM_MSG_PREFIX`; `maude_types::sort_of_name`
+/// recognises that sentinel and reports `LSort::Msg`, so the emitted
+/// Maude constant is `c(i)` (op `c : Nat -> Msg`) rather than `p(i)`.
+/// For every other sort the matching `NameTag` already yields the right
+/// Maude sort directly.
+fn skolem_name(counter: u64, lv: &crate::lterm::LVar) -> crate::lterm::Name {
+    use crate::lterm::{LSort, Name, NameTag};
+    match lv.sort {
+        LSort::Msg => {
+            // Sentinel-prefixed id; the rest mirrors the historical
+            // synthetic-string layout so distinct LVars stay distinct.
+            let id = format!(
+                "{}{}_{}_{}_{}",
+                crate::maude_types::SKOLEM_MSG_PREFIX,
+                counter, lv.name, lv.idx, sort_tag(lv.sort)
+            );
+            Name::new(NameTag::Pub, id)
+        }
+        sort => {
+            let tag = match sort {
+                LSort::Pub => NameTag::Pub,
+                LSort::Fresh => NameTag::Fresh,
+                LSort::Nat => NameTag::Nat,
+                LSort::Node => NameTag::Node,
+                LSort::Msg => unreachable!(),
+            };
+            let id = format!("__sk{}_{}_{}_{}", counter, lv.name, lv.idx, sort_tag(sort));
+            Name::new(tag, id)
+        }
+    }
+}
+
 /// Walk an `LNTerm` and replace any `Lit::Con(name)` whose `name` is in
 /// `reverse` with the corresponding original `Lit::Var(lv)`.  Used to
 /// un-skolemize match results from `match_eqs_const_subject`.
@@ -1613,67 +1645,43 @@ fn unskolemize(
 /// previously-generated witness from another call, silently
 /// conflating distinct semantic variables (the root cause of bug
 /// #21 — variable-conflation in source-case grafting).
-/// HS `msubstToLSubstVFresh` (Maude/Types.hs:134) sorts the Maude
-/// substitution by the domain variable's integer index
-/// (`sortBy (comparing (snd . fst))`) before the back-conversion, so the
-/// fresh-witness allocation order — and hence the witness indices baked
-/// into the resulting `SubstVFresh` — is canonical regardless of the
-/// order Maude happened to emit the bindings.  Upstream added this sort
-/// so proofs become reproducible across thread counts (`-N`): the
-/// unsorted Maude order was a hidden, schedule-dependent global-interning
-/// artifact (see [[rs-hs-thread-schedule-divergence]]).
 ///
-/// `msubstToLSubstVFree` (the *match* path, Maude/Types.hs:158) does NOT
-/// sort, so this is gated by `sort_domain`: unify/variants → `true`,
-/// match → `false`.
+/// **Domain order**: entries are converted in Maude's RAW returned
+/// order (`0..ms.len()`).  Current HS `msubstToLSubstVFresh`
+/// (Maude/Types.hs:127-138) does NO sort either — upstream `c9d456b8`
+/// ("More general fix for substitution canonicalisation") REMOVED the old
+/// `sortBy (comparing (snd . fst))` from both the VFresh (unify/variants)
+/// and VFree (match) conversions, moving the split-disjunction
+/// canonicalisation into `performSplit` (`sortOnMemo
+/// dropNameHintsLNSubstVFresh`, EquationStore.hs; mirrored in RS
+/// `perform_split`, 631e0a85).  RS's Maude command stream is already
+/// aligned to HS, so the raw orders coincide.
 ///
-/// Returns the iteration order over `ms` (a permutation of `0..ms.len()`).
-/// HS's `sortBy` is a stable mergesort; `Vec::sort_by_key` is likewise
-/// stable, so entries with an equal index keep their Maude order.
-fn msubst_iter_order(ms: &MSubst, _sort_domain: bool) -> Vec<usize> {
-    // Upstream `c9d456b8` ("More general fix for substitution
-    // canonicalisation") REMOVED the `sortBy (comparing (snd . fst))` from
-    // `msubstToLSubstVFresh` (Maude/Types.hs:131) — both the VFresh
-    // (unify/variants) and VFree (match) conversions now use Maude's RAW
-    // returned order.  The split-disjunction canonicalisation moved into
-    // `performSplit` (`sortOnMemo dropNameHintsLNSubstVFresh`,
-    // EquationStore.hs; mirrored in RS `perform_split`, 631e0a85), which
-    // subsumes the removed sort for SPLIT paths — but NOT for the
-    // variant/unify path.  Keeping the old `00a282da` sort here (the
-    // `sort_domain` branch) left RS sorting variant/unify substs where HS
-    // no longer does, re-breaking the bilinear source-case order on the
-    // rebase (Scott key_secrecy #vk.N source cases).  Mirror upstream: do
-    // NOT sort — return Maude's raw order (RS's Maude command stream is
-    // already aligned to HS, so the raw orders coincide).  `_sort_domain`
-    // is retained for caller compatibility but no longer distinguishes.
-    (0..ms.len()).collect()
-}
-
-/// Match-path conversion (HS `msubstToLSubstVFree`): does NOT canonicalise
-/// the domain order — `sort_domain = false`.
+/// Match-path conversion (HS `msubstToLSubstVFree`).
 fn msubst_to_lnsubst(
     ms: &MSubst,
     ctx: &mut ConvCtx,
 ) -> Result<Vec<(crate::lterm::LVar, LNTerm)>, MaudeError> {
-    msubst_to_lnsubst_with_avoid(ms, ctx, 0, false)
+    msubst_to_lnsubst_with_avoid(ms, ctx, 0)
 }
 
-/// Unify/variants-path conversion (HS `msubstToLSubstVFresh`): sorts the
-/// domain by variable index before back-conversion — `sort_domain = true`.
+/// Unify/variants-path conversion (HS `msubstToLSubstVFresh`).  Identical
+/// to `msubst_to_lnsubst` now that neither path sorts the domain (see the
+/// `msubst_to_lnsubst` doc); kept as a separate name to mark the
+/// VFresh-vs-VFree call sites.
 fn msubst_to_lnsubst_unify(
     ms: &MSubst,
     ctx: &mut ConvCtx,
 ) -> Result<Vec<(crate::lterm::LVar, LNTerm)>, MaudeError> {
-    msubst_to_lnsubst_with_avoid(ms, ctx, 0, true)
+    msubst_to_lnsubst_with_avoid(ms, ctx, 0)
 }
 
 fn msubst_to_lnsubst_with_avoid(
     ms: &MSubst,
     ctx: &mut ConvCtx,
     avoid_max: u64,
-    sort_domain: bool,
 ) -> Result<Vec<(crate::lterm::LVar, LNTerm)>, MaudeError> {
-    msubst_to_lnsubst_with_maude(ms, ctx, avoid_max, None, sort_domain)
+    msubst_to_lnsubst_with_maude(ms, ctx, avoid_max, None)
 }
 
 /// Variant of `msubst_to_lnsubst` that forces the Maude-witness name hint
@@ -1707,10 +1715,9 @@ fn msubst_to_lnsubst_force_x(
         }
         n
     };
-    // HS-faithful: variants use `msubstToLSubstVFresh`, which sorts the
-    // domain by variable index before back-conversion (Maude/Types.hs:134).
-    for &i in &msubst_iter_order(ms, true) {
-        let ((sort, idx), mt) = &ms[i];
+    // HS-faithful: variants use `msubstToLSubstVFresh`, which converts in
+    // Maude's raw returned order (no domain sort; Maude/Types.hs:127-138).
+    for ((sort, idx), mt) in ms {
         let lv = crate::maude_types::substitute_lookup_var(ctx, *sort, *idx)
             .ok_or_else(|| MaudeError::Other(format!(
                 "no binding for Maude variable x{}:{:?}", idx, sort)))?;
@@ -1733,7 +1740,6 @@ fn msubst_to_lnsubst_with_maude(
     ctx: &mut ConvCtx,
     avoid_max: u64,
     maude: Option<&MaudeHandle>,
-    sort_domain: bool,
 ) -> Result<Vec<(crate::lterm::LVar, LNTerm)>, MaudeError> {
     let mut out = Vec::with_capacity(ms.len());
     // Initialise `next`.  With a global counter, push it above
@@ -1761,12 +1767,11 @@ fn msubst_to_lnsubst_with_maude(
         }
         n
     };
-    // HS-faithful: the unify/variants path (`msubstToLSubstVFresh`) sorts
-    // the domain by variable index before back-conversion so the
-    // fresh-witness allocation order is canonical (Maude/Types.hs:134);
-    // the match path (`msubstToLSubstVFree`) passes `sort_domain = false`.
-    for &i in &msubst_iter_order(ms, sort_domain) {
-        let ((sort, idx), mt) = &ms[i];
+    // HS-faithful: both the unify/variants path (`msubstToLSubstVFresh`)
+    // and the match path (`msubstToLSubstVFree`) convert in Maude's raw
+    // returned order — neither sorts the domain (Maude/Types.hs:127-138;
+    // the old `sortBy` was removed upstream in `c9d456b8`).
+    for ((sort, idx), mt) in ms {
         let lv = crate::maude_types::substitute_lookup_var(ctx, *sort, *idx)
             .ok_or_else(|| MaudeError::Other(format!(
                 "no binding for Maude variable x{}:{:?}", idx, sort)))?;
@@ -1888,9 +1893,13 @@ pub struct PooledMaude<'a> {
 }
 
 impl<'a> PooledMaude<'a> {
-    /// Consume the guard and return an owned `MaudeHandle` whose Drop
-    /// will return the handle to the pool.  Useful when callers need
-    /// ownership semantics (e.g. cloning into a per-task `ProofContext`).
+    /// Borrow the underlying `MaudeHandle` for the lifetime of this guard.
+    /// Does NOT consume the guard or transfer ownership: the returned
+    /// reference is valid only while the `PooledMaude` lives, and the
+    /// handle is released back to the pool in `PooledMaude::drop`.  This
+    /// is the same accessor as the `Deref` impl; callers that need an
+    /// owned handle (e.g. to clone into a per-task `ProofContext`) should
+    /// `.clone()` the returned `&MaudeHandle`.
     pub fn handle(&self) -> &MaudeHandle {
         self.inner.as_ref().expect("PooledMaude inner not yet taken")
     }

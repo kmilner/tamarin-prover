@@ -50,14 +50,9 @@ pub fn rename_precise_system(sys: &mut System) {
     //   sEqStore → sFormulas → sSolvedFormulas → sLemmas → sGoals
     //
     // This MUST match HS's renamePrecise to keep per-name idx assignment
-    // in lockstep.  Previously Rust visited goals BEFORE formulas, which
-    // for Helper_Loop_and_success caused formula[0]'s free `k2` to end
-    // up at idx 4 (because 4 other "k2" LVars in goals' Disjs were
-    // imported first) — making it a DIFFERENT LVar from the action term
-    // `k2` (which got idx 0 elsewhere), so the impl pass's match against
-    // `∀ t. ChainKey(k2) @ t ⇒ ⊥` failed and no gfalse was emitted at
-    // case_3 entry — forcing Rust to solve an inner disj before reaching
-    // contradiction.
+    // in lockstep: formulas must be visited before goals so that a free
+    // LVar shared between a formula and a goal Disj is bound to the same
+    // fresh idx HS would assign, otherwise the two become distinct LVars.
     // ----------------------------------------------------------------------
 
     // HS-faithful: HS's `instance HasFrees (Map k v)` uses
@@ -91,8 +86,7 @@ pub fn rename_precise_system(sys: &mut System) {
     // assigns canonical idxs in HS Set-order — matching HS's
     // `evalFresh ... nothingUsed`-canonicalised numbering exactly —
     // without touching the live `less_atoms` / `edges` Vec used
-    // elsewhere.  Root cause of wireguard `--prove=exists_session`
-    // `#vk.N` off-by-{1,6,7} divergence (resolved this commit).
+    // elsewhere.
     let mut edges_sorted: Vec<&crate::constraint::constraints::Edge>
         = sys.edges.iter().collect();
     edges_sorted.sort();
@@ -279,11 +273,12 @@ pub fn rename_precise_system(sys: &mut System) {
         let mut la = la;
         la.smaller = map_var(la.smaller.clone());
         la.larger  = map_var(la.larger.clone());
-        if !new_less.iter().any(|x| x == &la) {
-            new_less.push(la);
-        }
+        new_less.push(la);
     }
+    // Sort + dedup (O(n log n)), matching HS's `S.fromList` over the renamed
+    // set rather than an O(n^2) membership scan.
     new_less.sort();
+    new_less.dedup();
     sys.less_atoms = new_less;
 
     // 5. Goals — per-variant rewrite.
@@ -317,16 +312,20 @@ pub fn rename_precise_system(sys: &mut System) {
             Goal::Split(s) => Goal::Split(s),
             Goal::Subterm((s, t)) => Goal::Subterm((apply_term(s), apply_term(t))),
         };
-        if !new_goals.iter().any(|(eg, _)| eg == &g2) {
-            new_goals.push((g2, st));
-        }
+        new_goals.push((g2, st));
     }
     // HS-faithful: `mapFrees (M.Map Goal GoalStatus)`
     // = `fmap M.fromList . mapFrees f . M.toList` (Term/LTerm.hs:876-877).
     // `M.fromList` builds a Map keyed by Ord Goal, so post-rename the
     // entries land in ascending NEW Goal order.
+    //
+    // Sort + dedup (O(n log n)) instead of an O(n^2) membership scan. We
+    // dedup on structural `Goal` equality (the old `any(eg == &g2)`
+    // relation) — NOT on `goal_cmp == Equal`, because `goal_cmp` orders
+    // Disj goals by len + canonical string and would over-collapse.
     new_goals.sort_by(|a, b|
         crate::constraint::solver::goals::goal_cmp(&a.0, &b.0));
+    new_goals.dedup_by(|a, b| a.0 == b.0);
     sys.goals = std::sync::Arc::new(new_goals);
 
     // 6. Formulas / solved / lemmas — via parser-level VarSubst.
@@ -373,13 +372,9 @@ pub fn rename_precise_system(sys: &mut System) {
     //         where mapDomain (v, t) = (,t) <$> mapFrees f v
     //
     // So renamePrecise renames variant subst KEYS but PRESERVES the
-    // witness idxs in VALUES.  This preserves the AES-output witness
-    // idxs at perform_split time — which is what gives HS the
-    // sort-discriminating idx differences across variants (e.g.,
-    // ~k.11 vs ~k.14 for test4's CHECKSIGN vs SIGN).
-    //
-    // Rust previously renamed values too, collapsing all to small
-    // PreciseFresh idxs (1, 2) and reversing the sort order vs HS.
+    // witness idxs in VALUES.  This preserves the variant witness idxs at
+    // perform_split time — which is what gives HS the sort-discriminating
+    // idx differences across variants.
     for d in sys.eq_store.conj.iter_mut() {
         for s in d.substs.iter_mut() {
             let pairs: Vec<(LVar, LNTerm)> = s.to_list().into_iter()

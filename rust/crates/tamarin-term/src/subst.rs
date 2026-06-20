@@ -217,18 +217,14 @@ mod tests {
 
     #[test]
     fn compose_applies_right_then_left() {
-        // s1 = {x ~> y}, s2 = {y ~> 1}. Then (s1 ∘ s2)(x) should equal
-        // s1(s2(x)) = s1(x) = y, but `compose` uses Haskell semantics:
-        // `compose s1 s2` is `s1.s2` — applying the result has the same
-        // effect as `s1(s2(t))`.
+        // `compose s1 s2` applied to t == s1(s2(t)) (Haskell convention:
+        // s1 *after* s2).
+        // s1 = {x ~> y}, s2 = {y ~> 1}.
         let s1: Subst<C, V> = Subst::from_list(vec![("x", var_term("y"))]);
         let s2: Subst<C, V> = Subst::from_list(vec![("y", const_term(1))]);
         let composed = s1.compose(&s2);
         let t: VTerm<C, V> = var_term("x");
-        // Per Haskell docstring: applying composed to t == s1(s2(t)).
-        // s2(x) = x (no binding), s1(x) = y. So composed(x) = y.
-        // But the convention is the *other* direction: s1.s2 means s1
-        // *after* s2; i.e. composed(x) = s1(s2(x)) = s1(x) = y.
+        // composed(x) = s1(s2(x)) = s1(x) = y.
         assert_eq!(apply_vterm(&composed, t), var_term("y"));
         // And for y: s2(y) = 1, s1(1) = 1.
         let t: VTerm<C, V> = var_term("y");

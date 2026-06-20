@@ -55,22 +55,32 @@ impl TheoryPath {
             TheoryPath::Add(n) => vec!["add".into(), n.clone()],
             TheoryPath::Delete(n) => vec!["delete".into(), n.clone()],
         };
-        segs.into_iter().map(prefix_with_underscore).collect()
+        segs.iter().map(|s| prefix_with_underscore(s)).collect()
     }
+}
+
+/// Canonical URL path-segment escaping shared by the theory/graph/proof
+/// handlers: keep `[A-Za-z0-9_.-]`, percent-encode everything else.
+pub fn url_path_escape(s: &str) -> String {
+    s.chars().map(|c| match c {
+        c if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' => c.to_string(),
+        c => format!("%{:02X}", c as u32),
+    }).collect()
 }
 
 /// Match Haskell's `prefixWithUnderscore`.  Empty + `_*` strings get
 /// an extra leading `_` to avoid the empty-segment trap in Yesod.
-fn prefix_with_underscore(s: String) -> String {
+pub fn prefix_with_underscore(s: &str) -> String {
     if s.is_empty() { "_".into() }
     else if s.starts_with('_') { format!("_{}", s) }
-    else { s }
+    else { s.to_string() }
 }
 
-fn unprefix_underscore(s: String) -> String {
+/// Inverse of [`prefix_with_underscore`].
+pub fn unprefix_underscore(s: &str) -> String {
     if s == "_" { String::new() }
     else if s.starts_with("__") { s[1..].to_string() }
-    else { s }
+    else { s.to_string() }
 }
 
 /// Parse a wildcard-captured path (e.g. `proof/Alice/case_1/0`) into a
@@ -81,7 +91,7 @@ pub fn parse(raw: &str) -> Option<TheoryPath> {
         .split('/')
         .filter(|s| !s.is_empty())
         .map(|s| percent_decode_str(s).decode_utf8_lossy().to_string())
-        .map(unprefix_underscore)
+        .map(|s| unprefix_underscore(&s))
         .collect();
     parse_segs(&decoded)
 }
