@@ -20,7 +20,6 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use tamarin_term::maude_proc::{MaudeHandle, MaudePool};
-use tamarin_theory::constraint::solver::search::NodeStatus;
 use tamarin_theory::elaborate::elaborate;
 // `prove_lemma_with_pool` is called via its fully-qualified path
 // inside the prove loop (it lets us pass the optional Maude pool);
@@ -1025,30 +1024,34 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 let (verdict, proof_steps, proof_body) = match outcome {
                     Ok(root) => {
                         let steps = count_proof_steps(&root);
-                        let v = match root.status {
-                            NodeStatus::Solved => {
-                                if matches!(
-                                    l.trace_quantifier,
-                                    tamarin_theory::theory::TraceQuantifier::ExistsTrace,
-                                ) {
-                                    LemmaVerdict::Verified
-                                } else {
-                                    LemmaVerdict::Falsified
-                                }
+                        // HS lemma verdict = `getProofStatus` (Proof.hs)
+                        // folded over the WHOLE tree, NOT the root's
+                        // per-node `NodeStatus`.  This matters for
+                        // part-replayed proofs: a stale stored-proof branch
+                        // kept verbatim is `Undetermined`, which the
+                        // Semigroup absorbs into the `Complete` of the
+                        // freshly-proved siblings (e.g. KCL07-manualproof —
+                        // `verified` not `analysis incomplete`).  For a
+                        // fully-fresh proof the fold yields the same verdict
+                        // as `root.status` did.
+                        use tamarin_theory::constraint::solver::search::ProofStatus;
+                        let is_exists = matches!(
+                            l.trace_quantifier,
+                            tamarin_theory::theory::TraceQuantifier::ExistsTrace,
+                        );
+                        let v = match tamarin_theory::constraint::solver::search::proof_status(&root) {
+                            ProofStatus::TraceFound => {
+                                if is_exists { LemmaVerdict::Verified }
+                                else { LemmaVerdict::Falsified }
                             }
-                            NodeStatus::Contradictory => {
-                                if matches!(
-                                    l.trace_quantifier,
-                                    tamarin_theory::theory::TraceQuantifier::ExistsTrace,
-                                ) {
-                                    LemmaVerdict::Falsified
-                                } else {
-                                    LemmaVerdict::Verified
-                                }
+                            ProofStatus::Complete => {
+                                if is_exists { LemmaVerdict::Falsified }
+                                else { LemmaVerdict::Verified }
                             }
-                            NodeStatus::Unfinishable => LemmaVerdict::Unfinishable,
-                            NodeStatus::Sorry
-                            | NodeStatus::Open => LemmaVerdict::Analyzed,
+                            ProofStatus::Unfinishable => LemmaVerdict::Unfinishable,
+                            ProofStatus::Incomplete
+                            | ProofStatus::Undetermined
+                            | ProofStatus::Invalidated => LemmaVerdict::Analyzed,
                         };
                         let body = tamarin_theory::pretty_theory::pretty_proof_body(&root);
                         (v, steps, Some(body))

@@ -61,6 +61,68 @@ pub enum NodeStatus {
     Sorry,
 }
 
+/// HS `ProofStatus` (Proof.hs:399-409) — the aggregate status of a WHOLE
+/// proof tree, used to decide the lemma verdict.  Unlike the per-node
+/// [`NodeStatus`], this folds over every step (HS `getProofStatus =
+/// foldMap proofStepStatus`) and therefore correctly ABSORBS verbatim
+/// (`/* unannotated */`) subtrees: a stale stored-proof branch kept
+/// verbatim is `Undetermined`, which the Semigroup overrides with the
+/// `Complete` of the freshly-proved siblings — so a part-replayed proof
+/// still reports `verified`, matching HS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofStatus {
+    Undetermined,
+    Complete,
+    Incomplete,
+    TraceFound,
+    Unfinishable,
+    Invalidated,
+}
+
+impl ProofStatus {
+    /// HS `ProofStatus` Semigroup (Proof.hs:411-422): precedence
+    /// `Invalidated > TraceFound > Incomplete > Unfinishable > Complete >
+    /// Undetermined`.
+    fn combine(self, other: ProofStatus) -> ProofStatus {
+        use ProofStatus::*;
+        match (self, other) {
+            (Invalidated, _) | (_, Invalidated) => Invalidated,
+            (TraceFound, _) | (_, TraceFound) => TraceFound,
+            (Incomplete, _) | (_, Incomplete) => Incomplete,
+            (Unfinishable, _) | (_, Unfinishable) => Unfinishable,
+            (Complete, _) | (_, Complete) => Complete,
+            (Undetermined, Undetermined) => Undetermined,
+        }
+    }
+}
+
+/// HS `proofStepStatus` (Proof.hs:429-435): the status of ONE node.
+/// A node with no system annotation (`annotated == false`, HS `Nothing`)
+/// is `Undetermined` REGARDLESS of its method; otherwise it is keyed on
+/// the node's own method (NOT its aggregated `NodeStatus`).
+fn step_status(node: &ProofNode) -> ProofStatus {
+    if !node.annotated {
+        return ProofStatus::Undetermined;
+    }
+    match &node.method {
+        ProofMethod::Finished(MethodResult::Solved) => ProofStatus::TraceFound,
+        ProofMethod::Finished(MethodResult::Unfinishable) => ProofStatus::Unfinishable,
+        ProofMethod::Sorry(_) => ProofStatus::Incomplete,
+        ProofMethod::Invalidated => ProofStatus::Invalidated,
+        _ => ProofStatus::Complete,
+    }
+}
+
+/// HS `getProofStatus` = `foldMap proofStepStatus` over every node in the
+/// tree.  This is the source of the lemma verdict (see `run_batch`).
+pub fn proof_status(node: &ProofNode) -> ProofStatus {
+    let mut s = step_status(node);
+    for c in node.children.values() {
+        s = s.combine(proof_status(c));
+    }
+    s
+}
+
 // --- Cached kill-switch / debug env flags -------------------------------
 // `expand`/`expand_inner` run once per proof-tree node (thousands of
 // times per lemma); these env vars are constant for the process, so cache

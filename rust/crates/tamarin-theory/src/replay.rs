@@ -395,37 +395,23 @@ fn replay_node(
         let child_sys = match &runtime_name_opt {
             Some(n) => produced.get(n).cloned().unwrap(),
             None => {
-                // No matching runtime case — the skeleton drifted from
-                // the actual decomposition.  Fall back to auto-prover
-                // for this subtree, but use a synthetic "skeleton
-                // mismatch" Sorry leaf seeded with the parent system
-                // so the user gets a visible signal.  Honest
-                // divergence reporting; not a paper-over.
-                let placeholder = if auto_prove {
-                    ProofNode {
-                        method: ProofMethod::Sorry(Some(format!(
-                            "skeleton case `{}` not produced at replay",
-                            skel_name
-                        ))),
-                        sys: sys.clone(),
-                        children: BTreeMap::new(),
-                        status: NodeStatus::Sorry,
-                        annotated: true,
-                    }
-                } else {
-                    // HS check-and-extend, `mergeMapsWith` rightOnly branch
-                    // (Proof.hs): a case present in the stored skeleton
-                    // but NOT produced by re-executing the method is mapped
-                    // through `noSystemPrf` (Proof.hs) =
-                    // `mapProofInfo (\i -> (Just i, Nothing))`, applied to
-                    // the WHOLE skeleton subtree.  After `mapProofInfo snd`
-                    // (checkAndExtendProver, Proof.hs) the info is
-                    // `Nothing` for every node, so the entire subtree
-                    // renders unannotated (`/* unannotated */`).  Mirror
-                    // this with `parsed_to_unannotated`, NOT a single
-                    // annotated sorry leaf.
-                    parsed_to_unannotated(sub_tree, sys.clone())
-                };
+                // No matching runtime case — the stored skeleton drifted
+                // from the current decomposition (a case present in the
+                // skeleton but NOT produced by re-executing the method).
+                // HS `checkAndExtendProver` (Proof.hs) handles this the
+                // SAME WAY regardless of whether sorry-leaves get extended:
+                // `mergeMapsWith` maps the stored-only case through
+                // `noSystemPrf` (= `mapProofInfo (\i -> (Just i, Nothing))`)
+                // over the WHOLE subtree; after `mapProofInfo snd` the info
+                // is `Nothing` everywhere, so the entire subtree is kept
+                // VERBATIM and renders unannotated (`/* unannotated */`).
+                // The auto-prover never runs on it (no system attached), so
+                // this is independent of `auto_prove` — both the target
+                // lemma (extend sorries) and check-only replay keep drifted
+                // cases verbatim.  (Previously the `auto_prove` path emitted
+                // a synthetic `skeleton case not produced` sorry, which
+                // diverged from HS on stale stored proofs, e.g. KCL07.)
+                let placeholder = parsed_to_unannotated(sub_tree, sys.clone());
                 children.insert(skel_name.clone(), placeholder);
                 any_sorry = true;
                 if push_path {
