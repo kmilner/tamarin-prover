@@ -811,26 +811,38 @@ fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro]) -> Str
             // AC ordering and nat-constant representation differ between the
             // parsed form and `lnfacts_to_parser(r.rule.*)`, producing false
             // negatives for plain rules like those in ParserTests.spthy.
+            // HS `isTrivialProtoVariantAC` (Rule.hs:762-764) compares the AC
+            // rule body against the E rule body (`ps==ps' && as==as' &&
+            // cs==cs' && nvs==nvs'`).  `closeProtoRule` stores `cprRuleE`
+            // (the ORIGINAL rule, WITH macro calls) untouched and computes
+            // `cprRuleAC` from the macro-EXPANDED, variant-base rule
+            // (Rule.hs:96-98).  So a macro call makes `ps != ps'` and the
+            // rule is NOT trivial — it must render the AC block showing the
+            // expanded body.  Detect a macro in the display (E) body by
+            // expanding it: if anything changes, the E (macro) form differs
+            // from the AC (expanded) form.  This holds REGARDLESS of whether
+            // Maude abstracted the rule, so it gates BOTH branches below —
+            // the previous code only checked it in the `None` branch, so a
+            // rule that was both macro-using AND abstracted (e.g. a `^`/DH
+            // rule whose body is a macro call) was wrongly called trivial
+            // (regression/trace/issue777: `pk(x)='g'^x`, `Out(pk(~x))`).
+            let no_macro_in_display = {
+                let mp: Vec<p::Fact> = premises.iter()
+                    .map(|f| crate::macro_expand::apply_macros_fact(macros, f)).collect();
+                let ma: Vec<p::Fact> = actions.iter()
+                    .map(|f| crate::macro_expand::apply_macros_fact(macros, f)).collect();
+                let mc: Vec<p::Fact> = conclusions.iter()
+                    .map(|f| crate::macro_expand::apply_macros_fact(macros, f)).collect();
+                mp == premises && ma == actions && mc == conclusions
+            };
             let ac_body_matches = match &r.abstracted_rule {
-                None => {
-                    // Trivial unless macros fired on this rule's display body.
-                    // Apply macros to the display facts; if unchanged, the
-                    // rule has no macro calls → display == elaborated → trivial.
-                    let macro_prems: Vec<p::Fact> = premises.iter()
-                        .map(|f| crate::macro_expand::apply_macros_fact(macros, f))
-                        .collect();
-                    let macro_acts: Vec<p::Fact> = actions.iter()
-                        .map(|f| crate::macro_expand::apply_macros_fact(macros, f))
-                        .collect();
-                    let macro_concs: Vec<p::Fact> = conclusions.iter()
-                        .map(|f| crate::macro_expand::apply_macros_fact(macros, f))
-                        .collect();
-                    // Same iff no macro call in this rule's terms changed anything.
-                    macro_prems == premises
-                        && macro_acts == actions
-                        && macro_concs == conclusions
-                }
-                Some(ac) => same_rule_body(&r.rule, ac),
+                // No Maude abstraction: AC form == E form structurally, so
+                // trivial iff no macro changes the display body.
+                None => no_macro_in_display,
+                // Maude abstracted the rule: the AC (abstracted) body must
+                // match the elaborated body AND no macro may differ between
+                // the display (E) and expanded (AC) forms.
+                Some(ac) => same_rule_body(&r.rule, ac) && no_macro_in_display,
             };
             no_residual_substs && ac_body_matches
         })
