@@ -567,9 +567,26 @@ fn render_parsed_item(
         IntrRule(_) => None,
         Lemma(l) => Some(render_parsed_lemma(l, &macros, proved, in_file, elab)),
         Restriction(r) => Some(render_parsed_restriction(r, &macros, elab)),
-        Predicates(_) => {
-            // TODO: render predicates (port HS prettyPredicate).
-            None
+        Predicates(ps) => {
+            if ps.is_empty() { return None; }
+            // HS `prettyPredicate p = kwPredicate <> colon <-> text
+            //   (factstr ++ "<=>" ++ formulastr)` (TheoryObject.hs:802-806):
+            //   factstr    = render $ prettyFact prettyLVar (pFact p)
+            //   formulastr = render $ prettyLNFormula      (pFormula p)
+            // `kwPredicate <> colon` = "predicate:", `<->` = one space, then
+            // the fact, the LITERAL "<=>" (no surrounding spaces — string
+            // concat), then the formula.  In HS each `predicate:`/`predicates:`
+            // declaration becomes one `PredicateItem` per predicate, and the
+            // theory's `vsep` separates them with a blank line.  RS groups the
+            // whole `predicates:` list into a single parser item, so render
+            // each predicate on its own `predicate:` line and join with a
+            // blank line to match HS's per-item `vsep` spacing.
+            let blocks: Vec<String> = ps.iter().map(|pred| {
+                let factstr = pf::pretty_fact(&pred.fact);
+                let formulastr = pf::pretty_formula(&pred.formula);
+                format!("predicate: {}<=>{}", factstr, formulastr)
+            }).collect();
+            Some(blocks.join("\n\n"))
         }
         Macros(macros) => {
             if macros.is_empty() { return None; }

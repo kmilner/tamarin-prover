@@ -28,7 +28,15 @@ use crate::guarded::{Guarded, Quant};
 /// Mirrors HS `LVar`'s role inside the `Precise.Fresh` monad used by
 /// `prettyLNFormula` (Formula.hs:511) and `prettyGuarded`
 /// (Guarded.hs:822-864).
-type Bind = (String, p::SortHint, String);
+/// `(source_name, sort, display_name, source_idx)`.  The `source_idx` is
+/// the binder var's ORIGINAL index (HS `lvarIdx`); it lets the body-var
+/// scope lookup distinguish two binders that share a name+sort but differ
+/// by index — e.g. the `x`(idx 0) / `x.1`(idx 1) fresh vars minted by
+/// `rule_restriction::rewrite` (HS `freshLVar "x" LSortMsg` from counter
+/// 0).  Matching on the full LVar identity also fixes shadowing of
+/// idx-bearing source binders, mirroring HS's positional (De-Bruijn)
+/// resolution.
+type Bind = (String, p::SortHint, String, u64);
 
 /// Pretty-print a parser-AST formula.  Mirrors Haskell's
 /// `prettyLNFormula` (Formula.hs:511-513):
@@ -547,7 +555,7 @@ fn allocate_formula_binders(
         } else {
             format!("{}.{}", v.name, idx)
         };
-        out.push((v.name.clone(), v.sort, display));
+        out.push((v.name.clone(), v.sort, display, v.idx));
     }
     out
 }
@@ -569,7 +577,10 @@ fn allocate_guarded_binders(
         } else {
             format!("{}.{}", v.name, idx)
         };
-        out.push((v.name.clone(), v.sort, display));
+        // The guarded path resolves bound vars POSITIONALLY (`lookup_bound`
+        // / `bound_to_varspec`), never via the name-based `lookup_display`,
+        // so the stored source_idx is unused here; carry `0`.
+        out.push((v.name.clone(), v.sort, display, 0));
     }
     out
 }
@@ -859,13 +870,22 @@ fn resolved_sort(v: &p::VarSpec, scope: &[Bind]) -> p::SortHint {
     v.sort
 }
 
-/// Find the binding's display name, if any.  Match by (name, resolved sort)
-/// against the scope (innermost first).  Mirrors HS's De Bruijn lookup —
-/// a Bound var resolves to its binder's freshly-allocated LVar (whose
-/// `show` is `sortPrefix ++ name[.idx]`).
-fn lookup_display(name: &str, sort: p::SortHint, scope: &[Bind]) -> Option<(p::SortHint, String)> {
+/// Find the binding's display name, if any.  Match by the binder's FULL
+/// source identity (name, source-idx, resolved sort) against the scope,
+/// innermost first.  Mirrors HS's De Bruijn lookup — a Bound var resolves
+/// to its binder's freshly-allocated LVar (whose `show` is
+/// `sortPrefix ++ name[.idx]`).
+///
+/// Matching on `idx` (not just name+sort) is what distinguishes two
+/// binders that share a name+sort but differ by index — the `x`(idx 0) /
+/// `x.1`(idx 1) fresh vars `rule_restriction::rewrite` mints (HS
+/// `freshLVar "x" LSortMsg`).  Innermost-first matching still resolves
+/// ordinary same-(name,idx) shadowing to the inner binder, identical to
+/// the previous behaviour (source binders carry idx 0, so the idx test is
+/// a no-op there).
+fn lookup_display(name: &str, idx: u64, sort: p::SortHint, scope: &[Bind]) -> Option<(p::SortHint, String)> {
     for b in scope.iter().rev() {
-        if b.0 == name && b.1 == sort {
+        if b.0 == name && b.3 == idx && b.1 == sort {
             return Some((b.1, b.2.clone()));
         }
     }
@@ -887,12 +907,15 @@ fn pp_var(v: &p::VarSpec, out: &mut String) {
 /// LTerm.hs:526-532).  Otherwise emit the source name+idx as Free.
 fn pp_var_scoped(v: &p::VarSpec, scope: &[Bind], out: &mut String) {
     let sort = resolved_sort(v, scope);
-    if v.idx == 0 {
-        if let Some((bsort, display)) = lookup_display(&v.name, sort, scope) {
-            out.push_str(sort_prefix_from_hint(bsort));
-            out.push_str(&display);
-            return;
-        }
+    // Resolve against the binder scope by FULL identity (name, idx, sort),
+    // for any idx — a body occurrence of a binder var may itself carry an
+    // index (e.g. the `x.1` fresh var minted by `rule_restriction`).  When
+    // no binder matches (the common case: free vars like `#vk.6`), fall
+    // through to render the source name+idx verbatim, identical to before.
+    if let Some((bsort, display)) = lookup_display(&v.name, v.idx, sort, scope) {
+        out.push_str(sort_prefix_from_hint(bsort));
+        out.push_str(&display);
+        return;
     }
     out.push_str(sort_prefix_from_hint(sort));
     out.push_str(&v.name);
@@ -1626,7 +1649,7 @@ fn lookup_bound(n: u32, scope: &[Vec<Bind>]) -> Option<&Bind> {
 /// recovered from the display name (`name` ⇒ 0, `name.k` ⇒ k).
 fn bound_to_varspec(n: u32, scope: &[Vec<Bind>]) -> Option<p::VarSpec> {
     let b = lookup_bound(n, scope)?;
-    let (src_name, sort, display) = b;
+    let (src_name, sort, display, _src_idx) = b;
     // display = src_name (idx 0) | "src_name.idx".
     let idx = if display == src_name {
         0

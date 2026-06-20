@@ -496,10 +496,23 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             RunError(format!("failed to read {}: {}", in_file, e))
         })?;
         phase!("read_to_string");
-        let parsed = tamarin_parser::parse_theory(&src, &parser_flags).map_err(|e| {
+        let mut parsed = tamarin_parser::parse_theory(&src, &parser_flags).map_err(|e| {
             RunError(format!("parse error in {}: {}", in_file, e))
         })?;
         phase!("parse_theory");
+        // HS `liftedAddProtoRule` (Theory/Text/Parser.hs:166-193) runs per
+        // rule DURING parsing: it expands each rule's `_restrict(φ)`
+        // embedded restriction into a fresh `Restr_<rule>_<i>` restriction
+        // (inserted before the rule) and rewrites the rule's actions to
+        // reference it.  RS captures `_restrict` into
+        // `Rule.embedded_restrictions` at parse time; run the equivalent
+        // lifting pass here, BEFORE wellformedness / elaboration / rendering,
+        // so the transformed parser theory drives all three (the renderer
+        // iterates `parsed.items`).
+        tamarin_theory::rule_restriction::lift_rule_restrictions(&mut parsed)
+            .map_err(|e| RunError(format!(
+                "_restrict expansion failed in {}: {}", in_file, e.message)))?;
+        phase!("lift_rule_restrictions");
         // HS emits this trace marker as soon as the theory parses
         // (TheoryLoader.hs:409).  `--parse-only` and `--quiet` skip it.
         let theory_name = parsed.name.clone();

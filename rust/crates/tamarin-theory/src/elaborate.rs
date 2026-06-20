@@ -646,9 +646,22 @@ fn elaborate_items(
                 if !ms.is_empty() { out.items.push(TheoryItem::Macros(ms)); }
             }
             p::TheoryItem::Predicates(_predicates) => {
-                // Predicate elaboration needs a typed Fact + LNFormula.
-                // Skip for now; the parser-AST predicate is preserved
-                // by the wf checker through different means.
+                // Predicates render via the PARSER-AST path
+                // (`render_parsed_item` → HS `prettyPredicate`,
+                // pretty_theory.rs) since the pretty-printer iterates the
+                // parser theory, not this elaborated one.  Their `_restrict`
+                // / lemma / restriction USES are already inlined upstream:
+                // `predicate_expand::expand_theory_formulas` (called below)
+                // substitutes predicate atoms in lemmas/restrictions, and
+                // `rule_restriction::lift_rule_restrictions` (run in run.rs
+                // right after parse, mirroring HS `liftedAddProtoRule`)
+                // expands them inside `_restrict` formulas.  Building a typed
+                // `theory::Predicate` here would need a parser-Formula →
+                // LNFormula converter that nothing consumes (the typed
+                // predicate item is read nowhere), so we do not synthesise
+                // dead state — HS keeps a `PredicateItem` only to feed its
+                // own closed-theory renderer, a role the RS parser-AST
+                // renderer already fills.
             }
             p::TheoryItem::Options(opts) => {
                 let mut o = out.options.clone();
