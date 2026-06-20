@@ -496,9 +496,15 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             RunError(format!("failed to read {}: {}", in_file, e))
         })?;
         phase!("read_to_string");
-        let mut parsed = tamarin_parser::parse_theory(&src, &parser_flags).map_err(|e| {
-            RunError(format!("parse error in {}: {}", in_file, e))
-        })?;
+        // Thread the including file's directory so `#include "file"` resolves
+        // relative to it (HS `takeDirectory inFile0`, Parser.hs:323-343).
+        let base_dir = std::path::Path::new(in_file)
+            .parent()
+            .map(|p| p.to_path_buf());
+        let mut parsed = tamarin_parser::parse_theory_with_base(&src, &parser_flags, base_dir)
+            .map_err(|e| {
+                RunError(format!("parse error in {}: {}", in_file, e))
+            })?;
         phase!("parse_theory");
         // HS `liftedAddProtoRule` (Theory/Text/Parser.hs:166-193) runs per
         // rule DURING parsing: it expands each rule's `_restrict(φ)`

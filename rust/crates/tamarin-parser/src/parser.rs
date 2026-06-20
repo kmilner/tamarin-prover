@@ -1,6 +1,7 @@
 //! Recursive-descent parser for `.spthy` files.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use crate::ast::*;
 use crate::lexer::{is_ident_char, Lexer, Pos};
@@ -42,6 +43,26 @@ impl std::error::Error for ParseError {}
 /// also tolerates.
 pub fn parse_theory(input: &str, flags: &[&str]) -> Result<Theory, ParseError> {
     let mut p = Parser::new(input, flags, false);
+    let thy = p.theory()?;
+    Ok(thy)
+}
+
+/// Like [`parse_theory`], but threads the **including file's directory** so that
+/// `#include "file"` directives resolve relative to it.
+///
+/// Direct port of HS `include` (Theory/Text/Parser.hs:323-343): the path is
+/// resolved against `takeDirectory inFile0`, the included header-less fragment
+/// is parsed as a continuation of the current item stream (same parser state —
+/// signature, known functions, flags thread through), and nested includes
+/// resolve relative to the included file's own directory.  `base_dir` is the
+/// directory of the file `input` was read from (`takeDirectory inFile0`).
+pub fn parse_theory_with_base(
+    input: &str,
+    flags: &[&str],
+    base_dir: Option<PathBuf>,
+) -> Result<Theory, ParseError> {
+    let mut p = Parser::new(input, flags, false);
+    p.base_dir = base_dir;
     let thy = p.theory()?;
     Ok(thy)
 }
@@ -118,6 +139,10 @@ pub struct Parser<'a> {
     enable_bp: bool,
     /// Builtin names that are reserved (e.g. the function `inv`, `pmult`, ...).
     reserved_funcs: HashSet<String>,
+    /// Directory of the file currently being parsed (`takeDirectory inFile0` in
+    /// HS).  `#include "file"` resolves relative to this; `None` (no source
+    /// file) means includes are taken verbatim, mirroring HS's `Nothing` case.
+    base_dir: Option<PathBuf>,
 }
 
 impl<'a> Parser<'a> {
@@ -135,6 +160,7 @@ impl<'a> Parser<'a> {
             enable_nat: false,
             enable_bp: false,
             reserved_funcs: HashSet::new(),
+            base_dir: None,
         };
         // Always enable parse-time recognition of the operators. The parser is
         // syntactic — semantic gating against builtin enablement happens at
@@ -270,6 +296,17 @@ impl<'a> Parser<'a> {
                     self.restore(save);
                     break;
                 }
+                if directive == "include" {
+                    // HS `include` (Parser.hs:323-343): consume the directive,
+                    // resolve the path relative to the including file's dir,
+                    // recursively parse the header-less fragment with the SAME
+                    // parser state, and SPLICE its items in place (no `Include`
+                    // node survives).  Item order = directive position.
+                    self.restore(save);
+                    let included = self.expand_include()?;
+                    items.extend(included);
+                    continue;
+                }
                 self.restore(save);
             }
             let item = self.theory_item()?;
@@ -389,6 +426,95 @@ impl<'a> Parser<'a> {
             }
             other => Err(self.err(format!("unknown preprocessor directive `#{}`", other))),
         }
+    }
+
+    /// Expand a `#include "file"` directive at the current position into the
+    /// sequence of theory items declared in the referenced file.
+    ///
+    /// HS `include` (Theory/Text/Parser.hs:323-343):
+    /// ```haskell
+    /// include inFile0 thy = do
+    ///    filepath <- try (symbol "#include") *> filePathParser
+    ///    st <- getState
+    ///    let (thy', st') = unsafePerformIO (parseFileWState st ... filepath)
+    ///    _ <- putState st'
+    ///    addItems inFile0 $ set (sigpMaudeSig . thySignature) (sig st') thy'
+    ///  where
+    ///    filePathParser = case takeDirectory <$> inFile0 of
+    ///        Nothing -> doubleQuoted filePath
+    ///        Just s  -> (s </>) <$> doubleQuoted filePath
+    /// ```
+    /// The `#include` token + double-quoted path are consumed here; the path is
+    /// resolved against `self.base_dir` (HS `takeDirectory inFile0`); the file
+    /// is read and its header-less fragment parsed by [`parse_include_fragment`]
+    /// — which threads parser state both ways (signature / known funcs / flags),
+    /// matching HS's `getState`/`putState` round-trip and `sig st'` merge.
+    fn expand_include(&mut self) -> Result<Vec<TheoryItem>, ParseError> {
+        // Consume `#include`.
+        self.skip_ws();
+        if !self.lx.eat_str("#include") {
+            return Err(self.err("expected `#include`"));
+        }
+        self.skip_ws();
+        let raw_path = self.string_literal()?;
+
+        // HS `filePathParser`: resolve relative to the including file's dir when
+        // we know it (`Just s -> s </> path`), else verbatim (`Nothing`).
+        let resolved: PathBuf = match &self.base_dir {
+            Some(dir) => dir.join(&raw_path),
+            None => PathBuf::from(&raw_path),
+        };
+
+        let content = std::fs::read_to_string(&resolved).map_err(|e| {
+            self.err(format!(
+                "failed to read included file {}: {}",
+                resolved.display(),
+                e
+            ))
+        })?;
+
+        // Nested includes in the fragment resolve relative to ITS directory
+        // (HS recurses: `takeDirectory filepath`).
+        let sub_base = resolved.parent().map(|p| p.to_path_buf());
+        self.parse_include_fragment(&content, sub_base)
+    }
+
+    /// Parse a header-less theory-item fragment (an included file body — no
+    /// `theory … begin … end` wrapper) using a sub-parser that SHARES this
+    /// parser's mutable state.
+    ///
+    /// Mirrors HS `parseFileWState`: the included file is parsed as a
+    /// continuation of `addItems` (a plain item sequence terminated by EOF, not
+    /// `end`), threading the parser `State` in and back out so that signature
+    /// declarations (`functions:`/`builtins:`/`equations:`) and `#define` flags
+    /// from the included file are visible to the rest of the parse.
+    fn parse_include_fragment(
+        &mut self,
+        content: &str,
+        sub_base: Option<PathBuf>,
+    ) -> Result<Vec<TheoryItem>, ParseError> {
+        let mut sub = Parser::new(content, &[], self.is_diff);
+        // Thread parser state IN (HS `getState` before `parseFileWState`).
+        sub.flags = self.flags.clone();
+        sub.known_funcs = self.known_funcs.clone();
+        sub.reserved_funcs = self.reserved_funcs.clone();
+        sub.base_dir = sub_base;
+
+        // Parse the header-less item stream: same loop as a theory body, but it
+        // terminates at EOF (there is no `end` keyword in a fragment).
+        let items = sub.theory_items_until_end()?;
+        sub.skip_ws();
+        if !sub.lx.is_eof() {
+            return Err(sub.err("unexpected trailing input in included file"));
+        }
+
+        // Thread parser state BACK (HS `putState st'` + `sig st'` merge): pick up
+        // any new function symbols / flags the included file declared.
+        self.flags = sub.flags;
+        self.known_funcs = sub.known_funcs;
+        self.reserved_funcs = sub.reserved_funcs;
+
+        Ok(items)
     }
 
     fn skip_until(&mut self, terminator: &str) {
