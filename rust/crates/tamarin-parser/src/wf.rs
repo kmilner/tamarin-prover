@@ -679,23 +679,43 @@ pub fn reserved_prefix_report(thy: &Theory) -> WfReport {
 pub fn special_facts_usage(thy: &Theory) -> WfReport {
     let mut out = Vec::new();
     for r in theory_rules(thy) {
-        let lhs_bad: Vec<&Fact> = r.premises.iter()
+        // HS `specialFactsUsage'` (Wellformedness.hs:553-566) reads
+        // `get rPrems`/`get rConcs` on the closed `ProtoRuleE`, whose facts
+        // carry their fully-inlined `let` terms — mirror the reserved-names
+        // sibling and use the let-substituted facts.
+        let (prems, _acts, concs) = rule_facts_with_lets(r);
+        let lhs_bad: Vec<&Fact> = prems.iter()
             .filter(|f| f.name == "Out")
             .collect();
-        let rhs_bad: Vec<&Fact> = r.conclusions.iter()
+        let rhs_bad: Vec<&Fact> = concs.iter()
             .filter(|f| f.name == "Fr" || f.name == "In")
             .collect();
-        if !lhs_bad.is_empty() {
-            out.push(WfError::new("Special facts",
-                format!("rule '{}' uses disallowed facts on left-hand-side: {}",
-                    r.name, lhs_bad.iter().map(|f| f.name.as_str())
-                        .collect::<Vec<_>>().join(", "))));
-        }
-        if !rhs_bad.is_empty() {
-            out.push(WfError::new("Special facts",
-                format!("rule '{}' uses disallowed facts on right-hand-side: {}",
-                    r.name, rhs_bad.iter().map(|f| f.name.as_str())
-                        .collect::<Vec<_>>().join(", "))));
+        for (msg, fs) in [
+            ("on left-hand-side", lhs_bad),
+            ("on right-hand-side", rhs_bad),
+        ] {
+            if !fs.is_empty() {
+                // HS `specialFactsUsage'` (Wellformedness.hs:553-566):
+                //   (underlineTopic "Special facts",
+                //      text ("rule " ++ quote (showRuleCaseName ru)) <-> text msg
+                //      $-$ nest 2 (fsep $ punctuate comma $ map prettyLNFact fas))
+                // grouped/nested by `prettyWfErrorReport` exactly like the
+                // "Reserved names" sibling.  Note HS uses lowercase `"rule "`
+                // here (vs capital `"Rule "` for reserved names).
+                let facts: Vec<String> =
+                    fs.iter().map(|f| pp_wf_fact(f)).collect();
+                // Headerless body (no trailing newline); `format_wf_block`
+                // emits the single "Special facts" header for the group and
+                // joins per-rule/side bodies with the 2-space blank separator.
+                let mut s = String::new();
+                s.push_str(&format!(
+                    "  rule `{}' uses disallowed facts {}:\n",
+                    r.name, msg,
+                ));
+                s.push_str("    ");
+                s.push_str(&facts.join(", "));
+                out.push(WfError::new("Special facts", s));
+            }
         }
     }
     out

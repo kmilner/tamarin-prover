@@ -1155,7 +1155,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
 fn wf_headerless_preamble(topic: &str) -> Option<String> {
     use tamarin_parser::wf::underline_topic;
     match topic {
-        "Unbound variables" | "Reserved names" => {
+        "Unbound variables" | "Reserved names" | "Special facts" => {
             Some(format!("{}\n", underline_topic(topic)))
         }
         "Variable with mismatching sorts or capitalization" => {
