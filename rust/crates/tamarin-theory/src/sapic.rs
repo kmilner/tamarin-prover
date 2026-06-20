@@ -208,22 +208,30 @@ impl<Ann, V> Process<Ann, V> {
 }
 
 /// `pfoldMap`: visit every node in the process tree calling `f`,
-/// concatenating outputs. Self-first (pre-order): each node is emitted
-/// before its children (body for `Action`; left then right for `Comb`).
+/// concatenating outputs. Traversal order matches Haskell
+/// `pfoldMap` (Process.hs:285-296):
+/// - `Null`: just `f(self)`.
+/// - `Action`: self first, then the body (`f self <> pfoldMap body`).
+/// - `Comb`: in-order — left subtree, then self, then right subtree
+///   (`pfoldMap pl <> f self <> pfoldMap pr`).
 pub fn pfold_map<Ann, V, T, F: FnMut(&Process<Ann, V>) -> Vec<T>>(
     p: &Process<Ann, V>,
     f: &mut F,
 ) -> Vec<T> {
-    let mut out = f(p);
     match p {
-        Process::Null(_) => {}
-        Process::Action(_, _, body) => out.extend(pfold_map(body, f)),
+        Process::Null(_) => f(p),
+        Process::Action(_, _, body) => {
+            let mut out = f(p);
+            out.extend(pfold_map(body, f));
+            out
+        }
         Process::Comb(_, _, l, r) => {
-            out.extend(pfold_map(l, f));
+            let mut out = pfold_map(l, f);
+            out.extend(f(p));
             out.extend(pfold_map(r, f));
+            out
         }
     }
-    out
 }
 
 /// `processContains`: any node in `p` for which `f` returns true.
@@ -292,12 +300,26 @@ impl PatternSapicLVar {
 /// `unpatternVar`: drop the bind/match tag.
 pub fn unpattern_var(p: PatternSapicLVar) -> SapicLVar { p.into_var() }
 
-/// `freesSapicTerm`: deduplicated, sorted list of SAPIC variables in a term.
+/// Deduplicated, sorted list of SAPIC variables in a term.
+///
+/// NOTE: despite the name, this mirrors HS `varsVTerm`
+/// (VTerm.hs:116-117, `sortednub . toList . foldMap (foldMap return)` —
+/// sorted and deduplicated), NOT HS `freesSapicTerm`
+/// (Term.hs:131-132, `foldMap (foldMap (:[]))` — a plain in-order
+/// traversal that is neither sorted nor deduplicated). All current
+/// callers feed the result into set-difference / set-membership, so the
+/// sort+dedup here is observationally equivalent to the HS `freesSapicTerm`
+/// + downstream `nub`/`\\` usage.
 pub fn frees_sapic_term(t: &SapicTerm) -> Vec<SapicLVar> {
     tamarin_term::vterm::vars_vterm(t)
 }
 
-/// `freesSapicFact`: deduplicated, sorted list of SAPIC variables in a fact.
+/// Deduplicated, sorted list of SAPIC variables in a fact.
+///
+/// As with [`frees_sapic_term`], this mirrors a sort+dedup over the term
+/// variables rather than HS `freesSapicFact` (Term.hs:136-137,
+/// `foldMap freesSapicTerm`, which preserves order and duplicates); the
+/// difference is masked because every consumer treats the result as a set.
 pub fn frees_sapic_fact(f: &Fact<SapicTerm>) -> Vec<SapicLVar> {
     let mut out = Vec::new();
     for t in &f.terms {
@@ -310,6 +332,21 @@ pub fn frees_sapic_fact(f: &Fact<SapicTerm>) -> Vec<SapicLVar> {
 
 // =============================================================================
 // Action / combinator predicates (mirroring Sapic.ProcessUtils)
+//
+// `is_lock`/`is_unlock`/`is_ch_in`/`is_ch_out`/`is_eq` are faithful ports of
+// the corresponding HS predicates (ProcessUtils.hs:54-72), which are generic
+// over the annotation and inspect only the action/combinator shape.
+//
+// `is_delete`/`is_lookup` are an INTENTIONALLY INCOMPLETE mirror: HS
+// `isDelete`/`isLookup` (ProcessUtils.hs:46-52) are specialised to
+// `Process (ProcessAnnotation LVar) v` and additionally require
+// `pureState=False`, i.e. they exclude optimized pure-state states. That
+// guard cannot be expressed here — these functions are generic over `Ann`,
+// and `tamarin-theory` cannot reference `ProcessAnnotation`'s `pure_state`
+// field without a dependency cycle (that type lives downstream in
+// `tamarin-sapic`). Callers that need the HS `pureState=False` semantics
+// (e.g. a future Sapic.Basetranslation port) MUST re-check `pure_state`
+// themselves rather than relying on these predicates alone.
 // =============================================================================
 
 pub fn is_lock<Ann, V>(p: &Process<Ann, V>) -> bool {
@@ -324,12 +361,16 @@ pub fn is_ch_in<Ann, V>(p: &Process<Ann, V>) -> bool {
 pub fn is_ch_out<Ann, V>(p: &Process<Ann, V>) -> bool {
     matches!(p, Process::Action(SapicAction::ChOut { .. }, _, _))
 }
+/// Incomplete mirror of HS `isDelete`: matches the `Delete` action shape but
+/// omits the HS `pureState=False` guard (see module section note above).
 pub fn is_delete<Ann, V>(p: &Process<Ann, V>) -> bool {
     matches!(p, Process::Action(SapicAction::Delete(_), _, _))
 }
 pub fn is_eq<Ann, V>(p: &Process<Ann, V>) -> bool {
     matches!(p, Process::Comb(ProcessCombinator::CondEq(_, _), _, _, _))
 }
+/// Incomplete mirror of HS `isLookup`: matches the `Lookup` combinator shape
+/// but omits the HS `pureState=False` guard (see module section note above).
 pub fn is_lookup<Ann, V>(p: &Process<Ann, V>) -> bool {
     matches!(p, Process::Comb(ProcessCombinator::Lookup(_, _), _, _, _))
 }

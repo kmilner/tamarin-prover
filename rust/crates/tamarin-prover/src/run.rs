@@ -20,7 +20,6 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use tamarin_term::maude_proc::{MaudeHandle, MaudePool};
-use tamarin_theory::constraint::solver::search::NodeStatus;
 use tamarin_theory::elaborate::elaborate;
 // `prove_lemma_with_pool` is called via its fully-qualified path
 // inside the prove loop (it lets us pass the optional Maude pool);
@@ -48,7 +47,7 @@ pub enum LemmaVerdict {
     /// We exhausted the search budget or hit `Sorry`.
     Analyzed,
     /// HS `UnfinishableProof`: no open goals but subterm store has reducible
-    /// operators.  HS `showProofStatus` (Theory/Proof.hs:1128):
+    /// operators.  HS `showProofStatus` (Theory/Proof.hs:1109):
     ///   "analysis cannot be finished (reducible operators in subterms)"
     Unfinishable,
     /// `[reuse]`-only lemma that we didn't try to prove (out of filter).
@@ -58,21 +57,8 @@ pub enum LemmaVerdict {
     Error(String),
 }
 
-impl LemmaVerdict {
-    pub fn label(&self) -> &str {
-        match self {
-            LemmaVerdict::Verified => "verified",
-            LemmaVerdict::Falsified => "falsified",
-            LemmaVerdict::Analyzed => "analysis incomplete",
-            LemmaVerdict::Unfinishable => "analysis cannot be finished (reducible operators in subterms)",
-            LemmaVerdict::Skipped => "analysis incomplete",
-            LemmaVerdict::Filtered => "analysis incomplete",
-            LemmaVerdict::Error(_) => "error",
-        }
-    }
-}
-
-/// HS-faithful per-lemma summary line, mirroring `Theory.Constraint.Solver.summarize`:
+/// HS-faithful per-lemma summary line, mirroring `prettyClosedSummary`
+/// (ClosedTheory.hs:463, which renders `showProofStatus ... <-> (siz "steps")`):
 ///   `<lemma> (<quantifier>): falsified - found trace (<N> steps)`
 ///   `<lemma> (<quantifier>): verified (<N> steps)`
 ///   `<lemma> (<quantifier>): analysis incomplete (<N> steps)`
@@ -80,7 +66,7 @@ impl LemmaVerdict {
 fn format_lemma_summary_line(r: &LemmaResult) -> String {
     let quantifier = if r.exists_trace { "exists-trace" } else { "all-traces" };
     let body = match &r.verdict {
-        // HS `showProofStatus` (Theory/Proof.hs:1124-1127): a falsified
+        // HS `showProofStatus` (Theory/Proof.hs:1105-1108): a falsified
         // exists-trace lemma is a `CompleteProof` of `ExistsSomeTrace`
         // ("falsified - no trace found"), whereas a falsified all-traces
         // lemma is a `TraceFound` for `ExistsNoTrace` ("falsified - found
@@ -92,7 +78,7 @@ fn format_lemma_summary_line(r: &LemmaResult) -> String {
         LemmaVerdict::Analyzed
         | LemmaVerdict::Skipped
         | LemmaVerdict::Filtered => format!("analysis incomplete ({} steps)", r.proof_steps),
-        // HS `showProofStatus _ UnfinishableProof` (Theory/Proof.hs:1128).
+        // HS `showProofStatus _ UnfinishableProof` (Theory/Proof.hs:1109).
         LemmaVerdict::Unfinishable =>
             format!("analysis cannot be finished (reducible operators in subterms) ({} steps)", r.proof_steps),
         LemmaVerdict::Error(msg) => format!("error: {}", msg),
@@ -106,7 +92,8 @@ pub struct LemmaResult {
     pub verdict: LemmaVerdict,
     pub elapsed_ms: u128,
     /// Proof-tree node count — matches HS's "(N steps)" in
-    /// `--prove` output (Theory.Proof.proofStepCount).
+    /// `--prove` output (`foldProof proofStepSummary`, ClosedTheory.hs:484,491,
+    /// summing one per ProofStep via `foldProof`, Theory/Proof.hs:358).
     pub proof_steps: usize,
     /// `true` for `exists-trace` lemmas, `false` for `all-traces`.
     /// Drives the trace-quantifier label in the summary.
@@ -207,20 +194,30 @@ fn run_variants(args: &Args) -> Result<i32, RunError> {
     // is 125 rules.  Porting BP intruder rules is a deeper functional
     // gap (no `bp_intruder_rules` exists yet in tamarin_theory).
     let rules = tamarin_theory::intruder_rules::dh_intruder_rules(args.diff, &maude);
-    // Mirror HS `Theory.Rule.prettyIntrRuleACInfo` naming:
-    //   ConstrRule "_exp"    → "c_exp"
-    //   DestrRule  "_exp"... → "d_0_exp"  (i64 = remaining-apps counter)
+    // Mirror HS `Theory.Model.Rule.prettyIntrRuleACInfo`
+    // (Theory/Model/Rule.hs:1233-1234) naming:
+    //   ConstrRule "_exp"    → prefixIfReserved("c" ++ "_exp") → "c_exp"
+    //   DestrRule  "_exp"... → prefixIfReserved("d" ++ "_exp") → "d_exp"
+    // HS wildcards the three numeric DestrRule fields (the remaining-apps
+    // counter is NEVER rendered into the name; the `d_NAME_i` form is the
+    // commented-out line Rule.hs:1235), then wraps in `prefixIfReserved`,
+    // which prepends `_` only for reserved rule names or names already
+    // starting with `_` (a no-op for `c_exp`/`d_exp`-style names).
+    let prefix_if_reserved = |n: String| -> String {
+        const RESERVED: [&str; 7] =
+            ["Fresh", "irecv", "isend", "coerce", "fresh", "pub", "iequality"];
+        if RESERVED.contains(&n.as_str()) || n.starts_with('_') {
+            format!("_{}", n)
+        } else {
+            n
+        }
+    };
     for r in &rules {
         let name = match &r.info {
             tamarin_theory::rule::IntrRuleACInfo::ConstrRule(n) =>
-                format!("c{}", String::from_utf8_lossy(n)),
-            // HS suppresses the remaining-apps counter when it's 0
-            // (i.e. unbounded) — `d_NAME` not `d_0_NAME`.  Matches
-            // `Theory.Rule.prettyIntrRuleACInfo`.
-            tamarin_theory::rule::IntrRuleACInfo::DestrRule(n, 0, _, _) =>
-                format!("d{}", String::from_utf8_lossy(n)),
-            tamarin_theory::rule::IntrRuleACInfo::DestrRule(n, k, _, _) =>
-                format!("d_{}{}", k, String::from_utf8_lossy(n)),
+                prefix_if_reserved(format!("c{}", String::from_utf8_lossy(n))),
+            tamarin_theory::rule::IntrRuleACInfo::DestrRule(n, _, _, _) =>
+                prefix_if_reserved(format!("d{}", String::from_utf8_lossy(n))),
             other => format!("{:?}", other),
         };
         let kind = match &r.info {
@@ -438,6 +435,12 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
 
     let parser_flags: Vec<&str> = args.defines.iter().map(String::as_str).collect();
 
+    // The Maude version is constant for the whole run, but detecting it
+    // spawns a `maude --version` subprocess.  Detect it ONCE here and
+    // reuse the cached value for both the banner and every file's
+    // `BuildInfo` (previously re-detected per file → N+1 subprocesses).
+    let maude_version: Option<String> = crate::cli::detect_maude_version_pub();
+
     // HS prints the maude tool + version banner ONCE at the top of the
     // batch run (`Main.Console.argExists` path).  Mirror that here:
     // emit `maude tool: 'maude'\n checking version: X. OK.\n checking
@@ -460,7 +463,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 .to_string()
         };
         eprintln!("maude tool: '{}'", disp);
-        if let Some(v) = crate::cli::detect_maude_version_pub() {
+        if let Some(v) = &maude_version {
             eprintln!(" checking version: {}. OK.", v);
             eprintln!(" checking installation: OK.");
         }
@@ -496,10 +499,29 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             RunError(format!("failed to read {}: {}", in_file, e))
         })?;
         phase!("read_to_string");
-        let parsed = tamarin_parser::parse_theory(&src, &parser_flags).map_err(|e| {
-            RunError(format!("parse error in {}: {}", in_file, e))
-        })?;
+        // Thread the including file's directory so `#include "file"` resolves
+        // relative to it (HS `takeDirectory inFile0`, Parser.hs:323-343).
+        let base_dir = std::path::Path::new(in_file)
+            .parent()
+            .map(|p| p.to_path_buf());
+        let mut parsed = tamarin_parser::parse_theory_with_base(&src, &parser_flags, base_dir)
+            .map_err(|e| {
+                RunError(format!("parse error in {}: {}", in_file, e))
+            })?;
         phase!("parse_theory");
+        // HS `liftedAddProtoRule` (Theory/Text/Parser.hs:166-193) runs per
+        // rule DURING parsing: it expands each rule's `_restrict(φ)`
+        // embedded restriction into a fresh `Restr_<rule>_<i>` restriction
+        // (inserted before the rule) and rewrites the rule's actions to
+        // reference it.  RS captures `_restrict` into
+        // `Rule.embedded_restrictions` at parse time; run the equivalent
+        // lifting pass here, BEFORE wellformedness / elaboration / rendering,
+        // so the transformed parser theory drives all three (the renderer
+        // iterates `parsed.items`).
+        tamarin_theory::rule_restriction::lift_rule_restrictions(&mut parsed)
+            .map_err(|e| RunError(format!(
+                "_restrict expansion failed in {}: {}", in_file, e.message)))?;
+        phase!("lift_rule_restrictions");
         // HS emits this trace marker as soon as the theory parses
         // (TheoryLoader.hs:409).  `--parse-only` and `--quiet` skip it.
         let theory_name = parsed.name.clone();
@@ -912,7 +934,8 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                     elapsed_ms: 0,
                     // HS counts the default `Sorry` placeholder proof
                     // as 1 step (one `LNode (ProofStep Sorry ...)` —
-                    // see `Theory.Proof.proofStepCount`).  Match it.
+                    // see `foldProof proofStepSummary`, ClosedTheory.hs:484,491).
+                    // Match it.
                     proof_steps: 1,
                     exists_trace: matches!(
                         l.trace_quantifier,
@@ -1006,30 +1029,34 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 let (verdict, proof_steps, proof_body) = match outcome {
                     Ok(root) => {
                         let steps = count_proof_steps(&root);
-                        let v = match root.status {
-                            NodeStatus::Solved => {
-                                if matches!(
-                                    l.trace_quantifier,
-                                    tamarin_theory::theory::TraceQuantifier::ExistsTrace,
-                                ) {
-                                    LemmaVerdict::Verified
-                                } else {
-                                    LemmaVerdict::Falsified
-                                }
+                        // HS lemma verdict = `getProofStatus` (Proof.hs)
+                        // folded over the WHOLE tree, NOT the root's
+                        // per-node `NodeStatus`.  This matters for
+                        // part-replayed proofs: a stale stored-proof branch
+                        // kept verbatim is `Undetermined`, which the
+                        // Semigroup absorbs into the `Complete` of the
+                        // freshly-proved siblings (e.g. KCL07-manualproof —
+                        // `verified` not `analysis incomplete`).  For a
+                        // fully-fresh proof the fold yields the same verdict
+                        // as `root.status` did.
+                        use tamarin_theory::constraint::solver::search::ProofStatus;
+                        let is_exists = matches!(
+                            l.trace_quantifier,
+                            tamarin_theory::theory::TraceQuantifier::ExistsTrace,
+                        );
+                        let v = match tamarin_theory::constraint::solver::search::proof_status(&root) {
+                            ProofStatus::TraceFound => {
+                                if is_exists { LemmaVerdict::Verified }
+                                else { LemmaVerdict::Falsified }
                             }
-                            NodeStatus::Contradictory => {
-                                if matches!(
-                                    l.trace_quantifier,
-                                    tamarin_theory::theory::TraceQuantifier::ExistsTrace,
-                                ) {
-                                    LemmaVerdict::Falsified
-                                } else {
-                                    LemmaVerdict::Verified
-                                }
+                            ProofStatus::Complete => {
+                                if is_exists { LemmaVerdict::Falsified }
+                                else { LemmaVerdict::Verified }
                             }
-                            NodeStatus::Unfinishable => LemmaVerdict::Unfinishable,
-                            NodeStatus::Sorry
-                            | NodeStatus::Open => LemmaVerdict::Analyzed,
+                            ProofStatus::Unfinishable => LemmaVerdict::Unfinishable,
+                            ProofStatus::Incomplete
+                            | ProofStatus::Undetermined
+                            | ProofStatus::Invalidated => LemmaVerdict::Analyzed,
                         };
                         let body = tamarin_theory::pretty_theory::pretty_proof_body(&root);
                         (v, steps, Some(body))
@@ -1090,7 +1117,8 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         // Generated-from footer.
         let build_info = tamarin_theory::pretty_theory::BuildInfo {
             tamarin_version: crate::cli::VERSION.to_string(),
-            maude_version: crate::cli::detect_maude_version_pub()
+            maude_version: maude_version
+                .clone()
                 .unwrap_or_else(|| "unknown".to_string()),
             git_revision: crate::cli::GIT_REV.to_string(),
             git_branch: crate::cli::GIT_BRANCH.to_string(),
@@ -1155,7 +1183,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
 fn wf_headerless_preamble(topic: &str) -> Option<String> {
     use tamarin_parser::wf::underline_topic;
     match topic {
-        "Unbound variables" | "Reserved names" => {
+        "Unbound variables" | "Reserved names" | "Special facts" => {
             Some(format!("{}\n", underline_topic(topic)))
         }
         "Variable with mismatching sorts or capitalization" => {
@@ -1265,9 +1293,9 @@ fn populate_rule_variants(elaborated: &mut tamarin_theory::theory::Theory,
     // inner loop.
     if maude.maude_sig().reducible_fun_syms.is_empty() { return; }
 
-    // Index → (abstracted_rule, variant_substs) for rules that have
-    // any.  Computed in parallel; the BTreeMap/Vec collect preserves
-    // source order via the keyed structure.
+    // Per-item Option<(abstracted_rule, variant_substs)> for rules that
+    // have any.  Computed in parallel; rayon's indexed `par_iter().collect()`
+    // preserves positional order, and the result is zipped back by position.
     let outs: Vec<Option<(tamarin_theory::rule::ProtoRuleE, Vec<tamarin_term::subst_vfresh::LNSubstVFresh>)>> =
         elaborated.items.par_iter().map(|item| {
             let TheoryItem::Rule(opr) = item else { return None; };
@@ -1380,11 +1408,12 @@ pub fn out_path_for(args: &Args, in_file: &str) -> Option<String> {
     None
 }
 
-/// Count proof-tree nodes in HS's `proofStepCount` style — the number
-/// of `LNode` constructors in the proof tree.  Each `step` in the
-/// proof's textual form (a `simplify` / `solve(...) case X` /
-/// `qed` / `SOLVED` annotation) corresponds to one ProofNode.
-/// Mirrors `Theory.Proof.proofStepCount`.
+/// Count proof-tree nodes — the number of `LNode` constructors in the
+/// proof tree.  Each `step` in the proof's textual form (a `simplify` /
+/// `solve(...) case X` / `qed` / `SOLVED` annotation) corresponds to one
+/// ProofNode.  Mirrors HS's `foldProof proofStepSummary` (which sums
+/// `const (Sum 1)` over every ProofStep — ClosedTheory.hs:484,491 via
+/// `foldProof`, Theory/Proof.hs:358).
 fn count_proof_steps(node: &tamarin_theory::constraint::solver::search::ProofNode) -> usize {
     1 + node.children.values().map(count_proof_steps).sum::<usize>()
 }
@@ -1398,10 +1427,12 @@ fn print_overall_summary(file_results: &[FileResult], prove_mode: bool) {
     println!();
     for fr in file_results {
         println!("analyzed: {}", fr.in_file);
+        // HS `ppRep` (Batch.hs) emits a single blank line between
+        // `analyzed:` and the nested `output:`/`processing time:` block.
         println!();
         if let Some(out) = &fr.out_file {
             // HS aligns `output:` and `processing time:` columns
-            // (Theory.Constraint.Solver.summarize).
+            // (`ppRep` in Main.Mode.Batch, src/Main/Mode/Batch.hs:144).
             println!("  output:          {}", out);
         }
         println!("  processing time: {:.2}s", fr.elapsed_ms as f64 / 1000.0);

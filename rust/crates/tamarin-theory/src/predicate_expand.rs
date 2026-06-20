@@ -34,19 +34,28 @@ pub fn expand_formula(
 }
 
 /// Convenience: expand every formula in a theory's lemmas / restrictions
-/// against the theory's own predicate definitions. Returns a new theory
-/// (a copy with the formulas rewritten). Items that don't carry a
-/// formula are returned unchanged.
+/// against the theory's predicate definitions. Items that don't carry a
+/// formula are left unchanged.
+///
+/// Each formula-bearing item is expanded only against predicates declared
+/// EARLIER in the theory (in source order), matching Haskell: there the
+/// expansion runs incrementally during parsing (`liftedExpandLemma` /
+/// `liftedExpandRestriction` call `expandFormula (theoryPredicates thy)`,
+/// Parser.hs / TheoryObject.hs), where `thy` only contains items parsed
+/// so far. A lemma textually preceding a predicate definition therefore
+/// does NOT see that predicate (Haskell would report `UndefinedPredicate`
+/// for a use of it), so we must not pre-collect the full predicate set.
 pub fn expand_theory_formulas(thy: &mut p::Theory) -> Result<(), ExpandError> {
-    let predicates: Vec<p::Predicate> = thy.items.iter().filter_map(|i| match i {
-        p::TheoryItem::Predicates(ps) => Some(ps.clone()),
-        _ => None,
-    }).flatten().collect();
-
-    if predicates.is_empty() { return Ok(()); }
+    // Predicates accumulated from items seen so far, in source order.
+    let mut predicates: Vec<p::Predicate> = Vec::new();
 
     for item in thy.items.iter_mut() {
         match item {
+            // A predicate declaration only becomes visible to items that
+            // follow it (HS `preddeclaration` adds it at this point).
+            p::TheoryItem::Predicates(ps) => {
+                predicates.extend(ps.iter().cloned());
+            }
             p::TheoryItem::Lemma(l) => {
                 l.formula = expand_formula(&l.formula, &predicates)?;
             }

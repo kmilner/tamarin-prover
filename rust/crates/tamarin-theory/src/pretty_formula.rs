@@ -28,13 +28,23 @@ use crate::guarded::{Guarded, Quant};
 /// Mirrors HS `LVar`'s role inside the `Precise.Fresh` monad used by
 /// `prettyLNFormula` (Formula.hs:511) and `prettyGuarded`
 /// (Guarded.hs:822-864).
-type Bind = (String, p::SortHint, String);
+/// `(source_name, sort, display_name, source_idx)`.  The `source_idx` is
+/// the binder var's ORIGINAL index (HS `lvarIdx`); it lets the body-var
+/// scope lookup distinguish two binders that share a name+sort but differ
+/// by index — e.g. the `x`(idx 0) / `x.1`(idx 1) fresh vars minted by
+/// `rule_restriction::rewrite` (HS `freshLVar "x" LSortMsg` from counter
+/// 0).  Matching on the full LVar identity also fixes shadowing of
+/// idx-bearing source binders, mirroring HS's positional (De-Bruijn)
+/// resolution.
+type Bind = (String, p::SortHint, String, u64);
 
 /// Pretty-print a parser-AST formula.  Mirrors Haskell's
 /// `prettyLNFormula` (Formula.hs:511-513):
 ///
-///     prettyLNFormula fm =
-///         Precise.evalFresh (prettyLFormula prettyNAtom fm) (avoidPrecise fm)
+/// ```text
+/// prettyLNFormula fm =
+///     Precise.evalFresh (prettyLFormula prettyNAtom fm) (avoidPrecise fm)
+/// ```
 ///
 /// We seed the Precise fresh state with the formula's free-var names
 /// (`avoidPrecise = avoidPreciseVars . frees`, LTerm.hs:672-680) and
@@ -48,10 +58,11 @@ pub fn pretty_formula(f: &p::Formula) -> String {
     s
 }
 
-/// Pretty-print a formula with HS-style `sep`/`nest`-driven line
-/// wrapping.  `indent` is the column where the first character of the
-/// formula will land in the final output; `width` is the (legacy)
-/// target line width.
+/// Pretty-print a formula with HS-style `sep`/`nest`-driven
+/// line wrapping.  `indent` is the column where the first character of the
+/// formula will land in the final output.  The fixed page/ribbon widths
+/// come from `LINE_LENGTH`/`RIBBON` (HS `lineWidth = 110`,
+/// `ribbonLength = 73`), so there is no per-call width knob.
 ///
 /// HS's `Text.PrettyPrint.HughesPJ` decides "does flat fit on this
 /// line" via `fits ((w `min` r) - sl) p` (HughesPJ.hs:873), where
@@ -66,7 +77,7 @@ pub fn pretty_formula(f: &p::Formula) -> String {
 /// This routes through the HS-faithful Doc engine
 /// (`crate::pretty_hpj`) so per-NilAbove `w`-shrinkage is tracked
 /// (HS get1 NilAbove: `nilAbove_ (get (w - sl) p)`).
-pub fn pretty_formula_wrapped(f: &p::Formula, indent: usize, _width: usize) -> String {
+pub fn pretty_formula_wrapped(f: &p::Formula, indent: usize) -> String {
     use crate::pretty_hpj as hpj;
     // Build the formula's Doc tree, then render via the HS-faithful
     // engine.  `indent` is the column where the first text of the
@@ -113,8 +124,10 @@ pub fn formula_doublequoted_nested(f: &p::Formula, nest_n: usize) -> String {
 /// Pretty-print a guarded formula.  Mirrors Haskell's
 /// `prettyGuarded` (Guarded.hs:822-826):
 ///
-///     prettyGuarded fm =
-///         Precise.evalFresh (pp fm) (avoidPrecise fm)
+/// ```text
+/// prettyGuarded fm =
+///     Precise.evalFresh (pp fm) (avoidPrecise fm)
+/// ```
 ///
 /// We seed the Precise fresh state with the guarded formula's free-var
 /// names and run pp under that state — each `GGuarded` then does
@@ -129,11 +142,13 @@ pub fn pretty_guarded(g: &Guarded) -> String {
     s
 }
 
-/// Pretty-print a guarded formula with HS-style `sep`/`nest`-driven
-/// line wrapping.  `indent` is the column where the first character of
-/// the formula will land in the final output; `width` is the target
-/// line width.  Mirrors Haskell's `prettyGuarded` (Guarded.hs:822-864)
-/// composed with the HughesPJ `sep`/`nest` layout semantics.
+/// Test-only: pretty-print a guarded formula with HS-style
+/// `sep`/`nest`-driven line wrapping.  `indent` is the column where the
+/// first character of the formula will land in the final output.  The page
+/// /ribbon widths are the fixed `LINE_LENGTH`/`RIBBON` constants, so there
+/// is no per-call width knob.  Mirrors Haskell's `prettyGuarded`
+/// (Guarded.hs:822-864) composed with the HughesPJ `sep`/`nest` layout
+/// semantics.
 ///
 /// Routes through the HS-faithful Doc engine (`crate::pretty_hpj`):
 /// `guarded_to_doc` builds a `Doc` tree that mirrors HS `prettyGuarded`'s
@@ -152,7 +167,8 @@ pub fn pretty_guarded(g: &Guarded) -> String {
 /// `pretty_guarded_doublequoted` (which models the `"` as a real Doc
 /// `beside`, getting the continuation indent right).  This bare entry
 /// point is kept for callers that pass `indent=0`.
-pub fn pretty_guarded_wrapped(g: &Guarded, indent: usize, _width: usize) -> String {
+#[cfg(test)]
+fn pretty_guarded_wrapped(g: &Guarded, indent: usize) -> String {
     use crate::pretty_hpj as hpj;
     let mut state = avoid_precise_guarded(g);
     let doc = guarded_to_doc(g, &[], &mut state);
@@ -298,14 +314,10 @@ pub fn step_line_with_unann(
     };
     // HS `ppCases ps [] = prettyCase ps (kwBy <> text " ") <> prettyStep ps`
     // (Proof.hs:1085): the `by ` keyword is laid out BESIDE the WHOLE
-    // `sep [method, comment]`, NOT folded into the first `sep` element.
-    // So when `sep` breaks vertically the dropped `/* unannotated */`
-    // aligns at the sep's start column = `base_indent + len(prefix)`.
-    // Baking `by ` inside the `sep`'s first element (the previous RS
-    // structure) put the sep's base at `base_indent`, dropping the comment
-    // a `len("by ")` = 3 spaces too shallow — the dnp3-proven
-    // `/* unannotated */` divergence.  `beside` shifts the comment's
-    // continuation column identically to HughesPJ.
+    // `sep [method, comment]`, NOT folded into the first `sep` element.  So
+    // when `sep` breaks vertically the dropped `/* unannotated */` aligns at
+    // the sep's start column = `base_indent + len(prefix)`; `beside` shifts
+    // the comment's continuation column identically to HughesPJ.
     let step = if prefix.is_empty() {
         core
     } else {
@@ -415,13 +427,12 @@ pub fn rule_body_to_doc(
 /// (LTerm.hs:672-675).
 fn avoid_precise_insert(state: &mut PreciseFreshState, name: &str, idx: u64) {
     let want = idx + 1;
-    if let Some(cur) = state.as_map().get(name).copied() {
-        if cur >= want { return; }
-    }
-    // PreciseFreshState has no direct "set" API; emulate via scope rollback
-    // would re-allocate, so do it through repeated fresh_ident until we hit
-    // `want`.  Using the public API keeps internals encapsulated.
+    // `PreciseFreshState` exposes no direct "set"; emulate `insertWith max`
+    // via repeated `fresh_ident` until the counter reaches `want`.  Read the
+    // current value ONCE (default 0) and early-return when it already meets
+    // `want` — no double lookup.
     let cur = state.as_map().get(name).copied().unwrap_or(0);
+    if cur >= want { return; }
     for _ in cur..want {
         let _ = state.fresh_ident(name);
     }
@@ -528,30 +539,6 @@ fn avoid_precise_guarded(g: &Guarded) -> PreciseFreshState {
     state
 }
 
-/// Allocate display names for a list of binder vars (parser AST), mirroring
-/// HS `openFormulaPrefix`'s loop of `freshLVar n s` calls
-/// (Formula.hs:293-307, LTerm.hs:295-296).  Returns the new scope entries.
-fn allocate_formula_binders(
-    vs: &[p::VarSpec],
-    scope: &[Bind],
-    state: &mut PreciseFreshState,
-) -> Vec<Bind> {
-    let mut out: Vec<Bind> = scope.to_vec();
-    for v in vs {
-        // HS `freshLVar n s = LVar n s <$> freshIdent n`.
-        let idx = state.fresh_ident(&v.name);
-        // HS `show LVar` body: idx==0 → just name; else `name.idx`
-        // (LTerm.hs:526-532).
-        let display = if idx == 0 {
-            v.name.clone()
-        } else {
-            format!("{}.{}", v.name, idx)
-        };
-        out.push((v.name.clone(), v.sort, display));
-    }
-    out
-}
-
 /// Allocate display names for a guarded binder (GBinding list), mirroring
 /// HS `openGuarded`'s `mapM (\(n,s) -> freshLVar n s) vs`
 /// (Guarded.hs:362-371).
@@ -569,7 +556,10 @@ fn allocate_guarded_binders(
         } else {
             format!("{}.{}", v.name, idx)
         };
-        out.push((v.name.clone(), v.sort, display));
+        // The guarded path resolves bound vars POSITIONALLY (`lookup_bound`
+        // / `bound_to_varspec`), never via the name-based `lookup_display`,
+        // so the stored source_idx is unused here; carry `0`.
+        out.push((v.name.clone(), v.sort, display, 0));
     }
     out
 }
@@ -612,8 +602,63 @@ fn pp_formula(
     }
 }
 
+/// Peel consecutive same-kind quantifier nodes, mirroring HS
+/// `openFormulaPrefix` (Formula.hs:296-307): `∀ x. ∀ y. P` is one binder
+/// block `∀ x y. P`.  The parser builds nested `Forall([x], Forall([y], P))`
+/// (one keyword per node), so we greedily collect the var-specs of all
+/// directly-nested same-kind nodes and return the innermost body.
+fn open_formula_prefix<'a>(
+    is_forall: bool,
+    vs: &'a [p::VarSpec],
+    body: &'a p::Formula,
+) -> (Vec<&'a p::VarSpec>, &'a p::Formula) {
+    let mut collected: Vec<&p::VarSpec> = vs.iter().collect();
+    let mut cur = body;
+    loop {
+        match cur {
+            p::Formula::Forall(vs2, body2) if is_forall => {
+                collected.extend(vs2.iter());
+                cur = body2.as_ref();
+            }
+            p::Formula::Exists(vs2, body2) if !is_forall => {
+                collected.extend(vs2.iter());
+                cur = body2.as_ref();
+            }
+            _ => break,
+        }
+    }
+    (collected, cur)
+}
+
+/// Allocate display names for a list of binder var refs (the collapsed
+/// binder block from `open_formula_prefix`), mirroring HS `openFormulaPrefix`'s
+/// loop of `freshLVar n s` calls (Formula.hs:296-307, LTerm.hs:295-296).
+/// `idx==0` → just name; else `name.idx` (HS `show LVar`, LTerm.hs:526-532).
+fn allocate_formula_binders_refs(
+    vs: &[&p::VarSpec],
+    scope: &[Bind],
+    state: &mut PreciseFreshState,
+) -> Vec<Bind> {
+    let mut out: Vec<Bind> = scope.to_vec();
+    for v in vs {
+        let idx = state.fresh_ident(&v.name);
+        let display = if idx == 0 {
+            v.name.clone()
+        } else {
+            format!("{}.{}", v.name, idx)
+        };
+        // 4th element = source_idx (predicate-fix `Bind`): carry the parsed
+        // var's idx so `lookup_display` can resolve body-var occurrences by
+        // full identity (name, idx, sort) — distinguishing fresh `x` vs `x.1`
+        // in `_restrict`/predicate rendering (b6fc7919).
+        out.push((v.name.clone(), v.sort, display, v.idx));
+    }
+    out
+}
+
 /// HS `pp fm@(Qua _ _ _) = scopeFreshness $ do ...` (Formula.hs:496-502):
-/// save Precise state, allocate display names for `vs`, render body,
+/// save Precise state, `openFormulaPrefix` collapses consecutive same-kind
+/// quantifiers into one binder block, allocate display names, render body,
 /// restore state.
 fn pp_qua(
     is_forall: bool,
@@ -624,7 +669,10 @@ fn pp_qua(
     out: &mut String,
 ) {
     state.scope_freshness(|state| {
-        let new_scope = allocate_formula_binders(vs, scope, state);
+        // HS `openFormulaPrefix` (Formula.hs:498) collapses `∀ x. ∀ y. P`
+        // to `∀ x y. P`.
+        let (all_vs, inner_body) = open_formula_prefix(is_forall, vs, body);
+        let new_scope = allocate_formula_binders_refs(&all_vs, scope, state);
         out.push(if is_forall { '\u{2200}' } else { '\u{2203}' });
         out.push(' ');
         // Render binder display names (post-allocation).
@@ -634,7 +682,7 @@ fn pp_qua(
             out.push_str(&b.2);
         }
         out.push_str(". ");
-        pp_formula(body, &new_scope, state, out);
+        pp_formula(inner_body, &new_scope, state, out);
     })
 }
 
@@ -727,11 +775,13 @@ fn formula_to_doc(
             // `fsep` makes the bound-var list BREAKABLE, so a long var list
             // wraps across lines (continuation aligned after the `∃ ` prefix
             // via `<>`'s nesting offset) — matching HS byte-for-byte.
-            // Previously the prefix was a single flat `Doc::text`, so it
-            // could never wrap.
-            let sym = if matches!(f, Forall(_, _)) { "\u{2200} " } else { "\u{2203} " };
+            let is_forall = matches!(f, Forall(_, _));
+            let sym = if is_forall { "\u{2200} " } else { "\u{2203} " };
             state.scope_freshness(|state| {
-                let new_scope = allocate_formula_binders(vs, scope, state);
+                // HS `openFormulaPrefix` (Formula.hs:498) collapses
+                // `∀ x. ∀ y. P` to one binder block `∀ x y. P`.
+                let (all_vs, inner_body) = open_formula_prefix(is_forall, vs, body);
+                let new_scope = allocate_formula_binders_refs(&all_vs, scope, state);
                 let var_docs: Vec<hpj::Doc> = new_scope[scope.len()..]
                     .iter()
                     .map(|b| {
@@ -745,7 +795,7 @@ fn formula_to_doc(
                 let quant = doc_text(sym)
                     .beside(hpj::fsep(var_docs))
                     .beside(doc_text("."));
-                let body_doc = formula_to_doc(body, &new_scope, state);
+                let body_doc = formula_to_doc(inner_body, &new_scope, state);
                 hpj::sep(vec![quant, body_doc.nest(1)])
             })
         }
@@ -758,11 +808,8 @@ fn formula_to_doc(
 /// used elsewhere, so a fact like `F( a, b, c )` can drop its closing `)`
 /// onto its own line (HS `prettyFact`'s `nestShort'`) when the ribbon is
 /// exceeded — e.g. spdm Attack_Session_Mode_Switch's deeply-nested
-/// conjunction.  Previously the atom was flattened to one `Doc::text`,
-/// so it could never break inside a formula and overflowed the ribbon
-/// where HS wraps.  When the atom fits on the line the Doc renders
-/// byte-identically to the old flat string, so this only changes
-/// over-wide atoms (toward HS), never fitting ones.
+/// conjunction.  When the atom fits on the line it renders as the flat
+/// string; only over-wide atoms break (matching HS).
 fn atom_to_doc(a: &p::Atom, scope: &[Bind]) -> crate::pretty_hpj::Doc {
     use crate::pretty_hpj::{self as hpj, Doc};
     use p::Atom::*;
@@ -859,13 +906,22 @@ fn resolved_sort(v: &p::VarSpec, scope: &[Bind]) -> p::SortHint {
     v.sort
 }
 
-/// Find the binding's display name, if any.  Match by (name, resolved sort)
-/// against the scope (innermost first).  Mirrors HS's De Bruijn lookup —
-/// a Bound var resolves to its binder's freshly-allocated LVar (whose
-/// `show` is `sortPrefix ++ name[.idx]`).
-fn lookup_display(name: &str, sort: p::SortHint, scope: &[Bind]) -> Option<(p::SortHint, String)> {
+/// Find the binding's display name, if any.  Match by the binder's FULL
+/// source identity (name, source-idx, resolved sort) against the scope,
+/// innermost first.  Mirrors HS's De Bruijn lookup — a Bound var resolves
+/// to its binder's freshly-allocated LVar (whose `show` is
+/// `sortPrefix ++ name[.idx]`).
+///
+/// Matching on `idx` (not just name+sort) is what distinguishes two
+/// binders that share a name+sort but differ by index — the `x`(idx 0) /
+/// `x.1`(idx 1) fresh vars `rule_restriction::rewrite` mints (HS
+/// `freshLVar "x" LSortMsg`).  Innermost-first matching still resolves
+/// ordinary same-(name,idx) shadowing to the inner binder, identical to
+/// the previous behaviour (source binders carry idx 0, so the idx test is
+/// a no-op there).
+fn lookup_display(name: &str, idx: u64, sort: p::SortHint, scope: &[Bind]) -> Option<(p::SortHint, String)> {
     for b in scope.iter().rev() {
-        if b.0 == name && b.1 == sort {
+        if b.0 == name && b.3 == idx && b.1 == sort {
             return Some((b.1, b.2.clone()));
         }
     }
@@ -887,12 +943,15 @@ fn pp_var(v: &p::VarSpec, out: &mut String) {
 /// LTerm.hs:526-532).  Otherwise emit the source name+idx as Free.
 fn pp_var_scoped(v: &p::VarSpec, scope: &[Bind], out: &mut String) {
     let sort = resolved_sort(v, scope);
-    if v.idx == 0 {
-        if let Some((bsort, display)) = lookup_display(&v.name, sort, scope) {
-            out.push_str(sort_prefix_from_hint(bsort));
-            out.push_str(&display);
-            return;
-        }
+    // Resolve against the binder scope by FULL identity (name, idx, sort),
+    // for any idx — a body occurrence of a binder var may itself carry an
+    // index (e.g. the `x.1` fresh var minted by `rule_restriction`).  When
+    // no binder matches (the common case: free vars like `#vk.6`), fall
+    // through to render the source name+idx verbatim, identical to before.
+    if let Some((bsort, display)) = lookup_display(&v.name, v.idx, sort, scope) {
+        out.push_str(sort_prefix_from_hint(bsort));
+        out.push_str(&display);
+        return;
     }
     out.push_str(sort_prefix_from_hint(sort));
     out.push_str(&v.name);
@@ -1046,7 +1105,16 @@ pub fn term_to_doc(t: &p::Term, scope: &[Bind]) -> crate::pretty_hpj::Doc {
             }
         }
         AlgApp(name, l, r) => fun_doc_two(name, l, r, scope),
-        Diff(l, r) => fun_doc_two("diff", l, r, scope),
+        // HS `prettyTerm` dedicated diff case (Term/Term.hs:275):
+        //   `... | s == diffSym -> text "diff" <> "(" <> ppTerm t1 <>
+        //         ", " <> ppTerm t2 <> ")"` — all `<>` (no `fsep`), so it is
+        //   fully flat and never breaks at the comma (unlike the generic
+        //   `ppFun`/`fun_doc` path which joins args with a breakable `fsep`).
+        Diff(l, r) => Doc::text("diff(")
+            .beside(term_to_doc(l, scope))
+            .beside(Doc::text(", "))
+            .beside(term_to_doc(r, scope))
+            .beside(Doc::text(")")),
         BinOp(op, l, r) => {
             // HS `prettyTerm` (Term/Term.hs:273-274):
             //   `FApp (AC o) ts -> ppTerms (ppACOp o) 1 "(" ")" ts`  (wraps via fcat)
@@ -1062,9 +1130,8 @@ pub fn term_to_doc(t: &p::Term, scope: &[Bind]) -> crate::pretty_hpj::Doc {
                 // recursively `ppTerm`'d, so an AC exponent (e.g.
                 // `'g'^(~a*~b)`) keeps its inner `fcat` BREAK POINTS — the
                 // `*`-operands wrap when the term overruns at deep indent.
-                // Flattening the whole exp to a string (the old behaviour)
-                // destroyed those break points.  Compose the operand Docs with
-                // `beside` (HS `<>`) so the inner fcat survives.
+                // Composing the operand Docs with `beside` (HS `<>`) preserves
+                // that inner fcat.
                 term_to_doc(l, scope)
                     .beside(Doc::text("^"))
                     .beside(term_to_doc(r, scope))
@@ -1132,24 +1199,31 @@ fn pair_doc(flat: &[&p::Term], scope: &[Bind]) -> crate::pretty_hpj::Doc {
 }
 
 /// HS `ppFun f ts = text (f ++ "(") <> fsep (punctuate comma (map ppTerm ts))
-/// <> text ")"` (Term/Term.hs:295-296).
-fn fun_doc(name: &str, args: &[p::Term], scope: &[Bind]) -> crate::pretty_hpj::Doc {
+/// <> text ")"` (Term/Term.hs:295-296), over a slice of `&Term` so callers
+/// (incl. the boxed-pair binary shapes) need not clone the subtrees.
+fn fun_doc_refs(name: &str, args: &[&p::Term], scope: &[Bind]) -> crate::pretty_hpj::Doc {
     use crate::pretty_hpj::{self as hpj, Doc};
     let arg_docs: Vec<Doc> = args.iter().map(|a| term_to_doc(a, scope)).collect();
     let body = hpj::fsep(hpj::punctuate(comma_doc(), arg_docs));
     Doc::text(format!("{}(", name)).beside(body).beside(Doc::text(")"))
 }
 
+/// As `fun_doc_refs`, for callers holding an owned `&[p::Term]`.
+fn fun_doc(name: &str, args: &[p::Term], scope: &[Bind]) -> crate::pretty_hpj::Doc {
+    let refs: Vec<&p::Term> = args.iter().collect();
+    fun_doc_refs(name, &refs, scope)
+}
+
 /// `fun_doc` for the binary algebraic / diff shapes that the parser stores
-/// as boxed pairs rather than a `Vec`.
+/// as boxed pairs rather than a `Vec` — passes the operands by reference
+/// (no subtree clone).
 fn fun_doc_two(
     name: &str,
     l: &p::Term,
     r: &p::Term,
     scope: &[Bind],
 ) -> crate::pretty_hpj::Doc {
-    let args = [l.clone(), r.clone()];
-    fun_doc(name, &args, scope)
+    fun_doc_refs(name, &[l, r], scope)
 }
 
 /// Pretty-print a fact as a `pretty_hpj::Doc`.  Faithful to HS `prettyFact`
@@ -1235,20 +1309,26 @@ fn gterm_to_doc(t: &crate::guarded::GTerm, scope: &[Vec<Bind>]) -> crate::pretty
             // The curly-brace form `name{a}b` is parser-only sugar
             // (parser.rs:2111); HS `prettyTerm`/`ppFun` (Term/Term.hs:268-296)
             // has no brace case and emits these NoEq applications in function
-            // form `name(a, b)`.  Render identically to `App(name, [l, r])`.
-            let args = [(**l).clone(), (**r).clone()];
-            gfun_doc(name, &args, scope)
+            // form `name(a, b)`.  Render identically to `App(name, [l, r])`,
+            // passing the operands by reference (no subtree clone).
+            gfun_doc_refs(name, &[&**l, &**r], scope)
         }
         Diff(l, r) => {
-            let args = [(**l).clone(), (**r).clone()];
-            gfun_doc("diff", &args, scope)
+            // HS `prettyTerm` dedicated diff case (Term/Term.hs:275): fully
+            // flat `text "diff" <> "(" <> ppTerm t1 <> ", " <> ppTerm t2 <>
+            // ")"` (all `<>`, no `fsep`), so it never breaks at the comma
+            // (unlike the generic `gfun_doc` path).
+            Doc::text("diff(")
+                .beside(gterm_to_doc(l, scope))
+                .beside(Doc::text(", "))
+                .beside(gterm_to_doc(r, scope))
+                .beside(Doc::text(")"))
         }
         BinOp(op, l, r) => {
             // exp never breaks at `^`, but its operands are recursively
             // `ppTerm`'d (Term/Term.hs:274 `ppTerm t1 <> "^" <> ppTerm t2`),
             // so an AC exponent (`'g'^(~a*~b)`) keeps its inner `fcat` break
-            // points.  Composing operand Docs with `beside` preserves them;
-            // flattening the whole exp to a string destroyed them.
+            // points.  Composing operand Docs with `beside` preserves them.
             if matches!(op, p::BinOp::Exp) {
                 gterm_to_doc(l, scope)
                     .beside(Doc::text("^"))
@@ -1317,16 +1397,27 @@ fn gac_op_doc(
     hpj::fcat(parts)
 }
 
-/// HS `ppFun f ts` for `GTerm` (mirror of `fun_doc`).
-fn gfun_doc(
+/// HS `ppFun f ts` for `GTerm`, over a slice of `&GTerm` so callers (incl.
+/// the boxed-pair binary `AlgApp` shape) need not clone the subtrees.
+fn gfun_doc_refs(
     name: &str,
-    args: &[crate::guarded::GTerm],
+    args: &[&crate::guarded::GTerm],
     scope: &[Vec<Bind>],
 ) -> crate::pretty_hpj::Doc {
     use crate::pretty_hpj::{self as hpj, Doc};
     let arg_docs: Vec<Doc> = args.iter().map(|a| gterm_to_doc(a, scope)).collect();
     let body = hpj::fsep(hpj::punctuate(comma_doc(), arg_docs));
     Doc::text(format!("{}(", name)).beside(body).beside(Doc::text(")"))
+}
+
+/// As `gfun_doc_refs`, for callers holding an owned `&[GTerm]`.
+fn gfun_doc(
+    name: &str,
+    args: &[crate::guarded::GTerm],
+    scope: &[Vec<Bind>],
+) -> crate::pretty_hpj::Doc {
+    let refs: Vec<&crate::guarded::GTerm> = args.iter().collect();
+    gfun_doc_refs(name, &refs, scope)
 }
 
 /// Pretty-print a `GFact` as a `Doc`, faithful to HS `prettyFact`
@@ -1626,7 +1717,7 @@ fn lookup_bound(n: u32, scope: &[Vec<Bind>]) -> Option<&Bind> {
 /// recovered from the display name (`name` ⇒ 0, `name.k` ⇒ k).
 fn bound_to_varspec(n: u32, scope: &[Vec<Bind>]) -> Option<p::VarSpec> {
     let b = lookup_bound(n, scope)?;
-    let (src_name, sort, display) = b;
+    let (src_name, sort, display, _src_idx) = b;
     // display = src_name (idx 0) | "src_name.idx".
     let idx = if display == src_name {
         0
@@ -1790,30 +1881,35 @@ fn pp_gguarded(
     let alloc = allocate_guarded_binders(vars, scope, state);
     let mut new_scope: Vec<Vec<Bind>> = scope.to_vec();
     new_scope.push(alloc);
-    // Special case: `∀[] [Atom].⊥` renders as `¬<dante>` where
-    // `dante = pp (GConj (Conj antecedent))` and Conj wraps each
-    // conjunct in `opParens` (Guarded.hs:856-857).  So single
-    // guard `¬(a)`, multiple `¬((a) ∧ (b))` (outer Conj from
-    // `pp`).
+
+    // HS `dante = pp (GConj (Conj antecedent))` (Guarded.hs:852).  When the
+    // antecedent is empty `pp (GConj (Conj [])) = operator_ "⊤"`
+    // (Guarded.hs:838); otherwise each guard atom is wrapped via `opParens`
+    // and joined with ` ∧ ` (Guarded.hs:840-842).  Render dante into a local
+    // buffer so the empty-antecedent ⊤ is emitted in EVERY non-shortcut
+    // case, matching HS and the Doc path `gguarded_to_doc`.
+    let mut dante = String::new();
+    if guards.is_empty() {
+        dante.push('\u{22A4}'); // ⊤
+    } else {
+        for (i, gd) in guards.iter().enumerate() {
+            if i > 0 { dante.push_str(" \u{2227} "); }
+            dante.push('(');
+            pp_gatom(gd, &new_scope, &mut dante);
+            dante.push(')');
+        }
+    }
+
+    // Special case: `∀[] [Atom].⊥` renders as `¬<dante>`
+    // (Guarded.hs:856-857).  `<>` is no-break horizontal concat.  The
+    // caller's `opParens` (GConj/GDisj child position) adds outer parens.
     if matches!(qua, Quant::All)
         && vars.is_empty()
         && body_is_false(body)
     {
-        // HS Guarded.hs:856-857: `operator_ "¬" <> dante` —
-        // `<>` is no-break horizontal concat.  The caller's
-        // `opParens` (GConj/GDisj child position) adds outer
-        // parens around the whole `¬<dante>`.
         if paren_atomic { out.push('('); }
         out.push('\u{00AC}'); // ¬
-        // `dante = pp (GConj antecedent)` (Guarded.hs:852)
-        // emits each guard atom wrapped via `opParens` (lines
-        // 840-841) and joined by ` ∧ `.
-        for (i, gd) in guards.iter().enumerate() {
-            if i > 0 { out.push_str(" \u{2227} "); }
-            out.push('(');
-            pp_gatom(gd, &new_scope, out);
-            out.push(')');
-        }
+        out.push_str(&dante);
         if paren_atomic { out.push(')'); }
         return;
     }
@@ -1826,35 +1922,22 @@ fn pp_gguarded(
     out.push(' ');
     pp_binding_list_with_display(&new_scope[scope.len()], out);
     out.push_str(". ");
-    // Antecedent (guards).
-    if guards.is_empty() {
-        // Just the body.
-        pp_guarded_inner(body, false, &new_scope, state, out);
-    } else {
+    // HS `(Ex, _, GConj []) -> sep [quantifier, dante]` (Guarded.hs:854-855):
+    // existential with trivially-true body renders as `∃ vs. <dante>` with
+    // no connective/body.  Otherwise `sep [quantifier, sep [dante,
+    // connective, dsucc]]` (Guarded.hs:858-860): always emit dante (⊤ when
+    // empty), the connective, then the body rendered BARE.
+    out.push_str(&dante);
+    if !(matches!(qua, Quant::Ex) && body_is_true(body)) {
         let connective = match qua {
             Quant::All => " \u{21D2} ", // ⇒
             Quant::Ex => " \u{2227} ",  // ∧
         };
-        // Mirror HS: `dante = pp (GConj (Conj antecedent))` —
-        // each guard atom is wrapped via `opParens`, then
-        // joined with `∧`.  Single atom → `(atom)`; multiple
-        // → `(a) ∧ (b)`.
-        for (i, gd) in guards.iter().enumerate() {
-            if i > 0 { out.push_str(" \u{2227} "); }
-            out.push('(');
-            pp_gatom(gd, &new_scope, out);
-            out.push(')');
-        }
-        // Special case: existential with trivially-true body
-        // renders as `∃ vs. (guards)` (Guarded.hs:854-855).
-        if !(matches!(qua, Quant::Ex) && body_is_true(body)) {
-            out.push_str(connective);
-            // HS Guarded.hs:858-860: `dsucc <- nest 1 <$> pp gf`
-            // — the body is rendered BARE (no `opParens`); only
-            // the body's own pp may emit parens (e.g. GDisj
-            // self-wraps).  paren_atomic=false here.
-            pp_guarded_inner(body, false, &new_scope, state, out);
-        }
+        out.push_str(connective);
+        // HS Guarded.hs:858-860: `dsucc <- nest 1 <$> pp gf` — the body is
+        // rendered BARE (no `opParens`); only the body's own pp may emit
+        // parens (e.g. GDisj self-wraps).  paren_atomic=false here.
+        pp_guarded_inner(body, false, &new_scope, state, out);
     }
     if paren_atomic { out.push(')'); }
 }
@@ -2304,7 +2387,7 @@ mod tests {
         let vs: Vec<p::VarSpec> =
             names.iter().map(|n| v(n, p::SortHint::Untagged)).collect();
         let f = p::Formula::Exists(vs, Box::new(p::Formula::False));
-        let out = pretty_formula_wrapped(&f, 0, 110);
+        let out = pretty_formula_wrapped(&f, 0);
         let lines: Vec<&str> = out.split('\n').collect();
         assert!(lines.len() >= 2, "long var list must wrap: {out:?}");
         // First line opens with the existential symbol and a space.
@@ -2411,7 +2494,7 @@ mod tests {
         );
         let g = Guarded::Atom(crate::guarded::atom_to_gatom_free(&eq));
         // indent 12 (a proof-tree depth) forces the RHS chain to wrap.
-        let s = pretty_guarded_wrapped(&g, 12, 0);
+        let s = pretty_guarded_wrapped(&g, 12);
         assert!(s.contains("++\n"), "guarded AC chain did not wrap:\n{s}");
         assert!(s.contains("~longPayloadNameNumberTwo"), "payload missing:\n{s}");
         // The Eq's `=` is rendered (HS `sep [ppT l <-> opEqual, ppT r]`).

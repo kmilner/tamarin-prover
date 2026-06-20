@@ -50,6 +50,7 @@ pub mod pretty_system;
 pub mod pretty_theory;
 pub mod restriction;
 pub mod rule;
+pub mod rule_restriction;
 pub mod constraint;
 pub mod deriv_check;
 pub mod elaborate;

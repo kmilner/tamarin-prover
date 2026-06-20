@@ -42,7 +42,7 @@ impl<'a> Lexer<'a> {
         self.rest().chars().next()
     }
 
-    /// Peek two chars ahead.
+    /// Peek the char immediately after the next one (the second remaining char).
     pub fn peek2(&self) -> Option<char> {
         let mut it = self.rest().chars();
         it.next();
@@ -153,6 +153,13 @@ impl<'a> Lexer<'a> {
 
     /// Parse an identifier: alphanum start, alphanum or `_` continuation.
     /// Returns None if the next char isn't alphanumeric.
+    ///
+    /// Note: unlike Haskell's `T.identifier spthy`, which rejects the reserved
+    /// names `["in","let","rule","diff"]` (Token.hs:225), this deliberately does
+    /// NOT exclude reserved names. Callers rely on this (e.g. the `diff` term op
+    /// in parser.rs); facts named these words are still rejected upstream by the
+    /// uppercase-first-letter rule, so the only divergence is the unusual case of
+    /// a user naming a function/variable after a reserved keyword.
     pub fn identifier(&mut self) -> Option<String> {
         self.skip_ws();
         let save = self.pos;
@@ -176,7 +183,13 @@ impl<'a> Lexer<'a> {
         id
     }
 
-    /// Parse a natural number literal.
+    /// Parse a natural number literal (decimal only).
+    ///
+    /// Haskell `T.natural spthy` (Token.hs:341) additionally accepts Parsec's
+    /// `0x`/`0o` hex/octal prefixes. This restriction to decimal is intentional:
+    /// every `natural` call site is a small decimal index (premise/conclusion
+    /// numbers, function arity, reuse limit, `x.1` subscripts) that no real
+    /// `.spthy` file writes in an alternate radix.
     pub fn natural(&mut self) -> Option<u64> {
         self.skip_ws();
         let mut s = String::new();
@@ -204,7 +217,17 @@ impl<'a> Lexer<'a> {
         if got { self.skip_ws(); Some(n) } else { None }
     }
 
-    /// String literal in double quotes, escape via `\`.
+    /// String literal in double quotes.
+    ///
+    /// Escapes are handled by dropping the backslash and keeping the next char
+    /// verbatim (`\"` -> `"`, `\\` -> `\`, `\n` -> `n`). This is intentionally a
+    /// restricted approximation and matches neither Haskell semantics exactly:
+    /// config/fileArgs use `T.stringLiteral` (full Haskell escape decoding incl.
+    /// `\n`->newline, numeric `\65`, gap escapes), while export bodies use a
+    /// stricter `bodyChar` (Signature.hs:277-287) that only accepts `\\`/`\"` and
+    /// fails on any other `\x`. The common `\\`/`\"` cases coincide across all
+    /// call sites, and the diverging numeric/gap escapes do not occur in real
+    /// config strings, include paths, or export bodies.
     pub fn string_literal(&mut self) -> Option<String> {
         self.skip_ws();
         let save = self.pos;
@@ -238,6 +261,10 @@ impl<'a> Lexer<'a> {
                 Some(c) => { s.push(c); self.bump(); }
             }
         }
+        // Haskell `singleQuotedString = singleQuoted $ many1 (noneOf "'\n")`
+        // (Token.hs:452-453): `many1` requires at least one body char, so `''`
+        // must fail.
+        if s.is_empty() { self.pos = save; return None; }
         if !self.eat('\'') { self.pos = save; return None; }
         self.skip_ws();
         Some(s)
@@ -265,8 +292,13 @@ impl<'a> Lexer<'a> {
                     self.bump();
                     match self.peek() {
                         Some(c @ '\\') | Some(c @ '*') => { body.push(c); self.bump(); }
-                        Some(c) => { body.push('\\'); body.push(c); self.bump(); }
-                        None => { self.pos = save; return None; }
+                        // Haskell `bodyChar` (Token.hs:382-387): on `\` the inner
+                        // `char '\\' <|> char '*'` only accepts `\` or `*`; any
+                        // other `\x` makes `bodyChar` (wrapped in `try`) backtrack
+                        // un-consuming the `\`, so `many bodyChar` stops and the
+                        // required `string "*}"` then fails at the `\` — i.e. the
+                        // whole formalComment fails.
+                        _ => { self.pos = save; return None; }
                     }
                 }
                 Some(c) => { body.push(c); self.bump(); }
@@ -275,6 +307,12 @@ impl<'a> Lexer<'a> {
     }
 
     /// Hex colour code (optionally prefixed with `#`, optionally single-quoted).
+    ///
+    /// Unlike the Haskell `symbol`-based parser (Token.hs:404-406), this does not
+    /// skip whitespace after the opening quote or after `#`, so `' #FF'` / `'# FF'`
+    /// are rejected here though Haskell accepts them. Real colour attributes are
+    /// always tight (e.g. `'#111111'`), so this whitespace divergence has no
+    /// practical effect.
     pub fn hex_color(&mut self) -> Option<String> {
         self.skip_ws();
         let save = self.pos;

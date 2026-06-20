@@ -28,22 +28,25 @@ use tamarin_term::term::Term;
 /// Drops entailed less-atoms, then tries to hide each node in turn.
 pub fn compress_system(mut sys: System) -> System {
     sys = drop_entailed_ord_constraints(sys);
-    let node_ids: Vec<NodeId> = sys.nodes.iter().map(|(id, _)| id.clone()).collect();
-    let last_atom_id: Option<NodeId> = sys.last_atom.clone();
-    for v in node_ids {
-        sys = try_hide_node_id(&v, sys);
-    }
-    // Apply tryHideNodeId to less-atom endpoints / last-atom too —
-    // Haskell does this via `frees`, which walks every free variable
-    // of the System.  We approximate with the union of node-ids and
-    // less-atom endpoints.
-    let mut extra: BTreeSet<NodeId> = BTreeSet::new();
+    // Haskell: `foldl' (flip tryHideNodeId) se (frees (sLessAtoms, sNodes))`
+    // where `frees = sortednub . freesList` — a SINGLE sorted, deduplicated
+    // pass over the free vars of the (less-atoms, nodes) tuple.  The only
+    // Node-sort frees come from the node-id keys and the less-atom
+    // endpoints (rule instances carry term vars, not node vars), so we
+    // gather both into one sorted+deduplicated set and fold once.  We do
+    // NOT include `last_atom` (it is not part of Haskell's tuple) and we
+    // never double-visit a node id.  `BTreeSet<NodeId>` reproduces
+    // `sortednub`, since `LVar`'s `Ord` is Haskell-faithful (idx, sort,
+    // name).
+    let mut frees: BTreeSet<NodeId> = BTreeSet::new();
     for la in &sys.less_atoms {
-        extra.insert(la.smaller.clone());
-        extra.insert(la.larger.clone());
+        frees.insert(la.smaller.clone());
+        frees.insert(la.larger.clone());
     }
-    if let Some(la_id) = last_atom_id { extra.insert(la_id); }
-    for v in extra {
+    for (id, _) in sys.nodes.iter() {
+        frees.insert(id.clone());
+    }
+    for v in frees {
         sys = try_hide_node_id(&v, sys);
     }
     sys
@@ -51,8 +54,9 @@ pub fn compress_system(mut sys: System) -> System {
 
 /// Drop `LessAtom`s that are implied by the edge relation.
 fn drop_entailed_ord_constraints(mut sys: System) -> System {
-    // Build adjacency from edges only — Haskell uses `rawEdgeRel` here.
-    let adj = build_edge_adjacency(&sys.edges);
+    // Build adjacency from `rawEdgeRel` = edges ++ unsolvedChains
+    // (Simplification.hs:37 / System.hs:1613-1616).
+    let adj = build_raw_edge_adjacency(&sys);
     let mut new_atoms: Vec<LessAtom> = Vec::with_capacity(sys.less_atoms.len());
     for la in &sys.less_atoms {
         if !reachable(&adj, &la.smaller, &la.larger) {
@@ -63,10 +67,27 @@ fn drop_entailed_ord_constraints(mut sys: System) -> System {
     sys
 }
 
-fn build_edge_adjacency(edges: &[Edge]) -> BTreeMap<NodeId, Vec<NodeId>> {
+/// `(from, to)` node pairs of unsolved chain goals — mirror of
+/// `unsolvedChains` (System.hs:1601-1605) projected to node ids via
+/// `nodeConcNode *** nodePremNode`.
+fn unsolved_chain_pairs(sys: &System) -> Vec<(NodeId, NodeId)> {
+    sys.goals.iter().filter_map(|(g, st)| {
+        if st.solved { return None; }
+        if let Goal::Chain(src, tgt) = g {
+            Some((src.0.clone(), tgt.0.clone()))
+        } else { None }
+    }).collect()
+}
+
+/// Adjacency for `rawEdgeRel sys = edges ++ unsolvedChains sys`
+/// (System.hs:1613-1616).
+fn build_raw_edge_adjacency(sys: &System) -> BTreeMap<NodeId, Vec<NodeId>> {
     let mut adj: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
-    for e in edges {
+    for e in &sys.edges {
         adj.entry(e.src.0.clone()).or_default().push(e.tgt.0.clone());
+    }
+    for (from, to) in unsolved_chain_pairs(sys) {
+        adj.entry(from).or_default().push(to);
     }
     adj
 }
@@ -369,14 +390,23 @@ pub fn simplify_system(level: SimplificationLevel, sys: System) -> System {
 /// `total_red = True`  -> retain only `(x,y) ∈ transRed sLess`
 /// `total_red = False` -> retain `(x,y) ∈ transRed sLess` OR reason ∈ {Formula, Adversary}
 pub fn transitive_reduction(sys: System, total_red: bool) -> System {
-    // Compute the transitive reduction over (smaller,larger) projection
-    // of less-atoms.
-    let nodes: BTreeSet<NodeId> = sys.less_atoms.iter()
-        .flat_map(|la| [la.smaller.clone(), la.larger.clone()])
+    // Haskell: `oldLesses = rawLessRel sys`, used for BOTH `Dag.cyclic`
+    // and `Dag.transRed` (Simplification.hs:61-74).  `rawLessRel se =
+    // getLessRel sLessAtoms ++ rawEdgeRel se` (System.hs:1621-1622), and
+    // `rawEdgeRel = edges ++ unsolvedChains` (System.hs:1613-1616).
+    let mut old_lesses: Vec<(NodeId, NodeId)> = sys.less_atoms.iter()
+        .map(|la| (la.smaller.clone(), la.larger.clone()))
         .collect();
-    // If there's a cycle in the less-atom graph we bail (matches Haskell).
-    if has_cycle(&sys.less_atoms, &nodes) { return sys; }
-    let kept: BTreeSet<(NodeId, NodeId)> = trans_red(&sys.less_atoms);
+    for e in &sys.edges {
+        old_lesses.push((e.src.0.clone(), e.tgt.0.clone()));
+    }
+    old_lesses.extend(unsolved_chain_pairs(&sys));
+    let nodes: BTreeSet<NodeId> = old_lesses.iter()
+        .flat_map(|(a, b)| [a.clone(), b.clone()])
+        .collect();
+    // If there's a cycle in the combined graph we bail (matches Haskell).
+    if has_cycle(&old_lesses, &nodes) { return sys; }
+    let kept: BTreeSet<(NodeId, NodeId)> = trans_red(&old_lesses);
     let mut sys = sys;
     sys.less_atoms.retain(|la| {
         let p = (la.smaller.clone(), la.larger.clone());
@@ -390,11 +420,11 @@ pub fn transitive_reduction(sys: System, total_red: bool) -> System {
     sys
 }
 
-/// Detect whether the directed graph implied by `less` has a cycle.
-fn has_cycle(less: &[LessAtom], nodes: &BTreeSet<NodeId>) -> bool {
+/// Detect whether the directed graph implied by `edges` has a cycle.
+fn has_cycle(edges: &[(NodeId, NodeId)], nodes: &BTreeSet<NodeId>) -> bool {
     let mut adj: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
-    for la in less {
-        adj.entry(la.smaller.clone()).or_default().push(la.larger.clone());
+    for (a, b) in edges {
+        adj.entry(a.clone()).or_default().push(b.clone());
     }
     // DFS cycle detection per starting node.
     let mut color: BTreeMap<NodeId, u8> = BTreeMap::new();
@@ -424,19 +454,16 @@ fn dfs_has_cycle(
 
 /// Transitive reduction: a pair `(x,y)` is in `transRed R` if it's in
 /// `R` and there is no intermediate `z` such that `x R+ z` and `z R+ y`.
-fn trans_red(less: &[LessAtom]) -> BTreeSet<(NodeId, NodeId)> {
-    let edges: Vec<(NodeId, NodeId)> = less.iter()
-        .map(|la| (la.smaller.clone(), la.larger.clone()))
-        .collect();
+fn trans_red(edges: &[(NodeId, NodeId)]) -> BTreeSet<(NodeId, NodeId)> {
     let mut adj: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
-    for (a, b) in &edges {
+    for (a, b) in edges {
         adj.entry(a.clone()).or_default().push(b.clone());
     }
     // For each direct edge (x,y), check if there's another vertex z such
     // that x reaches z and z reaches y *non-trivially* (z != x, z != y,
     // and not via the direct (x,y) edge alone).
     let mut kept: BTreeSet<(NodeId, NodeId)> = BTreeSet::new();
-    for (x, y) in &edges {
+    for (x, y) in edges {
         if x == y { continue; }
         let mut redundant = false;
         if let Some(nbrs) = adj.get(x) {

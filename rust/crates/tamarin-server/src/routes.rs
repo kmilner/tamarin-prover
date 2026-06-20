@@ -26,7 +26,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/kill", get(handlers::root::kill_thread))
 
         // ----------------------------------------------------------------
-        // Static assets: serve data/ first, fall back to frontend dist.
+        // Static assets: serve `data/` with frontend-dist hoisting —
+        // the bundled `frontend/dist/` is served first for the
+        // `intdot-*` JS/CSS assets, falling back to `data/`.
         // ----------------------------------------------------------------
         .nest("/static", handlers::static_files::serve(state.clone()))
 

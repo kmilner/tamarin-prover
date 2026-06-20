@@ -1,7 +1,7 @@
 //! Pre-computed intruder-variant rule loaders.
 //!
 //! HS-faithful port of `Main.TheoryLoader.mkDhIntruderVariants` and
-//! `mkBpIntruderVariants` (src/Main/TheoryLoader.hs:744-780):
+//! `mkBpIntruderVariants` (src/Main/TheoryLoader.hs:745-768):
 //!
 //! ```haskell
 //! dhIntruderVariantsFile :: FilePath
@@ -38,22 +38,22 @@ use crate::rule::{IntrRuleAC, IntrRuleACInfo, Rule};
 /// HS `dhIntruderVariantsFile` (TheoryLoader.hs:746).
 pub const DH_INTRUDER_VARIANTS_FILE: &str = "data/intruder_variants_dh.spthy";
 
-/// HS `bpIntruderVariantsFile` (TheoryLoader.hs:747).
+/// HS `bpIntruderVariantsFile` (TheoryLoader.hs:750).
 pub const BP_INTRUDER_VARIANTS_FILE: &str = "data/intruder_variants_bp.spthy";
 
 /// The DH intruder-variants spthy source, embedded at compile time
 /// (HS uses `$(embedFile "data/intruder_variants_dh.spthy")` —
-/// TheoryLoader.hs:768).
+/// TheoryLoader.hs:759).
 pub const DH_INTRUDER_VARIANTS_SPTHY: &str =
     include_str!("../../../../data/intruder_variants_dh.spthy");
 
 /// The BP intruder-variants spthy source, embedded at compile time
 /// (HS uses `$(embedFile "data/intruder_variants_bp.spthy")` —
-/// TheoryLoader.hs:773).
+/// TheoryLoader.hs:768).
 pub const BP_INTRUDER_VARIANTS_SPTHY: &str =
     include_str!("../../../../data/intruder_variants_bp.spthy");
 
-/// HS `mkDhIntruderVariants` (TheoryLoader.hs:766-769).
+/// HS `mkDhIntruderVariants` (TheoryLoader.hs:753-759).
 ///
 /// ```haskell
 /// mkDhIntruderVariants :: MaudeSig -> [IntrRuleAC]
@@ -73,7 +73,7 @@ pub fn mk_dh_intruder_variants(msig: &MaudeSig) -> Vec<IntrRuleAC> {
         })
 }
 
-/// HS `mkBpIntruderVariants` (TheoryLoader.hs:771-774).
+/// HS `mkBpIntruderVariants` (TheoryLoader.hs:762-768).
 pub fn mk_bp_intruder_variants(msig: &MaudeSig) -> Vec<IntrRuleAC> {
     parse_intruder_rules(msig, BP_INTRUDER_VARIANTS_FILE, BP_INTRUDER_VARIANTS_SPTHY)
         .unwrap_or_else(|e| {
@@ -121,8 +121,9 @@ impl std::error::Error for IntrRuleParseError {}
 ///
 /// We mirror this here via [`MaudeSigNullaryGuard`], which pushes the
 /// 0-arity NoEq names from `msig` into the `USER_NULLARY_FUNS`
-/// thread-local read by `term_to_lnterm`'s `Var` branch
-/// (elaborate.rs:847-871).  The guard restores the prior state on drop.
+/// thread-local (defined at elaborate.rs:61) read by `term_to_lnterm`'s
+/// `Var` branch (elaborate.rs:1522-1545, via `is_user_nullary_fun` at
+/// elaborate.rs:1539).  The guard restores the prior state on drop.
 pub fn parse_intruder_rules(
     msig: &MaudeSig,
     ctxt_desc: &str,
@@ -222,7 +223,7 @@ fn ast_rule_to_intr_rule_ac(r: &p::Rule) -> Result<IntrRuleAC, String> {
     }
 
     // Convert facts via the existing AST→LNFact path.  `fact_to_lnfact`
-    // already handles the `KU`/`KD`/etc. tag mapping (elaborate.rs:707-719).
+    // already handles the `KU`/`KD`/etc. tag mapping (elaborate.rs:974).
     let prems: Vec<LNFact> = r.premises.iter()
         .map(|f| elaborate::fact_to_lnfact(f)
             .map_err(|e| format!("intruder rule {}: premise: {}", r.name, e.message)))

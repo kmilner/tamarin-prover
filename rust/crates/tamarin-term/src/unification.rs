@@ -55,9 +55,10 @@ pub fn unify_lnterm_no_ac(
 }
 
 /// Variant accepting a shared atomic counter for parity with the
-/// Maude-backed unifier call sites.  The counter is currently unused by
-/// the AC-free unification logic (no witnesses are minted), so this is
-/// identical to `unify_lnterm_no_ac`.
+/// Maude-backed unifier call sites.  The AC-free unification logic mints
+/// no fresh witnesses, so the counter is deliberately ignored; the
+/// parameter exists only so callers can use the same signature whether or
+/// not they route through Maude.  Do NOT assume the counter is threaded.
 pub fn unify_lnterm_no_ac_with_counter(
     eqs: Vec<Equal<crate::lterm::LNTerm>>,
     _counter: &AtomicU64,
@@ -98,8 +99,8 @@ where
             //
             // For same-sort, LARGER-idx becomes KEY; smaller-idx
             // becomes value.  This is the orientation that makes
-            // `restrict stableVars` (Sources.hs:118) and `applySource`
-            // (Sources.hs:178) work — stable pattern vars (small idx)
+            // `restrict stableVars` (Sources.hs:123) and `applySource`
+            // (Sources.hs:336) work — stable pattern vars (small idx)
             // stay on the value side and get dropped by the key-filter.
             use std::cmp::Ordering;
             match sort_compare(vl.sort, vr.sort) {
@@ -146,6 +147,28 @@ where
             }
             Ok(())
         }
+        // Special cases for builtin naturals (Unification.hs:251-256):
+        // a nullary NoEq vs a NatPlus sum unifies only when the nullary
+        // symbol is `natOne`; otherwise no unifier.  When it is natOne,
+        // Haskell `tell`s the equation for Maude (here: NeedsAC).
+        (Term::App(FunSym::NoEq(lf), la), Term::App(FunSym::Ac(crate::function_symbols::AcSym::NatPlus), _))
+            if la.is_empty() =>
+        {
+            if *lf == crate::function_symbols::nat_one_sym() {
+                Err(UnifyError::NeedsAC)
+            } else {
+                Err(UnifyError::NoUnifier)
+            }
+        }
+        (Term::App(FunSym::Ac(crate::function_symbols::AcSym::NatPlus), _), Term::App(FunSym::NoEq(rf), ra))
+            if ra.is_empty() =>
+        {
+            if *rf == crate::function_symbols::nat_one_sym() {
+                Err(UnifyError::NeedsAC)
+            } else {
+                Err(UnifyError::NoUnifier)
+            }
+        }
         (Term::App(FunSym::Ac(_), _), _) | (_, Term::App(FunSym::Ac(_), _)) => {
             Err(UnifyError::NeedsAC)
         }
@@ -164,7 +187,7 @@ where
 /// Also uses Haskell's same-sort var-var orientation: when `vl < vr`
 /// (under idx-first Ord), `elim vr l` — i.e., **larger-idx becomes
 /// the KEY**, smaller-idx the value.  This is the orientation Haskell's
-/// `restrict stableVars` (Sources.hs:118) and `applySource` (Sources.hs:178)
+/// `restrict stableVars` (Sources.hs:123) and `applySource` (Sources.hs:336)
 /// depend on: stable pattern vars (small idx) stay on the value side so
 /// they're never keys and never survive the post-saturate key-filter.
 fn unify_raw_factored<C, F>(
@@ -235,6 +258,30 @@ where
             }
             Ok(())
         }
+        // Special cases for builtin naturals (Unification.hs:251-256):
+        // a nullary NoEq vs a NatPlus sum unifies only when the nullary
+        // symbol is `natOne`; otherwise no unifier.  When it is natOne,
+        // Haskell `tell`s the equation, i.e. delays it for Maude.
+        (Term::App(FunSym::NoEq(lf), la), Term::App(FunSym::Ac(crate::function_symbols::AcSym::NatPlus), _))
+            if la.is_empty() =>
+        {
+            if *lf == crate::function_symbols::nat_one_sym() {
+                delayed.push(Equal { lhs: l.clone(), rhs: r.clone() });
+                Ok(())
+            } else {
+                Err(UnifyError::NoUnifier)
+            }
+        }
+        (Term::App(FunSym::Ac(crate::function_symbols::AcSym::NatPlus), _), Term::App(FunSym::NoEq(rf), ra))
+            if ra.is_empty() =>
+        {
+            if *rf == crate::function_symbols::nat_one_sym() {
+                delayed.push(Equal { lhs: l.clone(), rhs: r.clone() });
+                Ok(())
+            } else {
+                Err(UnifyError::NoUnifier)
+            }
+        }
         (Term::App(FunSym::Ac(_), _), _) | (_, Term::App(FunSym::Ac(_), _)) => {
             // Haskell: `tell [Equal l r]` — delay for Maude.
             delayed.push(Equal { lhs: l.clone(), rhs: r.clone() });
@@ -268,8 +315,9 @@ where
         match unify_raw_factored(sort_of_const, &mut acc, &mut delayed, lhs, rhs) {
             Ok(()) => {}
             Err(UnifyError::NoUnifier) => return None,
-            // unify_raw_factored never returns NeedsAC.
-            Err(UnifyError::NeedsAC) => return None,
+            // unify_raw_factored delays AC/C to `delayed` and never
+            // surfaces NeedsAC; make the invariant explicit.
+            Err(UnifyError::NeedsAC) => unreachable!("unify_raw_factored delays AC"),
         }
     }
     let subst = Subst::from_map(acc);

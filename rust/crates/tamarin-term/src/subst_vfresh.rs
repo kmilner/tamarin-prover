@@ -78,7 +78,7 @@ where
 /// appearance, threading `bindings`/`counter` so repeated occurrences (and
 /// later range terms in the same substitution) reuse earlier assignments.
 /// Left-to-right depth-first traversal mirrors HS `mapFrees`/`HasFrees`.
-fn rename_term_drop_hint<C: Clone>(
+fn rename_term_drop_hint<C: Ord + Clone>(
     t: &VTerm<C, LVar>,
     bindings: &mut BTreeMap<LVar, LVar>,
     counter: &mut u64,
@@ -102,13 +102,18 @@ fn rename_term_drop_hint<C: Clone>(
                 .iter()
                 .map(|a| rename_term_drop_hint(a, bindings, counter))
                 .collect();
-            Term::App(sym.clone(), new_args.into())
+            // Route through the AC/C-sorting smart constructor, matching
+            // HS `mapFrees f@(Arbitrary _) (FApp o l) = fApp o <$> ...`
+            // (LTerm.hs:733-734).  Renaming assigns fresh idxs by first
+            // appearance, so an AC/C arg list sorted under the OLD vars
+            // can become unsorted under the new ones; `fApp` re-sorts.
+            crate::term::f_app(sym.clone(), new_args)
         }
     }
 }
 
 impl<C: Ord + Clone> LSubstVFresh<C> {
-    /// `dropNameHintsLNSubstVFresh` (EquationStore.hs:154-158): the canonical
+    /// `dropNameHintsLNSubstVFresh` (EquationStore.hs:143-147): the canonical
     /// form used as the split-case sort key. Renames every RANGE variable to a
     /// fresh variable with an EMPTY name hint, sort preserved, indices assigned
     /// 0,1,2,… in order of first appearance across the range terms (visited in
@@ -279,11 +284,15 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
         Subst::from_list(pairs)
     }
 
-    /// `freshToFreeAvoidingFast`: convert this VFresh substitution to a
-    /// free `Subst` by renaming each range variable to a fresh LVar
-    /// using indices obtained from `alloc_idxs` (a MonadFresh substitute
-    /// — typically wrapping `MaudeHandle::reserve_idxs`).  Mirrors
-    /// `Term.Substitution.freshToFreeAvoidingFast` (Substitution.hs:77-92).
+    /// `freshToFree`: convert this VFresh substitution to a free `Subst`
+    /// by renaming each range variable to a fresh LVar using indices
+    /// obtained from `alloc_idxs` (a MonadFresh substitute — typically
+    /// wrapping `MaudeHandle::reserve_idxs`).  Implements the
+    /// `freshToFree`/`freshToFreeAvoiding` algorithm
+    /// (Substitution.hs:54-72): sort by image size + per-binding name
+    /// hints + `importBinding` caching.  (The uniform-shift
+    /// `freshToFreeAvoidingFast` at Substitution.hs:77-81 is instead
+    /// implemented by `fresh_to_free_uniform_shift`.)
     ///
     /// The reduction layer composes the result into the eq-store's
     /// free substitution so the picked variant's bindings propagate
@@ -298,12 +307,15 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
         self.fresh_to_free_avoiding(alloc_idxs, &std::collections::BTreeSet::new())
     }
 
-    /// `freshToFreeAvoidingFast`: convert VFresh → free subst.
+    /// `freshToFreeAvoiding`: convert VFresh → free subst.
     ///
-    /// Mirrors Haskell `freshToFreeAvoidingFast s t`, which renames
-    /// every range var unconditionally (HS has no "preserve" concept —
-    /// `evalFreshAvoiding` only seeds the fresh counter above `t`'s max
-    /// idx, it never skips a variable).  The `preserve` argument is
+    /// Mirrors Haskell `freshToFreeAvoiding s t = freshToFree s
+    /// \`evalFreshAvoiding\` t` (Substitution.hs:71-72, built on
+    /// `freshToFree` at 54-66): sorts entries by image size and applies
+    /// the per-binding name-hint rule.  It renames every range var
+    /// unconditionally (HS has no "preserve" concept — `evalFreshAvoiding`
+    /// only seeds the fresh counter above `t`'s max idx, it never skips a
+    /// variable).  The `preserve` argument is
     /// therefore IGNORED by default; it is only honoured under the
     /// legacy kill-switch `TAM_RS_LEGACY_FOLD_PRESERVE` (see the
     /// HS-faithfulness gate in the body).

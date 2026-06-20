@@ -63,7 +63,7 @@ fn render_node(node: &ProofNode, indent: usize, out: &mut String) {
                 out.push_str(" */\n");
             }
             ProofMethod::Finished(MethodResult::Solved) => {
-                // Mirror HS `prettyProofMethod` (ProofMethod.hs:1327):
+                // Mirror HS `prettyProofMethod` (ProofMethod.hs:1177):
                 //   `keyword_ "SOLVED" <-> lineComment_ "trace found"`.
                 out.push_str(&pad);
                 out.push_str("SOLVED // trace found\n");
@@ -123,12 +123,14 @@ fn render_node(node: &ProofNode, indent: usize, out: &mut String) {
             }
         }
     }
-    // Haskell's `prettyProof` prints only the trace-found path on
-    // exists-trace lemmas: when a node's status rolls up to Solved
-    // (TraceFound), siblings that closed Contradictory are elided —
-    // the auto-prover stopped exploring them once a witness existed.
+    // On exists-trace lemmas only the trace-found path survives: when a
+    // node's status rolls up to Solved (TraceFound), siblings that closed
+    // Contradictory are elided.  In Haskell this pruning is done *before*
+    // printing, by `cutOnSolved*` -> `extractSolved` (Proof.hs:879-882,
+    // 920-923), which rebuilds the tree keeping one label per level;
+    // `prettyProof` itself prints whatever tree it is handed.
     //
-    // Mirror that here so the skeleton diff is apples-to-apples.
+    // Mirror that pruning here so the skeleton diff is apples-to-apples.
     // We keep only the FIRST Solved child and drop other
     // Contradictory/Sorry siblings.  All-traces proofs (status =
     // Contradictory) keep every branch.
@@ -141,7 +143,8 @@ fn render_node(node: &ProofNode, indent: usize, out: &mut String) {
                     // Haskell's `extractSolved` (`Theory/Proof.hs:921-923`)
                     // keeps the survivor's label verbatim — including any
                     // `_case_N` dedup suffix appended by `uniqueListBy`
-                    // (ProofMethod.hs:441) when the goal originally had
+                    // (ProofMethod.hs:91, applied at :308) when the goal
+                    // originally had
                     // multiple cases sharing a rule name.  We had been
                     // stripping the suffix on the assumption Haskell did
                     // the same; it does not.  Pass the name through.
@@ -204,8 +207,16 @@ fn contradiction_label(
     c: &Option<crate::constraint::solver::contradictions::Contradiction>,
 ) -> String {
     use crate::constraint::solver::contradictions::Contradiction as K;
-    // Strings mirror Haskell `prettyContradiction` (Contradictions.hs:457+);
-    // see the case there for each variant.
+    // Strings are abbreviated mirrors of Haskell `prettyContradiction`
+    // (Contradictions.hs:438+); see the case there for each variant.
+    // A few variants drop Haskell's interpolated detail (e.g. Haskell's
+    // `"node " ++ show j ++ " after last node " ++ show i` becomes
+    // `"node after last"`, `"non-injective facts " ++ show cex` becomes
+    // `"non-injective facts"`, and the `"derived before and after"`
+    // wrapper drops its term/node id).  This is fine: the label is only
+    // emitted inside a `/* ... */` comment that `normalise_leaf_closure`
+    // collapses to `by contradiction /* closed */` before diffing, so
+    // the label text never affects comparison results.
     match c {
         None => "closed".to_string(),
         Some(K::Cyclic) => "cyclic".to_string(),
@@ -360,13 +371,10 @@ fn normalize_haskell_line(raw: &str) -> Option<String> {
     let pad = " ".repeat(indent_count);
     let t = raw.trim();
     if t.is_empty() { return None; }
-    // Drop block-comment fragments.
-    if t.starts_with("/*") || t.starts_with("*") || t.ends_with("*/") && !t.starts_with("by ") {
-        // `by contradiction /* ... */` is fine — it doesn't start with
-        // `/*`. Plain comment lines we drop.
-        if t.starts_with("/*") || t.starts_with("*") || t == "*/" {
-            return None;
-        }
+    // Drop block-comment fragments.  `by contradiction /* ... */` is
+    // fine — it doesn't start with `/*` or `*`, and isn't exactly `*/`.
+    if t.starts_with("/*") || t.starts_with("*") || t == "*/" {
+        return None;
     }
     // Tokenize.
     if t == "qed" || t == "next" {
@@ -405,9 +413,21 @@ fn normalize_haskell_line(raw: &str) -> Option<String> {
     if t.starts_with("by sorry") {
         return Some(format!("{}by sorry", pad));
     }
+    // UNFINISHABLE leaf (reducible operator in subterm).  Haskell's
+    // `prettyProof` prepends `by ` to this non-Solved finished leaf
+    // (ppCases ps [] at Proof.hs:1065) and `prettyProofMethod` emits
+    // `keyword_ "UNFINISHABLE" <-> lineComment_ "reducible operator in
+    // subterm"` (ProofMethod.hs:1179).  Our `render` emits the same
+    // line, so preserve it verbatim instead of dropping it.
+    if t.starts_with("UNFINISHABLE") || t.starts_with("by UNFINISHABLE") {
+        return Some(format!(
+            "{}by UNFINISHABLE // reducible operator in subterm",
+            pad
+        ));
+    }
     if t == "SOLVED" || t.starts_with("SOLVED") || t == "by SOLVED" {
         // HS pretty-prints `keyword_ "SOLVED" <-> lineComment_ "trace found"`
-        // (ProofMethod.hs:1327), so the raw line is `SOLVED // trace found`.
+        // (ProofMethod.hs:1177), so the raw line is `SOLVED // trace found`.
         // Our `render` emits the same suffix; preserve it here so the diff
         // matches verbatim instead of treating the cosmetic comment as a
         // divergence.

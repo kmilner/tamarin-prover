@@ -55,6 +55,7 @@ impl<I> Rule<I> {
     }
 
     /// `compareRulesUpToNewVars`: ordering ignoring `new_vars`.
+    /// Retained for port completeness (no current callers).
     pub fn cmp_up_to_new_vars(&self, other: &Self) -> std::cmp::Ordering
     where
         I: Ord,
@@ -82,7 +83,14 @@ impl<I> Rule<I> {
 
 // =============================================================================
 // HasFrees instance — visit/map over premises, conclusions, actions, new_vars.
-// `info` is treated as opaque (it has no free LVars in the usual rule kinds).
+// `info` is intentionally skipped here: the generic bound is `Clone`, not
+// `HasFrees`, so this impl cannot recurse into it. This is sound because every
+// caller operates on `RuleACInst`, whose info (ProtoRuleACInstInfo /
+// IntrRuleACInfo) carries no free LVars. Note that Haskell's `HasFrees (Rule i)`
+// (Rule.hs:280-292) DOES fold over `info` first, and ProtoRuleEInfo/ProtoRuleACInfo
+// info (Rule.hs:476, 486-489) carry frees (restrictions / variant keys); callers
+// that need those (ProtoRuleE/AC) must walk variants/restrictions separately, as
+// rule_variants.rs::rename_precise_rule_with_variants does.
 // =============================================================================
 
 impl<I: Clone> HasFrees for Rule<I> {
@@ -292,6 +300,8 @@ pub fn rule_ac_intr_to_rule_ac(r: IntrRuleAC) -> RuleAC {
     }
 }
 
+/// Retained for port completeness (no current callers); lifts an
+/// `IntrRuleAC` directly into the `RuleACInst` shape.
 pub fn rule_ac_intr_to_rule_ac_inst(r: IntrRuleAC) -> RuleACInst {
     Rule {
         info: RuleInfo::Intr(r.info),
@@ -302,6 +312,7 @@ pub fn rule_ac_intr_to_rule_ac_inst(r: IntrRuleAC) -> RuleACInst {
     }
 }
 
+/// Retained for port completeness (no current callers).
 /// `someRuleACInst` lite: drop the AC variants from a `ProtoRuleAC`,
 /// producing a `RuleACInst`. The `variants` and `loop_breakers` are
 /// carried into the inst-info; `variants` is stripped because the
@@ -465,7 +476,7 @@ pub fn rule_name_string(
     match &rule.info {
         RuleInfo::Proto(p) => match &p.name {
             ProtoRuleName::Stand(s) => s.clone(),
-            ProtoRuleName::Fresh => "Fresh".to_string(),
+            ProtoRuleName::Fresh => "FreshRule".to_string(),
         },
         RuleInfo::Intr(i) => match i {
             IntrRuleACInfo::ConstrRule(name) =>
@@ -485,26 +496,29 @@ pub fn rule_name_string(
     }
 }
 
-/// Mirror Haskell `prefixIfReserved` (Theory/Model/Rule.hs around line 760):
-/// prefixes the name with `_` if it collides with a reserved rule name.
-fn prefix_if_reserved(s: &str) -> String {
+/// Mirror Haskell `prefixIfReserved` (Theory/Model/Rule.hs:1154-1158):
+/// prefixes the name with `_` if it collides with a reserved rule name
+/// or already starts with `_`.
+pub(crate) fn prefix_if_reserved(s: &str) -> String {
     let reserved = reserved_rule_names();
-    if reserved.contains(s) {
+    if reserved.contains(s) || s.starts_with('_') {
         format!("_{}", s)
     } else {
         s.to_string()
     }
 }
 
-/// `reservedRuleNames` from Haskell.
+/// `reservedRuleNames` from Haskell (Theory/Model/Rule.hs:1161-1162):
+/// `["Fresh", "irecv", "isend", "coerce", "fresh", "pub", "iequality"]`.
 pub fn reserved_rule_names() -> BTreeSet<&'static str> {
     let mut s = BTreeSet::new();
     s.insert("Fresh");
-    s.insert("KU");
-    s.insert("KD");
-    s.insert("Send");
-    s.insert("Recv");
-    s.insert("Coerce");
+    s.insert("irecv");
+    s.insert("isend");
+    s.insert("coerce");
+    s.insert("fresh");
+    s.insert("pub");
+    s.insert("iequality");
     s
 }
 
@@ -699,8 +713,12 @@ mod tests {
     #[test]
     fn reserved_names_include_fresh() {
         let r = reserved_rule_names();
+        // Matches Haskell reservedRuleNames (Rule.hs:1161-1162):
+        // ["Fresh", "irecv", "isend", "coerce", "fresh", "pub", "iequality"].
         assert!(r.contains("Fresh"));
-        assert!(r.contains("KU"));
+        assert!(r.contains("coerce"));
+        assert!(r.contains("iequality"));
+        assert!(!r.contains("KU"));
     }
 
     fn maude_path() -> Option<String> {

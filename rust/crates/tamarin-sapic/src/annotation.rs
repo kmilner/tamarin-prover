@@ -80,24 +80,27 @@ impl<V: Clone> ProcessAnnotation<V> {
         Self { else_branch: b, ..Default::default() }
     }
 
-    /// Combine two annotations. All optional fields here prefer the *first*
-    /// defined value (`Option::or`). This matches Haskell's `mayMerge`
-    /// (left-biased on `Just`/`Just`, used for `destructor_equation` and
-    /// `is_state_channel`), but diverges for the `AnVar` fields (`lock`,
-    /// `unlock`, `secret_channel`, `state_channel`): Haskell combines those
-    /// via `Maybe`'s `<>`, whose inner `AnVar` `<>` is right-biased
-    /// (`(<>) _ b = b`), so `Just`/`Just` keeps the *right* value there.
-    /// `pure_state` is OR'ed; `else_branch` is taken from the right operand.
+    /// Combine two annotations, matching Haskell's
+    /// `Semigroup (ProcessAnnotation v)` (Annotation.hs:76-86).
+    ///
+    /// The `AnVar` fields (`lock`, `unlock`, `secret_channel`,
+    /// `state_channel`) are combined via `Maybe`'s `<>`, whose inner `AnVar`
+    /// `<>` is right-biased (`(<>) _ b = b`, Annotation.hs:43-44), so when
+    /// both are `Some` the *right* value wins (`other.X.or(self.X)`).
+    /// `destructor_equation`/`is_state_channel` use Haskell `mayMerge`
+    /// (left-biased on `Just`/`Just`), so they keep the *left* value
+    /// (`self.X.or(other.X)`). `pure_state` is OR'ed; `else_branch` is taken
+    /// from the right operand.
     pub fn append(self, other: Self) -> Self {
         ProcessAnnotation {
             parsing_ann: self.parsing_ann.append(other.parsing_ann),
-            lock: self.lock.or(other.lock),
-            unlock: self.unlock.or(other.unlock),
-            secret_channel: self.secret_channel.or(other.secret_channel),
+            lock: other.lock.or(self.lock),
+            unlock: other.unlock.or(self.unlock),
+            secret_channel: other.secret_channel.or(self.secret_channel),
             destructor_equation: self.destructor_equation.or(other.destructor_equation),
             else_branch: other.else_branch,
             pure_state: self.pure_state || other.pure_state,
-            state_channel: self.state_channel.or(other.state_channel),
+            state_channel: other.state_channel.or(self.state_channel),
             is_state_channel: self.is_state_channel.or(other.is_state_channel),
         }
     }
@@ -177,16 +180,15 @@ mod tests {
     }
 
     #[test]
-    fn append_or_left_for_options() {
+    fn append_anvar_field_is_right_biased() {
         let v1 = LVar::new("a", LSort::Msg, 0);
         let v2 = LVar::new("b", LSort::Msg, 0);
-        let a = ProcessAnnotation::<V>::with_lock(v1.clone());
-        let b = ProcessAnnotation::<V>::with_lock(v2);
+        let a = ProcessAnnotation::<V>::with_lock(v1);
+        let b = ProcessAnnotation::<V>::with_lock(v2.clone());
         let c = a.append(b);
-        // Haskell's `Maybe` semigroup uses `<>`-of-Just, but the
-        // ProcessAnnotation impl uses `Maybe`'s default (first-Just-wins
-        // via `or`). Verify our convention.
-        assert_eq!(c.lock.map(|AnVar(v)| v), Some(v1));
+        // `AnVar` `<>` is right-biased (`(<>) _ b = b`), so combining two
+        // `Just` lock annotations keeps the right (`b`) value.
+        assert_eq!(c.lock.map(|AnVar(v)| v), Some(v2));
     }
 
     #[test]

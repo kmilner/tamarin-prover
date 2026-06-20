@@ -1,13 +1,26 @@
 //! Solver layer (port of `Theory.Constraint.Solver.*`).
 //!
 //! Submodules:
+//! - [`annotated_goals`] — goal ranking / annotation helpers.
+//! - [`context`] — port of the `ProofContext` data type used by every
+//!   solver entry point.
 //! - [`contradictions`] — port of `Solver.Contradictions`. Identifies
 //!   all reasons a `System` is contradictory.
+//! - [`goals`] — port of `Solver.Goals`. Goal solving and case
+//!   distinction generation.
 //! - [`proof_method`] — port of `Solver.ProofMethod`. The
 //!   external small-step interface to the constraint solver
 //!   (`ProofMethod`, `Result`, `is_finished`, `exec_proof_method`).
-//! - [`context`] — port of the `ProofContext` data type used by every
-//!   solver entry point.
+//! - [`reduction`] — port of `Solver.Reduction`. Constraint-reduction
+//!   rules over a `System`.
+//! - [`rename_precise`] — precise variable renaming helpers.
+//! - [`search`] — proof-search driver over the small-step interface.
+//! - [`simplify`] — port of `Solver.Simplify`. Simplification of a
+//!   `System`.
+//! - [`sources`] — port of `Solver.Sources`. Source/case-distinction
+//!   precomputation.
+//! - [`tactic_show`] — pretty-printing for tactic diagnostics.
+//! - [`trace`] — RS-only diagnostic execution-trace scaffolding.
 //!
 //! The full Haskell source is ~4 k LOC across `ProofMethod`,
 //! `Reduction`, `Goals`, `Sources`, `Simplify`, `Contradictions`, all

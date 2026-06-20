@@ -109,7 +109,6 @@ pub struct Rule {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuleAttr {
     Color(String),
-    Process(String),
     NoDerivCheck,
     Role(String),
     IsSapicRule,
@@ -303,7 +302,8 @@ pub enum GoalSpec {
     /// HS parses each disjunct as a full `Guarded` value bearing
     /// concrete LVar identities, then matches by structural equality
     /// against the open `Goal::Disj(...)` in `sys.goals` (HS
-    /// ProofMethod.hs:374 `goal `M.member` sGoals`).
+    /// ProofMethod.hs:259 `SolveGoal goal -> guard (goal `M.member`
+    /// L.get sGoals sys)`).
     ///
     /// We can't reconstruct skeleton-text LVar indices reliably (they
     /// differ from runtime indices), so we capture each disjunct's
@@ -553,8 +553,7 @@ pub struct VarSpec {
     pub typ: Option<String>, // SAPIC type annotation
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SortHint {
     Msg,
     Pub,    // $x

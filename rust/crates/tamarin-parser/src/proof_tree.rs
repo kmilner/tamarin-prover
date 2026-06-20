@@ -145,7 +145,10 @@ impl<'a> TreeParser<'a> {
         if self.try_kw("induction") { return Ok(ParsedMethod::Induction); }
         if self.try_kw("INVALIDATED") { return Ok(ParsedMethod::Invalidated); }
         if self.try_kw("UNFINISHABLE") { return Ok(ParsedMethod::Unfinishable); }
-        if self.try_kw("SOLVED") { return Ok(ParsedMethod::SolvedLeaf); }
+        // SOLVED is intentionally NOT a proofMethod: HS `proofMethod`
+        // (Proof.hs:76-85) never lists it; it is handled only at the
+        // skeleton level (`solvedProof`, Proof.hs:102-103) — see
+        // `proof_skeleton` line 77.
         if self.try_kw("solve") {
             // `solve( <goal-text> )`.  HS parses an inner `goal`; we
             // capture the parenthesised text verbatim and best-effort
@@ -419,13 +422,31 @@ fn strip_outer_parens(s: &str) -> &str {
 /// a `∀` / `∃` and before the next `.`.  HS's quantifier list is
 /// `\\forall x1 x2 … xN.` — we count whitespace-separated tokens that
 /// look like identifiers (possibly with a leading `#` for nodevars or
-/// `~` for fresh-name vars).  Stops at the first `.` (the
-/// quantifier-body separator).
+/// `~` for fresh-name vars).  Stops at the quantifier-body separator
+/// `.`.
+///
+/// Note: a bound var with a non-zero LVar index renders as
+/// `name.idx` (HS `LVar` Show, LTerm.hs:529-532, via
+/// `ppVars = fsep . map (text . show)`, Guarded.hs:862), e.g.
+/// `∀ x #i.1 #j.`.  So a `.` that is immediately followed by an ASCII
+/// digit is a var-index suffix, NOT the body terminator — we must
+/// keep counting through it.  The real body terminator `.` is always
+/// followed by whitespace / `(` / EOF, never a digit.
 fn count_quant_vars(after_qua: &str) -> usize {
     let mut n = 0usize;
     let mut in_token = false;
-    for c in after_qua.chars() {
-        if c == '.' { break; }
+    let mut chars = after_qua.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '.' {
+            // `.idx` suffix on the current var token — consume the dot
+            // as part of the token and keep going.
+            if chars.peek().is_some_and(|d| d.is_ascii_digit()) {
+                in_token = true;
+                continue;
+            }
+            // Genuine quantifier-body terminator.
+            break;
+        }
         if c == '#' || c == '~' || c == '$' || c == '%' || is_ident_char(c) {
             if !in_token { n += 1; in_token = true; }
         } else {
@@ -590,7 +611,7 @@ impl<'a> GoalParser<'a> {
         // Read args text, balanced — we don't need to deeply parse the
         // terms here, but capture them as `crate::ast::Term::Var` from
         // raw text so the Fact struct is well-formed.
-        let args_text = self.read_balanced_paren().ok()?;
+        let args_text = self.read_balanced_paren()?;
         // After the `)`, expect `@` (action) or `▶<digit>` (premise).
         self.lx.skip_ws();
         if self.lx.eat_str("@") {
@@ -618,14 +639,11 @@ impl<'a> GoalParser<'a> {
         if self.lx.rest().starts_with('\u{25B6}') {
             // consume the ▶
             for _ in '\u{25B6}'.to_string().chars() { self.lx.bump(); }
-            let idx_val = match self.lx.natural_subscript() {
-                Some(n) => n,
-                None => {
-                    // Fallback: some tools render `▶0` with ASCII digits.
-                    self.lx.skip_ws();
-                    self.lx.natural()?
-                }
-            };
+            // HS always emits a Unicode subscript here: the pretty-printer
+            // prints `▶ ++ subscript (show v)` (Constraints.hs:273) and the
+            // parser `opRequires = symbol "▶" *> naturalSubscript`
+            // (Token.hs:619) accepts ONLY subscript digits.
+            let idx_val = self.lx.natural_subscript()?;
             self.lx.skip_ws();
             let _hash = self.lx.eat_str("#");
             let tvar = match self.lx.identifier() {
@@ -646,12 +664,12 @@ impl<'a> GoalParser<'a> {
         None
     }
 
-    fn read_balanced_paren(&mut self) -> Result<String, ()> {
+    fn read_balanced_paren(&mut self) -> Option<String> {
         let mut s = String::new();
         let mut depth: i32 = 1;
         while depth > 0 {
             match self.lx.peek() {
-                None => return Err(()),
+                None => return None,
                 Some('(') => { s.push('('); self.lx.bump(); depth += 1; }
                 Some(')') => {
                     depth -= 1;
@@ -661,7 +679,7 @@ impl<'a> GoalParser<'a> {
                 Some(c) => { s.push(c); self.lx.bump(); }
             }
         }
-        Ok(s)
+        Some(s)
     }
 }
 
@@ -698,7 +716,7 @@ fn split_top_level_commas(s: &str) -> Vec<String> {
         match c {
             '(' | '<' | '[' | '{' => { depth += 1; cur.push(c); }
             ')' | '>' | ']' | '}' => { depth -= 1; cur.push(c); }
-            ',' if depth == 0 => { out.push(cur.clone()); cur.clear(); }
+            ',' if depth == 0 => { out.push(std::mem::take(&mut cur)); }
             _ => cur.push(c),
         }
     }
@@ -731,6 +749,19 @@ mod tests {
     fn solved_leaf() {
         let t = parse_proof_tree("SOLVED").expect("parse");
         assert_eq!(t.method, ParsedMethod::SolvedLeaf);
+    }
+
+    #[test]
+    fn count_quant_vars_with_dotted_idx() {
+        // Bound vars with idx>0 render as `name.idx` (HS LVar Show).
+        // The `.idx` suffix must NOT terminate the count; only the
+        // body-terminator `.` (followed by ws/EOF) ends the var list.
+        assert_eq!(count_quant_vars("x y #i.1 #j."), 4);
+        assert_eq!(count_quant_vars("t.5 x."), 2);
+        // Trailing dotted var is the case that was already correct.
+        assert_eq!(count_quant_vars("#t #t.1."), 2);
+        // No dotted suffixes.
+        assert_eq!(count_quant_vars("a b c."), 3);
     }
 
     #[test]

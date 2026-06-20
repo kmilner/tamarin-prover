@@ -145,10 +145,18 @@ pub fn destruction_rules(
     let pos_iter: Vec<i64> = pos.clone();
     // `rhs` is loop-invariant, so compute `frees(rhs).is_empty()` once.
     let rhs_frees_empty = frees(rhs).is_empty();
-    if std::env::var("TAM_RS_DBG_DESTR_POS").is_ok() {
-        use tamarin_term::pretty::pretty_lnterm;
-        eprintln!("[destr_pos] lhs={} rhs={} pos={:?}",
-            pretty_lnterm(lhs), pretty_lnterm(rhs), pos);
+    // Ad-hoc debug tracing, gated behind a once-cached env lookup so the
+    // generation path doesn't `getenv` on every subterm rule.
+    {
+        use std::sync::OnceLock;
+        static DBG_DESTR_POS: OnceLock<bool> = OnceLock::new();
+        let dbg = *DBG_DESTR_POS
+            .get_or_init(|| std::env::var("TAM_RS_DBG_DESTR_POS").is_ok());
+        if dbg {
+            use tamarin_term::pretty::pretty_lnterm;
+            eprintln!("[destr_pos] lhs={} rhs={} pos={:?}",
+                pretty_lnterm(lhs), pretty_lnterm(rhs), pos);
+        }
     }
     for (step_idx, &i) in pos_iter.iter().enumerate() {
         match &t {
@@ -196,10 +204,19 @@ pub fn destruction_rules(
                         f
                     };
                     name.extend_from_slice(&funs);
+                    // `rhs == lhs `atPos` pos` (IntruderRules.hs:145).  Use
+                    // the AC-aware `at_pos` (Positions.hs:28-43) so paths
+                    // traversing an AC operator index exactly as Haskell.
+                    // `pos` is the (valid) walked LHS position, so the
+                    // lookup is `Some`; on the impossible invalid case fall
+                    // back to `lhs` (the old non-AC helper's behaviour),
+                    // keeping the boolean unchanged rather than panicking.
+                    let at = tamarin_term::positions::at_pos(lhs, pos)
+                        .unwrap_or_else(|| lhs.clone());
                     let info = IntrRuleACInfo::DestrRule(
                         name,
                         -1,
-                        rhs == &at_pos(lhs, pos),
+                        rhs == &at,
                         rhs_frees_empty,
                     );
                     let mut prems = vec![kd_fact(t_new.clone())];
@@ -223,24 +240,9 @@ pub fn destruction_rules(
     out
 }
 
-/// Read a sub-term at the given path.
-fn at_pos(t: &tamarin_term::lterm::LNTerm, pos: &[i64]) -> tamarin_term::lterm::LNTerm {
-    use tamarin_term::term::Term;
-    let mut cur = t;
-    for &i in pos {
-        match cur {
-            Term::App(_, args) => match args.get(i as usize) {
-                Some(a) => cur = a,
-                None => return t.clone(),
-            },
-            _ => return t.clone(),
-        }
-    }
-    cur.clone()
-}
-
 /// `subtermIntruderRules` — direct port:
-/// `minimizeIntruderRules diff $ concatMap (destructionRules diff) (S.toList stRules) ++ constructionRules`.
+/// `minimizeIntruderRules diff $ concatMap (destructionRules diff) (S.toList stRules)`
+/// `  ++ constructionRules (stFunSyms maudeSig) ++ privateConstructorRules (S.toList $ stRules maudeSig)`.
 ///
 /// IntruderRules.hs:210-213.  The `minimizeIntruderRules` pass strips
 /// subsumed/duplicate destructor rules — without it, a single equation
@@ -261,7 +263,104 @@ pub fn subterm_intruder_rules(
         out.extend(destruction_rules(diff, r));
     }
     out.extend(construction_rules(sig));
+    out.extend(private_constructor_rules(&sig.st_rules));
     minimize_intruder_rules(diff, out)
+}
+
+/// `privateConstructorRules` — port of IntruderRules.hs:177-184.
+///
+/// Returns the constructor rules for private constants that are
+/// consequences of the subterm rewrite rules in `st_rules`.  A private
+/// 0-arity constructor is "derivable" when there exists an equation whose
+/// RHS is that constant and whose LHS only mentions public functions (or
+/// already-derivable private constants) — computed by the
+/// `derivable_private_constants` fixpoint.  For each such constant `s` we
+/// emit:
+///
+/// ```text
+///   [] --[ KU(s) ]-> [ KU(s) ]    (ConstrRule "_<s>")
+/// ```
+///
+/// HS:
+/// ```haskell
+/// privateConstructorRules rules = map createRule $
+///     derivablePrivateConstants (privateConstructorEquations rules) []
+///   where createRule s = Rule (ConstrRule (append (pack "_") s)) [] [concfact] [concfact] []
+///           where m        = fAppNoEq (s,(0,Private,Constructor)) []
+///                 concfact = kuFact m
+/// ```
+fn private_constructor_rules(
+    st_rules: &std::collections::BTreeSet<tamarin_term::subterm_rule::CtxtStRule>,
+) -> Vec<IntrRuleAC> {
+    use tamarin_term::function_symbols::{
+        Constructability, FunSym, NoEqSym, Privacy,
+    };
+    use tamarin_term::term::Term;
+
+    // `privateConstructorEquations` (IntruderRules.hs:160-165): all
+    // equations whose RHS is a 0-arity Private constructor, paired with
+    // that constructor's name.
+    let eqs: Vec<(&LNTerm, Vec<u8>)> = st_rules.iter().filter_map(|r| {
+        match &r.rhs.term {
+            Term::App(FunSym::NoEq(NoEqSym { name, arity: 0, privacy: Privacy::Private, .. }), _) => {
+                Some((&r.lhs, name.clone()))
+            }
+            _ => None,
+        }
+    }).collect();
+
+    // `containsNoPrivateExcept funs t` (LTerm.hs:373-377): True if `t`
+    // contains no private function symbols other than those named in
+    // `funs`.
+    fn contains_no_private_except(funs: &[Vec<u8>], t: &LNTerm) -> bool {
+        match t {
+            Term::Lit(_) => true,
+            Term::App(FunSym::NoEq(NoEqSym { name, privacy: Privacy::Private, .. }), args) => {
+                funs.contains(name) && args.iter().all(|a| contains_no_private_except(funs, a))
+            }
+            Term::App(_, args) => args.iter().all(|a| contains_no_private_except(funs, a)),
+        }
+    }
+
+    // `derivablePrivateConstants eqs x` (IntruderRules.hs:169-175):
+    // fixpoint adding the RHS-constants of equations whose LHS only
+    // contains public functions or already-derivable private constants.
+    fn derivable_private_constants(
+        mut eqs: Vec<(&LNTerm, Vec<u8>)>,
+        mut x: Vec<Vec<u8>>,
+    ) -> Vec<Vec<u8>> {
+        loop {
+            // Both HS filters (drop + collect-names) use the OLD `x`, so
+            // snapshot it before augmenting.
+            let prev_x = x.clone();
+            let any_derivable = eqs.iter().any(|(l, _)| contains_no_private_except(&prev_x, l));
+            if !any_derivable {
+                return x;
+            }
+            // `x ++ map snd (filter (containsNoPrivateExcept x . fst) eqs)`.
+            for (l, name) in eqs.iter() {
+                if contains_no_private_except(&prev_x, l) {
+                    x.push(name.clone());
+                }
+            }
+            // `filter (not . containsNoPrivateExcept x . fst) eqs`.
+            eqs.retain(|(l, _)| !contains_no_private_except(&prev_x, l));
+        }
+    }
+
+    derivable_private_constants(eqs, Vec::new()).into_iter().map(|s| {
+        let sym = NoEqSym::new(s.clone(), 0, Privacy::Private, Constructability::Constructor);
+        let m: LNTerm = Term::App(FunSym::NoEq(sym), Vec::<LNTerm>::new().into());
+        let concfact = ku_fact(m);
+        let mut name = b"_".to_vec();
+        name.extend_from_slice(&s);
+        Rule::new(
+            IntrRuleACInfo::ConstrRule(name),
+            vec![],
+            vec![concfact.clone()],
+            vec![concfact],
+        )
+    }).collect()
 }
 
 /// Port of `minimizeIntruderRules` (IntruderRules.hs:186-206).
@@ -525,9 +624,7 @@ pub fn xor_intruder_rules() -> Vec<IntrRuleAC> {
 ///
 /// `[KU(x_1), ..., KU(x_n)] --[KU(f(x_1, ..., x_n))]-> [KU(f(x_1, ..., x_n))]`
 pub fn construction_rules(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<IntrRuleAC> {
-    use tamarin_term::function_symbols::{
-        Constructability, NoEqSym, Privacy,
-    };
+    use tamarin_term::function_symbols::{Constructability, Privacy};
     use tamarin_term::term::f_app_no_eq;
     // HS-faithful: `constructionRules (stFunSyms maudeSig)`
     // (IntruderRules.hs:213).  `stFunSyms` is the SUBTERM-theory function
@@ -544,13 +641,13 @@ pub fn construction_rules(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<IntrRu
     // `case exp_case_1` vs HS `case exp`).
     let mut out = Vec::new();
     for s in &sig.st_fun_syms {
-        let s: NoEqSym = if s.privacy == Privacy::Public
-            && s.constructability == Constructability::Constructor
+        // `[ createRule s k | (s,(k,Public,Constructor)) <- ... ]` —
+        // only public constructors.
+        if s.privacy != Privacy::Public
+            || s.constructability != Constructability::Constructor
         {
-            s.clone()
-        } else {
             continue;
-        };
+        }
         let arity = s.arity;
         // Build vars x_0 ... x_{n-1} : Msg
         let xs: Vec<tamarin_term::lterm::LNTerm> = (0..arity)
@@ -744,9 +841,12 @@ pub fn variants_intruder(
         Err(_) => return vec![ru.clone()],
     };
 
-    // Avoid set for `freshToFreeAvoiding ruleTerms` — every free var in
-    // the rule's fact terms.
-    let avoid_set: std::collections::BTreeSet<LVar> = {
+    // The free vars of the packed rule-terms list.  Note
+    // `frees(packed) == frees(rule_terms)` (packing only wraps the terms in
+    // an `fAppList`, introducing no new vars), so this single set serves
+    // BOTH roles below: the `restrictVFresh (frees packed)` key-set AND the
+    // `freshToFreeAvoiding ruleTerms` avoiding-set.
+    let packed_frees: std::collections::BTreeSet<LVar> = {
         let mut s: std::collections::BTreeSet<LVar> = std::collections::BTreeSet::new();
         for t in &rule_terms {
             for v in frees(t) { s.insert(v); }
@@ -762,26 +862,26 @@ pub fn variants_intruder(
         // (Compute.hs:148-150) does this implicitly.  Maude only binds the
         // vars we passed in, but be defensive.
         let s_fresh = LNSubstVFresh::from_list(pairs)
-            .restrict(&avoid_set.iter().cloned().collect::<Vec<_>>());
+            .restrict(&packed_frees.iter().cloned().collect::<Vec<_>>());
 
         // `freshToFreeAvoiding ruleTerms` — convert VFresh → free Subst,
         // allocating fresh idxs that avoid every var in `ruleTerms`.
         let sigma: Subst<tamarin_term::lterm::Name, LVar> = {
-            let mut counter = avoid_set.iter().map(|v| v.idx).max()
+            let mut counter = packed_frees.iter().map(|v| v.idx).max()
                 .map(|m| m + 1).unwrap_or(0);
             s_fresh.fresh_to_free_avoiding(
                 |n| { let b = counter; counter += n; b },
-                &avoid_set,
+                &packed_frees,
             )
         };
 
         // Build the variant rule by applying sigma + normalising every term.
+        // On Maude-reduce failure fall back to the (un-normalised) applied
+        // term — the same lenient fallback `map_facts` uses below — rather
+        // than fabricating a bogus `err` var into the rule's new_vars.
         let norm_t = |t: LNTerm| -> LNTerm {
             let applied = apply_vterm(&sigma, t);
-            maude.reduce(&applied).unwrap_or_else(|_| {
-                // Fallback to un-normalised on Maude failure.
-                Term::Lit(tamarin_term::vterm::Lit::Var(LVar::new("err", LSort::Msg, 0)))
-            })
+            maude.reduce(&applied).unwrap_or(applied)
         };
         let map_facts = |fs: &[LNFact]| -> Vec<LNFact> {
             fs.iter().map(|f| LNFact {
@@ -824,9 +924,25 @@ pub fn variants_intruder(
             // Not the identity variant.
             if &ruvariant == ru { continue; }
         }
-        // Always-applied: concs \\ prems != [].
-        let concs_minus_prems_nonempty = ruvariant.conclusions.iter()
-            .any(|c| !ruvariant.premises.contains(c));
+        // Always-applied: `(rConcs ruvariant) \\ (rPrems ruvariant) /= []`.
+        // `Data.List.(\\)` is multiset difference — it removes ONE matching
+        // premise per conclusion (so concs=[A,A], prems=[A] yields [A]).
+        let concs_minus_prems_nonempty = {
+            let mut prem_avail: Vec<bool> = vec![true; ruvariant.premises.len()];
+            let mut any_remaining = false;
+            for c in &ruvariant.conclusions {
+                let mut matched = false;
+                for (j, p) in ruvariant.premises.iter().enumerate() {
+                    if prem_avail[j] && p == c {
+                        prem_avail[j] = false;
+                        matched = true;
+                        break;
+                    }
+                }
+                if !matched { any_remaining = true; }
+            }
+            any_remaining
+        };
         if !concs_minus_prems_nonempty { continue; }
 
         // Drop rules with single product-conclusion (HS lines 303-305).
@@ -842,29 +958,29 @@ pub fn variants_intruder(
     }
 
     // `go [] $ reverse $ ...` — HS walks the reversed-produced list and
-    // prepends each kept rule via `r:checked`.  So `checked` accumulates
-    // in REVERSE order of traversal, which (since the traversal walks
-    // the already-reversed `produced`) ends up in `produced`'s ORIGINAL
-    // order.  We mirror that with `Vec::insert(0, r)`.
+    // prepends each kept rule via `r:checked`.  At walk-step `p` the peer
+    // set is `checked ++ unchecked` = {kept so far} ∪ {rev[p+1..]}; a
+    // candidate is dropped iff it is `equalRuleUpToRenaming` to some peer.
+    // Because HS prepends each kept rule, `checked` ends up in REVERSE of
+    // the (reversed-produced) traversal order — i.e. `produced`'s ORIGINAL
+    // order, filtered.  We walk by index (avoiding the O(n) `remove(0)` /
+    // `insert(0)` shifts), collect kept indices in encounter order, then
+    // reverse once to recover the prepend order.
     produced.reverse();
-    let mut checked: Vec<IntrRuleAC> = Vec::new();
-    let mut unchecked: Vec<IntrRuleAC> = produced;
-    while let Some(r) = unchecked.first().cloned() {
-        unchecked.remove(0);
-        // peers = checked ++ unchecked
-        let mut dup = false;
-        for peer in checked.iter().chain(unchecked.iter()) {
-            if equal_rule_up_to_renaming(maude, &r, peer) {
-                dup = true;
-                break;
-            }
-        }
+    let rev = produced;
+    let mut kept_idx: Vec<usize> = Vec::new();
+    for p in 0..rev.len() {
+        let r = &rev[p];
+        // peers = {kept so far} ∪ {rev[p+1..]}
+        let dup = kept_idx.iter().map(|&k| &rev[k])
+            .chain(rev[p + 1..].iter())
+            .any(|peer| equal_rule_up_to_renaming(maude, r, peer));
         if !dup {
-            // HS `checked' = r:checked` — prepend.
-            checked.insert(0, r);
+            kept_idx.push(p);
         }
     }
-    checked
+    // HS `checked' = r:checked` prepend ⇒ reverse the encounter order.
+    kept_idx.into_iter().rev().map(|k| rev[k].clone()).collect()
 }
 
 /// `equalRuleUpToRenaming` — port of
@@ -872,11 +988,19 @@ pub fn variants_intruder(
 ///
 /// Two rules are equal up to variable renaming iff:
 ///   - Same `info`.
-///   - Zipped (premises ++ concs ++ acts) have matching fact tags AND
+///   - Zipped (premises ++ concs ++ acts) have matching fact tags, and the
 ///     element-wise term-equalities admit a unifier that is a renaming
 ///     when restricted to either rule's variable occurrences (sorted).
 ///   - `new_vars` are also zipped into equalities (in HS, `nvs1` zipped
 ///     with `nvs2` start the equation list).
+///
+/// HS `matchFacts` only fails (`Nothing`) on a fact-TAG mismatch; the
+/// `zipWith Equal`/`zip` over `(pr1++co1++ac1)`/`(pr2++co2++ac2)` and over
+/// `nvs1`/`nvs2` silently TRUNCATE to the shorter list on a count or arity
+/// mismatch (they never force False), and the concatenations are zipped
+/// across section boundaries.  We mirror that exactly with truncating
+/// `zip`s and no length guards.  (In practice every caller compares
+/// variants of the same base rule, so counts/arities always agree.)
 ///
 /// HS:
 /// ```haskell
@@ -895,15 +1019,12 @@ pub fn equal_rule_up_to_renaming(
     use tamarin_term::subst_vfresh::LNSubstVFresh;
 
     if r1.info != r2.info { return false; }
-    // `matchFacts`: zip the fact lists; if any pair has mismatched tags
-    // OR arities, the whole equation set is unconstructible — return False.
-    if r1.premises.len() != r2.premises.len() { return false; }
-    if r1.conclusions.len() != r2.conclusions.len() { return false; }
-    if r1.actions.len() != r2.actions.len() { return false; }
-    if r1.new_vars.len() != r2.new_vars.len() { return false; }
 
-    // HS's `eqs` is initialised with `zipWith Equal nvs1 nvs2`, then
-    // each fact pair extends it by `zipWith Equal t1 t2` when tags match.
+    // HS's `eqs` is initialised with `zipWith Equal nvs1 nvs2` (truncating),
+    // then each tag-matching fact pair extends it by `zipWith Equal t1 t2`
+    // (also truncating).  `matchFacts` only fails on a TAG mismatch — never
+    // on a count/arity mismatch — so we use truncating `zip`s with no length
+    // guards, and zip the section concatenations across boundaries.
     let mut term_eqs: Vec<Equal<LNTerm>> = Vec::new();
     for (a, b) in r1.new_vars.iter().zip(r2.new_vars.iter()) {
         term_eqs.push(Equal { lhs: a.clone(), rhs: b.clone() });
@@ -912,7 +1033,6 @@ pub fn equal_rule_up_to_renaming(
         .zip(r2.premises.iter().chain(r2.conclusions.iter()).chain(r2.actions.iter()));
     for (f1, f2) in pair_iter {
         if f1.tag != f2.tag { return false; }
-        if f1.terms.len() != f2.terms.len() { return false; }
         for (a, b) in f1.terms.iter().zip(f2.terms.iter()) {
             term_eqs.push(Equal { lhs: a.clone(), rhs: b.clone() });
         }

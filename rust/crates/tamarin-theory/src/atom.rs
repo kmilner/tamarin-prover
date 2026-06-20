@@ -50,6 +50,9 @@ impl<T> Atom<T> {
     pub fn is_subterm(&self) -> bool { matches!(self, ProtoAtom::Subterm(_, _)) }
     pub fn is_less(&self) -> bool { matches!(self, ProtoAtom::Less(_, _)) }
     pub fn is_last(&self) -> bool { matches!(self, ProtoAtom::Last(_)) }
+    /// Retained for parity with Haskell's exported `isSyntacticSugar`; no Rust
+    /// call site currently uses it.
+    #[allow(dead_code)]
     pub fn is_syntactic_sugar(&self) -> bool { matches!(self, ProtoAtom::Syntactic(_)) }
 }
 

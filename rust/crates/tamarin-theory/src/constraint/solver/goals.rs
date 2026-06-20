@@ -35,20 +35,20 @@ pub enum GoalRanking {
     Smart(bool),
     /// `InjRanking useLoopBreakers` (ProofMethod.hs).
     Inj(bool),
-    /// `GoalNrRanking` (ProofMethod.hs:694): `sortOn (fst . snd)` —
-    /// presort identifier `C`.
+    /// `GoalNrRanking` (rankGoals dispatch ProofMethod.hs:482):
+    /// `sortOn (fst . snd)` — presort identifier `C`.
     GoalNr,
-    /// `UsefulGoalNrRanking` (ProofMethod.hs:697):
+    /// `UsefulGoalNrRanking` (rankGoals dispatch ProofMethod.hs:485):
     /// `sortOn (\(_, (nr, useless)) -> (useless, nr))` — presort `c`.
     UsefulGoalNr,
-    /// `OracleRanking quitOnEmpty oracle` (ProofMethod.hs:695).
+    /// `OracleRanking quitOnEmpty oracle` (rankGoals dispatch ProofMethod.hs:483).
     /// preSort = `const goalNrRanking`.
     /// `oracle_path` is the resolved filesystem path of the oracle script.
     Oracle { quit_on_empty: bool, oracle_path: String },
-    /// `OracleSmartRanking quitOnEmpty oracle` (ProofMethod.hs:696).
+    /// `OracleSmartRanking quitOnEmpty oracle` (rankGoals dispatch ProofMethod.hs:484).
     /// preSort = `smartRanking ctxt False`.
     OracleSmart { quit_on_empty: bool, oracle_path: String },
-    /// `InternalTacticRanking quitOnEmpty (Tactic …)` (ProofMethod.hs:703).
+    /// `InternalTacticRanking quitOnEmpty (Tactic …)` (rankGoals dispatch ProofMethod.hs:491).
     /// The resolved per-lemma tactic (presort + prio/deprio selectors).
     /// `quit_on_empty` is True for the `{.}` form, False for `{name}`.
     Tactic { quit_on_empty: bool, tactic: std::sync::Arc<crate::tactic::Tactic> },
@@ -77,19 +77,10 @@ impl GoalRanking {
         }
     }
 
-    /// Parse the first ranking identifier out of a heuristic string.
-    /// Used only for the non-oracle single-char case; oracle callers
-    /// use `parse_heuristic_str` which computes the oracle path.
-    pub fn from_str(s: &str) -> GoalRanking {
-        match s.trim().chars().next() {
-            Some(c) if c.is_ascii_alphabetic() => GoalRanking::from_char_with_oracle(c, "oracle"),
-            _ => GoalRanking::Smart(false),
-        }
-    }
 }
 
 /// Parse a full heuristic string into a list of `GoalRanking`s,
-/// mirroring HS's `Heuristic` list (ProofMethod.hs:802-811).
+/// mirroring HS's `Heuristic` list (ProofMethod.hs:581-590).
 ///
 /// `theory_file` is the path to the `.spthy` file; used to compute
 /// the default oracle name via `oracle_name_for_theory`
@@ -411,7 +402,12 @@ impl std::error::Error for OracleError {}
 /// now returns `false` (safe — it only ever moves goals later, never
 /// earlier).
 pub fn rank_goals(sys: &System) -> Vec<AnnotatedGoal> {
-    rank_goals_with(sys, None, 0).expect("no oracle without context")
+    // With `ctx = None` the ranking always resolves to `Smart(false)`
+    // (the oracle/tactic paths — the only `Err` sources — are
+    // unreachable), so this never errors.  Fall back to the unranked
+    // open-goal list rather than panicking, keeping this entry point
+    // panic-free public surface.
+    rank_goals_with(sys, None, 0).unwrap_or_else(|_| open_goals(sys))
 }
 
 /// Variant that takes a proof context for source-cache predicates
@@ -421,7 +417,7 @@ pub fn rank_goals(sys: &System) -> Vec<AnnotatedGoal> {
 /// executed — callers must propagate this as a hard abort.
 ///
 /// `depth` mirrors HS's `useHeuristic (Heuristic rankings) depth =
-/// rankings !! (depth mod n)` (ProofMethod.hs:802-811).
+/// rankings !! (depth mod n)` (ProofMethod.hs:581-590).
 pub fn rank_goals_with(
     sys: &System,
     ctx: Option<&crate::constraint::solver::context::ProofContext>,
@@ -458,7 +454,7 @@ fn rank_goals_with_inner(
     depth: usize,
 ) -> Result<Vec<AnnotatedGoal>, OracleError> {
     // Round-robin heuristic scheduling: `useHeuristic (Heuristic rankings) depth =
-    // rankings !! (depth mod n)` (ProofMethod.hs:802-811).
+    // rankings !! (depth mod n)` (ProofMethod.hs:581-590).
     // When no context (or no heuristic) is supplied we default to
     // `SmartRanking False` — exactly HS's
     // `defaultHeuristic False = Heuristic [SmartRanking False]`
@@ -479,13 +475,13 @@ fn rank_goals_with_inner(
             Ok(smart_ranking(sys, ctx, use_loop_breakers))
         }
         GoalRanking::GoalNr => {
-            // HS `goalNrRanking = sortOn (fst . snd)` (ProofMethod.hs:814).
+            // HS `goalNrRanking = sortOn (fst . snd)` (ProofMethod.hs:593-594).
             // `open_goals` already sorts by creation nr.
             Ok(open_goals(sys))
         }
         GoalRanking::UsefulGoalNr => {
-            // HS `UsefulGoalNrRanking -> plainRanking (sortOn (\(_, (nr,
-            // useless)) -> (useless, nr)) ags)` (ProofMethod.hs:697).
+            // HS `UsefulGoalNrRanking -> plainRanking . sortOn (\(_, (nr,
+            // useless)) -> (useless, nr))` (ProofMethod.hs:485).
             let mut ags = open_goals(sys);
             ags.sort_by(|a, b| {
                 tag_usefulness(a.usefulness)
@@ -497,25 +493,25 @@ fn rank_goals_with_inner(
         GoalRanking::Tactic { quit_on_empty, tactic } => {
             // HS `InternalTacticRanking quitOnEmpty tactic ->
             //   internalTacticRanking (chosenTactic ..) quitOnEmpty ..`
-            // (ProofMethod.hs:703,916).
+            // (ProofMethod.hs:491,695).
             internal_tactic_ranking(&tactic, quit_on_empty, ctx, sys)
         }
         GoalRanking::Oracle { quit_on_empty, oracle_path } => {
             // HS `oracleRanking (const goalNrRanking) oracle quitOnEmpty ctxt sys ags`
-            // (ProofMethod.hs:695): preSort = goalNrRanking (open_goals is already nr-sorted)
+            // (ProofMethod.hs:483): preSort = goalNrRanking (open_goals is already nr-sorted)
             let ags = open_goals(sys);
             oracle_ranking(ags, &oracle_path, quit_on_empty, ctx, sys)
         }
         GoalRanking::OracleSmart { quit_on_empty, oracle_path } => {
             // HS `oracleRanking (smartRanking ctxt False) oracle quitOnEmpty ctxt sys ags`
-            // (ProofMethod.hs:696): preSort = smartRanking ctxt False
+            // (ProofMethod.hs:484): preSort = smartRanking ctxt False
             let ags = smart_ranking(sys, ctx, false);
             oracle_ranking(ags, &oracle_path, quit_on_empty, ctx, sys)
         }
     }
 }
 
-/// Port of HS `oracleRanking` (ProofMethod.hs:819-844).
+/// Port of HS `oracleRanking` (ProofMethod.hs:598-621).
 ///
 /// Protocol:
 /// 1. `ags = preSort sys ags0`  (already done by caller).
@@ -525,7 +521,8 @@ fn rank_goals_with_inner(
 ///    out-of-range indices skipped.
 /// 5. Result = `ranked ++ (ags \\ ranked)` in original order.
 /// 6. If `quit_on_empty && !inp.is_empty() && ranked.is_empty()` →
-///    signal ApplySorry via `OracleError::sorry` sentinel.
+///    signal ApplySorry. We encode this as the `OracleError`
+///    `"__ORACLE_QUIT_ON_EMPTY__"` sentinel (matched in search.rs).
 ///
 /// On any exec failure (spawn error / non-zero exit) → `Err(OracleError)`,
 /// propagated as a hard abort (mirrors HS's uncaught IO exception).
@@ -543,7 +540,7 @@ fn oracle_ranking(
 
     // Step 2: build stdin — `show i ++": "++ concat . lines . render $ prettyGoal g`
     // HS `concat . lines . render` collapses multi-line renders to one line
-    // (ProofMethod.hs:828).
+    // (ProofMethod.hs:607).
     let inp: String = ags.iter().enumerate().map(|(i, ag)| {
         let goal_text = crate::pretty_theory::render_goal_for_oracle(&ag.goal);
         // concat . lines = remove all newlines
@@ -577,7 +574,7 @@ fn oracle_ranking(
 
     let outp = String::from_utf8_lossy(&output.stdout);
 
-    // HS debug trace (ProofMethod.hs:834-839) — optional stderr logging
+    // HS debug trace (ProofMethod.hs:613-618) — optional stderr logging
     if std::env::var("TAM_RS_ORACLE_TRACE").is_ok() {
         eprintln!(">>>>>>>>>>>>>>>>>>>>>>>> START INPUT\n{}", inp);
         eprintln!(">>>>>>>>>>>>>>>>>>>>>>>> START OUTPUT\n{}", outp);
@@ -590,34 +587,30 @@ fn oracle_ranking(
         .collect();
 
     // Step 5: ranked goals + remaining (filter(notElem ranked) ags)
-    let mut ranked: Vec<AnnotatedGoal> = indices.iter()
+    // HS `ranked = mapMaybe (atMay ags) indices` KEEPS duplicate entries when
+    // the oracle emits a repeated index (e.g. output `[2,2]` yields
+    // `[ags!!2, ags!!2]`). We mirror that exactly — no de-dup of `ranked`.
+    let ranked: Vec<AnnotatedGoal> = indices.iter()
         .filter_map(|&idx| ags.get(idx).cloned())
         .collect();
 
-    // De-duplicate: HS `mapMaybe (atMay ags) indices` can repeat if oracle
-    // outputs the same index twice; HS's `filter (notElem ranked)` then
-    // excludes duplicates from remaining but keeps first occurrence.
-    // Keep same semantics: deduplicate ranked by index.
-    let mut seen = std::collections::BTreeSet::new();
-    ranked.retain(|ag| {
-        // find original index
-        let idx = ags.iter().position(|a| std::ptr::eq(a, ag) || a.seq == ag.seq);
-        if let Some(i) = idx {
-            seen.insert(i)
-        } else {
-            true
-        }
-    });
+    // HS `remaining = filter (`notElem` ranked) ags`: keep every goal that is
+    // NOT present in `ranked`. We compare by original index (the set of indices
+    // the oracle selected), matching membership of the goal value in `ranked`.
+    let ranked_idx: std::collections::BTreeSet<usize> = indices.iter()
+        .filter(|&&idx| idx < ags.len())
+        .copied()
+        .collect();
 
     let remaining: Vec<AnnotatedGoal> = ags.into_iter().enumerate()
-        .filter(|(i, _)| !seen.contains(i))
+        .filter(|(i, _)| !ranked_idx.contains(i))
         .map(|(_, ag)| ag)
         .collect();
 
     // Step 6: quitOnEmpty check
     // HS: `guard $ quitOnEmpty && not (null inp) && null ranked`
     // The `guard` in the IO monad returns `mzero` when condition is True,
-    // which causes the sorry instruction to fire (ProofMethod.hs:842).
+    // which causes the sorry instruction to fire (ProofMethod.hs:621).
     if quit_on_empty && !inp.is_empty() && ranked.is_empty() {
         return Err(OracleError("__ORACLE_QUIT_ON_EMPTY__".to_string()));
     }
@@ -629,7 +622,7 @@ fn oracle_ranking(
 
 // =============================================================================
 // Tactic ranking — port of `internalTacticRanking` / `itRanking`
-// (ProofMethod.hs:848-933) + selector evaluation (Parser/Tactics.hs:117-220).
+// (ProofMethod.hs:627-712) + selector evaluation (Parser/Tactics.hs:117-220).
 // =============================================================================
 
 /// Resolve the tactic's `_presort` (a `char` in the parsed `Tactic`) into
@@ -643,7 +636,7 @@ fn presort_ranking(presort: char) -> GoalRanking {
 /// already-open annotated goals.  The presort rankings the corpus uses
 /// are `C` (GoalNr), `c` (UsefulGoalNr), `s`/`S` (Smart).  This mirrors
 /// HS `rankGoals ctxt defaultMethod [tactic] _sys ags0`
-/// (ProofMethod.hs:920) restricted to the non-oracle, non-tactic
+/// (ProofMethod.hs:699) restricted to the non-oracle, non-tactic
 /// presorts (a tactic presort cannot itself be a tactic or an oracle).
 fn apply_presort(
     presort: &GoalRanking,
@@ -687,7 +680,7 @@ fn apply_presort(
     }
 }
 
-/// Port of HS `internalTacticRanking` (ProofMethod.hs:916-933):
+/// Port of HS `internalTacticRanking` (ProofMethod.hs:695-712):
 ///   defaultMethod = _presort tactic
 ///   ags = ranked $ rankGoals ctxt defaultMethod [tactic] _sys ags0
 ///   res = itRanking tactic ags quitOnEmpty ctxt _sys
@@ -703,7 +696,7 @@ fn internal_tactic_ranking(
     it_ranking(tactic, ags, quit_on_empty, ctx, sys)
 }
 
-/// Port of HS `itRanking` (ProofMethod.hs:848-909) — the core tactic
+/// Port of HS `itRanking` (ProofMethod.hs:627-688) — the core tactic
 /// reordering algorithm:
 ///
 ///   * For each goal, `indexPrio` = index of the FIRST prio that
@@ -739,7 +732,7 @@ fn it_ranking(
         .collect();
 
     // quitOnEmpty: `guard (quitOnEmpty && null rankedPrioGoals &&
-    //   null rankedDeprioGoals) *> Just ApplySorry` (ProofMethod.hs:850).
+    //   null rankedDeprioGoals) *> Just ApplySorry` (ProofMethod.hs:629).
     if quit_on_empty && ranked_prio.is_empty() && ranked_deprio.is_empty() {
         return Err(OracleError("__ORACLE_QUIT_ON_EMPTY__".to_string()));
     }
@@ -754,7 +747,7 @@ fn it_ranking(
 /// Compute `rankedPrioGoals` (or `rankedDeprioGoals`) for one block list.
 ///
 /// Mirrors the `indexPrio` / `groupedPrio` / `rankingPrio` pipeline in
-/// `itRanking` (ProofMethod.hs:853-863):
+/// `itRanking` (ProofMethod.hs:633-642):
 ///   1. For each goal, find the index of the first block whose ANY
 ///      selector matches (`findIndex (==True) . applyIsPrio`).
 ///   2. Stable-group goals by that index in ascending order; drop
@@ -773,9 +766,12 @@ fn rank_by_blocks(
     // index_of_first_matching_block for each goal.
     // HS `indexedPrio = sortOn fst (zip indexPrio ags)` then `groupBy`
     // on equal index.  `sortOn` is STABLE, so within one index the goals
-    // keep their presort (ags) order.  `Nothing` sorts AFTER `Just _`
-    // and is dropped.  We replicate by iterating block indices 0..n and
-    // collecting the goals whose first-match is that index, in ags order.
+    // keep their presort (ags) order.  Under Haskell's `Ord (Maybe a)`
+    // (`compare Nothing (Just _) = LT`) `Nothing` sorts FIRST (least), so
+    // unmatched goals form the leading group, which HS drops via
+    // `tail groupedPrio`.  We replicate by iterating block indices 0..n and
+    // collecting only the goals whose first-match is `Some(bi)`, in ags
+    // order — `None` (unmatched) goals are never emitted, i.e. dropped.
     let first_match: Vec<Option<usize>> = ags
         .iter()
         .map(|g| {
@@ -1721,6 +1717,13 @@ fn chain_to_equality(
 /// trivially handled.  **Direct port of Haskell's `openGoals` filter**
 /// (`Theory.Constraint.Solver.Goals:66-101`):
 ///
+/// NOTE: Haskell's first ActionG arm branches on `get sDiffSystem sys`
+/// (Goals.hs:72-84): in a diff proof every KU action goal is open iff
+/// `not solved`, skipping the pub/nat/pair/msg-var auto-solve cases.
+/// This port intentionally omits that branch — diff mode is not
+/// supported (the Rust `System` has no diff field), so we always take
+/// the non-diff path.
+///
 ///   ActionG i (KU m) →
 ///       not ( solved
 ///             || (isMsgVar m && i ∉ sNodes)  -- handled later
@@ -1861,18 +1864,20 @@ fn is_nullary_public_function(t: &tamarin_term::lterm::LNTerm) -> bool {
                 && matches!(s.privacy, tamarin_term::function_symbols::Privacy::Public))
 }
 
-/// True if the term is a sort-Pub or sort-Nat literal (variable or
-/// constant).  These KU goals are auto-solved because the adversary
-/// can construct any Pub/Nat value trivially.
+/// True if the term's whole-term sort is Pub or Nat.  These KU goals
+/// are auto-solved because the adversary can construct any Pub/Nat
+/// value trivially.
+///
+/// Mirrors Haskell's `sortOfLNTerm m == LSortPub || sortOfLNTerm m ==
+/// LSortNat` in `openGoals` (Goals.hs:80-81).  `sortOfLNTerm`
+/// (LTerm.hs `sortOfLTerm`) is a WHOLE-TERM sort: besides Pub/Nat
+/// literals it returns `LSortNat` for an `Ac(NatPlus)` application
+/// (e.g. `tplus(x,y)`) and for the nat-one constant — so we must
+/// delegate to `sort_of_lnterm` rather than only inspecting bare
+/// literals, otherwise `+`/nat KU goals are wrongly left open.
 fn is_pub_or_nat_term(t: &tamarin_term::lterm::LNTerm) -> bool {
-    use tamarin_term::lterm::{LSort, NameTag};
-    use tamarin_term::term::Term;
-    use tamarin_term::vterm::Lit;
-    match t {
-        Term::Lit(Lit::Var(v)) => matches!(v.sort, LSort::Pub | LSort::Nat),
-        Term::Lit(Lit::Con(n)) => matches!(n.tag, NameTag::Pub | NameTag::Nat),
-        _ => false,
-    }
+    use tamarin_term::lterm::{sort_of_lnterm, LSort};
+    matches!(sort_of_lnterm(t), LSort::Pub | LSort::Nat)
 }
 
 /// True if the term's top symbol is a pair, inverse, product, or
@@ -1957,10 +1962,13 @@ pub fn goal_usefulness(g: &Goal, looping: bool, sys: &System) -> Usefulness {
 /// demotion never fires.  Walks recursively, surfacing KU action atoms
 /// from inside `GGuarded`/`GAtom`/`Conj`/`Disj` structures.
 fn has_ku_guards(sys: &System) -> bool {
-    use crate::fact::FactTag;
     use crate::guarded::{Guarded, GAtom};
     fn walk_guards(g: &Guarded) -> bool {
         match g {
+            // HS `getTags _qua _ss atos inner` inspects ONLY the guard list
+            // (`atos`) of a `GGuarded`; the bare-atom case is `fAto = mempty`,
+            // contributing NO tags (Guarded.hs:170-173).  So a bare `GAto`
+            // KU action atom must NOT count — only a `GGuarded`'s guards.
             Guarded::GGuarded { guards, body, .. } => {
                 for atom in guards {
                     if let GAtom::Action(fa, _) = atom {
@@ -1970,11 +1978,10 @@ fn has_ku_guards(sys: &System) -> bool {
                 walk_guards(body)
             }
             Guarded::Conj(items) | Guarded::Disj(items) => items.iter().any(walk_guards),
-            Guarded::Atom(GAtom::Action(fa, _)) => fa.name == "KU",
+            // `fAto = mempty`: bare atoms contribute no tags.
             Guarded::Atom(_) => false,
         }
     }
-    let _ = FactTag::Ku;
     sys.formulas.iter().any(walk_guards)
 }
 
@@ -2053,7 +2060,15 @@ fn toplevel_terms(t: &tamarin_term::lterm::LNTerm) -> Vec<tamarin_term::lterm::L
 }
 
 /// `rawLessRel`-based forward reachability: every node id reachable
-/// from `i` via `sLessAtoms ++ edges` (transitive closure).
+/// from `i` via `rawLessRel sys` (transitive closure).
+///
+/// `rawLessRel se = getLessRel sLessAtoms ++ rawEdgeRel se`, and
+/// `rawEdgeRel sys = map (nodeConcNode *** nodePremNode) $ [Edge..] ++
+/// unsolvedChains sys` (System.hs:1613-1622).  So the relation has one
+/// conc-node -> prem-node edge per *unsolved Chain goal* in addition to
+/// `sLessAtoms` and `sEdges` — mirroring `build_always_before_adj`
+/// (system.rs).  Omitting the unsolved-chain edges would mis-classify a
+/// KU goal's `Usefulness` in `extractible`/`currentlyDeducible`.
 fn reachable_from(
     sys: &System,
     i: &crate::constraint::constraints::NodeId,
@@ -2068,6 +2083,15 @@ fn reachable_from(
     }
     for e in &sys.edges {
         adj.entry(e.src.0.clone()).or_default().push(e.tgt.0.clone());
+    }
+    // HS-faithful `unsolvedChains` contribution to rawEdgeRel
+    // (System.hs:1613-1616): one conc-node -> prem-node edge per
+    // unsolved Chain goal.
+    for (g, st) in sys.goals.iter() {
+        if st.solved { continue; }
+        if let crate::constraint::constraints::Goal::Chain(c, p) = g {
+            adj.entry(c.0.clone()).or_default().push(p.0.clone());
+        }
     }
     let mut seen: BTreeSet<crate::constraint::constraints::NodeId> = BTreeSet::new();
     let mut q: VecDeque<crate::constraint::constraints::NodeId> = VecDeque::new();

@@ -172,10 +172,18 @@ impl ProofContext {
     /// (acquired from `maude_pool`) for the duration of one task,
     /// so workers don't serialise on a single Maude's IPC mutex.
     ///
-    /// Most fields are `Arc`-of-Vec-friendly already (`MaudeHandle`,
-    /// `Source`'s lazy cell, etc.), so the deep clone is cheap in
-    /// practice; the heavy `Vec`s (rules, full_sources) are O(n) but
-    /// only happen once per parallel task, not once per Maude call.
+    /// NOTE: this is a genuine deep clone, NOT an `Arc` refcount bump.
+    /// `ProofContext::clone` copies every `Vec` field by value
+    /// (`rules`, `full_sources`, `intruder_rules`, `injective_fact_insts`,
+    /// `restrictions`, …) and `Source::clone` deep-clones its
+    /// `cases_cell` (a `Mutex<Option<Vec<(Vec<String>, System)>>>`, each
+    /// `System` heavy), so for a saturated source set the cost is O(total
+    /// case size).  Because the call site in `search.rs` runs inside
+    /// `cases.into_par_iter().map(...)`, a wide parallel node re-clones
+    /// that read-only data once per child case.  Only `maude` /
+    /// `maude_pool` are cheap (`Arc`-backed).  Wrapping the heavy
+    /// read-only fields in `Arc` would make this O(1), but that is a
+    /// cross-cutting change deferred for now.
     ///
     /// The new context drops `maude_pool` (set to None) — a worker
     /// holding a pooled handle should NOT recursively borrow more
@@ -631,9 +639,9 @@ impl ProofContext {
         // UNCONDITIONALLY for every closed protocol rule.  For rules with no
         // reducible-headed sub-terms, the variant disjunction collapses to
         // `Disj [emptySubstVFresh]` (the `trueDisj` constant at
-        // RuleVariants.hs:158); `someRuleACInst` (Rule.hs:940-955) then
+        // RuleVariants.hs:120); `someRuleACInst` (Rule.hs:940-955) then
         // returns `Just (Disj [emptySubstVFresh])` for EVERY ProtoRule, so
-        // `solveRuleConstraints (Just trueDisj)` (Reduction.hs:967-979) still
+        // `solveRuleConstraints (Just trueDisj)` (Reduction.hs:766-773) still
         // calls `insertGoal (SplitG splitId) False` — bumping `sNextGoalNr`
         // by 1 at every `labelNodeId` call regardless of whether the rule has
         // any destructors.  Skipping the variant-substs computation for
@@ -680,7 +688,7 @@ impl ProofContext {
                 //
                 // HS-faithful: ALWAYS attempt the computation, even for
                 // non-destructor rules where the result is `[emptySubstVFresh]`
-                // (`trueDisj`, RuleVariants.hs:158).  The downstream
+                // (`trueDisj`, RuleVariants.hs:120).  The downstream
                 // `solve_rule_constraints` path treats `Some([empty])` as a
                 // trivial-but-real Split that bumps `next_goal_nr` and lets
                 // simp's `simp_singleton` fold the disj — matching HS's

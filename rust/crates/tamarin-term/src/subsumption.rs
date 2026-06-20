@@ -43,12 +43,9 @@ use crate::term::Term;
 ///
 /// **Convention trap.** `match_eqs` takes `Equal { lhs = subject,
 /// rhs = pattern }` (HS's `Equal subject pattern`, see its doc). So
-/// HS's `t1 matchWith t2` ⇒ `Equal { lhs: t1, rhs: t2 }`. An earlier
-/// version of this code wrote `Equal { lhs: t2, rhs: t1 }` here
-/// (mistaking RS's `Equal` for the flipped `pattern,subject` order),
-/// which SWAPPED `Greater`/`Less`. The only consumer is `eq_term_subs`
-/// (which tests `Equal`, invariant under the swap), so the bug was
-/// latent — but it is fixed here to stay faithful to HS.
+/// HS's `t1 matchWith t2` ⇒ `Equal { lhs: t1, rhs: t2 }` — keep
+/// `lhs = subject`, `rhs = pattern`. Flipping the two would swap
+/// `Greater`/`Less` (only `eq_term_subs` is invariant under the swap).
 pub fn compare_term_subs(
     maude: &MaudeHandle,
     t1: &LNTerm,
@@ -77,7 +74,12 @@ pub fn eq_term_subs(
 
 /// Counts every variable occurrence across a list of terms — used by
 /// `canonize_subst` for ordering.
-pub fn var_occurrences(ts: &[LNTerm]) -> BTreeMap<LVar, usize> {
+///
+/// NOTE: this is NOT a faithful port of Haskell `varOccurences`
+/// (`lib/term/src/Term/Subsumption.hs`), which returns
+/// `[(LVar, S.Set Occurence)]` (sets of context paths). Here we only
+/// keep an occurrence COUNT per variable.
+pub fn var_occurrence_counts(ts: &[LNTerm]) -> BTreeMap<LVar, usize> {
     let mut out: BTreeMap<LVar, usize> = BTreeMap::new();
     fn go(t: &LNTerm, out: &mut BTreeMap<LVar, usize>) {
         match t {
@@ -121,7 +123,7 @@ pub fn var_occurrences(ts: &[LNTerm]) -> BTreeMap<LVar, usize> {
 /// inner unifier's `reserve_idxs` order, which DOES diverge between
 /// alpha-equivalent inputs.  Without an alpha-invariant
 /// canonicalisation, the post-Maude `BTreeSet<LNSubstVFresh>` dedup
-/// in `apply_eq_store` (equation_store.rs:2202-2212) fails to
+/// in `apply_eq_store` (equation_store.rs:2552-2560) fails to
 /// collapse the duplicates HS would catch via `S.fromList`
 /// (EquationStore.hs:268).
 ///
@@ -142,7 +144,7 @@ pub fn var_occurrences(ts: &[LNTerm]) -> BTreeMap<LVar, usize> {
 /// labels absorbs that.
 pub fn canonize_subst(s: &LNSubstVFresh) -> LNSubstVFresh {
     let range: Vec<LNTerm> = s.range().cloned().collect();
-    let occs = var_occurrences(&range);
+    let occs = var_occurrence_counts(&range);
     // Compute first-occurrence position by DFS-walking the range terms
     // in domain-key order (BTreeMap iteration is by key Ord — stable
     // across alpha since domain vars are not renamed).
@@ -231,7 +233,7 @@ mod tests {
             Term::Lit(Lit::Var(x.clone())),
             Term::Lit(Lit::Var(y.clone())),
         ];
-        let occs = var_occurrences(&xs);
+        let occs = var_occurrence_counts(&xs);
         assert_eq!(occs[&x], 2);
         assert_eq!(occs[&y], 1);
     }

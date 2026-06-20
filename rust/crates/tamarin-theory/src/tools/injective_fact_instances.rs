@@ -128,8 +128,19 @@ pub fn simple_injective_fact_instances(
         rule: &'a ProtoRuleE, tag: &crate::fact::FactTag,
         t: &tamarin_term::lterm::LNTerm,
     ) -> Option<&'a crate::fact::LNFact> {
-        rule.premises.iter().find(|p|
-            &p.tag == tag && p.terms.first() == Some(t))
+        // Mirrors HS `getPrem` (InjectiveFactInstances.hs:226-228):
+        //   case filter (\faPrem -> factTag faPrem == tag && Just tConc == firstTerm faPrem) prems of
+        //     [g] -> Just g
+        //     _   -> Nothing  -- if there are multiple such guards, the rule cannot be executed
+        // We must return the premise ONLY when there is EXACTLY one match; if
+        // two or more premises share the tag and first term the rule cannot be
+        // executed and the tag is treated as non-injective.
+        let mut it = rule.premises.iter()
+            .filter(|p| &p.tag == tag && p.terms.first() == Some(t));
+        match (it.next(), it.next()) {
+            (Some(g), None) => Some(g),
+            _ => None,
+        }
     }
 
     // Candidate tags = Linear protocol-fact tags that appear as BOTH a

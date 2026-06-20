@@ -1,6 +1,9 @@
 //! Port of `Sapic.Bindings` from `lib/sapic/src/Sapic/Bindings.hs`.
 //!
 //! Compute the variables bound by SAPIC process actions / combinators.
+//!
+//! Note: the Haskell module also defines `capturedVariablesAt` and exports
+//! `capturedVariables` (Bindings.hs:40-47); these are not yet ported here.
 
 use std::collections::BTreeSet;
 
@@ -48,6 +51,12 @@ pub fn bindings_comb(c: &ProcessCombinator<SapicLVar>) -> Vec<SapicLVar> {
 }
 
 /// `accBindings`: every variable bound anywhere in `p` (with duplicates).
+///
+/// Mirrors Haskell `accBindings = pfoldMap bindings` (Bindings.hs). `pfoldMap`
+/// (Process.hs:285-296) visits a `ProcessComb` *in-order*
+/// (`pfoldMap f pl <> f node <> pfoldMap f pr`) and a `ProcessAction`
+/// self-first (`f node <> pfoldMap f p`); `tamarin_theory::sapic::pfold_map`
+/// implements exactly that order, so the bound-variable sequence matches HS.
 pub fn acc_bindings<A: GoodAnnotation>(p: &Process<A, SapicLVar>) -> Vec<SapicLVar> {
     pfold_map(p, &mut |node| bindings(node))
 }

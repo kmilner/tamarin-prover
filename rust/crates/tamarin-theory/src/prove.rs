@@ -125,7 +125,7 @@ struct CachedSources {
 
 /// Per-file shared prover state — the bits of work that depend only on
 /// the theory, not on which lemma is being proved.  Built once via
-/// [`ProverSession::build`] and reused across `prove_lemma_in_session`
+/// [`ProverSession::build_with_in_file`] and reused across `prove_lemma_in_session`
 /// calls so each lemma in a multi-lemma `--prove` run pays the heavy
 /// setup cost only ONCE.
 ///
@@ -196,25 +196,84 @@ pub struct ProverSession {
 /// would have advanced `n * delta`.  In session mode the template
 /// build only advanced it by `1 * delta`, so we need an extra
 /// `(n - 1) * delta` bump before lemma `n`'s runtime to match.
-fn setup_target_for(session: &ProverSession, n: u64) -> u64 {
-    session.setup_counter_delta.saturating_mul(n)
+fn setup_target_for(delta: u64, n: u64) -> u64 {
+    delta.saturating_mul(n)
+}
+
+/// Per-lemma source kind, mirroring HS `lemmaSourceKind` (Lemma.hs:38-41):
+///   lemmaSourceKind lem
+///     | SourceLemma `elem` lAttributes lem = RawSource
+///     | otherwise                          = RefinedSource
+/// HS sets `pcSourceKind = lemmaSourceKind l` (ClosedTheory.hs:116) and
+/// `mkSystem` stamps it onto the initial system's `sSourceKind`
+/// (Prover.hs:325).  In RS `SourceKind`, `RawSources < RefinedSources`,
+/// matching HS's `RawSource < RefinedSource` Ord (System.hs:362-365), so it
+/// can be used directly as the `lemmaSourceKind lem <= kind` bound below.
+fn lemma_source_kind(lemma: &crate::theory::Lemma) -> SourceKind {
+    if lemma.attributes.iter().any(|a| matches!(a, crate::theory::LemmaAttr::Sources)) {
+        SourceKind::RawSources
+    } else {
+        SourceKind::RefinedSources
+    }
+}
+
+/// Gather the `[reuse]` lemmas declared BEFORE `lemma_name`, mirroring HS
+/// `gatherReusableLemmas $ L.get sSourceKind sys` (Prover.hs:329-338):
+///
+///   guard $ lemmaSourceKind lem <= kind
+///        && ReuseLemma `elem` lAttributes lem
+///        && AllTraces == lTraceQuantifier lem
+///        && lName lem `notElem` pcHiddenLemmas ctxt
+///        && "ALL"     `notElem` pcHiddenLemmas ctxt
+///
+/// `kind` is the source kind of the system being built (= the proved
+/// lemma's `lemmaSourceKind`).  `pcHiddenLemmas` is populated from the
+/// PROVED lemma's own `[hide_lemma=..]` attributes (ClosedTheory.hs:109),
+/// so the hidden set is computed here from `lemma_name`'s attributes.
+/// HS uses `formulaToGuarded_` (fail-loud) on each reuse formula, so a
+/// non-guardable reuse formula propagates a `ProveError` rather than being
+/// silently dropped.
+fn gather_reusable_lemmas(
+    theory: &crate::theory::Theory,
+    lemma_name: &str,
+    kind: SourceKind,
+) -> Result<Vec<Guarded>, ProveError> {
+    // HS `pcHiddenLemmas` = the proved lemma's `[hide_lemma=h]` names.
+    let hidden: Vec<&str> = theory
+        .lookup_lemma(lemma_name)
+        .map(|l| l.attributes.iter().filter_map(|a| match a {
+            crate::theory::LemmaAttr::HideLemma(h) => Some(h.as_str()),
+            _ => None,
+        }).collect())
+        .unwrap_or_default();
+    let hide_all = hidden.contains(&"ALL");
+    let mut reuse_lemmas: Vec<Guarded> = Vec::new();
+    for prior in theory.lemmas() {
+        if prior.name == lemma_name { break; }
+        if lemma_source_kind(prior) > kind { continue; }
+        if !prior.attributes.iter().any(|a| matches!(a, crate::theory::LemmaAttr::Reuse)) {
+            continue;
+        }
+        if !matches!(prior.trace_quantifier, crate::theory::TraceQuantifier::AllTraces) {
+            continue;
+        }
+        if hide_all || hidden.contains(&prior.name.as_str()) {
+            continue;
+        }
+        let rg = formula_to_guarded(&prior.formula)
+            .map_err(|e| ProveError::Guarded(guard_error_doc(&e, &prior.formula)))?;
+        reuse_lemmas.push(rg);
+    }
+    Ok(reuse_lemmas)
 }
 
 impl ProverSession {
-    /// Build the shared per-file state.  Does the expensive once-per-file
-    /// work: theory elaboration, restriction conversion, full
+    /// Build the shared per-file state, also setting `theory.in_file` for
+    /// oracle path resolution (HS Parser.hs:304).  Does the expensive
+    /// once-per-file work: theory elaboration, restriction conversion, full
     /// `ProofContext` construction (which runs intruder rule generation,
     /// `close_intr_rule`, DH/BP cached variants, per-rule variant
     /// expansion, source precomputation).
-    pub fn build(
-        parser_theory: &p::Theory,
-        maude: tamarin_term::maude_proc::MaudeHandle,
-        pool: Option<std::sync::Arc<tamarin_term::maude_proc::MaudePool>>,
-    ) -> Result<Self, ProveError> {
-        Self::build_with_in_file(parser_theory, maude, pool, "")
-    }
-
-    /// Like `build` but also sets `theory.in_file` for oracle path resolution.
     pub fn build_with_in_file(
         parser_theory: &p::Theory,
         maude: tamarin_term::maude_proc::MaudeHandle,
@@ -229,11 +288,17 @@ impl ProverSession {
             .map_err(|e| ProveError::Elaboration(e.message))?;
         // Set in_file for oracle path resolution (HS Parser.hs:304).
         theory.in_file = in_file.to_string();
+        // HS `mkSystem` maps `formulaToGuarded_ = either (error . render) id`
+        // (Prover.hs:324, Guarded.hs:466-467) over restriction formulas — it
+        // ABORTS on a non-guardable restriction rather than silently dropping
+        // it (which would weaken the constraint set and could let an unsound
+        // proof through).  Mirror the fail-loud behaviour: propagate a
+        // `ProveError::Guarded` instead of skipping.
         let mut restrictions: Vec<Guarded> = Vec::new();
         for r in theory.restrictions() {
-            if let Ok(rg) = formula_to_guarded(&r.formula) {
-                restrictions.push(rg);
-            }
+            let rg = formula_to_guarded(&r.formula)
+                .map_err(|e| ProveError::Guarded(guard_error_doc(&e, &r.formula)))?;
+            restrictions.push(rg);
         }
         let rules: Vec<OpenProtoRule> = theory.rules().cloned().collect();
         // Capture the fresh-counter span around the template build so we
@@ -257,7 +322,7 @@ impl ProverSession {
 }
 
 /// Prove a single lemma using a pre-built `ProverSession`.  Skips the
-/// expensive theory-level setup (which `ProverSession::build` did) and
+/// expensive theory-level setup (which `ProverSession::build_with_in_file` did) and
 /// runs only the per-lemma work: guarded conversion of lemma+reuse
 /// formulas, `formula_to_system`, ProofContext clone +
 /// per-lemma-field setup, `ensure_saturated` (typing-asm refinement),
@@ -304,21 +369,17 @@ fn prove_lemma_in_session_mode(
     let g = formula_to_guarded(&lemma.formula)
         .map_err(|e| ProveError::Guarded(guard_error_doc(&e, &lemma.formula)))?;
 
+    // Per-lemma source kind, mirroring HS `lemmaSourceKind` (Lemma.hs:38-41):
+    // `[sources]`-tagged lemmas get RawSource, all others RefinedSource.
+    // HS sets `pcSourceKind = lemmaSourceKind l` (ClosedTheory.hs:102,116)
+    // and `formulaToSystem` stamps it onto the initial system's
+    // `sSourceKind` (Prover.hs:325).
+    let lemma_source_kind = lemma_source_kind(lemma);
+
     // `[reuse]` lemmas declared BEFORE this one.  Same gather logic as
     // the pre-session prove_lemma_with_pool path.
-    let mut reuse_lemmas: Vec<Guarded> = Vec::new();
-    for prior in theory.lemmas() {
-        if prior.name == lemma_name { break; }
-        if !prior.attributes.iter().any(|a| matches!(a, crate::theory::LemmaAttr::Reuse)) {
-            continue;
-        }
-        if !matches!(prior.trace_quantifier, crate::theory::TraceQuantifier::AllTraces) {
-            continue;
-        }
-        if let Ok(rg) = formula_to_guarded(&prior.formula) {
-            reuse_lemmas.push(rg);
-        }
-    }
+    let reuse_lemmas =
+        gather_reusable_lemmas(theory, lemma_name, lemma_source_kind)?;
 
     let tq = match lemma.trace_quantifier {
         crate::theory::TraceQuantifier::AllTraces => p::TraceQuantifier::AllTraces,
@@ -326,7 +387,7 @@ fn prove_lemma_in_session_mode(
     };
     let mut sys = formula_to_system(
         session.restrictions.clone(),
-        SourceKind::RawSources,
+        lemma_source_kind,
         tq,
         false,
         &g,
@@ -366,7 +427,7 @@ fn prove_lemma_in_session_mode(
     let lemma_i = session.lemma_idx
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let target = session.setup_counter_before
-        .saturating_add(setup_target_for(session, lemma_i + 1));
+        .saturating_add(setup_target_for(session.setup_counter_delta, lemma_i + 1));
     ctx.maude.ensure_above(target.saturating_sub(1));
     if trace { eprintln!("[phase] (session) ProofContext clone dt={:.3}s",
         t_ctx.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64())); }
@@ -406,10 +467,13 @@ fn prove_lemma_in_session_mode(
         if !matches!(prior.trace_quantifier, crate::theory::TraceQuantifier::AllTraces) {
             continue;
         }
-        if let Ok(rg) = formula_to_guarded(&prior.formula) {
-            typing_assumptions.push(rg);
-            source_key.push(prior.name.clone());
-        }
+        // HS `typAsms` (Prover.hs:142-144) uses `formulaToGuarded_`
+        // (fail-loud) on each source-lemma formula — propagate rather than
+        // silently drop.
+        let rg = formula_to_guarded(&prior.formula)
+            .map_err(|e| ProveError::Guarded(guard_error_doc(&e, &prior.formula)))?;
+        typing_assumptions.push(rg);
+        source_key.push(prior.name.clone());
     }
     source_key.sort();
     ctx.typing_assumptions = typing_assumptions;
@@ -418,9 +482,11 @@ fn prove_lemma_in_session_mode(
     // HS-faithful laziness: refined sources are a lazy `where`-bound thunk
     // in HS's `ClosedRuleCache` (`refinedSources` = `precomputeSources` →
     // `refineWithSourceAsms`, Rule.hs:156-157), forced ONLY when a proof
-    // method reads `pcSources` (ProofMethod.hs:504).  A non-target lemma
+    // method reads `pcSources` (ProofMethod.hs:317).  A non-target lemma
     // with NO stored skeleton replays HS's parsed `unproven () = sorry`
-    // (ProofSkeleton.hs:61) via `checkAndExtendProver`'s `sorry` walk
+    // (`unproven = sorry Nothing`, Proof.hs:255-256; used by the lemma
+    // constructor at ProofSkeleton.hs:61) via `checkAndExtendProver`'s
+    // `sorry` walk
     // (Proof.hs:626-632) — that single `Sorry` node consults no source,
     // so HS never forces the (potentially very expensive) refined-source
     // thunk for it.  RS mirrors that here: such a lemma will hit the
@@ -518,7 +584,9 @@ fn prove_lemma_in_session_mode(
     }
     if !auto_prove {
         // Non-target lemma with no stored skeleton: HS keeps the parsed
-        // `unproven ()` single-`sorry` proof (ProofSkeleton.hs:61) — an
+        // `unproven ()` single-`sorry` proof (`unproven = sorry Nothing`,
+        // Proof.hs:255-256; used by the lemma constructor at
+        // ProofSkeleton.hs:61) — an
         // annotated Sorry at the lemma's start system (the node carries
         // the start system, so it renders as plain `by sorry`).
         return Ok(crate::replay::annotated_sorry_root(sys));
@@ -608,21 +676,34 @@ pub fn prove_lemma_with_pool_and_file(
     let g = formula_to_guarded(&lemma.formula)
         .map_err(|e| ProveError::Guarded(guard_error_doc(&e, &lemma.formula)))?;
 
-    // Convert restrictions to guarded — drop any that fail conversion.
+    // Per-lemma source kind (HS `lemmaSourceKind`, Lemma.hs:38-41): RawSource
+    // for `[sources]`-tagged lemmas, RefinedSource for all others.  Stamped
+    // onto the initial system's `sSourceKind` (Prover.hs:325).
+    let lemma_source_kind = lemma_source_kind(lemma);
+
+    // Convert restrictions to guarded.  HS `mkSystem` maps
+    // `formulaToGuarded_ = either (error . render) id` (Prover.hs:324,
+    // Guarded.hs:466-467) over restriction formulas — it ABORTS on a
+    // non-guardable restriction rather than silently dropping it (a silent
+    // drop weakens the constraint set and could let an unsound proof
+    // through).  Mirror the fail-loud behaviour: propagate `ProveError`.
     let mut restrictions: Vec<Guarded> = Vec::new();
     for r in theory.restrictions() {
-        if let Ok(rg) = formula_to_guarded(&r.formula) {
-            restrictions.push(rg);
-        }
+        let rg = formula_to_guarded(&r.formula)
+            .map_err(|e| ProveError::Guarded(guard_error_doc(&e, &r.formula)))?;
+        restrictions.push(rg);
     }
 
     // `[reuse]` lemmas declared BEFORE this one are gathered separately
     // and pushed into `sLemmas` (not `sFormulas`) after building the
-    // system. Mirrors Haskell's `mkSystem` (Prover.hs:317-329):
+    // system. Mirrors Haskell's `mkSystem` (Prover.hs:317-338):
     //
     //   addLemmas
     //   . formulaToSystem restrictions ...
     //   where addLemmas sys = insertLemmas (gatherReusableLemmas ...) sys
+    //
+    // `gatherReusableLemmas` honours the source-kind bound and
+    // `pcHiddenLemmas` guards (see [`gather_reusable_lemmas`]).
     //
     // The distinction is load-bearing for induction: `formulaToSystem`
     // conjoins non-safety restrictions into `sFormulas` so they're
@@ -631,19 +712,8 @@ pub fn prove_lemma_with_pool_and_file(
     // conjoined: their IH would weaken the inductive hypothesis to a
     // disjunction across all reuse lemmas, blocking simplify from
     // resolving the IH against current trace actions.
-    let mut reuse_lemmas: Vec<Guarded> = Vec::new();
-    for prior in theory.lemmas() {
-        if prior.name == lemma_name { break; }
-        if !prior.attributes.iter().any(|a| matches!(a, crate::theory::LemmaAttr::Reuse)) {
-            continue;
-        }
-        if !matches!(prior.trace_quantifier, crate::theory::TraceQuantifier::AllTraces) {
-            continue;
-        }
-        if let Ok(rg) = formula_to_guarded(&prior.formula) {
-            reuse_lemmas.push(rg);
-        }
-    }
+    let reuse_lemmas =
+        gather_reusable_lemmas(&theory, lemma_name, lemma_source_kind)?;
 
     // Bridge our typed `theory::TraceQuantifier` back to the parser's
     // `ast::TraceQuantifier` (which `formula_to_system` consumes).
@@ -653,7 +723,7 @@ pub fn prove_lemma_with_pool_and_file(
     };
     let mut sys = formula_to_system(
         restrictions.clone(),
-        SourceKind::RawSources,
+        lemma_source_kind,
         tq,
         false,
         &g,
@@ -665,8 +735,9 @@ pub fn prove_lemma_with_pool_and_file(
     // Note: `[sources]`-tagged lemmas are NOT added to sLemmas.
     // Haskell's `gatherReusableLemmas` (Prover.hs:331) filters to
     // `[reuse]` only; `[sources]` lemmas are consumed solely by
-    // `refineWithSourceAsms` at precompute time (called below at
-    // line ~210 via ctx.full_sources).  Coverage on typing-class
+    // `refineWithSourceAsms` at precompute time (driven below by the
+    // `ctx.ensure_saturated()` call over `ctx.full_sources`).
+    // Coverage on typing-class
     // lemmas (NSLPK3, chaum, foo, okamoto) depends on the
     // architecture matching Haskell exactly — no workaround.
     sys.insert_lemmas(reuse_lemmas);
@@ -701,7 +772,8 @@ pub fn prove_lemma_with_pool_and_file(
     // `None` falls back to `SmartRanking False` in `rank_goals_with`
     // (= HS's `defaultHeuristic False`).
     // `parse_heuristic_str` returns the full list for round-robin
-    // scheduling (ProofMethod.hs:802-811) and resolves oracle paths.
+    // scheduling (HS `roundRobinHeuristic`/`useHeuristic`,
+    // ProofMethod.hs:576-595) and resolves oracle paths.
     let in_file = &theory.in_file;
     let lemma_heuristic: Option<&str> = lemma.attributes.iter().find_map(|a| match a {
         crate::theory::LemmaAttr::Heuristic(s) => Some(s.as_str()),
@@ -717,7 +789,7 @@ pub fn prove_lemma_with_pool_and_file(
         // HS `oraclePath oracle = takeDirectory inFile </> normalise relPath`
         // (System.hs:574-575, Parser.hs:304).
         // Resolve `{name}` tactic rankings against `theory.tactic`
-        // (HS `chosenTactic`, ProofMethod.hs:706-715).
+        // (HS `chosenTactic`, ProofMethod.hs:494-496).
         let mut rankings = crate::constraint::solver::goals::parse_heuristic_str_with_tactics(
             &h, in_file, &theory.tactic);
         prepend_theory_dir_to_oracle_paths(&mut rankings, in_file);
@@ -746,9 +818,12 @@ pub fn prove_lemma_with_pool_and_file(
         if !matches!(prior.trace_quantifier, crate::theory::TraceQuantifier::AllTraces) {
             continue;
         }
-        if let Ok(rg) = formula_to_guarded(&prior.formula) {
-            typing_assumptions.push(rg);
-        }
+        // HS `typAsms` (Prover.hs:142-144) uses `formulaToGuarded_`
+        // (fail-loud) on each source-lemma formula — propagate rather than
+        // silently drop.
+        let rg = formula_to_guarded(&prior.formula)
+            .map_err(|e| ProveError::Guarded(guard_error_doc(&e, &prior.formula)))?;
+        typing_assumptions.push(rg);
     }
     // HS-faithful saturation: store typing assumptions, then eagerly
     // run `ensure_saturated` (which applies `refine_with_source_asms`
@@ -960,13 +1035,16 @@ mod tests {
 
     #[test]
     fn probe_injectivity_with_pair_sig() {
-        // Last turn's `eval_formula_atoms_pass` resolved the
-        // `injectivity::injectivity_check` corpus mismatch. This pins
-        // the result so future regressions show up immediately.
+        // Probes the `injectivity::injectivity_check` corpus example.
+        // Resolves the example via a workspace-relative path computed
+        // from CARGO_MANIFEST_DIR (crate lives at
+        // rust/crates/tamarin-theory, so examples/ is three levels up);
+        // skips gracefully if the example is not present.
         let mp = match maude_path_local() { Some(p) => p, None => return };
-        let src = std::fs::read_to_string(
-            "/home/parallels/tamarin-prover/examples/features/injectivity/injectivity.spthy"
-        ).unwrap_or_default();
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../examples/features/injectivity/injectivity.spthy"
+        )).unwrap_or_default();
         if src.is_empty() { return; }
         let pt = tamarin_parser::parse_theory(&src, &[]).expect("parse");
         let h = MaudeHandle::start(&mp, pair_maude_sig()).expect("start maude");

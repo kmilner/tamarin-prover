@@ -2,9 +2,12 @@
 //!
 //! Goal: serve the existing `frontend/` (TypeScript + d3 + viz-js)
 //! and the static assets under `data/` (jQuery, CSS, images) without
-//! modifying any frontend code.  The route shape mirrors Haskell's
-//! `Web.Dispatch` exactly — same URL layout, same JSON response
-//! envelope (`{ html, title }` / `{ alert }` / `{ redirect }`).
+//! modifying any frontend code.  The route shape closely mirrors
+//! Haskell's `Web.Dispatch` — same URL layout and the same JSON
+//! response envelope (`{ html, title }` / `{ alert }` / `{ redirect }`)
+//! — with one Rust-specific addition: `/thy/trace/:idx/proof-step/*path`
+//! for the progressive UI, which has no counterpart in Haskell's route
+//! table (`Web/Types.hs`).
 //!
 //! Wiring:
 //!
@@ -122,9 +125,19 @@ async fn shutdown_signal() {
     let ctrl_c = async { let _ = tokio::signal::ctrl_c().await; };
     #[cfg(unix)]
     let term = async {
-        let mut s = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate()).expect("install terminate handler");
-        s.recv().await;
+        // Degrade gracefully if the SIGTERM handler can't be installed
+        // (e.g. resource limits): only ctrl_c drives shutdown, instead
+        // of panicking at startup.  Mirrors the non-unix branch.
+        match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate())
+        {
+            Ok(mut s) => { s.recv().await; }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not install SIGTERM handler; \
+                    only ctrl_c will trigger shutdown");
+                std::future::pending::<()>().await;
+            }
+        }
     };
     #[cfg(not(unix))]
     let term = std::future::pending::<()>();

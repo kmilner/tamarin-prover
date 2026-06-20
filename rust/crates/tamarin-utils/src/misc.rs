@@ -99,10 +99,11 @@ where
 pub fn string_sha256(s: &str) -> String {
     let digest = Sha256::digest(s.as_bytes());
     let mut out = B64.encode(digest);
-    // Haskell does `C8.init` (drop the trailing `=`) and replaces `/`→`_`, `+`→`-`.
-    if out.ends_with('=') {
-        out.pop();
-    }
+    // Haskell does `C8.init` (drop the final byte *unconditionally*) and then
+    // replaces `/`→`_`, `+`→`-`. The SHA-256 digest is always 32 bytes, so its
+    // standard base64 is always 44 chars ending in exactly one `=` (32 mod 3 ==
+    // 2 → one pad char); dropping the last byte therefore drops that `=`.
+    out.pop();
     let bytes: Vec<u8> = out
         .bytes()
         .map(|b| match b {
@@ -164,8 +165,12 @@ pub fn non_trivial_partitions<T: Clone + Eq>(xs: &[T]) -> Vec<Vec<Vec<T>>> {
     partitions(xs).into_iter().filter(|p| p != &trivial).collect()
 }
 
-/// `twoPartitions xs`: every way to split `xs` into an ordered pair of
-/// (possibly empty) lists, preserving original order within each side.
+/// `twoPartitions xs`: every way to split `xs` into an ordered pair of lists,
+/// preserving original order within each side. Mirrors Haskell `twoPartitions`,
+/// whose base case `twoPartitions [x] = [([x],[])]` forces the last element
+/// into the first list. Consequently the first list is never empty (so
+/// `([], [1,2,3])` is never produced) and there are `2^(n-1)` results, not all
+/// `2^n` ordered pairs.
 pub fn two_partitions<T: Clone>(xs: &[T]) -> Vec<(Vec<T>, Vec<T>)> {
     match xs.len() {
         0 => vec![],
@@ -352,7 +357,8 @@ mod tests {
         assert_eq!(two_partitions(&[1]), vec![(vec![1], vec![])]);
 
         let tp = two_partitions(&[1, 2, 3]);
-        // For n>=2, count is 2^(n-1) * 2 = 2^n? Let's just check coverage.
+        // There are 2^(n-1) results (the first list is never empty); here just
+        // check that each pair covers the input.
         for (a, b) in &tp {
             let mut combined: Vec<i32> = a.iter().chain(b.iter()).cloned().collect();
             combined.sort();

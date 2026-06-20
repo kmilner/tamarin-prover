@@ -3,10 +3,12 @@
 //! Emitting a one-line summary at each major solver event lets us
 //! diff two proof runs (Haskell's `tamarin-prover` vs our Rust port)
 //! side-by-side and localize where the two diverge.  Format is
-//! deliberately compact and stable; matching it against an equivalently
-//! instrumented Haskell tree (the `Theory.Constraint.Solver.Sources`
-//! and `Theory.Constraint.Solver.Goals` modules) lets the two traces be
-//! compared line-by-line.
+//! deliberately compact and stable.  The comparison relies on a
+//! SEPARATE, local Haskell instrumentation patch (mirroring this
+//! format in the `Theory.Constraint.Solver.Sources` and
+//! `Theory.Constraint.Solver.Goals` modules) which is NOT checked into
+//! this repository; apply that patch to the Haskell tree to produce a
+//! trace that lines up with this one.
 //!
 //! ## Usage
 //!
@@ -39,7 +41,8 @@
 //!
 //! Fields:
 //! - `<path>`: the current case path (see `solver::trace`).
-//! - `<step>`: monotonically-increasing per-session counter (so
+//! - `<step>`: monotonically-increasing per-process counter (never
+//!   reset; one lemma is proved per process on the probe examples, so
 //!   side-by-side line `N` of the two traces are comparable when the
 //!   first divergence is at step `N`).
 //! - `<op>`: short verb identifying the event (`expand`, `pick`,
@@ -65,8 +68,9 @@ pub fn enabled() -> bool {
     *V.get_or_init(|| std::env::var("TAM_TRACE_STATE").is_ok())
 }
 
-/// Compact one-line summary of a `System`'s shape.  Matches
-/// Haskell's tracer format exactly.
+/// Compact one-line summary of a `System`'s shape.  Mirrors the
+/// format produced by the separate (out-of-tree) Haskell
+/// instrumentation patch described in the module header.
 pub fn fingerprint(sys: &crate::constraint::system::System) -> String {
     let n = sys.nodes.len();
     let e = sys.edges.len();
@@ -81,22 +85,27 @@ pub fn fingerprint(sys: &crate::constraint::system::System) -> String {
     )
 }
 
+/// Short label for a `FactTag` as used by the tracer (`KU`, `KD`, the
+/// protocol fact name, `Fr`, `In`, `Out`, `Ded`, `Term`).
+fn fact_tag_label(tag: &crate::fact::FactTag) -> String {
+    use crate::fact::FactTag;
+    match tag {
+        FactTag::Ku => "KU".to_string(),
+        FactTag::Kd => "KD".to_string(),
+        FactTag::Proto(_, name, _) => name.clone(),
+        FactTag::Fresh => "Fr".to_string(),
+        FactTag::In => "In".to_string(),
+        FactTag::Out => "Out".to_string(),
+        FactTag::Ded => "Ded".to_string(),
+        FactTag::Term => "Term".to_string(),
+    }
+}
+
 /// Compact one-line summary of a `Goal` (or `-` when no goal).
 pub fn goal_summary(g: Option<&crate::constraint::constraints::Goal>) -> String {
     use crate::constraint::constraints::Goal;
-    use crate::fact::FactTag;
     let tag_label = |fa: &crate::fact::LNFact, prefix: &str| -> String {
-        let label = match &fa.tag {
-            FactTag::Ku => "KU".to_string(),
-            FactTag::Kd => "KD".to_string(),
-            FactTag::Proto(_, name, _) => name.clone(),
-            FactTag::Fresh => "Fr".to_string(),
-            FactTag::In => "In".to_string(),
-            FactTag::Out => "Out".to_string(),
-            FactTag::Ded => "Ded".to_string(),
-            FactTag::Term => "Term".to_string(),
-        };
-        format!("{}{}({})", prefix, label, terms_summary(&fa.terms))
+        format!("{}{}({})", prefix, fact_tag_label(&fa.tag), terms_summary(&fa.terms))
     };
     match g {
         None => "-".into(),
@@ -121,8 +130,8 @@ fn terms_summary(ts: &[tamarin_term::lterm::LNTerm]) -> String {
 }
 
 /// Compact summary of a single term.  Preserves the head symbol,
-/// abbreviates vars to their name (sort 1-char + idx is dropped
-/// for compactness), shows `<...>` for pair sub-trees.
+/// abbreviates vars to `name:sort:idx` (sort as a 1-char code),
+/// shows `<...>` for pair sub-trees.
 pub fn term_summary(t: &tamarin_term::lterm::LNTerm) -> String {
     use tamarin_term::lterm::LSort;
     use tamarin_term::term::Term;
@@ -137,14 +146,10 @@ pub fn term_summary(t: &tamarin_term::lterm::LNTerm) -> String {
                 LSort::Nat => 'N',
                 LSort::Node => 'I',
             };
-            // Include idx for witness vars so we can debug
-            // sort-conflation issues — comparing identical-looking
-            // names with different idxs.
-            if v.name == "x" {
-                format!("{}:{}:{}", v.name, sort_ch, v.idx)
-            } else {
-                format!("{}:{}", v.name, sort_ch)
-            }
+            // Include the idx for every var so the trace is uniform
+            // and diffable — this disambiguates identical-looking
+            // names that differ only by idx (sort-conflation debugging).
+            format!("{}:{}:{}", v.name, sort_ch, v.idx)
         }
         Term::Lit(Lit::Con(c)) => format!("'{}'", c.id.0),
         Term::App(FunSym::NoEq(noeq), args) => {
@@ -212,17 +217,7 @@ fn dump_sys(sys: &crate::constraint::system::System) {
 }
 
 fn state_trace_fact_brief(fa: &crate::fact::LNFact) -> String {
-    use crate::fact::FactTag;
-    let label = match &fa.tag {
-        FactTag::Ku => "KU".to_string(),
-        FactTag::Kd => "KD".to_string(),
-        FactTag::Proto(_, name, _) => name.clone(),
-        FactTag::Fresh => "Fr".to_string(),
-        FactTag::In => "In".to_string(),
-        FactTag::Out => "Out".to_string(),
-        FactTag::Ded => "Ded".to_string(),
-        FactTag::Term => "Term".to_string(),
-    };
+    let label = fact_tag_label(&fa.tag);
     let args: Vec<String> = fa.terms.iter().map(term_summary).collect();
     format!("{}({})", label, args.join(","))
 }
@@ -249,10 +244,4 @@ pub fn emit_case(op: &str, case_name: &str,
     eprintln!("[STATE path={} step={} op={} case={} goal={} {}]",
         path, s, op, case_name, goal_summary(goal), fingerprint(sys));
     dump_sys(sys);
-}
-
-/// Reset the step counter (for a fresh session).  Called at the
-/// start of `prove_lemma`.
-pub fn reset() {
-    STEP.store(0, Ordering::SeqCst);
 }

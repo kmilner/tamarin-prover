@@ -50,8 +50,10 @@ pub enum ProofMethod {
     /// Display-only: `solve( <raw_inner> )`.  Used for HS-faithful
     /// unannotated subtree display (replay.rs `parsed_to_unannotated`)
     /// where we have the original skeleton text but no live Goal object.
-    /// HS `noSystemPrf` (Proof.hs:469) carries the original ProofMethod
-    /// verbatim; RS uses raw inner text as the closest equivalent.
+    /// HS `noSystemPrf` (Proof.hs:467) clears the per-node system info
+    /// (`mapProofInfo (\i -> (Just i, Nothing))`); the ProofMethod itself
+    /// is preserved by the proof-tree node, not by `noSystemPrf`.  RS uses
+    /// raw inner text as the closest equivalent.
     RawSolve(String),
 }
 
@@ -160,16 +162,10 @@ pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
     let cs = contradictions(ctx, sys);
     if let Some(c) = cs.into_iter().next() {
         // Mirror Haskell `contradictorySystem`: any contradiction
-        // closes the branch.  Previous Cyclic/FormulasFalse→Unfinishable
-        // routing for conflation patterns has been removed — it was
-        // not Haskell-faithful.  See `project_rust_search_completeness_gaps.md`
-        // for the underlying search-completeness bugs that those
-        // workarounds were masking.
-        let _ = ctx;
-        // Haskell's `isFinished` (ProofMethod.hs:505) does not gate
-        // Contradictory on incomplete-source consumption.  Source's
-        // `incomplete` flag only affects diagnostic warnings, not
-        // search verdict.  Removed the Unfinishable downgrade to match.
+        // closes the branch as `Contradictory`.  Haskell's `isFinished`
+        // (ProofMethod.hs:505) does not gate this on incomplete-source
+        // consumption — `Source.incomplete` only affects diagnostic
+        // warnings, not the search verdict.
         return Some(Result::Contradictory(Some(c)));
     }
     if dbg_impl_enabled() {
@@ -186,18 +182,14 @@ pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
                 sys.formulas.len(), has_bot, sys.nodes.len());
         }
     }
-    // Mirror Haskell `isFinished`:
+    // Direct port of Haskell `isFinished` (ProofMethod.hs:505):
     //   | null ogs && stFinished     = Just Solved
     //   | null ogs && not stFinished = Just Unfinishable
     //   | otherwise                  = Nothing
     // where `ogs = openGoals sys` — the FILTERED list (with the
     // auto-solve KU heuristic applied), not just the unsolved-status
-    // count.  Our `open_goals` does the same filtering, so we should
-    // check IT for emptiness rather than the status flags.
-    // Direct port of Haskell `isFinished` (ProofMethod.hs:505):
-    //   | null ogs && stFinished     = Just Solved
-    //   | null ogs && not stFinished = Just Unfinishable
-    //   | otherwise                  = Nothing
+    // count.  Our `open_goals` does the same filtering, so we check IT
+    // for emptiness rather than the status flags.
     // (gfalse is caught as a FormulasFalse contradiction above, so we
     // don't need an explicit `no_false_formula` guard here.)
     use crate::constraint::solver::goals::open_goals;
@@ -326,19 +318,15 @@ fn is_initial_system(sys: &System) -> bool {
 /// top symbol, the proof cannot finish (further rewriting could
 /// reduce it).
 fn finished_subterms(ctx: &ProofContext, sys: &System) -> bool {
-    use tamarin_term::function_symbols::FunSym;
     use tamarin_term::term::Term;
     let msig = ctx.maude.maude_sig();
     let top_is_not_reducible = |t: &tamarin_term::lterm::LNTerm| -> bool {
         match t {
-            Term::App(f, _) => !msig.reducible_fun_syms.iter().any(|r| match (r, f) {
-                (FunSym::NoEq(rs), FunSym::NoEq(fs)) => rs.name == fs.name,
-                (FunSym::Ac(ra), FunSym::Ac(fa)) =>
-                    std::mem::discriminant(ra) == std::mem::discriminant(fa),
-                (FunSym::C(rc), FunSym::C(fc)) =>
-                    std::mem::discriminant(rc) == std::mem::discriminant(fc),
-                _ => false,
-            }),
+            // HS `topIsNotReducible (FApp f _) = f \`S.notMember\` reducible`
+            // (SubtermStore.hs:134-135).  `reducible_fun_syms` is a
+            // `FunSig = BTreeSet<FunSym>`, so `contains` does the exact
+            // structural `FunSym` equality test in O(log n).
+            Term::App(f, _) => !msig.reducible_fun_syms.contains(f),
             // Variables and constants are never reducible at the top.
             _ => true,
         }
@@ -367,7 +355,7 @@ pub fn exec_proof_method(
     method: &ProofMethod,
     sys: &System,
 ) -> Option<Vec<(CaseName, System)>> {
-    use crate::constraint::solver::reduction::{ChangeIndicator, GoalCases, Reduction};
+    use crate::constraint::solver::reduction::{GoalCases, Reduction};
     use crate::constraint::solver::simplify::simplify_system;
 
     // Deadline short-circuit (entry-guard).  Without this, a single
@@ -386,7 +374,7 @@ pub fn exec_proof_method(
         return None;
     }
 
-    // HS-faithful per-step Maude counter reset (ProofMethod.hs:443):
+    // HS-faithful per-step Maude counter reset (ProofMethod.hs:306):
     //   `runReduction (m <* simplifySystem) ctxt sys (avoid sys)`
     // The FreshT counter starts at `avoid sys + 1` for EVERY proof step.
     // Without this, Rust's Maude counter advances monotonically across all
@@ -437,16 +425,15 @@ pub fn exec_proof_method(
             let case_systems: Vec<System> =
                 if disable_simplify_fanout() {
                     let mut r = Reduction::new(ctx, sys.clone());
-                    r.changed = ChangeIndicator::Unchanged;
                     simplify_system(&mut r);
                     vec![r.sys]
                 } else {
                     crate::constraint::solver::simplify::simplify_system_with_fanout(ctx, sys.clone())
                 };
-            // HS-faithful `cleanup` (ProofMethod.hs:453-454): EVERY
+            // HS-faithful `cleanup` (ProofMethod.hs:310-311): EVERY
             // proof method's cases pass through `map (fmap cleanup .
-            // fst)` (ProofMethod.hs:442), and `Simplify` goes through
-            // `process` (ProofMethod.hs:405-406) — so its output is
+            // fst)` (ProofMethod.hs:305), and `Simplify` goes through
+            // `process` (ProofMethod.hs:302-308) — so its output is
             // ALSO cleaned.
             let cleanup = |s: &System| -> System {
                 let mut s2 = s.clone();
@@ -467,9 +454,9 @@ pub fn exec_proof_method(
                 .map(|s| cleanup(&s))
                 .collect();
             // HS-faithful `removeRedundantCases ctxt [] snd`
-            // (ProofMethod.hs:455): `process`/`processLabeled` apply it to
+            // (ProofMethod.hs:304): `process` applies it to
             // EVERY proof method's Disj fan-out, including `Simplify`
-            // (which uses `process (return "")`, ProofMethod.hs:420).
+            // (which uses `process (return "")`, ProofMethod.hs:290).
             // RS previously applied it only in the `SolveGoal` arm.  When
             // `simplifySystem`'s `solveUniqueActions` fans out an action
             // whose AC-multiset unification yields several unifiers that
@@ -498,14 +485,14 @@ pub fn exec_proof_method(
             if cleaned.is_empty() { return None; }
             let cleaned_input = cleanup(sys);
             if cleaned.len() == 1 {
-                // Single-case path: HS's `Simplify` arm (ProofMethod.hs:419-424)
+                // Single-case path: HS's `Simplify` arm (ProofMethod.hs:289-297)
                 // checks whether the simplified system equals the cleaned
                 // input — if so, the method "failed" and we return None.
                 // Multi-case fan-out trivially can't satisfy that condition.
                 if cleaned[0] == cleaned_input { return None; }
                 return Some(vec![("".to_string(), cleaned.into_iter().next().unwrap())]);
             }
-            // HS-faithful naming: `distinguish n` (ProofMethod.hs:527-532)
+            // HS-faithful naming: `distinguish n` (ProofMethod.hs:335-340)
             // with empty case name renders as `show i` ("1", "2", "3", ...)
             // with NO `_case_` prefix and NO zero-padding (the `pad`
             // call only runs in the else branch when the prefix is
@@ -600,7 +587,7 @@ pub fn exec_proof_method(
             }
             // Run simplify after every goal-solving step — mirrors
             // Haskell's `m <* simplifySystem` pattern in `process`
-            // (ProofMethod.hs:299-308).  Filter out cases that simplify
+            // (ProofMethod.hs:302-308).  Filter out cases that simplify
             // to a contradictory system — Haskell's Disj-monad does the
             // same via `mzero` on `contradictoryIf`, so contradictory
             // cases never make it into the children map.  This keeps
@@ -640,7 +627,7 @@ pub fn exec_proof_method(
                         t0.elapsed(), raw_systems.len());
                 }
                 // Cleanup each surviving system per HS
-                // `cleanup` (ProofMethod.hs:443-444):
+                // `cleanup` (ProofMethod.hs:310-311):
                 //   cleanup s = L.set sSubst emptySubst
                 //                       (renamePrecise s)
                 let mut out: Vec<System> = Vec::with_capacity(raw_systems.len());
@@ -835,7 +822,7 @@ pub fn exec_proof_method(
                                 dup_count, dup_names, seen_systems.len());
                         }
                         // HS-faithful `removeRedundantCases ctxt [] snd`
-                        // (ProofMethod.hs:455).  Gated on BP/MSet per HS
+                        // (ProofMethod.hs:304).  Gated on BP/MSet per HS
                         // short-circuit.  Empty stable_vars (HS passes `[]`).
                         // No-op outside BP/MSet by `remove_redundant_cases`'s
                         // own guard.
@@ -861,7 +848,7 @@ pub fn exec_proof_method(
                         let key = if total > 1 {
                             let n = seen.entry(name.clone()).or_default();
                             *n += 1;
-                            // HS-faithful zero-padding: ProofMethod.hs:485-490
+                            // HS-faithful zero-padding: ProofMethod.hs:335-340
                             //   distinguish n =
                             //     [ (\(x,y) -> (... x ++ "_case_" ++ pad (show i), y))
                             //     | i <- [(1::Int)..] ]
@@ -893,7 +880,7 @@ pub fn exec_proof_method(
                 Ok(p) => p,
                 Err(_) => return None,
             };
-            // HS-faithful: mirror Haskell's `induction` (ProofMethod.hs:521-525):
+            // HS-faithful: mirror Haskell's `induction` (ProofMethod.hs:329-333):
             //   induction (baseCase, stepCase) = do
             //     (caseName, caseFormula) <- disjunctionOfList
             //         [("empty_trace", baseCase), ("non_empty_trace", stepCase)]
@@ -927,10 +914,10 @@ pub fn exec_proof_method(
             let mut sr = Reduction::new(ctx, step_sys);
             simplify_system(&mut sr);
 
-            // HS-faithful `cleanup` (ProofMethod.hs:453-468): induction is
+            // HS-faithful `cleanup` (ProofMethod.hs:310-311): induction is
             //   `Induction -> process . induction <$> getInductionCases sys`
-            // (ProofMethod.hs:428), and `process`/`processLabeled` apply
-            //   `map (fmap cleanup . fst)` (ProofMethod.hs:456) where
+            // (ProofMethod.hs:298), and `process` applies
+            //   `map (fmap cleanup . fst)` (ProofMethod.hs:305) where
             //   cleanup s = L.set sSubst emptySubst
             //                 (Precise.evalFresh (renamePrecise s) nothingUsed)
             // So EVERY surviving induction case is renamePrecise'd with an
@@ -978,8 +965,14 @@ pub fn check_and_exec_proof_method(
             if !same_kind(r, &actual) { return None; }
         }
         ProofMethod::Induction => {
-            if !is_initial_system(sys) { return None; }
+            // Direct port of Haskell `canApplyInduction` (ProofMethod.hs:264-270):
+            //   guard (M.null sNodes); guard (S.null sSolvedFormulas);
+            //   guard (M.null sGoals); (_, t) <- uncons sFormulas; guard (null t)
+            // i.e. no nodes, no solved formulas, no open goals, exactly one
+            // formula.  No gfalse check (do NOT call is_initial_system here).
+            if !sys.nodes.is_empty() { return None; }
             if !sys.solved_formulas.is_empty() { return None; }
+            if !sys.goals.is_empty() { return None; }
             if sys.formulas.len() != 1 { return None; }
         }
         ProofMethod::SolveGoal(g) => {

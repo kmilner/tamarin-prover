@@ -162,16 +162,16 @@ pub fn find_connected_components<'a>(
     nodes: &'a [&'a GNode],
     edges: &[GEdge],
 ) -> Vec<Vec<&'a GNode>> {
-    // Build undirected adjacency.
+    // Build undirected adjacency.  Mirror of `expandCluster`, which walks
+    // ONLY `SystemEdge`s for connectivity — `LessEdge`/`UnsolvedChain`
+    // edges are not matched and so never join two nodes into one component.
     let mut adj: BTreeMap<NodeId, BTreeSet<NodeId>> = BTreeMap::new();
     for e in edges {
-        let (a, b) = match e {
-            GEdge::System(s, t) | GEdge::UnsolvedChain(s, t) =>
-                (s.0.clone(), t.0.clone()),
-            GEdge::Less(la) => (la.smaller.clone(), la.larger.clone()),
-        };
-        adj.entry(a.clone()).or_default().insert(b.clone());
-        adj.entry(b).or_default().insert(a);
+        if let GEdge::System(s, t) = e {
+            let (a, b) = (s.0.clone(), t.0.clone());
+            adj.entry(a.clone()).or_default().insert(b.clone());
+            adj.entry(b).or_default().insert(a);
+        }
     }
     let mut visited: BTreeSet<NodeId> = BTreeSet::new();
     let mut components: Vec<Vec<&'a GNode>> = Vec::new();
@@ -197,6 +197,11 @@ pub fn find_connected_components<'a>(
             .collect();
         if !comp.is_empty() { components.push(comp); }
     }
+    // Haskell `go (n:ns) components = go remainingNodes (component : components)`
+    // PREPENDS each newly-discovered component, so the returned list is in
+    // reverse-discovery order.  We discover in the same node order but append,
+    // so reverse here to match before downstream `zipWith [1..]` numbering.
+    components.reverse();
     components
 }
 
@@ -329,23 +334,9 @@ pub fn compute_basic_graph_repr(sys: &System) -> GraphRepr {
             seen_ids.insert(e.tgt.0.clone());
         }
     }
-    // Missing endpoints from less atoms.
-    for la in &sys.less_atoms {
-        if !seen_ids.contains(&la.smaller) {
-            nodes.push(GNode {
-                id: la.smaller.clone(),
-                ty: NodeType::Missing(MissingHint::Prem(PremIdx(0))),
-            });
-            seen_ids.insert(la.smaller.clone());
-        }
-        if !seen_ids.contains(&la.larger) {
-            nodes.push(GNode {
-                id: la.larger.clone(),
-                ty: NodeType::Missing(MissingHint::Prem(PremIdx(0))),
-            });
-            seen_ids.insert(la.larger.clone());
-        }
-    }
+    // NOTE: Haskell `systemMissingNodes` derives missing nodes ONLY from
+    // `sEdges` (`mapMaybe missingNode (S.toList $ get sEdges se)`); it never
+    // inspects `sLessAtoms`.  Less-atoms contribute edges (below), not nodes.
     // 5. Edges.
     let mut edges: Vec<GEdge> = Vec::new();
     for e in &sys.edges {

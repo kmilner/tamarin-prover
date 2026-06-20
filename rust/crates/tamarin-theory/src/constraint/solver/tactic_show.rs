@@ -12,12 +12,14 @@
 //!   - `show LVar`  : `sortPrefix s ++ body`  (LTerm.hs:526-533)
 //!   - `show Name`  : `~'n'` / `'n'` / `#'n'` / `%'n'` (LTerm.hs:231-235)
 //!   - `show (Term a)` (raw form, Term/Raw.hs:219-227):
-//!       Lit l                -> show l
-//!       FApp (NoEq (s,_)) [] -> s
-//!       FApp (NoEq (s,_)) as -> s ++ "(" ++ intercalate "," (map show as) ++ ")"
-//!       FApp (C EMap)     as -> "em" ++ "(" ++ ... ++ ")"
-//!       FApp List         as -> "LIST" ++ "(" ++ ... ++ ")"
-//!       FApp (AC o)       as -> show o ++ "(" ++ ... ++ ")"
+//!     ```text
+//!     Lit l                -> show l
+//!     FApp (NoEq (s,_)) [] -> s
+//!     FApp (NoEq (s,_)) as -> s ++ "(" ++ intercalate "," (map show as) ++ ")"
+//!     FApp (C EMap)     as -> "em" ++ "(" ++ ... ++ ")"
+//!     FApp List         as -> "LIST" ++ "(" ++ ... ++ ")"
+//!     FApp (AC o)       as -> show o ++ "(" ++ ... ++ ")"
+//!     ```
 //!     where `show o` is the AC constructor name (Union/Mult/Xor/NatPlus).
 //!   - `show (BVar v)` (derived, LTerm.hs:452-454): `Bound i` / `Free <show v>`.
 //!
@@ -112,7 +114,7 @@ fn write_gterm(t: &GTerm, out: &mut String) {
         GTerm::App(name, args) => write_app(name, args.iter(), out),
         // `op{a}b` == `op(a,b)` — a NoEq application.
         GTerm::AlgApp(name, a, b) => {
-            write_app(name, [a.as_ref(), b.as_ref()].into_iter(), out)
+            write_app(name, [a.as_ref(), b.as_ref()], out)
         }
         // `<a,b,c>` is binary-nested `pair(a, pair(b,c))` in HS Term.
         GTerm::Pair(items) => write_pair(items, out),

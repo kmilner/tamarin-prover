@@ -25,10 +25,12 @@
 //!
 //! HS recurses through the static skeleton tree; at each Sorry leaf
 //! that carries a `Just se` annotation (System state), the auto-prover
-//! `prover0` is invoked.  Non-sorry nodes have their `ProofMethod`
-//! executed via `oneStepProver` (Proof.hs:583-587) which calls
-//! `execProofMethod ctxt method se`, then recurses into the
-//! resulting case-map.
+//! `prover0` is invoked.  `replaceSorryProver` itself does NOT re-exec
+//! non-sorry nodes — `replace (LNode ps cases) = LNode ps $ M.map
+//! replace cases` keeps each node's stored `ProofStep` and only
+//! recurses into the already-built case-map.  The `ProofMethod`s were
+//! executed earlier, when the annotated tree was first constructed
+//! (`oneStepProver` / `checkProof`'s `execProofMethod ctxt method se`).
 //!
 //! ## Replay strategy in this port
 //!
@@ -106,6 +108,25 @@ fn annotated_sorry(reason: Option<String>, sys: System) -> ProofNode {
         method: ProofMethod::Sorry(reason),
         sys,
         children: BTreeMap::new(),
+        status: NodeStatus::Sorry,
+        annotated: true,
+    }
+}
+
+/// Build the HS check-and-extend "invalid proof step" node.  When
+/// `checkProof` finds an invalid step it emits
+/// `sorryNode (Just "invalid proof step encountered") (M.singleton "" prf)`
+/// where `prf` is the original subtree passed through `noSystemPrf`
+/// (→ unannotated).  Mirrors that: a `Sorry` whose single `""` child is
+/// `parsed_to_unannotated(node, sys)`.
+fn invalid_step_node(node: &ParsedProofTree, sys: System) -> ProofNode {
+    let child = parsed_to_unannotated(node, sys.clone());
+    let mut children = BTreeMap::new();
+    children.insert("".to_string(), child);
+    ProofNode {
+        method: ProofMethod::Sorry(Some("invalid proof step encountered".into())),
+        sys,
+        children,
         status: NodeStatus::Sorry,
         annotated: true,
     }
@@ -232,16 +253,7 @@ fn replay_node(
         //   `sorryNode (Just "invalid proof step encountered") (M.singleton "" prf)`
         // where `prf` is the current leaf, `noSystemPrf`'d → unannotated.
         if !auto_prove {
-            let child = parsed_to_unannotated(node, sys.clone());
-            let mut children = BTreeMap::new();
-            children.insert("".to_string(), child);
-            return ProofNode {
-                method: ProofMethod::Sorry(Some("invalid proof step encountered".into())),
-                sys,
-                children,
-                status: NodeStatus::Sorry,
-                annotated: true,
-            };
+            return invalid_step_node(node, sys);
         }
         return run_proof_search(ctx, sys, max_steps);
     }
@@ -262,16 +274,7 @@ fn replay_node(
             };
         }
         if !auto_prove {
-            let child = parsed_to_unannotated(node, sys.clone());
-            let mut children = BTreeMap::new();
-            children.insert("".to_string(), child);
-            return ProofNode {
-                method: ProofMethod::Sorry(Some("invalid proof step encountered".into())),
-                sys,
-                children,
-                status: NodeStatus::Sorry,
-                annotated: true,
-            };
+            return invalid_step_node(node, sys);
         }
         return run_proof_search(ctx, sys, max_steps);
     }
@@ -289,16 +292,7 @@ fn replay_node(
             };
         }
         if !auto_prove {
-            let child = parsed_to_unannotated(node, sys.clone());
-            let mut children = BTreeMap::new();
-            children.insert("".to_string(), child);
-            return ProofNode {
-                method: ProofMethod::Sorry(Some("invalid proof step encountered".into())),
-                sys,
-                children,
-                status: NodeStatus::Sorry,
-                annotated: true,
-            };
+            return invalid_step_node(node, sys);
         }
         return run_proof_search(ctx, sys, max_steps);
     }
@@ -323,16 +317,7 @@ fn replay_node(
             // this by creating a sorry with one child "" → the original
             // ParsedProofTree converted to unannotated ProofNodes.
             if !auto_prove {
-                let child = parsed_to_unannotated(node, sys.clone());
-                let mut children = BTreeMap::new();
-                children.insert("".to_string(), child);
-                return ProofNode {
-                    method: ProofMethod::Sorry(Some("invalid proof step encountered".into())),
-                    sys,
-                    children,
-                    status: NodeStatus::Sorry,
-                    annotated: true,
-                };
+                return invalid_step_node(node, sys);
             }
             return run_proof_search(ctx, sys, max_steps);
         }
@@ -343,7 +328,7 @@ fn replay_node(
     // contradictory closure), this is a leaf-equivalent.
     if cases.is_empty() {
         // Empty case-map after exec means contradictory closure —
-        // mirror the regular search-path handling at search.rs:478-481.
+        // mirror the regular search-path handling at search.rs:580-593.
         return ProofNode {
             method,
             sys,
@@ -373,8 +358,9 @@ fn replay_node(
         if push_path {
             crate::constraint::solver::trace::case_path_push(skel_name);
         }
-        // Wrap the body in a function so we can ensure pop() on every
-        // exit path.  Original body below, just indented one level.
+        // `case_path_pop()` is called manually on every exit path of
+        // this loop body (the early-continue at the no-match branch and
+        // the normal tail below) to balance the push above.
         // Find the matching runtime case.  Two common shapes:
         //   - Skel case is "" (no name; from Simplify or single-case
         //     SolveGoal) → matches the single produced case.
@@ -395,37 +381,23 @@ fn replay_node(
         let child_sys = match &runtime_name_opt {
             Some(n) => produced.get(n).cloned().unwrap(),
             None => {
-                // No matching runtime case — the skeleton drifted from
-                // the actual decomposition.  Fall back to auto-prover
-                // for this subtree, but use a synthetic "skeleton
-                // mismatch" Sorry leaf seeded with the parent system
-                // so the user gets a visible signal.  Honest
-                // divergence reporting; not a paper-over.
-                let placeholder = if auto_prove {
-                    ProofNode {
-                        method: ProofMethod::Sorry(Some(format!(
-                            "skeleton case `{}` not produced at replay",
-                            skel_name
-                        ))),
-                        sys: sys.clone(),
-                        children: BTreeMap::new(),
-                        status: NodeStatus::Sorry,
-                        annotated: true,
-                    }
-                } else {
-                    // HS check-and-extend, `mergeMapsWith` rightOnly branch
-                    // (Proof.hs): a case present in the stored skeleton
-                    // but NOT produced by re-executing the method is mapped
-                    // through `noSystemPrf` (Proof.hs) =
-                    // `mapProofInfo (\i -> (Just i, Nothing))`, applied to
-                    // the WHOLE skeleton subtree.  After `mapProofInfo snd`
-                    // (checkAndExtendProver, Proof.hs) the info is
-                    // `Nothing` for every node, so the entire subtree
-                    // renders unannotated (`/* unannotated */`).  Mirror
-                    // this with `parsed_to_unannotated`, NOT a single
-                    // annotated sorry leaf.
-                    parsed_to_unannotated(sub_tree, sys.clone())
-                };
+                // No matching runtime case — the stored skeleton drifted
+                // from the current decomposition (a case present in the
+                // skeleton but NOT produced by re-executing the method).
+                // HS `checkAndExtendProver` (Proof.hs) handles this the
+                // SAME WAY regardless of whether sorry-leaves get extended:
+                // `mergeMapsWith` maps the stored-only case through
+                // `noSystemPrf` (= `mapProofInfo (\i -> (Just i, Nothing))`)
+                // over the WHOLE subtree; after `mapProofInfo snd` the info
+                // is `Nothing` everywhere, so the entire subtree is kept
+                // VERBATIM and renders unannotated (`/* unannotated */`).
+                // The auto-prover never runs on it (no system attached), so
+                // this is independent of `auto_prove` — both the target
+                // lemma (extend sorries) and check-only replay keep drifted
+                // cases verbatim.  (Previously the `auto_prove` path emitted
+                // a synthetic `skeleton case not produced` sorry, which
+                // diverged from HS on stale stored proofs, e.g. KCL07.)
+                let placeholder = parsed_to_unannotated(sub_tree, sys.clone());
                 children.insert(skel_name.clone(), placeholder);
                 any_sorry = true;
                 if push_path {
@@ -654,8 +626,8 @@ fn cases_compatible(produced: &[(String, System)], skel: &[&str]) -> bool {
 }
 
 fn sort_cases(mut cases: Vec<(String, System)>) -> Vec<(String, System)> {
-    // Mirror search.rs:507-508: cases are visited in alphabetical
-    // order so name-based skeleton matching is deterministic.
+    // Mirror search.rs:621 (block at 610-619): cases are visited in
+    // alphabetical order so name-based skeleton matching is deterministic.
     cases.sort_by(|a, b| a.0.cmp(&b.0));
     cases
 }
@@ -687,7 +659,7 @@ fn resolve_method(parsed: &ParsedMethod, sys: &System) -> Option<ProofMethod> {
 }
 
 /// Exact-match a stored-proof fact's argument terms against a runtime
-/// [`LNFact`]'s terms — HS's `M.member` semantics (ProofMethod.hs:374
+/// [`LNFact`]'s terms — HS's `M.member` semantics (ProofMethod.hs:259
 /// `guard (goal `M.member` L.get sGoals sys)`).
 ///
 /// HS parses the stored `solve(...)` goal into a full `Goal` carrying
@@ -707,12 +679,12 @@ fn resolve_method(parsed: &ParsedMethod, sys: &System) -> Option<ProofMethod> {
 /// form are equal iff HS's `M.member` would treat the goals as equal, so a
 /// plain `==` is the faithful test.
 ///
-/// This REPLACES the previous sort-aware alpha-equivalence matcher, which
-/// accepted goals HS would reject — a renamed/drifted var set passed (too
-/// loose), letting a structurally-distinct same-shape goal bind and
-/// re-derive a divergent subtree.  Exact `==` mirrors HS: a valid replay
-/// step's goal is byte-for-byte the runtime goal (RS reproduces HS's reset
-/// indices), and any divergence is correctly rejected.
+/// Exact `==` mirrors HS: a valid replay step's goal is byte-for-byte the
+/// runtime goal (RS reproduces HS's reset indices), so any divergence is
+/// correctly rejected.  A looser sort-aware alpha-equivalence test would
+/// be wrong here — it accepts goals HS rejects, letting a
+/// structurally-distinct same-shape goal bind and re-derive a divergent
+/// subtree.
 fn fact_terms_match_exact(
     parsed_args: &[tamarin_parser::ast::Term],
     runtime_terms: &[tamarin_term::lterm::LNTerm],
@@ -786,7 +758,7 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
             //
             // HS-faithful: HS's parsed `ActionG i fa` carries the
             // timepoint LVar `i` and matches by structural equality
-            // (HS ProofMethod.hs:374 `goal `M.member` sGoals`).  RS's
+            // (HS ProofMethod.hs:259 `goal `M.member` sGoals`).  RS's
             // skeleton-text parser captures only the time-var ROOT
             // name (e.g. `i` from `#i.3`) — LVar idxs in the skeleton
             // and runtime differ because HS pretty-prints idxs after a
@@ -825,7 +797,7 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
                 return None;
             }
             // Narrow to candidates whose TERMS are EXACTLY EQUAL to the
-            // stored goal (HS `M.member`, ProofMethod.hs:374 — see
+            // stored goal (HS `M.member`, ProofMethod.hs:259 — see
             // `fact_terms_match_exact`).  When the stored goal's term is
             // absent from the drifted system, HS returns `Nothing` and
             // marks the step invalid (Proof.hs:455-468).  A name+arity
@@ -956,7 +928,7 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
             // `DisjG (Disj [GuardedFormula])` value via
             // `disjSplitGoal` (Theory/Text/Parser/Proof.hs:61), then
             // dispatches `SolveGoal goal` against `sys.goals` (HS
-            // ProofMethod.hs:374: `guard (goal \`M.member\` sGoals)`).
+            // ProofMethod.hs:259: `guard (goal \`M.member\` sGoals)`).
             //
             // Our skeleton parser only captures each alt's structural
             // SIGNATURE (top-level shape — see `DisjAlt`).  We pick
@@ -1044,7 +1016,7 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
             // HS dispatch: `solve( (#i, n) ~~> (#j, m) )` parses to
             // `ChainG (i, ConcIdx n) (j, PremIdx m)` (Proof.hs:59) and
             // matches by structural equality against an open
-            // `Goal::Chain(...)` in `sys.goals` (HS ProofMethod.hs:374:
+            // `Goal::Chain(...)` in `sys.goals` (HS ProofMethod.hs:259:
             // `goal `M.member` sGoals`).  HS's open chain-goal carries
             // concrete LVar identities — same skeleton-vs-runtime LVar
             // suffix-idx mismatch as Action/Premise.  We match by var
@@ -1080,7 +1052,7 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
         GoalSpec::Subterm { small_raw, big_raw } => {
             // HS `stSplitGoal` (Proof.hs:63-66) parses to
             // `SubtermG (small, big)` over LNTerm and dispatches via
-            // structural Map lookup in `sys.goals` (HS ProofMethod.hs:374).
+            // structural Map lookup in `sys.goals` (HS ProofMethod.hs:259).
             // We compare by canonical pretty-printed text — see HS
             // `prettyGoal (SubtermG (l,r))` at Constraints.hs:281-282
             // which prints `prettyLNTerm l ⊏ prettyLNTerm r`.  Pretty
@@ -1264,7 +1236,7 @@ fn name_matches(tag: &FactTag, want: &str) -> bool {
 }
 
 fn tag_persistent(tag: &FactTag) -> bool {
-    // `KU`/`KD` knowledge facts are persistent (Fact.hs:155;
+    // `KU`/`KD` knowledge facts are persistent (Fact.hs:353-357;
     // `factTagMultiplicity` → Persistent), and the skeleton pretty-prints
     // them with the `!` prefix (e.g. `solve( !KU( ~n ) @ #vk )`), so the
     // parsed spec's `persistent` flag is `true` and must match here.
@@ -1346,8 +1318,8 @@ mod tests {
 
     /// A `by contradiction` leaf on a system with no contradictions
     /// must NOT silently emit Finished(Contradictory).  Per the
-    /// post-`bfb0207b` walker contract (replay.rs:108-122), when the
-    /// runtime doesn't agree with the skeleton's `by contradiction`
+    /// walker contract (the contradiction-leaf branch, replay.rs:213-247),
+    /// when the runtime doesn't agree with the skeleton's `by contradiction`
     /// claim, the walker falls back to `run_proof_search` — the
     /// auto-prover then finds whatever the system actually proves
     /// (or emits Sorry honestly).  Crucially, the walker must NOT
@@ -1356,7 +1328,7 @@ mod tests {
     /// On an empty system (no goals, no contradictions) the auto-prover
     /// recognises the system as trivially Solved.  The key assertion
     /// is `status != Contradictory` — the original Sorry-emit was
-    /// replaced by auto-prove fallback in `bfb0207b`.
+    /// later replaced by the auto-prove fallback.
     #[test]
     fn contradiction_leaf_without_contradiction_falls_back_to_auto() {
         let h = match maude() { Some(m) => m, None => return };
@@ -1370,7 +1342,7 @@ mod tests {
         };
         let result = replace_sorry_prove(&ctx, sys, &skel, 50);
         // No goals, no contradictions → auto-prover recognises Solved.
-        // The pre-`bfb0207b` behaviour emitted Sorry; the new contract
+        // The earlier behaviour emitted Sorry; the current contract
         // is "fall back to auto-prover, never fabricate Contradictory".
         assert_ne!(result.status, NodeStatus::Contradictory,
             "walker must NOT fabricate Contradictory when runtime disagrees");
@@ -1432,9 +1404,8 @@ mod tests {
     ///
     /// HS reference: `ActionG i fa` carries the exact timepoint LVar
     /// `i`; HS dispatches via M.member on the structural goal
-    /// (ProofMethod.hs:374), so picking the wrong goal here is the
-    /// same divergence pattern that motivated the Disj matcher fix
-    /// (commit b49ef0a2).
+    /// (ProofMethod.hs:259), so picking the wrong goal here is the
+    /// same divergence pattern that motivated the Disj matcher fix.
     #[test]
     fn match_action_disambiguates_by_time_var_root() {
         use crate::fact::{Fact, FactTag, Multiplicity};
@@ -1633,7 +1604,7 @@ mod tests {
     ///
     /// HS reference: HS `disjSplitGoal` (Proof.hs:61) parses to
     /// `DisjG (Disj [Guarded])` and matches the runtime Goal::Disj by
-    /// structural equality (ProofMethod.hs:374).  The RS shape
+    /// structural equality (ProofMethod.hs:259).  The RS shape
     /// signature must uniquely pick the disjunction whose alt-count
     /// matches the skeleton.
     #[test]

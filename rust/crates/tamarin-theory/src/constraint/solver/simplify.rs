@@ -81,14 +81,14 @@ pub fn simplify_system(red: &mut Reduction) {
             red.sys.formulas.len(), red.sys.solved_formulas.len(),
             red.sys.goals.len(), red.sys.nodes.len());
         for (i, f) in red.sys.formulas.iter().enumerate() {
-            let head = match f {
-                crate::guarded::Guarded::Atom(_) => "Atom",
-                crate::guarded::Guarded::Conj(_) => "Conj",
-                crate::guarded::Guarded::Disj(_) => "Disj",
+            let head: String = match f {
+                crate::guarded::Guarded::Atom(_) => "Atom".to_string(),
+                crate::guarded::Guarded::Conj(_) => "Conj".to_string(),
+                crate::guarded::Guarded::Disj(_) => "Disj".to_string(),
                 crate::guarded::Guarded::GGuarded { qua: crate::guarded::Quant::Ex, vars, .. } =>
-                    Box::leak(format!("Ex({:?})", vars.iter().map(|b| (b.name.clone(), b.sort)).collect::<Vec<_>>()).into_boxed_str()),
+                    format!("Ex({:?})", vars.iter().map(|b| (b.name.clone(), b.sort)).collect::<Vec<_>>()),
                 crate::guarded::Guarded::GGuarded { qua: crate::guarded::Quant::All, vars, .. } =>
-                    Box::leak(format!("All({:?})", vars.iter().map(|b| (b.name.clone(), b.sort)).collect::<Vec<_>>()).into_boxed_str()),
+                    format!("All({:?})", vars.iter().map(|b| (b.name.clone(), b.sort)).collect::<Vec<_>>()),
             };
             eprintln!("  [SIMP_ENTER] formula[{}] head={}", i, head);
         }
@@ -209,14 +209,14 @@ pub fn simplify_system(red: &mut Reduction) {
     // sharing the same term.  Haskell runs this only in non-diff
     // mode, after the main loop, before `removeSolvedSplitGoals`.
     exploit_unique_msg_order(red);
-    // Haskell `simplifySystem` non-diff branch (Simplify.hs:73-78)
+    // Haskell `simplifySystem` non-diff branch (Simplify.hs:65-71)
     // runs `removeSolvedSplitGoals` AFTER `exploitUniqueMsgOrder`
     // and once at the end of the pipeline — NOT inside the
     // while_changing loop.  We had it in the loop body; that's
     // non-Haskell-faithful and can cause non-idempotent oscillation
     // with downstream passes that add goals.
     remove_solved_split_goals_pass(red);
-    // Post-loop: `addNonInjectiveFactInstances` (Simplify.hs:730-735).
+    // Post-loop: `addNonInjectiveFactInstances` (Simplify.hs:710-715).
     // Haskell runs this AFTER `exploitUniqueMsgOrder` and
     // `removeSolvedSplitGoals` in the non-diff branch of
     // `simplifySystem`.  For every (j, k) pair where (j ≠ i, k) and
@@ -279,7 +279,7 @@ fn simp_post_loop_steps(red: &mut Reduction) {
 }
 
 /// Fan-out variant of `simplify_system` — port of HS's `simplifySystem`
-/// (Simplify.hs:65-87) run inside the `Reduction = StateT (FreshT (DisjT ...))`
+/// (Simplify.hs:56-71) run inside the `Reduction = StateT (FreshT (DisjT ...))`
 /// monad.  When `solveUniqueActions` internally calls `disjunctionOfList`
 /// (via `solveGoal (ActionG i fa)` → source-cases / variants / Maude
 /// AC unifiers), the DisjT layer fans the entire enclosing `simplifySystem`
@@ -435,11 +435,11 @@ fn fan_out_on_pending_eq_arms(
 /// stashed in `pending_eq_arms` for `simplify_system_fan_out_inner`'s
 /// drain points to fork on.
 ///
-/// HS-faithful: `enforceNodeUniqueness` (Simplify.hs:192-197) merges
+/// HS-faithful: `enforceNodeUniqueness` (Simplify.hs:178-207) merges
 /// KD-conclusions via `solveRuleEqs SplitNow`, KU-actions via
 /// `solveFactEqs SplitNow` and node-ids via `solveNodeIdEqs` — all of
 /// which run `disjunctionOfList $ performSplit eqs2 splitId`
-/// (Reduction.hs:730-738) when Maude returns multiple AC unifiers,
+/// (Reduction.hs:723-725) when Maude returns multiple AC unifiers,
 /// forking the WHOLE remaining simplify continuation per arm in the
 /// `DisjT` layer.  RS's `solve_term_eqs` returns `Cases(arms)` WITHOUT
 /// installing any arm (the `mem::take`'d default store stays in
@@ -482,8 +482,8 @@ where
 }
 
 /// Direct port of Haskell `addNonInjectiveFactInstances`
-/// (Simplify.hs:730-735): collects (smaller, larger) pairs from
-/// `nonInjectiveFactInstances` (Simplify.hs:686) and inserts each as
+/// (Simplify.hs:710-715): collects (smaller, larger) pairs from
+/// `nonInjectiveFactInstances` (Simplify.hs:666-708) and inserts each as
 /// `LessAtom(smaller, larger, InjectiveFacts)`.
 fn add_non_injective_fact_instances(red: &mut Reduction) {
     use crate::constraint::constraints::{LessAtom, Reason};
@@ -494,7 +494,7 @@ fn add_non_injective_fact_instances(red: &mut Reduction) {
 }
 
 /// Direct port of Haskell `Simplify.nonInjectiveFactInstances`
-/// (Simplify.hs:686-728) — returns the (j, i) or (k, j) less-relation
+/// (Simplify.hs:666-708) — returns the (j, i) or (k, j) less-relation
 /// pairs that should be added when injective facts are duplicated
 /// across the system.  Distinct from
 /// `Contradictions.nonInjectiveFactInstances` (used in our
@@ -670,18 +670,18 @@ fn exploit_unique_msg_order(red: &mut Reduction) {
 fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
     use crate::guarded::{simplify_guarded_with, Guarded};
     // HS-faithful: `evalFormulaAtoms` iterates `S.toList sFormulas` —
-    // Simplify.hs:402-404 — ascending Guarded Ord.  Rust's Vec is in
+    // Simplify.hs:319-321 — ascending Guarded Ord.  Rust's Vec is in
     // insertion order; sort first to match HS's iteration.
     let mut formulas = red.sys.formulas.clone();
     formulas.sort_by(crate::guarded::cmp_guarded);
     // HS-faithful: `evalFormulaAtoms` builds a CHANGE LIST via
-    // `applyChangeList`'s list comprehension (Simplify.hs:444-454) where
+    // `applyChangeList`'s list comprehension (Simplify.hs:320-330) where
     // every `fm'` is computed from the SINGLE `valuation` captured at
     // pass entry (`valuation <- gets (partialAtomValuation ctxt)`,
-    // Simplify.hs:442) — i.e. against the FROZEN pre-pass system.  Only
+    // Simplify.hs:318) — i.e. against the FROZEN pre-pass system.  Only
     // after all `fm'` are determined does `applyChangeList = sequence_`
     // run the per-formula `insertFormula fm'` mutations, in `S.toList`
-    // order (Reduction.hs:191-193).
+    // order (Reduction.hs:162-164).
     //
     // Previously this loop recomputed `partial_atom_valuation(&red.sys,…)`
     // on EACH iteration against the LIVE, already-mutated `red.sys`, and
@@ -703,8 +703,15 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
     let mut change_list: Vec<(Guarded, Guarded)> = Vec::new();
     {
         let maude = red.ctx.maude.clone();
+        // The compute phase only READS `red.sys` (mutations are deferred to
+        // the loop below), so the `alwaysBefore` adjacency is invariant across
+        // this pass.  Build it ONCE and thread it into every per-atom
+        // evaluation — mirrors HS `partialAtomValuation`'s single
+        // `before = alwaysBefore sys` binding (Simplify.hs:349) rather than
+        // rebuilding the relation per atom.
+        let ab_adj = red.sys.build_always_before_adj();
         let val = |a: &tamarin_parser::ast::Atom|
-            partial_atom_valuation(&red.sys, &maude, a);
+            partial_atom_valuation_with(&red.sys, &maude, &ab_adj, a);
         for fm in formulas.into_iter() {
             let simp = simplify_guarded_with(&fm, &val);
             if simp == fm { continue; }
@@ -713,7 +720,7 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
     }
     let mut changed = ChangeIndicator::Unchanged;
     for (fm, simp) in change_list {
-        // Haskell `evalFormulaAtoms` (Simplify.hs:321-337):
+        // Haskell `evalFormulaAtoms` (Simplify.hs:324-329):
         //   case fm of
         //     GDisj disj -> markGoalAsSolved "simplified" (DisjG disj)
         //     _          -> return ()
@@ -740,7 +747,7 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
         }
         // Remove the original formula and route the simplified one
         // through `insert_formula` — mirrors Haskell's
-        // `evalFormulaAtoms` (Simplify.hs:334-336):
+        // `evalFormulaAtoms` (Simplify.hs:327-329):
         //   modM sFormulas       $ S.delete fm
         //   modM sSolvedFormulas $ S.insert fm
         //   insertFormula fm'
@@ -757,7 +764,7 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
             red.sys.invalidate_max_var_idx_cache();
             red.sys.solved_formulas.push(fm);
         }
-        // HS-faithful: `evalFormulaAtoms` (Simplify.hs:444-454) ALWAYS
+        // HS-faithful: `evalFormulaAtoms` (Simplify.hs:329) ALWAYS
         // calls `insertFormula fm'` regardless of whether `fm'` is gtrue,
         // gfalse, or any other shape.  Critical for the empty-Conj
         // (gtrue) case: `insertFormula gtrue` at mark=True enters the
@@ -802,9 +809,15 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
 ///     OR if the node `t` has `fa` among its actions.
 ///   - `Last t`: True if `t == sys.last_atom`; False if any node is
 ///     after `t` per the less relation.
-fn partial_atom_valuation(
+///
+/// The `alwaysBefore` adjacency is built ONCE by the caller and threaded in
+/// via `ab_adj` — mirroring HS `partialAtomValuation`, which binds
+/// `before = alwaysBefore sys` ONCE in its `where` clause (Simplify.hs:349)
+/// rather than recomputing it per atom.
+fn partial_atom_valuation_with(
     sys: &crate::constraint::system::System,
     maude: &tamarin_term::maude_proc::MaudeHandle,
+    ab_adj: &crate::constraint::system::PrebuiltAdj,
     atom: &tamarin_parser::ast::Atom,
 ) -> Option<bool> {
     use tamarin_parser::ast::{Atom, Term};
@@ -855,7 +868,7 @@ fn partial_atom_valuation(
         Atom::Less(i, j) => {
             let ni = parser_node_id(i)?;
             let nj = parser_node_id(j)?;
-            // HS-faithful guard ORDER (Simplify.hs:519-525):
+            // HS-faithful guard ORDER (Simplify.hs:374-380):
             //   | i == j || j `before` i  -> Just False
             //   | i `before` j            -> Just True
             // The `j before i -> Just False` guard is checked BEFORE the
@@ -874,10 +887,9 @@ fn partial_atom_valuation(
             // split and closes only `I_1_case_1` via a Cyclic contradiction.
             if ni == nj { return Some(false); }
             // Both `always_before` checks below query the same (invariant)
-            // relation, so build the adjacency once and reuse it.
-            let ab_adj = sys.build_always_before_adj();
-            if sys.always_before_with(&ab_adj, &nj, &ni) { return Some(false); }
-            if sys.always_before_with(&ab_adj, &ni, &nj) { return Some(true); }
+            // relation; use the pass-level pre-built adjacency.
+            if sys.always_before_with(ab_adj, &nj, &ni) { return Some(false); }
+            if sys.always_before_with(ab_adj, &ni, &nj) { return Some(true); }
             // Haskell:
             //   isLast sys i && isInTrace sys j  -> Just False
             //   isLast sys j && isInTrace sys i &&
@@ -895,9 +907,8 @@ fn partial_atom_valuation(
             // Node-id case: compare via the order relation and
             // rule-instance unifiability.
             if let (Some(ni), Some(nj)) = (parser_node_id(x), parser_node_id(y)) {
-                let ab_adj = sys.build_always_before_adj();
-                if sys.always_before_with(&ab_adj, &ni, &nj)
-                    || sys.always_before_with(&ab_adj, &nj, &ni) {
+                if sys.always_before_with(ab_adj, &ni, &nj)
+                    || sys.always_before_with(ab_adj, &nj, &ni) {
                     return Some(false);
                 }
                 if non_unifiable_nodes(&ni, &nj) { return Some(false); }
@@ -975,7 +986,7 @@ fn partial_atom_valuation(
         }
         Atom::Last(t) => {
             let n = parser_node_id(t)?;
-            // Haskell-faithful (Simplify.hs:518-524):
+            // Haskell-faithful (Simplify.hs:394-400):
             //   Last i
             //     | isLast sys i                       -> Just True
             //     | any (isInTrace sys) (nodesAfter i) -> Just False
@@ -1034,7 +1045,7 @@ fn partial_atom_valuation(
             None
         }
         // Direct port of Haskell `partialAtomValuation` Subterm arm
-        // (Simplify.hs:399):
+        // (Simplify.hs:392):
         //   Subterm small big -> isTrueFalse reducible (Just sst) (small, big)
         //
         // We restrict to the subset of `isTrueFalse`-cases that work over
@@ -1156,7 +1167,7 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     // applies the rename throughout antecedent + body.
     let mut rename_baseline = red.fresh_var_baseline().saturating_add(1);
     // HS-faithful: iterate formulas + lemmas in `S.toList` order
-    // (Guarded Ord ascending) — Simplify.hs:494-496:
+    // (Guarded Ord ascending) — Simplify.hs:412-413:
     //   clause <- (S.toList $ get sFormulas sys) ++
     //             (S.toList $ get sLemmas sys)
     let mut sorted_universals_src: Vec<&Guarded> = red.sys.formulas.iter().collect();
@@ -2295,7 +2306,7 @@ fn enforce_fresh_node_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
             })
             .collect();
         // Haskell `enforceNodeUniqueness` freshRuleInsts branch
-        // (Simplify.hs:185) calls `solveNodeIdEqs` via the `merge`
+        // (Simplify.hs:178,207) calls `solveNodeIdEqs` via the `merge`
         // helper.  The monadic bind through `solveTermEqs` ends in
         // `noContradictoryEqStore` (Reduction.hs:704) which fires
         // mzero on `eqsIsFalse`.  Previously this site used
@@ -2321,7 +2332,7 @@ fn enforce_fresh_node_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
             }
         }
         // HS-faithful: HS's `enforceNodeUniqueness` freshRuleInsts
-        // branch (Simplify.hs:194-196) uses `solver = const $ return
+        // branch (Simplify.hs:178) uses `solver = const $ return
         // Unchanged` — calls solveNodeIdEqs ONLY, never merges inline.
         // The merge happens on the NEXT iteration's substSystem →
         // substNodes → substNodeIds → setNodes, which detects the
@@ -2424,7 +2435,7 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     // The previous order (nodes first) made the goal id collapse
     // onto a fresh `vk.X`, which then dedup-merged with a grafted
     // goal whose solved=true status carried over.  See
-    // Simplify.hs:279 + 311 (`kuActions se = (\(i,fa,m) -> (m,(fa,i)))
+    // Simplify.hs:192 (`kuActions se = (\(i,fa,m) -> (m,(fa,i)))
     // <$> allKUActions se`).
     let mut acts: Vec<(NodeId, LNFact, LNTerm)> = Vec::new();
     for (g, st) in red.sys.goals.iter() {
@@ -2549,226 +2560,6 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         changed = ChangeIndicator::Changed;
     }
 
-    // H14.4 HS-faithful synthesis (2026-05-28):
-    //
-    // HS's `enforceUniqueKuFact` produces less_atoms `(action_node, prem_node,
-    // Adversary)` indirectly via this chain:
-    //   1. action_node has KU(t) action.
-    //   2. prem_node has KU(t) as a RULE PREMISE.
-    //   3. exploitPrem on the KU prem calls `requiresKU(t)` which creates a
-    //      new vk node with KU(t) action.
-    //   4. enforceUniqueKuFact merges the new vk with action_node (same KU
-    //      term) — Maude orients new_vk → action_node (smaller idx wins).
-    //   5. substLessAtoms applies the subst: `LessAtom new_vk prem_node`
-    //      becomes `LessAtom action_node prem_node`.
-    //
-    // RS doesn't reproduce this chain because RS's source-pick application
-    // specializes term variables eagerly, so the prem_node's prem term
-    // diverges from action_node's action term (see [[project-h14-3-generic-
-    // vs-specific-terms]]).
-    //
-    // Direct synthesis: detect (action_node, prem_node) pairs where
-    // action_node's KU(t1) action term UNIFIES with prem_node's KU(t2) rule
-    // premise term, then add the less_atom directly.  We use UNIFICATION
-    // (not exact equality) because HS's chain effectively applies the
-    // unifier via the merge — terms become equal post-merge.  In RS,
-    // since we don't merge, we accept the unifier exists and add the
-    // less_atom.  Soundness: if Maude can unify the terms, there's a
-    // valid sub-supply relationship and the less_atom is semantically
-    // correct.
-    //
-    // OPT-IN via `TAM_RS_ENABLE_KU_PREM_LESS=1` (default disabled).  Reverted
-    // 2026-05-28 because regresses aborted_contract_reachable (0→24) — the
-    // synthesis approximates HS's merge effect but isn't precise.  Kept as
-    // a documented experiment for future deep fix in apply_source_case_action.
-    //
-    // H17.3 TIGHTER CRITERION (opt-in via TAM_RS_ENABLE_KU_PREM_LESS_TIGHT=1):
-    // Only synthesize the less_atom when prem_node's KU term contains a
-    // sub-term EXACTLY equal to action_node's KU term (post-subst).  This
-    // tightens H14.4's `unifiable_shape` to "subterm equality", avoiding
-    // false-positive synthesis on aborted/other lemmas where the
-    // unifiable_shape match happens but no HS merge fires (different vars).
-    // Verified: 0 fires for resolved1 (terms have different vars).  Kept
-    // opt-in until verification on broader corpus.  See
-    // [[project-h17-3-synthesis-tighter]].
-    if std::env::var("TAM_RS_ENABLE_KU_PREM_LESS_TIGHT").is_ok() {
-        use crate::constraint::constraints::{LessAtom, Reason};
-        let mut action_kus: Vec<(crate::constraint::constraints::NodeId, LNTerm)>
-            = Vec::new();
-        for (id, rule) in red.sys.nodes.iter() {
-            for fa in &rule.actions {
-                if matches!(fa.tag, FactTag::Ku) {
-                    if let Some(m) = fa.terms.first() {
-                        action_kus.push((id.clone(), m.clone()));
-                    }
-                }
-            }
-        }
-        let mut prem_kus: Vec<(crate::constraint::constraints::NodeId, LNTerm)>
-            = Vec::new();
-        for (id, rule) in red.sys.nodes.iter() {
-            for fa in &rule.premises {
-                if matches!(fa.tag, FactTag::Ku) {
-                    if let Some(m) = fa.terms.first() {
-                        prem_kus.push((id.clone(), m.clone()));
-                    }
-                }
-            }
-        }
-        // H17.3 tighter: require prem_term to CONTAIN action_term as a
-        // SUB-TERM (post-subst). This corresponds to HS's `requiresKU(sub)`
-        // firing on a structured prem term, where the sub equals an
-        // existing action term — exact equality of the sub-component.
-        fn contains_subterm(haystack: &LNTerm, needle: &LNTerm) -> bool {
-            use tamarin_term::term::Term;
-            if haystack == needle { return true; }
-            match haystack {
-                Term::App(_, args) => args.iter().any(|a| contains_subterm(a, needle)),
-                _ => false,
-            }
-        }
-        if !action_kus.is_empty() && !prem_kus.is_empty() {
-            let existing: std::collections::BTreeSet<(crate::constraint::constraints::NodeId,
-                crate::constraint::constraints::NodeId)> =
-                red.sys.less_atoms.iter()
-                    .map(|la| (la.smaller.clone(), la.larger.clone()))
-                    .collect();
-            let dbg_synth = std::env::var("TAM_RS_DBG_KU_PREM_SYNTH").is_ok();
-            for (action_node, action_term) in &action_kus {
-                if !(action_node.name == "i" && action_node.idx == 0) { continue; }
-                // Action term must be an App (e.g., sign(t.1, t.2)).
-                if !matches!(action_term, tamarin_term::term::Term::App(_, _)) { continue; }
-                for (prem_node, prem_term) in &prem_kus {
-                    if action_node == prem_node { continue; }
-                    // Tighter: prem_term must contain action_term as a sub-term.
-                    if !contains_subterm(prem_term, action_term) { continue; }
-                    // Skip if already exists.
-                    if existing.contains(&(action_node.clone(), prem_node.clone())) {
-                        continue;
-                    }
-                    if dbg_synth {
-                        let a_str = format!("{:?}", action_term)
-                            .chars().take(80).collect::<String>();
-                        let p_str = format!("{:?}", prem_term)
-                            .chars().take(80).collect::<String>();
-                        eprintln!("[KU_PREM_SYNTH_TIGHT] LessAtom {}_{} {}_{} (action={}, prem_contains={})",
-                            action_node.name, action_node.idx,
-                            prem_node.name, prem_node.idx, a_str, p_str);
-                    }
-                    red.insert_less(LessAtom::new(
-                        action_node.clone(),
-                        prem_node.clone(),
-                        Reason::Adversary,
-                    ));
-                    changed = ChangeIndicator::Changed;
-                }
-            }
-        }
-    }
-    if std::env::var("TAM_RS_ENABLE_KU_PREM_LESS").is_ok() {
-        use crate::constraint::constraints::{LessAtom, Reason};
-        // Collect (node, KU action term).
-        let mut action_kus: Vec<(crate::constraint::constraints::NodeId, LNTerm)>
-            = Vec::new();
-        for (id, rule) in red.sys.nodes.iter() {
-            for fa in &rule.actions {
-                if matches!(fa.tag, FactTag::Ku) {
-                    if let Some(m) = fa.terms.first() {
-                        action_kus.push((id.clone(), m.clone()));
-                    }
-                }
-            }
-        }
-        // Collect (node, KU premise term).
-        let mut prem_kus: Vec<(crate::constraint::constraints::NodeId, LNTerm)>
-            = Vec::new();
-        for (id, rule) in red.sys.nodes.iter() {
-            for fa in &rule.premises {
-                if matches!(fa.tag, FactTag::Ku) {
-                    if let Some(m) = fa.terms.first() {
-                        prem_kus.push((id.clone(), m.clone()));
-                    }
-                }
-            }
-        }
-        if !action_kus.is_empty() && !prem_kus.is_empty() {
-            let existing: std::collections::BTreeSet<(crate::constraint::constraints::NodeId,
-                crate::constraint::constraints::NodeId)> =
-                red.sys.less_atoms.iter()
-                    .map(|la| (la.smaller.clone(), la.larger.clone()))
-                    .collect();
-            let dbg_synth = std::env::var("TAM_RS_DBG_KU_PREM_SYNTH").is_ok();
-            // Unification check: same top-level function symbol and same
-            // arity recursively (a structural match that admits any
-            // variable assignment).  This is a sound under-approximation
-            // of "unifiable" — actual Maude unification may admit more
-            // pairs (e.g., via equational theory), but missing some
-            // matches only means MISSING less_atoms (not extra ones).
-            // HS-faithful structural match: both terms must have the SAME
-            // top-level function symbol AND args must structurally match
-            // (allowing vars inside, but the head must be non-variable).
-            //
-            // We REQUIRE non-variable at the top level because HS's chain
-            // only fires when the new vk's KU action is a HEADED term
-            // (e.g., sign(...)) that matches the supplier's HEADED term.
-            // A bare variable wouldn't trigger HS's merge in the same way.
-            fn unifiable_shape(a: &LNTerm, b: &LNTerm) -> bool {
-                use tamarin_term::term::Term;
-                match (a, b) {
-                    // Top-level must be App (function symbol) — bare vars
-                    // or constants don't drive the merge chain HS uses.
-                    (Term::App(s1, args1), Term::App(s2, args2)) => {
-                        if s1 != s2 { return false; }
-                        if args1.len() != args2.len() { return false; }
-                        // Args can be vars or matching shape.
-                        args1.iter().zip(args2.iter())
-                            .all(|(x, y)| match (x, y) {
-                                (Term::Lit(_), Term::Lit(_)) => true, // var/const OK
-                                (Term::App(_, _), Term::App(_, _)) => unifiable_shape(x, y),
-                                // `Term` has only `Lit`/`App`, so these two
-                                // arms cover the remaining `(Lit, App)` and
-                                // `(App, Lit)` mixes exhaustively.
-                                (Term::Lit(_), _) | (_, Term::Lit(_)) => true,
-                            })
-                    }
-                    _ => false,
-                }
-            }
-            for (action_node, action_term) in &action_kus {
-                // NARROW: only fire when action_node is the source goal's
-                // i_0 (LVar name="i", idx=0).  This matches HS's chain
-                // where the outer source goal's #i is the merge target.
-                // For non-i_0 action nodes, the standard same-term merge
-                // in enforce_ku_action_uniqueness above handles it.
-                if !(action_node.name == "i" && action_node.idx == 0) { continue; }
-                for (prem_node, prem_term) in &prem_kus {
-                    if action_node == prem_node { continue; }
-                    if !unifiable_shape(action_term, prem_term) { continue; }
-                    // Skip if already exists.
-                    if existing.contains(&(action_node.clone(), prem_node.clone())) {
-                        continue;
-                    }
-                    // Synthesize the less_atom.
-                    if dbg_synth {
-                        let a_str = format!("{:?}", action_term)
-                            .chars().take(80).collect::<String>();
-                        let p_str = format!("{:?}", prem_term)
-                            .chars().take(80).collect::<String>();
-                        eprintln!("[KU_PREM_SYNTH] LessAtom {}_{} {}_{} (action={}, prem={})",
-                            action_node.name, action_node.idx,
-                            prem_node.name, prem_node.idx, a_str, p_str);
-                    }
-                    red.insert_less(LessAtom::new(
-                        action_node.clone(),
-                        prem_node.clone(),
-                        Reason::Adversary,
-                    ));
-                    changed = ChangeIndicator::Changed;
-                }
-            }
-        }
-    }
-
     changed
 }
 
@@ -2845,13 +2636,17 @@ fn solve_unique_actions_pass(red: &mut Reduction) -> ChangeIndicator {
     if candidates.is_empty() { return ChangeIndicator::Unchanged; }
     let mut changed = ChangeIndicator::Unchanged;
     for (i, fa) in candidates {
-        // The action might no longer be in `sys.goals` if a previous
-        // iteration solved it via merging; skip if so.
-        let still_present = red.sys.goals.iter().any(|(g, st)| {
-            !st.solved && matches!(g, Goal::Action(gi, gfa)
-                if gi == &i && gfa == &fa)
-        });
-        if !still_present { continue; }
+        // HS `solveUniqueActions`/`trySolve` (Simplify.hs:293-297) runs
+        // `solveGoal (ActionG i fa)` UNCONDITIONALLY on every captured
+        // `isUnique` action atom — there is no goal-status re-check.
+        // `solveAction` branches on NODE existence, not goal status, so a
+        // previous iteration's eq-store substitution that renamed the live
+        // goal must NOT cause this captured atom to be skipped (the
+        // `still_present` exact-(i,fa) guard removed here did exactly that,
+        // suppressing node creation and flipping the witness-trace pick —
+        // see the matching rationale in `solve_unique_actions_pass_fan_out`
+        // below).  An already-solved atom whose node exists with `fa` among
+        // its actions is a harmless no-op in `solve_action_goal`.
         // Haskell's `solveUniqueActions` uses monadic `>>` which
         // propagates Contradictory upstream.  In our pass form, we
         // surface the Contradictory by injecting gfalse so the next
@@ -2868,7 +2663,7 @@ fn solve_unique_actions_pass(red: &mut Reduction) -> ChangeIndicator {
 }
 
 /// Fan-out variant of `solve_unique_actions_pass`.  Mirrors HS's
-/// `solveUniqueActions` (Simplify.hs:400-421) running inside the
+/// `solveUniqueActions` (Simplify.hs:276-297) running inside the
 /// `Reduction = StateT System (FreshT (DisjT ...))` monad — when
 /// `solveGoal (ActionG i fa)` internally calls `disjunctionOfList`
 /// (over source-cases / variants / rule actions / Maude unifiers),
@@ -2925,7 +2720,7 @@ pub(crate) fn solve_unique_actions_pass_fan_out(
     let mut changed = ChangeIndicator::Unchanged;
     let mut iter = candidates.into_iter();
     while let Some((i, fa)) = iter.next() {
-        // HS-faithful (`solveUniqueActions`, Simplify.hs:411-433): the
+        // HS-faithful (`solveUniqueActions`, Simplify.hs:276-297): the
         // captured `actionAtoms` list is processed by `mapM trySolve`,
         // and `trySolve (i, fa) = solveGoal (ActionG i fa)` runs
         // UNCONDITIONALLY on every captured `isUnique` atom — there is NO
@@ -2967,7 +2762,7 @@ pub(crate) fn solve_unique_actions_pass_fan_out(
                 changed = ChangeIndicator::Changed;
             }
             GoalCases::Cases(cases) => {
-                // HS-faithful fan-out (Simplify.hs:401-422):
+                // HS-faithful fan-out (Simplify.hs:276-297):
                 //   solveUniqueActions = do
                 //     ...
                 //     actionAtoms <- gets unsolvedActionAtoms
@@ -3093,7 +2888,7 @@ fn drain_remaining_actions(
 fn has_funion_head(t: &tamarin_term::lterm::LNTerm) -> bool {
     // HS-faithful: `solveUniqueActions`'s exclusion is
     //   null [ () | t <- ts, FUnion _ <- return (viewTerm2 t) ]
-    // (Simplify.hs:468).  `viewTerm2 t` inspects ONLY the TOP-LEVEL
+    // (Simplify.hs:291).  `viewTerm2 t` inspects ONLY the TOP-LEVEL
     // symbol of `t` — it does NOT recurse into arguments.  So a fact
     // term excludes the action from `solveUniqueActions` ONLY when the
     // term is itself a top-level multiset union (`FUnion`), e.g. a bare
@@ -3139,7 +2934,7 @@ fn enforce_kd_fact_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     use crate::rule::RuleACInst;
     use tamarin_term::lterm::LNTerm;
 
-    // Haskell-faithful (`Simplify.hs:183-187`): `enforceNodeUniqueness`
+    // Haskell-faithful (`Simplify.hs:179,189`): `enforceNodeUniqueness`
     // kdConcs branch uses `(merge (solveRuleEqs SplitNow) kdConcs)`.
     // The merger emits BOTH `solveRuleEqs` (full rule-instance
     // equality) AND `solveNodeIdEqs`.  We previously only emitted
@@ -3158,6 +2953,7 @@ fn enforce_kd_fact_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         }
     }
     if kd_concs.len() < 2 { return ChangeIndicator::Unchanged; }
+    let kd_concs_n = kd_concs.len();
     use std::collections::BTreeMap;
     let mut by_term: BTreeMap<LNTerm, Vec<(NodeId, RuleACInst)>> = BTreeMap::new();
     for (i, r, m) in kd_concs {
@@ -3187,7 +2983,7 @@ fn enforce_kd_fact_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
             // Even when there's nothing to merge, log so we can see whether
             // the by_term grouping found candidates.
             let path = crate::constraint::solver::trace::case_path_string();
-            eprintln!("[kd_uniq] path={} ENTER (no-merge): kd_concs n=0", path);
+            eprintln!("[kd_uniq] path={} ENTER (no-merge): kd_concs n={}", path, kd_concs_n);
         }
         return ChangeIndicator::Unchanged;
     }
@@ -3210,7 +3006,7 @@ fn enforce_kd_fact_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         // Haskell uses `solveRuleEqs SplitNow` for the kdConcs merger
         // (Simplify.hs `merge (solveRuleEqs SplitNow) kdConcs`).
         // Multi-arm AC unifications fork the DisjT continuation in HS
-        // (Reduction.hs:730-738); mirror via install + pending_eq_arms.
+        // (Reduction.hs:723-725); mirror via install + pending_eq_arms.
         // Bug #3 (Joux_EphkRev): ignoring `Cases` here left the
         // `mem::take`'d default eq-store (conj=[], next_split=0)
         // installed — the next substSystem then parked its setNodes
@@ -3422,7 +3218,7 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
                 Ok(false) => {}
                 Err(_) => continue,
             }
-            // HS-faithful insertLess (Reduction.hs:397 `modM sLessAtoms . S.insert`).
+            // HS-faithful insertLess (Reduction.hs:390-391 `modM sLessAtoms . S.insert`).
             // Routes through `red.insert_less` which already does set-add dedup.
             let before = red.sys.less_atoms.len();
             red.insert_less(LessAtom::new(
@@ -3480,7 +3276,7 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
         });
         if !all_non_unifiable { continue; }
         let last = match rs.last() { Some(l) => l.clone(), None => continue };
-        // HS-faithful insertLess (Reduction.hs:397).
+        // HS-faithful insertLess (Reduction.hs:390-391).
         let before = red.sys.less_atoms.len();
         red.insert_less(LessAtom::new(last, j.clone(), Reason::Fresh));
         if red.sys.less_atoms.len() != before {
@@ -3603,12 +3399,15 @@ fn apply_node_eqs(
                     // Same shape: queue fact-list equations so the
                     // term-level constraints from the dropped rule
                     // still feed the eq-store (mirrors `subst_system`).
-                    for (a, b) in kept.premises.iter().zip(rule.premises.iter()) {
+                    // HS `solveRuleEqs` orders the per-fact equations
+                    // concs ++ prems ++ acts (Reduction.hs:752-754); match
+                    // that ordering here.
+                    for (a, b) in kept.conclusions.iter().zip(rule.conclusions.iter()) {
                         rule_eqs.push(tamarin_term::rewriting::Equal {
                             lhs: a.clone(), rhs: b.clone(),
                         });
                     }
-                    for (a, b) in kept.conclusions.iter().zip(rule.conclusions.iter()) {
+                    for (a, b) in kept.premises.iter().zip(rule.premises.iter()) {
                         rule_eqs.push(tamarin_term::rewriting::Equal {
                             lhs: a.clone(), rhs: b.clone(),
                         });
@@ -3962,7 +3761,7 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     }
     if let Ok(crate::constraint::solver::reduction::SolveOutcome::Cases(arms)) = res {
         // Multi-arm node-id unification: install arm[0] + stash the
-        // rest (HS DisjT fork, Reduction.hs:730-738).  Falling through
+        // rest (HS DisjT fork, Reduction.hs:723-725).  Falling through
         // would leave the `mem::take`'d default eq-store installed.
         install_pass_cases_arms(red, arms);
     }
@@ -4000,21 +3799,6 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     ChangeIndicator::Changed
 }
 
-/// `simpInjectiveFactEqMon` — direct port of Haskell's
-/// `Theory.Constraint.Solver.Simplify.simpInjectiveFactEqMon`.
-///
-/// For every pair of distinct nodes `(i, j)` whose rule premises
-/// contain the same injective fact tag with the same first term:
-///   - At every position marked `Constant`, the values must agree:
-///     emit a term-level `EqE` constraint via `solve_term_eqs`.
-///   - At every position marked `StrictlyIncreasing` (or
-///     `Decreasing`) where the two terms are syntactically equal,
-///     the nodes must coincide: equate node ids via
-///     `solve_node_id_eqs`.
-///
-/// The richer Increasing / subterm / pre-restriction-constraint
-/// machinery from Haskell is left for a follow-up; this minimal port
-/// is sound and unblocks the common Loop / Init-Copy-Stop pattern.
 /// Lift a `NodeId` (an `LVar` of sort Node) to an `LNTerm` variable —
 /// HS `varTerm (Free i)` for a node-id.
 fn node_id_to_lnterm(
@@ -4023,6 +3807,26 @@ fn node_id_to_lnterm(
     tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Var(n.clone()))
 }
 
+/// `simpInjectiveFactEqMon` — direct port of Haskell's
+/// `Theory.Constraint.Solver.Simplify.simpInjectiveFactEqMon`
+/// (Simplify.hs:547-587).
+///
+/// For every pair of distinct nodes `(i, j)` whose rule premises
+/// contain the same injective fact tag with the same first term:
+///   - At every position marked `Constant`, the values must agree:
+///     emit a term-level `EqE` constraint via `solve_term_eqs`.
+///   - At every `StrictlyIncreasing` / `Increasing` /
+///     `Decreasing` / `StrictlyDecreasing` position, the
+///     `trivially_smaller` / `trivially_not_smaller` subterm
+///     classification drives cases (1)-(5): equal node ids
+///     (`solve_node_id_eqs`), `EqE` constraints, `gnotAtom (EqE …)`
+///     formulas, and `LessAtom` ordering constraints.
+///
+/// This is a full port of the active HS arms. The only cases not
+/// ported — (6) and (6.1) — are themselves commented out in Haskell
+/// (Simplify.hs:577, 581-583), so nothing active is missing. The
+/// `Decreasing`/`StrictlyDecreasing` arms are handled by the i<->j
+/// swap below.
 fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
     use crate::tools::injective_fact_instances::MonotonicBehaviour;
 
@@ -4124,15 +3928,72 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
     let is_true_false = |s: &tamarin_term::lterm::LNTerm,
                          t: &tamarin_term::lterm::LNTerm| -> Option<bool> {
         use crate::tools::subterm_store::elem_not_below_reducible;
-        use tamarin_term::lterm::{is_fresh_var, is_pub_var, flattened_ac_terms};
+        use tamarin_term::lterm::{is_fresh_var, is_pub_var, is_msg_var,
+            sort_of_lnterm, flattened_ac_terms, LSort};
         use tamarin_term::term::Term as LTerm;
         use tamarin_term::vterm::Lit as LLit;
-        use tamarin_term::function_symbols::FunSym;
+        use tamarin_term::function_symbols::{FunSym, AcSym};
         if s == t { return Some(false); }
+        // HS `isTrueFalse reducible Nothing` Nat guards (SubtermStore.hs:336-340),
+        // which fire BEFORE the redElem cases:
+        //   | onlyOnes small && l small < l big && big::Nat -> Just True
+        //   | (small::Nat || isMsgVar small) && big::Nat ->
+        //         processACSubterm NatPlus (small, big)
+        let nat_one: tamarin_term::lterm::LNTerm = tamarin_term::term::f_app_no_eq(
+            tamarin_term::function_symbols::nat_one_sym(), vec![]);
+        let only_ones = |x: &tamarin_term::lterm::LNTerm| {
+            flattened_ac_terms(AcSym::NatPlus, x).iter().all(|e| **e == nat_one)
+        };
+        let nat_len = |x: &tamarin_term::lterm::LNTerm| {
+            flattened_ac_terms(AcSym::NatPlus, x).len()
+        };
+        if only_ones(s) && nat_len(s) < nat_len(t) && sort_of_lnterm(t) == LSort::Nat {
+            return Some(true);
+        }
+        if (sort_of_lnterm(s) == LSort::Nat || is_msg_var(s))
+            && sort_of_lnterm(t) == LSort::Nat
+        {
+            // processACSubterm NatPlus (SubtermStore.hs:313-318): sort +
+            // removeSame on flattenedACTerms; empty big -> False, empty
+            // small -> True, otherwise inconclusive (None).
+            let mut small_flat: Vec<tamarin_term::lterm::LNTerm> =
+                flattened_ac_terms(AcSym::NatPlus, s).into_iter().cloned().collect();
+            let mut big_flat: Vec<tamarin_term::lterm::LNTerm> =
+                flattened_ac_terms(AcSym::NatPlus, t).into_iter().cloned().collect();
+            small_flat.sort();
+            big_flat.sort();
+            let mut small_rem: Vec<tamarin_term::lterm::LNTerm> = Vec::new();
+            let mut big_rem: Vec<tamarin_term::lterm::LNTerm> = Vec::new();
+            let mut i = 0;
+            let mut j = 0;
+            while i < small_flat.len() && j < big_flat.len() {
+                match small_flat[i].cmp(&big_flat[j]) {
+                    std::cmp::Ordering::Equal => { i += 1; j += 1; }
+                    std::cmp::Ordering::Less => {
+                        small_rem.push(small_flat[i].clone()); i += 1;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        big_rem.push(big_flat[j].clone()); j += 1;
+                    }
+                }
+            }
+            while i < small_flat.len() { small_rem.push(small_flat[i].clone()); i += 1; }
+            while j < big_flat.len() { big_rem.push(big_flat[j].clone()); j += 1; }
+            if big_rem.is_empty() { return Some(false); }
+            if small_rem.is_empty() { return Some(true); }
+            return None;
+        }
         if elem_not_below_reducible(&reducible, t, s) { return Some(false); }
         if elem_not_below_reducible(&reducible, s, t) { return Some(true); }
         if let LTerm::Lit(LLit::Con(_)) = t { return Some(false); }
-        if is_pub_var(t) || is_fresh_var(t) { return Some(false); }
+        // CR-rule S_invalid (SubtermStore.hs:348-349): when big is a Var,
+        // pub/fresh has no subterms; also a Nat-sorted big with a
+        // non-Nat/non-MsgVar small is invalid.
+        if let LTerm::Lit(LLit::Var(_)) = t {
+            if is_pub_var(t) || is_fresh_var(t) { return Some(false); }
+            let small_ok = sort_of_lnterm(s) == LSort::Nat || is_msg_var(s);
+            if !small_ok && sort_of_lnterm(t) == LSort::Nat { return Some(false); }
+        }
         // HS-faithful: CR-rule `S_subterm-ac-recurse` (SubtermStore.hs:350-354).
         // When `t = FApp (AC f) _` and `AC f` is NOT a reducible function
         // symbol, run `processACSubterm` to peel matched flat elements
@@ -4185,11 +4046,16 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
         is_true_false(s, t) == Some(false)
     };
     // HS-faithful: iterate ALL ordered pairs of `by_inj` entries,
-    // skipping only the diagonal (`a == b`, same entry index) — not
-    // just unordered `a < b`.  Cases (3) and (5) are NOT symmetric —
+    // skipping any pair on the SAME NodeId — not just the diagonal
+    // entry index.  Cases (3) and (5) are NOT symmetric —
     // they emit `(i, j)` or `(j, i)` LessAtoms whose direction depends
     // on which side has the "smaller" term.  Mirrors HS `paired` list
-    // comprehension (Simplify.hs).
+    // comprehension (Simplify.hs:643-651) which keys `behaviourTerms`
+    // by NodeId and guards `i /= j` (Simplify.hs:649) on NodeIds — so
+    // two premises of the SAME node (which both live in that node's
+    // single map-list) are never paired.  `by_inj` holds one entry per
+    // premise, so a node with two same-tag premises appears twice with
+    // the same NodeId; the per-NodeId guard below excludes those.
     // The `alwaysBefore` relation is invariant across this pair loop: all
     // results below accumulate into `new_formulas`/`new_lesses` and are only
     // applied to `red` AFTER the loop, so `red.sys` is read-only here. Build
@@ -4200,6 +4066,9 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
             if a == b { continue; }
             let (i, fa_i, behaviours_i) = &by_inj[a];
             let (j, fa_j, _) = &by_inj[b];
+            // HS `paired` guard `i /= j` on NodeIds (Simplify.hs:649):
+            // never pair two premises living on the same node.
+            if i == j { continue; }
             if fa_i.tag != fa_j.tag { continue; }
             // Same first term required (the injectivity index).
             let t_i = match fa_i.terms.first() { Some(t) => t, None => continue };
@@ -4382,7 +4251,7 @@ fn reduce_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     // overlapping borrows (read+modify on `sys.formulas`).
     //
     // HS-faithful: `reduceFormulas` iterates `S.toList formulas` —
-    // Simplify.hs:388-389 — ascending Guarded Ord.  Sort to match HS's
+    // Simplify.hs:304-306 — ascending Guarded Ord.  Sort to match HS's
     // iteration order; otherwise the decomposition + re-insertion
     // sequence picks up different goal-nrs than HS.
     let mut to_decompose: Vec<_> = red.sys.formulas.iter()
@@ -4394,14 +4263,14 @@ fn reduce_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
         let total = red.sys.formulas.len();
         eprintln!("[REDUCE_FORM] total_formulas={} to_decompose={}", total, to_decompose.len());
         for (i, f) in red.sys.formulas.iter().enumerate() {
-            let head = match f {
-                crate::guarded::Guarded::Atom(_) => "Atom",
-                crate::guarded::Guarded::Conj(_) => "Conj",
-                crate::guarded::Guarded::Disj(_) => "Disj",
+            let head: String = match f {
+                crate::guarded::Guarded::Atom(_) => "Atom".to_string(),
+                crate::guarded::Guarded::Conj(_) => "Conj".to_string(),
+                crate::guarded::Guarded::Disj(_) => "Disj".to_string(),
                 crate::guarded::Guarded::GGuarded { qua: crate::guarded::Quant::Ex, vars, .. } =>
-                    Box::leak(format!("Ex({:?})", vars.iter().map(|b| (b.name.clone(), b.sort)).collect::<Vec<_>>()).into_boxed_str()),
+                    format!("Ex({:?})", vars.iter().map(|b| (b.name.clone(), b.sort)).collect::<Vec<_>>()),
                 crate::guarded::Guarded::GGuarded { qua: crate::guarded::Quant::All, vars, .. } =>
-                    Box::leak(format!("All({:?})", vars.iter().map(|b| (b.name.clone(), b.sort)).collect::<Vec<_>>()).into_boxed_str()),
+                    format!("All({:?})", vars.iter().map(|b| (b.name.clone(), b.sort)).collect::<Vec<_>>()),
             };
             let red_flag = reducible_formula(f);
             let s = format!("{:?}", f);
@@ -4493,7 +4362,7 @@ fn dedupe_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
 /// `simpSubtermStore` (`Theory.Tools.SubtermStore.simpSubtermStore`,
 /// SubtermStore.hs:144-157).
 ///
-/// HS's `simpSubterms` (Simplify.hs:632) is the per-iteration entry
+/// HS's `simpSubterms` (Simplify.hs:499-503) is the per-iteration entry
 /// point of `simplifySystem` that runs `simpSubtermStore` and threads
 /// its outputs (subterm-goal updates + emitted formulas) into the
 /// reduction.  This RS port mirrors the subset of HS's logic that
@@ -4828,7 +4697,7 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
         // oldNegSubterms := original negSubterms (HS line 201).  This is
         // the only place `old_neg_subterms` is written; updating it alone
         // does NOT count as a change (HS simpSubterms compares stores
-        // `ignoringOldSst1`, Simplify.hs:679).
+        // `ignoringOldSst1`, Simplify.hs:507-508).
         red.sys.subterm_store.old_neg_subterms = original_negs;
     }
 
@@ -4997,7 +4866,7 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
     // the formula into `solved_formulas` as well, after which a
     // subsequent `reduce_formulas_pass` round strips it back out of
     // `formulas` via the solved-dedup short-circuit in
-    // `insert_formula`).  HS's `simpSubterms` (Simplify.hs:655)
+    // `insert_formula`).  HS's `simpSubterms` (Simplify.hs:522)
     // funnels emitted formulas through `insertFormula` only ONCE per
     // simplify iteration and relies on the negSubterms set surviving
     // in `_negSubterms`; we mirror the same single-pass placement by
@@ -5592,7 +5461,7 @@ mod tests {
     /// when `any (isInTrace sys) (nodesAfter i)` — the existence of a
     /// less-relation edge `n < m` is NOT itself sufficient; `m` must
     /// satisfy `isInTrace` (in sNodes / isLast / unsolved Action atom).
-    /// Direct port of HS Simplify.hs:518-524.
+    /// Direct port of HS Simplify.hs:394-400.
     ///
     /// Pre-fix RS unconditionally returned Some(false) whenever any
     /// less-atom had `smaller == n` (or any edge had `src == n`),
@@ -5634,12 +5503,13 @@ mod tests {
             n.clone(), m,
             crate::constraint::constraints::Reason::Formula,
         ));
-        let result = partial_atom_valuation(&sys, &h, &Atom::Last(mkvar("n", 0)));
+        let ab_adj = sys.build_always_before_adj();
+        let result = partial_atom_valuation_with(&sys, &h, &ab_adj, &Atom::Last(mkvar("n", 0)));
         assert_eq!(result, None,
             "HS-faithful: `Last n` with `n < m` but m not in trace must \
              yield None (not Some(false)).  Pre-fix RS returned \
              Some(false) here — see commit 65c17ebb.  Mirrors HS \
-             Simplify.hs:518-524 `any (isInTrace sys) (nodesAfter i)` \
+             Simplify.hs:394-400 `any (isInTrace sys) (nodesAfter i)` \
              guard.");
     }
 

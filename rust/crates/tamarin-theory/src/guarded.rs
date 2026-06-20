@@ -138,8 +138,12 @@ pub fn cmp_atom(a: &GAtom, b: &GAtom) -> std::cmp::Ordering {
     let tb = atom_tag(b);
     if ta != tb { return ta.cmp(&tb); }
     match (a, b) {
+        // HS `data ProtoAtom s t = Action t (Fact t) | ...` derives Ord
+        // (Atom.hs:78-84), so the derived comparison is the timepoint term
+        // `t` FIRST, then the `Fact t`.  Rust's `GAtom::Action(GFact, GTerm)`
+        // stores fact-then-term, so we must compare the timepoint first.
         (GAtom::Action(f1, t1), GAtom::Action(f2, t2)) =>
-            cmp_fact(f1, f2).then_with(|| cmp_term(t1, t2)),
+            cmp_term(t1, t2).then_with(|| cmp_fact(f1, f2)),
         (GAtom::Eq(a1, b1), GAtom::Eq(a2, b2)) =>
             cmp_term(a1, a2).then_with(|| cmp_term(b1, b2)),
         (GAtom::Subterm(a1, b1), GAtom::Subterm(a2, b2)) =>
@@ -424,12 +428,73 @@ fn sort_hint_tag(s: &p::SortHint) -> u8 {
     }
 }
 
-/// HS Fact Ord (Theory/Model/Fact.hs): `(factTag, factAnnotations,
-/// factTerms)` tuple Ord.  Works on `GFact` (HS `Fact (VTerm c (BVar v))`).
+/// HS Fact Ord (Theory/Model/Fact.hs:168): `compare tag tag' <> compare ts
+/// ts'`.  Annotations are explicitly IGNORED in `Ord (Fact t)` (Fact.hs:163
+/// comment "Ignore annotations in equality and ord testing").  Works on
+/// `GFact` (HS `Fact (VTerm c (BVar v))`).
+///
+/// The HS `FactTag` Ord (Fact.hs:132-143, derived) compares a `ProtoFact`
+/// by `(Multiplicity, String, Int)` where `Multiplicity = Persistent |
+/// Linear` orders `Persistent < Linear`, and `Int` is the arity.  Rust's
+/// `bool` Ord gives `false < true`, so to reproduce `Persistent < Linear`
+/// we must order `persistent == true` BEFORE `persistent == false` — i.e.
+/// reverse the bool comparison.  Arity (`args.len()`) is part of the
+/// `FactTag` key and is therefore compared BEFORE the term list, exactly
+/// as `compare tag tag'` precedes `compare ts ts'`.
+///
+/// SPECIAL-TAG SEGREGATION: HS `FactTag` (Fact.hs:132-143, derived Ord) is
+/// `ProtoFact Multiplicity String Int | FreshFact | OutFact | InFact |
+/// KUFact | KDFact | DedFact | TermFact`.  With a derived `Ord` the
+/// *constructor index* dominates, so EVERY `ProtoFact` sorts before EVERY
+/// special tag, and the special tags order amongst themselves in that
+/// declaration sequence (Fresh < Out < In < KU < KD < Ded < Term).
+///
+/// `GFact` carries only `(persistent, name)`, not the full `FactTag` enum,
+/// but the parser (`fact()` in tamarin-parser, mirroring HS `mkProtoFact`,
+/// Parser/Fact.hs:56-63) has already CANONICALISED reserved names to their
+/// exact tag spelling — `Fr`, `Out`, `In`, `KU`, `KD`, `Ded` — and fixed
+/// their multiplicity (KU/KD persistent, the rest linear).  So we can
+/// recover the tag class from the name string with an exact (case-sensitive)
+/// match, identical to `fact_to_lnfact`'s mapping in `elaborate.rs`.  Names
+/// that are not one of those reserved spellings (including the ordinary
+/// proto-fact `K`) are `ProtoFact`s.
+fn fact_tag_class(f: &GFact) -> u8 {
+    // ProtoFact == 0 so it sorts before all special tags, matching the
+    // derived constructor order. Special tags follow Fact.hs:134-143.
+    match f.name.as_str() {
+        "Fr"  => 1, // FreshFact
+        "Out" => 2, // OutFact
+        "In"  => 3, // InFact
+        "KU"  => 4, // KUFact
+        "KD"  => 5, // KDFact
+        "Ded" => 6, // DedFact
+        "Term" => 7, // TermFact (internal; never parsed, but mapped for completeness)
+        _ => 0,     // ProtoFact (incl. "K")
+    }
+}
+
 pub fn cmp_fact(a: &GFact, b: &GFact) -> std::cmp::Ordering {
-    a.persistent.cmp(&b.persistent)
-        .then_with(|| a.name.cmp(&b.name))
-        .then_with(|| cmp_slice(&a.args, &b.args, cmp_term))
+    use std::cmp::Ordering;
+    // `compare tag tag'`: first by FactTag constructor class.
+    let (ca, cb) = (fact_tag_class(a), fact_tag_class(b));
+    let tag_ord = ca.cmp(&cb).then_with(|| {
+        if ca == 0 {
+            // Both ProtoFact: derived Ord compares the inner triple
+            // `(Multiplicity, String, Int)` = (multiplicity, name, arity).
+            // Persistent < Linear: persistent==true must sort first, so
+            // compare `b.persistent` against `a.persistent` to reverse
+            // `bool`'s false<true ordering.
+            b.persistent.cmp(&a.persistent)
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.args.len().cmp(&b.args.len()))
+        } else {
+            // Both the same special tag: nullary constructors compare
+            // equal at the tag level (no inner fields).
+            Ordering::Equal
+        }
+    });
+    // `<> compare ts ts'`: tie-break on the term list.
+    tag_ord.then_with(|| cmp_slice(&a.args, &b.args, cmp_term))
 }
 
 /// HS-faithful Guarded type. Mirrors `Theory.Constraint.System.Guarded.Guarded`.
@@ -509,12 +574,18 @@ pub fn gconj(items: Vec<Guarded>) -> Guarded {
     for it in items {
         if flatten(it, &mut out) { return gfalse(); }
     }
+    // HS-faithful: the `[gf] -> gf` singleton unwrap is matched on the
+    // FLATTENED, non-nubbed list (Guarded.hs:414), and `nub` is applied
+    // only in the otherwise branch (`GConj $ Conj $ nub gfs`,
+    // Guarded.hs:418).  So `gconj [a,a]` flattens to `[a,a]` (not a
+    // singleton) and yields `Conj (nub [a,a]) = Conj [a]`, NOT bare `a`.
+    if out.len() == 1 { return out.into_iter().next().unwrap(); }
     // Mirror Haskell `gconj`'s `nub gfs` (Guarded.hs:418).
     let mut deduped: Vec<Guarded> = Vec::with_capacity(out.len());
     for x in out {
         if !deduped.contains(&x) { deduped.push(x); }
     }
-    if deduped.len() == 1 { deduped.into_iter().next().unwrap() } else { Guarded::Conj(deduped) }
+    Guarded::Conj(deduped)
 }
 
 /// Walk a guarded formula and replace atoms whose truth value the
@@ -574,15 +645,14 @@ pub fn simplify_guarded_with(
                 .map(|(a, _)| a)
                 .collect();
             let body_s = simplify_guarded_with(body, valuation);
-            if kept.is_empty() {
-                // All guards were True — universal reduces to its body.
-                body_s
-            } else {
-                Guarded::GGuarded {
-                    qua: Quant::All, vars: vars.clone(),
-                    guards: kept, body: Box::new(body_s),
-                }
-            }
+            // HS-faithful: `simp` builds the universal via `gall [] (...) (simp
+            // gf)` (Guarded.hs:687).  `gall` collapses to the body when the
+            // kept guards are empty AND collapses the whole universal to
+            // `gtrue` when the simplified body is `gtrue` (Guarded.hs:450),
+            // regardless of whether guards remain.  Building `GGuarded`
+            // directly would leave a non-canonical `GGuarded{All,[],kept,
+            // gtrue}` where Haskell produces `gtrue`.
+            gall(vars.clone(), kept, body_s)
         }
         // Quantifiers with bound vars stay as-is — Haskell delays
         // simplification past the binder.
@@ -683,13 +753,20 @@ pub fn gdisj(items: Vec<Guarded>) -> Guarded {
     for it in items {
         if flatten(it, &mut out) { return gtrue(); }
     }
+    // HS-faithful: the `[gf] -> gf` singleton unwrap matches the FLATTENED,
+    // non-nubbed list (Guarded.hs:425); `nub` is applied only in the
+    // otherwise branch (`GDisj $ Disj $ nub gfs`, Guarded.hs:432).  So a
+    // flattened list like `[a,a]` is not a singleton and yields
+    // `Disj (nub [a,a]) = Disj [a]`, NOT bare `a`.  (Note: this `out`
+    // already has `gfalse` items dropped — see flatten above — so the
+    // empty case below collapses an all-`gfalse` disjunction to `gfalse`.)
+    if out.len() == 1 { return out.into_iter().next().unwrap(); }
     // Mirror Haskell `gdisj`'s `nub gfs` (Guarded.hs:432).
     let mut deduped: Vec<Guarded> = Vec::with_capacity(out.len());
     for x in out {
         if !deduped.contains(&x) { deduped.push(x); }
     }
     if deduped.is_empty() { gfalse() }
-    else if deduped.len() == 1 { deduped.into_iter().next().unwrap() }
     else { Guarded::Disj(deduped) }
 }
 
@@ -733,7 +810,7 @@ pub struct GuardError {
     /// `f0` in `convert polarity f0@(Qua qua0 _ _)` — the innermost
     /// quantifier that failed the guard check.  Used by callers to render
     /// the HS-faithful:
-    ///   ```
+    ///   ```text
     ///   <error_text>
     ///     "<sub_formula>"
     ///   in the formula
@@ -1142,15 +1219,32 @@ fn remaining_unguarded(xs: &[p::VarSpec], atoms: &[p::Atom]) -> Vec<p::VarSpec> 
 }
 
 fn unguarded_error(vars: &[p::VarSpec]) -> GuardError {
-    // HS: `map (quotes . text . show) unguarded` — each name is shown
-    // via Haskell's `show LVar` which renders as `'name'` (single-quoted).
-    // The Haskell `show` for LVar is its `Show` instance, which we can
-    // find at LTerm.hs:197: `show (LVar n s i) = ...` with no explicit
-    // instance → derives Show, producing `LVar "name" LSortMsg 0` style.
-    // But `quotes` wraps in single quotes at the Doc level.  The resulting
-    // `text . show` on each unguarded LVar produces `'name'` in the
-    // rendered Doc via `quotes (text "name")`.
-    let names: Vec<String> = vars.iter().map(|v| format!("'{}'", v.name)).collect();
+    // HS: `map (quotes . text . show) unguarded` (Guarded.hs:507-509) over
+    // `[LVar]`.  Each LVar is rendered by the EXPLICIT `instance Show LVar`
+    // (LTerm.hs:525-531): `show (LVar v s i) = sortPrefix s ++ body`, where
+    // `sortPrefix` (LTerm.hs:190-195) is "" (Msg) / "~" (Fresh) / "$" (Pub)
+    // / "#" (Node) / "%" (Nat), and `body` is `v` when `i == 0` else
+    // `v ++ "." ++ show i`.  `quotes` then single-quotes the result, so the
+    // rendered output is e.g. `'#i'` or `'x.5'` — NOT a bare `'name'`.
+    let show_lvar = |v: &p::VarSpec| -> String {
+        let prefix = match v.sort {
+            p::SortHint::Fresh | p::SortHint::Suffix(p::SuffixSort::Fresh) => "~",
+            p::SortHint::Pub | p::SortHint::Suffix(p::SuffixSort::Pub) => "$",
+            p::SortHint::Node | p::SortHint::Suffix(p::SuffixSort::Node) => "#",
+            p::SortHint::Nat | p::SortHint::Suffix(p::SuffixSort::Nat) => "%",
+            // Msg / Untagged / Suffix(Msg) => "" (LSortMsg has no prefix).
+            _ => "",
+        };
+        let body = if v.name.is_empty() {
+            v.idx.to_string()
+        } else if v.idx == 0 {
+            v.name.clone()
+        } else {
+            format!("{}.{}", v.name, v.idx)
+        };
+        format!("'{}{}'", prefix, body)
+    };
+    let names: Vec<String> = vars.iter().map(show_lvar).collect();
     err(format!("unguarded variable(s) {} in the subformula", names.join(", ")))
 }
 
@@ -1205,19 +1299,18 @@ pub fn subst_renaming(name: String, old_idx: u64, new_idx: u64,
     ((name, old_idx), target)
 }
 
-/// Apply a `VarSubst` to a parser-AST term in-place.
-/// Rewrite every Maude-witness LVar `~mw#N` (any idx) to a canonical
-/// `~mw#0`.  Used to dedup implied formulas in `insertImpliedFormulas`
-/// where Maude unification mints a fresh witness per call: two
-/// structurally-identical derivations from the same (restriction,
-/// action-node) pair would otherwise have different witness idx and
-/// bypass `Vec::contains`, causing solved_formulas to grow without
+/// Rewrite every Maude-witness LVar named `x` (any idx) to its canonical
+/// `idx == 0` form.  Used to dedup implied formulas in
+/// `insertImpliedFormulas` where Maude unification mints a fresh witness
+/// per call: two structurally-identical derivations from the same
+/// (restriction, action-node) pair would otherwise have different witness
+/// idx and bypass `Vec::contains`, causing solved_formulas to grow without
 /// bound and the simplify loop to never converge.
 ///
-/// We touch ONLY witness vars (name == "x") — every other LVar
-/// (real protocol vars, distinct named fresh values) keeps its
-/// identity, so the dedup doesn't over-merge legitimately-distinct
-/// implications.
+/// We touch ONLY witness vars (name == "x"), canonicalising their idx to 0
+/// while preserving name and sort — every other LVar (real protocol vars,
+/// distinct named fresh values) keeps its identity, so the dedup doesn't
+/// over-merge legitimately-distinct implications.
 pub fn normalize_witness_lvars(g: &Guarded) -> Guarded {
     let mut subst: VarSubst = std::collections::HashMap::new();
     collect_witness_vars(g, &mut subst);
@@ -1914,10 +2007,16 @@ pub fn satisfied_by_empty_trace(g: &Guarded) -> Result<bool, String> {
             Ok(any)
         }
         Guarded::Conj(xs) => {
+            // HS `liftM and . sequence . getConj` (Guarded.hs:589-591):
+            // `sequence` forces ALL conjuncts (failing if any is `Left`)
+            // BEFORE reducing with `and`.  So we must evaluate every
+            // conjunct and propagate any error rather than short-circuiting
+            // on the first `Ok(false)`.
+            let mut all = true;
             for x in xs {
-                if !satisfied_by_empty_trace(x)? { return Ok(false); }
+                if !satisfied_by_empty_trace(x)? { all = false; }
             }
-            Ok(true)
+            Ok(all)
         }
         Guarded::GGuarded { qua, .. } => Ok(matches!(qua, Quant::All)),
     }
@@ -1927,10 +2026,14 @@ pub fn satisfied_by_empty_trace(g: &Guarded) -> Result<bool, String> {
 /// `containsAction` from Haskell's `ginduct`.
 pub fn contains_action(g: &Guarded) -> bool {
     match g {
-        Guarded::Atom(a) => matches!(a, GAtom::Action(_, _)),
+        // Haskell `containsAction = foldGuarded (const True) ...`
+        // (Guarded.hs:634-635): the bare-atom handler is `const True`, so
+        // EVERY atom (Action/Eq/Less/Last/Subterm/Pred) yields True — not
+        // only Action atoms.
+        Guarded::Atom(_) => true,
         Guarded::Disj(xs) | Guarded::Conj(xs) => xs.iter().any(contains_action),
         Guarded::GGuarded { guards, body, .. } => {
-            // Haskell `Guarded.hs:636-637`: `\_ _ as body -> not (null as) || body`.
+            // Haskell `Guarded.hs:634-635`: `\_ _ as body -> not (null as) || body`.
             !guards.is_empty() || contains_action(body)
         }
     }
@@ -2087,6 +2190,55 @@ mod tests {
     fn ground_truth() {
         let r = g("T").unwrap();
         assert_eq!(r, gtrue());
+    }
+
+    // GFact builder for cmp_fact ordering tests.
+    fn gf(persistent: bool, name: &str) -> GFact {
+        GFact { persistent, name: name.into(), args: vec![], annotations: vec![] }
+    }
+
+    /// HS `FactTag` derived Ord segregates all ProtoFacts before every
+    /// special tag, and orders the special tags in declaration sequence
+    /// (Fr < Out < In < KU < KD < Ded < Term).  cmp_fact must reproduce
+    /// this from the canonicalised name string.
+    #[test]
+    fn cmp_fact_special_tag_segregation() {
+        use std::cmp::Ordering::Less;
+        // A ProtoFact with a name that lexically sorts AFTER every special
+        // name must still come FIRST (constructor index dominates).
+        let proto_z = gf(false, "Zebra");
+        for special in ["Fr", "Out", "In", "KU", "KD", "Ded", "Term"] {
+            let persistent = matches!(special, "KU" | "KD");
+            let s = gf(persistent, special);
+            assert_eq!(cmp_fact(&proto_z, &s), Less,
+                "ProtoFact must sort before special tag {special}");
+        }
+        // Special tags order in declaration sequence.
+        assert_eq!(cmp_fact(&gf(false, "Fr"), &gf(false, "Out")), Less);
+        assert_eq!(cmp_fact(&gf(false, "Out"), &gf(false, "In")), Less);
+        assert_eq!(cmp_fact(&gf(false, "In"), &gf(true, "KU")), Less);
+        assert_eq!(cmp_fact(&gf(true, "KU"), &gf(true, "KD")), Less);
+        assert_eq!(cmp_fact(&gf(true, "KD"), &gf(false, "Ded")), Less);
+        assert_eq!(cmp_fact(&gf(false, "Ded"), &gf(false, "Term")), Less);
+        // "K" is an ordinary ProtoFact (not special), so it precedes Fr.
+        assert_eq!(cmp_fact(&gf(false, "K"), &gf(false, "Fr")), Less);
+    }
+
+    /// ProtoFacts compare by (Persistent<Linear, name, arity).
+    #[test]
+    fn cmp_fact_proto_triple() {
+        use std::cmp::Ordering::Less;
+        // Persistent < Linear (reversed bool).
+        assert_eq!(cmp_fact(&gf(true, "P"), &gf(false, "P")), Less);
+        // Then by name.
+        assert_eq!(cmp_fact(&gf(false, "A"), &gf(false, "B")), Less);
+        // Then by arity.
+        let a1 = GFact { persistent: false, name: "P".into(),
+            args: vec![], annotations: vec![] };
+        let a2 = GFact { persistent: false, name: "P".into(),
+            args: vec![crate::guarded_types::GTerm::Var(crate::guarded_types::BVar::Bound(0))],
+            annotations: vec![] };
+        assert_eq!(cmp_fact(&a1, &a2), Less);
     }
 
     #[test]
@@ -2631,7 +2783,8 @@ mod tests {
     // =========================================================================
 
     /// `gtrue` is represented as `Conj []` and `gfalse` as `Disj []`.
-    /// This is a Haskell convention (Guarded.hs:139-145).  Many
+    /// This is a Haskell convention (`gtf False = GDisj (Disj [])`,
+    /// `gtf True = GConj (Conj [])`, Guarded.hs:395-398).  Many
     /// short-circuit checks rely on it (e.g. `x == gfalse()` in
     /// `gconj`).  If we accidentally encode them differently, every
     /// short-circuit silently breaks.

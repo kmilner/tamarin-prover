@@ -155,6 +155,28 @@ pub fn parse_variants_reply(msig: &MaudeSig, reply: &[u8]) -> Result<Vec<MSubst>
         }
         variants.push(subst);
     }
+    // Haskell `parseVariantsReply` (Parser.hs:275-278):
+    //   ... many1 parseVariant <* "No more variants." <* endOfLine
+    //       <* "rewrites: " <* takeWhile1 isDigit <* endOfLine <* endOfInput
+    // Require >=1 variant, then consume/validate the trailing footer and EOF.
+    if variants.is_empty() {
+        return Err(ParseError("expected at least one variant (many1)".into()));
+    }
+    // The `No more variants.` token was already consumed by the loop break.
+    let _ = c.skip_eol();
+    if !c.eat_str(b"rewrites: ") {
+        return Err(ParseError("expected `rewrites: ` footer".into()));
+    }
+    if c.read_decimal().is_none() {
+        return Err(ParseError("expected digits after `rewrites: `".into()));
+    }
+    let _ = c.skip_eol();
+    if !c.is_eof() {
+        return Err(ParseError(format!(
+            "unexpected trailing input after variants: {:?}",
+            String::from_utf8_lossy(&c.rest()[..c.rest().len().min(40)])
+        )));
+    }
     Ok(variants)
 }
 
@@ -173,7 +195,8 @@ fn parse_substitutions(msig: &MaudeSig, c: &mut Cursor) -> Result<Vec<MSubst>, P
             || { c.pos = saved; c.eat_str(b"Unifier ") }
             || { c.pos = saved; c.eat_str(b"Matcher ") };
         if !header_ok {
-            // No more substitutions.
+            // No more substitution headers; stop reading.  `endOfInput`
+            // is enforced after the loop.
             c.pos = saved;
             break;
         }
@@ -197,6 +220,23 @@ fn parse_substitutions(msig: &MaudeSig, c: &mut Cursor) -> Result<Vec<MSubst>, P
             }
         }
         substs.push(entries);
+    }
+    // Haskell `parseUnifyReply`/`parseMatchReply` (Parser.hs:258-270) wrap
+    // `many1 (parseSubstitution msig) <* endOfInput`: outside the explicit
+    // no-unifier/no-match line at least one substitution is required and all
+    // input must be consumed.
+    if substs.is_empty() {
+        return Err(ParseError(
+            "expected at least one substitution (many1)".into(),
+        ));
+    }
+    // `endOfInput`: skip a trailing newline, then require EOF.
+    let _ = c.skip_eol();
+    if !c.is_eof() {
+        return Err(ParseError(format!(
+            "unexpected trailing input after substitutions: {:?}",
+            String::from_utf8_lossy(&c.rest()[..c.rest().len().min(40)])
+        )));
     }
     Ok(substs)
 }
@@ -308,9 +348,8 @@ fn build_app(msig: &MaudeSig, ident: &[u8], args: Vec<MTerm>) -> MTerm {
             return Term::App(FunSym::List, flat.into());
         }
     }
-    if ident == b"cons" || ident == b"nil" {
-        // Should have been handled inside `list(...)`. Fall through to no-eq.
-    }
+    // `cons`/`nil` should have been handled inside `list(...)`; if they
+    // reach here they fall through to the no-eq handling below.
     // Free symbol — decode and lookup.
     if ident.starts_with(FUN_SYM_PREFIX.as_bytes()) {
         let (name, p, c) = fun_sym_decode(ident);
@@ -322,9 +361,14 @@ fn build_app(msig: &MaudeSig, ident: &[u8], args: Vec<MTerm>) -> MTerm {
             privacy: p,
             constructability: c,
         };
-        // Verify it's known to the signature; otherwise, accept anyway (the
-        // Haskell version errors here, but lenient pass is fine for our
-        // round-trip tests since we constructed the signature ourselves).
+        // Haskell `parseFunSym` (Parser.hs:331-344) errors when the decoded
+        // symbol is not in `allowedfunSyms` (consSym, nilSym, natOneSym plus
+        // `noEqFunSyms msig`).  This runs on the live Maude reply path, not
+        // just round-trip tests.  We intentionally keep a lenient pass here:
+        // Maude only ever echoes symbols from the signature we sent it, so in
+        // normal operation the check is redundant; we accept the decoded
+        // symbol rather than panicking on a malformed reply.  `msig` is kept
+        // in the signature for parity and possible future validation.
         let _ = msig;
         return Term::App(FunSym::NoEq(sym), args.into());
     }

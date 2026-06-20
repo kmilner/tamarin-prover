@@ -48,7 +48,7 @@ pub enum SelectorExpr {
 /// `functionsPrio :: [(AnnotatedGoal, ctx, System) -> Bool]`
 /// (System.hs:442).  The prio recognises a goal iff ANY of these
 /// expressions evaluates to True (HS `isPrio = or . sequenceA`,
-/// ProofMethod.hs:884).
+/// ProofMethod.hs:662-663).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrioBlock {
     pub ranking: String,
@@ -212,8 +212,8 @@ impl<'a> TacticParser<'a> {
         self.i >= self.s.len()
     }
 
-    /// Peek the identifier word starting at the current (post-ws) position
-    /// without consuming.
+    /// Skips leading whitespace/comments, then peeks the identifier word
+    /// at the resulting position without consuming it.
     fn peek_word(&mut self) -> Option<String> {
         self.skip_ws();
         let start = self.i;

@@ -41,6 +41,7 @@ use tamarin_theory::guarded::{formula_to_guarded, Guarded};
 use tamarin_theory::pretty_system::pretty_non_graph_system;
 use tamarin_theory::theory::{LemmaAttr, OpenProtoRule, TraceQuantifier};
 
+use crate::handlers::path_parse::{prefix_with_underscore, url_path_escape};
 use crate::handlers::root::html_escape;
 
 /// Per-lemma live proof state, held inside [`TheoryEntry`].
@@ -340,7 +341,7 @@ pub fn render_proof_tree_html(
 /// Render the per-path sub-proof snippet.  Mirrors Haskell's
 /// `subProofSnippet` (`src/Web/Theory.hs:513-611`).  Emits:
 ///
-///   1. `<h3>Applicable Proof Methods: <heuristic></h3>`
+///   1. `<h3>Applicable Proof Methods:</h3>`
 ///      `<div class="preformatted methods">…numbered method links…</div>`
 ///      `a. <autoprove>` etc.
 ///   2. `<h3>Constraint system</h3>`
@@ -384,7 +385,7 @@ pub fn render_sub_proof_snippet(
         let mut child_path = proof_path.to_vec();
         child_path.push(case_name.clone());
         let child_url = encode_path(&child_path);
-        out.push_str(&format!("<h4>case {}</h4>\n", html_escape(case_name)));
+        out.push_str(&format!("<h4>Case {}</h4>\n", html_escape(case_name)));
         let src = format!(
             "/thy/trace/{idx}/interactive-graph-def/proof/{lemma}{path}",
             idx = idx,
@@ -399,8 +400,26 @@ pub fn render_sub_proof_snippet(
     out
 }
 
+/// Mirror of Haskell `nonEmptyGraph` (`System.hs:1923-1927`):
+///
+/// ```text
+/// nonEmptyGraph sys = not $
+///     M.null sNodes && null (unsolvedActionAtoms sys) &&
+///     null (unsolvedChains sys) &&
+///     S.null sEdges && S.null sLessAtoms
+/// ```
+///
+/// i.e. the dotted graph is non-empty iff ANY of: nodes, unsolved
+/// action atoms, unsolved chains, edges, or less-atoms is present.
+/// `unsolvedActionAtoms` / `unsolvedChains` are the unsolved-status
+/// `ActionG` / `ChainG` goals (`System.hs:1568-1572,1601-1605`).
 fn has_graph_content(sys: &System) -> bool {
-    !sys.nodes.is_empty() || !sys.edges.is_empty()
+    if !sys.nodes.is_empty() || !sys.edges.is_empty() || !sys.less_atoms.is_empty() {
+        return true;
+    }
+    sys.goals.iter().any(|(g, st)| {
+        !st.solved && (g.is_action() || g.is_chain())
+    })
 }
 
 fn write_applicable_methods(
@@ -425,7 +444,23 @@ fn write_applicable_methods(
         .filter(|m| exec_proof_method(ctx, m, sys).is_some())
         .collect();
     if methods.is_empty() {
-        out.push_str("<h3>Constraint System is Solved or Unfinishable</h3>\n");
+        // Mirror Haskell `prettyApplicableProofMethods` (`Web/Theory.hs:540-542`):
+        //   [] | finishedSubterms ctxt sys -> "Constraint System is Solved"
+        //   []                             -> "Constraint System is Unfinishable"
+        // `finishedSubterms` is not exported here, so we route through
+        // `is_finished`, whose only non-finished verdict for a system
+        // with no applicable methods is `Unfinishable` (subterms not
+        // finished); Solved / Contradictory / initial all map to the
+        // "Solved" heading, matching the `finishedSubterms` branch.
+        let unfinishable = matches!(
+            is_finished(ctx, sys),
+            Some(tamarin_theory::constraint::solver::proof_method::Result::Unfinishable)
+        );
+        if unfinishable {
+            out.push_str("<h3>Constraint System is Unfinishable</h3>\n");
+        } else {
+            out.push_str("<h3>Constraint System is Solved</h3>\n");
+        }
         return;
     }
     out.push_str("<h3>Applicable Proof Methods:</h3>\n");
@@ -521,7 +556,7 @@ fn render_node(
             let mut child_path = path.to_vec();
             child_path.push(case_name.clone());
             out.push_str(&format!(
-                "<h4>case {}</h4>\n",
+                "<h4>Case {}</h4>\n",
                 html_escape(case_name)));
             render_node(out, idx, lemma, &child_path, child);
         }
@@ -530,7 +565,7 @@ fn render_node(
 }
 
 /// Port of Haskell's `prettyProofMethod`
-/// (`lib/theory/src/Theory/Constraint/Solver/ProofMethod.hs:1307`).
+/// (`lib/theory/src/Theory/Constraint/Solver/ProofMethod.hs:1174`).
 pub fn method_label(m: &ProofMethod) -> String {
     match m {
         ProofMethod::Sorry(reason) => match reason {
@@ -560,7 +595,7 @@ pub fn method_label(m: &ProofMethod) -> String {
 }
 
 /// Port of Haskell's `prettyContradiction`
-/// (`lib/theory/src/Theory/Constraint/Solver/Contradictions.hs:457`).
+/// (`lib/theory/src/Theory/Constraint/Solver/Contradictions.hs:437`).
 fn pretty_contradiction(c: &tamarin_theory::constraint::solver::contradictions::Contradiction) -> String {
     use tamarin_theory::constraint::solver::contradictions::Contradiction::*;
     match c {
@@ -619,21 +654,6 @@ fn action_link(
     )
 }
 
-fn url_path_escape(s: &str) -> String {
-    s.chars().map(|c| match c {
-        c if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' => c.to_string(),
-        c => format!("%{:02X}", c as u32),
-    }).collect()
-}
-
-/// Match Haskell's `prefixWithUnderscore`: empty segments become `_`
-/// so the Yesod / axum routers don't collapse adjacent slashes.
-fn prefix_with_underscore(s: &str) -> String {
-    if s.is_empty() { "_".into() }
-    else if s.starts_with('_') { format!("_{}", s) }
-    else { s.to_string() }
-}
-
 fn encode_path(path: &[String]) -> String {
     if path.is_empty() { return String::new(); }
     let mut s = String::new();
@@ -642,13 +662,6 @@ fn encode_path(path: &[String]) -> String {
         s.push_str(&url_path_escape(&prefix_with_underscore(seg)));
     }
     s
-}
-
-/// Inverse of `prefix_with_underscore`.
-pub fn unprefix_underscore(s: &str) -> String {
-    if s == "_" { String::new() }
-    else if s.starts_with("__") { s[1..].to_string() }
-    else { s.to_string() }
 }
 
 fn goal_summary(g: &Goal) -> String {
@@ -667,8 +680,23 @@ fn goal_summary(g: &Goal) -> String {
             format!("{}({}) @ prem #{}{}", tag, args.join(","),
                 np.0.name, np.0.idx)
         }
-        Goal::Split(s) => format!("Split({:?})", s),
-        Goal::Disj(_) => "Disj(...)".to_string(),
+        // Mirror Haskell `prettyGoal` (`Constraints.hs:279-280`):
+        //   prettyGoal (SplitG x) = "splitEqs" <> parens (show (unSplitId x))
+        Goal::Split(s) => format!("splitEqs({})", s.0),
+        // Mirror Haskell `prettyGoal` (`Constraints.hs:275-278`):
+        //   DisjG (Disj [])  -> "Disj (⊥)"
+        //   DisjG (Disj gfs) -> punctuate "  ∥" (map (parens . prettyGuarded) gfs)
+        Goal::Disj(d) => {
+            if d.0.is_empty() {
+                "Disj(\u{22A5})".to_string()
+            } else {
+                let parts: Vec<String> = d.0.iter()
+                    .map(|c| format!("({})",
+                        tamarin_theory::pretty_formula::pretty_guarded(c)))
+                    .collect();
+                parts.join("  \u{2225} ")
+            }
+        }
         Goal::Subterm((a, b)) => format!("{} \u{2291} {}",
             pretty_lnterm(a), pretty_lnterm(b)),
     }

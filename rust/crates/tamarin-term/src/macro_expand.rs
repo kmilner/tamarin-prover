@@ -77,7 +77,21 @@ fn find_matching_macro<'a, C, V>(
     fsym: &FunSym,
     macros: &'a [Macro<C, V>],
 ) -> Option<&'a Macro<C, V>> {
-    macros.iter().find(|m| &macro_to_fun_sym(m) == fsym)
+    // Equivalent to HS `find (\m -> macroToFunSym m == f)` but compares
+    // `fsym`'s fields directly instead of rebuilding (and heap-cloning the
+    // name into) a fresh `NoEqSym` per macro per node. `macroToFunSym`
+    // always yields a private destructor `NoEq` of arity `params.len()`,
+    // so the equality reduces to a head check on those four fields.
+    let s = match fsym {
+        FunSym::NoEq(s) => s,
+        _ => return None,
+    };
+    if s.privacy != Privacy::Private || s.constructability != Constructability::Destructor {
+        return None;
+    }
+    macros
+        .iter()
+        .find(|m| s.name == m.name && s.arity == m.params.len())
 }
 
 // Helper for tests: extract the inner NoEqSym out of a FunSym we know is NoEq.

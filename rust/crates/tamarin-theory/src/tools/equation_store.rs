@@ -60,18 +60,9 @@ fn freshen_witness_range(
     use std::collections::{BTreeMap, BTreeSet};
     let trace = std::env::var("TAM_DBG_FRESHEN_WITNESS").is_ok();
     let domain: BTreeSet<LVar> = raw.iter().map(|(v, _)| v.clone()).collect();
-    // Collect every range-only var that isn't a domain key OR an input.
-    // Mirrors Haskell-faithful witness detection: any var introduced by
-    // the Maude unifier that doesn't trace back to the input/output
-    // variable sets is a fresh witness that needs globally-unique idx.
-    //
-    // Earlier versions ALSO renamed domain keys whose (name, idx)
-    // coincidentally collided with input vars across different sorts,
-    // as a workaround for the now-removed sort-blind restrict matching
-    // (see commit 1e16e77f).  With full LVar equality everywhere
-    // downstream, those cross-sort collisions are no longer harmful —
-    // `t#1:Msg` and `t#1:Fresh` are correctly distinct LVars and the
-    // rename was unnecessary.  Removed for Haskell parity.
+    // Witnesses = range-only vars that are neither a domain key nor an
+    // input var (i.e. auxiliaries the Maude unifier introduced); these are
+    // the ones that need a globally-unique idx.
     let mut witnesses: BTreeSet<LVar> = BTreeSet::new();
     for (_, t) in &raw {
         t.for_each_free(&mut |w| {
@@ -193,6 +184,53 @@ fn aes_dbg_add_disj() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("TAM_DBG_ADD_DISJ").is_ok())
 }
+/// `TAM_RS_DISABLE_DISJ_SORT` is an opt-OUT kill-switch read on the hot
+/// simp fixed-point path (`sort_disj_substs`, called after every mutating
+/// pass) and in `add_disj`.  Cache it behind a `OnceLock<bool>` so the
+/// steady-state cost is an atomic load, not a getenv + `String` alloc per
+/// call.  `true` means "sort enabled" (default), i.e. the env var is unset.
+#[inline]
+fn aes_disj_sort_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_DISJ_SORT").is_err())
+}
+/// `TAM_RS_DISABLE_SIMP_ABSTRACT_FUN` is an opt-OUT kill-switch read on
+/// the hot simp path (`simp_abstract_fun_with_maude`).  `true` means the
+/// var is set (skip the pass).
+#[inline]
+fn aes_disable_simp_abstract_fun() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_SIMP_ABSTRACT_FUN").is_ok())
+}
+/// `TAM_RS_ENABLE_H29` is an opt-IN diagnostic flag read on the hot simp
+/// path (the singleton-fold guard).  `true` means the var is set.
+#[inline]
+fn aes_enable_h29() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_ENABLE_H29").is_ok())
+}
+/// `TAM_RS_DISABLE_ADDEQS_SINGLETON_DISJ` is an opt-IN kill-switch read in
+/// `add_eqs`'s single-non-empty-unifier arm.  `true` means the var is set
+/// (restore the old eager-compose).
+#[inline]
+fn aes_disable_addeqs_singleton_disj() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_ADDEQS_SINGLETON_DISJ").is_ok())
+}
+/// `TAM_TRACE_SET_FALSE` debug flag (opt-IN), read on the solve-path
+/// `set_false`.  Cached so the steady-state cost is an atomic load.
+#[inline]
+fn aes_trace_set_false() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_TRACE_SET_FALSE").is_ok())
+}
+/// `TAM_TRACE_SET_FALSE_FULL` debug flag (opt-IN), read on the solve-path
+/// `set_false`.  Cached so the steady-state cost is an atomic load.
+#[inline]
+fn aes_trace_set_false_full() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TAM_TRACE_SET_FALSE_FULL").is_ok())
+}
 
 fn impure_dbg_registry()
     -> &'static std::sync::Mutex<std::collections::HashMap<String, String>>
@@ -311,7 +349,7 @@ impl EquationStore {
 
     /// Set the store to logical false. Returns the modified store.
     pub fn set_false(mut self) -> Self {
-        if std::env::var("TAM_TRACE_SET_FALSE").is_ok() && !self.is_false() {
+        if aes_trace_set_false() && !self.is_false() {
             let bt = std::backtrace::Backtrace::force_capture();
             let bt_s = format!("{bt}");
             let caller = bt_s.lines()
@@ -322,7 +360,7 @@ impl EquationStore {
                 .trim();
             eprintln!("[set_false] caller={}", caller);
         }
-        if std::env::var("TAM_TRACE_SET_FALSE_FULL").is_ok() && !self.is_false() {
+        if aes_trace_set_false_full() && !self.is_false() {
             let bt = std::backtrace::Backtrace::force_capture();
             let bt_s = format!("{bt}");
             let cpath = crate::constraint::solver::trace::case_path_string();
@@ -435,7 +473,7 @@ impl EquationStore {
         //
         // Opt-out via `TAM_RS_DISABLE_DISJ_SORT=1` for diagnosis.
         let mut substs = substs;
-        if std::env::var("TAM_RS_DISABLE_DISJ_SORT").is_err() {
+        if aes_disj_sort_enabled() {
             substs.sort();
             substs.dedup();
         }
@@ -502,14 +540,19 @@ impl EquationStore {
                 eprintln!("[perform_split]   {:?} → {:?}", k, v);
             }
         }
-        // HS `performSplit` (EquationStore.hs:254) orders the cases via
-        //   orderedSubsts = sortOnMemo dropNameHintsLNSubstVFresh . S.toList
-        // i.e. a STABLE sort, by the substitution's canonical form (fresh range
-        // vars renumbered by first appearance, name hints dropped), of the
-        // `S.toList` (raw `Ord`) sequence. Without the canonical key the order
-        // would track the fresh-allocation counter, which differs between runs
-        // / implementations. `sort()` = `S.toList`; `sort_by_cached_key` is the
-        // stable, memoised `sortOnMemo dropNameHintsLNSubstVFresh`.
+        // HS `performSplit` (EquationStore.hs:208-217) itself does NO sort: it
+        // is `mkNewEqStore before after <$> S.toList disj`, i.e. the cases come
+        // out in the `Data.Set LNSubstVFresh` `S.toList` (raw `Ord`) order.
+        // The name-hint canonicalisation is applied EARLIER, not here: HS's
+        // `dropNameHintsBound` (EquationStore.hs:140-141) maps
+        // `dropNameHintsLNSubstVFresh` over every disj subst, and it is invoked
+        // from `addNormSys` (Sources.hs:246) before the store is split — which,
+        // because the disj is a `Data.Set`, reorders the substs by their
+        // canonical (name-hint-dropped) `Ord`.  The two sorts below reproduce
+        // that pipeline: `sort()` is the `Data.Set` raw-`Ord` order, and the
+        // stable `sort_by_cached_key(drop_name_hints)` applies the
+        // canonicalisation-induced reordering that `dropNameHintsBound` causes,
+        // so `split_case_1` matches HS's first `S.toList` element.
         sorted_substs.sort();
         sorted_substs.sort_by_cached_key(|s| s.drop_name_hints());
         if std::env::var("TAM_DBG_PERFORM_SPLIT").is_ok() {
@@ -563,11 +606,20 @@ impl EquationStore {
         self.add_eqs_inner(maude, eqs, extra_avoid)
     }
 
-    /// Maude-backed `addEqs`. Calls the supplied Maude bridge to AC-unify
-    /// the given equations and incorporates the result into the store.
+    /// Maude-backed `addEqs` with a ZERO freshness baseline.  Equivalent to
+    /// `add_eqs_with_avoid(maude, eqs, 0)`.
+    ///
+    /// TEST-ONLY: solver code MUST use `add_eqs_with_avoid` with the
+    /// surrounding system's max var idx.  With a zero baseline, Maude
+    /// witnesses are renamed using only the eq-store's own max idx, which can
+    /// collide with vars in nodes/edges/goals/formulas — the variable
+    /// conflation bug documented on `add_eqs_with_avoid`.  Gated behind
+    /// `#[cfg(test)]` so it cannot be reintroduced on a solve path.
+    ///
     /// Returns the new split id if the unification produced a non-trivial
     /// disjunction; `None` if the unifier was either single (already
     /// composed into `subst`) or empty (store becomes false).
+    #[cfg(test)]
     pub fn add_eqs(
         &mut self,
         maude: &tamarin_term::maude_proc::MaudeHandle,
@@ -713,8 +765,7 @@ impl EquationStore {
         // disj expansion.)
         // Kill-switch: TAM_RS_DISABLE_ADDEQS_SINGLETON_DISJ=1 restores the
         // old eager-compose for single non-empty unifiers.
-        let eager_single_disabled =
-            std::env::var("TAM_RS_DISABLE_ADDEQS_SINGLETON_DISJ").is_ok();
+        let eager_single_disabled = aes_disable_addeqs_singleton_disj();
         if unifiers.len() == 1
             && (unifiers[0].is_empty() || eager_single_disabled)
         {
@@ -897,6 +948,16 @@ impl EquationStore {
     /// - `simp_empty_disj`
     /// - `simp_identify`
     /// - `simp_abstract_name`
+    ///
+    /// NOT solve-path faithful and effectively test-only: its only callers
+    /// are the `simp_disjunction` helper (whose production path is
+    /// `simp_disjunction_with_maude`) and the in-file tests.  Unlike
+    /// `simp_with_fresh_avoiding`, this variant does NOT call
+    /// `sort_disj_substs` between passes, so after `simp_minimize` reorders
+    /// substs in insertion order, `d.substs[0]` (probed by `simp_identify`
+    /// / `simp_abstract_name`) may no longer be the `Ord`-least element that
+    /// HS's `Data.Set`-based `foreachDisj` would see.  Production code must
+    /// use `simp_with_fresh_avoiding`.
     pub fn simp<F: Fn(&LNSubst, &LNSubstVFresh) -> bool>(
         mut self,
         is_contr: F,
@@ -925,7 +986,7 @@ impl EquationStore {
     /// (used by simp_identify/simp_abstract_fun probing) matches HS's
     /// Set-first variant.  See [[project-h16-6-disj-sort-path-a]].
     pub fn sort_disj_substs(&mut self) {
-        if std::env::var("TAM_RS_DISABLE_DISJ_SORT").is_ok() { return; }
+        if !aes_disj_sort_enabled() { return; }
         for d in self.conj.iter_mut() {
             d.substs.sort();
             d.substs.dedup();
@@ -1391,7 +1452,7 @@ impl EquationStore {
         // operators is what prevents the HS-faithful cycle detection at
         // iter-2 c_pcs source-pick (vk's stored term needs rule-internal
         // var names that compose with chain bindings, not fresh witnesses).
-        if std::env::var("TAM_RS_DISABLE_SIMP_ABSTRACT_FUN").is_ok() {
+        if aes_disable_simp_abstract_fun() {
             return false;
         }
 
@@ -1526,16 +1587,22 @@ impl EquationStore {
                     let mut kept: Vec<(LVar, LNTerm)> = s.to_list().into_iter()
                         .filter(|(x, _)| x != &v)
                         .collect();
-                    if args.len() < 2 {
-                        // Shouldn't happen for AC (arity >= 2 by HS comment).
-                        // Bail out by keeping the subst unchanged.
-                        return s.clone();
-                    }
-                    let a1 = args[0].clone();
-                    let a_rest = if args.len() == 2 {
-                        args[1].clone()
-                    } else {
-                        Term::App(op.clone(), args[1..].to_vec().into())
+                    // HS-faithful `abstractTwo`/`newMappings` (EquationStore.hs:
+                    // 436-444): `newMappings []` ERRORS ("AC symbols must have
+                    // arity >= 2"); silently bailing here would leave a
+                    // malformed store (the factor `{v -> op(fv1,fv2)}` is
+                    // composed into the free subst below regardless, while this
+                    // subst would still bind `v`).  This branch is unreachable
+                    // in practice (AC ops are always arity >= 2), so matching
+                    // HS's hard error is the correct invariant.
+                    let (a1, a_rest) = match args.as_slice() {
+                        [] => panic!(
+                            "simpAbstract: impossible, AC symbols must have arity >= 2."),
+                        // `newMappings [a1,a2] = [(fv1,a1),(fv2,a2)]`
+                        [a1, a2] => (a1.clone(), a2.clone()),
+                        // `newMappings (a:as) = [(fv1,a),(fv2,fApp o as)]`
+                        [a1, rest @ ..] =>
+                            (a1.clone(), Term::App(op.clone(), rest.to_vec().into())),
                     };
                     kept.push((fv1.clone(), a1));
                     kept.push((fv2.clone(), a_rest));
@@ -1664,7 +1731,7 @@ impl EquationStore {
             // fires on singletons), so it neither helps nor harms resolved1
             // while reverting the 3 flips.  The experimental skip remains
             // reachable for diagnosis via the opt-IN `TAM_RS_ENABLE_H29=1`.
-            let h29_skip_fold = std::env::var("TAM_RS_ENABLE_H29").is_ok()
+            let h29_skip_fold = aes_enable_h29()
                 && crate::constraint::solver::sources::in_precompute_mode();
             if !h29_skip_fold
                 && self.simp_singleton_avoiding(&mut alloc, external_preserve, maude) {
@@ -2072,8 +2139,9 @@ impl EquationStore {
         // `solve…case Init_1/Resp/c_exp` block vs `by contradiction`
         // ordering at the leaf level.
         //
-        // When `TAM_RS_APPLYBOUND_LOCAL_RESET` is set (default-on after
-        // verification), each per-variant Maude call uses a LOCAL
+        // This behaviour is ON by default (disable via the opt-OUT
+        // `TAM_RS_DISABLE_APPLYBOUND_LOCAL_RESET=1`): each per-variant Maude
+        // call uses a LOCAL
         // MaudeHandle (via `with_fresh_counter_from(avoid_max)`).  The
         // local handle shares the underlying Maude process state but
         // has its own counter that starts at `succ avoid_max` PER call.
