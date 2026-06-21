@@ -5173,6 +5173,25 @@ fn close_trivial_chains_in_graft(
                     }
                 }
             }
+            // HS-faithful: never auto-close a chain that `openChainGoals`
+            // (Goals.hs:99-108) keeps as an OPEN ranked goal.  A DnK
+            // chain whose conclusion is NOT a Msg-sorted variable (a
+            // concrete app OR a Fresh/Pub/Nat name) is ALWAYS open in HS
+            // (`otherwise -> not solved`); HS solves it via the explicit
+            // `solveChain` proof method, never via an eager graft-time
+            // direct edge.  RS's over-eager closure here dropped the
+            // deconstruction chain `(#vl,0)~~>(#vk,0)` (conc KD(~x),
+            // Fresh-sorted) during the RFID_Simple `!KU(aenc)` Alice
+            // graft, where HS keeps it open and renders it as
+            // `solve( (#vl,0)~~>(#vk,0) ) case Var_fresh_1_x`.  Gate on
+            // the canonical `openGoals` mirror so RS leaves open exactly
+            // what HS leaves open; only chains HS itself auto-handles
+            // (union-all-known) remain eligible for direct-edge closure.
+            if crate::constraint::solver::goals::is_open_for_saturate(
+                &Goal::Chain(c.clone(), p.clone()), &r.sys)
+            {
+                return None;
+            }
             Some((c.clone(), p.clone(), fa_conc, fa_prem))
         });
         let Some((c, p, fa_conc, fa_prem)) = candidate else { break };
