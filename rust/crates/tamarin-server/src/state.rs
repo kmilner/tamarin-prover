@@ -45,8 +45,19 @@ pub struct TheoryEntry {
     pub loaded_at: DateTime<Local>,
     /// True for the originally loaded copy (vs. ones produced by edits).
     pub primary: bool,
-    /// HTML for wellformedness warnings (currently empty — wf surfaces
-    /// would land here once we route them through the server).
+    /// HTML for the wellformedness warning banner shown in the theory
+    /// page header (HS `errorsHtml`, rendered raw via
+    /// `preEscapedToMarkup info.errorsHtml` at `src/Web/Theory.hs:1194`).
+    /// HS populates it from `makeWfErrorsHtml`
+    /// (`src/Web/Handler.hs:461-469`), which wraps
+    /// `renderHtmlDoc (htmlDoc $ prettyWfErrorReport report)` of the
+    /// *closed* theory's wellformedness report in a `<div class="wf-warning">`.
+    /// This is an unported interactive-web-UI feature: the Rust load path
+    /// leaves it `String::new()` and no handler renders it, so the warning
+    /// banner is not surfaced. It does not affect `--prove` output (the CLI
+    /// reports wf errors via its own path). Populating it byte-for-byte
+    /// requires the close-time (Maude-dependent) wf report plus matching
+    /// HS `htmlDoc` escaping, so it is deferred rather than partially faked.
     pub errors_html: String,
     /// Live proof state — built lazily on first request that needs it
     /// (theory load → only kept-around-but-empty until `ensure_proof_state`

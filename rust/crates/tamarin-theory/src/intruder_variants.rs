@@ -178,6 +178,12 @@ pub fn parse_intruder_rules(
 /// `option 0 natural` defaults `limit` to 0.  The cached `.spthy` files
 /// never emit a non-zero limit (they're produced by the canonical HS
 /// generator which doesn't print one), so we always see limit=0 here.
+/// (Note: this port's `parse_intruder_rules` — parser.rs `parse_rule_ac`
+/// — does not even read a trailing natural limit; it expects `:` after
+/// the rule attributes.  A hand-written intruder rule carrying an
+/// explicit limit would therefore be rejected here, whereas HS's
+/// `option 0 natural` would accept it.  This is a latent, unexercised
+/// parser-side divergence — the cached corpus never hits it.)
 ///
 /// `True False` are HS hard-codes — see the FIXME at Rule.hs:164-165
 /// ("Currently we (wrongly) always assume that we have a subterm

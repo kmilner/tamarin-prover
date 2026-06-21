@@ -13,6 +13,12 @@ use std::time::Duration;
 
 use tamarin_parser::{ast, parse_theory};
 
+fn corpus_root() -> std::path::PathBuf {
+    std::env::var("CORPUS_ROOT").map(std::path::PathBuf::from).unwrap_or_else(|_| {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../examples")
+    })
+}
+
 #[derive(Debug, Default, Clone)]
 struct Counts {
     name: String,
@@ -23,7 +29,7 @@ struct Counts {
 
 fn main() {
     let mut args = env::args().skip(1);
-    let mut root = PathBuf::from("/home/parallels/tamarin-prover/examples");
+    let mut root = corpus_root();
     let mut limit: Option<usize> = None;
     let mut filter: Option<String> = None;
     let mut tamarin_path = "tamarin-prover".to_string();

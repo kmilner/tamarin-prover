@@ -29,29 +29,6 @@ pub fn norm(maude: &MaudeHandle, t: &LNTerm) -> Result<LNTerm, MaudeError> {
     maude.reduce(t)
 }
 
-/// `normSubstVFresh'` — normalise every range term of a `LNSubstVFresh`
-/// via Maude.
-///
-/// HS canonical (`lib/term/src/Term/Rewriting/Norm.hs:158-159`):
-/// ```haskell
-/// normSubstVFresh' :: LNSubstVFresh -> WithMaude LNSubstVFresh
-/// normSubstVFresh' s = reader $ \hnd ->
-///     mapRangeVFresh (\t -> norm' t `runReader` hnd) s
-/// ```
-///
-/// Behaviour: walk the substitution, replacing each range term with
-/// `norm hnd t` (falling back to the original term on Maude error —
-/// matches the lenient call sites already in the port).
-pub fn norm_subst_vfresh(
-    maude: &MaudeHandle,
-    s: &crate::subst_vfresh::LNSubstVFresh,
-) -> crate::subst_vfresh::LNSubstVFresh {
-    s.map_range(|t| match norm(maude, &t) {
-        Ok(n) => n,
-        Err(_) => t,
-    })
-}
-
 /// `nfViaHaskell` — pure structural normal-form check.  Mirrors HS
 /// `Term/Rewriting/Norm.hs:54-127` (`nfViaHaskell`).  Returns `true`
 /// iff `t` is in normal form according to the structural rules of the
@@ -89,9 +66,10 @@ fn go_nf(t: &LNTerm, msig: &MaudeSig, irreducible: &FunSig) -> bool {
             // `FAppNoEq o ts | (NoEq o) \`S.member\` irreducible` — the
             // irreducible-set check is gated by `FAppNoEq` (i.e. NoEq
             // function symbols only).  AC symbols like Mult are kept in
-            // `irreducible_fun_syms` for OTHER consumers (Sources.hs:177
-            // `maybeNonNormalTerms` uses `S.member` on the FUN set to
-            // decide which subterms to NOT include), but Norm.hs's NF
+            // `irreducible_fun_syms` for OTHER consumers
+            // (Contradictions.hs:149-150 `maybeNonNormalTerms` uses
+            // `S.member` on the FUN set to decide which subterms to NOT
+            // include), but Norm.hs's NF
             // check uses pattern matching on `FAppNoEq` which only
             // matches NoEq symbols.  Without this gate, RS treated
             // `Mult(tid, ekI, ekR, inv(tid))` as NF (skipped section 5's
@@ -318,27 +296,10 @@ fn rule_applies(t: &LNTerm, lhs: &LNTerm, rhs: &crate::subterm_rule::StRhs) -> b
     }
 }
 
-/// Subterms that *might* not be in normal form. Used by
-/// wellformedness / contradiction checks to limit the number of
-/// Maude callouts.
-pub fn maybe_not_nf_subterms(msig: &MaudeSig, t: &LNTerm) -> Vec<LNTerm> {
-    let mut out = Vec::new();
-    let irreducible = &msig.irreducible_fun_syms;
-    fn go(t: &LNTerm, irreducible: &FunSig, out: &mut Vec<LNTerm>) {
-        match t {
-            Term::Lit(_) => {}
-            Term::App(sym, args) => {
-                if irreducible.contains(sym) {
-                    for a in args.iter() { go(a, irreducible, out); }
-                } else {
-                    out.push(t.clone());
-                }
-            }
-        }
-    }
-    go(t, irreducible, &mut out);
-    out
-}
+// NOTE: `maybeNotNfSubterms` (HS `Term/Rewriting/Norm.hs:162-168`) lives
+// in the solver, not here — see `contradictions.rs::maybe_not_nf_subterms`,
+// which is the HS-faithful copy (it returns `[t]` for a bare `Lit (Var _)`,
+// matching HS's `_ -> [t]` wildcard, and `[]` only for `Lit (Con _)`).
 
 #[cfg(test)]
 mod tests {
@@ -396,13 +357,5 @@ mod tests {
         // (invalid_mult fires because tid appears as a factor and inside inv).
         assert!(!nf_via_haskell(&h.maude_sig(), &mult),
             "mult(tid, ekI, ekR, inv(tid)) should be non-NF");
-    }
-
-    #[test]
-    fn maybe_not_nf_subterms_lit_empty() {
-        let sig = pair_maude_sig();
-        let v = LVar::new("x", LSort::Msg, 0);
-        let t: LNTerm = Term::Lit(Lit::Var(v));
-        assert!(maybe_not_nf_subterms(&sig, &t).is_empty());
     }
 }

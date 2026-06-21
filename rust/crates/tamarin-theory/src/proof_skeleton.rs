@@ -2,6 +2,14 @@
 //! cross-checking that our proof trees structurally match
 //! `tamarin-prover`'s.
 //!
+//! This module is a test-only cross-checking harness; it is **not**
+//! part of `--prove` output. The production pretty-printer lives in
+//! `proof.rs` / `proof_method.rs` (ports of `Theory/Proof.hs`
+//! `prettyProofWith`/`ppCases` and
+//! `Theory/Constraint/Solver/ProofMethod.hs` `prettyProofMethod`).
+//! The "intentionally drops X" notes below describe abbreviations made
+//! by *this* skeleton diff tool, not divergences in the real prover.
+//!
 //! The skeleton intentionally drops goal pretty-printing (variable
 //! indices and term rendering diverge for cosmetic reasons even when
 //! the search is identical). What remains is the *shape*:
@@ -144,10 +152,8 @@ fn render_node(node: &ProofNode, indent: usize, out: &mut String) {
                     // keeps the survivor's label verbatim — including any
                     // `_case_N` dedup suffix appended by `uniqueListBy`
                     // (ProofMethod.hs:91, applied at :308) when the goal
-                    // originally had
-                    // multiple cases sharing a rule name.  We had been
-                    // stripping the suffix on the assumption Haskell did
-                    // the same; it does not.  Pass the name through.
+                    // originally had multiple cases sharing a rule name.
+                    // Pass the name through unchanged.
                     vec![(name.clone(), child)]
                 }
                 None => node.children.iter()

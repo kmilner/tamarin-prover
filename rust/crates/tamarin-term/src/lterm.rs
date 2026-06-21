@@ -4,9 +4,11 @@
 //! trait with `frees`/`occurs`/`bounds_var_idx`/`avoid`/`rename`, and
 //! `nat_to_fresh_vars`.
 //!
+//! The `MonotoneFunction` split (AC-preserving vs. arbitrary updates) is
+//! ported as a `monotone: bool` flag rather than an enum: see
+//! `HasFrees::map_free` (`Arbitrary`) and `map_free_monotone` (`Monotone`).
+//!
 //! Not yet ported from this module:
-//! - The `MonotoneFunction` split (AC-preserving vs. arbitrary updates);
-//!   here `HasFrees` exposes only the common cases.
 //! - Pretty-printing instances.
 //!
 //! (`varOccurences`, `eqModuloFreshnessNoAC`, `someInst`/`renamePrecise`,
@@ -522,12 +524,7 @@ where
                 if monotone {
                     crate::term::unsafe_f_app(fsym, mapped)
                 } else {
-                    match fsym {
-                        FunSym::Ac(s) => crate::term::f_app_ac(s, mapped),
-                        FunSym::C(c) => crate::term::f_app_c(c, mapped),
-                        FunSym::List => crate::term::f_app_list(mapped),
-                        FunSym::NoEq(s) => crate::term::f_app_no_eq(s, mapped),
-                    }
+                    crate::term::f_app(fsym, mapped)
                 }
             }
         }

@@ -243,18 +243,52 @@ fn materialise_proof_state_if_needed(
     let _ = state.store.ensure_proof_state(idx, &state.cfg.maude_path);
 }
 
+/// Mirror Haskell `titleThyPath` (`src/Web/Theory.hs:1586-1607`).
+/// Titles are independent of the theory name EXCEPT `TheoryHelp`.
 fn title_for(entry: &crate::state::TheoryEntry, path: &path_parse::TheoryPath) -> String {
     use path_parse::TheoryPath::*;
-    let base = &entry.name;
+    use path_parse::SourceKind;
     match path {
-        Help => format!("{} (help)", base),
-        Rules => format!("{} (rules)", base),
-        Message => format!("{} (message theory)", base),
-        Tactic => format!("{} (tactic)", base),
-        Lemma(n) => format!("{} :: {}", base, n),
-        Proof { lemma, .. } | Method { lemma, .. } => format!("{} :: proof {}", base, lemma),
-        Source { .. } => format!("{} (sources)", base),
-        Edit(n) | Add(n) | Delete(n) => format!("{} :: {}", base, n),
+        // TheoryHelp -> "Theory: " ++ thy._thyName
+        Help => format!("Theory: {}", entry.name),
+        // TheoryRules -> "Multiset rewriting rules and restrictions"
+        Rules => "Multiset rewriting rules and restrictions".to_string(),
+        // TheoryMessage -> "Message theory"
+        Message => "Message theory".to_string(),
+        // TheoryTactic -> "Tactics"
+        Tactic => "Tactics".to_string(),
+        // TheorySource RawSource _ _ -> "Raw sources"
+        Source { kind: SourceKind::Raw, .. } => "Raw sources".to_string(),
+        // TheorySource RefinedSource _ _ -> "Refined sources"
+        Source { kind: SourceKind::Refined, .. } => "Refined sources".to_string(),
+        // TheoryEdit l -> "Edit Lemma: " ++ l
+        Edit(l) => format!("Edit Lemma: {}", l),
+        // TheoryAdd _ -> "Add new Lemma"  (HS ignores its argument)
+        Add(_) => "Add new Lemma".to_string(),
+        // TheoryDelete l -> "Delete " ++ l
+        Delete(l) => format!("Delete {}", l),
+        // TheoryLemma l -> "Lemma: " ++ l
+        Lemma(l) => format!("Lemma: {}", l),
+        // TheoryProof l [] -> "Lemma: " ++ l
+        Proof { lemma, sub } if sub.is_empty() => format!("Lemma: {}", lemma),
+        // TheoryProof l p | null (last p) -> "Method: " ++ methodName l p
+        //                 | otherwise     -> "Case: " ++ last p
+        //
+        // `methodName` resolves the proof node and renders
+        // `prettyProofMethod` of the node's method, returning "None" when
+        // resolution fails.  That plumbing (resolveProofPath +
+        // prettyProofMethod) is not yet ported to the Rust server, so the
+        // `Method:` arm falls back to HS's own "None" failure value.
+        Proof { lemma: _, sub } => match sub.last() {
+            // null (last p): "Method: " ++ methodName l p  (== "None" here).
+            Some(s) if s.is_empty() => "Method: None".to_string(),
+            // otherwise: "Case: " ++ last p
+            Some(s) => format!("Case: {}", s),
+            None => unreachable!("sub is non-empty: the [] case is handled above"),
+        },
+        // TheoryMethod{} -> "Method Path: This title should not be shown. ..."
+        Method { .. } =>
+            "Method Path: This title should not be shown. Please file a bug".to_string(),
     }
 }
 
@@ -313,9 +347,18 @@ pub async fn message_deduction(
 /// `path`'s first segment is typically `proof/<lemma-name>`.
 pub async fn autoprove(
     State(state): State<Arc<AppState>>,
-    Path((idx, _extractor, bound, quit, raw_path)):
+    Path((idx, extractor, bound, quit, raw_path)):
         Path<(usize, String, usize, String, String)>,
 ) -> Response {
+    // Match Haskell's Yesod `PathPiece SolutionExtractor`
+    // (`src/Web/Types.hs:626-638`): only the five known extractor names
+    // parse; any other value makes `fromPathPiece` return `Nothing`, so
+    // Yesod routing yields `notFound` (404) before the handler runs.
+    // `autoprover_name` returns `None` for an unrecognised extractor and
+    // otherwise the exact `fullName` Haskell `getAutoProverR` builds.
+    let Some(name) = autoprover_name(&extractor, bound) else {
+        return not_found_response();
+    };
     // Match Haskell's Yesod `PathPiece Bool`: only "True" / "False"
     // are valid.  Anything else 404s.
     if parse_bool_path_piece(&quit).is_none() {
@@ -334,8 +377,11 @@ pub async fn autoprove(
         path_parse::TheoryPath::Proof { lemma, .. }
         | path_parse::TheoryPath::Method { lemma, .. }
         | path_parse::TheoryPath::Lemma(lemma) => lemma.clone(),
+        // Haskell `getProverR` non-`TheoryProof` arm
+        // (`src/Web/Handler.hs:1072-1073`):
+        //   JsonAlert $ "Can't run " <> name <> " on the given theory path!"
         _ => return json_resp::alert(
-            "Can't run the autoprover () on the given theory path!".to_string())
+            format!("Can't run {} on the given theory path!", name))
             .into_response(),
     };
 
@@ -367,11 +413,12 @@ pub async fn autoprove(
     match result {
         Err(join_err) => json_resp::alert(format!("internal error: {}", join_err)).into_response(),
         Ok(Err(_)) => {
-            // Haskell formats this as `"Sorry, but <prover-name> failed!"`.
-            // `getAutoProverR` builds `<prover-name>` as e.g. "the
-            // autoprover ()" — the same string Haskell uses when no
-            // qualifiers are emitted.
-            json_resp::alert("Sorry, but the autoprover () failed!").into_response()
+            // Haskell `getProverR` `TheoryProof` failure
+            // (`src/Web/Handler.hs:1068`):
+            //   JsonAlert $ "Sorry, but " <> name <> " failed!"
+            // where `name` is the `fullName` built by `getAutoProverR`
+            // from the extractor + bound (see `autoprover_name`).
+            json_resp::alert(format!("Sorry, but {} failed!", name)).into_response()
         }
         Ok(Ok(root)) => {
             let status = root.status.clone();
@@ -450,6 +497,41 @@ pub fn parse_bool_path_piece(s: &str) -> Option<bool> {
     }
 }
 
+/// Build the prover display name exactly as Haskell `getAutoProverR` /
+/// `getAutoProverAllR` (`src/Web/Handler.hs:1170-1218`):
+///
+/// ```text
+/// fullName   = proverName <> " (" <> intercalate ", " qualifiers <> ")"
+/// qualifiers = extractorQualifier ++ boundQualifier
+/// ```
+///
+/// `extractor` is the URL `#SolutionExtractor` path piece; Yesod's
+/// `instance PathPiece SolutionExtractor` (`src/Web/Types.hs:626-638`)
+/// accepts only the five strings below — any other value makes
+/// `fromPathPiece` return `Nothing`, which Yesod turns into a routing
+/// `notFound` (404) BEFORE the handler runs.  We mirror that by
+/// returning `None` here for an unrecognised extractor.
+///
+/// Note: the displayed name is computed from the RAW extractor, NOT the
+/// quit-on-empty–adjusted cut.  HS's `apCut = if quitOnEmpty then
+/// CutAfterSorry else extractor` only affects the prover, while
+/// `fullName`'s `extractorQualfier` matches on the original `extractor`.
+fn autoprover_name(extractor: &str, bound: usize) -> Option<String> {
+    let (prover_name, extractor_qual): (&str, &[&str]) = match extractor {
+        "characterize" => ("characterization", &["dfs"]),
+        "idfs"         => ("the autoprover",   &[]),
+        "bfs"          => ("the autoprover",   &["bfs"]),
+        "seqdfs"       => ("the autoprover",   &["seqdfs"]),
+        "sorry"        => ("the autoprover",   &["sorry"]),
+        _ => return None,
+    };
+    let mut qualifiers: Vec<String> = extractor_qual.iter().map(|s| s.to_string()).collect();
+    if bound > 0 {
+        qualifiers.push(format!("bound {}", bound));
+    }
+    Some(format!("{} ({})", prover_name, qualifiers.join(", ")))
+}
+
 /// `GET /thy/trace/<idx>/autoproveAll/<extractor>/<bound>/*path` —
 /// run the autoprover on every lemma and return a redirect to the
 /// fresh theory idx, matching Haskell `getAutoProverAllR` /
@@ -468,8 +550,17 @@ pub fn parse_bool_path_piece(s: &str) -> Option<bool> {
 /// rather than re-emitting the last lemma's proof root.
 pub async fn autoprove_all(
     State(state): State<Arc<AppState>>,
-    Path((idx, _extractor, bound, _raw_path)): Path<(usize, String, usize, String)>,
+    Path((idx, extractor, bound, _raw_path)): Path<(usize, String, usize, String)>,
 ) -> Response {
+    // Match Haskell's Yesod `PathPiece SolutionExtractor`
+    // (`src/Web/Types.hs:626-638`): an unrecognised extractor makes
+    // `fromPathPiece` return `Nothing`, so Yesod routing 404s before
+    // `getAutoProverAllR` runs.  (`getProverAllR` never surfaces the
+    // prover `name` to the user — it always redirects — so unlike
+    // `autoprove` we only need the validation, not the display name.)
+    if autoprover_name(&extractor, bound).is_none() {
+        return not_found_response();
+    }
     let Some(entry) = state.store.get(idx) else {
         return missing_idx_html(idx);
     };
@@ -547,21 +638,21 @@ pub async fn verify(
         // the proof here; the Rust port only redirects — see the
         // handler doc above.)
         path_parse::TheoryPath::Proof { lemma, sub } => {
-            // Re-emit the proof path verbatim so navigation stays
-            // pointed at the same node.  Mirrors Haskell `JsonRedirect`
-            // target: `/thy/trace/<idx>/overview/proof/<lemma>/...`.
-            let mut url = format!("/thy/trace/{}/overview/proof/{}", idx, lemma);
+            // Re-emit the proof path so navigation stays pointed at the
+            // same node.  Mirrors Haskell `JsonRedirect` target
+            // `/thy/trace/<idx>/overview/proof/<lemma>/...`, which goes
+            // through Yesod `getUrlRender` and so percent-encodes each
+            // path segment.  Use the shared helpers, identical to
+            // `apply_method_and_redirect` (this file): `url_path_escape`
+            // on the lemma, `prefixWithUnderscore` + `url_path_escape`
+            // on each sub segment.
+            let mut url = format!(
+                "/thy/trace/{}/overview/proof/{}",
+                idx, path_parse::url_path_escape(&lemma));
             for seg in sub {
                 url.push('/');
-                // Mirror prefixWithUnderscore for URL emission.
-                if seg.is_empty() {
-                    url.push('_');
-                } else if seg.starts_with('_') {
-                    url.push('_');
-                    url.push_str(&seg);
-                } else {
-                    url.push_str(&seg);
-                }
+                url.push_str(&path_parse::url_path_escape(
+                    &path_parse::prefix_with_underscore(&seg)));
             }
             json_resp::redirect(url).into_response()
         }
@@ -604,10 +695,14 @@ pub async fn reload(
         // form/button — surfacing through the standard alert UI.
         return json_resp::alert("Theory not found".to_string());
     };
+    // Mirror Haskell `checkReloadOrigin` (`src/Web/Handler.hs:385-388`):
+    // two distinct JsonAlert strings for the two non-Local origins.
     let path = match &entry.origin {
         crate::state::TheoryOrigin::Local(p) => p.clone(),
-        _ => return json_resp::alert(
-            "Cannot reload: theory was uploaded or interactively created"),
+        crate::state::TheoryOrigin::Upload(_) => return json_resp::alert(
+            "Cannot reload: theory was uploaded (no file path)"),
+        crate::state::TheoryOrigin::Interactive => return json_resp::alert(
+            "Cannot reload: theory was created interactively (no file path)"),
     };
     match crate::theory_io::load_from_path(&path) {
         Ok(new_entry) => {
@@ -1101,27 +1196,28 @@ pub async fn delete_step(
             // Haskell `modifyTheory` passes `(const path)` as fpath,
             // i.e. the redirect target is the same path that was
             // deleted (a `TheoryLemma name`).  Render shape:
-            // `/thy/trace/<newIdx>/overview/lemma/<name>`.
+            // `/thy/trace/<newIdx>/overview/lemma/<name>`.  The URL goes
+            // through Yesod `getUrlRender`, so percent-encode the name
+            // exactly like `apply_method_and_redirect`'s lemma segment.
             json_resp::redirect(format!(
                 "/thy/trace/{}/overview/lemma/{}",
-                new_idx, name)).into_response()
+                new_idx, path_parse::url_path_escape(name))).into_response()
         }
         // Haskell `applyProverAtPath ... sorryProver` branch — mark
         // the targeted proof step `sorry`.  Redirect target = same
         // proof path.
         path_parse::TheoryPath::Proof { lemma, sub } => {
             let new_idx = state.store.clone_at_new_idx(idx).unwrap_or(idx);
-            let mut url = format!("/thy/trace/{}/overview/proof/{}", new_idx, lemma);
+            // URL goes through Yesod `getUrlRender`; percent-encode each
+            // segment via the shared helpers, identical to
+            // `apply_method_and_redirect` (this file).
+            let mut url = format!(
+                "/thy/trace/{}/overview/proof/{}",
+                new_idx, path_parse::url_path_escape(lemma));
             for seg in sub {
                 url.push('/');
-                if seg.is_empty() {
-                    url.push('_');
-                } else if seg.starts_with('_') {
-                    url.push('_');
-                    url.push_str(seg);
-                } else {
-                    url.push_str(seg);
-                }
+                url.push_str(&path_parse::url_path_escape(
+                    &path_parse::prefix_with_underscore(seg)));
             }
             json_resp::redirect(url).into_response()
         }

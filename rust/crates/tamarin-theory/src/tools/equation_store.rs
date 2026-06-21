@@ -137,18 +137,6 @@ fn aes_dbg_filter_substantive() -> bool {
     *V.get_or_init(|| std::env::var("TAM_RS_DBG_APPLY_EQ_STORE_FILTER")
         .map(|s| s == "substantive").unwrap_or(false))
 }
-/// `TAM_RS_DISABLE_PER_VARIANT_COUNTER_RESET` is an opt-OUT (`.is_err()`).
-#[inline]
-fn aes_per_variant_reset() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_PER_VARIANT_COUNTER_RESET").is_err())
-}
-/// `TAM_RS_DISABLE_APPLYBOUND_LOCAL_RESET` is an opt-OUT (`.is_err()`).
-#[inline]
-fn aes_applybound_local_reset() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_APPLYBOUND_LOCAL_RESET").is_err())
-}
 #[inline]
 fn aes_dbg_variant() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -183,39 +171,6 @@ fn aes_dbg_add_disj_full() -> bool {
 fn aes_dbg_add_disj() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("TAM_DBG_ADD_DISJ").is_ok())
-}
-/// `TAM_RS_DISABLE_DISJ_SORT` is an opt-OUT kill-switch read on the hot
-/// simp fixed-point path (`sort_disj_substs`, called after every mutating
-/// pass) and in `add_disj`.  Cache it behind a `OnceLock<bool>` so the
-/// steady-state cost is an atomic load, not a getenv + `String` alloc per
-/// call.  `true` means "sort enabled" (default), i.e. the env var is unset.
-#[inline]
-fn aes_disj_sort_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_DISJ_SORT").is_err())
-}
-/// `TAM_RS_DISABLE_SIMP_ABSTRACT_FUN` is an opt-OUT kill-switch read on
-/// the hot simp path (`simp_abstract_fun_with_maude`).  `true` means the
-/// var is set (skip the pass).
-#[inline]
-fn aes_disable_simp_abstract_fun() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_SIMP_ABSTRACT_FUN").is_ok())
-}
-/// `TAM_RS_ENABLE_H29` is an opt-IN diagnostic flag read on the hot simp
-/// path (the singleton-fold guard).  `true` means the var is set.
-#[inline]
-fn aes_enable_h29() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_ENABLE_H29").is_ok())
-}
-/// `TAM_RS_DISABLE_ADDEQS_SINGLETON_DISJ` is an opt-IN kill-switch read in
-/// `add_eqs`'s single-non-empty-unifier arm.  `true` means the var is set
-/// (restore the old eager-compose).
-#[inline]
-fn aes_disable_addeqs_singleton_disj() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_ADDEQS_SINGLETON_DISJ").is_ok())
 }
 /// `TAM_TRACE_SET_FALSE` debug flag (opt-IN), read on the solve-path
 /// `set_false`.  Cached so the steady-state cost is an atomic load.
@@ -470,13 +425,9 @@ impl EquationStore {
         // pairs in the structured variant, RS sees only the identity
         // variant's unreduced entries and finds none.  See
         // [[project-h16-5-simp-identify-precondition]] for the trace.
-        //
-        // Opt-out via `TAM_RS_DISABLE_DISJ_SORT=1` for diagnosis.
         let mut substs = substs;
-        if aes_disj_sort_enabled() {
-            substs.sort();
-            substs.dedup();
-        }
+        substs.sort();
+        substs.dedup();
         self.conj.insert(0, EqDisj { split_id: id, substs });
         self.next_split = id.succ();
         id
@@ -520,14 +471,9 @@ impl EquationStore {
         // store that drops `id` and adds a fresh single-case
         // disjunction containing just that subst.
         //
-        // Mirrors Haskell `performSplit` (EquationStore.hs:213):
-        //   mkNewEqStore before after <$> S.toList disj
-        //
-        // `S.toList` returns substs in their natural `Ord` order — the
-        // BTreeMap<LVar, VTerm> derived ordering. We sort our `Vec`
-        // here to match, so `split_case_1` is Haskell's "first" subst
-        // (typically the meaningful destructor-variant binding) rather
-        // than the original insertion order.
+        // Mirrors Haskell `performSplit` (EquationStore.hs:208-217) with
+        // the canonical-split-ordering fix (see the two-stage sort below):
+        //   mkNewEqStore before after <$> orderedSubsts
         let mut sorted_substs: Vec<LNSubstVFresh> = disj.substs.clone();
         if std::env::var("TAM_DBG_PERFORM_SPLIT").is_ok() {
             eprintln!("[perform_split] split_id={:?}, {} substs (pre-sort):", id, sorted_substs.len());
@@ -540,19 +486,27 @@ impl EquationStore {
                 eprintln!("[perform_split]   {:?} → {:?}", k, v);
             }
         }
-        // HS `performSplit` (EquationStore.hs:208-217) itself does NO sort: it
-        // is `mkNewEqStore before after <$> S.toList disj`, i.e. the cases come
-        // out in the `Data.Set LNSubstVFresh` `S.toList` (raw `Ord`) order.
-        // The name-hint canonicalisation is applied EARLIER, not here: HS's
-        // `dropNameHintsBound` (EquationStore.hs:140-141) maps
-        // `dropNameHintsLNSubstVFresh` over every disj subst, and it is invoked
-        // from `addNormSys` (Sources.hs:246) before the store is split — which,
-        // because the disj is a `Data.Set`, reorders the substs by their
-        // canonical (name-hint-dropped) `Ord`.  The two sorts below reproduce
-        // that pipeline: `sort()` is the `Data.Set` raw-`Ord` order, and the
-        // stable `sort_by_cached_key(drop_name_hints)` applies the
-        // canonicalisation-induced reordering that `dropNameHintsBound` causes,
-        // so `split_case_1` matches HS's first `S.toList` element.
+        // Canonical-split-ordering: mirror HS
+        //   orderedSubsts = sortOnMemo dropNameHintsLNSubstVFresh . S.toList
+        // (the chosen "Fix2" of the proof -N nondeterminism fix, which
+        // retires the witness-numbering "Fix1" in favour of canonicalising
+        // the SPLIT-CASE order directly).
+        //
+        // `sort()` is the `Data.Set LNSubstVFresh` `S.toList` raw-`Ord`
+        // order.  The stable `sort_by_cached_key(drop_name_hints)` then
+        // re-sorts by the α-canonical key (`drop_name_hints` =
+        // `dropNameHintsLNSubstVFresh`, EquationStore.hs:143-147), which
+        // renumbers each subst's fresh witness range-vars by first
+        // appearance in domain-key order.  This makes `split_case_i` order
+        // independent of the Maude fresh-allocation counter (Rust's witness
+        // indices need not equal HS's), so case order is α-canonical and
+        // does not regress to the `analysis incomplete` symptom.  HS's
+        // `dropNameHintsBound` does NOT reach here: it is mapped only over
+        // the throwaway `addNormSys` copy in `removeRedundantCases`
+        // (Sources.hs:244-246, `map (fst . snd) ...` keeps the ORIGINAL
+        // case and discards the name-hint-dropped system; gated on
+        // `enableBP || enableMSet`), so it never mutates the live
+        // `sEqStore` that `performSplit` later splits.
         sorted_substs.sort();
         sorted_substs.sort_by_cached_key(|s| s.drop_name_hints());
         if std::env::var("TAM_DBG_PERFORM_SPLIT").is_ok() {
@@ -754,7 +708,8 @@ impl EquationStore {
         // applyBound
         // rounds with the local subst and the Maude unifier SEPARATELY,
         // not one round with their composition; (b) SplitLater callers get
-        // a SplitG goal + a live singleton disj (HS Reduction.hs:942-944);
+        // a SplitG goal + a live singleton disj (HS Reduction.hs:618
+        // `solveRuleEqs SplitLater`, addEqs/performSplit at 719-725);
         // (c) addDisj bumps the next-split-id counter.  The old eager
         // compose used `freshen_witness_range` naming and one combined
         // apply_eq_store round, with no HS counterpart for non-empty
@@ -763,12 +718,7 @@ impl EquationStore {
         // corpus — out>1 occurred 0 times on both sides — so the effect
         // of this fix is the naming/cadence/goal-counter alignment, not
         // disj expansion.)
-        // Kill-switch: TAM_RS_DISABLE_ADDEQS_SINGLETON_DISJ=1 restores the
-        // old eager-compose for single non-empty unifiers.
-        let eager_single_disabled = aes_disable_addeqs_singleton_disj();
-        if unifiers.len() == 1
-            && (unifiers[0].is_empty() || eager_single_disabled)
-        {
+        if unifiers.len() == 1 && unifiers[0].is_empty() {
             // Single unifier composes directly into the free substitution.
             // BUT first rename the witness range vars (vars Maude
             // introduced as auxiliaries that aren't in the input nor
@@ -804,7 +754,7 @@ impl EquationStore {
             // SplitG variants whose domain intersects with `subst.dom`
             // silently get their constraints dropped on later pick
             // (e.g. `{z → verify(s,m,pkA)}` vs `{z → true}` collapse).
-            // Mirrors Reduction.hs:225 / EquationStore.hs:228.
+            // Mirrors EquationStore.hs:228 (addEqs single-unifier arm).
             if self.conj.is_empty() {
                 if std::env::var("TAM_RS_DBG_APPLY_EQ_STORE").is_ok() {
                     let filter = std::env::var("TAM_RS_DBG_APPLY_EQ_STORE_FILTER")
@@ -986,7 +936,6 @@ impl EquationStore {
     /// (used by simp_identify/simp_abstract_fun probing) matches HS's
     /// Set-first variant.  See [[project-h16-6-disj-sort-path-a]].
     pub fn sort_disj_substs(&mut self) {
-        if !aes_disj_sort_enabled() { return; }
         for d in self.conj.iter_mut() {
             d.substs.sort();
             d.substs.dedup();
@@ -1112,8 +1061,9 @@ impl EquationStore {
         let factor = LNSubst::from_list(vec![(v.clone(), t)]);
         // HS-faithful order (`foreachDisj`, EquationStore.hs):
         // REPLACE the disj FIRST, THEN applyEqStore.  (For simpAbstractName
-        // the factor's range is a constant, so order is behaviourally
-        // neutral, but we keep the HS order for consistency.)
+        // the factor's range is a constant; we follow the HS replace-then-
+        // apply order so correctness rests on matching HS, not on any
+        // independent neutrality argument.)
         let new_substs: Vec<LNSubstVFresh> = self.conj[idx].substs
             .iter()
             .map(|s| {
@@ -1431,12 +1381,9 @@ impl EquationStore {
     /// HS-faithful variant of `simp_abstract_fun` that takes a Maude
     /// handle and calls `apply_eq_store` on the factored subst to
     /// re-unify remaining disjs (mirrors HS's `foreachDisj` at
-    /// EquationStore.hs).
-    ///
-    /// H17.7 (2026-05-28): opt-out via `TAM_RS_DISABLE_SIMP_ABSTRACT_FUN=1`
-    /// for diagnostic comparison.  Lifting common operators may introduce
-    /// fresh witnesses that don't compose with later chain bindings, breaking
-    /// the HS-faithful cycle detection at iter-2 c_pcs source-pick.
+    /// EquationStore.hs).  This pass always runs, matching HS `simp1`
+    /// where `b7 <- foreachDisj hnd simpAbstractFun` (EquationStore.hs:364)
+    /// is an unconditional member of the simplification fixed point.
     pub fn simp_abstract_fun_with_maude<F: FnMut(u64) -> u64>(
         &mut self,
         alloc: &mut F,
@@ -1446,15 +1393,6 @@ impl EquationStore {
         use tamarin_term::vterm::Lit;
         use tamarin_term::function_symbols::FunSym;
         use tamarin_term::lterm::{LVar, LSort};
-
-        // H17.7 opt-out (default ON, opt-out via TAM_RS_DISABLE_SIMP_ABSTRACT_FUN=1):
-        // skip simp_abstract_fun entirely.  Tests whether lifting common
-        // operators is what prevents the HS-faithful cycle detection at
-        // iter-2 c_pcs source-pick (vk's stored term needs rule-internal
-        // var names that compose with chain bindings, not fresh witnesses).
-        if aes_disable_simp_abstract_fun() {
-            return false;
-        }
 
         // Find (disj_idx, v, op, argss) where v has the same outermost
         // function symbol across every subst in the disjunction.
@@ -1703,38 +1641,13 @@ impl EquationStore {
                 self.sort_disj_substs();
             }
             changed |= self.simp_empty_disj();
-            // increment 2 (2026-05-29): ALWAYS fold singleton variant
-            // disjs into the free subst — this is exactly what HS does.
-            // HS's `simp1` runs `foreachDisj hnd simpSingleton`
-            // unconditionally on every disj (EquationStore.hs), with
-            // NO precompute guard; `simpSingleton [subst0]` folds a
-            // singleton disj via `freshToFree` into the free subst
-            // (EquationStore.hs `simpSingleton`).  Increment 1's H29 had
-            // skipped
-            // this fold during precompute on the premise that HS keeps
-            // the variant disj "lazy in cdCases".  That premise was
-            // wrong: `cdCases`'s laziness is Haskell *thunk* evaluation
-            // laziness (the case set isn't computed until forced), NOT an
-            // unfolded variant disjunction in the eq-store.  Once a source
-            // case IS computed, HS's `solveRuleConstraints` →
-            // `simp hnd ... eqs` folds the singleton variant, baking it
-            // into the rule body via `substSystem`.  Skipping the fold
-            // desynchronised a rule's premise from its conclusion (e.g.
-            // Tutorial Serv_1: conc `Out(h(t.1))` kept the abstract source
-            // pattern var while prem `In(aenc(<'1', x.26>, pk(x.67)))` used
-            // disconnected variant witnesses), so the search reached a
-            // spurious counterexample instead of HS's contradiction —
-            // verdict-flipping Client_auth, Client_auth_injective and
-            // TESLA_Scheme1::authentic from verified to falsified.
-            // Folding (this faithful behaviour) leaves resolved1's
-            // *multi-arm* variant disjs untouched (simpSingleton only
-            // fires on singletons), so it neither helps nor harms resolved1
-            // while reverting the 3 flips.  The experimental skip remains
-            // reachable for diagnosis via the opt-IN `TAM_RS_ENABLE_H29=1`.
-            let h29_skip_fold = aes_enable_h29()
-                && crate::constraint::solver::sources::in_precompute_mode();
-            if !h29_skip_fold
-                && self.simp_singleton_avoiding(&mut alloc, external_preserve, maude) {
+            // ALWAYS fold singleton variant disjs into the free subst —
+            // this is exactly what HS does.  HS's `simp1` runs
+            // `b4 <- foreachDisj hnd simpSingleton` unconditionally on
+            // every disj (EquationStore.hs:361), with NO precompute guard;
+            // `simpSingleton [subst0]` folds a singleton disj via
+            // `freshToFree` into the free subst (EquationStore.hs:391-397).
+            if self.simp_singleton_avoiding(&mut alloc, external_preserve, maude) {
                 changed = true;
                 self.sort_disj_substs();
             }
@@ -1949,7 +1862,7 @@ impl EquationStore {
     /// a fresh-idx allocator and skips simpSingleton — so a singleton
     /// disj with non-renaming entries stays in the residual.  Callers
     /// that have a Maude handle (e.g. `variantsProtoRule` at
-    /// RuleVariants.hs:106) MUST use this variant; otherwise the rule's
+    /// RuleVariants.hs:61) MUST use this variant; otherwise the rule's
     /// variant-disj retains abstrTerm entries that HS bakes into the
     /// rule body via commonSubst (e.g. JKL_TS1_2004 Init_2: HS's rule
     /// shows `!Sessk(~ekI, h(<~ekI, Y, 'g'^(~lkI*~lkR)>))`; without this
@@ -2103,67 +2016,34 @@ impl EquationStore {
             .collect();
         let mut new_conj: Vec<EqDisj> = Vec::with_capacity(self.conj.len());
         // HS-faithful per-variant fresh-state isolation.  In HS, each
-        // `applyBound` call runs `evalFreshAvoiding` independently
-        // (Substitution/SubstVFresh.hs:74-81), so each variant's
-        // witness allocation starts from the same avoid baseline.
-        // The variants' witnesses can OVERLAP in idx because each
-        // ends up in its own SubstVFresh.
-        //
-        // In Rust, Maude's global counter advances monotonically across
-        // calls, so the LAST variant gets the LARGEST witness idxs.
-        // This causes the SubstVFresh Ord at perform_split to order
-        // variants by witness allocation order (first variant always
-        // wins), not by HS-equivalent allocation.
-        //
-        // Snapshot the global counter at loop entry, reset before each
-        // per-variant call.  After the loop, advance the counter to the
-        // high water mark so subsequent (non-per-variant) Maude calls
-        // don't reuse these idxs.  Mirrors HS's per-call evalFreshAvoiding.
-        //
-        // `TAM_RS_DISABLE_PER_VARIANT_COUNTER_RESET=1` opts out for diagnosis.
-        let per_variant_reset = aes_per_variant_reset();
-        // HS-faithful local-per-call counter mode: each `applyBound`
-        // invocation runs `renameAvoiding (range) avoidSet` →
+        // `applyBound` call runs `renameAvoiding (range) avoidSet` →
         // `evalFreshAvoiding (rename ...)` which seeds the supply at
         // `succ (max idx in avoidSet)` LOCALLY — bounded by the call's
-        // own `avoid_max`, NOT the global session counter (LTerm.hs:647-664,
-        // EquationStore.hs `applyEqStore`/`applyBound`).  RS previously used
-        // Maude's global
-        // counter for these per-variant witness allocations; because
-        // `ensure_above` is monotone, the counter advances to the
-        // high-water mark of all prior calls and never bounds back down.
-        // For long apply_eq_store cascades (e.g. SignedDH_PFS), this
-        // means later variants get witness idxs THOUSANDS higher than
-        // HS's, FLIPPING the SubstVFresh Ord that ranks the resulting
-        // arms in `perform_split` — observable as the swapped
-        // `solve…case Init_1/Resp/c_exp` block vs `by contradiction`
-        // ordering at the leaf level.
+        // own `avoid_max`, NOT the global session counter
+        // (`avoid`/`evalFreshAvoiding` at LTerm.hs:647-653,
+        // EquationStore.hs `applyEqStore`/`applyBound`).  Each variant's
+        // witness allocation therefore starts from the same avoid
+        // baseline, and the variants' witnesses can OVERLAP in idx
+        // because each ends up in its own SubstVFresh.
         //
-        // This behaviour is ON by default (disable via the opt-OUT
-        // `TAM_RS_DISABLE_APPLYBOUND_LOCAL_RESET=1`): each per-variant Maude
-        // call uses a LOCAL
-        // MaudeHandle (via `with_fresh_counter_from(avoid_max)`).  The
-        // local handle shares the underlying Maude process state but
-        // has its own counter that starts at `succ avoid_max` PER call.
-        // The global counter is untouched by these calls, so subsequent
-        // non-applyBound allocations (rule freshening, sources) keep
-        // their cross-call uniqueness guarantee (TESLA Sender0a).
+        // Each per-variant Maude call uses a LOCAL MaudeHandle (via
+        // `with_fresh_counter_from(avoid_max)`).  The local handle shares
+        // the underlying Maude process state but has its own counter that
+        // starts at `succ avoid_max` PER call.  The global counter is
+        // untouched by these calls, so subsequent non-applyBound
+        // allocations (rule freshening, sources) keep their cross-call
+        // uniqueness guarantee (TESLA Sender0a).
         //
         // The witnesses minted here all live inside SubstVFresh range
         // values (α-equivalent up to witness rename — VFresh-local), so
         // discarding the local counter on exit cannot cause downstream
-        // collisions: `bounds_max` walks only the SubstVFresh DOMAIN
-        // keys (reduction.rs:2987-2994), so it won't reserve witnesses
+        // collisions: `bounds_max` (reduction.rs, `fn bounds_max`) walks
+        // only the SubstVFresh DOMAIN keys, so it won't reserve witnesses
         // — but downstream Maude calls compute their own per-call
         // `avoid_max` and use the global counter (which is the union
         // of every non-applyBound allocation we've done so far), so
         // they're guaranteed disjoint from any applyBound witness by
         // VFresh α-equivalence.
-        //
-        // Opt-out via `TAM_RS_DISABLE_APPLYBOUND_LOCAL_RESET=1`.
-        let applybound_local_reset = aes_applybound_local_reset();
-        let initial_counter = maude.fresh_counter_peek();
-        let mut high_water_mark = initial_counter;
         for d in self.conj.iter() {
             let mut new_substs: Vec<LNSubstVFresh> = Vec::new();
             for s in &d.substs {
@@ -2177,15 +2057,6 @@ impl EquationStore {
                         eprintln!("  OUT[0] (empty preserved)");
                     }
                     continue;
-                }
-                // HS-faithful: reset counter before each per-variant
-                // call so each variant's witness allocation starts fresh.
-                // Skipped when the local-handle path is on (the local
-                // handle has its own counter; the global one is left
-                // alone).
-                if per_variant_reset && !applybound_local_reset {
-                    high_water_mark = high_water_mark.max(maude.fresh_counter_peek());
-                    maude.reset_counter_to(initial_counter);
                 }
                 // Compute avoid_max = max idx across (domVFresh s ∪
                 // varsRange newsubst).
@@ -2271,44 +2142,31 @@ impl EquationStore {
                     }
                 }
                 // HS-faithful local Maude handle for this `applyBound`
-                // invocation.  When `applybound_local_reset` is on, the
-                // unification, the witness lift (`reserve_idxs`), and
-                // the post-unify `reduce` calls all draw witness idxs
-                // from a fresh local counter seeded at `succ avoid_max`
-                // (mirroring HS's `evalFreshAvoiding (range) avoidSet`,
-                // LTerm.hs:647-664).  The Maude process state is shared
-                // (Arc cloned), only the counter is per-call — so the
-                // global counter advances ONLY for non-applyBound
-                // allocations.  See [[locked diagnosis 2026-06-04]].
-                let local_maude_owned;
+                // invocation.  The unification, the witness lift
+                // (`reserve_idxs`), and the post-unify `reduce` calls all
+                // draw witness idxs from a fresh local counter seeded at
+                // `succ avoid_max` (mirroring HS's `evalFreshAvoiding
+                // (range) avoidSet`, LTerm.hs:647-653).  The Maude process
+                // state is shared (Arc cloned), only the counter is
+                // per-call — so the global counter advances ONLY for
+                // non-applyBound allocations.
+                //
+                // HS-faithful seed: `avoid avoidSet = succ (max idx in
+                // avoidSet)` where avoidSet = `domVFresh s ∪ varsRange
+                // newsubst` (LTerm.hs:647-648 `avoid`; EquationStore.hs
+                // `renameAvoiding (range slist) (domVFresh s ∪ varsRange newsubst)`).
+                // HS does NOT include `max_idx` (the post-shift
+                // equation-system vars) in the seed — the shifted RHS
+                // vars are themselves all > avoid_max by construction.
+                // Including `max_idx` would be non-faithful: two alpha-
+                // equivalent input variants whose `rhs_min` (and hence
+                // `max_idx`) differs would seed at distinct values →
+                // witness `reserve_idxs` returns a different base →
+                // outputs are alpha-equivalent but structurally distinct
+                // → the post-loop `sort + dedup` fails to collapse them.
+                let local_maude_owned = maude.with_fresh_counter_from(avoid_max);
                 let aes_maude: &tamarin_term::maude_proc::MaudeHandle =
-                    if applybound_local_reset {
-                        // HS-faithful seed: `avoid avoidSet = succ (max
-                        // idx in avoidSet)` where avoidSet =
-                        // `domVFresh s ∪ varsRange newsubst`
-                        // (LTerm.hs:647-664 `avoid`; EquationStore.hs:268-282
-                        // `renameAvoiding (range slist) (domVFresh s ∪ varsRange newsubst)`).
-                        // HS does NOT include `max_idx` (the post-shift
-                        // equation-system vars) in the seed — the shifted
-                        // RHS vars are themselves all > avoid_max by
-                        // construction.  Prior code used
-                        // `seed = avoid_max.max(max_idx)` as a safety
-                        // margin, which is non-faithful: two alpha-
-                        // equivalent input variants whose `rhs_min`
-                        // (and hence `max_idx`) differs seed at distinct
-                        // values → witness `reserve_idxs` returns
-                        // different base → outputs are alpha-equivalent
-                        // but structurally distinct → `sort + dedup`
-                        // (line 2161-2162) fails to collapse them.
-                        // KEA_plus_AdvKey::keaplus_{initiator,responder}_key
-                        // closed (4→0 diff) by this fix together with the
-                        // alpha-dedup below.
-                        let seed = avoid_max;
-                        local_maude_owned = maude.with_fresh_counter_from(seed);
-                        &local_maude_owned
-                    } else {
-                        maude
-                    };
+                    &local_maude_owned;
                 if let Some(input) = &dbg_in {
                     eprintln!("[rs-aes-applyBound] IN  : {:?}", input);
                 }
@@ -2369,7 +2227,8 @@ impl EquationStore {
                         }
                     }
                     // EXTRACT-SYSTEM-VARS-TO-DOMAIN: the AC-free local
-                    // unifier path (maude_proc.rs:503-532) doesn't
+                    // unifier path (maude_proc.rs, the AC-free fast path
+                    // in `unify_with_avoid`) doesn't
                     // introduce narrowing witnesses for cross-sort
                     // var-var unification.  E.g. for `Var(~k:Fresh) =
                     // Var(~mw:Msg)`, the local unifier returns
@@ -2480,7 +2339,7 @@ impl EquationStore {
                     // returns the raw Maude unifier outputs without
                     // calling `normSubstVFresh'` — that normaliser is only
                     // used during VARIANT COMPUTATION for rules
-                    // (RuleVariants.hs:88), NOT here.  Normalising here
+                    // (RuleVariants.hs:74 `normSubstVFresh'`), NOT here.  Normalising here
                     // hides non-NF range values (e.g. `Xor(~k,~k)` that
                     // reduces to `zero`) from the post-fan-out
                     // `simpMinimize`/`substCreatesNonNormalTerms` filter,
@@ -2511,19 +2370,6 @@ impl EquationStore {
             // making `perform_split` see a different sequence than HS
             // and changing `split_case_N` assignments downstream.
             //
-            // Known surfaced divergences (these regress when this is
-            // turned on — but they're EXISTING bugs in upstream code
-            // paths whose outputs differ from HS's; sorting just makes
-            // them visible):
-            //   - verify_checksign_test::test4/test5 — split_case order
-            //   - Typing_and_Destructors::Responder_secrecy — line-7
-            //     `case Initiator` vs `case c_fst` (Rust's apply_eq_store
-            //     output shapes differ from HS's, so HS-faithful sort
-            //     produces different order than HS does).
-            // These regressions are HS-faithful: each marks a place
-            // where Rust's apply_eq_store output structure diverges
-            // from HS's — to chase next.
-            //
             // ALPHA-DEDUP: before structural dedup, collapse substs that
             // are alpha-equivalent under witness-renaming.  RS's local
             // Maude counter inside `applyBound` is bumped to the max idx
@@ -2542,8 +2388,8 @@ impl EquationStore {
             // `renameAvoiding (range slist) (domVFresh s ∪ varsRange newsubst)`)
             // — which IS identical for alpha-equivalent input variants —
             // so HS's structural dedup catches them.  RS's local counter
-            // is bumped by the LHS system vars (`input_max` at
-            // unify_with_avoid, maude_proc.rs:706-717), which is not what
+            // is bumped by the LHS system vars (the `input_max` walk in
+            // `unify_with_avoid`, maude_proc.rs), which is not what
             // HS does.  Canonicalising the witness namespace per subst
             // (rename range fresh-vars to a deterministic sequence) lets
             // RS catch the same alpha-duplicates HS catches.
@@ -2618,28 +2464,17 @@ impl EquationStore {
             }
             new_conj.push(EqDisj { split_id: d.split_id, substs: new_substs });
         }
-        // After the per-variant loop, advance Maude's counter to the
-        // high water mark (the max reached across all variant calls).
-        // Without this, subsequent Maude calls might reuse witness idxs
-        // already consumed by the per-variant outputs, causing
-        // (name, sort, idx) collisions in the eq-store.
-        //
-        // In `applybound_local_reset` mode, this is unnecessary: each
-        // per-variant call uses its OWN counter (a local MaudeHandle
-        // clone), so the global counter never advanced from those calls
-        // in the first place.  The witnesses minted live only inside
-        // SubstVFresh range values, which are α-equivalent up to witness
-        // rename — VFresh-local.  Any subsequent allocation that needs
-        // to avoid these witnesses will see them via `bounds_max`'s
-        // walk of `eq_store.conj` (reduction.rs:2987-2994), which counts
-        // domain keys; the range/witness idxs don't affect cross-call
-        // uniqueness because they're per-SubstVFresh.
-        if per_variant_reset && !applybound_local_reset {
-            high_water_mark = high_water_mark.max(maude.fresh_counter_peek());
-            maude.ensure_above(high_water_mark.saturating_sub(1));
-        }
-        // Silence the unused-warning when local-reset is on.
-        let _ = (initial_counter, high_water_mark);
+        // No global-counter advance is needed after the per-variant loop:
+        // each per-variant call uses its OWN counter (a local MaudeHandle
+        // clone via `with_fresh_counter_from`), so the global counter
+        // never advanced from those calls in the first place.  The
+        // witnesses minted live only inside SubstVFresh range values,
+        // which are α-equivalent up to witness rename — VFresh-local.
+        // Any subsequent allocation that needs to avoid these witnesses
+        // will see them via `bounds_max`'s walk of `eq_store.conj`
+        // (reduction.rs, `fn bounds_max`), which counts domain keys; the
+        // range/witness idxs don't affect cross-call uniqueness because
+        // they're per-SubstVFresh.
         self.conj = new_conj;
         self.subst = new_subst;
         Ok(())

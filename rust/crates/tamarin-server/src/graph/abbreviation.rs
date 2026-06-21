@@ -8,7 +8,7 @@
 //!
 //! See `lib/theory/src/Theory/Constraint/System/Graph/Abbreviation.hs`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tamarin_term::function_symbols::{CSym, FunSym};
 use tamarin_term::lterm::{LNTerm, LSort, LVar};
@@ -17,7 +17,9 @@ use tamarin_term::term::Term;
 use tamarin_term::vterm::Lit;
 
 use tamarin_theory::fact::LNFact;
-use tamarin_theory::rule::RuleACInst;
+use tamarin_theory::rule::{
+    IntrRuleACInfo, ProtoRuleACInstInfo, ProtoRuleName, RuleACInst, RuleInfo,
+};
 
 use super::repr::{GraphRepr, NodeType};
 
@@ -136,7 +138,7 @@ type PrefixMap = BTreeMap<String, u32>;
 /// (a Msg-sort variable).
 fn abbreviate_term(
     opts: &AbbreviationOptions,
-    all_names: &[String],
+    all_names: &BTreeSet<String>,
     mut prefix_map: PrefixMap,
     t: &LNTerm,
 ) -> (PrefixMap, LNTerm) {
@@ -144,9 +146,12 @@ fn abbreviate_term(
     let mut idx = prefix_map.get(&prefix).copied().unwrap_or(opts.first_index);
     loop {
         let candidate = format!("{}{}", prefix, idx);
-        // Case-insensitive comparison against the global name set, since
-        // the Haskell side does `T.toUpper` on `allNames`.
-        if !all_names.iter().any(|n| n.eq_ignore_ascii_case(&candidate)) {
+        // `candidate` is already ASCII-uppercase (`prefix` is uppercased in
+        // `get_term_prefix`, `idx` is digits) and `all_names` is the
+        // uppercased global name set, mirroring the Haskell `T.toUpper` on
+        // `allNames`, so an exact set lookup matches `nameCandidate `elem`
+        // allNames`.
+        if !all_names.contains(&candidate) {
             prefix_map.insert(prefix, idx + 1);
             let v = LVar::new(candidate, LSort::Msg, 0);
             return (prefix_map, Term::Lit(Lit::Var(v)));
@@ -159,35 +164,37 @@ fn abbreviate_term(
 /// alphanumeric runs (uppercased, sorted, deduped).  Used to avoid
 /// generating an abbreviation name that aliases an existing identifier.
 ///
-/// APPROXIMATION of Haskell `allNames`, which renders the ENTIRE
-/// `GraphRepr` via `show repr` (every node variant incl. Missing/
-/// LastAction, all edges, NodeIds and constructor/field names) and then
-/// splits on non-alphanumerics.  We only dump node ids, fact tags and
-/// pretty-printed terms for System/UnsolvedAction nodes plus cluster
-/// names — i.e. the content that actually carries user identifiers.  The
-/// omitted tokens are long constructor/field words that cannot match a
-/// generated name's `<<=prefix_length letters><digits>` shape, so this
-/// cannot alias a real identifier differently in practice; any divergence
-/// from `show repr` is at worst a differently-numbered alias.
-fn collect_all_names(repr: &GraphRepr) -> Vec<String> {
+/// Mirrors Haskell `allNames` (Abbreviation.hs:220-225): `sort . nub . map
+/// toUpper . T.split (not . isAlphaNum) $ show repr`.  `show repr` is the
+/// DERIVED Show of the whole `GraphRepr`, which for a `SystemNode` renders
+/// the rule's `_rInfo` — exposing the RAW `StandRule "<name>"` string, the
+/// `role = Just "<role>"` string, and the intruder `ConstrRule`/`DestrRule
+/// "<name>"` byte string (verified against derived Show, e.g. a rule named
+/// `Se1` contributes the token `SE1`, a role `I` contributes `I`).  We
+/// therefore feed those user-controlled name/role tokens into `buf`
+/// (`dump_rule`) so an abbreviation never aliases one.  The only tokens we
+/// still omit are long constructor/field words (`ProtoInfo`,
+/// `ProtoRuleACInstInfo`, `RuleAttributes`, …) and small ints (`PremIdx`
+/// indices, `DestrRule` flags): none of those can match a generated name's
+/// `<<=prefix_length alpha letters><digits>` shape, so omitting them cannot
+/// change which abbreviation is chosen.
+fn collect_all_names(repr: &GraphRepr) -> BTreeSet<String> {
     let mut buf = String::new();
     for n in &repr.nodes { dump_node(&mut buf, n); }
     for c in &repr.clusters {
         buf.push_str(&c.name); buf.push('\n');
         for n in &c.nodes { dump_node(&mut buf, n); }
     }
-    let mut out: Vec<String> = Vec::new();
+    let mut out: BTreeSet<String> = BTreeSet::new();
     let mut cur = String::new();
     for ch in buf.chars() {
         if ch.is_ascii_alphanumeric() {
             cur.push(ch.to_ascii_uppercase());
         } else if !cur.is_empty() {
-            out.push(std::mem::take(&mut cur));
+            out.insert(std::mem::take(&mut cur));
         }
     }
-    if !cur.is_empty() { out.push(cur); }
-    out.sort();
-    out.dedup();
+    if !cur.is_empty() { out.insert(cur); }
     out
 }
 
@@ -204,9 +211,51 @@ fn dump_node(buf: &mut String, n: &super::repr::GNode) {
 }
 
 fn dump_rule(buf: &mut String, ru: &RuleACInst) {
+    // `show repr` renders the rule's `_rInfo`, exposing the RAW rule name,
+    // role, and intruder-rule name as alphanumeric tokens.  Feed exactly
+    // those (and only those) user-controlled tokens — the derived Show's
+    // long constructor/field words are harmless (see `collect_all_names`).
+    dump_rule_info(buf, &ru.info);
     for f in &ru.premises { dump_fact(buf, f); }
     for f in &ru.actions  { dump_fact(buf, f); }
     for f in &ru.conclusions { dump_fact(buf, f); }
+}
+
+/// Emit the user-controlled name/role tokens that derived `Show` of a
+/// rule's `_rInfo` exposes (Rule.hs:206-214, 397-400, 517-519): the raw
+/// `StandRule "<name>"` string, the `role = Just "<role>"` string, and the
+/// intruder `ConstrRule`/`DestrRule "<name>"` byte string.
+fn dump_rule_info(
+    buf: &mut String,
+    info: &RuleInfo<ProtoRuleACInstInfo, IntrRuleACInfo>,
+) {
+    use std::fmt::Write as _;
+    match info {
+        RuleInfo::Proto(p) => {
+            // `StandRule "<s>"`: the RAW stored string (derived Show emits it
+            // verbatim — do NOT route through prettyProtoRuleName).  `FreshRule`
+            // contributes the long, harmless token `FRESHRULE`.
+            if let ProtoRuleName::Stand(s) = &p.name {
+                let _ = write!(buf, "{} ", s);
+            }
+            // `role = Just "<role>"`.
+            if let Some(role) = &p.attributes.role {
+                let _ = write!(buf, "{} ", role);
+            }
+        }
+        RuleInfo::Intr(i) => {
+            // `ConstrRule "<name>"` / `DestrRule "<name>" _ _ _`: the byte-string
+            // name.  Remaining intruder variants carry no user string.
+            let name: Option<&[u8]> = match i {
+                IntrRuleACInfo::ConstrRule(n) => Some(n),
+                IntrRuleACInfo::DestrRule(n, _, _, _) => Some(n),
+                _ => None,
+            };
+            if let Some(n) = name {
+                let _ = write!(buf, "{} ", String::from_utf8_lossy(n));
+            }
+        }
+    }
 }
 
 fn dump_fact(buf: &mut String, fa: &LNFact) {
@@ -462,5 +511,61 @@ mod tests {
         let name = var("SE1", LSort::Msg);
         abbrevs.insert(t.clone(), (name.clone(), t.clone()));
         assert_eq!(lookup_abbreviation(&abbrevs, &t), Some(&name));
+    }
+
+    // A rule named `Se1` tokenises (via derived `show repr`) to `SE1`, exactly
+    // the shape of a generated `senc` abbreviation.  Haskell's `allNames`
+    // therefore contains `SE1`, so `abbreviateTerm` skips it and emits `SE2`.
+    // This pins that `collect_all_names` feeds the raw rule name into the name
+    // set, so the abbreviator skips `SE1` and emits `SE2` (matching HS).
+    #[test]
+    fn rule_name_blocks_aliasing_abbreviation() {
+        use tamarin_theory::fact::{Fact, FactTag, Multiplicity};
+        use tamarin_theory::rule::{ProtoRuleACInstInfo, RuleAttributes, Rule};
+        use super::super::repr::{GNode, NodeType};
+
+        // A senc(...) term long enough to clear the weight>=10 threshold and
+        // appearing in two facts so its occurrence count exceeds 1.
+        let enc = f_app_no_eq(
+            senc_sym(),
+            vec![var("plaintext", LSort::Msg), var("key", LSort::Msg)],
+        );
+        let mk_fact = |name: &str| {
+            Fact::new(
+                FactTag::Proto(Multiplicity::Linear, name.to_string(), 1),
+                vec![enc.clone()],
+            )
+        };
+
+        let plain_rule = |rule_name: &str, fact_name: &str| -> RuleACInst {
+            Rule::new(
+                RuleInfo::Proto(ProtoRuleACInstInfo {
+                    name: ProtoRuleName::Stand(rule_name.to_string()),
+                    attributes: RuleAttributes::default(),
+                    loop_breakers: Vec::new(),
+                }),
+                vec![mk_fact(fact_name)], // premises
+                Vec::new(),               // conclusions
+                Vec::new(),               // actions
+            )
+        };
+
+        let mut repr = GraphRepr::new();
+        // Rule literally named `Se1` -> contributes token `SE1` to allNames.
+        repr.nodes.push(GNode {
+            id: LVar::new("i", LSort::Node, 1),
+            ty: NodeType::System(plain_rule("Se1", "FactA")),
+        });
+        // Second node so the senc term occurs twice (occs > 1).
+        repr.nodes.push(GNode {
+            id: LVar::new("i", LSort::Node, 2),
+            ty: NodeType::System(plain_rule("Other", "FactB")),
+        });
+
+        let abbrevs = compute_abbreviations(&repr, &AbbreviationOptions::default());
+        let name = lookup_abbreviation(&abbrevs, &enc)
+            .expect("senc term should be abbreviated");
+        // HS skips SE1 (taken by the rule name) and uses SE2.
+        assert_eq!(name, &var("SE2", LSort::Msg));
     }
 }

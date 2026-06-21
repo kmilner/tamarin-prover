@@ -30,7 +30,7 @@ use tamarin_term::maude_proc::MaudeHandle;
 use tamarin_theory::constraint::constraints::Goal;
 use tamarin_theory::constraint::solver::context::ProofContext;
 use tamarin_theory::constraint::solver::proof_method::{
-    exec_proof_method, is_finished, ProofMethod,
+    exec_proof_method, finished_subterms, is_finished, ProofMethod,
 };
 use tamarin_theory::constraint::solver::search::{
     candidate_methods, NodeStatus, ProofNode,
@@ -120,10 +120,12 @@ impl ProofState {
                 }
             }
             sys.insert_lemmas(reuse);
-            // Root method is `Sorry("initial")` until the user (or
-            // autoprover) applies a method.
+            // Root method is the unproven `sorry` (no reason) until the
+            // user (or autoprover) applies a method.  Mirrors HS
+            // `unproven = sorry Nothing` (Proof.hs:255-256), which
+            // `prettyProofMethod` renders as a plain `sorry`.
             let root = ProofNode {
-                method: ProofMethod::Sorry(Some("initial".into())),
+                method: ProofMethod::Sorry(None),
                 sys,
                 children: BTreeMap::new(),
                 status: NodeStatus::Open,
@@ -272,14 +274,19 @@ fn navigate_mut<'a>(node: &'a mut ProofNode, path: &[String]) -> Option<&'a mut 
     Some(cur)
 }
 
+/// Combine two child statuses, mirroring Haskell's `instance Semigroup
+/// ProofStatus` (`lib/theory/src/Theory/Proof.hs:409-420`).  Precedence:
+/// `Solved` (TraceFound) > `Sorry` (IncompleteProof) > `Unfinishable`
+/// (UnfinishableProof) > `Contradictory` (CompleteProof) > `Open`
+/// (UndeterminedProof, the lowest).
 fn combine_status(a: NodeStatus, b: NodeStatus) -> NodeStatus {
     use NodeStatus::*;
     match (&a, &b) {
         (Solved, _) | (_, Solved) => Solved,
         (Sorry, _) | (_, Sorry) => Sorry,
         (Unfinishable, _) | (_, Unfinishable) => Unfinishable,
-        (Open, _) | (_, Open) => Open,
-        (Contradictory, Contradictory) => Contradictory,
+        (Contradictory, _) | (_, Contradictory) => Contradictory,
+        _ => Open,
     }
 }
 
@@ -430,36 +437,38 @@ fn write_applicable_methods(
     sys: &System,
     ctx: &ProofContext,
 ) {
-    // Match Haskell `rankProofMethods` (`ProofMethod.hs:653-668`):
-    // candidates come from `proofMethods`, then `execMethods` filters
-    // via `mapMaybe execMethod` to those that successfully apply.  In
-    // Rust, `candidate_methods` is the un-filtered list (used by the
-    // search loop which tries each in order); for the UI we must
-    // filter, so the user-visible numbering matches the actual click
-    // semantics (otherwise the user can click an inapplicable method
-    // and get an alert).  Filtering is exactly Haskell's
-    // `execProofMethod` call — same cost the search loop pays.
-    let methods: Vec<ProofMethod> = candidate_methods(sys, ctx, 0)
-        .into_iter()
-        .filter(|m| exec_proof_method(ctx, m, sys).is_some())
-        .collect();
+    // Match Haskell `rankProofMethods` (`ProofMethod.hs:520-535`):
+    //   stoppingMethod = Finished <$> isFinished ctxt sys
+    //   in execMethods $ maybe proofMethods ((:[]) . (,"")) stoppingMethod
+    // When `isFinished` yields a verdict the WHOLE method list is replaced
+    // by the single stopping method `[Finished r]` (and `execProofMethod
+    // (Finished _) = Just M.empty` always survives the `execMethods`
+    // filter).  Otherwise the list is `proofMethods` (Simplify / Induction
+    // / SolveGoal), filtered by `execProofMethod`.  In Rust,
+    // `candidate_methods` is that un-filtered `proofMethods` list (used by
+    // the search loop which tries each in order); for the UI we filter via
+    // `exec_proof_method` so the user-visible numbering matches the actual
+    // click semantics.
+    let methods: Vec<ProofMethod> = match is_finished(ctx, sys) {
+        Some(r) => vec![ProofMethod::Finished(r)],
+        None => candidate_methods(sys, ctx, 0)
+            .into_iter()
+            .filter(|m| exec_proof_method(ctx, m, sys).is_some())
+            .collect(),
+    };
     if methods.is_empty() {
         // Mirror Haskell `prettyApplicableProofMethods` (`Web/Theory.hs:540-542`):
         //   [] | finishedSubterms ctxt sys -> "Constraint System is Solved"
         //   []                             -> "Constraint System is Unfinishable"
-        // `finishedSubterms` is not exported here, so we route through
-        // `is_finished`, whose only non-finished verdict for a system
-        // with no applicable methods is `Unfinishable` (subterms not
-        // finished); Solved / Contradictory / initial all map to the
-        // "Solved" heading, matching the `finishedSubterms` branch.
-        let unfinishable = matches!(
-            is_finished(ctx, sys),
-            Some(tamarin_theory::constraint::solver::proof_method::Result::Unfinishable)
-        );
-        if unfinishable {
-            out.push_str("<h3>Constraint System is Unfinishable</h3>\n");
-        } else {
+        // We only reach here when `is_finished` returned `None` (the
+        // `Some` case produced a non-empty `[Finished r]` above), so the
+        // Solved/Unfinishable choice MUST come from `finished_subterms`
+        // exactly as HS does — not from `is_finished` (which is `None`
+        // here and would always pick "Solved").
+        if finished_subterms(ctx, sys) {
             out.push_str("<h3>Constraint System is Solved</h3>\n");
+        } else {
+            out.push_str("<h3>Constraint System is Unfinishable</h3>\n");
         }
         return;
     }
@@ -608,8 +617,11 @@ fn pretty_contradiction(c: &tamarin_theory::constraint::solver::contradictions::
         ForbiddenKD => "forbidden KD-fact".to_string(),
         ForbiddenChain => "forbidden chain".to_string(),
         ImpossibleChain => "impossible chain".to_string(),
+        // HS `Contradictions.hs:448`: `text $ "non-injective facts " ++ show cex`
+        // where `cex :: (NodeId,NodeId,NodeId)`.  Derived `Show` for a tuple
+        // yields `(a,b,c)` with NO spaces after the commas.
         NonInjectiveFactInstance(a, b, c) =>
-            format!("non-injective facts ({}, {}, {})",
+            format!("non-injective facts ({},{},{})",
                 pretty_lvar(a), pretty_lvar(b), pretty_lvar(c)),
         FormulasFalse => "from formulas".to_string(),
         SuperfluousLearn(m, v) => {
@@ -684,11 +696,11 @@ fn goal_summary(g: &Goal) -> String {
         //   prettyGoal (SplitG x) = "splitEqs" <> parens (show (unSplitId x))
         Goal::Split(s) => format!("splitEqs({})", s.0),
         // Mirror Haskell `prettyGoal` (`Constraints.hs:275-278`):
-        //   DisjG (Disj [])  -> "Disj (⊥)"
+        //   DisjG (Disj [])  -> text "Disj" <-> operator_ "(⊥)"   (`<->` = `<+>` inserts a space)
         //   DisjG (Disj gfs) -> punctuate "  ∥" (map (parens . prettyGuarded) gfs)
         Goal::Disj(d) => {
             if d.0.is_empty() {
-                "Disj(\u{22A5})".to_string()
+                "Disj (\u{22A5})".to_string()
             } else {
                 let parts: Vec<String> = d.0.iter()
                     .map(|c| format!("({})",
@@ -787,5 +799,49 @@ end
         let html = render_proof_tree_html(1, "L", &root);
         assert!(html.contains("Proof of"));
         assert!(html.contains("L"));
+    }
+
+    // --- HS-parity pretty-printing regression tests --------------------
+    //
+    // Each pins a byte-for-byte form of a shared Haskell printer.
+
+    #[test]
+    fn sorry_method_label_has_no_initial_comment() {
+        // HS `unproven = sorry Nothing` (Proof.hs:255-256) renders via
+        // `prettyProofMethod (Sorry Nothing)` (ProofMethod.hs:1180-1181)
+        // as a plain `sorry` (no `/* ... */` reason).  Confirmed against
+        // the repo HS prover: an unproven lemma prints `by sorry`.
+        assert_eq!(method_label(&ProofMethod::Sorry(None)), "sorry");
+        // The fresh root built by ProofState::new must be Sorry(None).
+        // (We only assert the label form here; building a full ProofState
+        // requires Maude and is covered by build_state_for_trivial_theory.)
+    }
+
+    #[test]
+    fn empty_disj_goal_summary_has_space() {
+        use tamarin_theory::constraint::constraints::{Disj, Goal};
+        // HS `prettyGoal (DisjG (Disj [])) = text "Disj" <-> operator_ "(⊥)"`
+        // (Constraints.hs:275).  `<->` = HughesPJ `<+>` (Class.hs:176),
+        // which inserts a single space: `Disj (⊥)`.
+        assert_eq!(goal_summary(&Goal::Disj(Disj(vec![]))), "Disj (\u{22A5})");
+    }
+
+    #[test]
+    fn non_injective_facts_contradiction_no_comma_spaces() {
+        use tamarin_term::lterm::{LSort, LVar};
+        use tamarin_theory::constraint::solver::contradictions::Contradiction;
+        // HS `prettyContradiction` (Contradictions.hs:448):
+        //   `text $ "non-injective facts " ++ show cex`
+        // where `cex :: (NodeId,NodeId,NodeId)`.  Derived `Show` for a
+        // 3-tuple yields `(a,b,c)` with NO spaces after the commas; each
+        // NodeId shows with its `#` sort prefix.
+        let a = LVar::new("a", LSort::Node, 0);
+        let b = LVar::new("b", LSort::Node, 0);
+        let c = LVar::new("c", LSort::Node, 0);
+        let cex = Contradiction::NonInjectiveFactInstance(a, b, c);
+        assert_eq!(
+            pretty_contradiction(&cex),
+            "non-injective facts (#a,#b,#c)"
+        );
     }
 }

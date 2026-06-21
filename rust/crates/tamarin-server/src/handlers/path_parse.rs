@@ -129,7 +129,7 @@ fn parse_segs(segs: &[String]) -> Option<TheoryPath> {
             // segment, which encodes the inner proof case named "".
             //
             // We intentionally do NOT pop trailing empty segments here
-            // (unlike `proof` below): the method URL is constructed
+            // (same as the `proof` branch above): the method URL is constructed
             // from the proof-tree path, and each `/_` denotes a real
             // path segment.  Popping would conflate the lemma-root
             // application with applying-at-inner-empty-case (which

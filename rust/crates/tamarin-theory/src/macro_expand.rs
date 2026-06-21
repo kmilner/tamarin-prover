@@ -222,7 +222,6 @@ fn apply_macros_atom(macros: &[p::Macro], a: &p::Atom) -> p::Atom {
 ///   - rule prems/concs/acts (Rule.hs:1032-1037 + ClosedTheory.hs:322-323)
 ///   - lemma formula (Lemma.hs:83-88, called from Parser.hs:105)
 ///   - restriction formula (Restriction.hs:163-165)
-///   - case-test / acc-lemma formula (mirror lemma)
 ///   - embedded restriction in rule (treat as formula)
 ///   - rule let-block RHS (already inlined into the rule by
 ///     `apply_let_block` at elaborate time)
@@ -261,12 +260,15 @@ fn expand_items(macros: &[p::Macro], items: &mut [p::TheoryItem]) {
             p::TheoryItem::Restriction(r) | p::TheoryItem::LegacyAxiom(r) => {
                 r.formula = apply_macros_formula(macros, &r.formula);
             }
-            p::TheoryItem::CaseTest(c) => {
-                c.formula = apply_macros_formula(macros, &c.formula);
-            }
-            p::TheoryItem::AccLemma(a) => {
-                a.formula = apply_macros_formula(macros, &a.formula);
-            }
+            // CaseTest / AccLemma are `TranslationItem`s in HS, which
+            // `closeTheoryItem` passes through verbatim with NO macro
+            // application (Prover.hs:204 `TranslationItem`; added unmacroed
+            // via Parser.hs:157,163 `liftedAddAccLemma`/`liftedAddCaseTest`).
+            // They stay `SyntacticLNFormula` and are only `toLNFormula`'d
+            // during accountability translation (Items/CaseTestItem.hs:34-37),
+            // which does not run macros. So we deliberately do NOT expand them
+            // (they fall into the `_ => {}` arm below).
+            //
             // Predicates: bodies are themselves formula templates. Apply
             // macros so a predicate body that calls a macro is expanded
             // before predicate-expand inlines it.
@@ -305,21 +307,13 @@ fn expand_rule(macros: &[p::Macro], r: &mut p::Rule) {
         b.value = apply_macros_term(macros, &b.value);
         b.var = apply_macros_term(macros, &b.var);
     }
-    // Variants / diff sides: `variants` holds the user-written explicit
-    // `variants ...` block (HS OpenProtoRule's ruAC) and `left_right` holds
-    // the diff `left ... right ...` block (HS DiffProtoRule's sides). HS does
-    // NOT macro-expand these: applyMacroInProtoRule / applyMacroInDiffProtoRule
-    // (ClosedTheory.hs) only run applyMacroInRule on the main rule and pass
-    // the variants/sides through unchanged. RS recurses into them anyway; this
-    // is harmless because these nested rules normally carry no macro call-sites
-    // (and re-expanding an already-expanded body is idempotent).
-    for v in &mut r.variants {
-        expand_rule(macros, v);
-    }
-    if let Some((l, r2)) = &mut r.left_right {
-        expand_rule(macros, l);
-        expand_rule(macros, r2);
-    }
+    // Variants / diff sides are passed through UNCHANGED, matching HS.
+    // `variants` is the user-written explicit `variants ...` block (HS
+    // OpenProtoRule's ruAC) and `left_right` is the diff `left ... right ...`
+    // block (HS DiffProtoRule's sides). `applyMacroInProtoRule` /
+    // `applyMacroInDiffProtoRule` (ClosedTheory.hs:319,323) only run
+    // applyMacroInRule on the main rule `ruE` and leave variants/sides intact,
+    // so a macro call inside an explicit variant must survive unexpanded.
 }
 
 #[cfg(test)]
@@ -463,6 +457,83 @@ mod tests {
         let rule = find_rule(&thy.items).expect("rule under ifdef");
         let arg = &rule.premises[0].args[0];
         assert!(matches!(arg, p::Term::Var(v) if v.name == "a"), "got {:?}", arg);
+    }
+
+    #[test]
+    fn case_test_formula_is_not_macro_expanded() {
+        // HS keeps CaseTest as a `TranslationItem` and applies NO macros to
+        // it (Prover.hs:204; Parser.hs:163 `liftedAddCaseTest`). Probed
+        // against the real HS prover (v1.13.0) on an equivalent theory: the
+        // stored case-test formula prints `Blame( idm(a) )` UNEXPANDED, e.g.
+        //   predicate: Blamed( a ) <=> ∃ #i. Blame( idm(a) ) @ #i
+        // So after `expand_theory_macros` the case-test formula must still
+        // contain the macro call `App("idm", ...)`.
+        let src = "theory T begin\n\
+            functions: id/1\n\
+            macros: idm(x) = id(x)\n\
+            rule R: [ In(x) ] --[ Blame(x) ]-> [ Out(x) ]\n\
+            test blamed: \"Ex #i. Blame(idm(a)) @ #i\"\n\
+            end\n";
+        let mut thy = parse(src);
+        expand_theory_macros(&mut thy);
+        let ct = thy.items.iter().find_map(|i| match i {
+            p::TheoryItem::CaseTest(c) => Some(c),
+            _ => None,
+        }).expect("case test");
+        // The Action atom's fact arg must remain App("idm", [Var("a")]).
+        fn check(f: &p::Formula) -> bool {
+            match f {
+                p::Formula::Exists(_, body) | p::Formula::Forall(_, body) => check(body),
+                p::Formula::And(a, b) | p::Formula::Or(a, b)
+                | p::Formula::Implies(a, b) | p::Formula::Iff(a, b) => check(a) || check(b),
+                p::Formula::Not(g) => check(g),
+                p::Formula::Atom(p::Atom::Action(fact, _)) => {
+                    matches!(fact.args.first(),
+                        Some(p::Term::App(name, args)) if name == "idm" && args.len() == 1)
+                }
+                _ => false,
+            }
+        }
+        assert!(check(&ct.formula),
+            "case-test formula was macro-expanded (idm should survive): {:?}",
+            ct.formula);
+    }
+
+    #[test]
+    fn acc_lemma_formula_is_not_macro_expanded() {
+        // AccLemma is also a `TranslationItem` (Prover.hs:204; Parser.hs:157
+        // `liftedAddAccLemma`) and is never macro-expanded. After
+        // `expand_theory_macros` the acc-lemma formula must still contain the
+        // macro call `App("idm", ...)`.
+        let src = "theory T begin\n\
+            functions: id/1\n\
+            macros: idm(x) = id(x)\n\
+            rule R: [ In(x) ] --[ Blame(x), Fin() ]-> [ Out(x) ]\n\
+            test blamed: \"Ex #i. Blame(idm(a)) @ #i\"\n\
+            lemma acc: blamed accounts for \"All #i. Fin() @ #i ==> Ex #j. Blame(idm(a)) @ #j\"\n\
+            end\n";
+        let mut thy = parse(src);
+        expand_theory_macros(&mut thy);
+        let acc = thy.items.iter().find_map(|i| match i {
+            p::TheoryItem::AccLemma(a) => Some(a),
+            _ => None,
+        }).expect("acc lemma");
+        fn check(f: &p::Formula) -> bool {
+            match f {
+                p::Formula::Exists(_, body) | p::Formula::Forall(_, body) => check(body),
+                p::Formula::And(a, b) | p::Formula::Or(a, b)
+                | p::Formula::Implies(a, b) | p::Formula::Iff(a, b) => check(a) || check(b),
+                p::Formula::Not(g) => check(g),
+                p::Formula::Atom(p::Atom::Action(fact, _)) => {
+                    matches!(fact.args.first(),
+                        Some(p::Term::App(name, args)) if name == "idm" && args.len() == 1)
+                }
+                _ => false,
+            }
+        }
+        assert!(check(&acc.formula),
+            "acc-lemma formula was macro-expanded (idm should survive): {:?}",
+            acc.formula);
     }
 
     #[test]

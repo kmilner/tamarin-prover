@@ -7,8 +7,7 @@
 //! `allMsgVarsKnownEarlier`, `splitExists`, and `SubtermG`
 //! membership — together with the usefulness annotation
 //! (`currentlyDeducible` / `extractible` / `probablyConstructible` /
-//! `hasKUGuards`).  A few helpers remain conservative stubs (e.g.
-//! `is_nat_subterm_split`).
+//! `hasKUGuards`).
 
 use crate::constraint::constraints::Goal;
 use crate::constraint::solver::annotated_goals::{AnnotatedGoal, Usefulness};
@@ -27,8 +26,12 @@ use crate::constraint::system::System;
 ///   * `OracleSmart  { quit_on_empty, oracle_path }` — heuristic `O`
 ///     (HS `OracleSmartRanking`, System.hs:590)
 ///
-/// `{..}` (InternalTacticRanking) and `p`/`P`/`c`/`C` fall back to
-/// `Smart(false)` — they are out of scope for this implementation.
+/// `c` → `UsefulGoalNr` and `C` → `GoalNr` are implemented
+/// (System.hs:593-594 `goalRankingIdentifiers`); `{name}` tactics are
+/// resolved via `parse_heuristic_str_with_tactics`.  Only `p`/`P`
+/// (HS `SapicRanking`/`SapicPKCS11Ranking`, System.hs:591-592) fall
+/// back to `Smart(false)` — they are out of scope for this
+/// implementation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalRanking {
     /// `SmartRanking useLoopBreakers` (ProofMethod.hs).
@@ -192,21 +195,28 @@ pub fn parse_heuristic_str_with_tactics(
 /// `openGoals`: enumerate annotated goals still to be solved.
 ///
 /// Haskell iterates `M.toList $ get sGoals sys` in Goal-derived-Ord
-/// order; here `open_goals` itself yields goals in insertion-order.
-/// Goal-Ord is instead applied at the goal-iteration / ranking sites
-/// that need it: `goal_cmp` (below) is the HS-`Ord Goal`-faithful
+/// order, but every ranking that consumes the result begins with
+/// `goalNrRanking = sortOn (fst . snd)` (ProofMethod.hs:594; the first
+/// stage of smartRanking:1053, injRanking:946, GoalNrRanking:482, and
+/// the oracle preSorts:483-484).  Since `gsNr` is unique, sorting by nr
+/// fully overrides the `M.toList` Goal-Ord, so emitting goals in nr
+/// order here is exactly HS's post-`goalNrRanking` order — HS-faithful.
+///
+/// The `M.toList` Goal-Ord is only material at the direct `goal_cmp`
+/// call sites: `goal_cmp` (below) is the HS-`Ord Goal`-faithful
 /// comparator, wired into the goal sorts in `reduction.rs`,
-/// `sources.rs`, and `rename_precise.rs` (~7 call sites).  Wiring it
-/// directly into `open_goals` was deferred because the deeper search
-/// Goal-Ord induces on a few lemmas (Destroy_charn,
-/// Device_Init_Use_Set) regressed under the old 10s corpus-probe
-/// deadline.
+/// `sources.rs`, and `rename_precise.rs` (~7 call sites), which already
+/// use it.
 pub fn open_goals(sys: &System) -> Vec<AnnotatedGoal> {
     let mut out = Vec::new();
+    // HS `existingDeps = rawLessRel sys` — built ONCE per openGoals pass
+    // and shared across every KU goal's `currentlyDeducible`/`extractible`
+    // check (Goals.hs:120), rather than rebuilt per goal.
+    let adj = build_raw_less_adj(sys);
     for (goal, status) in sys.goals.iter() {
         if status.solved { continue; }
         if !is_open_in_sys(goal, sys) { continue; }
-        let u = goal_usefulness(goal, status.looping, sys);
+        let u = goal_usefulness_with_adj(goal, status.looping, sys, &adj);
         // Use the persistent goal-number (`_gsNr`), NOT the Vec
         // position.  Haskell's `openGoals` returns `(goal, (gsNr,
         // useful))` (Goals.hs) and the rankings begin with
@@ -221,85 +231,6 @@ pub fn open_goals(sys: &System) -> Vec<AnnotatedGoal> {
     // so sort explicitly.  Stable so equal-nr goals (shouldn't happen,
     // but defensive) keep Vec order.
     out.sort_by_key(|a| a.seq);
-    out
-}
-
-/// Render a `Disj<Guarded>` in a form whose lexicographic compare
-/// matches HS's derived `Ord (Disj LNGuarded)` (which bottoms out at
-/// `Ord LVar = idx <> sort <> name` per May-20).  Default `Debug` puts
-/// `name` first so string compare disagrees with LVar Ord at the
-/// first var that differs.  See `goal_cmp` Disj arm for use.
-fn guarded_canon_idx_first(d: &crate::constraint::constraints::Disj<crate::guarded::Guarded>) -> String {
-    fn render_guarded(g: &crate::guarded::Guarded, out: &mut String) {
-        use crate::guarded::Guarded;
-        match g {
-            Guarded::Atom(a) => { out.push_str("A:"); render_atom(a, out); }
-            Guarded::Conj(items) => {
-                out.push('&');
-                for it in items { render_guarded(it, out); out.push('|'); }
-            }
-            Guarded::Disj(items) => {
-                out.push('|');
-                for it in items { render_guarded(it, out); out.push('|'); }
-            }
-            Guarded::GGuarded { qua, vars, guards, body } => {
-                out.push_str(&format!("{:?}{}", qua, vars.len()));
-                for g in guards { render_atom(g, out); }
-                render_guarded(body, out);
-            }
-        }
-    }
-    fn render_atom(a: &crate::guarded::GAtom, out: &mut String) {
-        use crate::guarded::GAtom;
-        match a {
-            GAtom::Eq(s, t) => { out.push('E'); render_term(s, out); render_term(t, out); }
-            GAtom::Less(s, t) => { out.push('L'); render_term(s, out); render_term(t, out); }
-            GAtom::LessMset(s, t) => { out.push('M'); render_term(s, out); render_term(t, out); }
-            GAtom::Subterm(s, t) => { out.push('S'); render_term(s, out); render_term(t, out); }
-            GAtom::Last(s) => { out.push_str("La"); render_term(s, out); }
-            GAtom::Action(f, t) => {
-                out.push_str(&format!("Ac{}/{}", f.name, f.args.len()));
-                for arg in &f.args { render_term(arg, out); }
-                render_term(t, out);
-            }
-            GAtom::Pred(f) => { out.push_str(&format!("P{}", f.name)); }
-        }
-    }
-    fn render_term(t: &crate::guarded::GTerm, out: &mut String) {
-        use crate::guarded::{GTerm, BVar};
-        match t {
-            // idx FIRST, then sort, then name — mirrors LVar Ord.
-            GTerm::Var(BVar::Free(v)) => out.push_str(&format!("v{}-{:?}-{}", v.idx, v.sort, v.name)),
-            GTerm::Var(BVar::Bound(n)) => out.push_str(&format!("B{}", n)),
-            GTerm::App(name, args) => {
-                out.push_str(&format!("a{}/{}", name, args.len()));
-                for arg in args.iter() { render_term(arg, out); }
-            }
-            GTerm::Pair(items) => {
-                out.push_str(&format!("p/{}", items.len()));
-                for it in items.iter() { render_term(it, out); }
-            }
-            GTerm::AlgApp(name, a, b) => {
-                out.push_str(&format!("g{}", name));
-                render_term(a, out); render_term(b, out);
-            }
-            GTerm::Diff(a, b) => { out.push('d'); render_term(a, out); render_term(b, out); }
-            GTerm::BinOp(op, a, b) => { out.push_str(&format!("b{:?}", op)); render_term(a, out); render_term(b, out); }
-            GTerm::PubLit(s) => out.push_str(&format!("PL{}", s)),
-            GTerm::FreshLit(s) => out.push_str(&format!("FL{}", s)),
-            GTerm::NatLit(s) => out.push_str(&format!("NL{}", s)),
-            GTerm::Number(n) => out.push_str(&format!("N{}", n)),
-            GTerm::NumberOne => out.push_str("N1"),
-            GTerm::NatOne => out.push_str("Na1"),
-            GTerm::DhNeutral => out.push_str("Dh"),
-            GTerm::PatMatch(t) => { out.push('m'); render_term(t, out); }
-        }
-    }
-    let mut out = String::new();
-    for g in &d.0 {
-        render_guarded(g, &mut out);
-        out.push('#');
-    }
     out
 }
 
@@ -337,16 +268,16 @@ pub(crate) fn goal_cmp(a: &Goal, b: &Goal) -> std::cmp::Ordering {
             (&pa.0, pa.1.0).cmp(&(&pb.0, pb.1.0))
                 .then_with(|| fa.cmp(fb)),
         (Goal::Disj(da), Goal::Disj(db)) => {
-            // HS-faithful: derived `Ord (Disj LNGuarded)` is structural
-            // and bottoms out at `Ord LVar`, which (per the May-20 LVar
-            // Ord change) is `idx <> sort <> name` — IDX-FIRST.
-            // Plain `Debug` would compare on `name` first because the
-            // `Debug` impl renders `VarSpec { name: ..., idx: ... }`
-            // with `name` lexicographically before `idx`.
-            // Build a render that puts idx first so string compare
-            // matches LVar Ord.
-            da.0.len().cmp(&db.0.len()).then_with(||
-                guarded_canon_idx_first(da).cmp(&guarded_canon_idx_first(db)))
+            // HS `Disj a = Disj [a]` derives `Ord` as the newtype over the
+            // list, i.e. plain list Ord (element-by-element, shorter < longer),
+            // bottoming out at the structural `Ord LNGuarded`.  Use the
+            // HS-faithful structural comparator `cmp_guarded` (which threads
+            // through `cmp_varspec`'s numeric idx-first LVar Ord, `cmp_atom`'s
+            // timepoint-first ProtoAtom Ord, and declaration-order sort Ord).
+            // The previous string-render approach (idx/sort via `{:?}`,
+            // length-first prefix) diverged from HS on var sort order, decimal
+            // idx width, and Action timepoint-vs-fact order.
+            crate::guarded::cmp_slice(&da.0, &db.0, crate::guarded::cmp_guarded)
         }
         (Goal::Subterm((sa, ta_)), Goal::Subterm((sb, tb_))) =>
             sa.cmp(sb).then_with(|| ta_.cmp(tb_)),
@@ -393,14 +324,10 @@ impl std::error::Error for OracleError {}
 ///
 /// `isMsgOneCaseGoal` (`pcSources`/`full_sources` analysis, via
 /// `is_msg_one_case_goal` + `collect_one_case_syms`), `isSplitGoalSmall`
-/// (`is_split_goal_small`, reading `eq_store.split_size`), and
-/// `isNoLargeSplitGoal` (`is_no_large_split_goal`) are all ported and
-/// wired in as live predicates in the decision tree below.
-///
-/// One predicate remains a conservative stub: `moveNatToEnd` (via
-/// `is_nat_subterm_split`) needs `isNatSubterm` over subterms and for
-/// now returns `false` (safe — it only ever moves goals later, never
-/// earlier).
+/// (`is_split_goal_small`, reading `eq_store.split_size`),
+/// `isNoLargeSplitGoal` (`is_no_large_split_goal`), and `moveNatToEnd`
+/// (via `is_nat_subterm_split`, mirroring `isNatSubterm`) are all ported
+/// and wired in as live predicates in the decision tree below.
 pub fn rank_goals(sys: &System) -> Vec<AnnotatedGoal> {
     // With `ctx = None` the ranking always resolves to `Smart(false)`
     // (the oracle/tactic paths — the only `Err` sources — are
@@ -481,11 +408,15 @@ fn rank_goals_with_inner(
         }
         GoalRanking::UsefulGoalNr => {
             // HS `UsefulGoalNrRanking -> plainRanking . sortOn (\(_, (nr,
-            // useless)) -> (useless, nr))` (ProofMethod.hs:485).
+            // useless)) -> (useless, nr))` (ProofMethod.hs:485).  This
+            // sorts on the DERIVED `Ord Usefulness` (declaration order
+            // Useful<LoopBreaker<ProbablyConstructible<CurrentlyDeducible,
+            // AnnotatedGoals.hs:18-27), NOT `tagUsefulness` (which collapses
+            // LoopBreaker and ProbablyConstructible).  Rust's `Usefulness`
+            // derives Ord in the same declaration order.
             let mut ags = open_goals(sys);
             ags.sort_by(|a, b| {
-                tag_usefulness(a.usefulness)
-                    .cmp(&tag_usefulness(b.usefulness))
+                a.usefulness.cmp(&b.usefulness)
                     .then_with(|| a.seq.cmp(&b.seq))
             });
             Ok(ags)
@@ -652,10 +583,11 @@ fn apply_presort(
             a
         }
         GoalRanking::UsefulGoalNr => {
+            // sortOn (\(_, (nr, useless)) -> (useless, nr)) — derived
+            // `Ord Usefulness` (ProofMethod.hs:485), NOT tagUsefulness.
             let mut a = ags;
             a.sort_by(|x, y| {
-                tag_usefulness(x.usefulness)
-                    .cmp(&tag_usefulness(y.usefulness))
+                x.usefulness.cmp(&y.usefulness)
                     .then_with(|| x.seq.cmp(&y.seq))
             });
             a
@@ -1118,10 +1050,10 @@ fn smart_ranking(
     let not_solve_last: Vec<fn(&AnnotatedGoal) -> bool> = vec![is_non_solve_last_goal];
     goals = sort_decision_tree(&not_solve_last, goals);
     // 3b. unmark — HS `smartRanking`'s `unmark | allowPremiseGLoopBreakers
-    //     = map unmarkPremiseG` (ProofMethod.hs:1248).  Resets each
+    //     = map unmarkPremiseG` (ProofMethod.hs:1073).  Resets each
     //     PremiseG goal's usefulness to Useful so loop-breaker premises
     //     are not deprioritised.  Only active when allowLoopBreakers
-    //     (heuristic `S`).  `unmarkPremiseG` (ProofMethod.hs:296-299).
+    //     (heuristic `S`).  `unmarkPremiseG` (ProofMethod.hs:181-184).
     if allow_premise_g_loop_breakers {
         for a in goals.iter_mut() {
             if matches!(a.goal, Goal::Premise(_, _)) {
@@ -1227,7 +1159,7 @@ fn inj_ranking(
     })];
     goals = sort_decision_tree_dyn(&not_solve_last, goals);
     // unmark — `unmark | allowLoopBreakers = map unmarkPremiseG`
-    // (ProofMethod.hs:1117).  Reset PremiseG usefulness to Useful.
+    // (ProofMethod.hs:962).  Reset PremiseG usefulness to Useful.
     if allow_loop_breakers {
         for a in goals.iter_mut() {
             if matches!(a.goal, Goal::Premise(_, _)) {
@@ -1619,10 +1551,21 @@ fn is_non_solve_last_goal(a: &AnnotatedGoal) -> bool {
         _ => true,
     }
 }
-fn is_nat_subterm_split(_g: &Goal) -> bool {
-    // Stubbed: Nat-subterm view requires the full Subterm shape; for now
-    // never push to the end.  Safe — this only ever moves goals later.
-    false
+/// `isNatSubtermSplit` (ProofMethod.hs:1065-1066): a `SubtermG (small,
+/// big)` whose `isNatSubterm` holds (SubtermStore.hs:113):
+///   `(sortOfLNTerm small == LSortNat || isMsgVar small)
+///        && sortOfLNTerm big == LSortNat`
+/// Non-SubtermG goals are `False`.  Used by `moveNatToEnd` in
+/// smart_ranking to push nat-subterm splits to the back.
+fn is_nat_subterm_split(g: &Goal) -> bool {
+    use tamarin_term::lterm::{sort_of_lnterm, LSort};
+    match g {
+        Goal::Subterm((small, big)) => {
+            (sort_of_lnterm(small) == LSort::Nat || is_msg_var(small))
+                && sort_of_lnterm(big) == LSort::Nat
+        }
+        _ => false,
+    }
 }
 
 // -- Fact-level helpers ------------------------------------------------------
@@ -1696,21 +1639,39 @@ fn chain_to_equality(
         crate::rule::RuleInfo::Intr(crate::rule::IntrRuleACInfo::IEquality));
     if !is_equality { return false; }
     // ku_before: there's a KU action for t_start at some node that
-    // is reachable-before c.0 in the less-relation.
+    // is always-before c.0 in the less-relation.
+    //
+    // HS `allKUActions sys = unsolvedActionAtoms sys ++ node actions`
+    // (System.hs:1575-1585): the KU action may exist only as an
+    // unsolved `ActionG i (KU t_start)` goal (node i not yet
+    // materialised in sNodes), so we must scan unsolved ActionG goals
+    // in ADDITION to node rule actions — not just sys.nodes.  (Mirrors
+    // the precedent in simplify.rs allActions scan.)
     //
     // `always_before(id, &c.0)` is invariant across the actions of a node
     // (it does not depend on `fa`) and the relation is invariant across the
-    // node loop, so build the adjacency once and test the cheap tag/term
-    // predicate before the single per-node `always_before_with` query.
+    // loops, so build the adjacency once and test the cheap tag/term
+    // predicate before the per-node `always_before_with` query.
     let ab_adj = sys.build_always_before_adj();
-    let ku_before = sys.nodes.iter().any(|(id, rule)| {
+    let is_ku_of_t = |fa: &crate::fact::LNFact| -> bool {
+        matches!(fa.tag, crate::fact::FactTag::Ku)
+            && fa.terms.first() == Some(t_start)
+    };
+    // Unsolved ActionG goals (= HS unsolvedActionAtoms half of allActions).
+    let ku_before_goal = sys.goals.iter()
+        .filter(|(_, st)| !st.solved)
+        .any(|(g, _)| match g {
+            Goal::Action(i, fa) =>
+                is_ku_of_t(fa) && sys.always_before_with(&ab_adj, i, &c.0),
+            _ => false,
+        });
+    // Node rule actions (= HS sNodes half of allActions).
+    let ku_before_node = sys.nodes.iter().any(|(id, rule)| {
         if id == &c.0 { return false; }
-        rule.actions.iter().any(|fa| {
-            matches!(fa.tag, crate::fact::FactTag::Ku)
-                && fa.terms.first() == Some(t_start)
-        }) && sys.always_before_with(&ab_adj, id, &c.0)
+        rule.actions.iter().any(is_ku_of_t)
+            && sys.always_before_with(&ab_adj, id, &c.0)
     });
-    ku_before
+    ku_before_goal || ku_before_node
 }
 
 /// True if a goal is still "open": not vacuously False, not already
@@ -1841,15 +1802,30 @@ fn all_msg_vars_known_earlier(
     // `always_before(j, i)` does not depend on `arg`, and the relation is
     // invariant across both loops (`sys` is read-only), so build it once.
     let ab_adj = sys.build_always_before_adj();
+    // HS `earlierMsgVars = do (j,_,t) <- allKUActions sys; ...` (Goals.hs:164)
+    // and `allKUActions sys = unsolvedActionAtoms sys ++ node actions`
+    // (System.hs:1575-1585): the KU action may exist only as an unsolved
+    // `ActionG j (KU arg)` goal (node j not yet in sNodes), so scan unsolved
+    // ActionG goals in ADDITION to node rule actions.
+    let is_ku_of = |fa: &crate::fact::LNFact, arg: &tamarin_term::lterm::LNTerm| -> bool {
+        matches!(fa.tag, crate::fact::FactTag::Ku) && fa.terms.first() == Some(arg)
+    };
     args.iter().all(|arg| {
-        sys.nodes.iter().any(|(j, rule)| {
+        // Unsolved ActionG goals half of allActions.
+        let in_goals = sys.goals.iter()
+            .filter(|(_, st)| !st.solved)
+            .any(|(g, _)| match g {
+                Goal::Action(j, fa) =>
+                    is_ku_of(fa, arg) && sys.always_before_with(&ab_adj, j, i),
+                _ => false,
+            });
+        // Node rule actions half of allActions.
+        let in_nodes = sys.nodes.iter().any(|(j, rule)| {
             j != i
                 && sys.always_before_with(&ab_adj, j, i)
-                && rule.actions.iter().any(|fa| {
-                    matches!(fa.tag, crate::fact::FactTag::Ku)
-                        && fa.terms.first() == Some(arg)
-                })
-        })
+                && rule.actions.iter().any(|fa| is_ku_of(fa, arg))
+        });
+        in_goals || in_nodes
     })
 }
 
@@ -1908,15 +1884,29 @@ fn has_top_pair_inv_prod(t: &tamarin_term::lterm::LNTerm) -> bool {
 ///                       | probablyConstructible m -> ProbablyConstructible
 ///     _                            -> Useful
 ///
-/// `currentlyDeducible` and `extractible` need full edge / less-rel
-/// reachability + node-rule introspection, which we haven't ported
-/// yet. We approximate by treating any KU goal whose term has only
-/// public-or-nat-sort literals (no fresh names, no private function
-/// symbols) as `ProbablyConstructible` and otherwise `Useful`. This
-/// matches `probablyConstructible` exactly and is strictly more
-/// conservative than `currentlyDeducible` (so the decision-tree
-/// sort still partitions correctly).
+/// `currentlyDeducible` and `extractible` ARE fully ported: the body
+/// calls `currently_deducible(sys, i, m)` (which does the full
+/// less-rel / edge reachability + node-rule introspection via
+/// `extractible` / `reachable_from`) and only then falls back to
+/// `probably_constructible(m)`, exactly as Haskell's `useful` block
+/// does.
 pub fn goal_usefulness(g: &Goal, looping: bool, sys: &System) -> Usefulness {
+    // Standalone callers build the shared `rawLessRel` adjacency on the
+    // spot.  `open_goals` builds it once and uses
+    // `goal_usefulness_with_adj` to share it across all goals (mirroring
+    // HS's `existingDeps = rawLessRel sys` shared in `openGoals`).
+    let adj = build_raw_less_adj(sys);
+    goal_usefulness_with_adj(g, looping, sys, &adj)
+}
+
+/// Like [`goal_usefulness`] but reuses a prebuilt `rawLessRel`
+/// adjacency (`existingDeps`, Goals.hs:120) instead of rebuilding it.
+fn goal_usefulness_with_adj(
+    g: &Goal,
+    looping: bool,
+    sys: &System,
+    adj: &RawLessAdj,
+) -> Usefulness {
     if looping { return Usefulness::LoopBreaker; }
     if let Goal::Action(i, fa) = g {
         if fa.is_ku() {
@@ -1934,7 +1924,7 @@ pub fn goal_usefulness(g: &Goal, looping: bool, sys: &System) -> Usefulness {
                 // Order matters — `currentlyDeducible` subsumes
                 // `probablyConstructible` for Pub/Nat-only terms but
                 // also catches the `extractible` case.
-                if currently_deducible(sys, i, m) {
+                if currently_deducible(sys, adj, i, m) {
                     return Usefulness::CurrentlyDeducible;
                 }
                 if probably_constructible(m) {
@@ -1994,6 +1984,7 @@ fn has_ku_guards(sys: &System) -> bool {
 ///     and that node is not reachable from `i` via `rawLessRel`.
 fn currently_deducible(
     sys: &System,
+    adj: &RawLessAdj,
     i: &crate::constraint::constraints::NodeId,
     m: &tamarin_term::lterm::LNTerm,
 ) -> bool {
@@ -2003,7 +1994,7 @@ fn currently_deducible(
     {
         return true;
     }
-    extractible(sys, i, m)
+    extractible(sys, adj, i, m)
 }
 
 /// `extractible i m` — direct port of Haskell's `Goals.hs:144`.
@@ -2013,11 +2004,12 @@ fn currently_deducible(
 /// the dependency wouldn't introduce a cycle).
 fn extractible(
     sys: &System,
+    adj: &RawLessAdj,
     i: &crate::constraint::constraints::NodeId,
     m: &tamarin_term::lterm::LNTerm,
 ) -> bool {
     use crate::fact::FactTag;
-    let i_reach = reachable_from(sys, i);
+    let i_reach = reachable_from(adj, i);
     for (j, rule) in sys.nodes.iter() {
         if Some(j) == sys.last_atom.as_ref() { continue; }
         // We cannot deduce a message via a node we ourselves precede.
@@ -2059,8 +2051,7 @@ fn toplevel_terms(t: &tamarin_term::lterm::LNTerm) -> Vec<tamarin_term::lterm::L
     out
 }
 
-/// `rawLessRel`-based forward reachability: every node id reachable
-/// from `i` via `rawLessRel sys` (transitive closure).
+/// The `rawLessRel` adjacency: `from -> [to]` successor lists.
 ///
 /// `rawLessRel se = getLessRel sLessAtoms ++ rawEdgeRel se`, and
 /// `rawEdgeRel sys = map (nodeConcNode *** nodePremNode) $ [Edge..] ++
@@ -2069,15 +2060,20 @@ fn toplevel_terms(t: &tamarin_term::lterm::LNTerm) -> Vec<tamarin_term::lterm::L
 /// `sLessAtoms` and `sEdges` — mirroring `build_always_before_adj`
 /// (system.rs).  Omitting the unsolved-chain edges would mis-classify a
 /// KU goal's `Usefulness` in `extractible`/`currentlyDeducible`.
-fn reachable_from(
-    sys: &System,
-    i: &crate::constraint::constraints::NodeId,
-) -> std::collections::BTreeSet<crate::constraint::constraints::NodeId> {
-    use std::collections::{BTreeMap, BTreeSet, VecDeque};
-    let mut adj: BTreeMap<
-        crate::constraint::constraints::NodeId,
-        Vec<crate::constraint::constraints::NodeId>,
-    > = BTreeMap::new();
+///
+/// This adjacency is invariant across all goals in one `openGoals`
+/// pass (only the BFS seed `i` varies per KU goal), so HS computes
+/// `existingDeps = rawLessRel sys` ONCE in the `where` clause of
+/// `openGoals` (Goals.hs:120) and shares it.  We build it once in
+/// `open_goals` and thread it through `goal_usefulness_with_adj`.
+type RawLessAdj = std::collections::BTreeMap<
+    crate::constraint::constraints::NodeId,
+    Vec<crate::constraint::constraints::NodeId>,
+>;
+
+/// Build the `rawLessRel` adjacency once for the whole system.
+fn build_raw_less_adj(sys: &System) -> RawLessAdj {
+    let mut adj: RawLessAdj = std::collections::BTreeMap::new();
     for l in &sys.less_atoms {
         adj.entry(l.smaller.clone()).or_default().push(l.larger.clone());
     }
@@ -2093,6 +2089,18 @@ fn reachable_from(
             adj.entry(c.0.clone()).or_default().push(p.0.clone());
         }
     }
+    adj
+}
+
+/// `rawLessRel`-based forward reachability: every node id reachable
+/// from `i` via the prebuilt `rawLessRel` adjacency (transitive
+/// closure).  Mirrors HS `D.reachableSet [i] existingDeps`
+/// (Goals.hs:155).
+fn reachable_from(
+    adj: &RawLessAdj,
+    i: &crate::constraint::constraints::NodeId,
+) -> std::collections::BTreeSet<crate::constraint::constraints::NodeId> {
+    use std::collections::{BTreeSet, VecDeque};
     let mut seen: BTreeSet<crate::constraint::constraints::NodeId> = BTreeSet::new();
     let mut q: VecDeque<crate::constraint::constraints::NodeId> = VecDeque::new();
     q.push_back(i.clone());
@@ -2667,5 +2675,102 @@ mod tests {
         // ~'a' (prio, seq 2) first, then nonRanked [~'b'=0, ~'c'=1] in
         // presort order.
         assert_eq!(seqs, vec![2, 0, 1]);
+    }
+
+    // -- moveNatToEnd / isNatSubtermSplit (ProofMethod.hs:1064-1066) ----------
+
+    /// `isNatSubtermSplit` (ProofMethod.hs:1065) = `isNatSubterm st`
+    /// (SubtermStore.hs:113): `(sort small == Nat || isMsgVar small) &&
+    /// sort big == Nat`.  Non-SubtermG goals are False.
+    #[test]
+    fn is_nat_subterm_split_matches_haskell() {
+        use tamarin_term::lterm::{LSort, LVar};
+        use tamarin_term::vterm::var_term;
+        use crate::constraint::constraints::SplitId;
+
+        let nat = |n: &str| var_term(LVar::new(n, LSort::Nat, 0));
+        let msg = |n: &str| tamarin_term::builtin::msg_var(n, 0);
+        let fresh = |n: &str| tamarin_term::builtin::fresh_var(n, 0);
+
+        // small Nat, big Nat -> true.
+        assert!(is_nat_subterm_split(&Goal::Subterm((nat("a"), nat("b")))));
+        // small MsgVar, big Nat -> true (isMsgVar small branch).
+        assert!(is_nat_subterm_split(&Goal::Subterm((msg("a"), nat("b")))));
+        // small Nat, big NOT Nat -> false (big must be Nat).
+        assert!(!is_nat_subterm_split(&Goal::Subterm((nat("a"), fresh("b")))));
+        // small Fresh (not Nat, not MsgVar), big Nat -> false.
+        assert!(!is_nat_subterm_split(&Goal::Subterm((fresh("a"), nat("b")))));
+        // Non-Subterm goal -> false.
+        assert!(!is_nat_subterm_split(&Goal::Split(SplitId(0))));
+    }
+
+    // -- UsefulGoalNr ('c') derived Usefulness Ord (ProofMethod.hs:485) ------
+
+    /// HS `UsefulGoalNrRanking -> sortOn (\(_, (nr, useless)) -> (useless,
+    /// nr))` sorts on the DERIVED `Ord Usefulness` (declaration order
+    /// Useful<LoopBreaker<ProbablyConstructible<CurrentlyDeducible,
+    /// AnnotatedGoals.hs:18-27), NOT `tagUsefulness` (which would collapse
+    /// LoopBreaker and ProbablyConstructible to the same key).  So a
+    /// LoopBreaker goal must rank BEFORE a ProbablyConstructible goal even
+    /// when its creation-nr is larger.
+    #[test]
+    fn useful_goal_nr_uses_derived_usefulness_ord() {
+        use tamarin_term::lterm::{LSort, LVar};
+        let mk = |seq: u64, u: Usefulness| {
+            let v = LVar::new("k", LSort::Msg, 0);
+            let f = crate::fact::LNFact::new(crate::fact::FactTag::Out, vec![]);
+            AnnotatedGoal::new(Goal::Action(v, f), seq, u)
+        };
+        // LoopBreaker with the LARGER nr, ProbablyConstructible with the
+        // smaller nr.  HS Usefulness Ord (LoopBreaker < ProbablyConstructible)
+        // must dominate the nr tiebreak.
+        let lb = mk(5, Usefulness::LoopBreaker);
+        let pc = mk(1, Usefulness::ProbablyConstructible);
+        let mut ags = vec![pc.clone(), lb.clone()];
+        ags.sort_by(|a, b| {
+            a.usefulness.cmp(&b.usefulness).then_with(|| a.seq.cmp(&b.seq))
+        });
+        // LoopBreaker (seq 5) ranks first despite the larger nr: HS
+        // `Usefulness` Ord (LoopBreaker < ProbablyConstructible) dominates the
+        // nr tiebreak, even though `tag_usefulness` collapses the two (below).
+        assert_eq!(ags[0].seq, 5, "LoopBreaker must rank before ProbablyConstructible");
+        assert_eq!(ags[1].seq, 1);
+        // And tag_usefulness genuinely WOULD collapse these two — proving the
+        // distinction matters.
+        assert_eq!(tag_usefulness(Usefulness::LoopBreaker),
+                   tag_usefulness(Usefulness::ProbablyConstructible));
+        // The derived Ord does NOT collapse them.
+        assert!(Usefulness::LoopBreaker < Usefulness::ProbablyConstructible);
+    }
+
+    // -- goal_cmp Disj structural Ord (Constraints.hs derived Ord) -----------
+
+    /// HS `Disj a = Disj [a]` derives Ord = list Ord bottoming out at the
+    /// structural `Ord LNGuarded`, whose var leaves use `Ord LVar = (idx,
+    /// sort, name)`.  When two Disj goals differ at a leaf var of different
+    /// SORT (idx and name equal), HS LSort Ord (Pub<Fresh<Msg<Node<Nat)
+    /// decides.  This pins that the comparator orders by that structural HS
+    /// `Ord LSort` (Pub<Fresh), not by the `{:?}` sort-name string
+    /// (Fresh<Msg<Nat<Node<Pub).
+    #[test]
+    fn goal_cmp_disj_var_sort_uses_lsort_ord() {
+        use std::cmp::Ordering;
+        use crate::constraint::constraints::Disj;
+        use crate::guarded::{Guarded, GAtom, GTerm, BVar};
+        use tamarin_parser::ast::{VarSpec, SortHint};
+
+        // A single-atom Disj over `Last(v)` where v differs only by sort.
+        let mk_disj = |sort: SortHint| -> Goal {
+            let v = VarSpec { name: "x".to_string(), idx: 0, sort, typ: None };
+            let atom = GAtom::Last(GTerm::Var(BVar::Free(v)));
+            Goal::Disj(Disj::new(vec![Guarded::Atom(atom)]))
+        };
+        let pub_disj = mk_disj(SortHint::Pub);
+        let fresh_disj = mk_disj(SortHint::Fresh);
+        // HS LSort Ord: Pub < Fresh.  The structural comparator must put the
+        // Pub-var Disj first (by sort, not by Debug-string name order).
+        assert_eq!(goal_cmp(&pub_disj, &fresh_disj), Ordering::Less,
+            "HS LSort Ord requires Pub < Fresh in Disj structural compare");
+        assert_eq!(goal_cmp(&fresh_disj, &pub_disj), Ordering::Greater);
     }
 }

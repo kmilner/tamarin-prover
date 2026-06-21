@@ -202,7 +202,7 @@ pub struct LNMacro {
 /// `tree` is the structured parse of `raw`, produced by
 /// [`tamarin_parser::parse_proof_tree`].  Used by
 /// `prove::replace_sorry_prove` (the HS `replaceSorryProver` analogue,
-/// HS: Theory/Proof.hs:644-652) to walk the skeleton at proof-replay
+/// HS: Theory/Proof.hs:642-650) to walk the skeleton at proof-replay
 /// time and invoke the auto-prover only at `by sorry` leaves.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProofSkeleton {

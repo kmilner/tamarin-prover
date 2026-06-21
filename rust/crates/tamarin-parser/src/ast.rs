@@ -183,7 +183,7 @@ pub enum LemmaAttr {
 ///
 /// The skeleton is the *static* tree as written in the `.spthy` source,
 /// before any prover is run; `by sorry` leaves are the placeholders
-/// `replaceSorryProver` (HS: Theory/Proof.hs:644-652) replaces with
+/// `replaceSorryProver` (HS: Theory/Proof.hs:642-651) replaces with
 /// auto-prover output at proof-replay time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProofSkeleton {

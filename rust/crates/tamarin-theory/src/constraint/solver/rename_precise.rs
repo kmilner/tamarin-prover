@@ -144,7 +144,7 @@ pub fn rename_precise_system(sys: &mut System) {
     // sort-discriminating across variants at perform_split.
     //
     // The outer container `Conj (SplitId, S.Set LNSubstVFresh)`
-    // (EquationStore.hs:131) is a `Conj`-list (insertion order — match
+    // (EquationStore.hs:118) is a `Conj`-list (insertion order — match
     // with RS's `Vec<EqDisj>`).  The INNER `S.Set LNSubstVFresh` is Ord
     // ascending — sort to match.
     for d in &sys.eq_store.conj {
@@ -162,7 +162,7 @@ pub fn rename_precise_system(sys: &mut System) {
     // `S.Set LNGuarded` (System.hs:390-392), walked via `HasFrees (S.Set
     // a) = foldMap (foldFrees f)` in Ord-ascending.  RS's
     // `Vec<Guarded>` is in insertion order — sort via the existing
-    // `cmp_guarded` helper (guarded.rs:66) which mirrors HS's derived
+    // `cmp_guarded` helper (guarded.rs:67) which mirrors HS's derived
     // `Ord Guarded` (Guarded.hs:121-129).
     let mut formulas_sorted: Vec<&crate::guarded::Guarded>
         = sys.formulas.iter().collect();
@@ -180,7 +180,8 @@ pub fn rename_precise_system(sys: &mut System) {
     // walked via `HasFrees (M.Map k v) = M.foldrWithKey combine`
     // (Term/LTerm.hs:829-836) in ascending key order (`Ord Goal`).
     // `goal_cmp` matches HS's derived `Ord Goal`
-    // (System/Constraints.hs:155-168); see goals.rs:1687 test.
+    // (System/Constraints.hs:156-168); see
+    // `goal_cmp_tag_order_matches_haskell_declaration` test in goals.rs.
     let mut goals_sorted: Vec<&(Goal, crate::constraint::system::GoalStatus)>
         = sys.goals.iter().collect();
     goals_sorted.sort_by(|a, b|
@@ -225,7 +226,7 @@ pub fn rename_precise_system(sys: &mut System) {
     // 1. Nodes — id + rule.
     //
     // HS-faithful: `mapFrees (M.Map NodeId RuleACInst)`
-    // = `fmap M.fromList . mapFrees f . M.toList` (Term/LTerm.hs:876-877).
+    // = `fmap M.fromList . mapFrees f . M.toList` (Term/LTerm.hs:836).
     // `M.fromList` builds a Map keyed by Ord NodeId, so post-rename the
     // entries land in ascending NEW NodeId order.  Without this sort,
     // RS's `Vec<(NodeId, _)>` keeps the pre-rename insertion order — which
@@ -266,7 +267,7 @@ pub fn rename_precise_system(sys: &mut System) {
     // after the in-place rename.  See `subst_system_once`'s comment for
     // detailed rationale.
     // HS `mapFrees (S.Set LessAtom)`: sort + dedup post-rename
-    // (Term/LTerm.hs:866 `fmap S.fromList . mapFrees f . S.toList`).
+    // (Term/LTerm.hs:827 `fmap S.fromList . mapFrees f . S.toList`).
     let mut new_less: Vec<crate::constraint::constraints::LessAtom>
         = Vec::with_capacity(sys.less_atoms.len());
     for la in std::mem::take(&mut sys.less_atoms) {
@@ -315,7 +316,7 @@ pub fn rename_precise_system(sys: &mut System) {
         new_goals.push((g2, st));
     }
     // HS-faithful: `mapFrees (M.Map Goal GoalStatus)`
-    // = `fmap M.fromList . mapFrees f . M.toList` (Term/LTerm.hs:876-877).
+    // = `fmap M.fromList . mapFrees f . M.toList` (Term/LTerm.hs:836).
     // `M.fromList` builds a Map keyed by Ord Goal, so post-rename the
     // entries land in ascending NEW Goal order.
     //
@@ -332,7 +333,7 @@ pub fn rename_precise_system(sys: &mut System) {
     //
     // HS-faithful: `_sFormulas` / `_sSolvedFormulas` / `_sLemmas` are
     // `S.Set LNGuarded`. `mapFrees (S.Set a) = fmap S.fromList . mapFrees
-    // f . S.toList` (Term/LTerm.hs:866) — rebuilds the set after mapping,
+    // f . S.toList` (Term/LTerm.hs:827) — rebuilds the set after mapping,
     // so post-rename entries are sorted by NEW Ord Guarded AND
     // collision-deduped.  Mirror by sorting+deduping after the in-place
     // rename: post-rename two formulas that became equal collapse.

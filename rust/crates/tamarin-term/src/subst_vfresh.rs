@@ -12,7 +12,7 @@ use crate::vterm::{Lit, VTerm};
 use crate::term::{f_app_list, Term};
 
 // `PartialOrd` / `Ord` derived to mirror Haskell's `deriving (Ord, ..)` on
-// `SubstVFresh c v` (LTerm.hs).  Haskell's `S.toList` in `performSplit`
+// `SubstVFresh c v` (SubstVFresh.hs:79-80).  Haskell's `S.toList` in `performSplit`
 // returns substitutions in sorted order; we need the same canonical
 // ordering so split-case enumeration matches Haskell (e.g. KAS2_eCK
 // Resp_1 variant `c1 = aenc(x, pk(~lkR))` comes before the trivial
@@ -315,17 +315,15 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
     /// the per-binding name-hint rule.  It renames every range var
     /// unconditionally (HS has no "preserve" concept — `evalFreshAvoiding`
     /// only seeds the fresh counter above `t`'s max idx, it never skips a
-    /// variable).  The `preserve` argument is
-    /// therefore IGNORED by default; it is only honoured under the
-    /// legacy kill-switch `TAM_RS_LEGACY_FOLD_PRESERVE` (see the
-    /// HS-faithfulness gate in the body).
+    /// variable).  The `preserve` argument is therefore IGNORED; it is kept
+    /// only for signature stability with the callers that build a preserve
+    /// set.
     pub fn fresh_to_free_avoiding<F: FnMut(u64) -> u64>(
         &self,
         mut alloc_idxs: F,
-        preserve: &std::collections::BTreeSet<LVar>,
+        _preserve: &std::collections::BTreeSet<LVar>,
     ) -> crate::subst::Subst<C, LVar> {
         use crate::subst::Subst;
-        // === HS-faithfulness gate (2026-06-10) ===
         // HS has NO preserve concept in ANY freshToFree* variant:
         //   - `freshToFree` (Substitution.hs:54-66) imports EVERY range
         //     var to a brand-new fresh var via `importBinding`;
@@ -335,32 +333,14 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
         //     skips a variable;
         //   - `freshToFreeAvoidingFast` (:74-81) renames all range vars
         //     via `rename ... \`evalFreshAvoiding\` t` — same.
-        // The preserve-keep-identity behaviour below was introduced by
-        // `f6a193aa`, whose commit message misread `evalFreshAvoiding`
-        // as "vars appearing in t are SKIPPED".  Keeping a range var's
-        // identity can FUSE a Maude witness with an unrelated live
-        // system var that happens to share (name, sort, idx) — observed
-        // on Scott::key_secrecy where the c_kdf source's case6/case10
-        // msk var fused with the exponent's Msg-factor witness
-        // (`ex.0 → ~x.12` colliding with the msk `~x.12`), spuriously
-        // merging Fresh nodes at conjoin and killing Resp_1 arms HS
-        // keeps.  It also drops the domain-name hint for preserved vars
-        // (witnesses stay "x"-named where HS yields protocol names like
-        // `~ex`/`~msk`).  HS instead maintains the invariant that VFresh
-        // ranges are pure-fresh (composeVFresh's `extendWithRenaming`,
-        // Substitution.hs:40-47) and renames unconditionally.
-        // Kill: `TAM_RS_LEGACY_FOLD_PRESERVE=1` restores the f6a193aa
-        // behaviour.
-        // Read the legacy kill-switch once and cache it: its value
-        // cannot change within a run, and this runs in the hot eq-store
-        // fold path — avoids a getenv + String allocation per call.
-        use std::sync::OnceLock;
-        static LEGACY_FOLD_PRESERVE: OnceLock<bool> = OnceLock::new();
-        let legacy = *LEGACY_FOLD_PRESERVE
-            .get_or_init(|| std::env::var("TAM_RS_LEGACY_FOLD_PRESERVE").is_ok());
-        let empty_preserve = std::collections::BTreeSet::new();
-        let preserve: &std::collections::BTreeSet<LVar> =
-            if legacy { preserve } else { &empty_preserve };
+        // We therefore rename every range var unconditionally and ignore
+        // `_preserve`.  HS maintains the invariant that VFresh ranges are
+        // pure-fresh (composeVFresh's `extendWithRenaming`,
+        // Substitution.hs:40-47), so keeping a range var's identity would
+        // be unsound: it could fuse a Maude witness with an unrelated live
+        // system var that happens to share (name, sort, idx).
+        let preserve = std::collections::BTreeSet::new();
+        let preserve = &preserve;
         // HS-faithful port (Substitution.hs:54-66):
         //
         //   freshToFree subst = (`evalBindT` noBindings) $ do
@@ -516,8 +496,7 @@ pub fn free_to_fresh_raw<C: Ord + Clone>(s: crate::subst::Subst<C, LVar>)
 /// This is what HS uses per-variant in `variantsProtoRule`
 /// (RuleVariants.hs:74-77).  Without this pipeline, two variants whose
 /// Maude-back-conversion shapes happen to collide will end up with
-/// structurally-identical range vars and collapse at `perform_split`
-/// (see [[project-split-case-divergence-root]]).
+/// structurally-identical range vars and collapse at `perform_split`.
 pub fn compose_vfresh<C>(
     s1_0: &LSubstVFresh<C>,
     s2: &crate::subst::Subst<C, LVar>,
@@ -624,5 +603,29 @@ mod tests {
             (lv("z", 0), var_term(lv("y", 0))),
         ]);
         assert!(!s2.is_renamed_var(&lv("x", 0)));
+    }
+
+    #[test]
+    fn fresh_to_free_ignores_preserve_set() {
+        use std::collections::BTreeSet;
+        // HS has no "preserve" concept: every range var is renamed
+        // unconditionally (Substitution.hs:54-72). Even when the range var
+        // is passed in `preserve`, the result must NOT keep its identity.
+        let s: LSubstVFresh<C> = SubstVFresh::from_list(vec![
+            (lv("x", 0), var_term(lv("y", 5))),
+        ]);
+        let mut preserve: BTreeSet<LVar> = BTreeSet::new();
+        preserve.insert(lv("y", 5));
+        // Allocator hands out a fixed, clearly-distinct fresh idx.
+        let free = s.fresh_to_free_avoiding(|_| 99, &preserve);
+        let img = free.image_of(&lv("x", 0)).expect("x.0 must be mapped");
+        match img {
+            Term::Lit(Lit::Var(v)) => {
+                // Renamed to the freshly-allocated idx, NOT the preserved y.5.
+                assert_eq!(v.idx, 99);
+                assert_ne!(*v, lv("y", 5));
+            }
+            other => panic!("expected a renamed var, got {other:?}"),
+        }
     }
 }

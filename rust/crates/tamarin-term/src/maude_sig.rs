@@ -120,12 +120,23 @@ impl MaudeSig {
         let mut singleton: BTreeSet<NoEqSym> = BTreeSet::new();
         singleton.insert(sym);
         self.st_fun_syms = union_except_pair_sym(&self.st_fun_syms, &singleton);
+        // HS `<>` (Signature.hs:120-141) rebuilds via `maudeSig (mempty {...})`,
+        // and `mempty` has `eqConvergent=False` (line 145), which `maudeSig`
+        // preserves (line 105).  So routing through the monoid RESETS
+        // eqConvergent to false; mirror that here.
+        self.eq_convergent = false;
         self.refresh()
     }
 
     /// Add a macro symbol.
+    ///
+    /// HS `addMacroSym funsym msig = msig <> mempty {macroNames=...}`
+    /// (Signature.hs:157-159) routes through the monoid `<>`, which rebuilds
+    /// from `mempty` (eqConvergent=False, line 145; preserved by `maudeSig`,
+    /// line 105) and so RESETS eqConvergent to false — match that.
     pub fn add_macro_sym(mut self, sym: NoEqSym) -> Self {
         self.macro_names.insert(sym);
+        self.eq_convergent = false;
         self.refresh()
     }
 
@@ -133,15 +144,16 @@ impl MaudeSig {
     pub fn add_ctxt_st_rule(mut self, rule: CtxtStRule) -> Self {
         // HS-faithful pair mutual-exclusion (`unionExceptPairRules`,
         // Term/Maude/Signature.hs:135-141): the fst/snd CONSTRUCTOR and
-        // DESTRUCTOR rule variants are mutually exclusive.  `union` (above)
-        // applies this when merging signatures, but user `equations:` are
-        // installed here one rule at a time via plain `insert`, which bypasses
-        // it.  So an exported theory that declares `fst/1[destructor]` + the
-        // pairing equation kept BOTH the base constructor rule AND the user
-        // destructor rule, rendering the equation twice (e.g.
-        // noise/secrecy_4_passiveINpsk1_proof).  Apply the same exclusion here:
-        // inserting a pair destructor rule drops the constructor variant and
-        // vice versa, matching the declared symbol.
+        // DESTRUCTOR rule variants are mutually exclusive.  HS `addCtxtStRule`
+        // (Signature.hs:162-164) is `msig <> mempty {stRules=[str]}`, so each
+        // user `equations:` rule goes through the monoid `<>`, which applies
+        // `unionExceptPairRules` (Signature.hs:130, 135-141) — it is NOT a plain
+        // set insert.  So an exported theory that declares `fst/1[destructor]` +
+        // the pairing equation must keep only the declared destructor rule, not
+        // BOTH the base constructor rule AND the user destructor rule (which
+        // would render the equation twice, e.g. noise/secrecy_4_passiveINpsk1_proof).
+        // Mirror HS here: inserting a pair destructor rule drops the constructor
+        // variant and vice versa, matching the declared symbol.
         if rule == fst_dest_rule() { self.st_rules.remove(&fst_rule()); }
         else if rule == fst_rule() { self.st_rules.remove(&fst_dest_rule()); }
         else if rule == snd_dest_rule() { self.st_rules.remove(&snd_rule()); }
@@ -475,5 +487,54 @@ mod tests {
     fn empty_signature_has_no_rules() {
         let sig = MaudeSig::default().refresh();
         assert!(sig.rrules().is_empty());
+    }
+
+    /// HS `addFunSym`/`addMacroSym` route through the monoid `<>`
+    /// (Signature.hs:152-159), which rebuilds from `mempty`
+    /// (eqConvergent=False, line 145) and so RESETS eqConvergent to false.
+    ///
+    /// Probed against the real prover (v1.13.0): a `functions:` block placed
+    /// AFTER an `equations [convergent]:` block prints `equations:` (the
+    /// convergent flag is dropped), whereas `functions:` BEFORE keeps
+    /// `equations [convergent]:`.  `add_ctxt_st_rule` must NOT reset, since
+    /// elaborate.rs sets eq_convergent before the rule loop (mirroring the HS
+    /// parser's explicit re-set AFTER `foldl addCtxtStRule`,
+    /// Theory/Text/Parser/Signature.hs:226-227).
+    #[test]
+    fn add_fun_sym_resets_eq_convergent() {
+        use crate::function_symbols::{Constructability, NoEqSym, Privacy};
+        let mut sig = MaudeSig::default();
+        sig.eq_convergent = true;
+        let g = NoEqSym::new(
+            b"g".to_vec(), 1, Privacy::Public, Constructability::Constructor);
+        let sig = sig.add_fun_sym(g);
+        assert!(!sig.eq_convergent,
+            "add_fun_sym must reset eq_convergent (HS monoid <>)");
+    }
+
+    #[test]
+    fn add_macro_sym_resets_eq_convergent() {
+        use crate::function_symbols::{Constructability, NoEqSym, Privacy};
+        let mut sig = MaudeSig::default();
+        sig.eq_convergent = true;
+        let m = NoEqSym::new(
+            b"m".to_vec(), 1, Privacy::Private, Constructability::Destructor);
+        let sig = sig.add_macro_sym(m);
+        assert!(!sig.eq_convergent,
+            "add_macro_sym must reset eq_convergent (HS monoid <>)");
+    }
+
+    /// `add_ctxt_st_rule` must PRESERVE eq_convergent (no reset), because the
+    /// Rust elaborator sets eq_convergent BEFORE the add_ctxt_st_rule loop
+    /// (elaborate.rs:666 then :683), then refreshes — matching the printed
+    /// `equations [convergent]:` for the normal functions-before-equations
+    /// corpus ordering.
+    #[test]
+    fn add_ctxt_st_rule_preserves_eq_convergent() {
+        let mut sig = MaudeSig::default();
+        sig.eq_convergent = true;
+        let sig = sig.add_ctxt_st_rule(fst_dest_rule());
+        assert!(sig.eq_convergent,
+            "add_ctxt_st_rule must NOT reset eq_convergent");
     }
 }

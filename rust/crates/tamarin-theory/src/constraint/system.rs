@@ -115,31 +115,6 @@ pub struct System {
     /// internal KU goals re-spawn at runtime will pick the same case
     /// again, looping until depth-limit.
     pub used_sources: Vec<String>,
-    /// Set when `subst_system` detected a shape mismatch — i.e. two
-    /// distinct rule instances collapsed to the same node id with
-    /// disagreeing fact-list shapes.  This is the same Maude-witness
-    /// conflation pattern as Fresh-consumer conflation, just at the
-    /// rule level instead of the premise level.  Recorded as a flag
-    /// (separately from the gfalse in formulas) so `is_finished` can
-    /// route conflation-induced FormulasFalse → Unfinishable, while
-    /// legitimate gfalse-in-formulas (e.g. from a body that genuinely
-    /// simplifies to ⊥) still produces Contradictory.
-    pub shape_mismatch_conflation: bool,
-    /// Set when `solve_action_goal` (under TAM_APPLY_SOURCE) had to
-    /// drop one or more source-cases via the Fresh-consumer conflation
-    /// guard.  The dropped case may have been the actual witness path,
-    /// so we can't trust an overall Contradictory rollup.  `is_finished`
-    /// routes Contradictory→Unfinishable when this flag is set,
-    /// preserving soundness on the new applySource path.
-    pub lost_conflation_case_apply_source: bool,
-    /// Set when a search branch consumed a source-case from a
-    /// precomputed `Source` whose case enumeration was truncated by
-    /// `TAM_MAX_CLOSURES_PER_SOURCE` (i.e. `Source.incomplete=true`).
-    /// `is_finished` must route Solved→Sorry in this case — the
-    /// dropped cases could contain attack witnesses we never enumerated.
-    /// Without this, the cap is unsound (denning_sacco::sessionsmatch
-    /// wrong-VERIFIED at cap=256).
-    pub used_incomplete_source: bool,
     /// Provenance tracking (task #157): universals in `lemmas` that
     /// came from `[sources]`-tagged lemma bodies.  Haskell never adds
     /// these to `sLemmas` (only `[reuse]` lemmas go there via
@@ -189,10 +164,6 @@ impl Clone for System {
             next_goal_nr: self.next_goal_nr,
             next_split: self.next_split,
             used_sources: self.used_sources.clone(),
-            shape_mismatch_conflation: self.shape_mismatch_conflation,
-            lost_conflation_case_apply_source:
-                self.lost_conflation_case_apply_source,
-            used_incomplete_source: self.used_incomplete_source,
             sources_lemma_universals: self.sources_lemma_universals.clone(),
             max_var_idx_cache: Cell::new(self.max_var_idx_cache.get()),
         }
@@ -221,10 +192,6 @@ impl PartialEq for System {
             && self.next_goal_nr == other.next_goal_nr
             && self.next_split == other.next_split
             && self.used_sources == other.used_sources
-            && self.shape_mismatch_conflation == other.shape_mismatch_conflation
-            && self.lost_conflation_case_apply_source
-                == other.lost_conflation_case_apply_source
-            && self.used_incomplete_source == other.used_incomplete_source
             && self.sources_lemma_universals == other.sources_lemma_universals
     }
 }
@@ -504,35 +471,11 @@ impl System {
     /// Add an open goal, no-op if already present (compared by `Goal`
     /// equality).
     pub fn add_goal(&mut self, g: Goal) {
-        // HS `insertGoalStatus` (Reduction.hs:516-521): advance the
-        // counter on EVERY call, even when the goal already exists.
-        let age = self.next_goal_nr;
-        self.next_goal_nr = self.next_goal_nr.wrapping_add(1);
-        if dbg_insert_goal() {
-            let in_pre = crate::constraint::solver::sources::in_precompute_mode()
-                || crate::constraint::solver::sources::in_initial_source_cases();
-            let want_pre = dbg_insert_goal_include_precompute();
-            if !in_pre || want_pre {
-                let tag = if in_pre { "<precompute>" } else { "<proof>" };
-                eprintln!("[RS_INS_GOAL] lemma={} gsNr={} solved=false loops=false goal={:?}", tag, age, g);
-            }
-        }
-        // Dedup via `canonical_goal_for_dedup` (identity for every
-        // non-Disj goal, alpha-canonicalising for Disj) so this entry
-        // point uses the SAME Disj-dedup semantics as
-        // `add_goal_with_loop_flag` and matches HS's DeBruijn-keyed Map.
-        // Production `add_goal` callers only ever pass non-Disj goals
-        // (where this is plain structural equality), so behaviour is
-        // unchanged; this just removes the latent divergence for the
-        // test-only Disj callers.
-        let canon_g = canonical_goal_for_dedup(&g);
-        if !self.goals.iter().any(|(existing, _)|
-            canonical_goal_for_dedup(existing) == canon_g)
-        {
-            let st = GoalStatus { nr: age, ..Default::default() };
-            self.bump_cache_goal(&g);
-            self.goals_mut().push((g, st));
-        }
+        // HS has a single goal entry point: `insertGoal goal False`
+        // (Reduction.hs:523-524). `add_goal` is exactly that — defer to
+        // `add_goal_with_loop_flag` with `looping = false` so both
+        // entry points share one counter-advance / dedup / push path.
+        self.add_goal_with_loop_flag(g, false);
     }
 
     /// `insertGoal` mirror with loop-breaker flag — direct port of
@@ -789,11 +732,12 @@ pub fn formula_to_system(
 
     let mut sys = System::empty();
     sys.source_kind = Some(source_kind);
-    if is_diff {
-        // Diff is not yet handled in our skeleton; record it via an
-        // empty marker Side. Real diff support arrives later.
-        sys.side = None;
-    }
+    // HS stores `_sDiffSystem = isdiff` on its `System` record
+    // (System.hs:821-824/396).  The Rust `System` has no such field —
+    // `side` encodes LHS/RHS, not diff — so diff-mode is carried on
+    // `ProofContext.is_diff` (context.rs:54) instead.  Nothing about
+    // `is_diff` is recorded on the System here.
+    let _ = is_diff;
 
     // Partition restrictions into safety / non-safety.
     let (safety, other_restrictions): (Vec<Guarded>, Vec<Guarded>) =

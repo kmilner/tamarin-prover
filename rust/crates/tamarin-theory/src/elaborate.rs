@@ -190,14 +190,13 @@ pub fn elaborate_with_diagnostics(
 /// err) + 2 (ppFormula nest 2) = 6 spaces for formula text.
 ///
 /// HS `msum` semantics: in `formulaReports` the check order is
-/// `checkQuantifiers`, `checkTerms`, `checkGuarded` — the FIRST that
-/// fires for a given formula wins and the others are skipped.  We do
-/// NOT model that filtering here: this function runs the guardedness
-/// check unconditionally on every lemma/restriction (it takes no
-/// `already_failed_terms`-style parameter and the caller in run.rs
-/// performs no msum filtering — it approximates by running this
-/// unconditionally).  The msum/skip semantics are therefore only
-/// approximated.
+/// `checkQuantifiers`, `checkTerms`, `checkGuarded` (Wellformedness.hs:1002-1004).
+/// Because `WfErrorReport = [WfError]`, the list monad's `msum` is
+/// `concat`, so all three checks run and their results are
+/// concatenated — there is NO "first wins" short-circuit, and
+/// `checkGuarded` always runs unconditionally for every
+/// lemma/restriction.  This function does the same: it runs the
+/// guardedness check unconditionally on every lemma/restriction.
 pub fn check_guarded_wf(parser_thy: &p::Theory) -> Vec<tamarin_parser::wf::WfError> {
     use tamarin_parser::wf::underline_topic;
     use crate::pretty_formula::pretty_formula;
@@ -601,11 +600,17 @@ fn elaborate_already_expanded(parser_thy: &p::Theory) -> Result<Theory, ElabErro
 
     let mut thy: Theory = Theory::new(parser_thy.name.clone(), sig);
     thy.in_file = String::new();
-    thy.is_sapic = parser_thy.items.iter().any(|i|
-        matches!(i, p::TheoryItem::ProcessDef(_)
-            | p::TheoryItem::TopLevelProcess(_)
-            | p::TheoryItem::EquivLemma(_, _)
-            | p::TheoryItem::DiffEquivLemma(_)));
+    // HS sets `_thyIsSapic = True` only for EXACTLY ONE top-level
+    // process: `translate` matches on `theoryProcesses th`
+    // (= `[i | ProcessItem i <- ...]`, only top-level ProcessItems,
+    // not ProcessDefItems), reaching the `True` assignment solely in
+    // the single-process `[p]` branch; `[]` leaves the default False
+    // and `>=2` throws MoreThanOneProcess (Sapic.hs:48,85,87). Mirror
+    // that: count only TopLevelProcess items, true iff exactly one.
+    // (Currently `is_sapic` has no readers, so this is non-behavioral.)
+    thy.is_sapic = parser_thy.items.iter()
+        .filter(|i| matches!(i, p::TheoryItem::TopLevelProcess(_)))
+        .count() == 1;
 
     if let Some(cfg) = &parser_thy.configuration {
         thy.items.push(TheoryItem::ConfigBlock(cfg.clone()));
@@ -691,9 +696,25 @@ fn elaborate_items(
                     let args: Vec<LVar> = m.args.iter()
                         .map(|v| LVar::new(v.name.clone(), sort_of(&v.sort), v.idx))
                         .collect();
+                    // HS `macro` parses the body with `msetterm False llit`
+                    // (Macro.hs:41), which has no pattern-match (`=t`)
+                    // production, so a body that converts to a `PatMatch`
+                    // here would be a hard parse failure in HS — and
+                    // `addMacroSym` (Macro.hs:48) always runs for any parsed
+                    // macro.  Returning an error therefore matches HS's
+                    // parse-fail semantics: silently skipping would drop both
+                    // the `LNMacro` push and the fun-sym registration.
+                    // `term_to_lnterm` returns None only on `PatMatch`, which
+                    // the surface macro parser never places in a body.
                     let body = match term_to_lnterm(&m.body) {
                         Some(t) => t,
-                        None => continue, // best-effort, skip on failure
+                        None => {
+                            return Err(ElabError {
+                                message: format!(
+                                    "could not elaborate macro body for `{}`",
+                                    m.name),
+                            });
+                        }
                     };
                     // Register macro fun-sym in MaudeSig — mirrors HS
                     // `addMacroSym (op,(k,Private,Destructor))`
@@ -787,8 +808,10 @@ fn elaborate_items(
                 out.items.push(TheoryItem::Lemma(lem));
             }
             p::TheoryItem::DiffLemma(_dl) => {
-                // DiffLemma lives in DiffTheory only. In a non-diff
-                // theory we'd reject; for now silently drop.
+                // Unreachable for a non-diff theory: HS only parses
+                // `diffLemma` inside `diffTheory`/`addDiffLemma`
+                // (Theory/Text/Parser/Lemma.hs), so a regular theory
+                // never yields a DiffLemma item. Defensive no-op.
             }
             p::TheoryItem::AccLemma(a) => {
                 let acc = AccLemma {
@@ -1600,10 +1623,12 @@ pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
             ))
         }
         p::Term::Number(_) => {
-            // Generic numeric literal — surface form `1`, `2`, …  We
-            // don't yet model these as LNTerm constants in a
-            // type-correct way; fall back to a public constant
-            // placeholder.  TODO: model as proper nat / public name.
+            // Defensive: `p::Term::Number` cannot arise from parsed
+            // input. HS has no bare-integer (>=2) term — the parser
+            // recognizes only `1`/`%1`/`DH_neutral` (Term.hs), and the
+            // Rust parser likewise never constructs `Term::Number`. This
+            // variant only appears via GTerm round-trip converters, so
+            // this arm is unreachable for real elaboration input.
             let n = Name::new(NameTag::Pub, "n".to_string());
             Some(Term::Lit(Lit::Con(n)))
         }

@@ -39,7 +39,7 @@ TIMEOUT="${TIMEOUT:-120}"
 RS_TIMEOUT="${RS_TIMEOUT:-30}"
 JOBS="${JOBS:-$(nproc)}"
 EXTRA_ENV="${EXTRA_ENV:-}"
-CORPUS_ROOT="${CORPUS_ROOT:-/home/parallels/tamarin-prover/examples}"
+CORPUS_ROOT="${CORPUS_ROOT:-$repo_root/examples}"
 CACHE_VERSION="${CACHE_VERSION:-1}"
 # Deriv-check timeout (secs) passed to BOTH binaries so the message-derivation
 # section compares deterministically.  HS default 5s fires on heavy theories

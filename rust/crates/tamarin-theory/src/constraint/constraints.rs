@@ -159,6 +159,9 @@ impl Goal {
     pub fn is_chain(&self) -> bool { matches!(self, Goal::Chain(_, _)) }
     pub fn is_split(&self) -> bool { matches!(self, Goal::Split(_)) }
     pub fn is_disj(&self) -> bool { matches!(self, Goal::Disj(_)) }
+    // HS's `isSubtermGoal` (Constraints.hs:197-199) erroneously matches `DisjG _`
+    // (a copy-paste of `isDisjGoal`); we match the semantically-correct
+    // `Goal::Subterm`. Both are currently unused, so the divergence is inert.
     pub fn is_subterm(&self) -> bool { matches!(self, Goal::Subterm(_)) }
 
     /// "Standard" action goals are non-`KU` actions — `KU(_)` is

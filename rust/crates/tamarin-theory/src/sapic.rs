@@ -300,33 +300,28 @@ impl PatternSapicLVar {
 /// `unpatternVar`: drop the bind/match tag.
 pub fn unpattern_var(p: PatternSapicLVar) -> SapicLVar { p.into_var() }
 
-/// Deduplicated, sorted list of SAPIC variables in a term.
+/// `freesSapicTerm`: free variables of a SAPIC term, in source order, with
+/// duplicates (HS Sapic/Term.hs:131-132, `freesSapicTerm = foldMap (: [])` —
+/// a plain in-order traversal, neither sorted nor deduplicated).
 ///
-/// NOTE: despite the name, this mirrors HS `varsVTerm`
-/// (VTerm.hs:116-117, `sortednub . toList . foldMap (foldMap return)` —
-/// sorted and deduplicated), NOT HS `freesSapicTerm`
-/// (Term.hs:131-132, `foldMap (foldMap (:[]))` — a plain in-order
-/// traversal that is neither sorted nor deduplicated). All current
-/// callers feed the result into set-difference / set-membership, so the
-/// sort+dedup here is observationally equivalent to the HS `freesSapicTerm`
-/// + downstream `nub`/`\\` usage.
+/// Order and duplicates are load-bearing: `bindingsAct`/`bindingsComb`
+/// (Sapic/Bindings.hs:22-33) apply `nub` (first-occurrence dedup) to this
+/// list, and that ordered list flows into the not-yet-ported
+/// `Typing.mkSubst`, where `mapM freshLVar bvars` (Sapic/Typing.hs:267-269)
+/// assigns fresh indices in binding-list order. Do not sort/dedup here.
 pub fn frees_sapic_term(t: &SapicTerm) -> Vec<SapicLVar> {
-    tamarin_term::vterm::vars_vterm(t)
+    tamarin_term::vterm::vars_vterm_in_order(t)
 }
 
-/// Deduplicated, sorted list of SAPIC variables in a fact.
-///
-/// As with [`frees_sapic_term`], this mirrors a sort+dedup over the term
-/// variables rather than HS `freesSapicFact` (Term.hs:136-137,
-/// `foldMap freesSapicTerm`, which preserves order and duplicates); the
-/// difference is masked because every consumer treats the result as a set.
+/// `freesSapicFact`: free variables of a SAPIC fact, in source order, with
+/// duplicates (HS Sapic/Term.hs:136-137, `freesSapicFact = foldMap
+/// freesSapicTerm` — a plain `concatMap` over the fact's terms; no sort, no
+/// dedup). See [`frees_sapic_term`] for why order/duplicates matter.
 pub fn frees_sapic_fact(f: &Fact<SapicTerm>) -> Vec<SapicLVar> {
     let mut out = Vec::new();
     for t in &f.terms {
         out.extend(frees_sapic_term(t));
     }
-    out.sort();
-    out.dedup();
     out
 }
 

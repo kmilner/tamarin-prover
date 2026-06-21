@@ -11,7 +11,7 @@
 //!
 //! Strategy:
 //!   - Serve `data/<rest>` via tower-http `ServeDir`.
-//!   - For `js/intdot-*.es.js` and `css/intdot-style.css`, look the
+//!   - For `js/intdot-*.es.js` and `css/intdot-*.css`, look the
 //!     file up in `frontend/dist/` and stream it back from a small
 //!     async handler.
 //!   - Everything else 404s.

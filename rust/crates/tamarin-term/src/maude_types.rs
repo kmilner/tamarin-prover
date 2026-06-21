@@ -193,12 +193,20 @@ pub fn mterm_to_lnterm(
             // LVar so subst lookups downstream don't see two distinct
             // (name, sort, idx) instances for the same logical variable.
             //
-            // NB: this INTENTIONALLY DIVERGES from HS `mTermToLNTerm`'s
+            // Known Rust-side compensation, NOT yet traced to its upstream
+            // encoding cause.  This diverges from HS `mTermToLNTerm`'s
             // `importLit` (Term/Maude/Types.hs:89), whose `lookupBinding`
-            // is strict in the full MaudeLit sort and would instead mint a
-            // fresh LVar at the widened sort.  We track Maude's ground
-            // truth here to avoid the TESLA Sender0a chain artifact rather
-            // than mirror HS's strict-sort lookup.
+            // (Bind.hs:117) is strict in the full `MaudeLit` sort
+            // (data MaudeLit = MaudeVar Integer LSort, deriving Ord —
+            // Types.hs:42-45): on a sort-miss HS would mint a FRESH `LVar`
+            // at the widened sort (importBinding, Bind.hs:134-141), never
+            // recovering the original.  Given identical Maude output the
+            // strict lookup should always hit (the forward encoder
+            // import_lit and the sort parser are byte-equivalent to HS), so
+            // when this branch fires it is masking a Rust-side mismatch, not
+            // a Maude-side fact.  Kept to preserve current corpus parity
+            // until the upstream cause is traced; do not delete without a
+            // full HS-parity corpus diff (TESLA Scheme1/2 are sensitive).
             if let MaudeLit::MaudeVar(idx, sort) = ml {
                 if let Some(orig) = lookup_canonical_var_lit(ctx, *sort, *idx) {
                     return Term::Lit(orig);
@@ -259,14 +267,22 @@ pub fn substitute_lookup_var(
     {
         return Some(lv);
     }
-    // Sort-tolerant fallback: Maude sometimes widens a variable's sort
-    // when constructing response terms (e.g. our `~k1:Fresh:6` may be
-    // referenced as `~k1:Msg:6` in the returned substitution). Look up
-    // by (idx, ANY sort) so we recover the original LVar identity.
-    // Without this, `mterm_to_lnterm` creates a fresh LVar with Maude's
-    // reported (widened) sort, producing a (name, sort, idx) collision
-    // with the original — breaking subst lookups downstream. This is
-    // the root cause of TESLA's Sender0a chain artifact.
+    // Sort-tolerant fallback: look up by (idx, ANY sort) to recover the
+    // original LVar identity when the strict (idx, sort) key misses.
+    //
+    // Known Rust-side compensation, NOT yet traced to its upstream cause.
+    // This diverges from HS `msubstToLSubstVFresh`/`VFree`'s `lookupVar s i
+    // = lookupBinding (MaudeVar i s)` (Types.hs:139-143, 159-163), which is
+    // strict in the full `MaudeLit` sort and `error`s on a miss — there is
+    // no any-sort fallback.  The forward encoder (`import_lit`) and the
+    // substitution sort parser (`parse_entry`/`parse_sort`) are
+    // byte-equivalent to HS `exportLit`/`parseEntry`, so given identical
+    // Maude output the strict lookup should always hit and HS never reaches
+    // the error.  When this loop fires it is therefore masking a Rust-side
+    // registration mismatch, not a Maude-side fact.  Kept to preserve
+    // current corpus parity until the upstream cause is traced; do not
+    // delete without a full HS-parity corpus diff (TESLA Scheme1/2 are
+    // sensitive, per project memory).
     for sort_candidate in &[LSort::Pub, LSort::Fresh, LSort::Nat, LSort::Msg, LSort::Node] {
         if *sort_candidate == sort { continue; }
         if let Some(lv) = ctx.inverse.get(&MaudeLit::MaudeVar(idx, *sort_candidate))
@@ -343,6 +359,53 @@ mod tests {
         let mut next = 0;
         let back = mterm_to_lnterm(&mt, &mut ctx, "x", &mut next);
         assert_eq!(t2, back);
+    }
+
+    /// Pins the load-bearing sort-tolerant DOMAIN fallback in
+    /// `substitute_lookup_var`.  HS `lookupVar s i = lookupBinding
+    /// (MaudeVar i s)` (Term/Maude/Types.hs:139-143) is strict and would
+    /// `error` on a sort-miss; the Rust fallback instead recovers the
+    /// original LVar by (idx, ANY sort).  This test locks the CURRENT Rust
+    /// behavior so any change to that fallback is caught and re-validated
+    /// against the corpus.  If the upstream registration cause is ever
+    /// traced and the fallback removed, this test changes with it.
+    #[test]
+    fn substitute_lookup_var_recovers_widened_sort() {
+        let mut ctx = ConvCtx::new();
+        // Bind MaudeVar(6, Fresh) -> ~k1 (a Fresh-sorted LVar).
+        let k1 = LVar::new("~k", LSort::Fresh, 1);
+        ctx.inverse
+            .insert(MaudeLit::MaudeVar(6, LSort::Fresh), Lit::Var(k1.clone()));
+        // Maude references it back with a WIDENED sort (Msg); the strict
+        // (6, Msg) key misses, but the (idx, any-sort) fallback recovers
+        // the original Fresh-sorted LVar.
+        let got = substitute_lookup_var(&ctx, LSort::Msg, 6);
+        assert_eq!(got, Some(k1));
+        // A genuinely unknown idx still returns None (no fabrication).
+        assert_eq!(substitute_lookup_var(&ctx, LSort::Msg, 99), None);
+    }
+
+    /// Pins the load-bearing sort-tolerant RANGE fallback used by
+    /// `mterm_to_lnterm` via `lookup_canonical_var_lit`.  HS `importLit`
+    /// (Term/Maude/Types.hs:89) is strict on the full sort and on a miss
+    /// mints a FRESH `LVar` at the widened sort; the Rust fallback instead
+    /// recovers the original LVar identity.  Locks current Rust behavior.
+    #[test]
+    fn mterm_to_lnterm_recovers_widened_sort_var() {
+        let mut ctx = ConvCtx::new();
+        // ctx only has MaudeVar(idx, Fresh) bound.
+        let k = LVar::new("~k", LSort::Fresh, 3);
+        ctx.inverse
+            .insert(MaudeLit::MaudeVar(4, LSort::Fresh), Lit::Var(k.clone()));
+        // Maude hands back the SAME idx widened to Msg.
+        let mt: MTerm = Term::Lit(MaudeLit::MaudeVar(4, LSort::Msg));
+        let mut next = 50;
+        let back = mterm_to_lnterm(&mt, &mut ctx, "x", &mut next);
+        // Rust recovers the original Fresh-sorted LVar rather than minting
+        // a fresh Msg-sorted one (which is what HS would do).  next is
+        // untouched because no new LVar was allocated.
+        assert_eq!(back, Term::Lit(Lit::Var(k)));
+        assert_eq!(next, 50);
     }
 
     /// Regression for #330: `mterm_to_lnterm` must sort `em` (C/EMap) args

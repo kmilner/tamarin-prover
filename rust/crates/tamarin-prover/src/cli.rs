@@ -8,11 +8,10 @@
 //! What we currently support (batch / prove pipeline):
 //!
 //!   --prove[=LEMMA]            select a lemma (or prefix*) to prove. Repeatable.
-//!   --prove-all                shorthand for proving every lemma.
 //!   --lemma[=LEMMA]            (synonym for --prove without proving — kept for parity)
 //!   --stop-on-trace=DFS|...    trace-search policy (parsed, not yet routed in port)
-//!   --bound=N, -b N            proof-depth bound
-//!   --saturation=N, -s N       saturation iterations (parsed, not yet routed)
+//!   --bound=N, -bN             proof-depth bound
+//!   --saturation=N, -sN        saturation iterations (parsed, not yet routed)
 //!   --heuristic=...            heuristic ranking sequence (parsed, not yet routed)
 //!   --partial-evaluation=...   partial-evaluation mode (parsed, not yet routed)
 //!   -D|--defines=STRING        preprocessor `#define` flags. Repeatable.
@@ -25,15 +24,15 @@
 //!   --verbose, -v              verbose proof-search output
 //!   --parse-only               parse + pretty-print, no analysis
 //!   --precompute-only          run precomputation only
-//!   --open-chains=N, -c N      open-chain bound (parsed, not yet routed)
-//!   --derivcheck-timeout=N -d  message-derivation check timeout (parsed, not yet routed)
+//!   --open-chains=N, -cN       open-chain bound (parsed, not yet routed)
+//!   --derivcheck-timeout=N -dN message-derivation check timeout (parsed, not yet routed)
 //!   --no-reuse                 do not export reuse lemmas (parsed, not yet routed)
 //!   --no-restrictions          do not export restrictions (parsed, not yet routed)
 //!   --replication-bound=N      DeepSec replication bound (parsed, not yet routed)
 //!   --no-compress              do not compress sequents (parsed, not yet routed)
-//!   --output=FILE, -o FILE     write the analyzed theory to FILE
-//!   --Output=DIR, -O DIR       write analyzed theory to DIR/<basename>_analyzed.spthy
-//!   --output-module=MODULE -m  output module selector (errors: not yet ported)
+//!   --output=FILE, -oFILE      write the analyzed theory to FILE
+//!   --Output=DIR, -ODIR        write analyzed theory to DIR/<basename>_analyzed.spthy
+//!   --output-module=MODULE -mMODULE  output module selector (errors: not yet ported)
 //!   --output-json=FILE, --oj   serialize traces to JSON (writes empty stub + warns; not yet ported)
 //!   --output-dot=FILE, --od    serialize traces to dot (writes empty stub + warns; not yet ported)
 //!   --with-maude=PATH          path to `maude` (default: looked up via PATH)
@@ -50,16 +49,20 @@
 //!
 //! `interactive` subcommand flags (mirrors `Main/Mode/Interactive.hs`):
 //!
-//!   --port=N, -p N             port to listen on (default 3001)
-//!   --interface=ADDR, -i ADDR  interface to listen on (default 127.0.0.1)
+//!   --port=N, -pN              port to listen on (default 3001)
+//!   --interface=ADDR, -iADDR   interface to listen on (default 127.0.0.1)
 //!   --image-format=PNG|SVG     image format used for graphs (default SVG)
 //!   --debug                    show server debugging output
 //!   --no-logging               suppress web server logs
 //!   --data-dir=DIR             override path to the bundled `data/` directory
 //!
-//! The Haskell CLI uses `cmdargs`'s `flagOpt` for both bare `--foo` and
-//! `--foo=VALUE` forms; we mirror that — a `--prove` with no value
-//! means "prove all lemmas".
+//! The Haskell CLI uses `cmdargs`'s `flagOpt` for almost every value
+//! flag, so each accepts a bare `--foo` (which records the flag's
+//! documented default) or `--foo=VALUE` / `-fVALUE` — but NOT a
+//! space-separated `--foo VALUE` (that next token stays positional,
+//! exactly as the HS binary treats `--bound 5 t.spthy` -> `5` is a file).
+//! The only exceptions are `--output-json`/`--output-dot`, which are
+//! `flagReq` and DO consume the following token (Batch.hs:79-80).
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopOnTrace {
@@ -143,9 +146,6 @@ pub struct Args {
     /// Names / prefixes from `--prove` or `--lemma`. An empty entry
     /// (e.g. bare `--prove`) means "all lemmas".
     pub lemma_names: Vec<String>,
-    /// True iff `--prove-all` was passed (alias for `--prove` with no
-    /// argument).
-    pub prove_all: bool,
 
     // Theory-load options.
     pub stop_on_trace: Option<StopOnTrace>,
@@ -224,7 +224,6 @@ impl Default for Args {
             in_files: Vec::new(),
             prove_mode: false,
             lemma_names: Vec::new(),
-            prove_all: false,
             stop_on_trace: None,
             bound: None,
             heuristic: None,
@@ -339,11 +338,6 @@ pub fn parse_args(raw: &[String]) -> Result<Args, CliError> {
                         args.lemma_names.push(String::new());
                     }
                 }
-                "prove-all" => {
-                    args.prove_mode = true;
-                    args.prove_all = true;
-                    args.lemma_names.push(String::new());
-                }
                 "lemma" => {
                     if let Some(v) = val_inline {
                         args.lemma_names.push(v.to_string());
@@ -351,53 +345,63 @@ pub fn parse_args(raw: &[String]) -> Result<Args, CliError> {
                         args.lemma_names.push(String::new());
                     }
                 }
+                // flagOpt "dfs" — bare flag records the default "dfs", which
+                // equals the Rust default; absent leaves None (same behaviour).
                 "stop-on-trace" => {
-                    let v = take_val(&mut i, raw, val_inline, "stop-on-trace")?;
+                    let v = flag_opt(val_inline, "dfs");
                     args.stop_on_trace = Some(StopOnTrace::parse(&v).map_err(CliError::Msg)?);
                 }
+                // flagOpt "5" (TheoryLoader.hs:105-110).  Load-bearing: HS
+                // `proofBound = parseIntArg (findArg "bound") Nothing Just`, so
+                // bare `--bound` records the default "5" => Some(5) (bounded
+                // search) while an absent `--bound` stays None (unbounded).
                 "bound" => {
-                    let v = take_val(&mut i, raw, val_inline, "bound")?;
+                    let v = flag_opt(val_inline, "5");
                     args.bound = Some(parse_int(&v, "bound")?);
                 }
                 "heuristic" => {
-                    let v = take_val(&mut i, raw, val_inline, "heuristic")?;
-                    args.heuristic = Some(v);
+                    // flagOpt default = head of defaultRankings False; that
+                    // default rebuilds the Rust default downstream, so a bare
+                    // flag is behaviourally equal to absent — leave None.
+                    if let Some(v) = val_inline {
+                        args.heuristic = Some(v.to_string());
+                    }
                 }
                 "partial-evaluation" => {
-                    let v = take_val(&mut i, raw, val_inline, "partial-evaluation")?;
+                    let v = flag_opt(val_inline, "summary");
                     args.partial_evaluation =
                         Some(PartialEval::parse(&v).map_err(CliError::Msg)?);
                 }
                 "defines" => {
-                    let v = take_val(&mut i, raw, val_inline, "defines")?;
-                    args.defines.push(v);
+                    // flagOpt "" — bare `-D`/`--defines` records the empty
+                    // string default (a no-op #define), matching HS.
+                    args.defines.push(flag_opt(val_inline, ""));
                 }
                 "diff" => args.diff = true,
                 "quit-on-warning" => args.quit_on_warning = true,
                 "auto-sources" => args.auto_sources = true,
                 "oraclename" => {
-                    let v = take_val(&mut i, raw, val_inline, "oraclename")?;
-                    args.oracle_name = Some(v);
+                    args.oracle_name = Some(flag_opt(val_inline, ""));
                 }
                 "oracle-only" => args.oracle_only = true,
                 "quiet" => args.quiet = true,
                 "verbose" => args.verbose = true,
                 "open-chains" => {
-                    let v = take_val(&mut i, raw, val_inline, "open-chains")?;
+                    let v = flag_opt(val_inline, "10");
                     args.open_chains = Some(parse_int(&v, "open-chains")?);
                 }
                 "saturation" => {
-                    let v = take_val(&mut i, raw, val_inline, "saturation")?;
+                    let v = flag_opt(val_inline, "5");
                     args.saturation = Some(parse_int(&v, "saturation")?);
                 }
                 "derivcheck-timeout" => {
-                    let v = take_val(&mut i, raw, val_inline, "derivcheck-timeout")?;
+                    let v = flag_opt(val_inline, "5");
                     args.derivcheck_timeout = Some(parse_int(&v, "derivcheck-timeout")?);
                 }
                 "no-reuse" => args.no_reuse = true,
                 "no-restrictions" => args.no_restrictions = true,
                 "replication-bound" => {
-                    let v = take_val(&mut i, raw, val_inline, "replication-bound")?;
+                    let v = flag_opt(val_inline, "3");
                     args.replication_bound = Some(parse_int(&v, "replication-bound")?);
                 }
                 "no-compress" => args.no_compress = true,
@@ -423,21 +427,24 @@ pub fn parse_args(raw: &[String]) -> Result<Args, CliError> {
                     }
                     args.maude_processes = Some(n);
                 }
-                // Output flags.
+                // Output flags.  output / Output / output-module are flagOpt
+                // (Batch.hs:76-78): only `=VALUE` or a bare flag (records the
+                // default ""/""/"spthy"); they never consume the next token.
                 "output" => {
-                    let v = take_val(&mut i, raw, val_inline, "output")?;
-                    args.output_file = Some(v);
+                    args.output_file = Some(flag_opt(val_inline, ""));
                 }
-                // Note: the long form in Haskell is `--Output` (capital O)
-                // for the directory variant. Accept both for friendliness.
-                "Output" | "output-dir" => {
-                    let v = take_val(&mut i, raw, val_inline, "Output")?;
-                    args.output_dir = Some(v);
+                // The long form in Haskell is `--Output` (capital O) for the
+                // directory variant (Batch.hs:77 registers only `Output`/`O`);
+                // there is no `--output-dir` alias, so it falls through to the
+                // unknown-flag arm, exactly as HS does.
+                "Output" => {
+                    args.output_dir = Some(flag_opt(val_inline, ""));
                 }
                 "output-module" => {
-                    let v = take_val(&mut i, raw, val_inline, "output-module")?;
-                    args.output_module = Some(v);
+                    args.output_module = Some(flag_opt(val_inline, "spthy"));
                 }
+                // output-json / output-dot are flagReq (Batch.hs:79-80): they
+                // REQUIRE a value and DO consume a separate next token.
                 "output-json" | "oj" => {
                     let v = take_val(&mut i, raw, val_inline, "output-json")?;
                     args.trace_json = Some(v);
@@ -446,30 +453,40 @@ pub fn parse_args(raw: &[String]) -> Result<Args, CliError> {
                     let v = take_val(&mut i, raw, val_inline, "output-dot")?;
                     args.trace_dot = Some(v);
                 }
+                // toolFlags are flagOpt (Environment.hs:31-33): defaults
+                // maude/dot/json; bare flag records the default, no token.
                 "with-maude" => {
-                    let v = take_val(&mut i, raw, val_inline, "with-maude")?;
-                    args.maude_path = Some(v);
+                    args.maude_path = Some(flag_opt(val_inline, "maude"));
                 }
                 "with-dot" => {
-                    let v = take_val(&mut i, raw, val_inline, "with-dot")?;
-                    args.dot_path = Some(v);
+                    args.dot_path = Some(flag_opt(val_inline, "dot"));
                 }
                 "with-json" => {
-                    let v = take_val(&mut i, raw, val_inline, "with-json")?;
-                    args.json_path = Some(v);
+                    args.json_path = Some(flag_opt(val_inline, "json"));
                 }
-                // Interactive-mode flags.
+                // Interactive-mode flags are flagOpt (Interactive.hs:53-56),
+                // so they never consume a separate token — only `=VALUE`.  A
+                // bare flag records the empty-string default; HS then reads
+                // port leniently (Interactive.hs:134-139, falls back to
+                // defaultPort) and interface defaults to 127.0.0.1
+                // (Interactive.hs:143), so an empty value behaves like absent.
                 "port" => {
-                    let v = take_val(&mut i, raw, val_inline, "port")?;
-                    args.port = Some(parse_int(&v, "port")?);
+                    if let Some(v) = val_inline {
+                        if !v.is_empty() {
+                            args.port = Some(parse_int(v, "port")?);
+                        }
+                    }
                 }
                 "interface" => {
-                    let v = take_val(&mut i, raw, val_inline, "interface")?;
-                    args.interface = Some(v);
+                    args.interface = Some(flag_opt(val_inline, ""));
                 }
                 "image-format" => {
-                    let v = take_val(&mut i, raw, val_inline, "image-format")?;
-                    args.image_format = Some(ImageFormat::parse(&v).map_err(CliError::Msg)?);
+                    if let Some(v) = val_inline {
+                        if !v.is_empty() {
+                            args.image_format =
+                                Some(ImageFormat::parse(v).map_err(CliError::Msg)?);
+                        }
+                    }
                 }
                 "debug" => args.debug = true,
                 "no-logging" => args.no_logging = true,
@@ -500,8 +517,12 @@ pub fn parse_args(raw: &[String]) -> Result<Args, CliError> {
             // We walk the cluster char-by-char: a boolean short consumes
             // exactly one char and we continue with the rest; the first
             // value-taking short consumes the remainder of the token as
-            // its inline value (e.g. `-b12`, `-vb12`) — or the next
-            // token if nothing remains — and ends the cluster.
+            // its inline value (e.g. `-b12`, `-vb12`) and ends the cluster.
+            // All the value-taking shorts here are cmdargs `flagOpt`, so they
+            // do NOT consume the next (space-separated) token; a bare short
+            // (`-b`) records the flag's default.  Verified against the HS
+            // binary: `-b 5 t.spthy` keeps `5` positional (`5: openFile: does
+            // not exist`); `-b5` is inline; bare `-b` uses default 5.
             for (idx, key) in rest.char_indices() {
                 // Bytes after this char in the token form a potential
                 // inline value for a value-taking flag.  Strip a single
@@ -524,44 +545,40 @@ pub fn parse_args(raw: &[String]) -> Result<Args, CliError> {
                         continue;
                     }
                     'b' => {
-                        let v = take_short_val(&mut i, raw, inline, "bound")?;
+                        let v = flag_opt(inline, "5");
                         args.bound = Some(parse_int(&v, "bound")?);
                     }
                     's' => {
-                        let v = take_short_val(&mut i, raw, inline, "saturation")?;
+                        let v = flag_opt(inline, "5");
                         args.saturation = Some(parse_int(&v, "saturation")?);
                     }
                     'c' => {
-                        let v = take_short_val(&mut i, raw, inline, "open-chains")?;
+                        let v = flag_opt(inline, "10");
                         args.open_chains = Some(parse_int(&v, "open-chains")?);
                     }
                     'd' => {
-                        let v = take_short_val(&mut i, raw, inline, "derivcheck-timeout")?;
+                        let v = flag_opt(inline, "5");
                         args.derivcheck_timeout = Some(parse_int(&v, "derivcheck-timeout")?);
                     }
                     'D' => {
-                        let v = take_short_val(&mut i, raw, inline, "defines")?;
-                        args.defines.push(v);
+                        args.defines.push(flag_opt(inline, ""));
                     }
                     'o' => {
-                        let v = take_short_val(&mut i, raw, inline, "output")?;
-                        args.output_file = Some(v);
+                        args.output_file = Some(flag_opt(inline, ""));
                     }
                     'O' => {
-                        let v = take_short_val(&mut i, raw, inline, "Output")?;
-                        args.output_dir = Some(v);
+                        args.output_dir = Some(flag_opt(inline, ""));
                     }
                     'm' => {
-                        let v = take_short_val(&mut i, raw, inline, "output-module")?;
-                        args.output_module = Some(v);
+                        args.output_module = Some(flag_opt(inline, "spthy"));
                     }
                     'p' => {
-                        let v = take_short_val(&mut i, raw, inline, "port")?;
-                        args.port = Some(parse_int(&v, "port")?);
+                        if let Some(v) = inline {
+                            args.port = Some(parse_int(v, "port")?);
+                        }
                     }
                     'i' => {
-                        let v = take_short_val(&mut i, raw, inline, "interface")?;
-                        args.interface = Some(v);
+                        args.interface = Some(flag_opt(inline, ""));
                     }
                     other => {
                         return Err(CliError::Msg(format!("unknown short flag: -{}", other)));
@@ -581,14 +598,6 @@ pub fn parse_args(raw: &[String]) -> Result<Args, CliError> {
         i += 1;
     }
     args.in_files = positional;
-
-    // Mirror Haskell: `--prove` with no value implies "match all".
-    // `lemma_names` with at least one empty entry already means that,
-    // so this is a no-op — but if --prove-all is set we ensure the
-    // marker is present even if the user didn't pass --prove too.
-    if args.prove_all && args.lemma_names.is_empty() {
-        args.lemma_names.push(String::new());
-    }
 
     Ok(args)
 }
@@ -637,6 +646,18 @@ fn split_eq(s: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Resolve a `cmdargs` `flagOpt` value: the inline `=VALUE` if present,
+/// otherwise the flag's documented default string (recorded when the bare
+/// flag is given).  A `flagOpt` flag NEVER consumes a separate following
+/// token — that token stays positional.  This mirrors
+/// `System.Console.CmdArgs.Explicit.flagOpt`, used by HS for `--bound`,
+/// `--output`, `--with-maude`, etc.  Verified against the installed HS
+/// binary: `tamarin-prover --bound 5 t.spthy` treats `5` as a positional
+/// file (`5: openFile: does not exist`), while bare `--bound` uses default 5.
+fn flag_opt(inline: Option<&str>, default: &str) -> String {
+    inline.unwrap_or(default).to_string()
+}
+
 fn take_val(
     i: &mut usize,
     raw: &[String],
@@ -657,45 +678,6 @@ fn take_val(
     }
     *i += 1;
     Ok(next)
-}
-
-fn take_short_val(
-    i: &mut usize,
-    raw: &[String],
-    inline: Option<&str>,
-    name: &str,
-) -> Result<String, CliError> {
-    if let Some(v) = inline {
-        return Ok(v.to_string());
-    }
-    let next = raw.get(*i + 1).cloned().ok_or_else(|| {
-        CliError::Msg(format!("flag -{} requires a value", short_for(name)))
-    })?;
-    if next.starts_with('-') {
-        return Err(CliError::Msg(format!(
-            "flag -{} requires a value (got {:?})",
-            short_for(name),
-            next
-        )));
-    }
-    *i += 1;
-    Ok(next)
-}
-
-fn short_for(long: &str) -> char {
-    match long {
-        "bound" => 'b',
-        "saturation" => 's',
-        "open-chains" => 'c',
-        "derivcheck-timeout" => 'd',
-        "defines" => 'D',
-        "output" => 'o',
-        "Output" => 'O',
-        "output-module" => 'm',
-        "port" => 'p',
-        "interface" => 'i',
-        _ => '?',
-    }
 }
 
 fn parse_int<T: std::str::FromStr>(s: &str, name: &str) -> Result<T, CliError> {
@@ -742,37 +724,54 @@ pub const GIT_REV: &str = env!("TAMARIN_GIT_REV");
 pub const GIT_BRANCH: &str = env!("TAMARIN_GIT_BRANCH");
 pub const BUILD_TIMESTAMP: &str = env!("TAMARIN_BUILD_TIMESTAMP");
 
-/// `--version` output.  Mirrors HS `--version` handling (Console.hs:328):
-/// `putStrLn versionStr` (the banner + license) is emitted first, THEN
-/// `ensureMaude` prints the `maude tool:` / ` checking version:` /
-/// ` checking installation:` self-check lines, and finally
-/// `getVersionIO` emits the `Generated from:` block (Console.hs:86-91).
+/// The STDOUT half of `--version` output.  Mirrors HS `--version` handling
+/// (Console.hs:326-330): `putStrLn versionStr` emits the banner + license to
+/// stdout, and `putStrLn versionMaude` emits the `Generated from:` block
+/// returned by `getVersionIO` (Console.hs:87-92) to stdout.  The maude
+/// self-check lines (`maude tool:`, ` checking version:`, ` checking
+/// installation:`) go to STDERR — see [`version_maude_stderr_text`] — because
+/// `ensureMaude` writes them with `hPutStrLn stderr` (Console.hs:153) and
+/// `testProcess` via `putStrErr = hPutStr stderr` (Console.hs:109,136-137).
 ///
-/// In `ensureMaude` (Console.hs:151-165) ` checking version: ` carries
-/// the *maude* version followed by `. OK.` (`Right (strip out ++ ". OK.")`),
-/// not the tamarin banner.  HS additionally writes the self-check lines to
-/// stderr while the banner/`Generated from:` go to stdout; we keep a single
-/// combined string here for simplicity, but preserve HS's line ORDER.
+/// `versionStr` is built with `unlines` (Console.hs:221), so it ends in `\n`;
+/// `putStrLn` then appends a second `\n`, yielding the blank line that
+/// precedes `Generated from:`.  We reproduce that blank line here exactly.
+/// The reported maude version comes from `getVersionIO`'s argument, which is
+/// `ensureMaude`'s `out` (the raw `maude --version` output, Console.hs:156-161).
 pub fn version_text() -> String {
-    let maude_version = detect_maude_version_pub();
-    let maude_ok = maude_version.is_some();
-    let mv = maude_version.unwrap_or_else(|| "unknown".to_string());
-    let ok = if maude_ok { "OK." } else { "FAILED." };
+    let mv = detect_maude_version_pub().unwrap_or_else(|| "unknown version".to_string());
     format!(
-        // versionStr: banner + license (Console.hs:220-231).
+        // versionStr: banner + license (Console.hs:220-231), unlines-terminated,
+        // then putStrLn's extra newline gives the blank line before the block.
         "tamarin-prover {VERSION}, (C) David Basin, Cas Cremers, Jannik Dreier, Simon Meier, Ralf Sasse, Benedikt Schmidt, 2010-2023\n\
          \n\
          This program comes with ABSOLUTELY NO WARRANTY. It is free software, and you\n\
          are welcome to redistribute it according to its LICENSE, see\n\
          'https://github.com/tamarin-prover/tamarin-prover/blob/master/LICENSE'.\n\
-         maude tool: 'maude'\n\
-         \x20checking version: {mv}. {ok}\n\
-         \x20checking installation: {ok}\n\
+         \n\
          Generated from:\n\
          Tamarin version {VERSION}\n\
          Maude version {mv}\n\
          Git revision: {GIT_REV}, branch: {GIT_BRANCH}\n\
          Compiled at: {BUILD_TIMESTAMP}\n",
+    )
+}
+
+/// The STDERR half of `--version` output: the three maude self-check lines
+/// `ensureMaude` writes via `hPutStrLn stderr` / `testProcess` (Console.hs:
+/// 151-165).  ` checking version: ` carries the *maude* version followed by
+/// `. OK.` (`Right (strip out ++ ". OK.")`, Console.hs:165); ` checking
+/// installation: ` carries `OK.` (Console.hs:171).  Returned without a
+/// trailing newline so the caller can `eprintln!` it as one block.
+pub fn version_maude_stderr_text() -> String {
+    let maude_version = detect_maude_version_pub();
+    let maude_ok = maude_version.is_some();
+    let mv = maude_version.unwrap_or_else(|| "unknown".to_string());
+    let ok = if maude_ok { "OK." } else { "FAILED." };
+    format!(
+        "maude tool: 'maude'\n\
+         \x20checking version: {mv}. {ok}\n\
+         \x20checking installation: {ok}",
     )
 }
 
@@ -827,7 +826,6 @@ pub fn help_text() -> String {
     s.push('\n');
     s.push_str("Lemma selection / proof options:\n");
     s.push_str("     --prove[=LEMMAPREFIX*|LEMMANAME]   Prove the named lemma(s). Repeatable.\n");
-    s.push_str("     --prove-all                        Prove every lemma.\n");
     s.push_str("     --lemma[=LEMMAPREFIX*|LEMMANAME]   Restrict to lemma(s) by name/prefix.\n");
     s.push_str("     --stop-on-trace=DFS|BFS|SEQDFS|SORRY|NONE   Trace search policy.\n");
     s.push_str("  -b --bound=INT                        Bound proof depth.\n");
@@ -917,10 +915,15 @@ mod tests {
     }
 
     #[test]
-    fn prove_all_alias() {
-        let a = parse(&["--prove-all", "x.spthy"]);
+    fn prove_all_is_unknown_flag() {
+        // HS has no `--prove-all`; theoryLoadFlags (TheoryLoader.hs:85-193)
+        // defines only `prove`/`lemma`.  Verified on the installed HS binary:
+        // `tamarin-prover --prove-all t1.spthy` -> `Unknown flag: --prove-all`.
+        let r = parse_args(&["--prove-all".to_string(), "x.spthy".to_string()]);
+        assert!(r.is_err());
+        // Bare `--prove` still sets prove_mode and pushes the match-all sentinel.
+        let a = parse(&["--prove", "x.spthy"]);
         assert!(a.prove_mode);
-        assert!(a.prove_all);
         assert_eq!(a.lemma_names, vec!["".to_string()]);
     }
 
@@ -931,23 +934,46 @@ mod tests {
     }
 
     #[test]
-    fn maude_path_short_and_long() {
+    fn maude_path_inline() {
+        // with-maude is flagOpt (Environment.hs:33); only `=VALUE` sets it.
         let a = parse(&["--with-maude=/opt/maude/maude"]);
         assert_eq!(a.maude_path.as_deref(), Some("/opt/maude/maude"));
+        // A space-separated token is NOT consumed: it stays positional and
+        // the flag records its default "maude".  Mirrors HS flagOpt.
         let a = parse(&["--with-maude", "/opt/maude/maude"]);
-        assert_eq!(a.maude_path.as_deref(), Some("/opt/maude/maude"));
+        assert_eq!(a.maude_path.as_deref(), Some("maude"));
+        assert_eq!(a.in_files, vec!["/opt/maude/maude".to_string()]);
     }
 
     #[test]
     fn output_file_and_dir() {
-        let a = parse(&["-o", "out.spthy", "input.spthy"]);
+        // flagOpt inline forms set the value.
+        let a = parse(&["-oout.spthy", "input.spthy"]);
         assert_eq!(a.output_file.as_deref(), Some("out.spthy"));
-        let a = parse(&["-O", "outdir", "input.spthy"]);
+        assert_eq!(a.in_files, vec!["input.spthy".to_string()]);
+        let a = parse(&["-Ooutdir", "input.spthy"]);
         assert_eq!(a.output_dir.as_deref(), Some("outdir"));
         let a = parse(&["--output=foo.spthy"]);
         assert_eq!(a.output_file.as_deref(), Some("foo.spthy"));
         let a = parse(&["--Output=bar"]);
         assert_eq!(a.output_dir.as_deref(), Some("bar"));
+        // Space-separated `-o out.spthy`: HS keeps `out.spthy` positional
+        // (verified: `-o out.spthy t.spthy` -> `out.spthy: openFile: does
+        // not exist`) and the flag records its empty default.
+        let a = parse(&["-o", "out.spthy", "input.spthy"]);
+        assert_eq!(a.output_file.as_deref(), Some(""));
+        assert_eq!(a.in_files, vec!["out.spthy".to_string(), "input.spthy".to_string()]);
+    }
+
+    #[test]
+    fn output_dir_alias_is_unknown_flag() {
+        // HS registers only `--Output`/`-O` (Batch.hs:77); there is no
+        // `--output-dir` alias.  Verified on the HS binary:
+        // `tamarin-prover --output-dir=foo t.spthy` -> `Unknown flag: --output-dir`.
+        assert!(parse_args(&["--output-dir=foo".to_string()]).is_err());
+        // `--Output=foo` still sets the directory.
+        let a = parse(&["--Output=foo"]);
+        assert_eq!(a.output_dir.as_deref(), Some("foo"));
     }
 
     #[test]
@@ -958,24 +984,52 @@ mod tests {
     }
 
     #[test]
-    fn bound_short_and_long() {
-        let a = parse(&["-b", "12"]);
+    fn bound_inline_short_and_long() {
+        // bound is flagOpt "5" (TheoryLoader.hs:105-110): inline forms set it.
+        let a = parse(&["-b12"]);
         assert_eq!(a.bound, Some(12));
         let a = parse(&["--bound=99"]);
         assert_eq!(a.bound, Some(99));
     }
 
     #[test]
-    fn saturation_short_and_long() {
-        let a = parse(&["-s", "7"]);
+    fn bound_space_separated_is_positional() {
+        // Load-bearing flagOpt behaviour, verified on the HS binary:
+        // `--bound 5 t.spthy` -> `5: openFile: does not exist` (the `5` is a
+        // POSITIONAL file, not the bound).  The bare `--bound` records the
+        // flagOpt default "5" => Some(5).
+        let a = parse(&["--bound", "5", "t.spthy"]);
+        assert_eq!(a.bound, Some(5)); // default, not the next token
+        assert_eq!(a.in_files, vec!["5".to_string(), "t.spthy".to_string()]);
+        // Same for the short form.
+        let a = parse(&["-b", "5", "t.spthy"]);
+        assert_eq!(a.bound, Some(5));
+        assert_eq!(a.in_files, vec!["5".to_string(), "t.spthy".to_string()]);
+    }
+
+    #[test]
+    fn bound_bare_vs_absent() {
+        // HS `proofBound = parseIntArg (findArg "bound") Nothing Just`:
+        // absent `--bound` => None (unbounded), bare `--bound` => Some(5)
+        // (bounded with the flagOpt default).
+        let absent = parse(&["t.spthy"]);
+        assert_eq!(absent.bound, None);
+        let bare = parse(&["--bound", "t.spthy"]);
+        assert_eq!(bare.bound, Some(5));
+        assert_eq!(bare.in_files, vec!["t.spthy".to_string()]);
+    }
+
+    #[test]
+    fn saturation_inline_short_and_long() {
+        let a = parse(&["-s7"]);
         assert_eq!(a.saturation, Some(7));
         let a = parse(&["--saturation=4"]);
         assert_eq!(a.saturation, Some(4));
     }
 
     #[test]
-    fn open_chains_short_and_long() {
-        let a = parse(&["-c", "20"]);
+    fn open_chains_inline_short_and_long() {
+        let a = parse(&["-c20"]);
         assert_eq!(a.open_chains, Some(20));
         let a = parse(&["--open-chains=11"]);
         assert_eq!(a.open_chains, Some(11));
@@ -1071,17 +1125,28 @@ mod tests {
 
     #[test]
     fn output_module_parsed() {
-        let a = parse(&["-m", "spthy"]);
-        assert_eq!(a.output_module.as_deref(), Some("spthy"));
+        // output-module is flagOpt "spthy" (Batch.hs:78): inline only.
+        let a = parse(&["-mmsr"]);
+        assert_eq!(a.output_module.as_deref(), Some("msr"));
         let a = parse(&["--output-module=msr"]);
         assert_eq!(a.output_module.as_deref(), Some("msr"));
+        // Bare `-m` records the default "spthy".
+        let a = parse(&["-m", "x.spthy"]);
+        assert_eq!(a.output_module.as_deref(), Some("spthy"));
+        assert_eq!(a.in_files, vec!["x.spthy".to_string()]);
     }
 
     #[test]
-    fn output_dot_and_json() {
+    fn output_dot_and_json_are_flag_req() {
+        // output-json/output-dot are flagReq (Batch.hs:79-80): they DO consume
+        // the next space-separated token, unlike the flagOpt family.  Verified
+        // on the HS binary: `--output-json trace.json t.spthy` writes trace.json.
         let a = parse(&["--output-dot=trace.dot", "--output-json=trace.json"]);
         assert_eq!(a.trace_dot.as_deref(), Some("trace.dot"));
         assert_eq!(a.trace_json.as_deref(), Some("trace.json"));
+        let a = parse(&["--output-json", "trace.json", "t.spthy"]);
+        assert_eq!(a.trace_json.as_deref(), Some("trace.json"));
+        assert_eq!(a.in_files, vec!["t.spthy".to_string()]);
     }
 
     #[test]
@@ -1226,5 +1291,45 @@ mod tests {
     fn effective_maude_processes_explicit_override() {
         let a = parse(&["--processors=8", "--maude-processes=2", "x.spthy"]);
         assert_eq!(a.effective_maude_processes(), 2);
+    }
+
+    #[test]
+    fn version_stdout_has_blank_line_before_generated_from_and_no_maude_lines() {
+        // HS (Console.hs:326-330) puts the banner + license + `Generated from:`
+        // block on STDOUT.  `putStrLn versionStr` (versionStr ends with the
+        // unlines `\n`) produces a blank line before `Generated from:`.  The
+        // maude self-check lines must NOT appear on stdout.  Probed against the
+        // installed HS binary: stdout ends `...LICENSE'.\n\nGenerated from:`.
+        let out = version_text();
+        assert!(
+            out.contains("'https://github.com/tamarin-prover/tamarin-prover/blob/master/LICENSE'.\n\nGenerated from:\n"),
+            "stdout must have a blank line between the license and `Generated from:`\n--- got ---\n{out}"
+        );
+        assert!(!out.contains("maude tool:"), "stdout must NOT contain the maude self-check lines");
+        assert!(!out.contains("checking version:"), "stdout must NOT contain the maude self-check lines");
+        assert!(!out.contains("checking installation:"), "stdout must NOT contain the maude self-check lines");
+        // The banner is the first line.
+        assert!(out.starts_with("tamarin-prover "));
+        // getVersionIO's block is present and ends with the compile-time line.
+        assert!(out.contains("\nTamarin version "));
+        assert!(out.contains("\nMaude version "));
+        assert!(out.contains("\nCompiled at: "));
+    }
+
+    #[test]
+    fn version_stderr_has_the_three_maude_self_check_lines() {
+        // HS `ensureMaude` writes these to STDERR via `hPutStrLn stderr` /
+        // `testProcess` (Console.hs:151-165).  Probed against the HS binary,
+        // stderr is exactly:
+        //   maude tool: 'maude'
+        //    checking version: 3.5.1. OK.
+        //    checking installation: OK.
+        let err = version_maude_stderr_text();
+        let lines: Vec<&str> = err.lines().collect();
+        assert_eq!(lines.len(), 3, "stderr block must be exactly three lines: {err:?}");
+        assert_eq!(lines[0], "maude tool: 'maude'");
+        assert!(lines[1].starts_with(" checking version: "), "got {:?}", lines[1]);
+        assert!(lines[1].ends_with(". OK.") || lines[1].ends_with(". FAILED."), "got {:?}", lines[1]);
+        assert!(lines[2] == " checking installation: OK." || lines[2] == " checking installation: FAILED.");
     }
 }

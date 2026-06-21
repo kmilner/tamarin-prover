@@ -406,22 +406,13 @@ fn minimize_intruder_rules(
     after_subsumption.into_iter().filter(|r| !is_double_premise_rule(r)).collect()
 }
 
-/// Multiset-subset check: every premise of `a` (counted with multiplicity)
-/// occurs in `b`.  Haskell's `subsetOf` on lists.
+/// Set-subset check: every distinct element of `a` is `==` to some element of
+/// `b`.  Mirrors Haskell's `subsetOf` (Utils/Misc.hs:87-88):
+/// `subsetOf xs ys = (S.fromList xs) `S.isSubsetOf` (S.fromList ys)` —
+/// `S.fromList` deduplicates BOTH arguments, so multiplicity is ignored on both
+/// sides.  This is a SET subset, not a multiset/list subset.
 fn is_subset_of(a: &[crate::fact::LNFact], b: &[crate::fact::LNFact]) -> bool {
-    let mut b_remaining: Vec<bool> = vec![true; b.len()];
-    for fa in a {
-        let mut found = false;
-        for (j, fb) in b.iter().enumerate() {
-            if b_remaining[j] && fa == fb {
-                b_remaining[j] = false;
-                found = true;
-                break;
-            }
-        }
-        if !found { return false; }
-    }
-    true
+    a.iter().all(|fa| b.iter().any(|fb| fa == fb))
 }
 
 /// `isDoublePremiseRule` (IntruderRules.hs:201-206).
@@ -859,8 +850,8 @@ pub fn variants_intruder(
     for pairs in raw_substs {
         // `restrictVFresh (frees packed) fsigma` — keep only entries whose
         // KEY is a free var of the packed term.  HS `computeVariants`
-        // (Compute.hs:148-150) does this implicitly.  Maude only binds the
-        // vars we passed in, but be defensive.
+        // (Compute.hs:150) does this EXPLICITLY via `restrictVFresh (frees t)
+        // subst`, so this `.restrict(packed_frees)` mirrors it exactly.
         let s_fresh = LNSubstVFresh::from_list(pairs)
             .restrict(&packed_frees.iter().cloned().collect::<Vec<_>>());
 
@@ -1322,6 +1313,60 @@ pub fn dh_intruder_rules(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Pins HS `subsetOf` (Utils/Misc.hs:88) as a SET subset:
+    // `(S.fromList xs) `S.isSubsetOf` (S.fromList ys)` deduplicates BOTH
+    // sides, so `is_subset_of` must ignore multiplicity entirely.
+    #[test]
+    fn is_subset_of_ignores_multiplicity() {
+        use tamarin_term::vterm::var_term;
+        let y = var_term(LVar::new("y", LSort::Msg, 0));
+        let z = var_term(LVar::new("z", LSort::Msg, 0));
+        // {KU(y)} ⊆ {KU(y), KU(z)}: as a SET subset (HS `subsetOf`) this holds
+        // even though a=[KU(y),KU(y)] has higher multiplicity than the single
+        // KU(y) in b — a multiset-subset check would reject it (no second
+        // KU(y) in b to consume).
+        let a = vec![ku_fact(y.clone()), ku_fact(y.clone())];
+        let b = vec![ku_fact(y.clone()), ku_fact(z.clone())];
+        assert!(is_subset_of(&a, &b));
+        // A distinct element of `a` not in `b` ⇒ not a subset.
+        assert!(!is_subset_of(&b, &a));
+    }
+
+    // minimize_intruder_rules subsumption uses the SET-subset `is_subset_of`
+    // (HS `prems' `subsetOf` prems`), so a peer whose DISTINCT premise set is a
+    // subset subsumes this rule even at higher multiplicity.  Pins HS
+    // IntruderRules.hs:195-197.
+    #[test]
+    fn minimize_drops_set_subsumed_rule() {
+        use tamarin_term::vterm::var_term;
+        let x = var_term(LVar::new("x", LSort::Msg, 0));
+        let y = var_term(LVar::new("y", LSort::Msg, 0));
+        let z = var_term(LVar::new("z", LSort::Msg, 1));
+        let name = b"_subsume_test".to_vec();
+        // r_j (subsumer): premises [KU(y), KU(y)], conclusion KD(x).
+        let r_j = Rule::new(
+            IntrRuleACInfo::DestrRule(name.clone(), -1, true, false),
+            vec![ku_fact(y.clone()), ku_fact(y.clone())],
+            vec![kd_fact(x.clone())],
+            vec![],
+        );
+        // r_i (subsumed): premises [KU(y), KU(z)], same conclusion KD(x).
+        // Distinct premises of r_j ({KU(y)}) ⊆ distinct premises of r_i
+        // ({KU(y), KU(z)}), so r_j subsumes r_i → r_i dropped.  r_j itself is
+        // not dropped: KU(z) of r_i is absent from r_j's premise set.
+        let r_i = Rule::new(
+            IntrRuleACInfo::DestrRule(name.clone(), -1, true, false),
+            vec![ku_fact(y.clone()), ku_fact(z.clone())],
+            vec![kd_fact(x.clone())],
+            vec![],
+        );
+        let out = minimize_intruder_rules(false, vec![r_j.clone(), r_i.clone()]);
+        // Set-subset: r_i is dropped; only r_j survives.  (Multiset bookkeeping
+        // would have kept both, since r_j has two KU(y) but r_i only one.)
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].premises, r_j.premises);
+    }
 
     #[test]
     fn special_rules_count_excluding_diff() {

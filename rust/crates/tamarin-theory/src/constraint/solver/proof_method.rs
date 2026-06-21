@@ -71,28 +71,6 @@ fn dbg_impl_enabled() -> bool {
     *V.get_or_init(|| std::env::var("TAM_DBG_IMPL").is_ok())
 }
 
-/// `TAM_RS_PER_STEP_RESET_LEGACY` is an opt-OUT: the per-step Maude
-/// counter reset runs UNLESS the var is set, so cache it as `.is_err()`.
-#[inline]
-fn per_step_reset_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_PER_STEP_RESET_LEGACY").is_err())
-}
-
-#[inline]
-fn disable_simplify_fanout() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_SIMPLIFY_FANOUT").is_ok())
-}
-
-/// `TAM_DISABLE_RENAME_PRECISE` is an opt-OUT: renamePrecise runs UNLESS
-/// the var is set, so cache it as `.is_err()`.
-#[inline]
-fn rename_precise_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_DISABLE_RENAME_PRECISE").is_err())
-}
-
 #[inline]
 fn dbg_solve_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -127,12 +105,6 @@ fn dbg_trace_cases_enabled() -> bool {
 fn dbg_kept_raw_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("TAM_RS_DBG_KEPT_RAW").is_ok())
-}
-
-#[inline]
-fn dbg_namesys_dedup_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_DBG_NAMESYS_DEDUP").is_ok())
 }
 
 /// `TAM_RS_DBG_SOLVED_GOALS` is matched against the exact value `"1"`,
@@ -317,7 +289,7 @@ fn is_initial_system(sys: &System) -> bool {
 /// is NOT in the reducible set.  If any subterm's RHS has a reducible
 /// top symbol, the proof cannot finish (further rewriting could
 /// reduce it).
-fn finished_subterms(ctx: &ProofContext, sys: &System) -> bool {
+pub fn finished_subterms(ctx: &ProofContext, sys: &System) -> bool {
     use tamarin_term::term::Term;
     let msig = ctx.maude.maude_sig();
     let top_is_not_reducible = |t: &tamarin_term::lterm::LNTerm| -> bool {
@@ -356,7 +328,6 @@ pub fn exec_proof_method(
     sys: &System,
 ) -> Option<Vec<(CaseName, System)>> {
     use crate::constraint::solver::reduction::{GoalCases, Reduction};
-    use crate::constraint::solver::simplify::simplify_system;
 
     // Deadline short-circuit (entry-guard).  Without this, a single
     // `exec_proof_method` invocation that internally enumerates many
@@ -385,12 +356,8 @@ pub fn exec_proof_method(
     // the collision pattern encodes an unintended unification that
     // cascades downstream (KAS_key_secrecy: `~ltkA.0` and `~ltkA.349`
     // both → `~ltkA.425` after lifting forces $R=$I via setNodes merge).
-    //
-    // Opt-out via `TAM_RS_PER_STEP_RESET_LEGACY=1`.
-    if per_step_reset_enabled() {
-        let avoid = crate::constraint::solver::reduction::bounds_max(sys);
-        ctx.maude.reset_counter_to(avoid.saturating_add(1));
-    }
+    let avoid = crate::constraint::solver::reduction::bounds_max(sys);
+    ctx.maude.reset_counter_to(avoid.saturating_add(1));
 
     match method {
         ProofMethod::Sorry(_) | ProofMethod::Finished(_) => Some(Vec::new()),
@@ -419,17 +386,8 @@ pub fn exec_proof_method(
             // Yubikey's `no_replay` (and 50 → 1 on
             // `slightly_weaker_invariant`), because `solve_action_goal`'s
             // Cases outcome was discarded.
-            //
-            // Kill switch: `TAM_RS_DISABLE_SIMPLIFY_FANOUT=1` reverts
-            // to the in-place behaviour.
             let case_systems: Vec<System> =
-                if disable_simplify_fanout() {
-                    let mut r = Reduction::new(ctx, sys.clone());
-                    simplify_system(&mut r);
-                    vec![r.sys]
-                } else {
-                    crate::constraint::solver::simplify::simplify_system_with_fanout(ctx, sys.clone())
-                };
+                crate::constraint::solver::simplify::simplify_system_with_fanout(ctx, sys.clone());
             // HS-faithful `cleanup` (ProofMethod.hs:310-311): EVERY
             // proof method's cases pass through `map (fmap cleanup .
             // fst)` (ProofMethod.hs:305), and `Simplify` goes through
@@ -437,10 +395,8 @@ pub fn exec_proof_method(
             // ALSO cleaned.
             let cleanup = |s: &System| -> System {
                 let mut s2 = s.clone();
-                if rename_precise_enabled() {
-                    crate::constraint::solver::rename_precise::rename_precise_system(
-                        &mut s2);
-                }
+                crate::constraint::solver::rename_precise::rename_precise_system(
+                    &mut s2);
                 s2.eq_store.subst =
                     tamarin_term::subst::Subst::from_list(Vec::new());
                 s2
@@ -605,9 +561,6 @@ pub fn exec_proof_method(
             // the case once per arm.  Our `simplify_system_with_fanout`
             // mirrors that, returning N systems.  Each is then cleaned
             // (renamePrecise + clear subst) per HS's `cleanup`.
-            //
-            // Kill switch: `TAM_RS_DISABLE_SIMPLIFY_FANOUT=1` falls back
-            // to the in-place behaviour (returns a single-element vec).
             let simplify = |sys: System| -> Vec<System> {
                 if dbg_solve {
                     eprintln!("[solve] simplify start (nodes={} goals={})",
@@ -615,13 +568,7 @@ pub fn exec_proof_method(
                 }
                 let t0 = std::time::Instant::now();
                 let raw_systems: Vec<System> =
-                    if disable_simplify_fanout() {
-                        let mut r = Reduction::new(ctx, sys);
-                        simplify_system(&mut r);
-                        vec![r.sys]
-                    } else {
-                        crate::constraint::solver::simplify::simplify_system_with_fanout(ctx, sys)
-                    };
+                    crate::constraint::solver::simplify::simplify_system_with_fanout(ctx, sys);
                 if dbg_solve {
                     eprintln!("[solve] simplify done {:?} (n_systems={})",
                         t0.elapsed(), raw_systems.len());
@@ -632,10 +579,8 @@ pub fn exec_proof_method(
                 //                       (renamePrecise s)
                 let mut out: Vec<System> = Vec::with_capacity(raw_systems.len());
                 for mut s in raw_systems {
-                    if rename_precise_enabled() {
-                        crate::constraint::solver::rename_precise::rename_precise_system(
-                            &mut s);
-                    }
+                    crate::constraint::solver::rename_precise::rename_precise_system(
+                        &mut s);
                     if !s.eq_store.is_false() {
                         s.invalidate_max_var_idx_cache();
                         s.eq_store.subst =
@@ -785,47 +730,20 @@ pub fn exec_proof_method(
                         eprintln!("[KEPT_RAW] path={} goal={} counts={:?}",
                             cpath, goal_short, kr_pre_counts);
                     }
-                    // Dedup cases that share BOTH a name and canonical
-                    // system (post-simplify + rename_precise).  Haskell's
-                    // `someRuleACInst` encodes rule variants as a SplitG
-                    // disjunction on the eq-store, so `solveAction`
-                    // returns ONE case per rule with variants threaded
-                    // through SplitG; our legacy expansion enumerates
-                    // each variant as a separate `RuleACInst`.  When
-                    // multiple variants converge to the same post-
-                    // simplify canonical system, drop the duplicates —
-                    // that's the structural-match win for NSPK3/NSLPK3/
-                    // roles `case R_1` (vs our prior `case R_1_case_1`).
+                    // HS `process` (ProofMethod.hs:302-308) dedups cases
+                    // ONLY via `removeRedundantCases ctxt [] snd`
+                    // (ProofMethod.hs:304) — gated on BP/MSet, comparing
+                    // systems up-to-new-vars (Sources.hs:236-244).  There is
+                    // no unconditional exact-(name,system) dedup: any
+                    // surviving same-named cases are renamed by
+                    // `uniqueListBy ... distinguish` (ProofMethod.hs:308,335)
+                    // to `name_case_1`/`name_case_2`, never dropped.  Variant
+                    // enumeration is threaded through SplitG by
+                    // `rule_insts_with_constrs` (reduction.rs:2876), so each
+                    // distinct variant arrives as its own RuleACInst case
+                    // here.  Empty stable_vars (HS passes
+                    // `[]`); the helper is a no-op outside BP/MSet.
                     let kept: Vec<(String, System)> = {
-                        // Dedup by (case_name, exact-system) — catches
-                        // cases where two distinct rule unifications
-                        // produce structurally-identical post-simplify
-                        // systems.  Safety guard for actually-isomorphic
-                        // cases; the proper Haskell-parity dedup is the
-                        // SplitG-variants path (now always on).
-                        let dbg_dedup = dbg_namesys_dedup_enabled();
-                        let mut seen_systems: Vec<(String, System)> = Vec::new();
-                        let mut dup_count = 0usize;
-                        let mut dup_names: Vec<String> = Vec::new();
-                        for (name, s) in kept_raw {
-                            let dup = seen_systems.iter().any(|(prev_name, prev_sys)|
-                                prev_name == &name && prev_sys == &s);
-                            if !dup {
-                                seen_systems.push((name, s));
-                            } else {
-                                dup_count += 1;
-                                if dbg_dedup { dup_names.push(name); }
-                            }
-                        }
-                        if dbg_dedup && dup_count > 0 {
-                            eprintln!("[NAMESYS_DEDUP] dropped={} names={:?} kept={}",
-                                dup_count, dup_names, seen_systems.len());
-                        }
-                        // HS-faithful `removeRedundantCases ctxt [] snd`
-                        // (ProofMethod.hs:304).  Gated on BP/MSet per HS
-                        // short-circuit.  Empty stable_vars (HS passes `[]`).
-                        // No-op outside BP/MSet by `remove_redundant_cases`'s
-                        // own guard.
                         let msig = ctx.maude.maude_sig();
                         let empty_stable: std::collections::BTreeSet<tamarin_term::lterm::LVar>
                             = std::collections::BTreeSet::new();
@@ -834,7 +752,7 @@ pub fn exec_proof_method(
                             msig.enable_mset,
                             &empty_stable,
                             |c| &c.1,
-                            seen_systems,
+                            kept_raw,
                         )
                     };
                     let mut counts: HashMap<String, usize> = HashMap::new();
@@ -888,10 +806,11 @@ pub fn exec_proof_method(
             //     return caseName
             // HS uses `setM` — direct field write into `sFormulas`, NOT
             // `insertFormula`.  Calling `insertFormula` here would route
-            // through HS's GDisj arm (Reduction.hs:529-543) which adds the
+            // through HS's GDisj insertion arm (`insertFormula`/`insert'`,
+            // Reduction.hs:424) which adds the
             // empty DisjG goal to `sGoals`; HS's `reduceFormulas`
-            // (Simplify.hs:426-433) filters by `reducibleFormula`
-            // (Reduction.hs:589-597) which returns False for `GDisj _`, so
+            // (Simplify.hs:302) filters by `reducibleFormula`
+            // (Reduction.hs:495-503) which returns False for `GDisj _`, so
             // an `empty_trace` formula `Disj([])` (gfalse) stays in
             // `sFormulas` untouched and never produces a DisjG goal —
             // `FormulasFalse` contradiction picks it up directly.
@@ -914,6 +833,30 @@ pub fn exec_proof_method(
             let mut sr = Reduction::new(ctx, step_sys);
             simplify_system(&mut sr);
 
+            // HS `process` (ProofMethod.hs:302-308) runs `simplifySystem`
+            // under the DisjT monad (so it could fan out) and then
+            // `removeRedundantCases`.  This arm deliberately uses in-place
+            // `simplify_system` (no fan-out) and skips `remove_redundant_cases`
+            // — both are guaranteed no-ops at induction time:
+            //   - Induction is only ever ranked/applied on the initial system:
+            //     `rankProofMethods` calls `insertInduction` only when
+            //     `isInitialSystem sys` (ProofMethod.hs:527), and
+            //     `canApplyInduction` requires no nodes, no solved formulas,
+            //     no open goals, exactly one formula (ProofMethod.hs:264-270;
+            //     mirrored in `check_and_exec_proof_method` below).  With no
+            //     nodes/actions/goals, `simplifySystem` (`solveUniqueActions`
+            //     has no actions; `reduceFormulas`/`insertImpliedFormulas`
+            //     reach no `Eq` atom over a node-free system) cannot fan out,
+            //     so per-case `simplify_system_with_fanout` would add nothing.
+            //   - The two cases (empty_trace = `gtf` base, non_empty_trace =
+            //     `gconj[gf, gfIH]` step) are never alpha-equivalent, so
+            //     `removeRedundantCases` (compares systems up-to-new-vars)
+            //     is a guaranteed no-op.
+            // Rewiring through `simplify_system_with_fanout` would also rebuild
+            // a fresh Reduction per case whose FreshT counter is re-aligned to
+            // bounds_max (simplify.rs), perturbing the high `.N` IH indices the
+            // `cleanup` below is calibrated to canonicalise — for zero benefit.
+
             // HS-faithful `cleanup` (ProofMethod.hs:310-311): induction is
             //   `Induction -> process . induction <$> getInductionCases sys`
             // (ProofMethod.hs:298), and `process` applies
@@ -927,9 +870,7 @@ pub fn exec_proof_method(
             // keep their high `.N` indices (e.g. `last(#z.7)`) instead of the
             // canonical per-name idx-0 form (`last(#z)`) HS renders.
             let cleanup = |s: &mut System| {
-                if rename_precise_enabled() {
-                    crate::constraint::solver::rename_precise::rename_precise_system(s);
-                }
+                crate::constraint::solver::rename_precise::rename_precise_system(s);
                 s.invalidate_max_var_idx_cache();
                 s.eq_store.subst =
                     tamarin_term::subst::Subst::from_list(Vec::new());
@@ -1050,6 +991,28 @@ mod tests {
         match is_finished(&ctx, &s) {
             Some(Result::Solved) => {}
             r => panic!("expected Solved, got {:?}", r),
+        }
+    }
+
+    #[test]
+    fn gfalse_formula_is_contradictory_not_unfinishable() {
+        // HS `isFinished` (ProofMethod.hs:505-511) routes any
+        // contradiction — including `gfalse ∈ sFormulas`
+        // (`FormulasFalse`) — to `Contradictory`, BEFORE the
+        // `null ogs && not stFinished => Unfinishable` arm.  A negated
+        // false lemma collapses to `gfalse`, closes the branch as
+        // Contradictory, and the prover reports `falsified - found
+        // trace` (verified against the v1.13.0 binary on a minimal
+        // `Setup() @ i ==> F` lemma).  This pins that routing so the
+        // gfalse-in-formulas path can never be misread as Unfinishable.
+        let ctx = match ctx() { Some(c) => c, None => return };
+        let mut s = System::empty();
+        // gfalse in formulas makes the system non-initial AND yields a
+        // `FormulasFalse` contradiction.
+        s.formulas.push(crate::guarded::gfalse());
+        match is_finished(&ctx, &s) {
+            Some(Result::Contradictory(Some(Contradiction::FormulasFalse))) => {}
+            r => panic!("expected Contradictory(FormulasFalse), got {:?}", r),
         }
     }
 

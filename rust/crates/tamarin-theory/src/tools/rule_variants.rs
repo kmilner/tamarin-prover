@@ -96,13 +96,6 @@ pub fn variants_proto_rule(
     // `makeRule`'s `apply commonSubst` (RuleVariants.hs:114-117) —
     // which is the root of the NAXOS_eCK_private Init_1-vs-Ltk_reveal
     // divergence.
-    //
-    // Previously this call was deliberately skipped because RS's
-    // simp_disjunction (no Maude handle) collapsed identity-containing
-    // disjunctions to Nothing.  Since f7321d2e added
-    // `simp_disjunction_with_maude` (which uses `simp_with_fresh_avoiding`
-    // → `simp_singleton` → only folds genuine singletons), the
-    // simplification is now safe to run.
     let (common_subst, residual) = crate::tools::equation_store::EquationStore::simp_disjunction_with_maude(
         substs, |_, _| false, maude);
     // HS `trueDisj = [emptySubstVFresh]` (RuleVariants.hs:120).
@@ -280,30 +273,11 @@ pub fn abstract_rule_and_variants(
     // `with_fresh_counter_from` clones the handle keeping the underlying
     // Maude PROCESS shared but with a fresh PER-CALL counter — exactly
     // HS's evalFreshTAvoiding semantics.
-    //
-    // `TAM_RS_DISABLE_VARIANT_LOCAL_FRESH=1` reverts to the global
-    // counter for diagnosis.
-    let use_local_fresh = std::env::var("TAM_RS_DISABLE_VARIANT_LOCAL_FRESH").is_err();
-    let local_maude_owned;
-    let maude: &MaudeHandle = if use_local_fresh {
-        local_maude_owned = maude.with_fresh_counter_from(avoid_max);
-        &local_maude_owned
-    } else {
-        maude.ensure_above(avoid_max);
-        maude
-    };
+    let local_maude_owned = maude.with_fresh_counter_from(avoid_max);
+    let maude: &MaudeHandle = &local_maude_owned;
     if std::env::var("TAM_DBG_FRESH_TRACE").is_ok() {
         eprintln!("[fresh-trace] rule={:?} avoid_max={} counter_at_entry={}",
             rule.info.name, avoid_max, maude.fresh_counter_peek());
-    }
-
-    fn sort_of_term(t: &LNTerm) -> tamarin_term::lterm::LSort {
-        use tamarin_term::vterm::Lit;
-        match t {
-            Term::Lit(Lit::Var(v)) => v.sort,
-            Term::Lit(Lit::Con(_)) => tamarin_term::lterm::LSort::Pub,
-            Term::App(_, _) => tamarin_term::lterm::LSort::Msg,
-        }
     }
 
     fn name_hint(t: &LNTerm) -> String {
@@ -347,7 +321,12 @@ pub fn abstract_rule_and_variants(
         let new_idx = maude.reserve_idxs(1);
         let v = LVar {
             name: name_hint(t),
-            sort: sort_of_term(t),
+            // HS-faithful `abstrTerm` (RuleVariants.hs:104):
+            // `importBinding (\`LVar\` sortOfLNTerm t) t (getHint t)`.
+            // `sort_of_lnterm` (lterm.rs:216) IS HS `sortOfLNTerm`:
+            // Con -> sort_of_name (Fresh/Pub/Node/Nat by tag), Var ->
+            // v.sort, NatPlus/NatOne -> Nat, _ -> Msg.
+            sort: tamarin_term::lterm::sort_of_lnterm(t),
             idx: new_idx,
         };
         bindings.insert(t.clone(), v.clone());
@@ -394,23 +373,19 @@ pub fn abstract_rule_and_variants(
     // partial order, so `~ekI` gets the smaller fresh idx and the
     // AC-decomposed variant lands before DH_neutral — matching HS.
     //
-    // `TAM_RS_DISABLE_LEAF_RENAME=1` opts out for diagnosis.
-    let leaf_rename = std::env::var("TAM_RS_DISABLE_LEAF_RENAME").is_err();
-    if leaf_rename {
-        // HS-faithful `frees`: a BTreeSet sorts insertion by `Ord LVar`
-        // and dedupes — exactly `sortednub` semantics.
-        let mut leaf_set: std::collections::BTreeSet<LVar> = std::collections::BTreeSet::new();
-        let mut visit = |v: &LVar| { leaf_set.insert(v.clone()); };
-        for f in &rule.premises { f.terms.iter().for_each(|t| t.for_each_free(&mut visit)); }
-        for f in &rule.actions { f.terms.iter().for_each(|t| t.for_each_free(&mut visit)); }
-        for f in &rule.conclusions { f.terms.iter().for_each(|t| t.for_each_free(&mut visit)); }
-        for t in &rule.new_vars { t.for_each_free(&mut visit); }
-        for v in leaf_set {
-            let leaf_term: LNTerm = Term::Lit(tamarin_term::vterm::Lit::Var(v));
-            // The result is discarded; the side effect on `bindings` is
-            // what matters.
-            let _ = abstr_term(&leaf_term, &irreducible, &mut bindings, maude);
-        }
+    // HS-faithful `frees`: a BTreeSet sorts insertion by `Ord LVar`
+    // and dedupes — exactly `sortednub` semantics.
+    let mut leaf_set: std::collections::BTreeSet<LVar> = std::collections::BTreeSet::new();
+    let mut visit = |v: &LVar| { leaf_set.insert(v.clone()); };
+    for f in &rule.premises { f.terms.iter().for_each(|t| t.for_each_free(&mut visit)); }
+    for f in &rule.actions { f.terms.iter().for_each(|t| t.for_each_free(&mut visit)); }
+    for f in &rule.conclusions { f.terms.iter().for_each(|t| t.for_each_free(&mut visit)); }
+    for t in &rule.new_vars { t.for_each_free(&mut visit); }
+    for v in leaf_set {
+        let leaf_term: LNTerm = Term::Lit(tamarin_term::vterm::Lit::Var(v));
+        // The result is discarded; the side effect on `bindings` is
+        // what matters.
+        let _ = abstr_term(&leaf_term, &irreducible, &mut bindings, maude);
     }
 
     let prems: Vec<Fact<LNTerm>> = rule.premises.iter()
@@ -498,6 +473,26 @@ pub fn abstract_rule_and_variants(
         return Ok(None);
     }
 
+    // HS-faithful `msubstToLSubstVFresh` (Maude/Types.hs:130) returns
+    // `removeRenamings $ substFromListVFresh slist` — i.e. EVERY raw Maude
+    // variant has its pure-rename entries dropped as part of the
+    // back-conversion (Process.hs:273 `map (msubstToLSubstVFresh bindings)
+    // <$> parseVariantsReply`).  So by the time HS's `variantSubsts`
+    // (RuleVariants.hs:72) reach BOTH `isFreshRedundant vsubst`
+    // (RuleVariants.hs:77) AND `composeVFresh vsubst abstractionSubst`
+    // (RuleVariants.hs:75), each `vsubst` is already removeRenamings'd.
+    //
+    // RS's `maude.variants()` (maude_proc.rs:1418) does NOT apply
+    // `remove_renamings` (unlike the unify path, maude_proc.rs:886-892), so
+    // we clean each variant HERE — once, up front — to match HS.  This puts
+    // the H20/`isFreshRedundant` filter (below) and the compose loop on the
+    // SAME cleaned form HS uses.  `remove_renamings` filters entries WITHIN
+    // each subst (never the list), preserving the Maude-determined variant
+    // ordering that the per-variant Ord sort relies on.
+    let raw_substs: Vec<Vec<(LVar, LNTerm)>> = raw_substs.into_iter()
+        .map(|pairs| LNSubstVFresh::from_list(pairs).remove_renamings().to_list())
+        .collect();
+
     // HS pipeline per variant (RuleVariants.hs:73-77):
     //   restrictVFresh (frees abstrPsCsAs) $
     //     removeRenamings $ normSubstVFresh' $
@@ -525,13 +520,9 @@ pub fn abstract_rule_and_variants(
         s.into_iter().collect()
     };
 
-    // `TAM_RS_DISABLE_HS_COMPOSE_PIPELINE=1` reverts to the old manual
-    // composition path for diagnosis.
-    let use_hs_compose = std::env::var("TAM_RS_DISABLE_HS_COMPOSE_PIPELINE").is_err();
-
     if std::env::var("TAM_DBG_HS_COMPOSE").is_ok() {
-        eprintln!("[hs-compose] rule={:?} leaf_rename={} use_hs_compose={} #variants={}",
-                  rule.info.name, leaf_rename, use_hs_compose, raw_substs.len());
+        eprintln!("[hs-compose] rule={:?} #variants={}",
+                  rule.info.name, raw_substs.len());
     }
     // TAM_DBG_FRESH_TRACE=1: diagnostic trace of the per-rule fresh counter
     // before/after the variant pipeline.  Used to triangulate which step
@@ -550,8 +541,7 @@ pub fn abstract_rule_and_variants(
     // so same-image pairs never emerge, simp_identify never fires, no
     // multi-key equivalence classes form, enforce_ku_action_uniqueness
     // never merges. This is the root cause of resolved1's 26-line diff.
-    let h20_enabled = std::env::var("TAM_RS_DISABLE_H20").is_err();
-    let raw_substs: Vec<_> = if h20_enabled {
+    let raw_substs: Vec<_> = {
         let freshly_introduced: Vec<LNTerm> = rule.premises.iter()
             .filter(|f| matches!(f.tag, crate::fact::FactTag::Fresh))
             .filter_map(|f| f.terms.first().cloned())
@@ -614,78 +604,34 @@ pub fn abstract_rule_and_variants(
                 true
             }).collect()
         }
-    } else {
-        raw_substs
     };
 
     let composed_substs: Vec<LNSubstVFresh> = raw_substs.into_iter().map(|pairs| {
-        if use_hs_compose {
-            // HS-faithful path.
-            // HS's `msubstToLSubstVFresh` (Maude/Types.hs:130) returns
-            // `removeRenamings $ substFromListVFresh slist` — i.e. raw
-            // Maude variants have their pure-rename entries (e.g.
-            // identity-variant `{s → s_w, pkA → pkA_w}` where each
-            // witness doesn't appear elsewhere) removed FIRST.
-            //
-            // Without this, Rust's identity variant keeps `{s.0 → s.1,
-            // pkA.0 → pkA.2, A.0 → A.3}` (DIFFERENT witness idxs from
-            // Maude's sequential allocation), then composeVFresh's
-            // uniform shift preserves the gap → witnesses end at
-            // DIFFERENT idxs.
-            //
-            // HS's identity variant becomes EMPTY here, so composeVFresh
-            // operates on empty s1_0 and adds renamings for the
-            // abstraction subst's range vars (the rule's leaves, all at
-            // idx 0 from parser) — uniform shift collapses them ALL to
-            // the SAME fresh idx.  THAT's how HS gets `{pkA.5, s.5}`
-            // (both at idx 5) for the CHECKSIGN identity variant.
-            //
-            // `TAM_RS_DISABLE_VARIANT_REMOVE_RENAMINGS=1` opts out.
-            let raw_vsubst = LNSubstVFresh::from_list(pairs);
-            let use_remove_renamings = std::env::var("TAM_RS_DISABLE_VARIANT_REMOVE_RENAMINGS").is_err();
-            let vsubst = if use_remove_renamings {
-                raw_vsubst.remove_renamings()
-            } else {
-                raw_vsubst.clone()
-            };
-            // composeVFresh vsubst abstractionSubst
-            let composed = tamarin_term::subst_vfresh::compose_vfresh(
-                &vsubst, &abstraction_subst);
-            // normSubstVFresh' — normalise each range term via Maude.
-            let normalised_pairs: Vec<(LVar, LNTerm)> = composed.to_list()
-                .into_iter()
-                .map(|(k, t)| {
-                    let n = maude.reduce(&t).unwrap_or(t);
-                    (k, n)
-                })
-                .collect();
-            let normalised = LNSubstVFresh::from_list(normalised_pairs);
-            // removeRenamings (post-compose, HS RuleVariants.hs:74)
-            let cleaned = normalised.remove_renamings();
-            // restrictVFresh (frees abstrPsCsAs)
-            cleaned.restrict(&abstr_frees)
-        } else {
-            // Old (pre-pipeline) manual composition path.
-            let sigma: LNSubst = Subst::from_list(pairs.into_iter().collect::<Vec<_>>());
-            let mut composed_pairs: Vec<(LVar, LNTerm)> = abstraction_pairs.iter()
-                .map(|(z, t)| {
-                    let new_t = apply_vterm(&sigma, t.clone());
-                    let normalised = maude.reduce(&new_t).unwrap_or(new_t);
-                    (z.clone(), normalised)
-                })
-                .collect();
-            let z_domain: std::collections::BTreeSet<LVar> = abstraction_pairs.iter()
-                .map(|(z, _)| z.clone()).collect();
-            let abstr_frees_set: std::collections::BTreeSet<LVar> =
-                abstr_frees.iter().cloned().collect();
-            for (v, t) in sigma.to_list().iter() {
-                if z_domain.contains(v) { continue; }
-                if !abstr_frees_set.contains(v) { continue; }
-                let normalised = maude.reduce(t).unwrap_or_else(|_| t.clone());
-                composed_pairs.push((v.clone(), normalised));
-            }
-            LNSubstVFresh::from_list(composed_pairs)
-        }
+        // `pairs` are already removeRenamings'd (applied once up front,
+        // mirroring HS's `msubstToLSubstVFresh`, Maude/Types.hs:130).  HS's
+        // identity variant therefore arrives EMPTY here, so composeVFresh
+        // operates on empty s1_0 and adds renamings for the abstraction
+        // subst's range vars (the rule's leaves, all at idx 0 from parser)
+        // — its uniform shift collapses them ALL to the SAME fresh idx.
+        // THAT's how HS gets `{pkA.5, s.5}` (both at idx 5) for the
+        // CHECKSIGN identity variant.
+        let vsubst = LNSubstVFresh::from_list(pairs);
+        // composeVFresh vsubst abstractionSubst
+        let composed = tamarin_term::subst_vfresh::compose_vfresh(
+            &vsubst, &abstraction_subst);
+        // normSubstVFresh' — normalise each range term via Maude.
+        let normalised_pairs: Vec<(LVar, LNTerm)> = composed.to_list()
+            .into_iter()
+            .map(|(k, t)| {
+                let n = maude.reduce(&t).unwrap_or(t);
+                (k, n)
+            })
+            .collect();
+        let normalised = LNSubstVFresh::from_list(normalised_pairs);
+        // removeRenamings (post-compose, HS RuleVariants.hs:74)
+        let cleaned = normalised.remove_renamings();
+        // restrictVFresh (frees abstrPsCsAs)
+        cleaned.restrict(&abstr_frees)
     })
     // HS-faithful: `variantsProtoRule` (RuleVariants.hs:87-91) builds the
     // composed `substs` list with NO post-composition renaming filter — the
@@ -837,13 +783,8 @@ pub fn abstract_rule_and_variants(
             eprintln!("[variant-out-pre]   [{}] keys=[{}]", i, keys.join(","));
         }
     }
-    // `TAM_RS_DISABLE_VARIANT_RENAME_PRECISE=1` opts out for diagnosis.
-    let use_rename_precise = std::env::var("TAM_RS_DISABLE_VARIANT_RENAME_PRECISE").is_err();
-    let (abstracted_rule, final_substs) = if use_rename_precise {
-        rename_precise_rule_with_variants(abstracted_rule, final_substs)
-    } else {
-        (abstracted_rule, final_substs)
-    };
+    let (abstracted_rule, final_substs) =
+        rename_precise_rule_with_variants(abstracted_rule, final_substs);
 
     if std::env::var("TAM_DBG_VARIANT_OUT").is_ok() {
         eprintln!("[variant-out] rule={:?} #final_substs={}", rule.info.name, final_substs.len());

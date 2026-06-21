@@ -1,7 +1,8 @@
 //! HughesPJ-faithful pretty-printer Doc engine.
 //!
 //! Port of the layout algorithm from
-//! `Text.PrettyPrint.Annotated.HughesPJ` (pretty-1.1.3.6).
+//! `Text.PrettyPrint.HughesPJ` (pretty-1.1.3.6) — the non-annotated
+//! module used in production (HS `Class.hs:67`/`:72`).
 //!
 //! The HS `Doc` is reduced to an RDoc with five constructors —
 //! `Empty`, `NilAbove`, `TextBeside`, `Nest`, `Union`, plus the
@@ -34,9 +35,10 @@ pub const RIBBON: usize = 73;
 // Doc tree
 // ============================================================================
 
-/// HS `Doc a` from `pretty-1.1.3.6/Text/PrettyPrint/Annotated/HughesPJ.hs`
+/// HS `Doc` from `pretty-1.1.3.6/Text/PrettyPrint/HughesPJ.hs` (the
+/// non-annotated module used in production, HS `Class.hs:67`/`:72`)
 /// — minus the `Above`/`Beside` lazy constructors (we eagerly reduce on
-/// build) and minus annotations.
+/// build).
 #[derive(Clone)]
 pub enum Doc {
     /// Empty doc, length 0.
@@ -137,9 +139,10 @@ fn lazy_union(p: Doc, q: impl FnOnce() -> Doc + 'static) -> Doc {
 impl Doc {
     pub fn empty() -> Doc { Doc::Empty }
 
-    /// `text s` with `width = s.chars().count()` — counts visible cols
-    /// for ASCII + 1-col-wide unicode like `∧`/`∀`/`→`.  Multi-col
-    /// glyphs (CJK) are NOT correctly measured; we don't need them.
+    /// `text s` with `width = s.chars().count()` — the number of
+    /// codepoints, exactly matching HS `P.text`'s `length s` (HS
+    /// likewise counts codepoints, not terminal columns, so wide glyphs
+    /// like CJK count as 1 in both).
     pub fn text<S: AsRef<str>>(s: S) -> Doc {
         let s = s.as_ref();
         let w = s.chars().count();
@@ -750,12 +753,9 @@ fn lay(k: isize, d: &Doc, out: &mut String) {
         }
         Doc::TextBeside(s, _w, p) => {
             // First char of this line: emit indent if buffer is empty
-            // OR the last char was '\n'.
-            if let Some(last) = out.chars().last() {
-                if last == '\n' {
-                    for _ in 0..k.max(0) { out.push(' '); }
-                }
-            } else {
+            // OR the last char was '\n'.  `'\n'` is ASCII, so the
+            // trailing-byte check is O(1) (no full-output scan).
+            if out.is_empty() || out.ends_with('\n') {
                 for _ in 0..k.max(0) { out.push(' '); }
             }
             out.push_str(s);
@@ -1045,15 +1045,8 @@ mod tests {
         assert_eq!(out, "Q.\n DANTE\nc\n DSUCC");
     }
 
-    // Note: a previous `tutorial_secrecy_guarded_layout` test attempted
-    // to validate the Doc engine on a tutorial Secrecy lemma layout
-    // (`∃ S k #i #j. (g1) ∧ (g2)\n ∧\n  ∀ #r. ... ⇒ ⊥`).  The Doc
-    // engine path for guarded formulas was reverted in favour of the
-    // legacy string-based `pp_guarded_inner_wrapped` (which matches
-    // HS byte-exact on Tutorial); the engine is still used for the
-    // PARSER-AST formula side (which fixes wireguard's 5-deep And).
-    // The Doc-engine guarded layout is left for a follow-up calibration
-    // pass — see `pretty_formula.rs::pretty_guarded_wrapped`.
+    // The guarded-formula layout runs through `guarded_to_doc` on this
+    // engine — see `pretty_formula.rs::pretty_guarded_doublequoted`.
 
     #[test]
     fn pkcs11_eleven_tuple_close_bracket_glue() {

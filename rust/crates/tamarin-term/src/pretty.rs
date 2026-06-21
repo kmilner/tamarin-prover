@@ -244,8 +244,9 @@ impl fmt::Display for Name {
     }
 }
 
-// Convenience: `LSort` display matches Haskell's `Show LSort`
-// (`Term.LTerm` line 230 area).
+// Convenience: `LSort` display matches Haskell's `sortSuffix`
+// (`Term.LTerm` lines 198-203), NOT the derived `Show LSort`
+// (which yields constructor names like `LSortMsg`).
 impl fmt::Display for LSort {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {

@@ -13,9 +13,15 @@ use std::path::PathBuf;
 use tamarin_parser::parse_theory;
 use walkdir::WalkDir;
 
+fn corpus_root() -> std::path::PathBuf {
+    std::env::var("CORPUS_ROOT").map(std::path::PathBuf::from).unwrap_or_else(|_| {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../examples")
+    })
+}
+
 fn main() {
     let mut args = env::args().skip(1);
-    let mut root = PathBuf::from("/home/parallels/tamarin-prover/examples");
+    let mut root = corpus_root();
     let mut list_fail = false;
     let mut limit: Option<usize> = None;
     let mut filter: Option<String> = None;

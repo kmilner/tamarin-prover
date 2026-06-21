@@ -76,9 +76,10 @@ pub fn eq_term_subs(
 /// `canonize_subst` for ordering.
 ///
 /// NOTE: this is NOT a faithful port of Haskell `varOccurences`
-/// (`lib/term/src/Term/Subsumption.hs`), which returns
-/// `[(LVar, S.Set Occurence)]` (sets of context paths). Here we only
-/// keep an occurrence COUNT per variable.
+/// (`lib/term/src/Term/LTerm.hs:593`, re-exported from
+/// `Term.Subsumption`), which returns `[(LVar, S.Set Occurence)]`
+/// (sets of context paths; `Occurence = [String]`, LTerm.hs:542).
+/// Here we only keep an occurrence COUNT per variable.
 pub fn var_occurrence_counts(ts: &[LNTerm]) -> BTreeMap<LVar, usize> {
     let mut out: BTreeMap<LVar, usize> = BTreeMap::new();
     fn go(t: &LNTerm, out: &mut BTreeMap<LVar, usize>) {
@@ -125,7 +126,7 @@ pub fn var_occurrence_counts(ts: &[LNTerm]) -> BTreeMap<LVar, usize> {
 /// canonicalisation, the post-Maude `BTreeSet<LNSubstVFresh>` dedup
 /// in `apply_eq_store` (equation_store.rs:2552-2560) fails to
 /// collapse the duplicates HS would catch via `S.fromList`
-/// (EquationStore.hs:268).
+/// (EquationStore.hs:257).
 ///
 /// The new ordering (asc) is:
 ///   1. occurrence count — same as HS.

@@ -188,7 +188,7 @@ pub fn pretty_guarded_doublequoted(g: &Guarded) -> String {
 }
 
 /// Build the `pretty_hpj::Doc` for a `prettyGoal (DisjG (Disj gfs))`
-/// (Constraints.hs:281-283):
+/// (Constraints.hs:276-277):
 ///   `fsep $ punctuate (operator_ "  ∥") (map (nest 1 . parens . prettyGuarded) gfs)`
 /// Each disjunct is `nest 1 (parens (prettyGuarded gf))`, the separator is
 /// `"  ∥"` (two spaces + ∥) placed AFTER each non-last item by `punctuate`,
@@ -211,7 +211,7 @@ pub fn disj_goal_to_doc(gfs: &[Guarded]) -> crate::pretty_hpj::Doc {
 /// Render a full `solve( <DisjG> )` proof-method line through the
 /// HS-faithful engine, mirroring HS
 ///   `SolveGoal goal -> keyword_ "solve(" <-> prettyGoal goal <-> keyword_ ")"`
-/// (ProofMethod.hs:1494) where `<->` is `<+>` (beside-with-space).  The
+/// (ProofMethod.hs:1182) where `<->` is `<+>` (beside-with-space).  The
 /// whole thing is built as ONE `Doc` so HughesPJ's beside column-shift
 /// indents the goal's wrapped continuation lines to the column after
 /// `solve( ` (= `indent + 7`), byte-identical to HS.
@@ -238,7 +238,7 @@ pub fn solve_disj_goal_line_pfx(gfs: &[Guarded], base_indent: usize, prefix: &st
 /// `prefix` (`"by "` for childless leaf steps, `""` otherwise).
 ///
 /// CRITICAL — ribbon faithfulness: HS lays a leaf step out as
-/// `kwBy <> text " " <> prettyStep` (Proof.hs:1085) — the `by ` is line
+/// `kwBy <> text " " <> prettyStep` (Proof.hs:1065-1066) — the `by ` is line
 /// CONTENT laid out BESIDE the step, so HughesPJ counts its 3 columns
 /// toward the ribbon when deciding where the step's `fsep`/`sep` break.
 /// Folding `by ` into the indent instead (rendering the step nested at
@@ -313,7 +313,7 @@ pub fn step_line_with_unann(
         hpj::sep(vec![method_doc, unannotated_comment_doc()])
     };
     // HS `ppCases ps [] = prettyCase ps (kwBy <> text " ") <> prettyStep ps`
-    // (Proof.hs:1085): the `by ` keyword is laid out BESIDE the WHOLE
+    // (Proof.hs:1065-1066): the `by ` keyword is laid out BESIDE the WHOLE
     // `sep [method, comment]`, NOT folded into the first `sep` element.  So
     // when `sep` breaks vertically the dropped `/* unannotated */` aligns at
     // the sep's start column = `base_indent + len(prefix)`; `beside` shifts
@@ -337,7 +337,7 @@ pub fn step_line_with_unann(
 /// caller has already constructed `goal_doc` for the goal body (HS
 /// `prettyGoal`, Constraints.hs:273-287).  Mirrors HS
 ///   `SolveGoal goal -> keyword_ "solve(" <-> prettyGoal goal <-> keyword_ ")"`
-/// (ProofMethod.hs:1494), `<->` = `<+>` (beside-with-space).  The whole
+/// (ProofMethod.hs:1182), `<->` = `<+>` (beside-with-space).  The whole
 /// line is ONE `Doc` so HughesPJ's beside column-shift indents the goal's
 /// wrapped continuation lines to the column after `solve( ` (= indent+7),
 /// byte-identical to HS.  Same wrapping plumbing as `solve_disj_goal_line`.
@@ -382,7 +382,7 @@ pub fn pretty_fact(fa: &p::Fact) -> String {
 
 /// HS `ppFactsList list = fsep [operator_ "[", ppList (map ppFact list),
 /// operator_ "]"]` where `ppList = fsep . punctuate comma`
-/// (Theory/Model/Rule.hs:1266-1268).
+/// (Theory/Model/Rule.hs:1256-1258).
 fn facts_list_doc(facts: &[p::Fact]) -> crate::pretty_hpj::Doc {
     use crate::pretty_hpj::{self as hpj, Doc};
     let inner: Vec<Doc> = facts.iter().map(|f| fact_to_doc(f, &[])).collect();
@@ -390,12 +390,20 @@ fn facts_list_doc(facts: &[p::Fact]) -> crate::pretty_hpj::Doc {
     hpj::fsep(vec![Doc::text("["), body, Doc::text("]")])
 }
 
-/// HS `prettyRuleRestrGen` (Theory/Model/Rule.hs:1254-1262):
+/// HS `prettyRuleRestrGen` (Theory/Model/Rule.hs:1243-1252):
 ///   `sep [ nest 1 (ppFactsList prems)
-///        , if null acts then "-->"
-///          else fsep ["--[", ppList (map ppFact acts), "]->"]
+///        , if null acts && null restr then "-->"
+///          else fsep ["--[", ppList (map ppFact acts ++ map ppRestr' restr), "]->"]
 ///        , nest 1 (ppFactsList concls) ]`
 /// Built as a `pretty_hpj::Doc` so the `sep`/`fsep` wrapping is HS-exact.
+///
+/// HS uses the bare `-->` arrow only when `null acts && null restr`.  The
+/// Rust check below tests only `acts.is_empty()` (there is no `restr`
+/// operand), which is correct ONLY because `_restrict` restrictions are
+/// pre-lifted out of the rule before rendering
+/// (`rule_restriction::lift_rule_restrictions` clears `embedded_restrictions`
+/// and folds them into `acts`), so `restr` is always empty at render time.
+/// Callers MUST pass already-lifted rules.
 pub fn rule_body_to_doc(
     prems: &[p::Fact],
     acts: &[p::Fact],
@@ -814,32 +822,39 @@ fn atom_to_doc(a: &p::Atom, scope: &[Bind]) -> crate::pretty_hpj::Doc {
     use crate::pretty_hpj::{self as hpj, Doc};
     use p::Atom::*;
     match a {
-        // HS `EqE l r -> sep [ppT l <-> opEqual, ppT r]` (Atom.hs:219).
+        // HS `EqE l r -> sep [ppT l <-> opEqual, ppT r]` (Atom.hs:217-218).
         Eq(l, r) => hpj::sep(vec![
             term_to_doc(l, scope).beside_sp(Doc::text("=")),
             term_to_doc(r, scope),
         ]),
-        // HS `Subterm l r -> sep [ppT l <-> opSubterm, ppT r]` (Atom.hs:221).
+        // HS `Subterm l r -> sep [ppT l <-> opSubterm, ppT r]` (Atom.hs:220).
         Subterm(l, r) => hpj::sep(vec![
             term_to_doc(l, scope).beside_sp(Doc::text("\u{228F}")),
             term_to_doc(r, scope),
         ]),
         // HS `Less u v -> text (show u) <-> opLess <-> text (show v)`
-        // (Atom.hs:222) — `<->` is `<+>`, no break.
+        // (Atom.hs:221) — `<->` is `<+>`, no break.
         Less(l, r) => term_to_doc(l, scope)
             .beside_sp(Doc::text("<"))
             .beside_sp(term_to_doc(r, scope)),
-        // Rust-only multiset-`(<)` ordering atom; mirror `Less`'s shape.
+        // Multiset `(<)`.  HS has NO printer for this: `smallerp`
+        // (Theory/Text/Parser/Formula.hs:30-38) parses `(<)` to
+        // `Pred Smaller`, and `expandFormula` (Predicate.hs:82-93) rewrites
+        // it to `∃ z. r = l ++ z` BEFORE any pretty-printing — see
+        // `predicate_expand::expand_atom`, which runs in elaborate.rs:311.
+        // So this arm is unreachable on the elaborated formula/restriction
+        // path; it is a defensive fallback that renders the pre-expansion
+        // shape only if a raw `LessMset` is ever printed directly.
         LessMset(l, r) => term_to_doc(l, scope)
             .beside_sp(Doc::text("(<)"))
             .beside_sp(term_to_doc(r, scope)),
         // HS `Action v fa -> prettyFact ppT fa <-> opAction <-> text (show v)`
-        // (Atom.hs:216-217).  Breakability lives inside `prettyFact`.
+        // (Atom.hs:214-215).  Breakability lives inside `prettyFact`.
         Action(fa, t) => fact_to_doc(fa, scope)
             .beside_sp(Doc::text("@"))
             .beside_sp(term_to_doc(t, scope)),
         // HS `Last i -> operator_ "last" <> parens (text (show i))`
-        // (Atom.hs:224) — `<>` is no-space beside.
+        // (Atom.hs:222) — `<>` is no-space beside.
         Last(t) => Doc::text("last(")
             .beside(term_to_doc(t, scope))
             .beside(Doc::text(")")),
@@ -994,6 +1009,10 @@ fn pp_atom(a: &p::Atom, scope: &[Bind], out: &mut String) {
             out.push_str(" < ");
             pp_term(r, scope, out);
         }
+        // Multiset `(<)`: HS has no printer for it — `expandFormula`
+        // rewrites it to `∃ z. r = l ++ z` before printing (see
+        // `predicate_expand::expand_atom`).  Unreachable on the elaborated
+        // path; defensive fallback rendering the pre-expansion shape.
         LessMset(l, r) => {
             pp_term(l, scope, out);
             out.push_str(" (<) ");
@@ -1065,6 +1084,49 @@ fn pp_fact(fa: &p::Fact, scope: &[Bind], out: &mut String) {
 /// HS `comma = char ','`.
 fn comma_doc() -> crate::pretty_hpj::Doc {
     crate::pretty_hpj::Doc::char(',')
+}
+
+/// Build the bracketed fact-annotation suffix, e.g. `[+, no_precomp]`.
+///
+/// HS `ppAnn ann = brackets . fsep . punctuate comma $ map (text .
+/// showFactAnnotation) $ S.toList ann` (Theory/Model/Fact.hs:543-544).
+/// `S.toList` of a `Set FactAnnotation` yields elements in `FactAnnotation`
+/// `Ord` order, which is the data-declaration order
+/// `SolveFirst < SolveLast < NoSources` (Fact.hs:149-150).  The parser-AST
+/// path stores annotations in a `Vec` in source (parse) order, so we sort by
+/// that key and dedup before rendering to match HS's set semantics.
+///
+/// For these three short annotations HS's `fsep`+`punctuate comma`+`brackets`
+/// produces exactly `", "` separators and never wraps, so the flat `String`
+/// here is byte-identical to the HS `Doc`; only the ordering is load-bearing.
+fn fact_annotations_suffix(annotations: &[p::FactAnnotation]) -> Option<String> {
+    if annotations.is_empty() {
+        return None;
+    }
+    // `FactAnnotation` Ord rank (declaration order); also used to dedup.
+    fn rank(a: &p::FactAnnotation) -> u8 {
+        match a {
+            p::FactAnnotation::SolveFirst => 0,
+            p::FactAnnotation::SolveLast => 1,
+            p::FactAnnotation::NoSources => 2,
+        }
+    }
+    let mut ranks: Vec<u8> = annotations.iter().map(rank).collect();
+    ranks.sort_unstable();
+    ranks.dedup();
+    let mut s = String::from("[");
+    for (i, r) in ranks.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        s.push_str(match r {
+            0 => "+",
+            1 => "-",
+            _ => "no_precomp",
+        });
+    }
+    s.push(']');
+    Some(s)
 }
 
 /// Pretty-print a parser-AST term as a `pretty_hpj::Doc`.  Faithful to HS
@@ -1241,18 +1303,9 @@ pub fn fact_to_doc(fa: &p::Fact, scope: &[Bind]) -> crate::pretty_hpj::Doc {
     let arg_docs: Vec<Doc> = fa.args.iter().map(|a| term_to_doc(a, scope)).collect();
     let body = hpj::fsep(hpj::punctuate(comma_doc(), arg_docs));
     let mut d = nest_short_doc(&lead, ")", body);
-    // Fact annotations: `<> ppAnn an = brackets . fsep . punctuate comma`.
-    if !fa.annotations.is_empty() {
-        let mut ann = String::from("[");
-        for (i, a) in fa.annotations.iter().enumerate() {
-            if i > 0 { ann.push_str(", "); }
-            ann.push_str(match a {
-                p::FactAnnotation::SolveFirst => "+",
-                p::FactAnnotation::SolveLast => "-",
-                p::FactAnnotation::NoSources => "no_precomp",
-            });
-        }
-        ann.push(']');
+    // Fact annotations: `<> ppAnn an = brackets . fsep . punctuate comma` in
+    // `FactAnnotation` Ord order (see `fact_annotations_suffix`).
+    if let Some(ann) = fact_annotations_suffix(&fa.annotations) {
         d = d.beside(Doc::text(ann));
     }
     d
@@ -1262,8 +1315,9 @@ pub fn fact_to_doc(fa: &p::Fact, scope: &[Bind]) -> crate::pretty_hpj::Doc {
 // GTerm / GFact / GAtom — HughesPJ Doc engine (HS-faithful wrapping)
 //
 // HS has ONE term renderer: `prettyTerm` (Term/Term.hs:268-296). The guarded
-// path's `prettyNAtom = prettyAtom prettyNTerm` and `prettyNTerm = prettyTerm
-// (text . show)` (LTerm.hs:893-894) use the EXACT same `prettyTerm`, only with
+// path's `prettyNAtom = prettyAtom prettyNTerm` (Atom.hs:230-231) and
+// `prettyNTerm = prettyTerm (text . show)` (LTerm.hs:852-853) use the EXACT
+// same `prettyTerm`, only with
 // a different leaf-printer for variables/literals. So `gterm_to_doc` is
 // structurally identical to `term_to_doc`; only the leaf cases (Var, lits)
 // differ and reuse `pp_gterm`'s leaf string-rendering (which already handles
@@ -1434,17 +1488,9 @@ fn gfact_to_doc(fa: &crate::guarded::GFact, scope: &[Vec<Bind>]) -> crate::prett
     let arg_docs: Vec<Doc> = fa.args.iter().map(|a| gterm_to_doc(a, scope)).collect();
     let body = hpj::fsep(hpj::punctuate(comma_doc(), arg_docs));
     let mut d = nest_short_doc(&lead, ")", body);
-    if !fa.annotations.is_empty() {
-        let mut ann = String::from("[");
-        for (i, a) in fa.annotations.iter().enumerate() {
-            if i > 0 { ann.push_str(", "); }
-            ann.push_str(match a {
-                p::FactAnnotation::SolveFirst => "+",
-                p::FactAnnotation::SolveLast => "-",
-                p::FactAnnotation::NoSources => "no_precomp",
-            });
-        }
-        ann.push(']');
+    // Annotations rendered in `FactAnnotation` Ord order (see
+    // `fact_annotations_suffix`); mirrors HS `ppAnn`'s `S.toList`.
+    if let Some(ann) = fact_annotations_suffix(&fa.annotations) {
         d = d.beside(Doc::text(ann));
     }
     d
@@ -1470,9 +1516,11 @@ fn gatom_to_doc(a: &crate::guarded::GAtom, scope: &[Vec<Bind>]) -> crate::pretty
             gterm_to_doc(l, scope).beside_sp(Doc::text("\u{228F}")), // ⊏
             gterm_to_doc(r, scope),
         ]),
-        // HS `Less u v -> text (show u) <-> opLess <-> text (show v)` — both
-        // operands are time-point vars (atomic). RS may carry non-var terms
-        // here defensively; render flat via pp_gterm (matches show-style).
+        // HS `Less u v -> text (show u) <-> opLess <-> text (show v)`
+        // (Atom.hs:221) — both operands are time-point LVars rendered via
+        // `show`, fully flat. In well-formed input a `Less` operand is always
+        // a node-var term (parser Formula.hs `blatom`), so the flat `pp_gterm`
+        // rendering of a time-point Var matches HS `show` exactly.
         Less(l, r) => {
             let mut s = String::new();
             pp_gterm(l, scope, &mut s);
@@ -1480,6 +1528,11 @@ fn gatom_to_doc(a: &crate::guarded::GAtom, scope: &[Vec<Bind>]) -> crate::pretty
             pp_gterm(r, scope, &mut s);
             Doc::text(s)
         }
+        // Multiset `(<)`: HS has no printer for it.  The parser-AST
+        // `Atom::LessMset` is rewritten to `∃ z. r = l ++ z` by
+        // `predicate_expand::expand_atom` BEFORE guarded conversion, so a
+        // `GAtom::LessMset` is never produced from theory input; this arm is
+        // a defensive fallback rendering the pre-expansion shape.
         LessMset(l, r) => {
             let mut s = String::new();
             pp_gterm(l, scope, &mut s);
@@ -2120,6 +2173,9 @@ fn pp_gatom(a: &crate::guarded::GAtom, scope: &[Vec<Bind>], out: &mut String) {
             out.push_str(" < ");
             pp_gterm(r, scope, out);
         }
+        // Multiset `(<)`: HS has no printer for it (it is expanded to
+        // `∃ z. r = l ++ z` before guarded conversion — see
+        // `predicate_expand::expand_atom`).  Defensive fallback only.
         GAtom::LessMset(l, r) => {
             pp_gterm(l, scope, out);
             out.push_str(" (<) ");
@@ -2171,8 +2227,12 @@ fn pp_gterm(t: &crate::guarded::GTerm, scope: &[Vec<Bind>], out: &mut String) {
                 out.push_str(sort_prefix_from_hint(b.1));
                 out.push_str(&b.2);
             } else {
-                // Free DeBruijn (shouldn't appear in a well-formed Guarded);
-                // emit as `?n` for debug visibility.
+                // Out-of-range De Bruijn index: corresponds to no HS output
+                // path. HS `pp (GAto a) = prettyNAtom $ bvarToLVar a`
+                // (Guarded.hs) requires every Bound index to be in scope, and
+                // `bvarToLVar` is partial (errors) on an out-of-range index, so
+                // a well-formed Guarded never reaches here. Emit `?n` purely as
+                // a debug aid; it is not expected output.
                 out.push('?');
                 out.push_str(&n.to_string());
             }
@@ -2620,6 +2680,23 @@ mod tests {
         );
         assert_eq!(gterm_to_doc(&g, &[]).render(), "senc(<a, b>, k)");
     }
+
+    #[test]
+    fn fact_annotations_render_in_ord_order() {
+        // HS `ppAnn` iterates `S.toList ann`, i.e. `FactAnnotation` Ord order
+        // (SolveFirst < SolveLast < NoSources), regardless of input order.
+        // Supply the annotations scrambled and assert the rendered suffix is
+        // sorted (and deduped).
+        let fa = p::Fact {
+            persistent: false,
+            name: "F".into(),
+            args: vec![p::Term::Var(v("a", p::SortHint::Untagged))],
+            annotations: vec![
+                p::FactAnnotation::NoSources,
+                p::FactAnnotation::SolveFirst,
+                p::FactAnnotation::NoSources, // duplicate: deduped like S.fromList
+            ],
+        };
+        assert_eq!(fact_to_doc(&fa, &[]).render(), "F( a )[+, no_precomp]");
+    }
 }
-
-

@@ -43,12 +43,11 @@ use std::collections::BTreeSet;
 ///   ordering therefore matters; callers must build it in HS's order.
 /// - A single **monotonic `visited` set** shared across all DFS roots
 ///   (`execRWS ... S.empty`): once a node is visited it is never
-///   re-explored, even from a later root.  (RS's prior implementation
-///   re-ran the whole DFS after each pick — not faithful.)
+///   re-explored, even from a later root — the DFS is not restarted
+///   per pick.
 /// - On the **first** successor that is already a parent (back-edge),
-///   emit the **current node `x`** (the back-edge SOURCE) as a loop
-///   breaker and STOP descending.  (RS's prior implementation emitted
-///   the back-edge TARGET / gray ancestor — not faithful.)
+///   emit the **current node `x`** (the back-edge SOURCE, not the
+///   gray-ancestor target) as a loop breaker and STOP descending.
 /// - Emission order = DFS discovery order (`tell`/`DList` append);
 ///   we mirror it with a `Vec` so the returned list matches HS's
 ///   `D.toList`.
