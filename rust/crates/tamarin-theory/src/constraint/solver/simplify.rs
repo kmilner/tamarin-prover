@@ -2214,6 +2214,19 @@ fn enforce_fresh_node_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     let mut hit_contra = false;
     for (_rule, ids) in buckets {
         if ids.len() < 2 { continue; }
+        // HS-faithful keep-direction (Simplify.hs:225,272-276): HS's `merge`
+        // runs `groupSortOn fst insts` where `insts` comes from
+        // `M.toList (get sNodes se)` (node-id-sorted) and is stably grouped
+        // by the rule, so `mergers ((keep):remove)` keeps the LOWEST node-id
+        // in each group and emits `Equal iKeep other`.  RS builds `buckets`
+        // by scanning `sys.nodes` in Vec (production) order, so `ids[0]` was
+        // whichever same-rule node happened to be created first, NOT the
+        // lowest id.  Sort each bucket's ids to node-id order so `keep` is
+        // the lowest, matching HS exactly.  (Distinct Fresh rules give
+        // disjoint node sets, so per-group merges don't interact — bucket
+        // order is immaterial; only the in-group keep-direction matters.)
+        let mut ids = ids;
+        ids.sort();
         // TAM_RS_TRACE_DG4=1: dump the merge event + current eq_store
         // contents.  Used to find the upstream binding that caused two
         // distinct Fresh suppliers' rules to compare equal here.
