@@ -1300,9 +1300,26 @@ impl<'ctx> Reduction<'ctx> {
             // is invoked from the simplifier loop — so we don't strip
             // the goal here, matching HS's lazy cleanup.
             folded = !self.sys.eq_store.conj.iter().any(|d| d.split_id == id);
-            if folded {
-                self.subst_system();
-            }
+            // HS-faithful: `solveRuleConstraints` (Reduction.hs:766-774) is
+            //   addRuleVariants → insertGoal (SplitG …) → setM sEqStore =<< simp …
+            //   → noContradictoryEqStore
+            // — it does NOT call `substSystem`, even when `simp` folds the
+            // singleton variant disjunction into the free subst.  The
+            // goal/node re-key from the new free-subst bindings is DEFERRED
+            // to the next simplify-loop `substSystem` pass (Simplify.hs:99).
+            //
+            // RS previously eagerly `subst_system()`d here on fold.  Inside
+            // `solveUniqueActions`' witness-rule graft (`solve_action_goal`
+            // → `solve_rule_constraints`), that re-keyed live KU msg-var
+            // goals (e.g. `KU(xa:Msg)` → `KU(~xa)`) AT the graft — before the
+            // later grafts in the same pass — instead of after them (where
+            // HS's deferred substSystem puts it).  That advanced the
+            // `GoalStatus.nr` of the re-keyed `~xa`/`~xb` ahead of the
+            // graft-minted `~na`/`~nb`, flipping the min-nr tie-break that
+            // `smartRanking` uses to order the fresh-nonce KU goals — so RS
+            // solved `~xa` first where HS solves `~na` first on
+            // CCITT_X509_3(_BAN) `Session_key_honest_setup`.  Deferring the
+            // re-key (matching HS) realigns the nonce solve order.
         }
         self.changed = ChangeIndicator::Changed;
         // HS-faithful: `noContradictoryEqStore` (Reduction.hs:703-704,
