@@ -153,8 +153,10 @@ fn prettify(s: &str) -> String {
 
 /// Map a presort token (HS `goalRankingPresort`, parsed with `noOracle`)
 /// to the char `goalRankingToChar` would print
-/// (System.hs:600-623, 647-649). Unknown tokens fall back to their first
-/// character (HS would `error`, but we keep robust output for rendering).
+/// (System.hs:600-623, 647-649). Unreachable for unknown tokens on valid
+/// input: HS `stringToGoalRanking`/`stringToGoalRankingDiff` `error`s
+/// before `goalRankingToChar` is ever reached, so the fallback below only
+/// affects rendering of input HS would have already rejected.
 fn presort_char(word: &str) -> char {
     match word {
         "s" => 's', // SmartRanking False
@@ -326,8 +328,8 @@ impl<'a> TacticParser<'a> {
         let (mut s, mut e) = self.conjuncts()?;
         loop {
             self.skip_ws();
-            if self.i < self.s.len() && self.s[self.i] == b'|' {
-                self.i += 1;
+            // HS opLOr = `|` <|> `∨` (Token.hs:600). `∨` = U+2228 = E2 88 A8.
+            if self.eat_op(b"|") || self.eat_op("\u{2228}".as_bytes()) {
                 let (rs, re) = self.conjuncts()?;
                 s = format!("{} | {}", s, rs);
                 e = SelectorExpr::Or(Box::new(e), Box::new(re));
@@ -342,8 +344,8 @@ impl<'a> TacticParser<'a> {
         let (mut s, mut e) = self.negation()?;
         loop {
             self.skip_ws();
-            if self.i < self.s.len() && self.s[self.i] == b'&' {
-                self.i += 1;
+            // HS opLAnd = `&` <|> `∧` (Token.hs:596). `∧` = U+2227 = E2 88 A7.
+            if self.eat_op(b"&") || self.eat_op("\u{2227}".as_bytes()) {
                 let (rs, re) = self.negation()?;
                 s = format!("{} & {}", s, rs);
                 e = SelectorExpr::And(Box::new(e), Box::new(re));
@@ -355,12 +357,27 @@ impl<'a> TacticParser<'a> {
     }
 
     fn negation(&mut self) -> Option<(String, SelectorExpr)> {
-        // opLNot is the word `not`.
-        if self.try_kw("not") {
+        // HS opLNot = `¬` <|> `not` (Token.hs:604). The ASCII `not` is an
+        // identifier word (needs a word boundary, hence try_kw); `¬`
+        // (U+00AC = C2 AC) is a non-identifier symbol matched directly.
+        if self.try_kw("not") || self.eat_op("\u{00AC}".as_bytes()) {
             let (s, e) = self.function()?;
             Some((format!("not {}", s), SelectorExpr::Not(Box::new(e))))
         } else {
             self.function()
+        }
+    }
+
+    /// If the next bytes (skipping leading layout) are the non-identifier
+    /// operator `op`, consume them and return true. Mirrors HS `symbol_`,
+    /// which lexes the literal and skips surrounding layout.
+    fn eat_op(&mut self, op: &[u8]) -> bool {
+        self.skip_ws();
+        if self.s[self.i..].starts_with(op) {
+            self.i += op.len();
+            true
+        } else {
+            false
         }
     }
 
@@ -410,8 +427,11 @@ impl<'a> TacticParser<'a> {
     }
 }
 
+/// HS spthy `identLetter = alphaNum <|> oneOf "_"`
+/// (Token.hs:224); `.` is NOT an identifier letter, so a name like
+/// `foo.bar` tokenizes as `foo` then a boundary at `.`.
 fn is_ident_byte(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_' || c == b'.'
+    c.is_ascii_alphanumeric() || c == b'_'
 }
 
 #[cfg(test)]
@@ -477,5 +497,73 @@ deprio:\n\
             r,
             "tactic: x\npresort: s\nprio: {id}\n  regex\".*!Tag\\(.*\"\ndeprio: {id}\n  regex\".*TagK\\(.*\""
         );
+    }
+
+    /// Locks the corpus-relevant presort chars (`C`, `c`, `s`) which
+    /// round-trip identically through `goalRankingToChar` (System.hs:647-649).
+    #[test]
+    fn presort_char_round_trips() {
+        let t = Tactic::parse("x", "presort: C\nprio:\n  regex \"a\"\n");
+        assert_eq!(t.presort, 'C');
+        let t = Tactic::parse("x", "presort: c\nprio:\n  regex \"a\"\n");
+        assert_eq!(t.presort, 'c');
+        // Default (no presort) is SmartRanking False -> 's' (Tactics.hs:112).
+        let t = Tactic::parse("x", "prio:\n  regex \"a\"\n");
+        assert_eq!(t.presort, 's');
+    }
+
+    /// HS opLAnd/opLOr/opLNot accept the Unicode spellings ∧/∨/¬ in a tactic
+    /// body (Token.hs:596-604) and render them as canonical ASCII ` & `/` | `/
+    /// `not ` (Tactics.hs:73-79). Verified against the HS prover v1.13.0: a
+    /// `regex "a" ∧ regex "b"` block prints `regex"a" & regex"b"`, etc.
+    #[test]
+    fn accepts_unicode_operators() {
+        let raw = "presort: C\n\
+prio:\n\
+  regex \"a\" \u{2227} regex \"b\"\n\
+prio:\n\
+  regex \"c\" \u{2228} regex \"d\"\n\
+prio:\n\
+  \u{00AC} regex \"e\"\n";
+        let t = Tactic::parse("mytac", raw);
+        assert_eq!(t.prios.len(), 3);
+        // Structure mirrors the ASCII spellings.
+        assert!(matches!(
+            t.prios[0].selectors[0],
+            SelectorExpr::And(_, _)
+        ));
+        assert!(matches!(t.prios[1].selectors[0], SelectorExpr::Or(_, _)));
+        assert!(matches!(t.prios[2].selectors[0], SelectorExpr::Not(_)));
+        // Rendered with canonical ASCII operators, byte-identical to HS.
+        let r = t.render();
+        assert_eq!(
+            r,
+            "tactic: mytac\npresort: C\n\
+prio: {id}\n  regex\"a\" & regex\"b\"\n\
+prio: {id}\n  regex\"c\" | regex\"d\"\n\
+prio: {id}\n  not regex\"e\""
+        );
+    }
+
+    /// HS spthy `identLetter` excludes `.` (Token.hs:224), so a function name
+    /// containing `.` is not tokenized as one identifier: HS parses `foo` then
+    /// requires a `"` and rejects the `.` (confirmed against the HS prover:
+    /// `unexpected "." expecting letter or digit or """`). The Rust parser
+    /// likewise stops the function name at `.`; with no quoted param following
+    /// `foo`, the disjunct is dropped rather than parsed as `foo.bar`.
+    #[test]
+    fn dot_is_not_an_ident_letter() {
+        let t = Tactic::parse("x", "prio:\n  foo.bar \"a\"\n");
+        // `foo` has no quoted parameter (next byte is `.`), so the disjunct
+        // is not accepted as a valid function -> empty prio block.
+        assert_eq!(t.prios.len(), 1);
+        assert!(t.prios[0].selectors.is_empty());
+        // A dot-free name still parses normally.
+        let t = Tactic::parse("x", "prio:\n  regex \"a\"\n");
+        assert_eq!(t.prios[0].selectors.len(), 1);
+        assert!(matches!(
+            t.prios[0].selectors[0],
+            SelectorExpr::Leaf(ref l) if l.name == "regex"
+        ));
     }
 }

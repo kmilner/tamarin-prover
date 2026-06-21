@@ -29,12 +29,12 @@ pub enum ProveError {
     Guarded(String),
 }
 
-/// Render the full HS `ppError` doc (Guarded.hs:479) for a failed guarded
+/// Render the full HS `ppError` doc (Guarded.hs:477) for a failed guarded
 /// conversion: the error text, the quoted failing sub-formula (both
 /// quantifier-level errors include `ppFormula f0`, Guarded.hs:508-514 and
 /// 561-563), then "in the formula" + the quoted converted formula.  This is
 /// the exact message HS's `formulaToGuarded_ = either (error . render) id`
-/// (Guarded.hs:466-467) dies with when a proven lemma's formula cannot be
+/// (Guarded.hs:464-465) dies with when a proven lemma's formula cannot be
 /// converted.
 fn guard_error_doc(
     e: &crate::guarded::GuardError,
@@ -62,9 +62,12 @@ impl std::fmt::Display for ProveError {
 ///
 /// Mirrors HS `oraclePath oracle = takeDirectory inFile </> normalise relPath`
 /// (System.hs:574-575, Parser.hs:304).  NOTE: HS's `normalise relPath`
-/// (`System.FilePath.normalise`) collapses `.`/`..` segments; we only
-/// directory-prefix via `std::path::Path::join`, which is purely lexical
-/// and does NOT collapse `.`/`..` (`a/b/../c` stays as-is).
+/// (`System.FilePath.normalise`) collapses `.` and redundant separators
+/// (NOT `..`); we skip that, directory-prefixing via `std::path::Path::join`
+/// (purely lexical, leaves `./` and `a/b/../c` as-is).  That only affects the
+/// literal exec-path string, not which file is run — the path is consumed by
+/// `Command::new` (oracle exec), never printed into `--prove` output, and the
+/// OS resolves a leading `./` identically — so the difference is unobservable.
 fn prepend_theory_dir_to_oracle_paths(
     rankings: &mut Vec<crate::constraint::solver::goals::GoalRanking>,
     in_file: &str,
@@ -81,7 +84,10 @@ fn prepend_theory_dir_to_oracle_paths(
                 if !p.is_absolute() {
                     let resolved = work_dir.join(p);
                     // Directory-prefix only — `Path::join` is lexical and
-                    // does NOT collapse `./` `../` (unlike HS `normalise`).
+                    // leaves `./` and `../` as-is.  HS `normalise` would drop
+                    // a leading `./` and collapse redundant separators (but
+                    // not `..`); the difference is exec-string-only and the OS
+                    // resolves it identically, so it is unobservable.
                     let resolved = resolved.to_string_lossy().to_string();
                     *oracle_path = resolved;
                 }
@@ -487,7 +493,7 @@ fn prove_lemma_in_session_mode(
     // (`unproven = sorry Nothing`, Proof.hs:255-256; used by the lemma
     // constructor at ProofSkeleton.hs:61) via `checkAndExtendProver`'s
     // `sorry` walk
-    // (Proof.hs:626-632) — that single `Sorry` node consults no source,
+    // (Proof.hs:624-630) — that single `Sorry` node consults no source,
     // so HS never forces the (potentially very expensive) refined-source
     // thunk for it.  RS mirrors that here: such a lemma will hit the
     // `annotated_sorry_root` early return below WITHOUT touching
@@ -499,9 +505,8 @@ fn prove_lemma_in_session_mode(
     // The `cases(ctx)` accessor (sources.rs) still calls `ensure_saturated`
     // lazily for every path that DOES consult a source — skeleton replay
     // and `run_proof_search` — so correctness is unchanged.)
-    let replay_disabled = std::env::var("TAM_RS_DISABLE_SKELETON_REPLAY").is_ok();
     let will_emit_bare_sorry =
-        !auto_prove && (replay_disabled || lemma.proof.tree.is_none());
+        !auto_prove && lemma.proof.tree.is_none();
     // Lever #3: reuse a previously-computed refined-source set when one
     // exists for this exact `source_key`.  See [`CachedSources`] for why a
     // hit is byte-identical (only delta==0 results are ever cached).
@@ -569,17 +574,13 @@ fn prove_lemma_in_session_mode(
         ctx.use_induction = crate::constraint::solver::context::UseInduction::UseInduction;
     }
     // Skeleton replay: same logic as in `prove_lemma_with_pool`.
-    // (`replay_disabled` was computed above where it also gates the
-    // bare-sorry saturation skip.)
-    if !replay_disabled {
-        if let Some(tree) = lemma.proof.tree.clone() {
-            if auto_prove {
-                return Ok(crate::replay::replace_sorry_prove(&ctx, sys, &tree, max_steps));
-            } else {
-                // Non-target lemma: HS close-time check-and-extend
-                // replay, no auto-proving of open leaves.
-                return Ok(crate::replay::check_and_extend(&ctx, sys, &tree, max_steps));
-            }
+    if let Some(tree) = lemma.proof.tree.clone() {
+        if auto_prove {
+            return Ok(crate::replay::replace_sorry_prove(&ctx, sys, &tree, max_steps));
+        } else {
+            // Non-target lemma: HS close-time check-and-extend
+            // replay, no auto-proving of open leaves.
+            return Ok(crate::replay::check_and_extend(&ctx, sys, &tree, max_steps));
         }
     }
     if !auto_prove {
@@ -874,24 +875,20 @@ pub fn prove_lemma_with_pool_and_file(
         ctx.use_induction = crate::constraint::solver::context::UseInduction::UseInduction;
     }
 
-    // HS-faithful `replaceSorryProver` (Proof.hs:644-652):
+    // HS-faithful `replaceSorryProver` (Proof.hs:642-650):
     // when the lemma carries a parsed skeleton, walk that skeleton and
     // invoke the auto-prover only at `by sorry` leaves.  Otherwise (no
     // skeleton or parser couldn't structure it) fall through to the
-    // pre-existing auto-prover-from-scratch behavior.  Gated by
-    // `TAM_RS_DISABLE_SKELETON_REPLAY` for emergency rollback.
-    let replay_disabled = std::env::var("TAM_RS_DISABLE_SKELETON_REPLAY").is_ok();
-    if !replay_disabled {
-        if let Some(tree) = lemma.proof.tree.clone() {
-            if std::env::var("TAM_DBG_REPLAY").is_ok() {
-                eprintln!("[replay] firing skeleton replay for `{}` (raw {} bytes)",
-                    lemma_name, lemma.proof.raw.len());
-            }
-            return Ok(crate::replay::replace_sorry_prove(&ctx, sys, &tree, max_steps));
-        } else if std::env::var("TAM_DBG_REPLAY").is_ok() {
-            eprintln!("[replay] NO tree on `{}` (raw {} bytes) — falling through to auto-prover",
+    // pre-existing auto-prover-from-scratch behavior.
+    if let Some(tree) = lemma.proof.tree.clone() {
+        if std::env::var("TAM_DBG_REPLAY").is_ok() {
+            eprintln!("[replay] firing skeleton replay for `{}` (raw {} bytes)",
                 lemma_name, lemma.proof.raw.len());
         }
+        return Ok(crate::replay::replace_sorry_prove(&ctx, sys, &tree, max_steps));
+    } else if std::env::var("TAM_DBG_REPLAY").is_ok() {
+        eprintln!("[replay] NO tree on `{}` (raw {} bytes) — falling through to auto-prover",
+            lemma_name, lemma.proof.raw.len());
     }
     let r = run_proof_search(&ctx, sys, max_steps);
     if trace { eprintln!("[phase] run_proof_search done dt={:.3}s total={:.3}s",

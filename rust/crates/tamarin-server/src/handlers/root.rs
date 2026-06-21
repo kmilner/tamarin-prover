@@ -55,7 +55,12 @@ pub async fn post(
                 // that report, so we emit the no-warning message only.
                 alert_msg = Some("Loaded new theory!".into());
             }
-            Err(e) => { alert_msg = Some(format!("Theory loading failed: {}", e)); }
+            // HS `postRootR` (src/Web/Handler.hs:803):
+            //   `setMessage $ "Theory loading failed:\n" <> toHtml (show err)`
+            // — a NEWLINE separates the prefix from the error, not a space.
+            // The '\n' survives both HS Blaze escaping and our `html_escape`
+            // (which leaves '\n' untouched).
+            Err(e) => { alert_msg = Some(format!("Theory loading failed:\n{}", e)); }
         }
         break;
     }
@@ -210,4 +215,32 @@ pub fn html_escape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// HS `postRootR` (src/Web/Handler.hs:803) separates the
+    /// "Theory loading failed:" prefix from the error body with a NEWLINE:
+    ///   `setMessage $ "Theory loading failed:\n" <> toHtml (show err)`.
+    /// We mirror that exact prefix (newline, not space).
+    #[test]
+    fn theory_load_error_prefix_uses_newline() {
+        let e = "parse error: boom";
+        let msg = format!("Theory loading failed:\n{}", e);
+        assert_eq!(msg, "Theory loading failed:\nparse error: boom");
+        assert!(!msg.starts_with("Theory loading failed: ")); // not a space
+    }
+
+    /// `html_escape` must leave '\n' untouched so the newline in the
+    /// load-error banner survives into the rendered page (HS Blaze escaping
+    /// likewise leaves '\n' alone).  Only `& < > " '` are escaped.
+    #[test]
+    fn html_escape_preserves_newline() {
+        assert_eq!(html_escape("Theory loading failed:\nerr"),
+                   "Theory loading failed:\nerr");
+        assert_eq!(html_escape("a&b<c>d\"e'f"),
+                   "a&amp;b&lt;c&gt;d&quot;e&#39;f");
+    }
 }

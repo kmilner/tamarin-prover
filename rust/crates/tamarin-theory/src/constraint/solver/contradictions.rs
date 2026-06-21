@@ -4,8 +4,9 @@
 //! Haskell version probes ~12 conditions. Most are pure structural
 //! checks (cycles, false formulas, fact incompatibilities); a few
 //! consult signature-aware helpers (`nf_via_haskell`,
-//! `irreducible_fun_syms`, `enableDH`).  ForbiddenBP is ported too
-//! (gated on `enableBP` at the caller); everything has a faithful
+//! `irreducible_fun_syms`, `enableDH`).  ForbiddenExp/ForbiddenBP are
+//! gated on `enable_dh`/`enable_bp` inside `contradictions` itself
+//! (matching HS Contradictions.hs:104,106); everything has a faithful
 //! port below.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -75,23 +76,31 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
     // every graph edge induces a strict ordering src < tgt, and the
     // cyclic check has to fold both relations together.
     //
-    // **Apply eq_store subst before cycle detection**.  Haskell's
-    // `cyclic` is called via `runReduction` which invariantly threads
-    // the eq-store's substitution through every node-id lookup; their
-    // `nodeConcNode` / `nodePremNode` resolve through `eqsSubst`
-    // implicitly.  Our `subst_system` propagates eq-store bindings to
-    // sys.edges / sys.less_atoms, but it isn't always called between
-    // every reduction step (e.g. between `solve_fact_eqs` and the next
-    // `contradictions(...)` call from `is_finished`).  When the
-    // eq-store binds `vr.X → ~mw.Y` but the system's edges still
-    // reference `vr.X`, the cyclic graph carries DOUBLE node identity
-    // for the same logical node — two distinct entries that should
-    // collapse, sometimes producing a spurious back-edge.
+    // **Apply eq_store subst before cycle detection** (RS-only
+    // compensation; NOT a step HS performs inside the cyclic check).
+    // HS's `contradictions` calls `D.cyclic $ rawLessRel sys` directly
+    // (Contradictions.hs:94), and `rawLessRel`/`rawEdgeRel`/`nodeConcNode`/
+    // `nodePremNode` are pure projections that apply NO eq-store subst
+    // (System.hs:1613-1622 `rawEdgeRel`/`rawLessRel`, 923-942
+    // `nodePremNode = fst`/`nodeConcNode = fst`; Constraints.hs:133-138
+    // `lessAtomToEdge`/`getLessRel`).  HS achieves canonical node
+    // identity instead by running `substSystem` — which applies the
+    // eq-store subst to sEdges/sLessAtoms/sNodes (Reduction.hs:571-602)
+    // — BEFORE the contradiction check (e.g. `solve` → `simplifySystem`
+    // ends in `void substSystem`, Simplify.hs:82, immediately before
+    // `contradictorySystem`, Sources.hs:176-178).
     //
-    // Apply the eq-store's substitution to less.smaller / less.larger
-    // before walking, so the cyclic graph reflects the canonical
-    // node identity. Pure node-id lookups (LVar variable terms) — no
-    // term traversal needed.
+    // RS's `subst_system` does the same propagation, but isn't always
+    // called between every reduction step (e.g. between `solve_fact_eqs`
+    // and the next `contradictions(...)` call from `is_finished`).  This
+    // `resolve` reproduces HS's already-substituted state: it uses the
+    // identical `apply_vterm`-on-Var op as `subst_system_once`'s `map_var`
+    // (reduction.rs map_var), so it is a no-op (idempotent) when subst has
+    // already run and a faithful compensation when it lags — never
+    // producing a Cyclic that HS's post-substSystem state wouldn't. Pure
+    // node-id lookups (LVar variable terms) — no term traversal needed. Do
+    // not remove without proving RS always runs `subst_system` before
+    // every `contradictions` call.
     use tamarin_term::lterm::LVar;
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
@@ -149,8 +158,12 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
     //   ForbiddenExp, ForbiddenBP, ForbiddenChain, IncompatibleEqs,
     //   FormulasFalse, then NonInjectiveFactInstance, then NodeAfterLast.
     //
-    // RS-only defence-in-depth checks that have no HS counterpart map onto
-    // `IncompatibleEqs` (CR-rules S_≐/S_≈) and are placed at that slot.
+    // RS-only soundness backstops are emitted at the IncompatibleEqs slot
+    // (NOT a port of the `eqsIsFalse` check, HS Contradictions.hs:110): they
+    // fire where HS's Maude unifier / `solveFactEqs` would already have
+    // pruned the branch at CONSTRUCTION time (sort-aware unification, edge
+    // tag-matching) so HS's `contradictions` never sees these systems. See
+    // the per-check notes below.
 
     // 2. SubtermCyclic — `isContradictory subtermStore`.
     if sys.subterm_store.is_false() { out.push(Contradiction::SubtermCyclic); }
@@ -176,8 +189,21 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
     }
     // 8. ForbiddenChain.
     if has_forbidden_chain(sys) { out.push(Contradiction::ForbiddenChain); }
-    // 9. IncompatibleEqs — `eqsIsFalse sEqStore` plus RS-only sort/edge-fact
-    //    guards that are likewise irreconcilable-equality contradictions.
+    // 9. IncompatibleEqs — HS-faithful: `eqsIsFalse sEqStore`
+    //    (Contradictions.hs:110). The three preceding probes are RS-only
+    //    soundness backstops, NOT a port of the eqsIsFalse check: each fires
+    //    where HS's Maude unifier / `solveFactEqs` would have already pruned
+    //    this branch at construction time. The real fix is upstream — make
+    //    RS's edge insertion / fact-eq solving reject these systems at
+    //    construction (as HS does), after which all three become dead code.
+    //    - has_sort_conflated_lvars: MOST suspect — under HS semantics
+    //      `~x:Pub.58` and `~x:Fresh.58` are DISTINCT, legitimately-coexisting
+    //      vars (LVar Eq is `i1==i2 && s1==s2 && n1==n2`, LTerm.hs:516-517), so
+    //      this has genuine over-fire risk relative to HS; if RS conflates them
+    //      it is an RS renaming/node-id bug this probe is masking.
+    //    - has_incompatible_edge_facts / has_fresh_fact_sort_violation: lower
+    //      risk — mirror real HS invariants (edges connect equal fact tags;
+    //      Fr requires Fresh sort) that the unifier/solveFactEqs enforce.
     if has_sort_conflated_lvars(sys) { out.push(Contradiction::IncompatibleEqs); }
     if has_incompatible_edge_facts(sys) { out.push(Contradiction::IncompatibleEqs); }
     if has_fresh_fact_sort_violation(sys) { out.push(Contradiction::IncompatibleEqs); }
@@ -221,25 +247,13 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
 /// no term can be in non-normal form structurally, so we skip
 /// the per-term check.
 ///
-/// The previous Rust implementation used `maude.reduce(t) != t`
-/// (mirroring `nfViaMaude`, Norm.hs:134-136 — `nfViaMaude sortOf t
-/// = (t ==) <$> norm sortOf t`).  HS does NOT use `nfViaMaude` for
-/// this purpose; it uses `nf'`.  The two predicates can disagree
-/// on AC operator argument order (Maude canonicalises `mult(tid,
-/// x)` and `mult(x, tid)` to the same form, but the pure
-/// structural check treats both as in NF) — the same reason
-/// `subst_creates_non_normal_terms` was switched to `nf_via_haskell`
-/// (the pure structural NF check) rather than `maude.reduce`.  The two checks are observably equivalent
-/// on the current corpus (no lemma's verdict changes) but the
-/// mechanism alignment to HS source is the point.
+/// `nf_via_haskell` ports `nf'` (Norm.hs:130-131): a pure structural
+/// NF check, not the Maude-driven `nfViaMaude`.
 fn has_non_normal_terms(ctx: &ProofContext, sys: &System) -> bool {
     // NF check is cheap (pure structural walk) but we call this
     // from `is_finished` on every expand step, so the early-exit
     // still helps for pair-only theories with no subterm rewrite
     // rules.
-    //
-    // Set TAM_SKIP_NF=1 to disable (e.g. for speed-critical probes).
-    if std::env::var("TAM_SKIP_NF").is_ok() { return false; }
     let sig = ctx.maude.maude_sig();
     if sig.reducible_fun_syms.is_empty() { return false; }
     let irreducible = &sig.irreducible_fun_syms;
@@ -329,9 +343,9 @@ fn has_subterm_cycle_contra(ctx: &ProofContext, sys: &System) -> bool {
 /// If both sets are determined and don't intersect, the chain
 /// can never be solved — declare contradictory.
 ///
-/// Skips DH/BP-specific cases (FExp/FPMult/FEMap) for now —
-/// corpus filters DH/BP-using protocols.  When DH support lands,
-/// these branches need adding.
+/// The DH/BP-specific cases (FExp/FPMult/FEMap) are handled via
+/// `dh_view` and the `viewTerm2` special-cases in `possible_end_syms`
+/// / `possible_root_syms` (Contradictions.hs:257-279).
 fn has_impossible_chain(ctx: &ProofContext, sys: &System) -> bool {
     use crate::constraint::constraints::Goal;
     use crate::fact::FactTag;
@@ -582,10 +596,22 @@ fn possible_root_syms(
 /// fresh, so we must conservatively say it *might* contain
 /// fresh.  Same for `Fresh` literals.)
 ///
-/// Skipped in diff mode (Haskell guards with `not isDiffSystem`).
+/// Skipped in diff mode (Haskell guards with `not isDiffSystem`,
+/// where `isDiffSystem = L.get sDiffSystem` — a dedicated boolean on
+/// the regular `System`, NOT the LHS/RHS `Side`, which in HS lives
+/// only on `DiffSystem`).
+///
+/// LATENT DIVERGENCE: RS has no `sDiffSystem` field, so this guard
+/// proxies it via `sys.side`. `formula_to_system` always sets `side`
+/// to `None` (diff is not yet handled), so the guard never fires for a
+/// diff system. Harmless today (no diff support in the corpus); when
+/// diff support lands, add a real `diff_system: bool` to `System` and
+/// guard on it instead of `side`.
 fn has_forbidden_kd(sys: &System) -> bool {
     use crate::fact::FactTag;
-    if sys.side.is_some() { return false; } // diff-system guard
+    // Diff-system guard — see LATENT DIVERGENCE note above; `side` is a
+    // stand-in for the missing `sDiffSystem` boolean.
+    if sys.side.is_some() { return false; }
     for (_, rule) in sys.nodes.iter() {
         for fa in &rule.conclusions {
             if !matches!(fa.tag, FactTag::Kd) { continue; }
@@ -740,10 +766,16 @@ fn has_forbidden_chain(sys: &System) -> bool {
         // Chain ends and starts must both be KD facts.
         if !matches!(conc_fact.tag, FactTag::Kd) { continue; }
         if !matches!(prem_fact.tag, FactTag::Kd) { continue; }
-        // Apply eq_store subst to chain conc term — substSystem may not
-        // have run since the last variant fold, so the rule's raw conc
-        // can lag behind the canonical term.  HS evaluates `nodeConcFact`
-        // through the eq-store-substituted node lookup; mirror that here.
+        // Mirror HS `substNodes` — node conc terms are kept eq-store-
+        // substituted by `substSystem` (Reduction.hs:609 `modM sNodes . M.map
+        // . apply =<< getM sSubst`, run after every reduction/variant fold),
+        // and the contradiction check runs after simplifySystem→substSystem
+        // (Sources.hs:177-178), so HS's `nodeConcFact` (System.hs:937-938, a
+        // plain `nodeRule` lookup that does NOT apply eqsSubst at read time)
+        // already returns the canonical term.  RS mirrors substNodes in
+        // `subst_system_once`; apply eq_store.subst here so t_start matches
+        // HS's already-substituted value.  Idempotent on the canonical path;
+        // compensates only if RS's subst_system lagged.
         let raw_t_start = match conc_fact.terms.first() { Some(t) => t.clone(), None => continue };
         let t_start_owned = tamarin_term::subst::apply_vterm(&sys.eq_store.subst, raw_t_start);
         let t_start = &t_start_owned;
@@ -1089,9 +1121,10 @@ fn is_forbidden_d_pmult<I>(ru: &crate::rule::Rule<crate::rule::RuleInfo<I, crate
     if dtc != BpDirTag::Dn { return false; }
     let (c, p_conc) = match bp_view_pmult(conc_term) { Some(x) => x, None => return false };
 
-    // Pre-filter: only Pmult-down rules.
-    if !crate::rule::is_d_pmult_rule(ru) { return false; }
-
+    // HS `isForbiddenDPMult` (Contradictions.hs:344-355) gates ONLY on the
+    // structural shape checked above (`[p1,p2]`/`[conc]`, `(DnK, FPMult _ _)`
+    // for p1, `(UpK, b)` for p2, `(DnK, FPMult c p)` for conc) — there is no
+    // `isDPMultRule` guard (contrast isForbiddenDEMap/Order which DO guard).
     if !never_contains_fresh_priv(p_conc) { return false; }
     bp_factors_subset(c, b)
 }
@@ -2037,5 +2070,38 @@ mod tests {
                 tamarin_term::vterm::Lit::Var(msg_var))));
         assert!(!has_sort_conflated_lvars(&sys),
             "Pub vs Msg should NOT be flagged (Msg is join sort)");
+    }
+
+    /// `isForbiddenDPMult` (Contradictions.hs:344-355) gates ONLY on the
+    /// structural shape `[KD(pmult(_,p)), KU(b)] -> [KD(pmult(c,p))]` plus
+    /// `neverContainsFreshPriv p && (niFactors c \\ niFactors b == [])` —
+    /// there is no `isDPMultRule` rule-name guard. Pin that the Rust port
+    /// fires on a rule with the pmult shape even when its `info` is NOT a
+    /// `_pmult` DestrRule (here: a Coerce intruder rule).
+    #[test]
+    fn forbidden_d_pmult_fires_without_pmult_rule_name() {
+        use crate::fact::{Fact, FactTag};
+        use crate::rule::{Rule, RuleInfo, ProtoRuleACInstInfo, IntrRuleACInfo, RuleACInst};
+        use tamarin_term::builtin::{msg_var, pmult, pub_var};
+
+        // p (point) is Pub → neverContainsFreshPriv p == true.
+        // c == b == msg_var "b" → niFactors c \\ niFactors b == [].
+        let p = pub_var("p", 0);
+        let b = msg_var("b", 0);
+        let s = msg_var("s", 0);
+        let kd = |t| Fact::new(FactTag::Kd, vec![t]);
+        let ku = |t| Fact::new(FactTag::Ku, vec![t]);
+
+        // info = Coerce, deliberately NOT a `_pmult` DestrRule.
+        let ru: RuleACInst = Rule::new(
+            RuleInfo::<ProtoRuleACInstInfo, IntrRuleACInfo>::Intr(IntrRuleACInfo::Coerce),
+            vec![kd(pmult(s.clone(), p.clone())), ku(b.clone())],
+            vec![kd(pmult(b.clone(), p.clone()))],
+            vec![],
+        );
+        assert!(!crate::rule::is_d_pmult_rule(&ru),
+            "guard precondition: this rule is NOT a _pmult DestrRule");
+        assert!(super::is_forbidden_d_pmult(&ru),
+            "HS isForbiddenDPMult fires on the pmult shape regardless of rule name");
     }
 }

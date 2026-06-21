@@ -101,14 +101,17 @@ fn write_gterm(t: &GTerm, out: &mut String) {
             out.push_str(n);
             out.push('\'');
         }
-        // Numeric / neutral literals render as their irreducible function head
-        // (matching the parser/check_terms NoEq classification).
-        GTerm::Number(n) => {
-            out.push('\'');
-            out.push_str(&n.to_string());
-            out.push('\'');
-        }
-        GTerm::NumberOne | GTerm::NatOne => out.push_str("one"),
+        // Numeric / neutral literals render as their irreducible function head.
+        // `Number(n)` is an RS-only bare-integer literal with no HS counterpart;
+        // render it unquoted, matching the sibling raw-show `show_debruijn_term`
+        // (parser wf.rs:1001 `Number(n) => n.to_string()`).
+        GTerm::Number(n) => out.push_str(&n.to_string()),
+        // `fAppOne` = `NoEq oneSym` with `oneSymString = "one"` and
+        // `fAppNatOne` = `NoEq natOneSym` with `natOneSymString = "tone"`
+        // (FunctionSymbols.hs:134,144). `show (FApp (NoEq (s,_)) [])` = `s`
+        // (Term/Raw.hs:222), so the two nullary symbols show differently.
+        GTerm::NumberOne => out.push_str("one"),
+        GTerm::NatOne => out.push_str("tone"),
         GTerm::DhNeutral => out.push_str("DH_neutral"),
         // FApp (NoEq (name,_)) as
         GTerm::App(name, args) => write_app(name, args.iter(), out),
@@ -415,10 +418,18 @@ pub fn check_formula(oracle_type: &str, f: &Guarded) -> Vec<p::VarSpec> {
         return Vec::new();
     }
 
-    // getFormulaTermsCore: concat $ map (map getCore . varsVTerm) (fact args)
-    // getCore (Free v) = v; getCore (Bound _) = error.  In practice the
-    // post-substitution Reveal terms are ground except for free vars, so we
-    // collect Free vars per-term (sortednub: sorted + deduped), then concat.
+    // getFormulaTermsCore (Tactics.hs:207-209):
+    //   concat $ map (map getCore . varsVTerm) (fact args)
+    // HS `varsVTerm` (VTerm.hs:116-117) sortednubs over `Ord (BVar LVar)`
+    // (Bound < Free), collecting BOTH Bound and Free vars; `getCore` (:194-195)
+    // then maps `Free v -> v` and `error`s on any Bound de-Bruijn index.
+    // We collect only Free vars per term (sortednub: sorted + deduped), then
+    // concat.  This is byte-identical to HS whenever HS does not crash; a Bound
+    // var here would require an existentially-quantified Reveal action whose
+    // fact TERM still carries an unbound de-Bruijn index (the corpus's Reveal
+    // formulas quantify only the temporal #reveal, so me/re/peer are Free).
+    // Dropping the Bound (vs. matching HS's panic) is intentional: a crash is
+    // never the desired `--prove` output.
     let mut acc: Vec<p::VarSpec> = Vec::new();
     for arg in &fact.args {
         let mut vars: Vec<p::VarSpec> = Vec::new();
@@ -542,5 +553,26 @@ mod tests {
     fn show_fact_tag_proto() {
         let t = FactTag::Proto(Multiplicity::Linear, "Foo".into(), 2);
         assert_eq!(show_fact_tag(&t), "ProtoFact Linear \"Foo\" 2");
+    }
+
+    #[test]
+    fn show_gterm_nat_one_is_tone() {
+        // fAppNatOne = FApp (NoEq natOneSym) [] with natOneSymString = "tone"
+        // (FunctionSymbols.hs:144) => `show fAppNatOne == "tone"`.
+        assert_eq!(show_gterm(&GTerm::NatOne), "tone");
+    }
+
+    #[test]
+    fn show_gterm_number_one_is_one() {
+        // fAppOne = FApp (NoEq oneSym) [] with oneSymString = "one"
+        // (FunctionSymbols.hs:134) => `show fAppOne == "one"`.
+        assert_eq!(show_gterm(&GTerm::NumberOne), "one");
+    }
+
+    #[test]
+    fn show_gterm_number_is_unquoted() {
+        // RS-only bare integer literal; raw-show unquoted to match the sibling
+        // renderer (parser wf.rs:1001 `Number(n) => n.to_string()`).
+        assert_eq!(show_gterm(&GTerm::Number(5)), "5");
     }
 }

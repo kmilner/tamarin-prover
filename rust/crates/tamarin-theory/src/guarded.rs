@@ -7,11 +7,12 @@
 //! The check is polarity-aware: `not (Ex x. P(x) @ #i)` becomes
 //! equivalent to `All x #i. P(x) @ #i ==> ⊥` and so on.
 //!
-//! For now we work over `tamarin_parser::ast::Formula` (named
-//! variables) rather than the locally-nameless typed AST in
-//! `crate::formula`. Once we port the BVar-based representation in
-//! anger we can refactor to share the same `Atom` type as the
-//! constraint solver.
+//! The conversion INPUT is `tamarin_parser::ast::Formula` (named
+//! variables, matching HS's `LNFormula`), while the OUTPUT `Guarded`
+//! uses the BVar-based, locally-nameless DeBruijn representation
+//! (`GAtom`/`GTerm` from `guarded_types`), mirroring HS's
+//! `Guarded (String,LSort) Name LVar` whose atoms are
+//! `Atom (VTerm c (BVar v))`.
 
 use std::collections::BTreeSet;
 
@@ -81,12 +82,11 @@ pub fn cmp_guarded(a: &Guarded, b: &Guarded) -> std::cmp::Ordering {
                 // HS-faithful: in `LNGuarded = Guarded (String,LSort) Name
                 // LVar` (Guarded.hs:279,389), the `s` parameter — used
                 // for GGuarded's binding list — is the TUPLE
-                // `(String, LSort)`, NOT `LVar`.  So bindings sort by
-                // (name, sort) only — there is no idx field on a binding.
-                // Rust's `VarSpec` carries `idx` but for binding-list
-                // comparison we must ignore it (cmp_binding); free-var
-                // comparison inside terms still uses cmp_varspec which
-                // mirrors HS's `Ord LVar = (idx, sort, name)`.
+                // `(String, LSort)`, NOT `LVar`.  Our `GBinding` carries
+                // exactly those two fields, so bindings sort by
+                // (name, sort) only (cmp_binding); there is no idx on a
+                // binding.  Free-var comparison inside terms still uses
+                // cmp_varspec which mirrors HS's `Ord LVar = (idx, sort, name)`.
                 .then_with(|| cmp_slice(v1, v2, cmp_binding))
                 .then_with(|| cmp_slice(g1, g2, cmp_atom))
                 .then_with(|| cmp_guarded(b1, b2))
@@ -111,7 +111,7 @@ fn cmp_quant(a: &Quant, b: &Quant) -> std::cmp::Ordering {
 }
 
 /// HS list Ord: element-by-element, shorter < longer.
-fn cmp_slice<T, F>(a: &[T], b: &[T], mut f: F) -> std::cmp::Ordering
+pub(crate) fn cmp_slice<T, F>(a: &[T], b: &[T], mut f: F) -> std::cmp::Ordering
 where F: FnMut(&T, &T) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let mut i = 0;
@@ -351,6 +351,11 @@ fn term_class(t: &GTerm) -> (u8, u8) {
         // LIT (Var v): variables sort after all constants.
         Var(_) => (0, 4),
         // FAPP: nullary builtins are NoEq function applications, not literals.
+        // NB: the second field below is a tie-breaker ONLY within the Lit
+        // class (sub-tags 0..4); the FApp sub-tags (1,0)..(1,8) are never
+        // consulted for ordering, because `cmp_term` dispatches every
+        // FApp-class term through `funsym_key`/`cmp_fapp_args` (the `ca == 1`
+        // branch) and returns before the `sa.cmp(&sb)` sub-tag fallthrough.
         NumberOne => (1, 0),
         NatOne => (1, 1),
         DhNeutral => (1, 2),
@@ -1284,20 +1289,10 @@ fn gnot_atom(a: &GAtom) -> Guarded {
 // Top-level negation — port of Haskell's `gnot`.
 // =============================================================================
 
-/// Variable-renaming substitution: maps `(name, idx)` to a new `idx`.
-/// Used by `Ex` decomposition to allocate fresh indices for bound vars
-/// without colliding with the rest of the system.
+/// Substitution mapping a free LVar (keyed by `(name, idx)`) to a
+/// replacement parser-AST term.  Applied to `Guarded` formulas via
+/// `subst_guarded` (e.g. witness-LVar canonicalisation below).
 pub type VarSubst = std::collections::HashMap<(String, u64), p::Term>;
-
-/// Convenience: build a single (name, idx) → fresh-idx-renaming entry
-/// for `VarSubst`. Used by Ex decomposition where we just bump indices.
-pub fn subst_renaming(name: String, old_idx: u64, new_idx: u64,
-                       sort: p::SortHint) -> ((String, u64), p::Term) {
-    let target = p::Term::Var(p::VarSpec {
-        name: name.clone(), idx: new_idx, sort, typ: None,
-    });
-    ((name, old_idx), target)
-}
 
 /// Rewrite every Maude-witness LVar named `x` (any idx) to its canonical
 /// `idx == 0` form.  Used to dedup implied formulas in

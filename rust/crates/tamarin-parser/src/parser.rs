@@ -219,6 +219,30 @@ impl<'a> Parser<'a> {
         m
     }
 
+    /// Non-consuming lookahead for a term-relational operator that `fatom`'s
+    /// term-level atom path handles: `=` (opEqual), `<<`/`⊏` (opSubterm),
+    /// `(<)` (opLessTerm), or `<` (opLess). Used to mirror HS `blatom`
+    /// (Formula.hs:45-57), where Subterm/Less/smallerp/EqE come before the
+    /// bare-fact `Pred` alternative. Guards against the logical operators that
+    /// share a prefix: `==>` (opImplies) and `<=>` (opLEquiv) must NOT count as
+    /// `=` or `<`, nor must `<-`.
+    fn peek_atom_relop(&mut self) -> bool {
+        self.skip_ws();
+        let r = self.lx.rest();
+        if r.starts_with("<<") || r.starts_with('⊏') || r.starts_with("(<)") {
+            return true;
+        }
+        // `=` but not `==`/`=>` (no real `==`/`=>` token, but `==>` is opImplies).
+        if let Some(after) = r.strip_prefix('=') {
+            return !after.starts_with('=') && !after.starts_with('>');
+        }
+        // `<` (opLess) but not `<<`/`<=`/`<-` (handled above / opLEquiv / arrow).
+        if let Some(after) = r.strip_prefix('<') {
+            return !after.starts_with('=') && !after.starts_with('-');
+        }
+        false
+    }
+
     fn ident(&mut self) -> Result<String, ParseError> {
         self.lx.identifier().ok_or_else(|| self.err("expected identifier"))
     }
@@ -739,18 +763,16 @@ impl<'a> Parser<'a> {
     }
 
     /// SAPIC type: `<defaultSapicTypeS>` = `Any` placeholder, or an identifier.
-    /// We accept any identifier as a type.
     fn type_p(&mut self) -> Result<Option<String>, ParseError> {
-        // HS `typep` (Token.hs:472-473): `try (symbol defaultSapicTypeS) *>
-        // return Nothing <|> Just <$> identifier`, where `defaultSapicTypeS =
-        // "Any"` (Theory/Sapic/Term.hs:95) — the default placeholder is the
-        // literal `Any` (case-sensitive), anything else is `Just <ident>`.
-        // This port additionally accepts `*` and lowercase `any` as the default
-        // (parser-level permissiveness beyond the strict Haskell grammar).
+        // HS `typep` (Token.hs:472-473): `(try (symbol defaultSapicTypeS) *>
+        // return Nothing) <|> Just <$> identifier`, where `defaultSapicTypeS =
+        // "Any"` (Theory/Sapic/Term.hs:95). Only the literal `Any`
+        // (case-sensitive) is the default placeholder; everything else is
+        // `Just <ident>` — so lowercase `any` is `Just "any"`, and `*` is not a
+        // valid identifier (a parse failure, matching HS).
         self.skip_ws();
-        if self.try_punct("*") { return Ok(None); }
         let id = self.ident()?;
-        if id == "Any" || id == "any" { Ok(None) } else { Ok(Some(id)) }
+        if id == "Any" { Ok(None) } else { Ok(Some(id)) }
     }
 
     fn equations(&mut self) -> Result<TheoryItem, ParseError> {
@@ -768,6 +790,19 @@ impl<'a> Parser<'a> {
         self.require_punct(":")?;
         let mut eqs = Vec::new();
         loop {
+            // HS `equation` (Signature.hs:230-231) parses both operands with
+            // `term llitNoPub True`. The `True` (eqn flag) gates AC/multiset/
+            // nat/xor/exp operators — matched here by `term(true)`. `llitNoPub`
+            // (Term.hs:53-54 = `asum [freshTerm <$> freshName, varTerm <$>
+            // msgvar]`) additionally forbids public-name literals `'foo'` and
+            // nat literals `%'n'` in operands, while still allowing fresh
+            // literals `~'n'` and all msgvar-sort variables (including `$x`
+            // pub-sort vars, since `msgvar = sortedLVar [Fresh,Pub,Nat,Msg]`).
+            // We deliberately use the public-name-allowing `term(true)` here:
+            // accepting `'foo'`/`%'n'` is benign parser-level leniency — such
+            // public/nat names are invalid in (convergent) equations and are
+            // rejected during elaboration, so end-to-end `--prove` output is
+            // unchanged on all valid theories.
             let lhs = self.term(true)?;
             self.require_punct("=")?;
             let rhs = self.term(true)?;
@@ -1333,13 +1368,32 @@ impl<'a> Parser<'a> {
         // top-level keyword. If no proof tokens appear, return None.
         self.skip_ws();
         let save = self.save();
-        // Proof-method starter keywords. `rule` is deliberately excluded: a bare
-        // `rule` followed by `:` is a rule declaration, not a proof start (only
-        // the hyphenated `rule-equivalence` is a proof method).
+        // First-token set that can START a stored proof skeleton, matching HS.
+        // This gate is shared by `lemma_item` (regular proofs) and
+        // `diff_lemma_item` (diff proofs), so it is the union of both:
+        //   - regular `proofMethod` (Proof.hs:77-85): sorry, simplify, solve,
+        //     contradiction, induction, INVALIDATED, UNFINISHABLE
+        //   - regular skeleton extras (Proof.hs:99-115): `by` (finalProof),
+        //     `SOLVED` (solvedProof)
+        //   - diff `diffProofMethod` (Proof.hs:119-126): sorry, rule-equivalence,
+        //     backward-search, step, ATTACK, UNFINISHABLEdiff
+        //   - diff skeleton extras (Proof.hs:130-144): `by` (finalProof),
+        //     `MIRRORED` (solvedProof)
+        // `case`/`next`/`qed` are intentionally absent: they only appear INSIDE
+        // an interProof block, never as a proof body's first token. `rule` is
+        // excluded (a bare `rule:` is a rule declaration; only the hyphenated
+        // `rule-equivalence` is a proof method).
         let proof_starters = [
-            "simplify", "solve", "case", "qed", "by", "next", "induction",
-            "rule-equivalence", "backward-search", "sorry",
-            "step", "rev",
+            // regular proofMethod
+            "sorry", "simplify", "solve", "contradiction", "induction",
+            "INVALIDATED", "UNFINISHABLE",
+            // regular skeleton extras
+            "by", "SOLVED",
+            // diff proofMethod
+            "rule-equivalence", "backward-search", "step", "ATTACK",
+            "UNFINISHABLEdiff",
+            // diff skeleton extras
+            "MIRRORED",
         ];
         // Check for hyphenated proof identifiers.
         let probe = self.peek_hyphen_identifier();
@@ -1441,7 +1495,9 @@ impl<'a> Parser<'a> {
         self.require_kw("export")?;
         let tag = self.ident()?;
         self.require_punct(":")?;
-        let body = self.string_literal()?;
+        // Export bodies use the strict `bodyChar` grammar (Signature.hs:282-287),
+        // NOT the general string-literal escape decoding.
+        let body = self.lx.export_body().ok_or_else(|| self.err("expected export body string"))?;
         Ok(TheoryItem::Export { tag, body })
     }
 
@@ -1742,7 +1798,12 @@ impl<'a> Parser<'a> {
         if self.try_punct("[")
             && !self.try_punct("]") {
                 loop {
-                    if self.try_punct("+") { annotations.push(FactAnnotation::SolveFirst); }
+                    // HS `factAnnotation` (Fact.hs:31-36): SolveFirst is
+                    // `opUnion`, and `opUnion = symbol_ "++" <|> symbol_ "+"`
+                    // (Token.hs:551-552) — so `++` is accepted as well as `+`
+                    // (try `++` first, then `+`). SolveLast is `opMinus` (`-`),
+                    // NoSources is `no_precomp`.
+                    if self.try_punct("++") || self.try_punct("+") { annotations.push(FactAnnotation::SolveFirst); }
                     else if self.try_punct("-") { annotations.push(FactAnnotation::SolveLast); }
                     else if self.try_kw("no_precomp") { annotations.push(FactAnnotation::NoSources); }
                     else { break; }
@@ -1917,8 +1978,17 @@ impl<'a> Parser<'a> {
                 let t = self.term(false)?;
                 return Ok(Formula::Atom(Atom::Action(f, t)));
             }
-            // Predicate atom (no @)
-            return Ok(Formula::Atom(Atom::Pred(f)));
+            // HS `blatom` (Formula.hs:45-57) tries the term-relational atoms
+            // (Subterm/Less/smallerp/EqE, alts 3-6, all `try`-guarded) BEFORE
+            // the bare-fact `Pred` alternative (alt 7). So a name like `Foo(x)`
+            // that is also a function symbol must be re-parsed as a term when a
+            // relational operator follows. A genuine predicate atom is never
+            // followed by such an operator, so this only diverts on what HS
+            // already treats as a term relation.
+            if !self.peek_atom_relop() {
+                // Predicate atom (no @, no following relational operator)
+                return Ok(Formula::Atom(Atom::Pred(f)));
+            }
         }
         self.restore(save_f);
         // Try term-level atom: t = t / t < t / t << t / t (<) t
@@ -2091,15 +2161,19 @@ impl<'a> Parser<'a> {
             if !r.starts_with("<-") {
                 self.lx.bump(); // consume '<'
                 self.skip_ws();
+                // HS `pairing = angled (tupleterm eqn plit)` with
+                // `tupleterm = chainr1 (msetterm ...) (... <$ comma)`
+                // (Term.hs:142,187-188). `chainr1` requires >=1 operand, so the
+                // operand loop always runs: an empty `<>` fails to parse
+                // (matching HS, where no other `term` alternative starts with
+                // `<`), and a singleton `<a>` collapses to `a`.
                 let mut items = Vec::new();
-                if !self.try_punct(">") {
-                    loop {
-                        let t = self.msetterm(eqn)?;
-                        items.push(t);
-                        if !self.try_punct(",") { break; }
-                    }
-                    self.require_punct(">")?;
+                loop {
+                    let t = self.msetterm(eqn)?;
+                    items.push(t);
+                    if !self.try_punct(",") { break; }
                 }
+                self.require_punct(">")?;
                 if items.len() == 1 {
                     return Ok(items.into_iter().next().unwrap());
                 }
@@ -2111,10 +2185,16 @@ impl<'a> Parser<'a> {
         if self.try_punct("1:nat") { return Ok(Term::NatOne); }
         if self.try_punct("%1") { return Ok(Term::NatOne); }
         // `1` only valid when DH is enabled; we accept it always at parse level.
-        // Divergence from HS: HS uses a bare `symbol "1"` (Term.hs) with no word
-        // boundary, so it would match the `1` prefix of `1G`/`1abc`. Here we add
-        // a word-boundary guard so `1` is only the DH unit when not immediately
-        // followed by an alphanumeric or `_`.
+        // Divergence from HS, benign on the corpus: HS `term` (Term.hs:134) tries
+        // `symbol "1"` before the identifier path, and `symbol`/`T.symbol`
+        // (Token.hs:273) has NO trailing word boundary, so HS splits the leading
+        // `1` off `1abc`/`12` (yielding fAppOne, leaving `abc`/`2`, which then
+        // fails as a stray token). Note HS identifiers CAN start with a digit
+        // (Token.hs:223 `identStart = alphaNum`), so a bare `2` is the variable
+        // `2`. The word-boundary guard below only diverges on a `1` immediately
+        // followed by an alphanumeric/`_` (e.g. `1abc`, `12`) — inputs that are
+        // never valid message terms and never appear in any .spthy, so accepted
+        // valid output is identical; only the parse-error location differs.
         {
             let save = self.save();
             self.skip_ws();
@@ -2176,13 +2256,15 @@ impl<'a> Parser<'a> {
             let s = self.lx.single_quoted().ok_or_else(|| self.err("bad public literal"))?;
             return Ok(Term::PubLit(s));
         }
-        // Identifier — could be: diff(...), function application f(...),
-        // algebraic application f{a}b, sort-suffixed var x:msg, or a bare
-        // variable / nullary function.
-        let save_id = self.save();
-        if let Some(id) = self.lx.identifier() {
-            // diff(a, b)
-            if id == "diff" && self.lx.peek() == Some('(') {
+        // diff(a, b) — HS `diffOp = symbol "diff" *> parens ...` (Term.hs:108-110).
+        // `diff` is a reserved name (Token.hs:225) so it is NOT an identifier and
+        // must be matched as a keyword here, BEFORE the identifier path. The
+        // word-boundary check in `peek_symbol` keeps `diffuse(...)` an identifier
+        // (function application), matching HS where `naryOpApp` handles it.
+        if self.lx.peek_symbol("diff") {
+            let save_diff = self.save();
+            let _ = self.lx.try_symbol("diff");
+            if self.lx.peek() == Some('(') {
                 self.lx.bump();
                 self.skip_ws();
                 let a = self.msetterm(eqn)?;
@@ -2191,6 +2273,16 @@ impl<'a> Parser<'a> {
                 self.require_punct(")")?;
                 return Ok(Term::Diff(Box::new(a), Box::new(b)));
             }
+            // `diff` not followed by `(`: HS `diffOp`'s `parens` fails and there is
+            // no identifier-named-`diff` fallback, so the term path moves on (and
+            // ultimately fails here, as in HS).
+            self.restore(save_diff);
+        }
+        // Identifier — could be: function application f(...), algebraic
+        // application f{a}b, sort-suffixed var x:msg, or a bare variable /
+        // nullary function.
+        let save_id = self.save();
+        if let Some(id) = self.lx.identifier() {
             self.skip_ws();
             if self.lx.peek() == Some('(') {
                 // Look one token ahead inside `(`: if it's `<)` (the multiset
@@ -2510,5 +2602,107 @@ mod tests {
             Formula::Forall(_, _) => {}
             _ => panic!("expected Forall"),
         }
+    }
+
+    // HS `blatom` (Formula.hs:45-57) tries the term-relational atoms
+    // (Subterm/Less/EqE) BEFORE the bare-fact `Pred` alternative, so an
+    // uppercase function applied with a relational operator is an equality/
+    // subterm atom, not a predicate. Verified against tamarin-prover 1.13.0:
+    // `A(Foo(x))@i ==> Foo(x) = Foo(y)` renders `(Foo(x) = Foo(y))`.
+    #[test]
+    fn fatom_fact_lhs_of_relop_is_term_atom() {
+        // Equality: `Foo(x) = Foo(y)` must be Atom::Eq(App,App), not Pred.
+        let f = parse_formula_str("Foo(x) = Foo(y)").unwrap();
+        match f {
+            Formula::Atom(Atom::Eq(Term::App(l, _), Term::App(r, _))) => {
+                assert_eq!(l, "Foo");
+                assert_eq!(r, "Foo");
+            }
+            other => panic!("expected Eq(App,App), got {:?}", other),
+        }
+        // Subterm: `A(x) << B(y)` must be Atom::Subterm, not Pred.
+        let f = parse_formula_str("A(x) << B(y)").unwrap();
+        match f {
+            Formula::Atom(Atom::Subterm(Term::App(l, _), Term::App(r, _))) => {
+                assert_eq!(l, "A");
+                assert_eq!(r, "B");
+            }
+            other => panic!("expected Subterm(App,App), got {:?}", other),
+        }
+        // A genuine predicate atom (no following relational op) stays Pred.
+        let f = parse_formula_str("P(x) & Q(y)").unwrap();
+        match f {
+            Formula::And(a, _) => match *a {
+                Formula::Atom(Atom::Pred(ref fa)) => assert_eq!(fa.name, "P"),
+                ref other => panic!("expected Pred, got {:?}", other),
+            },
+            other => panic!("expected And, got {:?}", other),
+        }
+        // Implication after a predicate must NOT be misread as `=` (==> guard).
+        let f = parse_formula_str("P(x) ==> Q(y)").unwrap();
+        match f {
+            Formula::Implies(a, _) => match *a {
+                Formula::Atom(Atom::Pred(ref fa)) => assert_eq!(fa.name, "P"),
+                ref other => panic!("expected Pred LHS of ==>, got {:?}", other),
+            },
+            other => panic!("expected Implies, got {:?}", other),
+        }
+    }
+
+    // HS `typep` (Token.hs:471-473) maps only the literal `Any` to the default
+    // (Nothing); lowercase `any` is `Just "any"`. Verified against
+    // tamarin-prover 1.13.0: `new x:any` renders with `:any` preserved.
+    #[test]
+    fn type_p_only_capital_any_is_default() {
+        // `functions: f(any):bitstring` — arg type must be Some("any").
+        let t = parse_theory("theory T begin functions: f(any):bitstring end", &[]).unwrap();
+        let decl = t.items.iter().find_map(|it| match it {
+            TheoryItem::Functions(ds) => ds.iter().find(|d| d.name == "f"),
+            _ => None,
+        }).expect("function f");
+        assert_eq!(decl.arg_types, vec![Some("any".to_string())]);
+        assert_eq!(decl.out_type, Some("bitstring".to_string()));
+
+        // `functions: g(Any):bitstring` — capital Any is the default (None).
+        let t = parse_theory("theory T begin functions: g(Any):bitstring end", &[]).unwrap();
+        let decl = t.items.iter().find_map(|it| match it {
+            TheoryItem::Functions(ds) => ds.iter().find(|d| d.name == "g"),
+            _ => None,
+        }).expect("function g");
+        assert_eq!(decl.arg_types, vec![None]);
+    }
+
+    // HS `tupleterm` uses `chainr1`, which requires >=1 operand, so `<>` fails
+    // to parse and `<x>` collapses to `x`. Verified against tamarin-prover
+    // 1.13.0: `A(<>)` is a parse error; `A(<x>)` renders `A( x )`.
+    #[test]
+    fn empty_tuple_is_error_singleton_collapses() {
+        assert!(parse_term_str("<>").is_err(), "<> must be a parse error");
+        // Singleton tuple collapses to the inner term.
+        match parse_term_str("<x>").unwrap() {
+            Term::Var(v) => assert_eq!(v.name, "x"),
+            other => panic!("expected singleton to collapse to Var, got {:?}", other),
+        }
+        // Two-element tuple is a Pair.
+        match parse_term_str("<x, y>").unwrap() {
+            Term::Pair(items) => assert_eq!(items.len(), 2),
+            other => panic!("expected Pair, got {:?}", other),
+        }
+    }
+
+    // HS `factAnnotation` SolveFirst is `opUnion = symbol_ "++" <|> symbol_ "+"`
+    // (Fact.hs:32, Token.hs:551-552), so `[++]` is accepted like `[+]`.
+    // Verified against tamarin-prover 1.13.0: `Foo(~k)[++]` parses and renders
+    // as `[+]`.
+    #[test]
+    fn fact_annotation_accepts_double_plus() {
+        let s = "theory T begin rule R: [ Fr(~k) ] --[ Foo(~k)[++] ]-> [ Out(~k) ] end";
+        let t = parse_theory(s, &[]).unwrap();
+        let rule = t.items.iter().find_map(|it| match it {
+            TheoryItem::Rule(r) => Some(r),
+            _ => None,
+        }).expect("rule R");
+        let act = &rule.actions[0];
+        assert_eq!(act.annotations, vec![FactAnnotation::SolveFirst]);
     }
 }

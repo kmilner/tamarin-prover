@@ -5,14 +5,17 @@
 //! plus a `Document` typeclass that lets the prover render to plain text or
 //! to HTML via a different instance.
 //!
-//! We give up the full Hughes width-aware reflowing for now and provide a
-//! line-based pretty-printer that supports the combinators the prover
-//! actually uses: `text`, `<>` (`cat_with`), `<+>` (`beside`), `$-$`
-//! (`above`), and `hcat`/`hsep`/`vcat`, `nest`. (The Haskell `$$` and
-//! `caseEmptyDoc` class methods are not ported here.) Width-sensitive
-//! `sep`/`cat` fall back to `vcat` (always-vertical) while `fsep`/`fcat` fall
-//! back to `hsep`/`hcat` (always-horizontal); this is slightly verbose but
-//! always correct. Improving them is a follow-up.
+//! This module provides a line-based pretty-printer (no Hughes width-aware
+//! reflowing) supporting the combinators the consumers here actually use:
+//! `text`, `<>` (`cat_with`), `<+>` (`beside`), `$-$` (`above`), and
+//! `hcat`/`hsep`/`vcat`, `nest`. (The Haskell `$$` and `caseEmptyDoc` class
+//! methods are not ported here.)
+//!
+//! This module is NOT used on the `--prove`/web-UI render path. The faithful,
+//! width-accurate HughesPJ port that the prover and web UI actually call lives
+//! in `tamarin-theory::pretty_hpj` (full HughesPJ with `render_with`). The only
+//! in-crate consumer of this module is `pretty_html`, which uses just `Doc`,
+//! `keyword`, `cat_with` and `render_with`.
 //!
 //! Highlight styling (`Comment`/`Keyword`/`Operator`) is carried as an enum
 //! tag on a `Doc` node; the plain-text renderer ignores it. The HTML renderer
@@ -85,10 +88,17 @@ impl Doc {
         out
     }
 
-    /// Render to a `String` calling `wrap` to bracket each highlighted span.
-    /// `wrap(style, body)` should return a wrapped form (e.g. with HTML tags).
-    pub fn render_with<F: Fn(HighlightStyle, &str) -> String>(&self, wrap: &F) -> String {
-        let lines = layout_with(&self.0, 0, wrap);
+    /// Render to a `String`, bracketing each highlighted span with the
+    /// `(open, close)` pair returned by `tags(style)`.
+    ///
+    /// Mirrors Haskell `withTag` (Html.hs:59-64), which glues ONE `open`
+    /// zero-width tag before the entire inner doc and ONE `close` after it
+    /// (`open <> inner <> close`). For a multi-line span this places `open` at
+    /// the start of the first line's content and `close` at the end of the last
+    /// line's content, leaving intermediate lines bare — so a two-line keyword
+    /// renders `<span ...>line1\nline2</span>`, not `<span>line1</span>\n<span>line2</span>`.
+    pub fn render_with<F: Fn(HighlightStyle) -> (String, String)>(&self, tags: &F) -> String {
+        let lines = layout_with(&self.0, 0, tags);
         let mut out = String::new();
         for (i, line) in lines.iter().enumerate() {
             if i > 0 { out.push('\n'); }
@@ -153,12 +163,6 @@ pub fn vcat(ds: impl IntoIterator<Item = Doc>) -> Doc {
     iter.fold(first, |acc, d| acc.above(d))
 }
 
-/// `sep`: tries to put on one line; we always go vertical for simplicity.
-pub fn sep(ds: impl IntoIterator<Item = Doc>) -> Doc { vcat(ds) }
-pub fn cat(ds: impl IntoIterator<Item = Doc>) -> Doc { vcat(ds) }
-pub fn fsep(ds: impl IntoIterator<Item = Doc>) -> Doc { hsep(ds) }
-pub fn fcat(ds: impl IntoIterator<Item = Doc>) -> Doc { hcat(ds) }
-
 // -- Atomic punctuation -------------------------------------------------------
 
 pub fn semi() -> Doc { Doc::char(';') }
@@ -173,17 +177,13 @@ pub fn rbrack() -> Doc { Doc::char(']') }
 pub fn lbrace() -> Doc { Doc::char('{') }
 pub fn rbrace() -> Doc { Doc::char('}') }
 
-pub fn int(n: i64) -> Doc { Doc::text(n.to_string()) }
-pub fn integer(n: i128) -> Doc { Doc::text(n.to_string()) }
-pub fn double(n: f64) -> Doc { Doc::text(format!("{}", n)) }
-
 pub fn quotes(d: Doc) -> Doc { Doc::char('\'').cat_with(d).cat_with(Doc::char('\'')) }
 pub fn double_quotes(d: Doc) -> Doc { Doc::char('"').cat_with(d).cat_with(Doc::char('"')) }
 pub fn parens(d: Doc) -> Doc { Doc::char('(').cat_with(d).cat_with(Doc::char(')')) }
 pub fn brackets(d: Doc) -> Doc { Doc::char('[').cat_with(d).cat_with(Doc::char(']')) }
 pub fn braces(d: Doc) -> Doc { Doc::char('{').cat_with(d).cat_with(Doc::char('}')) }
 
-pub fn hang(d1: Doc, n: usize, d2: Doc) -> Doc { sep([d1, d2.nest(n)]) }
+pub fn hang(d1: Doc, n: usize, d2: Doc) -> Doc { vcat([d1, d2.nest(n)]) }
 
 /// `punctuate sep ds`: insert `sep` between successive `ds`.
 pub fn punctuate(sep: Doc, ds: Vec<Doc>) -> Vec<Doc> {
@@ -215,7 +215,7 @@ pub fn fixed_width_text(n: usize, s: &str) -> Doc {
 pub fn symbol(s: &str) -> Doc { fixed_width_text(1, s) }
 
 /// `numbered vsep ds`: prefix each `d` with a right-flushed index, then join the
-/// items with `vsep` interspersed between them (Class.hs:252-261):
+/// items with `vsep` interspersed between them (Class.hs:252-259):
 ///   `foldr1 ($-$) $ intersperse vsep $ map pp $ zip [1..] ds`.
 /// `vsep` is a standalone document placed on its own "line" via `$-$`, not glued
 /// horizontally onto the items — so `numbered (text "")` yields blank separator
@@ -238,11 +238,6 @@ pub fn numbered(vsep: Doc, ds: Vec<Doc>) -> Doc {
         acc = acc.above(vsep.clone()).above(d);
     }
     acc
-}
-
-pub fn numbered_dot(ds: Vec<Doc>) -> Doc {
-    let dotted: Vec<Doc> = ds.into_iter().map(|d| Doc::text(". ").cat_with(d)).collect();
-    numbered(Doc::text(""), dotted)
 }
 
 // -- Highlight helpers --------------------------------------------------------
@@ -270,13 +265,13 @@ struct Line {
 }
 
 fn layout(n: &Node, base_indent: usize) -> Vec<Line> {
-    layout_with(n, base_indent, &|_, s: &str| s.to_string())
+    layout_with(n, base_indent, &|_| (String::new(), String::new()))
 }
 
-fn layout_with<F: Fn(HighlightStyle, &str) -> String>(
+fn layout_with<F: Fn(HighlightStyle) -> (String, String)>(
     n: &Node,
     base_indent: usize,
-    wrap: &F,
+    tags: &F,
 ) -> Vec<Line> {
     match n {
         Node::Empty => vec![Line { indent: base_indent, content: String::new() }],
@@ -284,8 +279,8 @@ fn layout_with<F: Fn(HighlightStyle, &str) -> String>(
             vec![Line { indent: base_indent, content: s.clone() }]
         }
         Node::Cat(a, b) => {
-            let mut la = layout_with(a, base_indent, wrap);
-            let lb = layout_with(b, base_indent, wrap);
+            let mut la = layout_with(a, base_indent, tags);
+            let lb = layout_with(b, base_indent, tags);
             // Glue first line of b onto last line of a.
             let last = la.pop().unwrap_or(Line { indent: base_indent, content: String::new() });
             let mut lb_iter = lb.into_iter();
@@ -299,23 +294,28 @@ fn layout_with<F: Fn(HighlightStyle, &str) -> String>(
             la
         }
         Node::Above(a, b) => {
-            let mut la = layout_with(a, base_indent, wrap);
-            let lb = layout_with(b, base_indent, wrap);
+            let mut la = layout_with(a, base_indent, tags);
+            let lb = layout_with(b, base_indent, tags);
             la.extend(lb);
             la
         }
-        Node::Nest(k, inner) => layout_with(inner, base_indent + k, wrap),
+        Node::Nest(k, inner) => layout_with(inner, base_indent + k, tags),
         Node::Highlight(style, inner) => {
-            // Re-wrap each rendered line's content separately. This coincides
-            // with Haskell's `withTag` (Html.hs:59-64) only for single-line
-            // spans: `withTag` splices ONE open tag before and ONE close tag
-            // after the whole `inner` document, so a multi-line highlight is
-            // `<span>line1<br/>line2</span>`, whereas this per-line wrapping
-            // emits `<span>line1</span>` ... `<span>line2</span>`. Highlights
-            // are overwhelmingly single tokens, so this rarely diverges.
-            let mut ls = layout_with(inner, base_indent, wrap);
-            for line in ls.iter_mut() {
-                line.content = wrap(*style, &line.content);
+            // Haskell `withTag` (Html.hs:59-64) is `open <> inner <> close`:
+            // one `open` tag glued before the whole inner doc and one `close`
+            // after it. We mirror that exactly — prepend `open` to the first
+            // laid-out line's content and append `close` to the last line's
+            // content, leaving intermediate lines bare. So a multi-line span
+            // renders `<span ...>line1\nline2</span>`. The open tag goes onto
+            // the line *content* (after any indentation), matching HS where the
+            // zero-width tag follows the line's leading spaces.
+            let mut ls = layout_with(inner, base_indent, tags);
+            let (open, close) = tags(*style);
+            if let Some(first) = ls.first_mut() {
+                first.content.insert_str(0, &open);
+            }
+            if let Some(last) = ls.last_mut() {
+                last.content.push_str(&close);
             }
             ls
         }
@@ -401,12 +401,19 @@ mod tests {
     }
 
     #[test]
-    fn numbered_dot_basic() {
-        let d = numbered_dot(vec![Doc::text("alpha"), Doc::text("beta"), Doc::text("gamma")]);
-        // Haskell `numbered' = numbered (text "")` intersperses a (non-empty)
-        // `text ""` separator joined via `$-$`, producing a BLANK line between
-        // entries: "1. alpha\n\n2. beta\n\n3. gamma".
-        assert_eq!(d.render(), "1. alpha\n\n2. beta\n\n3. gamma");
+    fn numbered_intersperses_blank_separator() {
+        // Haskell `numbered (text "")` intersperses a (non-empty) `text ""`
+        // separator joined via `$-$`, producing a BLANK line between entries:
+        // "1 alpha\n\n2 beta\n\n3 gamma".
+        let d = numbered(
+            Doc::text(""),
+            vec![
+                Doc::text(" alpha"),
+                Doc::text(" beta"),
+                Doc::text(" gamma"),
+            ],
+        );
+        assert_eq!(d.render(), "1 alpha\n\n2 beta\n\n3 gamma");
     }
 
     #[test]
@@ -421,9 +428,9 @@ mod tests {
     fn highlight_passes_through_render() {
         let d = keyword(Doc::text("rule"));
         assert_eq!(d.render(), "rule");
-        let html = d.render_with(&|s, body| match s {
-            HighlightStyle::Keyword => format!("<kw>{}</kw>", body),
-            _ => body.to_string(),
+        let html = d.render_with(&|s| match s {
+            HighlightStyle::Keyword => ("<kw>".to_string(), "</kw>".to_string()),
+            _ => (String::new(), String::new()),
         });
         assert_eq!(html, "<kw>rule</kw>");
     }

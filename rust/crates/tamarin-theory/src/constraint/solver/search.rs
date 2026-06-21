@@ -16,17 +16,20 @@
 //! `cutOnSolvedDFS`.
 //!
 //! Termination is bounded by the ID-DFS depth alone (`MAX_DEPTH`,
-//! doubling from 4) — `cutOnSolvedDFS` has only `dMax` and no
-//! step/node budget.  NOTE: unlike Haskell's `cutOnSolvedDFS`
-//! (Proof.hs:855-861), which doubles `dMax` without an upper bound,
-//! we cap the doubling at 2048 as a Rust-only termination safety
-//! guard.  This only diverges on pathological proofs whose witness
-//! sits below single-path depth 2048 (far beyond any realistic
-//! Tamarin proof); the divergence is conservative (we report
-//! `Sorry`, never a wrong verdict) and at that depth unbounded
-//! Haskell would itself likely hang/OOM.  The per-lemma wall-clock
-//! deadline is a Rust-only addition, OFF by default (opt in via
-//! `TAM_PROVE_DEADLINE_MS`); see `proof_deadline`.
+//! doubling from 4) — `cutOnSolvedDFS` (Proof.hs:855-861) has only
+//! `dMax` and no step/node budget, doubling `dMax` from 4 with no
+//! upper bound.  HS terminates because it deepens over a finite proof
+//! tree (any TERMINATING lemma's tree is finite, so once `dMax`
+//! exceeds its depth `findSolved` returns `NoSolution` and HS stops);
+//! the effective bound is the actual proof depth, tens-to-low-hundreds
+//! of single-path steps for any real lemma.  We mirror the unbounded
+//! doubling, retaining only a far-out `DEPTH_CAP` (`usize::MAX / 4`)
+//! as a Rust-only loop-termination guard so a genuinely
+//! non-terminating proof strategy aborts rather than overflows.  No
+//! realistic Tamarin proof approaches this cap, so it never flips a
+//! verdict.  The per-lemma wall-clock deadline is a Rust-only
+//! addition, OFF by default (opt in via `TAM_PROVE_DEADLINE_MS`); see
+//! `proof_deadline`.
 
 use std::collections::BTreeMap;
 
@@ -155,10 +158,13 @@ fn disable_parallel_expand() -> bool {
     *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_PARALLEL_EXPAND").is_ok())
 }
 
-/// Per-lemma wall-clock cap on `run_proof_search`. Mirrors Haskell
-/// tamarin's `--prove-timeout` flag: when the search tree branches
-/// faster than CR-rules can prune (e.g. with a richer signature), we'd
-/// rather mark the lemma `Sorry` than spin forever.
+/// Per-lemma wall-clock cap on `run_proof_search`. This is a Rust-only,
+/// opt-in cap (`TAM_PROVE_DEADLINE_MS`) with NO Haskell counterpart — HS
+/// has no `--prove-timeout`-style flag. It exists so that when the search
+/// tree branches faster than CR-rules can prune (e.g. with a richer
+/// signature) a corpus sweep can mark the lemma `Sorry` rather than spin
+/// forever. It defaults to an effectively-infinite deadline so the default
+/// behaviour is HS-faithful (no cutoff).
 ///
 /// HS-faithful: HS has NO per-lemma wall-clock deadline — its iterative
 /// deepening runs to completion.  So by DEFAULT we apply NO cutoff either
@@ -179,18 +185,19 @@ fn proof_deadline() -> std::time::Instant {
 
 thread_local! {
     /// Thread-local per-search deadline. Set at the start of
-    /// `run_proof_search`, queried from `solve_action_goal` /
-    /// `solve_premise_goal` so wide case enumeration can short-circuit
-    /// when the wall-clock cap is hit (the recursion-only check only
-    /// fires between successive `expand` calls — a single
-    /// `exec_proof_method` enumerating thousands of cases would
-    /// otherwise sit unchecked).
+    /// `run_proof_search`, queried at the top of `exec_proof_method`
+    /// (proof_method.rs) as a per-step entry-guard so wide case
+    /// enumeration can short-circuit when the wall-clock cap is hit (the
+    /// recursion-only check only fires between successive `expand` calls
+    /// — a single `exec_proof_method` enumerating thousands of cases
+    /// would otherwise sit unchecked).
     static DEADLINE: std::cell::Cell<Option<std::time::Instant>> =
         const { std::cell::Cell::new(None) };
 
     /// ID-DFS depth limit for the current iteration.  `usize::MAX` =
-    /// no limit (default; matches pre-ID-DFS behaviour).  Set per
-    /// iteration in `run_proof_search`'s ID-DFS loop.
+    /// no limit (the thread-local's initial/reset value, used outside an
+    /// active search).  Set per iteration in `run_proof_search`'s ID-DFS
+    /// loop, which always starts at depth 4 and doubles up to the cap.
     static MAX_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
 
     /// Set to true by `expand` whenever a node hits `MAX_DEPTH`.  The
@@ -247,9 +254,6 @@ fn clear_deadline()                     { DEADLINE.with(|d| d.set(None));     }
 /// when the longer path is alphabetically earlier — critical for
 /// NSPK3/roles `injective_agree` where Haskell renders `case c_aenc`
 /// (shorter) over `case I_2` (alphabetically earlier but deeper).
-///
-/// `TAM_DISABLE_ID_DFS=1` falls back to single-pass with no depth limit
-/// (pre-ID-DFS behaviour) — useful for diagnosing regressions.
 pub fn run_proof_search(
     ctx: &ProofContext,
     initial: System,
@@ -282,9 +286,12 @@ pub fn run_proof_search(
             })
             .ok();
     }
-    let id_dfs_disabled = std::env::var("TAM_DISABLE_ID_DFS").is_ok();
-    let cap: usize = 2048;
-    let mut current_max_depth: usize = if id_dfs_disabled { usize::MAX } else { 4 };
+    // HS's `cutOnSolvedDFS` (Proof.hs:855-861) doubles `dMax` from 4 with NO
+    // upper bound; we mirror that, keeping only a far-out cap as a loop-
+    // termination guard for genuinely non-terminating strategies.  No real
+    // Tamarin proof approaches this depth, so the cap never flips a verdict.
+    let cap: usize = usize::MAX / 4;
+    let mut current_max_depth: usize = 4;
     let mut root = ProofNode {
         method: ProofMethod::Sorry(Some("initial".into())),
         sys: initial.clone(),
@@ -303,13 +310,13 @@ pub fn run_proof_search(
         // exploration of *wide* (but correct) trees prematurely: e.g.
         // csf17 keylessssl-modified::exists_detect_no_C_compromise, whose
         // witness is reachable but sits beneath a broad fan-out of
-        // contradiction branches.  Once the loop-breaker count was made
-        // HS-faithful (wider, correct source cases), a too-small step
-        // budget turned a Solved exists-trace into Sorry.  HS never hits
-        // this because it has no budget — so neither do we.  `MAX_DEPTH`
-        // (capped at 2048) guarantees termination; `deadline` catches
-        // wall-clock runaway.  `max_steps` is retained in the signature
-        // for callers but no longer used as a terminal cutoff.
+        // contradiction branches.  A finite step budget can turn a Solved
+        // exists-trace into Sorry once the loop-breaker count is HS-faithful
+        // (wider source cases), so we run unbudgeted as HS does: `MAX_DEPTH`
+        // doubles unbounded (mirroring HS's `dMax`), with only the far-out
+        // `cap` (`usize::MAX / 4`) as a loop-termination guard, and `deadline`
+        // catching wall-clock runaway.  `max_steps` is accepted for call-site
+        // signature compatibility but is not used as a cutoff.
         let _ = max_steps;
         let mut budget = usize::MAX;
         if first_iter {
@@ -320,9 +327,6 @@ pub fn run_proof_search(
             // memoization — the cached tree IS the proof tree, only the
             // unforced "depth limit" thunks need (re-)expansion).
             re_expand_depth_limited(ctx, &mut root, &mut budget, &deadline, 0);
-        }
-        if id_dfs_disabled {
-            break;
         }
         if matches!(root.status, NodeStatus::Solved | NodeStatus::Contradictory) {
             break;
@@ -540,11 +544,10 @@ fn expand_inner(
             depth, *budget, node.sys.nodes.len(), node.sys.goals.len());
     }
     crate::state_trace::emit("expand", None, &node.sys);
-    // HS-faithful unconditional [STATE] emission at every prove entry
-    // — mirrors `Theory.Proof.proveSystemDFS` calling `traceProveEntry`
-    // before each prove call.  Without this, Rust's TAM_RS_TRACE_STATE
-    // only fires from SolveGoal dispatch (proof_method.rs), missing
-    // Simplify / Induction / Finished steps that HS records.
+    // Rust-only diagnostic [STATE] emission (gated by TAM_RS_TRACE_STATE)
+    // placed at every prove entry so Simplify / Induction / Finished
+    // steps are recorded, not just SolveGoal dispatch (proof_method.rs).
+    // It has no Haskell counterpart and does not affect --prove output.
     crate::constraint::solver::trace::trace_state(&node.sys);
     // ID-DFS depth limit (Haskell `cutOnSolvedDFS` Proof.hs:855-877).
     //
@@ -707,11 +710,16 @@ fn expand_inner(
     // monad strategy.  We do the equivalent by running each child's
     // `expand` on a rayon worker.  Faithful: case sort order, per-child
     // sys cloning, rollup semantics are unchanged.  Trade-off: parallel
-    // mode loses the `any_solved` early-break short-circuit (HS's
-    // parTraversable also forces all elements; it doesn't have lazy
-    // per-element short-circuit), so on exists-trace lemmas we may
-    // explore siblings HS's foldMap would prune.  Bounded by rayon's
-    // global pool sized via `--processors=N`.
+    // mode drops the `any_solved` early-break short-circuit, so it may
+    // explore siblings HS's lazy `foldMap` would prune.  This is
+    // output-neutral wasted work: `run_proof_search` finishes by calling
+    // `extract_solved_path`, which walks `node.children` (a key-sorted
+    // BTreeMap) and prunes to the first Solved leaf in key order —
+    // re-imposing exactly HS's `foldMap` + `extractSolved` first-in-map
+    // selection.  The extra exploration only costs CPU; the pruned output
+    // is identical.  Gated off for exists-trace lemmas (see below) so we
+    // never pay that cost where the early-break matters for speed.
+    // Bounded by rayon's global pool sized via `--processors=N`.
     //
     // Thread-locals propagated to workers: MAX_DEPTH (read-only), and
     // DEPTH_LIMIT_HIT (each worker sets its local, aggregated OR after
@@ -763,9 +771,9 @@ fn expand_inner(
             // The original parallel branch shared `ctx.maude`'s
             // `Arc<AtomicU64> fresh_counter` across sibling workers.
             // Multiple sites mutate this counter as a side-effect of
-            // ordinary solving (proof_method.rs:288 `reset_counter_to`,
-            // reduction.rs:91 `ensure_above`, sources.rs:7262/7277/7280
-            // `ensure_above`/`reset_counter_to`/`reserve_idxs`, the
+            // ordinary solving (`reset_counter_to` in proof_method.rs,
+            // `ensure_above` in reduction.rs, `ensure_above`/
+            // `reset_counter_to`/`reserve_idxs` in sources.rs, the
             // per-var `reserve_idxs(1)` in `freshen_system_some_inst`).
             // Under rayon, two workers' interleavings race on these
             // ops: worker A's apply_source allocates LVar indices that
@@ -778,8 +786,9 @@ fn expand_inner(
             // steps across runs (default --processors).
             //
             // HS-faithful fix: HS's `runReduction m ctxt sys (avoid sys)`
-            // is called per child case (ProofMethod.hs:443) with a
-            // FRESH FreshT counter seeded from `avoid sys`.  In HS
+            // is called per child case (ProofMethod.hs:306, inside
+            // `process`) with a FRESH FreshT counter seeded from
+            // `avoid sys`.  In HS
             // siblings never share a counter — each child case has
             // its own FreshT.  We mirror that by cloning `ctx.maude`
             // with its OWN `fresh_counter` per worker, seeded the
@@ -940,7 +949,8 @@ pub fn candidate_methods(
     // to Sorry whenever the top goal was un-solvable — even if a
     // lower-ranked goal could have made progress.
     //
-    // `depth` drives round-robin heuristic scheduling (ProofMethod.hs:802-811).
+    // `depth` drives round-robin heuristic scheduling (ProofMethod.hs:581-589,
+    // `useHeuristic`'s `rankings !! (depth `mod` n)`).
     let goals_result = crate::constraint::solver::goals::rank_goals_with(sys, Some(ctx), depth);
     let goals = match goals_result {
         Ok(gs) => gs,
@@ -954,7 +964,8 @@ pub fn candidate_methods(
         Err(e) => {
             // Oracle exec failed — hard abort.  HS behaviour: uncaught IO
             // exception → whole tamarin-prover invocation dies with
-            // EMPTY stdout (ProofMethod.hs:829 `readProcess` throws).
+            // EMPTY stdout (ProofMethod.hs:608, inside `oracleRanking`
+            // under `unsafePerformIO`, where `readProcess` throws).
             // Mirror exactly: print to stderr, flush stdout (so nothing
             // is printed), exit with code 1.
             eprintln!("tamarin-prover: {}", e);

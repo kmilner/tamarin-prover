@@ -437,10 +437,11 @@ pub fn get_remaining_rule_applications<I>(
     }
 }
 
-/// `setRemainingRuleApplications`: writes a new budget into a
-/// destruction rule's `paciRemainingApplications` field.  Non-destr
-/// rules are returned unchanged.  Mirrors Haskell
-/// `setRemainingRuleApplications` (Theory/Model/Rule.hs:807-811).
+/// `setRemainingRuleApplications`: writes a new budget into the
+/// DestrRule remaining-applications Int field (the 2nd field of
+/// `DestrRule name n subterm constant`).  Non-destr rules are returned
+/// unchanged.  Mirrors Haskell `setRemainingRuleApplications`
+/// (Theory/Model/Rule.hs:807-811).
 ///
 /// Used by `solve_chain_goal` EXTEND to decrement the destructor's
 /// remaining budget when chaining into another instance of the same
@@ -468,7 +469,9 @@ pub fn set_remaining_rule_applications<I>(
 /// otherwise the `forbiddenEdge` same-rule loop-breaker
 /// (Goals.hs) never fires for destructors, letting `solveChain`
 /// recurse indefinitely through `d_0_sdec → d_0_sdec → ...` chains that
-/// Haskell prunes after one application (per `paciRemainingApplications`).
+/// Haskell prunes after one application (per the DestrRule
+/// remaining-applications counter — `getRemainingRuleApplications` /
+/// `setRemainingRuleApplications`, Rule.hs:801-811).
 pub fn rule_name_string(
     rule: &RuleACInst,
 ) -> String

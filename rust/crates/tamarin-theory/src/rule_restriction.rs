@@ -304,6 +304,7 @@ fn rewrite_atom(a: &p::Atom, bound: &[String], st: &mut RewriteState) -> p::Atom
 ///   - `FApp _ as`, any free & no bound → substitute the WHOLE term
 ///   - `FApp f as`, any free & any bound → recurse into args
 ///   - otherwise                  → keep
+///
 /// where free/bound are computed with `varNow` treated as NOT free.
 fn rewrite_term(t: &p::Term, bound: &[String], st: &mut RewriteState) -> p::Term {
     match t {
@@ -409,22 +410,13 @@ fn var_key(v: &p::VarSpec) -> (String, u64) {
     (v.name.clone(), v.idx)
 }
 
-/// HS `freesList`: all free vars in first-appearance order, WITH
-/// duplicates removed only by the `D.toList` dlist (HS keeps duplicates in
-/// `freesList`, but `getBVarTerms`/`getVarTerms` then feed the action fact;
-/// for the formulas this pass produces every free var occurs once after
-/// abstraction, so first-appearance dedup matches HS output).
+/// HS `freesList` (LTerm.hs:578-585): all free vars in first-appearance order,
+/// keeping duplicates. After `rewrite` each free var is a unique fresh var, so
+/// first-appearance dedup here is identical to HS's un-deduped `freesList`.
 fn frees_list(f: &p::Formula) -> Vec<p::VarSpec> {
     let mut out: Vec<p::VarSpec> = Vec::new();
     let mut bound: Vec<String> = Vec::new();
     collect_frees_formula(f, &mut bound, &mut out);
-    // HS `freesDList` is a difference list of every free occurrence (with
-    // repeats); `getBVarTerms`/`getVarTerms` rely on positional `freesList`.
-    // We dedup by (name,idx,sort) keeping first appearance — the rewritten
-    // formula introduces each fresh var exactly once on the LHS but it may
-    // recur (e.g. an abstracted var reused), and HS's action fact would
-    // then list it once per the `nub`-free `freesList`… in practice the
-    // abstracted vars are distinct, so first-appearance is the HS order.
     dedup_first(out)
 }
 

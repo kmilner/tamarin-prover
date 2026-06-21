@@ -244,7 +244,10 @@ pub fn pp_theory(msig: &MaudeSig) -> String {
     }
     if msig.enable_dh {
         op_eq(&mut out, "one", "-> Msg");
-        op_eq(&mut out, "DH-neutral", "-> Msg");
+        // HS `theoryOpEq "DH-neutral  : -> Msg"` (Parser.hs:209) has TWO
+        // spaces before the colon; the trailing space on the name reproduces
+        // that so `format!("{} : {}")` yields `DH-neutral  : -> Msg`.
+        op_eq(&mut out, "DH-neutral ", "-> Msg");
         op_eq(&mut out, "exp", "Msg Msg -> Msg");
         op_ac(&mut out, "mult", "Msg Msg -> Msg");
         op_eq(&mut out, "inv", "Msg -> Msg");
@@ -331,7 +334,17 @@ fn emit_rrule(out: &mut String, rule: &RRule<crate::lterm::LNTerm>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::maude_sig::pair_maude_sig;
+    use crate::maude_sig::{dh_maude_sig, pair_maude_sig};
+
+    #[test]
+    fn dh_neutral_op_has_two_spaces_before_colon() {
+        // HS `theoryOpEq "DH-neutral  : -> Msg"` (Parser.hs:209) emits TWO
+        // spaces before the colon; the emitted module must match byte-for-byte.
+        let s = pp_theory(&dh_maude_sig());
+        assert!(s.contains("op tamXCDH-neutral  : -> Msg ."));
+        // Guard against accidentally emitting only a single space.
+        assert!(!s.contains("op tamXCDH-neutral : -> Msg ."));
+    }
 
     #[test]
     fn theory_for_pair_is_well_formed() {

@@ -34,20 +34,31 @@
 //!
 //! ## Replay strategy in this port
 //!
-//! We diverge slightly from HS's structure: HS first annotates the
-//! parsed skeleton with `(Just System)` at each node via
-//! `unprovenLookAhead`, then replaces Sorrys.  We do it in one pass —
-//! at every non-Sorry node we exec the proof method, get the case
-//! list, and recurse into each.  At Sorry leaves and at unmatched-case
-//! children we fall through to [`run_proof_search`].
+//! The full HS `--prove` flow runs in two passes that this one-pass
+//! walker folds together:
+//!   1. close-time `checkAndExtendProver (sorryProver Nothing)`
+//!      (`proveTheory (const True) checkProof`, Prover.hs:174-185) over
+//!      ALL lemmas — it re-execs each stored step, keeping the verbatim
+//!      structure and turning any step that no longer applies into an
+//!      annotated `sorry /* invalid proof step encountered */`;
+//!   2. prove-time `replaceSorryProver $ runAutoProver` (TheoryLoader.hs:606)
+//!      over the lemmas the `--prove` selector targets — it re-runs the
+//!      auto-prover at every annotated `sorry` leaf.
+//!
+//! We do both in one pass: at every non-Sorry node we exec the proof
+//! method, get the case list, and recurse into each; at Sorry leaves and
+//! at unmatched-case children we fall through to [`run_proof_search`]
+//! (target lemmas) or emit an annotated/unannotated `sorry` (non-target
+//! lemmas, via `auto_prove == false`).
 //!
 //! This matches HS's end result for any skeleton whose
 //! `exec_proof_method`-produced case names match the skeleton's
 //! child names — which is the normal case, since HS produced those
 //! names in the first place.  When names diverge (e.g. a case the
 //! user's skeleton has but our prover's `exec_proof_method` doesn't
-//! produce, or vice versa), we conservatively fall back to the
-//! auto-prover at that subtree.
+//! produce, or vice versa), we mirror `checkProof`'s `mergeMapsWith`
+//! handling: stored-only cases are kept verbatim and runtime-only cases
+//! are auto-proved (target) or annotated-sorry'd (non-target).
 
 use std::collections::BTreeMap;
 
@@ -217,20 +228,16 @@ fn replay_node(
     }
 
     // `by contradiction` leaf → emit a Finished(Contradictory) node if
-    // a contradiction can actually be derived; else fall back to the
-    // auto-prover (HS would have left a `Sorry` here at proof-display
-    // time, but at proof-replay time HS runs `oneStepProver
-    // (Finished (Contradictory Nothing))` which fails if no
-    // contradiction exists — and `replaceSorryProver` falls through
-    // to the original Sorry).  We diverge slightly: rather than emit
-    // a useless Sorry, we re-run the auto-prover to give the user a
-    // best-effort proof.  This is acceptable because:
-    //   (a) `by contradiction` in the .spthy file means the user
-    //       believed the system is contradictory at this point;
-    //   (b) if our prover agrees, we emit the same Finished node;
-    //   (c) if our prover doesn't (a faithfulness divergence
-    //       elsewhere), the auto-prover will find a valid proof or
-    //       Sorry — neither lies about the result.
+    // a contradiction can actually be derived; else fall through to the
+    // auto-prover.  This is HS-faithful, not a divergence: at close time
+    // `checkProof` re-execs the stored `Finished (Contradictory Nothing)`
+    // step (`checkAndExecProofMethod`, Proof.hs:456); if the system is no
+    // longer contradictory the method returns `Nothing`, so checkProof
+    // emits `sorryNode (Just "invalid proof step encountered") ...`
+    // (Proof.hs:459-461) carrying `Just sys`.  For a `--prove`-selected
+    // lemma `replaceSorryProver` then re-runs the auto-prover on that
+    // annotated sorry (Prover.hs:185 → TheoryLoader.hs:606), exactly the
+    // `run_proof_search` fall-through below.
     if matches!(node.method, ParsedMethod::Contradiction) && node.cases.is_empty() {
         if let Some(MethodResult::Contradictory(_)) = is_finished(ctx, &sys) {
             // HS replay (checkProof, Proof.hs) preserves the
@@ -259,10 +266,15 @@ fn replay_node(
     }
 
     // `SOLVED` leaf (HS Proof.hs:102-103).  If runtime is_finished
-    // agrees, emit Finished(Solved); else fall back to the auto-prover
+    // agrees, emit Finished(Solved); else fall through to the auto-prover
     // (whose run_proof_search may simplify/contract further until it
-    // reaches Solved naturally).  Skeleton's SOLVED is HS's claim;
-    // RS verifies via its own solver.
+    // reaches Solved naturally).  The fall-through is exactly HS's
+    // pipeline: close-time `checkProof` marks the stale `Finished Solved`
+    // an annotated `sorry /* invalid proof step encountered */`
+    // (Proof.hs:459-461), and for a `--prove`-selected lemma
+    // `replaceSorryProver` then reproves it (Prover.hs:185 →
+    // TheoryLoader.hs:606).  Skeleton's SOLVED is HS's claim; RS verifies
+    // via its own solver.
     if matches!(node.method, ParsedMethod::SolvedLeaf) && node.cases.is_empty() {
         if let Some(MethodResult::Solved) = is_finished(ctx, &sys) {
             return ProofNode {
@@ -425,11 +437,16 @@ fn replay_node(
 
     // For runtime cases NOT covered by the skeleton (e.g. skeleton was
     // stale and a new case appeared), invoke the auto-prover on each.
-    // HS's `replaceSorryProver` doesn't have this branch because HS
-    // parses the skeleton AFTER having built the tree-with-systems —
-    // they always match by construction.  In our port the skeleton is
-    // parsed from text BEFORE the runtime systems exist, so drift is
-    // possible.  Honest fallback.
+    // This is HS-faithful: `checkProof`'s `mergeMapsWith` treats the
+    // runtime-produced cases as the LEFT map and the stored skeleton's
+    // children as the RIGHT map (Proof.hs:463 `mergeMapsWith
+    // unhandledCase noSystemPrf (go (d+1)) cases cs`), so a runtime-only
+    // case (present left, absent right) goes through `unhandledCase =
+    // mapProofInfo (Nothing,) . prover d` (Proof.hs:462) → an annotated
+    // `sorry Nothing (Just se)`.  For a `--prove`-selected lemma
+    // `replaceSorryProver` then auto-proves that annotated sorry
+    // (Prover.hs:185 → TheoryLoader.hs:606), matching the
+    // `run_proof_search` branch below.
     let already_covered: std::collections::BTreeSet<String> =
         children.keys().cloned().collect();
     for (rt_name, rt_sys) in produced.into_iter() {
@@ -626,7 +643,7 @@ fn cases_compatible(produced: &[(String, System)], skel: &[&str]) -> bool {
 }
 
 fn sort_cases(mut cases: Vec<(String, System)>) -> Vec<(String, System)> {
-    // Mirror search.rs:621 (block at 610-619): cases are visited in
+    // Mirror search.rs:688 (block at 683-692): cases are visited in
     // alphabetical order so name-based skeleton matching is deterministic.
     cases.sort_by(|a, b| a.0.cmp(&b.0));
     cases
@@ -673,7 +690,7 @@ fn resolve_method(parsed: &ParsedMethod, sys: &System) -> Option<ProofMethod> {
 /// (`build_fact` stuffs it into a `Term::Var` name).  We recover the
 /// canonical runtime term by re-parsing that text (`parse_term_str`) and
 /// converting it through the SAME smart constructors the runtime uses
-/// ([`parse_arg_to_lnterm`] → `term_to_lnterm`, elaborate.rs:1448: sorts via
+/// ([`parse_arg_to_lnterm`] → `term_to_lnterm`, elaborate.rs:1542: sorts via
 /// sigil, AC flattened+sorted via `f_app_ac`, pairs right-nested,
 /// unary-builtins folded, `em` as a C-symbol).  Two terms in that canonical
 /// form are equal iff HS's `M.member` would treat the goals as equal, so a
@@ -708,7 +725,7 @@ fn fact_terms_match_exact(
 /// Re-parse a skeleton fact-argument's raw text into a canonical runtime
 /// [`LNTerm`] (the same representation runtime goals use), for exact `==`
 /// comparison.  `parsed_term_of_arg` recovers the surface AST from the
-/// `Term::Var` name shim; `term_to_lnterm` (elaborate.rs:1448) is HS's
+/// `Term::Var` name shim; `term_to_lnterm` (elaborate.rs:1542) is HS's
 /// `fact llit` term construction (it reads the live elaboration context for
 /// user function symbols, which is in scope during proof-search replay).
 fn parse_arg_to_lnterm(

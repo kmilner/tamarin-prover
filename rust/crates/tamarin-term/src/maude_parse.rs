@@ -219,6 +219,14 @@ fn parse_substitutions(msig: &MaudeSig, c: &mut Cursor) -> Result<Vec<MSubst>, P
                 break;
             }
         }
+        // HS `parseSubstitution` (Parser.hs:293) uses `many1 parseEntry` for
+        // the non-`empty substitution` branch, requiring at least one entry.
+        // (The `empty substitution` line is handled separately above.)
+        if entries.is_empty() {
+            return Err(ParseError(
+                "expected at least one substitution entry (many1)".into(),
+            ));
+        }
         substs.push(entries);
     }
     // Haskell `parseUnifyReply`/`parseMatchReply` (Parser.hs:258-270) wrap
@@ -267,8 +275,10 @@ fn parse_sort(c: &mut Cursor) -> Result<LSort, ParseError> {
     else if c.eat_str(b"TamNat") { Ok(LSort::Nat) }
     else if c.eat_str(b"Msg") { Ok(LSort::Msg) }
     else if c.eat_str(b"M") {
-        // `Msg` was matched above; the special-case in Haskell handles
-        // a `Maude` truncation. Recover any continuation.
+        // HS `parseSort` (Parser.hs:310-311) parses sort `Msg` as
+        // `string "M" *> string "sg"` (marked `FIXME: why?`); the explicit
+        // `Msg` branch above plus this `M`+`sg` branch reproduce it. Both
+        // accept exactly the byte sequence `Msg`.
         if c.eat_str(b"sg") { Ok(LSort::Msg) }
         else { Err(ParseError("unknown sort starting with M".into())) }
     }
@@ -413,6 +423,14 @@ mod tests {
     fn parse_no_match() {
         let r = parse_match_reply(&pair_maude_sig(), b"No match.\n").unwrap();
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn parse_substitution_requires_entry() {
+        // HS `many1 parseEntry`: a `Solution` header followed by neither
+        // `empty substitution` nor an `xN` entry must fail the whole parse.
+        let r = parse_unify_reply(&pair_maude_sig(), b"\nSolution 1\n\n");
+        assert!(r.is_err());
     }
 
     #[test]

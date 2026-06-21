@@ -56,7 +56,7 @@ pub struct ProofContext {
     /// identified by their first argument (the "injective" facts).
     /// Mirrors Haskell's `pcInjectiveFactInsts`.
     pub injective_fact_insts: Vec<(crate::fact::FactTag,
-        Vec<crate::tools::injective_fact_instances::MonotonicBehaviour>)>,
+        Vec<Vec<crate::tools::injective_fact_instances::MonotonicBehaviour>>)>,
     /// Precomputed source-case enumerations.  For each non-special
     /// protocol-fact tag, holds the disjunction of derivation cases
     /// computed once at theory-load time.  `solve_premise_goal`
@@ -103,8 +103,9 @@ pub struct ProofContext {
     pub pc_true_subterm: bool,
     /// The goal ranking list for this lemma, mirroring HS's
     /// `Heuristic ProofContext = Heuristic [GoalRanking ProofContext]`
-    /// (System.hs:527).  `None` ⇒ HS's `defaultHeuristic False`
-    /// (`[SmartRanking False]`).  Resolved per-lemma in `prove_lemma`
+    /// (System.hs:522).  `None` ⇒ HS's `defaultHeuristic False`
+    /// (`defaultRankings False = [SmartRanking False]`, System.hs:527).
+    /// Resolved per-lemma in `prove_lemma`
     /// (per-lemma `[heuristic=..]` overrides the theory-level directive,
     /// matching `apDefaultHeuristic <|> pcHeuristic`).
     /// Round-robin scheduling: depth d → `rankings[d % n]`
@@ -198,8 +199,8 @@ impl ProofContext {
 
     /// HS-faithful lazy `saturateSources` (Sources.hs:373).  Runs at
     /// most once per `ProofContext`: forces `initial_source_cases`
-    /// for each source in `full_sources`, then iterates
-    /// `saturate_sources_with_chain_fold` to convergence.  Subsequent
+    /// for each source in `full_sources`, then drives
+    /// `saturate_sources_with_simp` to convergence.  Subsequent
     /// calls no-op via the `saturate_state` flag.
     ///
     /// Triggered by `Source::cases(ctx)` on first force.  Trivial
@@ -247,18 +248,10 @@ impl ProofContext {
         }
         // HS-faithful `saturate_sources_with_simp` (mirrors HS's
         // `saturateSources` driven by `solveAllSafeGoals` as the
-        // proofStep).  Trace work-count closes from ~10-60× off
-        // (with the chain-fold shortcut) to ~3-10× off.
-        //
-        // The chain-fold path (`saturate_sources_with_chain_fold`)
-        // collapses HS's per-step `insertEdges`/`solveTermEqs`/
-        // `exploitPrems` work into a single graft operation,
-        // producing the same final case set with far fewer trace
-        // events — efficient but not HS-faithful.  We use simp here
-        // and investigate the resulting verdict regressions
-        // (currently 7 exists-trace lemmas where Rust falsifies and
-        // HS verifies) as separate missing-HS-behaviour bugs rather
-        // than reverting to the trace-divergent chain-fold path.
+        // proofStep): each iteration performs HS's per-step
+        // `insertEdges`/`solveTermEqs`/`exploitPrems` work, so the
+        // emitted trace matches HS's saturation rather than collapsing
+        // it into a single graft operation.
         let raw: Vec<crate::constraint::solver::sources::Source> =
             self.full_sources.to_vec();
         let saturated = crate::constraint::solver::sources::saturate_sources_with_simp_public(
@@ -603,27 +596,17 @@ impl ProofContext {
                 .any(|f| f.terms.iter().any(&term_has_reducible))
                 || r.new_vars.iter().any(&term_has_reducible)
         };
-        // Rule-variant plumbing: enabled by default to match Haskell's
-        // `variantsProtoRule` behaviour. Broadens search for protocols
-        // with destructors in conclusions (e.g. T&D::Responder), which
-        // is required to find destructor-narrowed exists-trace
-        // witnesses (e.g. T&D::Public_part_public). The cost is extra
-        // case-splitting on typing/secrecy lemmas in the same
-        // protocols, which can exhaust the per-lemma deadline on
-        // budget-tight harnesses. Set TAM_DISABLE_VARIANTS=1 to fall
-        // back to raw (variant-free) rules for performance debugging.
-        let var_disabled = std::env::var("TAM_DISABLE_VARIANTS").is_ok();
-        // Compute variants up front but DON'T install them yet — we want
-        // precompute_full_sources/precompute_sources to see only the raw
-        // rules. Installing variants at precompute time multiplies the
-        // [sources]-typing case enumeration by N variants per
-        // destructor rule, which causes typing/secrecy lemmas in
-        // destructor-using protocols (NSLPK3 types, T&D type_assertion,
-        // JCS12 typing_assertion, etc.) to blow past the search budget.
-        // Variants are installed *after* source precomputation but
-        // *before* `saturate_sources_with_chain_fold`, so chain-fold —
-        // which is the only path that actually needs destructor-
-        // narrowed alternatives — can still enumerate them.
+        // Rule-variant plumbing: matches Haskell's `variantsProtoRule`
+        // behaviour. Broadens search for protocols with destructors in
+        // conclusions (e.g. T&D::Responder), which is required to find
+        // destructor-narrowed exists-trace witnesses (e.g.
+        // T&D::Public_part_public).
+        // Compute the variants up front; they are installed onto
+        // `ctx.rules` BEFORE source precomputation so that
+        // `precompute_full_sources`/`precompute_sources` see the
+        // variant-expanded rule set, matching HS (whose precompute runs
+        // over `cprRuleAC` = the variant-expanded AC rules; Rule.hs:97,
+        // Rule.hs:156).
         let mut computed_variants: Vec<(usize, Vec<crate::rule::ProtoRuleAC>)> =
             Vec::new();
         let mut computed_variant_substs:
@@ -649,72 +632,70 @@ impl ProofContext {
         // RS's gsNr trace from HS's at every destructor-free `labelNodeId`
         // (e.g. Yubikey.spthy::Server, Yubikey.spthy::Setup), which the
         // smart-rank tie-breaker then resolved differently.
-        if !var_disabled {
-            for (idx, o) in rules.iter().enumerate() {
-                if !o.variants.is_empty() { continue; }
-                // Pre-applied variant *rules* (legacy path) and the
-                // abstracted-rule form only make sense when the rule has
-                // reducible-headed sub-terms — otherwise they degenerate to
-                // duplicates of the canonical rule.
-                let has_reducible = rule_has_reducible(&o.rule);
-                if has_reducible {
-                    if let Ok(vs) = crate::tools::rule_variants::expand_rule_variants(
-                        &maude, &o.rule, &reducible_syms) {
-                        if !vs.is_empty() {
-                            if dbg_variants {
-                                eprintln!("[VARIANTS] rule={:?} expanded into {} variants",
-                                    o.rule.info.name, vs.len());
-                                for (i, v) in vs.iter().enumerate() {
-                                    eprintln!("  [{}] concs: {:?}", i,
-                                        v.conclusions.iter()
-                                            .map(|c| format!("{:?}={:?}", c.tag, c.terms))
-                                            .collect::<Vec<_>>());
-                                }
+        for (idx, o) in rules.iter().enumerate() {
+            if !o.variants.is_empty() { continue; }
+            // Pre-applied variant *rules* and the abstracted-rule form
+            // only make sense when the rule has reducible-headed
+            // sub-terms — otherwise they degenerate to duplicates of the
+            // canonical rule.
+            let has_reducible = rule_has_reducible(&o.rule);
+            if has_reducible {
+                if let Ok(vs) = crate::tools::rule_variants::expand_rule_variants(
+                    &maude, &o.rule, &reducible_syms) {
+                    if !vs.is_empty() {
+                        if dbg_variants {
+                            eprintln!("[VARIANTS] rule={:?} expanded into {} variants",
+                                o.rule.info.name, vs.len());
+                            for (i, v) in vs.iter().enumerate() {
+                                eprintln!("  [{}] concs: {:?}", i,
+                                    v.conclusions.iter()
+                                        .map(|c| format!("{:?}={:?}", c.tag, c.terms))
+                                        .collect::<Vec<_>>());
                             }
-                            let lb = o.loop_breakers.clone();
-                            let mut vs = vs;
-                            for v in vs.iter_mut() {
-                                v.info.loop_breakers = lb.clone();
-                            }
-                            computed_variants.push((idx, vs));
                         }
+                        let lb = o.loop_breakers.clone();
+                        let mut vs = vs;
+                        for v in vs.iter_mut() {
+                            v.info.loop_breakers = lb.clone();
+                        }
+                        computed_variants.push((idx, vs));
                     }
                 }
-                // Compute the variant substitutions in their raw form
-                // (Haskell `RuleACConstrs = Disj LNSubstVFresh`) — these
-                // will be installed as a SplitG goal at search time via
-                // `solve_rule_constraints`, mirroring Haskell's
-                // `solveRuleConstraints` (Reduction.hs:766-774).
-                //
-                // HS-faithful: ALWAYS attempt the computation, even for
-                // non-destructor rules where the result is `[emptySubstVFresh]`
-                // (`trueDisj`, RuleVariants.hs:120).  The downstream
-                // `solve_rule_constraints` path treats `Some([empty])` as a
-                // trivial-but-real Split that bumps `next_goal_nr` and lets
-                // simp's `simp_singleton` fold the disj — matching HS's
-                // `insertGoal (SplitG _) False ; simp _ _ eqs` order.
-                if let Ok(substs) = crate::tools::rule_variants::variant_substs_for_rule(
-                    &maude, &o.rule) {
-                    if !substs.is_empty() {
-                        computed_variant_substs.push((idx, substs));
-                    }
+            }
+            // Compute the variant substitutions in their raw form
+            // (Haskell `RuleACConstrs = Disj LNSubstVFresh`) — these
+            // will be installed as a SplitG goal at search time via
+            // `solve_rule_constraints`, mirroring Haskell's
+            // `solveRuleConstraints` (Reduction.hs:766-774).
+            //
+            // HS-faithful: ALWAYS attempt the computation, even for
+            // non-destructor rules where the result is `[emptySubstVFresh]`
+            // (`trueDisj`, RuleVariants.hs:120).  The downstream
+            // `solve_rule_constraints` path treats `Some([empty])` as a
+            // trivial-but-real Split that bumps `next_goal_nr` and lets
+            // simp's `simp_singleton` fold the disj — matching HS's
+            // `insertGoal (SplitG _) False ; simp _ _ eqs` order.
+            if let Ok(substs) = crate::tools::rule_variants::variant_substs_for_rule(
+                &maude, &o.rule) {
+                if !substs.is_empty() {
+                    computed_variant_substs.push((idx, substs));
                 }
-                // Compute the abstracted-rule + variant disjunction
-                // (Haskell-faithful `variantsProtoRule` with `abstrRule`).
-                // Reducible-headed sub-terms in the rule's facts are
-                // replaced by fresh `z_i` vars, and the variant
-                // disjunction is keyed by those.  Without this, the
-                // canonical rule's destructor restrictions fire on
-                // un-narrowed forms and contradict before the SplitG
-                // can resolve.  Only meaningful when the rule has
-                // reducible-headed sub-terms.
-                if has_reducible {
-                    if let Ok(Some((abstr, av_substs))) =
-                        crate::tools::rule_variants::abstract_rule_and_variants(
-                            &maude, &o.rule)
-                    {
-                        computed_abstracted_rules.push((idx, abstr, av_substs));
-                    }
+            }
+            // Compute the abstracted-rule + variant disjunction
+            // (Haskell-faithful `variantsProtoRule` with `abstrRule`).
+            // Reducible-headed sub-terms in the rule's facts are
+            // replaced by fresh `z_i` vars, and the variant
+            // disjunction is keyed by those.  Without this, the
+            // canonical rule's destructor restrictions fire on
+            // un-narrowed forms and contradict before the SplitG
+            // can resolve.  Only meaningful when the rule has
+            // reducible-headed sub-terms.
+            if has_reducible {
+                if let Ok(Some((abstr, av_substs))) =
+                    crate::tools::rule_variants::abstract_rule_and_variants(
+                        &maude, &o.rule)
+                {
+                    computed_abstracted_rules.push((idx, abstr, av_substs));
                 }
             }
         }
@@ -777,15 +758,10 @@ impl ProofContext {
         // uses the full variant-expanded rule set so cases with chain
         // edges across reducible-headed conclusions (like
         // `Receiver0b → Receiver0b_check` where `verify(...) = true`)
-        // already have the variant subst applied. Enable by default;
-        // TAM_NO_PRECOMPUTE_VARIANTS=1 forces the legacy
-        // (variants-after-precompute) behaviour for diagnostics.
-        let precompute_with_variants = std::env::var("TAM_NO_PRECOMPUTE_VARIANTS").is_err();
-        if precompute_with_variants {
-            for (idx, vs) in &computed_variants {
-                if let Some(o) = ctx.rules.get_mut(*idx) {
-                    o.variants = vs.clone();
-                }
+        // already have the variant subst applied.
+        for (idx, vs) in &computed_variants {
+            if let Some(o) = ctx.rules.get_mut(*idx) {
+                o.variants = vs.clone();
             }
         }
         // Install the raw variant substitutions in their disjunction form.
@@ -811,29 +787,6 @@ impl ProofContext {
             }
         }
         let raw_sources = crate::constraint::solver::sources::precompute_full_sources(&ctx);
-        if !precompute_with_variants {
-            for (idx, vs) in computed_variants {
-                if let Some(o) = ctx.rules.get_mut(idx) {
-                    o.variants = vs;
-                }
-            }
-        }
-        // Chain-fold saturator: lightweight order-sorted aligner
-        // for Proto-premise grafting + Maude-backed intruder-chain
-        // folding (Out / KD premises) so `coerce → irecv →
-        // <protocol>` chains collapse into a single saturated
-        // `case <protocol>`, matching Haskell's
-        // `solveAllSafeGoals`-driven saturation.
-        //
-        // This EXPOSES bugs in `refine_with_source_asms`'s typing
-        // refinement (task #99): typing-style lemmas that were
-        // previously sorrying now produce wrong verdicts because
-        // the grafted protocol-rule producers interact with
-        // incomplete typing-pruning logic.  The exposed bugs are
-        // real and the saturation is correct per Haskell; the right
-        // fix is to strengthen the refinement, not hide the
-        // exposure behind a weaker saturator.  See
-        // project_rust_proof_diff.md / project_rust_chain_fold.md.
         // HS-faithful lazy precompute: `saturateSources` (Sources.hs:373)
         // is *lazy in cdCases* — its `refineSource ctxt solver`
         // applications produce `Source`s whose updated `cdCases` is
@@ -847,25 +800,14 @@ impl ProofContext {
         // saturate-time `[EXEC] solveGoal / exploitPrems / ...` lines
         // are emitted.
         //
-        // The eager Rust `saturate_sources_with_chain_fold` call here
-        // would walk every source's cases regardless, defeating
-        // laziness.  Skipping it leaves `ctx.full_sources` as the
-        // unsaturated raw sources from `precompute_full_sources`;
-        // each `Source::cases(ctx)` call still runs `initial_source_cases`
-        // which does the per-source `initialSource` work but NOT the
-        // cross-source chain-fold saturation.  For trivial protocols
-        // this is sufficient (HS's saturate is also lazy for them);
-        // for protocols that need saturated chains, this is a
-        // regression that future work will close by porting saturate
-        // itself in a lazy form.
-        // HS-faithful lazy saturate: defer the
-        // `saturate_sources_with_chain_fold` call to the first
-        // `Source::cases(ctx)` call via `ProofContext::ensure_saturated`.
-        // `ctx.full_sources` holds the unsaturated raw sources from
-        // `precompute_full_sources` (each with `cases_cell = None`).
-        // No `[EXEC] solveGoal / exploitPrems / ...` lines fire here —
-        // they only fire when a lemma proof forces a source's cases
-        // via pattern-matching on its `cdCases` (HS-faithful).
+        // To preserve this laziness we defer saturation to the first
+        // `Source::cases(ctx)` call via `ProofContext::ensure_saturated`
+        // (which drives `saturate_sources_with_simp`).  `ctx.full_sources`
+        // holds the unsaturated raw sources from `precompute_full_sources`
+        // (each with `cases_cell = None`); no `[EXEC] solveGoal /
+        // exploitPrems / ...` lines fire here — they only fire when a
+        // lemma proof forces a source's cases via pattern-matching on its
+        // `cdCases` (HS-faithful).
         ctx.full_sources = raw_sources;
         // No saturation here — `ctx.full_sources` holds unsaturated
         // raw sources.  `prove_lemma` calls `ctx.ensure_saturated()`
@@ -877,14 +819,7 @@ impl ProofContext {
         // No post-saturate drop pass — Haskell doesn't have one.
         // Haskell relies on saturate-time `contradictoryIf` inside
         // `solveAllSafeGoals` (Sources.hs:118-133) + runtime
-        // contradiction detection during proof search.  Set
-        // `TAM_ENABLE_DROP_CONTRADICTORY=1` to re-enable the Rust
-        // workaround for measurement.
-        if std::env::var("TAM_ENABLE_DROP_CONTRADICTORY").is_ok() {
-            let prev_full = std::mem::take(&mut ctx.full_sources);
-            ctx.full_sources = crate::constraint::solver::sources::drop_contradictory_cases(
-                prev_full, &ctx);
-        }
+        // contradiction detection during proof search.
         ctx
     }
 }
@@ -1006,11 +941,15 @@ pub fn annotate_loop_breakers(
         for (i_to, _ru_to) in rules.iter().enumerate() {
             let ru_to_ac = ac_rules[i_to];
             for (to_prem_idx, prem_fa) in ru_to_ac.enumerate_premises() {
-                // Skip K-facts and built-ins — they're handled by intruder
-                // rules and never participate in protocol-rule loops.
-                if !matches!(prem_fa.tag, crate::fact::FactTag::Proto(_, _, _)) {
-                    continue;
-                }
+                // HS `dataflowRelAC` (LoopBreakers.hs:43-54) enumerates ALL
+                // premises (`enumPrems`, Rule.hs:246-247) with no tag filter;
+                // the only premise-level guard is `not (isNoSourcesFact …)`.
+                // Non-Proto premises are kept here too: the tag-equality
+                // (`c0.tag != prem_fa.tag`) + `unifiable_ln_facts` gates below
+                // already exclude any conclusion that cannot form an edge,
+                // exactly as HS's `unifiableLNFacts` does (it returns []
+                // whenever `factTag fa1 /= factTag fa2`, Fact.hs:442-446).
+                //
                 // Haskell `LoopBreakers.hs:48`:
                 //   `guard $ not (isNoSourcesFact premFa0)`
                 if prem_fa.is_no_sources() {

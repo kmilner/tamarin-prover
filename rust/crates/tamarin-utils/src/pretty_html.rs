@@ -52,7 +52,7 @@ pub fn with_tag(tag: &str, attrs: &[(&str, &str)], inner: &str) -> String {
     s
 }
 
-/// `closedTag tag attrs` → `<tag k="v" />`.
+/// `closedTag tag attrs` → `<tag k="v"/>`.
 pub fn closed_tag(tag: &str, attrs: &[(&str, &str)]) -> String {
     let mut s = String::new();
     s.push('<');
@@ -75,8 +75,14 @@ pub fn closed_tag(tag: &str, attrs: &[(&str, &str)]) -> String {
 /// expected to either feed already-safe text, or use `Doc::text` of escaped
 /// content when text might contain `< > & " '`.
 pub fn render_html_doc(doc: &Doc) -> String {
-    let body = doc.render_with(&|style, content| {
-        with_tag("span", &[("class", class_name(style))], content)
+    // `render_with` wraps each highlighted span once (HS `withTag`): the
+    // closure returns the `(open, close)` tag pair for a style.
+    let body = doc.render_with(&|style| {
+        let open = format!(
+            "<span class=\"{}\">",
+            escape_html_entities(class_name(style))
+        );
+        (open, "</span>".to_string())
     });
     postprocess(&body)
 }

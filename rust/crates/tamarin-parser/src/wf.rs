@@ -52,19 +52,20 @@ pub type WfReport = Vec<WfError>;
 /// can be compared directly against `tamarin-prover`'s output.
 pub fn check_theory(thy: &Theory) -> WfReport {
     // Mirrors HS `Theory.Tools.Wellformedness.checkWellformedness`
-    // (Wellformedness.hs:1270-1287), in HS check order: unbound,
+    // (Wellformedness.hs:1270-1287) and, for diff theories,
+    // `checkWellformednessDiff` (1248-1265), in HS check order: unbound,
     // freshNames, publicNames, ruleSorts (variable_sort_clashes),
-    // factReports, formulaReports, lemmaAttribute, multRestricted,
-    // natWellSorted, subtermConvergence, then message-derivation.
-    // `left_right_rule_report` (the diff-only Left/Right check) is
-    // interleaved here rather than where HS places `leftRightRuleReportDiff`.
+    // factReports, [leftRightRule (diff only)], formulaReports,
+    // lemmaAttribute, multRestricted, natWellSorted, subtermConvergence,
+    // then message-derivation.  `leftRightRuleReportDiff` is placed AFTER
+    // the factReports group and the ruleSorts check, matching the diff
+    // order at Wellformedness.hs:1256-1261.
     let mut report = Vec::new();
     report.extend(unbound_report(thy));
     report.extend(fresh_names_report(thy));
     report.extend(public_names_report(thy));
-    report.extend(left_right_rule_report(thy));    // leftRightRuleReportDiff (diff only)
     // HS `ruleSortsReport` (sortsClashCheck) runs HERE — after publicNamesReport
-    // and BEFORE factReports (Wellformedness.hs:1275).  It is ported as
+    // and BEFORE factReports (Wellformedness.hs:1275/1256).  It is ported as
     // `variable_sort_clashes` ("Variable with mismatching sorts or
     // capitalization").
     report.extend(variable_sort_clashes(thy));
@@ -77,8 +78,13 @@ pub fn check_theory(thy: &Theory) -> WfReport {
     report.extend(special_facts_usage(thy));
     report.extend(fact_usage(thy));
     report.extend(fact_lhs_occur_no_rhs(thy));
+    // leftRightRuleReportDiff (diff only) — placed AFTER factReports and
+    // ruleSorts, BEFORE formulaReports, matching HS `checkWellformednessDiff`
+    // order (Wellformedness.hs:1259).  (ruleVariantsReportDiff sits between
+    // factReports and leftRightRule in HS but is unported, so it does not
+    // affect placement.)
+    report.extend(left_right_rule_report(thy));
     // formulaReports group:
-    // (variable_sort_clashes moved UP to HS's ruleSortsReport position, above.)
     // checkQuantifiers / checkGuarded — partial via formula_free_var_report.
     // lemmaAttributeReport, multRestrictedReport, natWellSortedReport:
     report.extend(lemma_attribute_report(thy));
@@ -303,6 +309,14 @@ pub fn underline_topic(title: &str) -> String {
     for _ in 0..len { s.push('='); }
     s.push('\n');
     s
+}
+
+/// HS `numbered'` index width: `nWidth = length (show n)` where `n` is the
+/// number of items (PrettyPrint/Class.hs:257-258).  Each index is rendered as
+/// `flushRight nWidth (show i)` — i.e. left-padded with spaces to this width —
+/// so a 1-of-10+ list prints ` 1.`…`10.`.
+fn numbered_index_width(count: usize) -> usize {
+    count.to_string().len()
 }
 
 /// Pretty-print a parser-AST fact in HS's `prettyLNFact` style:
@@ -697,6 +711,23 @@ pub fn reserved_fact_name_rules(thy: &Theory) -> WfReport {
 // =============================================================================
 
 pub fn reserved_prefix_report(thy: &Theory) -> WfReport {
+    // Port of HS `reservedPrefixReport` (Wellformedness.hs:796-808), diff
+    // theories only.  HS groups ONE error per offending rule with body
+    //   wrappedText ("The " ++ origin ++ " contains facts with reserved \
+    //     prefixes ('DiffIntr', 'DiffProto') inside names:")
+    //   $-$ map (nest 2) [prettyLNFact fa $-$ text (show factInfo)]
+    // where `origin = "Rule " ++ quote (showRuleCaseName ru)` and
+    // `quote cs = '`' : cs ++ "'"`.
+    //
+    // The faithful body needs HughesPJ `wrappedText` (greedy column-fill of the
+    // header, which ALWAYS wraps here since the string exceeds the render
+    // width) and `show factInfo` of the `(tag, arity, multiplicity)` tuple —
+    // neither reproducible in the parser crate (the HughesPJ renderer lives in
+    // `tamarin-theory`).  This check produces NO output on any corpus input, so
+    // per the module-header disclaimer (only the topic string is guaranteed
+    // byte-faithful) we emit a topic-faithful best-effort body and use the HS
+    // `quote` form for the rule name.  topic "Reserved prefixes" matches HS
+    // `underlineTopic`.
     let mut out = Vec::new();
     if !thy.is_diff { return out; }
     for r in theory_rules(thy) {
@@ -704,7 +735,7 @@ pub fn reserved_prefix_report(thy: &Theory) -> WfReport {
             let lower = f.name.to_lowercase();
             if lower.starts_with("diffintr") || lower.starts_with("diffproto") {
                 out.push(WfError::new("Reserved prefixes",
-                    format!("Rule '{}' contains a fact with reserved prefix: {}",
+                    format!("Rule `{}' contains a fact with reserved prefix: {}",
                         r.name, f.name)));
             }
         }
@@ -1070,17 +1101,24 @@ where F: Fn(&FactObservation) -> String,
         let name = group[0].name.to_lowercase();
         s.push_str(&format!("  Fact `{}':\n", name));
         s.push('\n');
+        let w = numbered_index_width(group.len());
         for (i, obs) in group.iter().enumerate() {
             if i > 0 {
                 s.push_str("    \n");  // 4-space trailing line
             }
             s.push_str(&format!(
-                "    {}. {}, {}\n",
+                "    {:>w$}. {}, {}\n",
                 i + 1,
                 obs.origin,
                 detail(obs),
+                w = w,
             ));
-            s.push_str(&format!("         {}\n", obs.pp));
+            // HS `text(origin..) $-$ nest 2 ppFa` under `numbered'`: the
+            // continuation `ppFa` aligns past the `flushRight w (show i) ++
+            // ". "` prefix, so its indent grows with the index width:
+            //   4 (outer nest) + w (flushRight) + 2 (". ") + 2 (nest 2) = 8 + w.
+            // (Probed: width 1 => 9 spaces, width 2 => 10 spaces.)
+            s.push_str(&format!("{}{}\n", " ".repeat(8 + w), obs.pp));
         }
         s.push_str("  \n");  // 2-space trailing line after the group
     }
@@ -1171,6 +1209,8 @@ pub fn fact_lhs_occur_no_rhs(thy: &Theory) -> WfReport {
     // (from the `nest 2` in the caller) renders as `"  "` (2 spaces).
     // Result: item1\n  \nitem2\n  \nitem3\n (blank 2-space lines between items).
     let last_idx = orphan_pairs.len() - 1;
+    // HS `numbered'` left-pads the index to the width of the largest index.
+    let w = numbered_index_width(orphan_pairs.len());
     for (i, (rule_name, fa, suggestion)) in orphan_pairs.iter().enumerate() {
         let primary = format!(
             "in rule \"{}\":  factName `{}' arity: {} multiplicity: {}",
@@ -1181,11 +1221,12 @@ pub fn fact_lhs_occur_no_rhs(thy: &Theory) -> WfReport {
         );
         let line = match suggestion {
             Some((sug_rule, sug_fa)) => format!(
-                "  {}. {}. Perhaps you want to use the fact in rule \"{}\":  factName `{}' arity: {} multiplicity: {}",
+                "  {:>w$}. {}. Perhaps you want to use the fact in rule \"{}\":  factName `{}' arity: {} multiplicity: {}",
                 i + 1, primary, sug_rule, sug_fa.name, sug_fa.args.len(),
                 if sug_fa.persistent { "Persistent" } else { "Linear" },
+                w = w,
             ),
-            None => format!("  {}. {}", i + 1, primary),
+            None => format!("  {:>w$}. {}", i + 1, primary, w = w),
         };
         s.push_str(&line);
         s.push('\n');
@@ -1204,10 +1245,21 @@ pub fn fact_lhs_occur_no_rhs(thy: &Theory) -> WfReport {
 // =============================================================================
 
 pub fn fresh_names_report(thy: &Theory) -> WfReport {
-    let mut out = Vec::new();
+    // HS `freshNamesReport'` (Wellformedness.hs:444-452): one WfError per
+    // offending rule, body = `fsep` of
+    //   text ("rule " ++ quote (showRuleCaseName ru) ++ ": fresh public \
+    //         constants are not allowed:") : punctuate comma (map (show) names)
+    // where `quote cs = '`' : cs ++ "'"` (Wellformedness.hs:165) and the fresh
+    // names render via `show (Name FreshName n) = "~'" ++ n ++ "'"`
+    // (LTerm.hs:232).  Topic is "Fresh public constants"; the umbrella renderer
+    // emits the underlineTopic header once and 2-space-nests the bodies
+    // (separated by a `  ` blank line) — we bake that whole block into a single
+    // WfError so the default `format_wf_block` path reproduces the exact bytes.
+    let topic = "Fresh public constants";
+    let mut bodies: Vec<String> = Vec::new();
     for r in theory_rules(thy) {
         // HS `freshNamesReport` runs `universeBi` over the let-substituted
-        // `ProtoRuleE` (Wellformedness.hs:478,486), so a fresh name occurring
+        // `ProtoRuleE` (Wellformedness.hs:456), so a fresh name occurring
         // only inside a `let` value (e.g. `let m = ~'foo' in ... Out(m)`) is
         // inlined and surfaces here.  Mirror by walking the let-inlined facts.
         let (prems, acts, concs) = rule_facts_with_lets(r);
@@ -1217,16 +1269,31 @@ pub fn fresh_names_report(thy: &Theory) -> WfReport {
                 term_name_lits(t, &mut names);
             }
         }
+        // HS `show (Name FreshName n) = "~'" ++ n ++ "'"` for each fresh name,
+        // joined by `punctuate comma` (`, `) under the `fsep`.
         let fresh_lits: Vec<String> = names.iter()
-            .filter_map(|(k, n)| if *k == NameKind::Fresh { Some(n.clone()) } else { None })
+            .filter_map(|(k, n)| if *k == NameKind::Fresh {
+                Some(format!("~'{}'", n))
+            } else { None })
             .collect();
         if !fresh_lits.is_empty() {
-            out.push(WfError::new("Fresh public constants",
-                format!("rule '{}': fresh public constants are not allowed: {}",
-                    r.name, fresh_lits.join(", "))));
+            // Body only, 2-space `nest 2` indent baked in; HS `quote` form for
+            // the rule name (backtick + apostrophe).
+            bodies.push(format!(
+                "  rule `{}': fresh public constants are not allowed: {}",
+                r.name, fresh_lits.join(", ")));
         }
     }
-    out
+    if bodies.is_empty() {
+        return Vec::new();
+    }
+    // `underline_topic` ends with the `====` rule + newline; the extra `\n` is
+    // HS's `$-$` blank line before the (nest-2) bodies.  Bodies are joined by a
+    // `nest 2`'d blank `text ""` line, rendering as `\n  \n`.
+    let mut msg = underline_topic(topic);
+    msg.push('\n');
+    msg.push_str(&bodies.join("\n  \n"));
+    vec![WfError::new(topic, msg)]
 }
 
 // =============================================================================
@@ -1287,6 +1354,7 @@ pub fn public_names_report(thy: &Theory) -> WfReport {
         are considered as different, i.e., 'ID' is different from 'id'. \
         Check the capitalization of your identifiers.\n");
     s.push('\n');
+    let w = numbered_index_width(clashes.len());
     let items: Vec<String> = clashes.iter().enumerate().map(|(k, grp)| {
         // groupOn fst: list each rule's names together.
         let mut parts: Vec<String> = Vec::new();
@@ -1302,7 +1370,7 @@ pub fn public_names_report(thy: &Theory) -> WfReport {
             parts.push(format!("rule \"{}\":  name {}", rule, names.join(", ")));
             m = n2;
         }
-        format!("  {}. {}", k + 1, parts.join(", "))
+        format!("  {:>w$}. {}", k + 1, parts.join(", "), w = w)
     }).collect();
     s.push_str(&items.join("\n  \n"));
     s.push('\n');
@@ -1351,6 +1419,20 @@ fn collect_rule_unbound_vars(r: &Rule, nullary_funs: &BTreeSet<String>) -> Vec<V
     // `let m1 = <'1',$A,~Na> in ... Out(m1)` is INLINED to `Out(<'1',$A,~Na>)`
     // before the check — the let value's free vars are NOT bound, only the
     // (now-substituted-away) let variable.  Mirror by inlining lets here.
+    //
+    // HS `unboundVars` carries two extra exclusions we do NOT replicate
+    // because both are SAPIC-translation artifacts that cannot occur on the
+    // raw parser AST this check runs over:
+    //   - `isNowNode v` (Wellformedness.hs:504-505): suppresses an unbound
+    //     `LSortNode` var literally named "NOW" (a `#NOW` node introduced by
+    //     process translation).
+    //   - `originatesFromLookup v` (Wellformedness.hs:506-510): suppresses
+    //     vars bound by a process `lookup`, matched against
+    //     `ruleProcess (preAttributes (rInfo ru))`.
+    // If SAPIC-translated rules are ever routed through this check, port both
+    // guards.  Also note HS collects `frees (rConcs, rActs, rInfo)`; we iterate
+    // only `acts.chain(concs)` and so do NOT fold in raw embedded-restriction
+    // (`rInfo`) free vars — a distinct, currently-out-of-scope gap.
     let (prems, acts, concs) = rule_facts_with_lets(r);
     // HS `boundVars = S.fromList $ frees (get rPrems ru)` keys on the full
     // LVar (name AND sort AND idx), so `~ltk` (fresh) does NOT bind `ltk`
@@ -1511,9 +1593,29 @@ fn render_var(v: &VarSpec) -> String {
 /// Rust's `{:?}` Debug formatter, generating false-positive WF warnings
 /// (e.g. on every CRxor/CH07/LAK06 rule). The fix keeps the check
 /// FAITHFUL to HS's narrower trigger: skip when no `*` is in RHS and no
-/// unbound is introduced. The full abstraction-based (b) check is not
-/// yet implemented; for now we conservatively skip when RHS has no `*`
-/// (which matches HS on all XOR/DH theories in the corpus).
+/// unbound is introduced.
+///
+/// Two known divergences from HS, both corpus-unreachable (this report
+/// fires on no corpus input):
+///   - BODY: HS emits a multi-line block (Wellformedness.hs:1055-1064)
+///     `"The following rule is not multiplication restricted:" $-$ nest 2
+///      (prettyProtoRuleE ru) $-$ "" $-$ "After replacing reducible
+///      function symbols in lhs with variables:" $-$ nest 2
+///      (prettyProtoRuleE (abstractRule ru)) $-$ "" $-$ ["Terms with
+///      multiplication: " <-> prettyLNTermList mults] $-$ ["Variables
+///      that occur only in rhs: " <-> prettyVarList unbounds]`.
+///     Reproducing it needs `prettyProtoRuleE` (kwRuleModulo "E"), which
+///     has no equivalent in the parser crate, so per the module-header
+///     disclaimer we emit only a topic-faithful one-liner.
+///   - TRIGGER (b): HS `restrictedFailures ru = (mults, unbound ruAbstr
+///     \\ unbound ru)` also flags a rule with NO `*` in its RHS when
+///     abstracting reducible-headed lhs sub-terms (against the IRREDUCIBLE
+///     FunSig) introduces new non-pub rhs-only vars.  That abstraction
+///     needs the elaborated `irreducibleFunSyms (sigpMaudeSig ...)`, which
+///     is signature-level, not available on the raw parser AST — so the
+///     (b) unbound trigger is NOT ported here, and rules that fail ONLY
+///     via rhs-only abstracted vars are silently passed.  (a) below is the
+///     ported trigger: a `*` directly in an RHS conclusion.
 pub fn mult_restricted_report(thy: &Theory) -> WfReport {
     let mut out = Vec::new();
     for r in theory_rules(thy) {
@@ -1523,10 +1625,6 @@ pub fn mult_restricted_report(thy: &Theory) -> WfReport {
             .flat_map(|f| f.args.iter())
             .any(term_has_mult_subterm);
         if !rhs_has_mult { continue; }
-        // (b) is approximated by `rhs_has_mult`; the abstraction-based
-        // unbound-var check is not yet ported. When the unbound case
-        // comes up in the corpus we'll thread the rule-abstraction
-        // path through here.
         out.push(WfError::new("Multiplication restriction of rules",
             format!("rule `{}' has multiplication in its RHS",
                 r.name)));
@@ -1595,6 +1693,18 @@ pub fn lemma_attribute_report(thy: &Theory) -> WfReport {
 // =============================================================================
 
 pub fn left_right_rule_report(thy: &Theory) -> WfReport {
+    // Port of HS `leftRightRuleReportDiff` (Wellformedness.hs:397-414).  Topics
+    // "Left rule"/"Right rule" match HS `underlineTopic` exactly.  HS's bodies
+    // are
+    //   text "Inconsistent left rule"  $-$ nest 2 (prettyProtoRuleE lr)
+    //   $--$ text "w.r.t." $--$ nest 2 (prettyProtoRuleE (get dprRule ru))
+    // i.e. the EXPLICIT user-written left rule `lr` and the PARENT diff rule
+    // (NOT the projection used for the equalUpToAddedActions comparison), with
+    // NO rule name.  Reproducing that needs `prettyProtoRuleE`/`prettyNamedRule`
+    // (kwRuleModulo "E"), which has no equivalent in the parser crate, and this
+    // path is unreachable on the corpus — so per the module-header disclaimer
+    // we keep a topic-faithful body and do not reproduce the full rule
+    // pretty-print.
     let mut out = Vec::new();
     if !thy.is_diff { return out; }
     for r in theory_rules(thy) {
@@ -1679,23 +1789,46 @@ fn rules_equivalent_up_to_actions(a: &Rule, b: &Rule) -> bool {
 ///    vcat (map prettyCtxtStRule nonSubtermEquations) $-$ manualRef`
 /// where `prettyCtxtStRule` uses `sep [nest 2 lhsDoc, "=" <-> rhsDoc]`.
 pub fn subterm_convergence_report(thy: &Theory) -> WfReport {
-    // Collect all non-subterm-convergent equations across all `equations` items.
-    // User-declared `/0` functions resolve to nullary constants (HS resolves
-    // them via the function signature at parse time, so they are variable-free).
+    // HS guards the WHOLE check on `not (isUserMarkedConvergent thy)`
+    // (Wellformedness.hs:1285), where `isUserMarkedConvergent thy =
+    // eqConvergent (sig thy)` (1211-1212).  The parser sets `eqConvergent =
+    // convergent` on EVERY `equations` block (Signature.hs:227) — LAST-WRITE-
+    // WINS, not "any block convergent".  Mirror by reading the `convergent`
+    // flag of the LAST `equations` item; if it is set, suppress the entire
+    // report.  (Probed: `[convergent]` block last => suppressed; `[convergent]`
+    // first + a regular block last => fires.)
+    let global_convergent = thy.items.iter().rev().find_map(|it| match it {
+        TheoryItem::Equations { convergent, .. } => Some(*convergent),
+        _ => None,
+    }).unwrap_or(false);
+    if global_convergent { return Vec::new(); }
+
+    // Collect all non-subterm-convergent equations across ALL `equations`
+    // items (HS `thyEquations = S.toList (stRules sig)` merges every block's
+    // equations into one Set — so we do NOT skip per-block).  User-declared
+    // `/0` functions resolve to nullary constants (HS resolves them via the
+    // function signature at parse time, so they are variable-free).
     let nullary_funs = collect_nullary_fun_names(thy);
     let mut non_conv: Vec<(&Term, &Term)> = Vec::new();
     for it in &thy.items {
-        let (eqs, convergent) = match it {
-            TheoryItem::Equations { eqs, convergent } => (eqs, *convergent),
+        let eqs = match it {
+            TheoryItem::Equations { eqs, .. } => eqs,
             _ => continue,
         };
-        if convergent { continue; }
         for eq in eqs {
             if !is_subterm_convergent(&eq.lhs, &eq.rhs, &nullary_funs) {
                 non_conv.push((&eq.lhs, &eq.rhs));
             }
         }
     }
+    // HS `thyEquations` is a `Set CtxtStRule` (`S.toList` => deduped, ordered
+    // by the derived `Ord CtxtStRule`).  We dedup structurally-equal equations
+    // to match the Set's deduplication; we keep source order rather than
+    // replicating the full `Ord LNTerm` term-AST order (the parser AST lacks
+    // it), so the LISTED ORDER may still differ from HS when there are >=2
+    // distinct non-convergent user equations.  Corpus cases have a single
+    // non-convergent equation, where this is a no-op.
+    non_conv.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
     if non_conv.is_empty() { return Vec::new(); }
 
     // HS `prettyCtxtStRule r = sep [nest 2 (prettyLNTerm lhs), "=" <-> prettyLNTerm rhs]`
@@ -1751,7 +1884,11 @@ pub fn subterm_convergence_report(thy: &Theory) -> WfReport {
 /// (No HughesPJ wrapping needed — equations are expected to fit on one line.)
 fn pp_term_for_wf(t: &Term) -> String {
     match t {
-        Term::Var(v) => v.name.clone(),
+        // HS `prettyLVar = text . show`, and `show LVar` prepends the
+        // `sortPrefix` (`~`/`$`/`#`/`%`, LTerm.hs:189-194) — so a fresh var
+        // renders as `~x`, not `x`.  Defer to `render_var` for the sigil +
+        // optional `.idx` suffix.
+        Term::Var(v) => render_var(v),
         Term::PubLit(s) => format!("'{}'", s),
         Term::FreshLit(s) => format!("~'{}'", s),
         Term::NatLit(s) => format!("%'{}'", s),
@@ -1837,8 +1974,15 @@ fn rhs_is_ground(t: &Term, nullary_funs: &BTreeSet<String>) -> bool {
 /// that semantically denote nullary constants (typically declared by
 /// `builtins:` or `functions: ... /0`). We treat them as constants
 /// for the purposes of subterm-convergence and free-variable checks.
+///
+/// These mirror the builtin nullary `NoEq` symbols HS resolves via
+/// `nullaryApp` against `funSyms maudeSig` (Parser/Term.hs:143-148):
+/// `trueSym = ("true",..)` (Builtin/Signature.hs:44), and
+/// `zeroSym`/`oneSym`/`dhNeutralSym` (FunctionSymbols.hs).  There is no
+/// builtin `True`, so a genuine variable literally named `True` must NOT
+/// be suppressed here — HS would report it as unbound/underivable.
 fn is_known_nullary_constant_name(n: &str) -> bool {
-    matches!(n, "true" | "True" | "zero" | "one" | "DH_neutral")
+    matches!(n, "true" | "zero" | "one" | "DH_neutral")
 }
 
 fn contains_subterm(haystack: &Term, needle: &Term) -> bool {
@@ -1923,9 +2067,10 @@ pub fn variable_sort_clashes(thy: &Theory) -> WfReport {
         // "  rule `X': \n    1. <vars>".  `numbered'` separates items by a
         // blank `text ""` line, which at 4-space indent renders as "    ".
         let mut body = format!("  rule `{}': \n", r.name);
+        let w = numbered_index_width(clash_groups.len());
         let items: Vec<String> = clash_groups.iter().enumerate().map(|(k, grp)| {
             let vs: Vec<String> = grp.iter().map(render_var).collect();
-            format!("    {}. {}", k + 1, vs.join(", "))
+            format!("    {:>w$}. {}", k + 1, vs.join(", "), w = w)
         }).collect();
         body.push_str(&items.join("\n    \n"));
         out.push(WfError::new(
@@ -1939,66 +2084,90 @@ pub fn variable_sort_clashes(thy: &Theory) -> WfReport {
 // =============================================================================
 
 pub fn nat_well_sorted_report(thy: &Theory) -> WfReport {
-    let mut out = Vec::new();
+    // Port of HS `natWellSortedReport` + `natSortErrors` (Wellformedness.hs:
+    // 314-333).  For each top-level fact-arg term `t` (HS `factTerms` of every
+    // prem/act/conc), `nonWellSorted t` collects the offending operands `err`
+    // and we emit ONE body `<err> in term <t> must be of sort nat` per
+    // (t, err) — the rule name is NOT part of the message, and `t` in the
+    // message is the WHOLE fact-arg term, not the `%+` subterm.
+    //
+    // HS produces one WfError per (t, err); `prettyWfErrorReport` groups them
+    // under a single "Nat Sorts" header (bodies 2-space-nested, separated by a
+    // `  ` blank line).  "Nat Sorts" is not in the headerless-preamble set, so
+    // we bake the whole block into one WfError (matching the single-error
+    // corpus case byte-for-byte; the multi-error count-collapse only differs
+    // synthetically, as with `fresh_names_report`/`lemma_attribute_report`).
+    let topic = "Nat Sorts";
+    let mut bodies: Vec<String> = Vec::new();
     for r in theory_rules(thy) {
         for t in rule_terms(r) {
-            collect_nat_violations(t, r, &mut out);
+            let mut errs: Vec<&Term> = Vec::new();
+            non_well_sorted(t, &mut errs);
+            for err in errs {
+                bodies.push(format!(
+                    "  {} in term {} must be of sort nat",
+                    pp_term_for_wf(err), pp_term_for_wf(t)));
+            }
         }
     }
     // HS `natWellSortedReport`'s `getItemTerms` also checks the formula terms
     // of LemmaItem/RestrictionItem/PredicateItem (Wellformedness.hs:327-329).
     // That formula-term walk is not yet implemented here; the nat checks that
     // fire in the corpus all sit inside rules.
-    out
+    if bodies.is_empty() {
+        return Vec::new();
+    }
+    let mut msg = underline_topic(topic);
+    msg.push('\n');
+    msg.push_str(&bodies.join("\n  \n"));
+    vec![WfError::new(topic, msg)]
 }
 
-fn collect_nat_violations(t: &Term, r: &Rule, out: &mut WfReport) {
-    if let Term::BinOp(BinOp::NatPlus, a, b) = t {
-        check_nat_operand(a, r, out);
-        check_nat_operand(b, r, out);
-    }
+/// Faithful port of HS `nonWellSorted` (Wellformedness.hs:293-303): collect
+/// the operands appearing under a `%+` (`FNatPlus`) that are not themselves
+/// nat-well-sorted.  Pushes references to the offending sub-terms onto `out`.
+fn non_well_sorted<'a>(t: &'a Term, out: &mut Vec<&'a Term>) {
     match t {
-        Term::App(_, args) | Term::Pair(args) => for a in args { collect_nat_violations(a, r, out); },
-        Term::AlgApp(_, a, b) => { collect_nat_violations(a, r, out); collect_nat_violations(b, r, out); }
-        Term::Diff(a, b) | Term::BinOp(_, a, b) => {
-            collect_nat_violations(a, r, out);
-            collect_nat_violations(b, r, out);
-        }
-        Term::PatMatch(inner) => collect_nat_violations(inner, r, out),
-        _ => {}
-    }
-}
-
-fn check_nat_operand(t: &Term, r: &Rule, out: &mut WfReport) {
-    match t {
-        Term::Var(v) if !is_nat_sort(&v.sort) => {
-            // Untagged is OK at parse level (sort inference would
-            // refine), but explicit non-nat sorts trigger.
-            if matches!(v.sort, SortHint::Untagged) { return; }
-            out.push(WfError::new("Nat Sorts",
-                format!("rule `{}': variable `{}' must be of sort nat",
-                    r.name, render_var(v))));
-        }
-        Term::NatOne | Term::NatLit(_) => {}
+        // FNatPlus list -> concatMap notOnlyNat list
         Term::BinOp(BinOp::NatPlus, a, b) => {
-            check_nat_operand(a, r, out);
-            check_nat_operand(b, r, out);
+            not_only_nat(a, out);
+            not_only_nat(b, out);
         }
-        // Anything else (pub literal, function app, fresh literal,
-        // etc.) is rejected.
-        Term::PubLit(_) | Term::FreshLit(_) | Term::App(_, _) | Term::Pair(_)
-        | Term::AlgApp(_, _, _) | Term::Diff(_, _) | Term::Number(_)
-        | Term::NumberOne | Term::DhNeutral | Term::PatMatch(_) => {
-            out.push(WfError::new("Nat Sorts",
-                format!("rule `{}': operand must be of sort nat: {}",
-                    r.name, pp_term_for_wf(t))));
+        // NatOne -> []; Lit _ -> []
+        Term::NatOne | Term::Var(_) | Term::PubLit(_) | Term::FreshLit(_)
+        | Term::NatLit(_) | Term::Number(_) | Term::NumberOne
+        | Term::DhNeutral => {}
+        // FApp _ ts -> concatMap nonWellSorted ts (recurse into children)
+        Term::App(_, args) | Term::Pair(args) => {
+            for a in args { non_well_sorted(a, out); }
         }
-        Term::Var(_) => {} // Untagged var, accepted.
-        Term::BinOp(_, _, _) => {
-            out.push(WfError::new("Nat Sorts",
-                format!("rule `{}': operand must be of sort nat: {}",
-                    r.name, pp_term_for_wf(t))));
+        Term::AlgApp(_, a, b) | Term::Diff(a, b) | Term::BinOp(_, a, b) => {
+            non_well_sorted(a, out);
+            non_well_sorted(b, out);
         }
+        Term::PatMatch(inner) => non_well_sorted(inner, out),
+    }
+}
+
+/// Faithful port of HS `notOnlyNat` (Wellformedness.hs:296-300): the inner
+/// recursion under `%+`.  Accepts `NatOne` and genuine nat-sorted *variables*
+/// (`isNatVar`, LTerm.hs:327-329); recurses through nested `%+`; flags
+/// everything else (including untagged/msg/pub vars and nat *literals* like
+/// `%'a'`, which are `Con` names, not vars — matching HS's `isNatVar`, which
+/// is true only for `Lit (Var v)` with `lvarSort v == LSortNat`).
+fn not_only_nat<'a>(t: &'a Term, out: &mut Vec<&'a Term>) {
+    match t {
+        // FNatPlus l -> concatMap notOnlyNat l
+        Term::BinOp(BinOp::NatPlus, a, b) => {
+            not_only_nat(a, out);
+            not_only_nat(b, out);
+        }
+        // NatOne -> []
+        Term::NatOne => {}
+        // t | isNatVar t = []  (nat-sorted VARIABLE only)
+        Term::Var(v) if is_nat_sort(&v.sort) => {}
+        // t = [t]  (anything else is an offending operand)
+        _ => out.push(t),
     }
 }
 
@@ -2046,5 +2215,100 @@ mod tests {
         end"#);
         let r = check_theory(&t);
         assert!(topics(&r).contains("Reserved names"));
+    }
+
+    /// Return the single `WfError` whose topic matches `topic`.
+    fn only(report: &WfReport, topic: &str) -> String {
+        let hits: Vec<&WfError> = report.iter().filter(|e| e.topic == topic).collect();
+        assert_eq!(hits.len(), 1, "expected exactly one {:?} entry, got {:?}",
+            topic, report);
+        hits[0].message.clone()
+    }
+
+    /// Probed against tamarin-prover v1.13.0 on `Out(%a %+ ~x)`:
+    ///   `~x in term (~x%+%a) must be of sort nat`
+    /// i.e. the offending operand is the fresh var `~x` (NOT the nat-sorted
+    /// `%a`), the message has NO rule name, and `t` is the WHOLE fact-arg
+    /// term.  (The AC operand order `(~x%+%a)` is a pre-existing pretty-print
+    /// limitation: RS renders source order `(%a%+~x)`; the message FORMAT —
+    /// which is what this finding fixes — matches HS exactly.)
+    #[test]
+    fn nat_sorts_message_format() {
+        let t = parse("theory T begin builtins: natural-numbers \
+            rule R: [ Fr(~x) ] --[ ]-> [ Out(%a %+ ~x) ] end");
+        let msg = only(&check_theory(&t), "Nat Sorts");
+        // Header + 2-space-nested single body.
+        assert_eq!(msg, "Nat Sorts\n=========\n\n  ~x in term (%a%+~x) must be of sort nat");
+    }
+
+    /// `%a` (nat-sorted var) is ACCEPTED; only `~x` (fresh) is flagged —
+    /// matching HS `notOnlyNat`/`isNatVar` (which accepts only NatOne and
+    /// nat-sorted *variables*).
+    #[test]
+    fn nat_sorts_accepts_nat_var_flags_fresh() {
+        let t = parse("theory T begin builtins: natural-numbers \
+            rule R: [ Fr(~x) ] --[ ]-> [ Out(%a %+ ~x) ] end");
+        let msg = only(&check_theory(&t), "Nat Sorts");
+        assert!(msg.contains("~x in term"), "should flag ~x: {}", msg);
+        assert!(!msg.contains("%a in term"), "should NOT flag %a: {}", msg);
+    }
+
+    /// A nat *literal* `%'a'` (a `Con` name, not a var) IS flagged, matching
+    /// HS `isNatVar` (true only for `Lit (Var ..)` with LSortNat).  Probed:
+    ///   `%'a' in term (%'a'%+%y) must be of sort nat`
+    #[test]
+    fn nat_sorts_flags_nat_literal() {
+        let t = parse("theory T begin builtins: natural-numbers \
+            rule R: [ Fr(~x) ] --[ ]-> [ Out(%'a' %+ %y) ] end");
+        let msg = only(&check_theory(&t), "Nat Sorts");
+        assert!(msg.contains("%'a' in term"), "should flag %'a': {}", msg);
+        assert!(!msg.contains("%y in term"), "should NOT flag nat var %y: {}", msg);
+    }
+
+    /// Probed against tamarin-prover v1.13.0 on `Out(<~k, ~'foo'>)`:
+    ///   rule name uses the HS `quote` form (backtick + apostrophe) and the
+    ///   fresh constant renders via `show (Name FreshName ..)` = `~'foo'`.
+    #[test]
+    fn fresh_public_constants_message_format() {
+        let t = parse("theory T begin \
+            rule R: [ Fr(~k) ] --[ ]-> [ Out(<~k, ~'foo'>) ] end");
+        let msg = only(&check_theory(&t), "Fresh public constants");
+        assert_eq!(msg,
+            "Fresh public constants\n======================\n\n  \
+             rule `R': fresh public constants are not allowed: ~'foo'");
+    }
+
+    /// A free variable literally named `True` IS reported as unbound — there
+    /// is no builtin `True` nullary (only `true`), so HS does not suppress it.
+    /// (Regression for removing `"True"` from `is_known_nullary_constant_name`.)
+    #[test]
+    fn variable_named_true_is_unbound() {
+        let t = parse("theory T begin rule R: [ ] --[ ]-> [ Out(True) ] end");
+        assert!(topics(&check_theory(&t)).contains("Unbound variables"),
+            "True must be reported as unbound");
+    }
+
+    /// `equations [convergent]` as the LAST equations block suppresses the
+    /// whole Subterm Convergence Warning (HS `isUserMarkedConvergent`,
+    /// last-write-wins), even with a non-convergent regular block present.
+    #[test]
+    fn subterm_convergence_global_convergent_guard() {
+        let t = parse("theory T begin functions: f/1, g/1, a/0, b/0 \
+            equations: f(x) = g(x) \
+            equations [convergent]: g(y) = a end");
+        assert!(!topics(&check_theory(&t)).contains("Subterm Convergence Warning"),
+            "global convergent flag (last-write-wins) must suppress the check");
+    }
+
+    /// A `[convergent]` block FIRST followed by a regular block LAST does NOT
+    /// suppress (last-write-wins => flag false), so the non-convergent
+    /// equation is reported.
+    #[test]
+    fn subterm_convergence_last_write_wins() {
+        let t = parse("theory T begin functions: f/1, g/1, a/0, b/0 \
+            equations [convergent]: g(y) = a \
+            equations: f(x) = g(x) end");
+        assert!(topics(&check_theory(&t)).contains("Subterm Convergence Warning"),
+            "regular block last => flag false => warning fires");
     }
 }

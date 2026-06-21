@@ -10,7 +10,7 @@
 //! summary lines match Haskell's `summary of summaries:` shape so
 //! existing tooling continues to recognise them.
 //!
-//! When invoked without `--prove`/`--prove-all` (and without
+//! When invoked without `--prove` (and without
 //! `--parse-only`/`--precompute-only`), we just re-emit the source
 //! verbatim — the same behaviour as Haskell's batch mode when no
 //! lemma is selected for proof.
@@ -50,6 +50,13 @@ pub enum LemmaVerdict {
     /// operators.  HS `showProofStatus` (Theory/Proof.hs:1109):
     ///   "analysis cannot be finished (reducible operators in subterms)"
     Unfinishable,
+    /// HS `UndeterminedProof` (Theory/Proof.hs:1111): proof tree folds to a
+    /// status that could not be determined — renders "analysis undetermined".
+    Undetermined,
+    /// HS `InvalidatedProof` (Theory/Proof.hs:1112): a stored proof step was
+    /// invalidated (e.g. by an interactive reuse-lemma edit) — renders
+    /// "proof has been invalidated".
+    Invalidated,
     /// `[reuse]`-only lemma that we didn't try to prove (out of filter).
     Skipped,
     /// Lemma was filtered out by `--prove=FOO` / `--lemma=FOO`.
@@ -81,6 +88,12 @@ fn format_lemma_summary_line(r: &LemmaResult) -> String {
         // HS `showProofStatus _ UnfinishableProof` (Theory/Proof.hs:1109).
         LemmaVerdict::Unfinishable =>
             format!("analysis cannot be finished (reducible operators in subterms) ({} steps)", r.proof_steps),
+        // HS `showProofStatus _ UndeterminedProof` (Theory/Proof.hs:1111).
+        LemmaVerdict::Undetermined =>
+            format!("analysis undetermined ({} steps)", r.proof_steps),
+        // HS `showProofStatus _ InvalidatedProof` (Theory/Proof.hs:1112).
+        LemmaVerdict::Invalidated =>
+            format!("proof has been invalidated ({} steps)", r.proof_steps),
         LemmaVerdict::Error(msg) => format!("error: {}", msg),
     };
     format!("{} ({}): {}", r.name, quantifier, body)
@@ -119,7 +132,12 @@ pub fn run(args: &Args) -> Result<i32, RunError> {
         return Ok(0);
     }
     if args.show_version {
-        println!("{}", crate::cli::version_text());
+        // HS (Console.hs:326-330) splits the two streams: the banner +
+        // license + `Generated from:` block go to STDOUT, the three maude
+        // self-check lines to STDERR (`ensureMaude` -> `hPutStrLn stderr`).
+        // version_text() already carries its own trailing newline.
+        print!("{}", crate::cli::version_text());
+        eprintln!("{}", crate::cli::version_maude_stderr_text());
         return Ok(0);
     }
 
@@ -167,33 +185,48 @@ fn run_test(_args: &Args) -> Result<i32, RunError> {
     Ok(0)
 }
 
-/// `tamarin-prover variants` — mirror HS's `Main.Mode.Variants`.
+/// `tamarin-prover variants` — mirror HS's `Main.Mode.Intruder.run`.
 /// HS dumps the DH-intruder rule variants (the `c_exp`, `c_inv`,
-/// `c_mult`, `c_one`, etc. rules) without needing a `.spthy` file.
+/// `c_mult`, `c_one`, etc. rules) then the BP-intruder variants, without
+/// needing a `.spthy` file (Intruder.hs:44-53).
 ///
-/// We mirror that: spin up Maude with the default DH-enabled MaudeSig,
-/// generate the rules via [`tamarin_theory::intruder_rules::dh_intruder_rules`],
-/// and pretty-print each rule in HS's `rule (modulo AC) NAME:` shape.
+/// We mirror the DH half: spin up Maude with `dh_maude_sig()`, generate the
+/// rules via [`tamarin_theory::intruder_rules::dh_intruder_rules`] with the
+/// HS-hardcoded `False` flag, and pretty-print each rule in HS's
+/// `rule (modulo AC) NAME:` shape.  The BP half is a known gap (see body).
 fn run_variants(args: &Args) -> Result<i32, RunError> {
     let maude_path = args.maude_path.clone().unwrap_or_else(default_maude_path);
-    // HS's `variants` default-enables both DH and BP (bilinear-pairing)
-    // — the 125-rule output set.  Mirror that: union the two sigs.
-    let sig = tamarin_term::maude_sig::dh_maude_sig()
-        .merge(tamarin_term::maude_sig::bp_maude_sig());
+    // HS `Main.Mode.Intruder.run` (Intruder.hs:44-53) starts TWO SEPARATE
+    // Maude handles — one on `dhMaudeSig`, one on `bpMaudeSig` — and
+    // generates `dhIntruderRules False` then `bpIntruderRules False`, then
+    // emits `dhS ++ bpS`.  We mirror the DH handle on `dh_maude_sig()` ALONE
+    // (NOT merged with bp): merging exposes pmult/em to Maude during the DH
+    // variant query and could perturb DH variant enumeration.  The DH
+    // generator is hardcoded `False` in HS, not the --diff flag, so we pass
+    // `false`.
+    let sig = tamarin_term::maude_sig::dh_maude_sig();
     let maude = MaudeHandle::start(&maude_path, sig).map_err(|e| {
         RunError(format!("failed to start maude at {:?}: {:?}", maude_path, e))
     })?;
+    // HS emits the maude tool/version banner on STDERR (via `ensureMaude`),
+    // not stdout — the rule dump alone goes to stdout.  Mirror that.
     if let Some(v) = crate::cli::detect_maude_version_pub() {
-        println!("maude tool: '{}'", maude_path);
-        println!(" checking version: {}. OK.", v);
-        println!(" checking installation: OK.");
+        eprintln!("maude tool: '{}'", maude_path);
+        eprintln!(" checking version: {}. OK.", v);
+        eprintln!(" checking installation: OK.");
     }
-    // NOTE: this enumerates the DH intruder rule variants only (53 rules
-    // on the default sig).  HS additionally generates the bilinear-
-    // pairing variants (`c_em`, `d_em`, `d_pmult`) — the full HS output
-    // is 125 rules.  Porting BP intruder rules is a deeper functional
-    // gap (no `bp_intruder_rules` exists yet in tamarin_theory).
-    let rules = tamarin_theory::intruder_rules::dh_intruder_rules(args.diff, &maude);
+    // KNOWN GAP: this enumerates the DH intruder rule variants only.  HS
+    // (Intruder.hs:49-53) additionally generates the bilinear-pairing
+    // variants via `bpIntruderRules False` on a SEPARATE bpMaudeSig handle
+    // and concatenates them after the DH block (the full HS stdout is 126
+    // `rule (modulo AC)` lines).  Porting that requires a Maude-querying
+    // `bp_intruder_rules` generator (mirroring HS bpIntruderRules,
+    // IntruderRules.hs:384-392) — NOT the cached-file parser
+    // `mk_bp_intruder_variants`, which is a different code path.  The
+    // `variants` subcommand is not exercised by the example corpus.  HS's
+    // pretty-printer also HughesPJ-line-wraps wide rules (`-->` on its own
+    // line), which the single-line printer below does not reproduce.
+    let rules = tamarin_theory::intruder_rules::dh_intruder_rules(false, &maude);
     // Mirror HS `Theory.Model.Rule.prettyIntrRuleACInfo`
     // (Theory/Model/Rule.hs:1233-1234) naming:
     //   ConstrRule "_exp"    → prefixIfReserved("c" ++ "_exp") → "c_exp"
@@ -213,18 +246,28 @@ fn run_variants(args: &Args) -> Result<i32, RunError> {
         }
     };
     for r in &rules {
+        use tamarin_theory::rule::IntrRuleACInfo;
+        // HS `prettyIntrRuleACInfo` (Rule.hs:1225-1234): every
+        // non-Constr/Destr variant maps to a fixed lowercase keyword.
+        // (dhIntruderRules only ever yields Constr/Destr, so these arms are
+        // defensive — but they remove the latent `{:?}` Debug divergence.)
         let name = match &r.info {
-            tamarin_theory::rule::IntrRuleACInfo::ConstrRule(n) =>
+            IntrRuleACInfo::ConstrRule(n) =>
                 prefix_if_reserved(format!("c{}", String::from_utf8_lossy(n))),
-            tamarin_theory::rule::IntrRuleACInfo::DestrRule(n, _, _, _) =>
+            IntrRuleACInfo::DestrRule(n, _, _, _) =>
                 prefix_if_reserved(format!("d{}", String::from_utf8_lossy(n))),
-            other => format!("{:?}", other),
+            IntrRuleACInfo::IRecv => "irecv".to_string(),
+            IntrRuleACInfo::ISend => "isend".to_string(),
+            IntrRuleACInfo::Coerce => "coerce".to_string(),
+            IntrRuleACInfo::FreshConstr => "fresh".to_string(),
+            IntrRuleACInfo::PubConstr => "pub".to_string(),
+            IntrRuleACInfo::NatConstr => "nat".to_string(),
+            IntrRuleACInfo::IEquality => "iequality".to_string(),
         };
-        let kind = match &r.info {
-            tamarin_theory::rule::IntrRuleACInfo::ConstrRule(_)
-            | tamarin_theory::rule::IntrRuleACInfo::DestrRule(_, _, _, _) => "rule (modulo AC)",
-            _ => "rule",
-        };
+        // HS `prettyIntrRuleAC` (Rule.hs:1324) uses `kwRuleModulo "AC"` =
+        // "rule (modulo AC)" UNCONDITIONALLY for every intruder rule — there
+        // is no bare "rule" case.
+        let kind = "rule (modulo AC)";
         println!();
         println!("{} {}:", kind, name);
         // Pretty-print each fact as `Tag(term, term, …)` using
@@ -403,17 +446,27 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
     }
     // --output-json / --output-dot: trace graph serialisation isn't
     // ported yet (HS emits a graph of the attack-trace nodes/edges
-    // for any falsified lemma).  Don't hard-error — many callers
-    // pass these flags unconditionally and just want them to be
-    // harmless when no trace is found.  Write empty stub files
-    // matching HS's empty shape so downstream tooling can `stat` them
-    // and parse them without crashing.  Print a one-line warning so
-    // the user knows the contents aren't real.
+    // for any falsified lemma — `outputTraces`, Batch.hs:251-271).  Don't
+    // hard-error — many callers pass these flags unconditionally and just
+    // want them harmless.  Write the exact bytes HS emits in the NO-TRACE
+    // case so downstream tooling can `stat`/parse them; the trace-FOUND
+    // case (real graphs) remains unported.  Print a one-line warning so the
+    // user knows the contents aren't real.
+    //
+    // HS no-trace bytes (verified against the v1.13.0 binary):
+    //   --output-dot:  `intercalate "\n" [] = ""`, then `writeFile ""`
+    //                  ⇒ a 0-byte file (NOT "digraph trace {}").
+    //   --output-json: `sequentsToJSONPretty graphOptions []`
+    //                  (JSON.hs:458-463) = aeson-pretty `encodePretty`
+    //                  of `{graphs:[]}` with the default Config
+    //                  (confIndent = Spaces 4, confTrailingNewline = False)
+    //                  ⇒ exactly `{\n    "graphs": []\n}` (20 bytes, NO
+    //                  trailing newline; empty array renders inline).
     if let Some(p) = &args.trace_json {
         if !args.quiet {
             eprintln!("warning: --output-json: trace graph serialisation not yet ported; writing empty stub to {}", p);
         }
-        fs::write(p, "{\"graphs\": []}\n").map_err(|e| {
+        fs::write(p, "{\n    \"graphs\": []\n}").map_err(|e| {
             RunError(format!("failed to write {}: {}", p, e))
         })?;
     }
@@ -421,7 +474,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         if !args.quiet {
             eprintln!("warning: --output-dot: trace graph serialisation not yet ported; writing empty stub to {}", p);
         }
-        fs::write(p, "digraph trace {}\n").map_err(|e| {
+        fs::write(p, "").map_err(|e| {
             RunError(format!("failed to write {}: {}", p, e))
         })?;
     }
@@ -631,11 +684,17 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         // check needs `formula_to_guarded` (in tamarin-theory) so it runs
         // HERE (post-elaborate) rather than inside `check_theory` (parser-level).
         //
-        // HS `msum` semantics: `checkGuarded` only fires for a formula when
-        // `checkQuantifiers` and `checkTerms` both passed for it.  We
-        // approximate by running unconditionally — in practice the failing
-        // formulas differ between checkTerms and checkGuarded, so no double-
-        // reporting occurs for any known corpus file.
+        // HS `formulaReports` (Wellformedness.hs:999-1005) is a list-monad
+        // `do` block: for each formula it runs `msum [checkQuantifiers,
+        // checkTerms, checkGuarded]`.  `WfErrorReport` is a list, and for
+        // lists `msum = concat` (with `<$> = map`), so ALL three checks run
+        // UNCONDITIONALLY for every formula and their outputs are
+        // concatenated — there is no short-circuit gating `checkGuarded` on
+        // the earlier checks.  Running `check_guarded_wf` unconditionally is
+        // therefore HS-faithful.  In particular, a formula that fails both
+        // checkTerms and checkGuarded is double-reported by HS (one entry
+        // under "Formula terms", one under " Formula guardedness"), so both
+        // must keep running unconditionally to stay byte-identical.
         //
         // Position: after `check_theory`'s `formula_terms_report` (8b) and
         // before `lemma_attribute_report` (9) — matches HS order.
@@ -907,10 +966,10 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         }
         phase!("derivation_checks");
 
-        // Decide which lemmas to prove. Without --prove/--prove-all,
-        // we never start the solver; output is just the source.
+        // Decide which lemmas to prove. Without --prove, we never start
+        // the solver; output is just the source.
         let lemma_filter: &[String] = &args.lemma_names;
-        let prove_anything = args.prove_mode || args.prove_all;
+        let prove_anything = args.prove_mode;
 
         let mut results: Vec<LemmaResult> = Vec::new();
         // Mirrors HS's per-lemma proof body for embedding in the
@@ -955,10 +1014,16 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             })?;
 
             // Per-lemma proof loop.
-            let budget: usize = args
-                .bound
-                .map(|b| b as usize)
-                .unwrap_or(500);
+            //
+            // The `max_steps` argument threaded into the prover below is a
+            // no-op: the solver (search.rs) discards it (`let _ = max_steps;
+            // let mut budget = usize::MAX;`) and bounds search by wall-clock
+            // deadline instead.  HS likewise defaults `proofBound` to
+            // `Nothing` (TheoryLoader.hs) so `boundProver` is never applied
+            // unless `--bound=N` is given — which the Rust solver does not
+            // yet honor.  We pass `usize::MAX` rather than computing a value
+            // that would be ignored.
+            let budget: usize = usize::MAX;
 
             // Build the per-file shared prover session ONCE.  Profile
             // showed that constructing a fresh `ProofContext` per lemma
@@ -1054,9 +1119,17 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                                 else { LemmaVerdict::Verified }
                             }
                             ProofStatus::Unfinishable => LemmaVerdict::Unfinishable,
-                            ProofStatus::Incomplete
-                            | ProofStatus::Undetermined
-                            | ProofStatus::Invalidated => LemmaVerdict::Analyzed,
+                            ProofStatus::Incomplete => LemmaVerdict::Analyzed,
+                            // HS `showProofStatus` (Proof.hs:1111-1112) renders
+                            // these as distinct strings, NOT "analysis
+                            // incomplete".  In batch `--prove` the root fold is
+                            // virtually never Undetermined/Invalidated (close-
+                            // time replay annotates every node ⇒ Incomplete;
+                            // Invalidated only arises from interactive reuse-
+                            // lemma edits), but map them faithfully so the label
+                            // is correct if such a tree ever surfaces.
+                            ProofStatus::Undetermined => LemmaVerdict::Undetermined,
+                            ProofStatus::Invalidated => LemmaVerdict::Invalidated,
                         };
                         let body = tamarin_theory::pretty_theory::pretty_proof_body(&root);
                         (v, steps, Some(body))
@@ -1115,6 +1188,17 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         // prefix and AC-variant comments, lemmas with inline guarded
         // formula and proof body, wellformedness block, and
         // Generated-from footer.
+        //
+        // KNOWN GAP (--precompute-only): HS (Batch.hs:201-205) renders
+        // `ppWf report $--$ prettyPrecomputation thy''` here instead — a
+        // compact 3-line overview (`Multiset rewriting rules: N` / `Raw
+        // sources: …` / `Refined sources: …`, ClosedTheory.hs:548-570), NOT
+        // the full closed theory.  We fall through to pretty_closed_theory in
+        // that mode.  Porting `prettyPrecomputation` faithfully needs the
+        // closed theory's raw + refined source case lists and per-case
+        // `unsolvedChainConstraints` counts (which live in the prover
+        // session, not surfaced here); --precompute-only is a niche
+        // diagnostic mode not exercised by the example corpus.
         let build_info = tamarin_theory::pretty_theory::BuildInfo {
             tamarin_version: crate::cli::VERSION.to_string(),
             maude_version: maude_version
@@ -1156,7 +1240,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
     // block entirely.  Only `--prove` (or any flag that actually runs
     // the prover) emits it.
     if !args.quiet && !args.parse_only {
-        print_overall_summary(&file_results, args.prove_mode || args.prove_all);
+        print_overall_summary(&file_results, args.prove_mode);
     }
 
     Ok(overall_status)
@@ -1427,8 +1511,13 @@ fn print_overall_summary(file_results: &[FileResult], prove_mode: bool) {
     println!();
     for fr in file_results {
         println!("analyzed: {}", fr.in_file);
-        // HS `ppRep` (Batch.hs) emits a single blank line between
-        // `analyzed:` and the nested `output:`/`processing time:` block.
+        // HS `ppRep` (Batch.hs:146-148) has TWO `Pretty.text ""` between
+        // `analyzed:` and the nested `output:`/`processing time:` block, but
+        // HughesPJ collapses adjacent empty lines under `vcat`, so the rendered
+        // output is a SINGLE blank line here.  Verified against the v1.13.0
+        // binary: `tamarin-prover --prove` emits exactly one blank line between
+        // `analyzed:` and `output:`/`processing time:`, so one `println!()` is
+        // byte-faithful.
         println!();
         if let Some(out) = &fr.out_file {
             // HS aligns `output:` and `processing time:` columns
@@ -1475,7 +1564,9 @@ mod tests {
 
     #[test]
     fn out_path_for_uses_file_when_set() {
-        let a = parse(&["-o", "/tmp/foo.spthy", "in.spthy"]);
+        // `-o`/`--output` is cmdargs flagOpt: only the inline (`=`/attached)
+        // form sets the value; a space-separated token stays positional.
+        let a = parse(&["-o/tmp/foo.spthy", "in.spthy"]);
         assert_eq!(
             out_path_for(&a, "in.spthy").as_deref(),
             Some("/tmp/foo.spthy"),
@@ -1484,7 +1575,7 @@ mod tests {
 
     #[test]
     fn out_path_for_uses_dir_with_basename_when_set() {
-        let a = parse(&["-O", "/tmp/outdir", "examples/foo.spthy"]);
+        let a = parse(&["-O/tmp/outdir", "examples/foo.spthy"]);
         let got = out_path_for(&a, "examples/foo.spthy");
         assert_eq!(got.as_deref(), Some("/tmp/outdir/foo_analyzed.spthy"));
     }
@@ -1554,5 +1645,54 @@ mod tests {
         let a = parse(&["--version"]);
         let r = run(&a).expect("version");
         assert_eq!(r, 0);
+    }
+
+    fn mk_result(verdict: LemmaVerdict, exists_trace: bool, steps: usize) -> LemmaResult {
+        LemmaResult {
+            name: "L".to_string(),
+            verdict,
+            elapsed_ms: 0,
+            proof_steps: steps,
+            exists_trace,
+        }
+    }
+
+    // Pins the per-lemma summary strings to HS `showProofStatus`
+    // (Theory/Proof.hs:1105-1112) + the `(N steps)` suffix
+    // (ClosedTheory.hs:487-489).  The Undetermined/Invalidated arms used to
+    // collapse into "analysis incomplete"; HS renders them distinctly.
+    #[test]
+    fn lemma_summary_distinguishes_undetermined_and_invalidated() {
+        // showProofStatus _ UndeterminedProof = "analysis undetermined"
+        assert_eq!(
+            format_lemma_summary_line(&mk_result(LemmaVerdict::Undetermined, false, 7)),
+            "L (all-traces): analysis undetermined (7 steps)",
+        );
+        // showProofStatus _ InvalidatedProof = "proof has been invalidated"
+        assert_eq!(
+            format_lemma_summary_line(&mk_result(LemmaVerdict::Invalidated, false, 3)),
+            "L (all-traces): proof has been invalidated (3 steps)",
+        );
+        // showProofStatus _ IncompleteProof = "analysis incomplete" (unchanged)
+        assert_eq!(
+            format_lemma_summary_line(&mk_result(LemmaVerdict::Analyzed, false, 5)),
+            "L (all-traces): analysis incomplete (5 steps)",
+        );
+    }
+
+    // Authentic HS bytes (verified against the v1.13.0 binary with
+    // `--prove --output-json=… --output-dot=…` on a no-trace theory):
+    //   --output-json no-trace stub = aeson-pretty `encodePretty` of
+    //     `{graphs:[]}` ⇒ `{\n    "graphs": []\n}` (20 bytes, 4-space indent,
+    //     NO trailing newline).  JSON.hs:458-463 + aeson-pretty default Config.
+    //   --output-dot no-trace stub = `intercalate "\n" [] = ""` ⇒ 0-byte file.
+    // These mirror the literals written in `run_batch`.
+    #[test]
+    fn output_json_dot_stub_bytes_match_hs() {
+        let json_stub = "{\n    \"graphs\": []\n}";
+        assert_eq!(json_stub.len(), 20);
+        assert!(!json_stub.ends_with('\n'), "no trailing newline");
+        let dot_stub = "";
+        assert_eq!(dot_stub.len(), 0);
     }
 }

@@ -114,12 +114,24 @@ pub fn extract_base_name(name: &str) -> Option<String> {
 }
 
 /// Return the rule's case-name (e.g. `Setup_1`) for proto-rules, else None.
-/// Mirror of `getRuleNameByNode`.
+/// Mirror of `getRuleNameByNode` (GraphRepr.hs:208-214) which renders
+/// `showRuleCaseName` -> `prettyProtoRuleName` (Rule.hs:1164-1167):
+/// `StandRule n -> prefixIfReserved n`, `FreshRule -> "Fresh"`.
+/// `prefixIfReserved` (Rule.hs:1154-1162) prepends `_` when the name is a
+/// reserved rule name or already starts with `_`.  This is plain
+/// `showRuleCaseName`, NOT the SAPiC-trimming `showDotRuleCaseName`.
 pub fn rule_name_by_node(n: &GNode) -> Option<String> {
     if let NodeType::System(ru) = &n.ty {
         if let RuleInfo::Proto(p) = &ru.info {
             return Some(match &p.name {
-                ProtoRuleName::Stand(s) => s.clone(),
+                ProtoRuleName::Stand(s) => {
+                    let reserved = tamarin_theory::rule::reserved_rule_names();
+                    if reserved.contains(s.as_str()) || s.starts_with('_') {
+                        format!("_{s}")
+                    } else {
+                        s.clone()
+                    }
+                }
                 ProtoRuleName::Fresh => "Fresh".to_string(),
             });
         }
@@ -192,8 +204,14 @@ pub fn find_connected_components<'a>(
                 }
             }
         }
-        let comp: Vec<&'a GNode> = comp_ids.iter()
-            .filter_map(|nid| by_id.get(nid).copied())
+        // HS `component = filter (\node -> get nNodeId node `elem` componentIds)
+        // (n:ns)` (GraphRepr.hs:190): component nodes are kept in the ORIGINAL
+        // `nodes` order, not DFS discovery order.  Filtering the full `nodes`
+        // slice is safe because each node belongs to exactly one component
+        // (globally `visited`), so the per-component relative order matches HS.
+        let comp_set: BTreeSet<NodeId> = comp_ids.iter().cloned().collect();
+        let comp: Vec<&'a GNode> = nodes.iter().copied()
+            .filter(|n| comp_set.contains(&n.id))
             .collect();
         if !comp.is_empty() { components.push(comp); }
     }
@@ -295,11 +313,15 @@ pub fn compute_basic_graph_repr(sys: &System) -> GraphRepr {
         seen_ids.insert(nid.clone());
     }
     // 2. Unsolved action atoms — collect by node id.
+    // HS `systemUnsolvedActionNodes se = map unsolvedActionNode
+    // (collectBy $ unsolvedActionAtoms se)` (Graph.hs:105-108) does NOT filter
+    // these ids against `sNodes`: if an id is both a system node and an
+    // unsolved ActionG goal, HS emits BOTH a SystemNode and an
+    // UnsolvedActionNode.  So there is no skip-if-already-a-system-node guard.
     let mut by_node: BTreeMap<NodeId, Vec<LNFact>> = BTreeMap::new();
     for (g, st) in sys.goals.iter() {
         if st.solved { continue; }
         if let Goal::Action(nid, fa) = g {
-            if seen_ids.contains(nid) { continue; }
             by_node.entry(nid.clone()).or_default().push(fa.clone());
         }
     }
@@ -318,25 +340,31 @@ pub fn compute_basic_graph_repr(sys: &System) -> GraphRepr {
         }
     }
     // 4. Missing nodes referenced by edges.
+    // HS `systemMissingNodes se = mapMaybe missingNode (S.toList sEdges)`
+    // (Graph.hs:116-122): each edge yields AT MOST ONE missing node — `missingNode`
+    // checks the source first (`MissingNode (Left idx)`), and only if the source
+    // is present does it check the target (`MissingNode (Right idx)`).  The
+    // membership test is `nid `notElem` nodelist` where `nodelist = map fst
+    // (M.toList sNodes)` — i.e. against `sNodes` ONLY, never against
+    // unsolved-action / last-atom ids.  There is also NO dedup among missing
+    // nodes: two edges sharing the same missing endpoint emit it twice.
+    // `systemMissingNodes` never inspects `sLessAtoms`; less-atoms contribute
+    // edges (below), not nodes.
+    let sys_node_ids: BTreeSet<NodeId> =
+        sys.nodes.iter().map(|(id, _)| id.clone()).collect();
     for e in &sys.edges {
-        if !seen_ids.contains(&e.src.0) {
+        if !sys_node_ids.contains(&e.src.0) {
             nodes.push(GNode {
                 id: e.src.0.clone(),
                 ty: NodeType::Missing(MissingHint::Conc(e.src.1)),
             });
-            seen_ids.insert(e.src.0.clone());
-        }
-        if !seen_ids.contains(&e.tgt.0) {
+        } else if !sys_node_ids.contains(&e.tgt.0) {
             nodes.push(GNode {
                 id: e.tgt.0.clone(),
                 ty: NodeType::Missing(MissingHint::Prem(e.tgt.1)),
             });
-            seen_ids.insert(e.tgt.0.clone());
         }
     }
-    // NOTE: Haskell `systemMissingNodes` derives missing nodes ONLY from
-    // `sEdges` (`mapMaybe missingNode (S.toList $ get sEdges se)`); it never
-    // inspects `sLessAtoms`.  Less-atoms contribute edges (below), not nodes.
     // 5. Edges.
     let mut edges: Vec<GEdge> = Vec::new();
     for e in &sys.edges {
@@ -453,5 +481,58 @@ mod tests {
         assert_eq!(repr.clusters.len(), 1);
         assert_eq!(repr.clusters[0].nodes.len(), 2);
         assert_eq!(repr.clusters[0].edges.len(), 1);
+    }
+
+    // HS `findConnectedComponents` keeps each component's nodes in the
+    // ORIGINAL input order (`filter (∈ componentIds) (n:ns)`), not in DFS
+    // discovery order.  With input [B, C, A] where A links to both B and C,
+    // DFS pop-order would be [B, A, C]; HS keeps [B, C, A].
+    #[test]
+    fn connected_components_preserve_original_node_order() {
+        let b = GNode { id: nid("i", 2), ty: NodeType::System(proto_rule("B", None)) };
+        let c = GNode { id: nid("i", 3), ty: NodeType::System(proto_rule("C", None)) };
+        let a = GNode { id: nid("i", 1), ty: NodeType::System(proto_rule("A", None)) };
+        // Input order is deliberately [B, C, A].
+        let input: Vec<&GNode> = vec![&b, &c, &a];
+        // A links to both B and C via SystemEdges.
+        let edges = vec![
+            GEdge::System((nid("i", 1), ConcIdx(0)), (nid("i", 2), PremIdx(0))),
+            GEdge::System((nid("i", 1), ConcIdx(0)), (nid("i", 3), PremIdx(0))),
+        ];
+        let comps = find_connected_components(&input, &edges);
+        assert_eq!(comps.len(), 1);
+        let ids: Vec<NodeId> = comps[0].iter().map(|n| n.id.clone()).collect();
+        // Original order [B, C, A], NOT DFS order [B, A, C].
+        assert_eq!(ids, vec![nid("i", 2), nid("i", 3), nid("i", 1)]);
+    }
+
+    // HS `getRuleNameByNode` -> `showRuleCaseName` -> `prettyProtoRuleName`
+    // applies `prefixIfReserved` to StandRule names.  A name already starting
+    // with `_` gets another `_` prepended, so `_Foo_1` -> `__Foo_1`, and
+    // `extractBaseName "__Foo_1"` (splitOn "_" = ["","","Foo","1"]) -> `__Foo`.
+    #[test]
+    fn rule_name_by_node_applies_prefix_if_reserved() {
+        let n = GNode {
+            id: nid("i", 1),
+            ty: NodeType::System(proto_rule("_Foo_1", None)),
+        };
+        assert_eq!(rule_name_by_node(&n), Some("__Foo_1".to_string()));
+        // Reserved name `pub` -> `_pub`.
+        let p = GNode {
+            id: nid("i", 2),
+            ty: NodeType::System(proto_rule("pub", None)),
+        };
+        assert_eq!(rule_name_by_node(&p), Some("_pub".to_string()));
+        // Ordinary name is unchanged.
+        let s = GNode {
+            id: nid("i", 3),
+            ty: NodeType::System(proto_rule("Setup", None)),
+        };
+        assert_eq!(rule_name_by_node(&s), Some("Setup".to_string()));
+        // The composed base name for `_Foo_1` is `__Foo` (HS), not `_Foo`.
+        assert_eq!(
+            rule_name_by_node(&n).and_then(|rn| extract_base_name(&rn)),
+            Some("__Foo".to_string())
+        );
     }
 }

@@ -47,10 +47,14 @@ fn prove_chain_writes_output_with_verified_summary() {
     std::fs::create_dir_all(&out_dir).expect("mkdir out_dir");
     let out_path = out_dir.join("single_recv_out.spthy");
 
+    // `-o`/`--output` is a cmdargs `flagOpt` (Batch.hs:76): its value is
+    // OPTIONAL and must be ATTACHED — `-o FILE` (space-separated) leaves the
+    // flag empty and treats FILE as a positional input (verified vs the HS
+    // binary). So pass it inline via `--output=FILE`.
+    let output_arg = format!("--output={}", out_path.to_str().unwrap());
     let args = args_from(&[
         "--prove=chain",
-        "-o",
-        out_path.to_str().unwrap(),
+        &output_arg,
         "--quiet",
         in_path.to_str().unwrap(),
     ]);
@@ -92,10 +96,12 @@ fn prove_lemma_filter_excludes_other_lemmas() {
 
     // Filter to a lemma that doesn't exist — every lemma is filtered
     // out and we still write an output.
+    // flagOpt: attach the output value (`--output=FILE`); a space-separated
+    // `-o FILE` would treat FILE as a positional input (HS Batch.hs:76).
+    let output_arg = format!("--output={}", out_path.to_str().unwrap());
     let args = args_from(&[
         "--prove=nonexistent",
-        "-o",
-        out_path.to_str().unwrap(),
+        &output_arg,
         "--quiet",
         in_path.to_str().unwrap(),
     ]);
@@ -119,10 +125,12 @@ fn parse_only_emits_source_to_stdout() {
     let out_dir = std::env::temp_dir().join("tamarin_prover_parseonly");
     std::fs::create_dir_all(&out_dir).expect("mkdir out_dir");
     let out_path = out_dir.join("parse_only.spthy");
+    // flagOpt: attach the output value (`--output=FILE`); a space-separated
+    // `-o FILE` would treat FILE as a positional input (HS Batch.hs:76).
+    let output_arg = format!("--output={}", out_path.to_str().unwrap());
     let args = args_from(&[
         "--parse-only",
-        "-o",
-        out_path.to_str().unwrap(),
+        &output_arg,
         in_path.to_str().unwrap(),
     ]);
     let code = run(&args).expect("run");
@@ -143,10 +151,14 @@ fn output_dir_writes_basename_underscore_analyzed() {
     let out_dir = std::env::temp_dir().join("tamarin_prover_outdir");
     let _ = std::fs::remove_dir_all(&out_dir); // clean prior runs
     std::fs::create_dir_all(&out_dir).expect("mkdir out_dir");
+    // `-O`/`--Output` is a cmdargs `flagOpt` (Batch.hs:77): its value is
+    // OPTIONAL and must be ATTACHED — `-O DIR` (space-separated) leaves the
+    // flag at its default and treats DIR as a positional input file (verified
+    // against the HS binary). So the value must be inline via `--Output=DIR`.
+    let output_arg = format!("--Output={}", out_dir.to_str().unwrap());
     let args = args_from(&[
         "--parse-only", // skip the proof to keep this test fast & maude-light
-        "-O",
-        out_dir.to_str().unwrap(),
+        &output_arg,
         in_path.to_str().unwrap(),
     ]);
     let code = run(&args).expect("run");

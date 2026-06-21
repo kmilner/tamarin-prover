@@ -44,6 +44,16 @@ pub fn vars_vterm<C, V: Ord + Clone>(t: &VTerm<C, V>) -> Vec<V> {
     out
 }
 
+/// In-order list of variables in `t`, with duplicates and in source order
+/// (left-to-right, depth-first). Mirrors the HS `foldMap (foldMap (:[]))`
+/// traversal used by `freesSapicTerm` (Sapic/Term.hs:131-132) — NOT sorted,
+/// NOT deduplicated. Use [`vars_vterm`] when set semantics are wanted.
+pub fn vars_vterm_in_order<C, V: Clone>(t: &VTerm<C, V>) -> Vec<V> {
+    let mut out = Vec::new();
+    collect_vars(t, &mut out);
+    out
+}
+
 fn collect_vars<C, V: Clone>(t: &VTerm<C, V>, out: &mut Vec<V>) {
     match t {
         Term::Lit(Lit::Var(v)) => out.push(v.clone()),

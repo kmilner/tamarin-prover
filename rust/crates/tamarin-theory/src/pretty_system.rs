@@ -194,12 +194,20 @@ fn combine(header: &str, d: Doc) -> Doc {
 // `Subterms` / `Solved Subterms`, each item rendered as
 // `prettyNTerm a $$ nest 3 (⊏ <-> prettyNTerm b)`.
 //
-// Known divergence: terms are rendered as flat `Doc::text` atoms (this
-// crate exposes only a `String` term printer, not a Doc one), so an
-// individual term wider than the line is not re-wrapped the way HS's
-// `prettyNTerm` Doc would. Section structure, ordering, numbering and the
-// `Contradictory` header are byte-faithful. UI diagnostic pane only — not
-// reached by raw `--prove` output.
+// Known divergences (UI diagnostic pane only — not reached by raw
+// `--prove` output):
+//   * terms are rendered as flat `Doc::text` atoms (this crate exposes
+//     only a `String` term printer, not a Doc one), so an individual term
+//     wider than the line is not re-wrapped the way HS's `prettyNTerm` Doc
+//     would;
+//   * ordering is byte-faithful only for `neg_subterms`, which is kept
+//     sorted by `add_neg`'s `binary_search` insert (matching HS `S.toList`
+//     over the `negSt` Set). `subterms`/`solved_subterms` are `Vec`s in
+//     insertion order (`.push()` in `add`/`conjoin`), whereas HS emits the
+//     `posSt`/`solvedSt` Sets via `S.toList` in `Ord` order, so the
+//     numbered ordering of those two sections may differ from Haskell.
+// Section structure, numbering and the `Contradictory` header are
+// byte-faithful.
 fn pretty_subterm_store(sys: &System) -> String {
     let st = &sys.subterm_store;
 
@@ -484,7 +492,13 @@ fn pretty_lesses(ls: &[LessAtom]) -> String {
 // LNFact / RuleACInst rendering
 // ---------------------------------------------------------------------
 
-fn pretty_fact(fa: &LNFact) -> String {
+/// Pretty-print an `LNFact` exactly as Haskell `prettyLNFact` /
+/// `prettyFact` (Fact.hs:537-552): `showFactTag tag` (with the persistent
+/// `!` prefix), the term list in parentheses (always emitted, even for
+/// zero-arity facts, matching `nestShort'`), and a trailing `[...]`
+/// annotation block. Used by the proof pretty-printer here and by the
+/// web DOT renderer (`tamarin-server`'s `dot::format_fact`).
+pub fn pretty_fact(fa: &LNFact) -> String {
     use crate::fact::{fact_tag_multiplicity, FactAnnotation, Multiplicity};
     // Matches Haskell `showFactTag` (Fact.hs:519-523): the `!` prefix is
     // applied to any tag whose `factTagMultiplicity` is `Persistent`,

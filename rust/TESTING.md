@@ -121,18 +121,8 @@ example (Responder_secrecy 54→10 diff lines).
 
 ## Useful env-var flags
 
-Environment flags toggle HS-faithful vs legacy behavior, and enable
-specific diagnostics. The big ones (current as of 2026-05-27):
-
-### HS-faithful behavior toggles (mostly default-on)
-
-| Variable | Effect |
-|---|---|
-| `TAM_RS_DISABLE_FLATTEN_UNIF=1` | revert flattenUnif in AC-free fast path |
-| `TAM_RS_PER_STEP_RESET_LEGACY=1` | skip Maude counter reset per proof step |
-| `TAM_RS_SOMEINST_LEGACY=1` | uniform-shift freshen instead of HS-faithful |
-| `TAM_RS_DISABLE_PER_VARIANT_COUNTER_RESET=1` | apply_eq_store loop counter |
-| `TAM_NO_PRECOMPUTE_VARIANTS=1` | variants AFTER precompute (legacy) |
+The Rust prover's solving behavior is not configurable by env var. The
+flags below are pure diagnostic dumps, off by default:
 
 ### Diagnostic dumps (off by default)
 
@@ -144,15 +134,13 @@ specific diagnostics. The big ones (current as of 2026-05-27):
 | `TAM_DBG_BRANCH_DROP=1` | saturate branches dropped via contras |
 | `TAM_DBG_AES_VARIANTS=1` | apply_eq_store variant before→after counts |
 | `TAM_RS_DBG_APPLY_EQ_STORE=1` | applyEqStore IN/OUT (paired with HS's) |
-| `TAM_RS_TRACE_N6=1` | N6 KD-conc/KU-act dump |
-| `TAM_RS_TRACE_CHAIN_EXTEND=1` | chain extension fact unification |
-| `TAM_DBG_DESTR=1` | destructor rule generation |
 | `TAM_HS_DBG_APPLY_EQ_STORE=1` | HS-side applyEqStore trace |
 | `TAM_HS_TRACE_CHAINS=1` | HS-side solveChain enter/extend |
 | `TAM_HS_DBG_PERFORM_SPLIT=1` | HS-side perform_split |
 
 `TAM_HS_*` flags only work with the HS binary; `TAM_RS_*` / `TAM_DBG_*`
-with the Rust one.
+with the Rust one. (This list is not exhaustive — grep the source for
+`TAM_DBG_`/`TAM_RS_DBG_` for the full set.)
 
 ## Files
 

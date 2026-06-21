@@ -1,11 +1,19 @@
-//! Port of the *non-AC* portion of `Term.Unification` from
-//! `lib/term/src/Term/Unification.hs`.
+//! Port of `Term.Unification` from `lib/term/src/Term/Unification.hs`.
 //!
 //! Tamarin performs unification in two phases: free unification with
-//! delayed AC equations, then ships the AC equations off to Maude. Without
-//! a Maude bridge we can only soundly handle the AC-free case — if the
-//! input contains AC operators we return `None` (no unifier found) rather
-//! than risking an unsound result.
+//! delayed AC equations, then ships the AC equations off to Maude. This
+//! file ports both of those:
+//!
+//! * The HS-faithful factored path (`unify_lterm_factored` /
+//!   `unify_raw_factored`, mirroring `unifyLTermFactored`) solves the
+//!   non-AC fragment and collects the residual AC/C equations into a
+//!   delayed list — `tell [Equal l r]` in the HS writer monad. Callers
+//!   (`maude_proc.rs`, `equation_store.rs`) ship those residuals to Maude,
+//!   exactly as HS does via `unifyViaMaude`. This is the primary path used
+//!   in solving.
+//! * The standalone non-AC helpers (`unify_lterm_no_ac` /
+//!   `solve_match_lterm_no_ac`) bail with `NeedsAC` / `None` on AC input;
+//!   they exist for callers that have no Maude bridge to fall back on.
 //!
 //! Matching follows the same split.
 
@@ -169,11 +177,24 @@ where
                 Err(UnifyError::NoUnifier)
             }
         }
-        (Term::App(FunSym::Ac(_), _), _) | (_, Term::App(FunSym::Ac(_), _)) => {
-            Err(UnifyError::NeedsAC)
+        // Haskell `unifyRaw` (Unification.hs:265-270): the AC/C arms fire ONLY
+        // when BOTH sides are AC (resp. C) apps and the symbols (and, for C,
+        // the arity) match — at which point HS does `tell [Equal l r]`.  In
+        // the no-AC caller (`unifyLTermFactoredNoAC`, Unification.hs:160-164)
+        // that delayed equation makes `solve (Just _)` hit
+        // `error "No AC unification, but AC symbol found."`; we surface that as
+        // `NeedsAC`.  A symbol/arity mismatch fails the `guard` (→ `Nothing`,
+        // i.e. `[]`/no unifier), and any AC-vs-non-AC (or C-vs-non-C) pairing
+        // falls through to HS `_ -> mzero` (line 273); both map to `NoUnifier`.
+        (Term::App(FunSym::Ac(la), _), Term::App(FunSym::Ac(ra), _)) => {
+            if la == ra { Err(UnifyError::NeedsAC) } else { Err(UnifyError::NoUnifier) }
         }
-        (Term::App(FunSym::C(_), _), _) | (_, Term::App(FunSym::C(_), _)) => {
-            Err(UnifyError::NeedsAC)
+        (Term::App(FunSym::C(ls), largs), Term::App(FunSym::C(rs), rargs)) => {
+            if ls == rs && largs.len() == rargs.len() {
+                Err(UnifyError::NeedsAC)
+            } else {
+                Err(UnifyError::NoUnifier)
+            }
         }
         _ => Err(UnifyError::NoUnifier),
     }
@@ -282,16 +303,29 @@ where
                 Err(UnifyError::NoUnifier)
             }
         }
-        (Term::App(FunSym::Ac(_), _), _) | (_, Term::App(FunSym::Ac(_), _)) => {
-            // Haskell: `tell [Equal l r]` — delay for Maude.
-            delayed.push(Equal { lhs: l.clone(), rhs: r.clone() });
-            Ok(())
+        // Haskell `unifyRaw` (Unification.hs:265-270): the AC arm fires ONLY
+        // when BOTH sides are AC apps, and `guard (lacsym == racsym)` delays
+        // for Maude only on matching symbols; a symbol mismatch (or any
+        // AC-vs-non-AC pairing falling through to `_ -> mzero`, line 273)
+        // means no unifier.
+        (Term::App(FunSym::Ac(la), _), Term::App(FunSym::Ac(ra), _)) => {
+            if la == ra {
+                delayed.push(Equal { lhs: l.clone(), rhs: r.clone() });
+                Ok(())
+            } else {
+                Err(UnifyError::NoUnifier)
+            }
         }
-        (Term::App(FunSym::C(_), _), _) | (_, Term::App(FunSym::C(_), _)) => {
-            // Haskell: `tell [Equal l r]` — delay for Maude.
-            delayed.push(Equal { lhs: l.clone(), rhs: r.clone() });
-            Ok(())
+        // C arm (Unification.hs:268-270): both sides C, same symbol AND arity.
+        (Term::App(FunSym::C(ls), largs), Term::App(FunSym::C(rs), rargs)) => {
+            if ls == rs && largs.len() == rargs.len() {
+                delayed.push(Equal { lhs: l.clone(), rhs: r.clone() });
+                Ok(())
+            } else {
+                Err(UnifyError::NoUnifier)
+            }
         }
+        // Everything else (incl. AC-vs-non-AC, C-vs-non-C) → HS `_ -> mzero`.
         _ => Err(UnifyError::NoUnifier),
     }
 }
@@ -509,6 +543,79 @@ mod tests {
         let problem = Match::match_with(t, p);
         assert!(solve_match_lterm_no_ac(&|n| crate::lterm::sort_of_name(n), problem).is_none());
     }
+
+    // -------------------------------------------------------------------
+    // HS `unifyRaw` AC/C arms (Unification.hs:265-273): the AC arm fires
+    // only when BOTH sides are AC apps with the SAME symbol; otherwise the
+    // pair falls through to `_ -> mzero` (no unifier).  These pin that the AC
+    // arm delays/NeedsAC only for same-symbol AC apps on both sides.
+    // -------------------------------------------------------------------
+    use crate::builtin::{mult, union};
+
+    #[test]
+    fn factored_unify_distinct_ac_symbols_is_no_unifier() {
+        // mult(a,b) vs union(c,d): different AC symbols → HS `mzero`.
+        let lhs: LNTerm = mult(msg_var("a", 0), msg_var("b", 0));
+        let rhs: LNTerm = union(msg_var("c", 0), msg_var("d", 0));
+        assert!(unify_lnterm_factored(vec![Equal::new(lhs, rhs)]).is_none(),
+                "different AC symbols (mult vs union) must yield no unifier, \
+                 not a residual shipped to Maude");
+    }
+
+    #[test]
+    fn factored_unify_ac_vs_non_ac_is_no_unifier() {
+        // mult(a,b) vs pk(x): AC-vs-NoEq → falls through to HS `_ -> mzero`.
+        let lhs: LNTerm = mult(msg_var("a", 0), msg_var("b", 0));
+        let rhs: LNTerm = pk(msg_var("x", 0));
+        assert!(unify_lnterm_factored(vec![Equal::new(lhs, rhs)]).is_none(),
+                "AC vs non-AC must yield no unifier (HS mzero), not a residual");
+    }
+
+    #[test]
+    fn factored_unify_same_ac_symbol_delays_residual() {
+        // mult(a,b) vs mult(c,d): same AC symbol → HS `tell [Equal l r]`,
+        // i.e. a single residual delayed for Maude, with an empty local subst.
+        let lhs: LNTerm = mult(msg_var("a", 0), msg_var("b", 0));
+        let rhs: LNTerm = mult(msg_var("c", 0), msg_var("d", 0));
+        let (subst, residuals) =
+            unify_lnterm_factored(vec![Equal::new(lhs, rhs)])
+                .expect("same AC symbol must delay (Some), not fail");
+        assert!(subst.is_empty(), "no non-AC bindings");
+        assert_eq!(residuals.len(), 1, "exactly one AC equation delayed for Maude");
+    }
+
+    #[test]
+    fn no_ac_distinct_ac_symbols_is_no_unifier_not_needs_ac() {
+        // HS no-AC path: a guard failure → Nothing → [] (no unifier).
+        let lhs: LNTerm = mult(msg_var("a", 0), msg_var("b", 0));
+        let rhs: LNTerm = union(msg_var("c", 0), msg_var("d", 0));
+        match unify_lnterm_no_ac(vec![Equal::new(lhs, rhs)]) {
+            Err(UnifyError::NoUnifier) => {}
+            other => panic!("expected NoUnifier (HS mzero), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn no_ac_ac_vs_non_ac_is_no_unifier_not_needs_ac() {
+        let lhs: LNTerm = mult(msg_var("a", 0), msg_var("b", 0));
+        let rhs: LNTerm = pk(msg_var("x", 0));
+        match unify_lnterm_no_ac(vec![Equal::new(lhs, rhs)]) {
+            Err(UnifyError::NoUnifier) => {}
+            other => panic!("expected NoUnifier (HS mzero), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn no_ac_same_ac_symbol_is_needs_ac() {
+        // Same AC symbol → HS `tell` → no-AC `solve (Just _)` "AC symbol
+        // found" error, surfaced here as NeedsAC.
+        let lhs: LNTerm = mult(msg_var("a", 0), msg_var("b", 0));
+        let rhs: LNTerm = mult(msg_var("c", 0), msg_var("d", 0));
+        match unify_lnterm_no_ac(vec![Equal::new(lhs, rhs)]) {
+            Err(UnifyError::NeedsAC) => {}
+            other => panic!("expected NeedsAC (HS AC symbol found), got {:?}", other),
+        }
+    }
 }
 
 // =============================================================================
@@ -607,7 +714,7 @@ mod haskell_invariants {
     //    LARGER-idx is the KEY.
     //
     //    This is the orientation that makes `restrict stableVars`
-    //    (Sources.hs:118) work: stable pattern vars (small idx) stay
+    //    (Sources.hs:123) work: stable pattern vars (small idx) stay
     //    on the value side and get dropped by the key-filter.
     // -------------------------------------------------------------------
 

@@ -57,7 +57,7 @@ pub struct Reduction<'ctx> {
     /// the call and emit one additional case per arm with `sys`
     /// cloned and `eq_store = arm`.  This mirrors HS's behaviour
     /// where each AC unifier arm produces its own downstream
-    /// `Goals.hs:432-436` `case_N` entry — i.e. `case_2` of an outer
+    /// `Goals.hs:393-395` `case_N` entry — i.e. `case_2` of an outer
     /// `solveDisjunction` further fans into `case_2_case_1`,
     /// `case_2_case_2` via `uniqueListBy ... distinguish`
     /// (ProofMethod.hs:308).
@@ -485,7 +485,7 @@ impl<'ctx> Reduction<'ctx> {
         //    triggered re-substitution sees a consistent state.
         let mut nodes = std::sync::Arc::unwrap_or_clone(
             std::mem::take(&mut self.sys.nodes));
-        // HS-faithful node-merge keep-order: `substNodeIds` (Reduction.hs:796)
+        // HS-faithful node-merge keep-order: `substNodeIds` (Reduction.hs:629-634)
         // reads `M.toList sNodes` — SORTED by node-id — so when several nodes
         // collapse to one id (eq-store node-id binding), `setNodes`'
         // stable `groupSortOn` keeps the rule of the LOWEST-OLD-ID node.  RS
@@ -542,25 +542,12 @@ impl<'ctx> Reduction<'ctx> {
         // normalise blocked HS's `hasNonNormalTerms` contradiction from
         // ever firing on a non-normal term shape (Responder_secrecy's
         // split_case_3/Initiator non-normal contradiction was lost).
-        //
-        // TAM_RS_EAGER_NORMALIZE_SUBST=1 reverts to the prior eager
-        // normalise for diagnostic comparison.
-        let maude = self.maude.clone();
-        let eager_normalize = std::env::var("TAM_RS_EAGER_NORMALIZE_SUBST").is_ok();
-        let normalize_term = |t: tamarin_term::lterm::LNTerm| -> tamarin_term::lterm::LNTerm {
-            if eager_normalize {
-                maude.reduce(&t).unwrap_or(t)
-            } else { t }
-        };
         let apply_to_fact = |fa: &crate::fact::LNFact| -> crate::fact::LNFact {
             crate::fact::LNFact {
                 tag: fa.tag.clone(),
                 annotations: fa.annotations.clone(),
                 terms: fa.terms.iter()
-                    .map(|t| {
-                        let substed = tamarin_term::subst::apply_vterm(&subst, t.clone());
-                        normalize_term(substed)
-                    })
+                    .map(|t| tamarin_term::subst::apply_vterm(&subst, t.clone()))
                     .collect(),
             }
         };
@@ -568,24 +555,7 @@ impl<'ctx> Reduction<'ctx> {
         let nodes_in = nodes.len();
         let mut collisions = 0usize;
         let mut shape_mm = 0usize;
-        // HS-faithful experiment (TAM_RS_NO_NODE_FACT_SUBST=1): skip
-        // eager substitution of rule premise/conclusion/action facts.
-        // HS's `setM sNodes` writes the raw rule to sNodes; downstream
-        // reads via `gets $ nodeConcFact c` retrieve the raw fact
-        // because HS state-monad reads don't auto-apply the eq-store
-        // subst.  This means HS pre-substitution-time checks like
-        // `contradictoryIf (isMsgVar m)` see the original `~mw:Msg`
-        // fresh var (which IS a msg-var, so mzero fires).  Rust's
-        // eager subst rewrites `~mw:Msg` to its bound term (often
-        // concrete) BEFORE `isMsgVar` runs — so the check never fires.
-        //
-        // This experiment leaves rule facts RAW in sys.nodes while
-        // still rewriting node ids (so collapsing-node lookups work).
-        // Downstream consumers that NEED substituted facts must apply
-        // subst lazily on read; this is the multi-week audit we're
-        // tracking.
-        let no_node_fact_subst = std::env::var("TAM_RS_NO_NODE_FACT_SUBST").is_ok();
-        // Haskell-faithful `substNodes` order (Reduction.hs:670-672):
+        // Haskell-faithful `substNodes` order (Reduction.hs:607-609):
         //   substNodes = substNodeIds <*
         //                ((modM sNodes . M.map . apply) =<< getM sSubst)
         //
@@ -682,22 +652,17 @@ impl<'ctx> Reduction<'ctx> {
         rule_eqs.append(&mut act_eqs);
         // Pass 2: NOW apply the full term substitution to the surviving
         // rules' fact terms (mirrors HS's `M.map . apply` AFTER
-        // substNodeIds).  Skipped when TAM_RS_NO_NODE_FACT_SUBST=1.
-        if !no_node_fact_subst {
-            for (_, rule) in new_nodes.iter_mut() {
-                *rule = crate::rule::Rule {
-                    info: rule.info.clone(),
-                    premises: rule.premises.iter().map(&apply_to_fact).collect(),
-                    conclusions: rule.conclusions.iter().map(&apply_to_fact).collect(),
-                    actions: rule.actions.iter().map(&apply_to_fact).collect(),
-                    new_vars: rule.new_vars.iter()
-                        .map(|t| {
-                            let substed = tamarin_term::subst::apply_vterm(&subst, t.clone());
-                            normalize_term(substed)
-                        })
-                        .collect(),
-                };
-            }
+        // substNodeIds).
+        for (_, rule) in new_nodes.iter_mut() {
+            *rule = crate::rule::Rule {
+                info: rule.info.clone(),
+                premises: rule.premises.iter().map(&apply_to_fact).collect(),
+                conclusions: rule.conclusions.iter().map(&apply_to_fact).collect(),
+                actions: rule.actions.iter().map(&apply_to_fact).collect(),
+                new_vars: rule.new_vars.iter()
+                    .map(|t| tamarin_term::subst::apply_vterm(&subst, t.clone()))
+                    .collect(),
+            };
         }
         if dbg_set_nodes && (nodes_in > 0) {
             eprintln!("[SET_NODES_RS] nodes_in={} collisions={} shape_mismatches={} rule_eqs_queued={}",
@@ -727,17 +692,6 @@ impl<'ctx> Reduction<'ctx> {
                 self.sys.invalidate_max_var_idx_cache();
                 self.sys.eq_store = s.set_false();
                 self.changed = ChangeIndicator::Changed;
-            }
-            // Mark the conflation source so is_finished can route
-            // this gfalse to Unfinishable rather than Contradictory.
-            // Only gated under KU-exp: without it, our shape_mismatch
-            // fires from legitimate Maude narrowings that DO mean the
-            // branch is genuinely contradictory.  Default-OFF keeps
-            // baseline corpus behaviour intact; default-ON would lose
-            // matched lemmas that rely on shape-mismatch closing
-            // attack branches.  See `System::shape_mismatch_conflation`.
-            if std::env::var("TAM_ENABLE_KU_EXP").is_ok() {
-                self.sys.shape_mismatch_conflation = true;
             }
         }
         // 2. Edges: rewrite both endpoints' node ids.
@@ -800,7 +754,7 @@ impl<'ctx> Reduction<'ctx> {
         //    occurrence.
         let mut goals = std::sync::Arc::unwrap_or_clone(
             std::mem::take(&mut self.sys.goals));
-        // HS-faithful (Reduction.hs:769-783): `substGoals` iterates
+        // HS-faithful (Reduction.hs:637-651): `substGoals` iterates
         // `M.toList sGoals` which is Goal-Ord order (NodeId-first for
         // ActionG / PremiseG / ChainG).  The order matters because
         // `insertAction` for re-inserted KU msg-var goals assigns a
@@ -815,24 +769,14 @@ impl<'ctx> Reduction<'ctx> {
         // picked `KU(~na)` first.
         goals.sort_by(|(g1, _), (g2, _)|
             crate::constraint::solver::goals::goal_cmp(g1, g2));
-        // Mirror node-fact handling above (lines 414-428): apply the
-        // eq-store substitution, then Maude-normalize the result.
-        // Without the normalize step a goal's term can stay non-normal
-        // after subst — e.g. `sec → fst(pair(~sec, ~pub))` rewrites
-        // the open KU goal to `KU(fst(pair(~sec, ~pub)))` instead of
-        // `KU(~sec)`, which then takes a totally different (and wrong)
-        // source-pick path.  HS's `substFacts` (Reduction.hs) reaches
-        // the same canonical form because Tamarin's term representation
-        // is normalised on construction; we do it explicitly via Maude.
-        // Surfaced via Responder_secrecy byte-level trace:
-        // /Setup_Key/split_case_2/Initiator had goal `KU(fst(pair(...)))`
-        // in Rust where HS had `KU(~sec)`.
+        // Mirror node-fact handling above: apply the eq-store
+        // substitution to each goal term with no Maude normalization.
+        // HS's `substGoals` applies subst via the `Apply` instance and
+        // does NOT normalise; `normDG` runs only inside impliedOrInitial
+        // (System.hs:1283).
         let apply_term = |t: tamarin_term::lterm::LNTerm|
             -> tamarin_term::lterm::LNTerm {
-            let substed = tamarin_term::subst::apply_vterm(&subst, t);
-            if eager_normalize {
-                self.maude.reduce(&substed).unwrap_or(substed)
-            } else { substed }
+            tamarin_term::subst::apply_vterm(&subst, t)
         };
         let mut new_goals: Vec<(Goal, crate::constraint::system::GoalStatus)>
             = Vec::with_capacity(goals.len());
@@ -1050,7 +994,7 @@ impl<'ctx> Reduction<'ctx> {
                 if &new_f != f { *f = new_f; self.changed = ChangeIndicator::Changed; }
             }
             // HS-faithful: `substFormulas`/`substSolvedFormulas`/`substLemmas`
-            // apply via `Apply LNSubst (Set Guarded)` (Reduction.hs:696-698),
+            // apply via `Apply LNSubst (Set Guarded)` (Reduction.hs:593-595),
             // which in Haskell is `S.map (apply subst)`.  `S.map` rebuilds the
             // Set, dropping entries that collide post-substitution.  Without
             // this dedup, RS's Vec retains structurally-identical formulas
@@ -1314,15 +1258,11 @@ impl<'ctx> Reduction<'ctx> {
         // friends) handle the propagation.  Removed 2026-05-28 to restore
         // HS faithfulness; regressions allowed per project policy.
         //
-        // NOTE 2026-05-22 sess 10: simp_abstract_sorted_var is now wired
-        // but currently a no-op for protocol variants because Rust's
-        // Maude bridge returns variant range vars as `~mw:Msg` (not
-        // `~mw:Fresh`).  The `sortCompare(v.sort, lx.sort)` strict-GT
-        // check fails when both are Msg.  Resolving the upstream Maude-
-        // bridge sort divergence (Fresh-narrowing of `~mw` returned
-        // from Maude) will let this pass narrow rule body Msg-vars to
-        // Fresh witnesses, fixing the TLS Rule_case_N cluster
-        // (impossible_chain skip on Msg-var chain conc).
+        // simp_abstract_sorted_var (EquationStore.hs:471-504) no-ops on
+        // protocol variants until the Maude bridge returns Fresh-sorted
+        // `~mw`: it returns variant range vars as `~mw:Msg`, so the
+        // `sortCompare(v.sort, lx.sort)` strict-GT guard fails when both
+        // are Msg.  The fix lives in the Maude bridge, not here.
         self.insert_goal(Goal::Split(id));
         let folded;
         {
@@ -1551,22 +1491,41 @@ impl<'ctx> Reduction<'ctx> {
                     crate::elaborate::term_to_lnterm(x),
                     crate::elaborate::term_to_lnterm(y),
                 ) else { return false; };
-                // Maude `unify in MSG` is AC-unification only — it does
-                // NOT apply user [variant] equations during unification.
-                // Haskell's pipeline calls `normRule` whenever it pushes
-                // a rule instance into the dependency graph
-                // (`normDG ctxt sys`), which `Maude.reduce`s every term
-                // in every fact.  As a result, when Haskell's
-                // `insertAtom EqE` fires, both sides are already
-                // normalised, so a restriction like
-                // `Equality(verify(sign(...),...,pk(...)), true)` is seen
-                // as `Eq(true, true)` and trivially closes.
+                // KNOWN COMPENSATING DIVERGENCE (pending a faithful
+                // rule-variant / normalisation pass).
                 //
-                // We don't yet have a global `normDG` pass; the targeted
-                // fix is to normalise the two sides at the point of
-                // insertion.  This matches Haskell's behaviour exactly
-                // for the EqE case — which is the only path where
-                // user-rewrite-rule normalisation gates the proof.
+                // HS's `insertAtom (EqE x y)` does NOT reduce x/y — it is
+                // literally `void $ solveTermEqs SplitNow [Equal x y]`
+                // (Reduction.hs:413).  HS reaches this point with both
+                // sides already in Maude normal form, so a `reduce` here
+                // would be idempotent for HS.  The pre-normalisation is
+                // NOT from `normDG`/`normRule`: those run only in the
+                // diff-mode mirror path (`getMirrorDG`, System.hs:1293)
+                // and inside `impliedOrInitial`'s implied systems
+                // (System.hs:1283) — neither is on the standard `--prove`
+                // solving path (the only `normRule` callers are
+                // System.hs:1289 `normDG` + IntruderRules variant
+                // computation).  The true reason HS's EqE terms are
+                // pre-normal is rule-variant computation (`variants in
+                // MSG` yields reduced action terms) plus eq-store
+                // bindings being Maude-unifier outputs.  HS's
+                // `substSystem`/`setNodes` deliberately does NOT
+                // normalise — documented at the `apply_to_fact` comment
+                // above (eager-normalise in `substNodes` was tried and
+                // reverted: it lost source-case head shapes in test4 and
+                // blocked the `hasNonNormalTerms` contradiction in
+                // Responder_secrecy).
+                //
+                // Because Rust does not yet compute reduced rule variants,
+                // a fact's terms can still carry non-normal shapes (e.g.
+                // `verify(sign(...),...,pk(...))`) when this atom fires.
+                // We therefore reduce the two sides HERE so a restriction
+                // like `Equality(verify(sign(...),...,pk(...)), true)` is
+                // seen as `Eq(true, true)` and closes as it does in HS.
+                // For HS-normal inputs this `reduce` is a no-op; it only
+                // corrects Rust-specific residual non-normality.  Remove
+                // these two reduces once a faithful variant/normalisation
+                // pass lands.
                 let maude = self.maude.clone();
                 let tx = maude.reduce(&tx).unwrap_or(tx);
                 let ty = maude.reduce(&ty).unwrap_or(ty);
@@ -1698,7 +1657,7 @@ impl<'ctx> Reduction<'ctx> {
                 // GDisj does NOT branch on emptiness — it always traces
                 // `Disj`, inserts into sFormulas, AND inserts the DisjG
                 // goal.  When the disj is empty, the DisjG goal becomes
-                // `solveDisjunction (Disj [])` = mzero (Goals.hs:432-436)
+                // `solveDisjunction (Disj [])` = mzero (Goals.hs:393-395)
                 // — a structurally-explicit contradiction that the goal
                 // ranker can pick.  Mirror by emitting the trace event,
                 // adding to formulas, AND inserting the empty DisjG goal
@@ -2089,7 +2048,7 @@ impl<'ctx> Reduction<'ctx> {
 
     /// Remove all `Split` goals whose split id is no longer valid in
     /// the equation store. Matches Haskell's `removeSolvedSplitGoals`
-    /// at `Reduction.hs:652-657`:
+    /// at `Reduction.hs:558-561`:
     ///
     /// ```haskell
     /// removeSolvedSplitGoals = do
@@ -2218,8 +2177,7 @@ impl<'ctx> Reduction<'ctx> {
         // empty reducible signatures — pair-only theories never
         // produce non-normal subterms structurally so the check is
         // pure overhead.  See contradictions.rs::subst_creates_non_normal_terms.
-        let has_reducible = !maude.maude_sig().reducible_fun_syms.is_empty()
-            && std::env::var("TAM_DISABLE_SUBST_NF").is_err();
+        let has_reducible = !maude.maude_sig().reducible_fun_syms.is_empty();
         // The snapshot + Maude clone are consumed ONLY by the
         // `subst_creates_non_normal_terms` check in the `if has_reducible`
         // arm of `do_simp` below.  Gate the (deep) System clone + Maude
@@ -2817,11 +2775,8 @@ impl<'ctx> Reduction<'ctx> {
             .collect();
         // Snapshot pre-step-12 sys for per-arm fanout.  Only taken when
         // we have any case_subst_eqs to feed (otherwise solve_term_eqs
-        // returns Linear-trivial and there's nothing to fan out).  Kill
-        // switch: `TAM_RS_DISABLE_CONJOIN_FANOUT=1` skips snapshot and
-        // arm-fanout, restoring the prior "collapse to one arm" behavior.
-        let conjoin_fanout_enabled = !case_subst_eqs.is_empty()
-            && std::env::var("TAM_RS_DISABLE_CONJOIN_FANOUT").is_err();
+        // returns Linear-trivial and there's nothing to fan out).
+        let conjoin_fanout_enabled = !case_subst_eqs.is_empty();
         let pre_step12_snapshot: Option<crate::constraint::system::System> =
             if conjoin_fanout_enabled { Some(self.sys.clone()) } else { None };
         if std::env::var("TAM_RS_DBG_CONJOIN_STEP12").is_ok() {
@@ -3029,7 +2984,7 @@ fn make_fresh_rule(m: tamarin_term::lterm::LNTerm) -> RuleACInst {
 /// Dedup a Vec in place while preserving the FIRST occurrence's position.
 ///
 /// Mirrors HS's `S.map` behaviour on `Set Guarded` in `substFormulas` /
-/// `substSolvedFormulas` / `substLemmas` (Reduction.hs:696-698): when two
+/// `substSolvedFormulas` / `substLemmas` (Reduction.hs:593-595): when two
 /// formulas become structurally equal after substitution, `S.map` rebuilds
 /// the Set and only one survives.  Our `Vec<Guarded>` storage does NOT
 /// auto-dedup, so we need to mirror this explicitly after subst.
@@ -3634,7 +3589,7 @@ enum SubtermSplit {
 /// Returns `Err(false)` / `Err(true)` for the trivially-false /
 /// trivially-true reductions, or `Ok((nSmall, nBig))` for the
 /// terms with common AC children removed (both re-wrapped under `f`).
-fn process_ac_subterm(
+pub(crate) fn process_ac_subterm(
     f: tamarin_term::function_symbols::AcSym,
     small: &tamarin_term::lterm::LNTerm,
     big: &tamarin_term::lterm::LNTerm,
@@ -4220,7 +4175,12 @@ impl<'ctx> Reduction<'ctx> {
     /// case — `disjunctionOfList $ zip [1..] $ getDisj disj` returns
     /// `"case_" ++ show i`, so a lone alternative is `case_1`, and
     /// `ppCases` (Proof.hs:1064-1075) only elides the heading for the
-    /// EMPTY name, NOT for `case_1`.  Hence `LinearNamed("case_1")`.
+    /// EMPTY name, NOT for `case_1`.  Hence `LinearNamed("case_1")`
+    /// in the common case.  If the lone disjunct opens to an `Atom::Eq`
+    /// that fans into multiple AC unifier arms, HS's `DisjT` monad forks
+    /// the continuation per arm (the inner `disjunctionOfList` in
+    /// `solveTermEqs`), so we instead return `GoalCases::Cases` with one
+    /// `case_1` entry per arm — exactly like the multi-disjunct path.
     pub fn solve_disj_goal(&mut self, disj: &Disj<Guarded>) -> GoalCases {
         let g = Goal::Disj(disj.clone());
         let alts = &disj.0;
@@ -4254,9 +4214,11 @@ impl<'ctx> Reduction<'ctx> {
                 // non-empty.  In the singleton-Disj path we cannot
                 // emit additional `case_N` entries (the caller treats a
                 // single LinearNamed as no-fork); the arms are lost.
-                // Singleton Disjs that route through EqE-fanout are not
-                // present in the current corpus — re-evaluate if a
-                // divergence surfaces.
+                // HS reaches the branch verdict directly here (e.g.
+                // `by contradiction /* from formulas */`) rather than
+                // forking the lone disjunct, so draining the arms is the
+                // corpus-faithful behavior (a fan-out here diverges from
+                // HS on csf18-alethea individualVerifiability_sel).
                 self.pending_eq_arms.clear();
                 // Haskell names a lone disjunct `case_1` (no singleton
                 // special-case in `solveDisjunction`), so emit the name.
@@ -4343,17 +4305,8 @@ impl<'ctx> Reduction<'ctx> {
         // binding-based merge mechanism in
         // `enforce_ku_action_uniqueness` to operate on the same
         // structure as HS.
-        //
-        // Opt-out: TAM_RS_DISABLE_H18=1 restores the prior eager subst.
-        let h18_disabled = std::env::var("TAM_RS_DISABLE_H18").is_ok();
-        let prems: Vec<(crate::rule::PremIdx, crate::fact::LNFact)> = if h18_disabled {
-            let subst = &self.sys.eq_store.subst;
-            rule.enumerate_premises()
-                .map(|(p, f)| (p, f.clone().map(|t| tamarin_term::subst::apply_vterm(subst, t))))
-                .collect()
-        } else {
-            rule.enumerate_premises().map(|(p, f)| (p, f.clone())).collect()
-        };
+        let prems: Vec<(crate::rule::PremIdx, crate::fact::LNFact)> =
+            rule.enumerate_premises().map(|(p, f)| (p, f.clone())).collect();
         // Loop-breaker premises (per Haskell `praciLoopBreakers`) are
         // those whose `PremIdx` was flagged at theory-load time by the
         // dataflow loop-breaker analysis.  Goals at these premises get
@@ -4760,7 +4713,7 @@ impl<'ctx> Reduction<'ctx> {
             }
             None => {
                 // Source-case dispatch for KU action goals — mirrors
-                // Haskell's `solveWithSource` (ProofMethod.hs:461-463)
+                // Haskell's `solveWithSource` (ProofMethod.hs:320)
                 // which is called from `solve` BEFORE falling back to
                 // plain `solveGoal`.  HS picks a source whose pattern
                 // matches the goal, then `applySource` does
@@ -4774,14 +4727,6 @@ impl<'ctx> Reduction<'ctx> {
                 // regresses corpus 97/117 → 42/94 with 23 timeouts.
                 // Source-cases are the equivalent of HS's
                 // `solveWithSource`; both code paths need them.
-                //
-                // Remaining divergence (NSLPK3 line 105): Rust's
-                // source-case for KU(aenc(...)) `case I_2` includes
-                // R_1 in its grafted chain.  Need to verify whether HS's
-                // I_2 source case for the same goal also includes R_1.
-                // If yes, this is identical HS behavior and the
-                // divergence is elsewhere.  If no, our precompute
-                // grafts extra chain.
                 if std::env::var("TAM_DBG_SRC_CASE").is_ok() {
                     eprintln!("[src_case] solve_action_goal None-branch: precompute={} tag={:?} full_sources.len={}",
                         crate::constraint::solver::sources::in_precompute_mode(),
@@ -5220,7 +5165,7 @@ impl<'ctx> Reduction<'ctx> {
                             SplitStrategy::SplitNow,
                             &[tamarin_term::rewriting::Equal {
                                 lhs: fa.clone(), rhs: act.clone() }]);
-                        // HS-faithful per-arm fan-out (Goals.hs:279-280):
+                        // HS-faithful per-arm fan-out (Goals.hs:241-242):
                         //   act <- disjunctionOfList (rActs ru)
                         //   void (solveFactEqs SplitNow [Equal fa act])
                         // The `disjunctionOfList` and `solveFactEqs SplitNow`
@@ -5768,7 +5713,7 @@ impl<'ctx> Reduction<'ctx> {
         let conc_term_is_msg_var = fa_conc.terms.first()
             .map(tamarin_term::lterm::is_msg_var)
             .unwrap_or(false);
-        // HS-faithful FUnion special branch (Goals.hs:348-364).  When the
+        // HS-faithful FUnion special branch (Goals.hs:314-318).  When the
         // chain conc's KD term is a literal multiset `Union(t1,...,tn)`,
         // HS bypasses the generic destructor pool and builds bespoke
         // per-arg destructors `mkDUnionRule args arg_i` for each arg.
@@ -6006,7 +5951,7 @@ impl<'ctx> Reduction<'ctx> {
                 // + Reduction.hs labelNodeId/extendAndMark):
                 //   1. labelNodeId → exploitPrems        (Reduction.hs:219-228)
                 //   2. contradictoryIf forbiddenEdge      (Goals.hs:371 — pre-filtered above)
-                //   3. extendAndMark → insertEdges chain_extend  (Goals.hs:382)
+                //   3. extendAndMark → insertEdges chain_extend  (Goals.hs:346)
                 //
                 // Previously Rust did chain_extend insertEdges FIRST,
                 // then subst_system, then exploit_prems_supplier_only.
@@ -6052,7 +5997,7 @@ impl<'ctx> Reduction<'ctx> {
                     continue;
                 }
                 // Step 2: HS-faithful `insertEdges` chain_extend
-                // (Goals.hs:382 extendAndMark) — solveFactEqs on
+                // (Goals.hs:346 extendAndMark) — solveFactEqs on
                 // (faConc, faPrem) BEFORE adding to sEdges.
                 let res = sub.insert_edge_labeled("chain_extend", crate::constraint::constraints::Edge {
                     src: c.clone(),
@@ -6075,7 +6020,7 @@ impl<'ctx> Reduction<'ctx> {
                 // multiple unifier arms via `solveTermEqs SplitNow ->
                 // disjunctionOfList` (Reduction.hs), HS's
                 // `disjunctionOfList arms` fans out IN the surrounding
-                // Disj monad — `extendAndMark` (Goals.hs:403-407) then
+                // Disj monad — `extendAndMark` (Goals.hs:346-348) then
                 // completes the markGoalAsSolved / insertChain steps
                 // INDEPENDENTLY per arm, each arm carrying its own
                 // unifier subst.
@@ -6347,8 +6292,7 @@ impl<'ctx> Reduction<'ctx> {
         // variants against a live Eq(verify, true) restriction).
         let maude = self.maude.clone();
         let sys_snapshot = self.sys.clone();
-        let has_reducible = !maude.maude_sig().reducible_fun_syms.is_empty()
-            && std::env::var("TAM_DISABLE_SUBST_NF").is_err();
+        let has_reducible = !maude.maude_sig().reducible_fun_syms.is_empty();
         // Collect the system's free vars — these are LIVE system vars
         // (node ids, rule premise/conclusion/action vars, edges, less
         // atoms, goals, formulas).  Pass to `simp_with_fresh_avoiding`

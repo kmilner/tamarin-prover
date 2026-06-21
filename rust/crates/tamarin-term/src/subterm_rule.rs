@@ -113,9 +113,21 @@ fn constant_positions(lhs: &LNTerm) -> Vec<Position> {
                 if pos.is_empty() { positions(lhs) } else { pos }
             }
         }
-        // HS `constantPositions` only matches `FApp`; a non-App LHS has no
-        // sibling structure — fall back to all positions.
-        _ => positions(lhs),
+        // HS `constantPositions` (SubtermRule.hs:65-69) has ONLY the
+        // `FApp _ args` clause; line 2 sets `-fno-warn-incomplete-patterns`.
+        // A non-FApp (Lit) LHS — e.g. a ground equation `x = c` — therefore
+        // hits a non-exhaustive-pattern bottom in HS. The thunk is forced when
+        // the rule is inserted into the `stRules` Set (Signature.hs:162-164,
+        // via the `Ord` instance over the `[Position]` field), aborting the
+        // run with:
+        //   src/Term/SubtermRule.hs:(65,5)-(69,47): Non-exhaustive patterns
+        //   in function constantPositions
+        // We panic here to mirror that abort rather than silently accepting
+        // the rule. Unreachable on real input (no equation reaching here has
+        // a literal LHS in practice).
+        _ => panic!(
+            "src/Term/SubtermRule.hs:(65,5)-(69,47): Non-exhaustive patterns in function constantPositions"
+        ),
     }
 }
 
@@ -131,8 +143,12 @@ pub fn rrule_to_ctxt_st_rule(rule: &RRule<LNTerm>) -> Option<CtxtStRule> {
         ));
     }
     let positions = find_all_subterms(&rule.lhs, &rule.rhs)?;
-    if positions.is_empty() { return None; }
-    if positions.contains(&Vec::<i64>::new()) { return None; } // proper subterm required
+    // HS (SubtermRule.hs:52-55) matches `case sbtms of []:_ -> Nothing; [] ->
+    // Nothing; pos -> Just`. The `[]:_` arm rejects ONLY when the empty
+    // position is at the HEAD of the list; an empty position later in the
+    // list does not reject. The `is_empty()` guard above covers HS's `[]` arm,
+    // so `positions[0]` is in bounds here.
+    if positions.is_empty() || positions[0].is_empty() { return None; }
     Some(CtxtStRule::new(
         rule.lhs.clone(),
         StRhs { positions, term: rule.rhs.clone() },
@@ -171,5 +187,63 @@ mod tests {
         let rule = RRule::new(lhs, rhs);
         let ctxt = rrule_to_ctxt_st_rule(&rule).unwrap();
         assert!(!ctxt.rhs.positions.is_empty());
+    }
+
+    /// HS `rRuleToCtxtStRule` (SubtermRule.hs:52-55) rejects via the `[]:_`
+    /// arm only when the empty position is at the HEAD of the position list.
+    /// For `h(x) = f(x, h(x))`, `findAllSubterms` yields `[[0], []]`: the
+    /// empty position is SECOND, so HS keeps the rule (`pos -> Just`).
+    ///
+    /// Verified against the real HS prover (v1.13.0): loading this equation
+    /// with `--prove` accepts it (it appears in the loaded theory with a
+    /// non-subterm-convergence wellformedness warning), it is NOT rejected
+    /// with "Not a correct equation".
+    #[test]
+    fn empty_position_only_rejects_at_head() {
+        use crate::function_symbols::{Constructability, NoEqSym, Privacy};
+        use crate::term::f_app_no_eq;
+        let h_sym = NoEqSym::new(
+            b"h".to_vec(),
+            1,
+            Privacy::Public,
+            Constructability::Constructor,
+        );
+        let f_sym = NoEqSym::new(
+            b"f".to_vec(),
+            2,
+            Privacy::Public,
+            Constructability::Constructor,
+        );
+        let x = msg_var("x", 0);
+        let lhs: LNTerm = f_app_no_eq(h_sym.clone(), vec![x.clone()]); // h(x)
+        let rhs: LNTerm = f_app_no_eq(f_sym, vec![x.clone(), lhs.clone()]); // f(x, h(x))
+        let rule = RRule::new(lhs, rhs);
+        let ctxt = rrule_to_ctxt_st_rule(&rule).expect("must not be rejected");
+        // `x` at position [0] inside arg 0, then the whole `h(x)` from arg 1.
+        assert_eq!(ctxt.rhs.positions, vec![vec![0i64], Vec::<i64>::new()]);
+    }
+
+    /// HS `constantPositions` (SubtermRule.hs:65-69) has only the `FApp`
+    /// clause under `-fno-warn-incomplete-patterns`; a literal LHS produces a
+    /// non-exhaustive-pattern bottom. Verified against the real HS prover:
+    /// loading `x = c` (with `c/0`) aborts with
+    ///   src/Term/SubtermRule.hs:(65,5)-(69,47): Non-exhaustive patterns in
+    ///   function constantPositions
+    /// We mirror that abort with a panic.
+    #[test]
+    #[should_panic(expected = "Non-exhaustive patterns in function constantPositions")]
+    fn literal_lhs_ground_equation_panics() {
+        use crate::function_symbols::{Constructability, NoEqSym, Privacy};
+        use crate::term::f_app_no_eq;
+        let c_sym = NoEqSym::new(
+            b"c".to_vec(),
+            0,
+            Privacy::Public,
+            Constructability::Constructor,
+        );
+        let lhs = msg_var("x", 0); // literal (Var) LHS
+        let rhs: LNTerm = f_app_no_eq(c_sym, vec![]); // ground RHS `c`
+        let rule = RRule::new(lhs, rhs);
+        let _ = rrule_to_ctxt_st_rule(&rule);
     }
 }

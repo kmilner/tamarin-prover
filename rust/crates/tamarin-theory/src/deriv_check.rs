@@ -12,30 +12,29 @@
 //! How HS does it (verbatim — see `MessageDerivationChecks.hs:35-50,181-188`):
 //!
 //!   For each rule R indexed by idx:
-//!     1. Drop ALL rules/lemmas/restrictions from the theory.
-//!     2. `replacePrivate`: rewrite every private NoEq fun-sym to public
-//!        (HS `MessageDerivationChecks.hs:46,94-98` maps `replacePrivate`
-//!        over the Out terms; the synthetic theory is also closed over a
-//!        public signature).  This is needed because the synthetic rule
-//!        emits Out facts and the intruder must be able to apply former-
-//!        private destructors.  In RS, symbol privacy is resolved at
-//!        elaborate time from `FunctionDecl.private`, so `synthesise_probe_
-//!        theory` flips every copied Functions decl to `private: false`,
-//!        which has the same combined effect.  (HS `makeFunsPublic` is a
-//!        misnomer — it only does SignatureWithMaude→SignaturePure and does
-//!        NOT flip privacy; only `replacePrivate` does.)
-//!     3. Add a single generated rule:
+//!     1. Drop ALL rules/lemmas/restrictions from the theory, carrying over
+//!        the signature items (builtins/functions/equations/macros) VERBATIM
+//!        — privacy flags included.  HS's `makeFunsPublic` and `replacePrivate`
+//!        both look like they make symbols public but neither changes the
+//!        verdict: `makeFunsPublic` only sets the OPEN theory's pure signature,
+//!        which `closeTheoryWithMaude sig` overwrites with the ORIGINAL private-
+//!        preserving maude signature (so intruder-rule generation stays private);
+//!        and `replacePrivate` rewrites Out-term heads to a same-name Public
+//!        variant that gets no construction/destruction rule, leaving the term
+//!        opaque exactly as the private application would be.  See
+//!        `synthesise_probe_theory` for the full citation.
+//!     2. Add a single generated rule:
 //!          rule Generated_<idx>:
 //!            [ Fr(~v1), Fr(~v2), ... ]                  // each free var of R
 //!            --[ Generated_<idx>(v1, v2, ...) ]->        // sole action
 //!            [ Out(t1), Out(t2), ... ]                   // R's premise terms
-//!     4. Add one exists-trace lemma per free var v.  HS's `landFormula`
+//!     3. Add one exists-trace lemma per free var v.  HS's `landFormula`
 //!        gives each conjunct its OWN timepoint via `zip [0..]`, and the
 //!        intruder-knowledge predicate is `KU` (`lntermToKUFact = kuFact`):
 //!          lemma deriv_v: exists-trace
 //!            "Ex v1 v2 ... #t0 #t1. Generated_<idx>(v1, v2, ...) @ #t0 & KU(v) @ #t1"
-//!     5. Run the prover on each lemma with `--derivcheck-timeout`.
-//!     6. Lemmas whose proof did NOT find a trace identify non-derivable
+//!     4. Run the prover on each lemma with `--derivcheck-timeout`.
+//!     5. Lemmas whose proof did NOT find a trace identify non-derivable
 //!        variables — report them.
 //!
 //! Note: `prove_probe` builds the `ProofContext` + runs `ensure_saturated()`
@@ -248,9 +247,16 @@ fn collect_all_nullary_fun_names(thy: &p::Theory) -> std::collections::BTreeSet<
 /// yields elements in ascending LVar Ord.  (Internally the dedup pass
 /// collects in first-occurrence order, but the result is re-sorted before
 /// return.)  EXCLUDING:
-///   - `Pub`-sort vars (`$x`) — HS's `deleteGlobals` drops these:
-///     they are adversary-known by definition.
-///   - `Node`-sort vars (`#i`) — timepoints, not message vars.
+///   - `Pub`-sort vars (`$x`) — RS drops these up-front as a sound
+///     optimization.  HS keeps them in `freeVars` (its `freesInThyRules`,
+///     MessageDerivationChecks.hs:168-172, filters out only `LSortNode`,
+///     not `LSortPub`) and generates a `KU($x)` lemma for each; but the
+///     intruder knows every public name, so those lemmas are ALWAYS
+///     TraceFound and the pub var is never reported.  (`deleteGlobals`,
+///     MessageDerivationChecks.hs:190-191, does drop Pub vars, but only
+///     inside the generated rule/action, not from the reported var list.)
+///   - `Node`-sort vars (`#i`) — timepoints, not message vars.  HS's
+///     `freesInThyRules` filters these out (the only sort it drops).
 ///   - Suffix-sorted vars whose underlying sort is Pub or Node, for the
 ///     same reason.
 ///   - Names that are actually 0-arity function calls (e.g. user-
@@ -320,7 +326,7 @@ fn sort_ord(s: &p::SortHint) -> u8 {
 }
 
 /// HS `lvarToLnterm`: retype an LSortNat var to LSortFresh; otherwise keep
-/// the var's sort unchanged (MessageDerivationChecks.hs:213-215).
+/// the var's sort unchanged (MessageDerivationChecks.hs:216-218).
 fn nat_to_fresh_var(v: &p::VarSpec) -> p::VarSpec {
     let mut nv = v.clone();
     if matches!(v.sort, p::SortHint::Nat | p::SortHint::Suffix(p::SuffixSort::Nat)) {
@@ -408,35 +414,42 @@ fn synthesise_probe_theory(
         configuration: None,
         items: Vec::new(),
     };
-    // Carry over the signature items.  Drops rules/lemmas/restrictions.
+    // Carry over the signature items VERBATIM.  Drops rules/lemmas/restrictions.
     //
-    // HS rewrites every private function symbol to public for the probe
-    // theory.  It does this two ways that, in the RS model, collapse into
-    // one: `replacePrivate` rewrites `FApp (NoEq (..,Private,..))` → Public
-    // on the Out terms (MessageDerivationChecks.hs:46,94-98), and the
-    // synthetic theory is closed over a signature in which those symbols are
-    // public, so the intruder may apply former-private destructors.  In RS,
-    // symbol privacy is NOT embedded per-occurrence in the parser AST; it is
-    // resolved at elaborate time from `FunctionDecl.private` (elaborate.rs
-    // `set_user_funs_for_theory`).  So flipping every copied Functions decl
-    // to `private: false` makes the elaborator treat those symbols as public
-    // EVERYWHERE — in the rule's Out terms AND in intruder-rule generation —
-    // which is exactly the combined effect of `replacePrivate` + closing
-    // over a public signature.  Without this, a variable derivable only via a
-    // private function is spuriously flagged "Failed to derive Variable(s)".
+    // HS keeps the maude signature PRIVATE for the deriv-check probe.  Two HS
+    // operations look like they make symbols public, but neither affects the
+    // verdict:
+    //   * `makeFunsPublic` (MessageDerivationChecks.hs:43,100-101) is just
+    //     `L.set thySignature (toSignaturePure sig)` — it sets the OPEN theory's
+    //     *pure* signature, which `closeTheoryWithMaude sig ...`
+    //     (MessageDerivationChecks.hs:41, Prover.hs:171-178) immediately
+    //     OVERWRITES with the ORIGINAL `SignatureWithMaude sig` (the 5th field
+    //     of the `Theory` record).  Intruder-rule generation runs off that
+    //     original maude signature (`closeRuleCache ... sig ...`, Rule.hs:144),
+    //     so destructor/constructor rules see the symbols as Private exactly as
+    //     in the real theory.  `makeFunsPublic` is a misnomer that touches only
+    //     pretty/storage state, never the verdict.
+    //   * `replacePrivate` (MessageDerivationChecks.hs:46,94-98) rewrites a
+    //     private NoEq head on the Out terms to a Public-headed variant of the
+    //     SAME name/arity.  That variant is never inserted into `stFunSyms`/
+    //     `stRules`, so it gets no construction rule (constructionRules iterates
+    //     `stFunSyms`, IntruderRules.hs:217-219) and no destruction rule (stRules
+    //     is keyed on the original private symbol; the variant matches nothing).
+    //     The intruder can coerce the whole opaque application KD→KU but cannot
+    //     peel a sub-variable out of it — behaviorally identical to leaving the
+    //     private application in place.  In RS, privacy is resolved by NAME at
+    //     elaborate time (elaborate.rs `set_user_funs_for_theory`), so there is
+    //     no per-occurrence public variant; emulating `replacePrivate` would
+    //     resolve to the real public signature symbol and re-introduce the
+    //     divergence.  So we mirror HS by doing NEITHER: keep privacy as-is.
+    //
+    // The Rust intruder-rule generation (intruder_rules.rs:164 destructor-skip,
+    // :648 Public-only `construction_rules` filter, `private_constructor_rules`)
+    // already matches IntruderRules.hs:149/219 once the privacy flags survive.
     for it in &src.items {
         match it {
-            p::TheoryItem::Functions(decls) => {
-                let public_decls: Vec<p::FunctionDecl> = decls.iter()
-                    .map(|d| {
-                        let mut d = d.clone();
-                        d.private = false;
-                        d
-                    })
-                    .collect();
-                probe.items.push(p::TheoryItem::Functions(public_decls));
-            }
-            p::TheoryItem::Builtins(_)
+            p::TheoryItem::Functions(_)
+            | p::TheoryItem::Builtins(_)
             | p::TheoryItem::Equations { .. }
             | p::TheoryItem::Macros(_) => {
                 probe.items.push(it.clone());
@@ -456,11 +469,13 @@ fn synthesise_probe_theory(
     // Each free var gets a UNIQUE probe name (`dvar<k>`) keeping its sort
     // (nat→fresh).  HS distinguishes same-named/different-sort vars (`~ltk`
     // vs `ltk`) via sort-aware LVar identity in de Bruijn conversion; RS's
-    // formula→guarded path binds quantifiers by name, so two `Ex ltk ltk`
-    // binders would be ambiguous and mis-resolve `KU(~ltk)`.  Unique names
-    // sidestep that with NO effect on derivability (variable names are
-    // immaterial to the intruder); the WfError still reports the ORIGINAL
-    // var name (prove_probe uses `free_vars`).
+    // `formula_to_guarded` keys binders by NAME (not the full sort-aware
+    // LVar identity), so two `Ex ltk ltk` binders would be ambiguous and
+    // mis-resolve `KU(~ltk)`.  The unique `dvar<k>` naming is the mechanism
+    // that recovers HS's sort-disambiguation, with NO effect on derivability
+    // (variable names are immaterial to the intruder); the original var name
+    // is restored for the WfError report via `show_lvar` (prove_probe uses
+    // `free_vars`).
     let probe_vars: Vec<p::VarSpec> = free_vars.iter().enumerate()
         .map(|(k, v)| {
             let mut nv = nat_to_fresh_var(v);
@@ -539,7 +554,7 @@ fn synthesise_probe_theory(
         let t1 = p::VarSpec { name: "t1".into(), idx: 0, sort: p::SortHint::Node, typ: None };
         let gen_at = action_atom(action.clone(), p::Term::Var(t0.clone()));
         let ku_fact = p::Fact {
-            // KU is Persistent per factTagMultiplicity (Model/Fact.hs:358);
+            // KU is Persistent per factTagMultiplicity (Model/Fact.hs:356);
             // keep the "for special names, persistent == tag multiplicity"
             // invariant so GFact equality with parsed KU facts is faithful.
             persistent: true,
@@ -717,6 +732,10 @@ fn format_deriv_report(per_rule: &[(String, Vec<String>)]) -> Vec<WfError> {
         "  The variables of the following rule(s) are not derivable \
          from their premises, you may be performing unintended pattern \
          matching.\n\n");
+    // The per-rule blocks are intentionally NOT 2-space-indented: HughesPJ
+    // `nest 2` re-indents only the first line of a `text`, leaving text that
+    // follows a literal `\n` un-reindented, so HS's 2-space indent lands on
+    // the intro line only and every `Rule X:` block starts at column 0.
     let blocks: Vec<String> = per_rule.iter()
         .map(|(rule_name, vars)| {
             format!("Rule {}: \nFailed to derive Variable(s): {}",
@@ -782,5 +801,80 @@ mod tests {
         let thy = parse_theory(src, &[]).expect("parse");
         let report = check_message_derivation(&thy, &m, 0);
         assert!(report.is_empty(), "timeout=0 should disable the check");
+    }
+
+    /// Start a Maude handle whose signature is elaborated from `src` (so the
+    /// theory's own `functions:`/`equations:` symbols — including a private
+    /// destructor — are present), exactly as the real driver does via
+    /// `elaborated.signature.maude_sig` (run.rs:644).  Returns `None` if Maude
+    /// is unavailable.
+    fn maude_for(src: &str) -> Option<(p::Theory, MaudeHandle)> {
+        let p = "/home/linuxbrew/.linuxbrew/bin/maude";
+        if !std::path::Path::new(p).exists() { return None; }
+        let thy = parse_theory(src, &[]).expect("parse");
+        // `elaborate` installs the per-theory user-funs guards internally.
+        let elaborated = crate::elaborate::elaborate(&thy).expect("elaborate");
+        let sig = elaborated.signature.maude_sig.clone();
+        let handle = MaudeHandle::start(p, sig).ok()?;
+        Some((thy, handle))
+    }
+
+    // The privacy of a function symbol is load-bearing for the deriv-check
+    // verdict, and HS keeps it PRIVATE for the probe theory (it does NOT flip
+    // privacy: `makeFunsPublic` is overwritten by `closeTheoryWithMaude sig`
+    // and `replacePrivate` is inert — see `synthesise_probe_theory`).  The two
+    // tests below pin HS's discriminating behaviour, confirmed against the
+    // real prover (tamarin-prover v1.13.0, `--derivcheck-timeout=10`):
+    //   * private `dec`  → `m` reported "Failed to derive Variable(s)".
+    //   * public  `dec`  → `m` derivable, nothing reported.
+    // Before the fix, the Rust probe flipped privacy to public, so the private
+    // case wrongly matched the public verdict (no report).
+
+    #[test]
+    fn deriv_check_flags_var_recoverable_only_via_private_destructor() {
+        // `m` is recoverable from the premise terms ONLY by applying the
+        // PRIVATE destructor `dec`, which the intruder may not use.  HS reports
+        // `m` as non-derivable.  (Probed: tamarin-prover 1.13.0 emits
+        // "Rule Reveal: \nFailed to derive Variable(s): m".)
+        let src = r#"
+            theory T begin
+              functions: dec/2 [private], enc/2
+              equations: dec(enc(m, k), k) = m
+              rule Reveal:
+                [ In(enc(m, k)), In(k) ]
+                --[ Got(m) ]->
+                [ Out(dec(enc(m, k), k)) ]
+              lemma trivial: exists-trace "Ex m #i. Got(m) @ i"
+            end
+        "#;
+        let Some((thy, m)) = maude_for(src) else { return };
+        let report = check_message_derivation(&thy, &m, 10);
+        assert_eq!(report.len(), 1, "expected one report, got {:?}", report);
+        assert!(report[0].message.contains("Reveal")
+                && report[0].message.contains("Failed to derive Variable(s)")
+                && report[0].message.contains("m"),
+            "expected `m` flagged in Rule Reveal, got {:?}", report);
+    }
+
+    #[test]
+    fn deriv_check_passes_when_destructor_is_public() {
+        // Same theory but `dec` is PUBLIC, so the intruder can apply it and
+        // recover `m`.  HS reports nothing.  (Probed: tamarin-prover 1.13.0
+        // emits no "Message Derivation Checks" section.)
+        let src = r#"
+            theory T begin
+              functions: dec/2, enc/2
+              equations: dec(enc(m, k), k) = m
+              rule Reveal:
+                [ In(enc(m, k)), In(k) ]
+                --[ Got(m) ]->
+                [ Out(dec(enc(m, k), k)) ]
+              lemma trivial: exists-trace "Ex m #i. Got(m) @ i"
+            end
+        "#;
+        let Some((thy, m)) = maude_for(src) else { return };
+        let report = check_message_derivation(&thy, &m, 10);
+        assert!(report.is_empty(),
+            "public `dec` → `m` derivable; expected no report, got {:?}", report);
     }
 }

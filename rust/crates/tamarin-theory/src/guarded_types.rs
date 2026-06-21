@@ -127,7 +127,8 @@ pub fn term_to_gterm_free(t: &p::Term) -> GTerm {
     match t {
         // A bare identifier that names a user-declared 0-arity function is a
         // CONSTANT (nullary application), not a variable — mirror HS's
-        // `fAppNoEq sym []` and `term_to_lnterm` (elaborate.rs:1464).  Without
+        // `fAppNoEq sym []` and the nullary-fun branch of `term_to_lnterm`
+        // (elaborate.rs:1558).  Without
         // this, a declared `true/0`/`false/0` used inside a formula (e.g.
         // OIDC_Implicit's `Verified(...,true)` / `...,false)` restrictions,
         // conjoined into a lemma's proof obligation) is lifted to a FREE
@@ -265,8 +266,12 @@ pub fn gatom_to_atom(a: &GAtom) -> p::Atom {
 /// Matching is by **(name, idx)** only — sort is ignored — because the
 /// parser sometimes produces inconsistent sort hints for the same logical
 /// variable (e.g. `Ex #i. P @ i` parses the binder as `Node` and the
-/// body reference as `Untagged`).  This mirrors the pre-DeBruijn Rust
-/// behaviour where `VarSubst` keys were `(String, u64)`.
+/// body reference as `Untagged`).  HS's `lookup` uses full `LVar` Eq, which
+/// *does* compare sort, but HS reaches `closeGuarded` only after sort
+/// resolution has made every occurrence of a logical variable carry the
+/// same sort; our `VarSpec` here still carries the raw parser sort hint, so
+/// (name, idx) is the HS-faithful key.  This also mirrors the pre-DeBruijn
+/// Rust behaviour where `VarSubst` keys were `(String, u64)`.
 pub fn subst_free_term_at_depth(t: &GTerm, s: &[(p::VarSpec, u32)], depth: u32) -> GTerm {
     match subst_free_term_cow(t, s, depth) {
         Some(g) => g,
@@ -756,8 +761,8 @@ mod tests {
     /// P(Bound 1, Bound 0) — x is one binder deeper, y is at the
     /// innermost.
     ///
-    /// We don't model the full Guarded tree here yet (Phase 3); this
-    /// just exercises that subst_free at depth gives the expected shift.
+    /// This test only exercises subst_free at depth (the full
+    /// Guarded-tree walk lives in `guarded.rs::subst_free_guarded`).
     #[test]
     fn nested_close_shift() {
         // Suppose we already closed `forall y. P(x, y)` — y is Bound 0,
@@ -801,8 +806,8 @@ mod tests {
     }
 
     /// Alpha-equivalence test: `forall x. P(x)` and `forall y. P(y)` should
-    /// produce IDENTICAL closed atoms (modulo binding name, which we strip
-    /// at Phase 3 via GBinding having no idx).
+    /// produce IDENTICAL closed atoms (modulo binding name, which lives in the
+    /// GBinding/GGuarded layer — stripped of idx — not in the GAtom).
     #[test]
     fn close_alpha_equivalence() {
         let x = vs("x", 0);

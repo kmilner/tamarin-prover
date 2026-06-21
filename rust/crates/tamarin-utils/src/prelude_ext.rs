@@ -149,12 +149,14 @@ pub fn split_by<T: Clone, F: FnMut(&T) -> bool>(xs: &[T], mut p: F) -> Vec<Vec<T
             had_separator = false;
         }
     }
+    // Matches Haskell `unfoldr split`: a chunk is emitted before every
+    // separator and once more for the final (non-separator-terminated)
+    // remainder. The final partial chunk `cur` is emitted unless the input
+    // ended on a separator AND `cur` is empty, i.e. `!had_separator ||
+    // !cur.is_empty()`.
     if !had_separator || !cur.is_empty() {
         out.push(cur);
     }
-    // Haskell quirk: a trailing separator on a non-empty input still drops
-    // the empty chunk, but trailing-separator on an empty chunk is included
-    // when the previous chunk was non-empty. The check above covers both.
     out
 }
 
@@ -359,6 +361,13 @@ mod tests {
         let trail = vec![1, 2, 0];
         // Haskell: trailing separator yields a single chunk [1,2] and no trailing empty.
         assert_eq!(split_by(&trail, |x| *x == 0), vec![vec![1, 2]]);
+        // Adjacent and leading separators lock the Haskell `unfoldr split` semantics:
+        // a chunk (possibly empty) is emitted before every separator.
+        let empty_i32: Vec<i32> = vec![];
+        assert_eq!(split_by(&[0, 0], |x| *x == 0), vec![empty_i32.clone(), empty_i32.clone()]);
+        assert_eq!(split_by(&[0], |x| *x == 0), vec![empty_i32.clone()]);
+        assert_eq!(split_by(&[1, 0, 0, 2], |x| *x == 0), vec![vec![1], empty_i32.clone(), vec![2]]);
+        assert_eq!(split_by(&[0, 1, 2], |x| *x == 0), vec![empty_i32.clone(), vec![1, 2]]);
     }
 
     #[test]

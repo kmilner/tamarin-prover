@@ -325,8 +325,20 @@ pub fn pretty_closed_theory(
         .flatten()
         .cloned()
         .collect();
+    // Collect predicate declarations once.  HS `expandRestriction` /
+    // `expandLemma` (TheoryObject.hs:430-446) predicate-expand BOTH the
+    // main and original formulas of every restriction/lemma against the
+    // theory's predicates (which includes the builtin `Smaller`/multiset-
+    // `(<)`), so the displayed formula is always the expanded one.  The
+    // parse already succeeded, so every referenced predicate is defined;
+    // using the full set for display-time expansion is safe.
+    let predicates: Vec<p::Predicate> = parsed.items.iter()
+        .filter_map(|i| if let p::TheoryItem::Predicates(ps) = i { Some(ps.as_slice()) } else { None })
+        .flatten()
+        .cloned()
+        .collect();
     let rendered: Vec<Option<String>> = parsed.items.par_iter()
-        .map(|item| render_parsed_item(item, &macros, elaborated, proved, in_file))
+        .map(|item| render_parsed_item(item, &macros, &predicates, elaborated, proved, in_file))
         .collect();
     for b in rendered.into_iter().flatten() {
         out.push('\n');
@@ -547,6 +559,7 @@ fn sep_block_with_lead(lead: &str, items: &[(String, String)]) -> String {
 fn render_parsed_item(
     item: &p::TheoryItem,
     macros: &[p::Macro],
+    predicates: &[p::Predicate],
     elab: &Theory,
     proved: &[ProvedLemma],
     in_file: &str,
@@ -573,8 +586,8 @@ fn render_parsed_item(
             }
         }
         IntrRule(_) => None,
-        Lemma(l) => Some(render_parsed_lemma(l, macros, proved, in_file, elab)),
-        Restriction(r) => Some(render_parsed_restriction(r, macros, elab)),
+        Lemma(l) => Some(render_parsed_lemma(l, macros, predicates, proved, in_file, elab)),
+        Restriction(r) => Some(render_parsed_restriction(r, macros, predicates, elab)),
         Predicates(preds) => {
             // HS `prettyTheory` folds each `PredicateItem` through
             // `prettyPredicate` (TheoryObject.hs:764, 802-806):
@@ -630,7 +643,7 @@ fn render_parsed_item(
             let mut active: Vec<&p::TheoryItem> = then_items.iter().collect();
             if let Some(else_b) = else_items { active.extend(else_b.iter()); }
             let blocks: Vec<String> = active.iter()
-                .filter_map(|it| render_parsed_item(it, macros, elab, proved, in_file))
+                .filter_map(|it| render_parsed_item(it, macros, predicates, elab, proved, in_file))
                 .collect();
             if blocks.is_empty() { None } else { Some(blocks.join("\n\n")) }
         }
@@ -719,11 +732,11 @@ fn render_parsed_macros(macros: &[p::Macro]) -> String {
 }
 
 /// Render a rule's attribute block `[...]`, mirroring HS `prettyRuleAttributes`
-/// / `prettyRuleAttribute` (Model/Rule.hs:1201-1217).  HS emits a FIXED-order
+/// / `prettyRuleAttribute` (Model/Rule.hs:1191-1205).  HS emits a FIXED-order
 /// `catMaybes [color, process, no_derivcheck, issapicrule, role]` joined by
 /// `fsep . punctuate comma` (", "), wrapped in `[`..`]`; empty → nothing.
 /// External (`x-…`) attributes are NOT in HS's list, so they are dropped.
-/// Build HS `prettyRuleAttribute`'s ordered part list (Model/Rule.hs:1202-1208).
+/// Build HS `prettyRuleAttribute`'s ordered part list (Model/Rule.hs:1192-1198).
 ///
 /// HS stores the parsed attribute LIST folded into a `RuleAttributes` STRUCT via
 /// its `Semigroup` (Model/Rule.hs:370-385): for the `Maybe`-typed fields
@@ -760,7 +773,7 @@ fn rule_attribute_parts(attrs: &[p::RuleAttr]) -> Vec<String> {
     parts
 }
 
-/// Build the `prettyRuleAttributes` Doc (Model/Rule.hs:1217-1221):
+/// Build the `prettyRuleAttributes` Doc (Model/Rule.hs:1207-1211):
 ///   `mempty == ruleAttributes ⇒ emptyDoc`,
 ///   else `hcat [text "[", prettyRuleAttribute ru, text "]"]`,
 /// where `prettyRuleAttribute = fsep $ punctuate comma [..]`.  Returning a Doc
@@ -1326,448 +1339,24 @@ fn lnterm_to_parser(t: &tamarin_term::lterm::LNTerm) -> p::Term {
     }
 }
 
-/// HS ribbon width.  HS uses `lineWidth = 110` (Main/Console.hs:236)
-/// with `defaultStyle`'s `ribbonsPerLine = 1.5` → ribbon length =
-/// `floor(110/1.5) = 73`.  HughesPJ `fsep` uses the ribbon to decide
-/// whether the next item fits on the current line:
-///
-/// ```text
-/// current_line_length - line_start_indent + next_item_len  <= ribbon
-/// ```
-///
-/// i.e. the line content (past the leading indent) cannot exceed the
-/// ribbon.  We model this by passing a target maximum end column of
-/// `indent + RIBBON` to the wrap decisions.
-const RIBBON: usize = 73;
+/// HughesPJ default-`style` line length used by the oracle/tactic
+/// ranking path.  HS `render = P.render` (`Text.PrettyPrint.Class`
+/// re-exports `P.render` from HughesPJ — Class.hs:77-78), and `P.render`
+/// uses HughesPJ's default `style { lineLength = 100 }`.  This is
+/// DISTINCT from the `--prove` DISPLAY width (`pretty_hpj::LINE_LENGTH`
+/// = 110, set by `defaultStyle { lineLength = 110 }` in Console.hs:392).
+const ORACLE_LINE_LENGTH: usize = 100;
 
-/// HS page width — the hard cap on total line length.  Mirrors
-/// `lineWidth = 110` (Main/Console.hs:236).  HughesPJ uses
-/// `min(line_start + ribbon, page_width)` as the inline-fit threshold,
-/// so deeply-nested lines can never exceed `PAGE_WIDTH` regardless of
-/// how generous the ribbon would be.
-const PAGE_WIDTH: usize = 110;
-
-/// Like `render_fact_at_with_trailing` but the inline-fit check reserves
-/// `trailing_chars` cols at the end of the line for caller-emitted
-/// trailing text (e.g. ` ▶₁ #i )` after a Premise goal's fact).  This
-/// mirrors HS's `fits` walking PAST the fact's nestShort' sep Union
-/// into the OUTER doc's remaining text — HS sees the trailing chars
-/// when deciding inline-vs-vertical at the fact's sep.
-fn render_fact_at_with_trailing(fa: &p::Fact, indent: usize, line_start: usize, trailing_chars: usize) -> String {
-    let head = {
-        let mut s = String::new();
-        if fa.persistent { s.push('!'); }
-        s.push_str(&fa.name);
-        s.push('(');
-        s
-    };
-    if fa.args.is_empty() {
-        return format!("{} )", head);
-    }
-    // Try inline.
-    let inline = {
-        let mut s = head.clone();
-        s.push(' ');
-        for (i, t) in fa.args.iter().enumerate() {
-            if i > 0 { s.push_str(", "); }
-            s.push_str(&pf::pretty_term(t));
-        }
-        s.push_str(" )");
-        s
-    };
-    let inline_max_col = std::cmp::min(line_start + RIBBON, PAGE_WIDTH);
-    // HughesPJ `fits` accepts a flat doc whose width exactly consumes the
-    // budget (`len <= width`), so use `<=` (matching `render_term_at` and
-    // `fsep_pack_inner`), not strict `<` which would break one column early.
-    if indent + inline.chars().count() + trailing_chars <= inline_max_col && !inline.contains('\n') {
-        return inline;
-    }
-    // Multi-line shape from `nestShort'`:
-    //   Name( <first_arg>,
-    //         <more_args fsep-packed>
-    //   )
-    // First-arg lands at col `indent + len(head) + 1` (the `$$` overlap
-    // puts the body's first line right after `Name( `).  Continuation
-    // lines at `indent + len(head) + 1`.  Close `)` on its own line at
-    // `indent` (HS's outer `sep` finish position).
-    let head_len = head.chars().count();
-    let cont_indent = indent + head_len + 1;
-    // HS `nestShort'` (Class.hs:218-223): `sep [lead $$ nest n body, finish]`.
-    // The `$$` puts `body`'s first line on the SAME line as `lead`
-    // (overlap), so the first arg lands at `cont_indent` on the
-    // current line — `line_start` propagates THROUGH from the fact's
-    // line.  Continuation lines (if any arg wraps) land at col
-    // `cont_indent` on fresh lines (their line_start = cont_indent).
-    //
-    // We pre-render each arg at the FACT'S `line_start` (matches the
-    // overlap-line budget for arg 1).  When fsep_pack later forces a
-    // break, the broken arg's continuation lines will be slightly
-    // more wrapped than HS would do at `line_start = cont_indent` —
-    // but never less.  HS-faithful in the common case (single-arg
-    // facts like `!KU( aead(...) )`).
-    let item_strs: Vec<String> = fa.args.iter()
-        .map(|t| render_term_at(t, cont_indent, line_start))
-        .collect();
-    let body = fsep_pack(&item_strs, cont_indent, ", ", line_start);
-    let pad = " ".repeat(indent);
-    format!("{} {}\n{})", head, body, pad)
-}
-
-/// Render a parser-AST term with wrap-awareness.  The output's first
-/// char will land at column `indent`; continuation lines (when the
-/// term wraps internally) start at column `indent` too.
-///
-/// `line_start`: column where the OUTPUT line on which this term begins
-/// started.  Equal to `indent` when the term is at the start of a fresh
-/// line; less than `indent` when it's mid-line.  Used for HS-faithful
-/// ribbon check `indent + inline_len - line_start <= RIBBON`, mirroring
-/// HughesPJ's `lineLength - ribbonsPerLine` semantics.
-fn render_term_at(t: &p::Term, indent: usize, line_start: usize) -> String {
-    // Try inline first — HS-faithful ribbon + pageWidth check.
-    // HughesPJ's effective inline budget is
-    // `min(line_start + RIBBON, PAGE_WIDTH)`.
-    let inline = pf::pretty_term(t);
-    let max_col = std::cmp::min(line_start + RIBBON, PAGE_WIDTH);
-    if indent + inline.chars().count() <= max_col && !inline.contains('\n') {
-        return inline;
-    }
-    // Decompose at the top-level constructor.
-    match t {
-        p::Term::Pair(items) => render_pair_at(items, indent, line_start),
-        p::Term::App(name, args) if !args.is_empty() => {
-            render_app_at(name, args, indent, line_start)
-        }
-        p::Term::AlgApp(name, l, r) => {
-            // HS-faithful: `aenc{m}pk` surface form, but prettyTerm emits
-            // it as `Name(m, pk)` — match `pretty_term`.
-            render_app_at(name, &[(**l).clone(), (**r).clone()], indent, line_start)
-        }
-        p::Term::Diff(l, r) => {
-            render_app_at("diff", &[(**l).clone(), (**r).clone()], indent, line_start)
-        }
-        p::Term::BinOp(p::BinOp::Exp, l, r) => {
-            // Exp `a^b` can't be broken at the `^` — leave inline.
-            // (Constituents may individually be long, but HS also
-            // doesn't break exp.)
-            let _ = (l, r);
-            inline
-        }
-        _ => inline,
-    }
-}
-
-/// Render `<a, b, c, ...>` at `indent`, wrapping inside `<...>` when
-/// overflowing.  HS uses `ppTerms ", " 1 "<" ">" (split t)` which is
-/// `fcat . (text "<" :) . (++[text ">"]) . map (nest 1) . punctuate
-/// comma . map ppTerm` (Term/Term.hs:288-290).  fcat is greedy-fill.
-///
-/// Layout when wrapping:
-/// ```text
-/// <first_arg, second_arg,
-///  third_arg,
-///  fourth_arg
-/// >
-/// ```
-/// First arg on same line as `<`; continuation at col-of-`<` + 1.
-/// Close `>` on own line at col-of-`<` when body wrapped to multiple
-/// lines; inline otherwise.
-///
-/// `line_start`: column where the OUTPUT line on which this pair's `<`
-/// lands started.  Equal to `indent` when `<` is at start of a fresh
-/// line; less when mid-line.  See `render_term_at`.
-fn render_pair_at(items: &[p::Term], indent: usize, line_start: usize) -> String {
-    if items.is_empty() {
-        return "<>".to_string();
-    }
-    let inline = {
-        let mut s = String::from("<");
-        for (i, t) in items.iter().enumerate() {
-            if i > 0 { s.push_str(", "); }
-            s.push_str(&pf::pretty_term(t));
-        }
-        s.push('>');
-        s
-    };
-    let inline_max_col = std::cmp::min(line_start + RIBBON, PAGE_WIDTH);
-    // HughesPJ `fits` is `len <= width`; use `<=` (matching `render_term_at`
-    // and `fsep_pack_inner`), not strict `<` which breaks one column early.
-    if indent + inline.chars().count() <= inline_max_col && !inline.contains('\n') {
-        return inline;
-    }
-    let cont_indent = indent + 1;
-    // Pre-render at `line_start = cont_indent` (the laxest budget,
-    // matching the eventual fresh-wrap-line case).  See `render_app_at`.
-    let item_strs: Vec<String> = items.iter()
-        .map(|t| render_term_at(t, cont_indent, cont_indent))
-        .collect();
-    // HS observed behavior:
-    //   - When the first item is multi-line, fcat breaks BEFORE it
-    //     (placing `<` alone on its own line, item 0 on next line at
-    //     `cont_indent`).  This is fcat's "can't inline a multi-line
-    //     doc after `<`" rule.
-    //   - When the first item is single-line, fcat inlines it after `<`
-    //     and greedily packs subsequent items.
-    //   - When any item is multi-line, the closing `>` goes on its own
-    //     line at col-of-`<`.
-    // first_is_multiline triggers the `<\n<inner_pad><body>>` layout
-    // (HS break-before-first-item when item 0 can't fit inline after `<`).
-    // We also trigger this when the FIRST item, while single-line, would
-    // overflow the ribbon at the pair's items col — keeping `<X` inline
-    // would force the line past `line_start + RIBBON`, so HS breaks at `<`
-    // and starts the item on its own fresh line at cont_indent (where
-    // its continuation lines align).
-    let first_is_too_wide = item_strs.first().map(|s| {
-        let first_line_len = match s.find('\n') {
-            Some(j) => s[..j].chars().count(),
-            None => s.chars().count(),
-        };
-        let max_col = std::cmp::min(line_start + RIBBON, PAGE_WIDTH);
-        cont_indent + first_line_len > max_col
-    }).unwrap_or(false);
-    let first_is_multiline = item_strs.first().map(|s| s.contains('\n')).unwrap_or(false)
-        || first_is_too_wide;
-    let last_is_multiline = item_strs.last().map(|s| s.contains('\n')).unwrap_or(false);
-    // For the inner-pair body fsep, line_start is the column where
-    // the outer `<` was opened — that's the OUTER `line_start` (the
-    // render_pair_at caller's line_start), since `<` is on that
-    // same line.  When `first_is_multiline`, we emit `<\n...` so the
-    // body's first item is on a fresh line at col `cont_indent`; in
-    // that case we pass `cont_indent` as line_start to fsep_pack.
-    let body_line_start = if first_is_multiline { cont_indent } else { line_start };
-    let body = fsep_pack_pair(&item_strs, cont_indent, body_line_start);
-    let pad = " ".repeat(indent);
-    let inner_pad = " ".repeat(cont_indent);
-    // HS-observed rule for close `>` placement:
-    //   - If the LAST item is multi-line, `>` goes on its own line at
-    //     col-of-`<` (the outer pair's indent).  HS examples:
-    //     wireguard L_State outer pair (line 105-121), Out pair where
-    //     last item is multi-line aead.
-    //   - If the last item is single-line, `>` attaches to body's last
-    //     line if it fits in the ribbon.  HS example: wireguard Out
-    //     pair where last items `$mac1, $mac2` pack onto a line.
-    //
-    // `close_fits` uses absolute-col ribbon check: compute the col
-    // where `>` would land, compare against the ribbon for the line it
-    // would sit on.
-    let body_is_multi = body.contains('\n');
-    let body_last_line_len = match body.rfind('\n') {
-        Some(j) => body[j + 1..].chars().count(),
-        None => body.chars().count(),
-    };
-    // Col where `>` would land if attached after body's last char.
-    // For single-line body: `<` at indent, body at indent+1..indent+body_len,
-    // `>` at indent+1+body_len.
-    // For multi-line body: body's last line starts at col 0 (after `\n`),
-    // already padded by fsep_pack to `cont_indent` leading spaces;
-    // `>` lands at col body_last_line_len.
-    let (gt_col, gt_line_start) = if body_is_multi {
-        (body_last_line_len, cont_indent)
-    } else {
-        let pair_starts_fresh = first_is_multiline;
-        let body_line_start = if pair_starts_fresh { cont_indent } else { line_start };
-        (indent + 1 + body_last_line_len, body_line_start)
-    };
-    let close_max = std::cmp::min(gt_line_start + RIBBON, PAGE_WIDTH);
-    let close_fits = !last_is_multiline && gt_col < close_max;
-    if first_is_multiline {
-        // `<\n<inner_pad><body>\n<pad>>` (close on own line when last
-        // is multi-line; attached when fits).
-        if close_fits {
-            format!("<\n{}{}>", inner_pad, body)
-        } else {
-            format!("<\n{}{}\n{}>", inner_pad, body, pad)
-        }
-    } else if close_fits {
-        format!("<{}>", body)
-    } else {
-        format!("<{}\n{}>", body, pad)
-    }
-}
-
-/// Render `Name( a, b, c, ... )` at `indent`, wrapping inside the
-/// parens when overflowing.  Mirrors HS `ppFun` (Term/Term.hs:295-296):
-///   `ppFun f ts = text (BC.unpack f ++"(") <> fsep (punctuate comma (map ppTerm ts)) <> text ")"`.
-///
-/// `line_start`: see `render_term_at`.
-fn render_app_at(name: &str, args: &[p::Term], indent: usize, line_start: usize) -> String {
-    let head = format!("{}(", name);
-    let inline = {
-        let mut s = head.clone();
-        for (i, t) in args.iter().enumerate() {
-            if i > 0 { s.push_str(", "); }
-            s.push_str(&pf::pretty_term(t));
-        }
-        s.push(')');
-        s
-    };
-    let inline_max_col = std::cmp::min(line_start + RIBBON, PAGE_WIDTH);
-    // HughesPJ `fits` is `len <= width`; use `<=` (matching `render_term_at`
-    // and `fsep_pack_inner`), not strict `<` which breaks one column early.
-    if indent + inline.chars().count() <= inline_max_col && !inline.contains('\n') {
-        return inline;
-    }
-    // HS `ppFun` uses `text (f ++ "(") <> fsep (...)  <> text ")"` (no
-    // `nestShort'`).  The `fsep` starts right after `Name(` and lays
-    // out items.  When wrapping, items continue at col-of-`(` + 1.
-    // Close `)` attaches to last line (since the `<>` glues it on).
-    let cont_indent = indent + head.chars().count();
-    // Items land on the SAME line as `Name(` (which started at the
-    // outer `line_start`).  Pre-render against that OUTER line_start
-    // so internal inline-fit decisions match the first-line ribbon
-    // budget.  fsep_pack then handles per-item break decisions for
-    // subsequent items — when an item breaks to a fresh line at col
-    // `cont_indent`, its already-rendered form may be slightly more
-    // wrapped than necessary, but never less.  HS-faithful in the
-    // common case (single-arg apps like `h(pair)` where the only arg
-    // stays on the first line).
-    let item_strs: Vec<String> = args.iter()
-        .map(|t| render_term_at(t, cont_indent, line_start))
-        .collect();
-    // line_start passes THROUGH: the `Name(` lands at `indent` on a
-    // line that started at `line_start`, so fsep_pack's first-line
-    // ribbon-fit check is against `line_start + RIBBON`.
-    let body = fsep_pack(&item_strs, cont_indent, ", ", line_start);
-    format!("{}{})", head, body)
-}
-
-/// Greedy fsep packer.  Given pre-rendered items (each starting at
-/// column 0 of its first line; continuation lines already pre-indented
-/// to `indent`), join them with `sep` (typically `", "`) and break to a
-/// new line at column `indent` when the next item would push the
-/// current line past the ribbon budget.
-///
-/// `line_start`: the column where the CURRENT line started (= the
-/// outer caller's leading indent).  For HS-faithful behavior, ribbon
-/// fits are measured from `line_start` (not `indent`) on the first
-/// line; from `indent` on subsequent (broken) lines.
-///
-/// `trim_break_space`: when true, the trailing space in `sep` (e.g. the
-/// ` ` in `", "`) is TRIMMED before the line break — HS's `fsep` with
-/// `punctuate comma` produces `f1,\n<indent>f2` shape (no trailing
-/// space after the comma).  When false, the full `sep` is kept at end
-/// of broken line — matches HS's pair-fcat shape `f1, \n<indent>f2`.
-///
-/// Returns the packed body (no leading newline, no leading indent
-/// before the first item).
-fn fsep_pack(items: &[String], indent: usize, sep: &str, line_start: usize) -> String {
-    fsep_pack_inner(items, indent, sep, line_start, /*trim_break_space=*/true)
-}
-
-fn fsep_pack_inner(items: &[String], indent: usize, sep: &str, line_start: usize, trim_break_space: bool) -> String {
-    if items.is_empty() {
-        return String::new();
-    }
-    let sep_chars = sep.chars().count();
-    let break_sep: String = if trim_break_space {
-        sep.trim_end().to_string()
-    } else {
-        sep.to_string()
-    };
-    let mut out = String::new();
-    let mut col = indent;
-    // `cur_line_start` is the col where the CURRENT line started.  On
-    // the very first iteration this is `line_start` (the outer caller's
-    // line start, possibly less than `indent`).  After a break this is
-    // `indent`.
-    let mut cur_line_start = line_start;
-    // After a multi-line item, the next item ALWAYS starts on a new
-    // line (HS observed behavior: fsep doesn't pack items onto the
-    // last line of a multi-line predecessor).
-    let mut force_break = false;
-    for (i, item) in items.iter().enumerate() {
-        let first_line_len = match item.find('\n') {
-            Some(j) => item[..j].chars().count(),
-            None => item.chars().count(),
-        };
-        let last_line_len = match item.rfind('\n') {
-            Some(j) => item[j + 1..].chars().count(),
-            None => item.chars().count(),
-        };
-        let is_multiline = item.contains('\n');
-        // HS-faithful ribbon + pageWidth constraint: line content past
-        // `cur_line_start` cannot exceed RIBBON, AND total col cannot
-        // exceed PAGE_WIDTH.  HughesPJ uses
-        // `min(line_start + ribbon, page_width)` as the inline-fit
-        // threshold (Text.PrettyPrint.HughesPJ source).
-        let max_col = std::cmp::min(cur_line_start + RIBBON, PAGE_WIDTH);
-        if i == 0 {
-            // First item lands at current col (= indent).  Multi-line
-            // items' continuation lines are pre-indented to `indent`,
-            // matching the line's absolute indent.
-            out.push_str(item);
-            col = if is_multiline { last_line_len } else { col + first_line_len };
-            if is_multiline { cur_line_start = indent; force_break = true; }
-        } else {
-            // Fit check: `col + sep + item_first_line_len <= max_col`.
-            // For multi-line items, also require they land at a fresh
-            // break (col == indent) so continuation lines' pre-indent
-            // matches the absolute col.  Otherwise force a break.
-            //
-            // Note: HS's `fsep`/`fill` (HughesPJ.hs:780-805) uses
-            // `fillNBE`/`fits` to decide at each item-boundary whether
-            // to inline.  `fits` walks the flat alt's RESOLVED doc tree
-            // and returns True as soon as it hits a `NilAbove` or
-            // `Empty`.  In practice this means "first line of flat
-            // alt fits".  When a later item internally breaks (its
-            // `nestShort'` Union picks multi-line), `fits` short-circuits
-            // True at that internal NilAbove — so the OUTER item's
-            // boundary Union can still pick "inline", even when the
-            // total flat doesn't fit.  Greedy `col + sep + first_line`
-            // check approximates this within RS's non-Doc-tree packer.
-            // HS-faithful lookahead: when the NEXT item is multi-line
-            // (forcing a break AFTER us), the `break_sep` (typically ",")
-            // is appended at the END of our line before the newline.  HS's
-            // `fits` walks past the boundary into the next fillNBE Union
-            // and sees the trailing `,` from `punctuate`'s `arg_i <> ","`.
-            // We reserve 1 extra col for that trailing break_sep so the
-            // inline-fit decision accounts for it (matching HS's `fits`
-            // walking arg_(i-1)<>"," + " " + arg_i<>"," up to the next
-            // NilAbove from the multi-line break).
-            let break_sep_reserve = if i + 1 < items.len() && items[i + 1].contains('\n') {
-                // break_sep is sep with trailing space trimmed (when
-                // trim_break_space=true) → 1 char less than sep_chars.
-                // Concretely sep ", " → break_sep "," → 1 char.
-                if trim_break_space { sep_chars - 1 } else { 0 }
-            } else {
-                0
-            };
-            let inline_fits = !force_break
-                && col + sep_chars + first_line_len + break_sep_reserve <= max_col
-                && (!is_multiline || col + sep_chars == indent);
-            if inline_fits {
-                out.push_str(sep);
-                out.push_str(item);
-                col = if is_multiline { last_line_len } else { col + sep_chars + first_line_len };
-                if is_multiline { cur_line_start = indent; force_break = true; }
-                else { force_break = false; }
-            } else {
-                out.push_str(&break_sep);
-                out.push('\n');
-                out.push_str(&" ".repeat(indent));
-                out.push_str(item);
-                col = if is_multiline { last_line_len } else { indent + first_line_len };
-                cur_line_start = indent;
-                force_break = is_multiline;
-            }
-        }
-    }
-    out
-}
-
-/// Variant of `fsep_pack` for pair `<...>` body — uses HS's `fcat`
-/// behaviour where the comma separator is `", "` (with trailing space)
-/// and the break point keeps the trailing space at end of broken line.
-/// HS output for pair body has the quirk that broken lines end with
-/// `", "` (space then newline), then next line at `indent`.
-fn fsep_pack_pair(items: &[String], indent: usize, line_start: usize) -> String {
-    fsep_pack_inner(items, indent, ", ", line_start, /*trim_break_space=*/false)
-}
+/// HughesPJ default-`style` ribbon length used by the oracle/tactic
+/// path: `ribbonsPerLine = 1.5` → `round(100/1.5) = round(66.67) = 67`.
+/// DISTINCT from the display ribbon `pretty_hpj::RIBBON` = 73.
+const ORACLE_RIBBON: usize = 67;
 
 // =============================================================================
 // Lemma
 // =============================================================================
 
-fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], proved: &[ProvedLemma], in_file: &str, elab: &Theory) -> String {
+fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], predicates: &[p::Predicate], proved: &[ProvedLemma], in_file: &str, elab: &Theory) -> String {
     use crate::pretty_hpj::{self as hpj, Doc};
     let mut out = String::new();
     // HS `prettyLemmaName` (Lemma.hs:91-95):
@@ -1804,7 +1393,10 @@ fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], proved: &[ProvedLemm
     // so the rendered formula must do the same.  Apply BEFORE the AC sort so
     // the canonicaliser sees the folded `h(<…>)` shape.
     let arity1 = arity1_noeq_names(elab);
-    let folded_formula = crate::elaborate::rewrite_arity1_formula(&lem.formula, &arity1);
+    // HS `expandLemma` (TheoryObject.hs:439-446) predicate-expands the lemma
+    // formula before it is stored/printed (e.g. multiset `(<)` → `∃ z. …`).
+    let expanded_formula = expand_predicates_for_display(&lem.formula, predicates);
+    let folded_formula = crate::elaborate::rewrite_arity1_formula(&expanded_formula, &arity1);
     // HS sorts AC arguments at parse time when building `LNTerm` via `fAppAC`
     // (Term/Term/Raw.hs:118-122); our parser keeps `BinOp` trees in written
     // order, so re-establish the canonical AC operand order on the formula
@@ -1815,7 +1407,7 @@ fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], proved: &[ProvedLemm
     out.push('\n');
 
     // /* guarded formula characterizing ... */
-    out.push_str(&render_guarded_block(lem, macros, &arity1));
+    out.push_str(&render_guarded_block(lem, macros, predicates, &arity1));
 
     // Proof body — either the prover's result (if --prove ran) or
     // the lemma's stored skeleton.
@@ -1865,7 +1457,7 @@ fn quantifier_keyword(q: &p::TraceQuantifier) -> &'static str {
     }
 }
 
-fn render_guarded_block(lem: &p::Lemma, macros: &[p::Macro], arity1: &std::collections::HashSet<String>) -> String {
+fn render_guarded_block(lem: &p::Lemma, macros: &[p::Macro], predicates: &[p::Predicate], arity1: &std::collections::HashSet<String>) -> String {
     let header = match &lem.trace_quantifier {
         p::TraceQuantifier::ExistsTrace => "guarded formula characterizing all satisfying traces:",
         p::TraceQuantifier::AllTraces => "guarded formula characterizing all counter-examples:",
@@ -1879,6 +1471,9 @@ fn render_guarded_block(lem: &p::Lemma, macros: &[p::Macro], arity1: &std::colle
     } else {
         crate::macro_expand::apply_macros_formula(macros, &lem.formula)
     };
+    // HS `expandLemma` predicate-expands before guarded conversion, so
+    // `Pred` sugar and multiset `(<)` never reach `formulaToGuarded`.
+    let expanded_formula = expand_predicates_for_display(&expanded_formula, predicates);
     // Fold surplus args of arity-1 functions into a pair (HS `naryOpApp`
     // `k == 1`, Term.hs:84-87) so the guarded form carries `h(<…>)` not
     // `h(…)`.  Same fold as the header path above.
@@ -1931,7 +1526,19 @@ fn render_guarded_block(lem: &p::Lemma, macros: &[p::Macro], arity1: &std::colle
 // Restriction
 // =============================================================================
 
-fn render_parsed_restriction(r: &p::Restriction, macros: &[p::Macro], elab: &Theory) -> String {
+/// Predicate-expand a formula for DISPLAY, mirroring HS `expandFormula`
+/// (Theory/Syntactic/Predicate.hs:82-93) as applied by `expandRestriction` /
+/// `expandLemma` (TheoryObject.hs:430-446).  This rewrites `Pred` sugar — and
+/// the builtin multiset `(<)` / `Smaller` — into the surviving atom forms, so
+/// the displayed lemma/restriction text matches HS byte-for-byte.  The parse
+/// already succeeded (so every referenced predicate is defined and arities
+/// match); should expansion nonetheless error, fall back to the un-expanded
+/// formula rather than panic.
+fn expand_predicates_for_display(f: &p::Formula, predicates: &[p::Predicate]) -> p::Formula {
+    crate::predicate_expand::expand_formula(f, predicates).unwrap_or_else(|_| f.clone())
+}
+
+fn render_parsed_restriction(r: &p::Restriction, macros: &[p::Macro], predicates: &[p::Predicate], elab: &Theory) -> String {
     // HS `prettyRestriction` (TheoryObject.hs:846-857):
     //   The `Restriction` carries two formulas after `applyMacroInRestriction`:
     //   - `_rstrFormula`         = macro-EXPANDED formula  (displayed in expanded block)
@@ -1944,13 +1551,21 @@ fn render_parsed_restriction(r: &p::Restriction, macros: &[p::Macro], elab: &The
     // Fold arity-1 surplus args into a pair first (HS `naryOpApp` `k == 1`,
     // Term.hs:84-87), exactly as the parser would — applies to BOTH the
     // original and expanded displays since HS folds at parse time.
+    //
+    // HS `expandRestriction` (TheoryObject.hs:430-437) predicate-expands BOTH
+    // formulas (`f'`, `ofm'`), so e.g. the multiset `(<)` operator is rewritten
+    // to `∃ z. r = l ++ z` BEFORE the formula is stored — and thus before it is
+    // printed.  Mirror that here on both displayed formulas.
     let arity1 = arity1_noeq_names(elab);
-    let original = crate::elaborate::rewrite_arity1_formula(&r.formula, &arity1);
+    let original = crate::elaborate::rewrite_arity1_formula(
+        &expand_predicates_for_display(&r.formula, predicates), &arity1);
     let expanded = if macros.is_empty() {
         original.clone()
     } else {
         crate::elaborate::rewrite_arity1_formula(
-            &crate::macro_expand::apply_macros_formula(macros, &r.formula), &arity1)
+            &expand_predicates_for_display(
+                &crate::macro_expand::apply_macros_formula(macros, &r.formula), predicates),
+            &arity1)
     };
     let mut out = String::new();
     out.push_str("restriction ");
@@ -2363,104 +1978,26 @@ fn pp_step_at(m: &crate::constraint::solver::proof_method::ProofMethod, indent: 
     }
 }
 
-/// Render a `Goal` for `solve(...)` output.  Mirrors HS `prettyGoal`
-/// (Constraints.hs:267-282).
-/// Also used as oracle stdin goal text (ProofMethod.hs:828).
-pub(crate) fn render_goal_for_oracle(g: &crate::constraint::constraints::Goal) -> String {
-    render_goal_at(g, 0, 0)
-}
-
-/// Wrap-aware goal renderer.  `indent` is the column where the goal's
-/// first character will land — used so internal facts/terms can decide
-/// to wrap when their inline form overflows the ribbon.  `line_start`
-/// is the column where the OUTPUT line that contains the goal started;
-/// it's used as the ribbon base for HS-faithful inline-fit decisions
-/// when the goal is placed mid-line (e.g. inside `solve( <goal> )`
-/// where the goal lands at col `line_start + 7`).
-/// `trailing_chars`: chars the CALLER will append after this goal on
-/// the same line (e.g. ` )` for `solve(...)`).  Threaded into the
-/// fact's nestShort' inline-fit check so HS-faithful break decisions
-/// account for what comes after.
-fn render_goal_at(g: &crate::constraint::constraints::Goal, indent: usize, line_start: usize) -> String {
-    render_goal_at_trailing(g, indent, line_start, 0)
-}
-
-fn render_goal_at_trailing(g: &crate::constraint::constraints::Goal, indent: usize, line_start: usize, trailing_chars: usize) -> String {
-    use crate::constraint::constraints::Goal;
-    use crate::rule::PremIdx;
-    match g {
-        // `prettyGoal (ActionG i fa) = prettyNAtom (Action (varTerm i) fa)`
-        // which expands (Atom.hs:214-215) to `prettyFact ppT fa <-> opAction <-> text (show v)`.
-        // `<->` is hsep-with-space → `<fact> @ <node-id>`.
-        // Trailing for the fact = ` @ <node-id>` + caller's trailing.
-        Goal::Action(i, fa) => {
-            let nid = render_node_id(i);
-            let fact_trailing = 1 + 1 + 1 + nid.chars().count() + trailing_chars;
-            format!("{} @ {}", render_lnfact_at_with_trailing(fa, indent, line_start, fact_trailing), nid)
-        }
-        // `prettyGoal (ChainG c p) = prettyNodeConc c <-> operator_ "~~>" <-> prettyNodePrem p`
-        Goal::Chain(c, p) =>
-            format!("{} ~~> {}", render_node_conc(c), render_node_prem(p)),
-        // `prettyGoal (PremiseG (i, PremIdx v) fa) =
-        //    prettyLNFact fa <-> text ("▶" ++ subscript (show v)) <-> prettyNodeId i`
-        // Trailing for the fact = ` ▶<subscript> <nid>` + caller's trailing.
-        Goal::Premise((i, PremIdx(v)), fa) => {
-            let sub = goal_subscript(*v);
-            let nid = render_node_id(i);
-            let fact_trailing = 1 + 1 + sub.chars().count() + 1 + nid.chars().count() + trailing_chars;
-            format!("{} \u{25B6}{} {}",
-                render_lnfact_at_with_trailing(fa, indent, line_start, fact_trailing), sub, nid)
-        }
-        // `prettyGoal (SplitG x) = text "splitEqs" <> parens (text $ show (unSplitId x))`
-        // `<>` is `<>` (no space) so it's `splitEqs(<n>)`.
-        Goal::Split(id) => format!("splitEqs({})", id.0),
-        // `prettyGoal (DisjG (Disj [])) = text "Disj" <-> operator_ "(⊥)"`
-        // → `Disj (⊥)` (one space, from `<->`).
-        Goal::Disj(d) if d.0.is_empty() => "Disj (\u{22A5})".to_string(),
-        // `prettyGoal (DisjG (Disj gfs)) =
-        //    fsep $ punctuate (operator_ "  ∥") (map (nest 1 . parens . prettyGuarded) gfs)`
-        // `punctuate` puts the separator AFTER each non-last element,
-        // and `fsep` joins with a space.  Each disjunct is `nest 1 (parens …)`,
-        // and HS's `nest 1` emits a LEADING space on the first element even at
-        // column 0, so the result is ` (<g1>)  ∥ (<g2>)  ∥ (<g3>)`.  A flat
-        // `join` would drop that leading space and diverge from the oracle
-        // stdin HS produces, so route through the same Doc path the display
-        // side uses (`disj_goal_to_doc`).
-        Goal::Disj(d) => {
-            crate::pretty_formula::disj_goal_to_doc(&d.0)
-                .render_at(crate::pretty_hpj::LINE_LENGTH, crate::pretty_hpj::RIBBON, indent)
-        }
-        // `prettyGoal (SubtermG (l,r)) =
-        //    prettyLNTerm l <-> operator_ "⊏" <-> prettyLNTerm r`
-        Goal::Subterm((l, r)) =>
-            format!("{} \u{228F} {}", render_lnterm(l), render_lnterm(r)),
-    }
-}
-
-/// Render an `LNFact` for goal output.  Mirrors HS `prettyFact`
-/// (Fact.hs:537-544) via `nestShort'` (Class.hs:218-223): in single-line
-/// form the body is sandwiched with spaces — `Name( arg1, arg2 )`.
-/// For arity-0: `Name( )`.  Persistent tags get a `!` prefix via
-/// `showFactTag` (Fact.hs:519-523).
+/// Render a `Goal` for the oracle/tactic ranking path.  This is HS's
+/// `render $ prettyGoal g` from `ProofMethod.hs:607,702` (oracle stdin)
+/// and `Tactics.hs` `pg = concat . lines . render $ prettyGoal agoal`
+/// (tactic regex string).  All consumers (goals.rs oracle stdin /
+/// `apply_ranking_fn` / `tactic_pg`) immediately apply `concat . lines`
+/// to drop the newlines, so the byte-for-byte requirement is on each
+/// line's internal text (leading indent spaces survive the `concat`).
 ///
-/// Wrap-aware: when the inline form exceeds the ribbon from `indent`,
-/// lays out the args with HS-faithful `nestShort'` semantics (see
-/// `render_fact_at_with_trailing` for the parser-AST equivalent).
-fn render_lnfact_at_with_trailing(fa: &crate::fact::LNFact, indent: usize, line_start: usize, trailing_chars: usize) -> String {
-    use crate::fact::Multiplicity;
-    let prefix = match &fa.tag {
-        crate::fact::FactTag::Proto(Multiplicity::Persistent, _, _) => "!",
-        // HS `factTagMultiplicity` (Fact.hs:353-358): KU/KD are persistent.
-        crate::fact::FactTag::Ku | crate::fact::FactTag::Kd => "!",
-        _ => "",
-    };
-    let name = crate::fact::fact_tag_name(&fa.tag);
-    if fa.terms.is_empty() {
-        return format!("{}{}( )", prefix, name);
-    }
-    // Convert to parser-AST and reuse the wrap-aware fact renderer.
-    let pfa = lnfact_to_parser(fa);
-    render_fact_at_with_trailing(&pfa, indent, line_start, trailing_chars)
+/// Width: the oracle/tactic path uses plain `render = P.render`
+/// (`Theory.Text.Pretty` re-exports `Text.PrettyPrint.Class.render`,
+/// which is `P.render` from HughesPJ — Class.hs:77-78).  `P.render`
+/// uses HughesPJ's DEFAULT `style`: `lineLength = 100`,
+/// `ribbonsPerLine = 1.5` → `ribbon = round(100/1.5) = 67`.  This is
+/// DISTINCT from the `--prove` display path, which uses
+/// `renderStyle (defaultStyle { lineLength = 110 })` (Console.hs:392),
+/// i.e. width 110 / ribbon 73 (`pretty_hpj::LINE_LENGTH`/`RIBBON`).
+/// We build the goal via the same `solve_goal_to_doc` builder the
+/// display path uses, then render it at the oracle width.
+pub(crate) fn render_goal_for_oracle(g: &crate::constraint::constraints::Goal) -> String {
+    solve_goal_to_doc(g).render_at(ORACLE_LINE_LENGTH, ORACLE_RIBBON, 0)
 }
 
 /// Build the `solve( <goal> )` Doc for an unannotated (replayed) step from
@@ -2793,4 +2330,76 @@ fn render_generated_from(build: &BuildInfo) -> String {
         build.git_branch,
         build.compiled_at,
     )
+}
+
+#[cfg(test)]
+mod oracle_goal_tests {
+    use super::*;
+    use crate::constraint::constraints::Goal;
+    use crate::fact::{Fact, FactTag, LNFact, Multiplicity};
+    use crate::rule::PremIdx;
+    use tamarin_term::lterm::{LSort, LVar, LNTerm};
+    use tamarin_term::vterm::Lit;
+    use tamarin_term::term::Term;
+
+    fn fresh(name: &str) -> LNTerm {
+        Term::Lit(Lit::Var(LVar::new(name, LSort::Fresh, 0)))
+    }
+
+    /// The oracle/tactic ranking string is HS's `concat . lines . render`,
+    /// where `render = P.render` uses HughesPJ's default `style`
+    /// (lineLength = 100, ribbon = 67) — NOT the `--prove` DISPLAY width
+    /// (110 / 73, used by `renderStyle (defaultStyle { lineLength = 110 })`
+    /// in Console.hs:392).
+    ///
+    /// Authentic ground truth (captured from the v1.13.0 HS prover with an
+    /// oracle that echoes stdin, on a crafted theory whose premise goal is
+    /// 69 columns wide):
+    ///
+    /// ```text
+    /// 0: !KeyStore0( ~keyaaaaaaaaaaaaaaaaaaaa, ~msgbbbbbbbbbbbbbbbbbbbb) ▶₀ #l
+    /// ```
+    ///
+    /// Note the absence of a space before the closing `)`: at ribbon 67 the
+    /// fact's `nestShort'` (Fact.hs:539-544) wraps, pushing `)` onto its own
+    /// line at column 0, and `concat . lines` then joins it directly to the
+    /// preceding `~msgbbbbbbbbbbbbbbbbbbbb`.  At the DISPLAY ribbon 73 the same
+    /// goal stays inline (`... ~msgbbbbbbbbbbbbbbbbbbbb )`, with the space).
+    /// This distinguishes the two widths and pins the behavioural fix.
+    #[test]
+    fn premise_goal_wraps_at_oracle_ribbon_67() {
+        // !KeyStore0( ~keyaaaaaaaaaaaaaaaaaaaa, ~msgbbbbbbbbbbbbbbbbbbbb ) ▶₀ #l
+        let fa: LNFact = Fact::new(
+            FactTag::Proto(Multiplicity::Persistent, "KeyStore0".into(), 2),
+            vec![fresh("keyaaaaaaaaaaaaaaaaaaaa"), fresh("msgbbbbbbbbbbbbbbbbbbbb")],
+        );
+        let node = LVar::new("l", LSort::Node, 0);
+        let goal = Goal::Premise((node, PremIdx(0)), fa);
+
+        // HS: `concat . lines . render $ prettyGoal g`.
+        let rendered = render_goal_for_oracle(&goal);
+        let collapsed: String = rendered.lines().collect::<Vec<_>>().concat();
+
+        assert_eq!(
+            collapsed,
+            "!KeyStore0( ~keyaaaaaaaaaaaaaaaaaaaa, ~msgbbbbbbbbbbbbbbbbbbbb) \u{25B6}\u{2080} #l",
+            "oracle goal string must match HS `render` at default ribbon 67 \
+             (wrapped fact: no space before `)`)",
+        );
+
+        // The SAME goal at the DISPLAY width (110 / 73) stays inline, keeping
+        // the space before `)`.  This guards against silently swapping the
+        // oracle width back to the display width.
+        let display: String = solve_goal_to_doc(&goal)
+            .render_at(crate::pretty_hpj::LINE_LENGTH, crate::pretty_hpj::RIBBON, 0)
+            .lines()
+            .collect::<Vec<_>>()
+            .concat();
+        assert_eq!(
+            display,
+            "!KeyStore0( ~keyaaaaaaaaaaaaaaaaaaaa, ~msgbbbbbbbbbbbbbbbbbbbb ) \u{25B6}\u{2080} #l",
+            "display width must keep the fact inline (space before `)`)",
+        );
+        assert_ne!(collapsed, display, "oracle and display widths must differ here");
+    }
 }

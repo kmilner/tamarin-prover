@@ -14,10 +14,14 @@ use std::process::Command;
 
 use tamarin_parser::{parse_theory, wf};
 
+fn corpus_root() -> std::path::PathBuf {
+    std::env::var("CORPUS_ROOT").map(std::path::PathBuf::from).unwrap_or_else(|_| {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../examples")
+    })
+}
+
 fn main() {
-    let root = env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| {
-        PathBuf::from("/home/parallels/tamarin-prover/examples")
-    });
+    let root = env::args().nth(1).map(PathBuf::from).unwrap_or_else(corpus_root);
     let limit: Option<usize> = env::var("WF_LIMIT").ok().and_then(|s| s.parse().ok());
 
     let mut files: Vec<PathBuf> = walkdir::WalkDir::new(&root)

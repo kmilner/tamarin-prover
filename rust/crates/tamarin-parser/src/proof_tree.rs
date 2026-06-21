@@ -87,19 +87,13 @@ impl<'a> TreeParser<'a> {
         }
         // interProof: <method> ( case-block | proofSkeleton )
         let m = self.proof_method()?;
-        // Decide: do we have a case-block or just an inline subproof?
-        // HS: `(sepBy oneCase "next" <* "qed") <|>
-        //      ((return . (,) "") <$> proofSkeleton)`
-        // `oneCase` starts with `case <ident>`, so if the next token
-        // is `case`, we're in the case-block branch.  Otherwise:
-        //   - if next token is a proof-skeleton starter, that's an
-        //     inline single-child sub-proof (single case with name "").
-        //   - else: this method is a leaf (e.g. `simplify` followed by
-        //     nothing if the proof ended).  Tolerated by HS via the
-        //     "" subproof branch returning whatever proofSkeleton
-        //     succeeded with — but if proofSkeleton fails the whole
-        //     parse fails.  We surface this as an unrecognised
-        //     terminator by returning the method with no children.
+        // HS: `cases <- (sepBy oneCase "next" <* "qed") <|>
+        //               ((return . (,) "") <$> proofSkeleton)`
+        // (Proof.hs:111-112).  `oneCase` starts with `case <ident>`, so
+        // a `case` token here means the case-block branch.  Otherwise HS
+        // *requires* a recursive `proofSkeleton` (the inline single-child
+        // subproof, named ""); there is NO childless-leaf branch — an
+        // interProof method must be followed by a child.
         self.lx.skip_ws();
         if self.peek_kw("case") {
             let mut cases: Vec<(String, ParsedProofTree)> = Vec::new();
@@ -113,18 +107,20 @@ impl<'a> TreeParser<'a> {
             return Ok(ParsedProofTree { method: m, cases });
         }
         // Inline (single-child) subproof.  HS: `(return . (,) "") <$>
-        // proofSkeleton`.  If a proof-skeleton starter follows, recurse;
-        // otherwise return a leaf.
-        if self.at_proof_starter() {
-            let sub = self.proof_skeleton()?;
-            return Ok(ParsedProofTree {
-                method: m,
-                cases: vec![("".to_string(), sub)],
-            });
-        }
-        // Method is itself a leaf (rare for interProof but fine — e.g.
-        // a single `simplify` at end-of-proof).
-        Ok(ParsedProofTree { method: m, cases: Vec::new() })
+        // proofSkeleton` — this alternative ALWAYS requires a successful
+        // recursive `proofSkeleton`.  If neither a case-block nor a
+        // following proofSkeleton parses, HS `interProof` fails (verified
+        // against the v1.13.0 prover: a bare `simplify` with no child is a
+        // parse error, "expecting case/qed/by/...").  We mirror that by
+        // failing here; the caller (parser.rs `try_proof_skeleton`)
+        // downgrades the `Err` to `tree: None` and replays via the
+        // auto-prover — matching HS, where a failed skeleton parse yields
+        // no usable tree.
+        let sub = self.proof_skeleton()?;
+        Ok(ParsedProofTree {
+            method: m,
+            cases: vec![("".to_string(), sub)],
+        })
     }
 
     /// HS `oneCase` (Proof.hs:115):
@@ -201,8 +197,8 @@ impl<'a> TreeParser<'a> {
     }
 
     /// Identifier with extended chars: HS's `identifier` accepts
-    /// alphanum + `_` and emits names like `Server_ReceiveOTP_NewSession_case_1`.
-    /// Case names may also include `-` (rare; we tolerate it).
+    /// alphanum + `_` (Token.hs:224 `identLetter = alphaNum <|> oneOf "_"`)
+    /// and emits names like `Server_ReceiveOTP_NewSession_case_1`.
     fn identifier_extended(&mut self) -> Result<String, ProofTreeParseError> {
         self.lx.skip_ws();
         let mut s = String::new();
@@ -241,20 +237,6 @@ impl<'a> TreeParser<'a> {
             }
         }
         Ok(s)
-    }
-
-    /// True iff a token immediately follows that can start a
-    /// proofSkeleton.  Used to decide whether `interProof`'s
-    /// "inline subproof" branch fires.
-    fn at_proof_starter(&mut self) -> bool {
-        self.lx.skip_ws();
-        for kw in &[
-            "sorry", "simplify", "contradiction", "induction",
-            "solve", "by", "SOLVED", "INVALIDATED", "UNFINISHABLE",
-        ] {
-            if self.lx.peek_symbol(kw) { return true; }
-        }
-        false
     }
 }
 
@@ -312,6 +294,15 @@ pub fn parse_goal_spec(raw: &str) -> GoalSpec {
 fn try_disj_split(text: &str) -> Option<GoalSpec> {
     let parts = split_top_level_disj(text);
     if parts.len() < 2 {
+        // HS `disjSplitGoal` uses `sepBy1`, so a lone `guardedFormula`
+        // (no `∥`) would parse as a single-disjunct `DisjG (Disj [gf])`.
+        // That degenerate goal is never emitted as an actionable goal by
+        // the solver (DisjG goals arise from case-splits with >=2
+        // disjuncts), so it is unreachable in printed proofs.  The `>= 2`
+        // guard is also needed to avoid mis-classifying every non-disj
+        // goal text as a 1-alt Disj — single-part text intentionally
+        // falls through to chain/eq/subterm and finally `GoalSpec::Raw`,
+        // which replays via the auto-prover.
         return None;
     }
     let alts: Vec<DisjAlt> = parts.iter().map(|p| classify_disj_alt(p)).collect();
@@ -336,12 +327,15 @@ fn try_disj_split(text: &str) -> Option<GoalSpec> {
     Some(GoalSpec::Disj { alts, alt_texts })
 }
 
-/// Normalize a disj-alt's text for cross-renderer comparison.  The HS
-/// skeleton uses `#t1` for time vars (with the leading `#`).  The
-/// runtime renderer produces e.g. `Var(Free(VarSpec { name: "t1", idx: 0
-/// }))`.  We canonicalize by stripping all whitespace and the leading
-/// `#` from time-var references so a simple substring/equality check
-/// reveals divergent var bindings.
+/// Normalize a disj-alt's text for cross-renderer comparison.  Both
+/// sides are tamarin-style text: the HS skeleton renders alts via
+/// `prettyGuarded` (Guarded.hs:822-864) and the runtime side is rendered
+/// by `pretty_disj_alt`/`pretty_guarded` (the same HS `prettyGuarded`),
+/// producing text such as `last(#t2)` — NOT a Rust Debug
+/// `Var(Free(VarSpec{...}))` string.  The comparison only works because
+/// BOTH sides run through this identical whitespace + leading-`#`
+/// stripping, which reveals divergent var bindings via a simple
+/// substring/equality check.
 fn normalize_disj_alt_text(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace() && *c != '#').collect()
 }
@@ -782,6 +776,35 @@ mod tests {
         assert_eq!(t.cases[0].1.method, ParsedMethod::Contradiction);
         assert_eq!(t.cases[1].0, "non_empty_trace");
         assert_eq!(t.cases[1].1.method, ParsedMethod::Sorry);
+    }
+
+    #[test]
+    fn identifier_stops_at_hyphen() {
+        // HS `identifier` (Token.hs:224 `identLetter = alphaNum <|> oneOf
+        // "_"`) does NOT accept `-`, so a case name like `foo-bar` is
+        // tokenised as the identifier `foo`; the `-bar` is not part of the
+        // case name.  This locks in HS-faithful identifier termination.
+        let t = parse_proof_tree("induction case foo-bar by sorry qed").expect("parse");
+        assert_eq!(t.method, ParsedMethod::Induction);
+        assert_eq!(t.cases.len(), 1);
+        assert_eq!(t.cases[0].0, "foo");
+    }
+
+    #[test]
+    fn bare_inter_method_without_child_is_err() {
+        // HS `interProof` (Proof.hs:109-113) has no childless-leaf branch:
+        // a method must be followed by either a `case`-block (`next`/`qed`)
+        // or a recursive `proofSkeleton`.  A bare `simplify` with nothing
+        // after it is a parse error in the v1.13.0 prover ("unexpected ...,
+        // expecting case/qed/SOLVED/by/sorry/simplify/solve/...").  We must
+        // mirror that failure (the caller downgrades `Err` to `tree: None`
+        // and replays via the auto-prover), so it must NOT parse to a leaf.
+        assert!(parse_proof_tree("simplify").is_err());
+        assert!(parse_proof_tree("induction").is_err());
+        // A method followed by an inline sub-proof DOES parse (the inline
+        // single-child `""` subproof branch), and the leaf form is `by`.
+        assert!(parse_proof_tree("simplify by sorry").is_ok());
+        assert!(parse_proof_tree("by simplify").is_ok());
     }
 
     #[test]

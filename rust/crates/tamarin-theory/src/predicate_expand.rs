@@ -24,8 +24,10 @@ impl std::fmt::Display for ExpandError {
 impl std::error::Error for ExpandError {}
 
 /// Recursively expand every predicate-atom in `formula`. Returns a
-/// new formula whose atoms are only `Action`, `Eq`, `Less`,
-/// `LessMset`, `Subterm`, `Last` — i.e. no `Pred(_)` left.
+/// new formula whose atoms are only `Action`, `Eq`, `Less`, `Subterm`,
+/// `Last` — i.e. no `Pred(_)` and no `LessMset(_)` left: the multiset
+/// `(<)` operator is rewritten to `∃ z. rhs = lhs ++ z` via the builtin
+/// `Smaller` predicate, exactly as HS `expandFormula` does.
 pub fn expand_formula(
     formula: &p::Formula,
     predicates: &[p::Predicate],
@@ -62,12 +64,16 @@ pub fn expand_theory_formulas(thy: &mut p::Theory) -> Result<(), ExpandError> {
             p::TheoryItem::Restriction(r) | p::TheoryItem::LegacyAxiom(r) => {
                 r.formula = expand_formula(&r.formula, &predicates)?;
             }
-            p::TheoryItem::CaseTest(c) => {
-                c.formula = expand_formula(&c.formula, &predicates)?;
-            }
-            p::TheoryItem::AccLemma(a) => {
-                a.formula = expand_formula(&a.formula, &predicates)?;
-            }
+            // CaseTest / AccLemma are NOT predicate-expanded: HS adds them
+            // verbatim via `liftedAddCaseTest` / `liftedAddAccLemma`
+            // (Theory/Text/Parser.hs:152-163), which call `addCaseTest` /
+            // `addAccLemma` directly with NO `expandFormula` / `expandLemma`.
+            // Only `liftedAddLemma` (→ `expandLemma`) and the restriction path
+            // (→ `expandRestriction`) expand (TheoryObject.hs:430-446). The
+            // case-test / acc-lemma formulas stay `SyntacticLNFormula` with
+            // their `Pred` sugar intact; the accountability translation
+            // (`caseTestToPredicate`, Items/CaseTestItem.hs:33-37) consumes
+            // them later via `toLNFormula`, not here.
             _ => {}
         }
     }
@@ -146,6 +152,15 @@ fn strip_shadowed(subst: &Subst, vs: &[p::VarSpec]) -> Subst {
 /// adding `binder → fresh` to the subst used for the body, which the
 /// normal name-substitution then applies, respecting inner shadowing via
 /// `strip_shadowed`).
+///
+/// Residual print-name gap (rare): HS keeps the original binder hint name
+/// (De-Bruijn shift only, Predicate.hs:94-106) and re-renames bound vars
+/// fresh at print time (`prettyLNFormula`→`avoidPrecise`/`freshLVar`,
+/// Theory/Model/Formula.hs:496-513), yielding e.g. `z.1` when a free `z`
+/// is in scope.  Our name-based rename mints a NEW base (`z`→`z1`), so the
+/// printed binder reads `z1` rather than `z.1` in that one collision case.
+/// A faithful fix would keep the base name `z` and instead allocate a
+/// distinct `idx` (keying the body `Subst` by (name, idx)); not done here.
 fn expand_quantified(
     vs: &[p::VarSpec],
     body: &p::Formula,
@@ -184,6 +199,42 @@ fn subst_range_vars(subst: &Subst) -> std::collections::BTreeSet<String> {
     let mut out = std::collections::BTreeSet::new();
     for v in subst.map.values() { collect_term_vars(v, &mut out); }
     out
+}
+
+/// Build the builtin `Smaller`/multiset-`(<)` expansion `∃ z. rhs = lhs ++ z`.
+///
+/// Mirrors HS `builtinPredicates` (Theory/Syntactic/Predicate.hs:58-74):
+/// `Smaller(x, y) <=> hinted exists z (Ato (EqE (bvt y) (fAppUnion (fvt x, fvt z))))`,
+/// i.e. `∃ z. y = x ++ z` with `lhs = x`, `rhs = y`.  The multiset operator
+/// `x (<) y` parses to `Smaller [x, y]` (HS `smallerp`, Formula.hs:30-38), so
+/// the same expansion applies with `lhs = x`, `rhs = y`.  `z`'s name is picked
+/// capture-avoidingly: a use-site argument may itself mention `z`, which the
+/// bound `z` would otherwise capture.
+fn smaller_expansion(lhs: &p::Term, rhs: &p::Term) -> p::Formula {
+    let mut avoid = std::collections::BTreeSet::new();
+    collect_term_vars(lhs, &mut avoid);
+    collect_term_vars(rhs, &mut avoid);
+    let zname = if avoid.contains("z") {
+        fresh_name("z", &avoid)
+    } else {
+        "z".to_string()
+    };
+    let z = p::VarSpec {
+        name: zname,
+        idx: 0,
+        sort: p::SortHint::Untagged,
+        typ: None,
+    };
+    let z_term = p::Term::Var(z.clone());
+    let sum = p::Term::BinOp(
+        p::BinOp::Union,
+        Box::new(lhs.clone()),
+        Box::new(z_term),
+    );
+    p::Formula::Exists(
+        vec![z],
+        Box::new(p::Formula::Atom(p::Atom::Eq(rhs.clone(), sum))),
+    )
 }
 
 /// A variant of `base` (e.g. `z` → `z1`) not present in `avoid`.
@@ -256,15 +307,16 @@ fn expand_atom(
             let sub_args: Vec<p::Term> = fact.args.iter()
                 .map(|t| subst_term(t, subst))
                 .collect();
-            // Look up predicate definition.
-            match find_predicate(preds, &fact.name) {
+            // Look up predicate definition.  HS `lookupPredicate`
+            // (Theory/Syntactic/Predicate.hs:76-80) matches on the FULL
+            // `FactTag` (`sameName (Fact tag _ _) (Fact tag' _ _) = tag ==
+            // tag'`), where `FactTag = ProtoFact Multiplicity String Int`
+            // derives `Eq` — so multiplicity (persistent/linear), name AND
+            // arity must all match.  An arity- or multiplicity-mismatched
+            // use-site simply does not match and falls through to the
+            // `UndefinedPredicate` error below.
+            match find_predicate(preds, fact) {
                 Some(pred) => {
-                    if pred.fact.args.len() != sub_args.len() {
-                        return Err(ExpandError {
-                            message: format!("predicate `{}` arity mismatch ({} vs {})",
-                                fact.name, pred.fact.args.len(), sub_args.len()),
-                        });
-                    }
                     // Build a fresh subst from the predicate's parameters
                     // (which the parser stores as terms — typically Var)
                     // to the use-site arguments.
@@ -285,39 +337,27 @@ fn expand_atom(
                     expand(&pred.formula, preds, &new_subst)
                 }
                 None => {
-                    // No matching predicate. If it's the builtin `Smaller`,
-                    // expand it inline (a hard-coded multiset less-than).
-                    if fact.name.eq_ignore_ascii_case("smaller") && sub_args.len() == 2 {
-                        // Smaller(x, y) <=> ∃ z. y = x + z.  Pick `z`'s
-                        // name capture-avoidingly: a use-site arg may
-                        // itself mention `z`, which the bound `z` would
-                        // otherwise capture.
-                        let mut avoid = std::collections::BTreeSet::new();
-                        collect_term_vars(&sub_args[0], &mut avoid);
-                        collect_term_vars(&sub_args[1], &mut avoid);
-                        let zname = if avoid.contains("z") {
-                            fresh_name("z", &avoid)
-                        } else {
-                            "z".to_string()
-                        };
-                        let z = p::VarSpec {
-                            name: zname,
-                            idx: 0,
-                            sort: p::SortHint::Untagged,
-                            typ: None,
-                        };
-                        let z_term = p::Term::Var(z.clone());
-                        let sum = p::Term::BinOp(
-                            p::BinOp::Union,
-                            Box::new(sub_args[0].clone()),
-                            Box::new(z_term),
-                        );
-                        return Ok(p::Formula::Exists(vec![z],
-                            Box::new(p::Formula::Atom(p::Atom::Eq(
-                                sub_args[1].clone(), sum)))));
+                    // No user predicate matched.  HS appends the single
+                    // builtin predicate `Smaller` whose fact tag is
+                    // `ProtoFact Linear "Smaller" 2` (Predicate.hs:50-67),
+                    // so it matches a use-site only when it is LINEAR (not
+                    // persistent), named exactly `Smaller`, and arity 2.
+                    if !fact.persistent && fact.name == "Smaller" && sub_args.len() == 2 {
+                        // Smaller(x, y) <=> ∃ z. y = x ++ z (see smaller_expansion).
+                        return Ok(smaller_expansion(&sub_args[0], &sub_args[1]));
                     }
+                    // HS `show (UndefinedPredicate facttag)`
+                    // (Theory/Text/Parser/Exceptions.hs:33-34) =
+                    //   "undefined predicate " ++ showFactTagArity facttag
+                    // and `showFactTagArity` (Theory/Model/Fact.hs:519-527) =
+                    //   (if persistent then "!" else "") ++ name ++ "/" ++ arity.
                     Err(ExpandError {
-                        message: format!("undefined predicate `{}`", fact.name),
+                        message: format!(
+                            "undefined predicate {}{}/{}",
+                            if fact.persistent { "!" } else { "" },
+                            fact.name,
+                            sub_args.len(),
+                        ),
                     })
                 }
             }
@@ -327,8 +367,16 @@ fn expand_atom(
             subst_term(s, subst), subst_term(t, subst)))),
         p::Atom::Less(s, t) => Ok(p::Formula::Atom(p::Atom::Less(
             subst_term(s, subst), subst_term(t, subst)))),
-        p::Atom::LessMset(s, t) => Ok(p::Formula::Atom(p::Atom::LessMset(
-            subst_term(s, subst), subst_term(t, subst)))),
+        // Multiset `s (<) t`.  In HS there is no dedicated atom for this:
+        // `smallerp` (Theory/Text/Parser/Formula.hs:30-38) parses `(<)` to
+        // `Syntactic . Pred $ protoFact Linear "Smaller" [s, t]`, which
+        // `expandFormula` (Predicate.hs:82-93) then rewrites via the builtin
+        // `Smaller` predicate to `∃ z. t = s ++ z`.  We mirror that rewrite
+        // here so `LessMset` never survives into guarded conversion / solving
+        // / pretty-printing — matching HS byte-for-byte (`... ⇒ (∃ z. y =
+        // (x++z))`).  Operand order: `s (<) t` ⇒ lhs = s, rhs = t.
+        p::Atom::LessMset(s, t) =>
+            Ok(smaller_expansion(&subst_term(s, subst), &subst_term(t, subst))),
         p::Atom::Subterm(s, t) => Ok(p::Formula::Atom(p::Atom::Subterm(
             subst_term(s, subst), subst_term(t, subst)))),
         p::Atom::Action(fact, t) => {
@@ -344,8 +392,20 @@ fn expand_atom(
     }
 }
 
-fn find_predicate<'a>(preds: &'a [p::Predicate], name: &str) -> Option<&'a p::Predicate> {
-    preds.iter().find(|pr| pr.fact.name == name)
+/// Find the predicate whose declared fact has the SAME `FactTag` as the
+/// use-site `fact`.  Mirrors HS `lookupPredicate`
+/// (Theory/Syntactic/Predicate.hs:76-80):
+///   `find (sameName fact . pFact)` with
+///   `sameName (Fact tag _ _) (Fact tag' _ _) = tag == tag'`.
+/// `FactTag = ProtoFact Multiplicity String Int` derives `Eq`, so the
+/// match requires multiplicity (persistent/linear), name, AND arity to
+/// all be equal.
+fn find_predicate<'a>(preds: &'a [p::Predicate], fact: &p::Fact) -> Option<&'a p::Predicate> {
+    preds.iter().find(|pr| {
+        pr.fact.persistent == fact.persistent
+            && pr.fact.name == fact.name
+            && pr.fact.args.len() == fact.args.len()
+    })
 }
 
 fn subst_term(t: &p::Term, subst: &Subst) -> p::Term {
@@ -402,10 +462,70 @@ mod tests {
         let preds: Vec<p::Predicate> = Vec::new();
         let f = parse_formula_str("All x. UndefinedPred(x)").unwrap();
         let res = expand_formula(&f, &preds);
-        // UndefinedPred is parsed as an Action atom (no @) by the parser
-        // — actually as a Pred. So expansion fails because there's no
-        // such predicate.
-        assert!(res.is_err(), "got {:?}", res);
+        // `UndefinedPred(x)` parses as a `Pred` atom; with no matching
+        // predicate, expansion reports `UndefinedPredicate`.  HS renders it
+        // (Theory/Text/Parser/Exceptions.hs:33-34 + Fact.hs:519-527) as
+        // `undefined predicate <name>/<arity>` (leading `!` if persistent).
+        // Probed against the v1.13.0 prover: `... ==> P(x)` reports
+        // `undefined predicate P/1`.
+        let err = res.expect_err("expected undefined-predicate error");
+        assert_eq!(err.message, "undefined predicate UndefinedPred/1");
+    }
+
+    #[test]
+    fn expand_arity_mismatch_is_undefined_predicate() {
+        // HS `lookupPredicate` (Predicate.hs:76-80) matches the FULL
+        // `FactTag` (multiplicity + name + arity).  A use-site whose arity
+        // differs from the declared predicate does not match and falls
+        // through to `UndefinedPredicate`.  Probed against the v1.13.0
+        // prover: `predicates: P(x) <=> ...` used as `P(a, b)` reports
+        // `undefined predicate P/2` — NOT a bespoke "arity mismatch".
+        let preds = pred("P(x) <=> Ex #i. A(x) @ #i");
+        let f = parse_formula_str("All a b. P(a, b)").unwrap();
+        let err = expand_formula(&f, &preds).expect_err("expected error");
+        assert_eq!(err.message, "undefined predicate P/2");
+    }
+
+    #[test]
+    fn case_test_and_acc_lemma_keep_pred_atoms() {
+        // HS adds case-tests / acc-lemmas verbatim (liftedAddCaseTest /
+        // liftedAddAccLemma, Theory/Text/Parser.hs:152-163) with NO
+        // predicate expansion — their `Pred` sugar stays intact for the
+        // accountability translation.  `expand_theory_formulas` must NOT
+        // expand them; a regular lemma over the same predicate IS expanded.
+        let src = "theory T begin\n\
+            predicates: P(x) <=> Ex #i. A(x) @ #i\n\
+            test ct:\n  \"P(a)\"\n\
+            lemma acc:\n  ct account for\n    \"All x. P(x)\"\n\
+            lemma reg:\n  \"All x. P(x)\"\n\
+            end";
+        let mut thy = tamarin_parser::parse_theory(src, &[]).unwrap();
+        expand_theory_formulas(&mut thy).unwrap();
+        let mut saw_ct = false;
+        let mut saw_acc = false;
+        let mut saw_reg = false;
+        for item in &thy.items {
+            match item {
+                p::TheoryItem::CaseTest(c) => {
+                    saw_ct = true;
+                    assert!(has_pred_atom(&c.formula),
+                        "case-test must keep too its Pred atom: {:?}", c.formula);
+                }
+                p::TheoryItem::AccLemma(a) => {
+                    saw_acc = true;
+                    assert!(has_pred_atom(&a.formula),
+                        "acc-lemma must keep its Pred atom: {:?}", a.formula);
+                }
+                p::TheoryItem::Lemma(l) => {
+                    saw_reg = true;
+                    assert!(!has_pred_atom(&l.formula),
+                        "regular lemma must be expanded: {:?}", l.formula);
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_ct && saw_acc && saw_reg,
+            "expected all three item kinds (ct={saw_ct}, acc={saw_acc}, reg={saw_reg})");
     }
 
     #[test]
@@ -419,6 +539,51 @@ mod tests {
         let expanded = expand_formula(&f, &preds).unwrap();
         assert!(!binds_var_named(&expanded, "z"),
             "variable capture: a quantifier still binds `z`: {:?}", expanded);
+    }
+
+    #[test]
+    fn expand_lessmset_to_smaller_existential() {
+        // The multiset `(<)` operator has no dedicated atom in HS: it parses
+        // to `Pred Smaller` and `expandFormula` rewrites it to
+        // `∃ z. rhs = lhs ++ z`.  Probed against the real HS prover (v1.13.0)
+        // on `All x y #i. Foo(x,y)@#i ==> x (<) y`, which prints
+        //   ∀ x y #i. (Foo( x, y ) @ #i) ⇒ (∃ z. y = (x++z))
+        // so a bare `x (<) y` expands to `∃ z. y = (x++z)`.
+        let preds: Vec<p::Predicate> = Vec::new();
+        let f = parse_formula_str("x (<) y").unwrap();
+        let expanded = expand_formula(&f, &preds).unwrap();
+        // `LessMset` must be gone (no `(<)` reaches the pretty-printer).
+        assert!(
+            !has_lessmset_atom(&expanded),
+            "LessMset survived expansion: {:?}",
+            expanded
+        );
+        let printed = crate::pretty_formula::pretty_formula(&expanded);
+        assert_eq!(printed, "\u{2203} z. y = (x++z)", "got {:?}", expanded);
+        assert!(!printed.contains("(<)"), "still emits (<): {}", printed);
+    }
+
+    #[test]
+    fn expand_lessmset_capture_avoids_z() {
+        // Use-site that mentions `z` must not be captured by the bound `z`.
+        let preds: Vec<p::Predicate> = Vec::new();
+        let f = parse_formula_str("z (<) y").unwrap();
+        let expanded = expand_formula(&f, &preds).unwrap();
+        // The bound var is renamed away from `z` (HS would pick a fresh name);
+        // the use-site `z` survives in the union term.
+        assert!(!has_lessmset_atom(&expanded), "got {:?}", expanded);
+    }
+
+    fn has_lessmset_atom(f: &p::Formula) -> bool {
+        match f {
+            p::Formula::Atom(p::Atom::LessMset(_, _)) => true,
+            p::Formula::True | p::Formula::False | p::Formula::Atom(_) => false,
+            p::Formula::Not(g) => has_lessmset_atom(g),
+            p::Formula::And(a, b) | p::Formula::Or(a, b)
+            | p::Formula::Implies(a, b) | p::Formula::Iff(a, b) =>
+                has_lessmset_atom(a) || has_lessmset_atom(b),
+            p::Formula::Forall(_, b) | p::Formula::Exists(_, b) => has_lessmset_atom(b),
+        }
     }
 
     fn binds_var_named(f: &p::Formula, name: &str) -> bool {

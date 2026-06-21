@@ -104,8 +104,9 @@ fn header(entry: &TheoryEntry) -> String {
     )
 }
 
-/// Left-pane proof-state tree.  Mirrors Haskell's `theoryIndex` +
-/// `lemmaIndex` + `proofIndex` (`src/Web/Theory.hs:296-417`).
+/// Left-pane proof-state tree.  Mirrors Haskell's `theoryIndex`
+/// (`src/Web/Theory.hs:371-392`) + `lemmaIndex` (`src/Web/Theory.hs:296-329`)
+/// + `proofIndex` (`src/Web/Theory.hs:223-260`).
 fn proof_state(entry: &TheoryEntry) -> String {
     let typed = &entry.typed_theory;
     let idx = entry.idx;
@@ -144,9 +145,9 @@ fn proof_state(entry: &TheoryEntry) -> String {
     // Lemmas — each with the nested proof tree below.  Mirrors
     // Haskell's `lemmaIndex` (`src/Web/Theory.hs:296-318`): the lemma
     // NAME is plain text (no link); the clickable step is `by sorry`
-    // pointing at `/main/proof/<lemma>/_`.  Haskell's `TheoryLemma`
-    // path renders the literal "this is a mistake" — so we must not
-    // link there.
+    // pointing at `/main/proof/<lemma>` (the lemma root, no trailing
+    // `_`).  Haskell's `TheoryLemma` path renders the literal "this is
+    // a mistake" — so we must not link there.
     let lemmas: Vec<_> = typed.lemmas().collect();
     for l in lemmas {
         let tq = match l.trace_quantifier {
@@ -172,7 +173,8 @@ fn proof_state(entry: &TheoryEntry) -> String {
         // `by <sorry-step>` line so the user can click into the lemma's
         // initial proof view.  This matches Haskell's
         // `proofIndex` output for a freshly loaded lemma whose root is
-        // `Sorry "not yet proven"`.
+        // `Sorry Nothing` (HS `unproven = sorry Nothing`), rendering as
+        // plain `sorry`.
         let mut rendered_tree = false;
         if let Some(ps) = &entry.proof_state {
             if let Some(root) = ps.get_root(&l.name) {

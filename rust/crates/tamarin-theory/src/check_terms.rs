@@ -331,14 +331,15 @@ fn resolve_term(t: &Term, scope: &Scope, irr: &Irreducible, pos: TermPos) -> RTe
         Term::PubLit(s) => RTerm::PubConst(s.clone()),
         Term::FreshLit(s) => RTerm::FreshConst(s.clone()),
         Term::NatLit(s) => RTerm::NatConst(s.clone()),
-        // Bare numeric/`1` literals: HS treats these as public-nat
-        // constructors.  They appear in atom terms only via multiset/nat
-        // contexts; render as an irreducible nullary so they don't
-        // spuriously flag.  (Out of the two reproducers' scope; conservative
-        // and HS-consistent for the `1`/`%1` constants.)
+        // Bare numeric/`1`/`%1` literals: HS treats these as nullary
+        // irreducible Public constructors.  The DH `1` is `oneSymString =
+        // "one"` and the nat `%1` is `natOneSymString = "tone"`
+        // (FunctionSymbols.hs:134,144); both are arity-0 Public Constructors
+        // and hence always `allowed`, so the head name is never rendered as
+        // an offender — but we still use the HS-faithful names here.
         Term::Number(n) => RTerm::PubConst(n.to_string()),
         Term::NumberOne => RTerm::App(Head::App { name: "one".into(), reducible: false }, vec![]),
-        Term::NatOne => RTerm::App(Head::App { name: "one".into(), reducible: false }, vec![]),
+        Term::NatOne => RTerm::App(Head::App { name: "tone".into(), reducible: false }, vec![]),
         Term::DhNeutral => RTerm::App(Head::App { name: "DH_neutral".into(), reducible: false }, vec![]),
         Term::App(name, args) => resolve_app(name, args, scope, irr),
         Term::AlgApp(name, a, b) => {
@@ -442,35 +443,35 @@ fn resolve_var(v: &VarSpec, scope: &Scope, irr: &Irreducible, pos: TermPos) -> R
 ///
 /// HS binds a use to its binder via full `LVar` equality — name AND sort AND
 /// idx (`quantify x = ... | v == x = Bound i`, Formula.hs:340-345; `LVar` `Eq`
-/// compares `idx`, sort and name, LTerm.hs). We compare name and `idx`
-/// exactly, and approximate the sort with the sort-*kind* derived from the
-/// use's explicit sigil (or the syntactic position when the use is untagged),
-/// matching the surrounding free-variable check's existing rule. The `idx`
-/// comparison ensures a binder and a use that share a name but carry
-/// different explicit dot-indices (e.g. `x.1` vs `x.2`) are NOT conflated,
-/// as in HS.
+/// compares `idx`, sort and name, LTerm.hs:516-517). We reproduce this exactly
+/// on the sort-*kind*: the use's sort is concrete in HS, never approximate.
+/// The parser assigns every variable a concrete `LSort` before `quantify`
+/// runs (Formula.hs:114 `standardFormula msgvar nodevar`):
+///   - a message-position variable is parsed by `msgvar`
+///     (`sortedLVar [LSortFresh, LSortPub, LSortNat, LSortMsg]`,
+///     Token.hs:440-441), so an *untagged* message use takes the
+///     `mkPrefixParser LSortMsg` arm (the bare `LSortMsg -> pure ()` case,
+///     Token.hs:424-426) and gets the concrete sort `LSortMsg` — hence
+///     `kind_of(SortHint::Untagged) == KIND_MSG` is exact, not approximate;
+///   - a temporal-position variable is parsed by `nodevar`
+///     (`LSortNode`, Token.hs:444-447), hence `KIND_NODE`.
+///
+/// `quantify`'s `v == x` then compares sort exactly, so an untagged `x` binds
+/// only to a `LSortMsg` binder, never to a `~x`/`$x`/`%x`/`#x` binder of the
+/// same name+idx. The `idx` comparison likewise keeps `x.1` and `x.2` distinct.
 fn lookup_bound(v: &VarSpec, scope: &Scope, pos: TermPos) -> Option<u32> {
-    // Expected sort-kind from the use's explicit sigil, or the position.
-    let expected: Option<u8> = match pos {
-        TermPos::Temporal => Some(KIND_NODE),
-        TermPos::Message => {
-            if is_explicit_sort(&v.sort) {
-                Some(kind_of(&v.sort))
-            } else {
-                None
-            }
-        }
+    // The use's concrete sort-kind (Temporal positions are LSortNode; message
+    // positions take the use's sigil, or LSortMsg when untagged — see above).
+    let expected: u8 = match pos {
+        TermPos::Temporal => KIND_NODE,
+        TermPos::Message => kind_of(&v.sort),
     };
     // Search innermost (last) first.
     for (i, b) in scope.iter().enumerate().rev() {
         if b.name != v.name || b.idx != v.idx {
             continue;
         }
-        let ok = match expected {
-            Some(k) => kind_of(&b.sort) == k,
-            None => true,
-        };
-        if ok {
+        if kind_of(&b.sort) == expected {
             let db = (scope.len() - 1 - i) as u32;
             return Some(db);
         }
@@ -493,10 +494,6 @@ fn kind_of(s: &SortHint) -> u8 {
         SortHint::Msg | SortHint::Suffix(SuffixSort::Msg) => KIND_MSG,
         SortHint::Untagged => KIND_MSG,
     }
-}
-
-fn is_explicit_sort(s: &SortHint) -> bool {
-    !matches!(s, SortHint::Untagged)
 }
 
 // =============================================================================
@@ -714,6 +711,29 @@ mod tests {
         let (thy, sig) = sig_of(src);
         let report = check_terms_wf(&thy, &sig);
         assert!(report.is_empty(), "expected no offenders, got {:?}", report);
+    }
+
+    #[test]
+    fn untagged_message_use_does_not_bind_to_node_binder() {
+        // An untagged message-position use `x` must NOT bind to a `#x` node
+        // binder of the same name+idx: HS's `LVar` Eq compares sort, and the
+        // parser gives an untagged message use the concrete sort `LSortMsg`,
+        // so `quantify`'s `v == x` fails and the use stays `Free x`.
+        //
+        // Verified against the v1.13.0 binary on
+        //   lemma L: "All #x. (K(x) @ #x) ==> F"
+        // which prints `Lemma `L' uses terms of the wrong form: `Free x'`.
+        let src = "theory T begin\n\
+                   lemma L:\n  \"All #x. (K(x) @ #x) ==> F\"\n\
+                   end\n";
+        let (thy, sig) = sig_of(src);
+        let report = check_terms_wf(&thy, &sig);
+        assert_eq!(report.len(), 1, "expected one Formula-terms block");
+        assert!(
+            report[0].message.contains("`Free x'"),
+            "untagged use must stay Free (not bind to #x), got:\n{}",
+            report[0].message
+        );
     }
 
     #[test]
