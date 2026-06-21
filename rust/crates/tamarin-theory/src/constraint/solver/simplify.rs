@@ -2363,7 +2363,19 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
             }
         }
     }
-    for (id, rule) in red.sys.nodes.iter() {
+    // HS-faithful order: HS `allKUActions` draws rule actions from
+    // `M.toList (get sNodes se)` (node-id-sorted), and `merge`'s
+    // `groupSortOn fst` is stable (Simplify.hs:240,251,272-276), so within
+    // a term-group the kept action (`iKeep`) is the one from the LOWEST
+    // node-id.  RS iterated `sys.nodes` in Vec (production) order, so a
+    // term-group with no goal kept whichever same-term node was created
+    // first, not the lowest id.  Sort the rule-action nodes by node-id so
+    // `group[0]` is the lowest, matching HS.  (Unsolved KU-action goals are
+    // still pushed FIRST — `allKUActions` lists `unsolvedActionAtoms`
+    // before rule actions — so a goal still wins `iKeep` over a rule node.)
+    let mut sorted_nodes: Vec<_> = red.sys.nodes.iter().collect();
+    sorted_nodes.sort_by(|a, b| a.0.cmp(&b.0));
+    for (id, rule) in sorted_nodes {
         for fa in &rule.actions {
             if matches!(fa.tag, FactTag::Ku) {
                 if let Some(m) = fa.terms.first() {
