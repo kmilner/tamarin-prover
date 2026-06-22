@@ -1,0 +1,40 @@
+# Per-file canonical extra HS flags, beyond bare `--prove`.
+#
+# WHY: some theories are meant to be run with specific flags (Makefile
+# case-study recipes / in-file invocation comments). Running them bare makes
+# HS time out or produce NO output (SKIP), so we never recorded the real HS
+# behaviour and "lost track" of what they need. This map records the canonical
+# flags so the HS cache is generated the right way, and the SAME flags are
+# passed to RS for the comparison.
+#
+# Format: <relpath><TAB><flags>   (relpath under examples/; '#' lines ignored).
+# Consumed by corpus_file_diff.sh and diff_proof_raw.sh. The cache key is
+# salted with a hash of the flags, so flagged entries are distinct from the
+# bare cache (flagless files are completely unaffected — no cache churn).
+#
+# NOTE: `--stop-on-trace=dfs` is the DEFAULT (HS `constructAutoProver`:
+# `fromMaybe CutDFS`), so bare `--prove` already == dfs — do NOT list it here.
+#
+# RS-MATCHABILITY (2026-06-22):
+#   --diff               RS NOT PORTED (errors "not yet ported") → HS recorded,
+#                        RS can't match yet (tracked DIFF until RS diff lands).
+#   --auto-sources       RS does not route it; RS auto-computes sources by a
+#                        different path → tracked DIFF (HS recorded).
+#   --stop-on-trace=...  (non-dfs) RS does not route it → tracked DIFF.
+#   in-file `heuristic: o "..."` oracles need NO entry here — RS routes the
+#                        in-file heuristic + has oracle_ranking, so those files
+#                        already work bare.
+
+# ---- observational-equivalence / diff theories (need --diff; RS unported) ----
+features/equivalence/AxiomDiffTest1.spthy	--diff
+features/equivalence/AxiomDiffTest2.spthy	--diff
+features/equivalence/AxiomDiffTest3.spthy	--diff
+features/equivalence/AxiomDiffTest4.spthy	--diff
+regression/diff/issue324.spthy	--diff
+
+# ---- auto-sources spore models (HS empty bare; need --auto-sources) ----------
+features/auto-sources/spore/SpliceAS.spthy	--auto-sources
+features/auto-sources/spore/Nssk_amended.spthy	--auto-sources
+
+# ---- seqdfs-dependent regression (HS empty/wrong under default dfs) ----------
+regression/trace/seqdfsneeded.spthy	--stop-on-trace=seqdfs
