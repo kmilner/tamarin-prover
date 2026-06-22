@@ -2929,92 +2929,119 @@ pub fn solve_with_source_cases_action_with_ctx(
     let dbg_rt = std::env::var("TAM_RS_DBG_RUNTIME_CASES").as_deref() == Ok("1");
     let total_n = cases_iter.len();
     let mut out: Vec<(String, System, crate::fact::LNFact)> = Vec::new();
-    // Parallel Vec tracking each `out` entry's post-refineSubst+restrict
-    // case sub-system (only Some(_) for the HS-faithful applySource path;
-    // None for the legacy graft path).  After all source cases iterated,
-    // we run `remove_redundant_cases` keyed on this to mirror HS's
-    // `refineSource` → `removeRedundantCases ctxt stableVars` step
-    // (Sources.hs).  HS performs this dedup BEFORE `_applySource`'s
-    // someInst+conjoinSystem; we do it AFTER conjoin (storing the
-    // pre-conjoin sub-system) but use the SAME comparator + stable_vars,
-    // so two refineSubst arms whose pre-conjoin sub-systems alpha-coincide
-    // collapse to one.  Prevents RS `shape_mismatch` from dropping cases
-    // HS never conjoined because HS deduped them away.
-    let mut out_refined: Vec<Option<System>> = Vec::new();
     let mut kept_names: Vec<String> = Vec::new();
     let mut all_names: Vec<String> = Vec::new();
-    for (name, case_sys) in cases_iter {
-        let case_label = saturated_chain_root(&name);
-        if dbg_rt { all_names.push(case_label.clone()); }
-        // Haskell-faithful `applySource` path when a ProofContext is
-        // available.  Matches the live goal against the source's
-        // ABSTRACT `cdGoal` (`src.goal`) — NOT a case-specific action.
-        // This mirrors `matchToGoal` (Sources.hs:268) which always
-        // uses `cdGoal`.  Then runs `someInst keepVarBindings` +
-        // `conjoinSystem`.
+
+    if let Some(ctx) = ctx_opt {
+        // ----------------------------------------------------------------
+        // HS-faithful `refineSource` order (Sources.hs:131,376-419):
+        //   refineSubst (per case) → removeRedundantCases (BEFORE conjoin)
+        //   → _applySource (someInst + conjoinSystem) per SURVIVOR only.
         //
-        // The graft fallback below is used by `saturate_out_premise` etc.,
-        // which compute source-cases at precompute time and don't have a
-        // ProofContext handy.
-        if let Some(ctx) = ctx_opt {
-            let result = apply_source_case_action(
+        // Step 1: run the REFINE half (match + refineSubst + someInst) for
+        // EVERY case, collecting one `RefineArm` per refineSubst AC arm.
+        // No conjoin yet.  refineSubst fan-out (HS `disjunctionOfList
+        // performSplit`, Reduction.hs:724-725) yields multiple arms per
+        // case; all arms share the case's `case_label`.
+        // ----------------------------------------------------------------
+        let mut refine_arms: Vec<(String, RefineArm)> = Vec::new();
+        for (name, case_sys) in cases_iter {
+            let case_label = saturated_chain_root(&name);
+            if dbg_rt { all_names.push(case_label.clone()); }
+            // Haskell-faithful `applySource` path: matches the live goal
+            // against the source's ABSTRACT `cdGoal` (`src.goal`) — NOT a
+            // case-specific action — mirroring `matchToGoal` (Sources.hs:268).
+            let arms = refine_source_case_action(
                 ctx, sys, src, &case_sys, goal_node, fa_live);
-            // refineSubst (`solve_term_eqs SplitNow`) can fan out
-            // into multiple AC-unification arms — HS replicates the
-            // Reduction continuation per arm via `disjunctionOfList
-            // performSplit` (Reduction.hs:724-725).  Each returned
-            // entry is one arm.  Same `case_label` for all arms;
-            // proof_method.rs::ProofMethod::SolveGoal handles
-            // `_case_N` disambiguation (HS `distinguish` ProofMethod.hs:335,
-            // applied via `uniqueListBy ... distinguish cases` at
-            // ProofMethod.hs:308).
-            for (grafted_sys, live_action, refined_case) in result {
-                if dbg_rt { kept_names.push(case_label.clone()); }
-                // Haskell-faithful: do NOT fan out variant SplitG
-                // at source-apply time.  The previous comment
-                // claimed Haskell's saturate produces one case per
-                // variant arm at PRECOMPUTE time — that was wrong.
-                // Haskell's `solveAllSafeGoals.solve` only treats
-                // SplitG as a safe goal when
-                // `doSplit = noChainGoals && not (null chains)`
-                // (Sources.hs:152-164).  For source cases with open
-                // chains (which is most of them), SplitG stays open
-                // through saturate AND is left in the case state.
-                // At runtime, the SplitG appears in the live system
-                // and `solveGoal SplitG` produces `case split` /
-                // `case case_1` / `case case_2` via smartRanking's
-                // `isSplitGoalSmall` pick — matching Haskell.
-                //
-                // The previous fan-out produced `Rule_case_N`
-                // siblings that Haskell never has (StatVerif
-                // Resolve1_case_1/2, TLS S_2_case_1/2, etc.).
-                out.push((case_label.clone(), grafted_sys, live_action));
-                out_refined.push(Some(refined_case));
+            for arm in arms {
+                refine_arms.push((case_label.clone(), arm));
             }
-            let _ = name;
-            let _ = ctx_opt;
-            continue;
         }
-        // Legacy path: freshen + graft + caller-runs-solve_fact_eqs.
-        // Used at saturate time (no ProofContext).
-        let renamed = freshen_system(&case_sys, avoid_max, ctx_opt.map(|c| &c.maude));
-        let abstract_renamed = {
-            let mut v = abstract_orig.clone();
-            v.idx = v.idx.saturating_add(avoid_max.saturating_add(1));
-            v
+
+        // ----------------------------------------------------------------
+        // Step 2: `removeRedundantCases ctxt stableVars` (Sources.hs:236-260)
+        // — run the dedup BEFORE conjoin, on the pre-conjoin case
+        // sub-system (`refined_case_for_dedup`), so the expensive bilinear
+        // `conjoinSystem` re-narrow is paid only for survivors HS keeps.
+        // Gated on BP/MSet per HS's `removeRedundantCases` short-circuit;
+        // for non-BP/non-MSet theories the dedup is a no-op (no two arms
+        // ever alpha-coincide) so every arm survives — identical to before.
+        // ----------------------------------------------------------------
+        let survivors: std::collections::BTreeSet<usize> = {
+            let msig = ctx.maude.maude_sig();
+            if msig.enable_bp || msig.enable_mset {
+                use tamarin_term::lterm::HasFrees;
+                let stable_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar> = {
+                    let mut s = std::collections::BTreeSet::new();
+                    s.insert(goal_node.clone());
+                    fa_live.for_each_free(&mut |v: &tamarin_term::lterm::LVar| {
+                        s.insert(v.clone());
+                    });
+                    s
+                };
+                // Mirror `removeRedundantCases` survivor selection exactly:
+                // `sortednubBy compareSystemsUpToNewVars` keeps the LAST
+                // element of an EQ-run, then `sortOn fst` restores
+                // original-index order (last-wins per EQ-run).
+                let keyed: Vec<(usize, String)> = refine_arms.iter().enumerate()
+                    .map(|(idx, (_label, arm))| {
+                        (idx, compute_compare_systems_key(
+                            &arm.refined_case_for_dedup, &stable_vars))
+                    })
+                    .collect();
+                let deduped = sortednub_by(
+                    &|a: &(usize, String), b: &(usize, String)| a.1.cmp(&b.1),
+                    keyed,
+                );
+                deduped.into_iter().map(|(idx, _)| idx).collect()
+            } else {
+                // No dedup: every arm survives.
+                (0..refine_arms.len()).collect()
+            }
         };
-        let action_fact = renamed.nodes.iter().find_map(|(id, ru)| {
-            if id == &abstract_renamed {
-                ru.actions.iter().find(|a| a.tag == FactTag::Ku).cloned()
-            } else { None }
-        });
-        let Some(action_fact) = action_fact else { continue };
-        let Some(grafted) = graft_case_into_action(
-            sys, &renamed, &abstract_renamed, goal_node, fa_live,
-        ) else { continue };
-        if dbg_rt { kept_names.push(case_label.clone()); }
-        out.push((case_label, grafted, action_fact));
-        out_refined.push(None);
+
+        // ----------------------------------------------------------------
+        // Step 3: `_applySource` (someInst already done; conjoinSystem +
+        // conjoin-fanout + E.5 + output) for SURVIVOR arms only.  Same
+        // `case_label` for all of a case's arms; proof_method.rs handles
+        // `_case_N` disambiguation (HS `uniqueListBy ... distinguish cases`
+        // ProofMethod.hs:308).
+        // ----------------------------------------------------------------
+        for (idx, (case_label, arm)) in refine_arms.into_iter().enumerate() {
+            if !survivors.contains(&idx) { continue; }
+            let result = conjoin_refine_arm(ctx, sys, goal_node, fa_live, arm);
+            for (grafted_sys, live_action, _refined_case) in result {
+                if dbg_rt { kept_names.push(case_label.clone()); }
+                out.push((case_label.clone(), grafted_sys, live_action));
+            }
+        }
+    } else {
+        // Legacy path: freshen + graft + caller-runs-solve_fact_eqs.
+        // Used at saturate time (no ProofContext).  No conjoin-time dedup
+        // (the saturate-time `saturate_out_premise` path's own
+        // `refine_one_source` already deduplicates).
+        for (name, case_sys) in cases_iter {
+            let case_label = saturated_chain_root(&name);
+            if dbg_rt { all_names.push(case_label.clone()); }
+            let renamed = freshen_system(&case_sys, avoid_max, ctx_opt.map(|c| &c.maude));
+            let abstract_renamed = {
+                let mut v = abstract_orig.clone();
+                v.idx = v.idx.saturating_add(avoid_max.saturating_add(1));
+                v
+            };
+            let action_fact = renamed.nodes.iter().find_map(|(id, ru)| {
+                if id == &abstract_renamed {
+                    ru.actions.iter().find(|a| a.tag == FactTag::Ku).cloned()
+                } else { None }
+            });
+            let Some(action_fact) = action_fact else { continue };
+            let Some(grafted) = graft_case_into_action(
+                sys, &renamed, &abstract_renamed, goal_node, fa_live,
+            ) else { continue };
+            if dbg_rt { kept_names.push(case_label.clone()); }
+            out.push((case_label, grafted, action_fact));
+            let _ = name;
+        }
     }
     if dbg_rt {
         let head = match &fa_live.terms[0] {
@@ -3023,69 +3050,6 @@ pub fn solve_with_source_cases_action_with_ctx(
         };
         eprintln!("[RUNTIME_CASES_ACT] head={} total={} kept={} all={:?} kept_names={:?}",
             head, total_n, out.len(), all_names, kept_names);
-    }
-    // HS-faithful matchToGoal-level `removeRedundantCases` (Sources.hs).
-    // HS does this dedup INSIDE `refineSource`, BEFORE `_applySource`'s
-    // someInst+conjoinSystem.  RS dedups AFTER conjoin, but on the
-    // pre-conjoin case sub-system saved in `out_refined`.  Two refineSubst
-    // arms with alpha-equivalent pre-conjoin sub-systems (modulo non-
-    // stable_vars renaming) collapse to one — first-occurrence-wins.
-    //
-    // Gated on BP/MSet per HS's `removeRedundantCases` short-circuit
-    // (Sources.hs).  Skipped when no `ProofContext` is available
-    // (saturate-time `saturate_out_premise` path — that path's own
-    // `refine_one_source` already deduplicates via its
-    // `remove_redundant_cases` call).
-    if let Some(ctx) = ctx_opt {
-        let msig = ctx.maude.maude_sig();
-        if msig.enable_bp || msig.enable_mset {
-            use tamarin_term::lterm::HasFrees;
-            let stable_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar> = {
-                let mut s = std::collections::BTreeSet::new();
-                s.insert(goal_node.clone());
-                fa_live.for_each_free(&mut |v: &tamarin_term::lterm::LVar| {
-                    s.insert(v.clone());
-                });
-                s
-            };
-            // Mirror `removeRedundantCases` (Sources.hs:236-260) survivor
-            // selection exactly: `sortednubBy compareSystemsUpToNewVars`
-            // keeps the LAST element of an EQ-run (NOT the first — the old
-            // first-wins `seen_keys.insert` was WRONG; cf. the note on
-            // `sortednub_by`/`remove_redundant_cases`, e.g. Joux/Scott
-            // `Session_Key_Secrecy_PFS` B↔C mirror), then `sortOn fst`
-            // restores original-index order.  Entries with no pre-conjoin
-            // sub-system (`refined_opt == None`) carry no key and are always
-            // kept in place.
-            let pairs: Vec<((String, System, crate::fact::LNFact), Option<System>)> =
-                out.into_iter().zip(out_refined).collect();
-            // Decorate keyed entries with (original index, key); compute
-            // last-wins survivor per EQ-run via sortednub_by.
-            let mut keyed: Vec<(usize, String)> = Vec::with_capacity(pairs.len());
-            for (idx, (_entry, refined_opt)) in pairs.iter().enumerate() {
-                if let Some(refined) = refined_opt {
-                    let key = compute_compare_systems_key(refined, &stable_vars);
-                    keyed.push((idx, key));
-                }
-            }
-            let deduped = sortednub_by(
-                &|a: &(usize, String), b: &(usize, String)| a.1.cmp(&b.1),
-                keyed,
-            );
-            // Surviving original indices among keyed entries.
-            let survivors: std::collections::BTreeSet<usize> =
-                deduped.into_iter().map(|(idx, _)| idx).collect();
-            let mut kept_out: Vec<(String, System, crate::fact::LNFact)>
-                = Vec::with_capacity(pairs.len());
-            for (idx, (entry, refined_opt)) in pairs.into_iter().enumerate() {
-                let keep = match &refined_opt {
-                    Some(_) => survivors.contains(&idx),
-                    None => true,
-                };
-                if keep { kept_out.push(entry); }
-            }
-            out = kept_out;
-        }
     }
     if out.is_empty() { return None; }
     Some(out)
@@ -3853,6 +3817,23 @@ fn vspec_to_lvar(v: &tamarin_parser::ast::VarSpec) -> Option<tamarin_term::lterm
     })
 }
 
+/// One refineSubst arm produced by `refine_source_case_action` — the
+/// per-arm state at the conjoin boundary of HS's `_applySource`
+/// (Sources.hs:447-468), BEFORE `conjoinSystem`.  HS runs
+/// `removeRedundantCases` (Sources.hs:236-260) on these (keyed by
+/// `refined_case_for_dedup`) BEFORE conjoining only the survivors.
+/// `conjoin_refine_arm` performs the `markGoalAsSolved` + `conjoinSystem`
+/// + conjoin-fanout + E.5 + close-trivial-chains + output for one arm.
+struct RefineArm {
+    /// someInst result — the freshened case sub-system to conjoin.
+    freshened_case: System,
+    /// The recovered live KU action fact returned per output entry.
+    live_action: crate::fact::LNFact,
+    /// Post-refineSubst+restrict case sub-system (BEFORE someInst/conjoin)
+    /// — the dedup key (HS `removeRedundantCases` `compareSystemsUpToNewVars`).
+    refined_case_for_dedup: System,
+}
+
 /// Apply a precomputed source case to a live action goal — Haskell-
 /// faithful port of `applySource` (Sources.hs:336-350):
 ///
@@ -3961,14 +3942,22 @@ fn vspec_to_lvar(v: &tamarin_parser::ast::VarSpec) -> Option<tamarin_term::lterm
 /// `uniqueListBy ... distinguish cases` (ProofMethod.hs:308, with
 /// `uniqueListBy` at ProofMethod.hs:91 and `distinguish` at
 /// ProofMethod.hs:335).
-fn apply_source_case_action(
+/// HS-faithful split of `applySource` at the `conjoinSystem` boundary:
+/// this half does match + refineSubst + restrict + someInst (the
+/// `matchToGoal`→`refineSource`→someInst part of `_applySource`,
+/// Sources.hs:336-468) and returns one `RefineArm` per surviving
+/// refineSubst arm WITHOUT conjoining.  The caller dedups the arms
+/// (HS `removeRedundantCases`, BEFORE conjoin) then calls
+/// `conjoin_refine_arm` only on survivors — so the expensive bilinear
+/// `conjoinSystem` re-narrow is paid only for cases HS actually keeps.
+fn refine_source_case_action(
     ctx: &crate::constraint::solver::context::ProofContext,
     live_sys: &System,
     src: &Source,
     case_sys: &System,
     live_node: &crate::constraint::constraints::NodeId,
     fa_live: &crate::fact::LNFact,
-) -> Vec<(System, crate::fact::LNFact, System)> {
+) -> Vec<RefineArm> {
     use crate::constraint::solver::reduction::{
         Reduction, SolveOutcome, SplitStrategy, bounds_max,
     };
@@ -4280,7 +4269,7 @@ fn apply_source_case_action(
     // collapse to one — without this dedup, RS conjoins both, and
     // any per-arm `setNodes:ruleInfoMismatch` (RS `shape_mismatch`)
     // drops cases HS keeps because HS never conjoined the duplicate.
-    let mut out_arms: Vec<(System, crate::fact::LNFact, System)> =
+    let mut out_arms: Vec<RefineArm> =
         Vec::with_capacity(arm_eq_stores.len());
 
     for arm_eq_store in arm_eq_stores {
@@ -4472,6 +4461,54 @@ fn apply_source_case_action(
         None => { dbg("no-KU-action-in-freshened-case"); continue; },
     };
 
+    // HS-faithful split: STOP here (BEFORE conjoinSystem).  The caller
+    // dedups these arms (`removeRedundantCases`, Sources.hs:236-260) and
+    // calls `conjoin_refine_arm` only on survivors, so the expensive
+    // bilinear `conjoinSystem` re-narrow is never paid for a case HS
+    // drops.
+    out_arms.push(RefineArm {
+        freshened_case,
+        live_action,
+        refined_case_for_dedup,
+    });
+    } // end `for arm_eq_store in arm_eq_stores`
+    out_arms
+}
+
+/// HS-faithful conjoin half of `applySource` (`_applySource`,
+/// Sources.hs:447-468) for a single surviving `RefineArm`: runs
+/// `markGoalAsSolved` + `conjoinSystem` + the conjoin-fanout drain +
+/// E.5 edge fact-eq propagation + close-trivial-chains, returning one
+/// `(grafted_sys, live_action, refined_case_for_dedup)` per output arm.
+/// Called only on cases that survived `removeRedundantCases`.
+fn conjoin_refine_arm(
+    ctx: &crate::constraint::solver::context::ProofContext,
+    live_sys: &System,
+    live_node: &crate::constraint::constraints::NodeId,
+    fa_live: &crate::fact::LNFact,
+    arm: RefineArm,
+) -> Vec<(System, crate::fact::LNFact, System)> {
+    use crate::constraint::solver::reduction::{Reduction, SolveOutcome};
+
+    let RefineArm { freshened_case, live_action, refined_case_for_dedup } = arm;
+
+    // dbg/trace plumbing (mirrors the refine half).  `case_label` is not
+    // recoverable post-split; left empty (TAM_DBG_APPLY_SOURCE drop traces
+    // here print case= blank, which is fine — the refine half already
+    // logged the labelled drops).
+    let dbg_apply = std::env::var("TAM_DBG_APPLY_SOURCE").is_ok();
+    let case_label = String::new();
+    let dbg = |reason: &str| {
+        if dbg_apply {
+            eprintln!("[applySource] DROP case={} reason={} live_node={:?} fa_live.tag={:?}",
+                case_label, reason, live_node, fa_live.tag);
+        }
+    };
+    let live_goal_for_trace = crate::constraint::constraints::Goal::Action(
+        live_node.clone(), fa_live.clone());
+
+    let mut out_arms: Vec<(System, crate::fact::LNFact, System)> = Vec::new();
+
     // ---------------------------------------------------------------
     // B — `markGoalAsSolved "precomputed" goal`.
     // E — `conjoinSystem sysTh`.
@@ -4520,7 +4557,7 @@ fn apply_source_case_action(
         });
         crate::state_trace::emit(
             "applySource_drop", Some(&live_goal_for_trace), &r.sys);
-        continue;
+        return out_arms;
     }
 
     // Drain `conjoin_system`'s step-12 fanout (HS Reduction.hs:736
@@ -4697,7 +4734,6 @@ fn apply_source_case_action(
     out_arms.push((r.sys, live_action.clone(), refined_case_for_dedup.clone()));
     } // end `for r_sys in e5_arm_systems`
     } // end `for r in arm_reductions`
-    } // end `for arm_eq_store in arm_eq_stores`
     out_arms
 }
 
