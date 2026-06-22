@@ -38,6 +38,12 @@ pub enum GoalRanking {
     Smart(bool),
     /// `InjRanking useLoopBreakers` (ProofMethod.hs).
     Inj(bool),
+    /// `SapicRanking` (ProofMethod.hs:993) — heuristic char `p`.
+    /// "heuristics adapted for processes" (System.hs:694).
+    Sapic,
+    /// `SapicPKCS11Ranking` (ProofMethod.hs:1072) — heuristic char `P`.
+    /// Deprecated PKCS#11-specific SAPIC ranking (System.hs:695).
+    SapicPKCS11,
     /// `GoalNrRanking` (rankGoals dispatch ProofMethod.hs:482):
     /// `sortOn (fst . snd)` — presort identifier `C`.
     GoalNr,
@@ -68,6 +74,15 @@ impl GoalRanking {
             'S' => GoalRanking::Smart(true),
             'i' => GoalRanking::Inj(false),
             'I' => GoalRanking::Inj(true),
+            // HS `SapicRanking` ('p') / `SapicPKCS11Ranking` ('P')
+            // (System.hs:591-592 `goalRankingIdentifiers`).  Previously
+            // these fell through to the `_ => Smart(false)` default, so
+            // SAPIC theories declaring `heuristic: p` silently used
+            // smartRanking — diverging goal selection (e.g. nsl-no_as
+            // `secrecy`: smart prioritises `isFreshKnowsGoal` KU(~n),
+            // sapic does NOT — it's commented out in HS sapicRanking).
+            'p' => GoalRanking::Sapic,
+            'P' => GoalRanking::SapicPKCS11,
             // HS `GoalNrRanking` (System.hs `goalRankingIdentifiers`: 'C')
             'C' => GoalRanking::GoalNr,
             // HS `UsefulGoalNrRanking` ('c')
@@ -405,6 +420,16 @@ fn rank_goals_with_inner(
         }
         GoalRanking::Smart(use_loop_breakers) => {
             Ok(smart_ranking(sys, ctx, use_loop_breakers))
+        }
+        GoalRanking::Sapic => {
+            // HS `SapicRanking -> plainRanking (sapicRanking ctxt sys ags)`
+            // (ProofMethod.hs:698).
+            Ok(sapic_ranking(sys, ctx, false))
+        }
+        GoalRanking::SapicPKCS11 => {
+            // HS `SapicPKCS11Ranking -> plainRanking (sapicPKCS11Ranking …)`
+            // (ProofMethod.hs:699).
+            Ok(sapic_ranking(sys, ctx, true))
         }
         GoalRanking::GoalNr => {
             // HS `goalNrRanking = sortOn (fst . snd)` (ProofMethod.hs:593-594).
@@ -1107,6 +1132,140 @@ fn smart_ranking(
     goals
 }
 
+/// Port of HS `sapicRanking` (ProofMethod.hs:993-1062, heuristic `p`) and
+/// `sapicPKCS11Ranking` (ProofMethod.hs:1072-1157, heuristic `P`).
+///
+/// ```text
+///   sortOnUsefulness . unmark . sortDecisionTreeLast solveLast
+///     . sortDecisionTree solveFirst . goalNrRanking
+/// ```
+///
+/// Differences from `smart_ranking` (HS `smartRanking`, ProofMethod.hs:1273):
+///   - `unmark` is UNCONDITIONAL here (`map unmarkPremiseG`, ProofMethod.hs:
+///     1011) — every PremiseG goal's usefulness is reset to `Useful`.
+///   - solve-last goals are moved to the END via `sortDecisionTreeLast`
+///     (not the `notSolveLast` partition trick).
+///   - `isFreshKnowsGoal` is COMMENTED OUT in HS's sapic solveFirst lists
+///     (ProofMethod.hs:1041, 1115) — so fresh-nonce KU goals are NOT
+///     prioritised (the key difference vs smartRanking, where it IS active).
+///   - there is NO `moveNatToEnd` tail stage.
+///
+/// `pkcs11` selects the deprecated PKCS#11 variant, which uses a slightly
+/// different solveFirst/solveLast set (isDisjGoal vs isDisjGoalButNotProgress,
+/// isInsertTemplateAction instead of the MID_/first-insert/progress entries,
+/// isStandardActionGoalButNotInsert, isKnowsHandleGoal as solve-last).
+fn sapic_ranking(
+    sys: &System,
+    ctx: Option<&crate::constraint::solver::context::ProofContext>,
+    pkcs11: bool,
+) -> Vec<AnnotatedGoal> {
+    let mut goals = open_goals(sys);
+    // HS-faithful lazy `oneCaseOnly` (see `smart_ranking`): only force the
+    // source-case analysis when a KU action goal is present.
+    let any_ku_action_goal = goals.iter().any(|a| {
+        use crate::fact::FactTag;
+        matches!(&a.goal, Goal::Action(_, fa) if matches!(fa.tag, FactTag::Ku))
+    });
+    let one_case_syms: std::collections::BTreeSet<Vec<u8>> = if any_ku_action_goal {
+        match ctx { Some(c) => collect_one_case_syms(c), None => Default::default() }
+    } else {
+        Default::default()
+    };
+    type Pred<'a> = Box<dyn Fn(&AnnotatedGoal) -> bool + 'a>;
+    let solve_first: Vec<Pred> = if pkcs11 {
+        vec![
+            Box::new(is_chain_goal),
+            Box::new(is_disj_goal),
+            Box::new(is_first_proto_fact),
+            Box::new(is_state_fact),
+            Box::new(is_unlock_action),
+            Box::new(is_insert_template_action),
+            Box::new(is_non_loop_breaker_proto_fact_goal),
+            Box::new(is_standard_action_goal_but_not_insert),
+            Box::new(is_not_auth_out),
+            Box::new(is_private_knows_goal),
+            // isFreshKnowsGoal — COMMENTED OUT in HS (ProofMethod.hs:1115)
+            Box::new(|a: &AnnotatedGoal| is_split_goal_small(a, sys)),
+            Box::new(|a: &AnnotatedGoal| is_msg_one_case_goal(a, &one_case_syms)),
+            Box::new(is_double_exp_goal),
+            Box::new(|a: &AnnotatedGoal| is_no_large_split_goal(a, sys)),
+        ]
+    } else {
+        vec![
+            Box::new(is_chain_goal),
+            Box::new(is_disj_goal_but_not_progress),
+            Box::new(is_first_proto_fact),
+            Box::new(is_mid_receiver),
+            Box::new(is_mid_sender),
+            Box::new(is_state_fact),
+            Box::new(is_unlock_action),
+            Box::new(is_knows_first_name_goal),
+            Box::new(is_first_insert_action),
+            Box::new(is_non_loop_breaker_proto_fact_goal),
+            Box::new(is_standard_action_goal_but_not_insert_or_receive),
+            Box::new(is_progress_disj),
+            Box::new(is_not_auth_out),
+            Box::new(is_private_knows_goal),
+            // isFreshKnowsGoal — COMMENTED OUT in HS (ProofMethod.hs:1041)
+            Box::new(|a: &AnnotatedGoal| is_split_goal_small(a, sys)),
+            Box::new(|a: &AnnotatedGoal| is_msg_one_case_goal(a, &one_case_syms)),
+            Box::new(is_double_exp_goal),
+            Box::new(|a: &AnnotatedGoal| is_no_large_split_goal(a, sys)),
+        ]
+    };
+    goals = sort_decision_tree_dyn(&solve_first, goals);
+    let solve_last: Vec<Pred> = if pkcs11 {
+        vec![
+            Box::new(is_knows_handle_goal),
+            Box::new(is_last_proto_fact),
+            Box::new(is_event_action),
+        ]
+    } else {
+        vec![
+            Box::new(is_last_insert_action),
+            Box::new(is_last_proto_fact),
+            Box::new(is_knows_last_name_goal),
+            Box::new(is_event_action),
+        ]
+    };
+    goals = sort_decision_tree_last_dyn(&solve_last, goals);
+    // unmark — UNCONDITIONAL (HS sapicRanking `unmark = map unmarkPremiseG`,
+    // ProofMethod.hs:1011): reset every PremiseG goal to `Useful`.
+    for a in goals.iter_mut() {
+        if matches!(a.goal, Goal::Premise(_, _)) {
+            a.usefulness = Usefulness::Useful;
+        }
+    }
+    // sortOnUsefulness — stable sort by usefulness tag.  NO moveNatToEnd.
+    goals.sort_by_key(|a| tag_usefulness(a.usefulness));
+    if std::env::var("TAM_RANK_DBG").is_ok() {
+        for (i, a) in goals.iter().take(6).enumerate() {
+            let g_str = format!("{:?}", a.goal).chars().take(160).collect::<String>();
+            eprintln!("[rank-sapic] #{}: {} useful={:?}", i, g_str, a.usefulness);
+        }
+    }
+    goals
+}
+
+/// `sortDecisionTreeLast ps xs` (ProofMethod.hs:935-937): like
+/// `sortDecisionTree` but the goals satisfying each predicate are appended
+/// at the END.  Order: goals matching NO predicate first, then goals
+/// matching the LAST predicate, …, then goals matching the FIRST predicate.
+fn sort_decision_tree_last_dyn(
+    ps: &[Box<dyn Fn(&AnnotatedGoal) -> bool + '_>],
+    xs: Vec<AnnotatedGoal>,
+) -> Vec<AnnotatedGoal> {
+    // HS: sortDecisionTreeLast (p:ps) xs = sortDecisionTreeLast ps nonsat ++ sat
+    if let Some((p, rest)) = ps.split_first() {
+        let (sat, nonsat): (Vec<_>, Vec<_>) = xs.into_iter().partition(|a| p(a));
+        let mut out = sort_decision_tree_last_dyn(rest, nonsat);
+        out.extend(sat);
+        out
+    } else {
+        xs
+    }
+}
+
 /// Port of HS `injRanking ctxt allowLoopBreakers sys`
 /// (ProofMethod.hs):
 ///
@@ -1475,6 +1634,154 @@ fn is_double_exp_goal(a: &AnnotatedGoal) -> bool {
         _ => false,
     }
 }
+
+// -- sapicRanking / sapicPKCS11Ranking priority-class predicates -------------
+//    (ProofMethod.hs:220-277, 941-987).  These mirror the SAPIC-translation
+//    fact-name conventions exactly; faithfulness requires matching HS's
+//    literal name strings (e.g. lowercase "state_", "Unlock", "MID_*").
+
+/// HS `isFirstProtoFact` (ProofMethod.hs:230): a PremiseG whose fact is a
+/// solve-first fact.  (Distinct from `is_solve_first_goal`, which HS's smart
+/// ranking uses and which also matches ActionG.)
+fn is_first_proto_fact(a: &AnnotatedGoal) -> bool {
+    matches!(&a.goal, Goal::Premise(_, fa) if is_solve_first_fact(fa))
+}
+
+/// HS `isLastProtoFact` (ProofMethod.hs:226): a PremiseG whose fact is a
+/// solve-last fact.
+fn is_last_proto_fact(a: &AnnotatedGoal) -> bool {
+    matches!(&a.goal, Goal::Premise(_, fa) if is_solve_last_fact(fa))
+}
+
+/// HS `isStateFact` (ProofMethod.hs:941): a PremiseG ProtoFact whose name
+/// has the lowercase `state_` prefix.
+fn is_state_fact(a: &AnnotatedGoal) -> bool {
+    use crate::fact::FactTag;
+    matches!(&a.goal, Goal::Premise(_, fa)
+        if matches!(&fa.tag, FactTag::Proto(_, n, _) if n.starts_with("state_")))
+}
+
+fn is_proto_named(a: &AnnotatedGoal, want_action: bool, name: &str) -> bool {
+    use crate::fact::FactTag;
+    let fa = match &a.goal {
+        Goal::Action(_, fa) if want_action => fa,
+        Goal::Premise(_, fa) if !want_action => fa,
+        _ => return false,
+    };
+    matches!(&fa.tag, FactTag::Proto(_, n, _) if n == name)
+}
+
+/// HS `isUnlockAction` (ProofMethod.hs:945): an ActionG of ProtoFact "Unlock".
+fn is_unlock_action(a: &AnnotatedGoal) -> bool { is_proto_named(a, true, "Unlock") }
+/// HS `isEventAction` (ProofMethod.hs:949): an ActionG of ProtoFact "Event".
+fn is_event_action(a: &AnnotatedGoal) -> bool { is_proto_named(a, true, "Event") }
+/// HS `isMID_Receiver` (ProofMethod.hs:953): PremiseG ProtoFact "MID_Receiver".
+fn is_mid_receiver(a: &AnnotatedGoal) -> bool { is_proto_named(a, false, "MID_Receiver") }
+/// HS `isMID_Sender` (ProofMethod.hs:957): PremiseG ProtoFact "MID_Sender".
+fn is_mid_sender(a: &AnnotatedGoal) -> bool { is_proto_named(a, false, "MID_Sender") }
+
+/// HS `isKnowsLastNameGoal` (ProofMethod.hs:262): KU goal of a fresh name
+/// var whose name has the `L_` prefix.
+fn is_knows_last_name_goal(a: &AnnotatedGoal) -> bool {
+    use tamarin_term::lterm::LSort;
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    matches!(msg_premise(&a.goal),
+        Some(Term::Lit(Lit::Var(v))) if v.sort == LSort::Fresh && v.name.starts_with("L_"))
+}
+
+/// HS `isKnowsHandleGoal` (ProofMethod.hs:1143, sapicPKCS11): KU goal of a
+/// fresh name var whose name has the `h` prefix.
+fn is_knows_handle_goal(a: &AnnotatedGoal) -> bool {
+    use tamarin_term::lterm::LSort;
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    matches!(msg_premise(&a.goal),
+        Some(Term::Lit(Lit::Var(v))) if v.sort == LSort::Fresh && v.name.starts_with("h"))
+}
+
+/// HS `isNotInsertAction` (ProofMethod.hs:973): NOT an ActionG ProtoFact "Insert".
+fn is_not_insert_action(a: &AnnotatedGoal) -> bool { !is_proto_named(a, true, "Insert") }
+/// HS `isNotReceiveAction` (ProofMethod.hs:977): NOT an ActionG ProtoFact "Receive".
+fn is_not_receive_action(a: &AnnotatedGoal) -> bool { !is_proto_named(a, true, "Receive") }
+
+/// HS `isStandardActionGoalButNotInsertOrReceive` (ProofMethod.hs:983).
+fn is_standard_action_goal_but_not_insert_or_receive(a: &AnnotatedGoal) -> bool {
+    is_standard_action_goal(a) && is_not_insert_action(a) && is_not_receive_action(a)
+}
+
+/// HS `isStandardActionGoalButNotInsert` (ProofMethod.hs:987, sapicPKCS11):
+/// standard action, not Insert, and not an Event action.
+fn is_standard_action_goal_but_not_insert(a: &AnnotatedGoal) -> bool {
+    is_standard_action_goal(a) && is_not_insert_action(a) && !is_event_action(a)
+}
+
+/// HS Insert-action key-prefix helper (ProofMethod.hs:961/968/1130):
+/// the first arg of an "Insert" ProtoFact is `<'name', _>` with `name` a
+/// public-name constant; true iff that name string has the given prefix.
+fn insert_action_first_key_has_prefix(a: &AnnotatedGoal, prefix: &str) -> bool {
+    use crate::fact::FactTag;
+    use tamarin_term::function_symbols::{FunSym, NoEqSym};
+    use tamarin_term::lterm::NameTag;
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+    let Goal::Action(_, fa) = &a.goal else { return false };
+    if !matches!(&fa.tag, FactTag::Proto(_, n, _) if n == "Insert") { return false; }
+    let Some(Term::App(FunSym::NoEq(NoEqSym { name, .. }), args)) = fa.terms.first() else {
+        return false;
+    };
+    if name.as_slice() != b"pair" || args.len() != 2 { return false; }
+    matches!(&args[0], Term::Lit(Lit::Con(c))
+        if c.tag == NameTag::Pub && c.id.0.starts_with(prefix))
+}
+
+/// HS `isFirstInsertAction` (ProofMethod.hs:961).
+fn is_first_insert_action(a: &AnnotatedGoal) -> bool {
+    insert_action_first_key_has_prefix(a, "F_")
+}
+/// HS `isLastInsertAction` (ProofMethod.hs:968).
+fn is_last_insert_action(a: &AnnotatedGoal) -> bool {
+    insert_action_first_key_has_prefix(a, "L_")
+}
+/// HS `isInsertTemplateAction` (ProofMethod.hs:1130, sapicPKCS11).
+fn is_insert_template_action(a: &AnnotatedGoal) -> bool {
+    insert_action_first_key_has_prefix(a, "template")
+}
+
+/// HS `isProgressFact` (ProofMethod.hs:243): a Linear fact of arity 1 whose
+/// name has the `ProgressTo_` prefix.  Operates on a guarded `GFact`.
+fn gfact_is_progress(f: &crate::guarded_types::GFact) -> bool {
+    !f.persistent && f.args.len() == 1 && f.name.starts_with("ProgressTo_")
+}
+
+fn is_node_sort_hint(s: &tamarin_parser::ast::SortHint) -> bool {
+    use tamarin_parser::ast::{SortHint, SuffixSort};
+    matches!(s, SortHint::Node | SortHint::Suffix(SuffixSort::Node))
+}
+
+/// HS `isProgressDisj` (ProofMethod.hs:246-252): a Disj goal all of whose
+/// disjuncts are `Ex #node. ProgressTo_…( #node )`.
+fn is_progress_disj(a: &AnnotatedGoal) -> bool {
+    use crate::constraint::constraints::Disj;
+    use crate::guarded::{GAtom, Guarded};
+    use crate::guarded::Quant;
+    let Goal::Disj(Disj(items)) = &a.goal else { return false };
+    if items.is_empty() { return false; }
+    items.iter().all(|g| match g {
+        Guarded::GGuarded { qua: Quant::Ex, vars, guards, .. }
+            if vars.len() == 1 && guards.len() == 1 && is_node_sort_hint(&vars[0].sort) =>
+        {
+            matches!(&guards[0], GAtom::Action(f, _) if gfact_is_progress(f))
+        }
+        _ => false,
+    })
+}
+
+/// HS `isDisjGoalButNotProgress` (ProofMethod.hs:253).
+fn is_disj_goal_but_not_progress(a: &AnnotatedGoal) -> bool {
+    is_disj_goal(a) && !is_progress_disj(a)
+}
+
 // -- injRanking priority-class predicates (ProofMethod.hs) --------------------
 
 /// `isImmediateGoal` (ProofMethod.hs): a PremiseG/ActionG
