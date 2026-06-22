@@ -12,7 +12,7 @@ pub mod options;
 pub mod repr;
 pub mod simplify;
 
-pub use options::{GraphOptions, graph_options_from_query};
+pub use options::{GraphOptions, graph_options_from_query, graph_options_from_params};
 pub use repr::{
     add_cluster_by_role, add_intelligent_cluster_using_similar_names,
     compute_basic_graph_repr, extract_role, group_nodes_by_role, Cluster, GEdge,

@@ -112,7 +112,8 @@ pub struct Source {
     /// which `ProofContext::ensure_saturated`'s post-saturate writeback
     /// requires.
     /// Internally stores case names as `Vec<String>` — HS's
-    /// `caseNames :: [String]` (Sources.hs:147-148).  The list
+    /// `caseNames :: [String]` (the `caseNames` parameter of `solve` at
+    /// Sources.hs:175; `[String]` type at Sources.hs:144).  The list
     /// representation is critical for `combine`'s truncation rule
     /// `combine (n:_) _ = [n]` (Sources.hs:139): without per-element
     /// boundaries, multi-step accumulated names can't be truncated
@@ -380,10 +381,10 @@ fn initial_source_cases_impl(
     // BEFORE invoking the solver, since unification inside the solver
     // can rewrite the goal's fact terms.
     red.mark_goal_as_solved(goal);
-    // HS `solveGoal` (Goals.hs:206) emits `traceExecM ("solveGoal "
-    // ++ goalKind goal)` here — this fires when the lemma proof
-    // forces the lazy thunk via `solveWithSourceAndReturn`.  Trivial
-    // protocols never force, so no trace.
+    // RS emits a solveGoal trace label here for diffing; HS's `solveGoal`
+    // (Goals.hs:200-213) only does `markGoalAsSolved "directly" goal` and
+    // dispatches — it has no trace emission (no traceExecM/goalKind exist
+    // in HS).
     {
         use crate::constraint::solver::trace::trace_exec;
         let label = match goal {
@@ -780,8 +781,8 @@ fn goal_free_vars(g: &crate::constraint::constraints::Goal, f: &mut dyn FnMut(&t
 /// matching the given live `fa` (a KU fact with a single term).
 /// Mirrors `source_label`'s KU arm — used at the runtime filterCases
 /// step where we have the live fa (not the source).  Equivalent to
-/// Haskell's full-`Source` equality (Sources.hs:218-219
-/// `filterCases usedCase cds = filter (\x -> usedCase /= x) cds`)
+/// Haskell's full-`Source` equality (Sources.hs:217-218, signature 217,
+/// body 218: `filterCases usedCase cds = filter (\x -> usedCase /= x) cds`)
 /// under the precompute invariant: `precompute_full_sources` emits
 /// at most one Source per distinct KU root symbol (mirroring
 /// Haskell's `sortednub absMsgFacts`), and `refineSource` preserves
@@ -1054,8 +1055,16 @@ fn refine_one_source(
     // dedup in a single pass after the loop.
     let mut deferred_filtered: Vec<(Vec<String>, crate::constraint::system::System)>
         = Vec::new();
+    // `stable_vars` (frees of the source's `cdGoal`) is invariant across
+    // the whole function — `src.goal` is never mutated by the loop — so
+    // compute it ONCE here and reuse it both inside the branch loop and
+    // for the post-loop removeRedundantCases.
+    let mut stable_vars: std::collections::BTreeSet<
+        tamarin_term::lterm::LVar> = std::collections::BTreeSet::new();
+    goal_free_vars(&src.goal, &mut |v| {
+        stable_vars.insert(v.clone());
+    });
     for (name_list, sys) in src.cases_take_list() {
-        let case_name_for_dbg = case_name_list_to_string(&name_list);
         // === Multi-branch refineSource (Haskell-faithful) ===
         set_precompute_mode(true);
         // HS-faithful: NO per-branch step cap.  HS `solveAllSafeGoals`
@@ -1071,6 +1080,14 @@ fn refine_one_source(
         // TAM_DISJ_OUTER_CAP remains as a diagnostic override.
         let outer_cap: i64 = std::env::var("TAM_DISJ_OUTER_CAP")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(i64::MAX);
+        // Only build the debug case-name join when actually debugging;
+        // `name_list` is moved into the solver call below, so capture it
+        // here under the `dbg` guard.  The non-dbg path skips the join.
+        let case_name_for_dbg = if dbg {
+            Some(case_name_list_to_string(&name_list))
+        } else {
+            None
+        };
         let (branches, branch_took_step) = run_solve_all_safe_goals_disj_with_progress(
             ctx, sys, ths_snapshot, /*chains_limit*/ 10,
             outer_cap, branch_cap, name_list);
@@ -1089,7 +1106,7 @@ fn refine_one_source(
             eprintln!("  case {:?}: refineSource produced {} branches",
                 case_name_for_dbg, branches.len());
         }
-        // HS-faithful `refineSource` (Sources.hs:137):
+        // HS-faithful `refineSource` (Sources.hs:123):
         //   map (second (modify sSubst (restrict stableVars)))
         // restricts each branch's eq-store subst to the STABLE vars
         // (frees of the source's `cdGoal`) before dedup.  This
@@ -1097,11 +1114,7 @@ fn refine_one_source(
         // cares about; internal fresh bindings are dropped so
         // equivalent branches dedupe.  Dedup itself is applied ONCE
         // across the flat preDedup list (after the loop, see below).
-        let mut stable_vars: std::collections::BTreeSet<
-            tamarin_term::lterm::LVar> = std::collections::BTreeSet::new();
-        goal_free_vars(&src.goal, &mut |v| {
-            stable_vars.insert(v.clone());
-        });
+        // `stable_vars` was computed once before the loop above.
         for (mut branch_sys, branch_name_list) in branches {
             if aggressive_drop && !contradictions(ctx, &branch_sys).is_empty() {
                 changed = true;
@@ -1123,15 +1136,10 @@ fn refine_one_source(
     // cases.  Gated on BP/MSet per HS short-circuit (`removeRedundantCases`
     // in Sources.hs returns the input unchanged outside BP/MSet).
     let msig = ctx.maude.maude_sig();
-    let mut stable_vars: std::collections::BTreeSet<
-        tamarin_term::lterm::LVar> = std::collections::BTreeSet::new();
-    goal_free_vars(&src.goal, &mut |v| {
-        stable_vars.insert(v.clone());
-    });
-    let pre_count = deferred_filtered.len();
+    // `stable_vars` was computed once before the branch loop above; reuse it.
     if std::env::var("TAM_RS_DBG_REMOVE_REDUNDANT").is_ok() {
         eprintln!("[RRC] === refine source goal={:?} input={} cases ===",
-            src.goal, pre_count);
+            src.goal, deferred_filtered.len());
     }
     let deduped = remove_redundant_cases(
         msig.enable_bp,
@@ -1140,7 +1148,6 @@ fn refine_one_source(
         |c| &c.1,
         deferred_filtered,
     );
-    let _ = pre_count;
     new_cases.extend(deduped);
     let count = new_cases.len();
     (new_cases, changed, count)
@@ -1219,7 +1226,6 @@ fn saturate_sources_with_simp_opt(
     // separate chain-fold pre-step (which would materialise branched
     // cases HS only explores lazily inside the Disj monad).
     for _iter_n in 0..limit {
-        let saturated = current.clone();
         // Haskell-faithful `goodTh` filter (Sources.hs:380-381):
         //
         //   goodTh th = length (getDisj (get cdCases th)) <= 1
@@ -1231,14 +1237,24 @@ fn saturate_sources_with_simp_opt(
         // multi-branch explodes to 234+ cases for NSPK3 Pre/Secret
         // (vs Haskell's handful), losing the Lowe attack case.  HS always
         // pairs the multi-branch refineSource with this `goodTh` filter.
-        let ths_snapshot: Vec<Source> = saturated.iter()
+        let ths_snapshot: Vec<Source> = current.iter()
             .filter(|s| s.cases_len() <= 1)
             .cloned()
             .collect();
+        // Pre-extract the cheap per-source values that the post-pipeline
+        // loop reads via index (goal, incomplete, prev case count) so that
+        // `current` can be MOVED directly into the parallel pipeline below
+        // instead of deep-cloning every materialised case System per
+        // saturate iteration.  These values are byte-identical to what
+        // `current.get(i)` would return.
+        let src_summaries: Vec<(crate::constraint::constraints::Goal, bool, usize)> =
+            current.iter()
+                .map(|s| (s.goal.clone(), s.incomplete, s.cases_len()))
+                .collect();
         if std::env::var("TAM_DBG_TS_SNAP").is_ok() {
             eprintln!("[ts_snap] iter={} saturated.len={} snapshot.len={}",
-                _iter_n, saturated.len(), ths_snapshot.len());
-            for (i, s) in saturated.iter().enumerate() {
+                _iter_n, current.len(), ths_snapshot.len());
+            for (i, s) in current.iter().enumerate() {
                 eprintln!("  saturated[{}] cases={} goal_head={}",
                     i, s.cases_len(),
                     {
@@ -1307,7 +1323,7 @@ fn saturate_sources_with_simp_opt(
         // serialises via `MaudeHandle::inner` (Arc<Mutex>) — workers
         // queue but don't race.
         let saturated_indexed: Vec<(usize, Source)> =
-            saturated.into_iter().enumerate().collect();
+            current.into_iter().enumerate().collect();
         // Per-worker MaudePool acquire: if a pool is set on the ctx, each
         // par_iter task borrows its own Maude subprocess for the
         // duration of `refine_one_source`, so workers don't serialise
@@ -1335,10 +1351,10 @@ fn saturate_sources_with_simp_opt(
                 }
             }).collect();
         for (i, (new_cases, per_changed, _)) in per_source.into_iter().enumerate() {
-            let src_goal_and_incomplete = current.get(i)
-                .map(|s| (s.goal.clone(), s.incomplete))
+            let summary = src_summaries.get(i)
                 .expect("saturate per_source index mismatch");
-            let prev_case_count = current.get(i).map(|s| s.cases_len()).unwrap_or(0);
+            let src_goal_and_incomplete = (summary.0.clone(), summary.1);
+            let prev_case_count = summary.2;
             if per_changed { changed = true; }
             // Determine if the case count changed for this source.
             let new_case_count = new_cases.len();
@@ -1682,7 +1698,8 @@ fn run_solve_all_safe_goals_disj_with_progress(
     use crate::fact::FactTag;
 
     // HS-faithful: track step names as a Vec<String> — HS's
-    // `caseNames` (Sources.hs:147-148) is `[String]`.  At finish we
+    // `caseNames` (the `solve` parameter at Sources.hs:175) is `[String]`
+    // (type at Sources.hs:144).  At finish we
     // apply HS's `combine` (Sources.hs:135-139) to merge with the
     // existing case-name list from `initial_name`:
     //
@@ -2464,7 +2481,9 @@ pub fn solve_with_source_cases_ctx(
 
     // HS's `filterCases` (Sources.hs:217-218) operates only inside
     // `solveAllSafeGoals` (saturate), not at runtime.  HS's runtime
-    // `solveWithSource` (ProofMethod.hs:461) passes the FULL source
+    // `solveWithSource` (ProofMethod.hs:319-320, the
+    // `(intercalate "_" <$>) (solveWithSource ctxt ths goal)` call site)
+    // passes the FULL source
     // list every call: `solveWithSource ctxt ths goal` where `ths =
     // pcSources ctxt`.  Re-applying the same source at multiple proof
     // positions is normal HS behaviour: each saturated case has its
@@ -2483,7 +2502,7 @@ pub fn solve_with_source_cases_ctx(
         _ => false,
     })?;
 
-    // HS-faithful: `solveWithSource` (ProofMethod.hs:461) accesses
+    // HS-faithful: `solveWithSource` (ProofMethod.hs:319-320) accesses
     // `cdCases` via `(names, sysTh0) <- disjunctionOfList $ getDisj $
     // get cdCases th` — forcing the lazy thunk.  We must force via
     // `src.cases(ctx)` to trigger `ensure_saturated` here at the
@@ -2540,12 +2559,13 @@ pub fn solve_with_source_cases_ctx(
         );
         let kept = !applied_arms.is_empty();
         if dbg { all_attempted.push((case_label.clone(), kept)); }
-        // HS-faithful: refineSubst's multi-arm fanout (Reduction.hs:776
+        // HS-faithful: refineSubst's multi-arm fanout (Reduction.hs:724-725
         // `disjunctionOfList performSplit`) produces one System per AC
         // unifier arm with the SAME case name.  Push each as a separate
         // (case_label, sys) entry.  Sibling cases sharing the same
         // case_label get `_case_N` suffixes via `distinguish`
-        // (ProofMethod.hs:485-490).
+        // (ProofMethod.hs:335, applied by `uniqueListBy ... distinguish
+        // cases` at ProofMethod.hs:308; `uniqueListBy` at ProofMethod.hs:91).
         for final_sys in applied_arms {
             out.push((case_label.clone(), final_sys));
         }
@@ -2942,10 +2962,12 @@ pub fn solve_with_source_cases_action_with_ctx(
             // refineSubst (`solve_term_eqs SplitNow`) can fan out
             // into multiple AC-unification arms — HS replicates the
             // Reduction continuation per arm via `disjunctionOfList
-            // performSplit` (Reduction.hs:776).  Each returned
+            // performSplit` (Reduction.hs:724-725).  Each returned
             // entry is one arm.  Same `case_label` for all arms;
             // proof_method.rs::ProofMethod::SolveGoal handles
-            // `_case_N` disambiguation (HS ProofMethod.hs:485-490).
+            // `_case_N` disambiguation (HS `distinguish` ProofMethod.hs:335,
+            // applied via `uniqueListBy ... distinguish cases` at
+            // ProofMethod.hs:308).
             for (grafted_sys, live_action, refined_case) in result {
                 if dbg_rt { kept_names.push(case_label.clone()); }
                 // Haskell-faithful: do NOT fan out variant SplitG
@@ -3082,7 +3104,7 @@ fn append_step_name_list(names: &mut Vec<String>, sub_name: &str) {
 }
 
 /// Render a step-name list as a single user-facing case-name string,
-/// matching HS's `intercalate "_" names'` (ProofMethod.hs:474).
+/// matching HS's `intercalate "_" names'` (ProofMethod.hs:319).
 pub(crate) fn case_name_list_to_string(names: &[String]) -> String {
     names.join("_")
 }
@@ -3186,7 +3208,9 @@ fn saturated_chain_root(name: &str) -> String {
     // `refineSource.combine` (Sources.hs:135-137) just keeps the first
     // non-coerce name without a per-closure suffix — multiple cases
     // sharing the same root name are disambiguated at runtime via
-    // `distinguish` (ProofMethod.hs:468-473) IF their proof-tree
+    // `distinguish` (ProofMethod.hs:335, applied via
+    // `uniqueListBy ... distinguish cases` at ProofMethod.hs:308) IF
+    // their proof-tree
     // siblings collide.  By stripping the saturate-time suffix here, we
     // let the runtime renderer's dedup do the same job from a clean
     // slate, matching Haskell's `Alice` vs `Alice_case_1`/`_case_2`
@@ -3917,7 +3941,8 @@ fn vspec_to_lvar(v: &tamarin_parser::ast::VarSpec) -> Option<tamarin_term::lterm
 /// out into multiple AC-unification arms — each arm is a distinct
 /// disjunctive sub-case in HS's `refineSource` (Sources.hs:114-138)
 /// because `solveTermEqs SplitNow` calls `disjunctionOfList performSplit`
-/// (Reduction.hs:773-781).  Empty Vec means the case dropped (match-fail,
+/// (Reduction.hs:712-733; `performSplit` use at 723-725).  Empty Vec
+/// means the case dropped (match-fail,
 /// refineSubst-contradictory, conjoin-fail, etc.).
 ///
 /// Multi-arm fan-out semantics: HS's `_applySource` runs in the
@@ -3933,7 +3958,9 @@ fn vspec_to_lvar(v: &tamarin_parser::ast::VarSpec) -> Option<tamarin_term::lterm
 /// returned entry.  When the same `case_label` shows up twice in the
 /// upstream `Vec<(String, System, LNFact)>`, the proof-method dispatcher
 /// (`proof_method.rs`:595-611) appends `_case_N` per HS's
-/// `uniqueListBy ... distinguish` (ProofMethod.hs:485-490).
+/// `uniqueListBy ... distinguish cases` (ProofMethod.hs:308, with
+/// `uniqueListBy` at ProofMethod.hs:91 and `distinguish` at
+/// ProofMethod.hs:335).
 fn apply_source_case_action(
     ctx: &crate::constraint::solver::context::ProofContext,
     live_sys: &System,
@@ -4160,7 +4187,8 @@ fn apply_source_case_action(
         })
         .collect();
     // -----------------------------------------------------------------
-    // refineSubst fan-out (HS Reduction.hs:773-781).
+    // refineSubst fan-out (HS Reduction.hs:712-733; `performSplit` use
+    // at 723-725).
     //
     // HS's `solveTermEqs SplitNow` calls
     //     disjunctionOfList $ performSplit eqs2 splitId
@@ -4187,8 +4215,9 @@ fn apply_source_case_action(
     // upstream caller pushes `(case_label, sys, fact)` per entry and the
     // proof-method dispatcher (`proof_method.rs`:595-611) handles
     // `_case_N` disambiguation when two entries share `case_label`,
-    // matching HS's `uniqueListBy ... distinguish` (HS ProofMethod.hs:
-    // 485-490).
+    // matching HS's `uniqueListBy ... distinguish cases` (HS
+    // ProofMethod.hs:308, with `uniqueListBy` at ProofMethod.hs:91 and
+    // `distinguish` at ProofMethod.hs:335).
     //
     // Arm order is preserved from `EquationStore::perform_split`, which
     // matches HS's `performSplit eqs2 splitId` enumeration order (Maude
@@ -4258,7 +4287,7 @@ fn apply_source_case_action(
         // Install this arm's eq_store into a fresh per-arm Reduction
         // whose system body is the post-refineSubst template.  This
         // mirrors HS's `DisjT` replication of the Reduction continuation
-        // (Reduction.hs:776 `disjunctionOfList performSplit`).
+        // (Reduction.hs:724-725 `disjunctionOfList performSplit`).
         let mut arm_sys = post_solve_sys_template.clone();
         arm_sys.invalidate_max_var_idx_cache();
         arm_sys.eq_store = arm_eq_store;
@@ -4464,7 +4493,7 @@ fn apply_source_case_action(
     // → `apply_source_case_action`).  Marking the live_goal as
     // solved during saturate produces case sub-systems with
     // pre-solved KU(...) ActionG goals; `conjoin_system`'s
-    // `combineGoalStatus` (Reduction.hs:680 `solved1 || solved2`)
+    // `combineGoalStatus` (Reduction.hs:510-511 `solved1 || solved2`)
     // then stamps solved=true on the live system's KU goals — the
     // runtime `case c_S` (or equivalent constructor) proof step HS
     // emits never fires because the goal is no longer "open".
@@ -4494,7 +4523,7 @@ fn apply_source_case_action(
         continue;
     }
 
-    // Drain `conjoin_system`'s step-12 fanout (HS Reduction.hs:847
+    // Drain `conjoin_system`'s step-12 fanout (HS Reduction.hs:736
     // `solveSubstEqs SplitNow` inside DisjT).  arm[0] is in r.sys;
     // arms[1..] are post-substSystem snapshots in
     // `pending_conjoin_arm_systems`.  We replay the rest of
@@ -4519,6 +4548,13 @@ fn apply_source_case_action(
         arm_reductions.push(Reduction::new(ctx, sys_i));
     }
 
+    // E.5 — edge fact-equality propagation (see per-arm comment below).
+    // `live_node_ids` depends only on `live_sys` (an immutable param,
+    // invariant across arms), so build it ONCE here instead of cloning
+    // every node id on each arm iteration.
+    let live_node_ids: std::collections::BTreeSet<crate::constraint::constraints::NodeId> =
+        live_sys.nodes.iter().map(|(n, _)| n.clone()).collect();
+
     for mut r in arm_reductions {
 
     // ---------------------------------------------------------------
@@ -4534,20 +4570,18 @@ fn apply_source_case_action(
     // Serv_1's action references `$S.Pub.0` while the lemma's
     // universal references `$S.Pub.1`.
     //
-    // SCOPING (HS-faithful): HS's `conjoinSystem` (Reduction.hs:824-846)
+    // SCOPING (HS-faithful): HS's `conjoinSystem` (Reduction.hs:660-690)
     // performs NO edge fact-equality solve at all — `joinSets sEdges`
-    // unions the edge SET and relies on the saturated case being
-    // edge-consistent.  This E.5 step is an RS-only compensation for
-    // saturate output that isn't fully edge-consistent.  It MUST only
+    // (Reduction.hs:667) unions the edge SET and relies on the saturated
+    // case being edge-consistent.  This E.5 step is an RS-only compensation
+    // for saturate output that isn't fully edge-consistent.  It MUST only
     // touch edges INTRODUCED by the grafted case — re-solving a
     // pre-existing LIVE edge re-narrows the live equation store and can
     // collapse live disjunctions HS keeps (Joux_EphkRev: re-solving the
     // live em-exponent Kd-pair chain edge folded the `splitEqs(3)/(4)`
     // disjunctions, turning HS's Split×3/×4 cascade into RS's Split×1).
     // A grafted edge is one with at least one endpoint NOT a pre-existing
-    // live node.
-    let live_node_ids: std::collections::BTreeSet<crate::constraint::constraints::NodeId> =
-        live_sys.nodes.iter().map(|(n, _)| n.clone()).collect();
+    // live node.  `live_node_ids` is computed once above the loop.
     let edge_eqs: Vec<_> = r.sys.edges.iter().filter_map(|e| {
         if live_node_ids.contains(&e.src.0)
             && live_node_ids.contains(&e.tgt.0)
@@ -4579,7 +4613,8 @@ fn apply_source_case_action(
     // when the edge-fact unification yields multiple AC unifier arms
     // (HS `solveFactEqs SplitNow` → `solveTermEqs SplitNow` →
     // `disjunctionOfList $ performSplit eqs2 splitId` forks the
-    // `Reduction`/`DisjT` continuation, Reduction.hs:730-738).  We
+    // `Reduction`/`DisjT` continuation, Reduction.hs:712-733;
+    // `performSplit` use at 723-725).  We
     // mirror that here: each arm continues the rest of `_applySource`
     // (F close_trivial_chains + output push) independently.  Each arm's
     // eq-store (from `perform_split`) PRESERVES the live system's other
@@ -4862,7 +4897,7 @@ fn apply_source_case_premise(
             }
         })
         .collect();
-    // HS-faithful multi-arm fanout (Reduction.hs:776 + Sources.hs:330-333):
+    // HS-faithful multi-arm fanout (Reduction.hs:724-725 + Sources.hs:330-333):
     // `refineSubst subst = solveSubstEqs SplitNow subst >> substSystem`.
     // `solveSubstEqs SplitNow` runs `disjunctionOfList $ performSplit eqs2
     // splitId` when the AC unifier returns multiple solutions.  Each arm
@@ -4900,6 +4935,13 @@ fn apply_source_case_premise(
 
     let post_solve_sys_template = refined.sys.clone();
     let mut out_arms: Vec<System> = Vec::with_capacity(arm_eq_stores.len());
+
+    // E.5 — `prem_live_node_ids` depends only on `live_sys` (an immutable
+    // param, invariant across arms), so build it ONCE here instead of
+    // cloning every node id on each arm iteration.  See the per-arm E.5
+    // comment below.
+    let prem_live_node_ids: std::collections::BTreeSet<crate::constraint::constraints::NodeId> =
+        live_sys.nodes.iter().map(|(n, _)| n.clone()).collect();
 
     for arm_eq_store in arm_eq_stores {
         let mut arm_sys = post_solve_sys_template.clone();
@@ -4971,7 +5013,7 @@ fn apply_source_case_premise(
     }
 
     // E.5 — edge fact-equality propagation.  Mirror Haskell's runtime
-    // `insertEdges` (Reduction.hs:280) which calls `solveFactEqs SplitNow`
+    // `insertEdges` (Reduction.hs:278-280) which calls `solveFactEqs SplitNow`
     // on every new edge so producer-conclusion ⇆ consumer-premise terms
     // unify before downstream `insertImpliedFormulas` runs.
     //
@@ -4987,12 +5029,12 @@ fn apply_source_case_premise(
     // Gen_Stop node's `ChainKey(kZero)` action and gfalse never enters
     // sFormulas → Rust does an extra solve step where Haskell sees
     // `by contradiction /* from formulas */`.  Same pattern as the
-    // saturate-time edge fact-equality fix at sources.rs:1221-1244.
+    // action-path edge fact-equality fix at sources.rs:4549-4568.
     // SCOPING (HS-faithful): the E.5 edge-fact solve must only touch edges
     // INTRODUCED by the grafted source case, NOT pre-existing LIVE edges.
-    // HS's `conjoinSystem` (Reduction.hs:824-846) does NO edge solve at all —
-    // `joinSets sEdges` unions the edge SET and lets the node-merge
-    // (`setNodes` → `solveRuleEqs SplitLater`) unify producer/consumer
+    // HS's `conjoinSystem` (Reduction.hs:660-690) does NO edge solve at all —
+    // `joinSets sEdges` (Reduction.hs:667) unions the edge SET and lets the
+    // node-merge (`setNodes` → `solveRuleEqs SplitLater`) unify producer/consumer
     // multisets of LIVE-LIVE edges LAZILY (as a deferred AC `splitEqs`).  RS's
     // premise E.5 eagerly `solve_fact_eqs(SplitNow)`s every edge; re-solving a
     // LIVE-LIVE edge re-narrows the live equation store and collapses
@@ -5002,13 +5044,11 @@ fn apply_source_case_premise(
     // SplitLater merge into RS's pinned 1-unifier APPLY — which collapses
     // `#a3`'s multiset nonce onto the witness `no1.0` (HS keeps it the fresh
     // `no1.1`, with `#a3`'s y's fresh `.2`).  This is the SAME live-edge
-    // hazard already guarded on the ACTION-path E.5 (sources.rs:7228-7238,
+    // hazard already guarded on the ACTION-path E.5 (sources.rs:4549-4568,
     // citing Joux_EphkRev's collapsed em-exponent splitEqs cascade); the
     // premise path was missing the guard.  A grafted edge has at least one
     // endpoint that is NOT a pre-existing live node — only those get the
-    // eager solve.
-    let prem_live_node_ids: std::collections::BTreeSet<crate::constraint::constraints::NodeId> =
-        live_sys.nodes.iter().map(|(n, _)| n.clone()).collect();
+    // eager solve.  `prem_live_node_ids` is computed once above the loop.
     let edge_eqs: Vec<_> = r.sys.edges.iter().filter_map(|e| {
         if prem_live_node_ids.contains(&e.src.0)
             && prem_live_node_ids.contains(&e.tgt.0)
@@ -5083,7 +5123,7 @@ fn apply_source_case_premise(
     // REAL `asubst` (from `solveSubstEqs`/`solveFactEqs`/`addEqs`); the
     // variant-drop for conflicting variants happens organically when the
     // conflicting binding enters via the normal solve path.  In particular
-    // HS's `insertEdges` (Reduction.hs:338) runs `solveFactEqs SplitNow`
+    // HS's `insertEdges` (Reduction.hs:278-280) runs `solveFactEqs SplitNow`
     // on every new edge's producer-conclusion ⇆ consumer-premise pair, and
     // THAT applyEqStore (with the real edge binding) drops a variant whose
     // range conflicts (e.g. TESLA Receiver0b variant `z → verify(...)`
@@ -6921,8 +6961,9 @@ mod tests {
     ///
     /// Mirrors Haskell `combine` (Sources.hs:135-137): the per-closure
     /// suffix is a Rust saturate-time artifact; Haskell doesn't add it.
-    /// Runtime `distinguish` (ProofMethod.hs:468) adds sibling-disambig
-    /// suffixes only when needed.
+    /// Runtime `distinguish` (ProofMethod.hs:335, applied via
+    /// `uniqueListBy ... distinguish cases` at ProofMethod.hs:308) adds
+    /// sibling-disambig suffixes only when needed.
     #[test]
     fn saturated_chain_root_strips_trailing_case_n() {
         assert_eq!(saturated_chain_root("Alice_case_1"), "Alice");

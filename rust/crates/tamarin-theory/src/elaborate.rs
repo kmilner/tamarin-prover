@@ -341,12 +341,11 @@ struct CollectedUserFuns {
 /// `set_user_funs_for_theory`).
 fn collect_user_funs(items: &[p::TheoryItem]) -> CollectedUserFuns {
     let user_names = |pred: fn(&p::FunctionDecl) -> bool| -> BTreeSet<String> {
-        items.iter().flat_map(|it| {
+        items.iter().filter_map(|it| {
             if let p::TheoryItem::Functions(decls) = it {
-                decls.iter().filter(|d| pred(d))
-                    .map(|d| d.name.clone()).collect::<Vec<_>>()
-            } else { Vec::new() }
-        }).collect()
+                Some(decls.iter().filter(|d| pred(d)).map(|d| d.name.clone()))
+            } else { None }
+        }).flatten().collect()
     };
     let mut nullary = user_names(|d| d.arg_types.is_empty());
     for it in items {
@@ -1662,10 +1661,9 @@ pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
                 let mut iter = new_args.into_iter().rev();
                 let last = iter.next()?;
                 let mut acc = last;
+                let pair_sym = tamarin_term::function_symbols::pair_sym();
                 for prev in iter {
-                    let pair_sym = NoEqSym::new(b"pair".to_vec(), 2,
-                        Privacy::Public, Constructability::Constructor);
-                    acc = f_app_no_eq(pair_sym, vec![prev, acc]);
+                    acc = f_app_no_eq(pair_sym.clone(), vec![prev, acc]);
                 }
                 new_args = vec![acc];
             }
@@ -1704,10 +1702,9 @@ pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
             let mut iter = new_items.into_iter().rev();
             let last = iter.next()?;
             let mut acc = last;
+            let sym = tamarin_term::function_symbols::pair_sym();
             for prev in iter {
-                let sym = NoEqSym::new(b"pair".to_vec(), 2,
-                    Privacy::Public, Constructability::Constructor);
-                acc = f_app_no_eq(sym, vec![prev, acc]);
+                acc = f_app_no_eq(sym.clone(), vec![prev, acc]);
             }
             Some(acc)
         }

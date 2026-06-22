@@ -303,10 +303,9 @@ pub async fn source_(
     let Some(entry) = state.store.get(idx) else {
         return missing_idx_html(idx);
     };
-    // This handler still emits the placeholder `(...)` form below.
-    // TODO: wire up the existing `prettyClosedTheory` port
-    // (`pretty_theory::pretty_closed_theory`) so this renders the full
-    // theory source instead.
+    // `pretty_theory::pretty_closed_theory` (pretty_theory.rs:238) is
+    // available; this handler still emits the `(...)` placeholder form below
+    // and just needs to call it to render the full theory source.
     let mut s = format!("theory {}\n\nbegin\n\n", entry.name);
     for r in entry.typed_theory.rules() {
         s.push_str(&format!("rule {}: (...)\n", r.name()));
@@ -984,13 +983,9 @@ pub async fn intdot(
 fn graph_options_from_map(
     qs: &HashMap<String, String>,
 ) -> crate::graph::GraphOptions {
-    // Serialise back to `key=value&...` so we can reuse the existing
-    // parser without duplicating it.
-    let s: String = qs.iter()
-        .map(|(k, v)| format!("{}={}", k, v))
-        .collect::<Vec<_>>()
-        .join("&");
-    crate::graph::graph_options_from_query(&s)
+    // Read the parsed map directly via the shared keyed-lookup helper,
+    // avoiding a round-trip through a re-serialised `key=value&...` string.
+    crate::graph::graph_options_from_params(qs)
 }
 
 /// `GET /thy/trace/<idx>/graph/*path` — return an SVG image of the

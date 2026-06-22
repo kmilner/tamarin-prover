@@ -86,6 +86,12 @@ pub fn apply_abbreviations_term(
             let new_args: Vec<LNTerm> = args.iter()
                 .map(|a| apply_abbreviations_term(lookup, a))
                 .collect();
+            // Fast path: if no child changed and no abbreviation matched at
+            // this node, the rebuilt App is structurally identical to `t`, so
+            // return an O(1) Arc bump instead of allocating a fresh App.
+            if new_args.iter().zip(args.iter()).all(|(n, o)| n == o) {
+                return t.clone();
+            }
             Term::App(s.clone(), new_args.into())
         }
     }
@@ -399,21 +405,28 @@ pub fn compute_abbreviations(
     let mut prefix_map: PrefixMap = BTreeMap::new();
     // Iteratively pick the best candidate.
     loop {
-        // Compute weights for each remaining term.
-        let weighted: Vec<(LNTerm, i64)> = term_occs.iter()
-            .map(|(t, (occs, legend_occs))|
-                (t.clone(), judge_term(&abbrevs, t, *occs, legend_occs))).collect();
-        let mut positives: Vec<(LNTerm, i64)> = weighted.into_iter()
-            .filter(|(_, w)| *w > 0).collect();
+        // Pick the best candidate (max positive weight, ties broken by
+        // ascending LNTerm `Ord` = BTreeMap iteration order).
+        //
         // Haskell `filterCandidateTerm`: `sortOn (Down . snd)` over the
         // `M.toList`-ordered (LNTerm `Ord`) weighted terms.  `sortOn` is
         // stable, so equal-weight ties fall back to ascending LNTerm `Ord`
-        // (the BTreeMap iteration order).  `slice::sort_by` is likewise
-        // stable, so sorting purely on descending weight preserves that
-        // tie-break — do NOT add a pretty-string secondary key.
-        positives.sort_by_key(|x| std::cmp::Reverse(x.1));
-        let (candidate, weight) = match positives.into_iter().next() {
-            Some(x) => x,
+        // (the BTreeMap iteration order).  A linear scan over the
+        // ascending-key BTreeMap that updates the running best only on a
+        // STRICT weight increase keeps the first-seen (smallest-key) term at
+        // the maximum weight, reproducing that stable tie-break — do NOT add a
+        // pretty-string secondary key.  Only positive weights qualify; no
+        // positive weight is the `None => break` case.  The chosen candidate is
+        // cloned once at the end.
+        let mut best: Option<(&LNTerm, i64)> = None;
+        for (t, (occs, legend_occs)) in term_occs.iter() {
+            let w = judge_term(&abbrevs, t, *occs, legend_occs);
+            if w > 0 && best.map_or(true, |(_, bw)| w > bw) {
+                best = Some((t, w));
+            }
+        }
+        let (candidate, weight) = match best {
+            Some((t, w)) => (t.clone(), w),
             None => break,
         };
         if weight < opts.always_abbrev_weight && abbrevs.len() >= opts.abbrevs_soft_limit {
@@ -462,6 +475,11 @@ fn apply_proper_subterms(
             let new_args: Vec<LNTerm> = args.iter()
                 .map(|a| apply_abbreviations_term(lookup, a))
                 .collect();
+            // Fast path: if no child changed, the rebuilt App is structurally
+            // identical to `t`, so return an O(1) Arc bump.
+            if new_args.iter().zip(args.iter()).all(|(n, o)| n == o) {
+                return t.clone();
+            }
             Term::App(s.clone(), new_args.into())
         }
     }

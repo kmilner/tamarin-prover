@@ -346,11 +346,14 @@ pub fn render_proof_tree_html(
 }
 
 /// Render the per-path sub-proof snippet.  Mirrors Haskell's
-/// `subProofSnippet` (`src/Web/Theory.hs:513-611`).  Emits:
+/// `subProofSnippet` (`src/Web/Theory.hs:513-611`; the methods section follows
+/// `prettyApplicableProofMethods`, `Web/Theory.hs:540`).  Emits:
 ///
-///   1. `<h3>Applicable Proof Methods:</h3>`
-///      `<div class="preformatted methods">…numbered method links…</div>`
-///      `a. <autoprove>` etc.
+///   1. The Applicable Proof Methods section — delegated to
+///      `write_applicable_methods`.  It emits the numbered method links
+///      together with the `a.`/`b.`/`s.` autoprove links, OR, when no method
+///      applies, the `<h3>Constraint System is Solved/Unfinishable</h3>`
+///      fallback.
 ///   2. `<h3>Constraint system</h3>`
 ///      `<dynamic-graph graphSrc="…">` (when the system has nodes/edges)
 ///      `<div class="preformatted sequent">…prettyNonGraphSystem…</div>`
@@ -449,6 +452,13 @@ fn write_applicable_methods(
     // the search loop which tries each in order); for the UI we filter via
     // `exec_proof_method` so the user-visible numbering matches the actual
     // click semantics.
+    // NOTE: this ranks at heuristic depth `0`, whereas Haskell
+    // `subProofSnippet` uses `length proofPath` and the method-apply route
+    // `apply_method_and_redirect` (theory.rs) passes `sub.len()`.  For
+    // multi-ranking heuristics at depth>0 the displayed numbering here can
+    // therefore disagree with the numbering the apply route selects from.
+    // Left as-is to avoid changing observed output; see
+    // `apply_method_and_redirect`'s `length proofPath` comment.
     let methods: Vec<ProofMethod> = match is_finished(ctx, sys) {
         Some(r) => vec![ProofMethod::Finished(r)],
         None => candidate_methods(sys, ctx, 0)

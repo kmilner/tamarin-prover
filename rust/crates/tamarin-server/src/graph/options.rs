@@ -55,7 +55,13 @@ pub fn graph_options_from_query(qs: &str) -> GraphOptions {
             let v = it.next().unwrap_or("");
             (k.to_string(), v.to_string())
         }).collect();
+    graph_options_from_params(&params)
+}
 
+/// Build `GraphOptions` from an already-parsed query parameter map.
+/// Shares the keyed-lookup logic of [`graph_options_from_query`] so callers
+/// that already hold a `HashMap` need not re-serialise it to a query string.
+pub fn graph_options_from_params(params: &HashMap<String, String>) -> GraphOptions {
     let simplification_level = params
         .get("simplification")
         .and_then(|v| read_simplification_level(v))

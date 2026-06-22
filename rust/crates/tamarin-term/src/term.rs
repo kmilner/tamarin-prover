@@ -90,6 +90,13 @@ pub fn f_app_ac<A: Ord + Clone>(sym: AcSym, args: Vec<Term<A>>) -> Term<A> {
         return args.into_iter().next().unwrap();
     }
     let target = FunSym::Ac(sym);
+    // Fast path: when no argument is a nested same-symbol App, the flatten
+    // loop would be the identity copy, so sort `args` in place and reuse it.
+    if !args.iter().any(|a| matches!(a, Term::App(s, _) if *s == target)) {
+        let mut args = args;
+        args.sort();
+        return Term::App(target, args.into());
+    }
     let mut flat: Vec<Term<A>> = Vec::with_capacity(args.len());
     for a in args {
         match a {

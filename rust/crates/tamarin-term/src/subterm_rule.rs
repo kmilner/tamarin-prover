@@ -70,7 +70,7 @@ pub fn find_all_subterms(l: &LNTerm, r: &LNTerm) -> Option<Vec<Position>> {
     }
 }
 
-/// `subterms args [] 1` (SubtermRule.hs:60-67): for each top-level arg
+/// `subterms args [] 1` (SubtermRule.hs:57-63, called at :67): for each top-level arg
 /// `t`, find the positions where `t` occurs as a subterm of a SIBLING
 /// arg, each prefixed with that sibling's top-level index.  HS visits the
 /// remaining siblings (`zip [i..] ts`) before the already-processed ones
@@ -82,7 +82,8 @@ fn subterms(args: &[LNTerm]) -> Vec<Position> {
         for (off, y) in args[k + 1..].iter().enumerate() {
             let x = (k + 1 + off) as i64;
             for mut p in find_subterm(y, t) {
-                let mut full = vec![x];
+                let mut full = Vec::with_capacity(1 + p.len());
+                full.push(x);
                 full.append(&mut p);
                 out.push(full);
             }
@@ -90,7 +91,8 @@ fn subterms(args: &[LNTerm]) -> Vec<Position> {
         // Then the already-processed siblings, at indices 0 .. k-1.
         for (x, y) in args[..k].iter().enumerate() {
             for mut p in find_subterm(y, t) {
-                let mut full = vec![x as i64];
+                let mut full = Vec::with_capacity(1 + p.len());
+                full.push(x as i64);
                 full.append(&mut p);
                 out.push(full);
             }

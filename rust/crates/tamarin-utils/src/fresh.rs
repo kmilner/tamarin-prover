@@ -60,10 +60,16 @@ impl PreciseFreshState {
     /// Get a fresh identifier for `name`. The next call with the same name
     /// yields the next sequential index.
     pub fn fresh_ident(&mut self, name: &str) -> u64 {
-        let entry = self.map.entry(name.to_string()).or_insert(0);
-        let i = *entry;
-        *entry = i + 1;
-        i
+        // Avoid allocating a `String` key on the common cache-hit path; only
+        // allocate when inserting a genuinely new name.
+        if let Some(entry) = self.map.get_mut(name) {
+            let i = *entry;
+            *entry = i + 1;
+            i
+        } else {
+            self.map.insert(name.to_string(), 1);
+            0
+        }
     }
 
     /// Reserve `k` identifiers across *all* names. Returns the first reserved

@@ -165,8 +165,9 @@ pub fn pretty_guarded(g: &Guarded) -> String {
 /// DOES shift the right doc's vertical layout by the leading `"`'s width
 /// (1 col).  Callers that place the formula after a 1-col prefix must use
 /// `pretty_guarded_doublequoted` (which models the `"` as a real Doc
-/// `beside`, getting the continuation indent right).  This bare entry
-/// point is kept for callers that pass `indent=0`.
+/// `beside`, getting the continuation indent right).  Used only by the
+/// unit tests in this module; production callers use
+/// `pretty_guarded_doublequoted`.
 #[cfg(test)]
 fn pretty_guarded_wrapped(g: &Guarded, indent: usize) -> String {
     use crate::pretty_hpj as hpj;

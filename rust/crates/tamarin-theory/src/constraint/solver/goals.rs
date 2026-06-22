@@ -213,14 +213,19 @@ pub fn open_goals(sys: &System) -> Vec<AnnotatedGoal> {
     // and shared across every KU goal's `currentlyDeducible`/`extractible`
     // check (Goals.hs:120), rather than rebuilt per goal.
     let adj = build_raw_less_adj(sys);
+    // HS always-before adjacency — invariant across all goals in this pass
+    // (`sys` is read-only), so build it ONCE and thread it through
+    // `is_open_in_sys` into the Chain-goal helpers rather than rebuilding
+    // it per Chain goal.
+    let ab_adj = sys.build_always_before_adj();
     for (goal, status) in sys.goals.iter() {
         if status.solved { continue; }
-        if !is_open_in_sys(goal, sys) { continue; }
+        if !is_open_in_sys(goal, sys, &ab_adj) { continue; }
         let u = goal_usefulness_with_adj(goal, status.looping, sys, &adj);
         // Use the persistent goal-number (`_gsNr`), NOT the Vec
         // position.  Haskell's `openGoals` returns `(goal, (gsNr,
         // useful))` (Goals.hs) and the rankings begin with
-        // `goalNrRanking = sortOn (fst . snd)` (ProofMethod.hs:748),
+        // `goalNrRanking = sortOn (fst . snd)` (ProofMethod.hs:593-594),
         // i.e. ordering by creation number.  We carry `status.nr`
         // here and sort below so the heuristic priority classes break
         // ties by creation order exactly as HS does.
@@ -474,8 +479,8 @@ fn oracle_ranking(
     // (ProofMethod.hs:607).
     let inp: String = ags.iter().enumerate().map(|(i, ag)| {
         let goal_text = crate::pretty_theory::render_goal_for_oracle(&ag.goal);
-        // concat . lines = remove all newlines
-        let single_line: String = goal_text.lines().collect::<Vec<_>>().concat();
+        // concat . lines = remove all newlines (no intermediate Vec<&str>)
+        let single_line: String = goal_text.lines().collect::<String>();
         format!("{}: {}\n", i, single_line)
     }).collect();
 
@@ -713,14 +718,21 @@ fn rank_by_blocks(
         })
         .collect();
 
+    // Single-pass bucketing by the already-computed first-match index.
+    // Each goal lands in exactly one bucket (its `Some(bi)`); `None`
+    // (unmatched) goals are skipped (dropped, matching HS `tail
+    // groupedPrio`).  Pushing in ags order preserves presort order within
+    // each bucket, and emitting buckets 0..n keeps ascending block-index
+    // order — identical to the prior nested loop.
+    let mut buckets: Vec<Vec<AnnotatedGoal>> = vec![Vec::new(); blocks.len()];
+    for (g, fm) in ags.iter().zip(first_match.iter()) {
+        if let Some(bi) = *fm {
+            buckets[bi].push(g.clone());
+        }
+    }
+
     let mut out = Vec::new();
-    for (bi, block) in blocks.iter().enumerate() {
-        let group: Vec<AnnotatedGoal> = ags
-            .iter()
-            .zip(first_match.iter())
-            .filter(|(_, fm)| **fm == Some(bi))
-            .map(|(g, _)| g.clone())
-            .collect();
+    for (block, group) in blocks.iter().zip(buckets.into_iter()) {
         if group.is_empty() {
             continue;
         }
@@ -736,10 +748,13 @@ fn apply_ranking_fn(name: &str, group: Vec<AnnotatedGoal>) -> Vec<AnnotatedGoal>
     match name {
         "smallest" => {
             // sortOn (length . render . prettyGoal) — STABLE.
+            // `sort_by_cached_key` computes the key exactly once per
+            // element (vs O(n log n) re-renders with `sort_by_key`),
+            // sorting with the same stable order.
             let mut g = group;
-            g.sort_by_key(|a| {
+            g.sort_by_cached_key(|a| {
                 let s = crate::pretty_theory::render_goal_for_oracle(&a.goal);
-                s.lines().collect::<Vec<_>>().concat().chars().count()
+                s.lines().collect::<String>().chars().count()
             });
             g
         }
@@ -786,7 +801,7 @@ fn eval_selector(
 /// `pg = concat . lines . render $ prettyGoal agoal` (Tactics.hs:134).
 fn tactic_pg(g: &AnnotatedGoal) -> String {
     let s = crate::pretty_theory::render_goal_for_oracle(&g.goal);
-    s.lines().collect::<Vec<_>>().concat()
+    s.lines().collect::<String>()
 }
 
 /// Evaluate one selector leaf (`regex "..."`, `dhreNoise "..."`, …).
@@ -1066,10 +1081,12 @@ fn smart_ranking(
     // 5. moveNatToEnd — Nat subterm splits to back.
     goals.sort_by_key(|a| is_nat_subterm_split(&a.goal));
     // 6. NO structural tie-break for Disj goals.  HS's `smartRanking`
-    // ends with `goalNrRanking = sortOn (fst . snd)` (ProofMethod.hs:
-    // 748-749) — sorting by goal NR (insertion-order counter), NOT by
-    // Goal Ord.  The `sortDecisionTree` partitions that follow are
-    // stable, so within each class the relative order from
+    // pipeline runs `goalNrRanking = sortOn (fst . snd)` (defined at
+    // ProofMethod.hs:593-594) FIRST — it is the rightmost composition
+    // stage `moveNatToEnd . ... . goalNrRanking` (ProofMethod.hs:1053),
+    // so it runs before the others — sorting by goal NR (insertion-order
+    // counter), NOT by Goal Ord.  The `sortDecisionTree` partitions that
+    // follow are stable, so within each class the relative order from
     // goalNrRanking is preserved.  Rust's `open_goals` yields goals in
     // sys.goals insertion order = nr order, and the subsequent
     // partitions here are stable too, so no extra sort is required.
@@ -1269,16 +1286,21 @@ fn collect_one_case_syms(
             continue
         };
         // Now we know the goal is `KU(FApp o _)` — HS-faithful: force
-        // cases at this point to check the disjunct count.
-        let cases = src.cases(ctx);
+        // cases at this point to check the disjunct count.  We only need
+        // the disjunct COUNT here, so force once (idempotent) and read
+        // the cell length in O(1) instead of deep-cloning every case
+        // `System`.  The full `cases()` deep clone is taken only inside
+        // the debug branch.
+        src.cases_list(ctx);
         if dbg_sources {
+            let cases = src.cases(ctx);
             let nm = String::from_utf8_lossy(&s.name);
             let arity = if let Term::App(_, args) = term { args.len() } else { 0 };
             let names: Vec<String> = cases.iter().map(|(n, _)| n.clone()).collect();
             eprintln!("[RS src] {} arity={} cases={} names={:?}",
                 nm, arity, cases.len(), names);
         }
-        if cases.len() != 1 { continue; }
+        if src.cases_len() != 1 { continue; }
         out.insert(s.name.clone());
     }
     out
@@ -1601,7 +1623,11 @@ fn msg_premise(g: &Goal) -> Option<&tamarin_term::lterm::LNTerm> {
 /// callers in saturate code make the intent explicit; if we ever need
 /// to diverge again, the seam is here.
 pub fn is_open_for_saturate(g: &Goal, sys: &System) -> bool {
-    is_open_in_sys(g, sys)
+    // Standalone caller: build the always-before adjacency on the spot
+    // (mirrors `goal_usefulness` building `rawLessRel` for non-`open_goals`
+    // callers).  `open_goals` instead builds it once and shares it.
+    let ab_adj = sys.build_always_before_adj();
+    is_open_in_sys(g, sys, &ab_adj)
 }
 
 /// `chain_kd_conc_term`: the KD-fact term at the chain's source-
@@ -1630,6 +1656,7 @@ fn chain_to_equality(
     c: &crate::constraint::constraints::NodeConc,
     p: &crate::constraint::constraints::NodePrem,
     sys: &System,
+    ab_adj: &crate::constraint::system::PrebuiltAdj,
 ) -> bool {
     // Look up the premise's rule. If it's NOT an IEquality rule,
     // chainToEquality returns False (chain is auto-handled).
@@ -1650,9 +1677,9 @@ fn chain_to_equality(
     //
     // `always_before(id, &c.0)` is invariant across the actions of a node
     // (it does not depend on `fa`) and the relation is invariant across the
-    // loops, so build the adjacency once and test the cheap tag/term
+    // loops and across all goals in one `open_goals` pass, so the caller
+    // builds the adjacency once and threads it in; test the cheap tag/term
     // predicate before the per-node `always_before_with` query.
-    let ab_adj = sys.build_always_before_adj();
     let is_ku_of_t = |fa: &crate::fact::LNFact| -> bool {
         matches!(fa.tag, crate::fact::FactTag::Ku)
             && fa.terms.first() == Some(t_start)
@@ -1662,14 +1689,14 @@ fn chain_to_equality(
         .filter(|(_, st)| !st.solved)
         .any(|(g, _)| match g {
             Goal::Action(i, fa) =>
-                is_ku_of_t(fa) && sys.always_before_with(&ab_adj, i, &c.0),
+                is_ku_of_t(fa) && sys.always_before_with(ab_adj, i, &c.0),
             _ => false,
         });
     // Node rule actions (= HS sNodes half of allActions).
     let ku_before_node = sys.nodes.iter().any(|(id, rule)| {
         if id == &c.0 { return false; }
         rule.actions.iter().any(is_ku_of_t)
-            && sys.always_before_with(&ab_adj, id, &c.0)
+            && sys.always_before_with(ab_adj, id, &c.0)
     });
     ku_before_goal || ku_before_node
 }
@@ -1706,7 +1733,11 @@ fn chain_to_equality(
 /// stale msg-var KD chains is still a valid Solved verdict — Haskell
 /// trusts that the intruder is omnipotent for any unspecified
 /// message, so the chain is vacuously satisfied.
-fn is_open_in_sys(g: &Goal, sys: &System) -> bool {
+fn is_open_in_sys(
+    g: &Goal,
+    sys: &System,
+    ab_adj: &crate::constraint::system::PrebuiltAdj,
+) -> bool {
     use crate::constraint::constraints::Disj;
     use crate::fact::FactTag;
     match g {
@@ -1737,13 +1768,13 @@ fn is_open_in_sys(g: &Goal, sys: &System) -> bool {
                 // treats these as open and explores extension paths Haskell
                 // skips.
                 if let Some(args) = union_args(&m) {
-                    if all_msg_vars_known_earlier(c, &args, sys) {
+                    if all_msg_vars_known_earlier(c, args, sys, ab_adj) {
                         return false;
                     }
                     return true;
                 }
                 if is_msg_var(&m) {
-                    return chain_to_equality(&m, c, _p, sys);
+                    return chain_to_equality(&m, c, _p, sys, ab_adj);
                 }
             }
             true
@@ -1776,14 +1807,15 @@ fn is_msg_var(t: &tamarin_term::lterm::LNTerm) -> bool {
 
 /// Extract args if the term is a multiset-union (`FUnion`) — Haskell's
 /// `viewTerm2 → FUnion args`.  Returns None for any other term shape.
-fn union_args(t: &tamarin_term::lterm::LNTerm) -> Option<Vec<tamarin_term::lterm::LNTerm>> {
+fn union_args(t: &tamarin_term::lterm::LNTerm) -> Option<&[tamarin_term::lterm::LNTerm]> {
     use tamarin_term::function_symbols::{AcSym, FunSym};
     use tamarin_term::term::Term;
     match t {
         // Multiset union is an AC symbol (`Ac(Union)`), never a `NoEq`
         // — matching the representation used everywhere else in this
-        // file (e.g. `has_top_pair_inv_prod`).
-        Term::App(FunSym::Ac(AcSym::Union), args) => Some(args.to_vec()),
+        // file (e.g. `has_top_pair_inv_prod`).  Borrow the existing
+        // Arc-backed child slice; the only caller just iterates it.
+        Term::App(FunSym::Ac(AcSym::Union), args) => Some(args),
         _ => None,
     }
 }
@@ -1796,12 +1828,14 @@ fn all_msg_vars_known_earlier(
     c: &crate::constraint::constraints::NodeConc,
     args: &[tamarin_term::lterm::LNTerm],
     sys: &System,
+    ab_adj: &crate::constraint::system::PrebuiltAdj,
 ) -> bool {
     if !args.iter().all(is_msg_var) { return false; }
     let i = &c.0;
     // `always_before(j, i)` does not depend on `arg`, and the relation is
-    // invariant across both loops (`sys` is read-only), so build it once.
-    let ab_adj = sys.build_always_before_adj();
+    // invariant across both loops and across all goals in one `open_goals`
+    // pass (`sys` is read-only), so the caller builds it once and threads
+    // it in.
     // HS `earlierMsgVars = do (j,_,t) <- allKUActions sys; ...` (Goals.hs:164)
     // and `allKUActions sys = unsolvedActionAtoms sys ++ node actions`
     // (System.hs:1575-1585): the KU action may exist only as an unsolved
@@ -1816,13 +1850,13 @@ fn all_msg_vars_known_earlier(
             .filter(|(_, st)| !st.solved)
             .any(|(g, _)| match g {
                 Goal::Action(j, fa) =>
-                    is_ku_of(fa, arg) && sys.always_before_with(&ab_adj, j, i),
+                    is_ku_of(fa, arg) && sys.always_before_with(ab_adj, j, i),
                 _ => false,
             });
         // Node rule actions half of allActions.
         let in_nodes = sys.nodes.iter().any(|(j, rule)| {
             j != i
-                && sys.always_before_with(&ab_adj, j, i)
+                && sys.always_before_with(ab_adj, j, i)
                 && rule.actions.iter().any(|fa| is_ku_of(fa, arg))
         });
         in_goals || in_nodes

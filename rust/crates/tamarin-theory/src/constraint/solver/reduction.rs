@@ -422,9 +422,9 @@ impl<'ctx> Reduction<'ctx> {
         let mut iter = 0u32;
         let cap = 32u32;
         loop {
-            let before_subst_len = self.sys.eq_store.subst.to_list().len();
+            let before_subst_len = self.sys.eq_store.subst.len();
             self.subst_system_once();
-            let after_subst_len = self.sys.eq_store.subst.to_list().len();
+            let after_subst_len = self.sys.eq_store.subst.len();
             if after_subst_len == before_subst_len { break; }
             iter += 1;
             if iter >= cap { break; }
@@ -433,8 +433,8 @@ impl<'ctx> Reduction<'ctx> {
 
     /// One pass of substSystem.  See [`subst_system`] for the loop wrapper.
     fn subst_system_once(&mut self) {
+        if self.sys.eq_store.subst.is_empty() { return; }
         let subst = self.sys.eq_store.subst.clone();
-        if subst.is_empty() { return; }
         // Substitution rewrites every term/fact/rule under the current
         // subst — vars in the domain get replaced (possibly by vars
         // with smaller idx), so max-var-idx can LOWER.  Invalidate.
@@ -2281,7 +2281,7 @@ impl<'ctx> Reduction<'ctx> {
             (Some(id), SplitStrategy::SplitNow) => {
                 // HS-faithful: perform_split FIRST, then simp + is_false
                 // check PER ARM.  Mirrors Haskell `solveTermEqs`
-                // (Reduction.hs:730-738):
+                // (Reduction.hs:712-731):
                 //   setM sEqStore =<< simp ... =<<
                 //       case (maySplitId, splitStrat) of
                 //         (Just splitId, SplitNow) -> disjunctionOfList
@@ -2415,8 +2415,9 @@ impl<'ctx> Reduction<'ctx> {
         for e in eqs {
             if e.lhs.tag != e.rhs.tag || e.lhs.terms.len() != e.rhs.terms.len() {
                 // Set eq_store.is_false so the SolveGoal-arm mzero
-                // proxy filter (proof_method.rs:326) sees the
-                // contradiction even if the caller `let _ = ...`s
+                // proxy filter (the SolveGoal-arm eq_store.is_false()
+                // case-drop in exec_proof_method, proof_method.rs:584)
+                // sees the contradiction even if the caller `let _ = ...`s
                 // our result.  Mirrors Haskell's `contradictoryIf`
                 // (Reduction.hs:745) firing mzero on tag mismatch.
                 if !self.sys.eq_store.is_false() {
@@ -3437,9 +3438,11 @@ pub fn bounds_max_uncached(sys: &System) -> u64 {
         let n = crate::guarded::max_var_idx(f);
         if n > max { max = n; }
     }
-    for (v, t) in sys.eq_store.subst.to_list() {
+    for v in sys.eq_store.subst.dom() {
         if v.idx > max { max = v.idx; }
-        bm_term(&t, &mut max);
+    }
+    for t in sys.eq_store.subst.range() {
+        bm_term(t, &mut max);
     }
     // Walk eq_store.conj (disjunctive substitutions).  HS-faithful:
     // `avoid sys = freshAvoiding (frees sys)`, and `frees` over the variant
@@ -3454,7 +3457,7 @@ pub fn bounds_max_uncached(sys: &System) -> u64 {
     // 98-109` and count keys only.
     for d in &sys.eq_store.conj {
         for s in &d.substs {
-            for (v, _t) in s.to_list() {
+            for v in s.dom() {
                 if v.idx > max { max = v.idx; }
                 // Range vars NOT counted (HS-faithful: foldFrees over keys).
             }
@@ -3510,8 +3513,8 @@ fn freshen_rule_with_constrs(
     rule.for_each_free(&mut acc);
     if let Some(cs) = &constrs {
         for s in cs {
-            for (k, _v) in s.to_list() {
-                acc(&k);
+            for k in s.dom() {
+                acc(k);
                 // Range NOT walked (HS-faithful keys-only fold).
             }
         }
@@ -3870,7 +3873,7 @@ fn has_fresh_consumer_conflation(
     use tamarin_term::lterm::{LSort, LVar};
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
-    let subst = sys.eq_store.subst.clone();
+    let subst = &sys.eq_store.subst;
     // Capture the rule reference alongside each consumer at build time —
     // it is exactly the node's rule we are already iterating, so the
     // inner pair loop need not re-scan `sys.nodes` (O(consumers^2 * nodes)
@@ -3881,7 +3884,7 @@ fn has_fresh_consumer_conflation(
         for prem in &rule.premises {
             if !matches!(prem.tag, FactTag::Fresh) { continue; }
             let t = match prem.terms.first() { Some(t) => t, None => continue };
-            let t_norm = tamarin_term::subst::apply_vterm(&subst, t.clone());
+            let t_norm = tamarin_term::subst::apply_vterm(subst, t.clone());
             if let Term::Lit(Lit::Var(v)) = t_norm {
                 if v.sort == LSort::Fresh {
                     consumers.push((id.clone(), v, rule));
@@ -4829,7 +4832,7 @@ impl<'ctx> Reduction<'ctx> {
                             // can fan out into multiple AC unifier arms
                             // (HS forks the `Reduction`/`DisjT`
                             // continuation per arm via `disjunctionOfList
-                            // performSplit`, Reduction.hs:730-738).  On
+                            // performSplit`, Reduction.hs:712-731).  On
                             // `Cases`, `solve_term_eqs` returns the arms
                             // WITHOUT installing any into `sub.sys`
                             // (it leaves the `mem::take`'d default
@@ -5338,7 +5341,9 @@ impl<'ctx> Reduction<'ctx> {
             // raw `sys.add_edge` (now routed through `insert_edge_labeled`)
             // plus the lack of `sub.subst_system` after `exploit_prems`
             // left case clones with eq_store bindings but stale node
-            // facts.  Both fixed now — see lines ~3960-3985 below.
+            // facts.  Both fixed now — see the rule-enumeration loop
+            // later in solve_premise_goal (the per-candidate freshen +
+            // insert_edge_labeled_with_facts + per-arm subst_system path).
             return self.solve_premise_goal(&p_learn, &prem_learn);
         }
         // Source-case short-circuit.  Mirrors Haskell's `solveWithSource`

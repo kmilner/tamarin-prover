@@ -145,21 +145,60 @@ pub fn apply_lit_map<C: Ord + Clone, V: Ord + Clone>(
 
 /// `applyVTerm` against a raw substitution map — the borrowing
 /// counterpart of [`apply_vterm`], producing byte-identical output.
+///
+/// Two short-circuits keep this off the allocator on the common case
+/// (mirroring the sharing optimisation in HS `applyVTerm`):
+///   - an empty map is the identity, so `t` is returned untouched;
+///   - any subterm the substitution does not actually rewrite is
+///     returned as-is (its `Arc` reused) rather than rebuilt — sound
+///     because an unchanged term is already AC-normal, so it needs no
+///     re-normalisation.  A new argument vector is allocated only when
+///     at least one child changes; that changed branch still routes
+///     through the same smart constructors, so output stays identical.
 pub fn apply_vterm_map<C: Ord + Clone, V: Ord + Clone>(
     map: &BTreeMap<V, VTerm<C, V>>,
     t: VTerm<C, V>,
 ) -> VTerm<C, V> {
+    if map.is_empty() {
+        return t;
+    }
+    apply_vterm_map_changed(map, &t).unwrap_or(t)
+}
+
+/// Apply `map` to a borrowed term, returning `Some(new)` only when the
+/// substitution actually rewrites it and `None` when it is left
+/// unchanged.  `None` is what lets [`apply_vterm_map`] hand back the
+/// original term (and reuse its `Arc`) instead of reallocating an
+/// identical one.
+fn apply_vterm_map_changed<C: Ord + Clone, V: Ord + Clone>(
+    map: &BTreeMap<V, VTerm<C, V>>,
+    t: &VTerm<C, V>,
+) -> Option<VTerm<C, V>> {
     match t {
-        Term::Lit(l) => apply_lit_map(map, &l),
+        Term::Lit(Lit::Var(v)) => map.get(v).cloned(),
+        Term::Lit(Lit::Con(_)) => None,
         Term::App(fsym, args) => {
-            let mapped: Vec<VTerm<C, V>> =
-                args.iter().cloned().map(|a| apply_vterm_map(map, a)).collect();
-            match fsym {
-                FunSym::Ac(o) => f_app_ac(o, mapped),
-                FunSym::C(o) => f_app_c(o, mapped),
-                FunSym::NoEq(o) => f_app_no_eq(o, mapped),
-                FunSym::List => f_app_list(mapped),
+            // Lazily allocate the rewritten argument vector: only once a
+            // child is found to change do we clone the unchanged prefix.
+            let mut new_args: Option<Vec<VTerm<C, V>>> = None;
+            for (i, a) in args.iter().enumerate() {
+                match apply_vterm_map_changed(map, a) {
+                    Some(na) => {
+                        new_args.get_or_insert_with(|| args[..i].to_vec()).push(na);
+                    }
+                    None => {
+                        if let Some(v) = new_args.as_mut() {
+                            v.push(a.clone());
+                        }
+                    }
+                }
             }
+            new_args.map(|mapped| match fsym {
+                FunSym::Ac(o) => f_app_ac(*o, mapped),
+                FunSym::C(o) => f_app_c(*o, mapped),
+                FunSym::NoEq(o) => f_app_no_eq(o.clone(), mapped),
+                FunSym::List => f_app_list(mapped),
+            })
         }
     }
 }

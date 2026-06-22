@@ -440,13 +440,11 @@ impl EquationStore {
             .map(|d| (d.split_id, d.substs.len()))
             .collect();
         indexed.sort_by_key(|(_, sz)| *sz);
-        // Dedup keeping first occurrence (matching Haskell's `nub`).
-        let mut seen: BTreeSet<SplitId> = BTreeSet::new();
-        let mut out = Vec::with_capacity(indexed.len());
-        for (id, _) in indexed {
-            if seen.insert(id) { out.push(id); }
-        }
-        out
+        // Mirrors Haskell's `nub`, but split-ids in `conj` are unique by
+        // construction (`add_disj` assigns a fresh incrementing id and never
+        // reuses one; the only other id is the lone `SplitId(-1)` false_conj),
+        // so the dedup is provably a no-op and is elided.
+        indexed.into_iter().map(|(id, _)| id).collect()
     }
 
     /// Number of cases for a given split id.
@@ -530,14 +528,18 @@ impl EquationStore {
     fn fresh_baseline(&self) -> u64 {
         use tamarin_term::lterm::HasFrees;
         let mut m = 0u64;
-        for (v, t) in self.subst.to_list().iter() {
+        for v in self.subst.dom() {
             if v.idx > m { m = v.idx; }
+        }
+        for t in self.subst.range() {
             t.for_each_free(&mut |w| if w.idx > m { m = w.idx; });
         }
         for d in &self.conj {
             for s in &d.substs {
-                for (v, t) in s.to_list() {
+                for v in s.dom() {
                     if v.idx > m { m = v.idx; }
+                }
+                for t in s.range() {
                     t.for_each_free(&mut |w| if w.idx > m { m = w.idx; });
                 }
             }
@@ -738,10 +740,11 @@ impl EquationStore {
                 raw, &input_vars,
                 self.fresh_baseline().max(extra_avoid),
                 maude);
-            let mut maude_subst = LNSubst::empty();
-            for (v, t) in raw {
-                maude_subst = maude_subst.compose(&LNSubst::from_list(vec![(v, t)]));
-            }
+            // `raw` is a Maude idempotent (solved-form) unifier: its range
+            // is disjoint from its domain (freshen_witness_range only renames
+            // range-only witnesses, never domain keys), so the one-at-a-time
+            // `compose` accumulation collapses to a single `from_list` build.
+            let maude_subst = LNSubst::from_list(raw);
             // Haskell-faithful: compose local_subst with Maude's result
             // (Unification.hs:147 `flattenUnif` =
             // `map (\`composeVFresh\` subst) substs`).
@@ -965,9 +968,12 @@ impl EquationStore {
         let mut changed = false;
         for d in self.conj.iter_mut() {
             for s in d.substs.iter_mut() {
-                let cleaned = s.remove_renamings();
-                if cleaned.dom().count() != s.dom().count() {
-                    *s = cleaned;
+                // `remove_renamings` drops exactly the entries `v` for which
+                // `is_renamed_var(v)` holds, so the domain count changes iff at
+                // least one such entry exists.  Gate the allocation on that
+                // cheap pre-check (the common case has no renamings).
+                if s.dom().any(|v| s.is_renamed_var(v)) {
+                    *s = s.remove_renamings();
                     changed = true;
                 }
             }
@@ -986,6 +992,16 @@ impl EquationStore {
         let mut changed = false;
         let empty = LNSubstVFresh::empty();
         for d in self.conj.iter_mut() {
+            // Fast path: if no duplicate, no empty, and no contradictory subst
+            // exists, this disj is left untouched (no change, no clone).  This
+            // is the common case and avoids the O(n^2) dedup-clone below.
+            let mut has_dup = false;
+            for (i, s) in d.substs.iter().enumerate() {
+                if d.substs[..i].iter().any(|x| x == s) { has_dup = true; break; }
+            }
+            let needs_work = has_dup
+                || d.substs.iter().any(|s| s == &empty || is_contr(s));
+            if !needs_work { continue; }
             // Dedup in-place while preserving first occurrences.
             let mut seen: Vec<LNSubstVFresh> = Vec::new();
             for s in &d.substs {

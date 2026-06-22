@@ -110,17 +110,15 @@ pub fn postprocess(s: &str) -> String {
                 (rest, "", false)
             }
         };
-        let leading = line.chars().take_while(|c| c.is_whitespace()).count();
-        for _ in 0..leading {
+        // Single pass: emit `&nbsp;` per leading-whitespace char and accumulate
+        // its byte length, giving the suffix byte offset without re-walking.
+        let mut suffix_offset = 0;
+        for c in line.chars() {
+            if !c.is_whitespace() { break; }
             out.push_str("&nbsp;");
+            suffix_offset += c.len_utf8();
         }
-        out.push_str(
-            &line[line
-                .char_indices()
-                .nth(leading)
-                .map(|(i, _)| i)
-                .unwrap_or(line.len())..],
-        );
+        out.push_str(&line[suffix_offset..]);
         // addBreak + unlines: `<br/>` then a trailing newline for every line.
         out.push_str("<br/>");
         out.push('\n');

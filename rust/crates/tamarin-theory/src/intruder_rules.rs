@@ -181,10 +181,11 @@ pub fn destruction_rules(
                 if pos_iter.len() == step_idx + 1 && !rhs_frees_empty {
                     return out;
                 }
-                // Build uprems' = uprems ++ siblings.
-                let mut new_uprems = uprems.clone();
+                // Build uprems' = uprems ++ siblings.  The pre-sibling
+                // `uprems` value is never read again (the next iteration uses
+                // the extended one), so extend in place instead of cloning.
                 for (j, a) in args.iter().enumerate() {
-                    if (j as i64) != i { new_uprems.push(a.clone()); }
+                    if (j as i64) != i { uprems.push(a.clone()); }
                 }
                 let t_new = match args.get(i as usize) {
                     Some(t) => t.clone(),
@@ -192,7 +193,7 @@ pub fn destruction_rules(
                 };
                 // Emit the rule unless the next step's term equals rhs
                 // and rhs already in uprems' (Haskell's filter).
-                let cond_emit = t_new != *rhs && !new_uprems.contains(rhs);
+                let cond_emit = t_new != *rhs && !uprems.contains(rhs);
                 if cond_emit {
                     // Build the rule name: `_<i><pd>` ++ funs.
                     let posname_now = format!("_{}{}", i, posname);
@@ -220,14 +221,13 @@ pub fn destruction_rules(
                         rhs_frees_empty,
                     );
                     let mut prems = vec![kd_fact(t_new.clone())];
-                    for u in &new_uprems { prems.push(ku_fact(u.clone())); }
+                    for u in &uprems { prems.push(ku_fact(u.clone())); }
                     out.push(Rule::new(info, prems, vec![kd_fact(rhs.clone())], vec![]));
                 }
                 // Update accumulators and walk down.
                 name_acc.extend_from_slice(b"_");
                 name_acc.extend_from_slice(&sym.name);
                 posname = format!("_{}{}", i, posname);
-                uprems = new_uprems;
                 t = t_new;
             }
             Term::Lit(_) => {
@@ -620,7 +620,8 @@ pub fn construction_rules(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<IntrRu
     // HS-faithful: `constructionRules (stFunSyms maudeSig)`
     // (IntruderRules.hs:213).  `stFunSyms` is the SUBTERM-theory function
     // signature — it EXCLUDES the DH / BP / MSet / Nat / Xor symbols
-    // (those are added by `funSyms` via `refresh`, MaudeSig.rs:74-78).
+    // (those are added into `fun_syms` by `refresh`,
+    // maude_sig.rs `fn refresh` lines 56-60, exposed as `fun_syms` at line 84).
     // The DH / BP intruder constructors (`c_exp` / `c_inv` / `c_mult`
     // / `c_one` / `c_DH_neutral` / `c_pmult` / `c_emap`) come from the
     // cached `intruder_variants_{dh,bp}.spthy` files via
@@ -825,24 +826,26 @@ pub fn variants_intruder(
     {
         for t in &f.terms { rule_terms.push(t.clone()); }
     }
-    let packed = f_app_list(rule_terms.clone());
-
-    let raw_substs = match maude.variants(&packed) {
-        Ok(v) => v,
-        Err(_) => return vec![ru.clone()],
-    };
-
     // The free vars of the packed rule-terms list.  Note
     // `frees(packed) == frees(rule_terms)` (packing only wraps the terms in
     // an `fAppList`, introducing no new vars), so this single set serves
     // BOTH roles below: the `restrictVFresh (frees packed)` key-set AND the
-    // `freshToFreeAvoiding ruleTerms` avoiding-set.
+    // `freshToFreeAvoiding ruleTerms` avoiding-set.  Computed from
+    // `&rule_terms` first so `rule_terms` can then be moved into `f_app_list`
+    // without a clone.
     let packed_frees: std::collections::BTreeSet<LVar> = {
         let mut s: std::collections::BTreeSet<LVar> = std::collections::BTreeSet::new();
         for t in &rule_terms {
             for v in frees(t) { s.insert(v); }
         }
         s
+    };
+
+    let packed = f_app_list(rule_terms);
+
+    let raw_substs = match maude.variants(&packed) {
+        Ok(v) => v,
+        Err(_) => return vec![ru.clone()],
     };
 
     // Build one candidate variant rule per Maude variant substitution.

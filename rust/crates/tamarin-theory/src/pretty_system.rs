@@ -358,7 +358,7 @@ fn pretty_subst_free(subst: &crate::tools::equation_store::LNSubst) -> Vec<Doc> 
 
 // HS `intersperse sep xs`.
 fn intersperse(sep: Doc, xs: Vec<Doc>) -> Vec<Doc> {
-    let mut out = Vec::with_capacity(xs.len().saturating_mul(2));
+    let mut out = Vec::with_capacity(xs.len().saturating_mul(2).saturating_sub(1));
     for (i, x) in xs.into_iter().enumerate() {
         if i > 0 {
             out.push(sep.clone());

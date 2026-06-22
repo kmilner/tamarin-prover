@@ -49,7 +49,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use tamarin_theory::constraint::constraints::{Edge, LessAtom, Reason};
+use tamarin_theory::constraint::constraints::{LessAtom, Reason};
 use tamarin_theory::constraint::system::System;
 use tamarin_theory::fact::{FactTag, LNFact};
 use tamarin_theory::rule::{
@@ -206,8 +206,7 @@ fn emit_edges_merged(
     for edge in edges {
         match edge {
             GEdge::System(src, tgt) => {
-                let e = Edge { src: src.clone(), tgt: tgt.clone() };
-                g.edge(node_map, &e);
+                g.edge(node_map, src, tgt);
             }
             GEdge::UnsolvedChain(src, tgt) => g.chain_edge(src, tgt),
             GEdge::Less(_) => {}
@@ -442,15 +441,18 @@ impl DotBuilder {
             "  {} [shape={},label=\"{}\"];",
             id, shape, escape_dot(&label));
     }
-    fn edge(&mut self, node_map: &HashMap<&LVar, &RuleACInst>, e: &Edge) {
-        let src_id = Self::dot_node_id(&e.src.0);
-        let tgt_id = Self::dot_node_id(&e.tgt.0);
+    fn edge(&mut self,
+            node_map: &HashMap<&LVar, &RuleACInst>,
+            src: &tamarin_theory::constraint::constraints::NodeConc,
+            tgt: &tamarin_theory::constraint::constraints::NodePrem) {
+        let src_id = Self::dot_node_id(&src.0);
+        let tgt_id = Self::dot_node_id(&tgt.0);
         // Look up the target premise's fact tag so we can colour
         // the edge.
-        let style = edge_style(node_map, e);
+        let style = edge_style(node_map, src, tgt);
         let _ = writeln!(self.buf,
             "  {}:c{} -> {}:p{} [{}];",
-            src_id, e.src.1.0, tgt_id, e.tgt.1.0, style);
+            src_id, src.1.0, tgt_id, tgt.1.0, style);
     }
     fn chain_edge(&mut self,
                   src: &tamarin_theory::constraint::constraints::NodeConc,
@@ -797,10 +799,12 @@ fn rule_group_color(ru: &RuleACInst) -> String {
     }
 }
 
-fn edge_style(node_map: &HashMap<&LVar, &RuleACInst>, e: &Edge) -> String {
+fn edge_style(node_map: &HashMap<&LVar, &RuleACInst>,
+              src: &tamarin_theory::constraint::constraints::NodeConc,
+              tgt: &tamarin_theory::constraint::constraints::NodePrem) -> String {
     // Look up tag of the source-conclusion or target-premise.
-    let conc_tag = lookup_conc_tag(node_map, &e.src);
-    let prem_tag = lookup_prem_tag(node_map, &e.tgt);
+    let conc_tag = lookup_conc_tag(node_map, src);
+    let prem_tag = lookup_prem_tag(node_map, tgt);
     let is_proto = |t: Option<&FactTag>| -> bool {
         matches!(t, Some(FactTag::Proto(_, _, _)))
     };

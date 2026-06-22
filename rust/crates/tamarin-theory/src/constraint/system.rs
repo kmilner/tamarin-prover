@@ -50,12 +50,13 @@ pub enum Side { LHS, RHS }
 /// A constraint-solver sequent. The solver mutates this incrementally
 /// during proof search.
 ///
-/// Storage choices: we use `Vec` for collections rather than
-/// `BTreeSet`/`BTreeMap` because the underlying values
-/// (`Edge`/`Goal`/`Guarded`/`RuleACInst`) don't all derive `Ord` /
-/// `Hash` yet. Lookup is currently linear; once those derives land
-/// we can swap to ordered containers without changing the public
-/// surface.
+/// Storage choices: we use `Vec` for most collections rather than
+/// `BTreeSet`/`BTreeMap` because some underlying values
+/// (`Goal`/`Guarded`/`RuleACInst`) don't yet derive `Ord`/`Hash`
+/// (`Edge` already does). `nodes`/`goals` are `Arc<Vec<..>>` for
+/// copy-on-write sharing (see field docs). Lookup is currently
+/// linear; once the remaining derives land we can swap to ordered
+/// containers without changing the public surface.
 #[derive(Debug, Default)]
 pub struct System {
     pub source_kind: Option<SourceKind>,
@@ -68,10 +69,9 @@ pub struct System {
     /// `RuleACInst` (the biggest payload — many `LNFact`s / `LNTerm`s).
     /// Mutations go through `Arc::make_mut`, which clones the inner
     /// `Vec` only when the `Arc` is actually shared.  Reads via `Deref`
-    /// are unchanged.  `Arc`'s `PartialEq`/`Ord`/`Hash` forward to the
-    /// inner `Vec` (content comparison, not pointer identity), so
-    /// equality semantics — critical for goal/case dedup — are
-    /// preserved.
+    /// are unchanged.  `Arc`'s `PartialEq` forwards to the inner `Vec`
+    /// (content comparison, not pointer identity), so equality
+    /// semantics — critical for goal/case dedup — are preserved.
     pub nodes: Arc<Vec<(NodeId, RuleACInst)>>,
     /// Edges from conclusions to premises.
     pub edges: Vec<Edge>,
@@ -528,8 +528,21 @@ impl System {
         // derive `is_new` from it, instead of running the same O(n)
         // `canonical_goal_for_dedup` comparison twice (once for the
         // trace, once for the find) on the goal-insertion hot path.
-        let slot_idx = self.goals.iter().position(|(existing, _)|
-            canonical_goal_for_dedup(existing) == canon_g);
+        //
+        // `canonical_goal_for_dedup` is identity (`g.clone()`) for every
+        // non-Disj variant, so we only need to canonicalise an existing
+        // entry when it is itself a `Disj` (and only then can it match a
+        // `Disj` `canon_g`; under `Goal`'s derived `PartialEq` distinct
+        // variants never compare equal). For the common non-Disj case
+        // this compares `existing == &canon_g` directly, avoiding one
+        // full `Goal` clone per existing goal per insertion.
+        let slot_idx = self.goals.iter().position(|(existing, _)| {
+            if matches!(existing, Goal::Disj(_)) {
+                canonical_goal_for_dedup(existing) == canon_g
+            } else {
+                *existing == canon_g
+            }
+        });
         if trace_goal_insert() {
             let kindstr = match &g {
                 Goal::Action(i, fa) => format!("Action {:?} {:?}", i, fa),

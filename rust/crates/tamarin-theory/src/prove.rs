@@ -772,9 +772,10 @@ pub fn prove_lemma_with_pool_and_file(
     //   per-lemma `[heuristic=..]` > theory-level `heuristic:` > None.
     // `None` falls back to `SmartRanking False` in `rank_goals_with`
     // (= HS's `defaultHeuristic False`).
-    // `parse_heuristic_str` returns the full list for round-robin
-    // scheduling (HS `roundRobinHeuristic`/`useHeuristic`,
-    // ProofMethod.hs:576-595) and resolves oracle paths.
+    // `parse_heuristic_str_with_tactics` returns the full list for
+    // round-robin scheduling (HS `roundRobinHeuristic`/`useHeuristic`,
+    // ProofMethod.hs:576-595), resolves oracle paths, and resolves
+    // `{name}` tactic rankings against `theory.tactic`.
     let in_file = &theory.in_file;
     let lemma_heuristic: Option<&str> = lemma.attributes.iter().find_map(|a| match a {
         crate::theory::LemmaAttr::Heuristic(s) => Some(s.as_str()),

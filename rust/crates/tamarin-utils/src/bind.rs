@@ -3,6 +3,10 @@
 //! A simple key/value binding store. The Haskell version is a `StateT` over
 //! a `Data.Map`; in Rust we expose plain methods on a `Bindings` struct and
 //! pair it with a `PreciseFreshState` for `import_binding`.
+//!
+//! Backed by a `HashMap` rather than the Haskell `Data.Map`; this is safe
+//! because bindings are only looked up by key and are never iterated into
+//! pretty-printed output (iteration order is therefore not observable).
 
 use std::collections::HashMap;
 use std::hash::Hash;

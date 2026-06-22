@@ -136,9 +136,13 @@ fn from_rule_restriction(rname: &str, f: &p::Formula) -> (p::Restriction, p::Fac
     //   where f'' = (Action #NOW fact) ==> f'
     //         fact = mkFact (getBVarTerms f')
     //         getBVarTerms = map (varTerm.Free) . delete varNow . freesList
-    let bvar_terms: Vec<p::Term> = frees_list(&rewr_f)
-        .into_iter()
+    // `frees_list(&rewr_f)` is consumed twice (here and for `action_args`);
+    // compute it once since it is a pure function of the unchanged `rewr_f`.
+    let rewr_frees = frees_list(&rewr_f);
+    let bvar_terms: Vec<p::Term> = rewr_frees
+        .iter()
         .filter(|v| !is_var_now(v))
+        .cloned()
         .map(p::Term::Var)
         .collect();
     let restr_fact = mk_fact(rname, bvar_terms);
@@ -168,7 +172,7 @@ fn from_rule_restriction(rname: &str, f: &p::Formula) -> (p::Restriction, p::Fac
     //   getVarTerms subst = map (apply subst . varTerm) . delete varNow . freesList
     // i.e. for each free var of the rewritten formula (minus NOW), look up
     // the ORIGINAL term it abstracted; vars with no entry stay themselves.
-    let action_args: Vec<p::Term> = frees_list(&rewr_f)
+    let action_args: Vec<p::Term> = rewr_frees
         .into_iter()
         .filter(|v| !is_var_now(v))
         .map(|v| match subst.get(&var_key(&v)) {
@@ -410,9 +414,11 @@ fn var_key(v: &p::VarSpec) -> (String, u64) {
     (v.name.clone(), v.idx)
 }
 
-/// HS `freesList` (LTerm.hs:578-585): all free vars in first-appearance order,
-/// keeping duplicates. After `rewrite` each free var is a unique fresh var, so
-/// first-appearance dedup here is identical to HS's un-deduped `freesList`.
+/// NOTE: unlike HS `freesList` (LTerm.hs:579-580 = `D.toList . freesDList`)
+/// which KEEPS duplicates, this dedups by first appearance via `dedup_first`.
+/// Safe only because every caller passes a post-`rewrite` formula where each
+/// free var is a unique fresh var, so the dedup is a no-op. (HS's sorted-dedup
+/// variant `frees` is at LTerm.hs:584-585.)
 fn frees_list(f: &p::Formula) -> Vec<p::VarSpec> {
     let mut out: Vec<p::VarSpec> = Vec::new();
     let mut bound: Vec<String> = Vec::new();

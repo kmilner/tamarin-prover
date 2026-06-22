@@ -47,38 +47,43 @@ enum Node {
 }
 
 /// A pretty-printable document.
+///
+/// The `empty` flag is an O(1) cache of the recursive emptiness predicate,
+/// computed once at construction. Without it, `is_empty` would re-walk the
+/// whole `Node` tree, making folds like `hcat`/`vcat` (which call combinators
+/// that test emptiness on a growing accumulator) O(N^2).
 #[derive(Debug, Clone)]
-pub struct Doc(Node);
+pub struct Doc {
+    node: Node,
+    empty: bool,
+}
 
 impl Default for Doc {
     fn default() -> Self { Doc::empty() }
 }
 
 impl Doc {
-    pub fn empty() -> Self { Doc(Node::Empty) }
-    pub fn text<S: Into<String>>(s: S) -> Self { Doc(Node::Text(s.into())) }
-    pub fn char(c: char) -> Self { Doc(Node::Text(c.to_string())) }
-    pub fn zero_width_text<S: Into<String>>(s: S) -> Self { Doc(Node::ZeroWidth(s.into())) }
+    pub fn empty() -> Self { Doc { node: Node::Empty, empty: true } }
+    pub fn text<S: Into<String>>(s: S) -> Self { Doc { node: Node::Text(s.into()), empty: false } }
+    pub fn char(c: char) -> Self { Doc { node: Node::Text(c.to_string()), empty: false } }
+    pub fn zero_width_text<S: Into<String>>(s: S) -> Self {
+        Doc { node: Node::ZeroWidth(s.into()), empty: false }
+    }
 
     pub fn is_empty(&self) -> bool {
         // Mirrors HughesPJ `P.isEmpty`, which is true ONLY for `mempty`/`empty`,
         // never for `text ""` / `zeroWidthText ""`. Combinators (`<>`, `$$`,
         // `nest`, ...) collapse `empty` operands away, so a tree built only from
-        // `empty` (via `Cat`/`Above`/`Nest`/`Highlight`) is itself empty.
-        fn check(n: &Node) -> bool {
-            match n {
-                Node::Empty => true,
-                Node::Text(_) | Node::ZeroWidth(_) => false,
-                Node::Cat(a, b) | Node::Above(a, b) => check(a) && check(b),
-                Node::Nest(_, a) | Node::Highlight(_, a) => check(a),
-            }
-        }
-        check(&self.0)
+        // `empty` (via `Cat`/`Above`/`Nest`/`Highlight`) is itself empty. The
+        // flag below equals that recursive predicate exactly: it is computed at
+        // construction (Empty => true; Text/ZeroWidth => false; Cat/Above =>
+        // both children empty; Nest/Highlight => child empty).
+        self.empty
     }
 
     /// Render to a `String` ignoring highlight tags.
     pub fn render(&self) -> String {
-        let lines = layout(&self.0, 0);
+        let lines = layout(&self.node, 0);
         let mut out = String::new();
         for (i, line) in lines.iter().enumerate() {
             if i > 0 { out.push('\n'); }
@@ -91,14 +96,14 @@ impl Doc {
     /// Render to a `String`, bracketing each highlighted span with the
     /// `(open, close)` pair returned by `tags(style)`.
     ///
-    /// Mirrors Haskell `withTag` (Html.hs:59-64), which glues ONE `open`
+    /// Mirrors Haskell `withTag` (Html.hs:60-64), which glues ONE `open`
     /// zero-width tag before the entire inner doc and ONE `close` after it
     /// (`open <> inner <> close`). For a multi-line span this places `open` at
     /// the start of the first line's content and `close` at the end of the last
     /// line's content, leaving intermediate lines bare — so a two-line keyword
     /// renders `<span ...>line1\nline2</span>`, not `<span>line1</span>\n<span>line2</span>`.
     pub fn render_with<F: Fn(HighlightStyle) -> (String, String)>(&self, tags: &F) -> String {
-        let lines = layout_with(&self.0, 0, tags);
+        let lines = layout_with(&self.node, 0, tags);
         let mut out = String::new();
         for (i, line) in lines.iter().enumerate() {
             if i > 0 { out.push('\n'); }
@@ -113,7 +118,8 @@ impl Doc {
         match (self.is_empty(), other.is_empty()) {
             (true, _) => other,
             (_, true) => self,
-            _ => Doc(Node::Cat(Box::new(self.0), Box::new(other.0))),
+            // Both non-empty here, so the result is non-empty.
+            _ => Doc { node: Node::Cat(Box::new(self.node), Box::new(other.node)), empty: false },
         }
     }
 
@@ -129,18 +135,22 @@ impl Doc {
         match (self.is_empty(), other.is_empty()) {
             (true, _) => other,
             (_, true) => self,
-            _ => Doc(Node::Above(Box::new(self.0), Box::new(other.0))),
+            // Both non-empty here, so the result is non-empty.
+            _ => Doc { node: Node::Above(Box::new(self.node), Box::new(other.node)), empty: false },
         }
     }
 
     /// `nest n d`: indent every line of `d` after the first by `n` spaces.
     pub fn nest(self, n: usize) -> Doc {
-        if self.is_empty() || n == 0 { self } else { Doc(Node::Nest(n, Box::new(self.0))) }
+        // Reached only when `self` is non-empty, so the result is non-empty.
+        if self.is_empty() || n == 0 { self } else { Doc { node: Node::Nest(n, Box::new(self.node)), empty: false } }
     }
 
     /// Tag this document with a highlight style.
     pub fn highlight(self, style: HighlightStyle) -> Doc {
-        Doc(Node::Highlight(style, Box::new(self.0)))
+        // Highlight is empty iff its child is empty.
+        let empty = self.empty;
+        Doc { node: Node::Highlight(style, Box::new(self.node)), empty }
     }
 }
 
@@ -301,7 +311,7 @@ fn layout_with<F: Fn(HighlightStyle) -> (String, String)>(
         }
         Node::Nest(k, inner) => layout_with(inner, base_indent + k, tags),
         Node::Highlight(style, inner) => {
-            // Haskell `withTag` (Html.hs:59-64) is `open <> inner <> close`:
+            // Haskell `withTag` (Html.hs:60-64) is `open <> inner <> close`:
             // one `open` tag glued before the whole inner doc and one `close`
             // after it. We mirror that exactly — prepend `open` to the first
             // laid-out line's content and append `close` to the last line's

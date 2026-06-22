@@ -162,7 +162,9 @@ fn invalid_step_node(node: &ParsedProofTree, sys: System) -> ProofNode {
 /// - `Contradiction` → `ProofMethod::Finished(Contradictory(None))`
 /// - `SolveGoal(_, raw)` → `ProofMethod::RawSolve(raw)` (display-only)
 /// - `SolvedLeaf`  → `ProofMethod::Finished(Solved)`
-/// - other         → `ProofMethod::Sorry(None)` (safe fallback)
+/// - `Unfinishable` → `ProofMethod::Finished(Unfinishable)`
+/// - `Invalidated` → `ProofMethod::Invalidated`
+/// - `Other(s)`    → `ProofMethod::Sorry(Some(s))`
 fn parsed_to_unannotated(node: &ParsedProofTree, sys: System) -> ProofNode {
     let method = parsed_method_to_display(&node.method);
     let status = match &method {
@@ -447,14 +449,12 @@ fn replay_node(
     // `replaceSorryProver` then auto-proves that annotated sorry
     // (Prover.hs:185 → TheoryLoader.hs:606), matching the
     // `run_proof_search` branch below.
-    let already_covered: std::collections::BTreeSet<String> =
-        children.keys().cloned().collect();
     for (rt_name, rt_sys) in produced.into_iter() {
-        if already_covered.contains(&rt_name) { continue; }
+        if children.contains_key(&rt_name) { continue; }
         // Also skip if the skeleton consumed this case via "".
         if node.cases.iter().any(|(s, _)| s.is_empty())
             && children.len() == 1
-            && already_covered.iter().next().map(|s| s.as_str()) == Some(rt_name.as_str())
+            && children.keys().next().map(|s| s.as_str()) == Some(rt_name.as_str())
         {
             continue;
         }
