@@ -48,37 +48,37 @@ search, few rules), `CCITT_X509_3` (auto-sources + stored-proof replay, heaviest
 
 | File | HS wall | RS wall | HS peak RSS | RS peak RSS |
 |------|--------:|--------:|------------:|------------:|
-| `NSPK3.spthy` | 0.9 s | 0.5 s | 66 MB | 18 MB |
-| `Joux.spthy` | 6.8 s | 9.2 s | 262 MB | 46 MB |
-| `stateverif_left_right.spthy` | 10.6 s | 8.0 s | 827 MB | 43 MB |
-| `wireguard.spthy` | 38.8 s | 21.1 s | 1651 MB | 127 MB |
-| `CCITT_X509_3.spthy` | 146.9 s | 73.2 s | 3396 MB | 636 MB |
+| `NSPK3.spthy` | 0.9 s | 0.5 s | 66 MB | 17 MB |
+| `Joux.spthy` | 6.7 s | 8.6 s | 265 MB | 47 MB |
+| `stateverif_left_right.spthy` | 10.5 s | 7.8 s | 879 MB | 44 MB |
+| `wireguard.spthy` | 40.0 s | 20.8 s | 1663 MB | 127 MB |
+| `CCITT_X509_3.spthy` | 143.4 s | 72.1 s | 3386 MB | 636 MB |
 
 **4 cores** — HS `+RTS -N4`, RS `--processors=4`
 
 | File | HS wall | RS wall | HS peak RSS | RS peak RSS |
 |------|--------:|--------:|------------:|------------:|
-| `NSPK3.spthy` | 0.4 s | 0.3 s | 99 MB | 27 MB |
-| `Joux.spthy` | 5.7 s | 9.1 s | 285 MB | 52 MB |
-| `stateverif_left_right.spthy` | 6.3 s | 5.0 s | 886 MB | 72 MB |
-| `wireguard.spthy` | 22.8 s | 15.0 s | 1656 MB | 131 MB |
-| `CCITT_X509_3.spthy` | 66.2 s | 24.4 s | 6060 MB | 675 MB |
+| `NSPK3.spthy` | 0.5 s | 0.3 s | 94 MB | 26 MB |
+| `Joux.spthy` | 5.7 s | 8.4 s | 291 MB | 51 MB |
+| `stateverif_left_right.spthy` | 6.0 s | 5.0 s | 851 MB | 71 MB |
+| `wireguard.spthy` | 22.3 s | 14.7 s | 1768 MB | 133 MB |
+| `CCITT_X509_3.spthy` | 63.5 s | 24.5 s | 6014 MB | 671 MB |
 
 **16 cores** — HS `+RTS -N16`, RS `--processors=16`
 
 | File | HS wall | RS wall | HS peak RSS | RS peak RSS |
 |------|--------:|--------:|------------:|------------:|
-| `NSPK3.spthy` | 0.6 s | 0.4 s | 147 MB | 34 MB |
-| `Joux.spthy` | 6.6 s | 9.3 s | 333 MB | 62 MB |
-| `stateverif_left_right.spthy` | 7.4 s | 5.0 s | 884 MB | 103 MB |
-| `wireguard.spthy` | 21.5 s | 14.9 s | 1739 MB | 144 MB |
-| `CCITT_X509_3.spthy` | 66.4 s | 10.3 s | 7788 MB | 779 MB |
+| `NSPK3.spthy` | 0.5 s | 0.4 s | 144 MB | 34 MB |
+| `Joux.spthy` | 6.5 s | 8.6 s | 330 MB | 66 MB |
+| `stateverif_left_right.spthy` | 7.0 s | 5.0 s | 877 MB | 100 MB |
+| `wireguard.spthy` | 21.2 s | 14.6 s | 1856 MB | 146 MB |
+| `CCITT_X509_3.spthy` | 66.6 s | 10.4 s | 7961 MB | 777 MB |
 
 Peak RSS is the prover **process** only — Maude runs as a separate subprocess on
 both sides and is not counted (GHC-heap vs Rust-heap). The memory gap is large
-and universal (e.g. `wireguard` ~0.13 GB vs ~1.7 GB; `CCITT_X509_3` ~0.8 GB vs
-~7.8 GB). Wall-clock scales with cores only where the proof parallelises —
-`CCITT_X509_3` drops 73 s → 10 s (RS, 1 → 16 cores), while Maude-bound `Joux` and
+and universal (e.g. `wireguard` ~0.15 GB vs ~1.9 GB; `CCITT_X509_3` ~0.8 GB vs
+~8.0 GB). Wall-clock scales with cores only where the proof parallelises —
+`CCITT_X509_3` drops 72 s → 10 s (RS, 1 → 16 cores), while Maude-bound `Joux` and
 search-bound `wireguard` are largely serial and barely move. Regenerate the
 tables with `rust/scripts/bench.sh`.
 
