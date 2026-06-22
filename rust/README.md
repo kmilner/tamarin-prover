@@ -37,9 +37,9 @@ exceeds the cap (genuinely hard or oracle-dependent searches).
 ## Performance
 
 RS uses a fraction of HS's peak resident memory across the board, and is faster
-in wall-clock on most workloads. The exception is Maude-bound proofs (bilinear
-pairing), where per-Maude-call IPC dominates and the work is essentially serial,
-so RS lands roughly on par with HS. Representative protocols (aarch64 Linux, GHC
+in wall-clock across the representative workloads — including the Maude-bound
+bilinear-pairing proofs, where per-Maude-call IPC dominates and the work is
+essentially serial. Representative protocols (aarch64 Linux, GHC
 9.6.7, Maude 3.5.1): `NSPK3` (classic, sub-second reference), `Joux` (bilinear
 pairing — Maude-bound), `stateverif_left_right` (SAPiC), `wireguard` (deep proof
 search, few rules), `CCITT_X509_3` (auto-sources + stored-proof replay, heaviest):
@@ -49,7 +49,7 @@ search, few rules), `CCITT_X509_3` (auto-sources + stored-proof replay, heaviest
 | File | HS wall | RS wall | HS peak RSS | RS peak RSS |
 |------|--------:|--------:|------------:|------------:|
 | `NSPK3.spthy` | 0.9 s | 0.5 s | 66 MB | 17 MB |
-| `Joux.spthy` | 6.7 s | 8.6 s | 265 MB | 47 MB |
+| `Joux.spthy` | 6.9 s | 5.6 s | 264 MB | 46 MB |
 | `stateverif_left_right.spthy` | 10.5 s | 7.8 s | 879 MB | 44 MB |
 | `wireguard.spthy` | 40.0 s | 20.8 s | 1663 MB | 127 MB |
 | `CCITT_X509_3.spthy` | 143.4 s | 72.1 s | 3386 MB | 636 MB |
@@ -59,7 +59,7 @@ search, few rules), `CCITT_X509_3` (auto-sources + stored-proof replay, heaviest
 | File | HS wall | RS wall | HS peak RSS | RS peak RSS |
 |------|--------:|--------:|------------:|------------:|
 | `NSPK3.spthy` | 0.5 s | 0.3 s | 94 MB | 26 MB |
-| `Joux.spthy` | 5.7 s | 8.4 s | 291 MB | 51 MB |
+| `Joux.spthy` | 5.9 s | 5.4 s | 287 MB | 50 MB |
 | `stateverif_left_right.spthy` | 6.0 s | 5.0 s | 851 MB | 71 MB |
 | `wireguard.spthy` | 22.3 s | 14.7 s | 1768 MB | 133 MB |
 | `CCITT_X509_3.spthy` | 63.5 s | 24.5 s | 6014 MB | 671 MB |
@@ -69,7 +69,7 @@ search, few rules), `CCITT_X509_3` (auto-sources + stored-proof replay, heaviest
 | File | HS wall | RS wall | HS peak RSS | RS peak RSS |
 |------|--------:|--------:|------------:|------------:|
 | `NSPK3.spthy` | 0.5 s | 0.4 s | 144 MB | 34 MB |
-| `Joux.spthy` | 6.5 s | 8.6 s | 330 MB | 66 MB |
+| `Joux.spthy` | 6.6 s | 5.5 s | 343 MB | 59 MB |
 | `stateverif_left_right.spthy` | 7.0 s | 5.0 s | 877 MB | 100 MB |
 | `wireguard.spthy` | 21.2 s | 14.6 s | 1856 MB | 146 MB |
 | `CCITT_X509_3.spthy` | 66.6 s | 10.4 s | 7961 MB | 777 MB |
