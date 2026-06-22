@@ -36,42 +36,51 @@ exceeds the cap (genuinely hard or oracle-dependent searches).
 
 ## Performance
 
-RS is faster than HS in wall-clock and uses a small fraction of the peak
-resident memory; the gap widens with proof size and core count. Representative
-figures (aarch64 Linux, GHC 9.6.7, Maude 3.5.1) — `NSPK3` (classic),
-`NAXOS_eCK` (Diffie-Hellman), `stateverif_left_right` (SAPiC), `CCITT_X509_3`
-(auto-sources + stored-proof replay):
+RS uses a fraction of HS's peak resident memory across the board, and is faster
+in wall-clock on most workloads. The exception is Maude-bound proofs (bilinear
+pairing), where per-Maude-call IPC dominates and the work is essentially serial,
+so RS lands roughly on par with HS. Representative protocols (aarch64 Linux, GHC
+9.6.7, Maude 3.5.1): `NSPK3` (classic, sub-second reference), `Joux` (bilinear
+pairing — Maude-bound), `stateverif_left_right` (SAPiC), `wireguard` (deep proof
+search, few rules), `CCITT_X509_3` (auto-sources + stored-proof replay, heaviest):
 
 **1 core** — HS `+RTS -N1`, RS `--processors=1`
 
 | File | HS wall | RS wall | HS peak RSS | RS peak RSS |
 |------|--------:|--------:|------------:|------------:|
 | `NSPK3.spthy` | 0.9 s | 0.5 s | 66 MB | 18 MB |
-| `NAXOS_eCK.spthy` | 1.1 s | 0.6 s | 77 MB | 17 MB |
-| `stateverif_left_right.spthy` | 10.9 s | 8.1 s | 825 MB | 43 MB |
-| `CCITT_X509_3.spthy` | 147.8 s | 74.8 s | 3396 MB | 636 MB |
+| `Joux.spthy` | 6.8 s | 9.2 s | 262 MB | 46 MB |
+| `stateverif_left_right.spthy` | 10.6 s | 8.0 s | 827 MB | 43 MB |
+| `wireguard.spthy` | 38.8 s | 21.1 s | 1651 MB | 127 MB |
+| `CCITT_X509_3.spthy` | 146.9 s | 73.2 s | 3396 MB | 636 MB |
 
 **4 cores** — HS `+RTS -N4`, RS `--processors=4`
 
 | File | HS wall | RS wall | HS peak RSS | RS peak RSS |
 |------|--------:|--------:|------------:|------------:|
-| `NSPK3.spthy` | 0.5 s | 0.3 s | 101 MB | 26 MB |
-| `NAXOS_eCK.spthy` | 0.8 s | 0.5 s | 86 MB | 23 MB |
-| `stateverif_left_right.spthy` | 6.4 s | 5.1 s | 854 MB | 70 MB |
-| `CCITT_X509_3.spthy` | 64.6 s | 23.9 s | 5986 MB | 671 MB |
+| `NSPK3.spthy` | 0.4 s | 0.3 s | 99 MB | 27 MB |
+| `Joux.spthy` | 5.7 s | 9.1 s | 285 MB | 52 MB |
+| `stateverif_left_right.spthy` | 6.3 s | 5.0 s | 886 MB | 72 MB |
+| `wireguard.spthy` | 22.8 s | 15.0 s | 1656 MB | 131 MB |
+| `CCITT_X509_3.spthy` | 66.2 s | 24.4 s | 6060 MB | 675 MB |
 
 **16 cores** — HS `+RTS -N16`, RS `--processors=16`
 
 | File | HS wall | RS wall | HS peak RSS | RS peak RSS |
 |------|--------:|--------:|------------:|------------:|
-| `NSPK3.spthy` | 0.5 s | 0.4 s | 145 MB | 33 MB |
-| `NAXOS_eCK.spthy` | 0.8 s | 0.6 s | 136 MB | 28 MB |
-| `stateverif_left_right.spthy` | 7.3 s | 5.0 s | 887 MB | 99 MB |
-| `CCITT_X509_3.spthy` | 66.5 s | 10.2 s | 8389 MB | 781 MB |
+| `NSPK3.spthy` | 0.6 s | 0.4 s | 147 MB | 34 MB |
+| `Joux.spthy` | 6.6 s | 9.3 s | 333 MB | 62 MB |
+| `stateverif_left_right.spthy` | 7.4 s | 5.0 s | 884 MB | 103 MB |
+| `wireguard.spthy` | 21.5 s | 14.9 s | 1739 MB | 144 MB |
+| `CCITT_X509_3.spthy` | 66.4 s | 10.3 s | 7788 MB | 779 MB |
 
 Peak RSS is the prover **process** only — Maude runs as a separate subprocess on
-both sides and is not counted (GHC-heap vs Rust-heap). Regenerate the tables
-with `rust/scripts/bench.sh`.
+both sides and is not counted (GHC-heap vs Rust-heap). The memory gap is large
+and universal (e.g. `wireguard` ~0.13 GB vs ~1.7 GB; `CCITT_X509_3` ~0.8 GB vs
+~7.8 GB). Wall-clock scales with cores only where the proof parallelises —
+`CCITT_X509_3` drops 73 s → 10 s (RS, 1 → 16 cores), while Maude-bound `Joux` and
+search-bound `wireguard` are largely serial and barely move. Regenerate the
+tables with `rust/scripts/bench.sh`.
 
 RS mirrors HS's `parList`/`parMap` sites with rayon (per-rule variants, source
 saturation, per-item pretty-print), backed by a pool of independent Maude

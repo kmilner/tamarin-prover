@@ -29,7 +29,7 @@ CORPUS="$repo_root/examples"
 TIMEOUT="${TIMEOUT:-600}"
 DERIV="${DERIV:-30}"
 CORES="${CORES:-1 4 16}"
-FILES="${FILES:-classic/NSPK3.spthy ake/dh/NAXOS_eCK.spthy features/auto-sources/spore/CCITT_X509_3.spthy features/auto-sources/tamarin-repo/sapic/statVerifLeftRight/stateverif_left_right.spthy}"
+FILES="${FILES:-classic/NSPK3.spthy wireguard/wireguard.spthy ake/bilinear/Joux.spthy features/auto-sources/tamarin-repo/sapic/statVerifLeftRight/stateverif_left_right.spthy features/auto-sources/spore/CCITT_X509_3.spthy}"
 
 find_hs() { ls "$repo_root"/.stack-work/install/*/*/*/bin/tamarin-prover 2>/dev/null | head -1; }
 HS_PATH="${HS_PATH:-$(find_hs)}"
