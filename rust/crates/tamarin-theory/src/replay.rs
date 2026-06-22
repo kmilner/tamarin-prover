@@ -768,7 +768,7 @@ fn parsed_term_of_arg(
 /// auto-prover.
 fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
     match spec {
-        GoalSpec::Action { fact, time_var, .. } => {
+        GoalSpec::Action { fact, time_var, time_idx, .. } => {
             // Open Action goals whose fact name matches.  Skip KU
             // (auto-handled) for non-KU goal specs — the skeleton's
             // `solve(...)` always names protocol facts, never `KU(...)`.
@@ -837,41 +837,31 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
                 // the stored subtree verbatim.
                 return None;
             }
-            if by_struct.len() == 1 {
-                return Some(by_struct[0].clone());
-            }
-            // Multiple structural matches (e.g. the same `!KU(_)` term at
-            // different timepoints) — disambiguate by time-var root name
-            // (HS resolves this via the exact LVar identity in
-            // `ActionG i fa`).
-            let by_time: Vec<&Goal> = by_struct.iter().copied()
-                .filter(|g| match g {
-                    Goal::Action(i, _) => &i.name == time_var,
+            // HS `M.member` keys on the FULL timepoint LVar (name AND idx):
+            // `SolveGoal (ActionG i fa)` matches iff that exact `ActionG i
+            // fa` is a key of `sGoals` (ProofMethod.hs:374,
+            // `goal `M.member` sGoals`).  A stored step whose timepoint idx
+            // has DRIFTED from the re-executed system's idx (e.g. stored
+            // `!KU(~e0)@#vk.17` but re-execution mints the goal at `#vk.18`
+            // after upstream case-numbering changed) is therefore a MISS in
+            // HS, which emits `sorry /* invalid proof step encountered */`
+            // and keeps the stored subtree verbatim (Proof.hs:461).
+            // Matching by term + root-name alone (ignoring the idx) is too
+            // lenient — it re-binds the drifted goal and replays it as a
+            // live step, diverging from HS.  Require the exact LVar idx.
+            // sGoals is keyed by Goal, so the same (term, LVar) goal cannot
+            // appear twice; at most one candidate carries the exact LVar.
+            // If none does, HS's `M.member` misses ⇒ invalid step — return
+            // None and mirror it.
+            by_struct.iter().copied()
+                .find(|g| match g {
+                    Goal::Action(i, _) =>
+                        &i.name == time_var && i.idx == *time_idx as u64,
                     _ => false,
                 })
-                .collect();
-            if by_time.len() == 1 {
-                return Some(by_time[0].clone());
-            }
-            if !by_time.is_empty() {
-                // Multiple shape+time matches — pick the one with the
-                // smallest LVar idx (the "root" instance HS's freshen
-                // would have picked first).
-                let mut pick: Option<&Goal> = None;
-                let mut best_idx: u64 = u64::MAX;
-                for g in &by_time {
-                    if let Goal::Action(i, _) = g {
-                        if i.idx <= best_idx { best_idx = i.idx; pick = Some(*g); }
-                    }
-                }
-                if let Some(g) = pick { return Some(g.clone()); }
-            }
-            // Time-var didn't disambiguate (e.g. skeleton shows `#t` but
-            // runtime has `#t1`/`#t2`) — pick first structural match in
-            // source order (creation order in `sGoals`).
-            Some(by_struct[0].clone())
+                .cloned()
         }
-        GoalSpec::Premise { fact, prem_idx, time_var, .. } => {
+        GoalSpec::Premise { fact, prem_idx, time_var, time_idx, .. } => {
             // HS `PremiseG (i, v) fa` carries the node-LVar `i` and
             // PremIdx `v`.  Disambiguate by name + arity + prem_idx
             // first, then by time-var root if the (name, arity, idx)
@@ -915,30 +905,19 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
             if by_struct.is_empty() {
                 return None;
             }
-            if by_struct.len() == 1 {
-                return Some(by_struct[0].clone());
-            }
-            // Multi-match: disambiguate by node-var name.
-            let by_time: Vec<&Goal> = by_struct.iter().copied()
-                .filter(|g| match g {
-                    Goal::Premise((node, _), _) => &node.name == time_var,
+            // HS `M.member` keys on the FULL node LVar (name AND idx) of the
+            // parsed `PremiseG (i, v) fa` (ProofMethod.hs:374).  A stored
+            // premise step whose node idx has drifted from the re-executed
+            // system is a miss in HS ⇒ invalid step.  Require the exact LVar
+            // idx — same rationale as the Action branch above (matching by
+            // root-name alone re-binds a drifted goal and replays it live).
+            by_struct.iter().copied()
+                .find(|g| match g {
+                    Goal::Premise((node, _), _) =>
+                        &node.name == time_var && node.idx == *time_idx as u64,
                     _ => false,
                 })
-                .collect();
-            if by_time.len() == 1 {
-                return Some(by_time[0].clone());
-            }
-            if !by_time.is_empty() {
-                let mut pick: Option<&Goal> = None;
-                let mut best_idx: u64 = u64::MAX;
-                for g in &by_time {
-                    if let Goal::Premise((node, _), _) = g {
-                        if node.idx <= best_idx { best_idx = node.idx; pick = Some(*g); }
-                    }
-                }
-                if let Some(g) = pick { return Some(g.clone()); }
-            }
-            Some(by_struct[0].clone())
+                .cloned()
         }
         GoalSpec::Disj { alts, alt_texts } => {
             // HS-faithful: HS parses the `solve(...)` text into a
@@ -1416,13 +1395,16 @@ mod tests {
 
     /// Variable-renaming-aware Action match: two same-fact-name Action
     /// goals at different timepoints — the matcher must disambiguate by
-    /// the skeleton's time-var ROOT name, NOT just pick the first
-    /// shape-match in source order.
+    /// the skeleton's FULL timepoint LVar (root name AND idx), mirroring
+    /// HS `M.member`.
     ///
-    /// HS reference: `ActionG i fa` carries the exact timepoint LVar
-    /// `i`; HS dispatches via M.member on the structural goal
-    /// (ProofMethod.hs:259), so picking the wrong goal here is the
-    /// same divergence pattern that motivated the Disj matcher fix.
+    /// HS reference: `ActionG i fa` carries the exact timepoint LVar `i`;
+    /// HS dispatches `SolveGoal goal -> guard (goal `M.member` sGoals)`
+    /// (ProofMethod.hs:374) — the goal key is the full LVar, so the idx is
+    /// part of the match.  HS pretty-prints a timepoint as `#t2` when its
+    /// idx is 0 and `#t2.7` when its idx is 7 (`Show LVar`, LTerm.hs:526),
+    /// so a stored skeleton's `time_idx` always equals the LVar idx of the
+    /// goal it was generated from — the matcher requires that exact idx.
     #[test]
     fn match_action_disambiguates_by_time_var_root() {
         use crate::fact::{Fact, FactTag, Multiplicity};
@@ -1440,7 +1422,7 @@ mod tests {
         let mut sys = System::empty();
         sys.goals_mut().push((g1.clone(), Default::default()));
         sys.goals_mut().push((g2.clone(), Default::default()));
-        // Skeleton spec asking for time-var t2 specifically.
+        // Skeleton spec asking for the t2 goal: full LVar `#t2.7`.
         let spec = GoalSpec::Action {
             fact: PFact {
                 persistent: false,
@@ -1452,15 +1434,15 @@ mod tests {
                 annotations: Vec::new(),
             },
             time_var: "t2".into(),
-            time_idx: 0,
+            time_idx: 7,
         };
         let matched = match_goal(&spec, &sys).expect("should match");
         match matched {
             Goal::Action(i, _) => assert_eq!(i.name, "t2",
-                "matcher must pick the goal whose timepoint LVar.name == time_var"),
+                "matcher must pick the goal whose timepoint LVar == (time_var, time_idx)"),
             other => panic!("expected Action, got {:?}", other),
         }
-        // And with time_var = t1 we get the other goal.
+        // And with the t1 goal's full LVar `#t1.5` we get the other goal.
         let spec2 = GoalSpec::Action {
             fact: PFact {
                 persistent: false,
@@ -1472,13 +1454,30 @@ mod tests {
                 annotations: Vec::new(),
             },
             time_var: "t1".into(),
-            time_idx: 0,
+            time_idx: 5,
         };
         let matched2 = match_goal(&spec2, &sys).expect("should match");
         match matched2 {
             Goal::Action(i, _) => assert_eq!(i.name, "t1"),
             other => panic!("expected Action, got {:?}", other),
         }
+        // A drifted idx (stored `#t2.9`, runtime `#t2.7`) is an `M.member`
+        // miss in HS — the matcher must reject it (→ invalid step).
+        let spec_drift = GoalSpec::Action {
+            fact: PFact {
+                persistent: false,
+                name: "Step".into(),
+                args: vec![tamarin_parser::ast::Term::Var(tamarin_parser::ast::VarSpec {
+                    name: "y".into(), idx: 0,
+                    sort: tamarin_parser::ast::SortHint::Untagged, typ: None,
+                })],
+                annotations: Vec::new(),
+            },
+            time_var: "t2".into(),
+            time_idx: 9,
+        };
+        assert!(match_goal(&spec_drift, &sys).is_none(),
+            "drifted timepoint idx must miss like HS `M.member`");
     }
 
     /// Variable-renaming-aware Premise match: two same-(name, arity,
