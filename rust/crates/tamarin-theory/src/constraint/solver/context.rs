@@ -524,9 +524,10 @@ impl ProofContext {
         let proto_rules: Vec<crate::rule::ProtoRuleE> = rules.iter()
             .map(|r| r.rule.clone())
             .collect();
+        let proto_rule_refs: Vec<&crate::rule::ProtoRuleE> = proto_rules.iter().collect();
         let injective_fact_insts =
             crate::tools::injective_fact_instances::simple_injective_fact_instances(
-                &proto_rules, &sig.reducible_fun_syms);
+                &proto_rule_refs, &sig.reducible_fun_syms);
         // Compute loop-breakers and annotate the protocol rules in
         // place — direct port of Haskell's `useAutoLoopBreakersAC`
         // (`Theory.Tools.LoopBreakers`).  Edge `R_from → R_to.prem`

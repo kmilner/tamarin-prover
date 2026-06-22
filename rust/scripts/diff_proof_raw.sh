@@ -37,6 +37,21 @@ QUIET="${QUIET:-}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
 CACHE_VERSION="${CACHE_VERSION:-1}"
+
+# --- per-file canonical flags (see file_flags.tsv) ---
+# Some theories need flags beyond bare `--prove` (e.g. --diff, --auto-sources)
+# to run the way HS intends; bare runs time out / produce nothing. Look up the
+# file's canonical flags (relpath under examples/) and pass them to BOTH HS and
+# RS; salt the cache key so a flagged entry is distinct from the bare one.
+FLAGS_MAP="${FLAGS_MAP:-$script_dir/file_flags.tsv}"
+file_rel="${file#"$repo_root"/examples/}"; file_rel="${file_rel#examples/}"
+EXTRA_FLAGS=""
+if [ -f "$FLAGS_MAP" ]; then
+    EXTRA_FLAGS="$(awk -F'\t' -v r="$file_rel" '!/^#/ && $1==r {print $2; exit}' "$FLAGS_MAP")"
+fi
+FLAGS_SALT=""
+[ -n "$EXTRA_FLAGS" ] && FLAGS_SALT="__f$(printf '%s' "$EXTRA_FLAGS" | sha256sum | cut -c1-12)"
+[ -n "$EXTRA_FLAGS" ] && echo "diff_proof_raw: $file_rel canonical flags: $EXTRA_FLAGS" >&2
 # Deriv-check timeout (secs) passed to BOTH binaries so the message-derivation
 # section is compared deterministically.  HS's DEFAULT is 5s, which fires on
 # heavy theories and records a "Derivation checks timed out" placeholder while
@@ -100,7 +115,7 @@ strip_env_lines() {
 key=""
 if [ -z "$NO_HS_CACHE" ]; then
     h=$(sha256sum "$file" 2>/dev/null | cut -d' ' -f1)
-    key="$HS_CANON_CACHE/${h}__${lemma}__v${CACHE_VERSION}"
+    key="$HS_CANON_CACHE/${h}__${lemma}__v${CACHE_VERSION}${FLAGS_SALT}"
 fi
 if [ -n "$key" ] && [ -f "$key.full.gz" ]; then
     # The cache is keyed by file CONTENT, but HS echoes the input path verbatim
@@ -112,7 +127,8 @@ if [ -n "$key" ] && [ -f "$key.full.gz" ]; then
         > "$tmp/hs.out"
     hs_src="cache"
 else
-    timeout "$TIMEOUT" "$hs_path" +RTS $HS_RTS -RTS --derivcheck-timeout="$DERIVCHECK_TIMEOUT" --prove="$lemma" "$file" 2>/dev/null > "$tmp/hs.out"
+    # shellcheck disable=SC2086  # $EXTRA_FLAGS must word-split into flags
+    timeout "$TIMEOUT" "$hs_path" +RTS $HS_RTS -RTS $EXTRA_FLAGS --derivcheck-timeout="$DERIVCHECK_TIMEOUT" --prove="$lemma" "$file" 2>/dev/null > "$tmp/hs.out"
     hs_rc=$?
     if [ "$hs_rc" -eq 124 ]; then
         echo "$lemma: HS TIMEOUT (${TIMEOUT}s)"
@@ -125,7 +141,7 @@ fi
 
 # --- RS.
 # shellcheck disable=SC2086
-timeout "$RS_TIMEOUT" env $extra_env "$rs_path" --derivcheck-timeout="$DERIVCHECK_TIMEOUT" --prove="$lemma" "$file" 2>/dev/null > "$tmp/rs.out"
+timeout "$RS_TIMEOUT" env $extra_env "$rs_path" $EXTRA_FLAGS --derivcheck-timeout="$DERIVCHECK_TIMEOUT" --prove="$lemma" "$file" 2>/dev/null > "$tmp/rs.out"
 rs_rc=$?
 if [ "$rs_rc" -eq 124 ]; then
     echo "$lemma: RS TIMEOUT (${RS_TIMEOUT}s)"

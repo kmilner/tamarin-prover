@@ -337,8 +337,13 @@ pub fn pretty_closed_theory(
         .flatten()
         .cloned()
         .collect();
+    // Names of arity-1 NoEq function symbols.  Depends only on the
+    // (immutable) elaborated signature, so compute it once here and thread
+    // it through to every per-item renderer rather than recomputing (and
+    // re-cloning the signature) for each rule/lemma/restriction/predicate.
+    let arity1 = arity1_noeq_names(elaborated);
     let rendered: Vec<Option<String>> = parsed.items.par_iter()
-        .map(|item| render_parsed_item(item, &macros, &predicates, elaborated, proved, in_file))
+        .map(|item| render_parsed_item(item, &macros, &predicates, elaborated, proved, in_file, &arity1))
         .collect();
     for b in rendered.into_iter().flatten() {
         out.push('\n');
@@ -389,8 +394,8 @@ pub fn pretty_closed_theory(
 fn render_injective_fact_insts(elab: &Theory) -> String {
     use crate::pretty_hpj::{self as hpj, Doc, punctuate};
     use crate::fact::{FactTag, Multiplicity};
-    let proto_rules: Vec<crate::rule::ProtoRuleE> = elab.rules()
-        .map(|r| r.rule.clone())
+    let proto_rules: Vec<&crate::rule::ProtoRuleE> = elab.rules()
+        .map(|r| &r.rule)
         .collect();
     let tags = crate::tools::injective_fact_instances::simple_injective_fact_instances(
         &proto_rules,
@@ -441,8 +446,7 @@ fn render_signature(sig: &tamarin_term::maude_sig::MaudeSig) -> String {
         // `(keyword_ "builtins:" <->) . fsep . punctuate comma`
         // (Term/Maude/Signature.hs:220,229-231) — so the list wraps through
         // the HughesPJ engine, not a flat join.
-        let items: Vec<String> = builtins.iter().map(|s| s.to_string()).collect();
-        out.push_str(&wrap_with_lead("builtins:", &items));
+        out.push_str(&wrap_with_lead("builtins:", &builtins));
         out.push('\n');
     }
 
@@ -511,7 +515,7 @@ fn render_equations(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<(String, Str
 /// fill-paragraph combinator, so the wrap decisions must come from the
 /// ported HughesPJ Doc engine (LINE_LENGTH=110, RIBBON=73) — not a
 /// hand-rolled greedy fill at a guessed width.  Route through `pretty_hpj`.
-fn wrap_with_lead(lead: &str, items: &[String]) -> String {
+fn wrap_with_lead<S: AsRef<str>>(lead: &str, items: &[S]) -> String {
     use crate::pretty_hpj::{self as hpj, Doc};
     if items.is_empty() { return String::new(); }
     let docs: Vec<Doc> = items.iter().map(Doc::text).collect();
@@ -563,6 +567,7 @@ fn render_parsed_item(
     elab: &Theory,
     proved: &[ProvedLemma],
     in_file: &str,
+    arity1: &std::collections::HashSet<String>,
 ) -> Option<String> {
     use p::TheoryItem::*;
     // `macros` is collected once by the caller (mirrors HS
@@ -580,14 +585,14 @@ fn render_parsed_item(
             // closed theory and never rendered.  Such rules are removed
             // from the elaborated theory in run.rs; mirror the absence here.
             if elab.rules().any(|er| er.name() == r.name) {
-                Some(render_rule(r, elab, macros))
+                Some(render_rule(r, elab, macros, arity1))
             } else {
                 None
             }
         }
         IntrRule(_) => None,
-        Lemma(l) => Some(render_parsed_lemma(l, macros, predicates, proved, in_file, elab)),
-        Restriction(r) => Some(render_parsed_restriction(r, macros, predicates, elab)),
+        Lemma(l) => Some(render_parsed_lemma(l, macros, predicates, proved, in_file, elab, arity1)),
+        Restriction(r) => Some(render_parsed_restriction(r, macros, predicates, elab, arity1)),
         Predicates(preds) => {
             // HS `prettyTheory` folds each `PredicateItem` through
             // `prettyPredicate` (TheoryObject.hs:764, 802-806):
@@ -606,9 +611,8 @@ fn render_parsed_item(
             if preds.is_empty() {
                 return None;
             }
-            let arity1 = arity1_noeq_names(elab);
             let lines: Vec<String> = preds.iter()
-                .map(|pr| render_predicate(pr, &arity1))
+                .map(|pr| render_predicate(pr, arity1))
                 .collect();
             Some(lines.join("\n\n"))
         }
@@ -643,7 +647,7 @@ fn render_parsed_item(
             let mut active: Vec<&p::TheoryItem> = then_items.iter().collect();
             if let Some(else_b) = else_items { active.extend(else_b.iter()); }
             let blocks: Vec<String> = active.iter()
-                .filter_map(|it| render_parsed_item(it, macros, predicates, elab, proved, in_file))
+                .filter_map(|it| render_parsed_item(it, macros, predicates, elab, proved, in_file, arity1))
                 .collect();
             if blocks.is_empty() { None } else { Some(blocks.join("\n\n")) }
         }
@@ -801,7 +805,7 @@ fn render_rule_attributes(attrs: &[p::RuleAttr]) -> String {
     if parts.is_empty() { String::new() } else { format!("[{}]", parts.join(", ")) }
 }
 
-fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro]) -> String {
+fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro], arity1: &std::collections::HashSet<String>) -> String {
     let name = &parsed_rule.name;
     let mut out = String::new();
     // HS rule-header line (`prettyNamedRule`, Model/Rule.hs:1285):
@@ -831,13 +835,13 @@ fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro]) -> Str
     // is folded by `naryOpApp`'s `k == 1` branch into `f(<a,b,c>)`
     // (Theory/Text/Parser/Term.hs:84-87).  RS's term parser keeps the surplus
     // args, so re-fold here before rendering.  See `rewrite_arity1_term`.
-    let arity1 = arity1_noeq_names(elab);
+    // `arity1` is computed once by the caller and threaded in.
     let premises: Vec<p::Fact> =
-        desugared.premises.iter().map(|f| rewrite_arity1_fact(f, &arity1)).collect();
+        desugared.premises.iter().map(|f| rewrite_arity1_fact(f, arity1)).collect();
     let actions: Vec<p::Fact> =
-        desugared.actions.iter().map(|f| rewrite_arity1_fact(f, &arity1)).collect();
+        desugared.actions.iter().map(|f| rewrite_arity1_fact(f, arity1)).collect();
     let conclusions: Vec<p::Fact> =
-        desugared.conclusions.iter().map(|f| rewrite_arity1_fact(f, &arity1)).collect();
+        desugared.conclusions.iter().map(|f| rewrite_arity1_fact(f, arity1)).collect();
     out.push_str(&render_rule_body(
         &premises,
         &actions,
@@ -917,7 +921,10 @@ fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro]) -> Str
             // rule that was both macro-using AND abstracted (e.g. a `^`/DH
             // rule whose body is a macro call) was wrongly called trivial
             // (regression/trace/issue777: `pk(x)='g'^x`, `Out(pk(~x))`).
-            let no_macro_in_display = {
+            // Fast path: with no macro definitions, `apply_macros_fact` is an
+            // identity rebuild (no macro can match), so the comparison below is
+            // always `true`.  Skip the three deep-clone passes entirely.
+            let no_macro_in_display = macros.is_empty() || {
                 let mp: Vec<p::Fact> = premises.iter()
                     .map(|f| crate::macro_expand::apply_macros_fact(macros, f)).collect();
                 let ma: Vec<p::Fact> = actions.iter()
@@ -1356,7 +1363,7 @@ const ORACLE_RIBBON: usize = 67;
 // Lemma
 // =============================================================================
 
-fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], predicates: &[p::Predicate], proved: &[ProvedLemma], in_file: &str, elab: &Theory) -> String {
+fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], predicates: &[p::Predicate], proved: &[ProvedLemma], in_file: &str, _elab: &Theory, arity1: &std::collections::HashSet<String>) -> String {
     use crate::pretty_hpj::{self as hpj, Doc};
     let mut out = String::new();
     // HS `prettyLemmaName` (Lemma.hs:91-95):
@@ -1392,11 +1399,11 @@ fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], predicates: &[p::Pre
     // (`naryOpApp` `k == 1`, Term.hs:84-87) — e.g. `h(H, x)` → `h(<H, x>)` —
     // so the rendered formula must do the same.  Apply BEFORE the AC sort so
     // the canonicaliser sees the folded `h(<…>)` shape.
-    let arity1 = arity1_noeq_names(elab);
+    // `arity1` is computed once by the caller and threaded in.
     // HS `expandLemma` (TheoryObject.hs:439-446) predicate-expands the lemma
     // formula before it is stored/printed (e.g. multiset `(<)` → `∃ z. …`).
     let expanded_formula = expand_predicates_for_display(&lem.formula, predicates);
-    let folded_formula = crate::elaborate::rewrite_arity1_formula(&expanded_formula, &arity1);
+    let folded_formula = crate::elaborate::rewrite_arity1_formula(&expanded_formula, arity1);
     // HS sorts AC arguments at parse time when building `LNTerm` via `fAppAC`
     // (Term/Term/Raw.hs:118-122); our parser keeps `BinOp` trees in written
     // order, so re-establish the canonical AC operand order on the formula
@@ -1407,7 +1414,7 @@ fn render_parsed_lemma(lem: &p::Lemma, macros: &[p::Macro], predicates: &[p::Pre
     out.push('\n');
 
     // /* guarded formula characterizing ... */
-    out.push_str(&render_guarded_block(lem, macros, predicates, &arity1));
+    out.push_str(&render_guarded_block(lem, macros, predicates, arity1));
 
     // Proof body — either the prover's result (if --prove ran) or
     // the lemma's stored skeleton.
@@ -1538,7 +1545,7 @@ fn expand_predicates_for_display(f: &p::Formula, predicates: &[p::Predicate]) ->
     crate::predicate_expand::expand_formula(f, predicates).unwrap_or_else(|_| f.clone())
 }
 
-fn render_parsed_restriction(r: &p::Restriction, macros: &[p::Macro], predicates: &[p::Predicate], elab: &Theory) -> String {
+fn render_parsed_restriction(r: &p::Restriction, macros: &[p::Macro], predicates: &[p::Predicate], _elab: &Theory, arity1: &std::collections::HashSet<String>) -> String {
     // HS `prettyRestriction` (TheoryObject.hs:846-857):
     //   The `Restriction` carries two formulas after `applyMacroInRestriction`:
     //   - `_rstrFormula`         = macro-EXPANDED formula  (displayed in expanded block)
@@ -1556,16 +1563,16 @@ fn render_parsed_restriction(r: &p::Restriction, macros: &[p::Macro], predicates
     // formulas (`f'`, `ofm'`), so e.g. the multiset `(<)` operator is rewritten
     // to `∃ z. r = l ++ z` BEFORE the formula is stored — and thus before it is
     // printed.  Mirror that here on both displayed formulas.
-    let arity1 = arity1_noeq_names(elab);
+    // `arity1` is computed once by the caller and threaded in.
     let original = crate::elaborate::rewrite_arity1_formula(
-        &expand_predicates_for_display(&r.formula, predicates), &arity1);
+        &expand_predicates_for_display(&r.formula, predicates), arity1);
     let expanded = if macros.is_empty() {
         original.clone()
     } else {
         crate::elaborate::rewrite_arity1_formula(
             &expand_predicates_for_display(
                 &crate::macro_expand::apply_macros_formula(macros, &r.formula), predicates),
-            &arity1)
+            arity1)
     };
     let mut out = String::new();
     out.push_str("restriction ");

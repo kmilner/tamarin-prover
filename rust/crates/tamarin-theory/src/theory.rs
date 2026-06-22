@@ -28,9 +28,10 @@ pub struct OpenProtoRule {
     /// Pre-applied variant rules — each entry is a fully-narrowed
     /// `ProtoRuleAC` with its variant subst applied.  Populated by
     /// `ProofContext::new` (context.rs) for rules with reducible-headed
-    /// sub-terms and still read by live code: `macro_expand` rewrites
-    /// each variant's terms, `intruder_variants` asserts intruder rules
-    /// carry none, and `context.rs` short-circuits when already filled.
+    /// sub-terms and still read by live code: `intruder_variants`
+    /// asserts intruder rules carry none, and `context.rs` short-circuits
+    /// (constraint/solver/context.rs:636 `if !o.variants.is_empty()`)
+    /// when this field is already filled.
     /// The SplitG-based solving path uses `variant_substs` instead.
     pub variants: Vec<ProtoRuleAC>,
     /// Variant substitutions as a disjunction (`RuleACConstrs` in

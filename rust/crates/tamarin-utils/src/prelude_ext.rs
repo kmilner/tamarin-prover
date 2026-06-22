@@ -246,8 +246,13 @@ fn flush_by(sep: &str, n: usize, s: &str, right: bool) -> String {
         return s.to_string();
     }
     let needed = n - s_len;
-    let cycled: String = sep.chars().cycle().take(needed).collect();
-    if right { format!("{}{}", cycled, s) } else { format!("{}{}", s, cycled) }
+    // Build the result in a single buffer: padding (cycled from `sep`) on the
+    // correct side of `s`, avoiding a second `format!` allocation.
+    let mut out = String::with_capacity(sep.len() * needed + s.len());
+    if !right { out.push_str(s); }
+    for c in sep.chars().cycle().take(needed) { out.push(c); }
+    if right { out.push_str(s); }
+    out
 }
 
 /// Mark a string as a warning. Mirrors `warning` in Haskell.

@@ -67,11 +67,12 @@ pub fn parse_theory_with_base(
     Ok(thy)
 }
 
-/// Parse a theory. Currently always delegates to `parse_theory`, which parses
-/// a regular (non-diff) theory: `is_diff` is hardcoded to `false` and neither
-/// `flags` nor a `#define diff` preamble is inspected to switch into diff mode.
-/// (HS's `theory` derives diff from `"diff" \`S.member\` flags0`; that wiring is
-/// not yet ported here, so diff selection is left to the caller.)
+/// Parse a theory.
+///
+/// NOTE: this entry point always parses a NON-diff theory. `is_diff` is
+/// hardcoded to `false` and neither `flags` nor a `#define diff` preamble
+/// switches into diff mode; diff-theory selection is not implemented at this
+/// layer (HS derives it from `"diff" \`S.member\` flags0`).
 pub fn parse_theory_or_diff(input: &str, flags: &[&str]) -> Result<Theory, ParseError> {
     parse_theory(input, flags)
 }
@@ -179,18 +180,19 @@ impl<'a> Parser<'a> {
     fn skip_ws(&mut self) { self.lx.skip_ws(); }
 
     fn at_keyword(&mut self, kw: &str) -> bool {
-        if !self.lx.peek_symbol(kw) { return false; }
-        // Reject if followed by `-` (e.g. `rule-equivalence` is NOT `rule`).
+        // Single non-consuming probe: scan the keyword once, check the
+        // trailing-`-` boundary, then always restore.
         let save = self.save();
-        let _ = self.lx.try_symbol(kw);
+        if !self.lx.try_symbol(kw) { self.restore(save); return false; }
+        // Reject if followed by `-` (e.g. `rule-equivalence` is NOT `rule`).
         let next = self.lx.peek();
         self.restore(save);
         next != Some('-')
     }
     fn try_kw(&mut self, kw: &str) -> bool {
-        if !self.lx.peek_symbol(kw) { return false; }
+        // Scan the keyword once; consume iff matched and not followed by `-`.
         let save = self.save();
-        let _ = self.lx.try_symbol(kw);
+        if !self.lx.try_symbol(kw) { self.restore(save); return false; }
         if self.lx.peek() == Some('-') { self.restore(save); return false; }
         true
     }

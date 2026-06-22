@@ -637,17 +637,16 @@ pub fn simplify_guarded_with(
             gconj(simplified)
         }
         Guarded::GGuarded { qua: Quant::All, vars, guards, body } if vars.is_empty() => {
-            let evaluated: Vec<(GAtom, Option<bool>)> = guards.iter()
-                .map(|a| (a.clone(), eval(a)))
-                .collect();
+            let evals: Vec<Option<bool>> = guards.iter().map(|a| eval(a)).collect();
             // Any False guard → universal vacuously holds.
-            if evaluated.iter().any(|(_, v)| v == &Some(false)) {
+            if evals.iter().any(|v| v == &Some(false)) {
                 return gtrue();
             }
             // Keep only the Unknown guards — True guards are vacuous.
-            let kept: Vec<GAtom> = evaluated.into_iter()
+            let kept: Vec<GAtom> = guards.iter()
+                .zip(&evals)
                 .filter(|(_, v)| v.is_none())
-                .map(|(a, _)| a)
+                .map(|(a, _)| a.clone())
                 .collect();
             let body_s = simplify_guarded_with(body, valuation);
             // HS-faithful: `simp` builds the universal via `gall [] (...) (simp
@@ -1192,7 +1191,7 @@ fn split_conj_actions_eqs(f: &p::Formula) -> (Vec<p::Atom>, Vec<p::Formula>) {
 /// Compute which of `xs` are NOT bound by any of `atoms`. Mirrors
 /// Haskell's `remainingUnguarded`.
 fn remaining_unguarded(xs: &[p::VarSpec], atoms: &[p::Atom]) -> Vec<p::VarSpec> {
-    let mut sorted_atoms = atoms.to_vec();
+    let mut sorted_atoms: Vec<&p::Atom> = atoms.iter().collect();
     // Action atoms first, then equalities.
     sorted_atoms.sort_by_key(|a| match a {
         p::Atom::Action(_, _) => 0,

@@ -32,9 +32,11 @@ pub fn reachable_set<T: Ord + Clone>(start: &[T], rel: &Relation<T>) -> BTreeSet
     let mut stack: Vec<T> = start.to_vec();
     while let Some(x) = stack.pop() {
         if visited.insert(x.clone()) {
-            for y in image(&x, rel) {
-                if !visited.contains(&y) {
-                    stack.push(y);
+            // Inlined `image(&x, rel)`: scan `rel` front-to-back, cloning only
+            // the unvisited successors actually pushed (avoids a per-node Vec).
+            for (a, b) in rel {
+                if a == &x && !visited.contains(b) {
+                    stack.push(b.clone());
                 }
             }
         }
@@ -53,9 +55,12 @@ pub fn cyclic<T: Ord + Clone>(rel: &Relation<T>) -> bool {
         if parents.contains(&x) { return true; }
         if visited.contains(&x) { return false; }
         parents.insert(x.clone());
-        let next = image(&x, rel);
-        for y in next {
-            if find_loop(rel, parents, visited, y) {
+        // Inlined `image(&x, rel)`: scan `rel` front-to-back, recursing into each
+        // successor in the same order (no `visited` guard here, matching the
+        // original `image` snapshot which has none). `rel` is not mutated during
+        // the scan, so the snapshot and the inlined scan are equivalent.
+        for (a, b) in rel {
+            if a == &x && find_loop(rel, parents, visited, b.clone()) {
                 return true;
             }
         }
@@ -99,8 +104,13 @@ pub fn toposort<T: Ord + Clone>(rel: &Relation<T>) -> Vec<T> {
     ) {
         if visited.contains(&x) { return; }
         visited.insert(x.clone());
-        for p in image(&x, inv) {
-            visit(rel, inv, visited, out, p);
+        // Inlined `image(&x, inv)`: scan `inv` front-to-back, recursing into each
+        // predecessor in the same order (avoids a per-node Vec). `inv` is
+        // immutable during the scan, so this matches the snapshot form.
+        for (a, b) in inv {
+            if a == &x {
+                visit(rel, inv, visited, out, b.clone());
+            }
         }
         out.push(x);
     }
@@ -127,13 +137,19 @@ pub fn dfs_loop_breakers<T: Ord + Clone>(rel: &Relation<T>) -> Vec<T> {
     ) {
         visited.insert(x.clone());
         parents.insert(x.clone());
-        let ys = image(&x, rel);
-        if ys.iter().any(|y| parents.contains(y)) {
+        // Inlined `image(&x, rel)`, preserving the two-phase structure: first
+        // check whether ANY successor is already a parent (back-edge), then
+        // otherwise recurse into the unvisited successors front-to-back. `rel` is
+        // immutable so the two scans see the same successors as the snapshot.
+        let hits_parent = rel
+            .iter()
+            .any(|(a, b)| a == &x && parents.contains(b));
+        if hits_parent {
             breakers.push(x.clone());
         } else {
-            for y in ys {
-                if !visited.contains(&y) {
-                    find(rel, parents, visited, breakers, y);
+            for (a, b) in rel {
+                if a == &x && !visited.contains(b) {
+                    find(rel, parents, visited, breakers, b.clone());
                 }
             }
         }
@@ -174,8 +190,7 @@ pub fn trans_red<T: Ord + Clone>(dag: &Relation<T>) -> Relation<T> {
     for (j, i) in indexed {
         let edge = (topo[j].clone(), topo[i].clone());
         if !dag_set.contains(&edge) { continue; }
-        let starts = vec![edge.0.clone()];
-        let reachable = reachable_set(&starts, &new_edges);
+        let reachable = reachable_set(std::slice::from_ref(&edge.0), &new_edges);
         if !reachable.contains(&edge.1) {
             new_edges.push(edge);
         }

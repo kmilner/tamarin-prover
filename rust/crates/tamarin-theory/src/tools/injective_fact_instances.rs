@@ -185,7 +185,7 @@ pub fn trimmed_pair_terms(
 /// pair-leaves of that position (HS `getPairTerms` / `getShape` /
 /// `shapeTerm` / `trimmedPairTerms`).
 pub fn simple_injective_fact_instances(
-    rules: &[ProtoRuleE],
+    rules: &[&ProtoRuleE],
     reducible: &tamarin_term::function_symbols::FunSig,
 ) -> Vec<(FactTag, Vec<Vec<MonotonicBehaviour>>)> {
     use crate::fact::{LNFact, fact_tag_multiplicity, Multiplicity};
@@ -245,16 +245,19 @@ pub fn simple_injective_fact_instances(
     // The non-empty list folds via `map (map combine) $ zipWith zip`.
     // The empty list yields the default candidate shape.
     fn combine_all(
-        list: Vec<Option<Vec<Vec<MonotonicBehaviour>>>>,
+        list: impl IntoIterator<Item = Option<Vec<Vec<MonotonicBehaviour>>>>,
         default_shape: &[Vec<MonotonicBehaviour>],
     ) -> Option<Vec<Vec<MonotonicBehaviour>>> {
-        if list.iter().any(|x| x.is_none()) { return None; }
-        let mut it = list.into_iter().map(|x| x.unwrap());
+        // Fold lazily with early-out on the first `None` (the result is `None`
+        // iff any element is `None`); the empty list yields the default
+        // candidate shape.
+        let mut it = list.into_iter();
         let mut acc = match it.next() {
-            Some(first) => first,
+            Some(first) => first?,
             None => return Some(default_shape.to_vec()),
         };
         for next in it {
+            let next = next?;
             acc = acc.iter().zip(next.iter())
                 .map(|(ai, bi)| ai.iter().zip(bi.iter())
                     .map(|(x, y)| combine_behaviour(*x, *y))
@@ -329,7 +332,7 @@ pub fn simple_injective_fact_instances(
     // `combineShapes` is symmetric in length-trimming), so we fold on
     // insert.
     let mut candidates: BTreeMap<FactTag, Vec<Vec<MonotonicBehaviour>>> = BTreeMap::new();
-    for r in rules {
+    for &r in rules {
         let prem_tags: std::collections::BTreeSet<FactTag> = r.premises.iter()
             .map(|p| p.tag.clone()).collect();
         for conc in &r.conclusions {
@@ -423,7 +426,7 @@ pub fn simple_injective_fact_instances(
             Some(behaviours)
         };
 
-        combine_all(copies.iter().map(|c| get_maybe_eq_mon_conclusion(c)).collect(),
+        combine_all(copies.iter().map(|c| get_maybe_eq_mon_conclusion(c)),
             default_shape)
     };
 
@@ -431,9 +434,8 @@ pub fn simple_injective_fact_instances(
     //   `combineAll (map (getMaybeEqStrict tag) rules) tag`.
     let mut out: Vec<(FactTag, Vec<Vec<MonotonicBehaviour>>)> = Vec::new();
     for (tag, default_shape) in &candidates {
-        let per_rule: Vec<Option<Vec<Vec<MonotonicBehaviour>>>> = rules.iter()
-            .map(|r| get_maybe_eq_strict(tag, r, default_shape))
-            .collect();
+        let per_rule = rules.iter()
+            .map(|&r| get_maybe_eq_strict(tag, r, default_shape));
         if let Some(behaviours) = combine_all(per_rule, default_shape) {
             out.push((tag.clone(), behaviours));
         }
@@ -455,7 +457,7 @@ mod tests {
 
     #[test]
     fn empty_rules_no_injective_facts() {
-        let r: Vec<ProtoRuleE> = Vec::new();
+        let r: Vec<&ProtoRuleE> = Vec::new();
         assert!(simple_injective_fact_instances(&r, &Default::default()).is_empty());
     }
 
@@ -489,6 +491,7 @@ mod tests {
             vec![],
         );
         let rules = vec![start, loop_r, stop];
+        let rules: Vec<&ProtoRuleE> = rules.iter().collect();
         let inj = simple_injective_fact_instances(&rules, &Default::default());
         assert_eq!(inj.len(), 1);
         assert_eq!(inj[0].0, a_tag);
@@ -518,6 +521,7 @@ mod tests {
             vec![],
         );
         let rules = vec![init, copy];
+        let rules: Vec<&ProtoRuleE> = rules.iter().collect();
         let inj = simple_injective_fact_instances(&rules, &Default::default());
         assert_eq!(inj.len(), 1);
         assert_eq!(inj[0].0, s_tag);
@@ -543,7 +547,7 @@ mod tests {
             vec![b_fact.clone()],
             vec![],
         );
-        assert!(simple_injective_fact_instances(&[weird], &Default::default()).is_empty());
+        assert!(simple_injective_fact_instances(&[&weird], &Default::default()).is_empty());
     }
 
     /// Pair-flattening (HS `getPairTerms` / `getShape` / `shapeTerm`):
@@ -576,7 +580,7 @@ mod tests {
             vec![conc_fact.clone()],
             vec![],
         );
-        let inj = simple_injective_fact_instances(&[init, copy], &Default::default());
+        let inj = simple_injective_fact_instances(&[&init, &copy], &Default::default());
         assert_eq!(inj.len(), 1);
         assert_eq!(inj[0].0, s_tag);
         // One non-first position whose tuple flattens into two leaves.
@@ -603,7 +607,7 @@ mod tests {
             vec![a_fact.clone(), a_fact.clone()],
             vec![],
         );
-        let inj = simple_injective_fact_instances(&[r], &Default::default());
+        let inj = simple_injective_fact_instances(&[&r], &Default::default());
         assert!(inj.is_empty(),
             "two conclusions A(x), A(x) share the first term x → A cannot be \
              injective (HS duplicateFirstTerms drops the whole tag)");
@@ -660,7 +664,7 @@ mod tests {
             vec![],
         );
 
-        let inj = simple_injective_fact_instances(&[step1, step2], &Default::default());
+        let inj = simple_injective_fact_instances(&[&step1, &step2], &Default::default());
         assert!(inj.is_empty(),
             "St is created in Step1, consumed in Step2, but NO single rule \
              has St in both prems and concs → must NOT be marked injective. \
@@ -689,7 +693,7 @@ mod tests {
             vec![p_fact.clone()],
             vec![],
         );
-        let inj = simple_injective_fact_instances(&[r], &Default::default());
+        let inj = simple_injective_fact_instances(&[&r], &Default::default());
         assert!(inj.is_empty(),
             "Persistent facts are never injective (Haskell: \
              `factTagMultiplicity tag == Linear` guard)");
@@ -712,7 +716,7 @@ mod tests {
             vec![z_fact.clone()],
             vec![],
         );
-        let inj = simple_injective_fact_instances(&[r], &Default::default());
+        let inj = simple_injective_fact_instances(&[&r], &Default::default());
         assert!(inj.is_empty(),
             "Arity-0 facts have no behaviour to track → never injective");
     }
@@ -733,7 +737,7 @@ mod tests {
             vec![out_fact.clone()],
             vec![],
         );
-        let inj = simple_injective_fact_instances(&[r], &Default::default());
+        let inj = simple_injective_fact_instances(&[&r], &Default::default());
         // Out should NOT appear (only Proto tags are candidates).
         assert!(inj.iter().all(|(t, _)| matches!(t, FactTag::Proto(_, _, _))),
             "Only Proto facts are injective candidates");

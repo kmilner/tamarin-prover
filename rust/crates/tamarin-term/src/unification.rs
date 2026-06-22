@@ -388,13 +388,14 @@ where
     if !sort_geq_lterm(sort_of_const, &v, &t) {
         return Err(UnifyError::NoUnifier);
     }
-    // Substitute `v ~> t` through the existing accumulator.
-    let s = Subst::from_list(vec![(v.clone(), t.clone())]);
-    let updated: BTreeMap<LVar, LTerm<C>> = acc
-        .iter()
-        .map(|(k, ts)| (k.clone(), apply_vterm(&s, ts.clone())))
-        .collect();
-    *acc = updated;
+    // Substitute `v ~> t` through the existing accumulator in place, mutating
+    // each value rather than rebuilding the whole map with cloned keys.
+    let mut single = BTreeMap::new();
+    single.insert(v.clone(), t.clone());
+    for ts in acc.values_mut() {
+        let cur = std::mem::replace(ts, Term::Lit(Lit::Var(v.clone())));
+        *ts = apply_vterm_map(&single, cur);
+    }
     acc.insert(v, t);
     Ok(())
 }

@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use crate::lterm::{LVar, Name};
 use crate::vterm::{Lit, VTerm};
-use crate::term::{f_app_list, Term};
+use crate::term::Term;
 
 // `PartialOrd` / `Ord` derived to mirror Haskell's `deriving (Ord, ..)` on
 // `SubstVFresh c v` (SubstVFresh.hs:79-80).  Haskell's `S.toList` in `performSplit`
@@ -68,6 +68,11 @@ where
     pub fn image_of(&self, v: &V) -> Option<&VTerm<C, V>> { self.map.get(v) }
     pub fn to_list(&self) -> Vec<(V, VTerm<C, V>)> {
         self.map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+    /// Borrowing view over the (key, image) pairs in domain order, avoiding
+    /// the per-entry clones of `to_list` when callers only need to read.
+    pub fn iter(&self) -> impl Iterator<Item = (&V, &VTerm<C, V>)> {
+        self.map.iter()
     }
     pub fn is_empty(&self) -> bool { self.map.is_empty() }
     pub fn len(&self) -> usize { self.map.len() }
@@ -136,9 +141,16 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
 
     /// `varsRangeVFresh`: every variable that appears in any range term.
     pub fn vars_range(&self) -> Vec<LVar> {
-        let collected: Vec<VTerm<C, LVar>> = self.range().cloned().collect();
-        let bundled: VTerm<C, LVar> = f_app_list(collected);
-        crate::vterm::vars_vterm(&bundled)
+        // Collect vars from every range term by reference (no clone of the
+        // terms, no intermediate `f_app_list` bundle), then sort+dedup to
+        // mirror `vars_vterm`'s set semantics.
+        let mut out: Vec<LVar> = Vec::new();
+        for t in self.range() {
+            out.extend(crate::vterm::vars_vterm_in_order(t));
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// `isRenamedVar`: the binding for `v` is just a sort-preserving
@@ -157,8 +169,23 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
     }
 
     /// `isRenaming`: every entry is a rename.
+    ///
+    /// Equivalent to `self.map.keys().all(|v| self.is_renamed_var(v))` but
+    /// computed in a single pass (the naive form is O(n^2): each
+    /// `is_renamed_var` re-scans every other range entry).  A substitution is
+    /// a renaming iff every binding maps to a sort-preserving variable and no
+    /// two distinct keys map to the same target variable (i.e. no target var
+    /// occurs in any other entry).
     pub fn is_renaming(&self) -> bool {
-        self.map.keys().all(|v| self.is_renamed_var(v))
+        let mut targets: std::collections::BTreeSet<&LVar> = std::collections::BTreeSet::new();
+        for (v, t) in self.map.iter() {
+            let Term::Lit(Lit::Var(target)) = t else { return false; };
+            if target.sort != v.sort { return false; }
+            // A duplicate target means this target var also appears in another
+            // entry, so that entry's `is_renamed_var` would have failed.
+            if !targets.insert(target) { return false; }
+        }
+        true
     }
 
     /// `removeRenamings`: drop every entry that's just a rename.
@@ -246,8 +273,8 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
         // Collect ALL distinct range vars in insertion order.
         let mut range_vars: Vec<LVar> = Vec::new();
         let mut seen: std::collections::BTreeSet<LVar> = std::collections::BTreeSet::new();
-        for (_v, t) in self.to_list() {
-            for w in crate::vterm::vars_vterm(&t) {
+        for t in self.range() {
+            for w in crate::vterm::vars_vterm(t) {
                 if seen.insert(w.clone()) {
                     range_vars.push(w);
                 }
@@ -520,7 +547,7 @@ where
     //
     // `frees s2` (s2 :: free LNSubst) walks BOTH domain and range.
     // `frees s1_0` (s1_0 :: LNSubstVFresh) uses `foldFrees (SubstVFresh n
-    // LVar) = foldFrees f . M.keys` (SubstVFresh.hs:196) — i.e. ONLY the
+    // LVar) = foldFrees f . M.keys` (SubstVFresh.hs:197) — i.e. ONLY the
     // DOMAIN KEYS, NOT the range (witnesses).  Including s1_0's range here
     // (as the old code did) over-counted the avoid set, so the re-based
     // witnesses came out inflated (Responder_secrecy: the Setup_Key `~k`

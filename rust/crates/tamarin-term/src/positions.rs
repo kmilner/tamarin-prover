@@ -61,7 +61,7 @@ pub fn replace_pos<C: Ord + Clone, V: Ord + Clone>(
         Term::App(fsym, args) => {
             let i = p[0] as usize;
             if p[0] < 0 || i >= args.len() { return None; }
-            let mut new: Vec<_> = args.iter().cloned().collect();
+            let mut new = args.to_vec();
             new[i] = replace_pos(&args[i], s, &p[1..])?;
             Some(f_app(fsym.clone(), new))
         }
@@ -71,58 +71,60 @@ pub fn replace_pos<C: Ord + Clone, V: Ord + Clone>(
 /// `positions t`: every position in `t` (including the empty position at
 /// the root). AC nesting follows the right-leaning binary interpretation.
 pub fn positions<C, V>(t: &VTerm<C, V>) -> Vec<Position> {
-    fn go<C, V>(t: &VTerm<C, V>, out: &mut Vec<Position>, prefix: &[i64]) {
-        out.push(prefix.to_vec());
+    fn go<C, V>(t: &VTerm<C, V>, out: &mut Vec<Position>, prefix: &mut Vec<i64>) {
+        out.push(prefix.clone());
         if let Term::App(FunSym::Ac(_), args) = t {
             let len = args.len();
             for (i, a) in args.iter().enumerate() {
-                let pre = ac_position(i, len);
-                let mut new_prefix = prefix.to_vec();
-                new_prefix.extend_from_slice(&pre);
-                go(a, out, &new_prefix);
+                let saved = prefix.len();
+                prefix.extend_from_slice(&ac_position(i, len));
+                go(a, out, prefix);
+                prefix.truncate(saved);
             }
         } else if let Term::App(_, args) = t {
             for (i, a) in args.iter().enumerate() {
-                let mut new_prefix = prefix.to_vec();
-                new_prefix.push(i as i64);
-                go(a, out, &new_prefix);
+                prefix.push(i as i64);
+                go(a, out, prefix);
+                prefix.pop();
             }
         }
     }
     let mut out = Vec::new();
-    go(t, &mut out, &[]);
+    let mut prefix = Vec::new();
+    go(t, &mut out, &mut prefix);
     out
 }
 
 /// `positionsNonVar`: like `positions` but excludes positions where the
 /// subterm is a variable.
 pub fn positions_non_var<C, V>(t: &VTerm<C, V>) -> Vec<Position> {
-    fn go<C, V>(t: &VTerm<C, V>, out: &mut Vec<Position>, prefix: &[i64]) {
+    fn go<C, V>(t: &VTerm<C, V>, out: &mut Vec<Position>, prefix: &mut Vec<i64>) {
         match t {
             Term::Lit(Lit::Var(_)) => {}
-            Term::Lit(Lit::Con(_)) => out.push(prefix.to_vec()),
+            Term::Lit(Lit::Con(_)) => out.push(prefix.clone()),
             Term::App(FunSym::Ac(_), args) => {
-                out.push(prefix.to_vec());
+                out.push(prefix.clone());
                 let len = args.len();
                 for (i, a) in args.iter().enumerate() {
-                    let pre = ac_position(i, len);
-                    let mut new_prefix = prefix.to_vec();
-                    new_prefix.extend_from_slice(&pre);
-                    go(a, out, &new_prefix);
+                    let saved = prefix.len();
+                    prefix.extend_from_slice(&ac_position(i, len));
+                    go(a, out, prefix);
+                    prefix.truncate(saved);
                 }
             }
             Term::App(_, args) => {
-                out.push(prefix.to_vec());
+                out.push(prefix.clone());
                 for (i, a) in args.iter().enumerate() {
-                    let mut new_prefix = prefix.to_vec();
-                    new_prefix.push(i as i64);
-                    go(a, out, &new_prefix);
+                    prefix.push(i as i64);
+                    go(a, out, prefix);
+                    prefix.pop();
                 }
             }
         }
     }
     let mut out = Vec::new();
-    go(t, &mut out, &[]);
+    let mut prefix = Vec::new();
+    go(t, &mut out, &mut prefix);
     out
 }
 

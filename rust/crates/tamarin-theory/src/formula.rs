@@ -4,10 +4,12 @@
 //! The Haskell version uses a locally-nameless representation: bound
 //! variables are `BVar::Bound(de_bruijn_idx)`, free variables are `Free(v)`.
 //!
-//! Not yet ported: `nnf`, `pullquants`, `prenex`, `pnf`, `simplifyFormula`.
-//! Those are pure transformations on the data type and can be added
-//! incrementally. (Pretty-printing of the parser-AST formula representation
-//! lives in `pretty_formula.rs`; this `ProtoFormula` has no pretty-printer.)
+//! Not yet ported (as of this writing): `nnf`, `pullquants`, `prenex`, `pnf`,
+//! `simplifyFormula` — pure transforms on `ProtoFormula`, addable
+//! incrementally. (The guarded-formula simplifier `simplifyGuarded` is ported
+//! separately as `simplify_guarded_with` in guarded.rs.) (Pretty-printing of
+//! the parser-AST formula representation lives in `pretty_formula.rs`; this
+//! `ProtoFormula` has no pretty-printer.)
 
 use crate::atom::{ProtoAtom, Unit2};
 use tamarin_term::lterm::{BVar, LVar, Name};

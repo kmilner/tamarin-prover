@@ -253,13 +253,14 @@ impl<'a> TreeParser<'a> {
 ///     chainGoal, disjSplitGoal, eqSplitGoal ]
 /// ```
 ///
-/// We structurally recognise Action (`Fact(...) @ #t`), Premise
-/// (`Fact(...) ▶<n> #t`), Disj (`gf1 ∥ gf2 ∥ ...` — HS
-/// `disjSplitGoal`, Proof.hs:61), Chain (`(#i,n) ~~> (#j,m)` — HS
-/// `chainGoal`, Proof.hs:59), Subterm (`<a> ⊏ <b>` — HS `stSplitGoal`,
-/// Proof.hs:63-66), and Split (`splitEqs(N)` — HS `eqSplitGoal`,
-/// Proof.hs:70-72).  Anything else lands in `GoalSpec::Raw` and the
-/// walker falls back to the auto-prover.
+/// We structurally recognise (in the order the code tries them) Action
+/// (`Fact(...) @ #t`), Premise (`Fact(...) ▶<n> #t`), Disj
+/// (`gf1 ∥ gf2 ∥ ...` — HS `disjSplitGoal`, Proof.hs:61), Chain
+/// (`(#i,n) ~~> (#j,m)` — HS `chainGoal`, Proof.hs:59), Split
+/// (`splitEqs(N)` — HS `eqSplitGoal`, Proof.hs:70-72), then Subterm
+/// (`<a> ⊏ <b>` — HS `stSplitGoal`, Proof.hs:63-66).  Anything else
+/// lands in `GoalSpec::Raw` and the walker falls back to the
+/// auto-prover.
 pub fn parse_goal_spec(raw: &str) -> GoalSpec {
     let trimmed = raw.trim();
     let mut p = GoalParser { lx: Lexer::new(trimmed) };
@@ -602,9 +603,10 @@ impl<'a> GoalParser<'a> {
             self.lx.set_pos(save);
             return None;
         }
-        // Read args text, balanced — we don't need to deeply parse the
-        // terms here, but capture them as `crate::ast::Term::Var` from
-        // raw text so the Fact struct is well-formed.
+        // Read the args as raw balanced-paren text here (we don't deeply
+        // parse the terms). `build_fact` later splits on top-level commas
+        // and wraps each arg as `crate::ast::Term::Var` so the Fact struct
+        // is well-formed.
         let args_text = self.read_balanced_paren()?;
         // After the `)`, expect `@` (action) or `▶<digit>` (premise).
         self.lx.skip_ws();
@@ -631,8 +633,8 @@ impl<'a> GoalParser<'a> {
         // Premise marker: `▶<digit>` — UTF-8 ▶ is `\u{25B6}`, the
         // subscript digit follows.
         if self.lx.rest().starts_with('\u{25B6}') {
-            // consume the ▶
-            for _ in '\u{25B6}'.to_string().chars() { self.lx.bump(); }
+            // consume the ▶ (a single Unicode scalar)
+            self.lx.bump();
             // HS always emits a Unicode subscript here: the pretty-printer
             // prints `▶ ++ subscript (show v)` (Constraints.hs:273) and the
             // parser `opRequires = symbol "▶" *> naturalSubscript`

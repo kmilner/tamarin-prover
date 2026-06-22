@@ -37,6 +37,7 @@ pub fn duplicate<A: Clone>(x: A) -> (A, A) {
 
 /// `subsetOf xs ys`: whether every element of `xs` appears in `ys`.
 pub fn subset_of<T: Ord + Clone>(xs: &[T], ys: &[T]) -> bool {
+    if xs.is_empty() { return true; }
     let ys_set: BTreeSet<&T> = ys.iter().collect();
     xs.iter().all(|x| ys_set.contains(x))
 }
@@ -102,17 +103,23 @@ pub fn string_sha256(s: &str) -> String {
     // Haskell does `C8.init` (drop the final byte *unconditionally*) and then
     // replaces `/`→`_`, `+`→`-`. The SHA-256 digest is always 32 bytes, so its
     // standard base64 is always 44 chars ending in exactly one `=` (32 mod 3 ==
-    // 2 → one pad char); dropping the last byte therefore drops that `=`.
+    // 2 → one pad char). `out.pop()` removes the final *char* (Unicode scalar);
+    // since base64 output is ASCII, that final char is exactly one byte (`=`),
+    // so this matches Haskell's byte-based `C8.init`.
     out.pop();
-    let bytes: Vec<u8> = out
-        .bytes()
-        .map(|b| match b {
-            b'/' => b'_',
-            b'+' => b'-',
-            x => x,
-        })
-        .collect();
-    String::from_utf8(bytes).expect("base64 alphabet is ASCII")
+    // In-place ASCII byte substitution: `/`→`_`, `+`→`-`. Both are
+    // single-ASCII-for-single-ASCII and length-preserving, so UTF-8 validity is
+    // preserved and the resulting String is identical to the round-trip form.
+    // SAFETY: the base64 alphabet is pure ASCII and we only swap one ASCII byte
+    // for another, keeping the buffer valid UTF-8.
+    for b in unsafe { out.as_mut_vec() } {
+        match *b {
+            b'/' => *b = b'_',
+            b'+' => *b = b'-',
+            _ => {}
+        }
+    }
+    out
 }
 
 // -- Partitions ---------------------------------------------------------------

@@ -4,8 +4,6 @@
 //! is a `State` monad; in Rust we expose a `DotGraph` struct with mutating
 //! methods. `scope` and `cluster` take a closure for the nested graph.
 
-use std::fmt::Write as _;
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NodeId {
     /// Auto-generated node id (e.g. `n42`).
@@ -161,65 +159,80 @@ impl DotGraph {
 
 /// `showDot label`: render a graph with the given digraph id.
 pub fn show_dot(label: &str, graph: &DotGraph) -> String {
-    let escaped: String = label.chars().flat_map(|c| {
-        if c == '"' { vec!['\\', '"'] } else { vec![c] }
-    }).collect();
     let mut out = String::new();
-    writeln!(&mut out, "digraph \"{}\" {{", escaped).unwrap();
+    out.push_str("digraph \"");
+    // Inline label escaping (`"`→`\"`): push each char directly instead of
+    // collecting a per-char Vec<char>.
+    for c in label.chars() {
+        if c == '"' { out.push('\\'); }
+        out.push(c);
+    }
+    out.push_str("\" {\n");
     for e in graph.elements() {
-        out.push_str(&show_element(e));
+        write_element(&mut out, e);
         out.push('\n');
     }
     out.push_str("\n}\n");
     out
 }
 
-fn show_element(e: &GraphElement) -> String {
+fn write_element(out: &mut String, e: &GraphElement) {
     match e {
-        GraphElement::Attribute(k, v) => format!("{};", show_attr(k, v)),
+        GraphElement::Attribute(k, v) => { write_attr(out, k, v); out.push(';'); }
         GraphElement::Node(nid, attrs) => {
-            format!("{}{};", nid.to_dot_string(), show_attrs(attrs))
+            out.push_str(&nid.to_dot_string());
+            write_attrs(out, attrs);
+            out.push(';');
         }
-        GraphElement::Edge(from, to, attrs) => format!(
-            "{} -> {}{};",
-            from.to_dot_string(),
-            to.to_dot_string(),
-            show_attrs(attrs)
-        ),
+        GraphElement::Edge(from, to, attrs) => {
+            out.push_str(&from.to_dot_string());
+            out.push_str(" -> ");
+            out.push_str(&to.to_dot_string());
+            write_attrs(out, attrs);
+            out.push(';');
+        }
         GraphElement::Scope(inner) | GraphElement::SubGraph(None, inner) => {
-            let body: String = inner.iter().map(|e| show_element(e) + "\n").collect();
-            format!("{{\n{}\n}}", body)
+            out.push_str("{\n");
+            for e in inner { write_element(out, e); out.push('\n'); }
+            out.push_str("\n}");
         }
         GraphElement::SubGraph(Some(nid), inner) => {
-            let body: String = inner.iter().map(|e| show_element(e) + "\n").collect();
-            format!("subgraph {} {{\n{}\n}}", nid.to_dot_string(), body)
+            out.push_str("subgraph ");
+            out.push_str(&nid.to_dot_string());
+            out.push_str(" {\n");
+            for e in inner { write_element(out, e); out.push('\n'); }
+            out.push_str("\n}");
         }
     }
 }
 
-fn show_attrs(attrs: &[(String, String)]) -> String {
-    if attrs.is_empty() { return String::new(); }
-    let body = attrs
-        .iter()
-        .map(|(k, v)| show_attr(k, v))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{}]", body)
+fn write_attrs(out: &mut String, attrs: &[(String, String)]) {
+    if attrs.is_empty() { return; }
+    out.push('[');
+    for (i, (k, v)) in attrs.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        write_attr(out, k, v);
+    }
+    out.push(']');
 }
 
-fn show_attr(name: &str, val: &str) -> String {
+fn write_attr(out: &mut String, name: &str, val: &str) {
     if name == "html_label" {
-        format!("label={}", val)
+        out.push_str("label=");
+        out.push_str(val);
     } else {
-        let escaped: String = val
-            .chars()
-            .flat_map(|c| match c {
-                '\n' => vec!['\\', 'l'],
-                '"' => vec!['\\', '"'],
-                c => vec![c],
-            })
-            .collect();
-        format!("{}=\"{}\"", name, escaped)
+        out.push_str(name);
+        out.push_str("=\"");
+        // Inline escaping (`\n`→`\l`, `"`→`\"`): push chars directly instead of
+        // collecting a per-char Vec<char>.
+        for c in val.chars() {
+            match c {
+                '\n' => { out.push('\\'); out.push('l'); }
+                '"' => { out.push('\\'); out.push('"'); }
+                c => out.push(c),
+            }
+        }
+        out.push('"');
     }
 }
 
@@ -243,13 +256,14 @@ pub fn fix_multi_line_label(s: &str) -> String {
     if !s.contains('\n') { return s.to_string(); }
     let mut out = String::new();
     for line in s.lines() {
-        let leading = line.chars().take_while(|c| c.is_whitespace()).count();
-        for _ in 0..leading { out.push_str("&nbsp;"); }
-        let suffix_offset = line
-            .char_indices()
-            .nth(leading)
-            .map(|(i, _)| i)
-            .unwrap_or(line.len());
+        // Single pass: count leading whitespace chars and accumulate their byte
+        // length, so we get the suffix byte offset without re-walking the line.
+        let mut suffix_offset = 0;
+        for c in line.chars() {
+            if !c.is_whitespace() { break; }
+            out.push_str("&nbsp;");
+            suffix_offset += c.len_utf8();
+        }
         out.push_str(&line[suffix_offset..]);
         out.push('\n');
     }

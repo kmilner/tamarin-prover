@@ -55,6 +55,28 @@ strip_env() {
 }
 export -f strip_env
 
+# --- per-file canonical flags (see file_flags.tsv) ---------------------------
+# flags_for echoes the extra HS/RS flags for a relpath (empty if none).
+# ckey salts the content-hash with a flags hash, so a flagged entry is a
+# DISTINCT cache key from the bare one; flagless files keep the plain
+# content-hash key → existing bare cache is untouched.
+FLAGS_MAP="${FLAGS_MAP:-$script_dir/file_flags.tsv}"
+export FLAGS_MAP
+flags_for() {
+    [ -f "$FLAGS_MAP" ] || return 0
+    awk -F'\t' -v r="$1" '!/^#/ && $1==r {print $2; exit}' "$FLAGS_MAP"
+}
+export -f flags_for
+ckey() {  # <relpath> <abs-file>
+    local h fl; h=$(sha256sum "$2" | cut -d' ' -f1); fl=$(flags_for "$1")
+    if [ -n "$fl" ]; then
+        printf '%s__f%s' "$h" "$(printf '%s' "$fl" | sha256sum | cut -c1-12)"
+    else
+        printf '%s' "$h"
+    fi
+}
+export -f ckey
+
 # --- file list (allowlist) ---
 filelist() {
     if [ -n "$ALLOWLIST" ] && [ -f "$ALLOWLIST" ]; then
@@ -68,24 +90,29 @@ filelist() {
 
 # --- Phase 1: HS ---
 hs_one() {
-    local rel="$1" f="$CORPUS_ROOT/$1" key out rc
+    local rel="$1" f="$CORPUS_ROOT/$1" key out rc fl
     [ -f "$f" ] || return 0
-    key=$(sha256sum "$f" | cut -d' ' -f1)
+    key=$(ckey "$rel" "$f"); fl=$(flags_for "$rel")
     [ -f "$CACHE/$key.full.gz" ] && return 0
     [ -f "$CACHE/$key.timeout" ] && return 0
     [ -f "$CACHE/$key.nohs" ] && return 0
+    # Record the flags this entry was generated with, so the cache is
+    # self-documenting (we don't "lose track" of what each file needs).
+    # Only for flagged files — flagless entries stay clutter-free.
+    [ -n "$fl" ] && printf '%s' "$fl" > "$CACHE/$key.flags"
     # Run HS to a temp file so we capture `timeout`'s OWN exit code (124 on
     # timeout) — piping straight into strip_env would make $? reflect grep's
     # exit, misclassifying timeouts as empty (SKIP_NO_HS).
+    # shellcheck disable=SC2086  # $fl must word-split into separate flags
     local tmp; tmp=$(mktemp)
     timeout "$FILE_TIMEOUT" "$HS_PATH" +RTS $HS_RTS -RTS \
-            --derivcheck-timeout="$DERIVCHECK_TIMEOUT" --prove "$f" >"$tmp" 2>/dev/null
+            $fl --derivcheck-timeout="$DERIVCHECK_TIMEOUT" --prove "$f" >"$tmp" 2>/dev/null
     rc=$?
     out=$(strip_env < "$tmp"); rm -f "$tmp"
     if [ "$rc" = "124" ]; then
         touch "$CACHE/$key.timeout"; echo "  HS TIMEOUT  $rel" >&2
     elif [ -z "$out" ]; then
-        touch "$CACHE/$key.nohs"; echo "  HS EMPTY!   $rel" >&2
+        touch "$CACHE/$key.nohs"; echo "  HS EMPTY!   $rel${fl:+  (flags: $fl)}" >&2
     else
         printf '%s' "$out" | gzip > "$CACHE/$key.full.gz"
     fi
@@ -94,13 +121,14 @@ export -f hs_one
 
 # --- Phase 2: RS + diff ---
 rs_one() {
-    local rel="$1" f="$CORPUS_ROOT/$1" key hs rs d rc
+    local rel="$1" f="$CORPUS_ROOT/$1" key hs rs d rc fl
     [ -f "$f" ] || { printf '%s\tSKIP_NO_HS\t0\t0\t0\n' "$rel"; return 0; }
-    key=$(sha256sum "$f" | cut -d' ' -f1)
+    key=$(ckey "$rel" "$f"); fl=$(flags_for "$rel")
     if [ -f "$CACHE/$key.timeout" ]; then printf '%s\tSKIP_HS_TIMEOUT\t0\t0\t0\n' "$rel"; return 0; fi
     if [ ! -f "$CACHE/$key.full.gz" ]; then printf '%s\tSKIP_NO_HS\t0\t0\t0\n' "$rel"; return 0; fi
+    # shellcheck disable=SC2086  # $fl must word-split into separate flags
     local tmp; tmp=$(mktemp)
-    timeout "$FILE_TIMEOUT" "$RS_PATH" --derivcheck-timeout="$DERIVCHECK_TIMEOUT" --prove "$f" >"$tmp" 2>/dev/null
+    timeout "$FILE_TIMEOUT" "$RS_PATH" $fl --derivcheck-timeout="$DERIVCHECK_TIMEOUT" --prove "$f" >"$tmp" 2>/dev/null
     rc=$?
     rs=$(strip_env < "$tmp"); rm -f "$tmp"
     if [ "$rc" = "124" ]; then printf '%s\tSKIP_RS_TIMEOUT\t0\t0\t0\n' "$rel"; return 0; fi

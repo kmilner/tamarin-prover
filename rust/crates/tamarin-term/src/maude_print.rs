@@ -101,32 +101,51 @@ pub fn replace_minus(s: &[u8]) -> Vec<u8> {
 
 /// AC operator's Maude name (with `tam` prefix).
 pub fn pp_maude_ac_sym(o: AcSym) -> Vec<u8> {
-    let mut v = FUN_SYM_PREFIX.as_bytes().to_vec();
+    let mut v = Vec::new();
+    pp_maude_ac_sym_into(o, &mut v);
+    v
+}
+
+/// Append an AC operator's Maude name directly into `buf`.
+fn pp_maude_ac_sym_into(o: AcSym, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(FUN_SYM_PREFIX.as_bytes());
     let s: &[u8] = match o {
         AcSym::Mult => MULT_SYM_STRING,
         AcSym::Union => MUN_SYM_STRING,
         AcSym::Xor => XOR_SYM_STRING,
         AcSym::NatPlus => NAT_PLUS_SYM_STRING,
     };
-    v.extend_from_slice(s);
-    v
+    buf.extend_from_slice(s);
 }
 
 /// Free symbol's Maude name.
 pub fn pp_maude_no_eq_sym(sym: &NoEqSym) -> Vec<u8> {
-    let mut v = FUN_SYM_PREFIX.as_bytes().to_vec();
-    v.extend_from_slice(fun_sym_encode_attr(sym.privacy, sym.constructability).as_bytes());
-    v.extend(replace_underscore(&sym.name));
+    let mut v = Vec::new();
+    pp_maude_no_eq_sym_into(sym, &mut v);
     v
+}
+
+/// Append a free symbol's Maude name directly into `buf`.
+fn pp_maude_no_eq_sym_into(sym: &NoEqSym, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(FUN_SYM_PREFIX.as_bytes());
+    buf.extend_from_slice(fun_sym_encode_attr(sym.privacy, sym.constructability).as_bytes());
+    // `replaceUnderscore`: map `_` -> `-`, pushed straight into `buf`.
+    buf.extend(sym.name.iter().map(|c| if *c == b'_' { b'-' } else { *c }));
 }
 
 /// C-symbol's Maude name (only `EMap`).
 pub fn pp_maude_c_sym(c: CSym) -> Vec<u8> {
+    let mut v = Vec::new();
+    pp_maude_c_sym_into(c, &mut v);
+    v
+}
+
+/// Append a C-symbol's Maude name directly into `buf`.
+fn pp_maude_c_sym_into(c: CSym, buf: &mut Vec<u8>) {
     match c {
         CSym::EMap => {
-            let mut v = FUN_SYM_PREFIX.as_bytes().to_vec();
-            v.extend_from_slice(EMAP_SYM_STRING);
-            v
+            buf.extend_from_slice(FUN_SYM_PREFIX.as_bytes());
+            buf.extend_from_slice(EMAP_SYM_STRING);
         }
     }
 }
@@ -139,6 +158,17 @@ pub fn pp_maude_c_sym(c: CSym) -> Vec<u8> {
 pub fn pp_mterm(t: &Term<MaudeLit>) -> Vec<u8> {
     let mut buf = Vec::new();
     pp_mterm_into(t, &mut buf);
+    buf
+}
+
+/// Render a `list(...)`-headed Maude term directly from a borrowed slice
+/// of elements, avoiding the `Vec`+`Arc` allocation a `Term::App(List, ..)`
+/// would require.  Byte-identical to `pp_mterm(&Term::App(FunSym::List, items))`.
+pub fn pp_mterm_list(items: &[Term<MaudeLit>]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"list(");
+    pp_list(items, &mut buf);
+    buf.push(b')');
     buf
 }
 
@@ -163,15 +193,15 @@ fn pp_mterm_into(t: &Term<MaudeLit>, buf: &mut Vec<u8>) {
         Term::App(sym, args) => {
             match sym {
                 FunSym::NoEq(s) => {
-                    buf.extend(pp_maude_no_eq_sym(s));
+                    pp_maude_no_eq_sym_into(s, buf);
                     if !args.is_empty() { pp_args(args, buf); }
                 }
                 FunSym::C(c) => {
-                    buf.extend(pp_maude_c_sym(*c));
+                    pp_maude_c_sym_into(*c, buf);
                     pp_args(args, buf);
                 }
                 FunSym::Ac(op) => {
-                    buf.extend(pp_maude_ac_sym(*op));
+                    pp_maude_ac_sym_into(*op, buf);
                     pp_args(args, buf);
                 }
                 FunSym::List => {
@@ -268,15 +298,26 @@ pub fn pp_theory(msig: &MaudeSig) -> String {
     // iterating it directly already yields the symbols deduplicated and
     // in `NoEqSym`-`Ord` order.
     for sym in &msig.st_fun_syms {
-        let name = String::from_utf8_lossy(&replace_underscore(&sym.name)).into_owned();
         let args = "Msg ".repeat(sym.arity);
         // Match HS `theoryFunSym` (Parser.hs:247) byte-for-byte:
         // `replaceUnderscore s <> " : " <> (concat $ replicate ar "Msg ") <> " -> Msg"`.
         // `args` already ends in a trailing space (or is empty), and the
         // literal " -> Msg" has a leading space, so there are two spaces
         // before `->` for arity>0 (and `name :  -> Msg` for arity 0).
-        let fsort = format!("{} : {} -> Msg", name, args);
-        op(&mut out, sym.privacy, sym.constructability, &fsort);
+        // Emit the op line piecewise so the `replaceUnderscore` name bytes go
+        // straight into `out` without a `format!`/`String::from_utf8_lossy`
+        // round-trip; the resulting bytes are identical to the `op(..)` helper.
+        out.push_str("  op ");
+        out.push_str(FUN_SYM_PREFIX);
+        out.push_str(fun_sym_encode_attr(sym.privacy, sym.constructability));
+        // `replaceUnderscore`: map `_` -> `-` (names are ASCII).
+        for b in sym.name.iter() {
+            out.push(if *b == b'_' { '-' } else { *b as char });
+        }
+        out.push_str(" : ");
+        out.push_str(&args);
+        out.push_str(" -> Msg");
+        out.push_str(" .\n");
     }
     // Rewrite rules.
     for rule in msig.rrules() {
@@ -325,9 +366,9 @@ fn emit_rrule(out: &mut String, rule: &RRule<crate::lterm::LNTerm>) {
     let lm = lterm_to_mterm_global(&rule.lhs, &mut ctx);
     let rm = lterm_to_mterm_global(&rule.rhs, &mut ctx);
     out.push_str("  eq ");
-    out.extend(String::from_utf8_lossy(&pp_mterm(&lm)).chars());
+    out.push_str(&String::from_utf8_lossy(&pp_mterm(&lm)));
     out.push_str(" = ");
-    out.extend(String::from_utf8_lossy(&pp_mterm(&rm)).chars());
+    out.push_str(&String::from_utf8_lossy(&pp_mterm(&rm)));
     out.push_str(" [variant] .\n");
 }
 

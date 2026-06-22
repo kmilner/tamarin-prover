@@ -135,10 +135,15 @@ fn expand(
     }
 }
 
-fn strip_shadowed(subst: &Subst, vs: &[p::VarSpec]) -> Subst {
+fn strip_shadowed<'a>(subst: &'a Subst, vs: &[p::VarSpec]) -> std::borrow::Cow<'a, Subst> {
+    // Common case: no binder shadows a substituted variable, so removing them
+    // would be a no-op — borrow the original instead of cloning the whole map.
+    if !vs.iter().any(|v| subst.map.contains_key(&v.name)) {
+        return std::borrow::Cow::Borrowed(subst);
+    }
     let mut out = subst.clone();
     for v in vs { out.map.remove(&v.name); }
-    out
+    std::borrow::Cow::Owned(out)
 }
 
 /// Expand the body of a quantifier, applying CAPTURE-AVOIDING
@@ -179,7 +184,7 @@ fn expand_quantified(
     collect_formula_vars(body, &mut avoid);
     for v in vs { avoid.insert(v.name.clone()); }
     let mut new_vs = vs.to_vec();
-    let mut body_subst = new_subst;
+    let mut body_subst = new_subst.into_owned();
     for v in new_vs.iter_mut() {
         if capture.contains(&v.name) {
             let fresh = fresh_name(&v.name, &avoid);

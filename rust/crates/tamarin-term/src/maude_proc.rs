@@ -14,7 +14,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use crate::lterm::LNTerm;
 use crate::maude_parse;
-use crate::maude_print::{pp_mterm, pp_theory};
+use crate::maude_print::{pp_mterm, pp_mterm_list, pp_theory};
 use crate::maude_sig::MaudeSig;
 use crate::maude_types::{
     lterm_to_mterm_global, mterm_to_lnterm, ConvCtx, MSubst, MTerm,
@@ -119,11 +119,15 @@ struct MaudeProcessInner {
     /// during a single proof.  Caching cuts those repeat round-trips.
     reduce_cache: std::collections::HashMap<LNTerm, LNTerm>,
     /// Memo for `match_eqs_const_subject` EMPTY-result queries.
-    /// Profiling on csf17/keylessssl::injectivity showed 210 k calls
-    /// to this matcher, ALL returning empty.  Many are identical
-    /// (same skolemized pattern + subject re-tried across fixpoint
-    /// passes).  Caching the empty answer is safe — no witness LVars
-    /// to renumber.  Non-empty results are NOT cached (witnesses
+    /// Historical: when this matcher was on the
+    /// `insert_implied_formulas` AC-fallback path, profiling on
+    /// csf17/keylessssl::injectivity showed 210 k calls to it, ALL
+    /// returning empty, many identical (same skolemized pattern +
+    /// subject re-tried across fixpoint passes).  That path now uses
+    /// `match_eqs_skolemize_both`, so `match_eqs_const_subject` is
+    /// test-only; the cache is retained for the tests / potential
+    /// future reuse.  Caching the empty answer is safe — no witness
+    /// LVars to renumber.  Non-empty results are NOT cached (witnesses
     /// need fresh-renaming per use, same reason `unifiable_cache`
     /// only stores booleans).
     match_empty_cache: std::collections::HashMap<(Vec<(LNTerm, LNTerm)>, Vec<(String, u64)>), ()>,
@@ -467,8 +471,9 @@ impl MaudeHandle {
     /// (called on every search step) calls it repeatedly for the same
     /// subterms.
     pub fn reduce(&self, t: &LNTerm) -> Result<LNTerm, MaudeError> {
-        {
-            let inner = self.inner.lock().unwrap();
+        let mut ctx = ConvCtx::new();
+        let (reply, sig) = {
+            let mut inner = self.inner.lock().unwrap();
             if let Some(cached) = inner.reduce_cache.get(t) {
                 return Ok(cached.clone());
             }
@@ -485,17 +490,15 @@ impl MaudeHandle {
             {
                 return Ok(t.clone());
             }
-        }
-        let mut inner = self.inner.lock().unwrap();
-        let mut ctx = ConvCtx::new();
-        let mt = lterm_to_mterm_global(t, &mut ctx);
-        let mut cmd = b"reduce ".to_vec();
-        cmd.extend(pp_mterm(&mt));
-        cmd.extend_from_slice(b" .\n");
-        let reply = inner.execute(&cmd)?;
-        inner.stats.norm_count += 1;
-        let sig = inner.sig.clone();
-        drop(inner);
+            let mt = lterm_to_mterm_global(t, &mut ctx);
+            let mut cmd = b"reduce ".to_vec();
+            cmd.extend(pp_mterm(&mt));
+            cmd.extend_from_slice(b" .\n");
+            let reply = inner.execute(&cmd)?;
+            inner.stats.norm_count += 1;
+            let sig = inner.sig.clone();
+            (reply, sig)
+        };
         let mt_back = maude_parse::parse_reduce_reply(&sig, &reply)?;
         let mut next = 0;
         let result = mterm_to_lnterm(&mt_back, &mut ctx, "z", &mut next);
@@ -560,10 +563,10 @@ impl MaudeHandle {
     /// produces a surviving Resolve2 case where xm doesn't bind to ct,
     /// missing the N6 contradiction.
     fn is_ac_free(&self) -> bool {
-        let sig = self.inner.lock().unwrap().sig.clone();
-        !sig.enable_dh && !sig.enable_xor && !sig.enable_mset
-            && !sig.enable_nat && !sig.enable_bp
-            && sig.st_rules.is_empty()
+        let g = self.inner.lock().unwrap();
+        !g.sig.enable_dh && !g.sig.enable_xor && !g.sig.enable_mset
+            && !g.sig.enable_nat && !g.sig.enable_bp
+            && g.sig.st_rules.is_empty()
     }
 
     pub fn unify_at(&self, label: &'static str, eqs: &[Equal<LNTerm>])
@@ -891,28 +894,30 @@ impl MaudeHandle {
             })
             .collect();
         // HS-faithful `flattenUnif (subst, substs) = map (composeVFresh _ subst) substs`
-        // (Unification.hs:147).  For the AC path, RS sends the FULL eqs to
-        // Maude (HS sends only AC residuals after applying local non-AC subst),
-        // so `subst` from the local non-AC factored unification is effectively
-        // empty here.  We then need `composeVFresh empty_subst arm` — which
+        // (Unification.hs:147).  For the AC path RS sends ONLY the AC residual
+        // equations to Maude (line 761) and composes each arm with the non-AC
+        // factored substitution `factored_m` (line 924), mirroring HS
+        // flattenUnif's `(subst, substs)`.  `composeVFresh factored_m arm` also
         // RENAMES the witnesses (the arm's range vars) via HS's
         // `freshToFreeAvoidingFast` uniform shift seeded by
-        // `succ (max idx in (s2=empty, s1_0=arm) domain)`.  Without this step,
-        // RS preserves the raw Maude-allocated witness idxs (e.g. ~x.39..~x.43
-        // because the per-call counter was advanced via `ensure_above(input_max)`
-        // to clear the input vars), while HS sees witnesses re-based to
-        // `~x.10..~x.14` (small idxs above just the arm's domain).
+        // `succ (max idx in (s2, s1_0=arm) domain)`, re-basing the
+        // Maude-allocated witness idxs to small idxs above just the relevant
+        // domain.  Without this composition step the witness numbering diverges.
         //
-        // Concrete divergence (LAK06::noninjectiveagreementTAG):
-        //   - HS apply_eq_store call producing 9 substs uses witness idxs
+        // Historical divergence (pre-factoring, LAK06::noninjectiveagreementTAG):
+        // when RS sent the FULL eqs to Maude and composed each arm with the
+        // EMPTY substitution, the raw Maude-allocated witness idxs leaked:
+        //   - HS apply_eq_store call producing 9 substs used witness idxs
         //     ~x.10..~x.14 for first applyBound batch (6 unifiers) and
         //     ~x.27..~x.31 for second batch (1 unifier with different eqs).
-        //   - RS produces the same 9 substs but with witnesses ~x.39..~x.43
+        //   - RS produced the same 9 substs but with witnesses ~x.39..~x.43
         //     uniformly — because the local Maude counter was ensure_above
         //     to clear x.38 in the input eqs.
         //   - The resulting BTreeSet sort order of these alpha-equivalent
-        //     substs DIFFERS, flipping the perform_split case order
+        //     substs DIFFERED, flipping the perform_split case order
         //     downstream → different `case_xor` chosen at split_case_N.
+        // Factoring (send AC residuals only, compose with `factored_m`) fixes
+        // this; the section below documents the current behavior.
         //
         // HS `flattenUnif (subst, substs) = map (`composeVFresh` subst) substs`
         // (Unification.hs:147) composes each Maude arm with `subst = m`, the
@@ -1027,11 +1032,9 @@ impl MaudeHandle {
         // Mirrors HS `matchCmd` (`Process.hs:227-229`): PATTERN on the
         // left (vars bind), SUBJECT on the right (ground).
         let pp_list = |items: &[MTerm]| -> Vec<u8> {
-            // Emit as `list( cons(t1, cons(t2, nil)) )` style by reusing
-            // pp_mterm on a constructed FunSym::List.
-            use crate::function_symbols::FunSym;
-            use crate::term::Term;
-            pp_mterm(&Term::App(FunSym::List, items.to_vec().into()))
+            // Emit as `list( cons(t1, cons(t2, nil)) )` style, formatting
+            // the borrowed slice directly without a `Vec`+`Arc` round-trip.
+            pp_mterm_list(items)
         };
         let mut cmd = b"match in MSG : ".to_vec();
         cmd.extend(pp_list(&pats));
@@ -1183,9 +1186,7 @@ impl MaudeHandle {
             t2s.push(lterm_to_mterm_global(&eq.rhs, &mut ctx));
         }
         let pp_list = |items: &[MTerm]| -> Vec<u8> {
-            use crate::function_symbols::FunSym;
-            use crate::term::Term;
-            pp_mterm(&Term::App(FunSym::List, items.to_vec().into()))
+            pp_mterm_list(items)
         };
         // Maude's `match A <=? B` finds σ with `B == σ(A)`: A is the
         // PATTERN (whose vars get bound), B is the SUBJECT (treated as
@@ -1374,9 +1375,7 @@ impl MaudeHandle {
             subjs.push(lterm_to_mterm_global(&eq.rhs, &mut ctx));
         }
         let pp_list = |items: &[MTerm]| -> Vec<u8> {
-            use crate::function_symbols::FunSym;
-            use crate::term::Term;
-            pp_mterm(&Term::App(FunSym::List, items.to_vec().into()))
+            pp_mterm_list(items)
         };
         // Maude's `match A <=? B` syntax means: find σ such that B = σ(A).
         // So A is the PATTERN (left), B is the SUBJECT (right).

@@ -119,12 +119,13 @@ pub fn var_occurrence_counts(ts: &[LNTerm]) -> BTreeMap<LVar, usize> {
 ///
 /// HS rarely hits this because its witness allocation is
 /// deterministic on `avoid_max` — alpha-equivalent inputs land on
-/// identical witness layouts.  RS's `applyBound` local unifier
-/// (maude_proc.rs:706-717) allocates witness idxs based on the
+/// identical witness layouts.  RS's bound-unifier fresh-idx
+/// reservation (maude_proc.rs:~706-717, the ensure_above/for_each_free
+/// block) allocates witness idxs based on the
 /// inner unifier's `reserve_idxs` order, which DOES diverge between
 /// alpha-equivalent inputs.  Without an alpha-invariant
 /// canonicalisation, the post-Maude `BTreeSet<LNSubstVFresh>` dedup
-/// in `apply_eq_store` (equation_store.rs:2552-2560) fails to
+/// in `apply_eq_store` (equation_store.rs:~2398-2401) fails to
 /// collapse the duplicates HS would catch via `S.fromList`
 /// (EquationStore.hs:257).
 ///
@@ -163,7 +164,7 @@ pub fn canonize_subst(s: &LNSubstVFresh) -> LNSubstVFresh {
             Term::App(_, args) => for a in args.iter() { dfs_pos(a, fp, np); }
         }
     }
-    for (_, t) in s.to_list().iter() {
+    for t in s.range() {
         dfs_pos(t, &mut first_pos, &mut next_pos);
     }
     let mut range_vars: Vec<LVar> = s.vars_range();

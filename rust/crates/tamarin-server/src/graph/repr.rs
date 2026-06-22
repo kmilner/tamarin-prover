@@ -187,8 +187,8 @@ pub fn find_connected_components<'a>(
     }
     let mut visited: BTreeSet<NodeId> = BTreeSet::new();
     let mut components: Vec<Vec<&'a GNode>> = Vec::new();
-    let by_id: BTreeMap<NodeId, &'a GNode> =
-        nodes.iter().map(|n| (n.id.clone(), *n)).collect();
+    let by_id: BTreeSet<NodeId> =
+        nodes.iter().map(|n| n.id.clone()).collect();
     for n in nodes {
         if visited.contains(&n.id) { continue; }
         let mut stack = vec![n.id.clone()];
@@ -198,7 +198,7 @@ pub fn find_connected_components<'a>(
             comp_ids.push(cur.clone());
             if let Some(neighbors) = adj.get(&cur) {
                 for nb in neighbors {
-                    if !visited.contains(nb) && by_id.contains_key(nb) {
+                    if !visited.contains(nb) && by_id.contains(nb) {
                         stack.push(nb.clone());
                     }
                 }

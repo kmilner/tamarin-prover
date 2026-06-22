@@ -18,7 +18,7 @@ type AnnotatedProc = Process<ProcessAnnotation<LVar>, SapicLVar>;
 
 /// Collect every plain `LVar` that appears in `t`'s variables.
 fn term_variables(t: &SapicTerm) -> BTreeSet<LVar> {
-    tamarin_term::vterm::vars_vterm(t)
+    tamarin_term::vterm::vars_vterm_in_order(t)
         .into_iter()
         .map(|sv| sv.var)
         .collect()
@@ -37,8 +37,8 @@ fn get_secret_channels(p: &AnnotatedProc, candidates: BTreeSet<LVar>) -> BTreeSe
         Process::Action(SapicAction::ChOut { msg, .. }, _, body)
         | Process::Action(SapicAction::Insert(_, msg), _, body) => {
             let used = term_variables(msg);
-            let next: BTreeSet<LVar> =
-                candidates.difference(&used).cloned().collect();
+            let mut next = candidates;
+            next.retain(|v| !used.contains(v));
             get_secret_channels(body, next)
         }
         Process::Action(_, _, body) => get_secret_channels(body, candidates),

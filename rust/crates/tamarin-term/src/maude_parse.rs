@@ -5,11 +5,12 @@
 
 use crate::function_symbols::{
     AcSym, Constructability, FunSym, NoEqSym, Privacy, CSym,
+    EMAP_SYM_STRING, MULT_SYM_STRING, MUN_SYM_STRING,
+    NAT_PLUS_SYM_STRING, XOR_SYM_STRING,
 };
 use crate::lterm::LSort;
 use crate::maude_print::{
-    fun_sym_decode, parse_lsort_sym, pp_maude_ac_sym, pp_maude_c_sym,
-    replace_minus, FUN_SYM_PREFIX,
+    fun_sym_decode, parse_lsort_sym, replace_minus, FUN_SYM_PREFIX,
 };
 use crate::maude_sig::MaudeSig;
 use crate::maude_types::{MSubst, MTerm, MaudeLit};
@@ -301,11 +302,13 @@ fn parse_term(msig: &MaudeSig, c: &mut Cursor) -> Result<MTerm, ParseError> {
     if ident.is_empty() {
         return Err(ParseError("empty identifier".into()));
     }
-    let ident = ident.to_vec();
+    // `ident` is borrowed from the immutable `Cursor::src` (`&'a [u8]`), so it
+    // stays valid across the recursive `parse_term` calls below; all consumers
+    // only need `&[u8]`, so no owned copy is required.
     // Three branches: `(`, `:`, or end-of-token.
     if c.eat(b'(') {
         // Could be a constant `c(123)` or a function application.
-        if let Some(s) = std::str::from_utf8(&ident).ok().and_then(parse_lsort_sym) {
+        if let Some(s) = std::str::from_utf8(ident).ok().and_then(parse_lsort_sym) {
             // constant
             let n = c.read_decimal().ok_or_else(|| ParseError("const idx".into()))?;
             if !c.eat(b')') { return Err(ParseError("expected `)` after const".into())); }
@@ -319,7 +322,7 @@ fn parse_term(msig: &MaudeSig, c: &mut Cursor) -> Result<MTerm, ParseError> {
             break;
         }
         if !c.eat(b')') { return Err(ParseError("expected `)` after args".into())); }
-        Ok(build_app(msig, &ident, args))
+        Ok(build_app(msig, ident, args))
     } else if c.eat_str(b":") {
         // Variable: `xN:Sort` — `ident` is `xN`.
         let s = parse_sort(c)?;
@@ -333,22 +336,36 @@ fn parse_term(msig: &MaudeSig, c: &mut Cursor) -> Result<MTerm, ParseError> {
         }
     } else {
         // Nullary application.
-        Ok(build_app(msig, &ident, Vec::new()))
+        Ok(build_app(msig, ident, Vec::new()))
     }
 }
 
 fn build_app(msig: &MaudeSig, ident: &[u8], args: Vec<MTerm>) -> MTerm {
-    // AC operator?
-    for op in [AcSym::Mult, AcSym::Union, AcSym::NatPlus, AcSym::Xor] {
-        if ident == pp_maude_ac_sym(op).as_slice() {
-            return crate::term::f_app_ac(op, args);
+    // AC/C operators are all `tam`-prefixed.  Strip the prefix once and
+    // compare the suffix against the (compile-time) symbol-name constants,
+    // avoiding the per-call `Vec` allocations that `pp_maude_ac_sym` /
+    // `pp_maude_c_sym` would do.  The compared bytes are exactly what those
+    // helpers would have produced (`tam` + name), so the dispatch is
+    // byte-identical; ordinary (non-`tam`) symbols short-circuit immediately.
+    if let Some(suffix) = ident.strip_prefix(FUN_SYM_PREFIX.as_bytes()) {
+        // AC operator?
+        for op in [AcSym::Mult, AcSym::Union, AcSym::NatPlus, AcSym::Xor] {
+            let name: &[u8] = match op {
+                AcSym::Mult => MULT_SYM_STRING,
+                AcSym::Union => MUN_SYM_STRING,
+                AcSym::Xor => XOR_SYM_STRING,
+                AcSym::NatPlus => NAT_PLUS_SYM_STRING,
+            };
+            if suffix == name {
+                return crate::term::f_app_ac(op, args);
+            }
         }
-    }
-    // C operator (em)?
-    // Mirror HS `fAppC EMap args` (Maude/Parser.hs:355): sort the two
-    // arguments so `em` is canonical regardless of Maude's output order.
-    if ident == pp_maude_c_sym(CSym::EMap).as_slice() {
-        return crate::term::f_app_c(CSym::EMap, args);
+        // C operator (em)?
+        // Mirror HS `fAppC EMap args` (Maude/Parser.hs:355): sort the two
+        // arguments so `em` is canonical regardless of Maude's output order.
+        if suffix == EMAP_SYM_STRING {
+            return crate::term::f_app_c(CSym::EMap, args);
+        }
     }
     // List?
     if ident == b"list" {

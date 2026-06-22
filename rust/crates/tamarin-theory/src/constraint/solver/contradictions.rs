@@ -8,6 +8,12 @@
 //! gated on `enable_dh`/`enable_bp` inside `contradictions` itself
 //! (matching HS Contradictions.hs:104,106); everything has a faithful
 //! port below.
+//!
+//! In addition to the HS-ported conditions, RS emits several RS-only
+//! soundness backstops at the IncompatibleEqs slot
+//! (`has_sort_conflated_lvars`, `has_incompatible_edge_facts`,
+//! `has_fresh_fact_sort_violation`) that have no Haskell counterpart;
+//! see the per-check note near the IncompatibleEqs push (lines ~192-209).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -151,8 +157,8 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
         }
         out.push(Contradiction::Cyclic);
     }
-    // HS-faithful enumeration ORDER (`contradictionsRaw`, Contradictions.hs:
-    // 134-165): the returned list's HEAD is the recorded reason, so the push
+    // HS-faithful enumeration ORDER (`contradictions`, Contradictions.hs:
+    // 92-113): the returned list's HEAD is the recorded reason, so the push
     // order MUST mirror HS's `asum [...]` exactly:
     //   Cyclic, SubtermCyclic, NonNormalTerms, ForbiddenKD, ImpossibleChain,
     //   ForbiddenExp, ForbiddenBP, ForbiddenChain, IncompatibleEqs,
@@ -211,7 +217,7 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
     // 10. FormulasFalse — `gfalse ∈ sFormulas` (our `Disj([])`).
     if has_false_formula(sys) { out.push(Contradiction::FormulasFalse); }
     // 11. NonInjectiveFactInstance (×n) — BEFORE NodeAfterLast, matching HS's
-    //     list concatenation order (Contradictions.hs:162 then :165).
+    //     list concatenation order (Contradictions.hs:119 then :122).
     out.extend(non_injective_fact_instances(_ctxt, sys));
     // 12. NodeAfterLast (×n).
     out.extend(node_after_last(sys));
@@ -718,17 +724,16 @@ fn has_forbidden_chain(sys: &System) -> bool {
     };
     for disj in &sys.eq_store.conj {
         for subst in &disj.substs {
-            let pairs = subst.to_list();
             // Group Msg-vars by their image's outermost function symbol.
             let mut by_head: std::collections::HashMap<
                 Vec<u8>,
                 Vec<tamarin_term::lterm::LVar>> = std::collections::HashMap::new();
-            for (v, t) in pairs {
+            for (v, t) in subst.iter() {
                 if v.sort != tamarin_term::lterm::LSort::Msg { continue; }
-                let head = match term_head_sig(&t) {
+                let head = match term_head_sig(t) {
                     Some(h) => h, None => continue,
                 };
-                by_head.entry(head).or_default().push(v);
+                by_head.entry(head).or_default().push(v.clone());
             }
             for (_, vars) in by_head {
                 if vars.len() < 2 { continue; }
@@ -1023,9 +1028,8 @@ fn has_forbidden_exp(sys: &System) -> bool {
             if !is_simple_term(g) || !all_msg_vars_known_earlier(g) { false }
             else {
                 let nfc = ni_factors(c);
-                let nfb = ni_factors(b);
                 // multiset difference: every element of nfc must appear in nfb.
-                let mut nfb_remaining = nfb.clone();
+                let mut nfb_remaining = ni_factors(b);
                 let mut all_in_b = true;
                 for x in &nfc {
                     if let Some(pos) = nfb_remaining.iter().position(|y| y == x) {
@@ -1333,8 +1337,7 @@ fn bp_ni_factors(t: &tamarin_term::lterm::LNTerm) -> Vec<tamarin_term::lterm::LN
 fn bp_factors_subset(c: &tamarin_term::lterm::LNTerm,
                      b: &tamarin_term::lterm::LNTerm) -> bool {
     let nfc = bp_ni_factors(c);
-    let nfb = bp_ni_factors(b);
-    let mut remaining = nfb.clone();
+    let mut remaining = bp_ni_factors(b);
     for x in &nfc {
         if let Some(pos) = remaining.iter().position(|y| y == x) {
             remaining.remove(pos);

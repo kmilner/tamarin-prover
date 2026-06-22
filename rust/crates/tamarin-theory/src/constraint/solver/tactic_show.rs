@@ -41,6 +41,14 @@ use crate::guarded_types::{BVar, GAtom, GFact, GTerm};
 
 /// HS `show LVar` (LTerm.hs:526-533): `sortPrefix s ++ body`.
 pub fn show_varspec(v: &p::VarSpec) -> String {
+    let mut s = String::new();
+    write_varspec(v, &mut s);
+    s
+}
+
+/// Like [`show_varspec`] but writes directly into `out`, avoiding the
+/// throwaway intermediate `String`.  Produces byte-identical output.
+fn write_varspec(v: &p::VarSpec, out: &mut String) {
     let prefix = match v.sort {
         p::SortHint::Fresh | p::SortHint::Suffix(p::SuffixSort::Fresh) => "~",
         p::SortHint::Pub | p::SortHint::Suffix(p::SuffixSort::Pub) => "$",
@@ -49,14 +57,16 @@ pub fn show_varspec(v: &p::VarSpec) -> String {
         // Msg / Untagged / Suffix(Msg) => "" (LSortMsg has no prefix).
         _ => "",
     };
-    let body = if v.name.is_empty() {
-        v.idx.to_string()
+    out.push_str(prefix);
+    if v.name.is_empty() {
+        out.push_str(&v.idx.to_string());
     } else if v.idx == 0 {
-        v.name.clone()
+        out.push_str(&v.name);
     } else {
-        format!("{}.{}", v.name, v.idx)
-    };
-    format!("{}{}", prefix, body)
+        out.push_str(&v.name);
+        out.push('.');
+        out.push_str(&v.idx.to_string());
+    }
 }
 
 // =============================================================================
@@ -81,7 +91,7 @@ fn write_gterm(t: &GTerm, out: &mut String) {
         }
         GTerm::Var(BVar::Free(v)) => {
             out.push_str("Free ");
-            out.push_str(&show_varspec(v));
+            write_varspec(v, out);
         }
         // Con (Name PubName n) -> 'n'
         GTerm::PubLit(n) => {
@@ -203,8 +213,8 @@ pub fn show_lnterm(t: &LNTerm) -> String {
 fn write_lnterm(t: &LNTerm, out: &mut String) {
     use tamarin_term::term::Term;
     match t {
-        Term::Lit(Lit::Var(v)) => out.push_str(&show_lvar(v)),
-        Term::Lit(Lit::Con(n)) => out.push_str(&show_name(n)),
+        Term::Lit(Lit::Var(v)) => write_lvar(v, out),
+        Term::Lit(Lit::Con(n)) => write_name(n, out),
         Term::App(sym, args) => match sym {
             // FApp (NoEq (s,_)) [] -> s ; FApp (NoEq (s,_)) as -> s(a,..)
             FunSym::NoEq(s) => {
@@ -265,8 +275,10 @@ fn write_lnterm(t: &LNTerm, out: &mut String) {
     }
 }
 
-/// HS `show LVar` for the typed `LVar` (LTerm.hs:526-533).
-fn show_lvar(v: &tamarin_term::lterm::LVar) -> String {
+/// HS `show LVar` for the typed `LVar` (LTerm.hs:526-533).  Writes
+/// directly into `out`, avoiding a throwaway intermediate `String`;
+/// produces byte-identical output.
+fn write_lvar(v: &tamarin_term::lterm::LVar, out: &mut String) {
     use tamarin_term::lterm::LSort;
     let prefix = match v.sort {
         LSort::Fresh => "~",
@@ -275,25 +287,30 @@ fn show_lvar(v: &tamarin_term::lterm::LVar) -> String {
         LSort::Nat => "%",
         LSort::Msg => "",
     };
-    let body = if v.name.is_empty() {
-        v.idx.to_string()
+    out.push_str(prefix);
+    if v.name.is_empty() {
+        out.push_str(&v.idx.to_string());
     } else if v.idx == 0 {
-        v.name.clone()
+        out.push_str(&v.name);
     } else {
-        format!("{}.{}", v.name, v.idx)
-    };
-    format!("{}{}", prefix, body)
+        out.push_str(&v.name);
+        out.push('.');
+        out.push_str(&v.idx.to_string());
+    }
 }
 
-/// HS `show Name` (LTerm.hs:231-235).
-fn show_name(n: &Name) -> String {
-    let body = format!("'{}'", n.id.0);
+/// HS `show Name` (LTerm.hs:231-235).  Writes directly into `out`,
+/// avoiding a throwaway intermediate `String`; byte-identical output.
+fn write_name(n: &Name, out: &mut String) {
     match n.tag {
-        NameTag::Fresh => format!("~{}", body),
-        NameTag::Pub => body,
-        NameTag::Node => format!("#{}", body),
-        NameTag::Nat => format!("%{}", body),
+        NameTag::Fresh => out.push('~'),
+        NameTag::Pub => {}
+        NameTag::Node => out.push('#'),
+        NameTag::Nat => out.push('%'),
     }
+    out.push('\'');
+    out.push_str(&n.id.0.to_string());
+    out.push('\'');
 }
 
 // =============================================================================

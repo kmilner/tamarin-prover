@@ -120,7 +120,7 @@ mod tests {
         // HS `bindingsAct` for `ChIn _ (pair y x) {}` is
         // `nub (freesSapicTerm (pair y x)) \\ S.toList {}` = `[y, x]`
         // (first-occurrence order), NOT the sorted `[x, y]`.
-        // freesSapicTerm = foldMap (:[]) (Sapic/Term.hs:131-132), nub keeps
+        // freesSapicTerm = foldMap (:[]) (Theory/Sapic/Term.hs:131-132), nub keeps
         // first-occurrence order (Sapic/Bindings.hs:24).
         use tamarin_term::builtin::pair;
         let x = slv("x");

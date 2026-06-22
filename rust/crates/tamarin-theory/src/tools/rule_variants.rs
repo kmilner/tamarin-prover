@@ -463,7 +463,7 @@ pub fn abstract_rule_and_variants(
     let abstraction_pairs: Vec<(LVar, LNTerm)> = bindings.iter()
         .map(|(t, v)| (v.clone(), t.clone()))
         .collect();
-    let abstraction_subst: LNSubst = Subst::from_list(abstraction_pairs.clone());
+    let abstraction_subst: LNSubst = Subst::from_list(abstraction_pairs);
 
     // `abstractedTerms = map snd eqsAbstr` — the ORIGINAL terms.
     let abstracted_terms: Vec<LNTerm> = bindings.keys().cloned().collect();

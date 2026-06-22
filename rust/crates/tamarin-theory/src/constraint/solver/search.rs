@@ -16,14 +16,14 @@
 //! `cutOnSolvedDFS`.
 //!
 //! Termination is bounded by the ID-DFS depth alone (`MAX_DEPTH`,
-//! doubling from 4) — `cutOnSolvedDFS` (Proof.hs:855-861) has only
+//! doubling from 4) — `cutOnSolvedDFS` (Proof.hs:854-884) has only
 //! `dMax` and no step/node budget, doubling `dMax` from 4 with no
 //! upper bound.  HS terminates because it deepens over a finite proof
 //! tree (any TERMINATING lemma's tree is finite, so once `dMax`
 //! exceeds its depth `findSolved` returns `NoSolution` and HS stops);
 //! the effective bound is the actual proof depth, tens-to-low-hundreds
 //! of single-path steps for any real lemma.  We mirror the unbounded
-//! doubling, retaining only a far-out `DEPTH_CAP` (`usize::MAX / 4`)
+//! doubling, retaining only a far-out cap (`cap = usize::MAX / 4`)
 //! as a Rust-only loop-termination guard so a genuinely
 //! non-terminating proof strategy aborts rather than overflows.  No
 //! realistic Tamarin proof approaches this cap, so it never flips a
@@ -71,7 +71,7 @@ pub enum NodeStatus {
     Sorry,
 }
 
-/// HS `ProofStatus` (Proof.hs:399-409) — the aggregate status of a WHOLE
+/// HS `ProofStatus` (Proof.hs:397-408) — the aggregate status of a WHOLE
 /// proof tree, used to decide the lemma verdict.  Unlike the per-node
 /// [`NodeStatus`], this folds over every step (HS `getProofStatus =
 /// foldMap proofStepStatus`) and therefore correctly ABSORBS verbatim
@@ -90,7 +90,7 @@ pub enum ProofStatus {
 }
 
 impl ProofStatus {
-    /// HS `ProofStatus` Semigroup (Proof.hs:411-422): precedence
+    /// HS `ProofStatus` Semigroup (Proof.hs:409-423): precedence
     /// `Invalidated > TraceFound > Incomplete > Unfinishable > Complete >
     /// Undetermined`.
     fn combine(self, other: ProofStatus) -> ProofStatus {
@@ -106,7 +106,7 @@ impl ProofStatus {
     }
 }
 
-/// HS `proofStepStatus` (Proof.hs:429-435): the status of ONE node.
+/// HS `proofStepStatus` (Proof.hs:427-433): the status of ONE node.
 /// A node with no system annotation (`annotated == false`, HS `Nothing`)
 /// is `Undetermined` REGARDLESS of its method; otherwise it is keyed on
 /// the node's own method (NOT its aggregated `NodeStatus`).
@@ -169,7 +169,9 @@ fn disable_parallel_expand() -> bool {
 /// HS-faithful: HS has NO per-lemma wall-clock deadline — its iterative
 /// deepening runs to completion.  So by DEFAULT we apply NO cutoff either
 /// (a far-future deadline that never fires); termination is still
-/// guaranteed by the ID-DFS depth cap (`MAX_DEPTH`, 2048).  A cutoff is
+/// guaranteed by the ID-DFS depth cap (`MAX_DEPTH`), doubling from 4
+/// with only the far-out `usize::MAX/4` loop-termination guard (no
+/// fixed numeric cap).  A cutoff is
 /// applied ONLY when the caller explicitly opts in via the
 /// `TAM_PROVE_DEADLINE_MS` env var (e.g. corpus sweeps that want to bound
 /// per-lemma wall time).
@@ -220,7 +222,9 @@ fn clear_deadline()                     { DEADLINE.with(|d| d.set(None));     }
 ///
 /// `max_steps` is accepted for API compatibility but is NOT used as a
 /// terminal cutoff: HS's `cutOnSolvedDFS` bounds the search purely by
-/// the ID-DFS depth `dMax` (`MAX_DEPTH`, capped 2048) and the per-lemma
+/// the ID-DFS depth `dMax` (`MAX_DEPTH`), doubling from 4 with only the
+/// far-out `usize::MAX/4` loop-termination guard (no fixed numeric cap),
+/// and the per-lemma
 /// wall-clock timeout (`deadline`).  See the `budget = usize::MAX`
 /// note in the loop body.
 ///
@@ -229,8 +233,9 @@ fn clear_deadline()                     { DEADLINE.with(|d| d.set(None));     }
 /// etc.) — matching Haskell's notion of "complete" proofs.
 ///
 /// **Iterative-deepening DFS** — port of Haskell's `cutOnSolvedDFS`
-/// (Proof.hs:855-877).  Starts at `max_depth=4` and doubles up to
-/// 2048.  At each iteration:
+/// (Proof.hs:854-884).  Starts at `max_depth=4` and doubles up with
+/// only the far-out `usize::MAX/4` loop-termination guard (no fixed
+/// numeric cap).  At each iteration:
 ///   1. Expand the tree at the current `MAX_DEPTH`.  On the first
 ///      iteration this builds the tree from scratch; on subsequent
 ///      iterations only `depth limit` Sorry leaves are re-expanded
@@ -294,7 +299,7 @@ pub fn run_proof_search(
     let mut current_max_depth: usize = 4;
     let mut root = ProofNode {
         method: ProofMethod::Sorry(Some("initial".into())),
-        sys: initial.clone(),
+        sys: initial,
         children: BTreeMap::new(),
         status: NodeStatus::Open,
         annotated: true,
@@ -348,7 +353,7 @@ pub fn run_proof_search(
     MAX_DEPTH.with(|m| m.set(usize::MAX));
     DEPTH_LIMIT_HIT.with(|f| f.set(false));
     clear_deadline();
-    // HS-faithful: `cutOnSolvedDFS` (Proof.hs:855-877) calls
+    // HS-faithful: `cutOnSolvedDFS` (Proof.hs:854-884) calls
     // `extractSolved path prf0` once a Solved leaf is found, pruning
     // the proof tree to JUST the solved-witness path.  All
     // Contradictory siblings are removed.  Without this, Rust's
@@ -580,12 +585,12 @@ fn expand_inner(
     }
     // Already terminal.
     if let Some(r) = is_finished(ctx, &node.sys) {
-        node.method = ProofMethod::Finished(r.clone());
-        node.status = match r {
+        node.status = match &r {
             MethodResult::Solved => NodeStatus::Solved,
             MethodResult::Contradictory(_) => NodeStatus::Contradictory,
             MethodResult::Unfinishable => NodeStatus::Unfinishable,
         };
+        node.method = ProofMethod::Finished(r);
         return;
     }
     if std::time::Instant::now() >= *deadline {
@@ -705,7 +710,8 @@ fn expand_inner(
     //
     // Per-child parallelism (env-opt: `TAM_RS_DISABLE_PARALLEL_EXPAND=1`
     // disables; default ON).  Mirrors HS's `parTraversable nfProofMethod`
-    // at `Theory/Proof.hs:873` inside `cutOnSolvedDFS`: HS evaluates
+    // at `Theory/Proof.hs:871` (the `nfProofMethod` helper at 871-877)
+    // inside `cutOnSolvedDFS`: HS evaluates
     // each child's proof-method/info/children in parallel via the Eval
     // monad strategy.  We do the equivalent by running each child's
     // `expand` on a rayon worker.  Faithful: case sort order, per-child
@@ -949,7 +955,7 @@ pub fn candidate_methods(
     // to Sorry whenever the top goal was un-solvable — even if a
     // lower-ranked goal could have made progress.
     //
-    // `depth` drives round-robin heuristic scheduling (ProofMethod.hs:581-589,
+    // `depth` drives round-robin heuristic scheduling (ProofMethod.hs:581-590,
     // `useHeuristic`'s `rankings !! (depth `mod` n)`).
     let goals_result = crate::constraint::solver::goals::rank_goals_with(sys, Some(ctx), depth);
     let goals = match goals_result {
