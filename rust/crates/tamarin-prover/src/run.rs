@@ -839,6 +839,21 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             let mut variants_errors: Vec<WfE> = Vec::new();
             let mut no_variant_rules: Vec<String> = Vec::new();
 
+            // `populate_rule_variants` (above) already ran
+            // `abstract_rule_and_variants` for every rule when the
+            // signature has reducible function symbols, recording its
+            // result on each `OpenProtoRule` (`abstracted_rule` is `Some`
+            // iff it returned `Ok(Some(_))`).  Reuse that result for the
+            // reducible (Maude) path of the WF "Rule has no variants"
+            // check so we don't issue a SECOND `get variants` query per
+            // rule.  When the signature has NO reducible funs,
+            // `populate_rule_variants` returned early without populating
+            // those fields, but then no rule is reducible either — the WF
+            // check takes its syntactic (no-Maude) path, so the precomputed
+            // value is never consulted.
+            let sig_has_reducible =
+                !wf_maude.maude_sig().reducible_fun_syms.is_empty();
+
             for item in &elaborated.items {
                 let TheoryItem::Rule(opr) = item else { continue };
 
@@ -851,8 +866,14 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 //
                 // Sub-check 2: "Variants mismatch" — not yet ported; no
                 // corpus files affected (see step-0 analysis).
-                if tamarin_theory::tools::rule_variants::rule_has_no_variants_for_wf(
-                    wf_maude, &opr.rule)
+                let precomputed_no_variants = if sig_has_reducible {
+                    Some(opr.abstracted_rule.is_none()
+                        && opr.variant_substs.is_empty())
+                } else {
+                    None
+                };
+                if tamarin_theory::tools::rule_variants::rule_has_no_variants_for_wf_with(
+                    wf_maude, &opr.rule, precomputed_no_variants)
                 {
                     // HS message (Wellformedness.hs:363-366):
                     //   text "Rule " <> prettyRuleName ruE <> text " has no variants."
