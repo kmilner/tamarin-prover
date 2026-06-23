@@ -78,13 +78,17 @@ ckey() {  # <relpath> <abs-file>
 export -f ckey
 
 # --- file list (allowlist) ---
+# Precedence: explicit ALLOWLIST env > committed canonical corpus
+# (scripts/parity_corpus.txt) > derive from PREV_TSV.
 filelist() {
     if [ -n "$ALLOWLIST" ] && [ -f "$ALLOWLIST" ]; then
         cat "$ALLOWLIST"
+    elif [ -f "$script_dir/parity_corpus.txt" ]; then
+        cat "$script_dir/parity_corpus.txt"
     elif [ -f "$PREV_TSV" ]; then
         cut -f1 "$PREV_TSV"
     else
-        echo "no ALLOWLIST and no $PREV_TSV to derive from" >&2; exit 2
+        echo "no ALLOWLIST, no $script_dir/parity_corpus.txt, no $PREV_TSV to derive from" >&2; exit 2
     fi
 }
 
