@@ -1060,8 +1060,19 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             // (which re-runs the setup per lemma but is more tolerant
             // of theories where elaboration fails on a subset of
             // lemmas).  Almost never hits in practice.
-            let session = tamarin_theory::prove::ProverSession::build_with_in_file(
-                &parsed, maude.clone(), file_maude_pool.clone(), in_file).ok();
+            //
+            // CLI `--heuristic`/`--oraclename`/`--oracle-only` (HS
+            // `AutoProver` via `constructAutoProver`, TheoryLoader.hs:702-706).
+            // When `--heuristic` is given it OVERRIDES the per-lemma / theory
+            // heuristic for every lemma (HS `selectHeuristic`, Proof.hs:707).
+            let cli_heuristic = tamarin_theory::prove::CliHeuristic {
+                raw: args.heuristic.clone(),
+                oracle_name: args.oracle_name.clone(),
+                oracle_only: args.oracle_only,
+            };
+            let session = tamarin_theory::prove::ProverSession::build_with_in_file_and_heuristic(
+                &parsed, maude.clone(), file_maude_pool.clone(), in_file,
+                cli_heuristic.clone()).ok();
 
             // HS prints "[Theory X] Theory closed" right after `closeTheory`
             // (TheoryLoader.hs:596) and BEFORE the proof search, which it
@@ -1103,9 +1114,9 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                         s, &lemma_name, budget),
                     (Some(s), false) => tamarin_theory::prove::check_and_extend_lemma_in_session(
                         s, &lemma_name, budget),
-                    (None, _) => tamarin_theory::prove::prove_lemma_with_pool_and_file(
+                    (None, _) => tamarin_theory::prove::prove_lemma_with_pool_file_heuristic(
                         &parsed, &lemma_name, maude.clone(),
-                        file_maude_pool.clone(), budget, in_file),
+                        file_maude_pool.clone(), budget, in_file, &cli_heuristic),
                 };
                 if dbg_timing {
                     eprintln!("[TAM_DBG_RUN_TIMING] {:>26}: {:>8.1} ms  (lemma={})",

@@ -106,11 +106,12 @@ mutex. The pool is a pure optimisation — Maude is a stateless oracle.
   stored-proof replay, and AC-modulo unification via pooled Maude.
 - **Heuristics:** smart (`s`/`S`), goal-number (`C`/`c`), injective (`i`/`I`),
   SAPiC (`p`/`P`), oracle (`o`/`O`), and `tactic:` rankings — selected by the
-  in-file `heuristic:`/`tactic:` annotation or per-lemma attribute.
-- **CLI:** `--prove`/`--lemma`, `--bound`, `--processors`, `--maude-processes`,
-  `--derivcheck-timeout`, `-D` defines, `--parse-only`, `--precompute-only`,
-  `-O/--output`, `--quiet`, `-v/--verbose`, `--quit-on-warning`; exit codes and
-  summary lines mirror HS.
+  in-file `heuristic:`/`tactic:` annotation or per-lemma attribute, or overridden
+  for every lemma by the CLI `--heuristic` (HS `selectHeuristic`).
+- **CLI:** `--prove`/`--lemma`, `--bound`, `--heuristic`, `--oraclename`,
+  `--oracle-only`, `--processors`, `--maude-processes`, `--derivcheck-timeout`,
+  `-D` defines, `--parse-only`, `--precompute-only`, `-O/--output`, `--quiet`,
+  `-v/--verbose`, `--quit-on-warning`; exit codes and summary lines mirror HS.
 - **Subcommands:** `interactive` (HTTP server), `variants` (DH intruder-rule
   dump), `test` (install self-check).
 
@@ -121,8 +122,6 @@ mutex. The pool is a pure optimisation — Maude is a stateless oracle.
   is not compiled.
 - **`diff(...)` / `--diff`** — observational-equivalence mode.
 - **`--auto-sources`** — automatic sources-lemma generation.
-- **CLI `--heuristic` / `--oraclename`** are parse-only; use the in-file
-  `heuristic:` annotation instead (fully supported, oracles included).
 - Other parse-only CLI flags: `--saturation`, `--open-chains`,
   `--partial-evaluation`, `--stop-on-trace` (RS already defaults to DFS, as HS
   does), `--replication-bound`; `--output-json`/`--output-dot` write stubs and
