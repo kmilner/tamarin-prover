@@ -26,8 +26,8 @@ only the Git-revision, compiled-at, and processing-time lines).
 
 On the comparable corpus — the theory files for which the Haskell prover
 produces a reference within the wall-clock cap — RS reproduces HS output
-**byte-for-byte**. The per-file parity gate (273 files, `--derivcheck-timeout=30`)
-stands at **197 MATCH with no proof-search or verdict (verified/falsified)
+**byte-for-byte**. The per-file parity gate (275 files, `--derivcheck-timeout=30`)
+stands at **200 MATCH with no proof-search or verdict (verified/falsified)
 divergence remaining**. Every file that still differs needs a feature not yet
 ported (`--diff` observational equivalence, SAPiC `--auto-sources`); the canonical
 HS output for those is recorded in the cache so they re-compare automatically
