@@ -1686,7 +1686,7 @@ fn try_match_all_guards(
                 let Some(subj_lnt) = crate::elaborate::term_to_lnterm(&subj_term)
                     else { return };
                 let mut struct_subst = std::collections::BTreeMap::new();
-                let struct_ok = structural_match(&pat_lnt, &subj_lnt,
+                let struct_outcome = structural_match(&pat_lnt, &subj_lnt,
                     &pattern_vars, &mut struct_subst);
                 // HS-faithful: HS's `matchTerm` (Guarded.hs:810-815)
                 // delegates to `solveMatchLTerm` → Maude, which does AC
@@ -1726,11 +1726,17 @@ fn try_match_all_guards(
                 // AC-shape mismatch.  Without this fallback the arm
                 // closes with extra `case_2`/`case_1` solves instead of
                 // HS's `by contradiction /* from formulas */`.
+                // HS `matchTerm term pat` = `solveMatchLNTerm` (Guarded.hs:
+                // 810-815): native-match first, Maude only on `ACProblem`.
+                // Mirror the 3-way dispatch exactly — `NoMatcher` returns
+                // no candidate WITHOUT a Maude round-trip (HS `[]`); only
+                // `NeedsAc` (HS `Left ACProblem`) shells out to Maude.
                 let candidates: Vec<std::collections::BTreeMap<
                     tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm>> =
-                if struct_ok {
-                    vec![struct_subst]
-                } else {
+                match struct_outcome {
+                    StructMatch::Matched => vec![struct_subst],
+                    StructMatch::NoMatcher => return,
+                    StructMatch::NeedsAc => {
                     let eqs = vec![tamarin_term::rewriting::Equal {
                         lhs: pat_lnt,
                         rhs: subj_lnt,
@@ -1740,6 +1746,7 @@ fn try_match_all_guards(
                             .map(|m| m.into_iter().collect())
                             .collect(),
                         Err(_) => return,
+                    }
                     }
                 };
                 if candidates.is_empty() { return; }
@@ -1813,31 +1820,72 @@ fn atom_has_unbound_pattern_var(
     }
 }
 
-/// Structural pattern matcher for `LNTerm`s.  Mirrors the pure
-/// portion of Haskell's `Term.Unification.matchRaw`:
+/// Outcome of `structural_match`, mirroring HS `matchRaw`'s three
+/// possible results (`Term/Unification.hs:308-337`):
 ///
-///   - If `pat` is an LVar whose (name, idx) is in `pattern_vars`,
+/// * `Matched`   — `Right ()`: the native matcher succeeded; the
+///   accumulated `subst` is the (unique) matcher.  HS returns
+///   `[substFromMap mappings]`, NO Maude call.
+/// * `NoMatcher` — `Left NoMatcher`: a structural clash (constant vs
+///   constant, head/arity mismatch, sort mismatch, a non-pattern var
+///   facing a non-identical subject, OR a pattern var already bound to
+///   a different subject).  HS returns `[]` natively, NO Maude call.
+/// * `NeedsAc`   — `Left ACProblem`: an AC-/C-headed pair appeared on
+///   BOTH sides during the recursion (`(FApp (AC _) _, FApp (AC _) _)`
+///   / `(FApp (C _) _, FApp (C _) _)`, `Unification.hs:333-334`).  Only
+///   here does HS call `matchViaMaude` on the *whole* problem.
+///
+/// CRITICAL HS-faithfulness point: an AC-/C-headed subterm under a
+/// PATTERN VARIABLE never triggers `NeedsAc` — HS checks the pattern-var
+/// arm `(_, Lit (Var vp))` FIRST (`Unification.hs:317`) and binds the
+/// var to the whole subject without inspecting its AC shape.  Likewise a
+/// function-app PATTERN facing a plain-variable SUBJECT is a `NoMatcher`
+/// (HS falls to the `_ -> throwError NoMatcher` arm), NOT an AC problem —
+/// because the AC arm requires BOTH sides AC-headed.  The previous
+/// bool-returning matcher collapsed `NoMatcher`/`NeedsAc` into `false`,
+/// and the caller then used an `any_ac_op` heuristic (does ANY AC symbol
+/// appear anywhere) to decide on a Maude round-trip — over-triggering
+/// massively (LAK06: 28 879 Maude `match`es where HS issues 0; Scott:
+/// 10 748 vs 598) whenever a structurally-failing match merely *mentioned*
+/// an AC operator.
+#[derive(Debug, PartialEq, Eq)]
+enum StructMatch {
+    Matched,
+    NoMatcher,
+    NeedsAc,
+}
+
+/// Structural pattern matcher for `LNTerm`s.  Faithful port of the
+/// pure portion of Haskell's `Term.Unification.matchRaw`
+/// (`lib/term/src/Term/Unification.hs:308-337`), returning the 3-way
+/// `StructMatch` outcome so the caller can mirror `solveMatchLTerm`'s
+/// `case runState (runExceptT match)` dispatch (`Unification.hs:209-214`)
+/// exactly — only `NeedsAc` warrants a Maude AC fallback.
+///
+///   - If `pat` is an LVar whose (name, idx) is in `pattern_vars`
+///     (a bindable universal var = HS's post-`openGuarded` `Var`),
 ///     bind it to `subj` (or check consistency with an existing
 ///     binding) — but only if the subject's sort is a subsort of
-///     the pattern var's sort.
-///   - If `pat` and `subj` are both `App` with identical heads and
-///     equal arity, recurse pairwise.
-///   - If `pat` is a non-pattern LVar, the only matching subject
-///     is the *same* LVar (treated as a constant).
-///   - Otherwise (constant vs constant, or differing shapes), fail.
+///     the pattern var's sort.  (HS `sortGeqLTerm`, `Unification.hs:320`.)
+///   - If `pat` is a non-pattern LVar (= HS `Con (SkConst _)` after
+///     `skolemizeGuarded`), it matches only the *same* literal LVar.
+///   - Constant vs constant: match iff equal.
+///   - `NoEq`/`List` app vs same: equal head + arity ⇒ recurse pairwise
+///     (left-to-right, first failure wins, like HS `sequence_ . zipWith`).
+///   - `AC`-vs-`AC` or `C`-vs-`C`: `NeedsAc` (HS `throwError ACProblem`).
+///   - Otherwise (head/arity/shape mismatch): `NoMatcher`.
 ///
-/// Returns `true` iff a matching substitution was found and recorded
-/// in `subst`.  AC matching is not handled here — it would require
-/// Maude — but the protocol-level fact arguments we match against
-/// (lemma guards) are almost never AC-shaped, so structural is
-/// sufficient for `impliedFormulas`.
+/// Left-to-right short-circuit on the FIRST failure matches HS `forM_` /
+/// `sequence_` ordering, so the first failing pair's classification
+/// (NoMatcher vs ACProblem) is the one that propagates.
 fn structural_match(
     pat: &tamarin_term::lterm::LNTerm,
     subj: &tamarin_term::lterm::LNTerm,
     pattern_vars: &std::collections::BTreeSet<(String, u64)>,
     subst: &mut std::collections::BTreeMap<
         tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm>,
-) -> bool {
+) -> StructMatch {
+    use tamarin_term::function_symbols::FunSym;
     use tamarin_term::lterm::LSort;
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
@@ -1852,7 +1900,6 @@ fn structural_match(
         )
     }
     fn term_lsort(t: &tamarin_term::lterm::LNTerm) -> LSort {
-        use tamarin_term::function_symbols::FunSym;
         match t {
             Term::Lit(Lit::Var(v)) => v.sort,
             Term::Lit(Lit::Con(n)) => match n.tag {
@@ -1867,58 +1914,74 @@ fn structural_match(
         }
     }
     match (pat, subj) {
-        // Pattern-bound var: bindable Maude var.
-        // Mirrors Haskell `matchAction` after `skolemizeGuarded` has
-        // converted free system vars into `SkConst` constants (see
-        // System.hs:1122 + Guarded.hs:741-805).
+        // Pattern-bound var: bindable Maude var.  Mirrors HS
+        // `(_, Lit (Var vp))` (`Unification.hs:317-324`) — checked
+        // FIRST, so an AC-headed subject under a pattern var is bound
+        // natively (never `NeedsAc`).  After `skolemizeGuarded`
+        // (System.hs:1122 + Guarded.hs:741-805) the universal's bound
+        // vars remain `Var`; free system vars become `SkConst`.
         (Term::Lit(Lit::Var(pv)), _)
             if pattern_vars.contains(&(pv.name.clone(), pv.idx)) =>
         {
             let subj_sort = term_lsort(subj);
-            if !sort_compatible(pv.sort, subj_sort) { return false; }
+            if !sort_compatible(pv.sort, subj_sort) { return StructMatch::NoMatcher; }
             if let Some(existing) = subst.get(pv) {
-                return existing == subj;
+                // HS `Just tp | t == tp -> () | otherwise -> NoMatcher`
+                // (Unification.hs:323-324).
+                return if existing == subj { StructMatch::Matched }
+                       else { StructMatch::NoMatcher };
             }
             if matches!(subj, Term::Lit(Lit::Var(sv)) if sv == pv) {
-                return true;
+                return StructMatch::Matched;
             }
             subst.insert(pv.clone(), subj.clone());
-            true
+            StructMatch::Matched
         }
-        // Non-pattern LVar = SkConst-equivalent: matches only the
-        // same literal LVar on the subject side.  Haskell's
-        // `skolemizeAtom` turns free LVars into `Con (SkConst v)` so
-        // they only unify with identical `SkConst`s.
-        (Term::Lit(Lit::Var(pv)), Term::Lit(Lit::Var(sv))) => pv == sv,
-        (Term::Lit(Lit::Con(pn)), Term::Lit(Lit::Con(sn))) => pn == sn,
-        (Term::App(p_sym, p_args), Term::App(s_sym, s_args)) => {
-            if p_sym != s_sym { return false; }
-            if p_args.len() != s_args.len() { return false; }
+        // Non-pattern LVar = SkConst-equivalent: matches only the same
+        // literal LVar on the subject side.  HS `skolemizeAtom` turns
+        // free LVars into `Con (SkConst v)`, so on the pattern side this
+        // is a constant — it falls into HS's `(Lit (Con _), Lit (Con _))`
+        // arm (Unification.hs:326) which matches iff equal.
+        (Term::Lit(Lit::Var(pv)), Term::Lit(Lit::Var(sv))) =>
+            if pv == sv { StructMatch::Matched } else { StructMatch::NoMatcher },
+        (Term::Lit(Lit::Con(pn)), Term::Lit(Lit::Con(sn))) =>
+            if pn == sn { StructMatch::Matched } else { StructMatch::NoMatcher },
+        // HS `(FApp (NoEq tfsym) targs, FApp (NoEq pfsym) pargs)`
+        // (Unification.hs:327-329) and the `List` arm (330-332):
+        // equal head + arity ⇒ recurse pairwise.  Note: `subj` is HS's
+        // `t` (term/subject), `pat` is HS's `p` (pattern); the head/arity
+        // guard is symmetric so the order here doesn't matter.
+        (Term::App(FunSym::NoEq(pf), p_args), Term::App(FunSym::NoEq(sf), s_args)) => {
+            if pf != sf || p_args.len() != s_args.len() { return StructMatch::NoMatcher; }
             for (pa, sa) in p_args.iter().zip(s_args.iter()) {
-                if !structural_match(pa, sa, pattern_vars, subst) {
-                    return false;
+                match structural_match(pa, sa, pattern_vars, subst) {
+                    StructMatch::Matched => {}
+                    other => return other,
                 }
             }
-            true
+            StructMatch::Matched
         }
-        _ => false,
-    }
-}
-
-/// Returns true iff any term in `eqs` is headed by an AC function symbol
-/// (`FunSym::Ac`, e.g. Union/Mult/Xor/NatPlus).  When false, the AC
-/// fallback can't produce matches that the structural matcher missed — bail.
-fn any_ac_op(eqs: &[tamarin_term::rewriting::Equal<tamarin_term::lterm::LNTerm>]) -> bool {
-    use tamarin_term::function_symbols::FunSym;
-    use tamarin_term::term::Term;
-    fn walk(t: &tamarin_term::lterm::LNTerm) -> bool {
-        match t {
-            Term::App(FunSym::Ac(_), _) => true,
-            Term::App(_, args) => args.iter().any(walk),
-            _ => false,
+        (Term::App(FunSym::List, p_args), Term::App(FunSym::List, s_args)) => {
+            if p_args.len() != s_args.len() { return StructMatch::NoMatcher; }
+            for (pa, sa) in p_args.iter().zip(s_args.iter()) {
+                match structural_match(pa, sa, pattern_vars, subst) {
+                    StructMatch::Matched => {}
+                    other => return other,
+                }
+            }
+            StructMatch::Matched
         }
+        // HS `(FApp (AC _) _, FApp (AC _) _) -> throwError ACProblem`
+        // and `(FApp (C _) _, FApp (C _) _) -> throwError ACProblem`
+        // (Unification.hs:333-334): ONLY when BOTH sides are AC-/C-headed.
+        (Term::App(FunSym::Ac(_), _), Term::App(FunSym::Ac(_), _))
+        | (Term::App(FunSym::C(_), _), Term::App(FunSym::C(_), _)) =>
+            StructMatch::NeedsAc,
+        // HS `_ -> throwError NoMatcher` (Unification.hs:337): every
+        // other constructor pairing (incl. AC-vs-NoEq, app-vs-literal,
+        // mismatched AC vs C heads).
+        _ => StructMatch::NoMatcher,
     }
-    eqs.iter().any(|e| walk(&e.lhs) || walk(&e.rhs))
 }
 
 /// Maude-backed matcher: convert the universal's pattern arguments
@@ -2009,22 +2072,32 @@ fn match_atom_via_maude(
     let mut struct_subst: std::collections::BTreeMap<
         tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm> =
         std::collections::BTreeMap::new();
-    let mut all_struct_ok = true;
+    // HS `matchTerms ms hnd` (Term/Unification.hs:209-214) folds all pairs
+    // through ONE shared `mappings` State via `forM_`, short-circuiting on
+    // the FIRST `Left`.  Mirror that: a shared `struct_subst`, stop on the
+    // first non-`Matched` outcome and remember WHICH (NoMatcher vs NeedsAc).
+    let mut outcome = StructMatch::Matched;
     for eq in &eqs {
-        if !structural_match(&eq.lhs, &eq.rhs, &pattern_vars, &mut struct_subst) {
-            all_struct_ok = false;
-            break;
+        match structural_match(&eq.lhs, &eq.rhs, &pattern_vars, &mut struct_subst) {
+            StructMatch::Matched => {}
+            other => { outcome = other; break; }
         }
     }
     let ms: Vec<Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)>> =
-    if all_struct_ok {
-        // Structural matcher yields a unique match (when it succeeds).
-        // HS's `matchRaw` succeeds with exactly one substitution per
-        // term pair when no `ACProblem` is raised — `matchTerms ms hnd`
-        // at Term/Unification.hs:209 returns `[substFromMap mappings]`,
-        // a single-element list.
-        vec![struct_subst.into_iter().collect()]
-    } else {
+    match outcome {
+        // HS `(Right (), mappings) -> [substFromMap mappings]`
+        // (Unification.hs:214): a single-element matcher list, NO Maude.
+        StructMatch::Matched => vec![struct_subst.into_iter().collect()],
+        // HS `(Left NoMatcher, _) -> []` (Unification.hs:211): the pattern
+        // structurally cannot match the subject — return empty WITHOUT any
+        // Maude round-trip.  This is the byte-for-byte equivalent of the
+        // surplus-`match`-eliminating change: HS issues 0 Maude `match`es
+        // here, so RS must too.
+        StructMatch::NoMatcher => return Vec::new(),
+        // HS `(Left ACProblem, _) -> matchViaMaude hnd sortOf matchProblem`
+        // (Unification.hs:212-213): an AC-/C-headed pair appeared on BOTH
+        // sides — only NOW shell out to Maude, on the WHOLE problem.
+        StructMatch::NeedsAc => {
         // AC-fallback: structural matcher can't handle AC-symbol
         // arguments (e.g. `exp(g, Mult(a, b))` vs
         // `exp(g, Mult(b, a))`).  HS's `matchAction` calls
@@ -2080,20 +2153,20 @@ fn match_atom_via_maude(
             eprintln!("[impl] AC-fallback for {} @ {:?}: {} eqs",
                 g_fact.name, i, eqs.len());
         }
-        // Fast path: if neither side contains any AC operator
-        // (Union/Mult/Xor/NatPlus), AC matching can't help where
-        // structural matching failed.  Skip the Maude round-trip.
-        // (Empty results are cached anyway, so the second + visit of
-        // an identical query is free — but the first visit pays the
-        // full IPC cost.  AC-free cases never need Maude.)
-        if !any_ac_op(&eqs) {
-            tamarin_term::maude_proc::_tally_callsite("ac_fallback::AC_FREE_BAIL");
-            return Vec::new();
-        }
+        // NOTE: the previous `any_ac_op(&eqs)` "does any AC symbol appear
+        // anywhere" fast-path is GONE — it was a coarse proxy that over-
+        // triggered Maude whenever a structurally-failing match merely
+        // mentioned an AC operator (e.g. a `Xor`-headed PATTERN facing a
+        // plain-variable SUBJECT, or an AC subterm under a SkConst
+        // pattern).  `structural_match` now returns the precise
+        // `NeedsAc`/`NoMatcher` distinction, so we only reach here when an
+        // AC-/C-vs-AC-/C pair was genuinely encountered — exactly HS's
+        // `Left ACProblem` branch.
         let maude_res = maude.match_eqs_skolemize_both(&eqs, &pattern_vars);
         let Ok(matches) = maude_res else { return Vec::new() };
         if matches.is_empty() { return Vec::new(); }
         matches
+        }
     };
 
     // Translate each LVar → LNTerm match back to parser-AST.

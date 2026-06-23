@@ -4125,15 +4125,23 @@ fn refine_source_case_action(
             tamarin_term::vterm::Lit::Var(renamed_abstract_node.clone())),
     ));
 
-    // Try no-AC match first, fall back to Maude on NeedsAC.
+    // HS-faithful `doMatch (faTerm matchFact faPat <> iTerm matchLVar
+    // iPat)` = `runReader (solveMatchLNTerm match) hnd` (Sources.hs:381,
+    // 414).  `solveMatchLTerm` (Term/Unification.hs:209-214) runs the
+    // native matcher and ONLY shells out to `matchViaMaude` on the
+    // `Left ACProblem` branch; a `Left NoMatcher` returns `[]` with NO
+    // Maude round-trip.  Mirror that 3-way split: native NoMatcher ⇒
+    // bail (no Maude), native match ⇒ use it, NeedsAc ⇒ Maude fallback.
     let match_pairs: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)> = {
+        use tamarin_term::unification::MatchOutcome;
         let problem = tamarin_term::rewriting::Match::DelayedMatches(pairs.clone());
-        match tamarin_term::unification::solve_match_lterm_no_ac::<
+        match tamarin_term::unification::solve_match_lterm::<
             tamarin_term::lterm::Name, _>(
             &tamarin_term::lterm::sort_of_name, problem,
         ) {
-            Some(s) => s.to_list(),
-            None => {
+            MatchOutcome::Matched(s) => s.to_list(),
+            MatchOutcome::NoMatcher => { dbg("match-empty"); return Vec::new(); }
+            MatchOutcome::NeedsAc => {
                 let match_eqs: Vec<_> = pairs.into_iter()
                     .map(|(t, p)| tamarin_term::rewriting::Equal { lhs: t, rhs: p })
                     .collect();
@@ -4858,14 +4866,19 @@ fn apply_source_case_premise(
         tamarin_term::term::Term::Lit(
             tamarin_term::vterm::Lit::Var(renamed_abstract_node.clone())),
     ));
+    // HS-faithful `doMatch` (Sources.hs:390,414) — see the action-path
+    // twin above: only the `NeedsAc` (HS `Left ACProblem`) branch shells
+    // out to Maude; `NoMatcher` returns `[]` natively.
     let match_pairs: Vec<(tamarin_term::lterm::LVar, tamarin_term::lterm::LNTerm)> = {
+        use tamarin_term::unification::MatchOutcome;
         let problem = tamarin_term::rewriting::Match::DelayedMatches(pairs.clone());
-        match tamarin_term::unification::solve_match_lterm_no_ac::<
+        match tamarin_term::unification::solve_match_lterm::<
             tamarin_term::lterm::Name, _>(
             &tamarin_term::lterm::sort_of_name, problem,
         ) {
-            Some(s) => s.to_list(),
-            None => {
+            MatchOutcome::Matched(s) => s.to_list(),
+            MatchOutcome::NoMatcher => { dbg("match-empty"); return Vec::new(); }
+            MatchOutcome::NeedsAc => {
                 let match_eqs: Vec<_> = pairs.into_iter()
                     .map(|(t, p)| tamarin_term::rewriting::Equal { lhs: t, rhs: p })
                     .collect();
