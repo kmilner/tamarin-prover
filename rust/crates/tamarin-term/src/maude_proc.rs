@@ -1018,6 +1018,25 @@ impl MaudeHandle {
         if eqs.is_empty() {
             return Ok(vec![Vec::new()]);
         }
+        // Ground-pattern short-circuit (provably equivalent to the Maude
+        // call below).  The generated MSG module declares AC/C operators
+        // `[comm assoc]` / `[comm]` and NO identity axiom
+        // (`maude_print.rs:op_ac`/`op_c`), so `match P <=? S` matches modulo
+        // AC/C only.  Here the pattern is `eq.rhs` (vars bind); when every
+        // pattern is ground there are no variables to bind, so the match
+        // succeeds with the empty substitution iff each pattern equals its
+        // subject modulo AC/C — and RS keeps AC/C terms flattened+sorted at
+        // construction (`f_app_ac`/`f_app_c`), so that is exactly structural
+        // `==`, the same canonical-form equality the solver uses for dedup.
+        // Maude returns exactly one (empty) solution or none for a ground
+        // match, so this is byte-identical.  On natural-numbers/multiset
+        // theories these ground multiset comparisons dominate and are
+        // re-issued thousands of times (gcm: ~99% of all `match` queries,
+        // ~3500x redundancy) — skipping the IPC is the bulk of the win.
+        if eqs.iter().all(|eq| crate::vterm::is_ground_vterm(&eq.rhs)) {
+            let matched = eqs.iter().all(|eq| eq.lhs == eq.rhs);
+            return Ok(if matched { vec![Vec::new()] } else { vec![] });
+        }
         let mut inner = self.inner.lock().unwrap();
         let mut ctx = ConvCtx::new();
         // `subjs` ← each `eq.lhs` (HS `t1s = a = subject`);
@@ -1297,6 +1316,38 @@ impl MaudeHandle {
         use crate::lterm::{LVar, Name};
         if eqs.is_empty() {
             return Ok(vec![Vec::new()]);
+        }
+        // Ground-pattern short-circuit (provably equivalent to the Maude
+        // call below).  The generated MSG module declares AC/C operators
+        // `[comm assoc]` / `[comm]` and NO identity axiom, so `match P <=? S`
+        // matches modulo AC/C only.  Here the pattern is `eq.lhs` and the
+        // only bindable variables are `pattern_vars` (every other var on
+        // either side is skolemized to a constant).  When no `eq.lhs`
+        // contains a `pattern_var` there is nothing to bind, so the match
+        // succeeds with the empty substitution iff each pattern equals its
+        // subject modulo AC/C.  Skolemization is a consistent var->const
+        // renaming applied to both sides, so it preserves structural
+        // equality — hence we can compare the ORIGINAL terms directly, and
+        // (canonical AC/C forms from `f_app_ac`/`f_app_c`) that equality is
+        // structural `==`.  Maude returns one (empty) solution or none for a
+        // ground match, so this is byte-identical and needs no
+        // un-skolemization (there are no bindings).
+        fn has_pattern_var(
+            t: &LNTerm,
+            pattern_vars: &std::collections::BTreeSet<(String, u64)>,
+        ) -> bool {
+            use crate::vterm::Lit;
+            match t {
+                crate::term::Term::Lit(Lit::Var(lv)) =>
+                    pattern_vars.contains(&(lv.name.clone(), lv.idx)),
+                crate::term::Term::App(_, args) =>
+                    args.iter().any(|a| has_pattern_var(a, pattern_vars)),
+                _ => false,
+            }
+        }
+        if eqs.iter().all(|eq| !has_pattern_var(&eq.lhs, pattern_vars)) {
+            let matched = eqs.iter().all(|eq| eq.lhs == eq.rhs);
+            return Ok(if matched { vec![Vec::new()] } else { vec![] });
         }
         // Step 1: collect ALL non-pattern free vars from BOTH sides.
         // The same LVar appearing on both sides must skolemize to the
