@@ -21,81 +21,75 @@ The release profile uses `lto = "fat"` and `codegen-units = 1`.
 
 ## Status
 
-The correctness target is **byte-identical raw `--prove` stdout** (stripping
-only the Git-revision, compiled-at, and processing-time lines).
+The correctness criterion is byte-identical raw `--prove` output, ignoring the
+volatile header lines (Git revision, compile time, processing time).
 
-On the comparable corpus — the theory files for which the Haskell prover
-produces a reference within the wall-clock cap — RS reproduces HS output
-**byte-for-byte**. The per-file parity gate (275 files, `--derivcheck-timeout=30`)
-stands at **200 MATCH with no proof-search or verdict (verified/falsified)
-divergence remaining**. Every file that still differs needs a feature not yet
-ported (`--diff` observational equivalence, SAPiC `--auto-sources`); the canonical
-HS output for those is recorded in the cache so they re-compare automatically
-once the feature lands. The rest are skipped because the Haskell side itself
-exceeds the cap (genuinely hard or oracle-dependent searches).
+The parity gate (`scripts/corpus_file_diff.sh`) compares the Rust port against
+the Haskell prover on a 275-file corpus: the theories under `examples/` that use
+only ported features and that Haskell proves within a 300 s/lemma cap. This
+spans `classic/`, `ake/`, `sp14/`, the `csf*/` series, `features/`, `loops/`,
+`post17/`, `regression/`, and `related_work/`.
+
+| Result | Files | Meaning |
+|--------|------:|---------|
+| MATCH | 200 | Rust output byte-identical to Haskell |
+| DIFF  |   6 | needs an unported feature (`--diff`, `--auto-sources`); HS output is cached and re-compared automatically when the feature lands |
+| SKIP  |  69 | no Haskell reference to compare against (HS exceeds the cap, or produces no/empty output) |
+
+No proof-search or verdict (verified/falsified) divergence remains. Theories
+outside the corpus require an unported frontend — SAPiC `process:`,
+observational equivalence (`--diff`), or `--auto-sources` — or exercise searches
+that Haskell itself does not finish.
 
 ## Performance
 
-RS uses a fraction of HS's peak resident memory across the board, and is faster
-in wall-clock across every representative workload at all core counts —
-including the Maude-bound bilinear-pairing proofs, where per-Maude-call IPC
-dominates and the work is essentially serial. The natural-numbers/multiset `gcm`
-proof is a strong RS win (24 s vs 42 s at one core, 9 s vs 30 s at sixteen) after
-a native ground-AC-equality match short-circuit eliminated ~500 K redundant Maude
-round-trips. Representative protocols (aarch64 Linux, 16 cores, GHC 9.6.7, Maude
-3.5.1): `NSPK3` (classic, sub-second reference), `Joux` (bilinear pairing —
-Maude-bound), `stateverif_left_right` (SAPiC), `gcm` (key-wrapping, natural-numbers
-+ multiset, deep constraint search), `wireguard` (deep proof search, few rules),
-`CCITT_X509_3` (auto-sources + stored-proof replay, heaviest):
+Wall-clock time and peak memory for both provers on six representative theories,
+proving all lemmas (`--derivcheck-timeout=30`) on aarch64 Linux (GHC 9.6.7,
+Maude 3.5.1). Haskell runs at `+RTS -N{1,4,16}`, the Rust port at
+`--processors={1,4,16}`. The theories are `NSPK3` (classic protocol), `Joux`
+(bilinear pairing), `stateverif_left_right` (SAPiC rules), `gcm` (key wrapping;
+natural-numbers and multiset), `wireguard` (deep proof search), and
+`CCITT_X509_3` (auto-sources with stored-proof replay).
 
-**1 core** — HS `+RTS -N1`, RS `--processors=1`
+**1 core**
 
-| File | HS wall | RS wall | HS peak RSS | RS peak RSS |
-|------|--------:|--------:|------------:|------------:|
-| `NSPK3.spthy` | 0.9 s | 0.5 s | 66 MB | 17 MB |
-| `Joux.spthy` | 6.6 s | 5.5 s | 252 MB | 48 MB |
-| `stateverif_left_right.spthy` | 10.5 s | 7.9 s | 825 MB | 50 MB |
-| `gcm.spthy` | 41.9 s | 24.4 s | 1336 MB | 103 MB |
-| `wireguard.spthy` | 38.7 s | 18.0 s | 1659 MB | 124 MB |
-| `CCITT_X509_3.spthy` | 143.6 s | 72.6 s | 3386 MB | 637 MB |
+| Theory | HS time | RS time | HS memory | RS memory |
+|--------|--------:|--------:|----------:|----------:|
+| `NSPK3` | 0.9 s | 0.5 s | 66 MB | 17 MB |
+| `Joux` | 6.6 s | 5.5 s | 252 MB | 48 MB |
+| `stateverif_left_right` | 10.5 s | 7.9 s | 825 MB | 50 MB |
+| `gcm` | 41.9 s | 24.4 s | 1336 MB | 103 MB |
+| `wireguard` | 38.7 s | 18.0 s | 1659 MB | 124 MB |
+| `CCITT_X509_3` | 143.6 s | 72.6 s | 3386 MB | 637 MB |
 
-**4 cores** — HS `+RTS -N4`, RS `--processors=4`
+**4 cores**
 
-| File | HS wall | RS wall | HS peak RSS | RS peak RSS |
-|------|--------:|--------:|------------:|------------:|
-| `NSPK3.spthy` | 0.4 s | 0.3 s | 96 MB | 26 MB |
-| `Joux.spthy` | 5.6 s | 5.3 s | 273 MB | 51 MB |
-| `stateverif_left_right.spthy` | 6.3 s | 5.0 s | 887 MB | 71 MB |
-| `gcm.spthy` | 31.8 s | 10.0 s | 1329 MB | 159 MB |
-| `wireguard.spthy` | 22.4 s | 11.6 s | 1652 MB | 131 MB |
-| `CCITT_X509_3.spthy` | 63.5 s | 24.0 s | 5970 MB | 672 MB |
+| Theory | HS time | RS time | HS memory | RS memory |
+|--------|--------:|--------:|----------:|----------:|
+| `NSPK3` | 0.4 s | 0.3 s | 96 MB | 26 MB |
+| `Joux` | 5.6 s | 5.3 s | 273 MB | 51 MB |
+| `stateverif_left_right` | 6.3 s | 5.0 s | 887 MB | 71 MB |
+| `gcm` | 31.8 s | 10.0 s | 1329 MB | 159 MB |
+| `wireguard` | 22.4 s | 11.6 s | 1652 MB | 131 MB |
+| `CCITT_X509_3` | 63.5 s | 24.0 s | 5970 MB | 672 MB |
 
-**16 cores** — HS `+RTS -N16`, RS `--processors=16`
+**16 cores**
 
-| File | HS wall | RS wall | HS peak RSS | RS peak RSS |
-|------|--------:|--------:|------------:|------------:|
-| `NSPK3.spthy` | 0.5 s | 0.4 s | 144 MB | 34 MB |
-| `Joux.spthy` | 6.4 s | 5.4 s | 328 MB | 62 MB |
-| `stateverif_left_right.spthy` | 6.6 s | 4.9 s | 833 MB | 96 MB |
-| `gcm.spthy` | 30.2 s | 8.8 s | 1412 MB | 239 MB |
-| `wireguard.spthy` | 21.2 s | 11.5 s | 1706 MB | 144 MB |
-| `CCITT_X509_3.spthy` | 66.5 s | 10.2 s | 8364 MB | 774 MB |
+| Theory | HS time | RS time | HS memory | RS memory |
+|--------|--------:|--------:|----------:|----------:|
+| `NSPK3` | 0.5 s | 0.4 s | 144 MB | 34 MB |
+| `Joux` | 6.4 s | 5.4 s | 328 MB | 62 MB |
+| `stateverif_left_right` | 6.6 s | 4.9 s | 833 MB | 96 MB |
+| `gcm` | 30.2 s | 8.8 s | 1412 MB | 239 MB |
+| `wireguard` | 21.2 s | 11.5 s | 1706 MB | 144 MB |
+| `CCITT_X509_3` | 66.5 s | 10.2 s | 8364 MB | 774 MB |
 
-Peak RSS is the prover **process** only — Maude runs as a separate subprocess on
-both sides and is not counted (GHC-heap vs Rust-heap). The memory gap is large
-and universal (e.g. `wireguard` ~0.15 GB vs ~1.7 GB; `CCITT_X509_3` ~0.8 GB vs
-~8.0 GB; `gcm` ~0.1–0.2 GB vs ~1.4 GB). Wall-clock scales with cores only where
-the proof parallelises — `CCITT_X509_3` drops 73 s → 10 s and `gcm` 24 s → 9 s
-(RS, 1 → 16 cores), while Maude-bound `Joux` and search-bound `wireguard` are
-largely serial and barely move. Regenerate the
-tables with `rust/scripts/bench.sh`.
-
-RS mirrors HS's `parList`/`parMap` sites with rayon (per-rule variants, source
-saturation, per-item pretty-print), backed by a pool of independent Maude
-subprocesses (`MaudePool`) so parallel calls don't serialise on one Maude IPC
-mutex. The pool is a pure optimisation — Maude is a stateless oracle.
-`--processors=N` sets the rayon worker count; `--maude-processes=M` the pool size
-(default `max(1, N/2)`).
+Memory is the maximum resident set of the prover process; Maude runs as a
+separate subprocess on both sides and is excluded. Across all theories and core
+counts the Rust port is faster and uses roughly 4–16× less memory. Parallelism
+is provided by rayon over a pool of Maude subprocesses: `--processors=N` sets the
+worker-thread count and `--maude-processes=M` (default `⌈N/2⌉`) the pool size.
+Regenerate the tables with `scripts/bench.sh`.
 
 ## Implemented
 
@@ -135,9 +129,8 @@ mutex. The pool is a pure optimisation — Maude is a stateless oracle.
   does), `--replication-bound`; `--output-json`/`--output-dot` write stubs and
   `--output-module=proverif|deepsec|…` errors.
 
-Files needing an unported feature sit outside the parity corpus; their canonical
-HS output is recorded (`scripts/file_flags.tsv`) so they re-compare the moment
-the feature lands.
+Theories using these features are tracked in `scripts/file_flags.tsv` and
+re-enter the gate automatically once the feature lands.
 
 ## Repository layout
 
@@ -156,7 +149,7 @@ scripts/
   diff_proof_raw.sh       per-lemma raw HS↔RS --prove diff (exit 0 = identical)
   corpus_file_diff.sh     per-file corpus parity gate vs cached HS → RESULTS_TSV
   file_flags.tsv          canonical per-file flags for theories needing them
-  bench.sh                RS-vs-HS wall-clock + peak-RSS tables
+  bench.sh                RS-vs-HS wall-clock + memory tables
 tests/                    cross-crate integration fixtures
 ```
 
