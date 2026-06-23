@@ -1363,6 +1363,33 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
                 crate::constraint::solver::trace::guarded_repr(&f));
         }
         red.insert_formula(f);
+        // HS-faithful DisjT fan-out: in HS, `insertImpliedFormulas`'s
+        // `applyChangeList` runs each `insertFormula implied` as a
+        // separate action inside the `Reduction = StateT (FreshT DisjT)`
+        // monad.  The moment one `insertFormula` decomposes a `GGuarded Ex`
+        // whose `EqE` `solveTermEqs SplitNow` returns multiple AC unifiers,
+        // `disjunctionOfList arms` FORKS THE ENTIRE REMAINING CONTINUATION
+        // — including the rest of this formula loop — once per arm.  Each
+        // arm therefore (re)processes the remaining implied formulas with
+        // ITS OWN eq-store binding.
+        //
+        // If we instead kept iterating after a fan-out, all remaining
+        // implied formulas would be solved (and `markAsSolved`-tagged)
+        // against arm[0]'s eq-store only; `fan_out_on_pending_eq_arms`
+        // then clones arm[0]'s `solved_formulas` into every other arm, so
+        // a later existential (e.g. the SharedKey `LessThan('1'+'1'+'1',
+        // lvl)` ⇒ `Ex z. '1'+'1'+'1'+z = lvl`) never re-fires in arms
+        // whose counter `n` binds to a value that would make it
+        // eq-store-false.  That is exactly the gcm/siv `Wrap` over-gen:
+        // the SharedKey-Lesser instance is solved while `n` is still free
+        // in arm[0] (single unifier, arm kept), but HS would have bound
+        // `n` first in the forked arm and dropped it.  Breaking here lets
+        // the drain fork the arms BEFORE the next existential is solved,
+        // so each arm re-derives the remaining implied formulas under its
+        // own binding — matching HS's per-arm continuation.
+        if !red.pending_eq_arms.is_empty() {
+            break;
+        }
     }
     red.changed = ChangeIndicator::Changed;
     ChangeIndicator::Changed
