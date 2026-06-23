@@ -14,6 +14,16 @@
 //! The variable binders use HS's names (`x`, `m`/`m1..mn`, `i`, `j`).
 
 use tamarin_parser::ast as p;
+use tamarin_term::lterm::LNTerm;
+use tamarin_term::maude_proc::MaudeHandle;
+use tamarin_term::positions::{at_pos, deepest_prot_subterm, find_pos};
+use tamarin_term::rewriting::Equal;
+use tamarin_term::term::all_prot_subterms;
+use crate::constraint::constraints::{NodeConc, NodePrem};
+use crate::constraint::system::System;
+use crate::fact::{proto_or_in_fact_view, proto_or_out_fact_view, FactTag, LNFact, Multiplicity};
+use crate::rule::{print_fact_position, print_position, rule_name_string, ExtendedPosition};
+use crate::theory::{OpenProtoRule, TheoryItem};
 
 /// Bound-variable names, matching HS's quantifier binders in
 /// `addAutoSourcesLemma` (`OpenTheory.hs:399-535`).
@@ -105,6 +115,409 @@ pub fn term_input_form_no_outputs(in_name: &str) -> p::Formula {
         vec![var("x", MSG), var("m", MSG), var("i", NODE)],
         implies(action(in_fact, var_term("i", NODE)), or_ku()),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Fact-input cases (AUTO_*_FACT) — HS `addForm (_, Right _, _)` and
+// `formulaMultArity` / `toFactsFact` (OpenTheory.hs:443-533).
+// ---------------------------------------------------------------------------
+
+/// `listOfM n` (OpenTheory.hs:380): `["m1", "m2", ..., "mn"]`.
+fn list_of_m(n: usize) -> Vec<String> {
+    (1..=n).map(|k| format!("m{}", k)).collect()
+}
+
+fn input_fact_fact_ast(name: &str, ms: &[p::VarSpec]) -> p::Fact {
+    p::Fact {
+        persistent: false,
+        name: name.to_string(),
+        args: ms.iter().map(|v| p::Term::Var(v.clone())).collect(),
+        annotations: Vec::new(),
+    }
+}
+
+/// `addForm (_, Right (_, []), _)` (OpenTheory.hs:443): no matching outputs →
+/// `∀ m1..mn i. AUTO_IN_FACT(m1..mn) @ i ⇒ ⊥`.
+fn fact_input_form_no_outputs(in_name: &str, arity: usize) -> p::Formula {
+    let ms: Vec<p::VarSpec> = list_of_m(arity).iter().map(|n| var(n, MSG)).collect();
+    let in_fact = input_fact_fact_ast(in_name, &ms);
+    let mut binders = ms;
+    binders.push(var("i", NODE));
+    forall(binders, implies(action(in_fact, var_term("i", NODE)), p::Formula::False))
+}
+
+/// `addForm (_, Right (_, outs:_), _)` (OpenTheory.hs:464): with a matching
+/// output → `∀ m1..mn i. AUTO_IN_FACT(m1..mn) @ i ⇒ toFactsFact`.
+/// `toFactsFact` (OpenTheory.hs:520): `∃ j. AUTO_OUT_FACT(m2..m{1+arity_out}?) @ j ∧ j < i`.
+fn fact_input_form_with_outputs(in_name: &str, out_name: &str, in_arity: usize, out_arity: usize) -> p::Formula {
+    let ms: Vec<p::VarSpec> = list_of_m(in_arity).iter().map(|n| var(n, MSG)).collect();
+    let in_fact = input_fact_fact_ast(in_name, &ms);
+    // toFactsFact: AUTO_OUT_FACT( listVarTerm (1 + out_arity) 2 ) — de-Bruijn
+    // Bound (1+out_arity)..Bound 2 with j=Bound 0, i=Bound 1. So the output
+    // fact references m1..m{out_arity} (the input binders), highest first.
+    let out_ms: Vec<p::Term> = (1..=out_arity).map(|k| var_term(&format!("m{}", k), MSG)).collect();
+    let out_fact = p::Fact { persistent: false, name: out_name.to_string(), args: out_ms, annotations: Vec::new() };
+    let to_facts = exists(
+        vec![var("j", NODE)],
+        and(action(out_fact, var_term("j", NODE)), less(var_term("j", NODE), var_term("i", NODE))),
+    );
+    let mut binders = ms;
+    binders.push(var("i", NODE));
+    forall(binders, implies(action(in_fact, var_term("i", NODE)), to_facts))
+}
+
+// ---------------------------------------------------------------------------
+// Discovery: walk the open chains, match inputs to outputs (OpenTheory.hs:144-538).
+// ---------------------------------------------------------------------------
+
+/// AUTO action facts (with CONCRETE rule terms) to add to a rule, plus the
+/// generated source-lemma formula.
+pub struct AutoSourcesResult {
+    /// One `(rule E-name, action fact)` group per processed chain, in chain
+    /// order; each group's facts are in HS `acts` order. HS applies
+    /// `addLabels` per chain (foldr-prepend), so the caller must too — apply
+    /// each group in order, reverse-iterating within the group and prepending.
+    pub annotation_groups: Vec<Vec<(String, LNFact)>>,
+    /// The source-lemma formula (parser AST), starting from `⊤`.
+    pub formula: p::Formula,
+}
+
+fn ac_concs(o: &OpenProtoRule) -> &[LNFact] {
+    match &o.abstracted_rule { Some(ar) => &ar.conclusions, None => &o.rule.conclusions }
+}
+fn ac_prems(o: &OpenProtoRule) -> &[LNFact] {
+    match &o.abstracted_rule { Some(ar) => &ar.premises, None => &o.rule.premises }
+}
+
+fn ln_proto(name: &str, terms: Vec<LNTerm>) -> LNFact {
+    crate::fact::proto_fact(Multiplicity::Linear, name, terms)
+}
+
+/// `t `renameAvoiding` avoid_set` (LTerm.hs): rename `t`'s vars to fresh
+/// indices that avoid those in `avoid`.
+fn rename_avoiding<T: tamarin_term::lterm::HasFrees>(t: T, avoid: &impl tamarin_term::lterm::HasFrees) -> T {
+    let mut fresh = tamarin_term::lterm::avoid(avoid);
+    tamarin_term::lterm::rename(t, &mut fresh)
+}
+
+/// One matched input together with its matching outputs.
+enum Matched {
+    /// protected-subterm input: deepest prot term, the var, matching (out-rule, out-term).
+    Term { protterm: LNTerm, vin: LNTerm, outs: Vec<(usize, LNTerm)> },
+    /// non-protected fact input: the fact, matching (out-rule, out-fact).
+    Fact { fact: LNFact, outs: Vec<(usize, LNFact)> },
+}
+
+/// Port of `addAutoSourcesLemma`'s body (OpenTheory.hs:144-538) without the
+/// theory-item plumbing: given the protocol rules and the open-chain cases,
+/// compute the rule AUTO annotations and the source-lemma formula.
+pub fn add_auto_sources_lemma(
+    maude: &MaudeHandle,
+    rules: &[OpenProtoRule],
+    chains: &[((NodeConc, NodePrem), System)],
+) -> AutoSourcesResult {
+    // allOutConcs: (rule idx, protected output subterm).
+    let mut all_out_concs: Vec<(usize, LNTerm)> = Vec::new();
+    // allOutConcsNotProt: (rule idx, non-Out conclusion fact).
+    let mut all_out_concs_not_prot: Vec<(usize, LNFact)> = Vec::new();
+    for (ri, ru) in rules.iter().enumerate() {
+        for fa in ac_concs(ru) {
+            if let Some(ts) = proto_or_out_fact_view(fa) {
+                for t in &ts {
+                    for sub in all_prot_subterms(t) {
+                        all_out_concs.push((ri, sub));
+                    }
+                }
+            }
+            if fa.tag != FactTag::Out {
+                all_out_concs_not_prot.push((ri, fa.clone()));
+            }
+        }
+    }
+
+    let mut formula = p::Formula::True;
+    let mut annotation_groups: Vec<Vec<(String, LNFact)>> = Vec::new();
+    let mut done: Vec<(String, ExtendedPosition)> = Vec::new();
+
+    for ((conc, _prem), source) in chains {
+        // v = head $ getFactTerms $ nodeConcFact conc source
+        let Some(c_rule) = source.node_rule_safe(&conc.0) else { continue };
+        let Some(conc_fact) = c_rule.conclusions.get(conc.1 .0) else { continue };
+        let Some(v) = conc_fact.terms.first().cloned() else { continue };
+
+        // unsolved premises of this source (for the fact-case guard).
+        let unsolved_prem_keys: Vec<NodePrem> =
+            source.unsolved_premises().into_iter().map(|(np, _)| np).collect();
+
+        // inputRules: for each (nodeid, pid, tidx, term) in allPrems containing v.
+        // Each element is (input-rule-idx, Left term | Right fact, position).
+        enum InRule { Term(LNTerm), Fact(LNFact) }
+        let mut input_rules: Vec<(usize, InRule, ExtendedPosition)> = Vec::new();
+        for (nodeid, pid, tidx, term) in source.all_prems() {
+            let Some(positions) = find_pos(&v, &term) else { continue };
+            let Some(rule_sys) = source.node_rule_safe(&nodeid) else { continue };
+            let sys_name = rule_name_string(rule_sys);
+            let Some((ri, rule)) = rules.iter().enumerate().find(|(_, r)| r.name() == sys_name) else { continue };
+            let Some(premise) = ac_prems(rule).get(pid.0) else { continue };
+            let Some(t_prime) = proto_or_in_fact_view(premise) else { continue };
+            let Some(t) = t_prime.get(tidx).cloned() else { continue };
+            // terms (Left): one per found position.
+            for pos in &positions {
+                input_rules.push((ri, InRule::Term(t.clone()), (pid, tidx, pos.clone())));
+            }
+            // facts (Right): proto fact + (pair|AC|msgvar) + premise unsolved.
+            let is_proto = matches!(premise.tag, FactTag::Proto(..));
+            let t_is_eligible = tamarin_term::term::is_pair(&t)
+                || tamarin_term::term::is_ac(&t)
+                || tamarin_term::lterm::is_msg_var(&t);
+            if is_proto && t_is_eligible && unsolved_prem_keys.contains(&(nodeid.clone(), pid)) {
+                for pos in &positions {
+                    input_rules.push((ri, InRule::Fact(premise.clone()), (pid, tidx, pos.clone())));
+                }
+            }
+        }
+
+        // premiseTermU: resolve Left terms to (deepest prot subterm, var).
+        enum Unify { Term(LNTerm, LNTerm), Fact(LNFact) }
+        let mut premise_term_u: Vec<(usize, Unify, ExtendedPosition)> = Vec::new();
+        for (ri, inr, pos) in input_rules {
+            match inr {
+                InRule::Term(y) => {
+                    let z = &pos.2;
+                    let Some(v_prime) = at_pos(&y, z) else { continue };
+                    let Some(prot_prime) = deepest_prot_subterm(&y, z) else { continue };
+                    if prot_prime == v_prime { continue; } // HS: skip when prot == var
+                    premise_term_u.push((ri, Unify::Term(prot_prime, v_prime), pos));
+                }
+                InRule::Fact(f) => premise_term_u.push((ri, Unify::Fact(f), pos)),
+            }
+        }
+
+        // filterFacts + matchingConclusions → inputsAndOutputs.
+        let has_subterm_case = premise_term_u.iter().any(|(_, u, _)| matches!(u, Unify::Term(..)));
+        let mut matches: Vec<(usize, Matched, ExtendedPosition)> = Vec::new();
+        for (ri, u, pos) in &premise_term_u {
+            let rin_name = rules[*ri].name().to_string();
+            match u {
+                Unify::Term(protterm, vin) => {
+                    if done.contains(&(rin_name.clone(), pos.clone())) { continue; }
+                    let mut outs: Vec<(usize, LNTerm)> = Vec::new();
+                    for (rout_i, tout) in &all_out_concs {
+                        if rules[*rout_i].name() == rin_name { continue; }
+                        let fout = rename_avoiding(tout.clone(), protterm);
+                        if maude.unifiable(&[Equal { lhs: protterm.clone(), rhs: fout }]).unwrap_or(false) {
+                            outs.push((*rout_i, tout.clone()));
+                        }
+                    }
+                    matches.push((*ri, Matched::Term { protterm: protterm.clone(), vin: vin.clone(), outs }, pos.clone()));
+                }
+                Unify::Fact(fact) => {
+                    if done.contains(&(rin_name.clone(), pos.clone())) || has_subterm_case { continue; }
+                    let mut outs: Vec<(usize, LNFact)> = Vec::new();
+                    for (rout_i, fout) in &all_out_concs_not_prot {
+                        if rules[*rout_i].name() == rin_name { continue; }
+                        if crate::fact::fact_tag_name(&fout.tag) != crate::fact::fact_tag_name(&fact.tag) { continue; }
+                        let unifout = rename_avoiding(fout.clone(), fact);
+                        if crate::rule::unifiable_ln_facts(maude, fact, &unifout).unwrap_or(false) {
+                            outs.push((*rout_i, fout.clone()));
+                        }
+                    }
+                    matches.push((*ri, Matched::Fact { fact: fact.clone(), outs }, pos.clone()));
+                }
+            }
+        }
+
+        // addFormula: foldr addForm formula matches (acc .&&. part(m)).
+        for (ri, m, pos) in matches.iter().rev() {
+            let rin_name = rules[*ri].name();
+            let part = match m {
+                Matched::Term { outs, .. } => {
+                    let in_name = format!("AUTO_IN_TERM_{}_{}", print_position(pos), rin_name);
+                    if outs.is_empty() {
+                        term_input_form_no_outputs(&in_name)
+                    } else {
+                        let out_name = format!("AUTO_OUT_TERM_{}_{}", print_position(pos), rin_name);
+                        term_input_form_with_outputs(&in_name, &out_name)
+                    }
+                }
+                Matched::Fact { fact, outs } => {
+                    let in_name = format!("AUTO_IN_FACT_{}_{}", print_fact_position(pos), rin_name);
+                    let in_arity = fact.terms.len();
+                    if outs.is_empty() {
+                        fact_input_form_no_outputs(&in_name, in_arity)
+                    } else {
+                        let out_name = format!("AUTO_OUT_FACT_{}_{}", print_fact_position(pos), rin_name);
+                        let out_arity = outs[0].1.terms.len();
+                        fact_input_form_with_outputs(&in_name, &out_name, in_arity, out_arity)
+                    }
+                }
+            };
+            formula = and(formula, part);
+        }
+
+        // addLabels + addCases (this chain's acts as one group).
+        let mut grp: Vec<(String, LNFact)> = Vec::new();
+        for (ri, m, pos) in &matches {
+            let rin_name = rules[*ri].name().to_string();
+            match m {
+                Matched::Term { protterm, vin, outs } => {
+                    let in_name = format!("AUTO_IN_TERM_{}_{}", print_position(pos), rin_name);
+                    grp.push((rin_name.clone(), ln_proto(&in_name, vec![protterm.clone(), vin.clone()])));
+                    let out_name = format!("AUTO_OUT_TERM_{}_{}", print_position(pos), rin_name);
+                    for (rout_i, tout) in outs {
+                        grp.push((rules[*rout_i].name().to_string(), ln_proto(&out_name, vec![tout.clone()])));
+                    }
+                }
+                Matched::Fact { fact, outs } => {
+                    let in_name = format!("AUTO_IN_FACT_{}_{}", print_fact_position(pos), rin_name);
+                    grp.push((rin_name.clone(), ln_proto(&in_name, fact.terms.clone())));
+                    let out_name = format!("AUTO_OUT_FACT_{}_{}", print_fact_position(pos), rin_name);
+                    for (rout_i, fout) in outs {
+                        grp.push((rules[*rout_i].name().to_string(), ln_proto(&out_name, fout.terms.clone())));
+                    }
+                }
+            }
+            done.push((rin_name, pos.clone()));
+        }
+        annotation_groups.push(grp);
+    }
+
+    AutoSourcesResult { annotation_groups, formula }
+}
+
+/// Whether any source case still has an open destruction chain
+/// (HS `containsPartialDeconstructions`, Rule.hs:180).
+pub fn contains_partial_deconstructions(chains: &[((NodeConc, NodePrem), System)]) -> bool {
+    !chains.is_empty()
+}
+
+/// Build the AUTO source lemma item (HS `unprovenLemma lemmaName [SourceLemma]
+/// AllTraces formula`, OpenTheory.hs:157).
+pub fn build_source_lemma(name: &str, formula: p::Formula) -> crate::theory::Lemma {
+    use crate::theory::{Lemma, LemmaAttr, TraceQuantifier};
+    Lemma {
+        name: name.to_string(),
+        modulo: None,
+        attributes: vec![LemmaAttr::Sources],
+        trace_quantifier: TraceQuantifier::AllTraces,
+        formula,
+        proof: crate::theory::ProofSkeleton::unproven(),
+    }
+}
+
+/// Whether the theory already contains a lemma named `name`
+/// (HS `find lemma items`, OpenTheory.hs:146).
+pub fn has_lemma_named(items: &[TheoryItem], name: &str) -> bool {
+    items.iter().any(|it| matches!(it, TheoryItem::Lemma(l) if l.name == name))
+}
+
+/// Add an AUTO action to an open proto rule's AC form. HS adds to
+/// `cprRuleAC` only (Rule.hs:1031); for a trivial-variant rule (no
+/// abstracted form) that is the rule itself, which renders as
+/// `rule (modulo E)` and propagates to its instances.
+fn add_action_to_open_rule(o: &mut OpenProtoRule, action: LNFact) {
+    if let Some(ar) = o.abstracted_rule.as_mut() {
+        ar.add_action(action.clone());
+    }
+    o.rule.add_action(action);
+}
+
+/// Add an AUTO action (as an AST fact) to a parsed rule, prepended unless
+/// already present — the parser-AST analogue of HS `addAction` used for the
+/// rendered theory.
+fn add_action_to_parsed_rule(r: &mut p::Rule, action: &p::Fact) {
+    if !r.actions.contains(action) {
+        r.actions.insert(0, action.clone());
+    }
+}
+
+/// Build the parser-AST `AUTO_typing [sources]` lemma for the rendered theory.
+fn build_parsed_source_lemma(name: &str, formula: p::Formula) -> p::Lemma {
+    p::Lemma {
+        name: name.to_string(),
+        modulo: None,
+        attributes: vec![p::LemmaAttr::Sources],
+        trace_quantifier: p::TraceQuantifier::AllTraces,
+        formula,
+        proof: None,
+    }
+}
+
+/// Apply `--auto-sources` (HS `closeTheoryWithMaude`'s autosources branch,
+/// Prover.hs:171-226).  When the raw sources contain partial deconstructions,
+/// annotate the rules with AUTO_* actions and append the `AUTO_typing` sources
+/// lemma — to BOTH the parser-AST theory (`parsed`, drives rendering) and the
+/// elaborated theory (`elaborated`, drives the prove loop and the
+/// trivial-AC-variant render check).  Returns `true` iff anything was added.
+pub fn apply_auto_sources(
+    parsed: &mut p::Theory,
+    elaborated: &mut crate::theory::Theory,
+    maude: MaudeHandle,
+    pool: Option<std::sync::Arc<tamarin_term::maude_proc::MaudePool>>,
+) -> bool {
+    use crate::constraint::solver::context::ProofContext;
+    use crate::guarded::formula_to_guarded;
+
+    // Restrictions → guarded (mirrors ProverSession::build; skip on failure).
+    let mut restrictions = Vec::new();
+    for r in elaborated.restrictions() {
+        if let Ok(g) = formula_to_guarded(&r.formula) {
+            restrictions.push(g);
+        }
+    }
+    let rules: Vec<OpenProtoRule> = elaborated.rules().cloned().collect();
+    let ctx = ProofContext::new_with_restrictions_and_pool(
+        maude.clone(), pool, rules.clone(), restrictions);
+
+    // chains = open destruction chains in the RAW source cases
+    // (HS `addAutoSourcesLemma` uses `crcRawSources`, RuleItem.hs:66).
+    let mut chains: Vec<((NodeConc, NodePrem), System)> = Vec::new();
+    for src in &ctx.full_sources {
+        for (_name, sys) in src.cases(&ctx) {
+            for ch in sys.unsolved_chains() {
+                chains.push((ch, sys.clone()));
+            }
+        }
+    }
+    if !contains_partial_deconstructions(&chains) {
+        return false;
+    }
+
+    let result = add_auto_sources_lemma(&maude, &rules, &chains);
+
+    // addLabels: add the AUTO actions to the matching rules. HS folds the
+    // per-rule act list right-to-left over `addActionClosedProtoRule`
+    // (prepend-if-absent); iterating the global list in reverse + prepend
+    // reproduces that order.  Apply to both the elaborated rule (LNFact) and
+    // the parsed rule (AST fact, for rendering).
+    for grp in &result.annotation_groups {
+        for (rule_name, action) in grp.iter().rev() {
+            for item in elaborated.items.iter_mut() {
+                if let TheoryItem::Rule(o) = item {
+                    if o.name() == rule_name {
+                        add_action_to_open_rule(o, action.clone());
+                    }
+                }
+            }
+            let ast_action = crate::pretty_theory::lnfact_to_parser(action);
+            for item in parsed.items.iter_mut() {
+                if let p::TheoryItem::Rule(r) = item {
+                    if &r.name == rule_name {
+                        add_action_to_parsed_rule(r, &ast_action);
+                    }
+                }
+            }
+        }
+    }
+
+    // Add the lemma unless one of the same name already exists — to both the
+    // elaborated theory (so the prove loop proves it) and the parsed theory
+    // (so it renders).
+    if !has_lemma_named(&elaborated.items, "AUTO_typing") {
+        elaborated.items.push(TheoryItem::Lemma(build_source_lemma("AUTO_typing", result.formula.clone())));
+        parsed.items.push(p::TheoryItem::Lemma(build_parsed_source_lemma("AUTO_typing", result.formula)));
+    }
+    true
 }
 
 #[cfg(test)]

@@ -1233,7 +1233,7 @@ fn lnfacts_to_parser(facts: &[crate::fact::LNFact]) -> Vec<p::Fact> {
     facts.iter().map(lnfact_to_parser).collect()
 }
 
-fn lnfact_to_parser(fa: &crate::fact::LNFact) -> p::Fact {
+pub(crate) fn lnfact_to_parser(fa: &crate::fact::LNFact) -> p::Fact {
     use crate::fact::FactTag;
     let (name, persistent) = match &fa.tag {
         FactTag::Proto(crate::fact::Multiplicity::Persistent, n, _) => (n.clone(), true),

@@ -1070,6 +1070,15 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 oracle_name: args.oracle_name.clone(),
                 oracle_only: args.oracle_only,
             };
+            // `--auto-sources` (HS `closeTheoryWithMaude` autosources branch,
+            // Prover.hs:171): when the raw sources contain partial
+            // deconstructions, annotate the rules with AUTO_* actions and add
+            // the `AUTO_typing` sources lemma — to the elaborated theory (so it
+            // renders + is iterated below) and the proving session alike.
+            if args.auto_sources {
+                tamarin_theory::auto_sources::apply_auto_sources(
+                    &mut parsed, &mut elaborated, maude.clone(), file_maude_pool.clone());
+            }
             let session = tamarin_theory::prove::ProverSession::build_with_in_file_and_heuristic(
                 &parsed, maude.clone(), file_maude_pool.clone(), in_file,
                 cli_heuristic.clone()).ok();
