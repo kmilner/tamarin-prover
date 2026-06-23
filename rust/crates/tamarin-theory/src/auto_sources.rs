@@ -466,24 +466,52 @@ pub fn apply_auto_sources(
         }
     }
     let rules: Vec<OpenProtoRule> = elaborated.rules().cloned().collect();
-    let ctx = ProofContext::new_with_restrictions_and_pool(
-        maude.clone(), pool, rules.clone(), restrictions);
 
-    // chains = open destruction chains in the RAW source cases
-    // (HS `addAutoSourcesLemma` uses `crcRawSources`, RuleItem.hs:66).
-    let mut chains: Vec<((NodeConc, NodePrem), System)> = Vec::new();
-    for src in &ctx.full_sources {
-        for (_name, sys) in src.cases(&ctx) {
-            for ch in sys.unsolved_chains() {
-                chains.push((ch, sys.clone()));
+    // collect open destruction chains across a context's (saturated) source
+    // cases.
+    fn collect_chains(ctx: &ProofContext) -> Vec<((NodeConc, NodePrem), System)> {
+        let mut chains = Vec::new();
+        for src in &ctx.full_sources {
+            for (_name, sys) in src.cases(ctx) {
+                for ch in sys.unsolved_chains() {
+                    chains.push((ch, sys.clone()));
+                }
             }
         }
+        chains
     }
-    if !contains_partial_deconstructions(&chains) {
+
+    // GENERATION chains: the RAW (saturated, unrefined) sources — HS
+    // `addAutoSourcesLemma` uses `crcRawSources` (RuleItem.hs:66).
+    let ctx_raw = ProofContext::new_with_restrictions_and_pool(
+        maude.clone(), pool.clone(), rules.clone(), restrictions.clone());
+    let raw_chains = collect_chains(&ctx_raw);
+
+    // TRIGGER: HS `containsPartialDeconstructions` checks the REFINED sources
+    // (crcRefinedSources, field 3) — those refined by the theory's existing
+    // `[sources]` lemmas. When such lemmas exist they can close the open
+    // chains, so the trigger is OFF even though the raw sources still have
+    // them (e.g. NSPK3 with a manual `types [sources]` lemma). Build a second
+    // context whose typing assumptions are those lemmas and check ITS chains.
+    let typing_asms: Vec<crate::guarded::Guarded> = elaborated
+        .lemmas()
+        .filter(|l| l.attributes.iter().any(|a| matches!(a, crate::theory::LemmaAttr::Sources)))
+        .filter_map(|l| formula_to_guarded(&l.formula).ok())
+        .collect();
+    let trigger = if typing_asms.is_empty() {
+        // refined == raw
+        !raw_chains.is_empty()
+    } else {
+        let mut ctx_ref = ProofContext::new_with_restrictions_and_pool(
+            maude.clone(), pool, rules.clone(), restrictions);
+        ctx_ref.typing_assumptions = typing_asms;
+        !collect_chains(&ctx_ref).is_empty()
+    };
+    if !trigger {
         return false;
     }
 
-    let result = add_auto_sources_lemma(&maude, &rules, &chains);
+    let result = add_auto_sources_lemma(&maude, &rules, &raw_chains);
 
     // addLabels: add the AUTO actions to the matching rules. HS folds the
     // per-rule act list right-to-left over `addActionClosedProtoRule`
