@@ -160,6 +160,45 @@ pub fn count_proper_subterms<A: PartialEq>(needle: &Term<A>, haystack: &Term<A>)
 }
 
 // =============================================================================
+// "Protected" subterms (auto-sources).
+// NB (HS Term.hs:235): anything but a pair or an AC symbol is "protected".
+// =============================================================================
+
+/// `True` iff the term's top symbol is an AC operator. Port of HS `isAC`
+/// (Term.hs:208).
+pub fn is_ac<A>(t: &Term<A>) -> bool {
+    matches!(t, Term::App(FunSym::Ac(_), _))
+}
+
+/// `True` iff the term is a pair `<_,_>`. Port of HS `isPair` (Term.hs:164,
+/// `viewTerm2 -> FPair _ _`): top symbol is the binary `pair` constructor.
+pub fn is_pair<A>(t: &Term<A>) -> bool {
+    match t {
+        Term::App(FunSym::NoEq(s), args) =>
+            *s == crate::function_symbols::pair_sym() && args.len() == 2,
+        _ => false,
+    }
+}
+
+/// All "protected" subterms of `t`: subterms whose top symbol is a function
+/// that is neither a pair nor an AC operator. Port of HS `allProtSubterms`
+/// (Term.hs:239) — pre-order, descending through pairs/AC operators.
+pub fn all_prot_subterms<A: Clone>(t: &Term<A>) -> Vec<Term<A>> {
+    match t {
+        Term::App(_, args) if is_pair(t) || is_ac(t) =>
+            args.iter().flat_map(|a| all_prot_subterms(a)).collect(),
+        Term::App(_, args) => {
+            let mut out = vec![t.clone()];
+            for a in args.iter() {
+                out.extend(all_prot_subterms(a));
+            }
+            out
+        }
+        Term::Lit(_) => Vec::new(),
+    }
+}
+
+// =============================================================================
 // Replacement helpers (top-down)
 // =============================================================================
 
@@ -257,6 +296,27 @@ mod tests {
     fn ac_singleton_unwrap() {
         let t = f_app_ac(AcSym::Mult, vec![nat(7)]);
         assert_eq!(t, nat(7));
+    }
+
+    #[test]
+    fn prot_subterms_descend_through_pair_and_ac() {
+        use crate::function_symbols::{Constructability, NoEqSym, Privacy};
+        let h1 = NoEqSym::new(b"h", 1, Privacy::Public, Constructability::Constructor);
+        let mk_h = |x: Term<u64>| Term::App(FunSym::NoEq(h1.clone()), vec![x].into());
+        // pair(h(1), mult(h(2), 3)): protected subterms are h(1), h(2)
+        // (descend through pair and the AC mult; bare 3 is a Lit → none).
+        let pr = Term::App(
+            FunSym::NoEq(pair_sym()),
+            vec![mk_h(nat(1)), f_app_ac(AcSym::Mult, vec![mk_h(nat(2)), nat(3)])].into(),
+        );
+        assert!(is_pair(&pr));
+        assert!(!is_ac(&pr));
+        let subs = all_prot_subterms(&pr);
+        assert_eq!(subs, vec![mk_h(nat(1)), mk_h(nat(2))]);
+        // A protected term itself: its top is returned, then its protected children.
+        assert_eq!(all_prot_subterms(&mk_h(nat(1))), vec![mk_h(nat(1))]);
+        // A bare literal has no protected subterms.
+        assert_eq!(all_prot_subterms(&nat(5)), Vec::<Term<u64>>::new());
     }
 
     #[test]

@@ -67,6 +67,15 @@ impl<I> Rule<I> {
             .then_with(|| self.actions.cmp(&other.actions))
     }
 
+    /// Add an action fact, prepended, unless already present. Port of HS
+    /// `addAction` (Rule.hs:1035): `if act elem acts then unchanged else
+    /// act:acts`.
+    pub fn add_action(&mut self, act: LNFact) {
+        if !self.actions.contains(&act) {
+            self.actions.insert(0, act);
+        }
+    }
+
     pub fn lookup_premise(&self, i: PremIdx) -> Option<&LNFact> {
         self.premises.get(i.0)
     }
