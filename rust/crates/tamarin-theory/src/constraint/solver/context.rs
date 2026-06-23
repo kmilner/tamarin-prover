@@ -547,7 +547,6 @@ impl ProofContext {
         // find the narrowed instance `msg → senc(pair(_, t), key)`
         // ⇒ `Out(t)`, leaving exists-trace lemmas that need this path
         // unprovable (e.g. T&D::Public_part_public).
-        let dbg_variants = std::env::var("TAM_DBG_VARIANTS").is_ok();
         // Pre-filter rules that can't have non-trivial variants: only
         // rules containing a *reducible* (destructor) function symbol
         // in some fact term could narrow. Skipping non-destructor
@@ -608,8 +607,6 @@ impl ProofContext {
         // variant-expanded rule set, matching HS (whose precompute runs
         // over `cprRuleAC` = the variant-expanded AC rules; Rule.hs:97,
         // Rule.hs:156).
-        let mut computed_variants: Vec<(usize, Vec<crate::rule::ProtoRuleAC>)> =
-            Vec::new();
         let mut computed_variant_substs:
             Vec<(usize, Vec<tamarin_term::subst_vfresh::LNSubstVFresh>)> = Vec::new();
         let mut computed_abstracted_rules:
@@ -635,68 +632,58 @@ impl ProofContext {
         // smart-rank tie-breaker then resolved differently.
         for (idx, o) in rules.iter().enumerate() {
             if !o.variants.is_empty() { continue; }
-            // Pre-applied variant *rules* and the abstracted-rule form
-            // only make sense when the rule has reducible-headed
-            // sub-terms — otherwise they degenerate to duplicates of the
-            // canonical rule.
+            // The pre-applied variant *rules* (the old `expand_rule_variants`
+            // path that fed `o.variants`) are DEAD for the constraint solver:
+            // the SplitG-based solving path reads only `abstracted_rule` +
+            // `variant_substs` (`canonical_rule_inst` / `rule_insts_with_constrs`,
+            // reduction.rs:2868,2895).  Their RAW `get variants` Maude query
+            // (over the un-abstracted rule structure) is the single biggest
+            // Maude cost on bilinear protocols, and its output is never read,
+            // so it is no longer computed at all.
+            //
+            // The variant substitutions and the abstracted rule are computed
+            // ONCE, HS-faithfully, by `abstract_rule_and_variants` (the
+            // `abstrRule` port: it abstracts each reducible-headed sub-term to
+            // a fresh `z_i`, queries Maude on the SMALL abstracted form, and
+            // composes the variant substs back via `composeVFresh vsubst
+            // abstractionSubst`, mirroring RuleVariants.hs:75-91).  This is
+            // exactly what `populate_rule_variants` (run.rs) already ran during
+            // theory elaboration, so when those fields are present we REUSE
+            // them rather than re-querying Maude.
             let has_reducible = rule_has_reducible(&o.rule);
             if has_reducible {
-                if let Ok(vs) = crate::tools::rule_variants::expand_rule_variants(
-                    &maude, &o.rule, &reducible_syms) {
-                    if !vs.is_empty() {
-                        if dbg_variants {
-                            eprintln!("[VARIANTS] rule={:?} expanded into {} variants",
-                                o.rule.info.name, vs.len());
-                            for (i, v) in vs.iter().enumerate() {
-                                eprintln!("  [{}] concs: {:?}", i,
-                                    v.conclusions.iter()
-                                        .map(|c| format!("{:?}={:?}", c.tag, c.terms))
-                                        .collect::<Vec<_>>());
-                            }
-                        }
-                        let lb = o.loop_breakers.clone();
-                        let mut vs = vs;
-                        for v in vs.iter_mut() {
-                            v.info.loop_breakers = lb.clone();
-                        }
-                        computed_variants.push((idx, vs));
+                // Reuse the pass-1 (`populate_rule_variants`) result when it
+                // already populated this rule; otherwise compute it here (e.g.
+                // when `ProofContext::new` is driven on rules that never went
+                // through elaboration's variant pass).  Either way the
+                // abstracted form is computed AT MOST ONCE — no RAW query.
+                if o.abstracted_rule.is_none() && o.variant_substs.is_empty() {
+                    if let Ok(Some((abstr, av_substs))) =
+                        crate::tools::rule_variants::abstract_rule_and_variants(
+                            &maude, &o.rule)
+                    {
+                        computed_abstracted_rules.push((idx, abstr, av_substs));
                     }
                 }
-            }
-            // Compute the variant substitutions in their raw form
-            // (Haskell `RuleACConstrs = Disj LNSubstVFresh`) — these
-            // will be installed as a SplitG goal at search time via
-            // `solve_rule_constraints`, mirroring Haskell's
-            // `solveRuleConstraints` (Reduction.hs:766-774).
-            //
-            // HS-faithful: ALWAYS attempt the computation, even for
-            // non-destructor rules where the result is `[emptySubstVFresh]`
-            // (`trueDisj`, RuleVariants.hs:120).  The downstream
-            // `solve_rule_constraints` path treats `Some([empty])` as a
-            // trivial-but-real Split that bumps `next_goal_nr` and lets
-            // simp's `simp_singleton` fold the disj — matching HS's
-            // `insertGoal (SplitG _) False ; simp _ _ eqs` order.
-            if let Ok(substs) = crate::tools::rule_variants::variant_substs_for_rule(
-                &maude, &o.rule) {
-                if !substs.is_empty() {
-                    computed_variant_substs.push((idx, substs));
-                }
-            }
-            // Compute the abstracted-rule + variant disjunction
-            // (Haskell-faithful `variantsProtoRule` with `abstrRule`).
-            // Reducible-headed sub-terms in the rule's facts are
-            // replaced by fresh `z_i` vars, and the variant
-            // disjunction is keyed by those.  Without this, the
-            // canonical rule's destructor restrictions fire on
-            // un-narrowed forms and contradict before the SplitG
-            // can resolve.  Only meaningful when the rule has
-            // reducible-headed sub-terms.
-            if has_reducible {
-                if let Ok(Some((abstr, av_substs))) =
-                    crate::tools::rule_variants::abstract_rule_and_variants(
-                        &maude, &o.rule)
-                {
-                    computed_abstracted_rules.push((idx, abstr, av_substs));
+            } else {
+                // Non-reducible rule: HS's `variantsProtoRule` still runs and
+                // collapses to the trivial disjunction `[emptySubstVFresh]`
+                // (`trueDisj`, RuleVariants.hs:120).  `populate_rule_variants`
+                // does NOT populate `variant_substs` for these (its
+                // `abstract_rule_and_variants` returns `None`), so compute the
+                // trivial disjunction here.  The query is over bare abstracted
+                // vars — cheap (no reducible structure to AC-narrow).  The
+                // downstream `solve_rule_constraints` path treats `Some([empty])`
+                // as a trivial-but-real Split that bumps `next_goal_nr` and lets
+                // simp's `simp_singleton` fold the disj — matching HS's
+                // `insertGoal (SplitG _) False ; simp _ _ eqs` order.
+                if o.variant_substs.is_empty() {
+                    if let Ok(substs) = crate::tools::rule_variants::variant_substs_for_rule(
+                        &maude, &o.rule) {
+                        if !substs.is_empty() {
+                            computed_variant_substs.push((idx, substs));
+                        }
+                    }
                 }
             }
         }
@@ -755,22 +742,17 @@ impl ProofContext {
         // the cases via `saturate_sources` so recursive Loop-style
         // chains fold into a finite enumeration of self-contained
         // sub-systems.
-        // Install rule variants BEFORE precompute. Haskell's precompute
-        // uses the full variant-expanded rule set so cases with chain
-        // edges across reducible-headed conclusions (like
-        // `Receiver0b → Receiver0b_check` where `verify(...) = true`)
-        // already have the variant subst applied.
-        for (idx, vs) in &computed_variants {
-            if let Some(o) = ctx.rules.get_mut(*idx) {
-                o.variants = vs.clone();
-            }
-        }
-        // Install the raw variant substitutions in their disjunction form.
-        // These are consumed by `solve_rule_constraints` at search time.
-        // The legacy pre-applied `variants` field above remains populated
-        // alongside for backward compatibility with `rule_insts_with`'s
-        // current expansion logic — callers can opt into the SplitG path
-        // by reading `variant_substs` instead.
+        // Install rule variants BEFORE precompute, so
+        // `precompute_full_sources`/`precompute_sources` see the
+        // variant-expanded (abstracted) rule set, matching HS (whose
+        // precompute runs over `cprRuleAC`; Rule.hs:97,156).
+        //
+        // Install the variant substitutions in their disjunction form.
+        // These are consumed by `solve_rule_constraints` at search time
+        // (`rule_insts_with_constrs`, reduction.rs:2895).  For reducible
+        // rules the disjunction comes from the abstracted-rule install
+        // below; for non-reducible rules it is the trivial
+        // `[emptySubstVFresh]` computed above.
         for (idx, substs) in &computed_variant_substs {
             if let Some(o) = ctx.rules.get_mut(*idx) {
                 o.variant_substs = substs.clone();

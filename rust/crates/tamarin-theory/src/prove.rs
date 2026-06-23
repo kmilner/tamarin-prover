@@ -57,44 +57,192 @@ impl std::fmt::Display for ProveError {
     }
 }
 
-/// Prepend the theory file's directory to any Oracle/OracleSmart rankings
-/// whose path is not already absolute.
+/// HS `System.FilePath.takeDirectory`: the directory portion of a path.
 ///
-/// Mirrors HS `oraclePath oracle = takeDirectory inFile </> normalise relPath`
-/// (System.hs:574-575, Parser.hs:304).  NOTE: HS's `normalise relPath`
-/// (`System.FilePath.normalise`) collapses `.` and redundant separators
-/// (NOT `..`); we skip that, directory-prefixing via `std::path::Path::join`
-/// (purely lexical, leaves `./` and `a/b/../c` as-is).  That only affects the
-/// literal exec-path string, not which file is run — the path is consumed by
-/// `Command::new` (oracle exec), never printed into `--prove` output, and the
-/// OS resolves a leading `./` identically — so the difference is unobservable.
+/// Crucially, HS returns `"."` (NOT `""`) for a path with no directory
+/// component (e.g. `takeDirectory "foo.spthy" == "."`), and drops a trailing
+/// slash from the directory (e.g. `takeDirectory "a/b" == "a"`).  Rust's
+/// `Path::parent()` returns `Some("")` for a no-dir path, which — when later
+/// joined and handed to `Command::new` — produces a path with NO `/`
+/// (e.g. `"foo.oracle"`), which Unix `exec` treats as a PATH lookup rather
+/// than a CWD-relative file.  HS's `"." </> "foo.oracle" == "./foo.oracle"`
+/// execs from the CWD.  Mirroring `takeDirectory`'s `"."` here is what makes
+/// the oracle path exec-faithful (Parser.hs:304 `workDir = takeDirectory inFile`).
+fn hs_take_directory(path: &str) -> String {
+    match path.rfind('/') {
+        // Strip the final segment.  HS keeps any leading run so e.g.
+        // `takeDirectory "/a/b" == "/a"`, `takeDirectory "a/b" == "a"`.
+        // A path like `"a/"` → `"a"`.  Collapse a bare `""` (root-only
+        // e.g. `"/foo"` → `"/"`) per HS (`takeDirectory "/foo" == "/"`).
+        Some(0) => "/".to_string(),
+        Some(i) => path[..i].to_string(),
+        None => ".".to_string(),
+    }
+}
+
+/// HS `System.FilePath.</>`: join two path components with a single `/`,
+/// but if the right side is absolute it REPLACES the left (HS semantics).
+/// We only ever call this with a non-absolute right side (absolute relPaths
+/// short-circuit at the caller), so the simple join suffices; we still guard
+/// the absolute case to stay faithful.  An empty left side yields the right
+/// side unchanged (HS `"" </> b == b`).
+fn hs_combine(a: &str, b: &str) -> String {
+    if b.starts_with('/') {
+        return b.to_string();
+    }
+    if a.is_empty() {
+        return b.to_string();
+    }
+    if a.ends_with('/') {
+        format!("{}{}", a, b)
+    } else {
+        format!("{}/{}", a, b)
+    }
+}
+
+/// Resolve an oracle ranking's relPath against a workDir, mirroring HS
+/// `oraclePath oracle = fromMaybe "." workDir </> normalise relPath`
+/// (System.hs:574-575).  `work_dir` is `Some(dir)` for the in-file heuristic
+/// (= `takeDirectory inFile`, Parser.hs:304) or `None` for the CLI
+/// heuristic (HS `defaultOracle = Oracle Nothing Nothing` ⇒ `fromMaybe "."`).
+/// NOTE: HS's `normalise` collapses `.` and redundant separators (not `..`);
+/// we apply a minimal `normalise` matching the cases that affect the leading
+/// `./` (the only part the OS exec distinguishes between PATH-lookup and
+/// CWD-relative).
+fn resolve_oracle_path(oracle_path: &str, work_dir: Option<&str>) -> String {
+    let p = std::path::Path::new(oracle_path);
+    if p.is_absolute() {
+        return oracle_path.to_string();
+    }
+    let wd = work_dir.unwrap_or(".");
+    hs_combine(wd, oracle_path)
+}
+
+/// Prepend the theory file's directory to any Oracle/OracleSmart rankings
+/// whose path is not already absolute.  Used for the IN-FILE `heuristic:`
+/// block whose oracle workDir is `takeDirectory inFile` (Parser.hs:304).
+///
+/// Mirrors HS `oraclePath oracle = fromMaybe "." workDir </> normalise relPath`
+/// (System.hs:574-575) with `workDir = takeDirectory inFile`.  Producing the
+/// `"."`-for-no-dir prefix (via [`hs_take_directory`]) is what gives the
+/// oracle path its leading `./` so Unix `exec` resolves it from the CWD rather
+/// than doing a PATH lookup.
 fn prepend_theory_dir_to_oracle_paths(
-    rankings: &mut Vec<crate::constraint::solver::goals::GoalRanking>,
+    rankings: &mut [crate::constraint::solver::goals::GoalRanking],
     in_file: &str,
 ) {
     use crate::constraint::solver::goals::GoalRanking;
-    let work_dir = std::path::Path::new(in_file).parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let work_dir = hs_take_directory(in_file);
     for r in rankings.iter_mut() {
         match r {
             GoalRanking::Oracle { oracle_path, .. }
             | GoalRanking::OracleSmart { oracle_path, .. } => {
-                let p = std::path::Path::new(oracle_path.as_str());
-                if !p.is_absolute() {
-                    let resolved = work_dir.join(p);
-                    // Directory-prefix only — `Path::join` is lexical and
-                    // leaves `./` and `../` as-is.  HS `normalise` would drop
-                    // a leading `./` and collapse redundant separators (but
-                    // not `..`); the difference is exec-string-only and the OS
-                    // resolves it identically, so it is unobservable.
-                    let resolved = resolved.to_string_lossy().to_string();
-                    *oracle_path = resolved;
+                *oracle_path = resolve_oracle_path(oracle_path, Some(&work_dir));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The CLI-supplied heuristic / oracle flags, carried verbatim from the
+/// command line.  Mirrors the `AutoProver` fields populated by HS
+/// `constructAutoProver` (TheoryLoader.hs:702-706) from `thyOpts`:
+///   * `raw`         = `--heuristic` ranking string (`apDefaultHeuristic`)
+///   * `oracle_name` = `--oraclename` (`Just "" -> Nothing`, TheoryLoader.hs:310)
+///   * `oracle_only` = `--oracle-only` (`quitOnEmptyOracle`)
+///
+/// `None` for any field means the flag was absent.  This whole struct is
+/// `None` on `ProverSession`/the prove entry points when `--heuristic` was
+/// not given, in which case the per-lemma / theory heuristic is used unchanged
+/// (HS `selectHeuristic`: `apDefaultHeuristic <|> pcHeuristic`, Proof.hs:707).
+#[derive(Debug, Clone, Default)]
+pub struct CliHeuristic {
+    /// `--heuristic` raw ranking string (e.g. `"O"`, `"s1Ss"`).  When
+    /// `Some`, this OVERRIDES the per-lemma / theory `heuristic:` (HS
+    /// `apDefaultHeuristic prover <|> L.get pcHeuristic ctx`, Proof.hs:708).
+    pub raw: Option<String>,
+    /// `--oraclename` — sets the oracle relPath for EVERY oracle ranking in
+    /// the CLI heuristic (HS `mapOracleRanking (maybeSetOracleRelPath
+    /// oraclename)`, TheoryLoader.hs:305).  `Just ""` parses to `None`.
+    pub oracle_name: Option<String>,
+    /// `--oracle-only` — sets `quitOnEmpty` on every oracle / tactic ranking
+    /// in the selected heuristic (HS `setQuitOnEmpty`, Proof.hs:712-716).
+    pub oracle_only: bool,
+}
+
+/// Resolve the CLI `--heuristic`/`--oraclename` into a `GoalRanking` list,
+/// mirroring HS's CLI heuristic pipeline:
+///
+///   1. `filterHeuristic diff rawRankings` — parse the ranking string char
+///      by char (System.hs:680-684).  RS `parse_heuristic_str_with_tactics`.
+///   2. `map (mapOracleRanking (maybeSetOracleRelPath oraclename))` — set the
+///      oracle relPath from `--oraclename` (TheoryLoader.hs:305).
+///   3. `defaultOracleNames srcThyInFileName` (TheoryLoader.hs:646) — fill any
+///      oracle ranking that STILL has no relPath with the default `.oracle`
+///      name (theory-basename `.oracle` if it exists on disk, else `"oracle"`).
+///   4. `oraclePath = fromMaybe "." workDir </> normalise relPath`
+///      (System.hs:574-575).  The CLI heuristic's `defaultOracle = Oracle
+///      Nothing Nothing` (System.hs:548) has workDir `Nothing` ⇒ `"."`, so
+///      its oracle exec path is CWD-relative (`./<name>`), NOT theory-dir
+///      relative (unlike the in-file heuristic).
+///   5. `setQuitOnEmpty` (Proof.hs:712-716) — `--oracle-only` sets
+///      `quitOnEmpty` on every oracle / tactic ranking.
+fn resolve_cli_heuristic(
+    cli: &CliHeuristic,
+    in_file: &str,
+    tactics: &[crate::tactic::Tactic],
+) -> Option<Vec<crate::constraint::solver::goals::GoalRanking>> {
+    use crate::constraint::solver::goals::GoalRanking;
+    let raw = cli.raw.as_ref()?;
+    // Step 1: parse the ranking string.  `parse_heuristic_str_with_tactics`
+    // also computes the default `.oracle` name (HS `defaultOracleNames`) for
+    // oracle rankings without an inline `"path"` — which covers BOTH HS step 2
+    // (oraclename, applied below) and step 3 (default name).  We post-process
+    // to (a) override the parsed default with `--oraclename` where given, and
+    // (b) resolve every relPath against workDir `"."` (CLI-heuristic workDir).
+    let mut rankings = crate::constraint::solver::goals::parse_heuristic_str_with_tactics(
+        raw, in_file, tactics);
+    // The CLI `--oraclename` (`Just "" -> Nothing`, TheoryLoader.hs:310).
+    let oraclename: Option<&str> = match cli.oracle_name.as_deref() {
+        Some("") => None,
+        other => other,
+    };
+    // Default `.oracle` name (HS `defaultOracleNames`) for oracle rankings
+    // that carried no inline `"path"` AND get no `--oraclename`.
+    let default_name = crate::pretty_theory::oracle_name_for_theory(in_file);
+    for r in rankings.iter_mut() {
+        match r {
+            GoalRanking::Oracle { oracle_path, quit_on_empty }
+            | GoalRanking::OracleSmart { oracle_path, quit_on_empty } => {
+                // Step 2/3: relPath = --oraclename if given, else the default
+                // name (the parser already filled the default name, but for a
+                // bare `O`/`o` from the CLI string it set the default — so we
+                // only OVERRIDE when --oraclename is present; if --oraclename
+                // is absent, the parser's default-name value stands).
+                if let Some(name) = oraclename {
+                    *oracle_path = name.to_string();
+                } else if oracle_path.is_empty() {
+                    *oracle_path = default_name.clone();
+                }
+                // Step 4: workDir = "." for the CLI heuristic (Oracle Nothing).
+                *oracle_path = resolve_oracle_path(oracle_path, None);
+                // Step 5: --oracle-only quitOnEmpty (Proof.hs:713-714).
+                if cli.oracle_only {
+                    *quit_on_empty = true;
+                }
+            }
+            // Step 5: --oracle-only also sets quitOnEmpty on tactic rankings
+            // (HS `aux (InternalTacticRanking _ t) = InternalTacticRanking
+            // (quitOnEmptyOracle prover) t`, Proof.hs:715).
+            GoalRanking::Tactic { quit_on_empty, .. } => {
+                if cli.oracle_only {
+                    *quit_on_empty = true;
                 }
             }
             _ => {}
         }
     }
+    Some(rankings)
 }
 
 /// One theory-level cache entry of refined source cases — the result of
@@ -147,6 +295,10 @@ pub struct ProverSession {
     /// Elaborated typed theory.  Used to look up lemmas, restrictions,
     /// rules, heuristic.  Constructed once.
     pub theory: crate::theory::Theory,
+    /// CLI `--heuristic`/`--oraclename`/`--oracle-only` (HS `AutoProver`
+    /// fields).  When `cli_heuristic.raw` is `Some`, it OVERRIDES the per-lemma
+    /// / theory heuristic for EVERY lemma (HS `selectHeuristic`, Proof.hs:707).
+    cli_heuristic: CliHeuristic,
     /// File-level RAII guard for `set_user_funs_for_theory`.  Kept
     /// alive for the whole session so per-lemma `term_to_lnterm`
     /// calls see the right user-fn-symbol set.
@@ -286,6 +438,22 @@ impl ProverSession {
         pool: Option<std::sync::Arc<tamarin_term::maude_proc::MaudePool>>,
         in_file: &str,
     ) -> Result<Self, ProveError> {
+        Self::build_with_in_file_and_heuristic(
+            parser_theory, maude, pool, in_file, CliHeuristic::default())
+    }
+
+    /// Like [`build_with_in_file`] but also carries the CLI
+    /// `--heuristic`/`--oraclename`/`--oracle-only` (HS `AutoProver`).  When
+    /// `cli_heuristic.raw` is `Some`, every lemma's goal ranking is the CLI
+    /// heuristic (HS `selectHeuristic`: `apDefaultHeuristic <|> pcHeuristic`,
+    /// Proof.hs:707).
+    pub fn build_with_in_file_and_heuristic(
+        parser_theory: &p::Theory,
+        maude: tamarin_term::maude_proc::MaudeHandle,
+        pool: Option<std::sync::Arc<tamarin_term::maude_proc::MaudePool>>,
+        in_file: &str,
+        cli_heuristic: CliHeuristic,
+    ) -> Result<Self, ProveError> {
         // RAII-set the user-fn-symbol thread-locals for the WHOLE
         // session.  Per-lemma `term_to_lnterm` calls during search
         // need these set; the parser-theory drives the set.
@@ -316,6 +484,7 @@ impl ProverSession {
         let setup_counter_delta = setup_counter_after.saturating_sub(setup_counter_before);
         Ok(ProverSession {
             theory,
+            cli_heuristic,
             _user_funs_guard,
             restrictions,
             template_ctx,
@@ -442,20 +611,34 @@ fn prove_lemma_in_session_mode(
         crate::theory::TraceQuantifier::ExistsTrace,
     );
     let session_in_file = &theory.in_file;
-    let lemma_heuristic: Option<&str> = lemma.attributes.iter().find_map(|a| match a {
-        crate::theory::LemmaAttr::Heuristic(s) => Some(s.as_str()),
-        _ => None,
-    });
-    let session_heuristic_raw: Option<String> = match lemma_heuristic {
-        Some(h) => Some(h.to_string()),
-        None => theory.heuristic.first().cloned(),
+    // HS `selectHeuristic prover ctx = ... apDefaultHeuristic prover <|>
+    // L.get pcHeuristic ctx` (Proof.hs:707-708): the CLI `--heuristic`
+    // (apDefaultHeuristic) OVERRIDES the per-lemma / theory heuristic when
+    // present.  Otherwise fall back to per-lemma `[heuristic=..]` > theory
+    // `heuristic:`.
+    ctx.heuristic = match resolve_cli_heuristic(
+        &session.cli_heuristic, session_in_file, &theory.tactic)
+    {
+        Some(rankings) => Some(rankings),
+        None => {
+            let lemma_heuristic: Option<&str> =
+                lemma.attributes.iter().find_map(|a| match a {
+                    crate::theory::LemmaAttr::Heuristic(s) => Some(s.as_str()),
+                    _ => None,
+                });
+            let session_heuristic_raw: Option<String> = match lemma_heuristic {
+                Some(h) => Some(h.to_string()),
+                None => theory.heuristic.first().cloned(),
+            };
+            session_heuristic_raw.map(|h| {
+                let mut rankings =
+                    crate::constraint::solver::goals::parse_heuristic_str_with_tactics(
+                        &h, session_in_file, &theory.tactic);
+                prepend_theory_dir_to_oracle_paths(&mut rankings, session_in_file);
+                rankings
+            })
+        }
     };
-    ctx.heuristic = session_heuristic_raw.map(|h| {
-        let mut rankings = crate::constraint::solver::goals::parse_heuristic_str_with_tactics(
-            &h, session_in_file, &theory.tactic);
-        prepend_theory_dir_to_oracle_paths(&mut rankings, session_in_file);
-        rankings
-    });
     ctx.lemma_name = lemma_name.to_string();
     ctx.theory_file = session_in_file.clone();
     let mut typing_assumptions: Vec<Guarded> = Vec::new();
@@ -644,6 +827,25 @@ pub fn prove_lemma_with_pool_and_file(
     max_steps: usize,
     in_file: &str,
 ) -> Result<ProofNode, ProveError> {
+    prove_lemma_with_pool_file_heuristic(
+        parser_theory, lemma_name, maude, pool, max_steps, in_file,
+        &CliHeuristic::default())
+}
+
+/// Like [`prove_lemma_with_pool_and_file`] but also carries the CLI
+/// `--heuristic`/`--oraclename`/`--oracle-only` (HS `AutoProver`).  This is
+/// the per-lemma (non-session) fallback path; when `cli_heuristic.raw` is
+/// `Some` it OVERRIDES the per-lemma / theory heuristic (HS `selectHeuristic`,
+/// Proof.hs:707).
+pub fn prove_lemma_with_pool_file_heuristic(
+    parser_theory: &p::Theory,
+    lemma_name: &str,
+    maude: tamarin_term::maude_proc::MaudeHandle,
+    pool: Option<std::sync::Arc<tamarin_term::maude_proc::MaudePool>>,
+    max_steps: usize,
+    in_file: &str,
+    cli_heuristic: &CliHeuristic,
+) -> Result<ProofNode, ProveError> {
     let trace = std::env::var("TAM_DBG_PHASE").is_ok();
     // Per-phase wall-clock instrumentation, gated by TAM_DBG_PHASE.
     // `Option<Instant>` keeps the disabled-path branch-predictable to
@@ -767,36 +969,45 @@ pub fn prove_lemma_with_pool_and_file(
         crate::theory::TraceQuantifier::ExistsTrace,
     );
 
-    // Resolve the goal-ranking heuristic, mirroring HS's
-    // `getProofContext.specifiedHeuristic` (ClosedTheory.hs:123-131):
-    //   per-lemma `[heuristic=..]` > theory-level `heuristic:` > None.
-    // `None` falls back to `SmartRanking False` in `rank_goals_with`
-    // (= HS's `defaultHeuristic False`).
+    // Resolve the goal-ranking heuristic.  HS `selectHeuristic prover ctx =
+    // ... apDefaultHeuristic prover <|> L.get pcHeuristic ctx` (Proof.hs:707):
+    // the CLI `--heuristic` (apDefaultHeuristic) OVERRIDES the per-lemma /
+    // theory heuristic when present.  Otherwise (`getProofContext.
+    // specifiedHeuristic`, ClosedTheory.hs:123-131): per-lemma `[heuristic=..]`
+    // > theory-level `heuristic:` > None.  `None` falls back to `SmartRanking
+    // False` in `rank_goals_with` (= HS's `defaultHeuristic False`).
     // `parse_heuristic_str_with_tactics` returns the full list for
     // round-robin scheduling (HS `roundRobinHeuristic`/`useHeuristic`,
     // ProofMethod.hs:576-595), resolves oracle paths, and resolves
     // `{name}` tactic rankings against `theory.tactic`.
     let in_file = &theory.in_file;
-    let lemma_heuristic: Option<&str> = lemma.attributes.iter().find_map(|a| match a {
-        crate::theory::LemmaAttr::Heuristic(s) => Some(s.as_str()),
-        _ => None,
-    });
-    // Build raw heuristic string: per-lemma overrides theory-level.
-    let heuristic_raw: Option<String> = match lemma_heuristic {
-        Some(h) => Some(h.to_string()),
-        None => theory.heuristic.first().cloned(),
+    ctx.heuristic = match resolve_cli_heuristic(cli_heuristic, in_file, &theory.tactic) {
+        Some(rankings) => Some(rankings),
+        None => {
+            let lemma_heuristic: Option<&str> =
+                lemma.attributes.iter().find_map(|a| match a {
+                    crate::theory::LemmaAttr::Heuristic(s) => Some(s.as_str()),
+                    _ => None,
+                });
+            // Build raw heuristic string: per-lemma overrides theory-level.
+            let heuristic_raw: Option<String> = match lemma_heuristic {
+                Some(h) => Some(h.to_string()),
+                None => theory.heuristic.first().cloned(),
+            };
+            heuristic_raw.map(|h| {
+                // Resolve oracle paths relative to theory file dir.
+                // HS `oraclePath oracle = takeDirectory inFile </> normalise
+                // relPath` (System.hs:574-575, Parser.hs:304).  Resolve
+                // `{name}` tactic rankings against `theory.tactic`
+                // (HS `chosenTactic`, ProofMethod.hs:494-496).
+                let mut rankings =
+                    crate::constraint::solver::goals::parse_heuristic_str_with_tactics(
+                        &h, in_file, &theory.tactic);
+                prepend_theory_dir_to_oracle_paths(&mut rankings, in_file);
+                rankings
+            })
+        }
     };
-    ctx.heuristic = heuristic_raw.map(|h| {
-        // Resolve oracle paths relative to theory file dir.
-        // HS `oraclePath oracle = takeDirectory inFile </> normalise relPath`
-        // (System.hs:574-575, Parser.hs:304).
-        // Resolve `{name}` tactic rankings against `theory.tactic`
-        // (HS `chosenTactic`, ProofMethod.hs:494-496).
-        let mut rankings = crate::constraint::solver::goals::parse_heuristic_str_with_tactics(
-            &h, in_file, &theory.tactic);
-        prepend_theory_dir_to_oracle_paths(&mut rankings, in_file);
-        rankings
-    });
     // Set lemma_name and theory_file on ctx for oracle invocation.
     ctx.lemma_name = lemma_name.to_string();
     ctx.theory_file = in_file.clone();

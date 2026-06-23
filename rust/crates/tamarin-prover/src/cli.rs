@@ -12,14 +12,14 @@
 //!   --stop-on-trace=DFS|...    trace-search policy (parsed, not yet routed in port)
 //!   --bound=N, -bN             proof-depth bound
 //!   --saturation=N, -sN        saturation iterations (parsed, not yet routed)
-//!   --heuristic=...            heuristic ranking sequence (parsed, not yet routed)
+//!   --heuristic=...            heuristic ranking sequence (overrides per-lemma)
 //!   --partial-evaluation=...   partial-evaluation mode (parsed, not yet routed)
 //!   -D|--defines=STRING        preprocessor `#define` flags. Repeatable.
 //!   --diff                     observational-equivalence mode (errors: not yet ported)
 //!   --quit-on-warning          treat wellformedness warnings as fatal
 //!   --auto-sources             auto-generate sources lemmas (parsed, not yet routed)
-//!   --oraclename=FILE          oracle heuristic file (parsed, not yet routed)
-//!   --oracle-only              oracle-only mode (parsed, not yet routed)
+//!   --oraclename=FILE          oracle script for --heuristic oracle rankings
+//!   --oracle-only              oracle-only mode (quit-on-empty-oracle)
 //!   --quiet                    suppress chatter on stderr
 //!   --verbose, -v              verbose proof-search output
 //!   --parse-only               parse + pretty-print, no analysis
@@ -363,6 +363,9 @@ pub fn parse_args(raw: &[String]) -> Result<Args, CliError> {
                     // flagOpt default = head of defaultRankings False; that
                     // default rebuilds the Rust default downstream, so a bare
                     // flag is behaviourally equal to absent — leave None.
+                    // Routed: when set, this OVERRIDES the per-lemma / theory
+                    // heuristic for every lemma (HS `selectHeuristic`:
+                    // `apDefaultHeuristic <|> pcHeuristic`, Proof.hs:707).
                     if let Some(v) = val_inline {
                         args.heuristic = Some(v.to_string());
                     }
@@ -381,8 +384,15 @@ pub fn parse_args(raw: &[String]) -> Result<Args, CliError> {
                 "quit-on-warning" => args.quit_on_warning = true,
                 "auto-sources" => args.auto_sources = true,
                 "oraclename" => {
+                    // Routed: sets the oracle relPath on every oracle ranking
+                    // in the `--heuristic` chain (HS `mapOracleRanking
+                    // (maybeSetOracleRelPath oraclename)`, TheoryLoader.hs:305).
+                    // `Just "" -> Nothing` is handled at resolution time.
                     args.oracle_name = Some(flag_opt(val_inline, ""));
                 }
+                // Routed: `--oracle-only` sets quitOnEmpty on every oracle /
+                // tactic ranking in the selected heuristic (HS `setQuitOnEmpty`,
+                // Proof.hs:712-716).
                 "oracle-only" => args.oracle_only = true,
                 "quiet" => args.quiet = true,
                 "verbose" => args.verbose = true,

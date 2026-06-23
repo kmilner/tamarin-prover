@@ -839,6 +839,21 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             let mut variants_errors: Vec<WfE> = Vec::new();
             let mut no_variant_rules: Vec<String> = Vec::new();
 
+            // `populate_rule_variants` (above) already ran
+            // `abstract_rule_and_variants` for every rule when the
+            // signature has reducible function symbols, recording its
+            // result on each `OpenProtoRule` (`abstracted_rule` is `Some`
+            // iff it returned `Ok(Some(_))`).  Reuse that result for the
+            // reducible (Maude) path of the WF "Rule has no variants"
+            // check so we don't issue a SECOND `get variants` query per
+            // rule.  When the signature has NO reducible funs,
+            // `populate_rule_variants` returned early without populating
+            // those fields, but then no rule is reducible either — the WF
+            // check takes its syntactic (no-Maude) path, so the precomputed
+            // value is never consulted.
+            let sig_has_reducible =
+                !wf_maude.maude_sig().reducible_fun_syms.is_empty();
+
             for item in &elaborated.items {
                 let TheoryItem::Rule(opr) = item else { continue };
 
@@ -851,8 +866,14 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 //
                 // Sub-check 2: "Variants mismatch" — not yet ported; no
                 // corpus files affected (see step-0 analysis).
-                if tamarin_theory::tools::rule_variants::rule_has_no_variants_for_wf(
-                    wf_maude, &opr.rule)
+                let precomputed_no_variants = if sig_has_reducible {
+                    Some(opr.abstracted_rule.is_none()
+                        && opr.variant_substs.is_empty())
+                } else {
+                    None
+                };
+                if tamarin_theory::tools::rule_variants::rule_has_no_variants_for_wf_with(
+                    wf_maude, &opr.rule, precomputed_no_variants)
                 {
                     // HS message (Wellformedness.hs:363-366):
                     //   text "Rule " <> prettyRuleName ruE <> text " has no variants."
@@ -1039,8 +1060,19 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             // (which re-runs the setup per lemma but is more tolerant
             // of theories where elaboration fails on a subset of
             // lemmas).  Almost never hits in practice.
-            let session = tamarin_theory::prove::ProverSession::build_with_in_file(
-                &parsed, maude.clone(), file_maude_pool.clone(), in_file).ok();
+            //
+            // CLI `--heuristic`/`--oraclename`/`--oracle-only` (HS
+            // `AutoProver` via `constructAutoProver`, TheoryLoader.hs:702-706).
+            // When `--heuristic` is given it OVERRIDES the per-lemma / theory
+            // heuristic for every lemma (HS `selectHeuristic`, Proof.hs:707).
+            let cli_heuristic = tamarin_theory::prove::CliHeuristic {
+                raw: args.heuristic.clone(),
+                oracle_name: args.oracle_name.clone(),
+                oracle_only: args.oracle_only,
+            };
+            let session = tamarin_theory::prove::ProverSession::build_with_in_file_and_heuristic(
+                &parsed, maude.clone(), file_maude_pool.clone(), in_file,
+                cli_heuristic.clone()).ok();
 
             // HS prints "[Theory X] Theory closed" right after `closeTheory`
             // (TheoryLoader.hs:596) and BEFORE the proof search, which it
@@ -1082,9 +1114,9 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                         s, &lemma_name, budget),
                     (Some(s), false) => tamarin_theory::prove::check_and_extend_lemma_in_session(
                         s, &lemma_name, budget),
-                    (None, _) => tamarin_theory::prove::prove_lemma_with_pool_and_file(
+                    (None, _) => tamarin_theory::prove::prove_lemma_with_pool_file_heuristic(
                         &parsed, &lemma_name, maude.clone(),
-                        file_maude_pool.clone(), budget, in_file),
+                        file_maude_pool.clone(), budget, in_file, &cli_heuristic),
                 };
                 if dbg_timing {
                     eprintln!("[TAM_DBG_RUN_TIMING] {:>26}: {:>8.1} ms  (lemma={})",

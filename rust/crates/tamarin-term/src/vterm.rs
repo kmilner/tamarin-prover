@@ -66,6 +66,17 @@ fn collect_vars<C, V: Clone>(t: &VTerm<C, V>, out: &mut Vec<V>) {
     }
 }
 
+/// `True` iff `t` contains no variable literals (i.e. is ground).
+/// Non-allocating, short-circuits on the first variable found — cheaper than
+/// `vars_vterm(t).is_empty()` on the hot match path.
+pub fn is_ground_vterm<C, V>(t: &VTerm<C, V>) -> bool {
+    match t {
+        Term::Lit(Lit::Var(_)) => false,
+        Term::Lit(Lit::Con(_)) => true,
+        Term::App(_, ts) => ts.iter().all(is_ground_vterm),
+    }
+}
+
 /// `occursVTerm v t`: whether `v` appears anywhere in `t`.
 pub fn occurs_vterm<C, V: PartialEq>(v: &V, t: &VTerm<C, V>) -> bool {
     match t {

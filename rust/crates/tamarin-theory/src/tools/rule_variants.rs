@@ -1094,6 +1094,25 @@ pub fn rule_has_no_variants_for_wf(
     maude: &MaudeHandle,
     rule: &ProtoRuleE,
 ) -> bool {
+    // `None` precomputed result ⇒ compute the reducible path here.
+    rule_has_no_variants_for_wf_with(maude, rule, None)
+}
+
+/// Like `rule_has_no_variants_for_wf`, but when the reducible-path result
+/// (`abstract_rule_and_variants(..) == Ok(None)`) is ALREADY known — e.g.
+/// it was computed once by `populate_rule_variants` and recorded on the
+/// rule's `OpenProtoRule` (`abstracted_rule`/`variant_substs`) — pass it
+/// as `reducible_has_no_variants` to skip the redundant Maude `get variants`
+/// query.  `populate_rule_variants` sets `abstracted_rule = Some(_)` exactly
+/// when `abstract_rule_and_variants` returned `Ok(Some(_))`, so the caller
+/// supplies `Some(opr.abstracted_rule.is_none() && opr.variant_substs.is_empty())`.
+/// The syntactic (non-reducible) path is always recomputed here — it is
+/// cheap and makes no Maude call.
+pub fn rule_has_no_variants_for_wf_with(
+    maude: &MaudeHandle,
+    rule: &ProtoRuleE,
+    reducible_has_no_variants: Option<bool>,
+) -> bool {
     // Path 1: syntactic fresh-redundancy check (no Maude call needed).
     //
     // If the rule has NO reducible-headed sub-terms, the only Maude
@@ -1138,8 +1157,13 @@ pub fn rule_has_no_variants_for_wf(
         });
     }
 
-    // Path 2: reducible rule — use `abstract_rule_and_variants`.
-    // Returns `Ok(None)` when all composed substs are filtered out.
+    // Path 2: reducible rule — `abstract_rule_and_variants` returns
+    // `Ok(None)` when all composed substs are filtered out.  Reuse the
+    // precomputed answer when the caller already ran the computation
+    // (avoids a duplicate `get variants` Maude round-trip).
+    if let Some(no_variants) = reducible_has_no_variants {
+        return no_variants;
+    }
     matches!(abstract_rule_and_variants(maude, rule), Ok(None))
 }
 

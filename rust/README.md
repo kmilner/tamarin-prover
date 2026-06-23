@@ -26,8 +26,8 @@ only the Git-revision, compiled-at, and processing-time lines).
 
 On the comparable corpus — the theory files for which the Haskell prover
 produces a reference within the wall-clock cap — RS reproduces HS output
-**byte-for-byte**. The per-file parity gate (273 files, `--derivcheck-timeout=30`)
-stands at **197 MATCH with no proof-search or verdict (verified/falsified)
+**byte-for-byte**. The per-file parity gate (275 files, `--derivcheck-timeout=30`)
+stands at **200 MATCH with no proof-search or verdict (verified/falsified)
 divergence remaining**. Every file that still differs needs a feature not yet
 ported (`--diff` observational equivalence, SAPiC `--auto-sources`); the canonical
 HS output for those is recorded in the cache so they re-compare automatically
@@ -37,49 +37,57 @@ exceeds the cap (genuinely hard or oracle-dependent searches).
 ## Performance
 
 RS uses a fraction of HS's peak resident memory across the board, and is faster
-in wall-clock on most workloads. The exception is Maude-bound proofs (bilinear
-pairing), where per-Maude-call IPC dominates and the work is essentially serial,
-so RS lands roughly on par with HS. Representative protocols (aarch64 Linux, GHC
-9.6.7, Maude 3.5.1): `NSPK3` (classic, sub-second reference), `Joux` (bilinear
-pairing — Maude-bound), `stateverif_left_right` (SAPiC), `wireguard` (deep proof
-search, few rules), `CCITT_X509_3` (auto-sources + stored-proof replay, heaviest):
+in wall-clock across every representative workload at all core counts —
+including the Maude-bound bilinear-pairing proofs, where per-Maude-call IPC
+dominates and the work is essentially serial. The natural-numbers/multiset `gcm`
+proof is a strong RS win (24 s vs 42 s at one core, 9 s vs 30 s at sixteen) after
+a native ground-AC-equality match short-circuit eliminated ~500 K redundant Maude
+round-trips. Representative protocols (aarch64 Linux, 16 cores, GHC 9.6.7, Maude
+3.5.1): `NSPK3` (classic, sub-second reference), `Joux` (bilinear pairing —
+Maude-bound), `stateverif_left_right` (SAPiC), `gcm` (key-wrapping, natural-numbers
++ multiset, deep constraint search), `wireguard` (deep proof search, few rules),
+`CCITT_X509_3` (auto-sources + stored-proof replay, heaviest):
 
 **1 core** — HS `+RTS -N1`, RS `--processors=1`
 
 | File | HS wall | RS wall | HS peak RSS | RS peak RSS |
 |------|--------:|--------:|------------:|------------:|
-| `NSPK3.spthy` | 0.9 s | 0.5 s | 66 MB | 18 MB |
-| `Joux.spthy` | 6.8 s | 9.2 s | 262 MB | 46 MB |
-| `stateverif_left_right.spthy` | 10.6 s | 8.0 s | 827 MB | 43 MB |
-| `wireguard.spthy` | 38.8 s | 21.1 s | 1651 MB | 127 MB |
-| `CCITT_X509_3.spthy` | 146.9 s | 73.2 s | 3396 MB | 636 MB |
+| `NSPK3.spthy` | 0.9 s | 0.5 s | 66 MB | 17 MB |
+| `Joux.spthy` | 6.6 s | 5.5 s | 252 MB | 48 MB |
+| `stateverif_left_right.spthy` | 10.5 s | 7.9 s | 825 MB | 50 MB |
+| `gcm.spthy` | 41.9 s | 24.4 s | 1336 MB | 103 MB |
+| `wireguard.spthy` | 38.7 s | 18.0 s | 1659 MB | 124 MB |
+| `CCITT_X509_3.spthy` | 143.6 s | 72.6 s | 3386 MB | 637 MB |
 
 **4 cores** — HS `+RTS -N4`, RS `--processors=4`
 
 | File | HS wall | RS wall | HS peak RSS | RS peak RSS |
 |------|--------:|--------:|------------:|------------:|
-| `NSPK3.spthy` | 0.4 s | 0.3 s | 99 MB | 27 MB |
-| `Joux.spthy` | 5.7 s | 9.1 s | 285 MB | 52 MB |
-| `stateverif_left_right.spthy` | 6.3 s | 5.0 s | 886 MB | 72 MB |
-| `wireguard.spthy` | 22.8 s | 15.0 s | 1656 MB | 131 MB |
-| `CCITT_X509_3.spthy` | 66.2 s | 24.4 s | 6060 MB | 675 MB |
+| `NSPK3.spthy` | 0.4 s | 0.3 s | 96 MB | 26 MB |
+| `Joux.spthy` | 5.6 s | 5.3 s | 273 MB | 51 MB |
+| `stateverif_left_right.spthy` | 6.3 s | 5.0 s | 887 MB | 71 MB |
+| `gcm.spthy` | 31.8 s | 10.0 s | 1329 MB | 159 MB |
+| `wireguard.spthy` | 22.4 s | 11.6 s | 1652 MB | 131 MB |
+| `CCITT_X509_3.spthy` | 63.5 s | 24.0 s | 5970 MB | 672 MB |
 
 **16 cores** — HS `+RTS -N16`, RS `--processors=16`
 
 | File | HS wall | RS wall | HS peak RSS | RS peak RSS |
 |------|--------:|--------:|------------:|------------:|
-| `NSPK3.spthy` | 0.6 s | 0.4 s | 147 MB | 34 MB |
-| `Joux.spthy` | 6.6 s | 9.3 s | 333 MB | 62 MB |
-| `stateverif_left_right.spthy` | 7.4 s | 5.0 s | 884 MB | 103 MB |
-| `wireguard.spthy` | 21.5 s | 14.9 s | 1739 MB | 144 MB |
-| `CCITT_X509_3.spthy` | 66.4 s | 10.3 s | 7788 MB | 779 MB |
+| `NSPK3.spthy` | 0.5 s | 0.4 s | 144 MB | 34 MB |
+| `Joux.spthy` | 6.4 s | 5.4 s | 328 MB | 62 MB |
+| `stateverif_left_right.spthy` | 6.6 s | 4.9 s | 833 MB | 96 MB |
+| `gcm.spthy` | 30.2 s | 8.8 s | 1412 MB | 239 MB |
+| `wireguard.spthy` | 21.2 s | 11.5 s | 1706 MB | 144 MB |
+| `CCITT_X509_3.spthy` | 66.5 s | 10.2 s | 8364 MB | 774 MB |
 
 Peak RSS is the prover **process** only — Maude runs as a separate subprocess on
 both sides and is not counted (GHC-heap vs Rust-heap). The memory gap is large
-and universal (e.g. `wireguard` ~0.13 GB vs ~1.7 GB; `CCITT_X509_3` ~0.8 GB vs
-~7.8 GB). Wall-clock scales with cores only where the proof parallelises —
-`CCITT_X509_3` drops 73 s → 10 s (RS, 1 → 16 cores), while Maude-bound `Joux` and
-search-bound `wireguard` are largely serial and barely move. Regenerate the
+and universal (e.g. `wireguard` ~0.15 GB vs ~1.7 GB; `CCITT_X509_3` ~0.8 GB vs
+~8.0 GB; `gcm` ~0.1–0.2 GB vs ~1.4 GB). Wall-clock scales with cores only where
+the proof parallelises — `CCITT_X509_3` drops 73 s → 10 s and `gcm` 24 s → 9 s
+(RS, 1 → 16 cores), while Maude-bound `Joux` and search-bound `wireguard` are
+largely serial and barely move. Regenerate the
 tables with `rust/scripts/bench.sh`.
 
 RS mirrors HS's `parList`/`parMap` sites with rayon (per-rule variants, source
@@ -106,11 +114,12 @@ mutex. The pool is a pure optimisation — Maude is a stateless oracle.
   stored-proof replay, and AC-modulo unification via pooled Maude.
 - **Heuristics:** smart (`s`/`S`), goal-number (`C`/`c`), injective (`i`/`I`),
   SAPiC (`p`/`P`), oracle (`o`/`O`), and `tactic:` rankings — selected by the
-  in-file `heuristic:`/`tactic:` annotation or per-lemma attribute.
-- **CLI:** `--prove`/`--lemma`, `--bound`, `--processors`, `--maude-processes`,
-  `--derivcheck-timeout`, `-D` defines, `--parse-only`, `--precompute-only`,
-  `-O/--output`, `--quiet`, `-v/--verbose`, `--quit-on-warning`; exit codes and
-  summary lines mirror HS.
+  in-file `heuristic:`/`tactic:` annotation or per-lemma attribute, or overridden
+  for every lemma by the CLI `--heuristic` (HS `selectHeuristic`).
+- **CLI:** `--prove`/`--lemma`, `--bound`, `--heuristic`, `--oraclename`,
+  `--oracle-only`, `--processors`, `--maude-processes`, `--derivcheck-timeout`,
+  `-D` defines, `--parse-only`, `--precompute-only`, `-O/--output`, `--quiet`,
+  `-v/--verbose`, `--quit-on-warning`; exit codes and summary lines mirror HS.
 - **Subcommands:** `interactive` (HTTP server), `variants` (DH intruder-rule
   dump), `test` (install self-check).
 
@@ -121,8 +130,6 @@ mutex. The pool is a pure optimisation — Maude is a stateless oracle.
   is not compiled.
 - **`diff(...)` / `--diff`** — observational-equivalence mode.
 - **`--auto-sources`** — automatic sources-lemma generation.
-- **CLI `--heuristic` / `--oraclename`** are parse-only; use the in-file
-  `heuristic:` annotation instead (fully supported, oracles included).
 - Other parse-only CLI flags: `--saturation`, `--open-chains`,
   `--partial-evaluation`, `--stop-on-trace` (RS already defaults to DFS, as HS
   does), `--replication-bound`; `--output-json`/`--output-dot` write stubs and

@@ -2004,7 +2004,19 @@ fn pp_step_at(m: &crate::constraint::solver::proof_method::ProofMethod, indent: 
 /// We build the goal via the same `solve_goal_to_doc` builder the
 /// display path uses, then render it at the oracle width.
 pub(crate) fn render_goal_for_oracle(g: &crate::constraint::constraints::Goal) -> String {
-    solve_goal_to_doc(g).render_at(ORACLE_LINE_LENGTH, ORACLE_RIBBON, 0)
+    // HS oracle stdin line = `show i ++": "++ (concat . lines . render $
+    // prettyGoal g)` (ProofMethod.hs:607).  HS `render` is HughesPJ's plain
+    // `render` (= `fullRender`/`display` from line column 0), which APPLIES a
+    // top-level `nest` to the FIRST line — so e.g. `prettyGoal (DisjG ..)` =
+    // `fsep (map (nest 1 . parens . prettyGuarded) gfs)` renders with a LEADING
+    // SPACE (`" (#a < #b)  ∥ .."`).  Use `render_with` (HughesPJ `lay`, indent
+    // 0) here, NOT `render_at` (`lay2`, continuation mode) — `lay2` discards a
+    // leading `Nest`, dropping that space and feeding the oracle a DIFFERENT
+    // goal string than HS, which can change the oracle's ranking decisions.
+    // (The `--prove` display path renders the disjunction AFTER a `solve( `
+    // prefix, so the nest is never at the doc start there and both lay/lay2
+    // agree — this divergence is oracle-stdin-specific.)
+    solve_goal_to_doc(g).render_with(ORACLE_LINE_LENGTH, ORACLE_RIBBON)
 }
 
 /// Build the `solve( <goal> )` Doc for an unannotated (replayed) step from
@@ -2408,5 +2420,48 @@ mod oracle_goal_tests {
             "display width must keep the fact inline (space before `)`)",
         );
         assert_ne!(collapsed, display, "oracle and display widths must differ here");
+    }
+
+    /// Regression: a disjunction goal sent to the oracle MUST carry the
+    /// leading space HS produces.  HS `prettyGoal (DisjG (Disj gfs))` =
+    /// `fsep (map (nest 1 . parens . prettyGuarded) gfs)` (Constraints.hs:
+    /// 276-277), and HS `render` (HughesPJ `lay`, from column 0) APPLIES the
+    /// top-level `nest 1` to the FIRST line — so the oracle stdin line is
+    /// `" (#a < #b)  ∥ (#b < #a)"` (leading space).  `render_goal_for_oracle`
+    /// must use `render_with`/`lay`, NOT `render_at`/`lay2` (which drops a
+    /// leading `Nest`); the latter fed the oracle a string differing from HS
+    /// by one space, perturbing oracle ranking decisions on oracle-driven
+    /// proofs (e.g. csf19-wrapping gcm).  Ground truth captured from the
+    /// v1.13.0 HS prover with an echoing oracle.
+    #[test]
+    fn disj_goal_for_oracle_has_leading_space() {
+        use crate::constraint::constraints::{Disj, Goal};
+        use crate::guarded::Guarded;
+        use crate::guarded_types::{BVar, GAtom, GTerm};
+        use tamarin_parser::ast::{SortHint, VarSpec};
+
+        let tp = |n: &str| GTerm::Var(BVar::Free(VarSpec {
+            name: n.to_string(),
+            idx: 0,
+            sort: SortHint::Node,
+            typ: None,
+        }));
+        // `#a < #b` ∥ `#b < #a`
+        let d1 = Guarded::Atom(GAtom::Less(tp("a"), tp("b")));
+        let d2 = Guarded::Atom(GAtom::Less(tp("b"), tp("a")));
+        let goal = Goal::Disj(Disj::new(vec![d1, d2]));
+
+        let rendered = render_goal_for_oracle(&goal);
+        let collapsed: String = rendered.lines().collect::<Vec<_>>().concat();
+        // HS `nest 1` leading space + `"  ∥"` separator (two spaces + ∥).
+        assert_eq!(
+            collapsed,
+            " (#a < #b)  \u{2225} (#b < #a)",
+            "oracle disjunction goal must keep HS's leading `nest 1` space",
+        );
+        assert!(
+            collapsed.starts_with(' '),
+            "regression: oracle disj goal lost its leading space (render_at/lay2 bug)",
+        );
     }
 }

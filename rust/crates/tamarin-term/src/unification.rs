@@ -441,6 +441,67 @@ where
     Some(Subst::from_map(mapping))
 }
 
+/// Outcome of the native matcher, mirroring HS `solveMatchLTerm`'s
+/// 3-way `case runState (runExceptT match)` split
+/// (`Term/Unification.hs:209-214`):
+///
+/// * `NoMatcher`   ⇒ `Left NoMatcher`  ⇒ HS returns `[]` *without* any
+///   Maude round-trip.  (The pattern structurally cannot match the
+///   subject — e.g. constant clash, arity mismatch, sort clash, or a
+///   pattern var already bound to a different subject.)
+/// * `Matched(s)`  ⇒ `Right ()`        ⇒ HS returns `[substFromMap …]`
+///   natively, no Maude.
+/// * `NeedsAC`     ⇒ `Left ACProblem`  ⇒ HS calls `matchViaMaude` on the
+///   *whole* original problem.
+///
+/// The crucial distinction over `solve_match_lterm_no_ac` (which folds
+/// `NoMatcher` and `NeedsAC` together into `None`) is that callers must
+/// only fall back to Maude on `NeedsAC` — a `NoMatcher` is a definitive
+/// "no match" answer that HS never sends to Maude.  Conflating the two
+/// makes the Rust port issue a Maude `match` for every structurally
+/// failing match attempt, which is exactly the surplus `match in MSG`
+/// flood observed on LAK06/Scott (`matchToGoal`, `Sources.hs:381,414`).
+pub enum MatchOutcome<C> {
+    NoMatcher,
+    Matched(Subst<C, LVar>),
+    NeedsAc,
+}
+
+/// HS-faithful `solveMatchLTerm` (`Term/Unification.hs:196-216`): run the
+/// native `matchRaw` matcher over all delayed pairs and report the 3-way
+/// outcome so the caller can decide whether a Maude AC fallback is
+/// actually warranted (only on `NeedsAc`).
+///
+/// `matchRaw` raises `ACProblem` (here `NeedsAC`) the *instant* it sees an
+/// AC-/C-headed pair on BOTH sides; a variable pattern facing an
+/// AC-headed subject is bound natively (HS `matchRaw` checks the
+/// `(_, Lit (Var vp))` arm first, `Unification.hs:317`) — so a `tamxor`
+/// buried under a variable pattern never triggers a Maude call.
+pub fn solve_match_lterm<C, F>(
+    sort_of_const: &F,
+    problem: Match<LTerm<C>>,
+) -> MatchOutcome<C>
+where
+    C: Ord + Clone,
+    F: Fn(&C) -> LSort,
+{
+    // HS `flattenMatch matchProblem` ⇒ `Nothing` means a non-flattenable
+    // problem (`MatchFailure`), treated as `[]` — i.e. NoMatcher.
+    let pairs = match problem.flatten() {
+        Some(p) => p,
+        None => return MatchOutcome::NoMatcher,
+    };
+    let mut mapping: BTreeMap<LVar, LTerm<C>> = BTreeMap::new();
+    for (term, pattern) in pairs {
+        match match_raw(sort_of_const, &mut mapping, term, pattern) {
+            Ok(()) => {}
+            Err(UnifyError::NeedsAC) => return MatchOutcome::NeedsAc,
+            Err(UnifyError::NoUnifier) => return MatchOutcome::NoMatcher,
+        }
+    }
+    MatchOutcome::Matched(Subst::from_map(mapping))
+}
+
 fn match_raw<C, F>(
     sort_of_const: &F,
     mapping: &mut BTreeMap<LVar, LTerm<C>>,
@@ -485,7 +546,28 @@ where
             }
             _ => Err(UnifyError::NoUnifier),
         },
-        Term::App(FunSym::Ac(_), _) | Term::App(FunSym::C(_), _) => Err(UnifyError::NeedsAC),
+        // HS `(FApp (AC _) _, FApp (AC _) _) -> throwError ACProblem` and
+        // `(FApp (C _) _, FApp (C _) _) -> throwError ACProblem`
+        // (Unification.hs:333-334): the AC/C arm fires ONLY when BOTH the
+        // subject `t` AND the pattern `p` are AC-/C-headed.  An AC-/C-headed
+        // PATTERN facing a variable / constant / NoEq / List / differently-
+        // headed subject is NOT an AC problem — HS falls to the final
+        // `_ -> throwError NoMatcher` arm (Unification.hs:337).  (The
+        // earlier code raised NeedsAC purely on the pattern's head, which —
+        // once `solve_match_lterm` started routing NeedsAC to Maude — would
+        // have shipped non-AC structural mismatches to Maude.)
+        // NB: HS does NOT require the AC (resp. C) symbols to match here —
+        // `Mult`-vs-`Union` is still `ACProblem` (Maude then resolves it,
+        // typically to no match).  So the guard is purely "both AC" / "both
+        // C", not "same symbol".
+        Term::App(FunSym::Ac(_), _) => match t {
+            Term::App(FunSym::Ac(_), _) => Err(UnifyError::NeedsAC),
+            _ => Err(UnifyError::NoUnifier),
+        },
+        Term::App(FunSym::C(_), _) => match t {
+            Term::App(FunSym::C(_), _) => Err(UnifyError::NeedsAC),
+            _ => Err(UnifyError::NoUnifier),
+        },
     }
 }
 
@@ -616,6 +698,76 @@ mod tests {
             Err(UnifyError::NeedsAC) => {}
             other => panic!("expected NeedsAC (HS AC symbol found), got {:?}", other),
         }
+    }
+
+    // -------------------------------------------------------------------
+    // `solve_match_lterm` 3-way outcome (HS `solveMatchLTerm`,
+    // Unification.hs:200-216).  These pin the exact distinction that
+    // eliminates the LAK06 (28 879→0) / NAXOS / CRxor surplus Maude
+    // `match`es: an AC-/C-headed subterm only forces a Maude fallback
+    // when it appears AC-vs-AC; under a variable pattern, or facing a
+    // variable subject, it resolves natively (Matched / NoMatcher).
+    // -------------------------------------------------------------------
+    fn sn(n: &crate::lterm::Name) -> LSort { crate::lterm::sort_of_name(n) }
+
+    #[test]
+    fn match_ac_subterm_under_var_pattern_is_matched_no_maude() {
+        // pattern = x (var), subject = mult(a,b) (AC-headed).  HS
+        // `matchRaw` checks `(_, Lit (Var vp))` FIRST → binds, no AC.
+        let t: LNTerm = mult(msg_var("a", 0), msg_var("b", 0));
+        let p: LNTerm = msg_var("x", 0);
+        match solve_match_lterm(&sn, Match::match_with(t, p)) {
+            MatchOutcome::Matched(s) => assert_eq!(s.len(), 1),
+            o => panic!("expected Matched, got {:?}", match o {
+                MatchOutcome::NoMatcher => "NoMatcher", _ => "NeedsAc" }),
+        }
+    }
+
+    #[test]
+    fn match_ac_pattern_vs_var_subject_is_no_matcher_not_needs_ac() {
+        // pattern = mult(a,b) (AC), subject = x (var).  Subject is a Lit
+        // Var, NOT an FApp(AC) — HS reaches `_ -> NoMatcher`, not the
+        // AC arm (which needs BOTH sides AC-headed).  This is the exact
+        // LAK06 shape (`Xor(..)` pattern vs `k.0` var subject) that the
+        // old `any_ac_op` heuristic wrongly shipped to Maude.
+        let t: LNTerm = msg_var("x", 0);
+        let p: LNTerm = mult(msg_var("a", 0), msg_var("b", 0));
+        match solve_match_lterm(&sn, Match::match_with(t, p)) {
+            MatchOutcome::NoMatcher => {}
+            MatchOutcome::Matched(_) => panic!("expected NoMatcher, got Matched"),
+            MatchOutcome::NeedsAc => panic!("expected NoMatcher, got NeedsAc"),
+        }
+    }
+
+    #[test]
+    fn match_same_ac_symbol_both_sides_is_needs_ac() {
+        // mult(a,b) vs mult(c,d): genuine AC-vs-AC → HS `ACProblem`.
+        let t: LNTerm = mult(msg_var("a", 0), msg_var("b", 0));
+        let p: LNTerm = mult(msg_var("c", 0), msg_var("d", 0));
+        match solve_match_lterm(&sn, Match::match_with(t, p)) {
+            MatchOutcome::NeedsAc => {}
+            MatchOutcome::Matched(_) => panic!("expected NeedsAc, got Matched"),
+            MatchOutcome::NoMatcher => panic!("expected NeedsAc, got NoMatcher"),
+        }
+    }
+
+    #[test]
+    fn match_ac_subterm_under_noeq_with_clash_is_no_matcher() {
+        // pk(mult(a,b)) vs pk(x): the AC subterm faces a var PATTERN →
+        // bound natively → Matched (no Maude), proving the AC op deep in
+        // the subject doesn't force a fallback when the pattern is a var.
+        let t: LNTerm = pk(mult(msg_var("a", 0), msg_var("b", 0)));
+        let p: LNTerm = pk(msg_var("x", 0));
+        match solve_match_lterm(&sn, Match::match_with(t, p)) {
+            MatchOutcome::Matched(s) => assert_eq!(s.len(), 1),
+            _ => panic!("expected Matched"),
+        }
+        // ...but pk(x) vs pair(a,b): head clash → NoMatcher, no Maude.
+        let t2: LNTerm = pk(msg_var("x", 0));
+        let p2: LNTerm = pair(msg_var("a", 0), msg_var("b", 0));
+        assert!(matches!(
+            solve_match_lterm(&sn, Match::match_with(t2, p2)),
+            MatchOutcome::NoMatcher));
     }
 }
 
