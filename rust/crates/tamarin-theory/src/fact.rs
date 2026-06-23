@@ -215,6 +215,34 @@ pub fn proto_fact(mult: Multiplicity, name: &str, terms: Vec<LNTerm>) -> LNFact 
     Fact::new(FactTag::Proto(mult, name.into(), terms.len()), terms)
 }
 
+/// View a protocol or `In` fact's terms. Port of HS `protoOrInFactView`
+/// (Fact.hs:331): a `ProtoFact` yields its terms; an `In` fact (arity 1)
+/// yields its single term; anything else is `None`. A malformed `In` fact
+/// (arity ≠ 1) panics, mirroring HS `errMalformed`.
+pub fn proto_or_in_fact_view(fa: &LNFact) -> Option<Vec<LNTerm>> {
+    match &fa.tag {
+        FactTag::Proto(..) => Some(fa.terms.clone()),
+        FactTag::In => match &fa.terms[..] {
+            [m] => Some(vec![m.clone()]),
+            _ => panic!("proto_or_in_fact_view: malformed In fact"),
+        },
+        _ => None,
+    }
+}
+
+/// View a protocol or `Out` fact's terms. Port of HS `protoOrOutFactView`
+/// (Fact.hs:339).
+pub fn proto_or_out_fact_view(fa: &LNFact) -> Option<Vec<LNTerm>> {
+    match &fa.tag {
+        FactTag::Proto(..) => Some(fa.terms.clone()),
+        FactTag::Out => match &fa.terms[..] {
+            [m] => Some(vec![m.clone()]),
+            _ => panic!("proto_or_out_fact_view: malformed Out fact"),
+        },
+        _ => None,
+    }
+}
+
 pub fn proto_fact_ann(
     mult: Multiplicity,
     name: &str,

@@ -6,7 +6,7 @@
 //! tail multiset.
 
 use crate::function_symbols::FunSym;
-use crate::term::{f_app, Term};
+use crate::term::{f_app, is_ac, is_pair, Term};
 use crate::vterm::{Lit, VTerm};
 
 /// A position in a term — list of integers.
@@ -66,6 +66,82 @@ pub fn replace_pos<C: Ord + Clone, V: Ord + Clone>(
             Some(f_app(fsym.clone(), new))
         }
     }
+}
+
+/// `find_pos t s`: all positions at which subterm `t` occurs inside `s`,
+/// or `None` if `t` is not a subterm. Port of HS `findPos` (Positions.hs:63).
+///
+/// NB: this mirrors HS exactly by indexing over the **n-ary** argument list
+/// (`viewTerm -> FApp _ ts`), NOT the right-leaning binary-AC encoding used
+/// by [`at_pos`]. These positions feed `print_position` (the `AUTO_*` fact
+/// names) and [`deepest_prot_subterm`], which use the same n-ary indexing.
+/// The result order matches HS's `foldr` (highest index first, index 0 last).
+pub fn find_pos<C: Ord + Clone, V: Ord + Clone>(
+    t: &VTerm<C, V>,
+    s: &VTerm<C, V>,
+) -> Option<Vec<Position>> {
+    if t == s {
+        return Some(vec![vec![]]);
+    }
+    match s {
+        Term::App(_, ts) => {
+            let mut acc: Option<Vec<Position>> = None;
+            // foldr over `zip [0..] ts`: process indices high→low, appending
+            // each contributing index's `(x:)`-prefixed positions.
+            for (x, sub) in ts.iter().enumerate().rev() {
+                if let Some(ps) = find_pos(t, sub) {
+                    let prefixed = ps.into_iter().map(|mut p| {
+                        p.insert(0, x as i64);
+                        p
+                    });
+                    match &mut acc {
+                        None => acc = Some(prefixed.collect()),
+                        Some(v) => v.extend(prefixed),
+                    }
+                }
+            }
+            acc
+        }
+        Term::Lit(_) => None,
+    }
+}
+
+/// `deepest_prot_subterm term pos`: the deepest "protected" subterm of `term`
+/// on the path to `pos` (anything but a pair or AC operator is protected).
+/// Returns `None` if there is no protected subterm. Port of HS
+/// `deepestProtSubterm` (Positions.hs:125). Uses n-ary indexing (`atMay`),
+/// matching [`find_pos`]. Panics on an invalid position, like HS.
+pub fn deepest_prot_subterm<C: Ord + Clone, V: Ord + Clone>(
+    term: &VTerm<C, V>,
+    pos: &[i64],
+) -> Option<VTerm<C, V>> {
+    fn f<C: Ord + Clone, V: Ord + Clone>(
+        orig: &VTerm<C, V>,
+        st: VTerm<C, V>,
+        t: &VTerm<C, V>,
+        pos: &[i64],
+    ) -> Option<VTerm<C, V>> {
+        match pos.split_first() {
+            None => {
+                if &st == orig && (is_pair(orig) || is_ac(orig)) {
+                    None
+                } else {
+                    Some(st)
+                }
+            }
+            Some((i, rest)) => match t {
+                Term::App(_, args) => {
+                    let a = args
+                        .get(*i as usize)
+                        .expect("deepest_prot_subterm: invalid position given");
+                    let new_st = if is_pair(t) || is_ac(t) { st } else { t.clone() };
+                    f(orig, new_st, a, rest)
+                }
+                Term::Lit(_) => panic!("deepest_prot_subterm: invalid position given"),
+            },
+        }
+    }
+    f(term, term.clone(), term, pos)
 }
 
 /// `positions t`: every position in `t` (including the empty position at
@@ -149,6 +225,41 @@ mod tests {
         let t: LNTerm = pair(msg_var("x", 0), msg_var("y", 0));
         let r = at_pos(&t, &[]).unwrap();
         assert_eq!(r, t);
+    }
+
+    #[test]
+    fn find_pos_root_and_children() {
+        let a = msg_var("a", 0);
+        let b = msg_var("b", 0);
+        let t: LNTerm = pair(a.clone(), b.clone());
+        assert_eq!(find_pos(&t, &t), Some(vec![vec![]]));
+        assert_eq!(find_pos(&a, &t), Some(vec![vec![0]]));
+        assert_eq!(find_pos(&b, &t), Some(vec![vec![1]]));
+        assert_eq!(find_pos(&msg_var("z", 0), &t), None);
+    }
+
+    #[test]
+    fn find_pos_multiple_occurrences_hs_foldr_order() {
+        // pair(a, pair(b, a)): `a` occurs at [0] and [1,1]. HS `findPos`
+        // folds right, so the higher index's positions come first.
+        let a = msg_var("a", 0);
+        let b = msg_var("b", 0);
+        let t: LNTerm = pair(a.clone(), pair(b.clone(), a.clone()));
+        assert_eq!(find_pos(&a, &t), Some(vec![vec![1, 1], vec![0]]));
+    }
+
+    #[test]
+    fn deepest_prot_subterm_through_pair() {
+        // In pair(h(a), b), the deepest protected subterm on the path to
+        // a (position [0,0]) is h(a): pairs are transparent, h is protected.
+        use crate::builtin::msg_var as mv;
+        use crate::function_symbols::{FunSym, NoEqSym, Privacy, Constructability};
+        let h = NoEqSym::new(b"h", 1, Privacy::Public, Constructability::Constructor);
+        let ha: LNTerm = Term::App(FunSym::NoEq(h), vec![mv("a", 0)].into());
+        let t: LNTerm = pair(ha.clone(), mv("b", 0));
+        assert_eq!(deepest_prot_subterm(&t, &[0, 0]), Some(ha));
+        // No protected subterm above a top-level pair → None at the root.
+        assert_eq!(deepest_prot_subterm(&t, &[]), None);
     }
 
     #[test]

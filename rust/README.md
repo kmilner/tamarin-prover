@@ -32,14 +32,14 @@ spans `classic/`, `ake/`, `sp14/`, the `csf*/` series, `features/`, `loops/`,
 
 | Result | Files | Meaning |
 |--------|------:|---------|
-| MATCH | 200 | Rust output byte-identical to Haskell |
-| DIFF  |   6 | needs an unported feature (`--diff`, `--auto-sources`); HS output is cached and re-compared automatically when the feature lands |
-| SKIP  |  69 | no Haskell reference to compare against (HS exceeds the cap, or produces no/empty output) |
+| MATCH | 202 | Rust output byte-identical to Haskell |
+| DIFF  |   5 | needs an unported feature (`--diff` observational equivalence); HS output is cached and re-compared automatically when the feature lands |
+| SKIP  |  68 | no Haskell reference to compare against (HS exceeds the cap, or produces no/empty output) |
 
 No proof-search or verdict (verified/falsified) divergence remains. Theories
-outside the corpus require an unported frontend — SAPiC `process:`,
-observational equivalence (`--diff`), or `--auto-sources` — or exercise searches
-that Haskell itself does not finish.
+outside the corpus require an unported frontend — SAPiC `process:` or
+observational equivalence (`--diff`) — or exercise searches that Haskell itself
+does not finish.
 
 ## Performance
 
@@ -106,6 +106,10 @@ Regenerate the tables with `scripts/bench.sh`.
 - **Solver:** full constraint-system port — simplification, source
   refinement/saturation, chain extension, contradiction detection, induction,
   stored-proof replay, and AC-modulo unification via pooled Maude.
+- **`--auto-sources`:** automatic sources-lemma generation — annotates rules
+  with `AUTO_IN_*`/`AUTO_OUT_*` actions and synthesises the `AUTO_typing`
+  sources lemma when the refined sources contain partial deconstructions
+  (HS `addAutoSourcesLemma`).
 - **Heuristics:** smart (`s`/`S`), goal-number (`C`/`c`), injective (`i`/`I`),
   SAPiC (`p`/`P`), oracle (`o`/`O`), and `tactic:` rankings — selected by the
   in-file `heuristic:`/`tactic:` annotation or per-lemma attribute, or overridden
@@ -123,7 +127,6 @@ Regenerate the tables with `scripts/bench.sh`.
   SAPiC theories (multiset-rewrite rules) prove fine; the `process:` block itself
   is not compiled.
 - **`diff(...)` / `--diff`** — observational-equivalence mode.
-- **`--auto-sources`** — automatic sources-lemma generation.
 - Other parse-only CLI flags: `--saturation`, `--open-chains`,
   `--partial-evaluation`, `--stop-on-trace` (RS already defaults to DFS, as HS
   does), `--replication-bound`; `--output-json`/`--output-dot` write stubs and

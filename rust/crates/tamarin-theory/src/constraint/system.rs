@@ -369,6 +369,57 @@ fn add_node_diagnostics(id: &NodeId, rule: &RuleACInst) {
 impl System {
     pub fn empty() -> Self { Self::default() }
 
+    /// The rule instance at node `v`, if present. Port of HS `nodeRuleSafe`
+    /// (System.hs:917): `M.lookup v sNodes`.
+    pub fn node_rule_safe(&self, v: &NodeId) -> Option<&RuleACInst> {
+        self.nodes.iter().find(|(id, _)| id == v).map(|(_, r)| r)
+    }
+
+    /// All `In`- and protocol-premise terms in the system, as
+    /// `(node, premise, term-index, term)`. Port of HS `allPrems`
+    /// (System.hs:894).
+    pub fn all_prems(&self) -> Vec<(NodeId, crate::rule::PremIdx, usize, tamarin_term::lterm::LNTerm)> {
+        let mut out = Vec::new();
+        for (i, ru) in self.nodes.iter() {
+            for (j, fa) in ru.enumerate_premises() {
+                if let Some(ms) = crate::fact::proto_or_in_fact_view(fa) {
+                    for (k, m) in ms.into_iter().enumerate() {
+                        out.push((i.clone(), j, k, m));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// All unsolved destruction chains, as `(NodeConc, NodePrem)`. Port of HS
+    /// `unsolvedChains` (System.hs:1601).
+    pub fn unsolved_chains(&self) -> Vec<(crate::constraint::constraints::NodeConc, crate::constraint::constraints::NodePrem)> {
+        use crate::constraint::constraints::Goal;
+        let mut out = Vec::new();
+        for (g, status) in self.goals.iter() {
+            if status.solved { continue; }
+            if let Goal::Chain(from, to) = g {
+                out.push((from.clone(), to.clone()));
+            }
+        }
+        out
+    }
+
+    /// All unsolved premise goals, as `(NodePrem, LNFact)`. Port of HS
+    /// `unsolvedPremises` (System.hs:1505).
+    pub fn unsolved_premises(&self) -> Vec<(crate::constraint::constraints::NodePrem, crate::fact::LNFact)> {
+        use crate::constraint::constraints::Goal;
+        let mut out = Vec::new();
+        for (g, status) in self.goals.iter() {
+            if status.solved { continue; }
+            if let Goal::Premise(premidx, fa) = g {
+                out.push((premidx.clone(), fa.clone()));
+            }
+        }
+        out
+    }
+
     /// Copy-on-write mutable access to `nodes`.  Clones the inner `Vec`
     /// only if the `Arc` is shared with another `System` (refcount > 1);
     /// otherwise hands out a `&mut` to the existing storage.  Use this
