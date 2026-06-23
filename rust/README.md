@@ -37,12 +37,12 @@ exceeds the cap (genuinely hard or oracle-dependent searches).
 ## Performance
 
 RS uses a fraction of HS's peak resident memory across the board, and is faster
-in wall-clock across the representative workloads at the default multi-core
-settings — including the Maude-bound bilinear-pairing proofs, where per-Maude-call
-IPC dominates and the work is essentially serial. The one single-core exception
-is the natural-numbers/multiset `gcm` proof: at one core RS trails HS by ~14 %, but
-it parallelises far better (47 s → 19 s, vs HS 42 s → 30 s), so it leads from four
-cores up. Representative protocols (aarch64 Linux, 16 cores, GHC 9.6.7, Maude
+in wall-clock across every representative workload at all core counts —
+including the Maude-bound bilinear-pairing proofs, where per-Maude-call IPC
+dominates and the work is essentially serial. The natural-numbers/multiset `gcm`
+proof is a strong RS win (24 s vs 42 s at one core, 9 s vs 30 s at sixteen) after
+a native ground-AC-equality match short-circuit eliminated ~500 K redundant Maude
+round-trips. Representative protocols (aarch64 Linux, 16 cores, GHC 9.6.7, Maude
 3.5.1): `NSPK3` (classic, sub-second reference), `Joux` (bilinear pairing —
 Maude-bound), `stateverif_left_right` (SAPiC), `gcm` (key-wrapping, natural-numbers
 + multiset, deep constraint search), `wireguard` (deep proof search, few rules),
@@ -53,39 +53,39 @@ Maude-bound), `stateverif_left_right` (SAPiC), `gcm` (key-wrapping, natural-numb
 | File | HS wall | RS wall | HS peak RSS | RS peak RSS |
 |------|--------:|--------:|------------:|------------:|
 | `NSPK3.spthy` | 0.9 s | 0.5 s | 66 MB | 17 MB |
-| `Joux.spthy` | 6.6 s | 5.6 s | 253 MB | 46 MB |
-| `stateverif_left_right.spthy` | 10.4 s | 7.8 s | 808 MB | 44 MB |
-| `gcm.spthy` | 41.5 s | 47.4 s | 1332 MB | 103 MB |
-| `wireguard.spthy` | 39.0 s | 18.3 s | 1659 MB | 123 MB |
-| `CCITT_X509_3.spthy` | 148.5 s | 76.4 s | 3396 MB | 636 MB |
+| `Joux.spthy` | 6.6 s | 5.5 s | 252 MB | 48 MB |
+| `stateverif_left_right.spthy` | 10.5 s | 7.9 s | 825 MB | 50 MB |
+| `gcm.spthy` | 41.9 s | 24.4 s | 1336 MB | 103 MB |
+| `wireguard.spthy` | 38.7 s | 18.0 s | 1659 MB | 124 MB |
+| `CCITT_X509_3.spthy` | 143.6 s | 72.6 s | 3386 MB | 637 MB |
 
 **4 cores** — HS `+RTS -N4`, RS `--processors=4`
 
 | File | HS wall | RS wall | HS peak RSS | RS peak RSS |
 |------|--------:|--------:|------------:|------------:|
-| `NSPK3.spthy` | 0.5 s | 0.3 s | 94 MB | 27 MB |
-| `Joux.spthy` | 6.0 s | 5.5 s | 283 MB | 50 MB |
-| `stateverif_left_right.spthy` | 6.5 s | 5.1 s | 780 MB | 69 MB |
-| `gcm.spthy` | 32.4 s | 21.4 s | 1368 MB | 155 MB |
-| `wireguard.spthy` | 23.2 s | 11.9 s | 1598 MB | 130 MB |
-| `CCITT_X509_3.spthy` | 66.5 s | 24.0 s | 5589 MB | 668 MB |
+| `NSPK3.spthy` | 0.4 s | 0.3 s | 96 MB | 26 MB |
+| `Joux.spthy` | 5.6 s | 5.3 s | 273 MB | 51 MB |
+| `stateverif_left_right.spthy` | 6.3 s | 5.0 s | 887 MB | 71 MB |
+| `gcm.spthy` | 31.8 s | 10.0 s | 1329 MB | 159 MB |
+| `wireguard.spthy` | 22.4 s | 11.6 s | 1652 MB | 131 MB |
+| `CCITT_X509_3.spthy` | 63.5 s | 24.0 s | 5970 MB | 672 MB |
 
 **16 cores** — HS `+RTS -N16`, RS `--processors=16`
 
 | File | HS wall | RS wall | HS peak RSS | RS peak RSS |
 |------|--------:|--------:|------------:|------------:|
-| `NSPK3.spthy` | 0.6 s | 0.4 s | 143 MB | 33 MB |
-| `Joux.spthy` | 6.7 s | 5.5 s | 321 MB | 59 MB |
-| `stateverif_left_right.spthy` | 9.6 s | 5.0 s | 876 MB | 101 MB |
-| `gcm.spthy` | 30.5 s | 19.2 s | 1365 MB | 228 MB |
-| `wireguard.spthy` | 21.6 s | 11.5 s | 1748 MB | 143 MB |
-| `CCITT_X509_3.spthy` | 66.1 s | 10.2 s | 8097 MB | 775 MB |
+| `NSPK3.spthy` | 0.5 s | 0.4 s | 144 MB | 34 MB |
+| `Joux.spthy` | 6.4 s | 5.4 s | 328 MB | 62 MB |
+| `stateverif_left_right.spthy` | 6.6 s | 4.9 s | 833 MB | 96 MB |
+| `gcm.spthy` | 30.2 s | 8.8 s | 1412 MB | 239 MB |
+| `wireguard.spthy` | 21.2 s | 11.5 s | 1706 MB | 144 MB |
+| `CCITT_X509_3.spthy` | 66.5 s | 10.2 s | 8364 MB | 774 MB |
 
 Peak RSS is the prover **process** only — Maude runs as a separate subprocess on
 both sides and is not counted (GHC-heap vs Rust-heap). The memory gap is large
 and universal (e.g. `wireguard` ~0.15 GB vs ~1.7 GB; `CCITT_X509_3` ~0.8 GB vs
 ~8.0 GB; `gcm` ~0.1–0.2 GB vs ~1.4 GB). Wall-clock scales with cores only where
-the proof parallelises — `CCITT_X509_3` drops 76 s → 10 s and `gcm` 47 s → 19 s
+the proof parallelises — `CCITT_X509_3` drops 73 s → 10 s and `gcm` 24 s → 9 s
 (RS, 1 → 16 cores), while Maude-bound `Joux` and search-bound `wireguard` are
 largely serial and barely move. Regenerate the
 tables with `rust/scripts/bench.sh`.
