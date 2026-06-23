@@ -38,6 +38,7 @@
 //! - Remaining `Theory.Sapic.*` (Substitution, Print)
 
 pub mod atom;
+pub mod auto_sources;
 pub mod check_terms;
 pub mod fact;
 pub mod formula;
