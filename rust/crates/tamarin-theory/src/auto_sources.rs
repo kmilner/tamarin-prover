@@ -385,12 +385,6 @@ pub fn add_auto_sources_lemma(
     AutoSourcesResult { annotation_groups, formula }
 }
 
-/// Whether any source case still has an open destruction chain
-/// (HS `containsPartialDeconstructions`, Rule.hs:180).
-pub fn contains_partial_deconstructions(chains: &[((NodeConc, NodePrem), System)]) -> bool {
-    !chains.is_empty()
-}
-
 /// Build the AUTO source lemma item (HS `unprovenLemma lemmaName [SourceLemma]
 /// AllTraces formula`, OpenTheory.hs:157).
 pub fn build_source_lemma(name: &str, formula: p::Formula) -> crate::theory::Lemma {
