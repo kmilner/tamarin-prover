@@ -26,18 +26,19 @@ volatile header lines (Git revision, compile time, processing time).
 
 The parity gate (`scripts/corpus_file_diff.sh`, corpus in
 `scripts/parity_corpus.txt`) compares the Rust port against the Haskell prover
-on a 377-file corpus: the theories under `examples/` that use only ported
+on a 427-file corpus: the theories under `examples/` that use only ported
 features and that Haskell proves within a 300 s/lemma cap. This spans
 `classic/`, `ake/`, `sp14/`, the `csf*/` series, `features/`, `loops/`,
-`post17/`, `regression/`, `related_work/`, and the multiset-rewrite theories in
+`post17/`, `regression/`, `related_work/`, the multiset-rewrite theories in
 `csf18-xor/`, `jcs19-xor/`, `idbased/`, `eurosp19-eccDAA/`,
 `esorics23-bluetooth/`, `csf20-disputeResolution/`, `fm24-cardpayments/`,
-`wisec21-5G-handover/`, `wireguard/`, the POIDC dirs, and the
-`thesis-LaraSchmid-evoting/` and pre-translated `sapic/` corpora.
+`wisec21-5G-handover/`, `wireguard/`, the POIDC and
+`thesis-LaraSchmid-evoting/` corpora, and 50 SAPiC `process:` theories from
+`sapic/`.
 
 | Result | Files | Meaning |
 |--------|------:|---------|
-| MATCH | 309 | Rust output byte-identical to Haskell |
+| MATCH | 359 | Rust output byte-identical to Haskell |
 | DIFF  |   0 | — |
 | SKIP  |  68 | no Haskell reference to compare against (HS exceeds the cap, or produces no/empty output) |
 
@@ -117,6 +118,14 @@ Regenerate the tables with `scripts/bench.sh`.
   with `AUTO_IN_*`/`AUTO_OUT_*` actions and synthesises the `AUTO_typing`
   sources lemma when the refined sources contain partial deconstructions
   (HS `addAutoSourcesLemma`).
+- **SAPiC `process:`** — the process-calculus frontend: translation of a
+  `process:` block (and `let` process definitions) to multiset-rewrite rules,
+  byte-identical to HS `Sapic.translate`. Covers the core constructs (`0`, `|`,
+  `+`, `!`, `new`, `in`/`out`, `event`, conditionals), mutable state
+  (`insert`/`delete`/`lookup`), `lock`/`unlock`, process calls + `let`
+  bindings/destructors, secret/private channels, and the progress + reliable-
+  channel translations. (`report()`/`locations-report` translation is the
+  remaining construct.)
 - **Heuristics:** smart (`s`/`S`), goal-number (`C`/`c`), injective (`i`/`I`),
   SAPiC (`p`/`P`), oracle (`o`/`O`), and `tactic:` rankings — selected by the
   in-file `heuristic:`/`tactic:` annotation or per-lemma attribute, or overridden
@@ -130,9 +139,9 @@ Regenerate the tables with `scripts/bench.sh`.
 
 ## Not yet ported
 
-- **`process:`** — the SAPiC frontend (process-calculus compiler). Pre-translated
-  SAPiC theories (multiset-rewrite rules) prove fine; the `process:` block itself
-  is not compiled.
+- **SAPiC `report()` / `locations-report` translation** — the remaining SAPiC
+  construct (the rest of the `process:` frontend is ported; see Implemented).
+  `feature-locations/` theories use it.
 - **`diff(...)` / `--diff`** — observational-equivalence mode.
 - **Accountability (`accounts for` / `verdictfunction`)** — the accountability
   frontend that expands a verdict lemma into case sub-lemmas; the surrounding
