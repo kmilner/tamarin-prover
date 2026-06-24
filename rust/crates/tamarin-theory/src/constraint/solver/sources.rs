@@ -5467,6 +5467,55 @@ fn var_occurrences_nodes(
     // ctx is HS's [String] occurrence path; head is innermost.
     // We push for each tree-descend, then mutate-and-pop is impractical;
     // we just clone (HS uses persistent list = sharing tail).
+    // HS `foldFreesOcc` context string for a function symbol head
+    // (Term.hs `instance HasFrees (Term l)`, LTerm.hs:745-748):
+    //   FApp (NoEq o) as  ->  push `BC.unpack . fst $ o`  (the bare op name)
+    //   FApp o        as  ->  push `show o`               (the FunSym, for AC/C/List)
+    // The SAME context is pushed once for the whole arg list — HS does NOT
+    // descend per-argument with an index, so every argument of an `FApp`
+    // shares the symbol-name context.  (Previously RS pushed the arg INDEX
+    // and no symbol name, which produced occurrence-sets incompatible with
+    // HS's `varOccurences`, breaking the canonical `renameDropNameHints`
+    // ordering and so under-collapsing alpha-equivalent cases in
+    // `removeRedundantCases`.)
+    fn funsym_occ_ctx(sym: &tamarin_term::function_symbols::FunSym) -> String {
+        use tamarin_term::function_symbols::{FunSym, AcSym, CSym};
+        match sym {
+            FunSym::NoEq(s) => String::from_utf8_lossy(&s.name).into_owned(),
+            FunSym::Ac(ac) => match ac {
+                AcSym::Union => "AC Union".to_string(),
+                AcSym::Mult => "AC Mult".to_string(),
+                AcSym::Xor => "AC Xor".to_string(),
+                AcSym::NatPlus => "AC NatPlus".to_string(),
+            },
+            FunSym::C(c) => match c {
+                CSym::EMap => "C EMap".to_string(),
+            },
+            FunSym::List => "List".to_string(),
+        }
+    }
+    // HS `show (factTag fa)` (derived `Show FactTag`, Fact.hs:132-143).
+    //   ProtoFact mult name arity -> "ProtoFact <mult> \"<name>\" <arity>"
+    //   FreshFact/OutFact/InFact/KUFact/KDFact/DedFact/TermFact (nullary)
+    fn fact_tag_occ_ctx(f: &crate::fact::LNFact) -> String {
+        use crate::fact::{FactTag, Multiplicity};
+        match &f.tag {
+            FactTag::Proto(m, name, arity) => {
+                let mstr = match m {
+                    Multiplicity::Persistent => "Persistent",
+                    Multiplicity::Linear => "Linear",
+                };
+                format!("ProtoFact {} {:?} {}", mstr, name, arity)
+            }
+            FactTag::Fresh => "FreshFact".to_string(),
+            FactTag::Out => "OutFact".to_string(),
+            FactTag::In => "InFact".to_string(),
+            FactTag::Ku => "KUFact".to_string(),
+            FactTag::Kd => "KDFact".to_string(),
+            FactTag::Ded => "DedFact".to_string(),
+            FactTag::Term => "TermFact".to_string(),
+        }
+    }
     fn visit_term(
         t: &tamarin_term::lterm::LNTerm,
         ctx: &[String],
@@ -5477,23 +5526,33 @@ fn var_occurrences_nodes(
                 out.entry(v.clone()).or_default().insert(ctx.to_vec());
             }
             Term::Lit(Lit::Con(_)) => {}
-            Term::App(_, args) => {
-                for (i, a) in args.iter().enumerate() {
-                    let mut sub = vec![i.to_string()];
-                    sub.extend(ctx.iter().cloned());
+            Term::App(sym, args) => {
+                // HS pushes the symbol-name context ONCE and recurses into
+                // ALL args under it (no per-arg index).
+                let mut sub = vec![funsym_occ_ctx(sym)];
+                sub.extend(ctx.iter().cloned());
+                for a in args.iter() {
                     visit_term(a, &sub, out);
                 }
             }
         }
     }
+    // HS `instance HasFrees Fact` (Fact.hs:187):
+    //   foldFreesOcc f c fa = foldFreesOcc f (show (factTag fa):c) (factTerms fa)
+    // i.e. push `show (factTag fa)` then descend into the term LIST, which
+    // (via the `[a]` instance) pushes the list index `show i` per term.  So
+    // term i's context = [show i, show factTag, ...c].  RS previously pushed
+    // only the term index and omitted the factTag layer.
     fn visit_fact(
         f: &crate::fact::LNFact,
         ctx: &[String],
         out: &mut BTreeMap<LVar, BTreeSet<Vec<String>>>,
     ) {
+        let mut tag_ctx = vec![fact_tag_occ_ctx(f)];
+        tag_ctx.extend(ctx.iter().cloned());
         for (i, t) in f.terms.iter().enumerate() {
             let mut sub = vec![i.to_string()];
-            sub.extend(ctx.iter().cloned());
+            sub.extend(tag_ctx.iter().cloned());
             visit_term(t, &sub, out);
         }
     }
