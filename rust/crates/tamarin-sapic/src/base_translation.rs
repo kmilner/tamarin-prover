@@ -151,6 +151,168 @@ pub fn base_trans_action(
             );
             Ok((vec![body], tildex.clone()))
         }
+        // (ChIn channel t' matchVar) (Basetranslation.hs:105-127): handle channel
+        // input `in(c,pat); P` like `in(c,x); let pat = x in P`.  Mint a fresh
+        // message variable `x` avoiding `tildex`, build the Let combinator rules
+        // for `let pat = x`, then prepend the channel facts via
+        // `mergeWithStateRule` (only onto rules that have a State premise).
+        SapicAction::ChIn { chan, msg, match_vars } => {
+            // `x = evalFreshAvoiding (freshLVar "x" LSortMsg) tildex`.
+            let x = fresh_msg_var_avoiding("x", tildex);
+            let xt: LNTerm = VTerm::Lit(Lit::Var(x.clone()));
+            // `xTerm = varTerm (SapicLVar { slvar = x, stype = Nothing })`.
+            let x_sapic: SapicTerm = VTerm::Lit(Lit::Var(SapicLVar::untyped(x.clone())));
+            // `(rules, tx', _) = baseTransComb (Let t' xTerm matchVar) (an {elseBranch=False}) p tildex`.
+            let let_comb = tamarin_theory::sapic::ProcessCombinator::Let {
+                left: msg.clone(),
+                right: x_sapic,
+                match_vars: match_vars.clone(),
+            };
+            let mut an_let = an.clone();
+            an_let.else_branch = false;
+            let (rules, tx_prime, _) = base_trans_comb(&let_comb, &an_let, p, tildex)?;
+            // `t = toLNTerm t'`.
+            let t = to_ln_term(msg);
+            // `channelIn ts = [ChannelIn ts | needsAssImmediate]`.
+            let channel_in = |ts: &LNTerm| -> Vec<TransAction> {
+                if needs_ass_immediate {
+                    vec![TransAction::ChannelIn(ts.clone())]
+                } else {
+                    vec![]
+                }
+            };
+            match chan {
+                None => {
+                    if needs_ass_immediate {
+                        // delay matching: `mergeWithStateRule ([In x], channelIn x, []) rules`.
+                        let merged = merge_with_state_rule(
+                            (vec![TransFact::In(xt.clone())], channel_in(&xt), vec![]),
+                            rules,
+                        );
+                        Ok((merged, tx_prime))
+                    } else {
+                        // `tx2' = freeset t `union` tildex`; single direct In rule.
+                        let mut tx2 = tildex.clone();
+                        tx2.extend(ln_term_vars(&t));
+                        let body: RuleBody = (
+                            vec![def_state(tildex), TransFact::In(t)],
+                            vec![],
+                            vec![def_state_next(&tx2)],
+                            vec![],
+                        );
+                        Ok((vec![body], tx2))
+                    }
+                }
+                Some(tc_term) => {
+                    // `tc = toLNTerm tc'`; `ts = fAppPair (tc, varTerm x)`.
+                    let tc = to_ln_term(tc_term);
+                    let ts = tamarin_term::builtin::pair(tc.clone(), xt.clone());
+                    // `ack = [Ack tc xt | not asyncChannels]`.
+                    let ack: Vec<TransFact> = if _async_channels {
+                        vec![]
+                    } else {
+                        vec![TransFact::Ack(tc.clone(), xt.clone())]
+                    };
+                    // `mergeWithStateRule ([Message tc xt], [], ack) rules`.
+                    let mut out = merge_with_state_rule(
+                        (vec![TransFact::Message(tc.clone(), xt.clone())], vec![], ack),
+                        rules.clone(),
+                    );
+                    // only add adversary rule if channel is not guaranteed secret.
+                    if an.secret_channel.is_none() {
+                        out.extend(merge_with_state_rule(
+                            (vec![TransFact::In(ts.clone())], channel_in(&ts), vec![]),
+                            rules,
+                        ));
+                    }
+                    Ok((out, tx_prime))
+                }
+            }
+        }
+        // (ChOut (Just tc') t') | secretChannel = Just (AnVar _)
+        // (Basetranslation.hs:128-137): the private secret-channel output.
+        SapicAction::ChOut { chan: Some(tc_term), msg } if an.secret_channel.is_some() => {
+            let tc = to_ln_term(tc_term);
+            let t = to_ln_term(msg);
+            if _async_channels {
+                // `[([def_state], [], [Message tc t, def_state' tildex], [])]`.
+                let body: RuleBody = (
+                    vec![def_state(tildex)],
+                    vec![],
+                    vec![TransFact::Message(tc, t), def_state_next(tildex)],
+                    vec![],
+                );
+                Ok((vec![body], tildex.clone()))
+            } else {
+                // `semistate = State LSemiState (p++[1]) tildex`.
+                let semistate = TransFact::State(
+                    StateKind::LSemiState,
+                    p1.clone(),
+                    tildex.iter().cloned().collect(),
+                );
+                let body1: RuleBody = (
+                    vec![def_state(tildex)],
+                    vec![],
+                    vec![TransFact::Message(tc.clone(), t.clone()), semistate.clone()],
+                    vec![],
+                );
+                let body2: RuleBody = (
+                    vec![semistate, TransFact::Ack(tc, t)],
+                    vec![],
+                    vec![def_state_next(tildex)],
+                    vec![],
+                );
+                Ok((vec![body1, body2], tildex.clone()))
+            }
+        }
+        // (ChOut (Just tc') t') | secretChannel = Nothing
+        // (Basetranslation.hs:138-149): the public-channel output.
+        SapicAction::ChOut { chan: Some(tc_term), msg } => {
+            let tc = to_ln_term(tc_term);
+            let t = to_ln_term(msg);
+            // The adversary-injected output rule: `([def_state, In tc],
+            // channelIn tc, [Out t, def_state' tildex], [])`, with
+            // `channelIn tc = [ChannelIn tc | needsAssImmediate]`.
+            let in_acts: Vec<TransAction> = if needs_ass_immediate {
+                vec![TransAction::ChannelIn(tc.clone())]
+            } else {
+                vec![]
+            };
+            let in_rule: RuleBody = (
+                vec![def_state(tildex), TransFact::In(tc.clone())],
+                in_acts,
+                vec![TransFact::Out(t.clone()), def_state_next(tildex)],
+                vec![],
+            );
+            if _async_channels {
+                let msg_rule: RuleBody = (
+                    vec![def_state(tildex)],
+                    vec![],
+                    vec![TransFact::Message(tc, t), def_state_next(tildex)],
+                    vec![],
+                );
+                Ok((vec![in_rule, msg_rule], tildex.clone()))
+            } else {
+                let semistate = TransFact::State(
+                    StateKind::LSemiState,
+                    p1.clone(),
+                    tildex.iter().cloned().collect(),
+                );
+                let msg_rule: RuleBody = (
+                    vec![def_state(tildex)],
+                    vec![],
+                    vec![TransFact::Message(tc.clone(), t.clone()), semistate.clone()],
+                    vec![],
+                );
+                let ack_rule: RuleBody = (
+                    vec![semistate, TransFact::Ack(tc, t)],
+                    vec![],
+                    vec![def_state_next(tildex)],
+                    vec![],
+                );
+                Ok((vec![in_rule, msg_rule, ack_rule], tildex.clone()))
+            }
+        }
         // (ChOut Nothing t): `[([def_state], [], [def_state' tildex, Out t], [])]`
         SapicAction::ChOut { chan: None, msg } => {
             let t = to_ln_term(msg);
@@ -559,6 +721,46 @@ pub fn base_trans_comb(
             }
         }
     }
+}
+
+/// `mergeWithStateRule' (l',a',r') (l,a,r,f)` (Basetranslation.hs:84-92):
+/// prepend the channel facts `(l',a',r')` onto a rule body `(l,a,r,f)` ONLY
+/// when the rule's premise list `l` contains a `State` fact (`List.find
+/// isState l`); otherwise the rule is left unchanged.  `mergeWithStateRule`
+/// maps this over a list of rule bodies.
+fn merge_with_state_rule(
+    extra: (Vec<TransFact>, Vec<TransAction>, Vec<TransFact>),
+    rules: Vec<RuleBody>,
+) -> Vec<RuleBody> {
+    let (extra_l, extra_a, extra_r) = extra;
+    rules
+        .into_iter()
+        .map(|(l, a, r, f)| {
+            let has_state = l.iter().any(|fact| matches!(fact, TransFact::State(..)));
+            if has_state {
+                // HS appends: `(l ++ l', a ++ a', r ++ r', f)`.
+                let mut nl = l;
+                nl.extend(extra_l.clone());
+                let mut na = a;
+                na.extend(extra_a.clone());
+                let mut nr = r;
+                nr.extend(extra_r.clone());
+                (nl, na, nr, f)
+            } else {
+                (l, a, r, f)
+            }
+        })
+        .collect()
+}
+
+/// `evalFreshAvoiding (freshLVar name LSortMsg) tildex` (Basetranslation.hs:106):
+/// mint a fresh `LSortMsg` variable named `name` whose index avoids every
+/// variable index already present in `tildex`.  HS `avoid` = `maybe 0 (succ .
+/// snd) . boundsVarIdx` — i.e. (max index in `tildex`) + 1, or 0 if empty.
+fn fresh_msg_var_avoiding(name: &str, tildex: &BTreeSet<LVar>) -> LVar {
+    use tamarin_term::lterm::LSort;
+    let idx = tildex.iter().map(|v| v.idx).max().map(|m| m + 1).unwrap_or(0);
+    LVar::new(name, LSort::Msg, idx)
 }
 
 /// `freeset = fromList . frees` over an `LNTerm` — its variables.
@@ -983,6 +1185,21 @@ pub fn state_restrictions(has_delete: bool) -> Vec<tamarin_parser::ast::Restrict
     vec![parse("set_in", set_in_src), parse("set_notin", set_notin_src)]
 }
 
+
+/// The `in_event` restriction `resInEv` (Basetranslation.hs:439-444), added by
+/// `baseRestr` when `needsInEvRes` (a lemma needs the in-event axiom).  As with
+/// the other hardcoded restrictions, HS parses the string with
+/// `parseRestriction`; we parse the same formula body so the rendered output is
+/// byte-identical to HS.
+pub fn in_event_restriction() -> tamarin_parser::ast::Restriction {
+    use tamarin_parser::ast as p;
+    let src = "All x #t3. ChannelIn(x)@t3 ==> (Ex #t2. K(x)@t2 & #t2 < #t3\n\
+               & (All #t1. Event()@t1  ==> #t1 < #t2 | #t3 < #t1)\n\
+               & (All #t1 xp. K(xp)@t1 ==> #t1 < #t2 | #t1 = #t2 | #t3 < #t1))";
+    let formula = tamarin_parser::parser::parse_formula_str(src)
+        .unwrap_or_else(|e| panic!("Error parsing hard-coded restriction in_event: {e:?}"));
+    p::Restriction { name: "in_event".to_string(), formula, attributes: vec![] }
+}
 
 // =============================================================================
 // resLocking / resLockingPure (Basetranslation.hs:366-425)

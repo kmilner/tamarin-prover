@@ -276,6 +276,29 @@ fn subst_term(subst: &Subst<Name, SapicLVar>, t: &SapicTerm) -> SapicTerm {
     apply_vterm(subst, t.clone())
 }
 
+/// `applyMatchVars subst vs` (Process.hs:305-309): rewrite a set of match
+/// variables under a substitution.  Each `v` is replaced by the variables of
+/// `subst(v)` if `v` is in the substitution's domain, else kept as-is.
+fn apply_match_vars(
+    subst: &Subst<Name, SapicLVar>,
+    vs: &std::collections::BTreeSet<SapicLVar>,
+) -> std::collections::BTreeSet<SapicLVar> {
+    let mut out = std::collections::BTreeSet::new();
+    for v in vs {
+        match subst.image_of(v) {
+            Some(img) => {
+                for w in tamarin_term::vterm::vars_vterm_in_order(img) {
+                    out.insert(w);
+                }
+            }
+            None => {
+                out.insert(v.clone());
+            }
+        }
+    }
+    out
+}
+
 fn subst_action(
     subst: &Subst<Name, SapicLVar>,
     ac: tamarin_theory::sapic::SapicAction<SapicLVar>,
@@ -291,7 +314,12 @@ fn subst_action(
         A::ChIn { chan, msg, match_vars } => A::ChIn {
             chan: chan.map(|t| subst_term(subst, &t)),
             msg: subst_term(subst, &msg),
-            match_vars,
+            // HS `applyMatchVars subst vs` (Process.hs:305-309, 320): a match var
+            // `v` whose image under `subst` is a (compound) term is replaced by
+            // ALL the variables of that image; an undefined `v` is kept.  So a
+            // `let`-bound match var `=t` (where `t = <a,'test'>`) becomes the
+            // match-var set `{a}`.
+            match_vars: apply_match_vars(subst, &match_vars),
         },
         A::Insert(a, b) => A::Insert(subst_term(subst, &a), subst_term(subst, &b)),
         A::Delete(t) => A::Delete(subst_term(subst, &t)),

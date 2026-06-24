@@ -279,16 +279,20 @@ pub fn translate(
     needs_in_ev_res: bool,
     st_rules: &std::collections::BTreeSet<tamarin_term::subterm_rule::CtxtStRule>,
 ) -> Result<Translation, String> {
-    // annotate: toAnProcess + propagateNames + translateLetDestr + annotateLocks
-    //   (Sapic.hs:54-61).  The secret-channel / pure-state / report passes are
-    //   either no-ops for the in-scope subset (secret-channels) or gated off by
-    //   default (pure-state needs `--translation-state-optimisation`).
-    //   `translateLetDestr` (Phase 5) runs AFTER propagateNames and BEFORE
-    //   annotateLocks, eliminating var-RHS `let`s and annotating destructor /
-    //   kept `let`s.
+    // annotate: toAnProcess + propagateNames + annotateSecretChannels +
+    //   translateLetDestr + annotateLocks (Sapic.hs:54-61).  The pure-state /
+    //   report passes are gated off by default (pure-state needs
+    //   `--translation-state-optimisation`).  `translateLetDestr` (Phase 5) runs
+    //   AFTER annotateSecretChannels and BEFORE annotateLocks, eliminating
+    //   var-RHS `let`s and annotating destructor / kept `let`s.
     let an_proc_pre: Process<ProcessAnnotation<LVar>, SapicLVar> =
         propagate_names(to_annotated::<LVar>(plain.clone()));
-    let an_proc_let = crate::let_destructors::translate_let_destr(st_rules, an_proc_pre);
+    // annotateSecretChannels (Sapic.hs:58): attach `secret_channel` to every
+    // ChIn/ChOut whose channel is an always-secret fresh variable.  Runs AFTER
+    // propagateNames and BEFORE translateLetDestr.  (annotatePureStates is gated
+    // off by default — it needs `--translation-state-optimisation`.)
+    let an_proc_sec = crate::secret_channels::annotate_secret_channels(an_proc_pre);
+    let an_proc_let = crate::let_destructors::translate_let_destr(st_rules, an_proc_sec);
     let an_proc = crate::locks::annotate_locks(an_proc_let)?;
 
     // initial rules + initial tildex
@@ -320,6 +324,11 @@ pub fn translate(
         restrictions.extend(predicate_restrictions());
     }
     restrictions.push(single_session_restriction());
+    // `addIf needsInEvRes [resInEv]` (Basetranslation.hs:460) — the in_event
+    // restriction, AFTER single_session, when a lemma needs it.
+    if needs_in_ev_res {
+        restrictions.push(crate::base_translation::in_event_restriction());
+    }
 
     // Locking restrictions (baseRestr, Basetranslation.hs:463-468), AFTER the
     // hardcoded restrictions, in HS order:
@@ -339,6 +348,76 @@ pub fn translate(
     }
 
     Ok(Translation { rules, restrictions })
+}
+
+// =============================================================================
+// needsInEvRes (Sapic.hs:101, 156-181)
+// =============================================================================
+
+/// `needsInEvRes = any lemmaNeedsInEvRes (theoryLemmas th)` (Sapic.hs:101): does
+/// any of the theory's lemmas fall in the fragment that requires the `in_event`
+/// restriction?  Each lemma is classified via `lemma_needs_in_ev_res`.
+pub fn needs_in_ev_res(lemmas: &[tamarin_parser::ast::Lemma]) -> bool {
+    lemmas.iter().any(lemma_needs_in_ev_res)
+}
+
+/// `lemmaNeedsInEvRes` (Sapic.hs:175-181): classify a lemma by its trace
+/// quantifier and the (pos, neg) polarity of its formula.
+fn lemma_needs_in_ev_res(lem: &tamarin_parser::ast::Lemma) -> bool {
+    use tamarin_parser::ast::TraceQuantifier as TQ;
+    let (pos, neg) = is_pos_neg_formula(&lem.formula);
+    match (&lem.trace_quantifier, pos, neg) {
+        (TQ::AllTraces, _, true) => false,   // L- for all-traces
+        (TQ::ExistsTrace, true, _) => false, // L+ for exists-trace
+        (TQ::ExistsTrace, false, true) => true, // L- for exists-trace
+        (TQ::AllTraces, true, false) => true,   // L+ for all-traces
+        _ => true,                               // not in L- and L+
+    }
+}
+
+/// `isPosNegFormula` (Sapic.hs:156-169): determine whether a formula is in the
+/// positive (L+) and/or negative (L-) fragment.  Returns `(isPos, isNeg)`.  The
+/// only special case is an `Action` atom on the `K` fact, which is `(True,
+/// False)` (a `K(..)@t` action is positive but not negative).
+fn is_pos_neg_formula(f: &tamarin_parser::ast::Formula) -> (bool, bool) {
+    use tamarin_parser::ast::Formula::*;
+    fn and2(a: (bool, bool), b: (bool, bool)) -> (bool, bool) {
+        (a.0 && b.0, a.1 && b.1)
+    }
+    fn swap(a: (bool, bool)) -> (bool, bool) {
+        (a.1, a.0)
+    }
+    match f {
+        True | False => (true, true),
+        Atom(a) => is_pos_neg_atom(a),
+        Not(p) => swap(is_pos_neg_formula(p)),
+        And(p, q) | Or(p, q) => and2(is_pos_neg_formula(p), is_pos_neg_formula(q)),
+        // `Conn Imp p q -> isPosNegFormula $ Not p .||. q`.
+        Implies(p, q) => {
+            let not_p = Not(Box::new((**p).clone()));
+            let disj = Or(Box::new(not_p), Box::new((**q).clone()));
+            is_pos_neg_formula(&disj)
+        }
+        // `Conn Iff p q -> isPosNegFormula $ p .==>. q .&&. q .==>. p`.
+        Iff(p, q) => {
+            let pq = Implies(Box::new((**p).clone()), Box::new((**q).clone()));
+            let qp = Implies(Box::new((**q).clone()), Box::new((**p).clone()));
+            let conj = And(Box::new(pq), Box::new(qp));
+            is_pos_neg_formula(&conj)
+        }
+        Forall(_, p) | Exists(_, p) => is_pos_neg_formula(p),
+    }
+}
+
+/// `isPosNegFormula (Ato (Action _ f))` dispatches on `isActualKFact (factTag
+/// f)` (Sapic.hs:159, 167-169): a `K`-fact action is `(True, False)`; every
+/// other atom is `(True, True)`.
+fn is_pos_neg_atom(a: &tamarin_parser::ast::Atom) -> (bool, bool) {
+    use tamarin_parser::ast::Atom;
+    match a {
+        Atom::Action(fact, _) if fact.name == "K" => (true, false),
+        _ => (true, true),
+    }
 }
 
 #[cfg(test)]

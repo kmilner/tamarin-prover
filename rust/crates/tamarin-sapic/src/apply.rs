@@ -20,7 +20,7 @@ use tamarin_theory::rule::{ProtoRuleE, ProtoRuleName};
 use tamarin_theory::theory::{OpenProtoRule, OpenRestriction, Theory, TheoryItem};
 
 use crate::inline::{collect_process_defs, convert_process_with_defs};
-use crate::translate::translate;
+use crate::translate::{needs_in_ev_res, translate};
 use crate::typing::type_and_rename_process;
 
 /// Apply the SAPIC `process:` translation to a theory that contains exactly one
@@ -62,12 +62,23 @@ pub fn apply_sapic(
     let typed = type_and_rename_process(maude_sig, &plain)
         .map_err(|e| ElabError { message: format!("SAPIC typing: {e}") })?;
 
-    // translate → rules + restrictions.  `needs_in_ev_res` = false for the
-    // linear subset (no lemma needs the `in_event` restriction in typing2).
+    // translate → rules + restrictions.  `needs_in_ev_res = any
+    // lemmaNeedsInEvRes (theoryLemmas th)` (Sapic.hs:101): gates the
+    // `EventEmpty`/`ChannelIn` actions + the `in_event` restriction.  HS
+    // `theoryLemmas` = the (non-diff, non-accountability) `Lemma` items.
+    let lemmas: Vec<p::Lemma> = parsed
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            p::TheoryItem::Lemma(l) => Some(l.clone()),
+            _ => None,
+        })
+        .collect();
+    let needs_in_ev = needs_in_ev_res(&lemmas);
     // The signature's CtxtStRules drive `translateLetDestr` (let-destructor /
     // let-elimination pass).
     let st_rules = &maude_sig.st_rules;
-    let translation = translate(&typed, false, st_rules)
+    let translation = translate(&typed, needs_in_ev, st_rules)
         .map_err(|e| ElabError { message: format!("SAPIC translation: {e}") })?;
 
     // The `predicate:` declarations the embedded `_restrict` formulas expand

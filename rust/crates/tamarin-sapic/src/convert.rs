@@ -94,15 +94,17 @@ fn action(a: &p::SapicAction) -> Result<SapicAction<SapicLVar>, ConvertError> {
             msg: term(msg)?,
         }),
         p::SapicAction::ChIn { chan, msg } => {
-            // The surface `in(pat)` parser separates pattern (match) variables
-            // from freshly-bound ones (`extractMatchingVariables`).  The Rust
-            // parser does not yet carry that split, so for the linear subset
-            // (typing2 has no `in`) we keep `match_vars` empty.  Phase 2 must
-            // port `validPattern`/`extractMatchingVariables`.
+            // The surface `in(c, pat)` parser stores the pattern with `=t`
+            // (`PatMatch`) match markers.  HS `ChIn maybeChannel (unpattern pt)
+            // (extractMatchingVariables pt)` (Parser/Sapic.hs:114) unpatterns the
+            // message term and splits the matched variables out into `match_vars`.
+            // We reuse the same `unpattern`/`extractMatchingVariables` helper used
+            // for `let` patterns (Phase 5).
+            let (msg_unpat, match_vars) = convert_let_pattern(msg)?;
             Ok(SapicAction::ChIn {
                 chan: chan.as_ref().map(term).transpose()?,
-                msg: term(msg)?,
-                match_vars: BTreeSet::new(),
+                msg: msg_unpat,
+                match_vars,
             })
         }
         // Mutable state (Phase 3): `insert t1 v` / `delete t`.  These map to the

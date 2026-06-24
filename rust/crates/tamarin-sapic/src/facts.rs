@@ -70,6 +70,12 @@ pub enum TransFact {
     /// through (Basetranslation.hs:252-277).  `vars` are the bound variables in
     /// scope (rendered sorted, like `State`).
     FLet(ProcessPosition, LNTerm, Vec<LVar>),
+    /// `Message t t'` (Facts.hs:101): `Message( c, m )` — a message in transit
+    /// on a private channel (Basetranslation.hs ChIn/ChOut with a channel).
+    Message(LNTerm, LNTerm),
+    /// `Ack t t'` (Facts.hs:102): `Ack( c, m )` — the synchronous acknowledgement
+    /// for a private-channel message (non-async-channels case).
+    Ack(LNTerm, LNTerm),
 }
 
 /// `TransAction` (Facts.hs:43-77) — action facts.  Only the constructors used
@@ -104,6 +110,10 @@ pub enum TransAction {
     UnlockNamed(LNTerm, LVar),
     /// `UnlockUnnamed t v` (Facts.hs:231): `Unlock( '<idx v>', v, t )`.
     UnlockUnnamed(LNTerm, LVar),
+    /// `ChannelIn t` (Facts.hs:69, 224): `ChannelIn( t )` — emitted by `in`
+    /// actions when the theory has a lemma needing the `in_event` restriction
+    /// (`needsAssImmediate`).
+    ChannelIn(LNTerm),
 }
 
 /// `SpecialPosition` (Facts.hs:110-112).
@@ -175,6 +185,16 @@ pub fn fact_to_fact(f: &TransFact) -> LNFact {
             );
             proto_fact(Multiplicity::Linear, &full, ts)
         }
+        // `factToFact (Message t t') = protoFact Linear "Message" [t, t']`
+        // (Facts.hs:260) — the private-channel message-in-transit fact.
+        TransFact::Message(t1, t2) => {
+            proto_fact(Multiplicity::Linear, "Message", vec![t1.clone(), t2.clone()])
+        }
+        // `factToFact (Ack t t') = protoFact Linear "Ack" [t, t']` (Facts.hs:261)
+        // — the private-channel acknowledgement fact.
+        TransFact::Ack(t1, t2) => {
+            proto_fact(Multiplicity::Linear, "Ack", vec![t1.clone(), t2.clone()])
+        }
     }
 }
 
@@ -236,6 +256,9 @@ pub fn action_to_fact(a: &TransAction) -> LNFact {
             "Unlock",
             vec![lock_pub_term(v), VTerm::Lit(Lit::Var(v.clone())), t.clone()],
         ),
+        // `actionToFact (ChannelIn t) = protoFact Linear "ChannelIn" [t]`
+        // (Facts.hs:224).
+        TransAction::ChannelIn(t) => proto_fact(Multiplicity::Linear, "ChannelIn", vec![t.clone()]),
     }
 }
 

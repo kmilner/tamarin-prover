@@ -752,6 +752,41 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         }
         phase!("sapic translate");
 
+        // HS runs the full `checkWellformedness` on the TRANSLATED theory
+        // (TheoryLoader.hs:469-473, `checkTranslatedTheory`), i.e. AFTER SAPIC
+        // `translate` has injected the generated rules.  Our `check_theory` ran
+        // earlier on the PRE-translation theory (line ~600), so the SAPIC rules
+        // were invisible to the rule-dependent fact checks.  Re-run
+        // `factLhsOccurNoRhs` on the post-translation parsed theory (macros
+        // expanded, as HS `thyProtoRules` does) so SAPIC-only premise facts —
+        // e.g. a `Message( c, m )` consumed by an `in(c,m)` with no producing
+        // `out` — are surfaced, byte-identically to HS.  For non-SAPIC theories
+        // this is a no-op (the pre- and post-translation rule sets are equal).
+        if elaborated.is_sapic {
+            let post_thy = {
+                let mut tmp = parsed.clone();
+                tamarin_theory::macro_expand::expand_theory_macros(&mut tmp);
+                tmp
+            };
+            let topic = "Facts occur in the left-hand-side but not in any right-hand-side ";
+            wf_report.retain(|e| e.topic != topic);
+            let lhs_rhs = tamarin_parser::wf::fact_lhs_occur_no_rhs(&post_thy);
+            if !lhs_rhs.is_empty() {
+                // Insert at the factReports position (after fact_usage, before
+                // formulaReports), matching HS check order.
+                let insert_before = wf_report.iter().position(|e| {
+                    matches!(e.topic.as_str(),
+                        "Formula terms" | " Formula guardedness"
+                        | "Lemma annotations" | "Multiplication restriction of rules"
+                        | "Nat Sorts" | "Subterm Convergence Warning"
+                        | "Message Derivation Checks" | "Derivation Checks")
+                }).unwrap_or(wf_report.len());
+                let tail = wf_report.split_off(insert_before);
+                wf_report.extend(lhs_rhs);
+                wf_report.extend(tail);
+            }
+        }
+
         // Spawn a single Maude handle for this file.  Used by:
         //   - the rule-variants computation that populates each rule's
         //     `variant_substs` + `abstracted_rule` (so the pretty-printer

@@ -53,6 +53,112 @@ pub fn pretty_sapic_term(t: &SapicTerm) -> String {
     out
 }
 
+/// `prettyPattern' vs = prettySapicTerm . unextractMatchingVariables vs`
+/// (Process.hs:443-444): render a `ChIn`/`let` pattern term, prefixing every
+/// variable that is in the match-var set `vs` with `=` (HS `PatternMatch v`
+/// shows as `=v`, `PatternBind v` shows as `v`).
+fn pretty_pattern(t: &SapicTerm, match_vars: &std::collections::BTreeSet<SapicLVar>) -> String {
+    let mut out = String::new();
+    pp_pattern_term(t, match_vars, &mut out);
+    out
+}
+
+/// `pp_sapic_term` with the match-var `=` marker.  Structurally identical to
+/// `pp_sapic_term`; only the `Var` leaf differs (it consults `match_vars`).  HS
+/// renders the pattern via the same `prettyTerm` printer, so pair splitting /
+/// AC / function rendering match exactly.
+fn pp_pattern_term(
+    t: &SapicTerm,
+    mv: &std::collections::BTreeSet<SapicLVar>,
+    out: &mut String,
+) {
+    match t {
+        VTerm::Lit(Lit::Var(v)) => {
+            // `unextractMatchingVariables`: `v ∈ vs` → `PatternMatch v` (`=v`).
+            // The match-var set holds `SapicLVar`s; compare on the inner `LVar`
+            // (the `extractMatchingVariables`/`unextract` round-trip preserves the
+            // variable identity, type included).
+            if mv.contains(v) {
+                out.push('=');
+            }
+            out.push_str(&show_sapic_lvar(v));
+        }
+        VTerm::Lit(Lit::Con(n)) => tamarin_term::pretty::pp_name(n, out),
+        VTerm::App(FunSym::Ac(o), ts) => {
+            out.push('(');
+            for (i, c) in ts.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(ac_op_symbol(*o));
+                }
+                pp_pattern_term(c, mv, out);
+            }
+            out.push(')');
+        }
+        VTerm::App(FunSym::NoEq(sym), ts) if ts.len() == 2 && *sym == exp_sym() => {
+            pp_pattern_term(&ts[0], mv, out);
+            out.push('^');
+            pp_pattern_term(&ts[1], mv, out);
+        }
+        VTerm::App(FunSym::NoEq(sym), ts) if ts.len() == 2 && *sym == diff_sym() => {
+            out.push_str("diff(");
+            pp_pattern_term(&ts[0], mv, out);
+            out.push_str(", ");
+            pp_pattern_term(&ts[1], mv, out);
+            out.push(')');
+        }
+        VTerm::App(FunSym::NoEq(sym), ts) if ts.is_empty() && *sym == nat_one_sym() => {
+            let _ = ts;
+            out.push_str("%1");
+        }
+        VTerm::App(FunSym::NoEq(sym), _) if *sym == pair_sym() => {
+            let mut flat: Vec<&SapicTerm> = Vec::new();
+            collect_pair_tail(t, &mut flat);
+            out.push('<');
+            for (i, c) in flat.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                pp_pattern_term(c, mv, out);
+            }
+            out.push('>');
+        }
+        VTerm::App(FunSym::NoEq(sym), ts) => {
+            out.push_str(&String::from_utf8_lossy(&sym.name));
+            if !ts.is_empty() {
+                out.push('(');
+                for (i, c) in ts.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    pp_pattern_term(c, mv, out);
+                }
+                out.push(')');
+            }
+        }
+        VTerm::App(FunSym::C(CSym::EMap), ts) => {
+            out.push_str(&String::from_utf8_lossy(EMAP_SYM_STRING));
+            out.push('(');
+            for (i, c) in ts.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                pp_pattern_term(c, mv, out);
+            }
+            out.push(')');
+        }
+        VTerm::App(FunSym::List, ts) => {
+            out.push_str("LIST(");
+            for (i, c) in ts.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                pp_pattern_term(c, mv, out);
+            }
+            out.push(')');
+        }
+    }
+}
+
 fn pp_sapic_term(t: &SapicTerm, out: &mut String) {
     match t {
         VTerm::Lit(Lit::Var(v)) => out.push_str(&show_sapic_lvar(v)),
@@ -131,10 +237,15 @@ fn pp_sapic_term(t: &SapicTerm, out: &mut String) {
     }
 }
 
+/// HS `split` (Term.hs:292-293): `split (viewTerm2 -> FPair t1 t2) = t1 :
+/// split t2; split t = [t]`.  ONLY the RIGHT spine of a pair is flattened —
+/// `pair(t1, t2)` yields `t1` then recurses into `t2`.  A LEFT-nested pair such
+/// as `pair(pair(a,b), c)` therefore renders as `<<a, b>, c>` (the left child is
+/// printed by the recursive `ppTerm`, NOT flattened here).
 fn collect_pair_tail<'a>(t: &'a SapicTerm, out: &mut Vec<&'a SapicTerm>) {
     if let VTerm::App(FunSym::NoEq(sym), args) = t {
         if sym.name == b"pair" && args.len() == 2 {
-            collect_pair_tail(&args[0], out);
+            out.push(&args[0]);
             collect_pair_tail(&args[1], out);
             return;
         }
@@ -178,11 +289,11 @@ fn pretty_sapic_action(a: &SapicAction<SapicLVar>) -> String {
         SapicAction::ChOut { chan: Some(c), msg } => {
             format!("out({},{})", pretty_sapic_term(c), pretty_sapic_term(msg))
         }
-        SapicAction::ChIn { chan: None, msg, .. } => {
-            format!("in({})", pretty_sapic_term(msg))
+        SapicAction::ChIn { chan: None, msg, match_vars } => {
+            format!("in({})", pretty_pattern(msg, match_vars))
         }
-        SapicAction::ChIn { chan: Some(c), msg, .. } => {
-            format!("in({},{})", pretty_sapic_term(c), pretty_sapic_term(msg))
+        SapicAction::ChIn { chan: Some(c), msg, match_vars } => {
+            format!("in({},{})", pretty_sapic_term(c), pretty_pattern(msg, match_vars))
         }
         SapicAction::Insert(a, b) => {
             format!("insert {},{}", pretty_sapic_term(a), pretty_sapic_term(b))
