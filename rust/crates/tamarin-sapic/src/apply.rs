@@ -84,6 +84,7 @@ pub fn apply_sapic(
         trans_reliable: elaborated.options.trans_reliable,
         async_channels: elaborated.options.asynchronous_channels,
         compress_events: elaborated.options.compress_events,
+        trans_report: elaborated.options.trans_report,
     };
     let translation = translate(&typed, needs_in_ev, st_rules, opts)
         .map_err(|e| ElabError { message: format!("SAPIC translation: {e}") })?;

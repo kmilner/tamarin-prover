@@ -408,11 +408,32 @@ fn collect_user_funs(items: &[p::TheoryItem]) -> CollectedUserFuns {
         }).flatten().collect()
     };
     let mut nullary = user_names(|d| d.arg_types.is_empty());
+    let mut private = user_names(|d| d.private);
+    let mut destructor = user_names(|d| d.destructor);
     for it in items {
         if let p::TheoryItem::Builtins(names) = it {
             for n in names {
                 for c in builtin_nullary_constants(n) {
                     nullary.insert(c.to_string());
+                }
+                // HS `naryOpApp` / `lookupArity` (Theory/Text/Parser/Term.hs:61-63,
+                // 84,92) reads `(k, priv, cnstr)` straight from the per-theory
+                // signature, which includes the BUILTIN symbols.  Mirror that by
+                // merging the privacy / constructability of each builtin's
+                // function symbols (most are public constructors, so this only
+                // matters for `locations-report` — `rep` private, `check_rep` /
+                // `get_rep` destructors — and the `dest-*` builtins' destructors).
+                // Without this, a user/translation `rep(..)` / `check_rep(..)`
+                // term serialises with the default `tamXC..` prefix and Maude
+                // rejects it (`bad token`), so `get variants` returns empty and
+                // the rule wrongly reports "has no variants".
+                for (name, priv_, constr) in builtin_fun_attrs(n) {
+                    if priv_ == Privacy::Private {
+                        private.insert(name.clone());
+                    }
+                    if constr == Constructability::Destructor {
+                        destructor.insert(name);
+                    }
                 }
             }
         }
@@ -420,9 +441,23 @@ fn collect_user_funs(items: &[p::TheoryItem]) -> CollectedUserFuns {
     CollectedUserFuns {
         unary: user_names(|d| d.arg_types.len() == 1),
         nullary,
-        private: user_names(|d| d.private),
-        destructor: user_names(|d| d.destructor),
+        private,
+        destructor,
     }
+}
+
+/// The `(name, privacy, constructability)` of every NoEq function symbol a
+/// builtin contributes, read from its `MaudeSig` (the same signature the Maude
+/// theory module is generated from).  Used to thread builtin privacy /
+/// destructor flags into `term_to_lnterm`'s symbol resolution — HS reads these
+/// from the per-theory signature via `lookupArity`.
+fn builtin_fun_attrs(name: &str) -> Vec<(String, Privacy, Constructability)> {
+    let Some(msig) = builtin_sig(name) else { return Vec::new() };
+    msig.st_fun_syms.iter().filter_map(|s| {
+        String::from_utf8(s.name.clone())
+            .ok()
+            .map(|n| (n, s.privacy, s.constructability))
+    }).collect()
 }
 
 /// Extracts the 0-arity NoEq function-symbol names from a `MaudeSig`.

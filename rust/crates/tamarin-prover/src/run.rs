@@ -743,6 +743,18 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         // run before `populate_rule_variants` below.  `user_set_heuristic` is
         // true iff a `heuristic:` item already populated `elaborated.heuristic`
         // (HS `addHeuristic` returns `Nothing` in that case).
+        // Install the user/builtin function-symbol flag sets
+        // (`USER_PRIVATE_FUNS` / `USER_DESTRUCTOR_FUNS` / …) for the duration
+        // of SAPIC translation AND the variant pre-computation below.  These
+        // thread-locals drive `term_to_lnterm`'s symbol resolution
+        // (privacy / constructability); `elaborate()` sets them only for its
+        // own scope, so without re-installing them here the SAPIC-injected
+        // rules' builtin symbols (`rep` private, `check_rep` / `get_rep`
+        // destructors from `locations-report`) re-elaborate with the default
+        // public-constructor flags, serialising as `tamXC..` — which Maude
+        // rejects, leaving the rule with "no variants".
+        let _sapic_funs_guard =
+            tamarin_theory::elaborate::set_user_funs_for_theory(&parsed);
         {
             let user_set_heuristic = !elaborated.heuristic.is_empty();
             tamarin_sapic::apply::apply_sapic(

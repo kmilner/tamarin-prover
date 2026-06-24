@@ -46,6 +46,7 @@ pub mod locks;
 pub mod progress_function;
 pub mod progress_translation;
 pub mod reliable_channel;
+pub mod report;
 pub mod secret_channels;
 pub mod translate;
 pub mod typing;

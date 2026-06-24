@@ -356,6 +356,10 @@ pub struct TranslateOptions {
     pub trans_reliable: bool,
     pub async_channels: bool,
     pub compress_events: bool,
+    /// `_transReport` (Sapic.hs:56, 64): gates `translateTermsReport` (the
+    /// `report(t)`→`rep(t, loc)` term rewrite) and `reportInit` (the fixed
+    /// `ReportRule`).  Set from the `locations-report` builtin.
+    pub trans_report: bool,
 }
 
 /// `translate` (Sapic.hs:45-101).  `needs_in_ev_res` is HS
@@ -381,7 +385,15 @@ pub fn translate(
     // propagateNames and BEFORE translateLetDestr.  (annotatePureStates is gated
     // off by default — it needs `--translation-state-optimisation`.)
     let an_proc_sec = crate::secret_channels::annotate_secret_channels(an_proc_pre);
-    let an_proc_let = crate::let_destructors::translate_let_destr(st_rules, an_proc_sec);
+    // `checkOps' (._transReport) translateTermsReport` (Sapic.hs:56): rewrite
+    // `report(t)` terms to `rep(t, loc)` under the in-scope `@location`
+    // annotation.  Runs AFTER annotateSecretChannels, BEFORE translateLetDestr.
+    let an_proc_rep = if opts.trans_report {
+        crate::report::translate_terms_report(an_proc_sec)
+    } else {
+        an_proc_sec
+    };
+    let an_proc_let = crate::let_destructors::translate_let_destr(st_rules, an_proc_rep);
     let an_proc = crate::locks::annotate_locks(an_proc_let)?;
 
     // Build the translation context (gated progress/reliable/async wrappers).
@@ -405,8 +417,8 @@ pub fn translate(
     };
 
     // initial rules + initial tildex.  HS chains (right-to-left via `=<<`):
-    //   baseInit → progressInit (if progress) → reliableChannelInit (if reliable)
-    // (reportInit is gated off — no `--locations-report` support yet.)
+    //   baseInit → progressInit → reliableChannelInit → reportInit
+    // i.e. reportInit runs LAST, prepending the `ReportRule` to the front.
     let (mut init_rules, mut init_tx) = base_init(&an_proc);
     if opts.trans_progress {
         let (r, t) = crate::progress_translation::progress_init(&an_proc, init_rules, init_tx)?;
@@ -416,6 +428,11 @@ pub fn translate(
     if opts.trans_reliable {
         let (r, t) =
             crate::reliable_channel::reliable_channel_init(&an_proc, init_rules, init_tx);
+        init_rules = r;
+        init_tx = t;
+    }
+    if opts.trans_report {
+        let (r, t) = crate::report::report_init(&an_proc, init_rules, init_tx);
         init_rules = r;
         init_tx = t;
     }
