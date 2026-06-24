@@ -504,11 +504,20 @@ fn render_fun_syms(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<String> {
 /// HS's `S.toList` exactly.  We must NOT re-sort by the rendered pretty-string,
 /// since that diverges from the structural (term-tree) order (e.g. AC products
 /// pretty-print with a leading `(`, `exp` as infix `a^b`).
-fn render_equations(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<(String, String)> {
-    let mut items: Vec<(String, String)> = Vec::new();
+///
+/// Each side is returned as a HughesPJ `Doc` (not a flat string) so that wide
+/// function applications wrap at the ribbon width exactly as HS
+/// `prettyCtxtStRule`/`prettyLNTerm` (SubtermRule.hs:122-123, Term.hs:295-296)
+/// — the `ppFun f ts = text (f++"(") <> fsep (punctuate comma …) <> ")"` `fsep`
+/// breaks at argument boundaries when the term overruns.  We reach the Doc path
+/// by converting the `LNTerm` to a parser-AST `p::Term` (`lnterm_to_parser`,
+/// the same conversion already used elsewhere) and rendering it through
+/// `pf::term_doc` (= HS `prettyTerm`).
+fn render_equations(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<(crate::pretty_hpj::Doc, crate::pretty_hpj::Doc)> {
+    let mut items = Vec::new();
     for r in &sig.st_rules {
-        let lhs = render_lnterm(&r.lhs);
-        let rhs = render_lnterm(&r.rhs.term);
+        let lhs = pf::term_doc(&lnterm_to_parser(&r.lhs));
+        let rhs = pf::term_doc(&lnterm_to_parser(&r.rhs.term));
         items.push((lhs, rhs));
     }
     items
@@ -542,7 +551,12 @@ fn wrap_with_lead<S: AsRef<str>>(lead: &str, items: &[S]) -> String {
 /// further 2, yielding the 4-space indent HS emits.  Reproducing that requires
 /// the structured doc, not a pre-joined `lhs = rhs` string.  Route through the
 /// ported HughesPJ engine so the break decision and indentation are HS-exact.
-fn sep_block_with_lead(lead: &str, items: &[(String, String)]) -> String {
+///
+/// `items` carries the LHS/RHS as already-built term `Doc`s (HS `prettyLNTerm`)
+/// so the inner function-application `fsep` wrapping survives — passing flat
+/// strings would defeat the engine and emit over-long single lines for wide
+/// equations (e.g. BP `idverify(idsign(…), m, IBPub(…))`).
+fn sep_block_with_lead(lead: &str, items: &[(crate::pretty_hpj::Doc, crate::pretty_hpj::Doc)]) -> String {
     use crate::pretty_hpj::{self as hpj, Doc};
     if items.is_empty() { return String::new(); }
     let n = items.len();
@@ -550,8 +564,8 @@ fn sep_block_with_lead(lead: &str, items: &[(String, String)]) -> String {
     docs.push(Doc::text(lead));
     for (i, (lhs, rhs)) in items.iter().enumerate() {
         // prettyCtxtStRule: sep [ nest 2 lhs, "=" <-> rhs ]
-        let lhs_doc = Doc::text(lhs).nest(2);
-        let eq_doc = Doc::text("=").beside_sp(Doc::text(rhs));
+        let lhs_doc = lhs.clone().nest(2);
+        let eq_doc = Doc::text("=").beside_sp(rhs.clone());
         let mut d = hpj::sep(vec![lhs_doc, eq_doc]);
         if i + 1 < n {
             d = d.beside(Doc::char(','));
