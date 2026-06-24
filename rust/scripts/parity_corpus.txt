@@ -309,6 +309,7 @@ sapic/fast/basic/channels1.spthy
 sapic/fast/basic/channels3.spthy
 sapic/fast/basic/channels4.spthy
 sapic/fast/basic/design-choices.spthy
+sapic/fast/basic/destructors.spthy
 sapic/fast/basic/exclusive-secrets.spthy
 sapic/fast/basic/let-blocks2.spthy
 sapic/fast/basic/let-blocks3.spthy
@@ -324,6 +325,7 @@ sapic/fast/basic/operator-precedence-2.spthy
 sapic/fast/basic/operator-precedence-3.spthy
 sapic/fast/basic/operator-precedence-4.spthy
 sapic/fast/basic/operator-precedence-5.spthy
+sapic/fast/basic/patterns.spthy
 sapic/fast/basic/reliable-channel.spthy
 sapic/fast/basic/replication.spthy
 sapic/fast/basic/running-example.spthy
