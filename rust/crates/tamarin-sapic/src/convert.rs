@@ -93,8 +93,13 @@ fn action(a: &p::SapicAction) -> Result<SapicAction<SapicLVar>, ConvertError> {
         // `baseTransAction` Insert/Delete (Basetranslation.hs:177-184).
         p::SapicAction::Insert(t1, t2) => Ok(SapicAction::Insert(term(t1)?, term(t2)?)),
         p::SapicAction::Delete(t) => Ok(SapicAction::Delete(term(t)?)),
+        // Locks (Phase 4): `lock t` / `unlock t` → theory `SapicAction::{Lock,Unlock}`
+        // (Process.hs:74-75), annotated by `Sapic.Locks.annotateLocks` and
+        // translated by `baseTransAction` Lock/Unlock (Basetranslation.hs:185-194).
+        p::SapicAction::Lock(t) => Ok(SapicAction::Lock(term(t)?)),
+        p::SapicAction::Unlock(t) => Ok(SapicAction::Unlock(term(t)?)),
         other => Err(ConvertError::new(format!(
-            "SAPIC action not yet ported (Phase 4+): {other:?}"
+            "SAPIC action not yet ported (Phase 5+): {other:?}"
         ))),
     }
 }

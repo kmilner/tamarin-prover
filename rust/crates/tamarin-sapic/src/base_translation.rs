@@ -79,7 +79,7 @@ pub fn base_trans_action(
     _async_channels: bool,
     needs_ass_immediate: bool,
     ac: &SapicAction<SapicLVar>,
-    _an: &ProcessAnnotation<LVar>,
+    an: &ProcessAnnotation<LVar>,
     p: &ProcessPosition,
     tildex: &BTreeSet<LVar>,
 ) -> Result<(Vec<RuleBody>, BTreeSet<LVar>), String> {
@@ -162,9 +162,69 @@ pub fn base_trans_action(
             );
             Ok((vec![body], tildex.clone()))
         }
-        // Classical state translation (Basetranslation.hs:177-184).  The pure
-        // cell optimisation (annotated `pureState`, Basetranslation.hs:155-174)
-        // is deferred to Phase 4; the classical translation is the default.
+        // === Pure cell translation (Basetranslation.hs:155-174) ===
+        // Gated on `an.pure_state`, which is only ever set when the
+        // state-channel optimisation is enabled (`--translation-state-optimisation`
+        // / `_stateChannelOpt`).  These guards MUST be checked BEFORE the classical
+        // `Insert`/`Lock`/`Unlock` cases (HS guard order).
+        //
+        // (Insert t1 t2) | pureState, Just (AnVar v) <- an.unlock
+        //   let tx' = v `insert` tildex in
+        //   [([def_state, CellLocked t1 (varTerm v)], [],
+        //     [def_state' tx', PureCell t1 t2], [])]
+        SapicAction::Insert(t1, t2) if an.pure_state && an.unlock.is_some() => {
+            let v = an.unlock.as_ref().unwrap().0.clone();
+            let lt1 = to_ln_term(t1);
+            let lt2 = to_ln_term(t2);
+            let mut tx2 = tildex.clone();
+            tx2.insert(v.clone());
+            let body: RuleBody = (
+                vec![
+                    def_state(tildex),
+                    TransFact::CellLocked(lt1.clone(), VTerm::Lit(Lit::Var(v))),
+                ],
+                vec![],
+                vec![def_state_next(&tx2), TransFact::PureCell(lt1, lt2)],
+                vec![],
+            );
+            Ok((vec![body], tx2))
+        }
+        // (Insert t1 t2) | pureState  (no unlock annotation — lone insert)
+        //   [([def_state], [], [def_state' tildex, PureCell t1 t2], [])]
+        SapicAction::Insert(t1, t2) if an.pure_state => {
+            let lt1 = to_ln_term(t1);
+            let lt2 = to_ln_term(t2);
+            let body: RuleBody = (
+                vec![def_state(tildex)],
+                vec![],
+                vec![def_state_next(tildex), TransFact::PureCell(lt1, lt2)],
+                vec![],
+            );
+            Ok((vec![body], tildex.clone()))
+        }
+        // (Lock _) | pureState -> silent passthrough.
+        //   [([def_state], [], [def_state' tildex], [])]
+        SapicAction::Lock(_) if an.pure_state => {
+            let body: RuleBody = (
+                vec![def_state(tildex)],
+                vec![],
+                vec![def_state_next(tildex)],
+                vec![],
+            );
+            Ok((vec![body], tildex.clone()))
+        }
+        // (Unlock _) | pureState -> silent passthrough.
+        SapicAction::Unlock(_) if an.pure_state => {
+            let body: RuleBody = (
+                vec![def_state(tildex)],
+                vec![],
+                vec![def_state_next(tildex)],
+                vec![],
+            );
+            Ok((vec![body], tildex.clone()))
+        }
+
+        // === Classical state translation (Basetranslation.hs:177-194) ===
         //
         // (Insert t1 t2): `[([def_state], [InsertA t1 t2], [def_state' tildex], [])]`
         SapicAction::Insert(t1, t2) => {
@@ -189,9 +249,54 @@ pub fn base_trans_action(
             );
             Ok((vec![body], tildex.clone()))
         }
-        // ChOut with a channel, ChIn, Lock/Unlock, MSR, calls: Phase 4+.
+        // (Lock t) | Just (AnVar v) <- an.lock (Basetranslation.hs:185-189):
+        //   let tx' = v `insert` tildex in
+        //   [([def_state, Fr v], [LockNamed t v, LockUnnamed t v], [def_state' tx'], [])]
+        // (Lock _) | Nothing <- an.lock -> "Unannotated lock" error
+        //   (Basetranslation.hs:190).
+        SapicAction::Lock(t) => {
+            let Some(an_v) = &an.lock else {
+                return Err("baseTransAction: Unannotated lock".to_string());
+            };
+            let v = an_v.0.clone();
+            let lt = to_ln_term(t);
+            let mut tx2 = tildex.clone();
+            tx2.insert(v.clone());
+            let body: RuleBody = (
+                vec![def_state(tildex), TransFact::Fr(v.clone())],
+                vec![
+                    TransAction::LockNamed(lt.clone(), v.clone()),
+                    TransAction::LockUnnamed(lt, v),
+                ],
+                vec![def_state_next(&tx2)],
+                vec![],
+            );
+            Ok((vec![body], tx2))
+        }
+        // (Unlock t) | Just (AnVar v) <- an.unlock (Basetranslation.hs:191-193):
+        //   [([def_state], [UnlockNamed t v, UnlockUnnamed t v], [def_state' tildex], [])]
+        // (Unlock _) | Nothing <- an.lock -> "Unannotated unlock" error
+        //   (Basetranslation.hs:194).
+        SapicAction::Unlock(t) => {
+            let Some(an_v) = &an.unlock else {
+                return Err("baseTransAction: Unannotated unlock".to_string());
+            };
+            let v = an_v.0.clone();
+            let lt = to_ln_term(t);
+            let body: RuleBody = (
+                vec![def_state(tildex)],
+                vec![
+                    TransAction::UnlockNamed(lt.clone(), v.clone()),
+                    TransAction::UnlockUnnamed(lt, v),
+                ],
+                vec![def_state_next(tildex)],
+                vec![],
+            );
+            Ok((vec![body], tildex.clone()))
+        }
+        // ChOut with a channel, ChIn, MSR, calls: Phase 5+.
         other => Err(format!(
-            "baseTransAction: action not yet ported (Phase 4+): {other:?}"
+            "baseTransAction: action not yet ported (Phase 5+): {other:?}"
         )),
     }
 }
@@ -208,7 +313,7 @@ pub type CombResult = (Vec<RuleBody>, BTreeSet<LVar>, Option<BTreeSet<LVar>>);
 /// are deferred (Phase 2+/3).
 pub fn base_trans_comb(
     c: &tamarin_theory::sapic::ProcessCombinator<SapicLVar>,
-    _an: &ProcessAnnotation<LVar>,
+    an: &ProcessAnnotation<LVar>,
     p: &ProcessPosition,
     tildex: &BTreeSet<LVar>,
 ) -> Result<CombResult, String> {
@@ -319,12 +424,41 @@ pub fn base_trans_comb(
             );
             Ok((vec![body_then, body_else], tildex.clone(), Some(tildex.clone())))
         }
+        // Pure cell Lookup (Basetranslation.hs:280-289), gated on
+        //   pureState && Just (AnVar vs) <- an.unlock:
+        //   let tx' = vs `insert` (v `insert` tildex) in
+        //   ([([def_state, PureCell t (varTerm v), Fr vs], [],
+        //      [def_state1 tx', CellLocked t (varTerm vs)], [])],
+        //    tx', Just tildex)
+        // (The right `IsNotSet` arm is commented out in HS — pure lookups have a
+        // single arm.)
+        PC::Lookup(t, v) if an.pure_state && an.unlock.is_some() => {
+            let vs = an.unlock.as_ref().unwrap().0.clone();
+            let lt = to_ln_term(t);
+            let lv = to_lvar(v);
+            let mut tx_prime = tildex.clone();
+            tx_prime.insert(lv.clone());
+            tx_prime.insert(vs.clone());
+            let body: RuleBody = (
+                vec![
+                    def_state(tildex),
+                    TransFact::PureCell(lt.clone(), VTerm::Lit(Lit::Var(lv))),
+                    TransFact::Fr(vs.clone()),
+                ],
+                vec![],
+                vec![
+                    def_state1(&tx_prime),
+                    TransFact::CellLocked(lt, VTerm::Lit(Lit::Var(vs))),
+                ],
+                vec![],
+            );
+            Ok((vec![body], tx_prime, Some(tildex.clone())))
+        }
         // Classical Lookup (Basetranslation.hs:293-299):
         //   let tx' = v `insert` tildex
         //   ([([def_state], [IsIn t v], [def_state1 tx'], []),
         //     ([def_state], [IsNotSet t], [def_state2 tildex], [])],
         //    tx', Just tildex)
-        // (The pure-cell lookup, Basetranslation.hs:280-289, is Phase 4.)
         PC::Lookup(t, v) => {
             let lt = to_ln_term(t);
             let lv = to_lvar(v);
@@ -651,6 +785,92 @@ pub fn state_restrictions(has_delete: bool) -> Vec<tamarin_parser::ast::Restrict
     vec![parse("set_in", set_in_src), parse("set_notin", set_notin_src)]
 }
 
+
+// =============================================================================
+// resLocking / resLockingPure (Basetranslation.hs:366-425)
+// =============================================================================
+
+/// `resLockingPOS` (Basetranslation.hs:368-376): the per-lock locking
+/// restriction.  `LockPOS`/`UnlockPOS` are placeholder fact names that
+/// `resLocking` rewrites to `Lock_<idx>`/`Unlock_<idx>` for the given lock var.
+const RES_LOCKING_POS: &str = "All p pp l x lp #t1 #t3. LockPOS(p, l, x)@t1 & Lock(pp, lp, x)@t3 ==>\n\
+        (#t1<#t3 & (Ex #t2. UnlockPOS(p, l, x)@t2 & #t1 < #t2 & #t2 < #t3\n\
+                   & (All #t0 pp. Unlock(pp, l, x)@t0 ==> #t0 = #t2)\n\
+                   & (All pp lpp #t0. Lock(pp, lpp, x)@t0 ==> #t0 < #t1 | #t0 = #t1 | #t2 < #t0)\n\
+                   & (All pp lpp #t0. Unlock(pp, lpp, x)@t0 ==> #t0 < #t1 | #t2 < #t0 | #t2 = #t0 )))\n\
+      | #t3<#t1 | #t1=#t3";
+
+/// `resLockingPOSNoUnlock` (Basetranslation.hs:379-383): the locking
+/// restriction for a lock with no matching unlock.
+const RES_LOCKING_POS_NO_UNLOCK: &str = "All p pp l x lp #t1 #t3. LockPOS(p, l, x)@t1 & Lock(pp, lp, x)@t3 ==>\n\
+        #t3<#t1 | #t1=#t3";
+
+/// `resLocking hasUnlock v` (Basetranslation.hs:406-425): produce the
+/// `locking_<idx v>` restriction by parsing `resLockingPOS` (or the NoUnlock
+/// variant) and rewriting the `LockPOS`/`UnlockPOS` action facts to
+/// `Lock_<idx>`/`Unlock_<idx>` (HS `mapAtoms subst`, with
+/// `hardcode s = s ++ "_" ++ show (lvarIdx v)`).
+pub fn res_locking(has_unlock: bool, v: &LVar) -> tamarin_parser::ast::Restriction {
+    use tamarin_parser::ast as p;
+    let src = if has_unlock { RES_LOCKING_POS } else { RES_LOCKING_POS_NO_UNLOCK };
+    let mut formula = tamarin_parser::parser::parse_formula_str(src)
+        .unwrap_or_else(|e| panic!("Error parsing hard-coded restriction locking: {e:?}"));
+    let idx = v.idx;
+    rename_lock_pos_atoms(&mut formula, idx);
+    p::Restriction {
+        name: format!("locking_{idx}"),
+        formula,
+        attributes: vec![],
+    }
+}
+
+/// HS `subst` inside `resLocking` (Basetranslation.hs:414-422): rewrite the
+/// `LockPOS` 3-ary action fact name to `Lock_<idx>` and `UnlockPOS` to
+/// `Unlock_<idx>`.  Non-POS `Lock`/`Unlock` facts are left untouched.
+fn rename_lock_pos_atoms(f: &mut tamarin_parser::ast::Formula, idx: u64) {
+    use tamarin_parser::ast as p;
+    fn walk_atom(a: &mut p::Atom, idx: u64) {
+        if let p::Atom::Action(fact, _) = a {
+            if fact.name == "LockPOS" && fact.args.len() == 3 {
+                fact.name = format!("Lock_{idx}");
+            } else if fact.name == "UnlockPOS" && fact.args.len() == 3 {
+                fact.name = format!("Unlock_{idx}");
+            }
+        }
+    }
+    fn walk(f: &mut p::Formula, idx: u64) {
+        use p::Formula::*;
+        match f {
+            True | False => {}
+            Atom(a) => walk_atom(a, idx),
+            Not(g) => walk(g, idx),
+            And(a, b) | Or(a, b) | Implies(a, b) | Iff(a, b) => {
+                walk(a, idx);
+                walk(b, idx);
+            }
+            Forall(_, body) | Exists(_, body) => walk(body, idx),
+        }
+    }
+    walk(f, idx);
+}
+
+/// `resLockingPure` (Basetranslation.hs:388-402): the two `locking1`/`locking2`
+/// restrictions used only in the pure-state case (state-channel optimisation).
+pub fn res_locking_pure() -> Vec<tamarin_parser::ast::Restriction> {
+    use tamarin_parser::ast as p;
+    let parse = |name: &str, src: &str| -> p::Restriction {
+        let formula = tamarin_parser::parser::parse_formula_str(src)
+            .unwrap_or_else(|e| panic!("Error parsing hard-coded restriction {name}: {e:?}"));
+        p::Restriction { name: name.to_string(), formula, attributes: vec![] }
+    };
+    let locking1 = "All p l x #t1 pp lp #t2 #t3 . Lock(p,l,x)@t1 &  Lock(pp,lp,x)@t2\n\
+                     & Unlock(p,l,x)@t3 & not(#t1=#t2)\n\
+                   ==> (t2 < t1) | (t3 < t2)";
+    let locking2 = "All p l x #t1 pp lp #t2 #t3 . Lock(p,l,x)@t1 &  Unlock(pp,lp,x)@t2\n\
+           & Unlock(p,l,x)@t3 & not(#t2=#t3)\n\
+           ==> (t3 < t2) | (t2 < t1)";
+    vec![parse("locking1", locking1), parse("locking2", locking2)]
+}
 
 #[cfg(test)]
 mod tests {

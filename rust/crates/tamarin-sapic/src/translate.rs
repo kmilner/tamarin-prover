@@ -212,6 +212,54 @@ fn subst_state_pos_fact(f: TransFact, p_old: &[i64], p_new: &[i64]) -> TransFact
     }
 }
 
+/// `getLockPositions = pfoldMap getLock` (Basetranslation.hs:473,478): the lock
+/// variables of every `Lock` action with `pureState=False` and a `lock`
+/// annotation, in `pfoldMap` order, NOT deduplicated.
+fn get_lock_positions(
+    p: &Process<ProcessAnnotation<LVar>, SapicLVar>,
+) -> Vec<LVar> {
+    use tamarin_theory::sapic::SapicAction;
+    let mut get_lock = |proc: &Process<ProcessAnnotation<LVar>, SapicLVar>| -> Vec<LVar> {
+        if let Process::Action(SapicAction::Lock(_), an, _) = proc {
+            if !an.pure_state {
+                if let Some(v) = &an.lock {
+                    return vec![v.0.clone()];
+                }
+            }
+        }
+        vec![]
+    };
+    tamarin_theory::sapic::pfold_map(p, &mut get_lock)
+}
+
+/// `nub $ getUnlockPositions` (Basetranslation.hs:463): the lock variables of
+/// every `Unlock` action with `pureState=False` and an `unlock` annotation, in
+/// `pfoldMap` order, first-occurrence deduplicated (HS `List.nub`).
+fn get_unlock_positions(
+    p: &Process<ProcessAnnotation<LVar>, SapicLVar>,
+) -> Vec<LVar> {
+    use tamarin_theory::sapic::SapicAction;
+    let mut get_unlock = |proc: &Process<ProcessAnnotation<LVar>, SapicLVar>| -> Vec<LVar> {
+        if let Process::Action(SapicAction::Unlock(_), an, _) = proc {
+            if !an.pure_state {
+                if let Some(v) = &an.unlock {
+                    return vec![v.0.clone()];
+                }
+            }
+        }
+        vec![]
+    };
+    let raw = tamarin_theory::sapic::pfold_map(p, &mut get_unlock);
+    // `List.nub` — keep first occurrence, preserve order.
+    let mut seen: Vec<LVar> = Vec::new();
+    for v in raw {
+        if !seen.contains(&v) {
+            seen.push(v);
+        }
+    }
+    seen
+}
+
 /// The result of translating a single top-level process.
 pub struct Translation {
     /// The generated rules, each paired with its embedded `_restrict` formulas
@@ -230,10 +278,14 @@ pub fn translate(
     plain: &PlainProcess,
     needs_in_ev_res: bool,
 ) -> Result<Translation, String> {
-    // annotate: toAnProcess + propagateNames.  (We skip the secret-channel /
-    // lock / let-destructor / state passes — none apply to the linear subset.)
-    let an_proc: Process<ProcessAnnotation<LVar>, SapicLVar> =
+    // annotate: toAnProcess + propagateNames + annotateLocks (Sapic.hs:54-61).
+    //   The secret-channel / pure-state / report / let-destructor passes are
+    //   either no-ops for the in-scope subset (secret-channels) or gated off by
+    //   default (pure-state needs `--translation-state-optimisation`); locks is
+    //   the last annotation step and the one Phase 4 requires.
+    let an_proc_pre: Process<ProcessAnnotation<LVar>, SapicLVar> =
         propagate_names(to_annotated::<LVar>(plain.clone()));
+    let an_proc = crate::locks::annotate_locks(an_proc_pre)?;
 
     // initial rules + initial tildex
     let (init_rules, init_tx) = base_init(&an_proc);
@@ -264,6 +316,23 @@ pub fn translate(
         restrictions.extend(predicate_restrictions());
     }
     restrictions.push(single_session_restriction());
+
+    // Locking restrictions (baseRestr, Basetranslation.hs:463-468), AFTER the
+    // hardcoded restrictions, in HS order:
+    //   lockingWithUnlock = map (resLocking True)  (nub  getUnlockPositions)
+    //   lockingOnlyLock   = map (resLocking False) (getLockPositions \\ getUnlockPositions)
+    let unlock_positions = get_unlock_positions(&an_proc); // nub'd
+    let lock_positions = get_lock_positions(&an_proc); // NOT nub'd (HS `getLockPositions`)
+    for v in &unlock_positions {
+        restrictions.push(crate::base_translation::res_locking(true, v));
+    }
+    // `getLockPositions anP \\ getUnlockPositions anP` — list-difference: keep
+    // each lock var (in order, with duplicates) NOT present in the unlock set.
+    for v in &lock_positions {
+        if !unlock_positions.contains(v) {
+            restrictions.push(crate::base_translation::res_locking(false, v));
+        }
+    }
 
     Ok(Translation { rules, restrictions })
 }

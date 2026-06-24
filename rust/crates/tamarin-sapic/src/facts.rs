@@ -59,6 +59,12 @@ pub enum TransFact {
     State(StateKind, ProcessPosition, Vec<LVar>),
     /// A literal user MSR fact (`TamarinFact`).
     TamarinFact(LNFact),
+    /// `PureCell t1 t2` (Facts.hs:108): `L_PureState( t1, t2 )` — the pure-state
+    /// cell content (used only when the state-channel optimisation is enabled).
+    PureCell(LNTerm, LNTerm),
+    /// `CellLocked t1 t2` (Facts.hs:109): `L_CellLocked( t1, t2 )` — the
+    /// pure-state lock token.
+    CellLocked(LNTerm, LNTerm),
 }
 
 /// `TransAction` (Facts.hs:43-77) — action facts.  Only the constructors used
@@ -84,6 +90,15 @@ pub enum TransAction {
     InsertA(LNTerm, LNTerm),
     /// `DeleteA t` (Facts.hs:223): `Delete( t )`.
     DeleteA(LNTerm),
+    // --- locks (Phase 4, Facts.hs:63-67) ---
+    /// `LockNamed t v` (Facts.hs:228): `Lock_<idx v>( '<idx v>', v, t )`.
+    LockNamed(LNTerm, LVar),
+    /// `LockUnnamed t v` (Facts.hs:229): `Lock( '<idx v>', v, t )`.
+    LockUnnamed(LNTerm, LVar),
+    /// `UnlockNamed t v` (Facts.hs:230): `Unlock_<idx v>( '<idx v>', v, t )`.
+    UnlockNamed(LNTerm, LVar),
+    /// `UnlockUnnamed t v` (Facts.hs:231): `Unlock( '<idx v>', v, t )`.
+    UnlockUnnamed(LNTerm, LVar),
 }
 
 /// `SpecialPosition` (Facts.hs:110-112).
@@ -133,6 +148,16 @@ pub fn fact_to_fact(f: &TransFact) -> LNFact {
             proto_fact_mult(kind.multiplicity(), &full, ts)
         }
         TransFact::TamarinFact(f) => f.clone(),
+        // `factToFact (PureCell t1 t2) = protoFact Linear "L_PureState" [t1, t2]`
+        // (Facts.hs:269).
+        TransFact::PureCell(t1, t2) => {
+            proto_fact(Multiplicity::Linear, "L_PureState", vec![t1.clone(), t2.clone()])
+        }
+        // `factToFact (CellLocked t1 t2) = protoFact Linear "L_CellLocked" [t1, t2]`
+        // (Facts.hs:270).
+        TransFact::CellLocked(t1, t2) => {
+            proto_fact(Multiplicity::Linear, "L_CellLocked", vec![t1.clone(), t2.clone()])
+        }
     }
 }
 
@@ -164,7 +189,53 @@ pub fn action_to_fact(a: &TransAction) -> LNFact {
         }
         // `actionToFact (DeleteA t) = protoFact Linear "Delete" [t]` (Facts.hs:223).
         TransAction::DeleteA(t) => proto_fact(Multiplicity::Linear, "Delete", vec![t.clone()]),
+        // `actionToFact (LockNamed t v) =
+        //    protoFact Linear (lockFactName v) [lockPubTerm v, varTerm v, t]`
+        // (Facts.hs:228).
+        TransAction::LockNamed(t, v) => proto_fact(
+            Multiplicity::Linear,
+            &lock_fact_name(v),
+            vec![lock_pub_term(v), VTerm::Lit(Lit::Var(v.clone())), t.clone()],
+        ),
+        // `actionToFact (LockUnnamed t v) =
+        //    protoFact Linear "Lock" [lockPubTerm v, varTerm v, t]` (Facts.hs:229).
+        TransAction::LockUnnamed(t, v) => proto_fact(
+            Multiplicity::Linear,
+            "Lock",
+            vec![lock_pub_term(v), VTerm::Lit(Lit::Var(v.clone())), t.clone()],
+        ),
+        // `actionToFact (UnlockNamed t v) =
+        //    protoFact Linear (unlockFactName v) [lockPubTerm v, varTerm v, t]`
+        // (Facts.hs:230).
+        TransAction::UnlockNamed(t, v) => proto_fact(
+            Multiplicity::Linear,
+            &unlock_fact_name(v),
+            vec![lock_pub_term(v), VTerm::Lit(Lit::Var(v.clone())), t.clone()],
+        ),
+        // `actionToFact (UnlockUnnamed t v) =
+        //    protoFact Linear "Unlock" [lockPubTerm v, varTerm v, t]` (Facts.hs:231).
+        TransAction::UnlockUnnamed(t, v) => proto_fact(
+            Multiplicity::Linear,
+            "Unlock",
+            vec![lock_pub_term(v), VTerm::Lit(Lit::Var(v.clone())), t.clone()],
+        ),
     }
+}
+
+/// `lockFactName v = "Lock_" ++ show (lvarIdx v)` (Facts.hs:180-181).
+pub fn lock_fact_name(v: &LVar) -> String {
+    format!("Lock_{}", v.idx)
+}
+
+/// `unlockFactName v = "Unlock_" ++ show (lvarIdx v)` (Facts.hs:183-184).
+pub fn unlock_fact_name(v: &LVar) -> String {
+    format!("Unlock_{}", v.idx)
+}
+
+/// `lockPubTerm v = pubTerm (show (lvarIdx v))` (Facts.hs:186-187): the public
+/// constant `'<idx v>'` used as the first argument of the lock/unlock facts.
+fn lock_pub_term(v: &LVar) -> LNTerm {
+    tamarin_term::lterm::pub_term(v.idx.to_string())
 }
 
 /// `mapFactName (prefix ++)` (Facts.hs:173-177): prepend `prefix` to a
