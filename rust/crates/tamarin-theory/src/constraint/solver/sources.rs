@@ -5527,12 +5527,37 @@ fn var_occurrences_nodes(
             }
             Term::Lit(Lit::Con(_)) => {}
             Term::App(sym, args) => {
-                // HS pushes the symbol-name context ONCE and recurses into
-                // ALL args under it (no per-arg index).
+                // HS `instance HasFrees (Term l)` `foldFreesOcc`
+                // (LTerm.hs:744-748):
+                //   FApp (NoEq o) as -> foldFreesOcc f ((opName):c) as
+                //   FApp o        as -> mconcat $ map (foldFreesOcc f (show o:c)) as
+                //                       -- AC or C symbols
+                // For a NoEq function the args are descended as a LIST, so the
+                // `HasFrees [a]` instance (LTerm.hs:843) prefixes EACH arg with
+                // its positional index `show i`: arg i's context becomes
+                // `[show i, opName, ...c]`.  For AC/C symbols HS maps over the
+                // args DIRECTLY (no list instance), so they get only
+                // `[show o, ...c]` with NO per-arg index (AC args are unordered
+                // anyway).  RS previously omitted the NoEq per-arg index, which
+                // made structurally-distinct vars at different argument
+                // positions (e.g. alethea's H1 vs H2 `encp`/`sg` operands)
+                // collapse to the SAME occurrence-context set; that under-
+                // discrimination broke the canonical `renameDropNameHints`
+                // ordering so `removeRedundantCases` kept alpha-equivalent
+                // split cases as distinct (`split_case_1` instead of `split`).
                 let mut sub = vec![funsym_occ_ctx(sym)];
                 sub.extend(ctx.iter().cloned());
-                for a in args.iter() {
-                    visit_term(a, &sub, out);
+                let is_ac_or_c = sym.is_ac() || sym.is_c();
+                for (i, a) in args.iter().enumerate() {
+                    if is_ac_or_c {
+                        // AC/C: no per-arg index (HS maps directly).
+                        visit_term(a, &sub, out);
+                    } else {
+                        // NoEq: prefix the arg index (HS list instance).
+                        let mut arg_ctx = vec![i.to_string()];
+                        arg_ctx.extend(sub.iter().cloned());
+                        visit_term(a, &arg_ctx, out);
+                    }
                 }
             }
         }
