@@ -117,10 +117,57 @@ fn action(a: &p::SapicAction) -> Result<SapicAction<SapicLVar>, ConvertError> {
         // translated by `baseTransAction` Lock/Unlock (Basetranslation.hs:185-194).
         p::SapicAction::Lock(t) => Ok(SapicAction::Lock(term(t)?)),
         p::SapicAction::Unlock(t) => Ok(SapicAction::Unlock(term(t)?)),
-        other => Err(ConvertError::new(format!(
-            "SAPIC action not yet ported (Phase 5+): {other:?}"
-        ))),
+        // Embedded MSR rule `[l]--[a]->[r]` (optionally with `restricting φ`).
+        // HS (Parser/Sapic.hs:154-160):
+        //   let matchVars = foldMap (foldMap extractMatchingVariables) l
+        //   let f = fmap (fmap unpattern); g = fmap (fmap unpatternVar)
+        //   if validMSR S.empty (l,a,r) then MSR (f l) (f a) (f r) (g phi) matchVars
+        // i.e. match-vars come from the PREMISES only; every fact row is
+        // `unpattern`ed (the `=v` markers stripped) and the embedded restriction
+        // formulas carry through (parser-AST, like `Cond`).
+        p::SapicAction::Msr { prems, acts, concs, restrictions } => {
+            let mut match_vars: BTreeSet<SapicLVar> = BTreeSet::new();
+            // Premises: unpattern + collect match-vars.
+            let prems_c = prems
+                .iter()
+                .map(|f| fact_unpattern(f, Some(&mut match_vars)))
+                .collect::<Result<Vec<_>, _>>()?;
+            // Actions / conclusions: unpattern only (no match-var collection).
+            let acts_c = acts
+                .iter()
+                .map(|f| fact_unpattern(f, None))
+                .collect::<Result<Vec<_>, _>>()?;
+            let concs_c = concs
+                .iter()
+                .map(|f| fact_unpattern(f, None))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(SapicAction::Msr {
+                prems: prems_c,
+                acts: acts_c,
+                concs: concs_c,
+                rest: restrictions.clone(),
+                match_vars,
+            })
+        }
     }
+}
+
+/// Convert a fact whose argument terms may carry `=v` (`PatMatch`) markers
+/// (HS `fmap (fmap unpattern)` over a fact; `extractMatchingVariables` over its
+/// terms).  Strips every match marker and — when `match_vars` is `Some` —
+/// records each matched variable.  Mirrors `convert_let_pattern` but for a fact.
+fn fact_unpattern(
+    f: &p::Fact,
+    mut match_vars: Option<&mut BTreeSet<SapicLVar>>,
+) -> Result<tamarin_theory::sapic::SapicLNFact, ConvertError> {
+    let mut sink = BTreeSet::new();
+    let args: Vec<p::Term> = f
+        .args
+        .iter()
+        .map(|t| strip_pat_match(t, match_vars.as_deref_mut().unwrap_or(&mut sink)))
+        .collect();
+    let f2 = p::Fact { args, ..f.clone() };
+    fact(&f2)
 }
 
 /// Convert a parser combinator into a theory `ProcessCombinator<SapicLVar>`.

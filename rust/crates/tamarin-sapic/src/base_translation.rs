@@ -469,10 +469,41 @@ pub fn base_trans_action(
             );
             Ok((vec![body], tildex.clone()))
         }
-        // ChOut with a channel, ChIn, MSR: secret/private channels (Phase 6+).
-        other => Err(format!(
-            "baseTransAction: action not yet ported (Phase 6+): {other:?}"
-        )),
+        // (MSR l' a' r' res' _): an embedded multiset-rewrite rule inside the
+        // process (Basetranslation.hs:200-203).  Match-vars are ignored here
+        // (they were consumed at parse time).
+        //   (l,a,r,res) = (map toLNFact l', map toLNFact a', map toLNFact r',
+        //                  map toLFormula res')
+        //   tx' = freeset' l ∪ tildex          (freeset' = vars of all premises)
+        //   [( def_state : map TamarinFact l
+        //    , map TamarinAct a ++ [EventEmpty | needsAss]
+        //    , def_state' tx' : map TamarinFact r
+        //    , res )]
+        SapicAction::Msr { prems, acts, concs, rest, .. } => {
+            let l: Vec<tamarin_theory::fact::LNFact> = prems.iter().map(to_ln_fact).collect();
+            let a: Vec<tamarin_theory::fact::LNFact> = acts.iter().map(to_ln_fact).collect();
+            let r: Vec<tamarin_theory::fact::LNFact> = concs.iter().map(to_ln_fact).collect();
+            // `tx' = freeset' l ∪ tildex`, `freeset' = fromList . concatMap getFactVariables`.
+            let mut tx2 = tildex.clone();
+            for f in &l {
+                tx2.extend(fact_vars(f));
+            }
+            // premises: def_state : map TamarinFact l
+            let mut prems_facts: Vec<TransFact> = vec![def_state(tildex)];
+            prems_facts.extend(l.into_iter().map(TransFact::TamarinFact));
+            // actions: map TamarinAct a ++ [EventEmpty | needsAss]
+            let mut act_facts: Vec<TransAction> =
+                a.into_iter().map(TransAction::TamarinAct).collect();
+            if needs_ass_immediate {
+                act_facts.push(TransAction::EventEmpty);
+            }
+            // conclusions: def_state' tx' : map TamarinFact r
+            let mut conc_facts: Vec<TransFact> = vec![def_state_next(&tx2)];
+            conc_facts.extend(r.into_iter().map(TransFact::TamarinFact));
+            // restrictions: the embedded `_restrict` formulas (parser-AST).
+            let body: RuleBody = (prems_facts, act_facts, conc_facts, rest.clone());
+            Ok((vec![body], tx2))
+        }
     }
 }
 

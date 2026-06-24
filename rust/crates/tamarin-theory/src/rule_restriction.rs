@@ -216,7 +216,7 @@ type RewriteSubst = BTreeMap<(String, u64), p::Term>;
 /// rewritten formula and the `{fresh ↦ original}` map.
 fn rewrite(f: &p::Formula) -> (p::Formula, RewriteSubst) {
     let mut st = RewriteState { counter: 0, subst: RewriteSubst::new() };
-    let bound: Vec<String> = Vec::new();
+    let bound: Vec<VarKey> = Vec::new();
     let out = rewrite_formula(f, &bound, &mut st);
     (out, st.subst)
 }
@@ -240,8 +240,9 @@ impl RewriteState {
 }
 
 /// Traverse a formula's atoms (HS `traverseFormulaAtom`), rewriting their
-/// terms.  `bound` carries the names bound by enclosing quantifiers.
-fn rewrite_formula(f: &p::Formula, bound: &[String], st: &mut RewriteState) -> p::Formula {
+/// terms.  `bound` carries the variables (full identity) bound by enclosing
+/// quantifiers.
+fn rewrite_formula(f: &p::Formula, bound: &[VarKey], st: &mut RewriteState) -> p::Formula {
     use p::Formula::*;
     match f {
         True | False => f.clone(),
@@ -265,18 +266,18 @@ fn rewrite_formula(f: &p::Formula, bound: &[String], st: &mut RewriteState) -> p
         ),
         Forall(vs, body) => {
             let mut b2 = bound.to_vec();
-            for v in vs { b2.push(v.name.clone()); }
+            for v in vs { b2.push(var_full_key(v)); }
             Forall(vs.clone(), Box::new(rewrite_formula(body, &b2, st)))
         }
         Exists(vs, body) => {
             let mut b2 = bound.to_vec();
-            for v in vs { b2.push(v.name.clone()); }
+            for v in vs { b2.push(var_full_key(v)); }
             Exists(vs.clone(), Box::new(rewrite_formula(body, &b2, st)))
         }
     }
 }
 
-fn rewrite_atom(a: &p::Atom, bound: &[String], st: &mut RewriteState) -> p::Atom {
+fn rewrite_atom(a: &p::Atom, bound: &[VarKey], st: &mut RewriteState) -> p::Atom {
     use p::Atom::*;
     match a {
         Eq(l, r) => Eq(rewrite_term(l, bound, st), rewrite_term(r, bound, st)),
@@ -315,7 +316,7 @@ fn rewrite_atom(a: &p::Atom, bound: &[String], st: &mut RewriteState) -> p::Atom
 ///   - otherwise                  → keep
 ///
 /// where free/bound are computed with `varNow` treated as NOT free.
-fn rewrite_term(t: &p::Term, bound: &[String], st: &mut RewriteState) -> p::Term {
+fn rewrite_term(t: &p::Term, bound: &[VarKey], st: &mut RewriteState) -> p::Term {
     match t {
         p::Term::Var(v) => {
             if is_free(v, bound) {
@@ -345,18 +346,37 @@ fn rewrite_term(t: &p::Term, bound: &[String], st: &mut RewriteState) -> p::Term
     }
 }
 
+/// Identity of a parser-AST variable for bound-tracking: `(name, idx)`.  HS
+/// quantifiers bind a specific `LVar`, so a body occurrence is "bound" only
+/// when it is the SAME variable the binder introduced.  Matching by name
+/// ALONE wrongly conflates a distinct variable sharing a binder's name (the
+/// equation's `k` (idx 0) vs the process's `k.1` (idx 1) in a let-destructor
+/// restriction) — so the index is required.  But sort must NOT be part of the
+/// key: the parser AST gives a binder and its body occurrences INCONSISTENT
+/// sort hints (a typed binder `∀ x:msg` vs an untagged body `x`, like the
+/// quantifier sort-conflation handled in the guarded conversion), so keying on
+/// sort would treat the body occurrence as free and mis-abstract it (it broke
+/// the dmn-message-tracing `_restrict` restrictions). `(name, idx)` matches
+/// HS for every gate file while still separating `k`/`k.1`.
+type VarKey = (String, u64);
+
+fn var_full_key(v: &p::VarSpec) -> VarKey {
+    (v.name.clone(), v.idx)
+}
+
 /// HS `isFree (Bound _) = False; isFree (Free v) = v /= varNow`.
-/// In the parser AST a var is "bound" if its name is bound by an enclosing
-/// quantifier; the special `#NOW` node var is treated as not-free.
-fn is_free(v: &p::VarSpec, bound: &[String]) -> bool {
-    if bound.iter().any(|n| n == &v.name) {
+/// In the parser AST a var is "bound" if it is the very variable (full
+/// identity) introduced by an enclosing quantifier; the special `#NOW` node
+/// var is treated as not-free.
+fn is_free(v: &p::VarSpec, bound: &[VarKey]) -> bool {
+    if bound.contains(&var_full_key(v)) {
         return false;
     }
     !is_var_now(v)
 }
 
 /// HS `containsVar p t`: does `t` mention a variable satisfying `p`?
-fn contains_var(t: &p::Term, bound: &[String], free_pred: bool) -> bool {
+fn contains_var(t: &p::Term, bound: &[VarKey], free_pred: bool) -> bool {
     match t {
         p::Term::Var(v) => {
             let free = is_free(v, bound);
@@ -366,11 +386,11 @@ fn contains_var(t: &p::Term, bound: &[String], free_pred: bool) -> bool {
     }
 }
 
-fn contains_free(t: &p::Term, bound: &[String]) -> bool {
+fn contains_free(t: &p::Term, bound: &[VarKey]) -> bool {
     contains_var(t, bound, true)
 }
 
-fn contains_bound(t: &p::Term, bound: &[String]) -> bool {
+fn contains_bound(t: &p::Term, bound: &[VarKey]) -> bool {
     contains_var(t, bound, false)
 }
 
@@ -426,7 +446,7 @@ fn var_key(v: &p::VarSpec) -> (String, u64) {
 /// variant `frees` is at LTerm.hs:584-585.)
 fn frees_list(f: &p::Formula) -> Vec<p::VarSpec> {
     let mut out: Vec<p::VarSpec> = Vec::new();
-    let mut bound: Vec<String> = Vec::new();
+    let mut bound: Vec<VarKey> = Vec::new();
     collect_frees_formula(f, &mut bound, &mut out);
     dedup_first(out)
 }
@@ -474,7 +494,7 @@ fn sort_rank(s: p::SortHint) -> u8 {
     }
 }
 
-fn collect_frees_formula(f: &p::Formula, bound: &mut Vec<String>, out: &mut Vec<p::VarSpec>) {
+fn collect_frees_formula(f: &p::Formula, bound: &mut Vec<VarKey>, out: &mut Vec<p::VarSpec>) {
     use p::Formula::*;
     match f {
         True | False => {}
@@ -486,14 +506,14 @@ fn collect_frees_formula(f: &p::Formula, bound: &mut Vec<String>, out: &mut Vec<
         }
         Forall(vs, body) | Exists(vs, body) => {
             let saved = bound.len();
-            for v in vs { bound.push(v.name.clone()); }
+            for v in vs { bound.push(var_full_key(v)); }
             collect_frees_formula(body, bound, out);
             bound.truncate(saved);
         }
     }
 }
 
-fn collect_frees_atom(a: &p::Atom, bound: &[String], out: &mut Vec<p::VarSpec>) {
+fn collect_frees_atom(a: &p::Atom, bound: &[VarKey], out: &mut Vec<p::VarSpec>) {
     use p::Atom::*;
     match a {
         Eq(l, r) | Less(l, r) | LessMset(l, r) | Subterm(l, r) => {
@@ -509,10 +529,10 @@ fn collect_frees_atom(a: &p::Atom, bound: &[String], out: &mut Vec<p::VarSpec>) 
     }
 }
 
-fn collect_frees_term(t: &p::Term, bound: &[String], out: &mut Vec<p::VarSpec>) {
+fn collect_frees_term(t: &p::Term, bound: &[VarKey], out: &mut Vec<p::VarSpec>) {
     match t {
         p::Term::Var(v) => {
-            if !bound.iter().any(|n| n == &v.name) {
+            if !bound.contains(&var_full_key(v)) {
                 out.push(v.clone());
             }
         }

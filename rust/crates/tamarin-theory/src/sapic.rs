@@ -143,7 +143,10 @@ impl GoodAnnotation for ProcessParsedAnnotation {
 // Process
 // =============================================================================
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Note: only `PartialEq` (not `Eq`) — the `Msr` variant carries a
+// `tamarin_parser::ast::Formula` in its `rest` (embedded-restriction) field,
+// which is `PartialEq` but not `Eq` (mirrors `ProcessCombinator::Cond`).
+#[derive(Debug, Clone, PartialEq)]
 pub enum SapicAction<V> {
     Rep,
     New(V),
@@ -166,7 +169,16 @@ pub enum SapicAction<V> {
         prems: Vec<SapicNFact<V>>,
         acts: Vec<SapicNFact<V>>,
         concs: Vec<SapicNFact<V>>,
-        rest: Vec<SapicNFormula<V>>,
+        /// Embedded `_restrict(...)` formulas attached to the MSR's action row
+        /// (`[l]--[a restricting φ]->[r]`).  HS stores these as
+        /// `SapicNFormula v` (Process.hs:88); the RS port carries the
+        /// un-expanded parser-AST [`tamarin_parser::ast::Formula`] directly,
+        /// exactly as `ProcessCombinator::Cond` does — the base translation
+        /// (`baseTransAction` MSR, Basetranslation.hs:200-203) keeps them as the
+        /// rule's 4th (restriction) component, which then flows through
+        /// `lift_rule_restrictions` (HS `liftedAddProtoRule`) unchanged, so a
+        /// `SapicNFormula` round-trip would be lossy with no consumer.
+        rest: Vec<tamarin_parser::ast::Formula>,
         match_vars: BTreeSet<V>,
     },
 }

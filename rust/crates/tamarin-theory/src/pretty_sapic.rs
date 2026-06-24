@@ -279,6 +279,61 @@ fn sapic_fact_to_doc(f: &crate::sapic::SapicLNFact) -> Doc {
     nest_short_doc(&lead, ")", body)
 }
 
+/// The MSR `process="..."` attribute printer.  HS `prettyRuleAttribute`'s
+/// local `ppProcess.f l a r rest _` (Rule.hs:1211-1214) — NOT `rulePrinter` —
+/// renders the rule's `ruleProcess` MSR node via `prettyRuleRestr (map toLNFact
+/// l) (map toLNFact a) (map toLNFact r) (map toLFormula rest)`, IGNORING the
+/// match-var set (the `_`).  So the premises render as PLAIN LN facts (no `=v`
+/// markers), unlike the `Theory.Sapic.Print.rulePrinter` path that re-applies
+/// `unextractMatchingVariables mv`.  `prettyRuleRestr = prettyRuleRestrGen
+/// prettyLNFact prettySyntacticLNFormula` (Rule.hs:1253-1273): builds
+/// `[ prems ] --[ acts (+ _restrict(..)) ]-> [ concls ]`; with no actions and
+/// no restrictions the arrow collapses to `-->`.
+fn render_msr(
+    prems: &[crate::sapic::SapicLNFact],
+    acts: &[crate::sapic::SapicLNFact],
+    concls: &[crate::sapic::SapicLNFact],
+    rest: &[tamarin_parser::ast::Formula],
+    _match_vars: &std::collections::BTreeSet<SapicLVar>,
+) -> String {
+    // `ppFactsList list = fsep [ "[", fsep (punctuate "," (map ppFact list)), "]" ]`.
+    let pp_facts_list = |facts: &[crate::sapic::SapicLNFact]| -> Doc {
+        let inner: Vec<Doc> = facts.iter().map(|f| sapic_fact_to_doc(f)).collect();
+        hpj::fsep(vec![
+            Doc::char('['),
+            hpj::fsep(hpj::punctuate(Doc::char(','), inner)),
+            Doc::char(']'),
+        ])
+    };
+
+    // The action/restriction row.
+    let arrow_row = if acts.is_empty() && rest.is_empty() {
+        Doc::text("-->")
+    } else {
+        // map ppFact acts ++ map ppRestr' restr
+        let mut items: Vec<Doc> = acts.iter().map(|f| sapic_fact_to_doc(f)).collect();
+        for phi in rest {
+            // `ppRestr' fact = "_restrict(" <> ppRestr fact <> ")"`,
+            // `ppRestr = prettySyntacticLNFormula . toLFormula` — the flat
+            // single-line formula renderer (matches `Cond`'s formula path).
+            let inner = crate::pretty_formula::pretty_formula(phi);
+            items.push(Doc::text(format!("_restrict({inner})")));
+        }
+        hpj::fsep(vec![
+            Doc::text("--["),
+            hpj::fsep(hpj::punctuate(Doc::char(','), items)),
+            Doc::text("]->"),
+        ])
+    };
+
+    let doc = hpj::sep(vec![
+        pp_facts_list(prems).nest(1),
+        arrow_row,
+        pp_facts_list(concls).nest(1),
+    ]);
+    render_sapic(doc)
+}
+
 /// HS `nestShort n lead finish body = sep [lead $$ nest n body, finish]`
 /// with `n = length lead + 1` (Class.hs:218-223).  Mirrors
 /// `pretty_formula::nest_short_doc`.
@@ -321,9 +376,10 @@ fn pretty_sapic_action(a: &SapicAction<SapicLVar>) -> String {
             let body = render_sapic(hpj::fsep(hpj::punctuate(Doc::char(','), arg_docs)));
             format!("{}({})", s, body)
         }
-        SapicAction::Msr { .. } => {
-            // MSR rendering inside a process is Phase 2+ (uses prettyRuleRestr).
-            "/* msr */".to_string()
+        // HS `prettySapicAction' prettyRule' (MSR p a c r mv) = prettyRule' p a c r mv`
+        // (Process.hs:470), where `prettyRule' = rulePrinter` (Print.hs:41-46).
+        SapicAction::Msr { prems, acts, concs, rest, match_vars } => {
+            render_msr(prems, acts, concs, rest, match_vars)
         }
     }
 }
@@ -355,8 +411,14 @@ fn pretty_sapic_comb(c: &ProcessCombinator<SapicLVar>) -> String {
         ProcessCombinator::Lookup(t, v) => {
             format!("lookup {} as {}", pretty_sapic_term(t), show_sapic_lvar(v))
         }
-        // Let renders its pattern/value; deferred to Phase 4.
-        ProcessCombinator::Let { .. } => "/* comb */".to_string(),
+        // HS `prettySapicComb (Let t t' vs) = "let "++ p' t ++ "=" ++ p t'`
+        // where `p = render . prettySapicTerm` and `p' = render . prettyPattern' vs`
+        // (Process.hs:479-481).  `prettyPattern' vs = prettySapicTerm .
+        // unextractMatchingVariables vs` renders the LEFT pattern with its match
+        // vars `=`-prefixed; the RIGHT is a plain term.
+        ProcessCombinator::Let { left, right, match_vars } => {
+            format!("let {}={}", pretty_pattern(left, match_vars), pretty_sapic_term(right))
+        }
     }
 }
 
