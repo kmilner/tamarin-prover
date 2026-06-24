@@ -24,22 +24,32 @@ The release profile uses `lto = "fat"` and `codegen-units = 1`.
 The correctness criterion is byte-identical raw `--prove` output, ignoring the
 volatile header lines (Git revision, compile time, processing time).
 
-The parity gate (`scripts/corpus_file_diff.sh`) compares the Rust port against
-the Haskell prover on a 275-file corpus: the theories under `examples/` that use
-only ported features and that Haskell proves within a 300 s/lemma cap. This
-spans `classic/`, `ake/`, `sp14/`, the `csf*/` series, `features/`, `loops/`,
-`post17/`, `regression/`, and `related_work/`.
+The parity gate (`scripts/corpus_file_diff.sh`, corpus in
+`scripts/parity_corpus.txt`) compares the Rust port against the Haskell prover
+on a 382-file corpus: the theories under `examples/` that use only ported
+features and that Haskell proves within a 300 s/lemma cap. This spans
+`classic/`, `ake/`, `sp14/`, the `csf*/` series, `features/`, `loops/`,
+`post17/`, `regression/`, `related_work/`, and the multiset-rewrite theories in
+`csf18-xor/`, `jcs19-xor/`, `idbased/`, `eurosp19-eccDAA/`,
+`esorics23-bluetooth/`, `csf20-disputeResolution/`, `fm24-cardpayments/`,
+`wisec21-5G-handover/`, `wireguard/`, the POIDC dirs, and the
+`thesis-LaraSchmid-evoting/` and pre-translated `sapic/` corpora.
 
 | Result | Files | Meaning |
 |--------|------:|---------|
-| MATCH | 202 | Rust output byte-identical to Haskell |
-| DIFF  |   5 | needs an unported feature (`--diff` observational equivalence); HS output is cached and re-compared automatically when the feature lands |
-| SKIP  |  68 | no Haskell reference to compare against (HS exceeds the cap, or produces no/empty output) |
+| MATCH        | 279 | Rust output byte-identical to Haskell |
+| DIFF (search)|  30 | genuine proof-output divergence on ported features — open faithfulness work (see below) |
+| DIFF (`--diff`)|  5 | needs the unported `--diff` observational-equivalence mode; HS output is cached and re-compared automatically when it lands |
+| SKIP         |  68 | no Haskell reference to compare against (HS exceeds the cap, or produces no/empty output) |
 
-No proof-search or verdict (verified/falsified) divergence remains. Theories
-outside the corpus require an unported frontend — SAPiC `process:` or
-observational equivalence (`--diff`) — or exercise searches that Haskell itself
-does not finish.
+No verdict (verified/falsified) divergence remains. The 30 search divergences
+are heavier protocols newly admitted to the gate and cluster into a few root
+causes: a pretty-printer line-wrap difference (`idbased/BP_*`), a systematic
+output delta across the `thesis-LaraSchmid-evoting` authentication models, and
+the previously-known structural divergences in the alethea/eccDAA/bluetooth
+theories. Theories outside the corpus require an unported frontend — SAPiC
+`process:`, accountability (`accounts for`), or observational equivalence
+(`--diff`) — or exercise searches that Haskell itself does not finish.
 
 ## Performance
 
@@ -127,6 +137,9 @@ Regenerate the tables with `scripts/bench.sh`.
   SAPiC theories (multiset-rewrite rules) prove fine; the `process:` block itself
   is not compiled.
 - **`diff(...)` / `--diff`** — observational-equivalence mode.
+- **Accountability (`accounts for` / `verdictfunction`)** — the accountability
+  frontend that expands a verdict lemma into case sub-lemmas; the surrounding
+  multiset-rewrite theory parses, but the accountability lemma is not expanded.
 - Other parse-only CLI flags: `--saturation`, `--open-chains`,
   `--partial-evaluation`, `--stop-on-trace` (RS already defaults to DFS, as HS
   does), `--replication-bound`; `--output-json`/`--output-dot` write stubs and
