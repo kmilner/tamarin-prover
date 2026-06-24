@@ -26,7 +26,7 @@ volatile header lines (Git revision, compile time, processing time).
 
 The parity gate (`scripts/corpus_file_diff.sh`, corpus in
 `scripts/parity_corpus.txt`) compares the Rust port against the Haskell prover
-on a 382-file corpus: the theories under `examples/` that use only ported
+on a 377-file corpus: the theories under `examples/` that use only ported
 features and that Haskell proves within a 300 s/lemma cap. This spans
 `classic/`, `ake/`, `sp14/`, the `csf*/` series, `features/`, `loops/`,
 `post17/`, `regression/`, `related_work/`, and the multiset-rewrite theories in
@@ -37,19 +37,20 @@ features and that Haskell proves within a 300 s/lemma cap. This spans
 
 | Result | Files | Meaning |
 |--------|------:|---------|
-| MATCH        | 279 | Rust output byte-identical to Haskell |
-| DIFF (search)|  30 | genuine proof-output divergence on ported features — open faithfulness work (see below) |
-| DIFF (`--diff`)|  5 | needs the unported `--diff` observational-equivalence mode; HS output is cached and re-compared automatically when it lands |
-| SKIP         |  68 | no Haskell reference to compare against (HS exceeds the cap, or produces no/empty output) |
+| MATCH | 298 | Rust output byte-identical to Haskell |
+| DIFF  |  11 | genuine proof-output divergence on ported features — open faithfulness work (see below) |
+| SKIP  |  68 | no Haskell reference to compare against (HS exceeds the cap, or produces no/empty output) |
 
-No verdict (verified/falsified) divergence remains. The 30 search divergences
-are heavier protocols newly admitted to the gate and cluster into a few root
-causes: a pretty-printer line-wrap difference (`idbased/BP_*`), a systematic
-output delta across the `thesis-LaraSchmid-evoting` authentication models, and
-the previously-known structural divergences in the alethea/eccDAA/bluetooth
-theories. Theories outside the corpus require an unported frontend — SAPiC
-`process:`, accountability (`accounts for`), or observational equivalence
-(`--diff`) — or exercise searches that Haskell itself does not finish.
+(Counts are projected from per-fix targeted validation; the consolidated gate is
+run periodically to confirm them.) No verdict (verified/falsified) divergence
+remains. The remaining DIFFs cluster into a few root causes: a bilinear
+goal-discharge difference (`idbased/BP_IBS_*`), proof-search/step-count
+divergences (`alethea_vot`, `wisec21-5G-handover`), and a handful of isolated
+cases (`chaum`, `timepoints`, `fm24-cardpayments/C8`). Theories outside the
+corpus require an unported frontend — SAPiC `process:`, accountability
+(`accounts for`), or observational equivalence (`--diff`) — or exercise searches
+that Haskell itself does not finish. Observational-equivalence (`--diff`)
+theories are excluded from the gate and re-enter once that mode is ported.
 
 ## Performance
 

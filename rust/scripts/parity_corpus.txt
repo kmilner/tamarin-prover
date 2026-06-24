@@ -173,10 +173,6 @@ features/derivation-checks/manualEncryptionDecryption.spthy
 features/derivation-checks/revealingSignatureDerivationTest.spthy
 features/derivation-checks/signatureDerivationTest.spthy
 features/derivation-checks/symEnc.spthy
-features/equivalence/AxiomDiffTest1.spthy
-features/equivalence/AxiomDiffTest2.spthy
-features/equivalence/AxiomDiffTest3.spthy
-features/equivalence/AxiomDiffTest4.spthy
 features/equivalence/future/ake_KEAplus.spthy
 features/equivalence/future/ake_NAXOS.spthy
 features/heuristic/OracleRanking.spthy
@@ -264,7 +260,6 @@ post17/foo_eligibility.spthy
 post17/needham_schroeder_symmetric_cbc.spthy
 post17/okamoto_eligibility.spthy
 regression/diff/issue223.spthy
-regression/diff/issue324.spthy
 regression/trace/defaultoracle.spthy
 regression/trace/issue193.spthy
 regression/trace/issue216.spthy
