@@ -1,15 +1,34 @@
 //! Port of the SAPIC process pretty-printers from
 //! `lib/theory/src/Theory/Sapic/{Term,Process}.hs` and
-//! `lib/theory/src/Theory/Model/Fact.hs`, restricted to the *flat* (single
-//! line) rendering used for the `process="..."` rule attribute and the
-//! SAPIC-generated rule names.
+//! `lib/theory/src/Theory/Model/Fact.hs`, used for the `process="..."` rule
+//! attribute and the SAPIC-generated rule names.
+//!
+//! WRAPPING.  The `process="..."` attribute value is NOT a single
+//! `text` — `prettySapicAction'` (Process.hs:450-469) builds it by string
+//! concatenation of literals (`"out("`, `"new "`, …) with the result of
+//! `render` applied SEPARATELY to each embedded term/fact/pattern `Doc`.  That
+//! inner `render` is `Text.PrettyPrint.Class.render = P.render`
+//! (`lib/utils/src/Text/PrettyPrint/Class.hs:77-78`), i.e. the HughesPJ
+//! DEFAULT `style = Style { lineLength = 100, ribbonsPerLine = 1.5 }`, giving
+//! ribbon `round(100 / 1.5) = 67`.  This is DIFFERENT from the theory display
+//! width (110 / 73) used everywhere else (`pretty_hpj::{LINE_LENGTH,RIBBON}`).
+//! A long term such as `<aenc(shared_key.1, pk(skV.1)),
+//! report(aenc(shared_key.1, pk(skV.1)))>` (70 cols > 67) therefore wraps
+//! INSIDE the rendered term, with continuation lines indented by the `nest 1`
+//! that `ppTerms`/pairs apply (Term.hs:288-290).  Each `render` starts at
+//! column 0 (the surrounding literals do not shift the wrap column), so we
+//! render each sub-Doc standalone via [`render_sapic`].
 //!
 //! HS references:
 //!   - `prettySapicTerm = prettyTerm (text . show)` (Term.hs:168-169), where
 //!     `show :: SapicLVar` is `show v ++ ":" ++ t` for typed vars (Term.hs:108).
+//!   - `prettyTerm` term Doc structure (Term/Term.hs:268-296): pairs via
+//!     `ppTerms ", " 1 "<" ">"` (fcat + `nest 1`), AC ops via
+//!     `ppTerms (ppACOp o) 1 "(" ")"`, functions via `ppFun = text(f++"(") <>
+//!     fsep (punctuate comma args) <> ")"`.
 //!   - `prettySapicFact = prettyFact prettySapicTerm` (Term.hs:171-172); a
-//!     fact renders as `Name( a, b )` with a leading/trailing space
-//!     (`nestShort'`, Fact.hs:540-547).
+//!     fact renders as `Name( a, b )` via `nestShort' (n++"(") ")" . fsep .
+//!     punctuate comma` (Fact.hs:540-547, Class.hs:218-223).
 //!   - `prettySapicAction'` (Process.hs:450-469).
 //!   - `prettySapicTopLevel'` (Process.hs:514-524).
 //!
@@ -22,9 +41,28 @@ use tamarin_term::function_symbols::{AcSym, CSym, FunSym};
 use tamarin_term::function_symbols::{diff_sym, exp_sym, nat_one_sym, pair_sym, EMAP_SYM_STRING};
 use tamarin_term::vterm::{Lit, VTerm};
 
+use crate::pretty_hpj::{self as hpj, Doc};
 use crate::sapic::{
     PlainProcess, Process, ProcessCombinator, SapicAction, SapicLVar, SapicTerm,
 };
+
+/// HughesPJ DEFAULT `lineLength` (`Text.PrettyPrint.HughesPJ.style`,
+/// pretty-1.1.3.6 HughesPJ.hs:939).  The inner `render` calls in
+/// `prettySapicAction'` use the bare `P.render` (Class.hs:77-78), so they
+/// render at this width, NOT the tamarin theory width (110).
+const SAPIC_LINE_LENGTH: usize = 100;
+/// HughesPJ DEFAULT ribbon = `round(lineLength / ribbonsPerLine)` =
+/// `round(100 / 1.5) = 67`.
+const SAPIC_RIBBON: usize = 67;
+
+/// Render a SAPIC sub-Doc the way HS's inner `render` does: standalone,
+/// starting at column 0, at the HughesPJ default width 100 / ribbon 67.
+/// Continuation lines carry the `nest`-driven indent verbatim — matching
+/// HS, which then string-concatenates the result with the surrounding action
+/// literals.
+fn render_sapic(d: Doc) -> String {
+    d.render_with(SAPIC_LINE_LENGTH, SAPIC_RIBBON)
+}
 
 /// `show :: SapicLVar` (Term.hs:108-110): `show lvar (++ ":" ++ type)`.
 fn show_sapic_lvar(v: &SapicLVar) -> String {
@@ -46,195 +84,159 @@ fn ac_op_symbol(op: AcSym) -> &'static str {
     }
 }
 
-/// `prettyTerm (text . show)` over a `SapicTerm` (Term.hs:268-298), flat.
+/// `render (prettySapicTerm t)` over a `SapicTerm` — HS `prettyTerm (text .
+/// show)` (Term.hs:268-296) built as a HughesPJ `Doc` then rendered standalone
+/// at the default width (100 / 67), so long terms WRAP exactly as HS's inner
+/// `render` does.
 pub fn pretty_sapic_term(t: &SapicTerm) -> String {
-    let mut out = String::new();
-    pp_sapic_term(t, &mut out);
-    out
+    render_sapic(sapic_term_to_doc(t, None))
 }
 
-/// `prettyPattern' vs = prettySapicTerm . unextractMatchingVariables vs`
-/// (Process.hs:443-444): render a `ChIn`/`let` pattern term, prefixing every
-/// variable that is in the match-var set `vs` with `=` (HS `PatternMatch v`
-/// shows as `=v`, `PatternBind v` shows as `v`).
-fn pretty_pattern(t: &SapicTerm, match_vars: &std::collections::BTreeSet<SapicLVar>) -> String {
-    let mut out = String::new();
-    pp_pattern_term(t, match_vars, &mut out);
-    out
-}
-
-/// `pp_sapic_term` with the match-var `=` marker.  Structurally identical to
-/// `pp_sapic_term`; only the `Var` leaf differs (it consults `match_vars`).  HS
-/// renders the pattern via the same `prettyTerm` printer, so pair splitting /
-/// AC / function rendering match exactly.
-fn pp_pattern_term(
+/// `prettyTerm (text . show) t` as a `Doc`.  Structurally identical to
+/// `pretty_formula::term_to_doc` (the parser-AST renderer that the rule body
+/// uses), only over `SapicTerm = VTerm`: pairs → `pair_doc` (fcat + `nest 1`),
+/// AC ops → `ac_op_doc`, functions → `fun_doc` (`text(f++"(") <> fsep(args)
+/// <> ")"`).  `match_vars`, when `Some`, marks pattern-match variables with a
+/// leading `=` (HS `prettyPattern' = prettySapicTerm . unextractMatchingVariables`,
+/// Process.hs:443-444).
+fn sapic_term_to_doc(
     t: &SapicTerm,
-    mv: &std::collections::BTreeSet<SapicLVar>,
-    out: &mut String,
-) {
+    match_vars: Option<&std::collections::BTreeSet<SapicLVar>>,
+) -> Doc {
     match t {
         VTerm::Lit(Lit::Var(v)) => {
             // `unextractMatchingVariables`: `v ∈ vs` → `PatternMatch v` (`=v`).
-            // The match-var set holds `SapicLVar`s; compare on the inner `LVar`
-            // (the `extractMatchingVariables`/`unextract` round-trip preserves the
-            // variable identity, type included).
-            if mv.contains(v) {
-                out.push('=');
-            }
-            out.push_str(&show_sapic_lvar(v));
-        }
-        VTerm::Lit(Lit::Con(n)) => tamarin_term::pretty::pp_name(n, out),
-        VTerm::App(FunSym::Ac(o), ts) => {
-            out.push('(');
-            for (i, c) in ts.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(ac_op_symbol(*o));
+            let mut s = String::new();
+            if let Some(mv) = match_vars {
+                if mv.contains(v) {
+                    s.push('=');
                 }
-                pp_pattern_term(c, mv, out);
             }
-            out.push(')');
+            s.push_str(&show_sapic_lvar(v));
+            Doc::text(s)
+        }
+        VTerm::Lit(Lit::Con(n)) => {
+            let mut s = String::new();
+            tamarin_term::pretty::pp_name(n, &mut s);
+            Doc::text(s)
+        }
+        VTerm::App(FunSym::Ac(o), ts) => {
+            // HS `FApp (AC o) ts -> ppTerms (ppACOp o) 1 "(" ")" ts`.
+            let refs: Vec<&SapicTerm> = ts.iter().collect();
+            ac_op_doc(ac_op_symbol(*o), &refs, match_vars)
         }
         VTerm::App(FunSym::NoEq(sym), ts) if ts.len() == 2 && *sym == exp_sym() => {
-            pp_pattern_term(&ts[0], mv, out);
-            out.push('^');
-            pp_pattern_term(&ts[1], mv, out);
+            // HS `... | s == expSym -> ppTerm t1 <> "^" <> ppTerm t2` (flat).
+            sapic_term_to_doc(&ts[0], match_vars)
+                .beside(Doc::text("^"))
+                .beside(sapic_term_to_doc(&ts[1], match_vars))
         }
         VTerm::App(FunSym::NoEq(sym), ts) if ts.len() == 2 && *sym == diff_sym() => {
-            out.push_str("diff(");
-            pp_pattern_term(&ts[0], mv, out);
-            out.push_str(", ");
-            pp_pattern_term(&ts[1], mv, out);
-            out.push(')');
+            // HS `... | s == diffSym -> "diff" <> "(" <> ppTerm t1 <> ", " <>
+            // ppTerm t2 <> ")"` (all `<>`, never breaks at the comma).
+            Doc::text("diff(")
+                .beside(sapic_term_to_doc(&ts[0], match_vars))
+                .beside(Doc::text(", "))
+                .beside(sapic_term_to_doc(&ts[1], match_vars))
+                .beside(Doc::text(")"))
         }
         VTerm::App(FunSym::NoEq(sym), ts) if ts.is_empty() && *sym == nat_one_sym() => {
             let _ = ts;
-            out.push_str("%1");
+            Doc::text("%1")
         }
         VTerm::App(FunSym::NoEq(sym), _) if *sym == pair_sym() => {
             let mut flat: Vec<&SapicTerm> = Vec::new();
             collect_pair_tail(t, &mut flat);
-            out.push('<');
-            for (i, c) in flat.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                pp_pattern_term(c, mv, out);
-            }
-            out.push('>');
+            pair_doc(&flat, match_vars)
         }
         VTerm::App(FunSym::NoEq(sym), ts) => {
-            out.push_str(&String::from_utf8_lossy(&sym.name));
-            if !ts.is_empty() {
-                out.push('(');
-                for (i, c) in ts.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(", ");
-                    }
-                    pp_pattern_term(c, mv, out);
-                }
-                out.push(')');
+            let name = String::from_utf8_lossy(&sym.name).into_owned();
+            if ts.is_empty() {
+                // HS `FApp (NoEq (f,_)) [] -> text f`.
+                Doc::text(name)
+            } else {
+                let refs: Vec<&SapicTerm> = ts.iter().collect();
+                fun_doc(&name, &refs, match_vars)
             }
         }
         VTerm::App(FunSym::C(CSym::EMap), ts) => {
-            out.push_str(&String::from_utf8_lossy(EMAP_SYM_STRING));
-            out.push('(');
-            for (i, c) in ts.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                pp_pattern_term(c, mv, out);
-            }
-            out.push(')');
+            let name = String::from_utf8_lossy(EMAP_SYM_STRING).into_owned();
+            let refs: Vec<&SapicTerm> = ts.iter().collect();
+            fun_doc(&name, &refs, match_vars)
         }
         VTerm::App(FunSym::List, ts) => {
-            out.push_str("LIST(");
-            for (i, c) in ts.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                pp_pattern_term(c, mv, out);
-            }
-            out.push(')');
+            let refs: Vec<&SapicTerm> = ts.iter().collect();
+            fun_doc("LIST", &refs, match_vars)
         }
     }
 }
 
-fn pp_sapic_term(t: &SapicTerm, out: &mut String) {
-    match t {
-        VTerm::Lit(Lit::Var(v)) => out.push_str(&show_sapic_lvar(v)),
-        VTerm::Lit(Lit::Con(n)) => tamarin_term::pretty::pp_name(n, out),
-        VTerm::App(FunSym::Ac(o), ts) => {
-            out.push('(');
-            for (i, c) in ts.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(ac_op_symbol(*o));
-                }
-                pp_sapic_term(c, out);
-            }
-            out.push(')');
+/// HS `ppTerms ", " 1 "<" ">" flat` (Term/Term.hs:288-290): a fcat of `<`,
+/// each element `nest 1`'d and comma-suffixed (except the last), and `>`.
+fn pair_doc(
+    flat: &[&SapicTerm],
+    match_vars: Option<&std::collections::BTreeSet<SapicLVar>>,
+) -> Doc {
+    let n = flat.len();
+    let mut parts: Vec<Doc> = Vec::with_capacity(n + 2);
+    parts.push(Doc::text("<"));
+    for (i, t) in flat.iter().enumerate() {
+        let mut d = sapic_term_to_doc(t, match_vars);
+        if i + 1 < n {
+            d = d.beside(Doc::text(", "));
         }
-        VTerm::App(FunSym::NoEq(sym), ts) if ts.len() == 2 && *sym == exp_sym() => {
-            pp_sapic_term(&ts[0], out);
-            out.push('^');
-            pp_sapic_term(&ts[1], out);
-        }
-        VTerm::App(FunSym::NoEq(sym), ts) if ts.len() == 2 && *sym == diff_sym() => {
-            out.push_str("diff(");
-            pp_sapic_term(&ts[0], out);
-            out.push_str(", ");
-            pp_sapic_term(&ts[1], out);
-            out.push(')');
-        }
-        VTerm::App(FunSym::NoEq(sym), ts) if ts.is_empty() && *sym == nat_one_sym() => {
-            out.push_str("%1");
-        }
-        VTerm::App(FunSym::NoEq(sym), _) if *sym == pair_sym() => {
-            let mut flat: Vec<&SapicTerm> = Vec::new();
-            collect_pair_tail(t, &mut flat);
-            out.push('<');
-            for (i, c) in flat.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                pp_sapic_term(c, out);
-            }
-            out.push('>');
-        }
-        VTerm::App(FunSym::NoEq(sym), ts) => {
-            out.push_str(&String::from_utf8_lossy(&sym.name));
-            if !ts.is_empty() {
-                out.push('(');
-                for (i, c) in ts.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(", ");
-                    }
-                    pp_sapic_term(c, out);
-                }
-                out.push(')');
-            }
-        }
-        VTerm::App(FunSym::C(CSym::EMap), ts) => {
-            out.push_str(&String::from_utf8_lossy(EMAP_SYM_STRING));
-            out.push('(');
-            for (i, c) in ts.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                pp_sapic_term(c, out);
-            }
-            out.push(')');
-        }
-        VTerm::App(FunSym::List, ts) => {
-            out.push_str("LIST(");
-            for (i, c) in ts.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                pp_sapic_term(c, out);
-            }
-            out.push(')');
-        }
+        parts.push(d.nest(1));
     }
+    parts.push(Doc::text(">"));
+    hpj::fcat(parts)
+}
+
+/// HS `ppTerms (ppACOp o) 1 "(" ")" ts` (Term/Term.hs:273,288-290): like
+/// `pair_doc` with `(`/`)` lead/finish and the AC-op symbol (no surrounding
+/// spaces) as separator.
+fn ac_op_doc(
+    sym: &str,
+    flat: &[&SapicTerm],
+    match_vars: Option<&std::collections::BTreeSet<SapicLVar>>,
+) -> Doc {
+    let n = flat.len();
+    let mut parts: Vec<Doc> = Vec::with_capacity(n + 2);
+    parts.push(Doc::text("("));
+    for (i, t) in flat.iter().enumerate() {
+        let mut d = sapic_term_to_doc(t, match_vars);
+        if i + 1 < n {
+            d = d.beside(Doc::text(sym));
+        }
+        parts.push(d.nest(1));
+    }
+    parts.push(Doc::text(")"));
+    hpj::fcat(parts)
+}
+
+/// HS `ppFun f ts = text (f ++ "(") <> fsep (punctuate comma (map ppTerm ts))
+/// <> text ")"` (Term/Term.hs:295-296).  The args are joined by a breakable
+/// `fsep` over a bare `,` (no following space — HS `comma = text ","`).
+fn fun_doc(
+    name: &str,
+    args: &[&SapicTerm],
+    match_vars: Option<&std::collections::BTreeSet<SapicLVar>>,
+) -> Doc {
+    let arg_docs: Vec<Doc> = args
+        .iter()
+        .map(|a| sapic_term_to_doc(a, match_vars))
+        .collect();
+    let body = hpj::fsep(hpj::punctuate(Doc::char(','), arg_docs));
+    Doc::text(format!("{}(", name))
+        .beside(body)
+        .beside(Doc::text(")"))
+}
+
+/// `render (prettyPattern' vs t)` (Process.hs:443-444): render a `ChIn`/`let`
+/// pattern term as a `Doc` (prefixing every variable in the match-var set `vs`
+/// with `=`) then render standalone at 100 / 67, so a long pattern wraps the
+/// same way HS's inner `render` does.
+fn pretty_pattern(t: &SapicTerm, match_vars: &std::collections::BTreeSet<SapicLVar>) -> String {
+    render_sapic(sapic_term_to_doc(t, Some(match_vars)))
 }
 
 /// HS `split` (Term.hs:292-293): `split (viewTerm2 -> FPair t1 t2) = t1 :
@@ -253,28 +255,37 @@ fn collect_pair_tail<'a>(t: &'a SapicTerm, out: &mut Vec<&'a SapicTerm>) {
     out.push(t);
 }
 
-/// `prettySapicFact = prettyFact prettySapicTerm` (Fact.hs:540-547).
-/// A non-empty argument list renders as `Name( a, b )` — note the leading and
-/// trailing space introduced by `nestShort'`'s `sep`.  An empty list renders
-/// as `Name( )` (HS `nestShort'` always prints lead/finish; `sep [empty,")"]`
-/// = `( )`).
+/// `render (prettySapicFact a)` = `render (prettyFact prettySapicTerm a)`
+/// (Term.hs:171-172, Fact.hs:539-546).  Built as a `Doc` via `nestShort'
+/// (n++"(") ")" . fsep . punctuate comma` (Class.hs:218-223) then rendered
+/// standalone at 100 / 67.  On one line this is `Name( a, b )` — the leading
+/// and trailing spaces come from `nestShort'`'s `sep [lead $$ nest k body,
+/// finish]` overlap; an empty arg list renders `Name( )`.  A wide event fact
+/// wraps the same way HS's inner `render` does.
 fn pretty_sapic_fact(f: &crate::sapic::SapicLNFact) -> String {
+    render_sapic(sapic_fact_to_doc(f))
+}
+
+/// HS `prettyFact prettySapicTerm` (Fact.hs:539-546): `ppFact (showFactTag
+/// tag) ts = nestShort' (n ++ "(") ")" . fsep . punctuate comma $ map
+/// prettySapicTerm ts`.  (SAPIC event facts never carry annotations, so the
+/// `<> ppAnn` suffix — empty for `S.null ann` — is omitted, matching the prior
+/// flat renderer and the committed gate.)
+fn sapic_fact_to_doc(f: &crate::sapic::SapicLNFact) -> Doc {
     let name = crate::fact::show_fact_tag(&f.tag);
-    let mut inner = String::new();
-    for (i, t) in f.terms.iter().enumerate() {
-        if i > 0 {
-            inner.push_str(", ");
-        }
-        inner.push_str(&pretty_sapic_term(t));
-    }
-    // `nestShort' (n++"(") ")" body = sep [text (n++"(") $$ nest k body, ")"]`.
-    // On one line that is `"<name>(" <space> <body> <space> ")"` for non-empty
-    // body, and `"<name>(" <space> ")"` for empty body.
-    if inner.is_empty() {
-        format!("{name}( )")
-    } else {
-        format!("{name}( {inner} )")
-    }
+    let lead = format!("{name}(");
+    let arg_docs: Vec<Doc> = f.terms.iter().map(|t| sapic_term_to_doc(t, None)).collect();
+    let body = hpj::fsep(hpj::punctuate(Doc::char(','), arg_docs));
+    nest_short_doc(&lead, ")", body)
+}
+
+/// HS `nestShort n lead finish body = sep [lead $$ nest n body, finish]`
+/// with `n = length lead + 1` (Class.hs:218-223).  Mirrors
+/// `pretty_formula::nest_short_doc`.
+fn nest_short_doc(lead: &str, finish: &str, body: Doc) -> Doc {
+    let n = lead.chars().count() as isize + 1;
+    let above = Doc::text(lead).above(body.nest(n));
+    hpj::sep(vec![above, Doc::text(finish)])
 }
 
 /// `prettySapicAction'` (Process.hs:450-469), linear subset.
@@ -302,8 +313,13 @@ fn pretty_sapic_action(a: &SapicAction<SapicLVar>) -> String {
         SapicAction::Lock(t) => format!("lock {}", pretty_sapic_term(t)),
         SapicAction::Unlock(t) => format!("unlock {}", pretty_sapic_term(t)),
         SapicAction::ProcessCall(s, ts) => {
-            let inner: Vec<String> = ts.iter().map(pretty_sapic_term).collect();
-            format!("{}({})", s, inner.join(", "))
+            // HS `prettySapicAction' _ (ProcessCall s ts) = s ++ "(" ++ p ts
+            // ++ ")"` where `p pts = render $ fsep (punctuate comma (map
+            // prettySapicTerm pts))` (Process.hs:469-471).  The args render
+            // standalone via a breakable `fsep` over a bare `,`.
+            let arg_docs: Vec<Doc> = ts.iter().map(|t| sapic_term_to_doc(t, None)).collect();
+            let body = render_sapic(hpj::fsep(hpj::punctuate(Doc::char(','), arg_docs)));
+            format!("{}({})", s, body)
         }
         SapicAction::Msr { .. } => {
             // MSR rendering inside a process is Phase 2+ (uses prettyRuleRestr).
