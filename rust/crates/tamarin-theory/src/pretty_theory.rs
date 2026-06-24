@@ -614,7 +614,13 @@ fn render_parsed_item(
         }
         IntrRule(_) => None,
         Lemma(l) => Some(render_parsed_lemma(l, macros, predicates, proved, in_file, elab, arity1)),
-        Restriction(r) => Some(render_parsed_restriction(r, macros, predicates, elab, arity1)),
+        // HS treats the deprecated `axiom` keyword as a synonym for
+        // `restriction` (`liftedAddRestriction`; the legacy `axiom`/`Axiom` is
+        // parsed and rendered as a `restriction`). RS already elaborates
+        // `LegacyAxiom` as a restriction for solving; render it the same so the
+        // deprecated-`axiom` blocks (e.g. the thesis-evoting auth models) emit
+        // their `restriction <name>:` blocks instead of being dropped.
+        Restriction(r) | LegacyAxiom(r) => Some(render_parsed_restriction(r, macros, predicates, elab, arity1)),
         Predicates(preds) => {
             // HS `prettyTheory` folds each `PredicateItem` through
             // `prettyPredicate` (TheoryObject.hs:764, 802-806):
