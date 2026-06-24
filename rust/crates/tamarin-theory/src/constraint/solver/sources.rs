@@ -2552,7 +2552,11 @@ pub fn solve_with_source_cases_ctx(
     let mut out: Vec<(String, System)> = Vec::new();
     let mut all_attempted: Vec<(String, bool)> = Vec::new();
     for (name, case_sys) in src.cases(ctx) {
-        let case_label = saturated_chain_root(&name);
+        // HS-faithful: use the stored (already-`combine`d, `_`-joined)
+        // case name verbatim — never re-split on `_`.  See the note at
+        // the action-goal call site above re: the removed
+        // `saturated_chain_root` mangling of underscore-bearing symbols.
+        let case_label = name.clone();
         let applied_arms = apply_source_case_premise(
             ctx, sys, src, &case_sys,
             goal_node, goal_prem_idx, fa_prem,
@@ -2946,7 +2950,14 @@ pub fn solve_with_source_cases_action_with_ctx(
         // ----------------------------------------------------------------
         let mut refine_arms: Vec<(String, RefineArm)> = Vec::new();
         for (name, case_sys) in cases_iter {
-            let case_label = saturated_chain_root(&name);
+            // HS-faithful: the stored case name is ALREADY the final
+            // display name — `refineSource` applied `combine` (Sources.hs
+            // :135-139) and the list was joined via `intercalate "_"`
+            // (ProofMethod.hs:511).  HS NEVER re-splits a name on `_`, so
+            // we must use it verbatim.  (A previous `saturated_chain_root`
+            // string-splitter mangled `c_KDF_SKc` → `SKc` for any function
+            // symbol whose name contains an underscore.)
+            let case_label = name.clone();
             if dbg_rt { all_names.push(case_label.clone()); }
             // Haskell-faithful `applySource` path: matches the live goal
             // against the source's ABSTRACT `cdGoal` (`src.goal`) — NOT a
@@ -3021,7 +3032,9 @@ pub fn solve_with_source_cases_action_with_ctx(
         // (the saturate-time `saturate_out_premise` path's own
         // `refine_one_source` already deduplicates).
         for (name, case_sys) in cases_iter {
-            let case_label = saturated_chain_root(&name);
+            // HS-faithful: stored case name is already final; use verbatim
+            // (no `_`-splitting).  See note at the action-goal call site.
+            let case_label = name.clone();
             if dbg_rt { all_names.push(case_label.clone()); }
             let renamed = freshen_system(&case_sys, avoid_max, ctx_opt.map(|c| &c.maude));
             let abstract_renamed = {
@@ -3104,100 +3117,17 @@ fn combine_case_names_list(existing: &[String], new_names: &[String]) -> Vec<Str
     }
 }
 
-/// Extract the chain-root case name from a saturated source-case name.
-/// Names are built by `saturate_out_premise` appending `_<producer>`
-/// for each fold:
-///
-///   "coerce_case_1_A"        → "A"        (legacy: case-marker form)
-///   "coerce_irecv_SendBoth"  → "SendBoth" (post-chain-extension form)
-///   "coerce_irecv"           → "irecv"    (un-folded leaf)
-///   "c_fresh"                → "c_fresh"  (no chain, single rule)
-///   "coerce"                 → "coerce"   (un-folded)
-///
-/// The strategy:
-///   1. Strip a leading `_case_<n>_` segment if present (legacy).
-///   2. Strip leading intruder-rule prefixes (`coerce_`, `irecv_`,
-///      `ipub_`, `isend_`, `c_<sym>_`) — the chain's interior intruder
-///      hops.  Remaining head is the protocol producer (or the last
-///      intruder if no protocol producer was reached).
-///   3. Strip a trailing `_case_<N>` suffix — saturate appends this to
-///      disambiguate multiple closures of the same sub-rule chain; the
-///      runtime renderer re-derives the disambiguation, so the suffix
-///      is dropped here to match HS's `Alice` vs `Alice_case_1` layout.
-fn saturated_chain_root(name: &str) -> String {
-    // Step 1: legacy `_case_<n>_` stripping.
-    let bytes = name.as_bytes();
-    let mut best_end = 0usize;
-    let mut i = 0;
-    while i + 6 < bytes.len() {
-        if &bytes[i..i+6] == b"_case_" {
-            let mut j = i + 6;
-            while j < bytes.len() && bytes[j].is_ascii_digit() { j += 1; }
-            if j > i + 6 && j < bytes.len() && bytes[j] == b'_' {
-                best_end = j + 1;
-                i = j + 1;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    let mut tail: &str = if best_end > 0 && best_end < bytes.len() {
-        &name[best_end..]
-    } else {
-        name
-    };
-    // Step 2: strip leading intruder-rule chain prefixes.  Each iter
-    // peels one segment if it matches a known intruder rule.
-    loop {
-        let next = if let Some(s) = tail.strip_prefix("coerce_") {
-            Some(s)
-        } else if let Some(s) = tail.strip_prefix("irecv_") {
-            Some(s)
-        } else if let Some(s) = tail.strip_prefix("ipub_") {
-            Some(s)
-        } else if let Some(s) = tail.strip_prefix("isend_") {
-            Some(s)
-        } else if let Some(stripped) = tail.strip_prefix("c_") {
-            // `c_<sym>_<rest>` — strip `c_<sym>_`.
-            stripped.find('_').map(|pos| &stripped[pos + 1..])
-        } else { None };
-        match next {
-            Some(n) if !n.is_empty() => tail = n,
-            _ => break,
-        }
-    }
-    // Step 3: strip trailing `_case_<N>` suffix.  Saturate
-    // (`saturate_out_premise`) appends `_case_<k>` to disambiguate
-    // multiple closures of the same sub-rule chain.  Haskell's
-    // `refineSource.combine` (Sources.hs:135-137) just keeps the first
-    // non-coerce name without a per-closure suffix — multiple cases
-    // sharing the same root name are disambiguated at runtime via
-    // `distinguish` (ProofMethod.hs:335, applied via
-    // `uniqueListBy ... distinguish cases` at ProofMethod.hs:308) IF
-    // their proof-tree
-    // siblings collide.  By stripping the saturate-time suffix here, we
-    // let the runtime renderer's dedup do the same job from a clean
-    // slate, matching Haskell's `Alice` vs `Alice_case_1`/`_case_2`
-    // sibling layout.
-    let stripped: &str = {
-        // Walk back from the end looking for `_case_<digits>` (no
-        // trailing underscore — `_case_<N>` is the LAST segment).
-        let b = tail.as_bytes();
-        let mut k = b.len();
-        // Trailing digits.
-        let mut d = 0;
-        while k > 0 && b[k - 1].is_ascii_digit() {
-            k -= 1; d += 1;
-        }
-        // Need `_case_` before the digits.
-        if d > 0 && k >= 6 && &b[k - 6..k] == b"_case_" {
-            &tail[..k - 6]
-        } else {
-            tail
-        }
-    };
-    stripped.to_string()
-}
+// NOTE: a former `saturated_chain_root(name) -> String` helper used to
+// re-derive the "chain root" by string-splitting a source-case name on
+// `_` (peeling `coerce_`/`c_<sym>_`/`_case_<N>` segments).  That was
+// REMOVED: by the time a case name reaches the runtime, `refineSource`
+// has already applied HS's `combine` (Sources.hs:135-139, ported in
+// `combine_case_names_list`) over the `[String]` step-name list and the
+// result is joined with `intercalate "_"` (ProofMethod.hs:511).  HS
+// never re-splits a single name on `_`, so the helper was a no-op for
+// every name in practice EXCEPT it corrupted function symbols whose
+// names contain `_` (e.g. `c_KDF_SKc` → `SKc`).  Callers now use the
+// stored name verbatim.
 
 /// Compute the term's "effective" sort.  Variables carry their sort;
 /// applications default to Msg (the join of all sub-sorts).
@@ -6994,71 +6924,49 @@ mod tests {
     }
 
     // =========================================================================
-    // Haskell-faithfulness invariants for `saturated_chain_root` —
-    // the function whose `_case_N` mishandling caused 14+ corpus
-    // divergences (Cluster B, task #209).
+    // HS-faithful source-case naming invariant (replaces the removed
+    // `saturated_chain_root` string-splitter tests).
     //
-    // Mirrors Haskell `refineSource.combine` (Sources.hs:135-137):
-    // strip the "coerce" prefix, descend through chain prefixes, and
-    // produce a stable per-chain root name.  Per-closure `_case_N`
-    // suffixes are saturate-time artifacts that must not survive into
-    // the rendered case name.
+    // By the time a case name reaches the runtime, `refineSource` has
+    // already applied HS's `combine` (Sources.hs:135-139, ported in
+    // `combine_case_names_list`) over the `[String]` step-name list, and
+    // the result is joined with `intercalate "_"` (ProofMethod.hs:511).
+    // The stored name is therefore the FINAL display name and must be
+    // used verbatim — HS never re-splits a single name on `_`.
     // =========================================================================
 
-    /// Trailing `_case_<N>` (saturate's per-closure suffix) must be
-    /// stripped.  Bug regressed 14 lemmas in cluster B until task #209.
-    ///
-    /// Mirrors Haskell `combine` (Sources.hs:135-137): the per-closure
-    /// suffix is a Rust saturate-time artifact; Haskell doesn't add it.
-    /// Runtime `distinguish` (ProofMethod.hs:335, applied via
-    /// `uniqueListBy ... distinguish cases` at ProofMethod.hs:308) adds
-    /// sibling-disambig suffixes only when needed.
+    /// `combine` keeps a single non-coerce element verbatim, including
+    /// when it is a `c_<sym>` construction-rule name whose symbol
+    /// contains underscores (e.g. `c_KDF_SKc`).  The former
+    /// `saturated_chain_root` split this to `SKc` (fm24-cardpayments C8
+    /// divergence); the list-model `combine` keeps it intact.
     #[test]
-    fn saturated_chain_root_strips_trailing_case_n() {
-        assert_eq!(saturated_chain_root("Alice_case_1"), "Alice");
-        assert_eq!(saturated_chain_root("Alice_case_42"), "Alice");
-        assert_eq!(saturated_chain_root("Resp_2_case_3"), "Resp_2",
-                   "only the FINAL _case_<N> is stripped, not internal _<digit>");
+    fn combine_keeps_underscore_bearing_constr_name_intact() {
+        // Single construction-rule name → kept whole.
+        assert_eq!(
+            combine_case_names_list(&["c_KDF_SKc".to_string()], &[]),
+            vec!["c_KDF_SKc".to_string()]);
+        // Leading "coerce" element dropped, next element kept whole.
+        assert_eq!(
+            combine_case_names_list(
+                &["coerce".to_string(), "c_KDF_SKc".to_string()], &[]),
+            vec!["c_KDF_SKc".to_string()]);
+        // Underscore-free constructors are likewise kept verbatim.
+        assert_eq!(
+            combine_case_names_list(&["c_senc".to_string()], &[]),
+            vec!["c_senc".to_string()]);
+        // Protocol-rule names with underscores kept whole.
+        assert_eq!(
+            combine_case_names_list(&["Card_Responds_To_GPO_C8".to_string()], &[]),
+            vec!["Card_Responds_To_GPO_C8".to_string()]);
     }
 
-    /// Middle `_case_<N>_` (legacy form: saturate used to produce
-    /// `Rule_case_3_chain`) gets stripped from the LEFT.  This is the
-    /// step-1 stripping logic that predates the trailing fix.
+    /// `case_name_list_to_string` is HS `intercalate "_"`.
     #[test]
-    fn saturated_chain_root_strips_middle_case_n_underscore() {
-        // `Foo_case_3_bar` → strip `Foo_case_3_` → `bar`.
-        assert_eq!(saturated_chain_root("Foo_case_3_bar"), "bar");
-        // No `_case_N_` middle → keep as-is (modulo prefix stripping).
-        assert_eq!(saturated_chain_root("Foo_bar"), "Foo_bar");
-    }
-
-    /// Intruder-rule prefixes (`coerce_`, `irecv_`, `ipub_`, `isend_`,
-    /// `c_<sym>_`) get peeled iteratively.  Mirrors Haskell's `combine`
-    /// behavior of blending out coerce/intruder noise.
-    #[test]
-    fn saturated_chain_root_strips_intruder_prefixes() {
-        assert_eq!(saturated_chain_root("coerce_Alice"), "Alice");
-        assert_eq!(saturated_chain_root("isend_Alice"), "Alice");
-        assert_eq!(saturated_chain_root("irecv_Bob"), "Bob");
-        assert_eq!(saturated_chain_root("ipub_Carol"), "Carol");
-        // `c_<sym>_<rest>` strips both the `c_` and the `<sym>_`.
-        assert_eq!(saturated_chain_root("c_pair_Alice"), "Alice");
-    }
-
-    /// Combination: intruder prefix + trailing `_case_N` both stripped.
-    /// This is the actual shape that hit production: an inner rule that
-    /// went through coerce got `coerce_Alice_case_1`, which must reduce
-    /// to `Alice`.
-    #[test]
-    fn saturated_chain_root_handles_prefix_and_trailing_suffix() {
-        assert_eq!(saturated_chain_root("coerce_Alice_case_1"), "Alice");
-        assert_eq!(saturated_chain_root("isend_Resp_2_case_3"), "Resp_2");
-    }
-
-    /// Empty / no-match input is returned unchanged.
-    #[test]
-    fn saturated_chain_root_passes_through_unrecognized_name() {
-        assert_eq!(saturated_chain_root("Alice"), "Alice");
-        assert_eq!(saturated_chain_root("XYZ"), "XYZ");
+    fn case_name_list_to_string_is_intercalate_underscore() {
+        assert_eq!(case_name_list_to_string(&["c_KDF_SKc".to_string()]), "c_KDF_SKc");
+        assert_eq!(case_name_list_to_string(
+            &["a".to_string(), "b".to_string()]), "a_b");
+        assert_eq!(case_name_list_to_string(&[]), "");
     }
 }
