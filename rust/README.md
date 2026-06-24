@@ -26,19 +26,19 @@ volatile header lines (Git revision, compile time, processing time).
 
 The parity gate (`scripts/corpus_file_diff.sh`, corpus in
 `scripts/parity_corpus.txt`) compares the Rust port against the Haskell prover
-on a 427-file corpus: the theories under `examples/` that use only ported
+on a 433-file corpus: the theories under `examples/` that use only ported
 features and that Haskell proves within a 300 s/lemma cap. This spans
 `classic/`, `ake/`, `sp14/`, the `csf*/` series, `features/`, `loops/`,
 `post17/`, `regression/`, `related_work/`, the multiset-rewrite theories in
 `csf18-xor/`, `jcs19-xor/`, `idbased/`, `eurosp19-eccDAA/`,
 `esorics23-bluetooth/`, `csf20-disputeResolution/`, `fm24-cardpayments/`,
 `wisec21-5G-handover/`, `wireguard/`, the POIDC and
-`thesis-LaraSchmid-evoting/` corpora, and 50 SAPiC `process:` theories from
+`thesis-LaraSchmid-evoting/` corpora, and 58 SAPiC `process:` theories from
 `sapic/`.
 
 | Result | Files | Meaning |
 |--------|------:|---------|
-| MATCH | 359 | Rust output byte-identical to Haskell |
+| MATCH | 365 | Rust output byte-identical to Haskell |
 | DIFF  |   0 | — |
 | SKIP  |  68 | no Haskell reference to compare against (HS exceeds the cap, or produces no/empty output) |
 
