@@ -44,10 +44,10 @@ features and that Haskell proves within a 300 s/lemma cap. This spans
 
 Every theory in the corpus that Haskell can prove is reproduced byte-for-byte:
 no rendering, proof-search, or verdict divergence remains. Theories outside the
-corpus require an unported frontend — SAPiC `process:`, accountability
-(`accounts for`), or observational equivalence (`--diff`) — or exercise searches
-that Haskell itself does not finish. Observational-equivalence (`--diff`)
-theories are excluded from the gate and re-enter once that mode is ported.
+corpus require an unported feature — the SAPiC `report()`/`locations-report`
+translation, accountability (`accounts for`), or observational equivalence
+(`--diff`) — or exercise searches that Haskell itself does not finish.
+Observational-equivalence (`--diff`) theories re-enter once that mode is ported.
 
 ## Performance
 
