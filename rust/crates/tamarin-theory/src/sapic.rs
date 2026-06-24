@@ -171,12 +171,25 @@ pub enum SapicAction<V> {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Note: only `PartialEq` (not `Eq`) — the `Cond` variant carries a
+// `tamarin_parser::ast::Formula`, which is `PartialEq` but not `Eq`.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ProcessCombinator<V> {
     Parallel,
     /// Non-deterministic choice.
     Ndc,
-    Cond(SapicNFormula<V>),
+    /// `if <formula> then .. else ..`.  HS stores this as a
+    /// `Cond (SapicNFormula v)` (a `ProtoFormula`/`SyntacticSugar` formula),
+    /// `lib/theory/src/Theory/Sapic/Process.hs:94`.  The RS port carries the
+    /// (un-expanded) parser-AST [`tamarin_parser::ast::Formula`] instead: every
+    /// downstream use is parser-AST based — the `process="if .."` attribute
+    /// renders it flat (mirroring `prettySyntacticSapicFormula`), and the
+    /// embedded `_restrict` expansion (`rule_restriction::lift_rule_restrictions`,
+    /// HS `liftedAddProtoRule`) consumes a parser-AST `Formula` — so storing the
+    /// parser formula avoids a lossy DeBruijn round-trip with no consumer of the
+    /// elaborated form.  Variable renaming (`renameUnique`) and the WFUnbound
+    /// check operate on its `VarSpec`s directly.
+    Cond(tamarin_parser::ast::Formula),
     CondEq(SapicNTerm<V>, SapicNTerm<V>),
     Lookup(SapicNTerm<V>, V),
     Let {
@@ -186,7 +199,9 @@ pub enum ProcessCombinator<V> {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Note: only `PartialEq` (not `Eq`) — a `Comb` may carry a `Cond` formula
+// (`tamarin_parser::ast::Formula`), which is `PartialEq` but not `Eq`.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Process<Ann, V> {
     Null(Ann),
     Comb(ProcessCombinator<V>, Ann, Box<Process<Ann, V>>, Box<Process<Ann, V>>),

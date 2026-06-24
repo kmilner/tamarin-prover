@@ -88,8 +88,13 @@ fn action(a: &p::SapicAction) -> Result<SapicAction<SapicLVar>, ConvertError> {
                 match_vars: BTreeSet::new(),
             })
         }
+        // Mutable state (Phase 3): `insert t1 v` / `delete t`.  These map to the
+        // theory `SapicAction::{Insert,Delete}` (Process.hs:72-73), translated by
+        // `baseTransAction` Insert/Delete (Basetranslation.hs:177-184).
+        p::SapicAction::Insert(t1, t2) => Ok(SapicAction::Insert(term(t1)?, term(t2)?)),
+        p::SapicAction::Delete(t) => Ok(SapicAction::Delete(term(t)?)),
         other => Err(ConvertError::new(format!(
-            "SAPIC action not yet ported (Phase 2+): {other:?}"
+            "SAPIC action not yet ported (Phase 4+): {other:?}"
         ))),
     }
 }
@@ -107,15 +112,21 @@ fn combinator(c: &p::ProcessComb) -> Result<ProcessCombinator<SapicLVar>, Conver
         p::ProcessComb::Cond(p::Condition::Eq(t1, t2)) => {
             Ok(ProcessCombinator::CondEq(term(t1)?, term(t2)?))
         }
-        p::ProcessComb::Cond(p::Condition::Formula(_)) => Err(ConvertError::new(
-            "conditional with a formula (`if <formula> then`) not yet ported \
-             (Phase 2+); only `if t1 = t2 then` is supported",
-        )),
-        p::ProcessComb::Lookup(_, _) => {
-            Err(ConvertError::new("lookup not yet ported (Phase 3 — state)"))
+        // `if <formula> then .. else ..` (Phase 3).  HS `Cond (SapicNFormula v)`;
+        // the RS `Cond` carries the un-expanded parser-AST formula directly (see
+        // `ProcessCombinator::Cond` doc).  Predicate atoms inside the formula are
+        // expanded later, by `lift_rule_restrictions` over the embedded
+        // `_restrict` (HS `liftedExpandFormula`), so we keep it un-expanded here.
+        p::ProcessComb::Cond(p::Condition::Formula(f)) => {
+            Ok(ProcessCombinator::Cond(f.clone()))
+        }
+        // `lookup t as v in .. else ..` (Phase 3).  HS `Lookup (SapicNTerm v) v`
+        // (Process.hs:95).
+        p::ProcessComb::Lookup(t, v) => {
+            Ok(ProcessCombinator::Lookup(term(t)?, varspec_to_sapic(v)))
         }
         p::ProcessComb::Let { .. } => {
-            Err(ConvertError::new("let-binding not yet ported (Phase 2+)"))
+            Err(ConvertError::new("let-binding not yet ported (Phase 4+)"))
         }
     }
 }
@@ -266,12 +277,45 @@ mod tests {
     }
 
     #[test]
-    fn convert_cond_formula_errors_gracefully() {
+    fn convert_cond_formula_now_supported() {
+        // `if <formula> then E else 0` converts to ProcessCombinator::Cond.
         let cond = p::Process::Comb {
             comb: p::ProcessComb::Cond(p::Condition::Formula(p::Formula::True)),
             left: Box::new(event("E")),
             right: Box::new(p::Process::Null),
         };
-        assert!(convert_process(&cond).is_err());
+        assert!(matches!(
+            convert_process(&cond).unwrap(),
+            Process::Comb(ProcessCombinator::Cond(_), _, _, _)
+        ));
+    }
+
+    #[test]
+    fn convert_lookup() {
+        let lookup = p::Process::Comb {
+            comb: p::ProcessComb::Lookup(
+                p::Term::PubLit("x".into()),
+                p::VarSpec { name: "v".into(), idx: 0, sort: p::SortHint::Untagged, typ: None },
+            ),
+            left: Box::new(event("E")),
+            right: Box::new(p::Process::Null),
+        };
+        assert!(matches!(
+            convert_process(&lookup).unwrap(),
+            Process::Comb(ProcessCombinator::Lookup(_, _), _, _, _)
+        ));
+    }
+
+    #[test]
+    fn convert_insert_delete() {
+        let ins = p::Process::Action {
+            action: p::SapicAction::Insert(p::Term::PubLit("k".into()), p::Term::PubLit("v".into())),
+            body: Box::new(p::Process::Action {
+                action: p::SapicAction::Delete(p::Term::PubLit("k".into())),
+                body: Box::new(p::Process::Null),
+            }),
+        };
+        let conv = convert_process(&ins).unwrap();
+        assert!(matches!(conv, Process::Action(SapicAction::Insert(_, _), _, _)));
     }
 }

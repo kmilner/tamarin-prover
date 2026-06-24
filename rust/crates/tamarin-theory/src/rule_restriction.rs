@@ -83,7 +83,12 @@ pub fn lift_rule_restrictions(thy: &mut p::Theory) -> Result<(), ExpandError> {
 
 /// Lift one rule's embedded restrictions.  Returns the generated
 /// restrictions (in `1..n` order) and the rewritten rule.
-fn lift_one_rule(
+///
+/// Public so the SAPIC translation (`tamarin_sapic::apply`) can run the same
+/// `_restrict` expansion HS `liftedAddProtoRule` performs, over the rules it
+/// synthesises, injecting the generated restrictions + rewritten actions into
+/// both the parsed and elaborated theories.
+pub fn lift_one_rule(
     rule: p::Rule,
     predicates: &[p::Predicate],
 ) -> Result<(Vec<p::Restriction>, p::Rule), ExpandError> {

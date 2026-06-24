@@ -27,7 +27,7 @@ use tamarin_theory::sapic::ProcessCombinator;
 use crate::annotation::{to_annotated, ProcessAnnotation};
 use crate::base_translation::{
     base_init, base_trans_action, base_trans_comb, base_trans_null, predicate_restrictions,
-    single_session_restriction, RuleBody,
+    single_session_restriction, state_restrictions, RuleBody,
 };
 use crate::facts::{to_rule, AnnotatedRule, RulePosition, StateKind, TransFact};
 
@@ -214,7 +214,12 @@ fn subst_state_pos_fact(f: TransFact, p_old: &[i64], p_new: &[i64]) -> TransFact
 
 /// The result of translating a single top-level process.
 pub struct Translation {
-    pub rules: Vec<ProtoRuleE>,
+    /// The generated rules, each paired with its embedded `_restrict` formulas
+    /// (parser-AST; non-empty only for `if <formula>` arms).  HS attaches these
+    /// as the rule's `_preRestriction`; the RS port keeps them alongside the
+    /// elaborated rule so `apply_sapic` can run the `_restrict` expansion
+    /// (`lift_rule_restrictions`, HS `liftedAddProtoRule`) over both theories.
+    pub rules: Vec<(ProtoRuleE, Vec<tamarin_parser::ast::Formula>)>,
     pub restrictions: Vec<tamarin_parser::ast::Restriction>,
 }
 
@@ -236,16 +241,25 @@ pub fn translate(
     // protocol rules
     let proto_rules = gen(needs_in_ev_res, &an_proc, &Vec::new(), &init_tx)?;
 
-    // toRule over (initRules ++ protoRules)
+    // toRule over (initRules ++ protoRules), pairing each elaborated rule with
+    // its embedded restriction formulas (the `AnnotatedRule.restr` field).
     let mut all = init_rules;
     all.extend(proto_rules);
-    let rules: Vec<ProtoRuleE> = all.iter().map(to_rule).collect();
+    let rules: Vec<(ProtoRuleE, Vec<tamarin_parser::ast::Formula>)> =
+        all.iter().map(|r| (to_rule(r), r.restr.clone())).collect();
 
     // restrictions (baseRestr, Basetranslation.hs:449-468), in HS order:
+    //   [setIn, setNotIn]   if the process `contains isLookup`
+    //                       (NoDelete variants unless it also `contains isDelete`)
     //   [resEq, resNotEq]   if the process `contains isEq`  (a CondEq node)
     //   [resSingleSession]  always (hasAccountabilityLemmaWithControl = True)
-    // (resSetIn/resSetNotIn for lookups + locking restrictions are Phase 3.)
+    // (locking restrictions are Phase 4.)
     let mut restrictions = Vec::new();
+    if tamarin_theory::sapic::process_contains(&an_proc, tamarin_theory::sapic::is_lookup) {
+        let has_delete =
+            tamarin_theory::sapic::process_contains(&an_proc, tamarin_theory::sapic::is_delete);
+        restrictions.extend(state_restrictions(has_delete));
+    }
     if tamarin_theory::sapic::process_contains(&an_proc, tamarin_theory::sapic::is_eq) {
         restrictions.extend(predicate_restrictions());
     }
@@ -307,6 +321,6 @@ mod tests {
         assert_eq!(tr.rules.len(), 5);
         assert_eq!(tr.restrictions.len(), 1);
         // First rule is "Init".
-        assert_eq!(tr.rules[0].info.name, tamarin_theory::rule::ProtoRuleName::Stand("Init".into()));
+        assert_eq!(tr.rules[0].0.info.name, tamarin_theory::rule::ProtoRuleName::Stand("Init".into()));
     }
 }

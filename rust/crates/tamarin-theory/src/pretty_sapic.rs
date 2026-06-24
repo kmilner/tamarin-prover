@@ -206,11 +206,30 @@ fn pretty_sapic_comb(c: &ProcessCombinator<SapicLVar>) -> String {
     match c {
         ProcessCombinator::Parallel => "|".to_string(),
         ProcessCombinator::Ndc => "+".to_string(),
+        // HS `prettySapicComb (CondEq t t') = "if "++ p t ++ "=" ++ p t'`.
         ProcessCombinator::CondEq(t, t2) => {
             format!("if {}={}", pretty_sapic_term(t), pretty_sapic_term(t2))
         }
-        // Cond/Lookup/Let render their formulas/patterns; deferred to Phase 2+.
-        _ => "/* comb */".to_string(),
+        // HS `prettySapicComb (Cond a) = "if "++ render (prettySyntacticSapicFormula a)`
+        // (Process.hs:476).  `prettySyntacticSapicFormula = prettySyntacticLNFormula
+        // . toLFormula` (Term.hs:174-175); `toLFormula` just drops the SAPIC type
+        // tags (`SapicLVar → LVar`), keeping the syntactic structure (predicates
+        // intact, formula un-expanded).  The RS `Cond` already carries the
+        // un-expanded parser-AST formula whose `VarSpec`s render WITHOUT type
+        // tags, so `pretty_formula` (the flat, single-line renderer) is
+        // byte-identical to `render . prettySyntacticSapicFormula`.
+        ProcessCombinator::Cond(f) => {
+            format!("if {}", crate::pretty_formula::pretty_formula(f))
+        }
+        // HS `prettySapicComb (Lookup t v) = "lookup "++ p t ++ " as " ++ show v`
+        // (Process.hs:482).  `show v` on an (untyped) `SapicLVar` is just the
+        // LVar display name (`x.1`); a typed var would append `:type`, but
+        // lookup binders are never typed by inference (`typeWithVar`).
+        ProcessCombinator::Lookup(t, v) => {
+            format!("lookup {} as {}", pretty_sapic_term(t), show_sapic_lvar(v))
+        }
+        // Let renders its pattern/value; deferred to Phase 4.
+        ProcessCombinator::Let { .. } => "/* comb */".to_string(),
     }
 }
 

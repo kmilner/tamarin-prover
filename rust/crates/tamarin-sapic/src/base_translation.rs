@@ -22,8 +22,14 @@ use crate::facts::{
 
 /// A single translation "rule body": `(prems, acts, concs, restr)`.
 /// HS `([TransFact],[TransAction],[TransFact],[SyntacticLNFormula])`; the
-/// linear subset never emits an embedded restriction, so `restr` is `Vec<()>`.
-pub type RuleBody = (Vec<TransFact>, Vec<TransAction>, Vec<TransFact>, Vec<()>);
+/// 4th element carries the embedded restriction formulas (non-empty only for
+/// the `if <formula>` arms — `Cond`), as parser-AST formulas.
+pub type RuleBody = (
+    Vec<TransFact>,
+    Vec<TransAction>,
+    Vec<TransFact>,
+    Vec<tamarin_parser::ast::Formula>,
+);
 
 /// `baseTransNull` (Basetranslation.hs:81):
 ///   `[([State LState p tildex], [], [], [])]`
@@ -156,10 +162,36 @@ pub fn base_trans_action(
             );
             Ok((vec![body], tildex.clone()))
         }
-        // ChOut with a channel, ChIn, Insert/Delete/Lock/Unlock, MSR, calls:
-        // Phase 2+.
+        // Classical state translation (Basetranslation.hs:177-184).  The pure
+        // cell optimisation (annotated `pureState`, Basetranslation.hs:155-174)
+        // is deferred to Phase 4; the classical translation is the default.
+        //
+        // (Insert t1 t2): `[([def_state], [InsertA t1 t2], [def_state' tildex], [])]`
+        SapicAction::Insert(t1, t2) => {
+            let lt1 = to_ln_term(t1);
+            let lt2 = to_ln_term(t2);
+            let body: RuleBody = (
+                vec![def_state(tildex)],
+                vec![TransAction::InsertA(lt1, lt2)],
+                vec![def_state_next(tildex)],
+                vec![],
+            );
+            Ok((vec![body], tildex.clone()))
+        }
+        // (Delete t): `[([def_state], [DeleteA t], [def_state' tildex], [])]`
+        SapicAction::Delete(t) => {
+            let lt = to_ln_term(t);
+            let body: RuleBody = (
+                vec![def_state(tildex)],
+                vec![TransAction::DeleteA(lt)],
+                vec![def_state_next(tildex)],
+                vec![],
+            );
+            Ok((vec![body], tildex.clone()))
+        }
+        // ChOut with a channel, ChIn, Lock/Unlock, MSR, calls: Phase 4+.
         other => Err(format!(
-            "baseTransAction: action not yet ported (Phase 2+): {other:?}"
+            "baseTransAction: action not yet ported (Phase 4+): {other:?}"
         )),
     }
 }
@@ -252,16 +284,155 @@ pub fn base_trans_comb(
                 Some(tildex.clone()),
             ))
         }
-        PC::Cond(_) => Err(
-            "baseTransComb: conditional with a formula not yet ported (Phase 2+)".to_string(),
-        ),
-        PC::Lookup(_, _) => {
-            Err("baseTransComb: lookup not yet ported (Phase 3 — state)".to_string())
+        // Cond f (Basetranslation.hs:234-242):
+        //   let freevars_f = fromList (freesList f)
+        //   if freevars_f ⊆ tildex then
+        //     ([([def_state], [], [def_state1 tildex], [f]),
+        //       ([def_state], [], [def_state2 tildex], [Not f])],
+        //      tildex, Just tildex)
+        //   else throw (WFUnbound (freevars_f \\ tildex))
+        // The formula is the parser-AST `Cond` payload; the embedded restriction
+        // flows through `lift_rule_restrictions` (HS `liftedAddProtoRule`).
+        PC::Cond(f) => {
+            // `freesList f` as LVars (the formula's free message/timepoint vars),
+            // mapped to `LVar`s to compare against `tildex :: Set LVar`.
+            let freevars_f = formula_free_lvars(f);
+            if !freevars_f.is_subset(tildex) {
+                let unbound: Vec<LVar> = freevars_f.difference(tildex).cloned().collect();
+                return Err(format!(
+                    "process not well-formed: unbound variables in conditional: {unbound:?}"
+                ));
+            }
+            // then-arm carries `[f]`; else-arm carries `[Not f]`.
+            let not_f = tamarin_parser::ast::Formula::Not(Box::new(f.clone()));
+            let body_then: RuleBody = (
+                vec![def_state(tildex)],
+                vec![],
+                vec![def_state1(tildex)],
+                vec![f.clone()],
+            );
+            let body_else: RuleBody = (
+                vec![def_state(tildex)],
+                vec![],
+                vec![def_state2(tildex)],
+                vec![not_f],
+            );
+            Ok((vec![body_then, body_else], tildex.clone(), Some(tildex.clone())))
+        }
+        // Classical Lookup (Basetranslation.hs:293-299):
+        //   let tx' = v `insert` tildex
+        //   ([([def_state], [IsIn t v], [def_state1 tx'], []),
+        //     ([def_state], [IsNotSet t], [def_state2 tildex], [])],
+        //    tx', Just tildex)
+        // (The pure-cell lookup, Basetranslation.hs:280-289, is Phase 4.)
+        PC::Lookup(t, v) => {
+            let lt = to_ln_term(t);
+            let lv = to_lvar(v);
+            let mut tx_prime = tildex.clone();
+            tx_prime.insert(lv.clone());
+            let body_in: RuleBody = (
+                vec![def_state(tildex)],
+                vec![TransAction::IsIn(lt.clone(), lv)],
+                vec![def_state1(&tx_prime)],
+                vec![],
+            );
+            let body_notset: RuleBody = (
+                vec![def_state(tildex)],
+                vec![TransAction::IsNotSet(lt)],
+                vec![def_state2(tildex)],
+                vec![],
+            );
+            Ok((vec![body_in, body_notset], tx_prime, Some(tildex.clone())))
         }
         PC::Let { .. } => {
-            Err("baseTransComb: let-binding not yet ported (Phase 2+)".to_string())
+            Err("baseTransComb: let-binding not yet ported (Phase 4+)".to_string())
         }
     }
+}
+
+/// `fromList (freesList f)` for a parser-AST formula — the formula's FREE
+/// variables (vars not bound by an enclosing quantifier), as `LVar`s for the
+/// WFUnbound `⊆ tildex` check (HS Basetranslation.hs:236).  Quantifier-bound
+/// vars are excluded; the special timepoint vars carry the `Node` sort.
+fn formula_free_lvars(f: &tamarin_parser::ast::Formula) -> BTreeSet<LVar> {
+    use tamarin_parser::ast as p;
+    fn sort_of(s: &p::SortHint) -> tamarin_term::lterm::LSort {
+        use tamarin_term::lterm::LSort;
+        match s {
+            p::SortHint::Fresh | p::SortHint::Suffix(p::SuffixSort::Fresh) => LSort::Fresh,
+            p::SortHint::Pub | p::SortHint::Suffix(p::SuffixSort::Pub) => LSort::Pub,
+            p::SortHint::Node | p::SortHint::Suffix(p::SuffixSort::Node) => LSort::Node,
+            p::SortHint::Nat | p::SortHint::Suffix(p::SuffixSort::Nat) => LSort::Nat,
+            p::SortHint::Msg | p::SortHint::Suffix(p::SuffixSort::Msg) | p::SortHint::Untagged => {
+                LSort::Msg
+            }
+        }
+    }
+    fn collect_term(t: &p::Term, bound: &[String], out: &mut BTreeSet<LVar>) {
+        match t {
+            p::Term::Var(v) => {
+                if !bound.iter().any(|n| n == &v.name) {
+                    out.insert(LVar::new(v.name.clone(), sort_of(&v.sort), v.idx));
+                }
+            }
+            p::Term::App(_, args) | p::Term::Pair(args) => {
+                for a in args {
+                    collect_term(a, bound, out);
+                }
+            }
+            p::Term::AlgApp(_, a, b) | p::Term::Diff(a, b) | p::Term::BinOp(_, a, b) => {
+                collect_term(a, bound, out);
+                collect_term(b, bound, out);
+            }
+            p::Term::PatMatch(inner) => collect_term(inner, bound, out),
+            _ => {}
+        }
+    }
+    fn collect_atom(a: &p::Atom, bound: &[String], out: &mut BTreeSet<LVar>) {
+        use p::Atom::*;
+        match a {
+            Eq(l, r) | Less(l, r) | LessMset(l, r) | Subterm(l, r) => {
+                collect_term(l, bound, out);
+                collect_term(r, bound, out);
+            }
+            Action(fa, t) => {
+                for arg in &fa.args {
+                    collect_term(arg, bound, out);
+                }
+                collect_term(t, bound, out);
+            }
+            Last(t) => collect_term(t, bound, out),
+            Pred(fa) => {
+                for arg in &fa.args {
+                    collect_term(arg, bound, out);
+                }
+            }
+        }
+    }
+    fn collect(f: &p::Formula, bound: &mut Vec<String>, out: &mut BTreeSet<LVar>) {
+        use p::Formula::*;
+        match f {
+            True | False => {}
+            Atom(a) => collect_atom(a, bound, out),
+            Not(g) => collect(g, bound, out),
+            And(a, b) | Or(a, b) | Implies(a, b) | Iff(a, b) => {
+                collect(a, bound, out);
+                collect(b, bound, out);
+            }
+            Forall(vs, body) | Exists(vs, body) => {
+                let saved = bound.len();
+                for v in vs {
+                    bound.push(v.name.clone());
+                }
+                collect(body, bound, out);
+                bound.truncate(saved);
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    let mut bound = Vec::new();
+    collect(f, &mut bound, &mut out);
+    out
 }
 
 /// `toLNFact (protoFact Linear "Eq" [t1, t2])` (Basetranslation.hs:244): build
@@ -434,6 +605,50 @@ pub fn predicate_restrictions() -> Vec<tamarin_parser::ast::Restriction> {
     };
 
     vec![predicate_eq, predicate_not_eq]
+}
+
+/// The `set_in` / `set_notin` restrictions (Basetranslation.hs:332-359), added
+/// by `baseRestr` (449-457) when the process `contains isLookup`.  HS hardcodes
+/// these as restriction strings and parses them with `toEx`/`parseRestriction`;
+/// we do the same with the RS `parse_formula_str` (so the rendered output is
+/// byte-identical to HS's hand-written strings, and AC/sort handling matches the
+/// parser path).  `has_delete` selects the full variants (the process also
+/// `contains isDelete`) over the NoDelete variants.
+pub fn state_restrictions(has_delete: bool) -> Vec<tamarin_parser::ast::Restriction> {
+    use tamarin_parser::ast as p;
+    // `parseRestriction`'s formula body, verbatim from Basetranslation.hs.
+    let (set_in_src, set_notin_src) = if has_delete {
+        (
+            // resSetIn (Basetranslation.hs:333-338)
+            "All x y #t3 . IsIn(x,y)@t3 ==>\n\
+             (Ex #t2 . Insert(x,y)@t2 & #t2<#t3\n\
+             & ( All #t1 . Delete(x)@t1 ==> (#t1<#t2 |  #t3<#t1))\n\
+             & ( All #t1 yp . Insert(x,yp)@t1 ==> (#t1<#t2 | #t1=#t2 | #t3<#t1))\n\
+             )",
+            // resSetNotIn (Basetranslation.hs:341-345)
+            "All x #t3 . IsNotSet(x)@t3 ==>\n\
+             (All #t1 y . Insert(x,y)@t1 ==>  #t3<#t1 )\n\
+             | ( Ex #t1 .   Delete(x)@t1 & #t1<#t3\n\
+             &  (All #t2 y . Insert(x,y)@t2 & #t2<#t3 ==>  #t2<#t1))",
+        )
+    } else {
+        (
+            // resSetInNoDelete (Basetranslation.hs:349-353)
+            "All x y #t3 . IsIn(x,y)@t3 ==>\n\
+             (Ex #t2 . Insert(x,y)@t2 & #t2<#t3\n\
+             & ( All #t1 yp . Insert(x,yp)@t1 ==> (#t1<#t2 | #t1=#t2 | #t3<#t1))\n\
+             )",
+            // resSetNotInNoDelete (Basetranslation.hs:356-358)
+            "All x #t3 . IsNotSet(x)@t3 ==>\n\
+             (All #t1 y . Insert(x,y)@t1 ==>  #t3<#t1 )",
+        )
+    };
+    let parse = |name: &str, src: &str| -> p::Restriction {
+        let formula = tamarin_parser::parser::parse_formula_str(src)
+            .unwrap_or_else(|e| panic!("Error parsing hard-coded restriction {name}: {e:?}"));
+        p::Restriction { name: name.to_string(), formula, attributes: vec![] }
+    };
+    vec![parse("set_in", set_in_src), parse("set_notin", set_notin_src)]
 }
 
 

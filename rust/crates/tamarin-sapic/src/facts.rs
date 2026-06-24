@@ -75,6 +75,15 @@ pub enum TransAction {
     /// `NegPredicateA f` (Facts.hs:75): renders `f` with its name prefixed by
     /// `Pred_Not_` (the negative arm of `if t1 = t2`).
     NegPredicateA(LNFact),
+    // --- mutable state (Phase 3, Facts.hs:59-62) ---
+    /// `IsIn t v` (Facts.hs:220): `IsIn( t, v )` — the lookup-found action.
+    IsIn(LNTerm, LVar),
+    /// `IsNotSet t` (Facts.hs:221): `IsNotSet( t )` — the lookup-not-found action.
+    IsNotSet(LNTerm),
+    /// `InsertA t1 t2` (Facts.hs:222): `Insert( t1, t2 )`.
+    InsertA(LNTerm, LNTerm),
+    /// `DeleteA t` (Facts.hs:223): `Delete( t )`.
+    DeleteA(LNTerm),
 }
 
 /// `SpecialPosition` (Facts.hs:110-112).
@@ -139,6 +148,22 @@ pub fn action_to_fact(a: &TransAction) -> LNFact {
         // `actionToFact (NegPredicateA f) = mapFactName ("Pred_Not_" ++) f`
         // (Facts.hs:227).
         TransAction::NegPredicateA(f) => map_fact_name(f, "Pred_Not_"),
+        // `actionToFact (IsIn t v) = protoFact Linear "IsIn" [t, varTerm v]`
+        // (Facts.hs:220).
+        TransAction::IsIn(t, v) => proto_fact(
+            Multiplicity::Linear,
+            "IsIn",
+            vec![t.clone(), VTerm::Lit(Lit::Var(v.clone()))],
+        ),
+        // `actionToFact (IsNotSet t) = protoFact Linear "IsNotSet" [t]` (Facts.hs:221).
+        TransAction::IsNotSet(t) => proto_fact(Multiplicity::Linear, "IsNotSet", vec![t.clone()]),
+        // `actionToFact (InsertA t1 t2) = protoFact Linear "Insert" [t1, t2]`
+        // (Facts.hs:222).
+        TransAction::InsertA(t1, t2) => {
+            proto_fact(Multiplicity::Linear, "Insert", vec![t1.clone(), t2.clone()])
+        }
+        // `actionToFact (DeleteA t) = protoFact Linear "Delete" [t]` (Facts.hs:223).
+        TransAction::DeleteA(t) => proto_fact(Multiplicity::Linear, "Delete", vec![t.clone()]),
     }
 }
 
@@ -237,8 +262,11 @@ pub struct AnnotatedRule<Ann> {
     pub prems: Vec<TransFact>,
     pub acts: Vec<TransAction>,
     pub concs: Vec<TransFact>,
-    /// Embedded restrictions — empty for the linear subset.
-    pub restr: Vec<()>,
+    /// Embedded restrictions (HS `restr :: [SyntacticLNFormula]`, Facts.hs:123).
+    /// Carried as parser-AST formulas so they flow through the existing
+    /// `_restrict` expansion (`rule_restriction::lift_rule_restrictions`).
+    /// Non-empty only for `if <formula>` arms (the `Cond` combinator).
+    pub restr: Vec<tamarin_parser::ast::Formula>,
     pub index: usize,
 }
 
@@ -318,14 +346,22 @@ pub fn rule_name<Ann: GoodAnnotation + Clone>(r: &AnnotatedRule<Ann>) -> String 
 /// `toRule` (Facts.hs:376-403): build the final `ProtoRuleE` with HS-exact
 /// `name`, `color`, `process`, `role`, `issapicrule` attributes.
 ///
-/// `ignoreDerivChecks = isLookup process` (false for the linear subset).
+/// `ignoreDerivChecks = isLookup process` (Facts.hs:404-405): the lookup rules
+/// carry the `no_derivcheck` attribute so the message-derivation check skips
+/// them (the bound lookup variable is unconstrained at that point).
 pub fn to_rule(r: &AnnotatedRule<ProcessAnnotation<LVar>>) -> ProtoRuleE {
     let name = rule_name(r);
     let names = get_top_level_name(&r.process);
+    // HS `isLookup (ProcessComb (Lookup _ _) _ _ _) = True; isLookup _ = False`
+    // (Facts.hs:404-405) — the LITERAL process node this rule was generated for.
+    let is_lookup_proc = matches!(
+        &r.process,
+        Process::Comb(tamarin_theory::sapic::ProcessCombinator::Lookup(_, _), _, _, _)
+    );
     let attr = RuleAttributes {
         color: Some(color_for_process_name(&names)),
         process: Some(to_plain(&r.process)),
-        ignore_deriv_checks: false,
+        ignore_deriv_checks: is_lookup_proc,
         is_sapic_rule: true,
         role: Some(role_from_process_name_list(
             &r.process.annotation().parsed().process_names,
@@ -345,7 +381,7 @@ pub fn to_rule(r: &AnnotatedRule<ProcessAnnotation<LVar>>) -> ProtoRuleE {
 
 /// `newVariables l r` (Rule.hs): variables in conclusions/actions not bound by
 /// the premises.  Mirrors `elaborate.rs::compute_new_vars`.
-fn compute_new_vars(prems: &[LNFact], concs: &[LNFact], acts: &[LNFact]) -> Vec<LNTerm> {
+pub fn compute_new_vars(prems: &[LNFact], concs: &[LNFact], acts: &[LNFact]) -> Vec<LNTerm> {
     use std::collections::BTreeSet;
     fn collect(t: &LNTerm, out: &mut BTreeSet<LVar>) {
         match t {

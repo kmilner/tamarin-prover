@@ -63,20 +63,74 @@ pub fn apply_sapic(
     let translation = translate(&typed, false)
         .map_err(|e| ElabError { message: format!("SAPIC translation: {e}") })?;
 
-    // Inject each generated rule into BOTH theories.  In the parsed theory we
-    // synthesise a `p::Rule` whose body mirrors the elaborated E-rule and whose
-    // attributes carry the rendered color / process / role (the pretty-printer
-    // reads these); in the elaborated theory we push the `OpenProtoRule` (the
-    // AC-variant pre-computation + solver read these).
-    for rule in &translation.rules {
-        let parsed_rule = synth_parsed_rule(rule);
-        parsed.items.push(p::TheoryItem::Rule(parsed_rule));
+    // The `predicate:` declarations the embedded `_restrict` formulas expand
+    // against (HS `liftedExpandFormula`).  Collected from the parsed theory.
+    let predicates: Vec<p::Predicate> = parsed
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            p::TheoryItem::Predicates(ps) => Some(ps.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+
+    // Inject each generated rule into BOTH theories, running the `_restrict`
+    // expansion HS `liftedAddProtoRule` (Theory/Text/Parser.hs:175-193) performs
+    // per rule: for each embedded restriction formula, mint a fresh action
+    // `Restr_<rule>_<i>` + a global restriction `∀ … #NOW. Restr…@#NOW ⇒ φ`,
+    // insert the restrictions BEFORE the rule, and append the actions to the
+    // rule.  We share the parser-AST lift (`lift_one_rule`) for both theories:
+    //   - parsed:     the generated restrictions + rewritten parser rule;
+    //   - elaborated: the same restrictions (as `OpenRestriction`, parser-AST
+    //                 formula) + the elaborated rewritten rule (the original
+    //                 `ProtoRuleE` attributes/name with the rewritten body, so
+    //                 the appended `Restr_*` actions are present).
+    for (rule, restr_formulas) in &translation.rules {
+        // Synthesise the parser-AST rule, carrying the embedded restrictions.
+        let mut parsed_rule = synth_parsed_rule(rule);
+        parsed_rule.embedded_restrictions = restr_formulas.clone();
+
+        if restr_formulas.is_empty() {
+            // No `_restrict` — inject directly (linear / state / lookup rules).
+            parsed.items.push(p::TheoryItem::Rule(parsed_rule));
+            elaborated
+                .items
+                .push(TheoryItem::Rule(OpenProtoRule::new(rule.clone())));
+            continue;
+        }
+
+        // `if <formula>` arm: expand the embedded restriction.
+        let (gen_restrs, rewritten) = tamarin_theory::rule_restriction::lift_one_rule(
+            parsed_rule,
+            &predicates,
+        )
+        .map_err(|e| ElabError {
+            message: format!("SAPIC _restrict expansion: {}", e.message),
+        })?;
+
+        // Restrictions precede the rule in both theories.
+        for r in &gen_restrs {
+            parsed.items.push(p::TheoryItem::Restriction(r.clone()));
+            elaborated.items.push(TheoryItem::Restriction(OpenRestriction::new(
+                r.name.clone(),
+                r.formula.clone(),
+            )));
+        }
+
+        // Elaborated rule: re-elaborate the rewritten parser-rule body to
+        // LNFacts and pair it with the original `ProtoRuleE`'s info (which holds
+        // the SAPIC attributes + name).  Re-elaborating the whole body keeps the
+        // appended `Restr_*` actions byte-faithful to the parsed rule.
+        let elab_rule = reelaborate_rule_body(rule, &rewritten)?;
         elaborated
             .items
-            .push(TheoryItem::Rule(OpenProtoRule::new(rule.clone())));
+            .push(TheoryItem::Rule(OpenProtoRule::new(elab_rule)));
+        parsed.items.push(p::TheoryItem::Rule(rewritten));
     }
 
-    // Inject the restriction into both theories.
+    // Inject the global restrictions (set_in/set_notin, predicate_eq/not_eq,
+    // single_session) into both theories.
     for restr in &translation.restrictions {
         parsed.items.push(p::TheoryItem::Restriction(restr.clone()));
         elaborated.items.push(TheoryItem::Restriction(OpenRestriction::new(
@@ -92,6 +146,41 @@ pub fn apply_sapic(
     }
 
     Ok(())
+}
+
+/// Re-elaborate a `_restrict`-rewritten parser-AST rule body into a
+/// `ProtoRuleE`, reusing the original SAPIC rule's `info` (name + attributes).
+///
+/// The rewrite appended `Restr_<rule>_<i>(...)` actions to the rule; elaborating
+/// the rewritten body (premises/actions/conclusions) regenerates the rule's
+/// LNFacts including those actions, byte-faithful to the parsed rendering.  The
+/// `new_vars` are recomputed (HS `newVariables l (c ++ a)`), though the Restr
+/// action args are always already premise-bound so they add nothing.
+fn reelaborate_rule_body(
+    original: &ProtoRuleE,
+    rewritten: &p::Rule,
+) -> Result<ProtoRuleE, ElabError> {
+    use tamarin_theory::elaborate::fact_to_lnfact;
+    let prems = rewritten
+        .premises
+        .iter()
+        .map(fact_to_lnfact)
+        .collect::<Result<Vec<_>, _>>()?;
+    let acts = rewritten
+        .actions
+        .iter()
+        .map(fact_to_lnfact)
+        .collect::<Result<Vec<_>, _>>()?;
+    let concs = rewritten
+        .conclusions
+        .iter()
+        .map(fact_to_lnfact)
+        .collect::<Result<Vec<_>, _>>()?;
+    let new_vars = crate::facts::compute_new_vars(&prems, &concs, &acts);
+    Ok(
+        tamarin_theory::rule::Rule::new(original.info.clone(), prems, concs, acts)
+            .with_new_vars(new_vars),
+    )
 }
 
 /// Build the synthetic parsed-AST rule for a SAPIC-generated `ProtoRuleE`.
