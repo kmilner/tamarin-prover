@@ -65,6 +65,11 @@ pub enum TransFact {
     /// `CellLocked t1 t2` (Facts.hs:109): `L_CellLocked( t1, t2 )` — the
     /// pure-state lock token.
     CellLocked(LNTerm, LNTerm),
+    /// `FLet p t vars` (Facts.hs:100): `Let_<pos>( t, v1, .., vn )` — the
+    /// intermediate fact a `let` combinator threads its RHS / matched LHS
+    /// through (Basetranslation.hs:252-277).  `vars` are the bound variables in
+    /// scope (rendered sorted, like `State`).
+    FLet(ProcessPosition, LNTerm, Vec<LVar>),
 }
 
 /// `TransAction` (Facts.hs:43-77) — action facts.  Only the constructors used
@@ -157,6 +162,18 @@ pub fn fact_to_fact(f: &TransFact) -> LNFact {
         // (Facts.hs:270).
         TransFact::CellLocked(t1, t2) => {
             proto_fact(Multiplicity::Linear, "L_CellLocked", vec![t1.clone(), t2.clone()])
+        }
+        // `factToFact (FLet p t vars) = protoFact Linear ("Let_" ++ pos) (t : vars)`
+        // (Facts.hs:257-259).  `vars` rendered as `S.toList` (sorted unique).
+        TransFact::FLet(p, t, vars) => {
+            let full = format!("Let_{}", pretty_position(p));
+            let mut ts: Vec<LNTerm> = vec![t.clone()];
+            ts.extend(
+                sorted_unique(vars.clone())
+                    .into_iter()
+                    .map(|v| VTerm::Lit(Lit::Var(v))),
+            );
+            proto_fact(Multiplicity::Linear, &full, ts)
         }
     }
 }

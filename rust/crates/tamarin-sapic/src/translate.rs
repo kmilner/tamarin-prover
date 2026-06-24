@@ -277,15 +277,19 @@ pub struct Translation {
 pub fn translate(
     plain: &PlainProcess,
     needs_in_ev_res: bool,
+    st_rules: &std::collections::BTreeSet<tamarin_term::subterm_rule::CtxtStRule>,
 ) -> Result<Translation, String> {
-    // annotate: toAnProcess + propagateNames + annotateLocks (Sapic.hs:54-61).
-    //   The secret-channel / pure-state / report / let-destructor passes are
+    // annotate: toAnProcess + propagateNames + translateLetDestr + annotateLocks
+    //   (Sapic.hs:54-61).  The secret-channel / pure-state / report passes are
     //   either no-ops for the in-scope subset (secret-channels) or gated off by
-    //   default (pure-state needs `--translation-state-optimisation`); locks is
-    //   the last annotation step and the one Phase 4 requires.
+    //   default (pure-state needs `--translation-state-optimisation`).
+    //   `translateLetDestr` (Phase 5) runs AFTER propagateNames and BEFORE
+    //   annotateLocks, eliminating var-RHS `let`s and annotating destructor /
+    //   kept `let`s.
     let an_proc_pre: Process<ProcessAnnotation<LVar>, SapicLVar> =
         propagate_names(to_annotated::<LVar>(plain.clone()));
-    let an_proc = crate::locks::annotate_locks(an_proc_pre)?;
+    let an_proc_let = crate::let_destructors::translate_let_destr(st_rules, an_proc_pre);
+    let an_proc = crate::locks::annotate_locks(an_proc_let)?;
 
     // initial rules + initial tildex
     let (init_rules, init_tx) = base_init(&an_proc);
@@ -385,7 +389,8 @@ mod tests {
         // empty signature (defaults all funs).
         let sig = tamarin_term::maude_sig::MaudeSig::default();
         let typed = type_and_rename_process(&sig, &plain).unwrap();
-        let tr = translate(&typed, false).unwrap();
+        let st_rules = std::collections::BTreeSet::new();
+        let tr = translate(&typed, false, &st_rules).unwrap();
         // Init + new + event + out + null = 5 rules.
         assert_eq!(tr.rules.len(), 5);
         assert_eq!(tr.restrictions.len(), 1);

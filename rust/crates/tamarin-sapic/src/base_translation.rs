@@ -294,9 +294,22 @@ pub fn base_trans_action(
             );
             Ok((vec![body], tildex.clone()))
         }
-        // ChOut with a channel, ChIn, MSR, calls: Phase 5+.
+        // (ProcessCall ..): a pure inlining marker (Basetranslation.hs:204-207).
+        //   [([def_state], [], [def_state' tildex], [])]
+        // The substituted body that follows the marker carries the real
+        // behaviour; this rule just threads the state on by one position.
+        SapicAction::ProcessCall(_, _) => {
+            let body: RuleBody = (
+                vec![def_state(tildex)],
+                vec![],
+                vec![def_state_next(tildex)],
+                vec![],
+            );
+            Ok((vec![body], tildex.clone()))
+        }
+        // ChOut with a channel, ChIn, MSR: secret/private channels (Phase 6+).
         other => Err(format!(
-            "baseTransAction: action not yet ported (Phase 5+): {other:?}"
+            "baseTransAction: action not yet ported (Phase 6+): {other:?}"
         )),
     }
 }
@@ -478,10 +491,195 @@ pub fn base_trans_comb(
             );
             Ok((vec![body_in, body_notset], tx_prime, Some(tildex.clone())))
         }
-        PC::Let { .. } => {
-            Err("baseTransComb: let-binding not yet ported (Phase 4+)".to_string())
+        // Let (Basetranslation.hs:252-277).  Match-vars are ignored in the
+        // translation (they are bound in the def_state).  The RHS / matched LHS
+        // are threaded through a `Let_<pos>` (FLet) fact:
+        //   t1or = toLNTerm left
+        //   (t1, t2, freevars) = case an.destructor_equation of
+        //       None        -> (t1or, toLNTerm right, frees t1or)
+        //       Some(tl1,tl2) -> (tl1, tl2, frees tl1 \ tildex)
+        //   fa  = (t1 = t2) ⇒ ⊥          (the else-arm restriction body)
+        //   faN = ∀ freevars. fa
+        //   tildexl = frees t1or ∪ tildex
+        //   pos = p++[1]
+        //   if elseBranch:
+        //     [ ([def_state], [], [FLet pos t2 tildex], []),
+        //       ([FLet pos t1 tildex], [], [def_state1 tildexl], []),
+        //       ([FLet pos t2 tildex], [], [def_state2 tildex], [faN]) ],
+        //      tildexl, Just tildex
+        //   else:
+        //     [ ([def_state], [], [FLet pos t2 tildex], []),
+        //       ([FLet pos t1 tildex], [], [def_state1 tildexl], []) ],
+        //      tildexl, Nothing
+        PC::Let { left, right, .. } => {
+            let t1or = to_ln_term(left);
+            let (t1, t2, freevars): (LNTerm, LNTerm, BTreeSet<LVar>) =
+                match &an.destructor_equation {
+                    None => {
+                        let fv = ln_term_vars(&t1or);
+                        (t1or.clone(), to_ln_term(right), fv)
+                    }
+                    Some((tl1, tl2)) => {
+                        let mut fv = ln_term_vars(tl1);
+                        for v in tildex {
+                            fv.remove(v);
+                        }
+                        (tl1.clone(), tl2.clone(), fv)
+                    }
+                };
+            // `tildexl = frees t1or ∪ tildex`
+            let mut tildexl = tildex.clone();
+            tildexl.extend(ln_term_vars(&t1or));
+            // `faN = ∀ freevars. ((t1 = t2) ⇒ ⊥)`
+            let fa_n = let_else_restriction(&t1, &t2, &freevars);
+            // `pos = p ++ [1]`
+            let pos = p1.clone();
+            let body0: RuleBody = (
+                vec![def_state(tildex)],
+                vec![],
+                vec![TransFact::FLet(pos.clone(), t2.clone(), tildex.iter().cloned().collect())],
+                vec![],
+            );
+            let body1: RuleBody = (
+                vec![TransFact::FLet(pos.clone(), t1, tildex.iter().cloned().collect())],
+                vec![],
+                vec![def_state1(&tildexl)],
+                vec![],
+            );
+            if an.else_branch {
+                let body2: RuleBody = (
+                    vec![TransFact::FLet(pos, t2, tildex.iter().cloned().collect())],
+                    vec![],
+                    vec![def_state2(tildex)],
+                    vec![fa_n],
+                );
+                Ok((vec![body0, body1, body2], tildexl, Some(tildex.clone())))
+            } else {
+                Ok((vec![body0, body1], tildexl, None))
+            }
         }
     }
+}
+
+/// `freeset = fromList . frees` over an `LNTerm` — its variables.
+fn ln_term_vars(t: &LNTerm) -> BTreeSet<LVar> {
+    use tamarin_term::vterm::{Lit, VTerm};
+    fn go(t: &LNTerm, out: &mut BTreeSet<LVar>) {
+        match t {
+            VTerm::Lit(Lit::Var(v)) => {
+                out.insert(v.clone());
+            }
+            VTerm::Lit(_) => {}
+            VTerm::App(_, args) => {
+                for a in args.iter() {
+                    go(a, out);
+                }
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    go(t, &mut out);
+    out
+}
+
+/// The else-arm restriction for a kept `let` (Basetranslation.hs:261-263):
+///   `faN = fold (hinted forAll) ((t1 = t2) ⇒ ⊥) freevars`
+/// = `∀ freevars. ¬(t1 = t2)`, rendered as a parser-AST formula so it flows
+/// through the existing restriction pipeline (HS keeps it as the rule's 4th
+/// (restriction) component).  `freevars` are quantified, in sorted order.
+fn let_else_restriction(
+    t1: &LNTerm,
+    t2: &LNTerm,
+    freevars: &BTreeSet<LVar>,
+) -> tamarin_parser::ast::Formula {
+    use tamarin_parser::ast as p;
+    let eq = p::Formula::Atom(p::Atom::Eq(
+        ln_term_to_parser(t1),
+        ln_term_to_parser(t2),
+    ));
+    // `Conn Imp (Ato (EqE t1 t2)) (TF False)` = `(t1 = t2) ⇒ False`.
+    let body = p::Formula::Implies(Box::new(eq), Box::new(p::Formula::False));
+    if freevars.is_empty() {
+        body
+    } else {
+        let vs: Vec<p::VarSpec> = freevars.iter().map(lvar_to_varspec).collect();
+        p::Formula::Forall(vs, Box::new(body))
+    }
+}
+
+/// `LVar` → parser `VarSpec` (for the quantifier binder list / atom vars).
+fn lvar_to_varspec(v: &LVar) -> tamarin_parser::ast::VarSpec {
+    use tamarin_parser::ast as p;
+    use tamarin_term::lterm::LSort;
+    let sort = match v.sort {
+        LSort::Fresh => p::SortHint::Fresh,
+        LSort::Pub => p::SortHint::Pub,
+        LSort::Node => p::SortHint::Node,
+        LSort::Nat => p::SortHint::Nat,
+        LSort::Msg => p::SortHint::Msg,
+    };
+    p::VarSpec { name: v.name.clone(), idx: v.idx, sort, typ: None }
+}
+
+/// `LNTerm` → parser-AST `Term` (for the `let` else restriction body).  The
+/// restriction is rendered through the parser-AST formula printer, so we lower
+/// the LN term into the parser term universe (variables keep their sort/idx).
+fn ln_term_to_parser(t: &LNTerm) -> tamarin_parser::ast::Term {
+    use tamarin_parser::ast as p;
+    use tamarin_term::function_symbols::{AcSym, FunSym};
+    use tamarin_term::lterm::NameTag;
+    use tamarin_term::vterm::{Lit, VTerm};
+    match t {
+        VTerm::Lit(Lit::Var(v)) => p::Term::Var(lvar_to_varspec(v)),
+        VTerm::Lit(Lit::Con(n)) => match n.tag {
+            NameTag::Pub => p::Term::PubLit(n.id.0.clone()),
+            NameTag::Fresh => p::Term::FreshLit(n.id.0.clone()),
+            NameTag::Nat => p::Term::NatLit(n.id.0.clone()),
+            NameTag::Node => p::Term::PubLit(n.id.0.clone()),
+        },
+        VTerm::App(FunSym::NoEq(sym), args) => {
+            let name = String::from_utf8_lossy(&sym.name).to_string();
+            if name == "pair" && args.len() == 2 {
+                let mut flat = Vec::new();
+                collect_pair(t, &mut flat);
+                return p::Term::Pair(flat);
+            }
+            p::Term::App(name, args.iter().map(ln_term_to_parser).collect())
+        }
+        VTerm::App(FunSym::Ac(op), args) => {
+            let bop = match op {
+                AcSym::Mult => p::BinOp::Mult,
+                AcSym::Union => p::BinOp::Union,
+                AcSym::Xor => p::BinOp::Xor,
+                AcSym::NatPlus => p::BinOp::NatPlus,
+            };
+            // Fold the AC arg list left-associatively into BinOps.
+            let mut it = args.iter();
+            let first = it.next().map(ln_term_to_parser).unwrap_or(p::Term::NumberOne);
+            it.fold(first, |acc, a| {
+                p::Term::BinOp(bop, Box::new(acc), Box::new(ln_term_to_parser(a)))
+            })
+        }
+        VTerm::App(FunSym::C(_), args) => {
+            p::Term::App("em".to_string(), args.iter().map(ln_term_to_parser).collect())
+        }
+        VTerm::App(FunSym::List, args) => {
+            p::Term::Pair(args.iter().map(ln_term_to_parser).collect())
+        }
+    }
+}
+
+fn collect_pair(t: &LNTerm, out: &mut Vec<tamarin_parser::ast::Term>) {
+    use tamarin_term::function_symbols::FunSym;
+    use tamarin_term::vterm::VTerm;
+    if let VTerm::App(FunSym::NoEq(sym), args) = t {
+        if sym.name == b"pair" && args.len() == 2 {
+            collect_pair(&args[0], out);
+            collect_pair(&args[1], out);
+            return;
+        }
+    }
+    out.push(ln_term_to_parser(t));
 }
 
 /// `fromList (freesList f)` for a parser-AST formula — the formula's FREE

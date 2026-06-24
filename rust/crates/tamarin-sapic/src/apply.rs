@@ -19,7 +19,7 @@ use tamarin_theory::pretty_sapic::pretty_sapic_top_level;
 use tamarin_theory::rule::{ProtoRuleE, ProtoRuleName};
 use tamarin_theory::theory::{OpenProtoRule, OpenRestriction, Theory, TheoryItem};
 
-use crate::convert::convert_process;
+use crate::inline::{collect_process_defs, convert_process_with_defs};
 use crate::translate::translate;
 use crate::typing::type_and_rename_process;
 
@@ -48,8 +48,12 @@ pub fn apply_sapic(
         return Ok(());
     };
 
-    // P0a: parser AST → theory AST.
-    let plain = convert_process(&top)
+    // P0a + Phase 5: parser AST → theory AST, inlining process-definition
+    // calls (`let P = ..` / `P(args)`) with parameter substitution.  HS inlines
+    // at parse time (`Theory.Text.Parser.Sapic.actionprocess`); we do it here,
+    // resolving every `Call` against the theory's `ProcessDef`s.
+    let defs = collect_process_defs(parsed);
+    let plain = convert_process_with_defs(&top, &defs)
         .map_err(|e| ElabError { message: format!("SAPIC translation: {}", e.message) })?;
 
     // P0e: typeTheory (renameUnique + type inference), using the elaborated
@@ -60,7 +64,10 @@ pub fn apply_sapic(
 
     // translate → rules + restrictions.  `needs_in_ev_res` = false for the
     // linear subset (no lemma needs the `in_event` restriction in typing2).
-    let translation = translate(&typed, false)
+    // The signature's CtxtStRules drive `translateLetDestr` (let-destructor /
+    // let-elimination pass).
+    let st_rules = &maude_sig.st_rules;
+    let translation = translate(&typed, false, st_rules)
         .map_err(|e| ElabError { message: format!("SAPIC translation: {e}") })?;
 
     // The `predicate:` declarations the embedded `_restrict` formulas expand

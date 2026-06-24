@@ -36,12 +36,12 @@ pub struct ConvertError {
 }
 
 impl ConvertError {
-    fn new(s: impl Into<String>) -> Self {
+    pub(crate) fn new(s: impl Into<String>) -> Self {
         ConvertError { message: s.into() }
     }
 }
 
-fn sort_of_hint(s: &p::SortHint) -> LSort {
+pub(crate) fn sort_of_hint(s: &p::SortHint) -> LSort {
     match s {
         p::SortHint::Fresh | p::SortHint::Suffix(p::SuffixSort::Fresh) => LSort::Fresh,
         p::SortHint::Pub | p::SortHint::Suffix(p::SuffixSort::Pub) => LSort::Pub,
@@ -54,7 +54,7 @@ fn sort_of_hint(s: &p::SortHint) -> LSort {
 }
 
 /// `VarSpec` → `SapicLVar` (carrying the SAPIC `name:type` annotation).
-fn varspec_to_sapic(v: &p::VarSpec) -> SapicLVar {
+pub(crate) fn varspec_to_sapic(v: &p::VarSpec) -> SapicLVar {
     SapicLVar::new(LVar::new(v.name.clone(), sort_of_hint(&v.sort), v.idx), v.typ.clone())
 }
 
@@ -63,8 +63,25 @@ fn term(t: &p::Term) -> Result<tamarin_theory::sapic::SapicTerm, ConvertError> {
         .ok_or_else(|| ConvertError::new("could not convert SAPIC term (pattern term?)"))
 }
 
+/// Public alias of [`term`] for the inlining pass (process-call arguments).
+pub(crate) fn convert_term(t: &p::Term) -> Result<tamarin_theory::sapic::SapicTerm, ConvertError> {
+    term(t)
+}
+
 fn fact(f: &p::Fact) -> Result<tamarin_theory::sapic::SapicLNFact, ConvertError> {
     fact_to_sapic_fact(f).map_err(|e| ConvertError::new(e.message))
+}
+
+/// Public alias of [`action`] for the inlining pass.
+pub(crate) fn convert_action(a: &p::SapicAction) -> Result<SapicAction<SapicLVar>, ConvertError> {
+    action(a)
+}
+
+/// Public alias of [`combinator`] for the inlining pass.
+pub(crate) fn convert_combinator(
+    c: &p::ProcessComb,
+) -> Result<ProcessCombinator<SapicLVar>, ConvertError> {
+    combinator(c)
 }
 
 /// Convert a parser action into a theory `SapicAction<SapicLVar>`.
@@ -130,9 +147,85 @@ fn combinator(c: &p::ProcessComb) -> Result<ProcessCombinator<SapicLVar>, Conver
         p::ProcessComb::Lookup(t, v) => {
             Ok(ProcessCombinator::Lookup(term(t)?, varspec_to_sapic(v)))
         }
-        p::ProcessComb::Let { .. } => {
-            Err(ConvertError::new("let-binding not yet ported (Phase 4+)"))
+        // `let pat = value in P [else Q]` (Phase 5).  HS
+        // `ProcessComb (Let (unpattern t1) t2 (extractMatchingVariables t1))`
+        // (Sapic.hs:268-269).  The parser-AST pattern `pat` may contain
+        // `=t` (`PatMatch`) match markers; we split them out into `match_vars`
+        // and `unpattern` the rest into the `left` term.
+        p::ProcessComb::Let { pat, value } => {
+            let (left, match_vars) = convert_let_pattern(pat)?;
+            let right = term(value)?;
+            Ok(ProcessCombinator::Let { left, right, match_vars })
         }
+    }
+}
+
+/// Convert a `let` pattern term (HS `unpattern` + `extractMatchingVariables`,
+/// Pattern.hs:55-96).  Returns the `unpattern`ed SAPIC term (with every `=v`
+/// match marker stripped to a plain `v`) plus the set of match-marked
+/// variables.  HS `extractMatchingVariables` collects every `PatternMatch v`;
+/// `unpattern = fmap (fmap unpatternVar)` drops the bind/match tag.
+fn convert_let_pattern(
+    pat: &p::Term,
+) -> Result<(tamarin_theory::sapic::SapicTerm, BTreeSet<SapicLVar>), ConvertError> {
+    let mut match_vars: BTreeSet<SapicLVar> = BTreeSet::new();
+    let unpatterned = strip_pat_match(pat, &mut match_vars);
+    let left = term(&unpatterned)?;
+    Ok((left, match_vars))
+}
+
+/// Recursively strip `PatMatch` wrappers from a pattern term, recording each
+/// matched variable.  A `=v` matching a plain variable contributes `v` to the
+/// match-var set and unwraps to `v`; a `=t` over a compound term unwraps the
+/// inner term (its variables are still matched, mirroring HS's per-leaf
+/// `PatternMatch`).  Non-pattern subterms are returned unchanged.
+fn strip_pat_match(t: &p::Term, match_vars: &mut BTreeSet<SapicLVar>) -> p::Term {
+    match t {
+        p::Term::PatMatch(inner) => {
+            // Collect every variable under the matched subterm.
+            collect_pattern_vars(inner, match_vars);
+            // `unpattern` the inner term (it may itself contain nested patterns).
+            strip_pat_match(inner, match_vars)
+        }
+        p::Term::Pair(items) => {
+            p::Term::Pair(items.iter().map(|x| strip_pat_match(x, match_vars)).collect())
+        }
+        p::Term::App(n, args) => {
+            p::Term::App(n.clone(), args.iter().map(|x| strip_pat_match(x, match_vars)).collect())
+        }
+        p::Term::AlgApp(n, a, b) => p::Term::AlgApp(
+            n.clone(),
+            Box::new(strip_pat_match(a, match_vars)),
+            Box::new(strip_pat_match(b, match_vars)),
+        ),
+        p::Term::Diff(a, b) => p::Term::Diff(
+            Box::new(strip_pat_match(a, match_vars)),
+            Box::new(strip_pat_match(b, match_vars)),
+        ),
+        p::Term::BinOp(op, a, b) => p::Term::BinOp(
+            *op,
+            Box::new(strip_pat_match(a, match_vars)),
+            Box::new(strip_pat_match(b, match_vars)),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Collect every SAPIC variable occurring in a pattern term (used to populate
+/// the match-var set for a `=t` matched subterm).
+fn collect_pattern_vars(t: &p::Term, out: &mut BTreeSet<SapicLVar>) {
+    match t {
+        p::Term::Var(v) => {
+            out.insert(varspec_to_sapic(v));
+        }
+        p::Term::PatMatch(inner) => collect_pattern_vars(inner, out),
+        p::Term::Pair(items) => items.iter().for_each(|x| collect_pattern_vars(x, out)),
+        p::Term::App(_, args) => args.iter().for_each(|x| collect_pattern_vars(x, out)),
+        p::Term::AlgApp(_, a, b) | p::Term::Diff(a, b) | p::Term::BinOp(_, a, b) => {
+            collect_pattern_vars(a, out);
+            collect_pattern_vars(b, out);
+        }
+        _ => {}
     }
 }
 
@@ -163,7 +256,11 @@ pub fn convert_process(proc: &p::Process) -> Result<PlainProcess, ConvertError> 
             Box::new(convert_process(body)?),
         )),
         p::Process::Call { .. } => {
-            Err(ConvertError::new("process calls not yet ported (Phase 2+)"))
+            // Process-call inlining requires the theory's process-definition
+            // map; the real pipeline goes through
+            // `inline::convert_process_with_defs`.  This def-less entry point
+            // (used by unit tests) cannot resolve a call.
+            Err(ConvertError::new("process calls require convert_process_with_defs"))
         }
         p::Process::AtAnnotation(inner, _) => {
             // Location annotation (`@ loc`) — for the linear subset we drop the
