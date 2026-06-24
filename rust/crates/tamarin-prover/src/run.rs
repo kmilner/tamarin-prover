@@ -1257,6 +1257,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             &wf_block,
             &build_info,
             in_file,
+            args.auto_sources,
         );
         phase!("pretty_closed_theory");
         emit_output(args, in_file, &body)?;

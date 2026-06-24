@@ -242,6 +242,7 @@ pub fn pretty_closed_theory(
     wf_block: &str,
     build: &BuildInfo,
     in_file: &str,
+    auto_sources: bool,
 ) -> String {
     let mut out = String::new();
 
@@ -342,8 +343,12 @@ pub fn pretty_closed_theory(
     // it through to every per-item renderer rather than recomputing (and
     // re-cloning the signature) for each rule/lemma/restriction/predicate.
     let arity1 = arity1_noeq_names(elaborated);
+    // HS `prettyClosedTheory` (ClosedTheory.hs:383) switches the WHOLE theory
+    // to the open-as-closed renderer when `containsManualRuleVariants` holds,
+    // which suppresses loop-breaker comments on trivial-AC-variant rules.
+    let manual_variants = contains_manual_rule_variants(parsed, elaborated, auto_sources);
     let rendered: Vec<Option<String>> = parsed.items.par_iter()
-        .map(|item| render_parsed_item(item, &macros, &predicates, elaborated, proved, in_file, &arity1))
+        .map(|item| render_parsed_item(item, &macros, &predicates, elaborated, proved, in_file, &arity1, manual_variants, auto_sources))
         .collect();
     for b in rendered.into_iter().flatten() {
         out.push('\n');
@@ -560,6 +565,7 @@ fn sep_block_with_lead(lead: &str, items: &[(String, String)]) -> String {
 // Item dispatch
 // =============================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn render_parsed_item(
     item: &p::TheoryItem,
     macros: &[p::Macro],
@@ -568,6 +574,8 @@ fn render_parsed_item(
     proved: &[ProvedLemma],
     in_file: &str,
     arity1: &std::collections::HashSet<String>,
+    manual_variants: bool,
+    auto_sources: bool,
 ) -> Option<String> {
     use p::TheoryItem::*;
     // `macros` is collected once by the caller (mirrors HS
@@ -585,7 +593,7 @@ fn render_parsed_item(
             // closed theory and never rendered.  Such rules are removed
             // from the elaborated theory in run.rs; mirror the absence here.
             if elab.rules().any(|er| er.name() == r.name) {
-                Some(render_rule(r, elab, macros, arity1))
+                Some(render_rule(r, elab, macros, arity1, manual_variants, auto_sources))
             } else {
                 None
             }
@@ -647,7 +655,7 @@ fn render_parsed_item(
             let mut active: Vec<&p::TheoryItem> = then_items.iter().collect();
             if let Some(else_b) = else_items { active.extend(else_b.iter()); }
             let blocks: Vec<String> = active.iter()
-                .filter_map(|it| render_parsed_item(it, macros, predicates, elab, proved, in_file, arity1))
+                .filter_map(|it| render_parsed_item(it, macros, predicates, elab, proved, in_file, arity1, manual_variants, auto_sources))
                 .collect();
             if blocks.is_empty() { None } else { Some(blocks.join("\n\n")) }
         }
@@ -664,6 +672,86 @@ fn render_parsed_item(
 /// `naryOpApp`'s `k == 1` tuple-folding (Theory/Text/Parser/Term.hs:58-93).
 fn arity1_noeq_names(elab: &Theory) -> std::collections::HashSet<String> {
     crate::elaborate::arity1_noeq_names(elab.signature.maude_sig())
+}
+
+/// HS `openProtoRule` (Rule.hs:65-72) returns `OpenProtoRule ruE ruleAC`
+/// where `ruleAC = []` iff `equalUpToTerms cprRuleAC cprRuleE` (i.e. the
+/// closed rule's AC and E forms agree on fact TAGS + lengths,
+/// Theory/Model/Rule.hs:887-895), else `ruleAC = [cprRuleAC]`.
+///
+/// `containsManualRuleVariants` (OpenTheory.hs:584-589) is True iff some
+/// (merged) rule has a non-empty `ruleAC` — i.e. some rule's `openProtoRule`
+/// yields the `[cprRuleAC]` branch.  `prettyClosedTheory`
+/// (ClosedTheory.hs:383) uses that to switch the WHOLE theory to the
+/// "open-as-closed" renderer `prettyOpenProtoRuleAsClosedRule`
+/// (OpenTheory.hs:827-851), which — for the `OpenProtoRule ruE []` (empty)
+/// branch — emits NO `prettyLoopBreakers` line ("cannot show loop breakers
+/// here, as we do not have the information"), whereas the
+/// `OpenProtoRule _ [ruAC]` (non-empty) branch KEEPS the loop breakers.
+///
+/// This predicate is RS's per-rule mirror of "would `openProtoRule` yield a
+/// non-empty `ruleAC`":
+///   * Manual variants: a parsed `variants (modulo AC)` block on the input
+///     rule produces `OpenProtoRule ruE (non-empty)` directly — always
+///     counts, with or without `--auto-sources`.
+///   * `--auto-sources`: `closeTheoryWithMaude` adds the synthetic
+///     `AUTO_IN_*`/`AUTO_OUT_*` action facts to `cprRuleAC` ONLY (NOT
+///     `cprRuleE` — `addActionClosedProtoRule`, Rule.hs:186-189), so an
+///     AUTO-annotated rule has AC ≠ E up to fact tags → `equalUpToTerms`
+///     False → non-empty `ruleAC`.  AC-variant substitution itself never
+///     changes a fact's TAG, so the AUTO action is the only operation that
+///     makes `equalUpToTerms` False here; "the elaborated rule carries an
+///     `AUTO_*` action" is therefore exactly the auto-path discriminant.
+///
+/// Used both to compute the theory-level gate (OR over all rules) and, in
+/// `render_rule`, to decide whether a trivial-AC-variant rule keeps or drops
+/// its loop-breaker comment under the open renderer.
+fn rule_open_ac_nonempty(
+    parsed_rule: &p::Rule,
+    elab_rule: Option<&crate::theory::OpenProtoRule>,
+    auto_sources: bool,
+) -> bool {
+    // Manual `variants (modulo AC)` block on the input rule.
+    if !parsed_rule.variants.is_empty() {
+        return true;
+    }
+    if !auto_sources {
+        // Non-auto path: HS does NOT unfold computed variants, and every
+        // closed rule's AC form agrees with its E form up to terms, so
+        // `openProtoRule` is always the empty branch.  Computed AC variants
+        // do not count.
+        return false;
+    }
+    // Auto path: the rule's AC form differs from its E form up to tags iff it
+    // received an `AUTO_*` action.
+    match elab_rule {
+        None => false,
+        Some(r) => r.rule.actions.iter().any(|f| {
+            matches!(&f.tag, crate::fact::FactTag::Proto(_, name, _)
+                if name.starts_with("AUTO_IN_") || name.starts_with("AUTO_OUT_"))
+        }),
+    }
+}
+
+/// HS `containsManualRuleVariants mergedRules` (OpenTheory.hs:584-589) as
+/// computed by `prettyClosedTheory` (ClosedTheory.hs:383, 402): True iff any
+/// rule's `openProtoRule` yields a non-empty AC list.  See
+/// [`rule_open_ac_nonempty`].  When True the theory renders via the
+/// open-as-closed path, which suppresses loop-breaker comments on
+/// trivial-AC-variant rules whose AC form equals their E form.
+fn contains_manual_rule_variants(
+    parsed: &p::Theory,
+    elaborated: &Theory,
+    auto_sources: bool,
+) -> bool {
+    parsed.items.iter().any(|item| {
+        if let p::TheoryItem::Rule(r) = item {
+            let elab_rule = elaborated.rules().find(|er| er.name() == r.name);
+            rule_open_ac_nonempty(r, elab_rule, auto_sources)
+        } else {
+            false
+        }
+    })
 }
 
 /// Apply the arity-1 surplus-arg pair-fold (HS `naryOpApp` `k == 1`,
@@ -805,7 +893,7 @@ fn render_rule_attributes(attrs: &[p::RuleAttr]) -> String {
     if parts.is_empty() { String::new() } else { format!("[{}]", parts.join(", ")) }
 }
 
-fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro], arity1: &std::collections::HashSet<String>) -> String {
+fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro], arity1: &std::collections::HashSet<String>, manual_variants: bool, auto_sources: bool) -> String {
     let name = &parsed_rule.name;
     let mut out = String::new();
     // HS rule-header line (`prettyNamedRule`, Model/Rule.hs:1285):
@@ -956,9 +1044,28 @@ fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro], arity1
     // `multiComment_` (trivial) or `multiComment (prettyProtoRuleAC ...)`
     // (non-trivial) block.  We emit the same `  // loop breaker: [<n>]`
     // / `  // loop breakers: [<n>,<m>]` line here when non-empty.
-    let outer_loop_breaker = elab_rule
-        .map(|r| render_loop_breakers_line(&r.loop_breakers, 2))
-        .unwrap_or_default();
+    //
+    // HS gate (ClosedTheory.hs:383): when `containsManualRuleVariants` holds
+    // the whole theory renders via `prettyOpenProtoRuleAsClosedRule`
+    // (OpenTheory.hs:827-851).  Its trivial-AC-variant branch
+    // `(OpenProtoRule ruE [])` (OpenTheory.hs:828-835) shows NO loop-breaker
+    // line ("cannot show loop breakers here, as we do not have the
+    // information"), while the `(OpenProtoRule _ [ruAC])` branch
+    // (OpenTheory.hs:836-843) KEEPS them.  A rule lands in the empty branch
+    // iff its `openProtoRule` AC list is empty — see `rule_open_ac_nonempty`.
+    // So under the gate, suppress the loop-breaker comment on a
+    // trivial-AC-variant rule whose AC form equals its E form (no manual
+    // variants, no AUTO action).  Without the gate the closed renderer
+    // (`prettyClosedProtoRule`) always shows them — unchanged.
+    let open_ac_nonempty = rule_open_ac_nonempty(parsed_rule, elab_rule, auto_sources);
+    let show_loop_breakers = !manual_variants || open_ac_nonempty;
+    let outer_loop_breaker = if show_loop_breakers {
+        elab_rule
+            .map(|r| render_loop_breakers_line(&r.loop_breakers, 2))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     if trivial {
         out.push_str("\n\n");
         out.push_str(&outer_loop_breaker);
