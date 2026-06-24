@@ -1225,7 +1225,24 @@ fn saturate_sources_with_simp_opt(
     // saturation mechanism, matching HS architecturally — there is no
     // separate chain-fold pre-step (which would materialise branched
     // cases HS only explores lazily inside the Disj monad).
-    for _iter_n in 0..limit {
+    //
+    // ITERATION COUNT — HS applies `refineSource` up to `limit + 1` times
+    // when changes persist (Sources.hs:479-498).  HS's `go ths n` computes
+    // `ths' = refineSource ths` in its `where` at EVERY call, then:
+    //   - guard1 `any changes && n <= limit` → recurse `go ths' (n+1)`;
+    //   - guard2 `n > limit`                 → return `ths'` (the final
+    //     refinement computed at the n = limit+1 call).
+    // So with the default limit=5 and never-converging sources, the
+    // recursion runs n=1..5 (5 refinements) THEN makes one more `go` call
+    // at n=6 whose `where` computes a 6th `refineSource` and returns it via
+    // guard2.  Net: 6 = limit+1 refinements.  Our loop must therefore run
+    // `limit + 1` iterations (the early `break` on `!changed` below already
+    // mirrors HS's `otherwise` branch returning `ths'` on convergence, so
+    // the extra pass only fires when changes never stop — exactly HS's
+    // behaviour).  Looping only `limit` times left chaum_offline_anonymity's
+    // Ku(sign) source one refinement short (29 vs HS's 33 cases), dropping
+    // the deepest nested-blind C_2 source cases.
+    for _iter_n in 0..=limit {
         // Haskell-faithful `goodTh` filter (Sources.hs:380-381):
         //
         //   goodTh th = length (getDisj (get cdCases th)) <= 1
