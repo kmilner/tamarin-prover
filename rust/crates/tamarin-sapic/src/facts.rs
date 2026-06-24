@@ -76,6 +76,12 @@ pub enum TransFact {
     /// `Ack t t'` (Facts.hs:102): `Ack( c, m )` — the synchronous acknowledgement
     /// for a private-channel message (non-async-channels case).
     Ack(LNTerm, LNTerm),
+    /// `MessageIDSender p` (Facts.hs:104, 262): `MID_Sender( ~mid_<pos> )` — the
+    /// reliable-channel sender message-id fact.
+    MessageIDSender(ProcessPosition),
+    /// `MessageIDReceiver p` (Facts.hs:105, 263): `MID_Receiver( ~mid_<pos> )` —
+    /// the reliable-channel receiver message-id fact.
+    MessageIDReceiver(ProcessPosition),
 }
 
 /// `TransAction` (Facts.hs:43-77) — action facts.  Only the constructors used
@@ -114,6 +120,18 @@ pub enum TransAction {
     /// actions when the theory has a lemma needing the `in_event` restriction
     /// (`needsAssImmediate`).
     ChannelIn(LNTerm),
+    /// `ProgressFrom p` (Facts.hs:77, 232): `ProgressFrom_<pos>( ~prog_<pos> )`.
+    ProgressFrom(ProcessPosition),
+    /// `ProgressTo p pf` (Facts.hs:78, 233): `ProgressTo_<pos>( ~prog_<pf> )` —
+    /// the action is named for `p` but carries the progress variable of `pf`
+    /// (the inverse position, for verification speedup).
+    ProgressTo(ProcessPosition, ProcessPosition),
+    /// `Send p t` (Facts.hs:80, 218): `Send( ~mid_<pos>, t )` — reliable-channel
+    /// send action.
+    Send(ProcessPosition, LNTerm),
+    /// `Receive p t` (Facts.hs:81, 219): `Receive( ~mid_<pos>, t )` —
+    /// reliable-channel receive action.
+    Receive(ProcessPosition, LNTerm),
 }
 
 /// `SpecialPosition` (Facts.hs:110-112).
@@ -195,6 +213,20 @@ pub fn fact_to_fact(f: &TransFact) -> LNFact {
         TransFact::Ack(t1, t2) => {
             proto_fact(Multiplicity::Linear, "Ack", vec![t1.clone(), t2.clone()])
         }
+        // `factToFact (MessageIDSender p) = protoFact Linear "MID_Sender" [varTerm $ varMID p]`
+        // (Facts.hs:262).
+        TransFact::MessageIDSender(p) => proto_fact(
+            Multiplicity::Linear,
+            "MID_Sender",
+            vec![VTerm::Lit(Lit::Var(var_mid(p)))],
+        ),
+        // `factToFact (MessageIDReceiver p) = protoFact Linear "MID_Receiver" [varTerm $ varMID p]`
+        // (Facts.hs:263).
+        TransFact::MessageIDReceiver(p) => proto_fact(
+            Multiplicity::Linear,
+            "MID_Receiver",
+            vec![VTerm::Lit(Lit::Var(var_mid(p)))],
+        ),
     }
 }
 
@@ -259,6 +291,90 @@ pub fn action_to_fact(a: &TransAction) -> LNFact {
         // `actionToFact (ChannelIn t) = protoFact Linear "ChannelIn" [t]`
         // (Facts.hs:224).
         TransAction::ChannelIn(t) => proto_fact(Multiplicity::Linear, "ChannelIn", vec![t.clone()]),
+        // `actionToFact (ProgressFrom p) =
+        //    protoFact Linear ("ProgressFrom_" ++ prettyPosition p) [varTerm $ varProgress p]`
+        // (Facts.hs:232).
+        TransAction::ProgressFrom(p) => proto_fact(
+            Multiplicity::Linear,
+            &format!("ProgressFrom_{}", pretty_position(p)),
+            vec![VTerm::Lit(Lit::Var(var_progress(p)))],
+        ),
+        // `actionToFact (ProgressTo p pf) =
+        //    protoFact Linear ("ProgressTo_" ++ prettyPosition p) [varTerm $ varProgress pf]`
+        // (Facts.hs:233).  NOTE: name uses `p`, but the term is `varProgress pf`.
+        TransAction::ProgressTo(p, pf) => proto_fact(
+            Multiplicity::Linear,
+            &format!("ProgressTo_{}", pretty_position(p)),
+            vec![VTerm::Lit(Lit::Var(var_progress(pf)))],
+        ),
+        // `actionToFact (Send p t) = protoFact Linear "Send" [varTerm $ varMsgId p, t]`
+        // (Facts.hs:218).
+        TransAction::Send(p, t) => proto_fact(
+            Multiplicity::Linear,
+            "Send",
+            vec![VTerm::Lit(Lit::Var(var_mid(p))), t.clone()],
+        ),
+        // `actionToFact (Receive p t) = protoFact Linear "Receive" [varTerm $ varMsgId p, t]`
+        // (Facts.hs:219).
+        TransAction::Receive(p, t) => proto_fact(
+            Multiplicity::Linear,
+            "Receive",
+            vec![VTerm::Lit(Lit::Var(var_mid(p))), t.clone()],
+        ),
+    }
+}
+
+/// `varNameProgress p = "prog_" ++ prettyPosition p` (Facts.hs:189-190).
+pub fn var_name_progress(p: &ProcessPosition) -> String {
+    format!("prog_{}", pretty_position(p))
+}
+
+/// `varProgress p = LVar (varNameProgress p) LSortFresh 0` (Facts.hs:192-197):
+/// the fresh progress variable used in the rule premise/conclusion/action.
+pub fn var_progress(p: &ProcessPosition) -> LVar {
+    LVar::new(var_name_progress(p), tamarin_term::lterm::LSort::Fresh, 0)
+}
+
+/// `msgVarProgress p = LVar (varNameProgress p) LSortMsg 0` (Facts.hs:199-204):
+/// the message-sort progress variable used in the progress RESTRICTION
+/// quantifier (`∀ prog_<pos>. ..`).
+pub fn msg_var_progress(p: &ProcessPosition) -> LVar {
+    LVar::new(var_name_progress(p), tamarin_term::lterm::LSort::Msg, 0)
+}
+
+/// `varMID p = LVar ("mid_" ++ prettyPosition p) LSortFresh 0` (Facts.hs:244-251).
+/// (HS also has the identical `varMsgId`, Facts.hs:206-211.)
+pub fn var_mid(p: &ProcessPosition) -> LVar {
+    LVar::new(
+        format!("mid_{}", pretty_position(p)),
+        tamarin_term::lterm::LSort::Fresh,
+        0,
+    )
+}
+
+/// `isState` (Facts.hs:158-160).
+pub fn is_state(f: &TransFact) -> bool {
+    matches!(f, TransFact::State(..))
+}
+
+/// `isNonSemiState` (Facts.hs:154-156): a non-semi `State` fact.
+pub fn is_non_semi_state(f: &TransFact) -> bool {
+    matches!(f, TransFact::State(kind, _, _) if !kind.is_semi_state())
+}
+
+/// `addVarToState v' (State kind pos vs) = State kind pos (v' `S.insert` vs)`
+/// (Facts.hs:162-164): insert a variable into a `State` fact's variable set;
+/// other facts unchanged.
+pub fn add_var_to_state(v: &LVar, f: &TransFact) -> TransFact {
+    match f {
+        TransFact::State(kind, pos, vs) => {
+            let mut nvs = vs.clone();
+            if !nvs.contains(v) {
+                nvs.push(v.clone());
+            }
+            TransFact::State(*kind, pos.clone(), nvs)
+        }
+        other => other.clone(),
     }
 }
 

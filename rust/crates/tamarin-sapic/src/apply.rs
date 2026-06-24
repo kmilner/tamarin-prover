@@ -20,7 +20,7 @@ use tamarin_theory::rule::{ProtoRuleE, ProtoRuleName};
 use tamarin_theory::theory::{OpenProtoRule, OpenRestriction, Theory, TheoryItem};
 
 use crate::inline::{collect_process_defs, convert_process_with_defs};
-use crate::translate::{needs_in_ev_res, translate};
+use crate::translate::{needs_in_ev_res, translate, TranslateOptions};
 use crate::typing::type_and_rename_process;
 
 /// Apply the SAPIC `process:` translation to a theory that contains exactly one
@@ -78,7 +78,14 @@ pub fn apply_sapic(
     // The signature's CtxtStRules drive `translateLetDestr` (let-destructor /
     // let-elimination pass).
     let st_rules = &maude_sig.st_rules;
-    let translation = translate(&typed, needs_in_ev, st_rules)
+    // Thread the theory options (HS `_thyOptions`) into the translation.
+    let opts = TranslateOptions {
+        trans_progress: elaborated.options.trans_progress,
+        trans_reliable: elaborated.options.trans_reliable,
+        async_channels: elaborated.options.asynchronous_channels,
+        compress_events: elaborated.options.compress_events,
+    };
+    let translation = translate(&typed, needs_in_ev, st_rules, opts)
         .map_err(|e| ElabError { message: format!("SAPIC translation: {e}") })?;
 
     // The `predicate:` declarations the embedded `_restrict` formulas expand
@@ -158,9 +165,23 @@ pub fn apply_sapic(
     }
 
     // `addHeuristic [SapicRanking]` unless a heuristic is already set
-    // (Sapic.hs:82).  `SapicRanking` renders as `p`.
+    // (Sapic.hs:82).  `SapicRanking` renders as `p`.  Add it to BOTH theories:
+    //   - `elaborated.heuristic` drives the rendered `heuristic: p` line; and
+    //   - the `parsed` theory drives the PROVER's heuristic — `ProverSession`
+    //     re-elaborates the parsed theory (`prove.rs:461`), so without the
+    //     parser-AST `Heuristic` item the prover would fall back to
+    //     `SmartRanking` instead of `SapicRanking`.
     if !user_set_heuristic && elaborated.heuristic.is_empty() {
         elaborated.heuristic.push("p".to_string());
+        // Only add to parsed if the parser theory doesn't already carry one
+        // (mirrors HS `addHeuristic` returning `Nothing` when present).
+        let parsed_has_heuristic = parsed
+            .items
+            .iter()
+            .any(|i| matches!(i, p::TheoryItem::Heuristic(_)));
+        if !parsed_has_heuristic {
+            parsed.items.push(p::TheoryItem::Heuristic("p".to_string()));
+        }
     }
 
     Ok(())

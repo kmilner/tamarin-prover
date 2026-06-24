@@ -31,6 +31,25 @@ use crate::base_translation::{
 };
 use crate::facts::{to_rule, AnnotatedRule, RulePosition, StateKind, TransFact};
 
+type Pos = Vec<i64>;
+type PosSet = BTreeSet<Vec<i64>>;
+
+/// Per-translation context for the gated progress / reliable / async wrappers
+/// (HS `trans` = `progressTrans . reliableChannelTrans . baseTrans` in
+/// `Sapic.hs:98-100`).  The progress function domain / inverse are computed once
+/// (HS recomputes `pfFrom`/`pfInv` per node; identical result, computed once
+/// here for speed).
+struct TransCtx {
+    needs_in_ev_res: bool,
+    async_channels: bool,
+    trans_progress: bool,
+    trans_reliable: bool,
+    /// progress-function domain `pfFrom anP` (only used when `trans_progress`).
+    dom_pf: PosSet,
+    /// progress-function inverse `pfInv anP` (only used when `trans_progress`).
+    inv_pf: Option<Box<dyn Fn(&[i64]) -> Option<Pos>>>,
+}
+
 /// `propagateNames` (Facts.hs:301-313): push each node's process-names down to
 /// its children so every node carries the names of all its ancestors.
 pub fn propagate_names<A: GoodAnnotation + Clone>(p: Process<A, SapicLVar>) -> Process<A, SapicLVar> {
@@ -117,7 +136,7 @@ fn map_to_annotated_rule(
 /// `Cond`-with-a-formula / `Lookup` / `Let` are rejected in `base_trans_comb`
 /// (Phase 2+/3).
 fn gen(
-    needs_in_ev_res: bool,
+    ctx: &TransCtx,
     an_proc: &Process<ProcessAnnotation<LVar>, SapicLVar>,
     p: &ProcessPosition,
     tildex: &BTreeSet<LVar>,
@@ -126,17 +145,17 @@ fn gen(
         .ok_or_else(|| format!("gen: invalid position {p:?}"))?;
     match proc {
         Process::Null(ann) => {
+            // `trans_null` is the identity wrapper for progress/reliable.
             let bodies = base_trans_null(p, tildex);
             let _ = ann;
             Ok(map_to_annotated_rule(proc, p, bodies))
         }
         Process::Action(ac, ann, _) => {
-            let (bodies, tildex2) =
-                base_trans_action(false, needs_in_ev_res, ac, ann, p, tildex)?;
+            let (bodies, tildex2) = trans_action(ctx, ac, ann, p, tildex)?;
             let mut here = map_to_annotated_rule(proc, p, bodies);
             let mut child_pos = p.clone();
             child_pos.push(1);
-            let rest = gen(needs_in_ev_res, an_proc, &child_pos, &tildex2)?;
+            let rest = gen(ctx, an_proc, &child_pos, &tildex2)?;
             here.extend(rest);
             Ok(here)
         }
@@ -151,8 +170,8 @@ fn gen(
             pl.push(1);
             let mut pr = p.clone();
             pr.push(2);
-            let l = gen(needs_in_ev_res, an_proc, &pl, tildex)?;
-            let r = gen(needs_in_ev_res, an_proc, &pr, tildex)?;
+            let l = gen(ctx, an_proc, &pl, tildex)?;
+            let r = gen(ctx, an_proc, &pr, tildex)?;
             let mut out = subst_state_pos_rules(l, &pl, p);
             out.extend(subst_state_pos_rules(r, &pr, p));
             Ok(out)
@@ -161,20 +180,78 @@ fn gen(
         // then recurse into the left child with `tildex'1` and (if present) the
         // right child with `tildex'2`.
         Process::Comb(c, ann, _, _) => {
-            let (bodies, tildex_l, tildex_r) = base_trans_comb(c, ann, p, tildex)?;
+            let (bodies, tildex_l, tildex_r) = trans_comb(ctx, c, ann, p, tildex)?;
             let mut here = map_to_annotated_rule(proc, p, bodies);
             let mut pl = p.clone();
             pl.push(1);
-            let msrs_l = gen(needs_in_ev_res, an_proc, &pl, &tildex_l)?;
+            let msrs_l = gen(ctx, an_proc, &pl, &tildex_l)?;
             here.extend(msrs_l);
             if let Some(tx_r) = tildex_r {
                 let mut pr = p.clone();
                 pr.push(2);
-                let msrs_r = gen(needs_in_ev_res, an_proc, &pr, &tx_r)?;
+                let msrs_r = gen(ctx, an_proc, &pr, &tx_r)?;
                 here.extend(msrs_r);
             }
             Ok(here)
         }
+    }
+}
+
+/// `trans_action` = `progressTransAct (reliableChannelTransAct baseTransAction)`
+/// (Sapic.hs:98-100, applied per node).  Reliable wraps the base; progress wraps
+/// the result.
+fn trans_action(
+    ctx: &TransCtx,
+    ac: &tamarin_theory::sapic::SapicAction<SapicLVar>,
+    ann: &ProcessAnnotation<LVar>,
+    p: &ProcessPosition,
+    tildex: &BTreeSet<LVar>,
+) -> Result<(Vec<RuleBody>, BTreeSet<LVar>), String> {
+    // reliable channel act: overrides base for 'c'/'r' channels, else base.
+    let (bodies, tx1) = if ctx.trans_reliable {
+        match crate::reliable_channel::reliable_channel_trans_act(ac, p, tildex)? {
+            Some(res) => res,
+            None => base_trans_action(ctx.async_channels, ctx.needs_in_ev_res, ac, ann, p, tildex)?,
+        }
+    } else {
+        base_trans_action(ctx.async_channels, ctx.needs_in_ev_res, ac, ann, p, tildex)?
+    };
+    if ctx.trans_progress {
+        let inv = ctx.inv_pf.as_ref().expect("inv_pf set when trans_progress");
+        Ok(crate::progress_translation::progress_trans_act(
+            &ctx.dom_pf,
+            inv,
+            p,
+            bodies,
+            tx1,
+        ))
+    } else {
+        Ok((bodies, tx1))
+    }
+}
+
+/// `trans_comb` = `progressTransComb baseTransComb`.  Reliable channels do NOT
+/// modify the combinator translation (HS `reliableChannelTrans` keeps `tComb`).
+fn trans_comb(
+    ctx: &TransCtx,
+    c: &tamarin_theory::sapic::ProcessCombinator<SapicLVar>,
+    ann: &ProcessAnnotation<LVar>,
+    p: &ProcessPosition,
+    tildex: &BTreeSet<LVar>,
+) -> Result<(Vec<RuleBody>, BTreeSet<LVar>, Option<BTreeSet<LVar>>), String> {
+    let (bodies, tx1, tx2) = base_trans_comb(c, ann, p, tildex)?;
+    if ctx.trans_progress {
+        let inv = ctx.inv_pf.as_ref().expect("inv_pf set when trans_progress");
+        Ok(crate::progress_translation::progress_trans_comb(
+            &ctx.dom_pf,
+            inv,
+            p,
+            bodies,
+            tx1,
+            tx2,
+        ))
+    } else {
+        Ok((bodies, tx1, tx2))
     }
 }
 
@@ -271,13 +348,25 @@ pub struct Translation {
     pub restrictions: Vec<tamarin_parser::ast::Restriction>,
 }
 
-/// `translate` (Sapic.hs:45-101) — linear subset.  `needs_in_ev_res` is HS
-/// `needsInEvRes = any lemmaNeedsInEvRes (theoryLemmas th)`; typing2 has no
-/// such lemma, so the caller passes `false`.
+/// Translation options threaded from the theory (HS `_thyOptions`).  Defaults
+/// (all-false) reproduce the pre-Phase-7 core linear pipeline.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TranslateOptions {
+    pub trans_progress: bool,
+    pub trans_reliable: bool,
+    pub async_channels: bool,
+    pub compress_events: bool,
+}
+
+/// `translate` (Sapic.hs:45-101).  `needs_in_ev_res` is HS
+/// `needsInEvRes = any lemmaNeedsInEvRes (theoryLemmas th)`.  `opts` carries the
+/// `_transProgress` / `_transReliable` / `_asynchronousChannels` /
+/// `_compressEvents` gates.
 pub fn translate(
     plain: &PlainProcess,
     needs_in_ev_res: bool,
     st_rules: &std::collections::BTreeSet<tamarin_term::subterm_rule::CtxtStRule>,
+    opts: TranslateOptions,
 ) -> Result<Translation, String> {
     // annotate: toAnProcess + propagateNames + annotateSecretChannels +
     //   translateLetDestr + annotateLocks (Sapic.hs:54-61).  The pure-state /
@@ -295,18 +384,78 @@ pub fn translate(
     let an_proc_let = crate::let_destructors::translate_let_destr(st_rules, an_proc_sec);
     let an_proc = crate::locks::annotate_locks(an_proc_let)?;
 
-    // initial rules + initial tildex
-    let (init_rules, init_tx) = base_init(&an_proc);
+    // Build the translation context (gated progress/reliable/async wrappers).
+    // The progress-function domain / inverse are computed once (HS recomputes
+    // them per node; same result).
+    let (dom_pf, inv_pf): (PosSet, Option<Box<dyn Fn(&[i64]) -> Option<Pos>>>) =
+        if opts.trans_progress {
+            let dom = crate::progress_function::pf_from(&an_proc)?;
+            let inv = crate::progress_function::pf_inv(&an_proc)?;
+            (dom, Some(Box::new(inv)))
+        } else {
+            (PosSet::new(), None)
+        };
+    let ctx = TransCtx {
+        needs_in_ev_res,
+        async_channels: opts.async_channels,
+        trans_progress: opts.trans_progress,
+        trans_reliable: opts.trans_reliable,
+        dom_pf,
+        inv_pf,
+    };
+
+    // initial rules + initial tildex.  HS chains (right-to-left via `=<<`):
+    //   baseInit → progressInit (if progress) → reliableChannelInit (if reliable)
+    // (reportInit is gated off — no `--locations-report` support yet.)
+    let (mut init_rules, mut init_tx) = base_init(&an_proc);
+    if opts.trans_progress {
+        let (r, t) = crate::progress_translation::progress_init(&an_proc, init_rules, init_tx)?;
+        init_rules = r;
+        init_tx = t;
+    }
+    if opts.trans_reliable {
+        let (r, t) =
+            crate::reliable_channel::reliable_channel_init(&an_proc, init_rules, init_tx);
+        init_rules = r;
+        init_tx = t;
+    }
 
     // protocol rules
-    let proto_rules = gen(needs_in_ev_res, &an_proc, &Vec::new(), &init_tx)?;
+    let proto_rules = gen(&ctx, &an_proc, &Vec::new(), &init_tx)?;
 
-    // toRule over (initRules ++ protoRules), pairing each elaborated rule with
-    // its embedded restriction formulas (the `AnnotatedRule.restr` field).
+    // toRule over (initRules ++ protoRules); HS then applies pathCompression
+    // (gated on progress) over the ELABORATED rules, BEFORE pairing with the
+    // per-rule embedded restrictions.  Path compression operates on
+    // `Rule ProtoRuleEInfo` and never touches the embedded `_restrict` formulas
+    // (those rules — `Cond` / `let`-else arms — carry no `State_( )`-reachable
+    // silent shape that compresses; their `restr` is preserved per-rule below).
     let mut all = init_rules;
     all.extend(proto_rules);
-    let rules: Vec<(ProtoRuleE, Vec<tamarin_parser::ast::Formula>)> =
-        all.iter().map(|r| (to_rule(r), r.restr.clone())).collect();
+    // The embedded restriction formulas, keyed by rule NAME (compression keeps
+    // the first rule's name and never merges `_restrict`-bearing arms — see the
+    // `isLetFact`/no-compress guards), so re-pairing by name is faithful.
+    let restr_by_name: std::collections::HashMap<String, Vec<tamarin_parser::ast::Formula>> = all
+        .iter()
+        .filter(|r| !r.restr.is_empty())
+        .map(|r| (crate::facts::rule_name(r), r.restr.clone()))
+        .collect();
+    let elaborated: Vec<ProtoRuleE> = all.iter().map(to_rule).collect();
+    let elaborated = if opts.trans_progress {
+        crate::compression::path_compression(opts.compress_events, elaborated)
+    } else {
+        elaborated
+    };
+    let rules: Vec<(ProtoRuleE, Vec<tamarin_parser::ast::Formula>)> = elaborated
+        .into_iter()
+        .map(|r| {
+            let name = match &r.info.name {
+                tamarin_theory::rule::ProtoRuleName::Stand(n) => n.clone(),
+                tamarin_theory::rule::ProtoRuleName::Fresh => "Fresh".to_string(),
+            };
+            let restr = restr_by_name.get(&name).cloned().unwrap_or_default();
+            (r, restr)
+        })
+        .collect();
 
     // restrictions (baseRestr, Basetranslation.hs:449-468), in HS order:
     //   [setIn, setNotIn]   if the process `contains isLookup`
@@ -345,6 +494,16 @@ pub fn translate(
         if !unlock_positions.contains(v) {
             restrictions.push(crate::base_translation::res_locking(false, v));
         }
+    }
+
+    // HS chains (right-to-left via `=<<`):
+    //   baseRestr → progressRestr (if progress) → reliableChannelRestr (if reliable)
+    if opts.trans_progress {
+        restrictions = crate::progress_translation::progress_restr(&an_proc, restrictions)?;
+    }
+    if opts.trans_reliable {
+        restrictions =
+            crate::reliable_channel::reliable_channel_restr(&an_proc, restrictions);
     }
 
     Ok(Translation { rules, restrictions })
@@ -469,7 +628,7 @@ mod tests {
         let sig = tamarin_term::maude_sig::MaudeSig::default();
         let typed = type_and_rename_process(&sig, &plain).unwrap();
         let st_rules = std::collections::BTreeSet::new();
-        let tr = translate(&typed, false, &st_rules).unwrap();
+        let tr = translate(&typed, false, &st_rules, TranslateOptions::default()).unwrap();
         // Init + new + event + out + null = 5 rules.
         assert_eq!(tr.rules.len(), 5);
         assert_eq!(tr.restrictions.len(), 1);

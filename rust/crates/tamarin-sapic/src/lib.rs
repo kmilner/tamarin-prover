@@ -24,21 +24,28 @@
 //! `Sapic.Exceptions`,
 //! `Sapic.States` (pure-state detection passes — the `pure_state`/`L_PureState`
 //! translation paths exist but the `annotatePureStates` detector is not wired),
-//! `Sapic.Compression`, `Sapic.ProgressFunction`,
-//! `Sapic.ProgressTranslation`, `Sapic.Report`,
-//! `Sapic.ReliableChannelTranslation`, `Sapic.Warnings`,
+//! `Sapic.Report`, `Sapic.Warnings`,
 //! plus secret/private channels (`ChIn`/`ChOut` on a named/private channel)
 //! in `convert`/`base_translation`.
+//!
+//! Phase 7 ported: [`progress_function`] ← `Sapic.ProgressFunction`,
+//! [`progress_translation`] ← `Sapic.ProgressTranslation`,
+//! [`reliable_channel`] ← `Sapic.ReliableChannelTranslation`,
+//! [`compression`] ← `Sapic.Compression`.
 
 pub mod annotation;
 pub mod apply;
 pub mod base_translation;
 pub mod bindings;
+pub mod compression;
 pub mod convert;
 pub mod facts;
 pub mod inline;
 pub mod let_destructors;
 pub mod locks;
+pub mod progress_function;
+pub mod progress_translation;
+pub mod reliable_channel;
 pub mod secret_channels;
 pub mod translate;
 pub mod typing;

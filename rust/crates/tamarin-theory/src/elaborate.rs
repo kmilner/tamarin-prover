@@ -691,6 +691,15 @@ fn elaborate_items(
                     if let Some(sig) = builtin_sig(name) {
                         s = s.merge(sig);
                     }
+                    // HS `builtinsNames` (Theory/Text/Parser/Signature.hs:78-83)
+                    // maps two builtins to translation options:
+                    //   `reliable-channel` → `_transReliable`
+                    //   `locations-report` → `_transReport`
+                    match name.as_str() {
+                        "reliable-channel" => out.options.trans_reliable = true,
+                        "locations-report" => out.options.trans_report = true,
+                        _ => {}
+                    }
                     // NOTE: `diffie-hellman` already arrives with `enable_dh`
                     // set (its MaudeSig is `dh_maude_sig`, see
                     // builtinsNames in Theory/Text/Parser/Signature.hs:60),
