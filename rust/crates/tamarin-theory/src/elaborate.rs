@@ -317,7 +317,48 @@ pub fn elaborate(parser_thy: &p::Theory) -> Result<Theory, ElabError> {
     let _nullary_guard = UserNullaryFunsGuard::set(funs.nullary);
     let _private_guard = UserPrivateFunsGuard::set(funs.private);
     let _destructor_guard = UserDestructorFunsGuard::set(funs.destructor);
-    elaborate_already_expanded(&thy_clone)
+    let mut thy = elaborate_already_expanded(&thy_clone)?;
+
+    // HS folds surplus arguments of arity-1 function applications into a
+    // single right-associative pair at PARSE time (`naryOpApp` `k == 1`,
+    // Theory/Text/Parser/Term.hs:79-93 + `tupleterm` line 187-188:
+    // `chainr1 (msetterm ...) (curry fAppPair <$ comma)`), so the surface
+    // `h(a, b, c)` parses to `h(<a, b, c>)` = `h(fAppPair a (fAppPair b c))`.
+    // Because the fold happens at parse time, the lemma/restriction formula
+    // stored in HS's theory is ALREADY folded, and every downstream consumer
+    // (in particular `formulaToGuarded`, which builds the prover's initial
+    // constraint-system goal and thus the `solve( ... )` text printed in the
+    // proof body) sees the folded form.
+    //
+    // RS's term parser is arity-unaware and keeps `App("h", [a, b, c])`, so we
+    // re-establish the fold here, once, on the elaborated theory's
+    // lemma/restriction formulas — after the signature is final so
+    // `arity1_noeq_names` covers both user `functions: f/1` and builtin
+    // arity-1 NoEq symbols.  This makes `prove.rs`'s `formula_to_guarded`
+    // calls (lemma + reuse-lemma + restriction) carry the folded `h(<…>)`
+    // shape into the goal, matching HS.  The display path folds the parser-AST
+    // separately (pretty_theory.rs), and the fold is idempotent (an arity-1
+    // application with exactly one — already-paired — argument is left
+    // unchanged), so applying it on both sides is safe.
+    let arity1 = arity1_noeq_names(thy.signature.maude_sig());
+    if !arity1.is_empty() {
+        for item in &mut thy.items {
+            match item {
+                TheoryItem::Lemma(l) => {
+                    l.formula = rewrite_arity1_formula(&l.formula, &arity1);
+                }
+                TheoryItem::Restriction(r) => {
+                    r.formula = rewrite_arity1_formula(&r.formula, &arity1);
+                    if let Some(of) = &r.original_formula {
+                        r.original_formula =
+                            Some(rewrite_arity1_formula(of, &arity1));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(thy)
 }
 
 /// The four user-declared function-name sets read by `term_to_lnterm`.
