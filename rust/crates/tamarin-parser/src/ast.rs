@@ -112,6 +112,13 @@ pub enum RuleAttr {
     NoDerivCheck,
     Role(String),
     IsSapicRule,
+    /// `process="..."` — the rendered `prettySapicTopLevel'` of a
+    /// SAPIC-generated rule's subprocess.  HS's rule-attribute PARSER ignores
+    /// a user-written `process=` (`parseAndIgnore`, Parser/Rule.hs:72), so this
+    /// variant is never produced by the parser; it is synthesised only by the
+    /// SAPIC translation when it injects generated rules into the parsed theory
+    /// (so the pretty-printer renders the `process="..."` attribute).
+    Process(String),
     External(String, Option<String>),
 }
 

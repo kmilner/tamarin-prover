@@ -964,6 +964,14 @@ fn rule_attribute_parts(attrs: &[p::RuleAttr]) -> Vec<String> {
         p::RuleAttr::Color(c) => Some(c), _ => None }) {
         parts.push(format!("color=#{}", hex.trim_start_matches('#').to_lowercase()));
     }
+    // process= : HS `ppProcess p = text "process=" <> "\"" ++ topLevel ++ "\""`
+    // (Model/Rule.hs:1210).  Rendered between color= and no_derivcheck.  Only
+    // SAPIC-translation-generated rules carry it (the parser ignores a
+    // user-written `process=`); the LAST occurrence wins (Maybe field).
+    if let Some(s) = attrs.iter().rev().find_map(|a| match a {
+        p::RuleAttr::Process(s) => Some(s), _ => None }) {
+        parts.push(format!("process=\"{}\"", s));
+    }
     if attrs.iter().any(|a| matches!(a, p::RuleAttr::NoDerivCheck)) {
         parts.push("no_derivcheck".to_string());
     }
@@ -994,15 +1002,6 @@ fn rule_attributes_doc(attrs: &[p::RuleAttr]) -> crate::pretty_hpj::Doc {
     // continuation hangs at the column right after `[` (beside, no space).
     let inner = hpj::fsep(hpj::punctuate(Doc::text(","), part_docs));
     Doc::text("[").beside(inner).beside(Doc::text("]"))
-}
-
-/// Flat `[a, b, c]` rendering of the rule attributes (no `fsep` wrapping).
-/// Used for the `/* rule (modulo AC) … */` comment block, whose surrounding
-/// layout is built by string concatenation rather than the Doc engine.  Shares
-/// the last-wins / `process=`-dropping logic via [`rule_attribute_parts`].
-fn render_rule_attributes(attrs: &[p::RuleAttr]) -> String {
-    let parts = rule_attribute_parts(attrs);
-    if parts.is_empty() { String::new() } else { format!("[{}]", parts.join(", ")) }
 }
 
 fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro], arity1: &std::collections::HashSet<String>, manual_variants: bool, auto_sources: bool) -> String {
@@ -1301,7 +1300,28 @@ fn render_rule_body_at(prems: &[p::Fact], acts: &[p::Fact], concs: &[p::Fact], i
 fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule, attrs: &[p::RuleAttr]) -> String {
     let mut s = String::new();
     s.push_str("  /*\n");
-    s.push_str(&format!("  rule (modulo AC) {}{}:\n", name, render_rule_attributes(attrs)));
+    // HS renders the AC rule via `nest 2 (multiComment (prettyProtoRuleAC …))`
+    // (ClosedTheory.hs:354), so the `rule (modulo AC) <name>[attrs]:` header
+    // line sits at column 2 and its attribute-list `fsep` wraps at the ribbon
+    // width with the continuation hanging right after the `[`.  Build it through
+    // the same Doc engine as the modulo-E header, prefixed by the 2-space
+    // comment indent so the absolute columns (and thus the wrap point) match HS.
+    {
+        use crate::pretty_hpj::Doc;
+        // Build the header with NO leading spaces, then `nest(2)` so BOTH the
+        // first line and the `fsep` continuation are indented exactly like HS's
+        // `nest 2 (multiComment …)` — the ribbon/width accounting is measured
+        // from the nest-2 baseline (a literal 2-space text prefix would charge
+        // the first line differently and wrap one element too early; cf.
+        // no-replication.spthy `news_0_`).
+        let header = Doc::text("rule (modulo AC)")
+            .beside_sp(Doc::text(name.to_string()))
+            .beside(rule_attributes_doc(attrs))
+            .beside(Doc::text(":"))
+            .nest(2);
+        s.push_str(&header.render());
+        s.push('\n');
+    }
     // Body of the abstracted rule.  Use the abstracted rule's facts when
     // available; when `abstracted_rule` is `None` (no reducible-headed
     // sub-terms), fall back to the ELABORATED rule's facts (`rule.rule`).
@@ -1452,7 +1472,7 @@ fn lnfacts_to_parser(facts: &[crate::fact::LNFact]) -> Vec<p::Fact> {
     facts.iter().map(lnfact_to_parser).collect()
 }
 
-pub(crate) fn lnfact_to_parser(fa: &crate::fact::LNFact) -> p::Fact {
+pub fn lnfact_to_parser(fa: &crate::fact::LNFact) -> p::Fact {
     use crate::fact::FactTag;
     let (name, persistent) = match &fa.tag {
         FactTag::Proto(crate::fact::Multiplicity::Persistent, n, _) => (n.clone(), true),

@@ -1807,6 +1807,157 @@ pub fn term_to_lnterm(t: &p::Term) -> Option<tamarin_term::lterm::LNTerm> {
 }
 
 // =============================================================================
+// Term conversion: parser::Term → SapicTerm (VTerm<Name, SapicLVar>)
+//
+// Parallel to `term_to_lnterm`, but the literal/variable case preserves the
+// SAPIC type annotation (`VarSpec.typ`) into `SapicLVar.stype`.  Mirrors HS's
+// SAPIC term parser (`Theory.Text.Parser.Sapic.sapicterm = msetterm False
+// ltypedlit`, Sapic.hs:56), which builds `Term (Lit Name SapicLVar)` keeping
+// the `name:type` annotation on each typed variable.  Reuses the SAME
+// function-symbol / arity-1-fold / em / pair logic as `term_to_lnterm` so the
+// resulting term universe matches the protocol-rule path exactly.
+// =============================================================================
+
+/// `parser::Term` → `SapicTerm`.  Returns `None` on a `PatMatch` term (the
+/// surface SAPIC action parser never places one in a plain term position).
+pub fn term_to_sapic_term(t: &p::Term) -> Option<crate::sapic::SapicTerm> {
+    use tamarin_term::function_symbols::AcSym;
+    use tamarin_term::term::{f_app_ac, f_app_no_eq};
+    use crate::sapic::SapicLVar;
+
+    // Build a typed SAPIC variable term from a parser VarSpec.
+    let sapic_var = |v: &p::VarSpec| -> crate::sapic::SapicTerm {
+        let lv = LVar::new(v.name.clone(), sort_of(&v.sort), v.idx);
+        Term::Lit(Lit::Var(SapicLVar::new(lv, v.typ.clone())))
+    };
+
+    match t {
+        p::Term::Var(v) => {
+            // A bare untagged identifier may be a 0-arity NoEq fun symbol
+            // (mirrors `term_to_lnterm`'s `nullaryApp` recovery).
+            if matches!(v.sort, p::SortHint::Untagged) && v.idx == 0
+                && v.typ.is_none() && is_user_nullary_fun(&v.name) {
+                let sym = NoEqSym::new(v.name.as_bytes().to_vec(), 0,
+                    user_fun_privacy(&v.name), Constructability::Constructor);
+                return Some(f_app_no_eq(sym, vec![]));
+            }
+            Some(sapic_var(v))
+        }
+        p::Term::PubLit(s) => Some(Term::Lit(Lit::Con(Name::new(NameTag::Pub, s.clone())))),
+        p::Term::FreshLit(s) => Some(Term::Lit(Lit::Con(Name::new(NameTag::Fresh, s.clone())))),
+        p::Term::NatLit(s) => Some(Term::Lit(Lit::Con(Name::new(NameTag::Nat, s.clone())))),
+        p::Term::NumberOne => Some(f_app_no_eq(tamarin_term::function_symbols::one_sym(), vec![])),
+        p::Term::DhNeutral => Some(f_app_no_eq(tamarin_term::function_symbols::dh_neutral_sym(), vec![])),
+        p::Term::NatOne => Some(f_app_no_eq(tamarin_term::function_symbols::nat_one_sym(), vec![])),
+        p::Term::Number(_) => Some(Term::Lit(Lit::Con(Name::new(NameTag::Pub, "n".to_string())))),
+        p::Term::App(name, args) => {
+            let unary_builtin = matches!(name.as_str(),
+                    "h" | "fst" | "snd" | "inv" | "pk"
+                    | "getMessage" | "get_rep" | "report")
+                || is_user_unary_fun(name.as_str());
+            let new_args: Option<Vec<_>> = args.iter().map(term_to_sapic_term).collect();
+            let mut new_args = new_args?;
+            if unary_builtin && new_args.len() > 1 {
+                let mut iter = new_args.into_iter().rev();
+                let last = iter.next()?;
+                let mut acc = last;
+                let pair_sym = tamarin_term::function_symbols::pair_sym();
+                for prev in iter {
+                    acc = f_app_no_eq(pair_sym.clone(), vec![prev, acc]);
+                }
+                new_args = vec![acc];
+            }
+            if name == "em" && new_args.len() == 2 {
+                let mut it = new_args.into_iter();
+                let a = it.next().unwrap();
+                let b = it.next().unwrap();
+                return Some(tamarin_term::builtin::emap(a, b));
+            }
+            let sym = NoEqSym::new(name.as_bytes().to_vec(), new_args.len(),
+                user_fun_privacy(name), user_fun_constructability(name));
+            Some(f_app_no_eq(sym, new_args))
+        }
+        p::Term::Pair(items) => {
+            let new_items: Option<Vec<_>> = items.iter().map(term_to_sapic_term).collect();
+            let new_items = new_items?;
+            let mut iter = new_items.into_iter().rev();
+            let last = iter.next()?;
+            let mut acc = last;
+            let sym = tamarin_term::function_symbols::pair_sym();
+            for prev in iter {
+                acc = f_app_no_eq(sym.clone(), vec![prev, acc]);
+            }
+            Some(acc)
+        }
+        p::Term::AlgApp(name, a, b) => {
+            let aa = term_to_sapic_term(a)?;
+            let bb = term_to_sapic_term(b)?;
+            let sym = NoEqSym::new(name.as_bytes().to_vec(), 2,
+                user_fun_privacy(name), user_fun_constructability(name));
+            Some(f_app_no_eq(sym, vec![aa, bb]))
+        }
+        p::Term::Diff(a, b) => {
+            let aa = term_to_sapic_term(a)?;
+            let bb = term_to_sapic_term(b)?;
+            let sym = NoEqSym::new(b"diff".to_vec(), 2,
+                Privacy::Public, Constructability::Constructor);
+            Some(f_app_no_eq(sym, vec![aa, bb]))
+        }
+        p::Term::BinOp(op, a, b) => {
+            let aa = term_to_sapic_term(a)?;
+            let bb = term_to_sapic_term(b)?;
+            match op {
+                p::BinOp::Mult => Some(f_app_ac(AcSym::Mult, vec![aa, bb])),
+                p::BinOp::Union => Some(f_app_ac(AcSym::Union, vec![aa, bb])),
+                p::BinOp::Xor => Some(f_app_ac(AcSym::Xor, vec![aa, bb])),
+                p::BinOp::NatPlus => Some(f_app_ac(AcSym::NatPlus, vec![aa, bb])),
+                p::BinOp::Exp => {
+                    let sym = NoEqSym::new(b"exp".to_vec(), 2,
+                        Privacy::Public, Constructability::Constructor);
+                    Some(f_app_no_eq(sym, vec![aa, bb]))
+                }
+            }
+        }
+        p::Term::PatMatch(_) => None,
+    }
+}
+
+/// `parser::Fact` → `SapicNFact<SapicLVar>` (`Fact<SapicTerm>`).  Mirrors
+/// `fact_to_lnfact` but over typed SAPIC terms.  The fact tag mapping is
+/// identical (`Fr`/`In`/`Out`/`KU`/`KD`/`Ded` → builtin tags, else ProtoFact).
+pub fn fact_to_sapic_fact(f: &p::Fact) -> Result<crate::sapic::SapicLNFact, ElabError> {
+    use crate::fact::{Fact, FactTag, Multiplicity};
+    let tag = match f.name.as_str() {
+        "Fr" => FactTag::Fresh,
+        "In" => FactTag::In,
+        "Out" => FactTag::Out,
+        "KU" => FactTag::Ku,
+        "KD" => FactTag::Kd,
+        "Ded" => FactTag::Ded,
+        _ => FactTag::Proto(
+            if f.persistent { Multiplicity::Persistent } else { Multiplicity::Linear },
+            f.name.clone(),
+            f.args.len(),
+        ),
+    };
+    let terms: Result<Vec<_>, _> = f.args.iter()
+        .map(|t| term_to_sapic_term(t).ok_or_else(||
+            ElabError { message: format!("could not elaborate term in fact `{}`", f.name) }))
+        .collect();
+    let mut fact = Fact::new(tag, terms?);
+    let mut anns: BTreeSet<crate::fact::FactAnnotation> = BTreeSet::new();
+    for ann in &f.annotations {
+        anns.insert(match ann {
+            p::FactAnnotation::SolveFirst => crate::fact::FactAnnotation::SolveFirst,
+            p::FactAnnotation::SolveLast => crate::fact::FactAnnotation::SolveLast,
+            p::FactAnnotation::NoSources => crate::fact::FactAnnotation::NoSources,
+        });
+    }
+    fact = fact.with_annotations(anns);
+    Ok(fact)
+}
+
+// =============================================================================
 // Builtin → MaudeSig
 // =============================================================================
 

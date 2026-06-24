@@ -19,5 +19,11 @@
 //! `Sapic.Warnings`, top-level `Sapic`.
 
 pub mod annotation;
+pub mod apply;
+pub mod base_translation;
 pub mod bindings;
+pub mod convert;
+pub mod facts;
 pub mod secret_channels;
+pub mod translate;
+pub mod typing;

@@ -734,6 +734,24 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             }
         }
 
+        // SAPIC `process:` translation (HS `typeTheory` → `translate`,
+        // TheoryLoader.hs:430).  Runs ONLY for `is_sapic` theories (exactly one
+        // top-level `process:`); a no-op otherwise, so non-process theories are
+        // byte-unchanged.  Injects the generated rules + `single_session`
+        // restriction + `heuristic: p` into BOTH `parsed` (for rendering) and
+        // `elaborated` (for solving / AC-variant pre-computation), so it MUST
+        // run before `populate_rule_variants` below.  `user_set_heuristic` is
+        // true iff a `heuristic:` item already populated `elaborated.heuristic`
+        // (HS `addHeuristic` returns `Nothing` in that case).
+        {
+            let user_set_heuristic = !elaborated.heuristic.is_empty();
+            tamarin_sapic::apply::apply_sapic(
+                &mut parsed, &mut elaborated, user_set_heuristic,
+            ).map_err(|e| RunError(format!(
+                "SAPIC translation error in {}: {}", in_file, e.message)))?;
+        }
+        phase!("sapic translate");
+
         // Spawn a single Maude handle for this file.  Used by:
         //   - the rule-variants computation that populates each rule's
         //     `variant_substs` + `abstracted_rule` (so the pretty-printer

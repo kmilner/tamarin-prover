@@ -122,6 +122,13 @@ pub fn fact_tag_name(t: &FactTag) -> String {
     }
 }
 
+/// `showFactTag` (Fact.hs:516-523): `factTagName` prefixed with `!` for
+/// persistent facts.
+pub fn show_fact_tag(t: &FactTag) -> String {
+    let prefix = if fact_tag_multiplicity(t) == Multiplicity::Persistent { "!" } else { "" };
+    format!("{}{}", prefix, fact_tag_name(t))
+}
+
 pub fn fact_tag_arity(t: &FactTag) -> usize {
     match t {
         FactTag::Proto(_, _, n) => *n,
