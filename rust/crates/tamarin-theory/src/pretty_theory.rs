@@ -523,6 +523,98 @@ fn render_equations(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<(crate::pret
     items
 }
 
+/// Port of HS `checkEquationsSubtermConvergence` (Wellformedness.hs:1222-1232).
+///
+/// HS works on `thyEquations thy = S.toList (stRules sig)` — the SIGNATURE's
+/// subterm-rule Set, NOT the parser-AST `equations:` blocks.  The parser-level
+/// `tamarin_parser::wf::subterm_convergence_report` approximates this on the
+/// parser AST but (a) keeps the source order rather than the `Ord CtxtStRule`
+/// Set order, and (b) renders each equation on a single flat line (no
+/// width-wrapping), because the `tamarin-parser` crate has no access to the
+/// HughesPJ engine.  This function — living in `tamarin-theory`, which has the
+/// elaborated `MaudeSig` plus the ported HughesPJ printer — reproduces HS
+/// byte-for-byte:
+///
+///   * order = `sig.st_rules` `BTreeSet` iteration = HS `S.toList` (derived
+///     `Ord CtxtStRule`), so e.g. `f1, f2, f3, g` rather than source order
+///     `f1, g, f2, f3`;
+///   * each equation = `prettyCtxtStRule r = sep [nest 2 lhs, "=" <-> rhs]`
+///     (SubtermRule.hs:122-123), rendered via `pf::term_doc` so a wide RHS
+///     wraps (HS `prettyTerm`'s `fsep` ppFun, Term.hs:295-296);
+///   * suppressed entirely when `eqConvergent (sig thy)` is set
+///     (`isUserMarkedConvergent`, Wellformedness.hs:1211/1285).
+///
+/// `run.rs` calls this AFTER elaboration and REPLACES the parser-level entry
+/// (same retain/re-add pattern used for "Message Derivation Checks").
+pub fn subterm_convergence_report_wf(
+    sig: &tamarin_term::maude_sig::MaudeSig,
+) -> Vec<tamarin_parser::wf::WfError> {
+    use tamarin_parser::wf::{underline_topic, WfError};
+    // HS: `if not (isUserMarkedConvergent thy) then checkEqs else []`
+    // (Wellformedness.hs:1285); `isUserMarkedConvergent thy = eqConvergent (sig thy)`.
+    if sig.eq_convergent {
+        return Vec::new();
+    }
+    // HS: `nonSubtermEquations = filterNonSubtermCtxtRule (thyEquations thy)`
+    // = filter (not . isSubtermConvergentCtxtRule) (S.toList (stRules sig)).
+    let non_conv: Vec<&tamarin_term::subterm_rule::CtxtStRule> = sig
+        .st_rules
+        .iter()
+        .filter(|r| !tamarin_term::subterm_rule::is_subterm_convergent(r))
+        .collect();
+    if non_conv.is_empty() {
+        return Vec::new();
+    }
+
+    // Equation list: `vcat (map prettyCtxtStRule nonSubtermEquations)`, each
+    // `sep [nest 2 lhs, "=" <-> rhs]`, all rendered inside prettyWfErrorReport's
+    // outer `nest 2`.  Build it as one HughesPJ Doc so the wrap decision +
+    // indentation are HS-exact.
+    //
+    // WIDTH: the WF report Doc is rendered by HS `addComment c = ... TextItem
+    // ("", render c)` (TheoryObject.hs:703), where `render = P.render` uses the
+    // HughesPJ DEFAULT style (`lineLength = 100`, `ribbonsPerLine = 1.5`,
+    // `ribbon = round (100 / 1.5) = 67`) — NOT the theory body's
+    // `renderDoc` width of 110/73 (Console.hs:236,392).  The pre-rendered
+    // string is then emitted verbatim inside the `/* ... */` comment.  So the
+    // equation list wraps at the 100/67 budget, e.g. `f3`/`f6` (inline width 73
+    // from column 4) wrap while `f2` (66) stays inline.  This is a SEPARATE
+    // width from the `equations:` block, which is part of the theory body and
+    // renders at 110/73.
+    const WF_LINE_LENGTH: usize = 100;
+    const WF_RIBBON: usize = 67; // round(100 / 1.5)
+    let eq_lines = {
+        use crate::pretty_hpj::{self as hpj, Doc};
+        let docs: Vec<Doc> = non_conv
+            .iter()
+            .map(|r| {
+                let lhs = pf::term_doc(&lnterm_to_parser(&r.lhs)).nest(2);
+                let rhs = pf::term_doc(&lnterm_to_parser(&r.rhs.term));
+                let eq_doc = Doc::text("=").beside_sp(rhs);
+                hpj::sep(vec![lhs, eq_doc])
+            })
+            .collect();
+        // Outer `nest 2` from prettyWfErrorReport `(nest 2 . vcat ...)`.
+        let mut s = hpj::vcat(docs).nest(2).render_with(WF_LINE_LENGTH, WF_RIBBON);
+        s.push('\n');
+        s
+    };
+
+    // Assemble the full message block (topic header + intro + equations +
+    // footer) — byte-identical to the parser-level version, only `eq_lines`
+    // differs (proper order + width-wrap).
+    let mut msg = String::new();
+    msg.push_str(&underline_topic("Subterm Convergence Warning"));
+    msg.push('\n'); // blank line before intro (HS `$-$`)
+    msg.push_str("  User-defined equations must be convergent and have the finite variant property. The following equations are not subterm convergent. If you are sure that the set of equations is nevertheless convergent and has the finite variant property, you can ignore this warning and continue \n");
+    msg.push('\n'); // blank line after intro (HS `$-$` before vcat)
+    msg.push_str(&eq_lines);
+    // HS: `$-$ text " \n For more information..."` — note the leading space.
+    msg.push_str("   \n For more information, please refer to the manual : https://tamarin-prover.com/manual/master/book/010_modeling-issues.html ");
+
+    vec![WfError::new("Subterm Convergence Warning", msg)]
+}
+
 /// HS `ppNonEmptyList' name pp xs = (keyword_ name <->) . fsep $
 /// punctuate comma (map pp xs)` (Term/Maude/Signature.hs:229-231).
 /// `<->` is HughesPJ `<+>` (beside-with-space), and `fsep` is the

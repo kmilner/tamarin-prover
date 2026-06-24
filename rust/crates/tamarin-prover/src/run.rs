@@ -642,6 +642,22 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         })?;
         phase!("elaborate");
         let maude_sig = elaborated.signature.maude_sig.clone();
+
+        // HS `checkEquationsSubtermConvergence` (Wellformedness.hs:1222-1232)
+        // works on `thyEquations = S.toList (stRules sig)` — the SIGNATURE's
+        // subterm-rule Set, not the parser-AST `equations:` blocks.  The
+        // parser-level `check_theory` produced a placeholder entry from the AST
+        // (source order, no width-wrap); replace it with the signature-driven,
+        // HughesPJ-rendered version now that the `MaudeSig` is available.  This
+        // mirrors HS exactly: `Ord CtxtStRule` Set order (e.g. f1, f2, f3, g
+        // rather than source order f1, g, f2, f3) and `prettyCtxtStRule`'s
+        // `sep [nest 2 lhs, "=" <-> rhs]` width-wrap for wide equations.
+        // (Same retain/re-add pattern as the "Message Derivation Checks" swap.)
+        wf_report.retain(|e| e.topic != "Subterm Convergence Warning");
+        wf_report.extend(
+            tamarin_theory::pretty_theory::subterm_convergence_report_wf(&maude_sig),
+        );
+
         // HS emits this marker after `translateTheory` finishes
         // (TheoryLoader.hs:454).
         if !args.quiet && !args.parse_only {
