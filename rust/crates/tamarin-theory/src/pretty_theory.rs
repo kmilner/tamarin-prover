@@ -242,6 +242,7 @@ pub fn pretty_closed_theory(
     wf_block: &str,
     build: &BuildInfo,
     in_file: &str,
+    auto_sources: bool,
 ) -> String {
     let mut out = String::new();
 
@@ -342,8 +343,12 @@ pub fn pretty_closed_theory(
     // it through to every per-item renderer rather than recomputing (and
     // re-cloning the signature) for each rule/lemma/restriction/predicate.
     let arity1 = arity1_noeq_names(elaborated);
+    // HS `prettyClosedTheory` (ClosedTheory.hs:383) switches the WHOLE theory
+    // to the open-as-closed renderer when `containsManualRuleVariants` holds,
+    // which suppresses loop-breaker comments on trivial-AC-variant rules.
+    let manual_variants = contains_manual_rule_variants(parsed, elaborated, auto_sources);
     let rendered: Vec<Option<String>> = parsed.items.par_iter()
-        .map(|item| render_parsed_item(item, &macros, &predicates, elaborated, proved, in_file, &arity1))
+        .map(|item| render_parsed_item(item, &macros, &predicates, elaborated, proved, in_file, &arity1, manual_variants, auto_sources))
         .collect();
     for b in rendered.into_iter().flatten() {
         out.push('\n');
@@ -499,14 +504,115 @@ fn render_fun_syms(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<String> {
 /// HS's `S.toList` exactly.  We must NOT re-sort by the rendered pretty-string,
 /// since that diverges from the structural (term-tree) order (e.g. AC products
 /// pretty-print with a leading `(`, `exp` as infix `a^b`).
-fn render_equations(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<(String, String)> {
-    let mut items: Vec<(String, String)> = Vec::new();
+///
+/// Each side is returned as a HughesPJ `Doc` (not a flat string) so that wide
+/// function applications wrap at the ribbon width exactly as HS
+/// `prettyCtxtStRule`/`prettyLNTerm` (SubtermRule.hs:122-123, Term.hs:295-296)
+/// — the `ppFun f ts = text (f++"(") <> fsep (punctuate comma …) <> ")"` `fsep`
+/// breaks at argument boundaries when the term overruns.  We reach the Doc path
+/// by converting the `LNTerm` to a parser-AST `p::Term` (`lnterm_to_parser`,
+/// the same conversion already used elsewhere) and rendering it through
+/// `pf::term_doc` (= HS `prettyTerm`).
+fn render_equations(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<(crate::pretty_hpj::Doc, crate::pretty_hpj::Doc)> {
+    let mut items = Vec::new();
     for r in &sig.st_rules {
-        let lhs = render_lnterm(&r.lhs);
-        let rhs = render_lnterm(&r.rhs.term);
+        let lhs = pf::term_doc(&lnterm_to_parser(&r.lhs));
+        let rhs = pf::term_doc(&lnterm_to_parser(&r.rhs.term));
         items.push((lhs, rhs));
     }
     items
+}
+
+/// Port of HS `checkEquationsSubtermConvergence` (Wellformedness.hs:1222-1232).
+///
+/// HS works on `thyEquations thy = S.toList (stRules sig)` — the SIGNATURE's
+/// subterm-rule Set, NOT the parser-AST `equations:` blocks.  The parser-level
+/// `tamarin_parser::wf::subterm_convergence_report` approximates this on the
+/// parser AST but (a) keeps the source order rather than the `Ord CtxtStRule`
+/// Set order, and (b) renders each equation on a single flat line (no
+/// width-wrapping), because the `tamarin-parser` crate has no access to the
+/// HughesPJ engine.  This function — living in `tamarin-theory`, which has the
+/// elaborated `MaudeSig` plus the ported HughesPJ printer — reproduces HS
+/// byte-for-byte:
+///
+///   * order = `sig.st_rules` `BTreeSet` iteration = HS `S.toList` (derived
+///     `Ord CtxtStRule`), so e.g. `f1, f2, f3, g` rather than source order
+///     `f1, g, f2, f3`;
+///   * each equation = `prettyCtxtStRule r = sep [nest 2 lhs, "=" <-> rhs]`
+///     (SubtermRule.hs:122-123), rendered via `pf::term_doc` so a wide RHS
+///     wraps (HS `prettyTerm`'s `fsep` ppFun, Term.hs:295-296);
+///   * suppressed entirely when `eqConvergent (sig thy)` is set
+///     (`isUserMarkedConvergent`, Wellformedness.hs:1211/1285).
+///
+/// `run.rs` calls this AFTER elaboration and REPLACES the parser-level entry
+/// (same retain/re-add pattern used for "Message Derivation Checks").
+pub fn subterm_convergence_report_wf(
+    sig: &tamarin_term::maude_sig::MaudeSig,
+) -> Vec<tamarin_parser::wf::WfError> {
+    use tamarin_parser::wf::{underline_topic, WfError};
+    // HS: `if not (isUserMarkedConvergent thy) then checkEqs else []`
+    // (Wellformedness.hs:1285); `isUserMarkedConvergent thy = eqConvergent (sig thy)`.
+    if sig.eq_convergent {
+        return Vec::new();
+    }
+    // HS: `nonSubtermEquations = filterNonSubtermCtxtRule (thyEquations thy)`
+    // = filter (not . isSubtermConvergentCtxtRule) (S.toList (stRules sig)).
+    let non_conv: Vec<&tamarin_term::subterm_rule::CtxtStRule> = sig
+        .st_rules
+        .iter()
+        .filter(|r| !tamarin_term::subterm_rule::is_subterm_convergent(r))
+        .collect();
+    if non_conv.is_empty() {
+        return Vec::new();
+    }
+
+    // Equation list: `vcat (map prettyCtxtStRule nonSubtermEquations)`, each
+    // `sep [nest 2 lhs, "=" <-> rhs]`, all rendered inside prettyWfErrorReport's
+    // outer `nest 2`.  Build it as one HughesPJ Doc so the wrap decision +
+    // indentation are HS-exact.
+    //
+    // WIDTH: the WF report Doc is rendered by HS `addComment c = ... TextItem
+    // ("", render c)` (TheoryObject.hs:703), where `render = P.render` uses the
+    // HughesPJ DEFAULT style (`lineLength = 100`, `ribbonsPerLine = 1.5`,
+    // `ribbon = round (100 / 1.5) = 67`) — NOT the theory body's
+    // `renderDoc` width of 110/73 (Console.hs:236,392).  The pre-rendered
+    // string is then emitted verbatim inside the `/* ... */` comment.  So the
+    // equation list wraps at the 100/67 budget, e.g. `f3`/`f6` (inline width 73
+    // from column 4) wrap while `f2` (66) stays inline.  This is a SEPARATE
+    // width from the `equations:` block, which is part of the theory body and
+    // renders at 110/73.
+    const WF_LINE_LENGTH: usize = 100;
+    const WF_RIBBON: usize = 67; // round(100 / 1.5)
+    let eq_lines = {
+        use crate::pretty_hpj::{self as hpj, Doc};
+        let docs: Vec<Doc> = non_conv
+            .iter()
+            .map(|r| {
+                let lhs = pf::term_doc(&lnterm_to_parser(&r.lhs)).nest(2);
+                let rhs = pf::term_doc(&lnterm_to_parser(&r.rhs.term));
+                let eq_doc = Doc::text("=").beside_sp(rhs);
+                hpj::sep(vec![lhs, eq_doc])
+            })
+            .collect();
+        // Outer `nest 2` from prettyWfErrorReport `(nest 2 . vcat ...)`.
+        let mut s = hpj::vcat(docs).nest(2).render_with(WF_LINE_LENGTH, WF_RIBBON);
+        s.push('\n');
+        s
+    };
+
+    // Assemble the full message block (topic header + intro + equations +
+    // footer) — byte-identical to the parser-level version, only `eq_lines`
+    // differs (proper order + width-wrap).
+    let mut msg = String::new();
+    msg.push_str(&underline_topic("Subterm Convergence Warning"));
+    msg.push('\n'); // blank line before intro (HS `$-$`)
+    msg.push_str("  User-defined equations must be convergent and have the finite variant property. The following equations are not subterm convergent. If you are sure that the set of equations is nevertheless convergent and has the finite variant property, you can ignore this warning and continue \n");
+    msg.push('\n'); // blank line after intro (HS `$-$` before vcat)
+    msg.push_str(&eq_lines);
+    // HS: `$-$ text " \n For more information..."` — note the leading space.
+    msg.push_str("   \n For more information, please refer to the manual : https://tamarin-prover.com/manual/master/book/010_modeling-issues.html ");
+
+    vec![WfError::new("Subterm Convergence Warning", msg)]
 }
 
 /// HS `ppNonEmptyList' name pp xs = (keyword_ name <->) . fsep $
@@ -537,7 +643,12 @@ fn wrap_with_lead<S: AsRef<str>>(lead: &str, items: &[S]) -> String {
 /// further 2, yielding the 4-space indent HS emits.  Reproducing that requires
 /// the structured doc, not a pre-joined `lhs = rhs` string.  Route through the
 /// ported HughesPJ engine so the break decision and indentation are HS-exact.
-fn sep_block_with_lead(lead: &str, items: &[(String, String)]) -> String {
+///
+/// `items` carries the LHS/RHS as already-built term `Doc`s (HS `prettyLNTerm`)
+/// so the inner function-application `fsep` wrapping survives — passing flat
+/// strings would defeat the engine and emit over-long single lines for wide
+/// equations (e.g. BP `idverify(idsign(…), m, IBPub(…))`).
+fn sep_block_with_lead(lead: &str, items: &[(crate::pretty_hpj::Doc, crate::pretty_hpj::Doc)]) -> String {
     use crate::pretty_hpj::{self as hpj, Doc};
     if items.is_empty() { return String::new(); }
     let n = items.len();
@@ -545,8 +656,8 @@ fn sep_block_with_lead(lead: &str, items: &[(String, String)]) -> String {
     docs.push(Doc::text(lead));
     for (i, (lhs, rhs)) in items.iter().enumerate() {
         // prettyCtxtStRule: sep [ nest 2 lhs, "=" <-> rhs ]
-        let lhs_doc = Doc::text(lhs).nest(2);
-        let eq_doc = Doc::text("=").beside_sp(Doc::text(rhs));
+        let lhs_doc = lhs.clone().nest(2);
+        let eq_doc = Doc::text("=").beside_sp(rhs.clone());
         let mut d = hpj::sep(vec![lhs_doc, eq_doc]);
         if i + 1 < n {
             d = d.beside(Doc::char(','));
@@ -560,6 +671,7 @@ fn sep_block_with_lead(lead: &str, items: &[(String, String)]) -> String {
 // Item dispatch
 // =============================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn render_parsed_item(
     item: &p::TheoryItem,
     macros: &[p::Macro],
@@ -568,6 +680,8 @@ fn render_parsed_item(
     proved: &[ProvedLemma],
     in_file: &str,
     arity1: &std::collections::HashSet<String>,
+    manual_variants: bool,
+    auto_sources: bool,
 ) -> Option<String> {
     use p::TheoryItem::*;
     // `macros` is collected once by the caller (mirrors HS
@@ -585,14 +699,20 @@ fn render_parsed_item(
             // closed theory and never rendered.  Such rules are removed
             // from the elaborated theory in run.rs; mirror the absence here.
             if elab.rules().any(|er| er.name() == r.name) {
-                Some(render_rule(r, elab, macros, arity1))
+                Some(render_rule(r, elab, macros, arity1, manual_variants, auto_sources))
             } else {
                 None
             }
         }
         IntrRule(_) => None,
         Lemma(l) => Some(render_parsed_lemma(l, macros, predicates, proved, in_file, elab, arity1)),
-        Restriction(r) => Some(render_parsed_restriction(r, macros, predicates, elab, arity1)),
+        // HS treats the deprecated `axiom` keyword as a synonym for
+        // `restriction` (`liftedAddRestriction`; the legacy `axiom`/`Axiom` is
+        // parsed and rendered as a `restriction`). RS already elaborates
+        // `LegacyAxiom` as a restriction for solving; render it the same so the
+        // deprecated-`axiom` blocks (e.g. the thesis-evoting auth models) emit
+        // their `restriction <name>:` blocks instead of being dropped.
+        Restriction(r) | LegacyAxiom(r) => Some(render_parsed_restriction(r, macros, predicates, elab, arity1)),
         Predicates(preds) => {
             // HS `prettyTheory` folds each `PredicateItem` through
             // `prettyPredicate` (TheoryObject.hs:764, 802-806):
@@ -647,7 +767,7 @@ fn render_parsed_item(
             let mut active: Vec<&p::TheoryItem> = then_items.iter().collect();
             if let Some(else_b) = else_items { active.extend(else_b.iter()); }
             let blocks: Vec<String> = active.iter()
-                .filter_map(|it| render_parsed_item(it, macros, predicates, elab, proved, in_file, arity1))
+                .filter_map(|it| render_parsed_item(it, macros, predicates, elab, proved, in_file, arity1, manual_variants, auto_sources))
                 .collect();
             if blocks.is_empty() { None } else { Some(blocks.join("\n\n")) }
         }
@@ -664,6 +784,86 @@ fn render_parsed_item(
 /// `naryOpApp`'s `k == 1` tuple-folding (Theory/Text/Parser/Term.hs:58-93).
 fn arity1_noeq_names(elab: &Theory) -> std::collections::HashSet<String> {
     crate::elaborate::arity1_noeq_names(elab.signature.maude_sig())
+}
+
+/// HS `openProtoRule` (Rule.hs:65-72) returns `OpenProtoRule ruE ruleAC`
+/// where `ruleAC = []` iff `equalUpToTerms cprRuleAC cprRuleE` (i.e. the
+/// closed rule's AC and E forms agree on fact TAGS + lengths,
+/// Theory/Model/Rule.hs:887-895), else `ruleAC = [cprRuleAC]`.
+///
+/// `containsManualRuleVariants` (OpenTheory.hs:584-589) is True iff some
+/// (merged) rule has a non-empty `ruleAC` — i.e. some rule's `openProtoRule`
+/// yields the `[cprRuleAC]` branch.  `prettyClosedTheory`
+/// (ClosedTheory.hs:383) uses that to switch the WHOLE theory to the
+/// "open-as-closed" renderer `prettyOpenProtoRuleAsClosedRule`
+/// (OpenTheory.hs:827-851), which — for the `OpenProtoRule ruE []` (empty)
+/// branch — emits NO `prettyLoopBreakers` line ("cannot show loop breakers
+/// here, as we do not have the information"), whereas the
+/// `OpenProtoRule _ [ruAC]` (non-empty) branch KEEPS the loop breakers.
+///
+/// This predicate is RS's per-rule mirror of "would `openProtoRule` yield a
+/// non-empty `ruleAC`":
+///   * Manual variants: a parsed `variants (modulo AC)` block on the input
+///     rule produces `OpenProtoRule ruE (non-empty)` directly — always
+///     counts, with or without `--auto-sources`.
+///   * `--auto-sources`: `closeTheoryWithMaude` adds the synthetic
+///     `AUTO_IN_*`/`AUTO_OUT_*` action facts to `cprRuleAC` ONLY (NOT
+///     `cprRuleE` — `addActionClosedProtoRule`, Rule.hs:186-189), so an
+///     AUTO-annotated rule has AC ≠ E up to fact tags → `equalUpToTerms`
+///     False → non-empty `ruleAC`.  AC-variant substitution itself never
+///     changes a fact's TAG, so the AUTO action is the only operation that
+///     makes `equalUpToTerms` False here; "the elaborated rule carries an
+///     `AUTO_*` action" is therefore exactly the auto-path discriminant.
+///
+/// Used both to compute the theory-level gate (OR over all rules) and, in
+/// `render_rule`, to decide whether a trivial-AC-variant rule keeps or drops
+/// its loop-breaker comment under the open renderer.
+fn rule_open_ac_nonempty(
+    parsed_rule: &p::Rule,
+    elab_rule: Option<&crate::theory::OpenProtoRule>,
+    auto_sources: bool,
+) -> bool {
+    // Manual `variants (modulo AC)` block on the input rule.
+    if !parsed_rule.variants.is_empty() {
+        return true;
+    }
+    if !auto_sources {
+        // Non-auto path: HS does NOT unfold computed variants, and every
+        // closed rule's AC form agrees with its E form up to terms, so
+        // `openProtoRule` is always the empty branch.  Computed AC variants
+        // do not count.
+        return false;
+    }
+    // Auto path: the rule's AC form differs from its E form up to tags iff it
+    // received an `AUTO_*` action.
+    match elab_rule {
+        None => false,
+        Some(r) => r.rule.actions.iter().any(|f| {
+            matches!(&f.tag, crate::fact::FactTag::Proto(_, name, _)
+                if name.starts_with("AUTO_IN_") || name.starts_with("AUTO_OUT_"))
+        }),
+    }
+}
+
+/// HS `containsManualRuleVariants mergedRules` (OpenTheory.hs:584-589) as
+/// computed by `prettyClosedTheory` (ClosedTheory.hs:383, 402): True iff any
+/// rule's `openProtoRule` yields a non-empty AC list.  See
+/// [`rule_open_ac_nonempty`].  When True the theory renders via the
+/// open-as-closed path, which suppresses loop-breaker comments on
+/// trivial-AC-variant rules whose AC form equals their E form.
+fn contains_manual_rule_variants(
+    parsed: &p::Theory,
+    elaborated: &Theory,
+    auto_sources: bool,
+) -> bool {
+    parsed.items.iter().any(|item| {
+        if let p::TheoryItem::Rule(r) = item {
+            let elab_rule = elaborated.rules().find(|er| er.name() == r.name);
+            rule_open_ac_nonempty(r, elab_rule, auto_sources)
+        } else {
+            false
+        }
+    })
 }
 
 /// Apply the arity-1 surplus-arg pair-fold (HS `naryOpApp` `k == 1`,
@@ -805,7 +1005,7 @@ fn render_rule_attributes(attrs: &[p::RuleAttr]) -> String {
     if parts.is_empty() { String::new() } else { format!("[{}]", parts.join(", ")) }
 }
 
-fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro], arity1: &std::collections::HashSet<String>) -> String {
+fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro], arity1: &std::collections::HashSet<String>, manual_variants: bool, auto_sources: bool) -> String {
     let name = &parsed_rule.name;
     let mut out = String::new();
     // HS rule-header line (`prettyNamedRule`, Model/Rule.hs:1285):
@@ -956,9 +1156,28 @@ fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro], arity1
     // `multiComment_` (trivial) or `multiComment (prettyProtoRuleAC ...)`
     // (non-trivial) block.  We emit the same `  // loop breaker: [<n>]`
     // / `  // loop breakers: [<n>,<m>]` line here when non-empty.
-    let outer_loop_breaker = elab_rule
-        .map(|r| render_loop_breakers_line(&r.loop_breakers, 2))
-        .unwrap_or_default();
+    //
+    // HS gate (ClosedTheory.hs:383): when `containsManualRuleVariants` holds
+    // the whole theory renders via `prettyOpenProtoRuleAsClosedRule`
+    // (OpenTheory.hs:827-851).  Its trivial-AC-variant branch
+    // `(OpenProtoRule ruE [])` (OpenTheory.hs:828-835) shows NO loop-breaker
+    // line ("cannot show loop breakers here, as we do not have the
+    // information"), while the `(OpenProtoRule _ [ruAC])` branch
+    // (OpenTheory.hs:836-843) KEEPS them.  A rule lands in the empty branch
+    // iff its `openProtoRule` AC list is empty — see `rule_open_ac_nonempty`.
+    // So under the gate, suppress the loop-breaker comment on a
+    // trivial-AC-variant rule whose AC form equals its E form (no manual
+    // variants, no AUTO action).  Without the gate the closed renderer
+    // (`prettyClosedProtoRule`) always shows them — unchanged.
+    let open_ac_nonempty = rule_open_ac_nonempty(parsed_rule, elab_rule, auto_sources);
+    let show_loop_breakers = !manual_variants || open_ac_nonempty;
+    let outer_loop_breaker = if show_loop_breakers {
+        elab_rule
+            .map(|r| render_loop_breakers_line(&r.loop_breakers, 2))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     if trivial {
         out.push_str("\n\n");
         out.push_str(&outer_loop_breaker);
@@ -1608,7 +1827,17 @@ fn render_predicate(pr: &p::Predicate, arity1: &std::collections::HashSet<String
     // HS `render` lays each sub-doc out at width 110 from column 0 (factstr and
     // formulastr are rendered INDEPENDENTLY, then concatenated as plain text),
     // so route the formula through the Doc engine starting at column 0.
-    let factstr = reparse_fact_doc(&fact).render();
+    //
+    // Render the predicate fact DIRECTLY (`fact_doc`), NOT via
+    // `reparse_fact_doc`.  HS `prettyPredicate` (TheoryObject.hs:802-806) calls
+    // `prettyFact prettyLVar (pFact p)`, where each formal-arg `LVar` carries
+    // its sort and `prettyLVar` renders the sigil (`#time` for an `LSortNode`
+    // arg).  A predicate's args come from the real term parser (`self.term`),
+    // so they are proper sorted `Var`s already.  `reparse_fact_doc` is meant
+    // for proof-tree facts whose args `build_fact` stuffs into `Var` *names* as
+    // raw text; re-parsing a sorted formal arg from its bare `name` drops the
+    // sigil (`#time` → `time`).  Going through `fact_doc` preserves the sort.
+    let factstr = pf::fact_doc(&fact).render();
     let formulastr = pf::pretty_formula_wrapped(&formula, 0);
     format!("predicate: {}<=>{}", factstr, formulastr)
 }

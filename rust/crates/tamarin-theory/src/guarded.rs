@@ -1490,6 +1490,39 @@ fn cac_rec_term_cow(t: &GTerm, cmp: GCmp) -> Option<GTerm> {
         GTerm::Var(_) | GTerm::PubLit(_) | GTerm::FreshLit(_)
         | GTerm::NatLit(_) | GTerm::Number(_) | GTerm::NumberOne
         | GTerm::NatOne | GTerm::DhNeutral => None,
+        // `em(a, b)` is the sole COMMUTATIVE (C) function symbol (EMap,
+        // bilinear pairing).  HS stores every C application in sorted-arg
+        // form: `fAppC nacsym as = FAPP (C nacsym) (sort as)` (Raw.hs:132-133;
+        // `fAppEMap (x,y) = fAppC EMap [x,y]`, Term.hs:146).  So in HS
+        // `em('P', x)` and `em(x, 'P')` are byte-identical, and the
+        // structural `S.member sSolvedFormulas` guard in `insertImpliedFormulas`
+        // always matches a re-derived instance against the solved one.
+        //
+        // RS's guarded canonicalisation previously sorted only AC operators
+        // (`Mult/Union/Xor/NatPlus`) and left C-symbol `em` args in whatever
+        // order substitution produced them.  After a reuse-lemma's abstract
+        // key var `s` is bound (e.g. `s ↦ KDF(em('P', ini_share)^…)`),
+        // `substSolvedFormulas` rewrote the solved disjunction with one `em`
+        // arg order while a fresh `impliedFormulas` match against the
+        // `Secret('KEY', …)` action produced the other order — so the
+        // `solved_formulas` dedup failed and RS re-inserted (and re-solved)
+        // a disjunction HS had already discharged.  This is the
+        // idbased/BP_IBS bilinear divergence (extra `secrecy_session_key`
+        // reuse-lemma instance after `splitEqs`).  Mirror HS: sort `em`'s two
+        // args here so both sides canonicalise to the same form.
+        GTerm::App(n, args) if &**n == "em" && args.len() == 2 => {
+            let a2 = cac_rec_term(&args[0], cmp);
+            let b2 = cac_rec_term(&args[1], cmp);
+            let (first, second) = if cmp(&a2, &b2) != std::cmp::Ordering::Greater {
+                (a2, b2)
+            } else {
+                (b2, a2)
+            };
+            let sorted: std::sync::Arc<[GTerm]> = std::sync::Arc::from(vec![first, second]);
+            // Reuse the input only when the children were unchanged AND
+            // already in sorted order (byte-identical to the rebuilt form).
+            if sorted.as_ref() == args.as_ref() { None } else { Some(GTerm::App(n.clone(), sorted)) }
+        }
         GTerm::App(n, args) =>
             cac_rec_slice(args, cmp).map(|new| GTerm::App(n.clone(), new)),
         GTerm::Pair(args) =>
@@ -3046,5 +3079,52 @@ mod tests {
         let expected = gconj(vec![gnot(&a), gnot(&b)]);
         assert_eq!(neg, expected,
             "De Morgan: ¬(a ∨ b) = ¬a ∧ ¬b — required for IH derivation");
+    }
+
+    /// `em` is the sole commutative (C) function symbol; HS stores it in
+    /// sorted-arg form (`fAppC EMap (sort [a,b])`).  `canonicalize_ac_in_guarded`
+    /// must sort the two `em` args so a substituted solved-formula and a
+    /// freshly-derived implied-formula over the same pairing compare equal —
+    /// otherwise `insertImpliedFormulas` re-fires a discharged reuse-lemma
+    /// disjunction (the idbased/BP_IBS bilinear divergence).
+    #[test]
+    fn canonicalize_sorts_commutative_em_args() {
+        use std::sync::Arc;
+        // Build em(x, 'P') — var-before-pub, i.e. NON-canonical, since
+        // constants sort before variables in cmp_term.
+        let x = GTerm::Var(BVar::Free(p::VarSpec {
+            name: "x".into(), idx: 0, sort: p::SortHint::Msg, typ: None,
+        }));
+        let p_lit = GTerm::PubLit("P".into());
+        let em_unsorted = GTerm::App(
+            Arc::from("em"),
+            Arc::from(vec![x.clone(), p_lit.clone()]));
+        let em_sorted = GTerm::App(
+            Arc::from("em"),
+            Arc::from(vec![p_lit.clone(), x.clone()]));
+        // Wrap each in an Eq atom inside a trivial guarded formula so we
+        // exercise the real `canonicalize_ac_in_guarded` entry point.
+        let mk = |t: &GTerm| Guarded::Atom(GAtom::Eq(
+            t.clone(), GTerm::PubLit("z".into())));
+        let canon_unsorted = canonicalize_ac_in_guarded(&mk(&em_unsorted));
+        let canon_sorted = canonicalize_ac_in_guarded(&mk(&em_sorted));
+        // Both must canonicalise to the sorted form, hence be equal.
+        assert_eq!(canon_unsorted, canon_sorted,
+            "em(x,'P') and em('P',x) must canonicalise to the same form");
+        assert_eq!(canon_unsorted, mk(&em_sorted),
+            "em args must be sorted to (pub, var) = ('P', x)");
+        // Also exercise em nested under exp(em(...), m) — the BP_IBS shape.
+        let exp_unsorted = GTerm::BinOp(
+            p::BinOp::Exp,
+            Arc::new(em_unsorted.clone()),
+            Arc::new(x.clone()));
+        let exp_sorted = GTerm::BinOp(
+            p::BinOp::Exp,
+            Arc::new(em_sorted.clone()),
+            Arc::new(x.clone()));
+        assert_eq!(
+            canonicalize_ac_in_guarded(&mk(&exp_unsorted)),
+            canonicalize_ac_in_guarded(&mk(&exp_sorted)),
+            "em nested under exp must also have its args sorted");
     }
 }

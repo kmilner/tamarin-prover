@@ -1225,7 +1225,24 @@ fn saturate_sources_with_simp_opt(
     // saturation mechanism, matching HS architecturally — there is no
     // separate chain-fold pre-step (which would materialise branched
     // cases HS only explores lazily inside the Disj monad).
-    for _iter_n in 0..limit {
+    //
+    // ITERATION COUNT — HS applies `refineSource` up to `limit + 1` times
+    // when changes persist (Sources.hs:479-498).  HS's `go ths n` computes
+    // `ths' = refineSource ths` in its `where` at EVERY call, then:
+    //   - guard1 `any changes && n <= limit` → recurse `go ths' (n+1)`;
+    //   - guard2 `n > limit`                 → return `ths'` (the final
+    //     refinement computed at the n = limit+1 call).
+    // So with the default limit=5 and never-converging sources, the
+    // recursion runs n=1..5 (5 refinements) THEN makes one more `go` call
+    // at n=6 whose `where` computes a 6th `refineSource` and returns it via
+    // guard2.  Net: 6 = limit+1 refinements.  Our loop must therefore run
+    // `limit + 1` iterations (the early `break` on `!changed` below already
+    // mirrors HS's `otherwise` branch returning `ths'` on convergence, so
+    // the extra pass only fires when changes never stop — exactly HS's
+    // behaviour).  Looping only `limit` times left chaum_offline_anonymity's
+    // Ku(sign) source one refinement short (29 vs HS's 33 cases), dropping
+    // the deepest nested-blind C_2 source cases.
+    for _iter_n in 0..=limit {
         // Haskell-faithful `goodTh` filter (Sources.hs:380-381):
         //
         //   goodTh th = length (getDisj (get cdCases th)) <= 1
@@ -2552,7 +2569,11 @@ pub fn solve_with_source_cases_ctx(
     let mut out: Vec<(String, System)> = Vec::new();
     let mut all_attempted: Vec<(String, bool)> = Vec::new();
     for (name, case_sys) in src.cases(ctx) {
-        let case_label = saturated_chain_root(&name);
+        // HS-faithful: use the stored (already-`combine`d, `_`-joined)
+        // case name verbatim — never re-split on `_`.  See the note at
+        // the action-goal call site above re: the removed
+        // `saturated_chain_root` mangling of underscore-bearing symbols.
+        let case_label = name.clone();
         let applied_arms = apply_source_case_premise(
             ctx, sys, src, &case_sys,
             goal_node, goal_prem_idx, fa_prem,
@@ -2946,7 +2967,14 @@ pub fn solve_with_source_cases_action_with_ctx(
         // ----------------------------------------------------------------
         let mut refine_arms: Vec<(String, RefineArm)> = Vec::new();
         for (name, case_sys) in cases_iter {
-            let case_label = saturated_chain_root(&name);
+            // HS-faithful: the stored case name is ALREADY the final
+            // display name — `refineSource` applied `combine` (Sources.hs
+            // :135-139) and the list was joined via `intercalate "_"`
+            // (ProofMethod.hs:511).  HS NEVER re-splits a name on `_`, so
+            // we must use it verbatim.  (A previous `saturated_chain_root`
+            // string-splitter mangled `c_KDF_SKc` → `SKc` for any function
+            // symbol whose name contains an underscore.)
+            let case_label = name.clone();
             if dbg_rt { all_names.push(case_label.clone()); }
             // Haskell-faithful `applySource` path: matches the live goal
             // against the source's ABSTRACT `cdGoal` (`src.goal`) — NOT a
@@ -3021,7 +3049,9 @@ pub fn solve_with_source_cases_action_with_ctx(
         // (the saturate-time `saturate_out_premise` path's own
         // `refine_one_source` already deduplicates).
         for (name, case_sys) in cases_iter {
-            let case_label = saturated_chain_root(&name);
+            // HS-faithful: stored case name is already final; use verbatim
+            // (no `_`-splitting).  See note at the action-goal call site.
+            let case_label = name.clone();
             if dbg_rt { all_names.push(case_label.clone()); }
             let renamed = freshen_system(&case_sys, avoid_max, ctx_opt.map(|c| &c.maude));
             let abstract_renamed = {
@@ -3104,100 +3134,17 @@ fn combine_case_names_list(existing: &[String], new_names: &[String]) -> Vec<Str
     }
 }
 
-/// Extract the chain-root case name from a saturated source-case name.
-/// Names are built by `saturate_out_premise` appending `_<producer>`
-/// for each fold:
-///
-///   "coerce_case_1_A"        → "A"        (legacy: case-marker form)
-///   "coerce_irecv_SendBoth"  → "SendBoth" (post-chain-extension form)
-///   "coerce_irecv"           → "irecv"    (un-folded leaf)
-///   "c_fresh"                → "c_fresh"  (no chain, single rule)
-///   "coerce"                 → "coerce"   (un-folded)
-///
-/// The strategy:
-///   1. Strip a leading `_case_<n>_` segment if present (legacy).
-///   2. Strip leading intruder-rule prefixes (`coerce_`, `irecv_`,
-///      `ipub_`, `isend_`, `c_<sym>_`) — the chain's interior intruder
-///      hops.  Remaining head is the protocol producer (or the last
-///      intruder if no protocol producer was reached).
-///   3. Strip a trailing `_case_<N>` suffix — saturate appends this to
-///      disambiguate multiple closures of the same sub-rule chain; the
-///      runtime renderer re-derives the disambiguation, so the suffix
-///      is dropped here to match HS's `Alice` vs `Alice_case_1` layout.
-fn saturated_chain_root(name: &str) -> String {
-    // Step 1: legacy `_case_<n>_` stripping.
-    let bytes = name.as_bytes();
-    let mut best_end = 0usize;
-    let mut i = 0;
-    while i + 6 < bytes.len() {
-        if &bytes[i..i+6] == b"_case_" {
-            let mut j = i + 6;
-            while j < bytes.len() && bytes[j].is_ascii_digit() { j += 1; }
-            if j > i + 6 && j < bytes.len() && bytes[j] == b'_' {
-                best_end = j + 1;
-                i = j + 1;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    let mut tail: &str = if best_end > 0 && best_end < bytes.len() {
-        &name[best_end..]
-    } else {
-        name
-    };
-    // Step 2: strip leading intruder-rule chain prefixes.  Each iter
-    // peels one segment if it matches a known intruder rule.
-    loop {
-        let next = if let Some(s) = tail.strip_prefix("coerce_") {
-            Some(s)
-        } else if let Some(s) = tail.strip_prefix("irecv_") {
-            Some(s)
-        } else if let Some(s) = tail.strip_prefix("ipub_") {
-            Some(s)
-        } else if let Some(s) = tail.strip_prefix("isend_") {
-            Some(s)
-        } else if let Some(stripped) = tail.strip_prefix("c_") {
-            // `c_<sym>_<rest>` — strip `c_<sym>_`.
-            stripped.find('_').map(|pos| &stripped[pos + 1..])
-        } else { None };
-        match next {
-            Some(n) if !n.is_empty() => tail = n,
-            _ => break,
-        }
-    }
-    // Step 3: strip trailing `_case_<N>` suffix.  Saturate
-    // (`saturate_out_premise`) appends `_case_<k>` to disambiguate
-    // multiple closures of the same sub-rule chain.  Haskell's
-    // `refineSource.combine` (Sources.hs:135-137) just keeps the first
-    // non-coerce name without a per-closure suffix — multiple cases
-    // sharing the same root name are disambiguated at runtime via
-    // `distinguish` (ProofMethod.hs:335, applied via
-    // `uniqueListBy ... distinguish cases` at ProofMethod.hs:308) IF
-    // their proof-tree
-    // siblings collide.  By stripping the saturate-time suffix here, we
-    // let the runtime renderer's dedup do the same job from a clean
-    // slate, matching Haskell's `Alice` vs `Alice_case_1`/`_case_2`
-    // sibling layout.
-    let stripped: &str = {
-        // Walk back from the end looking for `_case_<digits>` (no
-        // trailing underscore — `_case_<N>` is the LAST segment).
-        let b = tail.as_bytes();
-        let mut k = b.len();
-        // Trailing digits.
-        let mut d = 0;
-        while k > 0 && b[k - 1].is_ascii_digit() {
-            k -= 1; d += 1;
-        }
-        // Need `_case_` before the digits.
-        if d > 0 && k >= 6 && &b[k - 6..k] == b"_case_" {
-            &tail[..k - 6]
-        } else {
-            tail
-        }
-    };
-    stripped.to_string()
-}
+// NOTE: a former `saturated_chain_root(name) -> String` helper used to
+// re-derive the "chain root" by string-splitting a source-case name on
+// `_` (peeling `coerce_`/`c_<sym>_`/`_case_<N>` segments).  That was
+// REMOVED: by the time a case name reaches the runtime, `refineSource`
+// has already applied HS's `combine` (Sources.hs:135-139, ported in
+// `combine_case_names_list`) over the `[String]` step-name list and the
+// result is joined with `intercalate "_"` (ProofMethod.hs:511).  HS
+// never re-splits a single name on `_`, so the helper was a no-op for
+// every name in practice EXCEPT it corrupted function symbols whose
+// names contain `_` (e.g. `c_KDF_SKc` → `SKc`).  Callers now use the
+// stored name verbatim.
 
 /// Compute the term's "effective" sort.  Variables carry their sort;
 /// applications default to Msg (the join of all sub-sorts).
@@ -5520,6 +5467,55 @@ fn var_occurrences_nodes(
     // ctx is HS's [String] occurrence path; head is innermost.
     // We push for each tree-descend, then mutate-and-pop is impractical;
     // we just clone (HS uses persistent list = sharing tail).
+    // HS `foldFreesOcc` context string for a function symbol head
+    // (Term.hs `instance HasFrees (Term l)`, LTerm.hs:745-748):
+    //   FApp (NoEq o) as  ->  push `BC.unpack . fst $ o`  (the bare op name)
+    //   FApp o        as  ->  push `show o`               (the FunSym, for AC/C/List)
+    // The SAME context is pushed once for the whole arg list — HS does NOT
+    // descend per-argument with an index, so every argument of an `FApp`
+    // shares the symbol-name context.  (Previously RS pushed the arg INDEX
+    // and no symbol name, which produced occurrence-sets incompatible with
+    // HS's `varOccurences`, breaking the canonical `renameDropNameHints`
+    // ordering and so under-collapsing alpha-equivalent cases in
+    // `removeRedundantCases`.)
+    fn funsym_occ_ctx(sym: &tamarin_term::function_symbols::FunSym) -> String {
+        use tamarin_term::function_symbols::{FunSym, AcSym, CSym};
+        match sym {
+            FunSym::NoEq(s) => String::from_utf8_lossy(&s.name).into_owned(),
+            FunSym::Ac(ac) => match ac {
+                AcSym::Union => "AC Union".to_string(),
+                AcSym::Mult => "AC Mult".to_string(),
+                AcSym::Xor => "AC Xor".to_string(),
+                AcSym::NatPlus => "AC NatPlus".to_string(),
+            },
+            FunSym::C(c) => match c {
+                CSym::EMap => "C EMap".to_string(),
+            },
+            FunSym::List => "List".to_string(),
+        }
+    }
+    // HS `show (factTag fa)` (derived `Show FactTag`, Fact.hs:132-143).
+    //   ProtoFact mult name arity -> "ProtoFact <mult> \"<name>\" <arity>"
+    //   FreshFact/OutFact/InFact/KUFact/KDFact/DedFact/TermFact (nullary)
+    fn fact_tag_occ_ctx(f: &crate::fact::LNFact) -> String {
+        use crate::fact::{FactTag, Multiplicity};
+        match &f.tag {
+            FactTag::Proto(m, name, arity) => {
+                let mstr = match m {
+                    Multiplicity::Persistent => "Persistent",
+                    Multiplicity::Linear => "Linear",
+                };
+                format!("ProtoFact {} {:?} {}", mstr, name, arity)
+            }
+            FactTag::Fresh => "FreshFact".to_string(),
+            FactTag::Out => "OutFact".to_string(),
+            FactTag::In => "InFact".to_string(),
+            FactTag::Ku => "KUFact".to_string(),
+            FactTag::Kd => "KDFact".to_string(),
+            FactTag::Ded => "DedFact".to_string(),
+            FactTag::Term => "TermFact".to_string(),
+        }
+    }
     fn visit_term(
         t: &tamarin_term::lterm::LNTerm,
         ctx: &[String],
@@ -5530,23 +5526,58 @@ fn var_occurrences_nodes(
                 out.entry(v.clone()).or_default().insert(ctx.to_vec());
             }
             Term::Lit(Lit::Con(_)) => {}
-            Term::App(_, args) => {
+            Term::App(sym, args) => {
+                // HS `instance HasFrees (Term l)` `foldFreesOcc`
+                // (LTerm.hs:744-748):
+                //   FApp (NoEq o) as -> foldFreesOcc f ((opName):c) as
+                //   FApp o        as -> mconcat $ map (foldFreesOcc f (show o:c)) as
+                //                       -- AC or C symbols
+                // For a NoEq function the args are descended as a LIST, so the
+                // `HasFrees [a]` instance (LTerm.hs:843) prefixes EACH arg with
+                // its positional index `show i`: arg i's context becomes
+                // `[show i, opName, ...c]`.  For AC/C symbols HS maps over the
+                // args DIRECTLY (no list instance), so they get only
+                // `[show o, ...c]` with NO per-arg index (AC args are unordered
+                // anyway).  RS previously omitted the NoEq per-arg index, which
+                // made structurally-distinct vars at different argument
+                // positions (e.g. alethea's H1 vs H2 `encp`/`sg` operands)
+                // collapse to the SAME occurrence-context set; that under-
+                // discrimination broke the canonical `renameDropNameHints`
+                // ordering so `removeRedundantCases` kept alpha-equivalent
+                // split cases as distinct (`split_case_1` instead of `split`).
+                let mut sub = vec![funsym_occ_ctx(sym)];
+                sub.extend(ctx.iter().cloned());
+                let is_ac_or_c = sym.is_ac() || sym.is_c();
                 for (i, a) in args.iter().enumerate() {
-                    let mut sub = vec![i.to_string()];
-                    sub.extend(ctx.iter().cloned());
-                    visit_term(a, &sub, out);
+                    if is_ac_or_c {
+                        // AC/C: no per-arg index (HS maps directly).
+                        visit_term(a, &sub, out);
+                    } else {
+                        // NoEq: prefix the arg index (HS list instance).
+                        let mut arg_ctx = vec![i.to_string()];
+                        arg_ctx.extend(sub.iter().cloned());
+                        visit_term(a, &arg_ctx, out);
+                    }
                 }
             }
         }
     }
+    // HS `instance HasFrees Fact` (Fact.hs:187):
+    //   foldFreesOcc f c fa = foldFreesOcc f (show (factTag fa):c) (factTerms fa)
+    // i.e. push `show (factTag fa)` then descend into the term LIST, which
+    // (via the `[a]` instance) pushes the list index `show i` per term.  So
+    // term i's context = [show i, show factTag, ...c].  RS previously pushed
+    // only the term index and omitted the factTag layer.
     fn visit_fact(
         f: &crate::fact::LNFact,
         ctx: &[String],
         out: &mut BTreeMap<LVar, BTreeSet<Vec<String>>>,
     ) {
+        let mut tag_ctx = vec![fact_tag_occ_ctx(f)];
+        tag_ctx.extend(ctx.iter().cloned());
         for (i, t) in f.terms.iter().enumerate() {
             let mut sub = vec![i.to_string()];
-            sub.extend(ctx.iter().cloned());
+            sub.extend(tag_ctx.iter().cloned());
             visit_term(t, &sub, out);
         }
     }
@@ -6994,71 +7025,49 @@ mod tests {
     }
 
     // =========================================================================
-    // Haskell-faithfulness invariants for `saturated_chain_root` —
-    // the function whose `_case_N` mishandling caused 14+ corpus
-    // divergences (Cluster B, task #209).
+    // HS-faithful source-case naming invariant (replaces the removed
+    // `saturated_chain_root` string-splitter tests).
     //
-    // Mirrors Haskell `refineSource.combine` (Sources.hs:135-137):
-    // strip the "coerce" prefix, descend through chain prefixes, and
-    // produce a stable per-chain root name.  Per-closure `_case_N`
-    // suffixes are saturate-time artifacts that must not survive into
-    // the rendered case name.
+    // By the time a case name reaches the runtime, `refineSource` has
+    // already applied HS's `combine` (Sources.hs:135-139, ported in
+    // `combine_case_names_list`) over the `[String]` step-name list, and
+    // the result is joined with `intercalate "_"` (ProofMethod.hs:511).
+    // The stored name is therefore the FINAL display name and must be
+    // used verbatim — HS never re-splits a single name on `_`.
     // =========================================================================
 
-    /// Trailing `_case_<N>` (saturate's per-closure suffix) must be
-    /// stripped.  Bug regressed 14 lemmas in cluster B until task #209.
-    ///
-    /// Mirrors Haskell `combine` (Sources.hs:135-137): the per-closure
-    /// suffix is a Rust saturate-time artifact; Haskell doesn't add it.
-    /// Runtime `distinguish` (ProofMethod.hs:335, applied via
-    /// `uniqueListBy ... distinguish cases` at ProofMethod.hs:308) adds
-    /// sibling-disambig suffixes only when needed.
+    /// `combine` keeps a single non-coerce element verbatim, including
+    /// when it is a `c_<sym>` construction-rule name whose symbol
+    /// contains underscores (e.g. `c_KDF_SKc`).  The former
+    /// `saturated_chain_root` split this to `SKc` (fm24-cardpayments C8
+    /// divergence); the list-model `combine` keeps it intact.
     #[test]
-    fn saturated_chain_root_strips_trailing_case_n() {
-        assert_eq!(saturated_chain_root("Alice_case_1"), "Alice");
-        assert_eq!(saturated_chain_root("Alice_case_42"), "Alice");
-        assert_eq!(saturated_chain_root("Resp_2_case_3"), "Resp_2",
-                   "only the FINAL _case_<N> is stripped, not internal _<digit>");
+    fn combine_keeps_underscore_bearing_constr_name_intact() {
+        // Single construction-rule name → kept whole.
+        assert_eq!(
+            combine_case_names_list(&["c_KDF_SKc".to_string()], &[]),
+            vec!["c_KDF_SKc".to_string()]);
+        // Leading "coerce" element dropped, next element kept whole.
+        assert_eq!(
+            combine_case_names_list(
+                &["coerce".to_string(), "c_KDF_SKc".to_string()], &[]),
+            vec!["c_KDF_SKc".to_string()]);
+        // Underscore-free constructors are likewise kept verbatim.
+        assert_eq!(
+            combine_case_names_list(&["c_senc".to_string()], &[]),
+            vec!["c_senc".to_string()]);
+        // Protocol-rule names with underscores kept whole.
+        assert_eq!(
+            combine_case_names_list(&["Card_Responds_To_GPO_C8".to_string()], &[]),
+            vec!["Card_Responds_To_GPO_C8".to_string()]);
     }
 
-    /// Middle `_case_<N>_` (legacy form: saturate used to produce
-    /// `Rule_case_3_chain`) gets stripped from the LEFT.  This is the
-    /// step-1 stripping logic that predates the trailing fix.
+    /// `case_name_list_to_string` is HS `intercalate "_"`.
     #[test]
-    fn saturated_chain_root_strips_middle_case_n_underscore() {
-        // `Foo_case_3_bar` → strip `Foo_case_3_` → `bar`.
-        assert_eq!(saturated_chain_root("Foo_case_3_bar"), "bar");
-        // No `_case_N_` middle → keep as-is (modulo prefix stripping).
-        assert_eq!(saturated_chain_root("Foo_bar"), "Foo_bar");
-    }
-
-    /// Intruder-rule prefixes (`coerce_`, `irecv_`, `ipub_`, `isend_`,
-    /// `c_<sym>_`) get peeled iteratively.  Mirrors Haskell's `combine`
-    /// behavior of blending out coerce/intruder noise.
-    #[test]
-    fn saturated_chain_root_strips_intruder_prefixes() {
-        assert_eq!(saturated_chain_root("coerce_Alice"), "Alice");
-        assert_eq!(saturated_chain_root("isend_Alice"), "Alice");
-        assert_eq!(saturated_chain_root("irecv_Bob"), "Bob");
-        assert_eq!(saturated_chain_root("ipub_Carol"), "Carol");
-        // `c_<sym>_<rest>` strips both the `c_` and the `<sym>_`.
-        assert_eq!(saturated_chain_root("c_pair_Alice"), "Alice");
-    }
-
-    /// Combination: intruder prefix + trailing `_case_N` both stripped.
-    /// This is the actual shape that hit production: an inner rule that
-    /// went through coerce got `coerce_Alice_case_1`, which must reduce
-    /// to `Alice`.
-    #[test]
-    fn saturated_chain_root_handles_prefix_and_trailing_suffix() {
-        assert_eq!(saturated_chain_root("coerce_Alice_case_1"), "Alice");
-        assert_eq!(saturated_chain_root("isend_Resp_2_case_3"), "Resp_2");
-    }
-
-    /// Empty / no-match input is returned unchanged.
-    #[test]
-    fn saturated_chain_root_passes_through_unrecognized_name() {
-        assert_eq!(saturated_chain_root("Alice"), "Alice");
-        assert_eq!(saturated_chain_root("XYZ"), "XYZ");
+    fn case_name_list_to_string_is_intercalate_underscore() {
+        assert_eq!(case_name_list_to_string(&["c_KDF_SKc".to_string()]), "c_KDF_SKc");
+        assert_eq!(case_name_list_to_string(
+            &["a".to_string(), "b".to_string()]), "a_b");
+        assert_eq!(case_name_list_to_string(&[]), "");
     }
 }
