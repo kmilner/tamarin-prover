@@ -1827,7 +1827,17 @@ fn render_predicate(pr: &p::Predicate, arity1: &std::collections::HashSet<String
     // HS `render` lays each sub-doc out at width 110 from column 0 (factstr and
     // formulastr are rendered INDEPENDENTLY, then concatenated as plain text),
     // so route the formula through the Doc engine starting at column 0.
-    let factstr = reparse_fact_doc(&fact).render();
+    //
+    // Render the predicate fact DIRECTLY (`fact_doc`), NOT via
+    // `reparse_fact_doc`.  HS `prettyPredicate` (TheoryObject.hs:802-806) calls
+    // `prettyFact prettyLVar (pFact p)`, where each formal-arg `LVar` carries
+    // its sort and `prettyLVar` renders the sigil (`#time` for an `LSortNode`
+    // arg).  A predicate's args come from the real term parser (`self.term`),
+    // so they are proper sorted `Var`s already.  `reparse_fact_doc` is meant
+    // for proof-tree facts whose args `build_fact` stuffs into `Var` *names* as
+    // raw text; re-parsing a sorted formal arg from its bare `name` drops the
+    // sigil (`#time` → `time`).  Going through `fact_doc` preserves the sort.
+    let factstr = pf::fact_doc(&fact).render();
     let formulastr = pf::pretty_formula_wrapped(&formula, 0);
     format!("predicate: {}<=>{}", factstr, formulastr)
 }

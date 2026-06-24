@@ -206,6 +206,25 @@ pub fn check_guarded_wf(parser_thy: &p::Theory) -> Vec<tamarin_parser::wf::WfErr
     let mut thy_clone = parser_thy.clone();
     crate::macro_expand::expand_theory_macros(&mut thy_clone);
 
+    // Expand `predicates:` use-sites BEFORE the guardedness check, mirroring
+    // HS: there the lemma/restriction formula is predicate-expanded at PARSE
+    // time (`liftedAddLemma`→`expandLemma`→`expandFormula`,
+    // Theory/Text/Parser.hs:145-147; `liftedAddRestriction`→`expandRestriction`,
+    // lines 132-134), so by the time `formulaReports.checkGuarded`
+    // (Wellformedness.hs:1004) reads `get lFormula l` / `get rstrFormula rstr`
+    // the `Pred` sugar is already gone and the formula is the inlined body.
+    // The guardedness conversion can only guard a quantified var that appears
+    // in an `Action`/`Eq`/`Less`/… atom — never one buried inside an opaque
+    // `Pred(...)` atom.  A predicate like `Exists(#time) <=> ∃ val. Action(val)
+    // @ time` means `∃ #t. Exists(#t)` expands to `∃ #t. ∃ val. Action(val) @
+    // #t`, where `#t` IS guarded by the action's timepoint.  Without this
+    // expansion the check sees the un-expanded `∃ #t. Exists(#t)` and falsely
+    // reports `#t` as unguarded.  Order matches `elaborate` (macros → predicates).
+    // An expansion error here (e.g. an undefined predicate) is surfaced
+    // elsewhere by the elaborate path; here we keep the macro-only form so the
+    // guardedness check still runs on what it can.
+    let _ = crate::predicate_expand::expand_theory_formulas(&mut thy_clone);
+
     let mut out: Vec<tamarin_parser::wf::WfError> = Vec::new();
 
     // Iterate lemmas and restrictions in theory order, mirroring HS's
