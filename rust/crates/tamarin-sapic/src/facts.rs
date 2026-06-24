@@ -69,6 +69,12 @@ pub enum TransAction {
     EventEmpty,
     /// A literal user action fact (`TamarinAct`).
     TamarinAct(LNFact),
+    /// `PredicateA f` (Facts.hs:74): renders `f` with its name prefixed by
+    /// `Pred_` (used by the positive arm of `if t1 = t2`).
+    PredicateA(LNFact),
+    /// `NegPredicateA f` (Facts.hs:75): renders `f` with its name prefixed by
+    /// `Pred_Not_` (the negative arm of `if t1 = t2`).
+    NegPredicateA(LNFact),
 }
 
 /// `SpecialPosition` (Facts.hs:110-112).
@@ -127,7 +133,26 @@ pub fn action_to_fact(a: &TransAction) -> LNFact {
         TransAction::InitEmpty => proto_fact(Multiplicity::Linear, "Init", vec![]),
         TransAction::EventEmpty => proto_fact(Multiplicity::Linear, "Event", vec![]),
         TransAction::TamarinAct(f) => f.clone(),
+        // `actionToFact (PredicateA f) = mapFactName ("Pred_" ++) f`
+        // (Facts.hs:226).
+        TransAction::PredicateA(f) => map_fact_name(f, "Pred_"),
+        // `actionToFact (NegPredicateA f) = mapFactName ("Pred_Not_" ++) f`
+        // (Facts.hs:227).
+        TransAction::NegPredicateA(f) => map_fact_name(f, "Pred_Not_"),
     }
+}
+
+/// `mapFactName (prefix ++)` (Facts.hs:173-177): prepend `prefix` to a
+/// `ProtoFact` name (other tags are left unchanged).
+fn map_fact_name(f: &LNFact, prefix: &str) -> LNFact {
+    use tamarin_theory::fact::FactTag;
+    let tag = match &f.tag {
+        FactTag::Proto(m, s, i) => FactTag::Proto(*m, format!("{prefix}{s}"), *i),
+        other => other.clone(),
+    };
+    let mut nf = tamarin_theory::fact::Fact::new(tag, f.terms.clone());
+    nf = nf.with_annotations(f.annotations.clone());
+    nf
 }
 
 /// `proto_fact` is fixed to `Linear`; the state fact needs an explicit

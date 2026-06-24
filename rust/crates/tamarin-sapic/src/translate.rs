@@ -22,11 +22,14 @@ use tamarin_theory::sapic::{
     GoodAnnotation, PlainProcess, Process, SapicLVar, ProcessPosition,
 };
 
+use tamarin_theory::sapic::ProcessCombinator;
+
 use crate::annotation::{to_annotated, ProcessAnnotation};
 use crate::base_translation::{
-    base_init, base_trans_action, base_trans_null, single_session_restriction, RuleBody,
+    base_init, base_trans_action, base_trans_comb, base_trans_null, predicate_restrictions,
+    single_session_restriction, RuleBody,
 };
-use crate::facts::{to_rule, AnnotatedRule, RulePosition};
+use crate::facts::{to_rule, AnnotatedRule, RulePosition, StateKind, TransFact};
 
 /// `propagateNames` (Facts.hs:301-313): push each node's process-names down to
 /// its children so every node carries the names of all its ancestors.
@@ -108,8 +111,11 @@ fn map_to_annotated_rule(
         .collect()
 }
 
-/// `gen` (Sapic.hs:112-153) — linear subset (Null / Action).  Combinators and
-/// replication are rejected here (Phase 2+).
+/// `gen` (Sapic.hs:112-153).  Handles `Null`, `Action` (incl. the `Rep`
+/// replication action), and the `Comb` combinators in scope — `Parallel`,
+/// `NDC` (with the `substStatePos` shared-position rewrite), and `CondEq`.
+/// `Cond`-with-a-formula / `Lookup` / `Let` are rejected in `base_trans_comb`
+/// (Phase 2+/3).
 fn gen(
     needs_in_ev_res: bool,
     an_proc: &Process<ProcessAnnotation<LVar>, SapicLVar>,
@@ -134,9 +140,75 @@ fn gen(
             here.extend(rest);
             Ok(here)
         }
-        Process::Comb(..) => Err(
-            "gen: process combinators not yet ported (Phase 2+)".to_string(),
-        ),
+        // NDC special case (Sapic.hs:123-127): the NDC node itself emits NO
+        // rule; its two children SHARE the parent's state position.  We
+        // translate each child at `p++[1]` / `p++[2]` (so rule names carry the
+        // correct position suffix), then rewrite the State premise of EVERY
+        // generated rule from the child position back to the parent `p`
+        // (`substStatePos`).
+        Process::Comb(ProcessCombinator::Ndc, _, _, _) => {
+            let mut pl = p.clone();
+            pl.push(1);
+            let mut pr = p.clone();
+            pr.push(2);
+            let l = gen(needs_in_ev_res, an_proc, &pl, tildex)?;
+            let r = gen(needs_in_ev_res, an_proc, &pr, tildex)?;
+            let mut out = subst_state_pos_rules(l, &pl, p);
+            out.extend(subst_state_pos_rules(r, &pr, p));
+            Ok(out)
+        }
+        // General combinator (Sapic.hs:128-134): emit this node's own rules,
+        // then recurse into the left child with `tildex'1` and (if present) the
+        // right child with `tildex'2`.
+        Process::Comb(c, ann, _, _) => {
+            let (bodies, tildex_l, tildex_r) = base_trans_comb(c, ann, p, tildex)?;
+            let mut here = map_to_annotated_rule(proc, p, bodies);
+            let mut pl = p.clone();
+            pl.push(1);
+            let msrs_l = gen(needs_in_ev_res, an_proc, &pl, &tildex_l)?;
+            here.extend(msrs_l);
+            if let Some(tx_r) = tildex_r {
+                let mut pr = p.clone();
+                pr.push(2);
+                let msrs_r = gen(needs_in_ev_res, an_proc, &pr, &tx_r)?;
+                here.extend(msrs_r);
+            }
+            Ok(here)
+        }
+    }
+}
+
+/// `substStatePos p_old p_new` over a list of generated rules (Sapic.hs:124,
+/// 140-144): rewrite the position of every NON-semistate `State` PREMISE fact
+/// from `p_old` to `p_new` (leaving the actual position `p_old==p++[i]` only in
+/// the rule NAME, which was already fixed during `gen`).
+fn subst_state_pos_rules(
+    rules: Vec<AnnotatedRule<ProcessAnnotation<LVar>>>,
+    p_old: &[i64],
+    p_new: &[i64],
+) -> Vec<AnnotatedRule<ProcessAnnotation<LVar>>> {
+    rules
+        .into_iter()
+        .map(|mut r| {
+            r.prems = r
+                .prems
+                .into_iter()
+                .map(|f| subst_state_pos_fact(f, p_old, p_new))
+                .collect();
+            r
+        })
+        .collect()
+}
+
+/// `substStatePos` on a single fact (Sapic.hs:142-144):
+///   State s p' vs | p' == p_old, not (isSemiState s) = State LState p_new vs
+///   otherwise = fact
+fn subst_state_pos_fact(f: TransFact, p_old: &[i64], p_new: &[i64]) -> TransFact {
+    match f {
+        TransFact::State(kind, pos, vs) if pos == p_old && !kind.is_semi_state() => {
+            TransFact::State(StateKind::LState, p_new.to_vec(), vs)
+        }
+        other => other,
     }
 }
 
@@ -169,9 +241,15 @@ pub fn translate(
     all.extend(proto_rules);
     let rules: Vec<ProtoRuleE> = all.iter().map(to_rule).collect();
 
-    // restrictions: the always-on single_session (baseRestr with
-    // hasAccountabilityLemmaWithControl = True at the call site).
-    let restrictions = vec![single_session_restriction()];
+    // restrictions (baseRestr, Basetranslation.hs:449-468), in HS order:
+    //   [resEq, resNotEq]   if the process `contains isEq`  (a CondEq node)
+    //   [resSingleSession]  always (hasAccountabilityLemmaWithControl = True)
+    // (resSetIn/resSetNotIn for lookups + locking restrictions are Phase 3.)
+    let mut restrictions = Vec::new();
+    if tamarin_theory::sapic::process_contains(&an_proc, tamarin_theory::sapic::is_eq) {
+        restrictions.extend(predicate_restrictions());
+    }
+    restrictions.push(single_session_restriction());
 
     Ok(Translation { rules, restrictions })
 }

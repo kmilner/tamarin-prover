@@ -7,9 +7,12 @@
 //!
 //!   - `Null`
 //!   - `Action New / Event / ChOut / ChIn`
+//!   - `Action Rep` (replication `!P`)
+//!   - `Comb Parallel | NDC | CondEq` (`P|Q`, `P+Q`, `if t1 = t2 then P else Q`)
 //!
-//! Parallel / replication / state / locks / lookups / let / process-calls are
-//! deferred to later phases — they error out so we never silently mistranslate.
+//! `Cond`-with-a-formula (`if <formula> then`), state (insert/delete/lookup),
+//! locks, secret/private channels, `let`, and process-calls are deferred to
+//! later phases — they error out so we never silently mistranslate.
 //!
 //! There is no single HS function this mirrors: in HS the parser builds the
 //! `PlainProcess` directly (`Theory.Text.Parser.Sapic.process`), whereas the
@@ -22,7 +25,7 @@ use std::collections::BTreeSet;
 use tamarin_parser::ast as p;
 use tamarin_theory::elaborate::{fact_to_sapic_fact, term_to_sapic_term};
 use tamarin_theory::sapic::{
-    PlainProcess, Process, ProcessParsedAnnotation, SapicAction, SapicLVar,
+    PlainProcess, Process, ProcessCombinator, ProcessParsedAnnotation, SapicAction, SapicLVar,
 };
 use tamarin_term::lterm::{LSort, LVar};
 
@@ -91,6 +94,32 @@ fn action(a: &p::SapicAction) -> Result<SapicAction<SapicLVar>, ConvertError> {
     }
 }
 
+/// Convert a parser combinator into a theory `ProcessCombinator<SapicLVar>`.
+///
+/// Mirrors the SAPIC parser's combinator construction
+/// (`Theory.Text.Parser.Sapic`): `Parallel`/`Ndc` are nullary; `if t1 = t2`
+/// becomes `CondEq t1 t2`; `if frml` becomes `Cond frml`.  `Lookup`/`Let` are
+/// deferred (Phase 3+ for state; `let`-with-destructors).
+fn combinator(c: &p::ProcessComb) -> Result<ProcessCombinator<SapicLVar>, ConvertError> {
+    match c {
+        p::ProcessComb::Parallel => Ok(ProcessCombinator::Parallel),
+        p::ProcessComb::Ndc => Ok(ProcessCombinator::Ndc),
+        p::ProcessComb::Cond(p::Condition::Eq(t1, t2)) => {
+            Ok(ProcessCombinator::CondEq(term(t1)?, term(t2)?))
+        }
+        p::ProcessComb::Cond(p::Condition::Formula(_)) => Err(ConvertError::new(
+            "conditional with a formula (`if <formula> then`) not yet ported \
+             (Phase 2+); only `if t1 = t2 then` is supported",
+        )),
+        p::ProcessComb::Lookup(_, _) => {
+            Err(ConvertError::new("lookup not yet ported (Phase 3 — state)"))
+        }
+        p::ProcessComb::Let { .. } => {
+            Err(ConvertError::new("let-binding not yet ported (Phase 2+)"))
+        }
+    }
+}
+
 /// Convert a parser process into a `PlainProcess`.  Each node carries an empty
 /// [`ProcessParsedAnnotation`]; names/back-substitution are filled in by later
 /// passes (`propagate_names`, `rename_unique`).
@@ -103,12 +132,20 @@ pub fn convert_process(proc: &p::Process) -> Result<PlainProcess, ConvertError> 
             ann,
             Box::new(convert_process(body)?),
         )),
-        p::Process::Comb { .. } => Err(ConvertError::new(
-            "process combinators (parallel/ndc/cond/lookup/let) not yet ported (Phase 2+)",
-        )),
-        p::Process::Replication(_) => {
-            Err(ConvertError::new("replication `!` not yet ported (Phase 2+)"))
+        p::Process::Comb { comb, left, right } => {
+            let l = Box::new(convert_process(left)?);
+            let r = Box::new(convert_process(right)?);
+            let c = combinator(comb)?;
+            Ok(Process::Comb(c, ann, l, r))
         }
+        // `!P` parses to `ProcessAction Rep mempty P` in HS
+        // (Theory.Text.Parser.Sapic, replication branch); mirror by emitting a
+        // `Rep` action whose single child is the replicated body.
+        p::Process::Replication(body) => Ok(Process::Action(
+            SapicAction::Rep,
+            ann,
+            Box::new(convert_process(body)?),
+        )),
         p::Process::Call { .. } => {
             Err(ConvertError::new("process calls not yet ported (Phase 2+)"))
         }
@@ -164,5 +201,77 @@ mod tests {
         let conv = convert_process(&top).unwrap();
         // Outermost is New.
         assert!(matches!(conv, Process::Action(SapicAction::New(_), _, _)));
+    }
+
+    fn event(name: &str) -> p::Process {
+        p::Process::Action {
+            action: p::SapicAction::Event(p::Fact {
+                persistent: false,
+                name: name.into(),
+                args: vec![],
+                annotations: vec![],
+            }),
+            body: Box::new(p::Process::Null),
+        }
+    }
+
+    #[test]
+    fn convert_parallel_and_ndc() {
+        let par = p::Process::Comb {
+            comb: p::ProcessComb::Parallel,
+            left: Box::new(event("A")),
+            right: Box::new(event("B")),
+        };
+        assert!(matches!(
+            convert_process(&par).unwrap(),
+            Process::Comb(ProcessCombinator::Parallel, _, _, _)
+        ));
+        let ndc = p::Process::Comb {
+            comb: p::ProcessComb::Ndc,
+            left: Box::new(event("A")),
+            right: Box::new(event("B")),
+        };
+        assert!(matches!(
+            convert_process(&ndc).unwrap(),
+            Process::Comb(ProcessCombinator::Ndc, _, _, _)
+        ));
+    }
+
+    #[test]
+    fn convert_replication_becomes_rep_action() {
+        let rep = p::Process::Replication(Box::new(event("A")));
+        assert!(matches!(
+            convert_process(&rep).unwrap(),
+            Process::Action(SapicAction::Rep, _, _)
+        ));
+    }
+
+    #[test]
+    fn convert_condeq() {
+        let a = p::Term::Var(p::VarSpec {
+            name: "a".into(),
+            idx: 0,
+            sort: p::SortHint::Untagged,
+            typ: None,
+        });
+        let cond = p::Process::Comb {
+            comb: p::ProcessComb::Cond(p::Condition::Eq(a.clone(), a)),
+            left: Box::new(event("E")),
+            right: Box::new(p::Process::Null),
+        };
+        assert!(matches!(
+            convert_process(&cond).unwrap(),
+            Process::Comb(ProcessCombinator::CondEq(_, _), _, _, _)
+        ));
+    }
+
+    #[test]
+    fn convert_cond_formula_errors_gracefully() {
+        let cond = p::Process::Comb {
+            comb: p::ProcessComb::Cond(p::Condition::Formula(p::Formula::True)),
+            left: Box::new(event("E")),
+            right: Box::new(p::Process::Null),
+        };
+        assert!(convert_process(&cond).is_err());
     }
 }
