@@ -993,6 +993,56 @@ pub(crate) fn regex_all_matches(pattern: &str, haystack: &str) -> Vec<String> {
     }
 }
 
+/// Translate the escape sequences where HS's regex engine
+/// (`regex-pcre-builtin`, i.e. PCRE 8.x) and Rust's `fancy-regex` disagree,
+/// so the rewritten pattern matches in `fancy-regex` exactly as the original
+/// does under PCRE.
+///
+/// PCRE 8.x has NO `\<` / `\>` word-boundary assertions (those are a GNU
+/// regex / Vim extension): under PCRE `\<` and `\>` are simply the ESCAPED
+/// LITERAL characters `<` and `>`.  Verified against the exact HS library
+/// (`regex-pcre-builtin-0.95.2.3.8.44`):
+///   `"a\\>" =~ "a>"  == True`,  `"a\\>" =~ "a b" == False`.
+/// `fancy-regex`, however, interprets `\<` / `\>` as start/end-of-word
+/// boundary assertions, so e.g. `~K_ASME\>` there matches `~K_ASME,`
+/// (comma = word boundary), which PCRE never does.  Rewrite each `\<` / `\>`
+/// to the corresponding literal character (`<` / `>` are not metacharacters
+/// in `fancy-regex`).  Only `\<` / `\>` whose backslash is itself unescaped
+/// are rewritten; `\\>` (escaped backslash, then literal `>`) is left intact.
+fn pcre_to_fancy(pattern: &str) -> std::borrow::Cow<'_, str> {
+    if !pattern.contains("\\<") && !pattern.contains("\\>") {
+        return std::borrow::Cow::Borrowed(pattern);
+    }
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek() {
+                Some('<') => {
+                    chars.next();
+                    out.push('<'); // PCRE literal '<'
+                }
+                Some('>') => {
+                    chars.next();
+                    out.push('>'); // PCRE literal '>'
+                }
+                // Any other escape (incl. `\\`): copy the backslash AND the
+                // escaped char verbatim so a following `<`/`>` cannot be
+                // misread as the assertion form.
+                Some(&next) => {
+                    chars.next();
+                    out.push('\\');
+                    out.push(next);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Compile + cache a PCRE pattern (`fancy-regex`).  Shared by the
 /// boolean-match and all-matches helpers.
 fn compile_regex(pattern: &str) -> Option<std::sync::Arc<fancy_regex::Regex>> {
@@ -1005,7 +1055,7 @@ fn compile_regex(pattern: &str) -> Option<std::sync::Arc<fancy_regex::Regex>> {
     let mut map = cache.lock().unwrap();
     map.entry(pattern.to_string())
         .or_insert_with(|| {
-            fancy_regex::Regex::new(pattern)
+            fancy_regex::Regex::new(&pcre_to_fancy(pattern))
                 .ok()
                 .map(std::sync::Arc::new)
         })
@@ -2913,6 +2963,37 @@ mod tests {
         assert!(!regex_is_match(lb, "'g'^~n1"));
         // A regex that fails to compile yields `false`, never panics.
         assert!(!regex_is_match("(", "anything"));
+    }
+
+    /// PCRE (`regex-pcre-builtin`, the HS engine) has NO `\<` / `\>`
+    /// word-boundary assertions — they are the escaped LITERAL chars `<`/`>`.
+    /// `fancy-regex` would otherwise treat them as word boundaries, which
+    /// diverges from HS (wisec21 5G_handover `secret_k_asme` tactic prio
+    /// `.*RcvS.*~K_ASME\>.*`).  Behaviour pinned against the real HS library:
+    ///   `"a\\>" =~ "a>"  == True`,  `"a\\>" =~ "a b"/"ab" == False`.
+    #[test]
+    fn regex_backslash_lt_gt_are_pcre_literals() {
+        // `\>` == literal '>'.
+        assert!(regex_is_match(r"a\>", "a>"));
+        assert!(!regex_is_match(r"a\>", "a b")); // NOT a word boundary
+        assert!(!regex_is_match(r"a\>", "ab"));
+        // `\<` == literal '<'.
+        assert!(regex_is_match(r"\<a", "<a"));
+        assert!(!regex_is_match(r"\<a", " a"));
+        // The exact corpus prio: must NOT match a `~K_ASME,` (comma) goal.
+        let prio = r".*RcvS.*~K_ASME\>.*";
+        assert!(!regex_is_match(
+            prio,
+            "RcvS( ~cid_N26.1, <'fr_req', ~K_ASME, ~eNB_UE_S1AP_ID.1>)"
+        ));
+        // …but DOES match a goal where '>' literally follows ~K_ASME.
+        assert!(regex_is_match(prio, "RcvS( <'ho_required', x, ~K_ASME>)"));
+        // `\b` is still the standard word boundary (unchanged).
+        assert!(regex_is_match(r"a\b", "a b"));
+        assert!(!regex_is_match(r"a\b", "ab"));
+        // An escaped backslash before '>' is left intact: `\\>` = '\' then '>'.
+        assert!(regex_is_match(r"a\\>", "a\\>"));
+        assert!(!regex_is_match(r"a\\>", "a>"));
     }
 
     /// `apply_ranking_fn "smallest"` sorts by rendered length, stably;
