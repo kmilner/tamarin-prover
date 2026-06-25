@@ -337,6 +337,7 @@ sapic/fast/feature-ass-immediate/test-channelin.spthy
 sapic/fast/feature-export/export-tag.spthy
 sapic/fast/feature-inevent-restriction/inevent-restriction-private-channel.spthy
 sapic/fast/feature-inevent-restriction/inevent-restriction-public-channel.spthy
+sapic/fast/feature-locations/AKE.spthy
 sapic/fast/feature-locations/licensing.spthy
 sapic/fast/feature-predicates/decwrap-destr-manual.spthy
 sapic/fast/feature-predicates/decwrap-destr-restrict.spthy
