@@ -281,14 +281,17 @@ impl ProofContext {
         // join key.
         for orig in &self.full_sources {
             let sat = refined.iter().find(|s| s.goal == orig.goal);
-            // No matching saturated source — saturate dropped it
-            // entirely (all branches contradicted).  HS's
-            // `saturateSources` would leave the source with the
-            // initial cases in this case (its `solver` returns
-            // `(False, [])` on every iter, so `cdCases` stays
-            // unchanged from `initialSource`'s output).  Mirror by
-            // leaving the cell as-set by `initial_source_cases`
-            // earlier in `ensure_saturated` — no overwrite.
+            // HS-faithful: `saturateSources` (Sources.hs:498) keeps ONE
+            // source per input (`set cdCases newCases th`), so every
+            // `orig.goal` has a match in `refined` — including sources whose
+            // refine produced ZERO cases (the case list is just empty).  We
+            // overwrite the cell with the refined cases (possibly empty),
+            // matching HS's `cdCases = []` for goals with no source (e.g. the
+            // builtin destructors `check_rep`/`get_rep`).  The `if let Some`
+            // remains a defensive guard: should a future refine path ever
+            // drop a source from the list, we leave the initial cases rather
+            // than blanking an unrelated cell — but on the HS-faithful path
+            // the match always succeeds.
             if let Some(s) = sat {
                 orig.cases_set(s.cases_or_empty());
             }

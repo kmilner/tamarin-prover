@@ -1445,9 +1445,34 @@ fn saturate_sources_with_simp_opt(
                     }
                 }
             }
-            if !new_cases.is_empty() {
-                next.push(Source::eager_list(src_goal_and_incomplete.0, new_cases, src_goal_and_incomplete.1));
-            } else {
+            // HS-faithful `refineSource` (Sources.hs:131-133):
+            //   refineSource ctxt proofStep th = (..., set cdCases newCases th)
+            // and `saturateSources` (Sources.hs:498):
+            //   (changes, ths') = unzip $ map (refineSource ctxt solver) ths
+            // ALWAYS returns one source per input — `set cdCases newCases th`
+            // REPLACES the case list, even when it is EMPTY (every branch
+            // mzero'd).  Sources are NEVER dropped; the count is constant
+            // (`[SAT-FINAL] sources=N` stays fixed) and only `cdCases` shrinks.
+            //
+            // Previously RS DROPPED a source whose refine produced 0 cases
+            // (the `else` only set `changed`, never pushing to `next`).  That
+            // left the source absent from `current`/`refined`, so
+            // `ensure_saturated`'s match-by-goal (context.rs) found nothing
+            // and LEFT THE STALE *INITIAL* CASES in the cell.  For a builtin
+            // destructor like `check_rep`/`get_rep` (locations-report) the
+            // initial `coerce` case carries an unsolvable `KD(check_rep(..))`
+            // premise; HS solves that KD-premise during saturation, finds no
+            // source (nothing outputs `check_rep`), contradicts the branch,
+            // and ends with `cdCases = []`.  RS instead kept the coerce case,
+            // so during the lemma proof `KU(check_rep(..))` opened the
+            // coerce → KD → chain subtree HS prunes — inflating the
+            // locations-report SAPiC theories' proofs (AKE can_run_v: 9 HS
+            // steps vs 21 RS; SOC/OTP/AC likewise).  Keep the empty-case
+            // source so the cell is overwritten to empty, matching HS's
+            // `by solve( !KU( check_rep(..) ) )` (zero open cases).
+            let new_cases_empty = new_cases.is_empty();
+            next.push(Source::eager_list(src_goal_and_incomplete.0, new_cases, src_goal_and_incomplete.1));
+            if new_cases_empty {
                 changed = true;
             }
             if new_case_count > prev_case_count {
@@ -2947,6 +2972,26 @@ pub fn solve_with_source_cases_action_with_ctx(
     } else {
         src.cases_or_empty()
     };
+    // HS-faithful `applySource`/`solveWithSource` (Sources.hs:427,438-442):
+    // once a source's abstract pattern MATCHES the live goal (the `src`
+    // find above succeeded), `applySource` returns `Just _` and its
+    // reduction runs `disjunctionOfList (getDisj cdCases)`.  When `cdCases`
+    // is EMPTY, that `disjunctionOfList []` is `mzero` → ZERO branches, but
+    // the OUTER `solveWithSource` still returned `Just` — so `ProofMethod`'s
+    // `maybe (solveGoal goal) ... ws` does NOT fall back to `solveGoal`; the
+    // goal node closes with zero open cases (rendered `by`).  RS must mirror
+    // this: a matched source with ZERO precomputed cases is `Some(vec![])`,
+    // NOT `None`.  Returning `None` (the `out.is_empty()` path below) would
+    // conflate "matched, empty" (HS `Just []`) with "no match" (HS
+    // `Nothing`), letting the caller fall through to runtime rule
+    // enumeration — re-opening the `coerce` → `KD` → chain subtree HS prunes
+    // for builtin destructors like `check_rep`/`get_rep` (locations-report).
+    // This is the runtime half of the saturate-time fix (refineSource keeps
+    // 0-case sources); both are needed for the locations-report SAPiC
+    // theories' (AKE/SOC/OTP/AC) parity.
+    if cases_iter.is_empty() {
+        return Some(Vec::new());
+    }
     let dbg_rt = std::env::var("TAM_RS_DBG_RUNTIME_CASES").as_deref() == Ok("1");
     let total_n = cases_iter.len();
     let mut out: Vec<(String, System, crate::fact::LNFact)> = Vec::new();
