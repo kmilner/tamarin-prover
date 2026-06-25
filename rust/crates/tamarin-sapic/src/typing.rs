@@ -563,6 +563,27 @@ fn default_function_type(n: usize) -> (Vec<SapicType>, SapicType) {
     (vec![None; n], None)
 }
 
+/// True iff `fs` is a `viewTerm2`-SPECIAL NoEq symbol (Term/Raw.hs:183-196):
+/// `pair`, `exp`, `pmult`, `diff`, `inv`, `one`, `natOne`, `dhNeutral`.  HS's
+/// `viewTerm2` renders these as dedicated constructors (`FPair`/`FExp`/…) rather
+/// than `FAppNoEq`, so `typeWith` treats them via the polymorphic `viewTerm`
+/// branch (no function-type learning / no argument back-propagation).
+fn is_special_viewterm2_sym(fs: &NoEqSym) -> bool {
+    use tamarin_term::function_symbols::{
+        DH_NEUTRAL_SYM_STRING, DIFF_SYM_STRING, EXP_SYM_STRING, INV_SYM_STRING, NAT_ONE_SYM_STRING,
+        ONE_SYM_STRING, PMULT_SYM_STRING,
+    };
+    let n = &fs.name[..];
+    (n == b"pair" && fs.arity == 2)
+        || (n == EXP_SYM_STRING && fs.arity == 2)
+        || (n == PMULT_SYM_STRING && fs.arity == 2)
+        || (n == DIFF_SYM_STRING && fs.arity == 2)
+        || (n == INV_SYM_STRING && fs.arity == 1)
+        || (n == ONE_SYM_STRING && fs.arity == 0)
+        || (n == NAT_ONE_SYM_STRING && fs.arity == 0)
+        || (n == DH_NEUTRAL_SYM_STRING && fs.arity == 0)
+}
+
 /// `typeWith` (Typing.hs:73-114).  Types term `t` against target `tt`,
 /// returning the typed term and its inferred type, updating `env`.
 fn type_with(
@@ -592,7 +613,18 @@ fn type_with(
         VTerm::App(sym, args) => {
             use tamarin_term::function_symbols::FunSym;
             match sym {
-                FunSym::NoEq(fs) => {
+                // HS `typeWith` dispatches on `viewTerm2 t`: a NoEq application
+                // whose head is one of the SPECIAL symbols (`pair`, `exp`, `inv`,
+                // `pmult`, `diff`, `one`, `natOne`, `dhNeutral`) does NOT view as
+                // `FAppNoEq` (Term/Raw.hs:183-196) — it views as its own
+                // constructor (`FPair`, `FExp`, …).  None of those match the
+                // `FAppNoEq fs ts` case (Typing.hs:83), so they fall through to
+                // the polymorphic `FApp fs ts <- viewTerm t` branch (Typing.hs:102)
+                // which types arguments with `Nothing` and learns NO function
+                // type.  Crucially this means pairs (`<a,b>`) do NOT back-propagate
+                // an argument type onto `a`/`b` — matching HS, which keeps
+                // tuple-component variables untyped.
+                FunSym::NoEq(fs) if !is_special_viewterm2_sym(fs) => {
                     let n = fs.arity;
                     // First pass: refine output type from target.
                     let (intypes1, outtype1) = get_fun(env, n, fs);
@@ -679,30 +711,42 @@ fn merge_fun_types(
     Ok((ins, out))
 }
 
-/// `typeProcess` (Typing.hs:135-167): downward traversal — at each binder
-/// insert its variables (`fAct`/`fComb`); on the way back reconstruct the node
-/// with typed terms (`gAct`/`gComb`).  We fuse the two passes into a single
-/// pre-order recursion: insert binder vars, type this node's terms, recurse.
+/// `typeProcess` (Typing.hs:135-167) via `traverseProcess` (Process.hs:221-234):
+///   1. `fAct`/`fComb` — insert this node's bound vars (PRE-order, on the way
+///      down);
+///   2. recurse into the subtree (`p''<- traverseProcess … p'`);
+///   3. `gAct`/`gComb` — reconstruct THIS node's terms (`typeWith'`), POST-order,
+///      i.e. AFTER the whole subtree has been typed.
+///
+/// The post-order step (3) is what BACK-PROPAGATES a type learned deeper in the
+/// process onto an earlier term: e.g. with `f(bitstring):bitstring`, typing
+/// `out(y); out(f(y))` learns `y:bitstring` from `out(f(y))` (deeper) into the
+/// shared `vars` env, and the earlier `out(y)` — reconstructed afterwards — then
+/// renders `out(y:bitstring)`.  A pre-order single pass would miss this.
 fn type_process(env: &mut TypingEnvironment, p: &PlainProcess) -> Result<PlainProcess, String> {
     match p {
         Process::Null(ann) => Ok(Process::Null(ann.clone())),
         Process::Action(ac, ann, body) => {
-            // fAct: insert bound vars (with their declared types).
+            // 1. fAct: insert bound vars (with their declared types).
             for v in bindings_act(ac) {
                 insert_var(env, &v)?;
             }
-            // gAct: type the action's terms.
-            let ac1 = type_action(env, ac)?;
+            // 2. recurse into the subtree FIRST (learns deeper types into `env`).
             let body1 = type_process(env, body)?;
+            // 3. gAct: type the action's terms, with the now-complete `env`.
+            let ac1 = type_action(env, ac)?;
             Ok(Process::Action(ac1, ann.clone(), Box::new(body1)))
         }
         Process::Comb(c, ann, l, r) => {
+            // 1. fComb: insert bound vars.
             for v in bindings_comb(c) {
                 insert_var(env, &v)?;
             }
-            let c1 = type_comb(env, c)?;
+            // 2. recurse into BOTH children first.
             let l1 = type_process(env, l)?;
             let r1 = type_process(env, r)?;
+            // 3. gComb: type this node's terms with the completed `env`.
+            let c1 = type_comb(env, c)?;
             Ok(Process::Comb(c1, ann.clone(), Box::new(l1), Box::new(r1)))
         }
     }
@@ -813,14 +857,37 @@ fn type_event_fact(
 // initTEFromSig + type_theory orchestration
 // =============================================================================
 
-/// `initTEFromSig` (Typing.hs:185-200), minimal: seed every signature
-/// function symbol with its `defaultFunctionType`.  (User function-typing
-/// declarations and CtxtStRule pre-typing are Phase-2 refinements; typing2
-/// declares no function types, and its `f`/`fst`/`snd`/`pair` all default.)
-fn init_te_from_sig(maude_sig: &tamarin_term::maude_sig::MaudeSig) -> TypingEnvironment {
+/// A user `functions:` typing declaration — the function name, its declared
+/// argument types and return type (HS `SapicFunSym = (NoEqSym, [SapicType],
+/// SapicType)`, the payload of `theoryFunctionTypingInfos`).
+pub type UserFunTyping = (String, Vec<SapicType>, SapicType);
+
+/// `initTEFromSig` (Typing.hs:185-200): seed every signature function symbol
+/// with its `defaultFunctionType`, THEN overlay the user-declared function
+/// typings (`withUserDefinedFuns`, Typing.hs:191-192).  The user typings carry
+/// the declared argument / return types (e.g. `f(bitstring):bitstring`) that
+/// `typeWith` propagates onto the bound variables.
+fn init_te_from_sig(
+    maude_sig: &tamarin_term::maude_sig::MaudeSig,
+    user_fun_typings: &[UserFunTyping],
+) -> TypingEnvironment {
     let mut funs: BTreeMap<NoEqSym, (Vec<SapicType>, SapicType)> = BTreeMap::new();
     for fs in &maude_sig.st_fun_syms {
         funs.insert(fs.clone(), default_function_type(fs.arity));
+    }
+    // `withUserDefinedFuns`: overlay declared types onto the matching signature
+    // symbol (matched by name + arity, so the BTreeMap key — the actual term
+    // symbol — is preserved exactly, keeping the privacy/constructability flags
+    // that the process terms carry).
+    for (name, arg_types, out_type) in user_fun_typings {
+        let arity = arg_types.len();
+        if let Some(key) = maude_sig
+            .st_fun_syms
+            .iter()
+            .find(|fs| &fs.name[..] == name.as_bytes() && fs.arity == arity)
+        {
+            funs.insert(key.clone(), (arg_types.clone(), out_type.clone()));
+        }
     }
     TypingEnvironment { vars: BTreeMap::new(), funs }
 }
@@ -828,10 +895,11 @@ fn init_te_from_sig(maude_sig: &tamarin_term::maude_sig::MaudeSig) -> TypingEnvi
 /// `typeAndRenameProcess` (Typing.hs:209-212): renameUnique then typeProcess.
 pub fn type_and_rename_process(
     maude_sig: &tamarin_term::maude_sig::MaudeSig,
+    user_fun_typings: &[UserFunTyping],
     p: &PlainProcess,
 ) -> Result<PlainProcess, String> {
     let renamed = rename_unique(p);
-    let mut env = init_te_from_sig(maude_sig);
+    let mut env = init_te_from_sig(maude_sig, user_fun_typings);
     type_process(&mut env, &renamed)
 }
 

@@ -239,7 +239,16 @@ fn apply_m_action(
             Ok(SapicAction::ChIn {
                 chan: chan.map(|t| subst_term(subst, &t)),
                 msg: subst_term(subst, &msg),
-                match_vars,
+                // HS `apply subst (ChIn mt t vs) = ChIn … (applyMatchVars subst vs)`
+                // (Process.hs:320): each match var `v` is replaced by the
+                // variables of its image `subst(v)` (or kept if undefined).  When
+                // inlining a call like `Q(h(a))` into `in(<y, =x>)`, the param
+                // match-var `x` becomes the vars of `h(a)` (= `{a}`) so that
+                // `bindingsAct = frees(<y,h(a)>) \ {a} = {y}` — i.e. the already-
+                // bound `a` is NOT rebound (Bindings.hs:24).  Without this the
+                // stale `{x}` would leave `a` looking unbound, rebinding it to a
+                // fresh `a.N` and adding a spurious state-fact variable.
+                match_vars: apply_match_vars(subst, &match_vars),
             })
         }
         SapicAction::Insert(a, b) => {
@@ -299,6 +308,34 @@ fn apply_m_comb(
 /// SAPIC type (the substitution keys carry both typed and untyped forms).
 fn subst_term(subst: &SapicSubst, t: &SapicTerm) -> SapicTerm {
     apply_vterm(subst, t.clone())
+}
+
+/// `applyMatchVars subst vs` (Process.hs:304-309): `fromList . concatMap
+/// extractVars . toList` where `extractVars v = maybe [v] varsVTerm (imageOf
+/// subst v)`.  A match var `v` is replaced by ALL the variables of its image
+/// `subst(v)`; an undefined `v` is kept.  Probes both the typed and untyped
+/// substitution keys (the call subst carries both forms).
+fn apply_match_vars(
+    subst: &SapicSubst,
+    vs: &std::collections::BTreeSet<SapicLVar>,
+) -> std::collections::BTreeSet<SapicLVar> {
+    let mut out = std::collections::BTreeSet::new();
+    for v in vs {
+        let img = subst
+            .image_of(v)
+            .or_else(|| subst.image_of(&SapicLVar::untyped(v.var.clone())));
+        match img {
+            Some(t) => {
+                for w in tamarin_term::vterm::vars_vterm_in_order(t) {
+                    out.insert(w);
+                }
+            }
+            None => {
+                out.insert(v.clone());
+            }
+        }
+    }
+    out
 }
 
 fn subst_fact(

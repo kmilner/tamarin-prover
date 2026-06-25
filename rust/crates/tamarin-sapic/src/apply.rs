@@ -21,7 +21,7 @@ use tamarin_theory::theory::{OpenProtoRule, OpenRestriction, Theory, TheoryItem}
 
 use crate::inline::{collect_process_defs, convert_process_with_defs};
 use crate::translate::{needs_in_ev_res, translate, TranslateOptions};
-use crate::typing::type_and_rename_process;
+use crate::typing::{type_and_rename_process, UserFunTyping};
 
 /// Apply the SAPIC `process:` translation to a theory that contains exactly one
 /// top-level process.  A no-op for non-process theories (`elaborated.is_sapic`
@@ -57,9 +57,13 @@ pub fn apply_sapic(
         .map_err(|e| ElabError { message: format!("SAPIC translation: {}", e.message) })?;
 
     // P0e: typeTheory (renameUnique + type inference), using the elaborated
-    // signature's MaudeSig (HS `initTEFromSig`).
+    // signature's MaudeSig (HS `initTEFromSig`).  The user `functions:` typing
+    // declarations (`theoryFunctionTypingInfos`, e.g. `f(bitstring):bitstring`)
+    // seed the function-typing environment so `typeWith` can back-propagate a
+    // declared argument/return type onto the bound variables.
     let maude_sig = &elaborated.signature.maude_sig;
-    let typed = type_and_rename_process(maude_sig, &plain)
+    let user_fun_typings = collect_user_fun_typings(parsed);
+    let typed = type_and_rename_process(maude_sig, &user_fun_typings, &plain)
         .map_err(|e| ElabError { message: format!("SAPIC typing: {e}") })?;
 
     // translate → rules + restrictions.  `needs_in_ev_res = any
@@ -186,6 +190,24 @@ pub fn apply_sapic(
     }
 
     Ok(())
+}
+
+/// Collect the user `functions:` typing declarations (HS
+/// `theoryFunctionTypingInfos`).  Every parsed `FunctionDecl` becomes a
+/// `FunctionTypingInfo` (Theory/Text/Parser.hs:254-257 `addFunctionTypingInfo`),
+/// so we map each to its `(name, arg_types, out_type)` triple.  Plain `f/2`
+/// declarations carry `Nothing` types (the `defaultFunctionType`), which the
+/// typing env already holds — so they are harmless overlays.
+fn collect_user_fun_typings(parsed: &p::Theory) -> Vec<UserFunTyping> {
+    let mut out = Vec::new();
+    for item in &parsed.items {
+        if let p::TheoryItem::Functions(decls) = item {
+            for d in decls {
+                out.push((d.name.clone(), d.arg_types.clone(), d.out_type.clone()));
+            }
+        }
+    }
+    out
 }
 
 /// Re-elaborate a `_restrict`-rewritten parser-AST rule body into a

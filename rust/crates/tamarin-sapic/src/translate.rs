@@ -643,7 +643,7 @@ mod tests {
         // No function-typing needed for the rule-count check; type over an
         // empty signature (defaults all funs).
         let sig = tamarin_term::maude_sig::MaudeSig::default();
-        let typed = type_and_rename_process(&sig, &plain).unwrap();
+        let typed = type_and_rename_process(&sig, &[], &plain).unwrap();
         let st_rules = std::collections::BTreeSet::new();
         let tr = translate(&typed, false, &st_rules, TranslateOptions::default()).unwrap();
         // Init + new + event + out + null = 5 rules.

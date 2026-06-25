@@ -857,7 +857,7 @@ fn lvar_to_varspec(v: &LVar) -> tamarin_parser::ast::VarSpec {
 /// `LNTerm` → parser-AST `Term` (for the `let` else restriction body).  The
 /// restriction is rendered through the parser-AST formula printer, so we lower
 /// the LN term into the parser term universe (variables keep their sort/idx).
-fn ln_term_to_parser(t: &LNTerm) -> tamarin_parser::ast::Term {
+pub(crate) fn ln_term_to_parser(t: &LNTerm) -> tamarin_parser::ast::Term {
     use tamarin_parser::ast as p;
     use tamarin_term::function_symbols::{AcSym, FunSym};
     use tamarin_term::lterm::NameTag;
