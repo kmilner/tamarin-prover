@@ -111,9 +111,15 @@ fn map_let(
         }
     }
 
-    // Case C (LetDestructors.hs:62-65): keep the Let, annotate `annElse`.
-    let mut ann2 = ann;
-    ann2.else_branch = elsebranch;
+    // Case C (LetDestructors.hs:62-65): keep the Let, annotate `annElse
+    // elsebranch`.  HS `annElse b = mempty {elseBranch = b}` (Annotation.hs:131-132)
+    // builds a FRESH `mempty`-based annotation, REPLACING the existing one — so
+    // every other field (incl. the propagated `processnames`) is dropped back to
+    // its default.  `ann` (which carries the propagated process names) must NOT be
+    // reused here, else the role/color would over-propagate the enclosing
+    // sub-process name onto these let rules.
+    let _ = ann;
+    let ann2 = ProcessAnnotation::with_else_branch(elsebranch);
     let pl1 = map_proc(rules, pl);
     let pr1 = map_proc(rules, pr);
     Process::Comb(
@@ -150,9 +156,14 @@ fn case_destructor(
             let leftterms_subst = apply_vterm(&subst, leftterms_pairs);
             let rightterms_pairs = to_pairs(rightterms);
             // `new_an = annDestructorEquation leftermssubst (toPairs rightterms) elsebranch`
-            let mut new_an = ann;
-            new_an.destructor_equation = Some((leftterms_subst, rightterms_pairs));
-            new_an.else_branch = elsebranch;
+            // — HS `annDestructorEquation v1 v2 b = mempty { destructorEquation =
+            // Just (v1, v2), elseBranch = b }` (Annotation.hs:128-129) builds a
+            // FRESH `mempty`-based annotation, REPLACING the existing one.  Every
+            // other field (incl. the propagated `processnames`) is therefore reset
+            // to default — so `ann` must NOT be reused (see Case C above).
+            let _ = ann;
+            let new_an =
+                ProcessAnnotation::with_destructor_equation(leftterms_subst, rightterms_pairs, elsebranch);
             let pl1 = map_proc(rules, pl);
             let pr1 = map_proc(rules, pr);
             // The Let combinator `c` is preserved unchanged.  Reconstruct it
