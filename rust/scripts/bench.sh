@@ -70,6 +70,17 @@ measure() {
 cell_t() { [ "$1" = timeout ] && printf 'timeout' || printf '%s s' "$1"; }
 cell_m() { [ "$1" = "—" ] && printf '—' || printf '%s MB' "$1"; }
 
+# pct <rs> <hs> → " (-44%)" (RS vs HS; negative = lower).  Empty when either
+# side is non-numeric (timeout / — / zero baseline) so no bogus % is shown.
+pct() {
+    awk -v rs="$1" -v hs="$2" 'BEGIN{
+        if (rs !~ /^[0-9.]+$/ || hs !~ /^[0-9.]+$/ || hs+0==0) { exit }
+        printf " (%+.0f%%)", (rs-hs)/hs*100 }'
+}
+# RS cells: value + parenthetical % vs the HS value in the same row.
+cell_rs_t() { [ "$1" = timeout ] && printf 'timeout' || printf '%s s%s' "$1" "$(pct "$1" "$2")"; }
+cell_rs_m() { [ "$1" = "—" ] && printf '—' || printf '%s MB%s' "$1" "$(pct "$1" "$2")"; }
+
 # Emit the full marker block (header comment + per-core tables) to stdout.
 gen_block() {
     # Static header comment.  Kept in sync with the README prose; this is the
@@ -86,8 +97,9 @@ Both provers prove every lemma (--prove --derivcheck-timeout=30); HS at
 `+RTS -Nk`, RS at `--processors=k`; wall-clock + peak RSS come from
 `/usr/bin/time -v` (the prover process only — Maude is a separate subprocess on
 both sides and is excluded). Single run per cell (wall-clock is noisy ±10%).
-Tune the theory set / core counts / binaries via the FILES, CORES, TIMEOUT,
-DERIV, HS_PATH, RS_PATH env vars (see the scripts/bench.sh header comment).
+The RS columns show the % change vs HS in parentheses (negative = faster / less
+memory). Tune the theory set / core counts / binaries via the FILES, CORES,
+TIMEOUT, DERIV, HS_PATH, RS_PATH env vars (see the scripts/bench.sh header).
 -->
 HDR
     echo "<!-- last run: $(uname -m) Linux, $(nproc) cores -->"
@@ -103,7 +115,7 @@ HDR
             [ -f "$af" ] || { echo "| \`$base\` | (missing) | | | |"; continue; }
             h=$(measure "$HS_PATH" +RTS -N${k} -RTS --derivcheck-timeout="$DERIV" --prove "$af")
             r=$(measure "$RS_PATH" --processors="$k" --derivcheck-timeout="$DERIV" --prove "$af")
-            echo "| \`$base\` | $(cell_t "${h%|*}") | $(cell_t "${r%|*}") | $(cell_m "${h#*|}") | $(cell_m "${r#*|}") |"
+            echo "| \`$base\` | $(cell_t "${h%|*}") | $(cell_rs_t "${r%|*}" "${h%|*}") | $(cell_m "${h#*|}") | $(cell_rs_m "${r#*|}" "${h#*|}") |"
         done
     done
     echo
