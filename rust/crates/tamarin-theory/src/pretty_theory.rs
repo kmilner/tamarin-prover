@@ -2146,7 +2146,7 @@ fn pp_step_doc(
     prefix: &str,
 ) -> crate::pretty_hpj::Doc {
     use crate::constraint::constraints::Goal;
-    use crate::constraint::solver::proof_method::ProofMethod as PM;
+    use crate::constraint::solver::proof_method::{ProofMethod as PM, Result as MR};
     use crate::pretty_hpj::Doc;
     // `solve( <goal> )` builds its own goal Doc; everything else is a
     // flat string with no internal wrapping, so `Doc::text` of the
@@ -2175,6 +2175,29 @@ fn pp_step_doc(
         // re-parsing the goal text into a structured Doc and laying it out
         // through the same engine the live `SolveGoal` path uses.
         PM::RawSolve(raw) => raw_solve_to_doc(raw),
+        // HS `prettyProofMethod` (ProofMethod.hs:1496-1499):
+        //   Finished (Contradictory reason) ->
+        //     sep [ keyword_ "contradiction"
+        //         , maybe emptyDoc (closedComment . prettyContradiction) reason ]
+        // `closedComment d = comment $ fsep [text "/*", d, text "*/"]`
+        // (Pretty.hs:108-109).  Build this as a real Doc so HughesPJ's
+        // `sep`/`fsep` break the comment (and its `/*`…`*/` delimiters)
+        // onto their own lines at deep proof-tree indentation, identical
+        // to HS — the prior flat `pp_step_at` string could never wrap.
+        PM::Finished(MR::Contradictory(reason)) => {
+            let contra = Doc::text("contradiction");
+            match reason {
+                None => contra,
+                Some(c) => {
+                    let inner = crate::pretty_hpj::fsep(vec![
+                        Doc::text("/*"),
+                        Doc::text(pp_contradiction(c)),
+                        Doc::text("*/"),
+                    ]);
+                    crate::pretty_hpj::sep(vec![contra, inner])
+                }
+            }
+        }
         // For non-SolveGoal methods the goal indent argument is unused;
         // reuse `pp_step_at`'s string form.  `by `-prefixed leaf steps
         // (e.g. `by sorry`) render the method at the post-prefix column.
