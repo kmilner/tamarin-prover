@@ -1812,15 +1812,25 @@ fn render_parsed_restriction(r: &p::Restriction, macros: &[p::Macro], predicates
     // to `∃ z. r = l ++ z` BEFORE the formula is stored — and thus before it is
     // printed.  Mirror that here on both displayed formulas.
     // `arity1` is computed once by the caller and threaded in.
-    let original = crate::elaborate::rewrite_arity1_formula(
-        &expand_predicates_for_display(&r.formula, predicates), arity1);
+    //
+    // HS stores restriction formulas as `LNFormula`, whose AC heads
+    // (`Mult`/`Union`/`Xor`/`NatPlus`) are kept in `fAppAC`-sorted order
+    // (Term/Term/Raw.hs:118-122) — so a user-written union like `seq1 + dif`
+    // displays AC-sorted as `dif++seq1`.  Our parser keeps `BinOp` trees in
+    // written order, so re-establish the canonical AC operand order before
+    // rendering, exactly as the lemma display path does (render_parsed_lemma,
+    // `canonicalize_ac_in_formula`).
+    let original = crate::elaborate::canonicalize_ac_in_formula(
+        &crate::elaborate::rewrite_arity1_formula(
+            &expand_predicates_for_display(&r.formula, predicates), arity1));
     let expanded = if macros.is_empty() {
         original.clone()
     } else {
-        crate::elaborate::rewrite_arity1_formula(
-            &expand_predicates_for_display(
-                &crate::macro_expand::apply_macros_formula(macros, &r.formula), predicates),
-            arity1)
+        crate::elaborate::canonicalize_ac_in_formula(
+            &crate::elaborate::rewrite_arity1_formula(
+                &expand_predicates_for_display(
+                    &crate::macro_expand::apply_macros_formula(macros, &r.formula), predicates),
+                arity1))
     };
     let mut out = String::new();
     out.push_str("restriction ");

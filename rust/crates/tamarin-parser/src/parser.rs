@@ -2005,7 +2005,22 @@ impl<'a> Parser<'a> {
         }
         if self.try_punct("(<)") {
             let rhs = self.term(false)?;
-            return Ok(Formula::Atom(Atom::LessMset(lhs, rhs)));
+            // HS `smallerp` (Theory/Text/Parser/Formula.hs:30-38): the multiset
+            // comparison operator `a (<) b` desugars DIRECTLY into the built-in
+            // `Smaller` predicate fact at PARSE time —
+            //   `(Syntactic . Pred) $ protoFact Linear "Smaller" [a,b]`.
+            // There is no dedicated `(<)` atom downstream in HS; the whole
+            // pipeline (condition rendering, the `if Smaller(..)_<idx>` rule
+            // name, the restriction expansion via the built-in predicate, and
+            // the AC-sorted union rendering) flows from this being a `Smaller`
+            // predicate atom.  We mirror that exactly.
+            let fact = Fact {
+                persistent: false,
+                name: "Smaller".to_string(),
+                args: vec![lhs, rhs],
+                annotations: Vec::new(),
+            };
+            return Ok(Formula::Atom(Atom::Pred(fact)));
         }
         if self.try_punct("<") {
             // HS `blatom` (Formula.hs:49) restricts both operands of `<` to

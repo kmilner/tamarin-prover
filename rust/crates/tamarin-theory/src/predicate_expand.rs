@@ -289,11 +289,20 @@ fn smaller_expansion(lhs: &p::Term, rhs: &p::Term) -> p::Formula {
         typ: None,
     };
     let z_term = p::Term::Var(z.clone());
-    let sum = p::Term::BinOp(
+    // HS builds the body union via `fAppUnion (fvt x, fvt z)`
+    // (Predicate.hs:64-66), and `fAppUnion = fAppAC Union` SORTS its
+    // arguments on construction (Term/Term/Raw.hs:118-122).  Applying the
+    // use-site substitution (`x ↦ <lhs>`, `y ↦ <rhs>`) then re-normalises
+    // the AC term, re-sorting by `Ord LVar` = (idx, sort, name).  So the
+    // displayed union is always AC-sorted, e.g. an existential `z` (idx 0)
+    // precedes a use-site abstraction `x.1` (idx 1) → `z++x.1`, NOT
+    // `x.1++z`.  Build the union then canonicalise it exactly as the rest
+    // of the AC pipeline does (`canonicalize_ac_in_pterm`).
+    let sum = crate::elaborate::canonicalize_ac_in_pterm(&p::Term::BinOp(
         p::BinOp::Union,
         Box::new(lhs.clone()),
         Box::new(z_term),
-    );
+    ));
     p::Formula::Exists(
         vec![z],
         Box::new(p::Formula::Atom(p::Atom::Eq(rhs.clone(), sum))),
