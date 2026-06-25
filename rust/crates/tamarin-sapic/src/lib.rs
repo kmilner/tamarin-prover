@@ -9,15 +9,50 @@
 //! - [`bindings`] ← `Sapic.Bindings`
 //! - [`annotation`] ← `Sapic.Annotation`
 //! - [`secret_channels`] ← `Sapic.SecretChannels`
+//! - [`facts`] ← `Sapic.Facts`
+//! - [`typing`] ← `Sapic.Typing`
+//! - [`locks`] ← `Sapic.Locks` (lock annotation; `checkLocks` not ported)
+//! - [`inline`] ← process-call inlining (HS does this in the parser,
+//!   `Theory.Text.Parser.Sapic.actionprocess`)
+//! - [`let_destructors`] ← `Sapic.LetDestructors` (`let`-elimination /
+//!   destructor-let annotation)
+//! - [`base_translation`] ← `Sapic.Basetranslation`
+//!   (linear + state + locks + `let` (FLet) + process-call marker)
+//! - [`translate`] / [`apply`] ← top-level `Sapic`
 //!
-//! Not yet ported (~2700 LOC remaining):
-//! `Sapic.Exceptions`, `Sapic.Facts`, `Sapic.Typing`,
-//! `Sapic.LetDestructors`, `Sapic.Locks`, `Sapic.States`,
-//! `Sapic.Compression`, `Sapic.ProgressFunction`,
-//! `Sapic.ProgressTranslation`, `Sapic.Report`,
-//! `Sapic.ReliableChannelTranslation`, `Sapic.Basetranslation`,
-//! `Sapic.Warnings`, top-level `Sapic`.
+//! - [`states`] ← `Sapic.States` (pure-state / state-channel optimisation,
+//!   gated on `options: translation-state-optimisation` / `_stateChannelOpt`)
+//!
+//! - [`warnings`] ← `Sapic.Warnings` (SAPIC-process wellformedness report;
+//!   bound-twice / `WFBoundTwice` arm — `checkLocks` arm deferred)
+//!
+//! Not yet ported (later phases):
+//! `Sapic.Exceptions`,
+//! `Sapic.Report`,
+//! plus secret/private channels (`ChIn`/`ChOut` on a named/private channel)
+//! in `convert`/`base_translation`.
+//!
+//! Phase 7 ported: [`progress_function`] ← `Sapic.ProgressFunction`,
+//! [`progress_translation`] ← `Sapic.ProgressTranslation`,
+//! [`reliable_channel`] ← `Sapic.ReliableChannelTranslation`,
+//! [`compression`] ← `Sapic.Compression`.
 
 pub mod annotation;
+pub mod apply;
+pub mod base_translation;
 pub mod bindings;
+pub mod compression;
+pub mod convert;
+pub mod facts;
+pub mod inline;
+pub mod let_destructors;
+pub mod locks;
+pub mod progress_function;
+pub mod progress_translation;
+pub mod reliable_channel;
+pub mod report;
 pub mod secret_channels;
+pub mod states;
+pub mod translate;
+pub mod typing;
+pub mod warnings;

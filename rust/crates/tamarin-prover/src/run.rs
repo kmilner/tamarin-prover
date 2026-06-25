@@ -734,6 +734,82 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             }
         }
 
+        // SAPIC `process:` translation (HS `typeTheory` → `translate`,
+        // TheoryLoader.hs:430).  Runs ONLY for `is_sapic` theories (exactly one
+        // top-level `process:`); a no-op otherwise, so non-process theories are
+        // byte-unchanged.  Injects the generated rules + `single_session`
+        // restriction + `heuristic: p` into BOTH `parsed` (for rendering) and
+        // `elaborated` (for solving / AC-variant pre-computation), so it MUST
+        // run before `populate_rule_variants` below.  `user_set_heuristic` is
+        // true iff a `heuristic:` item already populated `elaborated.heuristic`
+        // (HS `addHeuristic` returns `Nothing` in that case).
+        // Install the user/builtin function-symbol flag sets
+        // (`USER_PRIVATE_FUNS` / `USER_DESTRUCTOR_FUNS` / …) for the duration
+        // of SAPIC translation AND the variant pre-computation below.  These
+        // thread-locals drive `term_to_lnterm`'s symbol resolution
+        // (privacy / constructability); `elaborate()` sets them only for its
+        // own scope, so without re-installing them here the SAPIC-injected
+        // rules' builtin symbols (`rep` private, `check_rep` / `get_rep`
+        // destructors from `locations-report`) re-elaborate with the default
+        // public-constructor flags, serialising as `tamXC..` — which Maude
+        // rejects, leaving the rule with "no variants".
+        let _sapic_funs_guard =
+            tamarin_theory::elaborate::set_user_funs_for_theory(&parsed);
+        {
+            let user_set_heuristic = !elaborated.heuristic.is_empty();
+            let sapic_wf = tamarin_sapic::apply::apply_sapic(
+                &mut parsed, &mut elaborated, user_set_heuristic,
+            ).map_err(|e| RunError(format!(
+                "SAPIC translation error in {}: {}", in_file, e.message)))?;
+            // HS `Sapic.checkWellformedness` (Warnings.hs:37-38) is part of
+            // `preReport`, which is PREPENDED to the rest of the report
+            // (`preReport ++ postReport`, TheoryLoader.hs:455/631).  Prepend
+            // the SAPIC-process warnings so they render FIRST in the
+            // wellformedness block (and the trailing `N wellformedness check
+            // failed` summary counts them via `wf_report.len()`).
+            if !sapic_wf.is_empty() {
+                let mut new_report = sapic_wf;
+                new_report.extend(std::mem::take(&mut wf_report));
+                wf_report = new_report;
+            }
+        }
+        phase!("sapic translate");
+
+        // HS runs the full `checkWellformedness` on the TRANSLATED theory
+        // (TheoryLoader.hs:469-473, `checkTranslatedTheory`), i.e. AFTER SAPIC
+        // `translate` has injected the generated rules.  Our `check_theory` ran
+        // earlier on the PRE-translation theory (line ~600), so the SAPIC rules
+        // were invisible to the rule-dependent fact checks.  Re-run
+        // `factLhsOccurNoRhs` on the post-translation parsed theory (macros
+        // expanded, as HS `thyProtoRules` does) so SAPIC-only premise facts —
+        // e.g. a `Message( c, m )` consumed by an `in(c,m)` with no producing
+        // `out` — are surfaced, byte-identically to HS.  For non-SAPIC theories
+        // this is a no-op (the pre- and post-translation rule sets are equal).
+        if elaborated.is_sapic {
+            let post_thy = {
+                let mut tmp = parsed.clone();
+                tamarin_theory::macro_expand::expand_theory_macros(&mut tmp);
+                tmp
+            };
+            let topic = "Facts occur in the left-hand-side but not in any right-hand-side ";
+            wf_report.retain(|e| e.topic != topic);
+            let lhs_rhs = tamarin_parser::wf::fact_lhs_occur_no_rhs(&post_thy);
+            if !lhs_rhs.is_empty() {
+                // Insert at the factReports position (after fact_usage, before
+                // formulaReports), matching HS check order.
+                let insert_before = wf_report.iter().position(|e| {
+                    matches!(e.topic.as_str(),
+                        "Formula terms" | " Formula guardedness"
+                        | "Lemma annotations" | "Multiplication restriction of rules"
+                        | "Nat Sorts" | "Subterm Convergence Warning"
+                        | "Message Derivation Checks" | "Derivation Checks")
+                }).unwrap_or(wf_report.len());
+                let tail = wf_report.split_off(insert_before);
+                wf_report.extend(lhs_rhs);
+                wf_report.extend(tail);
+            }
+        }
+
         // Spawn a single Maude handle for this file.  Used by:
         //   - the rule-variants computation that populates each rule's
         //     `variant_substs` + `abstracted_rule` (so the pretty-printer
@@ -1325,6 +1401,12 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
 fn wf_headerless_preamble(topic: &str) -> Option<String> {
     use tamarin_parser::wf::underline_topic;
     match topic {
+        // SAPIC-process wellformedness errors (HS `toWfErrorReport`,
+        // Warnings.hs:23-26).  Unlike the other topics, HS does NOT underline
+        // this one — `prettyWfErrorReport` renders it as a bare `text topic`
+        // (Wellformedness.hs:124).  So the per-error bodies (each
+        // `"  Variable bound twice: x."`) sit directly under a plain header.
+        "Wellformedness-error in Process" => Some(format!("{topic}\n")),
         "Unbound variables" | "Reserved names" | "Special facts" => {
             Some(format!("{}\n", underline_topic(topic)))
         }

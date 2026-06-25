@@ -443,6 +443,48 @@ pub fn simple_injective_fact_instances(
     out
 }
 
+/// HS `pureStateFactTag` / `pureStateLockFactTag` (Facts.hs:272-276): the two
+/// fact tags `setforcedInjectiveFacts` forces injective when the state-channel
+/// optimisation is on (Sapic.hs:84).  Both are `L_PureState/2` / `L_CellLocked/2`,
+/// linear, arity 2.
+pub fn pure_state_forced_fact_tags() -> Vec<FactTag> {
+    use crate::fact::Multiplicity;
+    vec![
+        FactTag::Proto(Multiplicity::Linear, "L_PureState".to_string(), 2),
+        FactTag::Proto(Multiplicity::Linear, "L_CellLocked".to_string(), 2),
+    ]
+}
+
+/// Union the forced-injective fact tags into a computed
+/// `simple_injective_fact_instances` result, mirroring HS `closeRuleCache`
+/// (Rule.hs:147-150):
+///
+/// ```haskell
+/// forcedInjFacts' = S.map (\x -> (x, replicate (factTagArity x) [Unspecified])) forcedInjFacts
+/// injFactInstances = forcedInjFacts' `S.union` simpleInjectiveFactInstances ...
+/// ```
+///
+/// Each forced tag carries `replicate arity [Unspecified]` as its behaviour
+/// (one singleton `[Unspecified]` per argument position).  `S.union` keeps the
+/// LEFT (forced) entry on a tag collision, then `S.toList` sorts by `Ord
+/// FactTag`; we reproduce that with a tag-keyed merge + sort.
+pub fn union_forced_injective_fact_instances(
+    computed: Vec<(FactTag, Vec<Vec<MonotonicBehaviour>>)>,
+    forced: &[FactTag],
+) -> Vec<(FactTag, Vec<Vec<MonotonicBehaviour>>)> {
+    use crate::fact::fact_tag_arity;
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<FactTag, Vec<Vec<MonotonicBehaviour>>> =
+        computed.into_iter().collect();
+    for tag in forced {
+        // `S.union` is LEFT-biased; the forced entry wins on collision.
+        let arity = fact_tag_arity(tag);
+        let behaviour = vec![vec![MonotonicBehaviour::Unspecified]; arity];
+        map.insert(tag.clone(), behaviour);
+    }
+    map.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

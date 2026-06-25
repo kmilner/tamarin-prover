@@ -402,10 +402,19 @@ fn render_injective_fact_insts(elab: &Theory) -> String {
     let proto_rules: Vec<&crate::rule::ProtoRuleE> = elab.rules()
         .map(|r| &r.rule)
         .collect();
-    let tags = crate::tools::injective_fact_instances::simple_injective_fact_instances(
+    let mut tags = crate::tools::injective_fact_instances::simple_injective_fact_instances(
         &proto_rules,
         &elab.signature.maude_sig.reducible_fun_syms,
     );
+    // HS `closeRuleCache` (Rule.hs:147-150): union the FORCED injective facts
+    // (`setforcedInjectiveFacts {L_PureState, L_CellLocked}`, Sapic.hs:84) when
+    // the state-channel optimisation is on.
+    if elab.options.state_channel_opt {
+        tags = crate::tools::injective_fact_instances::union_forced_injective_fact_instances(
+            tags,
+            &crate::tools::injective_fact_instances::pure_state_forced_fact_tags(),
+        );
+    }
     if tags.is_empty() { return String::new(); }
     // HS `showFactTagArity` (Fact.hs:526): persistent `!`-prefix + name
     // + `/` + arity.
@@ -964,6 +973,14 @@ fn rule_attribute_parts(attrs: &[p::RuleAttr]) -> Vec<String> {
         p::RuleAttr::Color(c) => Some(c), _ => None }) {
         parts.push(format!("color=#{}", hex.trim_start_matches('#').to_lowercase()));
     }
+    // process= : HS `ppProcess p = text "process=" <> "\"" ++ topLevel ++ "\""`
+    // (Model/Rule.hs:1210).  Rendered between color= and no_derivcheck.  Only
+    // SAPIC-translation-generated rules carry it (the parser ignores a
+    // user-written `process=`); the LAST occurrence wins (Maybe field).
+    if let Some(s) = attrs.iter().rev().find_map(|a| match a {
+        p::RuleAttr::Process(s) => Some(s), _ => None }) {
+        parts.push(format!("process=\"{}\"", s));
+    }
     if attrs.iter().any(|a| matches!(a, p::RuleAttr::NoDerivCheck)) {
         parts.push("no_derivcheck".to_string());
     }
@@ -994,15 +1011,6 @@ fn rule_attributes_doc(attrs: &[p::RuleAttr]) -> crate::pretty_hpj::Doc {
     // continuation hangs at the column right after `[` (beside, no space).
     let inner = hpj::fsep(hpj::punctuate(Doc::text(","), part_docs));
     Doc::text("[").beside(inner).beside(Doc::text("]"))
-}
-
-/// Flat `[a, b, c]` rendering of the rule attributes (no `fsep` wrapping).
-/// Used for the `/* rule (modulo AC) … */` comment block, whose surrounding
-/// layout is built by string concatenation rather than the Doc engine.  Shares
-/// the last-wins / `process=`-dropping logic via [`rule_attribute_parts`].
-fn render_rule_attributes(attrs: &[p::RuleAttr]) -> String {
-    let parts = rule_attribute_parts(attrs);
-    if parts.is_empty() { String::new() } else { format!("[{}]", parts.join(", ")) }
 }
 
 fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro], arity1: &std::collections::HashSet<String>, manual_variants: bool, auto_sources: bool) -> String {
@@ -1301,7 +1309,28 @@ fn render_rule_body_at(prems: &[p::Fact], acts: &[p::Fact], concs: &[p::Fact], i
 fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule, attrs: &[p::RuleAttr]) -> String {
     let mut s = String::new();
     s.push_str("  /*\n");
-    s.push_str(&format!("  rule (modulo AC) {}{}:\n", name, render_rule_attributes(attrs)));
+    // HS renders the AC rule via `nest 2 (multiComment (prettyProtoRuleAC …))`
+    // (ClosedTheory.hs:354), so the `rule (modulo AC) <name>[attrs]:` header
+    // line sits at column 2 and its attribute-list `fsep` wraps at the ribbon
+    // width with the continuation hanging right after the `[`.  Build it through
+    // the same Doc engine as the modulo-E header, prefixed by the 2-space
+    // comment indent so the absolute columns (and thus the wrap point) match HS.
+    {
+        use crate::pretty_hpj::Doc;
+        // Build the header with NO leading spaces, then `nest(2)` so BOTH the
+        // first line and the `fsep` continuation are indented exactly like HS's
+        // `nest 2 (multiComment …)` — the ribbon/width accounting is measured
+        // from the nest-2 baseline (a literal 2-space text prefix would charge
+        // the first line differently and wrap one element too early; cf.
+        // no-replication.spthy `news_0_`).
+        let header = Doc::text("rule (modulo AC)")
+            .beside_sp(Doc::text(name.to_string()))
+            .beside(rule_attributes_doc(attrs))
+            .beside(Doc::text(":"))
+            .nest(2);
+        s.push_str(&header.render());
+        s.push('\n');
+    }
     // Body of the abstracted rule.  Use the abstracted rule's facts when
     // available; when `abstracted_rule` is `None` (no reducible-headed
     // sub-terms), fall back to the ELABORATED rule's facts (`rule.rule`).
@@ -1452,7 +1481,7 @@ fn lnfacts_to_parser(facts: &[crate::fact::LNFact]) -> Vec<p::Fact> {
     facts.iter().map(lnfact_to_parser).collect()
 }
 
-pub(crate) fn lnfact_to_parser(fa: &crate::fact::LNFact) -> p::Fact {
+pub fn lnfact_to_parser(fa: &crate::fact::LNFact) -> p::Fact {
     use crate::fact::FactTag;
     let (name, persistent) = match &fa.tag {
         FactTag::Proto(crate::fact::Multiplicity::Persistent, n, _) => (n.clone(), true),
@@ -1783,15 +1812,25 @@ fn render_parsed_restriction(r: &p::Restriction, macros: &[p::Macro], predicates
     // to `∃ z. r = l ++ z` BEFORE the formula is stored — and thus before it is
     // printed.  Mirror that here on both displayed formulas.
     // `arity1` is computed once by the caller and threaded in.
-    let original = crate::elaborate::rewrite_arity1_formula(
-        &expand_predicates_for_display(&r.formula, predicates), arity1);
+    //
+    // HS stores restriction formulas as `LNFormula`, whose AC heads
+    // (`Mult`/`Union`/`Xor`/`NatPlus`) are kept in `fAppAC`-sorted order
+    // (Term/Term/Raw.hs:118-122) — so a user-written union like `seq1 + dif`
+    // displays AC-sorted as `dif++seq1`.  Our parser keeps `BinOp` trees in
+    // written order, so re-establish the canonical AC operand order before
+    // rendering, exactly as the lemma display path does (render_parsed_lemma,
+    // `canonicalize_ac_in_formula`).
+    let original = crate::elaborate::canonicalize_ac_in_formula(
+        &crate::elaborate::rewrite_arity1_formula(
+            &expand_predicates_for_display(&r.formula, predicates), arity1));
     let expanded = if macros.is_empty() {
         original.clone()
     } else {
-        crate::elaborate::rewrite_arity1_formula(
-            &expand_predicates_for_display(
-                &crate::macro_expand::apply_macros_formula(macros, &r.formula), predicates),
-            arity1)
+        crate::elaborate::canonicalize_ac_in_formula(
+            &crate::elaborate::rewrite_arity1_formula(
+                &expand_predicates_for_display(
+                    &crate::macro_expand::apply_macros_formula(macros, &r.formula), predicates),
+                arity1))
     };
     let mut out = String::new();
     out.push_str("restriction ");
@@ -2107,7 +2146,7 @@ fn pp_step_doc(
     prefix: &str,
 ) -> crate::pretty_hpj::Doc {
     use crate::constraint::constraints::Goal;
-    use crate::constraint::solver::proof_method::ProofMethod as PM;
+    use crate::constraint::solver::proof_method::{ProofMethod as PM, Result as MR};
     use crate::pretty_hpj::Doc;
     // `solve( <goal> )` builds its own goal Doc; everything else is a
     // flat string with no internal wrapping, so `Doc::text` of the
@@ -2136,6 +2175,29 @@ fn pp_step_doc(
         // re-parsing the goal text into a structured Doc and laying it out
         // through the same engine the live `SolveGoal` path uses.
         PM::RawSolve(raw) => raw_solve_to_doc(raw),
+        // HS `prettyProofMethod` (ProofMethod.hs:1496-1499):
+        //   Finished (Contradictory reason) ->
+        //     sep [ keyword_ "contradiction"
+        //         , maybe emptyDoc (closedComment . prettyContradiction) reason ]
+        // `closedComment d = comment $ fsep [text "/*", d, text "*/"]`
+        // (Pretty.hs:108-109).  Build this as a real Doc so HughesPJ's
+        // `sep`/`fsep` break the comment (and its `/*`…`*/` delimiters)
+        // onto their own lines at deep proof-tree indentation, identical
+        // to HS — the prior flat `pp_step_at` string could never wrap.
+        PM::Finished(MR::Contradictory(reason)) => {
+            let contra = Doc::text("contradiction");
+            match reason {
+                None => contra,
+                Some(c) => {
+                    let inner = crate::pretty_hpj::fsep(vec![
+                        Doc::text("/*"),
+                        Doc::text(pp_contradiction(c)),
+                        Doc::text("*/"),
+                    ]);
+                    crate::pretty_hpj::sep(vec![contra, inner])
+                }
+            }
+        }
         // For non-SolveGoal methods the goal indent argument is unused;
         // reuse `pp_step_at`'s string form.  `by `-prefixed leaf steps
         // (e.g. `by sorry`) render the method at the post-prefix column.

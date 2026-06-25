@@ -475,11 +475,19 @@ impl ProverSession {
             restrictions.push(rg);
         }
         let rules: Vec<OpenProtoRule> = theory.rules().cloned().collect();
+        // HS `setforcedInjectiveFacts {L_PureState, L_CellLocked}` (Sapic.hs:84):
+        // when the state-channel optimisation is on, those two facts are forced
+        // injective for the WHOLE proof (`closeRuleCache`, Rule.hs:147-150).
+        let forced_injective_facts: Vec<crate::fact::FactTag> = if theory.options.state_channel_opt {
+            crate::tools::injective_fact_instances::pure_state_forced_fact_tags()
+        } else {
+            Vec::new()
+        };
         // Capture the fresh-counter span around the template build so we
         // can replay the bump per lemma (see `setup_counter_delta` docs).
         let setup_counter_before = maude.fresh_counter_peek();
-        let template_ctx = ProofContext::new_with_restrictions_and_pool(
-            maude.clone(), pool, rules, restrictions.clone());
+        let template_ctx = ProofContext::new_with_restrictions_pool_forced(
+            maude.clone(), pool, rules, restrictions.clone(), &forced_injective_facts);
         let setup_counter_after = maude.fresh_counter_peek();
         let setup_counter_delta = setup_counter_after.saturating_sub(setup_counter_before);
         Ok(ProverSession {
@@ -644,25 +652,38 @@ fn prove_lemma_in_session_mode(
     let mut typing_assumptions: Vec<Guarded> = Vec::new();
     // `source_key` identifies the refined-source computation: the SORTED
     // set of `[sources]`-lemma names folded into `typing_assumptions`.
-    // Every normal lemma yields the full set (the current lemma, being
-    // normal, is never a `[sources]` lemma so the `continue` below never
-    // fires for it); a `[sources]` lemma yields the set minus itself.
+    //
+    // HS-faithful per-lemma RAW-vs-REFINED selection (ClosedTheory.hs:116-118
+    // `cases = case lemmaSourceKind l of RawSource -> crcRawSources;
+    // RefinedSource -> crcRefinedSources`).  `[sources]` lemmas (RawSource,
+    // Lemma.hs:40) use the RAW precomputed sources — `refineWithSourceAsms`
+    // is NEVER applied to them — so they must carry NO typing assumptions
+    // (an empty list makes `ensure_saturated` skip the refine and use the
+    // raw cases verbatim).  All other lemmas (RefinedSource) use the refined
+    // sources (`refineWithSourceAsms parameters typAsms`, Rule.hs:157), so
+    // they fold in every `[sources]`-lemma assumption.  Without this gate RS
+    // refined EVERY lemma's sources, which both (a) wrongly applied refine to
+    // the `[sources]` lemmas themselves (init_server) and (b) is the seam
+    // that lets the refine actually drop the extra coerce/open-chain `outL`
+    // deconstruction case for the non-`[sources]` lemmas.
     let mut source_key: Vec<String> = Vec::new();
-    for prior in theory.lemmas() {
-        if prior.name == lemma_name { continue; }
-        if !prior.attributes.iter().any(|a| matches!(a, crate::theory::LemmaAttr::Sources)) {
-            continue;
+    if lemma_source_kind >= SourceKind::RefinedSources {
+        for prior in theory.lemmas() {
+            if prior.name == lemma_name { continue; }
+            if !prior.attributes.iter().any(|a| matches!(a, crate::theory::LemmaAttr::Sources)) {
+                continue;
+            }
+            if !matches!(prior.trace_quantifier, crate::theory::TraceQuantifier::AllTraces) {
+                continue;
+            }
+            // HS `typAsms` (Prover.hs:142-144) uses `formulaToGuarded_`
+            // (fail-loud) on each source-lemma formula — propagate rather than
+            // silently drop.
+            let rg = formula_to_guarded(&prior.formula)
+                .map_err(|e| ProveError::Guarded(guard_error_doc(&e, &prior.formula)))?;
+            typing_assumptions.push(rg);
+            source_key.push(prior.name.clone());
         }
-        if !matches!(prior.trace_quantifier, crate::theory::TraceQuantifier::AllTraces) {
-            continue;
-        }
-        // HS `typAsms` (Prover.hs:142-144) uses `formulaToGuarded_`
-        // (fail-loud) on each source-lemma formula — propagate rather than
-        // silently drop.
-        let rg = formula_to_guarded(&prior.formula)
-            .map_err(|e| ProveError::Guarded(guard_error_doc(&e, &prior.formula)))?;
-        typing_assumptions.push(rg);
-        source_key.push(prior.name.clone());
     }
     source_key.sort();
     ctx.typing_assumptions = typing_assumptions;
@@ -951,13 +972,20 @@ pub fn prove_lemma_with_pool_file_heuristic(
         if trace { Some(std::time::Instant::now()) } else { None };
     // Bridge the elaborated theory's rules into the proof context.
     let rules: Vec<OpenProtoRule> = theory.rules().cloned().collect();
+    // HS `setforcedInjectiveFacts {L_PureState, L_CellLocked}` (Sapic.hs:84):
+    // force those facts injective when the state-channel optimisation is on.
+    let forced_injective_facts: Vec<crate::fact::FactTag> = if theory.options.state_channel_opt {
+        crate::tools::injective_fact_instances::pure_state_forced_fact_tags()
+    } else {
+        Vec::new()
+    };
     // Install the optional `maude_pool` BEFORE the precompute phase
     // runs inside the constructor — `precompute_full_sources` calls
     // `saturate_sources_with_simp` which is parallel and benefits
     // from the pool.  Setting `maude_pool` after construction would
     // leave that initial precompute on the single shared `maude`.
-    let mut ctx = ProofContext::new_with_restrictions_and_pool(
-        maude, pool, rules, restrictions.clone());
+    let mut ctx = ProofContext::new_with_restrictions_pool_forced(
+        maude, pool, rules, restrictions.clone(), &forced_injective_facts);
     if trace { eprintln!("[phase] ProofContext::new done dt={:.3}s",
         t_ctx.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64())); }
     // Propagate the lemma's trace quantifier so `is_finished` can
@@ -1017,26 +1045,34 @@ pub fn prove_lemma_with_pool_file_heuristic(
     // `refineWithSourceAsms` — typing-style protocols rely on these
     // assumptions to filter out spurious decryption cases that would
     // otherwise surface as false counterexamples in our search.
+    // HS-faithful per-lemma RAW-vs-REFINED selection (ClosedTheory.hs:116-118,
+    // Lemma.hs:40): `[sources]` lemmas (RawSource) use the RAW precomputed
+    // sources — `refineWithSourceAsms` is NEVER applied to them — so they
+    // carry NO typing assumptions (empty list => `ensure_saturated` skips the
+    // refine).  All other lemmas (RefinedSource) fold in every prior
+    // `[sources]`-lemma assumption (HS `typAsms`, Prover.hs:142-144).
     let mut typing_assumptions: Vec<Guarded> = Vec::new();
-    for prior in theory.lemmas() {
-        // Exclude the lemma we're currently proving — using it as its
-        // own refinement assumption is circular.  In Haskell, [sources]
-        // lemmas are proved via induction (against unrefined source-
-        // cases); only AFTER they're proved do they become typing
-        // assumptions for OTHER lemmas' source-case refinement.
-        if prior.name == lemma_name { continue; }
-        if !prior.attributes.iter().any(|a| matches!(a, crate::theory::LemmaAttr::Sources)) {
-            continue;
+    if lemma_source_kind >= SourceKind::RefinedSources {
+        for prior in theory.lemmas() {
+            // Exclude the lemma we're currently proving — using it as its
+            // own refinement assumption is circular.  In Haskell, [sources]
+            // lemmas are proved via induction (against unrefined source-
+            // cases); only AFTER they're proved do they become typing
+            // assumptions for OTHER lemmas' source-case refinement.
+            if prior.name == lemma_name { continue; }
+            if !prior.attributes.iter().any(|a| matches!(a, crate::theory::LemmaAttr::Sources)) {
+                continue;
+            }
+            if !matches!(prior.trace_quantifier, crate::theory::TraceQuantifier::AllTraces) {
+                continue;
+            }
+            // HS `typAsms` (Prover.hs:142-144) uses `formulaToGuarded_`
+            // (fail-loud) on each source-lemma formula — propagate rather than
+            // silently drop.
+            let rg = formula_to_guarded(&prior.formula)
+                .map_err(|e| ProveError::Guarded(guard_error_doc(&e, &prior.formula)))?;
+            typing_assumptions.push(rg);
         }
-        if !matches!(prior.trace_quantifier, crate::theory::TraceQuantifier::AllTraces) {
-            continue;
-        }
-        // HS `typAsms` (Prover.hs:142-144) uses `formulaToGuarded_`
-        // (fail-loud) on each source-lemma formula — propagate rather than
-        // silently drop.
-        let rg = formula_to_guarded(&prior.formula)
-            .map_err(|e| ProveError::Guarded(guard_error_doc(&e, &prior.formula)))?;
-        typing_assumptions.push(rg);
     }
     // HS-faithful saturation: store typing assumptions, then eagerly
     // run `ensure_saturated` (which applies `refine_with_source_asms`

@@ -4776,6 +4776,24 @@ impl<'ctx> Reduction<'ctx> {
                         avoid_max,
                         Some(self.ctx),
                     ) {
+                        // HS-faithful `solveWithSource` returned `Just []`:
+                        // the source pattern MATCHED the live goal but has
+                        // ZERO precomputed cases (e.g. a builtin destructor
+                        // `KU(check_rep(..))` / `KU(get_rep(..))` whose only
+                        // source — the `coerce`→`KD`→chain — was contradicted
+                        // during saturation).  HS's `maybe (solveGoal) ... ws`
+                        // takes the `Just` branch → the reduction yields 0
+                        // branches → the node closes (`by`).  RS must mirror
+                        // by returning `Contradictory` here, NOT falling
+                        // through to runtime rule enumeration (which re-opens
+                        // the `coerce` case HS prunes).  `Some([])` is emitted
+                        // ONLY when the matched source has no cases at all (see
+                        // `solve_with_source_cases_action_with_ctx`); a matched
+                        // source with cases that all fail the live graft still
+                        // returns `None` and falls through as before.
+                        if case_pairs.is_empty() {
+                            return GoalCases::Contradictory;
+                        }
                         let live_goal = Goal::Action(i.clone(), fa.clone());
                         let mut out: Vec<(String, crate::constraint::system::System)> = Vec::new();
                         // Runtime filterCases (mirroring Haskell's

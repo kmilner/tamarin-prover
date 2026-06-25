@@ -1932,7 +1932,7 @@ impl<'a> Parser<'a> {
             loop {
                 self.skip_ws();
                 if self.lx.peek() == Some('.') { break; }
-                let v = self.var_spec()?;
+                let v = self.quantifier_binder()?;
                 vs.push(v);
             }
             self.require_punct(".")?;
@@ -1944,7 +1944,7 @@ impl<'a> Parser<'a> {
             loop {
                 self.skip_ws();
                 if self.lx.peek() == Some('.') { break; }
-                let v = self.var_spec()?;
+                let v = self.quantifier_binder()?;
                 vs.push(v);
             }
             self.require_punct(".")?;
@@ -2005,7 +2005,22 @@ impl<'a> Parser<'a> {
         }
         if self.try_punct("(<)") {
             let rhs = self.term(false)?;
-            return Ok(Formula::Atom(Atom::LessMset(lhs, rhs)));
+            // HS `smallerp` (Theory/Text/Parser/Formula.hs:30-38): the multiset
+            // comparison operator `a (<) b` desugars DIRECTLY into the built-in
+            // `Smaller` predicate fact at PARSE time —
+            //   `(Syntactic . Pred) $ protoFact Linear "Smaller" [a,b]`.
+            // There is no dedicated `(<)` atom downstream in HS; the whole
+            // pipeline (condition rendering, the `if Smaller(..)_<idx>` rule
+            // name, the restriction expansion via the built-in predicate, and
+            // the AC-sorted union rendering) flows from this being a `Smaller`
+            // predicate atom.  We mirror that exactly.
+            let fact = Fact {
+                persistent: false,
+                name: "Smaller".to_string(),
+                args: vec![lhs, rhs],
+                annotations: Vec::new(),
+            };
+            return Ok(Formula::Atom(Atom::Pred(fact)));
         }
         if self.try_punct("<") {
             // HS `blatom` (Formula.hs:49) restricts both operands of `<` to
@@ -2405,6 +2420,28 @@ impl<'a> Parser<'a> {
         // Allow `: msg | pub | fresh | node | nat` sort suffix or a SAPIC
         // type annotation after the variable.
         self.attach_sort_suffix(v)
+    }
+
+    /// Parse a quantifier binder variable (`All`/`Ex` binder list), mirroring
+    /// HS `quantification`'s `many1 (try varp <|> nodep)` with `varp = msgvar`,
+    /// `nodep = nodevar` (Formula.hs:75, Token.hs:440-447).  `msgvar` parses a
+    /// PREFIXLESS binder as `LSortMsg` (Token.hs:426,441) — there is no
+    /// inference step for formula binders.  RS's generic `var_spec` tags a
+    /// prefixless var as `Untagged` (a placeholder it resolves later for RULE
+    /// terms), which has no HS equivalent and sorts LAST under `Ord LVar`
+    /// `(idx, sort, name)` (LTerm.hs:521-523).  That placeholder leaked into the
+    /// guarded binding's `LSort`, flipping the display-time AC arg sort of an
+    /// existential binder against a free Msg operand of equal idx (`dif++seq`
+    /// → `seq++dif`), since `fAppAC`/`openGuarded` sort by that key
+    /// (Term/Raw.hs:118-122, Guarded.hs:367).  Pin a prefixless binder to `Msg`
+    /// exactly as `msgvar` does; explicit `$`/`~`/`#`/`%`/suffix binders keep
+    /// their concrete sort.
+    fn quantifier_binder(&mut self) -> Result<VarSpec, ParseError> {
+        let mut v = self.var_spec()?;
+        if matches!(v.sort, SortHint::Untagged) {
+            v.sort = SortHint::Msg;
+        }
+        Ok(v)
     }
 
     /// Consume `.<digit>+` as a variable index, otherwise leave input

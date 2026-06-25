@@ -1,9 +1,8 @@
 //! Port of `Sapic.Bindings` from `lib/sapic/src/Sapic/Bindings.hs`.
 //!
-//! Compute the variables bound by SAPIC process actions / combinators.
-//!
-//! Note: the Haskell module also defines `capturedVariablesAt` and exports
-//! `capturedVariables` (Bindings.hs:40-47); these are not yet ported here.
+//! Compute the variables bound by SAPIC process actions / combinators, and
+//! (via [`captured_variables`]) the variables that are bound twice on a single
+//! path through the process — i.e. captured by a binder lower in the tree.
 
 use std::collections::BTreeSet;
 
@@ -65,6 +64,63 @@ pub fn bindings_comb(c: &ProcessCombinator<SapicLVar>) -> Vec<SapicLVar> {
 /// implements exactly that order, so the bound-variable sequence matches HS.
 pub fn acc_bindings<A: GoodAnnotation>(p: &Process<A, SapicLVar>) -> Vec<SapicLVar> {
     pfold_map(p, &mut |node| bindings(node))
+}
+
+/// `capturedVariablesAt` (Bindings.hs:40-43): the variables bound *at this
+/// node* that are *also* bound somewhere below it — i.e. captured by a deeper
+/// binder on the same path:
+///
+/// ```text
+/// capturedVariablesAt (ProcessAction ac _ p)  = bindingsAct ac `intersect` accBindings p
+/// capturedVariablesAt (ProcessComb c _ pl pr) = bindingsComb c `intersect` (accBindings pl `union` accBindings pr)
+/// capturedVariablesAt (ProcessNull _) = []
+/// ```
+fn captured_variables_at<A: GoodAnnotation>(p: &Process<A, SapicLVar>) -> Vec<SapicLVar> {
+    match p {
+        Process::Null(_) => Vec::new(),
+        // `bindingsAct ac \`intersect\` accBindings body`.
+        Process::Action(a, _, body) => {
+            list_intersect(&bindings_act(a), &acc_bindings(body))
+        }
+        // `bindingsComb c \`intersect\` (accBindings pl \`union\` accBindings pr)`.
+        Process::Comb(c, _, pl, pr) => {
+            let below = list_union(&acc_bindings(pl), &acc_bindings(pr));
+            list_intersect(&bindings_comb(c), &below)
+        }
+    }
+}
+
+/// `capturedVariables = pfoldMap capturedVariablesAt` (Bindings.hs:46-47):
+/// run `capturedVariablesAt` at every node and concatenate the results in
+/// `pfoldMap` order.  A variable appearing here is bound twice (captured) on
+/// some path and yields a `WFBoundTwice` warning.
+pub fn captured_variables<A: GoodAnnotation>(p: &Process<A, SapicLVar>) -> Vec<SapicLVar> {
+    pfold_map(p, &mut captured_variables_at)
+}
+
+/// `Data.List.intersect xs ys`: keep every element of `xs` (in `xs`-order,
+/// duplicates preserved) that is an `Eq`-member of `ys`.  `SapicLVar`'s derived
+/// `Eq` (Theory/Sapic/Term.hs:65) compares the `LVar` (name+sort+idx) AND the
+/// optional type annotation, so this respects sort/type as HS does.
+fn list_intersect(xs: &[SapicLVar], ys: &[SapicLVar]) -> Vec<SapicLVar> {
+    xs.iter()
+        .filter(|x| ys.iter().any(|y| *x == y))
+        .cloned()
+        .collect()
+}
+
+/// `Data.List.union xs ys = xs ++ (nub ys \\ xs)` — append `ys`'s elements not
+/// already present (and not duplicated within the appended tail).  Used for
+/// membership only by [`captured_variables_at`], so order is irrelevant to the
+/// intersection result, but we port it faithfully for exactness.
+fn list_union(xs: &[SapicLVar], ys: &[SapicLVar]) -> Vec<SapicLVar> {
+    let mut out = xs.to_vec();
+    for y in ys {
+        if !xs.iter().any(|x| x == y) && !out[xs.len()..].iter().any(|o| o == y) {
+            out.push(y.clone());
+        }
+    }
+    out
 }
 
 /// HS `nub xs \\ S.toList drop`: keep the first occurrence of each variable

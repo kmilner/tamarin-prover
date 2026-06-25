@@ -2386,41 +2386,26 @@ impl EquationStore {
             // making `perform_split` see a different sequence than HS
             // and changing `split_case_N` assignments downstream.
             //
-            // ALPHA-DEDUP: before structural dedup, collapse substs that
-            // are alpha-equivalent under witness-renaming.  RS's local
-            // Maude counter inside `applyBound` is bumped to the max idx
-            // of the input eqs (including system vars in `apply newsubst
-            // (Var lv)`).  When two alpha-equivalent input variants have
-            // different witness idxs in their range but the same domain
-            // and the same system-side LHS pattern, the LHS's `input_max`
-            // is identical — but the local counter still depends on
-            // which witnesses the inner unifier allocates first, so the
-            // resulting per-variant LNSubstVFresh witness idxs can diverge
-            // structurally even though both are alpha-equivalent.  HS's
-            // `S.fromList` (EquationStore.hs:268-269) is also a structural
-            // dedup on the underlying Map's Ord, but HS's witnesses are
-            // bounded only by the `domVFresh s ∪ varsRange newsubst`
-            // avoid set (LTerm.hs:647-664 `avoid`; EquationStore.hs
-            // `renameAvoiding (range slist) (domVFresh s ∪ varsRange newsubst)`)
-            // — which IS identical for alpha-equivalent input variants —
-            // so HS's structural dedup catches them.  RS's local counter
-            // is bumped by the LHS system vars (the `input_max` walk in
-            // `unify_with_avoid`, maude_proc.rs), which is not what
-            // HS does.  Canonicalising the witness namespace per subst
-            // (rename range fresh-vars to a deterministic sequence) lets
-            // RS catch the same alpha-duplicates HS catches.
-            {
-                use std::collections::BTreeSet;
-                let mut seen: BTreeSet<LNSubstVFresh> = BTreeSet::new();
-                let mut out: Vec<LNSubstVFresh> = Vec::with_capacity(new_substs.len());
-                for s in new_substs.drain(..) {
-                    let key = tamarin_term::subsumption::canonize_subst(&s);
-                    if seen.insert(key) {
-                        out.push(s);
-                    }
-                }
-                new_substs = out;
-            }
+            // STRUCTURAL-ONLY dedup (NO alpha-dedup).  HS's `S.fromList`
+            // is a STRUCTURAL set: two `applyBound` outputs that are
+            // alpha-equivalent up to witness rename but differ in their
+            // actual fresh-var idxs are DISTINCT `Set` elements and HS
+            // keeps BOTH.  This happens routinely when two different
+            // input variants of the disjunction re-unify (under the
+            // case-split subst) to results that are alpha-equivalent —
+            // HS preserves each as its own member.  Proven on
+            // CH07::noninjectiveagreement_reader: under splitEqs(0) /
+            // split_case_4 the sid=4 disjunction has 6 substs in HS, two
+            // of which (witness idxs ~r2.43… and ~r2.74…) are alpha-
+            // equivalent but kept distinct; an alpha-canonical dedup
+            // here collapses them to 5, dropping one split case and
+            // adding a spurious extra splitEqs goal in that branch
+            // (78 vs HS 77 steps).  HS NEVER alpha-collapses here, so we
+            // must not either — the per-call avoid_max seed (commit
+            // 5caa7d99 part 1) already aligns witness allocation with HS
+            // for the cases where HS *does* structurally coincide (e.g.
+            // KEA_plus_AdvKey::keaplus_{initiator,responder}_key, still
+            // byte-identical without the alpha-dedup).
             new_substs.sort();
             new_substs.dedup();
             if aes_dbg_variants() {

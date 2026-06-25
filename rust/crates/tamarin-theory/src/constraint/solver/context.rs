@@ -281,14 +281,17 @@ impl ProofContext {
         // join key.
         for orig in &self.full_sources {
             let sat = refined.iter().find(|s| s.goal == orig.goal);
-            // No matching saturated source — saturate dropped it
-            // entirely (all branches contradicted).  HS's
-            // `saturateSources` would leave the source with the
-            // initial cases in this case (its `solver` returns
-            // `(False, [])` on every iter, so `cdCases` stays
-            // unchanged from `initialSource`'s output).  Mirror by
-            // leaving the cell as-set by `initial_source_cases`
-            // earlier in `ensure_saturated` — no overwrite.
+            // HS-faithful: `saturateSources` (Sources.hs:498) keeps ONE
+            // source per input (`set cdCases newCases th`), so every
+            // `orig.goal` has a match in `refined` — including sources whose
+            // refine produced ZERO cases (the case list is just empty).  We
+            // overwrite the cell with the refined cases (possibly empty),
+            // matching HS's `cdCases = []` for goals with no source (e.g. the
+            // builtin destructors `check_rep`/`get_rep`).  The `if let Some`
+            // remains a defensive guard: should a future refine path ever
+            // drop a source from the list, we leave the initial cases rather
+            // than blanking an unrelated cell — but on the HS-faithful path
+            // the match always succeeds.
             if let Some(s) = sat {
                 orig.cases_set(s.cases_or_empty());
             }
@@ -370,8 +373,24 @@ impl ProofContext {
     pub fn new_with_restrictions_and_pool(
         maude: MaudeHandle,
         maude_pool: Option<std::sync::Arc<MaudePool>>,
+        rules: Vec<OpenProtoRule>,
+        restrictions: Vec<crate::guarded::Guarded>,
+    ) -> Self {
+        Self::new_with_restrictions_pool_forced(maude, maude_pool, rules, restrictions, &[])
+    }
+
+    /// Like [`new_with_restrictions_and_pool`] but also unions the FORCED
+    /// injective fact tags into `injective_fact_insts` BEFORE source
+    /// precomputation — mirroring HS `closeRuleCache` (Rule.hs:147-157), where
+    /// `injFactInstances` (forced ∪ simple) seeds `ctxt0`, which then drives
+    /// `precomputeSources`.  Used for the SAPIC state-channel optimisation
+    /// (`setforcedInjectiveFacts {L_PureState, L_CellLocked}`, Sapic.hs:84).
+    pub fn new_with_restrictions_pool_forced(
+        maude: MaudeHandle,
+        maude_pool: Option<std::sync::Arc<MaudePool>>,
         mut rules: Vec<OpenProtoRule>,
         restrictions: Vec<crate::guarded::Guarded>,
+        forced_injective_facts: &[crate::fact::FactTag],
     ) -> Self {
         // Inherit the maude signature from the handle so we can
         // synthesise per-symbol construction rules.
@@ -525,9 +544,16 @@ impl ProofContext {
             .map(|r| r.rule.clone())
             .collect();
         let proto_rule_refs: Vec<&crate::rule::ProtoRuleE> = proto_rules.iter().collect();
-        let injective_fact_insts =
+        let mut injective_fact_insts =
             crate::tools::injective_fact_instances::simple_injective_fact_instances(
                 &proto_rule_refs, &sig.reducible_fun_syms);
+        // HS `closeRuleCache` (Rule.hs:147-150): union the FORCED injective
+        // fact tags BEFORE source precomputation reads `injective_fact_insts`.
+        if !forced_injective_facts.is_empty() {
+            injective_fact_insts =
+                crate::tools::injective_fact_instances::union_forced_injective_fact_instances(
+                    injective_fact_insts, forced_injective_facts);
+        }
         // Compute loop-breakers and annotate the protocol rules in
         // place — direct port of Haskell's `useAutoLoopBreakersAC`
         // (`Theory.Tools.LoopBreakers`).  Edge `R_from → R_to.prem`

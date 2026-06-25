@@ -21,6 +21,12 @@ impl FastFreshState {
     /// Empty supply.
     pub fn nothing_used() -> Self { FastFreshState { next: 0 } }
 
+    /// Supply seeded so the first `fresh_ident` yields `seed` (HS
+    /// `evalFresh action seed` over the `FastFresh` `FreshState = Integer`).
+    /// Used by `Sapic.States.addStatesChannels`, which seeds the counter at
+    /// `initStateChan` (the next free `StateChannel` index).
+    pub fn seeded(seed: u64) -> Self { FastFreshState { next: seed } }
+
     /// Allocate `k` consecutive identifiers and return the first one.
     pub fn fresh_idents(&mut self, k: u64) -> u64 {
         let i = self.next;
@@ -56,6 +62,23 @@ pub struct PreciseFreshState {
 
 impl PreciseFreshState {
     pub fn nothing_used() -> Self { PreciseFreshState { map: HashMap::new() } }
+
+    /// Port of HS `avoidPreciseVars` (Term/LTerm.hs:681-684):
+    /// `foldl' (\m (name, idx) -> insertWith max name (idx+1) m) empty`.
+    /// Seeds the per-name counters so the next `fresh_ident name` yields an
+    /// index strictly greater than every avoided `(name, idx)`.  Used by
+    /// `Sapic.Typing.renameUnique` to avoid colliding with the process's
+    /// existing variables.
+    pub fn avoid_precise<I: IntoIterator<Item = (String, u64)>>(vars: I) -> Self {
+        let mut map: HashMap<String, u64> = HashMap::new();
+        for (name, idx) in vars {
+            let want = idx + 1;
+            map.entry(name)
+                .and_modify(|cur| { if want > *cur { *cur = want; } })
+                .or_insert(want);
+        }
+        PreciseFreshState { map }
+    }
 
     /// Get a fresh identifier for `name`. The next call with the same name
     /// yields the next sequential index.
