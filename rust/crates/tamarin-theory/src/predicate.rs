@@ -4,7 +4,7 @@
 //! Predicates name a fact pattern and provide a formula expansion that
 //! replaces the syntactic-sugar `Pred(...)` atom with a concrete logical
 //! body. We port:
-//! - `Predicate` data type + smart constructor (`mk_predicate`)
+//! - `Predicate` data type + smart constructor (`Predicate::new`, HS `mkPredicate`)
 //! - `smaller_fact` and the `builtinPredicates` list (just `Smaller`)
 //! - `lookup_predicate`
 //!
@@ -12,6 +12,9 @@
 //! (operating on parser-AST formulas / predicates), providing
 //! `expand_formula` / `expand_theory_formulas` including the builtin
 //! `Smaller` handling.
+//!
+//! No production caller exercises this module; kept as parity/API surface
+//! (the runtime expansion path lives in `predicate_expand.rs`).
 
 use crate::fact::{Fact, FactTag, Multiplicity};
 use crate::formula::LNFormula;

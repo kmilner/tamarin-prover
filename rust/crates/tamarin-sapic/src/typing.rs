@@ -5,10 +5,6 @@
 //! HS pipeline (`typeTheoryEnv`, Typing.hs:201-223):
 //!   for each top-level process:  `renameUnique` then `typeProcess`.
 //! We mirror that in [`type_and_rename_process`], driven by [`type_theory`].
-//!
-//! Scope: the LINEAR subset (Null / New / Event / ChOut / ChIn) needed for
-//! `typing2.spthy`.  Combinators, lookups and let-bindings are descended
-//! through but their type rules are not exercised here.
 
 use std::collections::BTreeMap;
 
@@ -531,8 +527,7 @@ pub fn rename_unique(p: &PlainProcess) -> PlainProcess {
 // Type inference (typeProcess / typeWith, Typing.hs:73-200)
 // =============================================================================
 
-/// `TypingEnvironment` (Typing.hs:56-60).  We only need `vars` and `funs` for
-/// the linear subset; `events` is unused so far.
+/// `TypingEnvironment` (Typing.hs:56-60).  We only need `vars` and `funs`.
 pub struct TypingEnvironment {
     pub vars: BTreeMap<LVar, SapicType>,
     pub funs: BTreeMap<NoEqSym, (Vec<SapicType>, SapicType)>,

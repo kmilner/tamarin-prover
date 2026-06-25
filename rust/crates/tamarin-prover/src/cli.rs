@@ -17,7 +17,7 @@
 //!   -D|--defines=STRING        preprocessor `#define` flags. Repeatable.
 //!   --diff                     observational-equivalence mode (errors: not yet ported)
 //!   --quit-on-warning          treat wellformedness warnings as fatal
-//!   --auto-sources             auto-generate sources lemmas (parsed, not yet routed)
+//!   --auto-sources             auto-generate sources lemmas
 //!   --oraclename=FILE          oracle script for --heuristic oracle rankings
 //!   --oracle-only              oracle-only mode (quit-on-empty-oracle)
 //!   --quiet                    suppress chatter on stderr
@@ -25,7 +25,7 @@
 //!   --parse-only               parse + pretty-print, no analysis
 //!   --precompute-only          run precomputation only
 //!   --open-chains=N, -cN       open-chain bound (parsed, not yet routed)
-//!   --derivcheck-timeout=N -dN message-derivation check timeout (parsed, not yet routed)
+//!   --derivcheck-timeout=N -dN message-derivation check timeout
 //!   --no-reuse                 do not export reuse lemmas (parsed, not yet routed)
 //!   --no-restrictions          do not export restrictions (parsed, not yet routed)
 //!   --replication-bound=N      DeepSec replication bound (parsed, not yet routed)
@@ -109,9 +109,9 @@ pub enum Subcommand {
     Batch,
     /// `interactive` — web UI.
     Interactive,
-    /// `variants` — intruder-rule variants (not supported in port).
+    /// `variants` — intruder-rule variants.
     Variants,
-    /// `test` — self-test (not supported in port).
+    /// `test` — self-test.
     Test,
 }
 
@@ -823,8 +823,8 @@ pub fn help_text() -> String {
     s.push('\n');
     s.push_str("Commands:\n");
     s.push_str("  interactive  Start a web-server to construct proofs interactively.\n");
-    s.push_str("  variants     Compute intruder-rule variants (NOT YET PORTED).\n");
-    s.push_str("  test         Self-test (NOT YET PORTED).\n");
+    s.push_str("  variants     Compute intruder-rule variants.\n");
+    s.push_str("  test         Self-test.\n");
     s.push('\n');
     s.push_str("Interactive-mode flags (used with the `interactive` subcommand):\n");
     s.push_str("  -p --port=PORT                        Port to listen on (default 3001).\n");

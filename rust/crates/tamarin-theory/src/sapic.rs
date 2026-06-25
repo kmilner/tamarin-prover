@@ -8,8 +8,8 @@
 //! Coverage:
 //! - `Theory.Sapic.Position` — full
 //! - `Theory.Sapic.Term` — `SapicType`, `SapicLVar` data types and
-//!   defaults; pretty-printing and `toLVar`/`toLNTerm` converters not
-//!   ported yet
+//!   defaults; pretty-printing (`pretty_sapic.rs`) and `to_lvar` ported.
+//!   The `toLNTerm` converter is not ported yet.
 //! - `Theory.Sapic.Annotation` — `ProcessParsedAnnotation` and the
 //!   `GoodAnnotation` trait
 //! - `Theory.Sapic.Process` — the `Process<Ann, V>` data type and

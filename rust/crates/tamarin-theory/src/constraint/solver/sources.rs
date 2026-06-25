@@ -123,8 +123,7 @@ pub struct Source {
     /// compat; saturate-internal code uses the `_list` variants
     /// that preserve list structure.
     pub(crate) cases_cell: std::sync::Mutex<Option<Vec<(Vec<String>, System)>>>,
-    /// `true` iff case enumeration was truncated by the per-source cap
-    /// (`TAM_MAX_CLOSURES_PER_SOURCE`).  Search must not return
+    /// `true` iff case enumeration was truncated.  Search must not return
     /// `Verified` for any proof tree that consumed an incomplete
     /// source — the dropped cases could contain attack witnesses.
     /// Used to prevent wrong-VERIFIED on user-equation files where the
@@ -2296,8 +2295,8 @@ fn run_solve_all_safe_goals_disj_with_progress(
         let mut any_branched = false;
         for (case_name, sys_cand, case_action) in unused {
             if use_ctx_aware {
-                // Ctx-aware path: apply_source_case_action has already
-                // done `someInst keepVarBindings` + `conjoinSystem`,
+                // Ctx-aware path: solve_with_source_cases_action_with_ctx
+                // has already done `someInst keepVarBindings` + `conjoinSystem`,
                 // so the system is fully merged.  No follow-up
                 // solve_fact_eqs needed — push directly.
                 let mut new_used = used.clone();
@@ -2820,7 +2819,7 @@ pub fn solve_with_source_cases_action(
 }
 
 /// Variant that takes an optional `ProofContext` to enable the
-/// Haskell-faithful `applySource` path (`apply_source_case_action`).
+/// Haskell-faithful `applySource` path (`refine_source_case_action`).
 /// When `ctx_opt = Some(ctx)`, uses one-way Maude matching +
 /// `someInst keepVarBindings` + `conjoinSystem` setNodes-collision
 /// rule-eqs. When `None`, falls back to the legacy graft (preserves
@@ -2837,7 +2836,6 @@ pub fn solve_with_source_cases_action_with_ctx(
 ) -> Option<Vec<(String, System, crate::fact::LNFact)>> {
     use crate::constraint::constraints::Goal;
     use crate::fact::FactTag;
-    use tamarin_term::lterm::LSort;
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
 
@@ -2846,7 +2844,6 @@ pub fn solve_with_source_cases_action_with_ctx(
         return None;
     }
     let m_live = &fa_live.terms[0];
-    let _ = LSort::Msg; // silence unused-import warning at low cost
     if std::env::var("TAM_DBG_SRC_CASE").is_ok() {
         let live_str = format!("{:?}", fa_live).chars().take(120).collect::<String>();
         eprintln!("[src_case] solve_with_source_cases CALLED for live={}", live_str);
@@ -3115,7 +3112,6 @@ pub fn solve_with_source_cases_action_with_ctx(
             ) else { continue };
             if dbg_rt { kept_names.push(case_label.clone()); }
             out.push((case_label, grafted, action_fact));
-            let _ = name;
         }
     }
     if dbg_rt {
@@ -3220,7 +3216,7 @@ fn sort_ge(a: tamarin_term::lterm::LSort, b: tamarin_term::lterm::LSort) -> bool
 /// Without this restriction, the case's eq-store at precompute time
 /// retains `t:Fresh:1 → ~ltk:Fresh:N` (the abstract pattern var
 /// bound to a rule's specific Fresh var).  At runtime, when
-/// `apply_source_case_action` adds the match-subst `t:Fresh:1
+/// `conjoin_refine_arm` adds the match-subst `t:Fresh:1
 /// (renamed) → ~ltkA:Fresh` to the eq-store, Maude's `addEqs`
 /// chains: `~ltk:Fresh:N (renamed) = ~ltkA:Fresh`.  After
 /// `subst_system`, the case's grafted Fresh-rule node has
@@ -4527,7 +4523,7 @@ fn conjoin_refine_arm(
     //
     // RS reaches this site during saturate via the chain-fold path
     // (`saturate_out_premise` → ... → `solve_with_source_cases_action_with_ctx`
-    // → `apply_source_case_action`).  Marking the live_goal as
+    // → `conjoin_refine_arm`).  Marking the live_goal as
     // solved during saturate produces case sub-systems with
     // pre-solved KU(...) ActionG goals; `conjoin_system`'s
     // `combineGoalStatus` (Reduction.hs:510-511 `solved1 || solved2`)
@@ -4572,7 +4568,7 @@ fn conjoin_refine_arm(
         &mut r.pending_conjoin_arm_systems);
     let dbg_cf = std::env::var("TAM_RS_DBG_CONJOIN_FANOUT").is_ok();
     if dbg_cf && !conjoin_arm_systems.is_empty() {
-        eprintln!("[conjoin_fanout] apply_source_case_action drained {} extra arms (case={})",
+        eprintln!("[conjoin_fanout] conjoin_refine_arm drained {} extra arms (case={})",
             conjoin_arm_systems.len(), case_label);
     }
     // Build a Vec<Reduction> over arm0 + extra-arms so the post-conjoin
@@ -4639,7 +4635,7 @@ fn conjoin_refine_arm(
     }).collect();
     if std::env::var("TAM_DBG_APPLY_E5").is_ok() {
         let path = crate::constraint::solver::trace::case_path_string();
-        eprintln!("[apply_source_case_action E.5] path={} edge_eqs.len={}", path, edge_eqs.len());
+        eprintln!("[conjoin_refine_arm E.5] path={} edge_eqs.len={}", path, edge_eqs.len());
         for (i, e) in edge_eqs.iter().enumerate() {
             eprintln!("  eq[{}]: {:?} = {:?}", i,
                 format!("{:?}", e.lhs).chars().take(160).collect::<String>(),
@@ -4738,7 +4734,7 @@ fn conjoin_refine_arm(
 }
 
 /// Haskell-faithful `applySource` for Premise goals.  Mirrors
-/// `apply_source_case_action` step-for-step, with the Premise-specific
+/// `conjoin_refine_arm` step-for-step, with the Premise-specific
 /// edge rewire from `matchToGoal` (Sources.hs:283).
 ///
 /// Includes a defensive edge-fact `chain_eqs` pass after `conjoinSystem`
@@ -4945,7 +4941,7 @@ fn apply_source_case_premise(
     // becomes a separate `Reduction` branch and `conjoinSystem sysTh`
     // runs once per arm — producing one Source-applied System per arm.
     //
-    // Mirror `apply_source_case_action`'s pattern: capture `Cases(arms)`
+    // Mirror `conjoin_refine_arm`'s pattern: capture `Cases(arms)`
     // from `solve_term_eqs` and re-run the post-`solve_term_eqs`
     // continuation once per arm.  Without this, a multiset Counter
     // premise solve yielded by HS as `Inc_case_1 | Inc_case_2` collapsed
@@ -5183,11 +5179,6 @@ fn apply_source_case_premise(
     // checksign→~k.11 distinct).  The collision falls through `Ord
     // LNSubstVFresh` to the next key and rotates the 2-way split (RS picks
     // split_case_2 where HS picks split_case_1).
-    //
-    // (No RS-only empty-subst `apply_eq_store` variant re-filter here: HS has
-    // none; the conflicting-variant drop is edge-driven via `solveFactEqs`
-    // (E.5), which RS mirrors. A second re-key here collapsed distinct
-    // witnesses and rotated split ordering — verify_checksign_test::test4/5.)
 
     crate::state_trace::emit(
         "applySource_prem_out", Some(&live_goal_for_trace), &r.sys);
@@ -5376,7 +5367,7 @@ fn graft_case_into_action(
     let live_goal = crate::constraint::constraints::Goal::Action(
         live_node.clone(), fa_live.clone());
     if let Some(slot) = out.goals_mut().iter_mut().find(|(g, _)| g == &live_goal) {
-        // HS-faithful: see the matching gate in `apply_source_case_action`.
+        // HS-faithful: see the matching gate in `conjoin_refine_arm`.
         // `solveAllSafeGoals.safeGoal` (Sources.hs:202) excludes KU
         // ActionG goals from saturate-time dispatch, so applying a
         // source-case for a KU goal during saturate must not mark

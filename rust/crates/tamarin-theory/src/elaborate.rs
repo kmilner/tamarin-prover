@@ -36,10 +36,10 @@ thread_local! {
     /// being elaborated.  Set by `elaborate()` from the theory's
     /// `functions:` declarations, read by `term_to_lnterm`'s arity-1
     /// auto-tuple branch.  In Tamarin's surface syntax, `f(a, b, c)`
-    /// for a function declared `f/1` is sugar for `f(<a, b, c>)`; our
-    /// hard-coded list previously only covered built-in arity-1 names
-    /// (h, fst, snd, inv, pk).  Without this, `PRF(pms, nc, ns)` for
-    /// `functions: PRF/1` would reach Maude as a 3-arg call, which
+    /// for a function declared `f/1` is sugar for `f(<a, b, c>)`.  This
+    /// set must include user-declared arity-1 names in addition to the
+    /// built-ins (h, fst, snd, inv, pk).  Without it, `PRF(pms, nc, ns)`
+    /// for `functions: PRF/1` would reach Maude as a 3-arg call, which
     /// Maude silently rejects, and our `reduce` loop spins forever.
     static USER_UNARY_FUNS: RefCell<BTreeSet<String>>
         = const { RefCell::new(BTreeSet::new()) };
@@ -701,7 +701,7 @@ fn elaborate_already_expanded(parser_thy: &p::Theory) -> Result<Theory, ElabErro
     // the single-process `[p]` branch; `[]` leaves the default False
     // and `>=2` throws MoreThanOneProcess (Sapic.hs:48,85,87). Mirror
     // that: count only TopLevelProcess items, true iff exactly one.
-    // (Currently `is_sapic` has no readers, so this is non-behavioral.)
+    // Read downstream to gate SAPIC translation (run.rs, apply.rs).
     thy.is_sapic = parser_thy.items.iter()
         .filter(|i| matches!(i, p::TheoryItem::TopLevelProcess(_)))
         .count() == 1;
@@ -1021,10 +1021,6 @@ fn rule_to_proto_rule_e(r: &p::Rule) -> Result<ProtoRuleE, ElabError> {
 ///     `resp_master_secret` defined 20 lines below keeps it as a free
 ///     Msg-var in the rule — semantically MORE GENERAL than the
 ///     expanded term, affecting unification and proof search).
-///
-/// The previous implementation pre-expanded each RHS with earlier
-/// bindings and applied all bindings to the body in FORWARD order,
-/// which wrongly expanded forward references.
 pub fn apply_let_block(r: &p::Rule) -> p::Rule {
     let mut out = r.clone();
     let bindings = std::mem::take(&mut out.let_block);
@@ -1126,9 +1122,9 @@ pub fn fact_to_lnfact(f: &p::Fact) -> Result<crate::fact::LNFact, ElabError> {
     // through to the protoFact case for "K", giving `ProtoFact Linear "K"`.
     // That matches ISend's action `kLogFact = protoFact Linear "K"`,
     // so user lemma `K(t) @ j` correctly matches ISend instances.
-    // We previously aliased "K" → FactTag::Ku, which broke witness
-    // construction for any lemma using K(_) atoms (they couldn't
-    // satisfy via ISend; only Coerce/etc. routes were available).
+    // Do NOT alias "K" → FactTag::Ku: that breaks witness construction
+    // for any lemma using K(_) atoms (they can no longer satisfy via
+    // ISend; only Coerce/etc. routes would remain available).
     let tag = match f.name.as_str() {
         "Fr" => FactTag::Fresh,
         "In" => FactTag::In,
@@ -1296,18 +1292,14 @@ pub fn lnterm_to_term(t: &tamarin_term::lterm::LNTerm) -> p::Term {
                     // AC terms are flattened by `f_app_ac` to 2+ args.
                     // Round-trip via parser BinOp (left-fold), which
                     // term_to_lnterm later rebuilds as a flat AC App.
-                    // Previously this only fired on EXACTLY 2 args — any
-                    // flat 3+-arg AC term (common with multiset: `a + b + c`)
-                    // fell through to the `?Union` placeholder branch and
-                    // a downstream `term_to_lnterm` re-parse rebuilt it as
-                    // `App(NoEq("?Union"), [a,b,c])`, an opaque non-AC
-                    // 3-ary functor.  That broke Maude unification on
-                    // multiset equations (e.g. `('1'++x++z) = x` returned
-                    // No-unifier in the Eq branch but the LNTerm we
-                    // actually fed Maude was `Union(1,x,z) =? x` vs a
-                    // BROKEN return-form leaking into impl_formulas matches
-                    // and breaking the `1+x+z` → false simplification
-                    // chain for `counters_linear_order`.
+                    // Must fire on ALL arity>=2 AC terms: a flat 3+-arg AC
+                    // term (common with multiset: `a + b + c`) must NOT fall
+                    // through to the `?Union` placeholder branch, or a
+                    // downstream `term_to_lnterm` re-parse rebuilds it as an
+                    // opaque non-AC functor `App(NoEq("?Union"), [a,b,c])`,
+                    // breaking Maude unification on multiset equations (e.g.
+                    // the `1+x+z` → false simplification chain for
+                    // `counters_linear_order`).
                     if parser_args.len() >= 2 {
                         let op = match ac {
                             AcSym::Mult => p::BinOp::Mult,

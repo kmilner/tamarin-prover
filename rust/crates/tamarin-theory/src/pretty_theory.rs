@@ -1124,10 +1124,9 @@ fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro], arity1
             // expanded body.  Detect a macro in the display (E) body by
             // expanding it: if anything changes, the E (macro) form differs
             // from the AC (expanded) form.  This holds REGARDLESS of whether
-            // Maude abstracted the rule, so it gates BOTH branches below —
-            // the previous code only checked it in the `None` branch, so a
-            // rule that was both macro-using AND abstracted (e.g. a `^`/DH
-            // rule whose body is a macro call) was wrongly called trivial
+            // Maude abstracted the rule, so it MUST gate BOTH branches below:
+            // a rule that is both macro-using AND abstracted (e.g. a `^`/DH
+            // rule whose body is a macro call) is NOT trivial
             // (regression/trace/issue777: `pk(x)='g'^x`, `Out(pk(~x))`).
             // Fast path: with no macro definitions, `apply_macros_fact` is an
             // identity rebuild (no macro can match), so the comparison below is
@@ -1345,12 +1344,10 @@ fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule, att
     // (prettyNamedRule …))` (ClosedTheory.hs:354), so the rule body's
     // facts land at absolute column 5 (2 comment + 2 rule nest + 1
     // bracket).  CRITICAL: render the body with the ENGINE aware of the
-    // full indent (nest 4 via indent=5) rather than rendering at the
-    // modulo-E indent and prepending 2 literal spaces per line — the
-    // prepend shifted every line +2 columns AFTER the HughesPJ width
-    // decisions were made, so lines within 2 columns of the boundary
-    // kept elements HS breaks (the spdm R_KE_Response tuple at visual
-    // col 111 vs HS's break at 95).
+    // full indent (nest 4 via indent=5) — the HughesPJ width decisions must
+    // be made at the absolute column, so lines within 2 columns of the
+    // boundary break exactly where HS breaks (cf. the spdm R_KE_Response
+    // tuple: HS breaks at col 95).
     use crate::elaborate::canonicalize_ac_in_pfact;
     let prems2: Vec<p::Fact> = prems.iter().map(canonicalize_ac_in_pfact).collect();
     let acts2:  Vec<p::Fact> = acts.iter().map(canonicalize_ac_in_pfact).collect();
@@ -1394,14 +1391,12 @@ fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule, att
 /// CRITICAL: the `text ". " <>` is a BESIDE onto the multi-line `vcat`.
 /// In HughesPJ the ribbon budget for the inner (wrapped) lines is then
 /// measured from the OUTER line start (the `text i` column), not from the
-/// var column.  Rendering each binding STANDALONE (`entry.nest(col)`)
-/// instead measures the ribbon from the var column, shifting wrap
-/// decisions for terms sitting within a few columns of the ribbon
-/// boundary — e.g. an 11-tuple `<x.16, …, x.26>` whose `x.26>` packs onto
-/// the overflow line standalone but breaks BEFORE `x.26` (gluing `>`)
-/// under the HS structure (pkcs11-templates `cannot_obtain_key` et al.).
-/// So build the whole numbered conjunction as ONE Doc and render it at
-/// `nest 4`, mirroring HS byte-for-byte.
+/// var column.  So build the whole numbered conjunction as ONE Doc and
+/// render it at `nest 4` (do NOT render each binding STANDALONE via
+/// `entry.nest(col)` — that measures the ribbon from the var column and
+/// shifts wrap decisions for terms within a few columns of the boundary,
+/// e.g. an 11-tuple `<x.16, …, x.26>`: pkcs11-templates
+/// `cannot_obtain_key` et al.), mirroring HS byte-for-byte.
 fn variant_subst_doc(
     n: usize,
     subst: &tamarin_term::subst_vfresh::LNSubstVFresh,
@@ -2054,8 +2049,7 @@ fn pp_proof(
     // fit the ribbon, else drops the comment to its OWN line at the
     // step's base indent (`depth*2`).  We build the method as a Doc and
     // run it through the same HughesPJ engine so the break is
-    // byte-identical to HS — replacing the prior literal-string append
-    // that always kept the comment inline.
+    // byte-identical to HS.
     let base = depth * 2;
     let annotated = node.annotated;
     let cases: Vec<(&String, &crate::constraint::solver::search::ProofNode)> =
@@ -2183,7 +2177,7 @@ fn pp_step_doc(
         // (Pretty.hs:108-109).  Build this as a real Doc so HughesPJ's
         // `sep`/`fsep` break the comment (and its `/*`…`*/` delimiters)
         // onto their own lines at deep proof-tree indentation, identical
-        // to HS — the prior flat `pp_step_at` string could never wrap.
+        // to HS.
         PM::Finished(MR::Contradictory(reason)) => {
             let contra = Doc::text("contradiction");
             match reason {

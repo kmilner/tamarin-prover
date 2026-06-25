@@ -167,9 +167,9 @@ fn strip_shadowed<'a>(subst: &'a Subst, vs: &[p::VarSpec]) -> std::borrow::Cow<'
 /// `freshLVar n s` (Formula.hs:276) over a `FreshState` seeded by
 /// `avoidPrecise = avoidPreciseVars . frees` (LTerm.hs:681-690); the bound
 /// `#a` is not free and the free `a` was abstracted to `x` before
-/// printing, so HS renders `#a` (idx 0).  Keying capture by name only made
-/// RS treat the substituted `a` as colliding with `#a` and rename it
-/// `#a1`, a divergence from HS (`binding.spthy`).
+/// printing, so HS renders `#a` (idx 0).  Do NOT key capture by name
+/// alone: that makes RS treat a substituted `a` as colliding with `#a`
+/// and rename it `#a1`, a divergence from HS (`binding.spthy`).
 ///
 /// Residual print-name gap (rare): HS keeps the original binder hint name
 /// (De-Bruijn shift only, Predicate.hs:94-106) and re-renames bound vars

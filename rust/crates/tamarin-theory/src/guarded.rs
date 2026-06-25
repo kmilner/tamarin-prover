@@ -187,14 +187,13 @@ pub fn cmp_term(a: &GTerm, b: &GTerm) -> std::cmp::Ordering {
     // RS special-cases several HS `FAPP (NoEq sym)` terms into dedicated
     // `GTerm` variants (`Pair`=pair, `BinOp Exp`=exp, `Diff`=diff,
     // `NumberOne`=one, `NatOne`=tone, `DhNeutral`=DH_neutral) and AC
-    // ops into `BinOp Mult/Union/Xor/NatPlus`.  The OLD `term_class`
-    // ordered these by RUST VARIANT (Pair=5, BinOp=7, ...) — which does
-    // NOT match HS's name-based `FunSym` Ord (e.g. HS sorts `exp(...)`
-    // BEFORE `pair(...)` because `"exp" < "pair"`, but the variant order
-    // put Pair=5 before BinOp(Exp)=7).  That swapped the `S.toList
-    // sFormulas` iteration order in `evalFormulaAtoms`, flipping which
-    // co-created SidUpdated DisjG got the lower `gsNr` (UM3
-    // `CK_secure_UM3` line-3438 abstract-vs-transcript disj swap).
+    // ops into `BinOp Mult/Union/Xor/NatPlus`.  These must NOT be ordered
+    // by RUST VARIANT — HS's `FunSym` Ord is name-based (e.g. HS sorts
+    // `exp(...)` BEFORE `pair(...)` because `"exp" < "pair"`), and a
+    // variant-based order swaps the `S.toList sFormulas` iteration order
+    // in `evalFormulaAtoms`, flipping which co-created SidUpdated DisjG
+    // got the lower `gsNr` (UM3 `CK_secure_UM3` abstract-vs-transcript
+    // disj swap).
     //
     // Faithful: compare two FApp-class terms by their HS `FunSym` key
     // (`funsym_key`), then by the argument list (flattened+sorted for AC,
@@ -556,11 +555,11 @@ pub fn reducible_formula(fm: &Guarded) -> bool {
 /// Smart `Conj` — recursively flatten nested `Conj`s and short-circuit.
 /// HS-faithful: mirrors Haskell `gconj` (Guarded.hs:413-421), whose
 /// helper `flatten (GConj conj) = concatMap flatten $ getConj conj`
-/// recursively unwraps every level of nested conjunction.  Prior RS
-/// implementation only unwrapped ONE level, leaving e.g. binary-Or
-/// chains parsed as `Conj(Conj(Conj(a, b), c), d)` only partially
-/// flattened — the runtime then saw a 2-item Conj instead of a 4-item
-/// one, which mismatched HS's case-enumeration shape.
+/// recursively unwraps every level of nested conjunction.  Must flatten
+/// EVERY level (not just one): a binary-And chain parsed as
+/// `Conj(Conj(Conj(a, b), c), d)` must collapse to a single 4-item Conj,
+/// else the runtime sees a 2-item Conj and mismatches HS's
+/// case-enumeration shape.
 pub fn gconj(items: Vec<Guarded>) -> Guarded {
     fn flatten(item: Guarded, out: &mut Vec<Guarded>) -> bool {
         // returns true if gfalse encountered (absorbs)
@@ -733,12 +732,12 @@ pub fn gdisj(items: Vec<Guarded>) -> Guarded {
     // Recursively flatten nested `Disj`s. HS-faithful: mirrors Haskell
     // `gdisj` (Guarded.hs:423-435) whose helper
     // `flatten (GDisj disj) = concatMap flatten $ getDisj disj`
-    // recursively unwraps every level. Prior RS implementation only
-    // unwrapped ONE level, leaving e.g. a 5-way `∨` parsed as a binary
-    // `Or` chain (`Disj(Disj(Disj(Disj(a, b), c), d), e)`) only partially
-    // flattened — the runtime then saw a 2-alt Disj goal instead of the
-    // 5-alt one HS sees, which mismatched the case-enumeration of
-    // skeleton proofs like YubiSecure slightly_weaker_invariant.
+    // recursively unwraps every level. Must flatten EVERY level (not just
+    // one): a 5-way `∨` parsed as a binary `Or` chain
+    // (`Disj(Disj(Disj(Disj(a, b), c), d), e)`) must collapse to a single
+    // 5-alt Disj goal, else the runtime sees a 2-alt Disj and mismatches
+    // the case-enumeration of skeleton proofs like YubiSecure
+    // slightly_weaker_invariant.
     fn flatten(item: Guarded, out: &mut Vec<Guarded>) -> bool {
         // returns true if gtrue encountered (absorbs)
         match item {
@@ -1268,13 +1267,13 @@ fn unguarded_error(vars: &[p::VarSpec]) -> GuardError {
 /// is the right encoding for Less/Eq/Action/Last/Pred/Subterm alike,
 /// independent of the term sort.
 ///
-/// (An earlier port used `gdisj [Less, Less]` for ¬EqE / ¬Less and
-/// `gex [] [a] gfalse` for ¬Action — both were copy-paste errors from
-/// `toInductionHypothesis` (which DOES decompose Less for induction).
-/// The disjunction form is semantically wrong for term-sort EqE since
-/// Less is undefined between Msg/Fresh/Pub terms; the Ex form is
-/// semantically False rather than ¬Action.  See `Guarded.hs:408-410`
-/// vs `Guarded.hs:614-616`.)
+/// Do NOT decompose ¬EqE / ¬Less into `gdisj [Less, Less]`, nor encode
+/// ¬Action as `gex [] [a] gfalse` (those belong only to
+/// `toInductionHypothesis`, which DOES decompose Less for induction): the
+/// disjunction form is semantically wrong for term-sort EqE since Less is
+/// undefined between Msg/Fresh/Pub terms, and the Ex form is semantically
+/// False rather than ¬Action.  See `Guarded.hs:408-410` vs
+/// `Guarded.hs:614-616`.
 fn gnot_atom(a: &GAtom) -> Guarded {
     Guarded::GGuarded {
         qua: Quant::All,
@@ -1498,18 +1497,18 @@ fn cac_rec_term_cow(t: &GTerm, cmp: GCmp) -> Option<GTerm> {
         // structural `S.member sSolvedFormulas` guard in `insertImpliedFormulas`
         // always matches a re-derived instance against the solved one.
         //
-        // RS's guarded canonicalisation previously sorted only AC operators
-        // (`Mult/Union/Xor/NatPlus`) and left C-symbol `em` args in whatever
-        // order substitution produced them.  After a reuse-lemma's abstract
-        // key var `s` is bound (e.g. `s ↦ KDF(em('P', ini_share)^…)`),
-        // `substSolvedFormulas` rewrote the solved disjunction with one `em`
-        // arg order while a fresh `impliedFormulas` match against the
-        // `Secret('KEY', …)` action produced the other order — so the
-        // `solved_formulas` dedup failed and RS re-inserted (and re-solved)
-        // a disjunction HS had already discharged.  This is the
-        // idbased/BP_IBS bilinear divergence (extra `secrecy_session_key`
-        // reuse-lemma instance after `splitEqs`).  Mirror HS: sort `em`'s two
-        // args here so both sides canonicalise to the same form.
+        // The C-symbol `em` must be sorted here too, not just the AC
+        // operators (`Mult/Union/Xor/NatPlus`).  If `em` args are left in
+        // whatever order substitution produced them, then after a
+        // reuse-lemma's abstract key var `s` is bound (e.g.
+        // `s ↦ KDF(em('P', ini_share)^…)`), `substSolvedFormulas` rewrites
+        // the solved disjunction with one `em` arg order while a fresh
+        // `impliedFormulas` match against the `Secret('KEY', …)` action
+        // produces the other order — so the `solved_formulas` dedup fails
+        // and RS re-inserts (and re-solves) a disjunction HS had already
+        // discharged (idbased/BP_IBS bilinear divergence: extra
+        // `secrecy_session_key` reuse-lemma instance after `splitEqs`).
+        // Mirror HS: sort `em`'s two args so both sides canonicalise alike.
         GTerm::App(n, args) if &**n == "em" && args.len() == 2 => {
             let a2 = cac_rec_term(&args[0], cmp);
             let b2 = cac_rec_term(&args[1], cmp);
@@ -1772,9 +1771,9 @@ pub fn subst_atom(a: &p::Atom, s: &VarSubst) -> p::Atom {
 /// guards, body, and every nested term/atom — but only Free LVar
 /// leaves (Bound vars are positional and cannot collide).
 ///
-/// With HS-faithful DeBruijn bindings, the elaborate capture-avoidance
-/// dance of the pre-migration code is unnecessary: Bound vars carry no
-/// LVar idx, so a free-var substitution cannot accidentally capture them.
+/// With HS-faithful DeBruijn bindings, no capture-avoidance dance is
+/// needed: Bound vars carry no LVar idx, so a free-var substitution
+/// cannot accidentally capture them.
 /// Mirrors HS `applySkGuarded subst = mapGuardedAtoms (const $ apply subst)`.
 pub fn subst_guarded(g: &Guarded, s: &VarSubst) -> Guarded {
     if s.is_empty() { return g.clone(); }

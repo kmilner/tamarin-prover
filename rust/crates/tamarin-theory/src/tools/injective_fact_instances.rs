@@ -320,17 +320,17 @@ pub fn simple_injective_fact_instances(
     //   guard (factTag prem == tag)
     //   guard (not (null (factTerms conc)))
     //
-    // Previously over-permissive: we included any tag that appeared as a
-    // conclusion in any rule.  That added spurious InjectiveFacts
-    // less-atoms (via `nonInjectiveFactInstances`) for protocols whose
-    // linear facts get *created* in one rule and *consumed* in another
-    // (no round-trip).  E.g. Artificial.spthy: Step1 creates St(x, k),
-    // Step2 consumes it — neither rule has both → St not injective in
-    // Haskell, but was injective in our port, creating a spurious cycle
-    // in Fin_unique's case_2.  `M.fromListWith` folds DUPLICATE keys with
-    // `combineShapes` (note the args are flipped vs. the first insert, but
-    // `combineShapes` is symmetric in length-trimming), so we fold on
-    // insert.
+    // The guards above must hold PER-RULE: a tag is injective only when a
+    // SINGLE rule has it in both its premises and conclusions.  Including
+    // any tag that merely appears as a conclusion in some rule is too
+    // permissive — it adds spurious InjectiveFacts less-atoms (via
+    // `nonInjectiveFactInstances`) for protocols whose linear facts get
+    // *created* in one rule and *consumed* in another (no round-trip).
+    // E.g. Artificial.spthy: Step1 creates St(x, k), Step2 consumes it —
+    // neither rule has both → St is not injective (Fin_unique's case_2).
+    // `M.fromListWith` folds DUPLICATE keys with `combineShapes` (note the
+    // args are flipped vs. the first insert, but `combineShapes` is
+    // symmetric in length-trimming), so we fold on insert.
     let mut candidates: BTreeMap<FactTag, Vec<Vec<MonotonicBehaviour>>> = BTreeMap::new();
     for &r in rules {
         let prem_tags: std::collections::BTreeSet<FactTag> = r.premises.iter()
@@ -665,12 +665,11 @@ mod tests {
     //   guard $ (factTagMultiplicity tag == Linear)
     //        && (tag `elem` (factTag <$> rPrems ru))
     //
-    // The `tag elem prems` check is PER-RULE, not across all rules.
-    // We previously had a broader filter (any rule that produces the
-    // tag) which counted facts as injective when one rule created them
-    // and another consumed them — but no SINGLE rule had both prems
-    // AND concs.  This added spurious less-atoms and broke Fin_unique's
-    // case_2.
+    // The `tag elem prems` check is PER-RULE, not across all rules: a
+    // broader filter (any rule that produces the tag) would count facts
+    // as injective when one rule creates them and another consumes them,
+    // even though no SINGLE rule has both prems AND concs — adding
+    // spurious less-atoms and breaking Fin_unique's case_2.
     // =========================================================================
 
     /// Fact created in Rule1 and consumed in Rule2 (no single rule has

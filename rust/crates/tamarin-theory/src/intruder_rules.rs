@@ -1613,8 +1613,7 @@ mod tests {
     }
 
     // =========================================================================
-    // `equal_rule_up_to_renaming` (Rule.hs:1065-1077 — see definition in
-    // intruder_rules.rs at line 734).  Mirrors HS:
+    // `equal_rule_up_to_renaming` (Rule.hs:1065-1077).  Mirrors HS:
     //
     //   equalRuleUpToRenaming r1 r2 = reader $ \hnd ->
     //     case eqs of
@@ -1712,8 +1711,7 @@ mod tests {
     }
 
     // =========================================================================
-    // `variants_intruder` (IntruderRules.hs:288-314 — definition in
-    // intruder_rules.rs at line 564).
+    // `variants_intruder` (IntruderRules.hs:288-314).
     //
     // Pin: a `DestrRule subterm=False` rule whose argument terms have
     // Maude variants under the AC theory produces MORE than one variant.

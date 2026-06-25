@@ -951,10 +951,6 @@ pub fn candidate_methods(
     // (e.g. its dispatch_solve_goal hit Contradictory and was filtered),
     // we fall through to the next-ranked goal.
     //
-    // Previously we only added the FIRST ranked goal, causing search
-    // to Sorry whenever the top goal was un-solvable — even if a
-    // lower-ranked goal could have made progress.
-    //
     // `depth` drives round-robin heuristic scheduling (ProofMethod.hs:581-590,
     // `useHeuristic`'s `rankings !! (depth `mod` n)`).
     let goals_result = crate::constraint::solver::goals::rank_goals_with(sys, Some(ctx), depth);

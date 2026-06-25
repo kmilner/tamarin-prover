@@ -206,14 +206,13 @@ fn make_proto_rule_ac(
 /// Filtering it out drops the no-narrowing case from the SplitG, so
 /// downstream search misses the alternative where the term is irreducible.
 ///
-/// Earlier versions of this function filtered out pure-renaming variants
-/// ("matches `expand_rule_variants`' useful filter").  That was wrong:
-/// `expand_rule_variants` produces the pre-applied variant *rules* (used
-/// by the legacy `o.variants` path), where the identity rule duplicates
-/// `o.rule` and is rightly skipped.  But the raw variant *substitutions*
-/// (`Disj LNSubstVFresh` of Haskell's `RuleACConstrs`) need the identity
-/// kept — it's what tells `solveRuleConstraints` to install a SplitG with
-/// both narrowing and no-narrowing branches.
+/// Do NOT filter out pure-renaming variants here.  `expand_rule_variants`
+/// produces the pre-applied variant *rules* (used by the legacy `o.variants`
+/// path), where the identity rule duplicates `o.rule` and is rightly skipped.
+/// But the raw variant *substitutions* (`Disj LNSubstVFresh` of Haskell's
+/// `RuleACConstrs`) need the identity kept — it's what tells
+/// `solveRuleConstraints` to install a SplitG with both narrowing and
+/// no-narrowing branches.
 pub fn variant_substs_for_rule(
     maude: &MaudeHandle,
     rule: &ProtoRuleE,
@@ -524,9 +523,6 @@ pub fn abstract_rule_and_variants(
         eprintln!("[hs-compose] rule={:?} #variants={}",
                   rule.info.name, raw_substs.len());
     }
-    // TAM_DBG_FRESH_TRACE=1: diagnostic trace of the per-rule fresh counter
-    // before/after the variant pipeline.  Used to triangulate which step
-    // consumes how many idxs when comparing witness idxs against HS.
     // HS-faithful: filter variants via `isFreshRedundant` (RuleVariants.hs:128-134)
     // BEFORE composition. A variant is redundant if it forces a freshly
     // introduced term (from a Fresh-fact premise) to also appear in a
@@ -639,26 +635,10 @@ pub fn abstract_rule_and_variants(
     // (applied above as the H20 pass).  Each composed entry is
     //   `restrictVFresh (frees abstrPsCsAs) $ removeRenamings $
     //      normSubstVFresh' $ composeVFresh vsubst abstractionSubst`
-    // and is kept verbatim.  A previous `.filter(|s| !s.is_renaming())` here
-    // (carried over from the pre-`compose_vfresh` manual path) dropped any
-    // composed subst that restricted-down to a pure renaming — which is
-    // EXACTLY HS's narrowing variant for a rule like foo_eligibility's `C_2`.
-    //
-    // `C_2`'s `commit(open(x,r),r)` abstracts to `commit(z,r)` with z=open(x,r).
-    // Maude returns 2 variants: identity, and the narrowing `x ↦ commit(_,r)`
-    // making `open(x,r) → z`.  After compose+removeRenamings+restrict the
-    // narrowing variant becomes `{A↦A', r↦x.5, z↦x.6}` — a renaming once the
-    // out-of-`abstrPsCsAs` `x ↦ commit(x.6,x.5)` entry is restricted away.  HS
-    // KEEPS this renaming subst (its `frees abstrPsCsAs = {A.1,r.2,z.4}` and
-    // restrictVFresh produces the same all-renaming subst, fed to
-    // `simpDisjunction` unfiltered).  With it present, `simpDisjunction` sees a
-    // genuine 2-way disjunction and does NOT fold `z ↦ open(x,r)` into
-    // `commonSubst`, so the stored rule keeps the abstracted `commit(z,r)`.
-    // Dropping it left RS with a single `{z ↦ open(x,r)}` subst, which
-    // `simpSingleton` folded into the rule body, un-abstracting it back to
-    // `commit(open(x,r),r)` — RS then renders "trivial AC variant" and the
-    // exists-trace `exec` lemma can no longer narrow `open(x,r)` to reach
-    // `case V_2` (the trace), so it was wrongly `falsified` (soundness bug).
+    // and is kept verbatim.  Do NOT re-add a `.filter(|s| !s.is_renaming())`
+    // here: it drops composed substs that restrict-down to a pure renaming,
+    // which are EXACTLY HS's narrowing variants (breaks foo_eligibility `C_2`,
+    // soundness bug — the `exec` exists-trace lemma can no longer narrow).
     .collect();
 
     if composed_substs.is_empty() {
@@ -951,6 +931,8 @@ fn rename_precise_rule_with_variants(
     (new_rule, new_substs)
 }
 
+// no production caller; kept as parity/API surface (HS `variantsProtoRule`
+// pre-applied variant-rule path).
 pub fn expand_rule_variants(
     maude: &MaudeHandle,
     rule: &ProtoRuleE,

@@ -289,8 +289,8 @@ pub fn unannotated_comment_doc() -> crate::pretty_hpj::Doc {
 /// `method_doc` is the rendered proof method (e.g. `solve( … )`,
 /// `simplify`, `by sorry` — the `by ` prefix, if any, must already be
 /// `beside`-prepended into `method_doc` by the caller).  When `annotated`
-/// is true the comment is omitted and only the method is laid out
-/// (byte-identical to the prior string path).  When false, HughesPJ's
+/// is true the comment is omitted and only the method is laid out.
+/// When false, HughesPJ's
 /// `sep` first tries to fit `method <space> /* unannotated */` on one
 /// line; if the (flattened) method + comment exceeds the ribbon, the
 /// comment drops to its OWN line at the sep's base indent
@@ -994,9 +994,8 @@ fn normalise_msg_hint(s: p::SortHint) -> p::SortHint {
 /// binders that share a name+sort but differ by index — the `x`(idx 0) /
 /// `x.1`(idx 1) fresh vars `rule_restriction::rewrite` mints (HS
 /// `freshLVar "x" LSortMsg`).  Innermost-first matching still resolves
-/// ordinary same-(name,idx) shadowing to the inner binder, identical to
-/// the previous behaviour (source binders carry idx 0, so the idx test is
-/// a no-op there).
+/// ordinary same-(name,idx) shadowing to the inner binder (source
+/// binders carry idx 0, so the idx test is a no-op there).
 fn lookup_display(name: &str, idx: u64, sort: p::SortHint, scope: &[Bind]) -> Option<(p::SortHint, String)> {
     for b in scope.iter().rev() {
         if b.0 == name && b.3 == idx && b.1 == sort {
@@ -1031,7 +1030,7 @@ fn pp_var_scoped_pos(v: &p::VarSpec, scope: &[Bind], temporal: bool, out: &mut S
     // for any idx — a body occurrence of a binder var may itself carry an
     // index (e.g. the `x.1` fresh var minted by `rule_restriction`).  When
     // no binder matches (the common case: free vars like `#vk.6`), fall
-    // through to render the source name+idx verbatim, identical to before.
+    // through to render the source name+idx verbatim.
     if let Some((bsort, display)) = lookup_display(&v.name, v.idx, sort, scope) {
         out.push_str(sort_prefix_from_hint(bsort));
         out.push_str(&display);
@@ -1146,8 +1145,7 @@ fn pp_fact(fa: &p::Fact, scope: &[Bind], out: &mut String) {
 // `nestShort n lead finish body = sep [lead $$ nest n body, finish]`
 // (Class.hs:218-223).  Building these as real `pretty_hpj::Doc` trees and
 // letting the ported HughesPJ engine lay them out makes the fcat/fsep/sep
-// wrap decisions byte-identical to HS, replacing the hand-rolled string
-// packers in pretty_theory.rs.
+// wrap decisions byte-identical to HS.
 // =============================================================================
 
 /// HS `comma = char ','`.
@@ -2633,9 +2631,8 @@ mod tests {
     /// Regression: the AC `*` exponent inside an `exp` term must keep its
     /// `fcat` break points.  HS `prettyTerm` (Term/Term.hs:274) renders exp as
     /// `ppTerm t1 <> "^" <> ppTerm t2`, so the exponent `t2 = (~a*~b)` stays a
-    /// breakable `fcat`.  The old Doc renderer flattened the whole exp to a
-    /// string, so `hmac('g'^(~a*~b), ...)` ran past LINE_LENGTH=110 instead of
-    /// wrapping the `*`-operands like HS.  Mirrors the spdm
+    /// breakable `fcat`: `hmac('g'^(~a*~b), ...)` must wrap the `*`-operands
+    /// like HS rather than run past LINE_LENGTH=110.  Mirrors the spdm
     /// `hmac('g'^(~newPrivKey*~respPrivKey), ...)` proof-line divergence.
     #[test]
     fn exp_with_ac_exponent_wraps_inside_fun() {

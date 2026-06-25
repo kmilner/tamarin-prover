@@ -73,6 +73,8 @@ pub fn parse_theory_with_base(
 /// hardcoded to `false` and neither `flags` nor a `#define diff` preamble
 /// switches into diff mode; diff-theory selection is not implemented at this
 /// layer (HS derives it from `"diff" \`S.member\` flags0`).
+///
+/// No production caller; kept as parity/API surface.
 pub fn parse_theory_or_diff(input: &str, flags: &[&str]) -> Result<Theory, ParseError> {
     parse_theory(input, flags)
 }
@@ -541,7 +543,6 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             if self.lx.is_eof() { return BranchEnd::Eof; }
             if self.lx.peek() == Some('#') {
-                let save = self.save();
                 self.lx.bump();
                 let mut name = String::new();
                 while let Some(c) = self.lx.peek() {
@@ -557,7 +558,6 @@ impl<'a> Parser<'a> {
                         if depth == 0 => { return BranchEnd::Else; }
                     _ => {}
                 }
-                let _ = save;
             } else {
                 self.lx.bump();
             }
@@ -630,7 +630,7 @@ impl<'a> Parser<'a> {
             s.push(c);
             self.lx.bump();
         }
-        // Trim any trailing inline comment? Skip; consumer can deal.
+        // Trailing inline comments are left intact; trimming is the consumer's job.
         s
     }
 
@@ -903,7 +903,7 @@ impl<'a> Parser<'a> {
         // We must distinguish protocol rules from intruder rules. Intruder
         // rules use `rule (modulo AC) name: ...` — they live in the top-level
         // theory only when explicitly parsed (e.g. for a precomputed intruder
-        // file). We treat both uniformly; the `modulo` field captures it.
+        // file).
         let r = self.parse_rule()?;
         // Tag intruder rules: their names start with `c<...>` or `d<...>`,
         // typically only when modulo == Some("AC"). We don't enforce this.
@@ -1093,7 +1093,6 @@ impl<'a> Parser<'a> {
     /// Read an identifier or a balanced parenthesised token (for `process=...`).
     fn read_balanced_token(&mut self) -> Result<String, ParseError> {
         self.skip_ws();
-        let start = self.save();
         // HS `parseAndIgnore = betweenMatching (\(l,r) -> manyCharsExcept [l,r] ...)`
         // (Rule.hs:85). `betweenMatching` (Token.hs:305-316) tries each pair in
         // `matches`, and `manyCharsExcept [l,r]` (Token.hs:320-321) consumes
@@ -1131,7 +1130,6 @@ impl<'a> Parser<'a> {
         }
         // Otherwise, read a single identifier-or-number token.
         let id = self.ident()?;
-        let _ = start;
         Ok(id)
     }
 
@@ -1198,7 +1196,6 @@ impl<'a> Parser<'a> {
     fn lemma_item(&mut self) -> Result<TheoryItem, ParseError> {
         // Look ahead to decide between a normal lemma and an accountability lemma.
         // Accountability lemmas have the body `accounts for [..]` after the name.
-        let save = self.save();
         self.require_kw("lemma")?;
         let _ = self.try_modulo();
         let name = self.ident()?;
@@ -1222,7 +1219,6 @@ impl<'a> Parser<'a> {
         };
         let formula = self.double_quoted_formula()?;
         let proof = self.try_proof_skeleton()?;
-        let _ = save;
         Ok(TheoryItem::Lemma(Lemma {
             name, modulo: None, attributes: attrs, trace_quantifier, formula, proof,
         }))
@@ -1966,7 +1962,6 @@ impl<'a> Parser<'a> {
             self.restore(save_p);
         }
         // Atom: try last(t), action f@t, equality, less, subterm, smaller, predicate
-        let save = self.save();
         if self.try_kw("last") {
             self.require_punct("(")?;
             let t = self.term(false)?;
@@ -2032,7 +2027,6 @@ impl<'a> Parser<'a> {
             let rhs = self.term(false)?;
             return Ok(Formula::Atom(Atom::Less(lhs, rhs)));
         }
-        let _ = save;
         Err(self.err("expected formula atom"))
     }
 
@@ -2405,12 +2399,10 @@ impl<'a> Parser<'a> {
             Some(c) if c.is_alphabetic() => SortHint::Untagged,
             _ => return Ok(None),
         };
-        let name_save = self.save();
         let id = match self.lx.identifier() {
             Some(s) => s,
             None => { self.restore(save); return Ok(None); }
         };
-        let _ = name_save;
         let idx = self.try_dot_index();
         Ok(Some(VarSpec { name: id, idx, sort, typ: None }))
     }

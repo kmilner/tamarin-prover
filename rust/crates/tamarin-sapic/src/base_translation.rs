@@ -1,12 +1,8 @@
-//! Port of `Sapic.Basetranslation` (`lib/sapic/src/Sapic/Basetranslation.hs`)
-//! for the CORE LINEAR subset:
+//! Port of `Sapic.Basetranslation` (`lib/sapic/src/Sapic/Basetranslation.hs`):
 //!   - `baseInit`       (Basetranslation.hs:312-318)
 //!   - `baseTransNull`  (Basetranslation.hs:81)
 //!   - `baseTransAction` New (103) / Event (197) / plain ChOut (155) / null-chan
 //!   - `baseRestr`      (449-485) — the always-on `single_session` restriction.
-//!
-//! Combinators, channels-with-secret, locks, inserts, lookups, replication,
-//! reliable channels and progress are deferred to Phase 2+.
 
 use std::collections::BTreeSet;
 
@@ -71,12 +67,11 @@ pub fn to_lvar(v: &SapicLVar) -> LVar {
     v.var.clone()
 }
 
-/// `baseTransAction` (Basetranslation.hs:94-205) — linear subset.  Returns the
-/// rule bodies and the updated `tildex`.  `needs_ass_immediate` is the
-/// `needsInEvRes` flag (false for typing2, which has no lemma needing
-/// `in_event`); when false, `Event` emits NO extra `EventEmpty` action.
+/// `baseTransAction` (Basetranslation.hs:94-205).  Returns the rule bodies and
+/// the updated `tildex`.  `needs_ass_immediate` is the `needsInEvRes` flag;
+/// when false, `Event` emits NO extra `EventEmpty` action.
 pub fn base_trans_action(
-    _async_channels: bool,
+    async_channels: bool,
     needs_ass_immediate: bool,
     ac: &SapicAction<SapicLVar>,
     an: &ProcessAnnotation<LVar>,
@@ -208,7 +203,7 @@ pub fn base_trans_action(
                     let tc = to_ln_term(tc_term);
                     let ts = tamarin_term::builtin::pair(tc.clone(), xt.clone());
                     // `ack = [Ack tc xt | not asyncChannels]`.
-                    let ack: Vec<TransFact> = if _async_channels {
+                    let ack: Vec<TransFact> = if async_channels {
                         vec![]
                     } else {
                         vec![TransFact::Ack(tc.clone(), xt.clone())]
@@ -234,7 +229,7 @@ pub fn base_trans_action(
         SapicAction::ChOut { chan: Some(tc_term), msg } if an.secret_channel.is_some() => {
             let tc = to_ln_term(tc_term);
             let t = to_ln_term(msg);
-            if _async_channels {
+            if async_channels {
                 // `[([def_state], [], [Message tc t, def_state' tildex], [])]`.
                 let body: RuleBody = (
                     vec![def_state(tildex)],
@@ -284,7 +279,7 @@ pub fn base_trans_action(
                 vec![TransFact::Out(t.clone()), def_state_next(tildex)],
                 vec![],
             );
-            if _async_channels {
+            if async_channels {
                 let msg_rule: RuleBody = (
                     vec![def_state(tildex)],
                     vec![],
@@ -509,14 +504,12 @@ pub fn base_trans_action(
 
 /// The result of translating a combinator: `(rules, tildex_l, Option<tildex_r>)`
 /// — HS `TranslationResultComb` (Basetranslation.hs:51).  `tildex_r` is `None`
-/// only when the combinator has no right child to translate (e.g. `let` without
-/// an else branch — deferred); for the in-scope combinators it is always
-/// `Some(...)`.
+/// when the combinator has no right child to translate (e.g. `let` without an
+/// else branch).
 pub type CombResult = (Vec<RuleBody>, BTreeSet<LVar>, Option<BTreeSet<LVar>>);
 
-/// `baseTransComb` (Basetranslation.hs:226-306) — the in-scope subset:
-/// `Parallel`, `NDC`, `CondEq`.  `Cond` (with a formula), `Lookup` and `Let`
-/// are deferred (Phase 2+/3).
+/// `baseTransComb` (Basetranslation.hs:226-306): `Parallel`, `NDC`, `CondEq`,
+/// `Cond` (with a formula), `Lookup` and `Let`.
 pub fn base_trans_comb(
     c: &tamarin_theory::sapic::ProcessCombinator<SapicLVar>,
     an: &ProcessAnnotation<LVar>,

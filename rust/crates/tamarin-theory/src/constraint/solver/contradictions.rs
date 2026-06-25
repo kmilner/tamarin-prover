@@ -810,12 +810,7 @@ fn has_forbidden_chain(sys: &System) -> bool {
         // (3) Some KU(t_start) action node precedes the chain
         // start `c.0`.  HS-faithful: `allKUActions` (System.hs:1582-1585)
         // unions BOTH `unsolvedActionAtoms` (unsolved ActionG goals)
-        // AND node `rActs` lists.  Rust previously only checked node
-        // actions, missing the unsolved-goal half — Cyclic/ForbiddenChain
-        // didn't fire on chain-destruction branches where t_start is
-        // a Msg-var that appears as an open KU action goal (no node yet
-        // labeled).  Root cause of StatVerif Resolve1/Resolve2 KU(pcs)
-        // case survival.
+        // AND node `rActs` lists.
         //
         // Walk node actions first:
         for (id, rule) in sys.nodes.iter() {
@@ -1858,12 +1853,7 @@ pub fn subst_creates_non_normal_terms(
         // distinction matters because Maude canonicalises AC operator
         // arguments (multiset / mult / xor / nat-plus), so
         // `mult(tid, x)` and `mult(x, tid)` are different `Eq`
-        // representations but both in NF.  The previous Rust check
-        // `match maude.reduce(&t_prime) { Ok(t_red) if t_red == t_prime
-        // => continue, _ => return true }` reported `creates non-normal`
-        // for AC-reordered arms, over-filtering `simpMinimize` and
-        // dropping legitimate `solve_term_eqs` cases in DH protocols
-        // (JKL_TS2_2004{,_KI_wPFS} key-secrecy lemmas).
+        // representations but both in NF.
         let is_nf = tamarin_term::norm::nf_via_haskell(&sig, &t_prime);
         if !is_nf {
             if std::env::var("TAM_RS_DBG_SUBST_NF").is_ok() {

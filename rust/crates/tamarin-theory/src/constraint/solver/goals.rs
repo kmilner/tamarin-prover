@@ -75,12 +75,11 @@ impl GoalRanking {
             'i' => GoalRanking::Inj(false),
             'I' => GoalRanking::Inj(true),
             // HS `SapicRanking` ('p') / `SapicPKCS11Ranking` ('P')
-            // (System.hs:591-592 `goalRankingIdentifiers`).  Previously
-            // these fell through to the `_ => Smart(false)` default, so
-            // SAPIC theories declaring `heuristic: p` silently used
-            // smartRanking — diverging goal selection (e.g. nsl-no_as
-            // `secrecy`: smart prioritises `isFreshKnowsGoal` KU(~n),
-            // sapic does NOT — it's commented out in HS sapicRanking).
+            // (System.hs:591-592 `goalRankingIdentifiers`).  SAPIC theories
+            // declaring `heuristic: p` must use sapicRanking, NOT smartRanking
+            // — they diverge in goal selection (e.g. nsl-no_as `secrecy`:
+            // smart prioritises `isFreshKnowsGoal` KU(~n), sapic does NOT —
+            // it's commented out in HS sapicRanking).
             'p' => GoalRanking::Sapic,
             'P' => GoalRanking::SapicPKCS11,
             // HS `GoalNrRanking` (System.hs `goalRankingIdentifiers`: 'C')
@@ -294,9 +293,9 @@ pub(crate) fn goal_cmp(a: &Goal, b: &Goal) -> std::cmp::Ordering {
             // HS-faithful structural comparator `cmp_guarded` (which threads
             // through `cmp_varspec`'s numeric idx-first LVar Ord, `cmp_atom`'s
             // timepoint-first ProtoAtom Ord, and declaration-order sort Ord).
-            // The previous string-render approach (idx/sort via `{:?}`,
-            // length-first prefix) diverged from HS on var sort order, decimal
-            // idx width, and Action timepoint-vs-fact order.
+            // Do NOT use a string-render approach (idx/sort via `{:?}`,
+            // length-first prefix): it diverges from HS on var sort order,
+            // decimal idx width, and Action timepoint-vs-fact order.
             crate::guarded::cmp_slice(&da.0, &db.0, crate::guarded::cmp_guarded)
         }
         (Goal::Subterm((sa, ta_)), Goal::Subterm((sb, tb_))) =>
@@ -370,10 +369,10 @@ pub fn rank_goals_with(
     ctx: Option<&crate::constraint::solver::context::ProofContext>,
     depth: usize,
 ) -> Result<Vec<AnnotatedGoal>, OracleError> {
-    let _result = rank_goals_with_inner(sys, ctx, depth)?;
+    let result = rank_goals_with_inner(sys, ctx, depth)?;
     if std::env::var("TAM_RS_DBG_RANK").as_deref() == Ok("1") {
         let in_pre = crate::constraint::solver::sources::in_precompute_mode();
-        let top: Vec<String> = _result.iter().take(8).map(|a| {
+        let top: Vec<String> = result.iter().take(8).map(|a| {
             use crate::constraint::constraints::Goal;
             let kind = match &a.goal {
                 Goal::Chain(_, _) => "Chain".to_string(),
@@ -390,9 +389,9 @@ pub fn rank_goals_with(
         }).collect();
         let path = crate::constraint::solver::trace::case_path_string();
         eprintln!("[RS_RANK] precompute={} path={} n={} top={:?}",
-            in_pre, path, _result.len(), top);
+            in_pre, path, result.len(), top);
     }
-    Ok(_result)
+    Ok(result)
 }
 
 fn rank_goals_with_inner(
@@ -1119,10 +1118,10 @@ fn smart_ranking(
         Box::new(is_private_knows_goal),
         // Haskell `smartRanking` solveFirst (ProofMethod.hs)
         // includes `isFreshKnowsGoal` AND `isSignatureGoal` — both are
-        // active in the smart ranking. Previous comment incorrectly cited
-        // `sapicRanking` (line 953) where they're commented out. TPM
-        // lemmas (Alice_Init / PCR_Unbind ranking) rely on isFreshKnowsGoal
-        // to prefer KU(~s0) over KU(sign(...)).
+        // active in the smart ranking (they are commented out in
+        // `sapicRanking`, not here). TPM lemmas (Alice_Init / PCR_Unbind
+        // ranking) rely on isFreshKnowsGoal to prefer KU(~s0) over
+        // KU(sign(...)).
         Box::new(is_fresh_knows_goal),
         Box::new(|a: &AnnotatedGoal| is_split_goal_small(a, sys)),
         Box::new(|a: &AnnotatedGoal| is_msg_one_case_goal(a, &one_case_syms)),
@@ -1166,10 +1165,9 @@ fn smart_ranking(
     // sys.goals insertion order = nr order, and the subsequent
     // partitions here are stable too, so no extra sort is required.
     //
-    // Previously this block re-sorted Disj goals by `goal_cmp`, on the
-    // mistaken belief that HS's `M.toList sGoals` order survived to the
-    // pick (it doesn't — `goalNrRanking` clobbers it).  Removed
-    // 2026-05-26 to restore HS-faithfulness for Device_Init_Use_Set
+    // Do NOT re-sort Disj goals by `goal_cmp` here: HS's `M.toList sGoals`
+    // order does NOT survive to the pick (`goalNrRanking` clobbers it).
+    // Re-sorting breaks HS-faithfulness for Device_Init_Use_Set
     // (case-content swap caused by Rust picking the structurally-
     // smaller induction Disj before HS's lemma-negation Disj).
     // See [[project-rust-port-lockstep]].
@@ -1477,10 +1475,10 @@ fn collect_one_case_syms(
         //     _                                            -> Nothing
         //
         // So Var-headed sources (e.g. `KU(t:Fresh)`) never force
-        // `cdCases`.  Previously we checked `src.cases.len() != 1`
-        // first, which forced the lazy thunk on every source and
-        // emitted spurious precompute `[EXEC] solveGoal ...` lines
-        // for sources HS would never compute.
+        // `cdCases`.  Do NOT check `src.cases.len() != 1` first: that
+        // forces the lazy thunk on every source and emits spurious
+        // precompute `[EXEC] solveGoal ...` lines for sources HS would
+        // never compute.
         //
         // Only KU-headed source goals.
         let term: &tamarin_term::lterm::LNTerm = match &src.goal {
@@ -1568,10 +1566,9 @@ fn sort_decision_tree(
 /// ```
 ///
 /// Lower = explored first.  LoopBreaker is `1` (deprioritised), NOT
-/// `0` — the earlier version conflated LoopBreaker with Useful, so
-/// our search expanded looping premises eagerly instead of after
-/// every contradiction-discovering goal.  Fixing this aligns goal
-/// ordering with Haskell's automatic prover.
+/// `0` — do NOT conflate LoopBreaker with Useful, or the search expands
+/// looping premises eagerly instead of after every
+/// contradiction-discovering goal.
 fn tag_usefulness(u: Usefulness) -> u8 {
     match u {
         Usefulness::Useful => 0,
@@ -1624,13 +1621,13 @@ fn is_private_knows_goal(a: &AnnotatedGoal) -> bool {
     //   isPrivateFunction (viewTerm -> FApp (NoEq (_, (_,Private,_))) _) = True
     //   isPrivateFunction _                                            = False
     //
-    // Previously we used `contains_private` (recursive) here, which
-    // mis-classified e.g. `KU(exp(Y, h1(<~ex, sk($A)>)))` as a
-    // private-knows goal because `sk` (private) appears deep inside.
-    // That collided with the genuine private-knows goal `KU(sk($A))` at
-    // the same slot, and the goalNr tie-break picked the wrong one —
-    // causing case-order swaps in NAXOS_eCK_PFS_private (and the
-    // non-PFS variant NAXOS_eCK_private).
+    // Do NOT use `contains_private` (recursive) here: it mis-classifies
+    // e.g. `KU(exp(Y, h1(<~ex, sk($A)>)))` as a private-knows goal
+    // because `sk` (private) appears deep inside.  That collides with
+    // the genuine private-knows goal `KU(sk($A))` at the same slot, and
+    // the goalNr tie-break picks the wrong one — causing case-order
+    // swaps in NAXOS_eCK_PFS_private (and the non-PFS variant
+    // NAXOS_eCK_private).
     msg_premise(&a.goal).map(is_private_function_toplevel).unwrap_or(false)
 }
 
