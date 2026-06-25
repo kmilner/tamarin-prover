@@ -151,21 +151,33 @@ fn strip_shadowed<'a>(subst: &'a Subst, vs: &[p::VarSpec]) -> std::borrow::Cow<'
 /// formulas and shifts use-site terms past the body's binders
 /// (`compSubst`, Predicate.hs), so a substituted variable can never be
 /// captured by an inner quantifier.  Our parser AST is name-based, so we
-/// emulate that: when a binder's name also occurs in the RANGE of the
-/// active substitution, that binder would capture the substituted
+/// emulate that: when a binder's `(name, sort)` also occurs in the RANGE
+/// of the active substitution, that binder would capture the substituted
 /// variable — so we alpha-rename the binder to a fresh name first (by
 /// adding `binder → fresh` to the subst used for the body, which the
 /// normal name-substitution then applies, respecting inner shadowing via
 /// `strip_shadowed`).
 ///
+/// Capture keys on `(name, sort)`, NOT name alone, because HS variables
+/// are `LVar { lvarName, lvarSort, lvarIdx }` and a substitution
+/// (`compSubst`/`substFromList`, Predicate.hs:96-105) maps a `Free LVar`
+/// keyed by the WHOLE LVar — so a message var `a` (`LSortMsg`) and a
+/// timepoint binder `#a` (`LSortNode`) are DISTINCT variables that cannot
+/// capture each other.  At print time HS likewise opens binders with
+/// `freshLVar n s` (Formula.hs:276) over a `FreshState` seeded by
+/// `avoidPrecise = avoidPreciseVars . frees` (LTerm.hs:681-690); the bound
+/// `#a` is not free and the free `a` was abstracted to `x` before
+/// printing, so HS renders `#a` (idx 0).  Keying capture by name only made
+/// RS treat the substituted `a` as colliding with `#a` and rename it
+/// `#a1`, a divergence from HS (`binding.spthy`).
+///
 /// Residual print-name gap (rare): HS keeps the original binder hint name
 /// (De-Bruijn shift only, Predicate.hs:94-106) and re-renames bound vars
-/// fresh at print time (`prettyLNFormula`→`avoidPrecise`/`freshLVar`,
-/// Theory/Model/Formula.hs:496-513), yielding e.g. `z.1` when a free `z`
-/// is in scope.  Our name-based rename mints a NEW base (`z`→`z1`), so the
-/// printed binder reads `z1` rather than `z.1` in that one collision case.
-/// A faithful fix would keep the base name `z` and instead allocate a
-/// distinct `idx` (keying the body `Subst` by (name, idx)); not done here.
+/// fresh at print time, yielding e.g. `z.1` when a free `z` (SAME sort) is
+/// in scope.  Our name-based rename mints a NEW base (`z`→`z1`), so the
+/// printed binder reads `z1` rather than `z.1` in that one same-sort
+/// collision case.  A faithful fix would keep the base name `z` and
+/// instead allocate a distinct `idx`; not done here.
 fn expand_quantified(
     vs: &[p::VarSpec],
     body: &p::Formula,
@@ -175,18 +187,24 @@ fn expand_quantified(
 ) -> Result<p::Formula, ExpandError> {
     let new_subst = strip_shadowed(subst, vs);
     let capture = subst_range_vars(&new_subst);
+    // A binder collides only with a substituted var of the SAME (name, sort)
+    // — HS LVar identity (see fn doc).
+    let collides = |v: &p::VarSpec| capture.contains(&(v.name.clone(), sort_key(v.sort)));
     // Fast path: no binder collides with a substituted variable.
-    if !vs.iter().any(|v| capture.contains(&v.name)) {
+    if !vs.iter().any(collides) {
         return Ok(make(vs.to_vec(), Box::new(expand(body, preds, &new_subst)?)));
     }
-    // Alpha-rename the colliding binders to fresh names.
-    let mut avoid = capture.clone();
+    // Alpha-rename the colliding binders to fresh names.  The fresh-name
+    // avoid-set stays name-based (over-avoiding a name is harmless; renaming
+    // only fires on a genuine same-sort collision).
+    let mut avoid: std::collections::BTreeSet<String> =
+        capture.iter().map(|(n, _)| n.clone()).collect();
     collect_formula_vars(body, &mut avoid);
     for v in vs { avoid.insert(v.name.clone()); }
     let mut new_vs = vs.to_vec();
     let mut body_subst = new_subst.into_owned();
     for v in new_vs.iter_mut() {
-        if capture.contains(&v.name) {
+        if collides(v) {
             let fresh = fresh_name(&v.name, &avoid);
             avoid.insert(fresh.clone());
             let mut fv = v.clone();
@@ -198,12 +216,52 @@ fn expand_quantified(
     Ok(make(new_vs, Box::new(expand(body, preds, &body_subst)?)))
 }
 
-/// Variable names occurring in the RANGE (values) of a substitution —
-/// the variables at risk of capture by a binder of the same name.
-fn subst_range_vars(subst: &Subst) -> std::collections::BTreeSet<String> {
+/// `(name, sort)` pairs occurring in the RANGE (values) of a substitution —
+/// the variables at risk of capture by a binder of the SAME name AND sort.
+fn subst_range_vars(subst: &Subst) -> std::collections::BTreeSet<(String, SortKey)> {
     let mut out = std::collections::BTreeSet::new();
-    for v in subst.map.values() { collect_term_vars(v, &mut out); }
+    for v in subst.map.values() { collect_term_vars_keyed(v, &mut out); }
     out
+}
+
+/// Normalised sort domain matching HS `LSort` variable identity.  HS LVars
+/// compare by `(lvarName, lvarSort)`; the message domain (a bare formula
+/// var, no prefix) is `LSortMsg`, so `Msg` and the un-prefixed `Untagged`
+/// hint collapse to the same key, while `#`/`~`/`$`/`%` are distinct sorts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SortKey { Msg, Pub, Fresh, Node, Nat }
+
+fn sort_key(s: p::SortHint) -> SortKey {
+    match s {
+        p::SortHint::Msg | p::SortHint::Untagged => SortKey::Msg,
+        p::SortHint::Pub => SortKey::Pub,
+        p::SortHint::Fresh => SortKey::Fresh,
+        p::SortHint::Node => SortKey::Node,
+        p::SortHint::Nat => SortKey::Nat,
+        p::SortHint::Suffix(p::SuffixSort::Msg) => SortKey::Msg,
+        p::SortHint::Suffix(p::SuffixSort::Pub) => SortKey::Pub,
+        p::SortHint::Suffix(p::SuffixSort::Fresh) => SortKey::Fresh,
+        p::SortHint::Suffix(p::SuffixSort::Node) => SortKey::Node,
+        p::SortHint::Suffix(p::SuffixSort::Nat) => SortKey::Nat,
+    }
+}
+
+/// Collect `(name, sort)` keys of every variable in a term.
+fn collect_term_vars_keyed(
+    t: &p::Term,
+    out: &mut std::collections::BTreeSet<(String, SortKey)>,
+) {
+    match t {
+        p::Term::Var(v) => { out.insert((v.name.clone(), sort_key(v.sort))); }
+        p::Term::App(_, args) | p::Term::Pair(args) =>
+            args.iter().for_each(|a| collect_term_vars_keyed(a, out)),
+        p::Term::AlgApp(_, a, b) | p::Term::Diff(a, b) | p::Term::BinOp(_, a, b) => {
+            collect_term_vars_keyed(a, out);
+            collect_term_vars_keyed(b, out);
+        }
+        p::Term::PatMatch(inner) => collect_term_vars_keyed(inner, out),
+        _ => {}
+    }
 }
 
 /// Build the builtin `Smaller`/multiset-`(<)` expansion `∃ z. rhs = lhs ++ z`.
