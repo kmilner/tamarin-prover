@@ -306,6 +306,7 @@ sapic/deprecated/csf21-acc-unbounded/mixvote/mixvote_SmHh-multi-session-1-fixed.
 sapic/deprecated/csf21-acc-unbounded/mixvote/mixvote_SmHh-multi-session-2-fixed.spthy
 sapic/fast/basic/boundonce.spthy
 sapic/fast/basic/channels1.spthy
+sapic/fast/basic/channels2.spthy
 sapic/fast/basic/channels3.spthy
 sapic/fast/basic/channels4.spthy
 sapic/fast/basic/design-choices.spthy
@@ -313,6 +314,8 @@ sapic/fast/basic/destructors.spthy
 sapic/fast/basic/exclusive-secrets.spthy
 sapic/fast/basic/let-blocks2.spthy
 sapic/fast/basic/let-blocks3.spthy
+sapic/fast/basic/let_pattern.spthy
+sapic/fast/basic/match_new.spthy
 sapic/fast/basic/ndc-nested-2.spthy
 sapic/fast/basic/ndc-nested-3.spthy
 sapic/fast/basic/ndc-nested-4.spthy
@@ -332,6 +335,7 @@ sapic/fast/basic/running-example.spthy
 sapic/fast/basic/typing2.spthy
 sapic/fast/basic/typing3.spthy
 sapic/fast/basic/typing4.spthy
+sapic/fast/basic/typing.spthy
 sapic/fast/feature-ass-immediate/test-all.spthy
 sapic/fast/feature-ass-immediate/test-channelin.spthy
 sapic/fast/feature-export/export-tag.spthy
@@ -339,13 +343,16 @@ sapic/fast/feature-inevent-restriction/inevent-restriction-private-channel.spthy
 sapic/fast/feature-inevent-restriction/inevent-restriction-public-channel.spthy
 sapic/fast/feature-locations/AKE.spthy
 sapic/fast/feature-locations/licensing.spthy
+sapic/fast/feature-locking-restriction/locking-restriction.spthy
 sapic/fast/feature-predicates/decwrap-destr-manual.spthy
 sapic/fast/feature-predicates/decwrap-destr-restrict.spthy
 sapic/fast/feature-predicates/decwrap-destr-restrict-variant.spthy
+sapic/fast/feature-predicates/pub.spthy
 sapic/fast/feature-predicates/simple_example.spthy
 sapic/fast/feature-predicates/timepoints.spthy
 sapic/fast/feature-progress/mini10.spthy
 sapic/fast/feature-progress/mini1.spthy
+sapic/fast/feature-progress/mini2.spthy
 sapic/fast/feature-progress/mini3.spthy
 sapic/fast/feature-progress/mini4.spthy
 sapic/fast/feature-progress/mini5.spthy
@@ -354,9 +361,11 @@ sapic/fast/feature-progress/mini7.spthy
 sapic/fast/feature-progress/mini8.spthy
 sapic/fast/feature-progress/mini9.spthy
 sapic/fast/feature-secret-channel/secret-channel.spthy
+sapic/fast/feature-secret-channel/U2F.spthy
 sapic/fast/feature-xor/CRxor.spthy
 sapic/fast/feature-xor/KCL07.spthy
 sapic/fast/MoedersheimWebService/set-abstr-lookup.spthy
+sapic/fast/MoedersheimWebService/set-abstr.spthy
 sapic/fast/regression-tests/issue332-capturing-processdefinition.spthy
 sapic/fast/regression-tests/issue332-const-fun-clash.spthy
 sapic/fast/regression-tests/issue332-notype-header.spthy
