@@ -360,6 +360,11 @@ pub struct TranslateOptions {
     /// `report(t)`→`rep(t, loc)` term rewrite) and `reportInit` (the fixed
     /// `ReportRule`).  Set from the `locations-report` builtin.
     pub trans_report: bool,
+    /// `_stateChannelOpt` (OpenTheory.hs:547, default False): gates the
+    /// pure-state / state-channel optimisation — `annotatePureStates`
+    /// (Sapic.hs:57) and `setforcedInjectiveFacts {L_PureState, L_CellLocked}`
+    /// (Sapic.hs:84).  Set from `options: translation-state-optimisation`.
+    pub state_channel_opt: bool,
 }
 
 /// `translate` (Sapic.hs:45-101).  `needs_in_ev_res` is HS
@@ -385,13 +390,22 @@ pub fn translate(
     // propagateNames and BEFORE translateLetDestr.  (annotatePureStates is gated
     // off by default — it needs `--translation-state-optimisation`.)
     let an_proc_sec = crate::secret_channels::annotate_secret_channels(an_proc_pre);
-    // `checkOps' (._transReport) translateTermsReport` (Sapic.hs:56): rewrite
-    // `report(t)` terms to `rep(t, loc)` under the in-scope `@location`
-    // annotation.  Runs AFTER annotateSecretChannels, BEFORE translateLetDestr.
-    let an_proc_rep = if opts.trans_report {
-        crate::report::translate_terms_report(an_proc_sec)
+    // `checkOps' (._stateChannelOpt) annotatePureStates` (Sapic.hs:57): the
+    // pure-state / state-channel optimisation.  Runs AFTER annotateSecretChannels
+    // and BEFORE translateTermsReport / translateLetDestr.  Gated off by default
+    // (needs `options: translation-state-optimisation`).
+    let an_proc_states = if opts.state_channel_opt {
+        crate::states::annotate_pure_states(an_proc_sec)
     } else {
         an_proc_sec
+    };
+    // `checkOps' (._transReport) translateTermsReport` (Sapic.hs:56): rewrite
+    // `report(t)` terms to `rep(t, loc)` under the in-scope `@location`
+    // annotation.  Runs AFTER annotatePureStates, BEFORE translateLetDestr.
+    let an_proc_rep = if opts.trans_report {
+        crate::report::translate_terms_report(an_proc_states)
+    } else {
+        an_proc_states
     };
     let an_proc_let = crate::let_destructors::translate_let_destr(st_rules, an_proc_rep);
     let an_proc = crate::locks::annotate_locks(an_proc_let)?;
@@ -481,9 +495,22 @@ pub fn translate(
     //   [resSingleSession]  always (hasAccountabilityLemmaWithControl = True)
     // (locking restrictions are Phase 4.)
     let mut restrictions = Vec::new();
-    if tamarin_theory::sapic::process_contains(&an_proc, tamarin_theory::sapic::is_lookup) {
+    // HS `isLookup`/`isDelete` (ProcessUtils.hs:46-52) only count
+    // `pureState=False` nodes — a pure-state lookup/delete uses the
+    // `L_PureState`/`L_CellLocked` facts and needs NO set_in/set_notin
+    // restriction.  (`is_lookup`/`is_delete` in tamarin_theory are generic
+    // over the annotation, so we inline the `pure_state` guard here.)
+    let is_lookup_non_pure = |proc: &Process<ProcessAnnotation<LVar>, SapicLVar>| -> bool {
+        matches!(proc, Process::Comb(ProcessCombinator::Lookup(_, _), an, _, _) if !an.pure_state)
+    };
+    let is_delete_non_pure = |proc: &Process<ProcessAnnotation<LVar>, SapicLVar>| -> bool {
+        matches!(proc,
+            Process::Action(tamarin_theory::sapic::SapicAction::Delete(_), an, _)
+                if !an.pure_state)
+    };
+    if tamarin_theory::sapic::process_contains(&an_proc, is_lookup_non_pure) {
         let has_delete =
-            tamarin_theory::sapic::process_contains(&an_proc, tamarin_theory::sapic::is_delete);
+            tamarin_theory::sapic::process_contains(&an_proc, is_delete_non_pure);
         restrictions.extend(state_restrictions(has_delete));
     }
     if tamarin_theory::sapic::process_contains(&an_proc, tamarin_theory::sapic::is_eq) {

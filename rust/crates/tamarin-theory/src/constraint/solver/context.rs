@@ -373,8 +373,24 @@ impl ProofContext {
     pub fn new_with_restrictions_and_pool(
         maude: MaudeHandle,
         maude_pool: Option<std::sync::Arc<MaudePool>>,
+        rules: Vec<OpenProtoRule>,
+        restrictions: Vec<crate::guarded::Guarded>,
+    ) -> Self {
+        Self::new_with_restrictions_pool_forced(maude, maude_pool, rules, restrictions, &[])
+    }
+
+    /// Like [`new_with_restrictions_and_pool`] but also unions the FORCED
+    /// injective fact tags into `injective_fact_insts` BEFORE source
+    /// precomputation — mirroring HS `closeRuleCache` (Rule.hs:147-157), where
+    /// `injFactInstances` (forced ∪ simple) seeds `ctxt0`, which then drives
+    /// `precomputeSources`.  Used for the SAPIC state-channel optimisation
+    /// (`setforcedInjectiveFacts {L_PureState, L_CellLocked}`, Sapic.hs:84).
+    pub fn new_with_restrictions_pool_forced(
+        maude: MaudeHandle,
+        maude_pool: Option<std::sync::Arc<MaudePool>>,
         mut rules: Vec<OpenProtoRule>,
         restrictions: Vec<crate::guarded::Guarded>,
+        forced_injective_facts: &[crate::fact::FactTag],
     ) -> Self {
         // Inherit the maude signature from the handle so we can
         // synthesise per-symbol construction rules.
@@ -528,9 +544,16 @@ impl ProofContext {
             .map(|r| r.rule.clone())
             .collect();
         let proto_rule_refs: Vec<&crate::rule::ProtoRuleE> = proto_rules.iter().collect();
-        let injective_fact_insts =
+        let mut injective_fact_insts =
             crate::tools::injective_fact_instances::simple_injective_fact_instances(
                 &proto_rule_refs, &sig.reducible_fun_syms);
+        // HS `closeRuleCache` (Rule.hs:147-150): union the FORCED injective
+        // fact tags BEFORE source precomputation reads `injective_fact_insts`.
+        if !forced_injective_facts.is_empty() {
+            injective_fact_insts =
+                crate::tools::injective_fact_instances::union_forced_injective_fact_instances(
+                    injective_fact_insts, forced_injective_facts);
+        }
         // Compute loop-breakers and annotate the protocol rules in
         // place — direct port of Haskell's `useAutoLoopBreakersAC`
         // (`Theory.Tools.LoopBreakers`).  Edge `R_from → R_to.prem`

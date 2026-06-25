@@ -21,6 +21,12 @@ impl FastFreshState {
     /// Empty supply.
     pub fn nothing_used() -> Self { FastFreshState { next: 0 } }
 
+    /// Supply seeded so the first `fresh_ident` yields `seed` (HS
+    /// `evalFresh action seed` over the `FastFresh` `FreshState = Integer`).
+    /// Used by `Sapic.States.addStatesChannels`, which seeds the counter at
+    /// `initStateChan` (the next free `StateChannel` index).
+    pub fn seeded(seed: u64) -> Self { FastFreshState { next: seed } }
+
     /// Allocate `k` consecutive identifiers and return the first one.
     pub fn fresh_idents(&mut self, k: u64) -> u64 {
         let i = self.next;

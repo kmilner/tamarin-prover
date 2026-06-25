@@ -475,11 +475,19 @@ impl ProverSession {
             restrictions.push(rg);
         }
         let rules: Vec<OpenProtoRule> = theory.rules().cloned().collect();
+        // HS `setforcedInjectiveFacts {L_PureState, L_CellLocked}` (Sapic.hs:84):
+        // when the state-channel optimisation is on, those two facts are forced
+        // injective for the WHOLE proof (`closeRuleCache`, Rule.hs:147-150).
+        let forced_injective_facts: Vec<crate::fact::FactTag> = if theory.options.state_channel_opt {
+            crate::tools::injective_fact_instances::pure_state_forced_fact_tags()
+        } else {
+            Vec::new()
+        };
         // Capture the fresh-counter span around the template build so we
         // can replay the bump per lemma (see `setup_counter_delta` docs).
         let setup_counter_before = maude.fresh_counter_peek();
-        let template_ctx = ProofContext::new_with_restrictions_and_pool(
-            maude.clone(), pool, rules, restrictions.clone());
+        let template_ctx = ProofContext::new_with_restrictions_pool_forced(
+            maude.clone(), pool, rules, restrictions.clone(), &forced_injective_facts);
         let setup_counter_after = maude.fresh_counter_peek();
         let setup_counter_delta = setup_counter_after.saturating_sub(setup_counter_before);
         Ok(ProverSession {
@@ -951,13 +959,20 @@ pub fn prove_lemma_with_pool_file_heuristic(
         if trace { Some(std::time::Instant::now()) } else { None };
     // Bridge the elaborated theory's rules into the proof context.
     let rules: Vec<OpenProtoRule> = theory.rules().cloned().collect();
+    // HS `setforcedInjectiveFacts {L_PureState, L_CellLocked}` (Sapic.hs:84):
+    // force those facts injective when the state-channel optimisation is on.
+    let forced_injective_facts: Vec<crate::fact::FactTag> = if theory.options.state_channel_opt {
+        crate::tools::injective_fact_instances::pure_state_forced_fact_tags()
+    } else {
+        Vec::new()
+    };
     // Install the optional `maude_pool` BEFORE the precompute phase
     // runs inside the constructor — `precompute_full_sources` calls
     // `saturate_sources_with_simp` which is parallel and benefits
     // from the pool.  Setting `maude_pool` after construction would
     // leave that initial precompute on the single shared `maude`.
-    let mut ctx = ProofContext::new_with_restrictions_and_pool(
-        maude, pool, rules, restrictions.clone());
+    let mut ctx = ProofContext::new_with_restrictions_pool_forced(
+        maude, pool, rules, restrictions.clone(), &forced_injective_facts);
     if trace { eprintln!("[phase] ProofContext::new done dt={:.3}s",
         t_ctx.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64())); }
     // Propagate the lemma's trace quantifier so `is_finished` can

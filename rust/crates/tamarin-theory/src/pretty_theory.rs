@@ -402,10 +402,19 @@ fn render_injective_fact_insts(elab: &Theory) -> String {
     let proto_rules: Vec<&crate::rule::ProtoRuleE> = elab.rules()
         .map(|r| &r.rule)
         .collect();
-    let tags = crate::tools::injective_fact_instances::simple_injective_fact_instances(
+    let mut tags = crate::tools::injective_fact_instances::simple_injective_fact_instances(
         &proto_rules,
         &elab.signature.maude_sig.reducible_fun_syms,
     );
+    // HS `closeRuleCache` (Rule.hs:147-150): union the FORCED injective facts
+    // (`setforcedInjectiveFacts {L_PureState, L_CellLocked}`, Sapic.hs:84) when
+    // the state-channel optimisation is on.
+    if elab.options.state_channel_opt {
+        tags = crate::tools::injective_fact_instances::union_forced_injective_fact_instances(
+            tags,
+            &crate::tools::injective_fact_instances::pure_state_forced_fact_tags(),
+        );
+    }
     if tags.is_empty() { return String::new(); }
     // HS `showFactTagArity` (Fact.hs:526): persistent `!`-prefix + name
     // + `/` + arity.

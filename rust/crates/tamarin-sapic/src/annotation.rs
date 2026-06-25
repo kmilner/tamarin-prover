@@ -5,7 +5,7 @@
 //! analysis passes (lock variables, secret-channel variables, etc.).
 
 use tamarin_theory::sapic::{
-    GoodAnnotation, Process, ProcessParsedAnnotation, SapicLVar,
+    GoodAnnotation, Process, ProcessParsedAnnotation, SapicLVar, SapicTerm,
 };
 use tamarin_term::lterm::LNTerm;
 
@@ -37,8 +37,10 @@ pub struct ProcessAnnotation<V> {
     pub pure_state: bool,
     /// Variable identifying the state cell associated with this op.
     pub state_channel: Option<AnVar<V>>,
-    /// Term marking the binding of a state-channel.
-    pub is_state_channel: Option<LNTerm>,
+    /// Term marking the binding of a state-channel.  HS `isStateChannel ::
+    /// Maybe SapicTerm` (Annotation.hs:59): the cell identifier this fresh
+    /// `new StateChannel:channel` was introduced for.
+    pub is_state_channel: Option<SapicTerm>,
 }
 
 impl<V> Default for ProcessAnnotation<V> {

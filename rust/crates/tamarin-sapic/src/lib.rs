@@ -20,10 +20,11 @@
 //!   (linear + state + locks + `let` (FLet) + process-call marker)
 //! - [`translate`] / [`apply`] ← top-level `Sapic`
 //!
+//! - [`states`] ← `Sapic.States` (pure-state / state-channel optimisation,
+//!   gated on `options: translation-state-optimisation` / `_stateChannelOpt`)
+//!
 //! Not yet ported (later phases):
 //! `Sapic.Exceptions`,
-//! `Sapic.States` (pure-state detection passes — the `pure_state`/`L_PureState`
-//! translation paths exist but the `annotatePureStates` detector is not wired),
 //! `Sapic.Report`, `Sapic.Warnings`,
 //! plus secret/private channels (`ChIn`/`ChOut` on a named/private channel)
 //! in `convert`/`base_translation`.
@@ -48,5 +49,6 @@ pub mod progress_translation;
 pub mod reliable_channel;
 pub mod report;
 pub mod secret_channels;
+pub mod states;
 pub mod translate;
 pub mod typing;
