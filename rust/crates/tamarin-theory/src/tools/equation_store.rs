@@ -647,9 +647,8 @@ impl EquationStore {
                 log_vr_node_bindings("local", &local_subst);
             }
             if self.conj.is_empty() {
-                if std::env::var("TAM_RS_DBG_APPLY_EQ_STORE").is_ok() {
-                    let filter = std::env::var("TAM_RS_DBG_APPLY_EQ_STORE_FILTER")
-                        .map(|s| s == "substantive").unwrap_or(false);
+                if aes_dbg() {
+                    let filter = aes_dbg_filter_substantive();
                     if !filter {
                         eprintln!("[rs-aes-tick] conj=0 substantive=false (short-circuit:add_eqs-no-ac)");
                     }
@@ -757,9 +756,8 @@ impl EquationStore {
             // (e.g. `{z → verify(s,m,pkA)}` vs `{z → true}` collapse).
             // Mirrors EquationStore.hs:228 (addEqs single-unifier arm).
             if self.conj.is_empty() {
-                if std::env::var("TAM_RS_DBG_APPLY_EQ_STORE").is_ok() {
-                    let filter = std::env::var("TAM_RS_DBG_APPLY_EQ_STORE_FILTER")
-                        .map(|s| s == "substantive").unwrap_or(false);
+                if aes_dbg() {
+                    let filter = aes_dbg_filter_substantive();
                     if !filter {
                         eprintln!("[rs-aes-tick] conj=0 substantive=false (short-circuit:add_eqs-single-maude)");
                     }
@@ -801,9 +799,8 @@ impl EquationStore {
         // first perform_split (1588-line diff).  See [[locked diagnosis
         // 2026-06-07 apply_eq_store gating]].
         if self.conj.is_empty() {
-            if std::env::var("TAM_RS_DBG_APPLY_EQ_STORE").is_ok() {
-                let filter = std::env::var("TAM_RS_DBG_APPLY_EQ_STORE_FILTER")
-                    .map(|s| s == "substantive").unwrap_or(false);
+            if aes_dbg() {
+                let filter = aes_dbg_filter_substantive();
                 if !filter {
                     eprintln!("[rs-aes-tick] conj=0 substantive=false (short-circuit:add_eqs-multi-maude)");
                 }

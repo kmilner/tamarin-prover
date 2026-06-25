@@ -1072,15 +1072,12 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     // so its runtime `insertImpliedFormulas` never fires `[sources]`.
     // Refine fires them at precompute (drives typing-violation drops).
     //
-    // Was previously default-OFF (workaround for our weaker refine);
-    // any NSPK3 / typing-class lemma that timed out without it was
-    // masking a refine-strength bug that needs to be fixed at refine,
+    // Skip `[sources]`-tagged universals at runtime unconditionally
+    // (refine fires them at precompute); the runtime path matches HS,
+    // which only puts `[reuse]` in sLemmas.  A weaker refine that timed
+    // out without this would be a refine-strength bug to fix at refine,
     // not papered over by runtime [sources] firings.
-    //
-    // TAM_PROVENANCE_SKIP_SOURCES_OFF=1 reverts to the old workaround
-    // for diagnostic comparison.
-    let skip_sources = std::env::var("TAM_PROVENANCE_SKIP_SOURCES_OFF").is_err()
-        && !crate::constraint::solver::sources::in_precompute_mode()
+    let skip_sources = !crate::constraint::solver::sources::in_precompute_mode()
         && !red.sys.sources_lemma_universals.is_empty();
     // Mirror Haskell's `openGuarded` (Guarded.hs:openGuarded): allocate
     // FRESH LVar idxs for each bound var BEFORE matching, then

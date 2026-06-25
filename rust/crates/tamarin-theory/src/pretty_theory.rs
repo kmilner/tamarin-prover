@@ -2204,7 +2204,7 @@ fn pp_step_doc(
     }
 }
 
-fn pp_step_at(m: &crate::constraint::solver::proof_method::ProofMethod, indent: usize) -> String {
+fn pp_step_at(m: &crate::constraint::solver::proof_method::ProofMethod, _indent: usize) -> String {
     use crate::constraint::solver::proof_method::{ProofMethod as PM, Result as MR};
     match m {
         PM::Simplify => "simplify".to_string(),
@@ -2217,38 +2217,6 @@ fn pp_step_at(m: &crate::constraint::solver::proof_method::ProofMethod, indent: 
         PM::Finished(MR::Unfinishable) => {
             "UNFINISHABLE // reducible operator in subterm".to_string()
         }
-        PM::Finished(MR::Contradictory(reason)) => match reason {
-            Some(c) => format!("contradiction /* {} */", pp_contradiction(c)),
-            None => "contradiction".to_string(),
-        },
-        PM::SolveGoal(g) => {
-            use crate::constraint::constraints::Goal;
-            // HS `prettyProofMethod` (ProofMethod.hs:1174; SolveGoal case 1182):
-            //   SolveGoal goal ->
-            //     keyword_ "solve(" <-> prettyGoal goal <-> keyword_ ")"
-            // For a non-empty `DisjG`, `prettyGoal` is
-            //   `fsep $ punctuate "  ∥" (map (nest 1 . parens . prettyGuarded) gfs)`
-            // (Constraints.hs:281-283) — a multi-disjunct guarded formula
-            // that HS wraps across lines inside the global proof-tree Doc.
-            // Route this whole `solve( ... )` line through the HS-faithful
-            // Doc engine so the `fsep`/`sep`/`nest` wrap decisions and the
-            // continuation-line indents (col `indent + 7`, after `solve( `)
-            // are byte-identical to HS.
-            if let Goal::Disj(d) = g {
-                if !d.0.is_empty() {
-                    return pf::solve_disj_goal_line(&d.0, indent);
-                }
-            }
-            // ActionG/ChainG/PremiseG/SplitG/SubtermG: route the whole
-            // `solve( <goal> )` line through the same HS-faithful Doc engine
-            // as DisjG (4a6b6d5a) so `prettyLNFact`'s `nestShort'` wrapping
-            // (Fact.hs:539-544) and the `<+>` beside column-shift indent the
-            // goal's continuation lines to the column after `solve( `
-            // (= indent+7), byte-identical to HS.  HS `prettyGoal`
-            // (Constraints.hs:273-287).
-            let goal_doc = solve_goal_to_doc(g);
-            pf::solve_goal_line_from_doc(goal_doc, indent)
-        }
         PM::Invalidated => {
             // HS `prettyProofMethod` (ProofMethod.hs):
             //   Invalidated -> lineComment_
@@ -2257,16 +2225,14 @@ fn pp_step_at(m: &crate::constraint::solver::proof_method::ProofMethod, indent: 
             // `lineComment_` renders the verbatim text after `// `.
             "// proof may have been invalidated by editing a reuse lemma above. You should ".to_string()
         }
-        PM::RawSolve(inner) => {
-            // Display-only: skeleton raw text preserved for unannotated
-            // subtrees (replay.rs `parsed_to_unannotated`).  Mirrors
-            // HS `noSystemPrf` (Proof.hs:469) which keeps the original
-            // ProofMethod value verbatim.  Output: `solve( <inner> )`.
-            // Trim the inner text: the parser's `read_balanced_paren`
-            // returns the content between `( ... )` which may carry a
-            // trailing space → `solve(  ...  )` if we don't trim.
-            format!("solve( {} )", inner.trim())
-        }
+        // SolveGoal / RawSolve / Finished(Contradictory) are rendered as
+        // Docs by `pp_step_doc`, which handles them BEFORE its
+        // `_ => pp_step_at(..)` fallback — so they never reach here.
+        // `pp_step_at` is the string-only path for the remaining leaf
+        // methods (Simplify/Induction/Sorry/Solved/Unfinishable/Invalidated).
+        PM::SolveGoal(_) | PM::RawSolve(_) | PM::Finished(MR::Contradictory(_)) =>
+            unreachable!("pp_step_at: {:?} is rendered by pp_step_doc, not here",
+                std::any::type_name::<PM>()),
     }
 }
 

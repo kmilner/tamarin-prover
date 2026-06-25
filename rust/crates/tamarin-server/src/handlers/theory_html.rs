@@ -355,7 +355,7 @@ fn lemma_html(entry: &TheoryEntry, name: &str) -> String {
                  &nbsp;\n\
                  <a class=\"ajax-action\" href=\"/thy/trace/{idx}/autoprove/bfs/0/False/proof/{n}\">[autoprove (bfs)]</a>\n\
                  </p>\n",
-                n = html_escape(name),
+                n = url_path_escape(name),
                 tq = tq,
                 f = html_escape(&formula),
                 idx = entry.idx,
@@ -425,6 +425,6 @@ pub fn proof_html(entry: &TheoryEntry, lemma: &str, sub: &[String]) -> String {
          </span>\n\
          </div>\n",
         idx = entry.idx,
-        lemma = html_escape(lemma)));
+        lemma = url_path_escape(lemma)));
     out
 }

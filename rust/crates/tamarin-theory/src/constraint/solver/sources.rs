@@ -968,9 +968,8 @@ pub fn refine_with_source_asms(
     // Haskell uses `paramSaturationLimit=5` for `saturateSources`. Our
     // multi-branch port grows the case set with each iteration (each
     // iter forks at every source-pick).  Capping iterations bounds
-    // growth.  `TAM_REFINE_SAT_LIMIT` overrides.
-    let limit: usize = std::env::var("TAM_REFINE_SAT_LIMIT")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+    // growth.
+    let limit: usize = 5;
     let saturated = saturate_sources_with_simp(intermediate, limit, ctx);
 
     // Step 3 (Haskell `removeFormulas`): strip formulas + solved
@@ -1075,10 +1074,10 @@ fn refine_one_source(
         // here PARKED branches mid-flight as emitted cases — states
         // with open chain/KD goals HS would have solved or
         // contradicted — ballooning Chen_Kudla's KU(exp) source from
-        // HS's 29 cases to 276 and flipping the no_WPFS verdict.
-        // TAM_DISJ_OUTER_CAP remains as a diagnostic override.
-        let outer_cap: i64 = std::env::var("TAM_DISJ_OUTER_CAP")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(i64::MAX);
+        // HS's 29 cases to 276 and flipping the no_WPFS verdict.  HS has
+        // no such cap (only chainsLeft + paramSaturationLimit), so this
+        // is unconditionally unbounded.
+        let outer_cap: i64 = i64::MAX;
         // Only build the debug case-name join when actually debugging;
         // `name_list` is moved into the solver call below, so capture it
         // here under the `dbg` guard.  The non-dbg path skips the join.
@@ -1309,10 +1308,8 @@ fn saturate_sources_with_simp_opt(
         // output cases.  The old default (50) parked branches as
         // half-refined cases once 50 finished, which is a non-HS
         // mechanism (see TAM_DISJ_OUTER_CAP comment in
-        // refine_one_source).  TAM_DISJ_BRANCH_CAP remains as a
-        // diagnostic override.
-        let branch_cap: usize = std::env::var("TAM_DISJ_BRANCH_CAP")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+        // refine_one_source).  Unconditionally unbounded to match HS.
+        let branch_cap: usize = usize::MAX;
         // Haskell-faithful: multi-branch refineSource.
         // Sources.hs's `saturateSources` runs `solveAllSafeGoals`
         // through the `Reduction` monad which is `Disj`-shaped — every
@@ -1667,11 +1664,6 @@ fn run_solve_all_safe_goals_disj(
 // for the process, so cache each behind a `OnceLock<bool>` (mirroring
 // `trace::flag()`) instead of re-reading the environment per branch.
 #[inline]
-fn sas_disable_simp_fanout() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_SAS_SIMPLIFY_FANOUT").is_ok())
-}
-#[inline]
 fn sas_dbg_branch_state() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("TAM_RS_DBG_BRANCH_STATE").is_ok())
@@ -1682,19 +1674,9 @@ fn sas_dbg_branch_drop() -> bool {
     *V.get_or_init(|| std::env::var("TAM_DBG_BRANCH_DROP").is_ok())
 }
 #[inline]
-fn sas_lct_filter_disabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_LCT_FILTER").is_ok())
-}
-#[inline]
 fn sas_iter_trace() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("TAM_RS_SAS_ITER").is_ok())
-}
-#[inline]
-fn disj_refine_ctx_aware() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_DISJ_REFINE_CTX").is_ok())
 }
 #[inline]
 fn disj_refine_trace() -> bool {
@@ -1705,11 +1687,6 @@ fn disj_refine_trace() -> bool {
 fn dbg_useful_kus() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("TAM_DBG_USEFUL_KUS").is_ok())
-}
-#[inline]
-fn disj_refine_no_source_pick() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_DISJ_REFINE_NO_SOURCE_PICK").is_ok())
 }
 /// Variant that also returns a flag indicating whether ANY branch took
 /// at least one solve step (safe-goal solve or source-pick).  This is
@@ -1734,8 +1711,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
     use crate::constraint::solver::goals::dispatch_solve_goal;
     use crate::constraint::solver::reduction::{
         GoalCases, Reduction, SolveOutcome, SplitStrategy};
-    use crate::constraint::solver::simplify::{
-        simplify_system, simplify_system_with_fanout};
+    use crate::constraint::solver::simplify::simplify_system_with_fanout;
     use crate::fact::FactTag;
 
     // HS-faithful: track step names as a Vec<String> — HS's
@@ -1793,8 +1769,10 @@ fn run_solve_all_safe_goals_disj_with_progress(
     // "changes" detection (Sources.hs:362-384; `not (null names)` from
     // solveAllSafeGoals returning caseNames, 213-215).
     let mut any_step_taken: bool = false;
-    // Safety: hard limit on total worklist processing iterations to
-    // avoid runaway exploration if branching is pathological.
+    // outer_cap / branch_cap are hardcoded to MAX (the HS-faithful
+    // unbounded default; the env knobs were removed), so the two guards
+    // below are inert — the real bounds are chains_left (HS chainsLeft=10)
+    // and the outer saturation limit (paramSaturationLimit=5).
     let mut total_steps: usize = 0;
     let total_step_cap: usize = branch_cap.saturating_mul(50).max(2000);
 
@@ -1805,9 +1783,6 @@ fn run_solve_all_safe_goals_disj_with_progress(
             finished.push((sys, name));
             continue;
         }
-        // Branch cap: if total alive+finished would exceed cap,
-        // park this branch as-is (its final state is whatever we
-        // accumulated so far).
         if finished.len() + 1 > branch_cap || iters_left <= 0 {
             any_step_taken |= took_step;
             finished.push((sys, name));
@@ -1839,14 +1814,10 @@ fn run_solve_all_safe_goals_disj_with_progress(
         // onto worklist with same (name, used, chains_left, iters_left,
         // last_chain_term), and process the head.  Empty result drops
         // the branch (HS mzero-equivalent).
-        let disable_simp_fanout = sas_disable_simp_fanout();
-        let post_simp: Vec<System> = if disable_simp_fanout {
-            let mut red0 = Reduction::new(ctx, sys);
-            simplify_system(&mut red0);
-            vec![red0.sys]
-        } else {
-            simplify_system_with_fanout(ctx, sys)
-        };
+        // HS-faithful: propagate the DisjT fan-out from simplifySystem
+        // (unconditional; the TAM_RS_DISABLE_SAS_SIMPLIFY_FANOUT opt-out
+        // that collapsed N siblings into 1 has been removed).
+        let post_simp: Vec<System> = simplify_system_with_fanout(ctx, sys);
         // Pop one sibling to continue with; push the rest back for
         // later processing.  Match HS's Disj-monad insertion order:
         // first sibling processed first (LIFO worklist → push tail
@@ -1949,11 +1920,10 @@ fn run_solve_all_safe_goals_disj_with_progress(
         // restores the open Chain/Split goals HS picks up at iter 1
         // and drops via solveChain's forbiddenEdge / illegalCoerce /
         // isMsgVar plus solveSplit's eqsIsFalse.
-        let filter_disabled = sas_lct_filter_disabled();
-        let filtered_goals: Vec<(Goal, bool)> = if filter_disabled {
-            goals.clone()
-        } else {
-            goals.iter().filter(|(g, _)| {
+        // HS-faithful `lastChainTerm` chain-goal filter (Sources.hs:182-186),
+        // applied unconditionally (the TAM_RS_DISABLE_LCT_FILTER opt-out
+        // that skipped it has been removed).
+        let filtered_goals: Vec<(Goal, bool)> = goals.iter().filter(|(g, _)| {
                 match g {
                     Goal::Chain(c, _) => {
                         let this_t = k_conc_term_for_chain(&red.sys, c);
@@ -1967,8 +1937,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
                     }
                     _ => true,
                 }
-            }).cloned().collect()
-        };
+            }).cloned().collect();
         // Unfiltered chains view — Haskell's `unsolvedChains`.
         let any_unsolved_chain = red.sys.goals.iter().any(|(g, st)|
             !st.solved && matches!(g, Goal::Chain(_, _)));
@@ -2190,7 +2159,6 @@ fn run_solve_all_safe_goals_disj_with_progress(
             continue;
         }
         let avoid_max = system_max_idx(&red.sys);
-        let use_ctx_aware = disj_refine_ctx_aware();
         let trace = disj_refine_trace();
         // Iterate useful goals in order; first one with a matching
         // source wins (Haskell `asum`).
@@ -2229,13 +2197,8 @@ fn run_solve_all_safe_goals_disj_with_progress(
             }
         }
         for (i_cand, fa_cand) in useful_kus {
-            let case_pairs_opt = if use_ctx_aware {
-                solve_with_source_cases_action_with_ctx(
-                    ths, &red.sys, &i_cand, &fa_cand, avoid_max, Some(ctx))
-            } else {
-                solve_with_source_cases_action(
-                    ths, &red.sys, &i_cand, &fa_cand, avoid_max)
-            };
+            let case_pairs_opt = solve_with_source_cases_action(
+                ths, &red.sys, &i_cand, &fa_cand, avoid_max);
             if dbg_useful {
                 let n = case_pairs_opt.as_ref().map(|cp| cp.len()).unwrap_or(usize::MAX);
                 let head = fa_cand.terms.first().map(|t| format!("{:?}",t).chars().take(80).collect::<String>()).unwrap_or_default();
@@ -2284,44 +2247,11 @@ fn run_solve_all_safe_goals_disj_with_progress(
         // Fork: try each viable candidate as a separate branch.
         // Mirrors Haskell `asum [solveWithSourceAndReturn ctxt ths g
         // | g <- usefulGoals]` — collects all branches that survive.
-        //
-        // TAM_DISJ_REFINE_NO_SOURCE_PICK=1: commit to FIRST viable
-        // source-pick (single-pick semantics) instead of forking.  This
-        // makes source-pick behave like single-pick while keeping
-        // Disj/Split/Subterm branching active.  Tests whether the
-        // wrong-VERIFY on NSPK3 attack comes from source-pick branching
-        // or from safe-goal branching.
-        let no_source_pick_fork = disj_refine_no_source_pick();
+        // (Unconditional fork; the TAM_DISJ_REFINE_NO_SOURCE_PICK
+        // single-pick opt-out has been removed.)
         let mut any_branched = false;
         for (case_name, sys_cand, case_action) in unused {
-            if use_ctx_aware {
-                // Ctx-aware path: solve_with_source_cases_action_with_ctx
-                // has already done `someInst keepVarBindings` + `conjoinSystem`,
-                // so the system is fully merged.  No follow-up
-                // solve_fact_eqs needed — push directly.
-                let mut new_used = used.clone();
-                // Haskell-faithful: track SOURCE LABEL.
-                if let Some(label) = ku_source_label_for_fa(&fa) {
-                    new_used.insert(label);
-                } else {
-                    new_used.insert(case_name.clone());
-                }
-                // HS-faithful: source-pick step APPENDS its name to
-                // `caseNames` (Sources.hs:232 `(caseNames ++ x)`).
-                // `combine` runs ONLY at refineSource level (between
-                // saturate iters), not per-step inside solveAllSafeGoals.
-                let mut new_name = name.clone();
-                append_step_name_list(&mut new_name, &case_name);
-                if trace {
-                    eprintln!("[disj-refine] commit ctx-aware case={} -> {:?}",
-                        case_name, new_name);
-                }
-                worklist.push((sys_cand, new_name, new_used,
-                    chains_left, iters_left - 1, new_last_chain_term.clone(), true));
-                any_branched = true;
-                continue;
-            }
-            // Legacy graft path: caller runs solve_fact_eqs(action) +
+            // Graft path: caller runs solve_fact_eqs(action) +
             // chain_eqs over the grafted system.
             let mut sub = Reduction::new(ctx, sys_cand);
             let res = sub.solve_fact_eqs(
@@ -2427,7 +2357,9 @@ fn run_solve_all_safe_goals_disj_with_progress(
             } else {
                 new_used.insert(case_name.clone());
             }
-            // HS-faithful append (see ctx-aware path above for rationale).
+            // HS-faithful: source-pick step APPENDS its name to `caseNames`
+            // (Sources.hs:232 `(caseNames ++ x)`); `combine` runs only at the
+            // refineSource boundary, not per-step inside solveAllSafeGoals.
             let mut new_name = name.clone();
             append_step_name_list(&mut new_name, &case_name);
             if trace {
@@ -2437,7 +2369,6 @@ fn run_solve_all_safe_goals_disj_with_progress(
             worklist.push((sub.sys, new_name, new_used,
                 chains_left, iters_left - 1, new_last_chain_term.clone(), true));
             any_branched = true;
-            if no_source_pick_fork { break; }
         }
 
         if !any_branched {
