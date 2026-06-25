@@ -38,20 +38,16 @@ features and that Haskell proves within a 300 s/lemma cap. This spans
 
 | Result | Files | Meaning |
 |--------|------:|---------|
-| MATCH | 380 | Rust output byte-identical to Haskell |
-| DIFF  |   6 | divergence remains — the SAPiC tail (below) |
+| MATCH | 386 | Rust output byte-identical to Haskell |
+| DIFF  |   0 | — |
 | SKIP  |  68 | no Haskell reference to compare against (HS exceeds the cap, or produces no/empty output) |
 
-All 380 non-SAPiC-tail theories are reproduced byte-for-byte. The 6 remaining
-DIFFs are a narrow SAPiC tail: `Yubikey` and `opc_ua_secure_conversation`
-(multiset predicate-rendering + AC argument order, and proof search),
-`boundonce2` (a `capturedVariables` wellformedness warning), `binding` (a
-cosmetic fresh-timepoint name), `CH07` (xor), and `smaller` (feature-export).
-Theories outside the corpus require an unported feature — accountability
-(`accounts for`) or observational equivalence (`--diff`) — or exercise searches
-that Haskell
-itself does not finish.
-Observational-equivalence (`--diff`) theories re-enter once that mode is ported.
+Every theory in the corpus that Haskell can prove is reproduced byte-for-byte:
+no rendering, proof-search, or verdict divergence remains. Theories outside the
+corpus require an unported feature — accountability (`accounts for`) or
+observational equivalence (`--diff`) — or exercise searches that Haskell itself
+does not finish. Observational-equivalence (`--diff`) theories re-enter once that
+mode is ported.
 
 ## Performance
 
