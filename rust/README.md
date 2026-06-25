@@ -26,26 +26,26 @@ volatile header lines (Git revision, compile time, processing time).
 
 The parity gate (`scripts/corpus_file_diff.sh`, corpus in
 `scripts/parity_corpus.txt`) compares the Rust port against the Haskell prover
-on a 433-file corpus: the theories under `examples/` that use only ported
+on a 446-file corpus: the theories under `examples/` that use only ported
 features and that Haskell proves within a 300 s/lemma cap. This spans
 `classic/`, `ake/`, `sp14/`, the `csf*/` series, `features/`, `loops/`,
 `post17/`, `regression/`, `related_work/`, the multiset-rewrite theories in
 `csf18-xor/`, `jcs19-xor/`, `idbased/`, `eurosp19-eccDAA/`,
 `esorics23-bluetooth/`, `csf20-disputeResolution/`, `fm24-cardpayments/`,
 `wisec21-5G-handover/`, `wireguard/`, the POIDC and
-`thesis-LaraSchmid-evoting/` corpora, and 58 SAPiC `process:` theories from
+`thesis-LaraSchmid-evoting/` corpora, and 71 SAPiC `process:` theories from
 `sapic/`.
 
 | Result | Files | Meaning |
 |--------|------:|---------|
-| MATCH | 365 | Rust output byte-identical to Haskell |
+| MATCH | 378 | Rust output byte-identical to Haskell |
 | DIFF  |   0 | — |
 | SKIP  |  68 | no Haskell reference to compare against (HS exceeds the cap, or produces no/empty output) |
 
 Every theory in the corpus that Haskell can prove is reproduced byte-for-byte:
 no rendering, proof-search, or verdict divergence remains. Theories outside the
-corpus require an unported feature — the SAPiC `report()`/`locations-report`
-translation, accountability (`accounts for`), or observational equivalence
+corpus require an unported feature — the SAPiC `--translation-state-optimisation`
+(pure-state) path, accountability (`accounts for`), or observational equivalence
 (`--diff`) — or exercise searches that Haskell itself does not finish.
 Observational-equivalence (`--diff`) theories re-enter once that mode is ported.
 
@@ -123,9 +123,9 @@ Regenerate the tables with `scripts/bench.sh`.
   byte-identical to HS `Sapic.translate`. Covers the core constructs (`0`, `|`,
   `+`, `!`, `new`, `in`/`out`, `event`, conditionals), mutable state
   (`insert`/`delete`/`lookup`), `lock`/`unlock`, process calls + `let`
-  bindings/destructors, secret/private channels, and the progress + reliable-
-  channel translations. (`report()`/`locations-report` translation is the
-  remaining construct.)
+  bindings/destructors, secret/private channels, the progress + reliable-channel
+  translations, and `report()`/`locations-report`. (The opt-in
+  `--translation-state-optimisation` pure-state path is the remaining construct.)
 - **Heuristics:** smart (`s`/`S`), goal-number (`C`/`c`), injective (`i`/`I`),
   SAPiC (`p`/`P`), oracle (`o`/`O`), and `tactic:` rankings — selected by the
   in-file `heuristic:`/`tactic:` annotation or per-lemma attribute, or overridden
@@ -139,9 +139,11 @@ Regenerate the tables with `scripts/bench.sh`.
 
 ## Not yet ported
 
-- **SAPiC `report()` / `locations-report` translation** — the remaining SAPiC
-  construct (the rest of the `process:` frontend is ported; see Implemented).
-  `feature-locations/` theories use it.
+- **SAPiC `--translation-state-optimisation` (pure-state)** — the opt-in
+  state-optimisation translation (`newStateChannel*` rules + `L_PureState`/
+  `L_CellLocked` facts); the rest of the `process:` frontend is ported (see
+  Implemented). A few `feature-locations/` theories (AC, AC_counter, Yubikey)
+  enable it.
 - **`diff(...)` / `--diff`** — observational-equivalence mode.
 - **Accountability (`accounts for` / `verdictfunction`)** — the accountability
   frontend that expands a verdict lemma into case sub-lemmas; the surrounding
