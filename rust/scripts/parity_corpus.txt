@@ -305,6 +305,7 @@ sapic/deprecated/csf21-acc-unbounded/mixnets/message-tracing/dmn-message-tracing
 sapic/deprecated/csf21-acc-unbounded/mixvote/mixvote_SmHh-multi-session-1-fixed.spthy
 sapic/deprecated/csf21-acc-unbounded/mixvote/mixvote_SmHh-multi-session-2-fixed.spthy
 sapic/fast/basic/boundonce.spthy
+sapic/fast/basic/boundonce2.spthy
 sapic/fast/basic/channels1.spthy
 sapic/fast/basic/channels2.spthy
 sapic/fast/basic/channels3.spthy
@@ -339,6 +340,7 @@ sapic/fast/basic/typing.spthy
 sapic/fast/feature-ass-immediate/test-all.spthy
 sapic/fast/feature-ass-immediate/test-channelin.spthy
 sapic/fast/feature-export/export-tag.spthy
+sapic/fast/feature-export/smaller.spthy
 sapic/fast/feature-inevent-restriction/inevent-restriction-private-channel.spthy
 sapic/fast/feature-inevent-restriction/inevent-restriction-public-channel.spthy
 sapic/fast/feature-locations/AC.spthy
@@ -348,6 +350,7 @@ sapic/fast/feature-locations/licensing.spthy
 sapic/fast/feature-locations/OTP.spthy
 sapic/fast/feature-locations/SOC.spthy
 sapic/fast/feature-locking-restriction/locking-restriction.spthy
+sapic/fast/feature-predicates/binding.spthy
 sapic/fast/feature-predicates/decwrap-destr-manual.spthy
 sapic/fast/feature-predicates/decwrap-destr-restrict.spthy
 sapic/fast/feature-predicates/decwrap-destr-restrict-variant.spthy
@@ -366,6 +369,7 @@ sapic/fast/feature-progress/mini8.spthy
 sapic/fast/feature-progress/mini9.spthy
 sapic/fast/feature-secret-channel/secret-channel.spthy
 sapic/fast/feature-secret-channel/U2F.spthy
+sapic/fast/feature-xor/CH07.spthy
 sapic/fast/feature-xor/CRxor.spthy
 sapic/fast/feature-xor/KCL07.spthy
 sapic/fast/GJM-contract/contract.spthy
@@ -377,6 +381,8 @@ sapic/fast/regression-tests/issue332-notype-header.spthy
 sapic/fast/regression-tests/issue731-clustering-by-role.spthy
 sapic/fast/regression-tests/issueX-translation-crash.spthy
 sapic/fast/statVerifLeftRight/stateverif_left_right.spthy
+sapic/fast/SCADA/opc_ua_secure_conversation.spthy
+sapic/fast/Yubikey/Yubikey.spthy
 sp14/Chen_Kudla.spthy
 sp14/GDH.spthy
 sp14/group_joux.spthy
