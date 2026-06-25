@@ -26,26 +26,30 @@ volatile header lines (Git revision, compile time, processing time).
 
 The parity gate (`scripts/corpus_file_diff.sh`, corpus in
 `scripts/parity_corpus.txt`) compares the Rust port against the Haskell prover
-on a 448-file corpus: the theories under `examples/` that use only ported
+on a 454-file corpus: the theories under `examples/` that use only ported
 features and that Haskell proves within a 300 s/lemma cap. This spans
 `classic/`, `ake/`, `sp14/`, the `csf*/` series, `features/`, `loops/`,
 `post17/`, `regression/`, `related_work/`, the multiset-rewrite theories in
 `csf18-xor/`, `jcs19-xor/`, `idbased/`, `eurosp19-eccDAA/`,
 `esorics23-bluetooth/`, `csf20-disputeResolution/`, `fm24-cardpayments/`,
 `wisec21-5G-handover/`, `wireguard/`, the POIDC and
-`thesis-LaraSchmid-evoting/` corpora, and 73 SAPiC `process:` theories from
+`thesis-LaraSchmid-evoting/` corpora, and 79 SAPiC `process:` theories from
 `sapic/`.
 
 | Result | Files | Meaning |
 |--------|------:|---------|
 | MATCH | 380 | Rust output byte-identical to Haskell |
-| DIFF  |   0 | — |
+| DIFF  |   6 | divergence remains — the SAPiC tail (below) |
 | SKIP  |  68 | no Haskell reference to compare against (HS exceeds the cap, or produces no/empty output) |
 
-Every theory in the corpus that Haskell can prove is reproduced byte-for-byte:
-no rendering, proof-search, or verdict divergence remains. Theories outside the
-corpus require an unported feature — accountability (`accounts for`) or
-observational equivalence (`--diff`) — or exercise searches that Haskell
+All 380 non-SAPiC-tail theories are reproduced byte-for-byte. The 6 remaining
+DIFFs are a narrow SAPiC tail: `Yubikey` and `opc_ua_secure_conversation`
+(multiset predicate-rendering + AC argument order, and proof search),
+`boundonce2` (a `capturedVariables` wellformedness warning), `binding` (a
+cosmetic fresh-timepoint name), `CH07` (xor), and `smaller` (feature-export).
+Theories outside the corpus require an unported feature — accountability
+(`accounts for`) or observational equivalence (`--diff`) — or exercise searches
+that Haskell
 itself does not finish.
 Observational-equivalence (`--diff`) theories re-enter once that mode is ported.
 
