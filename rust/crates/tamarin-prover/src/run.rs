@@ -757,10 +757,21 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             tamarin_theory::elaborate::set_user_funs_for_theory(&parsed);
         {
             let user_set_heuristic = !elaborated.heuristic.is_empty();
-            tamarin_sapic::apply::apply_sapic(
+            let sapic_wf = tamarin_sapic::apply::apply_sapic(
                 &mut parsed, &mut elaborated, user_set_heuristic,
             ).map_err(|e| RunError(format!(
                 "SAPIC translation error in {}: {}", in_file, e.message)))?;
+            // HS `Sapic.checkWellformedness` (Warnings.hs:37-38) is part of
+            // `preReport`, which is PREPENDED to the rest of the report
+            // (`preReport ++ postReport`, TheoryLoader.hs:455/631).  Prepend
+            // the SAPIC-process warnings so they render FIRST in the
+            // wellformedness block (and the trailing `N wellformedness check
+            // failed` summary counts them via `wf_report.len()`).
+            if !sapic_wf.is_empty() {
+                let mut new_report = sapic_wf;
+                new_report.extend(std::mem::take(&mut wf_report));
+                wf_report = new_report;
+            }
         }
         phase!("sapic translate");
 
@@ -1390,6 +1401,12 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
 fn wf_headerless_preamble(topic: &str) -> Option<String> {
     use tamarin_parser::wf::underline_topic;
     match topic {
+        // SAPIC-process wellformedness errors (HS `toWfErrorReport`,
+        // Warnings.hs:23-26).  Unlike the other topics, HS does NOT underline
+        // this one — `prettyWfErrorReport` renders it as a bare `text topic`
+        // (Wellformedness.hs:124).  So the per-error bodies (each
+        // `"  Variable bound twice: x."`) sit directly under a plain header.
+        "Wellformedness-error in Process" => Some(format!("{topic}\n")),
         "Unbound variables" | "Reserved names" | "Special facts" => {
             Some(format!("{}\n", underline_topic(topic)))
         }

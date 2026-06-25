@@ -23,9 +23,12 @@
 //! - [`states`] ← `Sapic.States` (pure-state / state-channel optimisation,
 //!   gated on `options: translation-state-optimisation` / `_stateChannelOpt`)
 //!
+//! - [`warnings`] ← `Sapic.Warnings` (SAPIC-process wellformedness report;
+//!   bound-twice / `WFBoundTwice` arm — `checkLocks` arm deferred)
+//!
 //! Not yet ported (later phases):
 //! `Sapic.Exceptions`,
-//! `Sapic.Report`, `Sapic.Warnings`,
+//! `Sapic.Report`,
 //! plus secret/private channels (`ChIn`/`ChOut` on a named/private channel)
 //! in `convert`/`base_translation`.
 //!
@@ -52,3 +55,4 @@ pub mod secret_channels;
 pub mod states;
 pub mod translate;
 pub mod typing;
+pub mod warnings;

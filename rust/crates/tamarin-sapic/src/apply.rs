@@ -12,6 +12,7 @@
 //! Scope: the CORE LINEAR subset (see `translate`/`base_translation`).
 
 use tamarin_parser::ast as p;
+use tamarin_parser::wf::WfError;
 
 use tamarin_theory::elaborate::ElabError;
 use tamarin_theory::pretty_theory::lnfact_to_parser;
@@ -29,13 +30,19 @@ use crate::typing::{type_and_rename_process, UserFunTyping};
 ///
 /// `user_set_heuristic` is true when the source / CLI already fixed a heuristic
 /// (in which case HS's `addHeuristic` returns `Nothing` and we do NOT add `p`).
+///
+/// Returns the SAPIC-process wellformedness report (HS `Sapic.checkWellformedness`,
+/// Warnings.hs:37-38), which the caller PREPENDS to the overall report — HS
+/// computes it in `translateTheory` on the OpenTheory *before* translation, so
+/// it sorts before every other check (`preReport ++ postReport`,
+/// TheoryLoader.hs:455/631).  Empty for a well-formed (or non-SAPIC) theory.
 pub fn apply_sapic(
     parsed: &mut p::Theory,
     elaborated: &mut Theory,
     user_set_heuristic: bool,
-) -> Result<(), ElabError> {
+) -> Result<Vec<WfError>, ElabError> {
     if !elaborated.is_sapic {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     // Locate the single top-level process in the parsed theory.
@@ -45,7 +52,7 @@ pub fn apply_sapic(
     });
     let Some(top) = top else {
         // `is_sapic` was set but no TopLevelProcess found — defensive no-op.
-        return Ok(());
+        return Ok(Vec::new());
     };
 
     // P0a + Phase 5: parser AST → theory AST, inlining process-definition
@@ -55,6 +62,15 @@ pub fn apply_sapic(
     let defs = collect_process_defs(parsed);
     let plain = convert_process_with_defs(&top, &defs)
         .map_err(|e| ElabError { message: format!("SAPIC translation: {}", e.message) })?;
+
+    // HS `Sapic.checkWellformedness = concatMap (toWfErrorReport . warnProcess)
+    // . theoryProcesses` (Warnings.hs:37-38) runs on the parsed process —
+    // AFTER inlining (HS inlines at parse time) but BEFORE `typeTheory` /
+    // `renameUnique` — so two binders sharing a name (e.g. `new x; new x`) are
+    // still alpha-identical and detected as captured.  `plain` is exactly that
+    // process.  We collect the report and return it to the caller; translation
+    // proceeds regardless (these are warnings, not hard errors).
+    let wf_report = crate::warnings::check_wellformedness(&plain);
 
     // P0e: typeTheory (renameUnique + type inference), using the elaborated
     // signature's MaudeSig (HS `initTEFromSig`).  The user `functions:` typing
@@ -190,7 +206,7 @@ pub fn apply_sapic(
         }
     }
 
-    Ok(())
+    Ok(wf_report)
 }
 
 /// Collect the user `functions:` typing declarations (HS
