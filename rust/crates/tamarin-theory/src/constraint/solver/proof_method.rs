@@ -646,24 +646,33 @@ pub fn exec_proof_method(
                 crate::state_trace::emit_case(op, name, Some(g), sys);
                 r
             };
-            match outcome {
-                GoalCases::Linear => {
-                    let systems = simplify(r.sys);
-                    let mut out = Vec::new();
-                    for s in systems {
-                        if keep(&s, "") { out.push(("".to_string(), s)); }
-                    }
-                    Some(out)
-                }
-                GoalCases::LinearNamed(name) => {
-                    let systems = simplify(r.sys);
-                    let mut out = Vec::new();
-                    for s in systems {
-                        if keep(&s, &name) { out.push((name.clone(), s)); }
-                    }
-                    Some(out)
-                }
-                GoalCases::Cases(cases) => {
+            // HS-faithful: `processLabeled` (ProofMethod.hs:453-465) treats
+            // EVERY `solveGoal` result UNIFORMLY — the solve yields ONE
+            // `CaseName`, then `runReduction (m <* simplifySystem)` fans the
+            // DisjT continuation out into N branches that ALL carry that same
+            // name, after which `removeRedundantCases` + `uniqueListBy ...
+            // distinguish` dedups and suffixes same-named survivors
+            // (`_case_1`/`_case_2`/...).  A `Linear`/`LinearNamed` outcome is
+            // therefore NOT special: it is simply a single-element case list
+            // whose post-`simplify` fan-out must run through the very same
+            // dedup+distinguish pipeline as `Cases`.  Treating it specially
+            // (pushing each fanned-out system with a bare, un-`distinguish`ed
+            // name) dropped the `_case_N` suffixes whenever a lone source-case
+            // fanned out at simplify time — e.g. Yubikey's
+            // `eventInitStuff...` premise, whose `Smaller` restriction
+            // `∃z. tc = z++otc` splits the ground counter
+            // `('one'++'one'++'zero')` into multiple AC subset arms.  RS then
+            // exposed 4 identically-named siblings and the exists-trace DFS
+            // committed to the first (`otc=('one'++'zero')`, 14 steps) instead
+            // of HS's `_case_2` (`otc='zero'`, 10 steps).  Normalise all three
+            // outcomes to a `Vec<(name, System)>` and share the pipeline.
+            let cases: Vec<(String, System)> = match outcome {
+                GoalCases::Linear => vec![("".to_string(), r.sys)],
+                GoalCases::LinearNamed(name) => vec![(name, r.sys)],
+                GoalCases::Cases(cases) => cases,
+                GoalCases::Contradictory => return Some(Vec::new()),
+            };
+            {
                     // De-duplicate identical case names by appending
                     // `_case_1`/`_case_2`/... — mirrors Haskell's
                     // `groupSortOn casName` printing convention
@@ -782,8 +791,6 @@ pub fn exec_proof_method(
                         out.push((key, s));
                     }
                     Some(out)
-                }
-                GoalCases::Contradictory => Some(Vec::new()),
             }
         }
         ProofMethod::Induction => {
