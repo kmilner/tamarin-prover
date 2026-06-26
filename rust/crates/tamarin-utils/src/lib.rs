@@ -6,6 +6,9 @@ pub mod bind;
 pub mod color;
 pub mod dag;
 pub mod dot;
+/// The `env_gate!` macro is exported at the crate root via
+/// `#[macro_export]`; this (private) module just holds its definition.
+mod env_gate;
 pub mod env_tracer;
 pub mod fresh;
 pub mod logic;
@@ -15,3 +18,12 @@ pub mod pretty;
 pub mod pretty_html;
 pub mod timing;
 pub mod unicode;
+
+/// Fast non-cryptographic hash map for internal *lookup-only* uses
+/// (membership tests / order-independent grouping / memo caches).  Uses
+/// `rustc_hash::FxBuildHasher`, which is `Default`, so this is a drop-in
+/// replacement for `std::collections::HashMap` at call sites that never
+/// iterate the map into observable output or into an ordering decision.
+pub type FastMap<K, V> = std::collections::HashMap<K, V, rustc_hash::FxBuildHasher>;
+/// Fast non-cryptographic hash set — see [`FastMap`].
+pub type FastSet<K> = std::collections::HashSet<K, rustc_hash::FxBuildHasher>;

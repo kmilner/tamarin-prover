@@ -9,6 +9,7 @@ description = "Term language for the Tamarin prover (Rust port)."
 
 [dependencies]
 tamarin-utils = { workspace = true }
+rustc-hash = { workspace = true }
 
 [lints]
 workspace = true

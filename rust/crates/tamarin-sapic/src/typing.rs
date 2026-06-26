@@ -243,7 +243,7 @@ fn rename_cond_formula(
                 let key = LVar::new(v.name.clone(), sort_of_hint(&v.sort), v.idx);
                 match subst.get(&key) {
                     Some(nv) => p::Term::Var(p::VarSpec {
-                        name: nv.name.clone(),
+                        name: nv.name.to_string(),
                         idx: nv.idx,
                         sort: v.sort,
                         typ: v.typ.clone(),
@@ -517,7 +517,7 @@ fn mk_subst(
 /// substitution.
 pub fn rename_unique(p: &PlainProcess) -> PlainProcess {
     let avoid: Vec<(String, u64)> =
-        proc_lvars(p).into_iter().map(|lv| (lv.name, lv.idx)).collect();
+        proc_lvars(p).into_iter().map(|lv| (lv.name.to_string(), lv.idx)).collect();
     let mut fresh = PreciseFreshState::avoid_precise(avoid);
     let empty: BTreeMap<LVar, LVar> = BTreeMap::new();
     rename_unique_go(&mut fresh, &empty, p)
@@ -918,7 +918,7 @@ mod tests {
         let r = rename_unique(&new);
         if let Process::Action(SapicAction::New(v), _, _) = r {
             assert_eq!(v.var.idx, 1);
-            assert_eq!(v.var.name, "x");
+            assert_eq!(&*v.var.name, "x");
             assert_eq!(v.stype, Some("lol".to_string()));
         } else {
             panic!("expected New action");

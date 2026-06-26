@@ -87,7 +87,7 @@ thread_local! {
 
 #[doc(hidden)]
 pub fn _tally_callsite(label: &'static str) {
-    if std::env::var_os("TAM_PROFILE_MAUDE").is_some() {
+    if tamarin_utils::env_gate!("TAM_PROFILE_MAUDE") {
         MAUDE_CALLSITE_COUNTS.with(|m| *m.borrow_mut().entry(label).or_insert(0) += 1);
     }
 }
@@ -109,7 +109,7 @@ struct MaudeProcessInner {
     /// to cache across calls (their indices need fresh-renaming each
     /// time) so we don't memoize substitutions, only the existence
     /// answer.
-    unifiable_cache: std::collections::HashMap<Vec<(LNTerm, LNTerm)>, bool>,
+    unifiable_cache: tamarin_utils::FastMap<Vec<(LNTerm, LNTerm)>, bool>,
     /// Memo for `reduce(...)` queries.  Maude `reduce` is a pure
     /// function of the input term modulo the (fixed-per-handle) theory
     /// signature, so successful reductions can be cached across calls.
@@ -117,7 +117,7 @@ struct MaudeProcessInner {
     /// every candidate subterm of every node, and `is_finished` runs
     /// every search step — so the same subterm gets reduced repeatedly
     /// during a single proof.  Caching cuts those repeat round-trips.
-    reduce_cache: std::collections::HashMap<LNTerm, LNTerm>,
+    reduce_cache: tamarin_utils::FastMap<LNTerm, LNTerm>,
     /// Memo for `match_eqs_const_subject` EMPTY-result queries.
     /// Historical: when this matcher was on the
     /// `insert_implied_formulas` AC-fallback path, profiling on
@@ -130,7 +130,7 @@ struct MaudeProcessInner {
     /// LVars to renumber.  Non-empty results are NOT cached (witnesses
     /// need fresh-renaming per use, same reason `unifiable_cache`
     /// only stores booleans).
-    match_empty_cache: std::collections::HashMap<(Vec<(LNTerm, LNTerm)>, Vec<(String, u64)>), ()>,
+    match_empty_cache: tamarin_utils::FastMap<(Vec<(LNTerm, LNTerm)>, Vec<(String, u64)>), ()>,
 }
 
 /// Cached `TAM_DBG_MAUDE_IO` / `TAM_DBG_MAUDE_IO_FILTER` configuration.
@@ -340,9 +340,9 @@ impl MaudeHandle {
             stdout,
             stats: MaudeStats::default(),
             sig: sig.clone(),
-            unifiable_cache: std::collections::HashMap::new(),
-            reduce_cache: std::collections::HashMap::new(),
-            match_empty_cache: std::collections::HashMap::new(),
+            unifiable_cache: tamarin_utils::FastMap::default(),
+            reduce_cache: tamarin_utils::FastMap::default(),
+            match_empty_cache: tamarin_utils::FastMap::default(),
         };
         // Banner / initial prompt.
         let _ = inner.read_until_prompt()?;
@@ -472,7 +472,7 @@ impl MaudeHandle {
     /// subterms.
     pub fn reduce(&self, t: &LNTerm) -> Result<LNTerm, MaudeError> {
         let mut ctx = ConvCtx::new();
-        let (reply, sig) = {
+        let reply = {
             let mut inner = self.inner.lock().unwrap();
             if let Some(cached) = inner.reduce_cache.get(t) {
                 return Ok(cached.clone());
@@ -496,10 +496,9 @@ impl MaudeHandle {
             cmd.extend_from_slice(b" .\n");
             let reply = inner.execute(&cmd)?;
             inner.stats.norm_count += 1;
-            let sig = inner.sig.clone();
-            (reply, sig)
+            reply
         };
-        let mt_back = maude_parse::parse_reduce_reply(&sig, &reply)?;
+        let mt_back = maude_parse::parse_reduce_reply(&reply)?;
         let mut next = 0;
         let result = mterm_to_lnterm(&mt_back, &mut ctx, "z", &mut next);
         let mut inner = self.inner.lock().unwrap();
@@ -713,10 +712,10 @@ impl MaudeHandle {
                     use crate::lterm::HasFrees;
                     for eq in eqs {
                         eq.lhs.for_each_free(&mut |v| {
-                            if v.name == "x" { self.ensure_above(v.idx); }
+                            if &*v.name == "x" { self.ensure_above(v.idx); }
                         });
                         eq.rhs.for_each_free(&mut |v| {
-                            if v.name == "x" { self.ensure_above(v.idx); }
+                            if &*v.name == "x" { self.ensure_above(v.idx); }
                         });
                     }
                 }
@@ -777,9 +776,8 @@ impl MaudeHandle {
         cmd.extend_from_slice(b" .\n");
         let reply = inner.execute(&cmd)?;
         inner.stats.unify_count += 1;
-        let sig = inner.sig.clone();
         drop(inner);
-        let msubsts = maude_parse::parse_unify_reply(&sig, &reply)?;
+        let msubsts = maude_parse::parse_unify_reply(&reply)?;
         // Also avoid colliding with vars in the input eqs (their `~mw`
         // indices set a floor for the witness counter).
         let mut input_max = avoid_max;
@@ -848,7 +846,7 @@ impl MaudeHandle {
             self.ensure_above(input_max);
             for lit in ctx.bindings().values() {
                 if let crate::vterm::Lit::Var(lv) = lit {
-                    if lv.name == "x" {
+                    if &*lv.name == "x" {
                         self.ensure_above(lv.idx);
                     }
                 }
@@ -975,9 +973,8 @@ impl MaudeHandle {
         cmd.extend_from_slice(b" .\n");
         let reply = inner.execute(&cmd)?;
         inner.stats.unify_count += 1;
-        let sig = inner.sig.clone();
         drop(inner);
-        let msubsts = maude_parse::parse_unify_reply(&sig, &reply)?;
+        let msubsts = maude_parse::parse_unify_reply(&reply)?;
         let mut out = Vec::with_capacity(msubsts.len());
         for ms in &msubsts {
             // VFresh (unify) path → canonical domain sort.
@@ -1060,18 +1057,17 @@ impl MaudeHandle {
         cmd.extend_from_slice(b" <=? ");
         cmd.extend(pp_list(&subjs));
         cmd.extend_from_slice(b" .\n");
-        if std::env::var_os("TAM_DBG_MATCH_EQS_RAW").is_some() {
+        if tamarin_utils::env_gate!("TAM_DBG_MATCH_EQS_RAW") {
             eprintln!("[match_eqs RAW] {}", String::from_utf8_lossy(&cmd).trim_end());
         }
         let reply = inner.execute(&cmd)?;
         inner.stats.match_count += 1;
-        let sig = inner.sig.clone();
         drop(inner);
-        if std::env::var_os("TAM_DBG_MATCH_EQS_RAW").is_some() {
+        if tamarin_utils::env_gate!("TAM_DBG_MATCH_EQS_RAW") {
             eprintln!("[match_eqs REPLY] {}", String::from_utf8_lossy(&reply).trim_end());
         }
         _tally_callsite("match_eqs");
-        let msubsts = maude_parse::parse_match_reply(&sig, &reply)?;
+        let msubsts = maude_parse::parse_match_reply(&reply)?;
         let mut out = Vec::with_capacity(msubsts.len());
         for ms in &msubsts {
             out.push(msubst_to_lnsubst(ms, &mut ctx)?);
@@ -1115,7 +1111,7 @@ impl MaudeHandle {
         if eqs.is_empty() {
             return Ok(vec![Vec::new()]);
         }
-        let prof = std::env::var_os("TAM_PROFILE_MAUDE_BREAKDOWN").is_some();
+        let prof = tamarin_utils::env_gate!("TAM_PROFILE_MAUDE_BREAKDOWN");
         let t0 = if prof { Some(std::time::Instant::now()) } else { None };
         // Empty-result cache.  Profiling showed 100 % of calls on
         // AC-heavy lemmas (e.g. csf17/keylessssl::injectivity) return
@@ -1148,7 +1144,7 @@ impl MaudeHandle {
         ) {
             match t {
                 crate::term::Term::Lit(Lit::Var(lv)) => {
-                    if !pattern_vars.contains(&(lv.name.clone(), lv.idx)) {
+                    if !pattern_vars.contains(&(lv.name.to_string(), lv.idx)) {
                         out.insert(lv.clone());
                     }
                 }
@@ -1237,16 +1233,15 @@ impl MaudeHandle {
         cmd.extend_from_slice(b" .\n");
         let t_before_exec = if prof { Some(std::time::Instant::now()) } else { None };
         let reply = inner.execute(&cmd)?;
-        if std::env::var_os("TAM_DBG_MECS_RAW").is_some() {
+        if tamarin_utils::env_gate!("TAM_DBG_MECS_RAW") {
             eprintln!("[MECS_RAW] cmd={}", String::from_utf8_lossy(&cmd));
             eprintln!("[MECS_RAW] reply={}", String::from_utf8_lossy(&reply));
         }
         let t_after_exec = if prof { Some(std::time::Instant::now()) } else { None };
         inner.stats.match_count += 1;
-        let sig = inner.sig.clone();
         drop(inner);
         _tally_callsite("match_eqs_const_subject");
-        let msubsts = maude_parse::parse_match_reply(&sig, &reply)?;
+        let msubsts = maude_parse::parse_match_reply(&reply)?;
         if msubsts.is_empty() {
             _tally_callsite("match_eqs_const_subject::EMPTY");
             // Re-acquire lock to insert into cache.  Safe — we already
@@ -1336,7 +1331,7 @@ impl MaudeHandle {
             use crate::vterm::Lit;
             match t {
                 crate::term::Term::Lit(Lit::Var(lv)) =>
-                    pattern_vars.contains(&(lv.name.clone(), lv.idx)),
+                    pattern_vars.contains(&(lv.name.to_string(), lv.idx)),
                 crate::term::Term::App(_, args) =>
                     args.iter().any(|a| has_pattern_var(a, pattern_vars)),
                 _ => false,
@@ -1362,7 +1357,7 @@ impl MaudeHandle {
             use crate::vterm::Lit;
             match t {
                 crate::term::Term::Lit(Lit::Var(lv)) => {
-                    if !pattern_vars.contains(&(lv.name.clone(), lv.idx)) {
+                    if !pattern_vars.contains(&(lv.name.to_string(), lv.idx)) {
                         out.insert(lv.clone());
                     }
                 }
@@ -1445,10 +1440,9 @@ impl MaudeHandle {
         cmd.extend_from_slice(b" .\n");
         let reply = inner.execute(&cmd)?;
         inner.stats.match_count += 1;
-        let sig = inner.sig.clone();
         drop(inner);
         _tally_callsite("match_eqs_skolemize_both");
-        let msubsts = maude_parse::parse_match_reply(&sig, &reply)?;
+        let msubsts = maude_parse::parse_match_reply(&reply)?;
         let mut out = Vec::with_capacity(msubsts.len());
         for ms in &msubsts {
             let lnsubst = msubst_to_lnsubst(ms, &mut ctx)?;
@@ -1471,9 +1465,8 @@ impl MaudeHandle {
         cmd.extend_from_slice(b" .\n");
         let reply = inner.execute(&cmd)?;
         inner.stats.var_count += 1;
-        let sig = inner.sig.clone();
         drop(inner);
-        let msubsts = maude_parse::parse_variants_reply(&sig, &reply)?;
+        let msubsts = maude_parse::parse_variants_reply(&reply)?;
         let mut out = Vec::with_capacity(msubsts.len());
         // HS-faithful: each variant's back-conversion uses a fresh ctx
         // clone.  Mirrors HS `msubstToLSubstVFresh` (Maude/Types.hs:130)
@@ -1661,7 +1654,7 @@ fn msubst_to_lnsubst_force_x(
         let mut n: u64 = 1;
         for lit in ctx.bindings().values() {
             if let crate::vterm::Lit::Var(lv) = lit {
-                if lv.name == "x" && lv.idx >= n {
+                if &*lv.name == "x" && lv.idx >= n {
                     n = lv.idx + 1;
                 }
             }
@@ -1703,7 +1696,7 @@ fn msubst_to_lnsubst_with_maude(
         h.ensure_above(avoid_max);
         for lit in ctx.bindings().values() {
             if let crate::vterm::Lit::Var(lv) = lit {
-                if lv.name == "x" {
+                if &*lv.name == "x" {
                     h.ensure_above(lv.idx);
                 }
             }
@@ -1713,7 +1706,7 @@ fn msubst_to_lnsubst_with_maude(
         let mut n = avoid_max.saturating_add(1);
         for lit in ctx.bindings().values() {
             if let crate::vterm::Lit::Var(lv) = lit {
-                if lv.name == "x" && lv.idx >= n {
+                if &*lv.name == "x" && lv.idx >= n {
                     n = lv.idx + 1;
                 }
             }

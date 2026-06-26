@@ -480,7 +480,7 @@ pub fn translate(
         .into_iter()
         .map(|r| {
             let name = match &r.info.name {
-                tamarin_theory::rule::ProtoRuleName::Stand(n) => n.clone(),
+                tamarin_theory::rule::ProtoRuleName::Stand(n) => n.to_string(),
                 tamarin_theory::rule::ProtoRuleName::Fresh => "Fresh".to_string(),
             };
             let restr = restr_by_name.get(&name).cloned().unwrap_or_default();

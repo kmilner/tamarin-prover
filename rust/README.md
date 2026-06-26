@@ -86,37 +86,37 @@ TIMEOUT, DERIV, HS_PATH, RS_PATH env vars (see the scripts/bench.sh header).
 
 | Theory | HS time | RS time | HS memory | RS memory |
 |--------|--------:|--------:|----------:|----------:|
-| `NSPK3` | 0.9 s | 0.5 s (-44%) | 65 MB | 18 MB (-72%) |
-| `Joux` | 6.7 s | 5.4 s (-19%) | 257 MB | 47 MB (-82%) |
-| `stateverif_left_right` | 10.8 s | 8.0 s (-26%) | 863 MB | 50 MB (-94%) |
-| `Yubikey` | 14.5 s | 9.1 s (-37%) | 285 MB | 50 MB (-82%) |
-| `gcm` | 42.8 s | 25.5 s (-40%) | 1325 MB | 104 MB (-92%) |
-| `wireguard` | 38.4 s | 18.2 s (-53%) | 1183 MB | 125 MB (-89%) |
-| `CCITT_X509_3` | 141.7 s | 75.8 s (-47%) | 2405 MB | 636 MB (-74%) |
+| `NSPK3` | 0.9 s | 0.3 s (-67%) | 65 MB | 17 MB (-74%) |
+| `Joux` | 6.9 s | 4.4 s (-36%) | 244 MB | 42 MB (-83%) |
+| `stateverif_left_right` | 11.0 s | 7.2 s (-35%) | 800 MB | 41 MB (-95%) |
+| `Yubikey` | 14.9 s | 6.5 s (-56%) | 293 MB | 42 MB (-86%) |
+| `gcm` | 44.1 s | 21.2 s (-52%) | 1328 MB | 92 MB (-93%) |
+| `wireguard` | 40.2 s | 16.4 s (-59%) | 1188 MB | 104 MB (-91%) |
+| `CCITT_X509_3` | 145.5 s | 65.1 s (-55%) | 2462 MB | 537 MB (-78%) |
 
 **4 cores**
 
 | Theory | HS time | RS time | HS memory | RS memory |
 |--------|--------:|--------:|----------:|----------:|
-| `NSPK3` | 0.5 s | 0.3 s (-40%) | 90 MB | 26 MB (-71%) |
-| `Joux` | 5.8 s | 5.2 s (-10%) | 291 MB | 50 MB (-83%) |
-| `stateverif_left_right` | 6.6 s | 5.2 s (-21%) | 875 MB | 72 MB (-92%) |
-| `Yubikey` | 10.2 s | 4.0 s (-61%) | 299 MB | 74 MB (-75%) |
-| `gcm` | 33.0 s | 10.4 s (-68%) | 1323 MB | 168 MB (-87%) |
-| `wireguard` | 22.9 s | 12.4 s (-46%) | 1260 MB | 131 MB (-90%) |
-| `CCITT_X509_3` | 63.3 s | 24.3 s (-62%) | 4524 MB | 670 MB (-85%) |
+| `NSPK3` | 0.5 s | 0.2 s (-60%) | 95 MB | 25 MB (-74%) |
+| `Joux` | 5.8 s | 4.3 s (-26%) | 286 MB | 45 MB (-84%) |
+| `stateverif_left_right` | 6.6 s | 4.6 s (-30%) | 850 MB | 67 MB (-92%) |
+| `Yubikey` | 10.7 s | 2.8 s (-74%) | 317 MB | 58 MB (-82%) |
+| `gcm` | 32.8 s | 8.8 s (-73%) | 1282 MB | 159 MB (-88%) |
+| `wireguard` | 22.7 s | 10.8 s (-52%) | 1224 MB | 110 MB (-91%) |
+| `CCITT_X509_3` | 61.6 s | 20.3 s (-67%) | 4058 MB | 565 MB (-86%) |
 
 **16 cores**
 
 | Theory | HS time | RS time | HS memory | RS memory |
 |--------|--------:|--------:|----------:|----------:|
-| `NSPK3` | 0.5 s | 0.4 s (-20%) | 144 MB | 33 MB (-77%) |
-| `Joux` | 6.7 s | 5.3 s (-21%) | 327 MB | 63 MB (-81%) |
-| `stateverif_left_right` | 7.5 s | 5.1 s (-32%) | 857 MB | 102 MB (-88%) |
-| `Yubikey` | 11.1 s | 3.4 s (-69%) | 361 MB | 106 MB (-71%) |
-| `gcm` | 30.8 s | 8.9 s (-71%) | 1319 MB | 242 MB (-82%) |
-| `wireguard` | 21.2 s | 11.7 s (-45%) | 1327 MB | 144 MB (-89%) |
-| `CCITT_X509_3` | 65.1 s | 10.7 s (-84%) | 5612 MB | 776 MB (-86%) |
+| `NSPK3` | 0.6 s | 0.3 s (-50%) | 142 MB | 31 MB (-78%) |
+| `Joux` | 6.7 s | 4.4 s (-34%) | 324 MB | 52 MB (-84%) |
+| `stateverif_left_right` | 7.2 s | 4.6 s (-36%) | 836 MB | 96 MB (-89%) |
+| `Yubikey` | 10.7 s | 2.5 s (-77%) | 388 MB | 90 MB (-77%) |
+| `gcm` | 31.3 s | 7.8 s (-75%) | 1362 MB | 226 MB (-83%) |
+| `wireguard` | 21.4 s | 10.5 s (-51%) | 1273 MB | 122 MB (-90%) |
+| `CCITT_X509_3` | 66.4 s | 8.7 s (-87%) | 5861 MB | 650 MB (-89%) |
 
 <!-- BENCH:END -->
 

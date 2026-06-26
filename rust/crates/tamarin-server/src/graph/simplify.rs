@@ -168,7 +168,7 @@ fn atom_mentions_node(v: &NodeId, at: &tamarin_theory::guarded_types::GAtom) -> 
     let v_name = &v.name;
     let mentions_term = |t: &GTerm| -> bool {
         if let GTerm::Var(BVar::Free(spec)) = t {
-            return &spec.name == v_name;
+            return spec.name == **v_name;
         }
         false
     };
@@ -259,13 +259,13 @@ fn eligible_term(t: &LNTerm) -> bool {
 
 fn is_pair(t: &LNTerm) -> bool {
     if let Term::App(FunSym::NoEq(sym), args) = t {
-        sym.name == b"pair" && args.len() == 2
+        &*sym.name == b"pair" && args.len() == 2
     } else { false }
 }
 
 fn is_inverse(t: &LNTerm) -> bool {
     if let Term::App(FunSym::NoEq(sym), args) = t {
-        sym.name == b"inv" && args.len() == 1
+        &*sym.name == b"inv" && args.len() == 1
     } else { false }
 }
 

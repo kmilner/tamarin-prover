@@ -87,9 +87,15 @@ pub struct System {
     /// Last-atom constraint, e.g. `last(i)` — at most one per system.
     pub last_atom: Option<NodeId>,
     /// Equation store.
-    pub eq_store: EquationStore,
+    ///
+    /// `Arc`-wrapped for copy-on-write structural sharing (see `nodes`).
+    /// Cloned at every proof fork; mutated through `eq_store_mut`.
+    pub eq_store: Arc<EquationStore>,
     /// Subterm store.
-    pub subterm_store: SubtermStore,
+    ///
+    /// `Arc`-wrapped for copy-on-write structural sharing (see `nodes`).
+    /// Cloned at every proof fork; mutated through `subterm_store_mut`.
+    pub subterm_store: Arc<SubtermStore>,
     /// Open goals paired with their current status.
     ///
     /// `Arc`-wrapped for copy-on-write structural sharing (see `nodes`).
@@ -308,7 +314,7 @@ fn add_node_diagnostics(id: &NodeId, rule: &RuleACInst) {
             use tamarin_term::lterm::HasFrees;
             let mut found_idx0: Option<tamarin_term::lterm::LVar> = None;
             rule.for_each_free(&mut |v| {
-                if v.idx == 0 && matches!(v.name.as_str(),
+                if v.idx == 0 && matches!(&*v.name,
                     "ni" | "nr" | "m1" | "m2" | "s" | "R" | "ltkA" | "ltkI")
                     && found_idx0.is_none() {
                     found_idx0 = Some(v.clone());
@@ -340,7 +346,7 @@ fn add_node_diagnostics(id: &NodeId, rule: &RuleACInst) {
     if dbg_trace_add_node() {
         let rule_name = crate::constraint::solver::reduction::rule_case_name(rule);
         // Also dump prem[1] term if id is j:N (R_1/I_1 candidates).
-        if id.name == "j" {
+        if &*id.name == "j" {
             let prem1 = rule.premises.get(1)
                 .and_then(|p| p.terms.first())
                 .map(|t| format!("{:?}", t).chars().take(120).collect::<String>())
@@ -433,6 +439,18 @@ impl System {
     #[inline]
     pub fn goals_mut(&mut self) -> &mut Vec<(Goal, GoalStatus)> {
         Arc::make_mut(&mut self.goals)
+    }
+
+    /// Copy-on-write mutable access to `eq_store` (see `nodes_mut`).
+    #[inline]
+    pub fn eq_store_mut(&mut self) -> &mut EquationStore {
+        Arc::make_mut(&mut self.eq_store)
+    }
+
+    /// Copy-on-write mutable access to `subterm_store` (see `nodes_mut`).
+    #[inline]
+    pub fn subterm_store_mut(&mut self) -> &mut SubtermStore {
+        Arc::make_mut(&mut self.subterm_store)
     }
 
     // ====== max_var_idx_cache maintenance ======
@@ -812,7 +830,7 @@ pub fn formula_to_system(
         TraceQuantifier::ExistsTrace => fm.clone(),
         TraceQuantifier::AllTraces => gnot(fm),
     };
-    if std::env::var("TAM_DBG_FORMULA_TO_SYS").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_FORMULA_TO_SYS") {
         eprintln!("[formula_to_system] tq={:?} fm = {:?}", trace_quantifier, fm);
         eprintln!("[formula_to_system] tq={:?} gf1 = {:?}", trace_quantifier, gf1);
     }

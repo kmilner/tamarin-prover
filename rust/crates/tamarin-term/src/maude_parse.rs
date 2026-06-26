@@ -12,7 +12,6 @@ use crate::lterm::LSort;
 use crate::maude_print::{
     fun_sym_decode, parse_lsort_sym, replace_minus, FUN_SYM_PREFIX,
 };
-use crate::maude_sig::MaudeSig;
 use crate::maude_types::{MSubst, MTerm, MaudeLit};
 use crate::term::Term;
 
@@ -76,27 +75,27 @@ impl<'a> Cursor<'a> {
 // =============================================================================
 
 /// Parse a `unify` reply.
-pub fn parse_unify_reply(msig: &MaudeSig, reply: &[u8]) -> Result<Vec<MSubst>, ParseError> {
+pub fn parse_unify_reply(reply: &[u8]) -> Result<Vec<MSubst>, ParseError> {
     let mut c = Cursor::new(reply);
     if c.eat_str(b"No unifier.") {
         let _ = c.skip_eol();
         return Ok(vec![]);
     }
-    parse_substitutions(msig, &mut c)
+    parse_substitutions(&mut c)
 }
 
 /// Parse a `match` reply.
-pub fn parse_match_reply(msig: &MaudeSig, reply: &[u8]) -> Result<Vec<MSubst>, ParseError> {
+pub fn parse_match_reply(reply: &[u8]) -> Result<Vec<MSubst>, ParseError> {
     let mut c = Cursor::new(reply);
     if c.eat_str(b"No match.") {
         let _ = c.skip_eol();
         return Ok(vec![]);
     }
-    parse_substitutions(msig, &mut c)
+    parse_substitutions(&mut c)
 }
 
 /// Parse a `reduce` reply: `result <Sort>: <term>\n`.
-pub fn parse_reduce_reply(msig: &MaudeSig, reply: &[u8]) -> Result<MTerm, ParseError> {
+pub fn parse_reduce_reply(reply: &[u8]) -> Result<MTerm, ParseError> {
     let mut c = Cursor::new(reply);
     if !c.eat_str(b"result ") {
         return Err(ParseError(format!("expected `result `, got: {:?}",
@@ -111,13 +110,13 @@ pub fn parse_reduce_reply(msig: &MaudeSig, reply: &[u8]) -> Result<MTerm, ParseE
     if !c.eat_str(b": ") {
         return Err(ParseError("expected `: ` after result sort".into()));
     }
-    let t = parse_term(msig, &mut c)?;
+    let t = parse_term(&mut c)?;
     let _ = c.skip_eol();
     Ok(t)
 }
 
 /// Parse a `get variants` reply.
-pub fn parse_variants_reply(msig: &MaudeSig, reply: &[u8]) -> Result<Vec<MSubst>, ParseError> {
+pub fn parse_variants_reply(reply: &[u8]) -> Result<Vec<MSubst>, ParseError> {
     let mut c = Cursor::new(reply);
     let _ = c.skip_eol();
     let mut variants = Vec::new();
@@ -142,7 +141,7 @@ pub fn parse_variants_reply(msig: &MaudeSig, reply: &[u8]) -> Result<Vec<MSubst>
             parse_sort(&mut c)?;
         }
         if !c.eat_str(b": ") { return Err(ParseError("expected `: ` in reprinted term".into())); }
-        let _ = parse_term(msig, &mut c)?;
+        let _ = parse_term(&mut c)?;
         let _ = c.skip_eol();
         // Then bindings: `xN:Sort --> term\n` until empty line.
         let mut subst = MSubst::new();
@@ -151,7 +150,7 @@ pub fn parse_variants_reply(msig: &MaudeSig, reply: &[u8]) -> Result<Vec<MSubst>
                 let _ = c.skip_eol();
                 break;
             }
-            let entry = parse_entry(msig, &mut c)?;
+            let entry = parse_entry(&mut c)?;
             subst.push(entry);
         }
         variants.push(subst);
@@ -185,7 +184,7 @@ pub fn parse_variants_reply(msig: &MaudeSig, reply: &[u8]) -> Result<Vec<MSubst>
 // Substitutions
 // =============================================================================
 
-fn parse_substitutions(msig: &MaudeSig, c: &mut Cursor) -> Result<Vec<MSubst>, ParseError> {
+fn parse_substitutions(c: &mut Cursor) -> Result<Vec<MSubst>, ParseError> {
     let mut substs = Vec::new();
     loop {
         let _ = c.skip_eol();
@@ -214,7 +213,7 @@ fn parse_substitutions(msig: &MaudeSig, c: &mut Cursor) -> Result<Vec<MSubst>, P
             let saved2 = c.pos;
             if c.eat_str(b"x") {
                 c.pos = saved2;
-                let entry = parse_entry(msig, c)?;
+                let entry = parse_entry(c)?;
                 entries.push(entry);
             } else {
                 break;
@@ -250,7 +249,7 @@ fn parse_substitutions(msig: &MaudeSig, c: &mut Cursor) -> Result<Vec<MSubst>, P
     Ok(substs)
 }
 
-fn parse_entry(msig: &MaudeSig, c: &mut Cursor) -> Result<((LSort, u64), MTerm), ParseError> {
+fn parse_entry(c: &mut Cursor) -> Result<((LSort, u64), MTerm), ParseError> {
     if !c.eat_str(b"x") {
         return Err(ParseError("expected `x` for substitution variable".into()));
     }
@@ -260,7 +259,7 @@ fn parse_entry(msig: &MaudeSig, c: &mut Cursor) -> Result<((LSort, u64), MTerm),
     if !c.eat_str(b" --> ") {
         return Err(ParseError("expected ` --> `".into()));
     }
-    let t = parse_term(msig, c)?;
+    let t = parse_term(c)?;
     let _ = c.skip_eol();
     Ok(((sort, n), t))
 }
@@ -289,7 +288,7 @@ fn parse_sort(c: &mut Cursor) -> Result<LSort, ParseError> {
     }
 }
 
-fn parse_term(msig: &MaudeSig, c: &mut Cursor) -> Result<MTerm, ParseError> {
+fn parse_term(c: &mut Cursor) -> Result<MTerm, ParseError> {
     // `#N:Sort` or `%N:Sort` is a fresh variable (Maude-introduced).
     if c.eat(b'#') || c.eat(b'%') {
         let n = c.read_decimal().ok_or_else(|| ParseError("fresh var idx".into()))?;
@@ -317,12 +316,12 @@ fn parse_term(msig: &MaudeSig, c: &mut Cursor) -> Result<MTerm, ParseError> {
         // function application: parse comma-separated arguments.
         let mut args = Vec::new();
         loop {
-            args.push(parse_term(msig, c)?);
+            args.push(parse_term(c)?);
             if c.eat_str(b", ") || c.eat(b',') { continue; }
             break;
         }
         if !c.eat(b')') { return Err(ParseError("expected `)` after args".into())); }
-        Ok(build_app(msig, ident, args))
+        Ok(build_app(ident, args))
     } else if c.eat_str(b":") {
         // Variable: `xN:Sort` — `ident` is `xN`.
         let s = parse_sort(c)?;
@@ -336,11 +335,11 @@ fn parse_term(msig: &MaudeSig, c: &mut Cursor) -> Result<MTerm, ParseError> {
         }
     } else {
         // Nullary application.
-        Ok(build_app(msig, ident, Vec::new()))
+        Ok(build_app(ident, Vec::new()))
     }
 }
 
-fn build_app(msig: &MaudeSig, ident: &[u8], args: Vec<MTerm>) -> MTerm {
+fn build_app(ident: &[u8], args: Vec<MTerm>) -> MTerm {
     // AC/C operators are all `tam`-prefixed.  Strip the prefix once and
     // compare the suffix against the (compile-time) symbol-name constants,
     // avoiding the per-call `Vec` allocations that `pp_maude_ac_sym` /
@@ -383,7 +382,7 @@ fn build_app(msig: &MaudeSig, ident: &[u8], args: Vec<MTerm>) -> MTerm {
         let name = replace_minus(&name);
         let arity = args.len();
         let sym = NoEqSym {
-            name,
+            name: crate::intern::intern_bytes(&name),
             arity,
             privacy: p,
             constructability: c,
@@ -394,16 +393,15 @@ fn build_app(msig: &MaudeSig, ident: &[u8], args: Vec<MTerm>) -> MTerm {
         // just round-trip tests.  We intentionally keep a lenient pass here:
         // Maude only ever echoes symbols from the signature we sent it, so in
         // normal operation the check is redundant; we accept the decoded
-        // symbol rather than panicking on a malformed reply.  `msig` is kept
-        // in the signature for parity and possible future validation.
-        let _ = msig;
+        // symbol rather than panicking on a malformed reply.  (The signature
+        // was therefore never consulted, so it is no longer threaded in.)
         return Term::App(FunSym::NoEq(sym), args.into());
     }
     // Unknown — fall back to a public-constructor symbol with the raw name
     // for forward compatibility; this matches Haskell only for certain
     // built-ins (like Maude's own `true`).
     let sym = NoEqSym {
-        name: ident.to_vec(),
+        name: crate::intern::intern_bytes(ident),
         arity: args.len(),
         privacy: Privacy::Public,
         constructability: Constructability::Constructor,
@@ -413,12 +411,12 @@ fn build_app(msig: &MaudeSig, ident: &[u8], args: Vec<MTerm>) -> MTerm {
 
 fn flatten_cons(t: &MTerm) -> Vec<MTerm> {
     if let Term::App(FunSym::NoEq(s), args) = t {
-        if s.name == b"cons" && args.len() == 2 {
+        if &*s.name == b"cons" && args.len() == 2 {
             let mut v = vec![args[0].clone()];
             v.extend(flatten_cons(&args[1]));
             return v;
         }
-        if s.name == b"nil" && args.is_empty() {
+        if &*s.name == b"nil" && args.is_empty() {
             return Vec::new();
         }
     }
@@ -428,17 +426,16 @@ fn flatten_cons(t: &MTerm) -> Vec<MTerm> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::maude_sig::pair_maude_sig;
 
     #[test]
     fn parse_no_unifier() {
-        let r = parse_unify_reply(&pair_maude_sig(), b"No unifier.\n").unwrap();
+        let r = parse_unify_reply(b"No unifier.\n").unwrap();
         assert!(r.is_empty());
     }
 
     #[test]
     fn parse_no_match() {
-        let r = parse_match_reply(&pair_maude_sig(), b"No match.\n").unwrap();
+        let r = parse_match_reply(b"No match.\n").unwrap();
         assert!(r.is_empty());
     }
 
@@ -446,13 +443,13 @@ mod tests {
     fn parse_substitution_requires_entry() {
         // HS `many1 parseEntry`: a `Solution` header followed by neither
         // `empty substitution` nor an `xN` entry must fail the whole parse.
-        let r = parse_unify_reply(&pair_maude_sig(), b"\nSolution 1\n\n");
+        let r = parse_unify_reply(b"\nSolution 1\n\n");
         assert!(r.is_err());
     }
 
     #[test]
     fn parse_simple_reduce_reply() {
-        let r = parse_reduce_reply(&pair_maude_sig(), b"result Pub: p(1)\n").unwrap();
+        let r = parse_reduce_reply(b"result Pub: p(1)\n").unwrap();
         match r {
             Term::Lit(MaudeLit::MaudeConst(1, LSort::Pub)) => {}
             x => panic!("got {:?}", x),

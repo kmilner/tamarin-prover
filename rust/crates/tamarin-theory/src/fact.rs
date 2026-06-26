@@ -18,7 +18,9 @@ pub enum Multiplicity {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FactTag {
     /// A protocol fact: `ProtoFact(multiplicity, name, arity)`.
-    Proto(Multiplicity, String, usize),
+    /// Interned `&'static str` (see `tamarin_term::intern`): pointer-copy
+    /// clone, no alloc/atomic, shared.
+    Proto(Multiplicity, &'static str, usize),
     Fresh,
     Out,
     In,
@@ -111,7 +113,7 @@ impl<T: HasFrees> HasFrees for Fact<T> {
 
 pub fn fact_tag_name(t: &FactTag) -> String {
     match t {
-        FactTag::Proto(_, n, _) => n.clone(),
+        FactTag::Proto(_, n, _) => n.to_string(),
         FactTag::Fresh => "Fr".into(),
         FactTag::Out => "Out".into(),
         FactTag::In => "In".into(),
@@ -219,7 +221,7 @@ pub fn k_log_fact(t: LNTerm) -> LNFact {
 pub fn term_fact(t: LNTerm) -> LNFact { Fact::new(FactTag::Term, vec![t]) }
 
 pub fn proto_fact(mult: Multiplicity, name: &str, terms: Vec<LNTerm>) -> LNFact {
-    Fact::new(FactTag::Proto(mult, name.into(), terms.len()), terms)
+    Fact::new(FactTag::Proto(mult, tamarin_term::intern::intern_str(name), terms.len()), terms)
 }
 
 /// View a protocol or `In` fact's terms. Port of HS `protoOrInFactView`
@@ -257,7 +259,7 @@ pub fn proto_fact_ann(
     terms: Vec<LNTerm>,
 ) -> LNFact {
     Fact {
-        tag: FactTag::Proto(mult, name.into(), terms.len()),
+        tag: FactTag::Proto(mult, tamarin_term::intern::intern_str(name), terms.len()),
         annotations,
         terms,
     }

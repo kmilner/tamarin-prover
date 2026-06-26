@@ -18,7 +18,7 @@
 //! so we walk each field by hand. The walk-order mirrors
 //! `Reduction::subst_system_once` so any future cross-checks stay aligned.
 
-use std::collections::HashMap;
+use tamarin_utils::FastMap;
 
 use tamarin_term::lterm::{HasFrees, LVar, LNTerm};
 use tamarin_term::subst::Subst;
@@ -209,9 +209,9 @@ pub fn rename_precise_system(sys: &mut System) {
     let formula_subst: VarSubst = map.iter().map(|(old, new)| {
         let sort = lvar_sort_to_sort_hint(new.sort);
         (
-            (old.name.clone(), old.idx),
+            (old.name.to_string(), old.idx),
             tamarin_parser::ast::Term::Var(tamarin_parser::ast::VarSpec {
-                name: new.name.clone(),
+                name: new.name.to_string(),
                 idx: new.idx,
                 sort,
                 typ: None,
@@ -353,13 +353,13 @@ pub fn rename_precise_system(sys: &mut System) {
 
     // 7. eq_store — rewrite the subst (dom + range) and the conj.
     let old_subst = std::mem::replace(
-        &mut sys.eq_store.subst,
+        &mut sys.eq_store_mut().subst,
         crate::tools::equation_store::LNSubst::empty(),
     );
     let pairs: Vec<(LVar, LNTerm)> = old_subst.to_list().into_iter()
         .map(|(k, v)| (map_var(k), apply_term(v)))
         .collect();
-    sys.eq_store.subst = Subst::from_list(pairs);
+    sys.eq_store_mut().subst = Subst::from_list(pairs);
 
     // HS-faithful: `HasFrees (SubstVFresh n LVar)` only maps DOMAIN
     // (keys), NOT values.  From Term.Substitution.SubstVFresh.hs:196-202:
@@ -376,7 +376,7 @@ pub fn rename_precise_system(sys: &mut System) {
     // witness idxs in VALUES.  This preserves the variant witness idxs at
     // perform_split time — which is what gives HS the sort-discriminating
     // idx differences across variants.
-    for d in sys.eq_store.conj.iter_mut() {
+    for d in sys.eq_store_mut().conj.iter_mut() {
         for s in d.substs.iter_mut() {
             let pairs: Vec<(LVar, LNTerm)> = s.to_list().into_iter()
                 .map(|(k, v)| (map_var(k), v))  // keep VALUE unchanged
@@ -390,30 +390,30 @@ pub fn rename_precise_system(sys: &mut System) {
     // HS-faithful: `_sSubtermStore` summands are `S.Set` (SubtermStore.hs
     // `Set SubtermD` for both pos and neg).  `mapFrees (S.Set a) =
     // fmap S.fromList . mapFrees f . S.toList` — sort + dedup post-rename.
-    for c in sys.subterm_store.subterms.iter_mut() {
+    for c in sys.subterm_store_mut().subterms.iter_mut() {
         c.small = apply_term(c.small.clone());
         c.big = apply_term(c.big.clone());
     }
-    sys.subterm_store.subterms.sort_by(|a, b|
+    sys.subterm_store_mut().subterms.sort_by(|a, b|
         (&a.small, &a.big).cmp(&(&b.small, &b.big)));
-    sys.subterm_store.subterms.dedup_by(|a, b|
+    sys.subterm_store_mut().subterms.dedup_by(|a, b|
         (&a.small, &a.big) == (&b.small, &b.big));
-    for c in sys.subterm_store.solved_subterms.iter_mut() {
+    for c in sys.subterm_store_mut().solved_subterms.iter_mut() {
         c.small = apply_term(c.small.clone());
         c.big = apply_term(c.big.clone());
     }
-    sys.subterm_store.solved_subterms.sort_by(|a, b|
+    sys.subterm_store_mut().solved_subterms.sort_by(|a, b|
         (&a.small, &a.big).cmp(&(&b.small, &b.big)));
-    sys.subterm_store.solved_subterms.dedup_by(|a, b|
+    sys.subterm_store_mut().solved_subterms.dedup_by(|a, b|
         (&a.small, &a.big) == (&b.small, &b.big));
     // negSubterms are mapped too; oldNegSubterms are NOT (HS mapFrees
     // keeps `oldNegSt` with `pure` — SubtermStore.hs:550-555).
-    for p in sys.subterm_store.neg_subterms.iter_mut() {
+    for p in sys.subterm_store_mut().neg_subterms.iter_mut() {
         p.0 = apply_term(p.0.clone());
         p.1 = apply_term(p.1.clone());
     }
-    sys.subterm_store.neg_subterms.sort();
-    sys.subterm_store.neg_subterms.dedup();
+    sys.subterm_store_mut().neg_subterms.sort();
+    sys.subterm_store_mut().neg_subterms.dedup();
 }
 
 // =============================================================================
@@ -422,22 +422,27 @@ pub fn rename_precise_system(sys: &mut System) {
 
 struct RenameState {
     fresh: PreciseFreshState,
-    map: HashMap<LVar, LVar>,
+    // Lookup-only: keyed by the original `LVar`, queried via
+    // `contains_key`/`insert`, and the eventual `into_map` is consumed
+    // only by `Subst::from_list` (a `BTreeMap`, re-sorted) and a
+    // distinct-key `VarSubst` applied by lookup — so iteration order is
+    // never observed.
+    map: FastMap<LVar, LVar>,
 }
 
 impl RenameState {
     fn new() -> Self {
-        RenameState { fresh: PreciseFreshState::nothing_used(), map: HashMap::new() }
+        RenameState { fresh: PreciseFreshState::nothing_used(), map: FastMap::default() }
     }
     /// `importBinding`: idempotent — first call for `v` allocates a fresh
     /// LVar keyed by `v.name`; later calls return the same binding.
     fn import(&mut self, v: &LVar) {
         if self.map.contains_key(v) { return; }
         let idx = self.fresh.fresh_ident(&v.name);
-        let new_v = LVar { name: v.name.clone(), sort: v.sort, idx };
+        let new_v = LVar { name: v.name, sort: v.sort, idx };
         self.map.insert(v.clone(), new_v);
     }
-    fn into_map(self) -> HashMap<LVar, LVar> { self.map }
+    fn into_map(self) -> FastMap<LVar, LVar> { self.map }
 }
 
 fn lvar_sort_to_sort_hint(s: tamarin_term::lterm::LSort) -> tamarin_parser::ast::SortHint {
@@ -521,7 +526,7 @@ fn term_for_each_free(t: &crate::guarded::GTerm, f: &mut dyn FnMut(&LVar)) {
     match t {
         GTerm::Var(BVar::Free(v)) => {
             let sort = parser_sort_to_lsort(v.sort);
-            f(&LVar { name: v.name.clone(), sort, idx: v.idx });
+            f(&LVar { name: tamarin_term::intern::intern_str(v.name.as_str()), sort, idx: v.idx });
         }
         GTerm::Var(BVar::Bound(_)) => {}
         GTerm::PubLit(_) | GTerm::FreshLit(_) | GTerm::NatLit(_)

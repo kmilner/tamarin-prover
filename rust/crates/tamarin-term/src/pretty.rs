@@ -145,7 +145,7 @@ fn collect_pair_tail<'a>(
     out: &mut Vec<&'a Term<Lit<Name, LVar>>>,
 ) {
     if let Term::App(FunSym::NoEq(sym), args) = t {
-        if sym.name == b"pair" && args.len() == 2 {
+        if &*sym.name == b"pair" && args.len() == 2 {
             collect_pair_tail(&args[0], out);
             collect_pair_tail(&args[1], out);
             return;

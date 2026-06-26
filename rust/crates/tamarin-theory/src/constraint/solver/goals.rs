@@ -535,7 +535,7 @@ fn oracle_ranking(
     let outp = String::from_utf8_lossy(&output.stdout);
 
     // HS debug trace (ProofMethod.hs:613-618) — optional stderr logging
-    if std::env::var("TAM_RS_ORACLE_TRACE").is_ok() {
+    if tamarin_utils::env_gate!("TAM_RS_ORACLE_TRACE") {
         eprintln!(">>>>>>>>>>>>>>>>>>>>>>>> START INPUT\n{}", inp);
         eprintln!(">>>>>>>>>>>>>>>>>>>>>>>> START OUTPUT\n{}", outp);
         eprintln!(">>>>>>>>>>>>>>>>>>>>>>>> END Oracle call");
@@ -954,7 +954,7 @@ fn eval_leaf(
         }
 
         other => {
-            if std::env::var("TAM_RS_TACTIC_DBG").is_ok() {
+            if tamarin_utils::env_gate!("TAM_RS_TACTIC_DBG") {
                 eprintln!("[RS_TACTIC] unimplemented selector '{}' → false", other);
             }
             false
@@ -1171,7 +1171,7 @@ fn smart_ranking(
     // (case-content swap caused by Rust picking the structurally-
     // smaller induction Disj before HS's lemma-negation Disj).
     // See [[project-rust-port-lockstep]].
-    if std::env::var("TAM_RANK_DBG").is_ok() {
+    if tamarin_utils::env_gate!("TAM_RANK_DBG") {
         for (i, a) in goals.iter().take(6).enumerate() {
             let g_str = format!("{:?}", a.goal).chars().take(160).collect::<String>();
             eprintln!("[rank] #{}: {} useful={:?}", i, g_str, a.usefulness);
@@ -1286,7 +1286,7 @@ fn sapic_ranking(
     }
     // sortOnUsefulness — stable sort by usefulness tag.  NO moveNatToEnd.
     goals.sort_by_key(|a| tag_usefulness(a.usefulness));
-    if std::env::var("TAM_RANK_DBG").is_ok() {
+    if tamarin_utils::env_gate!("TAM_RANK_DBG") {
         for (i, a) in goals.iter().take(6).enumerate() {
             let g_str = format!("{:?}", a.goal).chars().take(160).collect::<String>();
             eprintln!("[rank-sapic] #{}: {} useful={:?}", i, g_str, a.usefulness);
@@ -1394,7 +1394,7 @@ fn inj_ranking(
     // sortOnUsefulness — stable sort by usefulness tag.  (injRanking has
     // NO moveNatToEnd step — that's smartRanking-only.)
     goals.sort_by_key(|a| tag_usefulness(a.usefulness));
-    if std::env::var("TAM_RANK_DBG").is_ok() {
+    if tamarin_utils::env_gate!("TAM_RANK_DBG") {
         for (i, a) in goals.iter().take(6).enumerate() {
             let g_str = format!("{:?}", a.goal).chars().take(160).collect::<String>();
             eprintln!("[inj-rank] #{}: {} useful={:?}", i, g_str, a.usefulness);
@@ -1460,7 +1460,7 @@ fn collect_one_case_syms(
     use tamarin_term::function_symbols::FunSym;
     use tamarin_term::term::Term;
     let mut out = std::collections::BTreeSet::new();
-    let dbg_sources = std::env::var("TAM_DBG_SOURCES").is_ok();
+    let dbg_sources = tamarin_utils::env_gate!("TAM_DBG_SOURCES");
     if dbg_sources {
         eprintln!("[RS full_sources] count={}", ctx.full_sources.len());
     }
@@ -1508,7 +1508,7 @@ fn collect_one_case_syms(
                 nm, arity, cases.len(), names);
         }
         if src.cases_len() != 1 { continue; }
-        out.insert(s.name.clone());
+        out.insert(s.name.to_vec());
     }
     out
 }
@@ -1533,7 +1533,7 @@ fn is_msg_one_case_goal(
     if !matches!(fa.tag, FactTag::Ku) { return false; }
     let Some(t) = fa.terms.first() else { return false };
     if let Term::App(FunSym::NoEq(s), _) = t {
-        return one_case_syms.contains(&s.name);
+        return one_case_syms.contains(&*s.name);
     }
     false
 }
@@ -1649,7 +1649,7 @@ fn is_signature_goal(a: &AnnotatedGoal) -> bool {
     use tamarin_term::term::Term;
     matches!(msg_premise(&a.goal),
         Some(Term::App(FunSym::NoEq(NoEqSym { name, .. }), _))
-            if name.as_slice() == b"sign")
+            if &**name == b"sign")
 }
 
 /// `isDoubleExpGoal` (ProofMethod.hs):
@@ -1674,7 +1674,7 @@ fn is_double_exp_goal(a: &AnnotatedGoal) -> bool {
     use tamarin_term::term::Term;
     match msg_premise(&a.goal) {
         Some(Term::App(FunSym::NoEq(NoEqSym { name, .. }), args))
-            if name.as_slice() == b"exp" && args.len() == 2 =>
+            if &**name == b"exp" && args.len() == 2 =>
         {
             matches!(&args[1], Term::App(FunSym::Ac(AcSym::Mult), _))
         }
@@ -1715,7 +1715,7 @@ fn is_proto_named(a: &AnnotatedGoal, want_action: bool, name: &str) -> bool {
         Goal::Premise(_, fa) if !want_action => fa,
         _ => return false,
     };
-    matches!(&fa.tag, FactTag::Proto(_, n, _) if n == name)
+    matches!(&fa.tag, FactTag::Proto(_, n, _) if &**n == name)
 }
 
 /// HS `isUnlockAction` (ProofMethod.hs:945): an ActionG of ProtoFact "Unlock".
@@ -1773,11 +1773,11 @@ fn insert_action_first_key_has_prefix(a: &AnnotatedGoal, prefix: &str) -> bool {
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
     let Goal::Action(_, fa) = &a.goal else { return false };
-    if !matches!(&fa.tag, FactTag::Proto(_, n, _) if n == "Insert") { return false; }
+    if !matches!(&fa.tag, FactTag::Proto(_, n, _) if &**n == "Insert") { return false; }
     let Some(Term::App(FunSym::NoEq(NoEqSym { name, .. }), args)) = fa.terms.first() else {
         return false;
     };
-    if name.as_slice() != b"pair" || args.len() != 2 { return false; }
+    if &**name != b"pair" || args.len() != 2 { return false; }
     matches!(&args[0], Term::Lit(Lit::Con(c))
         if c.tag == NameTag::Pub && c.id.0.starts_with(prefix))
 }
@@ -1958,7 +1958,7 @@ fn is_solve_last_fact(fa: &crate::fact::LNFact) -> bool {
 }
 fn is_auth_out_fact(fa: &crate::fact::LNFact) -> bool {
     use crate::fact::FactTag;
-    matches!(&fa.tag, FactTag::Proto(_, name, _) if name == "AuthOut")
+    matches!(&fa.tag, FactTag::Proto(_, name, _) if &**name == "AuthOut")
 }
 
 /// `msgPremise`: the message argument of a KU action goal, if any.
@@ -2252,8 +2252,8 @@ fn has_top_pair_inv_prod(t: &tamarin_term::lterm::LNTerm) -> bool {
     use tamarin_term::term::Term;
     match t {
         Term::App(FunSym::NoEq(s), args) => {
-            s.name == b"pair" && args.len() == 2
-                || s.name == INV_SYM_STRING && args.len() == 1
+            &*s.name == b"pair" && args.len() == 2
+                || &*s.name == INV_SYM_STRING && args.len() == 1
         }
         Term::App(FunSym::Ac(AcSym::Mult), _) => true,  // product
         Term::App(FunSym::Ac(AcSym::Union), _) => true, // multiset union
@@ -2425,7 +2425,7 @@ fn toplevel_terms(t: &tamarin_term::lterm::LNTerm) -> Vec<tamarin_term::lterm::L
     use tamarin_term::term::Term;
     let mut out = vec![t.clone()];
     if let Term::App(FunSym::NoEq(NoEqSym { name, .. }), args) = t {
-        match name.as_slice() {
+        match &**name {
             b"pair" if args.len() == 2 => {
                 out.extend(toplevel_terms(&args[0]));
                 out.extend(toplevel_terms(&args[1]));

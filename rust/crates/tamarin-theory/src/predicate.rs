@@ -40,7 +40,7 @@ impl Predicate {
         };
         let arity = free_vars.len();
         Predicate {
-            fact: Fact::new(FactTag::Proto(Multiplicity::Linear, cap, arity), free_vars),
+            fact: Fact::new(FactTag::Proto(Multiplicity::Linear, tamarin_term::intern::intern_str(&cap), arity), free_vars),
             formula,
         }
     }
@@ -85,7 +85,7 @@ mod tests {
     fn capitalisation_in_constructor() {
         let f: LNFormula = ProtoFormula::ltrue();
         let p = Predicate::new("smaller", f, vec![]);
-        assert!(matches!(p.fact.tag, FactTag::Proto(_, ref n, _) if n == "Smaller"));
+        assert!(matches!(p.fact.tag, FactTag::Proto(_, ref n, _) if &**n == "Smaller"));
     }
 
     #[test]

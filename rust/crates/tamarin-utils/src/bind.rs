@@ -8,19 +8,20 @@
 //! because bindings are only looked up by key and are never iterated into
 //! pretty-printed output (iteration order is therefore not observable).
 
-use std::collections::HashMap;
 use std::hash::Hash;
+
+use crate::FastMap;
 
 use crate::fresh::PreciseFreshState;
 
 /// Binding store keyed by `K`, holding values of type `V`.
 #[derive(Debug, Clone)]
 pub struct Bindings<K, V> {
-    map: HashMap<K, V>,
+    map: FastMap<K, V>,
 }
 
 impl<K, V> Default for Bindings<K, V> {
-    fn default() -> Self { Bindings { map: HashMap::new() } }
+    fn default() -> Self { Bindings { map: FastMap::default() } }
 }
 
 impl<K, V> Bindings<K, V>

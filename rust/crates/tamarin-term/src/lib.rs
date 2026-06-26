@@ -32,6 +32,7 @@
 
 pub mod builtin;
 pub mod function_symbols;
+pub mod intern;
 pub mod lterm;
 pub mod macro_expand;
 pub mod maude_parse;

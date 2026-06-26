@@ -117,8 +117,8 @@ pub fn apply_abbreviations_fact(
 /// `getTermPrefix` (Abbreviation.hs:106-115).
 fn get_term_prefix(opts: &AbbreviationOptions, t: &LNTerm) -> String {
     let raw = match t {
-        Term::Lit(Lit::Var(v)) => v.name.clone(),
-        Term::Lit(Lit::Con(n)) => n.id.0.clone(),
+        Term::Lit(Lit::Var(v)) => v.name.to_string(),
+        Term::Lit(Lit::Con(n)) => n.id.0.to_string(),
         Term::App(FunSym::NoEq(sym), _) => {
             String::from_utf8_lossy(&sym.name).into_owned()
         }
@@ -335,7 +335,7 @@ fn sub_terms_no_pair(t: &LNTerm, out: &mut Vec<LNTerm>) {
 
 fn is_pair(t: &LNTerm) -> bool {
     if let Term::App(FunSym::NoEq(sym), args) = t {
-        sym.name == b"pair" && args.len() == 2
+        &*sym.name == b"pair" && args.len() == 2
     } else { false }
 }
 
@@ -550,7 +550,7 @@ mod tests {
         );
         let mk_fact = |name: &str| {
             Fact::new(
-                FactTag::Proto(Multiplicity::Linear, name.to_string(), 1),
+                FactTag::Proto(Multiplicity::Linear, tamarin_term::intern::intern_str(name), 1),
                 vec![enc.clone()],
             )
         };
@@ -558,7 +558,7 @@ mod tests {
         let plain_rule = |rule_name: &str, fact_name: &str| -> RuleACInst {
             Rule::new(
                 RuleInfo::Proto(ProtoRuleACInstInfo {
-                    name: ProtoRuleName::Stand(rule_name.to_string()),
+                    name: ProtoRuleName::Stand(tamarin_term::intern::intern_str(rule_name)),
                     attributes: RuleAttributes::default(),
                     loop_breakers: Vec::new(),
                 }),

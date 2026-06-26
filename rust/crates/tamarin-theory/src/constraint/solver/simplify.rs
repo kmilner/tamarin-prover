@@ -17,7 +17,7 @@ use crate::constraint::solver::reduction::{ChangeIndicator, Reduction};
 /// `TAM_RS_TRACE_SIMP_CONTRA=1` so per-pass contradiction firings can be
 /// attributed against HS's `[CONTRA-FIRE]` histogram.
 fn mark_contradictory_labeled(red: &mut Reduction, pass: &'static str) {
-    if std::env::var("TAM_RS_TRACE_SIMP_CONTRA").is_ok() {
+    if tamarin_utils::env_gate!("TAM_RS_TRACE_SIMP_CONTRA") {
         eprintln!("[SIMP_CONTRA] pass={}", pass);
     }
     red.mark_contradictory();
@@ -71,7 +71,7 @@ fn is_dead_for_trace(red: &Reduction) -> bool {
 /// only.) The underlying `while_changing` is itself uncapped.
 pub fn simplify_system(red: &mut Reduction) {
     crate::constraint::solver::trace::trace_exec("simplifySystem");
-    if std::env::var("TAM_DBG_SIMP_ENTER").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_SIMP_ENTER") {
         eprintln!("[SIMP_ENTER] formulas.len()={} solved.len()={} goals={} nodes={}",
             red.sys.formulas.len(), red.sys.solved_formulas.len(),
             red.sys.goals.len(), red.sys.nodes.len());
@@ -92,12 +92,12 @@ pub fn simplify_system(red: &mut Reduction) {
     // var: it emits a distinct, lower-case `[simp_enter]` path/node dump
     // (with its own `TAM_DBG_SIMP_ENTER_NODES` sub-gate) alongside the
     // upper-case `[SIMP_ENTER]` formula dump above.
-    if std::env::var("TAM_DBG_SIMP_ENTER").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_SIMP_ENTER") {
         let path = crate::constraint::solver::trace::case_path_string();
         eprintln!("[simp_enter] path={} nodes={} formulas={} eq_store={}",
             path, red.sys.nodes.len(), red.sys.formulas.len(),
             red.sys.eq_store.subst.to_list().len());
-        if std::env::var("TAM_DBG_SIMP_ENTER_NODES").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_SIMP_ENTER_NODES") {
             // Compact var dump: show "name.idx" only for LVar literals.
             fn term_compact(t: &tamarin_term::lterm::LNTerm) -> String {
                 use tamarin_term::term::Term;
@@ -284,7 +284,7 @@ fn simplify_system_fan_out_inner(
     crate::constraint::solver::trace::trace_exec("simplifySystem");
 
     let ctx = red.ctx;
-    let dbg = std::env::var("TAM_RS_DBG_SIMP_FANOUT").is_ok();
+    let dbg = tamarin_utils::env_gate!("TAM_RS_DBG_SIMP_FANOUT");
 
     // Manual while_changing loop so we can break out on fan-out.
     // HS-faithful (Simplify.hs:73-77): no iteration cap — the loop
@@ -365,7 +365,7 @@ fn fan_out_on_pending_eq_arms(
     for arm_eq in pending {
         let mut arm_sys = arm0_sys.clone();
         arm_sys.invalidate_max_var_idx_cache();
-        arm_sys.eq_store = arm_eq;
+        arm_sys.eq_store = std::sync::Arc::new(arm_eq);
         all_arm_systems.push(arm_sys);
     }
     let mut out: Vec<crate::constraint::system::System> = Vec::new();
@@ -400,7 +400,7 @@ fn install_pass_cases_arms(
     let mut it = arms.into_iter();
     if let Some(first) = it.next() {
         red.sys.invalidate_max_var_idx_cache();
-        red.sys.eq_store = first;
+        red.sys.eq_store = std::sync::Arc::new(first);
     }
     for rest in it {
         red.pending_eq_arms.push(rest);
@@ -465,8 +465,8 @@ fn non_injective_fact_instances_pairs(
     // Resolve node-id → rule via a once-built map instead of a linear
     // `nodes.iter().find` per lookup.  `or_insert` keeps the FIRST rule
     // for a given id, matching `find`'s first-match semantics.
-    let node_rule_map: std::collections::HashMap<&NodeId, &crate::rule::RuleACInst> = {
-        let mut m = std::collections::HashMap::new();
+    let node_rule_map: tamarin_utils::FastMap<&NodeId, &crate::rule::RuleACInst> = {
+        let mut m = tamarin_utils::FastMap::default();
         for (n, r) in sys.nodes.iter() {
             m.entry(n).or_insert(r);
         }
@@ -1184,12 +1184,12 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
 
     let maude = red.ctx.maude.clone();
     let mut new_formulas: Vec<Guarded> = Vec::new();
-    let dbg = std::env::var("TAM_DBG_IMPL").is_ok();
+    let dbg = tamarin_utils::env_gate!("TAM_DBG_IMPL");
     if dbg {
         eprintln!("[impl] {} universals, {} sys_actions, {} formulas, {} lemmas",
             universals.len(), sys_actions.len(),
             red.sys.formulas.len(), red.sys.lemmas.len());
-        if std::env::var("TAM_DBG_IMPL_FORMULAS").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_IMPL_FORMULAS") {
             eprintln!("  formulas:");
             for (i, f) in red.sys.formulas.iter().enumerate() {
                 let s = format!("{:?}", f);
@@ -1220,7 +1220,7 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
                     format!("{:?}", t)).unwrap_or_default();
                 eprintln!("  action[{}] @ {:?} tag={:?} term0={}",
                     i, id, fa.tag, t);
-                if std::env::var("TAM_DBG_IMPL_ALLT").is_ok() {
+                if tamarin_utils::env_gate!("TAM_DBG_IMPL_ALLT") {
                     for (j, t) in fa.terms.iter().enumerate() {
                         eprintln!("    action[{}].term[{}]={:?}", i, j, t);
                     }
@@ -1531,7 +1531,7 @@ fn try_match_all_guards(
             let in_solved = existing_solved.iter().any(|f| f == &implied || apply_canon(f) == canon);
             let in_out = out.iter().any(|f| f == &implied || apply_canon(f) == canon);
             let already = in_formulas || in_solved || in_out;
-            if std::env::var("TAM_DBG_IMPL2").is_ok() && !already {
+            if tamarin_utils::env_gate!("TAM_DBG_IMPL2") && !already {
                 eprintln!("[impl2] NEW canon: {:?}", format!("{:?}", canon).chars().take(140).collect::<String>());
                 for (i, f) in existing_formulas.iter().enumerate() {
                     let fc = crate::guarded::normalize_witness_lvars(f);
@@ -1544,14 +1544,14 @@ fn try_match_all_guards(
                         format!("{:?}", fc).chars().take(140).collect::<String>());
                 }
             }
-            if std::env::var("TAM_DBG_IMPL").is_ok() {
+            if tamarin_utils::env_gate!("TAM_DBG_IMPL") {
                 let is_bot = matches!(&implied,
                     crate::guarded::Guarded::Disj(v) if v.is_empty());
-                if is_bot || !already || std::env::var("TAM_DBG_IMPL_ALL").is_ok() {
+                if is_bot || !already || tamarin_utils::env_gate!("TAM_DBG_IMPL_ALL") {
                     eprintln!("[impl] path={} implied (bot={}) already={} (formulas={} solved={} out={}): {}",
                         crate::constraint::solver::trace::case_path_string(),
                         is_bot, already, in_formulas, in_solved, in_out,
-                        if std::env::var("TAM_DBG_IMPL_ALL").is_ok() {
+                        if tamarin_utils::env_gate!("TAM_DBG_IMPL_ALL") {
                             crate::constraint::solver::trace::guarded_repr(&implied)
                         } else {
                             format!("{:?}", implied).chars().take(80).collect::<String>()
@@ -1744,11 +1744,11 @@ fn try_match_all_guards(
                     // parser-AST VarSubst, restricted to universal vars.
                     let mut subst_here = VarSubst::new();
                     for (lv, lt) in struct_subst {
-                        if !vars.iter().any(|v| v.name == lv.name && v.idx == lv.idx) {
+                        if !vars.iter().any(|v| v.name == *lv.name && v.idx == lv.idx) {
                             continue;
                         }
                         let term = crate::elaborate::lnterm_to_term(&lt);
-                        subst_here.insert((lv.name, lv.idx), term);
+                        subst_here.insert((lv.name.to_string(), lv.idx), term);
                     }
                     let Some(combined) = combine_substs(acc, &subst_here) else { continue };
                     rec(maude, vars, guards, guard_idx + 1, sys_actions,
@@ -1910,7 +1910,7 @@ fn structural_match(
         // (System.hs:1122 + Guarded.hs:741-805) the universal's bound
         // vars remain `Var`; free system vars become `SkConst`.
         (Term::Lit(Lit::Var(pv)), _)
-            if pattern_vars.contains(&(pv.name.clone(), pv.idx)) =>
+            if pattern_vars.contains(&(pv.name.to_string(), pv.idx)) =>
         {
             let subj_sort = term_lsort(subj);
             if !sort_compatible(pv.sort, subj_sort) { return StructMatch::NoMatcher; }
@@ -2021,13 +2021,13 @@ fn match_atom_via_maude(
     let ATerm::Var(g_t) = g_time else { return Vec::new() };
     if vars.iter().any(|v| v.name == g_t.name && v.idx == g_t.idx) {
         let i_term = tamarin_parser::ast::Term::Var(tamarin_parser::ast::VarSpec {
-            name: i.name.clone(),
+            name: i.name.to_string(),
             idx: i.idx,
             sort: tamarin_parser::ast::SortHint::Node,
             typ: None,
         });
         base_subst.insert((g_t.name.clone(), g_t.idx), i_term);
-    } else if !(g_t.name == i.name && g_t.idx == i.idx) {
+    } else if !(g_t.name == *i.name && g_t.idx == i.idx) {
         // Bound (ground) time that is not this system node — no match.
         return Vec::new();
     }
@@ -2138,7 +2138,7 @@ fn match_atom_via_maude(
         // propagates into the next guard's matching call.  Previously
         // Rust took `matches.remove(0)` (the first match only), which
         // would silently under-fire whenever Maude returned >1 matcher.
-        if std::env::var("TAM_DBG_IMPL").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_IMPL") {
             eprintln!("[impl] AC-fallback for {} @ {:?}: {} eqs",
                 g_fact.name, i, eqs.len());
         }
@@ -2166,15 +2166,15 @@ fn match_atom_via_maude(
     // (the old behaviour) causes spurious propagation when later
     // guards re-encounter those names.
     let mut out: Vec<VarSubst> = Vec::with_capacity(ms.len());
-    let dbg = std::env::var("TAM_DBG_IMPL").is_ok();
+    let dbg = tamarin_utils::env_gate!("TAM_DBG_IMPL");
     for m in ms {
         let mut subst = base_subst.clone();
         for (lv, lt) in m {
-            if !pattern_vars.contains(&(lv.name.clone(), lv.idx)) {
+            if !pattern_vars.contains(&(lv.name.to_string(), lv.idx)) {
                 continue;
             }
             let term = crate::elaborate::lnterm_to_term(&lt);
-            subst.insert((lv.name, lv.idx), term);
+            subst.insert((lv.name.to_string(), lv.idx), term);
         }
         if dbg {
             eprintln!("[impl] MATCH SUCCEEDED: g_fact.name={} @ node={:?} subst={:?}",
@@ -2245,14 +2245,14 @@ fn normalise_less_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
 /// node ids via `solve_node_id_eqs`.
 fn enforce_fresh_node_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     use crate::rule::{ProtoRuleName, RuleInfo};
-    if std::env::var("TAM_RS_TRACE_DG4_ENTER").is_ok() {
+    if tamarin_utils::env_gate!("TAM_RS_TRACE_DG4_ENTER") {
         let n_fresh = red.sys.nodes.iter().filter(|(_, r)|
             matches!(&r.info, RuleInfo::Proto(p) if p.name == ProtoRuleName::Fresh))
             .count();
         let path = crate::constraint::solver::trace::case_path_string();
         eprintln!("[DG4_ENTER] path={} fresh_count={}", path, n_fresh);
     }
-    if std::env::var("TAM_RS_DBG_DG4_RULES").is_ok() {
+    if tamarin_utils::env_gate!("TAM_RS_DBG_DG4_RULES") {
         let path = crate::constraint::solver::trace::case_path_string();
         let concs: Vec<String> = red.sys.nodes.iter()
             .filter(|(_, r)| matches!(&r.info, RuleInfo::Proto(p) if p.name == ProtoRuleName::Fresh))
@@ -2308,7 +2308,7 @@ fn enforce_fresh_node_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         // TAM_RS_TRACE_DG4=1: dump the merge event + current eq_store
         // contents.  Used to find the upstream binding that caused two
         // distinct Fresh suppliers' rules to compare equal here.
-        if std::env::var("TAM_RS_TRACE_DG4").is_ok() {
+        if tamarin_utils::env_gate!("TAM_RS_TRACE_DG4") {
             let bindings: Vec<String> = red.sys.eq_store.subst.to_list().into_iter()
                 .map(|(k, v)| format!("{}.{}/{:?}→{:?}", k.name, k.idx, k.sort, v))
                 .collect();
@@ -2386,9 +2386,9 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     use tamarin_term::lterm::LNTerm;
 
     // H14.3 diagnostic: dump i_0's KU action at the moment of the merge.
-    if std::env::var("TAM_RS_DBG_KU_I0_ACT").is_ok() {
+    if tamarin_utils::env_gate!("TAM_RS_DBG_KU_I0_ACT") {
         for (id, rule) in red.sys.nodes.iter() {
-            if id.name == "i" && id.idx == 0 {
+            if &*id.name == "i" && id.idx == 0 {
                 for fa in &rule.actions {
                     if matches!(fa.tag, FactTag::Ku) {
                         let t = format!("{:?}", fa.terms.first()).chars().take(200).collect::<String>();
@@ -2460,7 +2460,7 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     }
     if acts.len() < 2 { return ChangeIndicator::Unchanged; }
     // H14.3 diagnostic: dump ALL acts at this invocation if env var set.
-    if std::env::var("TAM_RS_DBG_KU_ACTS").is_ok() {
+    if tamarin_utils::env_gate!("TAM_RS_DBG_KU_ACTS") {
         eprintln!("[KU_ACTS_CALL] acts:");
         for (id, _fa, m) in &acts {
             let term_s = format!("{:?}", m).chars().take(300).collect::<String>();
@@ -2471,9 +2471,9 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     // what bindings exist (or are missing) compared to HS's
     // HS_MERGE_EQSTORE_PRE dump.  Triggered only when there's at least
     // one i_0 node with a KU action AND the dump env var is set.
-    if std::env::var("TAM_RS_DBG_KU_EQSTORE").is_ok() {
+    if tamarin_utils::env_gate!("TAM_RS_DBG_KU_EQSTORE") {
         let has_i0_ku = red.sys.nodes.iter().any(|(id, rule)| {
-            id.name == "i" && id.idx == 0
+            &*id.name == "i" && id.idx == 0
                 && rule.actions.iter().any(|fa| matches!(fa.tag, FactTag::Ku))
         });
         if has_i0_ku {
@@ -2492,7 +2492,7 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     }
     let mut node_eqs: Vec<tamarin_term::rewriting::Equal<NodeId>> = Vec::new();
     let mut fact_eqs: Vec<tamarin_term::rewriting::Equal<LNFact>> = Vec::new();
-    let dbg_ku_groups = std::env::var("TAM_RS_DBG_KU_GROUPS").is_ok();
+    let dbg_ku_groups = tamarin_utils::env_gate!("TAM_RS_DBG_KU_GROUPS");
     for (_m, group) in by_term {
         if group.len() < 2 { continue; }
         if dbg_ku_groups {
@@ -2990,7 +2990,7 @@ fn enforce_kd_fact_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     }
     node_eqs.retain(|e| e.lhs != e.rhs);
     if node_eqs.is_empty() && rule_eqs.is_empty() {
-        if std::env::var("TAM_DBG_KD_UNIQ").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_KD_UNIQ") {
             // Even when there's nothing to merge, log so we can see whether
             // the by_term grouping found candidates.
             let path = crate::constraint::solver::trace::case_path_string();
@@ -2998,7 +2998,7 @@ fn enforce_kd_fact_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         }
         return ChangeIndicator::Unchanged;
     }
-    if std::env::var("TAM_DBG_KD_UNIQ").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_KD_UNIQ") {
         let path = crate::constraint::solver::trace::case_path_string();
         eprintln!("[kd_uniq] path={} node_eqs.n={} rule_eqs.n={}",
             path, node_eqs.len(), rule_eqs.len());
@@ -3363,7 +3363,7 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         crate::constraint::constraints::NodeConc,
         Vec<crate::constraint::constraints::NodePrem>,
     > = std::collections::BTreeMap::new();
-    if std::env::var("TAM_DBG_EDGES_ENTER").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_EDGES_ENTER") {
         let path = crate::constraint::solver::trace::case_path_string();
         eprintln!("[edges_enter] path={} edges_n={}", path, red.sys.edges.len());
         let mut sorted_edges: Vec<String> = red.sys.edges.iter().map(|e| {
@@ -3400,7 +3400,7 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
                 conc_idx_clash = true;
                 continue;
             }
-            if std::env::var("TAM_DBG_EEU_ESRC_ETGT").is_ok() {
+            if tamarin_utils::env_gate!("TAM_DBG_EEU_ESRC_ETGT") {
                 let path = crate::constraint::solver::trace::case_path_string();
                 let keep_rule = red.sys.nodes.iter()
                     .find(|(id, _)| id == &keep.0)
@@ -3420,13 +3420,13 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         }
     }
     if conc_idx_clash {
-        if std::env::var("TAM_DBG_EDGE_UNIQ").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_EDGE_UNIQ") {
             eprintln!("[edge_uniq] CONTRA conc_idx_clash");
         }
         mark_contradictory_labeled(red, "enforce_edge_uniqueness:conc_idx_clash");
         return ChangeIndicator::Changed;
     }
-    if std::env::var("TAM_DBG_EDGE_UNIQ2").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_EDGE_UNIQ2") {
         let path = crate::constraint::solver::trace::case_path_string();
         eprintln!("[edge_uniq2] path={} by_src.len={} by_tgt-merges={}",
             path, by_src.len(), node_eqs.len());
@@ -3446,7 +3446,7 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     for (src, prems) in by_src {
         if prems.len() < 2 { continue; }
         if persistent_concs.contains(&(src.0.clone(), src.1.0)) { continue; }
-        if std::env::var("TAM_DBG_EDGE_UNIQ2").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_EDGE_UNIQ2") {
             let path = crate::constraint::solver::trace::case_path_string();
             let keep_rule = red.sys.nodes.iter()
                 .find(|(id, _)| id == &prems[0].0)
@@ -3467,7 +3467,7 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         let keep = &prems[0];
         for other in prems.iter().skip(1) {
             if keep.1 != other.1 {
-                if std::env::var("TAM_DBG_EDGE_UNIQ").is_ok() {
+                if tamarin_utils::env_gate!("TAM_DBG_EDGE_UNIQ") {
                     let src_rule = red.sys.nodes.iter()
                         .find(|(id, _)| id == &src.0)
                         .map(|(_, r)| crate::constraint::solver::reduction::rule_case_name(r))
@@ -3514,10 +3514,10 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         }
     }
     if prem_idx_clash {
-        if std::env::var("TAM_DBG_EDGE_UNIQ").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_EDGE_UNIQ") {
             eprintln!("[edge_uniq] CONTRA prem_idx_clash");
         }
-        if std::env::var("TAM_RS_TRACE_CLASH_PATH").is_ok() {
+        if tamarin_utils::env_gate!("TAM_RS_TRACE_CLASH_PATH") {
             let path = crate::constraint::solver::trace::case_path_string();
             // Dump the smallest signature that can be diffed against HS:
             // sorted edges as (src, conc_idx) → (tgt, prem_idx).
@@ -3536,7 +3536,7 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     if node_eqs.is_empty() { return ChangeIndicator::Unchanged; }
     let res = red.solve_node_id_eqs(&node_eqs);
     if matches!(res, Err(_) | Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)) {
-        if std::env::var("TAM_DBG_EDGE_UNIQ").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_EDGE_UNIQ") {
             eprintln!("[edge_uniq] CONTRA solve_node_id_eqs n_eqs={}", node_eqs.len());
         }
         mark_contradictory_labeled(red, "enforce_edge_uniqueness:node_id_eqs_contradictory");
@@ -4057,7 +4057,7 @@ fn reduce_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
         .cloned()
         .collect();
     to_decompose.sort_by(crate::guarded::cmp_guarded);
-    if std::env::var("TAM_DBG_REDUCE_FORM").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_REDUCE_FORM") {
         let total = red.sys.formulas.len();
         eprintln!("[REDUCE_FORM] total_formulas={} to_decompose={}", total, to_decompose.len());
         for (i, f) in red.sys.formulas.iter().enumerate() {
@@ -4554,7 +4554,7 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
                             .any(|c| c.small == *nt && c.big == s_plus_one);
                     if !exists {
                         red.sys.invalidate_max_var_idx_cache();
-                        red.sys.subterm_store.subterms.push(
+                        red.sys.subterm_store_mut().subterms.push(
                             crate::tools::subterm_store::SubtermConstraint {
                                 small: nt.clone(),
                                 big: s_plus_one,
@@ -4570,7 +4570,7 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
         for x in &splits_all {
             if let Split::SubD(s, t) | Split::NatD(s, t) = x {
                 red.sys.invalidate_max_var_idx_cache();
-                if red.sys.subterm_store.add_neg(s.clone(), t.clone()) {
+                if red.sys.subterm_store_mut().add_neg(s.clone(), t.clone()) {
                     changed = ChangeIndicator::Changed;
                 }
             }
@@ -4579,7 +4579,7 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
         for p in &already_false {
             if let Ok(pos) = red.sys.subterm_store.neg_subterms.binary_search(p) {
                 red.sys.invalidate_max_var_idx_cache();
-                red.sys.subterm_store.neg_subterms.remove(pos);
+                red.sys.subterm_store_mut().neg_subterms.remove(pos);
                 changed = ChangeIndicator::Changed;
             }
         }
@@ -4587,7 +4587,7 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
         // the only place `old_neg_subterms` is written; updating it alone
         // does NOT count as a change (HS simpSubterms compares stores
         // `ignoringOldSst1`, Simplify.hs:507-508).
-        red.sys.subterm_store.old_neg_subterms = original_negs;
+        red.sys.subterm_store_mut().old_neg_subterms = original_negs;
     }
 
     // -------------------------------------------------------------
@@ -4605,8 +4605,8 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
     // turn the store contradictory.
     let mut kept: Vec<crate::tools::subterm_store::SubtermConstraint> = Vec::new();
     let mut solved: Vec<crate::tools::subterm_store::SubtermConstraint> =
-        std::mem::take(&mut red.sys.subterm_store.solved_subterms);
-    let mut subs = std::mem::take(&mut red.sys.subterm_store.subterms);
+        std::mem::take(&mut red.sys.subterm_store_mut().solved_subterms);
+    let mut subs = std::mem::take(&mut red.sys.subterm_store_mut().subterms);
     // sst0 — `posSubterms \ solvedSubterms` (HS SubtermStore.hs:146):
     // a substitution may have rewritten a live subterm into one that
     // is already solved.
@@ -4675,9 +4675,9 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
         kept.push(c);
     }
     red.sys.invalidate_max_var_idx_cache();
-    red.sys.subterm_store.subterms = kept;
+    red.sys.subterm_store_mut().subterms = kept;
     red.sys.invalidate_max_var_idx_cache();
-    red.sys.subterm_store.solved_subterms = solved;
+    red.sys.subterm_store_mut().solved_subterms = solved;
 
     // -------------------------------------------------------------
     // Phase 3 — negativeSubtermVars / CR-rule S_neg (HS SubtermStore.hs:377-385):
@@ -4707,7 +4707,7 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
                     }
                     // negSubterms ∪ {(ns, ps)} (HS line 384-385).
                     red.sys.invalidate_max_var_idx_cache();
-                    if red.sys.subterm_store.add_neg(ns.clone(), ps.clone()) {
+                    if red.sys.subterm_store_mut().add_neg(ns.clone(), ps.clone()) {
                         changed = ChangeIndicator::Changed;
                     }
                 }
@@ -4749,7 +4749,7 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
     }
 
     if contradictory {
-        red.sys.subterm_store.contradictory = true;
+        red.sys.subterm_store_mut().contradictory = true;
     }
     // Push emitted formulas directly to `sys.formulas` (NOT via
     // `insert_formula`, which routes negated-atom universals through
@@ -5315,7 +5315,7 @@ mod tests {
             r.sys.goals.iter().any(|(g, _)| match g {
                 crate::constraint::constraints::Goal::Action(_, fa) =>
                     matches!(&fa.tag,
-                        crate::fact::FactTag::Proto(_, n, _) if n == name),
+                        crate::fact::FactTag::Proto(_, n, _) if &**n == name),
                 _ => false,
             })
         };
@@ -5425,7 +5425,7 @@ mod tests {
         let t: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(
             tamarin_term::vterm::Lit::Var(v));
         sys.invalidate_max_var_idx_cache();
-        sys.subterm_store.add(t.clone(), t);
+        sys.subterm_store_mut().add(t.clone(), t);
         let mut r = Reduction::new(&ctx, sys);
         simplify_system(&mut r);
         assert!(r.sys.subterm_store.contradictory);
@@ -5676,7 +5676,7 @@ mod tests {
         let mut sys = System::empty();
         // Seed `¬(a++a ⊏ b++c)`.  `old_neg_subterms` is empty, so this
         // pair is in the "changed" set `negSubterms \ oldNegSubterms`.
-        assert!(sys.subterm_store.add_neg(small.clone(), big.clone()));
+        assert!(sys.subterm_store_mut().add_neg(small.clone(), big.clone()));
         let mut r = Reduction::new(&ctx, sys);
 
         let res = propagate_subterm_obvious(&mut r);
@@ -5706,7 +5706,7 @@ mod tests {
         let mut ctx = ProofContext::new(h, Vec::new());
         // Wire S as injective with one Constant behaviour position.
         let s_tag = crate::fact::FactTag::Proto(
-            crate::fact::Multiplicity::Linear, "S".to_string(), 2);
+            crate::fact::Multiplicity::Linear, "S".into(), 2);
         ctx.injective_fact_insts = vec![
             (s_tag.clone(),
              vec![vec![crate::tools::injective_fact_instances::MonotonicBehaviour::Constant]]),
@@ -5773,7 +5773,7 @@ mod tests {
         let mut ctx = ProofContext::new(h, Vec::new());
         use crate::tools::injective_fact_instances::MonotonicBehaviour::{Constant, Unstable};
         let s_tag = crate::fact::FactTag::Proto(
-            crate::fact::Multiplicity::Linear, "S".to_string(), 2);
+            crate::fact::Multiplicity::Linear, "S".into(), 2);
         ctx.injective_fact_insts = vec![
             (s_tag.clone(), vec![vec![Unstable, Constant]]),
         ];

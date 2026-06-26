@@ -62,10 +62,10 @@ pub fn check_message_derivation(
 ) -> Vec<WfError> {
     if timeout_secs == 0 { return Vec::new(); }
     let timeout = Duration::from_secs(timeout_secs as u64);
-    let dbg = std::env::var_os("TAM_DBG_DERIV_CHECK").is_some();
+    let dbg = tamarin_utils::env_gate!("TAM_DBG_DERIV_CHECK");
     // TAM_DBG_DERIV_TIMING=1: emit per-rule / per-variable wall-clock
     // timings on stderr.  Off-path when env var is absent.
-    let dbg_timing = std::env::var_os("TAM_DBG_DERIV_TIMING").is_some();
+    let dbg_timing = tamarin_utils::env_gate!("TAM_DBG_DERIV_TIMING");
     let t_total_start = std::time::Instant::now();
 
     // Collect the names that should NOT be treated as variables:

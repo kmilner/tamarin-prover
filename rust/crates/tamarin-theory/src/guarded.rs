@@ -1706,7 +1706,7 @@ pub fn var_subst_from_eq_store(
     let mut out: VarSubst = std::collections::HashMap::new();
     let pairs: Vec<(LVar, _)> = eq_store.subst.to_list();
     for (lv, lt) in pairs {
-        out.insert((lv.name.clone(), lv.idx), lnterm_to_term(&lt));
+        out.insert((lv.name.to_string(), lv.idx), lnterm_to_term(&lt));
     }
     out
 }

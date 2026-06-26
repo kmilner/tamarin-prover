@@ -58,7 +58,7 @@ fn freshen_witness_range(
 ) -> Vec<(LVar, LNTerm)> {
     use tamarin_term::lterm::HasFrees;
     use std::collections::{BTreeMap, BTreeSet};
-    let trace = std::env::var("TAM_DBG_FRESHEN_WITNESS").is_ok();
+    let trace = tamarin_utils::env_gate!("TAM_DBG_FRESHEN_WITNESS");
     let domain: BTreeSet<LVar> = raw.iter().map(|(v, _)| v.clone()).collect();
     // Witnesses = range-only vars that are neither a domain key nor an
     // input var (i.e. auxiliaries the Maude unifier introduced); these are
@@ -473,7 +473,7 @@ impl EquationStore {
         // the canonical-split-ordering fix (see the two-stage sort below):
         //   mkNewEqStore before after <$> orderedSubsts
         let mut sorted_substs: Vec<LNSubstVFresh> = disj.substs.clone();
-        if std::env::var("TAM_DBG_PERFORM_SPLIT").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_PERFORM_SPLIT") {
             eprintln!("[perform_split] split_id={:?}, {} substs (pre-sort):", id, sorted_substs.len());
             for (i, s) in sorted_substs.iter().enumerate() {
                 eprintln!("[perform_split]   raw[{}]: {:?}", i, s.to_list());
@@ -507,7 +507,7 @@ impl EquationStore {
         // `sEqStore` that `performSplit` later splits.
         sorted_substs.sort();
         sorted_substs.sort_by_cached_key(|s| s.drop_name_hints());
-        if std::env::var("TAM_DBG_PERFORM_SPLIT").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_PERFORM_SPLIT") {
             eprintln!("[perform_split] sorted result:");
             for (i, s) in sorted_substs.iter().enumerate() {
                 eprintln!("[perform_split]   case_{}: {:?}", i + 1, s.to_list());
@@ -678,7 +678,7 @@ impl EquationStore {
             .map_err(|e| AddEqsError::Maude(format!("{}", e)))?;
 
         if unifiers.is_empty() {
-            if std::env::var("TAM_DBG_NOUNIFY").is_ok() {
+            if tamarin_utils::env_gate!("TAM_DBG_NOUNIFY") {
                 eprintln!("[nounify] add_eqs found 0 unifiers for:");
                 for e in &applied {
                     let l = format!("{:?}", e.lhs).chars().take(150).collect::<String>();
@@ -823,7 +823,7 @@ impl EquationStore {
             dbg_register_subst_origin("addEqs.disj", &s);
             substs.push(s);
         }
-        if std::env::var("TAM_DBG_ADDEQS_VARIANTS").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_ADDEQS_VARIANTS") {
             eprintln!("[addEqs_variants] inserted {} variants for eqs:", substs.len());
             for (i, e) in applied.iter().enumerate() {
                 eprintln!("[addEqs_variants]   eq[{}]: {:?} = {:?}", i, e.lhs, e.rhs);
@@ -1125,7 +1125,7 @@ impl EquationStore {
         // per disj — used by H16.5 to confirm that RS variants never
         // contain same-image pairs (whereas HS's do after equation
         // reduction).  See [[project-h16-5-simp-identify-precondition]].
-        let dbg = std::env::var("TAM_RS_DBG_SIMP_IDENTIFY").is_ok();
+        let dbg = tamarin_utils::env_gate!("TAM_RS_DBG_SIMP_IDENTIFY");
         if dbg && self.conj.iter().any(|d| d.substs.len() >= 2) {
             for (idx, d) in self.conj.iter().enumerate() {
                 if d.substs.len() < 2 { continue; }
@@ -1152,7 +1152,7 @@ impl EquationStore {
                 if pairs_found == 0 {
                     eprintln!("[simp_id_probe] disj[{}] NO_PAIRS: no same-image pairs in first subst ({} entries, {} substs)",
                         idx, entries.len(), d.substs.len());
-                    if entries.len() >= 8 && std::env::var("TAM_RS_DBG_SIMP_IDENTIFY_FULL").is_ok() {
+                    if entries.len() >= 8 && tamarin_utils::env_gate!("TAM_RS_DBG_SIMP_IDENTIFY_FULL") {
                         for (sidx, s) in d.substs.iter().enumerate() {
                             eprintln!("[simp_id_probe]   subst[{}]:", sidx);
                             for (k, v) in s.to_list() {
@@ -1332,7 +1332,7 @@ impl EquationStore {
         };
         // Allocate a fresh witness fv with the narrower sort `s`.
         let new_idx = alloc(1);
-        let fv = LVar { name: v.name.clone(), sort: s, idx: new_idx };
+        let fv = LVar { name: v.name, sort: s, idx: new_idx };
         // Compose {v → Var(fv)} into the free substitution.
         let factor = LNSubst::from_list(vec![
             (v.clone(), Term::Lit(Lit::Var(fv.clone()))),
@@ -1613,7 +1613,7 @@ impl EquationStore {
         F: Fn(&LNSubst, &LNSubstVFresh) -> bool,
         G: FnMut(u64) -> u64,
     {
-        let dbg_simp_disj = std::env::var("TAM_RS_DBG_SIMP_DISJ").is_ok();
+        let dbg_simp_disj = tamarin_utils::env_gate!("TAM_RS_DBG_SIMP_DISJ");
         if dbg_simp_disj {
             let sizes: Vec<usize> = self.conj.iter().map(|d| d.substs.len()).collect();
             if sizes.iter().any(|n| *n >= 2) {
@@ -1737,7 +1737,7 @@ impl EquationStore {
         let pos = self.conj.iter().position(|d| d.substs.len() == 1);
         let Some(pos) = pos else { return false; };
         let subst_vf = self.conj[pos].substs[0].clone();
-        if std::env::var("TAM_DBG_APPLY_EQ").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_APPLY_EQ") {
             let pairs: Vec<String> = subst_vf.to_list().iter().take(8)
                 .map(|(k, v)| format!("{}_{} → {}", k.name, k.idx,
                     format!("{:?}", v).chars().take(40).collect::<String>()))
@@ -1775,7 +1775,7 @@ impl EquationStore {
                 }
             }
         }
-        if std::env::var("TAM_DBG_FOLD_VARIANT").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_FOLD_VARIANT") {
             let pairs: Vec<String> = subst_vf.to_list().iter()
                 .filter(|(k, _)| k.name.contains("ltkS") || k.name.contains("request"))
                 .map(|(k, v)| format!("{}.{} → {}", k.name, k.idx,
@@ -1807,7 +1807,7 @@ impl EquationStore {
             }
         }
         let new_subst = subst_vf.fresh_to_free_avoiding(alloc, &preserve);
-        if std::env::var("TAM_DBG_FOLD_VARIANT").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_FOLD_VARIANT") {
             let pairs: Vec<String> = new_subst.to_list().iter()
                 .filter(|(k, _)| k.name.contains("ltkS") || k.name.contains("request"))
                 .map(|(k, v)| format!("{}.{} → {}", k.name, k.idx,
@@ -2306,7 +2306,7 @@ impl EquationStore {
                         let base = aes_maude.reserve_idxs(to_lift.len() as u64);
                         for (i, s) in to_lift.iter().enumerate() {
                             let w = LVar {
-                                name: s.name.clone(),
+                                name: s.name,
                                 sort: s.sort,
                                 idx: base + i as u64,
                             };
@@ -2473,7 +2473,7 @@ fn is_constant_term(t: &LNTerm) -> bool {
 /// merge their suppliers and `enforce_edge_uniqueness` to fire
 /// prem_idx_clash false-positives).
 fn log_fresh_bindings(site: &str, subst: &LNSubst) {
-    if std::env::var("TAM_RS_TRACE_FRESH_BIND").is_err() { return; }
+    if !tamarin_utils::env_gate!("TAM_RS_TRACE_FRESH_BIND") { return; }
     use tamarin_term::lterm::LSort;
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
@@ -2496,13 +2496,13 @@ fn log_fresh_bindings(site: &str, subst: &LNSubst) {
 /// LVar with name="S" and sort=Pub.  Used to pinpoint the moment a
 /// freshly-grafted Serv_1's $S diverges from the lemma's $S.
 pub(crate) fn log_s_pub_bindings(site: &str, subst: &LNSubst) {
-    if std::env::var("TAM_RS_TRACE_S_BIND").is_err() { return; }
+    if !tamarin_utils::env_gate!("TAM_RS_TRACE_S_BIND") { return; }
     use tamarin_term::lterm::{HasFrees, LSort};
     for (v, t) in subst.to_list() {
-        let v_is_s = v.name == "S" && v.sort == LSort::Pub;
+        let v_is_s = &*v.name == "S" && v.sort == LSort::Pub;
         let mut t_has_s = false;
         t.for_each_free(&mut |w: &tamarin_term::lterm::LVar| {
-            if w.name == "S" && w.sort == LSort::Pub { t_has_s = true; }
+            if &*w.name == "S" && w.sort == LSort::Pub { t_has_s = true; }
         });
         if v_is_s || t_has_s {
             let path = crate::constraint::solver::trace::case_path_string();
@@ -2525,10 +2525,10 @@ pub(crate) fn log_s_pub_bindings(site: &str, subst: &LNSubst) {
 /// Serv_1 node ids get renamed to low-idx values that collide with
 /// pre-existing instances.
 pub(crate) fn log_vr_node_bindings(site: &str, subst: &LNSubst) {
-    if std::env::var("TAM_RS_TRACE_VR_BIND").is_err() { return; }
+    if !tamarin_utils::env_gate!("TAM_RS_TRACE_VR_BIND") { return; }
     use tamarin_term::lterm::LSort;
     for (v, t) in subst.to_list() {
-        if v.name == "vr" && v.sort == LSort::Node {
+        if &*v.name == "vr" && v.sort == LSort::Node {
             let path = crate::constraint::solver::trace::case_path_string();
             let bt = std::backtrace::Backtrace::force_capture();
             let bt_str = format!("{}", bt);
@@ -2860,9 +2860,9 @@ mod tests {
         use tamarin_term::lterm::HasFrees;
         let mut witness_found = false;
         for (key, term) in store.subst.to_list() {
-            if key.name != "x" && key.name != "y" { witness_found = true; }
+            if &*key.name != "x" && &*key.name != "y" { witness_found = true; }
             term.for_each_free(&mut |v| {
-                if v.name != "x" && v.name != "y" { witness_found = true; }
+                if &*v.name != "x" && &*v.name != "y" { witness_found = true; }
             });
         }
         assert!(!witness_found,

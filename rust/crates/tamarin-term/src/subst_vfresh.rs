@@ -94,7 +94,7 @@ fn rename_term_drop_hint<C: Ord + Clone>(
             let nv = match bindings.get(v) {
                 Some(nv) => nv.clone(),
                 None => {
-                    let nv = LVar { name: String::new(), sort: v.sort, idx: *counter };
+                    let nv = LVar { name: "".into(), sort: v.sort, idx: *counter };
                     *counter += 1;
                     bindings.insert(v.clone(), nv.clone());
                     nv
@@ -242,7 +242,7 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
                     else if new_idx_signed > u64::MAX as i128 { u64::MAX }
                     else { new_idx_signed as u64 };
                 let v_new = LVar {
-                    name: v.name.clone(),
+                    name: v.name,
                     sort: v.sort,
                     idx: new_idx,
                 };
@@ -265,7 +265,12 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
     /// idxs) rather than dense-packed sequential allocation.  Required for
     /// `compose_vfresh` to produce structurally-equivalent SubstVFresh
     /// shapes per variant.
-    pub fn fresh_to_free_uniform_shift(&self, avoid: &[LVar])
+    ///
+    /// `fresh_start` is the precomputed `succ . maxIdx . frees(avoid)` the
+    /// caller would otherwise build a set/list to derive: it is the ONLY thing
+    /// the old `avoid: &[LVar]` argument was used for (its max idx + 1), so we
+    /// take it directly and skip materialising the avoid collection.
+    pub fn fresh_to_free_uniform_shift(&self, fresh_start: u64)
         -> crate::subst::Subst<C, LVar>
     {
         use std::collections::BTreeMap;
@@ -285,9 +290,8 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
             let pairs: Vec<(LVar, VTerm<C, LVar>)> = self.to_list();
             return Subst::from_list(pairs);
         }
-        // HS: `evalFreshAvoiding t` initial counter = succ . maxIdx . frees t.
-        let fresh_start: u64 = avoid.iter().map(|v| v.idx).max()
-            .map(|m| m + 1).unwrap_or(0);
+        // HS: `evalFreshAvoiding t` initial counter = succ . maxIdx . frees t,
+        // precomputed by the caller and handed in as `fresh_start`.
         let min_idx = range_vars.iter().map(|v| v.idx).min().unwrap();
         let shift: i128 = fresh_start as i128 - min_idx as i128;
         let mut rename: BTreeMap<LVar, LVar> = BTreeMap::new();
@@ -297,7 +301,7 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
                 else if new_idx_signed > u64::MAX as i128 { u64::MAX }
                 else { new_idx_signed as u64 };
             let new = LVar {
-                name: old.name.clone(),
+                name: old.name,
                 sort: old.sort,
                 idx: new_idx,
             };
@@ -453,9 +457,9 @@ fn rename_lvars_with_hint<C: Ord + Clone, F: FnMut(u64) -> u64>(
                 // term shape.
                 let idx = alloc_idxs(1);
                 let name = if outer_is_singleton_var {
-                    lv.name.clone()
+                    lv.name
                 } else {
-                    v.name.clone()
+                    v.name
                 };
                 let new = LVar { name, sort: v.sort, idx };
                 rename.insert(v.clone(), new.clone());
@@ -547,17 +551,23 @@ where
     // witnesses came out inflated (Responder_secrecy: the Setup_Key `~k`
     // variant witnesses at ~k.30/42 vs HS's ~k.11/12/15, rotating the
     // 3-way split via `Ord LNSubstVFresh`).
-    let mut avoid_set: std::collections::BTreeSet<LVar> = std::collections::BTreeSet::new();
+    // `freshToFreeAvoidingFast` only consults the avoid set for its max idx
+    // (`succ . maxIdx`), so fold that max directly over the same three sources
+    // instead of materialising a BTreeSet + Vec.  Dedup/order are irrelevant
+    // to a max, so the resulting `fresh_start` is byte-identical to the old
+    // `avoid.iter().map(|v| v.idx).max().map(|m| m + 1).unwrap_or(0)`.
+    let mut max_idx: Option<u64> = None;
+    let mut bump = |idx: u64| { max_idx = Some(max_idx.map_or(idx, |m| m.max(idx))); };
     // s2's domain
-    for v in s2.dom() { avoid_set.insert(v.clone()); }
+    for v in s2.dom() { bump(v.idx); }
     // s2's range vars
     for t in s2.range() {
-        for v in crate::vterm::vars_vterm(t) { avoid_set.insert(v); }
+        for v in crate::vterm::vars_vterm(t) { bump(v.idx); }
     }
     // s1_0's domain keys ONLY (HS-faithful: frees of a SubstVFresh = keys).
-    for v in s1_0.dom() { avoid_set.insert(v.clone()); }
-    let avoid: Vec<LVar> = avoid_set.into_iter().collect();
-    let s1 = extended.fresh_to_free_uniform_shift(&avoid);
+    for v in s1_0.dom() { bump(v.idx); }
+    let fresh_start: u64 = max_idx.map(|m| m + 1).unwrap_or(0);
+    let s1 = extended.fresh_to_free_uniform_shift(fresh_start);
     let composed = s1.compose(s2);
     free_to_fresh_raw(composed)
 }

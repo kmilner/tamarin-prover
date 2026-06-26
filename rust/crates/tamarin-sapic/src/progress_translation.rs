@@ -331,7 +331,7 @@ fn lvar_to_varspec(v: &LVar) -> p::VarSpec {
         LSort::Msg => p::SortHint::Msg,
     };
     p::VarSpec {
-        name: v.name.clone(),
+        name: v.name.to_string(),
         idx: v.idx,
         sort,
         typ: None,

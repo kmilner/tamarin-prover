@@ -91,7 +91,7 @@ fn find_matching_macro<'a, C, V>(
     }
     macros
         .iter()
-        .find(|m| s.name == m.name && s.arity == m.params.len())
+        .find(|m| *s.name == *m.name && s.arity == m.params.len())
 }
 
 // Helper for tests: extract the inner NoEqSym out of a FunSym we know is NoEq.

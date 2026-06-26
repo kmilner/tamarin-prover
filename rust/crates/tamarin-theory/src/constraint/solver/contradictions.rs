@@ -67,10 +67,10 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
     if dbg_impl_enabled() {
         let has_i_1 = sys.nodes.iter().any(|(_, r)|
             matches!(&r.info, crate::rule::RuleInfo::Proto(p)
-                if matches!(&p.name, crate::rule::ProtoRuleName::Stand(s) if s == "I_1")));
+                if matches!(&p.name, crate::rule::ProtoRuleName::Stand(s) if *s == "I_1")));
         let has_r_1 = sys.nodes.iter().any(|(_, r)|
             matches!(&r.info, crate::rule::RuleInfo::Proto(p)
-                if matches!(&p.name, crate::rule::ProtoRuleName::Stand(s) if s == "R_1")));
+                if matches!(&p.name, crate::rule::ProtoRuleName::Stand(s) if *s == "R_1")));
         if has_i_1 && has_r_1 {
             let has_bot = sys.formulas.iter()
                 .any(|f| matches!(f, crate::guarded::Guarded::Disj(v) if v.is_empty()));
@@ -148,7 +148,7 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
     if cyclic(&all_less) {
         // H14-style diagnostic: dump the actual cycle path so a missing
         // less_atom (vs HS) can be identified by diffing the paths.
-        if std::env::var("TAM_RS_DBG_CYCLE_PATH").is_ok() {
+        if tamarin_utils::env_gate!("TAM_RS_DBG_CYCLE_PATH") {
             let cp = crate::constraint::solver::trace::case_path_string();
             let path = cyclic_with_path(&all_less);
             let path_str: Vec<String> = path.iter()
@@ -264,28 +264,39 @@ fn has_non_normal_terms(ctx: &ProofContext, sys: &System) -> bool {
     if sig.reducible_fun_syms.is_empty() { return false; }
     let irreducible = &sig.irreducible_fun_syms;
 
-    // Collect every (possibly-not-NF) subterm across all node
-    // facts and new-vars.  Mirrors Haskell's `maybeNonNormalTerms`
-    // ∘ `maybeNotNfSubterms`.
-    let mut candidates: std::collections::BTreeSet<tamarin_term::lterm::LNTerm>
-        = std::collections::BTreeSet::new();
+    // Short-circuiting structural walk: the moment a candidate subterm — a
+    // variable or a reducible-headed `App` (the `_` arm of
+    // `maybe_not_nf_subterms`) — fails `nf_via_haskell`, the system has a
+    // non-normal term.  Constants are in NF; irreducible-headed apps recurse
+    // into their args.  This is the boolean OR of `maybeNonNormalTerms` ∘
+    // `maybeNotNfSubterms` over `nf'` (Norm.hs:131), but without building the
+    // `BTreeSet` of every candidate: the dedup is irrelevant to an OR, and
+    // `nf_via_haskell` is a side-effect-free structural check, so visiting a
+    // subterm more than once cannot change the verdict.
+    fn any_non_nf(
+        sig: &tamarin_term::maude_sig::MaudeSig,
+        irreducible: &tamarin_term::function_symbols::FunSig,
+        t: &tamarin_term::lterm::LNTerm,
+    ) -> bool {
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+        match t {
+            Term::Lit(Lit::Con(_)) => false,
+            Term::App(sym, args) if irreducible.contains(sym) => {
+                args.iter().any(|a| any_non_nf(sig, irreducible, a))
+            }
+            _ => !tamarin_term::norm::nf_via_haskell(sig, t),
+        }
+    }
+
     for (_, rule) in sys.nodes.iter() {
         for f in rule.premises.iter().chain(&rule.conclusions).chain(&rule.actions) {
             for t in &f.terms {
-                maybe_not_nf_subterms(irreducible, t, &mut candidates);
+                if any_non_nf(&sig, irreducible, t) { return true; }
             }
         }
         for t in &rule.new_vars {
-            maybe_not_nf_subterms(irreducible, t, &mut candidates);
-        }
-    }
-    if candidates.is_empty() { return false; }
-
-    // HS-faithful NF check: `nf'` = `nfViaHaskell` (Norm.hs:131).
-    // Short-circuit on the first term that is NOT in NF.
-    for t in &candidates {
-        if !tamarin_term::norm::nf_via_haskell(&sig, t) {
-            return true;
+            if any_non_nf(&sig, irreducible, t) { return true; }
         }
     }
     false
@@ -355,7 +366,7 @@ fn has_subterm_cycle_contra(ctx: &ProofContext, sys: &System) -> bool {
 fn has_impossible_chain(ctx: &ProofContext, sys: &System) -> bool {
     use crate::constraint::constraints::Goal;
     use crate::fact::FactTag;
-    let dbg = std::env::var("TAM_RS_DBG_IMPOSSIBLE_CHAIN").is_ok();
+    let dbg = tamarin_utils::env_gate!("TAM_RS_DBG_IMPOSSIBLE_CHAIN");
 
     for (g, st) in sys.goals.iter() {
         if st.solved { continue; }
@@ -704,10 +715,10 @@ fn has_forbidden_chain(sys: &System) -> bool {
     // would equal a KU-action term in any branch.  Root cause of
     // StatVerif Resolve2_d_1_check_getmsg_d_0_fst_d_1_check_getmsg
     // case survival (see [[project-statverif-aborted-contract-reachable]]).
-    let mut equivalence_classes: std::collections::HashMap<
+    let mut equivalence_classes: tamarin_utils::FastMap<
         tamarin_term::lterm::LVar,
         std::collections::HashSet<tamarin_term::lterm::LVar>> =
-        std::collections::HashMap::new();
+        tamarin_utils::FastMap::default();
     // Compute a coarse "head signature" of a term for grouping: the
     // outermost function symbol (or Var/Const tag).  Two Msg-Vars
     // mapped to App-headed terms with the same outer function symbol
@@ -718,16 +729,16 @@ fn has_forbidden_chain(sys: &System) -> bool {
     let term_head_sig = |t: &tamarin_term::lterm::LNTerm| -> Option<Vec<u8>> {
         match t {
             Term::App(tamarin_term::function_symbols::FunSym::NoEq(sym), _) =>
-                Some(sym.name.clone()),
+                Some(sym.name.to_vec()),
             _ => None,
         }
     };
     for disj in &sys.eq_store.conj {
         for subst in &disj.substs {
             // Group Msg-vars by their image's outermost function symbol.
-            let mut by_head: std::collections::HashMap<
+            let mut by_head: tamarin_utils::FastMap<
                 Vec<u8>,
-                Vec<tamarin_term::lterm::LVar>> = std::collections::HashMap::new();
+                Vec<tamarin_term::lterm::LVar>> = tamarin_utils::FastMap::default();
             for (v, t) in subst.iter() {
                 if v.sort != tamarin_term::lterm::LSort::Msg { continue; }
                 let head = match term_head_sig(t) {
@@ -797,8 +808,8 @@ fn has_forbidden_chain(sys: &System) -> bool {
         };
         // Build the set of candidate-equal Msg-Vars: t_start itself
         // plus any var in its disj-equivalence class.
-        let mut candidate_vars: std::collections::HashSet<tamarin_term::lterm::LVar>
-            = std::collections::HashSet::new();
+        let mut candidate_vars: tamarin_utils::FastSet<tamarin_term::lterm::LVar>
+            = tamarin_utils::FastSet::default();
         candidate_vars.insert(t_start_var.clone());
         if let Some(eqs) = equivalence_classes.get(&t_start_var) {
             for v in eqs {
@@ -886,7 +897,7 @@ fn has_forbidden_exp(sys: &System) -> bool {
                 out
             }
             Term::App(FunSym::NoEq(s), args)
-                if s.name == INV_SYM_STRING && args.len() == 1 =>
+                if &*s.name == INV_SYM_STRING && args.len() == 1 =>
             {
                 ni_factors(&args[0])
             }
@@ -935,7 +946,7 @@ fn has_forbidden_exp(sys: &System) -> bool {
     }
     fn view_exp(t: &LNTerm) -> Option<(&LNTerm, &LNTerm)> {
         if let Term::App(FunSym::NoEq(s), args) = t {
-            if s.name == EXP_SYM_STRING && args.len() == 2 {
+            if &*s.name == EXP_SYM_STRING && args.len() == 2 {
                 return Some((&args[0], &args[1]));
             }
         }
@@ -1042,7 +1053,7 @@ fn has_forbidden_exp(sys: &System) -> bool {
         };
 
         if forbidden {
-            if std::env::var("TAM_RS_DBG_FORBIDDEN_EXP").is_ok() {
+            if tamarin_utils::env_gate!("TAM_RS_DBG_FORBIDDEN_EXP") {
                 eprintln!("[FORBIDDEN_EXP] node={:?} ru_concl={:?}", i, conc_term);
             }
             return true;
@@ -1074,19 +1085,19 @@ fn has_forbidden_exp(sys: &System) -> bool {
 /// RS kept 5 cases where HS keeps 2 — diverging the proof shape.
 fn has_forbidden_bp(sys: &System) -> bool {
     if sys.nodes.iter().any(|(_, ru)| is_forbidden_d_pmult(ru)) {
-        if std::env::var("TAM_RS_DBG_FORBIDDEN_BP").is_ok() {
+        if tamarin_utils::env_gate!("TAM_RS_DBG_FORBIDDEN_BP") {
             eprintln!("[FORBIDDEN_BP] dPMult fired");
         }
         return true;
     }
     if sys.nodes.iter().any(|(i, ru)| is_forbidden_d_emap(sys, i, ru)) {
-        if std::env::var("TAM_RS_DBG_FORBIDDEN_BP").is_ok() {
+        if tamarin_utils::env_gate!("TAM_RS_DBG_FORBIDDEN_BP") {
             eprintln!("[FORBIDDEN_BP] dEMap fired");
         }
         return true;
     }
     if sys.nodes.iter().any(|(i, ru)| is_forbidden_d_emap_order(sys, i, ru)) {
-        if std::env::var("TAM_RS_DBG_FORBIDDEN_BP").is_ok() {
+        if tamarin_utils::env_gate!("TAM_RS_DBG_FORBIDDEN_BP") {
             eprintln!("[FORBIDDEN_BP] dEMapOrder fired");
         }
         return true;
@@ -1210,7 +1221,7 @@ fn is_forbidden_d_emap_order(sys: &System,
     // tc = exp(em(p', q'), Mult([s', r', ...]))
     let (em_t, mult_arg) = match tc {
         Term::App(FunSym::NoEq(s), args)
-            if s.name == EXP_SYM_STRING && args.len() == 2 =>
+            if &*s.name == EXP_SYM_STRING && args.len() == 2 =>
             (&args[0], &args[1]),
         _ => return false,
     };
@@ -1302,7 +1313,7 @@ fn bp_view_pmult(t: &tamarin_term::lterm::LNTerm)
     use tamarin_term::function_symbols::{FunSym, PMULT_SYM_STRING};
     use tamarin_term::term::Term;
     if let Term::App(FunSym::NoEq(s), args) = t {
-        if s.name == PMULT_SYM_STRING && args.len() == 2 {
+        if &*s.name == PMULT_SYM_STRING && args.len() == 2 {
             return Some((&args[0], &args[1]));
         }
     }
@@ -1321,7 +1332,7 @@ fn bp_ni_factors(t: &tamarin_term::lterm::LNTerm) -> Vec<tamarin_term::lterm::LN
             out
         }
         Term::App(FunSym::NoEq(s), args)
-            if s.name == INV_SYM_STRING && args.len() == 1 =>
+            if &*s.name == INV_SYM_STRING && args.len() == 1 =>
             bp_ni_factors(&args[0]),
         _ => vec![t.clone()],
     }
@@ -1419,8 +1430,8 @@ fn non_injective_fact_instances(
     // Resolve node-id → rule via a once-built map instead of a linear
     // `nodes.iter().find` per `i`/`j`.  `or_insert` keeps the FIRST rule
     // for a given id, matching `find`'s first-match semantics.
-    let node_rule_map: std::collections::HashMap<&NodeId, &crate::rule::RuleACInst> = {
-        let mut m = std::collections::HashMap::new();
+    let node_rule_map: tamarin_utils::FastMap<&NodeId, &crate::rule::RuleACInst> = {
+        let mut m = tamarin_utils::FastMap::default();
         for (n, r) in sys.nodes.iter() {
             m.entry(n).or_insert(r);
         }
@@ -1481,7 +1492,7 @@ fn has_sort_conflated_lvars(sys: &System) -> bool {
     let mut visit = |v: &LVar| {
         if *conflict.borrow() { return; }
         let mut s = seen.borrow_mut();
-        let key = (v.name.clone(), v.idx);
+        let key = (v.name.to_string(), v.idx);
         match s.get(&key).copied() {
             None => { s.insert(key, v.sort); }
             Some(prev) if prev == v.sort => {}
@@ -1593,8 +1604,8 @@ fn has_incompatible_edge_facts(sys: &System) -> bool {
     // One node-id → rule map (instead of two linear `nodes.iter().find`
     // scans per edge → O(edges*nodes)).  `or_insert` keeps the FIRST rule
     // for a given id, matching `find`'s first-match semantics.
-    let mut node_rule_map: std::collections::HashMap<&NodeId, &crate::rule::RuleACInst> =
-        std::collections::HashMap::new();
+    let mut node_rule_map: tamarin_utils::FastMap<&NodeId, &crate::rule::RuleACInst> =
+        tamarin_utils::FastMap::default();
     for (id, r) in sys.nodes.iter() {
         node_rule_map.entry(id).or_insert(r);
     }
@@ -1856,7 +1867,7 @@ pub fn subst_creates_non_normal_terms(
         // representations but both in NF.
         let is_nf = tamarin_term::norm::nf_via_haskell(&sig, &t_prime);
         if !is_nf {
-            if std::env::var("TAM_RS_DBG_SUBST_NF").is_ok() {
+            if tamarin_utils::env_gate!("TAM_RS_DBG_SUBST_NF") {
                 eprintln!("[rs-subst-nf] CREATES t={:?} t_prime={:?}", t, t_prime);
             }
             return true;
@@ -1919,7 +1930,7 @@ mod tests {
         use tamarin_term::maude_proc::MaudeHandle;
 
         // Build the rule instances.
-        let inj_tag = FactTag::Proto(Multiplicity::Linear, "Inj".to_string(), 1);
+        let inj_tag = FactTag::Proto(Multiplicity::Linear, "Inj".into(), 1);
         let inj_fact = Fact::new(inj_tag.clone(), vec![msg_var("x", 0)]);
 
         let init: RuleACInst = Rule::new(
@@ -2007,7 +2018,7 @@ mod tests {
         // using "x" at idx 58 but with conflicting sorts: Pub vs Fresh.
         let pub_var = LVar::new("x", LSort::Pub, 58);
         let fresh_var = LVar::new("x", LSort::Fresh, 58);
-        let tag = FactTag::Proto(Multiplicity::Linear, "X".to_string(), 1);
+        let tag = FactTag::Proto(Multiplicity::Linear, "X".into(), 1);
         let pub_term = tamarin_term::term::Term::Lit(
             tamarin_term::vterm::Lit::Var(pub_var.clone()));
         let fresh_term = tamarin_term::term::Term::Lit(
@@ -2015,7 +2026,7 @@ mod tests {
         let mk_rule = |name: &str, t| -> RuleACInst {
             Rule::new(
                 RuleInfo::<ProtoRuleACInstInfo, IntrRuleACInfo>::Proto(ProtoRuleACInstInfo {
-                    name: ProtoRuleName::Stand(name.into()),
+                    name: ProtoRuleName::Stand(tamarin_term::intern::intern_str(name)),
                     attributes: RuleAttributes::empty(),
                     loop_breakers: Vec::new(),
                 }),
@@ -2043,11 +2054,11 @@ mod tests {
         };
         let pub_var = LVar::new("x", LSort::Pub, 58);
         let msg_var = LVar::new("x", LSort::Msg, 58);
-        let tag = FactTag::Proto(Multiplicity::Linear, "X".to_string(), 1);
+        let tag = FactTag::Proto(Multiplicity::Linear, "X".into(), 1);
         let mk = |name: &str, t| -> RuleACInst {
             Rule::new(
                 RuleInfo::<ProtoRuleACInstInfo, IntrRuleACInfo>::Proto(ProtoRuleACInstInfo {
-                    name: ProtoRuleName::Stand(name.into()),
+                    name: ProtoRuleName::Stand(tamarin_term::intern::intern_str(name)),
                     attributes: RuleAttributes::empty(),
                     loop_breakers: Vec::new(),
                 }),

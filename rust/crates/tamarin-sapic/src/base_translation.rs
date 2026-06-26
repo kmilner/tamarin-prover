@@ -844,7 +844,7 @@ fn lvar_to_varspec(v: &LVar) -> tamarin_parser::ast::VarSpec {
         LSort::Nat => p::SortHint::Nat,
         LSort::Msg => p::SortHint::Msg,
     };
-    p::VarSpec { name: v.name.clone(), idx: v.idx, sort, typ: None }
+    p::VarSpec { name: v.name.to_string(), idx: v.idx, sort, typ: None }
 }
 
 /// `LNTerm` → parser-AST `Term` (for the `let` else restriction body).  The
@@ -858,10 +858,10 @@ pub(crate) fn ln_term_to_parser(t: &LNTerm) -> tamarin_parser::ast::Term {
     match t {
         VTerm::Lit(Lit::Var(v)) => p::Term::Var(lvar_to_varspec(v)),
         VTerm::Lit(Lit::Con(n)) => match n.tag {
-            NameTag::Pub => p::Term::PubLit(n.id.0.clone()),
-            NameTag::Fresh => p::Term::FreshLit(n.id.0.clone()),
-            NameTag::Nat => p::Term::NatLit(n.id.0.clone()),
-            NameTag::Node => p::Term::PubLit(n.id.0.clone()),
+            NameTag::Pub => p::Term::PubLit(n.id.0.to_string()),
+            NameTag::Fresh => p::Term::FreshLit(n.id.0.to_string()),
+            NameTag::Nat => p::Term::NatLit(n.id.0.to_string()),
+            NameTag::Node => p::Term::PubLit(n.id.0.to_string()),
         },
         VTerm::App(FunSym::NoEq(sym), args) => {
             let name = String::from_utf8_lossy(&sym.name).to_string();
@@ -899,7 +899,7 @@ fn collect_pair(t: &LNTerm, out: &mut Vec<tamarin_parser::ast::Term>) {
     use tamarin_term::function_symbols::FunSym;
     use tamarin_term::vterm::VTerm;
     if let VTerm::App(FunSym::NoEq(sym), args) = t {
-        if sym.name == b"pair" && args.len() == 2 {
+        if &*sym.name == b"pair" && args.len() == 2 {
             collect_pair(&args[0], out);
             collect_pair(&args[1], out);
             return;
@@ -998,7 +998,7 @@ fn formula_free_lvars(f: &tamarin_parser::ast::Formula) -> BTreeSet<LVar> {
 fn eq_fact(t1: &SapicTerm, t2: &SapicTerm) -> tamarin_theory::fact::LNFact {
     use tamarin_theory::fact::{Fact, FactTag, Multiplicity};
     let terms = vec![to_ln_term(t1), to_ln_term(t2)];
-    Fact::new(FactTag::Proto(Multiplicity::Linear, "Eq".to_string(), 2), terms)
+    Fact::new(FactTag::Proto(Multiplicity::Linear, "Eq".into(), 2), terms)
 }
 
 /// `fromList $ getFactVariables fa` — the set of variables occurring in a fact.

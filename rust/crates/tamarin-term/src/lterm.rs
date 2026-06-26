@@ -76,11 +76,11 @@ pub fn sort_suffix(s: LSort) -> &'static str {
 // =============================================================================
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NameId(pub String);
+pub struct NameId(pub &'static str);
 
 impl NameId {
-    pub fn new(s: impl Into<String>) -> Self { NameId(s.into()) }
-    pub fn as_str(&self) -> &str { &self.0 }
+    pub fn new(s: impl Into<String>) -> Self { NameId(crate::intern::intern_str(&s.into())) }
+    pub fn as_str(&self) -> &str { self.0 }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -157,7 +157,9 @@ pub fn sort_of_name(n: &Name) -> LSort {
 /// `applySource` to bind cleanly.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LVar {
-    pub name: String,
+    /// Interned `&'static str` (see [`crate::intern`]): clone is a pointer
+    /// copy — no alloc, no atomic refcount — and equal names share one copy.
+    pub name: &'static str,
     pub sort: LSort,
     pub idx: u64,
 }
@@ -178,8 +180,8 @@ impl PartialOrd for LVar {
 }
 
 impl LVar {
-    pub fn new(name: impl Into<String>, sort: LSort, idx: u64) -> Self {
-        LVar { name: name.into(), sort, idx }
+    pub fn new(name: impl AsRef<str>, sort: LSort, idx: u64) -> Self {
+        LVar { name: crate::intern::intern_str(name.as_ref()), sort, idx }
     }
 }
 
@@ -198,7 +200,7 @@ pub fn fresh_lvar(
     name: &str,
     sort: LSort,
 ) -> LVar {
-    LVar { name: name.into(), sort, idx: state.fresh_ident(name) }
+    LVar { name: crate::intern::intern_str(name), sort, idx: state.fresh_ident(name) }
 }
 
 // =============================================================================
@@ -224,7 +226,7 @@ pub fn sort_of_lterm<C, F: Fn(&C) -> LSort>(t: &LTerm<C>, sort_of_const: F) -> L
         Term::Lit(Lit::Var(v)) => v.sort,
         Term::App(FunSym::Ac(AcSym::NatPlus), _) => LSort::Nat,
         Term::App(FunSym::NoEq(s), args)
-            if args.is_empty() && s.name == crate::function_symbols::NAT_ONE_SYM_STRING =>
+            if args.is_empty() && &*s.name == crate::function_symbols::NAT_ONE_SYM_STRING =>
         {
             LSort::Nat
         }

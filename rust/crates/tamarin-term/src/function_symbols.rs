@@ -36,7 +36,13 @@ pub enum Constructability {
 /// `(ByteString, (Int, Privacy, Constructability))`.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NoEqSym {
-    pub name: Vec<u8>,
+    /// Interned into a global pool and held as a `&'static [u8]`, so a clone
+    /// is a pointer copy — no heap allocation (unlike owned `Vec`) and no
+    /// atomic refcount (unlike `Arc`, whose refcount was a contention point
+    /// under the parallel proof search) — and equal names share one copy.
+    /// Raw-bytes (`ByteString`) semantics of HS `NoEqSym` are preserved:
+    /// `&[u8]` derefs to its contents, so `Eq`/`Ord`/`Hash` stay content-based.
+    pub name: &'static [u8],
     pub arity: usize,
     pub privacy: Privacy,
     pub constructability: Constructability,
@@ -47,7 +53,7 @@ pub struct NoEqSym {
 impl std::fmt::Debug for NoEqSym {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NoEqSym")
-            .field("name", &String::from_utf8_lossy(&self.name))
+            .field("name", &String::from_utf8_lossy(self.name))
             .field("arity", &self.arity)
             .field("privacy", &self.privacy)
             .field("constructability", &self.constructability)
@@ -57,7 +63,7 @@ impl std::fmt::Debug for NoEqSym {
 
 impl NoEqSym {
     pub fn new(name: impl Into<Vec<u8>>, arity: usize, privacy: Privacy, c: Constructability) -> Self {
-        NoEqSym { name: name.into(), arity, privacy, constructability: c }
+        NoEqSym { name: crate::intern::intern_bytes(&name.into()), arity, privacy, constructability: c }
     }
     pub fn with_destructor(mut self) -> Self {
         self.constructability = Constructability::Destructor;

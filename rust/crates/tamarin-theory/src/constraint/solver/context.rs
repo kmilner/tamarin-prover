@@ -296,7 +296,7 @@ impl ProofContext {
                 orig.cases_set(s.cases_or_empty());
             }
         }
-        if std::env::var("TAM_DBG_SAT_FINAL").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_SAT_FINAL") {
             use crate::constraint::constraints::Goal;
             for src in &self.full_sources {
                 let tag = match &src.goal {
@@ -428,7 +428,7 @@ impl ProofContext {
         // (already done inside `subterm_intruder_rules`) and BEFORE the
         // `special_intruder_rules` append (since HS appends specials
         // separately in `addMessageDeductionRuleVariants`).
-        let dbg_close = std::env::var("TAM_RS_DBG_CLOSE_INTR").is_ok();
+        let dbg_close = tamarin_utils::env_gate!("TAM_RS_DBG_CLOSE_INTR");
         if dbg_close {
             eprintln!("[close_intr] BEFORE: {} intr rules", intruder_rules.len());
             for r in &intruder_rules {
@@ -722,7 +722,7 @@ impl ProofContext {
         let pc_true_subterm = intruder_rules.iter()
             .filter(|r| crate::rule::is_destr_rule_info(&r.info))
             .all(|r| crate::rule::is_subterm_rule_info(&r.info));
-        if std::env::var("TAM_RS_DBG_PC_TRUE_SUBTERM").is_ok() {
+        if tamarin_utils::env_gate!("TAM_RS_DBG_PC_TRUE_SUBTERM") {
             eprintln!("[pc_true_subterm] = {}", pc_true_subterm);
             for r in &intruder_rules {
                 if crate::rule::is_destr_rule_info(&r.info) {

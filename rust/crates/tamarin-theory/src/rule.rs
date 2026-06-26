@@ -203,8 +203,9 @@ impl RuleAttributes {
 pub enum ProtoRuleName {
     /// The reserved `Fresh` rule.
     Fresh,
-    /// A user-defined protocol rule.
-    Stand(String),
+    /// A user-defined protocol rule.  Interned `&'static str` (see
+    /// `tamarin_term::intern`): pointer-copy clone per rule instantiation.
+    Stand(&'static str),
 }
 
 /// `SyntacticLNFormula` from `Theory.Model.Formula`.
@@ -230,7 +231,7 @@ impl ProtoRuleEInfo {
 
     pub fn standard(name: impl Into<String>) -> Self {
         ProtoRuleEInfo {
-            name: ProtoRuleName::Stand(name.into()),
+            name: ProtoRuleName::Stand(tamarin_term::intern::intern_str(&name.into())),
             attributes: RuleAttributes::empty(),
             restrictions: Vec::new(),
         }
@@ -487,7 +488,7 @@ pub fn rule_name_string(
 {
     match &rule.info {
         RuleInfo::Proto(p) => match &p.name {
-            ProtoRuleName::Stand(s) => s.clone(),
+            ProtoRuleName::Stand(s) => s.to_string(),
             ProtoRuleName::Fresh => "FreshRule".to_string(),
         },
         RuleInfo::Intr(i) => match i {
@@ -824,7 +825,7 @@ mod tests {
         let mut seen: Vec<(String, u64)> = Vec::new();
         r.for_each_free(&mut |v| {
             assert_eq!(v.sort, LSort::Msg);
-            seen.push((v.name.clone(), v.idx));
+            seen.push((v.name.to_string(), v.idx));
         });
         assert!(seen.contains(&("a".into(), 0)));
         assert!(seen.contains(&("b".into(), 1)));

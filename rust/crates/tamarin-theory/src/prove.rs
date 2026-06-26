@@ -540,7 +540,7 @@ fn prove_lemma_in_session_mode(
     max_steps: usize,
     auto_prove: bool,
 ) -> Result<ProofNode, ProveError> {
-    let trace = std::env::var("TAM_DBG_PHASE").is_ok();
+    let trace = tamarin_utils::env_gate!("TAM_DBG_PHASE");
     let t_phase: Option<std::time::Instant> =
         if trace { Some(std::time::Instant::now()) } else { None };
 
@@ -587,7 +587,7 @@ fn prove_lemma_in_session_mode(
     // unsaturated cells, so each lemma's `ensure_saturated` populates
     // ITS OWN clone's cells with refinements driven by ITS OWN
     // `typing_assumptions` — no cross-lemma contamination.
-    let mut ctx = if std::env::var("TAM_DBG_SESSION_REBUILD").is_ok() {
+    let mut ctx = if tamarin_utils::env_gate!("TAM_DBG_SESSION_REBUILD") {
         let rules: Vec<OpenProtoRule> = theory.rules().cloned().collect();
         ProofContext::new_with_restrictions_and_pool(
             session.template_ctx.maude.clone(),
@@ -714,7 +714,7 @@ fn prove_lemma_in_session_mode(
     // Lever #3: reuse a previously-computed refined-source set when one
     // exists for this exact `source_key`.  See [`CachedSources`] for why a
     // hit is byte-identical (only delta==0 results are ever cached).
-    let cache_disabled = std::env::var("TAM_RS_NO_SOURCE_CACHE").is_ok();
+    let cache_disabled = tamarin_utils::env_gate!("TAM_RS_NO_SOURCE_CACHE");
     let mut cache_hit = false;
     if will_emit_bare_sorry {
         // Skip the eager saturate + cache entirely — this lemma forces no
@@ -740,7 +740,7 @@ fn prove_lemma_in_session_mode(
         }
     }
     if will_emit_bare_sorry {
-        if std::env::var("TAM_DBG_SAT_COUNTER").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_SAT_COUNTER") {
             eprintln!("[SAT_COUNTER] lemma={} key={:?} (bare-sorry, saturation deferred)",
                 lemma_name, source_key);
         }
@@ -748,7 +748,7 @@ fn prove_lemma_in_session_mode(
         let cnt_before = ctx.maude.fresh_counter_peek();
         ctx.ensure_saturated();
         let delta = ctx.maude.fresh_counter_peek().saturating_sub(cnt_before);
-        if std::env::var("TAM_DBG_SAT_COUNTER").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_SAT_COUNTER") {
             eprintln!("[SAT_COUNTER] lemma={} key={:?} delta={} (computed)",
                 lemma_name, source_key, delta);
         }
@@ -764,12 +764,12 @@ fn prove_lemma_in_session_mode(
                 .entry(source_key)
                 .or_insert(CachedSources { sources: snapshot });
         }
-    } else if std::env::var("TAM_DBG_SAT_COUNTER").is_ok() {
+    } else if tamarin_utils::env_gate!("TAM_DBG_SAT_COUNTER") {
         eprintln!("[SAT_COUNTER] lemma={} key={:?} (cache hit)", lemma_name, source_key);
     }
     if trace { eprintln!("[phase] (session) ensure_saturated dt={:.3}s hit={}",
         t_sat.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64()), cache_hit); }
-    if std::env::var("TAM_RS_DBG_PHASE").is_ok() {
+    if tamarin_utils::env_gate!("TAM_RS_DBG_PHASE") {
         eprintln!("[rs-phase] lemma-proof START");
     }
     let force_induction = lemma.attributes.iter().any(|a| matches!(a,
@@ -867,7 +867,7 @@ pub fn prove_lemma_with_pool_file_heuristic(
     in_file: &str,
     cli_heuristic: &CliHeuristic,
 ) -> Result<ProofNode, ProveError> {
-    let trace = std::env::var("TAM_DBG_PHASE").is_ok();
+    let trace = tamarin_utils::env_gate!("TAM_DBG_PHASE");
     // Per-phase wall-clock instrumentation, gated by TAM_DBG_PHASE.
     // `Option<Instant>` keeps the disabled-path branch-predictable to
     // a single `if let Some(_)` check at each phase boundary.
@@ -1094,10 +1094,10 @@ pub fn prove_lemma_with_pool_file_heuristic(
     // Done` marker for HS↔Rust diffing of just the lemma proof
     // (excludes precompute/saturation).  Gated behind TAM_RS_DBG_PHASE
     // so default --prove stderr stays HS-faithful.
-    if std::env::var("TAM_RS_DBG_PHASE").is_ok() {
+    if tamarin_utils::env_gate!("TAM_RS_DBG_PHASE") {
         eprintln!("[rs-phase] lemma-proof START");
     }
-    if std::env::var("TAM_DBG_LEMMA_INIT").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_LEMMA_INIT") {
         eprintln!("[lemma-init] sys.formulas count = {}", sys.formulas.len());
         for (i, f) in sys.formulas.iter().enumerate() {
             let s = format!("{:?}", f);
@@ -1129,12 +1129,12 @@ pub fn prove_lemma_with_pool_file_heuristic(
     // skeleton or parser couldn't structure it) fall through to the
     // pre-existing auto-prover-from-scratch behavior.
     if let Some(tree) = lemma.proof.tree.clone() {
-        if std::env::var("TAM_DBG_REPLAY").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_REPLAY") {
             eprintln!("[replay] firing skeleton replay for `{}` (raw {} bytes)",
                 lemma_name, lemma.proof.raw.len());
         }
         return Ok(crate::replay::replace_sorry_prove(&ctx, sys, &tree, max_steps));
-    } else if std::env::var("TAM_DBG_REPLAY").is_ok() {
+    } else if tamarin_utils::env_gate!("TAM_DBG_REPLAY") {
         eprintln!("[replay] NO tree on `{}` (raw {} bytes) — falling through to auto-prover",
             lemma_name, lemma.proof.raw.len());
     }
@@ -1194,18 +1194,18 @@ mod tests {
                         c.terms.iter().map(|t| format!("{:?}", t)).collect::<Vec<_>>().join(",")))
                     .collect();
                 eprintln!("{}  node {:?} = {} concs=[{}]", pad,
-                    (id.name.clone(), id.idx), info, concs.join("; "));
+                    (id.name, id.idx), info, concs.join("; "));
             }
             eprintln!("{}  eq_store.subst = {:?}", pad, node.sys.eq_store.subst);
             for la in &node.sys.less_atoms {
                 eprintln!("{}  less {:?} < {:?}", pad,
-                    (la.smaller.name.clone(), la.smaller.idx),
-                    (la.larger.name.clone(), la.larger.idx));
+                    (la.smaller.name, la.smaller.idx),
+                    (la.larger.name, la.larger.idx));
             }
             for e in &node.sys.edges {
                 eprintln!("{}  edge {:?} -> {:?}", pad,
-                    (e.src.0.name.clone(), e.src.0.idx),
-                    (e.tgt.0.name.clone(), e.tgt.0.idx));
+                    (e.src.0.name, e.src.0.idx),
+                    (e.tgt.0.name, e.tgt.0.idx));
             }
         }
         for (k, c) in &node.children {

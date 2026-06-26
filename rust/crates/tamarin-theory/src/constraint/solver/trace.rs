@@ -45,11 +45,28 @@ thread_local! {
         RefCell::new(String::from("unlabeled"));
 }
 
+/// Cached: `true` iff a trace that *consumes* the op-label is enabled.
+///
+/// The op-label is only ever read into output by the `[rs-aes]` trace,
+/// which is gated on `TAM_RS_DBG_APPLY_EQ_STORE` (see `equation_store.rs`,
+/// `aes_dbg()` — the only output consumer of `current_op_label()`).  When
+/// that flag is unset the entire label machinery (`set_op_label` /
+/// `current_op_label` / `OpLabelGuard`) is pure overhead — each guard
+/// clones a thread-local `String` and runs `label.to_string()` — so the
+/// operations below early-return as no-ops.  Byte-safe: when the consuming
+/// flag IS set the label behaves exactly as before; when it is unset the
+/// label is never observed, so skipping the clones changes nothing.
+pub fn op_label_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("TAM_RS_DBG_APPLY_EQ_STORE").is_ok())
+}
+
 /// Set the current operation label.  Callers wrap their apply_eq_store
 /// / add_eqs call sites with `set_op_label` to associate the call with
 /// a semantic name.  Use `OpLabelGuard::new(...)` for scope-based
 /// management so the label restores on drop.
 pub fn set_op_label(label: &str) -> String {
+    if !op_label_enabled() { return String::new(); }
     CURRENT_OP_LABEL.with(|l| {
         let prev = l.borrow().clone();
         *l.borrow_mut() = label.to_string();
@@ -60,6 +77,7 @@ pub fn set_op_label(label: &str) -> String {
 /// Get the current operation label.  Used by apply_eq_store's [rs-aes]
 /// trace to print the site label.
 pub fn current_op_label() -> String {
+    if !op_label_enabled() { return String::new(); }
     CURRENT_OP_LABEL.with(|l| l.borrow().clone())
 }
 
@@ -80,6 +98,9 @@ pub struct OpLabelGuard {
 
 impl OpLabelGuard {
     pub fn new(label: &str) -> Self {
+        // No consuming trace => the label is never read; skip the
+        // thread-local clone + `to_string` entirely (Drop also no-ops).
+        if !op_label_enabled() { return Self { prev: String::new() }; }
         let outer = current_op_label();
         if outer == "unlabeled" {
             let prev = set_op_label(label);
@@ -94,6 +115,7 @@ impl OpLabelGuard {
     /// Force override the label (used by simp passes that prepend to
     /// the outer label, e.g. `simpAbstractFun@<outer>`).
     pub fn force(label: &str) -> Self {
+        if !op_label_enabled() { return Self { prev: String::new() }; }
         let prev = set_op_label(label);
         Self { prev }
     }
@@ -101,6 +123,7 @@ impl OpLabelGuard {
 
 impl Drop for OpLabelGuard {
     fn drop(&mut self) {
+        if !op_label_enabled() { return; }
         let prev = std::mem::take(&mut self.prev);
         CURRENT_OP_LABEL.with(|l| { *l.borrow_mut() = prev; });
     }
@@ -225,6 +248,16 @@ fn term_repr(t: &crate::guarded::GTerm) -> String {
 fn flag() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| std::env::var("TAM_RS_TRACE_EXEC").is_ok())
+}
+
+/// Public view of the cached `TAM_RS_TRACE_EXEC` gate (`flag()`), so
+/// `trace_exec` call sites can skip building their `format!(...)`
+/// argument on the common (untraced) path.  Returns the same cached
+/// `OnceLock<bool>` that `trace_exec` itself checks, so enabling the
+/// trace still produces byte-identical output.
+#[inline]
+pub fn exec_enabled() -> bool {
+    flag()
 }
 
 /// Static-string trace labels that the (private) instrumented Haskell
@@ -593,7 +626,7 @@ pub fn trace_pick(g: &crate::constraint::constraints::Goal) {
     // f-wrapped one first; Rust picks the bare-k#1 one — causing the
     // case_3 over-split.
     if let Goal::Disj(d) = g {
-        if std::env::var("TAM_RS_TRACE_PICK_DISJ").is_ok() {
+        if tamarin_utils::env_gate!("TAM_RS_TRACE_PICK_DISJ") {
             let alts: Vec<String> = d.0.iter().map(guarded_repr).collect();
             eprintln!("[PICK_DISJ] Disj[{}]", alts.join(" || "));
         }
@@ -601,7 +634,7 @@ pub fn trace_pick(g: &crate::constraint::constraints::Goal) {
     // TAM_RS_TRACE_PICK_TERM=1 also emits the full picked-fact term repr
     // for Action/Premise goals.  Used to compare HS↔Rust goal-ranking
     // when [PICK] heads agree but the picked goal-term differs.
-    if std::env::var("TAM_RS_TRACE_PICK_TERM").is_ok() {
+    if tamarin_utils::env_gate!("TAM_RS_TRACE_PICK_TERM") {
         use tamarin_term::pretty::pretty_lnterm;
         let term_repr = match g {
             Goal::Action(_, fa) | Goal::Premise(_, fa) => {
@@ -653,7 +686,7 @@ fn fact_tag_short(t: &crate::fact::FactTag) -> String {
         FactTag::Fresh => "Fr".to_string(),
         FactTag::Out => "Out".to_string(),
         FactTag::In => "In".to_string(),
-        FactTag::Proto(_, name, _) => name.clone(),
+        FactTag::Proto(_, name, _) => name.to_string(),
         _ => "?".to_string(),
     }
 }

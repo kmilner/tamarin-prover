@@ -303,7 +303,7 @@ fn private_constructor_rules(
     let eqs: Vec<(&LNTerm, Vec<u8>)> = st_rules.iter().filter_map(|r| {
         match &r.rhs.term {
             Term::App(FunSym::NoEq(NoEqSym { name, arity: 0, privacy: Privacy::Private, .. }), _) => {
-                Some((&r.lhs, name.clone()))
+                Some((&r.lhs, name.to_vec()))
             }
             _ => None,
         }
@@ -316,7 +316,7 @@ fn private_constructor_rules(
         match t {
             Term::Lit(_) => true,
             Term::App(FunSym::NoEq(NoEqSym { name, privacy: Privacy::Private, .. }), args) => {
-                funs.contains(name) && args.iter().all(|a| contains_no_private_except(funs, a))
+                funs.iter().any(|f| f.as_slice() == &**name) && args.iter().all(|a| contains_no_private_except(funs, a))
             }
             Term::App(_, args) => args.iter().all(|a| contains_no_private_except(funs, a)),
         }

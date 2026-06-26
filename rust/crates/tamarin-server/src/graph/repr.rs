@@ -126,10 +126,10 @@ pub fn rule_name_by_node(n: &GNode) -> Option<String> {
             return Some(match &p.name {
                 ProtoRuleName::Stand(s) => {
                     let reserved = tamarin_theory::rule::reserved_rule_names();
-                    if reserved.contains(s.as_str()) || s.starts_with('_') {
+                    if reserved.contains(s) || s.starts_with('_') {
                         format!("_{s}")
                     } else {
-                        s.clone()
+                        s.to_string()
                     }
                 }
                 ProtoRuleName::Fresh => "Fresh".to_string(),
@@ -405,7 +405,7 @@ mod tests {
         };
         Rule::new(
             RuleInfo::Proto(ProtoRuleACInstInfo {
-                name: ProtoRuleName::Stand(name.to_string()),
+                name: ProtoRuleName::Stand(tamarin_term::intern::intern_str(name)),
                 attributes: attrs,
                 loop_breakers: Vec::new(),
             }),
