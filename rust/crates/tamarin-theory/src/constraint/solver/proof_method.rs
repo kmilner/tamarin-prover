@@ -143,10 +143,10 @@ pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
     if dbg_impl_enabled() {
         let has_i_1 = sys.nodes.iter().any(|(_, r)|
             matches!(&r.info, crate::rule::RuleInfo::Proto(p)
-                if matches!(&p.name, crate::rule::ProtoRuleName::Stand(s) if s == "I_1")));
+                if matches!(&p.name, crate::rule::ProtoRuleName::Stand(s) if *s == "I_1")));
         let has_r_1 = sys.nodes.iter().any(|(_, r)|
             matches!(&r.info, crate::rule::RuleInfo::Proto(p)
-                if matches!(&p.name, crate::rule::ProtoRuleName::Stand(s) if s == "R_1")));
+                if matches!(&p.name, crate::rule::ProtoRuleName::Stand(s) if *s == "R_1")));
         if has_i_1 && has_r_1 {
             let has_bot = sys.formulas.iter()
                 .any(|f| matches!(f, crate::guarded::Guarded::Disj(v) if v.is_empty()));
@@ -393,7 +393,7 @@ pub fn exec_proof_method(
                 let mut s2 = s.clone();
                 crate::constraint::solver::rename_precise::rename_precise_system(
                     &mut s2);
-                s2.eq_store.subst =
+                s2.eq_store_mut().subst =
                     tamarin_term::subst::Subst::from_list(Vec::new());
                 s2
             };
@@ -578,7 +578,7 @@ pub fn exec_proof_method(
                         &mut s);
                     if !s.eq_store.is_false() {
                         s.invalidate_max_var_idx_cache();
-                        s.eq_store.subst =
+                        s.eq_store_mut().subst =
                             tamarin_term::subst::Subst::from_list(Vec::new());
                     }
                     out.push(s);
@@ -874,7 +874,7 @@ pub fn exec_proof_method(
             let cleanup = |s: &mut System| {
                 crate::constraint::solver::rename_precise::rename_precise_system(s);
                 s.invalidate_max_var_idx_cache();
-                s.eq_store.subst =
+                s.eq_store_mut().subst =
                     tamarin_term::subst::Subst::from_list(Vec::new());
             };
             cleanup(&mut br.sys);

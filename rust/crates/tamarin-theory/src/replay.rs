@@ -523,7 +523,7 @@ fn exec_method_for(
     ctx: &ProofContext,
     skel_children: &[(String, ParsedProofTree)],
 ) -> Option<(ProofMethod, Vec<(String, System)>)> {
-    let dbg = std::env::var("TAM_DBG_REPLAY").is_ok();
+    let dbg = tamarin_utils::env_gate!("TAM_DBG_REPLAY");
     // Fast path: parsed method resolves directly.
     if let Some(method) = resolve_method(parsed, sys) {
         if let Some(cases) = exec_proof_method(ctx, &method, sys) {
@@ -856,7 +856,7 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
             by_struct.iter().copied()
                 .find(|g| match g {
                     Goal::Action(i, _) =>
-                        &i.name == time_var && i.idx == *time_idx as u64,
+                        *i.name == **time_var && i.idx == *time_idx as u64,
                     _ => false,
                 })
                 .cloned()
@@ -914,7 +914,7 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
             by_struct.iter().copied()
                 .find(|g| match g {
                     Goal::Premise((node, _), _) =>
-                        &node.name == time_var && node.idx == *time_idx as u64,
+                        *node.name == **time_var && node.idx == *time_idx as u64,
                     _ => false,
                 })
                 .cloned()
@@ -972,7 +972,7 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
             // normalization the parser applied (whitespace + `#`
             // stripped).
             if !shape_matches.is_empty() {
-                let dbg = std::env::var("TAM_RS_DBG_MATCH_GOAL_DISJ").is_ok();
+                let dbg = tamarin_utils::env_gate!("TAM_RS_DBG_MATCH_GOAL_DISJ");
                 if dbg {
                     let path = crate::constraint::solver::trace::case_path_string();
                     eprintln!("[MATCH_GOAL_DISJ] path={} shape_matches={} skel.alt_texts={:?}",
@@ -1026,8 +1026,8 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
                 .filter(|(_, st)| !st.solved)
                 .filter_map(|(g, _)| match g {
                     Goal::Chain((src, c), (tgt, p)) => {
-                        if &src.name == want_src
-                            && &tgt.name == want_tgt
+                        if *src.name == **want_src
+                            && *tgt.name == **want_tgt
                             && c.0 == want_c
                             && p.0 == want_p
                         {
@@ -1438,8 +1438,8 @@ mod tests {
         };
         let matched = match_goal(&spec, &sys).expect("should match");
         match matched {
-            Goal::Action(i, _) => assert_eq!(i.name, "t2",
-                "matcher must pick the goal whose timepoint LVar == (time_var, time_idx)"),
+            Goal::Action(i, _) => assert_eq!(&*i.name, "t2",
+                "matcher must pick the goal whose timepoint LVar.name == time_var"),
             other => panic!("expected Action, got {:?}", other),
         }
         // And with the t1 goal's full LVar `#t1.5` we get the other goal.
@@ -1458,7 +1458,7 @@ mod tests {
         };
         let matched2 = match_goal(&spec2, &sys).expect("should match");
         match matched2 {
-            Goal::Action(i, _) => assert_eq!(i.name, "t1"),
+            Goal::Action(i, _) => assert_eq!(&*i.name, "t1"),
             other => panic!("expected Action, got {:?}", other),
         }
         // A drifted idx (stored `#t2.9`, runtime `#t2.7`) is an `M.member`
@@ -1505,7 +1505,7 @@ mod tests {
         };
         let matched = match_goal(&spec, &sys).expect("should match");
         match matched {
-            Goal::Premise((node, _), _) => assert_eq!(node.name, "v"),
+            Goal::Premise((node, _), _) => assert_eq!(&*node.name, "v"),
             other => panic!("expected Premise, got {:?}", other),
         }
     }

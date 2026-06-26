@@ -271,7 +271,7 @@ fn compress(
     mut compressed_facts: BTreeSet<LNFact>,
     mut msr: Vec<ERule>,
 ) -> Vec<ERule> {
-    let dbg = std::env::var("TAM_COMPRESS_DBG").is_ok();
+    let dbg = tamarin_utils::env_gate!("TAM_COMPRESS_DBG");
     while !worklist.is_empty() {
         let fact = worklist.remove(0);
         let remainder = worklist; // the tail
@@ -281,8 +281,8 @@ fn compress(
                 tamarin_theory::fact::fact_tag_name(&fact.tag),
                 msr.iter()
                     .map(|r| match &r.info.name {
-                        ProtoRuleName::Stand(n) => n.clone(),
-                        _ => "?".into(),
+                        ProtoRuleName::Stand(n) => n.to_string(),
+                        _ => "?".to_string(),
                     })
                     .collect::<Vec<_>>()
                     .join(", "),
@@ -317,7 +317,7 @@ fn compress(
 pub fn path_compression(comp_events: bool, msr: Vec<ERule>) -> Vec<ERule> {
     // `initfact = factToFact (State LState [] S.empty)` = `State_( )`, arity 0.
     let initfact: LNFact = LNFact::new(
-        FactTag::Proto(Multiplicity::Linear, "State_".to_string(), 0),
+        FactTag::Proto(Multiplicity::Linear, "State_".into(), 0),
         vec![],
     );
     let compressed = compress(comp_events, vec![initfact], BTreeSet::new(), msr);

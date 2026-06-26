@@ -164,16 +164,16 @@ impl<'ctx> Reduction<'ctx> {
             false
         };
         let flipped_eq = if !self.sys.eq_store.is_false() {
-            let s = std::mem::take(&mut self.sys.eq_store);
+            let s = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut self.sys.eq_store));
             self.sys.invalidate_max_var_idx_cache();
-            self.sys.eq_store = s.set_false();
+            self.sys.eq_store = std::sync::Arc::new(s.set_false());
             true
         } else {
             false
         };
         if added_bot || flipped_eq {
             self.changed = ChangeIndicator::Changed;
-            if std::env::var("TAM_TRACE_CONTRADICTION").is_ok() {
+            if tamarin_utils::env_gate!("TAM_TRACE_CONTRADICTION") {
                 let open = self.sys.goals.iter().filter(|(_, st)| !st.solved).count();
                 let bt = std::backtrace::Backtrace::force_capture();
                 let bt_s = format!("{bt}");
@@ -206,7 +206,7 @@ impl<'ctx> Reduction<'ctx> {
             }
             // HS-equivalent compact dump matching [CONTRA-DUMP] format
             // for one-to-one comparison with HS noContradictoryEqStore.
-            if std::env::var("TAM_RS_TRACE_CONTRA_DUMP").is_ok() {
+            if tamarin_utils::env_gate!("TAM_RS_TRACE_CONTRA_DUMP") {
                 eprintln!(
                     "[CONTRA-DUMP] label=mark_contradictory nodes={} edges={} formulas={} goals={}",
                     self.sys.nodes.len(),
@@ -216,7 +216,7 @@ impl<'ctx> Reduction<'ctx> {
                 );
             }
             // Path-aware compact dump — pair with TAM_TRACE_SET_FALSE_FULL.
-            if std::env::var("TAM_TRACE_MARK_CONTRA").is_ok() {
+            if tamarin_utils::env_gate!("TAM_TRACE_MARK_CONTRA") {
                 let bt = std::backtrace::Backtrace::force_capture();
                 let bt_s = format!("{bt}");
                 let frames: Vec<&str> = bt_s.lines()
@@ -261,7 +261,7 @@ impl<'ctx> Reduction<'ctx> {
     pub fn insert_edge_labeled(&mut self, site: &str, e: Edge)
         -> Result<SolveOutcome, crate::tools::equation_store::AddEqsError>
     {
-        if std::env::var("TAM_RS_TRACE_INSERT_EDGE").is_ok() {
+        if tamarin_utils::env_gate!("TAM_RS_TRACE_INSERT_EDGE") {
             let mode = if crate::constraint::solver::sources::in_precompute_mode() {
                 "saturate" } else { "runtime" };
             eprintln!("[INSERT_EDGE] enter site={} mode={} src={:?} tgt={:?} eqIsFalse={}",
@@ -300,7 +300,7 @@ impl<'ctx> Reduction<'ctx> {
         // Mirrors `noContradictoryEqStore` (Reduction.hs:703-704):
         // mzero-equivalent if eq_store becomes false.
         if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
-            if std::env::var("TAM_RS_TRACE_INSERT_EDGE_FIRE").is_ok() {
+            if tamarin_utils::env_gate!("TAM_RS_TRACE_INSERT_EDGE_FIRE") {
                 let mode = if crate::constraint::solver::sources::in_precompute_mode() {
                     "saturate" } else { "runtime" };
                 eprintln!("[INSERT_EDGE_FIRE] site={} mode={}", site, mode);
@@ -328,7 +328,7 @@ impl<'ctx> Reduction<'ctx> {
         fa_conc: &crate::fact::LNFact,
         fa_prem: &crate::fact::LNFact,
     ) -> Result<SolveOutcome, crate::tools::equation_store::AddEqsError> {
-        if std::env::var("TAM_RS_TRACE_INSERT_EDGE").is_ok() {
+        if tamarin_utils::env_gate!("TAM_RS_TRACE_INSERT_EDGE") {
             let mode = if crate::constraint::solver::sources::in_precompute_mode() {
                 "saturate" } else { "runtime" };
             eprintln!("[INSERT_EDGE] enter site={} mode={} src={:?} tgt={:?} eqIsFalse={}",
@@ -380,7 +380,7 @@ impl<'ctx> Reduction<'ctx> {
                 Ok(SolveOutcome::Linear(ChangeIndicator::Unchanged))
             }
             Some(j) => {
-                if std::env::var("TAM_DBG_INSERT_LAST").is_ok() {
+                if tamarin_utils::env_gate!("TAM_DBG_INSERT_LAST") {
                     eprintln!("[insert_last] existing={:?} new={:?} → eq", j, i);
                 }
                 let res = self.solve_node_id_eqs(&[
@@ -501,8 +501,8 @@ impl<'ctx> Reduction<'ctx> {
         nodes.sort_by(|a, b| a.0.cmp(&b.0));
         let mut new_nodes: Vec<(crate::constraint::constraints::NodeId, RuleACInst)>
             = Vec::with_capacity(nodes.len());
-        let mut id_to_index: std::collections::HashMap<crate::constraint::constraints::NodeId, usize>
-            = std::collections::HashMap::new();
+        let mut id_to_index: tamarin_utils::FastMap<crate::constraint::constraints::NodeId, usize>
+            = tamarin_utils::FastMap::default();
         // Accumulate fact-eqs split by component so we can flatten them in
         // Haskell `solveRuleEqs` order: ALL conclusions (across every colliding
         // node), THEN all premises, THEN all actions
@@ -551,7 +551,7 @@ impl<'ctx> Reduction<'ctx> {
                     .collect(),
             }
         };
-        let dbg_set_nodes = std::env::var("TAM_DBG_SET_NODES").is_ok();
+        let dbg_set_nodes = tamarin_utils::env_gate!("TAM_DBG_SET_NODES");
         let nodes_in = nodes.len();
         let mut collisions = 0usize;
         let mut shape_mm = 0usize;
@@ -579,7 +579,7 @@ impl<'ctx> Reduction<'ctx> {
         for (id, rule) in nodes {
             let id_orig = id.clone();
             let new_id = map_var(id);
-            if std::env::var("TAM_DBG_SUBST_NODE_RENAME").is_ok() && new_id != id_orig {
+            if tamarin_utils::env_gate!("TAM_DBG_SUBST_NODE_RENAME") && new_id != id_orig {
                 let path = crate::constraint::solver::trace::case_path_string();
                 let rule_name = rule_case_name(&rule);
                 eprintln!("[subst_node_rename] path={} {}.{} → {}.{}  rule={}",
@@ -590,7 +590,7 @@ impl<'ctx> Reduction<'ctx> {
             id_renamed_nodes.push((new_id, rule));
         }
         // Pass 1b: dedupe by new_id, detecting collisions on RAW rules.
-        let dbg_shape = std::env::var("TAM_DBG_SHAPE_MM").is_ok();
+        let dbg_shape = tamarin_utils::env_gate!("TAM_DBG_SHAPE_MM");
         for (new_id, rule) in id_renamed_nodes {
             match id_to_index.get(&new_id).copied() {
                 Some(i) => {
@@ -688,9 +688,9 @@ impl<'ctx> Reduction<'ctx> {
             // disappears from `runReduction`'s Disj.  Setting is_false
             // here matches that shape on the SolveGoal proof-tree filter.
             if !self.sys.eq_store.is_false() {
-                let s = std::mem::take(&mut self.sys.eq_store);
+                let s = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut self.sys.eq_store));
                 self.sys.invalidate_max_var_idx_cache();
-                self.sys.eq_store = s.set_false();
+                self.sys.eq_store = std::sync::Arc::new(s.set_false());
                 self.changed = ChangeIndicator::Changed;
             }
         }
@@ -1052,7 +1052,7 @@ impl<'ctx> Reduction<'ctx> {
         // we.  (`apply_term`'s normalise path is only used when the
         // eager-normalise env var is set; HS-default is non-normalising.)
         let mut changed_sst = false;
-        let pos_subs = std::mem::take(&mut self.sys.subterm_store.subterms);
+        let pos_subs = std::mem::take(&mut self.sys.subterm_store_mut().subterms);
         let mut new_subs = Vec::with_capacity(pos_subs.len());
         for c in pos_subs {
             let new_small = tamarin_term::subst::apply_vterm(&subst, c.small.clone());
@@ -1066,7 +1066,7 @@ impl<'ctx> Reduction<'ctx> {
                 propagated: c.propagated,
             });
         }
-        let solved = std::mem::take(&mut self.sys.subterm_store.solved_subterms);
+        let solved = std::mem::take(&mut self.sys.subterm_store_mut().solved_subterms);
         let mut new_solved = Vec::with_capacity(solved.len());
         for c in solved {
             let new_small = tamarin_term::subst::apply_vterm(&subst, c.small.clone());
@@ -1084,7 +1084,7 @@ impl<'ctx> Reduction<'ctx> {
         // (field `e`) do NOT — this is what re-arms the simpSplitNegSt
         // change-detection (`negSubterms \ oldNegSubterms`) after a
         // substitution alters a stored negative subterm.
-        let negs = std::mem::take(&mut self.sys.subterm_store.neg_subterms);
+        let negs = std::mem::take(&mut self.sys.subterm_store_mut().neg_subterms);
         let mut new_negs: Vec<(tamarin_term::lterm::LNTerm, tamarin_term::lterm::LNTerm)> =
             Vec::with_capacity(negs.len());
         for (s, t) in negs {
@@ -1097,9 +1097,9 @@ impl<'ctx> Reduction<'ctx> {
             if !new_negs.contains(&pair) { new_negs.push(pair); }
         }
         new_negs.sort();
-        self.sys.subterm_store.subterms = new_subs;
-        self.sys.subterm_store.solved_subterms = new_solved;
-        self.sys.subterm_store.neg_subterms = new_negs;
+        self.sys.subterm_store_mut().subterms = new_subs;
+        self.sys.subterm_store_mut().solved_subterms = new_solved;
+        self.sys.subterm_store_mut().neg_subterms = new_negs;
         if changed_sst {
             self.sys.invalidate_max_var_idx_cache();
             self.changed = ChangeIndicator::Changed;
@@ -1110,7 +1110,7 @@ impl<'ctx> Reduction<'ctx> {
         //    to the eq-store; if so we won't recurse here — the next
         //    simplify-loop iteration will pick them up.
         if !rule_eqs.is_empty() {
-            if std::env::var("TAM_DBG_SUBST_RULE_EQS").is_ok() {
+            if tamarin_utils::env_gate!("TAM_DBG_SUBST_RULE_EQS") {
                 let path = crate::constraint::solver::trace::case_path_string();
                 eprintln!("[subst_rule_eqs] path={} queueing {} rule_eqs from setNodes-style collision",
                     path, rule_eqs.len());
@@ -1160,7 +1160,7 @@ impl<'ctx> Reduction<'ctx> {
             // fails on same-tag facts with incompatible terms, e.g.
             // !Key(~k) = !Key(some_other_term)).
             let res = self.solve_fact_eqs(SplitStrategy::SplitLater, &safe_eqs);
-            if std::env::var("TAM_DBG_SUBST_RULE_EQS").is_ok() {
+            if tamarin_utils::env_gate!("TAM_DBG_SUBST_RULE_EQS") {
                 eprintln!("[subst_rule_eqs] solve_fact_eqs returned: {:?}",
                     res.as_ref().map(|o| match o {
                         SolveOutcome::Linear(_) => "Linear",
@@ -1207,20 +1207,20 @@ impl<'ctx> Reduction<'ctx> {
             Some(v) if !v.is_empty() => v,
             _ => return false,
         };
-        if std::env::var("TAM_RS_DBG_SOLVE_RULE_CONSTRAINTS").is_ok() {
+        if tamarin_utils::env_gate!("TAM_RS_DBG_SOLVE_RULE_CONSTRAINTS") {
             eprintln!("[RS_SOLVE_RULE_CONSTRAINTS] n_substs={}", substs.len());
         }
         // Haskell `addRuleVariants` errors if domain of variants
         // intersects with eq-store free subst — that case isn't
         // supported there either. We don't enforce it; the worst case
         // is a redundant SplitG entry that simplify will discharge.
-        if std::env::var("TAM_DBG_VS_DUMP").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_VS_DUMP") {
             let path = crate::constraint::solver::trace::case_path_string();
             eprintln!("[vs-dump] path={} solve_rule_constraints: {} substs", path, substs.len());
             for (i, s) in substs.iter().enumerate() {
                 let pairs: Vec<String> = s.to_list().iter()
                     .map(|(k, v)| {
-                        let trunc = if std::env::var("TAM_DBG_VS_DUMP_FULL").is_ok() { 500 } else { 120 };
+                        let trunc = if tamarin_utils::env_gate!("TAM_DBG_VS_DUMP_FULL") { 500 } else { 120 };
                         format!("{:?}→{:?}", k, v).chars().take(trunc).collect::<String>()
                     })
                     .collect();
@@ -1233,7 +1233,7 @@ impl<'ctx> Reduction<'ctx> {
                     "solveRuleConstraints", s);
             }
         }
-        let id = self.sys.eq_store.add_disj(substs);
+        let id = self.sys.eq_store_mut().add_disj(substs);
         // HS-faithful order (Reduction.hs:766-774): `solveRuleConstraints
         // (Just eqConstr)` is
         //   (eqs, splitId) <- addRuleVariants eqConstr <$> getM sEqStore
@@ -1284,14 +1284,14 @@ impl<'ctx> Reduction<'ctx> {
             }
             if let Some(la) = &self.sys.last_atom { la.for_each_free(&mut visit); }
             let maude = self.maude.clone();
-            let store = std::mem::take(&mut self.sys.eq_store);
+            let store = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut self.sys.eq_store));
             self.sys.invalidate_max_var_idx_cache();
-            self.sys.eq_store = store.simp_with_fresh_avoiding(
+            self.sys.eq_store = std::sync::Arc::new(store.simp_with_fresh_avoiding(
                 |_, _| false,
                 |n| maude.reserve_idxs(n),
                 &sys_vars,
                 Some(&maude),
-            );
+            ));
             // eq_store simp can rewrite/drop subst entries → max may lower.
             self.sys.invalidate_max_var_idx_cache();
             // Check if our disj was folded (singleton case).  HS leaves
@@ -1331,10 +1331,10 @@ impl<'ctx> Reduction<'ctx> {
         // `exploitPrems rule=X` trace never emits for rules whose
         // variants conflict with the live state.
         let contra = self.sys.eq_store.is_false();
-        if std::env::var("TAM_DBG_VARIANT_CONTRA").is_ok() && contra {
+        if tamarin_utils::env_gate!("TAM_DBG_VARIANT_CONTRA") && contra {
             eprintln!("[variant_contra] solve_rule_constraints contradiction fired");
         }
-        if std::env::var("TAM_DBG_VS_POST").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_VS_POST") {
             for (id, ru) in self.sys.nodes.iter() {
                 let nm = crate::constraint::solver::reduction::rule_case_name(ru);
                 if nm == "Serv_1" {
@@ -1379,11 +1379,11 @@ impl<'ctx> Reduction<'ctx> {
     /// `gsLoopBreaker` in the resulting status — used by the smart
     /// ranker to deprioritise premises that would otherwise loop.
     pub fn insert_goal_with_loop_flag(&mut self, g: Goal, looping: bool) {
-        if std::env::var("TAM_DBG_PANIC_GOAL_IDX0").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_PANIC_GOAL_IDX0") {
             use tamarin_term::lterm::HasFrees;
             let mut found_idx0: Option<tamarin_term::lterm::LVar> = None;
             if let Goal::Action(_, fa) = &g { fa.for_each_free(&mut |v| {
-                if v.idx == 0 && matches!(v.name.as_str(),
+                if v.idx == 0 && matches!(&*v.name,
                     "ni" | "nr" | "m1" | "m2" | "s" | "R" | "ltkA" | "ltkI")
                     && found_idx0.is_none() {
                     found_idx0 = Some(v.clone());
@@ -1442,7 +1442,7 @@ impl<'ctx> Reduction<'ctx> {
                             // path (`ku_decomp_subterms`) derives the index from
                             // `max(bm, outer.idx)+1` and does NOT advance the
                             // counter, unlike HS `freshLVar`.
-                            if std::env::var("TAM_RS_TRACE_VK_CREATE").is_ok() {
+                            if tamarin_utils::env_gate!("TAM_RS_TRACE_VK_CREATE") {
                                 let path = crate::constraint::solver::trace::case_path_string();
                                 eprintln!("[RS_VK_CREATE] path={} site=ku_decomp_subterms vk.{} cnt={} bm={}",
                                     path, next_idx, self.maude.fresh_counter_peek(), bounds_max(&self.sys));
@@ -1575,12 +1575,12 @@ impl<'ctx> Reduction<'ctx> {
                         let mut it = arms.into_iter();
                         if let Some(first) = it.next() {
                             self.sys.invalidate_max_var_idx_cache();
-                            self.sys.eq_store = first;
+                            self.sys.eq_store = std::sync::Arc::new(first);
                         }
                         for rest in it {
                             self.pending_eq_arms.push(rest);
                         }
-                        if std::env::var("TAM_RS_DBG_INSERT_ATOM_EQ_FANOUT").is_ok() {
+                        if tamarin_utils::env_gate!("TAM_RS_DBG_INSERT_ATOM_EQ_FANOUT") {
                             eprintln!("[insert_atom_eq_fanout] stashed {} extra arms",
                                 self.pending_eq_arms.len());
                         }
@@ -1618,7 +1618,7 @@ impl<'ctx> Reduction<'ctx> {
                     crate::elaborate::term_to_lnterm(b),
                 ) else { return false; };
                 self.sys.invalidate_max_var_idx_cache();
-                self.sys.subterm_store.add(ts, tb);
+                self.sys.subterm_store_mut().add(ts, tb);
                 self.changed = ChangeIndicator::Changed;
                 true
             }
@@ -1643,7 +1643,7 @@ impl<'ctx> Reduction<'ctx> {
     }
 
     fn insert_formula_inner(&mut self, g: Guarded, mark: bool) {
-        if std::env::var("TAM_DBG_INSERT_FORM").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_INSERT_FORM") {
             let head = match &g {
                 Guarded::Atom(_) => "Atom",
                 Guarded::Conj(_) => "Conj",
@@ -1769,13 +1769,13 @@ impl<'ctx> Reduction<'ctx> {
                         mark,
                         crate::constraint::solver::trace::guarded_repr(&outer));
                 }
-                if std::env::var("TAM_DBG_EX_DECOMP").is_ok() {
+                if tamarin_utils::env_gate!("TAM_DBG_EX_DECOMP") {
                     eprintln!("[EX-DECOMP] ENTER mark={} vars={:?}",
                         mark,
                         vars.iter().map(|b| (b.name.clone(), b.sort)).collect::<Vec<_>>());
                 }
                 if self.sys.solved_formulas.contains(&outer) {
-                    if std::env::var("TAM_DBG_EX_DECOMP").is_ok() {
+                    if tamarin_utils::env_gate!("TAM_DBG_EX_DECOMP") {
                         eprintln!("[EX-DECOMP] SKIP (already solved) vars={:?}",
                             vars.iter().map(|b| (b.name.clone(), b.sort)).collect::<Vec<_>>());
                     }
@@ -1796,7 +1796,7 @@ impl<'ctx> Reduction<'ctx> {
                         typ: None,
                     })
                     .collect();
-                if std::env::var("TAM_DBG_EX_DECOMP").is_ok() {
+                if tamarin_utils::env_gate!("TAM_DBG_EX_DECOMP") {
                     eprintln!("[EX-DECOMP] FIRE avoid_max={} base={} xs={:?}",
                         avoid_max, base,
                         xs.iter().map(|v| (v.name.clone(), v.idx)).collect::<Vec<_>>());
@@ -1940,7 +1940,7 @@ impl<'ctx> Reduction<'ctx> {
                         };
                         let last_term = tamarin_parser::ast::Term::Var(
                             tamarin_parser::ast::VarSpec {
-                                name: last_node.name.clone(),
+                                name: last_node.name.to_string(),
                                 idx: last_node.idx,
                                 sort: tamarin_parser::ast::SortHint::Node,
                                 typ: None,
@@ -1974,7 +1974,7 @@ impl<'ctx> Reduction<'ctx> {
                             crate::elaborate::term_to_lnterm(b),
                         ) {
                             self.sys.invalidate_max_var_idx_cache();
-                            if self.sys.subterm_store.add_neg(ts, tb) {
+                            if self.sys.subterm_store_mut().add_neg(ts, tb) {
                                 self.changed = ChangeIndicator::Changed;
                             }
                         } else if !self.sys.formulas.contains(&g) {
@@ -2153,7 +2153,7 @@ impl<'ctx> Reduction<'ctx> {
         // equation count, and the equations.  Pair with HS's
         // TAM_HS_DBG_SOLVE_TERM_EQS for HS↔Rust diffing of the
         // goal-by-goal solver flow (see [[project-apply-eq-store-divergence]]).
-        if std::env::var("TAM_RS_DBG_SOLVE_TERM_EQS").is_ok() {
+        if tamarin_utils::env_gate!("TAM_RS_DBG_SOLVE_TERM_EQS") {
             let loc = std::panic::Location::caller();
             let site = format!("{}:{}", loc.file(), loc.line());
             if pending.is_empty() {
@@ -2186,7 +2186,7 @@ impl<'ctx> Reduction<'ctx> {
         // attributes calls to solveTermEqs (matches HS's
         // `addEqsLabeled "solveTermEqs"` site naming).
         let _op_guard = crate::constraint::solver::trace::OpLabelGuard::new("solveTermEqs");
-        let split = self.sys.eq_store.add_eqs_with_avoid(&maude, &pending, avoid)?;
+        let split = self.sys.eq_store_mut().add_eqs_with_avoid(&maude, &pending, avoid)?;
         // Run simp with substCreatesNonNormalTerms as the is_contr
         // predicate.  Without it, SplitG variants that would
         // introduce non-normal terms (e.g. verify=sign(...)) aren't
@@ -2240,7 +2240,7 @@ impl<'ctx> Reduction<'ctx> {
             }
             s
         };
-        let store = std::mem::take(&mut self.sys.eq_store);
+        let store = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut self.sys.eq_store));
         // Use `simp_with_fresh_avoiding` so singleton SplitG disjunctions
         // get folded into `subst` via `simp_singleton`.  Haskell's `simp`
         // (EquationStore.hs:361) calls `simpSingleton` as part of the
@@ -2312,7 +2312,7 @@ impl<'ctx> Reduction<'ctx> {
                     if simped.is_false() { continue; }
                     live_arms.push(simped);
                 }
-                if std::env::var("TAM_RS_DBG_STE_RAW").is_ok() {
+                if tamarin_utils::env_gate!("TAM_RS_DBG_STE_RAW") {
                     let loc = std::panic::Location::caller();
                     eprintln!("[STE_RAW] raw={} live={} site={}:{} pending_eqs={}",
                         raw_count, live_arms.len(), loc.file(), loc.line(),
@@ -2324,8 +2324,8 @@ impl<'ctx> Reduction<'ctx> {
                     // checks see it (mirrors HS noContradictoryEqStore
                     // firing mzero on every arm).
                     self.sys.invalidate_max_var_idx_cache();
-                    self.sys.eq_store = crate::tools::equation_store::EquationStore::default()
-                        .set_false();
+                    self.sys.eq_store = std::sync::Arc::new(crate::tools::equation_store::EquationStore::default()
+                        .set_false());
                     return Ok(SolveOutcome::Contradictory);
                 }
                 self.changed = ChangeIndicator::Changed;
@@ -2334,10 +2334,10 @@ impl<'ctx> Reduction<'ctx> {
                     // eq_store and return Linear (no caller-side fork
                     // needed).
                     self.sys.invalidate_max_var_idx_cache();
-                    self.sys.eq_store = live_arms.into_iter().next().unwrap();
+                    self.sys.eq_store = std::sync::Arc::new(live_arms.into_iter().next().unwrap());
                     Ok(SolveOutcome::Linear(ChangeIndicator::Changed))
                 } else {
-                    if std::env::var("TAM_RS_DBG_STE_MULTI").is_ok() {
+                    if tamarin_utils::env_gate!("TAM_RS_DBG_STE_MULTI") {
                         let loc = std::panic::Location::caller();
                         eprintln!("[STE_MULTI] arms={} site={}:{} pending_eqs={}",
                             live_arms.len(), loc.file(), loc.line(), pending.len());
@@ -2348,7 +2348,7 @@ impl<'ctx> Reduction<'ctx> {
             (Some(id), SplitStrategy::SplitLater) => {
                 // No split fanout — simp once on the combined store.
                 self.sys.invalidate_max_var_idx_cache();
-                self.sys.eq_store = do_simp(store);
+                self.sys.eq_store = std::sync::Arc::new(do_simp(store));
                 if self.sys.eq_store.is_false() {
                     return Ok(SolveOutcome::Contradictory);
                 }
@@ -2359,7 +2359,7 @@ impl<'ctx> Reduction<'ctx> {
             (None, _) => {
                 // No split — simp once.
                 self.sys.invalidate_max_var_idx_cache();
-                self.sys.eq_store = do_simp(store);
+                self.sys.eq_store = std::sync::Arc::new(do_simp(store));
                 if self.sys.eq_store.is_false() {
                     return Ok(SolveOutcome::Contradictory);
                 }
@@ -2376,7 +2376,7 @@ impl<'ctx> Reduction<'ctx> {
     ) -> Result<SolveOutcome, crate::tools::equation_store::AddEqsError> {
         use tamarin_term::term::Term;
         use tamarin_term::vterm::Lit;
-        if std::env::var("TAM_DBG_NODE_EQS").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_NODE_EQS") {
             for e in eqs {
                 eprintln!("[node_eqs] {:?} = {:?}", e.lhs, e.rhs);
             }
@@ -2421,9 +2421,9 @@ impl<'ctx> Reduction<'ctx> {
                 // our result.  Mirrors Haskell's `contradictoryIf`
                 // (Reduction.hs:745) firing mzero on tag mismatch.
                 if !self.sys.eq_store.is_false() {
-                    let s = std::mem::take(&mut self.sys.eq_store);
+                    let s = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut self.sys.eq_store));
                     self.sys.invalidate_max_var_idx_cache();
-                    self.sys.eq_store = s.set_false();
+                    self.sys.eq_store = std::sync::Arc::new(s.set_false());
                 }
                 return Ok(SolveOutcome::Contradictory);
             }
@@ -2462,9 +2462,9 @@ impl<'ctx> Reduction<'ctx> {
         for e in eqs {
             if e.lhs.info != e.rhs.info {
                 if !self.sys.eq_store.is_false() {
-                    let s = std::mem::take(&mut self.sys.eq_store);
+                    let s = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut self.sys.eq_store));
                     self.sys.invalidate_max_var_idx_cache();
-                    self.sys.eq_store = s.set_false();
+                    self.sys.eq_store = std::sync::Arc::new(s.set_false());
                 }
                 return Ok(SolveOutcome::Contradictory);
             }
@@ -2571,7 +2571,7 @@ impl<'ctx> Reduction<'ctx> {
     {
         crate::state_trace::emit("conjoin_in", None, &self.sys);
         crate::state_trace::emit("conjoin_with", None, sys);
-        if std::env::var("TAM_RS_TRACE_CONJOIN").is_ok() {
+        if tamarin_utils::env_gate!("TAM_RS_TRACE_CONJOIN") {
             let path = crate::constraint::solver::trace::case_path_string();
             let live_fresh: Vec<String> = self.sys.nodes.iter()
                 .filter(|(_, r)| matches!(&r.info,
@@ -2743,7 +2743,7 @@ impl<'ctx> Reduction<'ctx> {
         let mut new_split_ids: Vec<crate::tools::equation_store::SplitId> = Vec::new();
         for disj in &sys.eq_store.conj {
             // TAM_DBG_CONJOIN_DISJ=1: dump each disj being added.
-            if std::env::var("TAM_DBG_CONJOIN_DISJ").is_ok() {
+            if tamarin_utils::env_gate!("TAM_DBG_CONJOIN_DISJ") {
                 for (j, s) in disj.substs.iter().enumerate() {
                     let pairs: Vec<String> = s.to_list().iter()
                         .map(|(k, v)| format!("{}.{}/{:?}→{:?}", k.name, k.idx, k.sort,
@@ -2759,13 +2759,13 @@ impl<'ctx> Reduction<'ctx> {
                         "conjoinSystem", s);
                 }
             }
-            let id = self.sys.eq_store.add_disj(disj.substs.clone());
+            let id = self.sys.eq_store_mut().add_disj(disj.substs.clone());
             new_split_ids.push(id);
         }
         // 10. conjoinSubtermStores — HS-faithful (SubtermStore.hs:108).
         // Mirrors HS `modM sSubtermStore (conjoinSubtermStores (get sSubtermStore sys))`
         // at Reduction.hs:698.
-        self.sys.subterm_store.conjoin(&sys.subterm_store);
+        self.sys.subterm_store_mut().conjoin(&sys.subterm_store);
         // 11. insertGoal(SplitG) for each new split-id.
         for id in new_split_ids {
             self.insert_goal(crate::constraint::constraints::Goal::Split(id));
@@ -2797,7 +2797,7 @@ impl<'ctx> Reduction<'ctx> {
         let conjoin_fanout_enabled = !case_subst_eqs.is_empty();
         let pre_step12_snapshot: Option<crate::constraint::system::System> =
             if conjoin_fanout_enabled { Some(self.sys.clone()) } else { None };
-        if std::env::var("TAM_RS_DBG_CONJOIN_STEP12").is_ok() {
+        if tamarin_utils::env_gate!("TAM_RS_DBG_CONJOIN_STEP12") {
             eprintln!("[conjoin_step12] n_eqs={} fanout_enabled={}",
                 case_subst_eqs.len(), conjoin_fanout_enabled);
         }
@@ -2812,14 +2812,14 @@ impl<'ctx> Reduction<'ctx> {
                 // Multi-arm fanout.  solve_term_eqs returned Cases
                 // without installing any arm; install arm[0] here,
                 // then build per-arm snapshots for arms[1..].
-                if std::env::var("TAM_RS_DBG_CONJOIN_FANOUT").is_ok() {
+                if tamarin_utils::env_gate!("TAM_RS_DBG_CONJOIN_FANOUT") {
                     eprintln!("[conjoin_fanout] arms={} (step 12 solveSubstEqs)",
                         arms.len());
                 }
                 let mut arm_iter = arms.into_iter();
                 let arm0 = arm_iter.next().expect("Cases has >=2 arms");
                 self.sys.invalidate_max_var_idx_cache();
-                self.sys.eq_store = arm0;
+                self.sys.eq_store = std::sync::Arc::new(arm0);
                 // Build per-arm fanout snapshots from the pre-step-12 sys.
                 // Each snapshot gets the arm's eq_store installed and
                 // step 13 (substSystem) applied locally.
@@ -2827,7 +2827,7 @@ impl<'ctx> Reduction<'ctx> {
                     for arm_i in arm_iter {
                         let mut arm_sys = snapshot.clone();
                         arm_sys.invalidate_max_var_idx_cache();
-                        arm_sys.eq_store = arm_i;
+                        arm_sys.eq_store = std::sync::Arc::new(arm_i);
                         // Replicate step 13 substSystem locally on the
                         // arm-i sys by spinning a transient Reduction.
                         let mut arm_red = Reduction::new(self.ctx, arm_sys);
@@ -2841,7 +2841,7 @@ impl<'ctx> Reduction<'ctx> {
         }
         // 13. substSystem.
         self.subst_system();
-        if std::env::var("TAM_DBG_CONJOIN_POST").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_CONJOIN_POST") {
             let path = crate::constraint::solver::trace::case_path_string();
             eprintln!("[conjoin_post] path={} eq_store after step 13 ({} entries):",
                 path, self.sys.eq_store.subst.to_list().len());
@@ -3065,7 +3065,7 @@ fn build_parser_subst_from_eq_store(
             if w == &lv { continue; }
         }
         let term = crate::elaborate::lnterm_to_term(&final_term);
-        out.insert((lv.name.clone(), lv.idx), term);
+        out.insert((lv.name.to_string(), lv.idx), term);
     }
     out
 }
@@ -3173,14 +3173,14 @@ fn illegal_coerce(p_rule: &RuleACInst, fa_conc: &crate::fact::LNFact) -> bool {
 fn is_pair(t: &tamarin_term::lterm::LNTerm) -> bool {
     use tamarin_term::function_symbols::FunSym;
     if let tamarin_term::term::Term::App(FunSym::NoEq(s), args) = t {
-        return s.name == b"pair" && args.len() == 2;
+        return &*s.name == b"pair" && args.len() == 2;
     }
     false
 }
 fn is_inverse(t: &tamarin_term::lterm::LNTerm) -> bool {
     use tamarin_term::function_symbols::{FunSym, INV_SYM_STRING};
     if let tamarin_term::term::Term::App(FunSym::NoEq(s), args) = t {
-        return s.name == INV_SYM_STRING && args.len() == 1;
+        return &*s.name == INV_SYM_STRING && args.len() == 1;
     }
     false
 }
@@ -3534,7 +3534,7 @@ fn freshen_rule_with_constrs(
         cs.into_iter().map(|s| {
             let pairs: Vec<_> = s.to_list().into_iter().map(|(k, v)| {
                 let new_k = LVar {
-                    name: k.name.clone(),
+                    name: k.name,
                     sort: k.sort,
                     idx: shift_idx(k.idx),
                 };
@@ -3923,10 +3923,10 @@ fn ku_decomp_subterms(t: &tamarin_term::lterm::LNTerm)
     use tamarin_term::term::Term;
     match t {
         Term::App(FunSym::NoEq(s), args)
-            if s.name == b"pair" && args.len() == 2
+            if &*s.name == b"pair" && args.len() == 2
                 => Some(args.to_vec()),
         Term::App(FunSym::NoEq(s), args)
-            if s.name == INV_SYM_STRING && args.len() == 1
+            if &*s.name == INV_SYM_STRING && args.len() == 1
                 => Some(args.to_vec()),
         // For AC operators (Mult, Union) HS reads the decomposition
         // sub-terms via `viewTerm2 -> FMult ms` / `FUnion ms`, where `ms`
@@ -3994,7 +3994,7 @@ pub fn chain_direct_case_name(fa_conc: &crate::fact::LNFact) -> Option<String> {
             let body = if v.name.is_empty() {
                 v.idx.to_string()
             } else if v.idx == 0 {
-                v.name.clone()
+                v.name.to_string()
             } else {
                 format!("{}_{}", v.idx, v.name)
             };
@@ -4048,6 +4048,11 @@ fn sort_suffix(s: tamarin_term::lterm::LSort) -> &'static str {
 /// exec-trace counts align between HS and Rust without Rust actually
 /// instantiating the dead rule.
 fn emit_dead_rule_premise_traces(rule: &crate::rule::RuleACInst) {
+    // Entirely a trace-synthesis helper: every body statement is a
+    // `trace_exec` (a no-op unless TAM_RS_TRACE_EXEC is set).  Bail out
+    // before the per-premise scan / `is_fresh` computation on the common
+    // untraced path.
+    if !crate::constraint::solver::trace::exec_enabled() { return; }
     use crate::fact::FactTag;
     use tamarin_term::lterm::LSort;
     use tamarin_term::term::Term;
@@ -4096,7 +4101,7 @@ pub fn rule_case_name(rule: &crate::rule::RuleACInst) -> String {
     match &rule.info {
         RuleInfo::Proto(p) => match &p.name {
             ProtoRuleName::Fresh => "Fresh".to_string(),
-            ProtoRuleName::Stand(s) => s.clone(),
+            ProtoRuleName::Stand(s) => s.to_string(),
         },
         RuleInfo::Intr(i) => match i {
             IntrRuleACInfo::ConstrRule(name) => {
@@ -4158,7 +4163,7 @@ pub fn rule_trace_name(rule: &crate::rule::RuleACInst) -> String {
     match &rule.info {
         RuleInfo::Proto(p) => match &p.name {
             ProtoRuleName::Fresh => "FreshRule".to_string(),
-            ProtoRuleName::Stand(s) => s.clone(),
+            ProtoRuleName::Stand(s) => s.to_string(),
         },
         RuleInfo::Intr(i) => match i {
             IntrRuleACInfo::ConstrRule(name) => {
@@ -4286,7 +4291,7 @@ impl<'ctx> Reduction<'ctx> {
                     for arm_eq in pending {
                         let mut arm_sys = post_sys.clone();
                         arm_sys.invalidate_max_var_idx_cache();
-                        arm_sys.eq_store = arm_eq;
+                        arm_sys.eq_store = std::sync::Arc::new(arm_eq);
                         cases.push((base_name.clone(), arm_sys));
                     }
                 }
@@ -4314,9 +4319,11 @@ impl<'ctx> Reduction<'ctx> {
         i: &crate::constraint::constraints::NodeId,
         rule: &RuleACInst,
     ) {
-        crate::constraint::solver::trace::trace_exec(
-            &format!("exploitPrems rule={}",
-                crate::constraint::solver::reduction::rule_trace_name(rule)));
+        if crate::constraint::solver::trace::exec_enabled() {
+            crate::constraint::solver::trace::trace_exec(
+                &format!("exploitPrems rule={}",
+                    crate::constraint::solver::reduction::rule_trace_name(rule)));
+        }
         // HS-faithful (Reduction.hs:241-268): `exploitPrem i ru (v, fa)`
         // uses `fa` from `enumPrems ru` directly — no substitution
         // applied at this point.  The substitution is applied later
@@ -4413,7 +4420,7 @@ impl<'ctx> Reduction<'ctx> {
         let j = tamarin_term::lterm::LVar::new(
             "vf", tamarin_term::lterm::LSort::Node, next);
         let rule = make_fresh_rule(m.clone());
-        if std::env::var("TAM_RS_TRACE_VF_CREATE").is_ok() {
+        if tamarin_utils::env_gate!("TAM_RS_TRACE_VF_CREATE") {
             let path = crate::constraint::solver::trace::case_path_string();
             eprintln!("[VF_CREATE] path={} site=add_fresh_supplier_for vf.{}", path, next);
         }
@@ -4460,7 +4467,7 @@ impl<'ctx> Reduction<'ctx> {
             let n_term = tamarin_term::term::Term::Lit(
                 tamarin_term::vterm::Lit::Var(n_var.clone()));
             crate::constraint::solver::trace::trace_exec("FrNarrow");
-            if std::env::var("TAM_RS_TRACE_FR_NARROW").is_ok() {
+            if tamarin_utils::env_gate!("TAM_RS_TRACE_FR_NARROW") {
                 eprintln!("[RS-FR-NARROW] Fr({}_{}:{:?}) narrowed to ~n.{}",
                     match &m {
                         tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Var(v)) => &v.name,
@@ -4515,11 +4522,11 @@ impl<'ctx> Reduction<'ctx> {
         fa: &crate::fact::LNFact,
     ) {
         let m = match fa.terms.first() { Some(t) => t.clone(), None => return };
-        if std::env::var("TAM_DBG_ISEND_M").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_ISEND_M") {
             use tamarin_term::lterm::HasFrees;
             let mut has_idx0 = false;
             m.for_each_free(&mut |v| {
-                if v.idx == 0 && matches!(v.name.as_str(),
+                if v.idx == 0 && matches!(&*v.name,
                     "ni" | "nr" | "m1" | "m2" | "s" | "R" | "ltkA" | "ltkI")
                 { has_idx0 = true; }
             });
@@ -4538,9 +4545,11 @@ impl<'ctx> Reduction<'ctx> {
         // the supplier rule's premises (which dispatches to add_ku_action
         // for the KU(m) premise).  Rust does the equivalent inline via
         // add_ku_action_before below, so emit the matching trace here.
-        crate::constraint::solver::trace::trace_exec(
-            &format!("exploitPrems rule={}",
-                crate::constraint::solver::reduction::rule_trace_name(&rule)));
+        if crate::constraint::solver::trace::exec_enabled() {
+            crate::constraint::solver::trace::trace_exec(
+                &format!("exploitPrems rule={}",
+                    crate::constraint::solver::reduction::rule_trace_name(&rule)));
+        }
         self.sys.add_node(j.clone(), rule);
         // HS-faithful (Reduction.hs:247): `exploitPrem InFact` does a
         // RAW `modM sEdges (S.insert $ Edge (j, ConcIdx 0) (i, v))` —
@@ -4582,7 +4591,7 @@ impl<'ctx> Reduction<'ctx> {
         // This path (`add_ku_action_before`, the HS `requiresKU`/`exploitPrem`
         // analog) DOES advance the maude fresh-counter via
         // `next_fresh_node_idx` = `max(counter, bm+1)`.
-        if std::env::var("TAM_RS_TRACE_VK_CREATE").is_ok() {
+        if tamarin_utils::env_gate!("TAM_RS_TRACE_VK_CREATE") {
             let path = crate::constraint::solver::trace::case_path_string();
             eprintln!("[RS_VK_CREATE] path={} site=add_ku_action_before vk.{} cnt={} bm={}",
                 path, next, self.maude.fresh_counter_peek(), bounds_max(&self.sys));
@@ -4638,12 +4647,12 @@ impl<'ctx> Reduction<'ctx> {
         let existing = self.sys.nodes.iter()
             .find(|(nid, _)| nid == i)
             .map(|(_, ru)| ru.clone());
-        if std::env::var("TAM_DBG_SAG").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_SAG") {
             eprintln!("[sag] ENTRY i={:?} fa.tag={:?} existing={:?}",
                 i, fa.tag,
                 existing.as_ref().map(rule_case_name));
         }
-        if std::env::var("TAM_DBG_SRC_CASE").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_SRC_CASE") {
             eprintln!("[src_case] solve_action_goal ENTRY: i={:?} fa.tag={:?} existing={:?}",
                 i, fa.tag,
                 existing.as_ref().map(crate::constraint::solver::reduction::rule_case_name));
@@ -4702,13 +4711,13 @@ impl<'ctx> Reduction<'ctx> {
                         Err(_) | Ok(SolveOutcome::Contradictory) => continue,
                         Ok(SolveOutcome::Cases(arms)) => arms,
                         Ok(SolveOutcome::Linear(_)) =>
-                            vec![sub.sys.eq_store.clone()],
+                            vec![(*sub.sys.eq_store).clone()],
                     };
                     let post_sys = sub.sys.clone();
                     for arm_eq in arm_eq_stores {
                         let mut sys = post_sys.clone();
                         sys.invalidate_max_var_idx_cache();
-                        sys.eq_store = arm_eq;
+                        sys.eq_store = std::sync::Arc::new(arm_eq);
                         for (existing, status) in sys.goals_mut().iter_mut() {
                             if existing == &g && !status.solved {
                                 status.solved = true;
@@ -4747,7 +4756,7 @@ impl<'ctx> Reduction<'ctx> {
                 // regresses corpus 97/117 → 42/94 with 23 timeouts.
                 // Source-cases are the equivalent of HS's
                 // `solveWithSource`; both code paths need them.
-                if std::env::var("TAM_DBG_SRC_CASE").is_ok() {
+                if tamarin_utils::env_gate!("TAM_DBG_SRC_CASE") {
                     eprintln!("[src_case] solve_action_goal None-branch: precompute={} tag={:?} full_sources.len={}",
                         crate::constraint::solver::sources::in_precompute_mode(),
                         fa.tag, self.ctx.full_sources.len());
@@ -4759,7 +4768,7 @@ impl<'ctx> Reduction<'ctx> {
                 let src_dispatch_ok = !crate::constraint::solver::sources::in_initial_source_cases()
                     && matches!(fa.tag, crate::fact::FactTag::Ku)
                     && !self.ctx.full_sources.is_empty();
-                if std::env::var("TAM_DBG_SAG_SOURCE_GATE").is_ok() {
+                if tamarin_utils::env_gate!("TAM_DBG_SAG_SOURCE_GATE") {
                     eprintln!("[sag-gate] tag={:?} src_dispatch_ok={} in_initial_source_cases={} ku={} full_sources_empty={}",
                         fa.tag, src_dispatch_ok,
                         crate::constraint::solver::sources::in_initial_source_cases(),
@@ -4873,7 +4882,7 @@ impl<'ctx> Reduction<'ctx> {
                                         for arm_eq in arms {
                                             let mut arm_sys = template.clone();
                                             arm_sys.invalidate_max_var_idx_cache();
-                                            arm_sys.eq_store = arm_eq;
+                                            arm_sys.eq_store = std::sync::Arc::new(arm_eq);
                                             let mut arm_red = Reduction::new(self.ctx, arm_sys);
                                             arm_red.subst_system();
                                             if arm_red.sys.eq_store.is_false() { continue; }
@@ -4907,11 +4916,11 @@ impl<'ctx> Reduction<'ctx> {
                                     // given id, matching `find`'s first-match.
                                     let (chain_eqs, tag_mismatch_edge): (Vec<_>, bool) = {
                                         let mut tag_mismatch_edge = false;
-                                        let node_rule_map: std::collections::HashMap<
+                                        let node_rule_map: tamarin_utils::FastMap<
                                             &crate::constraint::constraints::NodeId,
                                             &crate::rule::RuleACInst,
                                         > = {
-                                            let mut m = std::collections::HashMap::new();
+                                            let mut m = tamarin_utils::FastMap::default();
                                             for (n, r) in sub.sys.nodes.iter() {
                                                 m.entry(n).or_insert(r);
                                             }
@@ -4958,7 +4967,7 @@ impl<'ctx> Reduction<'ctx> {
                                                 for arm2 in arms2 {
                                                     let mut s2 = template2.clone();
                                                     s2.invalidate_max_var_idx_cache();
-                                                    s2.eq_store = arm2;
+                                                    s2.eq_store = std::sync::Arc::new(arm2);
                                                     let mut r3 = Reduction::new(self.ctx, s2);
                                                     r3.subst_system();
                                                     if r3.sys.eq_store.is_false() { continue; }
@@ -5144,10 +5153,12 @@ impl<'ctx> Reduction<'ctx> {
                         // HS emits in the dead Disj branch before
                         // mzero, so trace counts align.  Rust still
                         // skips the actual instantiation work.
-                        crate::constraint::solver::trace::trace_exec(
-                            &format!("exploitPrems rule={}",
-                                crate::constraint::solver::reduction::rule_trace_name(&rule)));
-                        emit_dead_rule_premise_traces(&rule);
+                        if crate::constraint::solver::trace::exec_enabled() {
+                            crate::constraint::solver::trace::trace_exec(
+                                &format!("exploitPrems rule={}",
+                                    crate::constraint::solver::reduction::rule_trace_name(&rule)));
+                            emit_dead_rule_premise_traces(&rule);
+                        }
                         continue;
                     }
                     // Matching rules: rely on the trace emitted from
@@ -5191,7 +5202,7 @@ impl<'ctx> Reduction<'ctx> {
                         // it mzeros (eq_store contradictory), the
                         // entire branch dies — exploitPrems trace
                         // never fires.
-                        if std::env::var("TAM_DBG_VS_DUMP").is_ok() {
+                        if tamarin_utils::env_gate!("TAM_DBG_VS_DUMP") {
                             eprintln!("[vs-dump]   rule_case={} for goal={:?}",
                                 rule_case_name(&renamed), fa.terms.first().map(|t| format!("{:?}", t).chars().take(80).collect::<String>()));
                         }
@@ -5223,13 +5234,13 @@ impl<'ctx> Reduction<'ctx> {
                             Err(_) | Ok(SolveOutcome::Contradictory) => continue,
                             Ok(SolveOutcome::Cases(arms)) => arms,
                             Ok(SolveOutcome::Linear(_)) =>
-                                vec![sub.sys.eq_store.clone()],
+                                vec![(*sub.sys.eq_store).clone()],
                         };
                         let post_sys = sub.sys.clone();
                         for arm_eq in arm_eq_stores {
                             let mut sys = post_sys.clone();
                             sys.invalidate_max_var_idx_cache();
-                            sys.eq_store = arm_eq;
+                            sys.eq_store = std::sync::Arc::new(arm_eq);
                             for (existing, status) in sys.goals_mut().iter_mut() {
                                 if existing == &g && !status.solved {
                                     status.solved = true;
@@ -5443,10 +5454,12 @@ impl<'ctx> Reduction<'ctx> {
             let any_conc_match = rule.enumerate_conclusions().any(|(_, fc)|
                 fc.tag == fa_prem.tag && fc.terms.len() == fa_prem.terms.len());
             if !any_conc_match {
-                crate::constraint::solver::trace::trace_exec(
-                    &format!("exploitPrems rule={}",
-                        crate::constraint::solver::reduction::rule_trace_name(rule)));
-                emit_dead_rule_premise_traces(rule);
+                if crate::constraint::solver::trace::exec_enabled() {
+                    crate::constraint::solver::trace::trace_exec(
+                        &format!("exploitPrems rule={}",
+                            crate::constraint::solver::reduction::rule_trace_name(rule)));
+                    emit_dead_rule_premise_traces(rule);
+                }
                 // Rust-only trace: `insertEdges n=1` is emitted (per
                 // enumerated conclusion) before `solveFactEqs` mzero's the
                 // branch, mirroring the per-edge `insertEdges`
@@ -5480,7 +5493,7 @@ impl<'ctx> Reduction<'ctx> {
             let mut label_sys = self.sys.clone();
             label_sys.add_node(new_node.clone(), renamed.clone());
             let mut label_sub = Reduction::new(self.ctx, label_sys);
-            if std::env::var("TAM_RS_DBG_SOLVE_RULE_CONSTRAINTS").is_ok() {
+            if tamarin_utils::env_gate!("TAM_RS_DBG_SOLVE_RULE_CONSTRAINTS") {
                 let n = renamed_constrs.as_ref().map(|c| c.len()).unwrap_or(0);
                 eprintln!("[RS_LABEL_NODE_ID] rule={} n_variant_substs={}",
                     rule_case_name(&renamed), n);
@@ -5545,7 +5558,7 @@ impl<'ctx> Reduction<'ctx> {
                             SolveOutcome::Cases(arms) => {
                                 arms.into_iter().map(|arm_eq| {
                                     let mut s = post_edge_sys.clone();
-                                    s.eq_store = arm_eq;
+                                    s.eq_store = std::sync::Arc::new(arm_eq);
                                     s
                                 }).collect()
                             }
@@ -5558,7 +5571,7 @@ impl<'ctx> Reduction<'ctx> {
                                     break;
                                 }
                             }
-                            if std::env::var("TAM_DBG_PREM_CASE_OUT").is_ok() {
+                            if tamarin_utils::env_gate!("TAM_DBG_PREM_CASE_OUT") {
                                 for (id, ru) in sys.nodes.iter() {
                                     let nm = crate::constraint::solver::reduction::rule_case_name(ru);
                                     if nm == "Serv_1" {
@@ -5634,7 +5647,7 @@ impl<'ctx> Reduction<'ctx> {
         // `insertEdges:chain_extend` / `insertEdges:chain_direct` labels).
         let _op_guard = crate::constraint::solver::trace::OpLabelGuard::new(
             "insertEdges:solveChain");
-        if std::env::var("TAM_RS_TRACE_SOLVE_CHAIN").is_ok() {
+        if tamarin_utils::env_gate!("TAM_RS_TRACE_SOLVE_CHAIN") {
             let mode = if crate::constraint::solver::sources::in_precompute_mode() {
                 "saturate" } else { "runtime" };
             eprintln!("[SOLVE_CHAIN] enter mode={} c={:?} p={:?}", mode, c, p);
@@ -5654,7 +5667,7 @@ impl<'ctx> Reduction<'ctx> {
         // TAM_RS_TRACE_CHAINS: mirror Haskell `solveChain` enter trace
         // (Goals.hs:300-305).  Format kept identical so a diff between
         // [HS-CHAIN] and [RS-CHAIN] surfaces directly.
-        let trace_chains = std::env::var("TAM_RS_TRACE_CHAINS").is_ok();
+        let trace_chains = tamarin_utils::env_gate!("TAM_RS_TRACE_CHAINS");
         if trace_chains {
             let n_destr = self.ctx.intruder_rules.iter()
                 .filter(|ir| crate::rule::is_destr_rule_info(&ir.info))
@@ -5711,7 +5724,7 @@ impl<'ctx> Reduction<'ctx> {
                             Ok(SolveOutcome::Cases(arms)) => {
                                 arms.into_iter().map(|arm_eq| {
                                     let mut s = post_edge_sys.clone();
-                                    s.eq_store = arm_eq;
+                                    s.eq_store = std::sync::Arc::new(arm_eq);
                                     s
                                 }).collect()
                             }
@@ -5834,7 +5847,7 @@ impl<'ctx> Reduction<'ctx> {
                     Ok(SolveOutcome::Cases(arms)) => {
                         arms.into_iter().map(|arm_eq| {
                             let mut s = post_edge_sys.clone();
-                            s.eq_store = arm_eq;
+                            s.eq_store = std::sync::Arc::new(arm_eq);
                             s
                         }).collect()
                     }
@@ -5925,12 +5938,14 @@ impl<'ctx> Reduction<'ctx> {
                 // the matching exploitPrems + per-premise traces so trace
                 // counts align; HS emits exactly one exploitPrems per rule.
                 let trace_dead = |ru: &crate::rule::RuleACInst| {
-                    crate::constraint::solver::trace::trace_exec(
-                        &format!("exploitPrems rule={}",
-                            crate::constraint::solver::reduction::rule_trace_name(ru)));
-                    emit_dead_rule_premise_traces(ru);
+                    if crate::constraint::solver::trace::exec_enabled() {
+                        crate::constraint::solver::trace::trace_exec(
+                            &format!("exploitPrems rule={}",
+                                crate::constraint::solver::reduction::rule_trace_name(ru)));
+                        emit_dead_rule_premise_traces(ru);
+                    }
                 };
-                let dbg_filter = std::env::var("TAM_RS_DBG_CHAIN_EXT_FILTER").is_ok();
+                let dbg_filter = tamarin_utils::env_gate!("TAM_RS_DBG_CHAIN_EXT_FILTER");
                 let prem0 = match ru_renamed.premises.first() {
                     Some(f) => f.clone(),
                     None => {
@@ -6043,7 +6058,7 @@ impl<'ctx> Reduction<'ctx> {
                     src: c.clone(),
                     tgt: (new_node.clone(), crate::rule::PremIdx(0)),
                 });
-                if std::env::var("TAM_RS_DBG_CHAIN_EXTEND_MULTI").is_ok() {
+                if tamarin_utils::env_gate!("TAM_RS_DBG_CHAIN_EXTEND_MULTI") {
                     if let Ok(SolveOutcome::Cases(ref arms)) = res {
                         eprintln!("[CHAIN_EXTEND_MULTI] rule={} arms={} faConc={:?}",
                             rule_case_name(&ru_renamed), arms.len(), fa_conc);
@@ -6095,7 +6110,7 @@ impl<'ctx> Reduction<'ctx> {
                     Ok(SolveOutcome::Cases(arms)) => {
                         arms.into_iter().map(|arm_eq| {
                             let mut s = post_edge_sys.clone();
-                            s.eq_store = arm_eq;
+                            s.eq_store = std::sync::Arc::new(arm_eq);
                             s
                         }).collect()
                     }
@@ -6193,7 +6208,7 @@ impl<'ctx> Reduction<'ctx> {
         // modM posSubterms (delete st); modM solvedSubterms (insert st).
         let mut moved = false;
         self.sys.invalidate_max_var_idx_cache();
-        self.sys.subterm_store.subterms.retain(|c| {
+        self.sys.subterm_store_mut().subterms.retain(|c| {
             let keep = !(c.small == st.0 && c.big == st.1);
             if !keep { moved = true; }
             keep
@@ -6203,7 +6218,7 @@ impl<'ctx> Reduction<'ctx> {
             if !self.sys.subterm_store.solved_subterms.iter()
                 .any(|c| c.small == st.0 && c.big == st.1)
             {
-                self.sys.subterm_store.solved_subterms.push(
+                self.sys.subterm_store_mut().solved_subterms.push(
                     crate::tools::subterm_store::SubtermConstraint {
                         small: st.0.clone(),
                         big: st.1.clone(),
@@ -6229,7 +6244,7 @@ impl<'ctx> Reduction<'ctx> {
 
         // disjunctionOfList [] -> Contradictory.
         if split_list.is_empty() {
-            self.sys.subterm_store.contradictory = true;
+            self.sys.subterm_store_mut().contradictory = true;
             return GoalCases::Contradictory;
         }
 
@@ -6252,7 +6267,7 @@ impl<'ctx> Reduction<'ctx> {
                 SubtermSplit::TrueD => { /* return () */ }
                 SubtermSplit::SubtermD(s, t) => {
                     sub.sys.invalidate_max_var_idx_cache();
-                    sub.sys.subterm_store.add(s.clone(), t.clone());
+                    sub.sys.subterm_store_mut().add(s.clone(), t.clone());
                 }
                 SubtermSplit::NatSubtermD(s, t) => {
                     if single {
@@ -6269,7 +6284,7 @@ impl<'ctx> Reduction<'ctx> {
                         sub.insert_formula(f);
                     } else {
                         sub.sys.invalidate_max_var_idx_cache();
-                        sub.sys.subterm_store.add(s.clone(), t.clone());
+                        sub.sys.subterm_store_mut().add(s.clone(), t.clone());
                     }
                 }
                 SubtermSplit::EqualD(l, r) => {
@@ -6308,7 +6323,7 @@ impl<'ctx> Reduction<'ctx> {
         &mut self,
         id: crate::tools::equation_store::SplitId,
     ) -> GoalCases {
-        if std::env::var("TAM_RS_DBG_SOLVE_SPLIT_PRECOMPUTE").is_ok() {
+        if tamarin_utils::env_gate!("TAM_RS_DBG_SOLVE_SPLIT_PRECOMPUTE") {
             let in_pre = crate::constraint::solver::sources::in_precompute_mode();
             eprintln!("[SOLVE_SPLIT_CALL] in_precompute={} split_id={:?}", in_pre, id);
         }
@@ -6402,8 +6417,8 @@ impl<'ctx> Reduction<'ctx> {
         };
         if cases.len() == 1 {
             self.sys.invalidate_max_var_idx_cache();
-            self.sys.eq_store = simplify_picked(
-                cases.into_iter().next().unwrap());
+            self.sys.eq_store = std::sync::Arc::new(simplify_picked(
+                cases.into_iter().next().unwrap()));
             self.mark_goal_as_solved(&g);
             // Push the resulting free subst back into the system.
             self.subst_system();
@@ -6413,7 +6428,7 @@ impl<'ctx> Reduction<'ctx> {
         for (i, store) in cases.into_iter().enumerate() {
             let mut sys = self.sys.clone();
             sys.invalidate_max_var_idx_cache();
-            sys.eq_store = simplify_picked(store);
+            sys.eq_store = std::sync::Arc::new(simplify_picked(store));
             for (existing, status) in sys.goals_mut().iter_mut() {
                 if existing == &g && !status.solved {
                     status.solved = true;
@@ -6764,7 +6779,7 @@ mod tests {
         let ty: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(
             tamarin_term::vterm::Lit::Var(w));
         sys.invalidate_max_var_idx_cache();
-        sys.subterm_store.add(tx.clone(), ty.clone());
+        sys.subterm_store_mut().add(tx.clone(), ty.clone());
         sys.add_goal(Goal::Subterm((tx.clone(), ty.clone())));
         let mut r = Reduction::new(&ctx, sys);
         let out = r.solve_subterm_goal(&(tx.clone(), ty.clone()));
@@ -6789,7 +6804,7 @@ mod tests {
         let tx: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(
             tamarin_term::vterm::Lit::Var(v));
         sys.invalidate_max_var_idx_cache();
-        sys.subterm_store.add(tx.clone(), tx.clone());
+        sys.subterm_store_mut().add(tx.clone(), tx.clone());
         let mut r = Reduction::new(&ctx, sys);
         let out = r.solve_subterm_goal(&(tx.clone(), tx));
         assert!(matches!(out, GoalCases::Contradictory));

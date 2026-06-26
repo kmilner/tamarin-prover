@@ -52,6 +52,10 @@ where
 
     pub fn dom(&self) -> impl Iterator<Item = &V> { self.map.keys() }
     pub fn range(&self) -> impl Iterator<Item = &VTerm<C, V>> { self.map.values() }
+    /// Borrowing iterator over the `(var, term)` mappings in domain (key)
+    /// order.  The non-cloning counterpart of [`to_list`]: callers that only
+    /// need to read `v.idx` / walk the term avoid cloning every entry.
+    pub fn iter(&self) -> impl Iterator<Item = (&V, &VTerm<C, V>)> { self.map.iter() }
     pub fn image_of(&self, v: &V) -> Option<&VTerm<C, V>> { self.map.get(v) }
     pub fn to_list(&self) -> Vec<(V, VTerm<C, V>)> {
         self.map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
@@ -146,15 +150,23 @@ pub fn apply_lit_map<C: Ord + Clone, V: Ord + Clone>(
 /// `applyVTerm` against a raw substitution map — the borrowing
 /// counterpart of [`apply_vterm`], producing byte-identical output.
 ///
-/// Two short-circuits keep this off the allocator on the common case
-/// (mirroring the sharing optimisation in HS `applyVTerm`):
-///   - an empty map is the identity, so `t` is returned untouched;
-///   - any subterm the substitution does not actually rewrite is
-///     returned as-is (its `Arc` reused) rather than rebuilt — sound
-///     because an unchanged term is already AC-normal, so it needs no
-///     re-normalisation.  A new argument vector is allocated only when
-///     at least one child changes; that changed branch still routes
-///     through the same smart constructors, so output stays identical.
+/// Two short-circuits mirror Haskell's `applyVTerm` (SubstVFree.hs) so we
+/// only allocate on the part of the term the substitution actually touches:
+///
+/// 1. **Empty-map fast path:** an empty substitution is the identity, so we
+///    return `t` untouched (it is already AC-normal).
+/// 2. **Unchanged-subterm sharing:** [`apply_vterm_map_changed`] returns
+///    `None` when the substitution leaves a subterm structurally unchanged;
+///    in that case we reuse the original `Arc<[_]>` instead of rebuilding and
+///    re-AC-sorting it.  This is sound because an unchanged term is already in
+///    AC-normal form, and the resulting *value* is identical to the
+///    full-rebuild path (only the `Arc` identity differs, which is invisible
+///    to callers and to `--prove` output).
+///
+/// Without these, applying the (idempotent) eq-store substitution across the
+/// whole constraint system on every solver step reallocated and re-sorted
+/// every node even when nothing changed — the dominant allocator in the
+/// alloc-bound theories (DH/classic/xor).
 pub fn apply_vterm_map<C: Ord + Clone, V: Ord + Clone>(
     map: &BTreeMap<V, VTerm<C, V>>,
     t: VTerm<C, V>,
@@ -162,35 +174,32 @@ pub fn apply_vterm_map<C: Ord + Clone, V: Ord + Clone>(
     if map.is_empty() {
         return t;
     }
-    apply_vterm_map_changed(map, &t).unwrap_or(t)
+    match apply_vterm_map_changed(map, &t) {
+        Some(changed) => changed,
+        None => t,
+    }
 }
 
-/// Apply `map` to a borrowed term, returning `Some(new)` only when the
-/// substitution actually rewrites it and `None` when it is left
-/// unchanged.  `None` is what lets [`apply_vterm_map`] hand back the
-/// original term (and reuse its `Arc`) instead of reallocating an
-/// identical one.
+/// Apply `map` to `t`, returning `Some(new_term)` only when the substitution
+/// actually changes `t`, and `None` when `t` is left structurally unchanged.
+///
+/// Callers reuse the original term (sharing its `Arc`) on `None`.  An `App`
+/// node is rebuilt — and re-AC-normalised through the smart constructors,
+/// exactly as the non-sharing path did — only when at least one child changed.
 fn apply_vterm_map_changed<C: Ord + Clone, V: Ord + Clone>(
     map: &BTreeMap<V, VTerm<C, V>>,
     t: &VTerm<C, V>,
 ) -> Option<VTerm<C, V>> {
     match t {
-        Term::Lit(Lit::Var(v)) => map.get(v).cloned(),
-        Term::Lit(Lit::Con(_)) => None,
+        Term::Lit(l) => apply_lit_map_changed(map, l),
         Term::App(fsym, args) => {
-            // Lazily allocate the rewritten argument vector: only once a
-            // child is found to change do we clone the unchanged prefix.
+            // Allocate the rebuilt argument vector lazily: only once the first
+            // child changes.  Until then every child is left shared.
             let mut new_args: Option<Vec<VTerm<C, V>>> = None;
             for (i, a) in args.iter().enumerate() {
-                match apply_vterm_map_changed(map, a) {
-                    Some(na) => {
-                        new_args.get_or_insert_with(|| args[..i].to_vec()).push(na);
-                    }
-                    None => {
-                        if let Some(v) = new_args.as_mut() {
-                            v.push(a.clone());
-                        }
-                    }
+                if let Some(changed) = apply_vterm_map_changed(map, a) {
+                    new_args
+                        .get_or_insert_with(|| args.to_vec())[i] = changed;
                 }
             }
             new_args.map(|mapped| match fsym {
@@ -200,6 +209,23 @@ fn apply_vterm_map_changed<C: Ord + Clone, V: Ord + Clone>(
                 FunSym::List => f_app_list(mapped),
             })
         }
+    }
+}
+
+/// `applyLit` against a raw map, returning `Some` only when the literal is a
+/// domain variable (and thus replaced).  The borrowing counterpart of
+/// [`apply_lit_map`] used by the sharing recursion above.
+///
+/// `from_map`/`from_list` drop trivial `x ~> x` entries and the unification
+/// accumulator never inserts one, so a found binding is always a genuine
+/// change — making `Some`/`None` here exactly track "did the term change".
+fn apply_lit_map_changed<C: Ord + Clone, V: Ord + Clone>(
+    map: &BTreeMap<V, VTerm<C, V>>,
+    l: &Lit<C, V>,
+) -> Option<VTerm<C, V>> {
+    match l {
+        Lit::Var(v) => map.get(v).cloned(),
+        Lit::Con(_) => None,
     }
 }
 

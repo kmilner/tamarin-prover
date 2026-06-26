@@ -454,7 +454,7 @@ fn collect_user_funs(items: &[p::TheoryItem]) -> CollectedUserFuns {
 fn builtin_fun_attrs(name: &str) -> Vec<(String, Privacy, Constructability)> {
     let Some(msig) = builtin_sig(name) else { return Vec::new() };
     msig.st_fun_syms.iter().filter_map(|s| {
-        String::from_utf8(s.name.clone())
+        String::from_utf8(s.name.to_vec())
             .ok()
             .map(|n| (n, s.privacy, s.constructability))
     }).collect()
@@ -482,7 +482,7 @@ fn builtin_fun_attrs(name: &str) -> Vec<(String, Privacy, Constructability)> {
 fn builtin_nullary_names_from_msig(msig: &MaudeSig) -> Vec<String> {
     msig.fun_syms.iter().filter_map(|fs| match fs {
         tamarin_term::function_symbols::FunSym::NoEq(s) if s.arity == 0 =>
-            String::from_utf8(s.name.clone()).ok(),
+            String::from_utf8(s.name.to_vec()).ok(),
         _ => None,
     }).collect()
 }
@@ -979,7 +979,7 @@ fn elaborate_lemma_attr(a: &p::LemmaAttr) -> LemmaAttr {
 
 fn rule_to_proto_rule_e(r: &p::Rule) -> Result<ProtoRuleE, ElabError> {
     let info = ProtoRuleEInfo {
-        name: ProtoRuleName::Stand(r.name.clone()),
+        name: ProtoRuleName::Stand(tamarin_term::intern::intern_str(&r.name)),
         attributes: RuleAttributes::empty(),
         restrictions: Vec::new(),
     };
@@ -1134,7 +1134,7 @@ pub fn fact_to_lnfact(f: &p::Fact) -> Result<crate::fact::LNFact, ElabError> {
         "Ded" => FactTag::Ded,
         _ => FactTag::Proto(
             if f.persistent { Multiplicity::Persistent } else { Multiplicity::Linear },
-            f.name.clone(),
+            tamarin_term::intern::intern_str(f.name.as_str()),
             f.args.len(),
         ),
     };
@@ -1217,7 +1217,7 @@ pub fn lnterm_to_term(t: &tamarin_term::lterm::LNTerm) -> p::Term {
                 LSort::Nat => p::SortHint::Nat,
             };
             p::Term::Var(p::VarSpec {
-                name: v.name.clone(),
+                name: v.name.to_string(),
                 idx: v.idx,
                 sort,
                 typ: None,
@@ -1227,17 +1227,17 @@ pub fn lnterm_to_term(t: &tamarin_term::lterm::LNTerm) -> p::Term {
             // Encode as the right literal kind based on the sort hint
             // attached to the name's tag.
             match name.tag {
-                tamarin_term::lterm::NameTag::Pub => p::Term::PubLit(name.id.0.clone()),
-                tamarin_term::lterm::NameTag::Fresh => p::Term::FreshLit(name.id.0.clone()),
-                tamarin_term::lterm::NameTag::Nat => p::Term::NatLit(name.id.0.clone()),
-                tamarin_term::lterm::NameTag::Node => p::Term::PubLit(name.id.0.clone()),
+                tamarin_term::lterm::NameTag::Pub => p::Term::PubLit(name.id.0.to_string()),
+                tamarin_term::lterm::NameTag::Fresh => p::Term::FreshLit(name.id.0.to_string()),
+                tamarin_term::lterm::NameTag::Nat => p::Term::NatLit(name.id.0.to_string()),
+                tamarin_term::lterm::NameTag::Node => p::Term::PubLit(name.id.0.to_string()),
             }
         }
         tamarin_term::term::Term::App(funsym, args) => {
             let parser_args: Vec<p::Term> = args.iter().map(lnterm_to_term).collect();
             match funsym {
                 FunSym::NoEq(s) => {
-                    let name = String::from_utf8(s.name.clone())
+                    let name = String::from_utf8(s.name.to_vec())
                         .unwrap_or_default();
                     if name == "pair" && parser_args.len() == 2 {
                         // Re-pair into a flat Pair term where possible.
@@ -1972,7 +1972,7 @@ pub fn fact_to_sapic_fact(f: &p::Fact) -> Result<crate::sapic::SapicLNFact, Elab
         "Ded" => FactTag::Ded,
         _ => FactTag::Proto(
             if f.persistent { Multiplicity::Persistent } else { Multiplicity::Linear },
-            f.name.clone(),
+            tamarin_term::intern::intern_str(f.name.as_str()),
             f.args.len(),
         ),
     };

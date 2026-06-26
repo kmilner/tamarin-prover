@@ -125,7 +125,7 @@ impl Irreducible {
         for s in &sig.irreducible_fun_syms {
             match s {
                 FunSym::NoEq(n) => {
-                    noeq.insert((n.name.clone(), n.arity));
+                    noeq.insert((n.name.to_vec(), n.arity));
                 }
                 FunSym::Ac(a) => {
                     ac.insert(*a);
@@ -137,7 +137,7 @@ impl Irreducible {
         for s in sig.fun_syms.iter() {
             if let FunSym::NoEq(n) = s {
                 if n.arity == 0 {
-                    nullary_names.insert(n.name.clone());
+                    nullary_names.insert(n.name.to_vec());
                 }
             }
         }

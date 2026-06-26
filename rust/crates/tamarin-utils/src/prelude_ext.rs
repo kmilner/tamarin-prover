@@ -53,7 +53,7 @@ where
 /// Order-preserving. O(n) via a `HashSet` of seen projections, hence the
 /// `K: Eq + Hash` bound.
 pub fn nub_on<T: Clone, K: Eq + Hash, F: FnMut(&T) -> K>(xs: &[T], mut proj: F) -> Vec<T> {
-    let mut seen: std::collections::HashSet<K> = std::collections::HashSet::new();
+    let mut seen: crate::FastSet<K> = crate::FastSet::default();
     let mut out = Vec::with_capacity(xs.len());
     for x in xs {
         if seen.insert(proj(x)) {
@@ -90,7 +90,7 @@ pub fn group_on<T: Clone, K: Eq, F: FnMut(&T) -> K>(xs: &[T], mut proj: F) -> Ve
 /// `collectBy pairs`: gather all values per key, preserving the order in
 /// which keys first appear.
 pub fn collect_by<K: Eq + Hash + Clone, V>(pairs: Vec<(K, V)>) -> Vec<(K, Vec<V>)> {
-    let mut indices: std::collections::HashMap<K, usize> = std::collections::HashMap::new();
+    let mut indices: crate::FastMap<K, usize> = crate::FastMap::default();
     let mut out: Vec<(K, Vec<V>)> = Vec::new();
     for (k, v) in pairs {
         match indices.get(&k) {

@@ -276,7 +276,7 @@ pub fn run_proof_search(
     // users) — only the `dump_proof` example and ProverSession callers
     // who explicitly set it want this behaviour.  Grace defaults to
     // 30s but is configurable via `TAM_PROVE_DEADLINE_GRACE_MS`.
-    if std::env::var("TAM_PROVE_DEADLINE_HARD_KILL").is_ok() {
+    if tamarin_utils::env_gate!("TAM_PROVE_DEADLINE_HARD_KILL") {
         let total_ms: u64 = std::env::var("TAM_PROVE_DEADLINE_MS").ok()
             .and_then(|s| s.parse().ok()).unwrap_or(30_000);
         let grace_ms: u64 = std::env::var("TAM_PROVE_DEADLINE_GRACE_MS").ok()
@@ -1159,7 +1159,7 @@ mod tests {
         let f = crate::fact::out_fact(tx);
         sys.add_goal(crate::constraint::constraints::Goal::Action(i, f));
         // Add a non-empty piece so isInitialSystem returns false.
-        sys.subterm_store.add(ty.clone(), ty);
+        sys.subterm_store_mut().add(ty.clone(), ty);
         let root = run_proof_search(&ctx, sys, 1);
         // Budget=1: one expand step. Action goal with no rules → contradiction.
         assert!(matches!(root.status,

@@ -451,7 +451,7 @@ fn initial_source_cases_impl(
             .collect(),
         GoalCases::Contradictory => Vec::new(),
     };
-    if std::env::var("TAM_DBG_INIT_SRC").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_INIT_SRC") {
         use tamarin_term::pretty::pretty_lnterm;
         let goal_str = match goal {
             Goal::Action(_, fa) | Goal::Premise(_, fa) => {
@@ -703,7 +703,7 @@ pub fn precompute_full_sources(
     // TAM_DBG_SRC_PRECOMP=1: dump every ku_pattern + every fun_sym
     // considered, so we can verify that precompute generated sources
     // for the expected function symbols.
-    if std::env::var("TAM_DBG_SRC_PRECOMP").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_SRC_PRECOMP") {
         eprintln!("[src_precomp] msig.fun_syms ({} entries):", msig.fun_syms.len());
         for sym in &msig.fun_syms {
             eprintln!("  fun_sym: {:?}", sym);
@@ -723,7 +723,7 @@ pub fn precompute_full_sources(
     }
 
     set_precompute_mode(false);
-    if std::env::var("TAM_DBG_SRC_LIST").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_SRC_LIST") {
         eprintln!("[src_list] precompute_full_sources emitted {} sources:", out.len());
         for (i, src) in out.iter().enumerate() {
             let s = format!("{:?}", src.goal).chars().take(200).collect::<String>();
@@ -733,7 +733,7 @@ pub fn precompute_full_sources(
     // TAM_DBG_SRC_CASES=1: force materialization of every source's
     // cases and dump per-source case name list + count.  Mirrors HS
     // SAT-FINAL output for byte-level comparison.
-    if std::env::var("TAM_DBG_SRC_CASES").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_SRC_CASES") {
         eprintln!("[src_cases] forcing materialization of {} sources:", out.len());
         for (i, src) in out.iter().enumerate() {
             let cases = src.cases(ctx);
@@ -943,16 +943,15 @@ pub fn refine_with_source_asms(
     let mut intermediate: Vec<Source> = Vec::new();
     for src in sources {
         let mut new_cases: Vec<(String, System)> = Vec::new();
-        for (name, sys) in src.cases_take() {
-            let mut refined = sys.clone();
+        for (name, mut sys) in src.cases_take() {
             for a in assumptions {
-                if !refined.formulas.contains(a) && !refined.solved_formulas.contains(a) {
-                    refined.formulas.push(a.clone());
+                if !sys.formulas.contains(a) && !sys.solved_formulas.contains(a) {
+                    sys.formulas.push(a.clone());
                 }
             }
             // Mirror Haskell `set sSourceKind RefinedSource`.
-            refined.source_kind = Some(crate::constraint::system::SourceKind::RefinedSources);
-            new_cases.push((name, refined));
+            sys.source_kind = Some(crate::constraint::system::SourceKind::RefinedSources);
+            new_cases.push((name, sys));
         }
         if !new_cases.is_empty() {
             intermediate.push(Source::eager(src.goal, new_cases, src.incomplete));
@@ -1124,7 +1123,7 @@ fn refine_one_source(
                 .filter(|(v, _)| stable_vars.contains(v))
                 .collect();
             branch_sys.invalidate_max_var_idx_cache();
-            branch_sys.eq_store.subst =
+            branch_sys.eq_store_mut().subst =
                 tamarin_term::subst::Subst::from_list(restricted_pairs);
             deferred_filtered.push((branch_name_list, branch_sys));
         }
@@ -1135,7 +1134,7 @@ fn refine_one_source(
     // in Sources.hs returns the input unchanged outside BP/MSet).
     let msig = ctx.maude.maude_sig();
     // `stable_vars` was computed once before the branch loop above; reuse it.
-    if std::env::var("TAM_RS_DBG_REMOVE_REDUNDANT").is_ok() {
+    if tamarin_utils::env_gate!("TAM_RS_DBG_REMOVE_REDUNDANT") {
         eprintln!("[RRC] === refine source goal={:?} input={} cases ===",
             src.goal, deferred_filtered.len());
     }
@@ -1159,7 +1158,7 @@ fn saturate_sources_with_simp_opt(
 ) -> Vec<Source> {
     use rayon::prelude::*;
     let mut current = sources;
-    let dbg = std::env::var("TAM_DBG_REFINE").is_ok();
+    let dbg = tamarin_utils::env_gate!("TAM_DBG_REFINE");
     if dbg {
         eprintln!("[refine] starting saturate_sources_with_simp over {} sources",
             current.len());
@@ -1256,17 +1255,7 @@ fn saturate_sources_with_simp_opt(
             .filter(|s| s.cases_len() <= 1)
             .cloned()
             .collect();
-        // Pre-extract the cheap per-source values that the post-pipeline
-        // loop reads via index (goal, incomplete, prev case count) so that
-        // `current` can be MOVED directly into the parallel pipeline below
-        // instead of deep-cloning every materialised case System per
-        // saturate iteration.  These values are byte-identical to what
-        // `current.get(i)` would return.
-        let src_summaries: Vec<(crate::constraint::constraints::Goal, bool, usize)> =
-            current.iter()
-                .map(|s| (s.goal.clone(), s.incomplete, s.cases_len()))
-                .collect();
-        if std::env::var("TAM_DBG_TS_SNAP").is_ok() {
+        if tamarin_utils::env_gate!("TAM_DBG_TS_SNAP") {
             eprintln!("[ts_snap] iter={} saturated.len={} snapshot.len={}",
                 _iter_n, current.len(), ths_snapshot.len());
             for (i, s) in current.iter().enumerate() {
@@ -1335,8 +1324,18 @@ fn saturate_sources_with_simp_opt(
         // Reduction over an owned System, no aliasing.  Maude IPC
         // serialises via `MaudeHandle::inner` (Arc<Mutex>) — workers
         // queue but don't race.
+        // Snapshot the per-source metadata that the post-par-iter loop
+        // reads (goal / incomplete / prior case-count) BEFORE moving the
+        // sources into the workers.  `collect` preserves index order, so
+        // `src_meta[i]` lines up with `per_source[i]`.  This lets us move
+        // `current`'s Systems into `refine_one_source` (which consumes
+        // them) instead of deep-cloning every source first.
+        let src_meta: Vec<(crate::constraint::constraints::Goal, bool, usize)> =
+            current.iter()
+                .map(|s| (s.goal.clone(), s.incomplete, s.cases_len()))
+                .collect();
         let saturated_indexed: Vec<(usize, Source)> =
-            current.into_iter().enumerate().collect();
+            std::mem::take(&mut current).into_iter().enumerate().collect();
         // Per-worker MaudePool acquire: if a pool is set on the ctx, each
         // par_iter task borrows its own Maude subprocess for the
         // duration of `refine_one_source`, so workers don't serialise
@@ -1363,11 +1362,11 @@ fn saturate_sources_with_simp_opt(
                     )
                 }
             }).collect();
-        for (i, (new_cases, per_changed, _)) in per_source.into_iter().enumerate() {
-            let summary = src_summaries.get(i)
-                .expect("saturate per_source index mismatch");
-            let src_goal_and_incomplete = (summary.0.clone(), summary.1);
-            let prev_case_count = summary.2;
+        for ((new_cases, per_changed, _), meta) in
+            per_source.into_iter().zip(src_meta)
+        {
+            let src_goal_and_incomplete = (meta.0, meta.1);
+            let prev_case_count = meta.2;
             if per_changed { changed = true; }
             // Determine if the case count changed for this source.
             let new_case_count = new_cases.len();
@@ -1386,7 +1385,7 @@ fn saturate_sources_with_simp_opt(
                 for (n, sys) in &new_cases {
                     eprintln!("[refine]   case {:?}: {} nodes, {} edges, {} goals",
                         n, sys.nodes.len(), sys.edges.len(), sys.goals.len());
-                    if std::env::var("TAM_DBG_REFINE_VERBOSE").is_ok() {
+                    if tamarin_utils::env_gate!("TAM_DBG_REFINE_VERBOSE") {
                         let nm = case_name_list_to_string(n);
                         if nm.starts_with("Resolve1") || nm.starts_with("Resolve2") {
                             eprintln!("[refine]     nodes:");
@@ -1414,7 +1413,7 @@ fn saturate_sources_with_simp_opt(
                             }
                             eprintln!("[refine]     i_0 node detail:");
                             for (id, rule) in sys.nodes.iter() {
-                                if id.name == "i" {
+                                if &*id.name == "i" {
                                     eprintln!("[refine]       i_{} acts: {:?}", id.idx,
                                         rule.actions);
                                 }
@@ -2688,8 +2687,8 @@ fn freshen_system(
                 (v2, t2)
             })
             .collect();
-        out.eq_store.subst = tamarin_term::subst::Subst::from_list(shifted_subst);
-        for d in out.eq_store.conj.iter_mut() {
+        out.eq_store_mut().subst = tamarin_term::subst::Subst::from_list(shifted_subst);
+        for d in out.eq_store_mut().conj.iter_mut() {
             for s in d.substs.iter_mut() {
                 let shifted: Vec<_> = s.to_list().iter()
                     .map(|(v, t)| {
@@ -2713,9 +2712,9 @@ fn freshen_system(
                 propagated: s.propagated,
             }
         };
-        out.subterm_store.subterms = out.subterm_store.subterms.iter()
+        out.subterm_store_mut().subterms = out.subterm_store.subterms.iter()
             .map(shift_st).collect();
-        out.subterm_store.solved_subterms = out.subterm_store.solved_subterms.iter()
+        out.subterm_store_mut().solved_subterms = out.subterm_store.solved_subterms.iter()
             .map(shift_st).collect();
     }
     out
@@ -2775,14 +2774,14 @@ pub fn solve_with_source_cases_action_with_ctx(
         return None;
     }
     let m_live = &fa_live.terms[0];
-    if std::env::var("TAM_DBG_SRC_CASE").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_SRC_CASE") {
         let live_str = format!("{:?}", fa_live).chars().take(120).collect::<String>();
         eprintln!("[src_case] solve_with_source_cases CALLED for live={}", live_str);
     }
 
     // TAM_DBG_SRC_MATCH=1: dump each source pattern + match decision
     // for HS↔Rust diffing of source-case selection.
-    let dbg_match = std::env::var("TAM_DBG_SRC_MATCH").is_ok();
+    let dbg_match = tamarin_utils::env_gate!("TAM_DBG_SRC_MATCH");
     if dbg_match {
         let live_str = format!("{:?}", m_live).chars().take(160).collect::<String>();
         let caller = std::panic::Location::caller();
@@ -2851,13 +2850,13 @@ pub fn solve_with_source_cases_action_with_ctx(
         _ => return None,
     };
 
-    if std::env::var("TAM_RS_TRACE_APPLY_SRC").is_ok() {
+    if tamarin_utils::env_gate!("TAM_RS_TRACE_APPLY_SRC") {
         let goal_str = format!("{:?}", fa_live).chars().take(200).collect::<String>();
         let _cases_for_print = src.cases_or_empty();
         let case_names: Vec<&String> = _cases_for_print.iter().map(|(n, _)| n).collect();
         eprintln!("[RS_APPLY_SRC_PRE] live_goal={} cases={:?}", goal_str, case_names);
     }
-    if std::env::var("TAM_DBG_SRC_CASE").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_SRC_CASE") {
         let goal_str = format!("{:?}", fa_live).chars().take(120).collect::<String>();
         eprintln!("[src_case] LIVE goal={}", goal_str);
         for (n, c) in src.cases_or_empty() {
@@ -3188,7 +3187,7 @@ fn restrict_eq_store_to_stable_vars(
             .filter(|(v, _)| stable_vars.contains(v))
             .collect();
     sys.invalidate_max_var_idx_cache();
-    sys.eq_store.subst = tamarin_term::subst::Subst::from_list(kept);
+    sys.eq_store_mut().subst = tamarin_term::subst::Subst::from_list(kept);
 }
 
 /// Compute the goal's free vars (= `stableVars` in Haskell).  For
@@ -3256,7 +3255,7 @@ fn freshen_system_keep_with_shift(
     // VarSpec sort and LVar sort are distinct types and in-practice
     // names disambiguate node vs message vars.
     let keep_name_idx: std::collections::BTreeSet<(String, u64)> = keep.iter()
-        .map(|v| (v.name.clone(), v.idx))
+        .map(|v| (v.name.to_string(), v.idx))
         .collect();
     let shift_vs = |v: &tamarin_parser::ast::VarSpec| {
         if keep_name_idx.contains(&(v.name.clone(), v.idx)) {
@@ -3340,16 +3339,16 @@ fn freshen_system_keep_with_shift(
         .map(|g| crate::guarded::map_lvars_in_guarded(&g, &shift_vs))
         .collect();
     // Shift LNTerm vars inside subterm_store constraints.
-    for c in &mut out.subterm_store.subterms {
+    for c in &mut out.subterm_store_mut().subterms {
         c.small = c.small.clone().map_free(&mut |v| shift_lvar(&v));
         c.big = c.big.clone().map_free(&mut |v| shift_lvar(&v));
     }
-    for c in &mut out.subterm_store.solved_subterms {
+    for c in &mut out.subterm_store_mut().solved_subterms {
         c.small = c.small.clone().map_free(&mut |v| shift_lvar(&v));
         c.big = c.big.clone().map_free(&mut |v| shift_lvar(&v));
     }
     // Eq-store subst: shift both var keys and term values.
-    out.eq_store.subst = {
+    out.eq_store_mut().subst = {
         let pairs: Vec<_> = out.eq_store.subst.to_list().into_iter()
             .map(|(v, t)| {
                 let new_v = shift_lvar(&v);
@@ -3373,7 +3372,7 @@ fn freshen_system_keep_with_shift(
     // so `subst_system` still finds matching keys after a variant is
     // picked (the resolved1_contract_reachable concern); the witnesses in
     // the range are local and need no shift.
-    for disj in out.eq_store.conj.iter_mut() {
+    for disj in out.eq_store_mut().conj.iter_mut() {
         for s in disj.substs.iter_mut() {
             let pairs: Vec<_> = s.to_list().into_iter()
                 .map(|(v, t)| (shift_lvar(&v), t))
@@ -3430,7 +3429,7 @@ fn freshen_system_some_inst(
         if bindings.contains_key(v) { return; }
         let new_idx = maude.reserve_idxs(1);
         let new_v = tamarin_term::lterm::LVar {
-            name: v.name.clone(),
+            name: v.name,
             sort: v.sort,
             idx: new_idx,
         };
@@ -3546,7 +3545,7 @@ fn freshen_system_some_inst(
                 if !bindings.contains_key(&lv) {
                     let new_idx = maude.reserve_idxs(1);
                     bindings.insert(lv.clone(), tamarin_term::lterm::LVar {
-                        name: lv.name.clone(), sort: lv.sort, idx: new_idx,
+                        name: lv.name, sort: lv.sort, idx: new_idx,
                     });
                 }
             }
@@ -3610,8 +3609,8 @@ fn freshen_system_some_inst(
     // VarSpec sort hints are preserved unchanged.
     let vs_map: std::collections::BTreeMap<(String, u64), (String, u64)> =
         bindings.iter()
-            .map(|(orig, new)| ((orig.name.clone(), orig.idx),
-                                (new.name.clone(), new.idx)))
+            .map(|(orig, new)| ((orig.name.to_string(), orig.idx),
+                                (new.name.to_string(), new.idx)))
             .collect();
     let lookup_vs = |v: &tamarin_parser::ast::VarSpec| -> tamarin_parser::ast::VarSpec {
         if let Some((new_name, new_idx)) = vs_map.get(&(v.name.clone(), v.idx)) {
@@ -3686,15 +3685,15 @@ fn freshen_system_some_inst(
     out.lemmas = out.lemmas.into_iter()
         .map(|g| crate::guarded::map_lvars_in_guarded(&g, &lookup_vs))
         .collect();
-    for c in &mut out.subterm_store.subterms {
+    for c in &mut out.subterm_store_mut().subterms {
         c.small = c.small.clone().map_free(&mut |v| lookup(&v));
         c.big = c.big.clone().map_free(&mut |v| lookup(&v));
     }
-    for c in &mut out.subterm_store.solved_subterms {
+    for c in &mut out.subterm_store_mut().solved_subterms {
         c.small = c.small.clone().map_free(&mut |v| lookup(&v));
         c.big = c.big.clone().map_free(&mut |v| lookup(&v));
     }
-    out.eq_store.subst = {
+    out.eq_store_mut().subst = {
         let pairs: Vec<_> = out.eq_store.subst.to_list().into_iter()
             .map(|(v, t)| (lookup(&v), t.map_free(&mut |w| lookup(&w))))
             .collect();
@@ -3702,7 +3701,7 @@ fn freshen_system_some_inst(
     };
     // HS-faithful `mapFrees (SubstVFresh)` (SubstVFresh.hs:200-202):
     // rewrite ONLY the domain keys; leave the range (witnesses) UNTOUCHED.
-    for disj in out.eq_store.conj.iter_mut() {
+    for disj in out.eq_store_mut().conj.iter_mut() {
         for s in disj.substs.iter_mut() {
             let pairs: Vec<_> = s.to_list().into_iter()
                 .map(|(v, t)| (lookup(&v), t))
@@ -3732,7 +3731,7 @@ fn vspec_to_lvar(v: &tamarin_parser::ast::VarSpec) -> Option<tamarin_term::lterm
         SortHint::Untagged => return None,
     };
     Some(tamarin_term::lterm::LVar {
-        name: v.name.clone(), sort, idx: v.idx,
+        name: tamarin_term::intern::intern_str(v.name.as_str()), sort, idx: v.idx,
     })
 }
 
@@ -3886,7 +3885,7 @@ fn refine_source_case_action(
     // TAM_DBG_APPLY_SOURCE=1 to log every drop site with case name +
     // reason.  Use this to track WHICH source-case drops at WHICH
     // step (match-fail, refineSubst-fail, conjoin-fail, etc.).
-    let dbg_apply = std::env::var("TAM_DBG_APPLY_SOURCE").is_ok();
+    let dbg_apply = tamarin_utils::env_gate!("TAM_DBG_APPLY_SOURCE");
     // Only consumed by the TAM_DBG_APPLY_SOURCE trace below.  Matching
     // the case by content deep-clones every case `System` via
     // `cases_or_empty()`, so skip it entirely in the common (untraced)
@@ -3976,7 +3975,7 @@ fn refine_source_case_action(
         .map_free(&mut |v| shift_lvar(&v));
     let empty_keep: std::collections::BTreeSet<tamarin_term::lterm::LVar>
         = std::collections::BTreeSet::new();
-    if std::env::var("TAM_DBG_CASE_PRE_FRESHEN").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_CASE_PRE_FRESHEN") {
         eprintln!("[case_pre_freshen] case={}: case_sys.nodes:", case_label);
         for (id, ru) in case_sys.nodes.iter() {
             let nm = crate::constraint::solver::reduction::rule_case_name(ru);
@@ -3994,8 +3993,8 @@ fn refine_source_case_action(
         }
     }
     // TAM_DBG_CASE_DISJ=1: dump case_sys's eq_store.conj BEFORE freshen.
-    if std::env::var("TAM_DBG_CASE_DISJ").is_ok() {
-        let trunc = if std::env::var("TAM_DBG_CASE_DISJ_FULL").is_ok() { 9999 } else { 60 };
+    if tamarin_utils::env_gate!("TAM_DBG_CASE_DISJ") {
+        let trunc = if tamarin_utils::env_gate!("TAM_DBG_CASE_DISJ_FULL") { 9999 } else { 60 };
         for (i, d) in case_sys.eq_store.conj.iter().enumerate() {
             for (j, s) in d.substs.iter().enumerate() {
                 let pairs: Vec<String> = s.to_list().iter()
@@ -4010,8 +4009,8 @@ fn refine_source_case_action(
     let renamed_case = freshen_system_keep_with_shift(
         case_sys, rename_shift, &empty_keep);
     // TAM_DBG_CASE_DISJ=1: dump renamed_case's eq_store.conj AFTER freshen.
-    if std::env::var("TAM_DBG_CASE_DISJ").is_ok() {
-        let trunc = if std::env::var("TAM_DBG_CASE_DISJ_FULL").is_ok() { 9999 } else { 60 };
+    if tamarin_utils::env_gate!("TAM_DBG_CASE_DISJ") {
+        let trunc = if tamarin_utils::env_gate!("TAM_DBG_CASE_DISJ_FULL") { 9999 } else { 60 };
         for (i, d) in renamed_case.eq_store.conj.iter().enumerate() {
             for (j, s) in d.substs.iter().enumerate() {
                 let pairs: Vec<String> = s.to_list().iter()
@@ -4082,7 +4081,7 @@ fn refine_source_case_action(
     // then run them through the renamed case's Reduction.
     // ---------------------------------------------------------------
     let mut refined = Reduction::new(ctx, renamed_case);
-    if std::env::var("TAM_DBG_APPLY_REFINE").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_APPLY_REFINE") {
         eprintln!("[apply_refine] case={} PRE-solve_term_eqs eq_store entries:", case_label);
         for (v, t) in refined.sys.eq_store.subst.to_list().iter().take(10) {
             eprintln!("[apply_refine]   {}.{}/{:?} → {:?}", v.name, v.idx, v.sort,
@@ -4141,16 +4140,16 @@ fn refine_source_case_action(
     let arm_eq_stores: Vec<crate::tools::equation_store::EquationStore> =
         if term_eqs.is_empty() {
             // No refineSubst; keep current eq_store as the sole arm.
-            if std::env::var("TAM_RS_DBG_APPLY_SRC_FANOUT_ALL").is_ok() {
+            if tamarin_utils::env_gate!("TAM_RS_DBG_APPLY_SRC_FANOUT_ALL") {
                 eprintln!("[apply_src_fanout] case={} arms=0/skip n_term_eqs={}",
                     case_label, term_eqs.len());
             }
-            vec![refined.sys.eq_store.clone()]
+            vec![(*refined.sys.eq_store).clone()]
         } else {
             let outcome = refined.solve_term_eqs(SplitStrategy::SplitNow, &term_eqs);
             match outcome {
                 Err(_) | Ok(SolveOutcome::Contradictory) => {
-                    if std::env::var("TAM_RS_DBG_APPLY_SRC_FANOUT_ALL").is_ok() {
+                    if tamarin_utils::env_gate!("TAM_RS_DBG_APPLY_SRC_FANOUT_ALL") {
                         eprintln!("[apply_src_fanout] case={} arms=0/contra n_term_eqs={}",
                             case_label, term_eqs.len());
                     }
@@ -4158,7 +4157,7 @@ fn refine_source_case_action(
                     return Vec::new();
                 }
                 Ok(SolveOutcome::Linear(_)) => {
-                    if std::env::var("TAM_RS_DBG_APPLY_SRC_FANOUT_ALL").is_ok() {
+                    if tamarin_utils::env_gate!("TAM_RS_DBG_APPLY_SRC_FANOUT_ALL") {
                         eprintln!("[apply_src_fanout] case={} arms=1/linear n_term_eqs={}",
                             case_label, term_eqs.len());
                     }
@@ -4166,11 +4165,11 @@ fn refine_source_case_action(
                     // into refined.sys.eq_store.  Mirror as a single-arm
                     // Vec so the post-continuation runs once with that
                     // store.
-                    vec![refined.sys.eq_store.clone()]
+                    vec![(*refined.sys.eq_store).clone()]
                 }
                 Ok(SolveOutcome::Cases(arms)) => {
-                    if std::env::var("TAM_RS_DBG_APPLY_SRC_FANOUT").is_ok()
-                        || std::env::var("TAM_RS_DBG_APPLY_SRC_FANOUT_ALL").is_ok() {
+                    if tamarin_utils::env_gate!("TAM_RS_DBG_APPLY_SRC_FANOUT")
+                        || tamarin_utils::env_gate!("TAM_RS_DBG_APPLY_SRC_FANOUT_ALL") {
                         eprintln!("[apply_src_fanout] case={} arms={} n_term_eqs={}",
                             case_label, arms.len(), term_eqs.len());
                     }
@@ -4206,9 +4205,9 @@ fn refine_source_case_action(
         // (Reduction.hs:724-725 `disjunctionOfList performSplit`).
         let mut arm_sys = post_solve_sys_template.clone();
         arm_sys.invalidate_max_var_idx_cache();
-        arm_sys.eq_store = arm_eq_store;
+        arm_sys.eq_store = std::sync::Arc::new(arm_eq_store);
         let mut refined = Reduction::new(ctx, arm_sys);
-    if std::env::var("TAM_DBG_APPLY_REFINE").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_APPLY_REFINE") {
         eprintln!("[apply_refine] case={} POST-solve_term_eqs eq_store entries:", case_label);
         for (v, t) in refined.sys.eq_store.subst.to_list().iter().take(15) {
             eprintln!("[apply_refine]   {}.{}/{:?} → {:?}", v.name, v.idx, v.sort,
@@ -4220,13 +4219,13 @@ fn refine_source_case_action(
         dbg("post-subst-eq-store-false");
         continue;
     }
-    if std::env::var("TAM_DBG_APPLY_REFINE").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_APPLY_REFINE") {
         eprintln!("[apply_refine] case={} POST-subst:", case_label);
         for (id, ru) in refined.sys.nodes.iter() {
             let nm = crate::constraint::solver::reduction::rule_case_name(ru);
             if nm == "Serv_1" || nm == "Register_pk" {
                 eprintln!("[apply_refine]   node {:?} → {}", id, nm);
-                let trunc = if std::env::var("TAM_DBG_APPLY_REFINE_FULL").is_ok() { 1000 } else { 280 };
+                let trunc = if tamarin_utils::env_gate!("TAM_DBG_APPLY_REFINE_FULL") { 1000 } else { 280 };
                 for (i, p) in ru.premises.iter().enumerate() {
                     eprintln!("[apply_refine]     prem[{}]: {:?}", i,
                         format!("{:?}", p).chars().take(trunc).collect::<String>());
@@ -4311,7 +4310,7 @@ fn refine_source_case_action(
     // postFrees, plus live_sys nodes+subst+goals and POST-conjoin
     // nodes+subst+splits+goals.  Both pre- and post-conjoin dumps so we
     // can diff each phase against HS's equivalent.
-    if std::env::var("TAM_RS_TRACE_APPLY_SRC").is_ok() {
+    if tamarin_utils::env_gate!("TAM_RS_TRACE_APPLY_SRC") {
         let ls = |v: &tamarin_term::lterm::LVar| -> String {
             let sort = match v.sort {
                 tamarin_term::lterm::LSort::Fresh => "~",
@@ -4423,7 +4422,7 @@ fn conjoin_refine_arm(
     // recoverable post-split; left empty (TAM_DBG_APPLY_SOURCE drop traces
     // here print case= blank, which is fine — the refine half already
     // logged the labelled drops).
-    let dbg_apply = std::env::var("TAM_DBG_APPLY_SOURCE").is_ok();
+    let dbg_apply = tamarin_utils::env_gate!("TAM_DBG_APPLY_SOURCE");
     let case_label = String::new();
     let dbg = |reason: &str| {
         if dbg_apply {
@@ -4497,7 +4496,7 @@ fn conjoin_refine_arm(
     // continuation.
     let conjoin_arm_systems = std::mem::take(
         &mut r.pending_conjoin_arm_systems);
-    let dbg_cf = std::env::var("TAM_RS_DBG_CONJOIN_FANOUT").is_ok();
+    let dbg_cf = tamarin_utils::env_gate!("TAM_RS_DBG_CONJOIN_FANOUT");
     if dbg_cf && !conjoin_arm_systems.is_empty() {
         eprintln!("[conjoin_fanout] conjoin_refine_arm drained {} extra arms (case={})",
             conjoin_arm_systems.len(), case_label);
@@ -4564,7 +4563,7 @@ fn conjoin_refine_arm(
         if conc == prem { return None; }
         Some(tamarin_term::rewriting::Equal { lhs: conc, rhs: prem })
     }).collect();
-    if std::env::var("TAM_DBG_APPLY_E5").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_APPLY_E5") {
         let path = crate::constraint::solver::trace::case_path_string();
         eprintln!("[conjoin_refine_arm E.5] path={} edge_eqs.len={}", path, edge_eqs.len());
         for (i, e) in edge_eqs.iter().enumerate() {
@@ -4616,7 +4615,7 @@ fn conjoin_refine_arm(
                 for arm_eq in arms {
                     let mut arm_sys = template.clone();
                     arm_sys.invalidate_max_var_idx_cache();
-                    arm_sys.eq_store = arm_eq;
+                    arm_sys.eq_store = std::sync::Arc::new(arm_eq);
                     let mut arm_red = Reduction::new(ctx, arm_sys);
                     arm_red.subst_system();
                     if arm_red.sys.eq_store.is_false() { continue; }
@@ -4686,7 +4685,7 @@ fn apply_source_case_premise(
     };
     use tamarin_term::lterm::HasFrees;
 
-    let dbg_apply = std::env::var("TAM_DBG_APPLY_SOURCE").is_ok();
+    let dbg_apply = tamarin_utils::env_gate!("TAM_DBG_APPLY_SOURCE");
     // Only consumed by the TAM_DBG_APPLY_SOURCE trace below.  Matching
     // the case by content deep-clones every case `System` via
     // `cases_or_empty()`, so skip it entirely in the common (untraced)
@@ -4838,7 +4837,7 @@ fn apply_source_case_premise(
     // unifier-selection diffs are visible.  Logs the live goal, the case
     // being applied, and the match_pairs (the substitution produced by
     // matchToGoal / refineSubst-input).  Pair with HS's same flag.
-    if std::env::var("TAM_RS_TRACE_APPLY_SRC_PREM").is_ok() {
+    if tamarin_utils::env_gate!("TAM_RS_TRACE_APPLY_SRC_PREM") {
         let path = crate::constraint::solver::trace::case_path_string();
         let live_fact = format!("{:?}", fa_live);
         let live_fact = live_fact.chars().take(220).collect::<String>();
@@ -4880,7 +4879,7 @@ fn apply_source_case_premise(
     // silently dropped).
     let arm_eq_stores: Vec<crate::tools::equation_store::EquationStore> =
         if term_eqs.is_empty() {
-            vec![refined.sys.eq_store.clone()]
+            vec![(*refined.sys.eq_store).clone()]
         } else {
             let outcome = refined.solve_term_eqs(SplitStrategy::SplitNow, &term_eqs);
             match outcome {
@@ -4889,10 +4888,10 @@ fn apply_source_case_premise(
                     return Vec::new();
                 }
                 Ok(SolveOutcome::Linear(_)) => {
-                    vec![refined.sys.eq_store.clone()]
+                    vec![(*refined.sys.eq_store).clone()]
                 }
                 Ok(SolveOutcome::Cases(arms)) => {
-                    if std::env::var("TAM_RS_DBG_APPLY_SRC_FANOUT").is_ok() {
+                    if tamarin_utils::env_gate!("TAM_RS_DBG_APPLY_SRC_FANOUT") {
                         eprintln!("[apply_src_prem_fanout] case={} arms={}",
                             case_label, arms.len());
                     }
@@ -4914,7 +4913,7 @@ fn apply_source_case_premise(
     for arm_eq_store in arm_eq_stores {
         let mut arm_sys = post_solve_sys_template.clone();
         arm_sys.invalidate_max_var_idx_cache();
-        arm_sys.eq_store = arm_eq_store;
+        arm_sys.eq_store = std::sync::Arc::new(arm_eq_store);
         let mut refined = Reduction::new(ctx, arm_sys);
 
     refined.subst_system();
@@ -5065,7 +5064,7 @@ fn apply_source_case_premise(
                 for arm_eq in arms {
                     let mut arm_sys = template.clone();
                     arm_sys.invalidate_max_var_idx_cache();
-                    arm_sys.eq_store = arm_eq;
+                    arm_sys.eq_store = std::sync::Arc::new(arm_eq);
                     let mut arm_red = Reduction::new(ctx, arm_sys);
                     arm_red.subst_system();
                     if arm_red.sys.eq_store.is_false() { continue; }
@@ -5340,7 +5339,7 @@ fn graft_case_into_action(
             merged_pairs.push((new_lv, lt));
         }
     }
-    out.eq_store.subst = tamarin_term::subst::Subst::from_list(merged_pairs);
+    out.eq_store_mut().subst = tamarin_term::subst::Subst::from_list(merged_pairs);
     Some(out)
 }
 
@@ -5645,7 +5644,7 @@ fn guarded_walk_frees(g: &crate::guarded::Guarded, push: &mut dyn FnMut(&tamarin
     collect(g, &mut frees);
     for vs in &frees {
         let sort = varspec_sort_to_lsort(&vs.sort);
-        push(&tamarin_term::lterm::LVar { name: vs.name.clone(), sort, idx: vs.idx });
+        push(&tamarin_term::lterm::LVar { name: tamarin_term::intern::intern_str(vs.name.as_str()), sort, idx: vs.idx });
     }
 }
 
@@ -5804,7 +5803,7 @@ fn compute_rename_map(
                   fresh: &mut tamarin_utils::fresh::FastFreshState| {
         if rename.contains_key(v) { return; }
         let new_idx = fresh.fresh_ident();
-        let new_v = LVar { name: String::new(), sort: v.sort, idx: new_idx };
+        let new_v = LVar { name: "".into(), sort: v.sort, idx: new_idx };
         rename.insert(v.clone(), new_v);
     };
     // Step 3: orderedVars sys — varOccurences from nodes ONLY,
@@ -5964,7 +5963,7 @@ fn write_gfree_var(
 ) {
     use std::fmt::Write as _;
     let sort = varspec_sort_to_lsort(&v.sort);
-    let lv = tamarin_term::lterm::LVar { name: v.name.clone(), sort, idx: v.idx };
+    let lv = tamarin_term::lterm::LVar { name: tamarin_term::intern::intern_str(v.name.as_str()), sort, idx: v.idx };
     let rv = rename.get(&lv).unwrap_or(&lv);
     // Encode the renamed identity (name + idx + sort) — matches what the
     // old subst_guarded+Debug path encoded for a Free leaf.
@@ -6246,7 +6245,7 @@ fn compute_compare_systems_key(
                                     n: &mut u64| {
                     if !m.contains_key(v) {
                         m.insert(v.clone(), tamarin_term::lterm::LVar {
-                            name: String::new(), sort: v.sort, idx: *n,
+                            name: "".into(), sort: v.sort, idx: *n,
                         });
                         *n += 1;
                     }
@@ -6606,8 +6605,8 @@ where
     F: Fn(&T) -> &crate::constraint::system::System,
 {
     if !(enable_bp || enable_mset) { return cases; }
-    let dbg = std::env::var("TAM_RS_DBG_REMOVE_REDUNDANT").is_ok();
-    let dump = std::env::var("TAM_RS_DBG_RRC_DUMP").is_ok();
+    let dbg = tamarin_utils::env_gate!("TAM_RS_DBG_REMOVE_REDUNDANT");
+    let dump = tamarin_utils::env_gate!("TAM_RS_DBG_RRC_DUMP");
     let pre = cases.len();
     // Decorate with (original index, canonical key).  HS:
     //   decoratedCases = map (second addNormSys) $ zip [0..] cases0
@@ -6762,7 +6761,7 @@ mod tests {
         let h = tamarin_term::maude_proc::MaudeHandle::start(
             &path, tamarin_term::maude_sig::pair_maude_sig()).unwrap();
 
-        let a_tag = FactTag::Proto(Multiplicity::Linear, "A".to_string(), 1);
+        let a_tag = FactTag::Proto(Multiplicity::Linear, "A".into(), 1);
         let a_fact = Fact::new(a_tag.clone(), vec![msg_var("x", 0)]);
         let init: ProtoRuleE = Rule::new(
             ProtoRuleEInfo::standard("Init"),
@@ -6819,7 +6818,7 @@ mod tests {
 
         // Minimal protocol so there's at least one proto rule (so
         // `precompute_full_sources` actually runs).
-        let a_tag = FactTag::Proto(Multiplicity::Linear, "A".to_string(), 1);
+        let a_tag = FactTag::Proto(Multiplicity::Linear, "A".into(), 1);
         let a_fact = Fact::new(a_tag.clone(), vec![msg_var("x", 0)]);
         let init: ProtoRuleE = Rule::new(
             ProtoRuleEInfo::standard("Init"),
@@ -6896,7 +6895,7 @@ mod tests {
         let pub_b = LVar::new("b", LSort::Pub, 0);
         let mut sys = System::empty();
         sys.invalidate_max_var_idx_cache();
-        sys.eq_store.subst = Subst::from_list(vec![
+        sys.eq_store_mut().subst = Subst::from_list(vec![
             (t1.clone(),  Term::Lit(Lit::Var(pub_a))),
             (m19.clone(), Term::Lit(Lit::Var(pub_b))),
             (sk28.clone(), Term::Lit(Lit::Var(t2.clone()))),
@@ -6938,7 +6937,7 @@ mod tests {
 
         let mut sys = System::empty();
         sys.invalidate_max_var_idx_cache();
-        sys.eq_store.subst = Subst::from_list(vec![
+        sys.eq_store_mut().subst = Subst::from_list(vec![
             (t1.clone(),  Term::Lit(Lit::Var(e10.clone()))),
             (e10.clone(), Term::Lit(Lit::Var(blind_arg.clone()))),
         ]);
@@ -6973,7 +6972,7 @@ mod tests {
         let pub_b = LVar::new("b", LSort::Pub, 0);
         let mut sys = System::empty();
         sys.invalidate_max_var_idx_cache();
-        sys.eq_store.subst = Subst::from_list(vec![
+        sys.eq_store_mut().subst = Subst::from_list(vec![
             (m19, Term::Lit(Lit::Var(pub_a))),
             (sk28, Term::Lit(Lit::Var(pub_b))),
         ]);

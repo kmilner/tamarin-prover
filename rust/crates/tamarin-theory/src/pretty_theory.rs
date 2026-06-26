@@ -1479,8 +1479,8 @@ fn lnfacts_to_parser(facts: &[crate::fact::LNFact]) -> Vec<p::Fact> {
 pub fn lnfact_to_parser(fa: &crate::fact::LNFact) -> p::Fact {
     use crate::fact::FactTag;
     let (name, persistent) = match &fa.tag {
-        FactTag::Proto(crate::fact::Multiplicity::Persistent, n, _) => (n.clone(), true),
-        FactTag::Proto(_, n, _) => (n.clone(), false),
+        FactTag::Proto(crate::fact::Multiplicity::Persistent, n, _) => (n.to_string(), true),
+        FactTag::Proto(_, n, _) => (n.to_string(), false),
         FactTag::Fresh => ("Fr".to_string(), false),
         FactTag::In => ("In".to_string(), false),
         FactTag::Out => ("Out".to_string(), false),
@@ -1513,7 +1513,7 @@ fn lnterm_to_parser(t: &tamarin_term::lterm::LNTerm) -> p::Term {
                 LSort::Msg => p::SortHint::Msg,
             };
             p::Term::Var(p::VarSpec {
-                name: v.name.clone(),
+                name: v.name.to_string(),
                 idx: v.idx,
                 sort,
                 typ: None,
@@ -1522,10 +1522,10 @@ fn lnterm_to_parser(t: &tamarin_term::lterm::LNTerm) -> p::Term {
         Term::Lit(Lit::Con(n)) => {
             use tamarin_term::lterm::NameTag;
             match n.tag {
-                NameTag::Pub => p::Term::PubLit(n.id.0.clone()),
-                NameTag::Fresh => p::Term::FreshLit(n.id.0.clone()),
-                NameTag::Nat => p::Term::NatLit(n.id.0.clone()),
-                NameTag::Node => p::Term::PubLit(n.id.0.clone()),
+                NameTag::Pub => p::Term::PubLit(n.id.0.to_string()),
+                NameTag::Fresh => p::Term::FreshLit(n.id.0.to_string()),
+                NameTag::Nat => p::Term::NatLit(n.id.0.to_string()),
+                NameTag::Node => p::Term::PubLit(n.id.0.to_string()),
             }
         }
         Term::App(FunSym::NoEq(sym), args) => {

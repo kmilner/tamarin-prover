@@ -393,7 +393,7 @@ fn lock_pub_term(v: &LVar) -> LNTerm {
 fn map_fact_name(f: &LNFact, prefix: &str) -> LNFact {
     use tamarin_theory::fact::FactTag;
     let tag = match &f.tag {
-        FactTag::Proto(m, s, i) => FactTag::Proto(*m, format!("{prefix}{s}"), *i),
+        FactTag::Proto(m, s, i) => FactTag::Proto(*m, tamarin_term::intern::intern_str(&format!("{prefix}{s}")), *i),
         other => other.clone(),
     };
     let mut nf = tamarin_theory::fact::Fact::new(tag, f.terms.clone());
@@ -405,7 +405,7 @@ fn map_fact_name(f: &LNFact, prefix: &str) -> LNFact {
 /// multiplicity, so build the tag directly.
 fn proto_fact_mult(mult: Multiplicity, name: &str, terms: Vec<LNTerm>) -> LNFact {
     use tamarin_theory::fact::{Fact, FactTag};
-    Fact::new(FactTag::Proto(mult, name.to_string(), terms.len()), terms)
+    Fact::new(FactTag::Proto(mult, tamarin_term::intern::intern_str(name), terms.len()), terms)
 }
 
 // =============================================================================
@@ -589,7 +589,7 @@ pub fn to_rule(r: &AnnotatedRule<ProcessAnnotation<LVar>>) -> ProtoRuleE {
         )),
     };
     let info = ProtoRuleEInfo {
-        name: ProtoRuleName::Stand(name),
+        name: ProtoRuleName::Stand(tamarin_term::intern::intern_str(&name)),
         attributes: attr,
         restrictions: Vec::new(),
     };
@@ -661,7 +661,7 @@ mod tests {
         let lnf = fact_to_fact(&f);
         match &lnf.tag {
             tamarin_theory::fact::FactTag::Proto(m, n, _) => {
-                assert_eq!(n, "State_1");
+                assert_eq!(&**n, "State_1");
                 assert_eq!(*m, Multiplicity::Linear);
             }
             _ => panic!("expected proto fact"),
@@ -673,7 +673,7 @@ mod tests {
         let f = TransFact::State(StateKind::LState, vec![], vec![]);
         let lnf = fact_to_fact(&f);
         if let tamarin_theory::fact::FactTag::Proto(_, n, _) = &lnf.tag {
-            assert_eq!(n, "State_");
+            assert_eq!(&**n, "State_");
         } else {
             panic!();
         }

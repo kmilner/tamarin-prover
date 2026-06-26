@@ -92,7 +92,7 @@ fn fact_tag_label(tag: &crate::fact::FactTag) -> String {
     match tag {
         FactTag::Ku => "KU".to_string(),
         FactTag::Kd => "KD".to_string(),
-        FactTag::Proto(_, name, _) => name.clone(),
+        FactTag::Proto(_, name, _) => name.to_string(),
         FactTag::Fresh => "Fr".to_string(),
         FactTag::In => "In".to_string(),
         FactTag::Out => "Out".to_string(),
@@ -159,7 +159,7 @@ pub fn term_summary(t: &tamarin_term::lterm::LNTerm) -> String {
                 fn flatten<'a>(t: &'a tamarin_term::lterm::LNTerm,
                                out: &mut Vec<&'a tamarin_term::lterm::LNTerm>) {
                     if let Term::App(FunSym::NoEq(ns), args) = t {
-                        if ns.name == b"pair" {
+                        if &*ns.name == b"pair" {
                             flatten(&args[0], out);
                             flatten(&args[1], out);
                             return;

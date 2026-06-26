@@ -107,7 +107,7 @@ fn annotate_locks_go(
         Process::Action(SapicAction::Lock(t), a, body) => {
             // freshLVar "lock" LSortMsg — fast counter, name ignored.
             let v = LVar {
-                name: "lock".to_string(),
+                name: "lock".into(),
                 sort: LSort::Msg,
                 idx: fresh.fresh_ident(),
             };
@@ -176,7 +176,7 @@ mod tests {
         // The lock annotation carries `lock` with idx 0.
         if let Process::Action(SapicAction::Lock(_), a, body) = out {
             let lv = a.lock.expect("lock annotated");
-            assert_eq!(lv.0.name, "lock");
+            assert_eq!(&*lv.0.name, "lock");
             assert_eq!(lv.0.idx, 0);
             assert_eq!(lv.0.sort, LSort::Msg);
             // ...and the matching unlock carries the SAME lock variable as unlock.

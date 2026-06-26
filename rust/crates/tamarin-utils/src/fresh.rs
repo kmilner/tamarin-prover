@@ -5,7 +5,7 @@
 //! explicitly — no transformer stack required. We provide both the *fast*
 //! flavour (single counter) and the *precise* flavour (per-name counter).
 
-use std::collections::HashMap;
+use crate::FastMap;
 
 // =============================================================================
 // Fast: single global counter.
@@ -57,11 +57,11 @@ impl FastFreshState {
 /// Haskell implementation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PreciseFreshState {
-    map: HashMap<String, u64>,
+    map: FastMap<String, u64>,
 }
 
 impl PreciseFreshState {
-    pub fn nothing_used() -> Self { PreciseFreshState { map: HashMap::new() } }
+    pub fn nothing_used() -> Self { PreciseFreshState { map: FastMap::default() } }
 
     /// Port of HS `avoidPreciseVars` (Term/LTerm.hs:681-684):
     /// `foldl' (\m (name, idx) -> insertWith max name (idx+1) m) empty`.
@@ -70,7 +70,7 @@ impl PreciseFreshState {
     /// `Sapic.Typing.renameUnique` to avoid colliding with the process's
     /// existing variables.
     pub fn avoid_precise<I: IntoIterator<Item = (String, u64)>>(vars: I) -> Self {
-        let mut map: HashMap<String, u64> = HashMap::new();
+        let mut map: FastMap<String, u64> = FastMap::default();
         for (name, idx) in vars {
             let want = idx + 1;
             map.entry(name)
@@ -117,7 +117,7 @@ impl PreciseFreshState {
     }
 
     /// Read-only view of the underlying counters.
-    pub fn as_map(&self) -> &HashMap<String, u64> { &self.map }
+    pub fn as_map(&self) -> &FastMap<String, u64> { &self.map }
 }
 
 #[cfg(test)]

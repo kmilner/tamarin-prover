@@ -77,7 +77,7 @@ impl OpenProtoRule {
 
     pub fn name(&self) -> &str {
         match &self.rule.info.name {
-            crate::rule::ProtoRuleName::Stand(n) => n.as_str(),
+            crate::rule::ProtoRuleName::Stand(n) => n,
             crate::rule::ProtoRuleName::Fresh => "Fresh",
         }
     }

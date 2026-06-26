@@ -274,7 +274,7 @@ pub fn abstract_rule_and_variants(
     // HS's evalFreshTAvoiding semantics.
     let local_maude_owned = maude.with_fresh_counter_from(avoid_max);
     let maude: &MaudeHandle = &local_maude_owned;
-    if std::env::var("TAM_DBG_FRESH_TRACE").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_FRESH_TRACE") {
         eprintln!("[fresh-trace] rule={:?} avoid_max={} counter_at_entry={}",
             rule.info.name, avoid_max, maude.fresh_counter_peek());
     }
@@ -282,7 +282,7 @@ pub fn abstract_rule_and_variants(
     fn name_hint(t: &LNTerm) -> String {
         use tamarin_term::vterm::Lit;
         match t {
-            Term::Lit(Lit::Var(v)) => v.name.clone(),
+            Term::Lit(Lit::Var(v)) => v.name.to_string(),
             _ => "z".to_string(),
         }
     }
@@ -319,7 +319,7 @@ pub fn abstract_rule_and_variants(
         }
         let new_idx = maude.reserve_idxs(1);
         let v = LVar {
-            name: name_hint(t),
+            name: tamarin_term::intern::intern_str(&name_hint(t)),
             // HS-faithful `abstrTerm` (RuleVariants.hs:104):
             // `importBinding (\`LVar\` sortOfLNTerm t) t (getHint t)`.
             // `sort_of_lnterm` (lterm.rs:216) IS HS `sortOfLNTerm`:
@@ -519,7 +519,7 @@ pub fn abstract_rule_and_variants(
         s.into_iter().collect()
     };
 
-    if std::env::var("TAM_DBG_HS_COMPOSE").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_HS_COMPOSE") {
         eprintln!("[hs-compose] rule={:?} #variants={}",
                   rule.info.name, raw_substs.len());
     }
@@ -669,13 +669,13 @@ pub fn abstract_rule_and_variants(
     // JKL_TS1_2004 Init_2 keeps `z.0 → 'g'^lkR; z.1 → 'g'^(lkI*lkR)` in
     // the residual instead of baking them into the rule's `!Sessk(...)`
     // conclusion — diverging Sessk_reveal source-case numbering downstream.
-    if std::env::var("TAM_DBG_FRESH_TRACE").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_FRESH_TRACE") {
         eprintln!("[fresh-trace] rule={:?} pre-simp_disj counter={} composed_substs={}",
             rule.info.name, maude.fresh_counter_peek(), composed_substs.len());
     }
     let (common_subst, residual) = crate::tools::equation_store::EquationStore::simp_disjunction_with_maude(
         composed_substs, |_, _| false, maude);
-    if std::env::var("TAM_DBG_FRESH_TRACE").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_FRESH_TRACE") {
         eprintln!("[fresh-trace] rule={:?} post-simp_disj counter={}",
             rule.info.name, maude.fresh_counter_peek());
     }
@@ -756,7 +756,7 @@ pub fn abstract_rule_and_variants(
     // — all rule keys at idx 0 → sorted by name first → CHECKSIGN
     // variant sort order matches HS for test4/test5.
     //
-    if std::env::var("TAM_DBG_VARIANT_OUT").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_VARIANT_OUT") {
         eprintln!("[variant-out-pre] rule={:?} #final_substs={}", rule.info.name, final_substs.len());
         for (i, s) in final_substs.iter().enumerate() {
             let keys: Vec<String> = s.dom().map(|v| format!("{}.{}/{:?}", v.name, v.idx, v.sort)).collect();
@@ -766,7 +766,7 @@ pub fn abstract_rule_and_variants(
     let (abstracted_rule, final_substs) =
         rename_precise_rule_with_variants(abstracted_rule, final_substs);
 
-    if std::env::var("TAM_DBG_VARIANT_OUT").is_ok() {
+    if tamarin_utils::env_gate!("TAM_DBG_VARIANT_OUT") {
         eprintln!("[variant-out] rule={:?} #final_substs={}", rule.info.name, final_substs.len());
         for (i, s) in final_substs.iter().enumerate() {
             let keys: Vec<String> = s.dom().map(|v| format!("{}.{}/{:?}", v.name, v.idx, v.sort)).collect();
@@ -830,7 +830,7 @@ fn rule_renames_under_precise(rule: &ProtoRuleE) -> bool {
         if map.contains_key(v) { continue; }
         let idx = state.fresh_ident(&v.name);
         if idx != v.idx { return true; }
-        map.insert(v.clone(), LVar { name: v.name.clone(), sort: v.sort, idx });
+        map.insert(v.clone(), LVar { name: v.name, sort: v.sort, idx });
     }
     false
 }
@@ -848,7 +848,7 @@ fn rename_precise_rule_with_variants(
     let import = |v: &LVar, st: &mut PreciseFreshState, m: &mut HashMap<LVar, LVar>| {
         if m.contains_key(v) { return; }
         let idx = st.fresh_ident(&v.name);
-        let new_v = LVar { name: v.name.clone(), sort: v.sort, idx };
+        let new_v = LVar { name: v.name, sort: v.sort, idx };
         m.insert(v.clone(), new_v);
     };
 
@@ -1175,7 +1175,7 @@ mod tests {
 
     fn empty_rule(name: &str) -> ProtoRuleE {
         let info = ProtoRuleEInfo {
-            name: ProtoRuleName::Stand(name.to_string()),
+            name: ProtoRuleName::Stand(tamarin_term::intern::intern_str(name)),
             attributes: RuleAttributes::empty(),
             restrictions: Vec::new(),
         };

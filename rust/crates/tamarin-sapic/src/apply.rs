@@ -268,7 +268,7 @@ fn reelaborate_rule_body(
 /// role exactly as HS's `toRule` produced them.
 fn synth_parsed_rule(rule: &ProtoRuleE) -> p::Rule {
     let name = match &rule.info.name {
-        ProtoRuleName::Stand(n) => n.clone(),
+        ProtoRuleName::Stand(n) => n.to_string(),
         ProtoRuleName::Fresh => "Fresh".to_string(),
     };
     let attrs = synth_attrs(&rule.info.attributes);

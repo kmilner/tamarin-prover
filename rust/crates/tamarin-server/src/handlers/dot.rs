@@ -644,7 +644,7 @@ fn is_not_diff_annotation(ru: &RuleACInst, fa: &LNFact) -> bool {
     let diff_fact_name = format!("Diff{}", rule_name_diff);
     let is_diff = matches!(&fa.tag,
         FactTag::Proto(tamarin_theory::fact::Multiplicity::Linear, n, 0)
-            if *n == diff_fact_name)
+            if **n == *diff_fact_name)
         && fa.terms.is_empty();
     !is_diff
 }
@@ -990,7 +990,7 @@ mod tests {
             };
             Rule::new(
                 RuleInfo::Proto(ProtoRuleACInstInfo {
-                    name: ProtoRuleName::Stand(name.to_string()),
+                    name: ProtoRuleName::Stand(tamarin_term::intern::intern_str(name)),
                     attributes: attrs,
                     loop_breakers: Vec::new(),
                 }),
@@ -1073,7 +1073,7 @@ mod tests {
             };
             Rule::new(
                 RuleInfo::Proto(ProtoRuleACInstInfo {
-                    name: ProtoRuleName::Stand(name.to_string()),
+                    name: ProtoRuleName::Stand(tamarin_term::intern::intern_str(name)),
                     attributes: attrs,
                     loop_breakers: Vec::new(),
                 }),
@@ -1130,7 +1130,7 @@ mod tests {
         let mk = |name: &str| -> RuleACInst {
             Rule::new(
                 RuleInfo::Proto(ProtoRuleACInstInfo {
-                    name: ProtoRuleName::Stand(name.to_string()),
+                    name: ProtoRuleName::Stand(tamarin_term::intern::intern_str(name)),
                     attributes: RuleAttributes::empty(),
                     loop_breakers: Vec::new(),
                 }),
@@ -1158,7 +1158,7 @@ mod tests {
         };
         Rule::new(
             RuleInfo::Proto(ProtoRuleACInstInfo {
-                name: ProtoRuleName::Stand(name.to_string()),
+                name: ProtoRuleName::Stand(tamarin_term::intern::intern_str(name)),
                 attributes: RuleAttributes::empty(),
                 loop_breakers: Vec::new(),
             }),
@@ -1324,7 +1324,7 @@ mod tests {
                 ..Default::default() };
             Rule::new(
                 RuleInfo::Proto(ProtoRuleACInstInfo {
-                    name: ProtoRuleName::Stand(name.to_string()),
+                    name: ProtoRuleName::Stand(tamarin_term::intern::intern_str(name)),
                     attributes: attrs,
                     loop_breakers: Vec::new(),
                 }),

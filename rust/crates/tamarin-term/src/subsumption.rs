@@ -253,7 +253,7 @@ mod tests {
         assert_eq!(pairs.len(), 1);
         match &pairs[0].1 {
             Term::Lit(Lit::Var(rv)) => {
-                assert_eq!(rv.name, "x");
+                assert_eq!(&*rv.name, "x");
                 assert_eq!(rv.sort, LSort::Msg);
                 assert_eq!(rv.idx, 1);
             }

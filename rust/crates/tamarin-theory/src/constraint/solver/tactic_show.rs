@@ -510,7 +510,7 @@ pub fn fact_name_probe(goal: &crate::constraint::constraints::Goal) -> FactNameP
     match goal {
         Goal::Premise(_, fa) => {
             if let FactTag::Proto(Multiplicity::Linear, name, _) = &fa.tag {
-                FactNameProbe::PremiseLinearName(name.clone())
+                FactNameProbe::PremiseLinearName(name.to_string())
             } else {
                 FactNameProbe::None
             }

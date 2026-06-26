@@ -276,7 +276,7 @@ fn run_variants(args: &Args) -> Result<i32, RunError> {
                 _ => "",
             };
             let name: String = match &f.tag {
-                FactTag::Proto(_, n, _) => n.clone(),
+                FactTag::Proto(_, n, _) => n.to_string(),
                 FactTag::Fresh => "Fr".into(),
                 FactTag::In => "In".into(),
                 FactTag::Out => "Out".into(),

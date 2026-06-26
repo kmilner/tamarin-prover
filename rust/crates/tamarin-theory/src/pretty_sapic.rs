@@ -246,7 +246,7 @@ fn pretty_pattern(t: &SapicTerm, match_vars: &std::collections::BTreeSet<SapicLV
 /// printed by the recursive `ppTerm`, NOT flattened here).
 fn collect_pair_tail<'a>(t: &'a SapicTerm, out: &mut Vec<&'a SapicTerm>) {
     if let VTerm::App(FunSym::NoEq(sym), args) = t {
-        if sym.name == b"pair" && args.len() == 2 {
+        if &*sym.name == b"pair" && args.len() == 2 {
             out.push(&args[0]);
             collect_pair_tail(&args[1], out);
             return;
