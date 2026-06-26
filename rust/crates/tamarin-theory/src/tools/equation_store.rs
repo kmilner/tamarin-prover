@@ -637,9 +637,9 @@ impl EquationStore {
         // addRuleVariants invariant), BUT applyBound's restrict expansion
         // to include `varsRange(newsubst)` lifts system-var range
         // references in disj substs into the disj domain via
-        // EXTRACT-SYSTEM-VARS-TO-DOMAIN (see apply_eq_store body).  RS
-        // previously short-circuited the empty-empty case, skipping this
-        // lift — observable on the LAK06::noninjectiveagreementTAG path.
+        // EXTRACT-SYSTEM-VARS-TO-DOMAIN (see apply_eq_store body).  The
+        // empty-empty case must NOT be short-circuited — skipping this
+        // lift is observable on the LAK06::noninjectiveagreementTAG path.
         if ac_residuals.is_empty() {
             if !local_subst.is_empty() {
                 log_fresh_bindings("local", &local_subst);
@@ -647,9 +647,8 @@ impl EquationStore {
                 log_vr_node_bindings("local", &local_subst);
             }
             if self.conj.is_empty() {
-                if std::env::var("TAM_RS_DBG_APPLY_EQ_STORE").is_ok() {
-                    let filter = std::env::var("TAM_RS_DBG_APPLY_EQ_STORE_FILTER")
-                        .map(|s| s == "substantive").unwrap_or(false);
+                if aes_dbg() {
+                    let filter = aes_dbg_filter_substantive();
                     if !filter {
                         eprintln!("[rs-aes-tick] conj=0 substantive=false (short-circuit:add_eqs-no-ac)");
                     }
@@ -702,8 +701,8 @@ impl EquationStore {
         //     (subst, substs) -> addDisj (applyEqStoreAt ... subst eqStore)
         //                                (S.fromList substs)  -- Just sid
         // — it's stored as a SINGLETON VFresh disjunction (with split id),
-        // NOT eagerly composed.  Faithful consequences vs the old eager
-        // compose: (a) the fold happens via `simp`'s `simpSingleton`
+        // NOT eagerly composed.  Faithful HS behaviour: (a) the fold
+        // happens via `simp`'s `simpSingleton`
         // (`freshToFree` witness naming, EquationStore.hs `simpSingleton`)
         // plus a SECOND `applyEqStoreAt "foreachDisj:simpSingleton"` round
         // over the remaining disjs (EquationStore.hs `foreachDisj`) — two
@@ -712,10 +711,8 @@ impl EquationStore {
         // not one round with their composition; (b) SplitLater callers get
         // a SplitG goal + a live singleton disj (HS Reduction.hs:618
         // `solveRuleEqs SplitLater`, addEqs/performSplit at 719-725);
-        // (c) addDisj bumps the next-split-id counter.  The old eager
-        // compose used `freshen_witness_range` naming and one combined
-        // apply_eq_store round, with no HS counterpart for non-empty
-        // unifiers.  (Note: paired HS/RS traces on Scott::key_secrecy
+        // (c) addDisj bumps the next-split-id counter.
+        // (Note: paired HS/RS traces on Scott::key_secrecy
         // showed applyBound itself never SPLITS a disj subst on this
         // corpus — out>1 occurred 0 times on both sides — so the effect
         // of this fix is the naming/cadence/goal-counter alignment, not
@@ -759,9 +756,8 @@ impl EquationStore {
             // (e.g. `{z → verify(s,m,pkA)}` vs `{z → true}` collapse).
             // Mirrors EquationStore.hs:228 (addEqs single-unifier arm).
             if self.conj.is_empty() {
-                if std::env::var("TAM_RS_DBG_APPLY_EQ_STORE").is_ok() {
-                    let filter = std::env::var("TAM_RS_DBG_APPLY_EQ_STORE_FILTER")
-                        .map(|s| s == "substantive").unwrap_or(false);
+                if aes_dbg() {
+                    let filter = aes_dbg_filter_substantive();
                     if !filter {
                         eprintln!("[rs-aes-tick] conj=0 substantive=false (short-circuit:add_eqs-single-maude)");
                     }
@@ -803,9 +799,8 @@ impl EquationStore {
         // first perform_split (1588-line diff).  See [[locked diagnosis
         // 2026-06-07 apply_eq_store gating]].
         if self.conj.is_empty() {
-            if std::env::var("TAM_RS_DBG_APPLY_EQ_STORE").is_ok() {
-                let filter = std::env::var("TAM_RS_DBG_APPLY_EQ_STORE_FILTER")
-                    .map(|s| s == "substantive").unwrap_or(false);
+            if aes_dbg() {
+                let filter = aes_dbg_filter_substantive();
                 if !filter {
                     eprintln!("[rs-aes-tick] conj=0 substantive=false (short-circuit:add_eqs-multi-maude)");
                 }
@@ -1477,18 +1472,18 @@ impl EquationStore {
                     crate::constraint::solver::trace::current_op_label()));
             // HS-faithful order (`foreachDisj`, EquationStore.hs):
             // REPLACE the disjunction with the abstracted substs FIRST,
-            // THEN run `applyEqStore` with the factored free subst.  RS
-            // previously ran apply_eq_store BEFORE replacing the disj, so
-            // apply_eq_store re-unified the OLD (un-abstracted) disj substs
-            // (still carrying `v → op(a, b)`) against the new free subst
-            // `{v → op(x1, x2)}`.  That re-unification re-allocated witnesses
-            // for OTHER range terms that shared `a, b` (e.g. a sibling
-            // `pcsig2 → pcs(op(a, b), ...)` entry), splitting the shared
-            // `a, b` into distinct fresh vars — the resolved1 linkage break
-            // (Out's `sign(a,b)` vs In's `pcs(sign(a',b'),...)`).  Applying
-            // the abstraction to the disj first makes `a, b` cleanly bound
-            // via `{x1 → a, x2 → b}`, and the subsequent apply_eq_store
-            // re-unifies the ALREADY-abstracted disj, preserving the share.
+            // THEN run `applyEqStore` with the factored free subst.  Do NOT
+            // run apply_eq_store before replacing the disj: re-unifying the
+            // un-abstracted disj substs (still carrying `v → op(a, b)`)
+            // against the new free subst `{v → op(x1, x2)}` re-allocates
+            // witnesses for OTHER range terms that shared `a, b` (e.g. a
+            // sibling `pcsig2 → pcs(op(a, b), ...)` entry), splitting the
+            // shared `a, b` into distinct fresh vars — the resolved1 linkage
+            // break (Out's `sign(a,b)` vs In's `pcs(sign(a',b'),...)`).
+            // Applying the abstraction to the disj first makes `a, b`
+            // cleanly bound via `{x1 → a, x2 → b}`, and the subsequent
+            // apply_eq_store re-unifies the ALREADY-abstracted disj,
+            // preserving the share.
             let new_substs: Vec<LNSubstVFresh> = self.conj[idx].substs.iter()
                 .zip(argss.iter())
                 .map(|(s, args)| {
@@ -1827,10 +1822,11 @@ impl EquationStore {
         // singleton disj.  applyEqStore composes msubst into eqsSubst
         // AND re-unifies remaining disj substs against the new
         // eqsSubst — so SplitG variants whose values reference the
-        // newly-bound vars get refined.  Direct compose (the previous
-        // code path) was a divergence that left remaining variants
-        // stale, surfacing as perform_split picking different cases
-        // than HS.  See [[project-apply-eq-store-divergence]].
+        // newly-bound vars get refined.  Direct compose (used only as the
+        // Err fallback below) leaves remaining variants stale, surfacing
+        // as perform_split picking different cases than HS — so the
+        // re-unifying apply_eq_store path is the faithful one.
+        // See [[project-apply-eq-store-divergence]].
         if let Some(m) = maude {
             // apply_eq_store does: compose new_subst into self.subst +
             // re-unify all remaining conj disjs.  On Err (e.g. dom/range
@@ -1904,23 +1900,6 @@ impl EquationStore {
             [] => (free, None),
             [d] => (free, Some(d.substs.clone())),
             _ => (free, Some(store.conj.into_iter().flat_map(|d| d.substs).collect())),
-        }
-    }
-
-    /// Apply a free substitution to the entire store. Structural-only
-    /// version (no Maude renormalisation). Use this when the new
-    /// substitution can't introduce AC-unification opportunities.
-    pub fn apply_subst_structural(&mut self, asubst: &LNSubst) {
-        // Composition of the new substitution with the free.
-        self.subst = asubst.compose(&self.subst);
-        // Apply structurally to each subst's range terms.
-        for d in self.conj.iter_mut() {
-            for s in d.substs.iter_mut() {
-                let new_pairs: Vec<(LVar, LNTerm)> = s.to_list().into_iter()
-                    .map(|(v, t)| (v, tamarin_term::subst::apply_vterm(asubst, t)))
-                    .collect();
-                *s = LNSubstVFresh::from_list(new_pairs);
-            }
         }
     }
 
@@ -2109,13 +2088,13 @@ impl EquationStore {
                 // seeded by `avoid avoidSet = succ (max idx in avoidSet)`.
                 // So shift = (avoid_max + 1) - minVarIdx applied to EVERY
                 // free var with NO exclusion — `Monotone incVar` has no
-                // special case for any var.  The previous Rust code
-                // preserved `new_subst_range_vars` (system vars), which is
-                // NOT what HS does and causes two distinct variant cases
-                // to collapse onto the same witness idx (the `~k.30`
-                // collision in Responder_secrecy) because the preserved
-                // system var keeps its (shared) idx while the other range
-                // vars shift away.  Port HS's plain uniform shift.
+                // special case for any var.  Do NOT preserve
+                // `new_subst_range_vars` (system vars): excluding them from
+                // the shift causes two distinct variant cases to collapse
+                // onto the same witness idx (the `~k.30` collision in
+                // Responder_secrecy), because the preserved system var keeps
+                // its (shared) idx while the other range vars shift away.
+                // Apply HS's plain uniform shift.
                 let renamed_rhs: Vec<LNTerm> = if let Some(min) = rhs_min {
                     let fresh_start: i128 = avoid_max as i128 + 1;
                     let shift: i128 = fresh_start - (min as i128);

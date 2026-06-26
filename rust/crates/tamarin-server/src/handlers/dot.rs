@@ -7,7 +7,7 @@
 //! chosen abbreviations and similar-name / role clustering. Node ids,
 //! fact rendering (`prettyLNFact`), action-row filtering (Diff /
 //! auto-source), the cluster/preamble attribute blocks, the `roleColor`
-//! cluster styling and the less-edge rendering all now match HS byte-for-
+//! cluster styling and the less-edge rendering all match HS byte-for-
 //! byte. Two intentional approximations remain (each documented at its
 //! site): the per-rule node FILL colours use four fixed placeholder hexes
 //! instead of HS `nodeColorMap`'s size-dependent HSV palette (only the
@@ -471,7 +471,7 @@ impl DotBuilder {
     /// `nodesep=0.6`, `ranksep=0.6`, `label`, `style=filled`, `color`,
     /// `penwidth=2`, `fillcolor`, `overlap=false`, `sep=4`. (The subgraph id
     /// `cluster_<n>` is the Rust convention — HS uses
-    /// `createClusterNodeId roleName` — but the styling attributes are now
+    /// `createClusterNodeId roleName` — but the styling attributes are
     /// byte-faithful.)
     fn open_subgraph(&mut self, idx: usize, name: &str, color: &str) {
         let _ = writeln!(self.buf, "  subgraph cluster_{} {{", idx);

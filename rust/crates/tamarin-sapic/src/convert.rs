@@ -2,17 +2,14 @@
 //!
 //! Maps `tamarin_parser::ast::Process` (the surface syntax tree) into
 //! `tamarin_theory::sapic::PlainProcess` (the HS-faithful `Process<ann, v>`
-//! working representation), for the CORE LINEAR subset of SAPIC needed by
-//! `examples/sapic/fast/basic/typing2.spthy`:
+//! working representation):
 //!
 //!   - `Null`
-//!   - `Action New / Event / ChOut / ChIn`
+//!   - `Action New / Event / ChOut / ChIn` (incl. named/private channels)
+//!   - state (`insert` / `delete` / `lookup` / `lock` / `unlock`)
 //!   - `Action Rep` (replication `!P`)
-//!   - `Comb Parallel | NDC | CondEq` (`P|Q`, `P+Q`, `if t1 = t2 then P else Q`)
-//!
-//! `Cond`-with-a-formula (`if <formula> then`), state (insert/delete/lookup),
-//! locks, secret/private channels, `let`, and process-calls are deferred to
-//! later phases — they error out so we never silently mistranslate.
+//!   - `Comb Parallel | NDC | CondEq | Cond | Let`
+//!     (`P|Q`, `P+Q`, `if t1 = t2 then P else Q`, `if <formula> then`, `let`)
 //!
 //! There is no single HS function this mirrors: in HS the parser builds the
 //! `PlainProcess` directly (`Theory.Text.Parser.Sapic.process`), whereas the
@@ -29,7 +26,8 @@ use tamarin_theory::sapic::{
 };
 use tamarin_term::lterm::{LSort, LVar};
 
-/// Error returned for SAPIC constructs not yet ported (Phase 2+).
+/// Error returned when a SAPIC process cannot be converted (e.g. an
+/// unconvertible term/fact, or a process call reached without a definition map).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConvertError {
     pub message: String,
@@ -174,8 +172,8 @@ fn fact_unpattern(
 ///
 /// Mirrors the SAPIC parser's combinator construction
 /// (`Theory.Text.Parser.Sapic`): `Parallel`/`Ndc` are nullary; `if t1 = t2`
-/// becomes `CondEq t1 t2`; `if frml` becomes `Cond frml`.  `Lookup`/`Let` are
-/// deferred (Phase 3+ for state; `let`-with-destructors).
+/// becomes `CondEq t1 t2`; `if frml` becomes `Cond frml`; `lookup`/`let`
+/// become `Lookup`/`Let`.
 fn combinator(c: &p::ProcessComb) -> Result<ProcessCombinator<SapicLVar>, ConvertError> {
     match c {
         p::ProcessComb::Parallel => Ok(ProcessCombinator::Parallel),
@@ -312,9 +310,7 @@ pub fn convert_process(proc: &p::Process) -> Result<PlainProcess, ConvertError> 
             Err(ConvertError::new("process calls require convert_process_with_defs"))
         }
         p::Process::AtAnnotation(inner, _) => {
-            // Location annotation (`@ loc`) — for the linear subset we drop the
-            // location and descend; locations matter only for IEE / reliable
-            // channels (Phase 2+).
+            // Location annotation (`@ loc`) — drop the location and descend.
             convert_process(inner)
         }
     }
@@ -428,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_cond_formula_now_supported() {
+    fn convert_cond_formula() {
         // `if <formula> then E else 0` converts to ProcessCombinator::Cond.
         let cond = p::Process::Comb {
             comb: p::ProcessComb::Cond(p::Condition::Formula(p::Formula::True)),

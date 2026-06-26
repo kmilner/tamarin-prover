@@ -159,7 +159,6 @@ pub fn simplify_system(red: &mut Reduction) {
         let mut c = ChangeIndicator::Unchanged;
         // Haskell-faithful order (Simplify.hs:131): enforceNodeUniqueness
         // returns (c1, c2, c3) = (fresh-DG4, KD-N5↓, KU-N5↑).
-        // Previously we ran KU before KD — order divergence.
         c = c.or(trace_subpass("enforceFreshNodeUniqueness", r, enforce_fresh_node_uniqueness_pass));
         c = c.or(trace_subpass("enforceKdFactUniqueness", r, enforce_kd_fact_uniqueness_pass));
         c = c.or(trace_subpass("enforceKuActionUniqueness", r, enforce_ku_action_uniqueness_pass));
@@ -185,7 +184,7 @@ pub fn simplify_system(red: &mut Reduction) {
     // Haskell `simplifySystem` non-diff branch (Simplify.hs:65-71)
     // runs `removeSolvedSplitGoals` AFTER `exploitUniqueMsgOrder`
     // and once at the end of the pipeline — NOT inside the
-    // while_changing loop.  We had it in the loop body; that's
+    // while_changing loop.  Do NOT move it into the loop body: that is
     // non-Haskell-faithful and can cause non-idempotent oscillation
     // with downstream passes that add goals.
     remove_solved_split_goals_pass(red);
@@ -637,18 +636,7 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
     // run the per-formula `insertFormula fm'` mutations, in `S.toList`
     // order (Reduction.hs:162-164).
     //
-    // Previously this loop recomputed `partial_atom_valuation(&red.sys,…)`
-    // on EACH iteration against the LIVE, already-mutated `red.sys`, and
-    // removed/re-inserted formulas mid-loop.  That made a later formula's
-    // simplification (and hence which DisjG goals are NEW vs already
-    // present) depend on earlier iterations' edits — splitting what HS
-    // does in ONE pass across several simplify-loop passes and SWAPPING
-    // the `_gsNr` insertion order of co-created disjunction goals (e.g.
-    // the `(∃Session('C',…,S(cw)))∨(∃Compromise)` vs
-    // `(∃Session('C',…,c1))∨(∃Compromise)` pair at
-    // `unmatching_implies_detect_with_W_uncompromised`'s divergence node:
-    // HS assigns S(cw)=209/c1=210, the live-mutation loop assigned
-    // c1=209/S(cw)=210).  We replicate HS's frozen `valuation` WITHOUT
+    // We replicate HS's frozen `valuation` WITHOUT
     // cloning the system: the first loop only READS `red.sys` (computing
     // every `simp` against the current, not-yet-mutated state) and
     // collects the change list; all mutations run afterwards.  Since
@@ -718,11 +706,10 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
         //   modM sSolvedFormulas $ S.insert fm
         //   insertFormula fm'
         //
-        // Critical: previously we pushed `simp` to `formulas` directly,
-        // bypassing `insertFormula`'s atom decomposition. When `simp`
-        // simplified to a bare `Atom(Last(k))`, the `last_atom` side
-        // effect of `insertAtom` was missed — leading to a vacuous
-        // Simplify step downstream where Haskell goes straight to
+        // Critical: route `simp` through `insert_formula` so its atom
+        // decomposition runs. A bare `Atom(Last(k))` must go through
+        // `insertAtom`'s `last_atom` side effect; bypassing it leads to a
+        // vacuous Simplify step downstream where Haskell goes straight to
         // Solve (injectivity_check class).
         red.sys.invalidate_max_var_idx_cache();
         red.sys.formulas.retain(|f| f != &fm);
@@ -747,13 +734,12 @@ fn eval_formula_atoms_pass(red: &mut Reduction) -> ChangeIndicator {
         // key_secrecy's c_kdf split: HS reaches 6/6 at split_case_1,
         // RS reaches 6/5, and bindings diverge from there).
         //
-        // Previously the gtrue branch was suppressed under the comment
-        // "skip — gtrue is no-op".  That's only true at the SEMANTIC
-        // level (gtrue can never falsify a model); HS's bookkeeping
-        // still tracks it explicitly so the next simp-loop iteration
-        // sees the empty Conj as already-solved and short-circuits the
-        // dedup check.  Without parity here we get +1 step counts at
-        // every checkpoint inside the affected proof subtree.
+        // Do NOT suppress the gtrue branch as a "no-op": that is only true
+        // at the SEMANTIC level (gtrue can never falsify a model); HS's
+        // bookkeeping still tracks it explicitly so the next simp-loop
+        // iteration sees the empty Conj as already-solved and
+        // short-circuits the dedup check.  Without parity here we get +1
+        // step counts at every checkpoint inside the affected proof subtree.
         red.insert_formula(simp);
         changed = ChangeIndicator::Changed;
     }
@@ -788,7 +774,7 @@ fn partial_atom_valuation_with(
         &crate::constraint::constraints::NodeId, &crate::rule::RuleACInst>,
     atom: &tamarin_parser::ast::Atom,
 ) -> Option<bool> {
-    use tamarin_parser::ast::{Atom, Term};
+    use tamarin_parser::ast::Atom;
     // `nonUnifiableNodes i j`: i and j must be distinct in every model.
     // Returns true iff both nodes are in the system *and* their rule
     // instances do not AC-unify.  Mirrors Haskell's helper of the same
@@ -841,16 +827,9 @@ fn partial_atom_valuation_with(
             // `i before j -> Just True` guard.  When the less-relation
             // already contains a cycle (`i before j` AND `j before i` both
             // hold — e.g. after an ordering edge closes a loop), HS yields
-            // `Just False` because the `j before i` arm matches first.  RS
-            // previously checked `always_before(i,j) -> Some(true)` first,
-            // yielding `Some(true)` in the cyclic case — the OPPOSITE result.
-            // That single mis-ordering collapsed a `[¬Less | EqE(~ni,~ni)]`
-            // reuse-lemma disjunction (matching_detects_later_misuse): RS
-            // dropped the `¬Less` disjunct (because `Less` read True), leaving
-            // a bare `EqE(~ni,~ni)` that `insertAtom` then unified — merging
-            // two distinct Fresh `~ni` producers (DG4) → node-id-eq FALSE →
-            // the case was dropped, where HS instead keeps the 2-way DisjG
-            // split and closes only `I_1_case_1` via a Cyclic contradiction.
+            // `Just False` because the `j before i` arm matches first.  Do
+            // NOT reorder these guards: checking `i before j -> Some(true)`
+            // first yields the OPPOSITE result in the cyclic case.
             if ni == nj { return Some(false); }
             // Both `always_before` checks below query the same (invariant)
             // relation; use the pass-level pre-built adjacency.
@@ -963,19 +942,9 @@ fn partial_atom_valuation_with(
             // `nodesAfter i = filter (i /=) $ reachableSet [i] lessRel`
             // where `lessRel = sLessAtoms ++ rawEdgeRel`.
             // `isInTrace` is the 3-clause check (sNodes / isLast /
-            // unsolvedActionAtoms) — see `is_in_trace` above.
-            //
-            // The PRIOR RS version added two non-HS-faithful checks:
-            // "any less_atom with smaller=n → Some(false)" and "any edge
-            // with src=n → Some(false)".  These returned `Some(false)`
-            // even when the successor was just a free variable not in
-            // trace — HS in that case returns `Nothing`.  Concrete
-            // manifestation: YubiSecure slightly_weaker_invariant's IH
-            // 5-way disjunction (`last(#t2) ∨ last(#t1) ∨ ...`) had its
-            // two `last(_)` alts eliminated to `gfalse` here (the bound
-            // variables happened to have less-atoms / edges to other
-            // bound variables not in trace), collapsing the 5-way Disj
-            // to a 3-way one — wrong goal shape vs HS's 5-way.
+            // unsolvedActionAtoms) — see `is_in_trace` above.  Do NOT add
+            // extra "successor exists → Some(false)" checks: HS returns
+            // `Nothing` when a successor is a free variable not in trace.
             if let Some(la) = &sys.last_atom {
                 if la == &n { return Some(true); }
             }
@@ -1007,7 +976,6 @@ fn partial_atom_valuation_with(
             if let Some(la) = &sys.last_atom {
                 if non_unifiable_nodes(&n, la) { return Some(false); }
             }
-            let _ = Term::Var as fn(_) -> _;
             None
         }
         // Direct port of Haskell `partialAtomValuation` Subterm arm
@@ -1104,15 +1072,12 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     // so its runtime `insertImpliedFormulas` never fires `[sources]`.
     // Refine fires them at precompute (drives typing-violation drops).
     //
-    // Was previously default-OFF (workaround for our weaker refine);
-    // any NSPK3 / typing-class lemma that timed out without it was
-    // masking a refine-strength bug that needs to be fixed at refine,
+    // Skip `[sources]`-tagged universals at runtime unconditionally
+    // (refine fires them at precompute); the runtime path matches HS,
+    // which only puts `[reuse]` in sLemmas.  A weaker refine that timed
+    // out without this would be a refine-strength bug to fix at refine,
     // not papered over by runtime [sources] firings.
-    //
-    // TAM_PROVENANCE_SKIP_SOURCES_OFF=1 reverts to the old workaround
-    // for diagnostic comparison.
-    let skip_sources = std::env::var("TAM_PROVENANCE_SKIP_SOURCES_OFF").is_err()
-        && !crate::constraint::solver::sources::in_precompute_mode()
+    let skip_sources = !crate::constraint::solver::sources::in_precompute_mode()
         && !red.sys.sources_lemma_universals.is_empty();
     // Mirror Haskell's `openGuarded` (Guarded.hs:openGuarded): allocate
     // FRESH LVar idxs for each bound var BEFORE matching, then
@@ -1186,12 +1151,9 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     //            (,) i <$> rActs ru
     //
     // i.e., UNSOLVED action goals + every action atom of every node's
-    // rule instance.  We previously filtered for SOLVED action goals
-    // — the INVERSE of Haskell — so the IH conjunct `All j. KU(m,j)
-    // ⇒ Last(j) ∨ j=i ∨ i<j` never fired against the (genuine)
-    // pending KU action goals at ghost nodes.  Result: typing-class
-    // [sources] lemmas reached bogus SOLVED leaves where the open
-    // KU(m) claim should have triggered an IH contradiction.
+    // rule instance.  Do NOT filter for SOLVED action goals (the INVERSE
+    // of Haskell): the IH conjunct `All j. KU(m,j) ⇒ Last(j) ∨ j=i ∨ i<j`
+    // must fire against the genuine pending KU action goals at ghost nodes.
     // Haskell-faithful: `allActions = unsolvedActionAtoms sys ++ ...`
     // both halves iterate Data.Map (M.toList = sorted by key).  Sort
     // each half to match — unsolved Action goals in Goal-Ord
@@ -2367,12 +2329,9 @@ fn enforce_fresh_node_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         // (Simplify.hs:178,207) calls `solveNodeIdEqs` via the `merge`
         // helper.  The monadic bind through `solveTermEqs` ends in
         // `noContradictoryEqStore` (Reduction.hs:704) which fires
-        // mzero on `eqsIsFalse`.  Previously this site used
-        // `if let Ok(SolveOutcome::Linear(...))` which silently
-        // swallowed `Ok(Contradictory)` and `Err(_)`, so a Fresh-rule
-        // node id eqs that produced an mzero in Haskell stayed silent
-        // here — funnel both through `mark_contradictory` so the
-        // mzero proxy stays in sync.  `Cases(arms)` must install arm[0]
+        // mzero on `eqsIsFalse`.  Funnel both `Ok(Contradictory)` and
+        // `Err(_)` through `mark_contradictory` so the mzero proxy stays
+        // in sync.  `Cases(arms)` must install arm[0]
         // + stash the rest (see `install_pass_cases_arms`); ignoring it
         // leaves the `mem::take`'d default eq-store installed.
         let res = red.solve_node_id_eqs(&eqs);
@@ -2443,13 +2402,10 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     // Collect (node, fact, term) for every KU action — both the
     // rule-instance actions and the UNSOLVED open goals.  Mirrors
     // Haskell's `allKUActions`: `unsolvedActionAtoms sys ++ <rule actions>`.
-    // Including SOLVED goals here (as we previously did) caused
-    // spurious merges: a KU(t) goal that was auto-solved at insert
-    // time (e.g. by pair-decomp) still pointed to a fresh-allocated
-    // vk.X node; merging it with another KU(t) on a DIFFERENT vk.Y
-    // emitted `node_eqs vk.X = vk.Y` which then induced self-loops
-    // in less_atoms (vk.X < outer < vk.Y → vk.X < outer < vk.X via
-    // post-merge subst).  Haskell's filter avoids this.
+    // Do NOT include SOLVED goals here: an auto-solved KU(t) goal still
+    // points to a fresh-allocated vk node, so merging it emits
+    // `node_eqs` that induce self-loops in less_atoms.  Haskell's filter
+    // avoids this.
     // Apply eq_store subst to the action term before grouping (mirrors
     // HS's `allKUActions` which extracts m from the node's action fact
     // AFTER substSystem propagated bindings).  Without this, RS's stored
@@ -2566,12 +2522,11 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     let mut changed = ChangeIndicator::Unchanged;
     let mut hit_contra = false;
     if !fact_eqs.is_empty() {
-        // `if let Ok(_)` previously matched Ok(Contradictory) too, so
-        // unification failure was silently swallowed.  Haskell's
-        // `enforceFreshAndKuNodeUniqueness` uses `merge solver
+        // Haskell's `enforceFreshAndKuNodeUniqueness` uses `merge solver
         // candidates` where solver is `solveFactEqs SplitNow`; the
         // monadic bind propagates contradictions via mzero.  We surface
-        // it as gfalse.
+        // it as gfalse — match `Ok(Contradictory)` and `Err(_)` explicitly
+        // so a unification failure is not silently swallowed.
         let res = red.solve_fact_eqs(
             crate::constraint::solver::reduction::SplitStrategy::SplitNow,
             &fact_eqs,
@@ -2801,18 +2756,13 @@ pub(crate) fn solve_unique_actions_pass_fan_out(
         // fresh rule instance (creating the node + its premise goals); if
         // present it merely unifies `fa` against the node's actions.
         //
-        // RS previously skipped any captured atom whose EXACT (i, fa) was
-        // no longer an unsolved goal.  But solving an earlier candidate
-        // (e.g. `Comm_D_Y@j1`/`@j2`, rule D_4) substitutes the live
-        // goals' facts via the eq-store, so a captured atom like
-        // `Learn_H_Ys@k1` no longer matches the (now-substituted) live
-        // goal by exact equality — and got skipped.  That suppressed the
-        // creation of node #k1 (and its `AgSt_H0 ▶₀ #k1` premise) at the
-        // captured position, so #k2's premise was created first and
-        // received the smaller `gsNr`.  `goalNrRanking` then ranked the
-        // symmetric H2 premise ahead of H1, flipping the witness-trace
-        // pick (alethea functional_env1/env2: HS solves `AgSt_H0('H1',…)`
-        // first, RS solved `AgSt_H0('H2',…)`).  Calling `solve_action_goal`
+        // Do NOT skip a captured atom whose EXACT (i, fa) is no longer an
+        // unsolved goal: solving an earlier candidate substitutes the live
+        // goals' facts via the eq-store, so a captured atom no longer
+        // matches the (now-substituted) live goal by exact equality, and
+        // skipping it suppresses node creation at the captured position —
+        // shifting `gsNr` and flipping witness-trace picks (alethea
+        // functional_env1/env2).  Calling `solve_action_goal`
         // on every captured atom restores HS's node-existence-driven
         // semantics; an already-solved atom whose node exists with `fa`
         // among its actions is a harmless no-op (the `Some(ru)` /
@@ -2842,17 +2792,12 @@ pub(crate) fn solve_unique_actions_pass_fan_out(
                 // `trySolve` runs INSIDE the fanned branch using the
                 // SAME captured (i, fa) — NOT a re-substituted version.
                 //
-                // RS previously returned immediately on fan-out; the
-                // caller `simplify_system_with_fanout` then recursed
-                // per-case, and each recursion re-collected candidates
-                // from `red.sys.goals` AFTER substSystem applied the
-                // fan-out arm's eq_store.  On TAK1::session_key_establish
-                // this drops the `Accept(sc, ...)` goal from candidates
-                // because the substituted `k`-term carries a Union from
-                // sb's arm's unifier — `is_unique` rejects it.  HS sees
-                // the same goal as captured pre-substitution and keeps
-                // processing it.  Result: HS produces 6×6=36 simplify
-                // cases, RS produced 6×1=6.
+                // Do NOT return immediately on fan-out and let the caller
+                // re-collect candidates per-case from the (substituted)
+                // goal set: the substituted term may carry a Union that
+                // `is_unique` rejects, dropping a goal HS keeps (captured
+                // pre-substitution).  HS produces N×M simplify cases where
+                // re-collection would yield N×1.
                 //
                 // Fix: process the REMAINING captured candidates in
                 // EACH fanned arm using the ORIGINAL (i, fa) values
@@ -2906,10 +2851,10 @@ fn drain_remaining_actions(
         // HS-faithful (Reduction.hs:656-680): `markGoalAsSolved` on a
         // missing key just traces a warning and returns silently; the
         // surrounding `solveGoal` proceeds with the captured (i, fa)
-        // regardless of whether the goal still exists post-subst.  RS
-        // previously short-circuited on a `still_present` check here,
-        // dropping the action goal's fan-out in branches where
-        // substSystem had renamed/rewritten the goal key.
+        // regardless of whether the goal still exists post-subst.  Do NOT
+        // short-circuit on a `still_present` check here: that drops the
+        // action goal's fan-out in branches where substSystem renamed the
+        // goal key.
         //
         // We DO want to skip if the goal exists but is solved (HS's
         // `mayStatus = Just status` path) — that prevents double-solving
@@ -3004,9 +2949,8 @@ fn enforce_kd_fact_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     // Haskell-faithful (`Simplify.hs:179,189`): `enforceNodeUniqueness`
     // kdConcs branch uses `(merge (solveRuleEqs SplitNow) kdConcs)`.
     // The merger emits BOTH `solveRuleEqs` (full rule-instance
-    // equality) AND `solveNodeIdEqs`.  We previously only emitted
-    // `solve_node_id_eqs` — that was missing the rule-level
-    // unification of the merged KD-conc rules.
+    // equality) AND `solveNodeIdEqs` — both are required so the merged
+    // KD-conc rules are unified at the rule level.
     //
     // Collect (node, rule, term) for every KD-conc.
     let mut kd_concs: Vec<(NodeId, RuleACInst, LNTerm)> = Vec::new();
@@ -3118,14 +3062,10 @@ fn enforce_kd_fact_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
 /// premise is `Fr(~x)`), NOT the Fresh-rule producer.  Soundness:
 /// `~x` is exclusive to its consumer's instance, so any node mentioning
 /// `~x` must trace its data flow back to the consumer; that consumer
-/// therefore precedes the mentioning node.
-///
-/// Using the Fresh-rule node as supplier (an earlier wrong port) gave
-/// only the weaker `Fresh-node < {consumers}` relation, missing the
+/// therefore precedes the mentioning node.  Do NOT use the Fresh-rule
+/// producer as supplier: that gives only the weaker
+/// `Fresh-node < {consumers}` relation, missing the
 /// `consumer_a < consumer_b` ordering Haskell derives via this rule.
-/// See `safety_two_keys::fresh_distinct_times` /
-/// `fresh_ordering::order` proof skeletons for the divergence this
-/// causes.
 fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
     use crate::constraint::constraints::{LessAtom, Reason};
     use crate::fact::FactTag;
@@ -3992,12 +3932,11 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
                     // pair) less-atom, collapsing it to the `(#i,#i)`
                     // self-loop that `contradictions` reads as `cyclic`.
                     //
-                    // RS previously split this arm into `if s == t` (only
-                    // case 2) and `if s != t` (cases 4,3,5), so case (5)
-                    // never fired once the value equality landed — the
-                    // strict atom was lost and the merge produced no self-
-                    // loop, mislabelling the leaf `from formulas` instead
-                    // of `cyclic` (counter.spthy::counters_linear_order).
+                    // Do NOT split this arm into `if s == t` / `if s != t`:
+                    // that suppresses case (5) once the value equality
+                    // lands, losing the strict atom and mislabelling the
+                    // leaf `from formulas` instead of `cyclic`
+                    // (counter.spthy::counters_linear_order).
                     MonotonicBehaviour::StrictlyIncreasing => {
                         // `alwaysBefore ii jj` and `alwaysBefore jj ii` are
                         // each used by two cases below; compute each once.

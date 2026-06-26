@@ -3,11 +3,6 @@
 //! conversion to real `LNFact`s (`factToFact` / `actionToFact`), the
 //! `AnnotatedRule` carrier, and the final `toRule` that produces a
 //! `ProtoRuleE` with HS-exact name / color / process / role attributes.
-//!
-//! Scope: the facts/actions reachable by the linear subset needed for
-//! `typing2.spthy` — `Init`, `State_<pos>`, `Fr`, `Out`, and `TamarinAct`
-//! (the `Test` event).  Other constructors are present (so the enums match HS)
-//! but only the ones typing2 exercises are wired through `to_rule`.
 
 use tamarin_term::lterm::{LVar, LNTerm};
 use tamarin_term::vterm::{Lit, VTerm};
@@ -48,9 +43,8 @@ impl StateKind {
     }
 }
 
-/// `TransFact` (Facts.hs:96-108) — premise/conclusion facts.  Only the
-/// constructors used by the linear subset are filled in `factToFact`; the rest
-/// are present for type-parity and will be wired in later phases.
+/// `TransFact` (Facts.hs:96-108) — premise/conclusion facts.  Every
+/// constructor is wired through `factToFact`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TransFact {
     Fr(LVar),
@@ -84,8 +78,8 @@ pub enum TransFact {
     MessageIDReceiver(ProcessPosition),
 }
 
-/// `TransAction` (Facts.hs:43-77) — action facts.  Only the constructors used
-/// by the linear subset are filled in `actionToFact`.
+/// `TransAction` (Facts.hs:43-77) — action facts.  Every constructor is wired
+/// through `actionToFact`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TransAction {
     InitEmpty,

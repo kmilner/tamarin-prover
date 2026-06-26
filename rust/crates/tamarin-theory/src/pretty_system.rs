@@ -15,10 +15,6 @@
 //!   unsolved constraints: ...
 //!   solved constraints: ...
 //!
-//! For the lemma view `pretty_system` also emits the graph-bearing
-//! sections (`nodes`, `edges`, `less`); unlike Haskell's `prettySystem`
-//! no `actions` section is produced.
-//!
 //! NOTE: the `subterms` and `equations` section bodies are now faithful
 //! ports of Haskell's `prettySubtermStore` (SubtermStore.hs:567-579) and
 //! `prettyEqStore` (EquationStore.hs:566-586) — same `Contradictory` /
@@ -34,15 +30,12 @@
 use tamarin_term::pretty::{pp_lvar, pretty_lnterm};
 
 use crate::pretty_hpj::{fsep, punctuate, Doc};
-use crate::constraint::constraints::{Edge, Goal, LessAtom, NodeId};
+use crate::constraint::constraints::{Goal, NodeId};
 use crate::constraint::system::{SourceKind, System};
 use crate::fact::{fact_tag_name, LNFact};
 use crate::guarded::Guarded;
 use crate::pretty_formula::pretty_guarded;
-use crate::rule::{
-    ConcIdx, IntrRuleACInfo, PremIdx, ProtoRuleACInstInfo, ProtoRuleName,
-    Rule, RuleACInst, RuleInfo,
-};
+use crate::rule::{ConcIdx, PremIdx};
 
 /// Emit just the non-graph-part of the system, matching Haskell's
 /// `prettyNonGraphSystem`.  See file-level docs for the section list.
@@ -57,21 +50,6 @@ pub fn pretty_non_graph_system(sys: &System) -> String {
     section(&mut out, "solved formulas", &pretty_formula_list(&sys.solved_formulas));
     section(&mut out, "unsolved constraints", &pretty_goals(sys, false));
     section(&mut out, "solved constraints", &pretty_goals(sys, true));
-    out
-}
-
-/// Full system rendering — emits the graph-bearing sections
-/// (`nodes`/`edges`/`less`) plus everything in
-/// `pretty_non_graph_system`.  Mirrors Haskell's `prettySystem`
-/// (System.hs) except that the `actions` section
-/// (`fsepList ppActionAtom $ unsolvedActionAtoms se`) is omitted.
-#[allow(dead_code)]
-pub fn pretty_system(sys: &System) -> String {
-    let mut out = String::new();
-    section(&mut out, "nodes", &pretty_nodes(sys));
-    section(&mut out, "edges", &pretty_edges(&sys.edges));
-    section(&mut out, "less", &pretty_lesses(&sys.less_atoms));
-    out.push_str(&pretty_non_graph_system(sys));
     out
 }
 
@@ -455,40 +433,6 @@ fn pretty_source_kind(sk: Option<SourceKind>) -> String {
 }
 
 // ---------------------------------------------------------------------
-// nodes / edges / less
-// ---------------------------------------------------------------------
-
-fn pretty_nodes(sys: &System) -> String {
-    let mut sorted = (*sys.nodes).clone();
-    sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
-    let lines: Vec<String> = sorted.iter()
-        .map(|(nid, ru)| format!("{}: {}", pretty_node_id(nid), pretty_rule_inst(ru)))
-        .collect();
-    lines.join("\n")
-}
-
-fn pretty_edges(es: &[Edge]) -> String {
-    let mut sorted = es.to_vec();
-    sorted.sort();
-    let parts: Vec<String> = sorted.iter()
-        .map(|e| format!("{} >--> {}",
-            pretty_node_conc(&e.src),
-            pretty_node_prem(&e.tgt)))
-        .collect();
-    parts.join(", ")
-}
-
-fn pretty_lesses(ls: &[LessAtom]) -> String {
-    let mut sorted = ls.to_vec();
-    sorted.sort();
-    let parts: Vec<String> = sorted.iter().map(|l| {
-        format!("{} < {}: induced by {}",
-            pretty_node_id(&l.smaller), pretty_node_id(&l.larger), l.reason)
-    }).collect();
-    parts.join(", ")
-}
-
-// ---------------------------------------------------------------------
 // LNFact / RuleACInst rendering
 // ---------------------------------------------------------------------
 
@@ -526,49 +470,6 @@ pub fn pretty_fact(fa: &LNFact) -> String {
             })
             .collect();
         format!("{}[{}]", base, anns.join(", "))
-    }
-}
-
-fn pretty_rule_inst(ru: &RuleACInst) -> String {
-    let name = rule_inst_name(ru);
-    let prems: Vec<String> = ru.premises.iter().map(pretty_fact).collect();
-    let acts: Vec<String> = ru.actions.iter().map(pretty_fact).collect();
-    let concs: Vec<String> = ru.conclusions.iter().map(pretty_fact).collect();
-    if acts.is_empty() {
-        format!("[{}] --> [{}]  // {}",
-            prems.join(", "), concs.join(", "), name)
-    } else {
-        format!("[{}] --[ {} ]-> [{}]  // {}",
-            prems.join(", "), acts.join(", "), concs.join(", "), name)
-    }
-}
-
-fn rule_inst_name(ru: &Rule<RuleInfo<ProtoRuleACInstInfo, IntrRuleACInfo>>) -> String {
-    match &ru.info {
-        RuleInfo::Proto(p) => match &p.name {
-            ProtoRuleName::Stand(s) => s.clone(),
-            ProtoRuleName::Fresh => "Fresh".to_string(),
-        },
-        RuleInfo::Intr(info) => intr_rule_name(info),
-    }
-}
-
-fn intr_rule_name(info: &IntrRuleACInfo) -> String {
-    match info {
-        IntrRuleACInfo::ConstrRule(bs) =>
-            format!("c_{}", String::from_utf8_lossy(bs)),
-        IntrRuleACInfo::DestrRule(bs, _, _, _) =>
-            format!("d_{}", String::from_utf8_lossy(bs)),
-        IntrRuleACInfo::Coerce => "coerce".to_string(),
-        IntrRuleACInfo::IRecv => "irecv".to_string(),
-        IntrRuleACInfo::ISend => "isend".to_string(),
-        // Built-in constructor rules render without the `c_` prefix —
-        // Haskell `prettyIntrRuleACInfo` (Rule.hs:1229) emits "pub",
-        // "nat", "fresh"; the `c` prefix is for named user constructors.
-        IntrRuleACInfo::PubConstr => "pub".to_string(),
-        IntrRuleACInfo::NatConstr => "nat".to_string(),
-        IntrRuleACInfo::FreshConstr => "fresh".to_string(),
-        IntrRuleACInfo::IEquality => "iequality".to_string(),
     }
 }
 

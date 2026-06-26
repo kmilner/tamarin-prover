@@ -267,11 +267,7 @@ pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
 /// Direct port of Haskell `isInitialSystem`:
 ///   isInitialSystem sys = null (get sSolvedFormulas sys) && not (member bot (get sFormulas sys))
 /// (`System.hs:828`).  Just two conditions: no solved formulas yet,
-/// and no gfalse in the formula set.  We were checking many more
-/// (empty nodes/edges/less/goals) which made us mark systems as
-/// non-initial too early — that caused `is_finished` to short-circuit
-/// to Solved/Unfinishable when Haskell would still return `None` and
-/// continue searching.
+/// and no gfalse in the formula set.
 fn is_initial_system(sys: &System) -> bool {
     let bot = crate::guarded::gfalse();
     sys.solved_formulas.is_empty() && !sys.formulas.contains(&bot)
@@ -413,8 +409,7 @@ pub fn exec_proof_method(
             // (ProofMethod.hs:304): `process` applies it to
             // EVERY proof method's Disj fan-out, including `Simplify`
             // (which uses `process (return "")`, ProofMethod.hs:290).
-            // RS previously applied it only in the `SolveGoal` arm.  When
-            // `simplifySystem`'s `solveUniqueActions` fans out an action
+            // When `simplifySystem`'s `solveUniqueActions` fans out an action
             // whose AC-multiset unification yields several unifiers that
             // are equal up to variable renaming (e.g. alethea's
             // `Learn_A_Ys(A,S,<'ys',<y1,no1>++<y2,no2>>)` — the straight

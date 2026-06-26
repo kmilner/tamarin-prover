@@ -479,7 +479,7 @@ pub async fn autoprove(
             let redir = format!(
                 "/thy/trace/{idx}/overview/proof/{lname}",
                 idx = new_idx,
-                lname = lemma_name);
+                lname = path_parse::url_path_escape(&lemma_name));
             json_resp::redirect(redir).into_response()
         }
     }
@@ -600,7 +600,7 @@ pub async fn autoprove_all(
         Some(n) => format!(
             "/thy/trace/{idx}/overview/proof/{lname}",
             idx = new_idx,
-            lname = n),
+            lname = path_parse::url_path_escape(&n)),
         None => format!("/thy/trace/{}/overview/help", new_idx),
     };
     json_resp::redirect(target).into_response()

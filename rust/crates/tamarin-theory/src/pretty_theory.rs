@@ -1124,10 +1124,9 @@ fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro], arity1
             // expanded body.  Detect a macro in the display (E) body by
             // expanding it: if anything changes, the E (macro) form differs
             // from the AC (expanded) form.  This holds REGARDLESS of whether
-            // Maude abstracted the rule, so it gates BOTH branches below —
-            // the previous code only checked it in the `None` branch, so a
-            // rule that was both macro-using AND abstracted (e.g. a `^`/DH
-            // rule whose body is a macro call) was wrongly called trivial
+            // Maude abstracted the rule, so it MUST gate BOTH branches below:
+            // a rule that is both macro-using AND abstracted (e.g. a `^`/DH
+            // rule whose body is a macro call) is NOT trivial
             // (regression/trace/issue777: `pk(x)='g'^x`, `Out(pk(~x))`).
             // Fast path: with no macro definitions, `apply_macros_fact` is an
             // identity rebuild (no macro can match), so the comparison below is
@@ -1345,12 +1344,10 @@ fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule, att
     // (prettyNamedRule …))` (ClosedTheory.hs:354), so the rule body's
     // facts land at absolute column 5 (2 comment + 2 rule nest + 1
     // bracket).  CRITICAL: render the body with the ENGINE aware of the
-    // full indent (nest 4 via indent=5) rather than rendering at the
-    // modulo-E indent and prepending 2 literal spaces per line — the
-    // prepend shifted every line +2 columns AFTER the HughesPJ width
-    // decisions were made, so lines within 2 columns of the boundary
-    // kept elements HS breaks (the spdm R_KE_Response tuple at visual
-    // col 111 vs HS's break at 95).
+    // full indent (nest 4 via indent=5) — the HughesPJ width decisions must
+    // be made at the absolute column, so lines within 2 columns of the
+    // boundary break exactly where HS breaks (cf. the spdm R_KE_Response
+    // tuple: HS breaks at col 95).
     use crate::elaborate::canonicalize_ac_in_pfact;
     let prems2: Vec<p::Fact> = prems.iter().map(canonicalize_ac_in_pfact).collect();
     let acts2:  Vec<p::Fact> = acts.iter().map(canonicalize_ac_in_pfact).collect();
@@ -1394,14 +1391,12 @@ fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule, att
 /// CRITICAL: the `text ". " <>` is a BESIDE onto the multi-line `vcat`.
 /// In HughesPJ the ribbon budget for the inner (wrapped) lines is then
 /// measured from the OUTER line start (the `text i` column), not from the
-/// var column.  Rendering each binding STANDALONE (`entry.nest(col)`)
-/// instead measures the ribbon from the var column, shifting wrap
-/// decisions for terms sitting within a few columns of the ribbon
-/// boundary — e.g. an 11-tuple `<x.16, …, x.26>` whose `x.26>` packs onto
-/// the overflow line standalone but breaks BEFORE `x.26` (gluing `>`)
-/// under the HS structure (pkcs11-templates `cannot_obtain_key` et al.).
-/// So build the whole numbered conjunction as ONE Doc and render it at
-/// `nest 4`, mirroring HS byte-for-byte.
+/// var column.  So build the whole numbered conjunction as ONE Doc and
+/// render it at `nest 4` (do NOT render each binding STANDALONE via
+/// `entry.nest(col)` — that measures the ribbon from the var column and
+/// shifts wrap decisions for terms within a few columns of the boundary,
+/// e.g. an 11-tuple `<x.16, …, x.26>`: pkcs11-templates
+/// `cannot_obtain_key` et al.), mirroring HS byte-for-byte.
 fn variant_subst_doc(
     n: usize,
     subst: &tamarin_term::subst_vfresh::LNSubstVFresh,
@@ -2054,8 +2049,7 @@ fn pp_proof(
     // fit the ribbon, else drops the comment to its OWN line at the
     // step's base indent (`depth*2`).  We build the method as a Doc and
     // run it through the same HughesPJ engine so the break is
-    // byte-identical to HS — replacing the prior literal-string append
-    // that always kept the comment inline.
+    // byte-identical to HS.
     let base = depth * 2;
     let annotated = node.annotated;
     let cases: Vec<(&String, &crate::constraint::solver::search::ProofNode)> =
@@ -2183,7 +2177,7 @@ fn pp_step_doc(
         // (Pretty.hs:108-109).  Build this as a real Doc so HughesPJ's
         // `sep`/`fsep` break the comment (and its `/*`…`*/` delimiters)
         // onto their own lines at deep proof-tree indentation, identical
-        // to HS — the prior flat `pp_step_at` string could never wrap.
+        // to HS.
         PM::Finished(MR::Contradictory(reason)) => {
             let contra = Doc::text("contradiction");
             match reason {
@@ -2210,7 +2204,7 @@ fn pp_step_doc(
     }
 }
 
-fn pp_step_at(m: &crate::constraint::solver::proof_method::ProofMethod, indent: usize) -> String {
+fn pp_step_at(m: &crate::constraint::solver::proof_method::ProofMethod, _indent: usize) -> String {
     use crate::constraint::solver::proof_method::{ProofMethod as PM, Result as MR};
     match m {
         PM::Simplify => "simplify".to_string(),
@@ -2223,38 +2217,6 @@ fn pp_step_at(m: &crate::constraint::solver::proof_method::ProofMethod, indent: 
         PM::Finished(MR::Unfinishable) => {
             "UNFINISHABLE // reducible operator in subterm".to_string()
         }
-        PM::Finished(MR::Contradictory(reason)) => match reason {
-            Some(c) => format!("contradiction /* {} */", pp_contradiction(c)),
-            None => "contradiction".to_string(),
-        },
-        PM::SolveGoal(g) => {
-            use crate::constraint::constraints::Goal;
-            // HS `prettyProofMethod` (ProofMethod.hs:1174; SolveGoal case 1182):
-            //   SolveGoal goal ->
-            //     keyword_ "solve(" <-> prettyGoal goal <-> keyword_ ")"
-            // For a non-empty `DisjG`, `prettyGoal` is
-            //   `fsep $ punctuate "  ∥" (map (nest 1 . parens . prettyGuarded) gfs)`
-            // (Constraints.hs:281-283) — a multi-disjunct guarded formula
-            // that HS wraps across lines inside the global proof-tree Doc.
-            // Route this whole `solve( ... )` line through the HS-faithful
-            // Doc engine so the `fsep`/`sep`/`nest` wrap decisions and the
-            // continuation-line indents (col `indent + 7`, after `solve( `)
-            // are byte-identical to HS.
-            if let Goal::Disj(d) = g {
-                if !d.0.is_empty() {
-                    return pf::solve_disj_goal_line(&d.0, indent);
-                }
-            }
-            // ActionG/ChainG/PremiseG/SplitG/SubtermG: route the whole
-            // `solve( <goal> )` line through the same HS-faithful Doc engine
-            // as DisjG (4a6b6d5a) so `prettyLNFact`'s `nestShort'` wrapping
-            // (Fact.hs:539-544) and the `<+>` beside column-shift indent the
-            // goal's continuation lines to the column after `solve( `
-            // (= indent+7), byte-identical to HS.  HS `prettyGoal`
-            // (Constraints.hs:273-287).
-            let goal_doc = solve_goal_to_doc(g);
-            pf::solve_goal_line_from_doc(goal_doc, indent)
-        }
         PM::Invalidated => {
             // HS `prettyProofMethod` (ProofMethod.hs):
             //   Invalidated -> lineComment_
@@ -2263,16 +2225,14 @@ fn pp_step_at(m: &crate::constraint::solver::proof_method::ProofMethod, indent: 
             // `lineComment_` renders the verbatim text after `// `.
             "// proof may have been invalidated by editing a reuse lemma above. You should ".to_string()
         }
-        PM::RawSolve(inner) => {
-            // Display-only: skeleton raw text preserved for unannotated
-            // subtrees (replay.rs `parsed_to_unannotated`).  Mirrors
-            // HS `noSystemPrf` (Proof.hs:469) which keeps the original
-            // ProofMethod value verbatim.  Output: `solve( <inner> )`.
-            // Trim the inner text: the parser's `read_balanced_paren`
-            // returns the content between `( ... )` which may carry a
-            // trailing space → `solve(  ...  )` if we don't trim.
-            format!("solve( {} )", inner.trim())
-        }
+        // SolveGoal / RawSolve / Finished(Contradictory) are rendered as
+        // Docs by `pp_step_doc`, which handles them BEFORE its
+        // `_ => pp_step_at(..)` fallback — so they never reach here.
+        // `pp_step_at` is the string-only path for the remaining leaf
+        // methods (Simplify/Induction/Sorry/Solved/Unfinishable/Invalidated).
+        PM::SolveGoal(_) | PM::RawSolve(_) | PM::Finished(MR::Contradictory(_)) =>
+            unreachable!("pp_step_at: {:?} is rendered by pp_step_doc, not here",
+                std::any::type_name::<PM>()),
     }
 }
 

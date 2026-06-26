@@ -3,17 +3,13 @@
 //!
 //! Mirrors `Main.Mode.Batch.run` in spirit — load each input file,
 //! parse + elaborate, optionally prove lemmas, and emit either to
-//! stdout or to `--output=` / `-O DIR`. We deliberately keep the
-//! output format simple here: rather than re-implementing Haskell's
-//! `prettyClosedTheory` (a multi-thousand-LOC subsystem), we emit
-//! the original source followed by a per-lemma summary section. The
-//! summary lines match Haskell's `summary of summaries:` shape so
-//! existing tooling continues to recognise them.
+//! stdout or to `--output=` / `-O DIR`. The analyzed-theory output is
+//! rendered via `pretty_theory::pretty_closed_theory`, the port of
+//! Haskell's `prettyClosedTheory`, which interleaves the theory items
+//! with their per-lemma proof/summary annotations.
 //!
-//! When invoked without `--prove` (and without
-//! `--parse-only`/`--precompute-only`), we just re-emit the source
-//! verbatim — the same behaviour as Haskell's batch mode when no
-//! lemma is selected for proof.
+//! `--parse-only` is the one path that re-emits the source verbatim
+//! (no analysis); all other modes go through the pretty-printer.
 
 use std::fs;
 use std::path::PathBuf;
@@ -315,7 +311,6 @@ const DEFAULT_INTERACTIVE_PORT: u16 = 3001;
 /// HTTP until SIGINT/SIGTERM. Returns 0 on graceful shutdown.
 fn run_interactive(args: &Args) -> Result<i32, RunError> {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::path::PathBuf;
 
     init_rayon_pool(args);
 
@@ -388,7 +383,6 @@ fn run_interactive(args: &Args) -> Result<i32, RunError> {
 /// accept either a directory (whose `.spthy` files we glob) or any
 /// number of `.spthy` files (the path Tamarin batch mode uses).
 fn collect_theory_paths(in_files: &[String]) -> Result<Vec<std::path::PathBuf>, RunError> {
-    use std::path::PathBuf;
     let mut out: Vec<PathBuf> = Vec::new();
     for f in in_files {
         let p = PathBuf::from(f);

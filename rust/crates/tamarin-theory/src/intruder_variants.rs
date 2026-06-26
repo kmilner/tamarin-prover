@@ -411,7 +411,7 @@ mod tests {
     /// Round-trip: every rule produced by `mk_dh_intruder_variants` has
     /// a name starting with `_` (the byte after the consumed `c`/`d`).
     /// Mirrors the same property checked for the runtime generator
-    /// `dh_intruder_rules` (intruder_rules.rs:1677).
+    /// `dh_intruder_rules` in `dh_variants_all_names_have_underscore_prefix`.
     #[test]
     fn dh_variants_all_names_have_underscore_prefix() {
         let rules = mk_dh_intruder_variants(&dh_maude_sig());
@@ -438,7 +438,8 @@ mod tests {
     #[test]
     fn bridge_runtime_generator_matches_cached_file_on_counts_and_names() {
         // The runtime generator needs a Maude handle; skip if not available
-        // (mirroring the gating in intruder_rules.rs:1477-1486).
+        // (mirroring the `maude_handle`/`dh_maude_handle` gating in
+        // intruder_rules.rs).
         let maude_path = std::env::var("MAUDE_PATH").ok().or_else(|| {
             for c in ["/home/linuxbrew/.linuxbrew/bin/maude",
                       "/usr/local/bin/maude", "maude"] {

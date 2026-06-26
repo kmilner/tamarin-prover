@@ -395,12 +395,6 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
         // what makes `~k → ~x.11` followed by `~k.1 → ~x.11` produce a
         // SHARED renamed var (both → ~k.<new>), folding the alpha-
         // equivalence into the free subst.
-        //
-        // Previously RS named every range var by the range's own name,
-        // producing `~x.<idx>` everywhere and losing HS's per-binding
-        // name-hint structure — which then cascaded through `Ord LVar`
-        // → `S.toList performSplit` ordering → divergent canonical
-        // split_case_N labelling.
 
         // Step 0: sort entries by size of image (smaller first).
         // HS's `sortOn (size . snd)` — stable sort by size.

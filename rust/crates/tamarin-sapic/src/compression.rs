@@ -108,13 +108,9 @@ fn get_produced_facts(rules: &[ERule]) -> BTreeSet<LNFact> {
 }
 
 /// `mergeAttrs a a' = a <> a'` (Compression.hs:67) — Semigroup on attributes.
-/// HS `RuleAttributes` Semigroup keeps the FIRST `Just`/`True` (mappend on
-/// Maybe = `<|>` semantics via the `Last`/`First` newtypes... actually HS uses
-/// the derived monoid which for `Maybe` keeps the left if both present? The
-/// merged rule color/process is rarely observed because merged rules share the
-/// same source process). We mirror `RuleAttributes::merge` semantics used
-/// elsewhere in the port (right precedence on Options), which for two rules of
-/// the same process yields the same result.
+/// `RuleAttributes::merge` is right-precedence (`other.x.or(self.x)`), matching
+/// HS `a <> a'`; for two rules of the same source process the result is the same
+/// either way.
 fn merge_attrs(a: RuleAttributes, b: RuleAttributes) -> RuleAttributes {
     a.merge(b)
 }

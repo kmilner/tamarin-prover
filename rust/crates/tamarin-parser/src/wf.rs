@@ -1628,12 +1628,10 @@ fn render_var(v: &VarSpec) -> String {
 /// (xor / exp / inv) — those are explicitly permitted as long as (a)
 /// and (b) hold.
 ///
-/// Implementation note: a previous draft of this check fired on every
-/// rule with ANY reducible LHS op and rendered the offending term with
-/// Rust's `{:?}` Debug formatter, generating false-positive WF warnings
-/// (e.g. on every CRxor/CH07/LAK06 rule). The fix keeps the check
-/// FAITHFUL to HS's narrower trigger: skip when no `*` is in RHS and no
-/// unbound is introduced.
+/// Keep this check FAITHFUL to HS's narrower trigger: skip when no `*` is
+/// in RHS and no unbound is introduced. Do NOT broaden it to fire on every
+/// rule with a reducible LHS op (xor/exp/inv) — that produces
+/// false-positive WF warnings (CRxor/CH07/LAK06).
 ///
 /// Two known divergences from HS, both corpus-unreachable (this report
 /// fires on no corpus input):
@@ -1877,12 +1875,7 @@ pub fn subterm_convergence_report(thy: &Theory) -> WfReport {
     // `  {lhs} = {rhs}` (two spaces from the outer nest-2 context inside `vcat`).
     // HS's outer `$-$` / `vcat` adds no extra indent — each rule renders
     // with its own `nest 2` inside the sep.  Result: `    {lhs} = {rhs}`
-    // (4 spaces: 2 from `nest 2` on prettyLNTerm, but actually the outer
-    // context in `doc` has no extra nest, so `nest 2 (prettyLNTerm lhs)`
-    // → 2 spaces before lhs).  Observed HS output: 4 leading spaces.
-    // Reconstruction: `sep [nest 2 lhs, "=" <-> rhs]` inline →
-    // `  {lhs} = {rhs}` (2 spaces).  Then the wrapping `doc` context adds
-    // another 2 via `nest 2 $ vcat ...`?  Let's pin to the observed 4.
+    // (4 leading spaces, as observed in HS output).
     let mut eq_lines = String::new();
     for (lhs, rhs) in &non_conv {
         let lhs_s = pp_term_for_wf(lhs);

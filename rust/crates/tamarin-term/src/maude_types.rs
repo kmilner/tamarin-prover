@@ -48,13 +48,11 @@ pub struct ConvCtx {
     /// `freshIdent "a"` (constants) BOTH draw from ONE Integer counter that
     /// ignores the name hint.  Variables and constants therefore share a
     /// single 0,1,2,… encounter-order numbering (`x2:Fresh`, `p(3)`, `x4:Msg`,
-    /// …).  RS previously used SEPARATE per-sort counters
-    /// (`var_counters[sort]`, `const_counters[sort]`), so `x0:Fresh`,
-    /// `x0:Msg`, `x0:Pub` all got idx 0 — producing DIFFERENT Maude variable
-    /// names than HS for the same term.  Maude's AC-unifier enumeration is
-    /// sensitive to those names, so the per-sort numbering flipped the order
-    /// of the 2 symmetric unifiers on AC-symmetric problems (e.g. the
-    /// UM_three_pass `CK_secure_UM3` `R_Complete_case_1↔case_2` arm swap).
+    /// …).  Do NOT split into per-sort counters: Maude's AC-unifier
+    /// enumeration is sensitive to variable names, so per-sort numbering
+    /// flips the order of the 2 symmetric unifiers on AC-symmetric problems
+    /// (e.g. the UM_three_pass `CK_secure_UM3` `R_Complete_case_1↔case_2`
+    /// arm swap).
     counter: u64,
 }
 

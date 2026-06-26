@@ -612,13 +612,13 @@ impl MaudeHandle {
         // Maude's complete unifier set for a self-equal AC/C term is
         // NOT just the identity: e.g. `em(hp(a),hp(b)) =? em(hp(a),hp(b))`
         // (C/comm) also has the "diagonal" unifier a=b, and
-        // `mult(x,y) =? mult(x,y)` has the x=y merge.  RS previously
-        // short-circuited `all(lhs == rhs)` to `[identity]`, dropping
-        // these diagonal arms — observable on Scott::key_secrecy where
+        // `mult(x,y) =? mult(x,y)` has the x=y merge.  Do NOT add an
+        // `all(lhs == rhs) -> [identity]` fast path: it drops these
+        // diagonal arms — observable on Scott::key_secrecy where
         // HS's refineSubst fan-out at /case_2/Init_2/Init_1/c_kdf/
         // split_case_3 yields 4 unifier arms for em/Mult-headed source
-        // cases (the surviving Resp_1_case_01/06/09/10 arms) while RS
-        // yielded only 2.  Self-equal NON-AC eq sets still avoid the
+        // cases (the surviving Resp_1_case_01/06/09/10 arms) while a
+        // fast path yields only 2.  Self-equal NON-AC eq sets still avoid the
         // Maude round-trip via the local `unify_lnterm_no_ac_with_counter`
         // fast path below (HS-faithful: unifyRaw solves them locally).
         // AC-free fast path: when the signature has no DH / XOR /
@@ -1216,23 +1216,20 @@ impl MaudeHandle {
         // (`eq.rhs`) into ground constants above.  So the command must be
         //   match  <pattern = t1s = lhs>  <=?  <subject = t2s = rhs>.
         //
-        // PREVIOUSLY this emitted the two sides SWAPPED — `match t2s <=?
-        // t1s` — which placed the (ground, skolemized) subject in the
-        // pattern slot and the pattern (with its universal-bound vars) in
-        // the subject slot.  Maude then treated the pattern's vars as
-        // opaque constants, so any AC match where a pattern var must
-        // ABSORB a sub-multiset failed: e.g. matching the guard
+        // Do NOT swap the two sides: placing the (ground, skolemized)
+        // subject in the pattern slot makes Maude treat the pattern's
+        // vars as opaque constants, so any AC match where a pattern var
+        // must ABSORB a sub-multiset fails: e.g. matching the guard
         //   BB_Cs(BB, <'codes', codeOther ++ <cp(..),cp(..)>>)
         // against a system action with a 3-element multiset
         //   <'codes', code2 ++ x ++ <cp(..),cp(..)>>
         // needs `codeOther → code2 ++ x`, which Maude only does when
-        // `codeOther` sits on the PATTERN side.  With the swap it
-        // returned "No match", `insertImpliedFormulas` never derived
-        // gfalse for that case, and alethea `indivVerif` was FALSIFIED
-        // (false attack) where Haskell VERIFIES it.  HS sends
-        // `match pattern <=? subject` (Term/Maude.hs matchCmd); we now do
-        // the same.  Sibling `match_eqs_skolemize_both` already had the
-        // correct order.
+        // `codeOther` sits on the PATTERN side.  A swap returns
+        // "No match", `insertImpliedFormulas` never derives gfalse for
+        // that case, and alethea `indivVerif` is FALSIFIED (false attack)
+        // where Haskell VERIFIES it.  HS sends `match pattern <=? subject`
+        // (Term/Maude.hs matchCmd).  Sibling `match_eqs_skolemize_both`
+        // uses the same order.
         let mut cmd = b"match in MSG : ".to_vec();
         cmd.extend(pp_list(&t1s));
         cmd.extend_from_slice(b" <=? ");

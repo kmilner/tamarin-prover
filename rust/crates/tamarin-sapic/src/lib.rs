@@ -26,11 +26,11 @@
 //! - [`warnings`] ← `Sapic.Warnings` (SAPIC-process wellformedness report;
 //!   bound-twice / `WFBoundTwice` arm — `checkLocks` arm deferred)
 //!
-//! Not yet ported (later phases):
-//! `Sapic.Exceptions`,
-//! `Sapic.Report`,
-//! plus secret/private channels (`ChIn`/`ChOut` on a named/private channel)
-//! in `convert`/`base_translation`.
+//! - [`report`] ← `Sapic.Report`
+//! - [`secret_channels`]/`base_translation` — secret/private channels
+//!   (`ChIn`/`ChOut` on a named/private channel)
+//!
+//! Not yet ported (later phases): `Sapic.Exceptions`.
 //!
 //! Phase 7 ported: [`progress_function`] ← `Sapic.ProgressFunction`,
 //! [`progress_translation`] ← `Sapic.ProgressTranslation`,

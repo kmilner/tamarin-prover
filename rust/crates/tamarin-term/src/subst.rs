@@ -299,11 +299,10 @@ mod tests {
     /// ```
     /// Nothing else.  No chain-chase.
     ///
-    /// We previously had `restrict_eq_store_to_stable_vars` chain-chase
-    /// values to a fixed point before filtering, which collapsed
-    /// `t.1 → e_A_1 → blind(...)` into `t.1 → blind(...)` directly,
-    /// preventing Haskell-faithful `restrict` from dropping the binding
-    /// (since `t.1` is stable).  This caused foo_eligibility's `A_1`
+    /// Do NOT chain-chase values to a fixed point before filtering:
+    /// collapsing `t.1 → e_A_1 → blind(...)` into `t.1 → blind(...)`
+    /// directly prevents Haskell-faithful `restrict` from dropping the
+    /// binding (since `t.1` is stable), causing foo_eligibility's `A_1`
     /// case to be dropped at runtime via refineSubst-contradictory.
     #[test]
     fn restrict_does_not_chain_chase() {
