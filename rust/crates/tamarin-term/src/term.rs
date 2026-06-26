@@ -37,10 +37,73 @@ pub enum DiffType {
 /// convert via `vec.into()` (or `Arc::from(vec)`); destructure-and-
 /// consume patterns use `args.iter().cloned()` (each child clone is
 /// itself O(1)).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Hash)]
 pub enum Term<A> {
     Lit(A),
     App(FunSym, Arc<[Term<A>]>),
+}
+
+// Hand-written `Eq`/`Ord` with a structural-sharing fast-path.  `Term::App`
+// children live in an `Arc<[_]>`, so two terms cloned from a common source
+// (pervasive in the proof search — substitution shares subterms) point at the
+// SAME slice; `Arc::ptr_eq` then settles equality/ordering in O(1) instead of a
+// deep recursive walk.  The std `Ord for Arc` does NOT short-circuit on pointer
+// identity (only `PartialEq` does), which is why `cmp`/`partial_cmp` are
+// hand-written here.  Correctness: `Arc::ptr_eq ⇒ true` means the same
+// allocation ⇒ identical contents, so the result equals the previous derived,
+// content-based one; on a pointer mismatch we fall back to the full structural
+// comparison.  Variant order (Lit < App) and field order are preserved exactly.
+impl<A: PartialEq> PartialEq for Term<A> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Term::Lit(a), Term::Lit(b)) => a == b,
+            (Term::App(s1, a1), Term::App(s2, a2)) => {
+                s1 == s2 && (Arc::ptr_eq(a1, a2) || a1[..] == a2[..])
+            }
+            _ => false,
+        }
+    }
+}
+impl<A: Eq> Eq for Term<A> {}
+impl<A: Ord> Ord for Term<A> {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (Term::Lit(a), Term::Lit(b)) => a.cmp(b),
+            (Term::Lit(_), Term::App(..)) => Ordering::Less,
+            (Term::App(..), Term::Lit(_)) => Ordering::Greater,
+            (Term::App(s1, a1), Term::App(s2, a2)) => s1.cmp(s2).then_with(|| {
+                if Arc::ptr_eq(a1, a2) {
+                    Ordering::Equal
+                } else {
+                    a1[..].cmp(&a2[..])
+                }
+            }),
+        }
+    }
+}
+impl<A: PartialOrd> PartialOrd for Term<A> {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (Term::Lit(a), Term::Lit(b)) => a.partial_cmp(b),
+            (Term::Lit(_), Term::App(..)) => Some(Ordering::Less),
+            (Term::App(..), Term::Lit(_)) => Some(Ordering::Greater),
+            (Term::App(s1, a1), Term::App(s2, a2)) => match s1.partial_cmp(s2) {
+                Some(Ordering::Equal) => {
+                    if Arc::ptr_eq(a1, a2) {
+                        Some(Ordering::Equal)
+                    } else {
+                        a1[..].partial_cmp(&a2[..])
+                    }
+                }
+                non_eq => non_eq,
+            },
+        }
+    }
 }
 
 /// Mirror view that distinguishes the two cases — kept for parity with the

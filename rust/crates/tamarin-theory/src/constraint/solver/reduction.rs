@@ -740,11 +740,21 @@ impl<'ctx> Reduction<'ctx> {
         //         + `Term.Substitution.SubstVFree.SubstVFree.hs:345`.
         let mut new_less: Vec<crate::constraint::constraints::LessAtom>
             = Vec::with_capacity(self.sys.less_atoms.len());
+        // Dedup by `(smaller, larger)`: `LessAtom`'s `Eq` ignores `reason`
+        // (constraints.rs:92-95), so a `FastSet` of seen pairs reproduces the
+        // previous `new_less.iter().any(|x| x == &la)` scan exactly — first
+        // occurrence wins, insertion order preserved, bit-identical Vec — but
+        // in O(1) per atom instead of O(n²) over the growing list (this scan
+        // was ~half of `subst_system_once` self-time on Less-heavy systems).
+        let mut seen_less: tamarin_utils::FastSet<(
+            crate::constraint::constraints::NodeId,
+            crate::constraint::constraints::NodeId,
+        )> = tamarin_utils::FastSet::default();
         for la in std::mem::take(&mut self.sys.less_atoms) {
             let mut la = la;
             la.smaller = map_var(la.smaller.clone());
             la.larger  = map_var(la.larger.clone());
-            if !new_less.iter().any(|x| x == &la) {
+            if seen_less.insert((la.smaller.clone(), la.larger.clone())) {
                 new_less.push(la);
             }
         }
@@ -3646,7 +3656,7 @@ pub(crate) fn process_ac_subterm(
 /// Returns `Some(true)`/`Some(false)` for trivially true/false subterms,
 /// `None` when undecidable.
 fn subterm_is_true_false(
-    reducible: &tamarin_term::function_symbols::FunSig,
+    reducible: &tamarin_utils::FastSet<tamarin_term::function_symbols::FunSym>,
     small: &tamarin_term::lterm::LNTerm,
     big: &tamarin_term::lterm::LNTerm,
 ) -> Option<bool> {
@@ -3711,7 +3721,7 @@ fn subterm_is_true_false(
 /// iteration is sorted — we keep insertion order then sort+dedup at the
 /// call site to mirror `S.toList`).
 fn subterm_step(
-    reducible: &tamarin_term::function_symbols::FunSig,
+    reducible: &tamarin_utils::FastSet<tamarin_term::function_symbols::FunSym>,
     small: &tamarin_term::lterm::LNTerm,
     big: &tamarin_term::lterm::LNTerm,
     mk_fresh: &mut dyn FnMut(tamarin_term::lterm::LSort) -> tamarin_term::lterm::LVar,
@@ -3787,7 +3797,7 @@ fn subterm_step(
 /// (HS `S.toList`).  `mk_fresh` allocates fresh vars for the AC arm,
 /// mirroring `MonadFresh`.
 fn split_subterm_single(
-    reducible: &tamarin_term::function_symbols::FunSig,
+    reducible: &tamarin_utils::FastSet<tamarin_term::function_symbols::FunSym>,
     small: &tamarin_term::lterm::LNTerm,
     big: &tamarin_term::lterm::LNTerm,
     mk_fresh: &mut dyn FnMut(tamarin_term::lterm::LSort) -> tamarin_term::lterm::LVar,
@@ -6231,7 +6241,7 @@ impl<'ctx> Reduction<'ctx> {
 
         // splitList <- splitSubterm reducible True st.  Fresh vars for the
         // AC-recurse arm come from the maude counter (HS `freshLVar`).
-        let reducible = self.maude.maude_sig().reducible_fun_syms.clone();
+        let reducible = self.maude.maude_sig().reducible_fun_syms_fast;
         let split_list = {
             let avoid_max = self.fresh_var_baseline();
             self.maude.ensure_above(avoid_max);

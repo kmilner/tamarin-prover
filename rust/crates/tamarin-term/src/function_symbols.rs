@@ -34,7 +34,7 @@ pub enum Constructability {
 /// Free (no-equation) function symbol — name plus arity, privacy, and
 /// constructability. Mirrors the Haskell tuple
 /// `(ByteString, (Int, Privacy, Constructability))`.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Hash)]
 pub struct NoEqSym {
     /// Interned into a global pool and held as a `&'static [u8]`, so a clone
     /// is a pointer copy — no heap allocation (unlike owned `Vec`) and no
@@ -58,6 +58,47 @@ impl std::fmt::Debug for NoEqSym {
             .field("privacy", &self.privacy)
             .field("constructability", &self.constructability)
             .finish()
+    }
+}
+
+// Hand-written `Eq`/`Ord` with an interned-name pointer fast-path.  `name` is
+// interned (`intern_bytes`), so equal content ⇒ equal pointer; therefore an
+// `as_ptr()` match is true exactly on the common same-symbol path and lets us
+// skip the byte `memcmp` that dominated `FunSig::contains` and term comparison
+// in the proof search.  Correctness does NOT depend on the interning
+// invariant: equal data pointers always imply equal content (same allocation),
+// and on a pointer MISmatch we fall back to the full byte comparison — so the
+// boolean/total-order is identical to the previous derived, content-based one.
+impl PartialEq for NoEqSym {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        (std::ptr::eq(self.name.as_ptr(), other.name.as_ptr()) || self.name == other.name)
+            && self.arity == other.arity
+            && self.privacy == other.privacy
+            && self.constructability == other.constructability
+    }
+}
+impl Eq for NoEqSym {}
+impl Ord for NoEqSym {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Field order matches the previous derive: name, arity, privacy,
+        // constructability.  Only the name compare gains the ptr fast-path.
+        let name_ord = if std::ptr::eq(self.name.as_ptr(), other.name.as_ptr()) {
+            std::cmp::Ordering::Equal
+        } else {
+            self.name.cmp(other.name)
+        };
+        name_ord
+            .then_with(|| self.arity.cmp(&other.arity))
+            .then_with(|| self.privacy.cmp(&other.privacy))
+            .then_with(|| self.constructability.cmp(&other.constructability))
+    }
+}
+impl PartialOrd for NoEqSym {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 

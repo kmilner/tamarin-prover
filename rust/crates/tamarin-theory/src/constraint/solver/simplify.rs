@@ -1004,7 +1004,7 @@ fn partial_atom_valuation_with(
             // Reducible-syntactic check (redElem): port of Haskell's
             // `small `redElem` big` line in `isTrueFalse`
             // (SubtermStore.hs:342).
-            let reducible_syms = maude.maude_sig().reducible_fun_syms.clone();
+            let reducible_syms = maude.maude_sig().reducible_fun_syms_fast;
             if elem_not_below_reducible(&reducible_syms, &small_lt, &big_lt) {
                 return Some(true);
             }
@@ -1357,6 +1357,21 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     ChangeIndicator::Changed
 }
 
+/// Canonicalising key for implied-formula dedup: witness LVars `~mw#N → ~mw#0`,
+/// bound LVars normalised, then AC `BinOp` permutations re-sorted.  Two formulas
+/// that differ only by Maude witness idxs / AC argument order compare equal
+/// under `==` after this.  MUST mirror the per-candidate canonicalisation used
+/// in `try_match_all_guards::rec` for `implied` (the dedup compares the two), so
+/// keep this and that site in lock-step.  Hoisted to a free fn so the existing
+/// formulas' canons can be precomputed ONCE per `try_match_all_guards` call
+/// rather than recomputed for every candidate (the dedup was O(candidates ×
+/// |existing|) deep canonicalisations; now O(candidates + |existing|)).
+fn implied_apply_canon(f: &crate::guarded::Guarded) -> crate::guarded::Guarded {
+    let f1 = crate::guarded::normalize_witness_lvars(f);
+    let f2 = crate::guarded::normalize_bound_lvars(&f1);
+    crate::guarded::canonicalize_ac_in_guarded(&f2)
+}
+
 /// Try every assignment of system actions to the universal's action
 /// guards. For each consistent assignment that binds all universal
 /// vars, instantiate the body and add to `new_formulas`.
@@ -1383,9 +1398,12 @@ fn try_match_all_guards(
         acc: &VarSubst,
         body: &crate::guarded::Guarded,
         existing_formulas: &[crate::guarded::Guarded],
+        existing_formulas_canon: &[crate::guarded::Guarded],
         existing_solved: &[crate::guarded::Guarded],
+        existing_solved_canon: &[crate::guarded::Guarded],
         other_guards: &[&tamarin_parser::ast::Atom],
         out: &mut Vec<crate::guarded::Guarded>,
+        out_canon: &mut Vec<crate::guarded::Guarded>,
     ) {
         if guard_idx == guards.len() {
             // All Action guards matched.  Now decide what the implied
@@ -1527,9 +1545,17 @@ fn try_match_all_guards(
             // unconditionally clones + walks.  If implied == f
             // syntactically (typical post-fixpoint case), skip
             // canonicalization entirely.
-            let in_formulas = existing_formulas.iter().any(|f| f == &implied || apply_canon(f) == canon);
-            let in_solved = existing_solved.iter().any(|f| f == &implied || apply_canon(f) == canon);
-            let in_out = out.iter().any(|f| f == &implied || apply_canon(f) == canon);
+            // Dedup against existing formulas using PRECOMPUTED canons (zipped
+            // 1:1 with their source slices), so `apply_canon` runs once per
+            // existing formula per pass instead of once per (existing × candidate).
+            // Identical result to the previous `apply_canon(f) == canon` — the
+            // `f == &implied` syntactic fast-path is preserved verbatim.
+            let in_formulas = existing_formulas.iter().zip(existing_formulas_canon.iter())
+                .any(|(f, fc)| f == &implied || *fc == canon);
+            let in_solved = existing_solved.iter().zip(existing_solved_canon.iter())
+                .any(|(f, fc)| f == &implied || *fc == canon);
+            let in_out = out.iter().zip(out_canon.iter())
+                .any(|(f, fc)| f == &implied || *fc == canon);
             let already = in_formulas || in_solved || in_out;
             if tamarin_utils::env_gate!("TAM_DBG_IMPL2") && !already {
                 eprintln!("[impl2] NEW canon: {:?}", format!("{:?}", canon).chars().take(140).collect::<String>());
@@ -1559,7 +1585,10 @@ fn try_match_all_guards(
                 }
             }
             if !already {
+                // Keep `out_canon` 1:1 with `out` so the `in_out` check above
+                // stays correct as `out` grows across candidates.
                 out.push(implied);
+                out_canon.push(canon);
             }
             return;
         }
@@ -1586,8 +1615,8 @@ fn try_match_all_guards(
                     for subst_here in substs_here {
                         let Some(combined) = combine_substs(acc, &subst_here) else { continue };
                         rec(maude, vars, guards, guard_idx + 1, sys_actions,
-                            &combined, body, existing_formulas, existing_solved,
-                            other_guards, out);
+                            &combined, body, existing_formulas, existing_formulas_canon, existing_solved, existing_solved_canon,
+                            other_guards, out, out_canon);
                     }
                 }
             }
@@ -1643,15 +1672,15 @@ fn try_match_all_guards(
                         if let (Some(a), Some(b)) = (lhs_eq, rhs_eq) {
                             if a == b {
                                 rec(maude, vars, guards, guard_idx + 1, sys_actions,
-                                    acc, body, existing_formulas, existing_solved,
-                                    other_guards, out);
+                                    acc, body, existing_formulas, existing_formulas_canon, existing_solved, existing_solved_canon,
+                                    other_guards, out, out_canon);
                             }
                         } else if s_subst == t_subst {
                             // Fallback for terms term_to_lnterm can't elaborate
                             // (e.g. PatMatch); preserve previous behaviour.
                             rec(maude, vars, guards, guard_idx + 1, sys_actions,
-                                acc, body, existing_formulas, existing_solved,
-                                other_guards, out);
+                                acc, body, existing_formulas, existing_formulas_canon, existing_solved, existing_solved_canon,
+                                other_guards, out, out_canon);
                         }
                         return;
                     }
@@ -1752,17 +1781,27 @@ fn try_match_all_guards(
                     }
                     let Some(combined) = combine_substs(acc, &subst_here) else { continue };
                     rec(maude, vars, guards, guard_idx + 1, sys_actions,
-                        &combined, body, existing_formulas, existing_solved,
-                        other_guards, out);
+                        &combined, body, existing_formulas, existing_formulas_canon, existing_solved, existing_solved_canon,
+                        other_guards, out, out_canon);
                 }
             }
             _ => (),
         }
     }
 
+    // Precompute the canon keys of the existing formulas (and of any
+    // pre-existing `out` entries) ONCE; `rec` reads these by reference and
+    // pushes each accepted candidate's canon into `out_canon` in lock-step with
+    // `out`, so the per-candidate dedup never recomputes them.
+    let existing_formulas_canon: Vec<crate::guarded::Guarded> =
+        existing_formulas.iter().map(implied_apply_canon).collect();
+    let existing_solved_canon: Vec<crate::guarded::Guarded> =
+        existing_solved.iter().map(implied_apply_canon).collect();
+    let mut out_canon: Vec<crate::guarded::Guarded> =
+        out.iter().map(implied_apply_canon).collect();
     rec(maude, vars, action_guards, 0, sys_actions,
-        &VarSubst::new(), body, existing_formulas, existing_solved,
-        other_guards, out);
+        &VarSubst::new(), body, existing_formulas, &existing_formulas_canon, existing_solved, &existing_solved_canon,
+        other_guards, out, &mut out_canon);
 }
 
 /// Combine two substitutions. If they map the same key to different
@@ -3137,7 +3176,12 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
     // be the *same* instance, in which case adding `i < j` AND `j < i`
     // would create a spurious cycle.  Skipping unifiable pairs lets
     // node-uniqueness merge them via the eq-store first.
-    let nodes_snapshot: Vec<_> = (*red.sys.nodes).clone();
+    // O(1) Arc handle, NOT a deep clone: this is a read-only snapshot used to
+    // borrow node rules while `red` is mutated below (`insert_less`).  An Arc
+    // clone keeps that decoupling — any later mutation of `red.sys.nodes` would
+    // copy-on-write, leaving this handle on the old Vec — without deep-copying
+    // every node's `RuleACInst` up front (a large per-pass allocation).
+    let nodes_snapshot = red.sys.nodes.clone();
     let edges_snapshot: Vec<_> = red.sys.edges.clone();
     let maude = red.ctx.maude.clone();
     let mut changed = ChangeIndicator::Unchanged;
@@ -3221,11 +3265,11 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
         // each consumed by the other's input ⇒ HS sees no cycle (freshs
         // are under `exp`), Rust sees a 4-edge cycle ⇒ premature
         // `by contradiction /* cyclic */`.
-        let reducible = &maude.maude_sig().reducible_fun_syms;
+        let reducible = &maude.maude_sig().reducible_fun_syms_fast;
         let fresh_term: tamarin_term::lterm::LNTerm =
             tamarin_term::term::Term::Lit(
                 tamarin_term::vterm::Lit::Var(fresh_var.clone()));
-        for (other_id, other_rule) in &nodes_snapshot {
+        for (other_id, other_rule) in nodes_snapshot.iter() {
             if other_id == sup_id { continue; }
             let mut found = false;
             for f in other_rule.premises.iter().chain(other_rule.actions.iter()) {
@@ -3689,7 +3733,7 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
     let mut new_formulas: Vec<crate::guarded::Guarded> = Vec::new();
     let mut new_lesses: Vec<(crate::constraint::constraints::NodeId,
                              crate::constraint::constraints::NodeId)> = Vec::new();
-    let reducible = red.ctx.maude.maude_sig().reducible_fun_syms.clone();
+    let reducible = red.ctx.maude.maude_sig().reducible_fun_syms_fast;
     // Snapshot the subterm-store membership sets for the `Just sst` arm
     // below (HS `isTrueFalse reducible (Just sst)`, SubtermStore.hs:356-371).
     // `posSt = posSubterms ∪ solvedSubterms`, `negSt = negSubterms`.
@@ -4221,7 +4265,7 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
     use tamarin_term::function_symbols::FunSym;
     let mut changed = ChangeIndicator::Unchanged;
     if red.sys.subterm_store.contradictory { return changed; }
-    let reducible = red.ctx.maude.maude_sig().reducible_fun_syms.clone();
+    let reducible = red.ctx.maude.maude_sig().reducible_fun_syms_fast;
 
     // -------------------------------------------------------------
     // isTrueFalse — HS SubtermStore.hs:334-355 (Nothing sst branch).
@@ -4304,7 +4348,7 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
     // disjunction of immediate decompositions of `(small, big)`, or
     // None when `(small, big)` cannot be decomposed further.
     // Mirrors HS `step` (SubtermStore.hs:279-305) closely.
-    fn step_split(reducible: &tamarin_term::function_symbols::FunSig,
+    fn step_split(reducible: &tamarin_utils::FastSet<tamarin_term::function_symbols::FunSym>,
                   is_true_false: &impl Fn(&tamarin_term::lterm::LNTerm,
                                           &tamarin_term::lterm::LNTerm)
                                           -> Option<bool>,
@@ -4393,7 +4437,7 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
             _ => None,
         }
     }
-    fn recurse_split(reducible: &tamarin_term::function_symbols::FunSig,
+    fn recurse_split(reducible: &tamarin_utils::FastSet<tamarin_term::function_symbols::FunSym>,
                      is_true_false: &impl Fn(&tamarin_term::lterm::LNTerm,
                                              &tamarin_term::lterm::LNTerm)
                                              -> Option<bool>,

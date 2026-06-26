@@ -262,7 +262,7 @@ fn has_non_normal_terms(ctx: &ProofContext, sys: &System) -> bool {
     // rules.
     let sig = ctx.maude.maude_sig();
     if sig.reducible_fun_syms.is_empty() { return false; }
-    let irreducible = &sig.irreducible_fun_syms;
+    let irreducible = &sig.irreducible_fun_syms_fast;
 
     // Short-circuiting structural walk: the moment a candidate subterm — a
     // variable or a reducible-headed `App` (the `_` arm of
@@ -275,7 +275,7 @@ fn has_non_normal_terms(ctx: &ProofContext, sys: &System) -> bool {
     // subterm more than once cannot change the verdict.
     fn any_non_nf(
         sig: &tamarin_term::maude_sig::MaudeSig,
-        irreducible: &tamarin_term::function_symbols::FunSig,
+        irreducible: &tamarin_utils::FastSet<tamarin_term::function_symbols::FunSym>,
         t: &tamarin_term::lterm::LNTerm,
     ) -> bool {
         use tamarin_term::term::Term;
@@ -319,7 +319,7 @@ fn has_non_normal_terms(ctx: &ProofContext, sys: &System) -> bool {
 /// variables are structurally in NF under `nf_via_haskell`, so an
 /// included bare variable never triggers a non-normal-term verdict.
 fn maybe_not_nf_subterms(
-    irreducible: &tamarin_term::function_symbols::FunSig,
+    irreducible: &tamarin_utils::FastSet<tamarin_term::function_symbols::FunSym>,
     t: &tamarin_term::lterm::LNTerm,
     out: &mut std::collections::BTreeSet<tamarin_term::lterm::LNTerm>,
 ) {
@@ -342,7 +342,7 @@ fn maybe_not_nf_subterms(
 /// detection (the `simpSubterms` simplification pass — see
 /// `propagate_subterm_obvious` in `simplify.rs` — handles the rest).
 fn has_subterm_cycle_contra(ctx: &ProofContext, sys: &System) -> bool {
-    let reducible = &ctx.maude.maude_sig().reducible_fun_syms;
+    let reducible = &ctx.maude.maude_sig().reducible_fun_syms_fast;
     crate::tools::subterm_store::has_subterm_cycle(reducible, &sys.subterm_store)
 }
 
@@ -1798,7 +1798,7 @@ fn node_after_last(sys: &System) -> Vec<Contradiction> {
 /// (Contradictions.hs:149-155).
 pub fn maybe_non_normal_terms(
     sys: &System,
-    irreducible: &tamarin_term::function_symbols::FunSig,
+    irreducible: &tamarin_utils::FastSet<tamarin_term::function_symbols::FunSym>,
 ) -> Vec<tamarin_term::lterm::LNTerm> {
     let mut candidates: std::collections::BTreeSet<tamarin_term::lterm::LNTerm>
         = std::collections::BTreeSet::new();
@@ -1840,7 +1840,7 @@ pub fn subst_creates_non_normal_terms(
     use tamarin_term::subst::apply_vterm;
     use tamarin_term::vterm::vars_vterm;
     let sig = maude.maude_sig();
-    let irreducible = &sig.irreducible_fun_syms;
+    let irreducible = &sig.irreducible_fun_syms_fast;
     // Apply fsubst once upfront.
     let terms: Vec<tamarin_term::lterm::LNTerm> = maybe_non_normal_terms(sys, irreducible)
         .into_iter()

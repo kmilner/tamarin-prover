@@ -546,7 +546,7 @@ impl ProofContext {
         let proto_rule_refs: Vec<&crate::rule::ProtoRuleE> = proto_rules.iter().collect();
         let mut injective_fact_insts =
             crate::tools::injective_fact_instances::simple_injective_fact_instances(
-                &proto_rule_refs, &sig.reducible_fun_syms);
+                &proto_rule_refs, &sig.reducible_fun_syms_fast);
         // HS `closeRuleCache` (Rule.hs:147-150): union the FORCED injective
         // fact tags BEFORE source precomputation reads `injective_fact_insts`.
         if !forced_injective_facts.is_empty() {
