@@ -483,13 +483,23 @@ impl ProverSession {
         } else {
             Vec::new()
         };
-        // Capture the fresh-counter span around the template build so we
-        // can replay the bump per lemma (see `setup_counter_delta` docs).
+        // HS-FAITHFUL PURITY (mirrors the source-refinement purity in
+        // `ensure_saturated`): HS closes the theory ONCE and each lemma's
+        // proof independently resets fresh to `avoid sys` per step
+        // (ProofMethod.hs:457) — the theory-build's fresh allocation never
+        // feeds the per-lemma proof counter.  RS's template build advances
+        // the shared counter; the session model REPLAYED that advance per
+        // lemma as `(i+1)*setup_counter_delta` to mimic the non-session path
+        // that rebuilds the context per lemma.  That replay is an RS-ism, not
+        // HS.  Restore the counter to its pre-build value so the build is
+        // counter-neutral: every lemma starts from the same base, template
+        // vars are re-freshened from `avoid sys` on instantiation, and
+        // `setup_counter_delta` collapses to 0.
         let setup_counter_before = maude.fresh_counter_peek();
         let template_ctx = ProofContext::new_with_restrictions_pool_forced(
             maude.clone(), pool, rules, restrictions.clone(), &forced_injective_facts);
-        let setup_counter_after = maude.fresh_counter_peek();
-        let setup_counter_delta = setup_counter_after.saturating_sub(setup_counter_before);
+        maude.reset_counter_to(setup_counter_before);
+        let setup_counter_delta = 0u64;
         Ok(ProverSession {
             theory,
             cli_heuristic,
