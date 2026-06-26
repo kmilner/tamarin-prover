@@ -226,6 +226,21 @@ impl ProofContext {
                 }
             }
         }
+        // HS-FAITHFUL PURITY: source refinement (`precomputeSources` /
+        // `saturateSources` / `refineWithSourceAsms`, Sources.hs) is a PURE
+        // `[Source] -> [Source]` computation with LOCAL `evalFresh (avoid
+        // goalTerm)` scopes — it does NOT thread the per-proof `MonadFresh`
+        // counter.  Each proof step independently resets fresh to `avoid sys`
+        // (ProofMethod.hs:457 `runReduction (m <* simplifySystem) ctxt sys
+        // (avoid sys)`), and source cases are re-freshened on apply.  RS's
+        // saturation, by contrast, advances the shared `maude` counter while
+        // computing cases; that advance is HS-invisible and its magnitude is
+        // parallelism- and source-structure-dependent (large for SAPiC state
+        // facts), which leaks into the proof when the cache skips/replays it.
+        // Snapshot the counter and restore it after saturation so the refine
+        // is counter-neutral exactly as in HS — making the post-saturation
+        // counter (hence cache reuse vs recompute) byte-identical regardless.
+        let saturate_cnt_before = self.maude.fresh_counter_peek();
         // Pre-populate every source's cell with `Some(vec![])` BEFORE
         // running `initial_source_cases` on any of them.  This breaks
         // the recursion: when `initial_source_cases` for source A
@@ -332,6 +347,11 @@ impl ProofContext {
                 }
             }
         }
+        // Restore the fresh counter to its pre-saturation value (see the
+        // HS-FAITHFUL PURITY note above): the refine consumed idxs only for
+        // the stored cases, which are re-freshened from `avoid(live_sys)` on
+        // every apply, so the global counter must not retain the advance.
+        self.maude.reset_counter_to(saturate_cnt_before);
         *self.saturate_state.lock().unwrap() = SaturateState::Done;
     }
 
