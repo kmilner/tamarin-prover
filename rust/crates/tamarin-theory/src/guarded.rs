@@ -17,7 +17,8 @@
 use std::collections::BTreeSet;
 
 use tamarin_parser::ast as p;
-use tamarin_utils::cow::{cow_map_vec, cow_pair};
+use tamarin_utils::cow::{cow_map_arc, cow_map_vec, cow_pair};
+use crate::guarded_types::cow_pair_arc;
 
 pub use crate::guarded_types::{
     ga,
@@ -1535,25 +1536,10 @@ fn cac_rec_term_cow(t: &GTerm, cmp: GCmp) -> Option<GTerm> {
             cac_rec_slice(args, cmp).map(|new| GTerm::App(n.clone(), new)),
         GTerm::Pair(args) =>
             cac_rec_slice(args, cmp).map(GTerm::Pair),
-        GTerm::AlgApp(n, a, b) => {
-            let a2 = cac_rec_term_cow(a, cmp);
-            let b2 = cac_rec_term_cow(b, cmp);
-            if a2.is_none() && b2.is_none() { return None; }
-            Some(GTerm::AlgApp(
-                n.clone(),
-                a2.map(ga).unwrap_or_else(|| a.clone()),
-                b2.map(ga).unwrap_or_else(|| b.clone()),
-            ))
-        }
-        GTerm::Diff(a, b) => {
-            let a2 = cac_rec_term_cow(a, cmp);
-            let b2 = cac_rec_term_cow(b, cmp);
-            if a2.is_none() && b2.is_none() { return None; }
-            Some(GTerm::Diff(
-                a2.map(ga).unwrap_or_else(|| a.clone()),
-                b2.map(ga).unwrap_or_else(|| b.clone()),
-            ))
-        }
+        GTerm::AlgApp(n, a, b) => cow_pair_arc(a, cac_rec_term_cow(a, cmp), b, cac_rec_term_cow(b, cmp))
+            .map(|(a, b)| GTerm::AlgApp(n.clone(), a, b)),
+        GTerm::Diff(a, b) => cow_pair_arc(a, cac_rec_term_cow(a, cmp), b, cac_rec_term_cow(b, cmp))
+            .map(|(a, b)| GTerm::Diff(a, b)),
         GTerm::BinOp(op, l, r) => {
             if matches!(op, p::BinOp::Mult | p::BinOp::Union | p::BinOp::Xor | p::BinOp::NatPlus) {
                 // Recurse into children first, then flatten the whole AC
@@ -1575,14 +1561,8 @@ fn cac_rec_term_cow(t: &GTerm, cmp: GCmp) -> Option<GTerm> {
                 // (children unchanged AND already sorted+right-leaning).
                 if acc == *t { None } else { Some(acc) }
             } else {
-                let l2 = cac_rec_term_cow(l, cmp);
-                let r2 = cac_rec_term_cow(r, cmp);
-                if l2.is_none() && r2.is_none() { return None; }
-                Some(GTerm::BinOp(
-                    *op,
-                    l2.map(ga).unwrap_or_else(|| l.clone()),
-                    r2.map(ga).unwrap_or_else(|| r.clone()),
-                ))
+                cow_pair_arc(l, cac_rec_term_cow(l, cmp), r, cac_rec_term_cow(r, cmp))
+                    .map(|(l, r)| GTerm::BinOp(*op, l, r))
             }
         }
         GTerm::PatMatch(inner) =>
@@ -1595,7 +1575,7 @@ fn cac_rec_term_cow(t: &GTerm, cmp: GCmp) -> Option<GTerm> {
 /// by cloning their `Arc`).  Single-pass: the output `Vec` is allocated lazily
 /// only when (and after) the first child changes.
 fn cac_rec_slice(args: &std::sync::Arc<[GTerm]>, cmp: GCmp) -> Option<std::sync::Arc<[GTerm]>> {
-    cow_map_vec(&args[..], |a| cac_rec_term_cow(a, cmp)).map(std::sync::Arc::from)
+    cow_map_arc(args, |a| cac_rec_term_cow(a, cmp))
 }
 
 // Copy-on-write canonicalisation, one level up from `cac_rec_term_cow`: each
@@ -1911,16 +1891,8 @@ fn subst_gterm_cow(t: &GTerm, s: &VarSubst) -> Option<GTerm> {
         | GTerm::Number(_) | GTerm::NumberOne | GTerm::NatOne | GTerm::DhNeutral => None,
         GTerm::App(n, args) =>
             subst_gterm_slice(args, s).map(|new| GTerm::App(n.clone(), new)),
-        GTerm::AlgApp(n, a, b) => {
-            let a2 = subst_gterm_cow(a, s);
-            let b2 = subst_gterm_cow(b, s);
-            if a2.is_none() && b2.is_none() { return None; }
-            Some(GTerm::AlgApp(
-                n.clone(),
-                a2.map(ga).unwrap_or_else(|| a.clone()),
-                b2.map(ga).unwrap_or_else(|| b.clone()),
-            ))
-        }
+        GTerm::AlgApp(n, a, b) => cow_pair_arc(a, subst_gterm_cow(a, s), b, subst_gterm_cow(b, s))
+            .map(|(a, b)| GTerm::AlgApp(n.clone(), a, b)),
         // Canonicalise via `mk_gpair`: substituting a pair-valued var into a
         // tuple tail (`<..,matchingComm>` with `matchingComm := <a,b>`) would
         // otherwise leave a non-canonical `Pair([..,Pair([a,b])])` that no
@@ -1954,25 +1926,10 @@ fn subst_gterm_cow(t: &GTerm, s: &VarSubst) -> Option<GTerm> {
                 }
             }
         }
-        GTerm::Diff(a, b) => {
-            let a2 = subst_gterm_cow(a, s);
-            let b2 = subst_gterm_cow(b, s);
-            if a2.is_none() && b2.is_none() { return None; }
-            Some(GTerm::Diff(
-                a2.map(ga).unwrap_or_else(|| a.clone()),
-                b2.map(ga).unwrap_or_else(|| b.clone()),
-            ))
-        }
-        GTerm::BinOp(op, a, b) => {
-            let a2 = subst_gterm_cow(a, s);
-            let b2 = subst_gterm_cow(b, s);
-            if a2.is_none() && b2.is_none() { return None; }
-            Some(GTerm::BinOp(
-                *op,
-                a2.map(ga).unwrap_or_else(|| a.clone()),
-                b2.map(ga).unwrap_or_else(|| b.clone()),
-            ))
-        }
+        GTerm::Diff(a, b) => cow_pair_arc(a, subst_gterm_cow(a, s), b, subst_gterm_cow(b, s))
+            .map(|(a, b)| GTerm::Diff(a, b)),
+        GTerm::BinOp(op, a, b) => cow_pair_arc(a, subst_gterm_cow(a, s), b, subst_gterm_cow(b, s))
+            .map(|(a, b)| GTerm::BinOp(*op, a, b)),
         GTerm::PatMatch(inner) =>
             subst_gterm_cow(inner, s).map(|g| GTerm::PatMatch(ga(g))),
     }
@@ -1985,14 +1942,7 @@ fn subst_gterm_cow(t: &GTerm, s: &VarSubst) -> Option<GTerm> {
 fn subst_gterm_slice(args: &std::sync::Arc<[GTerm]>, s: &VarSubst)
     -> Option<std::sync::Arc<[GTerm]>>
 {
-    let mut out: Option<Vec<GTerm>> = None;
-    for (i, a) in args.iter().enumerate() {
-        match subst_gterm_cow(a, s) {
-            Some(g) => out.get_or_insert_with(|| args[..i].to_vec()).push(g),
-            None => if let Some(v) = out.as_mut() { v.push(a.clone()); }
-        }
-    }
-    out.map(std::sync::Arc::from)
+    cow_map_arc(args, |a| subst_gterm_cow(a, s))
 }
 
 /// Find the maximum variable idx used in a guarded formula. Used

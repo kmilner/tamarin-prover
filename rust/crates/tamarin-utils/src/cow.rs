@@ -53,6 +53,18 @@ pub fn cow_pair<T: Clone, U: Clone>(
     Some((fx.unwrap_or_else(|| x.clone()), fy.unwrap_or_else(|| y.clone())))
 }
 
+/// COW-map an `Arc<[T]>` (a shared slice): like [`cow_map_vec`], but rebuilds
+/// into a fresh `Arc<[T]>`.  `None` when every element is unchanged, so the
+/// caller reuses the original `Arc` (no allocation); `Some` carries the rebuilt
+/// slice with the unchanged prefix cloned and changed elements rebuilt.
+#[inline]
+pub fn cow_map_arc<T: Clone>(
+    xs: &std::sync::Arc<[T]>,
+    f: impl FnMut(&T) -> Option<T>,
+) -> Option<std::sync::Arc<[T]>> {
+    cow_map_vec(&xs[..], f).map(std::sync::Arc::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +110,13 @@ mod tests {
         assert_eq!(cow_pair(&1, None, &2, Some(20)), Some((1, 20)));
         assert_eq!(cow_pair(&1, Some(10), &2, None), Some((10, 2)));
         assert_eq!(cow_pair(&1, Some(10), &2, Some(20)), Some((10, 20)));
+    }
+
+    #[test]
+    fn map_arc_rebuilds_into_fresh_arc() {
+        let xs: std::sync::Arc<[i32]> = std::sync::Arc::from(vec![1, 2, 3]);
+        assert_eq!(cow_map_arc(&xs, neg_even).as_deref(), Some(&[1, -2, 3][..]));
+        let ys: std::sync::Arc<[i32]> = std::sync::Arc::from(vec![1, 3, 5]);
+        assert_eq!(cow_map_arc(&ys, neg_even), None);
     }
 }
