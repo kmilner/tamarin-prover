@@ -102,7 +102,10 @@ struct MaudeProcessInner {
     stdin: ChildStdin,
     stdout: ChildStdout,
     stats: MaudeStats,
-    sig: MaudeSig,
+    /// The theory signature — immutable after `start()`.  Shared (`Arc`) with
+    /// the owning `MaudeHandle` so reads via `MaudeHandle::maude_sig()` are a
+    /// refcount bump rather than a deep clone taken under this IPC mutex.
+    sig: Arc<MaudeSig>,
     /// Memo for `unifiable(...)` queries — see `MaudeHandle::unifiable`.
     /// Caches the *boolean* outcome (true = at least one unifier
     /// exists).  Witness LVars produced inside the subst aren't safe
@@ -294,6 +297,13 @@ pub struct MaudeHandle {
     /// goes backward, so once a witness/rule idx is allocated it can
     /// never be reused.
     fresh_counter: Arc<AtomicU64>,
+    /// The theory signature, shared (`Arc`) with `inner` and across every
+    /// `with_fresh_counter_from` clone.  Immutable after `start()`, so
+    /// `maude_sig()` hands out a cheap refcount-bumped clone WITHOUT taking the
+    /// IPC mutex or deep-cloning the `BTreeSet`s — the previous
+    /// `self.inner.lock().unwrap().sig.clone()` did both on every proof-search
+    /// membership probe, a needless allocation and a parallel contention point.
+    sig: Arc<MaudeSig>,
 }
 
 impl std::fmt::Debug for MaudeHandle {
@@ -305,6 +315,9 @@ impl std::fmt::Debug for MaudeHandle {
 impl MaudeHandle {
     /// Start a new Maude process and load the theory module for `sig`.
     pub fn start(maude_path: &str, sig: MaudeSig) -> Result<Self, MaudeError> {
+        // Wrap once: `inner`, the handle, and every `with_fresh_counter_from`
+        // clone share this single immutable signature.
+        let sig = Arc::new(sig);
         // stderr: INHERIT, not pipe.  HS uses `runInteractiveCommand`
         // (System.Process) at Process.hs:109, which opens a PIPE for
         // stderr too — the returned `herr` (captured into the `MP` record
@@ -339,7 +352,7 @@ impl MaudeHandle {
             stdin,
             stdout,
             stats: MaudeStats::default(),
-            sig: sig.clone(),
+            sig: Arc::clone(&sig),
             unifiable_cache: tamarin_utils::FastMap::default(),
             reduce_cache: tamarin_utils::FastMap::default(),
             match_empty_cache: tamarin_utils::FastMap::default(),
@@ -363,6 +376,7 @@ impl MaudeHandle {
             // The global fresh counter starts at 0 (HS-faithful: HS's
             // `MonadFresh` global counter starts at 0).
             fresh_counter: Arc::new(AtomicU64::new(0)),
+            sig,
         })
     }
 
@@ -436,11 +450,17 @@ impl MaudeHandle {
             inner: self.inner.clone(),
             child: self.child.clone(),
             fresh_counter: Arc::new(AtomicU64::new(avoid_max.saturating_add(1))),
+            sig: Arc::clone(&self.sig),
         }
     }
 
-    pub fn maude_sig(&self) -> MaudeSig {
-        self.inner.lock().unwrap().sig.clone()
+    /// The theory signature.  Cheap: a refcount bump on the shared immutable
+    /// `Arc<MaudeSig>` — NO IPC-mutex lock and NO deep clone of the signature's
+    /// `BTreeSet`s.  Hot proof-search predicates probe `reducible_fun_syms_fast`
+    /// etc. through this; returning the `Arc` keeps those reads allocation-free
+    /// and lock-free (the old version locked `inner` and cloned the whole sig).
+    pub fn maude_sig(&self) -> Arc<MaudeSig> {
+        Arc::clone(&self.sig)
     }
 
     /// Kill the underlying Maude subprocess.  Use as a watchdog when a

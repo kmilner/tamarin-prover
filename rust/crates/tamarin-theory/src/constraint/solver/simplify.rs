@@ -1004,7 +1004,7 @@ fn partial_atom_valuation_with(
             // Reducible-syntactic check (redElem): port of Haskell's
             // `small `redElem` big` line in `isTrueFalse`
             // (SubtermStore.hs:342).
-            let reducible_syms = maude.maude_sig().reducible_fun_syms_fast;
+            let reducible_syms = maude.maude_sig().reducible_fun_syms_fast.clone();
             if elem_not_below_reducible(&reducible_syms, &small_lt, &big_lt) {
                 return Some(true);
             }
@@ -1237,6 +1237,15 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
             }
         }
     }
+    // Canon keys of the existing formulas, computed ONCE for the whole pass:
+    // `red.sys.formulas`/`solved_formulas` are not mutated inside the loop
+    // (only the local `new_formulas` grows; `red.insert_formula` runs after),
+    // so these are loop-invariant.  Hoisting them out turns the dedup canon
+    // cost from O(universals · |formulas|) to O(|formulas|).
+    let existing_formulas_canon: Vec<crate::guarded::Guarded> =
+        red.sys.formulas.iter().map(implied_apply_canon).collect();
+    let existing_solved_canon: Vec<crate::guarded::Guarded> =
+        red.sys.solved_formulas.iter().map(implied_apply_canon).collect();
     for (_orig, vars, guards, body) in &universals {
         // Mirrors Haskell's `impliedFormulas`'s `prepare` partition
         // (`System.hs:1124-1126`): Action and Eq atoms drive matching,
@@ -1280,7 +1289,8 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
         // and emits the implied body with `acc = emptySubst`.
         try_match_all_guards(
             &maude, vars, &driving_guards, &sys_actions, body,
-            &red.sys.formulas, &red.sys.solved_formulas,
+            &red.sys.formulas, &existing_formulas_canon,
+            &red.sys.solved_formulas, &existing_solved_canon,
             &other_guards,
             &mut new_formulas,
         );
@@ -1382,7 +1392,16 @@ fn try_match_all_guards(
     sys_actions: &[(crate::constraint::constraints::NodeId, crate::fact::LNFact)],
     body: &crate::guarded::Guarded,
     existing_formulas: &[crate::guarded::Guarded],
+    // Canon keys of `existing_formulas` / `existing_solved`, precomputed ONCE by
+    // the caller (`insert_implied_formulas_pass`) and shared across every
+    // universal — they depend only on `red.sys.formulas`/`solved_formulas`,
+    // which the per-universal loop never mutates.  Previously recomputed inside
+    // this fn, i.e. once per universal: O(universals · |formulas|) deep
+    // canonicalisations (the profiled `GTerm/Guarded::clone` cost on
+    // stateverif/gcm).  Now O(|formulas|) per pass.
+    existing_formulas_canon: &[crate::guarded::Guarded],
     existing_solved: &[crate::guarded::Guarded],
+    existing_solved_canon: &[crate::guarded::Guarded],
     other_guards: &[&tamarin_parser::ast::Atom],
     out: &mut Vec<crate::guarded::Guarded>,
 ) {
@@ -1789,18 +1808,14 @@ fn try_match_all_guards(
         }
     }
 
-    // Precompute the canon keys of the existing formulas (and of any
-    // pre-existing `out` entries) ONCE; `rec` reads these by reference and
-    // pushes each accepted candidate's canon into `out_canon` in lock-step with
-    // `out`, so the per-candidate dedup never recomputes them.
-    let existing_formulas_canon: Vec<crate::guarded::Guarded> =
-        existing_formulas.iter().map(implied_apply_canon).collect();
-    let existing_solved_canon: Vec<crate::guarded::Guarded> =
-        existing_solved.iter().map(implied_apply_canon).collect();
+    // `existing_formulas_canon` / `existing_solved_canon` arrive precomputed
+    // from the caller (loop-invariant across universals).  Only `out_canon`
+    // (the canon of accepted candidates) is per-call, since `out` grows here;
+    // `rec` pushes each accepted candidate's canon in lock-step with `out`.
     let mut out_canon: Vec<crate::guarded::Guarded> =
         out.iter().map(implied_apply_canon).collect();
     rec(maude, vars, action_guards, 0, sys_actions,
-        &VarSubst::new(), body, existing_formulas, &existing_formulas_canon, existing_solved, &existing_solved_canon,
+        &VarSubst::new(), body, existing_formulas, existing_formulas_canon, existing_solved, existing_solved_canon,
         other_guards, out, &mut out_canon);
 }
 
@@ -3733,7 +3748,7 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
     let mut new_formulas: Vec<crate::guarded::Guarded> = Vec::new();
     let mut new_lesses: Vec<(crate::constraint::constraints::NodeId,
                              crate::constraint::constraints::NodeId)> = Vec::new();
-    let reducible = red.ctx.maude.maude_sig().reducible_fun_syms_fast;
+    let reducible = red.ctx.maude.maude_sig().reducible_fun_syms_fast.clone();
     // Snapshot the subterm-store membership sets for the `Just sst` arm
     // below (HS `isTrueFalse reducible (Just sst)`, SubtermStore.hs:356-371).
     // `posSt = posSubterms ∪ solvedSubterms`, `negSt = negSubterms`.
@@ -4265,7 +4280,7 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
     use tamarin_term::function_symbols::FunSym;
     let mut changed = ChangeIndicator::Unchanged;
     if red.sys.subterm_store.contradictory { return changed; }
-    let reducible = red.ctx.maude.maude_sig().reducible_fun_syms_fast;
+    let reducible = red.ctx.maude.maude_sig().reducible_fun_syms_fast.clone();
 
     // -------------------------------------------------------------
     // isTrueFalse — HS SubtermStore.hs:334-355 (Nothing sst branch).
