@@ -629,11 +629,18 @@ impl Args {
 
     /// Resolve `--maude-processes` (or its default).
     ///
-    /// Default = `max(1, effective_processors() / 2)` — balances Maude
-    /// memory cost (~30-100 MB per subprocess on real protocols)
-    /// against throughput; empirically a ratio of 1:2 (workers:maudes)
-    /// gives most of the benefit of 1:1 without doubling memory.
-    /// Tight-RAM users can override with `--maude-processes=2` etc.
+    /// Default = `max(1, effective_processors())` — a 1:1
+    /// workers:maudes ratio.  Lemma-level parallelism (B1) plus the
+    /// within-lemma fan-out both draw Maude handles from this pool
+    /// concurrently, so a half-size pool (the previous `procs/2`
+    /// default) was frequently exhausted, forcing the fan-out to fall
+    /// back to the single shared subprocess (serialised IPC).  At 1:1 the
+    /// Maude-bound theories keep more queries in flight (gcm ~-8%,
+    /// Yubikey ~-12% @16c; output-identical — Maude is stateless so pool
+    /// size never affects results).  Costs ~30-100 MB per extra
+    /// subprocess on real protocols; tight-RAM users can dial it back
+    /// with `--maude-processes=N`.  Going ABOVE `procs` over-subscribes
+    /// and regresses (measured), so do not raise the default further.
     ///
     /// When `--processors=1`, force pool size 1 (no parallelism to
     /// exploit; saves spawn cost).
@@ -644,7 +651,7 @@ impl Args {
         }
         match self.maude_processes {
             Some(n) => n.max(1),
-            None => (procs / 2).max(1),
+            None => procs.max(1),
         }
     }
 }
@@ -1291,10 +1298,11 @@ mod tests {
     }
 
     #[test]
-    fn effective_maude_processes_default_is_half_processors() {
+    fn effective_maude_processes_default_is_one_to_one() {
         let a = parse(&["--processors=8", "x.spthy"]);
-        // 8/2 = 4 default
-        assert_eq!(a.effective_maude_processes(), 4);
+        // Default is now 1:1 (= processors) so B1 lemma-level + within-lemma
+        // fan-out don't exhaust the pool and fall back to the shared Maude.
+        assert_eq!(a.effective_maude_processes(), 8);
     }
 
     #[test]
