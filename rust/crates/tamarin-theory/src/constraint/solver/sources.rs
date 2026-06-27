@@ -43,6 +43,34 @@ thread_local! {
         = const { std::cell::Cell::new(false) };
 }
 
+/// The variables kept stable across a source-case graft: the live goal's node
+/// id plus every free variable of its fact — HS's `frees goal = [iTerm] ++
+/// frees faTerm`.  Both the `restrict_eq_store_to_stable_vars` (`stableVars`)
+/// restriction and the `someInst` keep-var bindings use this exact set, in the
+/// action and premise paths alike; the shared helper makes that invariant
+/// explicit instead of leaving four separated copies to drift.
+fn collect_node_and_fact_frees(
+    live_node: &crate::constraint::constraints::NodeId,
+    fa_live: &crate::fact::LNFact,
+) -> std::collections::BTreeSet<tamarin_term::lterm::LVar> {
+    use tamarin_term::lterm::HasFrees;
+    let mut s = std::collections::BTreeSet::new();
+    s.insert(live_node.clone());
+    fa_live.for_each_free(&mut |v: &tamarin_term::lterm::LVar| {
+        s.insert(v.clone());
+    });
+    s
+}
+
+/// The set of every node id in `sys` — the membership set used to keep only
+/// edges wholly within the live sub-system (E.5).  Loop-invariant across arms,
+/// so built once per `apply_source_case_*` call.
+fn collect_node_ids(
+    sys: &System,
+) -> std::collections::BTreeSet<crate::constraint::constraints::NodeId> {
+    sys.nodes.iter().map(|(n, _)| n.clone()).collect()
+}
+
 pub fn in_precompute_mode() -> bool {
     IN_PRECOMPUTE.with(|c| c.get())
 }
@@ -4257,14 +4285,7 @@ fn refine_source_case_action(
     // goal's free vars (since `set cdGoal goalTerm` was applied).
     // Drops any leftover abstract/rule-internal bindings introduced
     // during precompute and renamed via Step A.1.
-    let runtime_stable: std::collections::BTreeSet<tamarin_term::lterm::LVar> = {
-        let mut s = std::collections::BTreeSet::new();
-        s.insert(live_node.clone());
-        fa_live.for_each_free(&mut |v: &tamarin_term::lterm::LVar| {
-            s.insert(v.clone());
-        });
-        s
-    };
+    let runtime_stable = collect_node_and_fact_frees(live_node, fa_live);
     restrict_eq_store_to_stable_vars(&mut refined.sys, &runtime_stable);
     crate::state_trace::emit(
         "applySource_refined", Some(&live_goal_for_trace), &refined.sys);
@@ -4289,12 +4310,7 @@ fn refine_source_case_action(
     // `avoid(live_sys) + 1` below, then `freshen_system_some_inst`
     // draws fresh idxs from it per unique LVar in traversal order.
     // ---------------------------------------------------------------
-    let mut keep_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar>
-        = std::collections::BTreeSet::new();
-    keep_vars.insert(live_node.clone());
-    fa_live.for_each_free(&mut |v: &tamarin_term::lterm::LVar| {
-        keep_vars.insert(v.clone());
-    });
+    let keep_vars = collect_node_and_fact_frees(live_node, fa_live);
     let post_refine_max = bounds_max(&refined_case);
     ctx.maude.ensure_above(post_refine_max);
     // HS-faithful `someInst`: traversal-order per-var fresh idx
@@ -4525,8 +4541,7 @@ fn conjoin_refine_arm(
     // `live_node_ids` depends only on `live_sys` (an immutable param,
     // invariant across arms), so build it ONCE here instead of cloning
     // every node id on each arm iteration.
-    let live_node_ids: std::collections::BTreeSet<crate::constraint::constraints::NodeId> =
-        live_sys.nodes.iter().map(|(n, _)| n.clone()).collect();
+    let live_node_ids = collect_node_ids(live_sys);
 
     for mut r in arm_reductions {
 
@@ -4917,8 +4932,7 @@ fn apply_source_case_premise(
     // param, invariant across arms), so build it ONCE here instead of
     // cloning every node id on each arm iteration.  See the per-arm E.5
     // comment below.
-    let prem_live_node_ids: std::collections::BTreeSet<crate::constraint::constraints::NodeId> =
-        live_sys.nodes.iter().map(|(n, _)| n.clone()).collect();
+    let prem_live_node_ids = collect_node_ids(live_sys);
 
     for arm_eq_store in arm_eq_stores {
         let mut arm_sys = post_solve_sys_template.clone();
@@ -4931,26 +4945,14 @@ fn apply_source_case_premise(
         dbg("post-subst-eq-store-false");
         continue;
     }
-    let runtime_stable: std::collections::BTreeSet<tamarin_term::lterm::LVar> = {
-        let mut s = std::collections::BTreeSet::new();
-        s.insert(live_node.clone());
-        fa_live.for_each_free(&mut |v: &tamarin_term::lterm::LVar| {
-            s.insert(v.clone());
-        });
-        s
-    };
+    let runtime_stable = collect_node_and_fact_frees(live_node, fa_live);
     restrict_eq_store_to_stable_vars(&mut refined.sys, &runtime_stable);
     crate::state_trace::emit(
         "applySource_prem_refined", Some(&live_goal_for_trace), &refined.sys);
     let refined_case = refined.sys;
 
     // D — someInst keepVarBindings.
-    let mut keep_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar>
-        = std::collections::BTreeSet::new();
-    keep_vars.insert(live_node.clone());
-    fa_live.for_each_free(&mut |v: &tamarin_term::lterm::LVar| {
-        keep_vars.insert(v.clone());
-    });
+    let keep_vars = collect_node_and_fact_frees(live_node, fa_live);
     let post_refine_max = bounds_max(&refined_case);
     ctx.maude.ensure_above(post_refine_max);
     // HS-faithful `someInst`: traversal-order per-var fresh idx
