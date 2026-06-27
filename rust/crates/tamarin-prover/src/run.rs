@@ -1181,7 +1181,8 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 eprintln!("[Theory {}] Theory closed", theory_name);
             }
 
-            for l in elaborated.lemmas() {
+            let run_lemma = |l: &tamarin_theory::theory::Lemma<_>|
+                -> (tamarin_theory::pretty_theory::ProvedLemma, LemmaResult) {
                 let lemma_name = l.name.clone();
                 let exists_trace = matches!(
                     l.trace_quantifier,
@@ -1273,17 +1274,38 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                     }
                     Err(e) => (LemmaVerdict::Error(format!("{}", e)), 0, None),
                 };
-                proved_lemmas.push(tamarin_theory::pretty_theory::ProvedLemma {
+                let pl = tamarin_theory::pretty_theory::ProvedLemma {
                     name: lemma_name.clone(),
                     proof_body,
-                });
-                results.push(LemmaResult {
+                };
+                let lr = LemmaResult {
                     name: lemma_name,
                     verdict,
                     elapsed_ms: lt.elapsed().as_millis(),
                     proof_steps,
                     exists_trace,
-                });
+                };
+                (pl, lr)
+            };
+
+            if session.is_some() {
+                use rayon::prelude::*;
+                let specs: Vec<&tamarin_theory::theory::Lemma<_>> =
+                    elaborated.lemmas().collect();
+                let mut out: Vec<(usize, tamarin_theory::pretty_theory::ProvedLemma, LemmaResult)> =
+                    specs.par_iter().enumerate()
+                        .map(|(i, l)| { let (pl, lr) = run_lemma(l); (i, pl, lr) })
+                        .collect();
+                // Reassemble in DECLARATION order so output is identical to the
+                // sequential loop regardless of which worker finished first.
+                out.sort_by_key(|(i, _, _)| *i);
+                for (_, pl, lr) in out { proved_lemmas.push(pl); results.push(lr); }
+            } else {
+                for l in elaborated.lemmas() {
+                    let (pl, lr) = run_lemma(l);
+                    proved_lemmas.push(pl);
+                    results.push(lr);
+                }
             }
 
             // HS-faithful: rc=0 regardless of verdict.  Falsified is a

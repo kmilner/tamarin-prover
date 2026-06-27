@@ -40,6 +40,17 @@ pub struct MaudeSig {
     pub fun_syms: FunSig,
     pub irreducible_fun_syms: FunSig,
     pub reducible_fun_syms: FunSig,
+    /// Hash-set mirrors of `irreducible_fun_syms` / `reducible_fun_syms`, kept
+    /// in lock-step by [`MaudeSig::refresh`].  The proof search's hottest
+    /// predicates (`elem_not_below_reducible`, `any_non_nf`,
+    /// `maybe_not_nf_subterms`) probe membership per term node, recursively;
+    /// these give O(1) `contains` instead of the `BTreeSet`'s O(log n)
+    /// `FunSym::cmp` tree-walk.  The `BTreeSet`s are retained because their
+    /// SORTED iteration order reaches rendered output (signature pretty-print,
+    /// wellformedness) — only the boolean membership tests use these mirrors,
+    /// so the two are membership-identical and the output is unchanged.
+    pub irreducible_fun_syms_fast: tamarin_utils::FastSet<FunSym>,
+    pub reducible_fun_syms_fast: tamarin_utils::FastSet<FunSym>,
 }
 
 
@@ -81,6 +92,11 @@ impl MaudeSig {
             }
         }
 
+        // Hash-set mirrors for O(1) membership in the proof-search hot path.
+        // Kept in lock-step with the BTreeSets above (same elements), so every
+        // `.contains()` answer is identical — only the cost differs.
+        self.irreducible_fun_syms_fast = irreducible.iter().cloned().collect();
+        self.reducible_fun_syms_fast = reducible.iter().cloned().collect();
         self.fun_syms = all_funs;
         self.irreducible_fun_syms = irreducible;
         self.reducible_fun_syms = reducible;
@@ -177,6 +193,8 @@ impl MaudeSig {
             fun_syms: BTreeSet::new(),
             irreducible_fun_syms: BTreeSet::new(),
             reducible_fun_syms: BTreeSet::new(),
+            irreducible_fun_syms_fast: tamarin_utils::FastSet::default(),
+            reducible_fun_syms_fast: tamarin_utils::FastSet::default(),
         };
         merged.refresh()
     }

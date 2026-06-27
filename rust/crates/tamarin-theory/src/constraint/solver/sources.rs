@@ -1350,7 +1350,17 @@ fn saturate_sources_with_simp_opt(
             saturated_indexed.into_par_iter().map(|(_i, src)| {
                 if let Some(pool) = &ctx.maude_pool {
                     let pooled = pool.acquire();
-                    let task_ctx = ctx.with_swapped_maude(pooled.handle().clone());
+                    // Give the worker a FRESH counter (not the pooled handle's
+                    // accumulating one) so `refine_one_source`'s internal
+                    // `ensure_above(avoid_max)` reseeds it to the source's OWN
+                    // structural `avoid_max` — producing CANONICAL, source-
+                    // local case var idxs (HS `evalFresh (avoid goalTerm)`,
+                    // Sources.hs:409).  Without this the case idxs depend on
+                    // the pooled handle's reuse history, so the refined-source
+                    // cache content (shared across lemmas) becomes
+                    // order-dependent and breaks under parallel lemma proving.
+                    let task_ctx = ctx.with_swapped_maude(
+                        pooled.handle().with_fresh_counter_from(0));
                     refine_one_source(
                         &task_ctx, src, &ths_snapshot, branch_cap,
                         aggressive_drop, dbg,

@@ -1806,6 +1806,15 @@ impl MaudePool {
         }
     }
 
+    /// Non-blocking acquire: return a free handle if one is immediately
+    /// available, else `None`.  Used by the within-lemma fan-out so that
+    /// nested (lemma-level B1 + within-lemma) parallelism can't deadlock
+    /// waiting on a pool that the outer lemma tasks have fully drained.
+    pub fn try_acquire(&self) -> Option<PooledMaude<'_>> {
+        let mut free = self.free.lock().unwrap();
+        free.pop().map(|h| PooledMaude { pool: self, inner: Some(h) })
+    }
+
     /// Number of subprocesses this pool was constructed with.
     pub fn size(&self) -> usize { self.size }
 }

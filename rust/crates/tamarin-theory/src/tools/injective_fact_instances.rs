@@ -186,7 +186,7 @@ pub fn trimmed_pair_terms(
 /// `shapeTerm` / `trimmedPairTerms`).
 pub fn simple_injective_fact_instances(
     rules: &[&ProtoRuleE],
-    reducible: &tamarin_term::function_symbols::FunSig,
+    reducible: &tamarin_utils::FastSet<tamarin_term::function_symbols::FunSym>,
 ) -> Vec<(FactTag, Vec<Vec<MonotonicBehaviour>>)> {
     use crate::fact::{LNFact, fact_tag_multiplicity, Multiplicity};
     use tamarin_term::lterm::LNTerm;

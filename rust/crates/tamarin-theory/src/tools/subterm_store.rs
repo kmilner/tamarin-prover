@@ -11,7 +11,8 @@
 //! `simpSubtermStore`, `simpSplitNegSt`, and the recursive `splitSubterm`
 //! — are ported in `constraint::solver::simplify` rather than here.
 
-use tamarin_term::function_symbols::FunSig;
+use tamarin_term::function_symbols::FunSym;
+use tamarin_utils::FastSet;
 use tamarin_term::lterm::LNTerm;
 use tamarin_term::term::Term;
 
@@ -109,7 +110,7 @@ impl SubtermStore {
 /// the equational theory: once you cross a reducible head, the
 /// subterm could disappear under rewriting.
 pub fn elem_not_below_reducible(
-    reducible: &FunSig,
+    reducible: &FastSet<FunSym>,
     inner: &LNTerm,
     outer: &LNTerm,
 ) -> bool {
@@ -135,7 +136,7 @@ pub fn elem_not_below_reducible(
 /// while still detecting back-edges into the current recursion
 /// stack.
 pub fn has_subterm_cycle(
-    reducible: &FunSig,
+    reducible: &FastSet<FunSym>,
     store: &SubtermStore,
 ) -> bool {
     // Build the dag from positive subterms — every active (small, big)
@@ -158,7 +159,7 @@ pub fn has_subterm_cycle(
 /// DFS helper: returns `None` on a detected back-edge (cycle),
 /// `Some(())` otherwise.  Marks the edge as visited on completion.
 fn find_loop(
-    reducible: &FunSig,
+    reducible: &FastSet<FunSym>,
     dag: &[(LNTerm, LNTerm)],
     x: &(LNTerm, LNTerm),
     parents: &mut std::collections::BTreeSet<(LNTerm, LNTerm)>,

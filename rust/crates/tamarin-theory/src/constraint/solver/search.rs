@@ -760,6 +760,25 @@ fn expand_inner(
         let path_snapshot: Vec<String> =
             crate::constraint::solver::trace::case_path_snapshot();
         let deadline_snapshot = *deadline;
+        // B1 (lemma-level parallelism) faithfulness: `run_proof_search` now
+        // runs on a rayon WORKER thread (the outer per-lemma `par_iter`
+        // dispatches it there), so `into_par_iter().collect()` below — called
+        // from a worker — lets rayon run the per-case closures ON THIS SAME
+        // THREAD (work-participation), where they mutate the per-search
+        // thread-locals (`DEPTH_LIMIT_HIT` reset to false at the top of each
+        // closure; `MAX_DEPTH`/`DEADLINE`/case_path re-seeded).  Pre-B1,
+        // `run_proof_search` ran on `main` while the closures ran on distinct
+        // worker threads, so those mutations were isolated from the search's
+        // own flags.  Under B1 they are NOT — a later non-depth-limited
+        // sibling closure's `DEPTH_LIMIT_HIT = false` would clobber an earlier
+        // sibling's `true`, and the search's `MAX_DEPTH`/case_path would be
+        // left at a worker's value.  Snapshot the parent's per-search
+        // thread-locals here and restore them after `collect`, folding
+        // `DEPTH_LIMIT_HIT` as `prior || any_hit` so the parallel branch's
+        // effect on the search's flags is IDENTICAL to the serial branch
+        // (which only ever raises `DEPTH_LIMIT_HIT`, never lowers it).  This
+        // is output-neutral whether or not B1 is active.
+        let parent_depth_limit_hit = DEPTH_LIMIT_HIT.with(|f| f.get());
         let results: Vec<(String, ProofNode, bool)> = cases.into_par_iter().map(|(name, sys)| {
             // Each rayon worker has its own thread-locals.  Initialise
             // them from the parent's captured state so downstream code
@@ -810,7 +829,12 @@ fn expand_inner(
             // single Maude process; the IPC mutex serialises queries,
             // which is correctness-safe (just slower).
             let avoid_max = crate::constraint::solver::reduction::bounds_max(&sys);
-            let pool_guard = ctx.maude_pool.as_ref().map(|pool| pool.acquire());
+            // Non-blocking: with B1 lemma-level parallelism the pool may be
+            // fully drained by sibling lemma tasks.  A blocking `acquire`
+            // here could deadlock the nested fan-out; fall back to the shared
+            // `ctx.maude` (output-identical — both branches seed via
+            // `with_fresh_counter_from(avoid_max)`).
+            let pool_guard = ctx.maude_pool.as_ref().and_then(|pool| pool.try_acquire());
             let worker_maude = match &pool_guard {
                 Some(pooled) => pooled.handle().with_fresh_counter_from(avoid_max),
                 None => ctx.maude.with_fresh_counter_from(avoid_max),
@@ -839,11 +863,21 @@ fn expand_inner(
         }).collect();
         // Aggregate worker DEPTH_LIMIT_HIT into the parent thread —
         // run_proof_search's ID-DFS loop reads this to decide whether
-        // to grow MAX_DEPTH for the next iteration.
+        // to grow MAX_DEPTH for the next iteration.  Fold the workers'
+        // hits with the parent's PRE-fan-out flag (snapshotted above) so a
+        // non-hitting closure that ran on this same thread (B1) cannot lower
+        // a previously-raised flag — matching the serial branch, which never
+        // lowers `DEPTH_LIMIT_HIT`.
         let any_hit = results.iter().any(|(_, _, hit)| *hit);
-        if any_hit {
-            DEPTH_LIMIT_HIT.with(|f| f.set(true));
-        }
+        DEPTH_LIMIT_HIT.with(|f| f.set(parent_depth_limit_hit || any_hit));
+        // Restore the parent's per-search thread-locals that the closures
+        // may have clobbered while running on this same thread (B1).  Pre-B1
+        // these ran on distinct worker threads and were already isolated, so
+        // this restore is a no-op there; under B1 it makes the search see its
+        // own MAX_DEPTH / DEADLINE / case_path after the fan-out.
+        MAX_DEPTH.with(|m| m.set(mp_snapshot));
+        DEADLINE.with(|d| d.set(Some(deadline_snapshot)));
+        crate::constraint::solver::trace::case_path_set(&path_snapshot);
         for (name, child, _hit) in results {
             match child.status {
                 NodeStatus::Solved => any_solved = true,

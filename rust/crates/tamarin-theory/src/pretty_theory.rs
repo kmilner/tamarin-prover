@@ -404,7 +404,7 @@ fn render_injective_fact_insts(elab: &Theory) -> String {
         .collect();
     let mut tags = crate::tools::injective_fact_instances::simple_injective_fact_instances(
         &proto_rules,
-        &elab.signature.maude_sig.reducible_fun_syms,
+        &elab.signature.maude_sig.reducible_fun_syms_fast,
     );
     // HS `closeRuleCache` (Rule.hs:147-150): union the FORCED injective facts
     // (`setforcedInjectiveFacts {L_PureState, L_CellLocked}`, Sapic.hs:84) when
