@@ -381,7 +381,8 @@ pub fn elaborate(parser_thy: &p::Theory) -> Result<Theory, ElabError> {
 }
 
 /// The four user-declared function-name sets read by `term_to_lnterm`.
-struct CollectedUserFuns {
+#[derive(Clone, Default)]
+pub struct CollectedUserFuns {
     /// Arity-1 user `functions:` names (drives the auto-tuple fold, like
     /// the built-in unary names h / fst / snd / ...).
     unary: BTreeSet<String>,
@@ -678,11 +679,28 @@ impl MaudeSigNullaryGuard {
 /// time term conversions see the right per-theory signature info.
 pub fn set_user_funs_for_theory(parser_theory: &p::Theory) -> UserFunsForTheoryGuard {
     let funs = collect_user_funs(&parser_theory.items);
+    set_user_funs_from_collected(&funs)
+}
+
+/// Collect the user-declared function-name sets from a parser theory, to
+/// be cached and re-installed later (e.g. per-lemma on a rayon worker
+/// thread under lemma-level parallelism, where the file-level guard set
+/// on the main thread is not visible).
+pub fn collect_user_funs_for_theory(parser_theory: &p::Theory) -> CollectedUserFuns {
+    collect_user_funs(&parser_theory.items)
+}
+
+/// Install the cached user-fn sets into the current thread's thread-locals,
+/// returning an RAII guard that restores the previous values on drop.
+/// `term_to_lnterm` / `term_to_gterm` read these thread-locals, so any
+/// thread that performs search-time term conversion must have them set —
+/// including rayon worker threads proving lemmas in parallel.
+pub fn set_user_funs_from_collected(funs: &CollectedUserFuns) -> UserFunsForTheoryGuard {
     UserFunsForTheoryGuard {
-        _unary: UserUnaryFunsGuard::set(funs.unary),
-        _nullary: UserNullaryFunsGuard::set(funs.nullary),
-        _private: UserPrivateFunsGuard::set(funs.private),
-        _destructor: UserDestructorFunsGuard::set(funs.destructor),
+        _unary: UserUnaryFunsGuard::set(funs.unary.clone()),
+        _nullary: UserNullaryFunsGuard::set(funs.nullary.clone()),
+        _private: UserPrivateFunsGuard::set(funs.private.clone()),
+        _destructor: UserDestructorFunsGuard::set(funs.destructor.clone()),
     }
 }
 

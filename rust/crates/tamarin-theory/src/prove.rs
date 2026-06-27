@@ -301,8 +301,19 @@ pub struct ProverSession {
     cli_heuristic: CliHeuristic,
     /// File-level RAII guard for `set_user_funs_for_theory`.  Kept
     /// alive for the whole session so per-lemma `term_to_lnterm`
-    /// calls see the right user-fn-symbol set.
+    /// calls see the right user-fn-symbol set on the BUILDING thread.
     _user_funs_guard: crate::elaborate::UserFunsForTheoryGuard,
+    /// Cached user-declared function-name sets, re-installed per lemma on
+    /// the proving thread.  Under B1 (lemma-level parallelism) each lemma
+    /// is proved on a rayon WORKER thread whose thread-locals are empty —
+    /// the file-level `_user_funs_guard` above only populated them on the
+    /// thread that BUILT the session (main).  `term_to_lnterm` /
+    /// `term_to_gterm` (in `formula_to_guarded` etc.) read those
+    /// thread-locals during the proof, so each worker must re-install them
+    /// or it would mis-classify user nullary/unary funs (e.g. a declared
+    /// `left/0` lifted to a free variable), corrupting the guarded formulas
+    /// and the proof.  See `prove_lemma_in_session_mode`.
+    user_funs: crate::elaborate::CollectedUserFuns,
     /// Guarded-form restrictions (constructed once from theory).
     restrictions: Vec<Guarded>,
     /// Template `ProofContext` carrying the expensive precompute:
@@ -457,7 +468,8 @@ impl ProverSession {
         // RAII-set the user-fn-symbol thread-locals for the WHOLE
         // session.  Per-lemma `term_to_lnterm` calls during search
         // need these set; the parser-theory drives the set.
-        let _user_funs_guard = crate::elaborate::set_user_funs_for_theory(parser_theory);
+        let user_funs = crate::elaborate::collect_user_funs_for_theory(parser_theory);
+        let _user_funs_guard = crate::elaborate::set_user_funs_from_collected(&user_funs);
         let mut theory = elaborate(parser_theory)
             .map_err(|e| ProveError::Elaboration(e.message))?;
         // Set in_file for oracle path resolution (HS Parser.hs:304).
@@ -504,6 +516,7 @@ impl ProverSession {
             theory,
             cli_heuristic,
             _user_funs_guard,
+            user_funs,
             restrictions,
             template_ctx,
             setup_counter_delta,
@@ -553,6 +566,21 @@ fn prove_lemma_in_session_mode(
     let trace = tamarin_utils::env_gate!("TAM_DBG_PHASE");
     let t_phase: Option<std::time::Instant> =
         if trace { Some(std::time::Instant::now()) } else { None };
+
+    // B1 (lemma-level parallelism): under the per-lemma rayon `par_iter`,
+    // this runs on a WORKER thread whose user-fn-symbol thread-locals are
+    // empty (the session's file-level `_user_funs_guard` only set them on
+    // the thread that BUILT the session, i.e. `main`).  `formula_to_guarded`
+    // below — and every search-time `term_to_lnterm` / `term_to_gterm` —
+    // reads those thread-locals, so re-install them here for the duration of
+    // this prove call.  Without this, a declared nullary fun (e.g. `left/0`)
+    // is mis-classified as a free variable on the worker, corrupting the
+    // guarded formula and flipping the lemma verdict.  The guard restores
+    // the previous (empty) values on drop, so it is safe to nest and is
+    // output-identical to the serial path (where the file-level guard
+    // already covered the main thread).
+    let _lemma_user_funs_guard =
+        crate::elaborate::set_user_funs_from_collected(&session.user_funs);
 
     let theory = &session.theory;
     let lemma = theory
@@ -621,6 +649,12 @@ fn prove_lemma_in_session_mode(
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let target = session.setup_counter_before
         .saturating_add(setup_target_for(session.setup_counter_delta, lemma_i + 1));
+    // B1 (lemma-level parallelism): give each lemma its OWN fresh-counter
+    // Arc (still sharing the template's Maude subprocess) so concurrently
+    // proving lemmas don't race on a shared counter.  With
+    // `setup_counter_delta == 0`, `target == setup_counter_before` for every
+    // lemma, so this is output-identical to the serial path.
+    ctx.maude = ctx.maude.with_fresh_counter_from(0);
     ctx.maude.ensure_above(target.saturating_sub(1));
     if trace { eprintln!("[phase] (session) ProofContext clone dt={:.3}s",
         t_ctx.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64())); }
