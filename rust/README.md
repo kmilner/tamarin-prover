@@ -122,11 +122,18 @@ TIMEOUT, DERIV, HS_PATH, RS_PATH env vars (see the scripts/bench.sh header).
 
 Memory is the maximum resident set of the prover process; Maude runs as a
 separate subprocess on both sides and is excluded. Across all theories and core
-counts the Rust port is faster and uses roughly 4–16× less memory. `Yubikey`
-shows the SAPiC `process:` translation in action: the Rust port scales from
-9.1 s to 3.4 s as cores grow, while Haskell stays around 10–15 s. Parallelism is
-provided by rayon over a pool of Maude subprocesses: `--processors=N` sets the
-worker-thread count and `--maude-processes=M` (default `⌈N/2⌉`) the pool size.
+counts the Rust port is faster, and uses several-fold less memory — from ≈4–16×
+at one core down to ≈2–8× at sixteen, where lemma-level parallelism keeps
+several constraint systems live at once.
+
+The port parallelises at two levels, both via rayon. Independent lemmas of a
+theory are proved concurrently; within a lemma, the proof-search fan-out and
+source saturation run in parallel over a pool of Maude subprocesses.
+`--processors=N` sets the worker-thread count and `--maude-processes=M`
+(default `N`) the Maude pool size. Multi-lemma theories gain the most across
+cores (`wireguard` roughly halves from one to sixteen); theories dominated by
+source saturation also speed up at a single core, because the refined sources
+are computed once and reused across all of a theory's lemmas (`gcm`, `Yubikey`).
 
 ## Implemented
 
