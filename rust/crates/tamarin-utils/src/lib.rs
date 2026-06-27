@@ -4,6 +4,7 @@
 
 pub mod bind;
 pub mod color;
+pub mod cow;
 pub mod dag;
 pub mod dot;
 /// The `env_gate!` macro is exported at the crate root via

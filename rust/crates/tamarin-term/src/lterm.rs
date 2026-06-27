@@ -19,6 +19,7 @@ use std::cmp::Ordering;
 
 use crate::function_symbols::{AcSym, FunSym, Privacy};
 use crate::term::{Term, TermView};
+use tamarin_utils::cow::cow_map_vec;
 use crate::vterm::{const_term, var_term, Lit, VTerm};
 
 // =============================================================================
@@ -543,17 +544,12 @@ where
             if &nl != l { Some(Term::Lit(nl)) } else { None }
         }
         Term::App(fsym, args) => {
-            let mut out: Option<Vec<Term<L>>> = None;
-            for (i, a) in args.iter().enumerate() {
-                match map_free_term_cow(a, f, monotone) {
-                    Some(g) => out.get_or_insert_with(|| args[..i].to_vec()).push(g),
-                    None => if let Some(v) = out.as_mut() { v.push(a.clone()); }
+            cow_map_vec(&args[..], |a| map_free_term_cow(a, &mut *f, monotone)).map(|mapped| {
+                if monotone {
+                    crate::term::unsafe_f_app(fsym.clone(), mapped)
+                } else {
+                    crate::term::f_app(fsym.clone(), mapped)
                 }
-            }
-            out.map(|mapped| if monotone {
-                crate::term::unsafe_f_app(fsym.clone(), mapped)
-            } else {
-                crate::term::f_app(fsym.clone(), mapped)
             })
         }
     }
