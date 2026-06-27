@@ -71,6 +71,42 @@ fn collect_node_ids(
     sys.nodes.iter().map(|(n, _)| n.clone()).collect()
 }
 
+/// Build a fresh per-arm `Reduction` for a source-case DisjT fan-out: install
+/// `arm_eq` into a clone of `template` (invalidating the cached max-var idx) and
+/// wrap it in a new `Reduction`.  Mirrors HS's `DisjT` replication of the
+/// Reduction continuation (Reduction.hs:724-725 `disjunctionOfList
+/// performSplit`); shared by the action/premise fan-outs so the
+/// clone-then-install sequence lives in exactly one place.
+fn fork_arm_reduction<'c>(
+    ctx: &'c crate::constraint::solver::context::ProofContext,
+    template: &System,
+    arm_eq: crate::tools::equation_store::EquationStore,
+) -> crate::constraint::solver::reduction::Reduction<'c> {
+    use crate::constraint::solver::reduction::Reduction;
+    let mut arm_sys = template.clone();
+    arm_sys.invalidate_max_var_idx_cache();
+    arm_sys.eq_store = std::sync::Arc::new(arm_eq);
+    Reduction::new(ctx, arm_sys)
+}
+
+/// E.5 nested fan-out: for each arm eq-store, fork a `Reduction` off `template`
+/// (see [`fork_arm_reduction`]), run `subst_system`, and collect the surviving
+/// (non-`false`-eq-store) systems into `out`.  Shared verbatim by the action and
+/// premise E.5 `Cases` arms.
+fn subst_arms_into(
+    ctx: &crate::constraint::solver::context::ProofContext,
+    template: &System,
+    arms: Vec<crate::tools::equation_store::EquationStore>,
+    out: &mut Vec<System>,
+) {
+    for arm_eq in arms {
+        let mut arm_red = fork_arm_reduction(ctx, template, arm_eq);
+        arm_red.subst_system();
+        if arm_red.sys.eq_store.is_false() { continue; }
+        out.push(arm_red.sys);
+    }
+}
+
 pub fn in_precompute_mode() -> bool {
     IN_PRECOMPUTE.with(|c| c.get())
 }
@@ -4241,10 +4277,7 @@ fn refine_source_case_action(
         // whose system body is the post-refineSubst template.  This
         // mirrors HS's `DisjT` replication of the Reduction continuation
         // (Reduction.hs:724-725 `disjunctionOfList performSplit`).
-        let mut arm_sys = post_solve_sys_template.clone();
-        arm_sys.invalidate_max_var_idx_cache();
-        arm_sys.eq_store = std::sync::Arc::new(arm_eq_store);
-        let mut refined = Reduction::new(ctx, arm_sys);
+        let mut refined = fork_arm_reduction(ctx, &post_solve_sys_template, arm_eq_store);
     if tamarin_utils::env_gate!("TAM_DBG_APPLY_REFINE") {
         eprintln!("[apply_refine] case={} POST-solve_term_eqs eq_store entries:", case_label);
         for (v, t) in refined.sys.eq_store.subst.to_list().iter().take(15) {
@@ -4637,15 +4670,7 @@ fn conjoin_refine_arm(
                 // into a clone of the pre-solve `r.sys`, run substSystem,
                 // and continue the rest of `_applySource` per arm.
                 let template = r.sys.clone();
-                for arm_eq in arms {
-                    let mut arm_sys = template.clone();
-                    arm_sys.invalidate_max_var_idx_cache();
-                    arm_sys.eq_store = std::sync::Arc::new(arm_eq);
-                    let mut arm_red = Reduction::new(ctx, arm_sys);
-                    arm_red.subst_system();
-                    if arm_red.sys.eq_store.is_false() { continue; }
-                    e5_arm_systems.push(arm_red.sys);
-                }
+                subst_arms_into(ctx, &template, arms, &mut e5_arm_systems);
                 if e5_arm_systems.is_empty() { continue; }
             }
         }
@@ -4935,10 +4960,7 @@ fn apply_source_case_premise(
     let prem_live_node_ids = collect_node_ids(live_sys);
 
     for arm_eq_store in arm_eq_stores {
-        let mut arm_sys = post_solve_sys_template.clone();
-        arm_sys.invalidate_max_var_idx_cache();
-        arm_sys.eq_store = std::sync::Arc::new(arm_eq_store);
-        let mut refined = Reduction::new(ctx, arm_sys);
+        let mut refined = fork_arm_reduction(ctx, &post_solve_sys_template, arm_eq_store);
 
     refined.subst_system();
     if refined.sys.eq_store.is_false() {
@@ -5073,15 +5095,7 @@ fn apply_source_case_premise(
             }
             Ok(SolveOutcome::Cases(arms)) => {
                 let template = r.sys.clone();
-                for arm_eq in arms {
-                    let mut arm_sys = template.clone();
-                    arm_sys.invalidate_max_var_idx_cache();
-                    arm_sys.eq_store = std::sync::Arc::new(arm_eq);
-                    let mut arm_red = Reduction::new(ctx, arm_sys);
-                    arm_red.subst_system();
-                    if arm_red.sys.eq_store.is_false() { continue; }
-                    e5_arm_systems.push(arm_red.sys);
-                }
+                subst_arms_into(ctx, &template, arms, &mut e5_arm_systems);
                 if e5_arm_systems.is_empty() { continue; }
             }
         }
