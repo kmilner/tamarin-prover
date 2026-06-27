@@ -970,12 +970,29 @@ impl<'ctx> Reduction<'ctx> {
             // partially-applied formula-subst.  Bounded loop (16 steps)
             // to defend against degenerate cycles.  Diagnosed by
             // agent-a60950ef2370100e5 on Destroy_charn wrong-falsified.
-            let apply_to_fixpoint = |f: &Guarded| -> Guarded {
-                let mut cur = f.clone();
-                for _ in 0..16 {
-                    let nxt = crate::guarded::subst_guarded(&cur, formula_subst);
-                    if nxt == cur { break; }
-                    cur = nxt;
+            // Copy-on-write: returns `None` when the formula is wholly
+            // unchanged (subst touches no leaf AND no AC node needs re-sorting),
+            // so the caller skips the store entirely with zero allocation.  This
+            // replaces three unconditional deep rebuilds (clone + subst + canon)
+            // per stored formula per `subst_system` call — the dominant residual
+            // guarded-clone cost after the dedup-canon hoist.  Byte-identical:
+            // `subst_guarded_cow == None` ⇔ the original loop broke immediately
+            // (`nxt == cur`), and `canonicalize_ac_in_guarded_cow == None` ⇔ the
+            // original `canonicalize` returned a value `== cur`.
+            let apply_to_fixpoint = |f: &Guarded| -> Option<Guarded> {
+                let mut cur = match crate::guarded::subst_guarded_cow(f, formula_subst) {
+                    // Subst is a structural no-op; the only possible change is
+                    // the trailing canonicalisation (mirror `canonicalize(f)`).
+                    None => return crate::guarded::canonicalize_ac_in_guarded_cow(f),
+                    Some(s0) => s0,
+                };
+                // One subst pass already applied; continue to the fixpoint
+                // (the original ran up to 16 passes total).
+                for _ in 0..15 {
+                    match crate::guarded::subst_guarded_cow(&cur, formula_subst) {
+                        None => break,
+                        Some(nxt) => cur = nxt,
+                    }
                 }
                 // Re-canonicalise AC operators after substitution.  Substituting
                 // an AC-valued var into an AC context (`rest ++ matchingComm`
@@ -989,19 +1006,22 @@ impl<'ctx> Reduction<'ctx> {
                 // (`fAppAC`) flatten+sort on construction, so HS never sees the
                 // nested form; mirror that here.  (Tuple pairs are already
                 // canonicalised inside `subst_gterm` via `mk_gpair`.)
-                crate::guarded::canonicalize_ac_in_guarded(&cur)
+                Some(crate::guarded::canonicalize_ac_in_guarded_cow(&cur).unwrap_or(cur))
             };
             for f in self.sys.formulas.iter_mut() {
-                let new_f = apply_to_fixpoint(f);
-                if &new_f != f { *f = new_f; self.changed = ChangeIndicator::Changed; }
+                if let Some(new_f) = apply_to_fixpoint(f) {
+                    if &new_f != f { *f = new_f; self.changed = ChangeIndicator::Changed; }
+                }
             }
             for f in self.sys.solved_formulas.iter_mut() {
-                let new_f = apply_to_fixpoint(f);
-                if &new_f != f { *f = new_f; self.changed = ChangeIndicator::Changed; }
+                if let Some(new_f) = apply_to_fixpoint(f) {
+                    if &new_f != f { *f = new_f; self.changed = ChangeIndicator::Changed; }
+                }
             }
             for f in self.sys.lemmas.iter_mut() {
-                let new_f = apply_to_fixpoint(f);
-                if &new_f != f { *f = new_f; self.changed = ChangeIndicator::Changed; }
+                if let Some(new_f) = apply_to_fixpoint(f) {
+                    if &new_f != f { *f = new_f; self.changed = ChangeIndicator::Changed; }
+                }
             }
             // HS-faithful: `substFormulas`/`substSolvedFormulas`/`substLemmas`
             // apply via `Apply LNSubst (Set Guarded)` (Reduction.hs:593-595),

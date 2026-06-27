@@ -1455,6 +1455,14 @@ pub fn canonicalize_ac_in_guarded(g: &Guarded) -> Guarded {
     canonicalize_ac_in_guarded_with(g, cmp_term)
 }
 
+/// Copy-on-write variant of [`canonicalize_ac_in_guarded`]: returns `None` when
+/// `g` is already AC-canonical (no AC subterm anywhere needed re-sorting), so a
+/// caller holding an OWNED `g` can reuse it by move instead of allocating a
+/// rebuilt deep copy.  `Some(_)` is byte-identical to the eager entry point.
+pub fn canonicalize_ac_in_guarded_cow(g: &Guarded) -> Option<Guarded> {
+    cac_rec_guarded_cow(g, cmp_term)
+}
+
 type GCmp = fn(&GTerm, &GTerm) -> std::cmp::Ordering;
 
 fn cac_flatten(op: &p::BinOp, t: &GTerm, out: &mut Vec<GTerm>) {
@@ -1596,41 +1604,106 @@ fn cac_rec_slice(args: &std::sync::Arc<[GTerm]>, cmp: GCmp) -> Option<std::sync:
     out.map(std::sync::Arc::from)
 }
 
-fn cac_rec_fact(f: &GFact, cmp: GCmp) -> GFact {
-    GFact {
+// Copy-on-write canonicalisation, one level up from `cac_rec_term_cow`: each
+// `*_cow` returns `None` when nothing under it needed re-sorting, so an
+// all-unchanged formula propagates a single `None` to the root and the owned
+// caller reuses its input by move (no rebuild).  Every `Some(_)` materialises
+// EXACTLY what the previous eager rebuild produced (changed children rebuilt,
+// unchanged children cloned), so the output is byte-identical — the parity gate
+// verifies.  Mirrors the `cac_rec_slice` single-pass "allocate the Vec lazily
+// only after the first change" shape.
+
+/// COW over a `Vec<GTerm>` (fact args): `None` if every element is unchanged.
+fn cac_rec_vec_cow(args: &[GTerm], cmp: GCmp) -> Option<Vec<GTerm>> {
+    let mut out: Option<Vec<GTerm>> = None;
+    for (i, a) in args.iter().enumerate() {
+        match cac_rec_term_cow(a, cmp) {
+            Some(g) => out.get_or_insert_with(|| args[..i].to_vec()).push(g),
+            None => if let Some(v) = out.as_mut() { v.push(a.clone()); }
+        }
+    }
+    out
+}
+
+fn cac_rec_fact_cow(f: &GFact, cmp: GCmp) -> Option<GFact> {
+    cac_rec_vec_cow(&f.args, cmp).map(|args| GFact {
         persistent: f.persistent,
         name: f.name.clone(),
-        args: f.args.iter().map(|a| cac_rec_term(a, cmp)).collect(),
+        args,
         annotations: f.annotations.clone(),
+    })
+}
+
+/// COW of a GTerm pair: `None` when BOTH are unchanged.
+fn cac_pair_cow(x: &GTerm, y: &GTerm, cmp: GCmp) -> Option<(GTerm, GTerm)> {
+    let x2 = cac_rec_term_cow(x, cmp);
+    let y2 = cac_rec_term_cow(y, cmp);
+    if x2.is_none() && y2.is_none() { return None; }
+    Some((x2.unwrap_or_else(|| x.clone()), y2.unwrap_or_else(|| y.clone())))
+}
+
+fn cac_rec_atom_cow(a: &GAtom, cmp: GCmp) -> Option<GAtom> {
+    match a {
+        GAtom::Action(f, t) => {
+            let f2 = cac_rec_fact_cow(f, cmp);
+            let t2 = cac_rec_term_cow(t, cmp);
+            if f2.is_none() && t2.is_none() { return None; }
+            Some(GAtom::Action(f2.unwrap_or_else(|| f.clone()), t2.unwrap_or_else(|| t.clone())))
+        }
+        GAtom::Eq(x, y) => cac_pair_cow(x, y, cmp).map(|(a, b)| GAtom::Eq(a, b)),
+        GAtom::Less(x, y) => cac_pair_cow(x, y, cmp).map(|(a, b)| GAtom::Less(a, b)),
+        GAtom::LessMset(x, y) => cac_pair_cow(x, y, cmp).map(|(a, b)| GAtom::LessMset(a, b)),
+        GAtom::Subterm(x, y) => cac_pair_cow(x, y, cmp).map(|(a, b)| GAtom::Subterm(a, b)),
+        GAtom::Last(t) => cac_rec_term_cow(t, cmp).map(GAtom::Last),
+        GAtom::Pred(f) => cac_rec_fact_cow(f, cmp).map(GAtom::Pred),
     }
 }
 
-fn cac_rec_atom(a: &GAtom, cmp: GCmp) -> GAtom {
-    match a {
-        GAtom::Action(f, t) => GAtom::Action(cac_rec_fact(f, cmp), cac_rec_term(t, cmp)),
-        GAtom::Eq(x, y) => GAtom::Eq(cac_rec_term(x, cmp), cac_rec_term(y, cmp)),
-        GAtom::Less(x, y) => GAtom::Less(cac_rec_term(x, cmp), cac_rec_term(y, cmp)),
-        GAtom::LessMset(x, y) => GAtom::LessMset(cac_rec_term(x, cmp), cac_rec_term(y, cmp)),
-        GAtom::Subterm(x, y) => GAtom::Subterm(cac_rec_term(x, cmp), cac_rec_term(y, cmp)),
-        GAtom::Last(t) => GAtom::Last(cac_rec_term(t, cmp)),
-        GAtom::Pred(f) => GAtom::Pred(cac_rec_fact(f, cmp)),
+/// COW over a `Vec<GAtom>` (quantifier guards): `None` if every element unchanged.
+fn cac_rec_atom_vec_cow(items: &[GAtom], cmp: GCmp) -> Option<Vec<GAtom>> {
+    let mut out: Option<Vec<GAtom>> = None;
+    for (i, a) in items.iter().enumerate() {
+        match cac_rec_atom_cow(a, cmp) {
+            Some(g) => out.get_or_insert_with(|| items[..i].to_vec()).push(g),
+            None => if let Some(v) = out.as_mut() { v.push(a.clone()); }
+        }
+    }
+    out
+}
+
+/// COW over a `Vec<Guarded>` (Disj/Conj children): `None` if every element unchanged.
+fn cac_rec_guarded_vec_cow(items: &[Guarded], cmp: GCmp) -> Option<Vec<Guarded>> {
+    let mut out: Option<Vec<Guarded>> = None;
+    for (i, it) in items.iter().enumerate() {
+        match cac_rec_guarded_cow(it, cmp) {
+            Some(g) => out.get_or_insert_with(|| items[..i].to_vec()).push(g),
+            None => if let Some(v) = out.as_mut() { v.push(it.clone()); }
+        }
+    }
+    out
+}
+
+fn cac_rec_guarded_cow(g: &Guarded, cmp: GCmp) -> Option<Guarded> {
+    match g {
+        Guarded::Atom(a) => cac_rec_atom_cow(a, cmp).map(Guarded::Atom),
+        Guarded::Disj(items) => cac_rec_guarded_vec_cow(items, cmp).map(Guarded::Disj),
+        Guarded::Conj(items) => cac_rec_guarded_vec_cow(items, cmp).map(Guarded::Conj),
+        Guarded::GGuarded { qua, vars, guards, body } => {
+            let guards2 = cac_rec_atom_vec_cow(guards, cmp);
+            let body2 = cac_rec_guarded_cow(body, cmp);
+            if guards2.is_none() && body2.is_none() { return None; }
+            Some(Guarded::GGuarded {
+                qua: qua.clone(),
+                vars: vars.clone(),
+                guards: guards2.unwrap_or_else(|| guards.clone()),
+                body: Box::new(body2.unwrap_or_else(|| (**body).clone())),
+            })
+        }
     }
 }
 
 fn canonicalize_ac_in_guarded_with(g: &Guarded, cmp: GCmp) -> Guarded {
-    match g {
-        Guarded::Atom(a) => Guarded::Atom(cac_rec_atom(a, cmp)),
-        Guarded::Disj(items) => Guarded::Disj(
-            items.iter().map(|i| canonicalize_ac_in_guarded_with(i, cmp)).collect()),
-        Guarded::Conj(items) => Guarded::Conj(
-            items.iter().map(|i| canonicalize_ac_in_guarded_with(i, cmp)).collect()),
-        Guarded::GGuarded { qua, vars, guards, body } => Guarded::GGuarded {
-            qua: qua.clone(),
-            vars: vars.clone(),
-            guards: guards.iter().map(|a| cac_rec_atom(a, cmp)).collect(),
-            body: Box::new(canonicalize_ac_in_guarded_with(body, cmp)),
-        },
-    }
+    cac_rec_guarded_cow(g, cmp).unwrap_or_else(|| g.clone())
 }
 
 fn collect_witness_vars(g: &Guarded, out: &mut VarSubst) {
@@ -1781,19 +1854,43 @@ pub fn subst_guarded(g: &Guarded, s: &VarSubst) -> Guarded {
 }
 
 fn subst_guarded_inner(g: &Guarded, s: &VarSubst) -> Guarded {
+    subst_guarded_cow(g, s).unwrap_or_else(|| g.clone())
+}
+
+/// Copy-on-write core of `subst_guarded_inner`: returns `None` when the
+/// substitution touches no Free leaf anywhere in `g` (and no `mk_gpair` flatten
+/// fires), so a caller can reuse `g` instead of deep-rebuilding the whole
+/// connective tree.  One level up from `subst_gterm_cow`, mirroring its shape;
+/// every `Some(_)` is byte-identical to the eager rebuild (changed children
+/// rebuilt, unchanged children cloned, in positional order).
+pub fn subst_guarded_cow(g: &Guarded, s: &VarSubst) -> Option<Guarded> {
     match g {
-        Guarded::Atom(a) => Guarded::Atom(subst_gatom(a, s)),
-        Guarded::Disj(items) =>
-            Guarded::Disj(items.iter().map(|i| subst_guarded_inner(i, s)).collect()),
-        Guarded::Conj(items) =>
-            Guarded::Conj(items.iter().map(|i| subst_guarded_inner(i, s)).collect()),
-        Guarded::GGuarded { qua, vars, guards, body } => Guarded::GGuarded {
-            qua: qua.clone(),
-            vars: vars.clone(),
-            guards: guards.iter().map(|a| subst_gatom(a, s)).collect(),
-            body: Box::new(subst_guarded_inner(body, s)),
+        Guarded::Atom(a) => subst_gatom_cow(a, s).map(Guarded::Atom),
+        Guarded::Disj(items) => subst_guarded_vec_cow(items, s).map(Guarded::Disj),
+        Guarded::Conj(items) => subst_guarded_vec_cow(items, s).map(Guarded::Conj),
+        Guarded::GGuarded { qua, vars, guards, body } => {
+            let guards2 = subst_gatom_vec_cow(guards, s);
+            let body2 = subst_guarded_cow(body, s);
+            if guards2.is_none() && body2.is_none() { return None; }
+            Some(Guarded::GGuarded {
+                qua: qua.clone(),
+                vars: vars.clone(),
+                guards: guards2.unwrap_or_else(|| guards.clone()),
+                body: Box::new(body2.unwrap_or_else(|| (**body).clone())),
+            })
         }
     }
+}
+
+fn subst_guarded_vec_cow(items: &[Guarded], s: &VarSubst) -> Option<Vec<Guarded>> {
+    let mut out: Option<Vec<Guarded>> = None;
+    for (i, it) in items.iter().enumerate() {
+        match subst_guarded_cow(it, s) {
+            Some(g) => out.get_or_insert_with(|| items[..i].to_vec()).push(g),
+            None => if let Some(v) = out.as_mut() { v.push(it.clone()); }
+        }
+    }
+    out
 }
 
 /// Substitute Free LVar leaves in a `GAtom`.  Replacement targets are
@@ -1801,25 +1898,67 @@ fn subst_guarded_inner(g: &Guarded, s: &VarSubst) -> Guarded {
 /// leaves — those Free LVars are at the system's top-level scope and
 /// cannot collide with any binder.
 pub fn subst_gatom(a: &GAtom, s: &VarSubst) -> GAtom {
+    subst_gatom_cow(a, s).unwrap_or_else(|| a.clone())
+}
+
+fn subst_gatom_cow(a: &GAtom, s: &VarSubst) -> Option<GAtom> {
     match a {
-        GAtom::Eq(x, y) => GAtom::Eq(subst_gterm(x, s), subst_gterm(y, s)),
-        GAtom::Less(x, y) => GAtom::Less(subst_gterm(x, s), subst_gterm(y, s)),
-        GAtom::LessMset(x, y) => GAtom::LessMset(subst_gterm(x, s), subst_gterm(y, s)),
-        GAtom::Subterm(x, y) => GAtom::Subterm(subst_gterm(x, s), subst_gterm(y, s)),
-        GAtom::Action(f, t) => GAtom::Action(subst_gfact(f, s), subst_gterm(t, s)),
-        GAtom::Last(t) => GAtom::Last(subst_gterm(t, s)),
-        GAtom::Pred(f) => GAtom::Pred(subst_gfact(f, s)),
+        GAtom::Eq(x, y) => subst_gpair_cow(x, y, s).map(|(a, b)| GAtom::Eq(a, b)),
+        GAtom::Less(x, y) => subst_gpair_cow(x, y, s).map(|(a, b)| GAtom::Less(a, b)),
+        GAtom::LessMset(x, y) => subst_gpair_cow(x, y, s).map(|(a, b)| GAtom::LessMset(a, b)),
+        GAtom::Subterm(x, y) => subst_gpair_cow(x, y, s).map(|(a, b)| GAtom::Subterm(a, b)),
+        GAtom::Action(f, t) => {
+            let f2 = subst_gfact_cow(f, s);
+            let t2 = subst_gterm_cow(t, s);
+            if f2.is_none() && t2.is_none() { return None; }
+            Some(GAtom::Action(f2.unwrap_or_else(|| f.clone()), t2.unwrap_or_else(|| t.clone())))
+        }
+        GAtom::Last(t) => subst_gterm_cow(t, s).map(GAtom::Last),
+        GAtom::Pred(f) => subst_gfact_cow(f, s).map(GAtom::Pred),
     }
+}
+
+fn subst_gpair_cow(x: &GTerm, y: &GTerm, s: &VarSubst) -> Option<(GTerm, GTerm)> {
+    let x2 = subst_gterm_cow(x, s);
+    let y2 = subst_gterm_cow(y, s);
+    if x2.is_none() && y2.is_none() { return None; }
+    Some((x2.unwrap_or_else(|| x.clone()), y2.unwrap_or_else(|| y.clone())))
+}
+
+fn subst_gatom_vec_cow(items: &[GAtom], s: &VarSubst) -> Option<Vec<GAtom>> {
+    let mut out: Option<Vec<GAtom>> = None;
+    for (i, a) in items.iter().enumerate() {
+        match subst_gatom_cow(a, s) {
+            Some(g) => out.get_or_insert_with(|| items[..i].to_vec()).push(g),
+            None => if let Some(v) = out.as_mut() { v.push(a.clone()); }
+        }
+    }
+    out
 }
 
 /// Substitute Free LVar leaves in a `GFact`.
 pub fn subst_gfact(f: &GFact, s: &VarSubst) -> GFact {
-    GFact {
+    subst_gfact_cow(f, s).unwrap_or_else(|| f.clone())
+}
+
+fn subst_gfact_cow(f: &GFact, s: &VarSubst) -> Option<GFact> {
+    subst_gterm_vec_cow(&f.args, s).map(|args| GFact {
         persistent: f.persistent,
         name: f.name.clone(),
-        args: f.args.iter().map(|a| subst_gterm(a, s)).collect(),
+        args,
         annotations: f.annotations.clone(),
+    })
+}
+
+fn subst_gterm_vec_cow(args: &[GTerm], s: &VarSubst) -> Option<Vec<GTerm>> {
+    let mut out: Option<Vec<GTerm>> = None;
+    for (i, a) in args.iter().enumerate() {
+        match subst_gterm_cow(a, s) {
+            Some(g) => out.get_or_insert_with(|| args[..i].to_vec()).push(g),
+            None => if let Some(v) = out.as_mut() { v.push(a.clone()); }
+        }
     }
+    out
 }
 
 /// Substitute Free LVar leaves in a `GTerm`.

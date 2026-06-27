@@ -1377,9 +1377,13 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
 /// rather than recomputed for every candidate (the dedup was O(candidates ×
 /// |existing|) deep canonicalisations; now O(candidates + |existing|)).
 fn implied_apply_canon(f: &crate::guarded::Guarded) -> crate::guarded::Guarded {
+    // `normalize_bound_lvars` is currently an identity clone (the DeBruijn
+    // bound-var invariant already holds for formulas reaching dedup), so we skip
+    // it here and at the lock-step `apply_canon` closure below — saving one full
+    // `Guarded` deep clone per canonicalisation.  Byte-inert while that fn stays
+    // identity (the parity gate verifies); the two sites MUST stay in lock-step.
     let f1 = crate::guarded::normalize_witness_lvars(f);
-    let f2 = crate::guarded::normalize_bound_lvars(&f1);
-    crate::guarded::canonicalize_ac_in_guarded(&f2)
+    crate::guarded::canonicalize_ac_in_guarded_cow(&f1).unwrap_or(f1)
 }
 
 /// Try every assignment of system actions to the universal's action
@@ -1518,8 +1522,10 @@ fn try_match_all_guards(
             // structural Eq keeps them apart, and 4 distinct Disjs survive.
             // Reverted to witness+bound normalisation only.
             let apply_canon = |f: &crate::guarded::Guarded| {
+                // Lock-step with `implied_apply_canon`: `normalize_bound_lvars`
+                // is an identity clone, so skip it (saves a `Guarded` deep clone
+                // per candidate).
                 let f1 = crate::guarded::normalize_witness_lvars(f);
-                let f2 = crate::guarded::normalize_bound_lvars(&f1);
                 // HS-faithful: collapse AC-`BinOp` permutations so two
                 // formulas that differ only by AC argument ordering
                 // (e.g. `Mult(ltkI, ekR)` vs `Mult(ekR, ltkI)`) compare
@@ -1539,7 +1545,7 @@ fn try_match_all_guards(
                 // adds 1 RKeys-from-IKeys implication, RS emits an extra
                 // `simplify` proof-tree node where HS reports
                 // `Nothing` from the `sys' /= cleanup sys` guard).
-                crate::guarded::canonicalize_ac_in_guarded(&f2)
+                crate::guarded::canonicalize_ac_in_guarded_cow(&f1).unwrap_or(f1)
             };
             let canon = apply_canon(&implied);
             // TAM_RS_TRACE_FORM=1 also emits an `Impl-candidate` event
@@ -3197,32 +3203,35 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
     // copy-on-write, leaving this handle on the old Vec — without deep-copying
     // every node's `RuleACInst` up front (a large per-pass allocation).
     let nodes_snapshot = red.sys.nodes.clone();
-    let edges_snapshot: Vec<_> = red.sys.edges.clone();
     let maude = red.ctx.maude.clone();
     let mut changed = ChangeIndicator::Unchanged;
 
-    // Build the route() function as a closure (Simplify.hs `getRoute`/`plainRoute`).
-    // `route nid` follows linear-fact edges from a node's single
-    // linear conclusion, returning the chain of node ids until either
-    // the node has multiple conclusions, the single conclusion is
-    // non-linear, or there's no outgoing edge from that conclusion.
-    let lookup_rule = |nid: &crate::constraint::constraints::NodeId|
-        -> Option<crate::rule::RuleACInst>
-    {
-        nodes_snapshot.iter().find(|(id, _)| id == nid)
-            .map(|(_, r)| r.clone())
-    };
-    // edge_map: NodeConc → NodeId (only first edge per conc is needed
-    // since the source case has at most one outgoing edge per conc).
+    // Precompute, ONCE, the set of nodes whose rule has exactly one, LINEAR
+    // conclusion — the only rule property `plain_route` (`getRoute`/`plainRoute`,
+    // Simplify.hs) actually reads.  The previous `lookup_rule` closure did a
+    // linear `find` over every node AND deep-cloned the whole `RuleACInst`
+    // (every premise/conclusion/action fact-term `Vec`) on EVERY recursive
+    // `plain_route` step — the dominant `slice::to_vec` cost on SAPiC theories
+    // (Yubikey).  Membership is identical, so the routed chains are byte-
+    // identical (and lookup is now O(log n), not an O(nodes) scan + deep clone).
+    let single_linear_conc: std::collections::BTreeSet<
+        crate::constraint::constraints::NodeId> = nodes_snapshot.iter()
+        .filter(|(_, r)| r.conclusions.len() == 1 && r.conclusions[0].is_linear())
+        .map(|(id, _)| id.clone())
+        .collect();
+    // edge_map: NodeConc → NodeId (only first edge per conc is needed since the
+    // source case has at most one outgoing edge per conc).  Built directly from
+    // the live edges; the resulting OWNED map decouples it from the later `red`
+    // mutation, so no `edges` snapshot clone is needed.
     let edge_map: std::collections::BTreeMap<
         crate::constraint::constraints::NodeConc,
-        crate::constraint::constraints::NodeId> = edges_snapshot.iter()
+        crate::constraint::constraints::NodeId> = red.sys.edges.iter()
         .map(|e| (e.src.clone(), e.tgt.0.clone()))
         .collect();
     fn plain_route(
         nid: &crate::constraint::constraints::NodeId,
-        lookup_rule: &dyn Fn(&crate::constraint::constraints::NodeId)
-            -> Option<crate::rule::RuleACInst>,
+        single_linear_conc: &std::collections::BTreeSet<
+            crate::constraint::constraints::NodeId>,
         edge_map: &std::collections::BTreeMap<
             crate::constraint::constraints::NodeConc,
             crate::constraint::constraints::NodeId>,
@@ -3230,18 +3239,17 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
     ) -> Vec<crate::constraint::constraints::NodeId> {
         // Defensive depth bound — proto chains rarely exceed 16 in
         // practice; this stops on cyclic edges (shouldn't happen
-        // in a well-formed system, but defensive).
-        if depth > 32 { return vec![nid.clone()]; }
-        let Some(rule) = lookup_rule(nid) else { return vec![nid.clone()]; };
-        if rule.conclusions.len() != 1 { return vec![nid.clone()]; }
-        let conc_fact = &rule.conclusions[0];
-        if !conc_fact.is_linear() { return vec![nid.clone()]; }
-        let conc_idx = crate::rule::ConcIdx(0);
-        let conc_key = (nid.clone(), conc_idx);
+        // in a well-formed system, but defensive).  A node continues the route
+        // iff it has a single linear conclusion (precomputed) — equivalent to
+        // the old `lookup_rule(nid).conclusions.len()==1 && [0].is_linear()`.
+        if depth > 32 || !single_linear_conc.contains(nid) {
+            return vec![nid.clone()];
+        }
+        let conc_key = (nid.clone(), crate::rule::ConcIdx(0));
         match edge_map.get(&conc_key) {
             Some(next) => {
                 let mut out = vec![nid.clone()];
-                out.extend(plain_route(next, lookup_rule, edge_map, depth + 1));
+                out.extend(plain_route(next, single_linear_conc, edge_map, depth + 1));
                 out
             }
             None => vec![nid.clone()],
@@ -3342,7 +3350,7 @@ fn enforce_fresh_ordering_pass(red: &mut Reduction) -> ChangeIndicator {
         .map(|(id, _)| id.clone()).collect();
     for (i, j) in &new_lesses {
         if !supplier_ids.contains(i) { continue; }   // i must be a frI
-        let rs = plain_route(i, &lookup_rule, &edge_map, 0);
+        let rs = plain_route(i, &single_linear_conc, &edge_map, 0);
         if rs.len() <= 1 { continue; }
         // `tail rs` — all nodes after the first.
         let tail = &rs[1..];

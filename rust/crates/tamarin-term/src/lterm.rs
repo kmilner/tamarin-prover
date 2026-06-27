@@ -512,23 +512,49 @@ where
         }
     }
     fn map_free_with(self, f: &mut dyn FnMut(LVar) -> LVar, monotone: bool) -> Self {
-        match self {
-            Term::Lit(l) => Term::Lit(l.map_free_with(f, monotone)),
-            Term::App(fsym, args) => {
-                let mapped: Vec<Term<L>> =
-                    args.iter().cloned().map(|a| a.map_free_with(f, monotone)).collect();
-                // Mirrors HS `mapFrees` for `Term l` (LTerm.hs:733-735):
-                //   Arbitrary -> `fApp o`     (re-sorts AC/C via `fAppAC`/`fAppC`)
-                //   Monotone  -> `unsafefApp o` (preserves arg order for EVERY
-                //                symbol — a monotone shift cannot change the
-                //                AC/C-normal-form ordering, so the unsorted
-                //                rebuild equals the sorted one).
-                if monotone {
-                    crate::term::unsafe_f_app(fsym, mapped)
-                } else {
-                    crate::term::f_app(fsym, mapped)
+        // Copy-on-write: when `f` is identity on every free leaf of a subtree,
+        // that subtree is unchanged, so reuse it (the owned `self`) instead of
+        // cloning all args and re-running `f_app`/`unsafe_f_app`.  Mirrors
+        // `subst::apply_vterm_map_changed`.  Byte-identical: a subtree with no
+        // remapped leaf is already in `f_app`-normal form (the monotone path
+        // never re-sorts; the non-monotone path's `f_app` re-sort of unchanged,
+        // already-normal args yields the same term — the same invariant
+        // `apply_vterm_map_changed` relies on).
+        match map_free_term_cow(&self, f, monotone) {
+            Some(t) => t,
+            None => self,
+        }
+    }
+}
+
+/// Copy-on-write core of `Term::map_free_with`: `None` when no free leaf in `t`
+/// is remapped by `f` (so the caller can reuse the input), else the rebuilt
+/// term.  Single-pass: the rebuild `Vec` is allocated lazily on the first
+/// changed child, and unchanged children reuse their `Arc` by clone.  Mirrors
+/// `Term::App`'s `mapFrees`: monotone keeps arg order (`unsafe_f_app`),
+/// non-monotone re-sorts AC/C (`f_app`).
+fn map_free_term_cow<L>(t: &Term<L>, f: &mut dyn FnMut(LVar) -> LVar, monotone: bool) -> Option<Term<L>>
+where
+    L: Clone + Ord + HasFrees + HasFreesLit,
+{
+    match t {
+        Term::Lit(l) => {
+            let nl = l.clone().map_free_with(f, monotone);
+            if &nl != l { Some(Term::Lit(nl)) } else { None }
+        }
+        Term::App(fsym, args) => {
+            let mut out: Option<Vec<Term<L>>> = None;
+            for (i, a) in args.iter().enumerate() {
+                match map_free_term_cow(a, f, monotone) {
+                    Some(g) => out.get_or_insert_with(|| args[..i].to_vec()).push(g),
+                    None => if let Some(v) = out.as_mut() { v.push(a.clone()); }
                 }
             }
+            out.map(|mapped| if monotone {
+                crate::term::unsafe_f_app(fsym.clone(), mapped)
+            } else {
+                crate::term::f_app(fsym.clone(), mapped)
+            })
         }
     }
 }
