@@ -6241,7 +6241,7 @@ impl<'ctx> Reduction<'ctx> {
 
         // splitList <- splitSubterm reducible True st.  Fresh vars for the
         // AC-recurse arm come from the maude counter (HS `freshLVar`).
-        let reducible = self.maude.maude_sig().reducible_fun_syms_fast;
+        let reducible = self.maude.maude_sig().reducible_fun_syms_fast.clone();
         let split_list = {
             let avoid_max = self.fresh_var_baseline();
             self.maude.ensure_above(avoid_max);

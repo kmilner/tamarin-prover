@@ -37,7 +37,7 @@ pub enum DiffType {
 /// convert via `vec.into()` (or `Arc::from(vec)`); destructure-and-
 /// consume patterns use `args.iter().cloned()` (each child clone is
 /// itself O(1)).
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone)]
 pub enum Term<A> {
     Lit(A),
     App(FunSym, Arc<[Term<A>]>),
@@ -102,6 +102,23 @@ impl<A: PartialOrd> PartialOrd for Term<A> {
                 }
                 non_eq => non_eq,
             },
+        }
+    }
+}
+// Hand-written `Hash` to accompany the manual ptr-fast-path `PartialEq`/`Ord`
+// above, satisfying `clippy::derived_hash_with_manual_eq` (a correctness lint
+// guarding `a == b ⇒ hash(a) == hash(b)`).  This hash is purely content-based —
+// `App` always hashes its symbol and children, never the `Arc` identity — so it
+// agrees with the content-based `Eq`.  No `HashMap`/`FastSet` keyed on `Term`
+// has an iteration order that reaches the prover output (the port is byte-
+// deterministic and these maps were run-randomised `std::HashMap`s before the
+// `FxHash` switch), so the concrete hash value is output-irrelevant.
+impl<A: std::hash::Hash> std::hash::Hash for Term<A> {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Term::Lit(a) => { 0u8.hash(state); a.hash(state); }
+            Term::App(s, args) => { 1u8.hash(state); s.hash(state); args.hash(state); }
         }
     }
 }

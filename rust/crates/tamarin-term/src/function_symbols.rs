@@ -34,7 +34,7 @@ pub enum Constructability {
 /// Free (no-equation) function symbol — name plus arity, privacy, and
 /// constructability. Mirrors the Haskell tuple
 /// `(ByteString, (Int, Privacy, Constructability))`.
-#[derive(Clone, Hash)]
+#[derive(Clone)]
 pub struct NoEqSym {
     /// Interned into a global pool and held as a `&'static [u8]`, so a clone
     /// is a pointer copy — no heap allocation (unlike owned `Vec`) and no
@@ -79,6 +79,22 @@ impl PartialEq for NoEqSym {
     }
 }
 impl Eq for NoEqSym {}
+// Hand-written `Hash` (rather than `derive`d) so it sits alongside the manual
+// `PartialEq`/`Ord` above without tripping `clippy::derived_hash_with_manual_eq`
+// (a correctness lint: a derived `Hash` next to a hand-written `Eq` risks the
+// `a == b ⇒ hash(a) == hash(b)` invariant being violated).  Here both are
+// content-based — the `Eq`/`Ord` pointer fast-path only ever returns early when
+// the contents are provably equal — so the invariant holds.  The field order
+// matches the previous `derive(Hash)`, keeping the hash byte-identical.
+impl std::hash::Hash for NoEqSym {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.arity.hash(state);
+        self.privacy.hash(state);
+        self.constructability.hash(state);
+    }
+}
 impl Ord for NoEqSym {
     #[inline]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
