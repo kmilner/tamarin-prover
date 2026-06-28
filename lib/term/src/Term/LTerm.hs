@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns               #-}
 {-# LANGUAGE CPP                        #-}
 {-# LANGUAGE DeriveDataTypeable         #-}
 {-# LANGUAGE FlexibleContexts           #-}
@@ -123,6 +124,7 @@ import           Control.Basics
 import           Control.DeepSeq
 import           Control.Monad.Bind
 import           Control.Monad.Identity
+import qualified Control.Monad.State.Strict       as St
 import qualified Control.Monad.Trans.PreciseFresh as Precise
 
 import           GHC.Generics                     (Generic)
@@ -693,9 +695,38 @@ avoidPrecise = avoidPreciseVars . frees
 --   If 'Control.Monad.PreciseFresh' is used with non-AC terms and identical
 --   fresh state, the same result is returned for two terms that only differ
 --   in the indices of variables.
+--
+-- This sits on the hottest path of the proof search: 'cleanup' canonicalises
+-- every case after every step. The generic formulation
+-- @evalBindT (someInst t) noBindings@ run in 'Precise.Fresh' threads the
+-- binding map and the per-name index supply through /two/ nested 'StateT'
+-- layers (@BindT@ over @PreciseFresh@), allocating a result pair at each layer
+-- on every bind. We fuse them into a single strict 'State' over
+-- @(bindings, supply)@. The variable-to-fresh-index assignment is identical to
+-- the generic version started from an empty 'Precise.FreshState' (the only way
+-- it is ever called): on the first occurrence of a variable we hand out
+-- @findWithDefault 0 name@ for its name hint and bump that name's counter,
+-- mirroring 'importBinding' + 'Precise.freshIdent'; repeated occurrences reuse
+-- the stored binding. It reuses the same 'mapFrees' traversal as 'someInst', so
+-- the visit order (and hence the output) is unchanged.
 {-# INLINABLE renamePrecise #-}
-renamePrecise :: (MonadFresh m, HasFrees a) => a -> m a
-renamePrecise x = evalBindT (someInst x) noBindings
+renamePrecise :: HasFrees a => a -> a
+renamePrecise t =
+    St.evalState (mapFrees (Arbitrary importVar) t) (M.empty, M.empty)
+  where
+    importVar :: LVar
+              -> St.State (M.Map LVar LVar, Precise.FreshState) LVar
+    importVar v = do
+        (binds, supply) <- St.get
+        case M.lookup v binds of
+          Just v' -> return v'
+          Nothing -> do
+            let name  = lvarName v
+                idx   = M.findWithDefault 0 name supply
+                !idx' = succ idx          -- avoid building thunks in the Map
+                v'    = LVar name (lvarSort v) idx
+            St.put (M.insert v v' binds, M.insert name idx' supply)
+            return v'
 
 
 renameDropNamehint :: (MonadFresh m, MonadBind LVar LVar m, HasFrees a) => a -> m a
