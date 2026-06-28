@@ -348,7 +348,8 @@ partialAtomValuation ctxt sys =
     runMaude   = (`runReader` get pcMaudeHandle ctxt)
     before     = alwaysBefore sys
     lessRel    = rawLessRel sys
-    nodesAfter = \i -> filter (i /=) $ S.toList $ D.reachableSet [i] lessRel
+    lessAdj    = D.adjacency lessRel
+    nodesAfter = \i -> filter (i /=) $ S.toList $ D.reachableSetWith lessAdj [i]
     reducible  = reducibleFunSyms $ mhMaudeSig $ get pcMaudeHandle ctxt
     sst        = get sSubtermStore sys
 

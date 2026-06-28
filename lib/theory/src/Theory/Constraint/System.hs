@@ -1054,7 +1054,8 @@ safePartialAtomValuation ctxt sys =
     runMaude   = (`runReader` L.get pcMaudeHandle ctxt)
     before     = alwaysBefore sys
     lessRel    = rawLessRel sys
-    nodesAfter = \i -> filter (i /=) $ S.toList $ D.reachableSet [i] lessRel
+    lessAdj    = D.adjacency lessRel
+    nodesAfter = \i -> filter (i /=) $ S.toList $ D.reachableSetWith lessAdj [i]
     reducible  = reducibleFunSyms $ mhMaudeSig $ L.get pcMaudeHandle ctxt
     sst        = L.get sSubtermStore sys
 
@@ -1628,13 +1629,18 @@ getLessAtoms = S.fromList . getLessRel . S.toList . L.get sLessAtoms
 -- the second argument in all models of the sequent.
 alwaysBefore :: System -> (NodeId -> NodeId -> Bool)
 alwaysBefore sys =
-    check -- lessRel is cached for partial applications
+    check -- lessRel/adjacency/less-atoms are cached for partial applications
   where
     lessRel   = rawLessRel sys
+    -- Build the adjacency map and the less-atom set once per partial
+    -- application, rather than rebuilding them on every 'check i j' query
+    -- (this predicate is queried per-atom during formula evaluation).
+    lessAdj   = D.adjacency lessRel
+    lessAtomS = getLessAtoms sys
     check i j =
          -- speed-up check by first checking less-atoms
-         ((i, j) `S.member` getLessAtoms sys)
-      || (j `S.member` D.reachableSet [i] lessRel)
+         ((i, j) `S.member` lessAtomS)
+      || (j `S.member` D.reachableSetWith lessAdj [i])
 
 -- | 'True' iff the given node id is guaranteed to be instantiated to an
 -- index in the trace.

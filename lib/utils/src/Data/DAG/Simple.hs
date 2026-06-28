@@ -12,7 +12,9 @@ module Data.DAG.Simple (
   , transRed
   , inverse
   , image
+  , adjacency
   , reachableSet
+  , reachableSetWith
   , restrict
 
   -- ** Cycles
@@ -29,6 +31,7 @@ import           Control.Monad.RWS
 
 import           Data.List
 import qualified Data.DList as D
+import qualified Data.Map   as M
 import qualified Data.Set   as S
 import           Data.Maybe
 
@@ -68,21 +71,38 @@ toposort dag =
         preds = x `image` inverse dag
 
 
--- | Compute the set of nodes reachable from the given set of nodes.
-reachableSet :: Ord a => [a] -> [(a,a)] -> S.Set a
-reachableSet start dag = 
+-- | Build a successor-adjacency map from a relation. Computing this once and
+-- reusing it across many reachability queries (see 'reachableSetWith') avoids
+-- rescanning the whole relation per query. The order of successors per key is
+-- unspecified, which is fine for the order-independent consumers below.
+adjacency :: Ord a => [(a,a)] -> M.Map a [a]
+adjacency rel = M.fromListWith (++) [ (x, [y]) | (x, y) <- rel ]
+
+-- | Compute the set of nodes reachable from the given set of nodes, using a
+-- prebuilt adjacency map (see 'adjacency'). Prefer this over 'reachableSet'
+-- whenever the same relation is queried repeatedly (e.g. 'alwaysBefore').
+reachableSetWith :: Ord a => M.Map a [a] -> [a] -> S.Set a
+reachableSetWith adj start =
     foldl' visit S.empty start
-  where 
-    visit visited x 
+  where
+    visit visited x
       | x `S.member` visited = visited
       | otherwise            =
-          foldl' visit (S.insert x visited) (x `image` dag)
+          foldl' visit (S.insert x visited) (M.findWithDefault [] x adj)
+
+-- | Compute the set of nodes reachable from the given set of nodes. Builds the
+-- adjacency map for a single use; use 'reachableSetWith' for repeated queries.
+reachableSet :: Ord a => [a] -> [(a,a)] -> S.Set a
+reachableSet start dag = reachableSetWith (adjacency dag) start
 
 -- | Is the relation cyclic.
 cyclic :: Ord a => [(a,a)] -> Bool
 cyclic rel = 
     maybe True (const False) $ foldM visitForest S.empty $ map fst rel
-  where 
+  where
+    -- Adjacency map built once (see 'adjacency'); cyclicity is a Bool, so the
+    -- order of successors does not matter (byte-inert).
+    adj = adjacency rel
     visitForest visited x
       | x `S.member` visited = return visited
       | otherwise            = findLoop S.empty visited x
@@ -93,7 +113,7 @@ cyclic rel =
       | otherwise            = 
           S.insert x <$> foldM (findLoop parents') visited next
       where
-        next     = [ e' | (e,e') <- rel, e == x ]
+        next     = M.findWithDefault [] x adj
         parents' = S.insert x parents
 
 
