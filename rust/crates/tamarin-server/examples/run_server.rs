@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if p2.is_dir() { Some(p2) } else { None }
         }
     };
-    let maude_path = ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude",
+    let maude_path = ["/usr/local/bin/maude",
                       "/opt/homebrew/bin/maude", "/usr/bin/maude"]
         .iter().find(|p| std::path::Path::new(p).exists())
         .map(|s| s.to_string()).unwrap_or_else(|| "maude".into());

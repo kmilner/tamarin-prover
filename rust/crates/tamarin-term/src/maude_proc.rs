@@ -1888,7 +1888,6 @@ mod tests {
         // Honour an env override; otherwise look for `maude` on PATH.
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
         let candidates = [
-            "/home/linuxbrew/.linuxbrew/bin/maude",
             "/usr/local/bin/maude",
             "/usr/bin/maude",
             "maude",

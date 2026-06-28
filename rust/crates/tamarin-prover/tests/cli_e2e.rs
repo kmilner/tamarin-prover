@@ -12,7 +12,6 @@ use tamarin_prover::{parse_args, run};
 
 fn maude_available() -> bool {
     for c in [
-        "/home/linuxbrew/.linuxbrew/bin/maude",
         "/usr/local/bin/maude",
         "/usr/bin/maude",
     ] {

@@ -6,11 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Accountability extension for the Tamarin prover (Rust port)."
+# Placeholder crate: the Generation.hs / Accountability.hs port has not landed
+# yet (lib.rs is doc-only), so it is not ready to publish on its own.
+publish = false
 
 [dependencies]
-tamarin-utils = { workspace = true }
-tamarin-term = { workspace = true }
-tamarin-theory = { workspace = true }
+# Intentionally empty. The workspace deps (tamarin-term/-theory) will be re-added
+# when the accountability translation is ported; keeping them now would be
+# unused-dependency noise.
 
 [lints]
 workspace = true

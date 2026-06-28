@@ -1597,7 +1597,6 @@ fn init_rayon_pool(args: &Args) {
 
 fn default_maude_path() -> String {
     for c in [
-        "/home/linuxbrew/.linuxbrew/bin/maude",
         "/usr/local/bin/maude",
         "/usr/bin/maude",
     ] {

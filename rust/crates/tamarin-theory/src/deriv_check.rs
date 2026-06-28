@@ -751,10 +751,25 @@ mod tests {
     use super::*;
     use tamarin_parser::parse_theory;
 
+    /// Resolve a maude binary: `$MAUDE_PATH`, then a portable candidate list
+    /// (bare `maude` resolves via `PATH`). Returns `None` only if the list is
+    /// exhausted, so the Maude-backed tests no-op rather than fail when maude
+    /// is unavailable.
+    fn maude_bin() -> Option<String> {
+        if let Ok(p) = std::env::var("MAUDE_PATH") {
+            return Some(p);
+        }
+        for c in ["/usr/local/bin/maude", "/usr/bin/maude", "maude"] {
+            if c == "maude" || std::path::Path::new(c).exists() {
+                return Some(c.to_string());
+            }
+        }
+        None
+    }
+
     fn maude() -> Option<MaudeHandle> {
-        let p = "/home/linuxbrew/.linuxbrew/bin/maude";
-        if !std::path::Path::new(p).exists() { return None; }
-        MaudeHandle::start(p, tamarin_term::maude_sig::pair_maude_sig()).ok()
+        let p = maude_bin()?;
+        MaudeHandle::start(&p, tamarin_term::maude_sig::pair_maude_sig()).ok()
     }
 
     #[test]
@@ -809,13 +824,12 @@ mod tests {
     /// `elaborated.signature.maude_sig` (run.rs:644).  Returns `None` if Maude
     /// is unavailable.
     fn maude_for(src: &str) -> Option<(p::Theory, MaudeHandle)> {
-        let p = "/home/linuxbrew/.linuxbrew/bin/maude";
-        if !std::path::Path::new(p).exists() { return None; }
+        let p = maude_bin()?;
         let thy = parse_theory(src, &[]).expect("parse");
         // `elaborate` installs the per-theory user-funs guards internally.
         let elaborated = crate::elaborate::elaborate(&thy).expect("elaborate");
         let sig = elaborated.signature.maude_sig.clone();
-        let handle = MaudeHandle::start(p, sig).ok()?;
+        let handle = MaudeHandle::start(&p, sig).ok()?;
         Some((thy, handle))
     }
 

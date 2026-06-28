@@ -15,7 +15,6 @@ use common::*;
 /// Maude for the per-theory `ProofContext`).  Skip if not available.
 fn maude_available() -> bool {
     for c in [
-        "/home/linuxbrew/.linuxbrew/bin/maude",
         "/usr/local/bin/maude",
         "/opt/homebrew/bin/maude",
         "/usr/bin/maude",

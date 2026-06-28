@@ -117,7 +117,6 @@ pub async fn start_server_with_theory(fixture_name: &str) -> TestServer {
 
 fn detect_maude() -> String {
     for c in [
-        "/home/linuxbrew/.linuxbrew/bin/maude",
         "/usr/local/bin/maude",
         "/opt/homebrew/bin/maude",
         "/usr/bin/maude",

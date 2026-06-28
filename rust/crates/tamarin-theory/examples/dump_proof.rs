@@ -27,9 +27,10 @@ fn main() {
     // know the user-declared symbols, producing a wrong proof tree.
     let elaborated = elaborate(&parsed).expect("elaborate");
 
-    let maude_path = "/home/linuxbrew/.linuxbrew/bin/maude";
+    // Resolve maude from $MAUDE_PATH, else `maude` on PATH.
+    let maude_path = std::env::var("MAUDE_PATH").unwrap_or_else(|_| "maude".to_string());
     let maude_sig = elaborated.signature.maude_sig.clone();
-    let maude = MaudeHandle::start(maude_path, maude_sig).expect("start maude");
+    let maude = MaudeHandle::start(&maude_path, maude_sig).expect("start maude");
 
     let root = prove_lemma(&parsed, lemma, maude, 500).expect("prove");
     let steps = count_steps(&root);

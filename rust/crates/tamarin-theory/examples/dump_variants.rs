@@ -10,11 +10,13 @@ fn main() {
     let source = std::fs::read_to_string(theory_path).expect("read");
     let parsed = parse_theory(&source, &[]).expect("parse");
     let elaborated = elaborate(&parsed).expect("elaborate");
-    let maude = MaudeHandle::start("/home/linuxbrew/.linuxbrew/bin/maude", elaborated.signature.maude_sig.clone()).expect("maude");
+    // Resolve maude from $MAUDE_PATH, else `maude` on PATH.
+    let maude_path = std::env::var("MAUDE_PATH").unwrap_or_else(|_| "maude".to_string());
+    let maude = MaudeHandle::start(&maude_path, elaborated.signature.maude_sig.clone()).expect("maude");
     for open in elaborated.rules() {
         let r = &open.rule;
         let n = match &r.info.name {
-            tamarin_theory::rule::ProtoRuleName::Stand(s) => s.as_str(),
+            tamarin_theory::rule::ProtoRuleName::Stand(s) => *s,
             _ => "",
         };
         if n == *rule_name {

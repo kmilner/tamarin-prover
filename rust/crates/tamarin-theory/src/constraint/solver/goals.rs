@@ -2777,7 +2777,7 @@ mod tests {
         use tamarin_term::maude_sig::pair_maude_sig;
 
         let path = match std::env::var("MAUDE_PATH").ok().or_else(|| {
-            for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+            for c in ["/usr/local/bin/maude", "maude"] {
                 if std::path::Path::new(c).exists() { return Some(c.to_string()); }
             }
             None

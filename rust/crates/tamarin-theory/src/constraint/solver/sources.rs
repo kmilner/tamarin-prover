@@ -6696,7 +6696,7 @@ mod tests {
 
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+        for c in ["/usr/local/bin/maude", "maude"] {
             if std::path::Path::new(c).exists() { return Some(c.to_string()); }
         }
         None

@@ -441,7 +441,7 @@ mod tests {
         // (mirroring the `maude_handle`/`dh_maude_handle` gating in
         // intruder_rules.rs).
         let maude_path = std::env::var("MAUDE_PATH").ok().or_else(|| {
-            for c in ["/home/linuxbrew/.linuxbrew/bin/maude",
+            for c in [
                       "/usr/local/bin/maude", "maude"] {
                 if std::path::Path::new(c).exists() { return Some(c.to_string()); }
             }
