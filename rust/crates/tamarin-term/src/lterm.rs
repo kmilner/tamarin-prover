@@ -166,7 +166,7 @@ impl Ord for LVar {
         // Haskell-faithful: idx <> sort <> name (idx FIRST).
         self.idx.cmp(&other.idx)
             .then_with(|| self.sort.cmp(&other.sort))
-            .then_with(|| self.name.cmp(&other.name))
+            .then_with(|| self.name.cmp(other.name))
     }
 }
 
@@ -225,7 +225,7 @@ pub fn sort_of_lterm<C, F: Fn(&C) -> LSort>(t: &LTerm<C>, sort_of_const: F) -> L
         Term::Lit(Lit::Var(v)) => v.sort,
         Term::App(FunSym::Ac(AcSym::NatPlus), _) => LSort::Nat,
         Term::App(FunSym::NoEq(s), args)
-            if args.is_empty() && &*s.name == crate::function_symbols::NAT_ONE_SYM_STRING =>
+            if args.is_empty() && s.name == crate::function_symbols::NAT_ONE_SYM_STRING =>
         {
             LSort::Nat
         }

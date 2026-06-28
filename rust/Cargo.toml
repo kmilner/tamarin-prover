@@ -49,6 +49,9 @@ rustc-hash = "2"
 #   - ptr_arg: several helpers take `&Vec`/`&mut Vec` intentionally.
 #   - should_implement_trait / only_used_in_recursion: a few inherent
 #     methods and recursion-threaded params are intentional.
+#   - doc_overindented_list_items: many module docs lay out Haskell rule /
+#     formula syntax as indented ASCII art under a numbered step; the
+#     "overindentation" is deliberate alignment, not a list typo.
 [workspace.lints.clippy]
 type_complexity = "allow"
 too_many_arguments = "allow"
@@ -57,6 +60,7 @@ large_enum_variant = "allow"
 ptr_arg = "allow"
 should_implement_trait = "allow"
 only_used_in_recursion = "allow"
+doc_overindented_list_items = "allow"
 
 # Optimized release profile.  `lto = "fat"` enables cross-crate
 # inlining (FunSym match arms in the term crate inlined into hot

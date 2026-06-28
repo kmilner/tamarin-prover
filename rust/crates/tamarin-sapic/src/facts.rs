@@ -456,11 +456,9 @@ pub fn color_for_process_name(names: &[String]) -> Rgb {
     }
     let palette: Vec<Hsv> = names.iter().map(|n| rgb_to_hsv(color_hash(n))).collect();
     let mut acc = palette[0];
-    let mut i: i32 = 0;
-    for v in &palette[1..] {
-        let t = 2f64.powi(-i);
+    for (i, v) in palette[1..].iter().enumerate() {
+        let t = 2f64.powi(-(i as i32));
         acc = interpolate(acc, *v, t);
-        i += 1;
     }
     // normalize (HSV h _ _) = HSV h 0.5 0.5
     let normalized = Hsv::new(acc.h, 0.5, 0.5);

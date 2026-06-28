@@ -2035,15 +2035,6 @@ impl<'ctx> Reduction<'ctx> {
     }
 }
 
-/// Helpers matching Haskell's `getProofContext` / `getMaudeHandle`.
-// Intentionally retained: faithful HS port; no caller yet (Rust callers
-// reach the `ctx`/`maude` fields directly).
-impl<'ctx> Reduction<'ctx> {
-    pub(crate) fn get_proof_context(&self) -> &ProofContext { self.ctx }
-    pub(crate) fn get_maude_handle(&self) -> &tamarin_term::maude_proc::MaudeHandle {
-        &self.maude
-    }
-}
 
 // =============================================================================
 // Equality solving — bridges into the equation store
@@ -3106,14 +3097,14 @@ fn illegal_coerce(p_rule: &RuleACInst, fa_conc: &crate::fact::LNFact) -> bool {
 fn is_pair(t: &tamarin_term::lterm::LNTerm) -> bool {
     use tamarin_term::function_symbols::FunSym;
     if let tamarin_term::term::Term::App(FunSym::NoEq(s), args) = t {
-        return &*s.name == b"pair" && args.len() == 2;
+        return s.name == b"pair" && args.len() == 2;
     }
     false
 }
 fn is_inverse(t: &tamarin_term::lterm::LNTerm) -> bool {
     use tamarin_term::function_symbols::{FunSym, INV_SYM_STRING};
     if let tamarin_term::term::Term::App(FunSym::NoEq(s), args) = t {
-        return &*s.name == INV_SYM_STRING && args.len() == 1;
+        return s.name == INV_SYM_STRING && args.len() == 1;
     }
     false
 }
@@ -3856,10 +3847,10 @@ fn ku_decomp_subterms(t: &tamarin_term::lterm::LNTerm)
     use tamarin_term::term::Term;
     match t {
         Term::App(FunSym::NoEq(s), args)
-            if &*s.name == b"pair" && args.len() == 2
+            if s.name == b"pair" && args.len() == 2
                 => Some(args.to_vec()),
         Term::App(FunSym::NoEq(s), args)
-            if &*s.name == INV_SYM_STRING && args.len() == 1
+            if s.name == INV_SYM_STRING && args.len() == 1
                 => Some(args.to_vec()),
         // For AC operators (Mult, Union) HS reads the decomposition
         // sub-terms via `viewTerm2 -> FMult ms` / `FUnion ms`, where `ms`
@@ -3946,7 +3937,7 @@ pub fn chain_direct_case_name(fa_conc: &crate::fact::LNFact) -> Option<String> {
         Term::App(sym, _) => {
             use tamarin_term::function_symbols::FunSym;
             match sym {
-                FunSym::NoEq(noeq) => String::from_utf8_lossy(&noeq.name).into_owned(),
+                FunSym::NoEq(noeq) => String::from_utf8_lossy(noeq.name).into_owned(),
                 FunSym::Ac(op) => format!("{:?}", op),
                 FunSym::C(op) => format!("{:?}", op),
                 FunSym::List => "List".to_string(),
@@ -6501,7 +6492,7 @@ mod tests {
         let i = LVar::new("i", LSort::Node, 2);
         let j = LVar::new("j", LSort::Node, 3);
         let info = || crate::rule::RuleInfo::Proto(crate::rule::ProtoRuleACInstInfo {
-            name: crate::rule::ProtoRuleName::Stand("R".into()),
+            name: crate::rule::ProtoRuleName::Stand("R"),
             attributes: crate::rule::RuleAttributes::empty(),
             loop_breakers: Vec::new(),
         });
@@ -6541,7 +6532,7 @@ mod tests {
         // Two empty rule instances, one keyed by i and one by j.
         let ru = || crate::rule::Rule {
             info: crate::rule::RuleInfo::Proto(crate::rule::ProtoRuleACInstInfo {
-                name: crate::rule::ProtoRuleName::Stand("R".into()),
+                name: crate::rule::ProtoRuleName::Stand("R"),
                 attributes: crate::rule::RuleAttributes::empty(),
                 loop_breakers: Vec::new(),
             }),
@@ -6801,7 +6792,7 @@ mod tests {
         let tx: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(Lit::Var(v));
         let fa = crate::fact::Fact::new(
             crate::fact::FactTag::Proto(
-                crate::fact::Multiplicity::Linear, "Foo".into(), 1),
+                crate::fact::Multiplicity::Linear, "Foo", 1),
             vec![tx]);
         let p = (i, crate::rule::PremIdx(0));
         let out = r.solve_premise_goal(&p, &fa);
@@ -6950,7 +6941,7 @@ mod tests {
         assert_eq!(r.sys.goals.len(), 1);
         assert!(matches!(&r.sys.goals[0].0, Goal::Action(_, fact)
             if fact.tag == crate::fact::FactTag::Proto(
-                crate::fact::Multiplicity::Linear, "Setup".into(), 1)));
+                crate::fact::Multiplicity::Linear, "Setup", 1)));
     }
 
     #[test]
@@ -6991,7 +6982,7 @@ mod tests {
         let prem = crate::fact::fresh_fact(tk.clone());
         let act = crate::fact::Fact::new(
             crate::fact::FactTag::Proto(
-                crate::fact::Multiplicity::Linear, "Setup".into(), 1),
+                crate::fact::Multiplicity::Linear, "Setup", 1),
             vec![tk.clone()]);
         let conc = crate::fact::out_fact(tk);
         let rule: crate::rule::ProtoRuleE = crate::rule::Rule::new(
@@ -7013,7 +7004,7 @@ mod tests {
         let tx: tamarin_term::lterm::LNTerm = tamarin_term::term::Term::Lit(Lit::Var(v2));
         let fa = crate::fact::Fact::new(
             crate::fact::FactTag::Proto(
-                crate::fact::Multiplicity::Linear, "Setup".into(), 1),
+                crate::fact::Multiplicity::Linear, "Setup", 1),
             vec![tx]);
         let out = r.solve_action_goal(&i, &fa);
         // LinearNamed("Setup") with in-place mutation: 2 nodes (Setup

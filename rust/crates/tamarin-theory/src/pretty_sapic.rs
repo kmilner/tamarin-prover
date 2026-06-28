@@ -150,7 +150,7 @@ fn sapic_term_to_doc(
             pair_doc(&flat, match_vars)
         }
         VTerm::App(FunSym::NoEq(sym), ts) => {
-            let name = String::from_utf8_lossy(&sym.name).into_owned();
+            let name = String::from_utf8_lossy(sym.name).into_owned();
             if ts.is_empty() {
                 // HS `FApp (NoEq (f,_)) [] -> text f`.
                 Doc::text(name)
@@ -246,7 +246,7 @@ fn pretty_pattern(t: &SapicTerm, match_vars: &std::collections::BTreeSet<SapicLV
 /// printed by the recursive `ppTerm`, NOT flattened here).
 fn collect_pair_tail<'a>(t: &'a SapicTerm, out: &mut Vec<&'a SapicTerm>) {
     if let VTerm::App(FunSym::NoEq(sym), args) = t {
-        if &*sym.name == b"pair" && args.len() == 2 {
+        if sym.name == b"pair" && args.len() == 2 {
             out.push(&args[0]);
             collect_pair_tail(&args[1], out);
             return;
@@ -298,7 +298,7 @@ fn render_msr(
 ) -> String {
     // `ppFactsList list = fsep [ "[", fsep (punctuate "," (map ppFact list)), "]" ]`.
     let pp_facts_list = |facts: &[crate::sapic::SapicLNFact]| -> Doc {
-        let inner: Vec<Doc> = facts.iter().map(|f| sapic_fact_to_doc(f)).collect();
+        let inner: Vec<Doc> = facts.iter().map(sapic_fact_to_doc).collect();
         hpj::fsep(vec![
             Doc::char('['),
             hpj::fsep(hpj::punctuate(Doc::char(','), inner)),
@@ -311,7 +311,7 @@ fn render_msr(
         Doc::text("-->")
     } else {
         // map ppFact acts ++ map ppRestr' restr
-        let mut items: Vec<Doc> = acts.iter().map(|f| sapic_fact_to_doc(f)).collect();
+        let mut items: Vec<Doc> = acts.iter().map(sapic_fact_to_doc).collect();
         for phi in rest {
             // `ppRestr' fact = "_restrict(" <> ppRestr fact <> ")"`,
             // `ppRestr = prettySyntacticLNFormula . toLFormula` — the flat
@@ -472,7 +472,7 @@ mod tests {
     fn event_top_level_has_spaces() {
         let x = VTerm::Lit(Lit::Var(sv("x", 1, Some("lol"))));
         let fact = crate::fact::Fact::new(
-            crate::fact::FactTag::Proto(crate::fact::Multiplicity::Linear, "Test".into(), 1),
+            crate::fact::FactTag::Proto(crate::fact::Multiplicity::Linear, "Test", 1),
             vec![x],
         );
         let p = Process::Action(

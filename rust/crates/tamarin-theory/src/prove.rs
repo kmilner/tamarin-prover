@@ -234,11 +234,10 @@ fn resolve_cli_heuristic(
             // Step 5: --oracle-only also sets quitOnEmpty on tactic rankings
             // (HS `aux (InternalTacticRanking _ t) = InternalTacticRanking
             // (quitOnEmptyOracle prover) t`, Proof.hs:715).
-            GoalRanking::Tactic { quit_on_empty, .. } => {
-                if cli.oracle_only {
+            GoalRanking::Tactic { quit_on_empty, .. }
+                if cli.oracle_only => {
                     *quit_on_empty = true;
                 }
-            }
             _ => {}
         }
     }
@@ -1303,7 +1302,7 @@ mod tests {
         for fs in &sig.fun_syms {
             if let tamarin_term::function_symbols::FunSym::NoEq(s) = fs {
                 eprintln!("  {} (arity={}, priv={:?}, ctor={:?})",
-                    String::from_utf8_lossy(&s.name), s.arity, s.privacy, s.constructability);
+                    String::from_utf8_lossy(s.name), s.arity, s.privacy, s.constructability);
             }
         }
         let h = MaudeHandle::start(&mp, sig).expect("start maude");

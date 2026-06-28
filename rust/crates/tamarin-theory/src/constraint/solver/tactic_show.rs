@@ -218,7 +218,7 @@ fn write_lnterm(t: &LNTerm, out: &mut String) {
         Term::App(sym, args) => match sym {
             // FApp (NoEq (s,_)) [] -> s ; FApp (NoEq (s,_)) as -> s(a,..)
             FunSym::NoEq(s) => {
-                let name = String::from_utf8_lossy(&s.name);
+                let name = String::from_utf8_lossy(s.name);
                 out.push_str(&name);
                 if !args.is_empty() {
                     out.push('(');
@@ -291,9 +291,9 @@ fn write_lvar(v: &tamarin_term::lterm::LVar, out: &mut String) {
     if v.name.is_empty() {
         out.push_str(&v.idx.to_string());
     } else if v.idx == 0 {
-        out.push_str(&v.name);
+        out.push_str(v.name);
     } else {
-        out.push_str(&v.name);
+        out.push_str(v.name);
         out.push('.');
         out.push_str(&v.idx.to_string());
     }
@@ -309,7 +309,7 @@ fn write_name(n: &Name, out: &mut String) {
         NameTag::Nat => out.push('%'),
     }
     out.push('\'');
-    out.push_str(&n.id.0.to_string());
+    out.push_str(n.id.0);
     out.push('\'');
 }
 
@@ -568,7 +568,7 @@ mod tests {
 
     #[test]
     fn show_fact_tag_proto() {
-        let t = FactTag::Proto(Multiplicity::Linear, "Foo".into(), 2);
+        let t = FactTag::Proto(Multiplicity::Linear, "Foo", 2);
         assert_eq!(show_fact_tag(&t), "ProtoFact Linear \"Foo\" 2");
     }
 

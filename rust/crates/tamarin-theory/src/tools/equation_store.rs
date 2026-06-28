@@ -1432,7 +1432,7 @@ impl EquationStore {
             let mut fvars: Vec<LVar> = Vec::with_capacity(first_arity);
             for _ in 0..first_arity {
                 let idx_alloc = alloc(1);
-                fvars.push(LVar { name: "x".into(), sort: LSort::Msg, idx: idx_alloc });
+                fvars.push(LVar { name: "x", sort: LSort::Msg, idx: idx_alloc });
             }
             // Build factor `{v → op(x1, ..., xk)}`.
             let factor = LNSubst::from_list(vec![(
@@ -1496,8 +1496,8 @@ impl EquationStore {
             // AC operator with varying arity: factor first two args.
             let fv1_idx = alloc(1);
             let fv2_idx = alloc(1);
-            let fv1 = LVar { name: "x".into(), sort: LSort::Msg, idx: fv1_idx };
-            let fv2 = LVar { name: "x".into(), sort: LSort::Msg, idx: fv2_idx };
+            let fv1 = LVar { name: "x", sort: LSort::Msg, idx: fv1_idx };
+            let fv2 = LVar { name: "x", sort: LSort::Msg, idx: fv2_idx };
             // Factor: `{v → op(fv1, fv2)}`
             let factor = LNSubst::from_list(vec![(
                 v.clone(),
@@ -2418,10 +2418,10 @@ pub(crate) fn log_s_pub_bindings(site: &str, subst: &LNSubst) {
     if !tamarin_utils::env_gate!("TAM_RS_TRACE_S_BIND") { return; }
     use tamarin_term::lterm::{HasFrees, LSort};
     for (v, t) in subst.to_list() {
-        let v_is_s = &*v.name == "S" && v.sort == LSort::Pub;
+        let v_is_s = v.name == "S" && v.sort == LSort::Pub;
         let mut t_has_s = false;
         t.for_each_free(&mut |w: &tamarin_term::lterm::LVar| {
-            if &*w.name == "S" && w.sort == LSort::Pub { t_has_s = true; }
+            if w.name == "S" && w.sort == LSort::Pub { t_has_s = true; }
         });
         if v_is_s || t_has_s {
             let path = crate::constraint::solver::trace::case_path_string();
@@ -2447,7 +2447,7 @@ pub(crate) fn log_vr_node_bindings(site: &str, subst: &LNSubst) {
     if !tamarin_utils::env_gate!("TAM_RS_TRACE_VR_BIND") { return; }
     use tamarin_term::lterm::LSort;
     for (v, t) in subst.to_list() {
-        if &*v.name == "vr" && v.sort == LSort::Node {
+        if v.name == "vr" && v.sort == LSort::Node {
             let path = crate::constraint::solver::trace::case_path_string();
             let bt = std::backtrace::Backtrace::force_capture();
             let bt_str = format!("{}", bt);
@@ -2778,9 +2778,9 @@ mod tests {
         use tamarin_term::lterm::HasFrees;
         let mut witness_found = false;
         for (key, term) in store.subst.to_list() {
-            if &*key.name != "x" && &*key.name != "y" { witness_found = true; }
+            if key.name != "x" && key.name != "y" { witness_found = true; }
             term.for_each_free(&mut |v| {
-                if &*v.name != "x" && &*v.name != "y" { witness_found = true; }
+                if v.name != "x" && v.name != "y" { witness_found = true; }
             });
         }
         assert!(!witness_found,

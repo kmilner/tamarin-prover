@@ -239,7 +239,7 @@ fn make_restriction(pos: &[i64], tos: &PosSet) -> p::Restriction {
         "Progress_{}_to_{}",
         pretty_position(&pos_v),
         tos.iter()
-            .map(|t| pretty_position(t))
+            .map(pretty_position)
             .collect::<Vec<_>>()
             .join("_or_")
     );

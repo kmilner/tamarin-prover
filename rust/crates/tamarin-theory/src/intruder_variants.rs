@@ -531,7 +531,7 @@ mod tests {
             match action_term {
                 Term::App(sym, args) => {
                     if let tamarin_term::function_symbols::FunSym::NoEq(s) = sym {
-                        assert_eq!(&*s.name, expected_name,
+                        assert_eq!(s.name, expected_name,
                             "{}: action term sym name", label);
                         assert_eq!(s.arity, 0, "{}: action term arity", label);
                         assert!(args.is_empty(), "{}: action term args", label);
@@ -572,7 +572,7 @@ mod tests {
         let action_term = &rules[0].actions[0].terms[0];
         match action_term {
             Term::Lit(Lit::Var(v)) => {
-                assert_eq!(&*v.name, "one",
+                assert_eq!(v.name, "one",
                     "under pair_maude_sig, `one` should remain a Var; HS-equivalent: \
                      `funSyms pairMaudeSig` does not include `oneSym`");
             }

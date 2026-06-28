@@ -875,7 +875,7 @@ fn has_forbidden_exp(sys: &System) -> bool {
                 out
             }
             Term::App(FunSym::NoEq(s), args)
-                if &*s.name == INV_SYM_STRING && args.len() == 1 =>
+                if s.name == INV_SYM_STRING && args.len() == 1 =>
             {
                 ni_factors(&args[0])
             }
@@ -890,9 +890,8 @@ fn has_forbidden_exp(sys: &System) -> bool {
         let mut ok = true;
         let mut visit = |term: &LNTerm| {
             match term {
-                Term::Lit(Lit::Var(v)) => {
-                    if v.sort == LSort::Fresh { ok = false; }
-                }
+                Term::Lit(Lit::Var(v))
+                    if v.sort == LSort::Fresh => { ok = false; }
                 Term::Lit(Lit::Con(c))
                     if sort_of_name(c) == LSort::Fresh => {
                         ok = false;
@@ -924,7 +923,7 @@ fn has_forbidden_exp(sys: &System) -> bool {
     }
     fn view_exp(t: &LNTerm) -> Option<(&LNTerm, &LNTerm)> {
         if let Term::App(FunSym::NoEq(s), args) = t {
-            if &*s.name == EXP_SYM_STRING && args.len() == 2 {
+            if s.name == EXP_SYM_STRING && args.len() == 2 {
                 return Some((&args[0], &args[1]));
             }
         }
@@ -1199,7 +1198,7 @@ fn is_forbidden_d_emap_order(sys: &System,
     // tc = exp(em(p', q'), Mult([s', r', ...]))
     let (em_t, mult_arg) = match tc {
         Term::App(FunSym::NoEq(s), args)
-            if &*s.name == EXP_SYM_STRING && args.len() == 2 =>
+            if s.name == EXP_SYM_STRING && args.len() == 2 =>
             (&args[0], &args[1]),
         _ => return false,
     };
@@ -1291,7 +1290,7 @@ fn bp_view_pmult(t: &tamarin_term::lterm::LNTerm)
     use tamarin_term::function_symbols::{FunSym, PMULT_SYM_STRING};
     use tamarin_term::term::Term;
     if let Term::App(FunSym::NoEq(s), args) = t {
-        if &*s.name == PMULT_SYM_STRING && args.len() == 2 {
+        if s.name == PMULT_SYM_STRING && args.len() == 2 {
             return Some((&args[0], &args[1]));
         }
     }
@@ -1310,7 +1309,7 @@ fn bp_ni_factors(t: &tamarin_term::lterm::LNTerm) -> Vec<tamarin_term::lterm::LN
             out
         }
         Term::App(FunSym::NoEq(s), args)
-            if &*s.name == INV_SYM_STRING && args.len() == 1 =>
+            if s.name == INV_SYM_STRING && args.len() == 1 =>
             bp_ni_factors(&args[0]),
         _ => vec![t.clone()],
     }
@@ -1908,12 +1907,12 @@ mod tests {
         use tamarin_term::maude_proc::MaudeHandle;
 
         // Build the rule instances.
-        let inj_tag = FactTag::Proto(Multiplicity::Linear, "Inj".into(), 1);
+        let inj_tag = FactTag::Proto(Multiplicity::Linear, "Inj", 1);
         let inj_fact = Fact::new(inj_tag.clone(), vec![msg_var("x", 0)]);
 
         let init: RuleACInst = Rule::new(
             RuleInfo::<ProtoRuleACInstInfo, IntrRuleACInfo>::Proto(ProtoRuleACInstInfo {
-                name: ProtoRuleName::Stand("Init".into()),
+                name: ProtoRuleName::Stand("Init"),
                 attributes: RuleAttributes::empty(),
                 loop_breakers: Vec::new(),
             }),
@@ -1923,7 +1922,7 @@ mod tests {
         );
         let copy: RuleACInst = Rule::new(
             RuleInfo::<ProtoRuleACInstInfo, IntrRuleACInfo>::Proto(ProtoRuleACInstInfo {
-                name: ProtoRuleName::Stand("Copy".into()),
+                name: ProtoRuleName::Stand("Copy"),
                 attributes: RuleAttributes::empty(),
                 loop_breakers: Vec::new(),
             }),
@@ -1933,7 +1932,7 @@ mod tests {
         );
         let stop: RuleACInst = Rule::new(
             RuleInfo::<ProtoRuleACInstInfo, IntrRuleACInfo>::Proto(ProtoRuleACInstInfo {
-                name: ProtoRuleName::Stand("Stop".into()),
+                name: ProtoRuleName::Stand("Stop"),
                 attributes: RuleAttributes::empty(),
                 loop_breakers: Vec::new(),
             }),
@@ -1996,7 +1995,7 @@ mod tests {
         // using "x" at idx 58 but with conflicting sorts: Pub vs Fresh.
         let pub_var = LVar::new("x", LSort::Pub, 58);
         let fresh_var = LVar::new("x", LSort::Fresh, 58);
-        let tag = FactTag::Proto(Multiplicity::Linear, "X".into(), 1);
+        let tag = FactTag::Proto(Multiplicity::Linear, "X", 1);
         let pub_term = tamarin_term::term::Term::Lit(
             tamarin_term::vterm::Lit::Var(pub_var.clone()));
         let fresh_term = tamarin_term::term::Term::Lit(
@@ -2032,7 +2031,7 @@ mod tests {
         };
         let pub_var = LVar::new("x", LSort::Pub, 58);
         let msg_var = LVar::new("x", LSort::Msg, 58);
-        let tag = FactTag::Proto(Multiplicity::Linear, "X".into(), 1);
+        let tag = FactTag::Proto(Multiplicity::Linear, "X", 1);
         let mk = |name: &str, t| -> RuleACInst {
             Rule::new(
                 RuleInfo::<ProtoRuleACInstInfo, IntrRuleACInfo>::Proto(ProtoRuleACInstInfo {

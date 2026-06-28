@@ -26,7 +26,7 @@ use crate::bindings::{bindings_act, bindings_comb};
 
 /// `varsProc`: every SAPIC variable that occurs anywhere in `p` (HS
 /// `varsProc = foldMap Data.Set.singleton`, Process.hs:361 — a Set, so sorted
-/// + deduplicated).  We return the underlying `LVar`s used to seed the
+/// and deduplicated).  We return the underlying `LVar`s used to seed the
 /// avoidance state for `renameUnique`.
 fn proc_lvars(p: &PlainProcess) -> Vec<LVar> {
     let mut set = std::collections::BTreeSet::new();
@@ -144,11 +144,10 @@ fn cond_formula_free_lvars(f: &tamarin_parser::ast::Formula) -> Vec<LVar> {
     use tamarin_parser::ast as p;
     fn collect_term(t: &p::Term, bound: &[String], out: &mut Vec<LVar>) {
         match t {
-            p::Term::Var(v) => {
-                if !bound.iter().any(|n| n == &v.name) {
+            p::Term::Var(v)
+                if !bound.iter().any(|n| n == &v.name) => {
                     out.push(LVar::new(v.name.clone(), crate::convert::sort_of_hint(&v.sort), v.idx));
                 }
-            }
             p::Term::App(_, args) | p::Term::Pair(args) => {
                 for a in args {
                     collect_term(a, bound, out);
@@ -478,7 +477,7 @@ fn mk_subst(
     let mut inv_pairs: Vec<(LVar, VTerm<Name, LVar>)> = Vec::new();
     for sv in bvars {
         let lv = &sv.var;
-        let v_new = tamarin_term::lterm::fresh_lvar(fresh, &lv.name, lv.sort);
+        let v_new = tamarin_term::lterm::fresh_lvar(fresh, lv.name, lv.sort);
         fwd.insert(lv.clone(), v_new.clone());
         inv_pairs.push((v_new, VTerm::Lit(Lit::Var(lv.clone()))));
     }
@@ -537,12 +536,13 @@ fn default_function_type(n: usize) -> (Vec<SapicType>, SapicType) {
 /// `viewTerm2` renders these as dedicated constructors (`FPair`/`FExp`/…) rather
 /// than `FAppNoEq`, so `typeWith` treats them via the polymorphic `viewTerm`
 /// branch (no function-type learning / no argument back-propagation).
+#[allow(clippy::nonminimal_bool)] // intentional per-symbol -> arity enumeration
 fn is_special_viewterm2_sym(fs: &NoEqSym) -> bool {
     use tamarin_term::function_symbols::{
         DH_NEUTRAL_SYM_STRING, DIFF_SYM_STRING, EXP_SYM_STRING, INV_SYM_STRING, NAT_ONE_SYM_STRING,
         ONE_SYM_STRING, PMULT_SYM_STRING,
     };
-    let n = &fs.name[..];
+    let n = fs.name;
     (n == b"pair" && fs.arity == 2)
         || (n == EXP_SYM_STRING && fs.arity == 2)
         || (n == PMULT_SYM_STRING && fs.arity == 2)
@@ -853,7 +853,7 @@ fn init_te_from_sig(
         if let Some(key) = maude_sig
             .st_fun_syms
             .iter()
-            .find(|fs| &fs.name[..] == name.as_bytes() && fs.arity == arity)
+            .find(|fs| fs.name == name.as_bytes() && fs.arity == arity)
         {
             funs.insert(key.clone(), (arg_types.clone(), out_type.clone()));
         }
@@ -892,7 +892,7 @@ mod tests {
         let r = rename_unique(&new);
         if let Process::Action(SapicAction::New(v), _, _) = r {
             assert_eq!(v.var.idx, 1);
-            assert_eq!(&*v.var.name, "x");
+            assert_eq!(v.var.name, "x");
             assert_eq!(v.stype, Some("lol".to_string()));
         } else {
             panic!("expected New action");

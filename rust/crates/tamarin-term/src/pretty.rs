@@ -103,7 +103,7 @@ fn pp_term_lnterm(t: &Term<Lit<Name, LVar>>, out: &mut String) {
             out.push('>');
         }
         Term::App(FunSym::NoEq(sym), ts) => {
-            out.push_str(&String::from_utf8_lossy(&sym.name));
+            out.push_str(&String::from_utf8_lossy(sym.name));
             if !ts.is_empty() {
                 out.push('(');
                 for (i, c) in ts.iter().enumerate() {
@@ -167,9 +167,9 @@ pub fn pp_lvar(v: &LVar, out: &mut String) {
     if v.name.is_empty() {
         out.push_str(&v.idx.to_string());
     } else if v.idx == 0 {
-        out.push_str(&v.name);
+        out.push_str(v.name);
     } else {
-        out.push_str(&v.name);
+        out.push_str(v.name);
         out.push('.');
         out.push_str(&v.idx.to_string());
     }

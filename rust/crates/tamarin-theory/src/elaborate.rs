@@ -1555,7 +1555,7 @@ pub fn arity1_noeq_names(sig: &tamarin_term::maude_sig::MaudeSig)
     sig.no_eq_fun_syms()
         .iter()
         .filter(|s| s.arity == 1)
-        .map(|s| String::from_utf8_lossy(&s.name).to_string())
+        .map(|s| String::from_utf8_lossy(s.name).to_string())
         .collect()
 }
 
@@ -2082,7 +2082,7 @@ mod tests {
         let t = elaborate(&p).unwrap();
         // hashing adds h/1, signing adds sign/2 etc.
         let funs: Vec<String> = t.signature.maude_sig.st_fun_syms.iter()
-            .map(|s| String::from_utf8_lossy(&s.name).to_string())
+            .map(|s| String::from_utf8_lossy(s.name).to_string())
             .collect();
         assert!(funs.iter().any(|n| n == "h"), "expected h: {:?}", funs);
         assert!(funs.iter().any(|n| n == "sign"), "expected sign: {:?}", funs);

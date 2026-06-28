@@ -937,7 +937,7 @@ mod tests {
         let info: RuleInfo<ProtoRuleACInstInfo,
             tamarin_theory::rule::IntrRuleACInfo> =
             RuleInfo::Proto(ProtoRuleACInstInfo {
-                name: ProtoRuleName::Stand("Setup".into()),
+                name: ProtoRuleName::Stand("Setup"),
                 attributes: RuleAttributes::empty(),
                 loop_breakers: Vec::new(),
             });
@@ -969,7 +969,7 @@ mod tests {
         let info: RuleInfo<ProtoRuleACInstInfo,
             tamarin_theory::rule::IntrRuleACInfo> =
             RuleInfo::Proto(ProtoRuleACInstInfo {
-                name: ProtoRuleName::Stand("Setup".into()),
+                name: ProtoRuleName::Stand("Setup"),
                 attributes: RuleAttributes::empty(),
                 loop_breakers: Vec::new(),
             });
@@ -1281,7 +1281,7 @@ mod tests {
         let attrs = RuleAttributes { color: Some(rgb), ..Default::default() };
         let ru = Rule::new(
             RuleInfo::Proto(ProtoRuleACInstInfo {
-                name: ProtoRuleName::Stand("Coloured".into()),
+                name: ProtoRuleName::Stand("Coloured"),
                 attributes: attrs,
                 loop_breakers: Vec::new(),
             }),

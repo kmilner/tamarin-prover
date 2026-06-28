@@ -3384,12 +3384,8 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
             // removeSame on flattenedACTerms; empty big -> False, empty
             // small -> True, otherwise inconclusive (None).  The rebuilt
             // `Ok` terms are unused here.
-            return match crate::constraint::solver::reduction::process_ac_subterm(
-                AcSym::NatPlus, s, t)
-            {
-                Err(res) => Some(res),
-                Ok(_) => None,
-            };
+            return crate::constraint::solver::reduction::process_ac_subterm(
+                AcSym::NatPlus, s, t).err();
         }
         if elem_not_below_reducible(&reducible, t, s) { return Some(false); }
         if elem_not_below_reducible(&reducible, s, t) { return Some(true); }
@@ -5169,7 +5165,7 @@ mod tests {
             crate::fact::FactTag::Ku, vec![k_term.clone()]);
         let mk_rule = || {
             let info = crate::rule::RuleInfo::Proto(crate::rule::ProtoRuleACInstInfo {
-                name: crate::rule::ProtoRuleName::Stand("R".into()),
+                name: crate::rule::ProtoRuleName::Stand("R"),
                 attributes: crate::rule::RuleAttributes::empty(),
                 loop_breakers: Vec::new(),
             });
@@ -5266,7 +5262,7 @@ mod tests {
         let mut ctx = ProofContext::new(h, Vec::new());
         // Wire S as injective with one Constant behaviour position.
         let s_tag = crate::fact::FactTag::Proto(
-            crate::fact::Multiplicity::Linear, "S".into(), 2);
+            crate::fact::Multiplicity::Linear, "S", 2);
         ctx.injective_fact_insts = vec![
             (s_tag.clone(),
              vec![vec![crate::tools::injective_fact_instances::MonotonicBehaviour::Constant]]),
@@ -5291,7 +5287,7 @@ mod tests {
             s_tag.clone(), vec![id_t.clone(), k2_t.clone()]);
 
         let info = || crate::rule::RuleInfo::Proto(crate::rule::ProtoRuleACInstInfo {
-            name: crate::rule::ProtoRuleName::Stand("R".into()),
+            name: crate::rule::ProtoRuleName::Stand("R"),
             attributes: crate::rule::RuleAttributes::empty(),
             loop_breakers: Vec::new(),
         });
@@ -5333,7 +5329,7 @@ mod tests {
         let mut ctx = ProofContext::new(h, Vec::new());
         use crate::tools::injective_fact_instances::MonotonicBehaviour::{Constant, Unstable};
         let s_tag = crate::fact::FactTag::Proto(
-            crate::fact::Multiplicity::Linear, "S".into(), 2);
+            crate::fact::Multiplicity::Linear, "S", 2);
         ctx.injective_fact_insts = vec![
             (s_tag.clone(), vec![vec![Unstable, Constant]]),
         ];
@@ -5359,7 +5355,7 @@ mod tests {
             s_tag.clone(), vec![id_t.clone(), pair(a2.clone(), k2.clone())]);
 
         let info = || crate::rule::RuleInfo::Proto(crate::rule::ProtoRuleACInstInfo {
-            name: crate::rule::ProtoRuleName::Stand("R".into()),
+            name: crate::rule::ProtoRuleName::Stand("R"),
             attributes: crate::rule::RuleAttributes::empty(),
             loop_breakers: Vec::new(),
         });
@@ -5403,7 +5399,7 @@ mod tests {
                 vec![tamarin_term::term::Term::Lit(tamarin_term::vterm::Lit::Var(v))])
         };
         let info = || crate::rule::RuleInfo::Proto(crate::rule::ProtoRuleACInstInfo {
-            name: crate::rule::ProtoRuleName::Stand("R".into()),
+            name: crate::rule::ProtoRuleName::Stand("R"),
             attributes: crate::rule::RuleAttributes::empty(),
             loop_breakers: Vec::new(),
         });

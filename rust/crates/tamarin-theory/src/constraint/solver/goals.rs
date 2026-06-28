@@ -727,7 +727,7 @@ fn rank_by_blocks(
     }
 
     let mut out = Vec::new();
-    for (block, group) in blocks.iter().zip(buckets.into_iter()) {
+    for (block, group) in blocks.iter().zip(buckets) {
         if group.is_empty() {
             continue;
         }
@@ -1464,7 +1464,7 @@ fn is_msg_one_case_goal(
     if !matches!(fa.tag, FactTag::Ku) { return false; }
     let Some(t) = fa.terms.first() else { return false };
     if let Term::App(FunSym::NoEq(s), _) = t {
-        return one_case_syms.contains(&*s.name);
+        return one_case_syms.contains(s.name);
     }
     false
 }
@@ -2183,8 +2183,8 @@ fn has_top_pair_inv_prod(t: &tamarin_term::lterm::LNTerm) -> bool {
     use tamarin_term::term::Term;
     match t {
         Term::App(FunSym::NoEq(s), args) => {
-            &*s.name == b"pair" && args.len() == 2
-                || &*s.name == INV_SYM_STRING && args.len() == 1
+            s.name == b"pair" && args.len() == 2
+                || s.name == INV_SYM_STRING && args.len() == 1
         }
         Term::App(FunSym::Ac(AcSym::Mult), _) => true,  // product
         Term::App(FunSym::Ac(AcSym::Union), _) => true, // multiset union
@@ -2659,7 +2659,7 @@ fn fact_term_head(
             format!("{}{}", sort_prefix(v.sort), v.name),
         Some(Term::Lit(Lit::Con(_))) => "<const>".to_string(),
         Some(Term::App(sym, _)) => match sym {
-            FunSym::NoEq(noeq) => String::from_utf8_lossy(&noeq.name).into_owned(),
+            FunSym::NoEq(noeq) => String::from_utf8_lossy(noeq.name).into_owned(),
             FunSym::Ac(op) => format!("{:?}", op),
             FunSym::C(op) => format!("{:?}", op),
             FunSym::List => "List".to_string(),
@@ -2766,7 +2766,7 @@ mod tests {
         let v: LVar = LVar::new("k", LSort::Msg, 0);
         let n: NodeId = LVar::new("i", LSort::Node, 0);
         let f: LNFact = LNFact::new(
-            FactTag::Proto(Multiplicity::Linear, "F".into(), 0), vec![]);
+            FactTag::Proto(Multiplicity::Linear, "F", 0), vec![]);
 
         let action: Goal = Goal::Action(v.clone(), f.clone());
         let chain: Goal = Goal::Chain(
@@ -2843,7 +2843,7 @@ mod tests {
         let v: LVar = LVar::new("k", LSort::Msg, 0);
         let n: NodeId = LVar::new("i", LSort::Node, 0);
         let f: LNFact = LNFact::new(
-            FactTag::Proto(Multiplicity::Linear, "F".into(), 0), vec![]);
+            FactTag::Proto(Multiplicity::Linear, "F", 0), vec![]);
 
         // Build one of each variant in Haskell's declaration order.
         let variants = [
@@ -3076,7 +3076,7 @@ mod tests {
         // must dominate the nr tiebreak.
         let lb = mk(5, Usefulness::LoopBreaker);
         let pc = mk(1, Usefulness::ProbablyConstructible);
-        let mut ags = vec![pc.clone(), lb.clone()];
+        let mut ags = [pc.clone(), lb.clone()];
         ags.sort_by(|a, b| {
             a.usefulness.cmp(&b.usefulness).then_with(|| a.seq.cmp(&b.seq))
         });

@@ -265,13 +265,13 @@ fn eligible_term(t: &LNTerm) -> bool {
 
 fn is_pair(t: &LNTerm) -> bool {
     if let Term::App(FunSym::NoEq(sym), args) = t {
-        &*sym.name == b"pair" && args.len() == 2
+        sym.name == b"pair" && args.len() == 2
     } else { false }
 }
 
 fn is_inverse(t: &LNTerm) -> bool {
     if let Term::App(FunSym::NoEq(sym), args) = t {
-        &*sym.name == b"inv" && args.len() == 1
+        sym.name == b"inv" && args.len() == 1
     } else { false }
 }
 
@@ -521,7 +521,7 @@ mod tests {
         // Three rule instances.
         let r1 = Rule::new(
             RuleInfo::Proto(ProtoRuleACInstInfo {
-                name: ProtoRuleName::Stand("Source".into()),
+                name: ProtoRuleName::Stand("Source"),
                 attributes: RuleAttributes::empty(),
                 loop_breakers: Vec::new(),
             }),
@@ -533,7 +533,7 @@ mod tests {
             // A trivial proto-rule with one premise + one conclusion +
             // no actions -- eligible for compression.
             RuleInfo::Proto(ProtoRuleACInstInfo {
-                name: ProtoRuleName::Stand("Transfer".into()),
+                name: ProtoRuleName::Stand("Transfer"),
                 attributes: RuleAttributes::empty(),
                 loop_breakers: Vec::new(),
             }),
@@ -544,7 +544,7 @@ mod tests {
         // Sink with an action — guaranteed not hidden by compress.
         let r3 = Rule::new(
             RuleInfo::Proto(ProtoRuleACInstInfo {
-                name: ProtoRuleName::Stand("Sink".into()),
+                name: ProtoRuleName::Stand("Sink"),
                 attributes: RuleAttributes::empty(),
                 loop_breakers: Vec::new(),
             }),
@@ -582,7 +582,7 @@ mod tests {
         let kvar: LNTerm = Term::Lit(Lit::Var(LVar::new("k", LSort::Fresh, 0)));
         let r1 = Rule::new(
             RuleInfo::Proto(ProtoRuleACInstInfo {
-                name: ProtoRuleName::Stand("WithAction".into()),
+                name: ProtoRuleName::Stand("WithAction"),
                 attributes: RuleAttributes::empty(),
                 loop_breakers: Vec::new(),
             }),
@@ -606,7 +606,7 @@ mod tests {
         // time it's considered.
         let r1 = Rule::new(
             RuleInfo::Proto(ProtoRuleACInstInfo {
-                name: ProtoRuleName::Stand("Source".into()),
+                name: ProtoRuleName::Stand("Source"),
                 attributes: RuleAttributes::empty(),
                 loop_breakers: Vec::new(),
             }),
@@ -622,7 +622,7 @@ mod tests {
         );
         let r3 = Rule::new(
             RuleInfo::Proto(ProtoRuleACInstInfo {
-                name: ProtoRuleName::Stand("Sink".into()),
+                name: ProtoRuleName::Stand("Sink"),
                 attributes: RuleAttributes::empty(),
                 loop_breakers: Vec::new(),
             }),

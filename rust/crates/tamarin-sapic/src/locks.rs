@@ -52,15 +52,11 @@ fn annotate_each_closest_unlock(
         Process::Action(ac, a, body) => match &ac {
             // (Unlock t') | t == t' -> annUnlock here, STOP (closest match).
             //              | otherwise -> recurse into body.
-            SapicAction::Unlock(t_prime) => {
-                if t == t_prime {
+            SapicAction::Unlock(t_prime)
+                if t == t_prime => {
                     let a2 = a.append(ProcessAnnotation::with_unlock(v.clone()));
                     Ok(Process::Action(ac, a2, body))
-                } else {
-                    let body2 = annotate_each_closest_unlock(t, v, *body)?;
-                    Ok(Process::Action(ac, a, Box::new(body2)))
                 }
-            }
             // (Insert t1 t2) | t1 == t -> annUnlock here AND recurse into body.
             //  (otherwise falls through to the generic action case below.)
             SapicAction::Insert(t1, _t2) if t1 == t => {
@@ -107,7 +103,7 @@ fn annotate_locks_go(
         Process::Action(SapicAction::Lock(t), a, body) => {
             // freshLVar "lock" LSortMsg — fast counter, name ignored.
             let v = LVar {
-                name: "lock".into(),
+                name: "lock",
                 sort: LSort::Msg,
                 idx: fresh.fresh_ident(),
             };
@@ -176,7 +172,7 @@ mod tests {
         // The lock annotation carries `lock` with idx 0.
         if let Process::Action(SapicAction::Lock(_), a, body) = out {
             let lv = a.lock.expect("lock annotated");
-            assert_eq!(&*lv.0.name, "lock");
+            assert_eq!(lv.0.name, "lock");
             assert_eq!(lv.0.idx, 0);
             assert_eq!(lv.0.sort, LSort::Msg);
             // ...and the matching unlock carries the SAME lock variable as unlock.

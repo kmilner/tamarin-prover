@@ -637,7 +637,7 @@ pub fn simplify_guarded_with(
             gconj(simplified)
         }
         Guarded::GGuarded { qua: Quant::All, vars, guards, body } if vars.is_empty() => {
-            let evals: Vec<Option<bool>> = guards.iter().map(|a| eval(a)).collect();
+            let evals: Vec<Option<bool>> = guards.iter().map(eval).collect();
             // Any False guard → universal vacuously holds.
             if evals.iter().any(|v| v == &Some(false)) {
                 return gtrue();
@@ -1926,7 +1926,7 @@ fn subst_gterm_slice(args: &std::sync::Arc<[GTerm]>, s: &VarSubst)
 pub fn max_var_idx(g: &Guarded) -> u64 {
     fn rec_term(t: &GTerm, m: &mut u64) {
         match t {
-            GTerm::Var(BVar::Free(v)) => { if v.idx > *m { *m = v.idx; } }
+            GTerm::Var(BVar::Free(v)) if v.idx > *m => { *m = v.idx; }
             GTerm::Var(BVar::Bound(_)) => {}
             GTerm::App(_, args) | GTerm::Pair(args) => {
                 for a in args.iter() { rec_term(a, m); }

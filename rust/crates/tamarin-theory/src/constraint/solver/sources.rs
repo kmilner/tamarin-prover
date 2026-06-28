@@ -672,7 +672,7 @@ pub fn precompute_full_sources(
             // Union are AC, not NoEq, so they're naturally excluded.)
             // Previously also excluded fst/snd/1 — but HS includes
             // those, so dropping the exclusion to match.
-            let name = String::from_utf8_lossy(&noeq.name);
+            let name = String::from_utf8_lossy(noeq.name);
             if matches!(name.as_ref(), "pair" | "inv") { continue; }
             // HS arity gate: `k > 0 || priv == Private` —
             // include arity-≥1 symbols (regardless of priv/cons)
@@ -796,7 +796,7 @@ fn ku_source_label_for_fa(
             LSort::Msg => "KU:msg".to_string(),
         }),
         Term::App(tamarin_term::function_symbols::FunSym::NoEq(s), _) =>
-            Some(format!("KU:{}", String::from_utf8_lossy(&s.name))),
+            Some(format!("KU:{}", String::from_utf8_lossy(s.name))),
         Term::App(tamarin_term::function_symbols::FunSym::Ac(_), _) =>
             Some("KU:ac".to_string()),
         Term::App(tamarin_term::function_symbols::FunSym::C(_), _) =>
@@ -2417,7 +2417,8 @@ pub fn solve_with_source_cases_action_with_ctx(
                 return false;
             }
             let pat = &gfa.terms[0];
-            let result = match (pat, m_live) {
+            
+            match (pat, m_live) {
                 (Term::Lit(Lit::Var(pv)), _) => {
                     let live_sort = sort_of_lnterm(m_live);
                     sort_ge(pv.sort, live_sort)
@@ -2433,8 +2434,7 @@ pub fn solve_with_source_cases_action_with_ctx(
                 // `x.3 → sign(t.1, t.2)`).
                 (Term::App(_, _), Term::Lit(Lit::Var(_))) => true,
                 _ => false,
-            };
-            result
+            }
         }
         _ => false,
     })?;
@@ -4624,7 +4624,7 @@ fn var_occurrences_nodes(
     fn funsym_occ_ctx(sym: &tamarin_term::function_symbols::FunSym) -> String {
         use tamarin_term::function_symbols::{FunSym, AcSym, CSym};
         match sym {
-            FunSym::NoEq(s) => String::from_utf8_lossy(&s.name).into_owned(),
+            FunSym::NoEq(s) => String::from_utf8_lossy(s.name).into_owned(),
             FunSym::Ac(ac) => match ac {
                 AcSym::Union => "AC Union".to_string(),
                 AcSym::Mult => "AC Mult".to_string(),
@@ -4980,7 +4980,7 @@ fn compute_rename_map(
                   fresh: &mut tamarin_utils::fresh::FastFreshState| {
         if rename.contains_key(v) { return; }
         let new_idx = fresh.fresh_ident();
-        let new_v = LVar { name: "".into(), sort: v.sort, idx: new_idx };
+        let new_v = LVar { name: "", sort: v.sort, idx: new_idx };
         rename.insert(v.clone(), new_v);
     };
     // Step 3: orderedVars sys — varOccurences from nodes ONLY,
@@ -5422,7 +5422,7 @@ fn compute_compare_systems_key(
                                     n: &mut u64| {
                     if !m.contains_key(v) {
                         m.insert(v.clone(), tamarin_term::lterm::LVar {
-                            name: "".into(), sort: v.sort, idx: *n,
+                            name: "", sort: v.sort, idx: *n,
                         });
                         *n += 1;
                     }
@@ -5880,7 +5880,7 @@ mod tests {
     #[test]
     fn precompute_sources_picks_single_producer() {
         use crate::fact::{FactTag, Multiplicity};
-        let tag = FactTag::Proto(Multiplicity::Linear, "Foo".into(), 0);
+        let tag = FactTag::Proto(Multiplicity::Linear, "Foo", 0);
         let rules = vec![make_rule("MakeFoo", tag.clone())];
         let ctx = match ctx_with_rules(rules) { Some(c) => c, None => return };
         // Foo is produced by exactly one rule → unique-source entry.
@@ -5894,7 +5894,7 @@ mod tests {
     #[test]
     fn precompute_sources_drops_multi_producer() {
         use crate::fact::{FactTag, Multiplicity};
-        let tag = FactTag::Proto(Multiplicity::Linear, "Bar".into(), 0);
+        let tag = FactTag::Proto(Multiplicity::Linear, "Bar", 0);
         let rules = vec![
             make_rule("MakeBarA", tag.clone()),
             make_rule("MakeBarB", tag.clone()),
@@ -5926,7 +5926,7 @@ mod tests {
         let h = tamarin_term::maude_proc::MaudeHandle::start(
             &path, tamarin_term::maude_sig::pair_maude_sig()).unwrap();
 
-        let a_tag = FactTag::Proto(Multiplicity::Linear, "A".into(), 1);
+        let a_tag = FactTag::Proto(Multiplicity::Linear, "A", 1);
         let a_fact = Fact::new(a_tag.clone(), vec![msg_var("x", 0)]);
         let init: ProtoRuleE = Rule::new(
             ProtoRuleEInfo::standard("Init"),
@@ -5983,7 +5983,7 @@ mod tests {
 
         // Minimal protocol so there's at least one proto rule (so
         // `precompute_full_sources` actually runs).
-        let a_tag = FactTag::Proto(Multiplicity::Linear, "A".into(), 1);
+        let a_tag = FactTag::Proto(Multiplicity::Linear, "A", 1);
         let a_fact = Fact::new(a_tag.clone(), vec![msg_var("x", 0)]);
         let init: ProtoRuleE = Rule::new(
             ProtoRuleEInfo::standard("Init"),
@@ -6011,8 +6011,8 @@ mod tests {
     #[test]
     fn precompute_sources_handles_multiple_unique_tags() {
         use crate::fact::{FactTag, Multiplicity};
-        let tag_a = FactTag::Proto(Multiplicity::Linear, "A".into(), 0);
-        let tag_b = FactTag::Proto(Multiplicity::Linear, "B".into(), 0);
+        let tag_a = FactTag::Proto(Multiplicity::Linear, "A", 0);
+        let tag_b = FactTag::Proto(Multiplicity::Linear, "B", 0);
         let rules = vec![
             make_rule("MakeA", tag_a.clone()),
             make_rule("MakeB", tag_b.clone()),

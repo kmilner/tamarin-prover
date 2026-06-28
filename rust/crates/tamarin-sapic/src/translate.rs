@@ -676,6 +676,6 @@ mod tests {
         assert_eq!(tr.rules.len(), 5);
         assert_eq!(tr.restrictions.len(), 1);
         // First rule is "Init".
-        assert_eq!(tr.rules[0].0.info.name, tamarin_theory::rule::ProtoRuleName::Stand("Init".into()));
+        assert_eq!(tr.rules[0].0.info.name, tamarin_theory::rule::ProtoRuleName::Stand("Init"));
     }
 }

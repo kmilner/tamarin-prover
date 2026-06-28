@@ -793,7 +793,7 @@ fn rule_renames_under_precise(rule: &ProtoRuleE) -> bool {
     let mut map: HashMap<LVar, LVar> = HashMap::new();
     for v in &vars {
         if map.contains_key(v) { continue; }
-        let idx = state.fresh_ident(&v.name);
+        let idx = state.fresh_ident(v.name);
         if idx != v.idx { return true; }
         map.insert(v.clone(), LVar { name: v.name, sort: v.sort, idx });
     }
@@ -812,7 +812,7 @@ fn rename_precise_rule_with_variants(
     let mut map: HashMap<LVar, LVar> = HashMap::new();
     let import = |v: &LVar, st: &mut PreciseFreshState, m: &mut HashMap<LVar, LVar>| {
         if m.contains_key(v) { return; }
-        let idx = st.fresh_ident(&v.name);
+        let idx = st.fresh_ident(v.name);
         let new_v = LVar { name: v.name, sort: v.sort, idx };
         m.insert(v.clone(), new_v);
     };
@@ -1071,7 +1071,7 @@ mod tests {
         let prem = Fact::new(FactTag::Fresh, vec![kt.clone()]);
         let conc = Fact::new(FactTag::Out, vec![kt.clone()]);
         let info = ProtoRuleEInfo {
-            name: ProtoRuleName::Stand("R".into()),
+            name: ProtoRuleName::Stand("R"),
             attributes: RuleAttributes::empty(),
             restrictions: Vec::new(),
         };

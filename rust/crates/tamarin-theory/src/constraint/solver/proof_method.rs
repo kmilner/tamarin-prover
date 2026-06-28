@@ -677,7 +677,7 @@ mod tests {
         };
         let info: RuleInfo<ProtoRuleACInstInfo, IntrRuleACInfo> =
             RuleInfo::Proto(ProtoRuleACInstInfo {
-                name: ProtoRuleName::Stand("Test".into()),
+                name: ProtoRuleName::Stand("Test"),
                 attributes: RuleAttributes::empty(),
                 loop_breakers: Vec::new(),
             });

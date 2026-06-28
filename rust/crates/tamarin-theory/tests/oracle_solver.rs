@@ -1709,7 +1709,7 @@ fn ex_decomposition_produces_action_goal_via_induction() {
     assert!(non_empty.goals.iter().any(|(g, _)|
         matches!(g, tamarin_theory::constraint::constraints::Goal::Action(_, fact)
             if fact.tag == tamarin_theory::fact::FactTag::Proto(
-                tamarin_theory::fact::Multiplicity::Linear, "Setup".into(), 1))),
+                tamarin_theory::fact::Multiplicity::Linear, "Setup", 1))),
         "expected a Setup-action goal in the step case after Ex decomposition");
 }
 
@@ -1969,7 +1969,7 @@ fn proof_search_end_to_end_tiny_theory() {
     };
     let info: RuleInfo<ProtoRuleACInstInfo, IntrRuleACInfo> =
         RuleInfo::Proto(ProtoRuleACInstInfo {
-            name: ProtoRuleName::Stand("Setup".into()),
+            name: ProtoRuleName::Stand("Setup"),
             attributes: RuleAttributes::empty(),
             loop_breakers: Vec::new(),
         });

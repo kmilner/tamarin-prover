@@ -521,8 +521,7 @@ mod tests {
     #[test]
     fn add_fun_sym_resets_eq_convergent() {
         use crate::function_symbols::{Constructability, NoEqSym, Privacy};
-        let mut sig = MaudeSig::default();
-        sig.eq_convergent = true;
+        let sig = MaudeSig { eq_convergent: true, ..MaudeSig::default() };
         let g = NoEqSym::new(
             b"g".to_vec(), 1, Privacy::Public, Constructability::Constructor);
         let sig = sig.add_fun_sym(g);
@@ -533,8 +532,7 @@ mod tests {
     #[test]
     fn add_macro_sym_resets_eq_convergent() {
         use crate::function_symbols::{Constructability, NoEqSym, Privacy};
-        let mut sig = MaudeSig::default();
-        sig.eq_convergent = true;
+        let sig = MaudeSig { eq_convergent: true, ..MaudeSig::default() };
         let m = NoEqSym::new(
             b"m".to_vec(), 1, Privacy::Private, Constructability::Destructor);
         let sig = sig.add_macro_sym(m);
@@ -549,8 +547,7 @@ mod tests {
     /// corpus ordering.
     #[test]
     fn add_ctxt_st_rule_preserves_eq_convergent() {
-        let mut sig = MaudeSig::default();
-        sig.eq_convergent = true;
+        let sig = MaudeSig { eq_convergent: true, ..MaudeSig::default() };
         let sig = sig.add_ctxt_st_rule(fst_dest_rule());
         assert!(sig.eq_convergent,
             "add_ctxt_st_rule must NOT reset eq_convergent");

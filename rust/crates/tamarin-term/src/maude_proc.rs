@@ -738,10 +738,10 @@ impl MaudeHandle {
                     use crate::lterm::HasFrees;
                     for eq in eqs {
                         eq.lhs.for_each_free(&mut |v| {
-                            if &*v.name == "x" { self.ensure_above(v.idx); }
+                            if v.name == "x" { self.ensure_above(v.idx); }
                         });
                         eq.rhs.for_each_free(&mut |v| {
-                            if &*v.name == "x" { self.ensure_above(v.idx); }
+                            if v.name == "x" { self.ensure_above(v.idx); }
                         });
                     }
                 }
@@ -867,7 +867,7 @@ impl MaudeHandle {
             self.ensure_above(input_max);
             for lit in ctx.bindings().values() {
                 if let crate::vterm::Lit::Var(lv) = lit {
-                    if &*lv.name == "x" {
+                    if lv.name == "x" {
                         self.ensure_above(lv.idx);
                     }
                 }
@@ -1154,11 +1154,10 @@ impl MaudeHandle {
             out: &mut std::collections::BTreeSet<LVar>,
         ) {
             match t {
-                crate::term::Term::Lit(Lit::Var(lv)) => {
-                    if !pattern_vars.contains(&(lv.name.to_string(), lv.idx)) {
+                crate::term::Term::Lit(Lit::Var(lv))
+                    if !pattern_vars.contains(&(lv.name.to_string(), lv.idx)) => {
                         out.insert(lv.clone());
                     }
-                }
                 crate::term::Term::App(_, args) => {
                     for a in args.iter() { collect_subject_vars(a, pattern_vars, out); }
                 }
@@ -1350,11 +1349,10 @@ impl MaudeHandle {
         ) {
             use crate::vterm::Lit;
             match t {
-                crate::term::Term::Lit(Lit::Var(lv)) => {
-                    if !pattern_vars.contains(&(lv.name.to_string(), lv.idx)) {
+                crate::term::Term::Lit(Lit::Var(lv))
+                    if !pattern_vars.contains(&(lv.name.to_string(), lv.idx)) => {
                         out.insert(lv.clone());
                     }
-                }
                 crate::term::Term::App(_, args) => {
                     for a in args.iter() { collect_free_non_pattern(a, pattern_vars, out); }
                 }
@@ -1649,7 +1647,7 @@ fn msubst_to_lnsubst_force_x(
         let mut n: u64 = 1;
         for lit in ctx.bindings().values() {
             if let crate::vterm::Lit::Var(lv) = lit {
-                if &*lv.name == "x" && lv.idx >= n {
+                if lv.name == "x" && lv.idx >= n {
                     n = lv.idx + 1;
                 }
             }
@@ -1691,7 +1689,7 @@ fn msubst_to_lnsubst_with_maude(
         h.ensure_above(avoid_max);
         for lit in ctx.bindings().values() {
             if let crate::vterm::Lit::Var(lv) = lit {
-                if &*lv.name == "x" {
+                if lv.name == "x" {
                     h.ensure_above(lv.idx);
                 }
             }
@@ -1701,7 +1699,7 @@ fn msubst_to_lnsubst_with_maude(
         let mut n = avoid_max.saturating_add(1);
         for lit in ctx.bindings().values() {
             if let crate::vterm::Lit::Var(lv) = lit {
-                if &*lv.name == "x" && lv.idx >= n {
+                if lv.name == "x" && lv.idx >= n {
                     n = lv.idx + 1;
                 }
             }

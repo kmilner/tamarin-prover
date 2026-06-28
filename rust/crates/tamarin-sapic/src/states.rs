@@ -111,7 +111,7 @@ fn add_states_channels(p: AnnotatedProc) -> AnnotatedProc {
     // is `max { idx+1 | (StateChannel, idx) ∈ varsProc p }` (0 if none).
     let init_state_chan = vars_proc(&p)
         .into_iter()
-        .filter(|v| &*v.name == STATE_CHANNEL_NAME)
+        .filter(|v| v.name == STATE_CHANNEL_NAME)
         .map(|v| v.idx + 1)
         .max()
         .unwrap_or(0);
@@ -225,7 +225,7 @@ fn new_states(
     for v in declarables {
         // `newvar <- freshLVar stateChannelName LSortMsg` — fast counter.
         let newvar = LVar {
-            name: STATE_CHANNEL_NAME.into(),
+            name: STATE_CHANNEL_NAME,
             sort: LSort::Msg,
             idx: fresh.fresh_ident(),
         };
@@ -554,7 +554,7 @@ mod tests {
         let Process::Action(SapicAction::New(chan_var), chan_an, body) = *body else {
             panic!("expected inserted `new StateChannel:channel`")
         };
-        assert_eq!(&*chan_var.var.name, "StateChannel");
+        assert_eq!(chan_var.var.name, "StateChannel");
         assert_eq!(chan_var.stype, Some("channel".to_string()));
         assert_eq!(chan_an.is_state_channel.as_ref(), Some(&s));
         assert!(chan_an.pure_state, "the StateChannel new is marked pure");

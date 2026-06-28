@@ -66,6 +66,7 @@ pub type Abbreviations = BTreeMap<LNTerm, (LNTerm, LNTerm)>;
 ///
 /// Retained for HS API parity (the live caller in `dot.rs` does the lookup
 /// inline); no cross-crate caller yet.
+#[allow(dead_code)] // HS API parity; exercised by tests, no production caller (dot.rs inlines the lookup)
 pub(crate) fn lookup_abbreviation<'a>(
     abbrevs: &'a Abbreviations,
     t: &LNTerm,
@@ -128,7 +129,7 @@ fn get_term_prefix(opts: &AbbreviationOptions, t: &LNTerm) -> String {
         Term::Lit(Lit::Var(v)) => v.name.to_string(),
         Term::Lit(Lit::Con(n)) => n.id.0.to_string(),
         Term::App(FunSym::NoEq(sym), _) => {
-            String::from_utf8_lossy(&sym.name).into_owned()
+            String::from_utf8_lossy(sym.name).into_owned()
         }
         Term::App(FunSym::C(CSym::EMap), _) => "EMP".to_string(),
         Term::App(FunSym::List, _) => "LST".to_string(),

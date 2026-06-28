@@ -1351,7 +1351,7 @@ mod tests {
     fn match_action_goal_by_name_arity() {
         use crate::fact::{Fact, FactTag, Multiplicity};
         let i = LVar::new("t", LSort::Node, 0);
-        let tag = FactTag::Proto(Multiplicity::Linear, "Setup".into(), 0);
+        let tag = FactTag::Proto(Multiplicity::Linear, "Setup", 0);
         let fact = Fact::new(tag, Vec::new());
         let goal = Goal::Action(i.clone(), fact);
         let mut sys = System::empty();
@@ -1375,7 +1375,7 @@ mod tests {
     fn no_match_returns_none() {
         use crate::fact::{Fact, FactTag, Multiplicity};
         let i = LVar::new("t", LSort::Node, 0);
-        let tag = FactTag::Proto(Multiplicity::Linear, "Setup".into(), 0);
+        let tag = FactTag::Proto(Multiplicity::Linear, "Setup", 0);
         let fact = Fact::new(tag, Vec::new());
         let goal = Goal::Action(i, fact);
         let mut sys = System::empty();
@@ -1410,7 +1410,7 @@ mod tests {
         use crate::fact::{Fact, FactTag, Multiplicity};
         let i1 = LVar::new("t1", LSort::Node, 5);
         let i2 = LVar::new("t2", LSort::Node, 7);
-        let tag = FactTag::Proto(Multiplicity::Linear, "Step".into(), 1);
+        let tag = FactTag::Proto(Multiplicity::Linear, "Step", 1);
         // Two goals with the same fact tag/arity but different
         // timepoints.
         let g1 = Goal::Action(i1.clone(),
@@ -1438,7 +1438,7 @@ mod tests {
         };
         let matched = match_goal(&spec, &sys).expect("should match");
         match matched {
-            Goal::Action(i, _) => assert_eq!(&*i.name, "t2",
+            Goal::Action(i, _) => assert_eq!(i.name, "t2",
                 "matcher must pick the goal whose timepoint LVar.name == time_var"),
             other => panic!("expected Action, got {:?}", other),
         }
@@ -1458,7 +1458,7 @@ mod tests {
         };
         let matched2 = match_goal(&spec2, &sys).expect("should match");
         match matched2 {
-            Goal::Action(i, _) => assert_eq!(&*i.name, "t1"),
+            Goal::Action(i, _) => assert_eq!(i.name, "t1"),
             other => panic!("expected Action, got {:?}", other),
         }
         // A drifted idx (stored `#t2.9`, runtime `#t2.7`) is an `M.member`
@@ -1488,7 +1488,7 @@ mod tests {
         use crate::rule::PremIdx;
         let n1 = LVar::new("u", LSort::Node, 0);
         let n2 = LVar::new("v", LSort::Node, 0);
-        let tag = FactTag::Proto(Multiplicity::Linear, "Inp".into(), 0);
+        let tag = FactTag::Proto(Multiplicity::Linear, "Inp", 0);
         let g1 = Goal::Premise((n1, PremIdx(0)), Fact::new(tag.clone(), Vec::new()));
         let g2 = Goal::Premise((n2, PremIdx(0)), Fact::new(tag, Vec::new()));
         let mut sys = System::empty();
@@ -1505,7 +1505,7 @@ mod tests {
         };
         let matched = match_goal(&spec, &sys).expect("should match");
         match matched {
-            Goal::Premise((node, _), _) => assert_eq!(&*node.name, "v"),
+            Goal::Premise((node, _), _) => assert_eq!(node.name, "v"),
             other => panic!("expected Premise, got {:?}", other),
         }
     }

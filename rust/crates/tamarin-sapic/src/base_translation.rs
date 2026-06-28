@@ -884,7 +884,7 @@ pub(crate) fn ln_term_to_parser(t: &LNTerm) -> tamarin_parser::ast::Term {
             NameTag::Node => p::Term::PubLit(n.id.0.to_string()),
         },
         VTerm::App(FunSym::NoEq(sym), args) => {
-            let name = String::from_utf8_lossy(&sym.name).to_string();
+            let name = String::from_utf8_lossy(sym.name).to_string();
             if name == "pair" && args.len() == 2 {
                 let mut flat = Vec::new();
                 collect_pair(t, &mut flat);
@@ -919,7 +919,7 @@ fn collect_pair(t: &LNTerm, out: &mut Vec<tamarin_parser::ast::Term>) {
     use tamarin_term::function_symbols::FunSym;
     use tamarin_term::vterm::VTerm;
     if let VTerm::App(FunSym::NoEq(sym), args) = t {
-        if &*sym.name == b"pair" && args.len() == 2 {
+        if sym.name == b"pair" && args.len() == 2 {
             collect_pair(&args[0], out);
             collect_pair(&args[1], out);
             return;
@@ -948,11 +948,10 @@ fn formula_free_lvars(f: &tamarin_parser::ast::Formula) -> BTreeSet<LVar> {
     }
     fn collect_term(t: &p::Term, bound: &[String], out: &mut BTreeSet<LVar>) {
         match t {
-            p::Term::Var(v) => {
-                if !bound.iter().any(|n| n == &v.name) {
+            p::Term::Var(v)
+                if !bound.iter().any(|n| n == &v.name) => {
                     out.insert(LVar::new(v.name.clone(), sort_of(&v.sort), v.idx));
                 }
-            }
             p::Term::App(_, args) | p::Term::Pair(args) => {
                 for a in args {
                     collect_term(a, bound, out);
@@ -1018,7 +1017,7 @@ fn formula_free_lvars(f: &tamarin_parser::ast::Formula) -> BTreeSet<LVar> {
 fn eq_fact(t1: &SapicTerm, t2: &SapicTerm) -> tamarin_theory::fact::LNFact {
     use tamarin_theory::fact::{Fact, FactTag, Multiplicity};
     let terms = vec![to_ln_term(t1), to_ln_term(t2)];
-    Fact::new(FactTag::Proto(Multiplicity::Linear, "Eq".into(), 2), terms)
+    Fact::new(FactTag::Proto(Multiplicity::Linear, "Eq", 2), terms)
 }
 
 /// `fromList $ getFactVariables fa` — the set of variables occurring in a fact.

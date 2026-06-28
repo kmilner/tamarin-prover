@@ -191,7 +191,7 @@ pub fn destruction_rules(
                     let funs = {
                         let mut f = name_acc.clone();
                         f.extend_from_slice(b"_");
-                        f.extend_from_slice(&sym.name);
+                        f.extend_from_slice(sym.name);
                         f
                     };
                     name.extend_from_slice(&funs);
@@ -216,7 +216,7 @@ pub fn destruction_rules(
                 }
                 // Update accumulators and walk down.
                 name_acc.extend_from_slice(b"_");
-                name_acc.extend_from_slice(&sym.name);
+                name_acc.extend_from_slice(sym.name);
                 posname = next_posname;
                 t = t_new;
             }
@@ -641,7 +641,7 @@ pub fn construction_rules(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<IntrRu
         let act = ku_fact(m);
         // Encode the constructor name in the IntrRuleACInfo.
         let mut name = b"_".to_vec();
-        name.extend_from_slice(&s.name);
+        name.extend_from_slice(s.name);
         let info = IntrRuleACInfo::ConstrRule(name);
         out.push(Rule::new(info, prems, vec![conc], vec![act]));
     }
