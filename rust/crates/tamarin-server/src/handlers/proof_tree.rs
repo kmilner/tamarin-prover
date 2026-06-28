@@ -545,15 +545,14 @@ fn render_node(
         // at 8 so the UI doesn't blow up on systems with many open
         // goals.
         let mut shown = 0usize;
-        for (i, (g, st)) in node.sys.goals.iter().enumerate() {
+        // Haskell's `goalNr` is 1-based on UNSOLVED goals; we mirror that
+        // with a running counter incremented per unsolved goal (identical
+        // to a `take(i+1).filter(unsolved).count()` recount, but O(n)).
+        let mut nr = 0usize;
+        for (g, st) in node.sys.goals.iter() {
             if st.solved { continue; }
+            nr += 1;
             if shown >= 8 { break; }
-            // Haskell's `goalNr` is 1-based on UNSOLVED goals; we
-            // mirror that by counting only unsolved entries here.
-            let nr = node.sys.goals.iter()
-                .take(i + 1)
-                .filter(|(_, s)| !s.solved)
-                .count();
             let goal_label = goal_summary(g);
             out.push_str(&action_link(
                 idx, lemma, &url_path,

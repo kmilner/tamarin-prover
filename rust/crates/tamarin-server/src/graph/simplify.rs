@@ -13,7 +13,7 @@ use tamarin_theory::constraint::constraints::{
 use tamarin_theory::constraint::system::System;
 use tamarin_theory::fact::FactTag;
 use tamarin_theory::rule::{
-    is_coerce_rule_info, is_fresh_rule_info, is_irecv_rule_info, is_isend_rule_info,
+    is_coerce_rule_info, is_irecv_rule_info, is_isend_rule_info,
     RuleACInst, RuleInfo,
 };
 use tamarin_term::function_symbols::FunSym;
@@ -158,7 +158,13 @@ fn guarded_mentions_node(v: &NodeId, g: &tamarin_theory::guarded::Guarded) -> bo
         Guarded::Conj(items) | Guarded::Disj(items) => {
             items.iter().any(|x| guarded_mentions_node(v, x))
         }
-        Guarded::GGuarded { body, .. } => guarded_mentions_node(v, body),
+        Guarded::GGuarded { guards, body, .. } => {
+            // HS `foldFrees` over the `Foldable (Guarded s c)` instance folds
+            // BOTH the guard atoms and the body (Guarded.hs:259-263), so a
+            // free node-sort var occurring only in a guard atom must count.
+            guards.iter().any(|a| atom_mentions_node(v, a))
+                || guarded_mentions_node(v, body)
+        }
         Guarded::Atom(at) => atom_mentions_node(v, at),
     }
 }
@@ -321,22 +327,11 @@ fn rule_eligible(ru: &RuleACInst) -> bool {
         }
         RuleInfo::Proto(p) => {
             // isFreshRule treats only the Fresh proto-rule as fresh.
-            if is_fresh_rule_info(&proto_e_info(p)) { return true; }
+            if p.name == tamarin_theory::rule::ProtoRuleName::Fresh { return true; }
             ru.actions.is_empty()
                 && ru.premises.len() <= 1
                 && ru.conclusions.len() <= 1
         }
-    }
-}
-
-// Helper: build a temp ProtoRuleEInfo from a ProtoRuleACInstInfo so we
-// can reuse the existing is_fresh_rule_info predicate.
-fn proto_e_info(p: &tamarin_theory::rule::ProtoRuleACInstInfo)
-    -> tamarin_theory::rule::ProtoRuleEInfo {
-    tamarin_theory::rule::ProtoRuleEInfo {
-        name: p.name.clone(),
-        attributes: p.attributes.clone(),
-        restrictions: Vec::new(),
     }
 }
 

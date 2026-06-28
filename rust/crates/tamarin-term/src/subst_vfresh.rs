@@ -98,7 +98,7 @@ fn rename_term_drop_hint<C: Ord + Clone>(
             let nv = match bindings.get(v) {
                 Some(nv) => nv.clone(),
                 None => {
-                    let nv = LVar { name: "".into(), sort: v.sort, idx: *counter };
+                    let nv = LVar { name: "", sort: v.sort, idx: *counter };
                     *counter += 1;
                     bindings.insert(v.clone(), nv.clone());
                     nv
@@ -336,10 +336,8 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
         &self,
         alloc_idxs: F,
     ) -> crate::subst::Subst<C, LVar> {
-        // Default: no preserve set — every range var is treated as a
-        // witness and gets renamed.  Suitable when the caller knows
-        // there are no live system vars in the range.
-        self.fresh_to_free_avoiding(alloc_idxs, &std::collections::BTreeSet::new())
+        // Every range var is treated as a witness and gets renamed.
+        self.fresh_to_free_avoiding(alloc_idxs)
     }
 
     /// `freshToFreeAvoiding`: convert VFresh → free subst.
@@ -350,13 +348,10 @@ impl<C: Ord + Clone> LSubstVFresh<C> {
     /// the per-binding name-hint rule.  It renames every range var
     /// unconditionally (HS has no "preserve" concept — `evalFreshAvoiding`
     /// only seeds the fresh counter above `t`'s max idx, it never skips a
-    /// variable).  The `preserve` argument is therefore IGNORED; it is kept
-    /// only for signature stability with the callers that build a preserve
-    /// set.
+    /// variable).
     pub fn fresh_to_free_avoiding<F: FnMut(u64) -> u64>(
         &self,
         mut alloc_idxs: F,
-        _preserve: &std::collections::BTreeSet<LVar>,
     ) -> crate::subst::Subst<C, LVar> {
         use crate::subst::Subst;
         // HS has NO preserve concept in ANY freshToFree* variant:
@@ -641,22 +636,19 @@ mod tests {
     }
 
     #[test]
-    fn fresh_to_free_ignores_preserve_set() {
-        use std::collections::BTreeSet;
+    fn fresh_to_free_renames_every_range_var() {
         // HS has no "preserve" concept: every range var is renamed
-        // unconditionally (Substitution.hs:54-72). Even when the range var
-        // is passed in `preserve`, the result must NOT keep its identity.
+        // unconditionally (Substitution.hs:54-72) — the result must NOT
+        // keep its identity.
         let s: LSubstVFresh<C> = SubstVFresh::from_list(vec![
             (lv("x", 0), var_term(lv("y", 5))),
         ]);
-        let mut preserve: BTreeSet<LVar> = BTreeSet::new();
-        preserve.insert(lv("y", 5));
         // Allocator hands out a fixed, clearly-distinct fresh idx.
-        let free = s.fresh_to_free_avoiding(|_| 99, &preserve);
+        let free = s.fresh_to_free_avoiding(|_| 99);
         let img = free.image_of(&lv("x", 0)).expect("x.0 must be mapped");
         match img {
             Term::Lit(Lit::Var(v)) => {
-                // Renamed to the freshly-allocated idx, NOT the preserved y.5.
+                // Renamed to the freshly-allocated idx, NOT the original y.5.
                 assert_eq!(v.idx, 99);
                 assert_ne!(*v, lv("y", 5));
             }

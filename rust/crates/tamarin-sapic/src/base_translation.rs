@@ -63,6 +63,26 @@ pub fn to_ln_fact(f: &tamarin_theory::sapic::SapicLNFact) -> tamarin_theory::fac
 }
 
 /// `toLVar v = slvar v`.
+/// Apply a SAPIC substitution to a SAPIC term. Shared by `inline` and
+/// `let_destructors` (both substitute SAPIC terms identically).
+pub(crate) fn subst_term(
+    subst: &tamarin_term::subst::Subst<tamarin_term::lterm::Name, SapicLVar>,
+    t: &SapicTerm,
+) -> SapicTerm {
+    tamarin_term::subst::apply_vterm(subst, t.clone())
+}
+
+/// Apply a SAPIC substitution to a SAPIC fact (tag + annotations preserved).
+pub(crate) fn subst_fact(
+    subst: &tamarin_term::subst::Subst<tamarin_term::lterm::Name, SapicLVar>,
+    f: &tamarin_theory::sapic::SapicLNFact,
+) -> tamarin_theory::sapic::SapicLNFact {
+    let terms = f.terms.iter().map(|t| subst_term(subst, t)).collect();
+    let mut nf = tamarin_theory::fact::Fact::new(f.tag.clone(), terms);
+    nf = nf.with_annotations(f.annotations.clone());
+    nf
+}
+
 pub fn to_lvar(v: &SapicLVar) -> LVar {
     v.var.clone()
 }

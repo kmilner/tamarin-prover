@@ -57,7 +57,7 @@ fn freshen_witness_range(
     maude: &tamarin_term::maude_proc::MaudeHandle,
 ) -> Vec<(LVar, LNTerm)> {
     use tamarin_term::lterm::HasFrees;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
     let trace = tamarin_utils::env_gate!("TAM_DBG_FRESHEN_WITNESS");
     let domain: BTreeSet<LVar> = raw.iter().map(|(v, _)| v.clone()).collect();
     // Witnesses = range-only vars that are neither a domain key nor an
@@ -1719,27 +1719,6 @@ impl EquationStore {
             // Identity disjunction: nothing to compose; just dropped.
             return true;
         }
-        // Build preserve set:
-        //   1. external_preserve (system's free vars — node terms, etc.)
-        //   2. self.subst.range() (vars referenced by current free subst)
-        //   3. self.subst.dom() (current free subst's keys)
-        //   4. every other disjunct's dom/range (cross-disjunct sharing)
-        let mut preserve: BTreeSet<LVar> = external_preserve.clone();
-        preserve.extend(self.subst.range()
-            .flat_map(tamarin_term::vterm::vars_vterm));
-        preserve.extend(self.subst.dom().cloned());
-        for d in &self.conj {
-            for s in &d.substs {
-                for v in s.dom() {
-                    preserve.insert(v.clone());
-                }
-                for t in s.range() {
-                    for w in tamarin_term::vterm::vars_vterm(t) {
-                        preserve.insert(w);
-                    }
-                }
-            }
-        }
         if tamarin_utils::env_gate!("TAM_DBG_FOLD_VARIANT") {
             let pairs: Vec<String> = subst_vf.to_list().iter()
                 .filter(|(k, _)| k.name.contains("ltkS") || k.name.contains("request"))
@@ -1771,7 +1750,7 @@ impl EquationStore {
                     subst_vf.to_list());
             }
         }
-        let new_subst = subst_vf.fresh_to_free_avoiding(alloc, &preserve);
+        let new_subst = subst_vf.fresh_to_free_avoiding(alloc);
         if tamarin_utils::env_gate!("TAM_DBG_FOLD_VARIANT") {
             let pairs: Vec<String> = new_subst.to_list().iter()
                 .filter(|(k, _)| k.name.contains("ltkS") || k.name.contains("request"))

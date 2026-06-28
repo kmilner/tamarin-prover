@@ -568,7 +568,6 @@ pub fn abstract_rule_and_variants(
                 let mut counter = filter_base;
                 let subst = s_fresh.fresh_to_free_avoiding(
                     |n| { let b = counter; counter += n; b },
-                    &frees,
                 );
                 let premises: Vec<LNTerm> = premise_terms_for_filter.iter()
                     .map(|t| {

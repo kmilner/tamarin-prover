@@ -181,10 +181,13 @@ pub fn destruction_rules(
                 // Emit the rule unless the next step's term equals rhs
                 // and rhs already in uprems' (Haskell's filter).
                 let cond_emit = t_new != *rhs && !uprems.contains(rhs);
+                // Next step's position-name prefix `_<i><pd>`; reused both
+                // for the (conditional) rule name and to advance `posname`
+                // below — neither `i` nor `posname` changes in between.
+                let next_posname = format!("_{}{}", i, posname);
                 if cond_emit {
                     // Build the rule name: `_<i><pd>` ++ funs.
-                    let posname_now = format!("_{}{}", i, posname);
-                    let mut name = posname_now.as_bytes().to_vec();
+                    let mut name = next_posname.as_bytes().to_vec();
                     let funs = {
                         let mut f = name_acc.clone();
                         f.extend_from_slice(b"_");
@@ -214,7 +217,7 @@ pub fn destruction_rules(
                 // Update accumulators and walk down.
                 name_acc.extend_from_slice(b"_");
                 name_acc.extend_from_slice(&sym.name);
-                posname = format!("_{}{}", i, posname);
+                posname = next_posname;
                 t = t_new;
             }
             Term::Lit(_) => {
@@ -852,7 +855,6 @@ pub fn variants_intruder(
                 .map(|m| m + 1).unwrap_or(0);
             s_fresh.fresh_to_free_avoiding(
                 |n| { let b = counter; counter += n; b },
-                &packed_frees,
             )
         };
 

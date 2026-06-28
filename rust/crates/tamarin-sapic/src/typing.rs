@@ -8,9 +8,8 @@
 
 use std::collections::BTreeMap;
 
-use tamarin_term::function_symbols::{FunSym, NoEqSym};
+use tamarin_term::function_symbols::NoEqSym;
 use tamarin_term::lterm::{LSort, LVar, Name};
-use tamarin_term::term::{f_app_ac, f_app_c, f_app_list, f_app_no_eq};
 use tamarin_term::vterm::{Lit, VTerm};
 use tamarin_utils::fresh::PreciseFreshState;
 
@@ -138,20 +137,6 @@ fn collect_comb_vars(c: &ProcessCombinator<SapicLVar>, out: &mut std::collection
     }
 }
 
-/// Parser `SortHint` → `LSort` (mirrors elaborate.rs `sort_of`).
-fn sort_of_hint(s: &tamarin_parser::ast::SortHint) -> LSort {
-    use tamarin_parser::ast as p;
-    match s {
-        p::SortHint::Fresh | p::SortHint::Suffix(p::SuffixSort::Fresh) => LSort::Fresh,
-        p::SortHint::Pub | p::SortHint::Suffix(p::SuffixSort::Pub) => LSort::Pub,
-        p::SortHint::Node | p::SortHint::Suffix(p::SuffixSort::Node) => LSort::Node,
-        p::SortHint::Nat | p::SortHint::Suffix(p::SuffixSort::Nat) => LSort::Nat,
-        p::SortHint::Msg | p::SortHint::Suffix(p::SuffixSort::Msg) | p::SortHint::Untagged => {
-            LSort::Msg
-        }
-    }
-}
-
 /// Free `LVar`s of a `Cond` parser-AST formula (vars not bound by an enclosing
 /// quantifier).  Used to seed the `renameUnique` avoidance set and as the
 /// rename domain.
@@ -161,7 +146,7 @@ fn cond_formula_free_lvars(f: &tamarin_parser::ast::Formula) -> Vec<LVar> {
         match t {
             p::Term::Var(v) => {
                 if !bound.iter().any(|n| n == &v.name) {
-                    out.push(LVar::new(v.name.clone(), sort_of_hint(&v.sort), v.idx));
+                    out.push(LVar::new(v.name.clone(), crate::convert::sort_of_hint(&v.sort), v.idx));
                 }
             }
             p::Term::App(_, args) | p::Term::Pair(args) => {
@@ -240,7 +225,7 @@ fn rename_cond_formula(
                 if bound.iter().any(|n| n == &v.name) {
                     return t.clone();
                 }
-                let key = LVar::new(v.name.clone(), sort_of_hint(&v.sort), v.idx);
+                let key = LVar::new(v.name.clone(), crate::convert::sort_of_hint(&v.sort), v.idx);
                 match subst.get(&key) {
                     Some(nv) => p::Term::Var(p::VarSpec {
                         name: nv.name.to_string(),
@@ -348,19 +333,8 @@ fn rename_term(subst: &BTreeMap<LVar, LVar>, t: &SapicTerm) -> SapicTerm {
         VTerm::App(sym, args) => {
             let new_args: Vec<SapicTerm> = args.iter().map(|a| rename_term(subst, a)).collect();
             // Rebuild through the smart constructor so AC normal form is kept.
-            rebuild_app(sym, new_args)
+            tamarin_term::term::f_app(sym.clone(), new_args)
         }
-    }
-}
-
-/// Rebuild an `App` node through the AC-preserving smart constructors, mirroring
-/// `apply_vterm_map_changed`'s reconstruction (subst.rs).
-fn rebuild_app(sym: &FunSym, args: Vec<SapicTerm>) -> SapicTerm {
-    match sym {
-        FunSym::Ac(o) => f_app_ac(*o, args),
-        FunSym::C(o) => f_app_c(*o, args),
-        FunSym::NoEq(o) => f_app_no_eq(o.clone(), args),
-        FunSym::List => f_app_list(args),
     }
 }
 
@@ -646,7 +620,7 @@ fn type_with(
                     }
                     insert_fun(env, fs, (ptypes2, outtype2.clone()))?;
                     Ok((
-                        rebuild_app(sym, ts_new),
+                        tamarin_term::term::f_app(sym.clone(), ts_new),
                         outtype2,
                     ))
                 }
@@ -658,7 +632,7 @@ fn type_with(
                         ts_new.push(a_new);
                     }
                     Ok((
-                        rebuild_app(sym, ts_new),
+                        tamarin_term::term::f_app(sym.clone(), ts_new),
                         None,
                     ))
                 }

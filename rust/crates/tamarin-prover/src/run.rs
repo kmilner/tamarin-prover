@@ -164,18 +164,34 @@ fn run_test(_args: &Args) -> Result<i32, RunError> {
         }
     }
     let dot = std::process::Command::new("dot").arg("-V").output();
-    match dot {
+    // HS `successGraphVizDot = isJust maybeSuccessGraphVizDot` (Test.hs:51):
+    // a missing/unavailable `dot` is a test FAILURE, not a silent skip.
+    let success_graphviz = match dot {
         Ok(out) if out.status.success() => {
             let s = String::from_utf8_lossy(&out.stderr);
             println!("GraphViz tool: 'dot'\n checking version: {}OK.", s.trim());
+            true
         }
-        _ => println!("GraphViz check skipped (`dot` not found)."),
-    }
+        _ => {
+            println!("GraphViz check skipped (`dot` not found).");
+            false
+        }
+    };
     println!("\n*** TEST SUMMARY ***");
-    println!("All tool checks successful.");
-    println!("The tamarin-prover should work as intended.\n");
-    println!("           :-) happy proving (-:");
-    Ok(0)
+    // HS `success = successMaude && successGraphVizDot && successTerm`
+    // (Test.hs:96); on failure it warns and `exitFailure` (Test.hs:97-105).
+    // Maude reachability is asserted above (early `Ok(1)` return), so the
+    // only failure reachable here is a missing GraphViz `dot`.
+    if success_graphviz {
+        println!("All tool checks successful.");
+        println!("The tamarin-prover should work as intended.\n");
+        println!("           :-) happy proving (-:");
+        Ok(0)
+    } else {
+        println!("\nWARNING: Some tests failed.");
+        println!("The tamarin-prover might NOT WORK AS INTENDED.\n");
+        Ok(1)
+    }
 }
 
 /// `tamarin-prover variants` — mirror HS's `Main.Mode.Intruder.run`.
@@ -267,25 +283,13 @@ fn run_variants(args: &Args) -> Result<i32, RunError> {
         // `tamarin_term::pretty::pretty_lnterm` for argument terms.
         // Mirrors HS `prettyLNFact` for the variants command.
         let fmt_fact = |f: &tamarin_theory::fact::LNFact| -> String {
-            use tamarin_theory::fact::{FactTag, Multiplicity};
-            let prefix = match &f.tag {
-                FactTag::Proto(Multiplicity::Persistent, _, _) => "!",
-                _ => "",
-            };
-            let name: String = match &f.tag {
-                FactTag::Proto(_, n, _) => n.to_string(),
-                FactTag::Fresh => "Fr".into(),
-                FactTag::In => "In".into(),
-                FactTag::Out => "Out".into(),
-                FactTag::Ku => "!KU".into(),
-                FactTag::Kd => "!KD".into(),
-                FactTag::Ded => "Ded".into(),
-                FactTag::Term => "Term".into(),
-            };
+            // HS `showFactTag` (Fact.hs:516-523): factTagName + `!` for
+            // persistent.  Use the canonical table rather than re-hardcoding it.
+            let name = tamarin_theory::fact::show_fact_tag(&f.tag);
             let args: Vec<String> = f.terms.iter()
                 .map(tamarin_term::pretty::pretty_lnterm)
                 .collect();
-            format!("{}{}({})", prefix, name, args.join(", "))
+            format!("{}({})", name, args.join(", "))
         };
         let fmt_facts = |facts: &[tamarin_theory::fact::LNFact]| -> String {
             let parts: Vec<String> = facts.iter().map(fmt_fact).collect();

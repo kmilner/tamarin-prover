@@ -23,14 +23,6 @@ fn mark_contradictory_labeled(red: &mut Reduction, pass: &'static str) {
     red.mark_contradictory();
 }
 
-/// `TAM_RS_TRACE_SIMPLIFY=1` — cached once per process (env vars are
-/// constant for the run); mirrors `trace::flag()`/`bounds_max_verify_enabled`.
-#[inline]
-fn simplify_trace_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_TRACE_SIMPLIFY").is_ok())
-}
-
 /// `TAM_RS_TRACE_SIMPLIFY=1` — per-subpass enter/exit traces matching
 /// HS's `tracePassPair` format.  Lets us count contradiction-firing per
 /// pass via `delta = enter - exit` (an exit MISSING means the pass
@@ -40,7 +32,7 @@ fn trace_subpass<F: FnOnce(&mut Reduction) -> ChangeIndicator>(
 ) -> ChangeIndicator {
     // Tracing off (the default): skip the two `is_dead_for_trace` scans
     // entirely — they are only observed through the `&& on` guard below.
-    if !simplify_trace_enabled() {
+    if !tamarin_utils::env_gate!("TAM_RS_TRACE_SIMPLIFY") {
         return f(red);
     }
     eprintln!("[SUBPASS] enter {}", label);
@@ -72,78 +64,50 @@ fn is_dead_for_trace(red: &Reduction) -> bool {
 pub fn simplify_system(red: &mut Reduction) {
     crate::constraint::solver::trace::trace_exec("simplifySystem");
     red.while_changing(|r| {
-        // Mirror Haskell: at the start of every simplify iteration,
-        // consume the eq-store substitution into nodes/edges/less/goals
-        // so the per-pass reasoning sees canonical node ids.
-        trace_subpass("substSystem", r, |r| { r.subst_system(); ChangeIndicator::Unchanged });
-        // Pass order ported from Haskell `Simplify.hs:124-132`
-        // (non-diff branch):
-        //   enforceNodeUniqueness    -- {fresh, ku, kd}-node uniqueness (DG4, N5↑, N5↓)
-        //   enforceEdgeUniqueness    -- DG2+DG3
-        //   solveUniqueActions       -- S_@
-        //   reduceFormulas           -- decompose trace formula
-        //   evalFormulaAtoms         -- propagate atom valuation
-        //   insertImpliedFormulas    -- saturate ∀
-        //   freshOrdering            -- S_fresh-order
-        //   simpSubterms             -- subterm-store simplification
-        //   simpInjectiveFactEqMon   -- injective-fact equations
-        //
-        // Our extra Rust-specific passes (remove_solved_split_goals,
-        // propagate_subterm_obvious, dedupe_formulas, drop_trivially_true,
-        // normalise_less_atoms) run after their nearest Haskell analog
-        // — they don't have direct Haskell counterparts but are
-        // necessary for our slightly-different data structures.
-        let mut c = ChangeIndicator::Unchanged;
-        // Haskell-faithful order (Simplify.hs): enforceNodeUniqueness
-        // returns (c1, c2, c3) = (fresh-DG4, KD-N5↓, KU-N5↑).
-        c = c.or(trace_subpass("enforceFreshNodeUniqueness", r, enforce_fresh_node_uniqueness_pass));
-        c = c.or(trace_subpass("enforceKdFactUniqueness", r, enforce_kd_fact_uniqueness_pass));
-        c = c.or(trace_subpass("enforceKuActionUniqueness", r, enforce_ku_action_uniqueness_pass));
-        c = c.or(trace_subpass("enforceEdgeUniqueness", r, enforce_edge_uniqueness_pass));
+        // One simplify iteration, factored into the same helpers the
+        // fan-out driver uses so the byte-critical pass order has a
+        // single source of truth: pre-unique-actions passes, then
+        // `solveUniqueActions`, then post-unique-actions passes.  See
+        // `simp_iteration_pre_unique_actions` /
+        // `simp_iteration_post_unique_actions` for the documented order.
+        let mut c = simp_iteration_pre_unique_actions(r);
         c = c.or(trace_subpass("solveUniqueActions", r, solve_unique_actions_pass));
-        c = c.or(trace_subpass("reduceFormulas", r, reduce_formulas_pass));
-        c = c.or(trace_subpass("evalFormulaAtoms", r, eval_formula_atoms_pass));
-        c = c.or(trace_subpass("insertImpliedFormulas", r, insert_implied_formulas_pass));
-        c = c.or(trace_subpass("enforceFreshOrdering", r, enforce_fresh_ordering_pass));
-        c = c.or(trace_subpass("propagateSubtermObvious", r, propagate_subterm_obvious));
-        c = c.or(trace_subpass("simpInjectiveFactEqMon", r, simp_injective_fact_eq_mon_pass));
-        c = c.or(trace_subpass("dedupeFormulas", r, dedupe_formulas_pass));
-        c = c.or(trace_subpass("dropTriviallyTrueFormulas", r, drop_trivially_true_formulas_pass));
-        c = c.or(trace_subpass("normaliseLessAtoms", r, normalise_less_atoms_pass));
+        c = c.or(simp_iteration_post_unique_actions(r));
         c
     });
-    // Post-loop: CR-rule N6 (`exploitUniqueMsgOrder`) — once the
-    // simplifier has converged on all the within-loop CR-rules, add
-    // ordering constraints between KU actions and KD conclusions
-    // sharing the same term.  Haskell runs this only in non-diff
-    // mode, after the main loop, before `removeSolvedSplitGoals`.
-    exploit_unique_msg_order(red);
-    // Haskell `simplifySystem` non-diff branch (Simplify.hs:65-71)
-    // runs `removeSolvedSplitGoals` AFTER `exploitUniqueMsgOrder`
-    // and once at the end of the pipeline — NOT inside the
-    // while_changing loop.  Do NOT move it into the loop body: that is
-    // non-Haskell-faithful and can cause non-idempotent oscillation
-    // with downstream passes that add goals.
-    remove_solved_split_goals_pass(red);
-    // Post-loop: `addNonInjectiveFactInstances` (Simplify.hs).
-    // Haskell runs this AFTER `exploitUniqueMsgOrder` and
-    // `removeSolvedSplitGoals` in the non-diff branch of
-    // `simplifySystem`.  For every (j, k) pair where (j ≠ i, k) and
-    // both j and i (or k and j) have conflicting injective fact
-    // instances under appropriate reachability, add an InjectiveFacts
-    // LessAtom.  Without this step, our `simplify_system` is one CR-
-    // rule shy of Haskell's: a follow-up `Simplify` call on the same
-    // system would then add these atoms, accounting for the
-    // `case_check → simplify → by contradiction` pattern instead of
-    // `case_check → by contradiction` we see in lemmas like
-    // Loop_Start, Use_charn, Start_before_Loop.
-    add_non_injective_fact_instances(red);
+    // Post-loop steps (exploitUniqueMsgOrder, removeSolvedSplitGoals,
+    // addNonInjectiveFactInstances) — see `simp_post_loop_steps`.
+    simp_post_loop_steps(red);
 }
 
-/// Run one iteration of the simplify loop — every pass EXCEPT
-/// `solveUniqueActions`.  Used by both the in-place `simplify_system`
-/// (where the in-place `solve_unique_actions_pass` is called separately)
-/// and the fan-out variant (which uses `solve_unique_actions_pass_fan_out`).
+/// Run the simplify-loop passes BEFORE `solveUniqueActions`.  Used by
+/// both the in-place `simplify_system` (where the in-place
+/// `solve_unique_actions_pass` is called separately) and the fan-out
+/// variant (which uses `solve_unique_actions_pass_fan_out`).
+///
+/// Pass order ported from Haskell `Simplify.hs:124-132` (non-diff
+/// branch):
+///   substSystem              -- consume the eq-store substitution into
+///                               nodes/edges/less/goals so the per-pass
+///                               reasoning sees canonical node ids
+///   enforceNodeUniqueness    -- {fresh, ku, kd}-node uniqueness (DG4, N5↑, N5↓)
+///   enforceEdgeUniqueness    -- DG2+DG3
+/// followed (in `simp_iteration_post_unique_actions`) by:
+///   reduceFormulas           -- decompose trace formula
+///   evalFormulaAtoms         -- propagate atom valuation
+///   insertImpliedFormulas    -- saturate ∀
+///   freshOrdering            -- S_fresh-order
+///   simpSubterms             -- subterm-store simplification
+///   simpInjectiveFactEqMon   -- injective-fact equations
+///
+/// Our extra Rust-specific passes (remove_solved_split_goals,
+/// propagate_subterm_obvious, dedupe_formulas, drop_trivially_true,
+/// normalise_less_atoms) run after their nearest Haskell analog
+/// — they don't have direct Haskell counterparts but are necessary for
+/// our slightly-different data structures.
+///
+/// `enforceNodeUniqueness` returns (c1, c2, c3) = (fresh-DG4, KD-N5↓,
+/// KU-N5↑), here the fresh/kd/ku passes.
 fn simp_iteration_pre_unique_actions(r: &mut Reduction) -> ChangeIndicator {
     trace_subpass("substSystem", r, |r| { r.subst_system(); ChangeIndicator::Unchanged });
     let mut c = ChangeIndicator::Unchanged;
@@ -171,6 +135,31 @@ fn simp_iteration_post_unique_actions(r: &mut Reduction) -> ChangeIndicator {
 }
 
 /// Post-loop steps shared between `simplify_system` and `simplify_system_fan_out`.
+///
+/// CR-rule N6 (`exploitUniqueMsgOrder`) — once the simplifier has
+/// converged on all the within-loop CR-rules, add ordering constraints
+/// between KU actions and KD conclusions sharing the same term.  Haskell
+/// runs this only in non-diff mode, after the main loop, before
+/// `removeSolvedSplitGoals`.
+///
+/// `removeSolvedSplitGoals`: Haskell `simplifySystem` non-diff branch
+/// (Simplify.hs:65-71) runs it AFTER `exploitUniqueMsgOrder` and once at
+/// the end of the pipeline — NOT inside the while_changing loop.  Do NOT
+/// move it into the loop body: that is non-Haskell-faithful and can
+/// cause non-idempotent oscillation with downstream passes that add
+/// goals.
+///
+/// `addNonInjectiveFactInstances` (Simplify.hs): Haskell runs this AFTER
+/// `exploitUniqueMsgOrder` and `removeSolvedSplitGoals` in the non-diff
+/// branch of `simplifySystem`.  For every (j, k) pair where (j ≠ i, k)
+/// and both j and i (or k and j) have conflicting injective fact
+/// instances under appropriate reachability, add an InjectiveFacts
+/// LessAtom.  Without this step, our `simplify_system` is one CR-rule
+/// shy of Haskell's: a follow-up `Simplify` call on the same system
+/// would then add these atoms, accounting for the `case_check → simplify
+/// → by contradiction` pattern instead of `case_check → by
+/// contradiction` we see in lemmas like Loop_Start, Use_charn,
+/// Start_before_Loop.
 fn simp_post_loop_steps(red: &mut Reduction) {
     exploit_unique_msg_order(red);
     remove_solved_split_goals_pass(red);
@@ -344,7 +333,7 @@ fn trace_subpass_fan_out<T, F>(
 where
     F: FnOnce(&mut Reduction) -> std::result::Result<ChangeIndicator, T>,
 {
-    if !simplify_trace_enabled() {
+    if !tamarin_utils::env_gate!("TAM_RS_TRACE_SIMPLIFY") {
         return f(red);
     }
     eprintln!("[SUBPASS] enter {}", label);
@@ -3393,33 +3382,14 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
         {
             // processACSubterm NatPlus (SubtermStore.hs:313-318): sort +
             // removeSame on flattenedACTerms; empty big -> False, empty
-            // small -> True, otherwise inconclusive (None).
-            let mut small_flat: Vec<tamarin_term::lterm::LNTerm> =
-                flattened_ac_terms(AcSym::NatPlus, s).into_iter().cloned().collect();
-            let mut big_flat: Vec<tamarin_term::lterm::LNTerm> =
-                flattened_ac_terms(AcSym::NatPlus, t).into_iter().cloned().collect();
-            small_flat.sort();
-            big_flat.sort();
-            let mut small_rem: Vec<tamarin_term::lterm::LNTerm> = Vec::new();
-            let mut big_rem: Vec<tamarin_term::lterm::LNTerm> = Vec::new();
-            let mut i = 0;
-            let mut j = 0;
-            while i < small_flat.len() && j < big_flat.len() {
-                match small_flat[i].cmp(&big_flat[j]) {
-                    std::cmp::Ordering::Equal => { i += 1; j += 1; }
-                    std::cmp::Ordering::Less => {
-                        small_rem.push(small_flat[i].clone()); i += 1;
-                    }
-                    std::cmp::Ordering::Greater => {
-                        big_rem.push(big_flat[j].clone()); j += 1;
-                    }
-                }
-            }
-            while i < small_flat.len() { small_rem.push(small_flat[i].clone()); i += 1; }
-            while j < big_flat.len() { big_rem.push(big_flat[j].clone()); j += 1; }
-            if big_rem.is_empty() { return Some(false); }
-            if small_rem.is_empty() { return Some(true); }
-            return None;
+            // small -> True, otherwise inconclusive (None).  The rebuilt
+            // `Ok` terms are unused here.
+            return match crate::constraint::solver::reduction::process_ac_subterm(
+                AcSym::NatPlus, s, t)
+            {
+                Err(res) => Some(res),
+                Ok(_) => None,
+            };
         }
         if elem_not_below_reducible(&reducible, t, s) { return Some(false); }
         if elem_not_below_reducible(&reducible, s, t) { return Some(true); }
@@ -3441,36 +3411,17 @@ fn simp_injective_fact_eq_mon_pass(red: &mut Reduction) -> ChangeIndicator {
         if let LTerm::App(FunSym::Ac(ac_sym), _) = t {
             let ac_fun_sym = FunSym::Ac(*ac_sym);
             if !reducible.contains(&ac_fun_sym) {
-                // processACSubterm (SubtermStore.hs:313-318):
-                //   sort + removeSame on flattenedACTerms of both sides.
-                let mut small_flat: Vec<tamarin_term::lterm::LNTerm> =
-                    flattened_ac_terms(*ac_sym, s).into_iter().cloned().collect();
-                let mut big_flat: Vec<tamarin_term::lterm::LNTerm> =
-                    flattened_ac_terms(*ac_sym, t).into_iter().cloned().collect();
-                small_flat.sort();
-                big_flat.sort();
-                // removeSame (SubtermStore.hs:323-326): walk both sorted
-                // lists in tandem, dropping equal pairs.
-                let mut small_rem: Vec<tamarin_term::lterm::LNTerm> = Vec::new();
-                let mut big_rem: Vec<tamarin_term::lterm::LNTerm> = Vec::new();
-                let mut i = 0;
-                let mut j = 0;
-                while i < small_flat.len() && j < big_flat.len() {
-                    match small_flat[i].cmp(&big_flat[j]) {
-                        std::cmp::Ordering::Equal => { i += 1; j += 1; }
-                        std::cmp::Ordering::Less => {
-                            small_rem.push(small_flat[i].clone()); i += 1;
-                        }
-                        std::cmp::Ordering::Greater => {
-                            big_rem.push(big_flat[j].clone()); j += 1;
-                        }
-                    }
+                // processACSubterm (SubtermStore.hs:313-318): sort +
+                // removeSame on flattenedACTerms of both sides; empty big
+                // -> False, empty small -> True.  The rebuilt `Ok` terms
+                // are unused — fall through to the `(Just sst)` arm.
+                match crate::constraint::solver::reduction::process_ac_subterm(
+                    *ac_sym, s, t)
+                {
+                    Err(false) => return Some(false),
+                    Err(true) => return Some(true),
+                    Ok(_) => {}
                 }
-                while i < small_flat.len() { small_rem.push(small_flat[i].clone()); i += 1; }
-                while j < big_flat.len() { big_rem.push(big_flat[j].clone()); j += 1; }
-                if big_rem.is_empty() { return Some(false); }
-                if small_rem.is_empty() { return Some(true); }
-                // Otherwise inconclusive — fall through to the `(Just sst)` arm.
             }
         }
         // HS `isTrueFalse reducible (Just sst)` membership arm
@@ -3844,7 +3795,7 @@ fn dedupe_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
 fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
     use crate::tools::subterm_store::elem_not_below_reducible;
     use tamarin_term::lterm::{is_fresh_var, is_pub_var, is_msg_var,
-        flattened_ac_terms, LSort, sort_of_lnterm};
+        LSort, sort_of_lnterm};
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
     use tamarin_term::function_symbols::FunSym;
@@ -3882,31 +3833,16 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
         if let Term::App(FunSym::Ac(ac_sym), _) = t {
             let ac_fun_sym = FunSym::Ac(*ac_sym);
             if !reducible.contains(&ac_fun_sym) {
-                let mut small_flat: Vec<tamarin_term::lterm::LNTerm> =
-                    flattened_ac_terms(*ac_sym, s).into_iter().cloned().collect();
-                let mut big_flat: Vec<tamarin_term::lterm::LNTerm> =
-                    flattened_ac_terms(*ac_sym, t).into_iter().cloned().collect();
-                small_flat.sort();
-                big_flat.sort();
-                let mut small_rem: Vec<tamarin_term::lterm::LNTerm> = Vec::new();
-                let mut big_rem: Vec<tamarin_term::lterm::LNTerm> = Vec::new();
-                let mut i = 0;
-                let mut j = 0;
-                while i < small_flat.len() && j < big_flat.len() {
-                    match small_flat[i].cmp(&big_flat[j]) {
-                        std::cmp::Ordering::Equal => { i += 1; j += 1; }
-                        std::cmp::Ordering::Less => {
-                            small_rem.push(small_flat[i].clone()); i += 1;
-                        }
-                        std::cmp::Ordering::Greater => {
-                            big_rem.push(big_flat[j].clone()); j += 1;
-                        }
-                    }
+                // processACSubterm (SubtermStore.hs:313-318): empty big
+                // -> False, empty small -> True; the rebuilt `Ok` terms
+                // are unused — fall through to `None` below.
+                match crate::constraint::solver::reduction::process_ac_subterm(
+                    *ac_sym, s, t)
+                {
+                    Err(false) => return Some(false),
+                    Err(true) => return Some(true),
+                    Ok(_) => {}
                 }
-                while i < small_flat.len() { small_rem.push(small_flat[i].clone()); i += 1; }
-                while j < big_flat.len() { big_rem.push(big_flat[j].clone()); j += 1; }
-                if big_rem.is_empty() { return Some(false); }
-                if small_rem.is_empty() { return Some(true); }
             }
         }
         None

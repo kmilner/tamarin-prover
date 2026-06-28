@@ -31,6 +31,7 @@ use tamarin_term::function_symbols::{Constructability, FunSym};
 use tamarin_term::lterm::{LNTerm, LVar, Name};
 use tamarin_term::subterm_rule::CtxtStRule;
 use tamarin_term::subst::{apply_vterm, Subst};
+use crate::base_translation::{subst_term, subst_fact};
 use tamarin_term::vterm::{Lit, VTerm};
 
 use tamarin_theory::sapic::{
@@ -82,8 +83,8 @@ fn map_let(
     pr: AnnotatedProcess<LVar>,
 ) -> AnnotatedProcess<LVar> {
     // `t1' = toLNTerm t1`, `t2' = toLNTerm t2` (LetDestructors.hs:68-69).
-    let t1_ln = to_ln_term(&left);
-    let t2_ln = to_ln_term(&right);
+    let t1_ln = crate::base_translation::to_ln_term(&left);
+    let t2_ln = crate::base_translation::to_ln_term(&right);
 
     // `elsebranch = case pr of ProcessNull _ -> False; _ -> True`
     // (LetDestructors.hs:74-76).
@@ -283,10 +284,6 @@ fn apply_subst_process(
     }
 }
 
-fn subst_term(subst: &Subst<Name, SapicLVar>, t: &SapicTerm) -> SapicTerm {
-    apply_vterm(subst, t.clone())
-}
-
 /// `applyMatchVars subst vs` (Process.hs:305-309): rewrite a set of match
 /// variables under a substitution.  Each `v` is replaced by the variables of
 /// `subst(v)` if `v` is in the substitution's domain, else kept as-is.
@@ -411,7 +408,7 @@ fn subst_cond_formula(
         let img = subst
             .image_of(&SapicLVar::untyped(lv.clone()))
             .or_else(|| subst.image_of(&SapicLVar::new(lv.clone(), None)));
-        img.map(|t| crate::base_translation::ln_term_to_parser(&to_ln_term(t)))
+        img.map(|t| crate::base_translation::ln_term_to_parser(&crate::base_translation::to_ln_term(t)))
     }
     fn rt(subst: &Subst<Name, SapicLVar>, bound: &[String], t: &p::Term) -> p::Term {
         match t {
@@ -503,33 +500,6 @@ fn subst_cond_formula(
     }
     let mut bound = Vec::new();
     rf(subst, &mut bound, f)
-}
-
-fn subst_fact(
-    subst: &Subst<Name, SapicLVar>,
-    f: &tamarin_theory::sapic::SapicLNFact,
-) -> tamarin_theory::sapic::SapicLNFact {
-    let terms = f.terms.iter().map(|t| subst_term(subst, t)).collect();
-    let mut nf = tamarin_theory::fact::Fact::new(f.tag.clone(), terms);
-    nf = nf.with_annotations(f.annotations.clone());
-    nf
-}
-
-/// `toLNTerm` — drop SAPIC type tags (mirror of `base_translation::to_ln_term`).
-fn to_ln_term(t: &SapicTerm) -> LNTerm {
-    match t {
-        VTerm::Lit(Lit::Var(sv)) => VTerm::Lit(Lit::Var(sv.var.clone())),
-        VTerm::Lit(Lit::Con(c)) => VTerm::Lit(Lit::Con(c.clone())),
-        VTerm::App(sym, args) => {
-            let new_args: Vec<LNTerm> = args.iter().map(to_ln_term).collect();
-            match sym {
-                FunSym::Ac(o) => tamarin_term::term::f_app_ac(*o, new_args),
-                FunSym::C(o) => tamarin_term::term::f_app_c(*o, new_args),
-                FunSym::NoEq(o) => tamarin_term::term::f_app_no_eq(o.clone(), new_args),
-                FunSym::List => tamarin_term::term::f_app_list(new_args),
-            }
-        }
-    }
 }
 
 /// Lift an `LNTerm` (untyped) back to a SAPIC term (all variables untyped).

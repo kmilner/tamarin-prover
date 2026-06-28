@@ -1615,7 +1615,7 @@ impl<'ctx> Reduction<'ctx> {
                 crate::constraint::solver::trace::trace_form(
                     if already_in { "Disj-dedup" } else { "Disj" },
                     &crate::constraint::solver::trace::guarded_repr(&g));
-                if std::env::var("TAM_RS_TRACE_GFALSE").map(|v| v == "1").unwrap_or(false) {
+                if tamarin_utils::env_gate!("TAM_RS_TRACE_GFALSE") {
                     eprintln!("[RS_GFALSE] path={} gfalse inserted",
                         crate::constraint::solver::trace::case_path_string());
                 }
@@ -1694,7 +1694,7 @@ impl<'ctx> Reduction<'ctx> {
                 // the bound vars, substitute Bound → Free in guards/body,
                 // and recurse on `gconj([atoms..., body])`.
                 let outer = g.clone();
-                if std::env::var("TAM_RS_DBG_EX_INSERT").map(|v| v == "1").unwrap_or(false) {
+                if tamarin_utils::env_gate!("TAM_RS_DBG_EX_INSERT") {
                     eprintln!("[RS_EX_INSERT] path={} mark={} fm={}",
                         crate::constraint::solver::trace::case_path_string(),
                         mark,

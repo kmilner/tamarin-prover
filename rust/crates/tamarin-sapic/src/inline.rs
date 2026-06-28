@@ -29,7 +29,8 @@ use std::collections::BTreeMap;
 
 use tamarin_parser::ast as p;
 use tamarin_term::lterm::Name;
-use tamarin_term::subst::{apply_vterm, Subst};
+use tamarin_term::subst::Subst;
+use crate::base_translation::{subst_term, subst_fact};
 use tamarin_term::vterm::{Lit, VTerm};
 
 use tamarin_theory::sapic::{
@@ -299,20 +300,25 @@ fn apply_m_comb(
         ProcessCombinator::CondEq(a, b) => {
             Ok(ProcessCombinator::CondEq(subst_term(subst, &a), subst_term(subst, &b)))
         }
-        // `Cond` carries a parser-AST formula; process-call args are message
-        // terms, not formula-bound vars — substitution into a Cond formula is
-        // not exercised by the in-scope corpus (a call's body that begins with
-        // a typed-param `if <formula>` would need it).  Leave the formula as-is.
+        // `Cond` carries an un-expanded parser-AST formula.  HS DOES substitute
+        // here: `apply subst (Cond fa) = Cond (apply subst fa)` (Process.hs:165),
+        // reached via the `ApplyM`/`Apply` ProcessCombinator instances
+        // (Process.hs:330,382).  So to be byte-faithful a call whose body begins
+        // with `if <formula>` mentioning a parameter (the call substitutes that
+        // parameter into the formula's free vars) must rewrite the formula too —
+        // exactly as the sibling Case-B `let`-elimination path does in
+        // let_destructors.rs::subst_cond_formula.  We omit it here as a KNOWN
+        // gap: no in-scope corpus theory inlines a call whose body's leading
+        // `Cond` formula references a parameter, so the omission is currently
+        // output-inert.  If such a theory appears, route `Cond` through a
+        // subst_cond_formula-style rewrite (and re-gate) rather than the
+        // pass-through below.
         other => Ok(other),
     }
 }
 
 /// Apply `subst` to a SAPIC term, preserving AC normal form and each variable's
 /// SAPIC type (the substitution keys carry both typed and untyped forms).
-fn subst_term(subst: &SapicSubst, t: &SapicTerm) -> SapicTerm {
-    apply_vterm(subst, t.clone())
-}
-
 /// `applyMatchVars subst vs` (Process.hs:304-309): `fromList . concatMap
 /// extractVars . toList` where `extractVars v = maybe [v] varsVTerm (imageOf
 /// subst v)`.  A match var `v` is replaced by ALL the variables of its image
@@ -339,16 +345,6 @@ fn apply_match_vars(
         }
     }
     out
-}
-
-fn subst_fact(
-    subst: &SapicSubst,
-    f: &tamarin_theory::sapic::SapicLNFact,
-) -> tamarin_theory::sapic::SapicLNFact {
-    let terms = f.terms.iter().map(|t| subst_term(subst, t)).collect();
-    let mut nf = tamarin_theory::fact::Fact::new(f.tag.clone(), terms);
-    nf = nf.with_annotations(f.annotations.clone());
-    nf
 }
 
 #[cfg(test)]

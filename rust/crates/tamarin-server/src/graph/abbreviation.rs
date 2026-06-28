@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use tamarin_term::function_symbols::{CSym, FunSym};
 use tamarin_term::lterm::{LNTerm, LSort, LVar};
 use tamarin_term::pretty::pretty_lnterm;
-use tamarin_term::term::Term;
+use tamarin_term::term::{is_pair, Term};
 use tamarin_term::vterm::Lit;
 
 use tamarin_theory::fact::LNFact;
@@ -339,12 +339,6 @@ fn sub_terms_no_pair(t: &LNTerm, out: &mut Vec<LNTerm>) {
             }
         }
     }
-}
-
-fn is_pair(t: &LNTerm) -> bool {
-    if let Term::App(FunSym::NoEq(sym), args) = t {
-        &*sym.name == b"pair" && args.len() == 2
-    } else { false }
 }
 
 // ---------------------------------------------------------------------

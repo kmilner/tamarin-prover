@@ -8,12 +8,18 @@
 //! fact rendering (`prettyLNFact`), action-row filtering (Diff /
 //! auto-source), the cluster/preamble attribute blocks, the `roleColor`
 //! cluster styling and the less-edge rendering all match HS byte-for-
-//! byte. Two intentional approximations remain (each documented at its
-//! site): the per-rule node FILL colours use four fixed placeholder hexes
-//! instead of HS `nodeColorMap`'s size-dependent HSV palette (only the
-//! group PARTITION is faithful; an explicit per-rule `color:` attribute IS
-//! honoured exactly), and the cluster subgraph identifier uses the Rust
-//! `cluster_<n>` form rather than HS `createClusterNodeId`.
+//! byte.
+//!
+//! KNOWN DIVERGENCES (vs upstream Tamarin's graph rendering — intentional,
+//! each also documented at its site): downstream consumers of the web
+//! graph view should expect these two DOT/SVG rendering results to differ
+//! from upstream:
+//!   1. Per-rule node FILL colours use four fixed placeholder hexes instead
+//!      of HS `nodeColorMap`'s size-dependent HSV palette (only the group
+//!      PARTITION is faithful; an explicit per-rule `color:` attribute IS
+//!      honoured exactly).
+//!   2. The cluster subgraph identifier uses the Rust `cluster_<n>` form
+//!      rather than HS `createClusterNodeId`.
 //!
 //! Reference:
 //!   - `lib/theory/src/Theory/Constraint/System/Dot.hs` (605 lines)
@@ -527,10 +533,10 @@ impl DotBuilder {
             let (name, exp) = entries[i];
             html.push_str("<TR>");
             html.push_str(&format!("<TD ALIGN=\"LEFT\" VALIGN=\"TOP\">{}</TD>",
-                html_escape(&pretty_lnterm(name))));
+                dot_html_escape(&pretty_lnterm(name))));
             html.push_str("<TD ALIGN=\"LEFT\" VALIGN=\"TOP\">=</TD>");
             html.push_str(&format!("<TD ALIGN=\"LEFT\" VALIGN=\"TOP\">{}</TD>",
-                html_escape(&pretty_lnterm(exp))));
+                dot_html_escape(&pretty_lnterm(exp))));
             html.push_str("</TR>");
         }
         html.push_str("</TABLE>>");
@@ -596,7 +602,10 @@ fn topo_sort_abbrevs(entries: &[(&LNTerm, &LNTerm)]) -> Vec<usize> {
 }
 
 /// HTML-escape a string for use in a Graphviz HTML-like label.
-fn html_escape(s: &str) -> String {
+/// Distinct from `crate::handlers::root::html_escape` (which also escapes
+/// `'`) because it targets a different context (DOT HTML-like label vs a
+/// general HTML page); do NOT merge the two char sets.
+fn dot_html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {

@@ -651,6 +651,14 @@ impl<'a> Parser<'a> {
     /// one of the recognised top-level keywords, or a `#`-prefixed
     /// preprocessor directive. Used for tactics, proof skeletons, etc.
     fn read_until_next_top_level(&mut self) -> String {
+        // NOTE: the top-level `let X = ...` process definition (dispatched by
+        // `theory_item`) is deliberately OMITTED here. `let` is overloaded —
+        // it also begins `let`-bindings inside rules/processes — and a bare
+        // `let` token can never legitimately appear inside the proof-skeleton
+        // or tactic-body grammars this scanner captures, so the only effect of
+        // adding it would be to risk truncating a capture mid-body. A top-level
+        // `let` following a tactic/proof block (then needing this stop word) is
+        // unattested in the corpus; keep the conservative set.
         const KW: &[&str] = &[
             "end", "rule", "lemma", "diffLemma", "restriction", "axiom",
             "tactic", "heuristic", "predicates", "predicate", "macros", "macro",
@@ -1224,7 +1232,7 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    fn try_acc_lemma_body(&mut self, name: &str, _attrs: &[LemmaAttr])
+    fn try_acc_lemma_body(&mut self, name: &str, attrs: &[LemmaAttr])
         -> Result<Option<AccLemma>, ParseError>
     {
         // Pattern: `<id1, id2, ...> (accounts|account) for "phi"`
@@ -1257,7 +1265,7 @@ impl<'a> Parser<'a> {
         let formula = self.double_quoted_formula()?;
         Ok(Some(AccLemma {
             name: name.to_string(),
-            attributes: Vec::new(),
+            attributes: attrs.to_vec(),
             formula,
             case_test_idents: idents,
         }))
@@ -1637,7 +1645,7 @@ impl<'a> Parser<'a> {
         }
         // Sapic action: new / insert / delete / in / out / lock / unlock / event / msr
         let save = self.save();
-        if let Some((act, _)) = self.try_sapic_action()? {
+        if let Some(act) = self.try_sapic_action()? {
             // Optional `; rest` (sequencing)
             let body = if self.try_punct(";") {
                 self.action_process()?
@@ -1678,22 +1686,22 @@ impl<'a> Parser<'a> {
         } else { Ok(Process::Null) }
     }
 
-    fn try_sapic_action(&mut self) -> Result<Option<(SapicAction, ())>, ParseError> {
+    fn try_sapic_action(&mut self) -> Result<Option<SapicAction>, ParseError> {
         self.skip_ws();
         let save = self.save();
         if self.try_kw("new") {
             let v = self.var_spec()?;
-            return Ok(Some((SapicAction::New(v), ())));
+            return Ok(Some(SapicAction::New(v)));
         }
         if self.try_kw("insert") {
             let t1 = self.term(false)?;
             self.require_punct(",")?;
             let t2 = self.term(false)?;
-            return Ok(Some((SapicAction::Insert(t1, t2), ())));
+            return Ok(Some(SapicAction::Insert(t1, t2)));
         }
         if self.try_kw("delete") {
             let t = self.term(false)?;
-            return Ok(Some((SapicAction::Delete(t), ())));
+            return Ok(Some(SapicAction::Delete(t)));
         }
         if self.try_kw("in") {
             self.require_punct("(")?;
@@ -1707,7 +1715,7 @@ impl<'a> Parser<'a> {
                 self.require_punct(")")?;
                 SapicAction::ChIn { chan: None, msg: first }
             };
-            return Ok(Some((res, ())));
+            return Ok(Some(res));
         }
         if self.try_kw("out") {
             self.require_punct("(")?;
@@ -1720,19 +1728,19 @@ impl<'a> Parser<'a> {
                 self.require_punct(")")?;
                 SapicAction::ChOut { chan: None, msg: first }
             };
-            return Ok(Some((res, ())));
+            return Ok(Some(res));
         }
         if self.try_kw("lock") {
             let t = self.term(false)?;
-            return Ok(Some((SapicAction::Lock(t), ())));
+            return Ok(Some(SapicAction::Lock(t)));
         }
         if self.try_kw("unlock") {
             let t = self.term(false)?;
-            return Ok(Some((SapicAction::Unlock(t), ())));
+            return Ok(Some(SapicAction::Unlock(t)));
         }
         if self.try_kw("event") {
             let f = self.fact()?;
-            return Ok(Some((SapicAction::Event(f), ())));
+            return Ok(Some(SapicAction::Event(f)));
         }
         // Embedded MSR: `[..] --[..]-> [..]`
         if self.lx.peek() == Some('[') {
@@ -1761,9 +1769,9 @@ impl<'a> Parser<'a> {
                 return Ok(None);
             };
             let concs = self.fact_list()?;
-            return Ok(Some((SapicAction::Msr {
+            return Ok(Some(SapicAction::Msr {
                 prems, acts, concs, restrictions: restrs
-            }, ())));
+            }));
         }
         self.restore(save);
         Ok(None)

@@ -28,7 +28,7 @@
 //! application of that symbol before classifying it (so `K(f)` with
 //! `f/0 [private]` is an irreducible `FApp f []`, allowed — matching HS).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tamarin_parser::ast as p;
 use tamarin_parser::ast::{Atom, BinOp, Formula, SortHint, SuffixSort, Term, VarSpec};
@@ -106,8 +106,8 @@ enum RTerm {
 /// Index of irreducible function symbols by (name, arity).  Mirrors
 /// `irreducibleFunSyms maudeSig` membership tests.
 struct Irreducible {
-    /// (name-bytes, arity) of every irreducible NoEq symbol.
-    noeq: BTreeSet<(Vec<u8>, usize)>,
+    /// Arities (keyed by name-bytes) of every irreducible NoEq symbol.
+    noeq: BTreeMap<Vec<u8>, BTreeSet<usize>>,
     /// Irreducible AC symbols (e.g. `Mult`, `NatPlus` are irreducible; `Xor`
     /// is reducible).  HS keys on the `FunSym` value, which for AC ops is
     /// `AC <ACSym>`.
@@ -120,12 +120,12 @@ struct Irreducible {
 
 impl Irreducible {
     fn from_sig(sig: &MaudeSig) -> Self {
-        let mut noeq = BTreeSet::new();
+        let mut noeq: BTreeMap<Vec<u8>, BTreeSet<usize>> = BTreeMap::new();
         let mut ac = BTreeSet::new();
         for s in &sig.irreducible_fun_syms {
             match s {
                 FunSym::NoEq(n) => {
-                    noeq.insert((n.name.to_vec(), n.arity));
+                    noeq.entry(n.name.to_vec()).or_default().insert(n.arity);
                 }
                 FunSym::Ac(a) => {
                     ac.insert(*a);
@@ -146,7 +146,7 @@ impl Irreducible {
 
     /// Is the NoEq symbol `name/arity` irreducible?
     fn is_irreducible(&self, name: &str, arity: usize) -> bool {
-        self.noeq.contains(&(name.as_bytes().to_vec(), arity))
+        self.noeq.get(name.as_bytes()).is_some_and(|s| s.contains(&arity))
     }
 
     /// Is the AC symbol `a` irreducible?

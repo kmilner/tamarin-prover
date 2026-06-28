@@ -378,21 +378,33 @@ fn annotate_each_pure_states(
             match &ac {
                 // new StateChannel with isStateChannel cid: if the cell is
                 // pure, mark pure_state and add cid to pureStates for the body.
-                SapicAction::New(_) if an.is_state_channel.is_some() => {
-                    let cid = an.is_state_channel.clone().unwrap();
-                    if is_pure_state(&body, &cid, false).0 {
-                        let mut next = pure_states.clone();
-                        next.insert(cid.clone());
-                        let body2 = annotate_each_pure_states(*body, &next);
-                        let an2 = ProcessAnnotation {
-                            pure_state: true,
-                            is_state_channel: Some(cid),
-                            ..an
-                        };
-                        Process::Action(ac, an2, Box::new(body2))
+                // Bind cid via `if let Some(..)` (dropping the `.unwrap()`);
+                // the `.clone()` is unavoidable since `an` is consumed by
+                // `..an` below.  A `New(_)` with no state channel takes the
+                // `else` (recurse into body), exactly as the prior
+                // `if an.is_state_channel.is_some()` guard + default arm did.
+                SapicAction::New(_) => {
+                    if let Some(cid) = &an.is_state_channel {
+                        let cid = cid.clone();
+                        if is_pure_state(&body, &cid, false).0 {
+                            let mut next = pure_states.clone();
+                            next.insert(cid.clone());
+                            let body2 = annotate_each_pure_states(*body, &next);
+                            let an2 = ProcessAnnotation {
+                                pure_state: true,
+                                is_state_channel: Some(cid),
+                                ..an
+                            };
+                            Process::Action(ac, an2, Box::new(body2))
+                        } else {
+                            // HS does NOT recurse into the body in this branch.
+                            Process::Action(ac, an, body)
+                        }
                     } else {
-                        // HS does NOT recurse into the body in this branch.
-                        Process::Action(ac, an, body)
+                        // No state channel: recurse into the body (matches
+                        // the default `_ =>` arm below).
+                        let body2 = annotate_each_pure_states(*body, pure_states);
+                        Process::Action(ac, an, Box::new(body2))
                     }
                 }
                 SapicAction::Unlock(t) => {

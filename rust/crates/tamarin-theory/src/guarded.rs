@@ -1469,16 +1469,6 @@ pub fn canonicalize_ac_in_guarded_cow(g: &Guarded) -> Option<Guarded> {
 
 type GCmp = fn(&GTerm, &GTerm) -> std::cmp::Ordering;
 
-fn cac_flatten(op: &p::BinOp, t: &GTerm, out: &mut Vec<GTerm>) {
-    match t {
-        GTerm::BinOp(inner_op, l, r) if inner_op == op => {
-            cac_flatten(op, l, out);
-            cac_flatten(op, r, out);
-        }
-        _ => out.push(t.clone()),
-    }
-}
-
 fn cac_rec_term(t: &GTerm, cmp: GCmp) -> GTerm {
     // Wrapper: materialise the COW result, reusing `t` when nothing changed.
     match cac_rec_term_cow(t, cmp) {
@@ -1543,18 +1533,18 @@ fn cac_rec_term_cow(t: &GTerm, cmp: GCmp) -> Option<GTerm> {
         GTerm::Diff(a, b) => cow_pair_arc(a, cac_rec_term_cow(a, cmp), b, cac_rec_term_cow(b, cmp))
             .map(|(a, b)| GTerm::Diff(a, b)),
         GTerm::BinOp(op, l, r) => {
-            if matches!(op, p::BinOp::Mult | p::BinOp::Union | p::BinOp::Xor | p::BinOp::NatPlus) {
+            if is_ac_binop(op) {
                 // Recurse into children first, then flatten the whole AC
                 // chain rooted here and rebuild in sorted multiset order.
                 let l2 = cac_rec_term(l, cmp);
                 let r2 = cac_rec_term(r, cmp);
                 let mut flat = Vec::new();
-                cac_flatten(op, &l2, &mut flat);
-                cac_flatten(op, &r2, &mut flat);
+                flatten_ac_binop(op, &l2, &mut flat);
+                flatten_ac_binop(op, &r2, &mut flat);
                 flat.sort_by(&cmp);
                 // Right-fold to a binary chain.  At least 2 args.
                 let mut iter = flat.into_iter().rev();
-                let last = iter.next().unwrap_or(GTerm::PubLit(String::new()));
+                let last = iter.next().expect("AC BinOp always flattens to >=2 args");
                 let mut acc = last;
                 for prev in iter {
                     acc = GTerm::BinOp(*op, ga(prev), ga(acc));

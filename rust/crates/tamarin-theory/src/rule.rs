@@ -173,8 +173,7 @@ impl<P, I> RuleInfo<P, I> {
 // Protocol rule attributes / names
 // =============================================================================
 
-#[derive(Debug, Clone, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct RuleAttributes {
     /// Color for graphical display.
     pub color: Option<Rgb>,
