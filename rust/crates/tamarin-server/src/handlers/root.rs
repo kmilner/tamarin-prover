@@ -198,7 +198,7 @@ fn render_index(state: &AppState) -> String {
 
 fn html_response(html: String) -> Response {
     let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, "text/html; charset=utf-8".parse().unwrap());
+    headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/html; charset=utf-8"));
     (StatusCode::OK, headers, html).into_response()
 }
 

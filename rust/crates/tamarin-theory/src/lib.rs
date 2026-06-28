@@ -7,7 +7,10 @@
 //! - [`formula`] ← `Theory.Model.Formula` (data type + builders)
 //! - [`guarded`] / [`guarded_types`] ← `Theory.Model.Formula` (guarded
 //!   formulas)
-//! - [`restriction`] ← `Theory.Model.Restriction`
+//! - [`restriction`] ← `Theory.Model.Restriction`;
+//!   [`rule_restriction`] ← `Theory.Model.Restriction` `liftedAddProtoRule`
+//!   (surface-formula → `LNFormula` rewrite-then-quantify)
+//! - [`macro_expand`] ← `Term.Macro` `applyMacros`
 //! - [`rule`] ← `Theory.Model.Rule` (data layer + indices + info types);
 //!   instantiation (`someRuleACInst*`) lives in
 //!   [`constraint::solver::reduction`]
@@ -29,7 +32,9 @@
 //! - [`tactic`] ← heuristic tactics; [`proof_skeleton`] / [`replay`] /
 //!   [`prove`] ← proof skeletons, replay, and the per-lemma prover driver
 //! - [`pretty_theory`] / [`pretty_system`] / [`pretty_formula`] /
-//!   [`pretty_hpj`] ← theory / system / formula pretty-printing
+//!   [`pretty_hpj`] ← theory / system / formula pretty-printing;
+//!   [`pretty_sapic`] ← `Theory.Sapic.{Term,Process}` pretty-printing
+//! - [`auto_sources`] ← `OpenTheory` `addAutoSourcesLemma` (`--auto-sources`)
 //! - [`state_trace`] ← solver state tracing
 //!
 //! The `.spthy` parser lives in the sibling `tamarin-parser` crate.

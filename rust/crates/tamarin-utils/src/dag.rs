@@ -1,6 +1,10 @@
 //! Port of `Data.DAG.Simple` from `lib/utils/src/Data/DAG/Simple.hs`.
 //!
 //! Vertex-list-based DAG operations. A `Relation<T>` is `Vec<(T, T)>`.
+//!
+//! Intentionally retained: faithful HS port. Currently has no live caller —
+//! the consumers that need these operations (loop breakers, transitive
+//! reduction, cyclicity) carry their own specialized re-implementations.
 
 use std::collections::BTreeSet;
 

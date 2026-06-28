@@ -35,6 +35,9 @@ impl<T> Disj<T> {
     }
 
     /// `contradictoryBecause`: an empty disjunction (i.e. `false`).
+    ///
+    /// Retained as a named-constructor alias mirroring the upstream Haskell
+    /// API; equivalent to [`Disj::new`].
     pub fn contradiction() -> Self { Disj(Vec::new()) }
 }
 

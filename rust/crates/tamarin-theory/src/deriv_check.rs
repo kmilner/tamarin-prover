@@ -624,21 +624,16 @@ fn prove_probe(
 
     // Per-prove deadline gate: set TAM_PROVE_DEADLINE_MS from `timeout`
     // so each variable's `run_proof_search` still honours the deadline.
-    let prev_deadline = std::env::var("TAM_PROVE_DEADLINE_MS").ok();
+    // The RAII guard restores the prior value on EVERY exit path (including
+    // any future early-return), so the deadline can't leak into the main
+    // prove loop.
     let ms = (timeout.as_millis() as u64).max(1);
-    std::env::set_var("TAM_PROVE_DEADLINE_MS", ms.to_string());
+    let _deadline_guard = DeadlineEnvGuard::set(ms);
 
     let _user_funs_guard = crate::elaborate::set_user_funs_for_theory(probe);
     let elaborated = match elaborate(probe) {
         Ok(t) => t,
-        Err(_) => {
-            // Restore deadline before bailing.
-            match prev_deadline {
-                Some(v) => std::env::set_var("TAM_PROVE_DEADLINE_MS", v),
-                None => std::env::remove_var("TAM_PROVE_DEADLINE_MS"),
-            }
-            return None;
-        }
+        Err(_) => return None,
     };
     let rules: Vec<OpenProtoRule> = elaborated.rules().cloned().collect();
     let mut ctx = ProofContext::new_with_restrictions(maude, rules, Vec::new());
@@ -707,13 +702,35 @@ fn prove_probe(
         }
     }
 
-    // Restore prior deadline so the deriv check doesn't leak into the
-    // main prove loop.
-    match prev_deadline {
-        Some(v) => std::env::set_var("TAM_PROVE_DEADLINE_MS", v),
-        None => std::env::remove_var("TAM_PROVE_DEADLINE_MS"),
-    }
+    // `_deadline_guard` restores the prior deadline on drop, so the deriv
+    // check doesn't leak into the main prove loop.
     Some(ProbeOutcome { undecidable, prove_time, var_count })
+}
+
+/// RAII guard for the `TAM_PROVE_DEADLINE_MS` env var (mirrors the
+/// thread-local `User*FunsGuard` idiom in `elaborate.rs`).  On `set` it
+/// records the prior value and installs `ms`; on drop it restores the
+/// prior value (or removes it if unset).  This guarantees the per-probe
+/// deadline cannot leak into the main prove loop on any exit path.
+struct DeadlineEnvGuard {
+    previous: Option<String>,
+}
+
+impl DeadlineEnvGuard {
+    fn set(ms: u64) -> Self {
+        let previous = std::env::var("TAM_PROVE_DEADLINE_MS").ok();
+        std::env::set_var("TAM_PROVE_DEADLINE_MS", ms.to_string());
+        DeadlineEnvGuard { previous }
+    }
+}
+
+impl Drop for DeadlineEnvGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(v) => std::env::set_var("TAM_PROVE_DEADLINE_MS", v),
+            None => std::env::remove_var("TAM_PROVE_DEADLINE_MS"),
+        }
+    }
 }
 
 fn format_deriv_report(per_rule: &[(String, Vec<String>)]) -> Vec<WfError> {
@@ -751,10 +768,25 @@ mod tests {
     use super::*;
     use tamarin_parser::parse_theory;
 
+    /// Resolve a maude binary: `$MAUDE_PATH`, then a portable candidate list
+    /// (bare `maude` resolves via `PATH`). Returns `None` only if the list is
+    /// exhausted, so the Maude-backed tests no-op rather than fail when maude
+    /// is unavailable.
+    fn maude_bin() -> Option<String> {
+        if let Ok(p) = std::env::var("MAUDE_PATH") {
+            return Some(p);
+        }
+        for c in ["/usr/local/bin/maude", "/usr/bin/maude", "maude"] {
+            if c == "maude" || std::path::Path::new(c).exists() {
+                return Some(c.to_string());
+            }
+        }
+        None
+    }
+
     fn maude() -> Option<MaudeHandle> {
-        let p = "/home/linuxbrew/.linuxbrew/bin/maude";
-        if !std::path::Path::new(p).exists() { return None; }
-        MaudeHandle::start(p, tamarin_term::maude_sig::pair_maude_sig()).ok()
+        let p = maude_bin()?;
+        MaudeHandle::start(&p, tamarin_term::maude_sig::pair_maude_sig()).ok()
     }
 
     #[test]
@@ -809,13 +841,12 @@ mod tests {
     /// `elaborated.signature.maude_sig` (run.rs:644).  Returns `None` if Maude
     /// is unavailable.
     fn maude_for(src: &str) -> Option<(p::Theory, MaudeHandle)> {
-        let p = "/home/linuxbrew/.linuxbrew/bin/maude";
-        if !std::path::Path::new(p).exists() { return None; }
+        let p = maude_bin()?;
         let thy = parse_theory(src, &[]).expect("parse");
         // `elaborate` installs the per-theory user-funs guards internally.
         let elaborated = crate::elaborate::elaborate(&thy).expect("elaborate");
         let sig = elaborated.signature.maude_sig.clone();
-        let handle = MaudeHandle::start(p, sig).ok()?;
+        let handle = MaudeHandle::start(&p, sig).ok()?;
         Some((thy, handle))
     }
 

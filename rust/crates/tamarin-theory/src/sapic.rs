@@ -33,12 +33,14 @@ use crate::atom::SyntacticSugar;
 pub type ProcessPosition = Vec<i64>;
 
 /// `lhsP p`: append `1` to `p` (left branch).
+// Intentionally retained: faithful HS port; exercised only by tests so far.
 pub fn lhs_position(mut p: ProcessPosition) -> ProcessPosition {
     p.push(1);
     p
 }
 
 /// `rhsP p`: append `2` to `p` (right branch).
+// Intentionally retained: faithful HS port; exercised only by tests so far.
 pub fn rhs_position(mut p: ProcessPosition) -> ProcessPosition {
     p.push(2);
     p
@@ -61,6 +63,7 @@ pub fn pretty_position(p: &ProcessPosition) -> String {
 /// SAPIC variables carry an optional type tag (`Some("node")`, `Some("Any")`, …).
 pub type SapicType = Option<String>;
 
+// Intentionally retained: faithful HS port; no caller yet.
 pub fn default_sapic_type_string() -> String { "Any".to_string() }
 pub fn default_sapic_type() -> SapicType { None }
 pub fn default_sapic_node_type() -> SapicType { Some("node".to_string()) }
@@ -325,6 +328,7 @@ impl PatternSapicLVar {
 }
 
 /// `unpatternVar`: drop the bind/match tag.
+// Intentionally retained: faithful HS port; exercised only by tests so far.
 pub fn unpattern_var(p: PatternSapicLVar) -> SapicLVar { p.into_var() }
 
 /// `freesSapicTerm`: free variables of a SAPIC term, in source order, with

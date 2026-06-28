@@ -213,7 +213,7 @@ pub fn mterm_to_lnterm(
             // Otherwise it must be a Maude-introduced fresh variable.
             match ml {
                 MaudeLit::FreshVar(_, sort) | MaudeLit::MaudeVar(_, sort) => {
-                    let lv = LVar::new(name_hint.to_string(), *sort, *next_idx);
+                    let lv = LVar::new(name_hint, *sort, *next_idx);
                     *next_idx += 1;
                     let lit = Lit::Var(lv);
                     ctx.inverse.insert(ml.clone(), lit.clone());

@@ -30,7 +30,7 @@ use crate::vterm::Lit;
 
 /// Pretty-print an `LNTerm` to a `String`.
 ///
-/// Port of `prettyLNTerm` from `Term.LTerm` (line 856 of `LTerm.hs`)
+/// Port of `prettyLNTerm` from `Term.LTerm` (`LTerm.hs`)
 /// which delegates to `prettyTerm (text . show)`.
 pub fn pretty_lnterm<T: PrettyTerm + ?Sized>(t: &T) -> String {
     let mut s = String::new();
@@ -103,7 +103,7 @@ fn pp_term_lnterm(t: &Term<Lit<Name, LVar>>, out: &mut String) {
             out.push('>');
         }
         Term::App(FunSym::NoEq(sym), ts) => {
-            out.push_str(&String::from_utf8_lossy(&sym.name));
+            out.push_str(&String::from_utf8_lossy(sym.name));
             if !ts.is_empty() {
                 out.push('(');
                 for (i, c) in ts.iter().enumerate() {
@@ -145,7 +145,7 @@ fn collect_pair_tail<'a>(
     out: &mut Vec<&'a Term<Lit<Name, LVar>>>,
 ) {
     if let Term::App(FunSym::NoEq(sym), args) = t {
-        if &*sym.name == b"pair" && args.len() == 2 {
+        if *sym == pair_sym() && args.len() == 2 {
             collect_pair_tail(&args[0], out);
             collect_pair_tail(&args[1], out);
             return;
@@ -167,9 +167,9 @@ pub fn pp_lvar(v: &LVar, out: &mut String) {
     if v.name.is_empty() {
         out.push_str(&v.idx.to_string());
     } else if v.idx == 0 {
-        out.push_str(&v.name);
+        out.push_str(v.name);
     } else {
-        out.push_str(&v.name);
+        out.push_str(v.name);
         out.push('.');
         out.push_str(&v.idx.to_string());
     }

@@ -15,7 +15,9 @@
 //! width-accurate HughesPJ port that the prover and web UI actually call lives
 //! in `tamarin-theory::pretty_hpj` (full HughesPJ with `render_with`). The only
 //! in-crate consumer of this module is `pretty_html`, which uses just `Doc`,
-//! `keyword`, `cat_with` and `render_with`.
+//! `keyword`, `cat_with` and `render_with`. Since `pretty_html` itself has no
+//! live consumer, this module currently has no live caller; it is retained as
+//! the `Class.hs` port for the future HTML rendering path.
 //!
 //! Highlight styling (`Comment`/`Keyword`/`Operator`) is carried as an enum
 //! tag on a `Doc` node; the plain-text renderer ignores it. The HTML renderer

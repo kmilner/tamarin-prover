@@ -116,8 +116,17 @@ fn equal_to_var<C, V: PartialEq>(t: &VTerm<C, V>, v: &V) -> bool {
 }
 
 /// `applyLit`: substitute a single literal.
+///
+/// Intentionally retained: faithful HS port of `applyLit` (SubstVFree.hs); no
+/// caller yet (the hot substitution path uses [`apply_vterm_map`]).
 pub fn apply_lit<C: Ord + Clone, V: Ord + Clone>(s: &Subst<C, V>, l: &Lit<C, V>) -> VTerm<C, V> {
-    apply_lit_map(&s.map, l)
+    match l {
+        Lit::Var(v) => match s.map.get(v) {
+            Some(t) => t.clone(),
+            None => lit(Lit::Var(v.clone())),
+        },
+        Lit::Con(c) => lit(Lit::Con(c.clone())),
+    }
 }
 
 /// `applyVTerm`: substitute through a whole term, re-AC-normalising.
@@ -126,25 +135,6 @@ pub fn apply_vterm<C: Ord + Clone, V: Ord + Clone>(
     t: VTerm<C, V>,
 ) -> VTerm<C, V> {
     apply_vterm_map(&s.map, t)
-}
-
-/// `applyLit` against a raw substitution map — the borrowing
-/// counterpart of [`apply_lit`].  Hot unification loops call this to
-/// avoid cloning the accumulator into a [`Subst`] on every recursion.
-/// Output is identical to applying the [`Subst::from_map`]-built subst:
-/// a trivial `x ~> x` entry (which `from_map` would drop) returns the
-/// same `x` whether found in the map or falling through to identity.
-pub fn apply_lit_map<C: Ord + Clone, V: Ord + Clone>(
-    map: &BTreeMap<V, VTerm<C, V>>,
-    l: &Lit<C, V>,
-) -> VTerm<C, V> {
-    match l {
-        Lit::Var(v) => match map.get(v) {
-            Some(t) => t.clone(),
-            None => lit(Lit::Var(v.clone())),
-        },
-        Lit::Con(c) => lit(Lit::Con(c.clone())),
-    }
 }
 
 /// `applyVTerm` against a raw substitution map — the borrowing
@@ -214,7 +204,7 @@ fn apply_vterm_map_changed<C: Ord + Clone, V: Ord + Clone>(
 
 /// `applyLit` against a raw map, returning `Some` only when the literal is a
 /// domain variable (and thus replaced).  The borrowing counterpart of
-/// [`apply_lit_map`] used by the sharing recursion above.
+/// [`apply_lit`] used by the sharing recursion above.
 ///
 /// `from_map`/`from_list` drop trivial `x ~> x` entries and the unification
 /// accumulator never inserts one, so a found binding is always a genuine

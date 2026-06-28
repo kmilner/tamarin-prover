@@ -10,7 +10,7 @@
 //!    its variants — `MaudeHandle::variants(packed) -> Vec<MSubst>`.
 //! 3. For each variant subst, compose with the abstraction-bindings
 //!    subst and renormalise.
-//! 4. Simplify via `simp_disjunction`.
+//! 4. Simplify via `simp_disjunction_with_maude`.
 //! 5. Wrap as a `ProtoRuleAC` with the surviving substitutions stored
 //!    in its `variants` field.
 //!
@@ -195,10 +195,10 @@ fn make_proto_rule_ac(
     }
 }
 
-/// Like `expand_rule_variants`, but returns the raw variant substitutions
-/// (the `Disj LNSubstVFresh` of `RuleACConstrs` in Haskell) — the
-/// substitutions that should be installed as a SplitG goal via
-/// `solve_rule_constraints`.
+/// Returns the raw variant substitutions of `rule` (the `Disj LNSubstVFresh`
+/// of `RuleACConstrs` in Haskell, taken from `variants_proto_rule`'s
+/// `ac.info.variants`) — the substitutions that should be installed as a
+/// SplitG goal via `solve_rule_constraints`.
 ///
 /// Haskell-faithful: keeps ALL variants Maude returns (including the
 /// identity).  The identity variant corresponds to "destructor doesn't
@@ -206,13 +206,10 @@ fn make_proto_rule_ac(
 /// Filtering it out drops the no-narrowing case from the SplitG, so
 /// downstream search misses the alternative where the term is irreducible.
 ///
-/// Do NOT filter out pure-renaming variants here.  `expand_rule_variants`
-/// produces the pre-applied variant *rules* (used by the legacy `o.variants`
-/// path), where the identity rule duplicates `o.rule` and is rightly skipped.
-/// But the raw variant *substitutions* (`Disj LNSubstVFresh` of Haskell's
-/// `RuleACConstrs`) need the identity kept — it's what tells
-/// `solveRuleConstraints` to install a SplitG with both narrowing and
-/// no-narrowing branches.
+/// Do NOT filter out pure-renaming variants here either: the raw variant
+/// *substitutions* (`Disj LNSubstVFresh` of Haskell's `RuleACConstrs`) need
+/// the identity kept — it's what tells `solveRuleConstraints` to install a
+/// SplitG with both narrowing and no-narrowing branches.
 pub fn variant_substs_for_rule(
     maude: &MaudeHandle,
     rule: &ProtoRuleE,
@@ -274,10 +271,6 @@ pub fn abstract_rule_and_variants(
     // HS's evalFreshTAvoiding semantics.
     let local_maude_owned = maude.with_fresh_counter_from(avoid_max);
     let maude: &MaudeHandle = &local_maude_owned;
-    if tamarin_utils::env_gate!("TAM_DBG_FRESH_TRACE") {
-        eprintln!("[fresh-trace] rule={:?} avoid_max={} counter_at_entry={}",
-            rule.info.name, avoid_max, maude.fresh_counter_peek());
-    }
 
     fn name_hint(t: &LNTerm) -> String {
         use tamarin_term::vterm::Lit;
@@ -519,10 +512,6 @@ pub fn abstract_rule_and_variants(
         s.into_iter().collect()
     };
 
-    if tamarin_utils::env_gate!("TAM_DBG_HS_COMPOSE") {
-        eprintln!("[hs-compose] rule={:?} #variants={}",
-                  rule.info.name, raw_substs.len());
-    }
     // HS-faithful: filter variants via `isFreshRedundant` (RuleVariants.hs:128-134)
     // BEFORE composition. A variant is redundant if it forces a freshly
     // introduced term (from a Fresh-fact premise) to also appear in a
@@ -579,7 +568,6 @@ pub fn abstract_rule_and_variants(
                 let mut counter = filter_base;
                 let subst = s_fresh.fresh_to_free_avoiding(
                     |n| { let b = counter; counter += n; b },
-                    &frees,
                 );
                 let premises: Vec<LNTerm> = premise_terms_for_filter.iter()
                     .map(|t| {
@@ -664,21 +652,13 @@ pub fn abstract_rule_and_variants(
     // That pass folds a single-variant disj into the free subst — so the
     // residual returned to `makeRule` is `Nothing` and the variant subst
     // content gets baked into the rule body via commonSubst.  RS's
-    // `simp_disjunction` (no Maude handle) SKIPS simpSingleton; use the
+    // the plain (no-Maude-handle) simplification SKIPS simpSingleton; use the
     // `_with_maude` variant here to match HS.  Without it, e.g.
     // JKL_TS1_2004 Init_2 keeps `z.0 → 'g'^lkR; z.1 → 'g'^(lkI*lkR)` in
     // the residual instead of baking them into the rule's `!Sessk(...)`
     // conclusion — diverging Sessk_reveal source-case numbering downstream.
-    if tamarin_utils::env_gate!("TAM_DBG_FRESH_TRACE") {
-        eprintln!("[fresh-trace] rule={:?} pre-simp_disj counter={} composed_substs={}",
-            rule.info.name, maude.fresh_counter_peek(), composed_substs.len());
-    }
     let (common_subst, residual) = crate::tools::equation_store::EquationStore::simp_disjunction_with_maude(
         composed_substs, |_, _| false, maude);
-    if tamarin_utils::env_gate!("TAM_DBG_FRESH_TRACE") {
-        eprintln!("[fresh-trace] rule={:?} post-simp_disj counter={}",
-            rule.info.name, maude.fresh_counter_peek());
-    }
 
     // Apply common_subst to the abstracted rule's terms.
     let abstracted_rule = if common_subst.is_empty() {
@@ -756,23 +736,8 @@ pub fn abstract_rule_and_variants(
     // — all rule keys at idx 0 → sorted by name first → CHECKSIGN
     // variant sort order matches HS for test4/test5.
     //
-    if tamarin_utils::env_gate!("TAM_DBG_VARIANT_OUT") {
-        eprintln!("[variant-out-pre] rule={:?} #final_substs={}", rule.info.name, final_substs.len());
-        for (i, s) in final_substs.iter().enumerate() {
-            let keys: Vec<String> = s.dom().map(|v| format!("{}.{}/{:?}", v.name, v.idx, v.sort)).collect();
-            eprintln!("[variant-out-pre]   [{}] keys=[{}]", i, keys.join(","));
-        }
-    }
     let (abstracted_rule, final_substs) =
         rename_precise_rule_with_variants(abstracted_rule, final_substs);
-
-    if tamarin_utils::env_gate!("TAM_DBG_VARIANT_OUT") {
-        eprintln!("[variant-out] rule={:?} #final_substs={}", rule.info.name, final_substs.len());
-        for (i, s) in final_substs.iter().enumerate() {
-            let keys: Vec<String> = s.dom().map(|v| format!("{}.{}/{:?}", v.name, v.idx, v.sort)).collect();
-            eprintln!("[variant-out]   [{}] keys=[{}]", i, keys.join(","));
-        }
-    }
 
     Ok(Some((abstracted_rule, final_substs)))
 }
@@ -828,7 +793,7 @@ fn rule_renames_under_precise(rule: &ProtoRuleE) -> bool {
     let mut map: HashMap<LVar, LVar> = HashMap::new();
     for v in &vars {
         if map.contains_key(v) { continue; }
-        let idx = state.fresh_ident(&v.name);
+        let idx = state.fresh_ident(v.name);
         if idx != v.idx { return true; }
         map.insert(v.clone(), LVar { name: v.name, sort: v.sort, idx });
     }
@@ -847,7 +812,7 @@ fn rename_precise_rule_with_variants(
     let mut map: HashMap<LVar, LVar> = HashMap::new();
     let import = |v: &LVar, st: &mut PreciseFreshState, m: &mut HashMap<LVar, LVar>| {
         if m.contains_key(v) { return; }
-        let idx = st.fresh_ident(&v.name);
+        let idx = st.fresh_ident(v.name);
         let new_v = LVar { name: v.name, sort: v.sort, idx };
         m.insert(v.clone(), new_v);
     };
@@ -929,108 +894,6 @@ fn rename_precise_rule_with_variants(
     }).collect();
 
     (new_rule, new_substs)
-}
-
-// no production caller; kept as parity/API surface (HS `variantsProtoRule`
-// pre-applied variant-rule path).
-pub fn expand_rule_variants(
-    maude: &MaudeHandle,
-    rule: &ProtoRuleE,
-    reducible: &std::collections::BTreeSet<tamarin_term::function_symbols::FunSym>,
-) -> Result<Vec<ProtoRuleAC>, VariantsError> {
-    let ac = match variants_proto_rule(maude, rule)? {
-        Some(ac) => ac,
-        None => return Ok(Vec::new()),
-    };
-    let substs = &ac.info.variants;
-    // Drop pure-renaming variants — Maude's identity variant comes
-    // back as `x0 → ~mw1:Msg, x1 → ~mw2:Msg` etc., which carries no
-    // information beyond α-renaming and is already covered by the
-    // raw rule the solver instantiates. Keep only variants with at
-    // least one App in their range (i.e. actually-narrowing).
-    let useful: Vec<&LNSubstVFresh> = substs.iter()
-        .filter(|s| s.range().any(|t| matches!(t, Term::App(_, _))))
-        .collect();
-    if useful.is_empty() {
-        return Ok(Vec::new());
-    }
-    // After applying a variant substitution we must renormalise via
-    // Maude so destructor terms reduce to their narrowed form: e.g.
-    // `Out(snd(sdec(senc(pair(a,b), k), k)))` must reduce to `Out(b)`.
-    // Without this, the rule conclusion stays as the literal pre-
-    // reduction shape and won't unify with destructor-free goals.
-    let normalize = |t: LNTerm| -> LNTerm {
-        match maude.reduce(&t) { Ok(n) => n, Err(_) => t }
-    };
-    let mut out: Vec<ProtoRuleAC> = Vec::with_capacity(useful.len() + 1);
-    // Include the raw (un-narrowed) rule alongside the narrowed
-    // variants — Haskell's Disj-of-variants does include the
-    // identity, and the chain-fold enumeration needs the un-narrowed
-    // form for non-destructor-driven goals.
-    {
-        let info = ProtoRuleACInfo {
-            name: rule.info.name.clone(),
-            attributes: rule.info.attributes.clone(),
-            variants: vec![LNSubstVFresh::empty()],
-            loop_breakers: Vec::new(),
-        };
-        out.push(crate::rule::Rule {
-            info,
-            premises: rule.premises.clone(),
-            conclusions: rule.conclusions.clone(),
-            actions: rule.actions.clone(),
-            new_vars: rule.new_vars.clone(),
-        });
-    }
-    fn has_reducible(
-        t: &LNTerm,
-        rs: &std::collections::BTreeSet<tamarin_term::function_symbols::FunSym>,
-    ) -> bool {
-        match t {
-            Term::Lit(_) => false,
-            Term::App(f, args) =>
-                rs.contains(f) || args.iter().any(|a| has_reducible(a, rs)),
-        }
-    }
-    for vsubst in useful {
-        let lnsubst: LNSubst = LNSubst::from_list(vsubst.to_list());
-        let premises: Vec<Fact<LNTerm>> = rule.premises.iter()
-            .map(|f| f.clone().map(|t| normalize(apply_vterm(&lnsubst, t))))
-            .collect();
-        let actions: Vec<Fact<LNTerm>> = rule.actions.iter()
-            .map(|f| f.clone().map(|t| normalize(apply_vterm(&lnsubst, t))))
-            .collect();
-        let conclusions: Vec<Fact<LNTerm>> = rule.conclusions.iter()
-            .map(|f| f.clone().map(|t| normalize(apply_vterm(&lnsubst, t))))
-            .collect();
-        let new_vars: Vec<LNTerm> = rule.new_vars.iter()
-            .map(|t| normalize(apply_vterm(&lnsubst, t.clone())))
-            .collect();
-        // Skip partial-narrowing variants: if any conclusion term still
-        // contains a reducible function symbol after normalisation, the
-        // variant didn't fully narrow through. The raw rule already
-        // covers this case shape, so emitting the intermediate just
-        // bloats search.
-        let has_destr_in_concs = conclusions.iter()
-            .any(|f| f.terms.iter().any(|t| has_reducible(t, reducible)));
-        if has_destr_in_concs { continue; }
-        // Each per-variant ProtoRuleAC carries the identity inside —
-        // the variant subst is already applied to the terms above.
-        let info = ProtoRuleACInfo {
-            name: rule.info.name.clone(),
-            attributes: rule.info.attributes.clone(),
-            variants: vec![LNSubstVFresh::empty()],
-            loop_breakers: Vec::new(),
-        };
-        out.push(crate::rule::Rule {
-            info,
-            premises,
-            conclusions,
-            actions,
-            new_vars,
-        });
-    }
-    Ok(out)
 }
 
 /// `findPos`-style subterm check: returns true if `needle` appears
@@ -1162,7 +1025,6 @@ mod tests {
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
         let candidates = [
-            "/home/linuxbrew/.linuxbrew/bin/maude",
             "/usr/local/bin/maude",
             "/usr/bin/maude",
             "maude",
@@ -1209,7 +1071,7 @@ mod tests {
         let prem = Fact::new(FactTag::Fresh, vec![kt.clone()]);
         let conc = Fact::new(FactTag::Out, vec![kt.clone()]);
         let info = ProtoRuleEInfo {
-            name: ProtoRuleName::Stand("R".into()),
+            name: ProtoRuleName::Stand("R"),
             attributes: RuleAttributes::empty(),
             restrictions: Vec::new(),
         };

@@ -40,7 +40,7 @@ use crate::guarded_types::{BVar, GAtom, GFact, GTerm};
 // =============================================================================
 
 /// HS `show LVar` (LTerm.hs:526-533): `sortPrefix s ++ body`.
-pub fn show_varspec(v: &p::VarSpec) -> String {
+pub(crate) fn show_varspec(v: &p::VarSpec) -> String {
     let mut s = String::new();
     write_varspec(v, &mut s);
     s
@@ -75,7 +75,7 @@ fn write_varspec(v: &p::VarSpec, out: &mut String) {
 
 /// HS `Show (Term a)` applied to `VTerm Name (BVar LVar)`
 /// (Term/Raw.hs:219-227 + the derived `Show (BVar v)`).
-pub fn show_gterm(t: &GTerm) -> String {
+pub(crate) fn show_gterm(t: &GTerm) -> String {
     let mut s = String::new();
     write_gterm(t, &mut s);
     s
@@ -114,7 +114,7 @@ fn write_gterm(t: &GTerm, out: &mut String) {
         // Numeric / neutral literals render as their irreducible function head.
         // `Number(n)` is an RS-only bare-integer literal with no HS counterpart;
         // render it unquoted, matching the sibling raw-show `show_debruijn_term`
-        // (parser wf.rs:1001 `Number(n) => n.to_string()`).
+        // (parser wf.rs `show_debruijn_term`: `Number(n) => n.to_string()`).
         GTerm::Number(n) => out.push_str(&n.to_string()),
         // `fAppOne` = `NoEq oneSym` with `oneSymString = "one"` and
         // `fAppNatOne` = `NoEq natOneSym` with `natOneSymString = "tone"`
@@ -218,7 +218,7 @@ fn write_lnterm(t: &LNTerm, out: &mut String) {
         Term::App(sym, args) => match sym {
             // FApp (NoEq (s,_)) [] -> s ; FApp (NoEq (s,_)) as -> s(a,..)
             FunSym::NoEq(s) => {
-                let name = String::from_utf8_lossy(&s.name);
+                let name = String::from_utf8_lossy(s.name);
                 out.push_str(&name);
                 if !args.is_empty() {
                     out.push('(');
@@ -291,9 +291,9 @@ fn write_lvar(v: &tamarin_term::lterm::LVar, out: &mut String) {
     if v.name.is_empty() {
         out.push_str(&v.idx.to_string());
     } else if v.idx == 0 {
-        out.push_str(&v.name);
+        out.push_str(v.name);
     } else {
-        out.push_str(&v.name);
+        out.push_str(v.name);
         out.push('.');
         out.push_str(&v.idx.to_string());
     }
@@ -309,7 +309,7 @@ fn write_name(n: &Name, out: &mut String) {
         NameTag::Nat => out.push('%'),
     }
     out.push('\'');
-    out.push_str(&n.id.0.to_string());
+    out.push_str(n.id.0);
     out.push('\'');
 }
 
@@ -408,7 +408,7 @@ fn formula_action_fact(g: &Guarded) -> Option<&GFact> {
 ///
 /// The returned `VarSpec`s are `show`n by the callers to build PCRE
 /// alternations like `(~n|~s|...)`.
-pub fn check_formula(oracle_type: &str, f: &Guarded) -> Vec<p::VarSpec> {
+pub(crate) fn check_formula(oracle_type: &str, f: &Guarded) -> Vec<p::VarSpec> {
     // rev = any guard fact-tag name =~ "Reveal"
     let mut tag_names = Vec::new();
     guard_fact_tag_names(f, &mut tag_names);
@@ -568,7 +568,7 @@ mod tests {
 
     #[test]
     fn show_fact_tag_proto() {
-        let t = FactTag::Proto(Multiplicity::Linear, "Foo".into(), 2);
+        let t = FactTag::Proto(Multiplicity::Linear, "Foo", 2);
         assert_eq!(show_fact_tag(&t), "ProtoFact Linear \"Foo\" 2");
     }
 
@@ -589,7 +589,7 @@ mod tests {
     #[test]
     fn show_gterm_number_is_unquoted() {
         // RS-only bare integer literal; raw-show unquoted to match the sibling
-        // renderer (parser wf.rs:1001 `Number(n) => n.to_string()`).
+        // renderer (parser wf.rs `show_debruijn_term`: `Number(n) => n.to_string()`).
         assert_eq!(show_gterm(&GTerm::Number(5)), "5");
     }
 }

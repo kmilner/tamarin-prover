@@ -47,9 +47,9 @@ pub struct TheoryEntry {
     pub primary: bool,
     /// HTML for the wellformedness warning banner shown in the theory
     /// page header (HS `errorsHtml`, rendered raw via
-    /// `preEscapedToMarkup info.errorsHtml` at `src/Web/Theory.hs:1194`).
+    /// `preEscapedToMarkup info.errorsHtml` at `src/Web/Theory.hs`).
     /// HS populates it from `makeWfErrorsHtml`
-    /// (`src/Web/Handler.hs:461-469`), which wraps
+    /// (`src/Web/Handler.hs`), which wraps
     /// `renderHtmlDoc (htmlDoc $ prettyWfErrorReport report)` of the
     /// *closed* theory's wellformedness report in a `<div class="wf-warning">`.
     /// This is an unported interactive-web-UI feature: the Rust load path
@@ -75,7 +75,9 @@ pub enum TheoryOrigin {
     Local(PathBuf),
     /// Uploaded via POST `/`.
     Upload(String),
-    /// Generated interactively (e.g. by an edit).
+    /// Generated interactively (e.g. by an edit). Currently never
+    /// constructed — placeholder for the unported interactive-edit
+    /// path (HS `Interactive`).
     Interactive,
 }
 
@@ -177,7 +179,7 @@ impl TheoryStore {
     }
 
     /// Replace the entry at `idx` in place, keeping the idx the same.
-    /// Mirrors Haskell `replaceTheory` (`src/Web/Handler.hs:307-318` —
+    /// Mirrors Haskell `replaceTheory` (`src/Web/Handler.hs` —
     /// used by `reload` and `editProof`).  Like `replaceTheory`'s
     /// `M.insert idx newThy theories`, this inserts unconditionally
     /// (creating the entry if `idx` is currently absent), and forces

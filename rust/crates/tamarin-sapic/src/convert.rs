@@ -1,4 +1,4 @@
-//! Parser-AST → theory-AST process converter (P0a).
+//! Parser-AST → theory-AST process converter.
 //!
 //! Maps `tamarin_parser::ast::Process` (the surface syntax tree) into
 //! `tamarin_theory::sapic::PlainProcess` (the HS-faithful `Process<ann, v>`
@@ -97,7 +97,7 @@ fn action(a: &p::SapicAction) -> Result<SapicAction<SapicLVar>, ConvertError> {
             // (extractMatchingVariables pt)` (Parser/Sapic.hs:114) unpatterns the
             // message term and splits the matched variables out into `match_vars`.
             // We reuse the same `unpattern`/`extractMatchingVariables` helper used
-            // for `let` patterns (Phase 5).
+            // for `let` patterns.
             let (msg_unpat, match_vars) = convert_let_pattern(msg)?;
             Ok(SapicAction::ChIn {
                 chan: chan.as_ref().map(term).transpose()?,
@@ -105,12 +105,12 @@ fn action(a: &p::SapicAction) -> Result<SapicAction<SapicLVar>, ConvertError> {
                 match_vars,
             })
         }
-        // Mutable state (Phase 3): `insert t1 v` / `delete t`.  These map to the
+        // Mutable state: `insert t1 v` / `delete t`.  These map to the
         // theory `SapicAction::{Insert,Delete}` (Process.hs:72-73), translated by
         // `baseTransAction` Insert/Delete (Basetranslation.hs:177-184).
         p::SapicAction::Insert(t1, t2) => Ok(SapicAction::Insert(term(t1)?, term(t2)?)),
         p::SapicAction::Delete(t) => Ok(SapicAction::Delete(term(t)?)),
-        // Locks (Phase 4): `lock t` / `unlock t` → theory `SapicAction::{Lock,Unlock}`
+        // Locks: `lock t` / `unlock t` → theory `SapicAction::{Lock,Unlock}`
         // (Process.hs:74-75), annotated by `Sapic.Locks.annotateLocks` and
         // translated by `baseTransAction` Lock/Unlock (Basetranslation.hs:185-194).
         p::SapicAction::Lock(t) => Ok(SapicAction::Lock(term(t)?)),
@@ -181,7 +181,7 @@ fn combinator(c: &p::ProcessComb) -> Result<ProcessCombinator<SapicLVar>, Conver
         p::ProcessComb::Cond(p::Condition::Eq(t1, t2)) => {
             Ok(ProcessCombinator::CondEq(term(t1)?, term(t2)?))
         }
-        // `if <formula> then .. else ..` (Phase 3).  HS `Cond (SapicNFormula v)`;
+        // `if <formula> then .. else ..`.  HS `Cond (SapicNFormula v)`;
         // the RS `Cond` carries the un-expanded parser-AST formula directly (see
         // `ProcessCombinator::Cond` doc).  Predicate atoms inside the formula are
         // expanded later, by `lift_rule_restrictions` over the embedded
@@ -189,12 +189,12 @@ fn combinator(c: &p::ProcessComb) -> Result<ProcessCombinator<SapicLVar>, Conver
         p::ProcessComb::Cond(p::Condition::Formula(f)) => {
             Ok(ProcessCombinator::Cond(f.clone()))
         }
-        // `lookup t as v in .. else ..` (Phase 3).  HS `Lookup (SapicNTerm v) v`
+        // `lookup t as v in .. else ..`.  HS `Lookup (SapicNTerm v) v`
         // (Process.hs:95).
         p::ProcessComb::Lookup(t, v) => {
             Ok(ProcessCombinator::Lookup(term(t)?, varspec_to_sapic(v)))
         }
-        // `let pat = value in P [else Q]` (Phase 5).  HS
+        // `let pat = value in P [else Q]`.  HS
         // `ProcessComb (Let (unpattern t1) t2 (extractMatchingVariables t1))`
         // (Sapic.hs:268-269).  The parser-AST pattern `pat` may contain
         // `=t` (`PatMatch`) match markers; we split them out into `match_vars`

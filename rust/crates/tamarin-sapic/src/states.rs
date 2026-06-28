@@ -2,8 +2,9 @@
 //!
 //! The pure-state ("state-channel") optimisation.  When enabled via
 //! `options: translation-state-optimisation` (`_stateChannelOpt`,
-//! OpenTheory.hs:547), `annotatePureStates` runs in the SAPIC annotation
-//! pipeline (Sapic.hs:57, gated on `_stateChannelOpt`).  It:
+//! `Items/OptionItem.hs`; parsed as `stateChannelOpt` in
+//! `Theory/Text/Parser/Signature.hs`), `annotatePureStates` runs in the SAPIC
+//! annotation pipeline (Sapic.hs, gated on `_stateChannelOpt`).  It:
 //!
 //!   1. declares a fresh `new StateChannel:channel` cell-handle for every
 //!      state term whose identifier is fully bound by names
@@ -110,7 +111,7 @@ fn add_states_channels(p: AnnotatedProc) -> AnnotatedProc {
     // is `max { idx+1 | (StateChannel, idx) ∈ varsProc p }` (0 if none).
     let init_state_chan = vars_proc(&p)
         .into_iter()
-        .filter(|v| &*v.name == STATE_CHANNEL_NAME)
+        .filter(|v| v.name == STATE_CHANNEL_NAME)
         .map(|v| v.idx + 1)
         .max()
         .unwrap_or(0);
@@ -224,7 +225,7 @@ fn new_states(
     for v in declarables {
         // `newvar <- freshLVar stateChannelName LSortMsg` — fast counter.
         let newvar = LVar {
-            name: STATE_CHANNEL_NAME.into(),
+            name: STATE_CHANNEL_NAME,
             sort: LSort::Msg,
             idx: fresh.fresh_ident(),
         };
@@ -377,21 +378,33 @@ fn annotate_each_pure_states(
             match &ac {
                 // new StateChannel with isStateChannel cid: if the cell is
                 // pure, mark pure_state and add cid to pureStates for the body.
-                SapicAction::New(_) if an.is_state_channel.is_some() => {
-                    let cid = an.is_state_channel.clone().unwrap();
-                    if is_pure_state(&body, &cid, false).0 {
-                        let mut next = pure_states.clone();
-                        next.insert(cid.clone());
-                        let body2 = annotate_each_pure_states(*body, &next);
-                        let an2 = ProcessAnnotation {
-                            pure_state: true,
-                            is_state_channel: Some(cid),
-                            ..an
-                        };
-                        Process::Action(ac, an2, Box::new(body2))
+                // Bind cid via `if let Some(..)` (dropping the `.unwrap()`);
+                // the `.clone()` is unavoidable since `an` is consumed by
+                // `..an` below.  A `New(_)` with no state channel takes the
+                // `else` (recurse into body), exactly as the prior
+                // `if an.is_state_channel.is_some()` guard + default arm did.
+                SapicAction::New(_) => {
+                    if let Some(cid) = &an.is_state_channel {
+                        let cid = cid.clone();
+                        if is_pure_state(&body, &cid, false).0 {
+                            let mut next = pure_states.clone();
+                            next.insert(cid.clone());
+                            let body2 = annotate_each_pure_states(*body, &next);
+                            let an2 = ProcessAnnotation {
+                                pure_state: true,
+                                is_state_channel: Some(cid),
+                                ..an
+                            };
+                            Process::Action(ac, an2, Box::new(body2))
+                        } else {
+                            // HS does NOT recurse into the body in this branch.
+                            Process::Action(ac, an, body)
+                        }
                     } else {
-                        // HS does NOT recurse into the body in this branch.
-                        Process::Action(ac, an, body)
+                        // No state channel: recurse into the body (matches
+                        // the default `_ =>` arm below).
+                        let body2 = annotate_each_pure_states(*body, pure_states);
+                        Process::Action(ac, an, Box::new(body2))
                     }
                 }
                 SapicAction::Unlock(t) => {
@@ -541,7 +554,7 @@ mod tests {
         let Process::Action(SapicAction::New(chan_var), chan_an, body) = *body else {
             panic!("expected inserted `new StateChannel:channel`")
         };
-        assert_eq!(&*chan_var.var.name, "StateChannel");
+        assert_eq!(chan_var.var.name, "StateChannel");
         assert_eq!(chan_var.stype, Some("channel".to_string()));
         assert_eq!(chan_an.is_state_channel.as_ref(), Some(&s));
         assert!(chan_an.pure_state, "the StateChannel new is marked pure");

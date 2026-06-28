@@ -94,6 +94,8 @@ pub fn union<A: Ord + Clone>(a: Term<A>, b: Term<A>) -> Term<A> {
 pub fn xor<A: Ord + Clone>(a: Term<A>, b: Term<A>) -> Term<A> {
     f_app_ac(AcSym::Xor, vec![a, b])
 }
+/// Mirrors `Convenience.hs` `(++:)`; retained for AC-constructor family
+/// completeness, no caller yet.
 pub fn nat_plus<A: Ord + Clone>(a: Term<A>, b: Term<A>) -> Term<A> {
     f_app_ac(AcSym::NatPlus, vec![a, b])
 }

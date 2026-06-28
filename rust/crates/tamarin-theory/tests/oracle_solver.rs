@@ -274,7 +274,7 @@ fn simplify_top_level_disj_lemma_left_intact() {
 
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+        for c in ["/usr/local/bin/maude", "maude"] {
             if std::path::Path::new(c).exists() { return Some(c.to_string()); }
         }
         None
@@ -325,7 +325,7 @@ fn proof_search_disj_lemma_picks_induction_first() {
 
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+        for c in ["/usr/local/bin/maude", "maude"] {
             if std::path::Path::new(c).exists() { return Some(c.to_string()); }
         }
         None
@@ -375,7 +375,7 @@ fn verdict_match_suite_all_solved_against_tamarin() {
 
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+        for c in ["/usr/local/bin/maude", "maude"] {
             if std::path::Path::new(c).exists() { return Some(c.to_string()); }
         }
         None
@@ -576,7 +576,7 @@ fn corpus_verdict_match_coverage_probe() {
 
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+        for c in ["/usr/local/bin/maude", "maude"] {
             if std::path::Path::new(c).exists() { return Some(c.to_string()); }
         }
         None
@@ -864,7 +864,7 @@ fn corpus_proof_skeleton_match_probe() {
 
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+        for c in ["/usr/local/bin/maude", "maude"] {
             if std::path::Path::new(c).exists() { return Some(c.to_string()); }
         }
         None
@@ -1088,7 +1088,7 @@ fn probe_tpm_left_reachable() {
     use tamarin_theory::constraint::solver::search::ProofNode;
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+        for c in ["/usr/local/bin/maude", "maude"] {
             if std::path::Path::new(c).exists() { return Some(c.to_string()); }
         }
         None
@@ -1160,7 +1160,7 @@ fn probe_nspk3_fresh_sources() {
     use tamarin_theory::constraint::solver::sources::precompute_full_sources;
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+        for c in ["/usr/local/bin/maude", "maude"] {
             if std::path::Path::new(c).exists() { return Some(c.to_string()); }
         }
         None
@@ -1197,7 +1197,7 @@ fn probe_nspk3_cyclic_leaf() {
     use tamarin_theory::constraint::solver::search::ProofNode;
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+        for c in ["/usr/local/bin/maude", "maude"] {
             if std::path::Path::new(c).exists() { return Some(c.to_string()); }
         }
         None
@@ -1285,7 +1285,7 @@ fn probe_chaum_unforgeability() {
     use tamarin_theory::constraint::constraints::Goal;
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+        for c in ["/usr/local/bin/maude", "maude"] {
             if std::path::Path::new(c).exists() { return Some(c.to_string()); }
         }
         None
@@ -1375,7 +1375,7 @@ fn probe_chaum_unforgeability() {
 fn probe_tls_setup_possible() {
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+        for c in ["/usr/local/bin/maude", "maude"] {
             if std::path::Path::new(c).exists() { return Some(c.to_string()); }
         }
         None
@@ -1473,7 +1473,7 @@ fn probe_tls_setup_possible() {
 fn probe_nslpk3_nonce_secrecy() {
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+        for c in ["/usr/local/bin/maude", "maude"] {
             if std::path::Path::new(c).exists() { return Some(c.to_string()); }
         }
         None
@@ -1563,7 +1563,7 @@ fn probe_nslpk3_nonce_secrecy() {
 fn probe_cr_executable() {
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+        for c in ["/usr/local/bin/maude", "maude"] {
             if std::path::Path::new(c).exists() { return Some(c.to_string()); }
         }
         None
@@ -1636,7 +1636,7 @@ fn prove_lemma_tiny_setup_verdict_matches_tamarin() {
 
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+        for c in ["/usr/local/bin/maude", "maude"] {
             if std::path::Path::new(c).exists() { return Some(c.to_string()); }
         }
         None
@@ -1677,7 +1677,7 @@ fn ex_decomposition_produces_action_goal_via_induction() {
 
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+        for c in ["/usr/local/bin/maude", "maude"] {
             if std::path::Path::new(c).exists() { return Some(c.to_string()); }
         }
         None
@@ -1709,7 +1709,7 @@ fn ex_decomposition_produces_action_goal_via_induction() {
     assert!(non_empty.goals.iter().any(|(g, _)|
         matches!(g, tamarin_theory::constraint::constraints::Goal::Action(_, fact)
             if fact.tag == tamarin_theory::fact::FactTag::Proto(
-                tamarin_theory::fact::Multiplicity::Linear, "Setup".into(), 1))),
+                tamarin_theory::fact::Multiplicity::Linear, "Setup", 1))),
         "expected a Setup-action goal in the step case after Ex decomposition");
 }
 
@@ -1727,7 +1727,7 @@ fn atom_decomposition_creates_action_goal_in_simplify() {
 
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+        for c in ["/usr/local/bin/maude", "maude"] {
             if std::path::Path::new(c).exists() { return Some(c.to_string()); }
         }
         None
@@ -1771,7 +1771,7 @@ fn prove_lemma_disj_lemma_terminates_and_tamarin_verifies() {
 
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+        for c in ["/usr/local/bin/maude", "maude"] {
             if std::path::Path::new(c).exists() { return Some(c.to_string()); }
         }
         None
@@ -1820,7 +1820,7 @@ fn proof_search_disj_lemma_descends_into_disj_goal() {
 
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+        for c in ["/usr/local/bin/maude", "maude"] {
             if std::path::Path::new(c).exists() { return Some(c.to_string()); }
         }
         None
@@ -1879,7 +1879,7 @@ fn simplify_conj_wrapping_disj_produces_goal() {
 
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+        for c in ["/usr/local/bin/maude", "maude"] {
             if std::path::Path::new(c).exists() { return Some(c.to_string()); }
         }
         None
@@ -1952,7 +1952,7 @@ fn proof_search_end_to_end_tiny_theory() {
 
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+        for c in ["/usr/local/bin/maude", "maude"] {
             if std::path::Path::new(c).exists() { return Some(c.to_string()); }
         }
         None
@@ -1969,7 +1969,7 @@ fn proof_search_end_to_end_tiny_theory() {
     };
     let info: RuleInfo<ProtoRuleACInstInfo, IntrRuleACInfo> =
         RuleInfo::Proto(ProtoRuleACInstInfo {
-            name: ProtoRuleName::Stand("Setup".into()),
+            name: ProtoRuleName::Stand("Setup"),
             attributes: RuleAttributes::empty(),
             loop_breakers: Vec::new(),
         });
@@ -2003,7 +2003,7 @@ fn solve_premise_goal_against_fixture_matches_rule_count() {
 
     fn maude_path() -> Option<String> {
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
-        for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+        for c in ["/usr/local/bin/maude", "maude"] {
             if std::path::Path::new(c).exists() { return Some(c.to_string()); }
         }
         None

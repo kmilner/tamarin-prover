@@ -1,4 +1,4 @@
-//! Port of `GraphOptions` from `Graph.hs:55-73`.
+//! Port of `GraphOptions` from `Graph.hs`.
 
 use std::collections::HashMap;
 
@@ -18,7 +18,7 @@ pub struct GraphOptions {
 
 impl Default for GraphOptions {
     fn default() -> Self {
-        // Mirror of `defaultGraphOptions` (Graph.hs:66-73).
+        // Mirror of `defaultGraphOptions` (Graph.hs).
         GraphOptions {
             simplification_level: SimplificationLevel::SL2,
             show_auto_source: false,
@@ -31,7 +31,7 @@ impl Default for GraphOptions {
 
 /// Build `GraphOptions` from a render-request query string.
 ///
-/// Faithful port of Haskell `getOptions` (`Web/Handler.hs:1331-1349`).
+/// Faithful port of Haskell `getOptions` (`Web/Handler.hs`).
 /// The flags are presence-based (`un*`/`no-*` toggles arrive with an empty
 /// value, so presence, not value, is what matters):
 /// - `uncompress`     present => `compress = false`        (HS `isNothing`)
@@ -45,7 +45,12 @@ impl Default for GraphOptions {
 ///   (HS `fromMaybe SL2 (simpl >>= readMaybe . T.unpack)`).
 ///
 /// The `uncompact`/`CompactBoringNodes` flag belongs to `DotOptions`
-/// (`Handler.hs:1333-1334`), not `GraphOptions`, so it is not handled here.
+/// (`Handler.hs`), not `GraphOptions`, so it is not handled here.
+///
+/// Convenience wrapper that parses the query string and delegates to
+/// [`graph_options_from_params`]; live handlers go through
+/// `graph_options_from_params` directly, so this entry point is used
+/// only where a raw query string is on hand (and in tests).
 pub fn graph_options_from_query(qs: &str) -> GraphOptions {
     let params: HashMap<String, String> = qs.split('&')
         .filter(|kv| !kv.is_empty())
@@ -83,7 +88,7 @@ pub fn graph_options_from_params(params: &HashMap<String, String>) -> GraphOptio
 /// Parse a `SimplificationLevel` exactly as Haskell's derived `Read` would.
 ///
 /// The data type is `data SimplificationLevel = SL0 | SL1 | SL2 | SL3`
-/// (`Graph.hs:45-46`), so its derived `Read` parses only the bare
+/// (`Graph.hs`), so its derived `Read` parses only the bare
 /// constructor tokens. Following `Read`'s lexer it skips leading/trailing
 /// whitespace and accepts a single matched pair of surrounding parentheses;
 /// numeric input (e.g. `"2"`) fails. Returns `None` on any non-match.

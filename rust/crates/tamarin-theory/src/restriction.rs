@@ -8,6 +8,8 @@
 
 use crate::formula::LNFormula;
 
+// Not yet ported: the `--diff` lhs/rhs restriction attributes
+// (HS `RestrictionAttribute`); no caller yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RestrictionAttribute {
     LhsRestriction,

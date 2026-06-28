@@ -495,7 +495,7 @@ fn canonical_lnterm_with_idx(t: &tamarin_term::lterm::LNTerm) -> String {
         }
         Term::App(sym, args) => {
             let head = match sym {
-                FunSym::NoEq(s) => String::from_utf8_lossy(&s.name).to_string(),
+                FunSym::NoEq(s) => String::from_utf8_lossy(s.name).to_string(),
                 FunSym::C(_) => "C".to_string(),
                 FunSym::Ac(_) => "AC".to_string(),
                 FunSym::List => "List".to_string(),
@@ -556,7 +556,7 @@ fn canonical_lnterm(t: &tamarin_term::lterm::LNTerm) -> String {
         }
         Term::App(sym, args) => {
             let head = match sym {
-                FunSym::NoEq(s) => String::from_utf8_lossy(&s.name).to_string(),
+                FunSym::NoEq(s) => String::from_utf8_lossy(s.name).to_string(),
                 FunSym::C(_) => "C".to_string(),
                 FunSym::Ac(_) => "AC".to_string(),
                 FunSym::List => "List".to_string(),

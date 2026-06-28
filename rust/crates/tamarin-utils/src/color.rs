@@ -115,6 +115,13 @@ pub fn hex_to_rgb(s: &str) -> Option<Rgb> {
 pub fn hsv_to_hex(c: Hsv) -> String { rgb_to_hex(hsv_to_rgb(c)) }
 
 // -- Palette generation -------------------------------------------------------
+//
+// Intentionally retained: faithful `Color.hs` port. This palette layer
+// (`ColorParams`/`*color_group*`/`gen_color_groups`) plus the `hex_to_rgb`,
+// `hsv_to_hex`, `hsv_to_gray` and `rgb_to_gray` helpers above currently have no
+// Rust caller — the dot-color path uses a fixed-hex approximation and is slated
+// to migrate onto this byte-faithful palette later. (`rgb_to_hsv`/`hsv_to_rgb`/
+// `rgb_to_hex`/`Rgb`/`Hsv` above ARE live in `tamarin-sapic`/`tamarin-server`.)
 
 #[derive(Debug, Clone, Copy)]
 pub struct ColorParams {

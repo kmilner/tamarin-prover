@@ -121,9 +121,9 @@ impl std::error::Error for IntrRuleParseError {}
 ///
 /// We mirror this here via [`MaudeSigNullaryGuard`], which pushes the
 /// 0-arity NoEq names from `msig` into the `USER_NULLARY_FUNS`
-/// thread-local (defined at elaborate.rs:61) read by `term_to_lnterm`'s
-/// `Var` branch (elaborate.rs:1522-1545, via `is_user_nullary_fun` at
-/// elaborate.rs:1539).  The guard restores the prior state on drop.
+/// thread-local (defined in elaborate.rs) read by `term_to_lnterm`'s
+/// `Var` branch, via `is_user_nullary_fun` (defined in elaborate.rs).
+/// The guard restores the prior state on drop.
 pub fn parse_intruder_rules(
     msig: &MaudeSig,
     ctxt_desc: &str,
@@ -185,9 +185,9 @@ pub fn parse_intruder_rules(
 /// `option 0 natural` would accept it.  This is a latent, unexercised
 /// parser-side divergence — the cached corpus never hits it.)
 ///
-/// `True False` are HS hard-codes — see the FIXME at Rule.hs:164-165
-/// ("Currently we (wrongly) always assume that we have a subterm
-/// rule").  Subterm=True / constant=False.
+/// `True False` are HS hard-codes — see the FIXME in
+/// Theory/Text/Parser/Rule.hs ("Currently we (wrongly) always assume
+/// that we have a subterm rule").  Subterm=True / constant=False.
 fn ast_rule_to_intr_rule_ac(r: &p::Rule) -> Result<IntrRuleAC, String> {
     // HS `intrInfo` rejects non-c/d-prefixed names.  Mirror that here.
     let bytes = r.name.as_bytes();
@@ -441,7 +441,7 @@ mod tests {
         // (mirroring the `maude_handle`/`dh_maude_handle` gating in
         // intruder_rules.rs).
         let maude_path = std::env::var("MAUDE_PATH").ok().or_else(|| {
-            for c in ["/home/linuxbrew/.linuxbrew/bin/maude",
+            for c in [
                       "/usr/local/bin/maude", "maude"] {
                 if std::path::Path::new(c).exists() { return Some(c.to_string()); }
             }
@@ -531,7 +531,7 @@ mod tests {
             match action_term {
                 Term::App(sym, args) => {
                     if let tamarin_term::function_symbols::FunSym::NoEq(s) = sym {
-                        assert_eq!(&*s.name, expected_name,
+                        assert_eq!(s.name, expected_name,
                             "{}: action term sym name", label);
                         assert_eq!(s.arity, 0, "{}: action term arity", label);
                         assert!(args.is_empty(), "{}: action term args", label);
@@ -572,7 +572,7 @@ mod tests {
         let action_term = &rules[0].actions[0].terms[0];
         match action_term {
             Term::Lit(Lit::Var(v)) => {
-                assert_eq!(&*v.name, "one",
+                assert_eq!(v.name, "one",
                     "under pair_maude_sig, `one` should remain a Var; HS-equivalent: \
                      `funSyms pairMaudeSig` does not include `oneSym`");
             }

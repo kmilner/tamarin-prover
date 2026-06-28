@@ -55,7 +55,7 @@ pub fn apply_sapic(
         return Ok(Vec::new());
     };
 
-    // P0a + Phase 5: parser AST → theory AST, inlining process-definition
+    // parser AST → theory AST, inlining process-definition
     // calls (`let P = ..` / `P(args)`) with parameter substitution.  HS inlines
     // at parse time (`Theory.Text.Parser.Sapic.actionprocess`); we do it here,
     // resolving every `Call` against the theory's `ProcessDef`s.

@@ -145,19 +145,6 @@ pub fn destruction_rules(
     let pos_iter: Vec<i64> = pos.clone();
     // `rhs` is loop-invariant, so compute `frees(rhs).is_empty()` once.
     let rhs_frees_empty = frees(rhs).is_empty();
-    // Ad-hoc debug tracing, gated behind a once-cached env lookup so the
-    // generation path doesn't `getenv` on every subterm rule.
-    {
-        use std::sync::OnceLock;
-        static DBG_DESTR_POS: OnceLock<bool> = OnceLock::new();
-        let dbg = *DBG_DESTR_POS
-            .get_or_init(|| std::env::var("TAM_RS_DBG_DESTR_POS").is_ok());
-        if dbg {
-            use tamarin_term::pretty::pretty_lnterm;
-            eprintln!("[destr_pos] lhs={} rhs={} pos={:?}",
-                pretty_lnterm(lhs), pretty_lnterm(rhs), pos);
-        }
-    }
     for (step_idx, &i) in pos_iter.iter().enumerate() {
         match &t {
             Term::App(FunSym::NoEq(sym), args) => {
@@ -194,14 +181,17 @@ pub fn destruction_rules(
                 // Emit the rule unless the next step's term equals rhs
                 // and rhs already in uprems' (Haskell's filter).
                 let cond_emit = t_new != *rhs && !uprems.contains(rhs);
+                // Next step's position-name prefix `_<i><pd>`; reused both
+                // for the (conditional) rule name and to advance `posname`
+                // below — neither `i` nor `posname` changes in between.
+                let next_posname = format!("_{}{}", i, posname);
                 if cond_emit {
                     // Build the rule name: `_<i><pd>` ++ funs.
-                    let posname_now = format!("_{}{}", i, posname);
-                    let mut name = posname_now.as_bytes().to_vec();
+                    let mut name = next_posname.as_bytes().to_vec();
                     let funs = {
                         let mut f = name_acc.clone();
                         f.extend_from_slice(b"_");
-                        f.extend_from_slice(&sym.name);
+                        f.extend_from_slice(sym.name);
                         f
                     };
                     name.extend_from_slice(&funs);
@@ -226,8 +216,8 @@ pub fn destruction_rules(
                 }
                 // Update accumulators and walk down.
                 name_acc.extend_from_slice(b"_");
-                name_acc.extend_from_slice(&sym.name);
-                posname = format!("_{}{}", i, posname);
+                name_acc.extend_from_slice(sym.name);
+                posname = next_posname;
                 t = t_new;
             }
             Term::Lit(_) => {
@@ -651,7 +641,7 @@ pub fn construction_rules(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<IntrRu
         let act = ku_fact(m);
         // Encode the constructor name in the IntrRuleACInfo.
         let mut name = b"_".to_vec();
-        name.extend_from_slice(&s.name);
+        name.extend_from_slice(s.name);
         let info = IntrRuleACInfo::ConstrRule(name);
         out.push(Rule::new(info, prems, vec![conc], vec![act]));
     }
@@ -865,7 +855,6 @@ pub fn variants_intruder(
                 .map(|m| m + 1).unwrap_or(0);
             s_fresh.fresh_to_free_avoiding(
                 |n| { let b = counter; counter += n; b },
-                &packed_frees,
             )
         };
 
@@ -1090,8 +1079,13 @@ pub fn equal_rule_up_to_renaming(
 // =============================================================================
 /// `normRule'` — normalise every term in an intruder rule via Maude.
 ///
-/// Mirrors HS `normRule'` (IntruderRules.hs:316-321).
-pub fn norm_rule(
+/// Mirrors HS `normRule'` (IntruderRules.hs). Retained as a standalone
+/// reusable mirror of `normRule'`; it is intentionally not on the
+/// `variants_intruder` hot path, which inlines normalisation via
+/// `maude.reduce` rather than going through this function.
+// Intentionally retained: faithful HS port; no caller yet.
+#[allow(dead_code)]
+pub(crate) fn norm_rule(
     maude: &tamarin_term::maude_proc::MaudeHandle,
     ru: &IntrRuleAC,
 ) -> IntrRuleAC {
@@ -1540,7 +1534,7 @@ mod tests {
     //
     //   1. Pattern #1 line 135: at the LAST position step, if the
     //      current term is an FApp AND rhs has free vars, return [].
-    //      (The "skip-last" — task #164 resolved this.)
+    //      (The "skip-last" case.)
     //
     //   2. Private-symbol stop (line 149): descending through a Private
     //      constructor terminates the loop early.
@@ -1625,7 +1619,7 @@ mod tests {
     // =========================================================================
     fn maude_handle() -> Option<tamarin_term::maude_proc::MaudeHandle> {
         let path = std::env::var("MAUDE_PATH").ok().or_else(|| {
-            for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+            for c in ["/usr/local/bin/maude", "maude"] {
                 if std::path::Path::new(c).exists() { return Some(c.to_string()); }
             }
             None
@@ -1816,7 +1810,7 @@ mod tests {
 
     fn dh_maude_handle() -> Option<tamarin_term::maude_proc::MaudeHandle> {
         let path = std::env::var("MAUDE_PATH").ok().or_else(|| {
-            for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+            for c in ["/usr/local/bin/maude", "maude"] {
                 if std::path::Path::new(c).exists() { return Some(c.to_string()); }
             }
             None

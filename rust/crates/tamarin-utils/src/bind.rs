@@ -30,6 +30,8 @@ where
 {
     pub fn new() -> Self { Bindings::default() }
 
+    /// `noBindings`: retained as a named-constructor alias mirroring the
+    /// upstream Haskell API; equivalent to [`Bindings::new`].
     pub fn no_bindings() -> Self { Bindings::default() }
 
     /// `lookupBinding`.

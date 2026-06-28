@@ -6,11 +6,11 @@
 //! becoming open, then computes a minimum cycle-breaking set with
 //! DFS.
 //!
-//! For the Rust port we expose the cycle-breaking algorithm
-//! (`dfs_loop_breakers`) and the abstraction over data-flow
-//! relations. Computing the actual relation requires Maude-backed
-//! unifiability — that piece is wired in by callers once the typed
-//! rule layer is in place.
+//! For the Rust port this module provides only the cycle-breaking DFS
+//! (`dfs_loop_breakers`) over an abstract data-flow relation. The
+//! relation itself (the `useAutoLoopBreakersAC` / `dataflowRelAC` port,
+//! with its Maude-backed `unifiable_ln_facts` checks) is built by the
+//! constraint-solver context and passed in.
 
 use std::collections::BTreeSet;
 

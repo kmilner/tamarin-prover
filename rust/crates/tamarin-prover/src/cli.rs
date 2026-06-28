@@ -183,7 +183,8 @@ pub struct Args {
     /// `--maude-processes=M` — size of the pool of Maude subprocesses
     /// the rayon workers borrow from at parallel sites.  Each
     /// subprocess costs ~30-100 MB resident; too many → OOM on small
-    /// VMs.  Default is `max(1, processors / 2)`, balancing throughput
+    /// VMs.  Default is `max(1, processors)` (a 1:1 workers:maudes
+    /// ratio; forced to 1 when `--processors=1`), balancing throughput
     /// against memory.  `M=1` forces all workers to share one Maude
     /// (pre-pool behaviour, byte-identical to sequential).  When
     /// `--processors=1` we force `M=1` automatically (no point in a
@@ -614,10 +615,9 @@ pub fn parse_args(raw: &[String]) -> Result<Args, CliError> {
 
 impl Args {
     /// Resolve `--processors` (or its default).  Default = full
-    /// machine parallelism (`available_parallelism()`).  Previously
-    /// capped at 4 to avoid Maude IPC mutex contention from making
-    /// larger values unproductive; with `MaudePool` the contention
-    /// is gone and we let users use every core.
+    /// machine parallelism (`available_parallelism()`); Maude IPC mutex
+    /// contention is mediated by the `MaudePool` (`--maude-processes`),
+    /// so every core can be used.
     pub fn effective_processors(&self) -> usize {
         match self.processors {
             Some(n) => n.max(1),
@@ -805,10 +805,11 @@ pub fn detect_maude_version_pub() -> Option<String> {
 }
 
 /// Probe `<path> --version` and return the trimmed version string when
-/// the binary is reachable, `None` otherwise.  Callers that have an
-/// explicit `--with-maude` path (e.g. `run::run_test`/`run::run_variants`)
-/// should pass it here so the reported version matches the binary the
-/// prover will actually invoke (HS `ensureMaude` uses `maudePath as`).
+/// the binary is reachable, `None` otherwise.  A caller that has an
+/// explicit `--with-maude` path can pass it here so the reported version
+/// matches the binary the prover will actually invoke (HS `ensureMaude`
+/// uses `maudePath`).  No current caller does — the only caller is
+/// [`detect_maude_version_pub`], which probes the bare `maude` binary.
 pub fn detect_maude_version_at(path: &str) -> Option<String> {
     if let Ok(out) = std::process::Command::new(path).arg("--version").output() {
         if out.status.success() {
@@ -865,7 +866,8 @@ pub fn help_text() -> String {
     s.push_str("                                        Default: available_parallelism() (full machine).\n");
     s.push_str("                                        N=1 → byte-identical to sequential output.\n");
     s.push_str("     --maude-processes=M                Maude subprocesses in the per-task pool.\n");
-    s.push_str("                                        Default: max(1, processors / 2).  Each costs\n");
+    s.push_str("                                        Default: processors (1:1 with the worker pool,\n");
+    s.push_str("                                        or 1 when --processors=1).  Each costs\n");
     s.push_str("                                        ~30-100 MB RAM; lower if memory is tight.\n");
     s.push_str("                                        M=1 → single Maude (pre-pool behaviour).\n");
     s.push('\n');

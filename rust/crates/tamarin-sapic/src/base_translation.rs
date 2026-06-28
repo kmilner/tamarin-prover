@@ -63,6 +63,26 @@ pub fn to_ln_fact(f: &tamarin_theory::sapic::SapicLNFact) -> tamarin_theory::fac
 }
 
 /// `toLVar v = slvar v`.
+/// Apply a SAPIC substitution to a SAPIC term. Shared by `inline` and
+/// `let_destructors` (both substitute SAPIC terms identically).
+pub(crate) fn subst_term(
+    subst: &tamarin_term::subst::Subst<tamarin_term::lterm::Name, SapicLVar>,
+    t: &SapicTerm,
+) -> SapicTerm {
+    tamarin_term::subst::apply_vterm(subst, t.clone())
+}
+
+/// Apply a SAPIC substitution to a SAPIC fact (tag + annotations preserved).
+pub(crate) fn subst_fact(
+    subst: &tamarin_term::subst::Subst<tamarin_term::lterm::Name, SapicLVar>,
+    f: &tamarin_theory::sapic::SapicLNFact,
+) -> tamarin_theory::sapic::SapicLNFact {
+    let terms = f.terms.iter().map(|t| subst_term(subst, t)).collect();
+    let mut nf = tamarin_theory::fact::Fact::new(f.tag.clone(), terms);
+    nf = nf.with_annotations(f.annotations.clone());
+    nf
+}
+
 pub fn to_lvar(v: &SapicLVar) -> LVar {
     v.var.clone()
 }
@@ -864,7 +884,7 @@ pub(crate) fn ln_term_to_parser(t: &LNTerm) -> tamarin_parser::ast::Term {
             NameTag::Node => p::Term::PubLit(n.id.0.to_string()),
         },
         VTerm::App(FunSym::NoEq(sym), args) => {
-            let name = String::from_utf8_lossy(&sym.name).to_string();
+            let name = String::from_utf8_lossy(sym.name).to_string();
             if name == "pair" && args.len() == 2 {
                 let mut flat = Vec::new();
                 collect_pair(t, &mut flat);
@@ -899,7 +919,7 @@ fn collect_pair(t: &LNTerm, out: &mut Vec<tamarin_parser::ast::Term>) {
     use tamarin_term::function_symbols::FunSym;
     use tamarin_term::vterm::VTerm;
     if let VTerm::App(FunSym::NoEq(sym), args) = t {
-        if &*sym.name == b"pair" && args.len() == 2 {
+        if sym.name == b"pair" && args.len() == 2 {
             collect_pair(&args[0], out);
             collect_pair(&args[1], out);
             return;
@@ -928,11 +948,10 @@ fn formula_free_lvars(f: &tamarin_parser::ast::Formula) -> BTreeSet<LVar> {
     }
     fn collect_term(t: &p::Term, bound: &[String], out: &mut BTreeSet<LVar>) {
         match t {
-            p::Term::Var(v) => {
-                if !bound.iter().any(|n| n == &v.name) {
+            p::Term::Var(v)
+                if !bound.iter().any(|n| n == &v.name) => {
                     out.insert(LVar::new(v.name.clone(), sort_of(&v.sort), v.idx));
                 }
-            }
             p::Term::App(_, args) | p::Term::Pair(args) => {
                 for a in args {
                     collect_term(a, bound, out);
@@ -998,7 +1017,7 @@ fn formula_free_lvars(f: &tamarin_parser::ast::Formula) -> BTreeSet<LVar> {
 fn eq_fact(t1: &SapicTerm, t2: &SapicTerm) -> tamarin_theory::fact::LNFact {
     use tamarin_theory::fact::{Fact, FactTag, Multiplicity};
     let terms = vec![to_ln_term(t1), to_ln_term(t2)];
-    Fact::new(FactTag::Proto(Multiplicity::Linear, "Eq".into(), 2), terms)
+    Fact::new(FactTag::Proto(Multiplicity::Linear, "Eq", 2), terms)
 }
 
 /// `fromList $ getFactVariables fa` — the set of variables occurring in a fact.

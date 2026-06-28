@@ -4,8 +4,9 @@
 //!
 //! This module is a test-only cross-checking harness; it is **not**
 //! part of `--prove` output. The production pretty-printer lives in
-//! `proof.rs` / `proof_method.rs` (ports of `Theory/Proof.hs`
-//! `prettyProofWith`/`ppCases` and
+//! `pretty_theory.rs` (`pretty_proof_body` / `pp_step_at`, port of
+//! `Theory/Proof.hs` `prettyProofWith`/`ppCases`) and
+//! `constraint/solver/proof_method.rs` (port of
 //! `Theory/Constraint/Solver/ProofMethod.hs` `prettyProofMethod`).
 //! The "intentionally drops X" notes below describe abbreviations made
 //! by *this* skeleton diff tool, not divergences in the real prover.

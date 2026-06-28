@@ -239,7 +239,7 @@ fn subst(loc: &Option<SapicTerm>, t: &SapicTerm) -> SapicTerm {
             use tamarin_term::function_symbols::FunSym;
             // `FApp (NoEq sym) [a] | sym == reportSym = rep(subst loc a, loc)`.
             if let FunSym::NoEq(s) = sym {
-                if &*s.name == b"report" && args.len() == 1 {
+                if s.name == b"report" && args.len() == 1 {
                     let inner = subst(&Some(loc.clone()), &args[0]);
                     return tamarin_term::term::f_app_no_eq(
                         sapic_rep_sym(),
@@ -317,7 +317,7 @@ mod tests {
         let out = subst(&Some(loc.clone()), &report_c);
         match &out {
             VTerm::App(tamarin_term::function_symbols::FunSym::NoEq(s), args) => {
-                assert_eq!(&*s.name, b"rep");
+                assert_eq!(s.name, b"rep");
                 assert_eq!(args.len(), 2);
                 assert_eq!(args[0], c);
                 assert_eq!(args[1], loc);

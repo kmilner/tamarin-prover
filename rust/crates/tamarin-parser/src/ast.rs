@@ -1,7 +1,5 @@
 //! Surface-syntax AST for `.spthy` files.
 
-use std::fmt;
-
 // =============================================================================
 // Top-level theory
 // =============================================================================
@@ -236,7 +234,7 @@ pub struct ParsedProofTree {
 /// Parsed proof method.  Mirrors HS's `ProofMethod` enum (matched by
 /// `Theory.Text.Parser.Proof.proofMethod`, Proof.hs:76-85).  Plus
 /// `Solved` for the `SOLVED` keyword leaf and `Other` for any token
-/// pattern we don't yet recognise.
+/// pattern intentionally left to the auto-prover fallback.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedMethod {
     /// `by sorry` or `sorry` (HS: `Sorry Nothing`).  This is the
@@ -259,8 +257,8 @@ pub enum ParsedMethod {
     Unfinishable,
     /// `INVALIDATED` (HS: `Invalidated`).
     Invalidated,
-    /// Any other proof-method token we don't yet handle structurally.
-    /// At replay time these fall back to the auto-prover.
+    /// Any proof-method token not matched by a structural variant;
+    /// intentionally replayed via the auto-prover.
     Other(String),
 }
 
@@ -590,17 +588,3 @@ pub enum FlagFormula {
     Or(Box<FlagFormula>, Box<FlagFormula>),
 }
 
-// =============================================================================
-// Pretty
-// =============================================================================
-
-impl fmt::Display for Theory {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "theory {}", self.name)?;
-        if let Some(c) = &self.configuration {
-            write!(f, " configuration: {:?}", c)?;
-        }
-        writeln!(f, " (items: {})", self.items.len())?;
-        Ok(())
-    }
-}

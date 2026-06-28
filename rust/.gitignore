@@ -3,4 +3,7 @@ Cargo.lock
 
 # corpus_full_trace_diff.sh local caches and per-run result snapshots
 scripts/.hs_canon_cache/
+scripts/.hs_file_cache/
 scripts/.corpus_full_truedl_*.txt
+# scratch workflow scripts dropped by tooling runs
+scripts/.wf_*.js

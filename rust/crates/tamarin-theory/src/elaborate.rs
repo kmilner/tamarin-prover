@@ -1,22 +1,26 @@
 //! Elaboration: parser AST → typed `Theory`.
 //!
 //! This pass takes a `tamarin_parser::ast::Theory` (the surface syntax
-//! tree) and produces a `crate::theory::Theory` (typed). The full
-//! Haskell `processOpenTheory` does many things — macro expansion,
-//! sort inference, predicate expansion, `_restrict` lifting, derivation
-//! checks. This first cut handles:
+//! tree) and produces a `crate::theory::Theory` (typed), mirroring the
+//! Haskell `processOpenTheory`. It handles:
 //!
 //! - Theory header (`name`, `in_file`, `is_diff`)
 //! - `builtins:` → `MaudeSig` (we record the names; full sig
 //!   composition is handled by `signature::SignaturePure::empty`)
-//! - `functions:` → `st_fun_syms` extension
-//! - `equations:` → recorded as `CtxtStRule`s when convertible
+//! - `functions:`/`equations:`/`macros:` → signature registration
+//!   (`st_fun_syms`, `CtxtStRule`s when convertible, macro definitions)
+//! - Parser-AST macro expansion (`macro_expand::expand_theory_macros`)
+//!   and predicate expansion (`predicate_expand::expand_theory_formulas`)
+//!   before any typed conversion
 //! - Rules — `parser::Rule` → `OpenProtoRule(ProtoRuleE, [])`
-//! - Lemmas — passthrough; the formula is intentionally retained as
-//!   parser AST, with guarded conversion done lazily via
-//!   `formula_to_guarded`
-//! - Restrictions — passthrough as `OpenRestriction`
-//! - Predicates, macros, formal comments — copied verbatim
+//! - Lemmas / restrictions — the formula is intentionally retained as
+//!   parser AST (guarded conversion done lazily via `formula_to_guarded`),
+//!   after arity-1 tuple folding (`rewrite_arity1_*`) and AC/C
+//!   canonicalization (`canonicalize_ac_in_p*`)
+//!
+//! It also provides the parser↔typed conversion helpers used above:
+//! `term_to_lnterm`/`lnterm_to_term` (LNTerm round-tripping) and the
+//! SAPIC term/fact converters (`term_to_sapic_term`/`fact_to_sapic_fact`).
 //!
 //! Returned errors describe the surface offence (e.g. "duplicate rule
 //! `R`"), with no internal panics.
@@ -949,9 +953,12 @@ fn elaborate_items(
             }
             p::TheoryItem::ProcessDef(_) | p::TheoryItem::TopLevelProcess(_)
             | p::TheoryItem::EquivLemma(_, _) | p::TheoryItem::DiffEquivLemma(_) => {
-                // Process elaboration is a separate, large pass — left
-                // for the SAPIC port. We keep the items in the source
-                // representation by skipping for now.
+                // Process/equiv items are intentionally not lowered here.
+                // SAPIC translation is a dedicated pass
+                // (`tamarin_sapic::apply::apply_sapic`) that consumes the
+                // parser AST directly and injects the generated MSR rules
+                // into the elaborated theory, so this arm deliberately
+                // drops them.
             }
             p::TheoryItem::Export { tag, body } => {
                 out.items.push(TheoryItem::Translation(
@@ -1548,7 +1555,7 @@ pub fn arity1_noeq_names(sig: &tamarin_term::maude_sig::MaudeSig)
     sig.no_eq_fun_syms()
         .iter()
         .filter(|s| s.arity == 1)
-        .map(|s| String::from_utf8_lossy(&s.name).to_string())
+        .map(|s| String::from_utf8_lossy(s.name).to_string())
         .collect()
 }
 
@@ -2075,7 +2082,7 @@ mod tests {
         let t = elaborate(&p).unwrap();
         // hashing adds h/1, signing adds sign/2 etc.
         let funs: Vec<String> = t.signature.maude_sig.st_fun_syms.iter()
-            .map(|s| String::from_utf8_lossy(&s.name).to_string())
+            .map(|s| String::from_utf8_lossy(s.name).to_string())
             .collect();
         assert!(funs.iter().any(|n| n == "h"), "expected h: {:?}", funs);
         assert!(funs.iter().any(|n| n == "sign"), "expected sign: {:?}", funs);

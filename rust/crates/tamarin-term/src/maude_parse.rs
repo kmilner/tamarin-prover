@@ -411,12 +411,12 @@ fn build_app(ident: &[u8], args: Vec<MTerm>) -> MTerm {
 
 fn flatten_cons(t: &MTerm) -> Vec<MTerm> {
     if let Term::App(FunSym::NoEq(s), args) = t {
-        if &*s.name == b"cons" && args.len() == 2 {
+        if s.name == b"cons" && args.len() == 2 {
             let mut v = vec![args[0].clone()];
             v.extend(flatten_cons(&args[1]));
             return v;
         }
-        if &*s.name == b"nil" && args.is_empty() {
+        if s.name == b"nil" && args.is_empty() {
             return Vec::new();
         }
     }

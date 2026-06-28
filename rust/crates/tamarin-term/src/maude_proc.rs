@@ -26,9 +26,13 @@ const PROMPT: &[u8] = b"Maude> ";
 /// Errors that can arise from the Maude bridge.
 #[derive(Debug)]
 pub enum MaudeError {
+    /// stdin/stdout I/O failure talking to the Maude subprocess.
     Io(std::io::Error),
+    /// The `maude` binary could not be launched (e.g. not found on PATH).
     Spawn(String),
+    /// Maude's reply could not be parsed.
     Parse(maude_parse::ParseError),
+    /// Protocol or term back-conversion error not covered by the above.
     Other(String),
 }
 
@@ -78,9 +82,8 @@ pub struct MaudeStats {
 thread_local! {
     /// Per-callsite Maude call counters.  Set `TAM_PROFILE_MAUDE=1` to
     /// enable; query via `dump_callsite_profile()`.  Diagnostic only —
-    /// used in investigation #29 to confirm 100 % of `unify` calls
-    /// originate from `eq_store::add_eqs` (so optimisation effort
-    /// should target the fact-equation engine, not other call sites).
+    /// used to attribute Maude calls to their originating call site when
+    /// deciding where to focus optimisation effort.
     static MAUDE_CALLSITE_COUNTS: std::cell::RefCell<std::collections::BTreeMap<&'static str, u64>>
         = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
 }
@@ -121,18 +124,17 @@ struct MaudeProcessInner {
     /// every search step — so the same subterm gets reduced repeatedly
     /// during a single proof.  Caching cuts those repeat round-trips.
     reduce_cache: tamarin_utils::FastMap<LNTerm, LNTerm>,
-    /// Memo for `match_eqs_const_subject` EMPTY-result queries.
-    /// Historical: when this matcher was on the
-    /// `insert_implied_formulas` AC-fallback path, profiling on
-    /// csf17/keylessssl::injectivity showed 210 k calls to it, ALL
-    /// returning empty, many identical (same skolemized pattern +
-    /// subject re-tried across fixpoint passes).  That path now uses
-    /// `match_eqs_skolemize_both`, so `match_eqs_const_subject` is
-    /// test-only; the cache is retained for the tests / potential
-    /// future reuse.  Caching the empty answer is safe — no witness
-    /// LVars to renumber.  Non-empty results are NOT cached (witnesses
-    /// need fresh-renaming per use, same reason `unifiable_cache`
-    /// only stores booleans).
+    /// Memo for `match_eqs_const_subject` EMPTY-result queries.  Still
+    /// read and written by `match_eqs_const_subject` on every call;
+    /// that matcher is now reached only from tests (its former
+    /// `insert_implied_formulas` AC-fallback use moved to
+    /// `match_eqs_skolemize_both`), but the cache is retained for those
+    /// tests / potential future reuse.  AC-heavy patterns re-issue many
+    /// identical all-empty matches across fixpoint passes, so caching the
+    /// empty answer skips the repeat round-trips.  Caching the empty
+    /// answer is safe — no witness LVars to renumber.  Non-empty results
+    /// are NOT cached (witnesses need fresh-renaming per use, same reason
+    /// `unifiable_cache` only stores booleans).
     match_empty_cache: tamarin_utils::FastMap<(Vec<(LNTerm, LNTerm)>, Vec<(String, u64)>), ()>,
 }
 
@@ -481,6 +483,7 @@ impl MaudeHandle {
         }
     }
 
+    /// Snapshot of the per-operation Maude call counters for this handle.
     pub fn stats(&self) -> MaudeStats {
         self.inner.lock().unwrap().stats
     }
@@ -588,6 +591,9 @@ impl MaudeHandle {
             && g.sig.st_rules.is_empty()
     }
 
+    /// `unify` tagged with a `label` for the per-callsite profiler; uses
+    /// `avoid_max = 0`, so witness LVar indices may collide with existing
+    /// system vars — prefer `unify_at_with_avoid` when that matters.
     pub fn unify_at(&self, label: &'static str, eqs: &[Equal<LNTerm>])
         -> Result<Vec<Vec<(crate::lterm::LVar, LNTerm)>>, MaudeError>
     {
@@ -611,11 +617,18 @@ impl MaudeHandle {
         self.unify_with_avoid(eqs, avoid_max)
     }
 
+    /// Unify a list of equations modulo the theory, returning one
+    /// substitution per Maude unifier.  Equivalent to
+    /// `unify_with_avoid(eqs, 0)`; see that method for the witness-var
+    /// `avoid` contract.
     pub fn unify(&self, eqs: &[Equal<LNTerm>]) -> Result<Vec<Vec<(crate::lterm::LVar, LNTerm)>>, MaudeError>
     {
         self.unify_with_avoid(eqs, 0)
     }
 
+    /// Unify modulo the theory, with Maude-introduced witness vars given
+    /// indices above `avoid_max + 1` so they cannot collide with existing
+    /// system vars (see `unify_at_with_avoid`).
     pub fn unify_with_avoid(
         &self,
         eqs: &[Equal<LNTerm>],
@@ -678,24 +691,17 @@ impl MaudeHandle {
         // its lifted witness collides with K's renamed target,
         // creating the SubstVFresh same-target collision that
         // cascades into $R=$I (KAS_key_secrecy).
-        // H16.9 (HS-faithful): ALWAYS try the local non-AC unifier first.
+        // HS-faithful: ALWAYS try the local non-AC unifier first.
         // HS's `unifyLTermFactored` (Unification.hs:107-119) does this:
         //   1. Run `unifyRaw` locally (no Maude).
         //   2. If success with no AC residuals → return result.
         //   3. If success with AC residuals → call Maude on residuals only.
         //   4. If failure → return empty (no Maude call).
-        // Previously RS gated the fast path on `is_ac_free()` (signature
-        // has no [variant] equations).  But that meant for signatures
-        // WITH [variant] equations (e.g. StatVerif's convertpcs/checkpcs),
-        // RS sent EVERY unification to Maude, which then NARROWS via
-        // [variant] equations — keeping variants HS would drop.
-        //
-        // Verified via TAM_DBG_MAUDE_IO=full on resolved1:
-        //   HS: 0 unify calls, 198 reduce, 18 get variants.
-        //   RS: 864 unify calls (incl 81 with `true =? checkpcs(...)`),
-        //       998 reduce, 9 get variants.
-        // The extra 864 unify calls let Maude narrow [variant] equations
-        // RS shouldn't have asked about.
+        // The fast path is intentionally NOT gated on `is_ac_free()`:
+        // signatures WITH [variant] equations (e.g. StatVerif's
+        // convertpcs/checkpcs) must still try the local non-AC unifier
+        // first, otherwise every unification goes to Maude, which narrows
+        // via the [variant] equations and keeps variants HS would drop.
         {
             let eqs_owned: Vec<Equal<LNTerm>> = eqs.to_vec();
             let result = crate::unification::unify_lnterm_no_ac_with_counter(
@@ -732,10 +738,10 @@ impl MaudeHandle {
                     use crate::lterm::HasFrees;
                     for eq in eqs {
                         eq.lhs.for_each_free(&mut |v| {
-                            if &*v.name == "x" { self.ensure_above(v.idx); }
+                            if v.name == "x" { self.ensure_above(v.idx); }
                         });
                         eq.rhs.for_each_free(&mut |v| {
-                            if &*v.name == "x" { self.ensure_above(v.idx); }
+                            if v.name == "x" { self.ensure_above(v.idx); }
                         });
                     }
                 }
@@ -754,11 +760,10 @@ impl MaudeHandle {
         // `flattenUnif (subst, substs) = map (`composeVFresh` subst) substs`
         // (Unification.hs:144-147) composes each Maude arm with `subst = m`.
         //
-        // Previously RS sent the FULL `eqs` to Maude and composed each arm
-        // with the EMPTY substitution.  That left `m`'s non-AC bindings
-        // (e.g. `X.18 → em(...)`, `~ey.16 → ~ey.11`) to be re-derived by
-        // Maude per arm, with witness idxs allocated against the full input
-        // var set rather than just the AC residual's vars.
+        // We therefore factor out the non-AC substitution `m` and send only
+        // the AC residuals to Maude, so witness idxs are allocated against
+        // the residual's vars (matching HS); `m`'s bindings are composed
+        // back in below.
         let (factored_m, residual_eqs): (
             crate::subst::Subst<crate::lterm::Name, crate::lterm::LVar>,
             Vec<Equal<LNTerm>>,
@@ -839,15 +844,11 @@ impl MaudeHandle {
         // the equate target.  Net: HS sorts Mult arm BEFORE Equates arm
         // by the SubstVFresh Ord (Map-of-(key,value) lexicographic).
         //
-        // Previously RS shared `ctx` AND advanced the global counter
-        // monotonically across unifiers (msubst_to_lnsubst_with_maude
-        // line 1136-1138).  Result: every unifier saw the previous
-        // unifier's mutations to ctx.inverse (so a FreshVar reuses the
-        // same LVar across arms) and started its counter where the prior
-        // ended.  Witness collisions across arms then collapsed the
-        // distinguishing per-arm idx differences HS produces, leaving
-        // RS's SubstVFresh Ord to fall back on the VALUE structure
-        // (Lit < App), putting Equates BEFORE Mult.
+        // Each unifier therefore gets a FRESH `ctx` and counter, so per-arm
+        // witness idxs differ exactly as HS produces.  Sharing them would
+        // collapse those per-arm idx differences (cross-arm FreshVar/counter
+        // reuse), making RS's SubstVFresh Ord fall back on VALUE structure
+        // (Lit < App) and mis-order the arms.
         //
         // Fix (HS-faithful): per unifier, CLONE ctx and RESET the global
         // counter to a shared baseline.  After all unifiers, advance the
@@ -866,7 +867,7 @@ impl MaudeHandle {
             self.ensure_above(input_max);
             for lit in ctx.bindings().values() {
                 if let crate::vterm::Lit::Var(lv) = lit {
-                    if &*lv.name == "x" {
+                    if lv.name == "x" {
                         self.ensure_above(lv.idx);
                     }
                 }
@@ -939,9 +940,8 @@ impl MaudeHandle {
         //
         // HS `flattenUnif (subst, substs) = map (`composeVFresh` subst) substs`
         // (Unification.hs:147) composes each Maude arm with `subst = m`, the
-        // non-AC factored substitution.  Previously RS composed with the
-        // empty substitution because it sent the full eqs to Maude; now that
-        // we factor and send only AC residuals, `factored_m` carries the
+        // non-AC factored substitution.  Because we factor and send only the
+        // AC residuals to Maude, `factored_m` carries the
         // non-AC bindings and MUST be the second argument to composeVFresh.
         let renamed: Vec<Vec<(crate::lterm::LVar, LNTerm)>> = out.into_iter().map(|arm| {
             let arm_vfresh = crate::subst_vfresh::LSubstVFresh::<crate::lterm::Name>::from_list(arm);
@@ -1077,15 +1077,9 @@ impl MaudeHandle {
         cmd.extend_from_slice(b" <=? ");
         cmd.extend(pp_list(&subjs));
         cmd.extend_from_slice(b" .\n");
-        if tamarin_utils::env_gate!("TAM_DBG_MATCH_EQS_RAW") {
-            eprintln!("[match_eqs RAW] {}", String::from_utf8_lossy(&cmd).trim_end());
-        }
         let reply = inner.execute(&cmd)?;
         inner.stats.match_count += 1;
         drop(inner);
-        if tamarin_utils::env_gate!("TAM_DBG_MATCH_EQS_RAW") {
-            eprintln!("[match_eqs REPLY] {}", String::from_utf8_lossy(&reply).trim_end());
-        }
         _tally_callsite("match_eqs");
         let msubsts = maude_parse::parse_match_reply(&reply)?;
         let mut out = Vec::with_capacity(msubsts.len());
@@ -1131,8 +1125,6 @@ impl MaudeHandle {
         if eqs.is_empty() {
             return Ok(vec![Vec::new()]);
         }
-        let prof = tamarin_utils::env_gate!("TAM_PROFILE_MAUDE_BREAKDOWN");
-        let t0 = if prof { Some(std::time::Instant::now()) } else { None };
         // Empty-result cache.  Profiling showed 100 % of calls on
         // AC-heavy lemmas (e.g. csf17/keylessssl::injectivity) return
         // empty, with many repeats across fixpoint passes.  Cache the
@@ -1145,7 +1137,6 @@ impl MaudeHandle {
             _tally_callsite("match_eqs_const_subject::CACHE_HIT");
             return Ok(Vec::new());
         }
-        let t_after_cache = if prof { Some(std::time::Instant::now()) } else { None };
         // Skolemize subject-side free vars not in `pattern_vars`:
         // walk each rhs LNTerm and replace such LVars with a public
         // `Name`-constant tagged with a deterministic synthetic
@@ -1163,11 +1154,10 @@ impl MaudeHandle {
             out: &mut std::collections::BTreeSet<LVar>,
         ) {
             match t {
-                crate::term::Term::Lit(Lit::Var(lv)) => {
-                    if !pattern_vars.contains(&(lv.name.to_string(), lv.idx)) {
+                crate::term::Term::Lit(Lit::Var(lv))
+                    if !pattern_vars.contains(&(lv.name.to_string(), lv.idx)) => {
                         out.insert(lv.clone());
                     }
-                }
                 crate::term::Term::App(_, args) => {
                     for a in args.iter() { collect_subject_vars(a, pattern_vars, out); }
                 }
@@ -1210,7 +1200,6 @@ impl MaudeHandle {
             lhs: eq.lhs.clone(),
             rhs: rewrite_subject(&eq.rhs, &skolem_map),
         }).collect();
-        let t_after_skolem = if prof { Some(std::time::Instant::now()) } else { None };
 
         let mut inner = self.inner.lock().unwrap();
         let mut ctx = ConvCtx::new();
@@ -1251,13 +1240,7 @@ impl MaudeHandle {
         cmd.extend_from_slice(b" <=? ");
         cmd.extend(pp_list(&t2s));
         cmd.extend_from_slice(b" .\n");
-        let t_before_exec = if prof { Some(std::time::Instant::now()) } else { None };
         let reply = inner.execute(&cmd)?;
-        if tamarin_utils::env_gate!("TAM_DBG_MECS_RAW") {
-            eprintln!("[MECS_RAW] cmd={}", String::from_utf8_lossy(&cmd));
-            eprintln!("[MECS_RAW] reply={}", String::from_utf8_lossy(&reply));
-        }
-        let t_after_exec = if prof { Some(std::time::Instant::now()) } else { None };
         inner.stats.match_count += 1;
         drop(inner);
         _tally_callsite("match_eqs_const_subject");
@@ -1279,16 +1262,6 @@ impl MaudeHandle {
                 .map(|(lv, lt)| (lv, unskolemize(&lt, &reverse)))
                 .collect();
             out.push(unskolemized);
-        }
-        if let (Some(a), Some(b), Some(c), Some(d), Some(e)) =
-            (t0, t_after_cache, t_after_skolem, t_before_exec, t_after_exec) {
-            let cache = (b - a).as_micros();
-            let skol = (c - b).as_micros();
-            let prep = (d - c).as_micros();
-            let exec = (e - d).as_micros();
-            let parse = std::time::Instant::now().duration_since(e).as_micros();
-            eprintln!("[mecs] cache={}us skol={}us prep={}us exec={}us parse={}us",
-                cache, skol, prep, exec, parse);
         }
         Ok(out)
     }
@@ -1376,11 +1349,10 @@ impl MaudeHandle {
         ) {
             use crate::vterm::Lit;
             match t {
-                crate::term::Term::Lit(Lit::Var(lv)) => {
-                    if !pattern_vars.contains(&(lv.name.to_string(), lv.idx)) {
+                crate::term::Term::Lit(Lit::Var(lv))
+                    if !pattern_vars.contains(&(lv.name.to_string(), lv.idx)) => {
                         out.insert(lv.clone());
                     }
-                }
                 crate::term::Term::App(_, args) => {
                     for a in args.iter() { collect_free_non_pattern(a, pattern_vars, out); }
                 }
@@ -1426,8 +1398,6 @@ impl MaudeHandle {
             lhs: rewrite(&eq.lhs, &skolem_map),
             rhs: rewrite(&eq.rhs, &skolem_map),
         }).collect();
-        // Avoid unused-var lint when no skolemization happened.
-        let _ = &reverse;
 
         let mut inner = self.inner.lock().unwrap();
         let mut ctx = ConvCtx::new();
@@ -1475,7 +1445,10 @@ impl MaudeHandle {
         Ok(out)
     }
 
-    /// Get variants of a term.
+    /// Get the variants of a term, one substitution per Maude `[variant]`.
+    /// Each variant is back-converted with its own fresh conversion
+    /// context (see the inline note) so that fresh witness vars do not
+    /// collide between variants.
     pub fn variants(&self, t: &LNTerm) -> Result<Vec<Vec<(crate::lterm::LVar, LNTerm)>>, MaudeError> {
         let mut inner = self.inner.lock().unwrap();
         let mut ctx = ConvCtx::new();
@@ -1674,7 +1647,7 @@ fn msubst_to_lnsubst_force_x(
         let mut n: u64 = 1;
         for lit in ctx.bindings().values() {
             if let crate::vterm::Lit::Var(lv) = lit {
-                if &*lv.name == "x" && lv.idx >= n {
+                if lv.name == "x" && lv.idx >= n {
                     n = lv.idx + 1;
                 }
             }
@@ -1716,7 +1689,7 @@ fn msubst_to_lnsubst_with_maude(
         h.ensure_above(avoid_max);
         for lit in ctx.bindings().values() {
             if let crate::vterm::Lit::Var(lv) = lit {
-                if &*lv.name == "x" {
+                if lv.name == "x" {
                     h.ensure_above(lv.idx);
                 }
             }
@@ -1726,7 +1699,7 @@ fn msubst_to_lnsubst_with_maude(
         let mut n = avoid_max.saturating_add(1);
         for lit in ctx.bindings().values() {
             if let crate::vterm::Lit::Var(lv) = lit {
-                if &*lv.name == "x" && lv.idx >= n {
+                if lv.name == "x" && lv.idx >= n {
                     n = lv.idx + 1;
                 }
             }
@@ -1888,7 +1861,6 @@ mod tests {
         // Honour an env override; otherwise look for `maude` on PATH.
         if let Ok(p) = std::env::var("MAUDE_PATH") { return Some(p); }
         let candidates = [
-            "/home/linuxbrew/.linuxbrew/bin/maude",
             "/usr/local/bin/maude",
             "/usr/bin/maude",
             "maude",

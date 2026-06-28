@@ -79,7 +79,7 @@ fn dot_output_for_a_simple_system() {
         ProtoRuleACInstInfo,
         tamarin_theory::rule::IntrRuleACInfo,
     > = RuleInfo::Proto(ProtoRuleACInstInfo {
-        name: ProtoRuleName::Stand("Setup".into()),
+        name: ProtoRuleName::Stand("Setup"),
         attributes: RuleAttributes::empty(),
         loop_breakers: Vec::new(),
     });

@@ -8,9 +8,8 @@
 
 use std::collections::BTreeMap;
 
-use tamarin_term::function_symbols::{FunSym, NoEqSym};
+use tamarin_term::function_symbols::NoEqSym;
 use tamarin_term::lterm::{LSort, LVar, Name};
-use tamarin_term::term::{f_app_ac, f_app_c, f_app_list, f_app_no_eq};
 use tamarin_term::vterm::{Lit, VTerm};
 use tamarin_utils::fresh::PreciseFreshState;
 
@@ -27,7 +26,7 @@ use crate::bindings::{bindings_act, bindings_comb};
 
 /// `varsProc`: every SAPIC variable that occurs anywhere in `p` (HS
 /// `varsProc = foldMap Data.Set.singleton`, Process.hs:361 — a Set, so sorted
-/// + deduplicated).  We return the underlying `LVar`s used to seed the
+/// and deduplicated).  We return the underlying `LVar`s used to seed the
 /// avoidance state for `renameUnique`.
 fn proc_lvars(p: &PlainProcess) -> Vec<LVar> {
     let mut set = std::collections::BTreeSet::new();
@@ -138,20 +137,6 @@ fn collect_comb_vars(c: &ProcessCombinator<SapicLVar>, out: &mut std::collection
     }
 }
 
-/// Parser `SortHint` → `LSort` (mirrors elaborate.rs `sort_of`).
-fn sort_of_hint(s: &tamarin_parser::ast::SortHint) -> LSort {
-    use tamarin_parser::ast as p;
-    match s {
-        p::SortHint::Fresh | p::SortHint::Suffix(p::SuffixSort::Fresh) => LSort::Fresh,
-        p::SortHint::Pub | p::SortHint::Suffix(p::SuffixSort::Pub) => LSort::Pub,
-        p::SortHint::Node | p::SortHint::Suffix(p::SuffixSort::Node) => LSort::Node,
-        p::SortHint::Nat | p::SortHint::Suffix(p::SuffixSort::Nat) => LSort::Nat,
-        p::SortHint::Msg | p::SortHint::Suffix(p::SuffixSort::Msg) | p::SortHint::Untagged => {
-            LSort::Msg
-        }
-    }
-}
-
 /// Free `LVar`s of a `Cond` parser-AST formula (vars not bound by an enclosing
 /// quantifier).  Used to seed the `renameUnique` avoidance set and as the
 /// rename domain.
@@ -159,11 +144,10 @@ fn cond_formula_free_lvars(f: &tamarin_parser::ast::Formula) -> Vec<LVar> {
     use tamarin_parser::ast as p;
     fn collect_term(t: &p::Term, bound: &[String], out: &mut Vec<LVar>) {
         match t {
-            p::Term::Var(v) => {
-                if !bound.iter().any(|n| n == &v.name) {
-                    out.push(LVar::new(v.name.clone(), sort_of_hint(&v.sort), v.idx));
+            p::Term::Var(v)
+                if !bound.iter().any(|n| n == &v.name) => {
+                    out.push(LVar::new(v.name.clone(), crate::convert::sort_of_hint(&v.sort), v.idx));
                 }
-            }
             p::Term::App(_, args) | p::Term::Pair(args) => {
                 for a in args {
                     collect_term(a, bound, out);
@@ -240,7 +224,7 @@ fn rename_cond_formula(
                 if bound.iter().any(|n| n == &v.name) {
                     return t.clone();
                 }
-                let key = LVar::new(v.name.clone(), sort_of_hint(&v.sort), v.idx);
+                let key = LVar::new(v.name.clone(), crate::convert::sort_of_hint(&v.sort), v.idx);
                 match subst.get(&key) {
                     Some(nv) => p::Term::Var(p::VarSpec {
                         name: nv.name.to_string(),
@@ -348,19 +332,8 @@ fn rename_term(subst: &BTreeMap<LVar, LVar>, t: &SapicTerm) -> SapicTerm {
         VTerm::App(sym, args) => {
             let new_args: Vec<SapicTerm> = args.iter().map(|a| rename_term(subst, a)).collect();
             // Rebuild through the smart constructor so AC normal form is kept.
-            rebuild_app(sym, new_args)
+            tamarin_term::term::f_app(sym.clone(), new_args)
         }
-    }
-}
-
-/// Rebuild an `App` node through the AC-preserving smart constructors, mirroring
-/// `apply_vterm_map_changed`'s reconstruction (subst.rs).
-fn rebuild_app(sym: &FunSym, args: Vec<SapicTerm>) -> SapicTerm {
-    match sym {
-        FunSym::Ac(o) => f_app_ac(*o, args),
-        FunSym::C(o) => f_app_c(*o, args),
-        FunSym::NoEq(o) => f_app_no_eq(o.clone(), args),
-        FunSym::List => f_app_list(args),
     }
 }
 
@@ -504,7 +477,7 @@ fn mk_subst(
     let mut inv_pairs: Vec<(LVar, VTerm<Name, LVar>)> = Vec::new();
     for sv in bvars {
         let lv = &sv.var;
-        let v_new = tamarin_term::lterm::fresh_lvar(fresh, &lv.name, lv.sort);
+        let v_new = tamarin_term::lterm::fresh_lvar(fresh, lv.name, lv.sort);
         fwd.insert(lv.clone(), v_new.clone());
         inv_pairs.push((v_new, VTerm::Lit(Lit::Var(lv.clone()))));
     }
@@ -563,12 +536,13 @@ fn default_function_type(n: usize) -> (Vec<SapicType>, SapicType) {
 /// `viewTerm2` renders these as dedicated constructors (`FPair`/`FExp`/…) rather
 /// than `FAppNoEq`, so `typeWith` treats them via the polymorphic `viewTerm`
 /// branch (no function-type learning / no argument back-propagation).
+#[allow(clippy::nonminimal_bool)] // intentional per-symbol -> arity enumeration
 fn is_special_viewterm2_sym(fs: &NoEqSym) -> bool {
     use tamarin_term::function_symbols::{
         DH_NEUTRAL_SYM_STRING, DIFF_SYM_STRING, EXP_SYM_STRING, INV_SYM_STRING, NAT_ONE_SYM_STRING,
         ONE_SYM_STRING, PMULT_SYM_STRING,
     };
-    let n = &fs.name[..];
+    let n = fs.name;
     (n == b"pair" && fs.arity == 2)
         || (n == EXP_SYM_STRING && fs.arity == 2)
         || (n == PMULT_SYM_STRING && fs.arity == 2)
@@ -646,7 +620,7 @@ fn type_with(
                     }
                     insert_fun(env, fs, (ptypes2, outtype2.clone()))?;
                     Ok((
-                        rebuild_app(sym, ts_new),
+                        tamarin_term::term::f_app(sym.clone(), ts_new),
                         outtype2,
                     ))
                 }
@@ -658,7 +632,7 @@ fn type_with(
                         ts_new.push(a_new);
                     }
                     Ok((
-                        rebuild_app(sym, ts_new),
+                        tamarin_term::term::f_app(sym.clone(), ts_new),
                         None,
                     ))
                 }
@@ -879,7 +853,7 @@ fn init_te_from_sig(
         if let Some(key) = maude_sig
             .st_fun_syms
             .iter()
-            .find(|fs| &fs.name[..] == name.as_bytes() && fs.arity == arity)
+            .find(|fs| fs.name == name.as_bytes() && fs.arity == arity)
         {
             funs.insert(key.clone(), (arg_types.clone(), out_type.clone()));
         }
@@ -918,7 +892,7 @@ mod tests {
         let r = rename_unique(&new);
         if let Process::Action(SapicAction::New(v), _, _) = r {
             assert_eq!(v.var.idx, 1);
-            assert_eq!(&*v.var.name, "x");
+            assert_eq!(v.var.name, "x");
             assert_eq!(v.stype, Some("lol".to_string()));
         } else {
             panic!("expected New action");

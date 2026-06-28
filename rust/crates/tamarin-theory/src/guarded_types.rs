@@ -11,6 +11,7 @@
 //! `Bound (k-1)` refers to the outermost.
 
 use tamarin_parser::ast as p;
+use tamarin_utils::cow::cow_map_arc;
 
 /// Mirrors HS `BVar v = Bound Integer | Free v`.
 ///
@@ -58,6 +59,24 @@ pub enum GTerm {
 /// O(1)-clone helper: wrap a recursive `GTerm` child in `Arc`.
 #[inline]
 pub fn ga(t: GTerm) -> std::sync::Arc<GTerm> { std::sync::Arc::new(t) }
+
+/// COW combinator for a binary `GTerm` node whose two children are
+/// `Arc<GTerm>` (`AlgApp`, `Diff`, non-AC `BinOp`): `None` when both children
+/// are unchanged; otherwise materialise each side into an `Arc` slot, wrapping
+/// the rebuilt child (`ga`) or cloning the original.  The `Arc<GTerm>`-children
+/// specialisation of [`tamarin_utils::cow::cow_pair`] (which works on owned
+/// fields); the per-variant `match` arm rebuilds the node from the pair.
+pub(crate) fn cow_pair_arc(
+    a: &std::sync::Arc<GTerm>,
+    a2: Option<GTerm>,
+    b: &std::sync::Arc<GTerm>,
+    b2: Option<GTerm>,
+) -> Option<(std::sync::Arc<GTerm>, std::sync::Arc<GTerm>)> {
+    if a2.is_none() && b2.is_none() {
+        return None;
+    }
+    Some((a2.map(ga).unwrap_or_else(|| a.clone()), b2.map(ga).unwrap_or_else(|| b.clone())))
+}
 
 /// Mirrors HS `Fact (VTerm c (BVar v))`.
 #[derive(Debug, Clone, PartialEq)]
@@ -355,35 +374,18 @@ fn subst_free_term_cow(
             .map(|new| GTerm::App(n.clone(), new)),
         GTerm::Pair(items) => subst_free_slice(items, s, depth)
             .map(GTerm::Pair),
-        GTerm::AlgApp(n, a, b) => {
-            let a2 = subst_free_term_cow(a, s, depth, false);
-            let b2 = subst_free_term_cow(b, s, depth, false);
-            if a2.is_none() && b2.is_none() { return None; }
-            Some(GTerm::AlgApp(
-                n.clone(),
-                a2.map(ga).unwrap_or_else(|| a.clone()),
-                b2.map(ga).unwrap_or_else(|| b.clone()),
-            ))
-        }
-        GTerm::Diff(a, b) => {
-            let a2 = subst_free_term_cow(a, s, depth, false);
-            let b2 = subst_free_term_cow(b, s, depth, false);
-            if a2.is_none() && b2.is_none() { return None; }
-            Some(GTerm::Diff(
-                a2.map(ga).unwrap_or_else(|| a.clone()),
-                b2.map(ga).unwrap_or_else(|| b.clone()),
-            ))
-        }
-        GTerm::BinOp(op, a, b) => {
-            let a2 = subst_free_term_cow(a, s, depth, false);
-            let b2 = subst_free_term_cow(b, s, depth, false);
-            if a2.is_none() && b2.is_none() { return None; }
-            Some(GTerm::BinOp(
-                *op,
-                a2.map(ga).unwrap_or_else(|| a.clone()),
-                b2.map(ga).unwrap_or_else(|| b.clone()),
-            ))
-        }
+        GTerm::AlgApp(n, a, b) => cow_pair_arc(
+            a, subst_free_term_cow(a, s, depth, false),
+            b, subst_free_term_cow(b, s, depth, false),
+        ).map(|(a, b)| GTerm::AlgApp(n.clone(), a, b)),
+        GTerm::Diff(a, b) => cow_pair_arc(
+            a, subst_free_term_cow(a, s, depth, false),
+            b, subst_free_term_cow(b, s, depth, false),
+        ).map(|(a, b)| GTerm::Diff(a, b)),
+        GTerm::BinOp(op, a, b) => cow_pair_arc(
+            a, subst_free_term_cow(a, s, depth, false),
+            b, subst_free_term_cow(b, s, depth, false),
+        ).map(|(a, b)| GTerm::BinOp(*op, a, b)),
         GTerm::PatMatch(inner) => subst_free_term_cow(inner, s, depth, false)
             .map(|g| GTerm::PatMatch(ga(g))),
     }
@@ -392,14 +394,7 @@ fn subst_free_term_cow(
 fn subst_free_slice(args: &std::sync::Arc<[GTerm]>, s: &[(p::VarSpec, u32)], depth: u32)
     -> Option<std::sync::Arc<[GTerm]>>
 {
-    let mut out: Option<Vec<GTerm>> = None;
-    for (i, a) in args.iter().enumerate() {
-        match subst_free_term_cow(a, s, depth, false) {
-            Some(g) => out.get_or_insert_with(|| args[..i].to_vec()).push(g),
-            None => if let Some(v) = out.as_mut() { v.push(a.clone()); }
-        }
-    }
-    out.map(std::sync::Arc::from)
+    cow_map_arc(args, |a| subst_free_term_cow(a, s, depth, false))
 }
 
 /// `subst_free_fact_at_depth(f, s, depth)` — analogous for facts.
@@ -491,35 +486,18 @@ fn subst_bound_term_cow(t: &GTerm, s: &[(u32, p::VarSpec)], depth: u32) -> Optio
             .map(|new| GTerm::App(n.clone(), new)),
         GTerm::Pair(items) => subst_bound_slice(items, s, depth)
             .map(GTerm::Pair),
-        GTerm::AlgApp(n, a, b) => {
-            let a2 = subst_bound_term_cow(a, s, depth);
-            let b2 = subst_bound_term_cow(b, s, depth);
-            if a2.is_none() && b2.is_none() { return None; }
-            Some(GTerm::AlgApp(
-                n.clone(),
-                a2.map(ga).unwrap_or_else(|| a.clone()),
-                b2.map(ga).unwrap_or_else(|| b.clone()),
-            ))
-        }
-        GTerm::Diff(a, b) => {
-            let a2 = subst_bound_term_cow(a, s, depth);
-            let b2 = subst_bound_term_cow(b, s, depth);
-            if a2.is_none() && b2.is_none() { return None; }
-            Some(GTerm::Diff(
-                a2.map(ga).unwrap_or_else(|| a.clone()),
-                b2.map(ga).unwrap_or_else(|| b.clone()),
-            ))
-        }
-        GTerm::BinOp(op, a, b) => {
-            let a2 = subst_bound_term_cow(a, s, depth);
-            let b2 = subst_bound_term_cow(b, s, depth);
-            if a2.is_none() && b2.is_none() { return None; }
-            Some(GTerm::BinOp(
-                *op,
-                a2.map(ga).unwrap_or_else(|| a.clone()),
-                b2.map(ga).unwrap_or_else(|| b.clone()),
-            ))
-        }
+        GTerm::AlgApp(n, a, b) => cow_pair_arc(
+            a, subst_bound_term_cow(a, s, depth),
+            b, subst_bound_term_cow(b, s, depth),
+        ).map(|(a, b)| GTerm::AlgApp(n.clone(), a, b)),
+        GTerm::Diff(a, b) => cow_pair_arc(
+            a, subst_bound_term_cow(a, s, depth),
+            b, subst_bound_term_cow(b, s, depth),
+        ).map(|(a, b)| GTerm::Diff(a, b)),
+        GTerm::BinOp(op, a, b) => cow_pair_arc(
+            a, subst_bound_term_cow(a, s, depth),
+            b, subst_bound_term_cow(b, s, depth),
+        ).map(|(a, b)| GTerm::BinOp(*op, a, b)),
         GTerm::PatMatch(inner) => subst_bound_term_cow(inner, s, depth)
             .map(|g| GTerm::PatMatch(ga(g))),
     }
@@ -528,14 +506,7 @@ fn subst_bound_term_cow(t: &GTerm, s: &[(u32, p::VarSpec)], depth: u32) -> Optio
 fn subst_bound_slice(args: &std::sync::Arc<[GTerm]>, s: &[(u32, p::VarSpec)], depth: u32)
     -> Option<std::sync::Arc<[GTerm]>>
 {
-    let mut out: Option<Vec<GTerm>> = None;
-    for (i, a) in args.iter().enumerate() {
-        match subst_bound_term_cow(a, s, depth) {
-            Some(g) => out.get_or_insert_with(|| args[..i].to_vec()).push(g),
-            None => if let Some(v) = out.as_mut() { v.push(a.clone()); }
-        }
-    }
-    out.map(std::sync::Arc::from)
+    cow_map_arc(args, |a| subst_bound_term_cow(a, s, depth))
 }
 
 /// `subst_bound_fact_at_depth(f, s, depth)` — analogous for facts.

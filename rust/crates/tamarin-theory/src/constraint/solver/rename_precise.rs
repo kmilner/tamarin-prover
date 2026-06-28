@@ -438,7 +438,7 @@ impl RenameState {
     /// LVar keyed by `v.name`; later calls return the same binding.
     fn import(&mut self, v: &LVar) {
         if self.map.contains_key(v) { return; }
-        let idx = self.fresh.fresh_ident(&v.name);
+        let idx = self.fresh.fresh_ident(v.name);
         let new_v = LVar { name: v.name, sort: v.sort, idx };
         self.map.insert(v.clone(), new_v);
     }

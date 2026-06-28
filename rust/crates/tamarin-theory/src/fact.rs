@@ -164,7 +164,9 @@ pub fn fact_tag_multiplicity(t: &FactTag) -> Multiplicity {
 impl<T> Fact<T> {
     pub fn is_linear(&self) -> bool { fact_tag_multiplicity(&self.tag) == Multiplicity::Linear }
     pub fn is_persistent(&self) -> bool { fact_tag_multiplicity(&self.tag) == Multiplicity::Persistent }
+    // Intentionally retained: faithful HS port; no caller yet.
     pub fn is_proto(&self) -> bool { matches!(self.tag, FactTag::Proto(_, _, _)) }
+    // Intentionally retained: faithful HS port; no caller yet.
     pub fn is_in_fact(&self) -> bool { self.tag == FactTag::In }
     pub fn is_k_fact(&self) -> bool {
         matches!(self.tag, FactTag::Ku | FactTag::Kd)
@@ -205,6 +207,7 @@ pub fn out_fact(t: LNTerm) -> LNFact { Fact::new(FactTag::Out, vec![t]) }
 pub fn in_fact(t: LNTerm) -> LNFact { Fact::new(FactTag::In, vec![t]) }
 pub fn ku_fact(t: LNTerm) -> LNFact { Fact::new(FactTag::Ku, vec![t]) }
 pub fn kd_fact(t: LNTerm) -> LNFact { Fact::new(FactTag::Kd, vec![t]) }
+// Intentionally retained: faithful HS port; no caller yet.
 pub fn ded_fact(t: LNTerm) -> LNFact { Fact::new(FactTag::Ded, vec![t]) }
 
 /// `kLogFact` from Haskell's `Theory.Model.Fact:280`:
@@ -216,7 +219,7 @@ pub fn ded_fact(t: LNTerm) -> LNFact { Fact::new(FactTag::Ded, vec![t]) }
 /// same tag (per the parser's fall-through for unknown fact
 /// names), so action goals like `K(t) @ j` match ISend instances.
 pub fn k_log_fact(t: LNTerm) -> LNFact {
-    Fact::new(FactTag::Proto(Multiplicity::Linear, "K".into(), 1), vec![t])
+    Fact::new(FactTag::Proto(Multiplicity::Linear, "K", 1), vec![t])
 }
 pub fn term_fact(t: LNTerm) -> LNFact { Fact::new(FactTag::Term, vec![t]) }
 
@@ -328,7 +331,7 @@ mod tests {
     /// for deterministic case ranking.
     #[test]
     fn fact_tag_ord_proto_sorts_before_builtins() {
-        let proto = FactTag::Proto(Multiplicity::Linear, "Foo".into(), 0);
+        let proto = FactTag::Proto(Multiplicity::Linear, "Foo", 0);
         let fresh = FactTag::Fresh;
         assert!(proto < fresh,
                 "Proto must sort before Fresh (Haskell decl order Fact.hs:132)");
@@ -347,17 +350,17 @@ mod tests {
     /// inconsistently bucketed.
     #[test]
     fn proto_fact_tag_compare_by_multiplicity_then_name_then_arity() {
-        let lp = FactTag::Proto(Multiplicity::Linear,     "P".into(), 1);
-        let pp = FactTag::Proto(Multiplicity::Persistent, "P".into(), 1);
+        let lp = FactTag::Proto(Multiplicity::Linear,     "P", 1);
+        let pp = FactTag::Proto(Multiplicity::Persistent, "P", 1);
         // Persistent < Linear (per Haskell Multiplicity Ord).
         assert!(pp < lp);
 
         // Same multiplicity, different name → name breaks tie.
-        let la = FactTag::Proto(Multiplicity::Linear, "A".into(), 1);
+        let la = FactTag::Proto(Multiplicity::Linear, "A", 1);
         assert!(la < lp);
 
         // Same multiplicity+name, different arity → arity breaks tie.
-        let lp2 = FactTag::Proto(Multiplicity::Linear, "P".into(), 2);
+        let lp2 = FactTag::Proto(Multiplicity::Linear, "P", 2);
         assert!(lp < lp2);
     }
 

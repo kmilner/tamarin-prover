@@ -11,7 +11,9 @@ pub enum ProVerifHeader {
     Sym(String, String, String, Vec<String>),
     /// Function declaration: `(symkind, name, arity, types, attrs)`.
     Fun(String, String, usize, String, Vec<String>),
+    /// Event declaration: `(name, type)`, rendered as `event <name><type>.`.
     HEvent(String, String),
+    /// Table declaration: `(name, type)`, rendered as `table <name><type>.`.
     Table(String, String),
     /// Equation: `(eqtype, quantif, equation, pub_priv)`.
     Eq(String, String, String, String),

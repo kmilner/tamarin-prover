@@ -4,6 +4,9 @@
 //! [`escape_html_entities`] for safe text, and [`render_html_doc`] which calls
 //! `Doc::render_with` to wrap highlight spans in `<span class="hl_...">` tags
 //! and post-processes the output to convert newlines and leading whitespace.
+//!
+//! NOTE: this faithful port currently has no consumer in the tree; the web
+//! UI's HTML rendering does not route through it. Retained as reserved API.
 
 use crate::pretty::{Doc, HighlightStyle};
 
@@ -91,7 +94,7 @@ pub fn render_html_doc(doc: &Doc) -> String {
 /// with `&nbsp;` runs.
 ///
 /// Mirrors `postprocessHtmlDoc = unlines . map (addBreak . indent) . lines`
-/// (Html.hs:157-162). Note both `lines` (treats `\n` as a terminator, so a
+/// (Html.hs). Note both `lines` (treats `\n` as a terminator, so a
 /// trailing `\n` does not yield an extra empty line) and `unlines` (appends
 /// `\n` after *every* line, including the last) are matched here.
 pub fn postprocess(s: &str) -> String {

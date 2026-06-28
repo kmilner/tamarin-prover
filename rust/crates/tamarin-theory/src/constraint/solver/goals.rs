@@ -28,10 +28,9 @@ use crate::constraint::system::System;
 ///
 /// `c` → `UsefulGoalNr` and `C` → `GoalNr` are implemented
 /// (System.hs:593-594 `goalRankingIdentifiers`); `{name}` tactics are
-/// resolved via `parse_heuristic_str_with_tactics`.  Only `p`/`P`
-/// (HS `SapicRanking`/`SapicPKCS11Ranking`, System.hs:591-592) fall
-/// back to `Smart(false)` — they are out of scope for this
-/// implementation.
+/// resolved via `parse_heuristic_str_with_tactics`.  `p` → `Sapic` and
+/// `P` → `SapicPKCS11` (HS `SapicRanking`/`SapicPKCS11Ranking`,
+/// System.hs:591-592) are implemented and dispatched via `sapic_ranking`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalRanking {
     /// `SmartRanking useLoopBreakers` (ProofMethod.hs).
@@ -370,27 +369,6 @@ pub fn rank_goals_with(
     depth: usize,
 ) -> Result<Vec<AnnotatedGoal>, OracleError> {
     let result = rank_goals_with_inner(sys, ctx, depth)?;
-    if std::env::var("TAM_RS_DBG_RANK").as_deref() == Ok("1") {
-        let in_pre = crate::constraint::solver::sources::in_precompute_mode();
-        let top: Vec<String> = result.iter().take(8).map(|a| {
-            use crate::constraint::constraints::Goal;
-            let kind = match &a.goal {
-                Goal::Chain(_, _) => "Chain".to_string(),
-                Goal::Disj(_) => "Disj".to_string(),
-                Goal::Premise(_, fa) => format!("Premise({:?})", fa.tag),
-                Goal::Action(_, fa) => format!("Action({:?})", fa.tag),
-                Goal::Split(_) => "Split".to_string(),
-                Goal::Subterm(_) => "Subterm".to_string(),
-            };
-            let ku = msg_premise(&a.goal)
-                .map(|t| format!("/KU={:?}", t))
-                .unwrap_or_default();
-            format!("#{}:{}{}/use={:?}", a.seq, kind, ku, a.usefulness)
-        }).collect();
-        let path = crate::constraint::solver::trace::case_path_string();
-        eprintln!("[RS_RANK] precompute={} path={} n={} top={:?}",
-            in_pre, path, result.len(), top);
-    }
     Ok(result)
 }
 
@@ -533,13 +511,6 @@ fn oracle_ranking(
     }
 
     let outp = String::from_utf8_lossy(&output.stdout);
-
-    // HS debug trace (ProofMethod.hs:613-618) — optional stderr logging
-    if tamarin_utils::env_gate!("TAM_RS_ORACLE_TRACE") {
-        eprintln!(">>>>>>>>>>>>>>>>>>>>>>>> START INPUT\n{}", inp);
-        eprintln!(">>>>>>>>>>>>>>>>>>>>>>>> START OUTPUT\n{}", outp);
-        eprintln!(">>>>>>>>>>>>>>>>>>>>>>>> END Oracle call");
-    }
 
     // Step 4: parse stdout indices — `mapMaybe readMay (lines outp)`
     let indices: Vec<usize> = outp.lines()
@@ -756,7 +727,7 @@ fn rank_by_blocks(
     }
 
     let mut out = Vec::new();
-    for (block, group) in blocks.iter().zip(buckets.into_iter()) {
+    for (block, group) in blocks.iter().zip(buckets) {
         if group.is_empty() {
             continue;
         }
@@ -953,12 +924,7 @@ fn eval_leaf(
             }
         }
 
-        other => {
-            if tamarin_utils::env_gate!("TAM_RS_TACTIC_DBG") {
-                eprintln!("[RS_TACTIC] unimplemented selector '{}' → false", other);
-            }
-            false
-        }
+        _ => false,
     }
 }
 
@@ -1170,13 +1136,6 @@ fn smart_ranking(
     // Re-sorting breaks HS-faithfulness for Device_Init_Use_Set
     // (case-content swap caused by Rust picking the structurally-
     // smaller induction Disj before HS's lemma-negation Disj).
-    // See [[project-rust-port-lockstep]].
-    if tamarin_utils::env_gate!("TAM_RANK_DBG") {
-        for (i, a) in goals.iter().take(6).enumerate() {
-            let g_str = format!("{:?}", a.goal).chars().take(160).collect::<String>();
-            eprintln!("[rank] #{}: {} useful={:?}", i, g_str, a.usefulness);
-        }
-    }
     goals
 }
 
@@ -1286,12 +1245,6 @@ fn sapic_ranking(
     }
     // sortOnUsefulness — stable sort by usefulness tag.  NO moveNatToEnd.
     goals.sort_by_key(|a| tag_usefulness(a.usefulness));
-    if tamarin_utils::env_gate!("TAM_RANK_DBG") {
-        for (i, a) in goals.iter().take(6).enumerate() {
-            let g_str = format!("{:?}", a.goal).chars().take(160).collect::<String>();
-            eprintln!("[rank-sapic] #{}: {} useful={:?}", i, g_str, a.usefulness);
-        }
-    }
     goals
 }
 
@@ -1394,12 +1347,6 @@ fn inj_ranking(
     // sortOnUsefulness — stable sort by usefulness tag.  (injRanking has
     // NO moveNatToEnd step — that's smartRanking-only.)
     goals.sort_by_key(|a| tag_usefulness(a.usefulness));
-    if tamarin_utils::env_gate!("TAM_RANK_DBG") {
-        for (i, a) in goals.iter().take(6).enumerate() {
-            let g_str = format!("{:?}", a.goal).chars().take(160).collect::<String>();
-            eprintln!("[inj-rank] #{}: {} useful={:?}", i, g_str, a.usefulness);
-        }
-    }
     goals
 }
 
@@ -1460,10 +1407,6 @@ fn collect_one_case_syms(
     use tamarin_term::function_symbols::FunSym;
     use tamarin_term::term::Term;
     let mut out = std::collections::BTreeSet::new();
-    let dbg_sources = tamarin_utils::env_gate!("TAM_DBG_SOURCES");
-    if dbg_sources {
-        eprintln!("[RS full_sources] count={}", ctx.full_sources.len());
-    }
     for src in &ctx.full_sources {
         // HS-faithful order — `smartRanking.getMsgOneCase`
         // (ProofMethod.hs:1207-1210) pattern-matches on `cdGoal` BEFORE
@@ -1487,26 +1430,14 @@ fn collect_one_case_syms(
             _ => continue,
         };
         let Term::App(FunSym::NoEq(s), _) = term else {
-            if dbg_sources {
-                eprintln!("[RS src non-app]");
-            }
             continue
         };
         // Now we know the goal is `KU(FApp o _)` — HS-faithful: force
         // cases at this point to check the disjunct count.  We only need
         // the disjunct COUNT here, so force once (idempotent) and read
         // the cell length in O(1) instead of deep-cloning every case
-        // `System`.  The full `cases()` deep clone is taken only inside
-        // the debug branch.
+        // `System`.
         src.cases_list(ctx);
-        if dbg_sources {
-            let cases = src.cases(ctx);
-            let nm = String::from_utf8_lossy(&s.name);
-            let arity = if let Term::App(_, args) = term { args.len() } else { 0 };
-            let names: Vec<String> = cases.iter().map(|(n, _)| n.clone()).collect();
-            eprintln!("[RS src] {} arity={} cases={} names={:?}",
-                nm, arity, cases.len(), names);
-        }
         if src.cases_len() != 1 { continue; }
         out.insert(s.name.to_vec());
     }
@@ -1533,7 +1464,7 @@ fn is_msg_one_case_goal(
     if !matches!(fa.tag, FactTag::Ku) { return false; }
     let Some(t) = fa.terms.first() else { return false };
     if let Term::App(FunSym::NoEq(s), _) = t {
-        return one_case_syms.contains(&*s.name);
+        return one_case_syms.contains(s.name);
     }
     false
 }
@@ -2252,8 +2183,8 @@ fn has_top_pair_inv_prod(t: &tamarin_term::lterm::LNTerm) -> bool {
     use tamarin_term::term::Term;
     match t {
         Term::App(FunSym::NoEq(s), args) => {
-            &*s.name == b"pair" && args.len() == 2
-                || &*s.name == INV_SYM_STRING && args.len() == 1
+            s.name == b"pair" && args.len() == 2
+                || s.name == INV_SYM_STRING && args.len() == 1
         }
         Term::App(FunSym::Ac(AcSym::Mult), _) => true,  // product
         Term::App(FunSym::Ac(AcSym::Union), _) => true, // multiset union
@@ -2594,7 +2525,7 @@ pub fn dispatch_solve_goal(
     // substituted) goal in the map and leaves it open.  Concrete
     // trigger: Minimal_HashChain Loop_Start source-case Check0 left
     // its abstract Loop goal open, which then triggered another graft
-    // iteration adding a duplicate Check0 node (task #222).
+    // iteration adding a duplicate Check0 node.
     red.mark_goal_as_solved(g);
     // HS-faithful `solve goal = maybe (solveGoal goal) ...
     // (solveWithSource ctxt ths goal)` (ProofMethod.hs:467-470).
@@ -2728,7 +2659,7 @@ fn fact_term_head(
             format!("{}{}", sort_prefix(v.sort), v.name),
         Some(Term::Lit(Lit::Con(_))) => "<const>".to_string(),
         Some(Term::App(sym, _)) => match sym {
-            FunSym::NoEq(noeq) => String::from_utf8_lossy(&noeq.name).into_owned(),
+            FunSym::NoEq(noeq) => String::from_utf8_lossy(noeq.name).into_owned(),
             FunSym::Ac(op) => format!("{:?}", op),
             FunSym::C(op) => format!("{:?}", op),
             FunSym::List => "List".to_string(),
@@ -2777,7 +2708,7 @@ mod tests {
         use tamarin_term::maude_sig::pair_maude_sig;
 
         let path = match std::env::var("MAUDE_PATH").ok().or_else(|| {
-            for c in ["/home/linuxbrew/.linuxbrew/bin/maude", "/usr/local/bin/maude", "maude"] {
+            for c in ["/usr/local/bin/maude", "maude"] {
                 if std::path::Path::new(c).exists() { return Some(c.to_string()); }
             }
             None
@@ -2835,7 +2766,7 @@ mod tests {
         let v: LVar = LVar::new("k", LSort::Msg, 0);
         let n: NodeId = LVar::new("i", LSort::Node, 0);
         let f: LNFact = LNFact::new(
-            FactTag::Proto(Multiplicity::Linear, "F".into(), 0), vec![]);
+            FactTag::Proto(Multiplicity::Linear, "F", 0), vec![]);
 
         let action: Goal = Goal::Action(v.clone(), f.clone());
         let chain: Goal = Goal::Chain(
@@ -2912,7 +2843,7 @@ mod tests {
         let v: LVar = LVar::new("k", LSort::Msg, 0);
         let n: NodeId = LVar::new("i", LSort::Node, 0);
         let f: LNFact = LNFact::new(
-            FactTag::Proto(Multiplicity::Linear, "F".into(), 0), vec![]);
+            FactTag::Proto(Multiplicity::Linear, "F", 0), vec![]);
 
         // Build one of each variant in Haskell's declaration order.
         let variants = [
@@ -3145,7 +3076,7 @@ mod tests {
         // must dominate the nr tiebreak.
         let lb = mk(5, Usefulness::LoopBreaker);
         let pc = mk(1, Usefulness::ProbablyConstructible);
-        let mut ags = vec![pc.clone(), lb.clone()];
+        let mut ags = [pc.clone(), lb.clone()];
         ags.sort_by(|a, b| {
             a.usefulness.cmp(&b.usefulness).then_with(|| a.seq.cmp(&b.seq))
         });

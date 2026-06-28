@@ -148,7 +148,8 @@ fn fact_input_form_no_outputs(in_name: &str, arity: usize) -> p::Formula {
 
 /// `addForm (_, Right (_, outs:_), _)` (OpenTheory.hs:464): with a matching
 /// output → `∀ m1..mn i. AUTO_IN_FACT(m1..mn) @ i ⇒ toFactsFact`.
-/// `toFactsFact` (OpenTheory.hs:520): `∃ j. AUTO_OUT_FACT(m2..m{1+arity_out}?) @ j ∧ j < i`.
+/// `toFactsFact` (OpenTheory.hs): `∃ j. AUTO_OUT_FACT(m1..m{out_arity}) @ j ∧ j < i`
+/// — the output fact references the input binders `m1..m{out_arity}`, highest first.
 fn fact_input_form_with_outputs(in_name: &str, out_name: &str, in_arity: usize, out_arity: usize) -> p::Formula {
     let ms: Vec<p::VarSpec> = list_of_m(in_arity).iter().map(|n| var(n, MSG)).collect();
     let in_fact = input_fact_fact_ast(in_name, &ms);

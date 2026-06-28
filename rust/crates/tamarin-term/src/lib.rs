@@ -5,6 +5,7 @@
 //! - [`term`] ← `Term.Term.Raw` (raw term type + AC-normalising smart constructors)
 //! - [`vterm`] ← `Term.VTerm` (`Lit<C, V>` and helpers)
 //! - [`lterm`] ← `Term.LTerm` (sorts, names, LVar, BVar, HasFrees, rename)
+//! - [`pretty`] ← pretty-printing helpers (`prettyLNTerm`/`prettyTerm`)
 //! - [`subst`] ← `Term.Substitution.SubstVFree` (generic free substitution)
 //! - [`subst_vfresh`] ← `Term.Substitution.SubstVFresh` (fresh-range substitution)
 //! - [`rewriting`] ← `Term.Rewriting.Definitions` (Equal, Match, RRule)
@@ -24,6 +25,8 @@
 //! - [`macro_expand`] ← `Term.Macro`
 //! - [`subsumption`] ← `Term.Subsumption`
 //! - [`norm`] ← `Term.Rewriting.Norm` (calls into Maude)
+//! - [`intern`] ← (no HS analog) global write-once intern pools for
+//!   symbol/variable names
 //!
 //! Not yet ported:
 //! - `Term.Narrowing.{Variants, Variants.Check, Variants.Compute, Narrow}`

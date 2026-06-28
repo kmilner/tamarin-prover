@@ -30,9 +30,9 @@
 //! - [`secret_channels`]/`base_translation` — secret/private channels
 //!   (`ChIn`/`ChOut` on a named/private channel)
 //!
-//! Not yet ported (later phases): `Sapic.Exceptions`.
+//! Not yet ported: `Sapic.Exceptions`.
 //!
-//! Phase 7 ported: [`progress_function`] ← `Sapic.ProgressFunction`,
+//! Also ported: [`progress_function`] ← `Sapic.ProgressFunction`,
 //! [`progress_translation`] ← `Sapic.ProgressTranslation`,
 //! [`reliable_channel`] ← `Sapic.ReliableChannelTranslation`,
 //! [`compression`] ← `Sapic.Compression`.

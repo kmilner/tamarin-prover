@@ -133,8 +133,7 @@ fn map_to_annotated_rule(
 /// `gen` (Sapic.hs:112-153).  Handles `Null`, `Action` (incl. the `Rep`
 /// replication action), and the `Comb` combinators in scope — `Parallel`,
 /// `NDC` (with the `substStatePos` shared-position rewrite), and `CondEq`.
-/// `Cond`-with-a-formula / `Lookup` / `Let` are rejected in `base_trans_comb`
-/// (Phase 2+/3).
+/// `Cond`-with-a-formula / `Lookup` / `Let` are rejected in `base_trans_comb`.
 fn gen(
     ctx: &TransCtx,
     an_proc: &Process<ProcessAnnotation<LVar>, SapicLVar>,
@@ -380,7 +379,7 @@ pub fn translate(
     // annotate: toAnProcess + propagateNames + annotateSecretChannels +
     //   translateLetDestr + annotateLocks (Sapic.hs:54-61).  The pure-state /
     //   report passes are gated off by default (pure-state needs
-    //   `--translation-state-optimisation`).  `translateLetDestr` (Phase 5) runs
+    //   `--translation-state-optimisation`).  `translateLetDestr` runs
     //   AFTER annotateSecretChannels and BEFORE annotateLocks, eliminating
     //   var-RHS `let`s and annotating destructor / kept `let`s.
     let an_proc_pre: Process<ProcessAnnotation<LVar>, SapicLVar> =
@@ -493,7 +492,7 @@ pub fn translate(
     //                       (NoDelete variants unless it also `contains isDelete`)
     //   [resEq, resNotEq]   if the process `contains isEq`  (a CondEq node)
     //   [resSingleSession]  always (hasAccountabilityLemmaWithControl = True)
-    // (locking restrictions are Phase 4.)
+    // (locking restrictions are handled separately.)
     let mut restrictions = Vec::new();
     // HS `isLookup`/`isDelete` (ProcessUtils.hs:46-52) only count
     // `pureState=False` nodes — a pure-state lookup/delete uses the
@@ -677,6 +676,6 @@ mod tests {
         assert_eq!(tr.rules.len(), 5);
         assert_eq!(tr.restrictions.len(), 1);
         // First rule is "Init".
-        assert_eq!(tr.rules[0].0.info.name, tamarin_theory::rule::ProtoRuleName::Stand("Init".into()));
+        assert_eq!(tr.rules[0].0.info.name, tamarin_theory::rule::ProtoRuleName::Stand("Init"));
     }
 }

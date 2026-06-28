@@ -209,59 +209,6 @@ pub fn disj_goal_to_doc(gfs: &[Guarded]) -> crate::pretty_hpj::Doc {
     hpj::fsep(punct)
 }
 
-/// Render a full `solve( <DisjG> )` proof-method line through the
-/// HS-faithful engine, mirroring HS
-///   `SolveGoal goal -> keyword_ "solve(" <-> prettyGoal goal <-> keyword_ ")"`
-/// (ProofMethod.hs:1182) where `<->` is `<+>` (beside-with-space).  The
-/// whole thing is built as ONE `Doc` so HughesPJ's beside column-shift
-/// indents the goal's wrapped continuation lines to the column after
-/// `solve( ` (= `indent + 7`), byte-identical to HS.
-///
-/// `indent` is the column where `solve(` starts (the proof-tree depth
-/// indent).  The returned string's FIRST line has NO leading indent (the
-/// proof-tree printer adds that itself); continuation lines carry their
-/// full absolute indentation.
-pub fn solve_disj_goal_line(gfs: &[Guarded], indent: usize) -> String {
-    solve_disj_goal_line_pfx(gfs, indent, "")
-}
-
-/// As `solve_disj_goal_line`, but with a leading `prefix` (e.g. `"by "`)
-/// laid out as line CONTENT before `solve(`.  See `solve_line_render`.
-pub fn solve_disj_goal_line_pfx(gfs: &[Guarded], base_indent: usize, prefix: &str) -> String {
-    use crate::pretty_hpj::Doc;
-    let body = Doc::text("solve(")
-        .beside_sp(disj_goal_to_doc(gfs))
-        .beside_sp(Doc::text(")"));
-    solve_line_render(body, base_indent, prefix)
-}
-
-/// Render a `solve( … )` proof-step line, optionally prefixed with
-/// `prefix` (`"by "` for childless leaf steps, `""` otherwise).
-///
-/// CRITICAL — ribbon faithfulness: HS lays a leaf step out as
-/// `kwBy <> text " " <> prettyStep` (Proof.hs:1065-1066) — the `by ` is line
-/// CONTENT laid out BESIDE the step, so HughesPJ counts its 3 columns
-/// toward the ribbon when deciding where the step's `fsep`/`sep` break.
-/// Folding `by ` into the indent instead (rendering the step nested at
-/// `depth*2 + 3`) leaves the ribbon budget 3 columns too generous, so a
-/// fact argument that HS wraps stays inline (the NAXOS/KAS2 `Match( a,`
-/// / `<…>` divergence).  We therefore lay `by ` out as a `beside` text and
-/// nest the whole line at the bare proof indent: the `beside` column-shift
-/// still indents wrapped continuation lines to `base_indent + len(prefix)`
-/// (= the column after `by `), while the ribbon now sees `by `.
-fn solve_line_render(solve_body: crate::pretty_hpj::Doc, base_indent: usize, prefix: &str) -> String {
-    use crate::pretty_hpj::Doc;
-    let line = if prefix.is_empty() {
-        solve_body
-    } else {
-        Doc::text(prefix).beside(solve_body)
-    };
-    let indented = line.nest(base_indent as isize);
-    let rendered = indented.render();
-    let strip = rendered.chars().take(base_indent).take_while(|c| *c == ' ').count();
-    rendered[strip..].to_string()
-}
-
 /// HS `multiComment_ ["unannotated"]`
 /// (Theory/Text/Pretty.hs:105-106):
 ///   `comment $ fsep [text "/*", vcat $ map text ls, text "*/"]`
@@ -270,7 +217,7 @@ fn solve_line_render(solve_body: crate::pretty_hpj::Doc, base_indent: usize, pre
 /// spaces when they fit (they always do at any indent ≤ ribbon), giving
 /// `/* unannotated */`.  `comment` is a highlight wrapper — a no-op for
 /// raw (non-coloured) output.
-pub fn unannotated_comment_doc() -> crate::pretty_hpj::Doc {
+fn unannotated_comment_doc() -> crate::pretty_hpj::Doc {
     use crate::pretty_hpj::{self as hpj, Doc};
     hpj::fsep(vec![
         Doc::text("/*"),
@@ -296,10 +243,10 @@ pub fn unannotated_comment_doc() -> crate::pretty_hpj::Doc {
 /// comment drops to its OWN line at the sep's base indent
 /// (= `base_indent`, the proof step's depth indent).
 ///
-/// As with `solve_line_render`, the whole step is `nest`ed at
-/// `base_indent` and the leading `base_indent` spaces are stripped from
-/// the FIRST line (the caller has already emitted that indent), while a
-/// dropped comment line retains its `base_indent` leading spaces.
+/// The whole step is `nest`ed at `base_indent` and the leading
+/// `base_indent` spaces are stripped from the FIRST line (the caller has
+/// already emitted that indent), while a dropped comment line retains its
+/// `base_indent` leading spaces.
 pub fn step_line_with_unann(
     method_doc: crate::pretty_hpj::Doc,
     base_indent: usize,
@@ -332,28 +279,6 @@ pub fn step_line_with_unann(
         .take_while(|c| *c == ' ')
         .count();
     rendered[strip..].to_string()
-}
-
-/// Build the `solve( <goal> )` line for a NON-DisjG goal, where the
-/// caller has already constructed `goal_doc` for the goal body (HS
-/// `prettyGoal`, Constraints.hs:273-287).  Mirrors HS
-///   `SolveGoal goal -> keyword_ "solve(" <-> prettyGoal goal <-> keyword_ ")"`
-/// (ProofMethod.hs:1182), `<->` = `<+>` (beside-with-space).  The whole
-/// line is ONE `Doc` so HughesPJ's beside column-shift indents the goal's
-/// wrapped continuation lines to the column after `solve( ` (= indent+7),
-/// byte-identical to HS.  Same wrapping plumbing as `solve_disj_goal_line`.
-pub fn solve_goal_line_from_doc(goal_doc: crate::pretty_hpj::Doc, indent: usize) -> String {
-    solve_goal_line_from_doc_pfx(goal_doc, indent, "")
-}
-
-/// As `solve_goal_line_from_doc`, but with a leading `prefix` (e.g. `"by "`)
-/// laid out as line CONTENT before `solve(`.  See `solve_line_render`.
-pub fn solve_goal_line_from_doc_pfx(goal_doc: crate::pretty_hpj::Doc, base_indent: usize, prefix: &str) -> String {
-    use crate::pretty_hpj::Doc;
-    let body = Doc::text("solve(")
-        .beside_sp(goal_doc)
-        .beside_sp(Doc::text(")"));
-    solve_line_render(body, base_indent, prefix)
 }
 
 /// Public accessor for the Doc-based fact renderer (HS `prettyLNFact` /

@@ -20,7 +20,8 @@
 #
 # Methodology:
 #   - Core control: HS `+RTS -Nk -RTS`; RS `--processors=k` (its Maude pool
-#     auto-sizes to max(1, k/2)).  Both prove all lemmas (`--prove`).
+#     defaults to max(1, k), a 1:1 workers:maudes ratio).  Both prove all
+#     lemmas (`--prove`).
 #   - "peak RSS" is the prover PROCESS only (/usr/bin/time -v "Maximum resident
 #     set size").  Maude runs as separate subprocess(es) on BOTH sides and is
 #     not counted — the comparison is GHC-heap vs Rust-heap.

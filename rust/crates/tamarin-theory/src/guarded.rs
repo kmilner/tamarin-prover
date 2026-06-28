@@ -17,6 +17,8 @@
 use std::collections::BTreeSet;
 
 use tamarin_parser::ast as p;
+use tamarin_utils::cow::{cow_map_arc, cow_map_vec, cow_pair};
+use crate::guarded_types::cow_pair_arc;
 
 pub use crate::guarded_types::{
     ga,
@@ -60,8 +62,7 @@ pub enum Quant { All, Ex }
 // Disj formulas → goal pick at downstream proof steps.
 //
 // This module provides `cmp_guarded` (and helpers `cmp_atom` /
-// `cmp_term`) that mirror HS's derived Ord chain.  See
-// [[reference-vec-vs-set-walks]] for the sites that need this.
+// `cmp_term`) that mirror HS's derived Ord chain.
 
 /// HS-faithful structural comparison for Guarded.  Mirrors HS's derived
 /// `Ord (Guarded s c v)` on `Theory.Constraint.System.Guarded.Guarded`.
@@ -636,7 +637,7 @@ pub fn simplify_guarded_with(
             gconj(simplified)
         }
         Guarded::GGuarded { qua: Quant::All, vars, guards, body } if vars.is_empty() => {
-            let evals: Vec<Option<bool>> = guards.iter().map(|a| eval(a)).collect();
+            let evals: Vec<Option<bool>> = guards.iter().map(eval).collect();
             // Any False guard → universal vacuously holds.
             if evals.iter().any(|v| v == &Some(false)) {
                 return gtrue();
@@ -1316,9 +1317,12 @@ pub fn normalize_witness_lvars(g: &Guarded) -> Guarded {
 /// formulas compare equal under structural `Eq` automatically — Bound vars carry
 /// no idx, so `Ex j:5. KU(s)@j:5` and `Ex j:6. KU(s)@j:6` both yield
 /// `GGuarded { vars: [(j, Node)], body: ... Bound(0) ... }` — so no rewriting is
-/// needed.  Called from `constraint::system`, `solver::reduction`, and
-/// `solver::simplify` to mark the spots where HS relied on its DeBruijn
-/// invariant.
+/// needed.  Called from `constraint::system` and `solver::reduction` to mark
+/// the spots where HS relied on its DeBruijn invariant.  `solver::simplify`
+/// deliberately skips it — see `implied_apply_canon` in simplify.rs, which
+/// drops the call to save one full `Guarded` deep clone.
+///
+/// Intentionally a no-op identity clone: faithful HS port marker.
 pub fn normalize_bound_lvars(g: &Guarded) -> Guarded {
     g.clone()
 }
@@ -1429,7 +1433,7 @@ pub fn normalize_sort_hints(g: &Guarded) -> Guarded {
 /// Every HS `mapFrees` / `apply` over LNTerm routes through `f_app_ac`,
 /// so AC heads stay in canonical sorted order after substitution.  Rust
 /// stores formulas in parser-AST `BinOp(op, l, r)` (strict arity-2), and
-/// `subst_term` / `subst_gterm` recurse into the children without
+/// `subst_term` / `subst_gterm_cow` recurse into the children without
 /// re-sorting.
 ///
 /// After `rename_precise_system` renumbers free vars (e.g. `ekR.5 →
@@ -1455,17 +1459,15 @@ pub fn canonicalize_ac_in_guarded(g: &Guarded) -> Guarded {
     canonicalize_ac_in_guarded_with(g, cmp_term)
 }
 
-type GCmp = fn(&GTerm, &GTerm) -> std::cmp::Ordering;
-
-fn cac_flatten(op: &p::BinOp, t: &GTerm, out: &mut Vec<GTerm>) {
-    match t {
-        GTerm::BinOp(inner_op, l, r) if inner_op == op => {
-            cac_flatten(op, l, out);
-            cac_flatten(op, r, out);
-        }
-        _ => out.push(t.clone()),
-    }
+/// Copy-on-write variant of [`canonicalize_ac_in_guarded`]: returns `None` when
+/// `g` is already AC-canonical (no AC subterm anywhere needed re-sorting), so a
+/// caller holding an OWNED `g` can reuse it by move instead of allocating a
+/// rebuilt deep copy.  `Some(_)` is byte-identical to the eager entry point.
+pub fn canonicalize_ac_in_guarded_cow(g: &Guarded) -> Option<Guarded> {
+    cac_rec_guarded_cow(g, cmp_term)
 }
+
+type GCmp = fn(&GTerm, &GTerm) -> std::cmp::Ordering;
 
 fn cac_rec_term(t: &GTerm, cmp: GCmp) -> GTerm {
     // Wrapper: materialise the COW result, reusing `t` when nothing changed.
@@ -1526,38 +1528,23 @@ fn cac_rec_term_cow(t: &GTerm, cmp: GCmp) -> Option<GTerm> {
             cac_rec_slice(args, cmp).map(|new| GTerm::App(n.clone(), new)),
         GTerm::Pair(args) =>
             cac_rec_slice(args, cmp).map(GTerm::Pair),
-        GTerm::AlgApp(n, a, b) => {
-            let a2 = cac_rec_term_cow(a, cmp);
-            let b2 = cac_rec_term_cow(b, cmp);
-            if a2.is_none() && b2.is_none() { return None; }
-            Some(GTerm::AlgApp(
-                n.clone(),
-                a2.map(ga).unwrap_or_else(|| a.clone()),
-                b2.map(ga).unwrap_or_else(|| b.clone()),
-            ))
-        }
-        GTerm::Diff(a, b) => {
-            let a2 = cac_rec_term_cow(a, cmp);
-            let b2 = cac_rec_term_cow(b, cmp);
-            if a2.is_none() && b2.is_none() { return None; }
-            Some(GTerm::Diff(
-                a2.map(ga).unwrap_or_else(|| a.clone()),
-                b2.map(ga).unwrap_or_else(|| b.clone()),
-            ))
-        }
+        GTerm::AlgApp(n, a, b) => cow_pair_arc(a, cac_rec_term_cow(a, cmp), b, cac_rec_term_cow(b, cmp))
+            .map(|(a, b)| GTerm::AlgApp(n.clone(), a, b)),
+        GTerm::Diff(a, b) => cow_pair_arc(a, cac_rec_term_cow(a, cmp), b, cac_rec_term_cow(b, cmp))
+            .map(|(a, b)| GTerm::Diff(a, b)),
         GTerm::BinOp(op, l, r) => {
-            if matches!(op, p::BinOp::Mult | p::BinOp::Union | p::BinOp::Xor | p::BinOp::NatPlus) {
+            if is_ac_binop(op) {
                 // Recurse into children first, then flatten the whole AC
                 // chain rooted here and rebuild in sorted multiset order.
                 let l2 = cac_rec_term(l, cmp);
                 let r2 = cac_rec_term(r, cmp);
                 let mut flat = Vec::new();
-                cac_flatten(op, &l2, &mut flat);
-                cac_flatten(op, &r2, &mut flat);
+                flatten_ac_binop(op, &l2, &mut flat);
+                flatten_ac_binop(op, &r2, &mut flat);
                 flat.sort_by(&cmp);
                 // Right-fold to a binary chain.  At least 2 args.
                 let mut iter = flat.into_iter().rev();
-                let last = iter.next().unwrap_or(GTerm::PubLit(String::new()));
+                let last = iter.next().expect("AC BinOp always flattens to >=2 args");
                 let mut acc = last;
                 for prev in iter {
                     acc = GTerm::BinOp(*op, ga(prev), ga(acc));
@@ -1566,14 +1553,8 @@ fn cac_rec_term_cow(t: &GTerm, cmp: GCmp) -> Option<GTerm> {
                 // (children unchanged AND already sorted+right-leaning).
                 if acc == *t { None } else { Some(acc) }
             } else {
-                let l2 = cac_rec_term_cow(l, cmp);
-                let r2 = cac_rec_term_cow(r, cmp);
-                if l2.is_none() && r2.is_none() { return None; }
-                Some(GTerm::BinOp(
-                    *op,
-                    l2.map(ga).unwrap_or_else(|| l.clone()),
-                    r2.map(ga).unwrap_or_else(|| r.clone()),
-                ))
+                cow_pair_arc(l, cac_rec_term_cow(l, cmp), r, cac_rec_term_cow(r, cmp))
+                    .map(|(l, r)| GTerm::BinOp(*op, l, r))
             }
         }
         GTerm::PatMatch(inner) =>
@@ -1586,51 +1567,69 @@ fn cac_rec_term_cow(t: &GTerm, cmp: GCmp) -> Option<GTerm> {
 /// by cloning their `Arc`).  Single-pass: the output `Vec` is allocated lazily
 /// only when (and after) the first child changes.
 fn cac_rec_slice(args: &std::sync::Arc<[GTerm]>, cmp: GCmp) -> Option<std::sync::Arc<[GTerm]>> {
-    let mut out: Option<Vec<GTerm>> = None;
-    for (i, a) in args.iter().enumerate() {
-        match cac_rec_term_cow(a, cmp) {
-            Some(g) => out.get_or_insert_with(|| args[..i].to_vec()).push(g),
-            None => if let Some(v) = out.as_mut() { v.push(a.clone()); }
-        }
-    }
-    out.map(std::sync::Arc::from)
+    cow_map_arc(args, |a| cac_rec_term_cow(a, cmp))
 }
 
-fn cac_rec_fact(f: &GFact, cmp: GCmp) -> GFact {
-    GFact {
+// Copy-on-write canonicalisation, one level up from `cac_rec_term_cow`: each
+// `*_cow` returns `None` when nothing under it needed re-sorting, so an
+// all-unchanged formula propagates a single `None` to the root and the owned
+// caller reuses its input by move (no rebuild).  Every `Some(_)` materialises
+// EXACTLY what the previous eager rebuild produced (changed children rebuilt,
+// unchanged children cloned), so the output is byte-identical — the parity gate
+// verifies.  The lazy single-pass bookkeeping (clone the unchanged prefix on the
+// first change) lives once in `tamarin_utils::cow::{cow_map_vec, cow_pair}`.
+
+fn cac_rec_fact_cow(f: &GFact, cmp: GCmp) -> Option<GFact> {
+    cow_map_vec(f.args.as_slice(), |a| cac_rec_term_cow(a, cmp)).map(|args| GFact {
         persistent: f.persistent,
         name: f.name.clone(),
-        args: f.args.iter().map(|a| cac_rec_term(a, cmp)).collect(),
+        args,
         annotations: f.annotations.clone(),
+    })
+}
+
+/// COW of a GTerm pair: `None` when BOTH are unchanged.
+fn cac_pair_cow(x: &GTerm, y: &GTerm, cmp: GCmp) -> Option<(GTerm, GTerm)> {
+    cow_pair(x, cac_rec_term_cow(x, cmp), y, cac_rec_term_cow(y, cmp))
+}
+
+fn cac_rec_atom_cow(a: &GAtom, cmp: GCmp) -> Option<GAtom> {
+    match a {
+        GAtom::Action(f, t) => cow_pair(f, cac_rec_fact_cow(f, cmp), t, cac_rec_term_cow(t, cmp))
+            .map(|(f, t)| GAtom::Action(f, t)),
+        GAtom::Eq(x, y) => cac_pair_cow(x, y, cmp).map(|(a, b)| GAtom::Eq(a, b)),
+        GAtom::Less(x, y) => cac_pair_cow(x, y, cmp).map(|(a, b)| GAtom::Less(a, b)),
+        GAtom::LessMset(x, y) => cac_pair_cow(x, y, cmp).map(|(a, b)| GAtom::LessMset(a, b)),
+        GAtom::Subterm(x, y) => cac_pair_cow(x, y, cmp).map(|(a, b)| GAtom::Subterm(a, b)),
+        GAtom::Last(t) => cac_rec_term_cow(t, cmp).map(GAtom::Last),
+        GAtom::Pred(f) => cac_rec_fact_cow(f, cmp).map(GAtom::Pred),
     }
 }
 
-fn cac_rec_atom(a: &GAtom, cmp: GCmp) -> GAtom {
-    match a {
-        GAtom::Action(f, t) => GAtom::Action(cac_rec_fact(f, cmp), cac_rec_term(t, cmp)),
-        GAtom::Eq(x, y) => GAtom::Eq(cac_rec_term(x, cmp), cac_rec_term(y, cmp)),
-        GAtom::Less(x, y) => GAtom::Less(cac_rec_term(x, cmp), cac_rec_term(y, cmp)),
-        GAtom::LessMset(x, y) => GAtom::LessMset(cac_rec_term(x, cmp), cac_rec_term(y, cmp)),
-        GAtom::Subterm(x, y) => GAtom::Subterm(cac_rec_term(x, cmp), cac_rec_term(y, cmp)),
-        GAtom::Last(t) => GAtom::Last(cac_rec_term(t, cmp)),
-        GAtom::Pred(f) => GAtom::Pred(cac_rec_fact(f, cmp)),
+fn cac_rec_guarded_cow(g: &Guarded, cmp: GCmp) -> Option<Guarded> {
+    match g {
+        Guarded::Atom(a) => cac_rec_atom_cow(a, cmp).map(Guarded::Atom),
+        Guarded::Disj(items) =>
+            cow_map_vec(items.as_slice(), |i| cac_rec_guarded_cow(i, cmp)).map(Guarded::Disj),
+        Guarded::Conj(items) =>
+            cow_map_vec(items.as_slice(), |i| cac_rec_guarded_cow(i, cmp)).map(Guarded::Conj),
+        Guarded::GGuarded { qua, vars, guards, body } => cow_pair(
+            guards,
+            cow_map_vec(guards.as_slice(), |a| cac_rec_atom_cow(a, cmp)),
+            &**body,
+            cac_rec_guarded_cow(body, cmp),
+        )
+        .map(|(guards, body)| Guarded::GGuarded {
+            qua: qua.clone(),
+            vars: vars.clone(),
+            guards,
+            body: Box::new(body),
+        }),
     }
 }
 
 fn canonicalize_ac_in_guarded_with(g: &Guarded, cmp: GCmp) -> Guarded {
-    match g {
-        Guarded::Atom(a) => Guarded::Atom(cac_rec_atom(a, cmp)),
-        Guarded::Disj(items) => Guarded::Disj(
-            items.iter().map(|i| canonicalize_ac_in_guarded_with(i, cmp)).collect()),
-        Guarded::Conj(items) => Guarded::Conj(
-            items.iter().map(|i| canonicalize_ac_in_guarded_with(i, cmp)).collect()),
-        Guarded::GGuarded { qua, vars, guards, body } => Guarded::GGuarded {
-            qua: qua.clone(),
-            vars: vars.clone(),
-            guards: guards.iter().map(|a| cac_rec_atom(a, cmp)).collect(),
-            body: Box::new(canonicalize_ac_in_guarded_with(body, cmp)),
-        },
-    }
+    cac_rec_guarded_cow(g, cmp).unwrap_or_else(|| g.clone())
 }
 
 fn collect_witness_vars(g: &Guarded, out: &mut VarSubst) {
@@ -1781,18 +1780,34 @@ pub fn subst_guarded(g: &Guarded, s: &VarSubst) -> Guarded {
 }
 
 fn subst_guarded_inner(g: &Guarded, s: &VarSubst) -> Guarded {
+    subst_guarded_cow(g, s).unwrap_or_else(|| g.clone())
+}
+
+/// Copy-on-write core of `subst_guarded_inner`: returns `None` when the
+/// substitution touches no Free leaf anywhere in `g` (and no `mk_gpair` flatten
+/// fires), so a caller can reuse `g` instead of deep-rebuilding the whole
+/// connective tree.  One level up from `subst_gterm_cow`, mirroring its shape;
+/// every `Some(_)` is byte-identical to the eager rebuild (changed children
+/// rebuilt, unchanged children cloned, in positional order).
+pub fn subst_guarded_cow(g: &Guarded, s: &VarSubst) -> Option<Guarded> {
     match g {
-        Guarded::Atom(a) => Guarded::Atom(subst_gatom(a, s)),
+        Guarded::Atom(a) => subst_gatom_cow(a, s).map(Guarded::Atom),
         Guarded::Disj(items) =>
-            Guarded::Disj(items.iter().map(|i| subst_guarded_inner(i, s)).collect()),
+            cow_map_vec(items.as_slice(), |i| subst_guarded_cow(i, s)).map(Guarded::Disj),
         Guarded::Conj(items) =>
-            Guarded::Conj(items.iter().map(|i| subst_guarded_inner(i, s)).collect()),
-        Guarded::GGuarded { qua, vars, guards, body } => Guarded::GGuarded {
+            cow_map_vec(items.as_slice(), |i| subst_guarded_cow(i, s)).map(Guarded::Conj),
+        Guarded::GGuarded { qua, vars, guards, body } => cow_pair(
+            guards,
+            cow_map_vec(guards.as_slice(), |a| subst_gatom_cow(a, s)),
+            &**body,
+            subst_guarded_cow(body, s),
+        )
+        .map(|(guards, body)| Guarded::GGuarded {
             qua: qua.clone(),
             vars: vars.clone(),
-            guards: guards.iter().map(|a| subst_gatom(a, s)).collect(),
-            body: Box::new(subst_guarded_inner(body, s)),
-        }
+            guards,
+            body: Box::new(body),
+        }),
     }
 }
 
@@ -1800,37 +1815,34 @@ fn subst_guarded_inner(g: &Guarded, s: &VarSubst) -> Guarded {
 /// parser-AST terms (`p::Term`), which we lift to `GTerm` with all-Free
 /// leaves — those Free LVars are at the system's top-level scope and
 /// cannot collide with any binder.
-pub fn subst_gatom(a: &GAtom, s: &VarSubst) -> GAtom {
+fn subst_gatom_cow(a: &GAtom, s: &VarSubst) -> Option<GAtom> {
     match a {
-        GAtom::Eq(x, y) => GAtom::Eq(subst_gterm(x, s), subst_gterm(y, s)),
-        GAtom::Less(x, y) => GAtom::Less(subst_gterm(x, s), subst_gterm(y, s)),
-        GAtom::LessMset(x, y) => GAtom::LessMset(subst_gterm(x, s), subst_gterm(y, s)),
-        GAtom::Subterm(x, y) => GAtom::Subterm(subst_gterm(x, s), subst_gterm(y, s)),
-        GAtom::Action(f, t) => GAtom::Action(subst_gfact(f, s), subst_gterm(t, s)),
-        GAtom::Last(t) => GAtom::Last(subst_gterm(t, s)),
-        GAtom::Pred(f) => GAtom::Pred(subst_gfact(f, s)),
+        GAtom::Eq(x, y) => subst_gpair_cow(x, y, s).map(|(a, b)| GAtom::Eq(a, b)),
+        GAtom::Less(x, y) => subst_gpair_cow(x, y, s).map(|(a, b)| GAtom::Less(a, b)),
+        GAtom::LessMset(x, y) => subst_gpair_cow(x, y, s).map(|(a, b)| GAtom::LessMset(a, b)),
+        GAtom::Subterm(x, y) => subst_gpair_cow(x, y, s).map(|(a, b)| GAtom::Subterm(a, b)),
+        GAtom::Action(f, t) => cow_pair(f, subst_gfact_cow(f, s), t, subst_gterm_cow(t, s))
+            .map(|(f, t)| GAtom::Action(f, t)),
+        GAtom::Last(t) => subst_gterm_cow(t, s).map(GAtom::Last),
+        GAtom::Pred(f) => subst_gfact_cow(f, s).map(GAtom::Pred),
     }
+}
+
+fn subst_gpair_cow(x: &GTerm, y: &GTerm, s: &VarSubst) -> Option<(GTerm, GTerm)> {
+    cow_pair(x, subst_gterm_cow(x, s), y, subst_gterm_cow(y, s))
 }
 
 /// Substitute Free LVar leaves in a `GFact`.
-pub fn subst_gfact(f: &GFact, s: &VarSubst) -> GFact {
-    GFact {
+fn subst_gfact_cow(f: &GFact, s: &VarSubst) -> Option<GFact> {
+    cow_map_vec(f.args.as_slice(), |a| subst_gterm_cow(a, s)).map(|args| GFact {
         persistent: f.persistent,
         name: f.name.clone(),
-        args: f.args.iter().map(|a| subst_gterm(a, s)).collect(),
+        args,
         annotations: f.annotations.clone(),
-    }
+    })
 }
 
-/// Substitute Free LVar leaves in a `GTerm`.
-pub fn subst_gterm(t: &GTerm, s: &VarSubst) -> GTerm {
-    match subst_gterm_cow(t, s) {
-        Some(g) => g,
-        None => t.clone(),
-    }
-}
-
-/// Copy-on-write core of `subst_gterm`.  Returns `None` when the subtree
+/// Copy-on-write substitution of Free LVar leaves in a `GTerm`.  Returns `None` when the subtree
 /// contains no variable in the substitution's domain (so no leaf is replaced
 /// and no `mk_gpair` flattening can fire), letting the caller reuse the input
 /// `Arc` without rebuilding.  `Some(g)` carries the rebuilt subtree.
@@ -1855,16 +1867,8 @@ fn subst_gterm_cow(t: &GTerm, s: &VarSubst) -> Option<GTerm> {
         | GTerm::Number(_) | GTerm::NumberOne | GTerm::NatOne | GTerm::DhNeutral => None,
         GTerm::App(n, args) =>
             subst_gterm_slice(args, s).map(|new| GTerm::App(n.clone(), new)),
-        GTerm::AlgApp(n, a, b) => {
-            let a2 = subst_gterm_cow(a, s);
-            let b2 = subst_gterm_cow(b, s);
-            if a2.is_none() && b2.is_none() { return None; }
-            Some(GTerm::AlgApp(
-                n.clone(),
-                a2.map(ga).unwrap_or_else(|| a.clone()),
-                b2.map(ga).unwrap_or_else(|| b.clone()),
-            ))
-        }
+        GTerm::AlgApp(n, a, b) => cow_pair_arc(a, subst_gterm_cow(a, s), b, subst_gterm_cow(b, s))
+            .map(|(a, b)| GTerm::AlgApp(n.clone(), a, b)),
         // Canonicalise via `mk_gpair`: substituting a pair-valued var into a
         // tuple tail (`<..,matchingComm>` with `matchingComm := <a,b>`) would
         // otherwise leave a non-canonical `Pair([..,Pair([a,b])])` that no
@@ -1898,25 +1902,10 @@ fn subst_gterm_cow(t: &GTerm, s: &VarSubst) -> Option<GTerm> {
                 }
             }
         }
-        GTerm::Diff(a, b) => {
-            let a2 = subst_gterm_cow(a, s);
-            let b2 = subst_gterm_cow(b, s);
-            if a2.is_none() && b2.is_none() { return None; }
-            Some(GTerm::Diff(
-                a2.map(ga).unwrap_or_else(|| a.clone()),
-                b2.map(ga).unwrap_or_else(|| b.clone()),
-            ))
-        }
-        GTerm::BinOp(op, a, b) => {
-            let a2 = subst_gterm_cow(a, s);
-            let b2 = subst_gterm_cow(b, s);
-            if a2.is_none() && b2.is_none() { return None; }
-            Some(GTerm::BinOp(
-                *op,
-                a2.map(ga).unwrap_or_else(|| a.clone()),
-                b2.map(ga).unwrap_or_else(|| b.clone()),
-            ))
-        }
+        GTerm::Diff(a, b) => cow_pair_arc(a, subst_gterm_cow(a, s), b, subst_gterm_cow(b, s))
+            .map(|(a, b)| GTerm::Diff(a, b)),
+        GTerm::BinOp(op, a, b) => cow_pair_arc(a, subst_gterm_cow(a, s), b, subst_gterm_cow(b, s))
+            .map(|(a, b)| GTerm::BinOp(*op, a, b)),
         GTerm::PatMatch(inner) =>
             subst_gterm_cow(inner, s).map(|g| GTerm::PatMatch(ga(g))),
     }
@@ -1929,14 +1918,7 @@ fn subst_gterm_cow(t: &GTerm, s: &VarSubst) -> Option<GTerm> {
 fn subst_gterm_slice(args: &std::sync::Arc<[GTerm]>, s: &VarSubst)
     -> Option<std::sync::Arc<[GTerm]>>
 {
-    let mut out: Option<Vec<GTerm>> = None;
-    for (i, a) in args.iter().enumerate() {
-        match subst_gterm_cow(a, s) {
-            Some(g) => out.get_or_insert_with(|| args[..i].to_vec()).push(g),
-            None => if let Some(v) = out.as_mut() { v.push(a.clone()); }
-        }
-    }
-    out.map(std::sync::Arc::from)
+    cow_map_arc(args, |a| subst_gterm_cow(a, s))
 }
 
 /// Find the maximum variable idx used in a guarded formula. Used
@@ -1944,7 +1926,7 @@ fn subst_gterm_slice(args: &std::sync::Arc<[GTerm]>, s: &VarSubst)
 pub fn max_var_idx(g: &Guarded) -> u64 {
     fn rec_term(t: &GTerm, m: &mut u64) {
         match t {
-            GTerm::Var(BVar::Free(v)) => { if v.idx > *m { *m = v.idx; } }
+            GTerm::Var(BVar::Free(v)) if v.idx > *m => { *m = v.idx; }
             GTerm::Var(BVar::Bound(_)) => {}
             GTerm::App(_, args) | GTerm::Pair(args) => {
                 for a in args.iter() { rec_term(a, m); }

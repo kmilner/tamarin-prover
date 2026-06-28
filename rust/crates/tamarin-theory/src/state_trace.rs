@@ -153,13 +153,13 @@ pub fn term_summary(t: &tamarin_term::lterm::LNTerm) -> String {
         }
         Term::Lit(Lit::Con(c)) => format!("'{}'", c.id.0),
         Term::App(FunSym::NoEq(noeq), args) => {
-            let name = String::from_utf8_lossy(&noeq.name);
+            let name = String::from_utf8_lossy(noeq.name);
             if name == "pair" {
                 let mut inner = Vec::new();
                 fn flatten<'a>(t: &'a tamarin_term::lterm::LNTerm,
                                out: &mut Vec<&'a tamarin_term::lterm::LNTerm>) {
                     if let Term::App(FunSym::NoEq(ns), args) = t {
-                        if &*ns.name == b"pair" {
+                        if ns.name == b"pair" {
                             flatten(&args[0], out);
                             flatten(&args[1], out);
                             return;

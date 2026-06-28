@@ -15,6 +15,11 @@
 //!
 //! No production caller exercises this module; kept as parity/API surface
 //! (the runtime expansion path lives in `predicate_expand.rs`).
+//! Intentionally retained: faithful HS port; no caller yet. The
+//! `theory.rs` `TheoryItem::Predicate` arm and `Theory::predicates()`
+//! iterator that type against [`Predicate`] are likewise unused (the
+//! parser carries predicates as the parser-AST `TheoryItem::Predicates`,
+//! which `predicate_expand.rs` consumes directly).
 
 use crate::fact::{Fact, FactTag, Multiplicity};
 use crate::formula::LNFormula;
@@ -50,7 +55,7 @@ impl Predicate {
 /// predicate.
 pub fn smaller_fact<T>(t1: T, t2: T) -> Fact<T> {
     Fact::new(
-        FactTag::Proto(Multiplicity::Linear, "Smaller".into(), 2),
+        FactTag::Proto(Multiplicity::Linear, "Smaller", 2),
         vec![t1, t2],
     )
 }
@@ -85,7 +90,7 @@ mod tests {
     fn capitalisation_in_constructor() {
         let f: LNFormula = ProtoFormula::ltrue();
         let p = Predicate::new("smaller", f, vec![]);
-        assert!(matches!(p.fact.tag, FactTag::Proto(_, ref n, _) if &**n == "Smaller"));
+        assert!(matches!(p.fact.tag, FactTag::Proto(_, n, _) if n == "Smaller"));
     }
 
     #[test]

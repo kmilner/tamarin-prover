@@ -8,12 +8,18 @@
 //! fact rendering (`prettyLNFact`), action-row filtering (Diff /
 //! auto-source), the cluster/preamble attribute blocks, the `roleColor`
 //! cluster styling and the less-edge rendering all match HS byte-for-
-//! byte. Two intentional approximations remain (each documented at its
-//! site): the per-rule node FILL colours use four fixed placeholder hexes
-//! instead of HS `nodeColorMap`'s size-dependent HSV palette (only the
-//! group PARTITION is faithful; an explicit per-rule `color:` attribute IS
-//! honoured exactly), and the cluster subgraph identifier uses the Rust
-//! `cluster_<n>` form rather than HS `createClusterNodeId`.
+//! byte.
+//!
+//! KNOWN DIVERGENCES (vs upstream Tamarin's graph rendering — intentional,
+//! each also documented at its site): downstream consumers of the web
+//! graph view should expect these two DOT/SVG rendering results to differ
+//! from upstream:
+//!   1. Per-rule node FILL colours use four fixed placeholder hexes instead
+//!      of HS `nodeColorMap`'s size-dependent HSV palette (only the group
+//!      PARTITION is faithful; an explicit per-rule `color:` attribute IS
+//!      honoured exactly).
+//!   2. The cluster subgraph identifier uses the Rust `cluster_<n>` form
+//!      rather than HS `createClusterNodeId`.
 //!
 //! Reference:
 //!   - `lib/theory/src/Theory/Constraint/System/Dot.hs` (605 lines)
@@ -257,7 +263,9 @@ pub fn render_svg_or_dot_with(sys: &System, opts: &GraphOptions) -> RenderResult
 
 /// What we got back from `dot`.
 pub enum RenderResult {
+    /// SVG bytes produced by `dot -Tsvg`.
     Svg(Vec<u8>),
+    /// Raw DOT source, returned when the `dot` binary is unavailable or failed.
     Dot(String),
 }
 
@@ -525,10 +533,10 @@ impl DotBuilder {
             let (name, exp) = entries[i];
             html.push_str("<TR>");
             html.push_str(&format!("<TD ALIGN=\"LEFT\" VALIGN=\"TOP\">{}</TD>",
-                html_escape(&pretty_lnterm(name))));
+                dot_html_escape(&pretty_lnterm(name))));
             html.push_str("<TD ALIGN=\"LEFT\" VALIGN=\"TOP\">=</TD>");
             html.push_str(&format!("<TD ALIGN=\"LEFT\" VALIGN=\"TOP\">{}</TD>",
-                html_escape(&pretty_lnterm(exp))));
+                dot_html_escape(&pretty_lnterm(exp))));
             html.push_str("</TR>");
         }
         html.push_str("</TABLE>>");
@@ -594,7 +602,10 @@ fn topo_sort_abbrevs(entries: &[(&LNTerm, &LNTerm)]) -> Vec<usize> {
 }
 
 /// HTML-escape a string for use in a Graphviz HTML-like label.
-fn html_escape(s: &str) -> String {
+/// Distinct from `crate::handlers::root::html_escape` (which also escapes
+/// `'`) because it targets a different context (DOT HTML-like label vs a
+/// general HTML page); do NOT merge the two char sets.
+fn dot_html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -879,8 +890,8 @@ fn role_color(name: &str) -> String {
 }
 
 fn escape_dot(s: &str) -> String {
-    // Escape `"`, `\`, `{`, `}`, `|`, `<`, `>` for the Graphviz record
-    // string syntax.
+    // Escape `"`, `\`, `{`, `}`, `|`, `<`, `>`, and newline for the
+    // Graphviz record string syntax.
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -926,7 +937,7 @@ mod tests {
         let info: RuleInfo<ProtoRuleACInstInfo,
             tamarin_theory::rule::IntrRuleACInfo> =
             RuleInfo::Proto(ProtoRuleACInstInfo {
-                name: ProtoRuleName::Stand("Setup".into()),
+                name: ProtoRuleName::Stand("Setup"),
                 attributes: RuleAttributes::empty(),
                 loop_breakers: Vec::new(),
             });
@@ -944,7 +955,7 @@ mod tests {
 
     #[test]
     fn dot_uses_pretty_printing_for_terms() {
-        // Two pub var literals shoult render as $a, $b not as cryptic
+        // Two pub var literals should render as $a, $b not as cryptic
         // M:0 placeholders.
         use tamarin_theory::fact::{out_fact, fresh_fact};
         use tamarin_theory::rule::{
@@ -958,7 +969,7 @@ mod tests {
         let info: RuleInfo<ProtoRuleACInstInfo,
             tamarin_theory::rule::IntrRuleACInfo> =
             RuleInfo::Proto(ProtoRuleACInstInfo {
-                name: ProtoRuleName::Stand("Setup".into()),
+                name: ProtoRuleName::Stand("Setup"),
                 attributes: RuleAttributes::empty(),
                 loop_breakers: Vec::new(),
             });
@@ -1270,7 +1281,7 @@ mod tests {
         let attrs = RuleAttributes { color: Some(rgb), ..Default::default() };
         let ru = Rule::new(
             RuleInfo::Proto(ProtoRuleACInstInfo {
-                name: ProtoRuleName::Stand("Coloured".into()),
+                name: ProtoRuleName::Stand("Coloured"),
                 attributes: attrs,
                 loop_breakers: Vec::new(),
             }),

@@ -490,7 +490,7 @@ fn render_signature(sig: &tamarin_term::maude_sig::MaudeSig) -> String {
 fn render_fun_syms(sig: &tamarin_term::maude_sig::MaudeSig) -> Vec<String> {
     use tamarin_term::function_symbols::{Constructability, Privacy};
     let mut items: Vec<(String, String)> = sig.st_fun_syms.iter().map(|sym| {
-        let name = String::from_utf8_lossy(&sym.name).to_string();
+        let name = String::from_utf8_lossy(sym.name).to_string();
         let arity = sym.arity;
         let attr = match (sym.privacy, sym.constructability) {
             (Privacy::Public, Constructability::Constructor) => "",
@@ -1323,7 +1323,7 @@ fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule, att
         // the first line differently and wrap one element too early; cf.
         // no-replication.spthy `news_0_`).
         let header = Doc::text("rule (modulo AC)")
-            .beside_sp(Doc::text(name.to_string()))
+            .beside_sp(Doc::text(name))
             .beside(rule_attributes_doc(attrs))
             .beside(Doc::text(":"))
             .nest(2);
@@ -1529,7 +1529,7 @@ fn lnterm_to_parser(t: &tamarin_term::lterm::LNTerm) -> p::Term {
             }
         }
         Term::App(FunSym::NoEq(sym), args) => {
-            let name = String::from_utf8_lossy(&sym.name).to_string();
+            let name = String::from_utf8_lossy(sym.name).to_string();
             // `exp` is the DH exponentiation infix operator — HS
             // `prettyTerm` (Term/Term.hs:274) renders `exp(a, b)` as `a^b`.
             // Surface as `p::Term::BinOp(Exp, ..)` so `pp_term`'s special
@@ -1551,7 +1551,7 @@ fn lnterm_to_parser(t: &tamarin_term::lterm::LNTerm) -> p::Term {
                 loop {
                     match tail {
                         Term::App(FunSym::NoEq(s2), a2)
-                            if a2.len() == 2 && String::from_utf8_lossy(&s2.name) == "pair" =>
+                            if a2.len() == 2 && String::from_utf8_lossy(s2.name) == "pair" =>
                         {
                             items.push(lnterm_to_parser(&a2[0]));
                             tail = &a2[1];
@@ -1936,7 +1936,7 @@ pub(crate) fn render_lnterm(t: &tamarin_term::lterm::LNTerm) -> String {
             format!("{}'{}'", prefix, n.id.0)
         }
         Term::App(FunSym::NoEq(sym), args) => {
-            let name = String::from_utf8_lossy(&sym.name);
+            let name = String::from_utf8_lossy(sym.name);
             // Special-case `exp` → `<a>^<b>` (infix DH exponentiation).
             // Mirrors HS `prettyTerm` (Term/Term.hs:274):
             //   `FApp (NoEq s) [t1,t2] | s == expSym -> ppTerm t1 <> text "^" <> ppTerm t2`
@@ -1956,7 +1956,7 @@ pub(crate) fn render_lnterm(t: &tamarin_term::lterm::LNTerm) -> String {
                 loop {
                     match tail {
                         Term::App(FunSym::NoEq(s2), a2)
-                            if a2.len() == 2 && &*String::from_utf8_lossy(&s2.name) == "pair" =>
+                            if a2.len() == 2 && &*String::from_utf8_lossy(s2.name) == "pair" =>
                         {
                             parts.push(render_lnterm(&a2[0]));
                             tail = &a2[1];
@@ -2068,7 +2068,7 @@ fn pp_proof(
             // out BESIDE `by `.  For a `SolveGoal` step the goal can wrap, and
             // HughesPJ counts the `by ` (3 cols) toward the ribbon when
             // deciding the `fsep`/`sep` break — so we must render `by ` as
-            // line CONTENT, not as part of the indent (see `solve_line_render`;
+            // line CONTENT, not as part of the indent (cf. the live string path;
             // the NAXOS/KAS2 `Match( a,` / `<…>` divergence).  The `by `
             // prefix is laid out by `step_line_with_unann` BESIDE the WHOLE
             // `sep [method, comment]` (HS `prettyCase ps (kwBy<>" ") <>
@@ -2129,7 +2129,7 @@ fn pp_proof(
 /// `prefix` is the leaf-step keyword (`"by "` for childless steps, `""`
 /// otherwise); it is laid out BESIDE the method as line content (NOT
 /// folded into the indent) so HughesPJ counts its columns toward the
-/// ribbon, identical to `solve_line_render`/`pp_proof`'s string path.
+/// ribbon, identical to `step_line_with_unann`/`pp_proof`'s string path.
 ///
 /// `base_indent` is the column where the step's first char lands; used
 /// by the SolveGoal goal builders so wrapped continuation lines indent
@@ -2459,8 +2459,8 @@ fn strip_one_outer_paren(s: &str) -> &str {
 /// space).  Facts go through `prettyLNFact`'s `nestShort'` wrapping (via
 /// `pf::fact_doc`); terms through `prettyLNTerm` (via `pf::term_doc`);
 /// node-ids / node-conc / node-prem are atomic strings (HS `prettyNodeId`
-/// is `text . show`).  The DisjG case is handled by `solve_disj_goal_line`
-/// upstream and never reaches here.
+/// is `text . show`).  The non-empty DisjG case is rendered by the
+/// `disj_goal_to_doc` arm below.
 fn solve_goal_to_doc(
     g: &crate::constraint::constraints::Goal,
 ) -> crate::pretty_hpj::Doc {
@@ -2500,8 +2500,7 @@ fn solve_goal_to_doc(
         Goal::Disj(d) if d.0.is_empty() => {
             Doc::text("Disj").beside_sp(Doc::text("(\u{22A5})"))
         }
-        // Non-empty DisjG is routed via `solve_disj_goal_line` upstream;
-        // fall back to the Doc form for safety.
+        // Non-empty DisjG renders via the Doc form (`disj_goal_to_doc`).
         Goal::Disj(d) => pf::disj_goal_to_doc(&d.0),
         // `prettyGoal (SubtermG (l,r)) =
         //    prettyLNTerm l <-> operator_ "⊏" <-> prettyLNTerm r`.
@@ -2640,7 +2639,7 @@ mod oracle_goal_tests {
     fn premise_goal_wraps_at_oracle_ribbon_67() {
         // !KeyStore0( ~keyaaaaaaaaaaaaaaaaaaaa, ~msgbbbbbbbbbbbbbbbbbbbb ) ▶₀ #l
         let fa: LNFact = Fact::new(
-            FactTag::Proto(Multiplicity::Persistent, "KeyStore0".into(), 2),
+            FactTag::Proto(Multiplicity::Persistent, "KeyStore0", 2),
             vec![fresh("keyaaaaaaaaaaaaaaaaaaaa"), fresh("msgbbbbbbbbbbbbbbbbbbbb")],
         );
         let node = LVar::new("l", LSort::Node, 0);
