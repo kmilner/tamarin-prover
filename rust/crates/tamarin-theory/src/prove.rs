@@ -1398,18 +1398,6 @@ mod tests {
     }
 
     #[test]
-    fn probe_two_rules_proof_shape_v2() {
-        let h = match maude() { Some(m) => m, None => return };
-        let src = std::fs::read_to_string(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/two_rules.spthy"))
-            .expect("read");
-        let pt = tamarin_parser::parse_theory(&src, &[]).expect("parse");
-        let root = prove_lemma(&pt, "reachable", h, 200).expect("prove");
-        eprintln!("=== two_rules.spthy `reachable` (v2) ===");
-        print_tree(&root, 0);
-    }
-
-    #[test]
     fn probe_auth_pattern_proof_shape() {
         let h = match maude() { Some(m) => m, None => return };
         let src = std::fs::read_to_string(

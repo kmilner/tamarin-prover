@@ -1063,9 +1063,7 @@ fn insert_implied_formulas_pass(red: &mut Reduction) -> ChangeIndicator {
     // formula — including those with empty `vs`.  Such empty-var universals
     // can arise as residuals (e.g. `gall [] otherAtoms succedent` from a
     // previous `impliedFormulas` round, or from a multi-guard formula whose
-    // bound vars have all been substituted away).  Previously we filtered
-    // `!vars.is_empty()` which excluded them entirely — a deviation from
-    // Haskell that left implications unfired.
+    // bound vars have all been substituted away).
     // Haskell-faithful: at runtime (NOT in_precompute_mode), SKIP
     // universals from `[sources]`-tagged lemma bodies.  Haskell only
     // adds `[reuse]` to sLemmas (gatherReusableLemmas in Prover.hs:331),

@@ -1888,8 +1888,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
         // last_chain_term), and process the head.  Empty result drops
         // the branch (HS mzero-equivalent).
         // HS-faithful: propagate the DisjT fan-out from simplifySystem
-        // (unconditional; the TAM_RS_DISABLE_SAS_SIMPLIFY_FANOUT opt-out
-        // that collapsed N siblings into 1 has been removed).
+        // (unconditional).
         let post_simp: Vec<System> = simplify_system_with_fanout(ctx, sys);
         // Pop one sibling to continue with; push the rest back for
         // later processing.  Match HS's Disj-monad insertion order:
@@ -1994,8 +1993,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
         // and drops via solveChain's forbiddenEdge / illegalCoerce /
         // isMsgVar plus solveSplit's eqsIsFalse.
         // HS-faithful `lastChainTerm` chain-goal filter (Sources.hs:182-186),
-        // applied unconditionally (the TAM_RS_DISABLE_LCT_FILTER opt-out
-        // that skipped it has been removed).
+        // applied unconditionally.
         let filtered_goals: Vec<(Goal, bool)> = goals.iter().filter(|(g, _)| {
                 match g {
                     Goal::Chain(c, _) => {
@@ -2305,8 +2303,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
         // useful_ku's source label was verified NOT in `used` above,
         // so all case_pairs from this single source are available.
         // No per-case-name filter needed.
-        let unused: Vec<_> = case_pairs;
-        if unused.is_empty() {
+        if case_pairs.is_empty() {
             // No candidates returned by solve_with_source_cases_action
             // — surface as survivor (Haskell's asum returns [] here).
             if trace {
@@ -2320,10 +2317,8 @@ fn run_solve_all_safe_goals_disj_with_progress(
         // Fork: try each viable candidate as a separate branch.
         // Mirrors Haskell `asum [solveWithSourceAndReturn ctxt ths g
         // | g <- usefulGoals]` — collects all branches that survive.
-        // (Unconditional fork; the TAM_DISJ_REFINE_NO_SOURCE_PICK
-        // single-pick opt-out has been removed.)
         let mut any_branched = false;
-        for (case_name, sys_cand, case_action) in unused {
+        for (case_name, sys_cand, case_action) in case_pairs {
             // Graft path: caller runs solve_fact_eqs(action) +
             // chain_eqs over the grafted system.
             let mut sub = Reduction::new(ctx, sys_cand);
@@ -2597,10 +2592,8 @@ pub fn solve_with_source_cases_ctx(
     let mut out: Vec<(String, System)> = Vec::new();
     let mut all_attempted: Vec<(String, bool)> = Vec::new();
     for (name, case_sys) in src.cases(ctx) {
-        // HS-faithful: use the stored (already-`combine`d, `_`-joined)
-        // case name verbatim — never re-split on `_`.  See the note at
-        // the action-goal call site above re: the removed
-        // `saturated_chain_root` mangling of underscore-bearing symbols.
+        // HS-faithful: use the stored (already-`combine`d, `_`-joined) case name
+        // verbatim — never re-split on `_` (would corrupt funsyms containing `_`).
         let case_label = name.clone();
         let applied_arms = apply_source_case_premise(
             ctx, sys, src, &case_sys,
@@ -3013,13 +3006,10 @@ pub fn solve_with_source_cases_action_with_ctx(
         // ----------------------------------------------------------------
         let mut refine_arms: Vec<(String, RefineArm)> = Vec::new();
         for (name, case_sys) in cases_iter {
-            // HS-faithful: the stored case name is ALREADY the final
-            // display name — `refineSource` applied `combine` (Sources.hs
-            // :135-139) and the list was joined via `intercalate "_"`
-            // (ProofMethod.hs:511).  HS NEVER re-splits a name on `_`, so
-            // we must use it verbatim.  (A previous `saturated_chain_root`
-            // string-splitter mangled `c_KDF_SKc` → `SKc` for any function
-            // symbol whose name contains an underscore.)
+            // HS-faithful: the stored case name is ALREADY the final display
+            // name — `refineSource` applied `combine` (Sources.hs:135-139) and
+            // the list was joined via `intercalate "_"` (ProofMethod.hs:511).
+            // HS NEVER re-splits a name on `_`, so use it verbatim.
             let case_label = name.clone();
             if dbg_rt { all_names.push(case_label.clone()); }
             // Haskell-faithful `applySource` path: matches the live goal
@@ -3179,17 +3169,11 @@ fn combine_case_names_list(existing: &[String], new_names: &[String]) -> Vec<Str
     }
 }
 
-// NOTE: a former `saturated_chain_root(name) -> String` helper used to
-// re-derive the "chain root" by string-splitting a source-case name on
-// `_` (peeling `coerce_`/`c_<sym>_`/`_case_<N>` segments).  That was
-// REMOVED: by the time a case name reaches the runtime, `refineSource`
-// has already applied HS's `combine` (Sources.hs:135-139, ported in
-// `combine_case_names_list`) over the `[String]` step-name list and the
-// result is joined with `intercalate "_"` (ProofMethod.hs:511).  HS
-// never re-splits a single name on `_`, so the helper was a no-op for
-// every name in practice EXCEPT it corrupted function symbols whose
-// names contain `_` (e.g. `c_KDF_SKc` → `SKc`).  Callers now use the
-// stored name verbatim.
+// A source-case name reaching the runtime is already the final, `combine`d
+// display name (HS `combine`, Sources.hs:135-139, ported in
+// `combine_case_names_list`; joined with `intercalate "_"`, ProofMethod.hs:511).
+// Use it verbatim — never re-split on `_`, which would corrupt function symbols
+// whose names contain `_` (e.g. `c_KDF_SKc` → `SKc`).
 
 /// Compute the term's "effective" sort.  Variables carry their sort;
 /// applications default to Msg (the join of all sub-sorts).
@@ -7017,8 +7001,7 @@ mod tests {
     }
 
     // =========================================================================
-    // HS-faithful source-case naming invariant (replaces the removed
-    // `saturated_chain_root` string-splitter tests).
+    // HS-faithful source-case naming invariant.
     //
     // By the time a case name reaches the runtime, `refineSource` has
     // already applied HS's `combine` (Sources.hs:135-139, ported in
@@ -7028,11 +7011,10 @@ mod tests {
     // used verbatim — HS never re-splits a single name on `_`.
     // =========================================================================
 
-    /// `combine` keeps a single non-coerce element verbatim, including
-    /// when it is a `c_<sym>` construction-rule name whose symbol
-    /// contains underscores (e.g. `c_KDF_SKc`).  The former
-    /// `saturated_chain_root` split this to `SKc` (fm24-cardpayments C8
-    /// divergence); the list-model `combine` keeps it intact.
+    /// `combine` keeps a single non-coerce element verbatim, including when it
+    /// is a `c_<sym>` construction-rule name whose symbol contains underscores
+    /// (e.g. `c_KDF_SKc` must stay intact, never split to `SKc` — the
+    /// fm24-cardpayments C8 divergence).
     #[test]
     fn combine_keeps_underscore_bearing_constr_name_intact() {
         // Single construction-rule name → kept whole.

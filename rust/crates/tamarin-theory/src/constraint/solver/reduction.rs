@@ -571,10 +571,9 @@ impl<'ctx> Reduction<'ctx> {
         // After substNodeIds, HS applies subst to rule contents via
         // `M.map . apply`.
         //
-        // Rust previously applied node-id rename AND fact substitution
-        // in the SAME loop, so rule_eqs at collision time saw
-        // already-substituted (and thus identical-looking) rules.
-        // Splitting into two passes mirrors HS exactly.
+        // RS mirrors HS in two passes: Pass 1 renames node-ids only (rules stay
+        // un-substituted so rule_eqs at collision time see the raw rules), Pass 2
+        // applies the fact-term substitution.
         let mut id_renamed_nodes: Vec<(crate::constraint::constraints::NodeId, RuleACInst)> = Vec::new();
         for (id, rule) in nodes {
             let id_orig = id.clone();
@@ -903,24 +902,6 @@ impl<'ctx> Reduction<'ctx> {
                 // is called with the OLD value and the NEW value, and
                 // its `min age1 age2` chooses the SMALLER nr regardless
                 // of iteration order.
-                //
-                // Previously: RS kept the FIRST-iterated goal's gsNr and
-                // dropped subsequent goals' nrs entirely — so when two
-                // pre-subst goals (e.g. `Premise(#vr.3, p1) PCR(x.5)` at
-                // nr=14 and `Premise(#vr.10, p0) PCR(h(...obtain))` at
-                // nr=28) substitute to the SAME post-subst goal, RS
-                // could keep nr=28 (whichever came first in goal_cmp
-                // order) while HS kept nr=14.  This shifts the
-                // smartRanking pick: HS picks `PCR('pcr0')` at nr=14
-                // first, RS picks `PCR(h(...))` at nr=28 first — taking
-                // a different proof path.
-                //
-                // Surfaced on Envelope::Secret_and_Denied_exclusive
-                // (5828 diff lines): at /Alice1/PCR_Init/Alice2/PCR_Init/
-                // PCR_Unbind/PCR_Extend/Alice1/PCR_CertKey/Alice1/PCR_Quote/
-                // PCR_Extend/Alice2 the divergent pick was traced to this
-                // gsNr-merge gap, not to apply_source_case unifier
-                // selection (the prior diagnosis).
                 //
                 // Comparison key: `canonical_goal_for_dedup` (mirrors
                 // HS's Map-key equality on Goal, which is structural Eq
