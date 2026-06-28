@@ -697,18 +697,11 @@ impl MaudeHandle {
         //   2. If success with no AC residuals → return result.
         //   3. If success with AC residuals → call Maude on residuals only.
         //   4. If failure → return empty (no Maude call).
-        // Previously RS gated the fast path on `is_ac_free()` (signature
-        // has no [variant] equations).  But that meant for signatures
-        // WITH [variant] equations (e.g. StatVerif's convertpcs/checkpcs),
-        // RS sent EVERY unification to Maude, which then NARROWS via
-        // [variant] equations — keeping variants HS would drop.
-        //
-        // Verified via TAM_DBG_MAUDE_IO=full on resolved1:
-        //   HS: 0 unify calls, 198 reduce, 18 get variants.
-        //   RS: 864 unify calls (incl 81 with `true =? checkpcs(...)`),
-        //       998 reduce, 9 get variants.
-        // The extra 864 unify calls let Maude narrow [variant] equations
-        // RS shouldn't have asked about.
+        // The fast path is intentionally NOT gated on `is_ac_free()`:
+        // signatures WITH [variant] equations (e.g. StatVerif's
+        // convertpcs/checkpcs) must still try the local non-AC unifier
+        // first, otherwise every unification goes to Maude, which narrows
+        // via the [variant] equations and keeps variants HS would drop.
         {
             let eqs_owned: Vec<Equal<LNTerm>> = eqs.to_vec();
             let result = crate::unification::unify_lnterm_no_ac_with_counter(
@@ -767,11 +760,10 @@ impl MaudeHandle {
         // `flattenUnif (subst, substs) = map (`composeVFresh` subst) substs`
         // (Unification.hs:144-147) composes each Maude arm with `subst = m`.
         //
-        // Previously RS sent the FULL `eqs` to Maude and composed each arm
-        // with the EMPTY substitution.  That left `m`'s non-AC bindings
-        // (e.g. `X.18 → em(...)`, `~ey.16 → ~ey.11`) to be re-derived by
-        // Maude per arm, with witness idxs allocated against the full input
-        // var set rather than just the AC residual's vars.
+        // We therefore factor out the non-AC substitution `m` and send only
+        // the AC residuals to Maude, so witness idxs are allocated against
+        // the residual's vars (matching HS); `m`'s bindings are composed
+        // back in below.
         let (factored_m, residual_eqs): (
             crate::subst::Subst<crate::lterm::Name, crate::lterm::LVar>,
             Vec<Equal<LNTerm>>,
@@ -852,15 +844,11 @@ impl MaudeHandle {
         // the equate target.  Net: HS sorts Mult arm BEFORE Equates arm
         // by the SubstVFresh Ord (Map-of-(key,value) lexicographic).
         //
-        // Previously RS shared `ctx` AND advanced the global counter
-        // monotonically across unifiers (msubst_to_lnsubst_with_maude
-        // line 1136-1138).  Result: every unifier saw the previous
-        // unifier's mutations to ctx.inverse (so a FreshVar reuses the
-        // same LVar across arms) and started its counter where the prior
-        // ended.  Witness collisions across arms then collapsed the
-        // distinguishing per-arm idx differences HS produces, leaving
-        // RS's SubstVFresh Ord to fall back on the VALUE structure
-        // (Lit < App), putting Equates BEFORE Mult.
+        // Each unifier therefore gets a FRESH `ctx` and counter, so per-arm
+        // witness idxs differ exactly as HS produces.  Sharing them would
+        // collapse those per-arm idx differences (cross-arm FreshVar/counter
+        // reuse), making RS's SubstVFresh Ord fall back on VALUE structure
+        // (Lit < App) and mis-order the arms.
         //
         // Fix (HS-faithful): per unifier, CLONE ctx and RESET the global
         // counter to a shared baseline.  After all unifiers, advance the
@@ -952,9 +940,8 @@ impl MaudeHandle {
         //
         // HS `flattenUnif (subst, substs) = map (`composeVFresh` subst) substs`
         // (Unification.hs:147) composes each Maude arm with `subst = m`, the
-        // non-AC factored substitution.  Previously RS composed with the
-        // empty substitution because it sent the full eqs to Maude; now that
-        // we factor and send only AC residuals, `factored_m` carries the
+        // non-AC factored substitution.  Because we factor and send only the
+        // AC residuals to Maude, `factored_m` carries the
         // non-AC bindings and MUST be the second argument to composeVFresh.
         let renamed: Vec<Vec<(crate::lterm::LVar, LNTerm)>> = out.into_iter().map(|arm| {
             let arm_vfresh = crate::subst_vfresh::LSubstVFresh::<crate::lterm::Name>::from_list(arm);

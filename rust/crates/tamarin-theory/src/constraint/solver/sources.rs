@@ -1034,10 +1034,7 @@ fn refine_one_source(
     // HS-faithful `refineSource` (Sources.hs:131-148): the Reduction
     // monad flattens all `getDisj cdCases th` into a single Disj of
     // post-refine branches; `removeRedundantCases` deduplicates that
-    // flat list ONCE at the end.  Previously RS applied dedup PER
-    // input case (input=1 — a no-op for single-branch cases), so
-    // alpha-equivalent branches arising from DIFFERENT input cases
-    // were never compared.  Accumulate to a deferred list and
+    // flat list ONCE at the end.  We accumulate to a deferred list and
     // dedup in a single pass after the loop.
     let mut deferred_filtered: Vec<(Vec<String>, crate::constraint::system::System)>
         = Vec::new();
@@ -1285,22 +1282,13 @@ fn saturate_sources_with_simp_opt(
             // mzero'd).  Sources are NEVER dropped; the count is constant
             // (`[SAT-FINAL] sources=N` stays fixed) and only `cdCases` shrinks.
             //
-            // Previously RS DROPPED a source whose refine produced 0 cases
-            // (the `else` only set `changed`, never pushing to `next`).  That
-            // left the source absent from `current`/`refined`, so
-            // `ensure_saturated`'s match-by-goal (context.rs) found nothing
-            // and LEFT THE STALE *INITIAL* CASES in the cell.  For a builtin
-            // destructor like `check_rep`/`get_rep` (locations-report) the
-            // initial `coerce` case carries an unsolvable `KD(check_rep(..))`
-            // premise; HS solves that KD-premise during saturation, finds no
-            // source (nothing outputs `check_rep`), contradicts the branch,
-            // and ends with `cdCases = []`.  RS instead kept the coerce case,
-            // so during the lemma proof `KU(check_rep(..))` opened the
-            // coerce → KD → chain subtree HS prunes — inflating the
-            // locations-report SAPiC theories' proofs (AKE can_run_v: 9 HS
-            // steps vs 21 RS; SOC/OTP/AC likewise).  Keep the empty-case
-            // source so the cell is overwritten to empty, matching HS's
-            // `by solve( !KU( check_rep(..) ) )` (zero open cases).
+            // A source whose refine produces 0 cases must still be pushed
+            // (with an empty case list) so its cell is overwritten to empty,
+            // matching HS: HS solves the unsolvable KD-premise during
+            // saturation, contradicts the branch, and ends with `cdCases = []`.
+            // Dropping it would leave the STALE *initial* cases in the cell
+            // (e.g. a builtin `check_rep`/`get_rep` coerce case), inflating the
+            // locations-report SAPiC proofs.
             let new_cases_empty = new_cases.is_empty();
             next.push(Source::eager_list(src_goal_and_incomplete.0, new_cases, src_goal_and_incomplete.1));
             if new_cases_empty {
@@ -1549,10 +1537,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
     // HS's `changes = map fst (getDisj refinement)` collects `x = not
     // (null names)` ONLY from surviving Disj branches (Sources.hs:118-
     // 133).  A branch that takes a step then mzero's contributes
-    // nothing.  (Previously RS used a single mutable `any_step_taken`
-    // set on ANY step incl. branches that later die — an over-count
-    // that drove an EXTRA saturate iteration vs HS, collapsing e.g.
-    // TLS_Handshake's PRF C_2/S_2 deconstruction cases that HS keeps.)
+    // nothing.
     type Entry = (System, Vec<String> /* step_names accumulator */,
                   std::collections::BTreeSet<String>, i64, i64,
                   Option<tamarin_term::lterm::LNTerm> /* last_chain_term */,
@@ -1608,12 +1593,10 @@ fn run_solve_all_safe_goals_disj_with_progress(
         // sibling proceeds independently through the rest of
         // `solveAllSafeGoals.solve`.
         //
-        // Previously RS called `simplify_system(&mut red)` (in-place)
-        // here, dropping any Disj fan-out on the floor.  That collapsed
-        // N HS-siblings into 1 RS branch — exact same pattern as the
-        // 2026-06-07 `simplify_system_with_fanout` landing in
-        // `exec_proof_method` (memory entry `a0ae5655`).  We need the
-        // SAME fan-out propagation here in `solveAllSafeGoals.solve`.
+        // This pass must PROPAGATE Disj fan-out, not collapse it in-place:
+        // a simplify step that fans out N siblings must yield N sibling
+        // systems here (as `simplify_system_with_fanout` does in
+        // `exec_proof_method`), else N HS-siblings collapse into 1 RS branch.
         //
         // Strategy: split into N sibling systems, push the tail back
         // onto worklist with same (name, used, chains_left, iters_left,
@@ -4637,11 +4620,7 @@ fn var_occurrences_nodes(
     //   FApp o        as  ->  push `show o`               (the FunSym, for AC/C/List)
     // The SAME context is pushed once for the whole arg list — HS does NOT
     // descend per-argument with an index, so every argument of an `FApp`
-    // shares the symbol-name context.  (Previously RS pushed the arg INDEX
-    // and no symbol name, which produced occurrence-sets incompatible with
-    // HS's `varOccurences`, breaking the canonical `renameDropNameHints`
-    // ordering and so under-collapsing alpha-equivalent cases in
-    // `removeRedundantCases`.)
+    // shares the symbol-name context.
     fn funsym_occ_ctx(sym: &tamarin_term::function_symbols::FunSym) -> String {
         use tamarin_term::function_symbols::{FunSym, AcSym, CSym};
         match sym {
