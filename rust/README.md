@@ -6,8 +6,11 @@ mirrors them function-for-function, targeting **byte-identical raw `--prove`
 output** against the Haskell prover.
 
 ```
-utils → term → parser → theory → {sapic, accountability, export, server} → tamarin-prover
+utils → term → parser → theory → {sapic, server} → tamarin-prover
 ```
+
+(`accountability` and `export` are standalone placeholder crates, not yet wired
+into the binary — see *Not yet ported*.)
 
 ## Build
 
@@ -87,42 +90,42 @@ TIMEOUT, DERIV, HS_PATH, RS_PATH env vars (see the scripts/bench.sh header).
 | Theory | HS time | RS time | HS memory | RS memory |
 |--------|--------:|--------:|----------:|----------:|
 | `NSPK3` | 0.9 s | 0.3 s (-67%) | 65 MB | 16 MB (-75%) |
-| `Joux` | 6.8 s | 3.9 s (-43%) | 244 MB | 43 MB (-82%) |
-| `stateverif_left_right` | 11.0 s | 2.5 s (-77%) | 861 MB | 49 MB (-94%) |
-| `Yubikey` | 15.2 s | 2.9 s (-81%) | 295 MB | 46 MB (-84%) |
-| `gcm` | 42.0 s | 10.2 s (-76%) | 1242 MB | 104 MB (-92%) |
-| `wireguard` | 37.9 s | 8.5 s (-78%) | 1250 MB | 50 MB (-96%) |
-| `CCITT_X509_3` | 139.1 s | 43.4 s (-69%) | 2406 MB | 297 MB (-88%) |
+| `Joux` | 6.7 s | 3.9 s (-42%) | 244 MB | 42 MB (-83%) |
+| `stateverif_left_right` | 11.1 s | 2.5 s (-77%) | 863 MB | 49 MB (-94%) |
+| `Yubikey` | 14.5 s | 2.8 s (-81%) | 290 MB | 45 MB (-84%) |
+| `gcm` | 42.8 s | 10.2 s (-76%) | 1298 MB | 106 MB (-92%) |
+| `wireguard` | 37.9 s | 8.5 s (-78%) | 1183 MB | 50 MB (-96%) |
+| `CCITT_X509_3` | 138.7 s | 45.0 s (-68%) | 2406 MB | 297 MB (-88%) |
 
 **4 cores**
 
 | Theory | HS time | RS time | HS memory | RS memory |
 |--------|--------:|--------:|----------:|----------:|
-| `NSPK3` | 0.5 s | 0.2 s (-60%) | 95 MB | 26 MB (-73%) |
-| `Joux` | 5.7 s | 3.8 s (-33%) | 278 MB | 49 MB (-82%) |
-| `stateverif_left_right` | 6.3 s | 1.5 s (-76%) | 843 MB | 79 MB (-91%) |
-| `Yubikey` | 9.9 s | 2.0 s (-80%) | 318 MB | 77 MB (-76%) |
-| `gcm` | 31.8 s | 4.4 s (-86%) | 1331 MB | 193 MB (-85%) |
-| `wireguard` | 21.7 s | 3.7 s (-83%) | 1244 MB | 84 MB (-93%) |
-| `CCITT_X509_3` | 60.4 s | 11.5 s (-81%) | 4488 MB | 517 MB (-88%) |
+| `NSPK3` | 0.5 s | 0.2 s (-60%) | 94 MB | 26 MB (-72%) |
+| `Joux` | 5.8 s | 3.9 s (-33%) | 276 MB | 44 MB (-84%) |
+| `stateverif_left_right` | 6.6 s | 1.6 s (-76%) | 875 MB | 81 MB (-91%) |
+| `Yubikey` | 9.4 s | 2.0 s (-79%) | 305 MB | 76 MB (-75%) |
+| `gcm` | 32.6 s | 4.6 s (-86%) | 1326 MB | 214 MB (-84%) |
+| `wireguard` | 22.8 s | 4.1 s (-82%) | 1280 MB | 77 MB (-94%) |
+| `CCITT_X509_3` | 64.5 s | 12.0 s (-81%) | 4395 MB | 539 MB (-88%) |
 
 **16 cores**
 
 | Theory | HS time | RS time | HS memory | RS memory |
 |--------|--------:|--------:|----------:|----------:|
-| `NSPK3` | 0.5 s | 0.3 s (-40%) | 141 MB | 36 MB (-74%) |
-| `Joux` | 6.4 s | 4.0 s (-38%) | 333 MB | 57 MB (-83%) |
-| `stateverif_left_right` | 6.8 s | 1.6 s (-76%) | 887 MB | 122 MB (-86%) |
-| `Yubikey` | 10.8 s | 1.9 s (-82%) | 393 MB | 162 MB (-59%) |
-| `gcm` | 30.1 s | 3.5 s (-88%) | 1320 MB | 364 MB (-72%) |
-| `wireguard` | 20.0 s | 3.7 s (-82%) | 1316 MB | 133 MB (-90%) |
-| `CCITT_X509_3` | 64.0 s | 4.4 s (-93%) | 5883 MB | 762 MB (-87%) |
+| `NSPK3` | 0.5 s | 0.3 s (-40%) | 145 MB | 36 MB (-75%) |
+| `Joux` | 6.7 s | 4.0 s (-40%) | 335 MB | 57 MB (-83%) |
+| `stateverif_left_right` | 7.9 s | 1.7 s (-78%) | 842 MB | 120 MB (-86%) |
+| `Yubikey` | 11.3 s | 2.1 s (-81%) | 389 MB | 163 MB (-58%) |
+| `gcm` | 31.4 s | 4.2 s (-87%) | 1378 MB | 334 MB (-76%) |
+| `wireguard` | 21.8 s | 3.8 s (-83%) | 1369 MB | 131 MB (-90%) |
+| `CCITT_X509_3` | 67.9 s | 4.9 s (-93%) | 5598 MB | 666 MB (-88%) |
 
 <!-- BENCH:END -->
 
 Memory is the maximum resident set of the prover process; Maude runs as a
 separate subprocess on both sides and is excluded. Across all theories and core
-counts the Rust port is faster, and uses several-fold less memory — from ≈4–25×
+counts the Rust port is faster, and uses several-fold less memory — from ≈4–24×
 at one core down to ≈2–10× at sixteen, where lemma-level parallelism keeps
 several constraint systems live at once.
 
@@ -196,7 +199,7 @@ crates/
   tamarin-term/           Term/LTerm/LNTerm, MaudeSig, Maude IPC, normalisation
   tamarin-parser/         .spthy AST + lexer + parser + #include resolver
   tamarin-theory/         elaborator, constraint system, solver, simplify, sources, replay
-  tamarin-sapic/          SAPiC channel / source-case helpers (no full frontend)
+  tamarin-sapic/          SAPiC process: frontend — translation to multiset-rewrite rules
   tamarin-accountability/ accountability frontend (placeholder)
   tamarin-export/         ProVerif / DeepSec / SPDL export (placeholder)
   tamarin-server/         interactive HTTP server (Axum)
