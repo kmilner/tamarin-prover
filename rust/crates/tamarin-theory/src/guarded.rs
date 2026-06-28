@@ -62,8 +62,7 @@ pub enum Quant { All, Ex }
 // Disj formulas → goal pick at downstream proof steps.
 //
 // This module provides `cmp_guarded` (and helpers `cmp_atom` /
-// `cmp_term`) that mirror HS's derived Ord chain.  See
-// [[reference-vec-vs-set-walks]] for the sites that need this.
+// `cmp_term`) that mirror HS's derived Ord chain.
 
 /// HS-faithful structural comparison for Guarded.  Mirrors HS's derived
 /// `Ord (Guarded s c v)` on `Theory.Constraint.System.Guarded.Guarded`.
@@ -1318,9 +1317,12 @@ pub fn normalize_witness_lvars(g: &Guarded) -> Guarded {
 /// formulas compare equal under structural `Eq` automatically — Bound vars carry
 /// no idx, so `Ex j:5. KU(s)@j:5` and `Ex j:6. KU(s)@j:6` both yield
 /// `GGuarded { vars: [(j, Node)], body: ... Bound(0) ... }` — so no rewriting is
-/// needed.  Called from `constraint::system`, `solver::reduction`, and
-/// `solver::simplify` to mark the spots where HS relied on its DeBruijn
-/// invariant.
+/// needed.  Called from `constraint::system` and `solver::reduction` to mark
+/// the spots where HS relied on its DeBruijn invariant.  `solver::simplify`
+/// deliberately skips it — see `implied_apply_canon` in simplify.rs, which
+/// drops the call to save one full `Guarded` deep clone.
+///
+/// Intentionally a no-op identity clone: faithful HS port marker.
 pub fn normalize_bound_lvars(g: &Guarded) -> Guarded {
     g.clone()
 }
@@ -1431,7 +1433,7 @@ pub fn normalize_sort_hints(g: &Guarded) -> Guarded {
 /// Every HS `mapFrees` / `apply` over LNTerm routes through `f_app_ac`,
 /// so AC heads stay in canonical sorted order after substitution.  Rust
 /// stores formulas in parser-AST `BinOp(op, l, r)` (strict arity-2), and
-/// `subst_term` / `subst_gterm` recurse into the children without
+/// `subst_term` / `subst_gterm_cow` recurse into the children without
 /// re-sorting.
 ///
 /// After `rename_precise_system` renumbers free vars (e.g. `ekR.5 →
@@ -1823,10 +1825,6 @@ pub fn subst_guarded_cow(g: &Guarded, s: &VarSubst) -> Option<Guarded> {
 /// parser-AST terms (`p::Term`), which we lift to `GTerm` with all-Free
 /// leaves — those Free LVars are at the system's top-level scope and
 /// cannot collide with any binder.
-pub fn subst_gatom(a: &GAtom, s: &VarSubst) -> GAtom {
-    subst_gatom_cow(a, s).unwrap_or_else(|| a.clone())
-}
-
 fn subst_gatom_cow(a: &GAtom, s: &VarSubst) -> Option<GAtom> {
     match a {
         GAtom::Eq(x, y) => subst_gpair_cow(x, y, s).map(|(a, b)| GAtom::Eq(a, b)),
@@ -1845,10 +1843,6 @@ fn subst_gpair_cow(x: &GTerm, y: &GTerm, s: &VarSubst) -> Option<(GTerm, GTerm)>
 }
 
 /// Substitute Free LVar leaves in a `GFact`.
-pub fn subst_gfact(f: &GFact, s: &VarSubst) -> GFact {
-    subst_gfact_cow(f, s).unwrap_or_else(|| f.clone())
-}
-
 fn subst_gfact_cow(f: &GFact, s: &VarSubst) -> Option<GFact> {
     cow_map_vec(f.args.as_slice(), |a| subst_gterm_cow(a, s)).map(|args| GFact {
         persistent: f.persistent,
@@ -1858,15 +1852,7 @@ fn subst_gfact_cow(f: &GFact, s: &VarSubst) -> Option<GFact> {
     })
 }
 
-/// Substitute Free LVar leaves in a `GTerm`.
-pub fn subst_gterm(t: &GTerm, s: &VarSubst) -> GTerm {
-    match subst_gterm_cow(t, s) {
-        Some(g) => g,
-        None => t.clone(),
-    }
-}
-
-/// Copy-on-write core of `subst_gterm`.  Returns `None` when the subtree
+/// Copy-on-write substitution of Free LVar leaves in a `GTerm`.  Returns `None` when the subtree
 /// contains no variable in the substitution's domain (so no leaf is replaced
 /// and no `mk_gpair` flattening can fire), letting the caller reuse the input
 /// `Arc` without rebuilding.  `Some(g)` carries the rebuilt subtree.

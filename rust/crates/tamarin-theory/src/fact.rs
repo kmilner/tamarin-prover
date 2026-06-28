@@ -164,7 +164,9 @@ pub fn fact_tag_multiplicity(t: &FactTag) -> Multiplicity {
 impl<T> Fact<T> {
     pub fn is_linear(&self) -> bool { fact_tag_multiplicity(&self.tag) == Multiplicity::Linear }
     pub fn is_persistent(&self) -> bool { fact_tag_multiplicity(&self.tag) == Multiplicity::Persistent }
+    // Intentionally retained: faithful HS port; no caller yet.
     pub fn is_proto(&self) -> bool { matches!(self.tag, FactTag::Proto(_, _, _)) }
+    // Intentionally retained: faithful HS port; no caller yet.
     pub fn is_in_fact(&self) -> bool { self.tag == FactTag::In }
     pub fn is_k_fact(&self) -> bool {
         matches!(self.tag, FactTag::Ku | FactTag::Kd)
@@ -205,6 +207,7 @@ pub fn out_fact(t: LNTerm) -> LNFact { Fact::new(FactTag::Out, vec![t]) }
 pub fn in_fact(t: LNTerm) -> LNFact { Fact::new(FactTag::In, vec![t]) }
 pub fn ku_fact(t: LNTerm) -> LNFact { Fact::new(FactTag::Ku, vec![t]) }
 pub fn kd_fact(t: LNTerm) -> LNFact { Fact::new(FactTag::Kd, vec![t]) }
+// Intentionally retained: faithful HS port; no caller yet.
 pub fn ded_fact(t: LNTerm) -> LNFact { Fact::new(FactTag::Ded, vec![t]) }
 
 /// `kLogFact` from Haskell's `Theory.Model.Fact:280`:

@@ -342,7 +342,7 @@ fn replay_node(
     // contradictory closure), this is a leaf-equivalent.
     if cases.is_empty() {
         // Empty case-map after exec means contradictory closure —
-        // mirror the regular search-path handling at search.rs:580-593.
+        // mirror search.rs's contradictory-closure handling.
         return ProofNode {
             method,
             sys,
@@ -643,7 +643,7 @@ fn cases_compatible(produced: &[(String, System)], skel: &[&str]) -> bool {
 }
 
 fn sort_cases(mut cases: Vec<(String, System)>) -> Vec<(String, System)> {
-    // Mirror search.rs:688 (block at 683-692): cases are visited in
+    // Mirror search.rs's alphabetical case sort: cases are visited in
     // alphabetical order so name-based skeleton matching is deterministic.
     cases.sort_by(|a, b| a.0.cmp(&b.0));
     cases
@@ -676,7 +676,7 @@ fn resolve_method(parsed: &ParsedMethod, sys: &System) -> Option<ProofMethod> {
 }
 
 /// Exact-match a stored-proof fact's argument terms against a runtime
-/// [`LNFact`]'s terms — HS's `M.member` semantics (ProofMethod.hs:259
+/// [`LNFact`]'s terms — HS's `M.member` semantics (ProofMethod.hs:374
 /// `guard (goal `M.member` L.get sGoals sys)`).
 ///
 /// HS parses the stored `solve(...)` goal into a full `Goal` carrying
@@ -690,7 +690,7 @@ fn resolve_method(parsed: &ParsedMethod, sys: &System) -> Option<ProofMethod> {
 /// (`build_fact` stuffs it into a `Term::Var` name).  We recover the
 /// canonical runtime term by re-parsing that text (`parse_term_str`) and
 /// converting it through the SAME smart constructors the runtime uses
-/// ([`parse_arg_to_lnterm`] → `term_to_lnterm`, elaborate.rs:1542: sorts via
+/// ([`parse_arg_to_lnterm`] → `term_to_lnterm` in elaborate.rs: sorts via
 /// sigil, AC flattened+sorted via `f_app_ac`, pairs right-nested,
 /// unary-builtins folded, `em` as a C-symbol).  Two terms in that canonical
 /// form are equal iff HS's `M.member` would treat the goals as equal, so a
@@ -725,7 +725,7 @@ fn fact_terms_match_exact(
 /// Re-parse a skeleton fact-argument's raw text into a canonical runtime
 /// [`LNTerm`] (the same representation runtime goals use), for exact `==`
 /// comparison.  `parsed_term_of_arg` recovers the surface AST from the
-/// `Term::Var` name shim; `term_to_lnterm` (elaborate.rs:1542) is HS's
+/// `Term::Var` name shim; `term_to_lnterm` (elaborate.rs) is HS's
 /// `fact llit` term construction (it reads the live elaboration context for
 /// user function symbols, which is in scope during proof-search replay).
 fn parse_arg_to_lnterm(
@@ -775,7 +775,7 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
             //
             // HS-faithful: HS's parsed `ActionG i fa` carries the
             // timepoint LVar `i` and matches by structural equality
-            // (HS ProofMethod.hs:259 `goal `M.member` sGoals`).  RS's
+            // (HS ProofMethod.hs:374 `goal `M.member` sGoals`).  RS's
             // skeleton-text parser captures only the time-var ROOT
             // name (e.g. `i` from `#i.3`) — LVar idxs in the skeleton
             // and runtime differ because HS pretty-prints idxs after a
@@ -814,7 +814,7 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
                 return None;
             }
             // Narrow to candidates whose TERMS are EXACTLY EQUAL to the
-            // stored goal (HS `M.member`, ProofMethod.hs:259 — see
+            // stored goal (HS `M.member`, ProofMethod.hs:374 — see
             // `fact_terms_match_exact`).  When the stored goal's term is
             // absent from the drifted system, HS returns `Nothing` and
             // marks the step invalid (Proof.hs:455-468).  A name+arity
@@ -924,7 +924,7 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
             // `DisjG (Disj [GuardedFormula])` value via
             // `disjSplitGoal` (Theory/Text/Parser/Proof.hs:61), then
             // dispatches `SolveGoal goal` against `sys.goals` (HS
-            // ProofMethod.hs:259: `guard (goal \`M.member\` sGoals)`).
+            // ProofMethod.hs:374: `guard (goal \`M.member\` sGoals)`).
             //
             // Our skeleton parser only captures each alt's structural
             // SIGNATURE (top-level shape — see `DisjAlt`).  We pick
@@ -1012,7 +1012,7 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
             // HS dispatch: `solve( (#i, n) ~~> (#j, m) )` parses to
             // `ChainG (i, ConcIdx n) (j, PremIdx m)` (Proof.hs:59) and
             // matches by structural equality against an open
-            // `Goal::Chain(...)` in `sys.goals` (HS ProofMethod.hs:259:
+            // `Goal::Chain(...)` in `sys.goals` (HS ProofMethod.hs:374:
             // `goal `M.member` sGoals`).  HS's open chain-goal carries
             // concrete LVar identities — same skeleton-vs-runtime LVar
             // suffix-idx mismatch as Action/Premise.  We match by var
@@ -1048,7 +1048,7 @@ fn match_goal(spec: &GoalSpec, sys: &System) -> Option<Goal> {
         GoalSpec::Subterm { small_raw, big_raw } => {
             // HS `stSplitGoal` (Proof.hs:63-66) parses to
             // `SubtermG (small, big)` over LNTerm and dispatches via
-            // structural Map lookup in `sys.goals` (HS ProofMethod.hs:259).
+            // structural Map lookup in `sys.goals` (HS ProofMethod.hs:374).
             // We compare by canonical pretty-printed text — see HS
             // `prettyGoal (SubtermG (l,r))` at Constraints.hs:281-282
             // which prints `prettyLNTerm l ⊏ prettyLNTerm r`.  Pretty
@@ -1620,7 +1620,7 @@ mod tests {
     ///
     /// HS reference: HS `disjSplitGoal` (Proof.hs:61) parses to
     /// `DisjG (Disj [Guarded])` and matches the runtime Goal::Disj by
-    /// structural equality (ProofMethod.hs:259).  The RS shape
+    /// structural equality (ProofMethod.hs:374).  The RS shape
     /// signature must uniquely pick the disjunction whose alt-count
     /// matches the skeleton.
     #[test]

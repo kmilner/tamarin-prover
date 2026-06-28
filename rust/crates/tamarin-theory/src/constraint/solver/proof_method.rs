@@ -57,76 +57,6 @@ pub enum ProofMethod {
     RawSolve(String),
 }
 
-// --- Cached kill-switch / debug env flags -------------------------------
-// Env vars are constant for a process; reading them per-node/per-step
-// (env-table lock + `String` alloc each) is pure overhead on the solver
-// hot path.  Cache each behind a `OnceLock<bool>`, mirroring
-// `trace::flag()` and `reduction::bounds_max_verify_enabled`.  Each
-// helper preserves the call site's EXACT semantics (`.is_ok()` opt-in vs
-// `.is_err()` opt-out).
-
-#[inline]
-fn dbg_impl_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_DBG_IMPL").is_ok())
-}
-
-#[inline]
-fn dbg_solve_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_DBG_SOLVE").is_ok())
-}
-
-#[inline]
-fn dbg_pick_nr_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_DBG_PICK_NR").is_ok())
-}
-
-#[inline]
-fn dbg_filter_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_DBG_FILTER").is_ok())
-}
-
-#[inline]
-fn dbg_filter_compact_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_DBG_FILTER_COMPACT").is_ok())
-}
-
-#[inline]
-fn dbg_trace_cases_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_DBG_TRACE_CASES").is_ok())
-}
-
-#[inline]
-fn dbg_kept_raw_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_DBG_KEPT_RAW").is_ok())
-}
-
-/// `TAM_RS_DBG_SOLVED_GOALS` is matched against the exact value `"1"`,
-/// so cache the equality test (not a bare `.is_ok()`) to preserve semantics.
-#[inline]
-fn dbg_solved_goals_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_RS_DBG_SOLVED_GOALS").as_deref() == Ok("1"))
-}
-
-#[inline]
-fn dbg_solved_dump_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_DBG_SOLVED_DUMP").is_ok())
-}
-
-#[inline]
-fn dbg_solve_nodes_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_DBG_SOLVE_NODES").is_ok())
-}
-
 /// `isFinished`: returns the appropriate `Result` if the system is in
 /// a terminal state — solved, contradictory, or unfinishable.
 pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
@@ -135,26 +65,12 @@ pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
     if let Some(c) = cs.into_iter().next() {
         // Mirror Haskell `contradictorySystem`: any contradiction
         // closes the branch as `Contradictory`.  Haskell's `isFinished`
-        // (ProofMethod.hs:505) does not gate this on incomplete-source
-        // consumption — `Source.incomplete` only affects diagnostic
-        // warnings, not the search verdict.
+        // does not gate this on incomplete-source consumption —
+        // `Source.incomplete` only affects diagnostic warnings, not the
+        // search verdict.
         return Some(Result::Contradictory(Some(c)));
     }
-    if dbg_impl_enabled() {
-        let has_i_1 = sys.nodes.iter().any(|(_, r)|
-            matches!(&r.info, crate::rule::RuleInfo::Proto(p)
-                if matches!(&p.name, crate::rule::ProtoRuleName::Stand(s) if *s == "I_1")));
-        let has_r_1 = sys.nodes.iter().any(|(_, r)|
-            matches!(&r.info, crate::rule::RuleInfo::Proto(p)
-                if matches!(&p.name, crate::rule::ProtoRuleName::Stand(s) if *s == "R_1")));
-        if has_i_1 && has_r_1 {
-            let has_bot = sys.formulas.iter()
-                .any(|f| matches!(f, crate::guarded::Guarded::Disj(v) if v.is_empty()));
-            eprintln!("[is_finished] HAS I_1+R_1: formulas.len={} has_bot={} nodes={}",
-                sys.formulas.len(), has_bot, sys.nodes.len());
-        }
-    }
-    // Direct port of Haskell `isFinished` (ProofMethod.hs:505):
+    // Direct port of Haskell `isFinished` (ProofMethod.hs):
     //   | null ogs && stFinished     = Just Solved
     //   | null ogs && not stFinished = Just Unfinishable
     //   | otherwise                  = Nothing
@@ -168,96 +84,9 @@ pub fn is_finished(ctx: &ProofContext, sys: &System) -> Option<Result> {
     let no_open_goals = open_goals(sys).is_empty();
     let sub_finished = finished_subterms(ctx, sys);
     if no_open_goals && sub_finished {
-        if dbg_solved_goals_enabled() {
-            use crate::constraint::constraints::Goal;
-            eprintln!("[SOLVED_GOALS] all open_goals empty. Showing all goal statuses:");
-            for (g, st) in sys.goals.iter() {
-                let kind = match g {
-                    Goal::Action(_, fa) => format!("Action({:?})", fa.tag),
-                    Goal::Premise(_, fa) => format!("Premise({:?})", fa.tag),
-                    Goal::Chain(_, _) => "Chain".to_string(),
-                    Goal::Split(_) => "Split".to_string(),
-                    Goal::Disj(_) => "Disj".to_string(),
-                    Goal::Subterm(_) => "Subterm".to_string(),
-                };
-                let term_dump = match g {
-                    Goal::Action(i, fa) | Goal::Premise((i, _), fa) =>
-                        format!("@{}.{} {}", i.name, i.idx,
-                            fa.terms.iter().map(|t| format!("{:?}", t).chars().take(60).collect::<String>())
-                                .collect::<Vec<_>>().join(",")),
-                    _ => String::new(),
-                };
-                eprintln!("[SOLVED_GOALS]   solved={} {} {}", st.solved, kind, term_dump);
-            }
-        }
-        if dbg_solved_dump_enabled() {
-            let path = crate::constraint::solver::trace::case_path_string();
-            eprintln!("[SOLVED_DUMP] path={} nodes={} actions=?, formulas={}, solved_formulas={}, lemmas={}, edges={}, eq_store_n={}",
-                path, sys.nodes.len(),
-                sys.formulas.len(), sys.solved_formulas.len(),
-                sys.lemmas.len(), sys.edges.len(),
-                sys.eq_store.subst.to_list().len());
-            eprintln!("[SOLVED_DUMP]   nodes:");
-            for (id, r) in sys.nodes.iter() {
-                let acts: Vec<String> = r.actions.iter()
-                    .map(|a| format!("{:?}({:?})", a.tag,
-                        a.terms.iter().map(|t| format!("{:?}", t).chars().take(80).collect::<String>())
-                            .collect::<Vec<_>>()))
-                    .collect();
-                eprintln!("[SOLVED_DUMP]     {}.{} {} acts={:?}",
-                    id.name, id.idx,
-                    crate::constraint::solver::reduction::rule_case_name(r),
-                    acts);
-            }
-            eprintln!("[SOLVED_DUMP]   formulas (open):");
-            for (i, f) in sys.formulas.iter().enumerate() {
-                eprintln!("[SOLVED_DUMP]     [{}] {}", i, format!("{:?}", f).chars().take(300).collect::<String>());
-            }
-            eprintln!("[SOLVED_DUMP]   solved_formulas:");
-            for (i, f) in sys.solved_formulas.iter().enumerate() {
-                eprintln!("[SOLVED_DUMP]     [{}] {}", i, format!("{:?}", f).chars().take(300).collect::<String>());
-            }
-            eprintln!("[SOLVED_DUMP]   lemmas:");
-            for (i, f) in sys.lemmas.iter().enumerate() {
-                eprintln!("[SOLVED_DUMP]     [{}] {}", i, format!("{:?}", f).chars().take(300).collect::<String>());
-            }
-            eprintln!("[SOLVED_DUMP]   eq_store bindings:");
-            for (v, t) in sys.eq_store.subst.to_list().iter() {
-                eprintln!("[SOLVED_DUMP]     {}.{}({:?}) → {}",
-                    v.name, v.idx, v.sort,
-                    format!("{:?}", t).chars().take(150).collect::<String>());
-            }
-            eprintln!("[SOLVED_DUMP]   edges:");
-            for e in &sys.edges {
-                let src_rule = sys.nodes.iter()
-                    .find(|(id, _)| id == &e.src.0)
-                    .map(|(_, r)| crate::constraint::solver::reduction::rule_case_name(r))
-                    .unwrap_or_else(|| "?".to_string());
-                let tgt_rule = sys.nodes.iter()
-                    .find(|(id, _)| id == &e.tgt.0)
-                    .map(|(_, r)| crate::constraint::solver::reduction::rule_case_name(r))
-                    .unwrap_or_else(|| "?".to_string());
-                eprintln!("[SOLVED_DUMP]     ({}.{}/{},conc{}) → ({}.{}/{},prem{})",
-                    e.src.0.name, e.src.0.idx, src_rule, e.src.1.0,
-                    e.tgt.0.name, e.tgt.0.idx, tgt_rule, e.tgt.1.0);
-            }
-            eprintln!("[SOLVED_DUMP]   node-premises by node:");
-            for (id, r) in sys.nodes.iter() {
-                let prems: Vec<String> = r.premises.iter()
-                    .map(|f| format!("{:?}", f.tag))
-                    .collect();
-                let concs: Vec<String> = r.conclusions.iter()
-                    .map(|f| format!("{:?}", f.tag))
-                    .collect();
-                eprintln!("[SOLVED_DUMP]     {}.{} ({}) prems={:?} concs={:?}",
-                    id.name, id.idx,
-                    crate::constraint::solver::reduction::rule_case_name(r),
-                    prems, concs);
-            }
-        }
-        // Haskell's `isFinished` (ProofMethod.hs:505) doesn't gate
-        // Solved on `incomplete` source consumption — `Source.incomplete`
-        // is diagnostic-only there.  Match that.
+        // Haskell's `isFinished` doesn't gate Solved on `incomplete`
+        // source consumption — `Source.incomplete` is diagnostic-only
+        // there.  Match that.
         Some(Result::Solved)
     }
     else if no_open_goals && !sub_finished { Some(Result::Unfinishable) }
@@ -333,15 +162,15 @@ pub fn exec_proof_method(
     // "no method applicable" — the caller in `expand_inner` then walks
     // the rest of the candidate list, all of which also return `None`,
     // and the node becomes `Sorry: no method`.  The next call up the
-    // recursion checks the deadline at the top of `expand_inner` (line
-    // 441 in search.rs) and bails to `Sorry: deadline reached`.
+    // recursion checks the deadline at the top of `search::expand_inner`
+    // and bails to `Sorry: deadline reached`.
     // Combined, this bounds the post-deadline runtime to O(depth) rather
     // than O(remaining-work-in-current-method).
     if crate::constraint::solver::search::deadline_reached() {
         return None;
     }
 
-    // HS-faithful per-step Maude counter reset (ProofMethod.hs:306):
+    // HS-faithful per-step Maude counter reset (ProofMethod.hs):
     //   `runReduction (m <* simplifySystem) ctxt sys (avoid sys)`
     // The FreshT counter starts at `avoid sys + 1` for EVERY proof step.
     // Without this, Rust's Maude counter advances monotonically across all
@@ -384,11 +213,10 @@ pub fn exec_proof_method(
             // Cases outcome was discarded.
             let case_systems: Vec<System> =
                 crate::constraint::solver::simplify::simplify_system_with_fanout(ctx, sys.clone());
-            // HS-faithful `cleanup` (ProofMethod.hs:310-311): EVERY
+            // HS-faithful `cleanup` (ProofMethod.hs): EVERY
             // proof method's cases pass through `map (fmap cleanup .
-            // fst)` (ProofMethod.hs:305), and `Simplify` goes through
-            // `process` (ProofMethod.hs:302-308) — so its output is
-            // ALSO cleaned.
+            // fst)`, and `Simplify` goes through `process` — so its
+            // output is ALSO cleaned.
             let cleanup = |s: &System| -> System {
                 let mut s2 = s.clone();
                 crate::constraint::solver::rename_precise::rename_precise_system(
@@ -406,9 +234,9 @@ pub fn exec_proof_method(
                 .map(|s| cleanup(&s))
                 .collect();
             // HS-faithful `removeRedundantCases ctxt [] snd`
-            // (ProofMethod.hs:304): `process` applies it to
-            // EVERY proof method's Disj fan-out, including `Simplify`
-            // (which uses `process (return "")`, ProofMethod.hs:290).
+            // (ProofMethod.hs `process`): applies it to EVERY proof
+            // method's Disj fan-out, including `Simplify` (which uses
+            // `process (return "")`).
             // When `simplifySystem`'s `solveUniqueActions` fans out an action
             // whose AC-multiset unification yields several unifiers that
             // are equal up to variable renaming (e.g. alethea's
@@ -436,14 +264,14 @@ pub fn exec_proof_method(
             if cleaned.is_empty() { return None; }
             let cleaned_input = cleanup(sys);
             if cleaned.len() == 1 {
-                // Single-case path: HS's `Simplify` arm (ProofMethod.hs:289-297)
+                // Single-case path: HS's `Simplify` arm (ProofMethod.hs)
                 // checks whether the simplified system equals the cleaned
                 // input — if so, the method "failed" and we return None.
                 // Multi-case fan-out trivially can't satisfy that condition.
                 if cleaned[0] == cleaned_input { return None; }
                 return Some(vec![("".to_string(), cleaned.into_iter().next().unwrap())]);
             }
-            // HS-faithful naming: `distinguish n` (ProofMethod.hs:335-340)
+            // HS-faithful naming: `distinguish n` (ProofMethod.hs)
             // with empty case name renders as `show i` ("1", "2", "3", ...)
             // with NO `_case_` prefix and NO zero-padding (the `pad`
             // call only runs in the else branch when the prefix is
@@ -461,84 +289,17 @@ pub fn exec_proof_method(
             Some(out)
         }
         ProofMethod::SolveGoal(g) => {
-            let dbg_solve = dbg_solve_enabled();
-            let t_dispatch = std::time::Instant::now();
             // State snapshot BEFORE dispatch — paired with HS's
             // `[STATE]` line in `Theory.Constraint.Solver.ProofMethod.solve`.
             // Emits the canonical open-goal / node set so we can see what
-            // ranking decision was available at this proof step.  Reusable
-            // for any future HS-vs-Rust step-by-step lockstep diff: set
-            // `TAM_RS_TRACE_STATE=1` + `TAM_HS_TRACE_STATE=1` on both
-            // sides, run the same theory, diff the outputs.
+            // ranking decision was available at this proof step.
             crate::constraint::solver::trace::trace_state(sys);
             crate::constraint::solver::trace::trace_pick(g);
-            // TAM_RS_DBG_PICK_NR=1 (mirrors HS TAM_HS_DBG_PICK_NR):
-            // dump the picked goal's gsNr and the entire open-goal queue with
-            // their gsNrs. Lets HS↔RS comparison align picks by gsNr ordering.
-            if dbg_pick_nr_enabled() {
-                use crate::constraint::constraints::Goal;
-                let pick_nr = sys.goals.iter()
-                    .find(|(eg, _)| eg == g)
-                    .map(|(_, st)| st.nr.to_string())
-                    .unwrap_or_else(|| "?".to_string());
-                let pick_kind = match g {
-                    Goal::Action(_, fa) => format!("Action {:?}", fa),
-                    Goal::Premise(_, fa) => format!("Premise {:?}", fa),
-                    Goal::Chain(_, _) => "Chain".to_string(),
-                    Goal::Split(_) => "Split".to_string(),
-                    Goal::Disj(_) => "Disj".to_string(),
-                    Goal::Subterm(_) => "Subterm".to_string(),
-                };
-                let all_open: Vec<String> = sys.goals.iter()
-                    .filter(|(_, st)| !st.solved)
-                    .map(|(eg, st)| {
-                        let k = match eg {
-                            Goal::Action(_, fa) => format!("Action({:?})", fa.tag),
-                            Goal::Premise(_, fa) => format!("Premise({:?})", fa.tag),
-                            Goal::Chain(_, _) => "Chain".to_string(),
-                            Goal::Split(_) => "Split".to_string(),
-                            Goal::Disj(_) => "Disj".to_string(),
-                            Goal::Subterm(_) => "Subterm".to_string(),
-                        };
-                        format!("#{}:{}/lb={}", st.nr, k, st.looping)
-                    })
-                    .collect();
-                let cpstr = crate::constraint::solver::trace::case_path_string();
-                eprintln!("[RS_PICK_NR] path={} #{}:{}", cpstr, pick_nr, pick_kind);
-                eprintln!("[RS_OPEN_NRS] path={} {}", cpstr, all_open.join(" ; "));
-            }
             let mut r = Reduction::new(ctx, sys.clone());
             let outcome = crate::constraint::solver::goals::dispatch_solve_goal(&mut r, g);
-            if dbg_solve {
-                let truncate_at: usize = std::env::var("TAM_DBG_SOLVE_TRUNC")
-                    .ok().and_then(|v| v.parse().ok()).unwrap_or(60);
-                let name: String = format!("{:?}", g).chars().take(truncate_at).collect();
-                let kind = match &outcome {
-                    crate::constraint::solver::reduction::GoalCases::Linear => "Linear".to_string(),
-                    crate::constraint::solver::reduction::GoalCases::LinearNamed(n) => format!("LinearNamed({})", n),
-                    crate::constraint::solver::reduction::GoalCases::Cases(cs) => {
-                        let names: Vec<&str> = cs.iter().map(|(n, _)| n.as_str()).collect();
-                        format!("Cases({})=[{}]", cs.len(), names.join(","))
-                    },
-                    crate::constraint::solver::reduction::GoalCases::Contradictory => "Contradictory".to_string(),
-                };
-                eprintln!("[solve] dispatch {} → {} in {:?}", name, kind, t_dispatch.elapsed());
-                if dbg_solve_nodes_enabled() {
-                    // Dump sys.nodes (rule names per node) so we can
-                    // see which rules are grafted when the goal is
-                    // dispatched.
-                    let mut node_list: Vec<String> = sys.nodes.iter()
-                        .map(|(id, rule)| format!("{}#{}={}",
-                            id.name, id.idx,
-                            crate::constraint::solver::reduction::rule_case_name(rule)))
-                        .collect();
-                    node_list.sort();
-                    eprintln!("[solve] nodes: [{}]", node_list.join(", "));
-                }
-            }
             // Run simplify after every goal-solving step — mirrors
             // Haskell's `m <* simplifySystem` pattern in `process`
-            // (ProofMethod.hs:302-308).  Filter out cases that simplify
+            // (ProofMethod.hs).  Filter out cases that simplify
             // to a contradictory system — Haskell's Disj-monad does the
             // same via `mzero` on `contradictoryIf`, so contradictory
             // cases never make it into the children map.  This keeps
@@ -557,19 +318,10 @@ pub fn exec_proof_method(
             // mirrors that, returning N systems.  Each is then cleaned
             // (renamePrecise + clear subst) per HS's `cleanup`.
             let simplify = |sys: System| -> Vec<System> {
-                if dbg_solve {
-                    eprintln!("[solve] simplify start (nodes={} goals={})",
-                        sys.nodes.len(), sys.goals.len());
-                }
-                let t0 = std::time::Instant::now();
                 let raw_systems: Vec<System> =
                     crate::constraint::solver::simplify::simplify_system_with_fanout(ctx, sys);
-                if dbg_solve {
-                    eprintln!("[solve] simplify done {:?} (n_systems={})",
-                        t0.elapsed(), raw_systems.len());
-                }
                 // Cleanup each surviving system per HS
-                // `cleanup` (ProofMethod.hs:310-311):
+                // `cleanup` (ProofMethod.hs):
                 //   cleanup s = L.set sSubst emptySubst
                 //                       (renamePrecise s)
                 let mut out: Vec<System> = Vec::with_capacity(raw_systems.len());
@@ -612,31 +364,8 @@ pub fn exec_proof_method(
             // catches them earlier (before the case is even built) or
             // leaves them as explicit `Finished(Contradictory(_))`
             // leaves.  Mirror the latter shape by *not* filtering them.
-            let dbg_filter = dbg_filter_enabled();
-            let dbg_filter_compact = dbg_filter_compact_enabled();
             let keep = |sys: &System, name: &str| -> bool {
                 let r = !sys.eq_store.is_false();
-                if dbg_filter {
-                    let cs = crate::constraint::solver::contradictions::contradictions(ctx, sys);
-                    eprintln!("[filter] goal={:?} case={:?} eqf={} contradictions={:?} keep={}",
-                        g, name, sys.eq_store.is_false(), cs, r);
-                }
-                if dbg_filter_compact {
-                    let cs = crate::constraint::solver::contradictions::contradictions(ctx, sys);
-                    let cpath = crate::constraint::solver::trace::case_path_string();
-                    let goal_short = match g {
-                        crate::constraint::constraints::Goal::Action(i, fa) =>
-                            format!("Action(#{}.{}, {:?}/{}args)", i.name, i.idx, fa.tag, fa.terms.len()),
-                        crate::constraint::constraints::Goal::Premise((i, p), fa) =>
-                            format!("Premise(#{}.{}@{}, {:?}/{}args)", i.name, i.idx, p.0, fa.tag, fa.terms.len()),
-                        crate::constraint::constraints::Goal::Chain(_,_) => "Chain".to_string(),
-                        crate::constraint::constraints::Goal::Split(_) => "Split".to_string(),
-                        crate::constraint::constraints::Goal::Disj(_) => "Disj".to_string(),
-                        crate::constraint::constraints::Goal::Subterm(_) => "Subterm".to_string(),
-                    };
-                    eprintln!("[filtercomp] path={} goal={} case={} contras={:?} keep={}",
-                        cpath, goal_short, name, cs, r);
-                }
                 let op = if r { "case_keep" } else { "case_drop" };
                 crate::state_trace::emit_case(op, name, Some(g), sys);
                 r
@@ -689,63 +418,27 @@ pub fn exec_proof_method(
                     // iteration order (rule order in `joinAllRules`).
                     use std::collections::HashMap;
                     // simplify can fan out per case — flat-map.
-                    // For debugging (TAM_DBG_FILTER_COMPACT), tag the case
-                    // path with the sibling name + index so traces map back
-                    // to the specific source-case being simplified.
-                    let trace_cases = dbg_trace_cases_enabled();
-                    let dbg_kr = dbg_kept_raw_enabled();
-                    let mut kr_pre_counts: std::collections::HashMap<String, (usize, usize, usize)>
-                        = std::collections::HashMap::new();
                     let kept_raw: Vec<(String, System)> = cases.into_iter()
-                        .enumerate()
-                        .flat_map(|(idx, (name, sys))| {
-                            if trace_cases {
-                                crate::constraint::solver::trace::case_path_push(
-                                    &format!("cand_{}_{}", idx, name));
-                            }
+                        .flat_map(|(name, sys)| {
                             let systems = simplify(sys);
-                            let n_pre_keep = systems.len();
                             let out: Vec<(String, System)> = systems.into_iter()
                                 .filter(|s| keep(s, &name))
                                 .map(|s| (name.clone(), s))
                                 .collect();
-                            let n_post_keep = out.len();
-                            if dbg_kr {
-                                let entry = kr_pre_counts.entry(name.clone()).or_insert((0,0,0));
-                                entry.0 += 1; // incoming cases
-                                entry.1 += n_pre_keep; // post-simplify
-                                entry.2 += n_post_keep; // post-keep
-                            }
-                            if trace_cases {
-                                crate::constraint::solver::trace::case_path_pop();
-                            }
                             out
                         })
                         .collect();
-                    if dbg_kr {
-                        let cpath = crate::constraint::solver::trace::case_path_string();
-                        let goal_short = match g {
-                            crate::constraint::constraints::Goal::Action(_, fa) =>
-                                format!("Action({:?})", fa.tag),
-                            crate::constraint::constraints::Goal::Premise(_, fa) =>
-                                format!("Premise({:?})", fa.tag),
-                            _ => format!("{:?}", g),
-                        };
-                        eprintln!("[KEPT_RAW] path={} goal={} counts={:?}",
-                            cpath, goal_short, kr_pre_counts);
-                    }
-                    // HS `process` (ProofMethod.hs:302-308) dedups cases
-                    // ONLY via `removeRedundantCases ctxt [] snd`
-                    // (ProofMethod.hs:304) — gated on BP/MSet, comparing
-                    // systems up-to-new-vars (Sources.hs:236-244).  There is
-                    // no unconditional exact-(name,system) dedup: any
-                    // surviving same-named cases are renamed by
-                    // `uniqueListBy ... distinguish` (ProofMethod.hs:308,335)
-                    // to `name_case_1`/`name_case_2`, never dropped.  Variant
-                    // enumeration is threaded through SplitG by
-                    // `rule_insts_with_constrs` (reduction.rs:2876), so each
-                    // distinct variant arrives as its own RuleACInst case
-                    // here.  Empty stable_vars (HS passes
+                    // HS `process` (ProofMethod.hs) dedups cases
+                    // ONLY via `removeRedundantCases ctxt [] snd` — gated
+                    // on BP/MSet, comparing systems up-to-new-vars
+                    // (Sources.hs).  There is no unconditional
+                    // exact-(name,system) dedup: any surviving same-named
+                    // cases are renamed by `uniqueListBy ... distinguish`
+                    // (ProofMethod.hs) to `name_case_1`/`name_case_2`,
+                    // never dropped.  Variant enumeration is threaded
+                    // through SplitG by `reduction::rule_insts_with_constrs`,
+                    // so each distinct variant arrives as its own
+                    // RuleACInst case here.  Empty stable_vars (HS passes
                     // `[]`); the helper is a no-op outside BP/MSet.
                     let kept: Vec<(String, System)> = {
                         let msig = ctx.maude.maude_sig();
@@ -770,7 +463,7 @@ pub fn exec_proof_method(
                         let key = if total > 1 {
                             let n = seen.entry(name.clone()).or_default();
                             *n += 1;
-                            // HS-faithful zero-padding: ProofMethod.hs:335-340
+                            // HS-faithful zero-padding: ProofMethod.hs `distinguish`
                             //   distinguish n =
                             //     [ (\(x,y) -> (... x ++ "_case_" ++ pad (show i), y))
                             //     | i <- [(1::Int)..] ]
@@ -800,7 +493,7 @@ pub fn exec_proof_method(
                 Ok(p) => p,
                 Err(_) => return None,
             };
-            // HS-faithful: mirror Haskell's `induction` (ProofMethod.hs:329-333):
+            // HS-faithful: mirror Haskell's `induction` (ProofMethod.hs):
             //   induction (baseCase, stepCase) = do
             //     (caseName, caseFormula) <- disjunctionOfList
             //         [("empty_trace", baseCase), ("non_empty_trace", stepCase)]
@@ -809,10 +502,10 @@ pub fn exec_proof_method(
             // HS uses `setM` — direct field write into `sFormulas`, NOT
             // `insertFormula`.  Calling `insertFormula` here would route
             // through HS's GDisj insertion arm (`insertFormula`/`insert'`,
-            // Reduction.hs:424) which adds the
+            // Reduction.hs) which adds the
             // empty DisjG goal to `sGoals`; HS's `reduceFormulas`
-            // (Simplify.hs:302) filters by `reducibleFormula`
-            // (Reduction.hs:495-503) which returns False for `GDisj _`, so
+            // (Simplify.hs) filters by `reducibleFormula`
+            // (Reduction.hs `reducibleFormula`) which returns False for `GDisj _`, so
             // an `empty_trace` formula `Disj([])` (gfalse) stays in
             // `sFormulas` untouched and never produces a DisjG goal —
             // `FormulasFalse` contradiction picks it up directly.
@@ -835,17 +528,18 @@ pub fn exec_proof_method(
             let mut sr = Reduction::new(ctx, step_sys);
             simplify_system(&mut sr);
 
-            // HS `process` (ProofMethod.hs:302-308) runs `simplifySystem`
+            // HS `process` (ProofMethod.hs) runs `simplifySystem`
             // under the DisjT monad (so it could fan out) and then
             // `removeRedundantCases`.  This arm deliberately uses in-place
             // `simplify_system` (no fan-out) and skips `remove_redundant_cases`
             // — both are guaranteed no-ops at induction time:
             //   - Induction is only ever ranked/applied on the initial system:
             //     `rankProofMethods` calls `insertInduction` only when
-            //     `isInitialSystem sys` (ProofMethod.hs:527), and
+            //     `isInitialSystem sys` (ProofMethod.hs), and
             //     `canApplyInduction` requires no nodes, no solved formulas,
-            //     no open goals, exactly one formula (ProofMethod.hs:264-270;
-            //     mirrored in `check_and_exec_proof_method` below).  With no
+            //     no open goals, exactly one formula (ProofMethod.hs
+            //     `canApplyInduction`; mirrored in
+            //     `check_and_exec_proof_method` below).  With no
             //     nodes/actions/goals, `simplifySystem` (`solveUniqueActions`
             //     has no actions; `reduceFormulas`/`insertImpliedFormulas`
             //     reach no `Eq` atom over a node-free system) cannot fan out,
@@ -859,10 +553,10 @@ pub fn exec_proof_method(
             // bounds_max (simplify.rs), perturbing the high `.N` IH indices the
             // `cleanup` below is calibrated to canonicalise — for zero benefit.
 
-            // HS-faithful `cleanup` (ProofMethod.hs:310-311): induction is
+            // HS-faithful `cleanup` (ProofMethod.hs): induction is
             //   `Induction -> process . induction <$> getInductionCases sys`
-            // (ProofMethod.hs:298), and `process` applies
-            //   `map (fmap cleanup . fst)` (ProofMethod.hs:305) where
+            // and `process` applies
+            //   `map (fmap cleanup . fst)` where
             //   cleanup s = L.set sSubst emptySubst
             //                 (Precise.evalFresh (renamePrecise s) nothingUsed)
             // So EVERY surviving induction case is renamePrecise'd with an
@@ -908,7 +602,7 @@ pub fn check_and_exec_proof_method(
             if !same_kind(r, &actual) { return None; }
         }
         ProofMethod::Induction => {
-            // Direct port of Haskell `canApplyInduction` (ProofMethod.hs:264-270):
+            // Direct port of Haskell `canApplyInduction` (ProofMethod.hs):
             //   guard (M.null sNodes); guard (S.null sSolvedFormulas);
             //   guard (M.null sGoals); (_, t) <- uncons sFormulas; guard (null t)
             // i.e. no nodes, no solved formulas, no open goals, exactly one
@@ -997,7 +691,7 @@ mod tests {
 
     #[test]
     fn gfalse_formula_is_contradictory_not_unfinishable() {
-        // HS `isFinished` (ProofMethod.hs:505-511) routes any
+        // HS `isFinished` (ProofMethod.hs) routes any
         // contradiction — including `gfalse ∈ sFormulas`
         // (`FormulasFalse`) — to `Contradictory`, BEFORE the
         // `null ogs && not stFinished => Unfinishable` arm.  A negated

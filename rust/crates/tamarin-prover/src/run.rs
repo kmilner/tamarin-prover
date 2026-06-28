@@ -17,9 +17,6 @@ use std::time::Instant;
 
 use tamarin_term::maude_proc::{MaudeHandle, MaudePool};
 use tamarin_theory::elaborate::elaborate;
-// `prove_lemma_with_pool` is called via its fully-qualified path
-// inside the prove loop (it lets us pass the optional Maude pool);
-// no top-level alias needed.
 
 use crate::cli::{lemma_matches, Args, Subcommand};
 
@@ -516,36 +513,11 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         }
     }
 
-    // TAM_DBG_RUN_TIMING=1 prints a per-phase wall-clock breakdown of
-    // run_batch to stderr.  Diagnostic-only — leave behind an env gate so
-    // it can be reused next time the prover-binary overhead is suspect.
-    let dbg_timing = std::env::var("TAM_DBG_RUN_TIMING")
-        .ok()
-        .map(|v| v == "1")
-        .unwrap_or(false);
-
     for in_file in &args.in_files {
         let t0 = Instant::now();
-        let mut t_phase = Instant::now();
-        macro_rules! phase {
-            ($name:expr) => {
-                if dbg_timing {
-                    eprintln!("[TAM_DBG_RUN_TIMING] {:>26}: {:>8.1} ms",
-                              $name, t_phase.elapsed().as_secs_f64() * 1000.0);
-                    // Reassign so the next phase! call measures the
-                    // delta since this one.  The last invocation in the
-                    // loop iteration writes a value the compiler can't
-                    // see being read — that's fine, the discipline is
-                    // uniform across phase boundaries.
-                    #[allow(unused_assignments)]
-                    { t_phase = Instant::now(); }
-                }
-            };
-        }
         let src = fs::read_to_string(in_file).map_err(|e| {
             RunError(format!("failed to read {}: {}", in_file, e))
         })?;
-        phase!("read_to_string");
         // Thread the including file's directory so `#include "file"` resolves
         // relative to it (HS `takeDirectory inFile0`, Parser.hs:323-343).
         let base_dir = std::path::Path::new(in_file)
@@ -555,7 +527,6 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             .map_err(|e| {
                 RunError(format!("parse error in {}: {}", in_file, e))
             })?;
-        phase!("parse_theory");
         // HS `liftedAddProtoRule` (Theory/Text/Parser.hs:166-193) runs per
         // rule DURING parsing: it expands each rule's `_restrict(φ)`
         // embedded restriction into a fresh `Restr_<rule>_<i>` restriction
@@ -568,7 +539,6 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         tamarin_theory::rule_restriction::lift_rule_restrictions(&mut parsed)
             .map_err(|e| RunError(format!(
                 "_restrict expansion failed in {}: {}", in_file, e.message)))?;
-        phase!("lift_rule_restrictions");
         // HS emits this trace marker as soon as the theory parses
         // (TheoryLoader.hs:409).  `--parse-only` and `--quiet` skip it.
         let theory_name = parsed.name.clone();
@@ -634,7 +604,6 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         let mut elaborated = elaborate(&parsed).map_err(|e| {
             RunError(format!("elaboration error in {}: {}", in_file, e.message))
         })?;
-        phase!("elaborate");
         let maude_sig = elaborated.signature.maude_sig.clone();
 
         // HS `checkEquationsSubtermConvergence` (Wellformedness.hs:1222-1232)
@@ -767,7 +736,6 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 wf_report = new_report;
             }
         }
-        phase!("sapic translate");
 
         // HS runs the full `checkWellformedness` on the TRANSLATED theory
         // (TheoryLoader.hs:469-473, `checkTranslatedTheory`), i.e. AFTER SAPIC
@@ -816,7 +784,6 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         } else {
             None
         };
-        phase!("spawn maude");
 
         // Spawn an auxiliary MaudePool of `effective_maude_processes()`
         // EXTRA subprocesses for use at the rayon parallel sites
@@ -851,7 +818,6 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             } else {
                 None
             };
-        phase!("spawn maude pool");
 
         // Populate variant_substs + abstracted_rule for each protocol
         // rule whose RHS contains reducible-headed sub-terms.  Without
@@ -864,7 +830,6 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             populate_rule_variants(&mut elaborated, m,
                 file_maude_pool.as_deref());
         }
-        phase!("populate_rule_variants");
 
         // Port of HS `ruleVariantsReport` / `variantsCheck`
         // (Wellformedness.hs:354-372, 375-394).
@@ -1047,7 +1012,6 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 }
             }
         }
-        phase!("annotate_loop_breakers");
 
         // Dynamic Message Derivation Checks (mirrors HS
         // `checkVariableDeducability`, gated by `--derivcheck-timeout`,
@@ -1071,7 +1035,6 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 eprintln!("[Theory {}] Derivation checks ended", theory_name);
             }
         }
-        phase!("derivation_checks");
 
         // Decide which lemmas to prove. Without --prove, we never start
         // the solver; output is just the source.
@@ -1214,11 +1177,6 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                         &parsed, &lemma_name, maude.clone(),
                         file_maude_pool.clone(), budget, in_file, &cli_heuristic),
                 };
-                if dbg_timing {
-                    eprintln!("[TAM_DBG_RUN_TIMING] {:>26}: {:>8.1} ms  (lemma={})",
-                              "prove_lemma", lt.elapsed().as_secs_f64() * 1000.0,
-                              lemma_name);
-                }
                 let (verdict, proof_steps, proof_body) = match outcome {
                     Ok(root) => {
                         let steps = count_proof_steps(&root);
@@ -1318,10 +1276,6 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 }
             }
         }
-        // Reset the phase clock so "Theory closed" + pretty-print +
-        // emit_output are measured fresh (the prove loop reports its own
-        // per-lemma timings above).
-        t_phase = Instant::now();
 
         // HS emits this marker after `closeTheory` finishes
         // (TheoryLoader.hs:596).  In prove mode it is emitted before the
@@ -1367,9 +1321,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             in_file,
             args.auto_sources,
         );
-        phase!("pretty_closed_theory");
         emit_output(args, in_file, &body)?;
-        phase!("emit_output");
 
         file_results.push(FileResult {
             in_file: in_file.clone(),
@@ -1582,7 +1534,7 @@ fn populate_rule_variants(elaborated: &mut tamarin_theory::theory::Theory,
 /// on a single subprocess; with `MaudePool` (`--maude-processes=M`)
 /// the contention is gone and users can productively scale to every
 /// core.  Memory budget is mediated by `--maude-processes`, which
-/// defaults to `processors / 2`.
+/// defaults to `processors` (1:1).
 fn init_rayon_pool(args: &Args) {
     let n = args.effective_processors();
     // `build_global` is idempotent-error: the SECOND call returns Err

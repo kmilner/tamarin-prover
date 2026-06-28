@@ -3,6 +3,10 @@
 //! Builder-style API for emitting Graphviz `.dot` graphs. The Haskell version
 //! is a `State` monad; in Rust we expose a `DotGraph` struct with mutating
 //! methods. `scope` and `cluster` take a closure for the nested graph.
+//!
+//! NOTE: this faithful port currently has no consumer in the tree; the
+//! live DOT path is `tamarin-server/src/handlers/dot.rs`. Retained as a
+//! reserved API for a future Rust DOT pipeline.
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NodeId {

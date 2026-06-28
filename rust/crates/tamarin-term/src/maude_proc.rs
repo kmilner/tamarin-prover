@@ -26,9 +26,13 @@ const PROMPT: &[u8] = b"Maude> ";
 /// Errors that can arise from the Maude bridge.
 #[derive(Debug)]
 pub enum MaudeError {
+    /// stdin/stdout I/O failure talking to the Maude subprocess.
     Io(std::io::Error),
+    /// The `maude` binary could not be launched (e.g. not found on PATH).
     Spawn(String),
+    /// Maude's reply could not be parsed.
     Parse(maude_parse::ParseError),
+    /// Protocol or term back-conversion error not covered by the above.
     Other(String),
 }
 
@@ -78,9 +82,8 @@ pub struct MaudeStats {
 thread_local! {
     /// Per-callsite Maude call counters.  Set `TAM_PROFILE_MAUDE=1` to
     /// enable; query via `dump_callsite_profile()`.  Diagnostic only —
-    /// used in investigation #29 to confirm 100 % of `unify` calls
-    /// originate from `eq_store::add_eqs` (so optimisation effort
-    /// should target the fact-equation engine, not other call sites).
+    /// used to attribute Maude calls to their originating call site when
+    /// deciding where to focus optimisation effort.
     static MAUDE_CALLSITE_COUNTS: std::cell::RefCell<std::collections::BTreeMap<&'static str, u64>>
         = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
 }
@@ -121,18 +124,17 @@ struct MaudeProcessInner {
     /// every search step — so the same subterm gets reduced repeatedly
     /// during a single proof.  Caching cuts those repeat round-trips.
     reduce_cache: tamarin_utils::FastMap<LNTerm, LNTerm>,
-    /// Memo for `match_eqs_const_subject` EMPTY-result queries.
-    /// Historical: when this matcher was on the
-    /// `insert_implied_formulas` AC-fallback path, profiling on
-    /// csf17/keylessssl::injectivity showed 210 k calls to it, ALL
-    /// returning empty, many identical (same skolemized pattern +
-    /// subject re-tried across fixpoint passes).  That path now uses
-    /// `match_eqs_skolemize_both`, so `match_eqs_const_subject` is
-    /// test-only; the cache is retained for the tests / potential
-    /// future reuse.  Caching the empty answer is safe — no witness
-    /// LVars to renumber.  Non-empty results are NOT cached (witnesses
-    /// need fresh-renaming per use, same reason `unifiable_cache`
-    /// only stores booleans).
+    /// Memo for `match_eqs_const_subject` EMPTY-result queries.  Still
+    /// read and written by `match_eqs_const_subject` on every call;
+    /// that matcher is now reached only from tests (its former
+    /// `insert_implied_formulas` AC-fallback use moved to
+    /// `match_eqs_skolemize_both`), but the cache is retained for those
+    /// tests / potential future reuse.  AC-heavy patterns re-issue many
+    /// identical all-empty matches across fixpoint passes, so caching the
+    /// empty answer skips the repeat round-trips.  Caching the empty
+    /// answer is safe — no witness LVars to renumber.  Non-empty results
+    /// are NOT cached (witnesses need fresh-renaming per use, same reason
+    /// `unifiable_cache` only stores booleans).
     match_empty_cache: tamarin_utils::FastMap<(Vec<(LNTerm, LNTerm)>, Vec<(String, u64)>), ()>,
 }
 
@@ -481,6 +483,7 @@ impl MaudeHandle {
         }
     }
 
+    /// Snapshot of the per-operation Maude call counters for this handle.
     pub fn stats(&self) -> MaudeStats {
         self.inner.lock().unwrap().stats
     }
@@ -588,6 +591,9 @@ impl MaudeHandle {
             && g.sig.st_rules.is_empty()
     }
 
+    /// `unify` tagged with a `label` for the per-callsite profiler; uses
+    /// `avoid_max = 0`, so witness LVar indices may collide with existing
+    /// system vars — prefer `unify_at_with_avoid` when that matters.
     pub fn unify_at(&self, label: &'static str, eqs: &[Equal<LNTerm>])
         -> Result<Vec<Vec<(crate::lterm::LVar, LNTerm)>>, MaudeError>
     {
@@ -611,11 +617,18 @@ impl MaudeHandle {
         self.unify_with_avoid(eqs, avoid_max)
     }
 
+    /// Unify a list of equations modulo the theory, returning one
+    /// substitution per Maude unifier.  Equivalent to
+    /// `unify_with_avoid(eqs, 0)`; see that method for the witness-var
+    /// `avoid` contract.
     pub fn unify(&self, eqs: &[Equal<LNTerm>]) -> Result<Vec<Vec<(crate::lterm::LVar, LNTerm)>>, MaudeError>
     {
         self.unify_with_avoid(eqs, 0)
     }
 
+    /// Unify modulo the theory, with Maude-introduced witness vars given
+    /// indices above `avoid_max + 1` so they cannot collide with existing
+    /// system vars (see `unify_at_with_avoid`).
     pub fn unify_with_avoid(
         &self,
         eqs: &[Equal<LNTerm>],
@@ -678,7 +691,7 @@ impl MaudeHandle {
         // its lifted witness collides with K's renamed target,
         // creating the SubstVFresh same-target collision that
         // cascades into $R=$I (KAS_key_secrecy).
-        // H16.9 (HS-faithful): ALWAYS try the local non-AC unifier first.
+        // HS-faithful: ALWAYS try the local non-AC unifier first.
         // HS's `unifyLTermFactored` (Unification.hs:107-119) does this:
         //   1. Run `unifyRaw` locally (no Maude).
         //   2. If success with no AC residuals → return result.
@@ -1077,15 +1090,9 @@ impl MaudeHandle {
         cmd.extend_from_slice(b" <=? ");
         cmd.extend(pp_list(&subjs));
         cmd.extend_from_slice(b" .\n");
-        if tamarin_utils::env_gate!("TAM_DBG_MATCH_EQS_RAW") {
-            eprintln!("[match_eqs RAW] {}", String::from_utf8_lossy(&cmd).trim_end());
-        }
         let reply = inner.execute(&cmd)?;
         inner.stats.match_count += 1;
         drop(inner);
-        if tamarin_utils::env_gate!("TAM_DBG_MATCH_EQS_RAW") {
-            eprintln!("[match_eqs REPLY] {}", String::from_utf8_lossy(&reply).trim_end());
-        }
         _tally_callsite("match_eqs");
         let msubsts = maude_parse::parse_match_reply(&reply)?;
         let mut out = Vec::with_capacity(msubsts.len());
@@ -1131,8 +1138,6 @@ impl MaudeHandle {
         if eqs.is_empty() {
             return Ok(vec![Vec::new()]);
         }
-        let prof = tamarin_utils::env_gate!("TAM_PROFILE_MAUDE_BREAKDOWN");
-        let t0 = if prof { Some(std::time::Instant::now()) } else { None };
         // Empty-result cache.  Profiling showed 100 % of calls on
         // AC-heavy lemmas (e.g. csf17/keylessssl::injectivity) return
         // empty, with many repeats across fixpoint passes.  Cache the
@@ -1145,7 +1150,6 @@ impl MaudeHandle {
             _tally_callsite("match_eqs_const_subject::CACHE_HIT");
             return Ok(Vec::new());
         }
-        let t_after_cache = if prof { Some(std::time::Instant::now()) } else { None };
         // Skolemize subject-side free vars not in `pattern_vars`:
         // walk each rhs LNTerm and replace such LVars with a public
         // `Name`-constant tagged with a deterministic synthetic
@@ -1210,7 +1214,6 @@ impl MaudeHandle {
             lhs: eq.lhs.clone(),
             rhs: rewrite_subject(&eq.rhs, &skolem_map),
         }).collect();
-        let t_after_skolem = if prof { Some(std::time::Instant::now()) } else { None };
 
         let mut inner = self.inner.lock().unwrap();
         let mut ctx = ConvCtx::new();
@@ -1251,13 +1254,7 @@ impl MaudeHandle {
         cmd.extend_from_slice(b" <=? ");
         cmd.extend(pp_list(&t2s));
         cmd.extend_from_slice(b" .\n");
-        let t_before_exec = if prof { Some(std::time::Instant::now()) } else { None };
         let reply = inner.execute(&cmd)?;
-        if tamarin_utils::env_gate!("TAM_DBG_MECS_RAW") {
-            eprintln!("[MECS_RAW] cmd={}", String::from_utf8_lossy(&cmd));
-            eprintln!("[MECS_RAW] reply={}", String::from_utf8_lossy(&reply));
-        }
-        let t_after_exec = if prof { Some(std::time::Instant::now()) } else { None };
         inner.stats.match_count += 1;
         drop(inner);
         _tally_callsite("match_eqs_const_subject");
@@ -1279,16 +1276,6 @@ impl MaudeHandle {
                 .map(|(lv, lt)| (lv, unskolemize(&lt, &reverse)))
                 .collect();
             out.push(unskolemized);
-        }
-        if let (Some(a), Some(b), Some(c), Some(d), Some(e)) =
-            (t0, t_after_cache, t_after_skolem, t_before_exec, t_after_exec) {
-            let cache = (b - a).as_micros();
-            let skol = (c - b).as_micros();
-            let prep = (d - c).as_micros();
-            let exec = (e - d).as_micros();
-            let parse = std::time::Instant::now().duration_since(e).as_micros();
-            eprintln!("[mecs] cache={}us skol={}us prep={}us exec={}us parse={}us",
-                cache, skol, prep, exec, parse);
         }
         Ok(out)
     }
@@ -1426,8 +1413,6 @@ impl MaudeHandle {
             lhs: rewrite(&eq.lhs, &skolem_map),
             rhs: rewrite(&eq.rhs, &skolem_map),
         }).collect();
-        // Avoid unused-var lint when no skolemization happened.
-        let _ = &reverse;
 
         let mut inner = self.inner.lock().unwrap();
         let mut ctx = ConvCtx::new();
@@ -1475,7 +1460,10 @@ impl MaudeHandle {
         Ok(out)
     }
 
-    /// Get variants of a term.
+    /// Get the variants of a term, one substitution per Maude `[variant]`.
+    /// Each variant is back-converted with its own fresh conversion
+    /// context (see the inline note) so that fresh witness vars do not
+    /// collide between variants.
     pub fn variants(&self, t: &LNTerm) -> Result<Vec<Vec<(crate::lterm::LVar, LNTerm)>>, MaudeError> {
         let mut inner = self.inner.lock().unwrap();
         let mut ctx = ConvCtx::new();

@@ -257,7 +257,9 @@ pub fn render_svg_or_dot_with(sys: &System, opts: &GraphOptions) -> RenderResult
 
 /// What we got back from `dot`.
 pub enum RenderResult {
+    /// SVG bytes produced by `dot -Tsvg`.
     Svg(Vec<u8>),
+    /// Raw DOT source, returned when the `dot` binary is unavailable or failed.
     Dot(String),
 }
 
@@ -879,8 +881,8 @@ fn role_color(name: &str) -> String {
 }
 
 fn escape_dot(s: &str) -> String {
-    // Escape `"`, `\`, `{`, `}`, `|`, `<`, `>` for the Graphviz record
-    // string syntax.
+    // Escape `"`, `\`, `{`, `}`, `|`, `<`, `>`, and newline for the
+    // Graphviz record string syntax.
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -944,7 +946,7 @@ mod tests {
 
     #[test]
     fn dot_uses_pretty_printing_for_terms() {
-        // Two pub var literals shoult render as $a, $b not as cryptic
+        // Two pub var literals should render as $a, $b not as cryptic
         // M:0 placeholders.
         use tamarin_theory::fact::{out_fact, fresh_fact};
         use tamarin_theory::rule::{

@@ -88,7 +88,7 @@ fn ac_op_symbol(op: AcSym) -> &'static str {
 /// show)` (Term.hs:268-296) built as a HughesPJ `Doc` then rendered standalone
 /// at the default width (100 / 67), so long terms WRAP exactly as HS's inner
 /// `render` does.
-pub fn pretty_sapic_term(t: &SapicTerm) -> String {
+pub(crate) fn pretty_sapic_term(t: &SapicTerm) -> String {
     render_sapic(sapic_term_to_doc(t, None))
 }
 

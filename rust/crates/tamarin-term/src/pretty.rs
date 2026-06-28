@@ -30,7 +30,7 @@ use crate::vterm::Lit;
 
 /// Pretty-print an `LNTerm` to a `String`.
 ///
-/// Port of `prettyLNTerm` from `Term.LTerm` (line 856 of `LTerm.hs`)
+/// Port of `prettyLNTerm` from `Term.LTerm` (`LTerm.hs`)
 /// which delegates to `prettyTerm (text . show)`.
 pub fn pretty_lnterm<T: PrettyTerm + ?Sized>(t: &T) -> String {
     let mut s = String::new();

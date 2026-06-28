@@ -80,10 +80,6 @@ impl LessAtom {
         LessAtom { smaller, larger, reason }
     }
 
-    pub fn from_edge(reason: Reason, edge: &Edge) -> Self {
-        LessAtom { smaller: edge.src.0.clone(), larger: edge.tgt.0.clone(), reason }
-    }
-
     pub fn to_edge(&self) -> (NodeId, NodeId) {
         (self.smaller.clone(), self.larger.clone())
     }
@@ -107,6 +103,8 @@ impl PartialOrd for LessAtom {
 }
 
 /// Project the relation: just the `(smaller, larger)` pairs.
+/// Reachable only from its own unit test in production; kept as a mirror
+/// of the HS `getLessRel`-style projection (`to_edge` likewise).
 pub fn get_less_rel(atoms: &[LessAtom]) -> Vec<(NodeId, NodeId)> {
     atoms.iter().map(|a| a.to_edge()).collect()
 }
@@ -129,7 +127,6 @@ pub struct Disj<T>(pub Vec<T>);
 
 impl<T> Disj<T> {
     pub fn new(items: Vec<T>) -> Self { Disj(items) }
-    pub fn iter(&self) -> std::slice::Iter<'_, T> { self.0.iter() }
 }
 
 // =============================================================================
@@ -154,14 +151,17 @@ pub enum Goal {
 }
 
 impl Goal {
+    // `is_split`/`is_disj`/`is_subterm`/`is_premise` mirror the HS `Goal`
+    // predicate set (`isSplitGoal`/`isDisjGoal`/`isSubtermGoal`); no caller
+    // yet, kept for parity with the sibling live predicates.
     pub fn is_action(&self) -> bool { matches!(self, Goal::Action(_, _)) }
     pub fn is_premise(&self) -> bool { matches!(self, Goal::Premise(_, _)) }
     pub fn is_chain(&self) -> bool { matches!(self, Goal::Chain(_, _)) }
     pub fn is_split(&self) -> bool { matches!(self, Goal::Split(_)) }
     pub fn is_disj(&self) -> bool { matches!(self, Goal::Disj(_)) }
-    // HS's `isSubtermGoal` (Constraints.hs:197-199) erroneously matches `DisjG _`
+    // HS's `isSubtermGoal` (Constraints.hs) erroneously matches `DisjG _`
     // (a copy-paste of `isDisjGoal`); we match the semantically-correct
-    // `Goal::Subterm`. Both are currently unused, so the divergence is inert.
+    // `Goal::Subterm`. The divergence is inert (no caller yet).
     pub fn is_subterm(&self) -> bool { matches!(self, Goal::Subterm(_)) }
 
     /// "Standard" action goals are non-`KU` actions — `KU(_)` is

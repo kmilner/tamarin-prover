@@ -3,6 +3,9 @@
 //! The original `timed`/`timedIO` rely on Haskell's `deepseq` to force
 //! lazy values before measuring. Rust evaluates eagerly, so we just measure
 //! the wall-clock duration of running a closure.
+//!
+//! Retained as a faithful mirror of the upstream Haskell module; the
+//! prover does not currently call `timed`.
 
 use std::time::{Duration, Instant};
 

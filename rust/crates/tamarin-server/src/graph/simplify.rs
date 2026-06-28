@@ -353,25 +353,6 @@ pub enum SimplificationLevel {
     SL3,
 }
 
-impl SimplificationLevel {
-    pub fn from_u8(n: u8) -> Self {
-        match n {
-            0 => SimplificationLevel::SL0,
-            1 => SimplificationLevel::SL1,
-            2 => SimplificationLevel::SL2,
-            _ => SimplificationLevel::SL3,
-        }
-    }
-    pub fn as_u8(self) -> u8 {
-        match self {
-            SimplificationLevel::SL0 => 0,
-            SimplificationLevel::SL1 => 1,
-            SimplificationLevel::SL2 => 2,
-            SimplificationLevel::SL3 => 3,
-        }
-    }
-}
-
 /// Mirror of Haskell `simplifySystem`:
 ///   SL2 = transitiveReduction sys False
 ///   SL3 = transitiveReduction sys True

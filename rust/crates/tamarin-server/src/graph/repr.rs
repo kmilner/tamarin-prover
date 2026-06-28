@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use tamarin_theory::constraint::constraints::{Edge as SysEdge, LessAtom, NodeId, NodePrem, NodeConc};
+use tamarin_theory::constraint::constraints::{LessAtom, NodeId, NodePrem, NodeConc};
 use tamarin_theory::fact::LNFact;
 use tamarin_theory::rule::{ConcIdx, PremIdx, ProtoRuleName, RuleACInst, RuleInfo};
 
@@ -380,16 +380,6 @@ pub fn compute_basic_graph_repr(sys: &System) -> GraphRepr {
         }
     }
     GraphRepr { clusters: Vec::new(), nodes, edges }
-}
-
-// ---------------------------------------------------------------------
-// Convert SysEdge -> GEdge for tests / shared helpers
-// ---------------------------------------------------------------------
-
-impl GEdge {
-    pub fn from_sys_edge(e: &SysEdge) -> Self {
-        GEdge::System(e.src.clone(), e.tgt.clone())
-    }
 }
 
 #[cfg(test)]

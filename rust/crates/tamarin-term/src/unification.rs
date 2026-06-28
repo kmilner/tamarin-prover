@@ -75,6 +75,9 @@ pub fn unify_lnterm_no_ac_with_counter(
 }
 
 /// `unifiableLNTermsNoAC`: shorthand for "is there a unifier?".
+///
+/// Intentionally retained for parity with HS `unifiableLNTermsNoAC`; no
+/// current Rust caller in the prover.
 pub fn unifiable_lnterms_no_ac(
     a: crate::lterm::LNTerm,
     b: crate::lterm::LNTerm,

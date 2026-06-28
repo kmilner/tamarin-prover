@@ -23,11 +23,17 @@ pub fn var_term<C, V>(v: V) -> VTerm<C, V> { lit(Lit::Var(v)) }
 pub fn const_term<C, V>(c: C) -> VTerm<C, V> { lit(Lit::Con(c)) }
 
 /// `isVar t`: whether `t` is a single variable literal.
+///
+/// Mirrors the exported `VTerm.hs` `isVar`; retained for surface parity, no
+/// caller yet.
 pub fn is_var<C, V>(t: &VTerm<C, V>) -> bool {
     matches!(t, Term::Lit(Lit::Var(_)))
 }
 
 /// `termVar t`: the variable literal of `t`, if `t` is exactly a variable.
+///
+/// Mirrors the exported `VTerm.hs` `termVar`; retained for surface parity, no
+/// caller yet.
 pub fn term_var<C, V>(t: &VTerm<C, V>) -> Option<&V> {
     match t.view() {
         TermView::Lit(Lit::Var(v)) => Some(v),
@@ -87,6 +93,9 @@ pub fn occurs_vterm<C, V: PartialEq>(v: &V, t: &VTerm<C, V>) -> bool {
 }
 
 /// `constsVTerm t`: sorted, deduplicated list of constants in `t`.
+///
+/// Mirrors the exported `VTerm.hs` `constsVTerm`; retained for surface parity,
+/// no caller yet.
 pub fn consts_vterm<C: Ord + Clone, V>(t: &VTerm<C, V>) -> Vec<C> {
     let mut out = Vec::new();
     collect_consts(t, &mut out);

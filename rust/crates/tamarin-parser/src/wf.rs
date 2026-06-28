@@ -281,7 +281,10 @@ fn theory_lemmas(thy: &Theory) -> Vec<&Lemma> {
 }
 
 /// Iterate all facts in a rule (premises ∪ actions ∪ conclusions),
-/// labelled with which side they appeared on.
+/// each paired with which side it appeared on. Callers currently discard
+/// the side tag; it is retained for callers that need to distinguish sides.
+// Intentionally retained: faithful HS port; no caller reads the tag yet.
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FactSide { Lhs, Acts, Rhs }
 

@@ -50,7 +50,10 @@ pub struct ProofContext {
     /// Whether the solver should attempt induction at the start of a
     /// proof. Mirrors Haskell's `pcUseInduction` flag.
     pub use_induction: UseInduction,
-    /// Whether this is a diff-mode proof.
+    /// Whether this is a diff-mode proof. Reserved for `--diff`
+    /// (observational equivalence), which is not yet ported, so no code
+    /// reads it to change behavior yet; it is the canonical carrier of
+    /// diff-mode state.
     pub is_diff: bool,
     /// Set of fact tags whose instances we know to be uniquely
     /// identified by their first argument (the "injective" facts).
@@ -182,14 +185,16 @@ impl ProofContext {
     /// case size).  Because the call site in `search.rs` runs inside
     /// `cases.into_par_iter().map(...)`, a wide parallel node re-clones
     /// that read-only data once per child case.  Only `maude` /
-    /// `maude_pool` are cheap (`Arc`-backed).  Wrapping the heavy
-    /// read-only fields in `Arc` would make this O(1), but that is a
-    /// cross-cutting change deferred for now.
+    /// `maude_pool` are cheap (`Arc`-backed).  The read-only fields are
+    /// deep-cloned here; `Arc`-sharing them would make this O(1) and is
+    /// a possible future optimization.
     ///
-    /// The new context drops `maude_pool` (set to None) — a worker
-    /// holding a pooled handle should NOT recursively borrow more
-    /// pool members from inside the same task; doing so could
-    /// deadlock if the pool is smaller than the rayon worker count.
+    /// The new context drops `maude_pool` (set to None): the worker
+    /// already owns a per-task subprocess for the task's duration, and
+    /// dropping the pool here keeps the nested fan-out (`search.rs`) on
+    /// its non-blocking `try_acquire` + `ctx.maude` fallback, which is
+    /// what prevents deadlock when the pool is smaller than the rayon
+    /// worker count.
     pub fn with_swapped_maude(&self, maude: MaudeHandle) -> Self {
         let mut c = self.clone();
         c.maude = maude;
@@ -311,42 +316,6 @@ impl ProofContext {
                 orig.cases_set(s.cases_or_empty());
             }
         }
-        if tamarin_utils::env_gate!("TAM_DBG_SAT_FINAL") {
-            use crate::constraint::constraints::Goal;
-            for src in &self.full_sources {
-                let tag = match &src.goal {
-                    Goal::Premise(_, f) => format!("Premise({:?})", f.tag),
-                    Goal::Action(_, f) => {
-                        let head = f.terms.first().map(|t| match t {
-                            tamarin_term::term::Term::App(n, args) =>
-                                format!("App({:?},{})", n, args.len()),
-                            tamarin_term::term::Term::Lit(_) => "Lit".to_string(),
-                        }).unwrap_or_else(|| "no_terms".to_string());
-                        format!("Action({:?},{})", f.tag, head)
-                    }
-                    _ => continue,
-                };
-                for (name, sys) in src.cases_or_empty() {
-                    eprintln!("[SAT_FINAL] src={} case={} nodes={:?} edges={} goals_solved={} goals_open={}",
-                        tag, name,
-                        sys.nodes.iter().map(|(id, r)|
-                            format!("{:?}={}", id,
-                                crate::constraint::solver::reduction::rule_case_name(r)))
-                            .collect::<Vec<_>>(),
-                        sys.edges.len(),
-                        sys.goals.iter().filter(|(_, st)| st.solved).count(),
-                        sys.goals.iter().filter(|(_, st)| !st.solved).count());
-                    for e in &sys.edges {
-                        eprintln!("[SAT_FINAL]   edge {:?}.{:?} → {:?}.{:?}",
-                            e.src.0, e.src.1, e.tgt.0, e.tgt.1);
-                    }
-                    for (g, st) in sys.goals.iter() {
-                        eprintln!("[SAT_FINAL]   goal solved={} {:?}",
-                            st.solved, format!("{:?}", g).chars().take(120).collect::<String>());
-                    }
-                }
-            }
-        }
         // Restore the fresh counter to its pre-saturation value (see the
         // HS-FAITHFUL PURITY note above): the refine consumed idxs only for
         // the stored cases, which are re-freshened from `avoid(live_sys)` on
@@ -448,35 +417,9 @@ impl ProofContext {
         // (already done inside `subterm_intruder_rules`) and BEFORE the
         // `special_intruder_rules` append (since HS appends specials
         // separately in `addMessageDeductionRuleVariants`).
-        let dbg_close = tamarin_utils::env_gate!("TAM_RS_DBG_CLOSE_INTR");
-        if dbg_close {
-            eprintln!("[close_intr] BEFORE: {} intr rules", intruder_rules.len());
-            for r in &intruder_rules {
-                if let crate::rule::IntrRuleACInfo::DestrRule(n, b, st, c) = &r.info {
-                    eprintln!("  destr: {} budget={} subterm={} const={}",
-                        String::from_utf8_lossy(n), b, st, c);
-                }
-            }
-        }
         intruder_rules = intruder_rules.into_iter()
             .flat_map(|ir| crate::intruder_rules::close_intr_rule(&maude, &ir))
             .collect();
-        if dbg_close {
-            eprintln!("[close_intr] AFTER: {} intr rules", intruder_rules.len());
-            for r in &intruder_rules {
-                if let crate::rule::IntrRuleACInfo::DestrRule(n, b, st, c) = &r.info {
-                    use tamarin_term::pretty::pretty_lnterm;
-                    let prems_s: Vec<String> = r.premises.iter().flat_map(|f|
-                        f.terms.iter().map(pretty_lnterm)
-                    ).collect();
-                    let concs_s: Vec<String> = r.conclusions.iter().flat_map(|f|
-                        f.terms.iter().map(pretty_lnterm)
-                    ).collect();
-                    eprintln!("  destr: {} b={} st={} const={}\n    prems={:?}\n    concs={:?}",
-                        String::from_utf8_lossy(n), b, st, c, prems_s, concs_s);
-                }
-            }
-        }
         intruder_rules.extend(crate::intruder_rules::special_intruder_rules(false));
         // HS-faithful: theory-specific intruder rules (Nat, MSet, Xor) —
         // port of `Main.TheoryLoader.addMessageDeductionRuleVariants`
@@ -678,8 +621,8 @@ impl ProofContext {
         // smart-rank tie-breaker then resolved differently.
         for (idx, o) in rules.iter().enumerate() {
             if !o.variants.is_empty() { continue; }
-            // The pre-applied variant *rules* (the old `expand_rule_variants`
-            // path that fed `o.variants`) are DEAD for the constraint solver:
+            // The pre-applied variant *rules* (the old variant-expansion path
+            // that fed `o.variants`) are DEAD for the constraint solver:
             // the SplitG-based solving path reads only `abstracted_rule` +
             // `variant_substs` (`canonical_rule_inst` / `rule_insts_with_constrs`,
             // reduction.rs:2868,2895).  Their RAW `get variants` Maude query
@@ -742,18 +685,6 @@ impl ProofContext {
         let pc_true_subterm = intruder_rules.iter()
             .filter(|r| crate::rule::is_destr_rule_info(&r.info))
             .all(|r| crate::rule::is_subterm_rule_info(&r.info));
-        if tamarin_utils::env_gate!("TAM_RS_DBG_PC_TRUE_SUBTERM") {
-            eprintln!("[pc_true_subterm] = {}", pc_true_subterm);
-            for r in &intruder_rules {
-                if crate::rule::is_destr_rule_info(&r.info) {
-                    eprintln!("  destr: {:?} subterm={}",
-                        crate::rule::rule_name_string(&crate::rule::Rule::new(
-                            crate::rule::RuleInfo::Intr(r.info.clone()),
-                            vec![], vec![], vec![])),
-                        crate::rule::is_subterm_rule_info(&r.info));
-                }
-            }
-        }
         let mut ctx = ProofContext {
             maude,
             maude_pool,

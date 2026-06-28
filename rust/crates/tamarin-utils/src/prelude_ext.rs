@@ -1,7 +1,11 @@
 //! Port of `Extension.Prelude` (and `Extension.Data.Monoid::MinMax`) from
 //! `lib/utils/src/Extension/Prelude.hs` and `Extension/Data/Monoid.hs`.
 //!
-//! Small list / pair / string helpers used pervasively in the prover.
+//! Small list / pair / string helpers.
+//!
+//! Intentionally retained: faithful `Extension.Prelude` mirror. Only `nub_on`
+//! and `flush_right` have a live caller; the remaining helpers and the `MinMax`
+//! type are kept for completeness of the port.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;

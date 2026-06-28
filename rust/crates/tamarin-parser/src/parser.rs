@@ -2239,7 +2239,8 @@ impl<'a> Parser<'a> {
             }
         }
         if self.lx.peek() == Some('%') {
-            // %1 / %'n' / %x — distinguish.
+            // %'n' / %x — distinguish. (`%1` is already handled above via the
+            // `try_punct("%1")` token match.)
             let mut probe = self.lx.clone();
             probe.bump();
             match probe.peek() {
@@ -2247,11 +2248,6 @@ impl<'a> Parser<'a> {
                     self.lx.bump();
                     let s = self.lx.single_quoted().ok_or_else(|| self.err("bad nat literal"))?;
                     return Ok(Term::NatLit(s));
-                }
-                Some('1') => {
-                    self.lx.bump();
-                    self.lx.bump();
-                    return Ok(Term::NatOne);
                 }
                 Some(c) if c.is_ascii_alphabetic() => {
                     if let Some(v) = self.try_var_spec()? {
@@ -2522,6 +2518,12 @@ enum FactOrRestr {
 // a quoted string)
 // =============================================================================
 
+/// Parse a standalone formula from its source text into the AST [`Formula`].
+///
+/// Lemmas and restrictions store their formula as a quoted string; this is the
+/// entry point used to recover the AST from that text.  Errors on any trailing
+/// input after the formula.  All algebraic operators are enabled at parse time
+/// (see [`Parser::new`]); semantic gating is irrelevant here.
 pub fn parse_formula_str(s: &str) -> Result<Formula, ParseError> {
     let mut p = Parser::new(s, &[], false);
     let f = p.formula()?;

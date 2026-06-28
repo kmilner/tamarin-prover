@@ -279,13 +279,13 @@ struct CachedSources {
 
 /// Per-file shared prover state — the bits of work that depend only on
 /// the theory, not on which lemma is being proved.  Built once via
-/// [`ProverSession::build_with_in_file`] and reused across `prove_lemma_in_session`
-/// calls so each lemma in a multi-lemma `--prove` run pays the heavy
-/// setup cost only ONCE.
+/// [`ProverSession::build_with_in_file_and_heuristic`] and reused across
+/// `prove_lemma_in_session` calls so each lemma in a multi-lemma `--prove`
+/// run pays the heavy setup cost only ONCE.
 ///
 /// Profile showed ~3s of `ProofContext::new` work (intruder rules,
 /// `close_intr_rule` Maude variants, DH/BP cached variants, per-rule
-/// `expand_rule_variants`, `precompute_sources`, `precompute_full_sources`)
+/// per-rule variant precomputation, `precompute_sources`, `precompute_full_sources`)
 /// re-running per lemma.  On wireguard's 8 lemmas that was ~24s
 /// (HS amortises this across the file).  By sharing the template
 /// `ProofContext` we recover that cost; per-lemma we still run the
@@ -324,29 +324,11 @@ pub struct ProverSession {
     /// and runs `ensure_saturated` to materialise lemma-specific
     /// refined source cases.
     template_ctx: ProofContext,
-    /// Fresh-counter delta consumed by `ProofContext::new_with_…` during
-    /// template construction.  Each non-session `prove_lemma_with_pool`
-    /// call advances the global fresh-var counter by this amount
-    /// (`close_intr_rule` Maude calls + per-rule `expand_rule_variants`).
-    /// In session mode the template is built ONCE so the counter only
-    /// advances by `K` once.  Without re-bumping per lemma, lemma N's
-    /// runtime fresh allocations would start at `K + sum(prior_proofs)`
-    /// instead of the per-lemma path's `N*K + sum(prior_proofs)` — and
-    /// that delta is observable as a divergent proof on a small subset
-    /// of lemmas where allocated witness indices interact with rule-
-    /// variant subst indices (e.g. wireguard `identity_hiding` becomes
-    /// 1 step shorter without this bump).  `prove_lemma_in_session`
-    /// calls `maude.ensure_above` with an incrementing target so each
-    /// per-lemma counter trajectory matches the non-session path
-    /// exactly, byte-for-byte across the whole proof tree.
-    setup_counter_delta: u64,
-    /// Counter value BEFORE the template was built — used together
-    /// with `setup_counter_delta` to compute the per-lemma bump target.
+    /// Fresh-counter value BEFORE the template was built.  The template
+    /// build is counter-neutral (the build's fresh allocation is undone by
+    /// restoring the counter), so every lemma starts from this same base.
+    /// Used as the `ensure_above` floor on the per-lemma counter clone.
     setup_counter_before: u64,
-    /// Number of lemmas already processed via `prove_lemma_in_session`.
-    /// Drives the counter-bump trajectory.  Use `AtomicU64` so the
-    /// session can stay `&self` to its callers.
-    lemma_idx: std::sync::atomic::AtomicU64,
     /// Lever #3 — shared refined-source cache (see [`CachedSources`]).
     /// Keyed by the sorted `[sources]`-lemma name set.  Populated lazily
     /// on the first lemma of each key; reused by all later lemmas with the
@@ -356,17 +338,6 @@ pub struct ProverSession {
     source_cache: std::sync::Mutex<
         std::collections::HashMap<Vec<String>, CachedSources>,
     >,
-}
-
-/// Compute the cumulative setup-counter advance the non-session
-/// `prove_lemma_with_pool` path would have done by lemma index `n`
-/// (1-indexed).  Each non-session call advances the counter by
-/// `setup_counter_delta`, so by the start of lemma `n` the counter
-/// would have advanced `n * delta`.  In session mode the template
-/// build only advanced it by `1 * delta`, so we need an extra
-/// `(n - 1) * delta` bump before lemma `n`'s runtime to match.
-fn setup_target_for(delta: u64, n: u64) -> u64 {
-    delta.saturating_mul(n)
 }
 
 /// Per-lemma source kind, mirroring HS `lemmaSourceKind` (Lemma.hs:38-41):
@@ -438,26 +409,15 @@ fn gather_reusable_lemmas(
 
 impl ProverSession {
     /// Build the shared per-file state, also setting `theory.in_file` for
-    /// oracle path resolution (HS Parser.hs:304).  Does the expensive
+    /// oracle path resolution (HS Parser.hs).  Does the expensive
     /// once-per-file work: theory elaboration, restriction conversion, full
     /// `ProofContext` construction (which runs intruder rule generation,
     /// `close_intr_rule`, DH/BP cached variants, per-rule variant
-    /// expansion, source precomputation).
-    pub fn build_with_in_file(
-        parser_theory: &p::Theory,
-        maude: tamarin_term::maude_proc::MaudeHandle,
-        pool: Option<std::sync::Arc<tamarin_term::maude_proc::MaudePool>>,
-        in_file: &str,
-    ) -> Result<Self, ProveError> {
-        Self::build_with_in_file_and_heuristic(
-            parser_theory, maude, pool, in_file, CliHeuristic::default())
-    }
-
-    /// Like [`build_with_in_file`] but also carries the CLI
-    /// `--heuristic`/`--oraclename`/`--oracle-only` (HS `AutoProver`).  When
+    /// expansion, source precomputation).  Carries the CLI
+    /// `--heuristic`/`--oraclename`/`--oracle-only` (HS `AutoProver`): when
     /// `cli_heuristic.raw` is `Some`, every lemma's goal ranking is the CLI
     /// heuristic (HS `selectHeuristic`: `apDefaultHeuristic <|> pcHeuristic`,
-    /// Proof.hs:707).
+    /// Proof.hs).
     pub fn build_with_in_file_and_heuristic(
         parser_theory: &p::Theory,
         maude: tamarin_term::maude_proc::MaudeHandle,
@@ -498,20 +458,16 @@ impl ProverSession {
         // HS-FAITHFUL PURITY (mirrors the source-refinement purity in
         // `ensure_saturated`): HS closes the theory ONCE and each lemma's
         // proof independently resets fresh to `avoid sys` per step
-        // (ProofMethod.hs:457) — the theory-build's fresh allocation never
+        // (ProofMethod.hs) — the theory-build's fresh allocation never
         // feeds the per-lemma proof counter.  RS's template build advances
-        // the shared counter; the session model REPLAYED that advance per
-        // lemma as `(i+1)*setup_counter_delta` to mimic the non-session path
-        // that rebuilds the context per lemma.  That replay is an RS-ism, not
-        // HS.  Restore the counter to its pre-build value so the build is
-        // counter-neutral: every lemma starts from the same base, template
-        // vars are re-freshened from `avoid sys` on instantiation, and
-        // `setup_counter_delta` collapses to 0.
+        // the shared counter, so restore the counter to its pre-build value
+        // to keep the build counter-neutral: every lemma starts from the same
+        // base and template vars are re-freshened from `avoid sys` on
+        // instantiation.
         let setup_counter_before = maude.fresh_counter_peek();
         let template_ctx = ProofContext::new_with_restrictions_pool_forced(
             maude.clone(), pool, rules, restrictions.clone(), &forced_injective_facts);
         maude.reset_counter_to(setup_counter_before);
-        let setup_counter_delta = 0u64;
         Ok(ProverSession {
             theory,
             cli_heuristic,
@@ -519,17 +475,15 @@ impl ProverSession {
             user_funs,
             restrictions,
             template_ctx,
-            setup_counter_delta,
             setup_counter_before,
-            lemma_idx: std::sync::atomic::AtomicU64::new(0),
             source_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 }
 
 /// Prove a single lemma using a pre-built `ProverSession`.  Skips the
-/// expensive theory-level setup (which `ProverSession::build_with_in_file` did) and
-/// runs only the per-lemma work: guarded conversion of lemma+reuse
+/// expensive theory-level setup (which `ProverSession::build_with_in_file_and_heuristic`
+/// did) and runs only the per-lemma work: guarded conversion of lemma+reuse
 /// formulas, `formula_to_system`, ProofContext clone +
 /// per-lemma-field setup, `ensure_saturated` (typing-asm refinement),
 /// and proof-tree search.
@@ -625,37 +579,14 @@ fn prove_lemma_in_session_mode(
     // unsaturated cells, so each lemma's `ensure_saturated` populates
     // ITS OWN clone's cells with refinements driven by ITS OWN
     // `typing_assumptions` — no cross-lemma contamination.
-    let mut ctx = if tamarin_utils::env_gate!("TAM_DBG_SESSION_REBUILD") {
-        let rules: Vec<OpenProtoRule> = theory.rules().cloned().collect();
-        ProofContext::new_with_restrictions_and_pool(
-            session.template_ctx.maude.clone(),
-            session.template_ctx.maude_pool.clone(),
-            rules,
-            session.restrictions.clone())
-    } else {
-        session.template_ctx.clone()
-    };
-    // Replay the fresh-counter bump that the legacy per-lemma
-    // `prove_lemma_with_pool` path would have done at this point via
-    // its own `ProofContext::new_with_restrictions_and_pool`.  In
-    // session mode the template was built ONCE, so the global counter
-    // only advanced by `K` once; without re-bumping per lemma, each
-    // lemma's runtime allocations would start at the wrong index and
-    // a small number of lemmas (e.g. wireguard `identity_hiding`)
-    // would diverge structurally.  Bump such that lemma `i` (0-indexed)
-    // sees the same counter value it would in the non-session path:
-    // `setup_counter_before + (i+1)*setup_counter_delta`.
-    let lemma_i = session.lemma_idx
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let target = session.setup_counter_before
-        .saturating_add(setup_target_for(session.setup_counter_delta, lemma_i + 1));
-    // B1 (lemma-level parallelism): give each lemma its OWN fresh-counter
-    // Arc (still sharing the template's Maude subprocess) so concurrently
-    // proving lemmas don't race on a shared counter.  With
-    // `setup_counter_delta == 0`, `target == setup_counter_before` for every
-    // lemma, so this is output-identical to the serial path.
+    let mut ctx = session.template_ctx.clone();
+    // The template build is counter-neutral, so every lemma starts from the
+    // same `setup_counter_before` base.  B1 (lemma-level parallelism): give
+    // each lemma its OWN fresh-counter Arc (still sharing the template's Maude
+    // subprocess) so concurrently proving lemmas don't race on a shared
+    // counter, then floor it at the shared base.
     ctx.maude = ctx.maude.with_fresh_counter_from(0);
-    ctx.maude.ensure_above(target.saturating_sub(1));
+    ctx.maude.ensure_above(session.setup_counter_before.saturating_sub(1));
     if trace { eprintln!("[phase] (session) ProofContext clone dt={:.3}s",
         t_ctx.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64())); }
     ctx.is_exists_trace = matches!(
@@ -1141,21 +1072,6 @@ pub fn prove_lemma_with_pool_file_heuristic(
     if tamarin_utils::env_gate!("TAM_RS_DBG_PHASE") {
         eprintln!("[rs-phase] lemma-proof START");
     }
-    if tamarin_utils::env_gate!("TAM_DBG_LEMMA_INIT") {
-        eprintln!("[lemma-init] sys.formulas count = {}", sys.formulas.len());
-        for (i, f) in sys.formulas.iter().enumerate() {
-            let s = format!("{:?}", f);
-            eprintln!("[lemma-init]   formula[{}]: {}", i,
-                s.chars().take(250).collect::<String>());
-        }
-        eprintln!("[lemma-init] sys.lemmas count = {}", sys.lemmas.len());
-        for (i, f) in sys.lemmas.iter().enumerate() {
-            let s = format!("{:?}", f);
-            eprintln!("[lemma-init]   lemma[{}]: {}", i,
-                s.chars().take(250).collect::<String>());
-        }
-    }
-    // Keep TAM_DBG_LEMMA_INIT as a documented diagnostic env var.
     // Honour the `[use_induction]` and `[sources]` attributes by
     // forcing the first proof method to be Induction. Haskell's
     // `ClosedTheory.hs` flips `pcUseInduction = UseInduction` for

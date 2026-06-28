@@ -24,7 +24,7 @@ use crate::tools::{EquationStore, SubtermStore};
 /// turns the per-call O(less+edges+chains) map rebuild into a single build
 /// per pass; the queries are pure BFS lookups. The relation is invariant
 /// across the inner loops (the system is not mutated mid-pass), so the
-/// hoisted result is identical to repeated per-call `always_before`.
+/// hoisted result is identical to rebuilding the adjacency on every query.
 #[derive(Debug, Clone, Default)]
 pub struct PrebuiltAdj {
     adj: std::collections::BTreeMap<NodeId, Vec<NodeId>>,
@@ -107,12 +107,6 @@ pub struct System {
     /// Reduction.hs:516-521 always `succ`s it).  Each new goal records
     /// the current value as its `GoalStatus.nr`.
     pub next_goal_nr: u64,
-    /// Generic fresh-LVar index supply used by
-    /// `Reduction::insert_fresh_node` to mint fresh node ids.  NOTE:
-    /// this is NOT the `SplitId` counter — Haskell's `_eqsNextSplitId`
-    /// lives in the equation store (here `eq_store.next_split`), and the
-    /// Haskell `System` record has no split/fresh counter of its own.
-    pub next_split: u64,
     /// Source-case names already grafted into this branch.  Mirrors
     /// Haskell's `filterCases` invariant in `solveAllSafeGoals`: once
     /// a precomputed case has been used to discharge a goal, it is
@@ -121,7 +115,7 @@ pub struct System {
     /// internal KU goals re-spawn at runtime will pick the same case
     /// again, looping until depth-limit.
     pub used_sources: Vec<String>,
-    /// Provenance tracking (task #157): universals in `lemmas` that
+    /// Provenance tracking: universals in `lemmas` that
     /// came from `[sources]`-tagged lemma bodies.  Haskell never adds
     /// these to `sLemmas` (only `[reuse]` lemmas go there via
     /// `gatherReusableLemmas`), so its runtime `insertImpliedFormulas`
@@ -168,7 +162,6 @@ impl Clone for System {
             subterm_store: self.subterm_store.clone(),
             goals: self.goals.clone(),
             next_goal_nr: self.next_goal_nr,
-            next_split: self.next_split,
             used_sources: self.used_sources.clone(),
             sources_lemma_universals: self.sources_lemma_universals.clone(),
             max_var_idx_cache: Cell::new(self.max_var_idx_cache.get()),
@@ -179,8 +172,8 @@ impl Clone for System {
 // Manual `PartialEq` — ignores the cache.  Two systems with identical
 // content but different cache state (e.g. one freshly cloned, one
 // after `bounds_max` populated its cache) must compare equal — see
-// `proof_method.rs:486/492` (`let cleaned_input = cleanup(sys); ...
-// if cleaned[0] == cleaned_input { return None; }`).
+// `proof_method.rs`'s cleanup-equality check (`let cleaned_input =
+// cleanup(sys); ... if cleaned[0] == cleaned_input { return None; }`).
 impl PartialEq for System {
     fn eq(&self, other: &Self) -> bool {
         self.source_kind == other.source_kind
@@ -196,7 +189,6 @@ impl PartialEq for System {
             && self.subterm_store == other.subterm_store
             && self.goals == other.goals
             && self.next_goal_nr == other.next_goal_nr
-            && self.next_split == other.next_split
             && self.used_sources == other.used_sources
             && self.sources_lemma_universals == other.sources_lemma_universals
     }
@@ -239,10 +231,9 @@ pub struct GoalStatus {
     pub nr: u64,
 }
 
-// --- Cached debug env flags for the node/goal insertion hot path -------
-// `add_node`/`add_goal`/`add_goal_with_loop_flag` are the core insertion
-// path (34+ `add_node` call sites; goal inserts per KU-decomposition /
-// conjoinSystem).  These diagnostic env vars are constant for the
+// --- Cached debug env flags for the goal insertion hot path -------
+// `add_goal`/`add_goal_with_loop_flag` insert goals per KU-decomposition /
+// conjoinSystem.  These diagnostic env vars are constant for the
 // process, so cache each behind a `OnceLock<bool>` (mirroring
 // `reduction::bounds_max_verify_enabled`) instead of an env-lock +
 // `String` alloc per insertion.
@@ -260,116 +251,6 @@ fn dbg_insert_goal_include_precompute() -> bool {
 fn trace_goal_insert() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("TAM_RS_TRACE_GOAL_INSERT").is_ok())
-}
-#[inline]
-fn dbg_panic_idx0() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_DBG_PANIC_IDX0").is_ok())
-}
-#[inline]
-fn dbg_panic_idx0_runtime_only() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_DBG_PANIC_IDX0_RUNTIME_ONLY").is_ok())
-}
-#[inline]
-fn dbg_add_node_serv1() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_DBG_ADD_NODE_SERV1").is_ok())
-}
-#[inline]
-fn dbg_trace_add_node() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_DBG_TRACE_ADD_NODE").is_ok())
-}
-#[inline]
-fn dbg_panic_any_idx0_node() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_DBG_PANIC_ANY_IDX0_NODE").is_ok())
-}
-/// True iff ANY of the `add_node` diagnostic env flags is set.  Lets the
-/// `add_node` hot path do a single cheap `OnceLock` read before calling
-/// the `#[cold]` diagnostics helper.
-#[inline]
-fn dbg_add_node_any_enabled() -> bool {
-    dbg_panic_idx0()
-        || dbg_add_node_serv1()
-        || dbg_trace_add_node()
-        || dbg_panic_any_idx0_node()
-}
-
-/// Env-gated `add_node` diagnostics, pulled out of the hot path.  Each
-/// block re-checks its own flag, so this only does work for the flags
-/// that are actually set.  Marked `#[cold]` since in production every
-/// flag is off and this is never called.
-#[cold]
-fn add_node_diagnostics(id: &NodeId, rule: &RuleACInst) {
-    // DIAGNOSTIC: panic if an instance rule with user-named idx-0 vars
-    // gets added.  Gated by env var so it doesn't affect production.
-    // Honors TAM_DBG_PANIC_IDX0_RUNTIME_ONLY=1 to skip during precompute.
-    if dbg_panic_idx0() {
-        let in_precompute = crate::constraint::solver::sources::in_precompute_mode();
-        let skip_during_precompute = dbg_panic_idx0_runtime_only();
-        let active = !(skip_during_precompute && in_precompute);
-        if active {
-            use tamarin_term::lterm::HasFrees;
-            let mut found_idx0: Option<tamarin_term::lterm::LVar> = None;
-            rule.for_each_free(&mut |v| {
-                if v.idx == 0 && matches!(&*v.name,
-                    "ni" | "nr" | "m1" | "m2" | "s" | "R" | "ltkA" | "ltkI")
-                    && found_idx0.is_none() {
-                    found_idx0 = Some(v.clone());
-                }
-            });
-            if let Some(v) = found_idx0 {
-                panic!("[TAM_DBG_PANIC_IDX0] add_node: rule has idx-0 var {:?} (id={:?}, precompute={})",
-                    v, id, in_precompute);
-            }
-        }
-    }
-    // DIAGNOSTIC: dump Serv_1 rule contents at the moment of add_node.
-    if dbg_add_node_serv1() {
-        let nm = crate::constraint::solver::reduction::rule_case_name(rule);
-        if nm == "Serv_1" {
-            eprintln!("[add_node_serv1] adding Serv_1 at {}.{}", id.name, id.idx);
-            for (i, p) in rule.premises.iter().enumerate() {
-                eprintln!("[add_node_serv1]   prem[{}]: {:?}", i,
-                    format!("{:?}", p).chars().take(400).collect::<String>());
-            }
-            for (i, c) in rule.conclusions.iter().enumerate() {
-                eprintln!("[add_node_serv1]   conc[{}]: {:?}", i,
-                    format!("{:?}", c).chars().take(400).collect::<String>());
-            }
-        }
-    }
-    // DIAGNOSTIC: trace every node addition with its id+rule_name.
-    // Captures both pre-saturation (precompute) and runtime grafts.
-    if dbg_trace_add_node() {
-        let rule_name = crate::constraint::solver::reduction::rule_case_name(rule);
-        // Also dump prem[1] term if id is j:N (R_1/I_1 candidates).
-        if &*id.name == "j" {
-            let prem1 = rule.premises.get(1)
-                .and_then(|p| p.terms.first())
-                .map(|t| format!("{:?}", t).chars().take(120).collect::<String>())
-                .unwrap_or_default();
-            let prem0 = rule.premises.first()
-                .and_then(|p| p.terms.first())
-                .map(|t| format!("{:?}", t).chars().take(80).collect::<String>())
-                .unwrap_or_default();
-            eprintln!("[ADD_NODE_J] id={}:{} rule={} prem[0]={} prem[1]={}",
-                id.name, id.idx, rule_name, prem0, prem1);
-        } else {
-            eprintln!("[ADD_NODE] id={:?}:{} rule={}", id.name, id.idx, rule_name);
-        }
-    }
-    // DIAGNOSTIC: TAM_DBG_PANIC_ANY_IDX0_NODE — panic on ANY node added
-    // with id idx 0 (excluding the very first node, which is legitimate).
-    // Used to find the source of the idx-0 leak.  Set
-    // TAM_DBG_PANIC_ANY_IDX0_NODE=1 to enable.
-    if dbg_panic_any_idx0_node() && id.idx == 0 {
-        let rule_name = crate::constraint::solver::reduction::rule_case_name(rule);
-        panic!("[TAM_DBG_PANIC_ANY_IDX0_NODE] add_node at idx 0: id={:?} rule={}",
-            id, rule_name);
-    }
 }
 
 impl System {
@@ -639,11 +520,6 @@ impl System {
     /// Insert a new node into the sequent. Replaces an existing entry
     /// for the same id.
     pub fn add_node(&mut self, id: NodeId, rule: RuleACInst) {
-        // Env-gated diagnostics (all flags off in production) live in a
-        // single `#[cold]` helper to keep this hot insertion path lean.
-        if dbg_add_node_any_enabled() {
-            add_node_diagnostics(&id, &rule);
-        }
         let pos = self.nodes.iter().position(|(k, _)| k == &id);
         if let Some(i) = pos {
             self.invalidate_max_var_idx_cache();
@@ -688,31 +564,23 @@ impl System {
         }
     }
 
-    /// `alwaysBefore i j`: True iff `i < j` in every model of the system.
-    /// Mirrors Haskell's `Theory.Constraint.System.alwaysBefore`. Computed
-    /// as transitive reachability over
+    /// Build the `alwaysBefore` adjacency map (`rawLessRel`) underpinning
+    /// `alwaysBefore i j` ("True iff `i < j` in every model of the
+    /// system"), mirroring Haskell's `Theory.Constraint.System.alwaysBefore`.
+    /// `alwaysBefore` is transitive reachability over
     ///   `rawLessRel = sLessAtoms ++ rawEdgeRel`
     /// where
-    ///   `rawEdgeRel = sEdges ++ unsolvedChains` (`System.hs:1613-1616`).
+    ///   `rawEdgeRel = sEdges ++ unsolvedChains` (`System.hs`).
     /// **Unsolved chain goals contribute (c.0, p.0) to the less-relation
     /// too** — HS treats an open chain as an implicit edge for purposes
     /// of cycle detection and ordering inference. Without this, RS's
     /// `cyclic` and `has_forbidden_chain` miss contradictions HS catches
     /// (root cause of the StatVerif KU(pcs) over-saturation).
-    pub fn always_before(&self, i: &NodeId, j: &NodeId) -> bool {
-        // Build the adjacency once and query it once; this keeps the old
-        // per-call path provably identical to the hoisted callers that
-        // call `build_always_before_adj` / `always_before_with`.
-        let adj = self.build_always_before_adj();
-        self.always_before_with(&adj, i, j)
-    }
-
-    /// Build the `alwaysBefore` adjacency map (`rawLessRel`) from
-    /// `sLessAtoms ++ sEdges ++ unsolvedChains`. This is exactly the map
-    /// that `always_before` constructs per call; hoist it out of loops via
-    /// [`always_before_with`] so the relation is built once per pass and
-    /// queried many times. The relation depends only on `&self`, never on
-    /// the `i`/`j` query arguments.
+    ///
+    /// Hoist this build out of loops via [`always_before_with`] so the
+    /// relation is built once per pass and queried many times. The
+    /// relation depends only on `&self`, never on the `i`/`j` query
+    /// arguments.
     pub fn build_always_before_adj(&self) -> PrebuiltAdj {
         let mut adj: std::collections::BTreeMap<NodeId, Vec<NodeId>>
             = std::collections::BTreeMap::new();
@@ -723,7 +591,7 @@ impl System {
             adj.entry(e.src.0.clone()).or_default().push(e.tgt.0.clone());
         }
         // HS-faithful `unsolvedChains` contribution to rawEdgeRel
-        // (`System.hs:1613-1616`).
+        // (`System.hs`).
         for (g, st) in self.goals.iter() {
             if st.solved { continue; }
             if let crate::constraint::constraints::Goal::Chain(c, p) = g {
@@ -735,8 +603,8 @@ impl System {
 
     /// `alwaysBefore i j` against a prebuilt adjacency map (see
     /// [`build_always_before_adj`](Self::build_always_before_adj)). The BFS
-    /// is byte-for-byte the one in the original per-call `always_before`,
-    /// so hoisting the adjacency build is a pure refactor.
+    /// reachability over `rawLessRel` is the `alwaysBefore` query itself;
+    /// hoisting the adjacency build out is a pure refactor.
     pub fn always_before_with(&self, adj: &PrebuiltAdj, i: &NodeId, j: &NodeId) -> bool {
         // DELIBERATE deviation from HS `alwaysBefore`: HS's
         // `reachableSet [i] lessRel` seeds the visited set with `i`
@@ -830,10 +698,6 @@ pub fn formula_to_system(
         TraceQuantifier::ExistsTrace => fm.clone(),
         TraceQuantifier::AllTraces => gnot(fm),
     };
-    if tamarin_utils::env_gate!("TAM_DBG_FORMULA_TO_SYS") {
-        eprintln!("[formula_to_system] tq={:?} fm = {:?}", trace_quantifier, fm);
-        eprintln!("[formula_to_system] tq={:?} gf1 = {:?}", trace_quantifier, gf1);
-    }
     // Conjoin non-safety restrictions.
     let mut conj_items = vec![gf1];
     conj_items.extend(other_restrictions);
@@ -856,7 +720,6 @@ mod tests {
         assert!(s.nodes.is_empty());
         assert!(s.edges.is_empty());
         assert!(s.goals.is_empty());
-        assert_eq!(s.next_split, 0);
     }
 
     #[test]

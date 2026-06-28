@@ -93,8 +93,8 @@ pub fn lift_one_rule(
     predicates: &[p::Predicate],
 ) -> Result<(Vec<p::Restriction>, p::Rule), ExpandError> {
     let rname = rule.name.clone();
-    // HS applies the `let` block to (ps, as, cs, rs) at parse time
-    // (Rule.hs:131) BEFORE `liftedAddProtoRule` runs.  Mirror by desugaring
+    // HS applies the `let` block to (ps, as, cs, rs) at parse time, in the
+    // parser around `liftedAddProtoRule`, BEFORE that runs.  Mirror by desugaring
     // the let block here, so the abstracted restriction terms (and the
     // appended action terms, which join the rule body) carry the let
     // expansion exactly once.  `apply_let_block` returns the rule with an
@@ -439,11 +439,11 @@ fn var_key(v: &p::VarSpec) -> (String, u64) {
     (v.name.clone(), v.idx)
 }
 
-/// NOTE: unlike HS `freesList` (LTerm.hs:579-580 = `D.toList . freesDList`)
+/// NOTE: unlike HS `freesList` (LTerm.hs = `D.toList . freesDList`)
 /// which KEEPS duplicates, this dedups by first appearance via `dedup_first`.
 /// Safe only because every caller passes a post-`rewrite` formula where each
 /// free var is a unique fresh var, so the dedup is a no-op. (HS's sorted-dedup
-/// variant `frees` is at LTerm.hs:584-585.)
+/// variant `frees` is also in LTerm.hs.)
 fn frees_list(f: &p::Formula) -> Vec<p::VarSpec> {
     let mut out: Vec<p::VarSpec> = Vec::new();
     let mut bound: Vec<VarKey> = Vec::new();

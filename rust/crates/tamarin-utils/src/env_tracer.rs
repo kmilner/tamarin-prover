@@ -3,6 +3,9 @@
 //! `DEBUG_TRACE=foo,bar tamarin-prover ...` enables traces tagged with
 //! either `foo` or `bar`. Output goes to stderr (the original calls
 //! `Debug.Trace.trace`, which does the same).
+//!
+//! Retained as a faithful mirror of the upstream Haskell module; the
+//! prover does not currently route any traces through it.
 
 use std::env;
 

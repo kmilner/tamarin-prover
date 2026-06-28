@@ -13,9 +13,9 @@
 //! shrinkage at each `NilAbove` (HS `get1` line 1011 of pretty-1.1.3.6:
 //! `get1 w sl (NilAbove p) = nilAbove_ (get (w - sl) p)`).
 //!
-//! Defaults: `lineLength = 110` (HS src/Main/Console.hs:236),
-//! `ribbonsPerLine = 1.5` (HS HughesPJ.hs:940), giving
-//! `ribbon = round(110/1.5) = 73` (HS HughesPJ.hs:1010).
+//! Defaults: `lineWidth = 110` (HS src/Main/Console.hs), threaded into
+//! HughesPJ's `lineLength` field, `ribbonsPerLine = 1.5` (HS HughesPJ.hs),
+//! giving `ribbon = round(110/1.5) = 73` (HS HughesPJ.hs).
 //!
 //! Subset choice: we omit `Above`/`Beside` lazy constructors and the
 //! `g` (with-space) tracking around fillNB's special "Empty after
@@ -25,10 +25,11 @@
 
 use std::rc::Rc;
 
-/// HS `lineLength` from `src/Main/Console.hs:236`.
+/// HS `lineWidth` from `src/Main/Console.hs`, threaded into HughesPJ's
+/// `lineLength` field.
 pub const LINE_LENGTH: usize = 110;
 /// HS `ribbonLen = round(lineLength / ribbonsPerLine)` =
-/// `round(110/1.5) = 73` (`pretty-1.1.3.6/Text/PrettyPrint/HughesPJ.hs:1010`).
+/// `round(110/1.5) = 73` (`pretty-1.1.3.6/Text/PrettyPrint/HughesPJ.hs`).
 pub const RIBBON: usize = 73;
 
 // ============================================================================
@@ -198,14 +199,6 @@ impl Doc {
         self.render_with(LINE_LENGTH, RIBBON)
     }
 
-    /// Debug: pretty-print the (pre-render) Doc tree structure.
-    #[allow(dead_code)]
-    pub fn dbg_tree(&self) -> String {
-        let mut s = String::new();
-        dbg_node(self, 0, &mut s);
-        s
-    }
-
     pub fn render_with(self, line_length: usize, ribbon: usize) -> String {
         let reduced = reduce_doc(self);
         let r = ribbon as isize;
@@ -213,14 +206,6 @@ impl Doc {
         let mut out = String::new();
         lay(0, &best, &mut out);
         out
-    }
-
-    /// Debug: dump the post-`get` (chosen-layout) reduced tree.
-    #[allow(dead_code)]
-    pub fn dbg_reduced(self, line_length: usize, ribbon: usize) -> String {
-        let reduced = reduce_doc(self);
-        let best = get_doc(line_length as isize, ribbon as isize, &reduced);
-        best.dbg_tree()
     }
 
     /// Render assuming `sl_initial` chars have already been emitted on
@@ -243,21 +228,6 @@ impl Doc {
 // ============================================================================
 // Smart constructors (internal)
 // ============================================================================
-
-#[allow(dead_code)]
-fn dbg_node(d: &Doc, depth: usize, out: &mut String) {
-    let pad = "  ".repeat(depth);
-    match d {
-        Doc::Empty => out.push_str(&format!("{}Empty\n", pad)),
-        Doc::NoDoc => out.push_str(&format!("{}NoDoc\n", pad)),
-        Doc::NilAbove(p) => { out.push_str(&format!("{}NilAbove\n", pad)); dbg_node(p, depth+1, out); }
-        Doc::TextBeside(s, w, p) => { out.push_str(&format!("{}Text({:?},{})\n", pad, s, w)); dbg_node(p, depth+1, out); }
-        Doc::Nest(k, p) => { out.push_str(&format!("{}Nest({})\n", pad, k)); dbg_node(p, depth+1, out); }
-        Doc::Union(a, b) => { out.push_str(&format!("{}Union\n", pad)); dbg_node(a, depth+1, out); dbg_node(b, depth+1, out); }
-        Doc::LazyUnion(a, _) => { out.push_str(&format!("{}LazyUnion(unforced)\n", pad)); dbg_node(a, depth+1, out); }
-        Doc::Deferred(_) => out.push_str(&format!("{}Deferred(unforced)\n", pad)),
-    }
-}
 
 fn rc(d: Doc) -> Rc<Doc> { Rc::new(d) }
 
@@ -922,14 +892,9 @@ mod tests {
         // after the outermost sep wraps to vertical, the inner sep
         // gets `w` shrunk by `sl` (col where prior text started) and
         // should wrap too.
-        let eq = |s: &str| Doc::text(format!("({s})"));
         let conn = |l: Doc, r: Doc| {
             sep(vec![l.beside_sp(Doc::text("\u{2227}")), r])
         };
-        // ((((A ∧ B) ∧ C) ∧ D) ∧ E)
-        let inner = conn(eq("p1=p2"), eq("p3=p4"));
-        let inner = conn(eq(""), inner);  // not used; for shape
-        let _ = inner;
         // Simpler test: sep deep nesting at width 40 should wrap.
         let mut d = Doc::text("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");  // 36 chars
         for _ in 0..3 {
@@ -1039,7 +1004,6 @@ mod tests {
         let outer = sep(vec![quant, inner]);
         // At width 10, both seps wrap.
         let out = outer.render_with(10, 10);
-        println!("nested_sep_indent_alignment: {out:?}");
         // We want HS-like alignment:
         // "Q.\n DANTE\nc\n DSUCC"
         assert_eq!(out, "Q.\n DANTE\nc\n DSUCC");

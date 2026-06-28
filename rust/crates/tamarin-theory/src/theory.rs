@@ -87,7 +87,8 @@ use crate::signature::SignaturePure;
 
 /// Lightweight placeholder for `Theory.Sapic.ProcessDef`, populated
 /// by the SAPIC translation pass. We carry just enough to round-trip
-/// through pretty-printing.
+/// through pretty-printing. Backs the not-yet-produced
+/// `TranslationElement::ProcessDef` variant — kept for the HS port.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProcessDef {
     pub name: String,
@@ -96,7 +97,8 @@ pub struct ProcessDef {
 }
 
 /// Lightweight placeholder for `Theory.Sapic.SapicFunSym` —
-/// `((NoEqSym), [SapicType], SapicType)`.
+/// `((NoEqSym), [SapicType], SapicType)`. Backs the not-yet-produced
+/// `TranslationElement::FunctionTypingInfo` variant — kept for the HS port.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SapicFunSym {
     pub sym: tamarin_term::function_symbols::NoEqSym,
@@ -117,6 +119,12 @@ pub type ConfigBlock = String;
 /// `TranslationElement` — items produced during SAPIC / accountability
 /// translation that aren't first-class top-level constructs in the
 /// surface syntax.
+///
+/// Mirrors the full HS `TranslationElement` surface. Only
+/// `SignatureBuiltin`, `AccLemma`, `CaseTest`, and `ExportInfo` are
+/// currently produced by elaboration; the remaining variants
+/// (`Process`, `ProcessDef`, `FunctionTypingInfo`, `DiffEquivLemma`,
+/// `EquivLemma`) are not yet produced — kept for the faithful HS port.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TranslationElement {
     Process(PlainProcess),
@@ -165,6 +173,9 @@ pub struct Lemma<P = ProofSkeleton> {
     pub proof: P,
 }
 
+// Not yet ported: diff theories (needs `ClosedDiffTheory`). `DiffLemma`,
+// `DiffTheoryItem`, `Side`, and `DiffTheory` below model the HS diff-theory
+// surface but are not yet produced by elaboration or consumed by the prover.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiffLemma<P = ProofSkeleton> {
     pub name: String,
@@ -297,6 +308,9 @@ impl<R, P, S> Theory<R, P, S> {
         }
     }
 
+    /// Builder helper to append an item. Currently no callers inside the
+    /// port (elaboration pushes to `items` directly); retained as public
+    /// builder API.
     pub fn add_item(&mut self, item: TheoryItem<R, P, S>) -> &mut Self {
         self.items.push(item);
         self

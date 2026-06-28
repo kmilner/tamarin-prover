@@ -1,4 +1,4 @@
-//! Process-call inlining (Phase 5).
+//! Process-call inlining.
 //!
 //! HS inlines process definitions at PARSE TIME: when the parser
 //! (`actionprocess`, `Theory/Text/Parser/Sapic.hs:293-312`) reads an identifier
@@ -20,7 +20,8 @@
 //! the theory AST.  [`convert_process_with_defs`] resolves every `Call` against
 //! the collected `ProcessDef`s and substitutes the parameters.
 //!
-//! The `extend_sup` "type-erasure doubling" of `Sapic.hs:299-306` is mirrored:
+//! The `extend_sup` "type-erasure doubling" of
+//! `Theory/Text/Parser/Sapic.hs:299-306` is mirrored:
 //! a typed formal `x:ty` produces TWO substitution entries (typed AND untyped
 //! keyed) to the same argument, so body occurrences of either form are hit.
 
@@ -90,7 +91,7 @@ pub fn convert_process_with_defs(
 }
 
 /// Inline one `P(args)` call (HS `actionprocess` identifier branch,
-/// `Sapic.hs:293-312`).
+/// `Theory/Text/Parser/Sapic.hs:293-312`).
 fn inline_call(
     name: &str,
     args: &[p::Term],
@@ -98,7 +99,8 @@ fn inline_call(
 ) -> Result<PlainProcess, ConvertError> {
     use tamarin_theory::sapic::ProcessParsedAnnotation;
 
-    // `checkProcess` (Sapic.hs:314-317): fail if the process is undefined.
+    // `checkProcess` (Theory/Text/Parser/Sapic.hs:314-317): fail if the
+    // process is undefined.
     let def = defs.get(name).ok_or_else(|| {
         ConvertError::new(format!("process not defined: {name}"))
     })?;
@@ -128,8 +130,8 @@ fn inline_call(
     let body = convert_process_with_defs(&def.body, defs)?;
 
     // Build the parameter substitution with HS's `extend_sup` type-erasure
-    // doubling (Sapic.hs:299-306): a typed formal contributes both its typed
-    // and untyped keys mapping to the argument.
+    // doubling (Theory/Text/Parser/Sapic.hs:299-306): a typed formal
+    // contributes both its typed and untyped keys mapping to the argument.
     let mut pairs: Vec<(SapicLVar, SapicTerm)> = Vec::new();
     for (param, arg) in params.iter().zip(sapic_args.iter()) {
         pairs.push((param.clone(), arg.clone()));
@@ -148,7 +150,8 @@ fn inline_call(
     name_ann.process_names = vec![name.to_string()];
     let annotated = process_add_annotation(substituted, name_ann);
 
-    // Wrap in the `ProcessCall` marker action (Sapic.hs:308-311).
+    // Wrap in the `ProcessCall` marker action
+    // (Theory/Text/Parser/Sapic.hs:308-311).
     Ok(Process::Action(
         SapicAction::ProcessCall(name.to_string(), sapic_args),
         ProcessParsedAnnotation::empty(),

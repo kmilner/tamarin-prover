@@ -329,7 +329,7 @@ pub fn parse_method(segments: &[String], sys: &tamarin_theory::constraint::syste
 // ---------------------------------------------------------------------
 
 /// Render the proof tree for a lemma as nested HTML — mirrors
-/// Haskell's `prettyProof` / `Web/Hamlet/proof.hamlet`.
+/// Haskell's `prettyProof`.
 pub fn render_proof_tree_html(
     idx: usize,
     lemma: &str,
@@ -410,7 +410,7 @@ pub fn render_sub_proof_snippet(
     out
 }
 
-/// Mirror of Haskell `nonEmptyGraph` (`System.hs:1923-1927`):
+/// Mirror of Haskell `nonEmptyGraph` (`System.hs`):
 ///
 /// ```text
 /// nonEmptyGraph sys = not $

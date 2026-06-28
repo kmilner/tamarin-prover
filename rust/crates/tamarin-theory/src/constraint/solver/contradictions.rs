@@ -6,14 +6,14 @@
 //! consult signature-aware helpers (`nf_via_haskell`,
 //! `irreducible_fun_syms`, `enableDH`).  ForbiddenExp/ForbiddenBP are
 //! gated on `enable_dh`/`enable_bp` inside `contradictions` itself
-//! (matching HS Contradictions.hs:104,106); everything has a faithful
-//! port below.
+//! (matching HS Contradictions.hs `contradictions`); everything has a
+//! faithful port below.
 //!
 //! In addition to the HS-ported conditions, RS emits several RS-only
 //! soundness backstops at the IncompatibleEqs slot
 //! (`has_sort_conflated_lvars`, `has_incompatible_edge_facts`,
 //! `has_fresh_fact_sort_violation`) that have no Haskell counterpart;
-//! see the per-check note near the IncompatibleEqs push (lines ~192-209).
+//! see the per-check note at the IncompatibleEqs push in `contradictions`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -53,31 +53,9 @@ pub enum Contradiction {
     NodeAfterLast(NodeId, NodeId),
 }
 
-/// `TAM_DBG_IMPL` opt-in debug flag, cached so the per-node scans it
-/// guards stay off the solver hot path (mirrors `proof_method::dbg_impl_enabled`).
-#[inline]
-fn dbg_impl_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_DBG_IMPL").is_ok())
-}
-
 /// Collect every contradiction currently witnessed by the system.
 pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> {
     let mut out = Vec::new();
-    if dbg_impl_enabled() {
-        let has_i_1 = sys.nodes.iter().any(|(_, r)|
-            matches!(&r.info, crate::rule::RuleInfo::Proto(p)
-                if matches!(&p.name, crate::rule::ProtoRuleName::Stand(s) if *s == "I_1")));
-        let has_r_1 = sys.nodes.iter().any(|(_, r)|
-            matches!(&r.info, crate::rule::RuleInfo::Proto(p)
-                if matches!(&p.name, crate::rule::ProtoRuleName::Stand(s) if *s == "R_1")));
-        if has_i_1 && has_r_1 {
-            let has_bot = sys.formulas.iter()
-                .any(|f| matches!(f, crate::guarded::Guarded::Disj(v) if v.is_empty()));
-            eprintln!("[contra] HAS I_1+R_1: formulas.len={} has_bot={}",
-                sys.formulas.len(), has_bot);
-        }
-    }
     // Mirror Haskell's `rawLessRel = sLessAtoms ++ rawEdgeRel` —
     // every graph edge induces a strict ordering src < tgt, and the
     // cyclic check has to fold both relations together.
@@ -85,7 +63,7 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
     // **Apply eq_store subst before cycle detection** (RS-only
     // compensation; NOT a step HS performs inside the cyclic check).
     // HS's `contradictions` calls `D.cyclic $ rawLessRel sys` directly
-    // (Contradictions.hs:94), and `rawLessRel`/`rawEdgeRel`/`nodeConcNode`/
+    // (Contradictions.hs), and `rawLessRel`/`rawEdgeRel`/`nodeConcNode`/
     // `nodePremNode` are pure projections that apply NO eq-store subst
     // (System.hs:1613-1622 `rawEdgeRel`/`rawLessRel`, 923-942
     // `nodePremNode = fst`/`nodeConcNode = fst`; Constraints.hs:133-138
@@ -157,15 +135,15 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
         }
         out.push(Contradiction::Cyclic);
     }
-    // HS-faithful enumeration ORDER (`contradictions`, Contradictions.hs:
-    // 92-113): the returned list's HEAD is the recorded reason, so the push
+    // HS-faithful enumeration ORDER (`contradictions`, Contradictions.hs):
+    // the returned list's HEAD is the recorded reason, so the push
     // order MUST mirror HS's `asum [...]` exactly:
     //   Cyclic, SubtermCyclic, NonNormalTerms, ForbiddenKD, ImpossibleChain,
     //   ForbiddenExp, ForbiddenBP, ForbiddenChain, IncompatibleEqs,
     //   FormulasFalse, then NonInjectiveFactInstance, then NodeAfterLast.
     //
     // RS-only soundness backstops are emitted at the IncompatibleEqs slot
-    // (NOT a port of the `eqsIsFalse` check, HS Contradictions.hs:110): they
+    // (NOT a port of the `eqsIsFalse` check, HS Contradictions.hs): they
     // fire where HS's Maude unifier / `solveFactEqs` would already have
     // pruned the branch at CONSTRUCTION time (sort-aware unification, edge
     // tag-matching) so HS's `contradictions` never sees these systems. See
@@ -180,13 +158,13 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
     if has_forbidden_kd(sys) { out.push(Contradiction::ForbiddenKD); }
     // 5. ImpossibleChain.
     if has_impossible_chain(_ctxt, sys) { out.push(Contradiction::ImpossibleChain); }
-    // 6. ForbiddenExp (Contradictions.hs:147 + 308-335).  Drops Exp-down rule
+    // 6. ForbiddenExp (Contradictions.hs `hasForbiddenExp`).  Drops Exp-down rule
     //    instances whose g is simple, whose MsgVar args are KU-known earlier,
     //    and whose exponent factors are already in the up-premise.  enableDH.
     if _ctxt.maude.maude_sig().enable_dh && has_forbidden_exp(sys) {
         out.push(Contradiction::ForbiddenExp);
     }
-    // 7. ForbiddenBP (Contradictions.hs:149 + 336-420).  Drops Pmult-down /
+    // 7. ForbiddenBP (Contradictions.hs `hasForbiddenBP`).  Drops Pmult-down /
     //    Emap-down rule instances violating BP normal-form (redundant scalars,
     //    simplifiable em-then-exp compositions, Emap tag-order violations).
     //    enableBP.  (Chen_Kudla::key_agreement_reachable relies on this.)
@@ -196,7 +174,7 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
     // 8. ForbiddenChain.
     if has_forbidden_chain(sys) { out.push(Contradiction::ForbiddenChain); }
     // 9. IncompatibleEqs — HS-faithful: `eqsIsFalse sEqStore`
-    //    (Contradictions.hs:110). The three preceding probes are RS-only
+    //    (Contradictions.hs `contradictions`). The three preceding probes are RS-only
     //    soundness backstops, NOT a port of the eqsIsFalse check: each fires
     //    where HS's Maude unifier / `solveFactEqs` would have already pruned
     //    this branch at construction time. The real fix is upstream — make
@@ -217,7 +195,7 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
     // 10. FormulasFalse — `gfalse ∈ sFormulas` (our `Disj([])`).
     if has_false_formula(sys) { out.push(Contradiction::FormulasFalse); }
     // 11. NonInjectiveFactInstance (×n) — BEFORE NodeAfterLast, matching HS's
-    //     list concatenation order (Contradictions.hs:119 then :122).
+    //     list concatenation order in `contradictions` (Contradictions.hs).
     out.extend(non_injective_fact_instances(_ctxt, sys));
     // 12. NodeAfterLast (×n).
     out.extend(node_after_last(sys));
@@ -226,7 +204,7 @@ pub fn contradictions(_ctxt: &ProofContext, sys: &System) -> Vec<Contradiction> 
 
 /// `hasNonNormalTerms` — port of Haskell's
 /// `Theory.Constraint.Solver.Contradictions.hasNonNormalTerms`
-/// (`Contradictions.hs:143-146`).
+/// (`Contradictions.hs`).
 ///
 /// HS spec:
 /// ```haskell
@@ -348,7 +326,7 @@ fn has_subterm_cycle_contra(ctx: &ProofContext, sys: &System) -> bool {
 
 /// `hasImpossibleChain` — port of Haskell's
 /// `Theory.Constraint.Solver.Contradictions.hasImpossibleChain`
-/// (`Contradictions.hs:225`).
+/// (`Contradictions.hs`).
 ///
 /// For every chain goal `(c, p)`:
 ///   - Collect the root symbols reachable from `t_start = c`'s
@@ -362,7 +340,7 @@ fn has_subterm_cycle_contra(ctx: &ProofContext, sys: &System) -> bool {
 ///
 /// The DH/BP-specific cases (FExp/FPMult/FEMap) are handled via
 /// `dh_view` and the `viewTerm2` special-cases in `possible_end_syms`
-/// / `possible_root_syms` (Contradictions.hs:257-279).
+/// / `possible_root_syms` (Contradictions.hs).
 fn has_impossible_chain(ctx: &ProofContext, sys: &System) -> bool {
     use crate::constraint::constraints::Goal;
     use crate::fact::FactTag;
@@ -433,7 +411,7 @@ fn has_impossible_chain(ctx: &ProofContext, sys: &System) -> bool {
 ///
 /// Encoding in Rust: we use a tagged enum-like type expressed as
 /// an `Option<RootSym>` where RootSym has both branches.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq)]
 enum RootSym {
     Sym(tamarin_term::function_symbols::FunSym),
     Sort(tamarin_term::lterm::LSort),
@@ -491,8 +469,8 @@ enum DhView<'a> {
 }
 
 /// `possibleEndSyms`: HS-faithful port using `viewTerm2` to apply DH-
-/// special cases (FExp/FPMult/FEMap).  Mirrors Contradictions.hs:257-266
-/// (defined locally inside `hasImpossibleChain`).
+/// special cases (FExp/FPMult/FEMap).  Mirrors `possibleEndSyms` in
+/// Contradictions.hs (defined locally inside `hasImpossibleChain`).
 fn possible_end_syms(
     t: &tamarin_term::lterm::LNTerm,
 ) -> Option<Vec<RootSym>> {
@@ -542,8 +520,8 @@ fn possible_end_syms(
 }
 
 /// `possibleRootSyms`: HS-faithful port using `viewTerm2` to apply DH-
-/// special cases.  Mirrors Contradictions.hs:268-279 (defined locally
-/// inside `hasImpossibleChain`).  Returns `Some([])`
+/// special cases.  Mirrors `possibleRootSyms` in Contradictions.hs
+/// (defined locally inside `hasImpossibleChain`).  Returns `Some([])`
 /// (no possible decomposition) when the term cannot contain fresh
 /// names or private functions — equivalent to
 /// `isForbiddenDeconstruction`.
@@ -595,7 +573,7 @@ fn possible_root_syms(
 
 /// `hasForbiddenKD` — port of Haskell's
 /// `Theory.Constraint.Solver.Contradictions.hasForbiddenKD`
-/// (`Contradictions.hs:131`).
+/// (`Contradictions.hs`).
 ///
 /// A KD-conclusion `KD(t)` is forbidden if *no instance* of `t`
 /// can ever contain fresh names or private function symbols —
@@ -669,7 +647,7 @@ fn never_contains_fresh_priv(t: &tamarin_term::lterm::LNTerm) -> bool {
 
 /// `hasForbiddenChain` — port of Haskell's
 /// `Theory.Constraint.Solver.Contradictions.hasForbiddenChain`
-/// (`Contradictions.hs:284`).
+/// (`Contradictions.hs`).
 ///
 /// Detects normal-form-violating chains.  A `Chain(c, p)` goal is
 /// forbidden when:
@@ -714,7 +692,7 @@ fn has_forbidden_chain(sys: &System) -> bool {
     // ForbiddenChain check, which means firing on chains where t_start
     // would equal a KU-action term in any branch.  Root cause of
     // StatVerif Resolve2_d_1_check_getmsg_d_0_fst_d_1_check_getmsg
-    // case survival (see [[project-statverif-aborted-contract-reachable]]).
+    // case survival.
     let mut equivalence_classes: tamarin_utils::FastMap<
         tamarin_term::lterm::LVar,
         std::collections::HashSet<tamarin_term::lterm::LVar>> =
@@ -852,7 +830,7 @@ fn has_forbidden_chain(sys: &System) -> bool {
 }
 
 /// HS-faithful port of `hasForbiddenExp`
-/// (`Theory.Constraint.Solver.Contradictions:308-335`).
+/// (`Theory.Constraint.Solver.Contradictions`).
 ///
 /// Detects an `Exp-down` (d_exp) rule instance whose conclusion is
 /// not allowed in a normal dependency graph.
@@ -1064,16 +1042,16 @@ fn has_forbidden_exp(sys: &System) -> bool {
 
 /// `hasForbiddenBP` — port of Haskell's
 /// `Theory.Constraint.Solver.Contradictions.hasForbiddenBP`
-/// (`Contradictions.hs:336-339`).  Gated on `enableBP` at the caller.
+/// (`Contradictions.hs`).  Gated on `enableBP` at the caller.
 ///
 /// Detects three non-normal bilinear-pairing rule instance patterns:
 ///   1. `isForbiddenDPMult`: `Pmult-down` with redundant scalar
-///      (Contradictions.hs:344-369).
+///      (Contradictions.hs `isForbiddenDPMult`).
 ///   2. `isForbiddenDEMap`:  `Emap-down` → `Exp-down` simplifiable
-///      composition (Contradictions.hs:371-396).
+///      composition (Contradictions.hs `isForbiddenDEMap`).
 ///   3. `isForbiddenDEMapOrder`: `Emap-down` premise ordering
 ///      violating tag-priority normal form
-///      (Contradictions.hs:398-420).
+///      (Contradictions.hs `isForbiddenDEMapOrder`).
 ///
 /// First found case suffices to flag the system contradictory.
 ///
@@ -1105,7 +1083,7 @@ fn has_forbidden_bp(sys: &System) -> bool {
     false
 }
 
-/// `isForbiddenDPMult` — Contradictions.hs:344-369.
+/// `isForbiddenDPMult` — Contradictions.hs.
 ///
 /// A `Pmult-down` rule of shape `[KD(pmult(s,p)), KU(b)] → [KD(pmult(c,p))]`
 /// is forbidden when:
@@ -1131,7 +1109,7 @@ fn is_forbidden_d_pmult<I>(ru: &crate::rule::Rule<crate::rule::RuleInfo<I, crate
     if dtc != BpDirTag::Dn { return false; }
     let (c, p_conc) = match bp_view_pmult(conc_term) { Some(x) => x, None => return false };
 
-    // HS `isForbiddenDPMult` (Contradictions.hs:344-355) gates ONLY on the
+    // HS `isForbiddenDPMult` (Contradictions.hs) gates ONLY on the
     // structural shape checked above (`[p1,p2]`/`[conc]`, `(DnK, FPMult _ _)`
     // for p1, `(UpK, b)` for p2, `(DnK, FPMult c p)` for conc) — there is no
     // `isDPMultRule` guard (contrast isForbiddenDEMap/Order which DO guard).
@@ -1139,7 +1117,7 @@ fn is_forbidden_d_pmult<I>(ru: &crate::rule::Rule<crate::rule::RuleInfo<I, crate
     bp_factors_subset(c, b)
 }
 
-/// `isForbiddenDEMap` — Contradictions.hs:371-396.
+/// `isForbiddenDEMap` — Contradictions.hs.
 ///
 /// A `dExp` rule whose first premise's provider is a `dEMap` rule
 /// instance, where the EMap's `[s]P / [r]Q` premises are
@@ -1184,7 +1162,7 @@ fn is_forbidden_d_emap(sys: &System,
     bp_over_complicated(s_sc, p_pt, ke) || bp_over_complicated(r_sc, q_pt, ke)
 }
 
-/// `isForbiddenDEMapOrder` — Contradictions.hs:398-420.
+/// `isForbiddenDEMapOrder` — Contradictions.hs.
 ///
 /// For a `dEMap` rule instance whose conclusion has the canonical
 /// shape `KD(exp(em(p,q), Mult([s,r])))`, find the two protocol
@@ -1354,7 +1332,7 @@ fn bp_factors_subset(c: &tamarin_term::lterm::LNTerm,
     true
 }
 
-/// `overComplicated scalar point ke` — Contradictions.hs:389-396.
+/// `overComplicated scalar point ke` — Contradictions.hs.
 ///   `(niFactors scalar \\ niFactors ke == []) && neverContainsFreshPriv point`
 fn bp_over_complicated(scalar: &tamarin_term::lterm::LNTerm,
                        point: &tamarin_term::lterm::LNTerm,
@@ -1363,7 +1341,7 @@ fn bp_over_complicated(scalar: &tamarin_term::lterm::LNTerm,
 }
 
 /// Direct port of Haskell's `nonInjectiveFactInstances`
-/// (`Theory.Constraint.Solver.Contradictions:186`).
+/// (`Theory.Constraint.Solver.Contradictions`).
 ///
 /// For every edge `(i,_) → (k,_)` whose conclusion fact has an
 /// injective tag and first term `t`, find every reachable node `j`
@@ -1795,7 +1773,7 @@ fn node_after_last(sys: &System) -> Vec<Contradiction> {
 /// returning every subterm that could be non-normal under some
 /// substitution.  Used by `subst_creates_non_normal_terms` below.
 /// Mirrors Haskell's `Contradictions.maybeNonNormalTerms`
-/// (Contradictions.hs:149-155).
+/// (Contradictions.hs).
 pub fn maybe_non_normal_terms(
     sys: &System,
     irreducible: &tamarin_utils::FastSet<tamarin_term::function_symbols::FunSym>,
@@ -1820,7 +1798,7 @@ pub fn maybe_non_normal_terms(
 /// substituted by `fsubst`) creates a non-normal-form term.  Used by
 /// `simp_minimize` to filter SplitG variants that would violate the
 /// nf-respecting trace semantics.  Mirrors Haskell's
-/// `Contradictions.substCreatesNonNormalTerms` (Contradictions.hs:157-164):
+/// `Contradictions.substCreatesNonNormalTerms` (Contradictions.hs):
 ///
 /// ```haskell
 /// substCreatesNonNormalTerms hnd sys fsubst =
@@ -2004,7 +1982,7 @@ mod tests {
 
     /// Two LVars sharing `(name, idx)` but with disjoint sub-sorts
     /// (Pub vs Fresh) must be flagged.  This is the soundness fix for
-    /// the NSLPK3-class false positives — see solver-memory bug #26.
+    /// the NSLPK3-class false positives.
     #[test]
     fn sort_conflated_pub_vs_fresh_detected() {
         use crate::constraint::system::System;
@@ -2076,7 +2054,7 @@ mod tests {
             "Pub vs Msg should NOT be flagged (Msg is join sort)");
     }
 
-    /// `isForbiddenDPMult` (Contradictions.hs:344-355) gates ONLY on the
+    /// `isForbiddenDPMult` (Contradictions.hs) gates ONLY on the
     /// structural shape `[KD(pmult(_,p)), KU(b)] -> [KD(pmult(c,p))]` plus
     /// `neverContainsFreshPriv p && (niFactors c \\ niFactors b == [])` —
     /// there is no `isDPMultRule` rule-name guard. Pin that the Rust port

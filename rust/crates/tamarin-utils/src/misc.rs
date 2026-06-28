@@ -1,7 +1,10 @@
 //! Port of `Utils.Misc` from `lib/utils/src/Utils/Misc.hs`.
 //!
-//! Pure helpers used throughout the prover. Functions named after their
-//! Haskell originals where reasonable; signatures adapted to idiomatic Rust.
+//! Pure helpers named after their Haskell originals where reasonable;
+//! signatures adapted to idiomatic Rust.
+//!
+//! Intentionally retained: faithful `Utils.Misc` mirror. Only `two_partitions`
+//! has a live caller; the rest are kept for completeness of the port.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;

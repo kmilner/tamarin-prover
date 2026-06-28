@@ -147,12 +147,6 @@ fn keep_sys() -> bool {
 }
 
 #[inline]
-fn dbg_expand_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TAM_DBG_EXPAND").is_ok())
-}
-
-#[inline]
 fn disable_parallel_expand() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_PARALLEL_EXPAND").is_ok())
@@ -246,7 +240,7 @@ fn clear_deadline()                     { DEADLINE.with(|d| d.set(None));     }
 ///   3. If `DEPTH_LIMIT_HIT` was set and depth < cap → double and retry.
 ///   4. Else (no Solved found, no depth limit hit) → return.
 ///
-/// **Memoization** (task #287): Haskell's iter-deep gets free
+/// **Memoization**: Haskell's iter-deep gets free
 /// memoization because the proof tree is built lazily — each `prove sys'`
 /// thunk fires once when forced, and re-forcing a thunk returns the
 /// cached value.  Rust has no laziness, so without memoization each
@@ -543,11 +537,6 @@ fn expand_inner(
     deadline: &std::time::Instant,
     depth: usize,
 ) {
-    let dbg_expand = dbg_expand_enabled();
-    if dbg_expand {
-        eprintln!("[expand] enter depth={} budget={} sys.nodes={} goals={}",
-            depth, *budget, node.sys.nodes.len(), node.sys.goals.len());
-    }
     crate::state_trace::emit("expand", None, &node.sys);
     // Rust-only diagnostic [STATE] emission (gated by TAM_RS_TRACE_STATE)
     // placed at every prove entry so Simplify / Induction / Finished
@@ -621,23 +610,10 @@ fn expand_inner(
     //
     // Then `execMethods` filters to those that succeed.
     let candidates = candidate_methods(&node.sys, ctx, depth);
-    if dbg_expand {
-        let names: Vec<String> = candidates.iter().map(|m| format!("{:?}", m).chars().take(180).collect()).collect();
-        eprintln!("[expand] candidates: {:?}", names);
-    }
     let (method, cases) = {
         let mut pick: Option<(ProofMethod, Vec<(String, System)>)> = None;
         for m in candidates {
-            if dbg_expand {
-                let name: String = format!("{:?}", m).chars().take(40).collect();
-                eprintln!("[expand] try method {}", name);
-            }
-            let t0 = std::time::Instant::now();
             let r = exec_proof_method(ctx, &m, &node.sys);
-            if dbg_expand {
-                eprintln!("[expand] method took {:?}, result_kind={}", t0.elapsed(),
-                    if r.is_some() { "Some" } else { "None" });
-            }
             match r {
                 Some(cs) => { pick = Some((m, cs)); break; }
                 None => continue,
@@ -652,9 +628,6 @@ fn expand_inner(
             }
         }
     };
-    if dbg_expand {
-        eprintln!("[expand] picked {} cases", cases.len());
-    }
     node.method = method;
     if cases.is_empty() {
         // An empty case-map after exec normally means contradictory

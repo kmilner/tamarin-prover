@@ -66,7 +66,10 @@ pub struct ServerConfig {
     pub frontend_dist: Option<PathBuf>,
     /// Path to the Maude binary.
     pub maude_path: String,
-    /// Per-lemma proof-search budget passed to `prove_lemma`.
+    /// Proof-search step budget threaded to `prove_lemma` for API
+    /// compatibility. Currently a no-op: the solver bounds search by
+    /// ID-DFS depth + wall-clock deadline (HS-faithful), so this value
+    /// is accepted but ignored.
     pub max_steps: usize,
 }
 

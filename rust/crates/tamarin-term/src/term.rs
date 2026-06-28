@@ -10,6 +10,9 @@ use std::sync::Arc;
 
 /// Diff annotation — whether the left or right interpretation of `diff` is
 /// in scope.
+///
+/// Ported for parity with HS `Term.Term.Raw` `DiffType`; no Rust consumer
+/// yet (diff-mode is not exercised by the port).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DiffType {
     Left,

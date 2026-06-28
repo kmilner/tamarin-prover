@@ -45,6 +45,11 @@ pub fn to_atom<S, T>(a: ProtoAtom<S, T>) -> Atom<T> {
 }
 
 // -- Predicates ---------------------------------------------------------------
+//
+// Kept for parity with the exported API of Haskell's `Theory.Model.Atom`; no
+// current Rust caller exercises these on an `Atom<T>` value (the live
+// `is_action`/`is_eq`/`is_subterm` elsewhere are on `Goal`/`Process`/`Term`,
+// not `Atom`).
 
 impl<T> Atom<T> {
     pub fn is_action(&self) -> bool { matches!(self, ProtoAtom::Action(_, _)) }

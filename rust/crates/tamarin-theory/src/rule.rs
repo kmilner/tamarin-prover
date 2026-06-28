@@ -56,7 +56,8 @@ impl<I> Rule<I> {
 
     /// `compareRulesUpToNewVars`: ordering ignoring `new_vars`.
     /// Retained for port completeness (no current callers).
-    pub fn cmp_up_to_new_vars(&self, other: &Self) -> std::cmp::Ordering
+    #[allow(dead_code)]
+    pub(crate) fn cmp_up_to_new_vars(&self, other: &Self) -> std::cmp::Ordering
     where
         I: Ord,
     {
@@ -157,7 +158,10 @@ pub enum RuleInfo<P, I> {
 }
 
 impl<P, I> RuleInfo<P, I> {
-    pub fn fold<C>(&self, proto: impl FnOnce(&P) -> C, intr: impl FnOnce(&I) -> C) -> C {
+    /// `foldRuleInfo`: case-analyse the two arms.
+    /// Retained for port completeness (no current callers).
+    #[allow(dead_code)]
+    pub(crate) fn fold<C>(&self, proto: impl FnOnce(&P) -> C, intr: impl FnOnce(&I) -> C) -> C {
         match self {
             RuleInfo::Proto(p) => proto(p),
             RuleInfo::Intr(i) => intr(i),
@@ -312,7 +316,8 @@ pub fn rule_ac_intr_to_rule_ac(r: IntrRuleAC) -> RuleAC {
 
 /// Retained for port completeness (no current callers); lifts an
 /// `IntrRuleAC` directly into the `RuleACInst` shape.
-pub fn rule_ac_intr_to_rule_ac_inst(r: IntrRuleAC) -> RuleACInst {
+#[allow(dead_code)]
+pub(crate) fn rule_ac_intr_to_rule_ac_inst(r: IntrRuleAC) -> RuleACInst {
     Rule {
         info: RuleInfo::Intr(r.info),
         premises: r.premises,
@@ -327,7 +332,8 @@ pub fn rule_ac_intr_to_rule_ac_inst(r: IntrRuleAC) -> RuleACInst {
 /// producing a `RuleACInst`. The `variants` and `loop_breakers` are
 /// carried into the inst-info; `variants` is stripped because the
 /// instance form refers to one chosen variant.
-pub fn proto_rule_ac_to_rule_ac_inst(r: ProtoRuleAC) -> RuleACInst {
+#[allow(dead_code)]
+pub(crate) fn proto_rule_ac_to_rule_ac_inst(r: ProtoRuleAC) -> RuleACInst {
     Rule {
         info: RuleInfo::Proto(ProtoRuleACInstInfo {
             name: r.info.name,
@@ -351,7 +357,7 @@ pub fn is_destr_rule_info(info: &IntrRuleACInfo) -> bool {
 /// `isSubtermRule`: True iff the rule is a destruction rule whose
 /// RHS is a true subterm of the LHS, or the IEquality rule.
 /// Mirrors Haskell's `Theory.Model.Rule.isSubtermRule`
-/// (`lib/theory/src/Theory/Model/Rule.hs:728`).
+/// (`lib/theory/src/Theory/Model/Rule.hs`).
 pub fn is_subterm_rule_info(info: &IntrRuleACInfo) -> bool {
     match info {
         IntrRuleACInfo::DestrRule(_, _, subterm, _) => *subterm,
@@ -421,7 +427,9 @@ pub fn is_coerce_rule_inst<I>(rule: &Rule<RuleInfo<I, IntrRuleACInfo>>) -> bool 
 }
 
 /// `isDestrRule`: destruction rule (DestrRule or IEquality).
-pub fn is_destr_rule<I>(rule: &Rule<RuleInfo<I, IntrRuleACInfo>>) -> bool {
+/// Retained for port completeness (no production callers; test-only).
+#[allow(dead_code)]
+pub(crate) fn is_destr_rule<I>(rule: &Rule<RuleInfo<I, IntrRuleACInfo>>) -> bool {
     matches!(&rule.info,
         RuleInfo::Intr(IntrRuleACInfo::DestrRule(_, _, _, _))
         | RuleInfo::Intr(IntrRuleACInfo::IEquality))
@@ -429,7 +437,9 @@ pub fn is_destr_rule<I>(rule: &Rule<RuleInfo<I, IntrRuleACInfo>>) -> bool {
 
 /// `isSubtermRule` for a `Rule` shape — RHS is a true subterm of LHS,
 /// or IEquality. Mirrors Haskell's `Theory.Model.Rule.isSubtermRule`.
-pub fn is_subterm_rule<I>(rule: &Rule<RuleInfo<I, IntrRuleACInfo>>) -> bool {
+/// Retained for port completeness (no current callers).
+#[allow(dead_code)]
+pub(crate) fn is_subterm_rule<I>(rule: &Rule<RuleInfo<I, IntrRuleACInfo>>) -> bool {
     match &rule.info {
         RuleInfo::Intr(info) => is_subterm_rule_info(info),
         _ => false,
@@ -451,7 +461,7 @@ pub fn get_remaining_rule_applications<I>(
 /// DestrRule remaining-applications Int field (the 2nd field of
 /// `DestrRule name n subterm constant`).  Non-destr rules are returned
 /// unchanged.  Mirrors Haskell `setRemainingRuleApplications`
-/// (Theory/Model/Rule.hs:807-811).
+/// (Theory/Model/Rule.hs).
 ///
 /// Used by `solve_chain_goal` EXTEND to decrement the destructor's
 /// remaining budget when chaining into another instance of the same
@@ -474,14 +484,14 @@ pub fn set_remaining_rule_applications<I>(
 /// Get the rule name for `RuleACInst` / `RuleAC` shapes — used to
 /// detect "same-name" rules in `forbiddenEdge`.
 ///
-/// Mirrors Haskell `getRuleName` (Theory/Model/Rule.hs:767-781).  Intr
+/// Mirrors Haskell `getRuleName` (Theory/Model/Rule.hs).  Intr
 /// rules — especially `DestrRule` — MUST return their proper names here;
 /// otherwise the `forbiddenEdge` same-rule loop-breaker
 /// (Goals.hs) never fires for destructors, letting `solveChain`
 /// recurse indefinitely through `d_0_sdec → d_0_sdec → ...` chains that
 /// Haskell prunes after one application (per the DestrRule
 /// remaining-applications counter — `getRemainingRuleApplications` /
-/// `setRemainingRuleApplications`, Rule.hs:801-811).
+/// `setRemainingRuleApplications`, Rule.hs).
 pub fn rule_name_string(
     rule: &RuleACInst,
 ) -> String
@@ -509,7 +519,7 @@ pub fn rule_name_string(
     }
 }
 
-/// Mirror Haskell `prefixIfReserved` (Theory/Model/Rule.hs:1154-1158):
+/// Mirror Haskell `prefixIfReserved` (Theory/Model/Rule.hs):
 /// prefixes the name with `_` if it collides with a reserved rule name
 /// or already starts with `_`.
 pub(crate) fn prefix_if_reserved(s: &str) -> String {
@@ -521,7 +531,7 @@ pub(crate) fn prefix_if_reserved(s: &str) -> String {
     }
 }
 
-/// `reservedRuleNames` from Haskell (Theory/Model/Rule.hs:1161-1162):
+/// `reservedRuleNames` from Haskell (Theory/Model/Rule.hs):
 /// `["Fresh", "irecv", "isend", "coerce", "fresh", "pub", "iequality"]`.
 pub fn reserved_rule_names() -> BTreeSet<&'static str> {
     let mut s = BTreeSet::new();
@@ -726,7 +736,7 @@ mod tests {
     #[test]
     fn reserved_names_include_fresh() {
         let r = reserved_rule_names();
-        // Matches Haskell reservedRuleNames (Rule.hs:1161-1162):
+        // Matches Haskell reservedRuleNames (Rule.hs):
         // ["Fresh", "irecv", "isend", "coerce", "fresh", "pub", "iequality"].
         assert!(r.contains("Fresh"));
         assert!(r.contains("coerce"));

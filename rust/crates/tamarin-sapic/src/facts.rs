@@ -92,7 +92,7 @@ pub enum TransAction {
     /// `NegPredicateA f` (Facts.hs:75): renders `f` with its name prefixed by
     /// `Pred_Not_` (the negative arm of `if t1 = t2`).
     NegPredicateA(LNFact),
-    // --- mutable state (Phase 3, Facts.hs:59-62) ---
+    // --- mutable state (Facts.hs) ---
     /// `IsIn t v` (Facts.hs:220): `IsIn( t, v )` — the lookup-found action.
     IsIn(LNTerm, LVar),
     /// `IsNotSet t` (Facts.hs:221): `IsNotSet( t )` — the lookup-not-found action.
@@ -101,7 +101,7 @@ pub enum TransAction {
     InsertA(LNTerm, LNTerm),
     /// `DeleteA t` (Facts.hs:223): `Delete( t )`.
     DeleteA(LNTerm),
-    // --- locks (Phase 4, Facts.hs:63-67) ---
+    // --- locks (Facts.hs) ---
     /// `LockNamed t v` (Facts.hs:228): `Lock_<idx v>( '<idx v>', v, t )`.
     LockNamed(LNTerm, LVar),
     /// `LockUnnamed t v` (Facts.hs:229): `Lock( '<idx v>', v, t )`.
@@ -346,8 +346,11 @@ pub fn var_mid(p: &ProcessPosition) -> LVar {
     )
 }
 
-/// `isState` (Facts.hs:158-160).
-pub fn is_state(f: &TransFact) -> bool {
+/// `isState` (Facts.hs `isState`).
+// Intentionally retained: faithful HS port; no caller yet (the predicate is
+// inlined as `matches!(.., TransFact::State(..))` at the merge-with-state site).
+#[allow(dead_code)]
+pub(crate) fn is_state(f: &TransFact) -> bool {
     matches!(f, TransFact::State(..))
 }
 
@@ -465,7 +468,10 @@ pub fn color_for_process_name(names: &[String]) -> Rgb {
 }
 
 /// The rendered `color=` hex value for a process-name list.
-pub fn color_hex_for_process_name(names: &[String]) -> String {
+// Test convenience only (no production caller; `to_rule` uses
+// `color_for_process_name` directly and the rule printer renders the hex).
+#[allow(dead_code)]
+pub(crate) fn color_hex_for_process_name(names: &[String]) -> String {
     rgb_to_hex(color_for_process_name(names))
 }
 
@@ -518,14 +524,6 @@ fn role_from_process_name_list(names: &[String]) -> String {
 /// `stripNonAlphanumerical = filter isAlpha` (Facts.hs:401).
 fn strip_non_alphabetic(s: &str) -> String {
     s.chars().filter(|c| c.is_alphabetic()).collect()
-}
-
-/// The `process="..."` attribute value: `prettySapicTopLevel'` of the
-/// subprocess (rendered through the same printer HS uses, ProcessAnnotation
-/// erased to the plain process).
-pub fn process_attr_value<Ann: GoodAnnotation + Clone>(p: &Process<Ann, SapicLVar>) -> String {
-    let plain = to_plain(p);
-    pretty_sapic_top_level(&plain)
 }
 
 /// Erase the rich annotation back to a `PlainProcess` for printing (HS
@@ -644,9 +642,10 @@ mod tests {
 
     #[test]
     fn crc32_known_values() {
-        // CRC32 (the "reflected" 0xEDB88320 polynomial used by HS) of "" is
-        // 0xFFFFFFFF before final-xor; HS does NOT apply the final xor, so for
-        // the empty string `crc32 "" == 0xffffffff`.
+        // CRC32 (HS's non-standard 0xedb88329 variant of the reflected CRC32
+        // polynomial, matching `crc32` above) of "" is 0xFFFFFFFF before
+        // final-xor; HS does NOT apply the final xor, so for the empty string
+        // `crc32 "" == 0xffffffff`.
         assert_eq!(crc32(""), 0xffff_ffff);
     }
 

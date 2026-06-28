@@ -8,8 +8,7 @@
 //! ported as a `monotone: bool` flag rather than an enum: see
 //! `HasFrees::map_free` (`Arbitrary`) and `map_free_monotone` (`Monotone`).
 //!
-//! Not yet ported from this module:
-//! - Pretty-printing instances.
+//! Pretty-printing (`Show LVar` / `Display LNTerm`) is ported in `pretty.rs`.
 //!
 //! (`varOccurences`, `eqModuloFreshnessNoAC`, `someInst`/`renamePrecise`,
 //! and `freshToFreeAvoiding` are ported elsewhere — see `subsumption.rs`,
@@ -113,9 +112,6 @@ pub fn fresh_term<V>(s: impl Into<String>) -> NTerm<V> {
 pub fn pub_term<V>(s: impl Into<String>) -> NTerm<V> {
     const_term(Name::new(NameTag::Pub, s))
 }
-pub fn nat_term<V>(s: impl Into<String>) -> NTerm<V> {
-    const_term(Name::new(NameTag::Nat, s))
-}
 
 pub fn sort_of_name(n: &Name) -> LSort {
     match n.tag {
@@ -208,7 +204,9 @@ pub fn fresh_lvar(
 // Predicates on LNTerm
 // =============================================================================
 
-pub fn sort_of_lit(l: &Lit<Name, LVar>) -> LSort {
+// Intentionally retained: faithful HS port of `sortOfLit` (LTerm.hs); no caller yet.
+#[allow(dead_code)]
+pub(crate) fn sort_of_lit(l: &Lit<Name, LVar>) -> LSort {
     match l {
         Lit::Con(n) => sort_of_name(n),
         Lit::Var(v) => v.sort,
@@ -286,7 +284,11 @@ pub fn flattened_ac_terms<A>(sym: AcSym, t: &Term<A>) -> Vec<&Term<A>> {
 
 /// `freshToConst t`: replace every fresh-sort variable with a fresh-tagged
 /// constant carrying its name and index.
-pub fn fresh_to_const(t: LNTerm) -> LNTerm {
+///
+/// Intentionally retained: faithful HS port of `freshToConst` (LTerm.hs); no
+/// production caller yet (exercised only by the unit test below).
+#[allow(dead_code)]
+pub(crate) fn fresh_to_const(t: LNTerm) -> LNTerm {
     match t {
         Term::Lit(Lit::Var(ref v)) if v.sort == LSort::Fresh => variable_to_const(v),
         Term::Lit(_) => t,
@@ -335,29 +337,29 @@ pub enum BVar<V> {
 impl<V> BVar<V> {
     pub fn is_bound(&self) -> bool { matches!(self, BVar::Bound(_)) }
     pub fn is_free(&self) -> bool { matches!(self, BVar::Free(_)) }
+    /// HS `fromFree` (LTerm.hs): unwrap a free variable, panicking on `Bound`.
     pub fn into_free(self) -> V {
         match self {
             BVar::Free(v) => v,
             BVar::Bound(i) => panic!("into_free: bound variable {}", i),
         }
     }
-    pub fn as_free(&self) -> Option<&V> {
-        match self {
-            BVar::Free(v) => Some(v),
-            _ => None,
-        }
-    }
 }
 
-pub type BLVar = BVar<LVar>;
+pub(crate) type BLVar = BVar<LVar>;
 /// `BLTerm` — `NTerm<BLVar>`.
-pub type BLTerm = NTerm<BLVar>;
+pub(crate) type BLTerm = NTerm<BLVar>;
 
-pub fn free_lnterm(v: LVar) -> BLVar { BVar::Free(v) }
+// Intentionally retained: faithful HS ports of `freeLNTerm`/`freeTerm`
+// (LTerm.hs). Currently unwired — the macro path that consumes them lives in
+// `macro_expand.rs` (reimplemented on the parser AST).
+#[allow(dead_code)]
+pub(crate) fn free_lnterm(v: LVar) -> BLVar { BVar::Free(v) }
 
 /// Convert an `LNTerm` to a term over `BVar<LVar>` — every variable becomes
 /// `Free`.
-pub fn free_term(t: LNTerm) -> BLTerm {
+#[allow(dead_code)]
+pub(crate) fn free_term(t: LNTerm) -> BLTerm {
     match t {
         Term::Lit(Lit::Var(v)) => crate::term::lit(Lit::Var(BVar::Free(v))),
         Term::Lit(Lit::Con(c)) => crate::term::lit(Lit::Con(c)),
@@ -488,6 +490,9 @@ impl HasFreesV for LVar {
     fn map_free_v(self, f: &mut dyn FnMut(LVar) -> LVar) -> Self { f(self) }
 }
 
+// Intentionally retained: faithful HS port of the `HasFrees (BVar v)` instance,
+// so `Lit<C, BVar<LVar>>` is a `HasFrees` leaf. Not yet reached through the
+// trait (formula terms over `BVar<LVar>` are traversed by pattern matching).
 impl HasFreesV for BVar<LVar> {
     fn for_each_free_v(&self, f: &mut dyn FnMut(&LVar)) {
         if let BVar::Free(v) = self { f(v); }
@@ -614,7 +619,11 @@ pub fn rename<T: HasFrees>(t: T, fresh: &mut tamarin_utils::fresh::FastFreshStat
     }
 }
 
-pub fn nat_to_fresh_vars(t: LNTerm) -> LNTerm {
+// Intentionally retained: faithful HS port of `natToFreshVars` (LTerm.hs).
+// Currently unwired — the nat→fresh logic on the parser AST in `deriv_check.rs`
+// supersedes this term-level version (exercised only by the unit test below).
+#[allow(dead_code)]
+pub(crate) fn nat_to_fresh_vars(t: LNTerm) -> LNTerm {
     match t {
         Term::Lit(Lit::Var(LVar { name, sort: LSort::Nat, idx })) => {
             var_term(LVar { name, sort: LSort::Fresh, idx })
@@ -792,8 +801,8 @@ mod tests {
                  contracts are deliberately different.)");
     }
 
-    /// LTerm.hs:51-58: sort prefixes for variable rendering.  These show
-    /// up in the proof skeleton as `~k` / `$A` / `#i` / `%n` and a parse
+    /// LTerm.hs `sortPrefix`: sort prefixes for variable rendering.  These
+    /// show up in the proof skeleton as `~k` / `$A` / `#i` / `%n` and a parse
     /// regression in the renderer would break corpus diffing.
     #[test]
     fn sort_prefixes_match_haskell() {

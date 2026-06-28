@@ -15,6 +15,11 @@
 //!
 //! No production caller exercises this module; kept as parity/API surface
 //! (the runtime expansion path lives in `predicate_expand.rs`).
+//! Intentionally retained: faithful HS port; no caller yet. The
+//! `theory.rs` `TheoryItem::Predicate` arm and `Theory::predicates()`
+//! iterator that type against [`Predicate`] are likewise unused (the
+//! parser carries predicates as the parser-AST `TheoryItem::Predicates`,
+//! which `predicate_expand.rs` consumes directly).
 
 use crate::fact::{Fact, FactTag, Multiplicity};
 use crate::formula::LNFormula;

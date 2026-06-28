@@ -2,8 +2,9 @@
 //!
 //! The pure-state ("state-channel") optimisation.  When enabled via
 //! `options: translation-state-optimisation` (`_stateChannelOpt`,
-//! OpenTheory.hs:547), `annotatePureStates` runs in the SAPIC annotation
-//! pipeline (Sapic.hs:57, gated on `_stateChannelOpt`).  It:
+//! `Items/OptionItem.hs`; parsed as `stateChannelOpt` in
+//! `Theory/Text/Parser/Signature.hs`), `annotatePureStates` runs in the SAPIC
+//! annotation pipeline (Sapic.hs, gated on `_stateChannelOpt`).  It:
 //!
 //!   1. declares a fresh `new StateChannel:channel` cell-handle for every
 //!      state term whose identifier is fully bound by names

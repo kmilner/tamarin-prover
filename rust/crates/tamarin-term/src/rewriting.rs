@@ -2,6 +2,12 @@
 //! `lib/term/src/Term/Rewriting/Definitions.hs`.
 //!
 //! Equalities, matching problems, and rewriting rules.
+//!
+//! Some methods here mirror the Haskell API one-to-one for parity even where
+//! the port does not yet exercise them: `Match::only_if`/`no_match`/`empty`,
+//! the `Match` `append` (the Haskell `Monoid` instance) and `Default`, and
+//! `Equal::eval` have no current production caller. They are intentionally
+//! retained as a faithful port surface.
 
 // -- Equality -----------------------------------------------------------------
 

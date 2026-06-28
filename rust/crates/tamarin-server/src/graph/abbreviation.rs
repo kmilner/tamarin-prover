@@ -33,8 +33,13 @@ pub struct AbbreviationOptions {
     /// Soft cap on the number of abbreviations to generate, unless
     /// a term scores above `always_abbrev_weight`.
     pub abbrevs_soft_limit: usize,
+    /// Terms whose weight is greater than or equal to this always generate an
+    /// abbreviation even when the number of abbreviations exceeds
+    /// `abbrevs_soft_limit`.
     pub always_abbrev_weight: i64,
+    /// The first index to use when generating abbreviations.
     pub first_index: u32,
+    /// The length of an abbreviation prefix.
     pub prefix_length: usize,
 }
 
@@ -58,7 +63,10 @@ impl Default for AbbreviationOptions {
 pub type Abbreviations = BTreeMap<LNTerm, (LNTerm, LNTerm)>;
 
 /// Lookup the abbreviation for a single term.  Mirror of `lookupAbbreviation`.
-pub fn lookup_abbreviation<'a>(
+///
+/// Retained for HS API parity (the live caller in `dot.rs` does the lookup
+/// inline); no cross-crate caller yet.
+pub(crate) fn lookup_abbreviation<'a>(
     abbrevs: &'a Abbreviations,
     t: &LNTerm,
 ) -> Option<&'a LNTerm> {
@@ -365,7 +373,7 @@ fn judge_term(
 
 /// Number of times `needle` appears as a PROPER subterm of `haystack`.
 /// Mirror of `countProperSubterms t (FApp _ ts) = sum $ map (countSubterms t) ts`
-/// (Raw.hs:255-257).
+/// (Raw.hs `countProperSubterms`).
 fn count_proper_subterms(needle: &LNTerm, haystack: &LNTerm) -> i64 {
     match haystack {
         Term::App(_, args) => args.iter().map(|a| count_subterms(needle, a)).sum(),
@@ -374,7 +382,7 @@ fn count_proper_subterms(needle: &LNTerm, haystack: &LNTerm) -> i64 {
 }
 
 /// Mirror of `countSubterms t1 t2 = if t1 == t2 then 1 else countProperSubterms t1 t2`
-/// (Raw.hs:252-253).  Note: when `needle == haystack` it returns 1 and does NOT
+/// (Raw.hs `countSubterms`).  Note: when `needle == haystack` it returns 1 and does NOT
 /// descend further (matches `if ... then 1 else ...`).
 fn count_subterms(needle: &LNTerm, haystack: &LNTerm) -> i64 {
     if needle == haystack {

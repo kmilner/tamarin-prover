@@ -145,19 +145,6 @@ pub fn destruction_rules(
     let pos_iter: Vec<i64> = pos.clone();
     // `rhs` is loop-invariant, so compute `frees(rhs).is_empty()` once.
     let rhs_frees_empty = frees(rhs).is_empty();
-    // Ad-hoc debug tracing, gated behind a once-cached env lookup so the
-    // generation path doesn't `getenv` on every subterm rule.
-    {
-        use std::sync::OnceLock;
-        static DBG_DESTR_POS: OnceLock<bool> = OnceLock::new();
-        let dbg = *DBG_DESTR_POS
-            .get_or_init(|| std::env::var("TAM_RS_DBG_DESTR_POS").is_ok());
-        if dbg {
-            use tamarin_term::pretty::pretty_lnterm;
-            eprintln!("[destr_pos] lhs={} rhs={} pos={:?}",
-                pretty_lnterm(lhs), pretty_lnterm(rhs), pos);
-        }
-    }
     for (step_idx, &i) in pos_iter.iter().enumerate() {
         match &t {
             Term::App(FunSym::NoEq(sym), args) => {
@@ -1090,8 +1077,13 @@ pub fn equal_rule_up_to_renaming(
 // =============================================================================
 /// `normRule'` — normalise every term in an intruder rule via Maude.
 ///
-/// Mirrors HS `normRule'` (IntruderRules.hs:316-321).
-pub fn norm_rule(
+/// Mirrors HS `normRule'` (IntruderRules.hs). Retained as a standalone
+/// reusable mirror of `normRule'`; it is intentionally not on the
+/// `variants_intruder` hot path, which inlines normalisation via
+/// `maude.reduce` rather than going through this function.
+// Intentionally retained: faithful HS port; no caller yet.
+#[allow(dead_code)]
+pub(crate) fn norm_rule(
     maude: &tamarin_term::maude_proc::MaudeHandle,
     ru: &IntrRuleAC,
 ) -> IntrRuleAC {
@@ -1540,7 +1532,7 @@ mod tests {
     //
     //   1. Pattern #1 line 135: at the LAST position step, if the
     //      current term is an FApp AND rhs has free vars, return [].
-    //      (The "skip-last" — task #164 resolved this.)
+    //      (The "skip-last" case.)
     //
     //   2. Private-symbol stop (line 149): descending through a Private
     //      constructor terminates the loop early.

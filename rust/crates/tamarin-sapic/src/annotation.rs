@@ -150,6 +150,8 @@ pub fn to_annotated<V: Clone>(
 }
 
 /// Drop the translation annotations and recover the parsed-stage form.
+// Intentionally retained: faithful HS port of `toProcess`; the symmetric
+// inverse of `to_annotated`, no non-test caller yet.
 pub fn to_parsed<V>(
     p: Process<ProcessAnnotation<V>, SapicLVar>,
 ) -> Process<ProcessParsedAnnotation, SapicLVar> {

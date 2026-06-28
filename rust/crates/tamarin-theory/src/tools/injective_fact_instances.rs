@@ -81,11 +81,11 @@ pub fn combine_behaviour(x: MonotonicBehaviour, y: MonotonicBehaviour) -> Monoto
     }
 }
 
-/// HS `getPairTerms` (InjectiveFactInstances.hs:109-111): flatten ONLY the
+/// HS `getPairTerms` (InjectiveFactInstances.hs): flatten ONLY the
 /// right-hand side of a tuple.
 ///   getPairTerms <t1, t2> = t1 : getPairTerms t2
 ///   getPairTerms t        = [t]
-pub fn get_pair_terms(t: &tamarin_term::lterm::LNTerm) -> Vec<&tamarin_term::lterm::LNTerm> {
+fn get_pair_terms(t: &tamarin_term::lterm::LNTerm) -> Vec<&tamarin_term::lterm::LNTerm> {
     let mut out = Vec::new();
     let mut cur = t;
     loop {

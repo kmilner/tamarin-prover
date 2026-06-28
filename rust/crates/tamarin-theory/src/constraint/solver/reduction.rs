@@ -173,65 +173,6 @@ impl<'ctx> Reduction<'ctx> {
         };
         if added_bot || flipped_eq {
             self.changed = ChangeIndicator::Changed;
-            if tamarin_utils::env_gate!("TAM_TRACE_CONTRADICTION") {
-                let open = self.sys.goals.iter().filter(|(_, st)| !st.solved).count();
-                let bt = std::backtrace::Backtrace::force_capture();
-                let bt_s = format!("{bt}");
-                // Extract first non-mark_contradictory frame for compact view.
-                // Walk a few frames up to find a non-helper caller — skip
-                // mark_contradictory, trace_subpass, and apply_node_eqs
-                // wrappers to surface the real CR-rule that fired.
-                let caller = bt_s.lines()
-                    .filter(|l| l.contains("tamarin_theory") || l.contains("tamarin-theory"))
-                    .filter(|l| !l.contains("mark_contradictory"))
-                    .filter(|l| !l.contains("trace_subpass"))
-                    .filter(|l| !l.contains("apply_node_eqs"))
-                    .filter(|l| !l.contains("while_changing"))
-                    .filter(|l| !l.contains("simp_with_fresh"))
-                    .filter(|l| !l.contains("::Reduction::insert_edge"))
-                    .filter(|l| !l.contains("::Reduction::insert_edge_labeled"))
-                    .nth(0)
-                    .unwrap_or("(no frame)")
-                    .trim();
-                eprintln!(
-                    "[contra] nodes={} edges={} open={} forms={} bot={} eq={} caller={}",
-                    self.sys.nodes.len(),
-                    self.sys.edges.len(),
-                    open,
-                    self.sys.formulas.len(),
-                    added_bot,
-                    flipped_eq,
-                    caller,
-                );
-            }
-            // HS-equivalent compact dump matching [CONTRA-DUMP] format
-            // for one-to-one comparison with HS noContradictoryEqStore.
-            if tamarin_utils::env_gate!("TAM_RS_TRACE_CONTRA_DUMP") {
-                eprintln!(
-                    "[CONTRA-DUMP] label=mark_contradictory nodes={} edges={} formulas={} goals={}",
-                    self.sys.nodes.len(),
-                    self.sys.edges.len(),
-                    self.sys.formulas.len(),
-                    self.sys.goals.len(),
-                );
-            }
-            // Path-aware compact dump — pair with TAM_TRACE_SET_FALSE_FULL.
-            if tamarin_utils::env_gate!("TAM_TRACE_MARK_CONTRA") {
-                let bt = std::backtrace::Backtrace::force_capture();
-                let bt_s = format!("{bt}");
-                let frames: Vec<&str> = bt_s.lines()
-                    .filter(|l| l.contains("tamarin_theory") || l.contains("tamarin-theory"))
-                    .filter(|l| !l.contains("mark_contradictory"))
-                    .filter(|l| !l.contains("trace_subpass"))
-                    .filter(|l| !l.contains("while_changing"))
-                    .filter(|l| !l.contains("simp_with_fresh"))
-                    .take(6)
-                    .map(|s| s.trim())
-                    .collect();
-                let cpath = crate::constraint::solver::trace::case_path_string();
-                eprintln!("[mark_contra] path={} added_bot={} flipped_eq={} frames=[ {} ]",
-                    cpath, added_bot, flipped_eq, frames.join(" | "));
-            }
         }
     }
 
@@ -813,14 +754,11 @@ impl<'ctx> Reduction<'ctx> {
         // KU action goals whose pre-subst term is a msg-var, product,
         // or union AND whose term actually changes via substitution,
         // re-insert via `insert_action`-equivalent so the pair/inv/prod
-        // auto-decomp fires retroactively.  This was task #118/#119:
-        // initially introduced unsoundness on NSPK3/roles via
-        // Maude-witness conflation in chain-saturated graft cases;
-        // the upstream `system_max_idx` was incomplete (didn't walk
-        // goals/formulas/eq_store), allowing freshen_system to assign
-        // colliding idxs across grafted Register_pk instances.  After
-        // fixing system_max_idx, the conflation no longer occurs and
-        // this re-insert path is sound.
+        // auto-decomp fires retroactively.  This re-insert path is sound
+        // only because `system_max_idx` walks goals/formulas/eq_store: an
+        // incomplete max-idx lets `freshen_system` assign colliding idxs
+        // across grafted instances, conflating Maude witnesses in
+        // chain-saturated graft cases.
         let mut to_insert_action: Vec<(crate::constraint::constraints::NodeId,
                                        crate::fact::LNFact,
                                        crate::constraint::system::GoalStatus)>
@@ -986,7 +924,7 @@ impl<'ctx> Reduction<'ctx> {
                 // (UM_three_pass `CK_secure_UM3`).  HS's AC constructors
                 // (`fAppAC`) flatten+sort on construction, so HS never sees the
                 // nested form; mirror that here.  (Tuple pairs are already
-                // canonicalised inside `subst_gterm` via `mk_gpair`.)
+                // canonicalised inside `subst_gterm_cow` via `mk_gpair`.)
                 Some(crate::guarded::canonicalize_ac_in_guarded_cow(&cur).unwrap_or(cur))
             };
             for f in self.sys.formulas.iter_mut() {
@@ -1261,13 +1199,10 @@ impl<'ctx> Reduction<'ctx> {
         // desynchronising RS's gsNr trace from HS's at every
         // destructor-free `labelNodeId` call.
         //
-        // Previously RS called apply_eq_store(maude, empty_subst) here to
-        // drop variants conflicting with the existing free subst (added
-        // for TESLA::authentic — see
-        // [[project-h16-1-variant-orient-hs-faithful]]).  That's
+        // Do NOT call apply_eq_store(maude, empty_subst) here to drop
+        // variants conflicting with the existing free subst: that is
         // HS-unfaithful: HS lets simp's own passes (simp_singleton +
-        // friends) handle the propagation.  Removed 2026-05-28 to restore
-        // HS faithfulness; regressions allowed per project policy.
+        // friends) handle the propagation.
         //
         // simp_abstract_sorted_var (EquationStore.hs:471-504) no-ops on
         // protocol variants until the Maude bridge returns Fresh-sorted
@@ -1390,21 +1325,6 @@ impl<'ctx> Reduction<'ctx> {
     /// `gsLoopBreaker` in the resulting status — used by the smart
     /// ranker to deprioritise premises that would otherwise loop.
     pub fn insert_goal_with_loop_flag(&mut self, g: Goal, looping: bool) {
-        if tamarin_utils::env_gate!("TAM_DBG_PANIC_GOAL_IDX0") {
-            use tamarin_term::lterm::HasFrees;
-            let mut found_idx0: Option<tamarin_term::lterm::LVar> = None;
-            if let Goal::Action(_, fa) = &g { fa.for_each_free(&mut |v| {
-                if v.idx == 0 && matches!(&*v.name,
-                    "ni" | "nr" | "m1" | "m2" | "s" | "R" | "ltkA" | "ltkI")
-                    && found_idx0.is_none() {
-                    found_idx0 = Some(v.clone());
-                }
-            }) }
-            if let Some(v) = found_idx0 {
-                panic!("[TAM_DBG_PANIC_GOAL_IDX0] insert_goal: Goal::Action with idx-0 var {:?} (goal={:?})",
-                    v, g);
-            }
-        }
         // Auto-decompose `KU(pair(a,b))` / `KU(inv(x))` / `KU(prod(...))`
         // into sub-KU goals on the components, each at a fresh
         // pre-ordered node (mirrors Haskell's `insertAction` in
@@ -2116,9 +2036,11 @@ impl<'ctx> Reduction<'ctx> {
 }
 
 /// Helpers matching Haskell's `getProofContext` / `getMaudeHandle`.
+// Intentionally retained: faithful HS port; no caller yet (Rust callers
+// reach the `ctx`/`maude` fields directly).
 impl<'ctx> Reduction<'ctx> {
-    pub fn get_proof_context(&self) -> &ProofContext { self.ctx }
-    pub fn get_maude_handle(&self) -> &tamarin_term::maude_proc::MaudeHandle {
+    pub(crate) fn get_proof_context(&self) -> &ProofContext { self.ctx }
+    pub(crate) fn get_maude_handle(&self) -> &tamarin_term::maude_proc::MaudeHandle {
         &self.maude
     }
 }
@@ -2163,7 +2085,7 @@ impl<'ctx> Reduction<'ctx> {
         // caller location (via #[track_caller]), split strategy,
         // equation count, and the equations.  Pair with HS's
         // TAM_HS_DBG_SOLVE_TERM_EQS for HS↔Rust diffing of the
-        // goal-by-goal solver flow (see [[project-apply-eq-store-divergence]]).
+        // goal-by-goal solver flow.
         if tamarin_utils::env_gate!("TAM_RS_DBG_SOLVE_TERM_EQS") {
             let loc = std::panic::Location::caller();
             let site = format!("{}:{}", loc.file(), loc.line());
@@ -2193,7 +2115,7 @@ impl<'ctx> Reduction<'ctx> {
         // goal vars, formula vars, etc., conflating distinct semantic
         // variables.
         let avoid = bounds_max(&self.sys);
-        // H16.4: set op label so apply_eq_store's [rs-aes-tick] trace
+        // Set op label so apply_eq_store's [rs-aes-tick] trace
         // attributes calls to solveTermEqs (matches HS's
         // `addEqsLabeled "solveTermEqs"` site naming).
         let _op_guard = crate::constraint::solver::trace::OpLabelGuard::new("solveTermEqs");
@@ -3002,14 +2924,6 @@ fn make_fresh_rule(m: tamarin_term::lterm::LNTerm) -> RuleACInst {
         .with_new_vars(vec![m])
 }
 
-/// Convert an eq-store `LSubst` (LVar → LNTerm) into a parser-AST
-/// `VarSubst` keyed by `(name, idx)`.  Used by `subst_system` to push
-/// the eq-store substitution into formulas / solved_formulas /
-/// lemmas — Haskell's `substFormulas` / `substSolvedFormulas` /
-/// `substLemmas`.  Each LVar in the subst's domain maps via its
-/// `(name, idx)` to a parser-AST term obtained from
-/// `lnterm_to_term`.  Only entries that change are recorded
-/// (skipping identity mappings keeps the per-step subst small).
 /// Dedup a Vec in place while preserving the FIRST occurrence's position.
 ///
 /// Mirrors HS's `S.map` behaviour on `Set Guarded` in `substFormulas` /
@@ -3038,6 +2952,14 @@ fn dedup_preserve_order<T: PartialEq>(v: &mut Vec<T>) {
     v.truncate(kept);
 }
 
+/// Convert an eq-store `LSubst` (LVar → LNTerm) into a parser-AST
+/// `VarSubst` keyed by `(name, idx)`.  Used by `subst_system` to push
+/// the eq-store substitution into formulas / solved_formulas /
+/// lemmas — Haskell's `substFormulas` / `substSolvedFormulas` /
+/// `substLemmas`.  Each LVar in the subst's domain maps via its
+/// `(name, idx)` to a parser-AST term obtained from
+/// `lnterm_to_term`.  Only entries that change are recorded
+/// (skipping identity mappings keeps the per-step subst small).
 fn build_parser_subst_from_eq_store(
     subst: &crate::tools::equation_store::LNSubst,
 ) -> crate::guarded::VarSubst {
@@ -3816,7 +3738,7 @@ fn split_subterm_single(
     out
 }
 
-/// Build `closeGuarded Ex [newVar] [EqE l r] gtrue` (HS Goals.hs:426,429).
+/// Build `closeGuarded Ex [newVar] [EqE l r] gtrue` (HS Goals.hs `closeGuarded`).
 /// `newVar` is the single existentially-bound variable; `l`/`r` are the
 /// equation sides (`lTermToBTerm`-lifted to the parser AST, becoming
 /// free then bound by `close_guarded`).
@@ -3875,7 +3797,7 @@ pub enum GoalCases {
 /// conflation across chain-saturated cases.  Detecting it lets the
 /// caller skip the conflated case so the search doesn't close a
 /// branch as Cyclic on the spurious shared-fresh ordering and roll
-/// up to Verified.  Task #119.
+/// up to Verified.
 fn has_fresh_consumer_conflation(
     sys: &crate::constraint::system::System,
     maude: &tamarin_term::maude_proc::MaudeHandle,
@@ -3970,12 +3892,6 @@ pub fn default_case_name(i: usize) -> String {
     format!("case_{}", i + 1)
 }
 
-/// Derive a Haskell-style case name for a rule-instantiation case.
-/// Matches `Theory.Constraint.Solver.Reduction.casName` conventions:
-/// protocol rules use their declared name, intruder constructors use
-/// `c_<head>`, destructors use `d_<head>`, fresh-construction uses
-/// `fresh`, coercion uses `coerce`, IRecv/ISend use their internal
-/// names.
 /// Haskell-faithful direct-close case name for a chain.  Mirrors
 /// Haskell `caseName mPrem` (Goals.hs) where `mPrem` is the
 /// chain conc's KD term:
@@ -4107,6 +4023,12 @@ fn emit_dead_rule_premise_traces(rule: &crate::rule::RuleACInst) {
     }
 }
 
+/// Derive a Haskell-style case name for a rule-instantiation case.
+/// Matches `Theory.Constraint.Solver.Reduction.casName` conventions:
+/// protocol rules use their declared name, intruder constructors use
+/// `c_<head>`, destructors use `d_<head>`, fresh-construction uses
+/// `fresh`, coercion uses `coerce`, IRecv/ISend use their internal
+/// names.
 pub fn rule_case_name(rule: &crate::rule::RuleACInst) -> String {
     use crate::rule::{IntrRuleACInfo, ProtoRuleName, RuleInfo};
     match &rule.info {
@@ -4117,7 +4039,7 @@ pub fn rule_case_name(rule: &crate::rule::RuleACInst) -> String {
         RuleInfo::Intr(i) => match i {
             IntrRuleACInfo::ConstrRule(name) => {
                 // The constructor's stored name carries a leading
-                // underscore (see `intruder_rules.rs:277`); strip it
+                // underscore (see `intruder_rules.rs`); strip it
                 // here so the case label matches Haskell's printer:
                 // `c_h` not `c__h`.
                 let s = String::from_utf8_lossy(name);
@@ -4167,7 +4089,7 @@ pub fn rule_case_name(rule: &crate::rule::RuleACInst) -> String {
 ///   StandRule s    → s   (no prefixIfReserved — that's the pretty path)
 ///
 /// The `x` for Constr/Destr is stored with HS's leading underscore
-/// (see `intruder_rules.rs:402`), so `ConstrRule(b"_fst")` yields
+/// (see `intruder_rules.rs`), so `ConstrRule(b"_fst")` yields
 /// `c` + `_fst` = `c_fst` and `prefixIfReserved` leaves it as-is.
 pub fn rule_trace_name(rule: &crate::rule::RuleACInst) -> String {
     use crate::rule::{IntrRuleACInfo, ProtoRuleName, RuleInfo};
@@ -4207,7 +4129,7 @@ impl<'ctx> Reduction<'ctx> {
     /// formula. The empty disjunction is `False` → `Contradictory`.
     /// A singleton disjunction continues linearly (mutating `self.sys`
     /// in place) but still carries the case name `case_1`: Haskell
-    /// `solveDisjunction` (Goals.hs:393-397) has no singleton special
+    /// `solveDisjunction` (Goals.hs) has no singleton special
     /// case — `disjunctionOfList $ zip [1..] $ getDisj disj` returns
     /// `"case_" ++ show i`, so a lone alternative is `case_1`, and
     /// `ppCases` (Proof.hs:1064-1075) only elides the heading for the
@@ -4220,21 +4142,6 @@ impl<'ctx> Reduction<'ctx> {
     pub fn solve_disj_goal(&mut self, disj: &Disj<Guarded>) -> GoalCases {
         let g = Goal::Disj(disj.clone());
         let alts = &disj.0;
-        if std::env::var("TAM_RS_DBG_DISJ_SPLIT").as_deref() == Ok("1") {
-            eprintln!("[DISJ_SPLIT] n_alts={}", alts.len());
-            for (i, a) in alts.iter().enumerate() {
-                eprintln!("  alt {}: {:?}", i + 1, a);
-            }
-            eprintln!("[DISJ_SPLIT] last_atom={:?}, n_nodes={}, n_less_atoms={}",
-                self.sys.last_atom, self.sys.nodes.len(), self.sys.less_atoms.len());
-            for la in &self.sys.less_atoms {
-                eprintln!("  less: {:?} < {:?}", la.smaller, la.larger);
-            }
-            eprintln!("[DISJ_SPLIT] node ids:");
-            for (id, _) in self.sys.nodes.iter() {
-                eprintln!("  node: {:?}", id);
-            }
-        }
         match alts.len() {
             0 => GoalCases::Contradictory,
             1 => {
@@ -4533,20 +4440,6 @@ impl<'ctx> Reduction<'ctx> {
         fa: &crate::fact::LNFact,
     ) {
         let m = match fa.terms.first() { Some(t) => t.clone(), None => return };
-        if tamarin_utils::env_gate!("TAM_DBG_ISEND_M") {
-            use tamarin_term::lterm::HasFrees;
-            let mut has_idx0 = false;
-            m.for_each_free(&mut |v| {
-                if v.idx == 0 && matches!(&*v.name,
-                    "ni" | "nr" | "m1" | "m2" | "s" | "R" | "ltkA" | "ltkI")
-                { has_idx0 = true; }
-            });
-            if has_idx0 {
-                eprintln!("[ISEND_M_IDX0] parent_node={:?}:{} prem_idx={:?} m={:?}",
-                    i.name, i.idx, idx,
-                    format!("{:?}", m).chars().take(200).collect::<String>());
-            }
-        }
         let next = self.next_fresh_node_idx();
         let j = tamarin_term::lterm::LVar::new(
             "vf", tamarin_term::lterm::LSort::Node, next);
@@ -4581,8 +4474,8 @@ impl<'ctx> Reduction<'ctx> {
         // left grafted ISend nodes with un-tracked KU premises, so the
         // runtime search marked leaves Solved while the encrypted-
         // message construction was actually un-proven (root cause of
-        // the NSLPK3-class `[sources]`-typing FPs; see solver-memory
-        // bug #27).  The goal is just a goal at precompute time — it
+        // the NSLPK3-class `[sources]`-typing FPs).  The goal is just a
+        // goal at precompute time — it
         // doesn't recursively expand within the precompute call.
         let ku = crate::fact::ku_fact(m);
         self.add_ku_action_before(&j, &ku);
@@ -4645,7 +4538,7 @@ impl<'ctx> Reduction<'ctx> {
         i: &crate::constraint::constraints::NodeId,
         fa: &crate::fact::LNFact,
     ) -> GoalCases {
-        // H16.4: tag apply_eq_store calls during KU action solving
+        // Tag apply_eq_store calls during KU action solving
         // with `ENU.kuActions` for KU facts, matching HS's site
         // naming (ENU = enforceUniqueKuFact).
         let label = if matches!(fa.tag, crate::fact::FactTag::Ku) {
@@ -4686,16 +4579,12 @@ impl<'ctx> Reduction<'ctx> {
                 // `fa` is already among `rActs ru` — the case-name
                 // emission is unconditional.
                 //
-                // Previously RS short-circuited to `GoalCases::Linear`
-                // here, which the proof-method printer renders as a
-                // bare `solve` with NO `case <rule>` child.  HS renders
-                // the same situation as `case <rule_name>` followed by
-                // SOLVED (or the next step).  Manifested on Yubikey's
-                // Login_reachable as RS skipping two `case c_S` steps
-                // for vk.0 = c_S(KU(S(myzero))) and vk.2 = c_S(KU(S(S(myzero))))
-                // — both nodes existed with the exact KU action present,
-                // so RS hit this short-circuit; HS emits `case c_S`
-                // both times.
+                // Do NOT short-circuit to `GoalCases::Linear` here: the
+                // proof-method printer renders that as a bare `solve` with
+                // NO `case <rule>` child, whereas HS renders this situation
+                // as `case <rule_name>` followed by SOLVED (or the next
+                // step).  Emit `LinearNamed(rule_name)` so the proof
+                // skeleton matches.
                 let rule_name = rule_case_name(&ru);
                 if ru.actions.contains(fa) {
                     self.mark_goal_as_solved(&g);
@@ -4762,10 +4651,9 @@ impl<'ctx> Reduction<'ctx> {
                 // entire sub-system (nodes/edges/goals) into the live
                 // system.
                 //
-                // Empirical verification (May 22 sess 14): removing
-                // this path entirely (pure labelNodeId rule enumeration)
-                // regresses corpus 97/117 → 42/94 with 23 timeouts.
-                // Source-cases are the equivalent of HS's
+                // Do NOT remove this path in favour of pure labelNodeId
+                // rule enumeration: it regresses the corpus with many
+                // timeouts.  Source-cases are the equivalent of HS's
                 // `solveWithSource`; both code paths need them.
                 if tamarin_utils::env_gate!("TAM_DBG_SRC_CASE") {
                     eprintln!("[src_case] solve_action_goal None-branch: precompute={} tag={:?} full_sources.len={}",
@@ -4820,7 +4708,7 @@ impl<'ctx> Reduction<'ctx> {
                         // `filterCases` in
                         // `Theory.Constraint.Solver.Sources`, which skips
                         // already-used chain-saturated source cases) is
-                        // disabled here (see task #115).  The right fix is
+                        // disabled here.  The right fix is
                         // N5_u-driven KU action-node unification on
                         // identical terms, which surfaces a
                         // cyclic-ordering contradiction.
@@ -5292,7 +5180,7 @@ impl<'ctx> Reduction<'ctx> {
         p: &crate::constraint::constraints::NodePrem,
         fa_prem: &crate::fact::LNFact,
     ) -> GoalCases {
-        // H16.4: tag apply_eq_store calls during premise-goal solving
+        // Tag apply_eq_store calls during premise-goal solving
         // with `insertEdges:solvePremise` label, matching HS's site
         // naming.
         let _op_guard = crate::constraint::solver::trace::OpLabelGuard::new(
@@ -5394,7 +5282,7 @@ impl<'ctx> Reduction<'ctx> {
         // `apply_source_case_premise` (sources.rs).
         //
         // The returned systems are already fact-aligned + edge-coherent
-        // (with a defensive `chain_eqs` pass — see task #249).
+        // (with a defensive `chain_eqs` pass).
         //
         // HS-faithful (Sources.hs:202-206): `solveAllSafeGoals` only
         // calls `solveWithSourceAndReturn` on "useful" goals (KU
@@ -5440,18 +5328,6 @@ impl<'ctx> Reduction<'ctx> {
         let candidates: Vec<(RuleACInst,
                 Option<Vec<tamarin_term::subst_vfresh::LNSubstVFresh>>)>
             = premise_solving_rule_insts_with_constrs(self.ctx, fa_prem);
-        if std::env::var("TAM_RS_DBG_PREM_CANDS").as_deref() == Ok("1") {
-            let path = crate::constraint::solver::trace::case_path_string();
-            eprintln!("[PREM_CANDS] path=[{}] prem_fact={:?} n_cands={}",
-                path, fa_prem, candidates.len());
-            let mut matchers: Vec<String> = Vec::new();
-            for (rule, _) in &candidates {
-                let any_match = rule.enumerate_conclusions().any(|(_, fc)|
-                    fc.tag == fa_prem.tag && fc.terms.len() == fa_prem.terms.len());
-                if any_match { matchers.push(rule_case_name(rule)); }
-            }
-            eprintln!("  tag-matchers: {:?}", matchers);
-        }
         let avoid_max = bounds_max(&self.sys);
         let mut cases: Vec<(String, crate::constraint::system::System)> = Vec::new();
         let mut next_node_idx = avoid_max.saturating_add(1);
@@ -5558,10 +5434,10 @@ impl<'ctx> Reduction<'ctx> {
                         // HS's `Inc_case_1` / `Inc_case_2` pair on
                         // multiset Counter premise solving.
                         //
-                        // Previously RS unconditionally `cases.push((name, sub.sys))`
-                        // — collapsing all AC unifier arms into a single
+                        // Do NOT unconditionally `cases.push((name, sub.sys))`
+                        // — that collapses all AC unifier arms into a single
                         // case.  Mirror `solve_chain_goal`'s post-edge
-                        // arm enumeration (Reduction.hs ~4760) to keep
+                        // arm enumeration (Reduction.hs) to keep
                         // the eq_store-from-arm and clone the rest of
                         // sub.sys per arm.
                         let post_edge_sys = sub.sys.clone();
@@ -5580,26 +5456,6 @@ impl<'ctx> Reduction<'ctx> {
                                 if existing == &g && !status.solved {
                                     status.solved = true;
                                     break;
-                                }
-                            }
-                            if tamarin_utils::env_gate!("TAM_DBG_PREM_CASE_OUT") {
-                                for (id, ru) in sys.nodes.iter() {
-                                    let nm = crate::constraint::solver::reduction::rule_case_name(ru);
-                                    if nm == "Serv_1" {
-                                        eprintln!("[prem_case_out] case={} id={}.{}",
-                                            case_name, id.name, id.idx);
-                                        for (i, p) in ru.premises.iter().enumerate() {
-                                            eprintln!("[prem_case_out]   prem[{}]: {:?}", i,
-                                                format!("{:?}", p).chars().take(400).collect::<String>());
-                                        }
-                                        eprintln!("[prem_case_out]   eq_store ({} entries):",
-                                            sys.eq_store.subst.to_list().len());
-                                        for (v, t) in sys.eq_store.subst.to_list().iter() {
-                                            eprintln!("[prem_case_out]     {}.{} → {}",
-                                                v.name, v.idx,
-                                                format!("{:?}", t).chars().take(120).collect::<String>());
-                                        }
-                                    }
                                 }
                             }
                             // Subst_system per arm so the variant subst
@@ -5653,7 +5509,7 @@ impl<'ctx> Reduction<'ctx> {
         c: &crate::constraint::constraints::NodeConc,
         p: &crate::constraint::constraints::NodePrem,
     ) -> GoalCases {
-        // H16.4: set op label so any apply_eq_store calls during chain
+        // Set op label so any apply_eq_store calls during chain
         // processing get attributed correctly (mirrors HS's
         // `insertEdges:chain_extend` / `insertEdges:chain_direct` labels).
         let _op_guard = crate::constraint::solver::trace::OpLabelGuard::new(
@@ -5676,7 +5532,7 @@ impl<'ctx> Reduction<'ctx> {
         };
 
         // TAM_RS_TRACE_CHAINS: mirror Haskell `solveChain` enter trace
-        // (Goals.hs:300-305).  Format kept identical so a diff between
+        // (Goals.hs `solveChain`).  Format kept identical so a diff between
         // [HS-CHAIN] and [RS-CHAIN] surfaces directly.
         let trace_chains = tamarin_utils::env_gate!("TAM_RS_TRACE_CHAINS");
         if trace_chains {
@@ -5694,7 +5550,7 @@ impl<'ctx> Reduction<'ctx> {
         if let Some(p_rule) = &p_rule_opt {
             let fa_prem_opt = p_rule.lookup_premise(p.1).cloned();
             if let Some(_fa_prem) = fa_prem_opt {
-                // Haskell (Goals.hs:304-309) tests `illegalCoerce pRule
+                // Haskell (Goals.hs `illegalCoerce`) tests `illegalCoerce pRule
                 // mPrem` where `mPrem = case kFactView faConc of
                 // Just (DnK, m') -> m'` — i.e. the CHAIN CONCLUSION's
                 // down-K message, NOT the premise fact `faPrem`.  The
@@ -5838,7 +5694,7 @@ impl<'ctx> Reduction<'ctx> {
                 let mut sys_clone = self.sys.clone();
                 sys_clone.add_node(new_node.clone(), ru_inst.clone());
                 let mut sub = Reduction::new(self.ctx, sys_clone);
-                // HS `extendAndMark i ru v faPrem faConc` (Goals.hs:345-348):
+                // HS `extendAndMark i ru v faPrem faConc` (Goals.hs `extendAndMark`):
                 //   insertEdges [(c, faConc, faPrem, (i, v))]
                 //   markGoalAsSolved "directly" (PremiseG (i, v) faPrem)
                 //   insertChain (i, ConcIdx 0) p
@@ -5942,7 +5798,7 @@ impl<'ctx> Reduction<'ctx> {
                         ru_renamed
                     }
                 };
-                // Mirror HS `insertFreshNode rules (Just cRule)` (Goals.hs:369)
+                // Mirror HS `insertFreshNode rules (Just cRule)` (Goals.hs `insertFreshNode`)
                 // which calls labelNodeId → exploitPrems for every destructor
                 // rule, BEFORE the forbiddenEdge / prem-tag mismatch checks
                 // mzero the branch.  For dead-branch destructors, synthesize
@@ -6037,23 +5893,18 @@ impl<'ctx> Reduction<'ctx> {
                 // fact-unification failure sets sub.sys.eq_store.is_false()
                 // via mark_contradictory.
                 //
-                // 2026-06-08: switched from `exploit_prems_supplier_only`
-                // to full `exploit_prems` to be HS-faithful — Haskell's
-                // `solveChain EXTEND` path calls
-                // `insertFreshNode rules (Just cRule)` →
+                // Use full `exploit_prems` (NOT a supplier-only variant)
+                // to be HS-faithful — Haskell's `solveChain EXTEND` path
+                // calls `insertFreshNode rules (Just cRule)` →
                 // `labelNodeId` → `exploitPrems` which inserts a
                 // `Goal::Premise` for every non-Fr/In/KU premise (incl.
-                // Kd / Ded).  Dropping these Premise goals on the floor
-                // (the prior supplier_only call) was a CORRECTNESS bug:
-                // for multi-premise destructor rules like `d_em`
-                // (Bilinear-Pairing Emap-down: two Kd premises), only
-                // prem 0 was tracked (as the chain), and prem 1's Kd
-                // premise had NO goal whatsoever — so the system was
-                // reported as Solved with an unsatisfied Kd input.
-                // This caused
-                // `ake/bilinear/Joux.spthy::Session_Key_Secrecy_PFS`
-                // to report "trace found" (verdict-falsified) where HS
-                // proves verified.
+                // Kd / Ded).  Dropping these Premise goals is a
+                // CORRECTNESS bug: for multi-premise destructor rules like
+                // `d_em` (Bilinear-Pairing Emap-down: two Kd premises),
+                // only prem 0 would be tracked (as the chain), and prem 1's
+                // Kd premise would have NO goal whatsoever — so the system
+                // is reported as Solved with an unsatisfied Kd input,
+                // falsifying the verdict.
                 sub.exploit_prems(&new_node, &ru_renamed);
                 if sub.sys.eq_store.is_false() {
                     if dbg_filter {
@@ -6183,7 +6034,7 @@ impl<'ctx> Reduction<'ctx> {
     }
 
     /// `solveSubterm` — full port of Haskell `solveSubterm`
-    /// (Goals.hs:407-431):
+    /// (Goals.hs `solveSubterm`):
     /// ```haskell
     /// solveSubterm st = do
     ///   modM (posSubterms . sSubtermStore) (st `S.delete`)
@@ -6436,7 +6287,7 @@ impl<'ctx> Reduction<'ctx> {
             return GoalCases::Linear;
         }
         let mut out = Vec::with_capacity(cases.len());
-        for (i, store) in cases.into_iter().enumerate() {
+        for store in cases.into_iter() {
             let mut sys = self.sys.clone();
             sys.invalidate_max_var_idx_cache();
             sys.eq_store = std::sync::Arc::new(simplify_picked(store));
@@ -6455,7 +6306,6 @@ impl<'ctx> Reduction<'ctx> {
             // `split_case_2`, ... happens in `distinguish`
             // (ProofMethod.hs:308) when multiple sibling cases share the
             // same name.  Mirror by emitting plain `"split"` here.
-            let _ = i;
             out.push(("split".to_string(), sub.sys));
         }
         self.changed = ChangeIndicator::Changed;
@@ -7207,8 +7057,8 @@ mod tests {
 
     /// `default_case_name(i)` produces `case_<i+1>` — 1-INDEXED.
     ///
-    /// Mirrors Haskell's `casName` convention; off-by-one here regressed
-    /// the `case split` cluster (task #207).  Disjunction-driven case
+    /// Mirrors Haskell's `casName` convention; an off-by-one here regresses
+    /// the `case split` cluster.  Disjunction-driven case
     /// labels (`case_1`, `case_2`, ...) must match the Haskell printer
     /// exactly or proof-skeleton diffs report spurious mismatches.
     #[test]
