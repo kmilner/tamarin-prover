@@ -371,6 +371,136 @@ pub fn rule_body_to_doc(
     hpj::sep(vec![prem_doc, arrow, conc_doc])
 }
 
+// ============================================================================
+// Intruder-variant rendering — the `tamarin-prover variants` subcommand.
+//
+// HS `prettyIntruderVariants` (Theory/Model/Rule.hs:1343):
+//   `vcat . intersperse (text "") $ map prettyIntrRuleAC vs`
+// each rule via `prettyNamedRule (kwRuleModulo "AC") (const emptyDoc)`
+// (Rule.hs:1285-1287) = `header $-$ nest 2 body`, where the body is laid out
+// by `prettyRuleRestrGen` — the SAME `sep`-based layout as `rule_body_to_doc`
+// above.  Facts render with HS `prettyLNFact`/`prettyFact` (Fact.hs:539-547):
+// the SAME `nest_short_doc` paren layout as `fact_to_doc`, only over the
+// runtime `LNFact` representation with atomic `pretty_lnterm` argument docs.
+// The two blocks (DH then BP) concatenate with NO separating newline
+// (HS `putStrLn (dhS ++ bpS)`, Main/Mode/Intruder.hs:53).
+// ============================================================================
+
+/// Render one runtime `LNFact` as a Doc — the `LNFact` analogue of
+/// `fact_to_doc`: `[!]TAG( t, … )` via `nest_short_doc`, arguments as atomic
+/// `pretty_lnterm` docs (intruder-rule fact terms never wrap internally, so
+/// the `sep`/`fsep` wrap decisions are identical to HS's structured docs).
+fn ln_fact_to_doc(fa: &crate::fact::LNFact) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    use crate::fact::{fact_tag_multiplicity, fact_tag_name, Multiplicity};
+    let mut lead = String::new();
+    // HS `showFactTag` (Fact.hs:519-523): `!` prefix for persistent tags
+    // (incl. KU/KD), then the tag name.
+    if fact_tag_multiplicity(&fa.tag) == Multiplicity::Persistent {
+        lead.push('!');
+    }
+    lead.push_str(&fact_tag_name(&fa.tag));
+    lead.push('(');
+    let arg_docs: Vec<Doc> = fa
+        .terms
+        .iter()
+        .map(|t| Doc::text(tamarin_term::pretty::pretty_lnterm(t)))
+        .collect();
+    let body = hpj::fsep(hpj::punctuate(comma_doc(), arg_docs));
+    nest_short_doc(&lead, ")", body)
+}
+
+/// `[ f, … ]` fact-list for runtime `LNFact`s (HS `ppFactsList`).
+fn ln_facts_list_doc(facts: &[crate::fact::LNFact]) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let inner: Vec<Doc> = facts.iter().map(ln_fact_to_doc).collect();
+    let body = hpj::fsep(hpj::punctuate(comma_doc(), inner));
+    hpj::fsep(vec![Doc::text("["), body, Doc::text("]")])
+}
+
+/// `[ prems ] --[ acts ]-> [ concls ]` body for an `LNFact` rule — the
+/// `LNFact` analogue of `rule_body_to_doc`, identical structure (HS
+/// `prettyRuleRestrGen`, Rule.hs:1254-1262).
+fn ln_rule_body_to_doc(
+    prems: &[crate::fact::LNFact],
+    acts: &[crate::fact::LNFact],
+    concls: &[crate::fact::LNFact],
+) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let prem_doc = ln_facts_list_doc(prems).nest(1);
+    let arrow = if acts.is_empty() {
+        Doc::text("-->")
+    } else {
+        let act_docs: Vec<Doc> = acts.iter().map(ln_fact_to_doc).collect();
+        let act_body = hpj::fsep(hpj::punctuate(comma_doc(), act_docs));
+        hpj::fsep(vec![Doc::text("--["), act_body, Doc::text("]->")])
+    };
+    let conc_doc = ln_facts_list_doc(concls).nest(1);
+    hpj::sep(vec![prem_doc, arrow, conc_doc])
+}
+
+/// HS intruder-rule name (`prettyIntrRuleACInfo`, Rule.hs:1225-1234):
+/// `c`/`d` prefix for Constr/Destr, fixed lowercase keywords otherwise, all
+/// wrapped in `prefixIfReserved` (prepend `_` for reserved names / names
+/// already starting with `_`).
+fn intr_rule_name(r: &crate::rule::IntrRuleAC) -> String {
+    use crate::rule::IntrRuleACInfo;
+    let prefix_if_reserved = |n: String| -> String {
+        const RESERVED: [&str; 7] =
+            ["Fresh", "irecv", "isend", "coerce", "fresh", "pub", "iequality"];
+        if RESERVED.contains(&n.as_str()) || n.starts_with('_') {
+            format!("_{}", n)
+        } else {
+            n
+        }
+    };
+    match &r.info {
+        IntrRuleACInfo::ConstrRule(n) => {
+            prefix_if_reserved(format!("c{}", String::from_utf8_lossy(n)))
+        }
+        IntrRuleACInfo::DestrRule(n, _, _, _) => {
+            prefix_if_reserved(format!("d{}", String::from_utf8_lossy(n)))
+        }
+        IntrRuleACInfo::IRecv => "irecv".to_string(),
+        IntrRuleACInfo::ISend => "isend".to_string(),
+        IntrRuleACInfo::Coerce => "coerce".to_string(),
+        IntrRuleACInfo::FreshConstr => "fresh".to_string(),
+        IntrRuleACInfo::PubConstr => "pub".to_string(),
+        IntrRuleACInfo::NatConstr => "nat".to_string(),
+        IntrRuleACInfo::IEquality => "iequality".to_string(),
+    }
+}
+
+/// `renderDoc . prettyIntruderVariants` for a block of intruder rules
+/// (Theory/Model/Rule.hs:1343).  Each rule is `rule (modulo AC) NAME:` then
+/// the `nest 2` body; rules are separated by ONE blank line
+/// (`vcat . intersperse (text "")`).  Returns the block with NO trailing
+/// newline, so a DH block and a BP block concatenate seamlessly (the DH
+/// `d_inv` body abutting the BP `c_pmult` header), matching HS `dhS ++ bpS`.
+pub fn pretty_intruder_variants(rules: &[crate::rule::IntrRuleAC]) -> String {
+    use crate::pretty_hpj::Doc;
+    rules
+        .iter()
+        .map(|r| {
+            // HS `prettyNamedRule` header: `kwRuleModulo "AC" <-> name <> ":"`.
+            let header = Doc::text("rule (modulo AC)")
+                .beside_sp(Doc::text(intr_rule_name(r)))
+                .beside(Doc::text(":"));
+            // Render header and body separately (as `render_rule` does): the
+            // header is one logical line, the body starts fresh at `nest 2`.
+            let mut s = header.render();
+            s.push('\n');
+            s.push_str(
+                &ln_rule_body_to_doc(&r.premises, &r.actions, &r.conclusions)
+                    .nest(2)
+                    .render(),
+            );
+            s
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 // =============================================================================
 // Precise-Fresh state seeding (HS `avoidPrecise = avoidPreciseVars . frees`,
 // LTerm.hs:672-680).  We seed `name -> maxIdx+1` for every free-var name

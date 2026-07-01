@@ -224,82 +224,36 @@ fn run_variants(args: &Args) -> Result<i32, RunError> {
         eprintln!(" checking version: {}. OK.", v);
         eprintln!(" checking installation: OK.");
     }
-    // KNOWN GAP: this enumerates the DH intruder rule variants only.  HS
-    // (Intruder.hs:49-53) additionally generates the bilinear-pairing
-    // variants via `bpIntruderRules False` on a SEPARATE bpMaudeSig handle
-    // and concatenates them after the DH block (the full HS stdout is 126
-    // `rule (modulo AC)` lines).  Porting that requires a Maude-querying
-    // `bp_intruder_rules` generator (mirroring HS bpIntruderRules,
-    // IntruderRules.hs:384-392) — NOT the cached-file parser
-    // `mk_bp_intruder_variants`, which is a different code path.  The
-    // `variants` subcommand is not exercised by the example corpus.  HS's
-    // pretty-printer also HughesPJ-line-wraps wide rules (`-->` on its own
-    // line), which the single-line printer below does not reproduce.
-    let rules = tamarin_theory::intruder_rules::dh_intruder_rules(false, &maude);
-    // Mirror HS `Theory.Model.Rule.prettyIntrRuleACInfo`
-    // (Theory/Model/Rule.hs:1233-1234) naming:
-    //   ConstrRule "_exp"    → prefixIfReserved("c" ++ "_exp") → "c_exp"
-    //   DestrRule  "_exp"... → prefixIfReserved("d" ++ "_exp") → "d_exp"
-    // HS wildcards the three numeric DestrRule fields (the remaining-apps
-    // counter is NEVER rendered into the name; the `d_NAME_i` form is the
-    // commented-out line Rule.hs:1235), then wraps in `prefixIfReserved`,
-    // which prepends `_` only for reserved rule names or names already
-    // starting with `_` (a no-op for `c_exp`/`d_exp`-style names).
-    let prefix_if_reserved = |n: String| -> String {
-        const RESERVED: [&str; 7] =
-            ["Fresh", "irecv", "isend", "coerce", "fresh", "pub", "iequality"];
-        if RESERVED.contains(&n.as_str()) || n.starts_with('_') {
-            format!("_{}", n)
-        } else {
-            n
-        }
-    };
-    for r in &rules {
-        use tamarin_theory::rule::IntrRuleACInfo;
-        // HS `prettyIntrRuleACInfo` (Rule.hs:1225-1234): every
-        // non-Constr/Destr variant maps to a fixed lowercase keyword.
-        // (dhIntruderRules only ever yields Constr/Destr, so these arms are
-        // defensive — but they remove the latent `{:?}` Debug divergence.)
-        let name = match &r.info {
-            IntrRuleACInfo::ConstrRule(n) =>
-                prefix_if_reserved(format!("c{}", String::from_utf8_lossy(n))),
-            IntrRuleACInfo::DestrRule(n, _, _, _) =>
-                prefix_if_reserved(format!("d{}", String::from_utf8_lossy(n))),
-            IntrRuleACInfo::IRecv => "irecv".to_string(),
-            IntrRuleACInfo::ISend => "isend".to_string(),
-            IntrRuleACInfo::Coerce => "coerce".to_string(),
-            IntrRuleACInfo::FreshConstr => "fresh".to_string(),
-            IntrRuleACInfo::PubConstr => "pub".to_string(),
-            IntrRuleACInfo::NatConstr => "nat".to_string(),
-            IntrRuleACInfo::IEquality => "iequality".to_string(),
-        };
-        // HS `prettyIntrRuleAC` (Rule.hs:1324) uses `kwRuleModulo "AC"` =
-        // "rule (modulo AC)" UNCONDITIONALLY for every intruder rule — there
-        // is no bare "rule" case.
-        let kind = "rule (modulo AC)";
-        println!();
-        println!("{} {}:", kind, name);
-        // Pretty-print each fact as `Tag(term, term, …)` using
-        // `tamarin_term::pretty::pretty_lnterm` for argument terms.
-        // Mirrors HS `prettyLNFact` for the variants command.
-        let fmt_fact = |f: &tamarin_theory::fact::LNFact| -> String {
-            // HS `showFactTag` (Fact.hs:516-523): factTagName + `!` for
-            // persistent.  Use the canonical table rather than re-hardcoding it.
-            let name = tamarin_theory::fact::show_fact_tag(&f.tag);
-            let args: Vec<String> = f.terms.iter()
-                .map(tamarin_term::pretty::pretty_lnterm)
-                .collect();
-            format!("{}({})", name, args.join(", "))
-        };
-        let fmt_facts = |facts: &[tamarin_theory::fact::LNFact]| -> String {
-            let parts: Vec<String> = facts.iter().map(fmt_fact).collect();
-            format!("[ {} ]", parts.join(", "))
-        };
-        println!("   {} --{}-> {}",
-            fmt_facts(&r.premises),
-            fmt_facts(&r.actions),
-            fmt_facts(&r.conclusions));
-    }
+    // HS `Main.Mode.Intruder.run` (Intruder.hs:48-53) generates BOTH the DH
+    // and the bilinear-pairing variants and emits `dhS ++ bpS`:
+    //   - DH: `dhIntruderRules False` (runtime, via Maude).  RS's runtime
+    //     generator is now byte-faithful (exactly 51 rules) after the
+    //     `remove_renamings` fix in `variants_intruder` — previously it
+    //     over-produced 53 (an extra identity-variant `d_inv` and `d_exp`).
+    //   - BP: `bpIntruderRules False` (runtime).  Like HS
+    //     (Intruder.hs:50), we start a SECOND Maude handle on
+    //     `bp_maude_sig()` and generate the 75 BP rules at runtime via
+    //     `bp_intruder_rules(false, ..)`.  This tracks the CURRENT Maude
+    //     rather than the stale cached `data/intruder_variants_bp.spthy`
+    //     (which production proving still parses via
+    //     `mk_bp_intruder_variants`); HS's `variants` command likewise
+    //     generates BP at runtime, so the two stay byte-identical.
+    let dh_rules = tamarin_theory::intruder_rules::dh_intruder_rules(false, &maude);
+    let bp_sig = tamarin_term::maude_sig::bp_maude_sig();
+    let bp_maude = MaudeHandle::start(&maude_path, bp_sig).map_err(|e| {
+        RunError(format!("failed to start maude at {:?}: {:?}", maude_path, e))
+    })?;
+    let bp_rules = tamarin_theory::intruder_rules::bp_intruder_rules(false, &bp_maude);
+    // HS `putStrLn (dhS ++ bpS)` where each block is
+    // `renderDoc . prettyIntruderVariants` (Rule.hs:1343): blank-line-separated
+    // `rule (modulo AC) NAME:` rules with HughesPJ body wrapping (`sep`/`fsep`
+    // at the standard width) and NO trailing newline — so the DH and BP blocks
+    // abut (the DH `d_inv` body directly precedes the BP `c_pmult` header with
+    // no separating newline).  `putStrLn` appends the single trailing newline.
+    let dh_s = tamarin_theory::pretty_formula::pretty_intruder_variants(&dh_rules);
+    let bp_s = tamarin_theory::pretty_formula::pretty_intruder_variants(&bp_rules);
+    print!("{}{}", dh_s, bp_s);
+    println!();
     Ok(0)
 }
 

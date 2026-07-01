@@ -800,6 +800,38 @@ pub fn variants_intruder(
     apply_filters: bool,
     ru: &IntrRuleAC,
 ) -> Vec<IntrRuleAC> {
+    // HS hardcodes `minimizeVariants = id` for the DH/pmult call
+    // (`variantsIntruder hnd id True ...`, IntruderRules.hs:242/390).
+    variants_intruder_with(maude, &|s| s, apply_filters, ru)
+}
+
+/// Core of `variantsIntruder` parameterised by the `minimizeVariants`
+/// hook — port of `Theory.Tools.IntruderRules.variantsIntruder`
+/// (IntruderRules.hs:288-314).
+///
+/// HS:
+/// ```haskell
+/// variantsIntruder :: MaudeHandle -> ([LNSubstVFresh] -> [LNSubstVFresh])
+///                  -> Bool -> IntrRuleAC -> [IntrRuleAC]
+/// variantsIntruder hnd minimizeVariants applyFilters ru = go [] $ reverse $ do
+///     let ruleTerms = concatMap factTerms (rPrems ++ rConcs ++ rActs)
+///     fsigma <- minimizeVariants $ computeVariants (fAppList ruleTerms) `runReader` hnd
+///     ...
+/// ```
+///
+/// `minimizeVariants` is applied to the WHOLE cleaned variant-subst
+/// list before any rule is built (HS `fsigma <- minimizeVariants $
+/// computeVariants ...`).  The `id` instance recovers
+/// [`variants_intruder`] (the DH / pmult-destructor path) exactly; the
+/// BP `emap` destructor passes `nub . map canonize` via
+/// [`bp_variants_intruder`].
+fn variants_intruder_with(
+    maude: &tamarin_term::maude_proc::MaudeHandle,
+    minimize_variants: &dyn Fn(Vec<tamarin_term::subst_vfresh::LNSubstVFresh>)
+        -> Vec<tamarin_term::subst_vfresh::LNSubstVFresh>,
+    apply_filters: bool,
+    ru: &IntrRuleAC,
+) -> Vec<IntrRuleAC> {
     use tamarin_term::function_symbols::{AcSym, FunSym};
     use tamarin_term::lterm::frees;
     use tamarin_term::subst::{apply_vterm, Subst};
@@ -838,15 +870,45 @@ pub fn variants_intruder(
         Err(_) => return vec![ru.clone()],
     };
 
-    // Build one candidate variant rule per Maude variant substitution.
+    // Clean each raw variant subst exactly as HS's `computeVariants`
+    // returns them (removeRenamings inside variantsViaMaude), then
+    // restrict to the packed free vars.  This is the
+    // `computeVariants (fAppList ruleTerms)` list that `minimizeVariants`
+    // is applied to.
+    let cleaned: Vec<LNSubstVFresh> = raw_substs
+        .into_iter()
+        .map(|pairs| {
+            // HS-faithful `removeRenamings` (Maude/Types.hs:130): HS's
+            // `msubstToLSubstVFresh bindings substMaude` — applied to EVERY
+            // variant subst inside `variantsViaMaude` (Process.hs:312,
+            // `map (msubstToLSubstVFresh bindings) <$> parseVariantsReply`) —
+            // ends with `removeRenamings $ substFromListVFresh slist`, dropping
+            // each entry whose image is a bare fresh Var with no other role in
+            // the substitution's range (`isRenamedVar`, SubstVFresh.hs:140-145).
+            // RS's `maude.variants()` does NOT clean (the proving caller
+            // `compute_rule_variants_for_rule` cleans it itself,
+            // rule_variants.rs:485), so we clean here to match HS.  The IDENTITY
+            // variant Maude returns for the `inv`/`exp` destructors is
+            // `x0 --> #1` (a fresh witness); `removeRenamings` collapses it to
+            // the EMPTY subst, so `freshToFreeAvoiding {}` is the identity and
+            // the variant rule equals the base rule — which the `ruvariant /= ru`
+            // guard (IntruderRules.hs:297) then drops.  Without this step the
+            // identity variants leak through as `{x0 -> x.N}`, yielding the two
+            // extra base-case rules (+1 `d_inv` `KD(x)->KD(inv(x))` and
+            // +1 `d_exp`) that over-produce 53 rules instead of HS's 51.
+            LNSubstVFresh::from_list(pairs)
+                .remove_renamings()
+                .restrict(&packed_frees.iter().cloned().collect::<Vec<_>>())
+        })
+        .collect();
+
+    // `fsigma <- minimizeVariants $ computeVariants ...` — apply the
+    // minimize hook to the WHOLE cleaned list before building rules.
+    let minimized = minimize_variants(cleaned);
+
+    // Build one candidate variant rule per (minimized) variant subst.
     let mut produced: Vec<IntrRuleAC> = Vec::new();
-    for pairs in raw_substs {
-        // `restrictVFresh (frees packed) fsigma` — keep only entries whose
-        // KEY is a free var of the packed term.  HS `computeVariants`
-        // (Compute.hs:150) does this EXPLICITLY via `restrictVFresh (frees t)
-        // subst`, so this `.restrict(packed_frees)` mirrors it exactly.
-        let s_fresh = LNSubstVFresh::from_list(pairs)
-            .restrict(&packed_frees.iter().cloned().collect::<Vec<_>>());
+    for s_fresh in minimized {
 
         // `freshToFreeAvoiding ruleTerms` — convert VFresh → free Subst,
         // allocating fresh idxs that avoid every var in `ruleTerms`.
@@ -1305,6 +1367,226 @@ pub fn dh_intruder_rules(
     let mut all = constrs;
     all.extend(destr_variants);
     minimize_intruder_rules(diff, all)
+}
+
+// =============================================================================
+// `bpIntruderRules` — port of
+// `Theory.Tools.IntruderRules.bpIntruderRules` (IntruderRules.hs:384-437).
+//
+// HS shape:
+// ```haskell
+// bpIntruderRules :: Bool -> WithMaude [IntrRuleAC]
+// bpIntruderRules diff = reader $ \hnd -> minimizeIntruderRules diff $
+//     [ pmultRule (ConstrRule "_pmult") kuFact return
+//     , emapRule  (ConstrRule "_em")    kuFact return
+//     ]
+//     ++ (variantsIntruder hnd id True $
+//           pmultRule (DestrRule "_pmult" 0 True False) kdFact (const []))
+//     ++ (bpVariantsIntruder hnd $
+//           emapRule (DestrRule "_em" 0 True False) kdFact (const []))
+//   where
+//     x_var_0 = varTerm (LVar "x" LSortMsg 0)
+//     x_var_1 = varTerm (LVar "x" LSortMsg 1)
+//     pmultRule mkInfo kud mkAction =
+//         Rule mkInfo [kud x0, kuFact x1] [kud (pmult(x1,x0))] (mkAction conc) []
+//     emapRule mkInfo kud mkAction =
+//         Rule mkInfo [kud x0, kud x1] [kud (em(x0,x1))] (mkAction conc) []
+// ```
+//
+// NOTE the asymmetries vs `dhIntruderRules`:
+//   * `pmultRule`'s conclusion is `pmult(x_var_1, x_var_0)` — the args
+//     are SWAPPED relative to the premise order (HS `fAppPMult (x_var_1,
+//     x_var_0)`, IntruderRules.hs:404).
+//   * `emapRule` uses `kud` (the KU/KD-fact constructor) for BOTH
+//     premises (`bfact = kud x0`, `efact = kud x1`), not `kuFact` for the
+//     second (IntruderRules.hs:410-411).
+//
+// # Role: runtime BP generator for the `variants` command ONLY
+//
+// HS's `variants` command (Main.Mode.Intruder.run, Intruder.hs:48-53)
+// generates `bpIntruderRules False` at RUNTIME against a fresh
+// `bpMaudeSig` handle.  On current Maude this differs from the STALE
+// cached `data/intruder_variants_bp.spthy`, which production PROVING
+// still parses via `mk_bp_intruder_variants`.  This function is the
+// runtime generator and is reachable ONLY from `run_variants`; proving
+// must keep using the cached file.
+// =============================================================================
+/// `bpIntruderRules` — compute the bilinear-pairing intruder rules at
+/// runtime.  Direct mirror of HS `bpIntruderRules` (IntruderRules.hs:384-437).
+///
+/// Returns 2 constructor rules (`_pmult`, `_em`) plus the
+/// variants-expansion of the `_pmult` destructor (via plain
+/// `variants_intruder`, like DH `exp`) and the `_em` destructor (via
+/// [`bp_variants_intruder`], which canonicalises + the KD→KU
+/// post-process).
+///
+/// Reachable only from the `variants` command — NOT from proving (which
+/// uses the cached [`crate::intruder_variants::mk_bp_intruder_variants`]).
+pub fn bp_intruder_rules(
+    diff: bool,
+    maude: &tamarin_term::maude_proc::MaudeHandle,
+) -> Vec<IntrRuleAC> {
+    use tamarin_term::builtin::{emap, pmult};
+    use tamarin_term::function_symbols::{EMAP_SYM_STRING, PMULT_SYM_STRING};
+
+    // `x_var_0 = varTerm (LVar "x" LSortMsg 0)` etc. (IntruderRules.hs:396-397).
+    let x_var_0 = var_term(LVar::new("x", LSort::Msg, 0));
+    let x_var_1 = var_term(LVar::new("x", LSort::Msg, 1));
+
+    // HS `pmultRule mkInfo kud mkAction` (IntruderRules.hs:399-405).
+    //   prems = [kud x0, kuFact x1]; conc = kud (pmult(x1, x0)).
+    // The conclusion args are SWAPPED: `fAppPMult (x_var_1, x_var_0)`.
+    let pmult_rule = |info: IntrRuleACInfo,
+                      kud_fact: fn(LNTerm) -> LNFact,
+                      mk_action: &dyn Fn(LNFact) -> Vec<LNFact>|
+     -> IntrRuleAC {
+        let bfact = kud_fact(x_var_0.clone());
+        let efact = ku_fact(x_var_1.clone());
+        let conc = pmult(x_var_1.clone(), x_var_0.clone());
+        let concfact = kud_fact(conc);
+        let acts = mk_action(concfact.clone());
+        Rule::new(info, vec![bfact, efact], vec![concfact], acts)
+    };
+
+    // HS `emapRule mkInfo kud mkAction` (IntruderRules.hs:407-413).
+    //   prems = [kud x0, kud x1] (BOTH via kud); conc = kud (em(x0, x1)).
+    let emap_rule = |info: IntrRuleACInfo,
+                     kud_fact: fn(LNTerm) -> LNFact,
+                     mk_action: &dyn Fn(LNFact) -> Vec<LNFact>|
+     -> IntrRuleAC {
+        let bfact = kud_fact(x_var_0.clone());
+        let efact = kud_fact(x_var_1.clone());
+        let conc = emap(x_var_0.clone(), x_var_1.clone());
+        let concfact = kud_fact(conc);
+        let acts = mk_action(concfact.clone());
+        Rule::new(info, vec![bfact, efact], vec![concfact], acts)
+    };
+
+    // `mkInfo` helpers mirror dh_intruder_rules' `constr_info`/`destr_info`.
+    let constr_info = |sym: &[u8]| -> IntrRuleACInfo {
+        let mut name = b"_".to_vec();
+        name.extend_from_slice(sym);
+        IntrRuleACInfo::ConstrRule(name)
+    };
+    let destr_info = |sym: &[u8]| -> IntrRuleACInfo {
+        let mut name = b"_".to_vec();
+        name.extend_from_slice(sym);
+        IntrRuleACInfo::DestrRule(name, 0, true, false)
+    };
+
+    let mk_singleton: &dyn Fn(LNFact) -> Vec<LNFact> = &|f| vec![f];
+    let mk_empty: &dyn Fn(LNFact) -> Vec<LNFact> = &|_| Vec::new();
+
+    // Constructor rules: `pmultRule (ConstrRule "_pmult") kuFact return`
+    // and `emapRule (ConstrRule "_em") kuFact return`.
+    let constrs: Vec<IntrRuleAC> = vec![
+        pmult_rule(constr_info(PMULT_SYM_STRING), ku_fact, mk_singleton),
+        emap_rule(constr_info(EMAP_SYM_STRING), ku_fact, mk_singleton),
+    ];
+
+    // pmult destructor variants — `variantsIntruder hnd id True`
+    // (like DH `exp`).
+    let pmult_destr = pmult_rule(destr_info(PMULT_SYM_STRING), kd_fact, mk_empty);
+    let mut all = constrs;
+    all.extend(variants_intruder(maude, true, &pmult_destr));
+
+    // em destructor variants — `bpVariantsIntruder hnd` (canonicalised +
+    // KD→KU post-process).
+    let emap_destr = emap_rule(destr_info(EMAP_SYM_STRING), kd_fact, mk_empty);
+    all.extend(bp_variants_intruder(maude, &emap_destr));
+
+    // `minimizeIntruderRules diff $ ...`.
+    minimize_intruder_rules(diff, all)
+}
+
+/// `bpVariantsIntruder` — port of
+/// `Theory.Tools.IntruderRules.bpVariantsIntruder` (IntruderRules.hs:415-437).
+///
+/// ```haskell
+/// bpVariantsIntruder hnd ru = do
+///     ruvariant <- variantsIntruder hnd minimizeVariants True ru
+///     case ruvariant of
+///       Rule i [Fact KDFact an args@[Lit (Var _)], yfact] cs as nvs ->
+///         return $ Rule i [Fact KUFact an args, yfact] cs as nvs
+///       Rule i [yfact, Fact KDFact an args@[Lit (Var _)]] cs as nvs ->
+///         return $ Rule i [yfact, Fact KUFact an args] cs as nvs
+///       _ -> return ruvariant
+///   where
+///     minimizeVariants = nub . map canonize
+///     canonize subst = canonizeSubst . substFromListVFresh $ zip doms (sort rngs)
+///       where mappings = substToListVFresh subst
+///             doms     = map fst mappings
+///             rngs     = map snd mappings
+/// ```
+///
+/// `minimizeVariants = nub . map canonize` collapses BP em-destructor
+/// variants that differ only by a renaming of their range terms.
+/// `canonize` re-zips the domain with the SORTED range terms and then
+/// applies [`canonize_subst`] (the occurrence-set canonicalisation).
+/// The KD→KU post-process makes the bare-`Var` premise of the
+/// `x, pmult(y,z) -> em(x,z)^y` / `pmult(y,z), x -> em(z,x)^y` variants a
+/// KU premise (the `x` becomes adversary-known).
+fn bp_variants_intruder(
+    maude: &tamarin_term::maude_proc::MaudeHandle,
+    ru: &IntrRuleAC,
+) -> Vec<IntrRuleAC> {
+    use tamarin_term::subst_vfresh::LNSubstVFresh;
+    use tamarin_term::subsumption::canonize_subst;
+    use tamarin_term::term::Term;
+    use tamarin_term::vterm::Lit;
+
+    // `minimizeVariants = nub . map canonize`.
+    //   canonize subst = canonizeSubst . substFromListVFresh $
+    //                       zip doms (sort rngs)
+    // where (doms, rngs) = unzip (substToListVFresh subst), i.e. the
+    // domain keys in `to_list` order zipped with the SORTED range terms.
+    let minimize_variants =
+        |substs: Vec<LNSubstVFresh>| -> Vec<LNSubstVFresh> {
+            let mut out: Vec<LNSubstVFresh> = Vec::new();
+            for s in substs {
+                let mappings = s.to_list();
+                let doms: Vec<LVar> = mappings.iter().map(|(d, _)| d.clone()).collect();
+                let mut rngs: Vec<LNTerm> =
+                    mappings.iter().map(|(_, t)| t.clone()).collect();
+                // `sort rngs` — `Ord LNTerm`.
+                rngs.sort();
+                let rezipped = LNSubstVFresh::from_list(
+                    doms.into_iter().zip(rngs).collect::<Vec<_>>(),
+                );
+                let canon = canonize_subst(&rezipped);
+                // `nub` — keep first occurrence, drop later duplicates
+                // (structural `Eq` on the canonicalised subst).
+                if !out.iter().any(|existing| existing == &canon) {
+                    out.push(canon);
+                }
+            }
+            out
+        };
+
+    let variants = variants_intruder_with(maude, &minimize_variants, true, ru);
+
+    // KD→KU post-process (IntruderRules.hs:424-429): if the first premise
+    // is a KD-fact whose single arg is a bare Var, rewrite that premise's
+    // tag KD→KU (keeping the same args/annotations); else the symmetric
+    // case where the SECOND premise is the bare-Var KD-fact.
+    let is_bare_var_kd = |f: &LNFact| -> bool {
+        f.tag == FactTag::Kd
+            && f.terms.len() == 1
+            && matches!(f.terms[0], Term::Lit(Lit::Var(_)))
+    };
+    variants
+        .into_iter()
+        .map(|mut rv| {
+            if rv.premises.len() == 2 {
+                if is_bare_var_kd(&rv.premises[0]) {
+                    rv.premises[0].tag = FactTag::Ku;
+                } else if is_bare_var_kd(&rv.premises[1]) {
+                    rv.premises[1].tag = FactTag::Ku;
+                }
+            }
+            rv
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1819,6 +2101,44 @@ mod tests {
             &path, tamarin_term::maude_sig::dh_maude_sig()).ok()
     }
 
+    fn bp_maude_handle() -> Option<tamarin_term::maude_proc::MaudeHandle> {
+        let path = std::env::var("MAUDE_PATH").ok().or_else(|| {
+            for c in ["/usr/local/bin/maude", "maude"] {
+                if std::path::Path::new(c).exists() { return Some(c.to_string()); }
+            }
+            None
+        })?;
+        tamarin_term::maude_proc::MaudeHandle::start(
+            &path, tamarin_term::maude_sig::bp_maude_sig()).ok()
+    }
+
+    /// `bp_intruder_rules(false)` yields exactly 75 bilinear-pairing
+    /// intruder rules (2 constructors `_pmult`/`_em` + the pmult- and
+    /// em-destructor variant expansions), matching HS `bpIntruderRules
+    /// False` on current Maude — the count the `variants` command emits
+    /// for the BP block (75 of the 126 total = 51 DH + 75 BP).
+    #[test]
+    fn bp_intruder_rules_yields_75() {
+        let maude = match bp_maude_handle() { Some(m) => m, None => return };
+        let rules = bp_intruder_rules(false, &maude);
+        assert_eq!(
+            rules.len(),
+            75,
+            "bp_intruder_rules(false) must produce exactly 75 rules; got {}",
+            rules.len()
+        );
+        // Sanity: the two construction rules are present and named.
+        let constr_names: Vec<&[u8]> = rules
+            .iter()
+            .filter_map(|r| match &r.info {
+                IntrRuleACInfo::ConstrRule(n) => Some(n.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert!(constr_names.contains(&b"_pmult".as_slice()));
+        assert!(constr_names.contains(&b"_em".as_slice()));
+    }
+
     /// Helper: extract the bytestring name of a ConstrRule or DestrRule.
     fn rule_name(info: &IntrRuleACInfo) -> Option<&[u8]> {
         match info {
@@ -1886,6 +2206,34 @@ mod tests {
                 "destructor rule name must start with `_`; got {}",
                 String::from_utf8_lossy(n));
         }
+
+        // EXACT byte-faithful shape vs HS `dhIntruderRules False`
+        // (data/intruder_variants_dh.spthy): 5 constr + 45 `d_exp` +
+        // 1 `d_inv` = 51 rules.  The lone `d_inv` is the swap variant
+        // `[KD(inv(x))] -> [KD(x)]`; the IDENTITY variants of the `_exp`
+        // and `_inv` destructors (`KD(x)->KD(inv(x))`, `[KD(x),KU(y)]->
+        // [KD(x^y)]`) MUST be dropped — Maude returns them as `x0 --> #N`
+        // fresh-witness renamings which HS's `removeRenamings`
+        // (Maude/Types.hs:130) collapses to the empty subst, so the
+        // `ruvariant /= ru` guard (IntruderRules.hs:297) discards them.
+        // A regression here (53 rules: +1 d_exp, +1 d_inv) means the
+        // `remove_renamings` step in `variants_intruder` was lost.
+        let (n_exp, n_inv) = destrs.iter().fold((0usize, 0usize), |(e, i), d| {
+            let n = rule_name(&d.info).unwrap();
+            let s = String::from_utf8_lossy(n);
+            if s.contains("inv") { (e, i + 1) }
+            else if s.contains("exp") { (e + 1, i) }
+            else { (e, i) }
+        });
+        assert_eq!(rules.len(), 51,
+            "dhIntruderRules must yield exactly 51 rules (5 constr + 45 d_exp \
+             + 1 d_inv) byte-identically to HS; got {} (n_exp={}, n_inv={}). \
+             53 indicates the dropped-identity-variant `remove_renamings` \
+             step regressed.", rules.len(), n_exp, n_inv);
+        assert_eq!(n_exp, 45, "expected exactly 45 d_exp destructors; got {}", n_exp);
+        assert_eq!(n_inv, 1, "expected exactly 1 d_inv destructor (the swap \
+             variant); got {} (2 means the identity variant KD(x)->KD(inv(x)) \
+             leaked)", n_inv);
     }
 
     /// The 5 ConstrRules MUST have the HS-specified shape:
