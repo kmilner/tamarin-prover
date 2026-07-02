@@ -93,6 +93,42 @@ impl GoalRanking {
         }
     }
 
+    /// Human-readable description of this ranking, mirroring HS
+    /// `goalRankingName` (System.hs:687-705).  Used by the interactive
+    /// web UI's "Applicable Proof Methods:" comment (`subProofSnippet`,
+    /// `Web/Theory.hs:544-545`).  Oracle variants render the resolved
+    /// script path (HS `printOracle`); we already store the resolved
+    /// path in `oracle_path`.
+    pub fn ranking_name(&self) -> String {
+        let body = match self {
+            GoalRanking::GoalNr => "their order of creation".to_string(),
+            GoalRanking::UsefulGoalNr =>
+                "their usefulness and order of creation".to_string(),
+            GoalRanking::Sapic =>
+                "heuristics adapted for processes".to_string(),
+            GoalRanking::SapicPKCS11 =>
+                "heuristics adapted to a specific model of PKCS#11 expressed \
+                 using SAPIC. deprecated.".to_string(),
+            GoalRanking::Smart(lb) =>
+                format!("the 'smart' heuristic{}", loop_status(*lb)),
+            GoalRanking::Inj(lb) =>
+                format!("heuristics adapted to stateful injective protocols{}",
+                        loop_status(*lb)),
+            GoalRanking::Oracle { oracle_path, .. } =>
+                format!("an oracle for ranking, located at {}", oracle_path),
+            GoalRanking::OracleSmart { oracle_path, .. } =>
+                format!("an oracle for ranking based on 'smart' heuristic, \
+                         located at {}", oracle_path),
+            GoalRanking::Tactic { tactic, .. } =>
+                format!("the tactic written in the theory file: {}", tactic.name),
+        };
+        format!("Goals sorted according to {}", body)
+    }
+}
+
+/// HS `goalRankingName`'s `loopStatus` (System.hs:701).
+fn loop_status(b: bool) -> String {
+    format!(" (loop breakers {})", if b { "allowed" } else { "delayed" })
 }
 
 /// Parse a full heuristic string into a list of `GoalRanking`s,
@@ -2216,6 +2252,48 @@ pub fn goal_usefulness(g: &Goal, looping: bool, sys: &System) -> Usefulness {
     // HS's `existingDeps = rawLessRel sys` shared in `openGoals`).
     let adj = build_raw_less_adj(sys);
     goal_usefulness_with_adj(g, looping, sys, &adj)
+}
+
+/// HS `prettyGoals`'s `useful` annotation STRING (System.hs:1745-1752) for
+/// the interactive sequent's per-goal comment.  UNLIKE the ranking
+/// [`Usefulness`] enum (which collapses both KU-guard and default goals
+/// into `Useful`), this distinguishes `" (useful1)"` (KU goal when the
+/// system has KU-guards) from `" (useful2)"` (the default), matching the
+/// exact suffix HS `prettyGoals` renders.  Returned WITHOUT surrounding
+/// quotes; the caller applies HS's `show` (which wraps it in `"…"`).
+///
+///   useful = case goal of
+///     _ | gsLoopBreaker         -> " (loop breaker)"
+///     ActionG i (UpK m)
+///       | hasKUGuards           -> " (useful1)"
+///       | currentlyDeducible i m -> " (currently deducible)"
+///       | probablyConstructible m -> " (probably constructible)"
+///     _                         -> " (useful2)"
+pub fn goal_useful_annotation(
+    g: &Goal,
+    gs_loop_breaker: bool,
+    sys: &System,
+) -> &'static str {
+    if gs_loop_breaker {
+        return " (loop breaker)";
+    }
+    if let Goal::Action(i, fa) = g {
+        if fa.is_ku() {
+            if has_ku_guards(sys) {
+                return " (useful1)";
+            }
+            if let Some(m) = fa.terms.first() {
+                let adj = build_raw_less_adj(sys);
+                if currently_deducible(sys, &adj, i, m) {
+                    return " (currently deducible)";
+                }
+                if probably_constructible(m) {
+                    return " (probably constructible)";
+                }
+            }
+        }
+    }
+    " (useful2)"
 }
 
 /// Like [`goal_usefulness`] but reuses a prebuilt `rawLessRel`

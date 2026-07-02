@@ -785,8 +785,8 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         // `closeTheoryWithMaude`'s variant pre-computation
         // (ClosedTheory.hs `closeTheory`).
         if let Some(m) = file_maude.as_ref() {
-            populate_rule_variants(&mut elaborated, m,
-                file_maude_pool.as_deref());
+            tamarin_theory::tools::rule_variants::populate_rule_variants(
+                &mut elaborated, m, file_maude_pool.as_deref());
         }
 
         // Port of HS `ruleVariantsReport` / `variantsCheck`
@@ -1431,54 +1431,6 @@ fn format_wf_block(report: &[tamarin_parser::wf::WfError]) -> String {
 /// HS-faithful witness allocation regardless of which pool member
 /// handles a given rule, so output is byte-identical to the
 /// single-Maude path.
-fn populate_rule_variants(elaborated: &mut tamarin_theory::theory::Theory,
-                          maude: &MaudeHandle,
-                          pool: Option<&MaudePool>) {
-    use rayon::prelude::*;
-    use tamarin_theory::theory::TheoryItem;
-
-    // HS-faithful: skip variant computation if the signature has
-    // NO reducible function symbols — there's nothing to narrow.
-    // Compute once (signature is read-only here) rather than in the
-    // inner loop.
-    if maude.maude_sig().reducible_fun_syms.is_empty() { return; }
-
-    // Per-item Option<(abstracted_rule, variant_substs)> for rules that
-    // have any.  Computed in parallel; rayon's indexed `par_iter().collect()`
-    // preserves positional order, and the result is zipped back by position.
-    let outs: Vec<Option<(tamarin_theory::rule::ProtoRuleE, Vec<tamarin_term::subst_vfresh::LNSubstVFresh>)>> =
-        elaborated.items.par_iter().map(|item| {
-            let TheoryItem::Rule(opr) = item else { return None; };
-            // Per-task Maude: acquire from the pool when available so
-            // each rule's variant computation runs on its own
-            // subprocess (no IPC mutex contention).  Fall back to
-            // the shared `maude` when no pool is configured.
-            let result = if let Some(pool) = pool {
-                let pooled = pool.acquire();
-                tamarin_theory::tools::rule_variants::abstract_rule_and_variants(
-                    &pooled, &opr.rule)
-            } else {
-                tamarin_theory::tools::rule_variants::abstract_rule_and_variants(
-                    maude, &opr.rule)
-            };
-            match result {
-                Ok(Some(pair)) => Some(pair),
-                _ => None,
-            }
-        }).collect();
-
-    // Sequential writeback in source order — matches HS's
-    // `parList rdeepseq` semantics (parallel evaluation, sequential
-    // list materialisation).
-    for (item, out) in elaborated.items.iter_mut().zip(outs) {
-        let TheoryItem::Rule(opr) = item else { continue };
-        if let Some((abstr, substs)) = out {
-            opr.abstracted_rule = Some(abstr);
-            opr.variant_substs = substs;
-        }
-    }
-}
-
 /// Install rayon's global worker pool to the size requested via
 /// `--processors=N` (or a sensible default).
 ///

@@ -116,6 +116,67 @@ pub fn parse_intruder_rules(input: &str) -> Result<Vec<Rule>, ParseError> {
     Ok(rules)
 }
 
+/// Strip `//` line comments and `/* */` block comments from a lemma's verbatim
+/// source span, used to populate `ast::Lemma::plaintext`.  Faithful port of HS
+/// `removeComments` / `removeCommentBlock` (`Theory/Text/Parser/Lemma.hs:62-74`),
+/// including the newline-swallowing behaviour that HS relies on: a `\n`
+/// immediately preceding a comment is consumed with the comment, and a block
+/// comment's closing `*/\n` consumes the trailing newline.  This determines the
+/// textarea's `rows` count in the web Edit form (HS `textHeight = 2 + number of
+/// '\n'`), so it must match char-for-char.
+pub(crate) fn remove_comments(s: &str) -> String {
+    let cs: Vec<char> = s.chars().collect();
+    let n = cs.len();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < n {
+        // '\n' : '/' : '/'  — drop the leading newline + the comment body,
+        //                     keeping the terminating newline (dropWhile /= '\n').
+        if cs[i] == '\n' && i + 2 < n && cs[i + 1] == '/' && cs[i + 2] == '/' {
+            i += 3;
+            while i < n && cs[i] != '\n' { i += 1; }
+            continue;
+        }
+        // '/' : '/'  — drop up to (not including) the next newline.
+        if cs[i] == '/' && i + 1 < n && cs[i + 1] == '/' {
+            i += 2;
+            while i < n && cs[i] != '\n' { i += 1; }
+            continue;
+        }
+        // '\n' : '/' : '*'  — drop the leading newline, enter block-comment mode.
+        if cs[i] == '\n' && i + 2 < n && cs[i + 1] == '/' && cs[i + 2] == '*' {
+            i = remove_comment_block(&cs, i + 3);
+            continue;
+        }
+        // '/' : '*'  — enter block-comment mode.
+        if cs[i] == '/' && i + 1 < n && cs[i + 1] == '*' {
+            i = remove_comment_block(&cs, i + 2);
+            continue;
+        }
+        out.push(cs[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Consume a `/* ... */` block comment body starting at `i`, returning the
+/// index just past the closing `*/` (and its trailing `\n` if present).
+/// Mirrors HS `removeCommentBlock`.
+fn remove_comment_block(cs: &[char], mut i: usize) -> usize {
+    let n = cs.len();
+    while i < n {
+        if cs[i] == '*' && i + 1 < n && cs[i + 1] == '/' {
+            // '*' : '/' : '\n'  swallows the newline; otherwise stop after '*/'.
+            if i + 2 < n && cs[i + 2] == '\n' {
+                return i + 3;
+            }
+            return i + 2;
+        }
+        i += 1;
+    }
+    n
+}
+
 // =============================================================================
 // Parser state
 // =============================================================================
@@ -1202,6 +1263,10 @@ impl<'a> Parser<'a> {
     // -------------------- Lemma --------------------
 
     fn lemma_item(&mut self) -> Result<TheoryItem, ParseError> {
+        // HS `protoLemma` captures `start <- getInput` BEFORE `symbol "lemma"`;
+        // the enclosing item loop has already consumed leading whitespace, so
+        // the cursor sits exactly at `lemma` here (`Theory/Text/Parser/Lemma.hs:80`).
+        let start = self.lx.pos().offset;
         // Look ahead to decide between a normal lemma and an accountability lemma.
         // Accountability lemmas have the body `accounts for [..]` after the name.
         self.require_kw("lemma")?;
@@ -1227,8 +1292,16 @@ impl<'a> Parser<'a> {
         };
         let formula = self.double_quoted_formula()?;
         let proof = self.try_proof_skeleton()?;
+        // HS `end <- getInput` after the proof skeleton; `inputString =
+        // removeComments $ take (length start - length end) start`
+        // (`Theory/Text/Parser/Lemma.hs:86-87`).  The closing-quote lexeme and
+        // `try_proof_skeleton` have already consumed trailing whitespace and
+        // comments, so `end` sits at the next top-level token — exactly HS's.
+        let end = self.lx.pos().offset;
+        let plaintext = remove_comments(&self.lx.src()[start..end]);
         Ok(TheoryItem::Lemma(Lemma {
             name, modulo: None, attributes: attrs, trace_quantifier, formula, proof,
+            plaintext,
         }))
     }
 

@@ -92,11 +92,30 @@ pub async fn serve(
     cfg: ServerConfig,
     theory_paths: Vec<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // The web UI renders every HTTP response at HS's web width (100/67),
+    // not the CLI console width (110/73) — HS `getTheorySourceR` uses
+    // `render` (HughesPJ default `style`) and every HTML fragment goes
+    // through `renderHtmlDoc`, both width 100.  Set process-wide before
+    // any rendering.  (Console-only `renderDoc` at 110 has no HTTP
+    // analogue here.)
+    tamarin_theory::pretty_hpj::set_display_width(
+        tamarin_theory::pretty_hpj::WEB_LINE_LENGTH,
+        tamarin_theory::pretty_hpj::WEB_RIBBON,
+    );
+
+    // Retain each proof node's constraint `System` after expansion.  The
+    // `--prove` CLI drops them post-expansion to keep RSS low (the text
+    // proof never reprints a per-node system), but the interactive UI
+    // renders the annotated system + applicable proof methods at every
+    // proof path — HS keeps a `Just System` on every `IncrementalProof`
+    // node.  Must be set before the first `autoprove` runs a search.
+    tamarin_theory::constraint::solver::search::set_keep_sys(true);
+
     let store = TheoryStore::default();
 
     // Eager-load every command-line theory.
     for p in &theory_paths {
-        match theory_io::load_from_path(p) {
+        match theory_io::load_from_path(p, &cfg.maude_path) {
             Ok(entry) => {
                 let name = entry.name.clone();
                 let idx = store.insert(entry);

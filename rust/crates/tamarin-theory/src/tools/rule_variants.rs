@@ -23,7 +23,7 @@
 //! can variant-narrow.
 
 use tamarin_term::lterm::{LNTerm, LVar, Name};
-use tamarin_term::maude_proc::{MaudeError, MaudeHandle};
+use tamarin_term::maude_proc::{MaudeError, MaudeHandle, MaudePool};
 use tamarin_term::subst::{apply_vterm, Subst};
 use tamarin_term::subst_vfresh::LNSubstVFresh;
 use tamarin_term::term::Term;
@@ -32,6 +32,7 @@ use crate::fact::Fact;
 use crate::rule::{
     ProtoRuleAC, ProtoRuleACInfo, ProtoRuleE,
 };
+use crate::theory::{Theory, TheoryItem};
 
 type LNSubst = Subst<Name, LVar>;
 
@@ -235,6 +236,69 @@ pub fn variant_substs_for_rule(
 ///
 /// Returns `Ok(None)` when no reducible-headed sub-terms exist, in
 /// which case `rule` is already canonical and needs no variants.
+///
+/// Populate each protocol rule's `abstracted_rule` + `variant_substs`
+/// via Maude, mirroring HS `closeTheoryWithMaude`'s variant
+/// pre-computation (`ClosedTheory.hs` `closeTheory`).  Both the CLI
+/// (`--prove`) and the interactive server call this so a theory is
+/// "closed" identically on both paths.
+///
+/// When `pool` is `Some`, rules are narrowed in parallel, each on its
+/// own pooled Maude subprocess.  When `pool` is `None`, computation is
+/// SEQUENTIAL on the single `maude` handle — a raw [`MaudeHandle`] wraps
+/// one child process and is not safe to share across rayon threads.
+/// Output is identical either way (writeback is in source order,
+/// mirroring HS's `parList rdeepseq`).
+pub fn populate_rule_variants(
+    elaborated: &mut Theory,
+    maude: &MaudeHandle,
+    pool: Option<&MaudePool>,
+) {
+    // HS-faithful: skip variant computation if the signature has NO
+    // reducible function symbols — there's nothing to narrow.
+    if maude.maude_sig().reducible_fun_syms.is_empty() {
+        return;
+    }
+    let outs: Vec<Option<(ProtoRuleE, Vec<LNSubstVFresh>)>> = if let Some(pool) = pool {
+        use rayon::prelude::*;
+        elaborated
+            .items
+            .par_iter()
+            .map(|item| {
+                let TheoryItem::Rule(opr) = item else { return None };
+                // Per-task Maude from the pool: each rule's variant
+                // computation runs on its own subprocess (no IPC mutex
+                // contention).
+                let pooled = pool.acquire();
+                match abstract_rule_and_variants(&pooled, &opr.rule) {
+                    Ok(Some(pair)) => Some(pair),
+                    _ => None,
+                }
+            })
+            .collect()
+    } else {
+        elaborated
+            .items
+            .iter()
+            .map(|item| {
+                let TheoryItem::Rule(opr) = item else { return None };
+                match abstract_rule_and_variants(maude, &opr.rule) {
+                    Ok(Some(pair)) => Some(pair),
+                    _ => None,
+                }
+            })
+            .collect()
+    };
+    // Sequential writeback in source order.
+    for (item, out) in elaborated.items.iter_mut().zip(outs) {
+        let TheoryItem::Rule(opr) = item else { continue };
+        if let Some((abstr, substs)) = out {
+            opr.abstracted_rule = Some(abstr);
+            opr.variant_substs = substs;
+        }
+    }
+}
+
 pub fn abstract_rule_and_variants(
     maude: &MaudeHandle,
     rule: &ProtoRuleE,

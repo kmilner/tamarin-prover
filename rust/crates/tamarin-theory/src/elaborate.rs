@@ -929,6 +929,7 @@ fn elaborate_items(
                         raw: l.proof.as_ref().map(|p| p.raw.clone()).unwrap_or_default(),
                         tree: l.proof.as_ref().and_then(|p| p.tree.clone()),
                     },
+                    plaintext: l.plaintext.clone(),
                 };
                 out.items.push(TheoryItem::Lemma(lem));
             }

@@ -373,6 +373,67 @@ pub fn pretty_closed_theory(
     out
 }
 
+// =============================================================================
+// Interactive-web snippet reuse (Web/Theory.hs `messageSnippet` /
+// `rulesSnippet` / `htmlSource`).  These re-expose the byte-faithful
+// `--prove` printers so the web handler (`tamarin-server`) renders the same
+// text the CLI does — the web handler only adds the surrounding HTML tags.
+// =============================================================================
+
+/// HS `prettySignatureWithMaude sig = prettyMaudeSig (mhMaudeSig …)`
+/// (Signature.hs) — the same signature block the theory body prints
+/// (`render_signature`).  Used by the web message page's "Signature" section.
+pub fn web_signature_block(sig: &tamarin_term::maude_sig::MaudeSig) -> String {
+    render_signature(sig)
+}
+
+/// HS `prettyGoal` (Constraints.hs:262-285) — reuses the byte-faithful
+/// `solve_goal_to_doc`, rendered at the active display width.  Used for the
+/// web source-case header/premise (`htmlSource`'s `prettyGoal th._cdGoal`).
+pub fn web_pretty_goal(g: &crate::constraint::constraints::Goal) -> String {
+    solve_goal_to_doc(g).render()
+}
+
+/// Collect the theory's macros + predicates the way `pretty_closed_theory`
+/// does, so the per-item renderers below see the same expansion inputs.
+fn web_collect_macros_predicates(parsed: &p::Theory) -> (Vec<p::Macro>, Vec<p::Predicate>) {
+    let macros: Vec<p::Macro> = parsed.items.iter()
+        .filter_map(|i| if let p::TheoryItem::Macros(ms) = i { Some(ms.as_slice()) } else { None })
+        .flatten().cloned().collect();
+    let predicates: Vec<p::Predicate> = parsed.items.iter()
+        .filter_map(|i| if let p::TheoryItem::Predicates(ps) = i { Some(ps.as_slice()) } else { None })
+        .flatten().cloned().collect();
+    (macros, predicates)
+}
+
+/// HS `prettyClosedProtoRule` over `theoryRules thy` (Web/Theory.hs:894,898) —
+/// one rendered rule string per user protocol rule, in source order.  Reuses
+/// `render_rule` (the `--prove` theory-body rule printer) with the same
+/// macro/arity1/manual-variant setup `pretty_closed_theory` uses.
+pub fn web_proto_rules(parsed: &p::Theory, elaborated: &Theory) -> Vec<String> {
+    let (macros, _preds) = web_collect_macros_predicates(parsed);
+    let arity1 = arity1_noeq_names(elaborated);
+    let manual_variants = contains_manual_rule_variants(parsed, elaborated, false);
+    parsed.items.iter().filter_map(|item| match item {
+        p::TheoryItem::Rule(r) if elaborated.rules().any(|er| er.name() == r.name) =>
+            Some(render_rule(r, elaborated, &macros, &arity1, manual_variants, false)),
+        _ => None,
+    }).collect()
+}
+
+/// HS `prettyRestriction` over `theoryRestrictions thy` (Web/Theory.hs:895) —
+/// one rendered restriction string per restriction, in source order.  Reuses
+/// `render_parsed_restriction` (the `--prove` theory-body restriction printer).
+pub fn web_restrictions(parsed: &p::Theory, elaborated: &Theory) -> Vec<String> {
+    let (macros, predicates) = web_collect_macros_predicates(parsed);
+    let arity1 = arity1_noeq_names(elaborated);
+    parsed.items.iter().filter_map(|item| match item {
+        p::TheoryItem::Restriction(r) | p::TheoryItem::LegacyAxiom(r) =>
+            Some(render_parsed_restriction(r, &macros, &predicates, elaborated, &arity1)),
+        _ => None,
+    }).collect()
+}
+
 /// Render HS `ppInjectiveFactInsts` (ClosedTheory.hs:413-418):
 ///
 /// ```text
@@ -2121,6 +2182,19 @@ fn pp_proof(
     }
 }
 
+/// Render a `ProofMethod` to a flat string exactly as HS `prettyProofMethod`
+/// (ProofMethod.hs:1490-1499) — the SAME renderer the `--prove` proof tree
+/// uses, so `solve( <goal> )` carries the faithful fact spacing (`!KU( ~ltk )`),
+/// LVar dots (`#vk.2`), and contradiction reasons.  Used by the interactive
+/// web UI's applicable-methods list + proof snippet (`tamarin-server`), which
+/// must match `--prove`'s method text.  Rendered at the process display width
+/// (100 for the web); the semantic web gate normalises any wrapping away.
+pub fn pretty_proof_method_inline(
+    m: &crate::constraint::solver::proof_method::ProofMethod,
+) -> String {
+    pp_step_doc(m, 0, "").render()
+}
+
 /// Build the proof-step method as a `pretty_hpj::Doc`, mirroring
 /// `pp_step_at` but yielding a Doc (so it can be combined with the
 /// `/* unannotated */` comment via `sep`, per HS
@@ -2461,7 +2535,7 @@ fn strip_one_outer_paren(s: &str) -> &str {
 /// node-ids / node-conc / node-prem are atomic strings (HS `prettyNodeId`
 /// is `text . show`).  The non-empty DisjG case is rendered by the
 /// `disj_goal_to_doc` arm below.
-fn solve_goal_to_doc(
+pub(crate) fn solve_goal_to_doc(
     g: &crate::constraint::constraints::Goal,
 ) -> crate::pretty_hpj::Doc {
     use crate::constraint::constraints::Goal;

@@ -86,12 +86,16 @@ pub async fn interactive_overview(
     let Some(path) = parse_path(&raw_path) else {
         return not_found_response();
     };
-    // Eagerly build the live proof state when navigating to a
-    // proof/lemma path so the right pane can render the initial
-    // constraint system + applicable proof methods (Haskell does this
-    // implicitly via `subProofSnippet` since its `IncrementalProof` is
-    // always populated at theory close time).
-    materialise_proof_state_if_needed(&state, idx, &path);
+    // The full framed page ALWAYS renders the left-pane proof-state tree
+    // (`proof_state`), whose rule count (incl. the ISend/IRecv intruder
+    // members of `crProtocol`) and raw/refined source-case annotations come
+    // from the closed-theory `ProofContext`.  HS has these at theory-close
+    // time for every page; RS builds the context lazily, so we must ensure it
+    // here regardless of the center path — otherwise a frame whose center
+    // needs no proof state (help/edit/add/delete) would show `(0 cases)` and a
+    // proto-only rule count.  Best-effort: a Maude failure leaves the counts
+    // as-is (same as before).
+    let _ = state.store.ensure_proof_state(idx, &state.cfg.maude_path);
     let Some(entry) = state.store.get(idx) else {
         return missing_idx_html(idx);
     };
@@ -203,22 +207,33 @@ fn apply_method_and_redirect(
     if let Err(e) = new_ps.apply_at_path(lemma, sub, method) {
         return json_resp::alert(format!("proof step failed: {}", e));
     }
-    // Build the redirect URL.  NOTE: Haskell's `getTheoryPathMR` for
-    // `TheoryMethod` (`src/Web/Handler.hs:1013-1016`) advances the
-    // target via `nextSmartThyPath thy (TheoryProof lemma proofPath)`,
-    // i.e. it walks INTO the freshly created child case after applying
-    // the method.  The Rust port intentionally lands on the SAME node
-    // (`proof/<lemma>/<sub>`) instead — the autoprove handler's comment
-    // (see `apply` in this file) acknowledges the analogous deviation.
-    // The URL SHAPE still matches Haskell's `renderTheoryPath` for
-    // `TheoryProof lemma sub` (`src/Web/Types.hs:372`):
-    //   "proof" : lemma : (map prefixWithUnderscore sub)
-    // i.e. lemma root (sub=[]) becomes `proof/<lemma>` (no trailing
-    // segments); each sub segment is `prefixWithUnderscore`d.
+    // Build the redirect URL.  Haskell's `getTheoryPathMR` for
+    // `TheoryMethod` (`src/Web/Handler.hs:1013-1016`) advances the target
+    // via `nextSmartThyPath newThy (TheoryProof lemma proofPath)`, i.e. it
+    // walks INTO the freshly created child case of the grown tree.  We now
+    // do the same: re-fetch the entry at `new_idx` (its `proof_state` Arc is
+    // the one `apply_at_path` just grew) and run the shared
+    // `next_thy_path_inner` (smart) over it.  For a `TheoryProof` input that
+    // arm always yields another `TheoryProof` (child path, next-lemma root,
+    // or same path when nothing follows), so we render the `overview/proof`
+    // URL from its `(lemma, sub)`.  The URL SHAPE matches Haskell's
+    // `renderTheoryPath` (`src/Web/Types.hs:372`): lemma root (sub=[]) →
+    // `proof/<lemma>`; each sub segment is `prefixWithUnderscore`d.
+    let Some(new_entry) = state.store.get(new_idx) else {
+        return json_resp::alert(format!("theory index {} vanished", new_idx));
+    };
+    let src_path = path_parse::TheoryPath::Proof {
+        lemma: lemma.to_string(), sub: sub.to_vec() };
+    let (target_lemma, target_sub) = match next_thy_path_inner(&src_path, &new_entry, true) {
+        path_parse::TheoryPath::Proof { lemma, sub } => (lemma, sub),
+        // `nextSmartThyPath` of a `TheoryProof` never leaves the proof arm;
+        // fall back to the applied node if that invariant ever breaks.
+        _ => (lemma.to_string(), sub.to_vec()),
+    };
     let mut url = format!(
         "/thy/trace/{}/overview/proof/{}",
-        new_idx, path_parse::url_path_escape(lemma));
-    for seg in sub {
+        new_idx, path_parse::url_path_escape(&target_lemma));
+    for seg in &target_sub {
         url.push('/');
         url.push_str(&path_parse::url_path_escape(&path_parse::prefix_with_underscore(seg)));
     }
@@ -238,7 +253,14 @@ fn materialise_proof_state_if_needed(
     let needs = matches!(path,
         path_parse::TheoryPath::Proof { .. }
         | path_parse::TheoryPath::Method { .. }
-        | path_parse::TheoryPath::Lemma(_));
+        | path_parse::TheoryPath::Lemma(_)
+        // Message / Rules pages need the closed-theory intruder-rule
+        // classification + injective facts; Source pages need the
+        // precomputed raw/refined source cases.  All live in the
+        // `ProofContext` behind the `ProofState`.
+        | path_parse::TheoryPath::Message
+        | path_parse::TheoryPath::Rules
+        | path_parse::TheoryPath::Source { .. });
     if !needs { return; }
     let _ = state.store.ensure_proof_state(idx, &state.cfg.maude_path);
 }
@@ -274,14 +296,31 @@ fn title_for(entry: &crate::state::TheoryEntry, path: &path_parse::TheoryPath) -
         // TheoryProof l p | null (last p) -> "Method: " ++ methodName l p
         //                 | otherwise     -> "Case: " ++ last p
         //
-        // `methodName` resolves the proof node and renders
-        // `prettyProofMethod` of the node's method, returning "None" when
-        // resolution fails.  That plumbing (resolveProofPath +
-        // prettyProofMethod) is not yet ported to the Rust server, so the
-        // `Method:` arm falls back to HS's own "None" failure value.
-        Proof { lemma: _, sub } => match sub.last() {
-            // null (last p): "Method: " ++ methodName l p  (== "None" here).
-            Some(s) if s.is_empty() => "Method: None".to_string(),
+        //   methodName l p = case resolveProofPath thy l p of
+        //     Nothing    -> "None"
+        //     Just proof -> renderHtmlDoc . prettyProofMethod . psMethod
+        //                     . root $ proof
+        // i.e. render the proof method stored at the node the path resolves
+        // to.  `resolveProofPath` here == `navigate_at` on the live tree;
+        // `psMethod . root` == that node's `.method`; `prettyProofMethod`
+        // == `method_label`.  (`renderHtmlDoc` wraps operators in `hl_*`
+        // spans the parity gate unwraps, so plain `method_label` compares
+        // equal.)  Falls back to "None" when the tree/path is unresolvable,
+        // exactly as HS's `Nothing` arm does.
+        Proof { lemma, sub } => match sub.last() {
+            // null (last p): "Method: " ++ methodName l p
+            Some(s) if s.is_empty() => {
+                let name = entry
+                    .proof_state
+                    .as_ref()
+                    .and_then(|ps| ps.get_root(lemma))
+                    .and_then(|root| {
+                        crate::handlers::proof_tree::navigate_at(&root, sub)
+                            .map(|n| crate::handlers::proof_tree::method_label(&n.method))
+                    })
+                    .unwrap_or_else(|| "None".to_string());
+                format!("Method: {}", name)
+            }
             // otherwise: "Case: " ++ last p
             Some(s) => format!("Case: {}", s),
             None => unreachable!("sub is non-empty: the [] case is handled above"),
@@ -296,6 +335,39 @@ fn title_for(entry: &crate::state::TheoryEntry, path: &path_parse::TheoryPath) -
 // Source / message deduction (pretty-printed)
 // ---------------------------------------------------------------------
 
+/// Render the full closed-theory source, mirroring HS `getTheorySourceR`
+/// and `getTheoryMessageDeductionR` — both are `render . prettyClosedTheory
+/// . theory` (`Web/Handler.hs:950,985`), i.e. identical output.
+///
+/// Lemmas whose proofs have not been built render `by sorry` (empty
+/// `proved`); the `Generated from:` version/build lines are placeholders
+/// (the interactive server does not carry the CLI build constants — the
+/// web-parity gate normalizes them away, as does HS's own `--prove` gate).
+/// Wellformedness: the plain-text report is not retained by the server
+/// (only the unported HTML banner), so we render the "all successful"
+/// block; theories with wf warnings will diverge here until it is threaded
+/// through.
+fn render_theory_source(entry: &crate::state::TheoryEntry) -> String {
+    let build = tamarin_theory::pretty_theory::BuildInfo {
+        tamarin_version: env!("CARGO_PKG_VERSION").to_string(),
+        maude_version: String::new(),
+        git_revision: String::new(),
+        git_branch: String::new(),
+        compiled_at: String::new(),
+    };
+    let wf_block = "/* All wellformedness checks were successful. */";
+    let in_file = entry.origin.label();
+    tamarin_theory::pretty_theory::pretty_closed_theory(
+        &entry.parser_theory,
+        &entry.typed_theory,
+        &[],
+        wf_block,
+        &build,
+        &in_file,
+        false,
+    )
+}
+
 pub async fn source_(
     State(state): State<Arc<AppState>>,
     Path(idx): Path<usize>,
@@ -303,21 +375,7 @@ pub async fn source_(
     let Some(entry) = state.store.get(idx) else {
         return missing_idx_html(idx);
     };
-    // `pretty_theory::pretty_closed_theory` (pretty_theory.rs:238) is
-    // available; this handler still emits the `(...)` placeholder form below
-    // and just needs to call it to render the full theory source.
-    let mut s = format!("theory {}\n\nbegin\n\n", entry.name);
-    for r in entry.typed_theory.rules() {
-        s.push_str(&format!("rule {}: (...)\n", r.name()));
-    }
-    for r in entry.typed_theory.restrictions() {
-        s.push_str(&format!("restriction {}: (...)\n", r.name));
-    }
-    for l in entry.typed_theory.lemmas() {
-        s.push_str(&format!("lemma {}: (...)\n", l.name));
-    }
-    s.push_str("\nend\n");
-    text_response(s)
+    text_response(render_theory_source(&entry))
 }
 
 pub async fn message_deduction(
@@ -327,7 +385,7 @@ pub async fn message_deduction(
     let Some(entry) = state.store.get(idx) else {
         return missing_idx_html(idx);
     };
-    text_response(format!("# message deduction for {}\n# (not yet implemented in Rust port)\n", entry.name))
+    text_response(render_theory_source(&entry))
 }
 
 // ---------------------------------------------------------------------
@@ -451,11 +509,16 @@ pub async fn autoprove(
             };
             tracing::info!("autoprove verdict for {}: {}", lemma_name, verdict);
             // Mirror Haskell `modifyTheory` (`src/Web/Handler.hs:736`):
-            // allocate a fresh theory idx for the post-autoprove state
-            // so the user can compare before/after.
+            // allocate a fresh theory idx for the post-autoprove state.
+            // Use the FORKING clone so the new idx PRESERVES the source
+            // idx's already-proved lemmas (HS `modifyTheory` puts the
+            // modified `ClosedTheory` — with its full `IncrementalProof`
+            // — at the new idx, so proving lemma-by-lemma accumulates).
+            // The non-forking `clone_at_new_idx` would reset the proof
+            // state, leaving only the just-proved lemma at each idx.
             let new_idx = state
                 .store
-                .clone_at_new_idx(idx)
+                .clone_at_new_idx_forking_proof_state(idx)
                 .unwrap_or(idx);
             // Install the autoproved tree into the new idx's ProofState
             // so the user can navigate it.  Best-effort: if
@@ -465,21 +528,42 @@ pub async fn autoprove(
                 new_idx, &state.cfg.maude_path) {
                 let _ = ps.replace_root(&lemma_name, root);
             }
-            // Render mirrors Haskell `renderTheoryPath` for
-            // `TheoryProof lemma []` → `proof/<lemma>` (the empty
-            // tail produces no extra path segment — see Haskell's
-            // `renderTheoryPath` definition in `src/Web/Types.hs:372`).
-            // After autoprove, Haskell's `nextSmartThyPath` typically
-            // walks INTO the freshly grown proof tree (the captured
-            // fixture has `ONE/ONE` from the protocol's first rule
-            // case).  Since our Rust solver returns a status rather
-            // than the proof tree, we land on the proof root.  Both
-            // shapes are accepted by the frontend dispatcher
-            // (`server.handleJson` just navigates).
-            let redir = format!(
-                "/thy/trace/{idx}/overview/proof/{lname}",
-                idx = new_idx,
-                lname = path_parse::url_path_escape(&lemma_name));
+            // Haskell `getAutoProverR` (`src/Web/Handler.hs`) redirects via
+            // `nextSmartThyPath newThy (TheoryProof lemma proofPath)` over the
+            // freshly autoproved tree.  For a fully-proved all-traces lemma
+            // (no interesting `Sorry`/`Finished Solved`/`Unfinishable` step)
+            // that walks to the NEXT lemma's root; for an exists-trace lemma
+            // it lands on the `Finished Solved` witness node.  Re-fetch the
+            // entry at `new_idx` (its `proof_state` Arc now holds the
+            // installed tree) and run the shared smart traversal from the
+            // proof path the autoprover was invoked at.
+            let src_sub: Vec<String> = match &path {
+                path_parse::TheoryPath::Proof { sub, .. } => sub.clone(),
+                _ => Vec::new(),
+            };
+            let redir = match state.store.get(new_idx) {
+                Some(new_entry) => {
+                    let src_path = path_parse::TheoryPath::Proof {
+                        lemma: lemma_name.clone(), sub: src_sub };
+                    let (tl, ts) = match next_thy_path_inner(&src_path, &new_entry, true) {
+                        path_parse::TheoryPath::Proof { lemma, sub } => (lemma, sub),
+                        _ => (lemma_name.clone(), Vec::new()),
+                    };
+                    let mut u = format!(
+                        "/thy/trace/{}/overview/proof/{}",
+                        new_idx, path_parse::url_path_escape(&tl));
+                    for seg in &ts {
+                        u.push('/');
+                        u.push_str(&path_parse::url_path_escape(
+                            &path_parse::prefix_with_underscore(seg)));
+                    }
+                    u
+                }
+                None => format!(
+                    "/thy/trace/{idx}/overview/proof/{lname}",
+                    idx = new_idx,
+                    lname = path_parse::url_path_escape(&lemma_name)),
+            };
             json_resp::redirect(redir).into_response()
         }
     }
@@ -703,7 +787,7 @@ pub async fn reload(
         crate::state::TheoryOrigin::Interactive => return json_resp::alert(
             "Cannot reload: theory was created interactively (no file path)"),
     };
-    match crate::theory_io::load_from_path(&path) {
+    match crate::theory_io::load_from_path(&path, &state.cfg.maude_path) {
         Ok(new_entry) => {
             // Replace at the SAME idx — matches Haskell's
             // `replaceTheory` (used by `postReloadTheoryR` and
@@ -780,12 +864,10 @@ pub async fn next_path(
     let Some(entry) = state.store.get(idx) else {
         return missing_idx_html(idx);
     };
-    let lemma_names: Vec<String> =
-        entry.typed_theory.lemmas().map(|l| l.name.clone()).collect();
     let Some(path) = parse_path(&raw_path) else {
         return not_found_response();
     };
-    let new_path = next_theory_path(&path, &section, &lemma_names);
+    let new_path = next_theory_path(&path, &section, &entry);
     let url = render_main_url(idx, &new_path);
     text_response(url)
 }
@@ -798,12 +880,10 @@ pub async fn prev_path(
     let Some(entry) = state.store.get(idx) else {
         return missing_idx_html(idx);
     };
-    let lemma_names: Vec<String> =
-        entry.typed_theory.lemmas().map(|l| l.name.clone()).collect();
     let Some(path) = parse_path(&raw_path) else {
         return not_found_response();
     };
-    let new_path = prev_theory_path(&path, &section, &lemma_names);
+    let new_path = prev_theory_path(&path, &section, &entry);
     let url = render_main_url(idx, &new_path);
     text_response(url)
 }
@@ -819,20 +899,26 @@ pub async fn prev_path(
 fn next_theory_path(
     p: &path_parse::TheoryPath,
     section: &str,
-    lemmas: &[String],
+    entry: &crate::state::TheoryEntry,
 ) -> path_parse::TheoryPath {
+    // HS `getNextTheoryPathR` (`Handler.hs:1452-1455`): `next "normal" =
+    // nextThyPath`, `next "smart" = nextSmartThyPath`, everything else
+    // `const id` (no-op).  The two differ ONLY in the `TheoryProof` arm.
     match section {
-        "normal" | "smart" => next_thy_path_inner(p, lemmas),
+        "normal" => next_thy_path_inner(p, entry, false),
+        "smart" => next_thy_path_inner(p, entry, true),
         _ => p.clone(),
     }
 }
 
 fn next_thy_path_inner(
     p: &path_parse::TheoryPath,
-    lemmas: &[String],
+    entry: &crate::state::TheoryEntry,
+    smart: bool,
 ) -> path_parse::TheoryPath {
     use path_parse::TheoryPath as T;
     use path_parse::SourceKind;
+    let lemmas = lemma_names(entry);
     match p {
         T::Help => T::Message,
         T::Message => T::Rules,
@@ -840,7 +926,7 @@ fn next_thy_path_inner(
         T::Tactic => T::Source { kind: SourceKind::Raw, src_idx: 0, case_idx: 0 },
         T::Source { kind: SourceKind::Raw, .. } =>
             T::Source { kind: SourceKind::Refined, src_idx: 0, case_idx: 0 },
-        // Haskell `nextThyPath` (Web/Theory.hs:1681): refined sources
+        // Haskell `nextThyPath` (Web/Theory.hs:1683): refined sources
         // advance to the FIRST lemma's proof root, falling back to Help
         // only when there are no lemmas.
         T::Source { kind: SourceKind::Refined, .. } => match lemmas.first() {
@@ -849,31 +935,52 @@ fn next_thy_path_inner(
         },
         T::Lemma(n) => T::Proof { lemma: n.clone(), sub: Vec::new() },
         T::Edit(_) | T::Add(_) | T::Delete(_) => T::Help,
-        // Haskell advances within the proof tree / to the next lemma's
-        // root.  The Rust port does not yet maintain proof-tree paths
-        // here, so a no-op (same path) is kept for TheoryProof; see the
-        // module doc on `next_path`.
-        T::Proof { .. } | T::Method { .. } => p.clone(),
+        // HS `nextThyPath`/`nextSmartThyPath` TheoryProof arm
+        // (Web/Theory.hs:1688-1691 / 1900-1903):
+        //   | Just nextPath <- getNextPath l p -> TheoryProof l nextPath
+        //   | Just nextLemma <- getNextLemma l -> TheoryProof nextLemma []
+        //   | otherwise                        -> TheoryProof l p
+        T::Proof { lemma, sub } => {
+            let paths = lemma_proof_paths(entry, lemma);
+            let next = if smart {
+                next_smart_path(&paths, sub)
+            } else {
+                next_element_path(&paths, sub)
+            };
+            match next {
+                Some(np) => T::Proof { lemma: lemma.clone(), sub: np },
+                None => match next_after(&lemmas, lemma) {
+                    Some(nl) => T::Proof { lemma: nl, sub: Vec::new() },
+                    None => p.clone(),
+                },
+            }
+        }
+        // HS `path@TheoryMethod{} -> path` (no-op).
+        T::Method { .. } => p.clone(),
     }
 }
 
 fn prev_theory_path(
     p: &path_parse::TheoryPath,
     section: &str,
-    lemmas: &[String],
+    entry: &crate::state::TheoryEntry,
 ) -> path_parse::TheoryPath {
     match section {
-        "normal" | "smart" => prev_thy_path_inner(p, lemmas),
+        "normal" => prev_thy_path_inner(p, entry, false),
+        "smart" => prev_thy_path_inner(p, entry, true),
         _ => p.clone(),
     }
 }
 
 fn prev_thy_path_inner(
     p: &path_parse::TheoryPath,
-    lemmas: &[String],
+    entry: &crate::state::TheoryEntry,
+    smart: bool,
 ) -> path_parse::TheoryPath {
     use path_parse::TheoryPath as T;
     use path_parse::SourceKind;
+    let lemmas = lemma_names(entry);
+    let refined_root = || T::Source { kind: SourceKind::Refined, src_idx: 0, case_idx: 0 };
     match p {
         T::Help => T::Help,
         T::Message => T::Help,
@@ -882,29 +989,123 @@ fn prev_thy_path_inner(
         T::Source { kind: SourceKind::Raw, .. } => T::Tactic,
         T::Source { kind: SourceKind::Refined, .. } =>
             T::Source { kind: SourceKind::Raw, src_idx: 0, case_idx: 0 },
-        // Haskell `prevThyPath` (Web/Theory.hs:1781-1782):
-        //   TheoryLemma l -> TheoryProof prevLemma (lastPath prevLemma)
-        //                    when a previous lemma exists,
-        //                 -> TheorySource RefinedSource 0 0  otherwise.
-        // `lastPath` needs the proof tree (not maintained here), so we
-        // land on the previous lemma's proof root instead of its last
-        // path; the no-previous-lemma fallback matches Haskell exactly.
-        T::Lemma(n) => {
-            let prev = lemmas.iter()
-                .position(|l| l == n)
-                .and_then(|i| i.checked_sub(1))
-                .and_then(|i| lemmas.get(i));
+        // HS `prevThyPath` (Web/Theory.hs:1781-1783):
+        //   TheoryLemma l | Just prevLemma <- getPrevLemma l
+        //                     -> TheoryProof prevLemma (lastPath prevLemma)
+        //                 | otherwise -> TheorySource RefinedSource 0 0
+        T::Lemma(n) => match prev_before(&lemmas, n) {
+            Some(pl) => {
+                let sub = last_path(&lemma_proof_paths(entry, &pl));
+                T::Proof { lemma: pl, sub }
+            }
+            None => refined_root(),
+        },
+        T::Edit(_) | T::Add(_) | T::Delete(_) => T::Help,
+        // HS `prevThyPath`/`prevSmartThyPath` TheoryProof arm
+        // (Web/Theory.hs:1784-1787 / 2001-2005):
+        //   | Just prevPath <- getPrevPath l p -> TheoryProof l prevPath
+        //   | Just prevLemma <- getPrevLemma l ->
+        //         TheoryProof prevLemma (lastPath prevLemma)
+        //   | otherwise                        -> TheorySource RefinedSource 0 0
+        T::Proof { lemma, sub } => {
+            let paths = lemma_proof_paths(entry, lemma);
+            let prev = if smart {
+                prev_smart_path(&paths, sub)
+            } else {
+                prev_element_path(&paths, sub)
+            };
             match prev {
-                Some(pl) => T::Proof { lemma: pl.clone(), sub: Vec::new() },
-                None => T::Source {
-                    kind: SourceKind::Refined, src_idx: 0, case_idx: 0 },
+                Some(pp) => T::Proof { lemma: lemma.clone(), sub: pp },
+                None => match prev_before(&lemmas, lemma) {
+                    Some(pl) => {
+                        let sub = last_path(&lemma_proof_paths(entry, &pl));
+                        T::Proof { lemma: pl, sub }
+                    }
+                    None => refined_root(),
+                },
             }
         }
-        T::Edit(_) | T::Add(_) | T::Delete(_) => T::Help,
-        // Proof-tree-dependent (lastPath / prevPath): kept as a no-op
-        // since the Rust port does not yet maintain proof-tree paths.
-        T::Proof { .. } | T::Method { .. } => p.clone(),
+        // HS `path@TheoryMethod{} -> path` (no-op).
+        T::Method { .. } => p.clone(),
     }
+}
+
+/// Lemma names in declaration order (HS `getLemmas thy`).
+fn lemma_names(entry: &crate::state::TheoryEntry) -> Vec<String> {
+    entry.typed_theory.lemmas().map(|l| l.name.clone()).collect()
+}
+
+/// The proof-path list for a lemma (HS `getProofPaths lemma._lProof`).  When
+/// no proof state has been materialised yet (a freshly-loaded theory before
+/// any autoprove), the lemma's proof is HS's initial `sorry` skeleton — a
+/// single root path — which is exactly what the `next`/`prev` traversal needs
+/// (an unproven lemma yields no in-tree next/prev step, only lemma jumps).
+fn lemma_proof_paths(
+    entry: &crate::state::TheoryEntry,
+    lemma: &str,
+) -> Vec<(Vec<String>, tamarin_theory::constraint::solver::proof_method::ProofMethod)> {
+    use tamarin_theory::constraint::solver::proof_method::ProofMethod;
+    entry
+        .proof_state
+        .as_ref()
+        .and_then(|ps| ps.get_root(lemma))
+        .map(|root| crate::handlers::proof_tree::get_proof_paths(&root))
+        .unwrap_or_else(|| vec![(Vec::new(), ProofMethod::Sorry(None))])
+}
+
+type PathList = [(Vec<String>, tamarin_theory::constraint::solver::proof_method::ProofMethod)];
+
+/// HS `getNextElement (== path) (map fst paths)` — the path immediately after
+/// the match; `None` if `sub` is absent or last.
+fn next_element_path(paths: &PathList, sub: &[String]) -> Option<Vec<String>> {
+    let i = paths.iter().position(|(p, _)| p.as_slice() == sub)?;
+    paths.get(i + 1).map(|(p, _)| p.clone())
+}
+
+/// HS `nextSmartThyPath.getNextPath`: `dropWhile (/= path)`, then the first of
+/// the REMAINING (after the match) whose method `isInterestingMethod`.
+fn next_smart_path(paths: &PathList, sub: &[String]) -> Option<Vec<String>> {
+    let i = paths.iter().position(|(p, _)| p.as_slice() == sub)?;
+    paths[i + 1..]
+        .iter()
+        .find(|(_, m)| crate::handlers::proof_tree::is_interesting_method(m))
+        .map(|(p, _)| p.clone())
+}
+
+/// HS `getPrevElement (== path) (map fst paths)` — the path immediately before
+/// the match; `None` if `sub` is absent or first.
+fn prev_element_path(paths: &PathList, sub: &[String]) -> Option<Vec<String>> {
+    let i = paths.iter().position(|(p, _)| p.as_slice() == sub)?;
+    i.checked_sub(1).map(|j| paths[j].0.clone())
+}
+
+/// HS `prevSmartThyPath.getPrevPath`: the LAST interesting-method path among
+/// those STRICTLY BEFORE the match (`filter isInteresting . takeWhile (/=)`).
+fn prev_smart_path(paths: &PathList, sub: &[String]) -> Option<Vec<String>> {
+    let i = paths.iter().position(|(p, _)| p.as_slice() == sub)?;
+    paths[..i]
+        .iter()
+        .rev()
+        .find(|(_, m)| crate::handlers::proof_tree::is_interesting_method(m))
+        .map(|(p, _)| p.clone())
+}
+
+/// HS `lastPath` = `last (map fst (getProofPaths ...))`.  The path list is
+/// never empty (always contains the root `[]`), so this is total.
+fn last_path(paths: &PathList) -> Vec<String> {
+    paths.last().map(|(p, _)| p.clone()).unwrap_or_default()
+}
+
+/// HS `getNextElement (== l) names` — the lemma after `cur`.
+fn next_after(names: &[String], cur: &str) -> Option<String> {
+    let i = names.iter().position(|n| n == cur)?;
+    names.get(i + 1).cloned()
+}
+
+/// HS `getPrevElement (== l) names` — the lemma before `cur`.
+fn prev_before(names: &[String], cur: &str) -> Option<String> {
+    let i = names.iter().position(|n| n == cur)?;
+    i.checked_sub(1).map(|j| names[j].clone())
 }
 
 fn render_main_url(idx: usize, p: &path_parse::TheoryPath) -> String {
@@ -960,22 +1161,39 @@ fn resolve_system_for_path(
 pub async fn intdot(
     State(state): State<Arc<AppState>>,
     Path((idx, raw_path)): Path<(usize, String)>,
-    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let Some(_entry) = state.store.get(idx) else {
+    let Some(entry) = state.store.get(idx) else {
         return missing_idx_html(idx);
     };
-    let Some(path) = parse_path(&raw_path) else {
-        return not_found_response();
-    };
-    let sys = match resolve_system_for_path(&state, idx, &path) {
-        Some(s) => s,
-        None => return text_response(
-            "digraph G { label=\"no system at this path\" }\n".into()),
-    };
-    let opts = graph_options_from_map(&query);
-    let dot = crate::handlers::dot::system_to_dot_with(&sys, &opts);
-    text_response(dot)
+    // HS `getInteractiveDotGraphR` (`src/Web/Handler.hs:897`) returns the
+    // HTML shell page `intdotLayout` (`src/Web/Types.hs:727-744`): a
+    // `<dot-graph-viz>` custom element whose `dotsrc` points at the
+    // `interactive-graph-def` route (which serves the raw DOT that the
+    // bundled `intdot-graph.es.js` renders client-side).  It does NOT
+    // resolve the constraint system itself — the shell is system-agnostic.
+    let dotsrc = format!(
+        "/thy/trace/{idx}/interactive-graph-def/{path}",
+        idx = idx,
+        path = raw_path,
+    );
+    let title = crate::handlers::root::html_escape(&format!("Theory: {}", entry.name));
+    // Byte-for-byte reproduction of HS `intdotLayout` (`src/Web/Types.hs:727`),
+    // including its doubled `</script></script>` Hamlet quirk — the stray end
+    // tag shifts DOM nesting, so matching it verbatim is what makes the
+    // semantic gate see the same tree.
+    let html = format!(
+        "<!DOCTYPE html>\n<html><head>\
+         <meta charset=\"UTF-8\" />\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\
+         <title>{title}</title>\
+         <style> body,html{{width: 100%; height: 100%; overflow: hidden; margin: 0; padding: 0; }}</style>\
+         <link rel=\"stylesheet\" href=\"/static/css/intdot-style.css\">\
+         <script type=\"module\" src=\"/static/js/intdot-graph.es.js\"></script></script>\
+         </head><body><dot-graph-viz dotsrc=\"{dotsrc}\"></dot-graph-viz>\n</body></html>",
+        title = title,
+        dotsrc = dotsrc,
+    );
+    html_response(html)
 }
 
 /// Build `GraphOptions` from a parsed query map.  Re-uses the same

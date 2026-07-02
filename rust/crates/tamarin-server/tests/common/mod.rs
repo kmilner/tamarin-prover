@@ -72,7 +72,7 @@ pub async fn start_server_with_theory(fixture_name: &str) -> TestServer {
 
     // Load theory before starting server.
     let store = TheoryStore::default();
-    let entry = tamarin_server::theory_io::load_from_path(&theory_path)
+    let entry = tamarin_server::theory_io::load_from_path(&theory_path, &detect_maude())
         .expect("fixture should parse + elaborate");
     let _idx = store.insert(entry);
 

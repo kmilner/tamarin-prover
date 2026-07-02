@@ -453,11 +453,15 @@ async fn test_main_message_envelope() {
     let haskell_keys = haskell_capture_keys("main_message.json");
     assert_eq!(rust_keys, haskell_keys);
 
-    // issue193's only restriction is `equality`.
+    // HS `messageSnippet` (Web/Theory.hs:920-931): Signature +
+    // Construction/Deconstruction rule sections (NOT restrictions — those
+    // live on the rules page).
     let html = v.get("html").and_then(|t| t.as_str()).unwrap_or("");
     assert!(
-        html.contains("equality"),
-        "message html should mention restriction `equality`; html={}",
+        html.contains("Signature")
+            && html.contains("Construction Rules")
+            && html.contains("Deconstruction Rules"),
+        "message html should have Signature + Construction/Deconstruction sections; html={}",
         html
     );
 }
@@ -479,17 +483,19 @@ async fn test_main_lemma_envelope() {
 
     let title = v.get("title").and_then(|t| t.as_str()).unwrap_or("");
     let html = v.get("html").and_then(|t| t.as_str()).unwrap_or("");
-    // Per our Rust title_for, the title is "<name> :: <lemma>".  This
-    // differs cosmetically from Haskell's "Lemma: <lemma>" but the
-    // KEY SET still matches.  See README.
     assert!(
         title.contains("debug"),
         "title should mention the lemma name; got {:?}",
         title
     );
+    // HS `htmlThyPath` renders `TheoryLemma _ -> text "this is a mistake"`
+    // (Web/Theory.hs:1068) — a deliberate upstream quirk; the bare
+    // `main/lemma/<name>` path is never used by the frontend (it always
+    // links to `main/proof/<name>`).  We match the oracle verbatim; the
+    // HS capture is `{"html":"this is a mistake<br/>\n",...}`.
     assert!(
-        html.contains("debug") || html.contains("exists-trace"),
-        "html should reference the lemma or its quantifier; got {}",
+        html.contains("this is a mistake"),
+        "html must match HS's `this is a mistake` quirk; got {}",
         html
     );
 }

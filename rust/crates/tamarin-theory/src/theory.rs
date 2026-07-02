@@ -171,6 +171,10 @@ pub struct Lemma<P = ProofSkeleton> {
     /// once we have a typed formula AST we'll narrow this.
     pub formula: tamarin_parser::ast::Formula,
     pub proof: P,
+    /// Verbatim source text (comments stripped) — HS `_lPlaintext`
+    /// (`Items/LemmaItem.hs:50`).  Carried through elaboration for the
+    /// interactive web server's Edit-lemma form; never used by `--prove`.
+    pub plaintext: String,
 }
 
 // Not yet ported: diff theories (needs `ClosedDiffTheory`). `DiffLemma`,

@@ -140,8 +140,29 @@ pub fn proof_status(node: &ProofNode) -> ProofStatus {
 // preserved exactly: `TAM_RS_KEEP_SYS` is `var_os`-presence, so cache it
 // as the affirmative `keep_sys()` and negate at the call site.
 
+/// Programmatic override for [`keep_sys`], set by the interactive web
+/// server at startup.  `--prove` drops each node's `System` after
+/// expansion to keep peak RSS low (the text proof never reprints a
+/// per-node system).  The interactive server, in contrast, renders the
+/// annotated constraint system + applicable proof methods at every proof
+/// path (HS keeps a `Just System` on every `IncrementalProof` node), so
+/// it must retain them.  Call `set_keep_sys(true)` before any
+/// `run_proof_search`.  Default `false` → CLI behaviour unchanged.
+static KEEP_SYS_OVERRIDE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Enable/disable per-node `System` retention across the whole process.
+pub fn set_keep_sys(retain: bool) {
+    KEEP_SYS_OVERRIDE.store(retain, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[inline]
 fn keep_sys() -> bool {
+    // Programmatic override (interactive server) OR the `TAM_RS_KEEP_SYS`
+    // env presence (diagnostic).  Either forces retention.
+    if KEEP_SYS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("TAM_RS_KEEP_SYS").is_some())
 }
@@ -1008,6 +1029,81 @@ pub fn candidate_methods(
                 UseInduction::AvoidInduction => {
                     // [Simplify, Induction, goals...]
                     out.insert(1, ProofMethod::Induction);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// UI-only variant of [`candidate_methods`] that also returns, for each
+/// method, the explanation string HS's `rankProofMethods` attaches
+/// (`ProofMethod.hs:754-769`).  `Simplify` / `Induction` / stopping
+/// methods get `""`; each `SolveGoal g` gets
+/// `"nr. " ++ show nr ++ sourceRule ++ usefulnessSuffix`, where
+/// `sourceRule = " (from rule "++getRuleName ru++")"` for the goal's node
+/// rule and the suffix comes from the `Usefulness` tag (NOT the
+/// useful1/useful2 split `prettyGoals` uses).  Consumed by
+/// `subProofSnippet`'s `prettyPM`, which renders it as a `// <expl>` line
+/// comment after each applicable proof method.  Kept separate from
+/// `candidate_methods` so the search hot path never allocates these
+/// strings.
+pub fn candidate_methods_with_expl(
+    sys: &System,
+    ctx: &ProofContext,
+    depth: usize,
+) -> Vec<(ProofMethod, String)> {
+    use crate::constraint::constraints::Goal;
+    use crate::constraint::solver::annotated_goals::Usefulness;
+    use crate::constraint::solver::context::UseInduction;
+    let goals = match crate::constraint::solver::goals::rank_goals_with(sys, Some(ctx), depth) {
+        Ok(gs) => gs,
+        // Oracle ranked nothing with quitOnEmpty → ApplySorry (expl "").
+        Err(e) if e.0 == "__ORACLE_QUIT_ON_EMPTY__" => {
+            return vec![(
+                ProofMethod::Sorry(Some("Oracle ranked no proof methods".into())),
+                String::new(),
+            )];
+        }
+        // Oracle exec failure — same hard abort as `candidate_methods`.
+        Err(e) => {
+            eprintln!("tamarin-prover: {}", e);
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            std::process::exit(1);
+        }
+    };
+    let mut out: Vec<(ProofMethod, String)> = Vec::with_capacity(goals.len() + 2);
+    out.push((ProofMethod::Simplify, String::new()));
+    for ag in goals.into_iter() {
+        // HS `sourceRule goal = case goalRule sys goal of Just ru -> …`.
+        let source_rule = match &ag.goal {
+            Goal::Action(i, _) | Goal::Premise((i, _), _) => sys
+                .node_rule_safe(i)
+                .map(|ru| format!(" (from rule {})", crate::rule::rule_name_string(ru)))
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        let suffix = match ag.usefulness {
+            Usefulness::Useful => "",
+            Usefulness::LoopBreaker => " (loop breaker)",
+            Usefulness::ProbablyConstructible => " (probably constructible)",
+            Usefulness::CurrentlyDeducible => " (currently deducible)",
+        };
+        let expl = format!("nr. {}{}{}", ag.seq, source_rule, suffix);
+        out.push((ProofMethod::SolveGoal(ag.goal), expl));
+    }
+    if is_initial_system(sys) {
+        let can_induct = sys
+            .formulas
+            .first()
+            .map(|fm| crate::guarded::ginduct(fm).is_ok())
+            .unwrap_or(false);
+        if can_induct {
+            match ctx.use_induction {
+                UseInduction::UseInduction => out.insert(0, (ProofMethod::Induction, String::new())),
+                UseInduction::AvoidInduction => {
+                    out.insert(1, (ProofMethod::Induction, String::new()))
                 }
             }
         }

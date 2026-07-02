@@ -35,7 +35,6 @@ use crate::constraint::system::{SourceKind, System};
 use crate::fact::{fact_tag_name, LNFact};
 use crate::guarded::Guarded;
 use crate::pretty_formula::pretty_guarded;
-use crate::rule::{ConcIdx, PremIdx};
 
 /// Emit just the non-graph-part of the system, matching Haskell's
 /// `prettyNonGraphSystem`.  See file-level docs for the section list.
@@ -361,58 +360,52 @@ fn vcat_doc(ds: Vec<Doc>) -> Doc {
 // goals
 // ---------------------------------------------------------------------
 
-// Mirrors Haskell `prettyGoals` (System.hs:1735-1753). The stored goal
-// number `gsNr` is used directly (HS `L.get gsNr status`) rather than
-// recomputed by counting. NOTE: this printer intentionally omits the
-// `sourceRule` (` (from rule NAME)`) and `useful` (` (useful1)` /
-// ` (currently deducible)` / ` (probably constructible)` / ` (useful2)`)
-// annotations, and iterates `sys.goals` in insertion order rather than
-// `M.toList` Goal-Ord order, because the supporting infrastructure
-// (`goalRule`, `currentlyDeducible`, `probablyConstructible`, a `Goal`
-// Ord matching Haskell) is not available in this crate. This is an
-// interactive-UI diagnostic pane only and does not affect proof results.
+// Mirrors Haskell `prettyGoals` (System.hs:1735-1753):
+//   (goal, status) <- M.toList sGoals          -- Goal-Ord iteration
+//   guard (solved == gsSolved status)
+//   prettyGoal goal <-> lineComment_
+//       ("nr: " ++ show nr ++ sourceRule ++ loopBreaker ++ show useful)
+// where `sourceRule = " (from rule "++getRuleName ru++")"` for the goal's
+// node rule (goalRule), `loopBreaker` from `gsLoopBreaker`, and `useful`
+// the KU-usefulness classification.  `show useful` wraps the annotation in
+// literal double-quotes (HS `Show String`).  Goals are rendered through the
+// SAME faithful `prettyGoal` Doc the `--prove` proof tree uses
+// (`solve_goal_to_doc`), so fact spacing (`!KU( ~ltk )`) and LVar dots match.
 fn pretty_goals(sys: &System, want_solved: bool) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    for (g, st) in sys.goals.iter() {
-        if st.solved != want_solved { continue; }
-        let lb = if st.looping { " (loop breaker)".to_string() } else { String::new() };
-        lines.push(format!("{}  // nr: {}{}", pretty_goal(g), st.nr, lb));
+    // `M.toList sGoals` yields Goal-Ord; RS stores goals in a Vec (creation
+    // order), so sort by the solver's `goal_cmp` before rendering.
+    let mut ordered: Vec<_> = sys.goals.iter()
+        .filter(|(_, st)| st.solved == want_solved)
+        .collect();
+    ordered.sort_by(|a, b|
+        crate::constraint::solver::goals::goal_cmp(&a.0, &b.0));
+    let mut lines: Vec<String> = Vec::with_capacity(ordered.len());
+    for (g, st) in ordered {
+        // sourceRule = HS `goalRule sys goal` → `nodeRuleSafe (goalNodeId g)`.
+        // `goalNodeId` is the node of a Premise/Action goal; other goals have
+        // none (→ no sourceRule).
+        let source_rule = match g {
+            Goal::Action(i, _) | Goal::Premise((i, _), _) => sys
+                .node_rule_safe(i)
+                .map(|ru| format!(" (from rule {})", crate::rule::rule_name_string(ru)))
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        let loop_breaker = if st.looping { " (loop breaker)" } else { "" };
+        // `show useful` — HS wraps the annotation string in literal quotes.
+        let useful = crate::constraint::solver::goals::goal_useful_annotation(
+            g, st.looping, sys);
+        // HS `prettyGoal goal <-> lineComment_ (...)` — the `<->`/`<+>`
+        // operators each insert a single space (goal ` ` `//` ` ` text).
+        lines.push(format!(
+            "{} // nr: {}{}{}\"{}\"",
+            crate::pretty_theory::solve_goal_to_doc(g).render(),
+            st.nr, source_rule, loop_breaker, useful,
+        ));
     }
-    lines.join("\n")
-}
-
-fn pretty_goal(g: &Goal) -> String {
-    match g {
-        Goal::Action(nid, fa) =>
-            format!("{} @ {}", pretty_fact(fa), pretty_node_id(nid)),
-        Goal::Chain(src, tgt) =>
-            format!("{} ~~> {}", pretty_node_conc(src), pretty_node_prem(tgt)),
-        Goal::Premise(np, fa) => {
-            let (nid, PremIdx(i)) = np;
-            format!("{} \u{25B6}{} {}", pretty_fact(fa), subscript(*i), pretty_node_id(nid))
-        }
-        Goal::Split(id) => format!("splitEqs({})", id.0),
-        Goal::Disj(d) => {
-            if d.0.is_empty() {
-                "Disj (\u{22A5})".to_string()
-            } else {
-                let parts: Vec<String> = d.0.iter()
-                    .map(|c| format!("({})", pretty_guarded(c))).collect();
-                parts.join("  \u{2225} ") // ‖
-            }
-        }
-        Goal::Subterm((l, r)) =>
-            format!("{} \u{228F} {}", pretty_lnterm(l), pretty_lnterm(r)), // ⊏
-    }
-}
-
-fn subscript(n: usize) -> String {
-    n.to_string().chars().map(|c| match c {
-        '0' => '\u{2080}', '1' => '\u{2081}', '2' => '\u{2082}',
-        '3' => '\u{2083}', '4' => '\u{2084}', '5' => '\u{2085}',
-        '6' => '\u{2086}', '7' => '\u{2087}', '8' => '\u{2088}',
-        '9' => '\u{2089}', _ => c,
-    }).collect()
+    // HS `vsep = foldr ($--$)`, and `$--$` inserts a BLANK line between
+    // adjacent goals (`d1 $-$ text "" $-$ d2`) — i.e. a double newline.
+    lines.join("\n\n")
 }
 
 // ---------------------------------------------------------------------
@@ -483,14 +476,6 @@ fn lvar_to_string(v: &tamarin_term::lterm::LVar) -> String {
     let mut s = String::new();
     pp_lvar(v, &mut s);
     s
-}
-
-fn pretty_node_conc(c: &(NodeId, ConcIdx)) -> String {
-    format!("({}, {})", pretty_node_id(&c.0), c.1 .0)
-}
-
-fn pretty_node_prem(p: &(NodeId, PremIdx)) -> String {
-    format!("({}, {})", pretty_node_id(&p.0), p.1 .0)
 }
 
 #[cfg(test)]

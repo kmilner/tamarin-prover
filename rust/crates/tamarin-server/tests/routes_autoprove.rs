@@ -173,3 +173,27 @@ async fn test_autoprove_on_unknown_lemma_returns_alert() {
         alert
     );
 }
+// Web-parity regression: after autoprove, `main/proof/<lemma>` must render
+// the "Applicable Proof Methods" + sequent snippet from the grown tree's
+// retained per-node systems — not an empty "Constraint System is Solved".
+// Guards the `set_keep_sys(true)` the interactive server enables at
+// startup (see `tamarin_server::serve`).
+#[tokio::test]
+async fn test_autoprove_proof_view_retains_systems() {
+    tamarin_theory::constraint::solver::search::set_keep_sys(true);
+    let s = start_server_with_theory("Tutorial.spthy").await;
+    let v: serde_json::Value = s.client
+        .get(&s.url("/thy/trace/1/autoprove/idfs/0/False/proof/Client_auth"))
+        .send().await.expect("send").json().await.expect("decode");
+    let redir = v.get("redirect").and_then(|x| x.as_str()).expect("redirect");
+    let idx: usize = redir.split('/').nth(3).and_then(|x| x.parse().ok()).expect("idx");
+    let pv: serde_json::Value = s.client
+        .get(&s.url(&format!("/thy/trace/{}/main/proof/Client_auth", idx)))
+        .send().await.expect("send").json().await.expect("decode");
+    let html = pv.get("html").and_then(|x| x.as_str()).unwrap_or("");
+    assert!(html.contains("Applicable Proof Methods"),
+        "proof view must render applicable methods from retained systems; got: {}",
+        &html[..html.len().min(200)]);
+    assert!(!html.contains("Constraint System is Solved"),
+        "root must not render as an empty solved system");
+}

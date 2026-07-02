@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tamarin_parser::parse_theory;
+use tamarin_term::maude_proc::MaudeHandle;
 use tamarin_theory::elaborate::elaborate;
 
 use crate::state::{TheoryEntry, TheoryOrigin};
@@ -31,21 +32,30 @@ impl std::error::Error for LoadError {}
 ///
 /// `entry.idx` is left as `0`; [`TheoryStore::insert`] assigns the
 /// real index.
-pub fn load_from_path(path: &Path) -> Result<TheoryEntry, LoadError> {
+pub fn load_from_path(path: &Path, maude_path: &str) -> Result<TheoryEntry, LoadError> {
     let src = std::fs::read_to_string(path)
         .map_err(|e| LoadError::Io(format!("{}: {}", path.display(), e)))?;
-    load_from_source(&src, TheoryOrigin::Local(PathBuf::from(path)))
+    load_from_source(&src, TheoryOrigin::Local(PathBuf::from(path)), maude_path)
 }
 
-/// Parse + elaborate from a string (for the upload path).
+/// Parse + elaborate from a string (for the upload path), then "close"
+/// the theory by pre-computing each protocol rule's AC-variants via
+/// Maude (HS `closeTheory`), so the source / rules / overview renderers
+/// can emit the `variants (modulo AC)` blocks byte-for-byte.  Variant
+/// computation is best-effort: if Maude can't be started the theory is
+/// still usable (rules just render without their variants block).
 pub fn load_from_source(
     src: &str,
     origin: TheoryOrigin,
+    maude_path: &str,
 ) -> Result<TheoryEntry, LoadError> {
     let parser_theory = parse_theory(src, &[])
         .map_err(|e| LoadError::Parse(format!("{:?}", e)))?;
-    let typed = elaborate(&parser_theory)
+    let mut typed = elaborate(&parser_theory)
         .map_err(|e| LoadError::Elaborate(e.message))?;
+    if let Ok(maude) = MaudeHandle::start(maude_path, typed.signature.maude_sig.clone()) {
+        tamarin_theory::tools::rule_variants::populate_rule_variants(&mut typed, &maude, None);
+    }
     Ok(TheoryEntry {
         idx: 0,
         name: typed.name.clone(),

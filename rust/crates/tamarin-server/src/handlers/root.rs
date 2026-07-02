@@ -46,7 +46,7 @@ pub async fn post(
             Ok(s) => s.to_string(),
             Err(_) => { alert_msg = Some("upload was not valid UTF-8".into()); break; }
         };
-        match theory_io::load_from_source(&src, TheoryOrigin::Upload(filename.clone())) {
+        match theory_io::load_from_source(&src, TheoryOrigin::Upload(filename.clone()), &state.cfg.maude_path) {
             Ok(entry) => {
                 let idx = state.store.insert(entry);
                 tracing::info!(idx, file = %filename, "uploaded theory");

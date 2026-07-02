@@ -12,7 +12,12 @@ mod common;
 use common::*;
 
 #[tokio::test]
-async fn intdot_returns_well_formed_dot() {
+async fn intdot_returns_html_shell() {
+    // HS `getInteractiveDotGraphR` (`src/Web/Handler.hs:897`) returns the
+    // `intdotLayout` HTML shell page (`src/Web/Types.hs:727`) — a
+    // `<dot-graph-viz>` custom element whose `dotsrc` points at the
+    // `interactive-graph-def` route (which serves the raw DOT the bundled
+    // client-side viz renders).  It is NOT the raw DOT itself.
     let s = start_server_with_theory("issue193.spthy").await;
     let res = s
         .client
@@ -22,10 +27,12 @@ async fn intdot_returns_well_formed_dot() {
         .expect("send");
     assert_eq!(res.status(), 200);
     let body = res.text().await.expect("text");
-    // DOT shape: `digraph G { ... }`.
-    assert!(body.contains("digraph"),
-        "body should be DOT-shaped, got: {}", &body[..body.len().min(200)]);
-    assert!(body.contains("}"));
+    assert!(body.contains("<dot-graph-viz"),
+        "intdot must be the HTML shell with a <dot-graph-viz>, got: {}",
+        &body[..body.len().min(200)]);
+    assert!(body.contains("/interactive-graph-def/proof/debug/_"),
+        "the shell's dotsrc must point at interactive-graph-def; got: {}",
+        &body[..body.len().min(300)]);
 }
 
 #[tokio::test]

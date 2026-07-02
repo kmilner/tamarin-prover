@@ -32,6 +32,43 @@ pub const LINE_LENGTH: usize = 110;
 /// `round(110/1.5) = 73` (`pretty-1.1.3.6/Text/PrettyPrint/HughesPJ.hs`).
 pub const RIBBON: usize = 73;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Process-wide DISPLAY width used by the bare [`Doc::render`] path.
+///
+/// The two output modes render at different widths in HS, and it is a
+/// property of the whole process (you invoke either `--prove` OR
+/// `interactive`, never both in one process):
+///   - the CLI (`--prove`) renders at the *console* width
+///     `LINE_LENGTH`/`RIBBON` = 110/73 (`src/Main/Console.hs`
+///     `renderDoc`);
+///   - the interactive web server renders every HTTP response at HS's
+///     *web* width 100/67 — HughesPJ's default `style` used by `render`
+///     (`getTheorySourceR` = `render . prettyClosedTheory`,
+///     `src/Web/Handler.hs:956`) and by `renderHtmlDoc`
+///     (`Text/PrettyPrint/Html.hs:151`).
+///
+/// Defaults to 110/73 so the CLI path is unchanged; the server calls
+/// [`set_display_width`] once at startup, before any rendering.  This is
+/// presentation-only — it can never affect proof search or verdicts —
+/// and the explicit `render_with`/`render_at` widths (WF/oracle/goal
+/// rendering) are unaffected.
+static DISPLAY_LINE_LENGTH: AtomicUsize = AtomicUsize::new(LINE_LENGTH);
+static DISPLAY_RIBBON: AtomicUsize = AtomicUsize::new(RIBBON);
+
+/// HS web display width: HughesPJ default `style` (100) with
+/// `round(100/1.5) = 67` ribbon.
+pub const WEB_LINE_LENGTH: usize = 100;
+pub const WEB_RIBBON: usize = 67;
+
+/// Override the bare-`render()` display width process-wide (see
+/// [`DISPLAY_LINE_LENGTH`]).  Called once by the interactive server with
+/// `(WEB_LINE_LENGTH, WEB_RIBBON)`.
+pub fn set_display_width(line_length: usize, ribbon: usize) {
+    DISPLAY_LINE_LENGTH.store(line_length, Ordering::Relaxed);
+    DISPLAY_RIBBON.store(ribbon, Ordering::Relaxed);
+}
+
 // ============================================================================
 // Doc tree
 // ============================================================================
@@ -194,9 +231,14 @@ impl Doc {
         mk_nest(n, reduce_doc(self))
     }
 
-    /// Render with default lineLength=110, ribbon=73.
+    /// Render at the process-wide display width (see
+    /// [`set_display_width`]): 110/73 for the CLI, 100/67 for the
+    /// interactive web server.
     pub fn render(self) -> String {
-        self.render_with(LINE_LENGTH, RIBBON)
+        self.render_with(
+            DISPLAY_LINE_LENGTH.load(Ordering::Relaxed),
+            DISPLAY_RIBBON.load(Ordering::Relaxed),
+        )
     }
 
     pub fn render_with(self, line_length: usize, ribbon: usize) -> String {

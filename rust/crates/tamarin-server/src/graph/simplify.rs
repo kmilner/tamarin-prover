@@ -321,18 +321,28 @@ fn try_hide_rule(v: &NodeId, ru: RuleACInst, sys: System) -> Result<System, Syst
 }
 
 fn rule_eligible(ru: &RuleACInst) -> bool {
-    match &ru.info {
+    // HS `eligibleRule` (Simplification.hs:148-152):
+    //   any ($ ru) [isISendRule, isIRecvRule, isCoerceRule, isFreshRule]
+    //   || ( null (get rActs ru) && all (\l -> length (get l ru) <= 1) [rPrems, rConcs] )
+    // The `isFooRule` disjunction and the `null rActs && <=1 prem/conc` fallback
+    // are INDEPENDENT — the fallback applies to EVERY rule, not just proto rules.
+    // In particular an intruder destructor such as `d_0_snd` (no actions, one
+    // premise, one conclusion) is eligible via the fallback even though it is
+    // not isend/irecv/coerce; HS hides it (bridging its single in/out edge),
+    // so RS must too.
+    let is_special = match &ru.info {
         RuleInfo::Intr(i) => {
             is_irecv_rule_info(i) || is_isend_rule_info(i) || is_coerce_rule_info(i)
         }
         RuleInfo::Proto(p) => {
             // isFreshRule treats only the Fresh proto-rule as fresh.
-            if p.name == tamarin_theory::rule::ProtoRuleName::Fresh { return true; }
-            ru.actions.is_empty()
-                && ru.premises.len() <= 1
-                && ru.conclusions.len() <= 1
+            p.name == tamarin_theory::rule::ProtoRuleName::Fresh
         }
-    }
+    };
+    is_special
+        || (ru.actions.is_empty()
+            && ru.premises.len() <= 1
+            && ru.conclusions.len() <= 1)
 }
 
 // ---------------------------------------------------------------------

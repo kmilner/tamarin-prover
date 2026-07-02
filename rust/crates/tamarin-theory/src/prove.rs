@@ -1434,6 +1434,43 @@ end";
         let _ = root.status;
     }
 
+    /// Web-parity regression: with `set_keep_sys(true)` (what the
+    /// interactive server sets at startup), `run_proof_search` must
+    /// RETAIN each proof node's constraint `System` instead of dropping
+    /// it to `System::default()` (the `--prove` RSS optimisation in
+    /// `expand`).  The interactive proof-view snippet renders the
+    /// annotated system + applicable proof methods at every proof path,
+    /// so an empty root would show a bogus "Constraint System is Solved"
+    /// with no formulas (HS keeps a `Just System` on every node).
+    #[test]
+    fn prove_lemma_keep_sys_retains_node_systems() {
+        let h = match maude() { Some(m) => m, None => return };
+        let src = r#"
+theory T begin
+rule R:
+  [ Fr(~k) ] --[ A(~k) ]-> [ Out(~k) ]
+lemma always_A:
+  all-traces
+  "All k #i. A(k) @ #i ==> Ex #j. A(k) @ #j"
+end
+"#;
+        crate::constraint::solver::search::set_keep_sys(true);
+        let pt = tamarin_parser::parse_theory(src, &[]).expect("parse");
+        let root = prove_lemma(&pt, "always_A", h, 200).expect("prove");
+        // Root = the initial constraint system (the negated goal formula),
+        // with the lemma's refined source kind — NOT an empty default.
+        assert!(!root.sys.formulas.is_empty(),
+            "root node must retain the initial system's formulas");
+        assert_eq!(root.sys.source_kind,
+            Some(crate::constraint::system::SourceKind::RefinedSources),
+            "root system source kind must survive (refined for a non-sources lemma)");
+        // Every child must also carry a real system.
+        for (name, ch) in &root.children {
+            assert!(ch.sys.source_kind.is_some(),
+                "child {:?} must retain a real system, not System::default()", name);
+        }
+    }
+
     /// Drive the tiny_setup proof and inspect the proof-tree shape.
     /// We expect the search to:
     /// 1. Pick `Induction` (root).
