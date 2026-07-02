@@ -349,10 +349,10 @@ fn title_for(entry: &crate::state::TheoryEntry, path: &path_parse::TheoryPath) -
 /// `proved`); the `Generated from:` version/build lines are placeholders
 /// (the interactive server does not carry the CLI build constants — the
 /// web-parity gate normalizes them away, as does HS's own `--prove` gate).
-/// Wellformedness: the plain-text report is not retained by the server
-/// (only the unported HTML banner), so we render the "all successful"
-/// block; theories with wf warnings will diverge here until it is threaded
-/// through.
+/// Wellformedness: the `/* WARNING: ... */` (or `/* All ... successful. */`)
+/// block is rendered from the theory's stored `wf_report` — computed at load
+/// by the same pipeline `--prove` runs — via the shared `format_wf_block`,
+/// so it matches HS byte-for-byte (empty report ⇒ the "all successful" block).
 fn render_theory_source(entry: &crate::state::TheoryEntry) -> String {
     let build = tamarin_theory::pretty_theory::BuildInfo {
         tamarin_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -361,13 +361,13 @@ fn render_theory_source(entry: &crate::state::TheoryEntry) -> String {
         git_branch: String::new(),
         compiled_at: String::new(),
     };
-    let wf_block = "/* All wellformedness checks were successful. */";
+    let wf_block = tamarin_theory::pretty_theory::format_wf_block(&entry.wf_report);
     let in_file = entry.origin.label();
     tamarin_theory::pretty_theory::pretty_closed_theory(
         &entry.parser_theory,
         &entry.typed_theory,
         &[],
-        wf_block,
+        &wf_block,
         &build,
         &in_file,
         false,

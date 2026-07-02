@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tamarin_parser::parse_theory;
+use tamarin_parser::wf::WfError;
 use tamarin_term::maude_proc::MaudeHandle;
 use tamarin_theory::elaborate::elaborate;
 
@@ -51,8 +52,80 @@ pub fn load_from_source(
 ) -> Result<TheoryEntry, LoadError> {
     let mut parser_theory = parse_theory(src, &[])
         .map_err(|e| LoadError::Parse(format!("{:?}", e)))?;
+
+    // Wellformedness report — computed by the SAME pipeline `--prove` runs
+    // (`run.rs`'s `checkWellformedness`, mirroring HS `TheoryLoader.hs`), so the
+    // interactive web UI surfaces exactly the warnings HS does.  HS runs
+    // `checkWellformedness` at theory load (before any proving), so running it
+    // here — including the Maude-backed derivation check in the block below — is
+    // faithful.  The result feeds two renderings: the `/* WARNING: ... */`
+    // comment in the source/message routes (`format_wf_block`) and the
+    // `<div class="wf-warning">` header banner in help/overview (`errors_html`).
+    //
+    // Static checks run on the PRE-translation parsed theory (HS runs
+    // `check_theory` BEFORE the SAPIC `translate` pass, run.rs:517-528).  HS
+    // `thyProtoRules` applies `applyMacroInRule` to every rule before the
+    // checks, so clone + macro-expand first.
+    let parsed_for_wf = {
+        let mut tmp = parser_theory.clone();
+        tamarin_theory::macro_expand::expand_theory_macros(&mut tmp);
+        tmp
+    };
+    let mut wf_report = tamarin_parser::wf::check_theory(&parsed_for_wf);
+    // Strip the STATIC "Message Derivation Checks" entry — the dynamic,
+    // Maude-backed check in the maude block below replaces it (run.rs:527-528).
+    wf_report.retain(|e| e.topic != "Message Derivation Checks");
+
     let mut typed = elaborate(&parser_theory)
         .map_err(|e| LoadError::Elaborate(e.message))?;
+    let maude_sig = typed.signature.maude_sig.clone();
+
+    // Subterm-convergence check on the signature's subterm-rule set
+    // (run.rs:577-580): replace `check_theory`'s AST-level placeholder with the
+    // signature-driven, width-wrapped version now that the MaudeSig exists.
+    wf_report.retain(|e| e.topic != "Subterm Convergence Warning");
+    wf_report.extend(
+        tamarin_theory::pretty_theory::subterm_convergence_report_wf(&maude_sig),
+    );
+
+    // Formula terms (run.rs:601-616): needs the elaborated MaudeSig
+    // (reducible/irreducible funsym classification), so it runs here rather than
+    // inside `check_theory`.  Insert BEFORE the guardedness / lemma-annotation
+    // topics to match HS `formulaReports` order (8b before 8c/9).
+    {
+        let term_errors = tamarin_theory::check_terms::check_terms_wf(
+            &parsed_for_wf, &maude_sig);
+        if !term_errors.is_empty() {
+            let insert_before = wf_report.iter().position(|e| {
+                matches!(e.topic.as_str(),
+                    " Formula guardedness"
+                    | "Lemma annotations" | "Multiplication restriction of rules"
+                    | "Nat Sorts" | "Subterm Convergence Warning"
+                    | "Message Derivation Checks" | "Derivation Checks")
+            }).unwrap_or(wf_report.len());
+            let tail = wf_report.split_off(insert_before);
+            wf_report.extend(term_errors);
+            wf_report.extend(tail);
+        }
+    }
+
+    // Formula guardedness (run.rs:638-656): each lemma/restriction formula that
+    // cannot be converted to a guarded formula.  Runs on the PRE-translation
+    // parser theory (HS `formulaReports`), before the SAPIC pass below.
+    {
+        let guard_errors = tamarin_theory::elaborate::check_guarded_wf(&parser_theory);
+        if !guard_errors.is_empty() {
+            let insert_before = wf_report.iter().position(|e| {
+                matches!(e.topic.as_str(),
+                    "Lemma annotations" | "Multiplication restriction of rules"
+                    | "Nat Sorts" | "Subterm Convergence Warning"
+                    | "Message Derivation Checks" | "Derivation Checks")
+            }).unwrap_or(wf_report.len());
+            let tail = wf_report.split_off(insert_before);
+            wf_report.extend(guard_errors);
+            wf_report.extend(tail);
+        }
+    }
 
     // SAPIC `process:` translation — mirror `run.rs`'s CLI-side pass
     // (run.rs:658-696) so the web load path renders SAPIC theories exactly
@@ -82,12 +155,45 @@ pub fn load_from_source(
     let _sapic_funs_guard =
         tamarin_theory::elaborate::set_user_funs_for_theory(&parser_theory);
     let user_set_heuristic = !typed.heuristic.is_empty();
-    // The SAPIC-process wellformedness warnings feed only the wf report, which
-    // is out of scope on the web load path, so we discard them here; a hard
+    // HS `Sapic.checkWellformedness` (Warnings.hs) is part of `preReport`, which
+    // is PREPENDED to the rest of the report (run.rs:685-695).  A hard
     // translation error still propagates as `LoadError::Elaborate`.
-    let _ = tamarin_sapic::apply::apply_sapic(
+    let sapic_wf = tamarin_sapic::apply::apply_sapic(
         &mut parser_theory, &mut typed, user_set_heuristic,
     ).map_err(|e| LoadError::Elaborate(e.message))?;
+    if !sapic_wf.is_empty() {
+        let mut new_report = sapic_wf;
+        new_report.extend(std::mem::take(&mut wf_report));
+        wf_report = new_report;
+    }
+
+    // HS re-runs the full `checkWellformedness` on the TRANSLATED theory
+    // (run.rs:698-731): re-run `factLhsOccurNoRhs` on the post-translation
+    // parsed theory so SAPIC-only premise facts (e.g. a `Message(c,m)` consumed
+    // by an `in(c,m)` with no producing `out`) are surfaced.  No-op for
+    // non-SAPIC theories (pre- and post-translation rule sets are equal).
+    if typed.is_sapic {
+        let post_thy = {
+            let mut tmp = parser_theory.clone();
+            tamarin_theory::macro_expand::expand_theory_macros(&mut tmp);
+            tmp
+        };
+        let topic = "Facts occur in the left-hand-side but not in any right-hand-side ";
+        wf_report.retain(|e| e.topic != topic);
+        let lhs_rhs = tamarin_parser::wf::fact_lhs_occur_no_rhs(&post_thy);
+        if !lhs_rhs.is_empty() {
+            let insert_before = wf_report.iter().position(|e| {
+                matches!(e.topic.as_str(),
+                    "Formula terms" | " Formula guardedness"
+                    | "Lemma annotations" | "Multiplication restriction of rules"
+                    | "Nat Sorts" | "Subterm Convergence Warning"
+                    | "Message Derivation Checks" | "Derivation Checks")
+            }).unwrap_or(wf_report.len());
+            let tail = wf_report.split_off(insert_before);
+            wf_report.extend(lhs_rhs);
+            wf_report.extend(tail);
+        }
+    }
 
     if let Ok(maude) = MaudeHandle::start(maude_path, typed.signature.maude_sig.clone()) {
         tamarin_theory::tools::rule_variants::populate_rule_variants(&mut typed, &maude, None);
@@ -112,7 +218,23 @@ pub fn load_from_source(
                 }
             }
         }
+
+        // Dynamic Message Derivation Checks (run.rs:974-995): HS
+        // `checkVariableDeducability`, gated by `--derivcheck-timeout` (HS
+        // interactive default 5s).  The web path has no CLI, so use HS's 5s
+        // default so RS matches the cached HS the parity gate compares against.
+        // Needs the Maude handle; runs on the POST-translation parser theory
+        // (`parser_theory`, matching run.rs's `&parsed` at that point).
+        let extra = tamarin_theory::deriv_check::check_message_derivation(
+            &parser_theory, &maude, 5,
+        );
+        wf_report.extend(extra);
     }
+
+    // HS `makeWfErrorsHtml` (src/Web/Handler.hs:463-469) — the header-banner
+    // rendering of the same report; empty string when the report is empty.
+    let errors_html = make_wf_errors_html(&wf_report);
+
     Ok(TheoryEntry {
         idx: 0,
         name: typed.name.clone(),
@@ -121,7 +243,59 @@ pub fn load_from_source(
         origin,
         loaded_at: Local::now(),
         primary: true,
-        errors_html: String::new(),
+        wf_report,
+        errors_html,
         proof_state: None,
     })
+}
+
+/// Build the HS `makeWfErrorsHtml` banner (`src/Web/Handler.hs:463-469`): wrap
+/// the wellformedness report in a `<div class="wf-warning">`, prefixed by the
+/// literal `WARNING: ...<br /><br />` line and followed by the report body
+/// rendered exactly as HS's `renderHtmlDoc (htmlDoc $ prettyWfErrorReport
+/// report)` — each source line HTML-escaped, its leading spaces turned into
+/// `&nbsp;`, and a `<br/>` appended (HS `postprocessHtmlDoc`,
+/// Text/PrettyPrint/Html.hs:157-162).  Empty report ⇒ empty string
+/// (HS `makeWfErrorsHtml [] = ""`).
+///
+/// `format_wf_block` is reused as the single source of truth for the report
+/// body: strip its `/* ... */` framing to recover the same
+/// `prettyWfErrorReport` text HS feeds to `renderHtmlDoc`, then re-render it
+/// HS-web-style.  Line-wrap width may differ from HS's web render, but the
+/// parity gate compares structure/text (whitespace-collapsed), so only the
+/// word tokens must match — which they do (the body is byte-identical to the
+/// `--prove` `/* */` block, itself HS-byte-faithful).
+fn make_wf_errors_html(report: &[WfError]) -> String {
+    if report.is_empty() {
+        return String::new();
+    }
+    let block = tamarin_theory::pretty_theory::format_wf_block(report);
+    // `format_wf_block` frames the body as
+    //   "/*\nWARNING: the following wellformedness checks failed!\n\n<body>*/"
+    // where <body> is the byte-exact `prettyWfErrorReport` text.  Strip the
+    // fixed prefix/suffix to recover just <body>.
+    const PREFIX: &str = "/*\nWARNING: the following wellformedness checks failed!\n\n";
+    let body = block
+        .strip_prefix(PREFIX)
+        .and_then(|b| b.strip_suffix("*/"))
+        .unwrap_or(&block);
+    // Mirror HS `postprocessHtmlDoc = unlines . map (addBreak . indent) . lines`
+    // over the HTML-escaped body: each line's leading spaces become `&nbsp;`,
+    // the rest is entity-escaped, and `<br/>` is appended; lines joined by `\n`
+    // with a trailing `\n` (unlines).
+    let mut rendered = String::new();
+    for line in body.lines() {
+        let n_lead = line.len() - line.trim_start_matches(' ').len();
+        for _ in 0..n_lead {
+            rendered.push_str("&nbsp;");
+        }
+        rendered.push_str(&crate::handlers::root::html_escape(&line[n_lead..]));
+        rendered.push_str("<br/>\n");
+    }
+    // HS `makeWfErrorsHtml`: <div> + literal WARNING line + rendered body + </div>.
+    format!(
+        "<div class=\"wf-warning\">\n\
+         WARNING: the following wellformedness checks failed!<br /><br />\n\
+         {rendered}\n</div>",
+    )
 }

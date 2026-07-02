@@ -685,6 +685,109 @@ pub fn subterm_convergence_report_wf(
     vec![WfError::new("Subterm Convergence Warning", msg)]
 }
 
+/// Format the `/* WARNING: ... */` or `/* All wellformedness checks
+/// were successful. */` block that goes BETWEEN the source body and
+/// the analysis summary.  Mirrors HS's `prettyWfErrorReport`
+/// (Wellformedness.hs:118-125).
+///
+/// Each `WfError.message` is expected to carry the FULL HS-style block
+/// for its topic: `Title\n=====\n\n<intro>\n<body>` — pre-formatted with
+/// the exact bytes HS emits, including trailing spaces from HS's
+/// `text ""` markers.  Multiple `WfError`s with the same topic are
+/// merged into one block (the per-clash bodies concatenated).  Topic
+/// groups are separated by blank lines.
+///
+/// Shared by the `--prove` CLI (`run.rs`) and the interactive web server
+/// (`source`/`message` routes) so both render the wellformedness comment
+/// byte-identically.  The empty-report case returns exactly
+/// `"/* All wellformedness checks were successful. */"`, so no-warning
+/// theories stay byte-for-byte unchanged on both paths.
+pub fn format_wf_block(report: &[tamarin_parser::wf::WfError]) -> String {
+    if report.is_empty() {
+        return "/* All wellformedness checks were successful. */".to_string();
+    }
+    let mut out = String::new();
+    out.push_str("/*\nWARNING: the following wellformedness checks failed!\n\n");
+    // Group by topic, preserving FIRST-APPEARANCE order — mirrors HS's
+    // `groupOn fst` over a left-to-right concatMap-over-checks.
+    let mut topic_order: Vec<&str> = Vec::new();
+    let mut grouped: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
+    for e in report {
+        if !grouped.contains_key(e.topic.as_str()) {
+            topic_order.push(e.topic.as_str());
+        }
+        grouped.entry(e.topic.as_str()).or_default().push(&e.message);
+    }
+    for (i, topic) in topic_order.iter().enumerate() {
+        let msgs = &grouped[topic];
+        if i > 0 { out.push('\n'); }
+        // HS `prettyWfErrorReport` (Wellformedness.hs:118-125) groups by
+        // topic and renders each group as
+        //   `text topic $-$ (nest 2 . vcat . intersperse (text "") $ bodies)`
+        // — the underlineTopic header ONCE per group, then the 2-space-nested
+        // bodies separated by a 2-space blank line.  Most RS checks already
+        // pre-render the FULL block (header + indent) into a single per-topic
+        // message, and we concatenate those as-is (legacy path, unchanged).
+        //
+        // Some checks emit one HEADER-LESS body per offending rule (so the
+        // summary's `length rep` WARNING count stays HS-faithful,
+        // Batch.hs:245), all sharing one topic.  These are assembled HS-style
+        // (`prettyWfErrorReport`, Wellformedness.hs:118-125): the topic header
+        // (+ any "reasons" preamble that HS folds into the topic string) ONCE,
+        // then the per-rule bodies joined by the `intersperse (text "")`
+        // 2-space blank separator.  Other (single-entry) topics keep baking
+        // their full block into the message (default path below).
+        if let Some(preamble) = wf_headerless_preamble(topic) {
+            out.push_str(&preamble);
+            out.push_str(&msgs.join("\n  \n"));
+            out.push('\n');
+        } else {
+            for (j, m) in msgs.iter().enumerate() {
+                if j > 0 { out.push('\n'); }
+                out.push_str(m);
+                if !m.ends_with('\n') { out.push('\n'); }
+            }
+        }
+    }
+    // Trim trailing blank lines but keep a single newline before `*/`.
+    while out.ends_with("\n\n") { out.pop(); }
+    out.push_str("*/");
+    out
+}
+
+/// For the WF topics whose checks emit one header-less body per finding,
+/// return the byte-exact preamble that `prettyWfErrorReport` prints ONCE
+/// before the group's bodies: the `underlineTopic` header, plus the blank
+/// line HS's `$-$`/topic-string folds in, plus (for the sort-clash topic)
+/// the "Possible reasons" paragraph that HS appends to the topic string
+/// (Wellformedness.hs:258-273).  Returns `None` for single-entry topics,
+/// which bake their full block into the message (default path).
+fn wf_headerless_preamble(topic: &str) -> Option<String> {
+    use tamarin_parser::wf::underline_topic;
+    match topic {
+        // SAPIC-process wellformedness errors (HS `toWfErrorReport`,
+        // Warnings.hs:23-26).  Unlike the other topics, HS does NOT underline
+        // this one — `prettyWfErrorReport` renders it as a bare `text topic`
+        // (Wellformedness.hs:124).  So the per-error bodies (each
+        // `"  Variable bound twice: x."`) sit directly under a plain header.
+        "Wellformedness-error in Process" => Some(format!("{topic}\n")),
+        "Unbound variables" | "Reserved names" | "Special facts" => {
+            Some(format!("{}\n", underline_topic(topic)))
+        }
+        "Variable with mismatching sorts or capitalization" => {
+            Some(format!(
+                "{}\nPossible reasons:\n\
+                 1. Identifiers are case sensitive, i.e.,\
+                 'x' and 'X' are considered to be different.\n\
+                 2. The same holds for sorts:, \
+                 i.e., '$x', 'x', and '~x' are considered to be different.\n\n",
+                underline_topic(topic)))
+        }
+        _ => None,
+    }
+}
+
 /// HS `ppNonEmptyList' name pp xs = (keyword_ name <->) . fsep $
 /// punctuate comma (map pp xs)` (Term/Maude/Signature.hs:229-231).
 /// `<->` is HughesPJ `<+>` (beside-with-space), and `fsep` is the

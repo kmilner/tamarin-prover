@@ -562,7 +562,8 @@ const WRAP_TEXT_STYLE: &str =
 /// from ORIGIN) ERRORS` env line.  The env line's `(Loaded at ...)` parenthetical
 /// is stripped by the parity normalizer (`norm_env`) on both sides, so its
 /// timestamp/origin need not be byte-identical to HS.  `errorsHtml` is the
-/// (currently unpopulated) wellformedness banner.
+/// wellformedness banner (`<div class="wf-warning">…</div>` when the theory has
+/// warnings, empty otherwise), populated from the stored `wf_report` at load.
 fn help_html(entry: &TheoryEntry) -> String {
     // HS `show info.origin` — e.g. `Local "/path/Foo.spthy"`.
     let origin = match &entry.origin {
