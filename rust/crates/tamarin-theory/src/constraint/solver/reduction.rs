@@ -5028,6 +5028,24 @@ impl<'ctx> Reduction<'ctx> {
                     = non_silent_rule_insts_with_constrs(self.ctx);
                 if candidates.is_empty() { return GoalCases::Contradictory; }
                 let avoid_max = bounds_max(&self.sys);
+                // HS-faithful: `solveAction`'s `labelNodeId i rules Nothing`
+                // (Goals.hs:274 → Reduction.hs:249) imports the chosen rule via
+                // `importRule =<< disjunctionOfList rules`.  The fresh counter
+                // threads ABOVE the `DisjT` layer (`FreshT (DisjT ...)`,
+                // Reduction.hs:123), so sibling candidate rules do NOT thread
+                // each other's `someRuleACInst` renamings — EVERY candidate
+                // renames from the SAME pre-fork fresh state.  RS shares one
+                // `self.maude`, so consecutive `freshen_rule_with_constrs` calls
+                // climbed the counter cumulatively (c_fst → c_pair → c_snd →
+                // …), lifting each grafted node's rule vars — and hence the
+                // source-case `#vk`/`#vf` node ids — N indices above HS's (e.g.
+                // `!KU(snd(t.1))`'s premise node `#vk.6` vs HS `#vk.3`).  Reset
+                // the shared counter to the pre-fork base before each candidate
+                // and restore the high-water mark afterward, exactly as
+                // `solve_premise_goal` already does around its `#vr` fork.
+                self.maude.ensure_above(avoid_max);
+                let base_counter = self.maude.fresh_counter_peek();
+                let mut counter_high_water = base_counter;
                 let mut cases: Vec<(String, crate::constraint::system::System)> = Vec::new();
                 for (rule, constrs) in candidates {
                     // Mirror Haskell's `labelNodeId` (Goals.hs:262) which
@@ -5063,8 +5081,14 @@ impl<'ctx> Reduction<'ctx> {
                         // consistently — Haskell `someRuleACInst` runs
                         // `rename` over the whole (rule, constrs) pair
                         // via `fmap extractInsts . rename`.
+                        // Independent `Disj` fork (see the base_counter note
+                        // above): rewind the shared counter so THIS candidate's
+                        // rename reserves its var range from the same base every
+                        // sibling sees.
+                        self.maude.reset_counter_to(base_counter);
                         let (renamed, renamed_constrs) = freshen_rule_with_constrs(
                             rule.clone(), constrs.clone(), avoid_max, &self.maude);
+                        counter_high_water = counter_high_water.max(self.maude.fresh_counter_peek());
                         let act = renamed.actions[act_idx].clone();
                         if act.tag != fa.tag || act.terms.len() != fa.terms.len() {
                             continue;
@@ -5141,6 +5165,10 @@ impl<'ctx> Reduction<'ctx> {
                         }
                     }
                 }
+                // Restore the shared counter to the high-water mark reached
+                // across all candidate forks so any later allocation on this
+                // Reduction can't collide with a reserved rule-var range.
+                self.maude.ensure_above(counter_high_water.saturating_sub(1));
                 if cases.is_empty() { return GoalCases::Contradictory; }
                 if cases.len() == 1 {
                     let (name, sys) = cases.into_iter().next().unwrap();

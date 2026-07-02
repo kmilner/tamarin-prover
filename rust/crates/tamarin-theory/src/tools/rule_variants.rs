@@ -841,6 +841,28 @@ pub fn abstract_rule_and_variants(
 /// Walks vars in the SAME order as `rename_precise_rule_with_variants` (the
 /// variant disjunction has no keys for the trivial-disjunction case, so it
 /// reduces to prems, concs, acts, new_vars).
+/// HS-faithful `renamePrecise` (RuleVariants.hs:78) applied to a protocol
+/// rule that has NO reducible-headed sub-terms (so no AC-variant narrowing).
+/// `variantsProtoRule` runs `renamePrecise` on EVERY closed rule, which
+/// re-indexes each variable to a PER-NAME fresh index — packing distinct-named
+/// variables that share no index dependency onto the same low index (e.g. a
+/// SAPiC `lock` + `v` become `lock.0` + `v.0`, not `lock.0` + `v.1`).  Returns
+/// the repacked rule iff `renamePrecise` actually rewrites at least one var;
+/// `None` when the rule is already in per-name precise normal form (so the
+/// caller can leave `abstracted_rule` unset and use the rule as-is).
+///
+/// For these rules the variant disjunction is always the trivial
+/// `[emptySubstVFresh]` (empty domain), so repacking the rule body cannot
+/// misalign any variant substitution.
+pub fn rename_precise_rule_if_changed(rule: &ProtoRuleE) -> Option<ProtoRuleE> {
+    if !rule_renames_under_precise(rule) {
+        return None;
+    }
+    let (packed, _substs) =
+        rename_precise_rule_with_variants(rule.clone(), vec![LNSubstVFresh::empty()]);
+    Some(packed)
+}
+
 fn rule_renames_under_precise(rule: &ProtoRuleE) -> bool {
     use tamarin_term::lterm::HasFrees;
     use tamarin_utils::fresh::PreciseFreshState;

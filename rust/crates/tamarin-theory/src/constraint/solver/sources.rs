@@ -444,7 +444,6 @@ fn initial_source_cases_impl(
         _ => return Vec::new(),
     };
 
-    let stable_vars = stable_vars_for_goal(goal);
     // Same HS-faithful filter — safety only — for normalize_and_keep.
     let safety_only: Vec<_> = ctx.restrictions.iter()
         .filter(|r| crate::guarded::is_safety_formula(r))
@@ -468,8 +467,22 @@ fn initial_source_cases_impl(
         if !crate::constraint::solver::contradictions::contradictions(ctx, &r.sys)
             .is_empty()
         { return None; }
-        let mut s = r.sys;
-        restrict_eq_store_to_stable_vars(&mut s, &stable_vars);
+        let s = r.sys;
+        // HS-faithful: `initialSource` (Sources.hs:105-119) does NOT restrict
+        // the raw case's substitution — it returns `polish <$> runReduction
+        // instantiate` verbatim, keeping every binding (e.g. a rule's internal
+        // `lock`/`v` ⟼ goal-var bindings).  `restrict stableVars` is applied
+        // ONLY by `refineSource` (Sources.hs:137) on the SATURATED output,
+        // which `refine_one_source` already mirrors.  RS previously also
+        // restricted here, at raw-case creation, which dropped the raw case's
+        // internal rule vars and so LOWERED `avoid th` — the fresh-var seed
+        // `saturateSources` threads into `refineSource` (Sources.hs:162
+        // `fs = avoid th`).  With the seed one index short per dropped var, the
+        // saturated source cases minted every grafted `#vr`/`~n` node id below
+        // HS's.  Keeping the raw subst here makes `bounds_max` (RS's `avoid`)
+        // match HS; the surviving internal bindings are dropped by the refine
+        // output restrict anyway, so the rendered saturated case is unchanged
+        // apart from the now-HS-aligned node numbering.
         Some(s)
     };
     let result: Vec<(String, System)> = match outcome {
@@ -2721,38 +2734,6 @@ fn restrict_eq_store_to_stable_vars(
             .collect();
     sys.invalidate_max_var_idx_cache();
     sys.eq_store_mut().subst = tamarin_term::subst::Subst::from_list(kept);
-}
-
-/// Compute the goal's free vars (= `stableVars` in Haskell).  For
-/// an `ActionG i fa` this is `[i] ++ frees fa`; for `PremiseG (i,_) fa`
-/// likewise.  Mirrors Haskell's `frees (cdGoal th)` (Sources.hs:126).
-fn stable_vars_for_goal(
-    goal: &crate::constraint::constraints::Goal,
-) -> std::collections::BTreeSet<tamarin_term::lterm::LVar> {
-    use tamarin_term::lterm::HasFrees;
-    let mut out = std::collections::BTreeSet::new();
-    match goal {
-        crate::constraint::constraints::Goal::Action(i, fa) => {
-            out.insert(i.clone());
-            fa.for_each_free(&mut |v: &tamarin_term::lterm::LVar| {
-                out.insert(v.clone());
-            });
-        }
-        crate::constraint::constraints::Goal::Premise((i, _), fa) => {
-            out.insert(i.clone());
-            fa.for_each_free(&mut |v: &tamarin_term::lterm::LVar| {
-                out.insert(v.clone());
-            });
-        }
-        crate::constraint::constraints::Goal::Chain(c, p) => {
-            out.insert(c.0.clone());
-            out.insert(p.0.clone());
-        }
-        crate::constraint::constraints::Goal::Disj(_)
-        | crate::constraint::constraints::Goal::Split(_)
-        | crate::constraint::constraints::Goal::Subterm(_) => {}
-    }
-    out
 }
 
 /// Freshen all vars in `sys` EXCEPT those in `keep`, shifting every
