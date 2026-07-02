@@ -176,7 +176,20 @@ pub fn system_to_dot_with(sys: &System, opts: &GraphOptions) -> String {
                 && DotBuilder::dot_node_id(&n.id) == base);
         if collides { format!("{base}__lastatom") } else { base }
     });
-    // 4a. Clusters as subgraphs.
+    // 4a. Top-level (ungrouped) nodes.
+    //
+    // HS `dotGraphCompact` (Dot.hs:505-510) emits, in order: the FREE
+    // (ungrouped) nodes (`mapM_ dotNodeCompact nodes`), THEN the clusters
+    // (`mapM_ dotCluster clusters`), THEN the edges.  The free nodes — e.g. an
+    // unsolved-action-atom ellipse like `Unlock_0(..) @ #t2.1` — therefore
+    // appear BEFORE any `subgraph cluster_*` block.  Emit them first to match
+    // (a free node emitted after the cluster's closing `}` lands in the wrong
+    // scope order vs HS).
+    for node in &repr.nodes {
+        emit_node(&mut g, node, &abbrev_lookup, opts, &color_map, &has_outgoing,
+            last_dot_id.as_deref());
+    }
+    // 4b. Clusters as subgraphs.
     //
     // HS `dotCluster` (Dot.hs:547-562): each cluster gets a `roleColor`
     // derived from `extractBaseName name`, the subgraph is `style=filled`
@@ -198,11 +211,6 @@ pub fn system_to_dot_with(sys: &System, opts: &GraphOptions) -> String {
         }
         g.close_subgraph();
         cluster_edges.extend(cluster.edges.iter().cloned());
-    }
-    // 4b. Top-level nodes.
-    for node in &repr.nodes {
-        emit_node(&mut g, node, &abbrev_lookup, opts, &color_map, &has_outgoing,
-            last_dot_id.as_deref());
     }
     // 4c. Edges. HS emits `restEdges` (non-less) before the merged
     // `lessEdges` within each scope (`dotGraphCompact`, Dot.hs:508-509),
@@ -410,10 +418,11 @@ impl DotBuilder {
             let _ = writeln!(self.buf, "  rankdir=TB;");
             let _ = writeln!(self.buf, "  showboxes=false;");
             let _ = writeln!(self.buf, "  clusterrank=local;");
-            // HS sets the graph-level node default shape to `ellipse`; each
-            // rule node overrides it with an explicit record label, so the
-            // `shape=record` we keep on the rule node still wins per-node
-            // (matching HS's per-node record attrs).
+            // HS `setDefaultAttributesIfCluster` sets the graph-level node
+            // default shape to `ellipse` (Dot.hs:160); each compact rule node
+            // overrides it with its own per-node `shape=record` (emitted in
+            // `rule_node`, mirroring HS `genRecord "record"`), so record rules
+            // still render as records inside clusters.
             let _ = writeln!(self.buf,
                 "  node [fontsize=8,fontname=\"Helvetica\",width=0.3,height=0.2,margin=\"0.05,0.05\",shape=ellipse];");
             let _ = writeln!(self.buf,
@@ -522,8 +531,15 @@ impl DotBuilder {
             "black"
         };
         let role = extract_role(ru).unwrap_or("Undefined");
+        // HS `genRecord "record"` (Text/Dot.hs:284-288) prepends an explicit
+        // `("shape","record")` to every compact record node, then the label and
+        // the `dotNodeCompact` `attrs`.  The per-node `shape=record` OVERRIDES the
+        // graph-level default node shape — which is `record` in the flat
+        // `setDefaultAttributes` case but `ellipse` in the clustered
+        // `setDefaultAttributesIfCluster` case (Dot.hs:160).  Emit it explicitly
+        // so clustered SAPIC graphs keep `shape=record` (not the ellipse default).
         let _ = writeln!(self.buf,
-            "  {} [label=\"{}\",style=\"filled\",fillcolor=\"{}\",fontcolor=\"{}\",role=\"{}\"];",
+            "  {} [shape=record,label=\"{}\",style=\"filled\",fillcolor=\"{}\",fontcolor=\"{}\",role=\"{}\"];",
             id, lbl, color, fontcolor, escape_dot(role));
     }
     fn action_node(&mut self, nid: &LVar, facts: &[LNFact]) {
