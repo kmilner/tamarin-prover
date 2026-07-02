@@ -41,12 +41,12 @@ use crate::pretty_formula::pretty_guarded;
 pub fn pretty_non_graph_system(sys: &System) -> String {
     let mut out = String::new();
     section(&mut out, "last", &pretty_last(sys));
-    section(&mut out, "formulas", &pretty_formula_list(&sys.formulas));
+    section(&mut out, "formulas", &pretty_formula_set(&sys.formulas));
     section(&mut out, "subterms", &pretty_subterm_store(sys));
     section(&mut out, "equations", &pretty_eq_store(sys));
     section(&mut out, "lemmas", &pretty_formula_set(&sys.lemmas));
     section(&mut out, "allowed cases", &pretty_source_kind(sys.source_kind));
-    section(&mut out, "solved formulas", &pretty_formula_list(&sys.solved_formulas));
+    section(&mut out, "solved formulas", &pretty_formula_set(&sys.solved_formulas));
     section(&mut out, "unsolved constraints", &pretty_goals(sys, false));
     section(&mut out, "solved constraints", &pretty_goals(sys, true));
     out
@@ -89,16 +89,6 @@ fn pretty_last(sys: &System) -> String {
 // ---------------------------------------------------------------------
 // formulas / lemmas / solved_formulas
 // ---------------------------------------------------------------------
-
-fn pretty_formula_list(items: &[Guarded]) -> String {
-    if items.is_empty() { return String::new(); }
-    let mut s = String::new();
-    for (i, g) in items.iter().enumerate() {
-        if i > 0 { s.push('\n'); }
-        s.push_str(&pretty_guarded(g));
-    }
-    s
-}
 
 /// Render a guarded-formula collection whose Haskell counterpart is a
 /// `S.Set LNGuarded` (System.hs:1679 renders `sLemmas` via `S.toList`,
@@ -212,8 +202,11 @@ fn combine(header: &str, d: Doc) -> Doc {
 //     sorted by `add_neg`'s `binary_search` insert (matching HS `S.toList`
 //     over the `negSt` Set). `subterms`/`solved_subterms` are `Vec`s in
 //     insertion order (`.push()` in `add`/`conjoin`), whereas HS emits the
-//     `posSt`/`solvedSt` Sets via `S.toList` in `Ord` order, so the
-//     numbered ordering of those two sections may differ from Haskell.
+//     `posSt`/`solvedSt` Sets via `S.toList` in `Ord` order — so their
+//     numbered ordering may differ from Haskell. Left as-is: sorting needs a
+//     faithful `Ord LNTerm` (FunSym-by-name, like `guarded::cmp_term` but for
+//     raw LNTerms); the derived `VTerm` Ord could flip a currently-matching
+//     pane, so it is not safe to apply blindly. Tracked as a residual gap.
 // Section structure, numbering and the `Contradictory` header are
 // byte-faithful.
 fn pretty_subterm_store(sys: &System) -> String {
