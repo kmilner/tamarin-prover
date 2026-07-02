@@ -104,10 +104,27 @@ impl ChangeIndicator {
 
 impl<'ctx> Reduction<'ctx> {
     pub fn new(ctx: &'ctx ProofContext, sys: System) -> Self {
+        Self::new_with_floor(ctx, sys, 0)
+    }
+
+    /// Like [`new`] but seeds the per-Reduction Fresh counter from
+    /// `max(bounds_max(sys), floor)` instead of `bounds_max(sys)` alone.
+    ///
+    /// HS-faithful `refineSource` (Sources.hs:162) seeds EVERY case's
+    /// `runReduction proofStep ctxt se fs` from `fs = avoid th` — the max
+    /// var idx over the WHOLE source `th` (all its cases), NOT the single
+    /// case `se`.  A source whose sibling case is complex (high var idx)
+    /// therefore seeds even its SIMPLE cases from that high `avoid th`.
+    /// RS creates each case's Reduction from `bounds_max(se)` alone
+    /// (per-case `avoid se`), so simple cases in a source with a complex
+    /// sibling seed too low → their solve-time allocations land below HS.
+    /// Source-precompute threads `avoid th` in as `floor`; the general
+    /// proving path passes `floor = 0` (a no-op) via [`new`].
+    pub fn new_with_floor(ctx: &'ctx ProofContext, sys: System, floor: u64) -> Self {
         // HS-faithful per-Reduction Fresh counter: init from
         // `bounds_max(sys) + 1`.  Matches `runReduction m ctx sys (avoid sys)`
         // in HS where `avoid t = maybe 0 (succ . snd) . boundsVarIdx`.
-        let avoid_max = bounds_max(&sys);
+        let avoid_max = bounds_max(&sys).max(floor);
         let maude = ctx.maude.with_fresh_counter_from(avoid_max);
         // Ensure the GLOBAL ctx.maude is at least as advanced as our
         // local high-water start.  Any non-Reduction allocator

@@ -1060,7 +1060,15 @@ fn refine_one_source(
     goal_free_vars(&src.goal, &mut |v| {
         stable_vars.insert(v.clone());
     });
-    for (name_list, sys) in src.cases_take_list() {
+    let all_cases = src.cases_take_list();
+    // HS `refineSource` (Sources.hs:162): `fs = avoid th` — the fresh seed
+    // for EVERY case is the max var idx over the WHOLE source `th` (all its
+    // cases), NOT the per-case `avoid se`.  Compute it once here and thread
+    // it as the seed floor into each case's Reduction.
+    let source_avoid = all_cases.iter()
+        .map(|(_, s)| crate::constraint::solver::reduction::bounds_max(s))
+        .max().unwrap_or(0);
+    for (name_list, sys) in all_cases {
         // === Multi-branch refineSource (Haskell-faithful) ===
         set_precompute_mode(true);
         // HS-faithful: NO per-branch step cap.  HS `solveAllSafeGoals`
@@ -1078,7 +1086,7 @@ fn refine_one_source(
         let outer_cap: i64 = i64::MAX;
         let (branches, branch_took_step) = run_solve_all_safe_goals_disj_with_progress(
             ctx, sys, ths_snapshot, /*chains_limit*/ 10,
-            outer_cap, branch_cap, name_list);
+            outer_cap, branch_cap, name_list, source_avoid);
         if branch_took_step {
             // HS-faithful `not (null names)` change signal —
             // solveAllSafeGoals took at least one step (safe-goal
@@ -1388,7 +1396,7 @@ pub fn run_solve_all_safe_goals_disj_for_probe(
 ) -> Vec<(System, String)> {
     let init = string_to_name_list(&initial_name);
     run_solve_all_safe_goals_disj(ctx, initial_sys, &[],
-        chains_limit, outer_cap, branch_cap, init)
+        chains_limit, outer_cap, branch_cap, init, /*source_avoid*/ 0)
         .into_iter()
         .map(|(sys, n)| (sys, case_name_list_to_string(&n)))
         .collect()
@@ -1408,7 +1416,7 @@ pub fn run_solve_all_safe_goals_disj_for_probe_with_ths(
 ) -> Vec<(System, String)> {
     let init = string_to_name_list(&initial_name);
     run_solve_all_safe_goals_disj(ctx, initial_sys, ths,
-        chains_limit, outer_cap, branch_cap, init)
+        chains_limit, outer_cap, branch_cap, init, /*source_avoid*/ 0)
         .into_iter()
         .map(|(sys, n)| (sys, case_name_list_to_string(&n)))
         .collect()
@@ -1488,9 +1496,11 @@ fn run_solve_all_safe_goals_disj(
     outer_cap: i64,
     branch_cap: usize,
     initial_name: Vec<String>,
+    source_avoid: u64,
 ) -> Vec<(System, Vec<String>)> {
     run_solve_all_safe_goals_disj_with_progress(
-        ctx, initial_sys, ths, chains_limit, outer_cap, branch_cap, initial_name).0
+        ctx, initial_sys, ths, chains_limit, outer_cap, branch_cap,
+        initial_name, source_avoid).0
 }
 
 /// Variant that also returns a flag indicating whether ANY branch took
@@ -1509,6 +1519,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
     outer_cap: i64,
     branch_cap: usize,
     initial_name: Vec<String>,
+    source_avoid: u64,
 ) -> (Vec<(System, Vec<String>)>, bool) {
     use crate::constraint::constraints::Goal;
     use crate::constraint::solver::contradictions::contradictions;
@@ -1636,7 +1647,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
                 head
             }
         };
-        let mut red = Reduction::new(ctx, sys);
+        let mut red = Reduction::new_with_floor(ctx, sys, source_avoid);
         let contras = contradictions(red.ctx, &red.sys);
         if !contras.is_empty() {
             // Haskell mzero — drop branch (don't push to finished).
