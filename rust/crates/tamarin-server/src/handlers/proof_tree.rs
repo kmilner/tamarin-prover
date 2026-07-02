@@ -28,7 +28,7 @@ use parking_lot::Mutex;
 
 use tamarin_term::maude_proc::MaudeHandle;
 use tamarin_theory::constraint::constraints::Goal;
-use tamarin_theory::constraint::solver::context::ProofContext;
+use tamarin_theory::constraint::solver::context::{ProofContext, UseInduction};
 use tamarin_theory::constraint::solver::goals::GoalRanking;
 use tamarin_theory::constraint::solver::proof_method::{
     exec_proof_method, finished_subterms, is_finished, ProofMethod,
@@ -50,6 +50,34 @@ pub struct LemmaProofState {
     pub root: ProofNode,
 }
 
+/// Per-lemma search settings that HS/`--prove` install into the
+/// `ProofContext` before ranking THAT lemma's applicable proof methods.
+///
+/// The web server builds ONE shared `ProofContext` (`Arc<Mutex<…>>`) for a
+/// theory (so it doesn't re-precompute sources / re-boot Maude per click),
+/// but HS's per-lemma `getProofContext` sets `pcUseInduction` and
+/// `pcHeuristic` from the lemma's attributes + the theory's `heuristic:`
+/// directive.  Without these the shared ctx defaults to `AvoidInduction` +
+/// `Smart`, which diverges from HS at the display / method-index sites that
+/// recompute `candidate_methods*` / `ranking_for_depth`.
+///
+/// Mirrors `tamarin_theory::prove::prove_lemma`:
+///   - `use_induction`: `UseInduction` iff the lemma carries `[use_induction]`
+///     or `[sources]` (prove.rs:749-753); else the `AvoidInduction` default.
+///   - `heuristic`: per-lemma `[heuristic=..]` > theory-level `heuristic:`
+///     directive, parsed via `parse_heuristic_str_with_tactics`
+///     (prove.rs:601-623, minus the CLI `--heuristic` the web path never has).
+///     `None` ⇒ HS default `Smart`.
+///
+/// Built ONCE in [`ProofState::new`] and never mutated → held lock-free
+/// (`Arc<BTreeMap<…>>`); each read site copies its two fields into the
+/// Mutex-locked ctx before ranking, so there is no stale read across
+/// interleaved requests.
+pub struct LemmaSearchSettings {
+    pub use_induction: UseInduction,
+    pub heuristic: Option<Vec<GoalRanking>>,
+}
+
 /// Each [`TheoryEntry`] carries one of these. `ctx` is shared (Arc'd)
 /// so we don't rebuild the full source-case precomputation on every
 /// click; per-lemma roots are cloned cheaply.
@@ -61,6 +89,11 @@ pub struct LemmaProofState {
 pub struct ProofState {
     pub ctx: Arc<Mutex<ProofContext>>,
     pub by_lemma: Arc<Mutex<BTreeMap<String, LemmaProofState>>>,
+    /// Immutable, lock-free per-lemma search settings (see
+    /// [`LemmaSearchSettings`]).  Built once in [`ProofState::new`]; read at
+    /// every display / method-index site to override the shared ctx's
+    /// `use_induction` + `heuristic` for the lemma being ranked.
+    pub lemma_settings: Arc<BTreeMap<String, LemmaSearchSettings>>,
 }
 
 impl ProofState {
@@ -93,8 +126,46 @@ impl ProofState {
         let ctx = ProofContext::new_with_restrictions(maude, rules, ctx_restrictions);
         // Build the initial system for every lemma.
         let mut by_lemma: BTreeMap<String, LemmaProofState> = BTreeMap::new();
+        // Per-lemma search settings HS installs before ranking each lemma's
+        // applicable methods (mirrors `prove::prove_lemma` heuristic/
+        // use_induction resolution).  Built once, read lock-free thereafter.
+        let mut lemma_settings: BTreeMap<String, LemmaSearchSettings> = BTreeMap::new();
         for lemma in typed.lemmas() {
             let lname = lemma.name.clone();
+            // --- Per-lemma search settings (prove.rs:601-623,749-753) -------
+            // `use_induction`: forced on by `[use_induction]` or `[sources]`.
+            let use_induction = if lemma.attributes.iter().any(|a| matches!(a,
+                LemmaAttr::UseInduction | LemmaAttr::Sources))
+            {
+                UseInduction::UseInduction
+            } else {
+                UseInduction::AvoidInduction
+            };
+            // `heuristic`: per-lemma `[heuristic=..]` > theory `heuristic:`.
+            // There is no CLI `--heuristic` on the web path, so the CLI
+            // override branch of `prove::prove_lemma` is skipped entirely.
+            let lemma_heuristic: Option<&str> = lemma.attributes.iter()
+                .find_map(|a| match a {
+                    LemmaAttr::Heuristic(s) => Some(s.as_str()),
+                    _ => None,
+                });
+            let heuristic_raw: Option<String> = match lemma_heuristic {
+                Some(h) => Some(h.to_string()),
+                None => typed.heuristic.first().cloned(),
+            };
+            // NOTE: oracle-relative paths in a web `heuristic:` directive are
+            // NOT yet prefixed with the theory dir (HS
+            // `prepend_theory_dir_to_oracle_paths`, prove.rs:130, is private to
+            // that module).  The observed web cases (`use_induction`, SAPiC
+            // `p`) are not oracles; a future oracle-on-web `heuristic:` case
+            // must thread that prefixing through here.
+            let heuristic = heuristic_raw.map(|h| {
+                tamarin_theory::constraint::solver::goals::parse_heuristic_str_with_tactics(
+                    &h, &typed.in_file, &typed.tactic)
+            });
+            lemma_settings.insert(
+                lname.clone(),
+                LemmaSearchSettings { use_induction, heuristic });
             let g = match formula_to_guarded(&lemma.formula) {
                 Ok(g) => g,
                 Err(_) => continue,
@@ -163,6 +234,7 @@ impl ProofState {
         Ok(ProofState {
             ctx: Arc::new(Mutex::new(ctx)),
             by_lemma: Arc::new(Mutex::new(by_lemma)),
+            lemma_settings: Arc::new(lemma_settings),
         })
     }
 
@@ -258,12 +330,31 @@ impl ProofState {
         ProofState {
             ctx: self.ctx.clone(),
             by_lemma: Arc::new(Mutex::new(clone)),
+            // Share the immutable per-lemma settings map (same theory).
+            lemma_settings: self.lemma_settings.clone(),
         }
     }
 
     /// Read the root ProofNode for a lemma.
     pub fn get_root(&self, lemma: &str) -> Option<ProofNode> {
         self.by_lemma.lock().get(lemma).map(|lp| lp.root.clone())
+    }
+
+    /// Copy the lemma's per-lemma search settings ([`LemmaSearchSettings`])
+    /// into a locked `ProofContext` before ranking that lemma's applicable
+    /// proof methods.  A no-op when the lemma has no settings (unknown lemma).
+    ///
+    /// Call this on a `mut` ctx guard right after locking, at every display /
+    /// method-index-mapping site — it makes the shared web `ProofContext`
+    /// behave like HS's per-lemma `getProofContext` (`pcUseInduction` +
+    /// `pcHeuristic`) for the ranking that follows.  The autoprove path builds
+    /// its OWN correct per-lemma context via `prove_lemma`, so it must NOT call
+    /// this.
+    pub fn install_lemma_settings(&self, ctx: &mut ProofContext, lemma: &str) {
+        if let Some(s) = self.lemma_settings.get(lemma) {
+            ctx.use_induction = s.use_induction;
+            ctx.heuristic = s.heuristic.clone();
+        }
     }
 
     /// Find the system at the given path (root if empty).

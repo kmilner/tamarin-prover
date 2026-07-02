@@ -619,7 +619,12 @@ pub fn proof_html(entry: &TheoryEntry, lemma: &str, sub: &[String]) -> String {
     if let Some(ps) = &entry.proof_state {
         if let Some(root) = ps.get_root(lemma) {
             if let Some(n) = crate::handlers::proof_tree::navigate_at(&root, sub) {
-                let ctx_guard = ps.ctx.lock();
+                // Install this lemma's per-lemma `use_induction`/`heuristic`
+                // into the shared ctx before ranking (HS `getProofContext`);
+                // otherwise the Applicable Proof Methods order + ranking name
+                // default to `AvoidInduction`/`Smart` and diverge from HS.
+                let mut ctx_guard = ps.ctx.lock();
+                ps.install_lemma_settings(&mut ctx_guard, lemma);
                 return crate::handlers::proof_tree::render_sub_proof_snippet(
                     entry.idx, lemma, sub, n, &ctx_guard);
             }

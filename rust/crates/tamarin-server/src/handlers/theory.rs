@@ -168,7 +168,13 @@ fn apply_method_and_redirect(
     // Without filtering here the numbering would drift on Sorry/no-op
     // candidates that the UI omits.
     let method = {
-        let ctx_guard = src_ps.ctx.lock();
+        let mut ctx_guard = src_ps.ctx.lock();
+        // Install this lemma's per-lemma `use_induction`/`heuristic` into the
+        // shared ctx BEFORE ranking, so the method-index → method mapping
+        // matches HS (and the numbering `write_applicable_methods` displays).
+        // Without this the mapping ranks under `AvoidInduction`/`Smart`, so a
+        // `[use_induction]` lemma's method `1` resolves to the wrong method.
+        src_ps.install_lemma_settings(&mut ctx_guard, lemma);
         // Haskell `applyMethodAtPath` ranks with `useHeuristic heuristic
         // (length proofPath)` (Web/Theory.hs:84-89); the depth selects
         // which ranking of a multi-ranking heuristic is active
@@ -1354,7 +1360,10 @@ pub async fn proof_step(
         None => return json_resp::alert(format!(
             "no node at path {:?} after step", case_path)),
     };
-    let ctx_guard = ps.ctx.lock();
+    // Install this lemma's per-lemma `use_induction`/`heuristic` into the
+    // shared ctx before ranking the re-rendered snippet (HS `getProofContext`).
+    let mut ctx_guard = ps.ctx.lock();
+    ps.install_lemma_settings(&mut ctx_guard, &lemma);
     let mut html = crate::handlers::proof_tree::render_sub_proof_snippet(
         idx, &lemma, &case_path, node, &ctx_guard);
     drop(ctx_guard);
