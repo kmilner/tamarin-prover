@@ -441,8 +441,11 @@ impl DotBuilder {
         // HS `ruleLabelM`: `prettyNodeId v <-> colon <-> showDotRuleCaseName`
         // (Dot.hs:336-337). `prettyNodeId = text . show` (LTerm.hs:849), so the
         // id renders as `show v` (e.g. `#i` / `#i.2`) via `Display for LVar`.
-        let header = format!("{} : {}", nid,
-            escape_dot(&rule_case_name(ru)));
+        // NOTE: `header` (and the `acts` below) are kept RAW here; the whole
+        // `mid` record field is escaped exactly once by `escape_dot` at the
+        // `sections.push` below.  Escaping here too would double-escape record
+        // metacharacters (a pair term's `<…>` → `\<…\>` → `\\\<…\\\>`).
+        let header = format!("{} : {}", nid, rule_case_name(ru));
         // HS `ruleLabelM` filters the action facts before rendering
         // (Dot.hs:330-354): always drop the synthetic `Diff<rulename>`
         // annotation, and — only when `goShowAutoSource` is set — drop the
@@ -459,8 +462,9 @@ impl DotBuilder {
                 .collect();
             // HS `ruleLabelM` joins the action bracket with `<>` (Dot.hs:338),
             // i.e. NO space before `[` (`name[acts]`), unlike the space-separated
-            // `<->` used for `id : name`.
-            format!("{}[{}]", header, escape_dot(&acts.join(", ")))
+            // `<->` used for `id : name`.  Kept RAW — escaped once at the
+            // `sections.push(escape_dot(&mid))` below (see the header note).
+            format!("{}[{}]", header, acts.join(", "))
         };
         // Record label: `{ prems | mid | concs }`.  When a section is
         // empty we omit it to avoid a stray `|`.
