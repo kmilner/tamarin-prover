@@ -5221,11 +5221,23 @@ impl<'ctx> Reduction<'ctx> {
             // unify with `<h(...), ~nb>` (head mismatch h vs pair).
             // Without the fresh var, the chain-up to responder never
             // materialises and the case name stays at "coerce_irecv".
+            // HS `solvePremise` KD branch (Goals.hs:318-321):
+            //   iLearn <- freshLVar "vl" LSortNode
+            //   mLearn <- varTerm <$> freshLVar "t" LSortMsg
+            // Both draw from — and ADVANCE — the shared MonadFresh counter,
+            // in that order.  RS previously used `bounds_max + 1/2` locally,
+            // which produced the same idx VALUES but left the maude counter
+            // un-advanced, so the recursive `solvePremise` (and the chain
+            // extension it feeds) numbered its `#vr` / rule variables two
+            // indices too low vs HS.
             let avoid = bounds_max(&self.sys);
+            self.maude.ensure_above(avoid);
+            let vl_idx = self.maude.fresh_idx();
+            let t_idx = self.maude.fresh_idx();
             let i_learn = tamarin_term::lterm::LVar::new(
-                "vl", tamarin_term::lterm::LSort::Node, avoid.saturating_add(1));
+                "vl", tamarin_term::lterm::LSort::Node, vl_idx);
             let m_learn_var = tamarin_term::lterm::LVar::new(
-                "t", tamarin_term::lterm::LSort::Msg, avoid.saturating_add(2));
+                "t", tamarin_term::lterm::LSort::Msg, t_idx);
             let m_learn = tamarin_term::term::Term::Lit(
                 tamarin_term::vterm::Lit::Var(m_learn_var));
             let irecv_rule = crate::rule::Rule::new(
@@ -5321,7 +5333,24 @@ impl<'ctx> Reduction<'ctx> {
             = premise_solving_rule_insts_with_constrs(self.ctx, fa_prem);
         let avoid_max = bounds_max(&self.sys);
         let mut cases: Vec<(String, crate::constraint::system::System)> = Vec::new();
-        let mut next_node_idx = avoid_max.saturating_add(1);
+        // HS `insertFreshNode` (Reduction.hs:238-241): `i <- freshLVar "vr"`
+        // is evaluated ONCE, in the shared prefix BEFORE the
+        // `disjunctionOfList rules` inside `labelNodeId`.  So EVERY candidate
+        // rule — and every conclusion of every rule — is a `Disj` fork that
+        // (a) inherits this single `#vr` node id, and (b) forks the fresh
+        // counter independently from the post-`freshLVar` state (the fresh
+        // state threads ABOVE the Disj layer — `FreshT (DisjT ...)`,
+        // Disj/Class.hs:38-45 — so sibling disjuncts do NOT see each other's
+        // allocations).  `freshLVar` also ADVANCES the shared counter, which
+        // is what pushes each imported rule's variables one index above the
+        // `#vr` id itself (`!Ltk( $A.4, ~ltkA.4 ) ▶₀ #i` under `#vr.3`, not
+        // `$A.3`).  RS previously minted `#vr` from a side counter that never
+        // touched the maude counter and did so AFTER the rule rename, so
+        // every source-case rule variable came out one-too-low vs HS.
+        self.maude.ensure_above(avoid_max);
+        let vr_idx = self.maude.fresh_idx();
+        let post_vr_counter = self.maude.fresh_counter_peek();
+        let mut counter_high_water = post_vr_counter;
         for (rule, constrs) in &candidates {
             // Mirror HS `labelNodeId` in solvePremise: HS exploits every
             // candidate rule via Disj-monad, including conclusion
@@ -5358,15 +5387,23 @@ impl<'ctx> Reduction<'ctx> {
             // its own insert_edge_labeled (Reduction.hs:300) emitting
             // `insertEdges n=1`.  Tag-mismatched conclusions mzero in
             // solveFactEqs but still emit their insertEdges trace.
+            // Independent `Disj` fork: reset the shared fresh counter to the
+            // post-`freshLVar "vr"` state so THIS rule's `importRule`
+            // (= rename, Rule.hs:940-944) reserves its var range from the
+            // exact same base every sibling rule sees.  HS forks don't thread
+            // the fresh state between disjuncts, so all candidate rules of one
+            // premise goal rename starting at `#vr` + 1 and share the `#vr`
+            // id.
+            self.maude.reset_counter_to(post_vr_counter);
             let (renamed, renamed_constrs) = freshen_rule_with_constrs(
                 rule.clone(), constrs.clone(), avoid_max, &self.maude);
+            counter_high_water = counter_high_water.max(self.maude.fresh_counter_peek());
             let case_name = rule_case_name(&renamed);
             let new_node = tamarin_term::lterm::LVar::new(
                 "vr",
                 tamarin_term::lterm::LSort::Node,
-                next_node_idx,
+                vr_idx,
             );
-            next_node_idx = next_node_idx.saturating_add(1);
             // HS-faithful labelNodeId (`Reduction.hs:246-256`).
             let mut label_sys = self.sys.clone();
             label_sys.add_node(new_node.clone(), renamed.clone());
@@ -5461,6 +5498,11 @@ impl<'ctx> Reduction<'ctx> {
                 }
             }
         }
+        // The per-candidate `reset_counter_to(post_vr_counter)` above rewinds
+        // the shared counter for each independent fork; restore it to the
+        // high-water mark reached across all forks so any later allocation on
+        // this Reduction can't collide with a reserved rule-var range.
+        self.maude.ensure_above(counter_high_water.saturating_sub(1));
         if cases.is_empty() { return GoalCases::Contradictory; }
         if cases.len() == 1 {
             let (name, sys) = cases.into_iter().next().unwrap();
@@ -5650,7 +5692,12 @@ impl<'ctx> Reduction<'ctx> {
         if let Some(args) = funion_args {
             use tamarin_term::function_symbols::UNION_SYM_STRING;
             let avoid_max = bounds_max(&self.sys);
-            let mut next_node_idx = avoid_max.saturating_add(1);
+            // HS `solveChain` union arm (Goals.hs:374): `i <- freshLVar "vr"`
+            // is allocated ONCE, before `disjunctionOfList rus`, so every
+            // union-decomposition case shares the same `#vr` id (and it
+            // advances the shared counter).
+            self.maude.ensure_above(avoid_max);
+            let vr_idx = self.maude.fresh_idx();
             let xy_union = tamarin_term::term::Term::App(
                 tamarin_term::function_symbols::FunSym::Ac(
                     tamarin_term::function_symbols::AcSym::Union),
@@ -5679,9 +5726,8 @@ impl<'ctx> Reduction<'ctx> {
                 let new_node = tamarin_term::lterm::LVar::new(
                     "vr",
                     tamarin_term::lterm::LSort::Node,
-                    next_node_idx,
+                    vr_idx,
                 );
-                next_node_idx = next_node_idx.saturating_add(1);
                 let mut sys_clone = self.sys.clone();
                 sys_clone.add_node(new_node.clone(), ru_inst.clone());
                 let mut sub = Reduction::new(self.ctx, sys_clone);
@@ -5755,11 +5801,25 @@ impl<'ctx> Reduction<'ctx> {
         }
         if !conc_term_is_msg_var {
             let avoid_max = bounds_max(&self.sys);
-            let mut next_node_idx = avoid_max.saturating_add(1);
+            // HS `solveChain` EXTEND (Goals.hs:394): `insertFreshNode rules
+            // (Just cRule)` allocates `i <- freshLVar "vr"` ONCE, before the
+            // `disjunctionOfList rules` inside `labelNodeId`.  So every
+            // destructor-extension case shares the same `#vr` id, and each
+            // destructor's `importRule` (= rename) reserves its var range from
+            // the single post-`freshLVar` counter state (independent forks).
+            self.maude.ensure_above(avoid_max);
+            let vr_idx = self.maude.fresh_idx();
+            let post_vr_counter = self.maude.fresh_counter_peek();
+            let mut counter_high_water = post_vr_counter;
             for ir in &self.ctx.intruder_rules {
                 if !crate::rule::is_destr_rule_info(&ir.info) { continue; }
                 let ru_inst = intr_rule_to_rule_ac_inst(ir.clone());
+                // Independent Disj fork: reset to the post-`freshLVar "vr"`
+                // state so this destructor renames from the same base as its
+                // siblings.
+                self.maude.reset_counter_to(post_vr_counter);
                 let ru_renamed = freshen_rule(ru_inst, avoid_max, &self.maude);
+                counter_high_water = counter_high_water.max(self.maude.fresh_counter_peek());
                 // HS-faithful `labelNodeId` (Reduction.hs:219-225) — when
                 // the chain conc's rule (parent) shares a name with this
                 // destructor and still has > 1 remaining applications,
@@ -5855,9 +5915,8 @@ impl<'ctx> Reduction<'ctx> {
                 let new_node = tamarin_term::lterm::LVar::new(
                     "vr",
                     tamarin_term::lterm::LSort::Node,
-                    next_node_idx,
+                    vr_idx,
                 );
-                next_node_idx = next_node_idx.saturating_add(1);
                 sys_clone.add_node(new_node.clone(), ru_renamed.clone());
                 let mut sub = Reduction::new(self.ctx, sys_clone);
                 // HS-faithful effect order (Goals.hs solveChain EXTEND
@@ -6011,6 +6070,10 @@ impl<'ctx> Reduction<'ctx> {
                     all_cases.push((case_name.clone(), arm_sys));
                 }
             }
+            // Restore the shared counter to the high-water mark reached
+            // across the per-destructor forks (each of which rewound it via
+            // `reset_counter_to`) so later allocations can't collide.
+            self.maude.ensure_above(counter_high_water.saturating_sub(1));
         }
 
         if all_cases.is_empty() { return GoalCases::Contradictory; }
