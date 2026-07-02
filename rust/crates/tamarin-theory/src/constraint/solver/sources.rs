@@ -4045,9 +4045,23 @@ fn apply_source_case_premise(
     };
 
     // A.2.5 (Premise-specific) — substNodePrem pPat (iPat, premIdxTerm).
-    // Rewrite edges in the case whose tgt is the renamed pattern
-    // premise so they point at the LIVE premise idx.  Same for any
-    // Premise goal at that position.
+    // HS `matchToGoal` (Sources.hs:385) rewrites ONLY the source case's
+    // EDGES: `modM sEdges (substNodePrem pPat (iPat, premIdxTerm))`, where
+    // `substNodePrem from to = S.map (\e@(Edge c p) -> if p == from then
+    // Edge c to else e)`.  It does NOT touch `sGoals`.  So when the source
+    // pattern's consumer premise sits at index 0 (all precomputed sources
+    // use `PremIdx 0`, Sources.hs:576) but the LIVE goal being solved is at
+    // index i≠0, HS keeps the source case's SOLVED premise goal at index 0.
+    // After `conjoinSystem` re-inserts it (with a fresh gsNr) and node-merge
+    // relabels its node to the live node, this leaves a redundant SOLVED
+    // "ghost" premise goal `fa ▶₀ #i` alongside the genuine (now-solved)
+    // `fa ▶ᵢ #i`.  That ghost is search-inert (solved goals never drive open-
+    // goal selection) but it IS rendered in the per-node sequent, so the web
+    // UI must reproduce it byte-for-byte.  Rewriting the GOAL index here (as
+    // an earlier port mistakenly did) instead deduped the source goal into
+    // the genuine `▶ᵢ` goal, dropping the ghost and diverging from HS on the
+    // interactive per-node systems (NSPK3 injective_agree, RFID_Simple, …).
+    // Faithful behaviour: rewrite edges only; leave goals at the source idx.
     let mut renamed_case = renamed_case;
     let pat_prem: (tamarin_term::lterm::LVar, crate::rule::PremIdx) =
         (renamed_abstract_node.clone(), abstract_prem_idx_orig);
@@ -4056,13 +4070,6 @@ fn apply_source_case_premise(
     for e in renamed_case.edges.iter_mut() {
         if e.tgt == pat_prem {
             e.tgt = new_prem.clone();
-        }
-    }
-    for (g, _) in renamed_case.goals_mut().iter_mut() {
-        if let crate::constraint::constraints::Goal::Premise(p, _) = g {
-            if *p == pat_prem {
-                *p = new_prem.clone();
-            }
         }
     }
 
