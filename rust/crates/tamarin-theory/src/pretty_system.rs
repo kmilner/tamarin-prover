@@ -44,7 +44,7 @@ pub fn pretty_non_graph_system(sys: &System) -> String {
     section(&mut out, "formulas", &pretty_formula_list(&sys.formulas));
     section(&mut out, "subterms", &pretty_subterm_store(sys));
     section(&mut out, "equations", &pretty_eq_store(sys));
-    section(&mut out, "lemmas", &pretty_formula_list(&sys.lemmas));
+    section(&mut out, "lemmas", &pretty_formula_set(&sys.lemmas));
     section(&mut out, "allowed cases", &pretty_source_kind(sys.source_kind));
     section(&mut out, "solved formulas", &pretty_formula_list(&sys.solved_formulas));
     section(&mut out, "unsolved constraints", &pretty_goals(sys, false));
@@ -94,6 +94,37 @@ fn pretty_formula_list(items: &[Guarded]) -> String {
     if items.is_empty() { return String::new(); }
     let mut s = String::new();
     for (i, g) in items.iter().enumerate() {
+        if i > 0 { s.push('\n'); }
+        s.push_str(&pretty_guarded(g));
+    }
+    s
+}
+
+/// Render a guarded-formula collection whose Haskell counterpart is a
+/// `S.Set LNGuarded` (System.hs:1679 renders `sLemmas` via `S.toList`,
+/// i.e. ascending `Ord LNGuarded` with structural dedup).  RS stores
+/// `sLemmas` as a `Vec<Guarded>` in *insertion* order (see
+/// `System::insert_lemma`), so the raw Vec would render in a different
+/// order than HS whenever two lemmas were inserted out of Ord order
+/// (e.g. the two safety restrictions of `design-choices.spthy`).  Mirror
+/// `S.toList` here by sorting a view of the Vec with the HS-faithful
+/// `cmp_guarded` comparator (guarded.rs — the derived `Ord Guarded`) and
+/// collapsing `Ord`-equal duplicates, exactly as the equivalent
+/// sort+dedup in `rename_precise.rs` does for the live field.
+///
+/// This is a *render-time only* reordering: the live `sys.lemmas` Vec is
+/// left untouched, so the constraint-solver iteration order (which some
+/// implied-formula sites read in storage order) is unchanged and the
+/// `--prove` byte-identity corpus is unaffected.  `prettyNonGraphSystem`
+/// is reached only from the interactive/web constraint-system pane, never
+/// from `--prove` output.
+fn pretty_formula_set(items: &[Guarded]) -> String {
+    if items.is_empty() { return String::new(); }
+    let mut sorted: Vec<&Guarded> = items.iter().collect();
+    sorted.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
+    sorted.dedup_by(|a, b| crate::guarded::cmp_guarded(a, b) == std::cmp::Ordering::Equal);
+    let mut s = String::new();
+    for (i, g) in sorted.into_iter().enumerate() {
         if i > 0 { s.push('\n'); }
         s.push_str(&pretty_guarded(g));
     }
