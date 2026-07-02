@@ -557,7 +557,20 @@ impl System {
     /// recorded; the resulting `a < a` is a true contradiction.  We
     /// still add it so the contradiction check catches it.
     pub fn add_less(&mut self, l: LessAtom) {
-        if !self.less_atoms.iter().any(|x| x == &l) {
+        // HS `insertLess` = `modM sLessAtoms (S.insert l)`. `Data.Set.insert`
+        // REPLACES an existing equal element with the new one, and
+        // `Eq`/`Ord LessAtom` ignore the reason tag (Constraints.hs:126-130),
+        // so re-inserting the same `(smaller,larger)` with a DIFFERENT reason
+        // OVERWRITES the stored reason (last-wins). A first-occurrence-wins
+        // dedup would keep the wrong reason — e.g. a GenKey→Alice ordering
+        // added first by fresh-uniqueness (`Fresh`) then by injective-fact
+        // monotonicity (`InjectiveFacts`, Simplify.hs:761) must end up
+        // `InjectiveFacts`, driving the less-edge's graph colour. The reason
+        // is metadata for rendering only (read solely by `Dot.hs`/graph
+        // simplification); replace in place to preserve iteration order.
+        if let Some(existing) = self.less_atoms.iter_mut().find(|x| **x == l) {
+            *existing = l;
+        } else {
             self.bump_cache_lvar(&l.smaller);
             self.bump_cache_lvar(&l.larger);
             self.less_atoms.push(l);

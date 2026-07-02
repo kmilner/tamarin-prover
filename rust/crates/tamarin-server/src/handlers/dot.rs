@@ -157,6 +157,25 @@ pub fn system_to_dot_with(sys: &System, opts: &GraphOptions) -> String {
             _ => None,
         })
         .collect();
+    // HS emits the `sLastAtom` node unconditionally (`systemLastActionNode`,
+    // Graph.hs:111-112), even when its id coincides with a system node — both
+    // are drawn (see repr.rs). In RS's semantic dot-id scheme both would share
+    // one dot id and collide, so a colliding last-atom node gets a distinct id.
+    // HS `dsNodes[v]` resolves to the last-atom (processed after the system
+    // node, Dot.hs:108), so less-edges at that id must target the last-atom's
+    // dot id. The last-atom node is never clustered (no role / rule name), so it
+    // always lives in `repr.nodes`.
+    let last_id: Option<&LVar> = repr.nodes.iter()
+        .find(|n| matches!(n.ty, NodeType::LastAction))
+        .map(|n| &n.id);
+    let last_dot_id: Option<String> = last_id.map(|lid| {
+        let base = DotBuilder::dot_node_id(lid);
+        let collides = repr.nodes.iter()
+            .chain(repr.clusters.iter().flat_map(|c| c.nodes.iter()))
+            .any(|n| !matches!(n.ty, NodeType::LastAction)
+                && DotBuilder::dot_node_id(&n.id) == base);
+        if collides { format!("{base}__lastatom") } else { base }
+    });
     // 4a. Clusters as subgraphs.
     //
     // HS `dotCluster` (Dot.hs:547-562): each cluster gets a `roleColor`
@@ -175,20 +194,21 @@ pub fn system_to_dot_with(sys: &System, opts: &GraphOptions) -> String {
         g.open_subgraph(i, &cluster.name, &color);
         for node in &cluster.nodes {
             emit_node_colored(&mut g, node, &abbrev_lookup, opts, Some(&color),
-                &color_map, &has_outgoing);
+                &color_map, &has_outgoing, last_dot_id.as_deref());
         }
         g.close_subgraph();
         cluster_edges.extend(cluster.edges.iter().cloned());
     }
     // 4b. Top-level nodes.
     for node in &repr.nodes {
-        emit_node(&mut g, node, &abbrev_lookup, opts, &color_map, &has_outgoing);
+        emit_node(&mut g, node, &abbrev_lookup, opts, &color_map, &has_outgoing,
+            last_dot_id.as_deref());
     }
     // 4c. Edges. HS emits `restEdges` (non-less) before the merged
     // `lessEdges` within each scope (`dotGraphCompact`, Dot.hs:508-509),
     // then the cluster edges last (`dotClustersEdges`).
-    emit_edges_merged(&mut g, &repr.edges, &node_map);
-    emit_edges_merged(&mut g, &cluster_edges, &node_map);
+    emit_edges_merged(&mut g, &repr.edges, &node_map, last_id, last_dot_id.as_deref());
+    emit_edges_merged(&mut g, &cluster_edges, &node_map, last_id, last_dot_id.as_deref());
     // 4c. Legend (if any abbreviations were chosen).
     if !abbrevs.is_empty() {
         g.legend(&abbrevs);
@@ -204,8 +224,10 @@ fn emit_node(
     opts: &GraphOptions,
     color_map: &NodeColorMap,
     has_outgoing: &HashSet<&LVar>,
+    last_dot_id: Option<&str>,
 ) {
-    emit_node_colored(g, node, abbrev, opts, None, color_map, has_outgoing);
+    emit_node_colored(g, node, abbrev, opts, None, color_map, has_outgoing,
+        last_dot_id);
 }
 
 /// `emit_node` with an optional `manual_color` — the cluster `roleColor`
@@ -220,6 +242,7 @@ fn emit_node_colored(
     manual_color: Option<&str>,
     color_map: &NodeColorMap,
     has_outgoing: &HashSet<&LVar>,
+    last_dot_id: Option<&str>,
 ) {
     match &node.ty {
         NodeType::System(ru) => {
@@ -234,7 +257,13 @@ fn emit_node_colored(
                 .collect();
             g.action_node(&node.id, &new_facts);
         }
-        NodeType::LastAction => g.last_node(&node.id),
+        // The last-atom uses its (possibly collision-disambiguated) dot id so
+        // it does not clash with a same-id system node (see `last_dot_id`).
+        NodeType::LastAction => {
+            let id = last_dot_id.map(str::to_string)
+                .unwrap_or_else(|| DotBuilder::dot_node_id(&node.id));
+            g.last_node(&id, &node.id);
+        }
         NodeType::Missing(hint) => g.missing_node(&node.id, hint),
     }
 }
@@ -251,6 +280,8 @@ fn emit_edges_merged(
     g: &mut DotBuilder,
     edges: &[GEdge],
     node_map: &HashMap<&LVar, &RuleACInst>,
+    last_id: Option<&LVar>,
+    last_dot_id: Option<&str>,
 ) {
     // restEdges: keep original order, drop less-edges.
     for edge in edges {
@@ -269,7 +300,7 @@ fn emit_edges_merged(
         .collect();
     lesses.sort_by(|a, b| (&a.smaller, &a.larger).cmp(&(&b.smaller, &b.larger)));
     for la in lesses {
-        g.less_edge(la);
+        g.less_edge(la, last_id, last_dot_id);
     }
 }
 
@@ -512,13 +543,13 @@ impl DotBuilder {
             "  {} [shape=ellipse,label=\"{}\",color=\"{}\"];",
             id, escape_dot(&s), color);
     }
-    fn last_node(&mut self, nid: &LVar) {
-        let id = Self::dot_node_id(nid);
+    fn last_node(&mut self, dot_id: &str, nid: &LVar) {
         // HS `LastActionAtom -> mkSimpleNode (show v) []` (Dot.hs:273): the
         // label is `show v`, rendered via `Display for LVar` (`#i` / `#i.2`).
+        // `dot_id` is the collision-disambiguated id (see `last_dot_id`).
         let _ = writeln!(self.buf,
             "  {} [shape=ellipse,label=\"{}\"];",
-            id, escape_dot(&nid.to_string()));
+            dot_id, escape_dot(&nid.to_string()));
     }
     fn missing_node(&mut self, nid: &LVar, hint: &MissingHint) {
         let id = Self::dot_node_id(nid);
@@ -590,9 +621,20 @@ impl DotBuilder {
     /// reasons; since at most one less-atom survives per node pair (LessAtom
     /// equality ignores the reason), the group is a singleton and the colour
     /// reduces to the single reason's `toColor` (`reason_color`).
-    fn less_edge(&mut self, la: &LessAtom) {
-        let s = Self::dot_node_id(&la.smaller);
-        let t = Self::dot_node_id(&la.larger);
+    fn less_edge(&mut self, la: &LessAtom, last_id: Option<&LVar>,
+                 last_dot_id: Option<&str>) {
+        // HS `dotLessEdge` resolves each endpoint through `dsNodes` (Dot.hs:408-409),
+        // which — when an id is both a system node and the last-atom — holds the
+        // last-atom (processed last). Mirror that: an endpoint equal to the
+        // last-atom id resolves to the last-atom's dot id.
+        let resolve = |nid: &LVar| -> String {
+            match (last_id, last_dot_id) {
+                (Some(li), Some(ld)) if nid == li => ld.to_string(),
+                _ => Self::dot_node_id(nid),
+            }
+        };
+        let s = resolve(&la.smaller);
+        let t = resolve(&la.larger);
         let _ = writeln!(self.buf,
             "  {} -> {} [color=\"{}\",style=\"dashed\"];",
             s, t, reason_color(la.reason));

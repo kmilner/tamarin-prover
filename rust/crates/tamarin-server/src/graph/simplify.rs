@@ -171,10 +171,17 @@ fn guarded_mentions_node(v: &NodeId, g: &tamarin_theory::guarded::Guarded) -> bo
 
 fn atom_mentions_node(v: &NodeId, at: &tamarin_theory::guarded_types::GAtom) -> bool {
     use tamarin_theory::guarded_types::{GAtom, GTerm, BVar};
-    let v_name = &v.name;
     let mentions_term = |t: &GTerm| -> bool {
         if let GTerm::Var(BVar::Free(spec)) = t {
-            return spec.name == **v_name;
+            // HS `notOccursIn proj = not $ getAny $ foldFrees (Any . (v ==))
+            // (proj se)` (Simplification.hs:95-96) folds FULL `LVar` equality
+            // (name AND idx AND sort) over the formula's free vars. Comparing
+            // the NAME ONLY spuriously matches a different index — e.g. node
+            // `#vr.4` matched a formula mentioning `#vr` (idx 0), wrongly
+            // rejecting `#vr.4` from compression and keeping a transfer node
+            // (`d_0_snd`) HS hides. Match name AND idx (both are node-sort
+            // here: `v` is a NodeId and only node vars can equal it).
+            return *spec.name == *v.name && spec.idx == v.idx;
         }
         false
     };

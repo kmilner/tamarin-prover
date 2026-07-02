@@ -306,11 +306,9 @@ use tamarin_theory::constraint::system::System;
 ///   - missing nodes referenced by edges.
 pub fn compute_basic_graph_repr(sys: &System) -> GraphRepr {
     let mut nodes: Vec<GNode> = Vec::new();
-    let mut seen_ids: BTreeSet<NodeId> = BTreeSet::new();
     // 1. System rule instances.
     for (nid, ru) in sys.nodes.iter() {
         nodes.push(GNode { id: nid.clone(), ty: NodeType::System(ru.clone()) });
-        seen_ids.insert(nid.clone());
     }
     // 2. Unsolved action atoms — collect by node id.
     // HS `systemUnsolvedActionNodes se = map unsolvedActionNode
@@ -330,14 +328,18 @@ pub fn compute_basic_graph_repr(sys: &System) -> GraphRepr {
             id: nid.clone(),
             ty: NodeType::UnsolvedAction(facts),
         });
-        seen_ids.insert(nid);
     }
     // 3. Last-atom node.
+    // HS `systemLastActionNode se = maybe [] (\nid -> [Node nid LastActionAtom])
+    // (get Sys.sLastAtom se)` (Graph.hs:111-112) appends this UNCONDITIONALLY
+    // whenever `sLastAtom` is set — it does NOT skip when the id coincides with
+    // a system/unsolved node.  `cacheState` (Dot.hs:108) re-runs each node's
+    // `dot` action and overwrites `dsNodes[v]`, so both the SystemNode record
+    // AND the bare `#i` last-atom ellipse are emitted at the same id (the
+    // ellipse ends up as `dsNodes[v]`, which drives less-edge resolution).  The
+    // colliding dot-id is disambiguated in `dot.rs`.
     if let Some(la) = &sys.last_atom {
-        if !seen_ids.contains(la) {
-            nodes.push(GNode { id: la.clone(), ty: NodeType::LastAction });
-            seen_ids.insert(la.clone());
-        }
+        nodes.push(GNode { id: la.clone(), ty: NodeType::LastAction });
     }
     // 4. Missing nodes referenced by edges.
     // HS `systemMissingNodes se = mapMaybe missingNode (S.toList sEdges)`
