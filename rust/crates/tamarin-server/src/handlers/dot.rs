@@ -675,20 +675,44 @@ impl DotBuilder {
         let mut html = String::new();
         html.push_str(
             "<<TABLE BORDER=\"1\" CELLBORDER=\"0\" CELLSPACING=\"3\" CELLPADDING=\"1\">");
-        for &i in &order {
+        // Mirror Haskell `renderLine` (Dot.hs:441-450): each row is three
+        // `LabelCell`s with `cellAttributes = [Align HLeft, VAlign HTop]`.
+        // The NAME cell wraps its text in `<FONT COLOR="labelColor">`
+        // (`font txt = Text [Font [Color labelColor] txt]`), while the `=`
+        // and expansion cells are bare `Text`.  `labelColor = doAbbrevColor`
+        // (`defaultDotOptions = DotOptions CompactBoringNodes black`,
+        // Dot.hs:82; the web route never overrides `_doAbbrevColor`), which
+        // renders as `#000000`.  The graphviz HTML-table printer emits the
+        // cells of a `Cells` row separated by a single space and each `<TR>`
+        // on its own line, so we join the three cells with `" "` and the rows
+        // with `"\n"`.
+        let rows: Vec<String> = order.iter().map(|&i| {
             let (name, exp) = entries[i];
-            html.push_str("<TR>");
-            html.push_str(&format!("<TD ALIGN=\"LEFT\" VALIGN=\"TOP\">{}</TD>",
-                dot_html_escape(&pretty_lnterm(name))));
-            html.push_str("<TD ALIGN=\"LEFT\" VALIGN=\"TOP\">=</TD>");
-            html.push_str(&format!("<TD ALIGN=\"LEFT\" VALIGN=\"TOP\">{}</TD>",
-                dot_html_escape(&pretty_lnterm(exp))));
-            html.push_str("</TR>");
-        }
+            let name_cell = format!(
+                "<TD ALIGN=\"LEFT\" VALIGN=\"TOP\"><FONT COLOR=\"#000000\">{}</FONT></TD>",
+                dot_html_escape(&pretty_lnterm(name)));
+            let eq_cell = "<TD ALIGN=\"LEFT\" VALIGN=\"TOP\">=</TD>".to_string();
+            let exp_cell = format!(
+                "<TD ALIGN=\"LEFT\" VALIGN=\"TOP\">{}</TD>",
+                dot_html_escape(&pretty_lnterm(exp)));
+            format!("<TR>{}</TR>", [name_cell, eq_cell, exp_cell].join(" "))
+        }).collect();
+        html.push_str(&rows.join("\n"));
         html.push_str("</TABLE>>");
-        // Haskell emits shape "plain".
-        let _ = writeln!(self.buf,
-            "  legend [shape=plain,label={}];", html);
+        // HS `generateLegend` (Dot.hs:419-425) emits the legend inside a
+        // `D.scope` carrying `rank="sink"` — i.e. `{ rank="sink"; <node>; }` —
+        // then adds invisible sink→legend edges purely for layout (which we
+        // omit, matching the parity comparator that drops `style=invis`
+        // edges).  Reproduce the scope: besides mirroring HS's structure, the
+        // leading `rank="sink";` statement keeps the legend a self-contained
+        // statement.  A bare top-level `legend [...]` node emitted right after
+        // a cluster's brace-terminated (`}`, no `;`) close would otherwise be
+        // glued to that `}` by a naive statement splitter and lost.  Haskell
+        // emits shape "plain".
+        let _ = writeln!(self.buf, "  {{");
+        let _ = writeln!(self.buf, "  rank=\"sink\";");
+        let _ = writeln!(self.buf, "  legend [shape=plain,label={}];", html);
+        let _ = writeln!(self.buf, "  }}");
     }
 }
 
@@ -1045,11 +1069,16 @@ fn group_idx(ru: &RuleACInst) -> usize {
 ///
 /// `rules` here is `M.elems $ get sNodes se` (Dot.hs:485) — the raw system's
 /// nodes in NodeId order — so we sort by NodeId (`M.Map` key order) first.
-/// We store only the palette colour (`defaultColor = hsvToRGB (getColor
-/// (gIdx, mIdx))`, Dot.hs:214): the explicit-`color`-attribute branch of
-/// `getColorForRule` is unreachable through the map because HS `dotNodeCompact`
-/// already prefers `ruleColor'` (handled by `explicit_rule_color` at the call
-/// site) over the map value.
+/// Each entry's colour follows `getColorForRule attrs gIdx mIdx = fromMaybe
+/// defaultColor (ruleColor attrs)` (Dot.hs:212): a rule with an explicit
+/// `color:` attribute maps to THAT colour, otherwise to the palette default
+/// (`defaultColor = hsvToRGB (getColor (gIdx, mIdx))`, Dot.hs:214).  This map
+/// value is what `dotNodeCompact` feeds to `colorUsesWhiteFont` (Dot.hs:255,
+/// 258) to pick a node's font colour — so a SAPiC rule with a dark `color:`
+/// attribute must map to that dark colour (→ white font), not to the light
+/// palette default.  (The FILL colour is resolved separately via
+/// `explicit_rule_color` at the call site, so carrying the explicit colour
+/// here changes only the font decision, never the fill.)
 fn build_node_color_map(nodes: &[(NodeId, RuleACInst)]) -> NodeColorMap<'_> {
     use tamarin_utils::color::{hsv_to_rgb, light_color_groups, Hsv, Rgb};
 
@@ -1086,7 +1115,18 @@ fn build_node_color_map(nodes: &[(NodeId, RuleACInst)]) -> NodeColorMap<'_> {
     let mut entries: Vec<(&RInfo, Rgb)> = Vec::new();
     for (gi, grp) in groups.iter().enumerate() {
         for (mi, ru) in grp.iter().enumerate() {
-            entries.push((&ru.info, hsv_to_rgb(get_color(gi, mi))));
+            // `getColorForRule attrs gIdx mIdx = fromMaybe defaultColor
+            // (ruleColor attrs)` (Dot.hs:212): explicit `color:` wins, else the
+            // palette default.  `ruleAttributes ru = praciAttributes` for a
+            // RuleACInst (Rule.hs:674) — the same attributes `explicit_rule_color`
+            // reads, so a coloured rule maps to its own dark fill colour.
+            let color = match &ru.info {
+                RuleInfo::Proto(p) => {
+                    p.attributes.color.unwrap_or_else(|| hsv_to_rgb(get_color(gi, mi)))
+                }
+                _ => hsv_to_rgb(get_color(gi, mi)),
+            };
+            entries.push((&ru.info, color));
         }
     }
     NodeColorMap { entries }
