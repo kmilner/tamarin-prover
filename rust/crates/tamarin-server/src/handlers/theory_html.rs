@@ -734,8 +734,11 @@ fn show_inj_fact(
 /// HS `rulesSnippet` (Web/Theory.hs:887-917).
 fn rules_html(entry: &TheoryEntry) -> String {
     let mut out = String::new();
-    // (`theoryMacros thy` is empty for the interactive corpus, so the "Macros"
-    // section — HS's first `ppWithHeader` — is never emitted here.)
+    // HS `rulesSnippet`'s FIRST `ppWithHeader "Macros" (prettyMacros ...)` —
+    // emitted only when the theory declares macros (`theoryMacros thy`
+    // non-empty); the same `macros: name( args ) = body, ...` block the
+    // `--prove` theory body renders.
+    let macros_block = tamarin_theory::pretty_theory::web_macros(&entry.parser_theory);
     let proto_rules = tamarin_theory::pretty_theory::web_proto_rules(
         &entry.parser_theory, &entry.typed_theory);
     let mut inj_body = String::from("None");
@@ -771,6 +774,10 @@ fn rules_html(entry: &TheoryEntry) -> String {
     let restr_body = tamarin_theory::pretty_theory::web_restrictions(
         &entry.parser_theory, &entry.typed_theory).join("\n\n");
 
+    // HS `rulesSnippet` order: Macros (if any) → Fact Symbols → MSR → Restrictions.
+    if let Some(m) = &macros_block {
+        pp_with_header(&mut out, "Macros", m);
+    }
     pp_with_header(&mut out, "Fact Symbols with Injective Instances", &inj_body);
     pp_with_header(&mut out, "Multiset Rewriting Rules", &msr_body);
     pp_with_header(&mut out, "Restrictions of the Set of Traces", &restr_body);

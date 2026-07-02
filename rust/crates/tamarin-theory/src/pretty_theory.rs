@@ -1005,6 +1005,24 @@ fn render_parsed_macros(macros: &[p::Macro]) -> String {
     header.above(body).render()
 }
 
+/// Render the `macros:` block for HS `rulesSnippet`'s first `ppWithHeader
+/// "Macros"` (Web/Theory.hs) — the interactive `main/rules` page.  Returns
+/// `None` when the theory declares no macros (HS omits the whole section),
+/// else the same `prettyMacros` string the `--prove` theory body uses
+/// ([`render_parsed_macros`]); rendered at the caller's active display width.
+pub fn web_macros(parsed: &p::Theory) -> Option<String> {
+    let macros: Vec<p::Macro> = parsed.items.iter()
+        .filter_map(|i| if let p::TheoryItem::Macros(ms) = i { Some(ms.as_slice()) } else { None })
+        .flatten()
+        .cloned()
+        .collect();
+    if macros.is_empty() {
+        None
+    } else {
+        Some(render_parsed_macros(&macros))
+    }
+}
+
 /// Render a rule's attribute block `[...]`, mirroring HS `prettyRuleAttributes`
 /// / `prettyRuleAttribute` (Model/Rule.hs:1191-1205).  HS emits a FIXED-order
 /// `catMaybes [color, process, no_derivcheck, issapicrule, role]` joined by
