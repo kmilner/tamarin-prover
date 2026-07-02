@@ -55,6 +55,27 @@ pub fn load_from_source(
         .map_err(|e| LoadError::Elaborate(e.message))?;
     if let Ok(maude) = MaudeHandle::start(maude_path, typed.signature.maude_sig.clone()) {
         tamarin_theory::tools::rule_variants::populate_rule_variants(&mut typed, &maude, None);
+        // Annotate per-rule loop breakers on the stored theory so the web
+        // rules / source / message renderers emit HS's `// loop breaker: [<n>]`
+        // comments — HS `prettyClosedProtoRule` reads them from the
+        // `ProtoRuleACInfo` baked into every closed rule.  Our prover computes
+        // them inside `ProofContext::new` on a local copy; mirror `run.rs`'s
+        // CLI-side pass here on the load path (identical writeback in source
+        // order) so the byte-faithful `web_proto_rules` printer has them.
+        use tamarin_theory::theory::{OpenProtoRule, TheoryItem};
+        let mut rules: Vec<OpenProtoRule> = typed.items.iter().filter_map(|i| match i {
+            TheoryItem::Rule(r) => Some(r.clone()),
+            _ => None,
+        }).collect();
+        tamarin_theory::constraint::solver::context::annotate_loop_breakers(&mut rules, &maude);
+        let mut iter = rules.into_iter();
+        for item in typed.items.iter_mut() {
+            if let TheoryItem::Rule(opr) = item {
+                if let Some(updated) = iter.next() {
+                    opr.loop_breakers = updated.loop_breakers;
+                }
+            }
+        }
     }
     Ok(TheoryEntry {
         idx: 0,
