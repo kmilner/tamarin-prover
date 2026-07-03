@@ -1828,9 +1828,16 @@ pub fn subst_creates_non_normal_terms(
         if tvars.is_empty() { continue; }
         let restricted = vfresh_subst.restrict(&tvars);
         if restricted.dom().count() == 0 { continue; }
-        // Build a free subst from the restricted VFresh, allocating
-        // fresh idxs above the rest of the system.
-        let free_subst = restricted.fresh_to_free(|n| maude.reserve_idxs(n));
+        // HS `freshToFreeAvoidingFast subst tvars` (Substitution.hs:77-81):
+        // a PURE uniform-shift rename of the range vars avoiding `tvars`
+        // (`rename (map snd l) \`evalFreshAvoiding\` tvars`).  It consumes
+        // NO fresh-counter state — the probe subst is local to this
+        // predicate.  Drawing real idxs from the shared counter here would
+        // advance it on every variant probed, shifting every later
+        // persisted mint above HS.
+        let fresh_start = tvars.iter().map(|v| v.idx).max().unwrap_or(0)
+            .saturating_add(1);
+        let free_subst = restricted.fresh_to_free_uniform_shift(fresh_start);
         let t_prime = apply_vterm(&free_subst, t.clone());
         // Fast path: if subst doesn't change the term, it's still NF.
         if &t_prime == t { continue; }

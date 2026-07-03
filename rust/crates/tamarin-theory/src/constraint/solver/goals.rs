@@ -2632,6 +2632,7 @@ pub fn dispatch_solve_goal(
                 &red.ctx.full_sources,
                 &red.sys,
                 &p.0, p.1, fa,
+                Some(&red.maude),
             ) {
                 use crate::constraint::solver::reduction::GoalCases;
                 if case_pairs.len() == 1 {

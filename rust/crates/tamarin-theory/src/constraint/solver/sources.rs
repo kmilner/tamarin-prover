@@ -2127,6 +2127,7 @@ pub fn solve_with_source_cases_ctx(
     goal_node: &crate::constraint::constraints::NodeId,
     goal_prem_idx: crate::rule::PremIdx,
     fa_prem: &crate::fact::LNFact,
+    red_maude: Option<&tamarin_term::maude_proc::MaudeHandle>,
 ) -> Option<Vec<(String, System)>> {
     use crate::constraint::constraints::Goal;
 
@@ -2205,7 +2206,7 @@ pub fn solve_with_source_cases_ctx(
         let case_label = name.clone();
         let applied_arms = apply_source_case_premise(
             ctx, sys, src, &case_sys,
-            goal_node, goal_prem_idx, fa_prem,
+            goal_node, goal_prem_idx, fa_prem, red_maude,
         );
         // HS-faithful: refineSubst's multi-arm fanout (Reduction.hs:724-725
         // `disjunctionOfList performSplit`) produces one System per AC
@@ -2404,7 +2405,7 @@ pub fn solve_with_source_cases_action(
     fa_live: &crate::fact::LNFact,
     avoid_max: u64,
 ) -> Option<Vec<(String, System, crate::fact::LNFact)>> {
-    solve_with_source_cases_action_with_ctx(sources, sys, goal_node, fa_live, avoid_max, None)
+    solve_with_source_cases_action_with_ctx(sources, sys, goal_node, fa_live, avoid_max, None, None)
 }
 
 /// Variant that takes an optional `ProofContext` to enable the
@@ -2422,6 +2423,7 @@ pub fn solve_with_source_cases_action_with_ctx(
     fa_live: &crate::fact::LNFact,
     avoid_max: u64,
     ctx_opt: Option<&crate::constraint::solver::context::ProofContext>,
+    red_maude: Option<&tamarin_term::maude_proc::MaudeHandle>,
 ) -> Option<Vec<(String, System, crate::fact::LNFact)>> {
     use crate::constraint::constraints::Goal;
     use crate::fact::FactTag;
@@ -2526,7 +2528,7 @@ pub fn solve_with_source_cases_action_with_ctx(
             // against the source's ABSTRACT `cdGoal` (`src.goal`) — NOT a
             // case-specific action — mirroring `matchToGoal` (Sources.hs:268).
             let arms = refine_source_case_action(
-                ctx, sys, src, &case_sys, goal_node, fa_live);
+                ctx, sys, src, &case_sys, goal_node, fa_live, red_maude);
             for arm in arms {
                 refine_arms.push((case_label.clone(), arm));
             }
@@ -2583,7 +2585,7 @@ pub fn solve_with_source_cases_action_with_ctx(
         // ----------------------------------------------------------------
         for (idx, (case_label, arm)) in refine_arms.into_iter().enumerate() {
             if !survivors.contains(&idx) { continue; }
-            let result = conjoin_refine_arm(ctx, sys, goal_node, fa_live, arm);
+            let result = conjoin_refine_arm(ctx, sys, goal_node, fa_live, arm, red_maude);
             for (grafted_sys, live_action, _refined_case) in result {
                 out.push((case_label.clone(), grafted_sys, live_action));
             }
@@ -3400,9 +3402,10 @@ fn refine_source_case_action(
     case_sys: &System,
     live_node: &crate::constraint::constraints::NodeId,
     fa_live: &crate::fact::LNFact,
+    red_maude: Option<&tamarin_term::maude_proc::MaudeHandle>,
 ) -> Vec<RefineArm> {
     use crate::constraint::solver::reduction::{
-        Reduction, SolveOutcome, SplitStrategy, bounds_max,
+        Reduction, SolveOutcome, SplitStrategy,
     };
     use tamarin_term::lterm::HasFrees;
 
@@ -3653,23 +3656,20 @@ fn refine_source_case_action(
     // draws fresh idxs from it per unique LVar in traversal order.
     // ---------------------------------------------------------------
     let keep_vars = collect_node_and_fact_frees(live_node, fa_live);
-    let post_refine_max = bounds_max(&refined_case);
-    ctx.maude.ensure_above(post_refine_max);
     // HS-faithful `someInst`: traversal-order per-var fresh idx
     // allocation, matching Haskell's `someInst` + `importBinding`
-    // (LTerm.hs:601-602 + Bind.hs:128-140).  Each unique LVar in
-    // HS-mapFrees traversal order gets the next idx from the global
-    // Maude counter.
+    // (LTerm.hs:601-602 + Bind.hs:128-140).
     //
-    // HS-faithful counter init: HS calls `runReduction (m <* simplifySystem)
-    // ctxt sys (avoid sys)` per proof step (ProofMethod.hs:306), so the
-    // FreshT counter resets to `avoid(live_sys) + 1` BEFORE each apply.
-    // Reset Rust's global counter to match.  Safe because all live_sys
-    // vars are < avoid(live_sys), so any new allocation at idx
-    // ≥ avoid(live_sys)+1 won't collide.
-    let avoid_live = bounds_max(live_sys);
-    ctx.maude.reset_counter_to(avoid_live.saturating_add(1));
-    let freshened_case = freshen_system_some_inst(&refined_case, &keep_vars, &ctx.maude);
+    // HS `_applySource` (Sources.hs:446-469) runs `someInst sysTh0` in
+    // the LIVE Reduction monad — the imports draw from the step's ONE
+    // threaded FreshT counter, sequentially after whatever the step
+    // already minted.  Drawing from a separately re-seeded allocator
+    // instead can hand out idxs the step counter also mints; two
+    // independently minted rule instances sharing (name,sort,idx) then
+    // get IDENTIFIED at node-merge.
+    let red_m = red_maude
+        .expect("refine_source_case_action someInst path requires the live Reduction's counter");
+    let freshened_case = freshen_system_some_inst(&refined_case, &keep_vars, red_m);
 
     // Recover the live action fact for return: it should be the KU
     // action at `live_node` in the freshened case (the abstract node
@@ -3716,6 +3716,7 @@ fn conjoin_refine_arm(
     live_node: &crate::constraint::constraints::NodeId,
     fa_live: &crate::fact::LNFact,
     arm: RefineArm,
+    red_maude: Option<&tamarin_term::maude_proc::MaudeHandle>,
 ) -> Vec<(System, crate::fact::LNFact, System)> {
     use crate::constraint::solver::reduction::{Reduction, SolveOutcome};
 
@@ -3729,8 +3730,11 @@ fn conjoin_refine_arm(
     // ---------------------------------------------------------------
     // B — `markGoalAsSolved "precomputed" goal`.
     // E — `conjoinSystem sysTh`.
+    // HS runs conjoinSystem in the SAME live Reduction (`_applySource`,
+    // Sources.hs:446-469) — share the step's threaded counter.
     // ---------------------------------------------------------------
     let mut r = Reduction::new(ctx, live_sys.clone());
+    if let Some(m) = red_maude { r.maude = m.clone(); }
     let live_goal = crate::constraint::constraints::Goal::Action(
         live_node.clone(), fa_live.clone());
     // HS-faithful (Sources.hs:196-216): `solveAllSafeGoals.safeGoal`
@@ -3941,9 +3945,10 @@ fn apply_source_case_premise(
     live_node: &crate::constraint::constraints::NodeId,
     live_prem_idx: crate::rule::PremIdx,
     fa_live: &crate::fact::LNFact,
+    red_maude: Option<&tamarin_term::maude_proc::MaudeHandle>,
 ) -> Vec<System> {
     use crate::constraint::solver::reduction::{
-        Reduction, SolveOutcome, SplitStrategy, bounds_max,
+        Reduction, SolveOutcome, SplitStrategy,
     };
     use tamarin_term::lterm::HasFrees;
 
@@ -4134,25 +4139,17 @@ fn apply_source_case_premise(
 
     // D — someInst keepVarBindings.
     let keep_vars = collect_node_and_fact_frees(live_node, fa_live);
-    let post_refine_max = bounds_max(&refined_case);
-    ctx.maude.ensure_above(post_refine_max);
-    // HS-faithful `someInst`: traversal-order per-var fresh idx
-    // allocation, matching Haskell's `someInst` + `importBinding`
-    // (LTerm.hs:601-602 + Bind.hs:128-140).  Each unique LVar in
-    // HS-mapFrees traversal order gets the next idx from the global
-    // Maude counter.
-    //
-    // HS-faithful counter init: HS calls `runReduction (m <* simplifySystem)
-    // ctxt sys (avoid sys)` per proof step (ProofMethod.hs:306), so the
-    // FreshT counter resets to `avoid(live_sys) + 1` BEFORE each apply.
-    // Reset Rust's global counter to match.  Safe because all live_sys
-    // vars are < avoid(live_sys), so any new allocation at idx
-    // ≥ avoid(live_sys)+1 won't collide.
-    let avoid_live = bounds_max(live_sys);
-    ctx.maude.reset_counter_to(avoid_live.saturating_add(1));
-    let freshened_case = freshen_system_some_inst(&refined_case, &keep_vars, &ctx.maude);
-    // B+E — markGoalAsSolved + conjoinSystem.
+    // HS `_applySource` (Sources.hs:446-469) runs `someInst sysTh0` in
+    // the LIVE Reduction monad — imports draw from the step's ONE
+    // threaded FreshT counter (see the matching comment in
+    // `refine_source_case_action`).
+    let red_m = red_maude
+        .expect("apply_source_case_premise someInst path requires the live Reduction's counter");
+    let freshened_case = freshen_system_some_inst(&refined_case, &keep_vars, red_m);
+    // B+E — markGoalAsSolved + conjoinSystem.  HS runs conjoinSystem in
+    // the SAME live Reduction — share the step's counter.
     let mut r = Reduction::new(ctx, live_sys.clone());
+    r.maude = red_m.clone();
     let live_goal = crate::constraint::constraints::Goal::Premise(
         (live_node.clone(), live_prem_idx), fa_live.clone());
     if let Some(slot) = r.sys.goals_mut().iter_mut().find(|(g, _)| g == &live_goal) {

@@ -4691,6 +4691,7 @@ impl<'ctx> Reduction<'ctx> {
                         i, fa,
                         avoid_max,
                         Some(self.ctx),
+                        Some(&self.maude),
                     ) {
                         // HS-faithful `solveWithSource` returned `Just []`:
                         // the source pattern MATCHED the live goal but has
@@ -5347,6 +5348,7 @@ impl<'ctx> Reduction<'ctx> {
                 &self.ctx.full_sources,
                 &self.sys,
                 &p.0, p.1, fa_prem,
+                Some(&self.maude),
             ) {
                 let mut out: Vec<(String, crate::constraint::system::System)> = Vec::new();
                 for (case_name, mut sys) in case_pairs {

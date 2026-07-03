@@ -1750,6 +1750,44 @@ impl EquationStore {
                     subst_vf.to_list());
             }
         }
+        // HS-faithful witness-freshening floor for the sibling disjs.
+        // `simpSingleton` folds this disj via `freshToFree`, which in HS
+        // draws its fresh range-var renames from the ambient `MonadFresh`
+        // counter.  That counter is threaded monotonically through the whole
+        // `runReduction`, so it is ALWAYS above the VFresh range vars of the
+        // OTHER variant disjunctions still in `eqsConj` (they were minted
+        // earlier from the same counter).  RS re-seeds a per-pop Fresh
+        // counter from `avoid sys = bounds_max`, which — HS-faithfully,
+        // matching `foldFrees (SubstVFresh) = foldFrees f . M.keys`
+        // (SubstVFresh.hs:197) — does NOT count those conj *range* vars.
+        // If the per-pop counter is under-advanced, `alloc` can draw a
+        // witness idx equal to a SIBLING disj's range var, fusing two
+        // independent variant witnesses into one and forcing the eq-store
+        // false.  Mirror the Maude single-unifier path's
+        // `freshen_witness_range` guard: push the shared counter above every
+        // sibling variant witness — those already folded (now range vars of
+        // the free `self.subst`) and those still un-folded (range vars of the
+        // remaining `self.conj` disjs) — before this fold allocates its own.
+        // No-op whenever the counter is already threaded above them.
+        if let Some(m) = maude {
+            use tamarin_term::lterm::HasFrees;
+            let mut floor = 0u64;
+            // Already-folded siblings live in `self.subst` (this fold's
+            // witnesses must not reuse a range var another fold produced) and
+            // un-folded siblings live in `self.conj` (their VFresh range vars
+            // must not be aliased by this fold's fresh renames).
+            for t in self.subst.range() {
+                t.for_each_free(&mut |w: &LVar| { if w.idx > floor { floor = w.idx; } });
+            }
+            for d in &self.conj {
+                for s in &d.substs {
+                    for t in s.range() {
+                        t.for_each_free(&mut |w: &LVar| { if w.idx > floor { floor = w.idx; } });
+                    }
+                }
+            }
+            if floor > 0 { m.ensure_above(floor); }
+        }
         let new_subst = subst_vf.fresh_to_free_avoiding(alloc);
         if tamarin_utils::env_gate!("TAM_DBG_FOLD_VARIANT") {
             let pairs: Vec<String> = new_subst.to_list().iter()
