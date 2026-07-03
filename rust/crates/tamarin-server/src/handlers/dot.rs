@@ -555,17 +555,26 @@ impl DotBuilder {
         let color = if facts.iter().any(|f| matches!(f.tag, FactTag::Ku)) {
             "gray"
         } else { "darkblue" };
+        // HS renders a loose action node via `mkSimpleNode (render lbl) attrs`
+        // = plain `D.node [("label", …), ("shape","ellipse")]` (Dot.hs:267-272,
+        // 289-290), NOT `D.record`.  A plain node label is a quoted string whose
+        // only metacharacters are `"` and newline (`escape_dot_label`); the
+        // record metacharacters `{ } | < >` are LITERAL, so a tuple `<A, B, …>`
+        // in a goal fact must stay `<…>` and NOT be `\<…\>`-escaped (only the
+        // `SystemNode`/`D.record` path escapes them). Using `escape_dot` here
+        // leaked record escaping onto ellipse labels (task #17 family B).
         let _ = writeln!(self.buf,
             "  {} [shape=ellipse,label=\"{}\",color=\"{}\"];",
-            id, escape_dot(&s), color);
+            id, escape_dot_label(&s), color);
     }
     fn last_node(&mut self, dot_id: &str, nid: &LVar) {
         // HS `LastActionAtom -> mkSimpleNode (show v) []` (Dot.hs:273): the
-        // label is `show v`, rendered via `Display for LVar` (`#i` / `#i.2`).
+        // label is `show v`, rendered via `Display for LVar` (`#i` / `#i.2`),
+        // via plain `D.node` (see `action_node`), so use the plain-label escaper.
         // `dot_id` is the collision-disambiguated id (see `last_dot_id`).
         let _ = writeln!(self.buf,
             "  {} [shape=ellipse,label=\"{}\"];",
-            dot_id, escape_dot(&nid.to_string()));
+            dot_id, escape_dot_label(&nid.to_string()));
     }
     fn missing_node(&mut self, nid: &LVar, hint: &MissingHint) {
         let id = Self::dot_node_id(nid);
@@ -580,9 +589,14 @@ impl DotBuilder {
             MissingHint::Prem(pi) => ("invtrapezium", pi.0),
         };
         let label = format!("({}, {})", nid, idx);
+        // HS `dotConcC`/`dotPremC` = `missingNode shape (render label)` = plain
+        // `D.node` (Dot.hs:280-282), so use the plain-label escaper (matching
+        // `action_node`/`last_node`).  This label (`(#i, 0)`) never contains
+        // record metacharacters, so the choice is inert here, but keeping all
+        // three plain (ellipse/trapezium) nodes on `escape_dot_label` mirrors HS.
         let _ = writeln!(self.buf,
             "  {} [shape={},label=\"{}\"];",
-            id, shape, escape_dot(&label));
+            id, shape, escape_dot_label(&label));
     }
     fn edge(&mut self,
             node_map: &HashMap<&LVar, &RuleACInst>,

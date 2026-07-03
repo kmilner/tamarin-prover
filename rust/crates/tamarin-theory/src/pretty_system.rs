@@ -39,6 +39,16 @@ use crate::pretty_formula::pretty_guarded;
 /// Emit just the non-graph-part of the system, matching Haskell's
 /// `prettyNonGraphSystem`.  See file-level docs for the section list.
 pub fn pretty_non_graph_system(sys: &System) -> String {
+    // HS renders this pane (Web/Theory.hs:535 `preformatted (Just "sequent")
+    // (prettyNonGraphSystem se)`) through the `HtmlDoc Doc` transformer via
+    // `renderHtmlDoc`, so the HughesPJ fill measures every `<`/`>`/`'` token at
+    // its escaped-entity width (`&lt;`/`&gt;`/`&#39;`) when choosing line
+    // breaks.  The server escapes only after rendering, so we must reproduce
+    // that width accounting here or the pair-tuple `<…>` wraps at a different
+    // column than HS (task #17 family D).  The guard is dropped at function
+    // exit, restoring plain (visible-column) width accounting; this function is
+    // web-only, so `--prove` never sees it.
+    let _html_width = crate::pretty_hpj::HtmlEntityWidthGuard::enable();
     let mut out = String::new();
     section(&mut out, "last", &pretty_last(sys));
     section(&mut out, "formulas", &pretty_formula_set(&sys.formulas));

@@ -325,7 +325,17 @@ fn title_for(entry: &crate::state::TheoryEntry, path: &path_parse::TheoryPath) -
                             .map(|n| crate::handlers::proof_tree::method_label(&n.method))
                     })
                     .unwrap_or_else(|| "None".to_string());
-                format!("Method: {}", name)
+                // HS `methodName` = `renderHtmlDoc . prettyProofMethod` and
+                // `renderHtmlDoc` (`Text/PrettyPrint/Html.hs:151`) escapes HTML
+                // entities in every text token via the `Document (HtmlDoc d)`
+                // instance (`Html.hs:105-107`, `escapeHtmlEntities`), so a
+                // method that mentions a tuple renders `&lt;B, A, …&gt;` in the
+                // JSON `title`, not a raw `<…>` (which the semantic canonicalizer
+                // would otherwise parse as a bogus HTML element).  Mirror that
+                // escaping here; the operator `hl_*` spans / `<br/>` that
+                // `renderHtmlDoc` also adds are unwrapped by the parity gate, so
+                // entity escaping is the only load-bearing part.
+                format!("Method: {}", crate::handlers::root::html_escape(&name))
             }
             // otherwise: "Case: " ++ last p
             Some(s) => format!("Case: {}", s),

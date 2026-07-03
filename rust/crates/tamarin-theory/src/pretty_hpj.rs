@@ -69,6 +69,71 @@ pub fn set_display_width(line_length: usize, ribbon: usize) {
     DISPLAY_RIBBON.store(ribbon, Ordering::Relaxed);
 }
 
+thread_local! {
+    /// When set, [`Doc::text`]/[`Doc::char`] measure each token's *fill* width
+    /// as its HTML-entity-escaped column count instead of its visible column
+    /// count.  This mirrors HS's web render path, which builds every document
+    /// through the `HtmlDoc Doc` transformer: its `Document (HtmlDoc d)`
+    /// instance (`Text/PrettyPrint/Html.hs:105-107`) runs `escapeHtmlEntities`
+    /// on every `text`/`char` token BEFORE the HughesPJ fill measures it, so a
+    /// `<`/`>` costs 4 columns (`&lt;`/`&gt;`) and a `'` costs 5 (`&#39;`) when
+    /// deciding line breaks.  The interactive server escapes AFTER rendering
+    /// (`html_escape`), so without matching this accounting its `fsep`/`fcat`
+    /// wraps a pair-tuple `<…>` at a different column than HS (task #17 family
+    /// D — a space appears/disappears before a tuple's closing `>`).
+    ///
+    /// This is presentation-only: it never affects proof search or verdicts,
+    /// and it is scoped (via [`HtmlEntityWidthGuard`]) to the web
+    /// constraint-system pane only, so the `--prove` byte-identity corpus is
+    /// untouched (the flag defaults to `false`).
+    static HTML_ENTITY_WIDTH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Column width of `s` after HTML-entity escaping, matching HS
+/// `escapeHtmlEntities` (`Text/PrettyPrint/Html.hs:130-138`) and the server's
+/// `html_escape`: `<`/`>` → `&lt;`/`&gt;` (4), `&` → `&amp;` (5), `'` →
+/// `&#39;` (5), `"` → `&quot;` (6); every other codepoint counts as 1 column.
+fn html_entity_col_width(s: &str) -> usize {
+    s.chars()
+        .map(|c| match c {
+            '<' | '>' => 4,
+            '&' | '\'' => 5,
+            '"' => 6,
+            _ => 1,
+        })
+        .sum()
+}
+
+/// RAII guard enabling HTML-entity fill-width accounting on the current thread
+/// until dropped (see [`HTML_ENTITY_WIDTH`]).  Restores the previous value on
+/// drop, so nested/re-entrant use is safe.
+pub struct HtmlEntityWidthGuard(bool);
+
+impl HtmlEntityWidthGuard {
+    /// Enable entity-width accounting for the current thread; the previous
+    /// value is restored when the returned guard is dropped.
+    pub fn enable() -> Self {
+        HtmlEntityWidthGuard(HTML_ENTITY_WIDTH.with(|c| c.replace(true)))
+    }
+}
+
+impl Drop for HtmlEntityWidthGuard {
+    fn drop(&mut self) {
+        HTML_ENTITY_WIDTH.with(|c| c.set(self.0));
+    }
+}
+
+/// The fill width of a text run `s`: its visible column count, or — under an
+/// active [`HtmlEntityWidthGuard`] — its HTML-entity-escaped column count.
+#[inline]
+fn fill_width(s: &str) -> usize {
+    if HTML_ENTITY_WIDTH.with(|c| c.get()) {
+        html_entity_col_width(s)
+    } else {
+        s.chars().count()
+    }
+}
+
 // ============================================================================
 // Doc tree
 // ============================================================================
@@ -183,7 +248,7 @@ impl Doc {
     /// like CJK count as 1 in both).
     pub fn text<S: AsRef<str>>(s: S) -> Doc {
         let s = s.as_ref();
-        let w = s.chars().count();
+        let w = fill_width(s);
         Doc::text_w(s, w)
     }
 
@@ -200,7 +265,8 @@ impl Doc {
     pub fn char(c: char) -> Doc {
         let mut buf = [0u8; 4];
         let s = c.encode_utf8(&mut buf);
-        Doc::text_w(s, 1)
+        let w = fill_width(s);
+        Doc::text_w(s, w)
     }
 
     /// HS `<>` (beside without space).
