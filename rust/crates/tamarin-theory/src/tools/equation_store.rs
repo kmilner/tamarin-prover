@@ -668,12 +668,14 @@ impl EquationStore {
         // the local subst at the end (mirrors `flattenUnif` =
         // `map (\`composeVFresh\` subst) substs`).
         //
-        // Pass `extra_avoid` (the caller's system-wide max var idx)
-        // to the unifier so Maude-introduced witness vars get indices
-        // above any system var, preventing `~mw:Pub:N` / `~mw:Msg:N`
-        // collisions that break our (name, sort, idx) LVar identity.
-        let avoid = self.fresh_baseline().max(extra_avoid);
-        let unifiers = maude.unify_at_with_avoid("eq_store::add_eqs", &ac_residuals, avoid)
+        // HS-faithful (EquationStore.hs:311-313 `addEqs`): the AC unifier
+        // is `unifyLNTermFactored eqs` with NO avoid — witness idxs are
+        // numbered purely per-call at `avoid (M.elems bindings)`
+        // (Term/Maude/Types.hs:112-113) and the resulting `SubstVFresh`
+        // witnesses are α-scoped per subst, so a system-wide floor is
+        // neither passed nor needed.  (The single-unifier arm below still
+        // re-bases its own witnesses via `freshen_witness_range`.)
+        let unifiers = maude.unify_at("eq_store::add_eqs", &ac_residuals)
             .map_err(|e| AddEqsError::Maude(format!("{}", e)))?;
 
         if unifiers.is_empty() {
@@ -2161,8 +2163,18 @@ impl EquationStore {
                         format!("{:?} =? {:?}", e.lhs, e.rhs)).collect::<Vec<_>>());
                 }
                 let counter_before_maude = aes_maude.fresh_counter_peek();
-                let unifiers = match aes_maude.unify_at_with_avoid(
-                    "apply_eq_store::re_unify", &eqs, max_idx) {
+                // HS `applyBound` (EquationStore.hs:434): `unifiers =
+                // unifyLNTerm eqs` — NO avoid.  The RHS terms were already
+                // rebased above `avoidSet` by the uniform-shift rename above
+                // (HS `ran = renameAvoiding (range) avoidSet`), so the reply
+                // witnesses (numbered per-call at `avoid (M.elems bindings)`)
+                // land above the avoid set without any injected floor.  The
+                // local handle's counter is used only by the downstream
+                // system-var lift (`reserve_idxs`), which mints
+                // differently-named witnesses that cannot collide by
+                // (name,sort,idx) with the "x"-named reply witnesses.
+                let unifiers = match aes_maude.unify_at(
+                    "apply_eq_store::re_unify", &eqs) {
                     Ok(u) => u,
                     Err(e) => return Err(AddEqsError::Maude(format!("{}", e))),
                 };
@@ -2201,7 +2213,7 @@ impl EquationStore {
                     }
                     // EXTRACT-SYSTEM-VARS-TO-DOMAIN: the AC-free local
                     // unifier path (maude_proc.rs, the AC-free fast path
-                    // in `unify_with_avoid`) doesn't
+                    // in `unify`) doesn't
                     // introduce narrowing witnesses for cross-sort
                     // var-var unification.  E.g. for `Var(~k:Fresh) =
                     // Var(~mw:Msg)`, the local unifier returns

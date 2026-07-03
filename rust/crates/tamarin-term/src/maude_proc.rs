@@ -605,9 +605,7 @@ impl MaudeHandle {
             && g.sig.st_rules.is_empty()
     }
 
-    /// `unify` tagged with a `label` for the per-callsite profiler; uses
-    /// `avoid_max = 0`, so witness LVar indices may collide with existing
-    /// system vars — prefer `unify_at_with_avoid` when that matters.
+    /// `unify` tagged with a `label` for the per-callsite profiler.
     pub fn unify_at(&self, label: &'static str, eqs: &[Equal<LNTerm>])
         -> Result<Vec<Vec<(crate::lterm::LVar, LNTerm)>>, MaudeError>
     {
@@ -615,38 +613,25 @@ impl MaudeHandle {
         self.unify(eqs)
     }
 
-    /// `unify_at` with explicit `avoid_max` — Maude-introduced witness
-    /// vars get indices above `avoid_max + 1`. Critical to prevent
-    /// witness/system var collisions: a system-wide `~mw:Pub:N` would
-    /// conflict with a Maude witness `~mw:Msg:N` if the counter starts
-    /// from 0 (or just the call's input).
-    pub fn unify_at_with_avoid(
-        &self,
-        label: &'static str,
-        eqs: &[Equal<LNTerm>],
-        avoid_max: u64,
-    ) -> Result<Vec<Vec<(crate::lterm::LVar, LNTerm)>>, MaudeError>
-    {
-        _tally_callsite(label);
-        self.unify_with_avoid(eqs, avoid_max)
-    }
-
     /// Unify a list of equations modulo the theory, returning one
-    /// substitution per Maude unifier.  Equivalent to
-    /// `unify_with_avoid(eqs, 0)`; see that method for the witness-var
-    /// `avoid` contract.
-    pub fn unify(&self, eqs: &[Equal<LNTerm>]) -> Result<Vec<Vec<(crate::lterm::LVar, LNTerm)>>, MaudeError>
-    {
-        self.unify_with_avoid(eqs, 0)
-    }
-
-    /// Unify modulo the theory, with Maude-introduced witness vars given
-    /// indices above `avoid_max + 1` so they cannot collide with existing
-    /// system vars (see `unify_at_with_avoid`).
-    pub fn unify_with_avoid(
+    /// substitution per Maude unifier.
+    ///
+    /// Witness numbering is HS-faithful and COUNTER-NEUTRAL: HS's
+    /// `unifyViaMaude` (Term/Maude/Process.hs:250-256) numbers each reply's
+    /// fresh witnesses in a pure per-call scope seeded at
+    /// `avoid (M.elems bindings)` — the query's own exported vars — via
+    /// `evalFreshAvoiding` (Term/Maude/Types.hs:112-113), reading and
+    /// writing NO global fresh state.  This method therefore takes NO
+    /// `avoid` parameter (there is no HS analogue): the session counter is
+    /// never touched by a unify call, and the returned `SubstVFresh`
+    /// witnesses are α-scoped per subst.  Collision safety at the eq-store
+    /// call sites comes structurally from HS `applyBound`'s
+    /// `renameAvoiding` pre-step (EquationStore.hs:428-435), mirrored in
+    /// `apply_eq_store`'s rhs uniform-shift rename — NOT from inflating the
+    /// witness idxs.
+    pub fn unify(
         &self,
         eqs: &[Equal<LNTerm>],
-        avoid_max: u64,
     ) -> Result<Vec<Vec<(crate::lterm::LVar, LNTerm)>>, MaudeError>
     {
         if eqs.is_empty() {
@@ -737,27 +722,18 @@ impl MaudeHandle {
                 Err(crate::unification::UnifyError::NeedsAC) => {
                     // Fall through to the Maude call below.
                     //
-                    // Counter bookkeeping lives HERE (not before the
-                    // local unify attempt): `unify_lnterm_no_ac_with_counter`
-                    // does NOT read the global fresh counter (unification.rs:
-                    // `_counter` is unused — no witnesses are minted), and the
-                    // two terminating branches above return via `compose_vfresh`
-                    // / empty, neither of which reads the counter.  So the
-                    // counter only needs raising on the AC fall-through, where
-                    // the Maude witness allocator consumes it.  Floor it above
-                    // `avoid_max` and any input `~mw` (`name == "x"`) var here;
-                    // the residual-only `input_max` walk below additionally
-                    // covers the AC residuals' vars.
-                    self.ensure_above(avoid_max);
-                    use crate::lterm::HasFrees;
-                    for eq in eqs {
-                        eq.lhs.for_each_free(&mut |v| {
-                            if v.name == "x" { self.ensure_above(v.idx); }
-                        });
-                        eq.rhs.for_each_free(&mut |v| {
-                            if v.name == "x" { self.ensure_above(v.idx); }
-                        });
-                    }
+                    // HS-faithful counter-neutrality: the global fresh
+                    // counter is NOT raised here.  HS's `unifyViaMaude`
+                    // (Term/Maude/Process.hs:250-256) numbers each reply's
+                    // witnesses in a PURE per-call scope via
+                    // `runBackConversion (...) bindings =
+                    //  evalBindT (...) bindings `evalFreshAvoiding` M.elems bindings`
+                    // (Term/Maude/Types.hs:112-113) — the fresh supply is
+                    // seeded from `avoid (M.elems bindings)` (the query's own
+                    // exported vars) and NO global state is read or written.
+                    // The reply conversion below therefore computes its
+                    // witness base locally (see `input_max`) and never
+                    // touches `self`'s counter.
                 }
             }
         }
@@ -817,103 +793,67 @@ impl MaudeHandle {
         inner.stats.unify_count += 1;
         drop(inner);
         let msubsts = maude_parse::parse_unify_reply(&reply)?;
-        // Also avoid colliding with vars in the input eqs (their `~mw`
-        // indices set a floor for the witness counter).
-        let mut input_max = avoid_max;
-        for eq in maude_eqs {
-            use crate::lterm::HasFrees;
-            eq.lhs.for_each_free(&mut |v| {
-                if v.idx > input_max { input_max = v.idx; }
-            });
-            eq.rhs.for_each_free(&mut |v| {
-                if v.idx > input_max { input_max = v.idx; }
-            });
+        // HS `avoid (M.elems bindings)` (Term/Maude/Types.hs:113 via
+        // LTerm.hs:656-657 `avoid = maybe 0 (succ . snd) . boundsVarIdx`):
+        // the witness fresh-supply floor is the max idx over ALL of the
+        // query's own binding vars — i.e. the vars of `maude_eqs`, which
+        // `lterm_to_mterm_global` has registered in `ctx`'s inverse map.
+        // This is the ONLY input to witness numbering: HS injects NO
+        // system-wide avoid (there is no HS `avoid` parameter on unify), so
+        // neither do we.  Each reply arm is converted below in this SAME
+        // local scope, never reading or advancing `self`'s session counter.
+        let mut input_max = 0u64;
+        for lit in ctx.bindings().values() {
+            if let crate::vterm::Lit::Var(lv) = lit {
+                if lv.idx > input_max { input_max = lv.idx; }
+            }
         }
         let mut out = Vec::with_capacity(msubsts.len());
-        // HS-faithful per-unifier conversion (Maude/Process.hs:218 +
-        // Types.hs:127-138).  HS does:
+        // HS-faithful per-unifier conversion (Term/Maude/Process.hs:255-256
+        // + Term/Maude/Types.hs:127-138).  HS does:
         //   map (msubstToLSubstVFresh bindings) <$> parseUnifyReply ...
-        // where `msubstToLSubstVFresh bindings` calls
+        // where each `msubstToLSubstVFresh bindings substMaude` calls
         //   runBackConversion (traverse translate substMaude) bindings
         // and `runBackConversion back bindings =
         //   evalBindT back bindings `evalFreshAvoiding` M.elems bindings`.
         //
-        // Each unifier conversion gets:
+        // Every unifier conversion gets:
         //   (a) the SAME initial bind-map `bindings` (the toMaude
-        //       conversion's output) — no carryover of FreshVar
+        //       conversion's output) — no carryover of witness/FreshVar
         //       allocations from one unifier to the next, AND
-        //   (b) a fresh supply starting at `max(M.elems bindings) + 1` —
-        //       same base per unifier.
-        // So if two unifiers each have a FreshVar(0), they both allocate
-        // it to LVar(x, sort, base) but the choices DOWNSTREAM of which
-        // domain key they bind diverge, producing different per-arm
-        // SubstVFresh contents.
+        //   (b) a fresh supply seeded LOCALLY at `avoid (M.elems bindings)`
+        //       = `input_max + 1` — the SAME base per unifier, drawn ONLY
+        //       from the query's own vars.  HS reads NO global fresh state
+        //       here and writes NONE back: after `evalFreshAvoiding` the
+        //       supply is discarded, so a `unifyViaMaude` call is
+        //       counter-neutral (the session `MonadFresh` state is
+        //       unchanged across it).
         //
-        // Concrete consequence on Resp_1 / Init_1 / generate_ltk multi-AC
-        // arms (UM_wPFS::wPFS_responder_key + JKL_TS2_2008 cluster):
-        // HS's Mult arm allocates witness `~x.20` to the rule-internal
-        // var bound first in traversal; the "everything-equates" arm
-        // (where Fresh-fresh and Msg-msg collapse) allocates `~x.21`
-        // because it traverses fewer distinct FreshVars before reaching
-        // the equate target.  Net: HS sorts Mult arm BEFORE Equates arm
-        // by the SubstVFresh Ord (Map-of-(key,value) lexicographic).
+        // This per-unifier same-base restart is load-bearing for arm Ord:
+        // on Resp_1 / Init_1 / generate_ltk multi-AC arms
+        // (UM_wPFS::wPFS_responder_key + JKL_TS2_2008), the Mult arm's
+        // witness gets a lower idx than the "everything-equates" arm's
+        // because it traverses fewer distinct FreshVars before the equate
+        // target, so HS sorts Mult before Equates under the SubstVFresh Ord.
         //
-        // Each unifier therefore gets a FRESH `ctx` and counter, so per-arm
-        // witness idxs differ exactly as HS produces.  Sharing them would
-        // collapse those per-arm idx differences (cross-arm FreshVar/counter
-        // reuse), making RS's SubstVFresh Ord fall back on VALUE structure
-        // (Lit < App) and mis-order the arms.
-        //
-        // Fix (HS-faithful): per unifier, CLONE ctx and RESET the global
-        // counter to a shared baseline.  After all unifiers, advance the
-        // counter to the high-water mark so subsequent allocations
-        // (next solveTermEqs / chain-close / etc.) don't collide with
-        // any per-arm witness.
-        //
-        // Single-unifier case: short-circuit to the original behaviour
-        // (no clone/reset overhead, identical observable output).
-        if msubsts.len() <= 1 {
-            for ms in &msubsts {
-                out.push(msubst_to_lnsubst_with_maude(ms, &mut ctx, input_max, Some(self))?);
-            }
-        } else {
-            // Snapshot the counter; each unifier resets to this base.
-            self.ensure_above(input_max);
-            for lit in ctx.bindings().values() {
-                if let crate::vterm::Lit::Var(lv) = lit {
-                    if lv.name == "x" {
-                        self.ensure_above(lv.idx);
-                    }
-                }
-            }
-            let baseline = self.fresh_counter_peek();
-            let mut high_water = baseline;
-            for ms in &msubsts {
-                // Clone ctx so inverse-map mutations don't carry across
-                // unifiers (mirrors HS's independent runBackConversion).
-                let mut per_arm_ctx = ctx.clone();
-                // Reset counter to the shared baseline (mirrors HS's
-                // `evalFreshAvoiding M.elems bindings` restarting per
-                // unifier).
-                self.reset_counter_to(baseline);
-                let arm = msubst_to_lnsubst_with_maude(
-                    ms, &mut per_arm_ctx, input_max, Some(self))?;
-                // Track high water for global counter restoration.
-                let cur = self.fresh_counter_peek();
-                if cur > high_water { high_water = cur; }
-                out.push(arm);
-            }
-            // Restore counter above any per-arm allocation so subsequent
-            // proof-session work doesn't collide with witness idxs we
-            // baked into the returned SubstVFresh arms.
-            self.reset_counter_to(high_water);
+        // Faithful realisation: convert each arm on its OWN clone of the
+        // shared `ctx`, seeding the witness supply at the same local
+        // `input_max` via `msubst_to_lnsubst_with_avoid`.  The session
+        // counter (`self`) is never passed, never read, never advanced —
+        // matching HS's pure `evalFreshAvoiding` scope.  Sharing `ctx` (or
+        // the counter) across arms would collapse the per-arm idx
+        // differences and mis-order the arms (fallback to VALUE-structure
+        // Ord).
+        for ms in &msubsts {
+            let mut per_arm_ctx = ctx.clone();
+            out.push(msubst_to_lnsubst_with_avoid(ms, &mut per_arm_ctx, input_max)?);
         }
         // HS-faithful `removeRenamings` (Maude/Types.hs:130): HS's
         // `msubstToLSubstVFresh bindings substMaude` ends with
         // `removeRenamings $ substFromListVFresh slist` — drops every
         // entry whose image is just a Var with no role elsewhere in
         // the substitution (`isRenamedVar` in SubstVFresh.hs:140-145).
-        // RS's `msubst_to_lnsubst_with_maude` returns the raw slist
+        // RS's `msubst_to_lnsubst_with_avoid` returns the raw slist
         // without this filter, so trivial rename entries leak into the
         // disjunction's substs.  At Scott's
         // `/case_2/Init_2/Init_1/c_kdf/split_case_3` these renames
@@ -1629,12 +1569,61 @@ fn msubst_to_lnsubst_unify(
     msubst_to_lnsubst_with_avoid(ms, ctx, 0)
 }
 
+/// Convert one Maude reply substitution to `[(LVar, LNTerm)]`, minting
+/// witness idxs in a PURE per-call scope — the faithful port of HS's
+/// `msubstToLSubstVFresh bindings` / `msubstToLSubstVFree bindings`, whose
+/// `runBackConversion (...) bindings =
+///  evalBindT (...) bindings `evalFreshAvoiding` M.elems bindings`
+/// (Term/Maude/Types.hs:112-113) seeds the fresh supply at
+/// `avoid (M.elems bindings)` and reads/writes NO global fresh state.
+///
+/// `avoid_max` is the caller's `avoid (M.elems bindings)` value (max idx
+/// over the query's own binding vars); the witness supply starts at
+/// `avoid_max + 1`.  There is deliberately no `MaudeHandle` here: witness
+/// numbering must be counter-neutral so that a `unify`/`match` call leaves
+/// the session `MonadFresh` state unchanged, exactly as HS's pure
+/// `evalFreshAvoiding` scope does.
 fn msubst_to_lnsubst_with_avoid(
     ms: &MSubst,
     ctx: &mut ConvCtx,
     avoid_max: u64,
 ) -> Result<Vec<(crate::lterm::LVar, LNTerm)>, MaudeError> {
-    msubst_to_lnsubst_with_maude(ms, ctx, avoid_max, None)
+    let mut out = Vec::with_capacity(ms.len());
+    // HS `avoid (M.elems bindings) = maybe 0 (succ . snd) . boundsVarIdx`
+    // (LTerm.hs:656-657): the local fresh supply starts just above the max
+    // idx among the query's own binding vars.  `avoid_max` already carries
+    // that max (the caller scans ALL of `ctx`'s Var bindings, not just
+    // `x`-named ones), so `avoid_max + 1` is the HS seed; the extra scan
+    // below is a defensive floor for any `x`-named binding.
+    let mut next: u64 = {
+        let mut n = avoid_max.saturating_add(1);
+        for lit in ctx.bindings().values() {
+            if let crate::vterm::Lit::Var(lv) = lit {
+                if lv.name == "x" && lv.idx >= n {
+                    n = lv.idx + 1;
+                }
+            }
+        }
+        n
+    };
+    // HS-faithful: both the unify/variants path (`msubstToLSubstVFresh`)
+    // and the match path (`msubstToLSubstVFree`) convert in Maude's raw
+    // returned order — neither sorts the domain (Maude/Types.hs:127-138;
+    // the old `sortBy` was removed upstream in `c9d456b8`).
+    for ((sort, idx), mt) in ms {
+        let lv = crate::maude_types::substitute_lookup_var(ctx, *sort, *idx)
+            .ok_or_else(|| MaudeError::Other(format!(
+                "no binding for Maude variable x{}:{:?}", idx, sort)))?;
+        // HS-faithful: HS's `msubstToLSubstVFresh` (Maude/Types.hs:138)
+        // UNCONDITIONALLY uses `"x"` as the name hint for Maude-introduced
+        // witnesses inside `eqsConj` substitutions.  The commented-out
+        // alternative branch at Maude/Types.hs:134-137 (preserve domain
+        // name for `xi → xj` renames) is explicitly marked "seems wrong".
+        let name_hint: &str = "x";
+        let t = mterm_to_lnterm(mt, ctx, name_hint, &mut next);
+        out.push((lv, t));
+    }
+    Ok(out)
 }
 
 /// Variant of `msubst_to_lnsubst` that forces the Maude-witness name hint
@@ -1681,69 +1670,6 @@ fn msubst_to_lnsubst_force_x(
     Ok(out)
 }
 
-/// Maude-handle-aware variant: draws witness indices from the
-/// MaudeHandle's global counter when supplied.  Mirrors Haskell's
-/// `MonadFresh` — every freshen across the entire proof session uses
-/// the same counter, so witness indices are globally unique.  Without
-/// this, two independent Maude calls both start at `avoid_max + 1`
-/// and produce colliding `(name, idx)` LVars at different sorts (the
-/// TESLA Sender0a root cause).
-fn msubst_to_lnsubst_with_maude(
-    ms: &MSubst,
-    ctx: &mut ConvCtx,
-    avoid_max: u64,
-    maude: Option<&MaudeHandle>,
-) -> Result<Vec<(crate::lterm::LVar, LNTerm)>, MaudeError> {
-    let mut out = Vec::with_capacity(ms.len());
-    // Initialise `next`.  With a global counter, push it above
-    // `avoid_max` and any input `~mw` var, then snapshot — every
-    // subsequent allocation increments BOTH the local `next` and the
-    // global counter (via the wrapper closure below).
-    let mut next: u64 = if let Some(h) = maude {
-        h.ensure_above(avoid_max);
-        for lit in ctx.bindings().values() {
-            if let crate::vterm::Lit::Var(lv) = lit {
-                if lv.name == "x" {
-                    h.ensure_above(lv.idx);
-                }
-            }
-        }
-        h.fresh_counter_peek()
-    } else {
-        let mut n = avoid_max.saturating_add(1);
-        for lit in ctx.bindings().values() {
-            if let crate::vterm::Lit::Var(lv) = lit {
-                if lv.name == "x" && lv.idx >= n {
-                    n = lv.idx + 1;
-                }
-            }
-        }
-        n
-    };
-    // HS-faithful: both the unify/variants path (`msubstToLSubstVFresh`)
-    // and the match path (`msubstToLSubstVFree`) convert in Maude's raw
-    // returned order — neither sorts the domain (Maude/Types.hs:127-138;
-    // the old `sortBy` was removed upstream in `c9d456b8`).
-    for ((sort, idx), mt) in ms {
-        let lv = crate::maude_types::substitute_lookup_var(ctx, *sort, *idx)
-            .ok_or_else(|| MaudeError::Other(format!(
-                "no binding for Maude variable x{}:{:?}", idx, sort)))?;
-        // HS-faithful: HS's `msubstToLSubstVFresh` (Maude/Types.hs:138)
-        // UNCONDITIONALLY uses `"x"` as the name hint for Maude-introduced
-        // witnesses inside `eqsConj` substitutions.  The commented-out
-        // alternative branch at Maude/Types.hs:134-137 (preserve domain
-        // name for `xi → xj` renames) is explicitly marked "seems wrong".
-        let name_hint: &str = "x";
-        let t = mterm_to_lnterm(mt, ctx, name_hint, &mut next);
-        out.push((lv, t));
-    }
-    // Bump the global counter so any subsequent allocator (in this or
-    // a parallel call on the same handle) starts above our allocations.
-    if let Some(h) = maude {
-        if next > 0 { h.ensure_above(next - 1); }
-    }
-    Ok(out)
-}
 
 // ---------------------------------------------------------------------------
 // MaudePool — a pool of independent Maude subprocesses.

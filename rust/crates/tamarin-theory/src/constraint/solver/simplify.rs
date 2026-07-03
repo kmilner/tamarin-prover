@@ -1477,7 +1477,7 @@ fn try_match_all_guards(
                     //
                     // Previous implementation called `sys_maude.unify_at`
                     // here, which under the HS-faithful flattenUnif fix
-                    // (maude_proc.rs::unify_with_avoid's AC-free fast
+                    // (maude_proc.rs::unify's AC-free fast
                     // path) returns narrowing-witness pairs
                     // `K → ~Vw, V → ~Vw`.  Those witness pairs were
                     // encoded as extra Eq atoms appended to other_guards,
