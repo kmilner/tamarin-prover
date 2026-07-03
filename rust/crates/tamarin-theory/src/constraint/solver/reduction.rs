@@ -121,17 +121,23 @@ impl<'ctx> Reduction<'ctx> {
     /// Source-precompute threads `avoid th` in as `floor`; the general
     /// proving path passes `floor = 0` (a no-op) via [`new`].
     pub fn new_with_floor(ctx: &'ctx ProofContext, sys: System, floor: u64) -> Self {
-        // HS-faithful per-Reduction Fresh counter: init from
-        // `bounds_max(sys) + 1`.  Matches `runReduction m ctx sys (avoid sys)`
-        // in HS where `avoid t = maybe 0 (succ . snd) . boundsVarIdx`.
-        let avoid_max = bounds_max(&sys).max(floor);
-        let maude = ctx.maude.with_fresh_counter_from(avoid_max);
+        // HS-faithful per-Reduction Fresh counter: seed the NEXT-draw value
+        // from `avoid sys` (LTerm.hs:656-657, via `avoid_fresh_state` — 0
+        // for a frees-less system, max idx + 1 otherwise).  Matches
+        // `runReduction m ctx sys (avoid sys)`.  `floor` (max-idx units,
+        // source-precompute's `avoid th` whole-source seed) lifts the
+        // next-draw to `floor + 1` when set; `floor == 0` means "no floor"
+        // (the general proving path via [`new`]).
+        let next = avoid_fresh_state(&sys)
+            .max(if floor == 0 { 0 } else { floor.saturating_add(1) });
+        let maude = ctx.maude.with_fresh_counter_next(next);
         // Ensure the GLOBAL ctx.maude is at least as advanced as our
-        // local high-water start.  Any non-Reduction allocator
-        // (`sources.rs`, etc.) that subsequently uses `ctx.maude` will
-        // then start above our base, preventing cross-allocator
-        // collisions on names like `~mw` that both routes mint.
-        ctx.maude.ensure_above(avoid_max);
+        // local high-water start (counter ≥ next).  Any non-Reduction
+        // allocator (`sources.rs`, etc.) that subsequently uses
+        // `ctx.maude` will then start above our base, preventing
+        // cross-allocator collisions on names like `~mw` that both
+        // routes mint.
+        if next > 0 { ctx.maude.ensure_above(next - 1); }
         Reduction {
             ctx, sys, maude,
             changed: ChangeIndicator::Unchanged,
@@ -1731,8 +1737,19 @@ impl<'ctx> Reduction<'ctx> {
                 }
                 self.sys.invalidate_max_var_idx_cache();
                 self.sys.solved_formulas.push(outer);
+                // HS (Reduction.hs:573) draws `xs <- mapM (uncurry freshLVar) ss`
+                // straight from the ambient MonadFresh counter — no clamp; the
+                // threaded counter is above every system var by construction
+                // (seeded from `avoid sys`, monotone thereafter).  RS's clamp
+                // compensates for its non-threaded counter and must preserve
+                // exactly that invariant: counter ≥ max idx + 1 ONLY when free
+                // vars exist; a frees-less system (lemma ROOT step: HS seeds 0)
+                // must stay unclamped — `ensure_above(0)` would force ≥ 1,
+                // shifting the root existentials (#i/#j/tid/key) +1 vs HS.
                 let avoid_max = self.fresh_var_baseline();
-                self.maude.ensure_above(avoid_max);
+                if avoid_max > 0 || system_has_any_free_var(&self.sys) {
+                    self.maude.ensure_above(avoid_max);
+                }
                 let base = self.maude.reserve_idxs(vars.len() as u64);
                 // Fresh LVars (HS `freshLVar`-style), one per binding in
                 // the original lexical order.
@@ -3306,6 +3323,75 @@ fn bounds_max_disable_enabled() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_BOUNDS_CACHE").is_ok())
+}
+
+/// HS `avoid` (LTerm.hs:656-657): `avoid = maybe 0 (succ . snd) . boundsVarIdx`
+/// — the `FreshState` (= NEXT index to draw) avoiding `sys`'s free vars:
+/// **0 when the system has NO free variables**, max idx + 1 otherwise.
+/// `bounds_max` alone returns 0 for both "no frees" and "frees at idx 0",
+/// so an unconditional `bounds_max + 1` seed off-by-ones every allocation
+/// at a lemma's root step (closed formula, no nodes ⇒ HS seeds 0) — the
+/// uniform +1 witness-index shift visible on web sequent pages (proven on
+/// cav13/DH_example: RS lemma existentials tid.3/key.4 vs HS tid.2/key.3
+/// at the first substantive applyEqStore call).
+pub fn avoid_fresh_state(sys: &System) -> u64 {
+    let bm = bounds_max(sys);
+    if bm > 0 || system_has_any_free_var(sys) { bm + 1 } else { 0 }
+}
+
+/// TRUE iff the system has at least one free variable — the existence
+/// companion to `bounds_max`, mirroring HS `boundsVarIdx` returning
+/// `Nothing` (LTerm.hs:649-651) over the same traversal domain as
+/// `bounds_max_uncached`.  Only consulted when `bounds_max(sys) == 0`
+/// (in practice: lemma-root systems), so the walk is cheap.
+pub fn system_has_any_free_var(sys: &System) -> bool {
+    use tamarin_term::lterm::HasFrees;
+    // Nodes / edges / less-atoms / last carry LVar node-ids structurally.
+    if !sys.nodes.is_empty() || !sys.edges.is_empty()
+        || !sys.less_atoms.is_empty() || sys.last_atom.is_some()
+    {
+        return true;
+    }
+    fn term_has_var(t: &tamarin_term::lterm::LNTerm) -> bool {
+        let mut seen = false;
+        t.for_each_free(&mut |_| { seen = true; });
+        seen
+    }
+    for c in sys.subterm_store.subterms.iter()
+        .chain(sys.subterm_store.solved_subterms.iter())
+    {
+        if term_has_var(&c.small) || term_has_var(&c.big) { return true; }
+    }
+    for (s, t) in &sys.subterm_store.neg_subterms {
+        if term_has_var(s) || term_has_var(t) { return true; }
+    }
+    for (g, _) in sys.goals.iter() {
+        use crate::constraint::constraints::Goal;
+        match g {
+            // These carry a node-id LVar structurally.
+            Goal::Action(..) | Goal::Premise(..) | Goal::Chain(..) => return true,
+            Goal::Subterm((s, t)) => {
+                if term_has_var(s) || term_has_var(t) { return true; }
+            }
+            Goal::Disj(_) | Goal::Split(_) => {}
+        }
+    }
+    for f in sys.formulas.iter()
+        .chain(sys.solved_formulas.iter())
+        .chain(sys.lemmas.iter())
+    {
+        if !crate::guarded::free_vars(f).is_empty() { return true; }
+    }
+    // eq-store: subst dom vars are frees; conj counts DOMAIN keys only
+    // (HS `foldFrees (SubstVFresh) = foldFrees f . M.keys`, matching the
+    // `bounds_max_uncached` walk).
+    if !sys.eq_store.subst.is_empty() { return true; }
+    for d in &sys.eq_store.conj {
+        for s in &d.substs {
+            if s.dom().next().is_some() { return true; }
+        }
+    }
+    false
 }
 
 /// Full-walk implementation of `bounds_max` — bypass for the cache.

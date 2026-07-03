@@ -172,7 +172,10 @@ pub fn exec_proof_method(
 
     // HS-faithful per-step Maude counter reset (ProofMethod.hs):
     //   `runReduction (m <* simplifySystem) ctxt sys (avoid sys)`
-    // The FreshT counter starts at `avoid sys + 1` for EVERY proof step.
+    // The FreshT counter starts at `avoid sys` for EVERY proof step
+    // (`avoid = maybe 0 (succ . snd) . boundsVarIdx`, LTerm.hs:656-657 —
+    // 0 for a frees-less system such as a lemma's ROOT step, else
+    // max idx + 1; `avoid_fresh_state` mirrors that exactly).
     // Without this, Rust's Maude counter advances monotonically across all
     // proof steps — so witness idxs grow to hundreds where HS stays in
     // the ~20-30 range.  Beyond cosmetics, the unbounded growth surfaces
@@ -181,8 +184,8 @@ pub fn exec_proof_method(
     // the collision pattern encodes an unintended unification that
     // cascades downstream (KAS_key_secrecy: `~ltkA.0` and `~ltkA.349`
     // both → `~ltkA.425` after lifting forces $R=$I via setNodes merge).
-    let avoid = crate::constraint::solver::reduction::bounds_max(sys);
-    ctx.maude.reset_counter_to(avoid.saturating_add(1));
+    let avoid = crate::constraint::solver::reduction::avoid_fresh_state(sys);
+    ctx.maude.reset_counter_to(avoid);
 
     match method {
         ProofMethod::Sorry(_) | ProofMethod::Finished(_) => Some(Vec::new()),

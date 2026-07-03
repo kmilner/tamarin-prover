@@ -822,16 +822,18 @@ fn expand_inner(
             // single shared IPC mutex.  Without a pool we share the
             // single Maude process; the IPC mutex serialises queries,
             // which is correctness-safe (just slower).
-            let avoid_max = crate::constraint::solver::reduction::bounds_max(&sys);
+            // HS `avoid sys` next-draw seed (0 for a frees-less system —
+            // see `avoid_fresh_state`), matching `Reduction::new`.
+            let avoid_next = crate::constraint::solver::reduction::avoid_fresh_state(&sys);
             // Non-blocking: with B1 lemma-level parallelism the pool may be
             // fully drained by sibling lemma tasks.  A blocking `acquire`
             // here could deadlock the nested fan-out; fall back to the shared
             // `ctx.maude` (output-identical — both branches seed via
-            // `with_fresh_counter_from(avoid_max)`).
+            // `with_fresh_counter_next(avoid_next)`).
             let pool_guard = ctx.maude_pool.as_ref().and_then(|pool| pool.try_acquire());
             let worker_maude = match &pool_guard {
-                Some(pooled) => pooled.handle().with_fresh_counter_from(avoid_max),
-                None => ctx.maude.with_fresh_counter_from(avoid_max),
+                Some(pooled) => pooled.handle().with_fresh_counter_next(avoid_next),
+                None => ctx.maude.with_fresh_counter_next(avoid_next),
             };
             let worker_ctx = ctx.with_swapped_maude(worker_maude);
             let mut child = ProofNode {

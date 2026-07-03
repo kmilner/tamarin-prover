@@ -1716,7 +1716,28 @@ impl EquationStore {
         // Drop the singleton disjunction.
         self.conj.remove(pos);
         if subst_vf.is_empty() {
-            // Identity disjunction: nothing to compose; just dropped.
+            // HS `simpSingleton` fires for the EMPTY singleton too:
+            // `freshToFree emptySubstVFresh` is empty, and `foreachDisj`
+            // UNCONDITIONALLY runs `applyEqStoreAt "foreachDisj:simpSingleton"`
+            // with that empty msubst after replacing the disj
+            // (EquationStore.hs:823-830).  An empty asubst is NOT a no-op:
+            // applyEqStore re-runs `applyBound` on every remaining disj
+            // subst, re-deriving (and RENUMBERING) their fresh witnesses
+            // under the current avoid set (renameAvoiding + unify +
+            // restrict).  Short-circuiting here left RS's surviving disj
+            // witnesses stale — JCS12 typing_assertion case_3: HS's
+            // empty-fold rounds renumber ~ltkS.12/m.9 → ~ltkS.6/m.6 before
+            // the next solveFactEqs, RS skipped them and rendered
+            // ~ltkS.9/$C.13 where HS shows ~ltkS.6/$C.10.  Same family as
+            // add_eqs' "empty-empty case must NOT be short-circuited"
+            // (LAK06 lesson).  The floor / fresh_to_free steps below are
+            // semantic no-ops for an empty subst, so skip straight to the
+            // apply_eq_store round.
+            if let Some(m) = maude {
+                // Err is impossible for the empty subst (dom ∩ range = ∅);
+                // the compose fallback would be a no-op anyway.
+                let _ = self.apply_eq_store(m, &LNSubst::empty());
+            }
             return true;
         }
         if tamarin_utils::env_gate!("TAM_DBG_FOLD_VARIANT") {

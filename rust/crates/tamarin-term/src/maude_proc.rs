@@ -456,6 +456,20 @@ impl MaudeHandle {
         }
     }
 
+    /// Like [`with_fresh_counter_from`] but takes the NEXT-draw value
+    /// directly (HS `FreshState` units).  HS `avoid sys` (LTerm.hs:656-657,
+    /// `maybe 0 (succ . snd) . boundsVarIdx`) is legitimately 0 for a
+    /// system with NO free variables (e.g. a lemma's root system: closed
+    /// formula, no nodes), which the `avoid_max + 1` form cannot express.
+    pub fn with_fresh_counter_next(&self, next: u64) -> MaudeHandle {
+        MaudeHandle {
+            inner: self.inner.clone(),
+            child: self.child.clone(),
+            fresh_counter: Arc::new(AtomicU64::new(next)),
+            sig: Arc::clone(&self.sig),
+        }
+    }
+
     /// The theory signature.  Cheap: a refcount bump on the shared immutable
     /// `Arc<MaudeSig>` — NO IPC-mutex lock and NO deep clone of the signature's
     /// `BTreeSet`s.  Hot proof-search predicates probe `reducible_fun_syms_fast`
