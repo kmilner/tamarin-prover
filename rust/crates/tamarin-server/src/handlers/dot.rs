@@ -157,25 +157,75 @@ pub fn system_to_dot_with(sys: &System, opts: &GraphOptions) -> String {
             _ => None,
         })
         .collect();
-    // HS emits the `sLastAtom` node unconditionally (`systemLastActionNode`,
-    // Graph.hs:111-112), even when its id coincides with a system node — both
-    // are drawn (see repr.rs). In RS's semantic dot-id scheme both would share
-    // one dot id and collide, so a colliding last-atom node gets a distinct id.
-    // HS `dsNodes[v]` resolves to the last-atom (processed after the system
-    // node, Dot.hs:108), so less-edges at that id must target the last-atom's
-    // dot id. The last-atom node is never clustered (no role / rule name), so it
-    // always lives in `repr.nodes`.
-    let last_id: Option<&LVar> = repr.nodes.iter()
-        .find(|n| matches!(n.ty, NodeType::LastAction))
-        .map(|n| &n.id);
-    let last_dot_id: Option<String> = last_id.map(|lid| {
-        let base = DotBuilder::dot_node_id(lid);
-        let collides = repr.nodes.iter()
-            .chain(repr.clusters.iter().flat_map(|c| c.nodes.iter()))
-            .any(|n| !matches!(n.ty, NodeType::LastAction)
-                && DotBuilder::dot_node_id(&n.id) == base);
-        if collides { format!("{base}__lastatom") } else { base }
-    });
+    // HS gives every node a globally-fresh dot id via `cacheState dsNodes`
+    // (Dot.hs:108-110), so a single system-node id `v` that is ALSO an
+    // unsolved-action atom and/or the last-action atom is drawn as SEVERAL
+    // distinct dot nodes (`n5` record + `n7` ellipse …). RS's semantic dot-id
+    // scheme derives one id per `v` (`dot_node_id`), so those extra ellipses
+    // would collide with the record on a single id — graphviz merges them (the
+    // ellipse overwrites the record) and the parity gate's label-keyed node map
+    // drops the record. Mirror HS: the SystemNode / MissingNode own the base id
+    // (their record ports / bare id are what `sEdges` reference via
+    // `conc_port_ref`/`prem_port_ref` = HS `dsConcs`/`dsPrems`), and a colliding
+    // UnsolvedAction / LastAction ellipse (which HS never references by an
+    // sEdge) gets a distinct suffixed id.
+    //
+    // `dsNodes[v]` (which HS `dotLessEdge` resolves each less-edge endpoint
+    // through, Dot.hs:408-409) is the LAST dot node emitted at `v`. Emission
+    // order is the free `repr.nodes` (System, UnsolvedAction, LastAction,
+    // Missing per `compute_basic_graph_repr`) then each cluster's nodes — so we
+    // walk that exact order, assigning ids and overwriting `ds_nodes` as we go.
+    //
+    // `port_owner_ids` = the `v`s whose base id backs an sEdge port ref
+    // (SystemNode records + MissingNodes). An UnsolvedAction/LastAction at such
+    // a `v` MUST yield the base to that owner regardless of emission order (a
+    // SystemNode can be clustered and thus emitted AFTER a free action ellipse).
+    let port_owner_ids: HashSet<&LVar> = repr.nodes.iter()
+        .chain(repr.clusters.iter().flat_map(|c| c.nodes.iter()))
+        .filter(|n| matches!(n.ty, NodeType::System(_) | NodeType::Missing(_)))
+        .map(|n| &n.id)
+        .collect();
+    let mut used_dot_ids: HashSet<String> = HashSet::new();
+    // Assigned id for each UnsolvedAction (tag 0) / LastAction (tag 1) node,
+    // keyed by (node id, tag) — at most one of each kind per `v`.
+    let mut ellipse_dot_ids: std::collections::BTreeMap<(LVar, u8), String> =
+        std::collections::BTreeMap::new();
+    // `dsNodes`: v -> dot id of the LAST node emitted at v (less-edge target).
+    let mut ds_nodes: std::collections::BTreeMap<LVar, String> =
+        std::collections::BTreeMap::new();
+    for node in repr.nodes.iter()
+        .chain(repr.clusters.iter().flat_map(|c| c.nodes.iter()))
+    {
+        let base = DotBuilder::dot_node_id(&node.id);
+        let id = match &node.ty {
+            // Base-id owners: their id is referenced by sEdge port refs.
+            NodeType::System(_) | NodeType::Missing(_) => {
+                used_dot_ids.insert(base.clone());
+                base
+            }
+            NodeType::UnsolvedAction(_) | NodeType::LastAction => {
+                let tag: u8 = if matches!(node.ty, NodeType::LastAction) { 1 } else { 0 };
+                let suffix = if tag == 1 { "__lastatom" } else { "__actionatom" };
+                let id = if port_owner_ids.contains(&node.id)
+                    || used_dot_ids.contains(&base)
+                {
+                    let mut cand = format!("{base}{suffix}");
+                    let mut n = 2u32;
+                    while used_dot_ids.contains(&cand) {
+                        cand = format!("{base}{suffix}{n}");
+                        n += 1;
+                    }
+                    cand
+                } else {
+                    base
+                };
+                used_dot_ids.insert(id.clone());
+                ellipse_dot_ids.insert((node.id.clone(), tag), id.clone());
+                id
+            }
+        };
+        ds_nodes.insert(node.id.clone(), id);
+    }
     // 4a. Top-level (ungrouped) nodes.
     //
     // HS `dotGraphCompact` (Dot.hs:505-510) emits, in order: the FREE
@@ -187,7 +237,7 @@ pub fn system_to_dot_with(sys: &System, opts: &GraphOptions) -> String {
     // scope order vs HS).
     for node in &repr.nodes {
         emit_node(&mut g, node, &abbrev_lookup, opts, &color_map, &has_outgoing,
-            last_dot_id.as_deref());
+            &ellipse_dot_ids);
     }
     // 4b. Clusters as subgraphs.
     //
@@ -207,7 +257,7 @@ pub fn system_to_dot_with(sys: &System, opts: &GraphOptions) -> String {
         g.open_subgraph(i, &cluster.name, &color);
         for node in &cluster.nodes {
             emit_node_colored(&mut g, node, &abbrev_lookup, opts, Some(&color),
-                &color_map, &has_outgoing, last_dot_id.as_deref());
+                &color_map, &has_outgoing, &ellipse_dot_ids);
         }
         g.close_subgraph();
         cluster_edges.extend(cluster.edges.iter().cloned());
@@ -215,8 +265,8 @@ pub fn system_to_dot_with(sys: &System, opts: &GraphOptions) -> String {
     // 4c. Edges. HS emits `restEdges` (non-less) before the merged
     // `lessEdges` within each scope (`dotGraphCompact`, Dot.hs:508-509),
     // then the cluster edges last (`dotClustersEdges`).
-    emit_edges_merged(&mut g, &repr.edges, &node_map, last_id, last_dot_id.as_deref());
-    emit_edges_merged(&mut g, &cluster_edges, &node_map, last_id, last_dot_id.as_deref());
+    emit_edges_merged(&mut g, &repr.edges, &node_map, &ds_nodes);
+    emit_edges_merged(&mut g, &cluster_edges, &node_map, &ds_nodes);
     // 4c. Legend (if any abbreviations were chosen).
     if !abbrevs.is_empty() {
         g.legend(&abbrevs);
@@ -232,10 +282,10 @@ fn emit_node(
     opts: &GraphOptions,
     color_map: &NodeColorMap,
     has_outgoing: &HashSet<&LVar>,
-    last_dot_id: Option<&str>,
+    ellipse_dot_ids: &std::collections::BTreeMap<(LVar, u8), String>,
 ) {
     emit_node_colored(g, node, abbrev, opts, None, color_map, has_outgoing,
-        last_dot_id);
+        ellipse_dot_ids);
 }
 
 /// `emit_node` with an optional `manual_color` — the cluster `roleColor`
@@ -250,8 +300,14 @@ fn emit_node_colored(
     manual_color: Option<&str>,
     color_map: &NodeColorMap,
     has_outgoing: &HashSet<&LVar>,
-    last_dot_id: Option<&str>,
+    ellipse_dot_ids: &std::collections::BTreeMap<(LVar, u8), String>,
 ) {
+    // Look up the (possibly collision-disambiguated) dot id assigned to a
+    // non-record ellipse node (UnsolvedAction tag 0 / LastAction tag 1).
+    let ellipse_id = |tag: u8| -> String {
+        ellipse_dot_ids.get(&(node.id.clone(), tag)).cloned()
+            .unwrap_or_else(|| DotBuilder::dot_node_id(&node.id))
+    };
     match &node.ty {
         NodeType::System(ru) => {
             let ru_abbreviated = abbreviate_rule(ru, abbrev);
@@ -263,14 +319,14 @@ fn emit_node_colored(
             let new_facts: Vec<LNFact> = facts.iter()
                 .map(|fa| apply_abbreviations_fact(abbrev, fa))
                 .collect();
-            g.action_node(&node.id, &new_facts);
+            // A colliding action ellipse (same `v` as a system record) gets a
+            // distinct dot id so both nodes survive (see `ds_nodes`).
+            g.action_node(&ellipse_id(0), &node.id, &new_facts);
         }
         // The last-atom uses its (possibly collision-disambiguated) dot id so
-        // it does not clash with a same-id system node (see `last_dot_id`).
+        // it does not clash with a same-id system node.
         NodeType::LastAction => {
-            let id = last_dot_id.map(str::to_string)
-                .unwrap_or_else(|| DotBuilder::dot_node_id(&node.id));
-            g.last_node(&id, &node.id);
+            g.last_node(&ellipse_id(1), &node.id);
         }
         NodeType::Missing(hint) => g.missing_node(&node.id, hint),
     }
@@ -288,8 +344,7 @@ fn emit_edges_merged(
     g: &mut DotBuilder,
     edges: &[GEdge],
     node_map: &HashMap<&LVar, &RuleACInst>,
-    last_id: Option<&LVar>,
-    last_dot_id: Option<&str>,
+    ds_nodes: &std::collections::BTreeMap<LVar, String>,
 ) {
     // restEdges: keep original order, drop less-edges.
     for edge in edges {
@@ -308,7 +363,7 @@ fn emit_edges_merged(
         .collect();
     lesses.sort_by(|a, b| (&a.smaller, &a.larger).cmp(&(&b.smaller, &b.larger)));
     for la in lesses {
-        g.less_edge(la, last_id, last_dot_id);
+        g.less_edge(la, ds_nodes);
     }
 }
 
@@ -542,8 +597,7 @@ impl DotBuilder {
             "  {} [shape=record,label=\"{}\",style=\"filled\",fillcolor=\"{}\",fontcolor=\"{}\",role=\"{}\"];",
             id, lbl, color, fontcolor, escape_dot(role));
     }
-    fn action_node(&mut self, nid: &LVar, facts: &[LNFact]) {
-        let id = Self::dot_node_id(nid);
+    fn action_node(&mut self, id: &str, nid: &LVar, facts: &[LNFact]) {
         let mut s = facts.iter()
             .map(format_fact)
             .collect::<Vec<_>>()
@@ -651,17 +705,16 @@ impl DotBuilder {
     /// reasons; since at most one less-atom survives per node pair (LessAtom
     /// equality ignores the reason), the group is a singleton and the colour
     /// reduces to the single reason's `toColor` (`reason_color`).
-    fn less_edge(&mut self, la: &LessAtom, last_id: Option<&LVar>,
-                 last_dot_id: Option<&str>) {
+    fn less_edge(&mut self, la: &LessAtom,
+                 ds_nodes: &std::collections::BTreeMap<LVar, String>) {
         // HS `dotLessEdge` resolves each endpoint through `dsNodes` (Dot.hs:408-409),
-        // which — when an id is both a system node and the last-atom — holds the
-        // last-atom (processed last). Mirror that: an endpoint equal to the
-        // last-atom id resolves to the last-atom's dot id.
+        // which holds the LAST dot node emitted at that id — the action / last
+        // ellipse when it shadows a same-id system record. Mirror that by
+        // resolving through the precomputed `ds_nodes` map (falling back to the
+        // bare id for any endpoint that was never emitted as a node).
         let resolve = |nid: &LVar| -> String {
-            match (last_id, last_dot_id) {
-                (Some(li), Some(ld)) if nid == li => ld.to_string(),
-                _ => Self::dot_node_id(nid),
-            }
+            ds_nodes.get(nid).cloned()
+                .unwrap_or_else(|| Self::dot_node_id(nid))
         };
         let s = resolve(&la.smaller);
         let t = resolve(&la.larger);
