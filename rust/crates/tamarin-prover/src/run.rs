@@ -323,8 +323,18 @@ fn run_interactive(args: &Args) -> Result<i32, RunError> {
     // Spin up a tokio runtime and run the server. We use a multi-thread
     // runtime so background `spawn_blocking` proof tasks don't park the
     // single executor thread.
+    //
+    // `thread_stack_size`: the web constraint-system pane is rendered as
+    // ONE HughesPJ Doc (HS `prettyNonGraphSystem = vsep …`), and the
+    // eager Doc builders (`beside`/`aboveNest`) recurse along the left
+    // operand's token spine — depth scales with the pane size.  GHC grows
+    // its stack on demand; tokio's default 2 MiB worker stacks do not, and
+    // overflowed on fact-heavy panes (UM_three_pass).  64 MiB is reserved
+    // virtual address space only (committed on use), applied to both
+    // worker and `spawn_blocking` threads.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .thread_stack_size(64 * 1024 * 1024)
         .build()
         .map_err(|e| RunError(format!("failed to build tokio runtime: {}", e)))?;
     runtime

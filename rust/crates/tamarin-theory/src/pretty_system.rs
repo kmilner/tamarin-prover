@@ -15,17 +15,17 @@
 //!   unsolved constraints: ...
 //!   solved constraints: ...
 //!
-//! NOTE: the `subterms` and `equations` section bodies are now faithful
+//! NOTE: the `subterms` and `equations` section bodies are faithful
 //! ports of Haskell's `prettySubtermStore` (SubtermStore.hs:567-579) and
 //! `prettyEqStore` (EquationStore.hs:566-586) — same `Contradictory` /
 //! `CONTRADICTORY` headers, numbered keyword sections and `∃`-quantified
-//! disjuncts — built on the `pretty_hpj` HughesPJ Doc engine.  The only
-//! residual divergences are documented on `pretty_subterm_store` /
-//! `pretty_eq_store` (flat-atom term rendering; derived term `Ord` for the
-//! eq-store subst grouping).  These are interactive-UI diagnostic panes
-//! only and do not affect proof results or golden `--prove` output.  The
-//! inter-section blank lines that Haskell's `vsep`/`$--$` inserts between
-//! non-empty top-level sections (Class.hs) are still not reproduced here.
+//! disjuncts — built on the `pretty_hpj` HughesPJ Doc engine.  The whole
+//! pane is ONE Doc (`vsep $ map combine_ …`, System.hs:1675-1686) rendered
+//! once, so every term/formula/goal wraps at the pane width under its
+//! real section nesting, exactly as HS.  Residual divergences documented
+//! on `pretty_subterm_store` / `pretty_eq_store` (derived term `Ord` for
+//! set iteration orders).  These are interactive-UI diagnostic panes only
+//! and do not affect proof results or golden `--prove` output.
 
 use tamarin_term::pretty::{pp_lvar, pretty_lnterm};
 
@@ -34,10 +34,12 @@ use crate::constraint::constraints::{Goal, NodeId};
 use crate::constraint::system::{SourceKind, System};
 use crate::fact::{fact_tag_name, LNFact};
 use crate::guarded::Guarded;
-use crate::pretty_formula::pretty_guarded;
+use crate::pretty_formula::guarded_doc;
 
 /// Emit just the non-graph-part of the system, matching Haskell's
-/// `prettyNonGraphSystem`.  See file-level docs for the section list.
+/// `prettyNonGraphSystem` (System.hs:1675-1686):
+/// `vsep $ map combine_ [("last", …), …]` — the entire pane is a single
+/// Doc rendered once at the web display width.
 pub fn pretty_non_graph_system(sys: &System) -> String {
     // HS renders this pane (Web/Theory.hs:535 `preformatted (Just "sequent")
     // (prettyNonGraphSystem se)`) through the `HtmlDoc Doc` transformer via
@@ -47,52 +49,67 @@ pub fn pretty_non_graph_system(sys: &System) -> String {
     // that width accounting here or the pair-tuple `<…>` wraps at a different
     // column than HS (task #17 family D).  The guard is dropped at function
     // exit, restoring plain (visible-column) width accounting; this function is
-    // web-only, so `--prove` never sees it.
+    // web-only, so `--prove` never sees it.  NOTE: the guard must span the Doc
+    // BUILD too (not just the render) — `Doc::text` captures each token's fill
+    // width at construction.
     let _html_width = crate::pretty_hpj::HtmlEntityWidthGuard::enable();
-    let mut out = String::new();
-    section(&mut out, "last", &pretty_last(sys));
-    section(&mut out, "formulas", &pretty_formula_set(&sys.formulas));
-    section(&mut out, "subterms", &pretty_subterm_store(sys));
-    section(&mut out, "equations", &pretty_eq_store(sys));
-    section(&mut out, "lemmas", &pretty_formula_set(&sys.lemmas));
-    section(&mut out, "allowed cases", &pretty_source_kind(sys.source_kind));
-    section(&mut out, "solved formulas", &pretty_formula_set(&sys.solved_formulas));
-    section(&mut out, "unsolved constraints", &pretty_goals(sys, false));
-    section(&mut out, "solved constraints", &pretty_goals(sys, true));
-    out
+    let sections = vec![
+        combine("last", pretty_last(sys)),
+        combine("formulas", pretty_formula_set(&sys.formulas)),
+        combine("subterms", pretty_subterm_store(sys)),
+        combine("equations", pretty_eq_store(sys)),
+        combine("lemmas", pretty_formula_set(&sys.lemmas)),
+        combine("allowed cases", Doc::text(pretty_source_kind(sys.source_kind))),
+        combine("solved formulas", pretty_formula_set(&sys.solved_formulas)),
+        combine("unsolved constraints", pretty_goals(sys, false)),
+        combine("solved constraints", pretty_goals(sys, true)),
+    ];
+    vsep_docs(sections).render()
 }
 
 // ---------------------------------------------------------------------
-// Section header helper
+// vsep / $--$ (HS Pretty.hs:83-84, Class.hs:112-114)
 // ---------------------------------------------------------------------
 
-fn section(out: &mut String, header: &str, body: &str) {
-    out.push_str(header);
-    out.push(':');
-    if body.contains('\n') {
-        out.push('\n');
-        for line in body.lines() {
-            out.push_str("  ");
-            out.push_str(line);
-            out.push('\n');
-        }
-    } else if body.is_empty() {
-        out.push('\n');
-    } else {
-        out.push(' ');
-        out.push_str(body);
-        out.push('\n');
+// HS `d1 $--$ d2 = caseEmptyDoc d2 (caseEmptyDoc d1 (d1 $-$ text "" $-$ d2)
+// d2) d1` (Class.hs:112-114): if d1 is Empty → d2; else if d2 is Empty →
+// d1; else the two separated by a blank line (`$-$ text "" $-$`).
+// `isEmpty` matches only the literal `Empty` constructor (HughesPJ).
+fn above_blank(d1: Doc, d2: Doc) -> Doc {
+    if matches!(d1, Doc::Empty) {
+        return d2;
     }
+    if matches!(d2, Doc::Empty) {
+        return d1;
+    }
+    d1.above_g(blank_text()).above_g(d2)
+}
+
+// HS `vsep = foldr ($--$) emptyDoc` (Pretty.hs:83-84) — RIGHT fold.
+fn vsep_docs(ds: Vec<Doc>) -> Doc {
+    let mut acc = Doc::Empty;
+    for d in ds.into_iter().rev() {
+        acc = above_blank(d, acc);
+    }
+    acc
+}
+
+// HS `prettyNTerm t` (LTerm.hs:894 `prettyTerm (text . show)`) as a Doc,
+// via the parser-AST projection — the same Doc path the proof printer and
+// web DOT renderer use, so fact/term wrapping is byte-faithful.
+fn lnterm_doc(t: &tamarin_term::lterm::LNTerm) -> Doc {
+    crate::pretty_formula::term_doc(&crate::pretty_theory::lnterm_to_parser(t))
 }
 
 // ---------------------------------------------------------------------
 // last_atom
 // ---------------------------------------------------------------------
 
-fn pretty_last(sys: &System) -> String {
+// HS `maybe (text "none") prettyNodeId $ L.get sLastAtom se` (System.hs:1676).
+fn pretty_last(sys: &System) -> Doc {
     match &sys.last_atom {
-        None => "none".to_string(),
-        Some(nid) => pretty_node_id(nid),
+        None => Doc::text("none"),
+        Some(nid) => Doc::text(pretty_node_id(nid)),
     }
 }
 
@@ -118,17 +135,16 @@ fn pretty_last(sys: &System) -> String {
 /// `--prove` byte-identity corpus is unaffected.  `prettyNonGraphSystem`
 /// is reached only from the interactive/web constraint-system pane, never
 /// from `--prove` output.
-fn pretty_formula_set(items: &[Guarded]) -> String {
-    if items.is_empty() { return String::new(); }
+///
+/// HS: `vsep $ map prettyGuarded $ S.toList` (System.hs:1677/1680/1682) —
+/// each formula is a real Doc (`guarded_doc`) and formulas are separated
+/// by a blank line (`vsep` = fold `$--$`).
+fn pretty_formula_set(items: &[Guarded]) -> Doc {
+    if items.is_empty() { return Doc::Empty; }
     let mut sorted: Vec<&Guarded> = items.iter().collect();
     sorted.sort_by(|a, b| crate::guarded::cmp_guarded(a, b));
     sorted.dedup_by(|a, b| crate::guarded::cmp_guarded(a, b) == std::cmp::Ordering::Equal);
-    let mut s = String::new();
-    for (i, g) in sorted.into_iter().enumerate() {
-        if i > 0 { s.push('\n'); }
-        s.push_str(&pretty_guarded(g));
-    }
-    s
+    vsep_docs(sorted.into_iter().map(guarded_doc).collect())
 }
 
 // ---------------------------------------------------------------------
@@ -202,31 +218,27 @@ fn combine(header: &str, d: Doc) -> Doc {
 // `Subterms` / `Solved Subterms`, each item rendered as
 // `prettyNTerm a $$ nest 3 (⊏ <-> prettyNTerm b)`.
 //
-// Known divergences (UI diagnostic pane only — not reached by raw
-// `--prove` output):
-//   * terms are rendered as flat `Doc::text` atoms (this crate exposes
-//     only a `String` term printer, not a Doc one), so an individual term
-//     wider than the line is not re-wrapped the way HS's `prettyNTerm` Doc
-//     would;
-//   * ordering is byte-faithful only for `neg_subterms`, which is kept
-//     sorted by `add_neg`'s `binary_search` insert (matching HS `S.toList`
-//     over the `negSt` Set). `subterms`/`solved_subterms` are `Vec`s in
-//     insertion order (`.push()` in `add`/`conjoin`), whereas HS emits the
-//     `posSt`/`solvedSt` Sets via `S.toList` in `Ord` order — so their
-//     numbered ordering may differ from Haskell. Left as-is: sorting needs a
-//     faithful `Ord LNTerm` (FunSym-by-name, like `guarded::cmp_term` but for
-//     raw LNTerms); the derived `VTerm` Ord could flip a currently-matching
-//     pane, so it is not safe to apply blindly. Tracked as a residual gap.
-// Section structure, numbering and the `Contradictory` header are
-// byte-faithful.
-fn pretty_subterm_store(sys: &System) -> String {
+// Known divergence (UI diagnostic pane only — not reached by raw
+// `--prove` output): ordering is byte-faithful only for `neg_subterms`,
+// which is kept sorted by `add_neg`'s `binary_search` insert (matching HS
+// `S.toList` over the `negSt` Set). `subterms`/`solved_subterms` are
+// `Vec`s in insertion order (`.push()` in `add`/`conjoin`), whereas HS
+// emits the `posSt`/`solvedSt` Sets via `S.toList` in `Ord` order — so
+// their numbered ordering may differ from Haskell. Left as-is: sorting
+// needs a faithful `Ord LNTerm` (FunSym-by-name, like `guarded::cmp_term`
+// but for raw LNTerms); the derived `VTerm` Ord could flip a
+// currently-matching pane, so it is not safe to apply blindly. Tracked as
+// a residual gap.
+// Section structure, numbering, term wrapping (`prettyNTerm` Docs) and
+// the `Contradictory` header are byte-faithful.
+fn pretty_subterm_store(sys: &System) -> Doc {
     let st = &sys.subterm_store;
 
     // `ppSt (a,b) = prettyNTerm a $$ nest 3 (opSubterm <-> prettyNTerm b)`
     let pp_st = |small: &tamarin_term::lterm::LNTerm, big: &tamarin_term::lterm::LNTerm| {
-        Doc::text(pretty_lnterm(small)).above(
+        lnterm_doc(small).above(
             Doc::text("\u{228F}") // ⊏  (opSubterm)
-                .beside_sp(Doc::text(pretty_lnterm(big)))
+                .beside_sp(lnterm_doc(big))
                 .nest(3),
         )
     };
@@ -263,22 +275,20 @@ fn pretty_subterm_store(sys: &System) -> String {
     }
 
     // HS `vcat $ map combine [...]`.
-    vcat_render(sections)
+    vcat_doc(sections)
 }
 
-// Faithful port of Haskell `prettyEqStore` (EquationStore.hs:566-586).
+// Faithful port of Haskell `prettyEqStore` (EquationStore.hs:837-858).
 // Emits a leading `CONTRADICTORY` line when `eqsIsFalse`, then a `subst:`
 // section (`prettySubst (text.show) (text.show)`, i.e. `t <~ {vars}`
 // lines) and a `conj:` section whose disjuncts are `N.` followed by
 // `numbered'` of `∃ vars. a = b ∧ ...`.
 //
-// Known divergences (UI-only diagnostic pane, not raw `--prove` output):
-//   * terms rendered as flat `Doc::text` atoms (no Doc term printer in
-//     this crate), so over-wide terms aren't re-wrapped;
-//   * the `prettySubst` grouping uses Rust's derived `Ord` on terms for
-//     the `equivClasses` map iteration order, which may differ from
-//     Haskell's `Ord (VTerm c v)` in edge cases.
-fn pretty_eq_store(sys: &System) -> String {
+// Known divergence (UI-only diagnostic pane, not raw `--prove` output):
+// the `prettySubst` grouping uses Rust's derived `Ord` on terms for the
+// `equivClasses` map iteration order, which may differ from Haskell's
+// `Ord (VTerm c v)` in edge cases.
+fn pretty_eq_store(sys: &System) -> Doc {
     let eq = &sys.eq_store;
     let mut lines: Vec<Doc> = Vec::new();
 
@@ -296,7 +306,7 @@ fn pretty_eq_store(sys: &System) -> String {
     let disjs: Vec<Doc> = eq.conj.iter().map(pp_disj).collect();
     lines.push(combine("conj", vcat_doc(disjs)));
 
-    vcat_render(lines)
+    vcat_doc(lines)
 }
 
 // HS `ppDisj (idx, substs) = text (show idx ++ ".") <-> numbered' conjs`
@@ -333,7 +343,7 @@ fn pp_subst_vfresh(subst: &crate::tools::equation_store::LNSubstVFresh) -> Doc {
 fn pp_eq(a: &tamarin_term::lterm::LVar, b: &tamarin_term::vterm::VTerm<tamarin_term::lterm::Name, tamarin_term::lterm::LVar>) -> Doc {
     Doc::text(lvar_to_string(a)).above(
         Doc::text("=") // opEqual
-            .beside_sp(Doc::text(pretty_lnterm(b)))
+            .beside_sp(lnterm_doc(b))
             .nest(6),
     )
 }
@@ -358,8 +368,10 @@ fn pretty_subst_free(subst: &crate::tools::equation_store::LNSubst) -> Vec<Doc> 
         .into_iter()
         .map(|(t, vs)| {
             let vars: Vec<Doc> = vs.iter().map(|v| Doc::text(lvar_to_string(v))).collect();
-            // prettyTerm t <-> " <~ {" <> fsep (punctuate comma vars) <> "}"
-            Doc::text(pretty_lnterm(&t))
+            // prettyTerm ppLit t <-> " <~ {" <> fsep (punctuate comma vars) <> "}"
+            // (SubstVFree.hs:342-348) — the term is a real `prettyTerm` Doc,
+            // so an over-wide term wraps at the pane width exactly as HS.
+            lnterm_doc(&t)
                 .beside_sp(Doc::text(" <~ {")) // operator_ " <~ {"
                 .beside(fsep(punctuate(Doc::text(","), vars)))
                 .beside(Doc::text("}"))
@@ -377,11 +389,6 @@ fn intersperse(sep: Doc, xs: Vec<Doc>) -> Vec<Doc> {
         out.push(x);
     }
     out
-}
-
-// HS `vcat ds` of Docs, then render to a String.
-fn vcat_render(ds: Vec<Doc>) -> String {
-    vcat_doc(ds).render()
 }
 
 // HS `vcat ds`: fold with `$$` (above). Empty operands collapse, matching
@@ -405,7 +412,7 @@ fn vcat_doc(ds: Vec<Doc>) -> Doc {
 // literal double-quotes (HS `Show String`).  Goals are rendered through the
 // SAME faithful `prettyGoal` Doc the `--prove` proof tree uses
 // (`solve_goal_to_doc`), so fact spacing (`!KU( ~ltk )`) and LVar dots match.
-fn pretty_goals(sys: &System, want_solved: bool) -> String {
+fn pretty_goals(sys: &System, want_solved: bool) -> Doc {
     // `M.toList sGoals` yields Goal-Ord; RS stores goals in a Vec (creation
     // order), so sort by the solver's `goal_cmp` before rendering.
     let mut ordered: Vec<_> = sys.goals.iter()
@@ -413,7 +420,7 @@ fn pretty_goals(sys: &System, want_solved: bool) -> String {
         .collect();
     ordered.sort_by(|a, b|
         crate::constraint::solver::goals::goal_cmp(&a.0, &b.0));
-    let mut lines: Vec<String> = Vec::with_capacity(ordered.len());
+    let mut items: Vec<Doc> = Vec::with_capacity(ordered.len());
     for (g, st) in ordered {
         // sourceRule = HS `goalRule sys goal` → `nodeRuleSafe (goalNodeId g)`.
         // `goalNodeId` is the node of a Premise/Action goal; other goals have
@@ -429,17 +436,22 @@ fn pretty_goals(sys: &System, want_solved: bool) -> String {
         // `show useful` — HS wraps the annotation string in literal quotes.
         let useful = crate::constraint::solver::goals::goal_useful_annotation(
             g, st.looping, sys);
-        // HS `prettyGoal goal <-> lineComment_ (...)` — the `<->`/`<+>`
-        // operators each insert a single space (goal ` ` `//` ` ` text).
-        lines.push(format!(
-            "{} // nr: {}{}{}\"{}\"",
-            crate::pretty_theory::solve_goal_to_doc(g).render(),
+        // HS `prettyGoal goal <-> lineComment_ (...)` where `lineComment_ =
+        // lineComment . text` and `lineComment d = comment $ text "//" <-> d`
+        // (Pretty.hs:96-100).  The comment is PART of the goal's Doc, so its
+        // width participates in the goal's own layout decisions (a goal near
+        // the ribbon wraps because of its trailing comment, exactly as HS).
+        let comment = format!(
+            "nr: {}{}{}\"{}\"",
             st.nr, source_rule, loop_breaker, useful,
-        ));
+        );
+        items.push(
+            crate::pretty_theory::solve_goal_to_doc(g)
+                .beside_sp(Doc::text("//").beside_sp(Doc::text(comment))),
+        );
     }
-    // HS `vsep = foldr ($--$)`, and `$--$` inserts a BLANK line between
-    // adjacent goals (`d1 $-$ text "" $-$ d2`) — i.e. a double newline.
-    lines.join("\n\n")
+    // HS `vsep = foldr ($--$)` — a BLANK line between adjacent goals.
+    vsep_docs(items)
 }
 
 // ---------------------------------------------------------------------
@@ -554,7 +566,7 @@ mod tests {
             old_neg_subterms: vec![],
         };
         let sys = System { subterm_store: std::sync::Arc::new(st), ..Default::default() };
-        let out = pretty_subterm_store(&sys);
+        let out = pretty_subterm_store(&sys).render();
         // Contradictory header + all three numbered keyword sections.
         assert!(out.contains("Contradictory: yes"), "got:\n{out}");
         assert!(out.contains("Negative Subterms:"), "got:\n{out}");
@@ -573,11 +585,109 @@ mod tests {
         // An empty disjunction makes the store contradictory.
         eq.conj.push(EqDisj { split_id: SplitId(0), substs: vec![] });
         let sys = System { eq_store: std::sync::Arc::new(eq), ..Default::default() };
-        let out = pretty_eq_store(&sys);
+        let out = pretty_eq_store(&sys).render();
         assert!(out.contains("CONTRADICTORY"), "got:\n{out}");
         assert!(out.contains("subst:"), "got:\n{out}");
         assert!(out.contains("conj:"), "got:\n{out}");
         // The disjunction index is rendered with a trailing dot.
         assert!(out.contains("0."), "got:\n{out}");
+    }
+
+    // Minimized web-pane repro for task #20 (json shape): the UM_three_pass
+    // `/main/cases/raw/0/0` subst term `<'UM3', $A.5, $B.5, (<'1',…>++…)>
+    // <~ {t.1}` must wrap EXACTLY as HS's `prettyEqStore`→`prettySubst`→
+    // `prettyTerm` Doc does inside the `equations:`/`subst:` nesting under
+    // the web HtmlDoc width (100/67 with entity fill-widths).  Expected
+    // bytes extracted verbatim from the cached HS response for
+    // `examples/ake/dh/UM_three_pass.spthy` (`&nbsp;`→space, `<br/>`→\n,
+    // entities decoded, hl-spans stripped).  Before the pane rewrite RS
+    // rendered the whole term one-line (flat `pretty_lnterm` atom).
+    #[test]
+    fn um3_subst_term_wraps_like_hs() {
+        use tamarin_parser::ast as p;
+
+        let var = |name: &str, idx: u64, sort: p::SortHint| {
+            p::Term::Var(p::VarSpec {
+                name: name.to_string(),
+                idx,
+                sort,
+                typ: None,
+            })
+        };
+        let pube = |s: &str| p::Term::PubLit(s.to_string());
+        let app = |n: &str, args: Vec<p::Term>| p::Term::App(n.to_string(), args);
+        let pair = p::Term::Pair;
+        let exp = |l: p::Term, r: p::Term| {
+            p::Term::BinOp(p::BinOp::Exp, Box::new(l), Box::new(r))
+        };
+        let a5 = || var("A", 5, p::SortHint::Pub);
+        let b5 = || var("B", 5, p::SortHint::Pub);
+        let y5 = || var("Y", 5, p::SortHint::Msg);
+        let z5 = || var("z", 5, p::SortHint::Msg);
+        let ex5 = || var("ex", 5, p::SortHint::Fresh);
+        let g_ex5 = || exp(pube("g"), ex5());
+        let g_eax5 = || {
+            exp(
+                pube("g"),
+                p::Term::BinOp(
+                    p::BinOp::Mult,
+                    Box::new(var("ea", 5, p::SortHint::Fresh)),
+                    Box::new(var("x", 5, p::SortHint::Fresh)),
+                ),
+            )
+        };
+        let h_arg = || pair(vec![z5(), g_eax5(), a5(), b5(), g_ex5(), y5()]);
+        let mac = |snd: p::Term| {
+            app("MAC", vec![app("first", vec![app("h", vec![h_arg()])]), snd])
+        };
+        let t1 = pair(vec![pube("1"), g_ex5()]);
+        let t2 = pair(vec![
+            pube("2"),
+            y5(),
+            mac(pair(vec![pube("I"), a5(), b5(), g_ex5(), y5()])),
+        ]);
+        let t3 = pair(vec![
+            pube("3"),
+            mac(pair(vec![pube("R"), b5(), a5(), y5(), g_ex5()])),
+        ]);
+        let union = p::Term::BinOp(
+            p::BinOp::Union,
+            Box::new(p::Term::BinOp(p::BinOp::Union, Box::new(t1), Box::new(t2))),
+            Box::new(t3),
+        );
+        let term = pair(vec![pube("UM3"), a5(), b5(), union]);
+
+        // Build under the entity-width guard (HS HtmlDoc measures escaped
+        // widths at `text` time; RS captures fill widths at Doc build).
+        let _g = crate::pretty_hpj::HtmlEntityWidthGuard::enable();
+        // The `prettySubst` mapping line (SubstVFree.hs:342-348).
+        let line = crate::pretty_formula::term_doc(&term)
+            .beside_sp(Doc::text(" <~ {"))
+            .beside(fsep(punctuate(Doc::text(","), vec![Doc::text("t.1")])))
+            .beside(Doc::text("}"));
+        // Pane context: `combine ("equations", vcat [combine ("subst", …)])`
+        // — the mapping sits at nest 2+2 exactly as in `prettyEqStore`.
+        let doc = combine(
+            "equations",
+            vcat_doc(vec![combine("subst", vcat_doc(vec![line]))]),
+        );
+        let out = doc.render_with(100, 67);
+        let expected = "equations:\n  \
+subst:\n    \
+<'UM3', $A.5, $B.5, \n     \
+(<'1', 'g'^~ex.5>++\n      \
+<'2', Y.5, \n       \
+MAC(first(h(<z.5, 'g'^(~ea.5*~x.5), $A.5, $B.5, \n                    \
+'g'^~ex.5, Y.5>)),\n           \
+<'I', $A.5, $B.5, 'g'^~ex.5, Y.5>)\n      \
+>++\n      \
+<'3', \n       \
+MAC(first(h(<z.5, 'g'^(~ea.5*~x.5), $A.5, $B.5, \n                    \
+'g'^~ex.5, Y.5>)),\n           \
+<'R', $B.5, $A.5, Y.5, 'g'^~ex.5>)\n      \
+>\n     \
+)\n    \
+>  <~ {t.1}";
+        assert_eq!(out, expected, "got:\n{out}\nexpected:\n{expected}");
     }
 }

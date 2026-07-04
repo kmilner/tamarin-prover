@@ -322,7 +322,23 @@ fn title_for(entry: &crate::state::TheoryEntry, path: &path_parse::TheoryPath) -
                     .and_then(|ps| ps.get_root(lemma))
                     .and_then(|root| {
                         crate::handlers::proof_tree::navigate_at(&root, sub)
-                            .map(|n| crate::handlers::proof_tree::method_label(&n.method))
+                            .map(|n| {
+                                // HS `methodName` = `renderHtmlDoc .
+                                // prettyProofMethod` — the HtmlDoc LAYOUT
+                                // (100/67, entity fill-widths, col 0): a
+                                // long method title WRAPS at the same
+                                // positions as HS's (the gate collapses
+                                // the newline to a space; the break
+                                // position is what must match).
+                                let _guard = tamarin_theory::pretty_hpj
+                                    ::HtmlEntityWidthGuard::enable();
+                                tamarin_theory::pretty_theory
+                                    ::pretty_proof_method_doc(&n.method)
+                                    .render_with(
+                                        tamarin_theory::pretty_hpj::WEB_LINE_LENGTH,
+                                        tamarin_theory::pretty_hpj::WEB_RIBBON,
+                                    )
+                            })
                     })
                     .unwrap_or_else(|| "None".to_string());
                 // HS `methodName` = `renderHtmlDoc . prettyProofMethod` and

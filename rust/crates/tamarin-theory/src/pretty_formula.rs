@@ -188,6 +188,17 @@ pub fn pretty_guarded_doublequoted(g: &Guarded) -> String {
     Doc::text("\"").beside(doc).beside(Doc::text("\"")).render()
 }
 
+/// HS bare `prettyGuarded gf` (Guarded.hs:822-864) as a Doc — WITHOUT the
+/// lemma path's `doubleQuotes` wrap.  This is what
+/// `prettyNonGraphSystem` renders the `sFormulas` / `sLemmas` /
+/// `sSolvedFormulas` sections with (System.hs:1677/1680/1682), so the
+/// formula participates in the surrounding pane Doc and wraps at the
+/// pane's width/nesting exactly as in HS.
+pub(crate) fn guarded_doc(g: &Guarded) -> crate::pretty_hpj::Doc {
+    let mut state = avoid_precise_guarded(g);
+    guarded_to_doc(g, &[], &mut state)
+}
+
 /// Build the `pretty_hpj::Doc` for a `prettyGoal (DisjG (Disj gfs))`
 /// (Constraints.hs:276-277):
 ///   `fsep $ punctuate (operator_ "  ∥") (map (nest 1 . parens . prettyGuarded) gfs)`

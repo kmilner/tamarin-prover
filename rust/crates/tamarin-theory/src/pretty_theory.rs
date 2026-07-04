@@ -1680,7 +1680,7 @@ pub fn lnfact_to_parser(fa: &crate::fact::LNFact) -> p::Fact {
     }
 }
 
-fn lnterm_to_parser(t: &tamarin_term::lterm::LNTerm) -> p::Term {
+pub(crate) fn lnterm_to_parser(t: &tamarin_term::lterm::LNTerm) -> p::Term {
     use tamarin_term::function_symbols::{AcSym, FunSym};
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
@@ -2314,6 +2314,18 @@ pub fn pretty_proof_method_inline(
     m: &crate::constraint::solver::proof_method::ProofMethod,
 ) -> String {
     pp_step_doc(m, 0, "").render()
+}
+
+/// HS `prettyProofMethod m` as a Doc (ProofMethod.hs:1170-1186), for
+/// callers that lay the method out INSIDE a larger Doc context — the web
+/// "Applicable Proof Methods" list (`Web/Theory.hs:546` `numbered' $
+/// zipWith prettyPM [1..] pms`), where the `N. ` prefix beside-shift and
+/// the trailing `// expl` line comment both participate in the HughesPJ
+/// fill decisions.
+pub fn pretty_proof_method_doc(
+    m: &crate::constraint::solver::proof_method::ProofMethod,
+) -> crate::pretty_hpj::Doc {
+    pp_step_doc(m, 0, "")
 }
 
 /// Build the proof-step method as a `pretty_hpj::Doc`, mirroring

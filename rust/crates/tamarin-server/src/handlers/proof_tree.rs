@@ -683,23 +683,64 @@ fn write_applicable_methods(
     // for `internal-link` posts the URL via `server.handleJson` —
     // landing on our `/main/method/...` route which dispatches to
     // `apply_method_and_redirect` and returns a `{redirect}`.
+    // HS lays the whole list out as ONE HtmlDoc (`numbered' $ zipWith
+    // prettyPM [1..] pms`, Web/Theory.hs:546): each item is
+    // `flushRight nW (show i) <> ". " <> (link (prettyProofMethod m) <->
+    // lineComment_ expl)` — so the method text wraps (a) at HTML-ENTITY
+    // fill widths (renderHtmlDoc), (b) beside-shifted by the `N. ` prefix
+    // (nW+2 cols), and (c) with the trailing `// expl` comment
+    // participating in the last line's fits check.  Reproduce that layout
+    // per item: build the method Doc under the entity-width guard and lay
+    // it with `render_at(100, 67, nW+2)` (the beside-shift budget), then
+    // split the never-wrapped `<->`-joined comment back off to place the
+    // `</a>` boundary.  (Continuation-line indent bytes and the blank line
+    // `numbered'` inserts between items are whitespace the parity gate
+    // canonicalizes; the break POSITIONS are what must match.)
+    let nw = methods.len().to_string().len();
     for (i, (m, expl)) in methods.iter().enumerate() {
         let nr = i + 1;
-        // HS `prettyPM`: `link <-> (if null expl then emptyDoc else
-        // lineComment_ expl)` (`Web/Theory.hs:593-597`).  `<->` inserts one
-        // space; `lineComment_ s = comment (text "//" <+> text s)` → ` // s`.
-        let comment = if expl.is_empty() {
-            String::new()
+        let prefix = format!("{:>nw$}. ", nr);
+        let rendered = {
+            let _guard =
+                tamarin_theory::pretty_hpj::HtmlEntityWidthGuard::enable();
+            let label_doc =
+                tamarin_theory::pretty_theory::pretty_proof_method_doc(m);
+            let full_doc = if expl.is_empty() {
+                label_doc
+            } else {
+                // `<-> lineComment_ expl` = ` // <expl>` beside the last line.
+                label_doc.beside_sp(
+                    tamarin_theory::pretty_hpj::Doc::text("//")
+                        .beside_sp(tamarin_theory::pretty_hpj::Doc::text(
+                            expl.clone(),
+                        )),
+                )
+            };
+            full_doc.render_at(
+                tamarin_theory::pretty_hpj::WEB_LINE_LENGTH,
+                tamarin_theory::pretty_hpj::WEB_RIBBON,
+                prefix.chars().count(),
+            )
+        };
+        // The comment is a pure `<->` (Beside) chain — never wrapped — so
+        // it is exactly the trailing ` // {expl}` of the render.
+        let suffix = format!(" // {expl}");
+        let (label_txt, comment) = if !expl.is_empty() {
+            match rendered.strip_suffix(&suffix) {
+                Some(lbl) => (lbl.to_string(), format!(" // {}", html_escape(expl))),
+                None => (rendered.clone(), String::new()),
+            }
         } else {
-            format!(" // {}", html_escape(expl))
+            (rendered.clone(), String::new())
         };
         out.push_str(&format!(
-            "{nr}. <a class=\"internal-link proof-method\" href=\"/thy/trace/{idx}/main/method/{lemma}/{nr}{path}\">{label}</a>{comment}\n",
+            "{prefix}<a class=\"internal-link proof-method\" href=\"/thy/trace/{idx}/main/method/{lemma}/{nr}{path}\">{label}</a>{comment}\n",
+            prefix = prefix,
             nr = nr,
             idx = idx,
             lemma = url_path_escape(lemma),
             path = url_path,
-            label = html_escape(&method_label(m)),
+            label = html_escape(&label_txt),
             comment = comment,
         ));
     }

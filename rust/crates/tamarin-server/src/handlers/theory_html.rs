@@ -261,7 +261,7 @@ fn lemma_index(out: &mut String, entry: &TheoryEntry,
         Some(root) => {
             let cx = PpCtx { idx, lemma: &l.name, tq: l.trace_quantifier };
             let path: Vec<String> = Vec::new();
-            pp_prf(out, &cx, &path, &root);
+            pp_prf(out, &cx, &path, &root, 0);
         }
         None => {
             // No live proof state yet (lazily built): the lemma's root is a
@@ -313,33 +313,36 @@ fn interpret_color(tq: TraceQuantifier, status: ProofStatus) -> StepColor {
 }
 
 /// HS `prettyProofWith.ppPrf` / `ppCases` (`Theory/Proof.hs:1080-1096`):
-/// dispatch on the node's children shape.
-fn pp_prf(out: &mut String, cx: &PpCtx, path: &[String], node: &ProofNode) {
+/// dispatch on the node's children shape.  `depth` counts the named-case
+/// `nest 2` levels the subtree sits under (HS `ppCase`), which shifts the
+/// method text's wrap budget — see `pp_step`.
+fn pp_prf(out: &mut String, cx: &PpCtx, path: &[String], node: &ProofNode, depth: usize) {
     let children = &node.children;
     if children.is_empty() {
         // `ppCases ps@(Finished Solved) [] = prettyStep ps` (SOLVED leaf,
         // no `by`); every other leaf is `prettyCase ps (kwBy<>" ") <> step`.
-        if !matches!(node.method, ProofMethod::Finished(MethodResult::Solved)) {
+        let by = !matches!(node.method, ProofMethod::Finished(MethodResult::Solved));
+        if by {
             out.push_str("by ");
         }
-        pp_step(out, cx, path, node);
+        pp_step(out, cx, path, node, depth, by);
     } else if children.len() == 1 && children.contains_key("") {
         // `ppCases ps [("", prf)] = prettyStep ps $-$ ppPrf prf` — single
         // unnamed continuation, no `case` label.
-        pp_step(out, cx, path, node);
+        pp_step(out, cx, path, node, depth, false);
         out.push_str("<br>\n");
         let mut child_path = path.to_vec();
         child_path.push(String::new());
-        pp_prf(out, cx, &child_path, &children[""]);
+        pp_prf(out, cx, &child_path, &children[""], depth);
     } else {
         // `ppCases ps cases = prettyStep ps $-$
         //    (vcat $ intersperse (prettyCase ps kwNext) $ map ppCase cases)
         //    $-$ prettyCase ps kwQED`.
-        pp_step(out, cx, path, node);
+        pp_step(out, cx, path, node, depth, false);
         out.push_str("<br>\n");
         for (i, (name, child)) in children.iter().enumerate() {
             if i > 0 { out.push_str("next<br>\n"); }
-            pp_case(out, cx, path, name, child);
+            pp_case(out, cx, path, name, child, depth);
         }
         out.push_str("qed");
     }
@@ -348,12 +351,14 @@ fn pp_prf(out: &mut String, cx: &PpCtx, path: &[String], node: &ProofNode) {
 /// HS `prettyProofWith.ppCase` (`Theory/Proof.hs:1094-1096`):
 /// `nest 2 $ (prettyCase (root prf) (kwCase <-> name)) $-$ ppPrf prf`.  The
 /// `case <name>` keyword is wrapped by HS in `markStatus`, a `hl_*` span the
-/// normalizer unwraps, so we emit it plain.
-fn pp_case(out: &mut String, cx: &PpCtx, path: &[String], name: &str, child: &ProofNode) {
+/// normalizer unwraps, so we emit it plain.  Each named case adds one
+/// `nest 2` level for the whole subtree.
+fn pp_case(out: &mut String, cx: &PpCtx, path: &[String], name: &str, child: &ProofNode,
+           depth: usize) {
     out.push_str(&format!("case {}<br>\n", html_escape(name)));
     let mut child_path = path.to_vec();
     child_path.push(name.to_string());
-    pp_prf(out, cx, &child_path, child);
+    pp_prf(out, cx, &child_path, child, depth + 1);
     out.push_str("<br>\n");
 }
 
@@ -362,8 +367,36 @@ fn pp_case(out: &mut String, cx: &PpCtx, path: &[String], name: &str, child: &Pr
 /// `Sorry`) an empty `remove-step` link at the same path.  An unannotated
 /// step (HS `psInfo == Nothing`) renders as a plain `hl_superfluous` span with
 /// no link.
-fn pp_step(out: &mut String, cx: &PpCtx, path: &[String], node: &ProofNode) {
-    let label = html_escape(&crate::handlers::proof_tree::method_label(&node.method));
+///
+/// The method text is `prettyProofMethod` laid out INSIDE the tree Doc
+/// (`prettyProofWith`) by HS: at `nest (2*depth)` (one `nest 2` per named
+/// case), with the leaf's `by ` prefix beside it, at the HtmlDoc width
+/// (100/67, entity fill-widths).  Reproduce that layout exactly by
+/// rendering `nest (2·depth) ("by "? <> method)` under the entity guard,
+/// then stripping the indent/`by ` back off the first line (the `<a>`
+/// wraps only the method text; continuation-line whitespace is
+/// canonicalized by the gate, break positions are what must match).
+fn pp_step(out: &mut String, cx: &PpCtx, path: &[String], node: &ProofNode,
+           depth: usize, by_prefix: bool) {
+    use tamarin_theory::pretty_hpj::{Doc, HtmlEntityWidthGuard, WEB_LINE_LENGTH, WEB_RIBBON};
+    let rendered = {
+        let _guard = HtmlEntityWidthGuard::enable();
+        let mut doc =
+            tamarin_theory::pretty_theory::pretty_proof_method_doc(&node.method);
+        if by_prefix {
+            doc = Doc::text("by ").beside(doc);
+        }
+        doc.nest((2 * depth) as isize)
+            .render_with(WEB_LINE_LENGTH, WEB_RIBBON)
+    };
+    // First line carries the nest indent (and the `by ` the caller already
+    // emitted); strip both so the label starts at the method text.
+    let mut label_txt: &str = &rendered;
+    label_txt = label_txt.trim_start_matches(' ');
+    if by_prefix {
+        label_txt = label_txt.strip_prefix("by ").unwrap_or(label_txt);
+    }
+    let label = html_escape(label_txt);
     if !node.annotated {
         // `superfluousStep = withTag "span" [("class","hl_superfluous")] ppMethod`.
         out.push_str(&format!("<span class=\"hl_superfluous\">{}</span>", label));
@@ -682,6 +715,10 @@ fn pp_with_header(out: &mut String, header: &str, body: &str) {
 /// HS `messageSnippet` (Web/Theory.hs:920-931): Signature +
 /// Construction/Deconstruction rule sections.
 fn message_html(entry: &TheoryEntry) -> String {
+    // HS renders `messageSnippet` through `HtmlDoc` (same `pp` dispatch as
+    // `rulesSnippet`, Web/Theory.hs:1014-1015) — entity fill-widths; see
+    // `rules_html`.
+    let _html_width = tamarin_theory::pretty_hpj::HtmlEntityWidthGuard::enable();
     // `prettySignatureWithMaude thy._thySignature` — the same signature block
     // the theory body prints.
     let sig_block = tamarin_theory::pretty_theory::web_signature_block(
@@ -734,6 +771,14 @@ fn show_inj_fact(
 
 /// HS `rulesSnippet` (Web/Theory.hs:887-917).
 fn rules_html(entry: &TheoryEntry) -> String {
+    // HS renders `rulesSnippet` through the `HtmlDoc` transformer
+    // (`HtmlDocument d => ClosedTheory -> d`, Web/Theory.hs:887, laid out by
+    // `renderHtmlDoc`), so the HughesPJ fill measures `<`/`>`/`'` at their
+    // escaped-entity widths when wrapping rule facts — same accounting as
+    // the sequent pane (`pretty_non_graph_system`).  Enable the guard for
+    // the whole pane build; the batch `--prove` theory printer calls the
+    // same renderers WITHOUT the guard and is unaffected (thread-local).
+    let _html_width = tamarin_theory::pretty_hpj::HtmlEntityWidthGuard::enable();
     let mut out = String::new();
     // HS `rulesSnippet`'s FIRST `ppWithHeader "Macros" (prettyMacros ...)` —
     // emitted only when the theory declares macros (`theoryMacros thy`
@@ -790,6 +835,10 @@ fn rules_html(entry: &TheoryEntry) -> String {
 /// `TheorySource kind _ _` renders the whole `getSource kind thy` list); they
 /// only address the per-case interactive graph.
 fn sources_html(entry: &TheoryEntry, kind: &SourceKind) -> String {
+    // HS renders `reqCasesSnippet` through `HtmlDoc` (Web/Theory.hs:1016) —
+    // entity fill-widths for the goal headers; the per-case sequent panes go
+    // through `pretty_non_graph_system`, which scopes its own guard.
+    let _html_width = tamarin_theory::pretty_hpj::HtmlEntityWidthGuard::enable();
     let mut out = String::new();
     let (kind_str, want_refined) = match kind {
         SourceKind::Raw => ("raw", false),

@@ -77,6 +77,7 @@ use std::fmt::Write as _;
 use tamarin_theory::constraint::constraints::{LessAtom, NodeId, Reason};
 use tamarin_theory::constraint::system::System;
 use tamarin_theory::fact::{FactTag, LNFact};
+use tamarin_theory::pretty_hpj::{self, Doc, WEB_LINE_LENGTH, WEB_RIBBON};
 use tamarin_theory::rule::{
     rule_name_string, IntrRuleACInfo, ProtoRuleName, RuleACInst, RuleInfo,
 };
@@ -523,55 +524,60 @@ impl DotBuilder {
             let lbl = if outgoing {
                 format!("{} : {}", nid, rule_case_name(ru))
             } else {
-                rule_label_body(nid, ru, opts)
+                // HS `concatMap snd as` (Dot.hs:302) — `as` is the
+                // `renderRow`-rendered rule label, i.e. the SAME
+                // `renderBalanced` single-doc row (width 130) the record
+                // mid row uses.  No `fixMultiLineLabel` here: this label
+                // goes through plain `mkSimpleNode` → `D.node` → `showAttr`
+                // (spaces stay spaces; `\n` → `\l` via `escape_dot_label`).
+                render_balanced(vec![rule_label_doc(nid, ru, opts)])
+                    .pop()
+                    .unwrap_or_default()
             };
             let _ = writeln!(self.buf,
                 "  {} [label=\"{}\",shape=ellipse];",
                 id, escape_dot_label(&lbl));
             return;
         }
-        // Build prems / acts / concs rows.
-        let prems = enumerate_label_row(&ru.premises, "p");
-        let concs = enumerate_label_row(&ru.conclusions, "c");
-        // HS `ruleLabelM`: `prettyNodeId v <-> colon <-> showDotRuleCaseName`
-        // (Dot.hs:336-337). `prettyNodeId = text . show` (LTerm.hs:849), so the
-        // id renders as `show v` (e.g. `#i` / `#i.2`) via `Display for LVar`.
-        // NOTE: `header` (and the `acts` below) are kept RAW here; the whole
-        // `mid` record field is escaped exactly once by `escape_dot` at the
-        // `sections.push` below.  Escaping here too would double-escape record
-        // metacharacters (a pair term's `<…>` → `\<…\>` → `\\\<…\\\>`).
-        let header = format!("{} : {}", nid, rule_case_name(ru));
-        // HS `ruleLabelM` filters the action facts before rendering
-        // (Dot.hs:330-354): always drop the synthetic `Diff<rulename>`
-        // annotation, and — only when `goShowAutoSource` is set — drop the
-        // `AUTO_{IN,OUT}_{TERM,FACT}_*` auto-source labels.
-        let acts: Vec<&LNFact> = ru.actions.iter()
-            .filter(|fa| is_not_diff_annotation(ru, fa))
-            .filter(|fa| !opts.show_auto_source || !is_auto_source(fa))
-            .collect();
-        let mid = if acts.is_empty() {
-            header.clone()
-        } else {
-            let acts: Vec<String> = acts.iter()
-                .map(|fa| format_fact(fa))
-                .collect();
-            // HS `ruleLabelM` joins the action bracket with `<>` (Dot.hs:338),
-            // i.e. NO space before `[` (`name[acts]`), unlike the space-separated
-            // `<->` used for `id : name`.  Kept RAW — escaped once at the
-            // `sections.push(escape_dot(&mid))` below (see the header note).
-            format!("{}[{}]", header, acts.join(", "))
-        };
-        // Record label: `{ prems | mid | concs }`.  When a section is
-        // empty we omit it to avoid a stray `|`.
-        let mut sections = Vec::new();
-        if !prems.is_empty() {
-            sections.push(format!("{{ {} }}", prems));
+        // Build prems / acts / concs rows as Docs, then lay each row out with
+        // HS `renderRow`/`renderBalanced` (Dot.hs:357-379): every field of a
+        // row is rendered at a width proportional to its one-line length
+        // (total 100, `max 30 . round . (*1.3)`), NOT at the page width.
+        let prem_docs: Vec<Doc> = ru.premises.iter().map(fact_doc_of).collect();
+        let conc_docs: Vec<Doc> = ru.conclusions.iter().map(fact_doc_of).collect();
+        let ps = render_balanced(prem_docs);
+        let mid = render_balanced(vec![rule_label_doc(nid, ru, opts)])
+            .pop()
+            .unwrap_or_default();
+        let cs = render_balanced(conc_docs);
+        // Record label — HS `D.vcat $ map D.hcat $ … $ filter (not . null)
+        // [ps, as, cs]` (Dot.hs:310-312) rendered by `Text.Dot.renderRecord`
+        // (Text/Dot.hs:254-280): the outer VCat renders as `{row|row|row}`,
+        // each row (HCat) as `{field|field}`, each ported field as
+        // `<port> text`.  Field text goes through `fixMultiLineLabel`
+        // (mkField, Text/Dot.hs:378-381: leading spaces → `&nbsp;`, plus a
+        // trailing newline via `unlines` when multi-line) and the
+        // record-metachar escape (`| { } < >`, Text/Dot.hs:273-280).  The
+        // remaining newlines become `\l` at the attribute level
+        // (`showAttr`, Text/Dot.hs:346-353) via `escape_dot_label`.
+        let mut rows: Vec<String> = Vec::new();
+        if !ps.is_empty() {
+            rows.push(format!("{{{}}}", ps.iter().enumerate()
+                .map(|(i, s)| format!(
+                    "<p{}> {}", i, escape_record_field(&fix_multi_line_label(s))))
+                .collect::<Vec<_>>()
+                .join("|")));
         }
-        sections.push(escape_dot(&mid).to_string());
-        if !concs.is_empty() {
-            sections.push(format!("{{ {} }}", concs));
+        rows.push(format!("{{{}}}",
+            escape_record_field(&fix_multi_line_label(&mid))));
+        if !cs.is_empty() {
+            rows.push(format!("{{{}}}", cs.iter().enumerate()
+                .map(|(i, s)| format!(
+                    "<c{}> {}", i, escape_record_field(&fix_multi_line_label(s))))
+                .collect::<Vec<_>>()
+                .join("|")));
         }
-        let lbl = sections.join(" | ");
+        let lbl = escape_dot_label(&format!("{{{}}}", rows.join("|")));
         let color = rule_fillcolor(ru, manual_color, color_map);
         // HS `dotNodeCompact` record `attrs` (Dot.hs:257-259) also carry a
         // `fontcolor` and a `role`. The `fontcolor` keys off the PALETTE colour
@@ -595,28 +601,32 @@ impl DotBuilder {
         // so clustered SAPIC graphs keep `shape=record` (not the ellipse default).
         let _ = writeln!(self.buf,
             "  {} [shape=record,label=\"{}\",style=\"filled\",fillcolor=\"{}\",fontcolor=\"{}\",role=\"{}\"];",
-            id, lbl, color, fontcolor, escape_dot(role));
+            id, lbl, color, fontcolor, escape_dot_label(role));
     }
     fn action_node(&mut self, id: &str, nid: &LVar, facts: &[LNFact]) {
-        let mut s = facts.iter()
-            .map(format_fact)
-            .collect::<Vec<_>>()
-            .join(", ");
-        // HS `lblPre <-> opAction <-> text (show v)` (Dot.hs:269):
-        // `opAction = operator_ "@"`, `<->` is space-joined, and `show v`
-        // renders via `Display for LVar` (e.g. `#i` / `#i.2`).
-        let _ = write!(s, " @ {}", nid);
+        // HS `lblPre <- fsep <$> punctuate comma <$> mapM renderLNFact facts;
+        // lbl = lblPre <-> opAction <-> text (show v); mkSimpleNode (render
+        // lbl) attrs` (Dot.hs:267-272): the WHOLE label is ONE Doc — the
+        // facts fill-wrap as a paragraph — rendered by the default-style
+        // `render` (HughesPJ `style`: lineLength 100, ribbon 67), NOT one
+        // fact at a time.  `opAction = operator_ "@"`, `<->` is space-joined,
+        // and `show v` renders via `Display for LVar` (e.g. `#i` / `#i.2`).
+        let fact_docs: Vec<Doc> = facts.iter().map(fact_doc_of).collect();
+        let s = pretty_hpj::fsep(pretty_hpj::punctuate(Doc::text(","), fact_docs))
+            .beside_sp(Doc::text("@"))
+            .beside_sp(Doc::text(nid.to_string()))
+            .render_with(WEB_LINE_LENGTH, WEB_RIBBON);
         let color = if facts.iter().any(|f| matches!(f.tag, FactTag::Ku)) {
             "gray"
         } else { "darkblue" };
         // HS renders a loose action node via `mkSimpleNode (render lbl) attrs`
         // = plain `D.node [("label", …), ("shape","ellipse")]` (Dot.hs:267-272,
         // 289-290), NOT `D.record`.  A plain node label is a quoted string whose
-        // only metacharacters are `"` and newline (`escape_dot_label`); the
-        // record metacharacters `{ } | < >` are LITERAL, so a tuple `<A, B, …>`
-        // in a goal fact must stay `<…>` and NOT be `\<…\>`-escaped (only the
-        // `SystemNode`/`D.record` path escapes them). Using `escape_dot` here
-        // leaked record escaping onto ellipse labels (task #17 family B).
+        // only metacharacters are `"` and newline (`escape_dot_label` =
+        // `showAttr`, Text/Dot.hs:346-353); the record metacharacters
+        // `{ } | < >` are LITERAL, so a tuple `<A, B, …>` in a goal fact must
+        // stay `<…>` and NOT be `\<…\>`-escaped (only the `SystemNode`/
+        // `D.record` path escapes them — task #17 family B).
         let _ = writeln!(self.buf,
             "  {} [shape=ellipse,label=\"{}\",color=\"{}\"];",
             id, escape_dot_label(&s), color);
@@ -688,7 +698,7 @@ impl DotBuilder {
         let _ = writeln!(self.buf, "  subgraph cluster_{} {{", idx);
         let _ = writeln!(self.buf, "    nodesep=\"0.6\";");
         let _ = writeln!(self.buf, "    ranksep=\"0.6\";");
-        let _ = writeln!(self.buf, "    label=\"{}\";", escape_dot(name));
+        let _ = writeln!(self.buf, "    label=\"{}\";", escape_dot_label(name));
         let _ = writeln!(self.buf, "    style=\"filled\";");
         let _ = writeln!(self.buf, "    color=\"{}\";", color);
         let _ = writeln!(self.buf, "    penwidth=\"2\";");
@@ -856,15 +866,7 @@ fn dot_html_escape(s: &str) -> String {
     out
 }
 
-fn enumerate_label_row(facts: &[LNFact], port_prefix: &str) -> String {
-    facts.iter().enumerate()
-        .map(|(i, fa)| format!("<{}{}> {}",
-            port_prefix, i, escape_dot(&format_fact(fa))))
-        .collect::<Vec<_>>()
-        .join(" | ")
-}
-
-/// Render an `LNFact` exactly as Haskell `renderLNFact = render .
+/// The `Doc` of an `LNFact` exactly as Haskell `renderLNFact =
 /// prettyLNFact` (Dot.hs:225-233, Fact.hs:551).  `prettyLNFact` builds the
 /// argument list with `nestShort' (n++"(") ")" . fsep . punctuate comma`
 /// (Fact.hs:539-546), which — unlike a bare `name(a, b)` — emits the
@@ -872,13 +874,105 @@ fn enumerate_label_row(facts: &[LNFact], port_prefix: &str) -> String {
 /// We therefore reuse the *same* faithful `Doc` path the proof pretty-
 /// printer uses for goals (`solve_goal_to_doc` → `pretty_formula::fact_doc`
 /// on the parser-AST projection), NOT `pretty_system::pretty_fact` (which
-/// omits those spaces).  `.render()` uses the process-global display width
-/// (set to the web width in `serve`), matching HS's default `render`.
-fn format_fact(fa: &LNFact) -> String {
+/// omits those spaces).
+fn fact_doc_of(fa: &LNFact) -> Doc {
     tamarin_theory::pretty_formula::fact_doc(
         &tamarin_theory::pretty_theory::lnfact_to_parser(fa),
     )
-    .render()
+}
+
+/// Haskell `round :: Double -> Int` — IEEE round-half-to-EVEN (banker's
+/// rounding), unlike Rust's `f64::round` (half-away-from-zero).  The
+/// balanced widths (`conv = max 30 . round . (*1.3)`), the ribbon
+/// (`round (w / 1.5)` in `fullRender`) and `scaleIndent`'s space count all
+/// go through HS `round`, and half cases DO occur (e.g. `130/1.5 =
+/// 86.66→87`, `1.5*23 = 34.5→34`).
+fn round_half_even(x: f64) -> i64 {
+    let f = x.floor();
+    let diff = x - f;
+    if diff > 0.5 {
+        f as i64 + 1
+    } else if diff < 0.5 {
+        f as i64
+    } else {
+        let fi = f as i64;
+        if fi % 2 == 0 { fi } else { fi + 1 }
+    }
+}
+
+/// HS `renderBalanced 100 (max 30 . round . (*1.3))` + `scaleIndent`
+/// (Dot.hs:357-379), the layout engine for record-row fields: each doc of
+/// a row is rendered at a line length PROPORTIONAL to its one-line length
+/// (`renderStyle (defaultStyle { lineLength = w })`, i.e. PageMode with
+/// ribbon `round (w / 1.5)`), so a lone fact in a row gets width
+/// `max 30 (round 130) = 130` (ribbon 87) while four facts share the
+/// 100-column budget.  `usedWidths` measure the OneLineMode render
+/// (`Doc::one_line_render`), which turns every fill/sep break point into
+/// one space.
+///
+/// `scaleIndent` is applied to the WHOLE rendered string (HS's `line`
+/// binding spans the full render): `span isSpace` therefore only rescales
+/// whitespace at the very START of the FIRST line — a no-op for every
+/// label whose first char is text, exactly as in HS.
+fn render_balanced(docs: Vec<Doc>) -> Vec<String> {
+    if docs.is_empty() {
+        return Vec::new();
+    }
+    let used: Vec<f64> = docs.iter()
+        .map(|d| d.one_line_render().chars().count() as f64)
+        .collect();
+    let total: f64 = used.iter().sum();
+    let ratio = 100.0 / total;
+    docs.into_iter()
+        .zip(used)
+        .map(|(d, u)| {
+            // conv (ratio * w) with conv = max 30 . round . (*1.3).
+            let w = std::cmp::max(30, round_half_even((ratio * u) * 1.3));
+            // `renderStyle (defaultStyle { lineLength = w })` keeps
+            // ribbonsPerLine = 1.5 → ribbon = round (w / 1.5)
+            // (pretty-1.1.3.6 `fullRender`).
+            let ribbon = round_half_even(w as f64 / 1.5);
+            scale_indent(d.render_with(w as usize, ribbon as usize))
+        })
+        .collect()
+}
+
+/// HS `scaleIndent` (Dot.hs:375-379) — see `render_balanced`.
+fn scale_indent(s: String) -> String {
+    let leading = s.chars().take_while(|c| c.is_whitespace()).count();
+    if leading == 0 {
+        return s;
+    }
+    let rest: String = s.chars().skip(leading).collect();
+    let n = round_half_even(1.5 * leading as f64);
+    let mut out = String::with_capacity(n as usize + rest.len());
+    for _ in 0..n {
+        out.push(' ');
+    }
+    out.push_str(&rest);
+    out
+}
+
+/// HS `fixMultiLineLabel` (Text/Dot.hs:355-363), applied to every record
+/// FIELD by the `mkField` smart constructor (Text/Dot.hs:378-381): a
+/// multi-line label has each line's leading spaces replaced 1:1 by
+/// `&nbsp;` and is re-joined with `unlines` — which appends a TRAILING
+/// newline (→ a trailing `\l` after `showAttr`).  Single-line labels pass
+/// through untouched.
+fn fix_multi_line_label(lbl: &str) -> String {
+    if !lbl.contains('\n') {
+        return lbl.to_string();
+    }
+    let mut out = String::with_capacity(lbl.len() + 8);
+    for line in lbl.split('\n') {
+        let leading = line.chars().take_while(|c| c.is_whitespace()).count();
+        for _ in 0..leading {
+            out.push_str("&nbsp;");
+        }
+        out.extend(line.chars().skip(leading));
+        out.push('\n');
+    }
+    out
 }
 
 /// Mirror Haskell `ruleLabelM.isNotDiffAnnotation` (Dot.hs:341): the action
@@ -926,24 +1020,35 @@ fn is_intruder_or_fresh(ru: &RuleACInst) -> bool {
     }
 }
 
-/// Build the rule-node label body — HS `ruleLabelM` (Dot.hs:330-338):
+/// Build the rule-node label Doc — HS `ruleLabelM` (Dot.hs:330-338):
 /// `prettyNodeId v <-> colon <-> text (showDotRuleCaseName ru) <> (if null lbl
 /// then mempty else brackets (vcat (punctuate comma lbl)))`. `<->` is
 /// space-separated (`#i : name`) but the action bracket is joined with `<>`
-/// (NO space before `[`). Actions are filtered exactly as the record mid row
-/// (`is_not_diff_annotation`; drop `AUTO_*` only when `goShowAutoSource`).
-/// Returns RAW (un-dot-escaped) text; the caller escapes it.
-fn rule_label_body(nid: &LVar, ru: &RuleACInst, opts: &GraphOptions) -> String {
-    let acts: Vec<String> = ru.actions.iter()
+/// (NO space before `[`), and the actions stack VERTICALLY (`vcat`,
+/// comma-punctuated) when there are several. Actions are filtered exactly
+/// as HS (`is_not_diff_annotation`; drop `AUTO_*` only when
+/// `goShowAutoSource`).  The caller lays this Doc out via
+/// `render_balanced` (HS `asM = renderRow [(Nothing, ruleLabel)]`,
+/// Dot.hs:320-322 — a single-doc row, i.e. width 130 / ribbon 87).
+fn rule_label_doc(nid: &LVar, ru: &RuleACInst, opts: &GraphOptions) -> Doc {
+    let act_docs: Vec<Doc> = ru.actions.iter()
         .filter(|fa| is_not_diff_annotation(ru, fa))
         .filter(|fa| !opts.show_auto_source || !is_auto_source(fa))
-        .map(format_fact)
+        .map(fact_doc_of)
         .collect();
-    let name = rule_case_name(ru);
-    if acts.is_empty() {
-        format!("{} : {}", nid, name)
+    // `prettyNodeId v <-> colon <-> text name` — three same-line text
+    // tokens joined by single spaces; layout-equivalent to one fused text
+    // run of the same width (no break points inside a `<>`/`<+>` chain).
+    let header = Doc::text(format!("{} : {}", nid, rule_case_name(ru)));
+    if act_docs.is_empty() {
+        header
     } else {
-        format!("{} : {}[{}]", nid, name, acts.join(", "))
+        // `brackets (vcat $ punctuate comma lbl)` (Dot.hs:338).
+        header
+            .beside(Doc::text("["))
+            .beside(pretty_hpj::vcat(pretty_hpj::punctuate(
+                Doc::text(","), act_docs)))
+            .beside(Doc::text("]"))
     }
 }
 
@@ -1313,31 +1418,32 @@ fn role_color(name: &str) -> String {
         chan(rgb.r), chan(rgb.g), chan(rgb.b), alpha)
 }
 
-fn escape_dot(s: &str) -> String {
-    // Escape `"`, `\`, `{`, `}`, `|`, `<`, `>`, and newline for the
-    // Graphviz record string syntax.
+/// Escape a record FIELD's text, mirroring HS `Text.Dot.renderRecord`'s
+/// `escape` (Text/Dot.hs:273-280): exactly the record metacharacters
+/// `| { } < >` get a backslash — NOT `"` / `\` / newline, which are handled
+/// once at the attribute level by `showAttr` (see `escape_dot_label`).
+fn escape_record_field(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
-            '"'  => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '{'  => out.push_str("\\{"),
-            '}'  => out.push_str("\\}"),
-            '|'  => out.push_str("\\|"),
-            '<'  => out.push_str("\\<"),
-            '>'  => out.push_str("\\>"),
-            '\n' => out.push_str("\\n"),
-            _    => out.push(c),
+            '|' => out.push_str("\\|"),
+            '{' => out.push_str("\\{"),
+            '}' => out.push_str("\\}"),
+            '<' => out.push_str("\\<"),
+            '>' => out.push_str("\\>"),
+            _   => out.push(c),
         }
     }
     out
 }
 
-/// Escape a PLAIN (non-record) Graphviz node-label value, mirroring HS
-/// `Text.Dot.showAttr` (Dot.hs:346-353): only `"` (→ `\"`) and newline
-/// (→ `\l`) are escaped — the record metacharacters `{ } | < >` are NOT, since
-/// a `shape=ellipse` label is a plain quoted string, not record syntax. This is
-/// deliberately distinct from `escape_dot` (which targets record-field text).
+/// Escape a Graphviz attribute VALUE, mirroring HS `Text.Dot.showAttr`
+/// (Text/Dot.hs:346-353): only `"` (→ `\"`) and newline (→ `\l`, graphviz's
+/// left-justified line break) are escaped.  This is the LAST escaping pass
+/// for every label — plain ellipse labels (where record metacharacters
+/// `{ } | < >` must stay literal) and record labels (whose field text was
+/// already record-escaped by `escape_record_field`) alike.  Emitting `\n`
+/// instead of `\l` here was task #20's dominant DOT divergence.
 fn escape_dot_label(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -1392,6 +1498,83 @@ mod tests {
         assert!(s.contains("Setup"));
         assert!(s.contains("Fr"));
         assert!(s.contains("Out"));
+    }
+
+    // Minimized web-parity repro for task #20 (dot shape): the premise /
+    // conclusion rows of OIDC_Implicit's `Browser_Redirects_To_URI` record
+    // node must be laid out by HS `renderRow`/`renderBalanced`
+    // (Dot.hs:357-379) — each field at width `max 30 (round (1.3 * 100 *
+    // oneLineLen/sumLens))`, ribbon `round (w/1.5)` — NOT at the page width.
+    // Expected bytes extracted verbatim from the cached HS response for
+    // `/thy/trace/…/interactive-graph-def/proof/Nonce_Sources/…` on
+    // `examples/asiaccs20-POIDC/OIDC_Implicit.spthy` (`\l`→`\n`,
+    // `&nbsp;`→space, record escapes undone).
+    #[test]
+    fn render_balanced_matches_hs_oidc_rows() {
+        use tamarin_theory::fact::{proto_fact, Multiplicity};
+        use tamarin_term::builtin::pair;
+        use tamarin_term::lterm::{pub_term, LSort, LVar};
+        use tamarin_term::vterm::var_term;
+
+        let mv = |n: &str| var_term(LVar::new(n, LSort::Msg, 0));
+        let pv = |n: &str| var_term(LVar::new(n, LSort::Pub, 0));
+        // <'id_token', <'iss', iss>, <'sub', sub>, <'aud', aud>, 'nonce', nonce>
+        let inner = || {
+            pair(
+                pub_term("id_token"),
+                pair(
+                    pair(pub_term("iss"), mv("iss")),
+                    pair(
+                        pair(pub_term("sub"), mv("sub")),
+                        pair(
+                            pair(pub_term("aud"), mv("aud")),
+                            pair(pub_term("nonce"), mv("nonce")),
+                        ),
+                    ),
+                ),
+            )
+        };
+        // <RE1, $uri, AU1, <inner>, sig>
+        let big = pair(
+            mv("RE1"),
+            pair(pv("uri"), pair(mv("AU1"), pair(inner(), mv("sig")))),
+        );
+        let f1 = proto_fact(Multiplicity::Persistent, "Server_to_Client_TLS",
+            vec![pv("Server1"), mv("BR1"), big]);
+        let f2 = proto_fact(Multiplicity::Persistent, "St_Browser_Session",
+            vec![mv("BR2"), pv("Server1"), mv("BR1")]);
+        let f3 = proto_fact(Multiplicity::Persistent, "St_Browser_Session",
+            vec![mv("BR2"), pv("Server"), mv("BR3")]);
+        let f4 = proto_fact(Multiplicity::Persistent, "Uri_belongs_to",
+            vec![pv("uri"), pv("Server")]);
+
+        // The 4-premise row: widths proportional to one-line lengths.
+        let sp = |n: usize| " ".repeat(n);
+        let rows = render_balanced(
+            [&f1, &f2, &f3, &f4].iter().map(|f| fact_doc_of(f)).collect());
+        assert_eq!(rows[0], format!(
+            "!Server_to_Client_TLS( $Server1, BR1,\n{}<RE1, $uri, AU1, \n{}<'id_token', <'iss', iss>, <'sub', sub>, \n{}<'aud', aud>, 'nonce', nonce>, \n{}sig>\n)",
+            sp(23), sp(24), sp(25), sp(24)), "row 0:\n{}", rows[0]);
+        assert_eq!(rows[1], format!(
+            "!St_Browser_Session( BR2,\n{}$Server1,\n{}BR1\n)",
+            sp(21), sp(21)), "row 1:\n{}", rows[1]);
+        assert_eq!(rows[2], format!(
+            "!St_Browser_Session( BR2,\n{}$Server,\n{}BR3\n)",
+            sp(21), sp(21)), "row 2:\n{}", rows[2]);
+        assert_eq!(rows[3], format!(
+            "!Uri_belongs_to( $uri,\n{}$Server\n)",
+            sp(17)), "row 3:\n{}", rows[3]);
+
+        // The single-fact conclusion row: w = max 30 (round 130) = 130,
+        // ribbon = round(130/1.5) = 87 — the 82-col pair fits ONE line
+        // (at the page width 100/67 it would split like the premise row).
+        let conc = proto_fact(Multiplicity::Persistent, "Client_to_Server_TLS",
+            vec![mv("BR3"), pv("Server"),
+                 pair(mv("AU1"), pair(inner(), mv("sig")))]);
+        let crow = render_balanced(vec![fact_doc_of(&conc)]);
+        assert_eq!(crow[0], format!(
+            "!Client_to_Server_TLS( BR3, $Server,\n{}<AU1, <'id_token', <'iss', iss>, <'sub', sub>, <'aud', aud>, 'nonce', nonce>, sig>\n)",
+            sp(23)), "conc row:\n{}", crow[0]);
     }
 
     #[test]
