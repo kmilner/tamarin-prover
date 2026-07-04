@@ -1773,41 +1773,47 @@ impl EquationStore {
                     subst_vf.to_list());
             }
         }
-        // HS-faithful witness-freshening floor for the sibling disjs.
-        // `simpSingleton` folds this disj via `freshToFree`, which in HS
-        // draws its fresh range-var renames from the ambient `MonadFresh`
-        // counter.  That counter is threaded monotonically through the whole
-        // `runReduction`, so it is ALWAYS above the VFresh range vars of the
-        // OTHER variant disjunctions still in `eqsConj` (they were minted
-        // earlier from the same counter).  RS re-seeds a per-pop Fresh
-        // counter from `avoid sys = bounds_max`, which — HS-faithfully,
+        // HS-faithful witness-freshening floor for the already-folded free
+        // subst.  `simpSingleton` folds this disj via `freshToFree`, which in
+        // HS draws its fresh range-var renames from the ambient `MonadFresh`
+        // counter (Substitution.hs:54-66 → importBinding → freshLVar).  That
+        // counter threads monotonically through `runReduction`, so it is
+        // ALWAYS above every idx it has ALREADY DRAWN — i.e. above the range
+        // vars of the free `eqsSubst`, which are all prior-fold outputs
+        // (`applyEqStore`'s `asubst \`compose\` eqsSubst`).  RS re-seeds a
+        // per-pop counter from `avoid sys = bounds_max`, which — HS-faithfully,
         // matching `foldFrees (SubstVFresh) = foldFrees f . M.keys`
-        // (SubstVFresh.hs:197) — does NOT count those conj *range* vars.
-        // If the per-pop counter is under-advanced, `alloc` can draw a
-        // witness idx equal to a SIBLING disj's range var, fusing two
-        // independent variant witnesses into one and forcing the eq-store
-        // false.  Mirror the Maude single-unifier path's
-        // `freshen_witness_range` guard: push the shared counter above every
-        // sibling variant witness — those already folded (now range vars of
-        // the free `self.subst`) and those still un-folded (range vars of the
-        // remaining `self.conj` disjs) — before this fold allocates its own.
-        // No-op whenever the counter is already threaded above them.
+        // (SubstVFresh.hs:197) — counts only DOMAIN keys, not range vars; when
+        // under-advanced (the WF message-derivation probe of a let-destructor
+        // rule) `alloc` could draw an idx equal to an already-folded free-subst
+        // range var, fusing two witnesses and forcing the eq-store false
+        // (foo_eligibility C_2 / fm24 C8 verdict flips).  Push the counter
+        // above `self.subst`'s range to restore HS's monotone-counter
+        // invariant.  No-op whenever the counter is already threaded above.
+        //
+        // Crucially we DO NOT floor above the un-folded sibling disjs in
+        // `self.conj`: HS's counter is NOT above those.  Their range vars are
+        // per-call-local unify witnesses (Term/Maude/Types.hs:112-113,
+        // `evalFreshAvoiding (M.elems bindings)`), seeded above the *query's*
+        // vars — NOT drawn from the `runReduction` MonadFresh counter — so HS's
+        // counter sits far below them (RYY em source: fold draws ~x.18 while
+        // SplitId(0) siblings already hold ~x.187).  HS avoids fusing the
+        // fold's fresh with a conj witness not by counter-avoidance but by
+        // `applyBound`'s `renameAvoiding (map snd slist) avoidSet` — which, on
+        // the post-fold `applyEqStore` re-unify, renames every conj disj's
+        // range away from `varsRange newsubst` (the fold's fresh vars)
+        // regardless of numeric overlap (EquationStore.hs:428-435).  RS mirrors
+        // that in `apply_eq_store`.  Flooring above the conj here instead makes
+        // each fold ratchet the counter to the max sibling witness, and the
+        // subsequent re-unify re-bases those siblings even higher — a positive
+        // feedback that inflated the KU(em(_,_)) bilinear source's witness span
+        // ~7x/pass (peak x.4393 vs HS x.653), diverging the `main/cases`
+        // raw/refined pages (task #18).
         if let Some(m) = maude {
             use tamarin_term::lterm::HasFrees;
             let mut floor = 0u64;
-            // Already-folded siblings live in `self.subst` (this fold's
-            // witnesses must not reuse a range var another fold produced) and
-            // un-folded siblings live in `self.conj` (their VFresh range vars
-            // must not be aliased by this fold's fresh renames).
             for t in self.subst.range() {
                 t.for_each_free(&mut |w: &LVar| { if w.idx > floor { floor = w.idx; } });
-            }
-            for d in &self.conj {
-                for s in &d.substs {
-                    for t in s.range() {
-                        t.for_each_free(&mut |w: &LVar| { if w.idx > floor { floor = w.idx; } });
-                    }
-                }
             }
             if floor > 0 { m.ensure_above(floor); }
         }
