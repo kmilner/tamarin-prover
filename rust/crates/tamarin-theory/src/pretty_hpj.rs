@@ -466,10 +466,24 @@ fn above_g(p: Doc, g: bool, q: Doc) -> Doc {
 fn above_nest(p: Doc, g: bool, k: isize, q: Doc) -> Doc {
     match p {
         Doc::NoDoc => Doc::NoDoc,
-        Doc::Union(p1, p2) => union_(
-            above_nest((*p1).clone(), g, k, q.clone()),
-            above_nest((*p2).clone(), g, k, q),
-        ),
+        // HS `aboveNest (p Union q) g k r = aboveNest p g k r `union_`
+        // aboveNest q g k r` (pretty-1.1.3.6 HughesPJ.hs:585).  CRITICAL:
+        // under GHC's call-by-need both distributed branches are thunks —
+        // `best`/`fits` forces the right one only when the left overflows.
+        // Distributing eagerly into BOTH branches rebuilds `q` under every
+        // Union alternative at construction time; for a union-rich doc (a
+        // vcat of 18 ∃-substs over bilinear eCK terms, each a nest of
+        // sep/fsep unions) that is O(2^depth) — the task-#19 web OOM
+        // (8 GB, source-cases page, Chen_Kudla `Init_2`).  Mirror HS's
+        // laziness exactly as `beside_inner`'s Union arm does: keep the
+        // right branch a memoised thunk.
+        Doc::Union(p1, p2) => {
+            let q2 = q.clone();
+            lazy_union(
+                above_nest((*p1).clone(), g, k, q),
+                move || above_nest((*p2).clone(), g, k, q2),
+            )
+        }
         // Lazy distribution: keep the right branch a thunk.
         Doc::LazyUnion(p1, r) => {
             let q2 = q.clone();
