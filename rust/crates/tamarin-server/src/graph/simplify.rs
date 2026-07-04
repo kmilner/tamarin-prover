@@ -59,7 +59,18 @@ fn drop_entailed_ord_constraints(mut sys: System) -> System {
     let adj = build_raw_edge_adjacency(&sys);
     let mut new_atoms: Vec<LessAtom> = Vec::with_capacity(sys.less_atoms.len());
     for la in &sys.less_atoms {
-        if !reachable(&adj, &la.smaller, &la.larger) {
+        // HS `entailed (LessAtom from to _) = to `S.member` reachableSet [from] edges`
+        // (Simplification.hs:38).  `Dag.reachableSet [from]` ALWAYS contains the
+        // start node `from` itself (DAG/Simple.hs:72-78: `visit` inserts `x`
+        // before recursing), so a REFLEXIVE atom (`from == to`) is unconditionally
+        // entailed — hence dropped from the display graph.  `reachable` below is
+        // strict-path (returns false for `from == to`), so the reflexive case must
+        // be added explicitly to match HS; otherwise a `#t1 < #t1` born from a
+        // `#t1 < #t2` less-atom collapsed under a `t2 = t1` subst survives here and
+        // renders as a spurious dashed self-loop that HS never draws.
+        let entailed = la.smaller == la.larger
+            || reachable(&adj, &la.smaller, &la.larger);
+        if !entailed {
             new_atoms.push(la.clone());
         }
     }
