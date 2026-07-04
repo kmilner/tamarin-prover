@@ -1566,6 +1566,20 @@ fn run_solve_all_safe_goals_disj_with_progress(
                   std::collections::BTreeSet<String>, i64, i64,
                   Option<tamarin_term::lterm::LNTerm> /* last_chain_term */,
                   bool /* took_step */);
+    // HS-faithful `avoid th` (Sources.hs:162): thread `source_avoid` as the
+    // fresh-counter floor for the WHOLE refinement of this case — including
+    // the floor-0 `simplify_system_with_fanout` sub-reductions where the
+    // `[sources]`-lemma `Ex #j` node is drawn — via a thread-local, restored
+    // on drop.  Without it, that sub-reduction reseeds at the per-case
+    // `avoid se`, undershooting HS for any case below the source-wide max.
+    struct RefineFloorGuard(u64);
+    impl Drop for RefineFloorGuard {
+        fn drop(&mut self) {
+            crate::constraint::solver::reduction::set_refine_floor(self.0);
+        }
+    }
+    let _refine_floor_guard = RefineFloorGuard(
+        crate::constraint::solver::reduction::set_refine_floor(source_avoid));
     let mut worklist: Vec<Entry> = vec![
         (initial_sys, Vec::new() /* fresh accumulator for steps */,
          std::collections::BTreeSet::new(),

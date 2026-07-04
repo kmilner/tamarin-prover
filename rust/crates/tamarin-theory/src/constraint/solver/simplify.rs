@@ -184,6 +184,9 @@ pub fn simplify_system_with_fanout(
     sys: crate::constraint::system::System,
 ) -> Vec<crate::constraint::system::System> {
     use crate::constraint::solver::reduction::Reduction;
+    // `Reduction::new` consults the `REFINE_FLOOR` thread-local so this
+    // sub-reduction inherits the source precompute's `avoid th` seed (HS
+    // Sources.hs:162); 0 (general proving path) is a no-op.
     let mut red = Reduction::new(ctx, sys);
     simplify_system_fan_out_inner(&mut red)
 }

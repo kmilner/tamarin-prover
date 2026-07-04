@@ -102,9 +102,48 @@ impl ChangeIndicator {
     }
 }
 
+thread_local! {
+    /// Source-precompute fresh-counter floor for `avoid th` faithfulness.
+    ///
+    /// HS's `refineSource` (Sources.hs:162) seeds ONE monotonic FreshT
+    /// counter at `fs = avoid th` — the max var idx over the WHOLE source
+    /// `th` (all its cases) — and threads it through EVERY reduction in the
+    /// refinement of each case, `simplifySystem` included.  RS breaks a
+    /// refineSource into a floored main-loop reduction plus floor-0
+    /// `simplify_system_with_fanout` sub-reductions; the latter reset the
+    /// counter to the per-case `avoid se`, which is BELOW `avoid th` for any
+    /// case whose max var is smaller than the source-wide max (e.g. NSPK3's
+    /// `!KU(~t.1)` R_1 case, avoid 27 vs source-wide 29).  A first NEW draw
+    /// there (the `[sources]`-lemma `Ex #j. OUT_I_1(m1)@#j` node) then lands
+    /// below HS's value.  This thread-local carries `source_avoid` into
+    /// those sub-reductions so they seed at `avoid th`, matching HS's single
+    /// monotonic counter.  Set for the duration of one source-case
+    /// refinement (`run_solve_all_safe_goals_disj_with_progress`); 0 (the
+    /// default, general proving path) means "no floor".
+    static REFINE_FLOOR: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Set the source-precompute fresh-counter floor, returning the previous
+/// value (for RAII restore).  See [`REFINE_FLOOR`].
+pub fn set_refine_floor(floor: u64) -> u64 {
+    REFINE_FLOOR.with(|c| { let old = c.get(); c.set(floor); old })
+}
+
+/// Current source-precompute fresh-counter floor (`avoid th`, 0 if unset).
+pub fn refine_floor() -> u64 {
+    REFINE_FLOOR.with(|c| c.get())
+}
+
 impl<'ctx> Reduction<'ctx> {
     pub fn new(ctx: &'ctx ProofContext, sys: System) -> Self {
-        Self::new_with_floor(ctx, sys, 0)
+        // HS-faithful `avoid th` (Sources.hs:162): during source precompute
+        // a thread-local floor (`REFINE_FLOOR`) carries the source-wide
+        // `avoid th` seed into EVERY reduction of the refinement — including
+        // the many `Reduction::new` sub-reductions (simplify, action solve,
+        // etc.) that would otherwise reseed at the per-case `avoid se` and
+        // undershoot HS's single monotonic counter.  0 (default, general
+        // proving path) is a no-op.
+        Self::new_with_floor(ctx, sys, refine_floor())
     }
 
     /// Like [`new`] but seeds the per-Reduction Fresh counter from
