@@ -3936,9 +3936,35 @@ fn conjoin_refine_arm(
     // (E.5), which RS mirrors. A second re-key here collapsed distinct
     // witnesses and rotated split ordering — verify_checksign_test::test4/5.)
 
+    // HS-faithful action reconciliation.  HS's `_applySource`
+    // (Sources.hs:446-469) reconciles the case's KU-action fact with the
+    // live goal ENTIRELY inside `conjoinSystem`'s node-merge — there is NO
+    // separate `solveFactEqs [caseAction = goal]` step.  RS's `conjoinSystem`
+    // (`r.conjoin_system` above) likewise already reconciled the grafted
+    // action node to the live goal fact (its em-agent / DH-exponent vars now
+    // carry the LIVE goal's `$A`/`~ex`, not the `someInst`-freshened
+    // `$A.12`/`~ex.24`).  The caller (reduction.rs `solve_action_goal`
+    // None-branch) then runs `solve_fact_eqs([case_action = fa])` to
+    // propagate action bindings before its chain-edge solve.  If we hand it
+    // the STALE pre-conjoin `live_action` (`$A.12`), that unify is
+    // NON-trivial against `fa` (`$A`) even though the grafted system already
+    // carries `$A` — so `add_eqs` re-freshens the live eqStore `conj` a
+    // SECOND time (HS re-freshes exactly once, inside conjoinSystem),
+    // bumping every DH-variant witness one notch (RYY_PFS
+    // Reveal_ltk_case_1: RS `~ex`/`x` = HS +1/+2).  Recover the POST-conjoin
+    // action from `r.sys` at the live node instead — when conjoin fully
+    // reconciled it (`== fa`) the caller's pass is a no-op (no extra
+    // re-fresh); when conjoin left a live var to bind (e.g.
+    // Reveal_session_key's `z`), the pass still binds exactly that, matching
+    // HS's single reconciliation.
+    let post_conjoin_action = r.sys.nodes.iter()
+        .find(|(id, _)| id == live_node)
+        .and_then(|(_, ru)| ru.actions.iter()
+            .find(|a| a.tag == crate::fact::FactTag::Ku).cloned())
+        .unwrap_or_else(|| live_action.clone());
     crate::state_trace::emit(
         "applySource_out", Some(&live_goal_for_trace), &r.sys);
-    out_arms.push((r.sys, live_action.clone(), refined_case_for_dedup.clone()));
+    out_arms.push((r.sys, post_conjoin_action, refined_case_for_dedup.clone()));
     } // end `for r_sys in e5_arm_systems`
     } // end `for r in arm_reductions`
     out_arms
