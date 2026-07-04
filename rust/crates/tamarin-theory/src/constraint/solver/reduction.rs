@@ -2265,11 +2265,33 @@ impl<'ctx> Reduction<'ctx> {
                         format!("split id {:?} not found", id)))?;
                 let raw_count = arms.len();
                 let mut live_arms: Vec<crate::tools::equation_store::EquationStore> = Vec::new();
+                // HS-faithful per-arm counter fork.  HS `solveTermEqs`
+                // (Reduction.hs:712-731) runs
+                //   `disjunctionOfList (performSplit eqs2 splitId)` and THEN
+                //   `simp` per arm — the `disjunctionOfList` sits in the
+                // DisjT layer BELOW FreshT (`Reduction = StateT System
+                // (FreshT (DisjT ...))`, Reduction.hs:123), so each arm's
+                // `simp` (whose `simpSingleton` fold draws fresh idxs via
+                // `freshToFree`) starts from an independent COPY of the
+                // counter at the fan-out point.  RS's `do_simp` allocs via
+                // the ONE shared `maude_alloc` counter, so consecutive arms
+                // threaded each other's fold draws: on RYY_PFS's
+                // `KU(em(t.1,t.2))` source the two C-unifier arms folded at
+                // t.7/t.8 and t.9/t.10 where HS has t.7/t.8 in BOTH
+                // (hs_ryy.err SAT-STEP: case2 = same t.7/t.8, premises
+                // swapped).  Rewind to the pre-fork base before each arm and
+                // restore the high-water mark after the loop, exactly as
+                // `solve_action_goal` does around its candidate fork.
+                let arm_fork_base = maude_alloc.fresh_counter_peek();
+                let mut arm_high_water = arm_fork_base;
                 for arm in arms {
+                    maude_alloc.reset_counter_to(arm_fork_base);
                     let simped = do_simp(arm);
+                    arm_high_water = arm_high_water.max(maude_alloc.fresh_counter_peek());
                     if simped.is_false() { continue; }
                     live_arms.push(simped);
                 }
+                maude_alloc.ensure_above(arm_high_water.saturating_sub(1));
                 if tamarin_utils::env_gate!("TAM_RS_DBG_STE_RAW") {
                     let loc = std::panic::Location::caller();
                     eprintln!("[STE_RAW] raw={} live={} site={}:{} pending_eqs={}",
