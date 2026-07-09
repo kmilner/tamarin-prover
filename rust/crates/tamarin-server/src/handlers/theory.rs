@@ -952,7 +952,19 @@ pub async fn reload(
             let kept_idx = state.store.replace_at(idx, new_entry).unwrap_or(idx);
             json_resp::redirect(format!("/thy/trace/{}/overview/help", kept_idx))
         }
-        Err(e) => json_resp::alert(format!("reload failed: {}", e)),
+        Err(e) => match e {
+            // HS `reloadTheoryFromFile` (Handler.hs:407-408): a parse failure
+            // becomes a JsonAlert
+            //   "Parse error while reloading file:\n\n" ++ filePath
+            //     ++ "\n\n" ++ show e
+            // where `show e` is the parsec frame (already headed by the path).
+            crate::theory_io::LoadError::Parse(frame) => json_resp::alert(format!(
+                "Parse error while reloading file:\n\n{}\n\n{}",
+                path.display(),
+                frame,
+            )),
+            other => json_resp::alert(format!("reload failed: {}", other)),
+        },
     }
 }
 

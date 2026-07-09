@@ -10,8 +10,24 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use tamarin_parser::parse_theory;
+use tamarin_parser::{parse_theory, Message};
 use walkdir::WalkDir;
+
+/// A representative message string for failure-category bucketing.  The
+/// `ParseError` no longer carries a single `msg`; it holds a parsec-style
+/// message list, so join the message strings for classification purposes.
+fn error_key_source(e: &tamarin_parser::ParseError) -> String {
+    e.messages
+        .iter()
+        .map(|m| match m {
+            Message::SysUnExpect(s)
+            | Message::UnExpect(s)
+            | Message::Expect(s)
+            | Message::Message(s) => s.as_str(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 fn corpus_root() -> std::path::PathBuf {
     std::env::var("CORPUS_ROOT").map(std::path::PathBuf::from).unwrap_or_else(|_| {
@@ -61,7 +77,7 @@ fn main() {
         match parse_theory(&src, &["diff"]) {
             Ok(_) => { ok += 1; }
             Err(e) => {
-                let key = classify(&e.msg);
+                let key = classify(&error_key_source(&e));
                 *failure_reasons.entry(key).or_insert(0) += 1;
                 failed.push((path.to_path_buf(), format!("{}", e)));
             }

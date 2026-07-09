@@ -119,17 +119,37 @@ pub async fn serve(
 
     let store = TheoryStore::default();
 
-    // Eager-load every command-line theory.
+    // Eager-load every command-line theory.  Per-theory stdout reporting
+    // mirrors HS `loadTheories` (Web/Dispatch.hs:157-198): a non-empty
+    // wellformedness report is echoed via `ppInteractive`
+    // (Dispatch.hs:200-209), and a load failure prints the dashed
+    // `reportFailure` block (Dispatch.hs:191-198) and skips the theory.
     for p in &theory_paths {
         match theory_io::load_from_path(p, &cfg.maude_path, cfg.derivcheck_timeout) {
             Ok(entry) => {
                 let name = entry.name.clone();
+                if !entry.wf_report.is_empty() {
+                    let dashes = "-".repeat(78);
+                    let report = tamarin_theory::pretty_theory::render_wf_error_report(
+                        &entry.wf_report,
+                    );
+                    println!(
+                        "{dashes}\nTheory file '{}'\n{dashes}\n\nWARNING: ignoring the following wellformedness errors\n\n{}\n{dashes}\n",
+                        p.display(),
+                        report.trim_end_matches('\n'),
+                    );
+                }
                 let idx = store.insert(entry);
                 tracing::info!(idx, ?name, path = ?p, "loaded theory");
             }
             Err(e) => {
                 tracing::error!(error = %e, path = ?p, "failed to load theory");
-                eprintln!("warning: failed to load `{}`: {}", p.display(), e);
+                let dashes = "-".repeat(78);
+                println!(
+                    "{dashes}\nUnable to load theory file `{}'\n{dashes}\n\n{}\n{dashes}\n",
+                    p.display(),
+                    e,
+                );
             }
         }
     }
@@ -141,11 +161,13 @@ pub async fn serve(
 
     let app = router(state.clone());
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr).await?;
+    // HS ready message (Interactive.hs:104, printed after all theories
+    // load, Dispatch.hs:160) — note the trailing space after "at" and the
+    // indented URL line.
     println!(
-        "tamarin-prover (Rust port) listening on http://{}",
+        "Finished loading theories ... server ready at \n\n    http://{}\n",
         cfg.bind_addr,
     );
-    println!("open this URL in your browser to use the interactive UI.");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;

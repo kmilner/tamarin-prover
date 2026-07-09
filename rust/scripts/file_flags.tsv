@@ -38,3 +38,33 @@ features/auto-sources/spore/Nssk_amended.spthy	--auto-sources
 
 # ---- seqdfs-dependent regression (HS empty/wrong under default dfs) ----------
 regression/trace/seqdfsneeded.spthy	--stop-on-trace=seqdfs
+
+# ---- upstream AUTO_SOURCES_CASE_STUDIES (Makefile:460-471): canonical
+# ---- invocation is --auto-sources (%_analyzed-auto-sources target,
+# ---- Makefile:157). Added 2026-07-09 after the skip-class census; the
+# ---- remaining 44 gate skips are upstream-excluded and were removed
+# ---- from parity_corpus.txt (see FIX_NOTES SESSION 29).
+features/auto-sources/spore/AS_Modified_RPC.spthy	--auto-sources
+features/auto-sources/spore/AS_RPC.spthy	--auto-sources
+features/auto-sources/spore/Denning-Sacco-SK-Lowe.spthy	--auto-sources
+features/auto-sources/spore/Denning-Sacco-SK.spthy	--auto-sources
+features/auto-sources/spore/Nssk.spthy	--auto-sources
+features/auto-sources/spore/Otway-Rees.spthy	--auto-sources
+features/auto-sources/spore/SpliceAS_2.spthy	--auto-sources
+features/auto-sources/spore/SpliceAS_3.spthy	--auto-sources
+features/auto-sources/spore/Wide_Mouthed_Frog.spthy	--auto-sources
+features/auto-sources/spore/Wide_Mouthed_Frog_Lowe.spthy	--auto-sources
+features/auto-sources/spore/WooLam_Pi_f.spthy	--auto-sources
+features/auto-sources/spore/Yahalom.spthy	--auto-sources
+features/auto-sources/spore/Yahalom-Lowe.spthy	--auto-sources
+features/auto-sources/spore/Yahalom_BAN.spthy	--auto-sources
+features/auto-sources/spore/CCITT_X509_1.spthy	--auto-sources
+features/auto-sources/spore/CCITT_X509_1c.spthy	--auto-sources
+features/auto-sources/spore/CCITT_X509_3.spthy	--auto-sources
+features/auto-sources/spore/CCITT_X509_3_BAN.spthy	--auto-sources
+features/auto-sources/spore/AS_Concrete_RPC.spthy	--auto-sources
+features/auto-sources/spore/Lowe_AS_Concrete_RPC.spthy	--auto-sources
+
+# ---- cwd-dependent oracle (upstream deforacle recipe cd-s into the dir,
+# ---- Makefile:199-201; the default-oracle lookup is cwd-relative) --------
+regression/trace/defaultoracle.spthy	@cd

@@ -11,26 +11,260 @@ use crate::proof_tree::parse_proof_tree;
 // Errors
 // =============================================================================
 
+/// A single parsec-style error message.
+///
+/// Direct port of parsec's `data Message` (`Text.Parsec.Error`, the
+/// `parsec-3.1.16.1` bundled with the GHC-9.6.7 that builds the HS oracle).
+/// The four constructors and their ordering are load-bearing: parsec's
+/// `instance Ord Message` compares *only* the constructor rank (`fromEnum`,
+/// `SysUnExpect`=0 … `Message`=3), and `errorMessages = sort msgs` stable-sorts
+/// by that rank before rendering, so the groups always appear in this order.
+#[derive(Debug, Clone)]
+pub enum Message {
+    /// Library-generated "unexpected" (parsec `SysUnExpect`): the token found
+    /// where the grammar could not continue.  Rendered `unexpected <tok>`, or
+    /// `unexpected end of input` when the string is empty.
+    SysUnExpect(String),
+    /// User "unexpected" (parsec `UnExpect`, via the `unexpected` combinator).
+    UnExpect(String),
+    /// "expecting" label (parsec `Expect`, from `<?>` and the token parsers).
+    Expect(String),
+    /// Raw message (parsec `Message`, e.g. via `fail`).  Rendered verbatim.
+    Message(String),
+}
+
+impl Message {
+    /// parsec `fromEnum :: Message -> Int` (`Text.Parsec.Error`).
+    fn rank(&self) -> u8 {
+        match self {
+            Message::SysUnExpect(_) => 0,
+            Message::UnExpect(_) => 1,
+            Message::Expect(_) => 2,
+            Message::Message(_) => 3,
+        }
+    }
+    /// parsec `messageString :: Message -> String`.
+    fn string(&self) -> &str {
+        match self {
+            Message::SysUnExpect(s)
+            | Message::UnExpect(s)
+            | Message::Expect(s)
+            | Message::Message(s) => s,
+        }
+    }
+}
+
+/// A parse error, modelled on parsec's `ParseError` (`Text.Parsec.Error`): a
+/// source position plus a list of [`Message`]s.  Rendering (the [`Display`]
+/// impl) is a verbatim port of parsec's `instance Show ParseError` +
+/// `showErrorMessages` + `instance Show SourcePos` (`Text.Parsec.Pos`), so the
+/// user-facing frame is byte-identical to HS's `show err`:
+///
+/// ```text
+/// "path/file.spthy" (line 2, column 5):
+/// unexpected " "
+/// expecting letter or "{*"
+/// ```
+///
+/// The line/col/offset are retained as public fields for callers that inspect
+/// the position; `source` is the parsec `SourcePos` "name" (the file path in
+/// the header), injected by each surface via [`ParseError::with_source`] —
+/// mirroring parsec threading `parseString`'s `inFile` into the `SourcePos`.
 #[derive(Debug, Clone)]
 pub struct ParseError {
     pub line: u32,
     pub col: u32,
     pub offset: usize,
-    pub msg: String,
-    pub snippet: String,
+    /// parsec `SourcePos` name (file path printed in the header).  Empty until
+    /// a surface injects it, in which case the header omits the quoted name
+    /// exactly as parsec's null-name `show SourcePos` branch does.
+    pub source: String,
+    /// Unsorted parsec-style messages; [`Display`] sorts + dedups them exactly
+    /// as parsec's `errorMessages` + `showErrorMessages` do.
+    pub messages: Vec<Message>,
+}
+
+impl ParseError {
+    /// Attach the source-file name parsec prints in the header.  Each surface
+    /// injects the path it knows (batch: the CLI arg; server eager-load: the
+    /// on-disk path; web upload: the uploaded filename) — the same value HS
+    /// passes as `inFile` to `parseString`.
+    pub fn with_source(mut self, name: impl Into<String>) -> Self {
+        self.source = name.into();
+        self
+    }
+
+    /// Port of parsec's `showErrorMessages` (`Text.Parsec.Error`) instantiated
+    /// with the exact argument strings from `instance Show ParseError`:
+    /// `showErrorMessages "or" "unknown parse error" "expecting" "unexpected"
+    /// "end of input"`.  Produces the message body (each line already prefixed
+    /// with `\n`, matching `concat $ map ("\n"++) …`).
+    fn show_error_messages(&self) -> String {
+        // errorMessages = sort msgs  (stable sort by constructor rank).
+        let mut msgs: Vec<&Message> = self.messages.iter().collect();
+        msgs.sort_by_key(|m| m.rank());
+        if msgs.is_empty() {
+            // parsec: `| null msgs = msgUnknown` (returned with NO leading '\n').
+            return "unknown parse error".to_string();
+        }
+        // span by rank into (sysUnExpect, unExpect, expect, messages).
+        let strings = |rank: u8| -> Vec<&str> {
+            msgs.iter().filter(|m| m.rank() == rank).map(|m| m.string()).collect()
+        };
+        let sys = strings(0);
+        let un = strings(1);
+        let exp = strings(2);
+        let raw = strings(3);
+
+        let show_expect = show_many("expecting", &exp);
+        let show_unexpect = show_many("unexpected", &un);
+        // showSysUnExpect: suppressed if there are UnExpect messages or no
+        // SysUnExpect; else uses only the FIRST sysUnExpect (empty → EOF).
+        let show_sys = if !un.is_empty() || sys.is_empty() {
+            String::new()
+        } else if sys[0].is_empty() {
+            "unexpected end of input".to_string()
+        } else {
+            format!("unexpected {}", sys[0])
+        };
+        let show_messages = show_many("", &raw);
+
+        // concat $ map ("\n"++) $ clean [showSys, showUn, showExp, showMsg]
+        let parts = clean_dedup(&[
+            show_sys.as_str(),
+            show_unexpect.as_str(),
+            show_expect.as_str(),
+            show_messages.as_str(),
+        ]);
+        parts.iter().map(|p| format!("\n{p}")).collect()
+    }
 }
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "parse error at line {} col {}: {} (near: {:?})",
-            self.line, self.col, self.msg, self.snippet
-        )
+        // Port of parsec `instance Show ParseError` (`show pos ++ ":" ++ …`)
+        // and `instance Show SourcePos` (`Text.Parsec.Pos`): the quoted name is
+        // omitted when empty, and there is a single space before "(line …".
+        let line_col = format!("(line {}, column {})", self.line, self.col);
+        if self.source.is_empty() {
+            write!(f, "{}:{}", line_col, self.show_error_messages())
+        } else {
+            write!(f, "\"{}\" {}:{}", self.source, line_col, self.show_error_messages())
+        }
     }
 }
 
 impl std::error::Error for ParseError {}
+
+/// parsec `clean = nub . filter (not . null)` — drop empties, dedup preserving
+/// first occurrence.
+fn clean_dedup(items: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in items {
+        if s.is_empty() || out.iter().any(|x| x == s) {
+            continue;
+        }
+        out.push((*s).to_string());
+    }
+    out
+}
+
+/// parsec `commasOr` (with `msgOr = "or"`): join with ", " and " or " before
+/// the last element.
+fn commas_or(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [m] => m.clone(),
+        _ => {
+            let (init, last) = items.split_at(items.len() - 1);
+            // commaSep = separate ", " . clean  (init is already clean here)
+            format!("{} or {}", init.join(", "), last[0])
+        }
+    }
+}
+
+/// parsec `showMany pre msgs`: clean+dedup, then `commasOr`, optionally prefixed
+/// by `pre` and a space.
+fn show_many(pre: &str, msgs: &[&str]) -> String {
+    let cleaned = clean_dedup(msgs);
+    if cleaned.is_empty() {
+        return String::new();
+    }
+    let co = commas_or(&cleaned);
+    if pre.is_empty() { co } else { format!("{pre} {co}") }
+}
+
+/// The show of a single-character token as parsec's Char-stream primitives
+/// render it: `show [c]` (Haskell `show :: String -> String` of a one-char
+/// string).  parsec's `Text.Parsec.Char.satisfy`/`string` use `show [c]` for
+/// the `SysUnExpect` token, so an unexpected `t` prints as `"t"`, a space as
+/// `" "`, a quote as `"\""`, a newline as `"\n"`, etc.
+fn show_char_token(c: char) -> String {
+    let mut s = String::from('"');
+    show_lit_char(c, &mut s);
+    s.push('"');
+    s
+}
+
+/// Port of GHC's `showLitChar` for the characters that appear inside a
+/// double-quoted string literal (`show :: String -> String`).  We only ever
+/// show a *single* char, so the `\&` empty-string separator (only emitted
+/// between a numeric escape and a following digit) never applies.
+fn show_lit_char(c: char, out: &mut String) {
+    match c {
+        '"' => out.push_str("\\\""),
+        '\\' => out.push_str("\\\\"),
+        '\n' => out.push_str("\\n"),
+        '\t' => out.push_str("\\t"),
+        '\r' => out.push_str("\\r"),
+        '\u{0B}' => out.push_str("\\v"),
+        '\u{0C}' => out.push_str("\\f"),
+        '\u{07}' => out.push_str("\\a"),
+        '\u{08}' => out.push_str("\\b"),
+        c if (' '..='~').contains(&c) => out.push(c),
+        // Control / non-ASCII: GHC uses a decimal escape `\NNN`.
+        c => {
+            out.push('\\');
+            out.push_str(&(c as u32).to_string());
+        }
+    }
+}
+
+/// The merged `expecting` labels of the top-level item alternation, in HS's
+/// exact order and spelling.  This is the base set parsec accumulates from
+/// `addItems`'s `asum` (`Theory/Text/Parser.hs:243-303`) — each alternative's
+/// leading `symbol`/`<?>` label — plus `letter` (from `formalComment`'s
+/// `many1 letter`, `Token.hs:377-378`) and the trailing `symbol_ "end"`.
+/// Captured empirically from the HS binary at a fresh item position (right
+/// after `begin`, no preceding item leftover).  See §28 residue note: after
+/// certain items parsec *prepends* extra merged tokens (rule → `"variants"`,
+/// functions → `"["`,`","`, …) that this port does not reproduce.
+const TOP_LEVEL_ITEM_EXPECTS: &[&str] = &[
+    "\"heuristic\"",
+    "\"tactic\"",
+    "\"builtins\"",
+    "\"options\"",
+    "\"functions\"",
+    "\"function\"",
+    "\"equations\"",
+    "\"macros\"",
+    "\"restriction\"",
+    "\"axiom\"",
+    "\"test\"",
+    "\"lemma\"",
+    "\"rule\"",
+    "letter",
+    "top-level process",
+    "\"let\"",
+    "\"equivLemma\"",
+    "\"diffEquivLemma\"",
+    "predicate block",
+    "export block",
+    "\"#ifdef\"",
+    "\"#define\"",
+    "\"#include\"",
+    "\"end\"",
+];
 
 // =============================================================================
 // Parser entry points
@@ -225,16 +459,99 @@ impl<'a> Parser<'a> {
 
     // -------- Error helpers --------
 
+    /// A raw-message parse error at the current position (parsec `Message`).
+    /// Renders as `"<path>" (line, column):\n<msg>` — the correct parsec frame
+    /// with a single message line, even though the message text itself is not a
+    /// `unexpected …`/`expecting …` pair.  Used by the many hand-coded error
+    /// sites that do not (yet) track a parsec-style expected set.
     fn err(&self, msg: impl Into<String>) -> ParseError {
         let pos = self.lx.pos();
-        let snippet: String = self.lx.rest().chars().take(40).collect();
         ParseError {
             line: pos.line,
             col: pos.col,
             offset: pos.offset,
-            msg: msg.into(),
-            snippet,
+            source: String::new(),
+            messages: vec![Message::Message(msg.into())],
         }
+    }
+
+    /// A parsec-shaped `unexpected TOKEN / expecting …` error at the current
+    /// (post-whitespace) position — the shape a failing `symbol`/token parser
+    /// produces.  `expects` are the raw `<?>` label strings, already carrying
+    /// any quoting (e.g. `"\"theory\""`).  The `SysUnExpect` token is `show [c]`
+    /// of the next char, or empty (→ `end of input`) at EOF, exactly as
+    /// parsec's Char-stream `SysUnExpect` is filled.  Whitespace is skipped
+    /// first so the reported position/token is the token start, matching
+    /// parsec (where `lexeme` has already consumed leading whitespace).
+    fn err_expect(&mut self, expects: &[&str]) -> ParseError {
+        self.skip_ws();
+        let pos = self.lx.pos();
+        let unexpected = match self.lx.peek() {
+            Some(c) => show_char_token(c),
+            None => String::new(),
+        };
+        let mut messages = Vec::with_capacity(expects.len() + 1);
+        messages.push(Message::SysUnExpect(unexpected));
+        for e in expects {
+            messages.push(Message::Expect((*e).to_string()));
+        }
+        ParseError {
+            line: pos.line,
+            col: pos.col,
+            offset: pos.offset,
+            source: String::new(),
+            messages,
+        }
+    }
+
+    /// The parse error parsec produces at a top-level *item* position when no
+    /// item alternative matches — a faithful reproduction of the merged error
+    /// from `addItems`'s `asum` (`Theory/Text/Parser.hs:243-303`) `<* symbol_
+    /// "end"`.
+    ///
+    /// Two shapes, exactly as parsec's longest-match error merging yields:
+    ///
+    /// * If the next token starts with letters, `formalComment`'s
+    ///   `try (many1 letter <* string "{*")` (`Token.hs:377-378`) consumes them
+    ///   and is the furthest-reaching alternative, so it dominates: the error
+    ///   sits *after* the letters and reads `unexpected <c> / expecting letter
+    ///   or "{*"` (the `many1 letter` hangover merged with the `string "{*"`
+    ///   expectation).
+    /// * Otherwise every alternative fails at the same position, so parsec
+    ///   unions all of their leading labels → [`TOP_LEVEL_ITEM_EXPECTS`].
+    ///
+    /// Residue (see §28): after certain preceding items parsec *prepends* extra
+    /// merged tokens (rule → `"variants"`, functions → `"["`,`","`, …) that this
+    /// port does not track; those cases match on frame+position+base-list but
+    /// omit the leading prefix.
+    fn item_position_error(&mut self) -> ParseError {
+        self.skip_ws();
+        let start = self.save();
+        let mut saw_letter = false;
+        while self.lx.peek().is_some_and(|c| c.is_alphabetic()) {
+            self.lx.bump();
+            saw_letter = true;
+        }
+        if saw_letter {
+            let pos = self.lx.pos();
+            let unexpected = match self.lx.peek() {
+                Some(c) => show_char_token(c),
+                None => String::new(),
+            };
+            return ParseError {
+                line: pos.line,
+                col: pos.col,
+                offset: pos.offset,
+                source: String::new(),
+                messages: vec![
+                    Message::SysUnExpect(unexpected),
+                    Message::Expect("letter".to_string()),
+                    Message::Expect("\"{*\"".to_string()),
+                ],
+            };
+        }
+        self.restore(start);
+        self.err_expect(TOP_LEVEL_ITEM_EXPECTS)
     }
 
     fn save(&self) -> Pos { self.lx.pos() }
@@ -260,13 +577,27 @@ impl<'a> Parser<'a> {
         true
     }
     fn require_kw(&mut self, kw: &str) -> Result<(), ParseError> {
-        if self.try_kw(kw) { Ok(()) } else { Err(self.err(format!("expected `{}`", kw))) }
+        // HS `symbol_ kw` = `void (try (T.symbol spthy kw) <?> ("\""++kw++"\""))`
+        // (Token.hs:272-277): on failure, Expect is the quoted keyword.
+        if self.try_kw(kw) {
+            Ok(())
+        } else {
+            let label = format!("\"{kw}\"");
+            Err(self.err_expect(&[&label]))
+        }
     }
 
     fn require_punct(&mut self, p: &str) -> Result<(), ParseError> {
         self.skip_ws();
-        if self.lx.eat_str(p) { self.skip_ws(); Ok(()) }
-        else { Err(self.err(format!("expected `{}`", p))) }
+        if self.lx.eat_str(p) {
+            self.skip_ws();
+            Ok(())
+        } else {
+            // HS `symbol p` labels the failure with the quoted punctuation
+            // (Token.hs:272-273).
+            let label = format!("\"{p}\"");
+            Err(self.err_expect(&[&label]))
+        }
     }
 
     fn try_punct(&mut self, p: &str) -> bool {
@@ -332,14 +663,27 @@ impl<'a> Parser<'a> {
         let name = self.ident()?;
         let mut configuration = None;
         if self.try_kw("configuration") {
+            // HS: `symbol "configuration" <* colon` then `stringLiteral <*
+            // symbol_ "begin"` (Parser.hs:233-238); the trailing `begin` here
+            // is a plain `symbol_ "begin"`, label `"begin"`.
             self.require_punct(":")?;
             configuration = Some(self.string_literal()?);
             self.require_kw("begin")?;
-        } else {
-            self.require_kw("begin")?;
+        } else if !self.try_kw("begin") {
+            // HS: `try (symbol "configuration" <* colon) <|> symbol "begin"
+            //      <?> "configuration or begin"` (Parser.hs:233) — the whole
+            // choice is relabelled, so the failure Expect is the single custom
+            // label, not the two quoted keywords.
+            return Err(self.err_expect(&["configuration or begin"]));
         }
         let items = self.theory_items_until_end()?;
-        self.require_kw("end")?;
+        // HS `addItems … <* symbol_ "end"` (Parser.hs:240): when `end` is
+        // absent the trailing-`end` failure merges with the item alternation's
+        // error, so report the full item-position error rather than a bare
+        // `expecting "end"`.
+        if !self.try_kw("end") {
+            return Err(self.item_position_error());
+        }
         // Allow trailing whitespace / comments / arbitrary text? Haskell stops here.
         Ok(Theory {
             is_diff: self.is_diff,
@@ -428,10 +772,9 @@ impl<'a> Parser<'a> {
         // `commaSep1`, Accountability.hs:36); the zero-ident form falls back to
         // a normal lemma.
 
-        Err(self.err(format!(
-            "unknown top-level construct, near {:?}",
-            self.lx.rest().chars().take(30).collect::<String>()
-        )))
+        // No item alternative matched: reproduce parsec's merged item-position
+        // error (`addItems` `asum` <* `symbol_ "end"`).
+        Err(self.item_position_error())
     }
 
     // -------------------- Preprocessor --------------------
@@ -2722,6 +3065,117 @@ pub fn parse_term_str(s: &str) -> Result<Term, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- parsec frame-rendering port (Text.Parsec.Error) ----
+
+    fn pe(source: &str, line: u32, col: u32, messages: Vec<Message>) -> String {
+        ParseError { line, col, offset: 0, source: source.to_string(), messages }.to_string()
+    }
+
+    #[test]
+    fn frame_sysunexpect_and_expect() {
+        // parsec: `unexpected "t"` / `expecting "theory"`.
+        let s = pe("f.spthy", 1, 1, vec![
+            Message::SysUnExpect("\"t\"".into()),
+            Message::Expect("\"theory\"".into()),
+        ]);
+        assert_eq!(s, "\"f.spthy\" (line 1, column 1):\nunexpected \"t\"\nexpecting \"theory\"");
+    }
+
+    #[test]
+    fn frame_eof_is_end_of_input() {
+        // Empty SysUnExpect string renders as "unexpected end of input".
+        let s = pe("f", 5, 1, vec![
+            Message::SysUnExpect(String::new()),
+            Message::Expect("\"end\"".into()),
+        ]);
+        assert_eq!(s, "\"f\" (line 5, column 1):\nunexpected end of input\nexpecting \"end\"");
+    }
+
+    #[test]
+    fn frame_expecting_commas_or() {
+        // showMany: `a, b or c` (comma-separated, "or" before the last).
+        let s = pe("f", 4, 7, vec![
+            Message::SysUnExpect("\"]\"".into()),
+            Message::Expect("\".\"".into()),
+            Message::Expect("\",\"".into()),
+            Message::Expect("\")\"".into()),
+        ]);
+        assert_eq!(s, "\"f\" (line 4, column 7):\nunexpected \"]\"\nexpecting \".\", \",\" or \")\"");
+    }
+
+    #[test]
+    fn frame_dedup_and_message_ordering() {
+        // clean = nub . filter (not . null): duplicate/empty Expects collapse,
+        // and sort orders SysUnExpect < Expect < Message regardless of input.
+        let s = pe("f", 2, 3, vec![
+            Message::Message("raw note".into()),
+            Message::Expect("\"a\"".into()),
+            Message::Expect("\"a\"".into()),
+            Message::Expect(String::new()),
+            Message::SysUnExpect("\"x\"".into()),
+        ]);
+        assert_eq!(
+            s,
+            "\"f\" (line 2, column 3):\nunexpected \"x\"\nexpecting \"a\"\nraw note"
+        );
+    }
+
+    #[test]
+    fn frame_sysunexpect_suppressed_by_unexpect() {
+        // showSysUnExpect = "" when a user UnExpect is present.
+        let s = pe("f", 1, 1, vec![
+            Message::SysUnExpect("\"z\"".into()),
+            Message::UnExpect("something".into()),
+            Message::Expect("\"a\"".into()),
+        ]);
+        assert_eq!(s, "\"f\" (line 1, column 1):\nunexpected something\nexpecting \"a\"");
+    }
+
+    #[test]
+    fn frame_empty_messages_is_unknown() {
+        // parsec: `| null msgs = msgUnknown` — no leading newline.
+        let s = pe("f", 1, 1, vec![]);
+        assert_eq!(s, "\"f\" (line 1, column 1):unknown parse error");
+    }
+
+    #[test]
+    fn frame_null_source_omits_quoted_name() {
+        // `instance Show SourcePos`: null name → no `"name" ` prefix.
+        let s = pe("", 3, 2, vec![Message::Message("m".into())]);
+        assert_eq!(s, "(line 3, column 2):\nm");
+    }
+
+    #[test]
+    fn show_char_token_escapes_like_haskell() {
+        assert_eq!(show_char_token('t'), "\"t\"");
+        assert_eq!(show_char_token(' '), "\" \"");
+        assert_eq!(show_char_token('"'), "\"\\\"\"");
+        assert_eq!(show_char_token('\n'), "\"\\n\"");
+        assert_eq!(show_char_token('\t'), "\"\\t\"");
+    }
+
+    #[test]
+    fn theory_keyword_error_matches_parsec() {
+        // End-to-end: the top-level `theory` keyword mismatch renders exactly
+        // like HS's `symbol_ "theory"` failure.
+        let e = parse_theory("theary Foo\nbegin\nend\n", &[]).unwrap_err();
+        assert_eq!(
+            e.with_source("f.spthy").to_string(),
+            "\"f.spthy\" (line 1, column 1):\nunexpected \"t\"\nexpecting \"theory\""
+        );
+    }
+
+    #[test]
+    fn item_position_letters_expect_letter_or_comment() {
+        // Garbage identifier at item position → `letter or "{*"` after the
+        // consumed letters (formalComment `many1 letter <* string "{*"`).
+        let e = parse_theory("theory Foo\nbegin\nrul R:\n[]-->[]\nend\n", &[]).unwrap_err();
+        assert_eq!(
+            e.with_source("f").to_string(),
+            "\"f\" (line 3, column 4):\nunexpected \" \"\nexpecting letter or \"{*\""
+        );
+    }
 
     #[test]
     fn empty_theory() {

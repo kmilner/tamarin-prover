@@ -318,9 +318,66 @@ fn run_interactive(args: &Args) -> Result<i32, RunError> {
     let theory_paths: Vec<PathBuf> = collect_theory_paths(&args.in_files)?;
 
     if !args.quiet {
-        eprintln!(
-            "The server is starting up on port {}.\nBrowse to http://{} once the server is ready.",
-            port, bind_addr,
+        // HS interactive runs the tool checks BEFORE the banner
+        // (Interactive.hs:86-91): `ensureMaudeAndGetVersion` prints the
+        // maude block (Console.hs:150-155) and `ensureGraphVizDot` the
+        // GraphViz block (Environment.hs:72-87), both on stderr.
+        {
+            let raw_path = args.maude_path.clone().unwrap_or_else(default_maude_path);
+            let disp = if args.maude_path.is_some() {
+                raw_path.clone()
+            } else {
+                std::path::Path::new(&raw_path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&raw_path)
+                    .to_string()
+            };
+            eprintln!("maude tool: '{}'", disp);
+            if let Some(v) = crate::cli::detect_maude_version_pub() {
+                eprintln!(" checking version: {}. OK.", v);
+                eprintln!(" checking installation: OK.");
+            }
+            eprintln!("GraphViz tool: 'dot'");
+            // HS lowercases `dot -V`'s stderr banner, strips the trailing
+            // newline, and appends ". OK." (Environment.hs:81-87); PNG
+            // support = "png" appears in the `dot -T?` error listing.
+            if let Ok(out) = std::process::Command::new("dot").arg("-V").output() {
+                let banner = String::from_utf8_lossy(&out.stderr).to_lowercase();
+                if banner.contains("graphviz") {
+                    eprintln!(" checking version: {}. OK.", banner.trim_end_matches('\n'));
+                    let png_ok = std::process::Command::new("dot").arg("-T?").output()
+                        .map(|o| {
+                            let s = format!(
+                                "{}{}",
+                                String::from_utf8_lossy(&o.stdout),
+                                String::from_utf8_lossy(&o.stderr),
+                            );
+                            s.to_lowercase().contains("png")
+                        })
+                        .unwrap_or(false);
+                    if png_ok {
+                        eprintln!(" checking PNG support: OK.");
+                    }
+                }
+            }
+        }
+
+        // HS startup banner (Interactive.hs:95-101) — stdout (`putStrLn`),
+        // including the "Loading the security protocol theories" line and
+        // the trailing blank line (`intercalate "\n" [.., ""]` plus
+        // putStrLn's newline).  HS shows `workDir </> "*.spthy"`; we accept
+        // dir-or-files, so a single dir arg renders HS-style and explicit
+        // file paths are listed verbatim.
+        let loading_what = match &args.in_files[..] {
+            [one] if std::path::Path::new(one).is_dir() => {
+                format!("{}", std::path::Path::new(one).join("*.spthy").display())
+            }
+            files => files.join(", "),
+        };
+        println!(
+            "The server is starting up on port {}.\nBrowse to http://{} once the server is ready.\n\nLoading the security protocol theories '{}' ...\n",
+            port, bind_addr, loading_what,
         );
     }
 
@@ -495,10 +552,18 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         let base_dir = std::path::Path::new(in_file)
             .parent()
             .map(|p| p.to_path_buf());
-        let mut parsed = tamarin_parser::parse_theory_with_base(&src, &parser_flags, base_dir)
-            .map_err(|e| {
-                RunError(format!("parse error in {}: {}", in_file, e))
-            })?;
+        let mut parsed = match tamarin_parser::parse_theory_with_base(&src, &parser_flags, base_dir) {
+            Ok(thy) => thy,
+            Err(e) => {
+                // HS batch: `handleError e@(ParserError _) = die $ show e`
+                // (Main/Mode/Batch.hs:234).  `die` writes `show e` — the raw
+                // parsec frame, with `inFile` as the `SourcePos` name — to
+                // stderr and exits with code 1.  No `error:` prefix and no
+                // `parse error in …:` wrapper (neither of which HS emits).
+                eprintln!("{}", e.with_source(in_file.clone()));
+                return Ok(1);
+            }
+        };
         // HS `liftedAddProtoRule` (Theory/Text/Parser.hs:166-193) runs per
         // rule DURING parsing: it expands each rule's `_restrict(φ)`
         // embedded restriction into a fresh `Restr_<rule>_<i>` restriction

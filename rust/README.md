@@ -29,28 +29,32 @@ volatile header lines (Git revision, compile time, processing time).
 
 The parity gate (`scripts/corpus_file_diff.sh`, corpus in
 `scripts/parity_corpus.txt`) compares the Rust port against the Haskell prover
-on a 454-file corpus: the theories under `examples/` that use only ported
-features and that Haskell proves within a 300 s per-theory cap. This spans
-`classic/`, `ake/`, `sp14/`, the `csf*/` series, `features/`, `loops/`,
-`post17/`, `regression/`, `related_work/`, the multiset-rewrite theories in
-`csf18-xor/`, `jcs19-xor/`, `idbased/`, `eurosp19-eccDAA/`,
-`esorics23-bluetooth/`, `csf20-disputeResolution/`, `fm24-cardpayments/`,
-`wisec21-5G-handover/`, `wireguard/`, the POIDC and
+on a 402-file corpus: the theories under `examples/` that use only ported
+features and that Haskell proves — each under its canonical invocation.
+Files whose upstream case-study recipe requires extra arguments run with
+exactly those arguments on both provers (`scripts/file_flags.tsv`: the
+`--auto-sources` spore suite, the seqdfs regression, the cwd-relative
+default-oracle test). This spans `classic/`, `ake/`, `sp14/`, the `csf*/`
+series, `features/`, `loops/`, `post17/`, `regression/`, `related_work/`,
+the multiset-rewrite theories in `csf18-xor/`, `jcs19-xor/`, `idbased/`,
+`eurosp19-eccDAA/`, `esorics23-bluetooth/`, `csf20-disputeResolution/`,
+`fm24-cardpayments/`, `wisec21-5G-handover/`, `wireguard/`, the POIDC and
 `thesis-LaraSchmid-evoting/` corpora, and 79 SAPiC `process:` theories from
 `sapic/`.
 
 | Result | Files | Meaning |
 |--------|------:|---------|
-| MATCH | 386 | Rust output byte-identical to Haskell |
+| MATCH | 402 | Rust output byte-identical to Haskell |
 | DIFF  |   0 | — |
-| SKIP  |  68 | no Haskell reference to compare against (HS exceeds the cap, or produces no/empty output) |
+| SKIP  |   0 | — |
 
-Every theory in the corpus that Haskell can prove is reproduced byte-for-byte:
-no rendering, proof-search, or verdict divergence remains. Theories outside the
-corpus require an unported feature — accountability (`accounts for`) or
-observational equivalence (`--diff`) — or exercise searches that Haskell itself
-does not finish. Observational-equivalence (`--diff`) theories re-enter once that
-mode is ported.
+Every theory in the corpus is reproduced byte-for-byte: no rendering,
+proof-search, or verdict divergence remains. Theories outside the corpus
+require an unported feature — accountability (`accounts for`) or
+observational equivalence (`--diff`) — or are excluded by upstream's own
+regression suite as non-terminating (the same files upstream's Makefile
+omits or marks "not finished"). Observational-equivalence (`--diff`)
+theories re-enter once that mode is ported.
 
 Stored proofs are validated, not just displayed: loading a proof-carrying file
 runs the same proof-checking pass as the Haskell prover, replaying every stored

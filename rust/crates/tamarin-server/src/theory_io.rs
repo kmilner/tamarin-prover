@@ -22,7 +22,13 @@ impl std::fmt::Display for LoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LoadError::Io(s) => write!(f, "IO error: {}", s),
-            LoadError::Parse(s) => write!(f, "parse error: {}", s),
+            // `Parse` already holds the fully-rendered parsec frame (HS `show
+            // err` = `show (ParserError e) = show e`, TheoryLoader.hs:397), so
+            // it is emitted verbatim — no `parse error:` prefix, which HS never
+            // prints.  This is what lands inside the eager-load dashed block
+            // (Dispatch.hs:191-198 `show err`) and after the web upload's
+            // "Theory loading failed:\n" banner (Handler.hs:803).
+            LoadError::Parse(s) => write!(f, "{}", s),
             LoadError::Elaborate(s) => write!(f, "elaboration error: {}", s),
         }
     }
@@ -56,8 +62,15 @@ pub fn load_from_source(
     maude_path: &str,
     derivcheck_timeout: u32,
 ) -> Result<TheoryEntry, LoadError> {
+    // Inject the parsec `SourcePos` name (the path HS prints in the frame
+    // header) from the origin: a local file's on-disk path, or the uploaded
+    // filename — the same value HS passes as `inFile`/`filename` to
+    // `parseString` (Dispatch.hs:167 `thLoad srcThy path`; Handler.hs:800
+    // `loadAndCloseTheory srcContent filename`).  `LoadError::Parse` then holds
+    // the byte-for-byte parsec frame.
+    let source_name = origin.label();
     let mut parser_theory = parse_theory(src, &[])
-        .map_err(|e| LoadError::Parse(format!("{:?}", e)))?;
+        .map_err(|e| LoadError::Parse(e.with_source(source_name).to_string()))?;
 
     // HS `liftedAddProtoRule` (Theory/Text/Parser.hs:166-193) expands each
     // rule's `_restrict(φ)` into a fresh `Restr_<rule>_<i>` restriction
@@ -71,6 +84,11 @@ pub fn load_from_source(
     tamarin_theory::rule_restriction::lift_rule_restrictions(&mut parser_theory)
         .map_err(|e| LoadError::Parse(format!(
             "_restrict expansion failed: {}", e.message)))?;
+
+    // HS lifecycle markers, stderr via `traceM`: "Theory loaded" right
+    // after parsing (TheoryLoader.hs:409; `liftedAddProtoRule` runs
+    // during parsing, so post-lift here is the same point).
+    eprintln!("[Theory {}] Theory loaded", parser_theory.name);
 
     // Wellformedness report — computed by the SAME pipeline `--prove` runs
     // (`run.rs`'s `checkWellformedness`, mirroring HS `TheoryLoader.hs`), so the
@@ -95,6 +113,10 @@ pub fn load_from_source(
     // Maude-backed check in the maude block below replaces it (run.rs:527-528).
     wf_report.retain(|e| e.topic != "Message Derivation Checks");
 
+    // "Theory translated" at the START of translation (TheoryLoader.hs:454
+    // prints before `processOpenTheory` runs); RS's `elaborate` is that
+    // translation step.
+    eprintln!("[Theory {}] Theory translated", parser_theory.name);
     let mut typed = elaborate(&parser_theory)
         .map_err(|e| LoadError::Elaborate(e.message))?;
     let maude_sig = typed.signature.maude_sig.clone();
@@ -246,15 +268,28 @@ pub fn load_from_source(
         // (Main/Mode/Interactive.hs:62).  Needs the Maude handle; runs on
         // the POST-translation parser theory (`parser_theory`, matching
         // run.rs's `&parsed` at that point).
+        // HS brackets the check with stderr markers via `traceM`
+        // (TheoryLoader.hs:485,498) — emitted for every close (initial
+        // load, upload, reload), and only when derivChecks != 0
+        // (TheoryLoader.hs:482-483 skips the whole block on EQ).
+        if derivcheck_timeout > 0 {
+            eprintln!("[Theory {}] Derivation checks started", typed.name);
+        }
         let extra = tamarin_theory::deriv_check::check_message_derivation(
             &parser_theory, &maude, derivcheck_timeout,
         );
         wf_report.extend(extra);
+        if derivcheck_timeout > 0 {
+            eprintln!("[Theory {}] Derivation checks ended", typed.name);
+        }
     }
 
     // HS `makeWfErrorsHtml` (src/Web/Handler.hs:463-469) — the header-banner
     // rendering of the same report; empty string when the report is empty.
     let errors_html = make_wf_errors_html(&wf_report);
+
+    // "Theory closed" at the end of `closeTheory` (TheoryLoader.hs:596).
+    eprintln!("[Theory {}] Theory closed", typed.name);
 
     Ok(TheoryEntry {
         idx: 0,

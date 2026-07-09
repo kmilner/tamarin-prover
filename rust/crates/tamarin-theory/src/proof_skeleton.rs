@@ -4,7 +4,7 @@
 //!
 //! This module is a test-only cross-checking harness; it is **not**
 //! part of `--prove` output. The production pretty-printer lives in
-//! `pretty_theory.rs` (`pretty_proof_body` / `pp_step_at`, port of
+//! `pretty_theory.rs` (`pretty_proof_body` / `pp_step_doc`, port of
 //! `Theory/Proof.hs` `prettyProofWith`/`ppCases`) and
 //! `constraint/solver/proof_method.rs` (port of
 //! `Theory/Constraint/Solver/ProofMethod.hs` `prettyProofMethod`).
@@ -206,7 +206,7 @@ fn method_keyword(m: &ProofMethod) -> &'static str {
         ProofMethod::Sorry(_) => "",     // handled at leaf-emit time
         ProofMethod::Finished(_) => "",  // handled at leaf-emit time
         ProofMethod::Invalidated => "INVALIDATED",
-        ProofMethod::RawSolve(_) => "solve", // display-only; handled in pp_step_at
+        ProofMethod::RawSolve(_) => "solve", // display-only; handled in pp_step_doc
     }
 }
 

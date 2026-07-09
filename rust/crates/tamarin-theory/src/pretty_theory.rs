@@ -748,6 +748,20 @@ pub fn format_wf_block(report: &[tamarin_parser::wf::WfError]) -> String {
     }
     let mut out = String::new();
     out.push_str("/*\nWARNING: the following wellformedness checks failed!\n\n");
+    out.push_str(&render_wf_error_report(report));
+    // Trim trailing blank lines but keep a single newline before `*/`.
+    while out.ends_with("\n\n") { out.pop(); }
+    out.push_str("*/");
+    out
+}
+
+/// Bare `prettyWfErrorReport` rendering (Wellformedness.hs:118-125) —
+/// the grouped topic blocks WITHOUT the `/* WARNING ... */` comment
+/// wrapper.  Shared by `format_wf_block` (batch theory output) and the
+/// interactive server's `ppInteractive` console echo of the report at
+/// theory-load time (Web/Dispatch.hs:187,200-209).
+pub fn render_wf_error_report(report: &[tamarin_parser::wf::WfError]) -> String {
+    let mut out = String::new();
     // Group by topic, preserving FIRST-APPEARANCE order — mirrors HS's
     // `groupOn fst` over a left-to-right concatMap-over-checks.
     let mut topic_order: Vec<&str> = Vec::new();
@@ -790,9 +804,6 @@ pub fn format_wf_block(report: &[tamarin_parser::wf::WfError]) -> String {
             }
         }
     }
-    // Trim trailing blank lines but keep a single newline before `*/`.
-    while out.ends_with("\n\n") { out.pop(); }
-    out.push_str("*/");
     out
 }
 
@@ -2320,7 +2331,7 @@ fn pp_proof(
 
     match (&node.method, cases.as_slice()) {
         (ProofMethod::Finished(MR::Solved), []) => {
-            let doc = pp_step_doc(&node.method, base, "");
+            let doc = pp_step_doc(&node.method, "");
             out.push_str(&pf::step_line_with_unann(doc, base, annotated, ""));
         }
         (_, []) => {
@@ -2340,11 +2351,11 @@ fn pp_proof(
             // the method's own wrapped continuation columns by the prefix
             // width and counts it toward the ribbon, so the method lines stay
             // byte-identical to the old baked-in layout.
-            let doc = pp_step_doc(&node.method, base, "");
+            let doc = pp_step_doc(&node.method, "");
             out.push_str(&pf::step_line_with_unann(doc, base, annotated, "by "));
         }
         (_, [(label, child)]) if label.is_empty() => {
-            let doc = pp_step_doc(&node.method, base, "");
+            let doc = pp_step_doc(&node.method, "");
             out.push_str(&pf::step_line_with_unann(doc, base, annotated, ""));
             out.push('\n');
             // HS `ppCases ps [("", prf)] = prettyStep ps $-$ ppPrf prf`
@@ -2357,7 +2368,7 @@ fn pp_proof(
             pp_proof(child, out, depth);
         }
         (_, multi) => {
-            let doc = pp_step_doc(&node.method, base, "");
+            let doc = pp_step_doc(&node.method, "");
             out.push_str(&pf::step_line_with_unann(doc, base, annotated, ""));
             for (i, (name, child)) in multi.iter().enumerate() {
                 if i > 0 {
@@ -2394,7 +2405,7 @@ fn pp_proof(
 pub fn pretty_proof_method_inline(
     m: &crate::constraint::solver::proof_method::ProofMethod,
 ) -> String {
-    pp_step_doc(m, 0, "").render()
+    pp_step_doc(m, "").render()
 }
 
 /// HS `prettyProofMethod m` as a Doc (ProofMethod.hs:1170-1186), for
@@ -2406,7 +2417,7 @@ pub fn pretty_proof_method_inline(
 pub fn pretty_proof_method_doc(
     m: &crate::constraint::solver::proof_method::ProofMethod,
 ) -> crate::pretty_hpj::Doc {
-    pp_step_doc(m, 0, "")
+    pp_step_doc(m, "")
 }
 
 /// Build the proof-step method as a `pretty_hpj::Doc`, mirroring
@@ -2418,13 +2429,8 @@ pub fn pretty_proof_method_doc(
 /// otherwise); it is laid out BESIDE the method as line content (NOT
 /// folded into the indent) so HughesPJ counts its columns toward the
 /// ribbon, identical to `step_line_with_unann`/`pp_proof`'s string path.
-///
-/// `base_indent` is the column where the step's first char lands; used
-/// by the SolveGoal goal builders so wrapped continuation lines indent
-/// to the column after `solve( ` (= base_indent + len(prefix) + 7).
 fn pp_step_doc(
     m: &crate::constraint::solver::proof_method::ProofMethod,
-    base_indent: usize,
     prefix: &str,
 ) -> crate::pretty_hpj::Doc {
     use crate::constraint::constraints::Goal;
@@ -2515,38 +2521,6 @@ fn pp_step_doc(
         body
     } else {
         Doc::text(prefix).beside(body)
-    }
-}
-
-fn pp_step_at(m: &crate::constraint::solver::proof_method::ProofMethod, _indent: usize) -> String {
-    use crate::constraint::solver::proof_method::{ProofMethod as PM, Result as MR};
-    match m {
-        PM::Simplify => "simplify".to_string(),
-        PM::Induction => "induction".to_string(),
-        PM::Sorry(reason) => match reason {
-            Some(r) => format!("sorry /* {} */", r),
-            None => "sorry".to_string(),
-        },
-        PM::Finished(MR::Solved) => "SOLVED // trace found".to_string(),
-        PM::Finished(MR::Unfinishable) => {
-            "UNFINISHABLE // reducible operator in subterm".to_string()
-        }
-        PM::Invalidated => {
-            // HS `prettyProofMethod` (ProofMethod.hs):
-            //   Invalidated -> lineComment_
-            //     "proof may have been invalidated by editing a reuse lemma above. You should "
-            // Note the trailing space inside the string literal — HS
-            // `lineComment_` renders the verbatim text after `// `.
-            "// proof may have been invalidated by editing a reuse lemma above. You should ".to_string()
-        }
-        // SolveGoal / RawSolve / Finished(Contradictory) are rendered as
-        // Docs by `pp_step_doc`, which handles them BEFORE its
-        // `_ => pp_step_at(..)` fallback — so they never reach here.
-        // `pp_step_at` is the string-only path for the remaining leaf
-        // methods (Simplify/Induction/Sorry/Solved/Unfinishable/Invalidated).
-        PM::SolveGoal(_) | PM::RawSolve(_) | PM::Finished(MR::Contradictory(_)) =>
-            unreachable!("pp_step_at: {:?} is rendered by pp_step_doc, not here",
-                std::any::type_name::<PM>()),
     }
 }
 
