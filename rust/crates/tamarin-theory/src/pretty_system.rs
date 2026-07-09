@@ -43,16 +43,13 @@ use crate::pretty_formula::guarded_doc;
 pub fn pretty_non_graph_system(sys: &System) -> String {
     // HS renders this pane (Web/Theory.hs:535 `preformatted (Just "sequent")
     // (prettyNonGraphSystem se)`) through the `HtmlDoc Doc` transformer via
-    // `renderHtmlDoc`, so the HughesPJ fill measures every `<`/`>`/`'` token at
-    // its escaped-entity width (`&lt;`/`&gt;`/`&#39;`) when choosing line
-    // breaks.  The server escapes only after rendering, so we must reproduce
-    // that width accounting here or the pair-tuple `<…>` wraps at a different
-    // column than HS (task #17 family D).  The guard is dropped at function
-    // exit, restoring plain (visible-column) width accounting; this function is
-    // web-only, so `--prove` never sees it.  NOTE: the guard must span the Doc
-    // BUILD too (not just the render) — `Doc::text` captures each token's fill
-    // width at construction.
-    let _html_width = crate::pretty_hpj::HtmlEntityWidthGuard::enable();
+    // `renderHtmlDoc`: keywords/operators become `hl_*` spans, every `text` is
+    // entity-escaped, and the HughesPJ fill measures each token at its escaped
+    // width (`&lt;`/`&gt;`/`&#39;`) when choosing line breaks (task #17 family
+    // D).  The web callers install an [`HtmlDocGuard`] around this call, so the
+    // Doc is built (and its per-token widths captured) under HtmlDoc mode; the
+    // plain `--prove`/unit-test path builds it with no guard (visible-column
+    // widths, no spans, no escaping), so it is unchanged.
     let sections = vec![
         combine("last", pretty_last(sys)),
         combine("formulas", pretty_formula_set(&sys.formulas)),
@@ -207,9 +204,10 @@ fn flush_right(n: usize, s: &str) -> String {
 }
 
 // HS `combine (header, d) = fsep [keyword_ header <> colon, nest 2 d]`
-// (SubtermStore.hs:576 / EquationStore.hs:574).
+// (SubtermStore.hs:576 / EquationStore.hs:574) — the section header is a
+// `keyword_` span, the colon is plain.  `keyword_` is the identity in plain mode.
 fn combine(header: &str, d: Doc) -> Doc {
-    fsep(vec![Doc::text(format!("{header}:")), d.nest(2)])
+    fsep(vec![crate::pretty_hpj::keyword_(header).beside(Doc::char(':')), d.nest(2)])
 }
 
 // Faithful port of Haskell `prettySubtermStore` (SubtermStore.hs:567-579).
@@ -237,7 +235,7 @@ fn pretty_subterm_store(sys: &System) -> Doc {
     // `ppSt (a,b) = prettyNTerm a $$ nest 3 (opSubterm <-> prettyNTerm b)`
     let pp_st = |small: &tamarin_term::lterm::LNTerm, big: &tamarin_term::lterm::LNTerm| {
         lnterm_doc(small).above(
-            Doc::text("\u{228F}") // ⊏  (opSubterm)
+            crate::pretty_hpj::operator_("\u{228F}") // ⊏  (opSubterm)
                 .beside_sp(lnterm_doc(big))
                 .nest(3),
         )
@@ -319,22 +317,25 @@ fn pp_disj(d: &crate::tools::equation_store::EqDisj) -> Doc {
 // HS `ppSubst subst = sep [ hsep (opExists : map prettyLVar (varsRangeVFresh subst)) <> opDot
 //                         , nest 2 $ fsep $ intersperse opLAnd $ map ppEq (substToListVFresh subst) ]`
 fn pp_subst_vfresh(subst: &crate::tools::equation_store::LNSubstVFresh) -> Doc {
-    use crate::pretty_hpj::{hsep, sep};
+    use crate::pretty_hpj::{hsep, operator_, sep};
     // hsep (opExists : map prettyLVar vars) <> opDot
-    // opExists renders "∃ " (trailing space) as a single operator token.
-    let mut quant_parts: Vec<Doc> = vec![Doc::text("\u{2203} ")]; // "∃ "
+    // opExists = operator_ "∃ " (Pretty.hs:177) — trailing space, one operator
+    // token; opDot = operator_ "." (Pretty.hs:183). Both `operator_`, so they
+    // carry `hl_operator` spans in HtmlDoc mode and are identity in plain mode.
+    let mut quant_parts: Vec<Doc> = vec![operator_("\u{2203} ")]; // opExists "∃ "
     for v in subst.vars_range() {
         quant_parts.push(Doc::text(lvar_to_string(&v)));
     }
-    let quant = hsep(quant_parts).beside(Doc::text(".")); // opDot
+    let quant = hsep(quant_parts).beside(operator_(".")); // opDot
 
     // fsep $ intersperse opLAnd $ map ppEq (substToListVFresh subst)
+    // opLAnd = operator_ "∧" (Pretty.hs:179).
     let eqs: Vec<Doc> = subst
         .to_list()
         .into_iter()
         .map(|(v, t)| pp_eq(&v, &t))
         .collect();
-    let body = fsep(intersperse(Doc::text("\u{2227}"), eqs)).nest(2); // ∧ (opLAnd)
+    let body = fsep(intersperse(operator_("\u{2227}"), eqs)).nest(2); // opLAnd ∧
 
     sep(vec![quant, body])
 }
@@ -342,7 +343,7 @@ fn pp_subst_vfresh(subst: &crate::tools::equation_store::LNSubstVFresh) -> Doc {
 // HS `ppEq (a,b) = prettyNTerm (lit (Var a)) $$ nest 6 (opEqual <-> prettyNTerm b)`
 fn pp_eq(a: &tamarin_term::lterm::LVar, b: &tamarin_term::vterm::VTerm<tamarin_term::lterm::Name, tamarin_term::lterm::LVar>) -> Doc {
     Doc::text(lvar_to_string(a)).above(
-        Doc::text("=") // opEqual
+        crate::pretty_hpj::operator_("=") // opEqual
             .beside_sp(lnterm_doc(b))
             .nest(6),
     )
@@ -372,9 +373,9 @@ fn pretty_subst_free(subst: &crate::tools::equation_store::LNSubst) -> Vec<Doc> 
             // (SubstVFree.hs:342-348) — the term is a real `prettyTerm` Doc,
             // so an over-wide term wraps at the pane width exactly as HS.
             lnterm_doc(&t)
-                .beside_sp(Doc::text(" <~ {")) // operator_ " <~ {"
+                .beside_sp(crate::pretty_hpj::operator_(" <~ {")) // operator_ " <~ {"
                 .beside(fsep(punctuate(Doc::text(","), vars)))
-                .beside(Doc::text("}"))
+                .beside(crate::pretty_hpj::operator_("}"))
         })
         .collect()
 }
@@ -447,7 +448,7 @@ fn pretty_goals(sys: &System, want_solved: bool) -> Doc {
         );
         items.push(
             crate::pretty_theory::solve_goal_to_doc(g)
-                .beside_sp(Doc::text("//").beside_sp(Doc::text(comment))),
+                .beside_sp(crate::pretty_hpj::line_comment_(&comment)),
         );
     }
     // HS `vsep = foldr ($--$)` — a BLANK line between adjacent goals.

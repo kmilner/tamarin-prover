@@ -212,11 +212,13 @@ pub fn disj_goal_to_doc(gfs: &[Guarded]) -> crate::pretty_hpj::Doc {
             let mut state = avoid_precise_guarded(g);
             let inner = guarded_to_doc(g, &[], &mut state);
             // `nest 1 (parens (prettyGuarded gf))` — `parens` (Class.hs:149)
-            // is `"(" <> d <> ")"`.
-            Doc::text("(").beside(inner).beside(Doc::text(")")).nest(1)
+            // is `char '(' <> d <> char ')'` (PLAIN).
+            Doc::char('(').beside(inner).beside(Doc::char(')')).nest(1)
         })
         .collect();
-    let punct = hpj::punctuate(Doc::text("  \u{2225}"), items); // "  ∥"
+    // HS `punctuate (operator_ "  ∥")` (Constraints.hs:276) — the `∥`
+    // separator is an `hl_operator` span.
+    let punct = hpj::punctuate(hpj::operator_("  \u{2225}"), items); // "  ∥"
     hpj::fsep(punct)
 }
 
@@ -347,7 +349,7 @@ fn facts_list_doc(facts: &[p::Fact]) -> crate::pretty_hpj::Doc {
     use crate::pretty_hpj::{self as hpj, Doc};
     let inner: Vec<Doc> = facts.iter().map(|f| fact_to_doc(f, &[])).collect();
     let body = hpj::fsep(hpj::punctuate(comma_doc(), inner));
-    hpj::fsep(vec![Doc::text("["), body, Doc::text("]")])
+    hpj::fsep(vec![hpj::operator_("["), body, hpj::operator_("]")])
 }
 
 /// HS `prettyRuleRestrGen` (Theory/Model/Rule.hs:1243-1252):
@@ -372,11 +374,11 @@ pub fn rule_body_to_doc(
     use crate::pretty_hpj::{self as hpj, Doc};
     let prem_doc = facts_list_doc(prems).nest(1);
     let arrow = if acts.is_empty() {
-        Doc::text("-->")
+        hpj::operator_("-->")
     } else {
         let act_docs: Vec<Doc> = acts.iter().map(|f| fact_to_doc(f, &[])).collect();
         let act_body = hpj::fsep(hpj::punctuate(comma_doc(), act_docs));
-        hpj::fsep(vec![Doc::text("--["), act_body, Doc::text("]->")])
+        hpj::fsep(vec![hpj::operator_("--["), act_body, hpj::operator_("]->")])
     };
     let conc_doc = facts_list_doc(concls).nest(1);
     hpj::sep(vec![prem_doc, arrow, conc_doc])
@@ -426,7 +428,7 @@ fn ln_facts_list_doc(facts: &[crate::fact::LNFact]) -> crate::pretty_hpj::Doc {
     use crate::pretty_hpj::{self as hpj, Doc};
     let inner: Vec<Doc> = facts.iter().map(ln_fact_to_doc).collect();
     let body = hpj::fsep(hpj::punctuate(comma_doc(), inner));
-    hpj::fsep(vec![Doc::text("["), body, Doc::text("]")])
+    hpj::fsep(vec![hpj::operator_("["), body, hpj::operator_("]")])
 }
 
 /// `[ prems ] --[ acts ]-> [ concls ]` body for an `LNFact` rule — the
@@ -440,11 +442,11 @@ fn ln_rule_body_to_doc(
     use crate::pretty_hpj::{self as hpj, Doc};
     let prem_doc = ln_facts_list_doc(prems).nest(1);
     let arrow = if acts.is_empty() {
-        Doc::text("-->")
+        hpj::operator_("-->")
     } else {
         let act_docs: Vec<Doc> = acts.iter().map(ln_fact_to_doc).collect();
         let act_body = hpj::fsep(hpj::punctuate(comma_doc(), act_docs));
-        hpj::fsep(vec![Doc::text("--["), act_body, Doc::text("]->")])
+        hpj::fsep(vec![hpj::operator_("--["), act_body, hpj::operator_("]->")])
     };
     let conc_doc = ln_facts_list_doc(concls).nest(1);
     hpj::sep(vec![prem_doc, arrow, conc_doc])
@@ -494,7 +496,7 @@ pub fn pretty_intruder_variants(rules: &[crate::rule::IntrRuleAC]) -> String {
         .iter()
         .map(|r| {
             // HS `prettyNamedRule` header: `kwRuleModulo "AC" <-> name <> ":"`.
-            let header = Doc::text("rule (modulo AC)")
+            let header = crate::pretty_hpj::kw_rule_modulo("AC")
                 .beside_sp(Doc::text(intr_rule_name(r)))
                 .beside(Doc::text(":"));
             // Render header and body separately (as `render_rule` does): the
@@ -828,8 +830,9 @@ fn pp_formula_opparens(
 /// HS `opParens p = "(" <> p <> ")"` (Highlight.hs:58-59) —
 /// unconditional paren wrap.
 fn doc_op_parens(d: crate::pretty_hpj::Doc) -> crate::pretty_hpj::Doc {
-    use crate::pretty_hpj::Doc;
-    Doc::text("(").beside(d).beside(Doc::text(")"))
+    // HS `opParens d = operator_ "(" <> d <> operator_ ")"` — the parens are
+    // `hl_operator` spans in HtmlDoc mode.
+    crate::pretty_hpj::op_parens(d)
 }
 
 /// `text` helper.
@@ -855,7 +858,7 @@ fn formula_to_doc(
             // HS: `operator_ "¬" <> opParens p'` — `<>` is no-break
             // beside.  The inner opParens is unconditional.
             let inner = formula_to_doc_opparens(p_, scope, state);
-            doc_text("\u{00AC}").beside(inner)
+            hpj::operator_("\u{00AC}").beside(inner)
         }
         And(l, r) => binop_to_doc(l, r, "\u{2227}", scope, state),
         Or(l, r) => binop_to_doc(l, r, "\u{2228}", scope, state),
@@ -889,10 +892,12 @@ fn formula_to_doc(
                         doc_text(s)
                     })
                     .collect();
-                // `opQuant <> fsep(vars) <> "."`
-                let quant = doc_text(sym)
+                // HS `ppQuant qua <> ppVars vs <> operator_ "."`: `opForall`/
+                // `opExists` (`operator_ "∀ "` / `"∃ "`, trailing space) and
+                // `opDot` (`operator_ "."`) are `hl_operator` spans.
+                let quant = hpj::operator_(sym)
                     .beside(hpj::fsep(var_docs))
-                    .beside(doc_text("."));
+                    .beside(hpj::operator_("."));
                 let body_doc = formula_to_doc(inner_body, &new_scope, state);
                 hpj::sep(vec![quant, body_doc.nest(1)])
             })
@@ -914,19 +919,19 @@ fn atom_to_doc(a: &p::Atom, scope: &[Bind]) -> crate::pretty_hpj::Doc {
     match a {
         // HS `EqE l r -> sep [ppT l <-> opEqual, ppT r]` (Atom.hs:217-218).
         Eq(l, r) => hpj::sep(vec![
-            term_to_doc(l, scope).beside_sp(Doc::text("=")),
+            term_to_doc(l, scope).beside_sp(hpj::operator_("=")),
             term_to_doc(r, scope),
         ]),
         // HS `Subterm l r -> sep [ppT l <-> opSubterm, ppT r]` (Atom.hs:220).
         Subterm(l, r) => hpj::sep(vec![
-            term_to_doc(l, scope).beside_sp(Doc::text("\u{228F}")),
+            term_to_doc(l, scope).beside_sp(hpj::operator_("\u{228F}")),
             term_to_doc(r, scope),
         ]),
         // HS `Less u v -> text (show u) <-> opLess <-> text (show v)`
         // (Atom.hs:221) — `<->` is `<+>`, no break.  Both operands are
         // timepoints (HS `nodevarTerm`), so resolve them temporally.
         Less(l, r) => temporal_term_to_doc(l, scope)
-            .beside_sp(Doc::text("<"))
+            .beside_sp(hpj::operator_("<"))
             .beside_sp(temporal_term_to_doc(r, scope)),
         // Multiset `(<)`.  HS has NO printer for this: `smallerp`
         // (Theory/Text/Parser/Formula.hs:30-38) parses `(<)` to
@@ -943,13 +948,12 @@ fn atom_to_doc(a: &p::Atom, scope: &[Bind]) -> crate::pretty_hpj::Doc {
         // (Atom.hs:214-215).  Breakability lives inside `prettyFact`.  The
         // `@`-timepoint is `nodevar`-parsed, so resolve it temporally.
         Action(fa, t) => fact_to_doc(fa, scope)
-            .beside_sp(Doc::text("@"))
+            .beside_sp(hpj::operator_("@"))
             .beside_sp(temporal_term_to_doc(t, scope)),
         // HS `Last i -> operator_ "last" <> parens (text (show i))`
-        // (Atom.hs:222) — `<>` is no-space beside.  `i` is a timepoint.
-        Last(t) => Doc::text("last(")
-            .beside(temporal_term_to_doc(t, scope))
-            .beside(Doc::text(")")),
+        // (Atom.hs:222) — `<>` is no-space beside; `parens` is plain.
+        Last(t) => hpj::operator_("last")
+            .beside(hpj::parens(temporal_term_to_doc(t, scope))),
         // HS syntactic-sugar predicate: `prettyPred (Pred fa) = prettyNFact fa`.
         Pred(fa) => fact_to_doc(fa, scope),
     }
@@ -978,8 +982,9 @@ fn binop_to_doc(
     // (beside with single space).
     let l_doc = formula_to_doc_opparens(l, scope, state);
     let r_doc = formula_to_doc_opparens(r, scope, state);
+    // HS `op` here is `opLAnd`/`opLOr`/`opImp`/`opIff` = `operator_ "∧"` etc.
     hpj::sep(vec![
-        l_doc.beside_sp(doc_text(op)),
+        l_doc.beside_sp(hpj::operator_(op)),
         r_doc,
     ])
 }
@@ -1651,12 +1656,12 @@ fn gatom_to_doc(a: &crate::guarded::GAtom, scope: &[Vec<Bind>]) -> crate::pretty
         // the LHS via `<+>`, and the whole thing is a `sep` so it may break
         // between `lhs =` and `rhs`.
         Eq(l, r) => hpj::sep(vec![
-            gterm_to_doc(l, scope).beside_sp(Doc::text("=")),
+            gterm_to_doc(l, scope).beside_sp(hpj::operator_("=")),
             gterm_to_doc(r, scope),
         ]),
         // HS `Subterm l r -> sep [ppT l <-> opSubterm, ppT r]`.
         Subterm(l, r) => hpj::sep(vec![
-            gterm_to_doc(l, scope).beside_sp(Doc::text("\u{228F}")), // ⊏
+            gterm_to_doc(l, scope).beside_sp(hpj::operator_("\u{228F}")), // ⊏
             gterm_to_doc(r, scope),
         ]),
         // HS `Less u v -> text (show u) <-> opLess <-> text (show v)`
@@ -1665,11 +1670,13 @@ fn gatom_to_doc(a: &crate::guarded::GAtom, scope: &[Vec<Bind>]) -> crate::pretty
         // a node-var term (parser Formula.hs `blatom`), so the flat `pp_gterm`
         // rendering of a time-point Var matches HS `show` exactly.
         Less(l, r) => {
-            let mut s = String::new();
-            pp_gterm(l, scope, &mut s);
-            s.push_str(" < ");
-            pp_gterm(r, scope, &mut s);
-            Doc::text(s)
+            let mut ls = String::new();
+            pp_gterm(l, scope, &mut ls);
+            let mut rs = String::new();
+            pp_gterm(r, scope, &mut rs);
+            // HS `text (show u) <-> opLess <-> text (show v)` — `opLess` is an
+            // `hl_operator` span between the two flat time-point operands.
+            Doc::text(ls).beside_sp(hpj::operator_("<")).beside_sp(Doc::text(rs))
         }
         // Multiset `(<)`: HS has no printer for it.  The parser-AST
         // `Atom::LessMset` is rewritten to `∃ z. r = l ++ z` by
@@ -1690,7 +1697,7 @@ fn gatom_to_doc(a: &crate::guarded::GAtom, scope: &[Vec<Bind>]) -> crate::pretty
             let mut tv = String::new();
             pp_gterm(t, scope, &mut tv);
             gfact_to_doc(fa, scope)
-                .beside_sp(Doc::text("@"))
+                .beside_sp(hpj::operator_("@"))
                 .beside_sp(Doc::text(tv))
         }
         // HS `Last i -> operator_ "last" <> parens (text (show i))`.
@@ -2187,8 +2194,8 @@ fn pp_binding_list_with_display(bs: &[Bind], out: &mut String) {
 /// `Doc` instance `operator_ = text` and `highlight = id`, so this is an
 /// unconditional `"(" <> d <> ")"` (Highlight.hs:58-59).
 fn gdoc_op_parens(d: crate::pretty_hpj::Doc) -> crate::pretty_hpj::Doc {
-    use crate::pretty_hpj::Doc;
-    Doc::text("(").beside(d).beside(Doc::text(")"))
+    // HS `opParens d = operator_ "(" <> d <> operator_ ")"` — `hl_operator` spans.
+    crate::pretty_hpj::op_parens(d)
 }
 
 /// Build a `pretty_hpj::Doc` for a guarded formula, mirroring HS `pp`
@@ -2209,23 +2216,23 @@ fn guarded_to_doc(
             // `prettyTerm`/`prettyFact` — NOT a flat string.
             gatom_to_doc(a, scope)
         }
-        Guarded::Disj(xs) if xs.is_empty() => Doc::text("\u{22A5}"), // ⊥
-        Guarded::Conj(xs) if xs.is_empty() => Doc::text("\u{22A4}"), // ⊤
+        Guarded::Disj(xs) if xs.is_empty() => hpj::operator_("\u{22A5}"), // ⊥
+        Guarded::Conj(xs) if xs.is_empty() => hpj::operator_("\u{22A4}"), // ⊤
         Guarded::Disj(xs) => {
             // HS: `parens $ sep $ punctuate (operator_ " ∨") (map opParens ps)`.
             let ps: Vec<Doc> = xs.iter()
                 .map(|x| gdoc_op_parens(guarded_to_doc(x, scope, state)))
                 .collect();
-            let punct = hpj::punctuate(Doc::text(" \u{2228}"), ps); // " ∨"
-            // `parens` (Class.hs:149) is `"(" <> d <> ")"` (no space).
-            Doc::text("(").beside(hpj::sep(punct)).beside(Doc::text(")"))
+            let punct = hpj::punctuate(hpj::operator_(" \u{2228}"), ps); // " ∨"
+            // `parens` (Class.hs:149) is `char '(' <> d <> char ')'` — PLAIN.
+            Doc::char('(').beside(hpj::sep(punct)).beside(Doc::char(')'))
         }
         Guarded::Conj(xs) => {
             // HS: `sep $ punctuate (operator_ " ∧") (map opParens ps)`.
             let ps: Vec<Doc> = xs.iter()
                 .map(|x| gdoc_op_parens(guarded_to_doc(x, scope, state)))
                 .collect();
-            let punct = hpj::punctuate(Doc::text(" \u{2227}"), ps); // " ∧"
+            let punct = hpj::punctuate(hpj::operator_(" \u{2227}"), ps); // " ∧"
             hpj::sep(punct)
         }
         Guarded::GGuarded { qua, vars, guards, body } => {
@@ -2259,12 +2266,12 @@ fn gguarded_to_doc(
     let dante = {
         if guards.is_empty() {
             // `pp (GConj (Conj [])) = operator_ "⊤"`.
-            Doc::text("\u{22A4}").nest(1)
+            hpj::operator_("\u{22A4}").nest(1)
         } else {
             let ps: Vec<Doc> = guards.iter()
                 .map(|gd| gdoc_op_parens(gatom_to_doc(gd, &new_scope)))
                 .collect();
-            let punct = hpj::punctuate(Doc::text(" \u{2227}"), ps);
+            let punct = hpj::punctuate(hpj::operator_(" \u{2227}"), ps);
             hpj::sep(punct).nest(1)
         }
     };
@@ -2282,7 +2289,7 @@ fn gguarded_to_doc(
         .collect();
     let ppvars = hpj::fsep(var_docs);
     // `operator_ sym <+> ppvars <> operator_ "."`
-    let quantifier = Doc::text(sym).beside_sp(ppvars).beside(Doc::text("."));
+    let quantifier = hpj::operator_(sym).beside_sp(ppvars).beside(hpj::operator_("."));
 
     // Case analysis (Guarded.hs:855-862).
     let is_ex_trivial = matches!(qua, Quant::Ex) && body_is_true(body);
@@ -2290,14 +2297,14 @@ fn gguarded_to_doc(
 
     if is_neg {
         // `(All, [], GDisj []) | gf == gfalse -> operator_ "¬" <> dante`.
-        Doc::text("\u{00AC}").beside(dante)
+        hpj::operator_("\u{00AC}").beside(dante)
     } else if is_ex_trivial {
         // `(Ex, _, GConj []) -> sep [quantifier, dante]`.
         hpj::sep(vec![quantifier, dante])
     } else {
         // `_ -> dsucc = nest 1 (pp gf);
         //       sep [quantifier, sep [dante, connective, dsucc]]`.
-        let connective = Doc::text(match qua {
+        let connective = hpj::operator_(match qua {
             Quant::All => "\u{21D2}", // ⇒
             Quant::Ex => "\u{2227}",  // ∧
         });

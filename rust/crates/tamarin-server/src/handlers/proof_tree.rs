@@ -698,7 +698,11 @@ pub fn render_sub_proof_snippet(
     node: &ProofNode,
     ctx: &ProofContext,
 ) -> String {
-    let mut out = String::new();
+    // HS renders the whole `subProofSnippet` through the `HtmlDoc Doc`
+    // transformer + `renderHtmlDoc` (`htmlThyPath`'s `pp`): every fragment is
+    // entity-escaped + span-marked and postprocessed once.  Build HtmlDoc mode
+    // for the whole pane (so the sequent + method keywords render spanned).
+    let _html = tamarin_theory::pretty_hpj::HtmlDocGuard::enable();
     // HS `subProofSnippet` (`Web/Theory.hs:524-525`): an unannotated node
     // (`psInfo == Nothing` — a close-time-replay divergence kept verbatim
     // via `noSystemPrf`) has NO constraint system to render; HS emits the
@@ -707,19 +711,22 @@ pub fn render_sub_proof_snippet(
     // RS's unannotated `ProofNode` carries a placeholder parent `sys`
     // (replay.rs `parsed_to_unannotated`) that MUST NOT be rendered.
     if !node.annotated {
-        out.push_str(&format!(
-            "no annotated constraint system / {} sub-case(s)\n",
+        return tamarin_theory::pretty_hpj::postprocess_html(&format!(
+            "no annotated constraint system / {} sub-case(s)",
             node.children.len()));
-        return out;
     }
     let url_path = encode_path(proof_path);
+    // HS `subProofSnippet = vcat [ …proofMethods…, text "", <h3>Constraint
+    // system</h3>, [dynamic-graph], sequent, <h3>N sub-case(s)</h3>, …subCases ]`
+    // — each element is a `vcat` line; join with `\n`, then postprocess once.
+    let mut parts: Vec<String> = Vec::new();
     // Applicable Proof Methods (ranked at this node's proof depth, HS
     // `subProofSnippet` uses `length proofPath`).
-    write_applicable_methods(&mut out, idx, lemma, &url_path, proof_path.len(),
+    write_applicable_methods(&mut parts, idx, lemma, &url_path, proof_path.len(),
                              &node.sys, ctx);
-    // HS inserts a bare `text ""` (a `<br/>` the gate drops) here — no element.
-    // Constraint system.
-    out.push_str("<h3>Constraint system</h3>\n");
+    // HS `text ""` — a blank line before the Constraint-system header.
+    parts.push(String::new());
+    parts.push("<h3>Constraint system</h3>".to_string());
     if has_graph_content(&node.sys) {
         // HS `refDotInteractiveDynamicPath` → `<dynamic-graph graphSrc=…>`
         // pointing at `InteractiveDotGraphR` = the `intdot` route (the HTML
@@ -727,48 +734,41 @@ pub fn render_sub_proof_snippet(
         // DOT route directly (`Web/Theory.hs:174-177`).
         let src = format!(
             "/thy/trace/{idx}/intdot/proof/{lemma}{path}",
-            idx = idx,
-            lemma = url_path_escape(lemma),
-            path = url_path,
+            idx = idx, lemma = url_path_escape(lemma), path = url_path,
         );
-        out.push_str(&format!(
-            "<dynamic-graph graphSrc=\"{}\"></dynamic-graph>\n",
-            src,
-        ));
+        parts.push(format!("<dynamic-graph graphSrc=\"{}\"></dynamic-graph>", src));
     }
-    out.push_str("<div class=\"preformatted sequent\"><pre>");
-    out.push_str(&html_escape(&pretty_non_graph_system(&node.sys)));
-    out.push_str("</pre></div>\n");
+    // HS `preformatted (Just "sequent") (prettyNonGraphSystem se)` =
+    // `withTag "div" [("class","preformatted sequent")] …` (no `<pre>`); the
+    // sequent renders escaped + span-marked under the guard.
+    parts.push(format!(
+        "<div class=\"preformatted sequent\">{}</div>",
+        pretty_non_graph_system(&node.sys)));
     // Sub-cases.
     let n_cases = node.children.len();
-    out.push_str(&format!("<h3>{} sub-case(s)</h3>\n", n_cases));
+    parts.push(format!("<h3>{} sub-case(s)</h3>", n_cases));
     for (case_name, child) in node.children.iter() {
         let mut child_path = proof_path.to_vec();
         child_path.push(case_name.clone());
         let child_url = encode_path(&child_path);
-        out.push_str(&format!("<h4>Case {}</h4>\n", html_escape(case_name)));
+        // HS `withTag "h4" [] (text "Case" <-> text name)` = `<h4>Case NAME</h4>`.
+        parts.push(format!("<h4>Case {}</h4>",
+            tamarin_theory::pretty_hpj::escape_html_entities(case_name)));
         // HS `refSubCase` (`Web/Theory.hs:608-611`): an unannotated child
         // (`psInfo == Nothing`) gets `text "no proof state available"`
         // instead of the static-graph reference.
         if !child.annotated {
-            out.push_str("no proof state available\n");
+            parts.push("no proof state available".to_string());
             continue;
         }
-        // HS `refDotInteractiveStaticPath` → `<static-graph graphSrc=…>`
-        // pointing at `InteractiveDotGraphR` = the `intdot` route
-        // (`Web/Theory.hs:168-171`).
+        // HS `refDotInteractiveStaticPath` → `<static-graph graphSrc=…>`.
         let src = format!(
             "/thy/trace/{idx}/intdot/proof/{lemma}{path}",
-            idx = idx,
-            lemma = url_path_escape(lemma),
-            path = child_url,
+            idx = idx, lemma = url_path_escape(lemma), path = child_url,
         );
-        out.push_str(&format!(
-            "<static-graph graphSrc=\"{}\"></static-graph>\n",
-            src,
-        ));
+        parts.push(format!("<static-graph graphSrc=\"{}\"></static-graph>", src));
     }
-    out
+    tamarin_theory::pretty_hpj::postprocess_html(&parts.join("\n"))
 }
 
 /// Mirror of Haskell `nonEmptyGraph` (`System.hs`):
@@ -794,7 +794,7 @@ fn has_graph_content(sys: &System) -> bool {
 }
 
 fn write_applicable_methods(
-    out: &mut String,
+    out: &mut Vec<String>,
     idx: usize,
     lemma: &str,
     url_path: &str,
@@ -802,6 +802,7 @@ fn write_applicable_methods(
     sys: &System,
     ctx: &ProofContext,
 ) {
+    use tamarin_theory::pretty_hpj::{self as hpj, Doc};
     // The ranking used at this proof depth (HS `subProofSnippet`:
     // `ranking = useHeuristic heuristic (length proofPath)`,
     // `Web/Theory.hs:600-602`).  Round-robin over the heuristic list
@@ -852,21 +853,22 @@ fn write_applicable_methods(
         // exactly as HS does — not from `is_finished` (which is `None`
         // here and would always pick "Solved").
         if finished_subterms(ctx, sys) {
-            out.push_str("<h3>Constraint System is Solved</h3>\n");
+            out.push("<h3>Constraint System is Solved</h3>".to_string());
         } else {
-            out.push_str("<h3>Constraint System is Unfinishable</h3>\n");
+            out.push("<h3>Constraint System is Unfinishable</h3>".to_string());
         }
         return;
     }
     // HS `subProofSnippet` (`Web/Theory.hs:544-545`):
     //   withTag "h3" [] (text "Applicable Proof Methods:" <-> comment_ (goalRankingName ranking))
-    // `comment_` wraps the ranking name in an `hl_comment` span the gate
-    // unwraps to plain text, so we emit the text directly.
-    out.push_str(&format!(
-        "<h3>Applicable Proof Methods: {}</h3>\n",
-        html_escape(&ranking.ranking_name()),
-    ));
-    out.push_str("<div class=\"preformatted methods\"><pre>");
+    // `comment_` wraps the ranking name in an `hl_comment` span (identity in
+    // plain mode); the name text is entity-escaped by `Doc::text`.
+    let h3 = Doc::text("Applicable Proof Methods:")
+        .beside_sp(hpj::comment_(&ranking.ranking_name()))
+        .render();
+    out.push(format!("<h3>{h3}</h3>"));
+    // HS `preformatted (Just "methods") (numbered' $ zipWith prettyPM [1..] pms)`
+    // = `withTag "div" [("class","preformatted methods")] …` (no `<pre>`).
     // Mirror Haskell `Web.Theory.subProofSnippet` (`Web/Theory.hs:593-596`):
     // each ranked method N (1-based) emits
     //   <a class="internal-link proof-method"
@@ -889,55 +891,38 @@ fn write_applicable_methods(
     // `</a>` boundary.  (Continuation-line indent bytes and the blank line
     // `numbered'` inserts between items are whitespace the parity gate
     // canonicalizes; the break POSITIONS are what must match.)
+    // HS `numbered' $ zipWith prettyPM [1..] pms` (Web/Theory.hs:546):
+    //   pp (i, d) = text (flushRight nW (show i)) <> text ". " <> d
+    //   d        = withTag "a" [("class",…),("href",…)] (prettyProofMethod m)
+    //              <-> (if null expl then emptyDoc else lineComment_ expl)
+    // and `numbered'` separates the items by a blank line (`intersperse (text "")`).
+    // Each item is built as ONE Doc (so the `N. ` prefix beside-shifts a wrapped
+    // method's continuation lines, the method carries its `hl_keyword` span, and
+    // the trailing `// expl` comment participates in the fill), then rendered
+    // under the active HtmlDoc guard.
     let nw = methods.len().to_string().len();
+    let mut method_blocks: Vec<String> = Vec::with_capacity(methods.len());
     for (i, (m, expl)) in methods.iter().enumerate() {
         let nr = i + 1;
-        let prefix = format!("{:>nw$}. ", nr);
-        let rendered = {
-            let _guard =
-                tamarin_theory::pretty_hpj::HtmlEntityWidthGuard::enable();
-            let label_doc =
-                tamarin_theory::pretty_theory::pretty_proof_method_doc(m);
-            let full_doc = if expl.is_empty() {
-                label_doc
-            } else {
-                // `<-> lineComment_ expl` = ` // <expl>` beside the last line.
-                label_doc.beside_sp(
-                    tamarin_theory::pretty_hpj::Doc::text("//")
-                        .beside_sp(tamarin_theory::pretty_hpj::Doc::text(
-                            expl.clone(),
-                        )),
-                )
-            };
-            full_doc.render_at(
-                tamarin_theory::pretty_hpj::WEB_LINE_LENGTH,
-                tamarin_theory::pretty_hpj::WEB_RIBBON,
-                prefix.chars().count(),
-            )
-        };
-        // The comment is a pure `<->` (Beside) chain — never wrapped — so
-        // it is exactly the trailing ` // {expl}` of the render.
-        let suffix = format!(" // {expl}");
-        let (label_txt, comment) = if !expl.is_empty() {
-            match rendered.strip_suffix(&suffix) {
-                Some(lbl) => (lbl.to_string(), format!(" // {}", html_escape(expl))),
-                None => (rendered.clone(), String::new()),
-            }
+        let href = format!(
+            "/thy/trace/{idx}/main/method/{lemma}/{nr}{path}",
+            idx = idx, lemma = url_path_escape(lemma), nr = nr, path = url_path);
+        let link = hpj::with_tag(
+            "a", &[("class", "internal-link proof-method"), ("href", &href)],
+            tamarin_theory::pretty_theory::pretty_proof_method_doc(m));
+        let item = if expl.is_empty() {
+            link
         } else {
-            (rendered.clone(), String::new())
+            // `<-> lineComment_ expl`.
+            link.beside_sp(hpj::line_comment_(expl))
         };
-        out.push_str(&format!(
-            "{prefix}<a class=\"internal-link proof-method\" href=\"/thy/trace/{idx}/main/method/{lemma}/{nr}{path}\">{label}</a>{comment}\n",
-            prefix = prefix,
-            nr = nr,
-            idx = idx,
-            lemma = url_path_escape(lemma),
-            path = url_path,
-            label = html_escape(&label_txt),
-            comment = comment,
-        ));
+        let prefix = format!("{:>nw$}. ", nr);
+        method_blocks.push(Doc::text(prefix).beside(item).render());
     }
-    out.push_str("</pre></div>\n");
+    // `numbered'` blank-line separator → join item blocks with a blank line.
+    out.push(format!(
+        "<div class=\"preformatted methods\">{}</div>",
+        method_blocks.join("\n\n")));
     // Autoprove links — faithful port of HS `subProofSnippet`'s
     // `autoProverLinks` (`Web/Theory.hs:547-591`), in HS order a, b, [o], s.
     // Each `AutoProverR tidx cut bound oracleBool path` renders as
@@ -948,26 +933,42 @@ fn write_applicable_methods(
     let l = url_path_escape(lemma);
     let p = url_path;
     let bound = 5; // HS `fromMaybe 5 (apBound ti.autoProver)` — default depth bound.
-    // a. autoprove  (A. for all solutions)
-    out.push_str(&format!(
-        "a. <a class=\"internal-link autoprove\" href=\"/thy/trace/{idx}/autoprove/idfs/0/False/proof/{l}{p}\">autoprove</a> \
-         (A. <a class=\"internal-link characterization\" href=\"/thy/trace/{idx}/autoprove/characterize/0/False/proof/{l}{p}\">for all solutions</a>)\n",
+    // HS `autoProverLinks` (Web/Theory.hs:557-591) wraps each link's visible
+    // text in `keyword_` — an `hl_keyword` span in HtmlDoc mode, plain text
+    // otherwise.  `kw` renders that span under the active guard.  The line is
+    // assembled by `hsep` (single-space separators); the `b.`/`s.` suffixes are
+    // separate `text " …"` literals that BEGIN with a space (`boundDesc`,
+    // `allProve`), so `hsep`'s separator space PLUS the literal's leading space
+    // give the TWO spaces before "with"/"for".  `allProve = " for all lemmas "`
+    // also has a TRAILING space.  These are matched verbatim here (confirmed
+    // against the HS oracle).
+    let kw = |s: &str| hpj::keyword_(s).render();
+    // a. autoprove  (A. for all solutions)   [nameSuffix = emptyDoc]
+    out.push(format!(
+        "a. <a class=\"internal-link autoprove\" href=\"/thy/trace/{idx}/autoprove/idfs/0/False/proof/{l}{p}\">{ap}</a> \
+         (A. <a class=\"internal-link characterization\" href=\"/thy/trace/{idx}/autoprove/characterize/0/False/proof/{l}{p}\">{fas}</a>)",
+        ap = kw("autoprove"), fas = kw("for all solutions"),
     ));
-    // b. bounded autoprove  (B. for all solutions) with proof-depth bound N
-    out.push_str(&format!(
-        "b. <a class=\"internal-link bounded-autoprove\" href=\"/thy/trace/{idx}/autoprove/idfs/{bound}/False/proof/{l}{p}\">autoprove</a> \
-         (B. <a class=\"internal-link bounded-characterization\" href=\"/thy/trace/{idx}/autoprove/characterize/{bound}/False/proof/{l}{p}\">for all solutions</a>) with proof-depth bound {bound}\n",
+    // b. bounded autoprove  (B. for all solutions)  with proof-depth bound N
+    out.push(format!(
+        "b. <a class=\"internal-link bounded-autoprove\" href=\"/thy/trace/{idx}/autoprove/idfs/{bound}/False/proof/{l}{p}\">{ap}</a> \
+         (B. <a class=\"internal-link bounded-characterization\" href=\"/thy/trace/{idx}/autoprove/characterize/{bound}/False/proof/{l}{p}\">{fas}</a>)  with proof-depth bound {bound}",
+        ap = kw("autoprove"), fas = kw("for all solutions"),
     ));
-    // o. oracle autoprove — only when the heuristic uses an oracle.
+    // o. oracle autoprove — only when the heuristic uses an oracle
+    // (`nameSuffix = "until oracle returns nothing"`, no leading space, so a
+    // single hsep separator).
     if uses_oracle(ctx) {
-        out.push_str(&format!(
-            "o. <a class=\"internal-link oracle-autoprove\" href=\"/thy/trace/{idx}/autoprove/idfs/0/True/proof/{l}{p}\">autoprove</a> until oracle returns nothing\n",
+        out.push(format!(
+            "o. <a class=\"internal-link oracle-autoprove\" href=\"/thy/trace/{idx}/autoprove/idfs/0/True/proof/{l}{p}\">{ap}</a> until oracle returns nothing",
+            ap = kw("autoprove"),
         ));
     }
-    // s. autoprove for all lemmas  (S. for all solutions)
-    out.push_str(&format!(
-        "s. <a class=\"internal-link autoprove-all\" href=\"/thy/trace/{idx}/autoproveAll/idfs/0/proof/{l}{p}\">autoprove</a> \
-         (S. <a class=\"internal-link characterization-all\" href=\"/thy/trace/{idx}/autoproveAll/characterize/0/proof/{l}{p}\">for all solutions</a>) for all lemmas\n",
+    // s. autoprove for all lemmas  (S. for all solutions)  for all lemmas<trailing space>
+    out.push(format!(
+        "s. <a class=\"internal-link autoprove-all\" href=\"/thy/trace/{idx}/autoproveAll/idfs/0/proof/{l}{p}\">{ap}</a> \
+         (S. <a class=\"internal-link characterization-all\" href=\"/thy/trace/{idx}/autoproveAll/characterize/0/proof/{l}{p}\">{fas}</a>)  for all lemmas ",
+        ap = kw("autoprove"), fas = kw("for all solutions"),
     ));
 }
 

@@ -123,11 +123,76 @@ impl Drop for HtmlEntityWidthGuard {
     }
 }
 
+thread_local! {
+    /// The full "HtmlDoc" render mode: a faithful port of HS building every
+    /// web pane through the `HtmlDoc Doc` transformer (`Text/PrettyPrint/Html.hs`).
+    /// When enabled:
+    ///   * [`Doc::text`]/[`Doc::char`] run `escapeHtmlEntities` on their content
+    ///     BEFORE it enters the layout, exactly as the `Document (HtmlDoc d)`
+    ///     instance (`Html.hs:102-105`) — so the stored bytes are already escaped
+    ///     and the HughesPJ fill measures each token at its escaped-entity width
+    ///     (`<`/`>` = 4, `&`/`'` = 5, `"` = 6).  This subsumes the older
+    ///     width-only [`HtmlEntityWidthGuard`].
+    ///   * the highlight combinators ([`keyword`]/[`operator`]/[`comment`] via
+    ///     [`Doc::highlight`]) wrap their argument in a `<span class="hl_*">…</span>`
+    ///     emitted as ZERO-WIDTH text (HS `withTag`, `Html.hs:59-64`,
+    ///     `highlight`, `Html.hs:129-135`), so markup never perturbs line breaks.
+    ///     In plain mode they are the identity (HS plain `Doc` instance,
+    ///     `Highlight.hs:41-42`), so the `--prove` byte-identity corpus is
+    ///     untouched (the flag defaults to `false`).
+    ///
+    /// Scoped via [`HtmlDocGuard`]; presentation-only, never affects verdicts.
+    static HTML_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII guard enabling the full HtmlDoc render mode on the current thread until
+/// dropped (see [`HTML_MODE`]).  Restores the previous value on drop.
+pub struct HtmlDocGuard(bool);
+
+impl HtmlDocGuard {
+    /// Enable HtmlDoc mode for the current thread; the previous value is
+    /// restored when the returned guard is dropped.
+    pub fn enable() -> Self {
+        HtmlDocGuard(HTML_MODE.with(|c| c.replace(true)))
+    }
+}
+
+impl Drop for HtmlDocGuard {
+    fn drop(&mut self) {
+        HTML_MODE.with(|c| c.set(self.0));
+    }
+}
+
+/// Whether the full HtmlDoc render mode is active on this thread.
+#[inline]
+pub fn html_mode() -> bool {
+    HTML_MODE.with(|c| c.get())
+}
+
+/// HS `escapeHtmlEntities` (`Text/PrettyPrint/Html.hs:140-149`, copied there
+/// from blaze-html) — escape the five HTML metacharacters in the exact HS
+/// order/mapping so escaped column widths and output bytes match.
+pub fn escape_html_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            x => out.push(x),
+        }
+    }
+    out
+}
+
 /// The fill width of a text run `s`: its visible column count, or — under an
-/// active [`HtmlEntityWidthGuard`] — its HTML-entity-escaped column count.
+/// active [`HtmlEntityWidthGuard`] or [`HtmlDocGuard`] — its HTML-entity-escaped
+/// column count.
 #[inline]
 fn fill_width(s: &str) -> usize {
-    if HTML_ENTITY_WIDTH.with(|c| c.get()) {
+    if HTML_MODE.with(|c| c.get()) || HTML_ENTITY_WIDTH.with(|c| c.get()) {
         html_entity_col_width(s)
     } else {
         s.chars().count()
@@ -242,8 +307,19 @@ impl Doc {
     /// like CJK count as 1 in both).
     pub fn text<S: AsRef<str>>(s: S) -> Doc {
         let s = s.as_ref();
-        let w = fill_width(s);
-        Doc::text_w(s, w)
+        // HS `Document (HtmlDoc d)` (`Html.hs:104`): `text = HtmlDoc . text .
+        // escapeHtmlEntities`.  In HtmlDoc mode we escape the content up front so
+        // the stored bytes AND the layout width are the escaped form (a `<`
+        // costs 4 columns, matching HS).  In plain mode this is the byte-faithful
+        // `--prove` path — no escaping, visible-column width.
+        if html_mode() {
+            let esc = escape_html_entities(s);
+            let w = esc.chars().count();
+            Doc::text_w(&esc, w)
+        } else {
+            let w = fill_width(s);
+            Doc::text_w(s, w)
+        }
     }
 
     /// `text` with explicit width.  Use when `chars().count()` doesn't
@@ -259,8 +335,17 @@ impl Doc {
     pub fn char(c: char) -> Doc {
         let mut buf = [0u8; 4];
         let s = c.encode_utf8(&mut buf);
-        let w = fill_width(s);
-        Doc::text_w(s, w)
+        // HS `Document (HtmlDoc d)` (`Html.hs:103`): `char = HtmlDoc . text .
+        // escapeHtmlEntities . return`.  Escape in HtmlDoc mode (a bare `<`
+        // becomes `&lt;`, width 4); plain mode is unchanged.
+        if html_mode() {
+            let esc = escape_html_entities(s);
+            let w = esc.chars().count();
+            Doc::text_w(&esc, w)
+        } else {
+            let w = fill_width(s);
+            Doc::text_w(s, w)
+        }
     }
 
     /// HS `<>` (beside without space).
@@ -357,6 +442,209 @@ impl Doc {
                 Doc::Deferred(c) => (*c.force()).clone(),
             };
         }
+    }
+}
+
+// ============================================================================
+// Highlighting + HTML markup (port of Text.PrettyPrint.Highlight / .Html and
+// Theory.Text.Pretty).  All markup is emitted as ZERO-WIDTH text so it never
+// perturbs the layout the plain `--prove` path already produces byte-for-byte.
+// The highlight combinators are the identity in plain mode; the `with_tag`/
+// `closed_tag` helpers are web-pane-only (never reached from `--prove`) and
+// always emit their tags, mirroring HS's `HtmlDoc`/`NoHtmlDoc` split.
+// ============================================================================
+
+/// HS `HighlightStyle` (`Text/PrettyPrint/Highlight.hs:33`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hl {
+    Keyword,
+    Comment,
+    Operator,
+}
+
+/// HS `hlClass` (`Text/PrettyPrint/Html.hs:133-135`).
+fn hl_class(h: Hl) -> &'static str {
+    match h {
+        Hl::Comment => "hl_comment",
+        Hl::Keyword => "hl_keyword",
+        Hl::Operator => "hl_operator",
+    }
+}
+
+impl Doc {
+    /// HS `highlight` — `withTag "span" [("class", hlClass style)]` in the
+    /// `HtmlDoc` instance (`Html.hs:129-135`), the identity in the plain `Doc`
+    /// instance (`Highlight.hs:41-42`).
+    pub fn highlight(self, style: Hl) -> Doc {
+        if html_mode() {
+            with_tag("span", &[("class", hl_class(style))], self)
+        } else {
+            self
+        }
+    }
+}
+
+/// HS `attribute` (`Html.hs:83`): ` key="escaped-value"`.
+fn push_attribute(buf: &mut String, key: &str, value: &str) {
+    buf.push(' ');
+    buf.push_str(key);
+    buf.push_str("=\"");
+    buf.push_str(&escape_html_entities(value));
+    buf.push('"');
+}
+
+/// HS `withTag tag attrs inner` (`Html.hs:59-64`):
+/// `unescapedZeroWidthText open <> inner <> unescapedZeroWidthText close`.
+/// The open/close tags are ZERO-WIDTH (they don't move any line break), and the
+/// inner document is laid out normally.  Used only when building web panes.
+pub fn with_tag(tag: &str, attrs: &[(&str, &str)], inner: Doc) -> Doc {
+    let mut open = String::from("<");
+    open.push_str(tag);
+    for (k, v) in attrs {
+        push_attribute(&mut open, k, v);
+    }
+    open.push('>');
+    let close = format!("</{tag}>");
+    Doc::text_w(&open, 0).beside(inner).beside(Doc::text_w(&close, 0))
+}
+
+/// HS `closedTag tag attrs` (`Html.hs:71-73`): `<tag …/>` as zero-width text.
+pub fn closed_tag(tag: &str, attrs: &[(&str, &str)]) -> Doc {
+    let mut s = String::from("<");
+    s.push_str(tag);
+    for (k, v) in attrs {
+        push_attribute(&mut s, k, v);
+    }
+    s.push_str("/>");
+    Doc::text_w(&s, 0)
+}
+
+/// The opening `<span class="hl_*">` tag for a highlight style, or the empty
+/// string in plain mode.  Together with [`hl_close`] this is the exact markup
+/// HS `withTag "span"`/`highlight` emits (zero-width), exposed for the few
+/// String-based printers that wrap an already-rendered MULTI-LINE block (e.g.
+/// a `multiComment` around an expanded-formula block); injecting these at the
+/// block's start/end is the same mechanism, and it keeps the plain-mode bytes
+/// exactly equal to the pre-existing literal.
+pub fn hl_open(style: Hl) -> String {
+    if html_mode() {
+        format!("<span class=\"{}\">", hl_class(style))
+    } else {
+        String::new()
+    }
+}
+
+/// The closing `</span>` tag for a highlight style, or the empty string in
+/// plain mode.  See [`hl_open`].  The style is accepted for call-site symmetry
+/// with [`hl_open`] (every `</span>` is identical regardless of class).
+pub fn hl_close(_style: Hl) -> String {
+    if html_mode() {
+        "</span>".to_string()
+    } else {
+        String::new()
+    }
+}
+
+// -- General highlighters (HS Highlight.hs:48-59) -----------------------------
+
+pub fn comment(d: Doc) -> Doc { d.highlight(Hl::Comment) }
+pub fn keyword(d: Doc) -> Doc { d.highlight(Hl::Keyword) }
+pub fn operator(d: Doc) -> Doc { d.highlight(Hl::Operator) }
+
+pub fn comment_(s: &str) -> Doc { comment(Doc::text(s)) }
+pub fn keyword_(s: &str) -> Doc { keyword(Doc::text(s)) }
+pub fn operator_(s: &str) -> Doc { operator(Doc::text(s)) }
+
+/// HS `opParens d = operator_ "(" <> d <> operator_ ")"` (`Highlight.hs:58-59`).
+pub fn op_parens(d: Doc) -> Doc {
+    operator_("(").beside(d).beside(operator_(")"))
+}
+
+/// HS `parens p = char '(' <> p <> char ')'` (`Class.hs:149`) — PLAIN parens
+/// (no highlight), used e.g. around `(modulo AC)`.
+pub fn parens(d: Doc) -> Doc {
+    Doc::char('(').beside(d).beside(Doc::char(')'))
+}
+
+// -- Comments (HS Theory.Text.Pretty.hs:96-112) -------------------------------
+
+/// HS `lineComment_ s = comment $ text "//" <-> text s` (`Pretty.hs:96-100`).
+pub fn line_comment_(s: &str) -> Doc {
+    comment(Doc::text("//").beside_sp(Doc::text(s)))
+}
+
+/// HS `multiComment_ ls = comment $ fsep [text "/*", vcat (map text ls),
+/// text "*/"]` (`Pretty.hs:105-106`).
+pub fn multi_comment_(lines: &[&str]) -> Doc {
+    let body = vcat(lines.iter().map(|l| Doc::text(*l)).collect());
+    comment(fsep(vec![Doc::text("/*"), body, Doc::text("*/")]))
+}
+
+/// HS `closedComment_ s = comment $ fsep [text "/*", text s, text "*/"]`
+/// (`Pretty.hs:111-112`).
+pub fn closed_comment_(s: &str) -> Doc {
+    comment(fsep(vec![Doc::text("/*"), Doc::text(s), Doc::text("*/")]))
+}
+
+// -- Keyword composites (HS Theory.Text.Pretty.hs:148-159) --------------------
+
+/// HS `kwModulo what thy = keyword_ what <-> parens (keyword_ "modulo" <->
+/// text thy)` (`Pretty.hs:148-152`).
+pub fn kw_modulo(what: &str, thy: &str) -> Doc {
+    keyword_(what).beside_sp(parens(keyword_("modulo").beside_sp(Doc::text(thy))))
+}
+
+/// HS `kwRuleModulo = kwModulo "rule"` (`Pretty.hs:156`).
+pub fn kw_rule_modulo(thy: &str) -> Doc {
+    kw_modulo("rule", thy)
+}
+
+// -- Postprocessing (HS Html.hs:155-162) --------------------------------------
+
+/// HS `postprocessHtmlDoc = unlines . map (addBreak . indent) . lines`
+/// (`Html.hs:157-162`): every line's leading spaces become `&nbsp;` runs, a
+/// `<br/>` is appended to every line, and lines are re-joined with `\n` (with a
+/// trailing `\n`, matching `unlines`).  `lines` treats `\n` as a terminator, so
+/// a trailing `\n` in the input does NOT create an extra empty line.
+pub fn postprocess_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + s.len() / 4);
+    let mut rest = s;
+    loop {
+        let (line, tail, more) = match rest.find('\n') {
+            Some(idx) => (&rest[..idx], &rest[idx + 1..], true),
+            None => {
+                if rest.is_empty() {
+                    break;
+                }
+                (rest, "", false)
+            }
+        };
+        let mut suffix_offset = 0;
+        for c in line.chars() {
+            if c != ' ' {
+                break;
+            }
+            out.push_str("&nbsp;");
+            suffix_offset += c.len_utf8();
+        }
+        out.push_str(&line[suffix_offset..]);
+        out.push_str("<br/>");
+        out.push('\n');
+        if !more {
+            break;
+        }
+        rest = tail;
+    }
+    out
+}
+
+impl Doc {
+    /// HS `renderHtmlDoc = postprocessHtmlDoc . render . getHtmlDoc`
+    /// (`Html.hs:151-153`).  Must be called with an [`HtmlDocGuard`] active so
+    /// the doc was built with escaped content + zero-width markup; `render`
+    /// uses the process display width (100/67 on the web server).
+    pub fn render_html(self) -> String {
+        postprocess_html(&self.render())
     }
 }
 

@@ -384,7 +384,12 @@ pub fn pretty_closed_theory(
 /// (Signature.hs) — the same signature block the theory body prints
 /// (`render_signature`).  Used by the web message page's "Signature" section.
 pub fn web_signature_block(sig: &tamarin_term::maude_sig::MaudeSig) -> String {
-    render_signature(sig)
+    // `render_signature` appends a trailing `\n` after each block for the
+    // `--prove` theory-body layout (where more theory items follow).  HS's
+    // `prettySignatureWithMaude` is one self-contained Doc with no trailing
+    // blank, and `messageSnippet` wraps just that Doc: strip the trailing
+    // newline so `</p>` glues directly after the last signature line.
+    render_signature(sig).trim_end_matches('\n').to_string()
 }
 
 /// HS `prettyGoal` (Constraints.hs:262-285) — reuses the byte-faithful
@@ -392,6 +397,41 @@ pub fn web_signature_block(sig: &tamarin_term::maude_sig::MaudeSig) -> String {
 /// web source-case header/premise (`htmlSource`'s `prettyGoal th._cdGoal`).
 pub fn web_pretty_goal(g: &crate::constraint::constraints::Goal) -> String {
     solve_goal_to_doc(g).render()
+}
+
+/// HS `ppPrem = nest 2 (doubleQuotes (prettyGoal th._cdGoal))`
+/// (Web/Theory.hs:830).  `doubleQuotes d = char '"' <> d <> char '"'` (the
+/// quotes entity-escape to `&quot;` under the active HtmlDoc guard); the
+/// `nest 2` indents wrapped continuation lines.  Rendered as ONE Doc so a long
+/// source goal wraps exactly as HS `renderHtmlDoc` (the per-case `<p>` prem).
+fn web_source_prem_doc(g: &crate::constraint::constraints::Goal) -> crate::pretty_hpj::Doc {
+    use crate::pretty_hpj::Doc;
+    Doc::text("\"")
+        .beside(solve_goal_to_doc(g))
+        .beside(Doc::text("\""))
+        .nest(2)
+}
+
+/// HS per-case `withTag "p" [] ppPrem` premise (Web/Theory.hs:837): the whole
+/// `<p>` is built as ONE Doc via `with_tag`, so the `nest 2` indents only
+/// WRAPPED continuation lines — the `<p>` tag is zero-width and the prem sits
+/// BESIDE it, so line 1 carries no leading indent (a standalone `.render()`
+/// WOULD emit the nest on line 1, which HS does not).  Returns `<p>…</p>`.
+pub fn web_pretty_source_prem(g: &crate::constraint::constraints::Goal) -> String {
+    crate::pretty_hpj::with_tag("p", &[], web_source_prem_doc(g)).render()
+}
+
+/// HS `ppHeader = hsep [text "Sources of" <-> ppPrem, parens (nCases <->
+/// text "cases")]` (Web/Theory.hs:832-834).  Built and rendered as ONE Doc so
+/// the goal wraps at the web width WITH the `Sources of ` prefix offset — the
+/// `<h2>` source header (`n_cases` is the number of cases).
+pub fn web_pretty_source_header(
+    g: &crate::constraint::constraints::Goal, n_cases: usize) -> String {
+    use crate::pretty_hpj::{self as hpj, Doc};
+    let left = Doc::text("Sources of").beside_sp(web_source_prem_doc(g));
+    let right = hpj::parens(
+        Doc::text(n_cases.to_string()).beside_sp(Doc::text("cases")));
+    hpj::hsep(vec![left, right]).render()
 }
 
 /// Collect the theory's macros + predicates the way `pretty_closed_theory`
@@ -799,7 +839,11 @@ fn wrap_with_lead<S: AsRef<str>>(lead: &str, items: &[S]) -> String {
     if items.is_empty() { return String::new(); }
     let docs: Vec<Doc> = items.iter().map(Doc::text).collect();
     let body = hpj::fsep(hpj::punctuate(Doc::char(','), docs));
-    Doc::text(lead).beside_sp(body).render()
+    // HS `ppNonEmptyList' name = (keyword_ name <->) . fsep`
+    // (Term/Maude/Signature.hs:229) — the `builtins:`/`functions:` lead is a
+    // keyword.  `keyword_` is the identity in plain mode, so `--prove` is
+    // unchanged.
+    hpj::keyword_(lead).beside_sp(body).render()
 }
 
 /// HS `equations:` layout (Term/Maude/Signature.hs:224-225):
@@ -826,11 +870,13 @@ fn sep_block_with_lead(lead: &str, items: &[(crate::pretty_hpj::Doc, crate::pret
     if items.is_empty() { return String::new(); }
     let n = items.len();
     let mut docs: Vec<Doc> = Vec::with_capacity(n + 1);
-    docs.push(Doc::text(lead));
+    // HS `keyword_ "equations:"` / `keyword_ "equations [convergent]:"`
+    // (Term/Maude/Signature.hs:225).  Identity in plain mode.
+    docs.push(hpj::keyword_(lead));
     for (i, (lhs, rhs)) in items.iter().enumerate() {
-        // prettyCtxtStRule: sep [ nest 2 lhs, "=" <-> rhs ]
+        // prettyCtxtStRule: sep [ nest 2 lhs, operator_ "=" <-> rhs ]
         let lhs_doc = lhs.clone().nest(2);
-        let eq_doc = Doc::text("=").beside_sp(rhs.clone());
+        let eq_doc = hpj::operator_("=").beside_sp(rhs.clone());
         let mut d = hpj::sep(vec![lhs_doc, eq_doc]);
         if i + 1 < n {
             d = d.beside(Doc::char(','));
@@ -1206,7 +1252,7 @@ fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro], arity1
     // to HS.  `<->`/`<+>` = space, `<>` = no space.
     {
         use crate::pretty_hpj::Doc;
-        let header = Doc::text("rule (modulo E)")
+        let header = crate::pretty_hpj::kw_rule_modulo("E")
             .beside_sp(Doc::text(name.clone()))
             .beside(rule_attributes_doc(&parsed_rule.attributes))
             .beside(Doc::text(":"));
@@ -1370,7 +1416,15 @@ fn render_rule(parsed_rule: &p::Rule, elab: &Theory, macros: &[p::Macro], arity1
     if trivial {
         out.push_str("\n\n");
         out.push_str(&outer_loop_breaker);
-        out.push_str("  /* has exactly the trivial AC variant */");
+        // HS trivial branch: `nest 2 (multiComment_ ["has exactly the trivial
+        // AC variant"])` (ClosedTheory.hs:337-339).  In HtmlDoc mode this yields
+        // an `hl_comment` span; in plain mode `multi_comment_` renders exactly
+        // `/* has exactly the trivial AC variant */` (single line at this width),
+        // byte-identical to the previous literal, so `--prove` is unchanged.
+        out.push_str("  ");
+        out.push_str(
+            &crate::pretty_hpj::multi_comment_(&["has exactly the trivial AC variant"]).render(),
+        );
     } else if let Some(r) = elab_rule {
         out.push_str("\n\n");
         out.push_str(&outer_loop_breaker);
@@ -1488,8 +1542,14 @@ fn render_rule_body_at(prems: &[p::Fact], acts: &[p::Fact], concs: &[p::Fact], i
 /// where the AC body differs from the E body but no residual variant
 /// disjunction remains.
 fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule, attrs: &[p::RuleAttr]) -> String {
+    use crate::pretty_hpj::{hl_open, hl_close, Hl};
     let mut s = String::new();
-    s.push_str("  /*\n");
+    // HS `nest 2 (multiComment (prettyProtoRuleAC ruAC))` (ClosedTheory.hs:354):
+    // `multiComment = comment (fsep [text "/*", …, text "*/"])` wraps the whole
+    // `/* … */` in an `hl_comment` span (opened after the 2-space indent).
+    s.push_str("  ");
+    s.push_str(&hl_open(Hl::Comment));
+    s.push_str("/*\n");
     // HS renders the AC rule via `nest 2 (multiComment (prettyProtoRuleAC …))`
     // (ClosedTheory.hs:354), so the `rule (modulo AC) <name>[attrs]:` header
     // line sits at column 2 and its attribute-list `fsep` wraps at the ribbon
@@ -1504,7 +1564,7 @@ fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule, att
         // from the nest-2 baseline (a literal 2-space text prefix would charge
         // the first line differently and wrap one element too early; cf.
         // no-replication.spthy `news_0_`).
-        let header = Doc::text("rule (modulo AC)")
+        let header = crate::pretty_hpj::kw_rule_modulo("AC")
             .beside_sp(Doc::text(name))
             .beside(rule_attributes_doc(attrs))
             .beside(Doc::text(":"))
@@ -1542,7 +1602,11 @@ fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule, att
     // residual disjunction beyond the identity.
     let has_residual_variants = rule.variant_substs.iter().any(|sub| !sub.is_empty());
     if has_residual_variants {
-        s.push_str("    variants (modulo AC)\n");
+        // HS `kwVariantsModulo "AC"` = `kwModulo "variants" "AC"` =
+        // `keyword_ "variants" <-> parens (keyword_ "modulo" <-> text "AC")`.
+        s.push_str("    ");
+        s.push_str(&crate::pretty_hpj::kw_modulo("variants", "AC").render());
+        s.push('\n');
         // HS `prettyDisjLNSubstsVFresh = numbered' (map ppConj substs)`
         // (SubstVFresh.hs:223-227).  Built and rendered as ONE Doc at
         // `nest 4` so the `text i <> ". " <> vcat` beside-onto-multiline
@@ -1556,6 +1620,7 @@ fn render_ac_variants_block(name: &str, rule: &crate::theory::OpenProtoRule, att
     // at indent 2 inside `nest 2 (multiComment ...)`).
     s.push_str(&render_loop_breakers_line(&rule.loop_breakers, 4));
     s.push_str("  */");
+    s.push_str(&hl_close(Hl::Comment));
     s
 }
 
@@ -1591,6 +1656,9 @@ fn variant_subst_doc(
     // (beside-with-space).
     let eq_docs: Vec<Doc> = bindings.iter().map(|(v, t)| {
         let term_doc = pf::term_to_doc(&lnterm_to_parser(t), &[]);
+        // HS `prettyEq (a,b) = prettyNTerm (Var a) $$ nest 6 (text "=" <->
+        // prettyNTerm b)` (SubstVFresh.hs:228-229) — the substitution `=` is a
+        // PLAIN `text`, NOT `opEqual`, so it carries no `hl_operator` span.
         let rhs = Doc::text("=").beside_sp(term_doc).nest(6);
         Doc::text(render_lvar(v)).above(rhs)
     }).collect();
@@ -2009,22 +2077,35 @@ fn render_parsed_restriction(r: &p::Restriction, macros: &[p::Macro], predicates
                     &crate::macro_expand::apply_macros_formula(macros, &r.formula), predicates),
                 arity1))
     };
+    use crate::pretty_hpj::{keyword_, line_comment_, hl_open, hl_close, html_mode,
+                            escape_html_entities, Hl};
     let mut out = String::new();
-    out.push_str("restriction ");
-    out.push_str(&r.name);
+    // HS `kwRestriction <-> text name <> colon` (TheoryObject.hs:848-849):
+    // `restriction` is a keyword; the name is `text` (entity-escaped in HtmlDoc
+    // mode).  `keyword_`/escaping are identities in plain mode.
+    out.push_str(&keyword_("restriction").render());
+    out.push(' ');
+    if html_mode() { out.push_str(&escape_html_entities(&r.name)); } else { out.push_str(&r.name); }
     out.push_str(":\n");
     // Top-level display: original formula (macro form) — `fromMaybe expandedFormula ogFormula`.
     // Since ogFormula = Just original, this always shows `r.formula` (macro form).
     out.push_str(&pf::formula_doublequoted_nested(&original, 2));
-    // Safety annotation: `if safety then "// safety formula" else emptyDoc`.
-    // HS checks `isSafetyFormula (formulaToGuarded_ expandedFormula)`.
+    // Safety annotation: `nest 2 (if safety then lineComment_ "safety formula"
+    // else emptyDoc)` (TheoryObject.hs:851).
     if is_safety_formula(&expanded) {
-        out.push_str("\n  // safety formula");
+        out.push_str("\n  ");
+        out.push_str(&line_comment_("safety formula").render());
     }
-    // Expanded formula block (always emitted — HS always has ogFormula = Just _).
-    out.push_str("\n\n  /*\n  expanded formula:\n");
+    // Expanded formula block: `nest 2 (multiComment (text "expanded formula:"
+    // $-$ doubleQuotes (prettyLNFormula expandedFormula)))` (TheoryObject.hs:
+    // 852-854).  `multiComment = comment (…)` wraps the whole `/* … */` in an
+    // `hl_comment` span; the inner formula still carries its own operator spans.
+    out.push_str("\n\n  ");
+    out.push_str(&hl_open(Hl::Comment));
+    out.push_str("/*\n  expanded formula:\n");
     out.push_str(&pf::formula_doublequoted_nested(&expanded, 2));
     out.push_str("\n  */");
+    out.push_str(&hl_close(Hl::Comment));
     out
 }
 
@@ -2358,9 +2439,11 @@ fn pp_step_doc(
                 Goal::Disj(d) if !d.0.is_empty() => pf::disj_goal_to_doc(&d.0),
                 _ => solve_goal_to_doc(g),
             };
-            Doc::text("solve(")
+            // HS `keyword_ "solve(" <-> prettyGoal goal <-> keyword_ ")"`
+            // (ProofMethod.hs:1493) — `solve(` and `)` are `hl_keyword` spans.
+            crate::pretty_hpj::keyword_("solve(")
                 .beside_sp(inner)
-                .beside_sp(Doc::text(")"))
+                .beside_sp(crate::pretty_hpj::keyword_(")"))
         }
         // A `RawSolve` is the display-only method kept for an unannotated
         // (replayed) subtree (replay.rs `parsed_to_unannotated`).  HS's
@@ -2386,23 +2469,47 @@ fn pp_step_doc(
         // onto their own lines at deep proof-tree indentation, identical
         // to HS.
         PM::Finished(MR::Contradictory(reason)) => {
-            let contra = Doc::text("contradiction");
+            // HS `sep [keyword_ "contradiction", maybe emptyDoc (closedComment
+            // . prettyContradiction) reason]` (ProofMethod.hs:1495-1497).
+            let contra = crate::pretty_hpj::keyword_("contradiction");
             match reason {
                 None => contra,
                 Some(c) => {
-                    let inner = crate::pretty_hpj::fsep(vec![
+                    // `closedComment d = comment (fsep [text "/*", d, text "*/"])`.
+                    let inner = crate::pretty_hpj::comment(crate::pretty_hpj::fsep(vec![
                         Doc::text("/*"),
                         Doc::text(pp_contradiction(c)),
                         Doc::text("*/"),
-                    ]);
+                    ]));
                     crate::pretty_hpj::sep(vec![contra, inner])
                 }
             }
         }
-        // For non-SolveGoal methods the goal indent argument is unused;
-        // reuse `pp_step_at`'s string form.  `by `-prefixed leaf steps
-        // (e.g. `by sorry`) render the method at the post-prefix column.
-        _ => Doc::text(pp_step_at(m, base_indent + prefix.chars().count())),
+        // HS `prettyProofMethod` leaf keywords/comments (ProofMethod.hs:1488-1494).
+        // Built as all-`beside` chains (no `fsep`) so plain-mode layout is
+        // byte-identical to the previous flat `pp_step_at` string (the highlight
+        // combinators are the identity there); HtmlDoc mode adds `hl_*` spans.
+        PM::Simplify => crate::pretty_hpj::keyword_("simplify"),
+        PM::Induction => crate::pretty_hpj::keyword_("induction"),
+        PM::Finished(MR::Solved) => crate::pretty_hpj::keyword_("SOLVED")
+            .beside_sp(crate::pretty_hpj::line_comment_("trace found")),
+        PM::Finished(MR::Unfinishable) => crate::pretty_hpj::keyword_("UNFINISHABLE")
+            .beside_sp(crate::pretty_hpj::line_comment_("reducible operator in subterm")),
+        PM::Invalidated => crate::pretty_hpj::line_comment_(
+            "proof may have been invalidated by editing a reuse lemma above. You should "),
+        // HS `Sorry reason -> fsep [keyword_ "sorry", maybe emptyDoc
+        // closedComment_ reason]` (ProofMethod.hs:1490-1491).  `keyword_` is
+        // identity in plain mode, so `sorry` / `sorry /* reason */` is
+        // byte-identical to the old flat `pp_step_at` string (verified against
+        // the `--prove` baseline); HtmlDoc mode adds the `hl_keyword`/`hl_comment`
+        // spans the overview `#proof` index needs.  `fsep [x, emptyDoc] = x`.
+        PM::Sorry(reason) => match reason {
+            None => crate::pretty_hpj::keyword_("sorry"),
+            Some(r) => crate::pretty_hpj::fsep(vec![
+                crate::pretty_hpj::keyword_("sorry"),
+                crate::pretty_hpj::closed_comment_(r),
+            ]),
+        },
     };
     if prefix.is_empty() {
         body
@@ -2490,11 +2597,15 @@ pub(crate) fn render_goal_for_oracle(g: &crate::constraint::constraints::Goal) -
 /// back to the verbatim text — those goals are short and never wrap, so HS
 /// renders them on one line too.
 fn raw_solve_to_doc(raw: &str) -> crate::pretty_hpj::Doc {
-    use crate::pretty_hpj::Doc;
+    // Mirror HS `SolveGoal goal -> keyword_ "solve(" <-> prettyGoal goal <->
+    // keyword_ ")"` (ProofMethod.hs:1493): the `solve(` / `)` delimiters are
+    // `hl_keyword` spans (identity in plain mode, so batch bytes are
+    // unchanged).  The unannotated-replay overview index (`hl_superfluous`
+    // steps) needs these spans to match HS.
     let goal_doc = raw_goal_to_doc(raw);
-    Doc::text("solve(")
+    crate::pretty_hpj::keyword_("solve(")
         .beside_sp(goal_doc)
-        .beside_sp(Doc::text(")"))
+        .beside_sp(crate::pretty_hpj::keyword_(")"))
 }
 
 /// Re-render the goal text inside a `solve( ... )` (the part between the
@@ -2517,7 +2628,7 @@ fn raw_goal_to_doc(raw: &str) -> crate::pretty_hpj::Doc {
         // the head is byte-identical to HS's re-render.
         GoalSpec::Action { fact, time_var, time_idx } => {
             reparse_fact_doc(&fact)
-                .beside_sp(Doc::text("@"))
+                .beside_sp(crate::pretty_hpj::operator_("@"))
                 .beside_sp(Doc::text(render_node_id_str(&time_var, time_idx)))
         }
         // `prettyGoal (PremiseG (i, PremIdx v) fa) =
@@ -2543,13 +2654,23 @@ fn raw_goal_to_doc(raw: &str) -> crate::pretty_hpj::Doc {
         GoalSpec::Subterm { small_raw, big_raw } => {
             match (parse_term_str(small_raw.trim()), parse_term_str(big_raw.trim())) {
                 (Ok(l), Ok(r)) => pf::term_doc(&l)
-                    .beside_sp(Doc::text("\u{228F}"))
+                    .beside_sp(crate::pretty_hpj::operator_("\u{228F}"))
                     .beside_sp(pf::term_doc(&r)),
                 _ => Doc::text(trimmed),
             }
         }
-        // `splitEqs(N)` and `(#i,n) ~~> (#j,m)` never wrap; keep verbatim.
-        GoalSpec::Split { .. } | GoalSpec::Chain { .. } => Doc::text(trimmed),
+        // `splitEqs(N)` never wraps; keep verbatim.
+        GoalSpec::Split { .. } => Doc::text(trimmed),
+        // `prettyGoal (ChainG c p) = prettyNodeConc c <-> operator_ "~~>" <->
+        //  prettyNodePrem p` (Constraints.hs).  The endpoints render as plain
+        // node text; only the `~~>` arrow is an `hl_operator` span.  The stored
+        // goal text is exactly `<conc> ~~> <prem>`, so split on the arrow.
+        GoalSpec::Chain { .. } => match trimmed.split_once("~~>") {
+            Some((l, r)) => Doc::text(l.trim_end().to_string())
+                .beside_sp(crate::pretty_hpj::operator_("~~>"))
+                .beside_sp(Doc::text(r.trim_start().to_string())),
+            None => Doc::text(trimmed),
+        },
         // Unrecognised goal shapes: a lone guarded formula goal (e.g. a
         // single quantified alt) parses here.  Try formula→guarded so it
         // re-wraps like HS's `prettyGuarded`; else keep verbatim.
@@ -2681,14 +2802,14 @@ pub(crate) fn solve_goal_to_doc(
         Goal::Action(i, fa) => {
             let nid = render_node_id(i);
             pf::fact_doc(&lnfact_to_parser(fa))
-                .beside_sp(Doc::text("@"))
+                .beside_sp(crate::pretty_hpj::operator_("@"))
                 .beside_sp(Doc::text(nid))
         }
         // `prettyGoal (ChainG c p) =
         //    prettyNodeConc c <-> operator_ "~~>" <-> prettyNodePrem p`.
         Goal::Chain(c, p) => {
             Doc::text(render_node_conc(c))
-                .beside_sp(Doc::text("~~>"))
+                .beside_sp(crate::pretty_hpj::operator_("~~>"))
                 .beside_sp(Doc::text(render_node_prem(p)))
         }
         // `prettyGoal (PremiseG (i, PremIdx v) fa) =
@@ -2705,7 +2826,7 @@ pub(crate) fn solve_goal_to_doc(
         Goal::Split(id) => Doc::text(format!("splitEqs({})", id.0)),
         // `prettyGoal (DisjG (Disj [])) = text "Disj" <-> operator_ "(⊥)"`.
         Goal::Disj(d) if d.0.is_empty() => {
-            Doc::text("Disj").beside_sp(Doc::text("(\u{22A5})"))
+            Doc::text("Disj").beside_sp(crate::pretty_hpj::operator_("(\u{22A5})"))
         }
         // Non-empty DisjG renders via the Doc form (`disj_goal_to_doc`).
         Goal::Disj(d) => pf::disj_goal_to_doc(&d.0),
@@ -2713,7 +2834,7 @@ pub(crate) fn solve_goal_to_doc(
         //    prettyLNTerm l <-> operator_ "⊏" <-> prettyLNTerm r`.
         Goal::Subterm((l, r)) => {
             pf::term_doc(&lnterm_to_parser(l))
-                .beside_sp(Doc::text("\u{228F}"))
+                .beside_sp(crate::pretty_hpj::operator_("\u{228F}"))
                 .beside_sp(pf::term_doc(&lnterm_to_parser(r)))
         }
     }

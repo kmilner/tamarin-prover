@@ -336,7 +336,13 @@ async fn test_overview_help_panes_are_direct_body_children() {
                     // Skip to end of tag.
                     let end = inner[i..].find('>').unwrap_or(0);
                     let tag = &inner[i..i + end];
-                    let is_self_close = tag.ends_with('/');
+                    // A trailing `/` is only a self-close marker when it is a
+                    // standalone token (` />` / `"/>` / `'/>`).  Hamlet emits
+                    // unquoted URL attributes like `<a href=/>` (RootR), whose
+                    // trailing `/` is part of the value `/` — NOT a self-close.
+                    let is_self_close = tag.ends_with('/')
+                        && tag[..tag.len() - 1]
+                            .ends_with([' ', '"', '\'']);
                     let starts = i + 1;
                     let name_end = tag[1..]
                         .find([' ', '>', '/'])

@@ -137,64 +137,41 @@ pub struct KillQuery {
 // ---------------------------------------------------------------------
 fn render_index(state: &AppState) -> String {
     let theories = state.store.list();
-    let mut rows = String::new();
-    if theories.is_empty() {
-        rows.push_str("<p><strong>No theories loaded!</strong></p>\n");
+    // HS `theoriesTpl` (Web/Hamlet.hs:84-101): the `<table>…</table><br>` (or
+    // the empty-branch `<strong>No theories loaded!</strong><br>`) that fills
+    // the second `intropage` `<p>` of `rootTpl`.
+    let theories_content = if theories.is_empty() {
+        "<strong>No theories loaded!</strong><br>".to_string()
     } else {
-        rows.push_str(r#"<table>
-<thead><tr><th>Theory name</th><th>Time</th><th>Version</th><th>Origin</th></tr></thead>
-<tbody>"#);
+        // HS `theoryTpl` (Web/Hamlet.hs:116-139): one `<tr>` per theory.  The
+        // `<thead>` emits four bare `<th>…</th>` (no `<tr>`), exactly as hamlet
+        // renders it.
+        let mut rows = String::new();
         for t in &theories {
             let link = format!("/thy/trace/{}/overview/help", t.idx);
             let time = t.loaded_at.format("%T");
-            let primary = if t.primary { "Original" } else { "<em>Modified</em>" };
+            // `$if getEitherTheoryPrimary` → `<td>Original`, else `<td><em>Modified`.
+            let primary = if t.primary { "<td>Original</td>" } else { "<td><em>Modified</em></td>" };
             rows.push_str(&format!(
-                "<tr><td><a href=\"{}\">{}</a></td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
-                html_escape(&link),
-                html_escape(&t.name),
-                time,
-                primary,
-                html_escape(&t.origin.label()),
+                "<tr><td><a href=\"{link}\">{name}</a></td><td>{time}</td>{primary}<td>{origin}</td></tr>",
+                link = html_escape(&link),
+                name = html_escape(&t.name),
+                origin = html_escape(&t.origin.label()),
             ));
         }
-        rows.push_str("</tbody></table>\n");
-    }
-
-    format!(r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Tamarin prover (Rust port)</title>
-<link rel="stylesheet" href="/static/css/tamarin-prover-ui.css">
-<link rel="stylesheet" href="/static/css/jquery-contextmenu.css">
-<link rel="stylesheet" href="/static/css/smoothness/jquery-ui.css">
-<script src="/static/js/jquery.js"></script>
-<script src="/static/js/jquery-ui.js"></script>
-<script src="/static/js/tamarin-prover-ui.js"></script>
-</head>
-<body>
-<div id="introbar">
-  <div id="header-info">
-    Running <a href="/"><span class="tamarin">Tamarin</span></a> {version} (Rust port)
-  </div>
-</div>
-<div id="logo"><p><img src="/static/img/tamarin-logo-3-0-0.png"></p></div>
-<div class="intropage">
-<noscript><div class="warning">JavaScript must be enabled for the Tamarin UI to function properly.</div></noscript>
-<h2>Loaded theories</h2>
-{rows}
-<h2>Loading a new theory</h2>
-<form class="root-form" enctype="multipart/form-data" action="/" method="POST">
-  <label>Filename: <input type="file" name="uploadedTheory"></label>
-  <div class="submit-form"><input type="submit" value="Load new theory"></div>
-</form>
-<p>Note: You can save a theory by downloading the source from the Actions menu.</p>
-</div>
-</body>
-</html>
-"#,
+        format!("<table><thead><th>Theory name</th><th>Time</th><th>Version</th><th>Origin</th></thead>{rows}</table><br>")
+    };
+    // Byte-faithful port of HS `defaultLayout'` (Web/Types.hs:686-723) wrapping
+    // `rootTpl` + `introTpl` (Web/Hamlet.hs).  Volatile substitutions: the
+    // `{version}` header field (matches `showVersion version`) and the
+    // `{theories_content}` table.  Everything else — including hamlet's
+    // unquoted `href=/`, the doubled `</script></script>` close tags, the
+    // `<p class="loading">` banner and the `contextMenu` — is verbatim.
+    format!(
+        r##"<!DOCTYPE html>
+<html><head><title>Welcome to the Tamarin prover</title><link rel="stylesheet" href="/static/css/intdot-style.css"><link rel="stylesheet" href="/static/css/tamarin-prover-ui.css"><link rel="stylesheet" href="/static/css/jquery-contextmenu.css"><link rel="stylesheet" href="/static/css/smoothness/jquery-ui.css"><script src="/static/js/jquery.js"></script></script><script src="/static/js/jquery-ui.js"></script></script><script src="/static/js/jquery-layout.js"></script></script><script src="/static/js/jquery-cookie.js"></script></script><script src="/static/js/jquery-superfish.js"></script></script><script src="/static/js/jquery-contextmenu.js"></script></script><script src="/static/js/tamarin-prover-ui.js"></script></script><script type="module" src="/static/js/intdot-graph.es.js"></script></script><script type="module" src="/static/js/intdot-staticgraph.es.js"></script></script><script type="module" src="/static/js/intdot-dynamicgraph.es.js"></script></script></head><body><p class="loading">Analyzing, please wait...  <a id=cancel href='#'>Cancel</a></p><div class="ui-layout-container"><div class="ui-layout-north"><div class="ui-layout-pane"><div class="layout-pane-north"><div class="ui-layout-pane-north"><div id="introbar"><div id="header-info">Running <a href=/><span class="tamarin">Tamarin</span></a> {version}</div></div></div></div></div></div></div><div id="logo"><p><img src="/static/img/tamarin-logo-3-0-0.png"></p></div><noscript><div class="warning">Warning: JavaScript must be enabled for the <span class="tamarin">Tamarin</span> prover GUI to function properly.</div></noscript><div class="intropage"><p>Core team: <a href="https://www.inf.ethz.ch/personal/basin/">David Basin</a>, <a href="https://cispa.saarland/group/cremers/">Cas Cremers</a>, <a href="https://www.jannikdreier.net">Jannik Dreier</a>, <a href="mailto:iridcode@gmail.com">Simon Meier</a>, <a href="https://people.inf.ethz.ch/rsasse/">Ralf Sasse</a>, <a href="https://beschmi.net">Benedikt Schmidt</a><br>Tamarin is a collaborative effort: see the <a href="https://tamarin-prover.com/manual/index.html">manual</a> for a more extensive overview of its development and additional contributors.</p><p>This program comes with ABSOLUTELY NO WARRANTY. It is free software, and you are welcome to redistribute it according to its <a href="/static/LICENSE" type="text/plain">LICENSE.</a></p><p>More information about Tamarin and technical papers describing the underlying theory can be found on the <a href="https://tamarin-prover.com"><span class="tamarin">Tamarin</span> webpage</a>.</p></div><div class="intropage"><p>{theories_content}</p><h2>Loading a new theory</h2><p>You can load a new theory file from disk in order to work with it.</p><form class="root-form" enctype="multipart/form-data" action="/" method="POST">Filename:<input type="file" name="uploadedTheory"><div class="submit-form"><input type="submit" value="Load new theory"></div></form><p>Note: You can save a theory by downloading the source from the Actions menu.</p></div><div id="dialog"></div><div id="confirm-dialog"></div><ul id="contextMenu"><li class="autoprove"><a href="#autoprove">Autoprove</a></a></li></ul></body></html>"##,
         version = env!("CARGO_PKG_VERSION"),
-        rows = rows,
+        theories_content = theories_content,
     )
 }
 
