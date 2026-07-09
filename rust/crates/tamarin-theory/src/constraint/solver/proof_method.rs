@@ -147,6 +147,47 @@ pub fn finished_subterms(ctx: &ProofContext, sys: &System) -> bool {
 /// and `replay.rs` re-sort the cases by name before walking them, to
 /// reproduce Haskell's `Data.Map` (alphabetical) iteration order from
 /// `execProofMethod`'s `M.fromListWith`.
+/// Render/index applicability — the evaluation depth HS's
+/// `mapMaybe execProofMethod` forces when building the web UI's
+/// "Applicable Proof Methods" list, WITHOUT the `SolveGoal` fan-out.
+///
+/// HS (`ProofMethod.hs:751-756`) forces each `execProofMethod` result
+/// only to WHNF (`Just`/`Nothing`); the `SolveGoal` arm is
+/// `… (return tracedCases)` (`ProofMethod.hs:429-447`) — ALWAYS `Just`,
+/// with the whole case fan-out an unforced thunk the node page never
+/// demands (`Web/Theory.hs:593-597` binds the cases to `_`; the
+/// "N sub-case(s)" count comes from the persisted tree, `:599`).  Only
+/// `Simplify` (bounded simplify + single-case guard, `:419-427`) and
+/// `Induction` (structural `ginduct` guard, `:428`) can drop a method at
+/// render, and those ARE forced — keep the full exec for them.  The
+/// fan-out is paid only when a method is APPLIED (`oneStepProver`'s
+/// `M.map` forces the spine, `Proof.hs:584-587`) — RS's `apply_at_path`,
+/// unchanged.
+///
+/// Eagerly exec'ing every candidate here made rendering one bilinear
+/// node cost 129s (ake/bilinear/Joux; HS renders it in 0.09s and takes
+/// 146.85s only when the method is clicked) — the Joux/Joux_EphkRev/siv
+/// web-crawl timeouts.  Also more faithful on the deadline: HS never
+/// drops a SolveGoal at render; the eager exec's deadline entry-guard
+/// could.
+pub fn is_applicable_for_display(
+    ctx: &ProofContext,
+    method: &ProofMethod,
+    sys: &System,
+) -> bool {
+    match method {
+        // `return tracedCases` — unconditionally `Just` in HS; do NOT
+        // call exec_proof_method (that forces the fan-out).
+        ProofMethod::SolveGoal(_) => true,
+        // Forced by HS at render too; cheap and can legitimately drop
+        // the method (no-op Simplify / non-initial Induction).
+        ProofMethod::Simplify | ProofMethod::Induction =>
+            exec_proof_method(ctx, method, sys).is_some(),
+        ProofMethod::Sorry(_) | ProofMethod::Finished(_) => true,
+        ProofMethod::Invalidated | ProofMethod::RawSolve(_) => false,
+    }
+}
+
 pub fn exec_proof_method(
     ctx: &ProofContext,
     method: &ProofMethod,
@@ -172,7 +213,10 @@ pub fn exec_proof_method(
 
     // HS-faithful per-step Maude counter reset (ProofMethod.hs):
     //   `runReduction (m <* simplifySystem) ctxt sys (avoid sys)`
-    // The FreshT counter starts at `avoid sys + 1` for EVERY proof step.
+    // The FreshT counter starts at `avoid sys` for EVERY proof step
+    // (`avoid = maybe 0 (succ . snd) . boundsVarIdx`, LTerm.hs:656-657 —
+    // 0 for a frees-less system such as a lemma's ROOT step, else
+    // max idx + 1; `avoid_fresh_state` mirrors that exactly).
     // Without this, Rust's Maude counter advances monotonically across all
     // proof steps — so witness idxs grow to hundreds where HS stays in
     // the ~20-30 range.  Beyond cosmetics, the unbounded growth surfaces
@@ -181,8 +225,32 @@ pub fn exec_proof_method(
     // the collision pattern encodes an unintended unification that
     // cascades downstream (KAS_key_secrecy: `~ltkA.0` and `~ltkA.349`
     // both → `~ltkA.425` after lifting forces $R=$I via setNodes merge).
-    let avoid = crate::constraint::solver::reduction::bounds_max(sys);
-    ctx.maude.reset_counter_to(avoid.saturating_add(1));
+    let avoid = crate::constraint::solver::reduction::avoid_fresh_state(sys);
+    ctx.maude.reset_counter_to(avoid);
+
+    let dbg_sua = tamarin_utils::env_gate!("TAM_RS_DBG_SUA");
+    if dbg_sua {
+        let mname = match method {
+            ProofMethod::Sorry(_) => "Sorry",
+            ProofMethod::Finished(_) => "Finished",
+            ProofMethod::Invalidated => "Invalidated",
+            ProofMethod::RawSolve(_) => "RawSolve",
+            ProofMethod::Simplify => "Simplify",
+            ProofMethod::Induction => "Induction",
+            ProofMethod::SolveGoal(_) => "SolveGoal",
+        };
+        eprintln!("[EXECPM] enter method={} goals={} nodes={} avoid={}",
+            mname, sys.goals.iter().count(), sys.nodes.iter().count(), avoid);
+    }
+    let _execpm_exit = if dbg_sua {
+        struct ExitLog(std::time::Instant);
+        impl Drop for ExitLog {
+            fn drop(&mut self) {
+                eprintln!("[EXECPM] exit after {:?}", self.0.elapsed());
+            }
+        }
+        Some(ExitLog(std::time::Instant::now()))
+    } else { None };
 
     match method {
         ProofMethod::Sorry(_) | ProofMethod::Finished(_) => Some(Vec::new()),
@@ -297,6 +365,12 @@ pub fn exec_proof_method(
             crate::constraint::solver::trace::trace_pick(g);
             let mut r = Reduction::new(ctx, sys.clone());
             let outcome = crate::constraint::solver::goals::dispatch_solve_goal(&mut r, g);
+            // HS FreshT-threading (task #16): per-case branch counters for
+            // the post-solve simplify continuation.  Single-case adoptions
+            // already reset `r.maude`; multi-case outcomes recorded their
+            // per-branch counters in `last_case_counters`.
+            let goal_case_counters = std::mem::take(&mut r.last_case_counters);
+            let adopted_counter = r.maude.fresh_counter_peek();
             // Run simplify after every goal-solving step — mirrors
             // Haskell's `m <* simplifySystem` pattern in `process`
             // (ProofMethod.hs).  Filter out cases that simplify
@@ -317,9 +391,10 @@ pub fn exec_proof_method(
             // the case once per arm.  Our `simplify_system_with_fanout`
             // mirrors that, returning N systems.  Each is then cleaned
             // (renamePrecise + clear subst) per HS's `cleanup`.
-            let simplify = |sys: System| -> Vec<System> {
+            let simplify = |sys: System, seed: u64| -> Vec<System> {
                 let raw_systems: Vec<System> =
-                    crate::constraint::solver::simplify::simplify_system_with_fanout(ctx, sys);
+                    crate::constraint::solver::simplify::simplify_system_with_fanout_seeded(
+                        ctx, sys, seed);
                 // Cleanup each surviving system per HS
                 // `cleanup` (ProofMethod.hs):
                 //   cleanup s = L.set sSubst emptySubst
@@ -390,10 +465,16 @@ pub fn exec_proof_method(
             // committed to the first (`otc=('one'++'zero')`, 14 steps) instead
             // of HS's `_case_2` (`otc='zero'`, 10 steps).  Normalise all three
             // outcomes to a `Vec<(name, System)>` and share the pipeline.
-            let cases: Vec<(String, System)> = match outcome {
-                GoalCases::Linear => vec![("".to_string(), r.sys)],
-                GoalCases::LinearNamed(name) => vec![(name, r.sys)],
-                GoalCases::Cases(cases) => cases,
+            let cases: Vec<(String, System, u64)> = match outcome {
+                GoalCases::Linear => vec![("".to_string(), r.sys, adopted_counter)],
+                GoalCases::LinearNamed(name) => vec![(name, r.sys, adopted_counter)],
+                GoalCases::Cases(cases) => cases.into_iter().enumerate()
+                    .map(|(ci, (n, s))| {
+                        let seed = goal_case_counters.get(ci).copied()
+                            .unwrap_or(adopted_counter);
+                        (n, s, seed)
+                    })
+                    .collect(),
                 GoalCases::Contradictory => return Some(Vec::new()),
             };
             {
@@ -419,8 +500,8 @@ pub fn exec_proof_method(
                     use std::collections::HashMap;
                     // simplify can fan out per case — flat-map.
                     let kept_raw: Vec<(String, System)> = cases.into_iter()
-                        .flat_map(|(name, sys)| {
-                            let systems = simplify(sys);
+                        .flat_map(|(name, sys, seed)| {
+                            let systems = simplify(sys, seed);
                             let out: Vec<(String, System)> = systems.into_iter()
                                 .filter(|s| keep(s, &name))
                                 .map(|s| (name.clone(), s))
@@ -482,8 +563,6 @@ pub fn exec_proof_method(
             }
         }
         ProofMethod::Induction => {
-            use crate::constraint::solver::reduction::Reduction;
-            use crate::constraint::solver::simplify::simplify_system;
             // Take the first formula and try `ginduct`.
             let fm = match sys.formulas.first() {
                 Some(f) => f.clone(),
@@ -514,70 +593,98 @@ pub fn exec_proof_method(
             // DisjG goal at gsNr=0, shifting every subsequent gsNr in
             // every sibling branch and producing a divergent goal
             // sequence vs HS at the very first insertGoal call.
-            let mut base_sys = sys.clone();
-            base_sys.invalidate_max_var_idx_cache();
-            base_sys.formulas.clear();
-            base_sys.formulas.push(base);
-            let mut br = Reduction::new(ctx, base_sys);
-            simplify_system(&mut br);
-
-            let mut step_sys = sys.clone();
-            step_sys.invalidate_max_var_idx_cache();
-            step_sys.formulas.clear();
-            step_sys.formulas.push(step);
-            let mut sr = Reduction::new(ctx, step_sys);
-            simplify_system(&mut sr);
-
-            // HS `process` (ProofMethod.hs) runs `simplifySystem`
-            // under the DisjT monad (so it could fan out) and then
-            // `removeRedundantCases`.  This arm deliberately uses in-place
-            // `simplify_system` (no fan-out) and skips `remove_redundant_cases`
-            // — both are guaranteed no-ops at induction time:
-            //   - Induction is only ever ranked/applied on the initial system:
-            //     `rankProofMethods` calls `insertInduction` only when
-            //     `isInitialSystem sys` (ProofMethod.hs), and
-            //     `canApplyInduction` requires no nodes, no solved formulas,
-            //     no open goals, exactly one formula (ProofMethod.hs
-            //     `canApplyInduction`; mirrored in
-            //     `check_and_exec_proof_method` below).  With no
-            //     nodes/actions/goals, `simplifySystem` (`solveUniqueActions`
-            //     has no actions; `reduceFormulas`/`insertImpliedFormulas`
-            //     reach no `Eq` atom over a node-free system) cannot fan out,
-            //     so per-case `simplify_system_with_fanout` would add nothing.
-            //   - The two cases (empty_trace = `gtf` base, non_empty_trace =
-            //     `gconj[gf, gfIH]` step) are never alpha-equivalent, so
-            //     `removeRedundantCases` (compares systems up-to-new-vars)
-            //     is a guaranteed no-op.
-            // Rewiring through `simplify_system_with_fanout` would also rebuild
-            // a fresh Reduction per case whose FreshT counter is re-aligned to
-            // bounds_max (simplify.rs), perturbing the high `.N` IH indices the
-            // `cleanup` below is calibrated to canonicalise — for zero benefit.
-
-            // HS-faithful `cleanup` (ProofMethod.hs): induction is
-            //   `Induction -> process . induction <$> getInductionCases sys`
-            // and `process` applies
-            //   `map (fmap cleanup . fst)` where
-            //   cleanup s = L.set sSubst emptySubst
-            //                 (Precise.evalFresh (renamePrecise s) nothingUsed)
-            // So EVERY surviving induction case is renamePrecise'd with an
-            // empty per-name Precise fresh supply, then has its substitution
-            // cleared.  Without this, the IH disjunction's free vars (opened
-            // from the `Ex` IH via global-counter freshLVar during simplify)
-            // keep their high `.N` indices (e.g. `last(#z.7)`) instead of the
-            // canonical per-name idx-0 form (`last(#z)`) HS renders.
+            // HS `process . induction` (ProofMethod.hs:428, 521-525):
+            // `runReduction (induction <* simplifySystem)` under the DisjT
+            // monad.  `simplifySystem` CAN fan out at induction time — a
+            // step-case formula that `reduceFormulas` decomposes into
+            // unique-action goals (e.g. eCK lemmas whose formula carries
+            // several `Accept(...)` atoms, TAK1_eCK_like) makes
+            // `solveUniqueActions` fan out over the AC unifiers of each
+            // action.  The former in-place `simplify_system` here DISCARDED
+            // that `Cases` outcome without marking the goal solved, so the
+            // simplify fixpoint re-solved the same action forever — the
+            // TAK1 web proof-page ≥20-min spin (write_applicable_methods
+            // execs Induction; the batch search never does, since Simplify
+            // succeeds first and the lemma doesn't use induction).
+            // Route through `simplify_system_with_fanout` exactly like the
+            // `Simplify` and `SolveGoal` arms.
             let cleanup = |s: &mut System| {
                 crate::constraint::solver::rename_precise::rename_precise_system(s);
                 s.invalidate_max_var_idx_cache();
                 s.eq_store_mut().subst =
                     tamarin_term::subst::Subst::from_list(Vec::new());
             };
-            cleanup(&mut br.sys);
-            cleanup(&mut sr.sys);
-
-            Some(vec![
-                ("empty_trace".to_string(), br.sys),
-                ("non_empty_trace".to_string(), sr.sys),
-            ])
+            // HS branch order: `disjunctionOfList [("empty_trace", base),
+            // ("non_empty_trace", step)]` — base first, then step; each
+            // branch's simplify sub-branches keep DisjT order (the same
+            // order `simplify_system_with_fanout` returns, validated by the
+            // `Simplify` arm's byte parity).
+            let mut named: Vec<(String, System)> = Vec::new();
+            for (name, fm_case) in [("empty_trace", base), ("non_empty_trace", step)] {
+                // HS `induction` uses `setM sFormulas` — a direct field
+                // write, NOT `insertFormula` (see the `insert_formula`
+                // rationale above).
+                let mut case_sys = sys.clone();
+                case_sys.invalidate_max_var_idx_cache();
+                case_sys.formulas.clear();
+                case_sys.formulas.push(fm_case);
+                let sub_systems: Vec<System> =
+                    crate::constraint::solver::simplify::simplify_system_with_fanout(
+                        ctx, case_sys);
+                for mut s in sub_systems {
+                    // mzero'd branches (eq-store false) don't survive HS's
+                    // Disj — same filter as the Simplify/SolveGoal arms.
+                    if s.eq_store.is_false() { continue; }
+                    // HS-faithful `cleanup` (ProofMethod.hs `process`):
+                    // renamePrecise with an empty Precise supply + clear
+                    // subst.  Without it the IH disjunction's free vars
+                    // keep their high `.N` indices (e.g. `last(#z.7)`)
+                    // instead of the canonical idx-0 form (`last(#z)`).
+                    cleanup(&mut s);
+                    named.push((name.to_string(), s));
+                }
+            }
+            // HS `removeRedundantCases ctxt [] snd` (in `process`) —
+            // BP/MSet-gated structural dedup, before naming.
+            let named: Vec<(String, System)> = {
+                let msig = ctx.maude.maude_sig();
+                let empty_stable: std::collections::BTreeSet<tamarin_term::lterm::LVar>
+                    = std::collections::BTreeSet::new();
+                crate::constraint::solver::sources::remove_redundant_cases(
+                    msig.enable_bp,
+                    msig.enable_mset,
+                    &empty_stable,
+                    |p: &(String, System)| &p.1,
+                    named,
+                )
+            };
+            // HS `uniqueListBy (comparing fst) id distinguish`
+            // (ProofMethod.hs:465, 527-532): singleton names stay bare;
+            // duplicate groups of size n get `<name>_case_<i>` with `i`
+            // zero-padded to the width of `show n`.  (The empty-name
+            // branch of `distinguish` is unreachable here — both
+            // induction case names are non-empty.)
+            let mut name_counts: std::collections::BTreeMap<&str, usize>
+                = std::collections::BTreeMap::new();
+            for (n, _) in &named { *name_counts.entry(n.as_str()).or_insert(0) += 1; }
+            let widths: std::collections::BTreeMap<String, usize> = name_counts
+                .iter()
+                .map(|(n, c)| ((*n).to_string(), c.to_string().len()))
+                .collect();
+            let counts_owned: std::collections::BTreeMap<String, usize> = name_counts
+                .iter().map(|(n, c)| ((*n).to_string(), *c)).collect();
+            let mut seen: std::collections::BTreeMap<String, usize>
+                = std::collections::BTreeMap::new();
+            let out: Vec<(String, System)> = named.into_iter()
+                .map(|(n, s)| {
+                    let total = counts_owned[&n];
+                    if total == 1 { return (n, s); }
+                    let i = seen.entry(n.clone()).and_modify(|v| *v += 1).or_insert(1);
+                    let digits = widths[&n];
+                    ((format!("{}_case_{:0width$}", n, i, width = digits)), s)
+                })
+                .collect();
+            Some(out)
         }
     }
 }

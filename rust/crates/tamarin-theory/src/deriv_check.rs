@@ -576,6 +576,7 @@ fn synthesise_probe_theory(
             trace_quantifier: p::TraceQuantifier::ExistsTrace,
             formula: body,
             proof: None,
+            plaintext: String::new(),
         }));
     }
 

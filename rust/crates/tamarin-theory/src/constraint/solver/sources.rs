@@ -77,33 +77,49 @@ fn collect_node_ids(
 /// Reduction continuation (Reduction.hs:724-725 `disjunctionOfList
 /// performSplit`); shared by the action/premise fan-outs so the
 /// clone-then-install sequence lives in exactly one place.
+///
+/// HS FreshT-threading (task #23, A(ii)): `inherit_next` is the fresh
+/// counter at the fan-out point — `DisjT` sits BELOW `FreshT`
+/// (Reduction.hs:123), so every arm's continuation draws (substSystem
+/// node-merge witness mints, later solves) start from an independent
+/// COPY of that value, not from `bounds_max(arm_sys)` (which silently
+/// rewinds past the step's transient draws).  Callers pass the forking
+/// Reduction's `maude.fresh_counter_peek()`.  `new_inheriting` maxes
+/// with `avoid_fresh_state` and the REFINE_FLOOR, so a floored refine
+/// caller keeps its `avoid th` seed and `inherit_next = 0` degrades to
+/// the old detached behaviour.
 fn fork_arm_reduction<'c>(
     ctx: &'c crate::constraint::solver::context::ProofContext,
     template: &System,
     arm_eq: crate::tools::equation_store::EquationStore,
+    inherit_next: u64,
 ) -> crate::constraint::solver::reduction::Reduction<'c> {
     use crate::constraint::solver::reduction::Reduction;
     let mut arm_sys = template.clone();
     arm_sys.invalidate_max_var_idx_cache();
     arm_sys.eq_store = std::sync::Arc::new(arm_eq);
-    Reduction::new(ctx, arm_sys)
+    Reduction::new_inheriting(ctx, arm_sys, inherit_next)
 }
 
 /// E.5 nested fan-out: for each arm eq-store, fork a `Reduction` off `template`
 /// (see [`fork_arm_reduction`]), run `subst_system`, and collect the surviving
-/// (non-`false`-eq-store) systems into `out`.  Shared verbatim by the action and
-/// premise E.5 `Cases` arms.
+/// (non-`false`-eq-store) systems into `out`, each paired with its
+/// continuation counter (`inherit_next` + that arm's own substSystem
+/// draws) for the post-E.5 close-chains/output continuation.  Shared
+/// verbatim by the action and premise E.5 `Cases` arms.
 fn subst_arms_into(
     ctx: &crate::constraint::solver::context::ProofContext,
     template: &System,
     arms: Vec<crate::tools::equation_store::EquationStore>,
-    out: &mut Vec<System>,
+    inherit_next: u64,
+    out: &mut Vec<(System, u64)>,
 ) {
     for arm_eq in arms {
-        let mut arm_red = fork_arm_reduction(ctx, template, arm_eq);
+        let mut arm_red = fork_arm_reduction(ctx, template, arm_eq, inherit_next);
         arm_red.subst_system();
         if arm_red.sys.eq_store.is_false() { continue; }
-        out.push(arm_red.sys);
+        let arm_cont = arm_red.maude.fresh_counter_peek();
+        out.push((arm_red.sys, arm_cont));
     }
 }
 
@@ -444,7 +460,6 @@ fn initial_source_cases_impl(
         _ => return Vec::new(),
     };
 
-    let stable_vars = stable_vars_for_goal(goal);
     // Same HS-faithful filter — safety only — for normalize_and_keep.
     let safety_only: Vec<_> = ctx.restrictions.iter()
         .filter(|r| crate::guarded::is_safety_formula(r))
@@ -468,8 +483,22 @@ fn initial_source_cases_impl(
         if !crate::constraint::solver::contradictions::contradictions(ctx, &r.sys)
             .is_empty()
         { return None; }
-        let mut s = r.sys;
-        restrict_eq_store_to_stable_vars(&mut s, &stable_vars);
+        let s = r.sys;
+        // HS-faithful: `initialSource` (Sources.hs:105-119) does NOT restrict
+        // the raw case's substitution — it returns `polish <$> runReduction
+        // instantiate` verbatim, keeping every binding (e.g. a rule's internal
+        // `lock`/`v` ⟼ goal-var bindings).  `restrict stableVars` is applied
+        // ONLY by `refineSource` (Sources.hs:137) on the SATURATED output,
+        // which `refine_one_source` already mirrors.  RS previously also
+        // restricted here, at raw-case creation, which dropped the raw case's
+        // internal rule vars and so LOWERED `avoid th` — the fresh-var seed
+        // `saturateSources` threads into `refineSource` (Sources.hs:162
+        // `fs = avoid th`).  With the seed one index short per dropped var, the
+        // saturated source cases minted every grafted `#vr`/`~n` node id below
+        // HS's.  Keeping the raw subst here makes `bounds_max` (RS's `avoid`)
+        // match HS; the surviving internal bindings are dropped by the refine
+        // output restrict anyway, so the rendered saturated case is unchanged
+        // apart from the now-HS-aligned node numbering.
         Some(s)
     };
     let result: Vec<(String, System)> = match outcome {
@@ -807,6 +836,179 @@ fn ku_source_label_for_fa(
     }
 }
 
+/// HS-faithful free-var idx BOUNDS of a `System` (`boundsVarIdx`,
+/// LTerm.hs:650-651, under `instance HasFrees System`,
+/// System.hs:1833-1847): `Some((min, max))`, or `None` when the system
+/// has no frees.
+///
+/// Coverage differs from [`system_max_idx`] deliberately: HS
+/// `SubstVFresh` `foldFrees` walks DOMAIN KEYS ONLY
+/// (SubstVFresh.hs:196-198), so eq-store conj RANGES (existential
+/// witnesses) are NOT counted here.  (`system_max_idx` includes them
+/// for its own collision-avoidance purposes — that is a superset of the
+/// HS fold and must stay as-is.)  Disj goals' formulas ARE counted (HS
+/// `Goal` HasFrees folds the `DisjG` disjunction).
+///
+/// Used by the `matchToGoal` whole-source `rename` rebase (min side:
+/// HS `rename x`, LTerm.hs:614-621, shifts by `freshStart - minVarIdx`)
+/// and the `refineSource` seed `fs = avoid th` (max side,
+/// Sources.hs:162).
+fn system_bounds_hs(sys: &System) -> Option<(u64, u64)> {
+    use std::cell::Cell;
+    use tamarin_term::lterm::HasFrees;
+    use crate::constraint::constraints::Goal;
+    let min: Cell<Option<(u64, u64)>> = Cell::new(None);
+    let mut visit = |v: &tamarin_term::lterm::LVar| {
+        let cur = min.get();
+        min.set(Some(cur.map_or((v.idx, v.idx),
+            |(lo, hi)| (lo.min(v.idx), hi.max(v.idx)))));
+    };
+    for (id, ru) in sys.nodes.iter() {
+        id.for_each_free(&mut visit);
+        ru.for_each_free(&mut visit);
+    }
+    for e in &sys.edges {
+        e.src.0.for_each_free(&mut visit);
+        e.tgt.0.for_each_free(&mut visit);
+    }
+    for l in &sys.less_atoms {
+        l.smaller.for_each_free(&mut visit);
+        l.larger.for_each_free(&mut visit);
+    }
+    if let Some(la) = &sys.last_atom {
+        la.for_each_free(&mut visit);
+    }
+    // Guarded formulas: `min_var_idx` returns None on frees-less
+    // formulas; when Some, `max_var_idx` over the same Free leaves is
+    // the valid max.
+    let upd_guarded = |g: &crate::guarded::Guarded| {
+        if let Some(lo) = crate::guarded::min_var_idx(g) {
+            let hi = crate::guarded::max_var_idx(g);
+            let cur = min.get();
+            min.set(Some(cur.map_or((lo, hi),
+                |(clo, chi)| (clo.min(lo), chi.max(hi)))));
+        }
+    };
+    for (g, _) in sys.goals.iter() {
+        match g {
+            Goal::Action(i, fa) => {
+                i.for_each_free(&mut visit);
+                fa.for_each_free(&mut visit);
+            }
+            Goal::Premise(p, fa) => {
+                p.0.for_each_free(&mut visit);
+                fa.for_each_free(&mut visit);
+            }
+            Goal::Chain(c, p) => {
+                c.0.for_each_free(&mut visit);
+                p.0.for_each_free(&mut visit);
+            }
+            Goal::Subterm((s, t)) => {
+                s.for_each_free(&mut visit);
+                t.for_each_free(&mut visit);
+            }
+            Goal::Disj(d) => {
+                for alt in &d.0 {
+                    upd_guarded(alt);
+                }
+            }
+            Goal::Split(_) => {}
+        }
+    }
+    for f in sys.formulas.iter()
+        .chain(sys.solved_formulas.iter())
+        .chain(sys.lemmas.iter())
+    {
+        upd_guarded(f);
+    }
+    // Eq-store free subst: keys AND range terms (HS `Subst` HasFrees).
+    for (v, t) in sys.eq_store.subst.to_list() {
+        visit(&v);
+        t.for_each_free(&mut visit);
+    }
+    // Eq-store conj: DOMAIN keys only (HS SubstVFresh foldFrees).
+    for d in &sys.eq_store.conj {
+        for s in &d.substs {
+            for (v, _t) in s.to_list() {
+                visit(&v);
+            }
+        }
+    }
+    for sc in sys.subterm_store.subterms.iter()
+        .chain(sys.subterm_store.solved_subterms.iter())
+    {
+        sc.small.for_each_free(&mut visit);
+        sc.big.for_each_free(&mut visit);
+    }
+    min.get()
+}
+
+/// HS-faithful idx bounds over a WHOLE precomputed `Source` for the
+/// `matchToGoal` rename + `refineSource` seed:
+///
+/// * `.0` = `boundsVarIdx th0` MIN (`matchToGoal`, Sources.hs:409,
+///   under `instance HasFrees Source`, System.hs:1880-1890: `cdGoal`
+///   pattern + ALL `cdCases`) — the rename's rebase origin.
+/// * `.1` = the CASES-only MAX — feeds `fs = avoid th` where
+///   `th = set cdGoal goalTerm (renamed th0)` (Sources.hs:162,387):
+///   `cdGoal` is the LIVE goal by then, so the pattern's frees don't
+///   count; the caller maxes this (post-shift) with the live goal's
+///   own max.
+///
+/// `cases` must be the source's materialised case list
+/// (`src.cases(ctx)`); the goal-pattern frees come from `src.goal`.
+fn source_bounds(
+    src: &Source,
+    cases: &[(String, System)],
+) -> (Option<u64>, Option<u64>) {
+    use tamarin_term::lterm::HasFrees;
+    use crate::constraint::constraints::Goal;
+    let mut min: Option<u64> = None;
+    let mut cases_max: Option<u64> = None;
+    {
+        let mut upd = |i: u64| { min = Some(min.map_or(i, |c| c.min(i))); };
+        let mut visit = |v: &tamarin_term::lterm::LVar| upd(v.idx);
+        match &src.goal {
+            Goal::Action(n, fa) => {
+                n.for_each_free(&mut visit);
+                fa.for_each_free(&mut visit);
+            }
+            Goal::Premise((n, _), fa) => {
+                n.for_each_free(&mut visit);
+                fa.for_each_free(&mut visit);
+            }
+            _ => {}
+        }
+    }
+    for (_, cs) in cases {
+        if let Some((lo, hi)) = system_bounds_hs(cs) {
+            min = Some(min.map_or(lo, |c| c.min(lo)));
+            cases_max = Some(cases_max.map_or(hi, |c| c.max(hi)));
+        }
+    }
+    (min, cases_max)
+}
+
+/// RAII scope for the runtime `refineSource` fresh-counter seed
+/// (`fs = avoid th`, Sources.hs:162): sets [`reduction::set_refine_floor`]
+/// to `fs - 1` on construction (so `Reduction::new` seeds the next draw
+/// at `max(avoid sys, fs)`, mirroring HS's `runReduction proofStep ctxt
+/// se fs`) and restores the previous floor on drop — early `return`s
+/// and `continue`s included.  Mirrors the precompute-side
+/// `RefineFloorGuard` (see `run_solve_all_safe_goals_disj_with_progress`).
+struct RefineFsScope(u64);
+impl RefineFsScope {
+    fn set(fs: u64) -> Self {
+        RefineFsScope(crate::constraint::solver::reduction::set_refine_floor(
+            fs.saturating_sub(1)))
+    }
+}
+impl Drop for RefineFsScope {
+    fn drop(&mut self) {
+        crate::constraint::solver::reduction::set_refine_floor(self.0);
+    }
+}
+
 fn system_max_idx(sys: &System) -> u64 {
     use std::cell::Cell;
     use tamarin_term::lterm::HasFrees;
@@ -943,9 +1145,16 @@ pub fn refine_with_source_asms(
             sys.source_kind = Some(crate::constraint::system::SourceKind::RefinedSources);
             new_cases.push((name, sys));
         }
-        if !new_cases.is_empty() {
-            intermediate.push(Source::eager(src.goal, new_cases, src.incomplete));
-        }
+        // HS `refineWithSourceAsms` maps over the source LIST (fmap per
+        // source) — a zero-case source stays in the list as an entry with
+        // an empty case set (same invariant as `saturateSources`, see the
+        // "Sources are NEVER dropped" note in the saturate loop).  Dropping
+        // it here made the web "Refined sources" pane show 25 entries where
+        // HS shows 29 on OIDC_Implicit (the four empties: AdversaryAction,
+        // KU(e1/e2/e3)), and starves `solve_with_source_cases_*`'s
+        // `Some([])` zero-case match (goal closes) into a `None`
+        // fall-through (runtime rule enumeration).
+        intermediate.push(Source::eager(src.goal, new_cases, src.incomplete));
     }
 
     // Step 2 (Haskell `saturateSources`): re-saturate with the
@@ -975,9 +1184,8 @@ pub fn refine_with_source_asms(
                 !matches!(g, crate::constraint::constraints::Goal::Disj(_)));
             new_cases.push((name, sys));
         }
-        if !new_cases.is_empty() {
-            out.push(Source::eager(src.goal, new_cases, src.incomplete));
-        }
+        // Keep zero-case sources — see the Step-1 note above.
+        out.push(Source::eager(src.goal, new_cases, src.incomplete));
     }
     out
 }
@@ -1047,7 +1255,15 @@ fn refine_one_source(
     goal_free_vars(&src.goal, &mut |v| {
         stable_vars.insert(v.clone());
     });
-    for (name_list, sys) in src.cases_take_list() {
+    let all_cases = src.cases_take_list();
+    // HS `refineSource` (Sources.hs:162): `fs = avoid th` — the fresh seed
+    // for EVERY case is the max var idx over the WHOLE source `th` (all its
+    // cases), NOT the per-case `avoid se`.  Compute it once here and thread
+    // it as the seed floor into each case's Reduction.
+    let source_avoid = all_cases.iter()
+        .map(|(_, s)| crate::constraint::solver::reduction::bounds_max(s))
+        .max().unwrap_or(0);
+    for (name_list, sys) in all_cases {
         // === Multi-branch refineSource (Haskell-faithful) ===
         set_precompute_mode(true);
         // HS-faithful: NO per-branch step cap.  HS `solveAllSafeGoals`
@@ -1065,7 +1281,7 @@ fn refine_one_source(
         let outer_cap: i64 = i64::MAX;
         let (branches, branch_took_step) = run_solve_all_safe_goals_disj_with_progress(
             ctx, sys, ths_snapshot, /*chains_limit*/ 10,
-            outer_cap, branch_cap, name_list);
+            outer_cap, branch_cap, name_list, source_avoid);
         if branch_took_step {
             // HS-faithful `not (null names)` change signal —
             // solveAllSafeGoals took at least one step (safe-goal
@@ -1375,7 +1591,7 @@ pub fn run_solve_all_safe_goals_disj_for_probe(
 ) -> Vec<(System, String)> {
     let init = string_to_name_list(&initial_name);
     run_solve_all_safe_goals_disj(ctx, initial_sys, &[],
-        chains_limit, outer_cap, branch_cap, init)
+        chains_limit, outer_cap, branch_cap, init, /*source_avoid*/ 0)
         .into_iter()
         .map(|(sys, n)| (sys, case_name_list_to_string(&n)))
         .collect()
@@ -1395,7 +1611,7 @@ pub fn run_solve_all_safe_goals_disj_for_probe_with_ths(
 ) -> Vec<(System, String)> {
     let init = string_to_name_list(&initial_name);
     run_solve_all_safe_goals_disj(ctx, initial_sys, ths,
-        chains_limit, outer_cap, branch_cap, init)
+        chains_limit, outer_cap, branch_cap, init, /*source_avoid*/ 0)
         .into_iter()
         .map(|(sys, n)| (sys, case_name_list_to_string(&n)))
         .collect()
@@ -1475,9 +1691,11 @@ fn run_solve_all_safe_goals_disj(
     outer_cap: i64,
     branch_cap: usize,
     initial_name: Vec<String>,
+    source_avoid: u64,
 ) -> Vec<(System, Vec<String>)> {
     run_solve_all_safe_goals_disj_with_progress(
-        ctx, initial_sys, ths, chains_limit, outer_cap, branch_cap, initial_name).0
+        ctx, initial_sys, ths, chains_limit, outer_cap, branch_cap,
+        initial_name, source_avoid).0
 }
 
 /// Variant that also returns a flag indicating whether ANY branch took
@@ -1496,6 +1714,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
     outer_cap: i64,
     branch_cap: usize,
     initial_name: Vec<String>,
+    source_avoid: u64,
 ) -> (Vec<(System, Vec<String>)>, bool) {
     use crate::constraint::constraints::Goal;
     use crate::constraint::solver::contradictions::contradictions;
@@ -1542,6 +1761,20 @@ fn run_solve_all_safe_goals_disj_with_progress(
                   std::collections::BTreeSet<String>, i64, i64,
                   Option<tamarin_term::lterm::LNTerm> /* last_chain_term */,
                   bool /* took_step */);
+    // HS-faithful `avoid th` (Sources.hs:162): thread `source_avoid` as the
+    // fresh-counter floor for the WHOLE refinement of this case — including
+    // the floor-0 `simplify_system_with_fanout` sub-reductions where the
+    // `[sources]`-lemma `Ex #j` node is drawn — via a thread-local, restored
+    // on drop.  Without it, that sub-reduction reseeds at the per-case
+    // `avoid se`, undershooting HS for any case below the source-wide max.
+    struct RefineFloorGuard(u64);
+    impl Drop for RefineFloorGuard {
+        fn drop(&mut self) {
+            crate::constraint::solver::reduction::set_refine_floor(self.0);
+        }
+    }
+    let _refine_floor_guard = RefineFloorGuard(
+        crate::constraint::solver::reduction::set_refine_floor(source_avoid));
     let mut worklist: Vec<Entry> = vec![
         (initial_sys, Vec::new() /* fresh accumulator for steps */,
          std::collections::BTreeSet::new(),
@@ -1623,7 +1856,7 @@ fn run_solve_all_safe_goals_disj_with_progress(
                 head
             }
         };
-        let mut red = Reduction::new(ctx, sys);
+        let mut red = Reduction::new_with_floor(ctx, sys, source_avoid);
         let contras = contradictions(red.ctx, &red.sys);
         if !contras.is_empty() {
             // Haskell mzero — drop branch (don't push to finished).
@@ -2091,11 +2324,17 @@ fn string_to_name_list(name: &str) -> Vec<String> {
 /// the source's cases, invoking `apply_source_case_premise` per case
 /// (which mirrors `matchToGoal` + `_applySource` from Sources.hs).
 ///
-/// Returns `(case_name, fully_conjoined_system)` per case that
-/// successfully matched + conjoined.  The system is already aligned
-/// against the live goal via `conjoinSystem`'s `solveSubstEqs +
+/// Returns `(case_name, fully_conjoined_system, branch_counter)` per
+/// case that successfully matched + conjoined.  The system is already
+/// aligned against the live goal via `conjoinSystem`'s `solveSubstEqs +
 /// substSystem` plus a defensive `chain_eqs` pass — no additional
-/// fact-eq work needed by the caller.
+/// fact-eq work needed by the caller.  `branch_counter` is the
+/// branch's live-counter continuation (HS FreshT-threading, task #23
+/// A(ii) premise parity: `_applySource` forks the counter per case via
+/// `disjunctionOfList cdCases` BELOW FreshT, so each output case's
+/// continuation = the pick-time fork + that branch's OWN
+/// someInst/conjoin/close-chains draws — not the shared handle's
+/// post-all-cases position).
 pub fn solve_with_source_cases_ctx(
     ctx: &crate::constraint::solver::context::ProofContext,
     sources: &[Source],
@@ -2103,7 +2342,8 @@ pub fn solve_with_source_cases_ctx(
     goal_node: &crate::constraint::constraints::NodeId,
     goal_prem_idx: crate::rule::PremIdx,
     fa_prem: &crate::fact::LNFact,
-) -> Option<Vec<(String, System)>> {
+    red_maude: Option<&tamarin_term::maude_proc::MaudeHandle>,
+) -> Option<Vec<(String, System, u64)>> {
     use crate::constraint::constraints::Goal;
 
     // HS's `filterCases` (Sources.hs:217-218) operates only inside
@@ -2174,24 +2414,37 @@ pub fn solve_with_source_cases_ctx(
         _ => false,
     };
 
-    let mut out: Vec<(String, System)> = Vec::new();
-    for (name, case_sys) in src.cases(ctx) {
+    let mut out: Vec<(String, System, u64)> = Vec::new();
+    let cases = src.cases(ctx);
+    // HS `matchToGoal` renames th0 ONCE for the whole source; the shift's
+    // min is over `cdGoal` + ALL cases (HasFrees Source).  Compute it here
+    // so every case shares the same rebase, mirroring HS exactly.
+    let src_bounds = source_bounds(src, &cases);
+    // HS FreshT-threading (`_applySource`, Sources.hs:447-469): the
+    // live counter at the pick.  `disjunctionOfList cdCases` forks the
+    // DisjT layer BELOW FreshT, so every (case × refineSubst-arm)
+    // branch's someInst+conjoin draws start from an independent COPY
+    // of this value — the premise-path twin of the action path's
+    // `fork_base` in `solve_with_source_cases_action_with_ctx`.
+    let fork_base = red_maude.map(|m| m.fresh_counter_peek());
+    for (name, case_sys) in cases {
         // HS-faithful: use the stored (already-`combine`d, `_`-joined) case name
         // verbatim — never re-split on `_` (would corrupt funsyms containing `_`).
         let case_label = name.clone();
         let applied_arms = apply_source_case_premise(
             ctx, sys, src, &case_sys,
-            goal_node, goal_prem_idx, fa_prem,
+            goal_node, goal_prem_idx, fa_prem, red_maude,
+            src_bounds, fork_base,
         );
         // HS-faithful: refineSubst's multi-arm fanout (Reduction.hs:724-725
         // `disjunctionOfList performSplit`) produces one System per AC
         // unifier arm with the SAME case name.  Push each as a separate
-        // (case_label, sys) entry.  Sibling cases sharing the same
-        // case_label get `_case_N` suffixes via `distinguish`
+        // (case_label, sys, branch_counter) entry.  Sibling cases sharing
+        // the same case_label get `_case_N` suffixes via `distinguish`
         // (ProofMethod.hs:335, applied by `uniqueListBy ... distinguish
         // cases` at ProofMethod.hs:308; `uniqueListBy` at ProofMethod.hs:91).
-        for final_sys in applied_arms {
-            out.push((case_label.clone(), final_sys));
+        for (final_sys, branch_counter) in applied_arms {
+            out.push((case_label.clone(), final_sys, branch_counter));
         }
     }
     // HS-faithful: an empty `out` (all cases contradictory) still counts
@@ -2380,7 +2633,8 @@ pub fn solve_with_source_cases_action(
     fa_live: &crate::fact::LNFact,
     avoid_max: u64,
 ) -> Option<Vec<(String, System, crate::fact::LNFact)>> {
-    solve_with_source_cases_action_with_ctx(sources, sys, goal_node, fa_live, avoid_max, None)
+    solve_with_source_cases_action_with_ctx(sources, sys, goal_node, fa_live, avoid_max, None, None)
+        .map(|v| v.into_iter().map(|(n, s, f, _)| (n, s, f)).collect())
 }
 
 /// Variant that takes an optional `ProofContext` to enable the
@@ -2398,7 +2652,10 @@ pub fn solve_with_source_cases_action_with_ctx(
     fa_live: &crate::fact::LNFact,
     avoid_max: u64,
     ctx_opt: Option<&crate::constraint::solver::context::ProofContext>,
-) -> Option<Vec<(String, System, crate::fact::LNFact)>> {
+    red_maude: Option<&tamarin_term::maude_proc::MaudeHandle>,
+    // Fourth tuple element: per-output-entry live-counter continuation
+    // (HS FreshT-threading — the producing branch's fork + own draws).
+) -> Option<Vec<(String, System, crate::fact::LNFact, u64)>> {
     use crate::constraint::constraints::Goal;
     use crate::fact::FactTag;
     use tamarin_term::term::Term;
@@ -2477,7 +2734,7 @@ pub fn solve_with_source_cases_action_with_ctx(
     if cases_iter.is_empty() {
         return Some(Vec::new());
     }
-    let mut out: Vec<(String, System, crate::fact::LNFact)> = Vec::new();
+    let mut out: Vec<(String, System, crate::fact::LNFact, u64)> = Vec::new();
 
     if let Some(ctx) = ctx_opt {
         // ----------------------------------------------------------------
@@ -2492,6 +2749,18 @@ pub fn solve_with_source_cases_action_with_ctx(
         // case; all arms share the case's `case_label`.
         // ----------------------------------------------------------------
         let mut refine_arms: Vec<(String, RefineArm)> = Vec::new();
+        // HS `matchToGoal` renames th0 ONCE for the whole source; the
+        // shift's min is over `cdGoal` + ALL cases (HasFrees Source).
+        // Compute it here so every case shares the same rebase.
+        let src_bounds = source_bounds(src, &cases_iter);
+        // HS FreshT-threading (`_applySource`, Sources.hs:447-469): the
+        // live counter at the pick.  `disjunctionOfList cdCases` forks
+        // the DisjT layer BELOW FreshT, so every (case × arm) branch's
+        // someInst+conjoin draws start from an independent COPY of this
+        // value; each branch's continuation = fork + its OWN draws
+        // (recorded per arm in `RefineArm::branch_counter`, resumed in
+        // Step 3, and returned per output entry to the adopting caller).
+        let fork_base = red_maude.map(|m| m.fresh_counter_peek());
         for (name, case_sys) in cases_iter {
             // HS-faithful: the stored case name is ALREADY the final display
             // name — `refineSource` applied `combine` (Sources.hs:135-139) and
@@ -2502,7 +2771,8 @@ pub fn solve_with_source_cases_action_with_ctx(
             // against the source's ABSTRACT `cdGoal` (`src.goal`) — NOT a
             // case-specific action — mirroring `matchToGoal` (Sources.hs:268).
             let arms = refine_source_case_action(
-                ctx, sys, src, &case_sys, goal_node, fa_live);
+                ctx, sys, src, &case_sys, goal_node, fa_live, red_maude,
+                src_bounds, fork_base);
             for arm in arms {
                 refine_arms.push((case_label.clone(), arm));
             }
@@ -2559,9 +2829,25 @@ pub fn solve_with_source_cases_action_with_ctx(
         // ----------------------------------------------------------------
         for (idx, (case_label, arm)) in refine_arms.into_iter().enumerate() {
             if !survivors.contains(&idx) { continue; }
-            let result = conjoin_refine_arm(ctx, sys, goal_node, fa_live, arm);
-            for (grafted_sys, live_action, _refined_case) in result {
-                out.push((case_label.clone(), grafted_sys, live_action));
+            // HS FreshT-threading: resume THIS branch's counter thread
+            // (fork + its own someInst draws) for the conjoin — HS's
+            // conjoinSystem runs inside the same DisjT-forked branch as
+            // the someInst (Sources.hs:463-468), NOT after the sibling
+            // branches' conjoins.
+            let arm_branch_counter = arm.branch_counter;
+            if let Some(m) = red_maude {
+                m.reset_counter_to(arm_branch_counter);
+            }
+            let result = conjoin_refine_arm(ctx, sys, goal_node, fa_live, arm, red_maude);
+            // Per-OUTPUT-arm continuation counter (task #23, A(ii)):
+            // `conjoin_refine_arm` now records each output arm's own
+            // thread position — fork + that branch's someInst +
+            // conjoin + step-12-arm + E.5 + close-chains draws — so
+            // the adopting caller continues every arm at ITS thread,
+            // not at a single post-conjoin peek shared across arms.
+            for (grafted_sys, live_action, _refined_case, arm_cont) in result {
+                out.push((case_label.clone(), grafted_sys, live_action,
+                          arm_cont));
             }
         }
     } else {
@@ -2588,7 +2874,9 @@ pub fn solve_with_source_cases_action_with_ctx(
             let Some(grafted) = graft_case_into_action(
                 sys, &renamed, &abstract_renamed, goal_node, fa_live,
             ) else { continue };
-            out.push((case_label, grafted, action_fact));
+            // Legacy path has no live-counter thread; `avoid_max` is the
+            // caller's bounds ceiling (the wrapper strips this column).
+            out.push((case_label, grafted, action_fact, avoid_max));
         }
     }
     if out.is_empty() { return None; }
@@ -2723,38 +3011,6 @@ fn restrict_eq_store_to_stable_vars(
     sys.eq_store_mut().subst = tamarin_term::subst::Subst::from_list(kept);
 }
 
-/// Compute the goal's free vars (= `stableVars` in Haskell).  For
-/// an `ActionG i fa` this is `[i] ++ frees fa`; for `PremiseG (i,_) fa`
-/// likewise.  Mirrors Haskell's `frees (cdGoal th)` (Sources.hs:126).
-fn stable_vars_for_goal(
-    goal: &crate::constraint::constraints::Goal,
-) -> std::collections::BTreeSet<tamarin_term::lterm::LVar> {
-    use tamarin_term::lterm::HasFrees;
-    let mut out = std::collections::BTreeSet::new();
-    match goal {
-        crate::constraint::constraints::Goal::Action(i, fa) => {
-            out.insert(i.clone());
-            fa.for_each_free(&mut |v: &tamarin_term::lterm::LVar| {
-                out.insert(v.clone());
-            });
-        }
-        crate::constraint::constraints::Goal::Premise((i, _), fa) => {
-            out.insert(i.clone());
-            fa.for_each_free(&mut |v: &tamarin_term::lterm::LVar| {
-                out.insert(v.clone());
-            });
-        }
-        crate::constraint::constraints::Goal::Chain(c, p) => {
-            out.insert(c.0.clone());
-            out.insert(p.0.clone());
-        }
-        crate::constraint::constraints::Goal::Disj(_)
-        | crate::constraint::constraints::Goal::Split(_)
-        | crate::constraint::constraints::Goal::Subterm(_) => {}
-    }
-    out
-}
-
 /// Freshen all vars in `sys` EXCEPT those in `keep`, shifting every
 /// other var's idx by `shift_amount`. Mirrors Haskell's
 /// `someInst sysTh0 keepVarBindings` (Sources.hs:348). Vars in `keep`
@@ -2769,16 +3025,26 @@ fn stable_vars_for_goal(
 /// cause).
 fn freshen_system_keep_with_shift(
     sys: &System,
-    shift_amount: u64,
+    shift_amount: i128,
     keep: &std::collections::BTreeSet<tamarin_term::lterm::LVar>,
 ) -> System {
     use tamarin_term::lterm::HasFrees;
+    // Signed shift: HS `rename x` (LTerm.hs:614-621) rebases the whole
+    // span by `freshStart - minVarIdx`, which is NEGATIVE whenever the
+    // source's stored idxs sit above the fresh-supply seed (the normal
+    // case at runtime source dispatch, where the supply is seeded at
+    // `avoid goalTerm`).  Every shifted idx stays ≥ 0 by construction
+    // (`shift ≥ -min(source)`); clamp defensively anyway.
+    let shift_idx = |idx: u64| -> u64 {
+        let n = idx as i128 + shift_amount;
+        if n < 0 { 0 } else if n > u64::MAX as i128 { u64::MAX } else { n as u64 }
+    };
     let shift_lvar = |v: &tamarin_term::lterm::LVar| {
         if keep.contains(v) {
             v.clone()
         } else {
             let mut v2 = v.clone();
-            v2.idx = v2.idx.saturating_add(shift_amount);
+            v2.idx = shift_idx(v2.idx);
             v2
         }
     };
@@ -2796,7 +3062,7 @@ fn freshen_system_keep_with_shift(
         } else {
             tamarin_parser::ast::VarSpec {
                 name: v.name.clone(),
-                idx: v.idx.saturating_add(shift_amount),
+                idx: shift_idx(v.idx),
                 sort: v.sort,
                 typ: v.typ.clone(),
             }
@@ -3283,6 +3549,16 @@ struct RefineArm {
     /// Post-refineSubst+restrict case sub-system (BEFORE someInst/conjoin)
     /// — the dedup key (HS `removeRedundantCases` `compareSystemsUpToNewVars`).
     refined_case_for_dedup: System,
+    /// HS FreshT-threading: the live counter position right after this
+    /// branch's `someInst` draws.  HS `_applySource` (Sources.hs:447-469)
+    /// runs `disjunctionOfList (getDisj cdCases)` BEFORE `someInst`, and
+    /// DisjT sits BELOW FreshT in the Reduction stack — so EVERY
+    /// (case × refineSubst-arm) branch's someInst starts from an
+    /// independent COPY of the counter at the pick, and the branch's
+    /// conjoin + continuation proceed from fork + that branch's OWN
+    /// draws.  Step 3 (`conjoin_refine_arm`) resumes the live counter
+    /// here per branch.
+    branch_counter: u64,
 }
 
 /// Apply a precomputed source case to a live action goal — Haskell-
@@ -3408,9 +3684,18 @@ fn refine_source_case_action(
     case_sys: &System,
     live_node: &crate::constraint::constraints::NodeId,
     fa_live: &crate::fact::LNFact,
+    red_maude: Option<&tamarin_term::maude_proc::MaudeHandle>,
+    src_bounds: (Option<u64>, Option<u64>),
+    // HS FreshT-threading (`_applySource`, Sources.hs:447-469): the live
+    // counter position at the source pick.  `disjunctionOfList cdCases`
+    // forks BELOW FreshT, so each (case × refineSubst-arm) branch's
+    // `someInst` draws start from an independent COPY of this value —
+    // NOT from the previous sibling branch's post-someInst position.
+    // `None` = legacy callers without a live counter (no rewind).
+    fork_base: Option<u64>,
 ) -> Vec<RefineArm> {
     use crate::constraint::solver::reduction::{
-        Reduction, SolveOutcome, SplitStrategy, bounds_max,
+        Reduction, SolveOutcome, SplitStrategy,
     };
     use tamarin_term::lterm::HasFrees;
 
@@ -3430,11 +3715,32 @@ fn refine_source_case_action(
     crate::state_trace::emit("applySource_in", Some(&live_goal_for_trace), live_sys);
 
     // ---------------------------------------------------------------
-    // A.1 — `rename th0` in matchToGoal.
+    // A.1 — `rename th0` in matchToGoal (Sources.hs:409):
+    //   `th = (`evalFresh` avoid goalTerm) . rename $ th0`
+    // HS `rename` (LTerm.hs:614-621) is a UNIFORM SIGNED SHIFT of the
+    // whole source's free-var span: `shift = freshStart - minVarIdx th0`
+    // with `freshStart = avoid goalTerm` (the supply's first draw), so
+    // the renamed source's MIN idx lands exactly at `avoid goalTerm` —
+    // a REBASE-DOWN at runtime, where the stored source's idxs are at
+    // precompute scale.  The refine (A.3) then runs at live scale, so
+    // every derived value — in particular the eq-store conj WITNESSES
+    // minted by the per-variant `applyBound` re-unify, whose idxs encode
+    // `avoid_max = max(dom(s) ∪ varsRange(newsubst))` — matches HS.
+    // The previous ADDITIVE shift (`goal_max.max(live_max)+1`, keeping
+    // the case at precompute scale + live_max) left those witnesses at
+    // session scale (UM_three_pass CK_secure_UM3 R_Activate: RS
+    // `∃ ~ey.863 X.863` / `~ey.1193 x.2384 x.2385` vs HS
+    // `∃ ~ey.11 X.11` / `~ey.341 x.680 x.681`) — the web sequent-pane
+    // conj: DIFF family.  Witnesses are VFresh-bound (batch-invisible;
+    // never in printed rule/goal terms).
     //
-    // Shift = avoid goalTerm = max free-var idx of (live_node, fa_live)
-    // + 1.  Local counter only.  Renames the WHOLE source coherently
-    // (cdGoal + case_sys share the same shift base).
+    // BP-cluster safety (the reason the old additive shift existed —
+    // commit e65f0a3f: case vars colliding with live `vr.0`/`i1.0`
+    // nodes at conjoinSystem→setNodes): conjoin only ever sees the
+    // post-`freshen_system_some_inst` case (step D), which renames
+    // every non-keep var from the LIVE Reduction's counter (≥ live
+    // max) — exactly HS's `someInst sysTh0` inside the live Reduction.
+    // The refine intermediates at live-goal scale never reach setNodes.
     // ---------------------------------------------------------------
     let mut goal_max: u64 = 0;
     {
@@ -3444,21 +3750,19 @@ fn refine_source_case_action(
         live_node.for_each_free(&mut visit);
         fa_live.for_each_free(&mut visit);
     }
-    // HS's `_applySource` runs `someInst sysTh0` inside the Reduction
-    // monad's FreshT (Sources.hs), which is initialized from the
-    // LIVE system's global fresh counter — so the case's non-goal vars
-    // get fresh indices above EVERY live var, not just the goal's frees.
-    // Previously we shifted only past goal_max; that left case vars like
-    // `vr.0`/`i1.0` at index 0, colliding with live's existing
-    // `vr.0=Init_1`/`i1.0=Init_2` nodes at conjoinSystem→setNodes and
-    // tripping shape_mismatch on cases HS keeps.  Closes BP cluster
-    // (Joux PFS/EphkRev/establish, RYY/RYY_PFS key_secrecy, TAK1/
-    // TAK1_eCK_like session_key_establish, Chen_Kudla key_secrecy_*).
-    let live_max = system_max_idx(live_sys);
-    let rename_shift = goal_max.max(live_max).saturating_add(1);
+    // `avoid goalTerm` (LTerm.hs:656-657): goal always has ≥ 1 free
+    // (live_node), so avoid = max idx + 1.
+    let avoid_goal = goal_max.saturating_add(1);
+    let (src_min, src_cases_max) = src_bounds;
+    // HS `rename x`: `boundsVarIdx x == Nothing` → x unchanged (shift 0).
+    let rename_shift: i128 = match src_min {
+        Some(m) => avoid_goal as i128 - m as i128,
+        None => 0,
+    };
     let shift_lvar = |v: &tamarin_term::lterm::LVar| {
         let mut v2 = v.clone();
-        v2.idx = v2.idx.saturating_add(rename_shift);
+        let n = v2.idx as i128 + rename_shift;
+        v2.idx = if n < 0 { 0 } else { n as u64 };
         v2
     };
     let renamed_abstract_node = shift_lvar(&abstract_node_orig);
@@ -3468,6 +3772,24 @@ fn refine_source_case_action(
         = std::collections::BTreeSet::new();
     let renamed_case = freshen_system_keep_with_shift(
         case_sys, rename_shift, &empty_keep);
+    // HS `refineSource` (Sources.hs:162): `fs = avoid th` where
+    // `th = set cdGoal goalTerm (renamed th0)` — ONE seed for EVERY
+    // case's `runReduction proofStep ctxt se fs`, computed over the
+    // live goal + ALL renamed cases (NOT the per-case `avoid se`).
+    // Thread it into the refine's sub-Reductions via REFINE_FLOOR
+    // (floor = fs - 1; `Reduction::new` lifts next-draw to floor + 1),
+    // exactly like source precompute does.  Cases whose own max sits
+    // below the source-wide max otherwise seed low and their refine
+    // draws (freshToFree folds, witness mints) land below HS
+    // (UM_three_pass residual: RS `~ex.470 x.927` vs HS `~ex.478
+    // x.943` — a source-wide-vs-per-case seed deficit).
+    let fs: u64 = {
+        let shifted_cases_max = src_cases_max.map(|m| {
+            let n = m as i128 + rename_shift;
+            if n < 0 { 0u64 } else { n as u64 }
+        });
+        goal_max.max(shifted_cases_max.unwrap_or(0)).saturating_add(1)
+    };
 
     // ---------------------------------------------------------------
     // A.2 — `doMatch (faTerm `matchFact` faPat <> iTerm `matchLVar` iPat)`.
@@ -3525,7 +3847,15 @@ fn refine_source_case_action(
     //
     // Build `Equal (varTerm v) t` for each (v, t) in the match-subst,
     // then run them through the renamed case's Reduction.
+    //
+    // The whole refine (A.3 solve + per-arm fork/subst_system below)
+    // runs under HS's `fs = avoid th` seed via `RefineFsScope`; the
+    // guard drops at function end, and someInst (`freshen_system_
+    // some_inst`) draws directly from `red_m` so it is floor-immune —
+    // matching HS where someInst runs in the LIVE Reduction, outside
+    // refineSource's runReduction.
     // ---------------------------------------------------------------
+    let _refine_fs = RefineFsScope::set(fs);
     let mut refined = Reduction::new(ctx, renamed_case);
     // HS-faithful `solveSubstEqs` (Reduction.hs:736):
     //   solveTermEqs split [Equal (varTerm v) t | (v, t) <- substToList subst]
@@ -3606,6 +3936,13 @@ fn refine_source_case_action(
     // but per-arm so each arm's eq_store substitutes through the rest
     // of the case body independently.
     let post_solve_sys_template = refined.sys.clone();
+    // HS FreshT-threading (task #23, A(ii)): the refineSubst fan-out
+    // point inside refineSource's own `runReduction ... fs` scale —
+    // each arm's substSystem continues the refine counter from here
+    // (interim: post-solve_term_eqs across-arm high water; faithful
+    // would be fork + arm's own eq-simp draws), instead of rewinding
+    // to `bounds_max(template)`.
+    let refine_fork_cont = refined.maude.fresh_counter_peek();
     // Each output entry is `(grafted_sys, live_action, refined_case)` —
     // the third element is the post-refineSubst+restrict case sub-system
     // BEFORE someInst+conjoinSystem.  Callers dedup on this to mirror
@@ -3624,7 +3961,8 @@ fn refine_source_case_action(
         // whose system body is the post-refineSubst template.  This
         // mirrors HS's `DisjT` replication of the Reduction continuation
         // (Reduction.hs:724-725 `disjunctionOfList performSplit`).
-        let mut refined = fork_arm_reduction(ctx, &post_solve_sys_template, arm_eq_store);
+        let mut refined = fork_arm_reduction(
+            ctx, &post_solve_sys_template, arm_eq_store, refine_fork_cont);
     refined.subst_system();
     if refined.sys.eq_store.is_false() {
         continue;
@@ -3661,23 +3999,39 @@ fn refine_source_case_action(
     // draws fresh idxs from it per unique LVar in traversal order.
     // ---------------------------------------------------------------
     let keep_vars = collect_node_and_fact_frees(live_node, fa_live);
-    let post_refine_max = bounds_max(&refined_case);
-    ctx.maude.ensure_above(post_refine_max);
     // HS-faithful `someInst`: traversal-order per-var fresh idx
     // allocation, matching Haskell's `someInst` + `importBinding`
-    // (LTerm.hs:601-602 + Bind.hs:128-140).  Each unique LVar in
-    // HS-mapFrees traversal order gets the next idx from the global
-    // Maude counter.
+    // (LTerm.hs:601-602 + Bind.hs:128-140).
     //
-    // HS-faithful counter init: HS calls `runReduction (m <* simplifySystem)
-    // ctxt sys (avoid sys)` per proof step (ProofMethod.hs:306), so the
-    // FreshT counter resets to `avoid(live_sys) + 1` BEFORE each apply.
-    // Reset Rust's global counter to match.  Safe because all live_sys
-    // vars are < avoid(live_sys), so any new allocation at idx
-    // ≥ avoid(live_sys)+1 won't collide.
-    let avoid_live = bounds_max(live_sys);
-    ctx.maude.reset_counter_to(avoid_live.saturating_add(1));
-    let freshened_case = freshen_system_some_inst(&refined_case, &keep_vars, &ctx.maude);
+    // HS `_applySource` (Sources.hs:446-469) runs `someInst sysTh0` in
+    // the LIVE Reduction monad — the imports draw from the step's ONE
+    // threaded FreshT counter, sequentially after whatever the step
+    // already minted.  Drawing from a separately re-seeded allocator
+    // instead can hand out idxs the step counter also mints; two
+    // independently minted rule instances sharing (name,sort,idx) then
+    // get IDENTIFIED at node-merge.
+    let red_m = red_maude
+        .expect("refine_source_case_action someInst path requires the live Reduction's counter");
+    // HS FreshT-threading: rewind to the pick-time fork base so THIS
+    // branch's someInst starts where HS's DisjT-forked branch does
+    // (see `fork_base` param doc).  Without the rewind, sibling
+    // (case × arm) branches thread each other's import draws: on
+    // csf18-xor/CH07's KU(lh(...)) pick, HS runs c_lh 4→5 and tag1
+    // 4→18 (TAM_HS_TRACE_APPLY_SRC freshBefore=4 for BOTH), while RS
+    // ran c_lh 4→5 then tag1 5→19 — every tag1-branch var +1, which
+    // the eq-store witness mints (avoid-set-derived) then compound
+    // into the growing ∃-witness drift on the web proof pages.
+    if let Some(fb) = fork_base {
+        red_m.reset_counter_to(fb);
+    }
+    if tamarin_utils::env_gate!("TAM_RS_DBG_FOLD_DRAWS") {
+        eprintln!("[rs-fold] SOMEINST-ACTION counter_before={}", red_m.fresh_counter_peek());
+    }
+    let freshened_case = freshen_system_some_inst(&refined_case, &keep_vars, red_m);
+    let branch_counter = red_m.fresh_counter_peek();
+    if tamarin_utils::env_gate!("TAM_RS_DBG_FOLD_DRAWS") {
+        eprintln!("[rs-fold] SOMEINST-ACTION-DONE counter_after={}", branch_counter);
+    }
 
     // Recover the live action fact for return: it should be the KU
     // action at `live_node` in the freshened case (the abstract node
@@ -3707,6 +4061,7 @@ fn refine_source_case_action(
         freshened_case,
         live_action,
         refined_case_for_dedup,
+        branch_counter,
     });
     } // end `for arm_eq_store in arm_eq_stores`
     out_arms
@@ -3724,21 +4079,34 @@ fn conjoin_refine_arm(
     live_node: &crate::constraint::constraints::NodeId,
     fa_live: &crate::fact::LNFact,
     arm: RefineArm,
-) -> Vec<(System, crate::fact::LNFact, System)> {
+    red_maude: Option<&tamarin_term::maude_proc::MaudeHandle>,
+) -> Vec<(System, crate::fact::LNFact, System, u64)> {
     use crate::constraint::solver::reduction::{Reduction, SolveOutcome};
 
-    let RefineArm { freshened_case, live_action, refined_case_for_dedup } = arm;
+    // `branch_counter` was consumed by the caller (Step 3's per-branch
+    // `reset_counter_to` before this call).
+    let RefineArm { freshened_case, live_action, refined_case_for_dedup,
+                    branch_counter: _ } = arm;
 
     let live_goal_for_trace = crate::constraint::constraints::Goal::Action(
         live_node.clone(), fa_live.clone());
 
-    let mut out_arms: Vec<(System, crate::fact::LNFact, System)> = Vec::new();
+    // Fourth tuple element: HS FreshT-threading (task #23, A(ii)) —
+    // the OUTPUT arm's continuation counter (this branch's fork + its
+    // own someInst + conjoin + E.5 + close-chains draws).  Every
+    // output arm is its own DisjT branch in HS, so each carries its
+    // own thread position; the caller hands it to the adopting
+    // caller's per-case `new_inheriting`.
+    let mut out_arms: Vec<(System, crate::fact::LNFact, System, u64)> = Vec::new();
 
     // ---------------------------------------------------------------
     // B — `markGoalAsSolved "precomputed" goal`.
     // E — `conjoinSystem sysTh`.
+    // HS runs conjoinSystem in the SAME live Reduction (`_applySource`,
+    // Sources.hs:446-469) — share the step's threaded counter.
     // ---------------------------------------------------------------
     let mut r = Reduction::new(ctx, live_sys.clone());
+    if let Some(m) = red_maude { r.maude = m.clone(); }
     let live_goal = crate::constraint::constraints::Goal::Action(
         live_node.clone(), fa_live.clone());
     // HS-faithful (Sources.hs:196-216): `solveAllSafeGoals.safeGoal`
@@ -3773,7 +4141,13 @@ fn conjoin_refine_arm(
     }
     crate::state_trace::emit(
         "applySource_pre_conjoin", Some(&live_goal_for_trace), &freshened_case);
+    if tamarin_utils::env_gate!("TAM_RS_DBG_FOLD_DRAWS") {
+        eprintln!("[rs-fold] CONJOIN counter_before={}", r.maude.fresh_counter_peek());
+    }
     let res = r.conjoin_system(&freshened_case);
+    if tamarin_utils::env_gate!("TAM_RS_DBG_FOLD_DRAWS") {
+        eprintln!("[rs-fold] CONJOIN-DONE counter_after={}", r.maude.fresh_counter_peek());
+    }
     if matches!(res, Err(_) | Ok(SolveOutcome::Contradictory)) {
         crate::state_trace::emit(
             "applySource_drop", Some(&live_goal_for_trace), &r.sys);
@@ -3791,13 +4165,19 @@ fn conjoin_refine_arm(
     let conjoin_arm_systems = std::mem::take(
         &mut r.pending_conjoin_arm_systems);
     // Build a Vec<Reduction> over arm0 + extra-arms so the post-conjoin
-    // work loop runs uniformly.  arm0 is the in-place `r`; arms[1..]
-    // each get a fresh Reduction with the pre-drained sys installed.
+    // work loop runs uniformly.  arm0 is the in-place `r` (its `maude`
+    // is the LIVE handle when `red_maude` is present); arms[1..] each
+    // get a Reduction that CONTINUES the arm's recorded step-12
+    // counter thread (HS FreshT-threading, task #23 A(ii): each
+    // solveSubstEqs arm is a DisjT fork BELOW FreshT — rebuilding from
+    // `Reduction::new`'s bounds_max seed rewound past this branch's
+    // someInst/conjoin transient draws, so the arm's E.5/close-chains
+    // witness mints landed below HS's).
     let mut arm_reductions: Vec<Reduction> = Vec::with_capacity(
         1 + conjoin_arm_systems.len());
     arm_reductions.push(r);
-    for sys_i in conjoin_arm_systems {
-        arm_reductions.push(Reduction::new(ctx, sys_i));
+    for (sys_i, cont_i) in conjoin_arm_systems {
+        arm_reductions.push(Reduction::new_inheriting(ctx, sys_i, cont_i));
     }
 
     // E.5 — edge fact-equality propagation (see per-arm comment below).
@@ -3868,11 +4248,24 @@ fn conjoin_refine_arm(
     // carrying the wiped default eq-store (conj=[], next_split=0) — that
     // silently dropped the live `splitEqs` disjunctions, collapsing
     // Joux_EphkRev's EphkRev cascade (HS Split×3/×4 → RS Split×1).
-    let mut e5_arm_systems: Vec<System> = Vec::new();
+    // Each E.5 output arm carries its continuation counter (HS
+    // FreshT-threading, task #23 A(ii)): the branch thread up to and
+    // including this arm's E.5 solve + substSystem draws.  The
+    // close-chains/output continuation below resumes from it instead
+    // of a detached `bounds_max` seed.
+    let mut e5_arm_systems: Vec<(System, u64)> = Vec::new();
     if !edge_eqs.is_empty() {
+        if tamarin_utils::env_gate!("TAM_RS_DBG_FOLD_DRAWS") {
+            eprintln!("[rs-fold] E5-ACTION edge_eqs={} counter_before={}",
+                edge_eqs.len(), r.maude.fresh_counter_peek());
+        }
         let res = r.solve_fact_eqs(
             crate::constraint::solver::reduction::SplitStrategy::SplitNow,
             &edge_eqs);
+        if tamarin_utils::env_gate!("TAM_RS_DBG_FOLD_DRAWS") {
+            eprintln!("[rs-fold] E5-ACTION-DONE counter_after={}",
+                r.maude.fresh_counter_peek());
+        }
         match res {
             Err(_) | Ok(SolveOutcome::Contradictory) => {
                 crate::state_trace::emit(
@@ -3883,24 +4276,40 @@ fn conjoin_refine_arm(
                 // Single arm: `solve_term_eqs` already installed it into
                 // `r.sys.eq_store`.
                 r.subst_system();
-                e5_arm_systems.push(r.sys.clone());
+                e5_arm_systems.push(
+                    (r.sys.clone(), r.maude.fresh_counter_peek()));
             }
             Ok(SolveOutcome::Cases(arms)) => {
                 // Multi-arm fanout: `solve_term_eqs` returned the arms
                 // WITHOUT installing any into `r.sys`.  Install each arm
                 // into a clone of the pre-solve `r.sys`, run substSystem,
-                // and continue the rest of `_applySource` per arm.
+                // and continue the rest of `_applySource` per arm — each
+                // arm continuing the counter from the E.5 fan-out point
+                // (post-solve across-arm high water; see
+                // `fork_arm_reduction`).
                 let template = r.sys.clone();
-                subst_arms_into(ctx, &template, arms, &mut e5_arm_systems);
+                subst_arms_into(ctx, &template, arms,
+                    r.maude.fresh_counter_peek(), &mut e5_arm_systems);
                 if e5_arm_systems.is_empty() { continue; }
             }
         }
     } else {
-        e5_arm_systems.push(r.sys.clone());
+        e5_arm_systems.push((r.sys.clone(), r.maude.fresh_counter_peek()));
     }
 
-    for r_sys in e5_arm_systems {
-    let mut r = Reduction::new(ctx, r_sys);
+    for (r_sys, e5_cont) in e5_arm_systems {
+    // HS FreshT-threading (task #23, A(ii)): continue the branch's
+    // counter thread through close_trivial_chains_in_graft.  Its
+    // `solve_fact_eqs` draws (add_eqs witness freshening + eq-store
+    // simp folds) are the RS-eager equivalent of unifications HS
+    // carries INSIDE the stored case (precompute chain closure /
+    // chainToEquality at the next simplify) — HS mints those vars on
+    // the live branch thread (someInst import or post-solve simplify),
+    // so a detached `Reduction::new` here both numbered them at
+    // `bounds_max` scale (below HS) and dropped them from the output
+    // arm's continuation counter — the UM_three_pass-family −4/−8/−16
+    // proof-page undershoot that grows with depth.
+    let mut r = Reduction::new_inheriting(ctx, r_sys, e5_cont);
 
     // ---------------------------------------------------------------
     // F — Close trivial chains via direct-edge unification.
@@ -3926,10 +4335,41 @@ fn conjoin_refine_arm(
     // (E.5), which RS mirrors. A second re-key here collapsed distinct
     // witnesses and rotated split ordering — verify_checksign_test::test4/5.)
 
+    // HS-faithful action reconciliation.  HS's `_applySource`
+    // (Sources.hs:446-469) reconciles the case's KU-action fact with the
+    // live goal ENTIRELY inside `conjoinSystem`'s node-merge — there is NO
+    // separate `solveFactEqs [caseAction = goal]` step.  RS's `conjoinSystem`
+    // (`r.conjoin_system` above) likewise already reconciled the grafted
+    // action node to the live goal fact (its em-agent / DH-exponent vars now
+    // carry the LIVE goal's `$A`/`~ex`, not the `someInst`-freshened
+    // `$A.12`/`~ex.24`).  The caller (reduction.rs `solve_action_goal`
+    // None-branch) then runs `solve_fact_eqs([case_action = fa])` to
+    // propagate action bindings before its chain-edge solve.  If we hand it
+    // the STALE pre-conjoin `live_action` (`$A.12`), that unify is
+    // NON-trivial against `fa` (`$A`) even though the grafted system already
+    // carries `$A` — so `add_eqs` re-freshens the live eqStore `conj` a
+    // SECOND time (HS re-freshes exactly once, inside conjoinSystem),
+    // bumping every DH-variant witness one notch (RYY_PFS
+    // Reveal_ltk_case_1: RS `~ex`/`x` = HS +1/+2).  Recover the POST-conjoin
+    // action from `r.sys` at the live node instead — when conjoin fully
+    // reconciled it (`== fa`) the caller's pass is a no-op (no extra
+    // re-fresh); when conjoin left a live var to bind (e.g.
+    // Reveal_session_key's `z`), the pass still binds exactly that, matching
+    // HS's single reconciliation.
+    let post_conjoin_action = r.sys.nodes.iter()
+        .find(|(id, _)| id == live_node)
+        .and_then(|(_, ru)| ru.actions.iter()
+            .find(|a| a.tag == crate::fact::FactTag::Ku).cloned())
+        .unwrap_or_else(|| live_action.clone());
     crate::state_trace::emit(
         "applySource_out", Some(&live_goal_for_trace), &r.sys);
-    out_arms.push((r.sys, live_action.clone(), refined_case_for_dedup.clone()));
-    } // end `for r_sys in e5_arm_systems`
+    // Per-output-arm continuation counter: the branch thread including
+    // this arm's close-chains draws (HS FreshT-threading, task #23
+    // A(ii)).
+    let arm_cont = r.maude.fresh_counter_peek();
+    out_arms.push((r.sys, post_conjoin_action, refined_case_for_dedup.clone(),
+                   arm_cont));
+    } // end `for (r_sys, e5_cont) in e5_arm_systems`
     } // end `for r in arm_reductions`
     out_arms
 }
@@ -3949,9 +4389,18 @@ fn apply_source_case_premise(
     live_node: &crate::constraint::constraints::NodeId,
     live_prem_idx: crate::rule::PremIdx,
     fa_live: &crate::fact::LNFact,
-) -> Vec<System> {
+    red_maude: Option<&tamarin_term::maude_proc::MaudeHandle>,
+    src_bounds: (Option<u64>, Option<u64>),
+    // HS FreshT-threading (task #23, A(ii) premise parity): the live
+    // counter position at the source pick — see the identical param on
+    // `refine_source_case_action`.  Each (case × refineSubst-arm)
+    // branch's someInst is rewound to this fork before drawing, so
+    // sibling branches do not thread each other's import draws.
+    // `None` = no live counter (no rewind).
+    fork_base: Option<u64>,
+) -> Vec<(System, u64)> {
     use crate::constraint::solver::reduction::{
-        Reduction, SolveOutcome, SplitStrategy, bounds_max,
+        Reduction, SolveOutcome, SplitStrategy,
     };
     use tamarin_term::lterm::HasFrees;
 
@@ -3971,7 +4420,17 @@ fn apply_source_case_premise(
         (live_node.clone(), live_prem_idx), fa_live.clone());
     crate::state_trace::emit("applySource_prem_in", Some(&live_goal_for_trace), live_sys);
 
-    // A.1 — rename th0 in matchToGoal.
+    // A.1 — `rename th0` in matchToGoal (Sources.hs:409):
+    //   `th = (`evalFresh` avoid goalTerm) . rename $ th0`
+    // Uniform SIGNED shift `avoid goalTerm - min(whole source)` — the
+    // renamed source's min idx lands exactly at `avoid goalTerm`
+    // (rebase-down at runtime).  See the block comment in
+    // `refine_source_case_action`'s A.1 for the full derivation, the
+    // witness-idx (web conj: DIFF) rationale, and why the BP-cluster
+    // setNodes collisions (commit e65f0a3f, the old additive
+    // `goal_max.max(live_max)+1` shift) can't recur: conjoin only sees
+    // the post-`freshen_system_some_inst` case (step D), renamed from
+    // the live Reduction's counter.
     let mut goal_max: u64 = 0;
     {
         let mut visit = |v: &tamarin_term::lterm::LVar| {
@@ -3980,22 +4439,27 @@ fn apply_source_case_premise(
         live_node.for_each_free(&mut visit);
         fa_live.for_each_free(&mut visit);
     }
-    // HS's `_applySource` runs `someInst sysTh0` inside the Reduction
-    // monad's FreshT (Sources.hs), which is initialized from the
-    // LIVE system's global fresh counter — so the case's non-goal vars
-    // get fresh indices above EVERY live var, not just the goal's frees.
-    // Previously we shifted only past goal_max; that left case vars like
-    // `vr.0`/`i1.0` at index 0, colliding with live's existing
-    // `vr.0=Init_1`/`i1.0=Init_2` nodes at conjoinSystem→setNodes and
-    // tripping shape_mismatch on cases HS keeps.  Closes BP cluster
-    // (Joux PFS/EphkRev/establish, RYY/RYY_PFS key_secrecy, TAK1/
-    // TAK1_eCK_like session_key_establish, Chen_Kudla key_secrecy_*).
-    let live_max = system_max_idx(live_sys);
-    let rename_shift = goal_max.max(live_max).saturating_add(1);
+    let avoid_goal = goal_max.saturating_add(1);
+    let (src_min, src_cases_max) = src_bounds;
+    let rename_shift: i128 = match src_min {
+        Some(m) => avoid_goal as i128 - m as i128,
+        None => 0,
+    };
     let shift_lvar = |v: &tamarin_term::lterm::LVar| {
         let mut v2 = v.clone();
-        v2.idx = v2.idx.saturating_add(rename_shift);
+        let n = v2.idx as i128 + rename_shift;
+        v2.idx = if n < 0 { 0 } else { n as u64 };
         v2
+    };
+    // HS `refineSource` seed `fs = avoid th` over the live goal + ALL
+    // renamed cases — see the matching comment in
+    // `refine_source_case_action`'s A.1/A.3.
+    let fs: u64 = {
+        let shifted_cases_max = src_cases_max.map(|m| {
+            let n = m as i128 + rename_shift;
+            if n < 0 { 0u64 } else { n as u64 }
+        });
+        goal_max.max(shifted_cases_max.unwrap_or(0)).saturating_add(1)
     };
     let renamed_abstract_node = shift_lvar(&abstract_node_orig);
     let renamed_abstract_fact = abstract_prem_fact_orig
@@ -4045,9 +4509,23 @@ fn apply_source_case_premise(
     };
 
     // A.2.5 (Premise-specific) — substNodePrem pPat (iPat, premIdxTerm).
-    // Rewrite edges in the case whose tgt is the renamed pattern
-    // premise so they point at the LIVE premise idx.  Same for any
-    // Premise goal at that position.
+    // HS `matchToGoal` (Sources.hs:385) rewrites ONLY the source case's
+    // EDGES: `modM sEdges (substNodePrem pPat (iPat, premIdxTerm))`, where
+    // `substNodePrem from to = S.map (\e@(Edge c p) -> if p == from then
+    // Edge c to else e)`.  It does NOT touch `sGoals`.  So when the source
+    // pattern's consumer premise sits at index 0 (all precomputed sources
+    // use `PremIdx 0`, Sources.hs:576) but the LIVE goal being solved is at
+    // index i≠0, HS keeps the source case's SOLVED premise goal at index 0.
+    // After `conjoinSystem` re-inserts it (with a fresh gsNr) and node-merge
+    // relabels its node to the live node, this leaves a redundant SOLVED
+    // "ghost" premise goal `fa ▶₀ #i` alongside the genuine (now-solved)
+    // `fa ▶ᵢ #i`.  That ghost is search-inert (solved goals never drive open-
+    // goal selection) but it IS rendered in the per-node sequent, so the web
+    // UI must reproduce it byte-for-byte.  Rewriting the GOAL index here (as
+    // an earlier port mistakenly did) instead deduped the source goal into
+    // the genuine `▶ᵢ` goal, dropping the ghost and diverging from HS on the
+    // interactive per-node systems (NSPK3 injective_agree, RFID_Simple, …).
+    // Faithful behaviour: rewrite edges only; leave goals at the source idx.
     let mut renamed_case = renamed_case;
     let pat_prem: (tamarin_term::lterm::LVar, crate::rule::PremIdx) =
         (renamed_abstract_node.clone(), abstract_prem_idx_orig);
@@ -4058,15 +4536,12 @@ fn apply_source_case_premise(
             e.tgt = new_prem.clone();
         }
     }
-    for (g, _) in renamed_case.goals_mut().iter_mut() {
-        if let crate::constraint::constraints::Goal::Premise(p, _) = g {
-            if *p == pat_prem {
-                *p = new_prem.clone();
-            }
-        }
-    }
 
     // A.3 — refineSubst: solveSubstEqs SplitNow subst >> substSystem.
+    // Runs under HS's `fs = avoid th` seed (RefineFsScope); explicitly
+    // dropped after the arm_eq_stores computation so someInst/conjoin
+    // (LIVE-counter territory in HS) stay outside the floor.
+    let refine_fs = RefineFsScope::set(fs);
     let mut refined = Reduction::new(ctx, renamed_case);
     // HS-faithful `solveSubstEqs` (Reduction.hs:736): build
     // `Equal (varTerm v) t` with no conditional flip.
@@ -4110,9 +4585,19 @@ fn apply_source_case_premise(
                 }
             }
         };
+    // End of the pre-arm refine section — drop the `fs` floor before
+    // someInst/conjoin (they run under the LIVE counter in HS).
+    drop(refine_fs);
 
     let post_solve_sys_template = refined.sys.clone();
-    let mut out_arms: Vec<System> = Vec::with_capacity(arm_eq_stores.len());
+    // HS FreshT-threading (task #23, A(ii)): the refineSubst fan-out
+    // point on the refine's own `fs` scale — see the identical capture
+    // in `refine_source_case_action`.
+    let refine_fork_cont = refined.maude.fresh_counter_peek();
+    // Per output arm: (grafted system, branch continuation counter) —
+    // the premise twin of `conjoin_refine_arm`'s per-output-arm
+    // counters.
+    let mut out_arms: Vec<(System, u64)> = Vec::with_capacity(arm_eq_stores.len());
 
     // E.5 — `prem_live_node_ids` depends only on `live_sys` (an immutable
     // param, invariant across arms), so build it ONCE here instead of
@@ -4121,9 +4606,15 @@ fn apply_source_case_premise(
     let prem_live_node_ids = collect_node_ids(live_sys);
 
     for arm_eq_store in arm_eq_stores {
-        let mut refined = fork_arm_reduction(ctx, &post_solve_sys_template, arm_eq_store);
+        // Per-arm refine continuation (still HS refineSubst's
+        // substSystem) — runs under the same `fs` seed; dropped before
+        // this arm's someInst/conjoin below.
+        let refine_fs = RefineFsScope::set(fs);
+        let mut refined = fork_arm_reduction(
+            ctx, &post_solve_sys_template, arm_eq_store, refine_fork_cont);
 
     refined.subst_system();
+    drop(refine_fs);
     if refined.sys.eq_store.is_false() {
         continue;
     }
@@ -4135,25 +4626,35 @@ fn apply_source_case_premise(
 
     // D — someInst keepVarBindings.
     let keep_vars = collect_node_and_fact_frees(live_node, fa_live);
-    let post_refine_max = bounds_max(&refined_case);
-    ctx.maude.ensure_above(post_refine_max);
-    // HS-faithful `someInst`: traversal-order per-var fresh idx
-    // allocation, matching Haskell's `someInst` + `importBinding`
-    // (LTerm.hs:601-602 + Bind.hs:128-140).  Each unique LVar in
-    // HS-mapFrees traversal order gets the next idx from the global
-    // Maude counter.
-    //
-    // HS-faithful counter init: HS calls `runReduction (m <* simplifySystem)
-    // ctxt sys (avoid sys)` per proof step (ProofMethod.hs:306), so the
-    // FreshT counter resets to `avoid(live_sys) + 1` BEFORE each apply.
-    // Reset Rust's global counter to match.  Safe because all live_sys
-    // vars are < avoid(live_sys), so any new allocation at idx
-    // ≥ avoid(live_sys)+1 won't collide.
-    let avoid_live = bounds_max(live_sys);
-    ctx.maude.reset_counter_to(avoid_live.saturating_add(1));
-    let freshened_case = freshen_system_some_inst(&refined_case, &keep_vars, &ctx.maude);
-    // B+E — markGoalAsSolved + conjoinSystem.
+    // HS `_applySource` (Sources.hs:446-469) runs `someInst sysTh0` in
+    // the LIVE Reduction monad — imports draw from the step's ONE
+    // threaded FreshT counter (see the matching comment in
+    // `refine_source_case_action`).
+    let red_m = red_maude
+        .expect("apply_source_case_premise someInst path requires the live Reduction's counter");
+    // HS FreshT-threading (task #23, A(ii) premise parity): rewind to
+    // the pick-time fork base so THIS (case × arm) branch's someInst
+    // starts where HS's DisjT-forked branch does — the premise twin of
+    // the rewind in `refine_source_case_action`.  Without it, sibling
+    // branches thread each other's import draws (every later case's
+    // vars sit higher than HS's — the overshoot half of the premise
+    // A(ii) family).
+    if let Some(fb) = fork_base {
+        red_m.reset_counter_to(fb);
+    }
+    if tamarin_utils::env_gate!("TAM_RS_DBG_FOLD_DRAWS") {
+        eprintln!("[rs-fold] SOMEINST-PREMISE counter_before={}",
+            red_m.fresh_counter_peek());
+    }
+    let freshened_case = freshen_system_some_inst(&refined_case, &keep_vars, red_m);
+    if tamarin_utils::env_gate!("TAM_RS_DBG_FOLD_DRAWS") {
+        eprintln!("[rs-fold] SOMEINST-PREMISE-DONE counter_after={}",
+            red_m.fresh_counter_peek());
+    }
+    // B+E — markGoalAsSolved + conjoinSystem.  HS runs conjoinSystem in
+    // the SAME live Reduction — share the step's counter.
     let mut r = Reduction::new(ctx, live_sys.clone());
+    r.maude = red_m.clone();
     let live_goal = crate::constraint::constraints::Goal::Premise(
         (live_node.clone(), live_prem_idx), fa_live.clone());
     if let Some(slot) = r.sys.goals_mut().iter_mut().find(|(g, _)| g == &live_goal) {
@@ -4223,20 +4724,33 @@ fn apply_source_case_premise(
         if conc == prem { return None; }
         Some(tamarin_term::rewriting::Equal { lhs: conc, rhs: prem })
     }).collect();
-    // E.5 fanout: `solve_fact_eqs(SplitNow)` may return `Cases(arms)`
-    // when the edge-fact unification yields multiple AC unifier arms.
-    // `solve_term_eqs`'s `Cases` branch does NOT reinstall `r.sys.eq_store`
-    // (it leaves the `mem::take`'d default store), so we MUST install each
-    // arm — otherwise the system proceeds with a wiped eq-store, silently
-    // dropping every live/grafted disjunction.  This mirrors the action
-    // variant's E.5 fanout; the premise path previously only branched on
-    // Err/Contradictory and fell through on `Cases` with the wiped store.
-    // Continue the rest of `_applySource` (F + push) per arm.
-    let mut e5_arm_systems: Vec<System> = Vec::new();
+    // HS-faithful deferral: HS's `_applySource` -> `conjoinSystem`
+    // (Sources.hs:447-469, Reduction.hs:839-866) never fact-solves grafted
+    // edges; producer<->consumer AC ambiguity surfaces via node merges as
+    // `solveRuleEqs SplitLater` (Reduction.hs:778) — a DEFERRED eq-store
+    // disjunction plus a pending `splitEqs(N)` goal, live vars left
+    // uninstantiated.  E.5's alignment job (Minimal_HashChain kZero<->kOrig,
+    // TESLA variant drop) is single-unifier, which SplitLater still
+    // composes immediately.  SplitNow here eagerly fanned multi-unifier
+    // arms into proof cases and let simp collapse the merge-derived
+    // splits — on alethea_selectionphase_malS establishedIK this pinned
+    // y2 |-> h(<'H1',x.1>) and dropped the splitEqs(5..8) HS keeps
+    // pending (web task #22).
+    // Per-arm continuation counters — see the action-path E.5 comment
+    // in `conjoin_refine_arm` (task #23, A(ii)).
+    let mut e5_arm_systems: Vec<(System, u64)> = Vec::new();
     if !edge_eqs.is_empty() {
+        if tamarin_utils::env_gate!("TAM_RS_DBG_FOLD_DRAWS") {
+            eprintln!("[rs-fold] E5-PREMISE edge_eqs={} counter_before={}",
+                edge_eqs.len(), r.maude.fresh_counter_peek());
+        }
         let res = r.solve_fact_eqs(
-            crate::constraint::solver::reduction::SplitStrategy::SplitNow,
+            crate::constraint::solver::reduction::SplitStrategy::SplitLater,
             &edge_eqs);
+        if tamarin_utils::env_gate!("TAM_RS_DBG_FOLD_DRAWS") {
+            eprintln!("[rs-fold] E5-PREMISE-DONE counter_after={}",
+                r.maude.fresh_counter_peek());
+        }
         match res {
             Err(_) | Ok(SolveOutcome::Contradictory) => {
                 crate::state_trace::emit(
@@ -4244,22 +4758,25 @@ fn apply_source_case_premise(
                     Some(&live_goal_for_trace), &r.sys);
                 continue;
             }
-            Ok(SolveOutcome::Linear(_)) => {
+            // SplitLater never returns Cases (reduction.rs installs the
+            // combined store + SplitG goal and returns Linear); keep the
+            // arm for type-completeness.
+            Ok(SolveOutcome::Linear(_)) | Ok(SolveOutcome::Cases(_)) => {
                 r.subst_system();
-                e5_arm_systems.push(r.sys.clone());
-            }
-            Ok(SolveOutcome::Cases(arms)) => {
-                let template = r.sys.clone();
-                subst_arms_into(ctx, &template, arms, &mut e5_arm_systems);
-                if e5_arm_systems.is_empty() { continue; }
+                e5_arm_systems.push(
+                    (r.sys.clone(), r.maude.fresh_counter_peek()));
             }
         }
     } else {
-        e5_arm_systems.push(r.sys.clone());
+        e5_arm_systems.push((r.sys.clone(), r.maude.fresh_counter_peek()));
     }
 
-    for r_sys in e5_arm_systems {
-    let mut r = Reduction::new(ctx, r_sys);
+    for (r_sys, e5_cont) in e5_arm_systems {
+    // HS FreshT-threading (task #23, A(ii)): continue the branch's
+    // counter thread through close_trivial_chains_in_graft — see the
+    // matching comment in `conjoin_refine_arm` (this is the premise
+    // twin of the action path's detached post-E.5 rebuild).
+    let mut r = Reduction::new_inheriting(ctx, r_sys, e5_cont);
 
     // F — close trivial chains.
     close_trivial_chains_in_graft(&mut r);
@@ -4293,8 +4810,13 @@ fn apply_source_case_premise(
 
     crate::state_trace::emit(
         "applySource_prem_out", Some(&live_goal_for_trace), &r.sys);
-    out_arms.push(r.sys);
-    } // end `for r_sys in e5_arm_systems`
+    // Per-output-arm continuation counter (fork + this branch's own
+    // someInst/conjoin/E.5/close-chains draws) — consumed by the
+    // adopting caller's per-case `reset_counter_to` /
+    // `last_case_counters`.
+    let arm_cont = r.maude.fresh_counter_peek();
+    out_arms.push((r.sys, arm_cont));
+    } // end `for (r_sys, e5_cont) in e5_arm_systems`
     } // end `for arm_eq_store in arm_eq_stores`
     out_arms
 }
@@ -5030,7 +5552,23 @@ fn write_term_to_key(
     match t {
         Term::Lit(Lit::Var(v)) => {
             let rv = rn(rename, v);
-            let _ = write!(out, "v{}:{:?}", rv.idx, rv.sort);
+            // Include the var NAME.  HS's `LVar` Ord is (idx, sort, name)
+            // and `renameDropNamehint` (Term/LTerm.hs:701-703) renames each
+            // DISTINCT `LVar` via `importBinding` (keyed on full identity),
+            // giving non-stable vars an EMPTY name but keeping stable vars
+            // bound to themselves (`stableVarBindings`, Sources.hs:356-360)
+            // with their ORIGINAL name.  Two distinct stable public vars —
+            // e.g. `$A.1` and `$B.1` — share (idx=1, sort=Pub) and differ
+            // ONLY in name; `compareSystemsUpToNewVars` therefore keeps them
+            // apart.  Dropping the name here conflated them, so the two
+            // symmetric commutative-`em` source-graft arms
+            // (`em(hp($A.1),hp($B.1))` = `em(x,y)` has two Maude matchings)
+            // produced byte-identical dedup keys and `removeRedundantCases`
+            // collapsed `c_em_case_1`/`c_em_case_2` into one `c_em` on
+            // Scott::key_secrecy.  `compute_rename_map` assigns non-stable
+            // vars an empty name, so appending it is a no-op for them and
+            // only restores HS's stable-var name discrimination.
+            let _ = write!(out, "v{}:{:?}:{}", rv.idx, rv.sort, rv.name);
         }
         Term::Lit(Lit::Con(c)) => { let _ = write!(out, "{:?}", c); }
         Term::App(sym, args) => {
@@ -5534,14 +6072,33 @@ fn write_goal_to_key(
             let _ = write!(out, "Sp({:?})", id);
         }
         Goal::Disj(d) => {
+            // HS `DisjG (Disj [LNGuarded])` participates in the structural
+            // `Ord System` (via `_sGoals :: Map Goal GoalStatus`) as an
+            // ORDERED disjunct list — `renameDropNamehint` (mapFrees,
+            // Term/LTerm.hs:701-703) preserves disjunct order, and `Disj`
+            // derives `Ord` element-wise.  Serialise the alternatives IN
+            // ORDER — this matches `write_guarded_struct` (used for the
+            // FORMULAS section, which never sorted).
+            //
+            // Sorting the alternatives (the previous behaviour) conflated
+            // `A ∨ B` with `B ∨ A`.  Two sibling cases that are alpha-
+            // equivalent EXCEPT that their two disjunction goals map to
+            // swapped `gsNr` under the canonical rename then produced
+            // byte-identical keys and `removeRedundantCases` wrongly
+            // collapsed them.  Concretely: Joux `solve( SessionKey(A, B++C,
+            // sessKey) )` (off-autoprove-trajectory) has two multiset AC-
+            // unifiers (a `$B↔$C` swap); HS keeps both `Proto2_case_1/2`
+            // (`[PROCESS ... SessionKey] 2 surviving cases`) because the
+            // canonical `$B↔$C` rename swaps which disjunction goal is
+            // `(A∨B∨C)` vs `(A∨C∨B)` while their `gsNr` (2 / 3) stays put,
+            // so the two renamed `Map Goal GoalStatus`es differ.  With the
+            // disjuncts sorted RS lost that order, its keys collided, and it
+            // collapsed to a single `Proto2` — dropping a case HS keeps.
             out.push_str("D[");
-            let mut alt_strs: Vec<String> = d.0.iter().map(|alt| {
-                let mut s = String::new();
-                write_guarded_to_key(alt, rename, &mut s);
-                s
-            }).collect();
-            alt_strs.sort();
-            for s in &alt_strs { out.push_str(s); out.push('|'); }
+            for (i, alt) in d.0.iter().enumerate() {
+                if i > 0 { out.push('|'); }
+                write_guarded_to_key(alt, rename, out);
+            }
             out.push(']');
         }
     }

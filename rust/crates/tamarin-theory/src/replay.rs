@@ -338,9 +338,20 @@ fn replay_node(
     };
 
     // Match the skeleton's child case-names against the cases
-    // exec_proof_method produced.  If `cases` is empty (e.g.
-    // contradictory closure), this is a leaf-equivalent.
-    if cases.is_empty() {
+    // exec_proof_method produced.  If BOTH the runtime case-map and the
+    // skeleton's child-map are empty (a genuine stored `by solve(...)`
+    // leaf whose re-execution also closes), this is a leaf-equivalent.
+    // If the runtime map is empty but the skeleton HAS children, do NOT
+    // short-circuit: HS `checkProof`'s `mergeMapsWith` runs with an
+    // empty LEFT map and every stored child lands in the rightOnly
+    // branch (`noSystemPrf`) — the whole stored subtree is kept
+    // VERBATIM and renders `/* unannotated */`.  Short-circuiting here
+    // dropped a 263-line stored subtree on
+    // csf18-alethea/alethea_votingphase_malS_Proof_functional.spthy
+    // (HS plain-load: 93 steps; RS: 22) — the merge loop below handles
+    // the empty `produced` map correctly (every skeleton child becomes
+    // a stored-only placeholder).
+    if cases.is_empty() && node.cases.is_empty() {
         // Empty case-map after exec means contradictory closure —
         // mirror search.rs's contradictory-closure handling.
         return ProofNode {

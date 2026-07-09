@@ -373,6 +373,67 @@ pub fn pretty_closed_theory(
     out
 }
 
+// =============================================================================
+// Interactive-web snippet reuse (Web/Theory.hs `messageSnippet` /
+// `rulesSnippet` / `htmlSource`).  These re-expose the byte-faithful
+// `--prove` printers so the web handler (`tamarin-server`) renders the same
+// text the CLI does — the web handler only adds the surrounding HTML tags.
+// =============================================================================
+
+/// HS `prettySignatureWithMaude sig = prettyMaudeSig (mhMaudeSig …)`
+/// (Signature.hs) — the same signature block the theory body prints
+/// (`render_signature`).  Used by the web message page's "Signature" section.
+pub fn web_signature_block(sig: &tamarin_term::maude_sig::MaudeSig) -> String {
+    render_signature(sig)
+}
+
+/// HS `prettyGoal` (Constraints.hs:262-285) — reuses the byte-faithful
+/// `solve_goal_to_doc`, rendered at the active display width.  Used for the
+/// web source-case header/premise (`htmlSource`'s `prettyGoal th._cdGoal`).
+pub fn web_pretty_goal(g: &crate::constraint::constraints::Goal) -> String {
+    solve_goal_to_doc(g).render()
+}
+
+/// Collect the theory's macros + predicates the way `pretty_closed_theory`
+/// does, so the per-item renderers below see the same expansion inputs.
+fn web_collect_macros_predicates(parsed: &p::Theory) -> (Vec<p::Macro>, Vec<p::Predicate>) {
+    let macros: Vec<p::Macro> = parsed.items.iter()
+        .filter_map(|i| if let p::TheoryItem::Macros(ms) = i { Some(ms.as_slice()) } else { None })
+        .flatten().cloned().collect();
+    let predicates: Vec<p::Predicate> = parsed.items.iter()
+        .filter_map(|i| if let p::TheoryItem::Predicates(ps) = i { Some(ps.as_slice()) } else { None })
+        .flatten().cloned().collect();
+    (macros, predicates)
+}
+
+/// HS `prettyClosedProtoRule` over `theoryRules thy` (Web/Theory.hs:894,898) —
+/// one rendered rule string per user protocol rule, in source order.  Reuses
+/// `render_rule` (the `--prove` theory-body rule printer) with the same
+/// macro/arity1/manual-variant setup `pretty_closed_theory` uses.
+pub fn web_proto_rules(parsed: &p::Theory, elaborated: &Theory) -> Vec<String> {
+    let (macros, _preds) = web_collect_macros_predicates(parsed);
+    let arity1 = arity1_noeq_names(elaborated);
+    let manual_variants = contains_manual_rule_variants(parsed, elaborated, false);
+    parsed.items.iter().filter_map(|item| match item {
+        p::TheoryItem::Rule(r) if elaborated.rules().any(|er| er.name() == r.name) =>
+            Some(render_rule(r, elaborated, &macros, &arity1, manual_variants, false)),
+        _ => None,
+    }).collect()
+}
+
+/// HS `prettyRestriction` over `theoryRestrictions thy` (Web/Theory.hs:895) —
+/// one rendered restriction string per restriction, in source order.  Reuses
+/// `render_parsed_restriction` (the `--prove` theory-body restriction printer).
+pub fn web_restrictions(parsed: &p::Theory, elaborated: &Theory) -> Vec<String> {
+    let (macros, predicates) = web_collect_macros_predicates(parsed);
+    let arity1 = arity1_noeq_names(elaborated);
+    parsed.items.iter().filter_map(|item| match item {
+        p::TheoryItem::Restriction(r) | p::TheoryItem::LegacyAxiom(r) =>
+            Some(render_parsed_restriction(r, &macros, &predicates, elaborated, &arity1)),
+        _ => None,
+    }).collect()
+}
+
 /// Render HS `ppInjectiveFactInsts` (ClosedTheory.hs:413-418):
 ///
 /// ```text
@@ -622,6 +683,109 @@ pub fn subterm_convergence_report_wf(
     msg.push_str("   \n For more information, please refer to the manual : https://tamarin-prover.com/manual/master/book/010_modeling-issues.html ");
 
     vec![WfError::new("Subterm Convergence Warning", msg)]
+}
+
+/// Format the `/* WARNING: ... */` or `/* All wellformedness checks
+/// were successful. */` block that goes BETWEEN the source body and
+/// the analysis summary.  Mirrors HS's `prettyWfErrorReport`
+/// (Wellformedness.hs:118-125).
+///
+/// Each `WfError.message` is expected to carry the FULL HS-style block
+/// for its topic: `Title\n=====\n\n<intro>\n<body>` — pre-formatted with
+/// the exact bytes HS emits, including trailing spaces from HS's
+/// `text ""` markers.  Multiple `WfError`s with the same topic are
+/// merged into one block (the per-clash bodies concatenated).  Topic
+/// groups are separated by blank lines.
+///
+/// Shared by the `--prove` CLI (`run.rs`) and the interactive web server
+/// (`source`/`message` routes) so both render the wellformedness comment
+/// byte-identically.  The empty-report case returns exactly
+/// `"/* All wellformedness checks were successful. */"`, so no-warning
+/// theories stay byte-for-byte unchanged on both paths.
+pub fn format_wf_block(report: &[tamarin_parser::wf::WfError]) -> String {
+    if report.is_empty() {
+        return "/* All wellformedness checks were successful. */".to_string();
+    }
+    let mut out = String::new();
+    out.push_str("/*\nWARNING: the following wellformedness checks failed!\n\n");
+    // Group by topic, preserving FIRST-APPEARANCE order — mirrors HS's
+    // `groupOn fst` over a left-to-right concatMap-over-checks.
+    let mut topic_order: Vec<&str> = Vec::new();
+    let mut grouped: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
+    for e in report {
+        if !grouped.contains_key(e.topic.as_str()) {
+            topic_order.push(e.topic.as_str());
+        }
+        grouped.entry(e.topic.as_str()).or_default().push(&e.message);
+    }
+    for (i, topic) in topic_order.iter().enumerate() {
+        let msgs = &grouped[topic];
+        if i > 0 { out.push('\n'); }
+        // HS `prettyWfErrorReport` (Wellformedness.hs:118-125) groups by
+        // topic and renders each group as
+        //   `text topic $-$ (nest 2 . vcat . intersperse (text "") $ bodies)`
+        // — the underlineTopic header ONCE per group, then the 2-space-nested
+        // bodies separated by a 2-space blank line.  Most RS checks already
+        // pre-render the FULL block (header + indent) into a single per-topic
+        // message, and we concatenate those as-is (legacy path, unchanged).
+        //
+        // Some checks emit one HEADER-LESS body per offending rule (so the
+        // summary's `length rep` WARNING count stays HS-faithful,
+        // Batch.hs:245), all sharing one topic.  These are assembled HS-style
+        // (`prettyWfErrorReport`, Wellformedness.hs:118-125): the topic header
+        // (+ any "reasons" preamble that HS folds into the topic string) ONCE,
+        // then the per-rule bodies joined by the `intersperse (text "")`
+        // 2-space blank separator.  Other (single-entry) topics keep baking
+        // their full block into the message (default path below).
+        if let Some(preamble) = wf_headerless_preamble(topic) {
+            out.push_str(&preamble);
+            out.push_str(&msgs.join("\n  \n"));
+            out.push('\n');
+        } else {
+            for (j, m) in msgs.iter().enumerate() {
+                if j > 0 { out.push('\n'); }
+                out.push_str(m);
+                if !m.ends_with('\n') { out.push('\n'); }
+            }
+        }
+    }
+    // Trim trailing blank lines but keep a single newline before `*/`.
+    while out.ends_with("\n\n") { out.pop(); }
+    out.push_str("*/");
+    out
+}
+
+/// For the WF topics whose checks emit one header-less body per finding,
+/// return the byte-exact preamble that `prettyWfErrorReport` prints ONCE
+/// before the group's bodies: the `underlineTopic` header, plus the blank
+/// line HS's `$-$`/topic-string folds in, plus (for the sort-clash topic)
+/// the "Possible reasons" paragraph that HS appends to the topic string
+/// (Wellformedness.hs:258-273).  Returns `None` for single-entry topics,
+/// which bake their full block into the message (default path).
+fn wf_headerless_preamble(topic: &str) -> Option<String> {
+    use tamarin_parser::wf::underline_topic;
+    match topic {
+        // SAPIC-process wellformedness errors (HS `toWfErrorReport`,
+        // Warnings.hs:23-26).  Unlike the other topics, HS does NOT underline
+        // this one — `prettyWfErrorReport` renders it as a bare `text topic`
+        // (Wellformedness.hs:124).  So the per-error bodies (each
+        // `"  Variable bound twice: x."`) sit directly under a plain header.
+        "Wellformedness-error in Process" => Some(format!("{topic}\n")),
+        "Unbound variables" | "Reserved names" | "Special facts" => {
+            Some(format!("{}\n", underline_topic(topic)))
+        }
+        "Variable with mismatching sorts or capitalization" => {
+            Some(format!(
+                "{}\nPossible reasons:\n\
+                 1. Identifiers are case sensitive, i.e.,\
+                 'x' and 'X' are considered to be different.\n\
+                 2. The same holds for sorts:, \
+                 i.e., '$x', 'x', and '~x' are considered to be different.\n\n",
+                underline_topic(topic)))
+        }
+        _ => None,
+    }
 }
 
 /// HS `ppNonEmptyList' name pp xs = (keyword_ name <->) . fsep $
@@ -942,6 +1106,24 @@ fn render_parsed_macros(macros: &[p::Macro]) -> String {
     let body = hpj::vcat(macro_docs).nest(4);
     let header = Doc::text("macros:");
     header.above(body).render()
+}
+
+/// Render the `macros:` block for HS `rulesSnippet`'s first `ppWithHeader
+/// "Macros"` (Web/Theory.hs) — the interactive `main/rules` page.  Returns
+/// `None` when the theory declares no macros (HS omits the whole section),
+/// else the same `prettyMacros` string the `--prove` theory body uses
+/// ([`render_parsed_macros`]); rendered at the caller's active display width.
+pub fn web_macros(parsed: &p::Theory) -> Option<String> {
+    let macros: Vec<p::Macro> = parsed.items.iter()
+        .filter_map(|i| if let p::TheoryItem::Macros(ms) = i { Some(ms.as_slice()) } else { None })
+        .flatten()
+        .cloned()
+        .collect();
+    if macros.is_empty() {
+        None
+    } else {
+        Some(render_parsed_macros(&macros))
+    }
 }
 
 /// Render a rule's attribute block `[...]`, mirroring HS `prettyRuleAttributes`
@@ -1498,7 +1680,7 @@ pub fn lnfact_to_parser(fa: &crate::fact::LNFact) -> p::Fact {
     }
 }
 
-fn lnterm_to_parser(t: &tamarin_term::lterm::LNTerm) -> p::Term {
+pub(crate) fn lnterm_to_parser(t: &tamarin_term::lterm::LNTerm) -> p::Term {
     use tamarin_term::function_symbols::{AcSym, FunSym};
     use tamarin_term::term::Term;
     use tamarin_term::vterm::Lit;
@@ -2121,6 +2303,31 @@ fn pp_proof(
     }
 }
 
+/// Render a `ProofMethod` to a flat string exactly as HS `prettyProofMethod`
+/// (ProofMethod.hs:1490-1499) — the SAME renderer the `--prove` proof tree
+/// uses, so `solve( <goal> )` carries the faithful fact spacing (`!KU( ~ltk )`),
+/// LVar dots (`#vk.2`), and contradiction reasons.  Used by the interactive
+/// web UI's applicable-methods list + proof snippet (`tamarin-server`), which
+/// must match `--prove`'s method text.  Rendered at the process display width
+/// (100 for the web); the semantic web gate normalises any wrapping away.
+pub fn pretty_proof_method_inline(
+    m: &crate::constraint::solver::proof_method::ProofMethod,
+) -> String {
+    pp_step_doc(m, 0, "").render()
+}
+
+/// HS `prettyProofMethod m` as a Doc (ProofMethod.hs:1170-1186), for
+/// callers that lay the method out INSIDE a larger Doc context — the web
+/// "Applicable Proof Methods" list (`Web/Theory.hs:546` `numbered' $
+/// zipWith prettyPM [1..] pms`), where the `N. ` prefix beside-shift and
+/// the trailing `// expl` line comment both participate in the HughesPJ
+/// fill decisions.
+pub fn pretty_proof_method_doc(
+    m: &crate::constraint::solver::proof_method::ProofMethod,
+) -> crate::pretty_hpj::Doc {
+    pp_step_doc(m, 0, "")
+}
+
 /// Build the proof-step method as a `pretty_hpj::Doc`, mirroring
 /// `pp_step_at` but yielding a Doc (so it can be combined with the
 /// `/* unannotated */` comment via `sep`, per HS
@@ -2461,7 +2668,7 @@ fn strip_one_outer_paren(s: &str) -> &str {
 /// node-ids / node-conc / node-prem are atomic strings (HS `prettyNodeId`
 /// is `text . show`).  The non-empty DisjG case is rendered by the
 /// `disj_goal_to_doc` arm below.
-fn solve_goal_to_doc(
+pub(crate) fn solve_goal_to_doc(
     g: &crate::constraint::constraints::Goal,
 ) -> crate::pretty_hpj::Doc {
     use crate::constraint::constraints::Goal;

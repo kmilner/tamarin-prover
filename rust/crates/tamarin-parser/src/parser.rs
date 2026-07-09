@@ -116,6 +116,67 @@ pub fn parse_intruder_rules(input: &str) -> Result<Vec<Rule>, ParseError> {
     Ok(rules)
 }
 
+/// Strip `//` line comments and `/* */` block comments from a lemma's verbatim
+/// source span, used to populate `ast::Lemma::plaintext`.  Faithful port of HS
+/// `removeComments` / `removeCommentBlock` (`Theory/Text/Parser/Lemma.hs:62-74`),
+/// including the newline-swallowing behaviour that HS relies on: a `\n`
+/// immediately preceding a comment is consumed with the comment, and a block
+/// comment's closing `*/\n` consumes the trailing newline.  This determines the
+/// textarea's `rows` count in the web Edit form (HS `textHeight = 2 + number of
+/// '\n'`), so it must match char-for-char.
+pub(crate) fn remove_comments(s: &str) -> String {
+    let cs: Vec<char> = s.chars().collect();
+    let n = cs.len();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < n {
+        // '\n' : '/' : '/'  — drop the leading newline + the comment body,
+        //                     keeping the terminating newline (dropWhile /= '\n').
+        if cs[i] == '\n' && i + 2 < n && cs[i + 1] == '/' && cs[i + 2] == '/' {
+            i += 3;
+            while i < n && cs[i] != '\n' { i += 1; }
+            continue;
+        }
+        // '/' : '/'  — drop up to (not including) the next newline.
+        if cs[i] == '/' && i + 1 < n && cs[i + 1] == '/' {
+            i += 2;
+            while i < n && cs[i] != '\n' { i += 1; }
+            continue;
+        }
+        // '\n' : '/' : '*'  — drop the leading newline, enter block-comment mode.
+        if cs[i] == '\n' && i + 2 < n && cs[i + 1] == '/' && cs[i + 2] == '*' {
+            i = remove_comment_block(&cs, i + 3);
+            continue;
+        }
+        // '/' : '*'  — enter block-comment mode.
+        if cs[i] == '/' && i + 1 < n && cs[i + 1] == '*' {
+            i = remove_comment_block(&cs, i + 2);
+            continue;
+        }
+        out.push(cs[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Consume a `/* ... */` block comment body starting at `i`, returning the
+/// index just past the closing `*/` (and its trailing `\n` if present).
+/// Mirrors HS `removeCommentBlock`.
+fn remove_comment_block(cs: &[char], mut i: usize) -> usize {
+    let n = cs.len();
+    while i < n {
+        if cs[i] == '*' && i + 1 < n && cs[i + 1] == '/' {
+            // '*' : '/' : '\n'  swallows the newline; otherwise stop after '*/'.
+            if i + 2 < n && cs[i + 2] == '\n' {
+                return i + 3;
+            }
+            return i + 2;
+        }
+        i += 1;
+    }
+    n
+}
+
 // =============================================================================
 // Parser state
 // =============================================================================
@@ -669,43 +730,128 @@ impl<'a> Parser<'a> {
         // Track whether the previous character was an identifier char. If so,
         // we are in the middle of a word and should not match keywords here.
         let mut prev_was_ident = false;
+        // Parenthesis-nesting depth of the captured text.  A top-level theory
+        // item can only begin at depth 0: HS parses the proof skeleton
+        // STRUCTURALLY (`proofMethod = ... solve <$> parens goal`,
+        // Theory/Text/Parser/Proof.hs:80), so the goal inside `solve( ... )`
+        // is consumed as a `parens` unit and its interior tokens can never be
+        // mistaken for a new top-level item.  Our raw-text scanner reproduces
+        // that boundary rule by only testing the top-level-keyword set (`KW`,
+        // which contains `test`, `rule`, `function`, `process`, ...) at
+        // depth 0.  Without this guard a fact argument named after a keyword —
+        // e.g. `solve( Match( test, sid ) @ #i4 )` in
+        // examples/ake/bilinear/Scott.spthy — truncates the capture and
+        // corrupts the following parse.
+        let mut depth: i32 = 0;
+        // Whether we are inside a double-quoted string, and must ignore its
+        // interior for both paren-depth and keyword purposes.  Tactic filters
+        // carry regex literals such as `regex "cp\("` and `regex "In_A\( 'S'"`
+        // (examples/csf18-alethea/...): those `(`s are escaped regex text with
+        // no matching `)`, so counting them would drive `depth` permanently
+        // positive and make the scanner swallow every following item.  HS lexes
+        // these as ordinary string literals (`stringLiteral`, Token.hs:366), so
+        // their content is opaque to the surrounding grammar.  Only `"` needs
+        // tracking: proof skeletons contain no double-quoted strings, and
+        // single-quoted public constants (`'Init'`) never hold parens and never
+        // occur at depth 0, so they need none.
+        let mut in_string = false;
+        // Whether the identifier at the NEXT depth-0 word boundary is a proof
+        // CASE LABEL and must not be tested against `KW`.  HS parses the proof
+        // skeleton structurally: `oneCase = symbol "case" *> identifier`
+        // (Theory/Text/Parser/Proof.hs:115; the diff variant is identical,
+        // Proof.hs:146), so the token immediately after the `case` keyword is
+        // consumed as the case name and can never begin a new top-level item.
+        // Case names are drawn from rule names and source-case names, so ANY
+        // top-level keyword can legally appear here — e.g. a rule named `test`
+        // prints as `case test`, and `test` is itself the CaseTest keyword
+        // (`caseTest = CaseTest <$> (symbol "test" *> identifier)`,
+        // Theory/Text/Parser/Accountability.hs:26; dispatched Parser.hs:268).
+        // Without this suppression the bare `test` at depth 0 truncates the
+        // capture and the main parser resumes by consuming `test` as a CaseTest
+        // declaration → `expected ':'`.  This is the only in-script position
+        // where a bare keyword can sit at depth 0: every proof method is a fixed
+        // keyword or `solve( <goal> )` whose goal is paren-nested (depth > 0),
+        // and tactic blocks (the other user of this scanner) carry only the
+        // fixed keywords `presort`/`prio`/`deprio`, the fixed tactic-function
+        // names, braced ranking names, and double-quoted (opaque) arguments —
+        // none of which collide with `KW`.
+        let mut expect_case_name = false;
         loop {
             if self.lx.is_eof() { break; }
-            // Skip whitespace and comments without resetting prev_was_ident,
-            // since whitespace is itself a word boundary — actually whitespace
-            // resets the prev-ident state. Block/line comments are entirely
-            // skipped by skip_ws.
-            let pre_ws = self.lx.pos();
-            self.lx.skip_ws();
-            if self.lx.pos() != pre_ws {
-                // Capture skipped whitespace verbatim.
-                let skipped = &self.lx.src()[pre_ws.offset..self.lx.pos().offset];
-                s.push_str(skipped);
-                prev_was_ident = false;
-            }
-            if self.lx.is_eof() { break; }
-            // At a word boundary, check for top-level keywords.
-            if !prev_was_ident {
-                if let Some(id) = self.peek_hyphen_identifier() {
-                    if KW.contains(&id.as_str()) { break; }
+            if !in_string {
+                // Skip whitespace and comments. Block/line comments are entirely
+                // skipped by skip_ws; whitespace resets the prev-ident state.
+                let pre_ws = self.lx.pos();
+                self.lx.skip_ws();
+                if self.lx.pos() != pre_ws {
+                    // Capture skipped whitespace/comments verbatim.
+                    let skipped = &self.lx.src()[pre_ws.offset..self.lx.pos().offset];
+                    s.push_str(skipped);
+                    prev_was_ident = false;
                 }
-                if self.lx.peek() == Some('#') {
-                    let mut probe = self.lx.clone();
-                    probe.bump();
-                    let mut name = String::new();
-                    while let Some(c) = probe.peek() {
-                        if c.is_ascii_alphabetic() { name.push(c); probe.bump(); }
-                        else { break; }
+                if self.lx.is_eof() { break; }
+                // At a word boundary AND at the top level, check for top-level
+                // keywords.  Inside a parenthesised group (`solve( ... )`, a
+                // function application, a tuple, ...) keyword identifiers are
+                // just terms, matching HS's `parens goal`.
+                if depth == 0 && !prev_was_ident {
+                    if expect_case_name {
+                        // This depth-0 identifier is a case label (see the
+                        // `expect_case_name` note above): suppress the keyword /
+                        // `#`-directive break for this one token.  The per-char
+                        // append below consumes it, and `prev_was_ident` prevents
+                        // any re-check mid-word.
+                        expect_case_name = false;
+                    } else {
+                        if let Some(id) = self.peek_hyphen_identifier() {
+                            if KW.contains(&id.as_str()) { break; }
+                            // Arm case-label suppression for the NEXT identifier.
+                            if id == "case" { expect_case_name = true; }
+                        }
+                        if self.lx.peek() == Some('#') {
+                            let mut probe = self.lx.clone();
+                            probe.bump();
+                            let mut name = String::new();
+                            while let Some(c) = probe.peek() {
+                                if c.is_ascii_alphabetic() { name.push(c); probe.bump(); }
+                                else { break; }
+                            }
+                            if matches!(name.as_str(),
+                                "ifdef" | "endif" | "else" | "define" | "include")
+                            { break; }
+                        }
                     }
-                    if matches!(name.as_str(),
-                        "ifdef" | "endif" | "else" | "define" | "include")
-                    { break; }
                 }
             }
             // Append next char.
             match self.lx.peek() {
+                Some(c) if in_string => {
+                    // Inside a double-quoted string: consume verbatim, honour
+                    // `\`-escapes (so `\"` does not close and `\(` is not a
+                    // paren), and close on an unescaped `"`.  Do NOT touch
+                    // `depth` — string interiors are opaque.
+                    if c == '\\' {
+                        s.push(c); self.lx.bump();
+                        if let Some(c2) = self.lx.peek() { s.push(c2); self.lx.bump(); }
+                    } else {
+                        if c == '"' { in_string = false; }
+                        s.push(c); self.lx.bump();
+                    }
+                    prev_was_ident = false;
+                }
                 Some(c) => {
                     prev_was_ident = is_ident_char(c) || c == '-';
+                    // Track parenthesis nesting so the keyword scan above only
+                    // fires at the top level.  `)` is clamped at 0 so a stray
+                    // unbalanced close (should not occur in a well-formed
+                    // proof) cannot drive the depth negative and re-enable the
+                    // scan inside a group.
+                    match c {
+                        '"' => in_string = true,
+                        '(' => depth += 1,
+                        ')' => depth = (depth - 1).max(0),
+                        _ => {}
+                    }
                     s.push(c);
                     self.lx.bump();
                 }
@@ -1202,6 +1348,10 @@ impl<'a> Parser<'a> {
     // -------------------- Lemma --------------------
 
     fn lemma_item(&mut self) -> Result<TheoryItem, ParseError> {
+        // HS `protoLemma` captures `start <- getInput` BEFORE `symbol "lemma"`;
+        // the enclosing item loop has already consumed leading whitespace, so
+        // the cursor sits exactly at `lemma` here (`Theory/Text/Parser/Lemma.hs:80`).
+        let start = self.lx.pos().offset;
         // Look ahead to decide between a normal lemma and an accountability lemma.
         // Accountability lemmas have the body `accounts for [..]` after the name.
         self.require_kw("lemma")?;
@@ -1227,8 +1377,16 @@ impl<'a> Parser<'a> {
         };
         let formula = self.double_quoted_formula()?;
         let proof = self.try_proof_skeleton()?;
+        // HS `end <- getInput` after the proof skeleton; `inputString =
+        // removeComments $ take (length start - length end) start`
+        // (`Theory/Text/Parser/Lemma.hs:86-87`).  The closing-quote lexeme and
+        // `try_proof_skeleton` have already consumed trailing whitespace and
+        // comments, so `end` sits at the next top-level token — exactly HS's.
+        let end = self.lx.pos().offset;
+        let plaintext = remove_comments(&self.lx.src()[start..end]);
         Ok(TheoryItem::Lemma(Lemma {
             name, modulo: None, attributes: attrs, trace_quantifier, formula, proof,
+            plaintext,
         }))
     }
 
@@ -2745,5 +2903,250 @@ mod tests {
         }).expect("rule R");
         let act = &rule.actions[0];
         assert_eq!(act.annotations, vec![FactAnnotation::SolveFirst]);
+    }
+
+    // Regression: `test` is a genuine top-level theory-item keyword (HS
+    // `caseTest = CaseTest <$> (symbol "test" *> identifier)`,
+    // Theory/Text/Parser/Accountability.hs:26, dispatched in `addItems`,
+    // Theory/Text/Parser.hs:268) but is ALSO an ordinary message variable
+    // name inside proof goals — e.g. `solve( Match( test, sid ) @ #i4 )` in
+    // examples/ake/bilinear/Scott.spthy.  HS parses the proof skeleton
+    // STRUCTURALLY (`solve <$> parens goal`, Proof.hs:80), so a `test` inside
+    // `solve( ... )` is a `parens`-nested term and can never begin a new
+    // top-level item.  `read_until_next_top_level` reproduces that boundary
+    // rule by only testing the top-level-keyword set at paren-depth 0; without
+    // it the capture truncates at `test` and the following parse blows up with
+    // `expected identifier`.
+    #[test]
+    fn proof_skeleton_not_truncated_by_keyword_fact_arg() {
+        let s = r#"theory T begin
+  lemma L:
+    "All x #i. Start(x) @ #i ==> F"
+  simplify
+  solve( Match( test, sid ) @ #i4 )
+    case c
+    by sorry
+  qed
+end"#;
+        let t = parse_theory(s, &[]).expect("keyword-named goal arg must parse");
+        let lemmas: Vec<_> = t.items.iter()
+            .filter(|it| matches!(it, TheoryItem::Lemma(_))).collect();
+        assert_eq!(lemmas.len(), 1, "expected exactly one lemma");
+        assert!(!t.items.iter().any(|it| matches!(it, TheoryItem::CaseTest(_))),
+            "no CaseTest may be split out of the proof body");
+        let proof = match &lemmas[0] {
+            TheoryItem::Lemma(l) => l.proof.as_ref().expect("lemma has a proof skeleton"),
+            _ => unreachable!(),
+        };
+        assert!(proof.raw.contains("Match( test, sid )"),
+            "proof raw truncated at/before `test`: {:?}", proof.raw);
+        assert!(proof.raw.contains("qed"), "proof raw missing `qed`: {:?}", proof.raw);
+    }
+
+    // The paren-depth guard must cover the full spread of message-argument
+    // sorts a printed goal can carry — fresh `~k`, public `$A`, nat `%n`,
+    // indexed `k.1` — mixed with several bare identifiers that collide with
+    // top-level keywords (`test`, `rule`, `function`).  None may truncate the
+    // capture.
+    #[test]
+    fn proof_skeleton_captures_mixed_sorted_indexed_and_keyword_args() {
+        let s = r#"theory T begin
+  lemma L:
+    "All x #i. Start(x) @ #i ==> F"
+  simplify
+  solve( Foo( ~k, $A, %n, k.1, test, rule, function ) @ #i1 )
+    case c
+    by sorry
+  qed
+end"#;
+        let t = parse_theory(s, &[]).expect("mixed-arg goal must parse");
+        let proof = match t.items.iter()
+            .find(|it| matches!(it, TheoryItem::Lemma(_))).expect("lemma") {
+            TheoryItem::Lemma(l) => l.proof.as_ref().expect("proof skeleton"),
+            _ => unreachable!(),
+        };
+        assert!(proof.raw.contains("Foo( ~k, $A, %n, k.1, test, rule, function )"),
+            "mixed-arg goal truncated: {:?}", proof.raw);
+        assert!(proof.raw.contains("qed"), "missing qed: {:?}", proof.raw);
+        assert!(!t.items.iter().any(|it| matches!(it, TheoryItem::CaseTest(_))));
+    }
+
+    // Dual check: the depth-0 boundary must still fire.  A genuine top-level
+    // `test` CaseTest item following a proof (whose body also contains a `test`
+    // goal argument) must be recognized as a CaseTest, and the proof must not
+    // absorb it.
+    #[test]
+    fn real_casetest_after_proof_still_recognized() {
+        let s = r#"theory T begin
+  lemma L:
+    "All x #i. Start(x) @ #i ==> F"
+  simplify
+  solve( Foo( test, sid ) @ #i1 )
+    case c
+    by sorry
+  qed
+  test Reachable:
+    "Ex #i. Bar() @ #i"
+end"#;
+        let t = parse_theory(s, &[]).expect("proof followed by CaseTest must parse");
+        let proof = match t.items.iter()
+            .find(|it| matches!(it, TheoryItem::Lemma(_))).expect("lemma") {
+            TheoryItem::Lemma(l) => l.proof.as_ref().expect("proof skeleton"),
+            _ => unreachable!(),
+        };
+        assert!(proof.raw.contains("Foo( test, sid )") && proof.raw.contains("qed"),
+            "proof body truncated: {:?}", proof.raw);
+        let ct = t.items.iter().find_map(|it| match it {
+            TheoryItem::CaseTest(c) => Some(c),
+            _ => None,
+        }).expect("top-level `test` CaseTest must be recognized after the proof");
+        assert_eq!(ct.name, "Reachable");
+    }
+
+    // Regression (companion to the depth guard): tactic filter regexes carry
+    // ESCAPED, UNBALANCED parens inside a double-quoted string literal —
+    // e.g. `regex "cp\("` and `regex "In_A\( 'S', <'codes'"` in
+    // examples/csf18-alethea/....  Those `(`s are opaque regex text (HS lexes
+    // the whole thing as `stringLiteral`, Token.hs:366); counting them as
+    // grouping would keep `depth` permanently positive so the tactic capture
+    // swallows every following item.  The scanner must treat double-quoted
+    // string interiors as opaque.
+    #[test]
+    fn tactic_regex_with_unbalanced_paren_does_not_swallow_next_item() {
+        let s = r#"theory T begin
+  tactic: myTac
+  presort: C
+  prio:
+    regex "In_A\( 'S', <'codes'"
+  prio:
+    regex "cp\("
+  rule R: [ Fr(~k) ] --[ Created(~k) ]-> [ Out(~k) ]
+end"#;
+        let t = parse_theory(s, &[]).expect("tactic with unbalanced regex parens must parse");
+        let tac = t.items.iter().find_map(|it| match it {
+            TheoryItem::Tactic(t) => Some(t),
+            _ => None,
+        }).expect("tactic present");
+        assert!(tac.raw.contains(r#"regex "cp\(""#),
+            "tactic body truncated: {:?}", tac.raw);
+        // The `(` inside the regex string must not leak the following rule into
+        // the tactic capture.
+        assert!(!tac.raw.contains("rule R"),
+            "next item leaked into tactic capture: {:?}", tac.raw);
+        let rule = t.items.iter().find_map(|it| match it {
+            TheoryItem::Rule(r) => Some(r),
+            _ => None,
+        }).expect("rule R must remain a separate top-level item");
+        assert_eq!(rule.name, "R");
+    }
+
+    // Regression: a proof CASE LABEL that collides with a top-level keyword must
+    // not truncate the capture.  HS parses `oneCase = symbol "case" *> identifier`
+    // (Theory/Text/Parser/Proof.hs:115) structurally, so the identifier after
+    // `case` is the case NAME and can be any top-level keyword — case names come
+    // from rule / source-case names, and `test` is the CaseTest keyword
+    // (Accountability.hs:26).  A rule named `test` prints its solved case as
+    // `case test` at paren-depth 0 (unlike Scott's `test` which was inside
+    // `solve( ... )`), so the depth guard from 64e80ecc alone does not cover it.
+    #[test]
+    fn proof_case_label_named_after_keyword_does_not_truncate() {
+        let s = r#"theory T begin
+  lemma l:
+    exists-trace "Ex x #i. Done(x) @ #i"
+  simplify
+  solve( A( x ) ▶₀ #i )
+    case test
+    SOLVED // trace found
+  qed
+end"#;
+        let t = parse_theory(s, &[]).expect("`case test` must not truncate the proof");
+        // The bare `test` case label must NOT be split off as a CaseTest item.
+        assert!(!t.items.iter().any(|it| matches!(it, TheoryItem::CaseTest(_))),
+            "case label `test` must not become a top-level CaseTest");
+        let proof = match t.items.iter()
+            .find(|it| matches!(it, TheoryItem::Lemma(_))).expect("lemma") {
+            TheoryItem::Lemma(l) => l.proof.as_ref().expect("proof skeleton"),
+            _ => unreachable!(),
+        };
+        assert!(proof.raw.contains("case test"),
+            "proof raw truncated at/before `case test`: {:?}", proof.raw);
+        assert!(proof.raw.contains("SOLVED") && proof.raw.contains("qed"),
+            "proof raw missing SOLVED/qed: {:?}", proof.raw);
+    }
+
+    // The suppression must fire per `case` keyword — several cases in a row, each
+    // labelled after a different top-level keyword (`rule`, `lemma`, `function`),
+    // separated by `next`.  None may truncate the capture, and none may be split
+    // off as its own top-level item.
+    #[test]
+    fn multiple_case_labels_named_after_keywords_do_not_truncate() {
+        let s = r#"theory T begin
+  lemma l:
+    all-traces "All x #i. Done(x) @ #i ==> F"
+  simplify
+  solve( A( x ) ▶₀ #i )
+    case rule
+      by sorry
+    next
+    case lemma
+      by sorry
+    next
+    case function
+      by sorry
+  qed
+end"#;
+        let t = parse_theory(s, &[]).expect("keyword-named case labels must not truncate");
+        // Exactly one lemma, no stray Rule/Functions items split out of the body.
+        assert_eq!(t.items.iter().filter(|it| matches!(it, TheoryItem::Lemma(_))).count(), 1);
+        assert!(!t.items.iter().any(|it| matches!(it, TheoryItem::Rule(_))),
+            "a `case rule` label must not be split into a top-level rule");
+        assert!(!t.items.iter().any(|it| matches!(it, TheoryItem::Functions(_))),
+            "a `case function` label must not be split into a top-level functions decl");
+        let proof = match t.items.iter()
+            .find(|it| matches!(it, TheoryItem::Lemma(_))).expect("lemma") {
+            TheoryItem::Lemma(l) => l.proof.as_ref().expect("proof skeleton"),
+            _ => unreachable!(),
+        };
+        for label in ["case rule", "case lemma", "case function"] {
+            assert!(proof.raw.contains(label),
+                "proof raw missing {label:?}: {:?}", proof.raw);
+        }
+        assert!(proof.raw.contains("qed"), "proof raw missing qed: {:?}", proof.raw);
+    }
+
+    // Dual check: the depth-0 boundary must still fire for a REAL top-level
+    // keyword that is NOT a case label.  A genuine `test` CaseTest item following
+    // a proof whose body contains a `case test` label must still be recognized:
+    // the case-label suppression is armed only by the preceding `case` keyword and
+    // is cleared after one token, so the later bare `test` still terminates the
+    // capture.
+    #[test]
+    fn keyword_after_proof_still_terminates_capture() {
+        let s = r#"theory T begin
+  lemma l:
+    exists-trace "Ex x #i. Done(x) @ #i"
+  simplify
+  solve( A( x ) ▶₀ #i )
+    case test
+    SOLVED
+  qed
+  rule two:
+    [ A(x) ] --[ Done(x) ]-> [ ]
+end"#;
+        let t = parse_theory(s, &[]).expect("proof followed by a real rule must parse");
+        let proof = match t.items.iter()
+            .find(|it| matches!(it, TheoryItem::Lemma(_))).expect("lemma") {
+            TheoryItem::Lemma(l) => l.proof.as_ref().expect("proof skeleton"),
+            _ => unreachable!(),
+        };
+        assert!(proof.raw.contains("case test") && proof.raw.contains("qed"),
+            "proof body truncated: {:?}", proof.raw);
+        assert!(!proof.raw.contains("rule two"),
+            "the following rule leaked into the proof capture: {:?}", proof.raw);
+        let rule = t.items.iter().find_map(|it| match it {
+            TheoryItem::Rule(r) => Some(r),
+            _ => None,
+        }).expect("the top-level `rule two` must remain a separate item");
+        assert_eq!(rule.name, "two");
     }
 }

@@ -929,6 +929,7 @@ fn elaborate_items(
                         raw: l.proof.as_ref().map(|p| p.raw.clone()).unwrap_or_default(),
                         tree: l.proof.as_ref().and_then(|p| p.tree.clone()),
                     },
+                    plaintext: l.plaintext.clone(),
                 };
                 out.items.push(TheoryItem::Lemma(lem));
             }
@@ -1002,10 +1003,53 @@ fn elaborate_lemma_attr(a: &p::LemmaAttr) -> LemmaAttr {
 // Rule elaboration
 // =============================================================================
 
+/// Fold a parsed rule's attribute list into `RuleAttributes`, mirroring HS
+/// `ruleAttributesp = option mempty (fold <$> list ruleAttribute)`
+/// (`Theory/Text/Parser/Rule.hs:95-96`) and the per-attribute `ruleAttribute`
+/// parser (`Rule.hs:68-93`):
+///   * `color=`/`colour=`  → `ruleColor` (`hexToRGB`);
+///   * `process=`          → IGNORED (`parseAndIgnore`; the RS parser already
+///                           drops it, so `RuleAttr::Process` never reaches here
+///                           for user input — SAPIC synthesis aside — but the
+///                           arm stays faithful);
+///   * `no_derivcheck`     → `ignoreDerivChecks = True`;
+///   * `role='...'`        → `role`;
+///   * `issapicrule`       → `isSAPiCRule = True`;
+///   * `x-<ext>`           → ignored.
+/// `fold` combines via the `RuleAttributes` `Semigroup` (Rule.hs:370-384):
+/// later duplicates win on the `Option` fields (`preferRight`), bools `||`.
+///
+/// This restores the SAPIC display attributes (role / color / issapicrule) onto
+/// the re-elaborated proving rules — HS's `toRule` bakes them straight into the
+/// `ProtoRuleE`, but the RS pipeline round-trips SAPIC rules through the parser
+/// AST (`apply_sapic`'s `synth_parsed_rule`) and re-elaborates the parser theory
+/// for proving (`prove.rs`), so they must be re-read here.  Display-only: no
+/// solver / `--prove`-text path reads these fields (only the web graph renderer
+/// does), so populating them is `--prove`-inert.
+fn rule_attributes_from_parser(attrs: &[p::RuleAttr]) -> RuleAttributes {
+    let mut out = RuleAttributes::empty();
+    for a in attrs {
+        match a {
+            p::RuleAttr::Color(hex) => {
+                if let Some(rgb) = tamarin_utils::color::hex_to_rgb(hex) {
+                    out.color = Some(rgb);
+                }
+            }
+            p::RuleAttr::NoDerivCheck => out.ignore_deriv_checks = true,
+            p::RuleAttr::Role(s) => out.role = Some(s.clone()),
+            p::RuleAttr::IsSapicRule => out.is_sapic_rule = true,
+            // `process=` (dropped by the parser) and external attributes carry
+            // no `RuleAttributes` field — HS `parseAndIgnore` / `parseExternal`.
+            p::RuleAttr::Process(_) | p::RuleAttr::External(_, _) => {}
+        }
+    }
+    out
+}
+
 fn rule_to_proto_rule_e(r: &p::Rule) -> Result<ProtoRuleE, ElabError> {
     let info = ProtoRuleEInfo {
         name: ProtoRuleName::Stand(tamarin_term::intern::intern_str(&r.name)),
-        attributes: RuleAttributes::empty(),
+        attributes: rule_attributes_from_parser(&r.attributes),
         restrictions: Vec::new(),
     };
     // Desugar let-bindings before fact conversion: each `let x = t in ...`

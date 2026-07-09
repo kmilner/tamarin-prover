@@ -434,6 +434,16 @@ impl ProofContext {
         //   ++ (if enableXor  msig then xorIntruderRules     else [])
         // ```
         //
+        // For nat: the single `nat` constructor
+        // `[] --[ KU(%x) ]-> [ KU(%x) ]` (natIntruderRules,
+        // IntruderRules.hs:113-120).  Without it the precomputed
+        // source-cases for nat-sorted `KU` goals are empty ("0 cases"
+        // where HS shows the `nat` source) and the `/main/message`
+        // page omits the rule.  Ordered between special and mset as in
+        // the HS list above.
+        if sig.enable_nat {
+            intruder_rules.extend(crate::intruder_rules::nat_intruder_rules());
+        }
         // For multiset: adds `_union` destructor (`KD(x++y) → KD(x)`,
         // subterm=True, budget=0) and `_union` constructor.  Without these,
         // the precomputed `KU(t)` source-cases miss the chain-extension
@@ -657,18 +667,33 @@ impl ProofContext {
             } else {
                 // Non-reducible rule: HS's `variantsProtoRule` still runs and
                 // collapses to the trivial disjunction `[emptySubstVFresh]`
-                // (`trueDisj`, RuleVariants.hs:120).  `populate_rule_variants`
-                // does NOT populate `variant_substs` for these (its
-                // `abstract_rule_and_variants` returns `None`), so compute the
-                // trivial disjunction here.  The query is over bare abstracted
-                // vars — cheap (no reducible structure to AC-narrow).  The
-                // downstream `solve_rule_constraints` path treats `Some([empty])`
-                // as a trivial-but-real Split that bumps `next_goal_nr` and lets
-                // simp's `simp_singleton` fold the disj — matching HS's
-                // `insertGoal (SplitG _) False ; simp _ _ eqs` order.
-                if o.variant_substs.is_empty() {
-                    if let Ok(substs) = crate::tools::rule_variants::variant_substs_for_rule(
-                        &maude, &o.rule) {
+                // (`trueDisj`, RuleVariants.hs:120), BUT it FIRST applies
+                // `renamePrecise` (RuleVariants.hs:78) to the rule — re-indexing
+                // every variable to a PER-NAME fresh index.  This packs
+                // distinct-named rule variables (e.g. a SAPiC `lock` + `v`) onto
+                // the same low index (`lock.0` + `v.0`, not `lock.0` + `v.1`).
+                // We must reproduce BOTH effects:
+                //   (1) the renamePrecise packing → set `abstracted_rule` when
+                //       it rewrites a var (the disjunction stays `[empty]`, whose
+                //       empty domain cannot misalign the packed rule body); and
+                //   (2) the trivial variant disjunction → `variant_substs =
+                //       [empty]` so `solve_rule_constraints` still bumps
+                //       `next_goal_nr` (matching HS's `insertGoal (SplitG _)`).
+                // Applying only (2) left rule vars at their translation indices,
+                // which spread the source-case fresh-var seed (`avoid th`, one
+                // index per extra span) so saturated raw/refined source cases
+                // rendered `#vr`/`~n` node ids off-by-N from HS.
+                if o.abstracted_rule.is_none() && o.variant_substs.is_empty() {
+                    if let Some(packed) =
+                        crate::tools::rule_variants::rename_precise_rule_if_changed(&o.rule)
+                    {
+                        computed_abstracted_rules.push((
+                            idx, packed,
+                            vec![tamarin_term::subst_vfresh::LNSubstVFresh::empty()],
+                        ));
+                    } else if let Ok(substs) =
+                        crate::tools::rule_variants::variant_substs_for_rule(&maude, &o.rule)
+                    {
                         if !substs.is_empty() {
                             computed_variant_substs.push((idx, substs));
                         }

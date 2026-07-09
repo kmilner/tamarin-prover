@@ -510,6 +510,143 @@ pub fn check_and_extend_lemma_in_session(
     prove_lemma_in_session_mode(session, lemma_name, max_steps, false)
 }
 
+/// Run the from-scratch autoprover on an ARBITRARY start system under
+/// `lemma_name`'s per-lemma `ProofContext` — the web interactive
+/// `autoprove` primitive.
+///
+/// HS `getProverR` → `applyProverAtPath` (`src/Web/Theory.hs:140-143`) →
+/// `focus proofPath (runAutoProver ap)` (`lib/theory/src/Theory/Proof.hs:604-612`)
+/// runs the prover from the subproof's system at the URL's proof path,
+/// under the per-lemma context `modifyLemmaProof` supplies
+/// (`getProofContext l thy`, ClosedTheory.hs — `pcSources` picked raw vs
+/// refined by `lemmaSourceKind`, `pcUseInduction`, `pcHeuristic`,
+/// typing-assumption-refined source cases).  This builds that context
+/// EXACTLY as [`prove_lemma_in_session`] does — same template clone, same
+/// counter base, same `typing_assumptions` gate, same saturation +
+/// source-cache participation — then drives `run_proof_search` from the
+/// caller's `sys` instead of the lemma's initial system.
+///
+/// Deliberately NO skeleton replay: web `runAutoProver` "ignores the
+/// existing proof and tries to find one by itself" (Theory/Proof.hs:743-747)
+/// — it is not wrapped in `replaceSorryProver` (batch-`--prove`-only,
+/// Main/TheoryLoader.hs:518,606).
+pub fn prove_system_in_session(
+    session: &ProverSession,
+    lemma_name: &str,
+    sys: crate::constraint::system::System,
+    max_steps: usize,
+) -> Result<ProofNode, ProveError> {
+    // Thread-locals for user-fn-symbol resolution — the web autoprove
+    // runs on a blocking-pool thread whose locals start empty.  Same
+    // rationale as `prove_lemma_in_session_mode`.
+    let _lemma_user_funs_guard =
+        crate::elaborate::set_user_funs_from_collected(&session.user_funs);
+
+    let theory = &session.theory;
+    let lemma = theory
+        .lookup_lemma(lemma_name)
+        .ok_or_else(|| ProveError::LemmaNotFound(lemma_name.to_string()))?;
+    let lemma_source_kind = lemma_source_kind(lemma);
+
+    // --- Per-lemma ProofContext, mirroring `prove_lemma_in_session_mode`
+    // step for step (see the comments there for the HS citations). ------
+    let mut ctx = session.template_ctx.clone();
+    ctx.maude = ctx.maude.with_fresh_counter_from(0);
+    ctx.maude.ensure_above(session.setup_counter_before.saturating_sub(1));
+    ctx.is_exists_trace = matches!(
+        lemma.trace_quantifier,
+        crate::theory::TraceQuantifier::ExistsTrace,
+    );
+    let session_in_file = &theory.in_file;
+    ctx.heuristic = match resolve_cli_heuristic(
+        &session.cli_heuristic, session_in_file, &theory.tactic)
+    {
+        Some(rankings) => Some(rankings),
+        None => {
+            let lemma_heuristic: Option<&str> =
+                lemma.attributes.iter().find_map(|a| match a {
+                    crate::theory::LemmaAttr::Heuristic(s) => Some(s.as_str()),
+                    _ => None,
+                });
+            let session_heuristic_raw: Option<String> = match lemma_heuristic {
+                Some(h) => Some(h.to_string()),
+                None => theory.heuristic.first().cloned(),
+            };
+            session_heuristic_raw.map(|h| {
+                let mut rankings =
+                    crate::constraint::solver::goals::parse_heuristic_str_with_tactics(
+                        &h, session_in_file, &theory.tactic);
+                prepend_theory_dir_to_oracle_paths(&mut rankings, session_in_file);
+                rankings
+            })
+        }
+    };
+    ctx.lemma_name = lemma_name.to_string();
+    ctx.theory_file = session_in_file.clone();
+    // `[sources]` lemmas prove against RAW sources (no typing
+    // assumptions); all others fold in every prior `[sources]` lemma —
+    // identical gate to `prove_lemma_in_session_mode`.
+    let mut typing_assumptions: Vec<Guarded> = Vec::new();
+    let mut source_key: Vec<String> = Vec::new();
+    if lemma_source_kind >= SourceKind::RefinedSources {
+        for prior in theory.lemmas() {
+            if prior.name == lemma_name { continue; }
+            if !prior.attributes.iter().any(|a| matches!(a, crate::theory::LemmaAttr::Sources)) {
+                continue;
+            }
+            if !matches!(prior.trace_quantifier, crate::theory::TraceQuantifier::AllTraces) {
+                continue;
+            }
+            let rg = formula_to_guarded(&prior.formula)
+                .map_err(|e| ProveError::Guarded(guard_error_doc(&e, &prior.formula)))?;
+            typing_assumptions.push(rg);
+            source_key.push(prior.name.clone());
+        }
+    }
+    source_key.sort();
+    ctx.typing_assumptions = typing_assumptions;
+    // Saturate (or restore from the session's refined-source cache) —
+    // the search below always consults source cases, so this is the
+    // `will_emit_bare_sorry == false` arm of `prove_lemma_in_session_mode`,
+    // including the delta==0 cache-write gate.
+    let cache_disabled = tamarin_utils::env_gate!("TAM_RS_NO_SOURCE_CACHE");
+    let mut cache_hit = false;
+    if !cache_disabled {
+        let guard = session.source_cache.lock().unwrap();
+        if let Some(entry) = guard.get(&source_key) {
+            for src in &mut ctx.full_sources {
+                if let Some((_, cases, incomplete)) =
+                    entry.sources.iter().find(|(g, _, _)| *g == src.goal)
+                {
+                    src.cases_set_list(cases.clone());
+                    src.incomplete = *incomplete;
+                }
+            }
+            ctx.mark_saturated_done();
+            cache_hit = true;
+        }
+    }
+    if !cache_hit {
+        let cnt_before = ctx.maude.fresh_counter_peek();
+        ctx.ensure_saturated();
+        let delta = ctx.maude.fresh_counter_peek().saturating_sub(cnt_before);
+        if !cache_disabled && delta == 0 {
+            let snapshot: Vec<_> = ctx.full_sources.iter()
+                .map(|s| (s.goal.clone(), s.cases_or_empty_list(), s.incomplete))
+                .collect();
+            session.source_cache.lock().unwrap()
+                .entry(source_key)
+                .or_insert(CachedSources { sources: snapshot });
+        }
+    }
+    let force_induction = lemma.attributes.iter().any(|a| matches!(a,
+        crate::theory::LemmaAttr::UseInduction | crate::theory::LemmaAttr::Sources));
+    if force_induction {
+        ctx.use_induction = crate::constraint::solver::context::UseInduction::UseInduction;
+    }
+    Ok(run_proof_search(&ctx, sys, max_steps))
+}
+
 fn prove_lemma_in_session_mode(
     session: &ProverSession,
     lemma_name: &str,
@@ -1432,6 +1569,43 @@ end";
         eprintln!("=== safety_unique.spthy `setup_unique` ===");
         print_tree(&root, 0);
         let _ = root.status;
+    }
+
+    /// Web-parity regression: with `set_keep_sys(true)` (what the
+    /// interactive server sets at startup), `run_proof_search` must
+    /// RETAIN each proof node's constraint `System` instead of dropping
+    /// it to `System::default()` (the `--prove` RSS optimisation in
+    /// `expand`).  The interactive proof-view snippet renders the
+    /// annotated system + applicable proof methods at every proof path,
+    /// so an empty root would show a bogus "Constraint System is Solved"
+    /// with no formulas (HS keeps a `Just System` on every node).
+    #[test]
+    fn prove_lemma_keep_sys_retains_node_systems() {
+        let h = match maude() { Some(m) => m, None => return };
+        let src = r#"
+theory T begin
+rule R:
+  [ Fr(~k) ] --[ A(~k) ]-> [ Out(~k) ]
+lemma always_A:
+  all-traces
+  "All k #i. A(k) @ #i ==> Ex #j. A(k) @ #j"
+end
+"#;
+        crate::constraint::solver::search::set_keep_sys(true);
+        let pt = tamarin_parser::parse_theory(src, &[]).expect("parse");
+        let root = prove_lemma(&pt, "always_A", h, 200).expect("prove");
+        // Root = the initial constraint system (the negated goal formula),
+        // with the lemma's refined source kind — NOT an empty default.
+        assert!(!root.sys.formulas.is_empty(),
+            "root node must retain the initial system's formulas");
+        assert_eq!(root.sys.source_kind,
+            Some(crate::constraint::system::SourceKind::RefinedSources),
+            "root system source kind must survive (refined for a non-sources lemma)");
+        // Every child must also carry a real system.
+        for (name, ch) in &root.children {
+            assert!(ch.sys.source_kind.is_some(),
+                "child {:?} must retain a real system, not System::default()", name);
+        }
     }
 
     /// Drive the tiny_setup proof and inspect the proof-tree shape.

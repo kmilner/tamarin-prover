@@ -1808,49 +1808,117 @@ pub fn maybe_non_normal_terms(
 ///                 subst = restrictVFresh tvars subst0
 ///                 t'    = apply (freshToFreeAvoidingFast subst tvars) t
 /// ```
+///
+/// NOTE the HS definition is CURRIED: `substCreatesNonNormalTerms hnd
+/// sys` shares the `maybeNonNormalTerms hnd sys` whole-system walk
+/// across every `fsubst`/`subst` probe (GHC full laziness floats it
+/// out of the `fsubst` lambda), and `terms` — the fsubst-applied list
+/// — is shared across every candidate `subst` that `simpMinimize`
+/// probes within one `simp1` iteration (`isContr (get eqsSubst eqs)`,
+/// EquationStore.hs).  Use [`SubstNfChecker`] to get that sharing; this
+/// free function recomputes everything per call and exists for tests /
+/// one-shot callers.
 pub fn subst_creates_non_normal_terms(
     maude: &tamarin_term::maude_proc::MaudeHandle,
     sys: &System,
     fsubst: &crate::tools::equation_store::LNSubst,
     vfresh_subst: &crate::tools::equation_store::LNSubstVFresh,
 ) -> bool {
-    use tamarin_term::subst::apply_vterm;
-    use tamarin_term::vterm::vars_vterm;
-    let sig = maude.maude_sig();
-    let irreducible = &sig.irreducible_fun_syms_fast;
-    // Apply fsubst once upfront.
-    let terms: Vec<tamarin_term::lterm::LNTerm> = maybe_non_normal_terms(sys, irreducible)
-        .into_iter()
-        .map(|t| apply_vterm(fsubst, t))
-        .collect();
-    for t in &terms {
-        let tvars: Vec<tamarin_term::lterm::LVar> = vars_vterm(t);
-        if tvars.is_empty() { continue; }
-        let restricted = vfresh_subst.restrict(&tvars);
-        if restricted.dom().count() == 0 { continue; }
-        // Build a free subst from the restricted VFresh, allocating
-        // fresh idxs above the rest of the system.
-        let free_subst = restricted.fresh_to_free(|n| maude.reserve_idxs(n));
-        let t_prime = apply_vterm(&free_subst, t.clone());
-        // Fast path: if subst doesn't change the term, it's still NF.
-        if &t_prime == t { continue; }
-        // Slow path: structural NF check (HS-faithful).  Mirrors HS
-        // `nfApply subst0 t = t == t' || nf' t' \`runReader\` hnd`
-        // where `nf' = nfViaHaskell` (Norm.hs:130-131).  This is a
-        // PURE structural check, NOT `maude.reduce(t) == t`.  The
-        // distinction matters because Maude canonicalises AC operator
-        // arguments (multiset / mult / xor / nat-plus), so
-        // `mult(tid, x)` and `mult(x, tid)` are different `Eq`
-        // representations but both in NF.
-        let is_nf = tamarin_term::norm::nf_via_haskell(&sig, &t_prime);
-        if !is_nf {
-            if tamarin_utils::env_gate!("TAM_RS_DBG_SUBST_NF") {
-                eprintln!("[rs-subst-nf] CREATES t={:?} t_prime={:?}", t, t_prime);
-            }
-            return true;
+    SubstNfChecker::new(maude, sys).check(fsubst, vfresh_subst)
+}
+
+/// Shared-state port of the curried `substCreatesNonNormalTerms hnd
+/// sys` shape (see the NOTE on [`subst_creates_non_normal_terms`]).
+///
+/// `base` — the `maybeNonNormalTerms hnd sys` walk — is computed once
+/// at construction.  The fsubst application is recomputed only when
+/// the free-subst VALUE changes (at most once per `simp1` iteration:
+/// `simp_with_fresh_avoiding` snapshots `self.subst` per iteration and
+/// probes every candidate against that same snapshot).  The previous
+/// per-call recompute turned post-autoprove eCK-class web proof pages
+/// (TAK1) into a 20+ minute spin that HS serves in under a minute:
+/// `simp_minimize` probes each disj subst, and every probe re-walked
+/// every node of the system.  Pure predicate — no fresh-counter
+/// movement, no output impact.
+pub struct SubstNfChecker {
+    maude: tamarin_term::maude_proc::MaudeHandle,
+    base: Vec<tamarin_term::lterm::LNTerm>,
+    applied: std::cell::RefCell<Option<(
+        crate::tools::equation_store::LNSubst,
+        Vec<tamarin_term::lterm::LNTerm>,
+    )>>,
+}
+
+impl SubstNfChecker {
+    pub fn new(maude: &tamarin_term::maude_proc::MaudeHandle, sys: &System) -> Self {
+        let sig = maude.maude_sig();
+        let irreducible = &sig.irreducible_fun_syms_fast;
+        SubstNfChecker {
+            maude: maude.clone(),
+            base: maybe_non_normal_terms(sys, irreducible),
+            applied: std::cell::RefCell::new(None),
         }
     }
-    false
+
+    /// `substCreatesNonNormalTerms hnd sys fsubst vfresh_subst`, with
+    /// the walk + fsubst application shared as in HS (see type docs).
+    pub fn check(
+        &self,
+        fsubst: &crate::tools::equation_store::LNSubst,
+        vfresh_subst: &crate::tools::equation_store::LNSubstVFresh,
+    ) -> bool {
+        use tamarin_term::subst::apply_vterm;
+        use tamarin_term::vterm::vars_vterm;
+        if self.base.is_empty() { return false; }
+        let sig = self.maude.maude_sig();
+        let mut applied = self.applied.borrow_mut();
+        let stale = match applied.as_ref() {
+            Some((fs, _)) => fs != fsubst,
+            None => true,
+        };
+        if stale {
+            let terms: Vec<tamarin_term::lterm::LNTerm> = self.base.iter()
+                .map(|t| apply_vterm(fsubst, t.clone()))
+                .collect();
+            *applied = Some((fsubst.clone(), terms));
+        }
+        let terms = &applied.as_ref().unwrap().1;
+        for t in terms {
+            let tvars: Vec<tamarin_term::lterm::LVar> = vars_vterm(t);
+            if tvars.is_empty() { continue; }
+            let restricted = vfresh_subst.restrict(&tvars);
+            if restricted.dom().count() == 0 { continue; }
+            // HS `freshToFreeAvoidingFast subst tvars` (Substitution.hs:77-81):
+            // a PURE uniform-shift rename of the range vars avoiding `tvars`
+            // (`rename (map snd l) \`evalFreshAvoiding\` tvars`).  It consumes
+            // NO fresh-counter state — the probe subst is local to this
+            // predicate.  Drawing real idxs from the shared counter here would
+            // advance it on every variant probed, shifting every later
+            // persisted mint above HS.
+            let fresh_start = tvars.iter().map(|v| v.idx).max().unwrap_or(0)
+                .saturating_add(1);
+            let free_subst = restricted.fresh_to_free_uniform_shift(fresh_start);
+            let t_prime = apply_vterm(&free_subst, t.clone());
+            // Fast path: if subst doesn't change the term, it's still NF.
+            if &t_prime == t { continue; }
+            // Slow path: structural NF check (HS-faithful).  Mirrors HS
+            // `nfApply subst0 t = t == t' || nf' t' \`runReader\` hnd`
+            // where `nf' = nfViaHaskell` (Norm.hs:130-131).  This is a
+            // PURE structural check, NOT `maude.reduce(t) == t`.  The
+            // distinction matters because Maude canonicalises AC operator
+            // arguments (multiset / mult / xor / nat-plus), so
+            // `mult(tid, x)` and `mult(x, tid)` are different `Eq`
+            // representations but both in NF.
+            let is_nf = tamarin_term::norm::nf_via_haskell(&sig, &t_prime);
+            if !is_nf {
+                if tamarin_utils::env_gate!("TAM_RS_DBG_SUBST_NF") {
+                    eprintln!("[rs-subst-nf] CREATES t={:?} t_prime={:?}", t, t_prime);
+                }
+                return true;
+            }
+        }
+        false
+    }
 }
 
 #[cfg(test)]

@@ -32,6 +32,108 @@ pub const LINE_LENGTH: usize = 110;
 /// `round(110/1.5) = 73` (`pretty-1.1.3.6/Text/PrettyPrint/HughesPJ.hs`).
 pub const RIBBON: usize = 73;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Process-wide DISPLAY width used by the bare [`Doc::render`] path.
+///
+/// The two output modes render at different widths in HS, and it is a
+/// property of the whole process (you invoke either `--prove` OR
+/// `interactive`, never both in one process):
+///   - the CLI (`--prove`) renders at the *console* width
+///     `LINE_LENGTH`/`RIBBON` = 110/73 (`src/Main/Console.hs`
+///     `renderDoc`);
+///   - the interactive web server renders every HTTP response at HS's
+///     *web* width 100/67 — HughesPJ's default `style` used by `render`
+///     (`getTheorySourceR` = `render . prettyClosedTheory`,
+///     `src/Web/Handler.hs:956`) and by `renderHtmlDoc`
+///     (`Text/PrettyPrint/Html.hs:151`).
+///
+/// Defaults to 110/73 so the CLI path is unchanged; the server calls
+/// [`set_display_width`] once at startup, before any rendering.  This is
+/// presentation-only — it can never affect proof search or verdicts —
+/// and the explicit `render_with`/`render_at` widths (WF/oracle/goal
+/// rendering) are unaffected.
+static DISPLAY_LINE_LENGTH: AtomicUsize = AtomicUsize::new(LINE_LENGTH);
+static DISPLAY_RIBBON: AtomicUsize = AtomicUsize::new(RIBBON);
+
+/// HS web display width: HughesPJ default `style` (100) with
+/// `round(100/1.5) = 67` ribbon.
+pub const WEB_LINE_LENGTH: usize = 100;
+pub const WEB_RIBBON: usize = 67;
+
+/// Override the bare-`render()` display width process-wide (see
+/// [`DISPLAY_LINE_LENGTH`]).  Called once by the interactive server with
+/// `(WEB_LINE_LENGTH, WEB_RIBBON)`.
+pub fn set_display_width(line_length: usize, ribbon: usize) {
+    DISPLAY_LINE_LENGTH.store(line_length, Ordering::Relaxed);
+    DISPLAY_RIBBON.store(ribbon, Ordering::Relaxed);
+}
+
+thread_local! {
+    /// When set, [`Doc::text`]/[`Doc::char`] measure each token's *fill* width
+    /// as its HTML-entity-escaped column count instead of its visible column
+    /// count.  This mirrors HS's web render path, which builds every document
+    /// through the `HtmlDoc Doc` transformer: its `Document (HtmlDoc d)`
+    /// instance (`Text/PrettyPrint/Html.hs:105-107`) runs `escapeHtmlEntities`
+    /// on every `text`/`char` token BEFORE the HughesPJ fill measures it, so a
+    /// `<`/`>` costs 4 columns (`&lt;`/`&gt;`) and a `'` costs 5 (`&#39;`) when
+    /// deciding line breaks.  The interactive server escapes AFTER rendering
+    /// (`html_escape`), so without matching this accounting its `fsep`/`fcat`
+    /// wraps a pair-tuple `<…>` at a different column than HS (task #17 family
+    /// D — a space appears/disappears before a tuple's closing `>`).
+    ///
+    /// This is presentation-only: it never affects proof search or verdicts,
+    /// and it is scoped (via [`HtmlEntityWidthGuard`]) to the web
+    /// constraint-system pane only, so the `--prove` byte-identity corpus is
+    /// untouched (the flag defaults to `false`).
+    static HTML_ENTITY_WIDTH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Column width of `s` after HTML-entity escaping, matching HS
+/// `escapeHtmlEntities` (`Text/PrettyPrint/Html.hs:130-138`) and the server's
+/// `html_escape`: `<`/`>` → `&lt;`/`&gt;` (4), `&` → `&amp;` (5), `'` →
+/// `&#39;` (5), `"` → `&quot;` (6); every other codepoint counts as 1 column.
+fn html_entity_col_width(s: &str) -> usize {
+    s.chars()
+        .map(|c| match c {
+            '<' | '>' => 4,
+            '&' | '\'' => 5,
+            '"' => 6,
+            _ => 1,
+        })
+        .sum()
+}
+
+/// RAII guard enabling HTML-entity fill-width accounting on the current thread
+/// until dropped (see [`HTML_ENTITY_WIDTH`]).  Restores the previous value on
+/// drop, so nested/re-entrant use is safe.
+pub struct HtmlEntityWidthGuard(bool);
+
+impl HtmlEntityWidthGuard {
+    /// Enable entity-width accounting for the current thread; the previous
+    /// value is restored when the returned guard is dropped.
+    pub fn enable() -> Self {
+        HtmlEntityWidthGuard(HTML_ENTITY_WIDTH.with(|c| c.replace(true)))
+    }
+}
+
+impl Drop for HtmlEntityWidthGuard {
+    fn drop(&mut self) {
+        HTML_ENTITY_WIDTH.with(|c| c.set(self.0));
+    }
+}
+
+/// The fill width of a text run `s`: its visible column count, or — under an
+/// active [`HtmlEntityWidthGuard`] — its HTML-entity-escaped column count.
+#[inline]
+fn fill_width(s: &str) -> usize {
+    if HTML_ENTITY_WIDTH.with(|c| c.get()) {
+        html_entity_col_width(s)
+    } else {
+        s.chars().count()
+    }
+}
+
 // ============================================================================
 // Doc tree
 // ============================================================================
@@ -111,19 +213,13 @@ impl LazyRight {
 // thunk.  Omitting the impl turns any stray direct deep-clone of a
 // `LazyRight` value into a compile error rather than a runtime panic.
 
-/// Force a `LazyUnion` into a concrete `Union`; pass other docs through
-/// unchanged.  Called at the head of every consumer that pattern-matches
-/// on `Doc`, so the rest of the engine only ever sees ordinary `Union`s.
-fn force(d: Doc) -> Doc {
-    match d {
-        Doc::LazyUnion(p, r) => Doc::Union(p, r.force()),
-        // A `Deferred` reduction node forces to the (memoised) reduced
-        // doc.  `get`/`get1` never return a `Deferred` at the head, so a
-        // single force suffices (no Deferred-of-Deferred chains).
-        Doc::Deferred(c) => (*c.force()).clone(),
-        other => other,
-    }
-}
+// NOTE (task #20): there is deliberately NO whole-`Doc` `force()` helper.
+// An earlier version forced every `LazyUnion`'s right branch at the head
+// of `sep1`/`fill1`/`get`/`get1` (`match force(d)`), which RAN the
+// deferred `aboveNest`/`fill` reconstructions even for layouts that never
+// break — O(n²) reduction on large docs.  Every consumer now has explicit
+// `LazyUnion`/`Deferred` arms that force the memoised thunk only on the
+// path that actually needs it, matching HS's call-by-need `best`.
 
 /// Wrap a `get`/`get1` reduction step as a memoised `Deferred` node, so
 /// it is only run when `fits`/`lay` walks into it.
@@ -146,7 +242,7 @@ impl Doc {
     /// like CJK count as 1 in both).
     pub fn text<S: AsRef<str>>(s: S) -> Doc {
         let s = s.as_ref();
-        let w = s.chars().count();
+        let w = fill_width(s);
         Doc::text_w(s, w)
     }
 
@@ -163,7 +259,8 @@ impl Doc {
     pub fn char(c: char) -> Doc {
         let mut buf = [0u8; 4];
         let s = c.encode_utf8(&mut buf);
-        Doc::text_w(s, 1)
+        let w = fill_width(s);
+        Doc::text_w(s, w)
     }
 
     /// HS `<>` (beside without space).
@@ -194,9 +291,14 @@ impl Doc {
         mk_nest(n, reduce_doc(self))
     }
 
-    /// Render with default lineLength=110, ribbon=73.
+    /// Render at the process-wide display width (see
+    /// [`set_display_width`]): 110/73 for the CLI, 100/67 for the
+    /// interactive web server.
     pub fn render(self) -> String {
-        self.render_with(LINE_LENGTH, RIBBON)
+        self.render_with(
+            DISPLAY_LINE_LENGTH.load(Ordering::Relaxed),
+            DISPLAY_RIBBON.load(Ordering::Relaxed),
+        )
     }
 
     pub fn render_with(self, line_length: usize, ribbon: usize) -> String {
@@ -222,6 +324,39 @@ impl Doc {
         // continuation lines come from `lay`'s nest tracking.
         lay2(sl_initial as isize, &best, &mut out);
         out
+    }
+
+    /// HS `renderStyle (defaultStyle { mode = OneLineMode })` —
+    /// `fullRender OneLineMode … = easyDisplay spaceText (\_ y -> y) …
+    /// (reduceDoc doc)` (pretty-1.1.3.6 `Text.PrettyPrint.HughesPJ`,
+    /// `fullRender`/`easyDisplay`): every `Union` takes its SECOND
+    /// (fully-laid-out) branch — the one guaranteed free of `NoDoc` —
+    /// every `Nest` is dropped, and every `NilAbove` (line break) becomes
+    /// exactly ONE space.  Used by HS `Dot.hs:371-373`'s `oneLineRender`
+    /// to measure each record field's used width for `renderBalanced`.
+    pub fn one_line_render(&self) -> String {
+        // Iterative for the same stack-depth reason as `lay_loop`.
+        let mut out = String::new();
+        let mut cur: Doc = self.clone();
+        loop {
+            cur = match cur {
+                Doc::Empty => return out,
+                Doc::NoDoc => panic!("one_line_render: NoDoc"),
+                Doc::NilAbove(p) => {
+                    out.push(' ');
+                    (*p).clone()
+                }
+                Doc::TextBeside(s, _w, p) => {
+                    out.push_str(&s);
+                    (*p).clone()
+                }
+                Doc::Nest(_, p) => (*p).clone(),
+                // `easyDisplay`'s chooser for OneLineMode is `\_ y -> y`.
+                Doc::Union(_, q) => (*q).clone(),
+                Doc::LazyUnion(_, r) => (*r.force()).clone(),
+                Doc::Deferred(c) => (*c.force()).clone(),
+            };
+        }
     }
 }
 
@@ -358,10 +493,24 @@ fn above_g(p: Doc, g: bool, q: Doc) -> Doc {
 fn above_nest(p: Doc, g: bool, k: isize, q: Doc) -> Doc {
     match p {
         Doc::NoDoc => Doc::NoDoc,
-        Doc::Union(p1, p2) => union_(
-            above_nest((*p1).clone(), g, k, q.clone()),
-            above_nest((*p2).clone(), g, k, q),
-        ),
+        // HS `aboveNest (p Union q) g k r = aboveNest p g k r `union_`
+        // aboveNest q g k r` (pretty-1.1.3.6 HughesPJ.hs:585).  CRITICAL:
+        // under GHC's call-by-need both distributed branches are thunks —
+        // `best`/`fits` forces the right one only when the left overflows.
+        // Distributing eagerly into BOTH branches rebuilds `q` under every
+        // Union alternative at construction time; for a union-rich doc (a
+        // vcat of 18 ∃-substs over bilinear eCK terms, each a nest of
+        // sep/fsep unions) that is O(2^depth) — the task-#19 web OOM
+        // (8 GB, source-cases page, Chen_Kudla `Init_2`).  Mirror HS's
+        // laziness exactly as `beside_inner`'s Union arm does: keep the
+        // right branch a memoised thunk.
+        Doc::Union(p1, p2) => {
+            let q2 = q.clone();
+            lazy_union(
+                above_nest((*p1).clone(), g, k, q),
+                move || above_nest((*p2).clone(), g, k, q2),
+            )
+        }
         // Lazy distribution: keep the right branch a thunk.
         Doc::LazyUnion(p1, r) => {
             let q2 = q.clone();
@@ -494,15 +643,24 @@ fn sep_x(x: bool, mut ds: Vec<Doc>) -> Doc {
 
 /// HS `sep1`.
 fn sep1(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
-    match force(p) {
+    match p {
         Doc::NoDoc => Doc::NoDoc,
-        Doc::LazyUnion(..) | Doc::Deferred(..) => unreachable!("forced above"),
         Doc::Union(p, q) => {
             let left = sep1(g, (*p).clone(), k, ys.clone());
             lazy_union(left, move || {
                 above_nest((*q).clone(), false, k, reduce_doc(vcat(ys)))
             })
         }
+        // Keep the right branch a thunk: forcing it here (the old
+        // `force()`-at-head) ran its `aboveNest`/`beside` reconstruction
+        // even for layouts that never break — see `get`'s LazyUnion arm.
+        Doc::LazyUnion(p, rt) => {
+            let left = sep1(g, (*p).clone(), k, ys.clone());
+            lazy_union(left, move || {
+                above_nest((*rt.force()).clone(), false, k, reduce_doc(vcat(ys)))
+            })
+        }
+        Doc::Deferred(c) => sep1(g, (*c.force()).clone(), k, ys),
         Doc::Empty => mk_nest(k, sep_x(g, ys)),
         Doc::Nest(n, inner) => nest_(n, sep1(g, (*inner).clone(), k - n, ys)),
         Doc::NilAbove(p) => nil_above_(above_nest((*p).clone(), false, k, reduce_doc(vcat(ys)))),
@@ -512,9 +670,7 @@ fn sep1(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
 
 /// HS `sepNB`.
 fn sep_nb(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
-    let p = force(p);
     match p {
-        Doc::LazyUnion(..) | Doc::Deferred(..) => unreachable!("forced above"),
         Doc::Nest(_, inner) => sep_nb(g, (*inner).clone(), k, ys),
         Doc::Empty => {
             // HS `sepNB g Empty k ys` (pretty-1.1.3.6 HughesPJ.hs:760-766):
@@ -560,9 +716,8 @@ fn fill(g: bool, mut ds: Vec<Doc>) -> Doc {
 
 /// HS `fill1`.
 fn fill1(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
-    match force(p) {
+    match p {
         Doc::NoDoc => Doc::NoDoc,
-        Doc::LazyUnion(..) | Doc::Deferred(..) => unreachable!("forced above"),
         Doc::Union(p, q) => {
             // Keep the right (line-breaking) branch lazy — it re-fills the
             // remaining items and is only needed if the flat layout fails.
@@ -571,6 +726,16 @@ fn fill1(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
                 above_nest((*q).clone(), false, k, fill(g, ys))
             })
         }
+        // Keep the right branch a thunk (see `sep1`/`get`): the old
+        // `force()`-at-head ran it eagerly, degenerating fill reduction to
+        // O(n²) on large docs.
+        Doc::LazyUnion(p, rt) => {
+            let left = fill1(g, (*p).clone(), k, ys.clone());
+            lazy_union(left, move || {
+                above_nest((*rt.force()).clone(), false, k, fill(g, ys))
+            })
+        }
+        Doc::Deferred(c) => fill1(g, (*c.force()).clone(), k, ys),
         Doc::Empty => mk_nest(k, fill(g, ys)),
         Doc::Nest(n, inner) => nest_(n, fill1(g, (*inner).clone(), k - n, ys)),
         Doc::NilAbove(p) => nil_above_(above_nest((*p).clone(), false, k, fill(g, ys))),
@@ -580,8 +745,7 @@ fn fill1(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
 
 /// HS `fillNB`.
 fn fill_nb(g: bool, p: Doc, k: isize, ys: Vec<Doc>) -> Doc {
-    match force(p) {
-        Doc::LazyUnion(..) | Doc::Deferred(..) => unreachable!("forced above"),
+    match p {
         Doc::Nest(_, inner) => fill_nb(g, (*inner).clone(), k, ys),
         Doc::Empty => {
             if ys.is_empty() { return Doc::Empty; }
@@ -638,10 +802,9 @@ fn get_doc(w: isize, r: isize, d: &Doc) -> Doc {
 /// unchosen alternatives are never materialised.  This mirrors HS's
 /// call-by-need `best` and keeps reduction O(output) instead of O(2^depth).
 fn get(w: isize, r: isize, d: Doc) -> Doc {
-    match force(d) {
+    match d {
         Doc::Empty => Doc::Empty,
         Doc::NoDoc => Doc::NoDoc,
-        Doc::LazyUnion(..) | Doc::Deferred(..) => unreachable!("forced above"),
         Doc::NilAbove(p) => nil_above_(defer(move || get(w, r, (*p).clone()))),
         Doc::TextBeside(s, sw, p) => {
             let len = sw as isize;
@@ -657,15 +820,27 @@ fn get(w: isize, r: isize, d: Doc) -> Doc {
             let budget = std::cmp::min(w, r); // sl = 0 here
             if fits(budget, &p1) { p1 } else { get(w, r, (*q).clone()) }
         }
+        // CRITICAL (task #20 perf): a `LazyUnion` must NOT be `force()`d at
+        // the match head — that RUNS the right-branch thunk (an
+        // `aboveNest`/`fill` reconstruction over the remaining doc) even
+        // when the flat branch fits, degenerating reduction to O(n²) on
+        // large docs (the one-Doc web constraint-system pane).  HS's
+        // call-by-need `best` evaluates `q` only when `p` overflows;
+        // mirror that by forcing the thunk exclusively on the failure path.
+        Doc::LazyUnion(p, rt) => {
+            let p1 = get(w, r, (*p).clone());
+            let budget = std::cmp::min(w, r); // sl = 0 here
+            if fits(budget, &p1) { p1 } else { get(w, r, (*rt.force()).clone()) }
+        }
+        Doc::Deferred(c) => get(w, r, (*c.force()).clone()),
     }
 }
 
 /// HS `get1 w sl doc` (in-line, after `sl` cols of text).
 fn get1(w: isize, r: isize, sl: isize, d: Doc) -> Doc {
-    match force(d) {
+    match d {
         Doc::Empty => Doc::Empty,
         Doc::NoDoc => Doc::NoDoc,
-        Doc::LazyUnion(..) | Doc::Deferred(..) => unreachable!("forced above"),
         Doc::NilAbove(p) => {
             // After a line break the next line's budget shrinks by `sl`.
             nil_above_(defer(move || get(w - sl, r, (*p).clone())))
@@ -681,6 +856,14 @@ fn get1(w: isize, r: isize, sl: isize, d: Doc) -> Doc {
             let budget = std::cmp::min(w, r) - sl;
             if fits(budget, &p1) { p1 } else { get1(w, r, sl, (*q).clone()) }
         }
+        // See `get`'s LazyUnion arm: force the right branch ONLY when the
+        // flat branch overflows (HS call-by-need).
+        Doc::LazyUnion(p, rt) => {
+            let p1 = get1(w, r, sl, (*p).clone());
+            let budget = std::cmp::min(w, r) - sl;
+            if fits(budget, &p1) { p1 } else { get1(w, r, sl, (*rt.force()).clone()) }
+        }
+        Doc::Deferred(c) => get1(w, r, sl, (*c.force()).clone()),
     }
 }
 
@@ -710,55 +893,67 @@ fn fits(n: isize, d: &Doc) -> bool {
 // ============================================================================
 
 /// HS `lay` — walk the reduced doc, accumulating output.
+///
+/// ITERATIVE (task #20): the walk is a pure state machine — `lay` (at
+/// line start, where `Nest` bumps the column and the first text emits the
+/// indent) vs `lay2` (mid-line, `Nest` inert) — so it is driven by a loop
+/// with a `line_start` flag instead of mutual recursion.  The recursive
+/// form's depth is the doc's total token count, which overflows the 2 MiB
+/// tokio worker stacks now that the web constraint-system pane is one
+/// single Doc (HS `prettyNonGraphSystem = vsep …`).  Semantics are
+/// byte-identical to the recursive HS `lay`/`lay2` pair.
 fn lay(k: isize, d: &Doc, out: &mut String) {
-    match d {
-        Doc::Empty => {}
-        Doc::NoDoc => {
-            panic!("pretty_hpj::lay: NoDoc reached — best should have picked a fitting alternative")
-        }
-        Doc::Nest(k1, p) => lay(k + k1, p, out),
-        Doc::NilAbove(p) => {
-            out.push('\n');
-            lay(k, p, out);
-        }
-        Doc::TextBeside(s, _w, p) => {
-            // First char of this line: emit indent if buffer is empty
-            // OR the last char was '\n'.  `'\n'` is ASCII, so the
-            // trailing-byte check is O(1) (no full-output scan).
-            if out.is_empty() || out.ends_with('\n') {
-                for _ in 0..k.max(0) { out.push(' '); }
-            }
-            out.push_str(s);
-            lay2(k + *_w as isize, p, out);
-        }
-        Doc::Deferred(c) => lay(k, &c.force(), out),
-        Doc::Union(_, _) => {
-            panic!("pretty_hpj::lay: Union — best did not reduce")
-        }
-        Doc::LazyUnion(_, _) => {
-            panic!("pretty_hpj::lay: LazyUnion — best did not reduce")
-        }
-    }
+    lay_loop(k, d, out, true)
 }
 
 /// HS `lay2` — continuation on the SAME line (no indent emission until
-/// NilAbove).
+/// NilAbove).  See `lay` for the loop rationale.
 fn lay2(k: isize, d: &Doc, out: &mut String) {
-    match d {
-        Doc::Empty => {}
-        Doc::NoDoc => panic!("pretty_hpj::lay2: NoDoc"),
-        Doc::NilAbove(p) => {
-            out.push('\n');
-            lay(k, p, out);
-        }
-        Doc::TextBeside(s, w, p) => {
-            out.push_str(s);
-            lay2(k + *w as isize, p, out);
-        }
-        Doc::Nest(_k1, p) => lay2(k, p, out),
-        Doc::Deferred(c) => lay2(k, &c.force(), out),
-        Doc::Union(_, _) => panic!("pretty_hpj::lay2: Union"),
-        Doc::LazyUnion(_, _) => panic!("pretty_hpj::lay2: LazyUnion"),
+    lay_loop(k, d, out, false)
+}
+
+fn lay_loop(k0: isize, d: &Doc, out: &mut String, line_start0: bool) {
+    let mut k = k0;
+    let mut line_start = line_start0;
+    let mut cur: Doc = d.clone();
+    loop {
+        cur = match cur {
+            Doc::Empty => return,
+            Doc::NoDoc => panic!(
+                "pretty_hpj::lay: NoDoc reached — best should have picked a fitting alternative"
+            ),
+            // `lay (k + k1)` at line start; `lay2` ignores Nest mid-line.
+            Doc::Nest(k1, p) => {
+                if line_start {
+                    k += k1;
+                }
+                (*p).clone()
+            }
+            // Both `lay` and `lay2` continue at column `k` on the next
+            // line (HS `lay2 k (NilAbove p) = nlText <> lay k p`).
+            Doc::NilAbove(p) => {
+                out.push('\n');
+                line_start = true;
+                (*p).clone()
+            }
+            Doc::TextBeside(s, w, p) => {
+                // First char of this line: emit indent if buffer is empty
+                // OR the last char was '\n'.  `'\n'` is ASCII, so the
+                // trailing-byte check is O(1) (no full-output scan).
+                if line_start && (out.is_empty() || out.ends_with('\n')) {
+                    for _ in 0..k.max(0) {
+                        out.push(' ');
+                    }
+                }
+                out.push_str(&s);
+                k += w as isize;
+                line_start = false;
+                (*p).clone()
+            }
+            Doc::Deferred(c) => (*c.force()).clone(),
+            Doc::Union(_, _) => panic!("pretty_hpj::lay: Union — best did not reduce"),
+            Doc::LazyUnion(_, _) => panic!("pretty_hpj::lay: LazyUnion — best did not reduce"),
+        };
     }
 }
 

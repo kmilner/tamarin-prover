@@ -10,11 +10,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use tamarin_term::function_symbols::{CSym, FunSym};
+use tamarin_term::function_symbols::{
+    diff_sym, exp_sym, nat_one_sym, pair_sym, AcSym, CSym, FunSym, EMAP_SYM_STRING,
+};
 use tamarin_term::lterm::{LNTerm, LSort, LVar};
 use tamarin_term::pretty::pretty_lnterm;
 use tamarin_term::term::{is_pair, Term};
 use tamarin_term::vterm::Lit;
+
+use tamarin_theory::pretty_hpj::{fcat, fsep, punctuate, Doc, WEB_LINE_LENGTH, WEB_RIBBON};
 
 use tamarin_theory::fact::LNFact;
 use tamarin_theory::rule::{
@@ -170,6 +174,9 @@ fn abbreviate_term(
             prefix_map.insert(prefix, idx + 1);
             let v = LVar::new(candidate, LSort::Msg, 0);
             return (prefix_map, Term::Lit(Lit::Var(v)));
+        }
+        if tamarin_utils::env_gate!("TAM_RS_DBG_ABBREV") {
+            eprintln!("collision: {}", candidate);
         }
         idx += 1;
     }
@@ -346,6 +353,131 @@ fn sub_terms_no_pair(t: &LNTerm, out: &mut Vec<LNTerm>) {
 // Weight
 // ---------------------------------------------------------------------
 
+/// `length $ render $ prettyLNTerm t` (Abbreviation.hs:88-92) — the term
+/// size that feeds `judgeTerm`'s weight.
+///
+/// HS `render` is HughesPJ `P.render`, i.e. the library DEFAULT style
+/// (PageMode, lineLength=100, ribbonsPerLine=1.5 ⇒ ribbon 67) regardless
+/// of output mode — NOT a single-line rendering: a term wider than the
+/// ribbon WRAPS, and the newline + nest-indentation characters count
+/// toward the weight.  Measured on csf17/commitment-protocol (page
+/// `.../proof/sent_commit_implies_generated/_/R_2/R_2/I_1/R_2`), the three
+/// wider-than-ribbon candidates measure 112/239/113 in HS vs 100/190/101
+/// single-line; the 113-vs-101 gap alone flips the greedy order of two
+/// picks (HS 5*113=565 beats the 561-weight commit term, single-line
+/// 5*101=505 loses to it), which is exactly the SIn index drift the web
+/// sweep flagged.  So measure through the same HughesPJ engine (the
+/// verified `pretty_hpj` port) at HS `render`'s default widths
+/// (`WEB_LINE_LENGTH`/`WEB_RIBBON` = 100/67).
+fn rendered_term_len(t: &LNTerm) -> usize {
+    lnterm_doc(t)
+        .render_with(WEB_LINE_LENGTH, WEB_RIBBON)
+        .chars()
+        .count()
+}
+
+/// HS `prettyLNTerm` = `prettyTerm (text . show)` as a HughesPJ `Doc`
+/// (Term.hs:268-296), built directly on `LNTerm`.
+///
+/// tamarin-theory has the same Doc under `pretty_formula::term_doc` via the
+/// `pub(crate)` parser-AST projection `lnterm_to_parser`; that path is not
+/// reachable from this crate, and widening its visibility would touch a
+/// shared module for a server-only need — so the (small, closed) `ppTerm`
+/// case split is mirrored here instead, using `pretty_hpj`'s public
+/// combinators.  Case order and Doc shape follow Term.hs exactly:
+///   - literals: `text (show l)` — one unbreakable token (the single-line
+///     `pretty_lnterm` of a literal IS `show l`);
+///   - AC:   `ppTerms (ppACOp o) 1 "(" ")" ts`;
+///   - exp:  `t1 <> "^" <> t2`; diff: `"diff" <> "(" <> t1 <> ", " <> t2 <> ")"`;
+///   - %1:   `text "%1"`; pairs: `ppTerms ", " 1 "<" ">" (split t)`;
+///   - nullary NoEq: `text f`; other NoEq / EMap / LIST: `ppFun`.
+fn lnterm_doc(t: &LNTerm) -> Doc {
+    match t {
+        Term::Lit(_) => Doc::text(pretty_lnterm(t)),
+        Term::App(FunSym::Ac(o), ts) => {
+            pp_terms(ac_op_symbol(*o), 1, "(", ")", ts.iter().collect())
+        }
+        Term::App(FunSym::NoEq(sym), ts) if ts.len() == 2 && *sym == exp_sym() => {
+            lnterm_doc(&ts[0])
+                .beside(Doc::text("^"))
+                .beside(lnterm_doc(&ts[1]))
+        }
+        Term::App(FunSym::NoEq(sym), ts) if ts.len() == 2 && *sym == diff_sym() => {
+            Doc::text("diff")
+                .beside(Doc::text("("))
+                .beside(lnterm_doc(&ts[0]))
+                .beside(Doc::text(", "))
+                .beside(lnterm_doc(&ts[1]))
+                .beside(Doc::text(")"))
+        }
+        Term::App(FunSym::NoEq(sym), ts) if ts.is_empty() && *sym == nat_one_sym() => {
+            Doc::text("%1")
+        }
+        Term::App(FunSym::NoEq(sym), _) if *sym == pair_sym() => {
+            let mut flat: Vec<&LNTerm> = Vec::new();
+            split_pair(t, &mut flat);
+            pp_terms(", ", 1, "<", ">", flat)
+        }
+        Term::App(FunSym::NoEq(sym), ts) if ts.is_empty() => {
+            Doc::text(String::from_utf8_lossy(sym.name).into_owned())
+        }
+        Term::App(FunSym::NoEq(sym), ts) => {
+            pp_fun(&String::from_utf8_lossy(sym.name), ts)
+        }
+        Term::App(FunSym::C(CSym::EMap), ts) => {
+            pp_fun(&String::from_utf8_lossy(EMAP_SYM_STRING), ts)
+        }
+        Term::App(FunSym::List, ts) => pp_fun("LIST", ts),
+    }
+}
+
+/// HS `ppTerms sepa n lead finish ts` (Term.hs:288-290):
+/// `fcat . (text lead :) . (++[text finish]) . map (nest n)
+///       . punctuate (text sepa) . map ppTerm`.
+fn pp_terms(sepa: &str, n: isize, lead: &str, finish: &str, ts: Vec<&LNTerm>) -> Doc {
+    let docs: Vec<Doc> = ts.into_iter().map(lnterm_doc).collect();
+    let items = punctuate(Doc::text(sepa), docs);
+    let mut all: Vec<Doc> = Vec::with_capacity(items.len() + 2);
+    all.push(Doc::text(lead));
+    for d in items {
+        all.push(d.nest(n));
+    }
+    all.push(Doc::text(finish));
+    fcat(all)
+}
+
+/// HS `ppFun f ts` (Term.hs:295-296):
+/// `text (f++"(") <> fsep (punctuate comma (map ppTerm ts)) <> text ")"`.
+fn pp_fun(f: &str, ts: &[LNTerm]) -> Doc {
+    let docs: Vec<Doc> = ts.iter().map(lnterm_doc).collect();
+    Doc::text(format!("{}(", f))
+        .beside(fsep(punctuate(Doc::text(","), docs)))
+        .beside(Doc::text(")"))
+}
+
+/// HS `split` (Term.hs:292-293): flatten a right-nested pair spine.
+/// `viewTerm2 -> FPair` requires exactly two arguments AND full `NoEqSym`
+/// equality with `pairSym`.
+fn split_pair<'a>(t: &'a LNTerm, out: &mut Vec<&'a LNTerm>) {
+    match t {
+        Term::App(FunSym::NoEq(sym), ts) if ts.len() == 2 && *sym == pair_sym() => {
+            out.push(&ts[0]);
+            split_pair(&ts[1], out);
+        }
+        _ => out.push(t),
+    }
+}
+
+/// HS `ppACOp` (Term.hs:283-286).
+fn ac_op_symbol(o: AcSym) -> &'static str {
+    match o {
+        AcSym::Mult => "*",
+        AcSym::Xor => "\u{2295}",
+        AcSym::Union => "++",
+        AcSym::NatPlus => "%+",
+    }
+}
+
 /// Mirror of `judgeTerm` (Abbreviation.hs:79-101).
 fn judge_term(
     abbrevs: &BTreeMap<LNTerm, LNTerm>,
@@ -355,7 +487,7 @@ fn judge_term(
 ) -> i64 {
     let lookup = |k: &LNTerm| abbrevs.get(k).cloned();
     let replaced = apply_abbreviations_term(&lookup, t);
-    let term_weight = pretty_lnterm(&replaced).chars().count() as i64;
+    let term_weight = rendered_term_len(&replaced) as i64;
     if term_weight < 10 { return -1; }
     let relative = if occs == 1 && legend_occs == [1] { 0 } else { occs };
     if relative <= 1 { return -1; }
@@ -404,6 +536,11 @@ pub fn compute_abbreviations(
         entry.0 += 1;
     }
     let all_names = collect_all_names(repr);
+    let dbg = tamarin_utils::env_gate!("TAM_RS_DBG_ABBREV");
+    if dbg {
+        let joined: Vec<&str> = all_names.iter().map(|s| s.as_str()).collect();
+        eprintln!("allNames: {}", joined.join(" "));
+    }
     let mut abbrevs: BTreeMap<LNTerm, LNTerm> = BTreeMap::new();
     let mut prefix_map: PrefixMap = BTreeMap::new();
     // Iteratively pick the best candidate.
@@ -433,10 +570,24 @@ pub fn compute_abbreviations(
             None => break,
         };
         if weight < opts.always_abbrev_weight && abbrevs.len() >= opts.abbrevs_soft_limit {
+            if dbg {
+                eprintln!("stop: weight={} nabbrevs={}", weight, abbrevs.len());
+            }
             break;
         }
         let (new_pmap, abbrev_name) = abbreviate_term(opts, &all_names, prefix_map, &candidate);
         prefix_map = new_pmap;
+        if dbg {
+            let lookup = |k: &LNTerm| abbrevs.get(k).cloned();
+            let replaced = apply_abbreviations_term(&lookup, &candidate);
+            eprintln!(
+                "pick: weight={} len={} name={} term={}",
+                weight,
+                rendered_term_len(&replaced),
+                pretty_lnterm(&abbrev_name),
+                pretty_lnterm(&candidate)
+            );
+        }
         // Decrement subterm counts in legend_occs for every other term.
         let mut new_term_occs: BTreeMap<LNTerm, (i64, Vec<i64>)> = BTreeMap::new();
         for (term, (occs, legend_occs)) in term_occs {

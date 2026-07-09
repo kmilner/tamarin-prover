@@ -384,6 +384,19 @@ pub fn rename_precise_system(sys: &mut System) {
             *s = tamarin_term::subst_vfresh::SubstVFresh::from_list(pairs);
         }
     }
+    // HS-faithful: `mapFrees` over the eqsConj's `S.Set LNSubstVFresh`
+    // is `fmap S.fromList . mapFrees f . S.toList` (HasFrees (S.Set a)),
+    // so after renaming the domain KEYS the set is re-collected via
+    // `S.fromList` — RE-SORTING (and deduping) by `Ord LNSubstVFresh`.
+    // Renaming keys is NOT order-preserving (it is a precise remap, not a
+    // monotone shift), so without this re-sort RS's `Vec`-backed disj is
+    // left in a stale order relative to the new keys.  The raw Set order
+    // is what `prettyEqStore` (`ppDisj`'s `S.toList substs`) renders on
+    // the web sequent pages, and it is masked in batch `--prove` output
+    // only because `performSplit` re-canonicalises the case order.
+    // Mirrors the identical `S.fromList` re-sort the subterm-store block
+    // below already performs for `mapFrees (S.Set SubtermD)`.
+    sys.eq_store_mut().sort_disj_substs();
 
     // 8. Subterm store.
     //

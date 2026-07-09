@@ -183,8 +183,25 @@ pub fn simplify_system_with_fanout(
     ctx: &crate::constraint::solver::context::ProofContext,
     sys: crate::constraint::system::System,
 ) -> Vec<crate::constraint::system::System> {
+    simplify_system_with_fanout_seeded(ctx, sys, 0)
+}
+
+/// Like [`simplify_system_with_fanout`] but continues an enclosing
+/// FreshT thread: `seed` = the producing branch's fresh-counter position
+/// (HS's `runReduction (solveGoal >> simplifySystem)` runs the per-case
+/// simplify with the SAME counter the branch's solve left off at; a
+/// `bounds_max(sys)` reseed silently rewinds past the branch's transient
+/// draws — task #16).  `seed = 0` degrades to `Reduction::new` exactly.
+pub fn simplify_system_with_fanout_seeded(
+    ctx: &crate::constraint::solver::context::ProofContext,
+    sys: crate::constraint::system::System,
+    seed: u64,
+) -> Vec<crate::constraint::system::System> {
     use crate::constraint::solver::reduction::Reduction;
-    let mut red = Reduction::new(ctx, sys);
+    // `new_inheriting` consults the `REFINE_FLOOR` thread-local so this
+    // sub-reduction inherits the source precompute's `avoid th` seed (HS
+    // Sources.hs:162); 0 (general proving path) is a no-op.
+    let mut red = Reduction::new_inheriting(ctx, sys, seed);
     simplify_system_fan_out_inner(&mut red)
 }
 
@@ -233,10 +250,14 @@ fn simplify_system_fan_out_inner(
                 // Recursively run `simplify_system_with_fanout` per
                 // case; each call rebuilds a fresh Reduction with its
                 // own FreshT counter (`bounds_max(sys)`).
+                if tamarin_utils::env_gate!("TAM_RS_DBG_SUA") {
+                    eprintln!("[SSFO] sua fanout -> {} case systems", case_systems.len());
+                }
                 let mut out: Vec<crate::constraint::system::System> = Vec::new();
-                for case_sys in case_systems {
+                for (case_sys, case_seed) in case_systems {
                     if case_sys.eq_store.is_false() { continue; }
-                    let mut sub = simplify_system_with_fanout(ctx, case_sys);
+                    let mut sub = simplify_system_with_fanout_seeded(
+                        ctx, case_sys, case_seed);
                     out.append(&mut sub);
                 }
                 return out;
@@ -276,7 +297,13 @@ fn fan_out_on_pending_eq_arms(
     red: &mut Reduction,
     ctx: &crate::constraint::solver::context::ProofContext,
 ) -> Vec<crate::constraint::system::System> {
+    // HS FreshT-threading (task #16): every eq-store arm continues from
+    // the fork point's counter (HS's DisjT copies the FreshT state).
+    let fork_seed = red.maude.fresh_counter_peek();
     let pending = std::mem::take(&mut red.pending_eq_arms);
+    if tamarin_utils::env_gate!("TAM_RS_DBG_SUA") {
+        eprintln!("[SSFO] eq-arm fanout -> {} arms", pending.len() + 1);
+    }
     let arm0_sys = std::mem::replace(&mut red.sys, crate::constraint::system::System::empty());
     let mut all_arm_systems: Vec<crate::constraint::system::System> = Vec::with_capacity(1 + pending.len());
     all_arm_systems.push(arm0_sys.clone());
@@ -289,7 +316,7 @@ fn fan_out_on_pending_eq_arms(
     let mut out: Vec<crate::constraint::system::System> = Vec::new();
     for arm_sys in all_arm_systems {
         if arm_sys.eq_store.is_false() { continue; }
-        let mut sub = simplify_system_with_fanout(ctx, arm_sys);
+        let mut sub = simplify_system_with_fanout_seeded(ctx, arm_sys, fork_seed);
         out.append(&mut sub);
     }
     out
@@ -1218,7 +1245,12 @@ fn implied_apply_canon(f: &crate::guarded::Guarded) -> crate::guarded::Guarded {
     // `Guarded` deep clone per canonicalisation.  Byte-inert while that fn stays
     // identity (the parity gate verifies); the two sites MUST stay in lock-step.
     let f1 = crate::guarded::normalize_witness_lvars(f);
-    crate::guarded::canonicalize_ac_in_guarded_cow(&f1).unwrap_or(f1)
+    let f2 = crate::guarded::canonicalize_ac_in_guarded_cow(&f1).unwrap_or(f1);
+    // Compare in stored normal form (HS 150f5eba: insertImpliedFormulas
+    // normalises derived instances before the membership pre-check) — a
+    // raw duplicate-carrying candidate must match its normalised stored
+    // twin, or the pass re-fires it every simplifier iteration.
+    crate::guarded::normalise_stored_formula(&f2)
 }
 
 /// Try every assignment of system actions to the universal's action
@@ -1380,7 +1412,10 @@ fn try_match_all_guards(
                 // adds 1 RKeys-from-IKeys implication, RS emits an extra
                 // `simplify` proof-tree node where HS reports
                 // `Nothing` from the `sys' /= cleanup sys` guard).
-                crate::guarded::canonicalize_ac_in_guarded_cow(&f1).unwrap_or(f1)
+                let f2 = crate::guarded::canonicalize_ac_in_guarded_cow(&f1).unwrap_or(f1);
+                // Lock-step with `implied_apply_canon`: compare in stored
+                // normal form (HS 150f5eba pre-check normalisation).
+                crate::guarded::normalise_stored_formula(&f2)
             };
             let canon = apply_canon(&implied);
             // TAM_RS_TRACE_FORM=1 also emits an `Impl-candidate` event
@@ -1477,7 +1512,7 @@ fn try_match_all_guards(
                     //
                     // Previous implementation called `sys_maude.unify_at`
                     // here, which under the HS-faithful flattenUnif fix
-                    // (maude_proc.rs::unify_with_avoid's AC-free fast
+                    // (maude_proc.rs::unify's AC-free fast
                     // path) returns narrowing-witness pairs
                     // `K → ~Vw, V → ~Vw`.  Those witness pairs were
                     // encoded as extra Eq atoms appended to other_guards,
@@ -2320,7 +2355,7 @@ fn enforce_ku_action_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         }
     }
     if !node_eqs.is_empty() {
-        let res = red.solve_node_id_eqs(&node_eqs);
+        let res = red.solve_node_id_eqs_broadcast(&node_eqs);
         match res {
             Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)
             | Err(_) => hit_contra = true,
@@ -2441,6 +2476,20 @@ fn solve_unique_actions_pass(red: &mut Reduction) -> ChangeIndicator {
         // surface the Contradictory by injecting gfalse so the next
         // contradictions check picks it up (`FormulasFalse`).
         let outcome = red.solve_action_goal(&i, &fa);
+        if tamarin_utils::env_gate!("TAM_RS_DBG_SUA") {
+            use crate::constraint::solver::reduction::GoalCases;
+            let oc = match &outcome {
+                GoalCases::Contradictory => "Contradictory".to_string(),
+                GoalCases::Linear => "Linear".to_string(),
+                GoalCases::LinearNamed(n) => format!("LinearNamed({})", n),
+                GoalCases::Cases(cs) => format!("Cases({})", cs.len()),
+            };
+            let now_solved = red.sys.goals.iter().any(|(g, st)|
+                matches!(g, Goal::Action(gi, gfa) if gi == &i && gfa == &fa)
+                && st.solved);
+            eprintln!("[SUA] i={}.{} tag={:?} outcome={} solved_after={}",
+                i.name, i.idx, fa.tag, oc, now_solved);
+        }
         if matches!(outcome,
             crate::constraint::solver::reduction::GoalCases::Contradictory)
         {
@@ -2473,7 +2522,7 @@ fn solve_unique_actions_pass(red: &mut Reduction) -> ChangeIndicator {
 ///     surrounding fixpoint).
 fn solve_unique_actions_pass_fan_out(
     red: &mut Reduction,
-) -> std::result::Result<ChangeIndicator, Vec<crate::constraint::system::System>> {
+) -> std::result::Result<ChangeIndicator, Vec<(crate::constraint::system::System, u64)>> {
     use crate::constraint::constraints::Goal;
     use crate::fact::{FactTag, LNFact};
 
@@ -2546,6 +2595,15 @@ fn solve_unique_actions_pass_fan_out(
         // `ru.actions.contains(fa)` arm in `solve_action_goal`).
         let outcome = red.solve_action_goal(&i, &fa);
         use crate::constraint::solver::reduction::GoalCases;
+        if tamarin_utils::env_gate!("TAM_RS_DBG_SUA") {
+            let oc = match &outcome {
+                GoalCases::Contradictory => "Contradictory".to_string(),
+                GoalCases::Linear => "Linear".to_string(),
+                GoalCases::LinearNamed(n) => format!("LinearNamed({})", n),
+                GoalCases::Cases(cs) => format!("Cases({})", cs.len()),
+            };
+            eprintln!("[SUA/fo] i={}.{} tag={:?} outcome={}", i.name, i.idx, fa.tag, oc);
+        }
         match outcome {
             GoalCases::Contradictory => {
                 mark_contradictory_labeled(red, "solve_unique_actions");
@@ -2583,11 +2641,16 @@ fn solve_unique_actions_pass_fan_out(
                 // analog: drain `iter` into each arm.
                 let remaining: Vec<(crate::constraint::constraints::NodeId, LNFact)> =
                     iter.collect();
-                let mut out_systems: Vec<crate::constraint::system::System> = Vec::new();
-                for (_name, case_sys) in cases {
+                // HS FreshT-threading (task #16): per-case branch counters
+                // recorded by `solve_action_goal` alongside its Cases.
+                let case_counters = std::mem::take(&mut red.last_case_counters);
+                let fallback_seed = red.maude.fresh_counter_peek();
+                let mut out_systems: Vec<(crate::constraint::system::System, u64)> = Vec::new();
+                for (ci, (_name, case_sys)) in cases.into_iter().enumerate() {
                     if case_sys.eq_store.is_false() { continue; }
+                    let seed = case_counters.get(ci).copied().unwrap_or(fallback_seed);
                     let mut case_sub = drain_remaining_actions(
-                        red.ctx, case_sys, &remaining);
+                        red.ctx, case_sys, &remaining, seed);
                     out_systems.append(&mut case_sub);
                 }
                 return Err(out_systems);
@@ -2612,10 +2675,13 @@ fn drain_remaining_actions(
     ctx: &crate::constraint::solver::context::ProofContext,
     case_sys: crate::constraint::system::System,
     remaining: &[(crate::constraint::constraints::NodeId, crate::fact::LNFact)],
-) -> Vec<crate::constraint::system::System> {
+    seed: u64,
+) -> Vec<(crate::constraint::system::System, u64)> {
     use crate::constraint::constraints::Goal;
     use crate::constraint::solver::reduction::GoalCases;
-    let mut red = Reduction::new(ctx, case_sys);
+    // HS FreshT-threading (task #16): continue the producing branch's
+    // counter through the remaining trySolve calls of this fanned branch.
+    let mut red = Reduction::new_inheriting(ctx, case_sys, seed);
     // HS-faithful: do NOT call subst_system here.  HS's `mapM trySolve
     // actionAtoms` runs each subsequent solveAction inside the
     // DisjT-fanned branch WITHOUT a substSystem in between — only the
@@ -2648,6 +2714,15 @@ fn drain_remaining_actions(
         });
         if goal_solved { continue; }
         let outcome = red.solve_action_goal(i, fa);
+        if tamarin_utils::env_gate!("TAM_RS_DBG_SUA") {
+            let oc = match &outcome {
+                GoalCases::Contradictory => "Contradictory".to_string(),
+                GoalCases::Linear => "Linear".to_string(),
+                GoalCases::LinearNamed(n) => format!("LinearNamed({})", n),
+                GoalCases::Cases(cs) => format!("Cases({})", cs.len()),
+            };
+            eprintln!("[SUA/drain] i={}.{} tag={:?} outcome={}", i.name, i.idx, fa.tag, oc);
+        }
         match outcome {
             GoalCases::Contradictory => {
                 mark_contradictory_labeled(&mut red, "solve_unique_actions");
@@ -2659,17 +2734,23 @@ fn drain_remaining_actions(
                 // Nested fan-out — recurse with remaining candidates.
                 let idx = remaining.iter().position(|(ii, ffa)| ii == i && ffa == fa).unwrap();
                 let next_remaining: Vec<_> = remaining[idx+1..].to_vec();
-                let mut out: Vec<crate::constraint::system::System> = Vec::new();
-                for (_name, case_sys) in cases {
+                // HS FreshT-threading (task #16): per-case branch counters
+                // recorded by `solve_action_goal` alongside its Cases.
+                let case_counters = std::mem::take(&mut red.last_case_counters);
+                let fallback_seed = red.maude.fresh_counter_peek();
+                let mut out: Vec<(crate::constraint::system::System, u64)> = Vec::new();
+                for (ci, (_name, case_sys)) in cases.into_iter().enumerate() {
                     if case_sys.eq_store.is_false() { continue; }
-                    let mut sub = drain_remaining_actions(ctx, case_sys, &next_remaining);
+                    let case_seed = case_counters.get(ci).copied().unwrap_or(fallback_seed);
+                    let mut sub = drain_remaining_actions(ctx, case_sys, &next_remaining, case_seed);
                     out.append(&mut sub);
                 }
                 return out;
             }
         }
     }
-    vec![std::mem::replace(&mut red.sys, crate::constraint::system::System::empty())]
+    let final_counter = red.maude.fresh_counter_peek();
+    vec![(std::mem::replace(&mut red.sys, crate::constraint::system::System::empty()), final_counter)]
 }
 
 /// True if the term's TOP-LEVEL symbol is the AC `Union` head —
@@ -2793,7 +2874,7 @@ fn enforce_kd_fact_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
         }
     }
     if !node_eqs.is_empty() {
-        let res = red.solve_node_id_eqs(&node_eqs);
+        let res = red.solve_node_id_eqs_broadcast(&node_eqs);
         match res {
             Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)
             | Err(_) => hit_contra = true,
@@ -3174,7 +3255,7 @@ fn enforce_edge_uniqueness_pass(red: &mut Reduction) -> ChangeIndicator {
     }
     node_eqs.retain(|e| e.lhs != e.rhs);
     if node_eqs.is_empty() { return ChangeIndicator::Unchanged; }
-    let res = red.solve_node_id_eqs(&node_eqs);
+    let res = red.solve_node_id_eqs_broadcast(&node_eqs);
     if matches!(res, Err(_) | Ok(crate::constraint::solver::reduction::SolveOutcome::Contradictory)) {
         mark_contradictory_labeled(red, "enforce_edge_uniqueness:node_id_eqs_contradictory");
         return ChangeIndicator::Changed;
@@ -4155,86 +4236,91 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
     // -------------------------------------------------------------
     // Phase 2 — process positive subterms (simpSplitPosSt analog).
     // -------------------------------------------------------------
-    // Classify every positive constraint by the trivial-true/false
-    // rules from Haskell `Theory.Tools.SubtermStore.isTrueFalse`
-    // (SubtermStore.hs:334-352):
-    //   - small ⊏ small        → False (contradiction)
-    //   - small ⊏ Con _        → False (constants have no subterms)
-    //   - small ⊏ Var _ (pub/fresh) → False (atoms have no subterms)
-    //   - small `redElem` big   → True (small appears in big not below reducible)
-    //
-    // True constraints get moved to `solved_subterms`; False constraints
-    // turn the store contradictory.
+    // Drive every positive constraint off its ONE-STEP split, exactly
+    // as Haskell `simpSplitPosSt` (SubtermStore.hs:170-183) does with
+    // `splitSubterm reducible True` (noRecurse).  `step_split` runs
+    // `is_true_false` first, so the trivial cases surface as:
+    //   Some([True_])  — trivially true  → toRemoveAsTrue (HS:176,179);
+    //                    pair leaves the live set (RS keeps a
+    //                    `propagated` copy in solved_subterms).
+    //   Some([])       — trivially false (incl. small == big) →
+    //                    isContradictory ||= [] ∈ splits (HS:181).  The
+    //                    pair REMAINS in posSubterms — HS removes ONLY
+    //                    the [TrueD] case — and it IS a goal, since
+    //                    `[] ∉ [[TrueD],[SubtermD x]]` (HS:174).
+    //   None           — step = Nothing ⇒ splitSubterm = [SubtermD self]
+    //                    ⇒ unsplittable: pair stays, NO goal.
+    //   Some(other)    — real decomposition ⇒ SubtermG goal (HS:174)
+    //                    plus the arity-one-deduction check (HS:177).
     let mut kept: Vec<crate::tools::subterm_store::SubtermConstraint> = Vec::new();
-    let mut solved: Vec<crate::tools::subterm_store::SubtermConstraint> =
+    let solved: Vec<crate::tools::subterm_store::SubtermConstraint> =
         std::mem::take(&mut red.sys.subterm_store_mut().solved_subterms);
     let mut subs = std::mem::take(&mut red.sys.subterm_store_mut().subterms);
     // sst0 — `posSubterms \ solvedSubterms` (HS SubtermStore.hs:146):
     // a substitution may have rewritten a live subterm into one that
     // is already solved.
     subs.retain(|c| !solved.iter().any(|x| x.small == c.small && x.big == c.big));
+    // `splittableSubterms` (HS SubtermStore.hs:174) — the SubtermG goal
+    // list handed back to `simpSubterms` for goal reconciliation below.
+    let mut subterm_goals: Vec<crate::constraint::constraints::Goal> = Vec::new();
     for c in subs {
-        // small ⊏ small → contradiction
-        if c.small == c.big { contradictory = true; changed = ChangeIndicator::Changed; continue; }
-        match is_true_false(&c.small, &c.big) {
-            Some(false) => {
+        let split = step_split(&reducible, &is_true_false, &mut mk_fresh,
+            &c.small, &c.big);
+        match split {
+            Some(ref entries)
+                if entries.len() == 1 && matches!(entries[0], Split::True_) =>
+            {
+                // toRemoveAsTrue (HS:176,179): the pair is DELETED from
+                // posSubterms and goes NOWHERE — HS's solvedSubterms is
+                // populated only by `solveSubtermGoal` (a solved proof
+                // goal), never by the trivially-true simp path.  Moving
+                // it to solved_subterms here rendered a spurious
+                // `Solved Subterms: 1. …` section HS doesn't show.
+                changed = ChangeIndicator::Changed;
+            }
+            Some(ref entries) if entries.is_empty() => {
                 contradictory = true;
                 changed = ChangeIndicator::Changed;
-                continue;
+                subterm_goals.push(crate::constraint::constraints::Goal::Subterm(
+                    (c.small.clone(), c.big.clone())));
+                kept.push(c);
             }
-            Some(true) => {
-                let mut c2 = c.clone();
-                c2.propagated = true;
-                if !solved.iter().any(|x| x.small == c2.small && x.big == c2.big) {
-                    solved.push(c2);
-                }
-                changed = ChangeIndicator::Changed;
-                continue;
-            }
-            None => {}
-        }
-        // arity-one-deduction (SubtermStore.hs:177): a single-level
-        // recurse step that yields exactly `[SubtermD st, EqualD (l,r)]`
-        // for some sub-pair, and where `st ∈ negSubterms`, emits
-        // `l = r` as an equality formula.  HS uses sorted-list pattern
-        // matching with SubtermD < EqualD (SubtermSplit.Ord, SubtermStore.hs:250).
-        if let Some(splits) = step_split(&reducible, &is_true_false, &mut mk_fresh,
-            &c.small, &c.big) {
-            // sort by SubtermD < EqualD
-            let mut ss = splits.clone();
-            ss.sort_by_key(|s| match s {
-                Split::SubD(_,_) => 0,
-                Split::EqD(_,_) => 1,
-                Split::NatD(_,_) => 2,
-                Split::AcNewVar(_,_,_) => 3,
-                Split::True_ => 4,
-            });
-            if let (Some(Split::SubD(s1, b1)), Some(Split::EqD(s2, b2))) =
-                (ss.first(), ss.get(1)) {
-                if ss.len() == 2 && s1 == s2 && b1 == b2 {
-                    // st = (s1, b1)
-                    let st_pair = (s1.clone(), b1.clone());
-                    if red.sys.subterm_store.neg_subterms.binary_search(&st_pair).is_ok() {
-                        // emit l = r as positive equality
-                        let atom = mk_eq_atom(s1, b1);
-                        let f = crate::guarded::Guarded::Atom(atom);
-                        if !new_formulas.contains(&f) {
-                            new_formulas.push(f);
-                            changed = ChangeIndicator::Changed;
+            None => kept.push(c),
+            Some(splits) => {
+                subterm_goals.push(crate::constraint::constraints::Goal::Subterm(
+                    (c.small.clone(), c.big.clone())));
+                // arity-one-deduction (SubtermStore.hs:177): a single-level
+                // recurse step that yields exactly `[SubtermD st, EqualD (l,r)]`
+                // for some sub-pair, and where `st ∈ negSubterms`, emits
+                // `l = r` as an equality formula.  HS uses sorted-list pattern
+                // matching with SubtermD < EqualD (SubtermSplit.Ord, SubtermStore.hs:250).
+                let mut ss = splits.clone();
+                ss.sort_by_key(|s| match s {
+                    Split::SubD(_,_) => 0,
+                    Split::EqD(_,_) => 1,
+                    Split::NatD(_,_) => 2,
+                    Split::AcNewVar(_,_,_) => 3,
+                    Split::True_ => 4,
+                });
+                if let (Some(Split::SubD(s1, b1)), Some(Split::EqD(s2, b2))) =
+                    (ss.first(), ss.get(1)) {
+                    if ss.len() == 2 && s1 == s2 && b1 == b2 {
+                        // st = (s1, b1)
+                        let st_pair = (s1.clone(), b1.clone());
+                        if red.sys.subterm_store.neg_subterms.binary_search(&st_pair).is_ok() {
+                            // emit l = r as positive equality
+                            let atom = mk_eq_atom(s1, b1);
+                            let f = crate::guarded::Guarded::Atom(atom);
+                            if !new_formulas.contains(&f) {
+                                new_formulas.push(f);
+                                changed = ChangeIndicator::Changed;
+                            }
                         }
                     }
                 }
-            }
-            // If step returned Just [] ⇒ contradictory (handled by
-            // the Some(false) branch above via is_true_false; defensive
-            // re-check for the AC-flat-empty case).
-            if splits.is_empty() {
-                contradictory = true;
-                changed = ChangeIndicator::Changed;
-                continue;
+                kept.push(c);
             }
         }
-        kept.push(c);
     }
     red.sys.invalidate_max_var_idx_cache();
     red.sys.subterm_store_mut().subterms = kept;
@@ -4278,6 +4364,23 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
     }
 
     // -------------------------------------------------------------
+    // Phase 3b — CR-rule S_chain (HS simpSubtermStore, SubtermStore.hs:150):
+    // `isContradictory ||= hasSubtermCycle reducible sst3` runs BETWEEN
+    // negativeSubtermVars and simpNatCycles.  The cyclic pairs REMAIN in
+    // the store (only the flag is set) — since trivially-false pairs are
+    // now retained too (phase 2), a cycle such as `a ⊏ a` keeps its edge
+    // and must be flagged here, matching HS's rendered
+    // `Contradictory: yes` header.
+    // -------------------------------------------------------------
+    if !contradictory
+        && crate::tools::subterm_store::has_subterm_cycle(
+            &reducible, &red.sys.subterm_store)
+    {
+        contradictory = true;
+        changed = ChangeIndicator::Changed;
+    }
+
+    // -------------------------------------------------------------
     // Phase 4 — simpNatCycles (HS SubtermStore.hs:206-211).
     // UTVPI cycle-detection on the nat-subterm fragment of posSubterms.
     // Returns either:
@@ -4285,9 +4388,10 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
     //   - Ok(eqs) ⇒ list of `(l, r)` pairs to emit as `EqE l r`
     //     positive equality formulas.
     // HS evaluates this on the full (mutated) posSubterms after the
-    // pos/neg/negVar phases.
+    // pos/neg/negVar phases, UNCONDITIONALLY — even on an
+    // already-contradictory store (simpSubtermStore has no gate).
     // -------------------------------------------------------------
-    if !contradictory {
+    {
         let pos_pairs: Vec<(tamarin_term::lterm::LNTerm, tamarin_term::lterm::LNTerm)> =
             red.sys.subterm_store.subterms.iter()
                 .map(|c| (c.small.clone(), c.big.clone()))
@@ -4310,6 +4414,44 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
         }
     }
 
+    // -------------------------------------------------------------
+    // Goal reconciliation — HS `simpSubterms` (Simplify.hs:683-691).
+    // ONLY when the split pass produced a non-empty goal list ("if the
+    // goals are [] then no goals have to be removed, as subterms cannot
+    // go from splittable to unsplittable", SubtermStore.hs:167):
+    //   goalsToRemove = OPEN SubtermG goals ∉ `subterm_goals`
+    //   goalsToAdd    = `subterm_goals` ∉ sGoals (any status)
+    // Insertion draws nrs from the same monotone goal counter as every
+    // other goal, which is what places e.g. `a ⊏ a // nr: 1` between
+    // the formula-decomposition goals exactly where HS numbers it.
+    // (HS iterates posSubterms in Set-Ord order; RS in insertion order —
+    // an nr-order deviation only when ONE pass yields MULTIPLE new
+    // subterm goals; same caveat class as the store-section ordering
+    // note in pretty_system.rs.)
+    // -------------------------------------------------------------
+    if !subterm_goals.is_empty() {
+        use crate::constraint::constraints::Goal;
+        let to_remove: Vec<Goal> = red.sys.goals.iter()
+            .filter(|(g, st)| !st.solved && matches!(g, Goal::Subterm(_)))
+            .filter(|(g, _)| !subterm_goals.contains(g))
+            .map(|(g, _)| g.clone())
+            .collect();
+        let to_add: Vec<Goal> = subterm_goals.iter()
+            .filter(|g| !red.sys.goals.iter().any(|(eg, _)| eg == *g))
+            .cloned()
+            .collect();
+        if !to_remove.is_empty() || !to_add.is_empty() {
+            changed = ChangeIndicator::Changed;
+        }
+        for g in &to_remove {
+            red.sys.invalidate_max_var_idx_cache();
+            red.sys.goals_mut().retain(|(eg, _)| eg != g);
+        }
+        for g in to_add {
+            red.insert_goal(g);
+        }
+    }
+
     if contradictory {
         red.sys.subterm_store_mut().contradictory = true;
     }
@@ -4325,6 +4467,9 @@ fn propagate_subterm_obvious(red: &mut Reduction) -> ChangeIndicator {
     // in `_negSubterms`; we mirror the same single-pass placement by
     // keeping the formula in `sys.formulas` only.
     for f in new_formulas {
+        // Stored-state boundary (150f5eba): normalise before the dedup
+        // check and the push, so the comparison is normal-to-normal.
+        let f = crate::guarded::normalise_stored_formula(&f);
         if !red.sys.formulas.contains(&f) && !red.sys.solved_formulas.contains(&f) {
             red.sys.invalidate_max_var_idx_cache();
             red.sys.formulas.push(f);

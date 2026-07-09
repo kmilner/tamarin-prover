@@ -16,6 +16,7 @@ tamarin-utils = { workspace = true }
 tamarin-term = { workspace = true }
 tamarin-theory = { workspace = true }
 tamarin-parser = { workspace = true }
+tamarin-sapic = { workspace = true }
 
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "matched-path", "tracing", "form", "query", "multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "sync", "time", "fs"] }

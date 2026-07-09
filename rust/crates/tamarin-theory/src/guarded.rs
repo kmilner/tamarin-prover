@@ -554,8 +554,8 @@ pub fn reducible_formula(fm: &Guarded) -> bool {
 }
 
 /// Smart `Conj` — recursively flatten nested `Conj`s and short-circuit.
-/// HS-faithful: mirrors Haskell `gconj` (Guarded.hs:413-421), whose
-/// helper `flatten (GConj conj) = concatMap flatten $ getConj conj`
+/// HS-faithful: mirrors Haskell `gconj` (Guarded.hs), whose helper
+/// `flatten (GConj conj) = concatMap flatten $ getConj conj`
 /// recursively unwraps every level of nested conjunction.  Must flatten
 /// EVERY level (not just one): a binary-And chain parsed as
 /// `Conj(Conj(Conj(a, b), c), d)` must collapse to a single 4-item Conj,
@@ -579,17 +579,16 @@ pub fn gconj(items: Vec<Guarded>) -> Guarded {
     for it in items {
         if flatten(it, &mut out) { return gfalse(); }
     }
-    // HS-faithful: the `[gf] -> gf` singleton unwrap is matched on the
-    // FLATTENED, non-nubbed list (Guarded.hs:414), and `nub` is applied
-    // only in the otherwise branch (`GConj $ Conj $ nub gfs`,
-    // Guarded.hs:418).  So `gconj [a,a]` flattens to `[a,a]` (not a
-    // singleton) and yields `Conj (nub [a,a]) = Conj [a]`, NOT bare `a`.
-    if out.len() == 1 { return out.into_iter().next().unwrap(); }
-    // Mirror Haskell `gconj`'s `nub gfs` (Guarded.hs:418).
+    // HS-faithful: mirror `gconj`'s `nub` BEFORE the `[gf] -> gf`
+    // singleton unwrap, so the result is a fixpoint of `gconj` itself:
+    // `gconj [a, a]` must be `a`, not the non-normal singleton `Conj [a]`
+    // that only a second application would unwrap.  `normalise_guarded`
+    // relies on this one-pass idempotence.
     let mut deduped: Vec<Guarded> = Vec::with_capacity(out.len());
     for x in out {
         if !deduped.contains(&x) { deduped.push(x); }
     }
+    if deduped.len() == 1 { return deduped.into_iter().next().unwrap(); }
     Guarded::Conj(deduped)
 }
 
@@ -948,6 +947,68 @@ pub fn subst_free_guarded(g: &Guarded, s: &[(p::VarSpec, u32)]) -> Guarded {
         }
     }
     rec(g, s, 0)
+}
+
+/// Rebuild a guarded formula bottom-up through the `gconj`/`gdisj` smart
+/// constructors, restoring the normal form that formula conversion
+/// (`convert`) establishes at creation: flattened, duplicate-free
+/// connectives.  Port of HS `normaliseGuarded` (150f5eba).
+/// NOTE: disjunctions are normalised CONSTRUCTOR-PRESERVING at every
+/// level (`normalise_disj_list`), not via the full `gdisj`: a singleton
+/// disjunction wrapping a conjunction is load-bearing for the S_∀
+/// saturation dedup — `insert_formula` STORES disjunctions (formula +
+/// `Goal::Disj` twin) but DECOMPOSES bare conjunctions without storing
+/// them, so unwrapping the singleton turns a storable, dedupable derived
+/// instance into one that re-fires every simplifier iteration (livelock
+/// on ake/bilinear/TAK1_eCK_like.spthy).  Conjunctions use the full
+/// `gconj` (their singleton unwrap is harmless because conjunctions are
+/// decomposed on insertion anyway); this requires `gconj` to be
+/// idempotent — see the note on `gconj`.  Mirrors HS 150f5eba + follow-up.
+pub fn normalise_guarded(g: &Guarded) -> Guarded {
+    match g {
+        Guarded::Atom(_) => g.clone(),
+        Guarded::Disj(items) => Guarded::Disj(normalise_disj_list(items)),
+        Guarded::Conj(items) => gconj(items.iter().map(normalise_guarded).collect()),
+        Guarded::GGuarded { qua, vars, guards, body } => Guarded::GGuarded {
+            qua: qua.clone(),
+            vars: vars.clone(),
+            guards: guards.clone(),
+            body: Box::new(normalise_guarded(body)),
+        },
+    }
+}
+
+/// Normalise the disjunct list of a stored disjunction WITHOUT changing
+/// its constructor: each disjunct normalised, nested disjunctions
+/// flattened one level, duplicates dropped — but no singleton unwrap and
+/// no truth-value absorption, so a `Guarded::Disj` formula and its
+/// `Goal::Disj` twin (same payload, different wrapper) stay in LOCKSTEP.
+/// Port of HS `normaliseDisjList` (150f5eba); see that commit for why
+/// full `gdisj` here desynchronises the twin stores (gcm livelock).
+pub fn normalise_disj_list(items: &[Guarded]) -> Vec<Guarded> {
+    fn push(g: Guarded, out: &mut Vec<Guarded>) {
+        if !out.contains(&g) { out.push(g); }
+    }
+    let mut out: Vec<Guarded> = Vec::new();
+    for it in items {
+        match normalise_guarded(it) {
+            Guarded::Disj(ds) => for d in ds { push(d, &mut out); },
+            g => push(g, &mut out),
+        }
+    }
+    out
+}
+
+/// Normalise a formula for storage in the constraint system: full
+/// smart-constructor normal form, except that a TOP-LEVEL disjunction
+/// keeps its `Disj` constructor (via `normalise_disj_list`) so it stays
+/// in lockstep with its `Goal::Disj` twin.  Port of HS
+/// `normaliseStoredFormula` (150f5eba).
+pub fn normalise_stored_formula(g: &Guarded) -> Guarded {
+    match g {
+        Guarded::Disj(items) => Guarded::Disj(normalise_disj_list(items)),
+        _ => normalise_guarded(g),
+    }
 }
 
 /// Mirror HS `substBound :: [(Integer, LVar)] -> LGuarded c -> LGuarded c`.
@@ -1966,6 +2027,23 @@ pub fn max_var_idx(g: &Guarded) -> u64 {
     m
 }
 
+/// Minimum idx over all `BVar::Free` leaves of a guarded formula, or
+/// `None` when the formula has no free variables.  The min-side twin of
+/// [`max_var_idx`] — needed by HS `boundsVarIdx` mirrors (LTerm.hs:650-651
+/// folds frees with `minMaxSingleton`), e.g. the `matchToGoal`
+/// whole-source `rename` rebase in `sources.rs`.
+pub fn min_var_idx(g: &Guarded) -> Option<u64> {
+    // Reuse `map_lvars_in_guarded`'s Free-leaf walk as a side-effect
+    // visitor so the leaf coverage stays in lockstep with the mapper
+    // used by the freshen/shift passes.
+    let mut m: Option<u64> = None;
+    let _ = map_lvars_in_guarded(g, |v: &tamarin_parser::ast::VarSpec| {
+        m = Some(m.map_or(v.idx, |c| c.min(v.idx)));
+        v.clone()
+    });
+    m
+}
+
 /// `gnot`: structural negation of a guarded formula.
 ///   - `Atom a`        → `gnot_atom a`
 ///   - `Disj xs`       → `Conj (map gnot xs)`
@@ -2866,6 +2944,17 @@ mod tests {
             }
             _ => panic!("expected Conj"),
         }
+    }
+
+    /// Dedup happens BEFORE the singleton unwrap: `gconj([a, a])` must be
+    /// `a` itself, not the non-normal singleton `Conj([a])` that only a
+    /// second application would unwrap.  `normalise_guarded` relies on
+    /// this one-pass idempotence (mirrors HS `gconj`).
+    #[test]
+    fn gconj_duplicates_collapse_to_bare_item() {
+        let a = g("Last(#i)").unwrap();
+        let out = gconj(vec![a.clone(), a.clone()]);
+        assert_eq!(out, a, "gconj must dedupe before the singleton unwrap");
     }
 
     /// `gdisj` deduplicates syntactically-equal items.  Same as above,

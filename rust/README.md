@@ -30,7 +30,7 @@ volatile header lines (Git revision, compile time, processing time).
 The parity gate (`scripts/corpus_file_diff.sh`, corpus in
 `scripts/parity_corpus.txt`) compares the Rust port against the Haskell prover
 on a 454-file corpus: the theories under `examples/` that use only ported
-features and that Haskell proves within a 300 s/lemma cap. This spans
+features and that Haskell proves within a 300 s per-theory cap. This spans
 `classic/`, `ake/`, `sp14/`, the `csf*/` series, `features/`, `loops/`,
 `post17/`, `regression/`, `related_work/`, the multiset-rewrite theories in
 `csf18-xor/`, `jcs19-xor/`, `idbased/`, `eurosp19-eccDAA/`,
@@ -52,11 +52,33 @@ observational equivalence (`--diff`) — or exercise searches that Haskell itsel
 does not finish. Observational-equivalence (`--diff`) theories re-enter once that
 mode is ported.
 
+Stored proofs are validated, not just displayed: loading a proof-carrying file
+runs the same proof-checking pass as the Haskell prover, replaying every stored
+step against a freshly derived constraint system (`--prove` additionally
+re-derives pruned or unverified subtrees). Proof files are cross-compatible in
+both directions — a proof exported by either prover parses, replays, and
+validates on the other, with byte-identical analysis output from either
+loader.
+
+The interactive web UI (`interactive` subcommand) is verified against the
+Haskell server by a semantic crawl gate (`scripts/web_parity.sh`): both
+servers are booted on the same theory, every proof-tree, constraint-system,
+graph and source page is crawled — autoproving each lemma along the way —
+and compared after normalisation. Across the crawlable corpus (≈380
+theories, ≈120,000 pages) the two UIs agree page-for-page except for a
+small documented residue that renders *identical* proof states with
+different internal counter values: fresh-variable witness indices and
+goal-creation numbers shown in constraint-system diagnostic views, plus the
+graph renderer's term-abbreviation picks on a few AC-heavy theories. These
+stem from Haskell's Maude round-trip emitting redundant identity unifiers
+that the Rust port resolves inline; they never appear in proof scripts,
+proof structure, or verdicts.
+
 ## Performance
 
 Wall-clock time and peak memory for both provers on seven representative
-theories, proving all lemmas (`--derivcheck-timeout=30`) on aarch64 Linux
-(GHC 9.6.7, Maude 3.5.1). Haskell runs at `+RTS -N{1,4,16}`, the Rust port at
+theories, proving all lemmas (`--derivcheck-timeout=30`) on x86_64 Linux,
+24 cores (GHC 9.6.7, Maude 3.5.1). Haskell runs at `+RTS -N{1,4,16}`, the Rust port at
 `--processors={1,4,16}`. The theories are `NSPK3` (classic protocol), `Joux`
 (bilinear pairing), `stateverif_left_right` (SAPiC, auto-sources), `Yubikey`
 (SAPiC `process:` frontend — pure-state + multiset counters), `gcm` (key
@@ -83,49 +105,49 @@ The RS columns show the % change vs HS in parentheses (negative = faster / less
 memory). Tune the theory set / core counts / binaries via the FILES, CORES,
 TIMEOUT, DERIV, HS_PATH, RS_PATH env vars (see the scripts/bench.sh header).
 -->
-<!-- last run: aarch64 Linux, 16 cores -->
+<!-- last run: x86_64 Linux, 24 cores -->
 
 **1 core**
 
 | Theory | HS time | RS time | HS memory | RS memory |
 |--------|--------:|--------:|----------:|----------:|
-| `NSPK3` | 0.9 s | 0.3 s (-67%) | 65 MB | 16 MB (-75%) |
-| `Joux` | 6.7 s | 3.9 s (-42%) | 244 MB | 42 MB (-83%) |
-| `stateverif_left_right` | 11.1 s | 2.5 s (-77%) | 863 MB | 49 MB (-94%) |
-| `Yubikey` | 14.5 s | 2.8 s (-81%) | 290 MB | 45 MB (-84%) |
-| `gcm` | 42.8 s | 10.2 s (-76%) | 1298 MB | 106 MB (-92%) |
-| `wireguard` | 37.9 s | 8.5 s (-78%) | 1183 MB | 50 MB (-96%) |
-| `CCITT_X509_3` | 138.7 s | 45.0 s (-68%) | 2406 MB | 297 MB (-88%) |
+| `NSPK3` | 2.3 s | 0.8 s (-65%) | 63 MB | 18 MB (-71%) |
+| `Joux` | 18.3 s | 8.0 s (-56%) | 233 MB | 41 MB (-82%) |
+| `stateverif_left_right` | 28.8 s | 7.2 s (-75%) | 867 MB | 48 MB (-94%) |
+| `Yubikey` | 37.4 s | 8.3 s (-78%) | 281 MB | 46 MB (-84%) |
+| `gcm` | 94.9 s | 30.4 s (-68%) | 1233 MB | 99 MB (-92%) |
+| `wireguard` | 99.6 s | 16.8 s (-83%) | 1211 MB | 46 MB (-96%) |
+| `CCITT_X509_3` | 372.6 s | 100.3 s (-73%) | 2499 MB | 299 MB (-88%) |
 
 **4 cores**
 
 | Theory | HS time | RS time | HS memory | RS memory |
 |--------|--------:|--------:|----------:|----------:|
-| `NSPK3` | 0.5 s | 0.2 s (-60%) | 94 MB | 26 MB (-72%) |
-| `Joux` | 5.8 s | 3.9 s (-33%) | 276 MB | 44 MB (-84%) |
-| `stateverif_left_right` | 6.6 s | 1.6 s (-76%) | 875 MB | 81 MB (-91%) |
-| `Yubikey` | 9.4 s | 2.0 s (-79%) | 305 MB | 76 MB (-75%) |
-| `gcm` | 32.6 s | 4.6 s (-86%) | 1326 MB | 214 MB (-84%) |
-| `wireguard` | 22.8 s | 4.1 s (-82%) | 1280 MB | 77 MB (-94%) |
-| `CCITT_X509_3` | 64.5 s | 12.0 s (-81%) | 4395 MB | 539 MB (-88%) |
+| `NSPK3` | 1.2 s | 0.5 s (-58%) | 84 MB | 28 MB (-67%) |
+| `Joux` | 15.4 s | 7.7 s (-50%) | 275 MB | 46 MB (-83%) |
+| `stateverif_left_right` | 17.3 s | 4.3 s (-75%) | 840 MB | 86 MB (-90%) |
+| `Yubikey` | 24.2 s | 6.0 s (-75%) | 294 MB | 78 MB (-73%) |
+| `gcm` | 70.3 s | 12.6 s (-82%) | 1302 MB | 212 MB (-84%) |
+| `wireguard` | 61.4 s | 8.6 s (-86%) | 1262 MB | 82 MB (-94%) |
+| `CCITT_X509_3` | 153.5 s | 26.3 s (-83%) | 4538 MB | 532 MB (-88%) |
 
 **16 cores**
 
 | Theory | HS time | RS time | HS memory | RS memory |
 |--------|--------:|--------:|----------:|----------:|
-| `NSPK3` | 0.5 s | 0.3 s (-40%) | 145 MB | 36 MB (-75%) |
-| `Joux` | 6.7 s | 4.0 s (-40%) | 335 MB | 57 MB (-83%) |
-| `stateverif_left_right` | 7.9 s | 1.7 s (-78%) | 842 MB | 120 MB (-86%) |
-| `Yubikey` | 11.3 s | 2.1 s (-81%) | 389 MB | 163 MB (-58%) |
-| `gcm` | 31.4 s | 4.2 s (-87%) | 1378 MB | 334 MB (-76%) |
-| `wireguard` | 21.8 s | 3.8 s (-83%) | 1369 MB | 131 MB (-90%) |
-| `CCITT_X509_3` | 67.9 s | 4.9 s (-93%) | 5598 MB | 666 MB (-88%) |
+| `NSPK3` | 1.2 s | 0.8 s (-33%) | 131 MB | 39 MB (-70%) |
+| `Joux` | 16.3 s | 8.2 s (-50%) | 325 MB | 57 MB (-82%) |
+| `stateverif_left_right` | 17.4 s | 4.4 s (-75%) | 833 MB | 119 MB (-86%) |
+| `Yubikey` | 24.2 s | 5.6 s (-77%) | 374 MB | 162 MB (-57%) |
+| `gcm` | 59.1 s | 9.1 s (-85%) | 1284 MB | 379 MB (-70%) |
+| `wireguard` | 49.0 s | 7.9 s (-84%) | 1333 MB | 133 MB (-90%) |
+| `CCITT_X509_3` | 142.9 s | 8.7 s (-94%) | 6041 MB | 741 MB (-88%) |
 
 <!-- BENCH:END -->
 
 Memory is the maximum resident set of the prover process; Maude runs as a
 separate subprocess on both sides and is excluded. Across all theories and core
-counts the Rust port is faster, and uses several-fold less memory — from ≈4–24×
+counts the Rust port is faster, and uses several-fold less memory — from ≈4–26×
 at one core down to ≈2–10× at sixteen, where lemma-level parallelism keeps
 several constraint systems live at once.
 
@@ -152,7 +174,8 @@ are computed once and reused across all of a theory's lemmas (`gcm`, `Yubikey`).
   functions and equations.
 - **Solver:** full constraint-system port — simplification, source
   refinement/saturation, chain extension, contradiction detection, induction,
-  stored-proof replay, and AC-modulo unification via pooled Maude.
+  stored-proof replay with plain-load proof validation, and AC-modulo
+  unification via pooled Maude.
 - **`--auto-sources`:** automatic sources-lemma generation — annotates rules
   with `AUTO_IN_*`/`AUTO_OUT_*` actions and synthesises the `AUTO_typing`
   sources lemma when the refined sources contain partial deconstructions
@@ -174,8 +197,8 @@ are computed once and reused across all of a theory's lemmas (`gcm`, `Yubikey`).
   `--oracle-only`, `--processors`, `--maude-processes`, `--derivcheck-timeout`,
   `-D` defines, `--parse-only`, `--precompute-only`, `-O/--output`, `--quiet`,
   `-v/--verbose`, `--quit-on-warning`; exit codes and summary lines mirror HS.
-- **Subcommands:** `interactive` (HTTP server), `variants` (DH intruder-rule
-  dump), `test` (install self-check).
+- **Subcommands:** `interactive` (HTTP server), `variants` (DH/BP
+  intruder-rule variants dump), `test` (install self-check).
 
 ## Not yet ported
 
@@ -207,6 +230,8 @@ crates/
 scripts/
   diff_proof_raw.sh       per-lemma raw HS↔RS --prove diff (exit 0 = identical)
   corpus_file_diff.sh     per-file corpus parity gate vs cached HS → RESULTS_TSV
+  web_parity.sh           interactive-mode parity gate (boot + crawl + semantic diff)
+  web_crawl.py …          crawler / page canonicaliser / differ used by web_parity.sh
   file_flags.tsv          canonical per-file flags for theories needing them
   bench.sh                RS-vs-HS wall-clock + memory tables
 tests/                    cross-crate integration fixtures
@@ -220,6 +245,7 @@ Parity against Haskell is the correctness gate:
 cd rust
 scripts/diff_proof_raw.sh ../examples/classic/NSPK3.spthy injective_agree   # one lemma
 RESULTS_TSV=/tmp/gate.tsv ALLOWLIST=<filelist> scripts/corpus_file_diff.sh  # corpus gate (cached HS)
+RESULTS_TSV=/tmp/web.tsv  ALLOWLIST=<filelist> scripts/web_parity.sh        # interactive-mode parity (crawl + semantic diff)
 cargo test                                                                  # Rust unit + integration
 ```
 

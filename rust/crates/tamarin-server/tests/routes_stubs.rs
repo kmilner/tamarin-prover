@@ -30,14 +30,15 @@ fn one_key_set(k: &str) -> std::collections::BTreeSet<String> {
 // ---------------------------------------------------------------------
 // Graph routes — now LIVE (DOT pipeline).
 //
-// `intdot` and `interactive-graph-def` return DOT source as
-// `text/plain`. `graph` returns SVG (or DOT as fallback when `dot`
-// is missing).  All three rely on a System lookup for the path; for
-// paths without a system (e.g. `lemma/<x>`) they return a
-// placeholder — never 501.
+// `intdot` returns the HS `intdotLayout` HTML shell page (a
+// `<dot-graph-viz>` pointing at `interactive-graph-def`);
+// `interactive-graph-def` returns the raw DOT source; `graph` returns
+// SVG (or DOT fallback when `dot` is missing).  `intdot` is
+// system-agnostic (HS `getInteractiveDotGraphR` only does `withTheory`),
+// so it returns the shell for any valid idx+path.
 // ---------------------------------------------------------------------
 #[tokio::test]
-async fn test_intdot_returns_dot_text() {
+async fn test_intdot_returns_html_shell() {
     let s = start_server_with_theory("issue193.spthy").await;
     let res = s
         .client
@@ -47,9 +48,10 @@ async fn test_intdot_returns_dot_text() {
         .expect("send");
     assert_eq!(res.status(), 200);
     let body = res.text().await.expect("text");
-    // Even when the path has no system, we emit a placeholder
-    // `digraph G { … }` so the frontend's viz.js doesn't choke.
-    assert!(body.contains("digraph"));
+    // HS returns the shell page regardless of whether the path has a
+    // system — the `<dot-graph-viz>` fetches the DOT lazily.
+    assert!(body.contains("<dot-graph-viz"),
+        "intdot must return the HTML shell; got: {}", &body[..body.len().min(200)]);
 }
 
 #[tokio::test]

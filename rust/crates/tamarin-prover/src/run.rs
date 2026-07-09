@@ -224,82 +224,36 @@ fn run_variants(args: &Args) -> Result<i32, RunError> {
         eprintln!(" checking version: {}. OK.", v);
         eprintln!(" checking installation: OK.");
     }
-    // KNOWN GAP: this enumerates the DH intruder rule variants only.  HS
-    // (Intruder.hs:49-53) additionally generates the bilinear-pairing
-    // variants via `bpIntruderRules False` on a SEPARATE bpMaudeSig handle
-    // and concatenates them after the DH block (the full HS stdout is 126
-    // `rule (modulo AC)` lines).  Porting that requires a Maude-querying
-    // `bp_intruder_rules` generator (mirroring HS bpIntruderRules,
-    // IntruderRules.hs:384-392) — NOT the cached-file parser
-    // `mk_bp_intruder_variants`, which is a different code path.  The
-    // `variants` subcommand is not exercised by the example corpus.  HS's
-    // pretty-printer also HughesPJ-line-wraps wide rules (`-->` on its own
-    // line), which the single-line printer below does not reproduce.
-    let rules = tamarin_theory::intruder_rules::dh_intruder_rules(false, &maude);
-    // Mirror HS `Theory.Model.Rule.prettyIntrRuleACInfo`
-    // (Theory/Model/Rule.hs:1233-1234) naming:
-    //   ConstrRule "_exp"    → prefixIfReserved("c" ++ "_exp") → "c_exp"
-    //   DestrRule  "_exp"... → prefixIfReserved("d" ++ "_exp") → "d_exp"
-    // HS wildcards the three numeric DestrRule fields (the remaining-apps
-    // counter is NEVER rendered into the name; the `d_NAME_i` form is the
-    // commented-out line Rule.hs:1235), then wraps in `prefixIfReserved`,
-    // which prepends `_` only for reserved rule names or names already
-    // starting with `_` (a no-op for `c_exp`/`d_exp`-style names).
-    let prefix_if_reserved = |n: String| -> String {
-        const RESERVED: [&str; 7] =
-            ["Fresh", "irecv", "isend", "coerce", "fresh", "pub", "iequality"];
-        if RESERVED.contains(&n.as_str()) || n.starts_with('_') {
-            format!("_{}", n)
-        } else {
-            n
-        }
-    };
-    for r in &rules {
-        use tamarin_theory::rule::IntrRuleACInfo;
-        // HS `prettyIntrRuleACInfo` (Rule.hs:1225-1234): every
-        // non-Constr/Destr variant maps to a fixed lowercase keyword.
-        // (dhIntruderRules only ever yields Constr/Destr, so these arms are
-        // defensive — but they remove the latent `{:?}` Debug divergence.)
-        let name = match &r.info {
-            IntrRuleACInfo::ConstrRule(n) =>
-                prefix_if_reserved(format!("c{}", String::from_utf8_lossy(n))),
-            IntrRuleACInfo::DestrRule(n, _, _, _) =>
-                prefix_if_reserved(format!("d{}", String::from_utf8_lossy(n))),
-            IntrRuleACInfo::IRecv => "irecv".to_string(),
-            IntrRuleACInfo::ISend => "isend".to_string(),
-            IntrRuleACInfo::Coerce => "coerce".to_string(),
-            IntrRuleACInfo::FreshConstr => "fresh".to_string(),
-            IntrRuleACInfo::PubConstr => "pub".to_string(),
-            IntrRuleACInfo::NatConstr => "nat".to_string(),
-            IntrRuleACInfo::IEquality => "iequality".to_string(),
-        };
-        // HS `prettyIntrRuleAC` (Rule.hs:1324) uses `kwRuleModulo "AC"` =
-        // "rule (modulo AC)" UNCONDITIONALLY for every intruder rule — there
-        // is no bare "rule" case.
-        let kind = "rule (modulo AC)";
-        println!();
-        println!("{} {}:", kind, name);
-        // Pretty-print each fact as `Tag(term, term, …)` using
-        // `tamarin_term::pretty::pretty_lnterm` for argument terms.
-        // Mirrors HS `prettyLNFact` for the variants command.
-        let fmt_fact = |f: &tamarin_theory::fact::LNFact| -> String {
-            // HS `showFactTag` (Fact.hs:516-523): factTagName + `!` for
-            // persistent.  Use the canonical table rather than re-hardcoding it.
-            let name = tamarin_theory::fact::show_fact_tag(&f.tag);
-            let args: Vec<String> = f.terms.iter()
-                .map(tamarin_term::pretty::pretty_lnterm)
-                .collect();
-            format!("{}({})", name, args.join(", "))
-        };
-        let fmt_facts = |facts: &[tamarin_theory::fact::LNFact]| -> String {
-            let parts: Vec<String> = facts.iter().map(fmt_fact).collect();
-            format!("[ {} ]", parts.join(", "))
-        };
-        println!("   {} --{}-> {}",
-            fmt_facts(&r.premises),
-            fmt_facts(&r.actions),
-            fmt_facts(&r.conclusions));
-    }
+    // HS `Main.Mode.Intruder.run` (Intruder.hs:48-53) generates BOTH the DH
+    // and the bilinear-pairing variants and emits `dhS ++ bpS`:
+    //   - DH: `dhIntruderRules False` (runtime, via Maude).  RS's runtime
+    //     generator is now byte-faithful (exactly 51 rules) after the
+    //     `remove_renamings` fix in `variants_intruder` — previously it
+    //     over-produced 53 (an extra identity-variant `d_inv` and `d_exp`).
+    //   - BP: `bpIntruderRules False` (runtime).  Like HS
+    //     (Intruder.hs:50), we start a SECOND Maude handle on
+    //     `bp_maude_sig()` and generate the 75 BP rules at runtime via
+    //     `bp_intruder_rules(false, ..)`.  This tracks the CURRENT Maude
+    //     rather than the stale cached `data/intruder_variants_bp.spthy`
+    //     (which production proving still parses via
+    //     `mk_bp_intruder_variants`); HS's `variants` command likewise
+    //     generates BP at runtime, so the two stay byte-identical.
+    let dh_rules = tamarin_theory::intruder_rules::dh_intruder_rules(false, &maude);
+    let bp_sig = tamarin_term::maude_sig::bp_maude_sig();
+    let bp_maude = MaudeHandle::start(&maude_path, bp_sig).map_err(|e| {
+        RunError(format!("failed to start maude at {:?}: {:?}", maude_path, e))
+    })?;
+    let bp_rules = tamarin_theory::intruder_rules::bp_intruder_rules(false, &bp_maude);
+    // HS `putStrLn (dhS ++ bpS)` where each block is
+    // `renderDoc . prettyIntruderVariants` (Rule.hs:1343): blank-line-separated
+    // `rule (modulo AC) NAME:` rules with HughesPJ body wrapping (`sep`/`fsep`
+    // at the standard width) and NO trailing newline — so the DH and BP blocks
+    // abut (the DH `d_inv` body directly precedes the BP `c_pmult` header with
+    // no separating newline).  `putStrLn` appends the single trailing newline.
+    let dh_s = tamarin_theory::pretty_formula::pretty_intruder_variants(&dh_rules);
+    let bp_s = tamarin_theory::pretty_formula::pretty_intruder_variants(&bp_rules);
+    print!("{}{}", dh_s, bp_s);
+    println!();
     Ok(0)
 }
 
@@ -353,6 +307,10 @@ fn run_interactive(args: &Args) -> Result<i32, RunError> {
     if let Some(b) = args.bound {
         cfg.max_steps = b as usize;
     }
+    // `-d/--derivcheck-timeout` — same default expression as the batch
+    // path's derivation-check block; previously parsed but ignored on the
+    // web path (theory_io hardcoded 5).
+    cfg.derivcheck_timeout = args.derivcheck_timeout.unwrap_or(5) as u32;
 
     // Positional args are theory files (Haskell uses a working
     // directory, but we accept either: a single dir arg, or one-or-more
@@ -369,8 +327,18 @@ fn run_interactive(args: &Args) -> Result<i32, RunError> {
     // Spin up a tokio runtime and run the server. We use a multi-thread
     // runtime so background `spawn_blocking` proof tasks don't park the
     // single executor thread.
+    //
+    // `thread_stack_size`: the web constraint-system pane is rendered as
+    // ONE HughesPJ Doc (HS `prettyNonGraphSystem = vsep …`), and the
+    // eager Doc builders (`beside`/`aboveNest`) recurse along the left
+    // operand's token spine — depth scales with the pane size.  GHC grows
+    // its stack on demand; tokio's default 2 MiB worker stacks do not, and
+    // overflowed on fact-heavy panes (UM_three_pass).  64 MiB is reserved
+    // virtual address space only (committed on use), applied to both
+    // worker and `spawn_blocking` threads.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .thread_stack_size(64 * 1024 * 1024)
         .build()
         .map_err(|e| RunError(format!("failed to build tokio runtime: {}", e)))?;
     runtime
@@ -831,8 +799,8 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         // `closeTheoryWithMaude`'s variant pre-computation
         // (ClosedTheory.hs `closeTheory`).
         if let Some(m) = file_maude.as_ref() {
-            populate_rule_variants(&mut elaborated, m,
-                file_maude_pool.as_deref());
+            tamarin_theory::tools::rule_variants::populate_rule_variants(
+                &mut elaborated, m, file_maude_pool.as_deref());
         }
 
         // Port of HS `ruleVariantsReport` / `variantsCheck`
@@ -1040,19 +1008,30 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             }
         }
 
-        // Decide which lemmas to prove. Without --prove, we never start
-        // the solver; output is just the source.
+        // Decide which lemmas to prove.  Without --prove, HS still runs
+        // the close-time `checkAndExtendProver` replay over every stored
+        // proof skeleton (`closeTheory`, Prover.hs:174-185) — a plain
+        // load VALIDATES embedded proofs and reports their real status.
+        // We mirror that whenever the file carries a stored proof tree;
+        // proofless files keep the cheap no-solver path below, whose
+        // output is identical either way (every lemma is a 1-step sorry).
         let lemma_filter: &[String] = &args.lemma_names;
         let prove_anything = args.prove_mode;
+        let any_stored_proof =
+            elaborated.lemmas().any(|l| l.proof.tree.is_some());
 
         let mut results: Vec<LemmaResult> = Vec::new();
         // Mirrors HS's per-lemma proof body for embedding in the
         // pretty-printed theory output.  Filled by the prove loop below.
         let mut proved_lemmas: Vec<tamarin_theory::pretty_theory::ProvedLemma> = Vec::new();
 
-        if !prove_anything || args.precompute_only {
-            // No proof step requested — record each lemma as Filtered
-            // / Skipped depending on whether --lemma had any effect.
+        // No proof step requested — record each lemma as Filtered
+        // / Skipped depending on whether --lemma had any effect.
+        // (Shared by the cheap branch below and the session-build
+        // failure fallback inside the prove/check branch.)
+        let push_skipped_results =
+            |results: &mut Vec<LemmaResult>,
+             elaborated: &tamarin_theory::theory::Theory| {
             for l in elaborated.lemmas() {
                 results.push(LemmaResult {
                     name: l.name.clone(),
@@ -1076,6 +1055,10 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                     ),
                 });
             }
+        };
+
+        if args.precompute_only || (!prove_anything && !any_stored_proof) {
+            push_skipped_results(&mut results, &elaborated);
         } else {
             // Reuse the per-file maude handle.  The `maude tool: ...`
             // banner is printed once at the top of the batch run (see
@@ -1167,7 +1150,12 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 // check-and-extend (replay only, no auto-proving open
                 // leaves) — which also keeps us from launching a heavy
                 // search on lemmas the user didn't ask to prove.
-                let is_target = lemma_matches(lemma_filter, &lemma_name);
+                // Without --prove this loop is HS's close-time
+                // `checkAndExtendProver` pass: EVERY lemma is non-target,
+                // so stored skeletons replay (check_and_extend) but no
+                // open leaf is auto-proved.
+                let is_target = prove_anything
+                    && lemma_matches(lemma_filter, &lemma_name);
                 // HS does NOT print a per-lemma "proving lemma X ..."
                 // marker; the only progress lines are the `[Theory X]
                 // ...` set above.  Stay quiet here for HS-faithful stderr.
@@ -1262,6 +1250,13 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
                 // sequential loop regardless of which worker finished first.
                 out.sort_by_key(|(i, _, _)| *i);
                 for (_, pl, lr) in out { proved_lemmas.push(pl); results.push(lr); }
+            } else if !prove_anything {
+                // The plain-load check pass needs the session's
+                // check_and_extend arm; the pool fallback below always
+                // auto-proves.  If the session failed to build, keep the
+                // historical no-solver behaviour instead of launching
+                // searches nobody asked for.
+                push_skipped_results(&mut results, &elaborated);
             } else {
                 for l in elaborated.lemmas() {
                     let (pl, lr) = run_lemma(l);
@@ -1285,7 +1280,8 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
         // (TheoryLoader.hs:596).  In prove mode it is emitted before the
         // prove loop (above); here it covers only the no-prove /
         // precompute-only paths, which skip that loop.
-        if !args.quiet && !args.parse_only && (!prove_anything || args.precompute_only) {
+        if !args.quiet && !args.parse_only
+            && (args.precompute_only || (!prove_anything && !any_stored_proof)) {
             eprintln!("[Theory {}] Theory closed", theory_name);
         }
 
@@ -1315,7 +1311,7 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
             git_branch: crate::cli::GIT_BRANCH.to_string(),
             compiled_at: crate::cli::BUILD_TIMESTAMP.to_string(),
         };
-        let wf_block = format_wf_block(&wf_report);
+        let wf_block = tamarin_theory::pretty_theory::format_wf_block(&wf_report);
         let body = tamarin_theory::pretty_theory::pretty_closed_theory(
             &parsed,
             &elaborated,
@@ -1352,103 +1348,6 @@ fn run_batch(args: &Args) -> Result<i32, RunError> {
     Ok(overall_status)
 }
 
-/// Format the `/* WARNING: ... */` or `/* All wellformedness checks
-/// were successful. */` block that goes BETWEEN the source body and
-/// the analysis summary.  Mirrors HS's `prettyWfErrorReport`
-/// (Wellformedness.hs:118-125).
-///
-/// Each `WfError.message` is expected to carry the FULL HS-style block
-/// for its topic: `Title\n=====\n\n<intro>\n<body>` — pre-formatted with
-/// the exact bytes HS emits, including trailing spaces from HS's
-/// `text ""` markers.  Multiple `WfError`s with the same topic are
-/// merged into one block (the per-clash bodies concatenated).  Topic
-/// groups are separated by blank lines.
-/// For the WF topics whose checks emit one header-less body per finding,
-/// return the byte-exact preamble that `prettyWfErrorReport` prints ONCE
-/// before the group's bodies: the `underlineTopic` header, plus the blank
-/// line HS's `$-$`/topic-string folds in, plus (for the sort-clash topic)
-/// the "Possible reasons" paragraph that HS appends to the topic string
-/// (Wellformedness.hs:258-273).  Returns `None` for single-entry topics,
-/// which bake their full block into the message (default path).
-fn wf_headerless_preamble(topic: &str) -> Option<String> {
-    use tamarin_parser::wf::underline_topic;
-    match topic {
-        // SAPIC-process wellformedness errors (HS `toWfErrorReport`,
-        // Warnings.hs:23-26).  Unlike the other topics, HS does NOT underline
-        // this one — `prettyWfErrorReport` renders it as a bare `text topic`
-        // (Wellformedness.hs:124).  So the per-error bodies (each
-        // `"  Variable bound twice: x."`) sit directly under a plain header.
-        "Wellformedness-error in Process" => Some(format!("{topic}\n")),
-        "Unbound variables" | "Reserved names" | "Special facts" => {
-            Some(format!("{}\n", underline_topic(topic)))
-        }
-        "Variable with mismatching sorts or capitalization" => {
-            Some(format!(
-                "{}\nPossible reasons:\n\
-                 1. Identifiers are case sensitive, i.e.,\
-                 'x' and 'X' are considered to be different.\n\
-                 2. The same holds for sorts:, \
-                 i.e., '$x', 'x', and '~x' are considered to be different.\n\n",
-                underline_topic(topic)))
-        }
-        _ => None,
-    }
-}
-
-fn format_wf_block(report: &[tamarin_parser::wf::WfError]) -> String {
-    if report.is_empty() {
-        return "/* All wellformedness checks were successful. */".to_string();
-    }
-    let mut out = String::new();
-    out.push_str("/*\nWARNING: the following wellformedness checks failed!\n\n");
-    // Group by topic, preserving FIRST-APPEARANCE order — mirrors HS's
-    // `groupOn fst` over a left-to-right concatMap-over-checks.
-    let mut topic_order: Vec<&str> = Vec::new();
-    let mut grouped: std::collections::HashMap<&str, Vec<&str>> =
-        std::collections::HashMap::new();
-    for e in report {
-        if !grouped.contains_key(e.topic.as_str()) {
-            topic_order.push(e.topic.as_str());
-        }
-        grouped.entry(e.topic.as_str()).or_default().push(&e.message);
-    }
-    for (i, topic) in topic_order.iter().enumerate() {
-        let msgs = &grouped[topic];
-        if i > 0 { out.push('\n'); }
-        // HS `prettyWfErrorReport` (Wellformedness.hs:118-125) groups by
-        // topic and renders each group as
-        //   `text topic $-$ (nest 2 . vcat . intersperse (text "") $ bodies)`
-        // — the underlineTopic header ONCE per group, then the 2-space-nested
-        // bodies separated by a 2-space blank line.  Most RS checks already
-        // pre-render the FULL block (header + indent) into a single per-topic
-        // message, and we concatenate those as-is (legacy path, unchanged).
-        //
-        // Some checks emit one HEADER-LESS body per offending rule (so the
-        // summary's `length rep` WARNING count stays HS-faithful,
-        // Batch.hs:245), all sharing one topic.  These are assembled HS-style
-        // (`prettyWfErrorReport`, Wellformedness.hs:118-125): the topic header
-        // (+ any "reasons" preamble that HS folds into the topic string) ONCE,
-        // then the per-rule bodies joined by the `intersperse (text "")`
-        // 2-space blank separator.  Other (single-entry) topics keep baking
-        // their full block into the message (default path below).
-        if let Some(preamble) = wf_headerless_preamble(topic) {
-            out.push_str(&preamble);
-            out.push_str(&msgs.join("\n  \n"));
-            out.push('\n');
-        } else {
-            for (j, m) in msgs.iter().enumerate() {
-                if j > 0 { out.push('\n'); }
-                out.push_str(m);
-                if !m.ends_with('\n') { out.push('\n'); }
-            }
-        }
-    }
-    // Trim trailing blank lines but keep a single newline before `*/`.
-    while out.ends_with("\n\n") { out.pop(); }
-    out.push_str("*/");
-    out
-}
-
 /// Compute and store `variant_substs` + `abstracted_rule` on every
 /// `OpenProtoRule` whose RHS contains reducible-headed sub-terms.
 /// Mirrors HS's `variantsProtoRule` pre-computation performed during
@@ -1477,54 +1376,6 @@ fn format_wf_block(report: &[tamarin_parser::wf::WfError]) -> String {
 /// HS-faithful witness allocation regardless of which pool member
 /// handles a given rule, so output is byte-identical to the
 /// single-Maude path.
-fn populate_rule_variants(elaborated: &mut tamarin_theory::theory::Theory,
-                          maude: &MaudeHandle,
-                          pool: Option<&MaudePool>) {
-    use rayon::prelude::*;
-    use tamarin_theory::theory::TheoryItem;
-
-    // HS-faithful: skip variant computation if the signature has
-    // NO reducible function symbols — there's nothing to narrow.
-    // Compute once (signature is read-only here) rather than in the
-    // inner loop.
-    if maude.maude_sig().reducible_fun_syms.is_empty() { return; }
-
-    // Per-item Option<(abstracted_rule, variant_substs)> for rules that
-    // have any.  Computed in parallel; rayon's indexed `par_iter().collect()`
-    // preserves positional order, and the result is zipped back by position.
-    let outs: Vec<Option<(tamarin_theory::rule::ProtoRuleE, Vec<tamarin_term::subst_vfresh::LNSubstVFresh>)>> =
-        elaborated.items.par_iter().map(|item| {
-            let TheoryItem::Rule(opr) = item else { return None; };
-            // Per-task Maude: acquire from the pool when available so
-            // each rule's variant computation runs on its own
-            // subprocess (no IPC mutex contention).  Fall back to
-            // the shared `maude` when no pool is configured.
-            let result = if let Some(pool) = pool {
-                let pooled = pool.acquire();
-                tamarin_theory::tools::rule_variants::abstract_rule_and_variants(
-                    &pooled, &opr.rule)
-            } else {
-                tamarin_theory::tools::rule_variants::abstract_rule_and_variants(
-                    maude, &opr.rule)
-            };
-            match result {
-                Ok(Some(pair)) => Some(pair),
-                _ => None,
-            }
-        }).collect();
-
-    // Sequential writeback in source order — matches HS's
-    // `parList rdeepseq` semantics (parallel evaluation, sequential
-    // list materialisation).
-    for (item, out) in elaborated.items.iter_mut().zip(outs) {
-        let TheoryItem::Rule(opr) = item else { continue };
-        if let Some((abstr, substs)) = out {
-            opr.abstracted_rule = Some(abstr);
-            opr.variant_substs = substs;
-        }
-    }
-}
-
 /// Install rayon's global worker pool to the size requested via
 /// `--processors=N` (or a sensible default).
 ///

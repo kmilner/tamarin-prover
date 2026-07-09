@@ -93,6 +93,42 @@ impl GoalRanking {
         }
     }
 
+    /// Human-readable description of this ranking, mirroring HS
+    /// `goalRankingName` (System.hs:687-705).  Used by the interactive
+    /// web UI's "Applicable Proof Methods:" comment (`subProofSnippet`,
+    /// `Web/Theory.hs:544-545`).  Oracle variants render the resolved
+    /// script path (HS `printOracle`); we already store the resolved
+    /// path in `oracle_path`.
+    pub fn ranking_name(&self) -> String {
+        let body = match self {
+            GoalRanking::GoalNr => "their order of creation".to_string(),
+            GoalRanking::UsefulGoalNr =>
+                "their usefulness and order of creation".to_string(),
+            GoalRanking::Sapic =>
+                "heuristics adapted for processes".to_string(),
+            GoalRanking::SapicPKCS11 =>
+                "heuristics adapted to a specific model of PKCS#11 expressed \
+                 using SAPIC. deprecated.".to_string(),
+            GoalRanking::Smart(lb) =>
+                format!("the 'smart' heuristic{}", loop_status(*lb)),
+            GoalRanking::Inj(lb) =>
+                format!("heuristics adapted to stateful injective protocols{}",
+                        loop_status(*lb)),
+            GoalRanking::Oracle { oracle_path, .. } =>
+                format!("an oracle for ranking, located at {}", oracle_path),
+            GoalRanking::OracleSmart { oracle_path, .. } =>
+                format!("an oracle for ranking based on 'smart' heuristic, \
+                         located at {}", oracle_path),
+            GoalRanking::Tactic { tactic, .. } =>
+                format!("the tactic written in the theory file: {}", tactic.name),
+        };
+        format!("Goals sorted according to {}", body)
+    }
+}
+
+/// HS `goalRankingName`'s `loopStatus` (System.hs:701).
+fn loop_status(b: bool) -> String {
+    format!(" (loop breakers {})", if b { "allowed" } else { "delayed" })
 }
 
 /// Parse a full heuristic string into a list of `GoalRanking`s,
@@ -2218,6 +2254,48 @@ pub fn goal_usefulness(g: &Goal, looping: bool, sys: &System) -> Usefulness {
     goal_usefulness_with_adj(g, looping, sys, &adj)
 }
 
+/// HS `prettyGoals`'s `useful` annotation STRING (System.hs:1745-1752) for
+/// the interactive sequent's per-goal comment.  UNLIKE the ranking
+/// [`Usefulness`] enum (which collapses both KU-guard and default goals
+/// into `Useful`), this distinguishes `" (useful1)"` (KU goal when the
+/// system has KU-guards) from `" (useful2)"` (the default), matching the
+/// exact suffix HS `prettyGoals` renders.  Returned WITHOUT surrounding
+/// quotes; the caller applies HS's `show` (which wraps it in `"…"`).
+///
+///   useful = case goal of
+///     _ | gsLoopBreaker         -> " (loop breaker)"
+///     ActionG i (UpK m)
+///       | hasKUGuards           -> " (useful1)"
+///       | currentlyDeducible i m -> " (currently deducible)"
+///       | probablyConstructible m -> " (probably constructible)"
+///     _                         -> " (useful2)"
+pub fn goal_useful_annotation(
+    g: &Goal,
+    gs_loop_breaker: bool,
+    sys: &System,
+) -> &'static str {
+    if gs_loop_breaker {
+        return " (loop breaker)";
+    }
+    if let Goal::Action(i, fa) = g {
+        if fa.is_ku() {
+            if has_ku_guards(sys) {
+                return " (useful1)";
+            }
+            if let Some(m) = fa.terms.first() {
+                let adj = build_raw_less_adj(sys);
+                if currently_deducible(sys, &adj, i, m) {
+                    return " (currently deducible)";
+                }
+                if probably_constructible(m) {
+                    return " (probably constructible)";
+                }
+            }
+        }
+    }
+    " (useful2)"
+}
+
 /// Like [`goal_usefulness`] but reuses a prebuilt `rawLessRel`
 /// adjacency (`existingDeps`, Goals.hs:120) instead of rebuilding it.
 fn goal_usefulness_with_adj(
@@ -2554,15 +2632,37 @@ pub fn dispatch_solve_goal(
                 &red.ctx.full_sources,
                 &red.sys,
                 &p.0, p.1, fa,
+                Some(&red.maude),
             ) {
                 use crate::constraint::solver::reduction::GoalCases;
                 if case_pairs.len() == 1 {
-                    let (name, sys) = case_pairs.into_iter().next().unwrap();
+                    let (name, sys, branch_counter) =
+                        case_pairs.into_iter().next().unwrap();
                     red.sys = sys;
+                    // HS FreshT-threading (task #23, A(ii) premise
+                    // parity): single-case adoption continues THIS
+                    // branch's counter thread (fork + its own
+                    // someInst/conjoin draws), not the shared handle's
+                    // post-all-cases position.
+                    red.maude.reset_counter_to(branch_counter);
                     return GoalCases::LinearNamed(name);
                 }
                 if !case_pairs.is_empty() {
-                    return GoalCases::Cases(case_pairs);
+                    // Multi-case: record per-branch continuation
+                    // counters for the post-solve simplify (consumed
+                    // via `last_case_counters`, parallel to the Cases
+                    // vec — same contract as the action-path source
+                    // adoption in `solve_action_goal`).
+                    let mut out: Vec<(String, crate::constraint::system::System)> =
+                        Vec::with_capacity(case_pairs.len());
+                    let mut out_counters: Vec<u64> =
+                        Vec::with_capacity(case_pairs.len());
+                    for (name, sys, branch_counter) in case_pairs {
+                        out.push((name, sys));
+                        out_counters.push(branch_counter);
+                    }
+                    red.last_case_counters = out_counters;
+                    return GoalCases::Cases(out);
                 }
                 // HS-faithful: `solveWithSource` returned `Just` (the
                 // abstract `matchToGoal` matched) but every case was

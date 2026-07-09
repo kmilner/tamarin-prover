@@ -45,19 +45,22 @@ pub struct TheoryEntry {
     pub loaded_at: DateTime<Local>,
     /// True for the originally loaded copy (vs. ones produced by edits).
     pub primary: bool,
+    /// The theory's wellformedness report, computed at load time by the
+    /// same pipeline `--prove` runs (`theory_io::load_from_source`, mirroring
+    /// `run.rs`'s `checkWellformedness`).  This is the single source of truth
+    /// for both wellformedness renderings: the `/* WARNING: ... */` comment in
+    /// the `source`/`message` routes (`format_wf_block`) and the
+    /// `<div class="wf-warning">` header banner in the `help`/`overview` routes
+    /// (`errors_html`).  Empty ⇒ no warnings (theory is well-formed).
+    pub wf_report: Vec<tamarin_parser::wf::WfError>,
     /// HTML for the wellformedness warning banner shown in the theory
     /// page header (HS `errorsHtml`, rendered raw via
     /// `preEscapedToMarkup info.errorsHtml` at `src/Web/Theory.hs`).
-    /// HS populates it from `makeWfErrorsHtml`
-    /// (`src/Web/Handler.hs`), which wraps
+    /// Populated from [`wf_report`](Self::wf_report) at load time,
+    /// mirroring HS `makeWfErrorsHtml` (`src/Web/Handler.hs`), which wraps
     /// `renderHtmlDoc (htmlDoc $ prettyWfErrorReport report)` of the
     /// *closed* theory's wellformedness report in a `<div class="wf-warning">`.
-    /// This is an unported interactive-web-UI feature: the Rust load path
-    /// leaves it `String::new()` and no handler renders it, so the warning
-    /// banner is not surfaced. It does not affect `--prove` output (the CLI
-    /// reports wf errors via its own path). Populating it byte-for-byte
-    /// requires the close-time (Maude-dependent) wf report plus matching
-    /// HS `htmlDoc` escaping, so it is deferred rather than partially faked.
+    /// Empty string when the report is empty (HS `makeWfErrorsHtml [] = ""`).
     pub errors_html: String,
     /// Live proof state — built lazily on first request that needs it
     /// (theory load → only kept-around-but-empty until `ensure_proof_state`

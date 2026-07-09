@@ -71,6 +71,11 @@ pub struct ServerConfig {
     /// ID-DFS depth + wall-clock deadline (HS-faithful), so this value
     /// is accepted but ignored.
     pub max_steps: usize,
+    /// `--derivcheck-timeout` for the dynamic message-derivation checks
+    /// run at theory load (HS interactive default 5s; 0 disables).  Set
+    /// from the CLI flag by `interactive` setup — previously the web load
+    /// path hardcoded 5 and ignored the parsed flag (task #20).
+    pub derivcheck_timeout: u32,
 }
 
 impl ServerConfig {
@@ -81,6 +86,7 @@ impl ServerConfig {
             frontend_dist: None,
             maude_path,
             max_steps: 500,
+            derivcheck_timeout: 5,
         }
     }
 }
@@ -92,11 +98,30 @@ pub async fn serve(
     cfg: ServerConfig,
     theory_paths: Vec<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // The web UI renders every HTTP response at HS's web width (100/67),
+    // not the CLI console width (110/73) — HS `getTheorySourceR` uses
+    // `render` (HughesPJ default `style`) and every HTML fragment goes
+    // through `renderHtmlDoc`, both width 100.  Set process-wide before
+    // any rendering.  (Console-only `renderDoc` at 110 has no HTTP
+    // analogue here.)
+    tamarin_theory::pretty_hpj::set_display_width(
+        tamarin_theory::pretty_hpj::WEB_LINE_LENGTH,
+        tamarin_theory::pretty_hpj::WEB_RIBBON,
+    );
+
+    // Retain each proof node's constraint `System` after expansion.  The
+    // `--prove` CLI drops them post-expansion to keep RSS low (the text
+    // proof never reprints a per-node system), but the interactive UI
+    // renders the annotated system + applicable proof methods at every
+    // proof path — HS keeps a `Just System` on every `IncrementalProof`
+    // node.  Must be set before the first `autoprove` runs a search.
+    tamarin_theory::constraint::solver::search::set_keep_sys(true);
+
     let store = TheoryStore::default();
 
     // Eager-load every command-line theory.
     for p in &theory_paths {
-        match theory_io::load_from_path(p) {
+        match theory_io::load_from_path(p, &cfg.maude_path, cfg.derivcheck_timeout) {
             Ok(entry) => {
                 let name = entry.name.clone();
                 let idx = store.insert(entry);

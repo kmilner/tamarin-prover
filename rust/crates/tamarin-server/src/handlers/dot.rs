@@ -10,16 +10,35 @@
 //! cluster styling and the less-edge rendering all match HS byte-for-
 //! byte.
 //!
-//! KNOWN DIVERGENCES (vs upstream Tamarin's graph rendering — intentional,
-//! each also documented at its site): downstream consumers of the web
-//! graph view should expect these two DOT/SVG rendering results to differ
-//! from upstream:
-//!   1. Per-rule node FILL colours use four fixed placeholder hexes instead
-//!      of HS `nodeColorMap`'s size-dependent HSV palette (only the group
-//!      PARTITION is faithful; an explicit per-rule `color:` attribute IS
-//!      honoured exactly).
-//!   2. The cluster subgraph identifier uses the Rust `cluster_<n>` form
-//!      rather than HS `createClusterNodeId`.
+//! Per-rule node FILL colours are a faithful port of HS `nodeColorMap`
+//! (Dot.hs:190-218): the size-dependent light-HSV palette keyed by
+//! `(groupIdx, memberIdx)` — see `build_node_color_map` / `NodeColorMap`
+//! below. An explicit per-rule `color:` attribute and a cluster's
+//! `manualNodeColor` still take priority (HS `dotNodeCompact`, Dot.hs:248-256).
+//! Each rule record also carries HS's `fontcolor` (`colorUsesWhiteFont` of the
+//! palette colour, Dot.hs:258/284-287) and `role` (Dot.hs:259) attributes.
+//!
+//! KNOWN DIVERGENCES:
+//!   * (serialization form only — normalised away by the parse-and-compare
+//!     gate) the cluster subgraph identifier uses the Rust `cluster_<n>` form
+//!     rather than HS `createClusterNodeId roleName`. The cluster's label /
+//!     colour / membership are all faithful.
+//!   * HS `mkNode`'s `CompactBoringNodes` branch (Dot.hs:294-304) — PORTED
+//!     (see `rule_node`): under the default node style, intruder rules and the
+//!     `Fresh` rule collapse to a PLAIN `mkSimpleNode` ellipse (Dot.hs:289-290)
+//!     with no fill/font/role attrs. The label is `show v : showDotRuleCaseName
+//!     ru` when the node has an outgoing edge (`hasOutgoingEdge`, Dot.hs:277-279,
+//!     over the TOP-LEVEL `grEdges` only), else the full rule label incl. the
+//!     bracketed action row. The `uncompact`/`FullBoringNodes` toggle is not
+//!     plumbed through the RS handler (see `graph/options.rs`), so this route is
+//!     always compact — matching the HS default (`defaultDotOptions`, Dot.hs:82).
+//!   * SERIALIZATION form only (normalised away by the parse-and-compare gate):
+//!     protocol-rule RECORD labels use RS port ids `<p0>`/`<c0>` and spaced
+//!     `{ .. } | .. | { .. }` bracketing, where HS's `Text.Dot.renderRecord`
+//!     (Dot.hs:254-280) uses a graph-global port counter `<n0>`, `<n1>`, … and
+//!     `{{..|..}|{..}|{..|..}}` bracketing. The gate ignores the node-id scheme
+//!     and record bracketing; the field CONTENT (facts, `id : name[acts]`) is
+//!     rendered identically.
 //!
 //! Reference:
 //!   - `lib/theory/src/Theory/Constraint/System/Dot.hs` (605 lines)
@@ -52,12 +71,13 @@
 //! with port names `p0`, `p1`, ..., `c0`, `c1`, ... so that edges from
 //! the `sEdges` set can target the correct slots.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
-use tamarin_theory::constraint::constraints::{LessAtom, Reason};
+use tamarin_theory::constraint::constraints::{LessAtom, NodeId, Reason};
 use tamarin_theory::constraint::system::System;
 use tamarin_theory::fact::{FactTag, LNFact};
+use tamarin_theory::pretty_hpj::{self, Doc, WEB_LINE_LENGTH, WEB_RIBBON};
 use tamarin_theory::rule::{
     rule_name_string, IntrRuleACInfo, ProtoRuleName, RuleACInst, RuleInfo,
 };
@@ -71,8 +91,8 @@ use crate::graph::abbreviation::{
 use crate::graph::options::GraphOptions;
 use crate::graph::repr::{
     add_cluster_by_role, add_intelligent_cluster_using_similar_names,
-    compute_basic_graph_repr, extract_base_name, GEdge, GNode, MissingHint,
-    NodeType,
+    compute_basic_graph_repr, extract_base_name, extract_role, GEdge, GNode,
+    MissingHint, NodeType,
 };
 use crate::graph::simplify::{compress_system, simplify_system};
 
@@ -110,6 +130,12 @@ pub fn system_to_dot_with(sys: &System, opts: &GraphOptions) -> String {
     };
     // 4. Emit DOT.
     let mut g = DotBuilder::new();
+    // HS `dotSystemCompact` (Dot.hs:481-487) computes the node colour map from
+    // the RAW system's nodes (`nodeColorMap (M.elems $ get sNodes se)`), NOT
+    // the compressed/simplified `working` used for the graph. Mirror that: the
+    // palette is sized by the whole rule set, so it must see every original
+    // node.
+    let color_map = build_node_color_map(&sys.nodes);
     // HS `dotGraphCompact` (Dot.hs:503) switches the graph-level defaults to
     // `setDefaultAttributesIfCluster` when the repr has any clusters.
     g.preamble(!repr.clusters.is_empty());
@@ -120,7 +146,101 @@ pub fn system_to_dot_with(sys: &System, opts: &GraphOptions) -> String {
     // instead of scanning `working.nodes` per edge.
     let node_map: HashMap<&LVar, &RuleACInst> =
         working.nodes.iter().map(|(id, ru)| (id, ru)).collect();
-    // 4a. Clusters as subgraphs.
+    // HS `hasOutgoingEdge graph v` (Dot.hs:277-279): a node has an outgoing edge
+    // iff it is the conclusion-side source of some `SystemEdge` in the graph's
+    // TOP-LEVEL edge set (`get grEdges repr`). Clustering removes a cluster's
+    // internal edges from `grEdges` (GraphRepr.hs:126-129), so we mirror HS and
+    // consult ONLY `repr.edges` (post-clustering), never a cluster's own edges.
+    // Drives the compact-node label choice in `rule_node`.
+    let has_outgoing: HashSet<&LVar> = repr.edges.iter()
+        .filter_map(|e| match e {
+            GEdge::System(src, _) => Some(&src.0),
+            _ => None,
+        })
+        .collect();
+    // HS gives every node a globally-fresh dot id via `cacheState dsNodes`
+    // (Dot.hs:108-110), so a single system-node id `v` that is ALSO an
+    // unsolved-action atom and/or the last-action atom is drawn as SEVERAL
+    // distinct dot nodes (`n5` record + `n7` ellipse …). RS's semantic dot-id
+    // scheme derives one id per `v` (`dot_node_id`), so those extra ellipses
+    // would collide with the record on a single id — graphviz merges them (the
+    // ellipse overwrites the record) and the parity gate's label-keyed node map
+    // drops the record. Mirror HS: the SystemNode / MissingNode own the base id
+    // (their record ports / bare id are what `sEdges` reference via
+    // `conc_port_ref`/`prem_port_ref` = HS `dsConcs`/`dsPrems`), and a colliding
+    // UnsolvedAction / LastAction ellipse (which HS never references by an
+    // sEdge) gets a distinct suffixed id.
+    //
+    // `dsNodes[v]` (which HS `dotLessEdge` resolves each less-edge endpoint
+    // through, Dot.hs:408-409) is the LAST dot node emitted at `v`. Emission
+    // order is the free `repr.nodes` (System, UnsolvedAction, LastAction,
+    // Missing per `compute_basic_graph_repr`) then each cluster's nodes — so we
+    // walk that exact order, assigning ids and overwriting `ds_nodes` as we go.
+    //
+    // `port_owner_ids` = the `v`s whose base id backs an sEdge port ref
+    // (SystemNode records + MissingNodes). An UnsolvedAction/LastAction at such
+    // a `v` MUST yield the base to that owner regardless of emission order (a
+    // SystemNode can be clustered and thus emitted AFTER a free action ellipse).
+    let port_owner_ids: HashSet<&LVar> = repr.nodes.iter()
+        .chain(repr.clusters.iter().flat_map(|c| c.nodes.iter()))
+        .filter(|n| matches!(n.ty, NodeType::System(_) | NodeType::Missing(_)))
+        .map(|n| &n.id)
+        .collect();
+    let mut used_dot_ids: HashSet<String> = HashSet::new();
+    // Assigned id for each UnsolvedAction (tag 0) / LastAction (tag 1) node,
+    // keyed by (node id, tag) — at most one of each kind per `v`.
+    let mut ellipse_dot_ids: std::collections::BTreeMap<(LVar, u8), String> =
+        std::collections::BTreeMap::new();
+    // `dsNodes`: v -> dot id of the LAST node emitted at v (less-edge target).
+    let mut ds_nodes: std::collections::BTreeMap<LVar, String> =
+        std::collections::BTreeMap::new();
+    for node in repr.nodes.iter()
+        .chain(repr.clusters.iter().flat_map(|c| c.nodes.iter()))
+    {
+        let base = DotBuilder::dot_node_id(&node.id);
+        let id = match &node.ty {
+            // Base-id owners: their id is referenced by sEdge port refs.
+            NodeType::System(_) | NodeType::Missing(_) => {
+                used_dot_ids.insert(base.clone());
+                base
+            }
+            NodeType::UnsolvedAction(_) | NodeType::LastAction => {
+                let tag: u8 = if matches!(node.ty, NodeType::LastAction) { 1 } else { 0 };
+                let suffix = if tag == 1 { "__lastatom" } else { "__actionatom" };
+                let id = if port_owner_ids.contains(&node.id)
+                    || used_dot_ids.contains(&base)
+                {
+                    let mut cand = format!("{base}{suffix}");
+                    let mut n = 2u32;
+                    while used_dot_ids.contains(&cand) {
+                        cand = format!("{base}{suffix}{n}");
+                        n += 1;
+                    }
+                    cand
+                } else {
+                    base
+                };
+                used_dot_ids.insert(id.clone());
+                ellipse_dot_ids.insert((node.id.clone(), tag), id.clone());
+                id
+            }
+        };
+        ds_nodes.insert(node.id.clone(), id);
+    }
+    // 4a. Top-level (ungrouped) nodes.
+    //
+    // HS `dotGraphCompact` (Dot.hs:505-510) emits, in order: the FREE
+    // (ungrouped) nodes (`mapM_ dotNodeCompact nodes`), THEN the clusters
+    // (`mapM_ dotCluster clusters`), THEN the edges.  The free nodes — e.g. an
+    // unsolved-action-atom ellipse like `Unlock_0(..) @ #t2.1` — therefore
+    // appear BEFORE any `subgraph cluster_*` block.  Emit them first to match
+    // (a free node emitted after the cluster's closing `}` lands in the wrong
+    // scope order vs HS).
+    for node in &repr.nodes {
+        emit_node(&mut g, node, &abbrev_lookup, opts, &color_map, &has_outgoing,
+            &ellipse_dot_ids);
+    }
+    // 4b. Clusters as subgraphs.
     //
     // HS `dotCluster` (Dot.hs:547-562): each cluster gets a `roleColor`
     // derived from `extractBaseName name`, the subgraph is `style=filled`
@@ -137,20 +257,17 @@ pub fn system_to_dot_with(sys: &System, opts: &GraphOptions) -> String {
         let color = role_color(&base);
         g.open_subgraph(i, &cluster.name, &color);
         for node in &cluster.nodes {
-            emit_node_colored(&mut g, node, &abbrev_lookup, opts, Some(&color));
+            emit_node_colored(&mut g, node, &abbrev_lookup, opts, Some(&color),
+                &color_map, &has_outgoing, &ellipse_dot_ids);
         }
         g.close_subgraph();
         cluster_edges.extend(cluster.edges.iter().cloned());
     }
-    // 4b. Top-level nodes.
-    for node in &repr.nodes {
-        emit_node(&mut g, node, &abbrev_lookup, opts);
-    }
     // 4c. Edges. HS emits `restEdges` (non-less) before the merged
     // `lessEdges` within each scope (`dotGraphCompact`, Dot.hs:508-509),
     // then the cluster edges last (`dotClustersEdges`).
-    emit_edges_merged(&mut g, &repr.edges, &node_map);
-    emit_edges_merged(&mut g, &cluster_edges, &node_map);
+    emit_edges_merged(&mut g, &repr.edges, &node_map, &ds_nodes);
+    emit_edges_merged(&mut g, &cluster_edges, &node_map, &ds_nodes);
     // 4c. Legend (if any abbreviations were chosen).
     if !abbrevs.is_empty() {
         g.legend(&abbrevs);
@@ -164,8 +281,12 @@ fn emit_node(
     node: &GNode,
     abbrev: &dyn Fn(&LNTerm) -> Option<LNTerm>,
     opts: &GraphOptions,
+    color_map: &NodeColorMap,
+    has_outgoing: &HashSet<&LVar>,
+    ellipse_dot_ids: &std::collections::BTreeMap<(LVar, u8), String>,
 ) {
-    emit_node_colored(g, node, abbrev, opts, None);
+    emit_node_colored(g, node, abbrev, opts, None, color_map, has_outgoing,
+        ellipse_dot_ids);
 }
 
 /// `emit_node` with an optional `manual_color` — the cluster `roleColor`
@@ -178,19 +299,36 @@ fn emit_node_colored(
     abbrev: &dyn Fn(&LNTerm) -> Option<LNTerm>,
     opts: &GraphOptions,
     manual_color: Option<&str>,
+    color_map: &NodeColorMap,
+    has_outgoing: &HashSet<&LVar>,
+    ellipse_dot_ids: &std::collections::BTreeMap<(LVar, u8), String>,
 ) {
+    // Look up the (possibly collision-disambiguated) dot id assigned to a
+    // non-record ellipse node (UnsolvedAction tag 0 / LastAction tag 1).
+    let ellipse_id = |tag: u8| -> String {
+        ellipse_dot_ids.get(&(node.id.clone(), tag)).cloned()
+            .unwrap_or_else(|| DotBuilder::dot_node_id(&node.id))
+    };
     match &node.ty {
         NodeType::System(ru) => {
             let ru_abbreviated = abbreviate_rule(ru, abbrev);
-            g.rule_node(&node.id, &ru_abbreviated, opts, manual_color);
+            let outgoing = has_outgoing.contains(&node.id);
+            g.rule_node(&node.id, &ru_abbreviated, opts, manual_color, color_map,
+                outgoing);
         }
         NodeType::UnsolvedAction(facts) => {
             let new_facts: Vec<LNFact> = facts.iter()
                 .map(|fa| apply_abbreviations_fact(abbrev, fa))
                 .collect();
-            g.action_node(&node.id, &new_facts);
+            // A colliding action ellipse (same `v` as a system record) gets a
+            // distinct dot id so both nodes survive (see `ds_nodes`).
+            g.action_node(&ellipse_id(0), &node.id, &new_facts);
         }
-        NodeType::LastAction => g.last_node(&node.id),
+        // The last-atom uses its (possibly collision-disambiguated) dot id so
+        // it does not clash with a same-id system node.
+        NodeType::LastAction => {
+            g.last_node(&ellipse_id(1), &node.id);
+        }
         NodeType::Missing(hint) => g.missing_node(&node.id, hint),
     }
 }
@@ -207,6 +345,7 @@ fn emit_edges_merged(
     g: &mut DotBuilder,
     edges: &[GEdge],
     node_map: &HashMap<&LVar, &RuleACInst>,
+    ds_nodes: &std::collections::BTreeMap<LVar, String>,
 ) {
     // restEdges: keep original order, drop less-edges.
     for edge in edges {
@@ -214,7 +353,7 @@ fn emit_edges_merged(
             GEdge::System(src, tgt) => {
                 g.edge(node_map, src, tgt);
             }
-            GEdge::UnsolvedChain(src, tgt) => g.chain_edge(src, tgt),
+            GEdge::UnsolvedChain(src, tgt) => g.chain_edge(node_map, src, tgt),
             GEdge::Less(_) => {}
         }
     }
@@ -225,7 +364,7 @@ fn emit_edges_merged(
         .collect();
     lesses.sort_by(|a, b| (&a.smaller, &a.larger).cmp(&(&b.smaller, &b.larger)));
     for la in lesses {
-        g.less_edge(la);
+        g.less_edge(la, ds_nodes);
     }
 }
 
@@ -335,10 +474,11 @@ impl DotBuilder {
             let _ = writeln!(self.buf, "  rankdir=TB;");
             let _ = writeln!(self.buf, "  showboxes=false;");
             let _ = writeln!(self.buf, "  clusterrank=local;");
-            // HS sets the graph-level node default shape to `ellipse`; each
-            // rule node overrides it with an explicit record label, so the
-            // `shape=record` we keep on the rule node still wins per-node
-            // (matching HS's per-node record attrs).
+            // HS `setDefaultAttributesIfCluster` sets the graph-level node
+            // default shape to `ellipse` (Dot.hs:160); each compact rule node
+            // overrides it with its own per-node `shape=record` (emitted in
+            // `rule_node`, mirroring HS `genRecord "record"`), so record rules
+            // still render as records inside clusters.
             let _ = writeln!(self.buf,
                 "  node [fontsize=8,fontname=\"Helvetica\",width=0.3,height=0.2,margin=\"0.05,0.05\",shape=ellipse];");
             let _ = writeln!(self.buf,
@@ -365,72 +505,140 @@ impl DotBuilder {
             .collect()
     }
     fn rule_node(&mut self, nid: &LVar, ru: &RuleACInst, opts: &GraphOptions,
-                 manual_color: Option<&str>) {
+                 manual_color: Option<&str>, color_map: &NodeColorMap,
+                 outgoing: bool) {
         let id = Self::dot_node_id(nid);
-        // Build prems / acts / concs rows.
-        let prems = enumerate_label_row(&ru.premises, "p");
-        let concs = enumerate_label_row(&ru.conclusions, "c");
-        // HS `ruleLabelM`: `prettyNodeId v <-> colon <-> showDotRuleCaseName`
-        // (Dot.hs:336-337). `prettyNodeId = text . show` (LTerm.hs:849), so the
-        // id renders as `show v` (e.g. `#i` / `#i.2`) via `Display for LVar`.
-        let header = format!("{} : {}", nid,
-            escape_dot(&rule_case_name(ru)));
-        // HS `ruleLabelM` filters the action facts before rendering
-        // (Dot.hs:330-354): always drop the synthetic `Diff<rulename>`
-        // annotation, and — only when `goShowAutoSource` is set — drop the
-        // `AUTO_{IN,OUT}_{TERM,FACT}_*` auto-source labels.
-        let acts: Vec<&LNFact> = ru.actions.iter()
-            .filter(|fa| is_not_diff_annotation(ru, fa))
-            .filter(|fa| !opts.show_auto_source || !is_auto_source(fa))
-            .collect();
-        let mid = if acts.is_empty() {
-            header.clone()
+        // HS `mkNode`'s `CompactBoringNodes` branch (Dot.hs:294-304): under the
+        // default node style (`defaultDotOptions = DotOptions CompactBoringNodes`,
+        // Dot.hs:82; the interactive route builds its `DotOptions` from
+        // `getOptions`, Handler.hs:1334/1348, defaulting to `CompactBoringNodes`
+        // when the `uncompact` query param is absent), an intruder rule or the
+        // `Fresh` rule collapses to a plain `mkSimpleNode` ellipse (Dot.hs:289-290)
+        // with NO fill/font/role attrs. Its label is `show v : showDotRuleCaseName
+        // ru` when the node has an outgoing edge, else the full rule label incl.
+        // the bracketed action row (`concatMap snd as` = `ruleLabelM`,
+        // Dot.hs:301-302/330-338). The ellipse label is a PLAIN string, so it is
+        // escaped with `escape_dot_label` (HS `showAttr`, Dot.hs:346-353), NOT the
+        // record-field `escape_dot`.
+        if is_intruder_or_fresh(ru) {
+            let lbl = if outgoing {
+                format!("{} : {}", nid, rule_case_name(ru))
+            } else {
+                // HS `concatMap snd as` (Dot.hs:302) — `as` is the
+                // `renderRow`-rendered rule label, i.e. the SAME
+                // `renderBalanced` single-doc row (width 130) the record
+                // mid row uses.  No `fixMultiLineLabel` here: this label
+                // goes through plain `mkSimpleNode` → `D.node` → `showAttr`
+                // (spaces stay spaces; `\n` → `\l` via `escape_dot_label`).
+                render_balanced(vec![rule_label_doc(nid, ru, opts)])
+                    .pop()
+                    .unwrap_or_default()
+            };
+            let _ = writeln!(self.buf,
+                "  {} [label=\"{}\",shape=ellipse];",
+                id, escape_dot_label(&lbl));
+            return;
+        }
+        // Build prems / acts / concs rows as Docs, then lay each row out with
+        // HS `renderRow`/`renderBalanced` (Dot.hs:357-379): every field of a
+        // row is rendered at a width proportional to its one-line length
+        // (total 100, `max 30 . round . (*1.3)`), NOT at the page width.
+        let prem_docs: Vec<Doc> = ru.premises.iter().map(fact_doc_of).collect();
+        let conc_docs: Vec<Doc> = ru.conclusions.iter().map(fact_doc_of).collect();
+        let ps = render_balanced(prem_docs);
+        let mid = render_balanced(vec![rule_label_doc(nid, ru, opts)])
+            .pop()
+            .unwrap_or_default();
+        let cs = render_balanced(conc_docs);
+        // Record label — HS `D.vcat $ map D.hcat $ … $ filter (not . null)
+        // [ps, as, cs]` (Dot.hs:310-312) rendered by `Text.Dot.renderRecord`
+        // (Text/Dot.hs:254-280): the outer VCat renders as `{row|row|row}`,
+        // each row (HCat) as `{field|field}`, each ported field as
+        // `<port> text`.  Field text goes through `fixMultiLineLabel`
+        // (mkField, Text/Dot.hs:378-381: leading spaces → `&nbsp;`, plus a
+        // trailing newline via `unlines` when multi-line) and the
+        // record-metachar escape (`| { } < >`, Text/Dot.hs:273-280).  The
+        // remaining newlines become `\l` at the attribute level
+        // (`showAttr`, Text/Dot.hs:346-353) via `escape_dot_label`.
+        let mut rows: Vec<String> = Vec::new();
+        if !ps.is_empty() {
+            rows.push(format!("{{{}}}", ps.iter().enumerate()
+                .map(|(i, s)| format!(
+                    "<p{}> {}", i, escape_record_field(&fix_multi_line_label(s))))
+                .collect::<Vec<_>>()
+                .join("|")));
+        }
+        rows.push(format!("{{{}}}",
+            escape_record_field(&fix_multi_line_label(&mid))));
+        if !cs.is_empty() {
+            rows.push(format!("{{{}}}", cs.iter().enumerate()
+                .map(|(i, s)| format!(
+                    "<c{}> {}", i, escape_record_field(&fix_multi_line_label(s))))
+                .collect::<Vec<_>>()
+                .join("|")));
+        }
+        let lbl = escape_dot_label(&format!("{{{}}}", rows.join("|")));
+        let color = rule_fillcolor(ru, manual_color, color_map);
+        // HS `dotNodeCompact` record `attrs` (Dot.hs:257-259) also carry a
+        // `fontcolor` and a `role`. The `fontcolor` keys off the PALETTE colour
+        // (`M.lookup rInfoVal colorMap`), i.e. the raw map value — NOT the
+        // resolved `fillcolor` — so an explicit/cluster override does not change
+        // the font choice. `role = fromMaybe "Undefined" (getNodeRole node)`
+        // (Dot.hs:243).
+        let palette_color = color_map.lookup(&ru.info);
+        let fontcolor = if color_uses_white_font(palette_color) {
+            "white"
         } else {
-            let acts: Vec<String> = acts.iter()
-                .map(|fa| format_fact(fa))
-                .collect();
-            format!("{} [{}]", header, escape_dot(&acts.join(", ")))
+            "black"
         };
-        // Record label: `{ prems | mid | concs }`.  When a section is
-        // empty we omit it to avoid a stray `|`.
-        let mut sections = Vec::new();
-        if !prems.is_empty() {
-            sections.push(format!("{{ {} }}", prems));
-        }
-        sections.push(escape_dot(&mid).to_string());
-        if !concs.is_empty() {
-            sections.push(format!("{{ {} }}", concs));
-        }
-        let lbl = sections.join(" | ");
-        let color = rule_fillcolor(ru, manual_color);
+        let role = extract_role(ru).unwrap_or("Undefined");
+        // HS `genRecord "record"` (Text/Dot.hs:284-288) prepends an explicit
+        // `("shape","record")` to every compact record node, then the label and
+        // the `dotNodeCompact` `attrs`.  The per-node `shape=record` OVERRIDES the
+        // graph-level default node shape — which is `record` in the flat
+        // `setDefaultAttributes` case but `ellipse` in the clustered
+        // `setDefaultAttributesIfCluster` case (Dot.hs:160).  Emit it explicitly
+        // so clustered SAPIC graphs keep `shape=record` (not the ellipse default).
         let _ = writeln!(self.buf,
-            "  {} [label=\"{}\",style=\"filled\",fillcolor=\"{}\"];",
-            id, lbl, color);
+            "  {} [shape=record,label=\"{}\",style=\"filled\",fillcolor=\"{}\",fontcolor=\"{}\",role=\"{}\"];",
+            id, lbl, color, fontcolor, escape_dot_label(role));
     }
-    fn action_node(&mut self, nid: &LVar, facts: &[LNFact]) {
-        let id = Self::dot_node_id(nid);
-        let mut s = facts.iter()
-            .map(format_fact)
-            .collect::<Vec<_>>()
-            .join(", ");
-        // HS `lblPre <-> opAction <-> text (show v)` (Dot.hs:269):
-        // `opAction = operator_ "@"`, `<->` is space-joined, and `show v`
-        // renders via `Display for LVar` (e.g. `#i` / `#i.2`).
-        let _ = write!(s, " @ {}", nid);
+    fn action_node(&mut self, id: &str, nid: &LVar, facts: &[LNFact]) {
+        // HS `lblPre <- fsep <$> punctuate comma <$> mapM renderLNFact facts;
+        // lbl = lblPre <-> opAction <-> text (show v); mkSimpleNode (render
+        // lbl) attrs` (Dot.hs:267-272): the WHOLE label is ONE Doc — the
+        // facts fill-wrap as a paragraph — rendered by the default-style
+        // `render` (HughesPJ `style`: lineLength 100, ribbon 67), NOT one
+        // fact at a time.  `opAction = operator_ "@"`, `<->` is space-joined,
+        // and `show v` renders via `Display for LVar` (e.g. `#i` / `#i.2`).
+        let fact_docs: Vec<Doc> = facts.iter().map(fact_doc_of).collect();
+        let s = pretty_hpj::fsep(pretty_hpj::punctuate(Doc::text(","), fact_docs))
+            .beside_sp(Doc::text("@"))
+            .beside_sp(Doc::text(nid.to_string()))
+            .render_with(WEB_LINE_LENGTH, WEB_RIBBON);
         let color = if facts.iter().any(|f| matches!(f.tag, FactTag::Ku)) {
             "gray"
         } else { "darkblue" };
+        // HS renders a loose action node via `mkSimpleNode (render lbl) attrs`
+        // = plain `D.node [("label", …), ("shape","ellipse")]` (Dot.hs:267-272,
+        // 289-290), NOT `D.record`.  A plain node label is a quoted string whose
+        // only metacharacters are `"` and newline (`escape_dot_label` =
+        // `showAttr`, Text/Dot.hs:346-353); the record metacharacters
+        // `{ } | < >` are LITERAL, so a tuple `<A, B, …>` in a goal fact must
+        // stay `<…>` and NOT be `\<…\>`-escaped (only the `SystemNode`/
+        // `D.record` path escapes them — task #17 family B).
         let _ = writeln!(self.buf,
             "  {} [shape=ellipse,label=\"{}\",color=\"{}\"];",
-            id, escape_dot(&s), color);
+            id, escape_dot_label(&s), color);
     }
-    fn last_node(&mut self, nid: &LVar) {
-        let id = Self::dot_node_id(nid);
+    fn last_node(&mut self, dot_id: &str, nid: &LVar) {
         // HS `LastActionAtom -> mkSimpleNode (show v) []` (Dot.hs:273): the
-        // label is `show v`, rendered via `Display for LVar` (`#i` / `#i.2`).
+        // label is `show v`, rendered via `Display for LVar` (`#i` / `#i.2`),
+        // via plain `D.node` (see `action_node`), so use the plain-label escaper.
+        // `dot_id` is the collision-disambiguated id (see `last_dot_id`).
         let _ = writeln!(self.buf,
             "  {} [shape=ellipse,label=\"{}\"];",
-            id, escape_dot(&nid.to_string()));
+            dot_id, escape_dot_label(&nid.to_string()));
     }
     fn missing_node(&mut self, nid: &LVar, hint: &MissingHint) {
         let id = Self::dot_node_id(nid);
@@ -445,31 +653,36 @@ impl DotBuilder {
             MissingHint::Prem(pi) => ("invtrapezium", pi.0),
         };
         let label = format!("({}, {})", nid, idx);
+        // HS `dotConcC`/`dotPremC` = `missingNode shape (render label)` = plain
+        // `D.node` (Dot.hs:280-282), so use the plain-label escaper (matching
+        // `action_node`/`last_node`).  This label (`(#i, 0)`) never contains
+        // record metacharacters, so the choice is inert here, but keeping all
+        // three plain (ellipse/trapezium) nodes on `escape_dot_label` mirrors HS.
         let _ = writeln!(self.buf,
             "  {} [shape={},label=\"{}\"];",
-            id, shape, escape_dot(&label));
+            id, shape, escape_dot_label(&label));
     }
     fn edge(&mut self,
             node_map: &HashMap<&LVar, &RuleACInst>,
             src: &tamarin_theory::constraint::constraints::NodeConc,
             tgt: &tamarin_theory::constraint::constraints::NodePrem) {
-        let src_id = Self::dot_node_id(&src.0);
-        let tgt_id = Self::dot_node_id(&tgt.0);
         // Look up the target premise's fact tag so we can colour
         // the edge.
         let style = edge_style(node_map, src, tgt);
+        let src_ref = conc_port_ref(node_map, src);
+        let tgt_ref = prem_port_ref(node_map, tgt);
         let _ = writeln!(self.buf,
-            "  {}:c{} -> {}:p{} [{}];",
-            src_id, src.1.0, tgt_id, tgt.1.0, style);
+            "  {} -> {} [{}];", src_ref, tgt_ref, style);
     }
     fn chain_edge(&mut self,
+                  node_map: &HashMap<&LVar, &RuleACInst>,
                   src: &tamarin_theory::constraint::constraints::NodeConc,
                   tgt: &tamarin_theory::constraint::constraints::NodePrem) {
-        let s = Self::dot_node_id(&src.0);
-        let t = Self::dot_node_id(&tgt.0);
+        let src_ref = conc_port_ref(node_map, src);
+        let tgt_ref = prem_port_ref(node_map, tgt);
         let _ = writeln!(self.buf,
-            "  {}:c{} -> {}:p{} [style=\"dotted\",color=\"green\"];",
-            s, src.1.0, t, tgt.1.0);
+            "  {} -> {} [style=\"dotted\",color=\"green\"];",
+            src_ref, tgt_ref);
     }
     /// Open a subgraph (Graphviz `subgraph cluster_<n> { ... }`).
     /// `idx` is a numeric disambiguator; `name` is shown as the label and
@@ -485,7 +698,7 @@ impl DotBuilder {
         let _ = writeln!(self.buf, "  subgraph cluster_{} {{", idx);
         let _ = writeln!(self.buf, "    nodesep=\"0.6\";");
         let _ = writeln!(self.buf, "    ranksep=\"0.6\";");
-        let _ = writeln!(self.buf, "    label=\"{}\";", escape_dot(name));
+        let _ = writeln!(self.buf, "    label=\"{}\";", escape_dot_label(name));
         let _ = writeln!(self.buf, "    style=\"filled\";");
         let _ = writeln!(self.buf, "    color=\"{}\";", color);
         let _ = writeln!(self.buf, "    penwidth=\"2\";");
@@ -502,9 +715,19 @@ impl DotBuilder {
     /// reasons; since at most one less-atom survives per node pair (LessAtom
     /// equality ignores the reason), the group is a singleton and the colour
     /// reduces to the single reason's `toColor` (`reason_color`).
-    fn less_edge(&mut self, la: &LessAtom) {
-        let s = Self::dot_node_id(&la.smaller);
-        let t = Self::dot_node_id(&la.larger);
+    fn less_edge(&mut self, la: &LessAtom,
+                 ds_nodes: &std::collections::BTreeMap<LVar, String>) {
+        // HS `dotLessEdge` resolves each endpoint through `dsNodes` (Dot.hs:408-409),
+        // which holds the LAST dot node emitted at that id — the action / last
+        // ellipse when it shadows a same-id system record. Mirror that by
+        // resolving through the precomputed `ds_nodes` map (falling back to the
+        // bare id for any endpoint that was never emitted as a node).
+        let resolve = |nid: &LVar| -> String {
+            ds_nodes.get(nid).cloned()
+                .unwrap_or_else(|| Self::dot_node_id(nid))
+        };
+        let s = resolve(&la.smaller);
+        let t = resolve(&la.larger);
         let _ = writeln!(self.buf,
             "  {} -> {} [color=\"{}\",style=\"dashed\"];",
             s, t, reason_color(la.reason));
@@ -529,20 +752,44 @@ impl DotBuilder {
         let mut html = String::new();
         html.push_str(
             "<<TABLE BORDER=\"1\" CELLBORDER=\"0\" CELLSPACING=\"3\" CELLPADDING=\"1\">");
-        for &i in &order {
+        // Mirror Haskell `renderLine` (Dot.hs:441-450): each row is three
+        // `LabelCell`s with `cellAttributes = [Align HLeft, VAlign HTop]`.
+        // The NAME cell wraps its text in `<FONT COLOR="labelColor">`
+        // (`font txt = Text [Font [Color labelColor] txt]`), while the `=`
+        // and expansion cells are bare `Text`.  `labelColor = doAbbrevColor`
+        // (`defaultDotOptions = DotOptions CompactBoringNodes black`,
+        // Dot.hs:82; the web route never overrides `_doAbbrevColor`), which
+        // renders as `#000000`.  The graphviz HTML-table printer emits the
+        // cells of a `Cells` row separated by a single space and each `<TR>`
+        // on its own line, so we join the three cells with `" "` and the rows
+        // with `"\n"`.
+        let rows: Vec<String> = order.iter().map(|&i| {
             let (name, exp) = entries[i];
-            html.push_str("<TR>");
-            html.push_str(&format!("<TD ALIGN=\"LEFT\" VALIGN=\"TOP\">{}</TD>",
-                dot_html_escape(&pretty_lnterm(name))));
-            html.push_str("<TD ALIGN=\"LEFT\" VALIGN=\"TOP\">=</TD>");
-            html.push_str(&format!("<TD ALIGN=\"LEFT\" VALIGN=\"TOP\">{}</TD>",
-                dot_html_escape(&pretty_lnterm(exp))));
-            html.push_str("</TR>");
-        }
+            let name_cell = format!(
+                "<TD ALIGN=\"LEFT\" VALIGN=\"TOP\"><FONT COLOR=\"#000000\">{}</FONT></TD>",
+                dot_html_escape(&pretty_lnterm(name)));
+            let eq_cell = "<TD ALIGN=\"LEFT\" VALIGN=\"TOP\">=</TD>".to_string();
+            let exp_cell = format!(
+                "<TD ALIGN=\"LEFT\" VALIGN=\"TOP\">{}</TD>",
+                dot_html_escape(&pretty_lnterm(exp)));
+            format!("<TR>{}</TR>", [name_cell, eq_cell, exp_cell].join(" "))
+        }).collect();
+        html.push_str(&rows.join("\n"));
         html.push_str("</TABLE>>");
-        // Haskell emits shape "plain".
-        let _ = writeln!(self.buf,
-            "  legend [shape=plain,label={}];", html);
+        // HS `generateLegend` (Dot.hs:419-425) emits the legend inside a
+        // `D.scope` carrying `rank="sink"` — i.e. `{ rank="sink"; <node>; }` —
+        // then adds invisible sink→legend edges purely for layout (which we
+        // omit, matching the parity comparator that drops `style=invis`
+        // edges).  Reproduce the scope: besides mirroring HS's structure, the
+        // leading `rank="sink";` statement keeps the legend a self-contained
+        // statement.  A bare top-level `legend [...]` node emitted right after
+        // a cluster's brace-terminated (`}`, no `;`) close would otherwise be
+        // glued to that `}` by a naive statement splitter and lost.  Haskell
+        // emits shape "plain".
+        let _ = writeln!(self.buf, "  {{");
+        let _ = writeln!(self.buf, "  rank=\"sink\";");
+        let _ = writeln!(self.buf, "  legend [shape=plain,label={}];", html);
+        let _ = writeln!(self.buf, "  }}");
     }
 }
 
@@ -619,24 +866,113 @@ fn dot_html_escape(s: &str) -> String {
     out
 }
 
-fn enumerate_label_row(facts: &[LNFact], port_prefix: &str) -> String {
-    facts.iter().enumerate()
-        .map(|(i, fa)| format!("<{}{}> {}",
-            port_prefix, i, escape_dot(&format_fact(fa))))
-        .collect::<Vec<_>>()
-        .join(" | ")
+/// The `Doc` of an `LNFact` exactly as Haskell `renderLNFact =
+/// prettyLNFact` (Dot.hs:225-233, Fact.hs:551).  `prettyLNFact` builds the
+/// argument list with `nestShort' (n++"(") ")" . fsep . punctuate comma`
+/// (Fact.hs:539-546), which — unlike a bare `name(a, b)` — emits the
+/// HughesPJ INNER-PAREN SPACES `!KU( ~ltk )` when the fact fits on one line.
+/// We therefore reuse the *same* faithful `Doc` path the proof pretty-
+/// printer uses for goals (`solve_goal_to_doc` → `pretty_formula::fact_doc`
+/// on the parser-AST projection), NOT `pretty_system::pretty_fact` (which
+/// omits those spaces).
+fn fact_doc_of(fa: &LNFact) -> Doc {
+    tamarin_theory::pretty_formula::fact_doc(
+        &tamarin_theory::pretty_theory::lnfact_to_parser(fa),
+    )
 }
 
-/// Render an `LNFact` exactly as Haskell `prettyLNFact` (Fact.hs:551), via
-/// the shared faithful printer in `tamarin-theory`. This reproduces
-/// `showFactTag` (the persistent `!` prefix, Fact.hs:519-523), the
-/// `nestShort'` parenthesisation that always emits `name(...)` even for a
-/// zero-arity fact (Class.hs:221-223 / Fact.hs:542), and the
-/// `[+]/[-]/[no_precomp]` annotation block (`ppAnn`, Fact.hs:543-545). The
-/// dot path reaches the same printer in HS via
-/// `renderLNFact -> prettyLNFact` (Dot.hs:225-233).
-fn format_fact(fa: &LNFact) -> String {
-    tamarin_theory::pretty_system::pretty_fact(fa)
+/// Haskell `round :: Double -> Int` — IEEE round-half-to-EVEN (banker's
+/// rounding), unlike Rust's `f64::round` (half-away-from-zero).  The
+/// balanced widths (`conv = max 30 . round . (*1.3)`), the ribbon
+/// (`round (w / 1.5)` in `fullRender`) and `scaleIndent`'s space count all
+/// go through HS `round`, and half cases DO occur (e.g. `130/1.5 =
+/// 86.66→87`, `1.5*23 = 34.5→34`).
+fn round_half_even(x: f64) -> i64 {
+    let f = x.floor();
+    let diff = x - f;
+    if diff > 0.5 {
+        f as i64 + 1
+    } else if diff < 0.5 {
+        f as i64
+    } else {
+        let fi = f as i64;
+        if fi % 2 == 0 { fi } else { fi + 1 }
+    }
+}
+
+/// HS `renderBalanced 100 (max 30 . round . (*1.3))` + `scaleIndent`
+/// (Dot.hs:357-379), the layout engine for record-row fields: each doc of
+/// a row is rendered at a line length PROPORTIONAL to its one-line length
+/// (`renderStyle (defaultStyle { lineLength = w })`, i.e. PageMode with
+/// ribbon `round (w / 1.5)`), so a lone fact in a row gets width
+/// `max 30 (round 130) = 130` (ribbon 87) while four facts share the
+/// 100-column budget.  `usedWidths` measure the OneLineMode render
+/// (`Doc::one_line_render`), which turns every fill/sep break point into
+/// one space.
+///
+/// `scaleIndent` is applied to the WHOLE rendered string (HS's `line`
+/// binding spans the full render): `span isSpace` therefore only rescales
+/// whitespace at the very START of the FIRST line — a no-op for every
+/// label whose first char is text, exactly as in HS.
+fn render_balanced(docs: Vec<Doc>) -> Vec<String> {
+    if docs.is_empty() {
+        return Vec::new();
+    }
+    let used: Vec<f64> = docs.iter()
+        .map(|d| d.one_line_render().chars().count() as f64)
+        .collect();
+    let total: f64 = used.iter().sum();
+    let ratio = 100.0 / total;
+    docs.into_iter()
+        .zip(used)
+        .map(|(d, u)| {
+            // conv (ratio * w) with conv = max 30 . round . (*1.3).
+            let w = std::cmp::max(30, round_half_even((ratio * u) * 1.3));
+            // `renderStyle (defaultStyle { lineLength = w })` keeps
+            // ribbonsPerLine = 1.5 → ribbon = round (w / 1.5)
+            // (pretty-1.1.3.6 `fullRender`).
+            let ribbon = round_half_even(w as f64 / 1.5);
+            scale_indent(d.render_with(w as usize, ribbon as usize))
+        })
+        .collect()
+}
+
+/// HS `scaleIndent` (Dot.hs:375-379) — see `render_balanced`.
+fn scale_indent(s: String) -> String {
+    let leading = s.chars().take_while(|c| c.is_whitespace()).count();
+    if leading == 0 {
+        return s;
+    }
+    let rest: String = s.chars().skip(leading).collect();
+    let n = round_half_even(1.5 * leading as f64);
+    let mut out = String::with_capacity(n as usize + rest.len());
+    for _ in 0..n {
+        out.push(' ');
+    }
+    out.push_str(&rest);
+    out
+}
+
+/// HS `fixMultiLineLabel` (Text/Dot.hs:355-363), applied to every record
+/// FIELD by the `mkField` smart constructor (Text/Dot.hs:378-381): a
+/// multi-line label has each line's leading spaces replaced 1:1 by
+/// `&nbsp;` and is re-joined with `unlines` — which appends a TRAILING
+/// newline (→ a trailing `\l` after `showAttr`).  Single-line labels pass
+/// through untouched.
+fn fix_multi_line_label(lbl: &str) -> String {
+    if !lbl.contains('\n') {
+        return lbl.to_string();
+    }
+    let mut out = String::with_capacity(lbl.len() + 8);
+    for line in lbl.split('\n') {
+        let leading = line.chars().take_while(|c| c.is_whitespace()).count();
+        for _ in 0..leading {
+            out.push_str("&nbsp;");
+        }
+        out.extend(line.chars().skip(leading));
+        out.push('\n');
+    }
+    out
 }
 
 /// Mirror Haskell `ruleLabelM.isNotDiffAnnotation` (Dot.hs:341): the action
@@ -672,6 +1008,48 @@ fn is_auto_source(fa: &LNFact) -> bool {
         || name.starts_with("AUTO_IN_FACT_")
         || name.starts_with("AUTO_OUT_TERM_")
         || name.starts_with("AUTO_OUT_FACT_")
+}
+
+/// HS `isIntruderRule ru || isFreshRule ru` (Rule.hs:761-763 / 716-717): the
+/// predicate gating `mkNode`'s `CompactBoringNodes` branch (Dot.hs:296-297).
+/// True for any intruder rule and for the reserved proto `Fresh` rule.
+fn is_intruder_or_fresh(ru: &RuleACInst) -> bool {
+    match &ru.info {
+        RuleInfo::Intr(_) => true,
+        RuleInfo::Proto(p) => p.name == ProtoRuleName::Fresh,
+    }
+}
+
+/// Build the rule-node label Doc — HS `ruleLabelM` (Dot.hs:330-338):
+/// `prettyNodeId v <-> colon <-> text (showDotRuleCaseName ru) <> (if null lbl
+/// then mempty else brackets (vcat (punctuate comma lbl)))`. `<->` is
+/// space-separated (`#i : name`) but the action bracket is joined with `<>`
+/// (NO space before `[`), and the actions stack VERTICALLY (`vcat`,
+/// comma-punctuated) when there are several. Actions are filtered exactly
+/// as HS (`is_not_diff_annotation`; drop `AUTO_*` only when
+/// `goShowAutoSource`).  The caller lays this Doc out via
+/// `render_balanced` (HS `asM = renderRow [(Nothing, ruleLabel)]`,
+/// Dot.hs:320-322 — a single-doc row, i.e. width 130 / ribbon 87).
+fn rule_label_doc(nid: &LVar, ru: &RuleACInst, opts: &GraphOptions) -> Doc {
+    let act_docs: Vec<Doc> = ru.actions.iter()
+        .filter(|fa| is_not_diff_annotation(ru, fa))
+        .filter(|fa| !opts.show_auto_source || !is_auto_source(fa))
+        .map(fact_doc_of)
+        .collect();
+    // `prettyNodeId v <-> colon <-> text name` — three same-line text
+    // tokens joined by single spaces; layout-equivalent to one fused text
+    // run of the same width (no break points inside a `<>`/`<+>` chain).
+    let header = Doc::text(format!("{} : {}", nid, rule_case_name(ru)));
+    if act_docs.is_empty() {
+        header
+    } else {
+        // `brackets (vcat $ punctuate comma lbl)` (Dot.hs:338).
+        header
+            .beside(Doc::text("["))
+            .beside(pretty_hpj::vcat(pretty_hpj::punctuate(
+                Doc::text(","), act_docs)))
+            .beside(Doc::text("]"))
+    }
 }
 
 /// Mirror Haskell's `showDotRuleCaseName` for `RuleACInst`
@@ -764,49 +1142,200 @@ fn explicit_rule_color(ru: &RuleACInst) -> Option<String> {
 /// Pick a rule node's fill colour with HS `dotNodeCompact`'s priority
 /// (Dot.hs:248-256): `fromMaybe (maybe "white" rgbToHex color)
 /// (ruleColor' <|> manualNodeColor)` — the explicit `color:` attribute wins,
-/// then the cluster's `manualNodeColor`, then the colormap fallback.
-fn rule_fillcolor(ru: &RuleACInst, manual_color: Option<&str>) -> String {
+/// then the cluster's `manualNodeColor`, then the `nodeColorMap` palette
+/// fallback (`maybe "white" rgbToHex (M.lookup rInfo colorMap)`): a rInfo
+/// present in the map yields its palette hex, an absent one yields `"white"`.
+fn rule_fillcolor(ru: &RuleACInst, manual_color: Option<&str>,
+                  color_map: &NodeColorMap) -> String {
     explicit_rule_color(ru)
         .or_else(|| manual_color.map(|c| c.to_string()))
-        .unwrap_or_else(|| rule_group_color(ru))
+        .unwrap_or_else(|| match color_map.lookup(&ru.info) {
+            Some(rgb) => tamarin_utils::color::rgb_to_hex(rgb),
+            None => "white".to_string(),
+        })
 }
 
-fn rule_group_color(ru: &RuleACInst) -> String {
-    // APPROXIMATION (not byte-faithful): the fall-back below mirrors only the
-    // GROUP PARTITION of HS `nodeColorMap`/`groupIdx` (Dot.hs:196-205), NOT its
-    // colour values. HS computes a per-rule HSV palette via
-    // `lightColorGroups intruderHue (map (length.snd) groups)` keyed by
-    // (groupIdx, memberIdx); we substitute four fixed placeholder hexes and
-    // emit "white" for the proto "otherwise" group (HS gives that group a real
-    // HSV colour). A faithful port would need the whole rule set to size the
-    // groups — out of scope here; only the explicit-`color` attribute above is
-    // byte-exact against HS.
+/// HS `dotNodeCompact.colorUsesWhiteFont` (Dot.hs:284-287): a node uses a white
+/// font iff it HAS a palette colour and that colour is "dark" in apparent
+/// (linear) luminance, `0.2126 r + 0.7152 g + 0.0722 b < 0.5`. An absent colour
+/// (`None`) ⇒ black font. Keyed off the palette colour (`M.lookup rInfo
+/// colorMap`), not the resolved fill.
+fn color_uses_white_font(color: Option<tamarin_utils::color::Rgb>) -> bool {
+    match color {
+        Some(c) => 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b < 0.5,
+        None => false,
+    }
+}
+
+/// Key of HS `NodeColorMap` (Dot.hs:88): a rule's `rInfo`
+/// (`RuleInfo ProtoRuleACInstInfo IntrRuleACInfo`).
+type RInfo = RuleInfo<tamarin_theory::rule::ProtoRuleACInstInfo, IntrRuleACInfo>;
+
+/// Faithful port of HS `NodeColorMap` (Dot.hs:88) — the per-rule fill palette,
+/// keyed by a rule's `rInfo`. Built by [`build_node_color_map`] (port of
+/// `nodeColorMap`, Dot.hs:190-218). `rInfo` is not `Hash`/`Ord` in the Rust
+/// port (`ProtoRuleACInstInfo` only derives `PartialEq`), so we keep an
+/// association list and resolve lookups by equality. HS builds the map with
+/// `M.fromList`, which keeps the LAST value for equal keys, so [`lookup`]
+/// scans in reverse and returns the last matching entry.
+///
+/// [`lookup`]: NodeColorMap::lookup
+struct NodeColorMap<'a> {
+    entries: Vec<(&'a RInfo, tamarin_utils::color::Rgb)>,
+}
+
+impl NodeColorMap<'_> {
+    /// HS `M.lookup rInfoVal colorMap` (Dot.hs:255). Returns the LAST entry
+    /// whose `rInfo` equals `info` (matching `M.fromList`'s last-wins), or
+    /// `None` when the rInfo is absent (→ `"white"` at the call site).
+    fn lookup(&self, info: &RInfo) -> Option<tamarin_utils::color::Rgb> {
+        self.entries.iter().rev().find(|(k, _)| **k == *info).map(|(_, c)| *c)
+    }
+}
+
+/// HS `nodeColorMap.groupIdx` (Dot.hs:196-200): partition a rule into one of
+/// four colour groups. Guard order matters and mirrors HS exactly:
+///   * `isDestrRule` (DestrRule or IEqualityRule)               → 0
+///   * `isConstrRule` (Constr/Fresh/Pub/Nat constr or Coerce)   → 2
+///   * `isFreshRule` (proto `Fresh`) or `isISendRule`           → 3
+///   * otherwise (protocol rules, IRecv, …)                     → 1
+fn group_idx(ru: &RuleACInst) -> usize {
+    use tamarin_theory::rule::{
+        is_coerce_rule_info, is_constr_rule_info, is_destr_rule_info,
+        is_fresh_constr_rule_info, is_iequality_rule_info, is_isend_rule_info,
+        is_nat_constr_rule_info, is_pub_constr_rule_info,
+    };
     match &ru.info {
         RuleInfo::Intr(i) => {
-            // Mirror HS `groupIdx` (Dot.hs:196-200): group 0 (destrs) is
-            // `isDestrRule`, True for both DestrRule and IEqualityRule
-            // (Rule.hs:671-675); group 2 (constrs) is `isConstrRule`, True for
-            // ConstrRule, Fresh/Pub/Nat constr AND CoerceRule (Rule.hs:684-691).
-            if tamarin_theory::rule::is_destr_rule_info(i)
-                || tamarin_theory::rule::is_iequality_rule_info(i) {
-                "#c0d4ff".to_string()
-            } else if tamarin_theory::rule::is_constr_rule_info(i)
-                || tamarin_theory::rule::is_pub_constr_rule_info(i)
-                || tamarin_theory::rule::is_nat_constr_rule_info(i)
-                || tamarin_theory::rule::is_fresh_constr_rule_info(i)
-                || tamarin_theory::rule::is_coerce_rule_info(i) {
-                "#ffd0c0".to_string()
-            } else if tamarin_theory::rule::is_isend_rule_info(i) {
-                "#e0e0e0".to_string()
+            if is_destr_rule_info(i) || is_iequality_rule_info(i) {
+                0
+            } else if is_constr_rule_info(i)
+                || is_fresh_constr_rule_info(i)
+                || is_pub_constr_rule_info(i)
+                || is_nat_constr_rule_info(i)
+                || is_coerce_rule_info(i)
+            {
+                2
+            } else if is_isend_rule_info(i) {
+                3
             } else {
-                "white".to_string()
+                1
             }
         }
+        // `isDestrRule`/`isConstrRule`/`isISendRule` are all intruder-only, so
+        // a protocol rule only ever hits `isFreshRule` (the reserved `Fresh`
+        // rule) → 3, else the `otherwise` group → 1.
         RuleInfo::Proto(p) => {
-            // Fresh proto-rule maps to gray (HS group 3).
-            if p.name == ProtoRuleName::Fresh { "#e0e0e0".to_string() }
-            else { "white".to_string() }
+            if p.name == ProtoRuleName::Fresh { 3 } else { 1 }
         }
+    }
+}
+
+/// Faithful port of HS `nodeColorMap` (Dot.hs:190-218).
+///
+/// HS: `M.fromList [ (get rInfo ru, getColorForRule (ruleAttributes ru) gIdx
+/// mIdx) | (gIdx, grp) <- groups, (mIdx, ru) <- zip [0..] grp ]`, with the
+/// four `groups` filtered from `rules` by [`group_idx`] and coloured via
+/// `colors = lightColorGroups intruderHue (map (length . snd) groups)` and
+/// `intruderHue = 18 % 360` (Dot.hs:208,217-218).
+///
+/// `rules` here is `M.elems $ get sNodes se` (Dot.hs:485) — the raw system's
+/// nodes in NodeId order — so we sort by NodeId (`M.Map` key order) first.
+/// Each entry's colour follows `getColorForRule attrs gIdx mIdx = fromMaybe
+/// defaultColor (ruleColor attrs)` (Dot.hs:212): a rule with an explicit
+/// `color:` attribute maps to THAT colour, otherwise to the palette default
+/// (`defaultColor = hsvToRGB (getColor (gIdx, mIdx))`, Dot.hs:214).  This map
+/// value is what `dotNodeCompact` feeds to `colorUsesWhiteFont` (Dot.hs:255,
+/// 258) to pick a node's font colour — so a SAPiC rule with a dark `color:`
+/// attribute must map to that dark colour (→ white font), not to the light
+/// palette default.  (The FILL colour is resolved separately via
+/// `explicit_rule_color` at the call site, so carrying the explicit colour
+/// here changes only the font decision, never the fill.)
+fn build_node_color_map(nodes: &[(NodeId, RuleACInst)]) -> NodeColorMap<'_> {
+    use tamarin_utils::color::{hsv_to_rgb, light_color_groups, Hsv, Rgb};
+
+    // `M.elems $ get sNodes se`: iterate in NodeId (Map key) order.
+    let mut ordered: Vec<&(NodeId, RuleACInst)> = nodes.iter().collect();
+    ordered.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // `groups = [ (gIdx, [ru | ru <- rules, gIdx == groupIdx ru]) | gIdx <- 0..3 ]`
+    // — order-preserving partition into four groups.
+    let mut groups: [Vec<&RuleACInst>; 4] =
+        [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    for pair in &ordered {
+        let ru = &pair.1;
+        groups[group_idx(ru)].push(ru);
+    }
+    let sizes: [usize; 4] =
+        [groups[0].len(), groups[1].len(), groups[2].len(), groups[3].len()];
+
+    // `colors = M.fromList $ lightColorGroups intruderHue (map (length . snd)
+    // groups)`, `intruderHue = 18 % 360`. The palette is exact `Rational` in
+    // HS; the f64 port matches `rgbToHex`'s `floor(256*f)` quantisation for all
+    // realistic group sizes (verified: 0/4.28M hex divergences).
+    const INTRUDER_HUE: f64 = 18.0 / 360.0;
+    let palette = light_color_groups(INTRUDER_HUE, &sizes);
+    let get_color = |gi: usize, mi: usize| -> Hsv {
+        palette.iter()
+            .find(|((g, m), _)| *g == gi && *m == mi)
+            .map(|(_, hsv)| *hsv)
+            // `getColor idx = fromMaybe (HSV 0 1 1) (M.lookup idx colors)`
+            // (Dot.hs:209) — unreachable for a valid (gIdx, mIdx).
+            .unwrap_or_else(|| Hsv::new(0.0, 1.0, 1.0))
+    };
+
+    let mut entries: Vec<(&RInfo, Rgb)> = Vec::new();
+    for (gi, grp) in groups.iter().enumerate() {
+        for (mi, ru) in grp.iter().enumerate() {
+            // `getColorForRule attrs gIdx mIdx = fromMaybe defaultColor
+            // (ruleColor attrs)` (Dot.hs:212): explicit `color:` wins, else the
+            // palette default.  `ruleAttributes ru = praciAttributes` for a
+            // RuleACInst (Rule.hs:674) — the same attributes `explicit_rule_color`
+            // reads, so a coloured rule maps to its own dark fill colour.
+            let color = match &ru.info {
+                RuleInfo::Proto(p) => {
+                    p.attributes.color.unwrap_or_else(|| hsv_to_rgb(get_color(gi, mi)))
+                }
+                _ => hsv_to_rgb(get_color(gi, mi)),
+            };
+            entries.push((&ru.info, color));
+        }
+    }
+    NodeColorMap { entries }
+}
+
+/// Whether a node exposes Graphviz record ports (`:c<i>` / `:p<i>`).
+/// HS `mkNode` (Dot.hs:294-312) only renders a record — with ports — for a
+/// non-compact System node; a COMPACT node (intruder/`Fresh` under
+/// `CompactBoringNodes`) and every non-System ellipse (missing / action / last)
+/// map ALL their prem/conc keys to the bare node id (no port, Dot.hs:303-304).
+/// `node_map` holds only System nodes, so an id absent from it is a non-System
+/// ellipse (portless); a present intruder/`Fresh` rule is a compact ellipse.
+fn node_has_ports(node_map: &HashMap<&LVar, &RuleACInst>, nid: &LVar) -> bool {
+    node_map.get(nid).is_some_and(|ru| !is_intruder_or_fresh(ru))
+}
+
+/// Render an edge's conclusion endpoint: `id:c<i>` for a record node, else the
+/// bare `id` (compact/simple node — HS emits no port there).
+fn conc_port_ref(node_map: &HashMap<&LVar, &RuleACInst>,
+                 nc: &tamarin_theory::constraint::constraints::NodeConc) -> String {
+    let id = DotBuilder::dot_node_id(&nc.0);
+    if node_has_ports(node_map, &nc.0) {
+        format!("{}:c{}", id, nc.1.0)
+    } else {
+        id
+    }
+}
+
+/// Render an edge's premise endpoint: `id:p<i>` for a record node, else the
+/// bare `id` (compact/simple node — HS emits no port there).
+fn prem_port_ref(node_map: &HashMap<&LVar, &RuleACInst>,
+                 np: &tamarin_theory::constraint::constraints::NodePrem) -> String {
+    let id = DotBuilder::dot_node_id(&np.0);
+    if node_has_ports(node_map, &np.0) {
+        format!("{}:p{}", id, np.1.0)
+    } else {
+        id
     }
 }
 
@@ -889,20 +1418,38 @@ fn role_color(name: &str) -> String {
         chan(rgb.r), chan(rgb.g), chan(rgb.b), alpha)
 }
 
-fn escape_dot(s: &str) -> String {
-    // Escape `"`, `\`, `{`, `}`, `|`, `<`, `>`, and newline for the
-    // Graphviz record string syntax.
+/// Escape a record FIELD's text, mirroring HS `Text.Dot.renderRecord`'s
+/// `escape` (Text/Dot.hs:273-280): exactly the record metacharacters
+/// `| { } < >` get a backslash — NOT `"` / `\` / newline, which are handled
+/// once at the attribute level by `showAttr` (see `escape_dot_label`).
+fn escape_record_field(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '|' => out.push_str("\\|"),
+            '{' => out.push_str("\\{"),
+            '}' => out.push_str("\\}"),
+            '<' => out.push_str("\\<"),
+            '>' => out.push_str("\\>"),
+            _   => out.push(c),
+        }
+    }
+    out
+}
+
+/// Escape a Graphviz attribute VALUE, mirroring HS `Text.Dot.showAttr`
+/// (Text/Dot.hs:346-353): only `"` (→ `\"`) and newline (→ `\l`, graphviz's
+/// left-justified line break) are escaped.  This is the LAST escaping pass
+/// for every label — plain ellipse labels (where record metacharacters
+/// `{ } | < >` must stay literal) and record labels (whose field text was
+/// already record-escaped by `escape_record_field`) alike.  Emitting `\n`
+/// instead of `\l` here was task #20's dominant DOT divergence.
+fn escape_dot_label(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
             '"'  => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '{'  => out.push_str("\\{"),
-            '}'  => out.push_str("\\}"),
-            '|'  => out.push_str("\\|"),
-            '<'  => out.push_str("\\<"),
-            '>'  => out.push_str("\\>"),
-            '\n' => out.push_str("\\n"),
+            '\n' => out.push_str("\\l"),
             _    => out.push(c),
         }
     }
@@ -951,6 +1498,83 @@ mod tests {
         assert!(s.contains("Setup"));
         assert!(s.contains("Fr"));
         assert!(s.contains("Out"));
+    }
+
+    // Minimized web-parity repro for task #20 (dot shape): the premise /
+    // conclusion rows of OIDC_Implicit's `Browser_Redirects_To_URI` record
+    // node must be laid out by HS `renderRow`/`renderBalanced`
+    // (Dot.hs:357-379) — each field at width `max 30 (round (1.3 * 100 *
+    // oneLineLen/sumLens))`, ribbon `round (w/1.5)` — NOT at the page width.
+    // Expected bytes extracted verbatim from the cached HS response for
+    // `/thy/trace/…/interactive-graph-def/proof/Nonce_Sources/…` on
+    // `examples/asiaccs20-POIDC/OIDC_Implicit.spthy` (`\l`→`\n`,
+    // `&nbsp;`→space, record escapes undone).
+    #[test]
+    fn render_balanced_matches_hs_oidc_rows() {
+        use tamarin_theory::fact::{proto_fact, Multiplicity};
+        use tamarin_term::builtin::pair;
+        use tamarin_term::lterm::{pub_term, LSort, LVar};
+        use tamarin_term::vterm::var_term;
+
+        let mv = |n: &str| var_term(LVar::new(n, LSort::Msg, 0));
+        let pv = |n: &str| var_term(LVar::new(n, LSort::Pub, 0));
+        // <'id_token', <'iss', iss>, <'sub', sub>, <'aud', aud>, 'nonce', nonce>
+        let inner = || {
+            pair(
+                pub_term("id_token"),
+                pair(
+                    pair(pub_term("iss"), mv("iss")),
+                    pair(
+                        pair(pub_term("sub"), mv("sub")),
+                        pair(
+                            pair(pub_term("aud"), mv("aud")),
+                            pair(pub_term("nonce"), mv("nonce")),
+                        ),
+                    ),
+                ),
+            )
+        };
+        // <RE1, $uri, AU1, <inner>, sig>
+        let big = pair(
+            mv("RE1"),
+            pair(pv("uri"), pair(mv("AU1"), pair(inner(), mv("sig")))),
+        );
+        let f1 = proto_fact(Multiplicity::Persistent, "Server_to_Client_TLS",
+            vec![pv("Server1"), mv("BR1"), big]);
+        let f2 = proto_fact(Multiplicity::Persistent, "St_Browser_Session",
+            vec![mv("BR2"), pv("Server1"), mv("BR1")]);
+        let f3 = proto_fact(Multiplicity::Persistent, "St_Browser_Session",
+            vec![mv("BR2"), pv("Server"), mv("BR3")]);
+        let f4 = proto_fact(Multiplicity::Persistent, "Uri_belongs_to",
+            vec![pv("uri"), pv("Server")]);
+
+        // The 4-premise row: widths proportional to one-line lengths.
+        let sp = |n: usize| " ".repeat(n);
+        let rows = render_balanced(
+            [&f1, &f2, &f3, &f4].iter().map(|f| fact_doc_of(f)).collect());
+        assert_eq!(rows[0], format!(
+            "!Server_to_Client_TLS( $Server1, BR1,\n{}<RE1, $uri, AU1, \n{}<'id_token', <'iss', iss>, <'sub', sub>, \n{}<'aud', aud>, 'nonce', nonce>, \n{}sig>\n)",
+            sp(23), sp(24), sp(25), sp(24)), "row 0:\n{}", rows[0]);
+        assert_eq!(rows[1], format!(
+            "!St_Browser_Session( BR2,\n{}$Server1,\n{}BR1\n)",
+            sp(21), sp(21)), "row 1:\n{}", rows[1]);
+        assert_eq!(rows[2], format!(
+            "!St_Browser_Session( BR2,\n{}$Server,\n{}BR3\n)",
+            sp(21), sp(21)), "row 2:\n{}", rows[2]);
+        assert_eq!(rows[3], format!(
+            "!Uri_belongs_to( $uri,\n{}$Server\n)",
+            sp(17)), "row 3:\n{}", rows[3]);
+
+        // The single-fact conclusion row: w = max 30 (round 130) = 130,
+        // ribbon = round(130/1.5) = 87 — the 82-col pair fits ONE line
+        // (at the page width 100/67 it would split like the premise row).
+        let conc = proto_fact(Multiplicity::Persistent, "Client_to_Server_TLS",
+            vec![mv("BR3"), pv("Server"),
+                 pair(mv("AU1"), pair(inner(), mv("sig")))]);
+        let crow = render_balanced(vec![fact_doc_of(&conc)]);
+        assert_eq!(crow[0], format!(
+            "!Client_to_Server_TLS( BR3, $Server,\n{}<AU1, <'id_token', <'iss', iss>, <'sub', sub>, <'aud', aud>, 'nonce', nonce>, sig>\n)",
+            sp(23)), "conc row:\n{}", crow[0]);
     }
 
     #[test]
@@ -1180,12 +1804,14 @@ mod tests {
     #[test]
     fn dot_persistent_fact_keeps_bang_prefix_and_zero_arity_parens() {
         // HS `prettyLNFact`: a persistent proto fact gets the `!` prefix
-        // (showFactTag, Fact.hs:519-523), and a zero-arity fact still renders
-        // `Name()` (nestShort', Class.hs:221-223 / Fact.hs:542).
+        // (showFactTag, Fact.hs:519-523), and a zero-arity fact renders
+        // `Name( )` — `nestShort'` = `sep [text (n++"("), text ")"]`, whose
+        // `sep` space-joins the two when they fit on one line (Class.hs:221-223 /
+        // Fact.hs:544).
         //
         // Authenticated against the repo's HS prover (v1.13.0) on a minimal
         // theory: `--prove` shows `[ Fr( ~k ) ] --> [ !Reg( ~k ), Started( ) ]`
-        // — i.e. the `!` prefix on `!Reg` and the empty parens on `Started`.
+        // — i.e. the `!` prefix on `!Reg` and the spaced empty parens on `Started`.
         use tamarin_theory::fact::{fresh_fact, proto_fact, Multiplicity};
         use tamarin_term::lterm::{LSort, LVar};
         use tamarin_term::term::Term;
@@ -1202,8 +1828,8 @@ mod tests {
             ..GraphOptions::default() };
         let s = system_to_dot_with(&sys, &opts);
         assert!(s.contains("!Reg("), "persistent `!` prefix missing: {}", s);
-        assert!(s.contains("Started()"),
-            "zero-arity fact should render `Started()`: {}", s);
+        assert!(s.contains("Started( )"),
+            "zero-arity fact should render `Started( )`: {}", s);
     }
 
     #[test]
@@ -1255,10 +1881,65 @@ mod tests {
         let opts = GraphOptions { compress: false, abbreviate: false,
             ..GraphOptions::default() };
         let s = system_to_dot_with(&sys, &opts);
-        assert!(s.contains("Visible()"),
+        assert!(s.contains("Visible( )"),
             "non-diff action fact must remain: {}", s);
         assert!(!s.contains("DiffProtoR"),
             "Diff annotation fact must be filtered out: {}", s);
+    }
+
+    #[test]
+    fn dot_compact_intruder_node_is_plain_ellipse() {
+        // HS `mkNode` CompactBoringNodes (Dot.hs:294-304): an intruder rule
+        // collapses to a plain `mkSimpleNode` ellipse with NO fill/role attrs.
+        // With an outgoing edge the label is `#id : name` (actions dropped);
+        // without one it is the full `#id : name[acts]`. Compact endpoints also
+        // carry no record ports (Dot.hs:303-304).
+        use tamarin_theory::constraint::constraints::Edge;
+        use tamarin_theory::fact::{in_fact, out_fact, proto_fact, Multiplicity};
+        use tamarin_theory::rule::{ConcIdx, IntrRuleACInfo, PremIdx, Rule};
+        use tamarin_term::lterm::{LSort, LVar};
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+        let opts = GraphOptions { compress: false, abbreviate: false,
+            ..GraphOptions::default() };
+        let x = Term::Lit(Lit::Var(LVar::new("x", LSort::Fresh, 0)));
+
+        // (1) coerce with an outgoing edge -> compact `#j : coerce`, no actions.
+        let mut sys = System::empty();
+        let coerce = Rule::new(RuleInfo::Intr(IntrRuleACInfo::Coerce),
+            vec![in_fact(x.clone())], vec![out_fact(x.clone())],
+            vec![proto_fact(Multiplicity::Linear, "Act", vec![x.clone()])]);
+        let isend = Rule::new(RuleInfo::Intr(IntrRuleACInfo::ISend),
+            vec![in_fact(x.clone())], vec![out_fact(x.clone())], Vec::new());
+        let j = LVar::new("j", LSort::Node, 0);
+        let v = LVar::new("v", LSort::Node, 0);
+        sys.add_node(j.clone(), coerce);
+        sys.add_node(v.clone(), isend);
+        sys.edges.push(Edge { src: (j.clone(), ConcIdx(0)), tgt: (v.clone(), PremIdx(0)) });
+        let out = system_to_dot_with(&sys, &opts);
+        // Outgoing coerce: `#j : coerce` (its `Act(..)` action is dropped).
+        assert!(out.contains("label=\"#j : coerce\",shape=ellipse"),
+            "outgoing intruder node must be a plain ellipse `#j : coerce`: {out}");
+        assert!(!out.contains("coerce[Act"),
+            "outgoing compact label must drop the action row: {out}");
+        // Compact nodes carry no record ports and no fill/role attrs.
+        assert!(!out.contains("<p0>") && !out.contains("<c0>"),
+            "compact intruder nodes must not emit record ports: {out}");
+        assert!(!out.contains("fillcolor"),
+            "compact intruder nodes carry no fill: {out}");
+        // The compact->compact edge is emitted portless.
+        assert!(out.contains("j_0 -> v_0"),
+            "edge between two compact nodes must be portless: {out}");
+
+        // (2) coerce with NO outgoing edge keeps the bracketed action row.
+        let mut sys2 = System::empty();
+        let coerce2 = Rule::new(RuleInfo::Intr(IntrRuleACInfo::Coerce),
+            vec![in_fact(x.clone())], vec![out_fact(x.clone())],
+            vec![proto_fact(Multiplicity::Linear, "Act", vec![x.clone()])]);
+        sys2.add_node(LVar::new("k", LSort::Node, 0), coerce2);
+        let out2 = system_to_dot_with(&sys2, &opts);
+        assert!(out2.contains("#k : coerce[Act( ~x )]"),
+            "non-outgoing compact label keeps the `[..]` action row: {out2}");
     }
 
     #[test]
@@ -1349,5 +2030,221 @@ mod tests {
         // Cluster subgraph styling: filled with the roleColor.
         assert!(s.contains("style=\"filled\";"),
             "cluster must be style=filled: {}", s);
+    }
+
+    // ---- nodeColorMap palette (HS Dot.hs:190-218) ----------------------------
+
+    use tamarin_theory::rule::{
+        IntrRuleACInfo, ProtoRuleACInstInfo, ProtoRuleName as PRN, Rule as TRule,
+        RuleAttributes, RuleInfo as TRuleInfo,
+    };
+    use tamarin_term::lterm::{LSort, LVar};
+
+    /// A bare intruder-rule node (no facts) with the given `IntrRuleACInfo`.
+    fn intr_node(info: IntrRuleACInfo) -> RuleACInst {
+        TRule::new(TRuleInfo::Intr(info), Vec::new(), Vec::new(), Vec::new())
+    }
+    /// A bare protocol-rule node (no facts) with the given name.
+    fn named_proto_node(name: PRN) -> RuleACInst {
+        TRule::new(
+            TRuleInfo::Proto(ProtoRuleACInstInfo {
+                name,
+                attributes: RuleAttributes::empty(),
+                loop_breakers: Vec::new(),
+            }),
+            Vec::new(), Vec::new(), Vec::new())
+    }
+    fn nid(i: u64) -> NodeId { LVar::new("i", LSort::Node, i) }
+    fn destr(n: &[u8]) -> IntrRuleACInfo {
+        IntrRuleACInfo::DestrRule(n.to_vec(), 0, false, false)
+    }
+    fn hex_of(cm: &NodeColorMap, ru: &RuleACInst) -> String {
+        tamarin_utils::color::rgb_to_hex(cm.lookup(&ru.info).unwrap())
+    }
+
+    #[test]
+    fn group_idx_partition_matches_hs() {
+        // HS groupIdx (Dot.hs:196-200).
+        assert_eq!(group_idx(&intr_node(destr(b"x"))), 0);          // isDestrRule
+        assert_eq!(group_idx(&intr_node(IntrRuleACInfo::IEquality)), 0);
+        assert_eq!(group_idx(&intr_node(IntrRuleACInfo::ConstrRule(b"c".to_vec()))), 2);
+        assert_eq!(group_idx(&intr_node(IntrRuleACInfo::Coerce)), 2); // isConstrRule
+        assert_eq!(group_idx(&intr_node(IntrRuleACInfo::FreshConstr)), 2);
+        assert_eq!(group_idx(&intr_node(IntrRuleACInfo::PubConstr)), 2);
+        assert_eq!(group_idx(&intr_node(IntrRuleACInfo::NatConstr)), 2);
+        assert_eq!(group_idx(&intr_node(IntrRuleACInfo::ISend)), 3);  // isISendRule
+        assert_eq!(group_idx(&named_proto_node(PRN::Fresh)), 3);      // isFreshRule
+        assert_eq!(group_idx(&intr_node(IntrRuleACInfo::IRecv)), 1);  // otherwise
+        assert_eq!(group_idx(&named_proto_node(PRN::Stand("R"))), 1); // otherwise
+    }
+
+    #[test]
+    fn node_color_map_palette_hex_matches_hs() {
+        // Expected hexes are hand-computed from HS `nodeColorMap` in EXACT
+        // Rational arithmetic (lightColorGroups intruderHue sizes; intruderHue
+        // = 18 % 360; hsvToRGB; rgbToHex = floor(256*f)), cross-checked against
+        // the f64 port over 4.28M size combinations (0 divergences).
+
+        // ---- one rule per group: sizes = [1, 1, 1, 1] ----
+        let n1111: Vec<(NodeId, RuleACInst)> = vec![
+            (nid(0), intr_node(destr(b"d"))),                       // g0 (0,0)
+            (nid(1), named_proto_node(PRN::Stand("R"))),           // g1 (1,0)
+            (nid(2), intr_node(IntrRuleACInfo::ConstrRule(b"c".to_vec()))), // g2 (2,0)
+            (nid(3), named_proto_node(PRN::Fresh)),                // g3 (3,0)
+        ];
+        let cm = build_node_color_map(&n1111);
+        assert_eq!(hex_of(&cm, &n1111[0].1), "#ce90ac"); // (0,0)
+        assert_eq!(hex_of(&cm, &n1111[1].1), "#d5d897"); // (1,0)
+        assert_eq!(hex_of(&cm, &n1111[2].1), "#9ee1c3"); // (2,0)
+        assert_eq!(hex_of(&cm, &n1111[3].1), "#a8a4eb"); // (3,0)
+
+        // ---- sizes = [2, 1, 3, 1], member index tracks NodeId order ----
+        let n2131: Vec<(NodeId, RuleACInst)> = vec![
+            (nid(0), intr_node(destr(b"d1"))),                       // g0 (0,0)
+            (nid(1), intr_node(destr(b"d2"))),                       // g0 (0,1)
+            (nid(2), named_proto_node(PRN::Stand("R"))),            // g1 (1,0)
+            (nid(3), intr_node(IntrRuleACInfo::ConstrRule(b"c1".to_vec()))), // g2 (2,0)
+            (nid(4), intr_node(IntrRuleACInfo::ConstrRule(b"c2".to_vec()))), // g2 (2,1)
+            (nid(5), intr_node(IntrRuleACInfo::Coerce)),            // g2 (2,2)
+            (nid(6), named_proto_node(PRN::Fresh)),                // g3 (3,0)
+        ];
+        let cm = build_node_color_map(&n2131);
+        assert_eq!(hex_of(&cm, &n2131[0].1), "#ce90ac"); // (0,0)
+        assert_eq!(hex_of(&cm, &n2131[1].1), "#d19292"); // (0,1)
+        assert_eq!(hex_of(&cm, &n2131[2].1), "#d5d897"); // (1,0)
+        assert_eq!(hex_of(&cm, &n2131[3].1), "#9ee1c3"); // (2,0)
+        assert_eq!(hex_of(&cm, &n2131[4].1), "#9fe3d9"); // (2,1)
+        assert_eq!(hex_of(&cm, &n2131[5].1), "#a0dbe5"); // (2,2)
+        assert_eq!(hex_of(&cm, &n2131[6].1), "#a8a4eb"); // (3,0)
+    }
+
+    #[test]
+    fn node_color_map_sorts_by_nodeid_not_insertion_order() {
+        // HS keys on `M.elems sNodes` = NodeId order, so member indices must
+        // follow NodeId order even when nodes are inserted out of order. Insert
+        // the second destr first; after the NodeId sort the (0,0)/(0,1) split
+        // must still land by NodeId, matching the in-order [2,1,3,1] map.
+        let shuffled: Vec<(NodeId, RuleACInst)> = vec![
+            (nid(1), intr_node(destr(b"d2"))),  // (0,1) after sort
+            (nid(0), intr_node(destr(b"d1"))),  // (0,0) after sort
+        ];
+        let cm = build_node_color_map(&shuffled);
+        // d1 (nid 0) is member 0; d2 (nid 1) is member 1 — regardless of the
+        // insertion order above.
+        assert_eq!(hex_of(&cm, &shuffled[1].1), "#ce90ac"); // d1 -> (0,0)
+        assert_eq!(hex_of(&cm, &shuffled[0].1), "#d19292"); // d2 -> (0,1)
+    }
+
+    #[test]
+    fn node_color_map_last_wins_on_duplicate_rinfo() {
+        // Two nodes sharing an identical rInfo collapse to one key; HS
+        // `M.fromList` keeps the LAST, so both resolve to the (1,1) colour,
+        // not (1,0). sizes = [0, 2, 0, 0]: (1,0)=#d5d897, (1,1)=#badb99.
+        let dup: Vec<(NodeId, RuleACInst)> = vec![
+            (nid(0), named_proto_node(PRN::Stand("R"))), // (1,0)
+            (nid(1), named_proto_node(PRN::Stand("R"))), // (1,1) — same rInfo
+        ];
+        let cm = build_node_color_map(&dup);
+        // Both look up the LAST member's colour.
+        assert_eq!(hex_of(&cm, &dup[0].1), "#badb99");
+        assert_eq!(hex_of(&cm, &dup[1].1), "#badb99");
+    }
+
+    #[test]
+    fn rule_fillcolor_priority_matches_hs() {
+        use tamarin_utils::color::Rgb;
+        // Palette-only map for a single otherwise-group proto rule "R":
+        // sizes = [0,1,0,0] -> (1,0) = #d5d897.
+        let nodes: Vec<(NodeId, RuleACInst)> =
+            vec![(nid(0), named_proto_node(PRN::Stand("R")))];
+        let cm = build_node_color_map(&nodes);
+        let r = &nodes[0].1;
+
+        // (3) palette fallback: no explicit colour, no manual colour.
+        assert_eq!(rule_fillcolor(r, None, &cm), "#d5d897");
+        // (2) cluster manualNodeColor beats the palette.
+        assert_eq!(rule_fillcolor(r, Some("#123456"), &cm), "#123456");
+        // (1) explicit `color:` attribute beats both manual and palette.
+        let mut colored = named_proto_node(PRN::Stand("R"));
+        if let TRuleInfo::Proto(p) = &mut colored.info {
+            p.attributes.color = Some(Rgb::new(1.0, 0.5, 0.0));
+        }
+        let expect = tamarin_utils::color::rgb_to_hex(Rgb::new(1.0, 0.5, 0.0));
+        assert_eq!(rule_fillcolor(&colored, Some("#123456"), &cm), expect);
+
+        // rInfo absent from the map -> HS `maybe "white" ...` = "white".
+        let absent = named_proto_node(PRN::Stand("NotInMap"));
+        assert_eq!(rule_fillcolor(&absent, None, &cm), "white");
+    }
+
+    #[test]
+    fn dot_rule_node_uses_faithful_palette_fillcolor() {
+        // End-to-end through system_to_dot_with: a lone protocol rule is the
+        // sole member of group 1, so its fill colour is the (1,0) palette hex
+        // #d5d897 (NOT the old placeholder "white").
+        use tamarin_theory::fact::out_fact;
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+        let mut sys = System::empty();
+        let k = Term::Lit(Lit::Var(LVar::new("k", LSort::Fresh, 0)));
+        sys.add_node(nid(0),
+            named_proto_node_with_out(PRN::Stand("R"), out_fact(k)));
+        let opts = GraphOptions { compress: false, abbreviate: false,
+            ..GraphOptions::default() };
+        let s = system_to_dot_with(&sys, &opts);
+        assert!(s.contains("fillcolor=\"#d5d897\""),
+            "rule node must use the faithful nodeColorMap palette hex: {}", s);
+        // HS record attrs: the light palette colour is bright, so a black font
+        // (Dot.hs:258/284-287); no `role` attribute -> "Undefined" (Dot.hs:259).
+        assert!(s.contains("fontcolor=\"black\""),
+            "bright palette colour must use a black font: {}", s);
+        assert!(s.contains("role=\"Undefined\""),
+            "role-less rule must render role=\"Undefined\": {}", s);
+    }
+
+    #[test]
+    fn color_uses_white_font_matches_hs_luminance() {
+        use tamarin_utils::color::Rgb;
+        // HS colorUsesWhiteFont: 0.2126r + 0.7152g + 0.0722b < 0.5 (and Just).
+        assert!(!color_uses_white_font(None));                       // absent -> black
+        assert!(!color_uses_white_font(Some(Rgb::new(1.0, 1.0, 1.0)))); // white bg -> black font
+        assert!(color_uses_white_font(Some(Rgb::new(0.0, 0.0, 0.0))));  // black bg -> white font
+        // A dark blue (low luminance) uses a white font.
+        assert!(color_uses_white_font(Some(Rgb::new(0.0, 0.0, 1.0))));  // 0.0722 < 0.5
+        // A pure green is bright enough for a black font (0.7152 >= 0.5).
+        assert!(!color_uses_white_font(Some(Rgb::new(0.0, 1.0, 0.0))));
+    }
+
+    #[test]
+    fn rule_node_emits_role_attribute() {
+        // HS `role = fromMaybe "Undefined" (getNodeRole node)` (Dot.hs:243,259):
+        // a rule carrying a `role` attribute renders it verbatim.
+        use tamarin_theory::fact::out_fact;
+        use tamarin_term::term::Term;
+        use tamarin_term::vterm::Lit;
+        let mut sys = System::empty();
+        let k = Term::Lit(Lit::Var(LVar::new("k", LSort::Fresh, 0)));
+        let mut ru = named_proto_node_with_out(PRN::Stand("R"), out_fact(k));
+        if let TRuleInfo::Proto(p) = &mut ru.info {
+            p.attributes.role = Some("Alice".to_string());
+        }
+        sys.add_node(nid(0), ru);
+        let opts = GraphOptions { compress: false, abbreviate: false,
+            ..GraphOptions::default() };
+        let s = system_to_dot_with(&sys, &opts);
+        assert!(s.contains("role=\"Alice\""),
+            "rule node must render its role attribute: {}", s);
+    }
+
+    /// Like [`named_proto_node`] but with a single conclusion so the node is
+    /// not compressed away.
+    fn named_proto_node_with_out(name: PRN, conc: LNFact) -> RuleACInst {
+        TRule::new(
+            TRuleInfo::Proto(ProtoRuleACInstInfo {
+                name,
+                attributes: RuleAttributes::empty(),
+                loop_breakers: Vec::new(),
+            }),
+            Vec::new(), vec![conc.clone()], vec![conc])
     }
 }

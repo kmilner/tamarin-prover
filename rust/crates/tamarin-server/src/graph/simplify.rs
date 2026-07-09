@@ -59,7 +59,18 @@ fn drop_entailed_ord_constraints(mut sys: System) -> System {
     let adj = build_raw_edge_adjacency(&sys);
     let mut new_atoms: Vec<LessAtom> = Vec::with_capacity(sys.less_atoms.len());
     for la in &sys.less_atoms {
-        if !reachable(&adj, &la.smaller, &la.larger) {
+        // HS `entailed (LessAtom from to _) = to `S.member` reachableSet [from] edges`
+        // (Simplification.hs:38).  `Dag.reachableSet [from]` ALWAYS contains the
+        // start node `from` itself (DAG/Simple.hs:72-78: `visit` inserts `x`
+        // before recursing), so a REFLEXIVE atom (`from == to`) is unconditionally
+        // entailed — hence dropped from the display graph.  `reachable` below is
+        // strict-path (returns false for `from == to`), so the reflexive case must
+        // be added explicitly to match HS; otherwise a `#t1 < #t1` born from a
+        // `#t1 < #t2` less-atom collapsed under a `t2 = t1` subst survives here and
+        // renders as a spurious dashed self-loop that HS never draws.
+        let entailed = la.smaller == la.larger
+            || reachable(&adj, &la.smaller, &la.larger);
+        if !entailed {
             new_atoms.push(la.clone());
         }
     }
@@ -171,10 +182,17 @@ fn guarded_mentions_node(v: &NodeId, g: &tamarin_theory::guarded::Guarded) -> bo
 
 fn atom_mentions_node(v: &NodeId, at: &tamarin_theory::guarded_types::GAtom) -> bool {
     use tamarin_theory::guarded_types::{GAtom, GTerm, BVar};
-    let v_name = &v.name;
     let mentions_term = |t: &GTerm| -> bool {
         if let GTerm::Var(BVar::Free(spec)) = t {
-            return spec.name == **v_name;
+            // HS `notOccursIn proj = not $ getAny $ foldFrees (Any . (v ==))
+            // (proj se)` (Simplification.hs:95-96) folds FULL `LVar` equality
+            // (name AND idx AND sort) over the formula's free vars. Comparing
+            // the NAME ONLY spuriously matches a different index — e.g. node
+            // `#vr.4` matched a formula mentioning `#vr` (idx 0), wrongly
+            // rejecting `#vr.4` from compression and keeping a transfer node
+            // (`d_0_snd`) HS hides. Match name AND idx (both are node-sort
+            // here: `v` is a NodeId and only node vars can equal it).
+            return *spec.name == *v.name && spec.idx == v.idx;
         }
         false
     };
@@ -321,18 +339,28 @@ fn try_hide_rule(v: &NodeId, ru: RuleACInst, sys: System) -> Result<System, Syst
 }
 
 fn rule_eligible(ru: &RuleACInst) -> bool {
-    match &ru.info {
+    // HS `eligibleRule` (Simplification.hs:148-152):
+    //   any ($ ru) [isISendRule, isIRecvRule, isCoerceRule, isFreshRule]
+    //   || ( null (get rActs ru) && all (\l -> length (get l ru) <= 1) [rPrems, rConcs] )
+    // The `isFooRule` disjunction and the `null rActs && <=1 prem/conc` fallback
+    // are INDEPENDENT — the fallback applies to EVERY rule, not just proto rules.
+    // In particular an intruder destructor such as `d_0_snd` (no actions, one
+    // premise, one conclusion) is eligible via the fallback even though it is
+    // not isend/irecv/coerce; HS hides it (bridging its single in/out edge),
+    // so RS must too.
+    let is_special = match &ru.info {
         RuleInfo::Intr(i) => {
             is_irecv_rule_info(i) || is_isend_rule_info(i) || is_coerce_rule_info(i)
         }
         RuleInfo::Proto(p) => {
             // isFreshRule treats only the Fresh proto-rule as fresh.
-            if p.name == tamarin_theory::rule::ProtoRuleName::Fresh { return true; }
-            ru.actions.is_empty()
-                && ru.premises.len() <= 1
-                && ru.conclusions.len() <= 1
+            p.name == tamarin_theory::rule::ProtoRuleName::Fresh
         }
-    }
+    };
+    is_special
+        || (ru.actions.is_empty()
+            && ru.premises.len() <= 1
+            && ru.conclusions.len() <= 1)
 }
 
 // ---------------------------------------------------------------------

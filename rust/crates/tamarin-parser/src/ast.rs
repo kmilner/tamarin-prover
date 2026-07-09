@@ -138,6 +138,14 @@ pub struct Lemma {
     pub trace_quantifier: TraceQuantifier,
     pub formula: Formula,
     pub proof: Option<ProofSkeleton>,
+    /// The verbatim source text of the lemma (from the `lemma` keyword up to
+    /// and including the trailing whitespace/comments after its proof
+    /// skeleton), with comments stripped.  Mirrors HS `_lPlaintext`
+    /// (`ProtoLemma`, `Items/LemmaItem.hs:50`), which the parser fills from
+    /// `removeComments $ take (length start - length end) start`
+    /// (`Theory/Text/Parser/Lemma.hs:87`).  Used only by the interactive web
+    /// server's Edit-lemma form (never rendered by `--prove`).
+    pub plaintext: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]

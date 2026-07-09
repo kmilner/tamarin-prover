@@ -668,12 +668,14 @@ impl EquationStore {
         // the local subst at the end (mirrors `flattenUnif` =
         // `map (\`composeVFresh\` subst) substs`).
         //
-        // Pass `extra_avoid` (the caller's system-wide max var idx)
-        // to the unifier so Maude-introduced witness vars get indices
-        // above any system var, preventing `~mw:Pub:N` / `~mw:Msg:N`
-        // collisions that break our (name, sort, idx) LVar identity.
-        let avoid = self.fresh_baseline().max(extra_avoid);
-        let unifiers = maude.unify_at_with_avoid("eq_store::add_eqs", &ac_residuals, avoid)
+        // HS-faithful (EquationStore.hs:311-313 `addEqs`): the AC unifier
+        // is `unifyLNTermFactored eqs` with NO avoid — witness idxs are
+        // numbered purely per-call at `avoid (M.elems bindings)`
+        // (Term/Maude/Types.hs:112-113) and the resulting `SubstVFresh`
+        // witnesses are α-scoped per subst, so a system-wide floor is
+        // neither passed nor needed.  (The single-unifier arm below still
+        // re-bases its own witnesses via `freshen_witness_range`.)
+        let unifiers = maude.unify_at("eq_store::add_eqs", &ac_residuals)
             .map_err(|e| AddEqsError::Maude(format!("{}", e)))?;
 
         if unifiers.is_empty() {
@@ -1322,6 +1324,10 @@ impl EquationStore {
         // Allocate a fresh witness fv with the narrower sort `s`.
         let new_idx = alloc(1);
         let fv = LVar { name: v.name, sort: s, idx: new_idx };
+        if tamarin_utils::env_gate!("TAM_RS_DBG_FOLD_DRAWS") {
+            eprintln!("[rs-fold] simpAbstractSortedVar v={}.{} fv={}.{}/{:?}",
+                v.name, v.idx, fv.name, fv.idx, fv.sort);
+        }
         // Compose {v → Var(fv)} into the free substitution.
         let factor = LNSubst::from_list(vec![
             (v.clone(), Term::Lit(Lit::Var(fv.clone()))),
@@ -1434,6 +1440,12 @@ impl EquationStore {
                 let idx_alloc = alloc(1);
                 fvars.push(LVar { name: "x", sort: LSort::Msg, idx: idx_alloc });
             }
+            if tamarin_utils::env_gate!("TAM_RS_DBG_FOLD_DRAWS") {
+                eprintln!("[rs-fold] simpAbstractFun v={}.{} fvars={:?}",
+                    v.name, v.idx,
+                    fvars.iter().map(|f| format!("{}.{}", f.name, f.idx))
+                        .collect::<Vec<_>>());
+            }
             // Build factor `{v → op(x1, ..., xk)}`.
             let factor = LNSubst::from_list(vec![(
                 v.clone(),
@@ -1498,6 +1510,10 @@ impl EquationStore {
             let fv2_idx = alloc(1);
             let fv1 = LVar { name: "x", sort: LSort::Msg, idx: fv1_idx };
             let fv2 = LVar { name: "x", sort: LSort::Msg, idx: fv2_idx };
+            if tamarin_utils::env_gate!("TAM_RS_DBG_FOLD_DRAWS") {
+                eprintln!("[rs-fold] simpAbstractFun.AC v={}.{} fvars=[\"{}.{}\", \"{}.{}\"]",
+                    v.name, v.idx, fv1.name, fv1.idx, fv2.name, fv2.idx);
+            }
             // Factor: `{v → op(fv1, fv2)}`
             let factor = LNSubst::from_list(vec![(
                 v.clone(),
@@ -1716,7 +1732,28 @@ impl EquationStore {
         // Drop the singleton disjunction.
         self.conj.remove(pos);
         if subst_vf.is_empty() {
-            // Identity disjunction: nothing to compose; just dropped.
+            // HS `simpSingleton` fires for the EMPTY singleton too:
+            // `freshToFree emptySubstVFresh` is empty, and `foreachDisj`
+            // UNCONDITIONALLY runs `applyEqStoreAt "foreachDisj:simpSingleton"`
+            // with that empty msubst after replacing the disj
+            // (EquationStore.hs:823-830).  An empty asubst is NOT a no-op:
+            // applyEqStore re-runs `applyBound` on every remaining disj
+            // subst, re-deriving (and RENUMBERING) their fresh witnesses
+            // under the current avoid set (renameAvoiding + unify +
+            // restrict).  Short-circuiting here left RS's surviving disj
+            // witnesses stale — JCS12 typing_assertion case_3: HS's
+            // empty-fold rounds renumber ~ltkS.12/m.9 → ~ltkS.6/m.6 before
+            // the next solveFactEqs, RS skipped them and rendered
+            // ~ltkS.9/$C.13 where HS shows ~ltkS.6/$C.10.  Same family as
+            // add_eqs' "empty-empty case must NOT be short-circuited"
+            // (LAK06 lesson).  The floor / fresh_to_free steps below are
+            // semantic no-ops for an empty subst, so skip straight to the
+            // apply_eq_store round.
+            if let Some(m) = maude {
+                // Err is impossible for the empty subst (dom ∩ range = ∅);
+                // the compose fallback would be a no-op anyway.
+                let _ = self.apply_eq_store(m, &LNSubst::empty());
+            }
             return true;
         }
         if tamarin_utils::env_gate!("TAM_DBG_FOLD_VARIANT") {
@@ -1750,7 +1787,72 @@ impl EquationStore {
                     subst_vf.to_list());
             }
         }
-        let new_subst = subst_vf.fresh_to_free_avoiding(alloc);
+        // HS-faithful witness-freshening floor for the already-folded free
+        // subst.  `simpSingleton` folds this disj via `freshToFree`, which in
+        // HS draws its fresh range-var renames from the ambient `MonadFresh`
+        // counter (Substitution.hs:54-66 → importBinding → freshLVar).  That
+        // counter threads monotonically through `runReduction`, so it is
+        // ALWAYS above every idx it has ALREADY DRAWN — i.e. above the range
+        // vars of the free `eqsSubst`, which are all prior-fold outputs
+        // (`applyEqStore`'s `asubst \`compose\` eqsSubst`).  RS re-seeds a
+        // per-pop counter from `avoid sys = bounds_max`, which — HS-faithfully,
+        // matching `foldFrees (SubstVFresh) = foldFrees f . M.keys`
+        // (SubstVFresh.hs:197) — counts only DOMAIN keys, not range vars; when
+        // under-advanced (the WF message-derivation probe of a let-destructor
+        // rule) `alloc` could draw an idx equal to an already-folded free-subst
+        // range var, fusing two witnesses and forcing the eq-store false
+        // (foo_eligibility C_2 / fm24 C8 verdict flips).  Push the counter
+        // above `self.subst`'s range to restore HS's monotone-counter
+        // invariant.  No-op whenever the counter is already threaded above.
+        //
+        // Crucially we DO NOT floor above the un-folded sibling disjs in
+        // `self.conj`: HS's counter is NOT above those.  Their range vars are
+        // per-call-local unify witnesses (Term/Maude/Types.hs:112-113,
+        // `evalFreshAvoiding (M.elems bindings)`), seeded above the *query's*
+        // vars — NOT drawn from the `runReduction` MonadFresh counter — so HS's
+        // counter sits far below them (RYY em source: fold draws ~x.18 while
+        // SplitId(0) siblings already hold ~x.187).  HS avoids fusing the
+        // fold's fresh with a conj witness not by counter-avoidance but by
+        // `applyBound`'s `renameAvoiding (map snd slist) avoidSet` — which, on
+        // the post-fold `applyEqStore` re-unify, renames every conj disj's
+        // range away from `varsRange newsubst` (the fold's fresh vars)
+        // regardless of numeric overlap (EquationStore.hs:428-435).  RS mirrors
+        // that in `apply_eq_store`.  Flooring above the conj here instead makes
+        // each fold ratchet the counter to the max sibling witness, and the
+        // subsequent re-unify re-bases those siblings even higher — a positive
+        // feedback that inflated the KU(em(_,_)) bilinear source's witness span
+        // ~7x/pass (peak x.4393 vs HS x.653), diverging the `main/cases`
+        // raw/refined pages (task #18).
+        // TAM_RS_DBG_FOLD_DRAWS=1: trace every session-counter draw batch
+        // feeding the free eqsSubst RANGE (fold draws) plus the RS-specific
+        // ensure_above counter jumps.  Pair with HS's TAM_HS_DBG_FOLD_DRAWS.
+        let fold_dbg = tamarin_utils::env_gate!("TAM_RS_DBG_FOLD_DRAWS");
+        if let Some(m) = maude {
+            use tamarin_term::lterm::HasFrees;
+            let mut floor = 0u64;
+            for t in self.subst.range() {
+                t.for_each_free(&mut |w: &LVar| { if w.idx > floor { floor = w.idx; } });
+            }
+            if floor > 0 {
+                if fold_dbg {
+                    let cur = m.fresh_counter_peek();
+                    if cur < floor.saturating_add(1) {
+                        eprintln!("[rs-fold] ensure_above MOVES counter {} -> {} (floor={})",
+                            cur, floor.saturating_add(1), floor);
+                    }
+                }
+                m.ensure_above(floor);
+            }
+        }
+        let fold_counter_before = if fold_dbg {
+            maude.map(|m| m.fresh_counter_peek())
+        } else { None };
+        let new_subst = subst_vf.fresh_to_free_avoiding(&mut *alloc);
+        if fold_dbg {
+            eprintln!("[rs-fold] simpSingleton in={:?} out={:?} counter_before={:?} counter_after={:?}",
+                subst_vf.to_list(), new_subst.to_list(),
+                fold_counter_before, maude.map(|m| m.fresh_counter_peek()));
+        }
         if tamarin_utils::env_gate!("TAM_DBG_FOLD_VARIANT") {
             let pairs: Vec<String> = new_subst.to_list().iter()
                 .filter(|(k, _)| k.name.contains("ltkS") || k.name.contains("request"))
@@ -2102,8 +2204,18 @@ impl EquationStore {
                         format!("{:?} =? {:?}", e.lhs, e.rhs)).collect::<Vec<_>>());
                 }
                 let counter_before_maude = aes_maude.fresh_counter_peek();
-                let unifiers = match aes_maude.unify_at_with_avoid(
-                    "apply_eq_store::re_unify", &eqs, max_idx) {
+                // HS `applyBound` (EquationStore.hs:434): `unifiers =
+                // unifyLNTerm eqs` — NO avoid.  The RHS terms were already
+                // rebased above `avoidSet` by the uniform-shift rename above
+                // (HS `ran = renameAvoiding (range) avoidSet`), so the reply
+                // witnesses (numbered per-call at `avoid (M.elems bindings)`)
+                // land above the avoid set without any injected floor.  The
+                // local handle's counter is used only by the downstream
+                // system-var lift (`reserve_idxs`), which mints
+                // differently-named witnesses that cannot collide by
+                // (name,sort,idx) with the "x"-named reply witnesses.
+                let unifiers = match aes_maude.unify_at(
+                    "apply_eq_store::re_unify", &eqs) {
                     Ok(u) => u,
                     Err(e) => return Err(AddEqsError::Maude(format!("{}", e))),
                 };
@@ -2142,7 +2254,7 @@ impl EquationStore {
                     }
                     // EXTRACT-SYSTEM-VARS-TO-DOMAIN: the AC-free local
                     // unifier path (maude_proc.rs, the AC-free fast path
-                    // in `unify_with_avoid`) doesn't
+                    // in `unify`) doesn't
                     // introduce narrowing witnesses for cross-sort
                     // var-var unification.  E.g. for `Var(~k:Fresh) =
                     // Var(~mw:Msg)`, the local unifier returns
@@ -2223,6 +2335,12 @@ impl EquationStore {
                     let mut witnesses: Vec<(LVar, LVar)> = Vec::new();
                     if !to_lift.is_empty() {
                         let base = aes_maude.reserve_idxs(to_lift.len() as u64);
+                        if tamarin_utils::env_gate!("TAM_RS_DBG_FOLD_DRAWS") {
+                            eprintln!("[rs-fold] to_lift len={} base={} avoid_max={} vars={:?}",
+                                to_lift.len(), base, avoid_max,
+                                to_lift.iter().map(|s| format!("{}.{}", s.name, s.idx))
+                                    .collect::<Vec<_>>());
+                        }
                         for (i, s) in to_lift.iter().enumerate() {
                             let w = LVar {
                                 name: s.name,

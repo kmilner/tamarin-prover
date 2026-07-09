@@ -68,11 +68,14 @@ pub async fn start_server_with_theory(fixture_name: &str) -> TestServer {
         frontend_dist: None,
         maude_path: detect_maude(),
         max_steps: 200,
+        // Match ServerConfig::new's default (HS interactive default 5s).
+        derivcheck_timeout: 5,
     };
 
     // Load theory before starting server.
     let store = TheoryStore::default();
-    let entry = tamarin_server::theory_io::load_from_path(&theory_path)
+    let entry = tamarin_server::theory_io::load_from_path(
+        &theory_path, &detect_maude(), cfg.derivcheck_timeout)
         .expect("fixture should parse + elaborate");
     let _idx = store.insert(entry);
 

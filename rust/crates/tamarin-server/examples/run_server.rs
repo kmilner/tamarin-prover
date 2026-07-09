@@ -48,6 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         frontend_dist,
         maude_path,
         max_steps: 500,
+        derivcheck_timeout: 5,
     };
     tamarin_server::serve(cfg, theories).await
 }

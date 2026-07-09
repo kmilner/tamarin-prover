@@ -84,7 +84,30 @@ pub struct Reduction<'ctx> {
     /// system.  Each stashed system has had `subst_system` already run
     /// with that arm's eq_store, mirroring HS's per-arm `substSystem`
     /// at Reduction.hs:686.
-    pub pending_conjoin_arm_systems: Vec<crate::constraint::system::System>,
+    ///
+    /// HS FreshT-threading (task #23, A(ii)): the `u64` is the arm's
+    /// continuation counter — the step-12 fork position plus the arm's
+    /// own `substSystem` draws (node-merge `solveRuleEqs` witness
+    /// mints).  HS's `disjunctionOfList` fork sits BELOW `FreshT`
+    /// (Reduction.hs:123), so each solveSubstEqs arm's post-conjoin
+    /// continuation (E.5 / close chains / output) proceeds from an
+    /// independent copy of the counter — NOT from `bounds_max` of the
+    /// stashed system (which silently rewinds past every transient
+    /// draw of the step so far).  The drain site
+    /// (`conjoin_refine_arm`) seeds each replayed arm's Reduction
+    /// from this value via `Reduction::new_inheriting`.
+    pub pending_conjoin_arm_systems: Vec<(crate::constraint::system::System, u64)>,
+    /// HS FreshT-threading for multi-case (`GoalCases::Cases`) outcomes:
+    /// per returned case, the producing branch's final fresh-counter
+    /// position (parallel to the `Cases` vec).  HS's `runReduction
+    /// (solveGoal >> simplifySystem)` continues each DisjT branch's
+    /// simplify with THAT branch's counter; RS's per-case continuation
+    /// (exec_proof_method's per-case `simplify_system_with_fanout`)
+    /// previously reseeded at `bounds_max(case_sys)`, silently rewinding
+    /// past the branch's transient draws (task #16).  Populated by the
+    /// goal solvers alongside `Cases`; empty means "no counters recorded"
+    /// (callers fall back to bounds_max seeding).
+    pub last_case_counters: Vec<u64>,
 }
 
 /// `ChangeIndicator` mirrors the `True`/`False` flag the Haskell
@@ -102,24 +125,121 @@ impl ChangeIndicator {
     }
 }
 
+thread_local! {
+    /// Source-precompute fresh-counter floor for `avoid th` faithfulness.
+    ///
+    /// HS's `refineSource` (Sources.hs:162) seeds ONE monotonic FreshT
+    /// counter at `fs = avoid th` — the max var idx over the WHOLE source
+    /// `th` (all its cases) — and threads it through EVERY reduction in the
+    /// refinement of each case, `simplifySystem` included.  RS breaks a
+    /// refineSource into a floored main-loop reduction plus floor-0
+    /// `simplify_system_with_fanout` sub-reductions; the latter reset the
+    /// counter to the per-case `avoid se`, which is BELOW `avoid th` for any
+    /// case whose max var is smaller than the source-wide max (e.g. NSPK3's
+    /// `!KU(~t.1)` R_1 case, avoid 27 vs source-wide 29).  A first NEW draw
+    /// there (the `[sources]`-lemma `Ex #j. OUT_I_1(m1)@#j` node) then lands
+    /// below HS's value.  This thread-local carries `source_avoid` into
+    /// those sub-reductions so they seed at `avoid th`, matching HS's single
+    /// monotonic counter.  Set for the duration of one source-case
+    /// refinement (`run_solve_all_safe_goals_disj_with_progress`); 0 (the
+    /// default, general proving path) means "no floor".
+    static REFINE_FLOOR: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Set the source-precompute fresh-counter floor, returning the previous
+/// value (for RAII restore).  See [`REFINE_FLOOR`].
+pub fn set_refine_floor(floor: u64) -> u64 {
+    REFINE_FLOOR.with(|c| { let old = c.get(); c.set(floor); old })
+}
+
+/// Current source-precompute fresh-counter floor (`avoid th`, 0 if unset).
+pub fn refine_floor() -> u64 {
+    REFINE_FLOOR.with(|c| c.get())
+}
+
 impl<'ctx> Reduction<'ctx> {
     pub fn new(ctx: &'ctx ProofContext, sys: System) -> Self {
-        // HS-faithful per-Reduction Fresh counter: init from
-        // `bounds_max(sys) + 1`.  Matches `runReduction m ctx sys (avoid sys)`
-        // in HS where `avoid t = maybe 0 (succ . snd) . boundsVarIdx`.
-        let avoid_max = bounds_max(&sys);
-        let maude = ctx.maude.with_fresh_counter_from(avoid_max);
+        // HS-faithful `avoid th` (Sources.hs:162): during source precompute
+        // a thread-local floor (`REFINE_FLOOR`) carries the source-wide
+        // `avoid th` seed into EVERY reduction of the refinement — including
+        // the many `Reduction::new` sub-reductions (simplify, action solve,
+        // etc.) that would otherwise reseed at the per-case `avoid se` and
+        // undershoot HS's single monotonic counter.  0 (default, general
+        // proving path) is a no-op.
+        Self::new_with_floor(ctx, sys, refine_floor())
+    }
+
+    /// Like [`new`] but seeds the per-Reduction Fresh counter from
+    /// `max(bounds_max(sys), floor)` instead of `bounds_max(sys)` alone.
+    ///
+    /// HS-faithful `refineSource` (Sources.hs:162) seeds EVERY case's
+    /// `runReduction proofStep ctxt se fs` from `fs = avoid th` — the max
+    /// var idx over the WHOLE source `th` (all its cases), NOT the single
+    /// case `se`.  A source whose sibling case is complex (high var idx)
+    /// therefore seeds even its SIMPLE cases from that high `avoid th`.
+    /// RS creates each case's Reduction from `bounds_max(se)` alone
+    /// (per-case `avoid se`), so simple cases in a source with a complex
+    /// sibling seed too low → their solve-time allocations land below HS.
+    /// Source-precompute threads `avoid th` in as `floor`; the general
+    /// proving path passes `floor = 0` (a no-op) via [`new`].
+    pub fn new_with_floor(ctx: &'ctx ProofContext, sys: System, floor: u64) -> Self {
+        // HS-faithful per-Reduction Fresh counter: seed the NEXT-draw value
+        // from `avoid sys` (LTerm.hs:656-657, via `avoid_fresh_state` — 0
+        // for a frees-less system, max idx + 1 otherwise).  Matches
+        // `runReduction m ctx sys (avoid sys)`.  `floor` (max-idx units,
+        // source-precompute's `avoid th` whole-source seed) lifts the
+        // next-draw to `floor + 1` when set; `floor == 0` means "no floor"
+        // (the general proving path via [`new`]).
+        let next = avoid_fresh_state(&sys)
+            .max(if floor == 0 { 0 } else { floor.saturating_add(1) });
+        let maude = ctx.maude.with_fresh_counter_next(next);
         // Ensure the GLOBAL ctx.maude is at least as advanced as our
-        // local high-water start.  Any non-Reduction allocator
-        // (`sources.rs`, etc.) that subsequently uses `ctx.maude` will
-        // then start above our base, preventing cross-allocator
-        // collisions on names like `~mw` that both routes mint.
-        ctx.maude.ensure_above(avoid_max);
+        // local high-water start (counter ≥ next).  Any non-Reduction
+        // allocator (`sources.rs`, etc.) that subsequently uses
+        // `ctx.maude` will then start above our base, preventing
+        // cross-allocator collisions on names like `~mw` that both
+        // routes mint.
+        if next > 0 { ctx.maude.ensure_above(next - 1); }
         Reduction {
             ctx, sys, maude,
             changed: ChangeIndicator::Unchanged,
             pending_eq_arms: Vec::new(),
             pending_conjoin_arm_systems: Vec::new(),
+            last_case_counters: Vec::new(),
+        }
+    }
+
+    /// Like [`new`] but continues an ENCLOSING Reduction's fresh-counter
+    /// thread: the sub-Reduction's next draw starts at
+    /// `max(avoid_fresh_state(sys), inherit_next)`.
+    ///
+    /// HS-faithful FreshT-threading (`Reduction = StateT System (FreshT
+    /// (DisjT ...))`, Reduction.hs:123): within one `runReduction` there is
+    /// ONE fresh counter; sub-computations (labelNodeId's exploitPrems,
+    /// insertEdges' solveFactEqs, per-arm simp) all draw from it, including
+    /// draws whose variables never persist in the system (transients:
+    /// Fresh-narrowing witnesses, eq-store simp fold draws).  RS runs these
+    /// sub-computations in child `Reduction`s; seeding a child from
+    /// `bounds_max(sys)` alone silently REWINDS the thread past any
+    /// transient draws, so later draws in the enclosing exec undershoot
+    /// HS — the fresh/witness numbering family on web sequent panes
+    /// (task #16).  `inherit_next` = the parent's
+    /// `maude.fresh_counter_peek()` at the fork point.
+    pub fn new_inheriting(ctx: &'ctx ProofContext, sys: System, inherit_next: u64) -> Self {
+        // Respect the source-precompute floor exactly like `new` does
+        // (REFINE_FLOOR is orthogonal to the in-exec thread continuation).
+        let floor = refine_floor();
+        let next = avoid_fresh_state(&sys)
+            .max(if floor == 0 { 0 } else { floor.saturating_add(1) })
+            .max(inherit_next);
+        let maude = ctx.maude.with_fresh_counter_next(next);
+        if next > 0 { ctx.maude.ensure_above(next - 1); }
+        Reduction {
+            ctx, sys, maude,
+            changed: ChangeIndicator::Unchanged,
+            pending_eq_arms: Vec::new(),
+            pending_conjoin_arm_systems: Vec::new(),
+            last_case_counters: Vec::new(),
         }
     }
 
@@ -815,7 +935,16 @@ impl<'ctx> Reduction<'ctx> {
                                 // `subst_system_once`).
                                 crate::guarded::canonicalize_ac_in_guarded(&cur)
                             })
-                            .collect();
+                            .collect::<Vec<_>>();
+                        // Normalise the disjunct LIST in lockstep with the
+                        // GDisj formula twin (HS 150f5eba substGoals DisjG
+                        // arm: `DisjG (normaliseDisjList (apply subst
+                        // disj))`) — a subst that identifies two variables
+                        // can make two alts equal; the formula twin's list
+                        // is deduplicated by `normalise_stored_formula`, so
+                        // the goal key must be too or the twin stores
+                        // desynchronise (gcm livelock class).
+                        let new_alts = crate::guarded::normalise_disj_list(&new_alts);
                         Goal::Disj(crate::constraint::constraints::Disj(new_alts))
                     }
                 },
@@ -902,7 +1031,10 @@ impl<'ctx> Reduction<'ctx> {
                 let mut cur = match crate::guarded::subst_guarded_cow(f, formula_subst) {
                     // Subst is a structural no-op; the only possible change is
                     // the trailing canonicalisation (mirror `canonicalize(f)`).
-                    None => return crate::guarded::canonicalize_ac_in_guarded_cow(f),
+                    // A canon change can equalise sibling connectives, so
+                    // re-normalise the changed result (150f5eba boundary).
+                    None => return crate::guarded::canonicalize_ac_in_guarded_cow(f)
+                        .map(|c| crate::guarded::normalise_stored_formula(&c)),
                     Some(s0) => s0,
                 };
                 // One subst pass already applied; continue to the fixpoint
@@ -925,7 +1057,13 @@ impl<'ctx> Reduction<'ctx> {
                 // (`fAppAC`) flatten+sort on construction, so HS never sees the
                 // nested form; mirror that here.  (Tuple pairs are already
                 // canonicalised inside `subst_gterm_cow` via `mk_gpair`.)
-                Some(crate::guarded::canonicalize_ac_in_guarded_cow(&cur).unwrap_or(cur))
+                let cur = crate::guarded::canonicalize_ac_in_guarded_cow(&cur).unwrap_or(cur);
+                // Re-normalise the connective structure — the stored-state
+                // substitution boundary of HS 150f5eba (substFormulas =
+                // `S.map (normaliseStoredFormula . apply subst)`): a subst
+                // that identifies two variables can make sibling conjuncts
+                // equal, and the raw rebuild keeps both copies.
+                Some(crate::guarded::normalise_stored_formula(&cur))
             };
             for f in self.sys.formulas.iter_mut() {
                 if let Some(new_f) = apply_to_fixpoint(f) {
@@ -1232,6 +1370,9 @@ impl<'ctx> Reduction<'ctx> {
             let maude = self.maude.clone();
             let store = std::sync::Arc::unwrap_or_clone(std::mem::take(&mut self.sys.eq_store));
             self.sys.invalidate_max_var_idx_cache();
+            if tamarin_utils::env_gate!("TAM_RS_DBG_FOLD_DRAWS") {
+                eprintln!("[rs-fold] ARV-SIMP counter={}", maude.fresh_counter_peek());
+            }
             self.sys.eq_store = std::sync::Arc::new(store.simp_with_fresh_avoiding(
                 |_, _| false,
                 |n| maude.reserve_idxs(n),
@@ -1363,6 +1504,32 @@ impl<'ctx> Reduction<'ctx> {
                                 tamarin_term::lterm::LSort::Node,
                                 next_idx,
                             );
+                            // HS-faithful counter side-effect: HS's
+                            // `requiresKU` (Reduction.hs:458-469, insertAction
+                            // pair/inv/mult decomposition) draws each sub-KU
+                            // node id via `freshLVar "vk" LSortNode`, ADVANCING
+                            // the ambient FreshT counter past the drawn idx.
+                            // RS derives the same VALUE from
+                            // `max(bounds_max, outer.idx)+1` but formerly left
+                            // the shared counter untouched — so every LATER
+                            // counter draw in the same Reduction (in particular
+                            // simp's `freshToFree` fold of a singleton variant
+                            // disj, which feeds the eqsSubst RANGE) sat N below
+                            // HS (N = number of decomposed components).  That
+                            // shifted `avoid_max = max(domVFresh ∪ varsRange
+                            // eqsSubst)` in every subsequent `applyBound`, and
+                            // with it the web sequent pane's `conj:` ∃-witness
+                            // indices (UM_three_pass: constant −2 across 77
+                            // pages).  Batch-invisible: the vk VALUE choice is
+                            // unchanged (the reverted TAM_EXPT_VK_DECOMP_COUNTER
+                            // experiment confirmed no index shifts when the
+                            // counter advances here) and eqsSubst is cleared
+                            // before proof storage.  `ensure_above` never
+                            // lowers the counter, so call sites where the
+                            // counter already ran past `next_idx` are untouched
+                            // — matching HS, whose monotone counter is by
+                            // construction past every idx it has drawn.
+                            self.maude.ensure_above(next_idx);
                             // TAM_RS_TRACE_VK_CREATE: mirror of the HS
                             // `TAM_HS_TRACE_VK_CREATE` hook (Reduction.hs /
                             // Goals.hs `requiresKU` + `exploitPrem`).  Logs
@@ -1570,6 +1737,12 @@ impl<'ctx> Reduction<'ctx> {
     ///   (split into ordering disjunctions), `Subterm`
     ///   (`insertNegSubterm`); otherwise kept in `formulas`
     pub fn insert_formula(&mut self, g: Guarded) {
+        // Normalise at the insertion boundary so the stored-formula state
+        // is ALWAYS in `normalise_stored_formula` normal form — the dedup
+        // checks inside `insert_formula_inner` compare against the
+        // (post-substitution, normalised) stored sets.  Port of HS
+        // insertFormula entry normalisation (150f5eba).
+        let g = crate::guarded::normalise_stored_formula(&g);
         self.insert_formula_inner(g, true);
     }
 
@@ -1714,8 +1887,19 @@ impl<'ctx> Reduction<'ctx> {
                 }
                 self.sys.invalidate_max_var_idx_cache();
                 self.sys.solved_formulas.push(outer);
+                // HS (Reduction.hs:573) draws `xs <- mapM (uncurry freshLVar) ss`
+                // straight from the ambient MonadFresh counter — no clamp; the
+                // threaded counter is above every system var by construction
+                // (seeded from `avoid sys`, monotone thereafter).  RS's clamp
+                // compensates for its non-threaded counter and must preserve
+                // exactly that invariant: counter ≥ max idx + 1 ONLY when free
+                // vars exist; a frees-less system (lemma ROOT step: HS seeds 0)
+                // must stay unclamped — `ensure_above(0)` would force ≥ 1,
+                // shifting the root existentials (#i/#j/tid/key) +1 vs HS.
                 let avoid_max = self.fresh_var_baseline();
-                self.maude.ensure_above(avoid_max);
+                if avoid_max > 0 || system_has_any_free_var(&self.sys) {
+                    self.maude.ensure_above(avoid_max);
+                }
                 let base = self.maude.reserve_idxs(vars.len() as u64);
                 // Fresh LVars (HS `freshLVar`-style), one per binding in
                 // the original lexical order.
@@ -2119,13 +2303,18 @@ impl<'ctx> Reduction<'ctx> {
         // produce non-normal subterms structurally so the check is
         // pure overhead.  See contradictions.rs::subst_creates_non_normal_terms.
         let has_reducible = !maude.maude_sig().reducible_fun_syms.is_empty();
-        // The snapshot + Maude clone are consumed ONLY by the
-        // `subst_creates_non_normal_terms` check in the `if has_reducible`
-        // arm of `do_simp` below.  Gate the (deep) System clone + Maude
-        // handle clone on `has_reducible` so pair-only / non-reducible-
-        // signature theories pay nothing on this hot unification path.
-        let sys_snapshot = has_reducible.then(|| self.sys.clone());
-        let maude_for_check = has_reducible.then(|| maude.clone());
+        // The checker is consumed ONLY by the `if has_reducible` arm of
+        // `do_simp` below.  It snapshots the `maybeNonNormalTerms` walk
+        // of `self.sys` ONCE here — mirroring HS's curried
+        // `substCreatesNonNormalTerms hnd se` (Reduction.hs:944), which
+        // captures `se` at the `simp` call and shares the walk across
+        // every candidate subst probed (see `SubstNfChecker`).  This
+        // replaces a former per-`do_simp` deep System clone + a
+        // per-candidate re-walk.  Gated on `has_reducible` so pair-only
+        // signatures pay nothing on this hot unification path.
+        let nf_checker = has_reducible.then(||
+            crate::constraint::solver::contradictions::SubstNfChecker::new(
+                &maude, &self.sys));
         // Collect live system vars so `simp_singleton`'s `fresh_to_free`
         // doesn't rename them.  Mirrors `solve_split_goal`'s approach.
         let system_vars: std::collections::BTreeSet<tamarin_term::lterm::LVar> = {
@@ -2179,14 +2368,11 @@ impl<'ctx> Reduction<'ctx> {
         let do_simp = |s: crate::tools::equation_store::EquationStore|
                 -> crate::tools::equation_store::EquationStore {
             if has_reducible {
-                // Safe: both are `Some` exactly when `has_reducible` is true
-                // (they were built via `has_reducible.then(...)`).
-                let maude_for_check = maude_for_check.as_ref().unwrap();
-                let sys_snapshot = sys_snapshot.as_ref().unwrap();
+                // Safe: `Some` exactly when `has_reducible` is true
+                // (built via `has_reducible.then(...)`).
+                let checker = nf_checker.as_ref().unwrap();
                 s.simp_with_fresh_avoiding(
-                    |fs, vfs| crate::constraint::solver::contradictions::subst_creates_non_normal_terms(
-                        maude_for_check, sys_snapshot, fs, vfs,
-                    ),
+                    |fs, vfs| checker.check(fs, vfs),
                     |n| maude_alloc.reserve_idxs(n),
                     &system_vars,
                     Some(&maude_alloc),
@@ -2231,11 +2417,36 @@ impl<'ctx> Reduction<'ctx> {
                         format!("split id {:?} not found", id)))?;
                 let raw_count = arms.len();
                 let mut live_arms: Vec<crate::tools::equation_store::EquationStore> = Vec::new();
+                // HS-faithful per-arm counter fork.  HS `solveTermEqs`
+                // (Reduction.hs:712-731) runs
+                //   `disjunctionOfList (performSplit eqs2 splitId)` and THEN
+                //   `simp` per arm — the `disjunctionOfList` sits in the
+                // DisjT layer BELOW FreshT (`Reduction = StateT System
+                // (FreshT (DisjT ...))`, Reduction.hs:123), so each arm's
+                // `simp` (whose `simpSingleton` fold draws fresh idxs via
+                // `freshToFree`) starts from an independent COPY of the
+                // counter at the fan-out point.  RS's `do_simp` allocs via
+                // the ONE shared `maude_alloc` counter, so consecutive arms
+                // threaded each other's fold draws: on RYY_PFS's
+                // `KU(em(t.1,t.2))` source the two C-unifier arms folded at
+                // t.7/t.8 and t.9/t.10 where HS has t.7/t.8 in BOTH
+                // (hs_ryy.err SAT-STEP: case2 = same t.7/t.8, premises
+                // swapped).  Rewind to the pre-fork base before each arm and
+                // restore the high-water mark after the loop, exactly as
+                // `solve_action_goal` does around its candidate fork.
+                let arm_fork_base = maude_alloc.fresh_counter_peek();
+                let mut arm_high_water = arm_fork_base;
                 for arm in arms {
+                    maude_alloc.reset_counter_to(arm_fork_base);
+                    if tamarin_utils::env_gate!("TAM_RS_DBG_FOLD_DRAWS") {
+                        eprintln!("[rs-fold] STE-ARM fork_base={}", arm_fork_base);
+                    }
                     let simped = do_simp(arm);
+                    arm_high_water = arm_high_water.max(maude_alloc.fresh_counter_peek());
                     if simped.is_false() { continue; }
                     live_arms.push(simped);
                 }
+                maude_alloc.ensure_above(arm_high_water.saturating_sub(1));
                 if tamarin_utils::env_gate!("TAM_RS_DBG_STE_RAW") {
                     let loc = std::panic::Location::caller();
                     eprintln!("[STE_RAW] raw={} live={} site={}:{} pending_eqs={}",
@@ -2313,6 +2524,77 @@ impl<'ctx> Reduction<'ctx> {
                 })
                 .collect();
         self.solve_term_eqs(SplitStrategy::SplitNow, &term_eqs)
+    }
+
+    /// `solveNodeIdEqs` applied to arm0 (`self.sys`) AND to every arm
+    /// stashed in `pending_eq_arms`.
+    ///
+    /// HS `enforceNodeUniqueness`/`enforceFreshAndKuNodeUniqueness`
+    /// (Simplify.hs:273-276, 356-360) merges each candidate group with
+    /// `solver <*> solveTermEqsLabeled SplitNow (node-id-eqs)`: the fact/
+    /// rule `solver` runs FIRST (and, on AC-multiunifiers, forks the whole
+    /// `DisjT` continuation via `disjunctionOfList $ performSplit`,
+    /// Reduction.hs:981-991), and the node-id equalities are then solved
+    /// INSIDE each forked arm's continuation.  So every arm of the fact/
+    /// rule split gets the same node-id merges applied.
+    ///
+    /// RS lacks lazy `DisjT`: a fact/rule split stashes arms in
+    /// `pending_eq_arms` and only `self.sys` (arm0) continues in place, so
+    /// the node-id eqs that HS runs per arm would reach arm0 ONLY.  A
+    /// pending arm then re-enters `simplify` missing those node-id
+    /// bindings; its first `subst_system` sees fewer node collisions and
+    /// re-cascades the setNodes drain differently, re-emitting a duplicate
+    /// multiset split (Joux Session_Key_Secrecy_PFS Proto1: the pending KD-
+    /// merge arm re-drained the $B/$C `Union` disjunction as a second
+    /// `splitEqs(10)` byte-identical to `splitEqs(9)`, so `removeRedundant-
+    /// Cases` kept 18 cases where HS keeps 10).  Broadcasting the node-id
+    /// eqs to the pending arms makes each arm's store carry the identical
+    /// node-id bindings HS's per-arm continuation applies.
+    ///
+    /// Node-id (Var=Var) unification never forks (single unifier) and draws
+    /// no fresh witness indices, so the per-arm application is counter-
+    /// neutral (the shared counter is restored afterwards; the pending arms
+    /// re-seed from the fan-out fork counter in any case).
+    pub fn solve_node_id_eqs_broadcast(
+        &mut self,
+        eqs: &[tamarin_term::rewriting::Equal<crate::constraint::constraints::NodeId>],
+    ) -> Result<SolveOutcome, crate::tools::equation_store::AddEqsError> {
+        // Fork base: the counter position BEFORE arm0's own node-id
+        // merge, i.e. the position HS's `DisjT` copies to every arm at the
+        // preceding fact/rule split.  Each arm's node-id merge must start
+        // from this same base (HS threads an independent FreshT copy per
+        // arm), so rewind to it before each pending arm and restore arm0's
+        // post-merge position at the end.
+        let fork_base = self.maude.fresh_counter_peek();
+        let out = self.solve_node_id_eqs(eqs);
+        if self.pending_eq_arms.is_empty() {
+            return out;
+        }
+        let arm0_end = self.maude.fresh_counter_peek();
+        let arm0_store = std::mem::take(&mut self.sys.eq_store);
+        let pending = std::mem::take(&mut self.pending_eq_arms);
+        let mut new_pending = Vec::with_capacity(pending.len());
+        for arm in pending {
+            self.maude.reset_counter_to(fork_base);
+            self.sys.invalidate_max_var_idx_cache();
+            self.sys.eq_store = std::sync::Arc::new(arm);
+            // Ignore the outcome: a contradictory arm keeps its `is_false`
+            // store and is dropped at the `fan_out_on_pending_eq_arms`
+            // is_false filter, exactly as HS's per-arm `noContradictory-
+            // EqStore` mzero drops that arm from the `DisjT`.
+            let _ = self.solve_node_id_eqs(eqs);
+            let updated = std::mem::replace(
+                &mut self.sys.eq_store,
+                std::sync::Arc::new(crate::tools::equation_store::EquationStore::default()));
+            new_pending.push(std::sync::Arc::unwrap_or_clone(updated));
+        }
+        self.sys.invalidate_max_var_idx_cache();
+        self.sys.eq_store = arm0_store;
+        self.pending_eq_arms = new_pending;
+        // Restore arm0's post-merge counter (fan-out then re-seeds every
+        // arm from this position, matching arm0's continuation).
+        self.maude.reset_counter_to(arm0_end);
+        out
     }
 
     /// `solveFactEqs` — equate two fact lists. Returns
@@ -2748,16 +3030,35 @@ impl<'ctx> Reduction<'ctx> {
                 // Each snapshot gets the arm's eq_store installed and
                 // step 13 (substSystem) applied locally.
                 if let Some(snapshot) = &pre_step12_snapshot {
+                    // HS FreshT-threading (task #23, A(ii)): each
+                    // solveSubstEqs arm is a DisjT branch BELOW FreshT
+                    // (Reduction.hs:946-956 `disjunctionOfList arms`),
+                    // so its substSystem (and everything after) draws
+                    // from a fork-point COPY of the counter — not from
+                    // `bounds_max(arm_sys)`.  `self.maude` here sits at
+                    // the step-12 across-arm high water (solve_term_eqs
+                    // restored it after its per-arm rewind loop); use
+                    // that as the interim fork seed (faithful would be
+                    // fork + arm_i's OWN eq-simp draws; the high water
+                    // differs only when sibling arms draw unequal
+                    // amounts).  Record each arm's continuation (seed +
+                    // its substSystem node-merge witness draws) next to
+                    // the stashed system for the drain site.
+                    let step12_cont = self.maude.fresh_counter_peek();
                     for arm_i in arm_iter {
                         let mut arm_sys = snapshot.clone();
                         arm_sys.invalidate_max_var_idx_cache();
                         arm_sys.eq_store = std::sync::Arc::new(arm_i);
                         // Replicate step 13 substSystem locally on the
-                        // arm-i sys by spinning a transient Reduction.
-                        let mut arm_red = Reduction::new(self.ctx, arm_sys);
+                        // arm-i sys by spinning a transient Reduction
+                        // that CONTINUES the step's counter thread.
+                        let mut arm_red = Reduction::new_inheriting(
+                            self.ctx, arm_sys, step12_cont);
                         arm_red.subst_system();
                         if !arm_red.sys.eq_store.is_false() {
-                            self.pending_conjoin_arm_systems.push(arm_red.sys);
+                            let arm_cont = arm_red.maude.fresh_counter_peek();
+                            self.pending_conjoin_arm_systems.push(
+                                (arm_red.sys, arm_cont));
                         }
                     }
                 }
@@ -3289,6 +3590,75 @@ fn bounds_max_disable_enabled() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("TAM_RS_DISABLE_BOUNDS_CACHE").is_ok())
+}
+
+/// HS `avoid` (LTerm.hs:656-657): `avoid = maybe 0 (succ . snd) . boundsVarIdx`
+/// — the `FreshState` (= NEXT index to draw) avoiding `sys`'s free vars:
+/// **0 when the system has NO free variables**, max idx + 1 otherwise.
+/// `bounds_max` alone returns 0 for both "no frees" and "frees at idx 0",
+/// so an unconditional `bounds_max + 1` seed off-by-ones every allocation
+/// at a lemma's root step (closed formula, no nodes ⇒ HS seeds 0) — the
+/// uniform +1 witness-index shift visible on web sequent pages (proven on
+/// cav13/DH_example: RS lemma existentials tid.3/key.4 vs HS tid.2/key.3
+/// at the first substantive applyEqStore call).
+pub fn avoid_fresh_state(sys: &System) -> u64 {
+    let bm = bounds_max(sys);
+    if bm > 0 || system_has_any_free_var(sys) { bm + 1 } else { 0 }
+}
+
+/// TRUE iff the system has at least one free variable — the existence
+/// companion to `bounds_max`, mirroring HS `boundsVarIdx` returning
+/// `Nothing` (LTerm.hs:649-651) over the same traversal domain as
+/// `bounds_max_uncached`.  Only consulted when `bounds_max(sys) == 0`
+/// (in practice: lemma-root systems), so the walk is cheap.
+pub fn system_has_any_free_var(sys: &System) -> bool {
+    use tamarin_term::lterm::HasFrees;
+    // Nodes / edges / less-atoms / last carry LVar node-ids structurally.
+    if !sys.nodes.is_empty() || !sys.edges.is_empty()
+        || !sys.less_atoms.is_empty() || sys.last_atom.is_some()
+    {
+        return true;
+    }
+    fn term_has_var(t: &tamarin_term::lterm::LNTerm) -> bool {
+        let mut seen = false;
+        t.for_each_free(&mut |_| { seen = true; });
+        seen
+    }
+    for c in sys.subterm_store.subterms.iter()
+        .chain(sys.subterm_store.solved_subterms.iter())
+    {
+        if term_has_var(&c.small) || term_has_var(&c.big) { return true; }
+    }
+    for (s, t) in &sys.subterm_store.neg_subterms {
+        if term_has_var(s) || term_has_var(t) { return true; }
+    }
+    for (g, _) in sys.goals.iter() {
+        use crate::constraint::constraints::Goal;
+        match g {
+            // These carry a node-id LVar structurally.
+            Goal::Action(..) | Goal::Premise(..) | Goal::Chain(..) => return true,
+            Goal::Subterm((s, t)) => {
+                if term_has_var(s) || term_has_var(t) { return true; }
+            }
+            Goal::Disj(_) | Goal::Split(_) => {}
+        }
+    }
+    for f in sys.formulas.iter()
+        .chain(sys.solved_formulas.iter())
+        .chain(sys.lemmas.iter())
+    {
+        if !crate::guarded::free_vars(f).is_empty() { return true; }
+    }
+    // eq-store: subst dom vars are frees; conj counts DOMAIN keys only
+    // (HS `foldFrees (SubstVFresh) = foldFrees f . M.keys`, matching the
+    // `bounds_max_uncached` walk).
+    if !sys.eq_store.subst.is_empty() { return true; }
+    for d in &sys.eq_store.conj {
+        for s in &d.substs {
+            if s.dom().next().is_some() { return true; }
+        }
+    }
+    false
 }
 
 /// Full-walk implementation of `bounds_max` — bypass for the cache.
@@ -4161,7 +4531,10 @@ impl<'ctx> Reduction<'ctx> {
             _ => {
                 let mut cases = Vec::with_capacity(alts.len());
                 for (i, gfm) in alts.iter().enumerate() {
-                    let mut sub = Reduction::new(self.ctx, self.sys.clone());
+                    // HS FreshT-threading: each disjunct branch continues
+                    // the enclosing thread (see `new_inheriting`).
+                    let mut sub = Reduction::new_inheriting(
+                        self.ctx, self.sys.clone(), self.maude.fresh_counter_peek());
                     for (existing, status) in sub.sys.goals_mut().iter_mut() {
                         if existing == &g && !status.solved {
                             status.solved = true;
@@ -4587,9 +4960,13 @@ impl<'ctx> Reduction<'ctx> {
                 // append `_case_1`/`_case_2`/... if multiple cases.
                 //
                 let mut cases = Vec::new();
+                // HS FreshT-threading: per pushed case, the branch's final
+                // fresh counter (see `new_inheriting`).
+                let mut case_counters: Vec<u64> = Vec::new();
                 for act in &ru.actions {
                     let sys = self.sys.clone();
-                    let mut sub = Reduction::new(self.ctx, sys);
+                    let mut sub = Reduction::new_inheriting(
+                        self.ctx, sys, self.maude.fresh_counter_peek());
                     let res = sub.solve_fact_eqs(
                         SplitStrategy::SplitNow,
                         &[tamarin_term::rewriting::Equal {
@@ -4605,6 +4982,7 @@ impl<'ctx> Reduction<'ctx> {
                             vec![(*sub.sys.eq_store).clone()],
                     };
                     let post_sys = sub.sys.clone();
+                    let branch_counter = sub.maude.fresh_counter_peek();
                     for arm_eq in arm_eq_stores {
                         let mut sys = post_sys.clone();
                         sys.invalidate_max_var_idx_cache();
@@ -4616,6 +4994,7 @@ impl<'ctx> Reduction<'ctx> {
                             }
                         }
                         cases.push((rule_name.clone(), sys));
+                        case_counters.push(branch_counter);
                     }
                 }
                 if cases.is_empty() { return GoalCases::Contradictory; }
@@ -4625,10 +5004,14 @@ impl<'ctx> Reduction<'ctx> {
                     // return and look at `self.sys`; the proof-method
                     // dispatcher emits `case <name>` + qed.
                     self.sys = cases.into_iter().next().unwrap().1;
+                    // HS FreshT-threading — see the candidate-loop
+                    // single-case adoption below (task #16).
+                    self.maude.reset_counter_to(case_counters[0]);
                     self.changed = ChangeIndicator::Changed;
                     return GoalCases::LinearNamed(rule_name);
                 }
                 self.changed = ChangeIndicator::Changed;
+                self.last_case_counters = case_counters;
                 GoalCases::Cases(cases)
             }
             None => {
@@ -4674,6 +5057,7 @@ impl<'ctx> Reduction<'ctx> {
                         i, fa,
                         avoid_max,
                         Some(self.ctx),
+                        Some(&self.maude),
                     ) {
                         // HS-faithful `solveWithSource` returned `Just []`:
                         // the source pattern MATCHED the live goal but has
@@ -4695,6 +5079,8 @@ impl<'ctx> Reduction<'ctx> {
                         }
                         let live_goal = Goal::Action(i.clone(), fa.clone());
                         let mut out: Vec<(String, crate::constraint::system::System)> = Vec::new();
+                        // HS FreshT-threading (task #16): per-out-case branch counters.
+                        let mut out_counters: Vec<u64> = Vec::new();
                         // Runtime filterCases (mirroring Haskell's
                         // `filterCases` in
                         // `Theory.Constraint.Solver.Sources`, which skips
@@ -4703,7 +5089,7 @@ impl<'ctx> Reduction<'ctx> {
                         // N5_u-driven KU action-node unification on
                         // identical terms, which surfaces a
                         // cyclic-ordering contradiction.
-                        for (case_label, mut sys, case_action) in case_pairs.into_iter() {
+                        for (case_label, mut sys, case_action, branch_counter) in case_pairs.into_iter() {
                             if let Some(slot) = sys.goals_mut().iter_mut()
                                 .find(|(g, _)| g == &live_goal) {
                                 slot.1.solved = true;
@@ -4734,7 +5120,16 @@ impl<'ctx> Reduction<'ctx> {
                             } else {
                                 case_label
                             };
-                            let mut sub = Reduction::new(self.ctx, sys);
+                            // HS FreshT-threading: continue THIS branch's
+                            // counter thread (the source pick's fork + the
+                            // branch's OWN someInst+conjoin draws, recorded
+                            // per output entry by
+                            // `solve_with_source_cases_action_with_ctx`).
+                            // `self.maude.fresh_counter_peek()` here would be
+                            // the LAST branch's post-conjoin position — HS's
+                            // DisjT fork gives every branch its own thread.
+                            let mut sub = Reduction::new_inheriting(
+                                self.ctx, sys, branch_counter);
                             let res = sub.solve_fact_eqs(
                                 SplitStrategy::SplitNow,
                                 &[tamarin_term::rewriting::Equal {
@@ -4759,24 +5154,27 @@ impl<'ctx> Reduction<'ctx> {
                             // eq-store (conj=[], next_split=0) that drops
                             // every live disjunction (the Joux_EphkRev
                             // `splitEqs` cascade collapse).
-                            let action_arm_systems: Vec<crate::constraint::system::System> =
+                            let action_arm_systems: Vec<(crate::constraint::system::System, u64)> =
                                 match res {
                                     Err(_) | Ok(SolveOutcome::Contradictory) => continue,
                                     Ok(SolveOutcome::Linear(_)) => {
                                         sub.subst_system();
-                                        vec![sub.sys.clone()]
+                                        vec![(sub.sys.clone(), sub.maude.fresh_counter_peek())]
                                     }
                                     Ok(SolveOutcome::Cases(arms)) => {
                                         let template = sub.sys.clone();
+                                        let post_solve_counter = sub.maude.fresh_counter_peek();
                                         let mut v = Vec::new();
                                         for arm_eq in arms {
                                             let mut arm_sys = template.clone();
                                             arm_sys.invalidate_max_var_idx_cache();
                                             arm_sys.eq_store = std::sync::Arc::new(arm_eq);
-                                            let mut arm_red = Reduction::new(self.ctx, arm_sys);
+                                            let mut arm_red = Reduction::new_inheriting(
+                                                self.ctx, arm_sys, post_solve_counter);
                                             arm_red.subst_system();
                                             if arm_red.sys.eq_store.is_false() { continue; }
-                                            v.push(arm_red.sys);
+                                            let c = arm_red.maude.fresh_counter_peek();
+                                            v.push((arm_red.sys, c));
                                         }
                                         v
                                     }
@@ -4789,8 +5187,9 @@ impl<'ctx> Reduction<'ctx> {
                             let action_live_node_ids: std::collections::BTreeSet<
                                 crate::constraint::constraints::NodeId> =
                                 self.sys.nodes.iter().map(|(n, _)| n.clone()).collect();
-                            'arm: for arm_sys in action_arm_systems {
-                                    let mut sub = Reduction::new(self.ctx, arm_sys);
+                            'arm: for (arm_sys, arm_counter) in action_arm_systems {
+                                    let mut sub = Reduction::new_inheriting(
+                                        self.ctx, arm_sys, arm_counter);
                                     // Edge-induced fact unification over
                                     // GRAFTED edges only (skip live-live
                                     // edges — see action_live_node_ids
@@ -4854,14 +5253,18 @@ impl<'ctx> Reduction<'ctx> {
                                                 // chain_eqs fan-out: install
                                                 // each arm and recurse the push.
                                                 let template2 = sub.sys.clone();
+                                                let post_chain_counter =
+                                                    sub.maude.fresh_counter_peek();
                                                 for arm2 in arms2 {
                                                     let mut s2 = template2.clone();
                                                     s2.invalidate_max_var_idx_cache();
                                                     s2.eq_store = std::sync::Arc::new(arm2);
-                                                    let mut r3 = Reduction::new(self.ctx, s2);
+                                                    let mut r3 = Reduction::new_inheriting(
+                                                        self.ctx, s2, post_chain_counter);
                                                     r3.subst_system();
                                                     if r3.sys.eq_store.is_false() { continue; }
                                                     r3.sys.used_sources.push(case_name.clone());
+                                                    out_counters.push(r3.maude.fresh_counter_peek());
                                                     out.push((case_name.clone(), r3.sys));
                                                 }
                                                 continue 'arm;
@@ -4873,6 +5276,7 @@ impl<'ctx> Reduction<'ctx> {
                                     // and let the next simplify+contradictions
                                     // pass catch any real impossibilities.
                                     sub.sys.used_sources.push(case_name.clone());
+                                    out_counters.push(sub.maude.fresh_counter_peek());
                                     out.push((case_name.clone(), sub.sys));
                             }
                         }
@@ -4881,8 +5285,12 @@ impl<'ctx> Reduction<'ctx> {
                             if out.len() == 1 {
                                 let (name, sys) = out.into_iter().next().unwrap();
                                 self.sys = sys;
+                                // HS FreshT-threading — single-case adoption
+                                // (see the candidate-loop rationale, task #16).
+                                self.maude.reset_counter_to(out_counters[0]);
                                 return GoalCases::LinearNamed(name);
                             }
+                            self.last_case_counters = out_counters;
                             return GoalCases::Cases(out);
                         }
                         // If source-cases yielded nothing applicable,
@@ -4936,10 +5344,14 @@ impl<'ctx> Reduction<'ctx> {
                         let partitions = tamarin_utils::misc::two_partitions(&ts_vec);
                         let mut cases: Vec<(String, crate::constraint::system::System)>
                             = Vec::new();
+                        // HS FreshT-threading (task #16): per-case branch counters.
+                        let mut case_counters: Vec<u64> = Vec::new();
                         let m = fa.terms[0].clone();
                         for (a_parts, b_parts) in partitions {
                             // Each case is a fresh fork.
-                            let mut sub = Reduction::new(self.ctx, self.sys.clone());
+                            let mut sub = Reduction::new_inheriting(
+                                self.ctx, self.sys.clone(),
+                                self.maude.fresh_counter_peek());
                             if b_parts.is_empty() {
                                 // Degenerate partition: CoerceRule.
                                 //   ru = Rule (IntrInfo CoerceRule)
@@ -4968,6 +5380,7 @@ impl<'ctx> Reduction<'ctx> {
                                         break;
                                     }
                                 }
+                                case_counters.push(sub.maude.fresh_counter_peek());
                                 cases.push((case_name, sub.sys));
                             } else {
                                 // Proper split: ConstrRule "_xor".
@@ -5004,6 +5417,7 @@ impl<'ctx> Reduction<'ctx> {
                                         break;
                                     }
                                 }
+                                case_counters.push(sub.maude.fresh_counter_peek());
                                 cases.push((case_name, sub.sys));
                             }
                         }
@@ -5012,8 +5426,12 @@ impl<'ctx> Reduction<'ctx> {
                             if cases.len() == 1 {
                                 let (name, sys) = cases.into_iter().next().unwrap();
                                 self.sys = sys;
+                                // HS FreshT-threading — single-case adoption
+                                // (task #16).
+                                self.maude.reset_counter_to(case_counters[0]);
                                 return GoalCases::LinearNamed(name);
                             }
+                            self.last_case_counters = case_counters;
                             return GoalCases::Cases(cases);
                         }
                     }
@@ -5028,7 +5446,29 @@ impl<'ctx> Reduction<'ctx> {
                     = non_silent_rule_insts_with_constrs(self.ctx);
                 if candidates.is_empty() { return GoalCases::Contradictory; }
                 let avoid_max = bounds_max(&self.sys);
+                // HS-faithful: `solveAction`'s `labelNodeId i rules Nothing`
+                // (Goals.hs:274 → Reduction.hs:249) imports the chosen rule via
+                // `importRule =<< disjunctionOfList rules`.  The fresh counter
+                // threads ABOVE the `DisjT` layer (`FreshT (DisjT ...)`,
+                // Reduction.hs:123), so sibling candidate rules do NOT thread
+                // each other's `someRuleACInst` renamings — EVERY candidate
+                // renames from the SAME pre-fork fresh state.  RS shares one
+                // `self.maude`, so consecutive `freshen_rule_with_constrs` calls
+                // climbed the counter cumulatively (c_fst → c_pair → c_snd →
+                // …), lifting each grafted node's rule vars — and hence the
+                // source-case `#vk`/`#vf` node ids — N indices above HS's (e.g.
+                // `!KU(snd(t.1))`'s premise node `#vk.6` vs HS `#vk.3`).  Reset
+                // the shared counter to the pre-fork base before each candidate
+                // and restore the high-water mark afterward, exactly as
+                // `solve_premise_goal` already does around its `#vr` fork.
+                self.maude.ensure_above(avoid_max);
+                let base_counter = self.maude.fresh_counter_peek();
+                let mut counter_high_water = base_counter;
                 let mut cases: Vec<(String, crate::constraint::system::System)> = Vec::new();
+                // HS FreshT-threading: per pushed case, the branch's fresh
+                // counter position at the end of its solve work (see the
+                // single-case adoption below).  Parallel to `cases`.
+                let mut case_counters: Vec<u64> = Vec::new();
                 for (rule, constrs) in candidates {
                     // Mirror Haskell's `labelNodeId` (Goals.hs:262) which
                     // exploits every candidate rule via Disj-monad,
@@ -5063,8 +5503,14 @@ impl<'ctx> Reduction<'ctx> {
                         // consistently — Haskell `someRuleACInst` runs
                         // `rename` over the whole (rule, constrs) pair
                         // via `fmap extractInsts . rename`.
+                        // Independent `Disj` fork (see the base_counter note
+                        // above): rewind the shared counter so THIS candidate's
+                        // rename reserves its var range from the same base every
+                        // sibling sees.
+                        self.maude.reset_counter_to(base_counter);
                         let (renamed, renamed_constrs) = freshen_rule_with_constrs(
                             rule.clone(), constrs.clone(), avoid_max, &self.maude);
+                        counter_high_water = counter_high_water.max(self.maude.fresh_counter_peek());
                         let act = renamed.actions[act_idx].clone();
                         if act.tag != fa.tag || act.terms.len() != fa.terms.len() {
                             continue;
@@ -5127,6 +5573,14 @@ impl<'ctx> Reduction<'ctx> {
                                 vec![(*sub.sys.eq_store).clone()],
                         };
                         let post_sys = sub.sys.clone();
+                        // Branch counter for HS FreshT-threading (see the
+                        // single-case adoption below): the sub-Reduction's
+                        // final fresh-counter position after exploit_prems +
+                        // solve_fact_eqs (including its eq-store simp fold
+                        // draws).  Multi-arm: `sub.solve_term_eqs`'s SplitNow
+                        // path already restored sub's counter to the
+                        // across-arm high water, so all arms share it.
+                        let branch_counter = sub.maude.fresh_counter_peek();
                         for arm_eq in arm_eq_stores {
                             let mut sys = post_sys.clone();
                             sys.invalidate_max_var_idx_cache();
@@ -5138,17 +5592,36 @@ impl<'ctx> Reduction<'ctx> {
                                 }
                             }
                             cases.push((case_name.clone(), sys));
+                            case_counters.push(branch_counter);
                         }
                     }
                 }
+                // Restore the shared counter to the high-water mark reached
+                // across all candidate forks so any later allocation on this
+                // Reduction can't collide with a reserved rule-var range.
+                self.maude.ensure_above(counter_high_water.saturating_sub(1));
                 if cases.is_empty() { return GoalCases::Contradictory; }
                 if cases.len() == 1 {
                     let (name, sys) = cases.into_iter().next().unwrap();
                     self.sys = sys;
+                    // HS FreshT-threading (Reduction = StateT System (FreshT
+                    // (DisjT ...)), Reduction.hs:123): the continuation of the
+                    // adopted Disj branch carries the BRANCH's fresh counter —
+                    // rule import + exploitPrems + solveFactEqs draws — not the
+                    // outer counter that only saw the `freshen` reservation.
+                    // RS ran the branch work in a sub-Reduction with a
+                    // detached counter cell and previously dropped its final
+                    // position on adoption, so every later draw in the
+                    // enclosing exec (e.g. insertImpliedFormulas' eq-store
+                    // simp fold draws) undershot HS by the branch's transient
+                    // draw count — visible as the fresh/witness numbering
+                    // family on web sequent panes (task #16).
+                    self.maude.reset_counter_to(case_counters[0]);
                     self.changed = ChangeIndicator::Changed;
                     return GoalCases::LinearNamed(name);
                 }
                 self.changed = ChangeIndicator::Changed;
+                self.last_case_counters = case_counters;
                 GoalCases::Cases(cases)
             }
         }
@@ -5221,11 +5694,23 @@ impl<'ctx> Reduction<'ctx> {
             // unify with `<h(...), ~nb>` (head mismatch h vs pair).
             // Without the fresh var, the chain-up to responder never
             // materialises and the case name stays at "coerce_irecv".
+            // HS `solvePremise` KD branch (Goals.hs:318-321):
+            //   iLearn <- freshLVar "vl" LSortNode
+            //   mLearn <- varTerm <$> freshLVar "t" LSortMsg
+            // Both draw from — and ADVANCE — the shared MonadFresh counter,
+            // in that order.  RS previously used `bounds_max + 1/2` locally,
+            // which produced the same idx VALUES but left the maude counter
+            // un-advanced, so the recursive `solvePremise` (and the chain
+            // extension it feeds) numbered its `#vr` / rule variables two
+            // indices too low vs HS.
             let avoid = bounds_max(&self.sys);
+            self.maude.ensure_above(avoid);
+            let vl_idx = self.maude.fresh_idx();
+            let t_idx = self.maude.fresh_idx();
             let i_learn = tamarin_term::lterm::LVar::new(
-                "vl", tamarin_term::lterm::LSort::Node, avoid.saturating_add(1));
+                "vl", tamarin_term::lterm::LSort::Node, vl_idx);
             let m_learn_var = tamarin_term::lterm::LVar::new(
-                "t", tamarin_term::lterm::LSort::Msg, avoid.saturating_add(2));
+                "t", tamarin_term::lterm::LSort::Msg, t_idx);
             let m_learn = tamarin_term::term::Term::Lit(
                 tamarin_term::vterm::Lit::Var(m_learn_var));
             let irecv_rule = crate::rule::Rule::new(
@@ -5290,22 +5775,37 @@ impl<'ctx> Reduction<'ctx> {
                 &self.ctx.full_sources,
                 &self.sys,
                 &p.0, p.1, fa_prem,
+                Some(&self.maude),
             ) {
                 let mut out: Vec<(String, crate::constraint::system::System)> = Vec::new();
-                for (case_name, mut sys) in case_pairs {
+                // HS FreshT-threading (task #23, A(ii) premise parity):
+                // per-branch continuation counters, parallel to `out`.
+                // HS `_applySource` forks the counter per case
+                // (`disjunctionOfList cdCases` BELOW FreshT); each
+                // adopted case's post-solve simplify must continue at
+                // fork + THAT case's own someInst/conjoin draws — not
+                // at the shared handle's post-ALL-cases position.
+                let mut out_counters: Vec<u64> = Vec::new();
+                for (case_name, mut sys, branch_counter) in case_pairs {
                     if has_fresh_consumer_conflation(&sys, &self.maude) {
                         continue;
                     }
                     sys.used_sources.push(case_name.clone());
                     out.push((case_name, sys));
+                    out_counters.push(branch_counter);
                 }
                 if !out.is_empty() {
                     self.changed = ChangeIndicator::Changed;
                     if out.len() == 1 {
                         let (name, sys) = out.into_iter().next().unwrap();
                         self.sys = sys;
+                        // Single-case adoption: continue THIS branch's
+                        // thread (mirrors the action-path source-case
+                        // adoption above).
+                        self.maude.reset_counter_to(out_counters[0]);
                         return GoalCases::LinearNamed(name);
                     }
+                    self.last_case_counters = out_counters;
                     return GoalCases::Cases(out);
                 }
                 // Fall through to plain rule enumeration if every case
@@ -5321,7 +5821,27 @@ impl<'ctx> Reduction<'ctx> {
             = premise_solving_rule_insts_with_constrs(self.ctx, fa_prem);
         let avoid_max = bounds_max(&self.sys);
         let mut cases: Vec<(String, crate::constraint::system::System)> = Vec::new();
-        let mut next_node_idx = avoid_max.saturating_add(1);
+        // HS FreshT-threading: per pushed case, the branch's final fresh
+        // counter (see `new_inheriting` and the single-case adoption below).
+        let mut case_counters: Vec<u64> = Vec::new();
+        // HS `insertFreshNode` (Reduction.hs:238-241): `i <- freshLVar "vr"`
+        // is evaluated ONCE, in the shared prefix BEFORE the
+        // `disjunctionOfList rules` inside `labelNodeId`.  So EVERY candidate
+        // rule — and every conclusion of every rule — is a `Disj` fork that
+        // (a) inherits this single `#vr` node id, and (b) forks the fresh
+        // counter independently from the post-`freshLVar` state (the fresh
+        // state threads ABOVE the Disj layer — `FreshT (DisjT ...)`,
+        // Disj/Class.hs:38-45 — so sibling disjuncts do NOT see each other's
+        // allocations).  `freshLVar` also ADVANCES the shared counter, which
+        // is what pushes each imported rule's variables one index above the
+        // `#vr` id itself (`!Ltk( $A.4, ~ltkA.4 ) ▶₀ #i` under `#vr.3`, not
+        // `$A.3`).  RS previously minted `#vr` from a side counter that never
+        // touched the maude counter and did so AFTER the rule rename, so
+        // every source-case rule variable came out one-too-low vs HS.
+        self.maude.ensure_above(avoid_max);
+        let vr_idx = self.maude.fresh_idx();
+        let post_vr_counter = self.maude.fresh_counter_peek();
+        let mut counter_high_water = post_vr_counter;
         for (rule, constrs) in &candidates {
             // Mirror HS `labelNodeId` in solvePremise: HS exploits every
             // candidate rule via Disj-monad, including conclusion
@@ -5358,19 +5878,31 @@ impl<'ctx> Reduction<'ctx> {
             // its own insert_edge_labeled (Reduction.hs:300) emitting
             // `insertEdges n=1`.  Tag-mismatched conclusions mzero in
             // solveFactEqs but still emit their insertEdges trace.
+            // Independent `Disj` fork: reset the shared fresh counter to the
+            // post-`freshLVar "vr"` state so THIS rule's `importRule`
+            // (= rename, Rule.hs:940-944) reserves its var range from the
+            // exact same base every sibling rule sees.  HS forks don't thread
+            // the fresh state between disjuncts, so all candidate rules of one
+            // premise goal rename starting at `#vr` + 1 and share the `#vr`
+            // id.
+            self.maude.reset_counter_to(post_vr_counter);
             let (renamed, renamed_constrs) = freshen_rule_with_constrs(
                 rule.clone(), constrs.clone(), avoid_max, &self.maude);
+            counter_high_water = counter_high_water.max(self.maude.fresh_counter_peek());
             let case_name = rule_case_name(&renamed);
             let new_node = tamarin_term::lterm::LVar::new(
                 "vr",
                 tamarin_term::lterm::LSort::Node,
-                next_node_idx,
+                vr_idx,
             );
-            next_node_idx = next_node_idx.saturating_add(1);
             // HS-faithful labelNodeId (`Reduction.hs:246-256`).
+            // The branch continues the enclosing FreshT thread (post-
+            // freshen counter), not a bounds_max re-derivation — see
+            // `new_inheriting`.
             let mut label_sys = self.sys.clone();
             label_sys.add_node(new_node.clone(), renamed.clone());
-            let mut label_sub = Reduction::new(self.ctx, label_sys);
+            let mut label_sub = Reduction::new_inheriting(
+                self.ctx, label_sys, self.maude.fresh_counter_peek());
             if tamarin_utils::env_gate!("TAM_RS_DBG_SOLVE_RULE_CONSTRAINTS") {
                 let n = renamed_constrs.as_ref().map(|c| c.len()).unwrap_or(0);
                 eprintln!("[RS_LABEL_NODE_ID] rule={} n_variant_substs={}",
@@ -5382,6 +5914,10 @@ impl<'ctx> Reduction<'ctx> {
                 }
             }
             label_sub.exploit_prems(&new_node, &renamed);
+            // Branch counter after labelNodeId (rule constraints +
+            // exploitPrems) — the enumConcs Disj forks below each continue
+            // from this state (HS: shared prefix of the Disj forks).
+            let label_counter = label_sub.maude.fresh_counter_peek();
             let label_sys = label_sub.sys;
             // enumConcs Disj sub-branches — emit insertEdges per conc.
             for (c_idx, fa_conc) in renamed.enumerate_conclusions() {
@@ -5396,7 +5932,8 @@ impl<'ctx> Reduction<'ctx> {
                         "insertEdges n=1");
                     continue;
                 }
-                let mut sub = Reduction::new(self.ctx, label_sys.clone());
+                let mut sub = Reduction::new_inheriting(
+                    self.ctx, label_sys.clone(), label_counter);
                 let res = sub.insert_edge_labeled_with_facts(
                     "premise_goal_rule_enum",
                     crate::constraint::constraints::Edge {
@@ -5432,6 +5969,9 @@ impl<'ctx> Reduction<'ctx> {
                         // the eq_store-from-arm and clone the rest of
                         // sub.sys per arm.
                         let post_edge_sys = sub.sys.clone();
+                        // Branch counter after insertEdges (incl. its
+                        // eq-store simp draws) — continues into each arm.
+                        let post_edge_counter = sub.maude.fresh_counter_peek();
                         let arm_systems: Vec<crate::constraint::system::System> = match outcome {
                             SolveOutcome::Cases(arms) => {
                                 arms.into_iter().map(|arm_eq| {
@@ -5453,22 +5993,36 @@ impl<'ctx> Reduction<'ctx> {
                             // gets baked into node/edge/goal terms before
                             // saving.  Mirrors `solve_chain_goal`'s
                             // post-arm substitution.
-                            let mut sub_per_arm = Reduction::new(self.ctx, sys);
+                            let mut sub_per_arm = Reduction::new_inheriting(
+                                self.ctx, sys, post_edge_counter);
                             sub_per_arm.subst_system();
+                            case_counters.push(sub_per_arm.maude.fresh_counter_peek());
                             cases.push((case_name.clone(), sub_per_arm.sys));
                         }
                     }
                 }
             }
         }
+        // The per-candidate `reset_counter_to(post_vr_counter)` above rewinds
+        // the shared counter for each independent fork; restore it to the
+        // high-water mark reached across all forks so any later allocation on
+        // this Reduction can't collide with a reserved rule-var range.
+        self.maude.ensure_above(counter_high_water.saturating_sub(1));
         if cases.is_empty() { return GoalCases::Contradictory; }
         if cases.len() == 1 {
             let (name, sys) = cases.into_iter().next().unwrap();
             self.sys = sys;
+            // HS FreshT-threading: the adopted branch's continuation
+            // carries the BRANCH's counter (labelNodeId + insertEdges +
+            // per-arm subst draws), not the outer counter that only saw
+            // the freshen reservation.  See `solve_action_goal`'s
+            // single-case adoption for the full rationale (task #16).
+            self.maude.reset_counter_to(case_counters[0]);
             self.changed = ChangeIndicator::Changed;
             return GoalCases::LinearNamed(name);
         }
         self.changed = ChangeIndicator::Changed;
+        self.last_case_counters = case_counters;
         GoalCases::Cases(cases)
     }
 
@@ -5536,6 +6090,10 @@ impl<'ctx> Reduction<'ctx> {
         crate::constraint::solver::trace::trace_exec("solveChain ENTER");
 
         let mut all_cases: Vec<(String, crate::constraint::system::System)> = Vec::new();
+        // HS FreshT-threading: per pushed case, the branch's final fresh
+        // counter (parallel to `all_cases`; see `new_inheriting` and the
+        // single-case adoptions below).
+        let mut all_case_counters: Vec<u64> = Vec::new();
 
         // ---------------- Branch 1: direct edge ----------------
         if let Some(p_rule) = &p_rule_opt {
@@ -5557,7 +6115,8 @@ impl<'ctx> Reduction<'ctx> {
                     // BEFORE the edge enters sEdges.  Mirrors HS's
                     // `solveFactEqs SplitNow` + `modM sEdges` order.
                     let sys_clone = self.sys.clone();
-                    let mut sub = Reduction::new(self.ctx, sys_clone);
+                    let mut sub = Reduction::new_inheriting(
+                        self.ctx, sys_clone, self.maude.fresh_counter_peek());
                     let res = sub.insert_edge_labeled("chain_direct", crate::constraint::constraints::Edge {
                         src: c.clone(), tgt: p.clone(),
                     });
@@ -5578,6 +6137,7 @@ impl<'ctx> Reduction<'ctx> {
                         // (Goals.hs:303).  Each arm becomes one
                         // independent solveChain DIRECT case.
                         let post_edge_sys = sub.sys.clone();
+                        let post_edge_counter = sub.maude.fresh_counter_peek();
                         let arm_systems: Vec<crate::constraint::system::System> = match res {
                             Ok(SolveOutcome::Cases(arms)) => {
                                 arms.into_iter().map(|arm_eq| {
@@ -5601,6 +6161,7 @@ impl<'ctx> Reduction<'ctx> {
                             crate::constraint::solver::trace::trace_exec(
                                 &format!("solveChain DIRECT {}", case_name));
                             all_cases.push((case_name.clone(), arm_sys));
+                            all_case_counters.push(post_edge_counter);
                         }
                     }
                 }
@@ -5650,7 +6211,12 @@ impl<'ctx> Reduction<'ctx> {
         if let Some(args) = funion_args {
             use tamarin_term::function_symbols::UNION_SYM_STRING;
             let avoid_max = bounds_max(&self.sys);
-            let mut next_node_idx = avoid_max.saturating_add(1);
+            // HS `solveChain` union arm (Goals.hs:374): `i <- freshLVar "vr"`
+            // is allocated ONCE, before `disjunctionOfList rus`, so every
+            // union-decomposition case shares the same `#vr` id (and it
+            // advances the shared counter).
+            self.maude.ensure_above(avoid_max);
+            let vr_idx = self.maude.fresh_idx();
             let xy_union = tamarin_term::term::Term::App(
                 tamarin_term::function_symbols::FunSym::Ac(
                     tamarin_term::function_symbols::AcSym::Union),
@@ -5679,12 +6245,12 @@ impl<'ctx> Reduction<'ctx> {
                 let new_node = tamarin_term::lterm::LVar::new(
                     "vr",
                     tamarin_term::lterm::LSort::Node,
-                    next_node_idx,
+                    vr_idx,
                 );
-                next_node_idx = next_node_idx.saturating_add(1);
                 let mut sys_clone = self.sys.clone();
                 sys_clone.add_node(new_node.clone(), ru_inst.clone());
-                let mut sub = Reduction::new(self.ctx, sys_clone);
+                let mut sub = Reduction::new_inheriting(
+                    self.ctx, sys_clone, self.maude.fresh_counter_peek());
                 // HS `extendAndMark i ru v faPrem faConc` (Goals.hs `extendAndMark`):
                 //   insertEdges [(c, faConc, faPrem, (i, v))]
                 //   markGoalAsSolved "directly" (PremiseG (i, v) faPrem)
@@ -5701,6 +6267,7 @@ impl<'ctx> Reduction<'ctx> {
                 }
                 let case_name = rule_case_name(&ru_inst);
                 let post_edge_sys = sub.sys.clone();
+                let post_edge_counter = sub.maude.fresh_counter_peek();
                 let arm_systems: Vec<crate::constraint::system::System> = match res {
                     Ok(SolveOutcome::Cases(arms)) => {
                         arms.into_iter().map(|arm_eq| {
@@ -5716,7 +6283,8 @@ impl<'ctx> Reduction<'ctx> {
                     None => continue,
                 };
                 for mut arm_sys in arm_systems {
-                    let mut arm_sub = Reduction::new(self.ctx, arm_sys);
+                    let mut arm_sub = Reduction::new_inheriting(
+                        self.ctx, arm_sys, post_edge_counter);
                     arm_sub.mark_goal_as_solved(&Goal::Premise(
                         (new_node.clone(), crate::rule::PremIdx(0)),
                         prem0.clone(),
@@ -5725,6 +6293,7 @@ impl<'ctx> Reduction<'ctx> {
                         (new_node.clone(), crate::rule::ConcIdx(0)),
                         p.clone(),
                     ));
+                    let arm_counter = arm_sub.maude.fresh_counter_peek();
                     arm_sys = arm_sub.sys;
                     for (existing, status) in arm_sys.goals_mut().iter_mut() {
                         if existing == &g && !status.solved {
@@ -5738,6 +6307,7 @@ impl<'ctx> Reduction<'ctx> {
                     crate::constraint::solver::trace::trace_exec(
                         &format!("solveChain UNION {}", case_name));
                     all_cases.push((case_name.clone(), arm_sys));
+                    all_case_counters.push(arm_counter);
                 }
             }
             // HS short-circuits the generic destructor loop in the FUnion
@@ -5747,19 +6317,37 @@ impl<'ctx> Reduction<'ctx> {
             if all_cases.len() == 1 {
                 let (name, sys) = all_cases.into_iter().next().unwrap();
                 self.sys = sys;
+                // HS FreshT-threading — see `solve_action_goal`'s
+                // single-case adoption (task #16).
+                self.maude.reset_counter_to(all_case_counters[0]);
                 self.changed = ChangeIndicator::Changed;
                 return GoalCases::LinearNamed(name);
             }
             self.changed = ChangeIndicator::Changed;
+            self.last_case_counters = all_case_counters.clone();
             return GoalCases::Cases(all_cases);
         }
         if !conc_term_is_msg_var {
             let avoid_max = bounds_max(&self.sys);
-            let mut next_node_idx = avoid_max.saturating_add(1);
+            // HS `solveChain` EXTEND (Goals.hs:394): `insertFreshNode rules
+            // (Just cRule)` allocates `i <- freshLVar "vr"` ONCE, before the
+            // `disjunctionOfList rules` inside `labelNodeId`.  So every
+            // destructor-extension case shares the same `#vr` id, and each
+            // destructor's `importRule` (= rename) reserves its var range from
+            // the single post-`freshLVar` counter state (independent forks).
+            self.maude.ensure_above(avoid_max);
+            let vr_idx = self.maude.fresh_idx();
+            let post_vr_counter = self.maude.fresh_counter_peek();
+            let mut counter_high_water = post_vr_counter;
             for ir in &self.ctx.intruder_rules {
                 if !crate::rule::is_destr_rule_info(&ir.info) { continue; }
                 let ru_inst = intr_rule_to_rule_ac_inst(ir.clone());
+                // Independent Disj fork: reset to the post-`freshLVar "vr"`
+                // state so this destructor renames from the same base as its
+                // siblings.
+                self.maude.reset_counter_to(post_vr_counter);
                 let ru_renamed = freshen_rule(ru_inst, avoid_max, &self.maude);
+                counter_high_water = counter_high_water.max(self.maude.fresh_counter_peek());
                 // HS-faithful `labelNodeId` (Reduction.hs:219-225) — when
                 // the chain conc's rule (parent) shares a name with this
                 // destructor and still has > 1 remaining applications,
@@ -5855,11 +6443,13 @@ impl<'ctx> Reduction<'ctx> {
                 let new_node = tamarin_term::lterm::LVar::new(
                     "vr",
                     tamarin_term::lterm::LSort::Node,
-                    next_node_idx,
+                    vr_idx,
                 );
-                next_node_idx = next_node_idx.saturating_add(1);
                 sys_clone.add_node(new_node.clone(), ru_renamed.clone());
-                let mut sub = Reduction::new(self.ctx, sys_clone);
+                // HS FreshT-threading: continue the enclosing thread
+                // (post-freshen counter of THIS destructor fork).
+                let mut sub = Reduction::new_inheriting(
+                    self.ctx, sys_clone, self.maude.fresh_counter_peek());
                 // HS-faithful effect order (Goals.hs solveChain EXTEND
                 // + Reduction.hs labelNodeId/extendAndMark):
                 //   1. labelNodeId → exploitPrems        (Reduction.hs:219-228)
@@ -5959,6 +6549,7 @@ impl<'ctx> Reduction<'ctx> {
                 // continue using `sub.sys` as before.
                 let case_name = rule_case_name(&ru_renamed);
                 let post_edge_sys = sub.sys.clone();
+                let post_edge_counter = sub.maude.fresh_counter_peek();
                 let arm_systems: Vec<crate::constraint::system::System> = match res {
                     Ok(SolveOutcome::Cases(arms)) => {
                         arms.into_iter().map(|arm_eq| {
@@ -5984,7 +6575,8 @@ impl<'ctx> Reduction<'ctx> {
                     // The freshly-added prem-0 goal now has an incoming
                     // edge from `c`, so mark it solved (Haskell's
                     // `markGoalAsSolved "directly" (PremiseG (i, v) ...)`).
-                    let mut arm_sub = Reduction::new(self.ctx, arm_sys);
+                    let mut arm_sub = Reduction::new_inheriting(
+                        self.ctx, arm_sys, post_edge_counter);
                     arm_sub.mark_goal_as_solved(&Goal::Premise(
                         (new_node.clone(), crate::rule::PremIdx(0)),
                         prem0.clone(),
@@ -5994,6 +6586,7 @@ impl<'ctx> Reduction<'ctx> {
                         (new_node.clone(), crate::rule::ConcIdx(0)),
                         p.clone(),
                     ));
+                    let arm_counter = arm_sub.maude.fresh_counter_peek();
                     arm_sys = arm_sub.sys;
                     // Mark the original chain goal as solved in this case
                     // (it's been extended, not closed).
@@ -6009,18 +6602,27 @@ impl<'ctx> Reduction<'ctx> {
                     crate::constraint::solver::trace::trace_exec(
                         &format!("solveChain EXTEND {}", case_name));
                     all_cases.push((case_name.clone(), arm_sys));
+                    all_case_counters.push(arm_counter);
                 }
             }
+            // Restore the shared counter to the high-water mark reached
+            // across the per-destructor forks (each of which rewound it via
+            // `reset_counter_to`) so later allocations can't collide.
+            self.maude.ensure_above(counter_high_water.saturating_sub(1));
         }
 
         if all_cases.is_empty() { return GoalCases::Contradictory; }
         if all_cases.len() == 1 {
             let (name, sys) = all_cases.into_iter().next().unwrap();
             self.sys = sys;
+            // HS FreshT-threading — see `solve_action_goal`'s single-case
+            // adoption (task #16).
+            self.maude.reset_counter_to(all_case_counters[0]);
             self.changed = ChangeIndicator::Changed;
             return GoalCases::LinearNamed(name);
         }
         self.changed = ChangeIndicator::Changed;
+        self.last_case_counters = all_case_counters;
         GoalCases::Cases(all_cases)
     }
 
@@ -6199,8 +6801,15 @@ impl<'ctx> Reduction<'ctx> {
         // Critical for SplitG variant filtering (e.g. drop verify=sign(...)
         // variants against a live Eq(verify, true) restriction).
         let maude = self.maude.clone();
-        let sys_snapshot = self.sys.clone();
         let has_reducible = !maude.maude_sig().reducible_fun_syms.is_empty();
+        // One `maybeNonNormalTerms` walk of `self.sys`, shared across every
+        // candidate probe below — HS's curried `substCheck` from Goals.hs:381
+        // (`gets (substCreatesNonNormalTerms hnd)` captures the system once).
+        // Replaces a former unconditional deep System clone + per-candidate
+        // re-walk.  See `SubstNfChecker`.
+        let nf_checker = has_reducible.then(||
+            crate::constraint::solver::contradictions::SubstNfChecker::new(
+                &maude, &self.sys));
         // Collect the system's free vars — these are LIVE system vars
         // (node ids, rule premise/conclusion/action vars, edges, less
         // atoms, goals, formulas).  Pass to `simp_with_fresh_avoiding`
@@ -6249,12 +6858,10 @@ impl<'ctx> Reduction<'ctx> {
             -> crate::tools::equation_store::EquationStore
         {
             if has_reducible {
-                let maude_ref = maude.clone();
-                let sys_ref = &sys_snapshot;
+                // Safe: `Some` exactly when `has_reducible` is true.
+                let checker = nf_checker.as_ref().unwrap();
                 store.simp_with_fresh_avoiding(
-                    |fs, vfs| crate::constraint::solver::contradictions::subst_creates_non_normal_terms(
-                        &maude_ref, sys_ref, fs, vfs,
-                    ),
+                    |fs, vfs| checker.check(fs, vfs),
                     |n| maude.reserve_idxs(n),
                     &system_vars,
                     Some(&maude),
@@ -6269,6 +6876,10 @@ impl<'ctx> Reduction<'ctx> {
             }
         };
         if cases.len() == 1 {
+            if tamarin_utils::env_gate!("TAM_RS_DBG_FOLD_DRAWS") {
+                eprintln!("[rs-fold] SPLITG-SINGLE id={:?} counter={}",
+                    id, self.maude.fresh_counter_peek());
+            }
             self.sys.invalidate_max_var_idx_cache();
             self.sys.eq_store = std::sync::Arc::new(simplify_picked(
                 cases.into_iter().next().unwrap()));
@@ -6278,10 +6889,47 @@ impl<'ctx> Reduction<'ctx> {
             return GoalCases::Linear;
         }
         let mut out = Vec::with_capacity(cases.len());
-        for store in cases.into_iter() {
+        let n_cases = cases.len();
+        let fold_dbg = tamarin_utils::env_gate!("TAM_RS_DBG_FOLD_DRAWS");
+        if fold_dbg {
+            eprintln!("[rs-fold] SPLITG-ENTER id={:?} n_cases={} counter={}",
+                id, n_cases, self.maude.fresh_counter_peek());
+        }
+        // HS FreshT-threading (`solveSplit`, Goals.hs:436-447):
+        // `disjunctionOfList split` forks the DisjT layer, which sits
+        // BELOW FreshT in `Reduction = StateT System (FreshT (DisjT ...))`
+        // (Reduction.hs:123) — so each arm's subsequent `simp` (whose
+        // `simpSingleton` fold draws fresh idxs via `freshToFree`) starts
+        // from an independent COPY of the counter at the fan-out point.
+        // RS's `simplify_picked` allocs via the ONE shared `self.maude`
+        // counter, so consecutive cases threaded each other's fold draws:
+        // on csf18-xor/CH07's `splitEqs(0)` (9 xor-unifier variants) the
+        // per-case folds drew 6→8, 8→12, 12→16, 16→19, ... where HS draws
+        // 6.. in EVERY case (TAM_{HS,RS}_DBG_FOLD_DRAWS traces).  The
+        // folded range vars persist in each case's system, so every case
+        // after the first carried a cumulative +offset in its whole var
+        // numbering — the growing ∃-witness index drift on CH07 /
+        // sapic feature-xor CH07 web proof pages.  Rewind to the fork
+        // base before each case and record the per-case continuation
+        // counter (fork + that case's OWN draws) in `last_case_counters`
+        // so the post-solve `simplifySystem` continues each branch at
+        // HS's counter position, exactly like the other Cases producers.
+        let fork_base = self.maude.fresh_counter_peek();
+        let mut case_counters: Vec<u64> = Vec::with_capacity(n_cases);
+        for (ci, store) in cases.into_iter().enumerate() {
+            self.maude.reset_counter_to(fork_base);
             let mut sys = self.sys.clone();
             sys.invalidate_max_var_idx_cache();
+            if fold_dbg {
+                eprintln!("[rs-fold] SPLITG-CASE id={:?} case={} before={}",
+                    id, ci, self.maude.fresh_counter_peek());
+            }
             sys.eq_store = std::sync::Arc::new(simplify_picked(store));
+            let branch_counter = self.maude.fresh_counter_peek();
+            if fold_dbg {
+                eprintln!("[rs-fold] SPLITG-CASE-DONE id={:?} case={} after={}",
+                    id, ci, branch_counter);
+            }
             for (existing, status) in sys.goals_mut().iter_mut() {
                 if existing == &g && !status.solved {
                     status.solved = true;
@@ -6298,8 +6946,10 @@ impl<'ctx> Reduction<'ctx> {
             // (ProofMethod.hs:308) when multiple sibling cases share the
             // same name.  Mirror by emitting plain `"split"` here.
             out.push(("split".to_string(), sub.sys));
+            case_counters.push(branch_counter);
         }
         self.changed = ChangeIndicator::Changed;
+        self.last_case_counters = case_counters;
         GoalCases::Cases(out)
     }
 }
